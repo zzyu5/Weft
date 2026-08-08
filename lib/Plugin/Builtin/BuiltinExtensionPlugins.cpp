@@ -1,15 +1,10 @@
 #include "Weft/Plugin/BuiltinExtensionPlugins.h"
 
-#include "Weft/Plugin/Demo/DemoExtensionPlugin.h"
 #include "Weft/Plugin/ExtensionBundle.h"
 #include "Weft/Plugin/ExtensionPlugin.h"
 #include "Weft/Plugin/IME/IMEExtensionPlugin.h"
-#include "Weft/Plugin/Offload/OffloadExtensionPlugin.h"
 #include "Weft/Plugin/RVV/RVVExtensionPlugin.h"
 #include "Weft/Plugin/Scalar/ScalarExtensionPlugin.h"
-#include "Weft/Plugin/Template/TemplateExtensionPlugin.h"
-#include "Weft/Plugin/TensorExtLite/TensorExtLiteExtensionPlugin.h"
-#include "Weft/Plugin/Toy/ToyExtensionPlugin.h"
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Errc.h"
@@ -34,11 +29,6 @@ struct BuiltinExtensionBundleSpec {
 
 constexpr BuiltinExtensionBundleSpec kBuiltinExtensionBundles[] = {
     {"rvv-extension-bundle", registerRVVExtensionPlugin},
-    {"offload-extension-bundle", registerOffloadExtensionPlugin},
-    {"toy-extension-bundle", registerToyExtensionPlugin},
-    {"template-extension-bundle", registerTemplateExtensionPlugin},
-    {"demo-extension-bundle", registerDemoExtensionPlugin},
-    {"tensorext-lite-extension-bundle", registerTensorExtLiteExtensionPlugin},
     {"ime-extension-bundle", registerIMEExtensionPlugin},
     {"scalar-extension-bundle", registerScalarExtensionPlugin},
 };

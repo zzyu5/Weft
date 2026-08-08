@@ -1,1 +1,0 @@
-# g7-perf-ceiling — zero-model IME-decode oracle / regpressure-strip / retranspose byte-exact driver. Source campaign: experiments/archive/g7/g7-perf-ceiling (G7 perf-ceiling zero-model). Extracted G8 §一.

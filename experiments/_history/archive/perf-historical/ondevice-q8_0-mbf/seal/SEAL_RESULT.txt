@@ -1,0 +1,40 @@
+q8_0 typed kernel — fp-fold CONFORMANCE SEAL (commit 92bf9d47, step 1a-hw)
+board = k1 SpacemiT-X60, VLEN256 (vlenb=32, VLMAX_e8m2=64), RVV1.0, Bianbu clang-18.1.8
+NOTE: correctness seal only — NO perf claim (perf voided pending step-3 constitutional retest).
+
+=== build provenance ===
+kernel: build/bin/tcrv-opt frontdoor_mbf1.mlir --tcrv-rvv-lower-to-emitc (current binary already
+        emits the conformed SeparatedLeftAssoc fold) -> mlir-translate --mlir-to-cpp ->
+        clang++-20 -target riscv64 -O2 -march=rv64gcv -mabi=lp64d   [DEFAULT -ffp-contract=on, NOT off, NOT fast]
+driver: current .trellis/scripts/ondevice/q8_0_verify_driver.c (FOLD_PINNED re-pinned oracle),
+        on k1: clang-18 -O2 -march=rv64gcv -mabi=lp64d --rtlib=compiler-rt   [DEFAULT -ffp-contract=on; 0 ffp-contract flags]
+
+=== generated C fold (SEPARATE statements — structural lock against re-fusion) ===
+    float v37 = v36 * v18;   // t = (float)sumi * d_x
+    float v38 = v37 * v19;   // t = t * d_y
+    float v39 = v35 + v38;   // sumf = sumf + t
+
+=== 3. objdump FOLD SEGMENT — instruction-level no-FMA seal (PASS) ===
+    82: fcvt.s.w  fa5, a0        // (float)sumi
+    86: fmul.s    fa5, fs0, fa5  // * d_x
+    8a: fmul.s    fa5, fa5, fa0  // * d_y
+    8e: fadd.s    fs1, fs1, fa5  // sumf +
+    FMA-family (fmadd/fmsub/fnmadd/vfmadd/vfmacc) count in .o = 0
+    => separated statements do NOT contract to fmadd under -ffp-contract=on. no-FMA by construction. SEAL PASS.
+
+=== 2. driver run on k1 (n=4096 / 128 blocks, 256 trials) ===
+    [GATE] exact-match vs PINNED oracle : 256/256   worst ULP=0        -> match_pin == trials  PASS
+    VERDICT (pinned §1 gate): BIT-EXACT
+    property: 5/5 passed  (all-zero, alt-sign, full-scale, subnormal-scale, extreme-exp — all ulp=0)
+    mutation caught (oracle discriminates): YES  (random-trial divergences 212/256)
+    DRIVER_EXIT_CODE = 0   (overall gate: bitexact && property 5/5 && mutation caught)
+
+    [diag] premul(no-fma): 44/256   [diag] premul+fmaf: 44/256
+    -> the kernel NO LONGER matches the old ggml premul/fmaf folds (was 256/256 fmaf pre-conform);
+       it now matches ONLY the pinned separated left-assoc §1 oracle. Confirms the fold genuinely moved.
+
+=== VERDICT: ALL THREE SEALS PASS ===
+1) bit-exact vs pinned oracle: 256/256 (worst ULP 0)         PASS
+2) property 5/5 + mutation caught YES                        PASS
+3) instruction-level no-FMA (fmul+fmul+fadd, 0 fmadd)        PASS
+fp16 conversion board-vs-oracle: consistent (256/256 + subnormal/extreme-exp property cases ulp=0).

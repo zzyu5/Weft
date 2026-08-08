@@ -1,0 +1,38 @@
+variant,core,board,board_id,vlen_bits,vlmax,register_fill,march,numeric_verdict,exact_match_fma,kernel_ns_min,kernel_ns_mean,ref_ns,ref_kind,kernel_vs_ref
+e8m2,m2-vl32-of-VLMAX64-half,k1,SpacemiT-X60,256,64,half(32/64),rv64gcv,BIT-EXACT,256/256,6901.5,6903.4,5149.8,clang-autovec-rvv,0.746
+e8m1,m1-vl32-of-VLMAX32-full,k1,SpacemiT-X60,256,32,full(32/32),rv64gcv,BIT-EXACT,256/256,6016.0,6017.6,5149.8,clang-autovec-rvv,0.856
+e8m2,m2,k1,SpacemiT-X60,256,64,half,rv64gc,BIT-EXACT,256/256,6900.4,6900.4,36208.1,pure-scalar-noV,5.25
+e8m1,m1,k1,SpacemiT-X60,256,32,full,rv64gc,BIT-EXACT,256/256,6015.7,6015.7,36211.4,pure-scalar-noV,6.02
+# ===== e8m1 vs e8m2 q8_0 vec_dot on k1 (VLEN256) — measure-first before building LMUL region machinery =====
+# e8m1 kernel = HAND-WRITTEN probe (experiments/ondevice-q8_0-mbf/ir/kernel_e8m1.c): byte-for-byte the
+#   compiler-emitted e8m2 core with ONLY the LMUL swapped (vsetvl_e8m1 / i8m1 / vwmul i16m2 / vwredsum i16m2_i32m1).
+#   Same QK=32, same fold sumf = sumf + (float)sumi*(dx*dy), one-vsetvl/no-strip elided core.
+#   Built with the SAME local cross-clang as the e8m2 core (clang++-20 -target riscv64 -O2 -march=rv64gcv -x c++).
+# On VLEN256: VLMAX_e8m1 = 256/8 = 32 = exactly one q8_0 block -> e8m1 FILLS the register (vs e8m2 vl=32 of 64 = half).
+# BIT-EXACT: both 256/256 fmaf fold, worst ULP 0 (sumi is exact integer -> e8m1 result bit-identical to e8m2).
+# methodology: n=4096 (128 blocks/dot), 256 verify trials, best-of-7 min over 150000 timed iters (60000 scalar),
+#   6 interleaved rv64gcv passes; CLOCK_MONOTONIC_RAW. kernel min/mean over the 6 passes.
+# autovec ref is DVFS-noisy (two clusters: ~5150 max-freq / ~6090 throttled); ref_ns column uses the max-freq floor (5149.8).
+#
+# RESULT: e8m1 = 6016 ns vs e8m2 = 6902 ns -> e8m1 is 12.8% FASTER (rock-stable, +/-0.1%). Register-fill genuinely helps.
+#   BUT e8m1 = 0.856x vs the (unthrottled) autovec floor -> still BELOW 1.0x. It only reaches ~1.01x when the autovec
+#   baseline itself is throttled (not a real win). vs pure scalar: e8m1 6.02x, e8m2 5.25x.
+# DECISION (criterion: >=1x vs autovec AND clearly beats e8m2):
+#   - clearly beats e8m2: YES (+12.8%).
+#   - >=1x vs autovec: NO (~0.86x). => e8m1 does NOT fix VLEN256 to the win bar.
+# Register-fill recovers only ~1/3 of the deficit (0.75 -> 0.86, gap to 1.0 remains).
+# CEILING framing (the load-bearing point for the build/no-build call): this e8m1 is HAND-WRITTEN and OPTIMAL for VLEN256
+#   (full register, no strip, same fold) -> 0.86x is the CEILING an m1 core can reach here. So the LMUL region-variant
+#   machinery PROVABLY cannot yield a VLEN256 winner: not "12.8% might be too little" but "the best achievable m1 still
+#   loses to clang autovec." Measure-first kills the build (as it did mbf).
+# CANDIDATE next hypothesis (NOT measured/isolated here -- do not treat as established; needs its own measure-first):
+#   q8_0 vec_dot may be LATENCY-bound on a per-block vector->scalar chain (vwredsum -> vmv.x.s -> 2 scalar fp16 scale
+#   reads (strided 34B) -> scalar fmaf into a serial fp32 accumulator), a chain whose length is identical for m1 and m2
+#   (one reduction per block). If so, register-fill only widens vwmul/vle (throughput, ~13%) and cannot shorten the
+#   latency floor, and the real fix would be STRUCTURAL (cross-block vectorized accumulation / vectorized scales / drop the
+#   per-block vector->scalar round-trip). NOT verified: the autovec reference was not disassembled/profiled in this run.
+#   This should authorize the next expensive build no more than the unmeasured LMUL story did -- prove it first.
+# WITHIN-BOARD fill effect (measured, clean): on k1/VLEN256 the register-filling LMUL (m1) beats the half-filled m2 by 12.8%.
+# NOT a confirmed VLEN flip: the m2@128=1.43x datapoint is a DIFFERENT board (rvv openEuler 64c, abs 1897ns) -- per project
+#   discipline cross-board perf is not comparable, and a win->loss "flip" would confound "our kernel scales with VLEN" with
+#   "autovec scales with VLEN". This experiment establishes only the within-k1 m1-vs-m2 fill effect, not a VLEN-driven flip.

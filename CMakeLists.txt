@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard")
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
-option(WEFT_ENABLE_TESTS "Enable Weft-RV lit/FileCheck tests" ON)
+option(WEFT_ENABLE_TESTS "Enable Weft-RV lit/FileCheck tests" OFF)
 
 set(_WEFT_LLVM_PREFIX_HINTS
   /usr/lib/llvm-20

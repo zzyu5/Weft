@@ -1,3 +1,0 @@
-# REQUIRES: weft-local-native-clangxx
-# RUN: weft-translate --weft-template-emitc-to-cpp %S/template-target-artifact-object.mlir > %t.cpp
-# RUN: clang++ -std=c++17 -fsyntax-only %t.cpp

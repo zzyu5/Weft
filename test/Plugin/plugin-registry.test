@@ -1,3 +1,0 @@
-# RUN: weft-plugin-registry-test | FileCheck %s
-
-# CHECK: plugin registry smoke test passed

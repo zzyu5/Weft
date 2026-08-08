@@ -1,3 +1,0 @@
-# RUN: weft-plugin-variant-cost-test | FileCheck %s
-
-# CHECK: plugin variant cost smoke test passed

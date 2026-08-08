@@ -1,0 +1,139 @@
+
+== ENV FINGERPRINT ==
+uname=Linux localhost.localdomain 6.12.66-0.0.0.0.riscv64 #1 SMP Mon Feb  2 22:50:01 CST 2026 riscv64 riscv64 riscv64 GNU/Linux
+clang_driver=/usr/bin/clang-17  clang version 17.0.6 ( 17.0.6-16.oe2403)
+isa=isa		: rv64imafdcv_zicbom_zicboz_zicntr_zicond_zicsr_zifencei_zihintntl_zihintpause_zihpm_zawrs_zfa_zfh_zfhmin_zca_zcb_zcd_zba_zbb_zbc_zbs_zve32f_zve32x_zve64d_zve64f_zve64x_zvfh_zvfhmin_sscofpmf_sstc_svinval_svnapot_svpbmt
+pinned_core=8 governor=performance max_khz=2600000
+driver_flags=-O2 -march=rv64gcv -mabi=lp64d -ffp-contract=off  n=4096 verify=256 perf_iters=100000 rounds=11
+kernel_.o provenance=clang-20 cross -O2 -mabi=lp64d -ffp-contract=off (A/B_zfh/C_zfh=rv64gcv_zfh_zvfhmin; B_nozfh/C_nozfh=rv64gcv_zvfhmin)
+== COMPILE DRIVER + SHIM ==
+driver.o OK
+shim.o OK
+############################## KERNEL=A_zfh (k_A_zfh.o) ##############################
+-- objdump confound seal (A_zfh) --
+   __extendhfsf2 libcall : 0
+   hw fcvt.s.h           : 2
+   vlse16 (vec fp16 gather): 2
+   vfwcvt.f.f.v          : 2
+  link OK (extra=)
+-- correctness (A_zfh) --
+[GATE] exact-match vs PINNED oracle : 256/256   worst ULP=0
+VERDICT (pinned §1 gate): BIT-EXACT
+property: 5/5 passed
+mutation caught (oracle discriminates): YES
+-- perf rounds (A_zfh): raw kernel_ns per round --
+PERF kernel=A_zfh round=1 kernel_ns=1085.3 freq_khz=2600000
+PERF kernel=A_zfh round=2 kernel_ns=1085.4 freq_khz=2600000
+PERF kernel=A_zfh round=3 kernel_ns=1085.2 freq_khz=2600000
+PERF kernel=A_zfh round=4 kernel_ns=1085.4 freq_khz=2600000
+PERF kernel=A_zfh round=5 kernel_ns=1085.4 freq_khz=2600000
+PERF kernel=A_zfh round=6 kernel_ns=1085.4 freq_khz=2600000
+PERF kernel=A_zfh round=7 kernel_ns=1158.4 freq_khz=2600000
+PERF kernel=A_zfh round=8 kernel_ns=1085.3 freq_khz=2600000
+PERF kernel=A_zfh round=9 kernel_ns=1085.3 freq_khz=2600000
+PERF kernel=A_zfh round=10 kernel_ns=1085.4 freq_khz=2600000
+PERF kernel=A_zfh round=11 kernel_ns=1085.4 freq_khz=2600000
+############################## KERNEL=B_nozfh (k_B_nozfh.o) ##############################
+-- objdump confound seal (B_nozfh) --
+   __extendhfsf2 libcall : 2
+   hw fcvt.s.h           : 0
+   vlse16 (vec fp16 gather): 0
+   vfwcvt.f.f.v          : 0
+  link OK (extra=shim.o)
+-- correctness (B_nozfh) --
+[GATE] exact-match vs PINNED oracle : 256/256   worst ULP=0
+VERDICT (pinned §1 gate): BIT-EXACT
+property: 5/5 passed
+mutation caught (oracle discriminates): YES
+-- perf rounds (B_nozfh): raw kernel_ns per round --
+PERF kernel=B_nozfh round=1 kernel_ns=1853.1 freq_khz=2600000
+PERF kernel=B_nozfh round=2 kernel_ns=1853.1 freq_khz=2600000
+PERF kernel=B_nozfh round=3 kernel_ns=1853.1 freq_khz=2600000
+PERF kernel=B_nozfh round=4 kernel_ns=1853.1 freq_khz=2600000
+PERF kernel=B_nozfh round=5 kernel_ns=1853.0 freq_khz=2600000
+PERF kernel=B_nozfh round=6 kernel_ns=1853.0 freq_khz=2600000
+PERF kernel=B_nozfh round=7 kernel_ns=1853.2 freq_khz=2600000
+PERF kernel=B_nozfh round=8 kernel_ns=1853.0 freq_khz=2600000
+PERF kernel=B_nozfh round=9 kernel_ns=1853.1 freq_khz=2600000
+PERF kernel=B_nozfh round=10 kernel_ns=1853.2 freq_khz=2600000
+PERF kernel=B_nozfh round=11 kernel_ns=1853.1 freq_khz=2600000
+############################## KERNEL=B_zfh (k_B_zfh.o) ##############################
+-- objdump confound seal (B_zfh) --
+   __extendhfsf2 libcall : 0
+   hw fcvt.s.h           : 2
+   vlse16 (vec fp16 gather): 0
+   vfwcvt.f.f.v          : 0
+  link OK (extra=)
+-- correctness (B_zfh) --
+[GATE] exact-match vs PINNED oracle : 256/256   worst ULP=0
+VERDICT (pinned §1 gate): BIT-EXACT
+property: 5/5 passed
+mutation caught (oracle discriminates): YES
+-- perf rounds (B_zfh): raw kernel_ns per round --
+PERF kernel=B_zfh round=1 kernel_ns=1009.7 freq_khz=2600000
+PERF kernel=B_zfh round=2 kernel_ns=1009.6 freq_khz=2600000
+PERF kernel=B_zfh round=3 kernel_ns=1009.8 freq_khz=2600000
+PERF kernel=B_zfh round=4 kernel_ns=1009.7 freq_khz=2600000
+PERF kernel=B_zfh round=5 kernel_ns=1009.7 freq_khz=2600000
+PERF kernel=B_zfh round=6 kernel_ns=1032.5 freq_khz=2600000
+PERF kernel=B_zfh round=7 kernel_ns=1009.8 freq_khz=2600000
+PERF kernel=B_zfh round=8 kernel_ns=1040.1 freq_khz=2600000
+PERF kernel=B_zfh round=9 kernel_ns=1009.8 freq_khz=2600000
+PERF kernel=B_zfh round=10 kernel_ns=1009.8 freq_khz=2600000
+PERF kernel=B_zfh round=11 kernel_ns=1009.8 freq_khz=2600000
+############################## KERNEL=C_nozfh (k_C_nozfh.o) ##############################
+-- objdump confound seal (C_nozfh) --
+   __extendhfsf2 libcall : 2
+   hw fcvt.s.h           : 0
+   vlse16 (vec fp16 gather): 0
+   vfwcvt.f.f.v          : 0
+  link OK (extra=shim.o)
+-- correctness (C_nozfh) --
+[GATE] exact-match vs PINNED oracle : 120/256   worst ULP=64
+VERDICT (pinned §1 gate): NOT bit-exact
+property: 5/5 passed
+mutation caught (oracle discriminates): YES
+-- perf rounds (C_nozfh): raw kernel_ns per round --
+PERF kernel=C_nozfh round=1 kernel_ns=1793.6 freq_khz=2600000
+PERF kernel=C_nozfh round=2 kernel_ns=1792.6 freq_khz=2600000
+PERF kernel=C_nozfh round=3 kernel_ns=1792.5 freq_khz=2600000
+PERF kernel=C_nozfh round=4 kernel_ns=1792.8 freq_khz=2600000
+PERF kernel=C_nozfh round=5 kernel_ns=1793.6 freq_khz=2600000
+PERF kernel=C_nozfh round=6 kernel_ns=1792.7 freq_khz=2600000
+PERF kernel=C_nozfh round=7 kernel_ns=1792.5 freq_khz=2600000
+PERF kernel=C_nozfh round=8 kernel_ns=1792.6 freq_khz=2600000
+PERF kernel=C_nozfh round=9 kernel_ns=1793.6 freq_khz=2600000
+PERF kernel=C_nozfh round=10 kernel_ns=1792.6 freq_khz=2600000
+PERF kernel=C_nozfh round=11 kernel_ns=1792.7 freq_khz=2600000
+############################## KERNEL=C_zfh (k_C_zfh.o) ##############################
+-- objdump confound seal (C_zfh) --
+   __extendhfsf2 libcall : 0
+   hw fcvt.s.h           : 2
+   vlse16 (vec fp16 gather): 0
+   vfwcvt.f.f.v          : 0
+  link OK (extra=)
+-- correctness (C_zfh) --
+[GATE] exact-match vs PINNED oracle : 120/256   worst ULP=64
+VERDICT (pinned §1 gate): NOT bit-exact
+property: 5/5 passed
+mutation caught (oracle discriminates): YES
+-- perf rounds (C_zfh): raw kernel_ns per round --
+PERF kernel=C_zfh round=1 kernel_ns=880.7 freq_khz=2600000
+PERF kernel=C_zfh round=2 kernel_ns=880.6 freq_khz=2600000
+PERF kernel=C_zfh round=3 kernel_ns=880.7 freq_khz=2600000
+PERF kernel=C_zfh round=4 kernel_ns=880.7 freq_khz=2600000
+PERF kernel=C_zfh round=5 kernel_ns=880.6 freq_khz=2600000
+PERF kernel=C_zfh round=6 kernel_ns=880.6 freq_khz=2600000
+PERF kernel=C_zfh round=7 kernel_ns=880.7 freq_khz=2600000
+PERF kernel=C_zfh round=8 kernel_ns=880.6 freq_khz=2600000
+PERF kernel=C_zfh round=9 kernel_ns=880.7 freq_khz=2600000
+PERF kernel=C_zfh round=10 kernel_ns=880.6 freq_khz=2600000
+PERF kernel=C_zfh round=11 kernel_ns=880.7 freq_khz=2600000
+== DONE ==
+
+== COMPILER-SWAP CONFIRMATION (same board/core8/2.6GHz, same source, -ffp-contract=off) ==
+# clang-17 on-board rv64gcv_zfh vs clang-20 cross rv64gcv_zfh_zvfhmin
+C17 kernel=B_c17 kernel_ns~=3543.9   (clang-20 B_zfh=1009.8  -> 3.51x compiler gap)
+C17 kernel=C_c17 kernel_ns~=3552.8   (clang-20 C_zfh=880.7   -> 4.03x compiler gap)
+# clang-17 B/C = 3543.9/3552.8 = 0.998 (per-block ~parity, reproduces step-3 clang-17 0.981 modulo ffp-contract)
+# clang-20 B/C = 1009.8/880.7   = 1.147 (ordering FLIPS: factory faster under clang-20)

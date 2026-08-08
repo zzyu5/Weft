@@ -1,3 +1,0 @@
-# RUN: weft-template-extension-plugin-test | FileCheck %s
-
-# CHECK: Template extension plugin template smoke test passed

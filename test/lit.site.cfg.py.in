@@ -1,8 +1,0 @@
-@LIT_SITE_CFG_IN_HEADER@
-
-config.weft_src_root = path("@WEFT_SOURCE_DIR@")
-config.weft_obj_root = path("@WEFT_BINARY_DIR@")
-config.weft_tools_dir = path("@LLVM_RUNTIME_OUTPUT_INTDIR@")
-config.llvm_tools_dir = path("@LLVM_TOOLS_BINARY_DIR@")
-
-lit_config.load_config(config, "@WEFT_SOURCE_DIR@/test/lit.cfg.py")

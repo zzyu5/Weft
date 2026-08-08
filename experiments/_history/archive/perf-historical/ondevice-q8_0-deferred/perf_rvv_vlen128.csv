@@ -1,0 +1,8 @@
+# rvv board VLEN128 (vlenb=16, VLMAX_e8m2=32), openEuler kernel 6.12.66, 64c, governor=performance
+# taskset -c 8, driver best-of-7 internal, n=4096 (128 blocks), 200000 iters/rep, march=rv64gcv driver, kernel .o = clang-20 -O2 -march=rv64gcv_zvfhmin -ffp-contract=off
+# kernel, ns_per_call (stable across reps + order-independent), gbps, bitexact_vs_pinned_§1
+A_deferred, 1093.3, 7.96, 256/256_ULP0
+B_perblock_shipped, 2032.0, 4.28, 256/256_ULP0
+C_ggml_factory, 1848.0, 4.71, 120/256(matches_premul_diag_256/256)
+reference_autovec_scalar, 2734.4, 3.18, n/a
+# ratios: A/B=0.538 (deferred 1.86x faster than per-block); A/C=0.592 (deferred 1.69x faster than factory); B/C=1.10 (shipped per-block 10% slower than factory)

@@ -1,0 +1,13 @@
+variant,build_path,board,board_id,vlen_bits,vlmax_e8m2,march,numeric_verdict,exact_match_fma,kernel_ns_per_call,ref_ns_per_call,ref_kind,kernel_vs_ref
+bridge_mbf1,frontdoor-monolithic-bridge,k1,SpacemiT-X60,256,64,rv64gcv,BIT-EXACT,256/256,6902.8,6106.2,clang-autovec-rvv,0.88
+core_mbf1,lower-to-emitc+mlir-to-cpp+clang++20,k1,SpacemiT-X60,256,64,rv64gcv,BIT-EXACT,256/256,6900.4,5155,clang-autovec-rvv,0.75-0.88
+core_mbf2,lower-to-emitc+mlir-to-cpp+clang++20,k1,SpacemiT-X60,256,64,rv64gcv,BIT-EXACT,256/256,6727.0,5155,clang-autovec-rvv,0.77-0.91
+core_mbf1,lower-to-emitc+mlir-to-cpp+clang++20,k1,SpacemiT-X60,256,64,rv64gc,BIT-EXACT,256/256,6900.3,36217.0,pure-scalar-noV,5.25
+core_mbf2,lower-to-emitc+mlir-to-cpp+clang++20,k1,SpacemiT-X60,256,64,rv64gc,BIT-EXACT,256/256,6724.5,36234.3,pure-scalar-noV,5.39
+# methodology: n=4096 (128 q8_0 blocks/dot), 256 verify trials, best-of-7 min over 200000 timed iters (60000 for scalar pass); CLOCK_MONOTONIC_RAW.
+# kernel ns/call is the clean signal (autovec ref is DVFS-noisy 5150-6106 within/across sessions; kernel stable +/-0.1%).
+# mbf1 core-path kernel over 4 rv64gcv passes: 6901.8 6900.3 6901.7 6899.3 -> mean 6900.4
+# mbf2 core-path kernel over 4 rv64gcv passes: 6725.7 6725.4 6731.0 6724.7 -> mean 6727.0
+# validity gate: bridge_mbf1 (6902.8) ~= core_mbf1 (6900.4) -> CORE build path reproduces the monolithic-bridge baseline; only mbf differs between mbf1/mbf2 (strip_elision=elided held constant).
+# mbf2/mbf1 = 0.975 (mbf2 is 2.5% faster). mbf2 vs autovec still ~0.77-0.91x (< 1.0). DECISION: NOT FIXED.
+# mechanism: mbf=2 = 2x unroll of two vl=32 (half of VLMAX_e8m2=64) elided cores + robust tail; q8_0 34-byte block stride (2B scale gap) blocks a 64-wide load, so mbf does NOT fill the register. Register-fill fix needs integer_core_lmul=m1 (e8m1@VLEN256=32=one block).
