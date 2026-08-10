@@ -29,9 +29,12 @@ set -uo pipefail
 BOARD="${1:-scalar}"; MODE="${2:-verify}"; FMT="${3:-tq2_0}"; REGIME="${4:-}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF/../../.." && pwd)"
-ASSETS="${SCALAR_VECDOT_ASSET_ROOT:-$ROOT/experiments/active/g8-stage3-attack/A3-xscalar-rv64gc}"
-EXPORTER="$ROOT/tools/bench/export_current_artifact.py"
+ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirname "$ROOT")"; done
+[ -d "$ROOT/.git" ] || { echo "# HARNESS-VOID cannot locate repo root above $SELF"; exit 3; }
+# Relocated 2026-08 from tools/bench/cells/: driver assets live alongside
+# this script's new home (experiments/coverage/_cross-format/g8-A3-xscalar-rv64gc-history/).
+ASSETS="${SCALAR_VECDOT_ASSET_ROOT:-$SELF}"
+EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-scalar-vec-dot.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }

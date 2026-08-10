@@ -32,9 +32,13 @@ set -uo pipefail
 BOARD="${1:-rvv}"; MODE="${2:-verify}"; FMT="${3:-q4_0_nibble}"; REGIME="${4:-}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF/../../.." && pwd)"
-ASSETS="${PRODUCT_REDUCE_ASSET_ROOT:-$ROOT/experiments/active/k-product-reduce}"
-EXPORTER="$ROOT/tools/bench/export_current_artifact.py"
+ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirname "$ROOT")"; done
+[ -d "$ROOT/.git" ] || { echo "# HARNESS-VOID cannot locate repo root above $SELF"; exit 3; }
+# Relocated 2026-08 from tools/bench/cells/: driver assets now live alongside
+# this script (experiments/scripts/product-reduce-harness/), not under the
+# old experiments/active/k-product-reduce/ campaign directory.
+ASSETS="${PRODUCT_REDUCE_ASSET_ROOT:-$SELF}"
+EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-product-reduce.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }

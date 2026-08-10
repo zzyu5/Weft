@@ -1,7 +1,8 @@
-# experiments/ 总纲
+# 历史实验材料索引
 
 本文件说明 `experiments/` 目录当前的组织方式，以及它与项目历史测量数据的关系。
-它不是研究方向文档——项目研究方向唯一权威在 [`doc/总纲.md`](../doc/总纲.md)。
+它不是设计权威；Weft 语言与编译器的唯一规范在
+[`WEFT_FINAL_SPEC.md`](../WEFT_FINAL_SPEC.md)，当前工程边界见 [`doc/`](../doc/README.md)。
 
 ## 这次重组做了什么
 
@@ -91,8 +92,8 @@ experiments/
 | `export_current_artifact.py`、`cells-README.md` | `scripts/`（五个 harness 共用） |
 
 **这纯粹是留档，不是恢复"当前可用工具"**——找回来的目的只是保留"这批历史测量
-数据当年是怎么跑出来的"这条记录，跟当前项目方向（Intent Kernel DSL 的 RISC-V
-domain realizer）已经没有关系，不代表这些脚本现在还能跑、也不会为了让它们能跑
+数据当年是怎么跑出来的"这条记录，跟当前 worker-local Weft kernel DSL/compiler
+主干已经没有直接关系，不代表这些脚本现在还能跑、也不会为了让它们能跑
 而去修复任何依赖（旧硬件环境路径、旧 `test/` fixture 位置等）。
 
 ## 已知问题：`_cross-format/` 体量偏大

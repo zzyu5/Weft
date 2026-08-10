@@ -47,8 +47,12 @@ set -uo pipefail
 BOARD="${1:-rvv}"; MODE="${2:-verify}"; FMT="${3:-iq3_xxs}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF/../../.." && pwd)"
-ASSETS="${DEQUANT_ROW_ASSET_ROOT:-$ROOT/experiments/active/r-dequant}"
+ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirname "$ROOT")"; done
+[ -d "$ROOT/.git" ] || { echo "# HARNESS-VOID cannot locate repo root above $SELF"; exit 3; }
+# Relocated 2026-08 from tools/bench/cells/: driver assets now live alongside
+# this script (experiments/scripts/dequant-row-drivers/), not under the old
+# experiments/active/r-dequant/ campaign directory.
+ASSETS="${DEQUANT_ROW_ASSET_ROOT:-$SELF}"
 
 REPS=25; S1=0x1357; S2=0xACE2; SV=0xD00D
 RDIR=/tmp/bench_cells_dequantize_row_${BOARD}_${FMT}

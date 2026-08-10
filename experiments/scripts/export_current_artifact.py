@@ -3,12 +3,20 @@
 
 This is runner orchestration, not a compiler implementation.  It deliberately
 owns no formula, format semantics, selection policy, or C body.  Each recipe
-starts at the production test/source entry for its family, invokes the current
-family construction path, and asks the registered artifact lowering to emit C.
+starts at a standalone MLIR fixture for its family (kept in ``fixtures/``
+next to this script), invokes the current family construction path, and asks
+the registered artifact lowering to emit C.
 
-The official cell harnesses call this tool with ``--require-clean`` and write
-the result only into an ephemeral ``mktemp`` directory.  The emitted seal makes
-the measured symbol traceable to the current commit, compiler binaries, source
+Historical note: this tool originally resolved its fixtures from the repo's
+``test/`` tree and cross-checked its recipe table against the archived
+``tools/bench/bench`` route dispatcher. Both of those have been retired; this
+script now lives entirely under ``experiments/scripts/`` and resolves its
+fixtures from the sibling ``fixtures/`` directory. It no longer requires or
+references the old measurement-schema runner.
+
+The cell harnesses call this tool with ``--require-clean`` and write the
+result only into an ephemeral ``mktemp`` directory. The emitted seal makes the
+measured symbol traceable to the current commit, compiler binaries, source
 fixture, target capability tier, and generated artifact.
 """
 
@@ -16,8 +24,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.machinery
-import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -27,8 +33,23 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
-ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BUILD_DIR = ROOT / "build" / "weft"
+def _find_repo_root(start: Path) -> Path:
+    """Walk upward from ``start`` until a directory containing ``.git`` is
+    found. This is robust to this script (and its fixtures) being relocated
+    within the repo, unlike a hardcoded ``parents[N]`` depth."""
+    current = start
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            raise RuntimeError(f"could not locate repo root above {start}")
+        current = current.parent
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+FIXTURES_DIR = SCRIPT_DIR / "fixtures"
+ROOT = _find_repo_root(SCRIPT_DIR)
+DEFAULT_BUILD_DIR = ROOT / "build"
 MLIR_TRANSLATE_CANDIDATES = (
     Path("/usr/bin/mlir-translate-20"),
     Path("/usr/lib/llvm-20/bin/mlir-translate"),
@@ -57,7 +78,7 @@ def _grid_recipe(fmt: str) -> ArtifactRecipe:
         fmt=fmt,
         family="rvv",
         fixture=(
-            "test/Conversion/RVV/rvv-emit-quant-contraction-"
+            "rvv-emit-quant-contraction-"
             f"{slug}-repack-gemm-prefill-vlen128.mlir"
         ),
         expected_symbol=(
@@ -76,7 +97,7 @@ def _vec_dot_recipe(fmt: str) -> ArtifactRecipe:
         fmt=fmt,
         family="rvv",
         fixture=(
-            f"test/Target/RVV/{qslug}-k-q8-k-super-block-block-dot-"
+            f"{qslug}-k-q8-k-super-block-block-dot-"
             "full-pipeline-export-e2e.mlir"
         ),
         expected_symbol=(
@@ -102,10 +123,7 @@ RECIPES = {
             op="product_reduce",
             fmt="q4_0_nibble",
             family="rvv",
-            fixture=(
-                "test/Conversion/RVV/"
-                "rvv-to-emitc-unsigned-nibble-x-i8-product-reduce.mlir"
-            ),
+            fixture="rvv-to-emitc-unsigned-nibble-x-i8-product-reduce.mlir",
             expected_symbol=(
                 "weft_emitc_rvv_unsigned_nibble_q8_1_integer_core_kernel_"
                 "rvv_unsigned_nibble_q8_1_integer_core"
@@ -116,10 +134,7 @@ RECIPES = {
             op="product_reduce",
             fmt="offset_binary_n3",
             family="rvv",
-            fixture=(
-                "test/Conversion/RVV/"
-                "rvv-to-emitc-five-bit-offset-binary-x-i8-product-reduce.mlir"
-            ),
+            fixture="rvv-to-emitc-five-bit-offset-binary-x-i8-product-reduce.mlir",
             expected_symbol=(
                 "weft_emitc_rvv_five_bit_q5_0_integer_core_kernel_"
                 "rvv_five_bit_q5_0_integer_core"
@@ -130,10 +145,7 @@ RECIPES = {
             op="product_reduce",
             fmt="codebook_n3",
             family="rvv",
-            fixture=(
-                "test/Conversion/RVV/"
-                "rvv-to-emitc-codebook-gather-x-i8-product-reduce.mlir"
-            ),
+            fixture="rvv-to-emitc-codebook-gather-x-i8-product-reduce.mlir",
             expected_symbol=(
                 "weft_emitc_rvv_codebook_q8_0_integer_core_kernel_"
                 "rvv_codebook_q8_0_integer_core"
@@ -144,7 +156,7 @@ RECIPES = {
             op="vec_dot",
             fmt="tq2_0",
             family="scalar",
-            fixture="test/Target/Scalar/tq2-0-q8-k-ternary-vec-dot.mlir",
+            fixture="tq2-0-q8-k-ternary-vec-dot.mlir",
             expected_symbol="weft_emitc_tq2_0_kernel_scalar_fallback_first_slice",
             mode="scalar-source-front-door",
         ),
@@ -226,17 +238,17 @@ def _build_tools(build_dir: Path) -> None:
 def _check_clean(require_clean: bool) -> str:
     head = _git("rev-parse", "HEAD")
     if require_clean:
-        # The official runner creates its immutable run directory before the
-        # measure invocation.  That evidence is an output of this transaction,
-        # not compiler input; every other tracked or untracked repository path
-        # remains cleanliness-sensitive.
+        # The harness invocation itself writes measurement output into a
+        # gitignored history/scratch location; every other tracked or
+        # untracked repository path remains cleanliness-sensitive so the
+        # exported symbol is traceable to an exact committed compiler state.
         dirty = _git(
             "status", "--porcelain", "--untracked-files=all", "--", ".",
-            ":(exclude)experiments/runs/**",
+            ":(exclude)experiments/_history/**",
         )
         if dirty:
             raise ExportError(
-                "official current-artifact export requires a clean worktree; "
+                "current-artifact export requires a clean worktree; "
                 "commit the compiler/task state before measurement"
             )
     return head
@@ -251,7 +263,7 @@ def _export_rvv(
 ) -> tuple[bytes, list[str]]:
     march = _march_for(board, recipe.family)
     weft_opt = build_dir / "bin" / "weft-opt"
-    args = [str(weft_opt), str(ROOT / recipe.fixture)]
+    args = [str(weft_opt), str(FIXTURES_DIR / recipe.fixture)]
     if recipe.mode == "rvv-quant-contraction":
         args.append(f"--weft-rvv-lower-quant-contraction=march={march}")
     elif recipe.mode == "rvv-source-front-door":
@@ -273,7 +285,7 @@ def _export_scalar(
     args = [
         str(weft_translate),
         "--weft-scalar-emitc-to-cpp",
-        str(ROOT / recipe.fixture),
+        str(FIXTURES_DIR / recipe.fixture),
     ]
     return _run(args), args
 
@@ -287,7 +299,7 @@ def export_current_artifact(
     require_clean: bool,
     skip_build: bool,
 ) -> None:
-    fixture = ROOT / recipe.fixture
+    fixture = FIXTURES_DIR / recipe.fixture
     if not fixture.is_file():
         raise ExportError(f"registered current-artifact fixture is missing: {fixture}")
     if output.exists():
@@ -348,43 +360,22 @@ def export_current_artifact(
     print("# CURRENT_ARTIFACT_COMMAND " + " ".join(command))
 
 
-def _load_bench_routes():
-    bench_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(bench_dir))
-    loader = importlib.machinery.SourceFileLoader(
-        "weft_bench_contract", str(bench_dir / "bench")
-    )
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        raise ExportError("cannot load canonical bench route registry")
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module.CELL_ROUTES
-
-
 def self_test() -> None:
+    # Historical note: this used to cross-check RECIPES against the archived
+    # tools/bench/bench route dispatcher for bijectivity. That dispatcher (and
+    # its whole measurement-schema apparatus) is retired; this self-test now
+    # only checks internal consistency of the recipe table and that every
+    # fixture it names actually exists in the sibling fixtures/ directory.
     if len(RECIPES) != len(set(RECIPES)):
         raise ExportError("duplicate current-artifact recipe")
-    route_keys = set()
-    for route in _load_bench_routes():
-        for fmt in route["formats"]:
-            route_keys.add((route["op"], fmt))
-            if (route["op"], fmt) not in RECIPES:
-                raise ExportError(
-                    "canonical bench route lacks current-artifact recipe: "
-                    f"{route['op']}/{fmt}"
-                )
-    extra = set(RECIPES) - route_keys
-    if extra:
-        raise ExportError(f"unregistered current-artifact recipes: {sorted(extra)}")
     for recipe in RECIPES.values():
-        if not (ROOT / recipe.fixture).is_file():
+        if not (FIXTURES_DIR / recipe.fixture).is_file():
             raise ExportError(f"missing fixture: {recipe.fixture}")
         if not recipe.expected_symbol or not recipe.mode:
             raise ExportError(f"incomplete recipe: {recipe.op}/{recipe.fmt}")
     print(
-        "current-artifact exporter self-test: canonical runner routes and "
-        "production export recipes are bijective"
+        f"current-artifact exporter self-test: {len(RECIPES)} recipes, "
+        "all fixtures present, all recipes complete"
     )
 
 

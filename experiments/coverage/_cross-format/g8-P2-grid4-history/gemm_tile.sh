@@ -29,10 +29,13 @@ set -uo pipefail
 BOARD="${1:-rvv}"; MODE="${2:-verify}"; FMT="${3:-iq1_s}"; REGIME="${4:-}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF/../../.." && pwd)"
+ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirname "$ROOT")"; done
+[ -d "$ROOT/.git" ] || { echo "# HARNESS-VOID cannot locate repo root above $SELF"; exit 3; }
 # 只读 support assets（driver/oracle/tables）；不再提供 DUT leaf。
-ASSETS="${GEMM_TILE_ASSET_ROOT:-$ROOT/experiments/active/g8-stage3-attack/P2-grid4-raw}"
-EXPORTER="$ROOT/tools/bench/export_current_artifact.py"
+# Relocated 2026-08 from tools/bench/cells/: driver assets live alongside
+# this script's new home (experiments/coverage/_cross-format/g8-P2-grid4-history/).
+ASSETS="${GEMM_TILE_ASSET_ROOT:-$SELF}"
+EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-gemm-tile.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }

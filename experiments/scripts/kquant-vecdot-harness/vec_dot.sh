@@ -39,9 +39,13 @@ set -uo pipefail
 BOARD="${1:-rvv}"; MODE="${2:-verify}"; FMT="${3:-q4_K}"; REGIME="${4:-}"
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$SELF/../../.." && pwd)"
-ASSETS="${VEC_DOT_ASSET_ROOT:-$ROOT/experiments/active/k-vecdot-harness}"
-EXPORTER="$ROOT/tools/bench/export_current_artifact.py"
+ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirname "$ROOT")"; done
+[ -d "$ROOT/.git" ] || { echo "# HARNESS-VOID cannot locate repo root above $SELF"; exit 3; }
+# Relocated 2026-08 from tools/bench/cells/: driver assets now live alongside
+# this script (experiments/scripts/kquant-vecdot-harness/), not under the old
+# experiments/active/k-vecdot-harness/ campaign directory.
+ASSETS="${VEC_DOT_ASSET_ROOT:-$SELF}"
+EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-vec-dot.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }

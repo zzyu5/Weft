@@ -1,102 +1,111 @@
-# 协作规则
+# Weft 仓库协作规则
 
-## 唯一目标
+## 1. 唯一设计权威
 
-推进独立的 Weft RISC-V kernel DSL/compiler 新主干。
+- 根目录 [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md) 是 Weft 语言、IR、provider、
+  lowering 与 artifact 的唯一规范性设计。
+- `doc/` 是工程解释、现状审计和重建决策，不得另立语义，不得覆盖规范。
+- 当前源码只说明“旧实现现在做了什么”，不说明“最终设计应该是什么”。源码、注释、
+  旧提交或辅助文档与最终规范冲突时，以最终规范为准。
+- 不保留旧设计的兼容语义、弃用期或双轨入口；历史由 Git 保存。
 
-判据：本轮改动是否让某个真实的 Weft 语言构造或 Kernel IR 节点，更接近
-“能够被 Weft 编译器发射成可运行的 RISC-V kernel”？
-不是，就不要做。
+## 2. 项目定位
 
-## 项目定位
+- Weft 是面向 RISC-V 的 worker-local AOT kernel DSL/compiler，作用类似 Triton
+  面向 GPU kernel，但它不是 Triton 的 SIMT/grid 模型移植。
+- 一个 Weft kernel 描述一个普通 RISC-V worker/hart 内执行的算法。线程创建、worker
+  编号、工作切分、NUMA 与线程池属于外部 runtime。
+- Weft core 不得出现 `program_id`、`task_id`、`grid_rank`、隐式 hart identity 或
+  launch grid。跨 worker 的任务分配必须通过普通 ABI 参数或 descriptor 显式传入。
+- `W.vla(begin, end)` 是一等的一维 VLA iteration region；strip、`vl`、LMUL 与寄存器
+  分组是物理实现，不得暴露给 source 或 canonical IR。
+- logical block 是局部 region value，不是根程序模型、任务、寄存器 tile、cache tile
+  或 ISA fragment。上述层次必须分别建模。
+- logical predicate、masked value 和 physical tail 是三个不同概念；不得用 RVV tail
+  mask 代替算法有效性。
+- `reduce`、`scan`、`summary_fold` 与普通 sequential carry 是不同的 state algebra，
+  不得统一塞入一个模糊的 loop/reduction 路径。
 
-- Weft 是一门独立的 RISC-V blocked/VLA kernel DSL 与编译器，地位类似
-  Triton 对 GPU；不是图编译器、算子目录、kernel 名称分派器或旧量化格式路由器。
-- canonical Weft Kernel IR 是 Weft 编译边界内的算法唯一真理。它可以由 Weft
-  Python eDSL 直接生成，也可以由 Intent 或其他前端 lowering 生成。
-- Weft core 不解析 intent.*，不依赖 intentdsl。Intent→Weft conversion 属于
-  Intent 侧 target plugin 或独立 bridge，依赖方向只能是 Intent → Weft。
-- bridge 负责把逻辑算法单向 lowering 成参数化 blocked program；Weft 负责在该
-  程序语义允许的空间内选择 meta-parameter、VLA layout 和 Scalar/RVV/IME 实现。
-  两边都不得靠 kernel 名替换整段算法。
-- RISC-V domain 可以包含 Scalar、RVV、IME 和未来扩展；owner 按结构化节点或物理
-  region 接入，不要求整个 kernel 只能属于一个 owner。
-- /home/kingdom/phdworks/intentdsl 是活跃上游。除非用户明确要求，始终只读，
-  不修改、不整理、不替它提交。
+## 3. 编译边界
 
-## 表示层纪律
+Weft 只有三类持久化承重表示：
 
-Weft 内部正式、可持久化的承重层只有三层：
+1. canonical Weft Kernel IR：唯一算法真理；
+2. Selected Execution IR：只记录多个合法实现中选中的物理决定；
+3. source/object/static-library/header/dispatcher artifact。
 
-1. canonical Weft Kernel MLIR；
-2. 一份 selected RISC-V execution/layout MLIR；
-3. 生成的 RISC-V source/object/header artifact。
+分析索引、候选集合、owner-local IR、EmitC/LLVM IR 和 target helper 都可以是瞬态实现，
+但不得成为第二份算法真理或第二份物理计划。发射只可读取 canonical IR、selected IR
+和静态 target facts；能从这三者推导的字段不得再持久化一份 schema。
 
-分析结果、索引、typed body、EmitC 和 target helper 可以作为单向生成的瞬态实现，
-但不得成为第二份算法真理或第二份物理决策：
+Python eDSL 是参考前端和 AOT 构建入口，不是运行时 JIT。它应直接构造 canonical
+Kernel IR；允许使用通用的单向 MLIR assembly builder，但不得维护另一套长期 typed IR
+或 verifier。
 
-- 能从 Weft Kernel IR、selected execution 和静态 target 表推导的字段，不得另立 schema；
-- 瞬态 IR 不得被缓存后绕过上游重算，不得反向驱动 selection；
-- emitter 只从 Weft Kernel IR、selected execution 和 target 静态表取事实；
-- owner-local 信息不得塞进跨 owner 的 giant optional struct。
+IntentDSL 和其他上游只可在 Weft 之外 lowering 到 canonical Weft Kernel IR：
 
-## 目录结构纪律
+```text
+IntentDSL / other frontend  ->  canonical Weft Kernel IR  ->  Weft
+```
 
-目录结构就是架构，内部层级和顶层目录同样重要。动手前先从完整数据流判断文件归属，
-不能只找一个能放的位置。
+Weft core 不解析 `intent.*`，不链接 IntentDSL，也不反向调用上游。除非用户明确授权，
+`/home/kingdom/phdworks/intentdsl` 始终只读。
 
-- 同一层保持一致抽象，用稳定职责和 lowering 边界组织文件。
-- Python frontend、Weft Kernel dialect、RISC-V analysis/execution layout、
-  owner realization、emission、artifact 必须分层放置。
-- Scalar、RVV、IME 的 owner-local 代码各自收拢；共享层不得包含 owner 名分支。
-- 强耦合、共同演进的文件相邻；共享内容放在职责明确的共同边界。
-- 缓存、环境、临时产物和一次性实验输出不得进入项目。
-- 落点或边界不明确时停下来问用户。
+## 4. Provider 纪律
 
-## 新旧路径
+- Provider 绑定 primitive/interface、typed operands、target facts 和局部上下文；不得
+  按 kernel 名、算子名、量化格式名或 whole-kernel route 接管整条 lowering。
+- Scalar、RVV、IME 和未来扩展是可组合的 primitive realization providers，而不是
+  互斥的整 kernel 后端。
+- 语义相同的扩展只能提供 realization；语义不同的扩展必须先成为明确的 canonical
+  extension primitive，不能藏在 provider 内替换算法。
+- packing、局部 fusion、microtile、指令选择和寄存器约束属于 provider/selection；
+  算法分块、状态代数、逻辑 predicate 和数值语义属于 source/canonical IR。
+- 未实现的 primitive 或组合必须明确失败；禁止静默走旧 emitter、Scalar fallback、
+  默认 route 或假成功路径。
 
-- 新主干不得经过旧 canonical-problem → whole-kernel variant → format body 路径。
-- 新主干也不得以“Intent adapter”为核心入口；weft-compile 只接受 canonical
-  Weft Kernel IR，Intent bridge 不能进入 Weft core。
-- 旧代码只是供体：只按新接口逐件抽取硬件知识、typed primitive、ABI 或 artifact
-  机制，不为复用而保留旧入口。
-- 新路径替代某段旧路径时，同一轮删除被替代分支、派生表示、兼容旁路和死代码。
-- 不建 compatibility layer，不保留 deprecation path；历史由 git 保存。
-- 未实现的结构直接报 unsupported 或 NotImplementedError，不得静默回落旧 emitter。
+## 5. 仓库重建边界
 
-## 卡住时
+当前源码树是 donor，不是最终骨架。工程决策见
+[`doc/REPOSITORY_RECONSTRUCTION.md`](doc/REPOSITORY_RECONSTRUCTION.md)：在同一 Git
+仓库内建立全新的根骨架，不在现有 grid/task 主干上渐进修补，也不立即拆成新仓库。
 
-遇到设计歧义、上游接口仍在变化、信息缺失或方案分叉，停下来问用户。
+执行重建时必须遵守：
 
-禁止用“先造一个可交付物”、兼容壳、默认值或假实现填补不确定性。宁可一轮只提出
-一个真正阻塞的问题，也不要生成一堆自洽但不会进入 lowering 主干的材料。
+- 先把旧实现整体隔离到 `materials/legacy-source/`，再在根目录建立新的独立依赖图；
+- `materials/` 永远不进入 CMake、include path、Python package path、链接、安装或运行时；
+- 复用的含义是阅读并把最小代码/硬件知识抽取到新接口下，不是调用、包装或链接旧路径；
+- 不建 compatibility layer，不让新旧主干并行可达，不用 feature flag 切回旧实现；
+- 每个抽取文件都必须能脱离 donor 独立解释，名称与依赖服从新架构；
+- 不确定某段代码是算法语义还是物理实现时，先回到最终规范，不按现有目录猜归属。
 
-## 验证
+## 6. 文档纪律
 
-唯一允许的验证是一条可手动执行的真实 repro：
+- 语义定义只写入 `WEFT_FINAL_SPEC.md`；需要修改规范时必须由用户明确决定。
+- 工程文档必须标明它描述的是规范解释、当前事实还是未来实施决定。
+- 不新增“V2”“旧版”“迁移指南”“总纲副本”或按阶段复制的设计文档。
+- 旧文档被替代后直接删除；不在仓库里另建 archive。代码材料与历史文档不是一回事。
+- 重要断言尽量指向实际符号或文件；不要用计划表把未实现能力写成已完成能力。
 
-Weft DSL kernel → canonical Weft Kernel MLIR → selected RISC-V execution →
-RISC-V source/object → 真实目标运行 → 数值对照。
+## 7. 工作方式
 
-- 独立 DSL 主干先用手写 Weft kernel 跑通；Intent 接入时再用 intentdsl 现有
-  kernel 生成同一 Weft IR，不复制出测试 corpus。
-- 不建 test/ 或 tests/，不用 pytest/lit/CTest，不留 fixture，不累计测试数字。
-- 一个改动只需要覆盖它推进的真实语言构造；不补边界测试、兼容测试或脚手架。
-- 如果当前没有可用 RISC-V 机器，必须明确停在 source/object，不用模拟结果冒充。
+- 搜索和阅读本地文件优先使用 FastCtx；已知位置的少量文件和即将修改的代码由主代理
+  亲自读取。
+- 跨目录审计、宽检索和独立核验可并行交给只读子代理；设计取舍、实际修改与最终验证
+  由主代理完成。
+- 工作区可能含用户或其他代理的改动。不得覆盖、回滚或顺手整理无关内容。
+- 未经用户明确要求，不执行 commit、push、rebase、reset 或清理未跟踪文件。
+- 不添加测试目录、覆盖率、边界测试账本或验证脚手架。验证采用与改动对应的最小真实
+  AOT repro：DSL/Kernel IR → selected IR → source/object → 目标机数值对照。目标机不可用
+  时，明确停在哪个 artifact 边界，不伪造运行结果。
+- 不用 hash、checksum、版本号、CHANGELOG、deprecation 或兼容层制造额外协议。
 
-## 禁止
+## 8. 完成判据
 
-- 任何 hash、SHA、checksum 来源或产物校验；
-- 上述 repro 之外的单测、边界测试、版本兼容测试和验证脚手架；
-- 版本号、CHANGELOG、迁移指南、deprecation 标记；
-- 未经要求的目录整理、注释批量补写、README 扩写或历史总结；
-- 按 kernel 名称、算子名字、量化格式名选择整条 lowering 路径；
-- try/except 吞异常、默认值兜底、防御性 fallback 和空壳成功；
-- emitter 从 kernel 名、operand 顺序或 route 字符串重新推导算法或 physical layout。
+一项实现工作只有在以下条件同时成立时才算进入新主干：
 
-## 交付形式
-
-- 只改推进当前真实 lowering 所必需的文件。
-- 用户明确要求设计文档时可以创建；否则不新建计划、进度、迁移或总结文档。
-- 回复结构：改了什么（一句）→ 关键设计取舍 → 真正卡住的地方。
-- 不用测试数量、文件数量或历史覆盖率包装完成度。
+- 数据流符合最终规范且没有读取 donor 路径；
+- canonical 与 selected 的事实没有重复；
+- provider 只拥有局部 primitive realization；
+- unsupported 组合 fail closed；
+- 产物边界和实际验证状态被如实说明。
