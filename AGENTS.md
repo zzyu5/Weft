@@ -7,7 +7,7 @@
 
 ## 设计边界
 
-- [`doc/WEFT_FINAL_SPEC.md`](doc/WEFT_FINAL_SPEC.md) 是唯一规范；源码是当前实现事实。
+- [`doc/index.md`](doc/index.md) 及其链接的模块是唯一规范；源码是当前实现事实。
 - Weft kernel 是 worker/hart-local 程序。core 中禁止 grid、task identity、隐式 hart identity
   和 GPU SIMT 根模型。
 - 持久表示只有 canonical Kernel IR、Selected Execution IR 和最终 artifacts。分析结果、
@@ -28,6 +28,7 @@
 - 模块拆到职责清楚，但不为单次任务随手造层级；强耦合、共同演进的文件应相邻。
 - `source/` 按语言、上游来源、算子职责和变体形成可读层级，source 与 runtime 相邻。
 - `examples/` 只放手工 repro 入口，不保存第二份算法 source。
+- `report/` 是扁平的工作记录区；实现问题、真实结果和阻塞写入主题报告，不进入 `doc/`。
 - 缓存、环境、临时产物和 generated artifacts 不得进入仓库。
 
 ## 卡住时
@@ -53,7 +54,7 @@
 - 上述 repro 之外的一切测试：单测、边界测试、版本兼容测试、脚手架。
 - 版本号、CHANGELOG、迁移指南、deprecation 标记——有 Git 就够了。
 - 未经要求的重构、目录整理、注释批量补写或 README/doc 更新。
-- 为任务新建计划文档、进度文档、状态快照或设计总纲副本；任务状态只在回复中报告。
+- 在 `doc/` 新建计划、进度、状态快照或设计总纲副本；可变事实只写入 `report/`。
 - 兜底代码：吞异常、默认值兜底、“防御性”分支、静默 fallback 或假成功路径。
   未实现就直接 `raise NotImplementedError` 或返回明确的 unsupported error，不要假装能跑。
 - compatibility layer、旧入口、双主干、feature flag 回退或按阶段保留旧路径。

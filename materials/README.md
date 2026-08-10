@@ -24,4 +24,4 @@
 monolithic block-dot catalog、旧 plugin root 或 compatibility/fallback 路径。无法脱离旧
 whole-kernel 上下文独立解释的代码只能阅读，不能复用。
 
-最终语义以 [`../doc/WEFT_FINAL_SPEC.md`](../doc/WEFT_FINAL_SPEC.md) 为准。
+最终语义以 [`../doc/index.md`](../doc/index.md) 及其链接的模块为准。
