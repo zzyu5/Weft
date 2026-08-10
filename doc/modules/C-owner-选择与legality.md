@@ -2,13 +2,14 @@
 
 ## 职责
 
-对每个结构化原语实例（一个 `contract`、一个 `reduce`……），给定其 typed
+对每个 Weft block operation/region（一个 `dot`、一个 `reduce`……），给定其 typed
 representation facts `g`、RISC-V domain 内某 owner 的能力投影 `c_o`、静态
 上下文 `ω`，构造候选 owner + legality 判定 + analytic prior。
 
 这是旧架构"每个具体格式手写一份候选表"（`RepackAccumulatorLMULFormulaResult`
-等）要泛化的地方：泛化的方向是**按结构化原语种类**（`contract`/`reduce`/
-`scan`/...）通用运作，而不是按具体量化格式（q2_K/q4_K/...）各写一份。
+等）要泛化的地方：泛化的方向是**按 Weft IR operation/interface**（`dot`/
+`reduce`/memory/control）通用运作，而不是按 kernel 名或量化格式
+（q2_K/q4_K/...）各写一份。
 
 ## 核心纪律（继承自旧两柱柱二，不动摇）
 
@@ -24,5 +25,5 @@ representation facts `g`、RISC-V domain 内某 owner 的能力投影 `c_o`、�
   的权衡见 `.trellis/tasks/`归档前的 brainstorm research，已随旧 task 树
   一并归档，需要时可从 `_attic/2026-08-07-riscv-quant-v2-archive/` 找回
   参考，但不作为现行结论）；
-- 是否所有结构化原语种类共享同一套候选构造/legality 骨架，还是
-  `contract` 与 `reduce`/`scan` 因为语义差异太大需要各自的骨架。
+- 哪些 legality 由通用 block tensor/type/interface 保证，哪些必须留给
+  RVV/IME/Scalar owner-local verifier。

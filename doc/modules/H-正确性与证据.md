@@ -2,31 +2,46 @@
 
 ## 职责
 
-定义新架构下"怎么证明系统正确、怎么证明性能主张成立"的方法论。
+定义新架构唯一允许的活验证：按当前被推进的一个 Weft kernel，尽可能走到真实
+RISC-V 运行和数值对照的手动 repro；若缺目标/工具链，必须明确停点，不能把
+selected MLIR 或 source 检查写成真机验证。
 
-## 为什么不能直接复用旧架构的测试哲学
+## 不迁移旧测试体系
 
-旧架构的测试哲学建立在"封闭问题目录"假设上：9 个手写 problem op、5 个
-DequantMechanism，覆盖率可以用"枚举 catalog + 逐条测试"来定义和验证。
-新架构消费的是开放的结构化原语组合空间（模块 A），理论上组合数量无界，
-"枚举式覆盖率"不再是一个有效概念，需要新的方法论回答"我们对系统正确性
-有多大信心"这个问题。
+旧 test、lit、CTest、fixture、catalog coverage、certification 和战役账本不迁入
+新主干，也不建立替代它们的新测试目录或覆盖率系统。
 
-## 待裁问题（全部待定，无既定方向）
+## 唯一 repro
 
-- 正确性验证：是否延续 byte-exact/ULP 对照 oracle 的模式，还是需要针对
-  "任意结构化原语组合"设计某种组合式/性质式（property-based）测试策略；
-- 性能证据：旧架构的四元行键（op/format/engine/regime）+ 三目的地
-  （master/runs/runs.log）是否需要因为"算子不再是预注册的封闭格式列表"
-  而调整测量 schema；
-- 覆盖信心：如果不能枚举，用什么指标/机制代替"catalog 覆盖率"来说明
-  系统在开放组合空间下的正确性/性能信心。
+每次只选一个手写 Weft kernel，执行：
+
+```text
+Weft Python DSL → canonical Weft Kernel MLIR → selected RISC-V execution
+→ RISC-V source/object → 真实目标运行 → source reference 数值对照
+```
+
+不建立 kernel corpus，不为边界情况增加 fixture，不累计通过数量。某个语言构造
+没有进入这条主链，就直接视为未实现。
+
+当前 RVV 代表 kernel 已经走到 object、真实机器和数值对照。第一条 IME
+`si8×si8→si32` fragment-tiled 路径目前只走到 canonical→`weft_ime_execution`
+selected MLIR→source；逻辑 `8×12×16`、非整除 `5×6×9` 与多 contract site 已完成
+selected IR round-trip 或 C++ syntax check。由于当前环境没有
+SpacemiT IME toolchain/目标机，这不是 IME runtime correctness 证据。旧 IME plugin 的
+K1 seal 只能证明复用的 `vmadot` hardware leaf 事实，不能代替新 canonical/selected
+主干的端到端运行。
+
+同一 kernel 的两个独立 RVV reduction component 已完成 canonical→selected→object 与
+selected IR round-trip，但由于共享 RVV 目标机当时已有持续硬件扫描负载，没有追加
+数值运行；因此它只证明组合选择和 artifact 闭合，不计作新的 runtime correctness 证据。
+
+本轮新增的 rowwise max、三阶段 softmax 与 rank-3 affine 都已完成 canonical MLIR、
+selected verifier/round-trip、RVV source 和 RISC-V object。softmax 的 source 可见真实
+`vfredmax`、`vfredusum` 与两个 `exp_poly_v1` 序列；rank-3 source 可见由 layout order
+推导出的三层循环。这仍是 artifact correctness，不是真机数值结论：实时预检发现共享
+RVV 主机上已有两个长期占满 CPU 的 sysfs 扫描进程，本轮没有部署、运行或终止它们。
 
 ## 与旧测量纪律的关系
 
-旧架构的测量操作纪律（正确性先于性能、真实硬件证据、no ad-hoc 数字、
-paired baseline、run lineage 归档规则等）已随旧 spec 一并归档，未被本次
-重写保留为现行文本。这些纪律背后的**原则**（正确性先于性能主张、硬件
-数字要有可追溯证据、不能凭空报数字）大概率仍然成立，但具体的 row schema、
-board 列表、runner 命令等全部需要重新设计，不能假设旧文本可以直接照搬
-生效——本模块待新方向的模块 A-D 定型后再展开设计。
+性能只在同一条真实 repro 上、同一目标和同一调用边界下测量。没有真实硬件结果
+就不报告性能；不建立 master/runs/certification 等累计账本。

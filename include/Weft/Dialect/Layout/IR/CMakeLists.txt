@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS LayoutAttrs.td)
+mlir_tablegen(LayoutOpsDialect.h.inc -gen-dialect-decls -dialect=weft_layout)
+mlir_tablegen(LayoutOpsDialect.cpp.inc -gen-dialect-defs -dialect=weft_layout)
+mlir_tablegen(LayoutAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=weft_layout)
+mlir_tablegen(LayoutAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=weft_layout)
+add_public_tablegen_target(MLIRLayoutAttrsIncGen)

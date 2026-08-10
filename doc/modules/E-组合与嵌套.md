@@ -2,13 +2,13 @@
 
 ## 职责
 
-处理结构化原语嵌套时跨层决策的一致性，以及 `I.auto(...)` 不可观察性的
-端到端保持。这是全新难点，旧架构（全部是"叶子"问题类型，从未处理过嵌套
-决策依赖）没有对应设施。
+处理 Weft blocked loop、block tensor、reduce/dot 和 owner group 嵌套时的资源
+一致性。这是全新难点，旧架构（全部是"叶子"问题类型，从未处理过一般 nested
+blocked program）没有对应设施。
 
-典型场景（如 FlashAttention）：外层 `I.parallel(I.partition(...))` 的分块
-决策，与内层 `state_stream` 里嵌套的 `I.contract` 的 LMUL/资源决策不是
-独立的——外层 tile 选大了，会挤爆内层 `contract` 所需的寄存器/scratch
+典型场景（如 FlashAttention）：外层 task/block tile，与内层 state-carry loop
+中嵌套的 `dot` 的 LMUL/资源决策不是独立的——外层 tile 选大了，会挤爆
+内层 `dot` 所需的寄存器/scratch
 预算。模块 D 的推导公式如果只按"单层原语独立求解"设计，无法处理这种
 跨层资源竞争。
 
@@ -16,7 +16,5 @@
 
 - 跨层一致性校验/联合求解的具体机制（自顶向下传递资源预算约束？自底向上
   先求内层需求再约束外层候选集？两者都需要，还是有更好的第三种方式？）；
-- `I.auto(...)` 值（不可被读取/分支/逃逸为可观察结果）如何在模块 D 产出
-  的 Physical Plan 中被机械保证——需要类型系统层面的强制，而不是靠约定/
-  注释（这正是旧架构 `[K-10]` 判据长期靠英文注释维护、而非结构强制的
-  已知痛点，新设计不能重犯）。
+- Weft compile-time meta-parameter、runtime scalar 和 block-tensor extent 如何
+  在类型上区分，避免 tuner 参数进入 runtime algorithm 或 C ABI。

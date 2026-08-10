@@ -10,7 +10,12 @@ add_mlir_library(WeftInitAll
 
   LINK_LIBS PUBLIC
   WeftExecDialect
+  WeftExecutionDialect
+  WeftIMEExecutionDialect
+  WeftKernelDialect
+  WeftLayoutDialect
   WeftPlugin
+  WeftRVVExecutionDialect
   MLIRArithDialect
   MLIRFuncDialect
   MLIRIR

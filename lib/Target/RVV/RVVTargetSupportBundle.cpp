@@ -1,5 +1,7 @@
 #include "Weft/Target/RVV/RVVTargetSupportBundle.h"
+#include "Weft/Target/RVV/SelectedExecutionRVVSource.h"
 
+#include "Weft/Dialect/Execution/IR/ExecutionDialect.h"
 #include "Weft/Plugin/ExtensionBundle.h"
 #include "Weft/Plugin/RVV/RVVArtifactContract.h"
 #include "Weft/Plugin/RVV/RVVExtensionPlugin.h"
@@ -93,8 +95,13 @@ llvm::Error validateRVVExactBodyCandidate(
   return llvm::Error::success();
 }
 
-llvm::Error compileRVVGeneratedSourceToObject(llvm::StringRef source,
-                                              llvm::raw_ostream &os) {
+llvm::Error compileRVVGeneratedSourceToObjectImpl(
+    llvm::StringRef source, llvm::StringRef selectedTarget,
+    llvm::raw_ostream &os) {
+  if (selectedTarget.empty() || selectedTarget.trim() != selectedTarget ||
+      !selectedTarget.starts_with("rv64"))
+    return makeRVVTargetError(
+        "object packaging requires a non-empty selected rv64 target identity");
   llvm::ErrorOr<std::string> clang = llvm::sys::findProgramByName("clang");
   if (!clang)
     clang = llvm::sys::findProgramByName(
@@ -157,15 +164,13 @@ llvm::Error compileRVVGeneratedSourceToObject(llvm::StringRef source,
       return makeRVVTargetError("failed to flush freestanding libm shim");
   }
 
-  // One artifact toolchain contract covers the current RVV bodies. Zvfh is
-  // required by the quantized scale-fold bodies and is harmless for the plain
-  // integer/vector bodies; choosing it here does not select computation.
+  std::string marchArgument = (llvm::Twine("-march=") + selectedTarget).str();
   llvm::SmallVector<llvm::StringRef, 14> args = {
       *clang,
       "-target",
       "riscv64",
       "-O2",
-      "-march=rv64gcv_zvfh",
+      marchArgument,
       "-mabi=lp64d",
       "-isystem",
       libmShimDir.path,
@@ -267,6 +272,34 @@ llvm::Error exportRVVEmitCToCpp(
       module, plugins, os, getRVVArtifactAdapterConfig());
 }
 
+llvm::Error exportSelectedExecutionRVVToCpp(
+    mlir::ModuleOp module, const plugin::ExtensionPluginRegistry &,
+    llvm::raw_ostream &os) {
+  return emitSelectedExecutionRVVSource(module, os);
+}
+
+llvm::Error exportSelectedExecutionRVVObject(
+    mlir::ModuleOp module, const plugin::ExtensionPluginRegistry &,
+    llvm::raw_ostream &os) {
+  std::string source;
+  llvm::raw_string_ostream sourceOS(source);
+  if (llvm::Error error = emitSelectedExecutionRVVSource(module, sourceOS))
+    return error;
+  sourceOS.flush();
+  std::optional<llvm::StringRef> selectedTarget;
+  for (weft::execution::PlanOp plan :
+       module.getOps<weft::execution::PlanOp>()) {
+    if (selectedTarget && *selectedTarget != plan.getTarget())
+      return makeRVVTargetError(
+          "selected RVV object requires every plan to use one target identity");
+    selectedTarget = plan.getTarget();
+  }
+  if (!selectedTarget)
+    return makeRVVTargetError(
+        "selected RVV object requires at least one execution plan");
+  return compileRVVGeneratedSourceToObject(source, *selectedTarget, os);
+}
+
 llvm::Error registerRVVArtifactExporters(
     TargetArtifactExporterRegistry &registry) {
   return registerConstructionTemplateArtifactAdapterExporters(
@@ -275,6 +308,17 @@ llvm::Error registerRVVArtifactExporters(
 }
 
 } // namespace
+
+llvm::Error compileRVVGeneratedSourceToObject(llvm::StringRef source,
+                                              llvm::raw_ostream &os) {
+  return compileRVVGeneratedSourceToObjectImpl(source, "rv64gcv_zvfh", os);
+}
+
+llvm::Error compileRVVGeneratedSourceToObject(llvm::StringRef source,
+                                              llvm::StringRef selectedTarget,
+                                              llvm::raw_ostream &os) {
+  return compileRVVGeneratedSourceToObjectImpl(source, selectedTarget, os);
+}
 
 llvm::Error registerRVVTargetSupportPluginTargetExporterBundles(
     PluginTargetArtifactExporterRegistry &registry) {
@@ -303,13 +347,34 @@ configureRVVTargetSupportExtensionBundle(plugin::ExtensionBundle &bundle) {
 llvm::Error registerRVVTargetSupportTargetTranslateRoutes(
     TargetTranslateRouteRegistry &registry) {
   llvm::StringRef routeID = plugin::rvv::getRVVExactBodyTranslateRouteID();
-  if (registry.lookup(routeID))
-    return llvm::Error::success();
-  return registry.registerRoute(TargetTranslateRoute(
-      routeID,
-      "export an RVV exact typed body through the registered RVV-to-EmitC "
-      "DialectConversion and MLIR EmitC C/C++ emitter",
-      exportRVVEmitCToCpp));
+  if (!registry.lookup(routeID))
+    if (llvm::Error error = registry.registerRoute(TargetTranslateRoute(
+            routeID,
+            "export an RVV exact typed body through the registered RVV-to-EmitC "
+            "DialectConversion and MLIR EmitC C/C++ emitter",
+            exportRVVEmitCToCpp)))
+      return error;
+
+  constexpr llvm::StringLiteral selectedSourceRoute(
+      "weft-rvv-selected-execution-to-cpp");
+  if (!registry.lookup(selectedSourceRoute))
+    if (llvm::Error error = registry.registerRoute(TargetTranslateRoute(
+            selectedSourceRoute,
+            "emit RVV C++ directly from canonical Weft Kernel IR and its "
+            "selected execution/layout plan",
+            exportSelectedExecutionRVVToCpp)))
+      return error;
+
+  constexpr llvm::StringLiteral selectedObjectRoute(
+      "weft-rvv-selected-execution-to-object");
+  if (!registry.lookup(selectedObjectRoute))
+    if (llvm::Error error = registry.registerRoute(TargetTranslateRoute(
+            selectedObjectRoute,
+            "compile selected Weft RVV execution to a RISC-V relocatable object",
+            exportSelectedExecutionRVVObject,
+            /*requiresBinaryStdout=*/true)))
+      return error;
+  return llvm::Error::success();
 }
 
 } // namespace weft::target::rvv

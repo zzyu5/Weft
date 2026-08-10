@@ -92,6 +92,12 @@ llvm::Error registerWeftOptPasses(
   mlir::registerPass([] {
     return weft::transforms::createRVVLowerQuantContractionPass();
   });
+  mlir::registerPass([] {
+    return weft::transforms::createSelectIMEExecutionPass();
+  });
+  mlir::registerPass([] {
+    return weft::transforms::createSelectRISCvExecutionPass();
+  });
   llvm::SmallVector<weft::plugin::SourceFrontDoorPassRegistration, 4>
       sourceFrontDoorPasses;
   if (llvm::Error error =

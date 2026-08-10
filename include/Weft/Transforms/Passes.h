@@ -80,6 +80,8 @@ std::unique_ptr<::mlir::Pass> createMaterializeEmitCLowerableRoutesPass(
     const plugin::ExtensionPluginRegistry &registry);
 std::unique_ptr<::mlir::Pass> createRVVLowerToEmitCPass();
 std::unique_ptr<::mlir::Pass> createRVVLowerQuantContractionPass();
+std::unique_ptr<::mlir::Pass> createSelectIMEExecutionPass();
+std::unique_ptr<::mlir::Pass> createSelectRISCvExecutionPass();
 std::unique_ptr<::mlir::Pass> createCheckExecutionPlanCoherencePass();
 std::unique_ptr<::mlir::Pass> createCheckExecutionPlanCoherencePass(
     const plugin::ExtensionPluginRegistry &plugins,
@@ -87,6 +89,11 @@ std::unique_ptr<::mlir::Pass> createCheckExecutionPlanCoherencePass(
 
 #define GEN_PASS_DECL
 #include "Weft/Transforms/Passes.h.inc"
+
+std::unique_ptr<::mlir::Pass>
+createSelectIMEExecutionPass(SelectIMEExecutionOptions options);
+std::unique_ptr<::mlir::Pass>
+createSelectRISCvExecutionPass(SelectRISCvExecutionOptions options);
 
 #define GEN_PASS_REGISTRATION
 #include "Weft/Transforms/Passes.h.inc"

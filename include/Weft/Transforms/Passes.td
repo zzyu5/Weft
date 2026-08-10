@@ -526,4 +526,71 @@ def RVVLowerQuantContraction
   ];
 }
 
+def SelectRISCvExecution
+    : Pass<"weft-select-riscv-execution", "::mlir::ModuleOp"> {
+  let summary = "Select one compositional RISC-V layout/execution plan from Weft Kernel IR";
+  let description = [{
+    Assigns deterministic source-node indices, derives value-local blocked
+    layouts with one VLA vector axis and ordered serial axes, and selects a legal
+    RVV lane ratio from canonical liveness plus owner-local transient pressure.
+    It selects f32 sum/max/min reductions, bounded vector-exp realization, and
+    verified per-use rematerialization without persisting derived address maps.
+    It never matches
+    kernel names, operator names, old whole-kernel variants or format routes.
+    Only the winner is materialized in weft_execution plus owner-local
+    weft_rvv_execution operations.
+  }];
+  let options = [
+    Option<"target", "target", "std::string", /*default=*/"\"rv64gcv\"",
+           "Selected RV64 target identity containing the V extension.">,
+    Option<"registerBudget", "register-budget", "int64_t", /*default=*/"28",
+           "Vector registers available to selected block values after fixed ABI and mask reserves.">,
+    ListOption<"metaBindings", "meta-bindings", "std::string",
+               "Explicit NAME=POSITIVE_INTEGER bindings for canonical constexpr parameters.">,
+    Option<"blockElements", "block-elements", "int64_t", /*default=*/"0",
+           "Explicit positive uniform value for every canonical constexpr parameter; zero leaves this compatibility shorthand unset.">
+  ];
+  let constructor =
+      "::weft::transforms::createSelectRISCvExecutionPass()";
+  let dependentDialects = [
+    "::weft::kernel::WEFTKernelDialect",
+    "::weft::layout::WEFTLayoutDialect",
+    "::weft::execution::WEFTExecutionDialect",
+    "::weft::rvv_execution::WEFTRVVExecutionDialect"
+  ];
+}
+
+def SelectIMEExecution
+    : Pass<"weft-select-ime-execution", "::mlir::ModuleOp"> {
+  let summary = "Select verified SpacemiT IME fragment tiling from Weft Kernel IR";
+  let description = [{
+    Selects every independent supported signed widening contraction site from
+    canonical SSA, logical extents, masks and pointer expressions. Arbitrary
+    positive logical M/N/K extents are tiled by the selected physical 4x4x8 IME
+    fragment; multiple non-overlapping sites receive independent owner records.
+    The pass never matches a kernel symbol, old variant, format route or named
+    whole-kernel shape. Only final decisions are materialized in weft_execution
+    plus owner-local weft_ime_execution.contract_config records.
+  }];
+  let options = [
+    Option<"target", "target", "std::string",
+           /*default=*/"\"rv64gcv_xsmtvdotii1p0\"",
+           "Selected RV64 target identity carrying xsmtvdotii.">,
+    Option<"vlenBits", "vlen-bits", "int64_t", /*default=*/"0",
+           "IME-only target VLEN capability in bits; the verified fragment path requires 256.">,
+    ListOption<"metaBindings", "meta-bindings", "std::string",
+               "Explicit NAME=POSITIVE_INTEGER bindings for canonical constexpr parameters.">,
+    Option<"blockElements", "block-elements", "int64_t", /*default=*/"0",
+           "Explicit positive uniform value for every canonical constexpr parameter; zero leaves this compatibility shorthand unset.">
+  ];
+  let constructor =
+      "::weft::transforms::createSelectIMEExecutionPass()";
+  let dependentDialects = [
+    "::weft::kernel::WEFTKernelDialect",
+    "::weft::layout::WEFTLayoutDialect",
+    "::weft::execution::WEFTExecutionDialect",
+    "::weft::ime_execution::WEFTIMEExecutionDialect"
+  ];
+}
+
 #endif // WEFT_TRANSFORMS_PASSES_TD

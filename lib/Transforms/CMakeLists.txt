@@ -9,6 +9,8 @@ add_mlir_library(WeftTransforms
   HartParallelCapabilities.cpp
   LoweringBoundary.cpp
   PluginVariantLegality.cpp
+  SelectIMEExecution.cpp
+  SelectRISCvExecution.cpp
   VariantDispatchSynthesis.cpp
   VariantMaterialization.cpp
   VariantSelection.cpp
@@ -20,7 +22,12 @@ add_mlir_library(WeftTransforms
   WeftConversionEmitC
   WeftConversionEmitCBuiltin
   WeftExecDialect
+  WeftExecutionDialect
+  WeftIMEExecutionDialect
+  WeftKernelDialect
+  WeftLayoutDialect
   WeftPlugin
+  WeftRVVExecutionDialect
   WeftSupport
   WeftTarget
   MLIRIR
