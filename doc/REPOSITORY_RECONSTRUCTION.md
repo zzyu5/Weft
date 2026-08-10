@@ -75,6 +75,9 @@ TianchenRV/
 
 ## 6. 新主干的依赖顺序
 
+第一里程碑整体定义见 [`PYTHON_DSL.md`](PYTHON_DSL.md)。它完成全部 Python source surface
+及对应 canonical types/ops/verifier，不包含物理 backend。
+
 ### 6.1 Canonical contract
 
 先建立 worker-local KernelOp、types、VLA region、logical block、predicate/masked value、
@@ -85,7 +88,7 @@ memory/effect 与四类 state semantics。不存在 `task_id/grid_rank` alias。
 抽取 source/AST/generic builder 的机械代码，直接发射 canonical MLIR；不建立第二份长期
 typed Python IR 或 verifier。
 
-### 6.3 Provider 与 selected contract
+### 6.3 第二里程碑：Provider 与 selected contract
 
 先建立 typed target profile、primitive provider interface 和 canonical-anchor selected
 records。Scalar baseline 先证明接口，随后加入一个 RVV VLA pointwise/memory provider。
@@ -97,10 +100,11 @@ header。只抽取旧 toolchain/packaging 机械代码，不接旧 emitter。
 
 ### 6.5 后续能力
 
-上述纵向链闭环后，再按依赖加入 reduce/scan/summary、logical block/contract、IME、AOT
+第二里程碑的 elementwise backend 纵向链闭环后，再为第一里程碑已经定义的
+reduce/scan/summary、logical block/contract 语义补充 providers，并随后加入 IME、AOT
 tuning 和外部 Intent bridge。Compiler 不自动发明 source algorithm variants。
 
-## 7. 首条真实链路
+## 7. 第二里程碑的首条真实链路
 
 ```text
 @weft.kernel worker-local elementwise

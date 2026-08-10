@@ -22,18 +22,16 @@ source/object/static-library/header artifact。
    隔离、当前根结构与下一步实现顺序。
 5. [`materials/README.md`](materials/README.md)：旧代码里哪些内容可抽取、哪些语义禁止复用。
 
-## 下一条实现主线
+## 第一里程碑
 
-第一条新主干只做一个纵向切片：
+第一步直接完成完整 Python reference frontend，并同步完成其 canonical Kernel IR/types/
+verifier。详细边界见 [`doc/PYTHON_DSL.md`](doc/PYTHON_DSL.md)。
 
 ```text
-worker-local Python kernel
-  -> W.vla(begin, end)
-  -> logical predicate + masked load/store
-  -> canonical Kernel IR
-  -> Scalar provider + one RVV provider
-  -> Selected Execution IR
-  -> source/object/C header
+complete Python DSL source
+  -> canonical Kernel MLIR
+  -> independent parse / print / verify
 ```
 
-新代码只能在根目录重新建立，不能调用 `materials/legacy-source/`。
+这一里程碑不做 provider/backend。语言闭环后，第二里程碑才建立 Scalar + RVV 的最小
+可执行纵向链。新代码只能在根目录重新建立，不能调用 `materials/legacy-source/`。

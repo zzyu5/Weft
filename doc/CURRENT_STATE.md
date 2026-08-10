@@ -81,17 +81,19 @@ materials/                只读 donor、历史实验与旧产物
 - source/object/header artifact pipeline；
 - 新语义下的真实 RISC-V repro。
 
-这些能力必须沿一条新纵向链逐步建立，不能用 materials 中的旧命令输出冒充。
+这些能力按“完整 source→canonical 语言闭环”和“最小 executable backend 纵向链”两个
+里程碑建立，不能用 materials 中的旧命令输出冒充。
 
-## 7. 下一实施边界
+## 7. 第一实施边界
 
-第一项实现应同时建立：
+第一里程碑是完整 Python reference frontend + canonical Kernel IR：
 
-1. 新 Kernel dialect 的最小 type/op/verifier；
-2. worker-local KernelOp、`W.vla`、predicate/masked load/store；
-3. Python source→canonical MLIR；
-4. Scalar provider 与一个 RVV VLA memory/pointwise provider；
-5. 最小 Selected Execution records；
-6. source/object/C header 的普通 ABI 链路。
+1. 完整 core type/annotation 与 worker-local KernelOp；
+2. scalar control、`W.vla`、memory/effect、predicate/masked value；
+3. logical block、四类 state semantics、contract 与 numerical attributes；
+4. Python source 直接生成 canonical MLIR；
+5. canonical dialect 独立 parse/print/verify；
+6. 最终规范的六个完整示例全部通过 canonical verifier。
 
-在这条链成立前，不接 GEMM、IME、tuning、Intent bridge 或旧量化格式。
+详细定义见 [`PYTHON_DSL.md`](PYTHON_DSL.md)。在语言闭环前，不接 selected/provider、
+RISC-V emitter、IME、tuning、Intent bridge 或旧量化格式。

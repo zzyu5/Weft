@@ -18,6 +18,8 @@
   边界、三层表示和端到端数据流。
 - [`LANGUAGE_AND_IR.md`](LANGUAGE_AND_IR.md)：Python DSL 到 canonical Kernel IR 的
   合同、VLA/block/predicate/state algebra，以及 canonical/selected verifier 边界。
+- [`PYTHON_DSL.md`](PYTHON_DSL.md)：第一里程碑的完整 Python frontend、canonical dialect、
+  verifier、实现顺序和验收边界。
 - [`PROVIDERS_AND_SELECTION.md`](PROVIDERS_AND_SELECTION.md)：primitive-local provider、
   target facts、compiler/tuner 权限与 Scalar/RVV/IME 组合方式。
 - [`INTEGRATION_AND_ARTIFACTS.md`](INTEGRATION_AND_ARTIFACTS.md)：IntentDSL/其他前端接入、
