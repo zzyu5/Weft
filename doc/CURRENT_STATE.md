@@ -1,99 +1,99 @@
 # 当前仓库状态
 
-> 状态基准：2026-08-10 完成旧树隔离后的工作区。本文陈述当前事实，不定义语言语义。
+> 状态基准：2026-08-10 第一里程碑实现后的工作区。本文只陈述实现与验证事实，不定义
+> Weft 语言语义。
 
-## 1. 当前结论
+## 1. 结论
 
-仓库根已经是干净的重建边界：
+新的活动根已经完成 Python source 到 canonical Kernel MLIR 的语言闭环。它不是旧编译器
+复活，也不是 RISC-V backend 已完成：
 
-- `doc/WEFT_FINAL_SPEC.md` 保留完整规范；
-- `AGENTS.md`、`README.md` 和 `doc/` 是现行工程入口；
-- 根 `CMakeLists.txt` 不读取 materials，也暂不定义 compiler target；
-- 根目录尚无 `include/`、`lib/`、`python/`、`tools/` 或 `examples/` 新主干；
-- 旧源码、实验和 artifacts 均位于 `materials/`；
-- 没有 compatibility layer、fallback 或双主干 build。
+- Python frontend 直接读取 `@weft.kernel` source AST 并生成 generic canonical MLIR；
+- `weft_kernel` dialect 拥有 worker-local ABI、scalar control、VLA、logical block、masked
+  value、memory/effect、state algebra、contract 和 numerical attributes；
+- `weft_ext` sibling dialect 拥有规范示例中的 `block_scaled_contract` 局部语义 primitive；
+- `weft-opt` 独立注册两个 dialect，并负责 parse/print/verify；
+- 六个规范示例均已完成 source→canonical→独立 parse/verify；
+- 活动构建与 import 路径不读取 `materials/` 或 IntentDSL。
 
-因此，当前状态不是“旧 compiler 已被重构完成”，而是“错误骨架已经退出活动依赖图，
-可以从 canonical contract 开始重建”。
+目前尚无 target/provider/selected/artifact 路径，因而没有新的 RISC-V source、object、header
+或目标机数值结果。
 
-## 2. 当前根目录的承重内容
+## 2. 活动根结构
 
 ```text
-AGENTS.md                 开发与边界纪律
-README.md                 项目入口
-CMakeLists.txt            零 target 的新构建根
-doc/                      最终规范、工程解释与重建决策
-materials/                只读 donor、历史实验与旧产物
+AGENTS.md
+CMakeLists.txt
+README.md
+doc/
+include/Weft/Dialect/
+  Kernel/IR/                 canonical core dialect + types/ops
+  Extension/IR/              typed sibling semantic extension
+lib/Dialect/
+python/weft/
+  api/                       AOT kernel definition
+  language/                  public types, annotations and intrinsics
+  frontend/                  source lowering + generic MLIR assembly
+tools/weft-opt/              canonical parse/print/verify driver
+examples/                    six normative source acceptance programs
+materials/                   inactive donor/history/artifacts
 ```
 
-新实现目录会在对应 contract 落地时创建，不提前放空壳或从 materials 软链接回来。
+`build/` 是 ignored 的可重建目录，不是持久表示或 artifact authority。
 
-## 3. Materials 状态
+## 3. 已实现的 source/canonical 能力
 
-| 路径 | 来源 | 是否活动代码 |
+| 领域 | 当前实现 |
+|---|---|
+| Entry/ABI | `@weft.kernel`、scalar/index、qualified pointer、`constexpr` |
+| Scalar control | Python scalar `if`、受限 `while`、`W.range`、SSA carry、helper inlining |
+| VLA | `W.vla(begin,end)`、单一 lexical VLA axis、escape/mutation checks |
+| Memory/validity | load/store/prefetch/atomic/fence、masked value、valid/fill/select |
+| Logical block | block_axis/full/zeros、expand/broadcast/reshape/transpose/slicing sugar |
+| State algebra | reduce、scan、summary_fold；与 sequential carry 分离 |
+| Structured compute | contract、dot、permute、lookup、decode、widen、narrow |
+| Numerics | dtype、acc/out dtype、order、math、rounding、saturation、exceptional policy |
+| Extension | `weft_ext.block_scaled_contract` typed sibling op |
+
+Python 中的 AST、environment、value/type spelling 和 generic Operation/Region node 都只在一次
+lowering 内存在；它们不持久化、不拥有独立 op schema、verifier 或优化 pipeline。Canonical
+TableGen dialect 是唯一算法 schema 与最终 legality authority。
+
+## 4. 已执行的验证
+
+本机使用 LLVM/MLIR 20.1.8 完成：
+
+1. CMake configure；
+2. TableGen 生成 Kernel/Extension dialect；
+3. C++ dialect 与 `weft-opt` 编译链接；
+4. Python package `compileall`；
+5. 六个 `examples/*.py` 分别由 `python -m weft` 生成 MLIR；
+6. 每份结果由新构建的 `weft-opt` parse/print/verify。
+
+验证没有调用 materials 下的旧 binary，也没有建立 pytest/lit/coverage 或兼容矩阵。当前
+结果只证明 source/canonical 边界，不证明 RISC-V lowering、性能或目标机数值正确性。
+
+## 5. Materials 状态
+
+| 路径 | 作用 | 活动依赖 |
 |---|---|---|
-| `materials/legacy-source/` | 旧 CMake、include/lib/python/tools/examples | 否，只读 donor |
-| `materials/experiments/` | 历史量化格式、selector、RVV/IME、板端运行记录 | 否，历史事实 |
-| `materials/artifacts/` | 旧 source/object/header/bundle | 否，不可链接 |
-| `materials/archive-local/` | 原本地 `_attic` | 否，本机 ignored 材料 |
+| `materials/legacy-source/` | 旧 CMake、源码和工具的只读 donor | 无 |
+| `materials/experiments/` | 历史 RVV/IME/量化实验 | 无 |
+| `materials/artifacts/` | 旧 source/object/header/bundle | 无 |
+| `materials/archive-local/` | 本机 ignored 历史材料 | 无 |
 
-详细抽取索引见 [`../materials/README.md`](../materials/README.md)。
-
-## 4. 旧实现为何不能回到根目录
-
-旧实现的根合同与最终规范直接冲突：
-
-| 最终能力 | Donor 实现 | 处置 |
-|---|---|---|
-| worker-local、无 grid | `grid_rank` + `task_id` | schema 重写，不设 alias |
-| 一等 `W.vla(begin,end)` | fixed `arange`/rank block root | 新 structured region |
-| logical validity/masked value | 固定 mask + eager `other` | 新类型与传播语义 |
-| reduce/scan/summary/sequential carry 分离 | reduce 与 block-carried loop 特判 | 新 state algebra |
-| primitive-local providers | whole-kernel RVV/IME selector | 新 provider contract |
-| Scalar/RVV/IME 可组合 | 互斥 target route | primitive 级组合 |
-| selected 只存物理选择 | task/layout whole-scope plan | selected schema 重建 |
-
-这些不是缺少 feature，而是相反的根模型。把 donor target 重新加入 CMake 会立即破坏这次
-边界切换。
-
-## 5. 仍有价值的 donor
-
-可抽取但不可链接的主要资产包括：
-
-- Python source capture、AST location、generic MLIR assembly builder；
-- MLIR TableGen/CMake/dialect registry 机械骨架；
-- RISC-V/RVV target facts、VLEN/SEW/LMUL/resource 解析；
-- RVV intrinsic spelling、masked memory/reduction 叶子；
-- IME fragment/resource arithmetic 与单条 asm helper；
-- source→RISC-V object、header/object/bundle packaging。
-
-每项精确路径和禁止路径都记录在 materials 索引，不在本文重复。
+精确抽取索引和禁区见 [`../materials/README.md`](../materials/README.md)。
 
 ## 6. 尚未实现
 
-当前新主干还没有：
+- typed RISC-V target profile；
+- primitive provider interface 与 candidate discovery；
+- Selected Execution IR；
+- Scalar、RVV、IME realization providers；
+- canonical+selected 到 source/object/header/static library 的 artifact pipeline；
+- build specification、specialization/tuning 与 dispatcher；
+- IntentDSL/其他 frontend 到 canonical Weft IR 的外部 bridge；
+- 新语义主干上的真实 RISC-V 数值与性能结果。
 
-- worker-local KernelOp 与 canonical types；
-- `W.vla`、logical block、masked value、state algebra；
-- Python reference frontend；
-- target profile/provider/Selected Execution IR；
-- Scalar/RVV/IME 新 providers；
-- source/object/header artifact pipeline；
-- 新语义下的真实 RISC-V repro。
-
-这些能力按“完整 source→canonical 语言闭环”和“最小 executable backend 纵向链”两个
-里程碑建立，不能用 materials 中的旧命令输出冒充。
-
-## 7. 第一实施边界
-
-第一里程碑是完整 Python reference frontend + canonical Kernel IR：
-
-1. 完整 core type/annotation 与 worker-local KernelOp；
-2. scalar control、`W.vla`、memory/effect、predicate/masked value；
-3. logical block、四类 state semantics、contract 与 numerical attributes；
-4. Python source 直接生成 canonical MLIR；
-5. canonical dialect 独立 parse/print/verify；
-6. 最终规范的六个完整示例全部通过 canonical verifier。
-
-详细定义见 [`PYTHON_DSL.md`](PYTHON_DSL.md)。在语言闭环前，不接 selected/provider、
-RISC-V emitter、IME、tuning、Intent bridge 或旧量化格式。
+下一步仍应是最终规范定义的第二里程碑最小 executable vertical slice，而不是回填旧 emitter
+或按 kernel/operator 名增加 whole-kernel route。

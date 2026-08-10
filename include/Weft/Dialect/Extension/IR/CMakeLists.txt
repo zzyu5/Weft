@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS ExtensionOps.td)
+mlir_tablegen(ExtensionOpsDialect.h.inc -gen-dialect-decls -dialect=weft_ext)
+mlir_tablegen(ExtensionOpsDialect.cpp.inc -gen-dialect-defs -dialect=weft_ext)
+mlir_tablegen(ExtensionOps.h.inc -gen-op-decls)
+mlir_tablegen(ExtensionOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(WeftExtensionIncGen)

@@ -1,37 +1,53 @@
 # Weft
 
-Weft 是一门面向 RISC-V worker/hart 的高性能 AOT kernel DSL 与编译器。它以
-worker-local 标量控制、VLA iteration region、logical block、state algebra 和可组合的
-primitive realization provider 为核心，生成 Scalar、RVV、IME 及未来扩展的 RISC-V
-source/object/static-library/header artifact。
+Weft 是一门面向 RISC-V worker/hart 的 AOT kernel DSL 与编译器。它以 worker-local 标量
+控制、一维 VLA iteration region、logical block、state algebra 和可组合的 primitive
+realization provider 为核心；它不是计算图编译器，也不把 GPU grid/SIMT 模型搬到 RISC-V。
 
-## 当前仓库状态
+## 当前状态
 
-仓库已经完成重建边界切换：旧编译器、旧 examples、历史实验和旧 artifacts 全部隔离在
-[`materials/`](materials/README.md)。根目录没有活动的旧源码，也没有兼容入口；新的
-`CMakeLists.txt` 可以独立配置，但在 canonical IR 合同落地前故意不定义编译 target。
+仓库已经完成净室重建的第一里程碑：
 
-这意味着当前仓库是“准备开始新实现”的干净骨架，不是一个已经可用的 compiler。
+```text
+Python @weft.kernel source
+  -> canonical weft_kernel / weft_ext MLIR
+  -> registered MLIR parse + print + verify
+```
+
+活动根包含新的 Python reference frontend、canonical Kernel/Extension dialect、独立
+`weft-opt` 和最终规范的六个 source examples。旧编译器、历史实验与旧 artifacts 仍被硬
+隔离在 [`materials/`](materials/README.md)，不进入 CMake、Python import、链接或运行时。
+
+这一里程碑只完成语言与 canonical IR 闭环。仓库目前没有 Selected Execution IR、target
+profile、Scalar/RVV/IME provider、RISC-V source/object/header artifact 或 IntentDSL bridge；
+因此不能把当前结果描述成已经可执行的 RISC-V kernel compiler。
+
+## 构建与最小使用
+
+当前开发环境使用 LLVM/MLIR 20：
+
+```bash
+cmake -S . -B build \
+  -DMLIR_DIR=/usr/lib/llvm-20/lib/cmake/mlir \
+  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+cmake --build build --target weft-opt
+```
+
+将一个 Python kernel 降到 canonical MLIR，并由独立方言解析与验证：
+
+```bash
+PYTHONPATH=python python3 -m weft examples/01_add_bias.py \
+  | build/tools/weft-opt/weft-opt
+```
+
+`python -m weft SOURCE --kernel NAME` 可在一个 source 文件含多个 kernel 时选择入口。
+Kernel definition 是 AOT source object，不能作为普通 Python 函数 eager 调用。
 
 ## 阅读顺序
 
-1. [`doc/WEFT_FINAL_SPEC.md`](doc/WEFT_FINAL_SPEC.md)：语言和编译器的唯一规范性设计。
-2. [`doc/README.md`](doc/README.md)：现行工程文档索引与权威关系。
-3. [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md)：worker-local、VLA、block、state 与三层表示。
-4. [`doc/REPOSITORY_RECONSTRUCTION.md`](doc/REPOSITORY_RECONSTRUCTION.md)：已经完成的仓库
-   隔离、当前根结构与下一步实现顺序。
-5. [`materials/README.md`](materials/README.md)：旧代码里哪些内容可抽取、哪些语义禁止复用。
-
-## 第一里程碑
-
-第一步直接完成完整 Python reference frontend，并同步完成其 canonical Kernel IR/types/
-verifier。详细边界见 [`doc/PYTHON_DSL.md`](doc/PYTHON_DSL.md)。
-
-```text
-complete Python DSL source
-  -> canonical Kernel MLIR
-  -> independent parse / print / verify
-```
-
-这一里程碑不做 provider/backend。语言闭环后，第二里程碑才建立 Scalar + RVV 的最小
-可执行纵向链。新代码只能在根目录重新建立，不能调用 `materials/legacy-source/`。
+1. [`doc/WEFT_FINAL_SPEC.md`](doc/WEFT_FINAL_SPEC.md)：语言与完整编译器的唯一规范性设计。
+2. [`doc/CURRENT_STATE.md`](doc/CURRENT_STATE.md)：已实现、已验证和尚未实现的精确边界。
+3. [`doc/PYTHON_DSL.md`](doc/PYTHON_DSL.md)：第一里程碑 source surface、canonical schema
+   与验收记录。
+4. [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md)：worker-local、VLA、block、state 与三层表示。
+5. [`materials/README.md`](materials/README.md)：donor 中可抽取与禁止复用的内容。

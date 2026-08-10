@@ -24,8 +24,8 @@
 | `_attic/` | `materials/archive-local/` | 本机 ignored 历史材料 |
 | `build/`、旧 `artifacts/tmp/` | 系统回收站 | 纯派生物，可重建 |
 
-根目录随后创建了全新的 `CMakeLists.txt`。它不查找 LLVM/MLIR、不添加 subdirectory、
-不读取 materials，并明确输出当前没有 compiler targets。
+根目录随后创建了全新的、零旧依赖的 `CMakeLists.txt`。第一里程碑已经在该根中加入
+LLVM/MLIR 20、TableGen、canonical dialect 与 `weft-opt` targets；它始终不读取 materials。
 
 ## 3. 为什么保留最终规范
 
@@ -47,8 +47,13 @@
 TianchenRV/
 ├── AGENTS.md
 ├── README.md
-├── CMakeLists.txt                 # 新根；当前零 target
+├── CMakeLists.txt                 # 新根；只构建新 canonical dialect/tool
 ├── doc/                           # 最终规范与现行工程文档
+├── include/Weft/Dialect/          # 新 Kernel + Extension TableGen schema
+├── lib/Dialect/                   # 新 canonical verifier 实现
+├── python/weft/                   # 新 reference frontend
+├── tools/weft-opt/                # canonical parse/print/verify
+├── examples/                      # 六个规范 source acceptance
 └── materials/
     ├── README.md                  # 抽取索引与禁区
     ├── legacy-source/             # 旧实现，保持原相对路径
@@ -57,8 +62,8 @@ TianchenRV/
     └── archive-local/             # 本机 ignored，可不存在
 ```
 
-未来的 `include/`、`lib/`、`python/`、`tools/` 和 `examples/` 只在新实现真正需要时创建。
-不使用 `weft-next/`、版本化目录、软链接或双 build root。
+上述活动目录均由第一里程碑按需创建，不从 materials 软链接或 import。项目不使用
+`weft-next/`、版本化目录、软链接或双 build root。
 
 ## 5. Materials 硬隔离
 
@@ -75,18 +80,18 @@ TianchenRV/
 
 ## 6. 新主干的依赖顺序
 
-第一里程碑整体定义见 [`PYTHON_DSL.md`](PYTHON_DSL.md)。它完成全部 Python source surface
+第一里程碑整体定义见 [`PYTHON_DSL.md`](PYTHON_DSL.md)。它已经完成 Python source surface
 及对应 canonical types/ops/verifier，不包含物理 backend。
 
 ### 6.1 Canonical contract
 
-先建立 worker-local KernelOp、types、VLA region、logical block、predicate/masked value、
+已建立 worker-local KernelOp、types、VLA region、logical block、predicate/masked value、
 memory/effect 与四类 state semantics。不存在 `task_id/grid_rank` alias。
 
 ### 6.2 Reference frontend
 
-抽取 source/AST/generic builder 的机械代码，直接发射 canonical MLIR；不建立第二份长期
-typed Python IR 或 verifier。
+新 frontend 使用 source/AST 与 generic one-way assembly builder 直接发射 canonical MLIR；
+不建立第二份长期 typed Python IR 或 verifier。
 
 ### 6.3 第二里程碑：Provider 与 selected contract
 

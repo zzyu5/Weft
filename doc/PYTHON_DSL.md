@@ -1,11 +1,12 @@
 # 第一里程碑：完整 Python DSL 与 Canonical Kernel IR
 
-> 本文定义第一项实现工作的工程边界。语言语义仍以 `WEFT_FINAL_SPEC.md` 为唯一权威。
+> 本文定义并记录第一项实现工作的工程边界。该里程碑已经落地；语言语义仍以
+> `WEFT_FINAL_SPEC.md` 为唯一权威。
 
 ## 1. 裁决
 
-第一里程碑直接完成完整的 Weft Python reference frontend，但“完整 Python DSL”必须同时
-包含与它一一对应的 canonical Kernel dialect、types 和 verifier：
+第一里程碑已经完成完整的 Weft Python reference frontend；“完整 Python DSL”同时包含
+与它一一对应的 canonical Kernel dialect、types 和 verifier：
 
 ```text
 Python source
@@ -46,6 +47,17 @@ Python source
    或 instruction spelling。
 
 “完整”只表示 source→canonical 的语言闭环，不表示已经能生成 RISC-V object。
+
+### 3.1 当前实现证据
+
+- `python/weft/`：AOT definition、public language、source compiler 与 generic assembly builder；
+- `include/Weft/Dialect/{Kernel,Extension}/IR/`：TableGen schema；
+- `lib/Dialect/{Kernel,Extension}/IR/`：canonical verifier；
+- `tools/weft-opt/`：独立方言注册、parse、print、verify；
+- `examples/01_*.py` 至 `06_*.py`：六个规范程序。
+
+本机 LLVM/MLIR 20.1.8 已完成 CMake/TableGen/C++ build；六个示例均由活动 Python package
+生成 MLIR，并由活动 `weft-opt` 独立解析与验证。没有使用 materials 中的旧 executable。
 
 ## 4. Public Python surface
 
@@ -145,27 +157,35 @@ saturation/wrap 和适用的 exceptional-value policy。`W.dot` 必须统一 low
 
 ### 4.8 Extension surface
 
-第一里程碑需要一个 typed local semantic extension 注册机制，并至少让规范中的
+第一里程碑已经通过 dialect registry 装载 typed local semantic extension，并让规范中的
 `W.block_scaled_contract` 示例形成独立 sibling canonical op。它验证 extension 可以增加
-局部新语义，但不能注册 whole-kernel/operator API。
+局部新语义，但不能注册 whole-kernel/operator API 或只有 Python callback 的无 schema op。
 
-## 5. 编码开始时必须闭合的合同空白
+## 5. 当前 Python signature ↔ canonical 裁决
 
-最终规范已经确定语义骨架，但有几处只给出可选形式或概念 API。第一批实现提交必须先把
-它们整理成逐项的 Python signature ↔ canonical type/op/region ledger，并把涉及 observable
-semantics 的结论回写最终规范：
+以下是最终规范允许工程选择之处的当前实现事实，不构成第二份语言规范：
 
-- pointer qualifier 的确切 Python typing 形式；
-- 选择 `W.while_`、受限 Python `while`，或明确两者的唯一 canonical lowering；
-- effectful helper 的声明语法与 effect set；
-- examples 使用但 API 汇总未枚举的 cast、tuple、maximum、exp、rsqrt、negative infinity；
-- `permute/lookup/decode/widen/narrow` 的精确 signatures、shape/type/effect contract；
-- masked value 和 tuple/state 的 canonical type 形态；
-- sibling semantic dialect 的 Python 注册与装载接口。
+| Source surface | Canonical 形态 |
+|---|---|
+| `W.ptr[T, W.readonly/writeonly, W.noalias, W.aligned(N), W.restrict, W.address_space(S)]` | `!weft_kernel.ptr` 保存 element/address/access/noalias/alignment/restrict-like |
+| `W.constexpr[T]` | ABI 使用 `!weft_kernel.constexpr<T>`；body 由 `meta_value` 显式物化 specialization value |
+| Python scalar `if` / 受限 `while` / `W.range` | `weft_kernel.if` / `while` / `for`，全部使用显式 SSA carry region |
+| `@W.pure` | helper AST 在使用点或 state region 内联；不得产生 effect |
+| `@W.helper(effects=(...))` | effect set 只允许 `read/write/atomic/fence`；helper 内联后保留真实 canonical effect ops |
+| `W.load(..., other=W.invalid)` | `!weft_kernel.masked<value-type>`；显式 `other` 返回普通 value |
+| `W.tuple` 与 destructuring | `!weft_kernel.tuple<[...]>` + `tuple`/`tuple_get` |
+| `W.cast/maximum/minimum/exp/exp2/log/rsqrt/neg_inf` | typed pointwise、math 或 special-value canonical op |
+| `W.permute(value, permutation)` | `weft_kernel.permute`，与 block transform `transpose` 分开命名 |
+| `W.lookup(table, indices, *, where=True)` | validity-aware typed `weft_kernel.lookup` |
+| `W.decode(codes, table, *, where=True, out_dtype=...)` | typed `weft_kernel.decode`，输出 dtype 显式保存 |
+| `W.widen(value, dtype)` | `weft_kernel.widen` |
+| `W.narrow(value, dtype, *, rounding="rne", saturation=False)` | `weft_kernel.narrow` 保存 rounding/saturation |
+| `W.block_scaled_contract(...)` | 已注册的 sibling `weft_ext.block_scaled_contract`；不是普通 contract provider alias |
 
-这不是额外的规划阶段，而是完整 DSL 实现的第一部分。规范未闭合的 API 不允许先放一个
-stub，也不允许由 Python compiler 和 C++ verifier 各自猜一套。规范明确允许实现选择的
-地方可以作工程裁决；会改变 source-observable semantics 的地方必须先由用户确认。
+Python compiler 与 C++ dialect 不各自维护 op schema：Python 只保存一次 lowering 所需的
+type spelling/shape facts 并打印 generic op；TableGen schema 和 C++ verifier 决定最终合法性。
+新的 semantic extension 必须先增加并注册 sibling canonical dialect/op，不能只注册一个
+Python 回调或 whole-kernel 名称。
 
 ## 6. Canonical dialect 必须同期完成的内容
 
@@ -233,18 +253,21 @@ python/weft/
   language/
   frontend/
   diagnostics.py
+  __main__.py                  # source -> canonical MLIR AOT entry
 
 include/Weft/Dialect/Kernel/IR/
 lib/Dialect/Kernel/IR/
+include/Weft/Dialect/Extension/IR/
+lib/Dialect/Extension/IR/
 tools/weft-opt/                 # parse/print/verify canonical IR
 examples/                       # 规范示例的 source acceptance
 ```
 
 不创建 `Execution`、RVV、IME、artifact 或 Intent 目录的空壳。
 
-## 9. 实现顺序
+## 9. 已执行的实现依赖顺序
 
-1. 建立 Python signature ↔ canonical schema ledger，闭合第 5 节列出的合同空白；
+1. 建立 Python signature ↔ canonical schema ledger，闭合第 5 节列出的工程选择；
 2. CMake/TableGen/dialect registration、source locations、core scalar/index/pointer/constexpr types；
 3. `@weft.kernel`、ABI annotations、constants、expressions、scalar control；
 4. VLA region、logical predicate、masked memory 和 effects；
@@ -255,8 +278,8 @@ examples/                       # 规范示例的 source acceptance
 9. 六个规范示例全部 lower→parse→verify；
 10. 对规范 verifier 义务做少量直接诊断 repro，不建立测试矩阵。
 
-顺序只表示依赖关系。某一项完成时，Python API、canonical schema 和 verifier 必须一起
-落地，不能先堆完整 API stub。
+该顺序只记录依赖关系。各项均由 Python API、canonical schema 和 verifier 同期落地，
+没有保留 placeholder API 或旧 fallback。
 
 ## 10. Donor 复用
 
@@ -282,7 +305,7 @@ typed Python IR 作为 authority，或任何从活动 Python package import mate
 
 ## 11. 验收
 
-使用 `WEFT_FINAL_SPEC.md` 第 23 节的六个完整程序作为固定 acceptance：
+已经使用 `WEFT_FINAL_SPEC.md` 第 23 节的六个完整程序作为固定 acceptance：
 
 1. elementwise add-bias；
 2. RMSNorm worker；
@@ -291,8 +314,8 @@ typed Python IR 作为 authority，或任何从活动 Python package import mate
 5. worker-local blocked GEMM；
 6. semantic extension primitive。
 
-验收终点是这些 source 生成的 canonical MLIR 能被独立 `weft-opt` parse/print/verify，并且
-非法语义明确失败。第一里程碑不以 RISC-V source/object 或性能数字作为完成条件。
+六份 source 已生成 canonical MLIR，并被独立 `weft-opt` parse/print/verify。第一里程碑
+仍不以 RISC-V source/object 或性能数字作为完成条件；这些产物目前也尚未实现。
 
 ## 12. 第二里程碑
 
