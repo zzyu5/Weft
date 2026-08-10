@@ -5,8 +5,8 @@
 - 根目录 [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md) 是 Weft 语言、IR、provider、
   lowering 与 artifact 的唯一规范性设计。
 - `doc/` 是工程解释、现状审计和重建决策，不得另立语义，不得覆盖规范。
-- 当前源码只说明“旧实现现在做了什么”，不说明“最终设计应该是什么”。源码、注释、
-  旧提交或辅助文档与最终规范冲突时，以最终规范为准。
+- `materials/legacy-source/` 只说明旧实现做过什么，不说明最终设计应该是什么。旧源码、
+  注释、提交或辅助文档与最终规范冲突时，以最终规范为准。
 - 不保留旧设计的兼容语义、弃用期或双轨入口；历史由 Git 保存。
 
 ## 2. 项目定位
@@ -66,13 +66,11 @@ Weft core 不解析 `intent.*`，不链接 IntentDSL，也不反向调用上游�
 
 ## 5. 仓库重建边界
 
-当前源码树是 donor，不是最终骨架。工程决策见
-[`doc/REPOSITORY_RECONSTRUCTION.md`](doc/REPOSITORY_RECONSTRUCTION.md)：在同一 Git
-仓库内建立全新的根骨架，不在现有 grid/task 主干上渐进修补，也不立即拆成新仓库。
+旧实现已经隔离到 `materials/`，根目录是全新的重建边界。工程状态见
+[`doc/REPOSITORY_RECONSTRUCTION.md`](doc/REPOSITORY_RECONSTRUCTION.md)，可复用资产见
+[`materials/README.md`](materials/README.md)。此后必须遵守：
 
-执行重建时必须遵守：
-
-- 先把旧实现整体隔离到 `materials/legacy-source/`，再在根目录建立新的独立依赖图；
+- 新实现只在根目录建立独立依赖图；不得把文件移回旧位置作为捷径；
 - `materials/` 永远不进入 CMake、include path、Python package path、链接、安装或运行时；
 - 复用的含义是阅读并把最小代码/硬件知识抽取到新接口下，不是调用、包装或链接旧路径；
 - 不建 compatibility layer，不让新旧主干并行可达，不用 feature flag 切回旧实现；

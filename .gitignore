@@ -1,49 +1,26 @@
+# Python and editor-local state
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-build/
-build/*/
-build-ime-bridge/
-build-weft/
-cmake-build-*/
-dist/
 *.egg-info/
+/.claude/settings.local.json
+/.claude/worktrees/
 
-# parallel work-line infra (see docs/method/parallel-build-and-baseline.md):
-#   .worktrees/<line>/        — per-line isolated worktree (branched from HEAD)
-#   .worktrees/<line>/build/  — that line's independent CMakeCache
-#   .worktrees/baseline-<sha> — detached base worktree for byte-exact (transient)
-#   .worktrees/cache/<sha>/   — cached pinned-base build products (idempotent)
-# All local, never committed. tools/bench/byte-exact-baseline.sh replaces the
-# global `git stash` baseline so parallel lines are not clobbered.
-.worktrees/
-
-artifacts/tmp/
+# Rebuildable outputs
+/build/
+/build-*/
+/build-demo/
+/cmake-build-*/
+/dist/
 *.log
-# 大重构 §3.2 单一目的地法:运行台账是【耐久】证据(每次调用一行 run-id·时间·格·结果|VOID),
-# 必须随仓分发 —— fresh-clone 拿不到台账 = run-id 无落脚处。豁免必须在 *.log 之后。
-!experiments/runs.log
 
+# Local parallel worktrees
+/.worktrees/
 
-.claude/settings.local.json
-/artifacts/p-a-fair-three-way/*/gen/
-/artifacts/p-a-fair-three-way/*/harness.c
-.claude/worktrees/
-
-# on-device measurement raw artifacts (kernels/objs/logs) — data, not source
-# (moved 2026-07-06 org STAGE1: experiments/ondevice-*/ -> experiments/archive/perf-historical/ondevice-*/)
-experiments/archive/perf-historical/ondevice-*/
-
-# gitignored diagnostic scratch (org STAGE1 target structure)
-scratch/
-
-# touch-set active-line marker — per-worktree, not shared (see .touch-set/README.md)
-.touch-set/ACTIVE
-build-demo/
-
-# 大重构 §4.1: 归档区(移入而非删除);索引 _attic/ATTIC_INDEX.md 本身在库内
-_attic/*
-!_attic/ATTIC_INDEX.md
+# Read-only historical materials. Existing tracked files remain tracked; new
+# local captures are intentionally not admitted into the new source tree.
+/materials/archive-local/
+/materials/experiments/**
+/materials/artifacts/**
