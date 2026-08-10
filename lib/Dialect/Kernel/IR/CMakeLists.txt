@@ -6,4 +6,5 @@ add_mlir_dialect_library(WeftKernelDialect
 
   LINK_LIBS PUBLIC
   MLIRIR
+  MLIRSideEffectInterfaces
 )

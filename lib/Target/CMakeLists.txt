@@ -1,0 +1,1 @@
+add_library(WeftRISCVTarget STATIC RISCVTargetProfile.cpp)

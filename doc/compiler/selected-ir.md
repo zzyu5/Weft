@@ -41,16 +41,23 @@ Selected IR 禁止复制：
 概念记录：
 
 ```text
+weft_execution.plan
 weft_execution.meta_binding
-weft_execution.vla_plan
+weft_execution.axis_plan
 weft_execution.memory_plan
 weft_execution.reduce_plan
 weft_execution.scan_plan
 weft_execution.summary_plan
 weft_execution.contract_plan
+weft_execution.math_plan
+weft_execution.primitive_plan
 weft_execution.scratch_plan
 weft_execution.specialization
 ```
+
+`axis_plan` 可以引用 canonical VLA axis 或 logical block axis；它只保存 Scalar/RVV、SEW、
+LMUL 与 unroll 等物理选择，不复制 logical extent 或 axis role。`plan` 同时绑定唯一 canonical
+kernel symbol 与静态 target profile facts，使 emitter 不需要第三个事实来源。
 
 Extension provider 可以定义 sibling selected op，但必须实现统一 selected-provider interface，并只引用 canonical anchor。
 
