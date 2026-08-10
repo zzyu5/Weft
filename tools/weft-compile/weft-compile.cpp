@@ -3,6 +3,7 @@
 #include "Weft/Dialect/Extension/IR/ExtensionDialect.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Target/RISCVTargetProfile.h"
+#include "Weft/Target/SourceEmitter.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -23,7 +24,7 @@ llvm::cl::opt<std::string> inputFilename(
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
 llvm::cl::opt<std::string> emitKind(
-    "emit", llvm::cl::desc("canonical-mlir or selected-mlir"),
+    "emit", llvm::cl::desc("canonical-mlir, selected-mlir, or source"),
     llvm::cl::init("selected-mlir"));
 llvm::cl::opt<std::string> march("march", llvm::cl::desc("RISC-V ISA string"));
 llvm::cl::opt<std::string> abi("abi", llvm::cl::desc("RISC-V ABI"));
@@ -56,7 +57,8 @@ bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
 
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv, "Weft RISC-V kernel compiler\n");
-  if (emitKind != "canonical-mlir" && emitKind != "selected-mlir") {
+  if (emitKind != "canonical-mlir" && emitKind != "selected-mlir" &&
+      emitKind != "source") {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
   }
@@ -79,7 +81,7 @@ int main(int argc, char **argv) {
   if (!module || mlir::failed(mlir::verify(*module)))
     return 1;
 
-  if (emitKind == "selected-mlir") {
+  if (emitKind == "selected-mlir" || emitKind == "source") {
     weft::RISCVTargetProfile target;
     std::string error;
     if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, target, error)) {
@@ -101,8 +103,13 @@ int main(int argc, char **argv) {
     llvm::errs() << "cannot open output: " << errorCode.message() << "\n";
     return 1;
   }
-  module->print(output.os());
-  output.os() << '\n';
+  if (emitKind == "source") {
+    if (mlir::failed(weft::emitSelectedSource(*module, output.os())))
+      return 1;
+  } else {
+    module->print(output.os());
+    output.os() << '\n';
+  }
   output.keep();
   return 0;
 }
