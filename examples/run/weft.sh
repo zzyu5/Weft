@@ -103,7 +103,8 @@ tar -C "${local_root}" -cf - . |
         -Dggml_source_${kernel}=${kernel} -c leaf/runtime.c -o runtime.o
       g++ kernel.o runtime.o -lm -o weft_runtime
     else
-      g++ -O2 -std=c++17 -Wall -Wextra -Werror \
+      clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
+        -march=rv64gcv -mabi=lp64d \
         kernel.cpp runtime.cpp -lm -o weft_runtime
     fi
     ./weft_runtime

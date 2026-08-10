@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -182,7 +183,7 @@ public:
   }
 
   mlir::LogicalResult emit() {
-    if (mlir::failed(requireScalarPlan()))
+    if (mlir::failed(requireSupportedPlan()))
       return mlir::failure();
 
     mlir::Block &body = kernel.getBody().front();
@@ -259,16 +260,13 @@ private:
     return found->second;
   }
 
-  mlir::LogicalResult requireScalarPlan() {
+  mlir::LogicalResult requireSupportedPlan() {
     for (mlir::Operation &record : plan.getBody().front().without_terminator()) {
       if (mlir::isa<MetaBindingOp>(record))
         continue;
       if (auto provider = record.getAttrOfType<mlir::StringAttr>("provider");
-          !provider || provider.getValue() != "scalar")
-        return record.emitError("C++ source emitter requires an explicitly selected scalar provider");
-      if (auto axis = mlir::dyn_cast<AxisPlanOp>(record);
-          axis && axis.getRealization() != "scalar")
-        return axis.emitError("C++ source emitter requires scalar axis realization");
+          !provider || (provider.getValue() != "scalar" && provider.getValue() != "rvv"))
+        return record.emitError("C++ source emitter received an unknown selected provider");
     }
     return mlir::success();
   }
@@ -288,7 +286,8 @@ private:
       return operation->emitError("has no selected realization record");
     auto provider = record->getAttrOfType<mlir::StringAttr>("provider");
     auto selected = record->getAttrOfType<mlir::StringAttr>("strategy");
-    if (!provider || provider.getValue() != "scalar" || !selected ||
+    llvm::StringRef expectedProvider = strategy.starts_with("rvv_") ? "rvv" : "scalar";
+    if (!provider || provider.getValue() != expectedProvider || !selected ||
         selected.getValue() != strategy)
       return operation->emitError()
              << "source emitter does not implement selected realization "
@@ -550,6 +549,11 @@ private:
   }
 
   mlir::LogicalResult emitVLA(VLAOp op) {
+    auto axis = mlir::dyn_cast_or_null<AxisPlanOp>(recordFor(op));
+    if (!axis)
+      return op.emitError("VLA has no selected axis realization");
+    if (axis.getProvider() == "rvv")
+      return emitRVVVLA(op, axis);
     if (mlir::failed(requireScalarAxis(op)))
       return mlir::failure();
     mlir::Block &body = op.getBody().front();
@@ -605,7 +609,8 @@ private:
         if (mlir::failed(emitOperation(&operation)))
           return mlir::failure();
       ValueInfo finalized = lookup(mlir::cast<YieldOp>(finalize.getTerminator()).getOperand(0));
-      line(aggregate.value + " = " + finalized.value + ";");
+      if (aggregate.value != finalized.value)
+        line(aggregate.value + " = " + finalized.value + ";");
       --indent;
       line("}");
     }
@@ -616,6 +621,164 @@ private:
       info.type = result.getType();
       values[result] = info;
     }
+    return mlir::success();
+  }
+
+  struct RVVInfo {
+    enum class Kind { Coordinate, Pointer, Vector } kind;
+    mlir::Type type;
+    std::string value;
+  };
+
+  mlir::LogicalResult emitRVVVLA(VLAOp op, AxisPlanOp axis) {
+    if (axis.getRealization() != "rvv" || axis.getSew() != 32 ||
+        axis.getLmul() != "m1" || op.getNumResults() != 0)
+      return op.emitError("RVV VLA provider implements outputless e32m1 strips");
+    mlir::Block &body = op.getBody().front();
+    llvm::DenseMap<mlir::Value, RVVInfo> rvvValues;
+    std::string lane = "__weft_rvv_i" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    line("for (std::size_t " + lane + " = " + lookup(op.getBegin()).value +
+         "; " + lane + " < " + lookup(op.getEnd()).value + ";) {");
+    ++indent;
+    line("const std::size_t " + vl + " = __riscv_vsetvl_e32m1(" +
+         lookup(op.getEnd()).value + " - " + lane + ");");
+    rvvValues[body.getArgument(0)] =
+        RVVInfo{RVVInfo::Kind::Coordinate, body.getArgument(0).getType(), lane};
+
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (mlir::isa<ConstantOp, InvalidOp>(nested)) {
+        if (mlir::failed(emitOperation(&nested)))
+          return mlir::failure();
+        continue;
+      }
+      if (auto pointer = mlir::dyn_cast<PtrAddOp>(nested)) {
+        if (mlir::isa<RegionType>(unwrapMasked(pointer.getResult().getType()))) {
+          auto coordinate = rvvValues.find(pointer.getOffset());
+          ValueInfo base = lookup(pointer.getBase());
+          if (coordinate == rvvValues.end() ||
+              coordinate->second.kind != RVVInfo::Kind::Coordinate ||
+              base.value.empty() || base.isShaped())
+            return pointer.emitError("RVV unit-stride pointer must be scalar base plus VLA coordinate");
+          rvvValues[pointer.getResult()] =
+              RVVInfo{RVVInfo::Kind::Pointer, pointer.getResult().getType(),
+                      "(" + base.value + " + " + lane + ")"};
+        } else if (mlir::failed(emitOperation(&nested))) {
+          return mlir::failure();
+        }
+        continue;
+      }
+      if (auto binary = mlir::dyn_cast<BinaryOp>(nested)) {
+        if (mlir::isa<RegionType>(unwrapMasked(binary.getResult().getType()))) {
+          if (mlir::failed(emitRVVBinary(binary, rvvValues, vl)))
+            return mlir::failure();
+        } else if (mlir::failed(emitOperation(&nested))) {
+          return mlir::failure();
+        }
+        continue;
+      }
+      if (auto load = mlir::dyn_cast<LoadOp>(nested)) {
+        if (mlir::failed(emitRVVLoad(load, rvvValues, vl)))
+          return mlir::failure();
+        continue;
+      }
+      if (auto store = mlir::dyn_cast<StoreOp>(nested)) {
+        if (mlir::failed(emitRVVStore(store, rvvValues, vl)))
+          return mlir::failure();
+        continue;
+      }
+      return nested.emitError("selected RVV VLA contains an unsupported primitive");
+    }
+    line(lane + " += " + vl + ";");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitRVVLoad(LoadOp op,
+                                  llvm::DenseMap<mlir::Value, RVVInfo> &rvvValues,
+                                  llvm::StringRef vl) {
+    if (mlir::failed(requireStrategy(op, "rvv_unit_stride")))
+      return mlir::failure();
+    auto pointer = rvvValues.find(op.getPointer());
+    if (pointer == rvvValues.end() ||
+        pointer->second.kind != RVVInfo::Kind::Pointer ||
+        !elementType(op.getResult().getType()).isF32())
+      return op.emitError("RVV unit-stride load requires a region f32 pointer");
+    std::string name = fresh("rvv");
+    line("vfloat32m1_t " + name + " = __riscv_vle32_v_f32m1(" +
+         pointer->second.value + ", " + vl.str() + ");");
+    rvvValues[op.getResult()] =
+        RVVInfo{RVVInfo::Kind::Vector, op.getResult().getType(), name};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitRVVBinary(
+      BinaryOp op, llvm::DenseMap<mlir::Value, RVVInfo> &rvvValues,
+      llvm::StringRef vl) {
+    auto lhsVector = rvvValues.find(op.getLhs());
+    auto rhsVector = rvvValues.find(op.getRhs());
+    bool lhsIsVector = lhsVector != rvvValues.end() &&
+                       lhsVector->second.kind == RVVInfo::Kind::Vector;
+    bool rhsIsVector = rhsVector != rvvValues.end() &&
+                       rhsVector->second.kind == RVVInfo::Kind::Vector;
+    if (!lhsIsVector && !rhsIsVector)
+      return op.emitError("RVV pointwise operation has no vector operand");
+    ValueInfo lhsScalar = lookup(op.getLhs());
+    ValueInfo rhsScalar = lookup(op.getRhs());
+    std::string lhs = lhsIsVector ? lhsVector->second.value : lhsScalar.value;
+    std::string rhs = rhsIsVector ? rhsVector->second.value : rhsScalar.value;
+    if (lhs.empty() || rhs.empty())
+      return op.emitError("RVV pointwise operand is unavailable");
+
+    std::string intrinsic;
+    llvm::StringRef kind = op.getKind();
+    if (lhsIsVector && rhsIsVector) {
+      intrinsic = llvm::StringSwitch<std::string>(kind)
+                      .Case("add", "__riscv_vfadd_vv_f32m1")
+                      .Case("sub", "__riscv_vfsub_vv_f32m1")
+                      .Case("mul", "__riscv_vfmul_vv_f32m1")
+                      .Case("div", "__riscv_vfdiv_vv_f32m1")
+                      .Default("");
+    } else if (lhsIsVector) {
+      intrinsic = llvm::StringSwitch<std::string>(kind)
+                      .Case("add", "__riscv_vfadd_vf_f32m1")
+                      .Case("sub", "__riscv_vfsub_vf_f32m1")
+                      .Case("mul", "__riscv_vfmul_vf_f32m1")
+                      .Case("div", "__riscv_vfdiv_vf_f32m1")
+                      .Default("");
+    } else {
+      intrinsic = llvm::StringSwitch<std::string>(kind)
+                      .Case("add", "__riscv_vfadd_vf_f32m1")
+                      .Case("mul", "__riscv_vfmul_vf_f32m1")
+                      .Case("sub", "__riscv_vfrsub_vf_f32m1")
+                      .Case("div", "__riscv_vfrdiv_vf_f32m1")
+                      .Default("");
+      std::swap(lhs, rhs);
+    }
+    if (intrinsic.empty())
+      return op.emitError("RVV pointwise provider does not implement binary kind");
+    std::string name = fresh("rvv");
+    line("vfloat32m1_t " + name + " = " + intrinsic + "(" + lhs + ", " +
+         rhs + ", " + vl.str() + ");");
+    rvvValues[op.getResult()] =
+        RVVInfo{RVVInfo::Kind::Vector, op.getResult().getType(), name};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitRVVStore(
+      StoreOp op, llvm::DenseMap<mlir::Value, RVVInfo> &rvvValues,
+      llvm::StringRef vl) {
+    if (mlir::failed(requireStrategy(op, "rvv_unit_stride")))
+      return mlir::failure();
+    auto pointer = rvvValues.find(op.getPointer());
+    auto value = rvvValues.find(op.getValue());
+    if (pointer == rvvValues.end() || value == rvvValues.end() ||
+        pointer->second.kind != RVVInfo::Kind::Pointer ||
+        value->second.kind != RVVInfo::Kind::Vector)
+      return op.emitError("RVV unit-stride store requires region pointer and vector value");
+    line("__riscv_vse32_v_f32m1(" + pointer->second.value + ", " +
+         value->second.value + ", " + vl.str() + ");");
     return mlir::success();
   }
 
@@ -899,12 +1062,24 @@ private:
     ValueInfo rhs = lookup(op.getRhs());
     llvm::SmallVector<ValueInfo> operands{lhs, rhs};
     llvm::SmallVector<std::string> shape = broadcastShape(operands);
-    if (combineExpression(op.getKind(), "a", "b").empty())
+    auto build = [&](llvm::StringRef lhsExpression, llvm::StringRef rhsExpression) {
+      auto integer = mlir::dyn_cast<mlir::IntegerType>(elementType(op.getResult().getType()));
+      if (integer && integer.getWidth() == 1) {
+        if (op.getKind() == "and")
+          return "(" + lhsExpression.str() + " && " + rhsExpression.str() + ")";
+        if (op.getKind() == "or")
+          return "(" + lhsExpression.str() + " || " + rhsExpression.str() + ")";
+        if (op.getKind() == "xor")
+          return "(" + lhsExpression.str() + " != " + rhsExpression.str() + ")";
+      }
+      return combineExpression(op.getKind(), lhsExpression, rhsExpression);
+    };
+    if (build("a", "b").empty())
       return op.emitError("scalar source provider does not implement binary kind");
     return emitPointwise(op.getResult(), shape, operands,
                          [&](llvm::StringRef index, llvm::StringRef outputName) {
-      return combineExpression(op.getKind(), elementAccess(lhs, index, outputName),
-                               elementAccess(rhs, index, outputName));
+      return build(elementAccess(lhs, index, outputName),
+                   elementAccess(rhs, index, outputName));
     });
   }
 
@@ -1268,7 +1443,9 @@ private:
   }
 };
 
-void emitPrelude(llvm::raw_ostream &output) {
+void emitPrelude(llvm::raw_ostream &output, bool usesRVV) {
+  if (usesRVV)
+    output << "#include <riscv_vector.h>\n";
   output << R"cpp(#include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -1412,7 +1589,13 @@ inline std::uint16_t float_to_half(float input) {
 
 mlir::LogicalResult weft::emitSelectedSource(mlir::ModuleOp module,
                                              llvm::raw_ostream &output) {
-  emitPrelude(output);
+  bool usesRVV = false;
+  module.walk([&](mlir::Operation *operation) {
+    auto provider = operation->getAttrOfType<mlir::StringAttr>("provider");
+    if (provider && provider.getValue() == "rvv")
+      usesRVV = true;
+  });
+  emitPrelude(output, usesRVV);
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())
     kernels.push_back(kernel);

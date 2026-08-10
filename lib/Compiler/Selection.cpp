@@ -8,12 +8,171 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+
+#include <cassert>
 
 namespace {
 
 using namespace weft;
 using namespace weft::execution;
 using namespace weft::kernel;
+
+struct Candidate {
+  llvm::StringRef provider;
+  llvm::StringRef realization;
+  llvm::StringRef strategy;
+  int64_t sew = 0;
+  llvm::StringRef lmul = "none";
+  int64_t unroll = 1;
+};
+
+llvm::StringRef selectedRecordName(mlir::Operation *operation);
+
+mlir::Type bareType(mlir::Type type) {
+  if (auto masked = mlir::dyn_cast<MaskedType>(type))
+    return masked.getValueType();
+  return type;
+}
+
+mlir::Type elementType(mlir::Type type) {
+  type = bareType(type);
+  if (auto region = mlir::dyn_cast<RegionType>(type))
+    return region.getElementType();
+  if (auto block = mlir::dyn_cast<BlockType>(type))
+    return block.getElementType();
+  return type;
+}
+
+bool isTrueScalarPredicate(mlir::Value value) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  return value.getType().isInteger(1) && integer && !integer.getValue().isZero();
+}
+
+bool isF32RegionValue(mlir::Type type) {
+  type = bareType(type);
+  auto region = mlir::dyn_cast<RegionType>(type);
+  if (!region)
+    return false;
+  mlir::Type element = region.getElementType();
+  if (auto pointer = mlir::dyn_cast<PtrType>(element))
+    element = pointer.getElementType();
+  return element.isF32();
+}
+
+bool isUnitStrideRegionPointer(mlir::Value value, mlir::BlockArgument coordinate) {
+  auto pointer = value.getDefiningOp<PtrAddOp>();
+  if (!pointer || pointer.getOffset() != coordinate)
+    return false;
+  mlir::Type base = bareType(pointer.getBase().getType());
+  return mlir::isa<PtrType>(base);
+}
+
+bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
+  if (!target.hasRVV || vla.getNumResults() != 0)
+    return false;
+  mlir::Block &body = vla.getBody().front();
+  auto coordinate = body.getArgument(0);
+  bool hasMemory = false;
+  for (mlir::Operation &operation : body.without_terminator()) {
+    if (mlir::isa<ConstantOp, InvalidOp>(operation))
+      continue;
+    if (auto pointer = mlir::dyn_cast<PtrAddOp>(operation)) {
+      mlir::Type result = bareType(pointer.getResult().getType());
+      if (mlir::isa<RegionType>(result) &&
+          !isUnitStrideRegionPointer(pointer.getResult(), coordinate))
+        return false;
+      if (mlir::isa<RegionType>(result) && !isF32RegionValue(result))
+        return false;
+      continue;
+    }
+    if (auto binary = mlir::dyn_cast<BinaryOp>(operation)) {
+      if (!llvm::is_contained({"add", "sub", "mul", "div"}, binary.getKind()))
+        return false;
+      if (mlir::isa<RegionType>(bareType(binary.getResult().getType())) &&
+          !isF32RegionValue(binary.getResult().getType()))
+        return false;
+      continue;
+    }
+    if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
+      if (!isUnitStrideRegionPointer(load.getPointer(), coordinate) ||
+          !isF32RegionValue(load.getResult().getType()) ||
+          !isTrueScalarPredicate(load.getWhere()) ||
+          !mlir::isa<mlir::NoneType>(load.getOther().getType()))
+        return false;
+      hasMemory = true;
+      continue;
+    }
+    if (auto store = mlir::dyn_cast<StoreOp>(operation)) {
+      if (!isUnitStrideRegionPointer(store.getPointer(), coordinate) ||
+          !isF32RegionValue(store.getValue().getType()) ||
+          !isTrueScalarPredicate(store.getWhere()))
+        return false;
+      hasMemory = true;
+      continue;
+    }
+    return false;
+  }
+  return hasMemory;
+}
+
+llvm::DenseSet<mlir::Operation *>
+findRVVVLAs(KernelOp kernel, const RISCVTargetProfile &target) {
+  llvm::DenseSet<mlir::Operation *> result;
+  kernel.walk([&](VLAOp vla) {
+    if (isRVVElementwiseVLA(vla, target))
+      result.insert(vla.getOperation());
+  });
+  return result;
+}
+
+bool belongsToRVVVLA(mlir::Operation *operation,
+                     const llvm::DenseSet<mlir::Operation *> &rvvVLAs) {
+  if (auto vla = operation->getParentOfType<VLAOp>())
+    return rvvVLAs.contains(vla.getOperation());
+  return false;
+}
+
+llvm::SmallVector<Candidate>
+buildCandidates(mlir::Operation *canonical,
+                const llvm::DenseSet<mlir::Operation *> &rvvVLAs) {
+  llvm::SmallVector<Candidate> candidates;
+  llvm::StringRef name = selectedRecordName(canonical);
+  if (name == "weft_execution.axis_plan")
+    candidates.push_back({"scalar", "scalar", {}, 0, "none", 1});
+  else if (name == "weft_execution.memory_plan")
+    candidates.push_back({"scalar", {}, "scalar_direct"});
+  else if (name == "weft_execution.reduce_plan")
+    candidates.push_back({"scalar", {}, "scalar_linear"});
+  else if (name == "weft_execution.scan_plan")
+    candidates.push_back({"scalar", {}, "scalar_linear"});
+  else if (name == "weft_execution.summary_plan")
+    candidates.push_back({"scalar", {}, "scalar_linear"});
+  else if (name == "weft_execution.contract_plan")
+    candidates.push_back({"scalar", {}, "scalar_nested"});
+  else if (name == "weft_execution.math_plan")
+    candidates.push_back({"scalar", {}, "scalar_libm"});
+  else if (name == "weft_execution.primitive_plan")
+    candidates.push_back({"scalar", {}, "scalar_direct"});
+
+  if (auto vla = mlir::dyn_cast<VLAOp>(canonical);
+      vla && rvvVLAs.contains(vla.getOperation()))
+    candidates.push_back({"rvv", "rvv", {}, 32, "m1", 1});
+  if (mlir::isa<LoadOp, StoreOp>(canonical) &&
+      belongsToRVVVLA(canonical, rvvVLAs))
+    candidates.push_back({"rvv", {}, "rvv_unit_stride"});
+  return candidates;
+}
+
+Candidate chooseCandidate(mlir::Operation *canonical,
+                          const llvm::DenseSet<mlir::Operation *> &rvvVLAs) {
+  llvm::SmallVector<Candidate> candidates = buildCandidates(canonical, rvvVLAs);
+  assert(!candidates.empty() && "planned anchor requires a legal candidate");
+  return candidates.back();
+}
 
 llvm::StringRef selectedRecordName(mlir::Operation *operation) {
   if (mlir::isa<MetaValueOp>(operation))
@@ -64,6 +223,7 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
                                       mlir::Operation *canonical,
                                       int64_t anchor,
                                       const SelectionOptions &options,
+                                      const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
                                       llvm::StringSet<> &consumedMeta) {
   llvm::StringRef name = selectedRecordName(canonical);
   if (name.empty())
@@ -89,44 +249,23 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
     consumedMeta.insert(nameAttr.getValue());
     attrs.push_back(attr(builder, "value",
                          builder.getI64IntegerAttr(binding->second)));
-  } else if (name == "weft_execution.axis_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "realization", builder.getStringAttr("scalar")));
-    attrs.push_back(attr(builder, "sew", builder.getI64IntegerAttr(0)));
-    attrs.push_back(attr(builder, "lmul", builder.getStringAttr("none")));
-    attrs.push_back(attr(builder, "unroll", builder.getI64IntegerAttr(1)));
-  } else if (name == "weft_execution.memory_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_direct")));
-  } else if (name == "weft_execution.reduce_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_linear")));
-  } else if (name == "weft_execution.scan_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_linear")));
-  } else if (name == "weft_execution.summary_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_linear")));
-  } else if (name == "weft_execution.contract_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_nested")));
+  } else {
+    Candidate selected = chooseCandidate(canonical, rvvVLAs);
+    attrs.push_back(attr(builder, "provider", builder.getStringAttr(selected.provider)));
+    if (name == "weft_execution.axis_plan") {
+      attrs.push_back(attr(builder, "realization",
+                           builder.getStringAttr(selected.realization)));
+      attrs.push_back(attr(builder, "sew", builder.getI64IntegerAttr(selected.sew)));
+      attrs.push_back(attr(builder, "lmul", builder.getStringAttr(selected.lmul)));
+      attrs.push_back(attr(builder, "unroll", builder.getI64IntegerAttr(selected.unroll)));
+    } else {
+      attrs.push_back(attr(builder, "strategy", builder.getStringAttr(selected.strategy)));
+    }
+  }
+  if (name == "weft_execution.contract_plan") {
     attrs.push_back(attr(builder, "micro_m", builder.getI64IntegerAttr(1)));
     attrs.push_back(attr(builder, "micro_n", builder.getI64IntegerAttr(1)));
     attrs.push_back(attr(builder, "micro_k", builder.getI64IntegerAttr(1)));
-  } else if (name == "weft_execution.math_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_libm")));
-  } else if (name == "weft_execution.primitive_plan") {
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr("scalar")));
-    attrs.push_back(
-        attr(builder, "strategy", builder.getStringAttr("scalar_direct")));
   }
   return createOperation(builder, name, canonical->getLoc(), attrs);
 }
@@ -180,10 +319,12 @@ mlir::FailureOr<PlanOp> createPlan(mlir::ModuleOp module, KernelOp kernel,
   }
   builder.setInsertionPointToStart(&plan.getBody().front());
   llvm::StringSet<> consumedMeta;
+  llvm::DenseSet<mlir::Operation *> rvvVLAs =
+      findRVVVLAs(kernel, options.target);
   for (auto [anchor, operation] : llvm::enumerate(planned)) {
     operation->setAttr(kCanonicalAnchorAttr,
                        builder.getI64IntegerAttr(anchor));
-    if (!createSelectedRecord(builder, operation, anchor, options,
+    if (!createSelectedRecord(builder, operation, anchor, options, rvvVLAs,
                               consumedMeta)) {
       plan.erase();
       return mlir::failure();
