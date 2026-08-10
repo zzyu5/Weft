@@ -50,15 +50,18 @@ bool isTrueScalarPredicate(mlir::Value value) {
   return value.getType().isInteger(1) && integer && !integer.getValue().isZero();
 }
 
-bool isF32RegionValue(mlir::Type type) {
+bool isF32RegionDataValue(mlir::Type type) {
   type = bareType(type);
   auto region = mlir::dyn_cast<RegionType>(type);
-  if (!region)
-    return false;
-  mlir::Type element = region.getElementType();
-  if (auto pointer = mlir::dyn_cast<PtrType>(element))
-    element = pointer.getElementType();
-  return element.isF32();
+  return region && region.getElementType().isF32();
+}
+
+bool isF32RegionPointerValue(mlir::Type type) {
+  type = bareType(type);
+  auto region = mlir::dyn_cast<RegionType>(type);
+  auto pointer = region ? mlir::dyn_cast<PtrType>(region.getElementType())
+                        : PtrType{};
+  return pointer && pointer.getElementType().isF32();
 }
 
 bool isUnitStrideRegionPointer(mlir::Value value, mlir::BlockArgument coordinate) {
@@ -83,7 +86,7 @@ bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
       if (mlir::isa<RegionType>(result) &&
           !isUnitStrideRegionPointer(pointer.getResult(), coordinate))
         return false;
-      if (mlir::isa<RegionType>(result) && !isF32RegionValue(result))
+      if (mlir::isa<RegionType>(result) && !isF32RegionPointerValue(result))
         return false;
       continue;
     }
@@ -91,13 +94,13 @@ bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
       if (!llvm::is_contained({"add", "sub", "mul", "div"}, binary.getKind()))
         return false;
       if (mlir::isa<RegionType>(bareType(binary.getResult().getType())) &&
-          !isF32RegionValue(binary.getResult().getType()))
+          !isF32RegionDataValue(binary.getResult().getType()))
         return false;
       continue;
     }
     if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
       if (!isUnitStrideRegionPointer(load.getPointer(), coordinate) ||
-          !isF32RegionValue(load.getResult().getType()) ||
+          !isF32RegionDataValue(load.getResult().getType()) ||
           !isTrueScalarPredicate(load.getWhere()) ||
           !mlir::isa<mlir::NoneType>(load.getOther().getType()))
         return false;
@@ -106,7 +109,7 @@ bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
     }
     if (auto store = mlir::dyn_cast<StoreOp>(operation)) {
       if (!isUnitStrideRegionPointer(store.getPointer(), coordinate) ||
-          !isF32RegionValue(store.getValue().getType()) ||
+          !isF32RegionDataValue(store.getValue().getType()) ||
           !isTrueScalarPredicate(store.getWhere()))
         return false;
       hasMemory = true;
@@ -115,7 +118,7 @@ bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
     if (auto reduce = mlir::dyn_cast<ReduceOp>(operation)) {
       if (reduce.getAxis() != -1 || reduce.getKind() != "add" ||
           reduce.getOrder() != "relaxed" ||
-          !isF32RegionValue(reduce.getInput().getType()) ||
+          !isF32RegionDataValue(reduce.getInput().getType()) ||
           !reduce.getResult().getType().isF32() ||
           !reduce.getIdentity().getType().isF32() ||
           !isTrueScalarPredicate(reduce.getWhere()))

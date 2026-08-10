@@ -1720,29 +1720,37 @@ template <typename To, typename From> To bit_cast(const From &input) {
 }
 
 template <typename T, typename S> T shift_left(T value, S amount) {
-  using U = std::make_unsigned_t<T>;
-  constexpr unsigned width = sizeof(T) * 8u;
   unsigned shift = static_cast<unsigned>(amount);
-  if (shift >= width)
-    return T{0};
-  return static_cast<T>(static_cast<U>(value) << shift);
+  if constexpr (std::is_same_v<T, bool>) {
+    return shift == 0 ? value : false;
+  } else {
+    using U = std::make_unsigned_t<T>;
+    constexpr unsigned width = sizeof(T) * 8u;
+    if (shift >= width)
+      return T{0};
+    return static_cast<T>(static_cast<U>(value) << shift);
+  }
 }
 
 template <typename T, typename S> T shift_right(T value, S amount) {
-  using U = std::make_unsigned_t<T>;
-  constexpr unsigned width = sizeof(T) * 8u;
   unsigned shift = static_cast<unsigned>(amount);
-  if (shift >= width) {
-    if constexpr (std::is_signed_v<T>)
-      return value < 0 ? T{-1} : T{0};
-    return T{0};
+  if constexpr (std::is_same_v<T, bool>) {
+    return shift == 0 ? value : false;
+  } else {
+    using U = std::make_unsigned_t<T>;
+    constexpr unsigned width = sizeof(T) * 8u;
+    if (shift >= width) {
+      if constexpr (std::is_signed_v<T>)
+        return value < 0 ? T{-1} : T{0};
+      return T{0};
+    }
+    U shifted = static_cast<U>(value) >> shift;
+    if constexpr (std::is_signed_v<T>) {
+      if (value < 0 && shift != 0)
+        shifted |= static_cast<U>(~U{0}) << (width - shift);
+    }
+    return static_cast<T>(shifted);
   }
-  U shifted = static_cast<U>(value) >> shift;
-  if constexpr (std::is_signed_v<T>) {
-    if (value < 0 && shift != 0)
-      shifted |= static_cast<U>(~U{0}) << (width - shift);
-  }
-  return static_cast<T>(shifted);
 }
 
 inline float half_to_float(std::uint16_t bits) {
