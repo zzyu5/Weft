@@ -21,6 +21,7 @@ W.i*/W.u*/W.f*/W.bf16
 ```python
 W.range(begin, end, step=1)
 W.select(pred, a, b)
+integer `&`, `|`, `^`, `<<`, `>>`
 @W.pure
 ```
 
@@ -81,6 +82,7 @@ W.lookup(...)
 W.decode(...)
 W.widen(...)
 W.narrow(...)
+W.bitcast(value, dtype)
 ```
 
 语义不同的扩展 primitive 进入独立 namespace 或 extension dialect，但必须保持局部、typed、可组合。

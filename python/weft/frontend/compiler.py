@@ -274,9 +274,14 @@ class FrontendCompiler:
                 "kernel ABI uses plain annotated positional parameters without defaults",
                 self.unit.location(self.unit.function),
             )
-        if signature.return_annotation not in {None, type(None)}:
+        return_annotation = signature.return_annotation
+        if return_annotation in {None, type(None)}:
+            return_type: ValueType = NONE_TYPE
+        elif isinstance(return_annotation, DType):
+            return_type = ScalarType(return_annotation)
+        else:
             raise FrontendError(
-                "the first Weft milestone supports worker entries returning None",
+                "kernel return annotation must be None or a Weft scalar dtype",
                 self.unit.location(self.unit.function),
             )
         parameters = tuple(signature.parameters.values())
@@ -313,9 +318,34 @@ class FrontendCompiler:
             else:
                 self.env[parameter.name] = argument
 
-        self._compile_statements(self.unit.function.body)
-        if not body.terminated:
-            self._emit("weft_kernel.return", self.unit.function)
+        if isinstance(return_type, NoneType):
+            self._compile_statements(self.unit.function.body)
+            if not body.terminated:
+                self._emit("weft_kernel.return", self.unit.function)
+        else:
+            if not self.unit.function.body or not isinstance(
+                self.unit.function.body[-1], ast.Return
+            ):
+                raise FrontendError(
+                    "a value-returning kernel must end in one scalar return",
+                    self.unit.location(self.unit.function),
+                )
+            self._compile_statements(self.unit.function.body[:-1])
+            return_node = self.unit.function.body[-1]
+            assert isinstance(return_node, ast.Return)
+            if return_node.value is None:
+                raise FrontendError(
+                    "kernel return requires a value", self.unit.location(return_node)
+                )
+            result = self._expect_value(
+                self._compile_expr(return_node.value), return_node.value
+            )
+            if result.type != return_type:
+                raise FrontendError(
+                    "kernel return value must match its scalar annotation",
+                    self.unit.location(return_node.value),
+                )
+            self._emit("weft_kernel.return", return_node, operands=(result,))
 
         location = self.unit.location(self.unit.function)
         source_name = f"{self.unit.filename}:{self.unit.first_line}"
@@ -330,6 +360,7 @@ class FrontendCompiler:
                 "arg_kinds": "["
                 + ", ".join(_string(kind) for kind in argument_kinds)
                 + "]",
+                "return_type": emit_type(return_type),
                 "source": _string(source_name),
             },
             regions=(body,),
@@ -669,6 +700,8 @@ class FrontendCompiler:
             ast.BitAnd: "and",
             ast.BitOr: "or",
             ast.BitXor: "xor",
+            ast.LShift: "shl",
+            ast.RShift: "shr",
         }
         kind = operations.get(type(expression.op))
         if kind is None:
@@ -682,6 +715,21 @@ class FrontendCompiler:
             raise FrontendError(
                 "binary operands must have the same element type", self._location(node)
             )
+        if kind in {"and", "or", "xor", "shl", "shr"}:
+            operand_type = element_type(lhs.type)
+            if (
+                not isinstance(operand_type, ScalarType)
+                or operand_type.dtype.category
+                not in {
+                    DTypeCategory.BOOL,
+                    DTypeCategory.INTEGER,
+                    DTypeCategory.INDEX,
+                }
+            ):
+                raise FrontendError(
+                    "bitwise operands must contain integer elements",
+                    self._location(node),
+                )
         result_kind, result_shape = _join_shapes(lhs.type, rhs.type, self._location(node))
         result_type: ValueType = shaped_type(
             result_kind, result_shape, element_type(lhs.type)
@@ -1127,6 +1175,35 @@ class FrontendCompiler:
         if not isinstance(dtype, DType):
             raise FrontendError("W.cast dtype must be a Weft type", self._location(call))
         return self._cast_value(value, dtype, call)
+
+    def _intrinsic_bitcast(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(call, ("value", "dtype"), {})
+        value = self._value_argument(args["value"], call)
+        dtype = args["dtype"]
+        if isinstance(dtype, ast.expr):
+            dtype = self._eval_static(dtype)
+        if not isinstance(dtype, DType) or dtype.category is DTypeCategory.INDEX:
+            raise FrontendError(
+                "W.bitcast dtype must be a fixed-width Weft scalar type",
+                self._location(call),
+            )
+        source = element_type(value.type)
+        if (
+            not isinstance(source, ScalarType)
+            or source.dtype.category is DTypeCategory.INDEX
+            or source.dtype.bits != dtype.bits
+        ):
+            raise FrontendError(
+                "W.bitcast requires equal-width scalar element types",
+                self._location(call),
+            )
+        result_type = with_element_type(value.type, ScalarType(dtype))
+        return self._emit(
+            "weft_kernel.bitcast",
+            call,
+            operands=(value,),
+            result_types=(result_type,),
+        )[0]
 
     def _cast_value(self, value: Value, dtype: DType, node: ast.AST) -> Value:
         result_type = with_element_type(value.type, ScalarType(dtype))

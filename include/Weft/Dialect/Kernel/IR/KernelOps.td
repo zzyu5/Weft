@@ -84,7 +84,7 @@ def WeftKernel_TupleType : WeftKernel_Type<"Tuple", "tuple"> {
 }
 
 def WeftKernel_ReturnOp : WeftKernel_Op<"return", [Terminator]> {
-  let arguments = (ins);
+  let arguments = (ins Variadic<AnyType>:$values);
   let results = (outs);
   let hasVerifier = 1;
 }
@@ -108,6 +108,7 @@ def WeftKernel_KernelOp
     SymbolNameAttr:$sym_name,
     ArrayAttr:$arg_names,
     ArrayAttr:$arg_kinds,
+    TypeAttr:$return_type,
     StrAttr:$source
   );
   let regions = (region SizedRegion<1>:$body);
@@ -222,6 +223,12 @@ def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
 }
 
 def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_BitcastOp : WeftKernel_Op<"bitcast", [Pure]> {
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;

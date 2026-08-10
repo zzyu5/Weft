@@ -32,6 +32,14 @@ bool isIntegerLike(mlir::Type type) {
   return type.isIndex() || mlir::isa<mlir::IntegerType>(type);
 }
 
+std::optional<unsigned> fixedBitWidth(mlir::Type type) {
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+    return integer.getWidth();
+  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type))
+    return floating.getWidth();
+  return std::nullopt;
+}
+
 mlir::Type unwrapMasked(mlir::Type type) {
   if (auto masked = mlir::dyn_cast<MaskedType>(type))
     return masked.getValueType();
@@ -355,6 +363,8 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
     return deriveExtentImpl(unary.getInput(), axis, visited);
   if (auto cast = mlir::dyn_cast<CastOp>(definition))
     return deriveExtentImpl(cast.getInput(), axis, visited);
+  if (auto bitcast = mlir::dyn_cast<BitcastOp>(definition))
+    return deriveExtentImpl(bitcast.getInput(), axis, visited);
   if (auto widen = mlir::dyn_cast<WidenOp>(definition))
     return deriveExtentImpl(widen.getInput(), axis, visited);
   if (auto narrow = mlir::dyn_cast<NarrowOp>(definition))
@@ -553,12 +563,33 @@ mlir::LogicalResult KernelOp::verify() {
   }
   if (!mlir::isa<ReturnOp>(entry.getTerminator()))
     return emitOpError("entry must terminate with weft_kernel.return");
+  mlir::Type returnType = getReturnType();
+  if (!mlir::isa<mlir::NoneType>(returnType) && !isScalarType(returnType))
+    return emitOpError("return_type must be none or one scalar type");
+  auto returnOp = mlir::cast<ReturnOp>(entry.getTerminator());
+  if (mlir::isa<mlir::NoneType>(returnType)) {
+    if (!returnOp.getValues().empty())
+      return emitOpError("void kernel cannot return a value");
+  } else if (returnOp.getValues().size() != 1 ||
+             returnOp.getValues().front().getType() != returnType) {
+    return emitOpError("kernel return must match return_type");
+  }
   return mlir::success();
 }
 
 mlir::LogicalResult ReturnOp::verify() {
-  if (!mlir::isa_and_nonnull<KernelOp>(getOperation()->getBlock()->getParentOp()))
+  auto kernel =
+      mlir::dyn_cast_or_null<KernelOp>(getOperation()->getBlock()->getParentOp());
+  if (!kernel)
     return emitOpError("must terminate a kernel entry");
+  mlir::Type returnType = kernel.getReturnType();
+  if (mlir::isa<mlir::NoneType>(returnType)) {
+    if (!getValues().empty())
+      return emitOpError("void kernel cannot return a value");
+  } else if (getValues().size() != 1 ||
+             getValues().front().getType() != returnType) {
+    return emitOpError("return value must match the kernel return_type");
+  }
   return mlir::success();
 }
 
@@ -797,9 +828,13 @@ mlir::LogicalResult UnaryOp::verify() {
 mlir::LogicalResult BinaryOp::verify() {
   if (!llvm::StringSwitch<bool>(getKind())
            .Cases("add", "sub", "mul", "div", "mod", true)
-           .Cases("and", "or", "xor", "max", "min", true)
+           .Cases("and", "or", "xor", "shl", "shr", "max", "min", true)
            .Default(false))
     return emitOpError("unsupported binary kind");
+  if ((getKind() == "and" || getKind() == "or" || getKind() == "xor" ||
+       getKind() == "shl" || getKind() == "shr") &&
+      !isIntegerLike(elementTypeOf(getLhs().getType())))
+    return emitOpError("bitwise operations require integer elements");
   return verifyPointwiseResult(getOperation(), getLhs(), getRhs(),
                                getResult().getType());
 }
@@ -820,6 +855,18 @@ mlir::LogicalResult CastOp::verify() {
       !isScalarType(elementTypeOf(getInput().getType())) ||
       !isScalarType(elementTypeOf(getResult().getType())))
     return emitOpError("cast must preserve logical shape and validity");
+  return mlir::success();
+}
+
+mlir::LogicalResult BitcastOp::verify() {
+  if (shapeKindOf(getInput().getType()) != shapeKindOf(getResult().getType()) ||
+      staticShapeOf(getInput().getType()) != staticShapeOf(getResult().getType()) ||
+      isMasked(getInput().getType()) != isMasked(getResult().getType()))
+    return emitOpError("bitcast must preserve logical shape and validity");
+  auto inputWidth = fixedBitWidth(elementTypeOf(getInput().getType()));
+  auto resultWidth = fixedBitWidth(elementTypeOf(getResult().getType()));
+  if (!inputWidth || !resultWidth || inputWidth != resultWidth)
+    return emitOpError("bitcast element types must have equal fixed width");
   return mlir::success();
 }
 

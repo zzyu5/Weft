@@ -38,6 +38,8 @@ def saxpy(
 ```
 
 `@weft.kernel` 定义一个 worker-local entry。它不是 Python callable 的 eager 执行语义。
+Entry 可以返回 `None` 或一个 scalar value；返回类型是 public C ABI 的一部分，不能由
+emitter 根据 kernel 名或 use context 改写。
 
 ### 6.3 Kernel 参数类型
 

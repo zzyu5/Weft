@@ -12,6 +12,7 @@ from .annotations import writeonly
 from .builtins import HelperDefinition
 from .builtins import Intrinsic
 from .builtins import atomic_add
+from .builtins import bitcast
 from .builtins import block_axis
 from .builtins import block_scaled_contract
 from .builtins import broadcast_to

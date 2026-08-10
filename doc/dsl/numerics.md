@@ -56,4 +56,10 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 如果某个 RISC-V 扩展改变这些 observable semantics，必须增加新的局部 primitive 或显式属性，不能伪装成普通 cast/contract 的无差别 lowering。
 
+`W.bitcast(value, dtype)` 只允许相同固定 bit width 的 scalar element type，并逐元素保留
+bit pattern。它不执行数值转换；普通数值转换继续使用 `W.cast`、`W.widen` 或 `W.narrow`。
+
+`&`、`|`、`^`、`<<` 与 `>>` 只接受 integer/index element。右移遵守 operand 的有符号性：
+signed integer 使用算术右移，unsigned integer 使用逻辑右移。
+
 ---

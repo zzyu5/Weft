@@ -50,6 +50,7 @@ weft_kernel.scan
 weft_kernel.summary_fold
 weft_kernel.contract
 weft_kernel.reshape / transpose / broadcast
+weft_kernel.cast / bitcast
 weft_kernel.meta_value
 ```
 
