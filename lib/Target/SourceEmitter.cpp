@@ -632,10 +632,23 @@ private:
 
   mlir::LogicalResult emitRVVVLA(VLAOp op, AxisPlanOp axis) {
     if (axis.getRealization() != "rvv" || axis.getSew() != 32 ||
-        axis.getLmul() != "m1" || op.getNumResults() != 0)
-      return op.emitError("RVV VLA provider implements outputless e32m1 strips");
+        axis.getLmul() != "m1")
+      return op.emitError("RVV VLA provider implements e32m1 strips");
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Value, RVVInfo> rvvValues;
+    llvm::DenseMap<mlir::Operation *, ValueInfo> aggregates;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      auto reduce = mlir::dyn_cast<ReduceOp>(nested);
+      if (!reduce)
+        continue;
+      std::string identity = literalExpression(reduce.getIdentity());
+      if (identity.empty())
+        return reduce.emitError("RVV reduction identity must be loop-invariant");
+      ValueInfo aggregate = makeResult(reduce.getResult(), {}, fresh("rvv_reduce"));
+      line(valueCType(aggregate) + " " + aggregate.value + " = " + identity + ";");
+      aggregates[reduce.getOperation()] = aggregate;
+      values[reduce.getResult()] = aggregate;
+    }
     std::string lane = "__weft_rvv_i" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     line("for (std::size_t " + lane + " = " + lookup(op.getBegin()).value +
@@ -687,11 +700,25 @@ private:
           return mlir::failure();
         continue;
       }
+      if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
+        if (mlir::failed(emitRVVReduce(reduce, aggregates[reduce.getOperation()],
+                                       rvvValues, vl)))
+          return mlir::failure();
+        continue;
+      }
       return nested.emitError("selected RVV VLA contains an unsupported primitive");
     }
     line(lane + " += " + vl + ";");
     --indent;
     line("}");
+    auto yield = mlir::cast<YieldOp>(body.getTerminator());
+    for (auto [result, yielded] : llvm::zip(op.getResults(), yield.getOperands())) {
+      ValueInfo info = lookup(yielded);
+      if (info.value.empty())
+        return op.emitError("RVV VLA yielded value has no materialized aggregate");
+      info.type = result.getType();
+      values[result] = info;
+    }
     return mlir::success();
   }
 
@@ -779,6 +806,30 @@ private:
       return op.emitError("RVV unit-stride store requires region pointer and vector value");
     line("__riscv_vse32_v_f32m1(" + pointer->second.value + ", " +
          value->second.value + ", " + vl.str() + ");");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitRVVReduce(
+      ReduceOp op, const ValueInfo &aggregate,
+      llvm::DenseMap<mlir::Value, RVVInfo> &rvvValues,
+      llvm::StringRef vl) {
+    if (mlir::failed(requireStrategy(op, "rvv_tree")))
+      return mlir::failure();
+    auto input = rvvValues.find(op.getInput());
+    if (input == rvvValues.end() ||
+        input->second.kind != RVVInfo::Kind::Vector ||
+        op.getAxis() != -1 || op.getKind() != "add" ||
+        !elementType(op.getInput().getType()).isF32())
+      return op.emitError("RVV tree reduction requires an active-axis f32 add");
+    std::string seed = fresh("rvv_seed");
+    std::string partial = fresh("rvv_partial");
+    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" +
+         aggregate.value + ", " + vl.str() + ");");
+    line("vfloat32m1_t " + partial +
+         " = __riscv_vfredusum_vs_f32m1_f32m1(" + input->second.value +
+         ", " + seed + ", " + vl.str() + ");");
+    line(aggregate.value + " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
+    values[op.getResult()] = aggregate;
     return mlir::success();
   }
 

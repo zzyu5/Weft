@@ -72,7 +72,7 @@ bool isUnitStrideRegionPointer(mlir::Value value, mlir::BlockArgument coordinate
 }
 
 bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
-  if (!target.hasRVV || vla.getNumResults() != 0)
+  if (!target.hasRVV)
     return false;
   mlir::Block &body = vla.getBody().front();
   auto coordinate = body.getArgument(0);
@@ -114,8 +114,27 @@ bool isRVVElementwiseVLA(VLAOp vla, const RISCVTargetProfile &target) {
       hasMemory = true;
       continue;
     }
+    if (auto reduce = mlir::dyn_cast<ReduceOp>(operation)) {
+      if (reduce.getAxis() != -1 || reduce.getKind() != "add" ||
+          reduce.getOrder() != "relaxed" ||
+          !isF32RegionValue(reduce.getInput().getType()) ||
+          !reduce.getResult().getType().isF32() ||
+          !reduce.getIdentity().getType().isF32() ||
+          !isTrueScalarPredicate(reduce.getWhere()))
+        return false;
+      if (!llvm::all_of(reduce.getResult().getUsers(),
+                        [](mlir::Operation *user) { return mlir::isa<YieldOp>(user); }))
+        return false;
+      continue;
+    }
     return false;
   }
+  auto yield = mlir::cast<YieldOp>(body.getTerminator());
+  if (yield.getNumOperands() != vla.getNumResults())
+    return false;
+  for (mlir::Value yielded : yield.getOperands())
+    if (!yielded.getDefiningOp<ReduceOp>())
+      return false;
   return hasMemory;
 }
 
@@ -164,6 +183,10 @@ buildCandidates(mlir::Operation *canonical,
   if (mlir::isa<LoadOp, StoreOp>(canonical) &&
       belongsToRVVVLA(canonical, rvvVLAs))
     candidates.push_back({"rvv", {}, "rvv_unit_stride"});
+  if (auto reduce = mlir::dyn_cast<ReduceOp>(canonical);
+      reduce && belongsToRVVVLA(canonical, rvvVLAs) &&
+      reduce.getOrder() == "relaxed")
+    candidates.push_back({"rvv", {}, "rvv_tree"});
   return candidates;
 }
 
