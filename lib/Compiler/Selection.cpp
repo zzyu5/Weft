@@ -155,9 +155,31 @@ bool belongsToRVVVLA(mlir::Operation *operation,
   return false;
 }
 
+bool isRVVF16F32Contract(ContractOp contract,
+                         const RISCVTargetProfile &target) {
+  if (!target.hasRVV || contract.getOrder() != "relaxed" ||
+      contract.getMath() != "native" || !contract.getAccDtype().isF32() ||
+      !contract.getOutDtype().isF32() || !contract.getOutputOrder().empty() ||
+      contract.getLhsAxes().size() != 1 || contract.getLhsAxes().front() != 1 ||
+      contract.getRhsAxes().size() != 1 || contract.getRhsAxes().front() != 0 ||
+      !isTrueScalarPredicate(contract.getWhereLhs()) ||
+      !isTrueScalarPredicate(contract.getWhereRhs()))
+    return false;
+  auto lhs = mlir::dyn_cast<BlockType>(bareType(contract.getLhs().getType()));
+  auto rhs = mlir::dyn_cast<BlockType>(bareType(contract.getRhs().getType()));
+  auto init = mlir::dyn_cast<BlockType>(bareType(contract.getInit().getType()));
+  auto result = mlir::dyn_cast<BlockType>(bareType(contract.getResult().getType()));
+  return lhs && rhs && init && result && lhs.getShape().size() == 2 &&
+         rhs.getShape().size() == 2 && init.getShape().size() == 2 &&
+         result.getShape().size() == 2 && lhs.getElementType().isF16() &&
+         rhs.getElementType().isF16() && init.getElementType().isF32() &&
+         result.getElementType().isF32();
+}
+
 llvm::SmallVector<Candidate>
 buildCandidates(mlir::Operation *canonical,
-                const llvm::DenseSet<mlir::Operation *> &rvvVLAs) {
+                const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                const RISCVTargetProfile &target) {
   llvm::SmallVector<Candidate> candidates;
   llvm::StringRef name = selectedRecordName(canonical);
   if (name == "weft_execution.axis_plan")
@@ -187,12 +209,17 @@ buildCandidates(mlir::Operation *canonical,
       reduce && belongsToRVVVLA(canonical, rvvVLAs) &&
       reduce.getOrder() == "relaxed")
     candidates.push_back({"rvv", {}, "rvv_tree"});
+  if (auto contract = mlir::dyn_cast<ContractOp>(canonical);
+      contract && isRVVF16F32Contract(contract, target))
+    candidates.push_back({"rvv", {}, "rvv_f16_f32_contract"});
   return candidates;
 }
 
 Candidate chooseCandidate(mlir::Operation *canonical,
-                          const llvm::DenseSet<mlir::Operation *> &rvvVLAs) {
-  llvm::SmallVector<Candidate> candidates = buildCandidates(canonical, rvvVLAs);
+                          const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                          const RISCVTargetProfile &target) {
+  llvm::SmallVector<Candidate> candidates =
+      buildCandidates(canonical, rvvVLAs, target);
   assert(!candidates.empty() && "planned anchor requires a legal candidate");
   return candidates.back();
 }
@@ -273,7 +300,7 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
     attrs.push_back(attr(builder, "value",
                          builder.getI64IntegerAttr(binding->second)));
   } else {
-    Candidate selected = chooseCandidate(canonical, rvvVLAs);
+    Candidate selected = chooseCandidate(canonical, rvvVLAs, options.target);
     attrs.push_back(attr(builder, "provider", builder.getStringAttr(selected.provider)));
     if (name == "weft_execution.axis_plan") {
       attrs.push_back(attr(builder, "realization",

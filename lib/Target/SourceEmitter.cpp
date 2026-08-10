@@ -1437,6 +1437,11 @@ private:
   }
 
   mlir::LogicalResult emitContract(ContractOp op) {
+    if (mlir::Operation *record = recordFor(op)) {
+      auto provider = record->getAttrOfType<mlir::StringAttr>("provider");
+      if (provider && provider.getValue() == "rvv")
+        return emitRVVContract(op);
+    }
     if (mlir::failed(requireStrategy(op, "scalar_nested")))
       return mlir::failure();
     ValueInfo lhs = lookup(op.getLhs());
@@ -1483,6 +1488,94 @@ private:
          "] += static_cast<" + scalarCType(op.getAccDtype()) + ">(" + lhs.value +
          ".data[" + lhsIndex + "]) * static_cast<" + scalarCType(op.getAccDtype()) +
          ">(" + rhs.value + ".data[" + rhsIndex + "]);" );
+    --indent;
+    line("}");
+    --indent;
+    line("}");
+    --indent;
+    line("}");
+    values[op.getResult()] = info;
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitRVVContract(ContractOp op) {
+    if (mlir::failed(requireStrategy(op, "rvv_f16_f32_contract")))
+      return mlir::failure();
+    ValueInfo lhs = lookup(op.getLhs());
+    ValueInfo rhs = lookup(op.getRhs());
+    ValueInfo init = lookup(op.getInit());
+    auto lhsAxes = op.getLhsAxes();
+    auto rhsAxes = op.getRhsAxes();
+    if (lhs.shape.size() != 2 || rhs.shape.size() != 2 ||
+        init.shape.size() != 2 || lhsAxes.size() != 1 ||
+        rhsAxes.size() != 1 || lhsAxes.front() != 1 ||
+        rhsAxes.front() != 0 || !op.getOutputOrder().empty() ||
+        !elementType(op.getLhs().getType()).isF16() ||
+        !elementType(op.getRhs().getType()).isF16() ||
+        !op.getAccDtype().isF32() || !op.getOutDtype().isF32())
+      return op.emitError("RVV f16/f32 contract provider requires [M,K]x[K,N]");
+
+    ValueInfo info{op.getResult().getType(), fresh("rvv_contract"), {}, init.shape};
+    line(valueCType(info) + " " + info.value + " = " + init.value + ";");
+    std::string m = fresh("m");
+    std::string n = fresh("n");
+    std::string k = fresh("k");
+    std::string lhsSlice = fresh("lhs_slice");
+    std::string rhsSlice = fresh("rhs_slice");
+    std::string strip = fresh("strip");
+    std::string vl = fresh("vl");
+    std::string lhsVector = fresh("lhs_vec");
+    std::string rhsVector = fresh("rhs_vec");
+    std::string product = fresh("product");
+    std::string seed = fresh("seed");
+    std::string partial = fresh("partial");
+    std::string lhsWhere = lookup(op.getWhereLhs()).value;
+    std::string rhsWhere = lookup(op.getWhereRhs()).value;
+    line("for (std::size_t " + m + " = 0; " + m + " < " + lhs.value +
+         ".shape[0]; ++" + m + ") {");
+    ++indent;
+    line("for (std::size_t " + n + " = 0; " + n + " < " + rhs.value +
+         ".shape[1]; ++" + n + ") {");
+    ++indent;
+    line("std::vector<float> " + lhsSlice + "(" + lhs.value + ".shape[1], 0.0f);");
+    line("std::vector<float> " + rhsSlice + "(" + rhs.value + ".shape[0], 0.0f);");
+    line("for (std::size_t " + k + " = 0; " + k + " < " + lhs.value +
+         ".shape[1]; ++" + k + ") {");
+    ++indent;
+    std::string lhsIndex = "(" + m + " * " + lhs.value + ".shape[1] + " + k + ")";
+    std::string rhsIndex = "(" + k + " * " + rhs.value + ".shape[1] + " + n + ")";
+    std::string lhsValid = lhs.isMasked()
+                               ? lhs.validity + ".data[" + lhsIndex + "]"
+                               : "true";
+    std::string rhsValid = rhs.isMasked()
+                               ? rhs.validity + ".data[" + rhsIndex + "]"
+                               : "true";
+    line("if (" + lhsWhere + " && " + lhsValid + ") " + lhsSlice + "[" + k +
+         "] = static_cast<float>(" + lhs.value + ".data[" + lhsIndex + "]);");
+    line("if (" + rhsWhere + " && " + rhsValid + ") " + rhsSlice + "[" + k +
+         "] = static_cast<float>(" + rhs.value + ".data[" + rhsIndex + "]);");
+    --indent;
+    line("}");
+    std::string outputIndex = "(" + m + " * " + info.value + ".shape[1] + " + n + ")";
+    line("for (std::size_t " + strip + " = 0; " + strip + " < " + lhsSlice +
+         ".size();) {");
+    ++indent;
+    line("const std::size_t " + vl + " = __riscv_vsetvl_e32m1(" + lhsSlice +
+         ".size() - " + strip + ");");
+    line("vfloat32m1_t " + lhsVector + " = __riscv_vle32_v_f32m1(" + lhsSlice +
+         ".data() + " + strip + ", " + vl + ");");
+    line("vfloat32m1_t " + rhsVector + " = __riscv_vle32_v_f32m1(" + rhsSlice +
+         ".data() + " + strip + ", " + vl + ");");
+    line("vfloat32m1_t " + product + " = __riscv_vfmul_vv_f32m1(" + lhsVector +
+         ", " + rhsVector + ", " + vl + ");");
+    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + info.value +
+         ".data[" + outputIndex + "], " + vl + ");");
+    line("vfloat32m1_t " + partial +
+         " = __riscv_vfredusum_vs_f32m1_f32m1(" + product + ", " + seed +
+         ", " + vl + ");");
+    line(info.value + ".data[" + outputIndex +
+         "] = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
+    line(strip + " += " + vl + ";");
     --indent;
     line("}");
     --indent;
