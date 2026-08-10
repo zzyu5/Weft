@@ -52,7 +52,7 @@ physical parameter space
 legality constraints
 resource equations
 selected record schema
-lowering/emission
+primitive-local lowering hook
 optional local fusion envelope
 ```
 
@@ -102,6 +102,11 @@ vendor permute/lookup provider
 它们是可组合的 primitive providers，不是互斥 whole-kernel backend。
 
 普通 scalar control 直接由 scalar lowering 处理；普通 VLA pointwise/memory 通常由 RVV provider 处理；structured primitive 可以选择更专用 provider。
+
+Provider 只能为当前 canonical anchor 声明 capability、候选和 lowering。它可以因 typed
+operand、effect 或 target fact 不满足而拒绝该局部候选，但不能据此接管或拒绝整个 kernel。
+Scalar provider 与 RVV、矩阵和 vendor extension provider 地位相同：都必须显式进入合法
+候选空间并被 Selected IR 选择，不存在隐式“最后走 Scalar”的 fallback。
 
 ### 16.4 纯 realization 扩展
 
@@ -191,7 +196,7 @@ Build system 可以在作者提供的 variants 中选择，但每个 variant 都
 - local packing / scratch；
 - local unroll / pipeline；
 - capability 与 resource constraints；
-- lowering。
+- primitive-local lowering hook。
 
 ### 17.3 Compiler 拥有
 
