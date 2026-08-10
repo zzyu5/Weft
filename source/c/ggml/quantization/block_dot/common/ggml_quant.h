@@ -1,5 +1,5 @@
-#ifndef WEFT_SOURCE_GGML_QUANT_H
-#define WEFT_SOURCE_GGML_QUANT_H
+#ifndef GGML_SOURCE_QUANT_H
+#define GGML_SOURCE_QUANT_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -116,27 +116,27 @@ static inline void ggml_ref_get_scale_min_k4(
   }
 }
 
-float weft_reference_q4_0_q8_0(
+float ggml_source_q4_0_q8_0(
     const block_q4_0 *x,
     const block_q8_0 *y,
     size_t blocks);
-float weft_reference_q4_1_q8_1(
+float ggml_source_q4_1_q8_1(
     const block_q4_1 *x,
     const block_q8_1 *y,
     size_t blocks);
-float weft_reference_q5_0_q8_0(
+float ggml_source_q5_0_q8_0(
     const block_q5_0 *x,
     const block_q8_0 *y,
     size_t blocks);
-float weft_reference_q5_1_q8_1(
+float ggml_source_q5_1_q8_1(
     const block_q5_1 *x,
     const block_q8_1 *y,
     size_t blocks);
-float weft_reference_q8_0_q8_0(
+float ggml_source_q8_0_q8_0(
     const block_q8_0 *x,
     const block_q8_0 *y,
     size_t blocks);
-float weft_reference_q4_K_q8_K(
+float ggml_source_q4_K_q8_K(
     const block_q4_K *x,
     const block_q8_K *y,
     size_t blocks);
