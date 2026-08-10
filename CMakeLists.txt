@@ -8,5 +8,5 @@ set(CMAKE_CXX_EXTENSIONS NO)
 
 # The previous compiler is isolated under materials/ and is intentionally not
 # part of this build. New targets begin here only after their canonical IR and
-# dependency direction satisfy WEFT_FINAL_SPEC.md.
+# dependency direction satisfy doc/WEFT_FINAL_SPEC.md.
 message(STATUS "Weft clean reconstruction root: no compiler targets yet")

@@ -29,7 +29,7 @@
 
 ## 3. 为什么保留最终规范
 
-`WEFT_FINAL_SPEC.md` 没有删除。其他工程文档已经吸收总体架构，但以下唯一规范信息仍
+`doc/WEFT_FINAL_SPEC.md` 没有删除。其他工程文档已经吸收总体架构，但以下唯一规范信息仍
 只在该文件中完整存在：
 
 - Python DSL 的完整类型、API、默认值和约束；
@@ -45,11 +45,10 @@
 
 ```text
 TianchenRV/
-├── WEFT_FINAL_SPEC.md
 ├── AGENTS.md
 ├── README.md
 ├── CMakeLists.txt                 # 新根；当前零 target
-├── doc/                           # 现行工程文档
+├── doc/                           # 最终规范与现行工程文档
 └── materials/
     ├── README.md                  # 抽取索引与禁区
     ├── legacy-source/             # 旧实现，保持原相对路径

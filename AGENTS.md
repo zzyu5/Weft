@@ -2,7 +2,7 @@
 
 ## 1. 唯一设计权威
 
-- 根目录 [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md) 是 Weft 语言、IR、provider、
+- [`doc/WEFT_FINAL_SPEC.md`](doc/WEFT_FINAL_SPEC.md) 是 Weft 语言、IR、provider、
   lowering 与 artifact 的唯一规范性设计。
 - `doc/` 是工程解释、现状审计和重建决策，不得另立语义，不得覆盖规范。
 - `materials/legacy-source/` 只说明旧实现做过什么，不说明最终设计应该是什么。旧源码、
@@ -79,7 +79,7 @@ Weft core 不解析 `intent.*`，不链接 IntentDSL，也不反向调用上游�
 
 ## 6. 文档纪律
 
-- 语义定义只写入 `WEFT_FINAL_SPEC.md`；需要修改规范时必须由用户明确决定。
+- 语义定义只写入 `doc/WEFT_FINAL_SPEC.md`；需要修改规范时必须由用户明确决定。
 - 工程文档必须标明它描述的是规范解释、当前事实还是未来实施决定。
 - 不新增“V2”“旧版”“迁移指南”“总纲副本”或按阶段复制的设计文档。
 - 旧文档被替代后直接删除；不在仓库里另建 archive。代码材料与历史文档不是一回事。

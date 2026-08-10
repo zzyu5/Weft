@@ -1,11 +1,11 @@
 # Weft 工程文档
 
-本目录解释如何把 [`../WEFT_FINAL_SPEC.md`](../WEFT_FINAL_SPEC.md) 落成代码，并记录
+本目录解释如何把 [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md) 落成代码，并记录
 当前实现与规范的差距。它不定义另一套 Weft 语言或编译器语义。
 
 ## 权威顺序
 
-1. `WEFT_FINAL_SPEC.md`：唯一规范，回答“系统必须是什么”。
+1. [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md)：唯一规范，回答“系统必须是什么”。
 2. `doc/`：非规范性的工程解释与已作出的仓库决策，回答“组件如何分界”和“当前如何重建”。
 3. 新根源码：未来实现事实；`materials/` 中的旧源码只作历史供体，不能反过来修改设计含义。
 

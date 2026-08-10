@@ -20,7 +20,7 @@
 | `artifacts/` | 旧 source/object/header/bundle 与测量输出 | 非现行产物，不可链接 |
 | `archive-local/` | 原本地 `_attic`，保持 ignored，fresh clone 不保证存在 | 仅本机历史追溯 |
 
-最终语言与编译器语义仍以根目录 [`WEFT_FINAL_SPEC.md`](../WEFT_FINAL_SPEC.md) 为准；
+最终语言与编译器语义仍以 [`doc/WEFT_FINAL_SPEC.md`](../doc/WEFT_FINAL_SPEC.md) 为准；
 工程入口在 [`doc/README.md`](../doc/README.md)。
 
 ## 第一类：可直接抽取的机械基础
@@ -76,7 +76,7 @@
 
 每次复用只做一个可审阅的小单元：
 
-1. 先从 `WEFT_FINAL_SPEC.md` 确定新组件的语义所有权；
+1. 先从 `doc/WEFT_FINAL_SPEC.md` 确定新组件的语义所有权；
 2. 定位 donor 中一个机械 helper、硬件表或资源公式；
 3. 在新根创建独立文件，使用新 namespace、types 和 canonical anchors；
 4. 删除对旧 route、problem、format、task/grid、hash/provenance object graph 的依赖；

@@ -15,7 +15,7 @@ source/object/static-library/header artifact。
 
 ## 阅读顺序
 
-1. [`WEFT_FINAL_SPEC.md`](WEFT_FINAL_SPEC.md)：语言和编译器的唯一规范性设计。
+1. [`doc/WEFT_FINAL_SPEC.md`](doc/WEFT_FINAL_SPEC.md)：语言和编译器的唯一规范性设计。
 2. [`doc/README.md`](doc/README.md)：现行工程文档索引与权威关系。
 3. [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md)：worker-local、VLA、block、state 与三层表示。
 4. [`doc/REPOSITORY_RECONSTRUCTION.md`](doc/REPOSITORY_RECONSTRUCTION.md)：已经完成的仓库

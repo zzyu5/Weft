@@ -6,7 +6,7 @@
 
 仓库根已经是干净的重建边界：
 
-- `WEFT_FINAL_SPEC.md` 保留完整规范；
+- `doc/WEFT_FINAL_SPEC.md` 保留完整规范；
 - `AGENTS.md`、`README.md` 和 `doc/` 是现行工程入口；
 - 根 `CMakeLists.txt` 不读取 materials，也暂不定义 compiler target；
 - 根目录尚无 `include/`、`lib/`、`python/`、`tools/` 或 `examples/` 新主干；
@@ -19,11 +19,10 @@
 ## 2. 当前根目录的承重内容
 
 ```text
-WEFT_FINAL_SPEC.md        唯一规范性语言/编译器设计
 AGENTS.md                 开发与边界纪律
 README.md                 项目入口
 CMakeLists.txt            零 target 的新构建根
-doc/                      现行工程解释与重建决策
+doc/                      最终规范、工程解释与重建决策
 materials/                只读 donor、历史实验与旧产物
 ```
 
