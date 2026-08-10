@@ -1,8 +1,8 @@
 # 历史实验材料索引
 
 本文件说明 `materials/experiments/` 的历史组织方式，以及它与旧测量数据的关系。
-它不是设计权威；Weft 语言与编译器的唯一规范在
-[`WEFT_FINAL_SPEC.md`](../../doc/WEFT_FINAL_SPEC.md)，当前工程边界见 [`doc/`](../../doc/README.md)。
+它不是设计权威；Weft 语言与编译器的唯一规范入口是
+[`doc/index.md`](../../doc/index.md)。
 
 ## 这次重组做了什么
 

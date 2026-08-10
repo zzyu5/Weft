@@ -16,6 +16,8 @@ kernel 模板的职责。现已按 `dsl/`、`compiler/`、`kernels/` 拆分；`d
 - 其余一行 CMake 文件都承担真实 `add_subdirectory` 路由，不是空壳；
 - `materials/` 中零字节 stderr、占位源码和 `.gitkeep` 没有可读取内容，本轮已经删除；历史
   仍由 Git 保存。
+- 全仓引用扫描发现 `materials/experiments/README.md` 仍指向旧单文件规范，本轮已改到
+  `doc/index.md`。
 
 ## 边界
 
