@@ -11,8 +11,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
-#include <cassert>
-
 namespace {
 
 using namespace weft;
@@ -192,7 +190,8 @@ buildCandidates(mlir::Operation *canonical,
     candidates.push_back({"scalar", {}, "scalar_linear"});
   else if (name == "weft_execution.summary_plan")
     candidates.push_back({"scalar", {}, "scalar_linear"});
-  else if (name == "weft_execution.contract_plan")
+  else if (name == "weft_execution.contract_plan" &&
+           mlir::isa<ContractOp>(canonical))
     candidates.push_back({"scalar", {}, "scalar_nested"});
   else if (name == "weft_execution.math_plan")
     candidates.push_back({"scalar", {}, "scalar_libm"});
@@ -215,12 +214,16 @@ buildCandidates(mlir::Operation *canonical,
   return candidates;
 }
 
-Candidate chooseCandidate(mlir::Operation *canonical,
-                          const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
-                          const RISCVTargetProfile &target) {
+mlir::FailureOr<Candidate>
+chooseCandidate(mlir::Operation *canonical,
+                const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                const RISCVTargetProfile &target) {
   llvm::SmallVector<Candidate> candidates =
       buildCandidates(canonical, rvvVLAs, target);
-  assert(!candidates.empty() && "planned anchor requires a legal candidate");
+  if (candidates.empty()) {
+    canonical->emitError("has no legal realization provider for the selected target");
+    return mlir::failure();
+  }
   return candidates.back();
 }
 
@@ -300,16 +303,19 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
     attrs.push_back(attr(builder, "value",
                          builder.getI64IntegerAttr(binding->second)));
   } else {
-    Candidate selected = chooseCandidate(canonical, rvvVLAs, options.target);
-    attrs.push_back(attr(builder, "provider", builder.getStringAttr(selected.provider)));
+    mlir::FailureOr<Candidate> selected =
+        chooseCandidate(canonical, rvvVLAs, options.target);
+    if (mlir::failed(selected))
+      return nullptr;
+    attrs.push_back(attr(builder, "provider", builder.getStringAttr(selected->provider)));
     if (name == "weft_execution.axis_plan") {
       attrs.push_back(attr(builder, "realization",
-                           builder.getStringAttr(selected.realization)));
-      attrs.push_back(attr(builder, "sew", builder.getI64IntegerAttr(selected.sew)));
-      attrs.push_back(attr(builder, "lmul", builder.getStringAttr(selected.lmul)));
-      attrs.push_back(attr(builder, "unroll", builder.getI64IntegerAttr(selected.unroll)));
+                           builder.getStringAttr(selected->realization)));
+      attrs.push_back(attr(builder, "sew", builder.getI64IntegerAttr(selected->sew)));
+      attrs.push_back(attr(builder, "lmul", builder.getStringAttr(selected->lmul)));
+      attrs.push_back(attr(builder, "unroll", builder.getI64IntegerAttr(selected->unroll)));
     } else {
-      attrs.push_back(attr(builder, "strategy", builder.getStringAttr(selected.strategy)));
+      attrs.push_back(attr(builder, "strategy", builder.getStringAttr(selected->strategy)));
     }
   }
   if (name == "weft_execution.contract_plan") {

@@ -150,6 +150,13 @@ std::string constantLiteral(mlir::Attribute attribute) {
   return {};
 }
 
+bool isTrueScalarPredicate(mlir::Value value) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  return value.getType().isInteger(1) && integer && !integer.getValue().isZero();
+}
+
 std::string shapeInitializer(llvm::ArrayRef<std::string> shape) {
   return "{" + llvm::join(shape, ", ") + "}";
 }
@@ -521,6 +528,8 @@ private:
   mlir::LogicalResult emitIf(IfOp op) {
     llvm::SmallVector<ValueInfo> results;
     for (mlir::Value result : op.getResults()) {
+      if (mlir::isa<BlockType, RegionType>(unwrapMasked(result.getType())))
+        return op.emitError("scalar if provider does not materialize shaped results");
       ValueInfo info = makeResult(result, {});
       declareResult(info, true);
       values[result] = info;
@@ -532,8 +541,12 @@ private:
     for (mlir::Operation &nested : op.getThenRegion().front().without_terminator())
       if (mlir::failed(emitOperation(&nested)))
         return mlir::failure();
-    for (auto [result, yielded] : llvm::zip(results, thenYield.getOperands()))
-      line(result.value + " = " + lookup(yielded).value + ";");
+    for (auto [result, yielded] : llvm::zip(results, thenYield.getOperands())) {
+      ValueInfo value = lookup(yielded);
+      line(result.value + " = " + value.value + ";");
+      if (result.isMasked())
+        line(result.validity + " = " + value.validity + ";");
+    }
     --indent;
     line("} else {");
     ++indent;
@@ -541,8 +554,12 @@ private:
     for (mlir::Operation &nested : op.getElseRegion().front().without_terminator())
       if (mlir::failed(emitOperation(&nested)))
         return mlir::failure();
-    for (auto [result, yielded] : llvm::zip(results, elseYield.getOperands()))
-      line(result.value + " = " + lookup(yielded).value + ";");
+    for (auto [result, yielded] : llvm::zip(results, elseYield.getOperands())) {
+      ValueInfo value = lookup(yielded);
+      line(result.value + " = " + value.value + ";");
+      if (result.isMasked())
+        line(result.validity + " = " + value.validity + ";");
+    }
     --indent;
     line("}");
     return mlir::success();
@@ -628,6 +645,7 @@ private:
     enum class Kind { Coordinate, Pointer, Vector } kind;
     mlir::Type type;
     std::string value;
+    bool allValid = true;
   };
 
   mlir::LogicalResult emitRVVVLA(VLAOp op, AxisPlanOp axis) {
@@ -730,7 +748,9 @@ private:
     auto pointer = rvvValues.find(op.getPointer());
     if (pointer == rvvValues.end() ||
         pointer->second.kind != RVVInfo::Kind::Pointer ||
-        !elementType(op.getResult().getType()).isF32())
+        !elementType(op.getResult().getType()).isF32() ||
+        !isTrueScalarPredicate(op.getWhere()) ||
+        !mlir::isa<mlir::NoneType>(op.getOther().getType()))
       return op.emitError("RVV unit-stride load requires a region f32 pointer");
     std::string name = fresh("rvv");
     line("vfloat32m1_t " + name + " = __riscv_vle32_v_f32m1(" +
@@ -757,6 +777,9 @@ private:
     std::string rhs = rhsIsVector ? rhsVector->second.value : rhsScalar.value;
     if (lhs.empty() || rhs.empty())
       return op.emitError("RVV pointwise operand is unavailable");
+    if ((lhsIsVector && !lhsVector->second.allValid) ||
+        (rhsIsVector && !rhsVector->second.allValid))
+      return op.emitError("RVV pointwise provider requires all-active validity");
 
     std::string intrinsic;
     llvm::StringRef kind = op.getKind();
@@ -802,7 +825,8 @@ private:
     auto value = rvvValues.find(op.getValue());
     if (pointer == rvvValues.end() || value == rvvValues.end() ||
         pointer->second.kind != RVVInfo::Kind::Pointer ||
-        value->second.kind != RVVInfo::Kind::Vector)
+        value->second.kind != RVVInfo::Kind::Vector ||
+        !value->second.allValid || !isTrueScalarPredicate(op.getWhere()))
       return op.emitError("RVV unit-stride store requires region pointer and vector value");
     line("__riscv_vse32_v_f32m1(" + pointer->second.value + ", " +
          value->second.value + ", " + vl.str() + ");");
@@ -819,7 +843,8 @@ private:
     if (input == rvvValues.end() ||
         input->second.kind != RVVInfo::Kind::Vector ||
         op.getAxis() != -1 || op.getKind() != "add" ||
-        !elementType(op.getInput().getType()).isF32())
+        !elementType(op.getInput().getType()).isF32() ||
+        !input->second.allValid || !isTrueScalarPredicate(op.getWhere()))
       return op.emitError("RVV tree reduction requires an active-axis f32 add");
     std::string seed = fresh("rvv_seed");
     std::string partial = fresh("rvv_partial");
@@ -1123,6 +1148,12 @@ private:
         if (op.getKind() == "xor")
           return "(" + lhsExpression.str() + " != " + rhsExpression.str() + ")";
       }
+      if (op.getKind() == "shl" || op.getKind() == "shr") {
+        std::string type = scalarCType(elementType(op.getResult().getType()));
+        return "weft_runtime::shift_" +
+               std::string(op.getKind() == "shl" ? "left" : "right") + "<" +
+               type + ">(" + lhsExpression.str() + ", " + rhsExpression.str() + ")";
+      }
       return combineExpression(op.getKind(), lhsExpression, rhsExpression);
     };
     if (build("a", "b").empty())
@@ -1334,6 +1365,8 @@ private:
       std::string condition = where.value;
       if (value.isMasked())
         condition = "(" + condition + " && " + value.validity + ")";
+      if (pointer.isMasked())
+        condition = "(" + condition + " && " + pointer.validity + ")";
       line("if (" + condition + ") " +
            storeStatement(pointer.value, value.value, pointerTy.getElementType()));
       return mlir::success();
@@ -1477,8 +1510,10 @@ private:
     std::string rhsIndex = rhsAxis == 0
                                ? "(" + k + " * " + rhs.value + ".shape[1] + " + n + ")"
                                : "(" + n + " * " + rhs.value + ".shape[1] + " + k + ")";
-    std::string condition = "(" + lookup(op.getWhereLhs()).value + " && " +
-                            lookup(op.getWhereRhs()).value + ")";
+    ValueInfo lhsWhere = lookup(op.getWhereLhs());
+    ValueInfo rhsWhere = lookup(op.getWhereRhs());
+    std::string condition = "(" + elementAccess(lhsWhere, lhsIndex, lhs.value) +
+                            " && " + elementAccess(rhsWhere, rhsIndex, rhs.value) + ")";
     if (lhs.isMasked())
       condition = "(" + condition + " && " + lhs.validity + ".data[" + lhsIndex + "])";
     if (rhs.isMasked())
@@ -1512,7 +1547,9 @@ private:
         rhsAxes.front() != 0 || !op.getOutputOrder().empty() ||
         !elementType(op.getLhs().getType()).isF16() ||
         !elementType(op.getRhs().getType()).isF16() ||
-        !op.getAccDtype().isF32() || !op.getOutDtype().isF32())
+        !op.getAccDtype().isF32() || !op.getOutDtype().isF32() ||
+        !isTrueScalarPredicate(op.getWhereLhs()) ||
+        !isTrueScalarPredicate(op.getWhereRhs()))
       return op.emitError("RVV f16/f32 contract provider requires [M,K]x[K,N]");
 
     ValueInfo info{op.getResult().getType(), fresh("rvv_contract"), {}, init.shape};
@@ -1598,6 +1635,7 @@ void emitPrelude(llvm::raw_ostream &output, bool usesRVV) {
 #include <initializer_list>
 #include <limits>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 namespace weft_runtime {
@@ -1681,6 +1719,32 @@ template <typename To, typename From> To bit_cast(const From &input) {
   return result;
 }
 
+template <typename T, typename S> T shift_left(T value, S amount) {
+  using U = std::make_unsigned_t<T>;
+  constexpr unsigned width = sizeof(T) * 8u;
+  unsigned shift = static_cast<unsigned>(amount);
+  if (shift >= width)
+    return T{0};
+  return static_cast<T>(static_cast<U>(value) << shift);
+}
+
+template <typename T, typename S> T shift_right(T value, S amount) {
+  using U = std::make_unsigned_t<T>;
+  constexpr unsigned width = sizeof(T) * 8u;
+  unsigned shift = static_cast<unsigned>(amount);
+  if (shift >= width) {
+    if constexpr (std::is_signed_v<T>)
+      return value < 0 ? T{-1} : T{0};
+    return T{0};
+  }
+  U shifted = static_cast<U>(value) >> shift;
+  if constexpr (std::is_signed_v<T>) {
+    if (value < 0 && shift != 0)
+      shifted |= static_cast<U>(~U{0}) << (width - shift);
+  }
+  return static_cast<T>(shifted);
+}
+
 inline float half_to_float(std::uint16_t bits) {
   std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
   std::uint32_t exponent = (bits >> 10) & 0x1fu;
@@ -1710,8 +1774,15 @@ inline float half_to_float(std::uint16_t bits) {
 inline std::uint16_t float_to_half(float input) {
   std::uint32_t bits = bit_cast<std::uint32_t>(input);
   std::uint32_t sign = (bits >> 16) & 0x8000u;
-  int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
+  std::uint32_t source_exponent = (bits >> 23) & 0xffu;
   std::uint32_t mantissa = bits & 0x7fffffu;
+  if (source_exponent == 0xffu) {
+    if (mantissa == 0)
+      return static_cast<std::uint16_t>(sign | 0x7c00u);
+    std::uint16_t payload = static_cast<std::uint16_t>(mantissa >> 13);
+    return static_cast<std::uint16_t>(sign | 0x7c00u | (payload ? payload : 1u));
+  }
+  int exponent = static_cast<int>(source_exponent) - 127 + 15;
   if (exponent <= 0) {
     if (exponent < -10)
       return static_cast<std::uint16_t>(sign);
