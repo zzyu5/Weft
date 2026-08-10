@@ -13,7 +13,10 @@
   value、memory/effect、state algebra、contract 和 numerical attributes；
 - `weft_ext` sibling dialect 拥有规范示例中的 `block_scaled_contract` 局部语义 primitive；
 - `weft-opt` 独立注册两个 dialect，并负责 parse/print/verify；
-- 六个规范示例均已完成 source→canonical→独立 parse/verify；
+- 六个规范 source 与新增完整 online-softmax baseline 均已完成
+  source→canonical→独立 parse/verify；
+- 十个固定 baseline 均已有可独立编译运行的 C reference/runtime，其中六个量化项保留
+  GGML packed block ABI 与通用标量语义；
 - 活动构建与 import 路径不读取 `materials/` 或 IntentDSL。
 
 目前尚无 target/provider/selected/artifact 路径，因而没有新的 RISC-V source、object、header
@@ -35,7 +38,9 @@ python/weft/
   language/                  public types, annotations and intrinsics
   frontend/                  source lowering + generic MLIR assembly
 tools/weft-opt/              canonical parse/print/verify driver
-examples/                    six normative source acceptance programs
+source/weft/weft/            normative source + active operator corpus
+source/c/                    adjacent reference/runtime source
+examples/repro/              manual repro entrypoints
 materials/                   inactive donor/history/artifacts
 ```
 
@@ -67,11 +72,15 @@ TableGen dialect 是唯一算法 schema 与最终 legality authority。
 2. TableGen 生成 Kernel/Extension dialect；
 3. C++ dialect 与 `weft-opt` 编译链接；
 4. Python package `compileall`；
-5. 六个 `examples/*.py` 分别由 `python -m weft` 生成 MLIR；
-6. 每份结果由新构建的 `weft-opt` parse/print/verify。
+5. `source/weft/weft/` 下六个规范 source 与完整 online-softmax baseline 分别由
+   `python -m weft` 生成 MLIR；
+6. 每份结果由新构建的 `weft-opt` parse/print/verify；
+7. `examples/repro/source/run_c_baselines.sh` 用系统 C 编译器分别编译并运行十份
+   `reference.c + runtime.c`，十项均输出 `PASS`。
 
 验证没有调用 materials 下的旧 binary，也没有建立 pytest/lit/coverage 或兼容矩阵。当前
-结果只证明 source/canonical 边界，不证明 RISC-V lowering、性能或目标机数值正确性。
+结果证明 Weft source/canonical 边界和独立 C baseline 可运行；C reference 的通过不证明
+Weft 已经生成它们，也不证明 RISC-V lowering、性能或目标机数值正确性。
 
 ## 5. Materials 状态
 
@@ -94,6 +103,10 @@ TableGen dialect 是唯一算法 schema 与最终 legality authority。
 - build specification、specialization/tuning 与 dispatcher；
 - IntentDSL/其他 frontend 到 canonical Weft IR 的外部 bridge；
 - 新语义主干上的真实 RISC-V 数值与性能结果。
+
+十项 baseline 及其 source readiness 以 [`../source/README.md`](../source/README.md) 为准。
+六项量化格式目前只有 GGML-derived C reference；在 canonical packed decode/quant contract
+语义完成前，不创建虚假的 Weft source。
 
 下一步仍应是最终规范定义的第二里程碑最小 executable vertical slice，而不是回填旧 emitter
 或按 kernel/operator 名增加 whole-kernel route。

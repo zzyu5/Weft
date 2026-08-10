@@ -53,7 +53,8 @@ TianchenRV/
 ├── lib/Dialect/                   # 新 canonical verifier 实现
 ├── python/weft/                   # 新 reference frontend
 ├── tools/weft-opt/                # canonical parse/print/verify
-├── examples/                      # 六个规范 source acceptance
+├── source/                        # 按 language/upstream/operator/variant 组织的输入语料
+├── examples/repro/                # 手工重放入口，不保存第二份 source
 └── materials/
     ├── README.md                  # 抽取索引与禁区
     ├── legacy-source/             # 旧实现，保持原相对路径
@@ -64,6 +65,10 @@ TianchenRV/
 
 上述活动目录均由第一里程碑按需创建，不从 materials 软链接或 import。项目不使用
 `weft-next/`、版本化目录、软链接或双 build root。
+
+`source/` 不参与默认 CMake：`source/weft/weft/` 保存 canonical frontend 输入，
+`source/c/` 保存相邻的 reference/runtime。它是端到端工作的 source corpus，不是测试树；
+固定 baseline 和当前 readiness 见 [`../source/README.md`](../source/README.md)。
 
 ## 5. Materials 硬隔离
 

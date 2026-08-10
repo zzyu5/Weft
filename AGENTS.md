@@ -76,6 +76,9 @@ Weft core 不解析 `intent.*`，不链接 IntentDSL，也不反向调用上游�
 - 不建 compatibility layer，不让新旧主干并行可达，不用 feature flag 切回旧实现；
 - 每个抽取文件都必须能脱离 donor 独立解释，名称与依赖服从新架构；
 - 不确定某段代码是算法语义还是物理实现时，先回到最终规范，不按现有目录猜归属。
+- `source/` 按 `source/<language>/<upstream>/<operator>/<variant>/` 组织输入语料；同一变体的
+  source/reference 与手工 runtime 相邻。`examples/` 只放 repro 入口，不保存第二份算法
+  source；`source/` 不得被包装成测试矩阵或默认 CMake target。
 
 ## 6. 文档纪律
 

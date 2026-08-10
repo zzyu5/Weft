@@ -54,7 +54,7 @@ Python source
 - `include/Weft/Dialect/{Kernel,Extension}/IR/`：TableGen schema；
 - `lib/Dialect/{Kernel,Extension}/IR/`：canonical verifier；
 - `tools/weft-opt/`：独立方言注册、parse、print、verify；
-- `examples/01_*.py` 至 `06_*.py`：六个规范程序。
+- `source/weft/weft/` 下对应最终规范的六个 source 文件：六个规范程序。
 
 本机 LLVM/MLIR 20.1.8 已完成 CMake/TableGen/C++ build；六个示例均由活动 Python package
 生成 MLIR，并由活动 `weft-opt` 独立解析与验证。没有使用 materials 中的旧 executable。
@@ -260,7 +260,8 @@ lib/Dialect/Kernel/IR/
 include/Weft/Dialect/Extension/IR/
 lib/Dialect/Extension/IR/
 tools/weft-opt/                 # parse/print/verify canonical IR
-examples/                       # 规范示例的 source acceptance
+source/weft/weft/               # 规范 source 与算子语料
+examples/repro/                 # 只保存手工 repro 入口
 ```
 
 不创建 `Execution`、RVV、IME、artifact 或 Intent 目录的空壳。
