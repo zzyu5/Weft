@@ -1,25 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <vec_dot|quantize|dequantize|forward|spacemit_rvv|ime1> <kernel> <repetitions>" >&2
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 <sg2044|k1> <mul_mat|vec_dot|quantize|dequantize|forward|ime1> <kernel> <repetitions>" >&2
   exit 2
 fi
 
-family=$1
-kernel=$2
-repetitions=$3
+target=$1
+family=$2
+kernel=$3
+repetitions=$4
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-remote_host=rvv
-remote_source=/home/ubuntu/llama.cpp-upstream-native
-remote_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv
-remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
-remote_cpu=8
-remote_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
-remote_extra_cxx_flags=
-remote_extra_define=
+
+case "${target}" in
+  sg2044)
+    remote_host=rvv
+    remote_source=/home/ubuntu/llama.cpp-upstream-native
+    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv
+    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_cpu=48
+    remote_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
+    remote_extra_cxx_flags=
+    remote_extra_define=
+    ;;
+  k1)
+    remote_host=k1
+    remote_source=/home/bianbu/tcrv-k1-llama
+    remote_build=/home/bianbu/tcrv-k1-llama/build-ime
+    remote_cxx=/usr/bin/clang++-18
+    remote_cpu=3
+    remote_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    remote_extra_cxx_flags=-fno-integrated-as
+    remote_extra_define=
+    ;;
+  *)
+    echo "unsupported GGML target: ${target}" >&2
+    exit 2
+    ;;
+esac
 
 case "${family}" in
+  mul_mat)
+    runtime=examples/repro/ggml/mul_mat_runtime.cpp
+    ;;
   vec_dot)
     runtime=examples/repro/ggml/vec_dot_runtime.cpp
     ;;
@@ -31,22 +54,16 @@ case "${family}" in
     ;;
   forward)
     runtime=examples/repro/ggml/forward_runtime.cpp
-    ;;
-  spacemit_rvv | ime1)
-    if [[ ${family} == spacemit_rvv ]]; then
-      runtime=examples/repro/ggml/forward_runtime.cpp
-      remote_extra_cxx_flags=-fno-integrated-as
-      remote_extra_define=-DGGML_BASELINE_SPACEMIT=1
-    else
-      runtime=examples/repro/ggml/ime1_runtime.cpp
-      remote_extra_cxx_flags=-fno-integrated-as
+    if [[ ${target} == k1 ]]; then
+      remote_extra_define=-DGGML_BASELINE_K1=1
     fi
-    remote_host=k1
-    remote_source=/home/bianbu/tcrv-k1-llama
-    remote_build=/home/bianbu/tcrv-k1-llama/build-ime
-    remote_cxx=/usr/bin/clang++-18
-    remote_cpu=3
-    remote_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    ;;
+  ime1)
+    if [[ ${target} != k1 ]]; then
+      echo "IME1 is only available on target k1" >&2
+      exit 2
+    fi
+    runtime=examples/repro/ggml/ime1_runtime.cpp
     ;;
   *)
     echo "unsupported GGML kernel family: ${family}" >&2

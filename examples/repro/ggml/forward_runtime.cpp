@@ -25,17 +25,26 @@ struct forward_case {
   const char *model_shape;
 };
 
-#if defined(GGML_BASELINE_SPACEMIT)
+#if defined(GGML_BASELINE_K1)
 const forward_case cases[] = {
     {"add", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
     {"mul", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"scale", "rvv_intrinsic", "hidden[128,4096]"},
+    {"cpy", "scalar_memcpy", "hidden[128,4096]"},
+    {"gelu", "scalar", "ffn[128,14336]"},
+    {"silu", "rvv_intrinsic", "ffn[128,14336]"},
     {"rms_norm", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"softmax", "rvv_intrinsic", "attention[heads=32,Q=128,K=128]"},
+    {"rope", "scalar", "q[head_dim=128,heads=32,tokens=128]"},
     {"sub", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
     {"div", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
     {"norm", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
     {"cont", "handwritten_rvv_inline_asm", "transpose(hidden[128,4096])"},
+    {"get_rows", "scalar", "embedding[vocab=128256,hidden=4096],tokens=128"},
     {"repeat", "spacemit_rvv_intrinsic", "norm_weight[4096]->hidden[128,4096]"},
     {"sum_rows", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"concat", "scalar", "hidden[64+64,4096]"},
+    {"flash_attn", "scalar_mixed", "Q=128,KV=128,H=32,Hkv=8,D=128"},
     {"get_rows_f32", "handwritten_rvv_inline_asm", "TinyLlama embedding[vocab=32000,hidden=2048],tokens=128"},
     {"concat_dim0", "spacemit_scalar", "hidden[128,2048+2048]"},
 };
@@ -304,7 +313,10 @@ int main(int argc, char **argv) {
       std::vector<float> b_values(
           static_cast<std::size_t>(ggml_nelements(operation.b)));
       for (std::size_t i = 0; i < b_values.size(); ++i) {
-        b_values[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 9.0F;
+        b_values[i] = std::strcmp(selected->name, "div") == 0
+                          ? static_cast<float>((i % 17) + 1) / 9.0F
+                          : static_cast<float>(static_cast<int>(i % 17) - 8) /
+                                9.0F;
       }
       ggml_backend_tensor_set(operation.b, b_values.data(), 0,
                               ggml_nbytes(operation.b));
@@ -399,15 +411,20 @@ int main(int argc, char **argv) {
     samples.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
   }
 
-  float output_sample = 0.0F;
-  ggml_backend_tensor_get(operation.output, &output_sample, 0, sizeof(output_sample));
-  if (!std::isfinite(output_sample)) {
-    std::fprintf(stderr, "non-finite output from %s\n", selected->name);
-    ggml_backend_buffer_free(buffer);
-    ggml_backend_free(backend);
-    ggml_free(ctx);
-    return 1;
+  std::vector<float> output_values(
+      static_cast<std::size_t>(ggml_nelements(operation.output)));
+  ggml_backend_tensor_get(operation.output, output_values.data(), 0,
+                          ggml_nbytes(operation.output));
+  for (float value : output_values) {
+    if (!std::isfinite(value)) {
+      std::fprintf(stderr, "non-finite output from %s\n", selected->name);
+      ggml_backend_buffer_free(buffer);
+      ggml_backend_free(backend);
+      ggml_free(ctx);
+      return 1;
+    }
   }
+  const float output_sample = output_values[0];
 
   std::printf("family=forward\n");
   std::printf("kernel=%s\n", selected->name);

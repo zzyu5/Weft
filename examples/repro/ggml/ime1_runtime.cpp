@@ -17,9 +17,9 @@
 
 namespace {
 
-constexpr std::size_t kN = 14336;
+constexpr std::size_t kN = 4096;
 constexpr std::size_t kK = 4096;
-constexpr std::size_t kFlushBytes = 32U * 1024U * 1024U;
+constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 
 using quantize_fn = void (*)(const float *, void *, std::int64_t);
 
@@ -212,17 +212,21 @@ int main(int argc, char **argv) {
         std::chrono::duration<double, std::micro>(end - begin).count());
   }
 
-  float output_sample = 0.0F;
-  ggml_backend_tensor_get(output, &output_sample, 0, sizeof(output_sample));
-  if (!std::isfinite(output_sample)) {
-    std::fprintf(stderr, "non-finite IME1 output from %s\n", selected->name);
-    ggml_backend_buffer_free(graph_buffer);
-    ggml_free(graph_ctx);
-    ggml_backend_buffer_free(weight_buffer);
-    ggml_free(weight_ctx);
-    ggml_backend_free(backend);
-    return 1;
+  std::vector<float> output_values(
+      static_cast<std::size_t>(ggml_nelements(output)));
+  ggml_backend_tensor_get(output, output_values.data(), 0, ggml_nbytes(output));
+  for (float value : output_values) {
+    if (!std::isfinite(value)) {
+      std::fprintf(stderr, "non-finite IME1 output from %s\n", selected->name);
+      ggml_backend_buffer_free(graph_buffer);
+      ggml_free(graph_ctx);
+      ggml_backend_buffer_free(weight_buffer);
+      ggml_free(weight_ctx);
+      ggml_backend_free(backend);
+      return 1;
+    }
   }
+  const float output_sample = output_values[0];
 
   const double cold_median_us = median(samples);
   const double operations = 2.0 * static_cast<double>(selected->m) *
@@ -232,11 +236,12 @@ int main(int argc, char **argv) {
   std::printf("phase=%s\n", selected->phase);
   std::printf("implementation=handwritten_ime1_asm\n");
   std::printf("target=SpacemiT-X60\n");
+  std::printf("model_shape=Llama-8B.hidden_projection\n");
   std::printf("M=%zu\nN=%zu\nK=%zu\n", selected->m, kN, kK);
   std::printf("vlen_bits=%d\n", ggml_cpu_get_rvv_vlen() * 8);
   std::printf("weight_buffer=%s\n", ggml_backend_buffer_name(weight_buffer));
   std::printf("scope=production-activation-quantize-plus-ime1-gemm\n");
-  std::printf("cold_protocol=32MiB-evict-then-single-op-graph\n");
+  std::printf("cold_protocol=64MiB-evict-then-single-op-graph\n");
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_gop_s=%.6f\n", operations / cold_median_us / 1.0e3);
