@@ -197,6 +197,14 @@ case "${kernel}" in
     dsl=examples/kernels/vision/conv_transpose2d.py
     runtime=examples/repro/weft/vision/conv_transpose2d_runtime.cpp
     ;;
+  im2col_backward)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 im2col_backward" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/im2col_backward.py
+    runtime=examples/repro/weft/vision/im2col_backward_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2
