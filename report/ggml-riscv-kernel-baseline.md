@@ -1,15 +1,184 @@
 # GGML RISC-V Kernel Baseline
 
-本文件是后续 Weft 单 kernel 性能对照的唯一 GGML baseline 口径。完整模型
-`llama-bench` 仍是独立的 e2e baseline，不能与这里的单 kernel 时间共用分母。
+本文件是后续 Weft 单 kernel 性能对照的 GGML baseline。这里比较的是模型级 shape 下的
+单次 kernel graph invocation；完整模型 `llama-bench` 是独立的 e2e baseline，二者不能
+共用分母。
 
-## 最终集合
+## 结论与计数口径
 
-当前 `ssh rvv` 上实际使用的是标准 RVV、VLEN=128 的 GGML CPU build。按 production
-primitive entry 去重，不重复计算同一 entry 内部的 VLEN body、generic fallback、reference
-implementation 或 graph traversal，最终 baseline 是 **69 个可运行 kernel**：
+GGML 的 RISC-V 路径不只有普通 RVV intrinsic。源码中同时存在标准 RVV intrinsic、
+SpacemiT 手写 RVV inline asm、XTheadVector inline asm、IME1 custom-instruction asm 和
+IME2 custom-instruction asm。它们依赖不同 ISA 与硬件，不能揉成一个脱离 target 的总数。
 
-| family | 数量 | RVV intrinsic | 当前标量/库实现 | 当前手写汇编 |
+当前可复现的 runtime baseline 分成三个 target profile：
+
+| target profile | 可运行 production entry | 实测 case | 当前结果 |
+|---|---:|---:|---|
+| SG2044，标准 RVV VLEN128 | 69 | 69 | 29 RVV intrinsic，40 scalar/library/generic，69/69 运行通过 |
+| K1/X60，SpacemiT RVV VLEN256 | 11 | 11 | 8 RVV intrinsic，2 手写 RVV inline asm，1 scalar，11/11 运行通过 |
+| K1/X60，IME1 | 3 个量化 weight-format entry | 6 个 decode/prefill case | production repack + activation quantize + IME1 GEMM，6/6 运行通过 |
+
+这三个 profile **不能相加成一个“83 个 kernel”**：第二组与第一组有逻辑算子重叠，第三组
+又是在不同 target 上对三个量化格式各测 decode/prefill。后续 Weft 对表时必须先选择 target
+profile，再在相同 shape、layout、线程数和 cold-memory 口径下比较。
+
+另外两组源码路径已经纳入清单，但当前没有可声称成功的性能数字：
+
+- XTheadVector：4 个量化 vec-dot alternate entry；当前 SG2044 build 选择标准 RVV，K1
+  runner 也不是 XTheadVector build。
+- IME2：8 个 active optimized dispatch family；目前可访问的 K1/X60 只报告
+  `use_ime1=1,use_ime2=0`，没有 IME2 core/build，因此不伪造 cold time。
+
+## 手写汇编清单
+
+### SpacemiT RVV inline asm
+
+`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/spacemit/rvv_kernels.cpp` 中有三个手写
+RVV helper、五个 `__asm__ volatile` block：
+
+- `rvv_transposed_s32_mn_to_nm`：e32 transpose；当前由 `cont` runtime 真实触发。
+- `rvv_transposed_s16_mn_to_nm`：e16 transpose；源码存在，但当前 K1 VLEN256 profile 没有
+  一条无缺陷的 production F16 graph 可以作为 baseline。
+- `memcpy1d`：按 VLEN 选择的手写 vector copy；当前由 F32 `get_rows` runtime 真实触发。
+
+因此，K1 profile 中可运行并计时的手写 RVV GGML entry 是 **2 个**：`cont` 和
+`get_rows_f32`。这不是“源码里有汇编但 benchmark 实际没走”的静态计数。
+
+### XTheadVector inline asm
+
+`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/arch/riscv/quants.c` 中有四个
+`__riscv_xtheadvector` alternate entry：
+
+- `ggml_vec_dot_q2_K_q8_K_xtheadvector`
+- `ggml_vec_dot_q3_K_q8_K_xtheadvector`
+- `ggml_vec_dot_q4_K_q8_K_xtheadvector`
+- `ggml_vec_dot_q6_K_q8_K_xtheadvector`
+
+它们使用 `th.*` inline asm。SG2044 的 69 项 profile 对应标准 RVV build，这四项实际走
+RVV intrinsic，而不是这些 alternate body。
+
+### IME1 asm
+
+`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/spacemit/ime1_kernels.cpp` 有六个 inline-asm
+block，production path 对外体现为三个手写 asm family：
+
+- `ime1::quantize_a_row_i8`
+- `ime1::quantize_a_4row_i8`
+- `ime1::gemm_kernel_i8i4`，内部按 M=1/M=4 与 zero-point 形式选择实现
+
+GGML 对 `Q4_0/Q4_1/Q4_K` 分别建立 repack trait；这三个格式都复用 i8×i4 IME1 GEMM
+family，而不是三个互不相关的手写 kernel。decode 会覆盖单行 activation quantizer，prefill
+会覆盖四行 quantizer。
+
+### IME2 asm
+
+`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/spacemit/ime2_kernels.cpp` 有 27 个 asm block。
+当前 wrapper 实际选择 optimized body 的八个 family 是：
+
+- `gemm_kernel_i8i2k`
+- `gemm_kernel_i8i3k`
+- `gemm_kernel_i8i4`
+- `gemm_kernel_i8i4_hp`
+- `gemm_kernel_i8i8`
+- `gemm_kernel_i8i5`
+- `moe_m2_gemm_kernel_i8i4`
+- `moe_m2_gemm_kernel_i8i5`
+
+`gemm_kernel_i8mxfp4` 当前 wrapper 明确选择 reference body；
+`moe_m2_gemm_kernel_i8mxfp4` 的 optimized 调用被注释，函数直接返回。因此二者不能算作
+active IME2 asm baseline。
+
+## Cold-memory 口径
+
+这里的“冷启动”是 **cache-cold 的稳定 kernel invocation**，不是进程首次调用、动态库
+加载、SSH、编译、模型载入、weight repack 或 codegen 时间。
+
+共同口径：
+
+- runtime 和动态链接在计时前完成；
+- 每个 case 先完整 warmup 一次；
+- 每次计时前读写 eviction buffer，eviction 本身不计时；
+- 每项运行 10 次，表中为 wall-time median；
+- 输入使用真实模型级 shape，不使用 toy matrix；
+- 单线程并固定到一个目标 core。
+
+目标差异：
+
+| profile | host/core | VLEN | eviction | build |
+|---|---|---:|---:|---|
+| 标准 RVV | `ssh rvv` / CPU 8 | 128 bit | 64 MiB | SG2044 `rv64gcv` GGML CPU build |
+| SpacemiT RVV | `ssh k1` / CPU 3 | 256 bit | 64 MiB | X60 SpacemiT GGML build |
+| IME1 | `ssh k1` / CPU 3 | 256 bit | 32 MiB | X60 IME1-enabled SpacemiT GGML build |
+
+K1 的 IME 只存在于 core 0--3，因此固定 core 3。当前机器没有 `/dev/tcm_sync_mem`，vendor
+runtime 报告 TCM allocation 不可用并回退 heap；下面的 IME1 数字仍是真实 IME1 指令执行，
+但不是 TCM-enabled 结果。
+
+## K1/X60 SpacemiT RVV
+
+这 11 个 entry 通过 GGML graph 和 SpacemiT `tensor_traits_common` dispatch，而不是直接调用
+helper。所有 case 均在 VLEN256、core 3、单线程、64 MiB eviction、10 次 median 下运行成功。
+
+| kernel | 实际实现 | 模型级 shape | cold median (ms) |
+|---|---|---|---:|
+| `norm` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 1.703 |
+| `rms_norm` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 1.768 |
+| `add` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 1.578 |
+| `sub` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 1.533 |
+| `mul` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 1.559 |
+| `div` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 2.019 |
+| `repeat` | SpacemiT RVV intrinsic | norm `[4096]` -> hidden `[128,4096]` | 0.352 |
+| `sum_rows` | SpacemiT RVV intrinsic | hidden `[128,4096]` | 0.598 |
+| `cont` | **handwritten RVV e32 transpose asm** | transpose of hidden `[128,4096]` | 4.307 |
+| `get_rows_f32` | **handwritten RVV copy asm** | TinyLlama vocab=32000, hidden=2048, tokens=128 | 0.682 |
+| `concat_dim0` | SpacemiT scalar target body | hidden `[128,2048+2048]` | 3.963 |
+
+SpacemiT source 中还有 VLEN1024-only FlashAttention target；K1 是 VLEN256，production dispatch
+会落到 generic path，所以它不计入这 11 项 target baseline。
+
+### 未纳入可运行集合的 vendor defect
+
+两条源码路径存在，但不能写成成功 baseline：
+
+- `forward_cpy_with_permute` 把 `n_dst_stride` 计算成 `n_src_stride * m`，而同构的 CONT
+  路径使用正确的 `dst->nb[1]`。模型级 F32 transpose-copy 会写出目标 buffer 并以 exit 255
+  结束。
+- `permute_transpose_impl` 的 `sizeof(int16_t)` 分支错误调用
+  `rvv_transposed_s32_mn_to_nm`，会用 e32 load/store 处理 F16。此前一次“能返回有限 float”
+  不能证明正确，因为两个 half 被当作一个 float 读取。
+
+runner 不再暴露这两个失败 case。修复 vendor backend 之前，它们只属于 source defect，不属于
+可运行性能基线。
+
+## K1/X60 IME1
+
+IME1 runtime 没有直接调用 `ime1_kernels.cpp` 的函数。它使用
+`ggml_backend_cpu_riscv64_spacemit_buffer_type()` 分配 weight，通过 `set_tensor` 执行 vendor
+repack，要求 `weight->extra` 非空，再建立单一 `GGML_OP_MUL_MAT` graph。当前 build 只启用
+IME1，runtime banner 为 `use_ime1=1,use_ime2=0`；因此 trait 选择会进入 IME1 activation
+quantizer 与 `gemm_kernel_i8i4`。
+
+统一权重 shape 来自 DeepSeek-R1-Distill-Llama-8B FFN-up：`N=14336, K=4096`。decode
+使用 `M=1`，prefill 使用 `M=128`。计时范围是 production activation quantize + IME1 GEMM，
+不含 weight repack。
+
+| weight format | phase | M | cold median (ms) | GOP/s |
+|---|---|---:|---:|---:|
+| `Q4_0` | decode | 1 | 9.666 | 12.150 |
+| `Q4_0` | prefill | 128 | 527.101 | 28.519 |
+| `Q4_1` | decode | 1 | 11.499 | 10.214 |
+| `Q4_1` | prefill | 128 | 603.625 | 24.904 |
+| `Q4_K` | decode | 1 | 11.450 | 10.257 |
+| `Q4_K` | prefill | 128 | 603.943 | 24.890 |
+
+6/6 case 均完成 dynamic link、repack、warmup、10 次 cold invocation，并返回有限 F32 输出。
+
+## SG2044 标准 RVV profile
+
+这一节只描述 `ssh rvv` 的标准 RVV VLEN128 build，不能代表整个 GGML RISC-V source。
+按 production primitive entry 去重，共 **69 个可运行 kernel**：
+
+| family | 数量 | RVV intrinsic | 标量/库/generic | 手写汇编 |
 |---|---:|---:|---:|---:|
 | quantized vec-dot | 24 | 23 | 1 | 0 |
 | activation row quantize | 3 | 3 | 0 | 0 |
@@ -17,53 +186,15 @@ implementation 或 graph traversal，最终 baseline 是 **69 个可运行 kerne
 | LLM forward | 18 | 3 | 15 | 0 |
 | **总计** | **69** | **29** | **40** | **0** |
 
-69/69 均已在目标机完成动态链接、真实调用并返回有限输出；没有用 scalar stub 冒充
-RVV 成功，也没有把未编译源码写成可运行 baseline。
+69/69 均完成实际动态链接、真实调用并返回有限输出。IQ1/IQ2/IQ3 没有普通 row quantizer，
+runtime 使用合法的全零 quantized block；它会执行同一 RVV entry 与完整矩阵调用次数，但不
+代表真实 GGUF 数值分布。
 
-### 实现类别
-
-- 当前实际 RVV intrinsic：23 个 RISC-V vec-dot、`quantize_row_q8_0/q8_1/q8_K`、
-  `scale`、`silu`、`softmax`。
-- 当前仅标量或标准库路径：`nvfp4_q8_0`、全部 24 个 row-dequant、其余 15 个
-  forward entry。其中 `cpy/cont` 主要是 scalar/`memcpy`，FlashAttention 是当前 generic
-  mixed path。
-- 当前实际手写汇编：**0 个**。
-
-源码中确实存在手写汇编，但它们不是这台机器当前选择的 baseline：
-
-- `q2_K/q3_K/q4_K/q6_K` 有 XTheadVector inline-asm alternate body；当前 build 使用标准
-  `__riscv_v`，四项实际走 RVV intrinsic。
-- SpacemiT IME1/IME2 source 含手写 custom-instruction asm，但当前 build 没有启用
-  `GGML_CPU_RISCV64_SPACEMIT`，动态库中没有对应符号。
-- RISC-V repack source 有 13 个 RVV quantize/GEMV/GEMM entry；VLEN128 的 production
-  selector 对 16×1 路径明确不选择，q4_0 8×8 又要求至少 VLEN256，因此当前可达数为 0。
-  这些 source-only entry 和 48 个 generic fallback 不进入 69 项 baseline。
-
-## Cold-memory 口径
-
-这里的“冷启动”沿用项目原有含义：**cache-cold 的稳定 kernel invocation**，不是进程
-第一次调用、动态库加载、SSH、编译或 codegen 时间。
-
-- 目标：`ssh rvv`，标准 RVV，VLEN=128，固定 CPU 8，单线程；
-- runtime 和动态链接在计时前完成；
-- 每个 kernel 先完整 warmup 一次；
-- 每次计时前顺序读写 64 MiB eviction buffer；eviction 本身不计时；
-- 每项运行 10 次，表中为 wall-time median；
-- 输入数值确定性构造，shape、block layout、buffer footprint 和调用次数使用完整模型级
-  尺寸，不使用 16×16、17×18×19 等 toy case；
-- IQ1/IQ2/IQ3 没有普通 row quantizer，使用合法的全零 quantized block；这能真实执行
-  同一 RVV entry 和完整矩阵调用次数，但不表示真实 GGUF 数值分布。
-
-已知远端两个长期高负载进程位于 CPU 37 和 56，不与固定 CPU 8 共核。`cont` 的一次
-首轮 sweep 出现外部干扰；随后两次独立 cold median 为 13.476 ms 和 13.532 ms，表中采用
-后者。其余抽查离群项均稳定复现。
-
-## Quantized vec-dot
+### Quantized vec-dot
 
 统一 shape：DeepSeek-R1-Distill-Llama-8B FFN-up decode，`M=1, N=14336, K=4096`。
-时间覆盖完整 `N` 个输出 dot；吞吐按 `2MNK` 计算。
 
-| kernel | 当前实现 | cold median (ms) | GOP/s |
+| kernel | 实现 | cold median (ms) | GOP/s |
 |---|---|---:|---:|
 | `q1_0_q8_0` | RVV intrinsic | 51.944 | 2.261 |
 | `q4_0_q8_0` | RVV intrinsic | 47.494 | 2.473 |
@@ -90,23 +221,19 @@ RVV 成功，也没有把未编译源码写成可运行 baseline。
 | `mxfp4_q8_0` | RVV intrinsic | 17.626 | 6.663 |
 | `nvfp4_q8_0` | scalar | 310.581 | 0.378 |
 
-## Activation quantize
+### Activation quantize
 
 统一 shape：DeepSeek 8B FFN-down prefill activation，`M=128, K=14336`。
 
-| kernel | 当前实现 | cold median (ms) | MElements/s |
+| kernel | 实现 | cold median (ms) | MElements/s |
 |---|---|---:|---:|
 | `quantize_row_q8_0` | RVV intrinsic | 3.294 | 557.016 |
 | `quantize_row_q8_1` | RVV intrinsic | 4.500 | 407.795 |
 | `quantize_row_q8_K` | RVV intrinsic | 3.969 | 462.372 |
 
-只纳入这三个 inference activation quantizer。其余 16 个 scalar `from_float` wrapper 主要
-服务模型量化、转换或 reference 路径，不是 quantized matmul 的 activation hot path，因此
-不重复扩张 baseline。
+### Row dequantize
 
-## Row dequantize
-
-统一 shape：DeepSeek 8B attention-K tensor，`N=1024, K=4096`。24 项均是 GGML 当前
+统一 shape：DeepSeek 8B attention-K tensor，`N=1024, K=4096`。24 项均是当前
 trait-visible scalar implementation。
 
 | kernel | cold median (ms) | MElements/s |
@@ -136,15 +263,12 @@ trait-visible scalar implementation。
 | `dequantize_row_iq4_nl` | 25.707 | 163.160 |
 | `dequantize_row_iq4_xs` | 26.090 | 160.764 |
 
-`q8_1` 没有 production dequant entry；`q8_K` 虽有 helper definition，但没有挂到当前
-production `to_float` trait，因此二者不计入这 24 项。
+`q8_1` 没有 production dequant entry；`q8_K` helper 没有挂到当前 production
+`to_float` trait，二者不计入这 24 项。
 
-## LLM forward
+### LLM forward
 
-这些 entry 覆盖 dense decoder、常见 GELU 模型、MoE row/repeat/concat 辅助路径，以及可选
-FlashAttention。所有 shape 都来自 DeepSeek/Llama 8B 级模型，而非统一小向量。
-
-| kernel | 当前实现 | 模型级 shape | cold median (ms) |
+| kernel | 实现 | 模型级 shape | cold median (ms) |
 |---|---|---|---:|
 | `add` | scalar | hidden `[128,4096]` | 0.783 |
 | `sub` | scalar | hidden `[128,4096]` | 0.791 |
@@ -160,13 +284,10 @@ FlashAttention。所有 shape 都来自 DeepSeek/Llama 8B 级模型，而非统�
 | `softmax` | RVV intrinsic | heads=32, Q=128, K=128 | 4.203 |
 | `rope` | scalar | head_dim=128, heads=32, tokens=128 | 1.311 |
 | `get_rows` | scalar Q4_K dequant | vocab=128256, hidden=4096, tokens=128 | 0.823 |
-| `repeat` | scalar | norm `[4096]` → hidden `[128,4096]` | 0.741 |
+| `repeat` | scalar | norm `[4096]` -> hidden `[128,4096]` | 0.741 |
 | `sum_rows` | scalar | hidden `[128,4096]` | 2.144 |
 | `concat` | scalar | hidden `[64+64,4096]` | 1.013 |
 | `flash_attn` | generic mixed | Q=128, KV=128, H=32, Hkv=8, D=128 | 18.196 |
-
-当前 build 没有编译 SpacemiT RVV forward traits，所以即使 source 中存在对应 target kernel，
-这里仍按动态库实际执行的 generic 路径分类。
 
 ## 运行入口
 
@@ -174,21 +295,35 @@ FlashAttention。所有 shape 都来自 DeepSeek/Llama 8B 级模型，而非统�
 
 ```bash
 ./examples/run/ggml-kernel.sh \
-  <vec_dot|quantize|dequantize|forward> \
+  <vec_dot|quantize|dequantize|forward|spacemit_rvv|ime1> \
   <kernel> \
   10
 ```
 
-四个 family 各自拥有独立 runtime；runner 只负责上传、按目标 build flags 编译、固定 CPU
-并执行，不包含 kernel 语义分支：
+SpacemiT RVV 的当前可运行 kernel 参数：
+
+```text
+norm rms_norm add sub mul div repeat sum_rows cont get_rows_f32 concat_dim0
+```
+
+IME1 的 kernel 参数：
+
+```text
+q4_0_decode q4_0_prefill
+q4_1_decode q4_1_prefill
+q4_K_decode q4_K_prefill
+```
+
+runtime 文件：
 
 ```text
 examples/repro/ggml/vec_dot_runtime.cpp
 examples/repro/ggml/quantize_runtime.cpp
 examples/repro/ggml/dequantize_runtime.cpp
 examples/repro/ggml/forward_runtime.cpp
+examples/repro/ggml/ime1_runtime.cpp
 ```
 
-未来 Weft intrinsic C 只能在相同 shape、layout、线程数和 cold-memory 口径下与对应行做
-比值。需要完整模型结论时，另用 `examples/run/ggml.sh` 的 prompt/decode token/s；不得拿
-本表 kernel ms 推导模型 token/s。
+runner 只负责选择目标 GGML build、上传对应 runtime、固定 CPU 并执行。IME2 没有 runner，
+因为当前没有可访问的 IME2 target；未实现就保持不可运行，不以 IME1、普通 RVV 或 reference
+body 兜底冒充 IME2。

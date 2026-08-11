@@ -25,6 +25,21 @@ struct forward_case {
   const char *model_shape;
 };
 
+#if defined(GGML_BASELINE_SPACEMIT)
+const forward_case cases[] = {
+    {"add", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"mul", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"rms_norm", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"sub", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"div", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"norm", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"cont", "handwritten_rvv_inline_asm", "transpose(hidden[128,4096])"},
+    {"repeat", "spacemit_rvv_intrinsic", "norm_weight[4096]->hidden[128,4096]"},
+    {"sum_rows", "spacemit_rvv_intrinsic", "hidden[128,4096]"},
+    {"get_rows_f32", "handwritten_rvv_inline_asm", "TinyLlama embedding[vocab=32000,hidden=2048],tokens=128"},
+    {"concat_dim0", "spacemit_scalar", "hidden[128,2048+2048]"},
+};
+#else
 const forward_case cases[] = {
     {"add", "scalar", "hidden[128,4096]"},
     {"mul", "scalar", "hidden[128,4096]"},
@@ -45,6 +60,7 @@ const forward_case cases[] = {
     {"concat", "scalar", "hidden[64+64,4096]"},
     {"flash_attn", "scalar_mixed", "Q=128,KV=128,H=32,Hkv=8,D=128"},
 };
+#endif
 
 struct built_case {
   ggml_tensor *a = nullptr;
@@ -147,6 +163,12 @@ built_case build(ggml_context *ctx, const char *name) {
     result.output = ggml_get_rows(ctx, result.a, result.indices);
     return result;
   }
+  if (std::strcmp(name, "get_rows_f32") == 0) {
+    result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 32000);
+    result.indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 128);
+    result.output = ggml_get_rows(ctx, result.a, result.indices);
+    return result;
+  }
   if (std::strcmp(name, "repeat") == 0) {
     result.a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4096);
     result.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 128);
@@ -162,6 +184,12 @@ built_case build(ggml_context *ctx, const char *name) {
     result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 64);
     result.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 64);
     result.output = ggml_concat(ctx, result.a, result.b, 1);
+    return result;
+  }
+  if (std::strcmp(name, "concat_dim0") == 0) {
+    result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 128);
+    result.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 128);
+    result.output = ggml_concat(ctx, result.a, result.b, 0);
     return result;
   }
   if (std::strcmp(name, "flash_attn") == 0) {
@@ -319,8 +347,11 @@ int main(int argc, char **argv) {
   if (operation.indices != nullptr) {
     std::vector<std::int32_t> index_values(
         static_cast<std::size_t>(ggml_nelements(operation.indices)));
+    const std::size_t vocabulary =
+        std::strcmp(selected->name, "get_rows_f32") == 0 ? 32000U : 128256U;
     for (std::size_t i = 0; i < index_values.size(); ++i) {
-      index_values[i] = static_cast<std::int32_t>((i * 997U) % 128256U);
+      index_values[i] =
+          static_cast<std::int32_t>((i * 997U) % vocabulary);
     }
     ggml_backend_tensor_set(operation.indices, index_values.data(), 0,
                             ggml_nbytes(operation.indices));
@@ -381,7 +412,10 @@ int main(int argc, char **argv) {
   std::printf("family=forward\n");
   std::printf("kernel=%s\n", selected->name);
   std::printf("implementation=%s\n", selected->implementation);
-  std::printf("model=DeepSeek-R1-Distill-Llama-8B\n");
+  std::printf("model=%s\n",
+              std::strcmp(selected->name, "get_rows_f32") == 0
+                  ? "TinyLlama-1.1B"
+                  : "DeepSeek-R1-Distill-Llama-8B");
   std::printf("model_shape=%s\n", selected->model_shape);
   std::printf("threads=1\n");
   std::printf("vlen_bits=%d\n", ggml_cpu_get_rvv_vlen() * 8);
