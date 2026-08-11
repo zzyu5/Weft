@@ -106,6 +106,14 @@ case "${kernel}" in
     multi_primary=top_k_f32
     multi_equivalent=top_k_f32_equivalent
     ;;
+  argsort)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 argsort" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/selection/argsort.py
+    runtime=examples/repro/weft/selection/argsort_runtime.cpp
+    ;;
   ssm_conv)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 ssm_conv" >&2

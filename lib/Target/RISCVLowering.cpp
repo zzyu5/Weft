@@ -955,6 +955,8 @@ private:
     }
     if (auto op = mlir::dyn_cast<ForOp>(operation))
       return emitFor(op);
+    if (auto op = mlir::dyn_cast<WhileOp>(operation))
+      return emitWhile(op);
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       if (auto lowered = tryEmitMaterializedF32BlockStore(op))
         return *lowered;
@@ -1259,6 +1261,90 @@ private:
     if (mlir::failed(emitCarriedUpdates(
             yield, "ordered range yielded an unavailable value")))
       return mlir::failure();
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitWhile(WhileOp op) {
+    mlir::Block &condition = op.getConditionRegion().front();
+    mlir::Block &body = op.getBodyRegion().front();
+    if (op.getInitArgs().size() != op.getNumResults() ||
+        condition.getNumArguments() != op.getNumResults() ||
+        body.getNumArguments() != op.getNumResults())
+      return op.emitError("ordered while carried-value arity is inconsistent");
+
+    llvm::SmallVector<CValue> carried;
+    for (auto [result, initial] : llvm::zip(op.getResults(), op.getInitArgs())) {
+      CValue init = require(initial);
+      if (init.kind != CValueKind::Scalar || init.spelling.empty() ||
+          !mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
+              result.getType()))
+        return op.emitError(
+            "ordered while currently carries only available scalar values");
+      CValue value{result.getType(), CValueKind::Scalar, fresh("while_carry")};
+      line(scalarCType(elementType(result.getType())) + " " + value.spelling +
+           " = " + init.spelling + ";");
+      values[result] = value;
+      carried.push_back(value);
+    }
+
+    auto stageScalars = [&](mlir::ValueRange source, llvm::StringRef prefix,
+                            llvm::SmallVectorImpl<CValue> &staged) {
+      if (source.size() != carried.size())
+        return mlir::failure();
+      for (auto [expected, value] : llvm::zip(carried, source)) {
+        CValue emitted = require(value);
+        if (emitted.kind != CValueKind::Scalar || emitted.spelling.empty() ||
+            emitted.type != expected.type)
+          return mlir::failure();
+        CValue next{emitted.type, CValueKind::Scalar, fresh(prefix)};
+        line(scalarCType(elementType(emitted.type)) + " " + next.spelling +
+             " = " + emitted.spelling + ";");
+        staged.push_back(next);
+      }
+      return mlir::success();
+    };
+
+    line("while (1) {");
+    ++indent;
+    for (auto [argument, value] : llvm::zip(condition.getArguments(), carried))
+      values[argument] = value;
+    for (mlir::Operation &nested : condition.without_terminator())
+      if (mlir::failed(emitOperation(&nested)))
+        return mlir::failure();
+    auto conditionTerminator =
+        mlir::cast<ConditionOp>(condition.getTerminator());
+    CValue predicate = require(conditionTerminator.getCondition());
+    if (predicate.kind != CValueKind::Scalar || predicate.spelling.empty())
+      return conditionTerminator.emitError(
+          "ordered while condition has no scalar realization");
+    llvm::SmallVector<CValue> forwarded;
+    if (mlir::failed(stageScalars(conditionTerminator.getValues(),
+                                  "while_forward", forwarded)))
+      return conditionTerminator.emitError(
+          "ordered while condition forwarded an unavailable scalar value");
+
+    line("if (!(" + predicate.spelling + ")) {");
+    ++indent;
+    for (auto [destination, value] : llvm::zip(carried, forwarded))
+      line(destination.spelling + " = " + value.spelling + ";");
+    line("break;");
+    --indent;
+    line("}");
+
+    for (auto [argument, value] : llvm::zip(body.getArguments(), forwarded))
+      values[argument] = value;
+    for (mlir::Operation &nested : body.without_terminator())
+      if (mlir::failed(emitOperation(&nested)))
+        return mlir::failure();
+    auto yield = mlir::cast<YieldOp>(body.getTerminator());
+    llvm::SmallVector<CValue> updated;
+    if (mlir::failed(stageScalars(yield.getValues(), "while_next", updated)))
+      return yield.emitError(
+          "ordered while body yielded an unavailable scalar value");
+    for (auto [destination, value] : llvm::zip(carried, updated))
+      line(destination.spelling + " = " + value.spelling + ";");
     --indent;
     line("}");
     return mlir::success();
@@ -2892,7 +2978,7 @@ private:
     else
       return op.emitError("masked scalar load requires an explicit other value");
     values[op.getResult()] = scalarExpression(
-        op.getResult(), std::move(expression), "load");
+        op.getResult(), std::move(expression), "load", true);
     return mlir::success();
   }
 
