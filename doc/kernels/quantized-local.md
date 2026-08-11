@@ -82,6 +82,33 @@ signed-i8 codebook作为显式readonly pointer operand，拆出low/high nibble�
 `vrgather` realization；emitter从decision取得E8M1/E32M4 physical shape。它不检查kernel名，
 也不从packed byte pattern猜IQ4_NL。
 
+## Q1_0 × Q8_0 row dot
+
+Q1_0 persistent block覆盖128个logical weight，总计18 bytes：little-endian F16 scale加16个
+sign bytes。一个Q1 block显式对应四个34-byte Q8_0 block；source负责：
+
+```text
+weight row stride = (K / 128) * 18
+weight block      = row_base + block * 18
+for sub_block in 0..4:
+  sign bytes      = weight block + 2 + sub_block * 4
+  activation      = q8 base + (block * 4 + sub_block) * 34
+  result          = sign_bit_i8_dot(..., result)
+```
+
+`sign_bit_i8_dot`只定义当前32 elements的bit-to-sign relation。128-element grouping、四个独立
+Q8 scale、outer block reduction与row output不会被target从format名或byte stride推断。
+
+## MXFP4 × Q8_0 row dot
+
+MXFP4 persistent block覆盖32个logical weight，总计17 bytes：一个E8M0 exponent byte加16个
+packed E2M1 bytes。Source显式形成17/34-byte block地址，分别load exponent、packed codes和
+Q8_0 scale/codes，然后调用一次 `e2m1_e8m0_i8_dot`。
+
+E2M1 codebook与E8M0 scale是local primitive的可观察数值语义；row stride、block traversal、
+activation layout和public ABI仍是Kernel IR事实。Target可以选择table/register organization，
+不能恢复whole-kernel `mxfp4` route。
+
 ## Activation quantize + affine contract
 
 Quantized projection通常包含两个不同层次：

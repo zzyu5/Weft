@@ -47,7 +47,11 @@ verifier、pipeline front door或长期provider registry。
 - local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；
 - block decode的table extent、code/result vector shape与RVV gather realization；
 - symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
-  N16×K32 realization。
+  N16×K32 realization；
+- sign-bit×i8 primitive的block bases、scale/init operands与VLEN128 widening-sign-sum
+  realization；
+- E2M1/E8M0×i8 primitive的packed-code/activation bases、exponent/scale/init operands与
+  VLEN128 table-dot realization。
 
 这些decision不进入Kernel IR。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape
 和fragment；后续store、cast或leaf不能再根据use count、周围op数量或完整kernel source重新
@@ -110,8 +114,9 @@ rounding或 lane permutation，则增加一个局部 canonical primitive。禁�
 
 若扩展要求改变outer traversal、cache blocking、persistent packing、多阶段staging或跨
 primitive state，作者或上游必须提供完整source variant。Target lowering不自动发明算法
-variant。当前 `weft_ext.affine_i4_i8_contract` 与 `grouped_affine_i4_i8_dot` 都只定义局部
-observable quantized relation；它们周围的packing、pointer和loop仍属于Kernel IR。
+variant。当前 `weft_ext.affine_i4_i8_contract`、`grouped_affine_i4_i8_dot`、
+`sign_bit_i8_dot` 与 `e2m1_e8m0_i8_dot` 都只定义局部observable quantized relation；
+它们周围的packing、pointer和loop仍属于Kernel IR。
 
 ## 组合判据
 
@@ -128,9 +133,10 @@ kernel family。
 
 ## 当前实现边界
 
-逐实体VLA memory/predicate/state/narrow、codebook decode与symmetric IME fragment已经按上述
-模型工作。Local F32 contract已经从enclosing-loop closure改为根据block axis、typed operand、
-pointer/access与predicate projection选择row microtile。当前源码仍有若干较早的exact closure
+逐实体VLA memory/predicate/state/narrow、codebook decode、sign-bit/E2M1 local dot与symmetric
+IME fragment已经按上述模型工作。Local F32 contract根据block/VLA axis、typed operand、
+pointer/access与predicate projection选择row microtile，并已在dense/out-product及卷积坐标关系中
+复用；当前仍只支持一个较窄的F32 free-axis family。源码另外保留若干较早的exact closure
 fast path：F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
 F16 GEMM nested loop以及affine Q4_K IME N/K loop。它们不依赖kernel symbol，但仍要求较精确
 的region/use/loop closure；因此当前实现不能被描述为已经完全closure-free。新增能力不得

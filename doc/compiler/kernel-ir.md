@@ -90,8 +90,8 @@ weft_kernel
 weft_ext
 ```
 
-`weft_ext` 当前包含 `affine_i4_i8_contract`、`symmetric_i4_i8_contract` 与
-`grouped_affine_i4_i8_dot`。Extension op必须
+`weft_ext` 当前包含 `affine_i4_i8_contract`、`symmetric_i4_i8_contract`、
+`grouped_affine_i4_i8_dot`、`sign_bit_i8_dot` 与 `e2m1_e8m0_i8_dot`。Extension op必须
 能随module独立parse/verify；它只表达typed local numerical relation，不能持有public ABI、
 persistent pointer layout、outer traversal或target fragment。
 

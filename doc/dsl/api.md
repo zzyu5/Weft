@@ -150,6 +150,14 @@ W.grouped_affine_i4_i8_dot(
     packed_weight, scale_min, activation, activation_sum_bytes,
     dot_scale, minimum_scale, init,
 )
+
+W.sign_bit_i8_dot(
+    sign_bits, activation, activation_scale, sign_scale, init,
+)
+
+W.e2m1_e8m0_i8_dot(
+    packed_codes, exponent, activation, activation_scale, init,
+)
 ```
 
 它们在 Python source 中通过 `W` 暴露，在 canonical IR 中属于 sibling `weft_ext` dialect。

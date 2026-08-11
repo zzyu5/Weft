@@ -70,6 +70,46 @@ Persistent 144/292-byte block storage、pointer field offset和outer reduction l
 primitive不保存这些pointer relation。VLEN、LMUL、register organization与RVV asm spelling
 属于target。
 
+## Sign-bit × signed-i8 local dot
+
+```python
+result = W.sign_bit_i8_dot(
+    sign_bits,        # block<4, u8>
+    activation,       # block<32, i8>
+    activation_scale, # scalar f32
+    sign_scale,       # scalar f32
+    init,             # scalar f32
+)
+```
+
+对logical lane `p`，little-endian bit
+`(sign_bits[p / 8] >> (p % 8)) & 1` 选择 `+activation[p]` 或
+`-activation[p]`。32项整数和乘显式 `activation_scale * sign_scale` 后加到 `init`。
+
+Primitive不拥有Q1 persistent block、128→4×32 sub-block关系或outer row/block traversal。
+当前VLEN128 realization使用mask load、signed widening、sign merge与widening reduction；这些
+都是target physical facts，不改变local numerical semantics。
+
+## E2M1/E8M0 × signed-i8 local dot
+
+```python
+result = W.e2m1_e8m0_i8_dot(
+    packed_codes,     # block<16, u8>
+    exponent,         # scalar u8 E8M0 code
+    activation,       # block<32, i8>
+    activation_scale, # scalar f32
+    init,             # scalar f32
+)
+```
+
+每个packed byte的low nibble编码logical element `0..15`，high nibble编码 `16..31`。E2M1
+codebook为 `[0,.5,1,1.5,2,3,4,6,0,-.5,-1,-1.5,-2,-3,-4,-6]`；E8M0 exponent定义
+block scale，code zero采用f32 bit pattern `0x00400000`。Decoded dot乘
+`activation_scale` 后加到 `init`。
+
+Persistent 17-byte MXFP4 block、34-byte Q8_0 block和outer reduction由source拥有。当前
+VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 reduction。
+
 ## Extension 判据
 
 增加extension op必须同时满足：
