@@ -75,10 +75,10 @@ canonical primitive
 
 局部 lowering 可以吸收相邻的纯 decode、cast、scale、packing producer 或 consumer，也可
 在不改变 source loop/state boundary 的前提下联合安排相邻 primitive。选择 authority必须
-锚定 canonical primitive/interface及其局部 closure，不能把整个 loop nest归类成一个
-`KernelKind`，也不得用完整 kernel shape或symbol选择模板。无法合法生成时直接报
-unsupported；不存在 legacy、GGML 或旧 emitter fallback。普通 scalar control的 C lowering
-是正式 realization，不是 fallback。
+锚定 canonical primitive/interface及其block axis、typed operand、access/use projection，
+不能把整个loop nest归类成一个`KernelKind`，也不得用完整 kernel shape或symbol选择模板。
+无法合法生成时直接报unsupported；不存在 legacy、GGML 或旧 emitter fallback。普通 scalar
+control的 C lowering是正式 realization，不是 fallback。
 
 ## 定位一句话
 

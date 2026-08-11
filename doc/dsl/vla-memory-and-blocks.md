@@ -58,6 +58,10 @@ VLA region body 不得任意修改外层 scalar / block state。
 
 任意依赖上一逻辑元素的 recurrence 必须写成有序 scalar loop，或使用显式 `W.scan`。这样可以防止 source 行为依赖编译器选择的 strip 边界。
 
+普通有序scalar `for` / `while`可以出现在VLA body中；禁止的是第二个active VLA region，
+不是scalar control。Target可以逐physical strip执行这些scalar loops，但不得把它们重排为
+新的VLA axis，也不得改变loop-carried state或memory effect的逻辑顺序。
+
 ### VLA effect independence
 
 非 atomic 的 VLA memory effect 必须满足 lane independence：
@@ -165,6 +169,10 @@ Target lowering 决定：
 - mask realization；
 - prefetch instruction；
 - local address strength reduction。
+
+若access或predicate位于VLA内的nested scalar control中，target仍按每个实体的pointer、
+lane relation、predicate与effect选择memory realization。该physical scan只为当前strip投影
+地址与mask，不把作者的scalar loop、window或state改写成标准region形状。
 
 ### Memory API
 

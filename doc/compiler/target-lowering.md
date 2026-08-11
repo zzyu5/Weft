@@ -27,6 +27,7 @@ config，它必须是显式、短生命周期的lowering option，不能进入ca
 Target lowering 可以为同一 semantic primitive 实现多种局部 realization family，例如：
 
 ```text
+scalar control/math   -> ordinary C / target libm spelling
 VLA pointwise       -> RVV f32m2 / f32m4
 reduce              -> scalar ordered / RVV tree / widening RVV
 contract            -> RVV FMA microtile / RVV dot / IME fragment
@@ -42,7 +43,7 @@ verifier、pipeline front door或长期provider registry。
 当前实现已经存在的transient physical decision包括：
 
 - 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
-  mode、activity、state realization和LMUL；
+  mode、activity、state realization和LMUL；位于nested scalar control中的access仍逐实体决策；
 - local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；
 - block decode的table extent、code/result vector shape与RVV gather realization；
 - symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
@@ -68,8 +69,9 @@ Scalar realization若存在，也是明确的局部实现，不是兜底。目�
 合法实现时，lowering 必须失败。
 
 当前 `intrinsic-c` backend在module入口整体要求RVV；其中的scalar control/memory仍生成普通
-C，但仓库尚无独立scalar-only target backend。缺少RVV时直接unsupported，不会把整个kernel
-切换到scalar fallback。
+C，显式scalar `floor`/`log`/`exp`等math primitive使用对应target spelling；仓库尚无独立
+scalar-only target backend。缺少RVV时直接unsupported，不会把整个kernel切换到scalar
+fallback。
 
 ## 算法与物理自由度
 
@@ -119,11 +121,17 @@ format route或whole-kernel emitter。一个local envelope可以跨多个相邻p
 consumer，甚至联合安排相邻primitive，但选择必须从明确canonical anchor出发，不能把整个
 loop nest的形状当作operator identity。
 
+同样的规则覆盖selection中的coordinate summary、ordered recurrence中的VLA memory、indexed
+base与unit-stride region、scalar coordinate/window与VLA channel，以及source-owned grouping
+中的local contract。它们是已有实体性质的新组合关系，不构成Top-K、SSM、MoE或vision
+kernel family。
+
 ## 当前实现边界
 
 逐实体VLA memory/predicate/state/narrow、codebook decode与symmetric IME fragment已经按上述
-模型工作。当前源码中仍有若干较早的exact closure fast path：F16 conversion/fill/dot/update/
-normalize、online-softmax producer-consumer envelope、F16 GEMM nested loop以及affine Q4_K
-IME N/K loop。它们不依赖kernel symbol，但仍要求较精确的region/use/loop closure；因此当前
-实现不能被描述为已经完全closure-free。新增能力不得沿这些路径继续增加整段case，已有
-路径应在对应primitive decision能够承载时被替换并删除。
+模型工作。Local F32 contract已经从enclosing-loop closure改为根据block axis、typed operand、
+pointer/access与predicate projection选择row microtile。当前源码仍有若干较早的exact closure
+fast path：F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
+F16 GEMM nested loop以及affine Q4_K IME N/K loop。它们不依赖kernel symbol，但仍要求较精确
+的region/use/loop closure；因此当前实现不能被描述为已经完全closure-free。新增能力不得
+沿这些路径继续增加整段case，已有路径应在对应primitive decision能够承载时被替换并删除。

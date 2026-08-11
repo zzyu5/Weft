@@ -8,7 +8,8 @@ Frontend和dialect verifier负责拒绝自相矛盾的IR，例如：
 
 - entry ABI、argument kind、return与type不一致；
 - pointer arithmetic、shape、broadcast、axis或tuple type不合法；
-- nested VLA、active VLA value逃逸或VLA body任意修改outer state；
+- nested active VLA、active VLA value逃逸或VLA body任意修改outer state；VLA中的普通
+  scalar control本身合法；
 - masked value进入不理解validity的consumer；
 - reduce/scan/summary/contract的operand、state、axis、predicate或result shape不闭合；
 - summary region含memory effect或不以正确type yield；
@@ -27,7 +28,8 @@ Target lowering针对本次target/profile/config检查：
 - meta/backend binding是否完整且合法。
 
 任何一项不满足都直接返回明确unsupported/error。不存在legacy、GGML、旧emitter或默认
-scalar fallback；正式scalar primitive的普通C lowering不属于fallback。
+scalar fallback；正式scalar control、memory、math primitive的普通C/libm lowering不属于
+fallback，也不授权把整个kernel静默切换到scalar-only路径。
 
 ## 不由 verifier 证明的事实
 

@@ -45,6 +45,10 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 近似 `exp`、`rsqrt`、activation 等 target realization 必须满足相应 primitive 定义的 value semantics；误差测试属于实现质量，不进入 source 认证流程。
 
+`W.floor(x)` 是显式逐元素语义，返回不大于 `x` 的最大整数值并保持floating dtype。它不
+隐含坐标clamp、整数cast或vector realization；这些关系必须由source分别写出，target只为
+已有scalar/block/region value选择合法实现。
+
 ### Conversion、narrow 与 quantization
 
 四种 conversion 必须区分：

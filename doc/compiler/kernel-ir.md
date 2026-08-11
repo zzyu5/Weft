@@ -74,8 +74,8 @@ state and structured compute
 - 一个 module可以包含多个kernel symbol，但每个 `weft_kernel.kernel` 是独立worker-local
   entry；CLI选择symbol不参与target realization选择。
 - entry argument kind只能是 `pointer`、`scalar` 或 `constexpr`；return为none或一个scalar。
-- VLA不能嵌套；active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出
-  lexical region。
+- 第二个active VLA region不能嵌套；普通scalar `for` / `while` / `if`可以位于VLA body中。
+  Active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出lexical region。
 - `summary_fold` 的value、可选coordinate、identity与where都是显式operand；coordinate若存在
   必须与value共享logical domain。Lift/merge/finalize region必须闭合、pure并以 `yield` 终结。
 - `contract` 的paired axes、where footprint、init/result shape与dtype必须由IR显式保存并局部

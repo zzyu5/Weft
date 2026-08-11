@@ -188,6 +188,10 @@ VLA region 必须被拒绝；这是当前语言能力边界，用来保持 regio
 唯一，并不是把 RVV lane count 暴露给 source。未来若引入多维 VLA，必须定义新的语言
 语义，不能由 target 自动猜测。
 
+该限制不禁止VLA body中的普通scalar `for` / `while` / `if`。短window、此前已选元素检查、
+coordinate decode等有序scalar control可以嵌在VLA内；它们不会产生第二个lane domain，且
+其source-visible顺序、state与effect必须保持不变。
+
 `W.contract` 不得缩并 VLA axis；跨 VLA axis 的聚合必须使用 reduce、scan 或 summary fold。VLA axis 可以作为 contract 的 batch/free axis。
 
 
