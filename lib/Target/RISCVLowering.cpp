@@ -32,6 +32,7 @@ enum class CValueKind {
   Coordinate,
   F16Vector,
   F32Vector,
+  I8Vector,
   Mask,
   Tuple,
 };
@@ -130,6 +131,13 @@ struct VLAStateDecision {
   VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
 };
 
+struct VLANarrowDecision {
+  mlir::Operation *operation = nullptr;
+  unsigned sourceLMUL = 4;
+  unsigned intermediateLMUL = 2;
+  unsigned resultLMUL = 1;
+};
+
 struct VLARegionDecision {
   mlir::Operation *operation = nullptr;
   mlir::Value coordinate;
@@ -141,6 +149,7 @@ struct VLARegionDecision {
   std::vector<VLAPredicateDecision> predicates;
   std::vector<VLAAccessDecision> accesses;
   std::vector<VLAStateDecision> states;
+  std::vector<VLANarrowDecision> narrows;
 };
 
 enum class ContractRealization {
@@ -683,6 +692,17 @@ private:
     return found == activeVLADecision->states.end() ? nullptr : &*found;
   }
 
+  const VLANarrowDecision *
+  findNarrowDecision(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeVLADecision->narrows, [&](const VLANarrowDecision &decision) {
+          return decision.operation == operation;
+        });
+    return found == activeVLADecision->narrows.end() ? nullptr : &*found;
+  }
+
   mlir::FailureOr<VLARegionDecision> decideVLARegion(VLAOp op) {
     mlir::Block &body = op.getBody().front();
     VLARegionDecision decision;
@@ -787,6 +807,23 @@ private:
     }
 
     for (mlir::Operation &nested : body.without_terminator()) {
+      auto narrow = mlir::dyn_cast<NarrowOp>(nested);
+      if (!narrow)
+        continue;
+      if (!elementType(narrow.getInput().getType()).isF32() ||
+          !elementType(narrow.getResult().getType()).isSignedInteger(8) ||
+          narrow.getRounding() != "rne" || !narrow.getSaturation()) {
+        narrow.emitError(
+            "VLA narrow has no selected saturating f32-to-i8 realization");
+        return mlir::failure();
+      }
+      decision.dataLMUL = 4;
+      decision.maskRatio = 8;
+      decision.indexLMUL = options.target.xlen == 64 ? 8 : 4;
+      decision.narrows.push_back(VLANarrowDecision{narrow.getOperation()});
+    }
+
+    for (mlir::Operation &nested : body.without_terminator()) {
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
         if (reduce.getAxis() != -1 ||
             !elementType(reduce.getInput().getType()).isF32() ||
@@ -840,6 +877,11 @@ private:
         }
       }
     }
+    if (!decision.narrows.empty() && !decision.states.empty()) {
+      op.emitError(
+          "one VLA region cannot currently share a narrow and aggregate realization");
+      return mlir::failure();
+    }
     return decision;
   }
 
@@ -878,6 +920,8 @@ private:
       return emitCompare(op);
     if (auto op = mlir::dyn_cast<CastOp>(operation))
       return emitCast(op);
+    if (auto op = mlir::dyn_cast<NarrowOp>(operation))
+      return emitNarrow(op);
     if (auto op = mlir::dyn_cast<BitcastOp>(operation))
       return emitBitcast(op);
     if (auto op = mlir::dyn_cast<SelectOp>(operation))
@@ -1499,92 +1543,6 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitF32ToI8NarrowVLA(VLAOp op) {
-    if (op.getNumResults() != 0)
-      return mlir::failure();
-    mlir::Block &body = op.getBody().front();
-    LoadOp load;
-    BinaryOp multiply;
-    NarrowOp narrow;
-    StoreOp store;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (auto candidate = mlir::dyn_cast<LoadOp>(nested)) {
-        if (load)
-          return mlir::failure();
-        load = candidate;
-      } else if (auto candidate = mlir::dyn_cast<BinaryOp>(nested)) {
-        if (multiply)
-          return mlir::failure();
-        multiply = candidate;
-      } else if (auto candidate = mlir::dyn_cast<NarrowOp>(nested)) {
-        if (narrow)
-          return mlir::failure();
-        narrow = candidate;
-      } else if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
-        if (store)
-          return mlir::failure();
-        store = candidate;
-      } else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return mlir::failure();
-    }
-    if (!load || !multiply || !narrow || !store ||
-        multiply.getKind() != "mul" || narrow.getInput() != multiply.getResult() ||
-        store.getValue() != narrow.getResult() || !isTrue(load.getWhere()) ||
-        !isTrue(store.getWhere()) || narrow.getRounding() != "rne" ||
-        !narrow.getSaturation() ||
-        !elementType(load.getResult().getType()).isF32() ||
-        !elementType(narrow.getResult().getType()).isSignedInteger(8))
-      return mlir::failure();
-
-    mlir::Value scalar;
-    if (multiply.getLhs() == load.getResult())
-      scalar = multiply.getRhs();
-    else if (multiply.getRhs() == load.getResult())
-      scalar = multiply.getLhs();
-    else
-      return mlir::failure();
-    std::string multiplier = expression(scalar);
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(load.getPointer(), coordinate) ||
-        !valueDependsOn(store.getPointer(), coordinate))
-      return mlir::failure();
-    std::optional<std::string> source =
-        pointerBase(load.getPointer(), coordinate);
-    std::optional<std::string> destination =
-        pointerBase(store.getPointer(), coordinate);
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    if (!source || !destination || multiplier.empty() || begin.spelling.empty() ||
-        end.spelling.empty())
-      return mlir::failure();
-
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string input = fresh("quant_input");
-    std::string scaled = fresh("quant_scaled");
-    std::string i16 = fresh("quant_i16");
-    std::string i8 = fresh("quant_i8");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m4(" + end.spelling +
-         " - " + strip + ");");
-    line("vfloat32m4_t " + input + " = __riscv_vle32_v_f32m4(" + *source +
-         " + " + strip + ", " + vl + ");");
-    line("vfloat32m4_t " + scaled + " = __riscv_vfmul_vf_f32m4(" + input +
-         ", " + multiplier + ", " + vl + ");");
-    line("vint16m2_t " + i16 + " = __riscv_vfncvt_x_f_w_i16m2(" + scaled +
-         ", " + vl + ");");
-    line("vint8m1_t " + i8 + " = __riscv_vnclip_wx_i8m1(" + i16 +
-         ", 0, __RISCV_VXRM_RNE, " + vl + ");");
-    line("__riscv_vse8_v_i8m1(" + *destination + " + " + strip + ", " + i8 +
-         ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-    return mlir::success();
-  }
-
   mlir::LogicalResult emitVLA(VLAOp op) {
     if (inVLA)
       return op.emitError("nested VLA regions are not supported");
@@ -1600,8 +1558,6 @@ private:
     if (mlir::succeeded(tryEmitF16WeightedUpdateVLA(op)))
       return mlir::success();
     if (mlir::succeeded(tryEmitF16ToF32NormalizeVLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitF32ToI8NarrowVLA(op)))
       return mlir::success();
     if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
       return mlir::success();
@@ -2076,38 +2032,42 @@ private:
     std::string second = rhs.spelling;
     if (lhsVector && rhsVector) {
       intrinsic = llvm::StringSwitch<std::string>(op.getKind())
-                      .Case("add", "__riscv_vfadd_vv_f32m2")
-                      .Case("sub", "__riscv_vfsub_vv_f32m2")
-                      .Case("mul", "__riscv_vfmul_vv_f32m2")
-                      .Case("div", "__riscv_vfdiv_vv_f32m2")
-                      .Case("max", "__riscv_vfmax_vv_f32m2")
-                      .Case("min", "__riscv_vfmin_vv_f32m2")
+                      .Case("add", "__riscv_vfadd_vv_")
+                      .Case("sub", "__riscv_vfsub_vv_")
+                      .Case("mul", "__riscv_vfmul_vv_")
+                      .Case("div", "__riscv_vfdiv_vv_")
+                      .Case("max", "__riscv_vfmax_vv_")
+                      .Case("min", "__riscv_vfmin_vv_")
                       .Default("");
     } else if (lhsVector) {
       intrinsic = llvm::StringSwitch<std::string>(op.getKind())
-                      .Case("add", "__riscv_vfadd_vf_f32m2")
-                      .Case("sub", "__riscv_vfsub_vf_f32m2")
-                      .Case("mul", "__riscv_vfmul_vf_f32m2")
-                      .Case("div", "__riscv_vfdiv_vf_f32m2")
-                      .Case("max", "__riscv_vfmax_vf_f32m2")
-                      .Case("min", "__riscv_vfmin_vf_f32m2")
+                      .Case("add", "__riscv_vfadd_vf_")
+                      .Case("sub", "__riscv_vfsub_vf_")
+                      .Case("mul", "__riscv_vfmul_vf_")
+                      .Case("div", "__riscv_vfdiv_vf_")
+                      .Case("max", "__riscv_vfmax_vf_")
+                      .Case("min", "__riscv_vfmin_vf_")
                       .Default("");
     } else {
       intrinsic = llvm::StringSwitch<std::string>(op.getKind())
-                      .Case("add", "__riscv_vfadd_vf_f32m2")
-                      .Case("sub", "__riscv_vfrsub_vf_f32m2")
-                      .Case("mul", "__riscv_vfmul_vf_f32m2")
-                      .Case("div", "__riscv_vfrdiv_vf_f32m2")
-                      .Case("max", "__riscv_vfmax_vf_f32m2")
-                      .Case("min", "__riscv_vfmin_vf_f32m2")
+                      .Case("add", "__riscv_vfadd_vf_")
+                      .Case("sub", "__riscv_vfrsub_vf_")
+                      .Case("mul", "__riscv_vfmul_vf_")
+                      .Case("div", "__riscv_vfrdiv_vf_")
+                      .Case("max", "__riscv_vfmax_vf_")
+                      .Case("min", "__riscv_vfmin_vf_")
                       .Default("");
       std::swap(first, second);
     }
     if (intrinsic.empty())
       return op.emitError("RVV pointwise lowering does not implement binary kind");
+    std::string suffix =
+        "f32m" + std::to_string(activeVLADecision->dataLMUL);
+    intrinsic += suffix;
     std::string name = fresh("v");
-    line("vfloat32m2_t " + name + " = " + intrinsic + "(" + first + ", " +
-         second + ", " + activeVL + ");");
+    line("vfloat32m" + std::to_string(activeVLADecision->dataLMUL) + "_t " +
+         name + " = " + intrinsic + "(" + first + ", " + second + ", " +
+         activeVL + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::F32Vector, name};
     return mlir::success();
@@ -2117,13 +2077,16 @@ private:
     CValue input = require(op.getInput());
     if (input.kind == CValueKind::F32Vector) {
       std::string name = fresh("v");
+      unsigned lmul = activeVLADecision->dataLMUL;
+      std::string suffix = "f32m" + std::to_string(lmul);
+      std::string vectorType = "vfloat32m" + std::to_string(lmul) + "_t";
       if (op.getKind() == "neg")
-        line("vfloat32m2_t " + name + " = __riscv_vfneg_v_f32m2(" +
+        line(vectorType + " " + name + " = __riscv_vfneg_v_" + suffix + "(" +
              input.spelling + ", " + activeVL + ");");
       else if (op.getKind() == "abs")
-        line("vfloat32m2_t " + name + " = __riscv_vfabs_v_f32m2(" +
+        line(vectorType + " " + name + " = __riscv_vfabs_v_" + suffix + "(" +
              input.spelling + ", " + activeVL + ");");
-      else if (op.getKind() == "exp")
+      else if (op.getKind() == "exp" && lmul == 2)
         line("vfloat32m2_t " + name + " = __weft_exp_f32m2(" +
              input.spelling + ", " + activeVL + ");");
       else
@@ -2236,7 +2199,9 @@ private:
     if (input.kind == CValueKind::F16Vector &&
         elementType(op.getResult().getType()).isF32()) {
       std::string name = fresh("widen_f16");
-      line("vfloat32m2_t " + name + " = __riscv_vfwcvt_f_f_v_f32m2(" +
+      unsigned lmul = activeVLADecision->dataLMUL;
+      line("vfloat32m" + std::to_string(lmul) + "_t " + name +
+           " = __riscv_vfwcvt_f_f_v_f32m" + std::to_string(lmul) + "(" +
            input.spelling + ", " + activeVL + ");");
       values[op.getResult()] =
           CValue{op.getResult().getType(), CValueKind::F32Vector, name};
@@ -2253,6 +2218,28 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult emitNarrow(NarrowOp op) {
+    const VLANarrowDecision *decision =
+        findNarrowDecision(op.getOperation());
+    CValue input = require(op.getInput());
+    if (!decision || input.kind != CValueKind::F32Vector ||
+        decision->sourceLMUL != activeVLADecision->dataLMUL)
+      return op.emitError("VLA narrow projection is unavailable");
+    std::string intermediate = fresh("narrow_i16");
+    std::string result = fresh("narrow_i8");
+    line("vint16m" + std::to_string(decision->intermediateLMUL) + "_t " +
+         intermediate + " = __riscv_vfncvt_x_f_w_i16m" +
+         std::to_string(decision->intermediateLMUL) + "(" + input.spelling +
+         ", " + activeVL + ");");
+    line("vint8m" + std::to_string(decision->resultLMUL) + "_t " + result +
+         " = __riscv_vnclip_wx_i8m" +
+         std::to_string(decision->resultLMUL) + "(" + intermediate +
+         ", 0, __RISCV_VXRM_RNE, " + activeVL + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::I8Vector, result};
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitBitcast(BitcastOp op) {
     CValue input = require(op.getInput());
     if (input.kind != CValueKind::Scalar || input.spelling.empty())
@@ -2266,6 +2253,8 @@ private:
       helper = "__weft_bitcast_u16_i16";
     else if (source.isUnsignedInteger(16) && isF16(target))
       helper = "__weft_bitcast_u16_f16";
+    else if (isF16(source) && target.isUnsignedInteger(16))
+      helper = "__weft_bitcast_f16_u16";
     else if (source.isUnsignedInteger(32) && target.isF32())
       helper = "__weft_bitcast_u32_f32";
     else
@@ -2608,23 +2597,34 @@ private:
         return op.emitError("masked VLA load has no selected realization");
       std::string name = fresh("load");
       if (loadedElement.isF32()) {
-        std::string prefix = "vfloat32m2_t " + name + " = ";
+        std::string suffix =
+            "f32m" + std::to_string(activeVLADecision->dataLMUL);
+        std::string prefix = "vfloat32m" +
+                             std::to_string(activeVLADecision->dataLMUL) +
+                             "_t " + name + " = ";
         if (decision->memoryMode == VLAMemoryMode::UnitStride)
-          line(prefix + "__riscv_vle32_v_f32m2(" + pointer.spelling + ", " +
+          line(prefix + "__riscv_vle32_v_" + suffix + "(" + pointer.spelling +
+               ", " +
                activeVL + ");");
         else
-          line(prefix + "__riscv_vlse32_v_f32m2(" + pointer.spelling +
+          line(prefix + "__riscv_vlse32_v_" + suffix + "(" + pointer.spelling +
                ", (ptrdiff_t)(sizeof(float) * (" + pointer.laneStride + ")), " +
                activeVL + ");");
         values[op.getResult()] =
             CValue{op.getResult().getType(), CValueKind::F32Vector, name};
       } else {
-        std::string prefix = "vfloat16m1_t " + name + " = ";
+        unsigned halfLMUL = activeVLADecision->dataLMUL / 2;
+        if (halfLMUL == 0)
+          return op.emitError("VLA f16 load has no compatible LMUL");
+        std::string suffix = "f16m" + std::to_string(halfLMUL);
+        std::string prefix = "vfloat16m" + std::to_string(halfLMUL) + "_t " +
+                             name + " = ";
         if (decision->memoryMode == VLAMemoryMode::UnitStride)
-          line(prefix + "__riscv_vle16_v_f16m1(" + pointer.spelling + ", " +
+          line(prefix + "__riscv_vle16_v_" + suffix + "(" + pointer.spelling +
+               ", " +
                activeVL + ");");
         else
-          line(prefix + "__riscv_vlse16_v_f16m1(" + pointer.spelling +
+          line(prefix + "__riscv_vlse16_v_" + suffix + "(" + pointer.spelling +
                ", (ptrdiff_t)(sizeof(_Float16) * (" + pointer.laneStride +
                ")), " + activeVL + ");");
         values[op.getResult()] =
@@ -2658,23 +2658,30 @@ private:
           findAccessDecision(op.getOperation());
       if (!decision)
         return op.emitError("VLA store has no physical memory decision");
-      if ((!decision->elementType.isF32() && !isF16(decision->elementType)) ||
+      bool f32 = decision->elementType.isF32();
+      bool f16 = isF16(decision->elementType);
+      bool i8 = decision->elementType.isSignedInteger(8);
+      if ((!f32 && !f16 && !i8) ||
           pointer.laneStride.empty())
         return op.emitError("VLA store element realization is unavailable");
 
-      bool f32 = decision->elementType.isF32();
       std::string vector = value.spelling;
-      CValueKind expectedKind = f32 ? CValueKind::F32Vector
-                                    : CValueKind::F16Vector;
+      CValueKind expectedKind = f32   ? CValueKind::F32Vector
+                                : f16 ? CValueKind::F16Vector
+                                      : CValueKind::I8Vector;
       if (decision->storeValueMode == VLAStoreValueMode::ScalarBroadcast) {
-        if (value.kind != CValueKind::Scalar || value.spelling.empty())
+        if (i8 || value.kind != CValueKind::Scalar || value.spelling.empty())
           return op.emitError("VLA store scalar broadcast is unavailable");
         vector = fresh("store_value");
-        line(std::string(f32 ? "vfloat32m2_t " : "vfloat16m1_t ") + vector +
-             " = " +
-             (f32 ? "__riscv_vfmv_v_f_f32m2(" :
-                    "__riscv_vfmv_v_f_f16m1(") +
-             value.spelling + ", " + activeVL + ");");
+        unsigned lmul =
+            f32 ? activeVLADecision->dataLMUL
+                : activeVLADecision->dataLMUL / 2;
+        std::string suffix =
+            std::string(f32 ? "f32m" : "f16m") + std::to_string(lmul);
+        line(std::string(f32 ? "vfloat32m" : "vfloat16m") +
+             std::to_string(lmul) + "_t " + vector +
+             " = __riscv_vfmv_v_f_" + suffix + "(" + value.spelling + ", " +
+             activeVL + ");");
       } else if (value.kind != expectedKind || value.spelling.empty()) {
         return op.emitError("VLA store vector projection is unavailable");
       }
@@ -2685,9 +2692,14 @@ private:
         if (predicate.kind != CValueKind::Mask || predicate.spelling.empty())
           return op.emitError("VLA store mask projection is unavailable");
       }
-      std::string sew = f32 ? "32" : "16";
-      std::string suffix = f32 ? "f32m2" : "f16m1";
-      std::string elementCType = f32 ? "float" : "_Float16";
+      unsigned lmul = f32   ? activeVLADecision->dataLMUL
+                      : f16 ? activeVLADecision->dataLMUL / 2
+                            : activeVLADecision->dataLMUL / 4;
+      std::string sew = f32 ? "32" : f16 ? "16" : "8";
+      std::string suffix =
+          std::string(f32 ? "f32m" : f16 ? "f16m" : "i8m") +
+          std::to_string(lmul);
+      std::string elementCType = f32 ? "float" : f16 ? "_Float16" : "int8_t";
       if (decision->memoryMode == VLAMemoryMode::UnitStride) {
         if (decision->activityMode == VLAActivityMode::AllActive)
           line("__riscv_vse" + sew + "_v_" + suffix + "(" + pointer.spelling +
@@ -4672,6 +4684,11 @@ static inline __attribute__((unused)) int16_t __weft_bitcast_u16_i16(uint16_t bi
 static inline __attribute__((unused)) _Float16 __weft_bitcast_u16_f16(uint16_t bits) {
   union { uint16_t u; _Float16 f; } value = { .u = bits };
   return value.f;
+}
+
+static inline __attribute__((unused)) uint16_t __weft_bitcast_f16_u16(_Float16 source) {
+  union { uint16_t u; _Float16 f; } value = { .f = source };
+  return value.u;
 }
 
 static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits) {

@@ -205,6 +205,14 @@ case "${kernel}" in
     quant=1
     runtime_arguments=("$1" "$2" "$3")
     ;;
+  quantize_q8_0)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 quantize_q8_0" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/q8_0.py
+    runtime=examples/repro/weft/quantization/q8_0_runtime.cpp
+    ;;
   *)
     echo "unsupported Weft kernel: ${kernel}" >&2
     exit 2
