@@ -118,6 +118,6 @@ sin = _intrinsic("sin")
 cos = _intrinsic("cos")
 rsqrt = _intrinsic("rsqrt")
 neg_inf = _intrinsic("neg_inf")
-block_scaled_contract = _intrinsic(
-    "block_scaled_contract", "weft_ext.block_scaled_contract"
+affine_i4_i8_contract = _intrinsic(
+    "affine_i4_i8_contract", "weft_ext.affine_i4_i8_contract"
 )

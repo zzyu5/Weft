@@ -13,12 +13,26 @@ def WEFT_Extension_Dialect : Dialect {
 class WeftExtension_Op<string mnemonic, list<Trait> traits = []>
     : Op<WEFT_Extension_Dialect, mnemonic, traits>;
 
-def WeftExtension_BlockScaledContractOp
-    : WeftExtension_Op<"block_scaled_contract", [Pure]> {
-  let summary = "Block-scaled contraction with explicit rounding and saturation";
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
-                       AnyType:$scale_a, AnyType:$scale_b, AnyType:$init,
-                       StrAttr:$rounding, BoolAttr:$saturation);
+def WeftExtension_AffineI4I8ContractOp
+    : WeftExtension_Op<"affine_i4_i8_contract", [Pure]> {
+  let summary = "Affine packed-i4 by signed-i8 block contraction";
+  let description = [{
+    Computes sixteen independent affine dot products over a thirty-two-element
+    signed-i8 activation block.  packed_weight[n, p] contains two unsigned-i4
+    values.  For p = half * 8 + lane, its low nibble multiplies activation
+    [half * 16 + lane] and its high nibble multiplies activation
+    [half * 16 + lane + 8].  Both nibbles are biased by
+    weight_zero_point[n].  The integer dot is scaled by activation_scale and
+    weight_scale[n], then added to init[n].
+
+    This operation defines only the local numerical relation.  Persistent
+    pointer layout and outer M/N/K traversal remain explicit in Kernel IR;
+    target fragments, registers, and instruction spelling are not represented
+    here.
+  }];
+  let arguments = (ins AnyType:$activation, AnyType:$packed_weight,
+                       AnyType:$activation_scale, AnyType:$weight_scale,
+                       AnyType:$weight_zero_point, AnyType:$init);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

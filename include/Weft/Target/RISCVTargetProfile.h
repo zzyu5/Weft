@@ -17,6 +17,7 @@ struct RISCVTargetProfile {
   bool hasRVV = false;
   int64_t vlenBits = 0;
   int64_t vectorRegisters = 32;
+  std::string matrixExtension;
 };
 
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

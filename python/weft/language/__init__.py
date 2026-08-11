@@ -14,7 +14,7 @@ from .builtins import Intrinsic
 from .builtins import atomic_add
 from .builtins import bitcast
 from .builtins import block_axis
-from .builtins import block_scaled_contract
+from .builtins import affine_i4_i8_contract
 from .builtins import broadcast_to
 from .builtins import cast
 from .builtins import contract

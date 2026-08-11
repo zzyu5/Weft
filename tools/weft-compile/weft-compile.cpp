@@ -30,6 +30,10 @@ llvm::cl::opt<int64_t> vlenBits(
     "vlen-bits",
     llvm::cl::desc("Fixed VLEN in bits, or zero when runtime-unknown"),
     llvm::cl::init(0));
+llvm::cl::opt<std::string> matrixExtension(
+    "matrix-extension",
+    llvm::cl::desc("Target matrix extension: none or spacemit-ime1"),
+    llvm::cl::init("none"));
 llvm::cl::list<std::string> metaBindings(
     "meta", llvm::cl::desc("Specialization binding NAME=INTEGER"),
     llvm::cl::ZeroOrMore);
@@ -92,6 +96,12 @@ int main(int argc, char **argv) {
       llvm::errs() << error << "\n";
       return 1;
     }
+    if (matrixExtension != "none" && matrixExtension != "spacemit-ime1") {
+      llvm::errs() << "unsupported --matrix-extension value: "
+                   << matrixExtension << "\n";
+      return 1;
+    }
+    options.target.matrixExtension = matrixExtension;
     if (!parseMetaBindings(options.metaBindings) ||
         mlir::failed(
             weft::lowerToRISCVIntrinsicC(*module, options, output.os())))

@@ -11,6 +11,14 @@ shift
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compiler="${project_root}/build/tools/weft-compile/weft-compile"
 target_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
+target_vlen_bits=128
+matrix_extension=none
+remote_host=rvv
+remote_cpu=8
+remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
+remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+remote_compile_flags=
+remote_link_flags="-L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm"
 local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
 cleanup_local() {
   status=$?
@@ -105,6 +113,24 @@ case "${kernel}" in
     runtime=examples/repro/weft/attention/online_flash_attention_runtime.cpp
     runtime_arguments=("$1")
     ;;
+  q4_k_projection_ime)
+    if [[ $# -ne 1 ]]; then
+      echo "usage: $0 q4_k_projection_ime <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/ime/q4_k_projection.py
+    runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
+    runtime_arguments=("$1")
+    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    target_vlen_bits=256
+    matrix_extension=spacemit-ime1
+    remote_host=k1
+    remote_cpu=3
+    remote_cc=/usr/bin/clang-18
+    remote_cxx=/usr/bin/clang++-18
+    remote_compile_flags=-fno-integrated-as
+    remote_link_flags=-lm
+    ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 ${kernel}" >&2
@@ -143,7 +169,7 @@ if [[ ${quant} -eq 1 ]]; then
   PYTHONPATH="${project_root}/python" python3 -m weft \
     "${project_root}/${dsl}" --kernel "${kernel}" |
     "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
-      --vlen-bits=128 \
+      --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
       -o "${local_root}/kernel.c"
   mkdir -p "${local_root}/leaf" "${local_root}/common"
   cp "${project_root}/examples/repro/weft/quantization/block_dot/${kernel}/runtime.c" \
@@ -154,42 +180,42 @@ else
   if [[ ${kernel} == blocked_gemm ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
-        --vlen-bits=128 \
+        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         --meta=BM=4 --meta=BN=8 --meta=BK=64 -o "${local_root}/kernel.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
-        --vlen-bits=128 \
+        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         -o "${local_root}/kernel.c"
   fi
   cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 fi
 
 tar -C "${local_root}" -cf - . |
-  ssh rvv "
+  ssh "${remote_host}" "
     set -eu
     remote_root=\$(mktemp -d /tmp/weft-kernel.XXXXXX)
     cleanup() {
-      status=\$?
+      cleanup_code=\$?
       trap - EXIT
       if ! find \"\${remote_root}\" -depth -delete; then
         echo \"failed to remove remote temporary directory: \${remote_root}\" >&2
-        if [ \"\${status}\" -eq 0 ]; then
-          status=1
+        if [ \"\${cleanup_code}\" -eq 0 ]; then
+          cleanup_code=1
         fi
       fi
-      exit \"\${status}\"
+      exit \"\${cleanup_code}\"
     }
     trap cleanup EXIT
     tar -C \"\${remote_root}\" -xf -
     cd \"\${remote_root}\"
-    cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
-    cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    cc=${remote_cc}
+    cxx=${remote_cxx}
     if [ '${quant}' -eq 1 ]; then
-      \"\${cc}\" -O3 -funroll-loops -std=c11 -Wall -Wextra -Werror \
+      \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
       ar rcs libweft_kernel.a kernel.o
-      \"\${cc}\" -O3 -funroll-loops -std=c11 -Wall -Wextra -Werror \
+      \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d \
         -c leaf/runtime.c -o runtime.o
       if [ '${kernel}' = q4_K_q8_K ]; then
@@ -204,14 +230,14 @@ tar -C "${local_root}" -cf - . |
           -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm -o weft_runtime
       fi
     else
-      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \
+      \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
       ar rcs libweft_kernel.a kernel.o
-      \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
+      \"\${cxx}\" -O3 ${remote_compile_flags} -std=c++17 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c runtime.cpp -o runtime.o
       \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
-        -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm \
+        ${remote_link_flags} \
         -o weft_runtime
     fi
-    exec taskset -c 8 ${runtime_command}
+    exec taskset -c ${remote_cpu} ${runtime_command}
   "

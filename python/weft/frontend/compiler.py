@@ -1831,37 +1831,37 @@ class FrontendCompiler:
     def _intrinsic_narrow(self, call: ast.Call) -> Value:
         return self._convert(call, "weft_kernel.narrow", True)
 
-    def _intrinsic_block_scaled_contract(self, call: ast.Call) -> Value:
+    def _intrinsic_affine_i4_i8_contract(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(
             call,
-            ("lhs", "rhs"),
+            ("activation", "packed_weight"),
             {
-                "scale_a": None,
-                "scale_b": None,
+                "activation_scale": None,
+                "weight_scale": None,
+                "weight_zero_point": None,
                 "init": None,
-                "rounding": "rne",
-                "saturation": True,
             },
         )
-        required = ("lhs", "rhs", "scale_a", "scale_b", "init")
+        required = (
+            "activation",
+            "packed_weight",
+            "activation_scale",
+            "weight_scale",
+            "weight_zero_point",
+            "init",
+        )
         if any(args[name] is None for name in required):
-            raise FrontendError("block_scaled_contract requires scales and init", self._location(call))
+            raise FrontendError(
+                "affine_i4_i8_contract requires packed operands, scales, "
+                "zero point, and init",
+                self._location(call),
+            )
         operands = tuple(self._value_argument(args[name], call) for name in required)
-        rounding = args["rounding"]
-        saturation = args["saturation"]
-        if isinstance(rounding, ast.expr):
-            rounding = self._eval_static(rounding)
-        if isinstance(saturation, ast.expr):
-            saturation = self._eval_static(saturation)
         return self._emit(
-            "weft_ext.block_scaled_contract",
+            "weft_ext.affine_i4_i8_contract",
             call,
             operands=operands,
             result_types=(operands[-1].type,),
-            attributes={
-                "rounding": _string(str(rounding)),
-                "saturation": _bool(bool(saturation)),
-            },
         )[0]
 
     def _intrinsic_range(self, call: ast.Call) -> Value:

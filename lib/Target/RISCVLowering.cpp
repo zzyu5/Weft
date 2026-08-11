@@ -1,5 +1,6 @@
 #include "Weft/Target/RISCVLowering.h"
 
+#include "Weft/Dialect/Extension/IR/ExtensionDialect.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -22,6 +23,7 @@
 namespace {
 
 using namespace weft;
+using namespace weft::extension;
 using namespace weft::kernel;
 
 enum class CValueKind {
@@ -532,6 +534,8 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
+    if (auto lowered = tryEmitAffineI4I8NTiles(op))
+      return *lowered;
     if (auto lowered = tryEmitF16GemmNTiles(op))
       return *lowered;
     mlir::Block &body = op.getBody().front();
@@ -1035,6 +1039,92 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult tryEmitF32ToI8NarrowVLA(VLAOp op) {
+    if (op.getNumResults() != 0)
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    LoadOp load;
+    BinaryOp multiply;
+    NarrowOp narrow;
+    StoreOp store;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<LoadOp>(nested)) {
+        if (load)
+          return mlir::failure();
+        load = candidate;
+      } else if (auto candidate = mlir::dyn_cast<BinaryOp>(nested)) {
+        if (multiply)
+          return mlir::failure();
+        multiply = candidate;
+      } else if (auto candidate = mlir::dyn_cast<NarrowOp>(nested)) {
+        if (narrow)
+          return mlir::failure();
+        narrow = candidate;
+      } else if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
+        if (store)
+          return mlir::failure();
+        store = candidate;
+      } else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
+        return mlir::failure();
+    }
+    if (!load || !multiply || !narrow || !store ||
+        multiply.getKind() != "mul" || narrow.getInput() != multiply.getResult() ||
+        store.getValue() != narrow.getResult() || !isTrue(load.getWhere()) ||
+        !isTrue(store.getWhere()) || narrow.getRounding() != "rne" ||
+        !narrow.getSaturation() ||
+        !elementType(load.getResult().getType()).isF32() ||
+        !elementType(narrow.getResult().getType()).isSignedInteger(8))
+      return mlir::failure();
+
+    mlir::Value scalar;
+    if (multiply.getLhs() == load.getResult())
+      scalar = multiply.getRhs();
+    else if (multiply.getRhs() == load.getResult())
+      scalar = multiply.getLhs();
+    else
+      return mlir::failure();
+    std::string multiplier = expression(scalar);
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(load.getPointer(), coordinate) ||
+        !valueDependsOn(store.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> source =
+        pointerBase(load.getPointer(), coordinate);
+    std::optional<std::string> destination =
+        pointerBase(store.getPointer(), coordinate);
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    if (!source || !destination || multiplier.empty() || begin.spelling.empty() ||
+        end.spelling.empty())
+      return mlir::failure();
+
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string input = fresh("quant_input");
+    std::string scaled = fresh("quant_scaled");
+    std::string i16 = fresh("quant_i16");
+    std::string i8 = fresh("quant_i8");
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m4(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat32m4_t " + input + " = __riscv_vle32_v_f32m4(" + *source +
+         " + " + strip + ", " + vl + ");");
+    line("vfloat32m4_t " + scaled + " = __riscv_vfmul_vf_f32m4(" + input +
+         ", " + multiplier + ", " + vl + ");");
+    line("vint16m2_t " + i16 + " = __riscv_vfncvt_x_f_w_i16m2(" + scaled +
+         ", " + vl + ");");
+    line("vint8m1_t " + i8 + " = __riscv_vnclip_wx_i8m1(" + i16 +
+         ", 0, __RISCV_VXRM_RNE, " + vl + ");");
+    line("__riscv_vse8_v_i8m1(" + *destination + " + " + strip + ", " + i8 +
+         ", " + vl + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitVLA(VLAOp op) {
     if (inVLA)
       return op.emitError("nested VLA regions are not supported");
@@ -1050,6 +1140,8 @@ private:
     if (mlir::succeeded(tryEmitF16WeightedUpdateVLA(op)))
       return mlir::success();
     if (mlir::succeeded(tryEmitF16ToF32NormalizeVLA(op)))
+      return mlir::success();
+    if (mlir::succeeded(tryEmitF32ToI8NarrowVLA(op)))
       return mlir::success();
     if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
       return mlir::success();
@@ -1809,6 +1901,322 @@ private:
   bool dependsOn(mlir::Value value, mlir::Value target) const {
     llvm::DenseSet<mlir::Value> visited;
     return dependsOn(value, target, visited);
+  }
+
+  bool matchBinaryOperands(mlir::Value value, llvm::StringRef kind,
+                           mlir::Value lhs, mlir::Value rhs,
+                           bool commutative = false) const {
+    auto binary = value.getDefiningOp<BinaryOp>();
+    if (!binary || binary.getKind() != kind)
+      return false;
+    return (binary.getLhs() == lhs && binary.getRhs() == rhs) ||
+           (commutative && binary.getLhs() == rhs && binary.getRhs() == lhs);
+  }
+
+  bool matchBinaryConstant(mlir::Value value, llvm::StringRef kind,
+                           int64_t constant, mlir::Value &other,
+                           bool commutative = true) const {
+    auto binary = value.getDefiningOp<BinaryOp>();
+    if (!binary || binary.getKind() != kind)
+      return false;
+    if (integerConstant(binary.getRhs()) == constant) {
+      other = binary.getLhs();
+      return true;
+    }
+    if (commutative && integerConstant(binary.getLhs()) == constant) {
+      other = binary.getRhs();
+      return true;
+    }
+    return false;
+  }
+
+  bool matchExpandedAxis(mlir::Value value, mlir::Value axis,
+                         int64_t dimension) const {
+    auto expand = value.getDefiningOp<ExpandDimsOp>();
+    return expand && expand.getInput() == axis && expand.getAxis() == dimension;
+  }
+
+  bool matchBlockAxis(mlir::Value value, int64_t extent) const {
+    auto axis = value.getDefiningOp<BlockAxisOp>();
+    return axis && integerConstant(axis.getExtent()) == extent &&
+           integerConstant(axis.getOffset()) == 0;
+  }
+
+  mlir::Value scalarPointerBase(mlir::Value value) const {
+    while (value && !mlir::isa<PtrType>(value.getType())) {
+      auto pointer = value.getDefiningOp<PtrAddOp>();
+      if (!pointer)
+        return {};
+      value = pointer.getBase();
+    }
+    return value;
+  }
+
+  bool matchF16LELoad(mlir::Value value, LoadOp &low, LoadOp &high) const {
+    auto widen = value.getDefiningOp<CastOp>();
+    auto bits = widen ? widen.getInput().getDefiningOp<BitcastOp>() : BitcastOp{};
+    auto combine = bits ? bits.getInput().getDefiningOp<BinaryOp>() : BinaryOp{};
+    if (!widen || !bits || !combine || combine.getKind() != "or" ||
+        !isF16(elementType(bits.getResult().getType())) ||
+        !elementType(widen.getResult().getType()).isF32())
+      return false;
+
+    auto lowCast = combine.getLhs().getDefiningOp<CastOp>();
+    auto shift = combine.getRhs().getDefiningOp<BinaryOp>();
+    if (!lowCast || !shift || shift.getKind() != "shl" ||
+        integerConstant(shift.getRhs()) != 8)
+      return false;
+    auto highCast = shift.getLhs().getDefiningOp<CastOp>();
+    low = lowCast.getInput().getDefiningOp<LoadOp>();
+    high = highCast ? highCast.getInput().getDefiningOp<LoadOp>() : LoadOp{};
+    if (!low || !high || !isTrue(low.getWhere()) || !isTrue(high.getWhere()) ||
+        !elementType(low.getResult().getType()).isUnsignedInteger(8) ||
+        !elementType(high.getResult().getType()).isUnsignedInteger(8))
+      return false;
+    auto highPointer = high.getPointer().getDefiningOp<PtrAddOp>();
+    return highPointer && highPointer.getBase() == low.getPointer() &&
+           integerConstant(highPointer.getOffset()) == 1;
+  }
+
+  std::optional<mlir::LogicalResult> tryEmitAffineI4I8NTiles(ForOp nLoop) {
+    mlir::Block &nBody = nLoop.getBody().front();
+    ForOp kLoop;
+    StoreOp store;
+    for (mlir::Operation &operation : nBody.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<ForOp>(operation)) {
+        if (kLoop)
+          return std::nullopt;
+        kLoop = candidate;
+      } else if (auto candidate = mlir::dyn_cast<StoreOp>(operation)) {
+        if (store)
+          return std::nullopt;
+        store = candidate;
+      }
+    }
+    if (!kLoop)
+      return std::nullopt;
+
+    mlir::Block &kBody = kLoop.getBody().front();
+    AffineI4I8ContractOp contract;
+    for (mlir::Operation &operation : kBody.without_terminator())
+      if (auto candidate = mlir::dyn_cast<AffineI4I8ContractOp>(operation)) {
+        if (contract)
+          return std::nullopt;
+        contract = candidate;
+      }
+    if (!contract)
+      return std::nullopt;
+
+    auto reject = [&](llvm::StringRef message)
+        -> std::optional<mlir::LogicalResult> {
+      contract.emitError(message);
+      return std::optional<mlir::LogicalResult>(mlir::failure());
+    };
+    for (mlir::Operation &operation : nBody.without_terminator()) {
+      if (&operation == kLoop.getOperation() ||
+          (store && &operation == store.getOperation()) ||
+          mlir::isa<ConstantOp, FullOp, BlockAxisOp, PtrAddOp>(operation))
+        continue;
+      return reject("IME1 N-tile lowering does not absorb additional source operations");
+    }
+    for (mlir::Operation &operation : kBody.without_terminator()) {
+      if (&operation == contract.getOperation() ||
+          mlir::isa<ConstantOp, BlockAxisOp, BinaryOp, PtrAddOp, LoadOp, CastOp,
+                    BitcastOp, ExpandDimsOp>(operation))
+        continue;
+      return reject("IME1 contraction lowering does not absorb additional source operations");
+    }
+    if (options.target.matrixExtension != "spacemit-ime1")
+      return reject("affine i4/i8 contraction requires --matrix-extension=spacemit-ime1");
+    if (options.target.vlenBits != 256)
+      return reject("SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+    if (nLoop.getNumResults() != 0 || nBody.getNumArguments() != 1 || !store ||
+        !isTrue(store.getWhere()) || kLoop.getNumResults() != 1 ||
+        kLoop.getInitArgs().size() != 1 || kBody.getNumArguments() != 2 ||
+        store.getValue() != kLoop.getResult(0))
+      return reject("IME1 lowering requires one explicit N loop, K recurrence, and output store");
+    auto nYield = mlir::cast<YieldOp>(nBody.getTerminator());
+    auto kYield = mlir::cast<YieldOp>(kBody.getTerminator());
+    if (nYield.getNumOperands() != 0 || kYield.getNumOperands() != 1 ||
+        kYield.getOperand(0) != contract.getResult() ||
+        contract.getInit() != kBody.getArgument(1))
+      return reject("IME1 lowering requires the extension result to be the sole K-loop carry");
+    auto init = kLoop.getInitArgs().front().getDefiningOp<FullOp>();
+    if (!init || !isFloatConstant(init.getValue(), 0.0))
+      return reject("IME1 lowering requires the explicit contraction accumulator to start at zero");
+    if (integerConstant(nLoop.getLower()) != 0 ||
+        integerConstant(nLoop.getStep()) != 16 ||
+        integerConstant(kLoop.getLower()) != 0 ||
+        integerConstant(kLoop.getStep()) != 1)
+      return reject("IME1 lowering requires the source-declared N16 and K-block traversal");
+
+    LoadOp activationLoad = contract.getActivation().getDefiningOp<LoadOp>();
+    LoadOp activationScaleLoad =
+        contract.getActivationScale().getDefiningOp<LoadOp>();
+    LoadOp zeroPointLoad =
+        contract.getWeightZeroPoint().getDefiningOp<LoadOp>();
+    LoadOp packedCodeLoad = contract.getPackedWeight().getDefiningOp<LoadOp>();
+    LoadOp scaleLow;
+    LoadOp scaleHigh;
+    if (!activationLoad || !activationScaleLoad || !zeroPointLoad ||
+        !packedCodeLoad || !matchF16LELoad(contract.getWeightScale(), scaleLow,
+                                          scaleHigh) ||
+        !isTrue(activationLoad.getWhere()) ||
+        !isTrue(activationScaleLoad.getWhere()) ||
+        !isTrue(zeroPointLoad.getWhere()) || !isTrue(packedCodeLoad.getWhere()))
+      return reject("IME1 lowering requires explicit activation, scale, zero-point, and packed-code loads");
+
+    mlir::Value nCoordinate = nBody.getArgument(0);
+    mlir::Value kCoordinate = kBody.getArgument(0);
+    ForOp rowLoop = nLoop->getParentOfType<ForOp>();
+    if (!rowLoop || nLoop->getBlock() != &rowLoop.getBody().front())
+      return reject("IME1 lowering requires the source-declared row traversal to remain outside N/K");
+    mlir::Value rowCoordinate = rowLoop.getBody().front().getArgument(0);
+
+    auto activationLane = activationLoad.getPointer().getDefiningOp<PtrAddOp>();
+    auto activationBlock =
+        activationLane ? activationLane.getBase().getDefiningOp<PtrAddOp>()
+                       : PtrAddOp{};
+    mlir::Value activationBlockIndex;
+    if (!activationLane || !activationBlock ||
+        !matchBlockAxis(activationLane.getOffset(), 32) ||
+        !matchBinaryConstant(activationBlock.getOffset(), "mul", 32,
+                             activationBlockIndex) ||
+        activationBlockIndex != kCoordinate)
+      return reject("IME1 lowering requires explicit contiguous K32 activation-code blocks");
+    mlir::Value codeRow = activationBlock.getBase();
+
+    auto activationScalePointer =
+        activationScaleLoad.getPointer().getDefiningOp<PtrAddOp>();
+    if (!activationScalePointer ||
+        activationScalePointer.getOffset() != kCoordinate)
+      return reject("IME1 lowering requires one explicit f32 activation scale per K32 block");
+    mlir::Value scaleRow = activationScalePointer.getBase();
+
+    auto outputLane = store.getPointer().getDefiningOp<PtrAddOp>();
+    auto outputTile = outputLane ? outputLane.getBase().getDefiningOp<PtrAddOp>()
+                                 : PtrAddOp{};
+    if (!outputLane || !outputTile || !matchBlockAxis(outputLane.getOffset(), 16) ||
+        outputTile.getOffset() != nCoordinate)
+      return reject("IME1 lowering requires an explicit contiguous N16 output tile");
+    mlir::Value outputRow = outputTile.getBase();
+
+    auto zeroPointLane = zeroPointLoad.getPointer().getDefiningOp<PtrAddOp>();
+    auto zeroPointBase =
+        zeroPointLane ? zeroPointLane.getBase().getDefiningOp<PtrAddOp>()
+                      : PtrAddOp{};
+    if (!zeroPointLane || !zeroPointBase ||
+        !matchBlockAxis(zeroPointLane.getOffset(), 16) ||
+        integerConstant(zeroPointBase.getOffset()) != 32)
+      return reject("IME1 lowering requires the explicit sixteen-byte zero-point field");
+    mlir::Value columnAxis = zeroPointLane.getOffset();
+    mlir::Value packedBase = zeroPointBase.getBase();
+
+    auto scaleLane = scaleLow.getPointer().getDefiningOp<PtrAddOp>();
+    mlir::Value scaleColumn;
+    if (!scaleLane || scaleLane.getBase() != packedBase ||
+        !matchBinaryConstant(scaleLane.getOffset(), "mul", 2, scaleColumn) ||
+        scaleColumn != columnAxis || scalarPointerBase(scaleHigh.getPointer()) !=
+                                          packedBase)
+      return reject("IME1 lowering requires the explicit little-endian fp16 scale field");
+
+    auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
+    auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
+                            : BinaryOp{};
+    auto columnAdd = withinAdd ? withinAdd.getBase().getDefiningOp<PtrAddOp>()
+                               : PtrAddOp{};
+    mlir::Value expandedColumn;
+    auto halfAdd = columnAdd ? columnAdd.getBase().getDefiningOp<PtrAddOp>()
+                             : PtrAddOp{};
+    mlir::Value halfIndex;
+    auto payloadBase = halfAdd ? halfAdd.getBase().getDefiningOp<PtrAddOp>()
+                               : PtrAddOp{};
+    if (!withinAdd || !within || within.getKind() != "mod" ||
+        integerConstant(within.getRhs()) != 8 || !columnAdd ||
+        !matchBinaryConstant(columnAdd.getOffset(), "mul", 8, expandedColumn) ||
+        !matchExpandedAxis(expandedColumn, columnAxis, 1) || !halfAdd ||
+        !matchBinaryConstant(halfAdd.getOffset(), "mul", 128, halfIndex) ||
+        !payloadBase || payloadBase.getBase() != packedBase ||
+        integerConstant(payloadBase.getOffset()) != 48)
+      return reject("IME1 lowering requires the explicit two-half packed-i4 payload layout");
+    auto half = halfIndex.getDefiningOp<BinaryOp>();
+    auto expandedByte = within.getLhs().getDefiningOp<ExpandDimsOp>();
+    auto expandedHalfByte =
+        half ? half.getLhs().getDefiningOp<ExpandDimsOp>() : ExpandDimsOp{};
+    if (!half || half.getKind() != "div" || integerConstant(half.getRhs()) != 8 ||
+        !expandedByte || expandedByte.getAxis() != 0 ||
+        !expandedHalfByte || expandedHalfByte.getAxis() != 0 ||
+        expandedHalfByte.getInput() != expandedByte.getInput() ||
+        !matchBlockAxis(expandedByte.getInput(), 16))
+      return reject("IME1 lowering requires the source-declared packed-byte axis");
+
+    auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
+    mlir::Value linearBlock;
+    if (!packedPointer ||
+        !matchBinaryConstant(packedPointer.getOffset(), "mul", 304,
+                             linearBlock))
+      return reject("IME1 lowering requires the explicit 304-byte persistent packed block");
+    auto blockAdd = linearBlock.getDefiningOp<BinaryOp>();
+    mlir::Value groupStride;
+    if (!blockAdd || blockAdd.getKind() != "add")
+      return reject("IME1 lowering requires the explicit packed-block index relation");
+    if (blockAdd.getLhs() == kCoordinate)
+      groupStride = blockAdd.getRhs();
+    else if (blockAdd.getRhs() == kCoordinate)
+      groupStride = blockAdd.getLhs();
+    else
+      return reject("IME1 packed-block index must include the explicit K block");
+    auto groupMultiply = groupStride.getDefiningOp<BinaryOp>();
+    mlir::Value group;
+    if (!groupMultiply || groupMultiply.getKind() != "mul")
+      return reject("IME1 packed-block index must include the explicit N-group stride");
+    if (groupMultiply.getLhs() == kLoop.getUpper())
+      group = groupMultiply.getRhs();
+    else if (groupMultiply.getRhs() == kLoop.getUpper())
+      group = groupMultiply.getLhs();
+    else
+      return reject("IME1 packed-block N stride must use the explicit K-block count");
+    auto groupDivide = group.getDefiningOp<BinaryOp>();
+    if (!groupDivide || groupDivide.getKind() != "div" ||
+        groupDivide.getLhs() != nCoordinate ||
+        integerConstant(groupDivide.getRhs()) != 16)
+      return reject("IME1 packed-block index must use the explicit N16 group");
+
+    mlir::Value packedRoot = packedPointer.getBase();
+    if (!dependsOn(codeRow, rowCoordinate) || !dependsOn(scaleRow, rowCoordinate) ||
+        !dependsOn(outputRow, rowCoordinate) ||
+        dependsOn(packedRoot, rowCoordinate) ||
+        dependsOn(codeRow, nCoordinate) || dependsOn(scaleRow, nCoordinate) ||
+        dependsOn(outputRow, kCoordinate))
+      return reject("IME1 lowering cannot change the source-declared row/N/K ownership");
+
+    CValue code = require(codeRow);
+    CValue scales = require(scaleRow);
+    CValue weights = require(packedRoot);
+    CValue outputValue = require(outputRow);
+    std::string columns = expression(nLoop.getUpper());
+    std::string blocks = expression(kLoop.getUpper());
+    if (code.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
+        weights.kind != CValueKind::Pointer ||
+        outputValue.kind != CValueKind::Pointer || code.spelling.empty() ||
+        scales.spelling.empty() || weights.spelling.empty() ||
+        outputValue.spelling.empty() || columns.empty() || blocks.empty())
+      return reject("IME1 lowering could not materialize the explicit source operands");
+
+    std::string nTile = fresh("ime_n");
+    std::string nCount = fresh("ime_n_count");
+    line("for (size_t " + nTile + " = 0; " + nTile + " < " + columns +
+         "; " + nTile + " += 16) {");
+    ++indent;
+    line("const size_t " + nCount + " = (" + columns + " - " + nTile +
+         ") < 16 ? (" + columns + " - " + nTile + ") : 16;");
+    line("__weft_ime1_affine_i4_i8_n16(" + scales.spelling + ", " +
+         code.spelling + ", " + weights.spelling + " + (" + nTile +
+         " / 16) * " + blocks + " * 304, " + outputValue.spelling + " + " +
+         nTile + ", " + nCount + ", " + blocks + ");");
+    --indent;
+    line("}");
+    return std::optional<mlir::LogicalResult>(mlir::success());
   }
 
   std::optional<mlir::LogicalResult> tryEmitF16GemmNTiles(ForOp nLoop) {
@@ -3210,34 +3618,208 @@ private:
   }
 };
 
-void emitPrelude(llvm::raw_ostream &output, bool usesExp) {
+void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <riscv_vector.h>
 
-static inline int8_t __weft_bitcast_u8_i8(uint8_t bits) {
+static inline __attribute__((unused)) int8_t __weft_bitcast_u8_i8(uint8_t bits) {
   union { uint8_t u; int8_t i; } value = { .u = bits };
   return value.i;
 }
 
-static inline int16_t __weft_bitcast_u16_i16(uint16_t bits) {
+static inline __attribute__((unused)) int16_t __weft_bitcast_u16_i16(uint16_t bits) {
   union { uint16_t u; int16_t i; } value = { .u = bits };
   return value.i;
 }
 
-static inline _Float16 __weft_bitcast_u16_f16(uint16_t bits) {
+static inline __attribute__((unused)) _Float16 __weft_bitcast_u16_f16(uint16_t bits) {
   union { uint16_t u; _Float16 f; } value = { .u = bits };
   return value.f;
 }
 
-static inline float __weft_bitcast_u32_f32(uint32_t bits) {
+static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits) {
   union { uint32_t u; float f; } value = { .u = bits };
   return value.f;
 }
 
 )c";
+  if (usesIME1) {
+    output << R"ime(#define __WEFT_IME1_COMP_I4_I8_M1                                      \
+  "vmadot       v16, v14, v0            \n\t"                         \
+  "vmadot       v18, v14, v1            \n\t"                         \
+  "vmadot       v20, v14, v2            \n\t"                         \
+  "vmadot       v22, v14, v3            \n\t"                         \
+  "vmadot       v16, v15, v4            \n\t"                         \
+  "vmadot       v18, v15, v5            \n\t"                         \
+  "vmadot       v20, v15, v6            \n\t"                         \
+  "vmadot       v22, v15, v7            \n\t"
+
+#define __WEFT_IME1_ACC_I4_I8_M1                                       \
+  "vfcvt.f.x.v  v16, v16                \n\t"                         \
+  "vfcvt.f.x.v  v18, v18                \n\t"                         \
+  "vfcvt.f.x.v  v20, v20                \n\t"                         \
+  "vfcvt.f.x.v  v22, v22                \n\t"                         \
+  "addi         s2, s1, 8                \n\t"                         \
+  "addi         s3, s1, 16               \n\t"                         \
+  "addi         s4, s1, 24               \n\t"                         \
+  "addi         s6, s5, 8                \n\t"                         \
+  "vfmacc.vv    v28, v16, v24            \n\t"                         \
+  "vfmacc.vv    v29, v18, v25            \n\t"                         \
+  "vfmacc.vv    v30, v20, v26            \n\t"                         \
+  "vfmacc.vv    v31, v22, v27            \n\t"
+
+#define __WEFT_IME1_LOAD_I4_I8_M1                                      \
+  "vle8.v       v4, (s1)                 \n\t"                         \
+  "addi         s1, s1, 128              \n\t"                         \
+  "vle8.v       v5, (s2)                 \n\t"                         \
+  "addi         s2, s2, 128              \n\t"                         \
+  "vle8.v       v6, (s3)                 \n\t"                         \
+  "addi         s3, s3, 128              \n\t"                         \
+  "vle8.v       v7, (s4)                 \n\t"                         \
+  "addi         s4, s4, 128              \n\t"                         \
+  "vsetvli      t0, zero, e8, mf4        \n\t"                         \
+  "vle8.v       v14, (s5)                \n\t"                         \
+  "addi         s5, s5, 16               \n\t"                         \
+  "vle8.v       v15, (s6)                \n\t"                         \
+  "addi         s6, s6, 16               \n\t"                         \
+  "addi         t5, t5, -1               \n\t"                         \
+  "vsetvli      t0, zero, e8, m1         \n\t"                         \
+  "vand.vi      v0, v4, 15               \n\t"                         \
+  "vand.vi      v1, v5, 15               \n\t"                         \
+  "vand.vi      v2, v6, 15               \n\t"                         \
+  "vand.vi      v3, v7, 15               \n\t"                         \
+  "vsrl.vi      v4, v4, 4                \n\t"                         \
+  "vsrl.vi      v5, v5, 4                \n\t"                         \
+  "vsrl.vi      v6, v6, 4                \n\t"                         \
+  "vsrl.vi      v7, v7, 4                \n\t"
+
+#define __WEFT_IME1_LOAD_ZP_I4_I8_M1                                   \
+  "vsetvli      t0, zero, e8, mf2       \n\t"                          \
+  "vle8.v       v1, (s7)                 \n\t"                          \
+  "vsetvli      t0, zero, e8, m1        \n\t"                          \
+  "vrgather.vv  v8, v1, v13              \n\t"                          \
+  "vadd.vi      v13, v13, 4              \n\t"                          \
+  "vrgather.vv  v9, v1, v13              \n\t"                          \
+  "vadd.vi      v13, v13, 4              \n\t"                          \
+  "vrgather.vv  v10, v1, v13             \n\t"                          \
+  "vadd.vi      v13, v13, 4              \n\t"                          \
+  "vrgather.vv  v11, v1, v13             \n\t"                          \
+  "vadd.vi      v13, v13, -12            \n\t"
+
+static inline void __weft_ime1_affine_i4_i8_n16(
+    const float *activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *output, size_t nblks,
+    size_t block_count) {
+  const size_t inner = 2;
+  const uint8_t *weight = packed_weight;
+  float *destination = output;
+  const float *scale = activation_scale;
+  size_t count = block_count;
+
+  __asm__ volatile(
+        "vsetvli      t0, zero, e32, m4       \n\t"
+        "vxor.vv      v28, v28, v28           \n\t"
+        "vsetvli      t0, zero, e8, m1        \n\t"
+        "vmv.v.i      v13, 3                  \n\t"
+        "li           s1, 24                  \n\t"
+        "vsetvli      t0, s1, e8, m1          \n\t"
+        "vmv.v.i      v13, 2                  \n\t"
+        "vsetvli      t0, zero, e8, mf2       \n\t"
+        "vmv.v.i      v13, 1                  \n\t"
+        "vsetvli      t0, zero, e8, mf4       \n\t"
+        "vmv.v.i      v13, 0                  \n\t"
+        "addi         s1, %[B], 0             \n\t"
+        "addi         s2, %[B], 8             \n\t"
+        "addi         s3, %[B], 16            \n\t"
+        "addi         s4, %[B], 24            \n\t"
+        "addi         s7, %[B], 32            \n\t"
+        "addi         s5, %[A], 0             \n\t"
+        "addi         s6, %[A], 8             \n\t"
+        "LOOP_K%=:                            \n\t"
+        "vsetvli      t0, zero, e16, mf4      \n\t"
+        "vle16.v      v4, (s1)                \n\t"
+        "addi         s1, s1, 48              \n\t"
+        "vle16.v      v5, (s2)                \n\t"
+        "addi         s2, s2, 72              \n\t"
+        "vle16.v      v6, (s3)                \n\t"
+        "addi         s3, s3, 96              \n\t"
+        "vle16.v      v7, (s4)                \n\t"
+        "addi         s4, s4, 120             \n\t"
+        "flw          f1, 0(%[AS])            \n\t"
+        "addi         %[AS], %[AS], 4         \n\t"
+        "vfwcvt.f.f.v v8, v4                  \n\t"
+        "vfwcvt.f.f.v v9, v5                  \n\t"
+        "vfwcvt.f.f.v v10, v6                 \n\t"
+        "vfwcvt.f.f.v v11, v7                 \n\t"
+        "vsetvli      t0, zero, e32, mf2      \n\t"
+        "addi         t5, %[INNER], 0         \n\t"
+        "vxor.vv      v16, v16, v16           \n\t"
+        "vxor.vv      v18, v18, v18           \n\t"
+        "vxor.vv      v20, v20, v20           \n\t"
+        "vxor.vv      v22, v22, v22           \n\t"
+        "vfmul.vf     v24, v8, f1             \n\t"
+        "vfmul.vf     v25, v9, f1             \n\t"
+        "vfmul.vf     v26, v10, f1            \n\t"
+        "vfmul.vf     v27, v11, f1            \n\t"
+        "addi         %[CNT], %[CNT], -1      \n\t"
+        __WEFT_IME1_LOAD_ZP_I4_I8_M1
+        "LOOP_INNER%=:                        \n\t"
+        __WEFT_IME1_LOAD_I4_I8_M1
+        "vsub.vv      v0, v0, v8              \n\t"
+        "vsub.vv      v4, v4, v8              \n\t"
+        "vsub.vv      v1, v1, v9              \n\t"
+        "vsub.vv      v5, v5, v9              \n\t"
+        "vsub.vv      v2, v2, v10             \n\t"
+        "vsub.vv      v6, v6, v10             \n\t"
+        "vsub.vv      v3, v3, v11             \n\t"
+        "vsub.vv      v7, v7, v11             \n\t"
+        __WEFT_IME1_COMP_I4_I8_M1
+        "bnez         t5, LOOP_INNER%=        \n\t"
+        "vsetvli      t0, zero, e32, mf2      \n\t"
+        __WEFT_IME1_ACC_I4_I8_M1
+        "addi         s7, s1, 32              \n\t"
+        "bnez         %[CNT], LOOP_K%=        \n\t"
+        "addi         t3, zero, 16            \n\t"
+        "addi         s1, %[C], 16            \n\t"
+        "addi         s2, %[C], 32            \n\t"
+        "addi         s3, %[C], 48            \n\t"
+        "blt          %[NBLKS], t3, ST_TAIL%= \n\t"
+        "vse32.v      v28, (%[C])             \n\t"
+        "vse32.v      v29, (s1)               \n\t"
+        "vse32.v      v30, (s2)               \n\t"
+        "vse32.v      v31, (s3)               \n\t"
+        "jal          x0, END%=               \n\t"
+        "ST_TAIL%=:                           \n\t"
+        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
+        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
+        "vse32.v      v28, (%[C])             \n\t"
+        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
+        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
+        "vse32.v      v29, (s1)               \n\t"
+        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
+        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
+        "vse32.v      v30, (s2)               \n\t"
+        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
+        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
+        "vse32.v      v31, (s3)               \n\t"
+        "END%=:                               \n\t"
+        : [CNT] "+r"(count), [NBLKS] "+r"(nblks), [AS] "+r"(scale)
+        : [INNER] "r"(inner), [A] "r"(activation_code), [B] "r"(weight),
+          [C] "r"(destination)
+      : "cc", "memory", "t0", "t5", "t3", "f1", "s1", "s2", "s3",
+        "s4", "s5", "s6", "s7");
+}
+
+#undef __WEFT_IME1_COMP_I4_I8_M1
+#undef __WEFT_IME1_ACC_I4_I8_M1
+#undef __WEFT_IME1_LOAD_I4_I8_M1
+#undef __WEFT_IME1_LOAD_ZP_I4_I8_M1
+
+)ime";
+  }
   if (!usesExp)
     return;
   output << R"c(static inline vfloat32m2_t __weft_exp_f32m2(
@@ -3303,8 +3885,10 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
     return module.emitError(
         "the intrinsic C target requires RVV; no fallback backend is installed");
   bool usesExp = false;
+  bool usesIME1 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
-  emitPrelude(output, usesExp);
+  module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
+  emitPrelude(output, usesExp, usesIME1);
 
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())
