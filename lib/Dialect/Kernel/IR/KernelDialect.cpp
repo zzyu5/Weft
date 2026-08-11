@@ -1079,12 +1079,21 @@ mlir::LogicalResult SummaryFoldOp::verify() {
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getInput(),
                                    "where")))
     return mlir::failure();
+  bool hasCoordinate =
+      !mlir::isa<mlir::NoneType>(getCoordinate().getType());
+  if (hasCoordinate &&
+      mlir::failed(verifyFootprint(getOperation(), getCoordinate(), getInput(),
+                                   "coordinate")))
+    return mlir::failure();
   mlir::Type element = elementTypeOf(input);
   mlir::Type state = getIdentity().getType();
   mlir::Block &lift = getLift().front();
   mlir::Block &merge = getMerge().front();
   mlir::Block &finalize = getFinalize().front();
-  if (lift.getNumArguments() != 1 || lift.getArgument(0).getType() != element ||
+  if (lift.getNumArguments() != (hasCoordinate ? 2U : 1U) ||
+      lift.getArgument(0).getType() != element ||
+      (hasCoordinate && lift.getArgument(1).getType() !=
+                            elementTypeOf(getCoordinate().getType())) ||
       merge.getNumArguments() != 2 ||
       merge.getArgument(0).getType() != state ||
       merge.getArgument(1).getType() != state ||

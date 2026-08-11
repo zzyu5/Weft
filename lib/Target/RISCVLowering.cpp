@@ -102,6 +102,7 @@ enum class VLAStateRealization {
   RVVAddReduction,
   RVVMaxReduction,
   RVVInclusiveAddScan,
+  RVVArgMaxSummary,
 };
 
 struct VLAPredicateDecision {
@@ -126,6 +127,7 @@ struct VLAStateDecision {
   VLAStateRealization realization = VLAStateRealization::RVVAddReduction;
   mlir::Type elementType;
   mlir::Value identity;
+  VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
 };
 
 struct VLARegionDecision {
@@ -353,7 +355,8 @@ bool matchesScaledSummaryTerm(mlir::Value value, mlir::BlockArgument state,
 }
 
 bool isOnlineSoftmaxSummary(SummaryFoldOp op) {
-  if (op.getOrder() != "preserve" || !isTrue(op.getWhere()))
+  if (op.getOrder() != "preserve" || !isTrue(op.getWhere()) ||
+      !mlir::isa<mlir::NoneType>(op.getCoordinate().getType()))
     return false;
   auto resultType = mlir::dyn_cast<TupleType>(op.getResult().getType());
   if (!resultType || resultType.getTypes().size() != 2 ||
@@ -402,6 +405,102 @@ bool isOnlineSoftmaxSummary(SummaryFoldOp op) {
                                    maximum.getResult()) &&
           matchesScaledSummaryTerm(sum.getRhs(), merge.getArgument(0),
                                    maximum.getResult()));
+}
+
+bool matchesTupleFieldCompare(mlir::Value value, llvm::StringRef predicate,
+                              mlir::BlockArgument lhsState, int64_t lhsIndex,
+                              mlir::BlockArgument rhsState,
+                              int64_t rhsIndex) {
+  auto compare = value.getDefiningOp<CompareOp>();
+  return compare && compare.getPredicate() == predicate &&
+         isTupleField(compare.getLhs(), lhsState, lhsIndex) &&
+         isTupleField(compare.getRhs(), rhsState, rhsIndex);
+}
+
+bool matchesArgMaxTie(mlir::Value value, mlir::BlockArgument lhsState,
+                      mlir::BlockArgument rhsState) {
+  auto conjunction = value.getDefiningOp<BinaryOp>();
+  if (!conjunction || conjunction.getKind() != "and")
+    return false;
+  auto matchesEquality = [&](mlir::Value candidate) {
+    return matchesTupleFieldCompare(candidate, "eq", rhsState, 0, lhsState,
+                                    0);
+  };
+  auto matchesLowerIndex = [&](mlir::Value candidate) {
+    return matchesTupleFieldCompare(candidate, "lt", rhsState, 1, lhsState,
+                                    1);
+  };
+  return (matchesEquality(conjunction.getLhs()) &&
+          matchesLowerIndex(conjunction.getRhs())) ||
+         (matchesEquality(conjunction.getRhs()) &&
+          matchesLowerIndex(conjunction.getLhs()));
+}
+
+bool matchesArgMaxTakeRight(mlir::Value value, mlir::BlockArgument lhsState,
+                            mlir::BlockArgument rhsState) {
+  auto disjunction = value.getDefiningOp<BinaryOp>();
+  if (!disjunction || disjunction.getKind() != "or")
+    return false;
+  auto matchesGreater = [&](mlir::Value candidate) {
+    return matchesTupleFieldCompare(candidate, "gt", rhsState, 0, lhsState,
+                                    0);
+  };
+  return (matchesGreater(disjunction.getLhs()) &&
+          matchesArgMaxTie(disjunction.getRhs(), lhsState, rhsState)) ||
+         (matchesGreater(disjunction.getRhs()) &&
+          matchesArgMaxTie(disjunction.getLhs(), lhsState, rhsState));
+}
+
+bool isArgMaxSummary(SummaryFoldOp op) {
+  if (op.getOrder() != "relaxed" || !isTrue(op.getWhere()) ||
+      !elementType(op.getInput().getType()).isF32() ||
+      !elementType(op.getCoordinate().getType()).isIndex())
+    return false;
+  auto resultType = mlir::dyn_cast<TupleType>(op.getResult().getType());
+  if (!resultType || resultType.getTypes().size() != 2 ||
+      !resultType.getTypes()[0].isF32() ||
+      !resultType.getTypes()[1].isIndex())
+    return false;
+
+  auto identity = op.getIdentity().getDefiningOp<TupleOp>();
+  if (!identity || identity.getNumOperands() != 2 ||
+      !identity.getOperand(0).getDefiningOp<SpecialValueOp>() ||
+      identity.getOperand(0).getDefiningOp<SpecialValueOp>().getKind() !=
+          "neg_inf" ||
+      integerConstantValue(identity.getOperand(1)) != 0)
+    return false;
+
+  mlir::Block &lift = op.getLift().front();
+  auto liftYield = mlir::cast<YieldOp>(lift.getTerminator());
+  auto lifted = liftYield.getOperand(0).getDefiningOp<TupleOp>();
+  if (lift.getNumArguments() != 2 || !lifted ||
+      lifted.getNumOperands() != 2 ||
+      lifted.getOperand(0) != lift.getArgument(0) ||
+      lifted.getOperand(1) != lift.getArgument(1))
+    return false;
+
+  mlir::Block &merge = op.getMerge().front();
+  auto mergeYield = mlir::cast<YieldOp>(merge.getTerminator());
+  auto merged = mergeYield.getOperand(0).getDefiningOp<TupleOp>();
+  if (!merged || merged.getNumOperands() != 2)
+    return false;
+  auto valueSelect = merged.getOperand(0).getDefiningOp<SelectOp>();
+  auto indexSelect = merged.getOperand(1).getDefiningOp<SelectOp>();
+  if (!valueSelect || !indexSelect ||
+      valueSelect.getPredicate() != indexSelect.getPredicate() ||
+      !matchesArgMaxTakeRight(valueSelect.getPredicate(), merge.getArgument(0),
+                              merge.getArgument(1)) ||
+      !isTupleField(valueSelect.getTrueValue(), merge.getArgument(1), 0) ||
+      !isTupleField(valueSelect.getFalseValue(), merge.getArgument(0), 0) ||
+      !isTupleField(indexSelect.getTrueValue(), merge.getArgument(1), 1) ||
+      !isTupleField(indexSelect.getFalseValue(), merge.getArgument(0), 1))
+    return false;
+
+  mlir::Block &finalize = op.getFinalize().front();
+  auto finalizeYield = mlir::cast<YieldOp>(finalize.getTerminator());
+  return finalize.getNumArguments() == 1 &&
+         finalizeYield.getNumOperands() == 1 &&
+         finalizeYield.getOperand(0) == finalize.getArgument(0);
 }
 
 class KernelEmitter {
@@ -699,6 +798,23 @@ private:
         decision.states.push_back(VLAStateDecision{
             scan.getOperation(), VLAStateRealization::RVVInclusiveAddScan,
             elementType(scan.getResult().getType()), scan.getIdentity()});
+      } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        if (isArgMaxSummary(summary)) {
+          LaneRelation coordinate =
+              classifyLaneRelation(summary.getCoordinate(), decision.coordinate);
+          if (coordinate != LaneRelation::UnitStride &&
+              coordinate != LaneRelation::Strided) {
+            summary.emitError("argmax coordinate is not affine in the VLA axis");
+            return mlir::failure();
+          }
+          VLAStateDecision state{
+              summary.getOperation(), VLAStateRealization::RVVArgMaxSummary,
+              summary.getResult().getType(), summary.getIdentity()};
+          state.coordinateMode = coordinate == LaneRelation::UnitStride
+                                     ? VLAMemoryMode::UnitStride
+                                     : VLAMemoryMode::Strided;
+          decision.states.push_back(state);
+        }
       }
     }
     return decision;
@@ -1472,6 +1588,23 @@ private:
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
+      if (state.realization == VLAStateRealization::RVVArgMaxSummary) {
+        auto summary = mlir::cast<SummaryFoldOp>(state.operation);
+        auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
+        CValue maximum{mlir::Float32Type::get(kernel.getContext()),
+                       CValueKind::Scalar, fresh("argmax_value")};
+        CValue index{mlir::IndexType::get(kernel.getContext()),
+                     CValueKind::Scalar, fresh("argmax_index")};
+        line("float " + maximum.spelling + " = " +
+             expression(identity.getOperand(0)) + ";");
+        line("size_t " + index.spelling + " = " +
+             expression(identity.getOperand(1)) + ";");
+        CValue aggregate{summary.getResult().getType(), CValueKind::Tuple, {}};
+        aggregate.fields = {maximum, index};
+        aggregates[state.operation] = aggregate;
+        values[summary.getResult()] = aggregate;
+        continue;
+      }
       std::string identity = expression(state.identity);
       if (identity.empty())
         return state.operation->emitError("VLA state identity is unavailable");
@@ -1490,6 +1623,8 @@ private:
     }
     for (mlir::Operation &nested : body.without_terminator()) {
       if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        if (aggregates.contains(summary.getOperation()))
+          continue;
         if (!isOnlineSoftmaxSummary(summary))
           return summary.emitError(
               "RISC-V target does not implement this summary algebra");
@@ -1551,8 +1686,15 @@ private:
         continue;
       }
       if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
-        if (mlir::failed(emitOnlineSoftmaxSummary(
-                summary, aggregates[summary.getOperation()])))
+        const VLAStateDecision *state =
+            findStateDecision(summary.getOperation());
+        mlir::LogicalResult lowered =
+            state && state->realization == VLAStateRealization::RVVArgMaxSummary
+                ? emitVectorArgMaxSummary(
+                      summary, *state, aggregates[summary.getOperation()])
+                : emitOnlineSoftmaxSummary(
+                      summary, aggregates[summary.getOperation()]);
+        if (mlir::failed(lowered))
           return mlir::failure();
         continue;
       }
@@ -4122,6 +4264,54 @@ private:
     line(carry.spelling + " = __riscv_vfmv_f_s_f32m2_f32(" + last + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::F32Vector, prefix};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitVectorArgMaxSummary(
+      SummaryFoldOp op, const VLAStateDecision &decision,
+      const CValue &aggregate) {
+    CValue input = require(op.getInput());
+    CValue coordinate = require(op.getCoordinate());
+    if (decision.realization != VLAStateRealization::RVVArgMaxSummary ||
+        input.kind != CValueKind::F32Vector ||
+        coordinate.kind != CValueKind::Coordinate ||
+        coordinate.spelling.empty() || coordinate.laneStride.empty() ||
+        aggregate.kind != CValueKind::Tuple || aggregate.fields.size() != 2)
+      return op.emitError("RVV argmax summary projection is unavailable");
+
+    const CValue &maximum = aggregate.fields[0];
+    const CValue &index = aggregate.fields[1];
+    std::string seed = fresh("argmax_seed");
+    std::string reduced = fresh("argmax_reduced");
+    std::string stripMaximum = fresh("argmax_strip_value");
+    std::string equal = fresh("argmax_equal");
+    std::string first = fresh("argmax_first");
+    std::string stripIndex = fresh("argmax_strip_index");
+    line("vfloat32m1_t " + seed +
+         " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
+    line("vfloat32m1_t " + reduced +
+         " = __riscv_vfredmax_vs_f32m2_f32m1(" + input.spelling + ", " +
+         seed + ", " + activeVL + ");");
+    line("const float " + stripMaximum +
+         " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
+    line("vbool16_t " + equal + " = __riscv_vmfeq_vf_f32m2_b16(" +
+         input.spelling + ", " + stripMaximum + ", " + activeVL + ");");
+    line("const long " + first + " = __riscv_vfirst_m_b16(" + equal + ", " +
+         activeVL + ");");
+    std::string laneOffset = first;
+    if (decision.coordinateMode == VLAMemoryMode::Strided)
+      laneOffset = "(" + first + " * (" + coordinate.laneStride + "))";
+    line("const size_t " + stripIndex + " = (size_t)(" + coordinate.spelling +
+         " + " + laneOffset + ");");
+    line("if (" + stripMaximum + " > " + maximum.spelling + " || (" +
+         stripMaximum + " == " + maximum.spelling + " && " + stripIndex +
+         " < " + index.spelling + ")) {");
+    ++indent;
+    line(maximum.spelling + " = " + stripMaximum + ";");
+    line(index.spelling + " = " + stripIndex + ";");
+    --indent;
+    line("}");
+    values[op.getResult()] = aggregate;
     return mlir::success();
   }
 

@@ -332,7 +332,7 @@ def WeftKernel_ScanOp : WeftKernel_Op<"scan", [Pure]> {
 
 def WeftKernel_SummaryFoldOp : WeftKernel_Op<"summary_fold", [Pure]> {
   let arguments = (ins AnyType:$input, AnyType:$identity, AnyType:$where,
-                       StrAttr:$order);
+                       AnyType:$coordinate, StrAttr:$order);
   let results = (outs AnyType:$result);
   let regions = (region SizedRegion<1>:$lift,
                          SizedRegion<1>:$merge,

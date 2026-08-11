@@ -76,6 +76,14 @@ case "${kernel}" in
     dsl=examples/kernels/reduction/cumsum.py
     runtime=examples/repro/weft/reduction/cumsum_runtime.cpp
     ;;
+  argmax)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 argmax" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/argmax.py
+    runtime=examples/repro/weft/reduction/argmax_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2

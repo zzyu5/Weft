@@ -13,3 +13,4 @@ matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inl
 predicate_memory,causal_mask_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"attention[heads=32;Q=128;K=2048]",full-causal-score-mask,10,0,64,full,no,,,,,6.684719,1254.893138,MElements/s
 scan_state,cumsum_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"mamba_dt[sequences=1;heads=64;tokens=4096]",full-inclusive-prefix-scan,10,0,64,full,no,,,0,0,0.393851,665.591810,MElements/s
 normalization,layer_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,1.19986008e-06,7.21449121e-07,1.602827,327.102052,MElements/s
+summary_state,argmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"logits[batch=128;vocab=128256]",full-first-index-argmax,10,0,64,full,no,,,,,16.925466,969.944816,MElements/s

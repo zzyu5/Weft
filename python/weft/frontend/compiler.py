@@ -1428,6 +1428,7 @@ class FrontendCompiler:
                 "merge": None,
                 "finalize": None,
                 "where": True,
+                "coordinate": None,
                 "order": "preserve",
             },
         )
@@ -1436,6 +1437,7 @@ class FrontendCompiler:
             raise FrontendError("summary_fold requires identity", self._location(call))
         identity = self._value_argument(args["identity"], call)
         where = self._value_argument(args["where"], call)
+        coordinate = self._value_argument(args["coordinate"], call)
         lift = self._resolve_helper_argument(args["lift"], call, "lift")
         merge = self._resolve_helper_argument(args["merge"], call, "merge")
         finalize_static = args["finalize"]
@@ -1448,8 +1450,18 @@ class FrontendCompiler:
             order = self._eval_static(order)
 
         input_element = element_type(bare_type(value.type))
+        lift_arguments = (input_element,)
+        if not isinstance(coordinate.type, NoneType):
+            if shape_kind(coordinate.type) != shape_kind(value.type) or shape_of(
+                coordinate.type
+            ) != shape_of(value.type):
+                raise FrontendError(
+                    "summary coordinate must share the input logical domain",
+                    self._location(call),
+                )
+            lift_arguments += (element_type(bare_type(coordinate.type)),)
         lift_region, lift_result = self._compile_helper_region(
-            lift, (input_element,), call
+            lift, lift_arguments, call
         )
         if lift_result != identity.type:
             raise FrontendError("lift result must match identity state", self._location(call))
@@ -1478,7 +1490,7 @@ class FrontendCompiler:
         return self._emit(
             "weft_kernel.summary_fold",
             call,
-            operands=(value, identity, where),
+            operands=(value, identity, where, coordinate),
             result_types=(result_type,),
             attributes={"order": _string(str(order))},
             regions=(lift_region, merge_region, finalize_region),
