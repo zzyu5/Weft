@@ -21,6 +21,7 @@ from .builtins import contract
 from .builtins import cos
 from .builtins import decode
 from .builtins import dot
+from .builtins import e2m1_e8m0_i8_dot
 from .builtins import exp
 from .builtins import exp2
 from .builtins import expand_dims
@@ -47,6 +48,7 @@ from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import scan
 from .builtins import select
+from .builtins import sign_bit_i8_dot
 from .builtins import sin
 from .builtins import store
 from .builtins import summary_fold

@@ -109,7 +109,60 @@ mlir::LogicalResult GroupedAffineI4I8DotOp::verify() {
   if (!getDotScale().getType().isF32() ||
       !getMinimumScale().getType().isF32())
     return emitOpError("dot_scale and minimum_scale must be scalar f32");
-  if (!getInit().getType().isF32() || getInit().getType() != getResult().getType())
+  if (!getInit().getType().isF32() ||
+      getInit().getType() != getResult().getType())
+    return emitOpError("init and result must be scalar f32");
+  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
+    return emitOpError("must be nested in a canonical Weft kernel");
+  return mlir::success();
+}
+
+mlir::LogicalResult SignBitI8DotOp::verify() {
+  auto blockType = [](mlir::Type type) {
+    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
+      type = masked.getValueType();
+    return mlir::dyn_cast<weft::kernel::BlockType>(type);
+  };
+  auto signBits = blockType(getSignBits().getType());
+  auto activation = blockType(getActivation().getType());
+  if (!signBits || signBits.getShape() != llvm::ArrayRef<int64_t>({4}) ||
+      !signBits.getElementType().isUnsignedInteger(8))
+    return emitOpError("sign_bits must be a u8 block<4>");
+  if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
+      !activation.getElementType().isSignedInteger(8))
+    return emitOpError("activation must be a signed i8 block<32>");
+  if (!getActivationScale().getType().isF32() ||
+      !getSignScale().getType().isF32())
+    return emitOpError("activation_scale and sign_scale must be scalar f32");
+  if (!getInit().getType().isF32() ||
+      getInit().getType() != getResult().getType())
+    return emitOpError("init and result must be scalar f32");
+  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
+    return emitOpError("must be nested in a canonical Weft kernel");
+  return mlir::success();
+}
+
+mlir::LogicalResult E2M1E8M0I8DotOp::verify() {
+  auto blockType = [](mlir::Type type) {
+    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
+      type = masked.getValueType();
+    return mlir::dyn_cast<weft::kernel::BlockType>(type);
+  };
+  auto packedCodes = blockType(getPackedCodes().getType());
+  auto activation = blockType(getActivation().getType());
+  if (!packedCodes ||
+      packedCodes.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+      !packedCodes.getElementType().isUnsignedInteger(8))
+    return emitOpError("packed_codes must be a u8 block<16>");
+  if (!getExponent().getType().isUnsignedInteger(8))
+    return emitOpError("exponent must be scalar u8");
+  if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
+      !activation.getElementType().isSignedInteger(8))
+    return emitOpError("activation must be a signed i8 block<32>");
+  if (!getActivationScale().getType().isF32())
+    return emitOpError("activation_scale must be scalar f32");
+  if (!getInit().getType().isF32() ||
+      getInit().getType() != getResult().getType())
     return emitOpError("init and result must be scalar f32");
   if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
     return emitOpError("must be nested in a canonical Weft kernel");

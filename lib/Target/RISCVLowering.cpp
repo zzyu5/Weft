@@ -106,6 +106,34 @@ struct SymmetricI4I8Decision {
   int64_t packedBlockBytes = 288;
 };
 
+enum class SignBitI8Realization {
+  RVVVLEN128WideningSignSum,
+};
+
+struct SignBitI8Decision {
+  SignBitI8Realization realization =
+      SignBitI8Realization::RVVVLEN128WideningSignSum;
+  mlir::Value signBitsBase;
+  mlir::Value activationBase;
+  mlir::Value activationScale;
+  mlir::Value signScale;
+  mlir::Value init;
+};
+
+enum class E2M1E8M0I8Realization {
+  RVVVLEN128TableDot,
+};
+
+struct E2M1E8M0I8Decision {
+  E2M1E8M0I8Realization realization =
+      E2M1E8M0I8Realization::RVVVLEN128TableDot;
+  mlir::Value packedCodesBase;
+  mlir::Value activationBase;
+  mlir::Value exponent;
+  mlir::Value activationScale;
+  mlir::Value init;
+};
+
 struct CValue {
   mlir::Type type;
   CValueKind kind = CValueKind::Scalar;
@@ -1198,6 +1226,10 @@ private:
       return op.emitError("scan must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
       return emitGroupedAffineI4I8Dot(op);
+    if (auto op = mlir::dyn_cast<SignBitI8DotOp>(operation))
+      return emitSignBitI8Dot(op);
+    if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
+      return emitE2M1E8M0I8Dot(op);
     if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
       return emitSymmetricI4I8Contract(op);
     if (auto op = mlir::dyn_cast<FullOp>(operation)) {
@@ -3826,6 +3858,220 @@ private:
     return std::optional<mlir::LogicalResult>(mlir::success());
   }
 
+  mlir::LogicalResult decideSignBitI8Dot(SignBitI8DotOp op,
+                                         SignBitI8Decision &decision) {
+    if (options.target.vlenBits != 128)
+      return op.emitError(
+          "sign-bit/i8 dot requires an explicit VLEN128 target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "sign-bit/i8 dot requires little-endian source bit order");
+    if (!op.getSignBits().hasOneUse() || !op.getActivation().hasOneUse())
+      return op.emitError(
+          "sign-bit/i8 dot requires local single-use block operands");
+
+    LoadOp signLoad = op.getSignBits().getDefiningOp<LoadOp>();
+    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
+    LoadOp activationLoad =
+        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
+                       : LoadOp{};
+    if (!signLoad || !activationCast || !activationLoad ||
+        !isTrue(signLoad.getWhere()) || !isTrue(activationLoad.getWhere()))
+      return op.emitError(
+          "sign-bit/i8 dot requires explicit all-active block loads");
+
+    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
+      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
+      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
+        return {};
+      return lane.getBase();
+    };
+    mlir::Value signBase = blockBase(signLoad, 4);
+    mlir::Value activationBase = blockBase(activationLoad, 32);
+    if (!signBase || !activationBase)
+      return op.emitError(
+          "sign-bit/i8 dot block axes do not match its typed operands");
+
+    decision = SignBitI8Decision{};
+    decision.signBitsBase = signBase;
+    decision.activationBase = activationBase;
+    decision.activationScale = op.getActivationScale();
+    decision.signScale = op.getSignScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitSignBitI8Dot(SignBitI8DotOp op) {
+    SignBitI8Decision decision;
+    if (mlir::failed(decideSignBitI8Dot(op, decision)))
+      return mlir::failure();
+    CValue signBits = require(decision.signBitsBase);
+    CValue activation = require(decision.activationBase);
+    CValue activationScale = require(decision.activationScale);
+    CValue signScale = require(decision.signScale);
+    CValue init = require(decision.init);
+    if (decision.realization !=
+            SignBitI8Realization::RVVVLEN128WideningSignSum ||
+        signBits.kind != CValueKind::Pointer ||
+        activation.kind != CValueKind::Pointer ||
+        activationScale.kind != CValueKind::Scalar ||
+        signScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
+        signBits.spelling.empty() || activation.spelling.empty() ||
+        activationScale.spelling.empty() || signScale.spelling.empty() ||
+        init.spelling.empty())
+      return op.emitError(
+          "selected sign-bit/i8 dot operands are unavailable");
+
+    std::string vl = fresh("sign_dot_vl");
+    std::string codes = fresh("sign_dot_codes");
+    std::string wide = fresh("sign_dot_wide");
+    std::string mask = fresh("sign_dot_mask");
+    std::string negative = fresh("sign_dot_negative");
+    std::string selected = fresh("sign_dot_selected");
+    std::string seed = fresh("sign_dot_seed");
+    std::string reduced = fresh("sign_dot_reduced");
+    std::string integerSum = fresh("sign_dot_sum");
+    std::string result = fresh("sign_dot");
+    line("const size_t " + vl + " = __riscv_vsetvl_e8m2(32);");
+    line("vint8m2_t " + codes + " = __riscv_vle8_v_i8m2(" +
+         "(const int8_t *)(const void *)" + activation.spelling + ", " + vl +
+         ");");
+    line("vint16m4_t " + wide + " = __riscv_vsext_vf2_i16m4(" + codes +
+         ", " + vl + ");");
+    line("vbool4_t " + mask + " = __riscv_vlm_v_b4(" + signBits.spelling +
+         ", " + vl + ");");
+    line("vint16m4_t " + negative + " = __riscv_vneg_v_i16m4(" + wide +
+         ", " + vl + ");");
+    line("vint16m4_t " + selected + " = __riscv_vmerge_vvm_i16m4(" +
+         negative + ", " + wide + ", " + mask + ", " + vl + ");");
+    line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+    line("vint32m1_t " + reduced +
+         " = __riscv_vwredsum_vs_i16m4_i32m1(" + selected + ", " + seed +
+         ", " + vl + ");");
+    line("const int32_t " + integerSum +
+         " = __riscv_vmv_x_s_i32m1_i32(" + reduced + ");");
+    line("const float " + result + " = " + init.spelling + " + (float)" +
+         integerSum + " * " + activationScale.spelling + " * " +
+         signScale.spelling + ";");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    markDiscardedBlockTree(op.getSignBits());
+    markDiscardedBlockTree(op.getActivation());
+    return mlir::success();
+  }
+
+  mlir::LogicalResult decideE2M1E8M0I8Dot(
+      E2M1E8M0I8DotOp op, E2M1E8M0I8Decision &decision) {
+    if (options.target.vlenBits != 128)
+      return op.emitError(
+          "E2M1/E8M0 i8 dot requires an explicit VLEN128 target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "E2M1/E8M0 i8 dot requires little-endian packed nibbles");
+    if (!op.getPackedCodes().hasOneUse() || !op.getActivation().hasOneUse())
+      return op.emitError(
+          "E2M1/E8M0 i8 dot requires local single-use block operands");
+
+    LoadOp packedLoad = op.getPackedCodes().getDefiningOp<LoadOp>();
+    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
+    LoadOp activationLoad =
+        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
+                       : LoadOp{};
+    if (!packedLoad || !activationCast || !activationLoad ||
+        !isTrue(packedLoad.getWhere()) || !isTrue(activationLoad.getWhere()))
+      return op.emitError(
+          "E2M1/E8M0 i8 dot requires explicit all-active block loads");
+
+    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
+      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
+      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
+        return {};
+      return lane.getBase();
+    };
+    mlir::Value packedBase = blockBase(packedLoad, 16);
+    mlir::Value activationBase = blockBase(activationLoad, 32);
+    if (!packedBase || !activationBase)
+      return op.emitError(
+          "E2M1/E8M0 i8 dot block axes do not match its typed operands");
+
+    decision = E2M1E8M0I8Decision{};
+    decision.packedCodesBase = packedBase;
+    decision.activationBase = activationBase;
+    decision.exponent = op.getExponent();
+    decision.activationScale = op.getActivationScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitE2M1E8M0I8Dot(E2M1E8M0I8DotOp op) {
+    E2M1E8M0I8Decision decision;
+    if (mlir::failed(decideE2M1E8M0I8Dot(op, decision)))
+      return mlir::failure();
+    CValue packed = require(decision.packedCodesBase);
+    CValue activation = require(decision.activationBase);
+    CValue exponent = require(decision.exponent);
+    CValue activationScale = require(decision.activationScale);
+    CValue init = require(decision.init);
+    if (decision.realization != E2M1E8M0I8Realization::RVVVLEN128TableDot ||
+        packed.kind != CValueKind::Pointer ||
+        activation.kind != CValueKind::Pointer ||
+        exponent.kind != CValueKind::Scalar ||
+        activationScale.kind != CValueKind::Scalar ||
+        init.kind != CValueKind::Scalar || packed.spelling.empty() ||
+        activation.spelling.empty() || exponent.spelling.empty() ||
+        activationScale.spelling.empty() || init.spelling.empty())
+      return op.emitError(
+          "selected E2M1/E8M0 i8 dot operands are unavailable");
+
+    std::string vl16 = fresh("e2m1_vl16");
+    std::string vl32 = fresh("e2m1_vl32");
+    std::string table = fresh("e2m1_table");
+    std::string packedVector = fresh("e2m1_packed");
+    std::string low = fresh("e2m1_low");
+    std::string high = fresh("e2m1_high");
+    std::string indices = fresh("e2m1_indices");
+    std::string activationVector = fresh("e2m1_activation");
+    std::string decoded = fresh("e2m1_decoded");
+    std::string products = fresh("e2m1_products");
+    std::string seed = fresh("e2m1_seed");
+    std::string reduced = fresh("e2m1_reduced");
+    std::string integerSum = fresh("e2m1_sum");
+    std::string result = fresh("e2m1_dot");
+    line("const size_t " + vl16 + " = __riscv_vsetvl_e8m1(16);");
+    line("vint8m2_t " + table +
+         " = __riscv_vle8_v_i8m2(__weft_e2m1_doubled, " + vl16 + ");");
+    line("vuint8m1_t " + packedVector + " = __riscv_vle8_v_u8m1(" +
+         packed.spelling + ", " + vl16 + ");");
+    line("vuint8m1_t " + low + " = __riscv_vand_vx_u8m1(" + packedVector +
+         ", UINT8_C(15), " + vl16 + ");");
+    line("vuint8m1_t " + high + " = __riscv_vsrl_vx_u8m1(" + packedVector +
+         ", 4, " + vl16 + ");");
+    line("vuint8m2_t " + indices +
+         " = __riscv_vcreate_v_u8m1_u8m2(" + low + ", " + high + ");");
+    line("const size_t " + vl32 + " = __riscv_vsetvl_e8m2(32);");
+    line("vint8m2_t " + activationVector + " = __riscv_vle8_v_i8m2(" +
+         "(const int8_t *)(const void *)" + activation.spelling + ", " + vl32 +
+         ");");
+    line("vint8m2_t " + decoded + " = __riscv_vrgather_vv_i8m2(" + table +
+         ", " + indices + ", " + vl32 + ");");
+    line("vint16m4_t " + products + " = __riscv_vwmul_vv_i16m4(" +
+         activationVector + ", " + decoded + ", " + vl32 + ");");
+    line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+    line("vint32m1_t " + reduced +
+         " = __riscv_vwredsum_vs_i16m4_i32m1(" + products + ", " + seed +
+         ", " + vl32 + ");");
+    line("const int32_t " + integerSum +
+         " = __riscv_vmv_x_s_i32m1_i32(" + reduced + ");");
+    line("const float " + result + " = " + init.spelling + " + (float)" +
+         integerSum + " * __weft_e8m0_half(" + exponent.spelling + ") * " +
+         activationScale.spelling + ";");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    markDiscardedBlockTree(op.getPackedCodes());
+    markDiscardedBlockTree(op.getActivation());
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
     if (options.target.vlenBits != 128)
       return op.emitError(
@@ -5740,7 +5986,7 @@ private:
 };
 
 void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1,
-                 bool usesGroupedI4I8) {
+                 bool usesGroupedI4I8, bool usesE2M1E8M0I8) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -5773,6 +6019,21 @@ static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits
 }
 
 )c";
+  if (usesE2M1E8M0I8) {
+    output << R"c(static const int8_t __attribute__((unused))
+__weft_e2m1_doubled[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+static inline __attribute__((always_inline, unused)) float
+__weft_e8m0_half(uint8_t exponent) {
+  const uint32_t bits = exponent < UINT8_C(2)
+                            ? (UINT32_C(0x00200000) << exponent)
+                            : ((uint32_t)(exponent - UINT8_C(1)) << 23);
+  return __weft_bitcast_u32_f32(bits);
+}
+
+)c";
+  }
   if (usesGroupedI4I8) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
 __weft_grouped_affine_i4_i8_vl128(
@@ -6268,11 +6529,14 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
   bool usesExp = false;
   bool usesIME1 = false;
   bool usesGroupedI4I8 = false;
+  bool usesE2M1E8M0I8 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
   module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
   module.walk([&](SymmetricI4I8ContractOp) { usesIME1 = true; });
   module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
-  emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8);
+  module.walk([&](E2M1E8M0I8DotOp) { usesE2M1E8M0I8 = true; });
+  emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8,
+              usesE2M1E8M0I8);
 
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())

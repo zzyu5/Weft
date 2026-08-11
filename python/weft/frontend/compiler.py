@@ -1928,6 +1928,40 @@ class FrontendCompiler:
             result_types=(operands[-1].type,),
         )[0]
 
+    def _intrinsic_sign_bit_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "sign_bits",
+            "activation",
+            "activation_scale",
+            "sign_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(self._value_argument(args[name], call) for name in names)
+        return self._emit(
+            "weft_ext.sign_bit_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[-1].type,),
+        )[0]
+
+    def _intrinsic_e2m1_e8m0_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "packed_codes",
+            "exponent",
+            "activation",
+            "activation_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(self._value_argument(args[name], call) for name in names)
+        return self._emit(
+            "weft_ext.e2m1_e8m0_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[-1].type,),
+        )[0]
+
     def _intrinsic_range(self, call: ast.Call) -> Value:
         raise FrontendError("W.range is valid only in a for statement", self._location(call))
 

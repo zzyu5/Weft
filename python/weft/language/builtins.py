@@ -128,3 +128,7 @@ symmetric_i4_i8_contract = _intrinsic(
 grouped_affine_i4_i8_dot = _intrinsic(
     "grouped_affine_i4_i8_dot", "weft_ext.grouped_affine_i4_i8_dot"
 )
+sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot", "weft_ext.sign_bit_i8_dot")
+e2m1_e8m0_i8_dot = _intrinsic(
+    "e2m1_e8m0_i8_dot", "weft_ext.e2m1_e8m0_i8_dot"
+)

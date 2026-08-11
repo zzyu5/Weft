@@ -85,4 +85,49 @@ def WeftExtension_GroupedAffineI4I8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_SignBitI8DotOp
+    : WeftExtension_Op<"sign_bit_i8_dot", [Pure]> {
+  let summary = "Little-endian sign-bit by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element dot.  sign_bits contains four bytes; bit p
+    is `(sign_bits[p / 8] >> (p % 8)) & 1` and contributes +activation[p]
+    when set or -activation[p] when clear.  The integer sum is multiplied by
+    activation_scale and sign_scale, then added to init.
+
+    This operation owns only the observable local bit relation and arithmetic.
+    Persistent block layout, the relation between multiple sub-blocks, outer
+    row/reduction traversal, and all pointer arithmetic remain explicit in
+    Kernel IR.  VLEN, LMUL, widening, and instruction spelling are target
+    decisions.
+  }];
+  let arguments = (ins AnyType:$sign_bits, AnyType:$activation,
+                       AnyType:$activation_scale, AnyType:$sign_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_E2M1E8M0I8DotOp
+    : WeftExtension_Op<"e2m1_e8m0_i8_dot", [Pure]> {
+  let summary = "Packed E2M1/E8M0 by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element dot.  packed_codes contains sixteen bytes;
+    its low nibbles encode elements 0..15 and its high nibbles encode elements
+    16..31 using the E2M1 values
+    [0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6].
+    exponent is an E8M0 code whose scale is 2^(exponent-127), with code zero
+    represented by the f32 bit pattern 0x00400000.  The decoded dot is
+    multiplied by activation_scale and added to init.
+
+    The exponent byte, packed-code bytes, activation block, and scales are
+    explicit operands.  Persistent storage, outer traversal, target lookup
+    organization, and instruction spelling are not part of this operation.
+  }];
+  let arguments = (ins AnyType:$packed_codes, AnyType:$exponent,
+                       AnyType:$activation, AnyType:$activation_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 #endif // WEFT_DIALECT_EXTENSION_IR_EXTENSIONOPS_TD

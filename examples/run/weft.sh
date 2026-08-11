@@ -367,6 +367,22 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/block_dot.py
     quant=1
     ;;
+  q1_0_rows)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 q1_0_rows" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/q1_0.py
+    runtime=examples/repro/weft/quantization/q1_0_runtime.cpp
+    ;;
+  mxfp4_rows)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 mxfp4_rows" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/mxfp4.py
+    runtime=examples/repro/weft/quantization/mxfp4_runtime.cpp
+    ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
       echo "usage: $0 q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
