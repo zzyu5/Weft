@@ -98,10 +98,11 @@ tar -C "${local_root}" -cf - . |
     tar -C \"\${remote_root}\" -xf -
     cd \"\${remote_root}\"
     if [ '${quant}' -eq 1 ]; then
-      g++ -O2 -std=c++17 -Wall -Wextra -Werror -c kernel.cpp -o kernel.o
+      clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
+        -march=rv64gcv -mabi=lp64d -c kernel.cpp -o kernel.o
       clang -O2 -std=c11 -Wall -Wextra -Werror \
         -Dggml_source_${kernel}=${kernel} -c leaf/runtime.c -o runtime.o
-      g++ kernel.o runtime.o -lm -o weft_runtime
+      clang++ -march=rv64gcv -mabi=lp64d kernel.o runtime.o -lm -o weft_runtime
     else
       clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
         -march=rv64gcv -mabi=lp64d \

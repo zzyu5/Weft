@@ -7,6 +7,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -60,6 +61,28 @@ bool isNone(mlir::Type type) { return mlir::isa<mlir::NoneType>(type); }
 bool isF16(mlir::Type type) {
   auto floating = mlir::dyn_cast<mlir::FloatType>(type);
   return floating && floating.getWidth() == 16;
+}
+
+bool isInteger(mlir::Type type, unsigned width, bool isSigned) {
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(type);
+  return integer && integer.getWidth() == width &&
+         (isSigned ? integer.isSigned() : integer.isUnsigned());
+}
+
+bool isRankOneBlock(mlir::Type type, int64_t extent,
+                    llvm::function_ref<bool(mlir::Type)> elementPredicate) {
+  auto block = mlir::dyn_cast<BlockType>(unwrapMasked(type));
+  return block && block.getShape().size() == 1 &&
+         block.getShape().front() == extent &&
+         elementPredicate(block.getElementType());
+}
+
+bool isZeroInteger(mlir::Value value, unsigned width, bool isSigned) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  return isInteger(value.getType(), width, isSigned) && integer &&
+         integer.getValue().isZero();
 }
 
 std::string sanitize(llvm::StringRef input) {
@@ -192,6 +215,8 @@ public:
   mlir::LogicalResult emit() {
     if (mlir::failed(requireSupportedPlan()))
       return mlir::failure();
+    if (mlir::failed(prepareRVVBlockSlices()))
+      return mlir::failure();
 
     mlir::Block &body = kernel.getBody().front();
     llvm::SmallVector<std::string> parameters;
@@ -248,6 +273,8 @@ private:
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, ValueInfo> values;
   llvm::DenseMap<int64_t, mlir::Operation *> records;
+  llvm::DenseSet<mlir::Operation *> rvvBlockDeferred;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> rvvBlockAxes;
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
   unsigned indent = 0;
@@ -310,6 +337,129 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult collectRVVBlockDependencies(
+      mlir::Value value, llvm::DenseSet<mlir::Operation *> &members,
+      llvm::SmallVector<BlockAxisOp> &axes) {
+    if (!mlir::isa<BlockType>(unwrapMasked(value.getType())))
+      return mlir::success();
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return value.getParentBlock()->getParentOp()->emitError(
+          "selected RVV block value has no defining primitive");
+    if (!members.insert(definition).second)
+      return mlir::success();
+    if (auto axis = mlir::dyn_cast<BlockAxisOp>(definition)) {
+      axes.push_back(axis);
+      return mlir::success();
+    }
+    if (!mlir::isa<PtrAddOp, LoadOp, BitcastOp, CastOp, BinaryOp>(definition))
+      return definition->emitError(
+          "selected RVV block slice contains an unsupported primitive");
+    for (mlir::Value operand : definition->getOperands())
+      if (mlir::failed(collectRVVBlockDependencies(operand, members, axes)))
+        return mlir::failure();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult prepareRVVBlockSlices() {
+    bool failed = false;
+    kernel.walk([&](ReduceOp reduce) {
+      if (failed)
+        return;
+      mlir::Operation *record = recordFor(reduce);
+      auto provider = record
+                          ? record->getAttrOfType<mlir::StringAttr>("provider")
+                          : mlir::StringAttr{};
+      auto strategy = record
+                          ? record->getAttrOfType<mlir::StringAttr>("strategy")
+                          : mlir::StringAttr{};
+      if (!provider || provider.getValue() != "rvv" || !strategy ||
+          strategy.getValue() != "rvv_block_tree")
+        return;
+
+      llvm::DenseSet<mlir::Operation *> members;
+      llvm::SmallVector<BlockAxisOp> axes;
+      if (mlir::failed(
+              collectRVVBlockDependencies(reduce.getInput(), members, axes))) {
+        failed = true;
+        return;
+      }
+      llvm::DenseSet<mlir::Operation *> uniqueAxes;
+      for (BlockAxisOp axis : axes)
+        uniqueAxes.insert(axis.getOperation());
+      if (uniqueAxes.size() != 1) {
+        reduce.emitError(
+            "selected RVV block reduction must have exactly one block-axis owner");
+        failed = true;
+        return;
+      }
+      auto axis = mlir::cast<BlockAxisOp>(*uniqueAxes.begin());
+      auto axisRecord = mlir::dyn_cast_or_null<AxisPlanOp>(recordFor(axis));
+      if (!axisRecord || axisRecord.getProvider() != "rvv" ||
+          axisRecord.getRealization() != "rvv" || axisRecord.getSew() != 32 ||
+          axisRecord.getLmul() != "m1") {
+        axis.emitError("selected RVV block owner requires an e32m1 axis plan");
+        failed = true;
+        return;
+      }
+      members.insert(reduce.getOperation());
+      for (mlir::Operation *member : members) {
+        if (member->getBlock() != reduce->getBlock()) {
+          member->emitError("selected RVV block slice cannot cross a region boundary");
+          failed = true;
+          return;
+        }
+        if (auto load = mlir::dyn_cast<LoadOp>(member)) {
+          mlir::Operation *loadRecord = recordFor(load);
+          auto loadProvider = loadRecord ? loadRecord->getAttrOfType<mlir::StringAttr>(
+                                              "provider")
+                                         : mlir::StringAttr{};
+          auto loadStrategy = loadRecord ? loadRecord->getAttrOfType<mlir::StringAttr>(
+                                              "strategy")
+                                         : mlir::StringAttr{};
+          if (!loadProvider || loadProvider.getValue() != "rvv" ||
+              !loadStrategy ||
+              loadStrategy.getValue() != "rvv_block_unit_stride") {
+            load.emitError(
+                "selected RVV block slice requires unit-stride RVV loads");
+            failed = true;
+            return;
+          }
+        }
+        for (mlir::Value result : member->getResults()) {
+          if (!mlir::isa<BlockType>(unwrapMasked(result.getType())))
+            continue;
+          for (mlir::Operation *user : result.getUsers())
+            if (!members.contains(user)) {
+              user->emitError(
+                  "uses a block value outside its selected RVV owner slice");
+              failed = true;
+              return;
+            }
+        }
+        if (rvvBlockDeferred.contains(member)) {
+          member->emitError("belongs to more than one selected RVV block slice");
+          failed = true;
+          return;
+        }
+      }
+      rvvBlockDeferred.insert(members.begin(), members.end());
+      rvvBlockAxes[reduce.getOperation()] = axis.getOperation();
+    });
+    if (failed)
+      return mlir::failure();
+
+    kernel.walk([&](BlockAxisOp axis) {
+      auto record = mlir::dyn_cast_or_null<AxisPlanOp>(recordFor(axis));
+      if (record && record.getProvider() == "rvv" &&
+          !rvvBlockDeferred.contains(axis.getOperation())) {
+        axis.emitError("selected RVV block axis has no closed reduction owner");
+        failed = true;
+      }
+    });
+    return failed ? mlir::failure() : mlir::success();
+  }
+
   std::string literalExpression(mlir::Value value) {
     if (auto constant = value.getDefiningOp<ConstantOp>())
       return constantLiteral(constant.getValue());
@@ -362,6 +512,11 @@ private:
   }
 
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
+    if (rvvBlockDeferred.contains(operation)) {
+      if (auto reduce = mlir::dyn_cast<ReduceOp>(operation))
+        return emitRVVBlockReduce(reduce);
+      return mlir::success();
+    }
     if (auto op = mlir::dyn_cast<ConstantOp>(operation))
       return emitConstant(op);
     if (auto op = mlir::dyn_cast<MetaValueOp>(operation))
@@ -648,6 +803,12 @@ private:
     bool allValid = true;
   };
 
+  struct RVVBlockValue {
+    enum class Kind { Coordinate, Pointer, U8, I8, I32 } kind;
+    mlir::Type type;
+    std::string value;
+  };
+
   mlir::LogicalResult emitRVVVLA(VLAOp op, AxisPlanOp axis) {
     if (axis.getRealization() != "rvv" || axis.getSew() != 32 ||
         axis.getLmul() != "m1")
@@ -905,6 +1066,214 @@ private:
         return mlir::failure();
     ValueInfo merged = lookup(mlir::cast<YieldOp>(merge.getTerminator()).getOperand(0));
     line(aggregate.value + " = " + merged.value + ";");
+    --indent;
+    line("}");
+    values[op.getResult()] = aggregate;
+    return mlir::success();
+  }
+
+  mlir::FailureOr<RVVBlockValue> emitRVVBlockValue(
+      mlir::Value value, BlockAxisOp axis,
+      llvm::DenseMap<mlir::Value, RVVBlockValue> &blockValues,
+      llvm::StringRef vl) {
+    auto found = blockValues.find(value);
+    if (found != blockValues.end())
+      return found->second;
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition) {
+      kernel.emitError("selected RVV block value has no defining primitive");
+      return mlir::failure();
+    }
+    int64_t extent = axis.getResult().getType().getShape().front();
+
+    if (auto pointer = mlir::dyn_cast<PtrAddOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> coordinate = emitRVVBlockValue(
+          pointer.getOffset(), axis, blockValues, vl);
+      ValueInfo base = lookup(pointer.getBase());
+      auto baseType = mlir::dyn_cast<PtrType>(unwrapMasked(
+          pointer.getBase().getType()));
+      auto resultBlock = mlir::dyn_cast<BlockType>(unwrapMasked(
+          pointer.getResult().getType()));
+      auto resultPointer = resultBlock
+                               ? mlir::dyn_cast<PtrType>(
+                                     resultBlock.getElementType())
+                               : PtrType{};
+      if (mlir::failed(coordinate) ||
+          coordinate->kind != RVVBlockValue::Kind::Coordinate ||
+          base.value.empty() || base.isShaped() || !baseType ||
+          !resultPointer ||
+          !isInteger(baseType.getElementType(), 8, false) ||
+          resultPointer.getElementType() != baseType.getElementType() ||
+          resultBlock.getShape().size() != 1 ||
+          resultBlock.getShape().front() != extent) {
+        pointer.emitError(
+            "RVV block pointer requires a scalar u8 base plus its block axis");
+        return mlir::failure();
+      }
+      RVVBlockValue info{RVVBlockValue::Kind::Pointer,
+                         pointer.getResult().getType(),
+                         "(" + base.value + " + " + coordinate->value + ")"};
+      blockValues[pointer.getResult()] = info;
+      return info;
+    }
+
+    if (auto load = mlir::dyn_cast<LoadOp>(definition)) {
+      if (mlir::failed(requireStrategy(load, "rvv_block_unit_stride")))
+        return mlir::failure();
+      mlir::FailureOr<RVVBlockValue> pointer = emitRVVBlockValue(
+          load.getPointer(), axis, blockValues, vl);
+      if (mlir::failed(pointer) ||
+          pointer->kind != RVVBlockValue::Kind::Pointer ||
+          !isRankOneBlock(load.getResult().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 8, false);
+                          }) ||
+          !isTrueScalarPredicate(load.getWhere()) ||
+          !isZeroInteger(load.getOther(), 8, false)) {
+        load.emitError(
+            "RVV block unit-stride load requires all-active filled u8 lanes");
+        return mlir::failure();
+      }
+      std::string name = fresh("rvv_u8");
+      line("vuint8mf4_t " + name + " = __riscv_vle8_v_u8mf4(" +
+           pointer->value + ", " + vl.str() + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::U8, load.getResult().getType(),
+                         name};
+      blockValues[load.getResult()] = info;
+      return info;
+    }
+
+    if (auto bitcast = mlir::dyn_cast<BitcastOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> input = emitRVVBlockValue(
+          bitcast.getInput(), axis, blockValues, vl);
+      if (mlir::failed(input) || input->kind != RVVBlockValue::Kind::U8 ||
+          !isRankOneBlock(bitcast.getInput().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 8, false);
+                          }) ||
+          !isRankOneBlock(bitcast.getResult().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 8, true);
+                          })) {
+        bitcast.emitError("RVV block bitcast requires u8 lanes to i8 lanes");
+        return mlir::failure();
+      }
+      std::string name = fresh("rvv_i8");
+      line("vint8mf4_t " + name +
+           " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input->value + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::I8,
+                         bitcast.getResult().getType(), name};
+      blockValues[bitcast.getResult()] = info;
+      return info;
+    }
+
+    if (auto cast = mlir::dyn_cast<CastOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> input = emitRVVBlockValue(
+          cast.getInput(), axis, blockValues, vl);
+      if (mlir::failed(input) || input->kind != RVVBlockValue::Kind::I8 ||
+          !isRankOneBlock(cast.getInput().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 8, true);
+                          }) ||
+          !isRankOneBlock(cast.getResult().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 32, true);
+                          })) {
+        cast.emitError("RVV block cast requires sign extension from i8 to i32");
+        return mlir::failure();
+      }
+      std::string name = fresh("rvv_i32");
+      line("vint32m1_t " + name + " = __riscv_vsext_vf4_i32m1(" +
+           input->value + ", " + vl.str() + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::I32,
+                         cast.getResult().getType(), name};
+      blockValues[cast.getResult()] = info;
+      return info;
+    }
+
+    if (auto binary = mlir::dyn_cast<BinaryOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> lhs = emitRVVBlockValue(
+          binary.getLhs(), axis, blockValues, vl);
+      mlir::FailureOr<RVVBlockValue> rhs = emitRVVBlockValue(
+          binary.getRhs(), axis, blockValues, vl);
+      if (mlir::failed(lhs) || mlir::failed(rhs) ||
+          lhs->kind != RVVBlockValue::Kind::I32 ||
+          rhs->kind != RVVBlockValue::Kind::I32 || binary.getKind() != "mul" ||
+          !isRankOneBlock(binary.getResult().getType(), extent,
+                          [](mlir::Type type) {
+                            return isInteger(type, 32, true);
+                          })) {
+        binary.emitError("RVV block arithmetic requires an i32 vector multiply");
+        return mlir::failure();
+      }
+      std::string name = fresh("rvv_product");
+      line("vint32m1_t " + name + " = __riscv_vmul_vv_i32m1(" + lhs->value +
+           ", " + rhs->value + ", " + vl.str() + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::I32,
+                         binary.getResult().getType(), name};
+      blockValues[binary.getResult()] = info;
+      return info;
+    }
+
+    definition->emitError(
+        "selected RVV block value has no implemented vector primitive");
+    return mlir::failure();
+  }
+
+  mlir::LogicalResult emitRVVBlockReduce(ReduceOp op) {
+    if (mlir::failed(requireStrategy(op, "rvv_block_tree")))
+      return mlir::failure();
+    auto owner = rvvBlockAxes.find(op.getOperation());
+    if (owner == rvvBlockAxes.end())
+      return op.emitError("selected RVV block reduction has no axis owner");
+    auto axis = mlir::cast<BlockAxisOp>(owner->second);
+    auto input = mlir::dyn_cast<BlockType>(unwrapMasked(op.getInput().getType()));
+    int64_t extent = axis.getResult().getType().getShape().front();
+    if (!input || input.getShape().size() != 1 ||
+        input.getShape().front() != extent ||
+        !isInteger(input.getElementType(), 32, true) || op.getAxis() != 0 ||
+        op.getKind() != "add" || op.getOrder() != "relaxed" ||
+        !isInteger(op.getAccDtype(), 32, true) ||
+        !isInteger(op.getResult().getType(), 32, true) ||
+        !isZeroInteger(op.getIdentity(), 32, true) ||
+        !isTrueScalarPredicate(op.getWhere()))
+      return op.emitError(
+          "RVV block tree provider requires a relaxed rank-one i32 add");
+    ValueInfo extentValue = lookup(axis.getExtent());
+    ValueInfo offsetValue = lookup(axis.getOffset());
+    ValueInfo identity = lookup(op.getIdentity());
+    if (extentValue.value.empty() || offsetValue.value.empty() ||
+        identity.value.empty() || extent <= 0)
+      return op.emitError("RVV block owner operands must be loop-invariant scalars");
+
+    ValueInfo aggregate = makeResult(op.getResult(), {}, fresh("rvv_block_sum"));
+    line(valueCType(aggregate) + " " + aggregate.value + " = " +
+         identity.value + ";");
+    std::string strip = fresh("rvv_block_i");
+    std::string vl = fresh("vl");
+    line("for (std::size_t " + strip + " = 0; " + strip + " < " +
+         extentValue.value + ";) {");
+    ++indent;
+    line("const std::size_t " + vl + " = __riscv_vsetvl_e32m1(" +
+         extentValue.value + " - " + strip + ");");
+    llvm::DenseMap<mlir::Value, RVVBlockValue> blockValues;
+    blockValues[axis.getResult()] =
+        RVVBlockValue{RVVBlockValue::Kind::Coordinate,
+                      axis.getResult().getType(),
+                      "(" + offsetValue.value + " + " + strip + ")"};
+    mlir::FailureOr<RVVBlockValue> vector = emitRVVBlockValue(
+        op.getInput(), axis, blockValues, vl);
+    if (mlir::failed(vector) || vector->kind != RVVBlockValue::Kind::I32)
+      return op.emitError("RVV block reduction input was not materialized as i32");
+    std::string seed = fresh("rvv_seed");
+    std::string partial = fresh("rvv_partial");
+    line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(" +
+         aggregate.value + ", " + vl + ");");
+    line("vint32m1_t " + partial +
+         " = __riscv_vredsum_vs_i32m1_i32m1(" + vector->value + ", " + seed +
+         ", " + vl + ");");
+    line(aggregate.value + " = __riscv_vmv_x_s_i32m1_i32(" + partial + ");");
+    line(strip + " += " + vl + ";");
     --indent;
     line("}");
     values[op.getResult()] = aggregate;

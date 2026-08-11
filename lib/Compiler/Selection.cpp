@@ -11,6 +11,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <limits>
+
 namespace {
 
 using namespace weft;
@@ -177,9 +179,173 @@ bool isRVVF16F32Contract(ContractOp contract,
          result.getElementType().isF32();
 }
 
+struct RVVBlockSelection {
+  llvm::DenseSet<mlir::Operation *> axes;
+  llvm::DenseSet<mlir::Operation *> unitStrideLoads;
+  llvm::DenseSet<mlir::Operation *> reductions;
+};
+
+bool isInteger(mlir::Type type, unsigned width, bool isSigned) {
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(type);
+  return integer && integer.getWidth() == width &&
+         (isSigned ? integer.isSigned() : integer.isUnsigned());
+}
+
+bool isRankOneBlock(mlir::Type type, int64_t extent,
+                    llvm::function_ref<bool(mlir::Type)> elementPredicate) {
+  auto block = mlir::dyn_cast<BlockType>(bareType(type));
+  return block && block.getShape().size() == 1 &&
+         block.getShape().front() == extent &&
+         elementPredicate(block.getElementType());
+}
+
+std::optional<int64_t> constantIndexValue(mlir::Value value) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  if (!value.getType().isIndex() || !integer)
+    return std::nullopt;
+  return integer.getInt();
+}
+
+bool isZeroInteger(mlir::Value value, unsigned width, bool isSigned) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  return isInteger(value.getType(), width, isSigned) && integer &&
+         integer.getValue().isZero();
+}
+
+struct RVVBlockMatch {
+  BlockAxisOp axis;
+  llvm::DenseSet<mlir::Operation *> members;
+  llvm::DenseSet<mlir::Operation *> loads;
+};
+
+bool matchUnitStrideI8Input(mlir::Value value, int64_t extent,
+                            RVVBlockMatch &match) {
+  auto cast = value.getDefiningOp<CastOp>();
+  if (!cast ||
+      !isRankOneBlock(cast.getResult().getType(), extent, [](mlir::Type type) {
+        return isInteger(type, 32, true);
+      }) ||
+      !isRankOneBlock(cast.getInput().getType(), extent, [](mlir::Type type) {
+        return isInteger(type, 8, true);
+      }))
+    return false;
+
+  auto bitcast = cast.getInput().getDefiningOp<BitcastOp>();
+  if (!bitcast ||
+      !isRankOneBlock(bitcast.getInput().getType(), extent, [](mlir::Type type) {
+        return isInteger(type, 8, false);
+      }) ||
+      !isRankOneBlock(bitcast.getResult().getType(), extent, [](mlir::Type type) {
+        return isInteger(type, 8, true);
+      }))
+    return false;
+
+  auto load = bitcast.getInput().getDefiningOp<LoadOp>();
+  if (!load ||
+      !isRankOneBlock(load.getResult().getType(), extent, [](mlir::Type type) {
+        return isInteger(type, 8, false);
+      }) ||
+      !isTrueScalarPredicate(load.getWhere()) ||
+      !isZeroInteger(load.getOther(), 8, false))
+    return false;
+
+  auto pointer = load.getPointer().getDefiningOp<PtrAddOp>();
+  auto pointerBlock = pointer
+                          ? mlir::dyn_cast<BlockType>(bareType(
+                                pointer.getResult().getType()))
+                          : BlockType{};
+  auto pointerElement = pointerBlock
+                            ? mlir::dyn_cast<PtrType>(
+                                  pointerBlock.getElementType())
+                            : PtrType{};
+  auto basePointer = pointer
+                         ? mlir::dyn_cast<PtrType>(
+                               bareType(pointer.getBase().getType()))
+                         : PtrType{};
+  auto axis = pointer ? pointer.getOffset().getDefiningOp<BlockAxisOp>()
+                      : BlockAxisOp{};
+  if (!pointer || !pointerBlock || pointerBlock.getShape().size() != 1 ||
+      pointerBlock.getShape().front() != extent || !pointerElement ||
+      !basePointer || pointerElement.getElementType() !=
+                          basePointer.getElementType() ||
+      !isInteger(pointerElement.getElementType(), 8, false) || !axis)
+    return false;
+  if (match.axis && match.axis != axis)
+    return false;
+  match.axis = axis;
+  match.members.insert(axis.getOperation());
+  match.members.insert(pointer.getOperation());
+  match.members.insert(load.getOperation());
+  match.members.insert(bitcast.getOperation());
+  match.members.insert(cast.getOperation());
+  match.loads.insert(load.getOperation());
+  return true;
+}
+
+bool matchI8DotReduction(ReduceOp reduce, RVVBlockMatch &match) {
+  if (reduce.getAxis() != 0 || reduce.getKind() != "add" ||
+      reduce.getOrder() != "relaxed" ||
+      !isInteger(reduce.getAccDtype(), 32, true) ||
+      !isInteger(reduce.getResult().getType(), 32, true) ||
+      !isZeroInteger(reduce.getIdentity(), 32, true) ||
+      !isTrueScalarPredicate(reduce.getWhere()))
+    return false;
+  auto input = mlir::dyn_cast<BlockType>(bareType(reduce.getInput().getType()));
+  if (!input || input.getShape().size() != 1 ||
+      input.getShape().front() <= 0 ||
+      !isInteger(input.getElementType(), 32, true))
+    return false;
+  int64_t extent = input.getShape().front();
+  auto product = reduce.getInput().getDefiningOp<BinaryOp>();
+  if (!product || product.getKind() != "mul" ||
+      !matchUnitStrideI8Input(product.getLhs(), extent, match) ||
+      !matchUnitStrideI8Input(product.getRhs(), extent, match) || !match.axis)
+    return false;
+  auto axisExtent = constantIndexValue(match.axis.getExtent());
+  if (!axisExtent || *axisExtent != extent ||
+      extent > std::numeric_limits<int32_t>::max() / (128 * 128))
+    return false;
+
+  match.members.insert(product.getOperation());
+  match.members.insert(reduce.getOperation());
+  for (mlir::Operation *member : match.members) {
+    if (member->getBlock() != reduce->getBlock())
+      return false;
+    for (mlir::Value result : member->getResults()) {
+      if (!mlir::isa<BlockType>(bareType(result.getType())))
+        continue;
+      for (mlir::Operation *user : result.getUsers())
+        if (!match.members.contains(user))
+          return false;
+    }
+  }
+  return true;
+}
+
+RVVBlockSelection findRVVBlocks(KernelOp kernel,
+                                const RISCVTargetProfile &target) {
+  RVVBlockSelection selected;
+  if (!target.hasRVV)
+    return selected;
+  kernel.walk([&](ReduceOp reduce) {
+    RVVBlockMatch match;
+    if (!matchI8DotReduction(reduce, match))
+      return;
+    selected.axes.insert(match.axis.getOperation());
+    selected.unitStrideLoads.insert(match.loads.begin(), match.loads.end());
+    selected.reductions.insert(reduce.getOperation());
+  });
+  return selected;
+}
+
 llvm::SmallVector<Candidate>
 buildCandidates(mlir::Operation *canonical,
                 const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                const RVVBlockSelection &rvvBlocks,
                 const RISCVTargetProfile &target) {
   llvm::SmallVector<Candidate> candidates;
   llvm::StringRef name = selectedRecordName(canonical);
@@ -204,13 +370,21 @@ buildCandidates(mlir::Operation *canonical,
   if (auto vla = mlir::dyn_cast<VLAOp>(canonical);
       vla && rvvVLAs.contains(vla.getOperation()))
     candidates.push_back({"rvv", "rvv", {}, 32, "m1", 1});
+  if (mlir::isa<BlockAxisOp>(canonical) && rvvBlocks.axes.contains(canonical))
+    candidates.push_back({"rvv", "rvv", {}, 32, "m1", 1});
   if (mlir::isa<LoadOp, StoreOp>(canonical) &&
       belongsToRVVVLA(canonical, rvvVLAs))
     candidates.push_back({"rvv", {}, "rvv_unit_stride"});
+  if (mlir::isa<LoadOp>(canonical) &&
+      rvvBlocks.unitStrideLoads.contains(canonical))
+    candidates.push_back({"rvv", {}, "rvv_block_unit_stride"});
   if (auto reduce = mlir::dyn_cast<ReduceOp>(canonical);
       reduce && belongsToRVVVLA(canonical, rvvVLAs) &&
       reduce.getOrder() == "relaxed")
     candidates.push_back({"rvv", {}, "rvv_tree"});
+  if (mlir::isa<ReduceOp>(canonical) &&
+      rvvBlocks.reductions.contains(canonical))
+    candidates.push_back({"rvv", {}, "rvv_block_tree"});
   if (auto contract = mlir::dyn_cast<ContractOp>(canonical);
       contract && isRVVF16F32Contract(contract, target))
     candidates.push_back({"rvv", {}, "rvv_f16_f32_contract"});
@@ -220,9 +394,10 @@ buildCandidates(mlir::Operation *canonical,
 mlir::FailureOr<Candidate>
 chooseCandidate(mlir::Operation *canonical,
                 const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                const RVVBlockSelection &rvvBlocks,
                 const RISCVTargetProfile &target) {
   llvm::SmallVector<Candidate> candidates =
-      buildCandidates(canonical, rvvVLAs, target);
+      buildCandidates(canonical, rvvVLAs, rvvBlocks, target);
   if (candidates.empty()) {
     canonical->emitError("has no legal realization provider for the selected target");
     return mlir::failure();
@@ -280,6 +455,7 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
                                       int64_t anchor,
                                       const SelectionOptions &options,
                                       const llvm::DenseSet<mlir::Operation *> &rvvVLAs,
+                                      const RVVBlockSelection &rvvBlocks,
                                       llvm::StringSet<> &consumedMeta) {
   llvm::StringRef name = selectedRecordName(canonical);
   if (name.empty())
@@ -307,7 +483,7 @@ mlir::Operation *createSelectedRecord(mlir::OpBuilder &builder,
                          builder.getI64IntegerAttr(binding->second)));
   } else {
     mlir::FailureOr<Candidate> selected =
-        chooseCandidate(canonical, rvvVLAs, options.target);
+        chooseCandidate(canonical, rvvVLAs, rvvBlocks, options.target);
     if (mlir::failed(selected))
       return nullptr;
     attrs.push_back(attr(builder, "provider", builder.getStringAttr(selected->provider)));
@@ -380,11 +556,12 @@ mlir::FailureOr<PlanOp> createPlan(mlir::ModuleOp module, KernelOp kernel,
   llvm::StringSet<> consumedMeta;
   llvm::DenseSet<mlir::Operation *> rvvVLAs =
       findRVVVLAs(kernel, options.target);
+  RVVBlockSelection rvvBlocks = findRVVBlocks(kernel, options.target);
   for (auto [anchor, operation] : llvm::enumerate(planned)) {
     operation->setAttr(kCanonicalAnchorAttr,
                        builder.getI64IntegerAttr(anchor));
     if (!createSelectedRecord(builder, operation, anchor, options, rvvVLAs,
-                              consumedMeta)) {
+                              rvvBlocks, consumedMeta)) {
       plan.erase();
       return mlir::failure();
     }
