@@ -22,7 +22,7 @@ with W.vla(begin, end) as i:
 remaining = end - begin
 base = begin
 while remaining > 0:
-    vl = choose_vl(remaining, SEW, LMUL, selected policy)
+    vl = choose_vl(remaining, SEW, LMUL, backend config)
     execute logical indices [base, base + vl)
     base += vl
     remaining -= vl
@@ -76,7 +76,7 @@ VLA region 内可以构造额外的 specialization-time block axis，形成：
 [VLA, D0, D1, ...]
 ```
 
-但物理硬件仍只有一个 RVV lane domain。静态 block axes 必须由 provider 映射到 serial loop、register repeat、register microtile 或 extension fragment，不能被伪装成第二个 VLA lane axis。
+但物理硬件仍只有一个 RVV lane domain。静态 block axes 必须由 target lowering 映射到 serial loop、register repeat、register microtile 或 extension fragment，不能被伪装成第二个 VLA lane axis。
 
 ---
 
@@ -130,7 +130,7 @@ Masked value 只能：
 | scan | 默认作为 identity；segment boundary 必须使用独立 `segment_start` |
 | ordinary sequential carry | 作者必须显式分支或 fill，compiler 不猜 |
 
-对于量化/编码 operand，contract 的“语义零”不一定是物理 bit pattern `0`。实现该 primitive 的 provider 必须根据 primitive 语义处理。
+对于量化/编码 operand，contract 的“语义零”不一定是物理 bit pattern `0`。Target lowering 必须根据 primitive 语义处理。
 
 ### 9.5 Predicate 到 AVL 的吸收
 
@@ -156,7 +156,7 @@ Source 显式表达 pointer/index arithmetic：
 ptr = base + row * stride_row + col * stride_col
 ```
 
-Compiler / provider 决定：
+Target lowering 决定：
 
 - scalar、unit-stride、strided、indexed 或 segment memory；
 - vector grouping；
@@ -186,7 +186,7 @@ Compiler 可以重新计算纯 pointer/index/value producer，也可以在合法
 
 ### 10.4 Local fusion
 
-Provider 可以吸收 structured primitive 附近的纯 producer / consumer，例如 cast、decode、scale 或 packing，前提是：
+Target lowering 可以吸收 structured primitive 附近的纯 producer / consumer，例如 cast、decode、scale 或 packing，前提是：
 
 - 所有被吸收 value 的 use 都在该局部 envelope 内，或仍能正确 materialize；
 - 不创建新的外层 loop；
@@ -207,7 +207,7 @@ m = W.block_axis(BM)
 k = W.block_axis(BK)
 ```
 
-`W.block_axis(D, offset=0)` 产生 shape `[D]` 的 logical index block。`D` 必须在 specialization 时可知，或具有 provider 可接受的静态上界。
+`W.block_axis(D, offset=0)` 产生 shape `[D]` 的 logical index block。`D` 必须在 specialization 时可知，或具有 target lowering 可接受的静态上界。
 
 ### 11.2 Broadcasting
 
@@ -234,7 +234,7 @@ W.reshape(value, shape)
 W.transpose(value, permutation)
 ```
 
-这些构造只定义 logical value。是否 materialize、如何分寄存器、是否重新生成，由 selected realization 决定。
+这些构造只定义 logical value。是否 materialize、如何分寄存器、是否重新生成，由 target lowering 决定。
 
 ### 11.4 Block load/store
 

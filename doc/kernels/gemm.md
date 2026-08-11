@@ -62,5 +62,5 @@ def gemm_worker(
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
 - block values 与 contraction axes 归 canonical semantics；
-- `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 provider/compiler/tuner；
+- `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
 - 外部 runtime 决定每个 worker 的 `[m_begin,m_end)`。

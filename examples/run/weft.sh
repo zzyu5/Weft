@@ -35,6 +35,14 @@ case "${kernel}" in
     dsl=examples/kernels/elementwise/add_bias.py
     runtime=examples/repro/weft/elementwise/add_bias_runtime.cpp
     ;;
+  silu)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 silu" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/pointwise/silu.py
+    runtime=examples/repro/weft/pointwise/silu_runtime.cpp
+    ;;
   rms_norm)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 rms_norm" >&2
@@ -96,8 +104,8 @@ fi
 if [[ ${quant} -eq 1 ]]; then
   PYTHONPATH="${project_root}/python" python3 -m weft \
     "${project_root}/${dsl}" --kernel "${kernel}" |
-    "${compiler}" --emit=source --march=rv64gcv --abi=lp64d \
-      -o "${local_root}/kernel.cpp"
+    "${compiler}" --emit=intrinsic-c --march=rv64gcv --abi=lp64d \
+      -o "${local_root}/kernel.c"
   mkdir -p "${local_root}/leaf" "${local_root}/common"
   cp "${project_root}/examples/repro/weft/quantization/block_dot/${kernel}/runtime.c" \
     "${local_root}/leaf/runtime.c"
@@ -106,12 +114,12 @@ if [[ ${quant} -eq 1 ]]; then
 else
   if [[ ${kernel} == blocked_gemm ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
-      "${compiler}" --emit=source --march=rv64gcv --abi=lp64d \
-        --meta=BM=16 --meta=BN=16 --meta=BK=16 -o "${local_root}/kernel.cpp"
+      "${compiler}" --emit=intrinsic-c --march=rv64gcv --abi=lp64d \
+        --meta=BM=16 --meta=BN=16 --meta=BK=16 -o "${local_root}/kernel.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
-      "${compiler}" --emit=source --march=rv64gcv --abi=lp64d \
-        -o "${local_root}/kernel.cpp"
+      "${compiler}" --emit=intrinsic-c --march=rv64gcv --abi=lp64d \
+        -o "${local_root}/kernel.c"
   fi
   cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 fi
@@ -134,25 +142,35 @@ tar -C "${local_root}" -cf - . |
     trap cleanup EXIT
     tar -C \"\${remote_root}\" -xf -
     cd \"\${remote_root}\"
+    cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
+    cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
     if [ '${quant}' -eq 1 ]; then
-      clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
-        -march=rv64gcv -mabi=lp64d -c kernel.cpp -o kernel.o
-      clang -O2 -std=c11 -Wall -Wextra -Werror \
+      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \
+        -march=rv64gcv -mabi=lp64d -c kernel.c -o kernel.o
+      ar rcs libweft_kernel.a kernel.o
+      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \
         -march=rv64gcv -mabi=lp64d \
         -c leaf/runtime.c -o runtime.o
       if [ '${kernel}' = q4_K_q8_K ]; then
         ggml_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv/bin
-        clang++ -march=rv64gcv -mabi=lp64d kernel.o runtime.o \
+        \"\${cxx}\" -march=rv64gcv -mabi=lp64d runtime.o libweft_kernel.a \
+          -L/opt/tcrv-toolchains/gcc-15.2.0/lib \
           -L\"\${ggml_build}\" -Wl,-rpath,\"\${ggml_build}\" \
           -Wl,--no-as-needed -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
           -o weft_runtime
       else
-        clang++ -march=rv64gcv -mabi=lp64d kernel.o runtime.o -lm -o weft_runtime
+        \"\${cxx}\" -march=rv64gcv -mabi=lp64d runtime.o libweft_kernel.a \
+          -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm -o weft_runtime
       fi
     else
-      clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
-        -march=rv64gcv -mabi=lp64d \
-        kernel.cpp runtime.cpp -lm -o weft_runtime
+      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \
+        -march=rv64gcv -mabi=lp64d -c kernel.c -o kernel.o
+      ar rcs libweft_kernel.a kernel.o
+      \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
+        -march=rv64gcv -mabi=lp64d -c runtime.cpp -o runtime.o
+      \"\${cxx}\" -march=rv64gcv -mabi=lp64d runtime.o libweft_kernel.a \
+        -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm \
+        -o weft_runtime
     fi
     exec taskset -c 8 ${runtime_command}
   "

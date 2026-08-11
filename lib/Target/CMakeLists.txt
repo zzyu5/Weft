@@ -1,10 +1,10 @@
 add_library(WeftRISCVTarget STATIC
   RISCVTargetProfile.cpp
-  SourceEmitter.cpp
+  RISCVLowering.cpp
 )
 
 target_link_libraries(WeftRISCVTarget PUBLIC
-  WeftExecutionDialect
+  WeftExtensionDialect
   WeftKernelDialect
   MLIRIR
 )

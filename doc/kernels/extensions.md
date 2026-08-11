@@ -16,6 +16,6 @@ acc = W.block_scaled_contract(
 )
 ```
 
-不同硬件仍可以为该同一 semantic primitive 提供多个 provider。
+不同硬件仍可以在 target lowering 内为同一 semantic primitive 提供多个 realization family。
 
 ---

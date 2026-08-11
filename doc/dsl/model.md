@@ -10,7 +10,7 @@ Weft 是一门面向**单个 RISC-V worker / hart** 的高性能 kernel DSL 与 
 
 Weft 的扩展原则是：
 
-> **已有语义增加局部 realization provider；新增可观察语义增加一个局部 primitive；永不为某个完整算子、模型格式或 kernel 名增加整段后端模板。**
+> **已有语义扩展局部 target realization；新增可观察语义增加一个局部 primitive；永不为某个完整算子、模型格式或 kernel 名增加整段后端模板。**
 
 Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它与 Triton 的关键区别是：
 
@@ -19,7 +19,7 @@ Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它
 - VLA region 的 strip 边界与 `vl` 在 source 中不可观察；
 - 跨 strip 的 reduce、scan、summary state 是一等语义；
 - logical block 只作为局部数据域和 structured primitive 的 operand，不是整个程序的根执行单元；
-- RISC-V 的 V、矩阵、量化、重排及 vendor extension 通过 primitive-local provider 组合接入。
+- RISC-V 的 V、矩阵、量化、重排及 vendor extension 在一次 primitive-local target lowering 中组合接入。
 
 ---
 
@@ -42,11 +42,11 @@ Weft 必须同时满足：
 
 1. **worker-local kernel 可写性**：作者能直接表达循环、blocking、staging、pointer/index、mask、state 与 structured compute；
 2. **VLA 原生性**：source 不观察固定 VLEN、exact `vl` 或 hardware lane count；
-3. **高性能物理自由度**：编译器与 provider 能决定 LMUL、register tile、unroll、packing、fragment 与 instruction family；
+3. **高性能物理自由度**：target lowering 能决定 LMUL、register tile、unroll、packing、fragment 与 instruction family；
 4. **RISC-V 扩展局部接入**：新增扩展不要求新增完整 GEMM、Softmax、RMSNorm、量化算子模板；
 5. **AOT 可嵌入性**：产物是普通 object / static library / header，运行期不依赖 Python、LLVM 或 JIT；
 6. **外部 runtime 兼容性**：llama.cpp、ggml、框架线程池或应用自己的调度器可直接调用生成的 worker-local entry；
-7. **算法与 realization 分离**：source 固定 worker-local 算法，selected execution 只保存物理选择。
+7. **算法与 realization 分离**：source 与 Kernel IR 固定 worker-local 算法，物理选择只存在于一次 target lowering 调用中。
 
 ### 2.2 非目标
 
@@ -209,12 +209,12 @@ Weft 必须区分以下四层，不得混用同一个 `tile` 概念：
 
 例如 `mr × nr` accumulator、register repeat、LMUL 组合及 K-unroll。
 
-它属于 primitive realization provider 的物理调优空间，由 compiler 建立 legality，构建期 tuner 选择。
+它属于 target lowering 的物理配置空间，由 lowering 检查 legality，构建期 tuning 循环选择。
 
 ### 5.4 ISA fragment
 
 例如某个矩阵扩展规定的 `4×4×8`、accumulator register class 或 encoded operand tile。
 
-它是具体扩展的硬件叶子，只存在于 selected execution / provider lowering，不进入通用 source block 类型。
+它是具体扩展的硬件叶子，只存在于 target lowering 的瞬态状态与生成代码中，不进入通用 source block 类型。
 
 ---

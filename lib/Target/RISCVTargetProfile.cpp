@@ -5,11 +5,11 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                                    RISCVTargetProfile &profile,
                                    std::string &error) {
   if (march.empty()) {
-    error = "--march is required for selected execution";
+    error = "--march is required for RISC-V target lowering";
     return false;
   }
   if (abi.empty()) {
-    error = "--abi is required for selected execution";
+    error = "--abi is required for RISC-V target lowering";
     return false;
   }
   if (march.starts_with("rv64")) {

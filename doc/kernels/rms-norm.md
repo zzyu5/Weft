@@ -6,7 +6,6 @@
 @weft.kernel
 def rms_norm_worker(
     x: W.ptr[W.f32],
-    weight: W.ptr[W.f32],
     y: W.ptr[W.f32],
     row_begin: W.index,
     row_end: W.index,
@@ -29,8 +28,7 @@ def rms_norm_worker(
 
         with W.vla(0, cols) as i:
             value = W.load(x + row * stride + i)
-            w = W.load(weight + i)
-            W.store(y + row * stride + i, value * scale * w)
+            W.store(y + row * stride + i, value * scale)
 ```
 
 作者定义两遍算法与 row loop；compiler 决定每遍的 strip、LMUL、reduction tree 与 memory realization。

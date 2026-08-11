@@ -5,7 +5,6 @@ import weft.language as W
 @weft.kernel
 def rms_norm_worker(
     x: W.ptr[W.f32, W.readonly, W.noalias],
-    weight: W.ptr[W.f32, W.readonly],
     y: W.ptr[W.f32, W.writeonly, W.noalias],
     row_begin: W.index,
     row_end: W.index,
@@ -28,5 +27,4 @@ def rms_norm_worker(
 
         with W.vla(0, cols) as i:
             value = W.load(x + row * stride + i)
-            w = W.load(weight + i)
-            W.store(y + row * stride + i, value * scale * w)
+            W.store(y + row * stride + i, value * scale)

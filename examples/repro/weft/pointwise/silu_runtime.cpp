@@ -6,18 +6,15 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void rms_norm_worker(const float *x, float *y,
-                                std::size_t row_begin,
-                                std::size_t row_end, std::size_t cols,
-                                std::size_t stride, float eps);
+extern "C" void silu_f32(const float *x, float *y, std::size_t begin,
+                         std::size_t end);
 
 namespace {
 
 constexpr std::size_t kRows = 128;
-constexpr std::size_t kColumns = 4096;
+constexpr std::size_t kColumns = 14336;
 constexpr std::size_t kElements = kRows * kColumns;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
-constexpr float kEpsilon = 1.0e-5F;
 volatile std::uint64_t evictionSink = 0;
 
 void evict(std::vector<std::uint8_t> &buffer) {
@@ -42,32 +39,21 @@ int main() {
   std::vector<float> output(kElements);
   for (std::size_t index = 0; index < input.size(); ++index)
     input[index] = static_cast<float>(static_cast<int>(index % 4093) - 2046) /
-                   1024.0F;
+                   128.0F;
 
-  rms_norm_worker(input.data(), output.data(), 0, kRows, kColumns, kColumns,
-                  kEpsilon);
+  silu_f32(input.data(), output.data(), 0, input.size());
   double maxAbsoluteError = 0.0;
   double maxRelativeError = 0.0;
-  for (std::size_t row = 0; row < kRows; ++row) {
-    double sumSquares = 0.0;
-    for (std::size_t column = 0; column < kColumns; ++column) {
-      const double value = input[row * kColumns + column];
-      sumSquares += value * value;
-    }
-    const double scale =
-        1.0 / std::sqrt(sumSquares / static_cast<double>(kColumns) + kEpsilon);
-    for (std::size_t column = 0; column < kColumns; ++column) {
-      const std::size_t index = row * kColumns + column;
-      const double reference = static_cast<double>(input[index]) * scale;
-      const double error =
-          std::abs(static_cast<double>(output[index]) - reference);
-      maxAbsoluteError = std::max(maxAbsoluteError, error);
-      maxRelativeError = std::max(
-          maxRelativeError, error / std::max(std::abs(reference), 1.0e-12));
-    }
+  for (std::size_t index = 0; index < input.size(); ++index) {
+    const double source = input[index];
+    const double reference = source / (1.0 + std::exp(-source));
+    const double error = std::abs(static_cast<double>(output[index]) - reference);
+    maxAbsoluteError = std::max(maxAbsoluteError, error);
+    maxRelativeError =
+        std::max(maxRelativeError, error / std::max(std::abs(reference), 1.0e-12));
   }
   if (maxAbsoluteError > 2.0e-5 && maxRelativeError > 2.0e-5) {
-    std::fprintf(stderr, "RMSNorm mismatch: max_abs=%g max_rel=%g\n",
+    std::fprintf(stderr, "SiLU mismatch: max_abs=%g max_rel=%g\n",
                  maxAbsoluteError, maxRelativeError);
     return 1;
   }
@@ -78,16 +64,15 @@ int main() {
   for (int repetition = 0; repetition < 10; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    rms_norm_worker(input.data(), output.data(), 0, kRows, kColumns, kColumns,
-                    kEpsilon);
+    silu_f32(input.data(), output.data(), 0, input.size());
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
   }
 
   const double milliseconds = median(samples);
-  std::printf("kernel=rms_norm_f32\n");
-  std::printf("model_shape=hidden[128,4096]\n");
+  std::printf("kernel=silu_f32\n");
+  std::printf("model_shape=ffn[128,14336]\n");
   std::printf("elements=%zu\n", kElements);
   std::printf("max_absolute_error=%.9g\n", maxAbsoluteError);
   std::printf("max_relative_error=%.9g\n", maxRelativeError);

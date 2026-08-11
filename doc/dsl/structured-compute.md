@@ -40,7 +40,7 @@ for k in W.range(...):
 
 是普通顺序 carry，不会被自动提升为 `W.contract`，也不会获得 register microtile / matrix extension 的完整调优自由度。
 
-作者必须显式使用 `W.contract` 才把局部 contraction decomposition 权交给 compiler/provider。
+作者必须显式使用 `W.contract` 才把局部 contraction decomposition 权交给 target lowering。
 
 ### 12.3 三层辖域
 
@@ -57,9 +57,9 @@ for k in W.range(...):
 
 - 当前 blocks 的 contraction axes 与 output relation；
 - 局部 accumulator 语义；
-- 允许 provider 重组的局部计算域。
+- 允许 target lowering 重组的局部计算域。
 
-Compiler/provider 拥有：
+Target lowering 拥有：
 
 - register microtile `mr × nr`；
 - LMUL、register repeat；
@@ -72,7 +72,7 @@ Compiler/provider 拥有：
 
 ### 12.4 Packing 边界
 
-Provider 只能自动决定 contract-local、短生命周期且不会越过 primitive 边界的 packing/scratch。
+Target lowering 只能自动决定 contract-local、短生命周期且不会越过 primitive 边界的 packing/scratch。
 
 以下行为必须进入 source 或独立显式 primitive：
 
@@ -118,9 +118,9 @@ W.contract(
 
 `W.dot` 可以作为 rank-1/rank-2 convenience，但 canonical IR 必须统一为 contraction。
 
-### 12.7 Provider 不得做的事
+### 12.7 Target lowering 不得做的事
 
-Contract provider 禁止：
+Contract lowering 禁止：
 
 - 创建 source 中不存在的 outer K loop；
 - 修改 cache block 位置；

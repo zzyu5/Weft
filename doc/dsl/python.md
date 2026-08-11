@@ -9,7 +9,8 @@ Weft Python DSL 是规范化参考 source frontend：
 ```text
 Python Weft source
     → canonical Weft Kernel IR
-    → selected RISC-V execution
+    → RISC-V target lowering
+    → intrinsic C / necessary inline asm
     → object / static library / header
 ```
 

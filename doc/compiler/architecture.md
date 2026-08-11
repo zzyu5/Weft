@@ -1,6 +1,6 @@
 # 编译器总架构
 
-## 27. 最终架构总图
+## 唯一 production 主链
 
 ```text
 Python Weft DSL / other frontend
@@ -16,39 +16,36 @@ Canonical worker-local Weft Kernel IR
   └─ source meta-parameters
                 │
                 ▼
-RISC-V target profile
-  architectural facts + optional microarchitecture hints
+RISC-V target lowering
+  Kernel IR + target facts + explicit backend config
+  ├─ local capability and legality
+  ├─ LMUL / unroll / register microtile
+  ├─ packing / fragment / local fusion
+  └─ RVV / IME / vendor-extension spelling
                 │
                 ▼
-Primitive-local realization providers
-  capability + parameter family + legality + resource + lowering
+intrinsic C / necessary inline asm
                 │
                 ▼
-Compiler-derived legal execution space
-                │
-        build-time AOT tuner
+system C compiler
                 │
                 ▼
-Selected Execution IR
-  vl mechanics / LMUL / memory plan / microtile / fragment / strategy
-                │
-                ▼
-Mechanical scalar + RVV + extension lowering
-                │
-                ▼
-object / static library / C header / optional AOT dispatcher
+relocatable object / static library / C header
                 │
                 ▼
 llama.cpp / ggml / framework / application runtime
   owns threads, work partition and multi-core scheduling
 ```
 
-### 27.1 单 kernel 编译边界
+Kernel IR 是唯一长期编译器表示。Capability query、legality、resource equation、候选枚举、
+物理配置选择和 target-local owner data 可以存在于一次 lowering 调用中，但不形成独立
+pipeline stage、持久 IR、可单独输入的 front door 或第二份 authority。
+
+## 单 kernel 编译边界
 
 Weft 的一次编译输入是一份完整的 worker-local kernel，不是计算图、算子节点集合或等待
 识别的通用 SSA graph。作者或外部 frontend 已经决定 outer control、blocking、staging、
-state、memory effect 和 structured primitive；Weft 只为这些 canonical 结构选择并生成
-RISC-V realization。
+state、memory effect 和 structured primitive；Weft 只为这些结构生成 RISC-V realization。
 
 因此 Weft core 不执行：
 
@@ -60,16 +57,24 @@ RISC-V realization。
 IntentDSL 或其他上游若使用 Weft，必须在仓库外生成一份完整 canonical Weft Kernel IR。
 Weft 不回读上游 graph，也不从 target lowering 反向补算法骨架。
 
-### 27.2 逐局部结构构造 realization
+## Target lowering 的决策单位
 
-Compiler 面对的是 kernel 内多个可组合的 canonical anchor：scalar control、VLA、memory、
-reduce、scan、summary、contract、decode、lookup 和 extension primitive。合法执行空间从这些
-局部结构及其 logical axes 分别构造，再联合检查资源与依赖；不存在先把整个 kernel 分类，
-再进入互斥 lowering 分支的阶段。具体决策单位与表示边界见
-[Selected Execution IR](selected-ir.md)。
+Target lowering 面对 kernel 内可组合的 canonical anchor：scalar control、VLA、memory、
+reduce、scan、summary、contract、decode、lookup 和 extension primitive。一个物理实现的输入
+只能是：
 
----
+```text
+canonical primitive
++ typed operands and effects
++ logical axes / local use relation
++ target facts
++ explicit backend config
+```
 
-## 28. 定位一句话
+局部 lowering 可以吸收相邻的纯 decode、cast、scale、packing producer 或 consumer，但不得
+用完整 kernel shape 或 symbol 选择模板。无法合法生成时直接报 unsupported；不存在 legacy、
+scalar、GGML 或旧 emitter fallback。
 
-> **Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者用普通控制流、一等 VLA iteration region、logical block、显式 predicate/state algebra 与 structured compute primitive 编写完整 worker-local 算法；compiler 从 target facts 与 primitive provider 中构造合法的动态 `vl`、LMUL、register microtile、memory 与扩展 realization，构建期 tuner 选择性能点，多核调度由外部 runtime 负责。**
+## 定位一句话
+
+> **Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者用普通控制流、一等 VLA iteration region、logical block、显式 predicate/state algebra 与 structured compute primitive 编写完整 worker-local 算法；一次 target lowering 直接从唯一 Kernel IR 与 target/config facts 生成动态 `vl`、LMUL、register microtile、memory、RVV 与扩展实现，再交给系统 C compiler 形成普通 object。**

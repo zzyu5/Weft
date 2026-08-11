@@ -10,10 +10,10 @@
 - [`doc/index.md`](doc/index.md) 及其链接的模块是唯一规范；源码是当前实现事实。
 - Weft kernel 是 worker/hart-local 程序。core 中禁止 grid、task identity、隐式 hart identity
   和 GPU SIMT 根模型。
-- 持久表示只有 canonical Kernel IR、Selected Execution IR 和最终 artifacts。分析结果、
-  provider-local IR 与 emitter helper 都是瞬态实现。
-- Provider 只实现 primitive + typed operands + target facts，禁止按 kernel、算子或量化格式
-  接管 whole-kernel lowering。
+- 持久表示只有 canonical Kernel IR 和最终 artifacts。LMUL、microtile、packing、fragment、
+  capability、legality 与候选选择都是单次 target lowering 内的瞬态实现。
+- Target lowering 只根据 primitive、typed operands、局部 use relation、显式 backend config
+  与 target facts 生成代码，禁止按 kernel、算子或量化格式接管 whole-kernel lowering。
 - IntentDSL/其他前端在仓库外生成 canonical Weft IR；Weft 不解析或链接 IntentDSL。
   `/home/kingdom/phdworks/intentdsl` 默认只读。
 - `materials/` 只作代码与硬件知识供体，不进入 CMake、include、import、link 或 runtime；

@@ -19,15 +19,13 @@ Canonical verifier 必须检查：
 - extension primitive dialect 是否注册；
 - effect 与 atomic/fence 基本规则。
 
-Selected verifier 必须检查：
+Target lowering 必须在内部拒绝：
 
-- 所有物理 plan 引用真实 canonical anchor；
-- provider 与 target capability 匹配；
-- LMUL、register、fragment、scratch legality；
-- selected record 未复制或改变 canonical algorithm；
-- 每个需要 realization 的 primitive 有唯一计划；
-- local fusion envelope 合法；
-- multiversion predicate 具有 fallback 或明确 no-match 行为。
+- target 不支持所选 element width、LMUL、instruction 或 extension；
+- register、fragment、scratch 与 alignment 约束不合法；
+- local fusion envelope 跨越 effect 或改变 canonical algorithm；
+- 一个 primitive 没有明确的 target realization；
+- backend config 包含未知、冲突或非法物理参数。
 
 ---
 
@@ -58,9 +56,9 @@ Selected verifier 必须检查：
 6. 从普通 multiply/add graph 自动发现并替换成 contract；
 7. 根据 GEMM、Softmax、q4_K 等名字选择整段实现；
 8. 新增扩展时复制整算子 kernel 模板；
-9. provider 修改 source outer loop、staging、ABI 或 logical predicate；
-10. selected IR 与 canonical IR 同时拥有算法真理；
-11. tuner 创造 candidate 或让非法 candidate 合法；
+9. target lowering 修改 source outer loop、staging、ABI 或 logical predicate；
+10. capability、legality、physical plan 或 target-local IR 成为第二份持久 authority；
+11. tuner 创造算法结构或让非法 config 合法；
 12. 把 physical tail 存成 canonical logical mask；
 13. 用普通 carried loop 假装 summary fold，同时期待 compiler 猜出 merge；
 14. 把所有 state construct 压成一个无 observable distinction 的 op；

@@ -1,122 +1,50 @@
 # 构建期 Tuning
 
-## 18. Tuning 规范
+## Tuning 不是 compiler stage
 
-### 18.1 三类变量
-
-#### Source structural knobs
-
-例如：
+Tuning 是外部构建循环：用不同 source meta binding 或 backend config 重复调用同一条编译
+主链，生成 object，真机测量，再保留最快合法 artifact。
 
 ```text
-BM / BN / BK
-作者显式声明的 prefetch distance
-作者显式声明的 staging depth
-显式 algorithm variant
+DSL meta / backend config candidate
+  -> Kernel IR
+  -> target lowering
+  -> intrinsic C / asm
+  -> system compiler
+  -> object
+  -> benchmark
+  -> retain fastest artifact
 ```
 
-其存在与语义位置属于 source，候选值由 build specification 提供。
+Tuning 不形成新 IR、不向 target lowering 插入第二份 legality，也不成为运行期依赖。
 
-#### Provider physical knobs
+## 三类变量
 
-例如：
+### Source structural knobs
 
-```text
-LMUL
-register microtile mr×nr
-register repeat
-unroll
-fragment strategy
-local packing strategy
-```
+例如 `BM/BN/BK`、显式 prefetch distance、staging depth 和算法 variant。它们的存在与使用
+位置属于 source，候选值由 build specification 绑定。
 
-由 provider 声明参数空间与约束。
+### Backend physical config
 
-#### Compiler-derived mechanics
+例如 LMUL、register microtile、unroll、fragment、local packing 与 instruction family。Target
+lowering定义合法值和资源关系；build loop只枚举并实测，不改变 Kernel IR 算法。
 
-例如：
+### Compiler-derived mechanics
 
-```text
-每次 strip 的 actual vl
-physical tail
-vsetvl placement
-已唯一决定的 mask realization
-pointer strength reduction
-```
+每次 strip 的 actual `vl`、physical tail、唯一决定的 mask realization、pointer strength
+reduction 等由 target lowering直接推导，不是 tuning knob。
 
-这些不是 tuner knob。
+## 允许的 specialization
 
-### 18.2 AOT build-time search
+构建期可以对 target、exact/range shape、alignment、stride class、persistent data layout、fixed
+VLEN 和 extension capability 生成多个普通 AOT object。Runtime dispatcher 只在这些现成
+artifact 中选择。
 
-Tuning 流程发生在构建期：
+Tuning 禁止：
 
-```text
-候选绑定
-  → selected execution
-  → emit source/object
-  → compile
-  → benchmark
-  → 固化最快合法变体
-```
-
-运行期不带 compiler，不即时生成代码。
-
-### 18.3 Shape specialization
-
-Tuning key 是：
-
-```text
-(target profile, specialization predicate)
-```
-
-Specialization predicate 可以是：
-
-- exact shape；
-- shape range；
-- alignment / stride class；
-- quant format；
-- model-specific constant；
-- generic fallback。
-
-### 18.4 单变体与多变体
-
-Weft artifact 必须支持两种 AOT 形态：
-
-1. **generic entry**：runtime shape 动态，单个 VLEN-agnostic kernel；
-2. **multiversion entry**：构建期生成多个 shape / target specialization，并生成轻量 runtime dispatch。
-
-Dispatch 只在已生成的 AOT variants 中选择，不进行 JIT。
-
-### 18.5 Build specification
-
-Python source 不需要包含完整搜索集合。外部 build specification 提供：
-
-```text
-entry
-source meta domains
-target profile
-specialization predicates
-measurement harness
-allowed providers
-optional provider constraints
-artifact options
-```
-
-概念示例：
-
-```toml
-[entry.gemm_worker]
-meta.BM = [16, 32, 64]
-meta.BN = [16, 32, 64]
-meta.BK = [16, 32]
-
-[[entry.gemm_worker.specialization]]
-when = "N % 64 == 0"
-
-[[entry.gemm_worker.specialization]]
-when = "true" # fallback
-```
-
-具体配置格式可以变化，职责边界不得变化。
-
----
+- 创造 source 中不存在的 loop、primitive 或 persistent layout；
+- 让 architectural-illegal config 合法；
+- 改变 numerical policy；
+- 将 benchmark winner 物化成新的 compiler IR authority；
+- 为失败候选启用 scalar、legacy 或 GGML fallback。

@@ -27,7 +27,7 @@ Canonical Kernel IR 保存：
 - LMUL；
 - register number；
 - register microtile；
-- provider ID；
+- target realization ID；
 - IME fragment；
 - instruction spelling；
 - build measurement；

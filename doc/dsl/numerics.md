@@ -28,7 +28,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 对于 `order="relaxed"` 的 floating reduce、summary fold 或 contract：
 
-- 同一 source 在不同 VLEN、LMUL 或 provider 上可以采用不同 parenthesization；
+- 同一 source 在不同 VLEN、LMUL 或 target realization 上可以采用不同 parenthesization；
 - 结果低位可以不同；
 - Weft 不承诺 bitwise reproducibility；
 - 该差异是语言允许的实现自由，而不只是测试策略。
@@ -43,7 +43,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 默认 `"native"`。
 
-近似 `exp`、`rsqrt`、activation 等 provider 必须满足相应 primitive 定义的 value semantics；误差测试属于实现质量，不进入 source 认证流程。
+近似 `exp`、`rsqrt`、activation 等 target realization 必须满足相应 primitive 定义的 value semantics；误差测试属于实现质量，不进入 source 认证流程。
 
 ### 14.5 Quantization
 
