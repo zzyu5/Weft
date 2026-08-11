@@ -51,9 +51,9 @@ case "${kernel}" in
     dsl=examples/kernels/normalization/rms_norm.py
     runtime=examples/repro/weft/normalization/rms_norm_runtime.cpp
     ;;
-  online_softmax)
+  softmax)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 online_softmax" >&2
+      echo "usage: $0 softmax" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/online_softmax.py

@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -12,6 +13,7 @@
 
 #include <cctype>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -122,6 +124,98 @@ bool isTrue(mlir::Value value) {
   return value.getType().isInteger(1) && integer && !integer.getValue().isZero();
 }
 
+bool isFloatConstant(mlir::Value value, double expected) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto floating = constant
+                      ? mlir::dyn_cast<mlir::FloatAttr>(constant.getValue())
+                      : mlir::FloatAttr{};
+  return floating && floating.getValueAsDouble() == expected;
+}
+
+bool isTupleField(mlir::Value value, mlir::BlockArgument tuple,
+                  int64_t index) {
+  auto get = value.getDefiningOp<TupleGetOp>();
+  return get && get.getInput() == tuple && get.getIndex() == index;
+}
+
+bool matchesScaledSummaryTerm(mlir::Value value, mlir::BlockArgument state,
+                              mlir::Value maximum) {
+  auto multiply = value.getDefiningOp<BinaryOp>();
+  if (!multiply || multiply.getKind() != "mul")
+    return false;
+  mlir::Value stateSum;
+  mlir::Value exponential;
+  if (isTupleField(multiply.getLhs(), state, 1)) {
+    stateSum = multiply.getLhs();
+    exponential = multiply.getRhs();
+  } else if (isTupleField(multiply.getRhs(), state, 1)) {
+    stateSum = multiply.getRhs();
+    exponential = multiply.getLhs();
+  } else {
+    return false;
+  }
+  (void)stateSum;
+  auto exp = exponential.getDefiningOp<UnaryOp>();
+  if (!exp || exp.getKind() != "exp")
+    return false;
+  auto subtract = exp.getInput().getDefiningOp<BinaryOp>();
+  return subtract && subtract.getKind() == "sub" &&
+         isTupleField(subtract.getLhs(), state, 0) &&
+         subtract.getRhs() == maximum;
+}
+
+bool isOnlineSoftmaxSummary(SummaryFoldOp op) {
+  if (op.getOrder() != "preserve" || !isTrue(op.getWhere()))
+    return false;
+  auto resultType = mlir::dyn_cast<TupleType>(op.getResult().getType());
+  if (!resultType || resultType.getTypes().size() != 2 ||
+      !resultType.getTypes()[0].isF32() || !resultType.getTypes()[1].isF32())
+    return false;
+
+  auto identity = op.getIdentity().getDefiningOp<TupleOp>();
+  if (!identity || identity.getNumOperands() != 2 ||
+      !identity.getOperand(0).getDefiningOp<SpecialValueOp>() ||
+      identity.getOperand(0).getDefiningOp<SpecialValueOp>().getKind() !=
+          "neg_inf" ||
+      !isFloatConstant(identity.getOperand(1), 0.0))
+    return false;
+
+  mlir::Block &lift = op.getLift().front();
+  auto liftYield = mlir::cast<YieldOp>(lift.getTerminator());
+  auto lifted = liftYield.getOperand(0).getDefiningOp<TupleOp>();
+  if (!lifted || lifted.getNumOperands() != 2 ||
+      lifted.getOperand(0) != lift.getArgument(0) ||
+      !isFloatConstant(lifted.getOperand(1), 1.0))
+    return false;
+
+  mlir::Block &merge = op.getMerge().front();
+  auto mergeYield = mlir::cast<YieldOp>(merge.getTerminator());
+  auto merged = mergeYield.getOperand(0).getDefiningOp<TupleOp>();
+  if (!merged || merged.getNumOperands() != 2)
+    return false;
+  auto maximum = merged.getOperand(0).getDefiningOp<BinaryOp>();
+  if (!maximum || maximum.getKind() != "max")
+    return false;
+  bool maxOperandsMatch =
+      (isTupleField(maximum.getLhs(), merge.getArgument(0), 0) &&
+       isTupleField(maximum.getRhs(), merge.getArgument(1), 0)) ||
+      (isTupleField(maximum.getLhs(), merge.getArgument(1), 0) &&
+       isTupleField(maximum.getRhs(), merge.getArgument(0), 0));
+  if (!maxOperandsMatch)
+    return false;
+  auto sum = merged.getOperand(1).getDefiningOp<BinaryOp>();
+  if (!sum || sum.getKind() != "add")
+    return false;
+  return (matchesScaledSummaryTerm(sum.getLhs(), merge.getArgument(0),
+                                   maximum.getResult()) &&
+          matchesScaledSummaryTerm(sum.getRhs(), merge.getArgument(1),
+                                   maximum.getResult())) ||
+         (matchesScaledSummaryTerm(sum.getLhs(), merge.getArgument(1),
+                                   maximum.getResult()) &&
+          matchesScaledSummaryTerm(sum.getRhs(), merge.getArgument(0),
+                                   maximum.getResult()));
+}
+
 class KernelEmitter {
 public:
   KernelEmitter(KernelOp kernel, const RISCVLoweringOptions &options,
@@ -190,6 +284,7 @@ private:
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
+  llvm::DenseSet<mlir::Operation *> consumed;
   unsigned indent = 0;
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
@@ -224,6 +319,8 @@ private:
   }
 
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
+    if (consumed.contains(operation))
+      return mlir::success();
     if (auto op = mlir::dyn_cast<ConstantOp>(operation))
       return emitConstant(op);
     if (auto op = mlir::dyn_cast<MetaValueOp>(operation))
@@ -244,6 +341,10 @@ private:
       return emitCast(op);
     if (auto op = mlir::dyn_cast<SelectOp>(operation))
       return emitSelect(op);
+    if (auto op = mlir::dyn_cast<TupleOp>(operation))
+      return emitTuple(op);
+    if (auto op = mlir::dyn_cast<TupleGetOp>(operation))
+      return emitTupleGet(op);
     if (auto op = mlir::dyn_cast<SpecialValueOp>(operation))
       return emitSpecial(op);
     if (auto op = mlir::dyn_cast<InvalidOp>(operation)) {
@@ -257,6 +358,9 @@ private:
       return emitStore(op);
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
+    if (auto op = mlir::dyn_cast<SummaryFoldOp>(operation))
+      return op.emitError(
+          "summary_fold must be lowered by its enclosing VLA region");
     if (mlir::isa<YieldOp, ReturnOp>(operation))
       return mlir::success();
     return operation->emitError(
@@ -342,9 +446,30 @@ private:
     if (!options.target.hasRVV)
       return op.emitError(
           "VLA requires RVV on the selected target; no scalar fallback exists");
+    if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
+      return mlir::success();
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        if (!isOnlineSoftmaxSummary(summary))
+          return summary.emitError(
+              "RISC-V target does not implement this summary algebra");
+        auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
+        CValue maximum{mlir::Float32Type::get(kernel.getContext()),
+                       CValueKind::Scalar, fresh("summary_max")};
+        CValue sum{mlir::Float32Type::get(kernel.getContext()),
+                   CValueKind::Scalar, fresh("summary_sum")};
+        line("float " + maximum.spelling + " = " +
+             expression(identity.getOperand(0)) + ";");
+        line("float " + sum.spelling + " = " +
+             expression(identity.getOperand(1)) + ";");
+        CValue aggregate{summary.getResult().getType(), CValueKind::Tuple, {}};
+        aggregate.fields = {maximum, sum};
+        aggregates[summary.getOperation()] = aggregate;
+        values[summary.getResult()] = aggregate;
+        continue;
+      }
       auto reduce = mlir::dyn_cast<ReduceOp>(nested);
       if (!reduce)
         continue;
@@ -384,6 +509,12 @@ private:
           return mlir::failure();
         continue;
       }
+      if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        if (mlir::failed(emitOnlineSoftmaxSummary(
+                summary, aggregates[summary.getOperation()])))
+          return mlir::failure();
+        continue;
+      }
       if (mlir::failed(emitOperation(&nested)))
         return mlir::failure();
     }
@@ -397,7 +528,9 @@ private:
     for (auto [result, yielded] :
          llvm::zip(op.getResults(), yield.getOperands())) {
       CValue value = require(yielded);
-      if (value.spelling.empty() || value.kind != CValueKind::Scalar)
+      if ((value.spelling.empty() && value.kind != CValueKind::Tuple) ||
+          (value.kind != CValueKind::Scalar &&
+           value.kind != CValueKind::Tuple))
         return op.emitError("VLA result is not a materialized scalar aggregate");
       value.type = result.getType();
       values[result] = value;
@@ -419,6 +552,218 @@ private:
         CValue{op.getResult().getType(), CValueKind::Pointer,
                "(" + base.spelling + " + " + offset.spelling + ")",
                lanePointer};
+    return mlir::success();
+  }
+
+  std::optional<std::string> pointerBase(mlir::Value value,
+                                         mlir::Value coordinate) {
+    if (value == coordinate)
+      return std::nullopt;
+    if (auto pointer = value.getDefiningOp<PtrAddOp>()) {
+      if (pointer.getOffset() == coordinate)
+        return pointerBase(pointer.getBase(), coordinate);
+      std::optional<std::string> base =
+          pointerBase(pointer.getBase(), coordinate);
+      std::string offset = expression(pointer.getOffset());
+      if (!base || offset.empty())
+        return std::nullopt;
+      return "(" + *base + " + " + offset + ")";
+    }
+    CValue materialized = require(value);
+    if (materialized.kind != CValueKind::Pointer ||
+        materialized.spelling.empty())
+      return std::nullopt;
+    return materialized.spelling;
+  }
+
+  bool sameBound(mlir::Value lhs, mlir::Value rhs) {
+    if (lhs == rhs)
+      return true;
+    std::string lhsExpression = expression(lhs);
+    std::string rhsExpression = expression(rhs);
+    return !lhsExpression.empty() && lhsExpression == rhsExpression;
+  }
+
+  mlir::LogicalResult tryEmitSoftmaxEnvelope(VLAOp producer) {
+    SummaryFoldOp summary;
+    for (mlir::Operation &operation :
+         producer.getBody().front().without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<SummaryFoldOp>(operation)) {
+        if (summary)
+          return mlir::failure();
+        summary = candidate;
+      }
+    }
+    if (!summary || !isOnlineSoftmaxSummary(summary) ||
+        producer.getNumResults() != 1)
+      return mlir::failure();
+
+    TupleGetOp maximumGet;
+    TupleGetOp sumGet;
+    for (mlir::Operation *user : producer.getResult(0).getUsers()) {
+      auto get = mlir::dyn_cast<TupleGetOp>(user);
+      if (!get)
+        return mlir::failure();
+      if (get.getIndex() == 0 && !maximumGet)
+        maximumGet = get;
+      else if (get.getIndex() == 1 && !sumGet)
+        sumGet = get;
+      else
+        return mlir::failure();
+    }
+    if (!maximumGet || !sumGet || maximumGet.getResult().use_empty() ||
+        sumGet.getResult().use_empty())
+      return mlir::failure();
+
+    VLAOp consumer;
+    for (mlir::Operation *user : maximumGet.getResult().getUsers()) {
+      auto parent = user->getParentOfType<VLAOp>();
+      if (!parent || (consumer && consumer != parent))
+        return mlir::failure();
+      consumer = parent;
+    }
+    for (mlir::Operation *user : sumGet.getResult().getUsers())
+      if (user->getParentOfType<VLAOp>() != consumer)
+        return mlir::failure();
+    if (!consumer || consumer->getBlock() != producer->getBlock() ||
+        !sameBound(producer.getBegin(), consumer.getBegin()) ||
+        !sameBound(producer.getEnd(), consumer.getEnd()))
+      return mlir::failure();
+
+    LoadOp consumerLoad;
+    StoreOp consumerStore;
+    for (mlir::Operation &operation :
+         consumer.getBody().front().without_terminator()) {
+      if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
+        if (consumerLoad)
+          return mlir::failure();
+        consumerLoad = load;
+      }
+      if (auto store = mlir::dyn_cast<StoreOp>(operation)) {
+        if (consumerStore)
+          return mlir::failure();
+        consumerStore = store;
+      }
+    }
+    if (!consumerLoad || !consumerStore || !isTrue(consumerLoad.getWhere()) ||
+        !isTrue(consumerStore.getWhere()))
+      return mlir::failure();
+    auto divide = consumerStore.getValue().getDefiningOp<BinaryOp>();
+    if (!divide || divide.getKind() != "div" ||
+        divide.getRhs() != sumGet.getResult())
+      return mlir::failure();
+    auto exponential = divide.getLhs().getDefiningOp<UnaryOp>();
+    auto subtract = exponential
+                        ? exponential.getInput().getDefiningOp<BinaryOp>()
+                        : BinaryOp{};
+    if (!exponential || exponential.getKind() != "exp" || !subtract ||
+        subtract.getKind() != "sub" ||
+        subtract.getLhs() != consumerLoad.getResult() ||
+        subtract.getRhs() != maximumGet.getResult())
+      return mlir::failure();
+    auto producerLoad = summary.getInput().getDefiningOp<LoadOp>();
+    if (!producerLoad || !isTrue(producerLoad.getWhere()))
+      return mlir::failure();
+
+    mlir::Value producerCoordinate =
+        producer.getBody().front().getArgument(0);
+    mlir::Value consumerCoordinate =
+        consumer.getBody().front().getArgument(0);
+    std::optional<std::string> input =
+        pointerBase(producerLoad.getPointer(), producerCoordinate);
+    std::optional<std::string> consumerInput =
+        pointerBase(consumerLoad.getPointer(), consumerCoordinate);
+    std::optional<std::string> outputPointer =
+        pointerBase(consumerStore.getPointer(), consumerCoordinate);
+    if (!input || !consumerInput || !outputPointer || *input != *consumerInput)
+      return mlir::failure();
+
+    std::string begin = expression(producer.getBegin());
+    std::string end = expression(producer.getEnd());
+    if (begin.empty() || end.empty())
+      return mlir::failure();
+    std::string maximum = fresh("softmax_max");
+    std::string strip = fresh("softmax_i");
+    std::string vl = fresh("vl");
+    std::string inputVector = fresh("softmax_x");
+    std::string seed = fresh("softmax_seed");
+    std::string partial = fresh("softmax_partial");
+    line("float " + maximum + " = -INFINITY;");
+    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
+         end + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+         strip + ");");
+    line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
+         *input + " + " + strip + ", " + vl + ");");
+    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + maximum +
+         ", 1);");
+    line("vfloat32m1_t " + partial +
+         " = __riscv_vfredmax_vs_f32m2_f32m1(" + inputVector + ", " + seed +
+         ", " + vl + ");");
+    line(maximum + " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+
+    std::string sum = fresh("softmax_sum");
+    std::string shifted = fresh("softmax_shifted");
+    std::string exponentials = fresh("softmax_exp");
+    std::string sumSeed = fresh("softmax_sum_seed");
+    std::string sumPartial = fresh("softmax_sum_partial");
+    line("float " + sum + " = 0.0f;");
+    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
+         end + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+         strip + ");");
+    line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
+         *input + " + " + strip + ", " + vl + ");");
+    line("vfloat32m2_t " + shifted + " = __riscv_vfsub_vf_f32m2(" +
+         inputVector + ", " + maximum + ", " + vl + ");");
+    line("vfloat32m2_t " + exponentials + " = __weft_exp_f32m2(" + shifted +
+         ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + *outputPointer + " + " + strip + ", " +
+         exponentials + ", " + vl + ");");
+    line("vfloat32m1_t " + sumSeed + " = __riscv_vfmv_v_f_f32m1(" + sum +
+         ", 1);");
+    line("vfloat32m1_t " + sumPartial +
+         " = __riscv_vfredusum_vs_f32m2_f32m1(" + exponentials + ", " +
+         sumSeed + ", " + vl + ");");
+    line(sum + " = __riscv_vfmv_f_s_f32m1_f32(" + sumPartial + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+
+    std::string inverse = fresh("softmax_inverse");
+    std::string outputVector = fresh("softmax_y");
+    line("const float " + inverse + " = 1.0f / " + sum + ";");
+    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
+         end + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+         strip + ");");
+    line("vfloat32m2_t " + outputVector + " = __riscv_vle32_v_f32m2(" +
+         *outputPointer + " + " + strip + ", " + vl + ");");
+    line(outputVector + " = __riscv_vfmul_vf_f32m2(" + outputVector + ", " +
+         inverse + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + *outputPointer + " + " + strip + ", " +
+         outputVector + ", " + vl + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+
+    CValue maxValue{mlir::Float32Type::get(kernel.getContext()),
+                    CValueKind::Scalar, maximum};
+    CValue sumValue{mlir::Float32Type::get(kernel.getContext()),
+                    CValueKind::Scalar, sum};
+    CValue tuple{producer.getResult(0).getType(), CValueKind::Tuple, {}};
+    tuple.fields = {maxValue, sumValue};
+    values[summary.getResult()] = tuple;
+    values[producer.getResult(0)] = tuple;
+    consumed.insert(maximumGet.getOperation());
+    consumed.insert(sumGet.getOperation());
+    consumed.insert(consumer.getOperation());
     return mlir::success();
   }
 
@@ -594,6 +939,29 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult emitTuple(TupleOp op) {
+    CValue tuple{op.getResult().getType(), CValueKind::Tuple, {}};
+    for (mlir::Value operand : op.getOperands()) {
+      CValue field = require(operand);
+      if (field.spelling.empty())
+        return op.emitError("tuple field is unavailable");
+      tuple.fields.push_back(std::move(field));
+    }
+    values[op.getResult()] = std::move(tuple);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitTupleGet(TupleGetOp op) {
+    CValue tuple = require(op.getInput());
+    if (tuple.kind != CValueKind::Tuple || op.getIndex() < 0 ||
+        static_cast<size_t>(op.getIndex()) >= tuple.fields.size())
+      return op.emitError("tuple field is unavailable");
+    CValue field = tuple.fields[op.getIndex()];
+    field.type = op.getResult().getType();
+    values[op.getResult()] = field;
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitSpecial(SpecialValueOp op) {
     std::string value;
     if (op.getKind() == "neg_inf")
@@ -696,6 +1064,53 @@ private:
       return op.emitError("RVV reduction kind is unsupported");
     line(aggregate.spelling + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
          ");");
+    values[op.getResult()] = aggregate;
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitOnlineSoftmaxSummary(
+      SummaryFoldOp op, const CValue &aggregate) {
+    CValue input = require(op.getInput());
+    if (!isOnlineSoftmaxSummary(op) ||
+        input.kind != CValueKind::F32Vector ||
+        aggregate.kind != CValueKind::Tuple || aggregate.fields.size() != 2)
+      return op.emitError(
+          "online summary requires an all-active f32 VLA input");
+    const CValue &maximum = aggregate.fields[0];
+    const CValue &sum = aggregate.fields[1];
+    std::string maxSeed = fresh("summary_max_seed");
+    std::string maxVector = fresh("summary_max_vector");
+    std::string stripMaximum = fresh("summary_strip_max");
+    std::string shifted = fresh("summary_shifted");
+    std::string exponentials = fresh("summary_exp");
+    std::string sumSeed = fresh("summary_sum_seed");
+    std::string sumVector = fresh("summary_sum_vector");
+    std::string stripSum = fresh("summary_strip_sum");
+    std::string mergedMaximum = fresh("summary_merged_max");
+    line("vfloat32m1_t " + maxSeed +
+         " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
+    line("vfloat32m1_t " + maxVector +
+         " = __riscv_vfredmax_vs_f32m2_f32m1(" + input.spelling + ", " +
+         maxSeed + ", " + activeVL + ");");
+    line("const float " + stripMaximum +
+         " = __riscv_vfmv_f_s_f32m1_f32(" + maxVector + ");");
+    line("vfloat32m2_t " + shifted + " = __riscv_vfsub_vf_f32m2(" +
+         input.spelling + ", " + stripMaximum + ", " + activeVL + ");");
+    line("vfloat32m2_t " + exponentials + " = __weft_exp_f32m2(" +
+         shifted + ", " + activeVL + ");");
+    line("vfloat32m1_t " + sumSeed +
+         " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
+    line("vfloat32m1_t " + sumVector +
+         " = __riscv_vfredusum_vs_f32m2_f32m1(" + exponentials + ", " +
+         sumSeed + ", " + activeVL + ");");
+    line("const float " + stripSum +
+         " = __riscv_vfmv_f_s_f32m1_f32(" + sumVector + ");");
+    line("const float " + mergedMaximum + " = fmaxf(" + maximum.spelling +
+         ", " + stripMaximum + ");");
+    line(sum.spelling + " = " + sum.spelling + " * expf(" +
+         maximum.spelling + " - " + mergedMaximum + ") + " + stripSum +
+         " * expf(" + stripMaximum + " - " + mergedMaximum + ");");
+    line(maximum.spelling + " = " + mergedMaximum + ";");
     values[op.getResult()] = aggregate;
     return mlir::success();
   }

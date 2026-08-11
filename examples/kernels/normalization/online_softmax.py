@@ -19,24 +19,29 @@ def softmax_merge(a, b):
 
 
 @weft.kernel
-def online_softmax_f32(
+def softmax_f32(
     x: W.ptr[W.f32, W.readonly],
     y: W.ptr[W.f32, W.writeonly],
-    n: W.index,
+    row_begin: W.index,
+    row_end: W.index,
+    cols: W.index,
+    stride: W.index,
 ) -> None:
-    with W.vla(0, n) as i:
-        value = W.load(x + i)
-        state = W.summary_fold(
-            value,
-            identity=W.tuple(W.neg_inf(W.f32), W.f32(0.0)),
-            lift=softmax_lift,
-            merge=softmax_merge,
-            finalize=None,
-            order="preserve",
-        )
+    for row in W.range(row_begin, row_end):
+        row_offset = row * stride
+        with W.vla(0, cols) as i:
+            value = W.load(x + row_offset + i)
+            state = W.summary_fold(
+                value,
+                identity=W.tuple(W.neg_inf(W.f32), W.f32(0.0)),
+                lift=softmax_lift,
+                merge=softmax_merge,
+                finalize=None,
+                order="preserve",
+            )
 
-    maximum, scaled_sum = state
-    with W.vla(0, n) as i:
-        value = W.load(x + i)
-        probability = W.exp(value - maximum, math="native") / scaled_sum
-        W.store(y + i, probability)
+        maximum, scaled_sum = state
+        with W.vla(0, cols) as i:
+            value = W.load(x + row_offset + i)
+            probability = W.exp(value - maximum, math="fast") / scaled_sum
+            W.store(y + row_offset + i, probability)
