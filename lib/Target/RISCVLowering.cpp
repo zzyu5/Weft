@@ -28,6 +28,7 @@ enum class CValueKind {
   Scalar,
   Pointer,
   Coordinate,
+  F16Vector,
   F32Vector,
   Mask,
   Tuple,
@@ -355,6 +356,17 @@ private:
     return "__weft_" + prefix.str() + std::to_string(nextValue++);
   }
 
+  CValue scalarExpression(mlir::Value result, std::string expression,
+                          llvm::StringRef prefix, bool force = false) {
+    if (force || (!result.use_empty() && !result.hasOneUse())) {
+      std::string name = fresh(prefix);
+      line("const " + scalarCType(elementType(result.getType())) + " " + name +
+           " = " + expression + ";");
+      expression = std::move(name);
+    }
+    return CValue{result.getType(), CValueKind::Scalar, std::move(expression)};
+  }
+
   CValue require(mlir::Value value) const {
     auto found = values.find(value);
     return found == values.end() ? CValue{} : found->second;
@@ -389,6 +401,8 @@ private:
       return emitConstant(op);
     if (auto op = mlir::dyn_cast<MetaValueOp>(operation))
       return emitMeta(op);
+    if (auto op = mlir::dyn_cast<IfOp>(operation))
+      return emitIf(op);
     if (auto op = mlir::dyn_cast<ForOp>(operation))
       return emitFor(op);
     if (auto op = mlir::dyn_cast<VLAOp>(operation))
@@ -458,9 +472,72 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult emitIf(IfOp op) {
+    CValue condition = require(op.getCondition());
+    if (condition.kind != CValueKind::Scalar || condition.spelling.empty())
+      return op.emitError("RISC-V conditional requires a scalar predicate");
+    auto thenYield =
+        mlir::cast<YieldOp>(op.getThenRegion().front().getTerminator());
+    auto elseYield =
+        mlir::cast<YieldOp>(op.getElseRegion().front().getTerminator());
+    if (thenYield.getNumOperands() != op.getNumResults() ||
+        elseYield.getNumOperands() != op.getNumResults())
+      return op.emitError("RISC-V conditional result arity is inconsistent");
+
+    llvm::SmallVector<CValue> results;
+    for (mlir::Value result : op.getResults()) {
+      if (!mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
+              result.getType()))
+        return op.emitError(
+            "RISC-V conditional currently yields only scalar values");
+      CValue value{result.getType(), CValueKind::Scalar, fresh("if_result")};
+      line(scalarCType(result.getType()) + " " + value.spelling + ";");
+      results.push_back(value);
+    }
+
+    auto emitBranch = [&](mlir::Region &region) {
+      mlir::Block &body = region.front();
+      for (mlir::Operation &nested : body.without_terminator())
+        if (mlir::failed(emitOperation(&nested)))
+          return mlir::failure();
+      auto yield = mlir::cast<YieldOp>(body.getTerminator());
+      for (auto [destination, yielded] :
+           llvm::zip(results, yield.getOperands())) {
+        CValue value = require(yielded);
+        if (value.kind != CValueKind::Scalar || value.spelling.empty()) {
+          yield.emitError(
+              "RISC-V conditional yielded an unavailable scalar value");
+          return mlir::failure();
+        }
+        line(destination.spelling + " = " + value.spelling + ";");
+      }
+      return mlir::success();
+    };
+
+    line("if (" + condition.spelling + ") {");
+    ++indent;
+    if (mlir::failed(emitBranch(op.getThenRegion())))
+      return mlir::failure();
+    --indent;
+    line("} else {");
+    ++indent;
+    if (mlir::failed(emitBranch(op.getElseRegion())))
+      return mlir::failure();
+    --indent;
+    line("}");
+
+    for (auto [result, value] : llvm::zip(op.getResults(), results))
+      values[result] = value;
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitFor(ForOp op) {
     if (auto lowered = tryEmitF16GemmNTiles(op))
       return *lowered;
+    mlir::Block &body = op.getBody().front();
+    if (op.getInitArgs().size() != op.getNumResults() ||
+        body.getNumArguments() != op.getNumResults() + 1)
+      return op.emitError("ordered range carried-value arity is inconsistent");
     llvm::SmallVector<CValue> carried;
     for (auto [result, initial] :
          llvm::zip(op.getResults(), op.getOperands().drop_front(3))) {
@@ -480,6 +557,29 @@ private:
     if (lower.spelling.empty() || upper.spelling.empty() ||
         step.spelling.empty())
       return op.emitError("ordered range has unavailable bounds");
+    auto emitCarriedUpdates = [&](YieldOp yield,
+                                  llvm::StringRef unavailableMessage) {
+      if (yield.getNumOperands() != carried.size()) {
+        yield.emitError("ordered range carried-value arity is inconsistent");
+        return mlir::failure();
+      }
+      llvm::SmallVector<std::pair<CValue, std::string>> updates;
+      for (auto [destination, yielded] :
+           llvm::zip(carried, yield.getOperands())) {
+        CValue value = require(yielded);
+        if (value.spelling.empty()) {
+          yield.emitError() << unavailableMessage;
+          return mlir::failure();
+        }
+        std::string next = fresh("next");
+        line(scalarCType(destination.type) + " " + next + " = " +
+             value.spelling + ";");
+        updates.emplace_back(destination, std::move(next));
+      }
+      for (const auto &[destination, next] : updates)
+        line(destination.spelling + " = " + next + ";");
+      return mlir::success();
+    };
     std::optional<int64_t> constantLower = integerConstant(op.getLower());
     std::optional<int64_t> constantUpper = integerConstant(op.getUpper());
     std::optional<int64_t> constantStep = integerConstant(op.getStep());
@@ -487,7 +587,6 @@ private:
         *constantUpper >= *constantLower &&
         (*constantUpper - *constantLower + *constantStep - 1) / *constantStep <=
             8) {
-      mlir::Block &body = op.getBody().front();
       llvm::DenseSet<mlir::Operation *> consumedBefore = consumed;
       for (int64_t induction = *constantLower; induction < *constantUpper;
            induction += *constantStep) {
@@ -502,14 +601,9 @@ private:
           if (mlir::failed(emitOperation(&nested)))
             return mlir::failure();
         auto yield = mlir::cast<YieldOp>(body.getTerminator());
-        for (auto [destination, yielded] :
-             llvm::zip(carried, yield.getOperands())) {
-          CValue value = require(yielded);
-          if (value.spelling.empty())
-            return yield.emitError(
-                "unrolled ordered range yielded an unavailable value");
-          line(destination.spelling + " = " + value.spelling + ";");
-        }
+        if (mlir::failed(emitCarriedUpdates(
+                yield, "unrolled ordered range yielded an unavailable value")))
+          return mlir::failure();
       }
       consumed = consumedBefore;
       return mlir::success();
@@ -519,7 +613,6 @@ private:
          induction + " < " + upper.spelling + "; " + induction + " += " +
          step.spelling + ") {");
     ++indent;
-    mlir::Block &body = op.getBody().front();
     values[body.getArgument(0)] =
         CValue{body.getArgument(0).getType(), CValueKind::Scalar, induction};
     for (auto [argument, value] :
@@ -529,13 +622,414 @@ private:
       if (mlir::failed(emitOperation(&nested)))
         return mlir::failure();
     auto yield = mlir::cast<YieldOp>(body.getTerminator());
-    for (auto [destination, yielded] :
-         llvm::zip(carried, yield.getOperands())) {
-      CValue value = require(yielded);
-      if (value.spelling.empty())
-        return yield.emitError("ordered range yielded an unavailable value");
-      line(destination.spelling + " = " + value.spelling + ";");
+    if (mlir::failed(emitCarriedUpdates(
+            yield, "ordered range yielded an unavailable value")))
+      return mlir::failure();
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult tryEmitF32ToF16VLA(VLAOp op) {
+    if (op.getNumResults() != 0)
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    LoadOp load;
+    CastOp cast;
+    StoreOp store;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<LoadOp>(nested)) {
+        if (load)
+          return mlir::failure();
+        load = candidate;
+      } else if (auto candidate = mlir::dyn_cast<CastOp>(nested)) {
+        if (cast)
+          return mlir::failure();
+        cast = candidate;
+      } else if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
+        if (store)
+          return mlir::failure();
+        store = candidate;
+      } else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
+        return mlir::failure();
     }
+    if (!load || !cast || !store || cast.getInput() != load.getResult() ||
+        store.getValue() != cast.getResult() || !isTrue(load.getWhere()) ||
+        !isTrue(store.getWhere()) ||
+        !elementType(load.getResult().getType()).isF32() ||
+        !isF16(elementType(cast.getResult().getType())))
+      return mlir::failure();
+
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(load.getPointer(), coordinate) ||
+        !valueDependsOn(store.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> source =
+        pointerBase(load.getPointer(), coordinate);
+    std::optional<std::string> destination =
+        pointerBase(store.getPointer(), coordinate);
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    if (!source || !destination || begin.spelling.empty() || end.spelling.empty())
+      return mlir::failure();
+
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string wide = fresh("load_f32");
+    std::string narrow = fresh("narrow_f16");
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat32m8_t " + wide + " = __riscv_vle32_v_f32m8(" + *source +
+         " + " + strip + ", " + vl + ");");
+    line("vfloat16m4_t " + narrow +
+         " = __riscv_vfncvt_f_f_w_f16m4(" + wide + ", " + vl + ");");
+    line("__riscv_vse16_v_f16m4(" + *destination + " + " + strip + ", " +
+         narrow + ", " + vl + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult tryEmitF16FillVLA(VLAOp op) {
+    if (op.getNumResults() != 0)
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    StoreOp store;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (mlir::isa<LoadOp>(nested))
+        return mlir::failure();
+      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
+        if (store)
+          return mlir::failure();
+        store = candidate;
+      } else if (!mlir::isa<PtrAddOp, ConstantOp>(nested))
+        return mlir::failure();
+    }
+    if (!store || !isTrue(store.getWhere()) ||
+        !isF16(elementType(store.getValue().getType())))
+      return mlir::failure();
+    std::string fill = expression(store.getValue());
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(store.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> destination =
+        pointerBase(store.getPointer(), coordinate);
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    if (fill.empty() || !destination || begin.spelling.empty() ||
+        end.spelling.empty())
+      return mlir::failure();
+
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string vector = fresh("fill_f16");
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat16m8_t " + vector + " = __riscv_vfmv_v_f_f16m8(" + fill +
+         ", " + vl + ");");
+    line("__riscv_vse16_v_f16m8(" + *destination + " + " + strip + ", " +
+         vector + ", " + vl + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult tryEmitWideningF16DotVLA(VLAOp op) {
+    if (op.getNumResults() != 1 || !op.getResult(0).getType().isF32())
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    unsigned loadCount = 0;
+    unsigned castCount = 0;
+    unsigned binaryCount = 0;
+    unsigned reduceCount = 0;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
+        continue;
+      if (mlir::isa<LoadOp>(nested))
+        ++loadCount;
+      else if (mlir::isa<CastOp>(nested))
+        ++castCount;
+      else if (mlir::isa<BinaryOp>(nested))
+        ++binaryCount;
+      else if (mlir::isa<ReduceOp>(nested))
+        ++reduceCount;
+      else
+        return mlir::failure();
+    }
+    if (loadCount != 2 || castCount != 2 || binaryCount != 1 ||
+        reduceCount != 1)
+      return mlir::failure();
+    auto yield = mlir::cast<YieldOp>(body.getTerminator());
+    if (yield.getNumOperands() != 1)
+      return mlir::failure();
+    auto reduce = yield.getOperand(0).getDefiningOp<ReduceOp>();
+    if (!reduce || reduce.getKind() != "add" || reduce.getAxis() != -1 ||
+        !isTrue(reduce.getWhere()))
+      return mlir::failure();
+    auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
+    if (!multiply || multiply.getKind() != "mul")
+      return mlir::failure();
+    auto lhsCast = multiply.getLhs().getDefiningOp<CastOp>();
+    auto rhsCast = multiply.getRhs().getDefiningOp<CastOp>();
+    if (!lhsCast || !rhsCast ||
+        !elementType(lhsCast.getResult().getType()).isF32() ||
+        !elementType(rhsCast.getResult().getType()).isF32())
+      return mlir::failure();
+    auto lhsLoad = lhsCast.getInput().getDefiningOp<LoadOp>();
+    auto rhsLoad = rhsCast.getInput().getDefiningOp<LoadOp>();
+    if (!lhsLoad || !rhsLoad || !isTrue(lhsLoad.getWhere()) ||
+        !isTrue(rhsLoad.getWhere()) ||
+        !isF16(elementType(lhsLoad.getResult().getType())) ||
+        !isF16(elementType(rhsLoad.getResult().getType())))
+      return mlir::failure();
+
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(lhsLoad.getPointer(), coordinate) ||
+        !valueDependsOn(rhsLoad.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> lhs =
+        pointerBase(lhsLoad.getPointer(), coordinate);
+    std::optional<std::string> rhs =
+        pointerBase(rhsLoad.getPointer(), coordinate);
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    std::string identity = expression(reduce.getIdentity());
+    if (!lhs || !rhs || begin.spelling.empty() || end.spelling.empty() ||
+        identity.empty())
+      return mlir::failure();
+
+    std::string fullVL = fresh("dot_vl");
+    std::string accumulator = fresh("dot_acc");
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string lhsVector = fresh("dot_lhs");
+    std::string rhsVector = fresh("dot_rhs");
+    std::string seed = fresh("dot_seed");
+    std::string reduced = fresh("dot_reduced");
+    std::string result = fresh("dot");
+    line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m1();");
+    line("vfloat32m2_t " + accumulator +
+         " = __riscv_vfmv_v_f_f32m2(0.0f, " + fullVL + ");");
+    line("size_t " + strip + " = " + begin.spelling + ";");
+    line("for (; " + strip + " + " + fullVL + " <= " + end.spelling + "; " +
+         strip + " += " + fullVL + ") {");
+    ++indent;
+    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" + *lhs +
+         " + " + strip + ", " + fullVL + ");");
+    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" + *rhs +
+         " + " + strip + ", " + fullVL + ");");
+    line(accumulator + " = __riscv_vfwmacc_vv_f32m2(" + accumulator + ", " +
+         lhsVector + ", " + rhsVector + ", " + fullVL + ");");
+    --indent;
+    line("}");
+    line("if (" + strip + " < " + end.spelling + ") {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" + *lhs +
+         " + " + strip + ", " + vl + ");");
+    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" + *rhs +
+         " + " + strip + ", " + vl + ");");
+    line(accumulator + " = __riscv_vfwmacc_vv_f32m2_tu(" + accumulator +
+         ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
+    --indent;
+    line("}");
+    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + identity +
+         ", 1);");
+    line("vfloat32m1_t " + reduced +
+         " = __riscv_vfredusum_vs_f32m2_f32m1(" + accumulator + ", " + seed +
+         ", " + fullVL + ");");
+    line("const float " + result + " = __riscv_vfmv_f_s_f32m1_f32(" +
+         reduced + ");");
+    CValue materialized{op.getResult(0).getType(), CValueKind::Scalar, result};
+    values[reduce.getResult()] = materialized;
+    values[op.getResult(0)] = materialized;
+    return mlir::success();
+  }
+
+  mlir::LogicalResult tryEmitF16WeightedUpdateVLA(VLAOp op) {
+    if (op.getNumResults() != 0)
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    StoreOp store;
+    unsigned loadCount = 0;
+    unsigned binaryCount = 0;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
+        if (store)
+          return mlir::failure();
+        store = candidate;
+      } else if (mlir::isa<LoadOp>(nested))
+        ++loadCount;
+      else if (mlir::isa<BinaryOp>(nested))
+        ++binaryCount;
+      else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
+        return mlir::failure();
+    }
+    if (loadCount != 2 || binaryCount != 2)
+      return mlir::failure();
+    if (!store || !isTrue(store.getWhere()) ||
+        !isF16(elementType(store.getValue().getType())))
+      return mlir::failure();
+    auto add = store.getValue().getDefiningOp<BinaryOp>();
+    if (!add || add.getKind() != "add")
+      return mlir::failure();
+
+    BinaryOp multiply = add.getLhs().getDefiningOp<BinaryOp>();
+    mlir::Value baseValue = add.getRhs();
+    if (!multiply || multiply.getKind() != "mul") {
+      multiply = add.getRhs().getDefiningOp<BinaryOp>();
+      baseValue = add.getLhs();
+    }
+    if (!multiply || multiply.getKind() != "mul")
+      return mlir::failure();
+    auto baseLoad = baseValue.getDefiningOp<LoadOp>();
+    if (!baseLoad || !isTrue(baseLoad.getWhere()) ||
+        !isF16(elementType(baseLoad.getResult().getType())))
+      return mlir::failure();
+
+    LoadOp productLoad = multiply.getLhs().getDefiningOp<LoadOp>();
+    mlir::Value weight = multiply.getRhs();
+    if (!productLoad) {
+      productLoad = multiply.getRhs().getDefiningOp<LoadOp>();
+      weight = multiply.getLhs();
+    }
+    if (!productLoad || !isTrue(productLoad.getWhere()) ||
+        !isF16(elementType(productLoad.getResult().getType())) ||
+        !isF16(elementType(weight.getType())))
+      return mlir::failure();
+
+    mlir::Value destinationRoot = pointerRoot(store.getPointer());
+    mlir::Value baseRoot = pointerRoot(baseLoad.getPointer());
+    mlir::Value productRoot = pointerRoot(productLoad.getPointer());
+    if (!destinationRoot ||
+        (destinationRoot != baseRoot && destinationRoot != productRoot))
+      return mlir::failure();
+
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(baseLoad.getPointer(), coordinate) ||
+        !valueDependsOn(productLoad.getPointer(), coordinate) ||
+        !valueDependsOn(store.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> base =
+        pointerBase(baseLoad.getPointer(), coordinate);
+    std::optional<std::string> product =
+        pointerBase(productLoad.getPointer(), coordinate);
+    std::optional<std::string> destination =
+        pointerBase(store.getPointer(), coordinate);
+    std::string weightExpression = expression(weight);
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    if (!base || !product || !destination || weightExpression.empty() ||
+        begin.spelling.empty() || end.spelling.empty())
+      return mlir::failure();
+
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string baseVector = fresh("update_base");
+    std::string productVector = fresh("update_value");
+    std::string result = fresh("update_f16");
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat16m8_t " + baseVector + " = __riscv_vle16_v_f16m8(" + *base +
+         " + " + strip + ", " + vl + ");");
+    line("vfloat16m8_t " + productVector +
+         " = __riscv_vle16_v_f16m8(" + *product + " + " + strip + ", " + vl +
+         ");");
+    line("vfloat16m8_t " + result + " = __riscv_vfmacc_vf_f16m8(" +
+         baseVector + ", " + weightExpression + ", " + productVector + ", " +
+         vl + ");");
+    line("__riscv_vse16_v_f16m8(" + *destination + " + " + strip + ", " +
+         result + ", " + vl + ");");
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult tryEmitF16ToF32NormalizeVLA(VLAOp op) {
+    if (op.getNumResults() != 0)
+      return mlir::failure();
+    mlir::Block &body = op.getBody().front();
+    StoreOp store;
+    unsigned loadCount = 0;
+    unsigned castCount = 0;
+    unsigned binaryCount = 0;
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
+        if (store)
+          return mlir::failure();
+        store = candidate;
+      } else if (mlir::isa<LoadOp>(nested))
+        ++loadCount;
+      else if (mlir::isa<CastOp>(nested))
+        ++castCount;
+      else if (mlir::isa<BinaryOp>(nested))
+        ++binaryCount;
+      else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
+        return mlir::failure();
+    }
+    if (loadCount != 1 || castCount != 1 || binaryCount != 1)
+      return mlir::failure();
+    if (!store || !isTrue(store.getWhere()) ||
+        !elementType(store.getValue().getType()).isF32())
+      return mlir::failure();
+    auto divide = store.getValue().getDefiningOp<BinaryOp>();
+    if (!divide || divide.getKind() != "div")
+      return mlir::failure();
+    auto cast = divide.getLhs().getDefiningOp<CastOp>();
+    if (!cast || !elementType(cast.getResult().getType()).isF32())
+      return mlir::failure();
+    auto load = cast.getInput().getDefiningOp<LoadOp>();
+    if (!load || !isTrue(load.getWhere()) ||
+        !isF16(elementType(load.getResult().getType())))
+      return mlir::failure();
+
+    mlir::Value coordinate = body.getArgument(0);
+    if (!valueDependsOn(load.getPointer(), coordinate) ||
+        !valueDependsOn(store.getPointer(), coordinate))
+      return mlir::failure();
+    std::optional<std::string> source =
+        pointerBase(load.getPointer(), coordinate);
+    std::optional<std::string> destination =
+        pointerBase(store.getPointer(), coordinate);
+    std::string divisor = expression(divide.getRhs());
+    CValue begin = require(op.getBegin());
+    CValue end = require(op.getEnd());
+    if (!source || !destination || divisor.empty() || begin.spelling.empty() ||
+        end.spelling.empty())
+      return mlir::failure();
+
+    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
+    std::string vl = fresh("vl");
+    std::string half = fresh("load_f16");
+    std::string wide = fresh("widen_f32");
+    std::string normalized = fresh("normalize_f32");
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + end.spelling +
+         " - " + strip + ");");
+    line("vfloat16m4_t " + half + " = __riscv_vle16_v_f16m4(" + *source +
+         " + " + strip + ", " + vl + ");");
+    line("vfloat32m8_t " + wide + " = __riscv_vfwcvt_f_f_v_f32m8(" + half +
+         ", " + vl + ");");
+    line("vfloat32m8_t " + normalized + " = __riscv_vfdiv_vf_f32m8(" + wide +
+         ", " + divisor + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m8(" + *destination + " + " + strip + ", " +
+         normalized + ", " + vl + ");");
+    line(strip + " += " + vl + ";");
     --indent;
     line("}");
     return mlir::success();
@@ -547,6 +1041,16 @@ private:
     if (!options.target.hasRVV)
       return op.emitError(
           "VLA requires RVV on the selected target; no scalar fallback exists");
+    if (mlir::succeeded(tryEmitF32ToF16VLA(op)))
+      return mlir::success();
+    if (mlir::succeeded(tryEmitF16FillVLA(op)))
+      return mlir::success();
+    if (mlir::succeeded(tryEmitWideningF16DotVLA(op)))
+      return mlir::success();
+    if (mlir::succeeded(tryEmitF16WeightedUpdateVLA(op)))
+      return mlir::success();
+    if (mlir::succeeded(tryEmitF16ToF32NormalizeVLA(op)))
+      return mlir::success();
     if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
       return mlir::success();
     mlir::Block &body = op.getBody().front();
@@ -680,6 +1184,25 @@ private:
         materialized.spelling.empty())
       return std::nullopt;
     return materialized.spelling;
+  }
+
+  bool valueDependsOn(mlir::Value value, mlir::Value target,
+                      llvm::DenseSet<mlir::Value> &visited) const {
+    if (value == target)
+      return true;
+    if (!value || !visited.insert(value).second)
+      return false;
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return false;
+    return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
+      return valueDependsOn(operand, target, visited);
+    });
+  }
+
+  bool valueDependsOn(mlir::Value value, mlir::Value target) const {
+    llvm::DenseSet<mlir::Value> visited;
+    return valueDependsOn(value, target, visited);
   }
 
   bool sameBound(mlir::Value lhs, mlir::Value rhs) {
@@ -940,8 +1463,8 @@ private:
           scalarBinary(op.getKind(), lhs.spelling, rhs.spelling);
       if (expression.empty())
         return op.emitError("RISC-V scalar lowering does not implement binary kind");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::Scalar, expression};
+      values[op.getResult()] = scalarExpression(
+          op.getResult(), std::move(expression), "scalar");
       return mlir::success();
     }
     if (!inVLA || (!elementType(op.getResult().getType()).isF32()))
@@ -1027,8 +1550,8 @@ private:
     else
       return op.emitError(
           "RISC-V scalar lowering does not implement unary kind");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::Scalar, expression};
+    values[op.getResult()] = scalarExpression(
+        op.getResult(), std::move(expression), "unary", op.getKind() == "exp");
     return mlir::success();
   }
 
@@ -1057,14 +1580,23 @@ private:
 
   mlir::LogicalResult emitCast(CastOp op) {
     CValue input = require(op.getInput());
+    if (input.kind == CValueKind::F16Vector &&
+        elementType(op.getResult().getType()).isF32()) {
+      std::string name = fresh("widen_f16");
+      line("vfloat32m2_t " + name + " = __riscv_vfwcvt_f_f_v_f32m2(" +
+           input.spelling + ", " + activeVL + ");");
+      values[op.getResult()] =
+          CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+      return mlir::success();
+    }
     if (input.kind != CValueKind::Scalar)
       return op.emitError("RVV cast lowering is not implemented yet");
     std::string target = scalarCType(elementType(op.getResult().getType()));
     if (target.empty())
       return op.emitError("cast target type is unsupported");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::Scalar,
-               "((" + target + ")(" + input.spelling + "))"};
+    values[op.getResult()] = scalarExpression(
+        op.getResult(), "((" + target + ")(" + input.spelling + "))",
+        "cast");
     return mlir::success();
   }
 
@@ -1149,22 +1681,35 @@ private:
     if (pointer.kind != CValueKind::Pointer || pointer.spelling.empty())
       return op.emitError("load pointer is unavailable");
     if (inVLA && pointer.lanePointer) {
-      if (!elementType(op.getResult().getType()).isF32() ||
+      mlir::Type loadedElement = elementType(op.getResult().getType());
+      if ((!loadedElement.isF32() && !isF16(loadedElement)) ||
           !isTrue(op.getWhere()) ||
           !mlir::isa<mlir::NoneType>(op.getOther().getType()) ||
           pointer.laneStride.empty())
         return op.emitError(
             "RVV load currently requires an all-active f32 VLA value");
       std::string name = fresh("load");
-      if (pointer.laneStride == "1")
-        line("vfloat32m2_t " + name + " = __riscv_vle32_v_f32m2(" +
-             pointer.spelling + ", " + activeVL + ");");
-      else
-        line("vfloat32m2_t " + name + " = __riscv_vlse32_v_f32m2(" +
-             pointer.spelling + ", (ptrdiff_t)(sizeof(float) * (" +
-             pointer.laneStride + ")), " + activeVL + ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+      if (loadedElement.isF32()) {
+        if (pointer.laneStride == "1")
+          line("vfloat32m2_t " + name + " = __riscv_vle32_v_f32m2(" +
+               pointer.spelling + ", " + activeVL + ");");
+        else
+          line("vfloat32m2_t " + name + " = __riscv_vlse32_v_f32m2(" +
+               pointer.spelling + ", (ptrdiff_t)(sizeof(float) * (" +
+               pointer.laneStride + ")), " + activeVL + ");");
+        values[op.getResult()] =
+            CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+      } else {
+        if (pointer.laneStride == "1")
+          line("vfloat16m1_t " + name + " = __riscv_vle16_v_f16m1(" +
+               pointer.spelling + ", " + activeVL + ");");
+        else
+          line("vfloat16m1_t " + name + " = __riscv_vlse16_v_f16m1(" +
+               pointer.spelling + ", (ptrdiff_t)(sizeof(_Float16) * (" +
+               pointer.laneStride + ")), " + activeVL + ");");
+        values[op.getResult()] =
+            CValue{op.getResult().getType(), CValueKind::F16Vector, name};
+      }
       return mlir::success();
     }
     CValue where = require(op.getWhere());
@@ -1178,8 +1723,8 @@ private:
                    other.spelling + ")";
     else
       return op.emitError("masked scalar load requires an explicit other value");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::Scalar, expression};
+    values[op.getResult()] = scalarExpression(
+        op.getResult(), std::move(expression), "load");
     return mlir::success();
   }
 
