@@ -26,6 +26,9 @@ typedef struct {
   size_t k;
 } projection;
 
+enum { EVICTION_BYTES = 64 * 1024 * 1024 };
+static volatile uint64_t eviction_sink;
+
 static const projection projections[] = {
     {"attn_q", "blk.0.attn_q.weight", 4096, 4096},
     {"attn_k", "blk.0.attn_k.weight", 1024, 4096},
@@ -66,6 +69,27 @@ static double now_seconds(void) {
   struct timespec value;
   clock_gettime(CLOCK_MONOTONIC, &value);
   return (double)value.tv_sec + (double)value.tv_nsec * 1.0e-9;
+}
+
+static void evict(uint8_t *buffer) {
+  for (size_t index = 0; index < EVICTION_BYTES; index += 64) {
+    buffer[index] = (uint8_t)(buffer[index] + 1u);
+    eviction_sink += buffer[index];
+  }
+}
+
+static int compare_double(const void *lhs, const void *rhs) {
+  const double left = *(const double *)lhs;
+  const double right = *(const double *)rhs;
+  return (left > right) - (left < right);
+}
+
+static double median(double *samples, size_t count) {
+  qsort(samples, count, sizeof(*samples), compare_double);
+  const size_t middle = count / 2;
+  return count % 2 == 0
+             ? (samples[middle - 1] + samples[middle]) * 0.5
+             : samples[middle];
 }
 
 static void initialize_weights(block_q4_K *weights, size_t count) {
@@ -180,18 +204,26 @@ int main(int argc, char **argv) {
   block_q8_K *activations = malloc(activation_blocks * sizeof(*activations));
   float *weft_output = malloc(output_elements * sizeof(*weft_output));
   float *ggml_output = malloc(output_elements * sizeof(*ggml_output));
+  uint8_t *eviction = malloc(EVICTION_BYTES);
+  double *weft_samples = malloc(repetitions * sizeof(*weft_samples));
+  double *ggml_samples = malloc(repetitions * sizeof(*ggml_samples));
   if (weights == NULL || activations == NULL || weft_output == NULL ||
-      ggml_output == NULL) {
+      ggml_output == NULL || eviction == NULL || weft_samples == NULL ||
+      ggml_samples == NULL) {
     fprintf(stderr, "failed to allocate model-scale projection buffers\n");
     free(weights);
     free(activations);
     free(weft_output);
     free(ggml_output);
+    free(eviction);
+    free(weft_samples);
+    free(ggml_samples);
     return 1;
   }
 
   initialize_weights(weights, weight_blocks);
   initialize_activations(activations, activation_blocks);
+  memset(eviction, 1, EVICTION_BYTES);
 
   run_weft(weights, activations, weft_output, m, n, k_blocks);
   run_ggml(weights, activations, ggml_output, m, n, k, k_blocks);
@@ -220,24 +252,27 @@ int main(int argc, char **argv) {
       free(activations);
       free(weft_output);
       free(ggml_output);
+      free(eviction);
+      free(weft_samples);
+      free(ggml_samples);
       return 1;
     }
   }
 
-  double weft_total = 0.0;
-  double ggml_total = 0.0;
   for (size_t repetition = 0; repetition < repetitions; ++repetition) {
+    evict(eviction);
     double begin = now_seconds();
     run_weft(weights, activations, weft_output, m, n, k_blocks);
-    weft_total += now_seconds() - begin;
+    weft_samples[repetition] = now_seconds() - begin;
 
+    evict(eviction);
     begin = now_seconds();
     run_ggml(weights, activations, ggml_output, m, n, k, k_blocks);
-    ggml_total += now_seconds() - begin;
+    ggml_samples[repetition] = now_seconds() - begin;
   }
 
-  const double weft_seconds = weft_total / (double)repetitions;
-  const double ggml_seconds = ggml_total / (double)repetitions;
+  const double weft_seconds = median(weft_samples, repetitions);
+  const double ggml_seconds = median(ggml_samples, repetitions);
   const double operations = 2.0 * (double)m * (double)n * (double)k;
 
   printf("kernel=q4_K_q8_K\n");
@@ -246,6 +281,7 @@ int main(int argc, char **argv) {
   printf("phase=%s\n", argv[2]);
   printf("M=%zu\nN=%zu\nK=%zu\n", m, n, k);
   printf("scope=single-thread-full-projection-block-dot\n");
+  printf("timing=cold-cache-64MiB-eviction-median\n");
   printf("repetitions=%zu\n", repetitions);
   printf("max_absolute_error=%.9g\n", max_absolute_error);
   printf("max_relative_error=%.9g\n", max_relative_error);
@@ -259,5 +295,8 @@ int main(int argc, char **argv) {
   free(activations);
   free(weft_output);
   free(ggml_output);
+  free(eviction);
+  free(weft_samples);
+  free(ggml_samples);
   return 0;
 }

@@ -33,6 +33,32 @@ enum class CValueKind {
   Tuple,
 };
 
+enum class BlockValueKind {
+  Scalar,
+  Pointer,
+  Index,
+  U8,
+  I8,
+  U16,
+  I16,
+  I32,
+  Mask,
+  Tuple,
+};
+
+struct BlockValue {
+  mlir::Type type;
+  BlockValueKind kind = BlockValueKind::Scalar;
+  std::string spelling;
+  std::string pointerBase;
+  std::string pointerIndex;
+  std::string contiguousIndex;
+  std::vector<BlockValue> fields;
+  BlockValueKind narrowKind = BlockValueKind::Scalar;
+  std::string narrowSpelling;
+  std::optional<uint64_t> unsignedMaximum;
+};
+
 struct CValue {
   mlir::Type type;
   CValueKind kind = CValueKind::Scalar;
@@ -61,6 +87,21 @@ mlir::Type elementType(mlir::Type type) {
   if (auto block = mlir::dyn_cast<BlockType>(type))
     return block.getElementType();
   return type;
+}
+
+bool containsBlockType(mlir::Type type) {
+  if (auto masked = mlir::dyn_cast<MaskedType>(type))
+    return containsBlockType(masked.getValueType());
+  if (mlir::isa<BlockType>(type))
+    return true;
+  if (auto tuple = mlir::dyn_cast<TupleType>(type))
+    return llvm::any_of(tuple.getTypes(), containsBlockType);
+  return false;
+}
+
+bool hasBlockPayload(mlir::Operation *operation) {
+  return llvm::any_of(operation->getOperandTypes(), containsBlockType) ||
+         llvm::any_of(operation->getResultTypes(), containsBlockType);
 }
 
 bool isF16(mlir::Type type) {
@@ -273,6 +314,12 @@ public:
       if (mlir::failed(emitOperation(&operation)))
         return mlir::failure();
     }
+    for (mlir::Operation *operation : deferredBlockOps)
+      if (!loweredBlockOps.contains(operation) &&
+          !llvm::all_of(operation->getResults(),
+                        [](mlir::Value value) { return value.use_empty(); }))
+        return operation->emitError(
+            "logical block is not owned by a supported target lowering");
     --indent;
     line("}");
     line("");
@@ -285,6 +332,8 @@ private:
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
   llvm::DenseSet<mlir::Operation *> consumed;
+  llvm::DenseSet<mlir::Operation *> deferredBlockOps;
+  llvm::DenseSet<mlir::Operation *> loweredBlockOps;
   unsigned indent = 0;
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
@@ -321,6 +370,12 @@ private:
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
     if (consumed.contains(operation))
       return mlir::success();
+    if (auto op = mlir::dyn_cast<ReduceOp>(operation))
+      return emitReduce(op);
+    if (hasBlockPayload(operation)) {
+      deferredBlockOps.insert(operation);
+      return mlir::success();
+    }
     if (auto op = mlir::dyn_cast<ConstantOp>(operation))
       return emitConstant(op);
     if (auto op = mlir::dyn_cast<MetaValueOp>(operation))
@@ -339,6 +394,8 @@ private:
       return emitCompare(op);
     if (auto op = mlir::dyn_cast<CastOp>(operation))
       return emitCast(op);
+    if (auto op = mlir::dyn_cast<BitcastOp>(operation))
+      return emitBitcast(op);
     if (auto op = mlir::dyn_cast<SelectOp>(operation))
       return emitSelect(op);
     if (auto op = mlir::dyn_cast<TupleOp>(operation))
@@ -356,15 +413,14 @@ private:
       return emitLoad(op);
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       return emitStore(op);
-    if (auto op = mlir::dyn_cast<ReduceOp>(operation))
-      return emitReduce(op);
     if (auto op = mlir::dyn_cast<SummaryFoldOp>(operation))
       return op.emitError(
           "summary_fold must be lowered by its enclosing VLA region");
     if (mlir::isa<YieldOp, ReturnOp>(operation))
       return mlir::success();
-    return operation->emitError(
-        "RISC-V target lowering does not implement this Kernel IR primitive");
+    return operation->emitError()
+           << "RISC-V target lowering does not implement Kernel IR primitive "
+           << operation->getName();
   }
 
   mlir::LogicalResult emitConstant(ConstantOp op) {
@@ -413,6 +469,40 @@ private:
     if (lower.spelling.empty() || upper.spelling.empty() ||
         step.spelling.empty())
       return op.emitError("ordered range has unavailable bounds");
+    std::optional<int64_t> constantLower = integerConstant(op.getLower());
+    std::optional<int64_t> constantUpper = integerConstant(op.getUpper());
+    std::optional<int64_t> constantStep = integerConstant(op.getStep());
+    if (constantLower && constantUpper && constantStep && *constantStep > 0 &&
+        *constantUpper >= *constantLower &&
+        (*constantUpper - *constantLower + *constantStep - 1) / *constantStep <=
+            8) {
+      mlir::Block &body = op.getBody().front();
+      llvm::DenseSet<mlir::Operation *> consumedBefore = consumed;
+      for (int64_t induction = *constantLower; induction < *constantUpper;
+           induction += *constantStep) {
+        consumed = consumedBefore;
+        values[body.getArgument(0)] =
+            CValue{body.getArgument(0).getType(), CValueKind::Scalar,
+                   std::to_string(induction)};
+        for (auto [argument, value] :
+             llvm::zip(body.getArguments().drop_front(), carried))
+          values[argument] = value;
+        for (mlir::Operation &nested : body.without_terminator())
+          if (mlir::failed(emitOperation(&nested)))
+            return mlir::failure();
+        auto yield = mlir::cast<YieldOp>(body.getTerminator());
+        for (auto [destination, yielded] :
+             llvm::zip(carried, yield.getOperands())) {
+          CValue value = require(yielded);
+          if (value.spelling.empty())
+            return yield.emitError(
+                "unrolled ordered range yielded an unavailable value");
+          line(destination.spelling + " = " + value.spelling + ";");
+        }
+      }
+      consumed = consumedBefore;
+      return mlir::success();
+    }
     std::string induction = "__weft_i" + std::to_string(nextLoop++);
     line("for (size_t " + induction + " = " + lower.spelling + "; " +
          induction + " < " + upper.spelling + "; " + induction + " += " +
@@ -924,6 +1014,29 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult emitBitcast(BitcastOp op) {
+    CValue input = require(op.getInput());
+    if (input.kind != CValueKind::Scalar || input.spelling.empty())
+      return op.emitError("RVV bitcast lowering requires a scalar input");
+    mlir::Type source = elementType(op.getInput().getType());
+    mlir::Type target = elementType(op.getResult().getType());
+    std::string helper;
+    if (source.isUnsignedInteger(8) && target.isSignedInteger(8))
+      helper = "__weft_bitcast_u8_i8";
+    else if (source.isUnsignedInteger(16) && target.isSignedInteger(16))
+      helper = "__weft_bitcast_u16_i16";
+    else if (source.isUnsignedInteger(16) && isF16(target))
+      helper = "__weft_bitcast_u16_f16";
+    else if (source.isUnsignedInteger(32) && target.isF32())
+      helper = "__weft_bitcast_u32_f32";
+    else
+      return op.emitError("RISC-V scalar bitcast pair is unsupported");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar,
+               helper + "(" + input.spelling + ")"};
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitSelect(SelectOp op) {
     CValue predicate = require(op.getPredicate());
     CValue trueValue = require(op.getTrueValue());
@@ -1034,11 +1147,799 @@ private:
     return mlir::success();
   }
 
+  BlockValue lookupBlockValue(
+      mlir::Value value,
+      const llvm::DenseMap<mlir::Value, BlockValue> &blockValues) const {
+    auto found = blockValues.find(value);
+    if (found != blockValues.end())
+      return found->second;
+    CValue scalar = require(value);
+    BlockValue result;
+    result.type = value.getType();
+    result.spelling = scalar.spelling;
+    if (scalar.kind == CValueKind::Pointer) {
+      result.kind = BlockValueKind::Pointer;
+      result.pointerBase = scalar.spelling;
+    }
+    return result;
+  }
+
+  std::optional<int64_t> integerConstant(mlir::Value value) const {
+    auto constant = value.getDefiningOp<ConstantOp>();
+    auto integer = constant
+                       ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                       : mlir::IntegerAttr{};
+    if (!integer)
+      return std::nullopt;
+    return integer.getInt();
+  }
+
+  void markDiscardedBlockTree(mlir::Value value) {
+    if (!containsBlockType(value.getType()))
+      return;
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition || !loweredBlockOps.insert(definition).second)
+      return;
+    for (mlir::Value operand : definition->getOperands())
+      markDiscardedBlockTree(operand);
+  }
+
+  mlir::LogicalResult collectBlockClosure(
+      mlir::Value value, llvm::DenseSet<mlir::Operation *> &closure,
+      llvm::SmallVectorImpl<BlockAxisOp> &axes, ReduceOp owner) {
+    if (!containsBlockType(value.getType()))
+      return mlir::success();
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return owner.emitError(
+          "block reduction cannot capture a block argument from another region");
+    if (!closure.insert(definition).second)
+      return mlir::success();
+    if (definition->getBlock() != owner->getBlock())
+      return owner.emitError(
+          "block reduction producer closure crosses a region boundary");
+    if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
+      auto tuple = get.getInput().getDefiningOp<TupleOp>();
+      if (!tuple)
+        return get.emitError(
+            "block tuple projection requires a local tuple producer");
+      closure.insert(tuple.getOperation());
+      for (auto [index, operand] : llvm::enumerate(tuple.getOperands())) {
+        if (static_cast<int64_t>(index) == get.getIndex()) {
+          if (mlir::failed(collectBlockClosure(operand, closure, axes, owner)))
+            return mlir::failure();
+          continue;
+        }
+        bool fieldIsLive = llvm::any_of(
+            tuple.getResult().getUsers(), [&](mlir::Operation *user) {
+              auto otherGet = mlir::dyn_cast<TupleGetOp>(user);
+              return otherGet && otherGet.getIndex() ==
+                                     static_cast<int64_t>(index) &&
+                     !otherGet.getResult().use_empty();
+            });
+        if (!fieldIsLive)
+          markDiscardedBlockTree(operand);
+      }
+      return mlir::success();
+    }
+    if (auto axis = mlir::dyn_cast<BlockAxisOp>(definition))
+      axes.push_back(axis);
+    for (mlir::Value operand : definition->getOperands())
+      if (containsBlockType(operand.getType()) &&
+          mlir::failed(collectBlockClosure(operand, closure, axes, owner)))
+        return mlir::failure();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockPtrAdd(
+      PtrAddOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue base = lookupBlockValue(op.getBase(), blockValues);
+    BlockValue offset = lookupBlockValue(op.getOffset(), blockValues);
+    if (base.kind != BlockValueKind::Pointer || base.pointerBase.empty())
+      return op.emitError("block pointer addition has no scalar pointer base");
+    BlockValue result;
+    result.type = op.getResult().getType();
+    result.kind = BlockValueKind::Pointer;
+    result.pointerBase = base.pointerBase;
+    result.pointerIndex = base.pointerIndex;
+    result.contiguousIndex = base.contiguousIndex;
+    if (offset.kind == BlockValueKind::Scalar) {
+      if (offset.spelling.empty())
+        return op.emitError("block pointer has an unavailable scalar offset");
+      result.pointerBase = "(" + result.pointerBase + " + " + offset.spelling + ")";
+    } else if (offset.kind == BlockValueKind::Index) {
+      if (!result.pointerIndex.empty())
+        return op.emitError("nested vector pointer offsets are not implemented");
+      result.pointerIndex = offset.spelling;
+      result.contiguousIndex = offset.contiguousIndex;
+    } else {
+      return op.emitError("block pointer offset must be scalar or logical index");
+    }
+    (void)vl;
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockIndexBinary(
+      BinaryOp op, BlockValue lhs, BlockValue rhs,
+      llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    bool lhsVector = lhs.kind == BlockValueKind::Index;
+    bool rhsVector = rhs.kind == BlockValueKind::Index;
+    if (!lhsVector && rhsVector &&
+        (op.getKind() == "add" || op.getKind() == "mul" ||
+         op.getKind() == "and" || op.getKind() == "or")) {
+      std::swap(lhs, rhs);
+      std::swap(lhsVector, rhsVector);
+    }
+    if (!lhsVector)
+      return op.emitError("logical-index binary requires a vector left operand");
+    std::string intrinsic;
+    std::string rhsSpelling = rhs.spelling;
+    if (rhsVector) {
+      intrinsic = llvm::StringSwitch<std::string>(op.getKind())
+                      .Case("add", "__riscv_vadd_vv_u16m2")
+                      .Case("sub", "__riscv_vsub_vv_u16m2")
+                      .Case("mul", "__riscv_vmul_vv_u16m2")
+                      .Case("and", "__riscv_vand_vv_u16m2")
+                      .Case("or", "__riscv_vor_vv_u16m2")
+                      .Default("");
+    } else {
+      if (rhs.spelling.empty())
+        return op.emitError("logical-index binary has an unavailable scalar");
+      std::optional<int64_t> constant = integerConstant(op.getRhs());
+      if ((op.getKind() == "div" || op.getKind() == "mod") && constant &&
+          *constant > 0 && ((*constant & (*constant - 1)) == 0)) {
+        unsigned shift = 0;
+        for (uint64_t value = static_cast<uint64_t>(*constant); value > 1;
+             value >>= 1)
+          ++shift;
+        if (op.getKind() == "div") {
+          intrinsic = "__riscv_vsrl_vx_u16m2";
+          rhsSpelling = std::to_string(shift);
+        } else {
+          intrinsic = "__riscv_vand_vx_u16m2";
+          rhsSpelling = std::to_string(*constant - 1);
+        }
+      } else {
+        intrinsic = llvm::StringSwitch<std::string>(op.getKind())
+                        .Case("add", "__riscv_vadd_vx_u16m2")
+                        .Case("sub", "__riscv_vsub_vx_u16m2")
+                        .Case("mul", "__riscv_vmul_vx_u16m2")
+                        .Case("div", "__riscv_vdivu_vx_u16m2")
+                        .Case("mod", "__riscv_vremu_vx_u16m2")
+                        .Case("and", "__riscv_vand_vx_u16m2")
+                        .Case("or", "__riscv_vor_vx_u16m2")
+                        .Case("shl", "__riscv_vsll_vx_u16m2")
+                        .Case("shr", "__riscv_vsrl_vx_u16m2")
+                        .Default("");
+      }
+    }
+    if (intrinsic.empty())
+      return op.emitError("RVV logical-index binary kind is unsupported");
+    std::string name = fresh("block_index");
+    line("vuint16m2_t " + name + " = " + intrinsic + "(" + lhs.spelling +
+         ", " + rhsSpelling + ", " + vl.str() + ");");
+    BlockValue result{op.getResult().getType(), BlockValueKind::Index, name};
+    if (!rhsVector && op.getKind() == "add" &&
+        !lhs.contiguousIndex.empty())
+      result.contiguousIndex =
+          "(" + lhs.contiguousIndex + " + " + rhsSpelling + ")";
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult materializeI32(BlockValue &value,
+                                     mlir::Operation *owner,
+                                     llvm::StringRef vl) {
+    if (value.kind != BlockValueKind::I32 || !value.spelling.empty())
+      return mlir::success();
+    std::string name = fresh("block_i32");
+    if (value.narrowKind == BlockValueKind::U8) {
+      std::string extended = fresh("block_u32");
+      line("vuint32m4_t " + extended + " = __riscv_vzext_vf4_u32m4(" +
+           value.narrowSpelling + ", " + vl.str() + ");");
+      line("vint32m4_t " + name +
+           " = __riscv_vreinterpret_v_u32m4_i32m4(" + extended + ");");
+    } else if (value.narrowKind == BlockValueKind::I8) {
+      line("vint32m4_t " + name + " = __riscv_vsext_vf4_i32m4(" +
+           value.narrowSpelling + ", " + vl.str() + ");");
+    } else {
+      return owner->emitError(
+          "deferred i32 block value has no legal widening source");
+    }
+    value.spelling = name;
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockIntegerBinary(
+      BinaryOp op, BlockValue lhs, BlockValue rhs, BlockValueKind resultKind,
+      llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    bool lhsVector = lhs.kind == resultKind;
+    bool rhsVector = rhs.kind == resultKind;
+    if (!lhsVector && rhsVector &&
+        (op.getKind() == "add" || op.getKind() == "mul" ||
+         op.getKind() == "and" || op.getKind() == "or" ||
+         op.getKind() == "xor")) {
+      std::swap(lhs, rhs);
+      std::swap(lhsVector, rhsVector);
+    }
+    if (!lhsVector)
+      return op.emitError("integer block binary requires a vector operand");
+
+    auto isNarrowI8 = [](const BlockValue &value) {
+      return value.kind == BlockValueKind::I32 &&
+             value.narrowKind == BlockValueKind::I8 &&
+             !value.narrowSpelling.empty();
+    };
+    auto isSmallU8 = [](const BlockValue &value) {
+      return value.kind == BlockValueKind::I32 &&
+             value.narrowKind == BlockValueKind::U8 &&
+             !value.narrowSpelling.empty() && value.unsignedMaximum &&
+             *value.unsignedMaximum <= 15;
+    };
+    if (resultKind == BlockValueKind::I32 && rhsVector &&
+        op.getKind() == "mul" &&
+        ((isSmallU8(lhs) && isNarrowI8(rhs)) ||
+         (isNarrowI8(lhs) && isSmallU8(rhs)))) {
+      BlockValue small = isSmallU8(lhs) ? lhs : rhs;
+      BlockValue signedValue = isNarrowI8(lhs) ? lhs : rhs;
+      std::string signedSmall = fresh("block_i8");
+      std::string name = fresh("block_i16_product");
+      line("vint8m1_t " + signedSmall +
+           " = __riscv_vreinterpret_v_u8m1_i8m1(" + small.narrowSpelling +
+           ");");
+      line("vint16m2_t " + name + " = __riscv_vwmul_vv_i16m2(" +
+           signedSmall + ", " + signedValue.narrowSpelling + ", " + vl.str() +
+           ");");
+      blockValues[op.getResult()] =
+          BlockValue{op.getResult().getType(), BlockValueKind::I16, name};
+      return mlir::success();
+    }
+    if (resultKind == BlockValueKind::I32) {
+      if (mlir::failed(materializeI32(lhs, op.getOperation(), vl)) ||
+          mlir::failed(materializeI32(rhs, op.getOperation(), vl)))
+        return mlir::failure();
+    }
+
+    std::string suffix;
+    std::string cType;
+    if (resultKind == BlockValueKind::U8) {
+      suffix = "u8m1";
+      cType = "vuint8m1_t";
+    } else if (resultKind == BlockValueKind::U16) {
+      suffix = "u16m2";
+      cType = "vuint16m2_t";
+    } else if (resultKind == BlockValueKind::I32) {
+      suffix = "i32m4";
+      cType = "vint32m4_t";
+    } else {
+      return op.emitError("integer block type has no physical RVV mapping");
+    }
+    llvm::StringRef form = rhsVector ? "vv" : "vx";
+    std::string stem = llvm::StringSwitch<std::string>(op.getKind())
+                           .Case("add", "vadd")
+                           .Case("sub", "vsub")
+                           .Case("mul", "vmul")
+                           .Case("and", "vand")
+                           .Case("or", "vor")
+                           .Case("xor", "vxor")
+                           .Case("shl", "vsll")
+                           .Case("shr", resultKind == BlockValueKind::I32
+                                            ? "vsra"
+                                            : "vsrl")
+                           .Default("");
+    if (stem.empty() || (!rhsVector && rhs.spelling.empty()))
+      return op.emitError("RVV integer block binary kind is unsupported");
+    std::string name = fresh("block_v");
+    line(cType + " " + name + " = __riscv_" + stem + "_" + form.str() +
+         "_" + suffix + "(" + lhs.spelling + ", " + rhs.spelling + ", " +
+         vl.str() + ");");
+    BlockValue result{op.getResult().getType(), resultKind, name};
+    if (resultKind == BlockValueKind::U8 && op.getKind() == "and") {
+      std::optional<int64_t> mask = integerConstant(op.getRhs());
+      if (mask && *mask >= 0)
+        result.unsignedMaximum = static_cast<uint64_t>(*mask);
+    } else if (resultKind == BlockValueKind::U8 && op.getKind() == "shr") {
+      std::optional<int64_t> shift = integerConstant(op.getRhs());
+      if (shift && *shift >= 0 && *shift < 8)
+        result.unsignedMaximum =
+            lhs.unsignedMaximum.value_or(255) >> static_cast<unsigned>(*shift);
+    }
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockBinary(
+      BinaryOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue lhs = lookupBlockValue(op.getLhs(), blockValues);
+    BlockValue rhs = lookupBlockValue(op.getRhs(), blockValues);
+    mlir::Type resultElement = elementType(op.getResult().getType());
+    if (resultElement.isIndex())
+      return emitBlockIndexBinary(op, lhs, rhs, blockValues, vl);
+    if (resultElement.isUnsignedInteger(8))
+      return emitBlockIntegerBinary(op, lhs, rhs, BlockValueKind::U8,
+                                    blockValues, vl);
+    if (resultElement.isUnsignedInteger(16))
+      return emitBlockIntegerBinary(op, lhs, rhs, BlockValueKind::U16,
+                                    blockValues, vl);
+    if (resultElement.isSignedInteger(32))
+      return emitBlockIntegerBinary(op, lhs, rhs, BlockValueKind::I32,
+                                    blockValues, vl);
+    return op.emitError("RVV block binary element type is unsupported");
+  }
+
+  mlir::LogicalResult emitBlockCompare(
+      CompareOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue lhs = lookupBlockValue(op.getLhs(), blockValues);
+    BlockValue rhs = lookupBlockValue(op.getRhs(), blockValues);
+    if (lhs.kind != BlockValueKind::Index ||
+        rhs.kind != BlockValueKind::Scalar || rhs.spelling.empty())
+      return op.emitError(
+          "RVV block comparison currently requires index-vector vs scalar");
+    std::string intrinsic =
+        llvm::StringSwitch<std::string>(op.getPredicate())
+            .Case("lt", "__riscv_vmsltu_vx_u16m2_b8")
+            .Case("le", "__riscv_vmsleu_vx_u16m2_b8")
+            .Case("gt", "__riscv_vmsgtu_vx_u16m2_b8")
+            .Case("ge", "__riscv_vmsgeu_vx_u16m2_b8")
+            .Case("eq", "__riscv_vmseq_vx_u16m2_b8")
+            .Case("ne", "__riscv_vmsne_vx_u16m2_b8")
+            .Default("");
+    if (intrinsic.empty())
+      return op.emitError("RVV block comparison predicate is unsupported");
+    std::string name = fresh("block_mask");
+    line("vbool8_t " + name + " = " + intrinsic + "(" + lhs.spelling + ", " +
+         rhs.spelling + ", " + vl.str() + ");");
+    blockValues[op.getResult()] =
+        BlockValue{op.getResult().getType(), BlockValueKind::Mask, name};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockCast(
+      CastOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue input = lookupBlockValue(op.getInput(), blockValues);
+    mlir::Type target = elementType(op.getResult().getType());
+    std::string name = fresh("block_cast");
+    BlockValueKind kind;
+    if (input.kind == BlockValueKind::Index && target.isUnsignedInteger(8)) {
+      kind = BlockValueKind::U8;
+      line("vuint8m1_t " + name + " = __riscv_vncvt_x_x_w_u8m1(" +
+           input.spelling + ", " + vl.str() + ");");
+    } else if (input.kind == BlockValueKind::U8 &&
+               target.isUnsignedInteger(16)) {
+      kind = BlockValueKind::U16;
+      line("vuint16m2_t " + name + " = __riscv_vzext_vf2_u16m2(" +
+           input.spelling + ", " + vl.str() + ");");
+    } else if (input.kind == BlockValueKind::U8 &&
+               target.isSignedInteger(32)) {
+      kind = BlockValueKind::I32;
+      name.clear();
+    } else if (input.kind == BlockValueKind::I8 &&
+               target.isSignedInteger(32)) {
+      kind = BlockValueKind::I32;
+      name.clear();
+    } else if (input.kind == BlockValueKind::U16 &&
+               target.isSignedInteger(32)) {
+      kind = BlockValueKind::I32;
+      std::string extended = fresh("block_u32");
+      line("vuint32m4_t " + extended + " = __riscv_vzext_vf2_u32m4(" +
+           input.spelling + ", " + vl.str() + ");");
+      line("vint32m4_t " + name +
+           " = __riscv_vreinterpret_v_u32m4_i32m4(" + extended + ");");
+    } else if (input.kind == BlockValueKind::I16 &&
+               target.isSignedInteger(32)) {
+      kind = BlockValueKind::I32;
+      line("vint32m4_t " + name + " = __riscv_vsext_vf2_i32m4(" +
+           input.spelling + ", " + vl.str() + ");");
+    } else {
+      return op.emitError("RVV block cast pair is unsupported");
+    }
+    BlockValue result{op.getResult().getType(), kind, name};
+    if (kind == BlockValueKind::I32 && name.empty()) {
+      result.narrowKind = input.kind;
+      result.narrowSpelling = input.spelling;
+      result.unsignedMaximum = input.unsignedMaximum;
+    }
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockBitcast(
+      BitcastOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues) {
+    BlockValue input = lookupBlockValue(op.getInput(), blockValues);
+    mlir::Type target = elementType(op.getResult().getType());
+    std::string name = fresh("block_bits");
+    BlockValueKind kind;
+    if (input.kind == BlockValueKind::U8 && target.isSignedInteger(8)) {
+      kind = BlockValueKind::I8;
+      line("vint8m1_t " + name +
+           " = __riscv_vreinterpret_v_u8m1_i8m1(" + input.spelling + ");");
+    } else if (input.kind == BlockValueKind::U16 &&
+               target.isSignedInteger(16)) {
+      kind = BlockValueKind::I16;
+      line("vint16m2_t " + name +
+           " = __riscv_vreinterpret_v_u16m2_i16m2(" + input.spelling + ");");
+    } else {
+      return op.emitError("RVV block bitcast pair is unsupported");
+    }
+    blockValues[op.getResult()] =
+        BlockValue{op.getResult().getType(), kind, name};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockLoad(
+      LoadOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue pointer = lookupBlockValue(op.getPointer(), blockValues);
+    BlockValue where = lookupBlockValue(op.getWhere(), blockValues);
+    BlockValue other = lookupBlockValue(op.getOther(), blockValues);
+    if (pointer.kind != BlockValueKind::Pointer || pointer.pointerBase.empty() ||
+        (pointer.pointerIndex.empty() && pointer.contiguousIndex.empty()))
+      return op.emitError("RVV block load has no vector address");
+    if (!elementType(op.getResult().getType()).isUnsignedInteger(8))
+      return op.emitError("RVV block load currently supports u8 elements");
+    std::string name = fresh("block_load");
+    bool allActive = isTrue(op.getWhere());
+    if (allActive && !pointer.contiguousIndex.empty()) {
+      line("vuint8m1_t " + name + " = __riscv_vle8_v_u8m1(" +
+           pointer.pointerBase + " + " + pointer.contiguousIndex + ", " +
+           vl.str() + ");");
+    } else if (allActive) {
+      line("vuint8m1_t " + name + " = __riscv_vluxei16_v_u8m1(" +
+           pointer.pointerBase + ", " + pointer.pointerIndex + ", " + vl.str() +
+           ");");
+    } else if (where.kind == BlockValueKind::Mask &&
+               !pointer.pointerIndex.empty() && !other.spelling.empty()) {
+      std::string maskedOff = fresh("block_other");
+      line("vuint8m1_t " + maskedOff + " = __riscv_vmv_v_x_u8m1(" +
+           other.spelling + ", " + vl.str() + ");");
+      line("vuint8m1_t " + name + " = __riscv_vluxei16_v_u8m1_mu(" +
+           where.spelling + ", " + maskedOff + ", " + pointer.pointerBase +
+           ", " + pointer.pointerIndex + ", " + vl.str() + ");");
+    } else {
+      return op.emitError("RVV masked block load address is unsupported");
+    }
+    BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
+    result.unsignedMaximum = 255;
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockSelect(
+      SelectOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue predicate = lookupBlockValue(op.getPredicate(), blockValues);
+    BlockValue trueValue = lookupBlockValue(op.getTrueValue(), blockValues);
+    BlockValue falseValue = lookupBlockValue(op.getFalseValue(), blockValues);
+    if (predicate.kind != BlockValueKind::Mask ||
+        trueValue.kind != BlockValueKind::U8 ||
+        falseValue.kind != BlockValueKind::U8)
+      return op.emitError("RVV block select currently requires mask and u8 values");
+    std::string name = fresh("block_select");
+    line("vuint8m1_t " + name + " = __riscv_vmerge_vvm_u8m1(" +
+         falseValue.spelling + ", " + trueValue.spelling + ", " +
+         predicate.spelling + ", " + vl.str() + ");");
+    blockValues[op.getResult()] =
+        BlockValue{op.getResult().getType(), BlockValueKind::U8, name};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockTuple(
+      TupleOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues) {
+    BlockValue tuple;
+    tuple.type = op.getResult().getType();
+    tuple.kind = BlockValueKind::Tuple;
+    for (mlir::Value operand : op.getOperands()) {
+      BlockValue field = lookupBlockValue(operand, blockValues);
+      tuple.fields.push_back(std::move(field));
+    }
+    blockValues[op.getResult()] = std::move(tuple);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockTupleGet(
+      TupleGetOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues) {
+    BlockValue tuple = lookupBlockValue(op.getInput(), blockValues);
+    if (tuple.kind != BlockValueKind::Tuple || op.getIndex() < 0 ||
+        static_cast<size_t>(op.getIndex()) >= tuple.fields.size())
+      return op.emitError("RVV block tuple field is unavailable");
+    BlockValue field = tuple.fields[op.getIndex()];
+    if (field.spelling.empty() && field.kind != BlockValueKind::Tuple)
+      return op.emitError("RVV block tuple field was not materialized");
+    field.type = op.getResult().getType();
+    blockValues[op.getResult()] = std::move(field);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockOperation(
+      mlir::Operation *operation,
+      llvm::DenseMap<mlir::Value, BlockValue> &blockValues, llvm::StringRef vl) {
+    if (mlir::isa<BlockAxisOp>(operation))
+      return mlir::success();
+    if (auto op = mlir::dyn_cast<PtrAddOp>(operation))
+      return emitBlockPtrAdd(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<BinaryOp>(operation))
+      return emitBlockBinary(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<CompareOp>(operation))
+      return emitBlockCompare(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<CastOp>(operation))
+      return emitBlockCast(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<BitcastOp>(operation))
+      return emitBlockBitcast(op, blockValues);
+    if (auto op = mlir::dyn_cast<LoadOp>(operation))
+      return emitBlockLoad(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<SelectOp>(operation))
+      return emitBlockSelect(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<TupleOp>(operation))
+      return emitBlockTuple(op, blockValues);
+    if (auto op = mlir::dyn_cast<TupleGetOp>(operation))
+      return emitBlockTupleGet(op, blockValues);
+    return operation->emitError(
+        "RISC-V target does not implement this block producer primitive");
+  }
+
+  mlir::LogicalResult emitBlockReduce(ReduceOp op) {
+    auto isSupportedReduction = [](ReduceOp reduction) {
+      auto input = mlir::dyn_cast<BlockType>(reduction.getInput().getType());
+      return input && input.getShape().size() == 1 &&
+             reduction.getAxis() == 0 && reduction.getKind() == "add" &&
+             reduction.getResult().getType().isSignedInteger(32) &&
+             input.getElementType().isSignedInteger(32) &&
+             isTrue(reduction.getWhere());
+    };
+    if (!isSupportedReduction(op))
+      return op.emitError(
+          "RVV block reduction currently requires all-active rank-one i32 add");
+    auto inputType = mlir::cast<BlockType>(op.getInput().getType());
+    int64_t extent = inputType.getShape().front();
+    if (extent <= 0 || extent > 65535)
+      return op.emitError(
+          "RVV block reduction requires a static extent in [1, 65535]");
+
+    llvm::DenseSet<mlir::Operation *> closure;
+    llvm::SmallVector<BlockAxisOp> firstAxes;
+    if (mlir::failed(
+            collectBlockClosure(op.getInput(), closure, firstAxes, op)))
+      return mlir::failure();
+    if (firstAxes.size() != 1)
+      return op.emitError(
+          "RVV block reduction requires exactly one local logical block axis");
+    BlockAxisOp axis = firstAxes.front();
+    auto axisType = axis.getResult().getType();
+    if (axisType.getShape().size() != 1 || axisType.getShape().front() != extent)
+      return op.emitError("block reduction extent does not match its logical axis");
+    llvm::SmallVector<ReduceOp> reductions{op};
+    for (mlir::Operation *candidate = op->getNextNode(); candidate;
+         candidate = candidate->getNextNode()) {
+      if (auto reduction = mlir::dyn_cast<ReduceOp>(candidate)) {
+        if (consumed.contains(candidate) || !isSupportedReduction(reduction))
+          break;
+        auto candidateType = mlir::cast<BlockType>(reduction.getInput().getType());
+        llvm::DenseSet<mlir::Operation *> candidateClosure;
+        llvm::SmallVector<BlockAxisOp> candidateAxes;
+        if (candidateType.getShape().front() != extent ||
+            mlir::failed(collectBlockClosure(reduction.getInput(),
+                                             candidateClosure, candidateAxes,
+                                             reduction)) ||
+            candidateAxes.size() != 1 || candidateAxes.front() != axis)
+          break;
+        reductions.push_back(reduction);
+        for (mlir::Operation *member : candidateClosure)
+          closure.insert(member);
+        continue;
+      }
+      if (hasBlockPayload(candidate) || mlir::isa<ConstantOp, InvalidOp>(candidate))
+        continue;
+      break;
+    }
+
+    llvm::DenseSet<mlir::Operation *> reductionOps;
+    for (ReduceOp reduction : reductions)
+      reductionOps.insert(reduction.getOperation());
+    for (mlir::Operation *operation : closure)
+      for (mlir::Value result : operation->getResults())
+        if (containsBlockType(result.getType()))
+          for (mlir::Operation *user : result.getUsers())
+            if (!reductionOps.contains(user) && !closure.contains(user) &&
+                !loweredBlockOps.contains(user) &&
+                !llvm::all_of(user->getResults(),
+                              [](mlir::Value value) { return value.use_empty(); }))
+              return op.emitError(
+                  "block producer escapes its operation-local reduction closure");
+
+    std::string offset = expression(axis.getOffset());
+    if (offset.empty())
+      return op.emitError("block reduction axis offset is unavailable");
+    llvm::SmallVector<std::string> accumulators;
+    for (ReduceOp reduction : reductions) {
+      std::string identity = expression(reduction.getIdentity());
+      if (identity.empty())
+        return reduction.emitError("block reduction identity is unavailable");
+      std::string accumulator = fresh("block_reduce");
+      line("int32_t " + accumulator + " = " + identity + ";");
+      accumulators.push_back(std::move(accumulator));
+    }
+    std::string strip = fresh("block_i");
+    std::string vl = fresh("block_vl");
+    std::string lane = fresh("block_lane");
+    bool needsLaneVector = llvm::any_of(
+        axis.getResult().getUsers(), [&](mlir::Operation *user) {
+          if (!closure.contains(user))
+            return false;
+          auto pointer = mlir::dyn_cast<PtrAddOp>(user);
+          return !pointer || pointer.getOffset() != axis.getResult();
+        });
+
+    if (!needsLaneVector && extent == 32) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(16);");
+      llvm::SmallVector<llvm::SmallVector<BlockValue>> stripInputs(
+          reductions.size());
+      llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
+      for (auto [index, reduction] : llvm::enumerate(reductions))
+        reductionIndices[reduction.getOperation()] = index;
+      for (int64_t stripOffset : {int64_t{0}, int64_t{16}}) {
+        llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+        BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
+                              ""};
+        coordinate.contiguousIndex =
+            "(" + std::to_string(stripOffset) + " + " + offset + ")";
+        blockValues[axis.getResult()] = std::move(coordinate);
+        for (mlir::Operation &candidate : *op->getBlock()) {
+          auto reduction = reductionIndices.find(&candidate);
+          if (reduction != reductionIndices.end()) {
+            ReduceOp current = reductions[reduction->second];
+            BlockValue input = lookupBlockValue(current.getInput(), blockValues);
+            if (input.kind == BlockValueKind::I32 &&
+                mlir::failed(
+                    materializeI32(input, current.getOperation(), vl)))
+              return mlir::failure();
+            if ((input.kind != BlockValueKind::I32 &&
+                 input.kind != BlockValueKind::I16) ||
+                input.spelling.empty())
+              return current.emitError(
+                  "fixed-strip reduction input is not an integer vector");
+            stripInputs[reduction->second].push_back(std::move(input));
+            if (&candidate == reductions.back().getOperation())
+              break;
+            continue;
+          }
+          if (!closure.contains(&candidate) ||
+              mlir::isa<BlockAxisOp>(candidate))
+            continue;
+          if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl)))
+            return mlir::failure();
+        }
+      }
+      for (auto [index, reduction] : llvm::enumerate(reductions)) {
+        if (stripInputs[index].size() != 2 ||
+            stripInputs[index][0].kind != stripInputs[index][1].kind)
+          return reduction.emitError(
+              "fixed-strip reduction produced incompatible physical values");
+        BlockValueKind kind = stripInputs[index][0].kind;
+        std::string combined = fresh("block_combined");
+        std::string seed = fresh("block_seed");
+        std::string partial = fresh("block_partial");
+        if (kind == BlockValueKind::I16) {
+          line("vint32m4_t " + combined + " = __riscv_vwadd_vv_i32m4(" +
+               stripInputs[index][0].spelling + ", " +
+               stripInputs[index][1].spelling + ", " + vl + ");");
+          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+          line("vint32m1_t " + partial +
+               " = __riscv_vredsum_vs_i32m4_i32m1(" + combined + ", " + seed +
+               ", " + vl + ");");
+        } else if (kind == BlockValueKind::I32) {
+          line("vint32m4_t " + combined + " = __riscv_vadd_vv_i32m4(" +
+               stripInputs[index][0].spelling + ", " +
+               stripInputs[index][1].spelling + ", " + vl + ");");
+          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+          line("vint32m1_t " + partial +
+               " = __riscv_vredsum_vs_i32m4_i32m1(" + combined + ", " + seed +
+               ", " + vl + ");");
+        } else {
+          return reduction.emitError(
+              "fixed-strip reduction physical type is unsupported");
+        }
+        line(accumulators[index] + " += __riscv_vmv_x_s_i32m1_i32(" +
+             partial + ");");
+        values[reduction.getResult()] =
+            CValue{reduction.getResult().getType(), CValueKind::Scalar,
+                   accumulators[index]};
+        if (reduction != op)
+          consumed.insert(reduction.getOperation());
+      }
+      for (mlir::Operation *operation : closure)
+        loweredBlockOps.insert(operation);
+      return mlir::success();
+    }
+
+    line("for (size_t " + strip + " = 0; " + strip + " < " +
+         std::to_string(extent) + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
+         std::to_string(extent) + " - " + strip + ") < 16 ? (" +
+         std::to_string(extent) + " - " + strip + ") : 16);");
+
+    if (needsLaneVector) {
+      line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl + ");");
+      line(lane + " = __riscv_vadd_vx_u16m2(" + lane + ", " + strip + " + " +
+           offset + ", " + vl + ");");
+    }
+
+    llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+    BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
+                          needsLaneVector ? lane : ""};
+    coordinate.contiguousIndex = "(" + strip + " + " + offset + ")";
+    blockValues[axis.getResult()] = std::move(coordinate);
+    llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
+    for (auto [index, reduction] : llvm::enumerate(reductions))
+      reductionIndices[reduction.getOperation()] = index;
+    for (mlir::Operation &candidate : *op->getBlock()) {
+      auto reduction = reductionIndices.find(&candidate);
+      if (reduction != reductionIndices.end()) {
+        ReduceOp current = reductions[reduction->second];
+        BlockValue input = lookupBlockValue(current.getInput(), blockValues);
+        if (input.kind == BlockValueKind::I32 &&
+            mlir::failed(materializeI32(input, current.getOperation(), vl)))
+          return mlir::failure();
+        if ((input.kind != BlockValueKind::I32 &&
+             input.kind != BlockValueKind::I16) ||
+            input.spelling.empty())
+          return current.emitError(
+              "RVV block reduction input is not an integer vector");
+        std::string seed = fresh("block_seed");
+        std::string partial = fresh("block_partial");
+        const std::string &accumulator = accumulators[reduction->second];
+        if (input.kind == BlockValueKind::I16) {
+          line("vint16m1_t " + seed + " = __riscv_vmv_v_x_i16m1(0, 1);");
+          line("vint16m1_t " + partial +
+               " = __riscv_vredsum_vs_i16m2_i16m1(" + input.spelling + ", " +
+               seed + ", " + vl + ");");
+          line(accumulator +
+               " += (int32_t)__riscv_vmv_x_s_i16m1_i16(" + partial + ");");
+        } else {
+          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+          line("vint32m1_t " + partial +
+               " = __riscv_vredsum_vs_i32m4_i32m1(" + input.spelling + ", " +
+               seed + ", " + vl + ");");
+          line(accumulator + " += __riscv_vmv_x_s_i32m1_i32(" + partial +
+               ");");
+        }
+        if (&candidate == reductions.back().getOperation())
+          break;
+        continue;
+      }
+      if (&candidate == reductions.back().getOperation())
+        break;
+      if (!closure.contains(&candidate) ||
+          mlir::isa<BlockAxisOp>(candidate))
+        continue;
+      if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl)))
+        return mlir::failure();
+    }
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
+    for (auto [reduction, accumulator] : llvm::zip(reductions, accumulators)) {
+      values[reduction.getResult()] = CValue{reduction.getResult().getType(),
+                                             CValueKind::Scalar, accumulator};
+      if (reduction != op)
+        consumed.insert(reduction.getOperation());
+    }
+    for (mlir::Operation *operation : closure)
+      loweredBlockOps.insert(operation);
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitReduce(ReduceOp op) {
     if (inVLA)
       return op.emitError("VLA reduction must be owned by its VLA lowering");
-    return op.emitError(
-        "block reduction has no RISC-V lowering yet; no scalar fallback exists");
+    return emitBlockReduce(op);
   }
 
   mlir::LogicalResult emitVectorReduce(ReduceOp op,
@@ -1122,6 +2023,26 @@ void emitPrelude(llvm::raw_ostream &output, bool usesExp) {
 #include <stddef.h>
 #include <stdint.h>
 #include <riscv_vector.h>
+
+static inline int8_t __weft_bitcast_u8_i8(uint8_t bits) {
+  union { uint8_t u; int8_t i; } value = { .u = bits };
+  return value.i;
+}
+
+static inline int16_t __weft_bitcast_u16_i16(uint16_t bits) {
+  union { uint16_t u; int16_t i; } value = { .u = bits };
+  return value.i;
+}
+
+static inline _Float16 __weft_bitcast_u16_f16(uint16_t bits) {
+  union { uint16_t u; _Float16 f; } value = { .u = bits };
+  return value.f;
+}
+
+static inline float __weft_bitcast_u32_f32(uint32_t bits) {
+  union { uint32_t u; float f; } value = { .u = bits };
+  return value.f;
+}
 
 )c";
   if (!usesExp)

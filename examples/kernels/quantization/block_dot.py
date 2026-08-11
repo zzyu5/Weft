@@ -256,8 +256,8 @@ def q8_0_q8_0(
 
 @weft.kernel
 def q4_K_q8_K(
-    x: W.ptr[W.u8, W.readonly],
-    y: W.ptr[W.u8, W.readonly],
+    x: W.ptr[W.u8, W.readonly, W.noalias],
+    y: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
     result = W.f32(0.0)
@@ -265,44 +265,60 @@ def q4_K_q8_K(
         x_block = x + block * W.index(144)
         y_block = y + block * W.index(292)
 
-        logical_index = W.block_axis(256)
-        group = logical_index // W.index(64)
-        offset = logical_index % W.index(64)
-        packed_index = group * W.index(32) + offset % W.index(32)
-        shift = W.cast((offset // W.index(32)) * W.index(4), W.u8)
-        packed = W.load(
-            x_block + W.index(16) + packed_index,
-            other=W.u8(0),
-        )
-        x_values = W.cast((packed >> shift) & W.u8(15), W.i32)
-        y_values = load_q8(y_block + 4, logical_index)
-        scale_index = logical_index // W.index(32)
-        scales, _ = load_k4_scale_min(x_block + 4, scale_index)
-        scaled_products = (
-            W.cast(scales, W.i32) * x_values * y_values
-        )
-        integer_sum = W.reduce(
-            scaled_products,
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
-        )
+        integer_sum = W.i32(0)
+        minimum_sum = W.i32(0)
+        for group_pair in W.range(0, 4):
+            group_member = W.block_axis(32)
+            packed_group = (
+                x_block
+                + W.index(16)
+                + group_pair * W.index(32)
+            )
+            packed = W.load(packed_group + group_member, other=W.u8(0))
+            low_values = W.cast(packed & W.u8(15), W.i32)
+            high_values = W.cast(packed >> W.u8(4), W.i32)
+            low_activations = load_q8(
+                y_block + W.index(4) + group_pair * W.index(64),
+                group_member,
+            )
+            high_activations = load_q8(
+                y_block + W.index(36) + group_pair * W.index(64),
+                group_member,
+            )
+            low_dot = W.reduce(
+                low_values * low_activations,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            high_dot = W.reduce(
+                high_values * high_activations,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
 
-        bsum_index = W.block_axis(16)
-        bsum_byte = y_block + W.index(260) + bsum_index * W.index(2)
-        bsums = load_i16_le(bsum_byte)
-        _, minimums = load_k4_scale_min(
-            x_block + 4,
-            bsum_index // W.index(2),
-        )
-        minimum_sum = W.reduce(
-            bsums * W.cast(minimums, W.i32),
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
-        )
+            low_group = group_pair * W.index(2)
+            high_group = low_group + W.index(1)
+            low_scale, low_minimum = load_k4_scale_min(x_block + 4, low_group)
+            high_scale, high_minimum = load_k4_scale_min(
+                x_block + 4, high_group
+            )
+            integer_sum += (
+                W.cast(low_scale, W.i32) * low_dot
+                + W.cast(high_scale, W.i32) * high_dot
+            )
+            bsum_group = y_block + W.index(260) + group_pair * W.index(8)
+            low_bsums = load_i16_le(bsum_group) + load_i16_le(bsum_group + 2)
+            high_bsums = (
+                load_i16_le(bsum_group + 4) + load_i16_le(bsum_group + 6)
+            )
+            minimum_sum += (
+                W.cast(low_minimum, W.i32) * low_bsums
+                + W.cast(high_minimum, W.i32) * high_bsums
+            )
 
         y_scale = load_f32_le(y_block)
         dot_scale = load_f16_le(x_block) * y_scale
