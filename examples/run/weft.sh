@@ -183,6 +183,14 @@ case "${kernel}" in
     runtime=examples/repro/weft/contraction/blocked_gemm_f32_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
+  mul_mat_id)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 mul_mat_id" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/contraction/mul_mat_id.py
+    runtime=examples/repro/weft/contraction/mul_mat_id_runtime.cpp
+    ;;
   contiguous_transpose)
     if [[ $# -ne 1 ]]; then
       echo "usage: $0 contiguous_transpose <repetitions>" >&2
