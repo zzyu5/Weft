@@ -873,6 +873,8 @@ class FrontendCompiler:
         if element_type(true_value.type) != element_type(false_value.type):
             raise FrontendError("W.select value types must match", self._location(call))
         kind, shape = _join_shapes(true_value.type, false_value.type, self._location(call))
+        branch_type = shaped_type(kind, shape, element_type(true_value.type))
+        kind, shape = _join_shapes(predicate.type, branch_type, self._location(call))
         result_type: ValueType = shaped_type(kind, shape, element_type(true_value.type))
         if is_masked(true_value.type) or is_masked(false_value.type):
             result_type = MaskedType(result_type)
@@ -1248,6 +1250,9 @@ class FrontendCompiler:
 
     def _intrinsic_cos(self, call: ast.Call) -> Value:
         return self._math_unary(call, "cos")
+
+    def _intrinsic_floor(self, call: ast.Call) -> Value:
+        return self._math_unary(call, "floor")
 
     def _intrinsic_rsqrt(self, call: ast.Call) -> Value:
         return self._math_unary(call, "rsqrt")

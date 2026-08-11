@@ -116,6 +116,7 @@ exp2 = _intrinsic("exp2")
 log = _intrinsic("log")
 sin = _intrinsic("sin")
 cos = _intrinsic("cos")
+floor = _intrinsic("floor")
 rsqrt = _intrinsic("rsqrt")
 neg_inf = _intrinsic("neg_inf")
 affine_i4_i8_contract = _intrinsic(

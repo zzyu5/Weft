@@ -814,6 +814,7 @@ mlir::LogicalResult PtrAddOp::verify() {
 mlir::LogicalResult UnaryOp::verify() {
   if (!llvm::StringSwitch<bool>(getKind())
            .Cases("neg", "exp", "exp2", "log", "rsqrt", "sin", "cos", true)
+           .Case("floor", true)
            .Default(false))
     return emitOpError("unsupported unary kind");
   if (!validMath(getMath()))

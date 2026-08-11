@@ -34,6 +34,7 @@ cleanup_local() {
 trap cleanup_local EXIT
 
 quant=0
+multi=0
 runtime_arguments=()
 case "${kernel}" in
   add_bias)
@@ -91,6 +92,15 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/reduction/argmax.py
     runtime=examples/repro/weft/reduction/argmax_runtime.cpp
+    ;;
+  top_k)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 top_k" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/selection/top_k.py
+    runtime=examples/repro/weft/selection/top_k_runtime.cpp
+    multi=1
     ;;
   softmax)
     if [[ $# -ne 0 ]]; then
@@ -273,6 +283,17 @@ else
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         --meta=BM=4 --meta=BN=8 --meta=BK=64 -o "${local_root}/kernel.c"
+  elif [[ ${kernel} == top_k ]]; then
+    PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
+      --kernel top_k_f32 |
+      "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
+        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
+        -o "${local_root}/kernel.c"
+    PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
+      --kernel top_k_f32_equivalent |
+      "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
+        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
+        -o "${local_root}/kernel_equivalent.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
@@ -323,7 +344,14 @@ tar -C "${local_root}" -cf - . |
     else
       \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
-      ar rcs libweft_kernel.a kernel.o
+      if [ '${multi}' -eq 1 ]; then
+        \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
+          -march=${target_march} -mabi=lp64d -c kernel_equivalent.c \
+          -o kernel_equivalent.o
+        ar rcs libweft_kernel.a kernel.o kernel_equivalent.o
+      else
+        ar rcs libweft_kernel.a kernel.o
+      fi
       \"\${cxx}\" -O3 ${remote_compile_flags} -std=c++17 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c runtime.cpp -o runtime.o
       \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
