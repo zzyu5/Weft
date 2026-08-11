@@ -181,6 +181,22 @@ case "${kernel}" in
     dsl=examples/kernels/vision/window_partition.py
     runtime=examples/repro/weft/vision/window_partition_runtime.cpp
     ;;
+  dense_conv2d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 dense_conv2d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/dense_conv2d.py
+    runtime=examples/repro/weft/vision/dense_conv2d_runtime.cpp
+    ;;
+  conv_transpose2d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 conv_transpose2d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/conv_transpose2d.py
+    runtime=examples/repro/weft/vision/conv_transpose2d_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2

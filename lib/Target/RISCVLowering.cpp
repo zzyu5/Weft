@@ -193,6 +193,9 @@ struct VLAContractDecision {
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
   unsigned lmul = 2;
+  VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
+  VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
+  bool lhsPredicateVariesByReduction = false;
   llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
@@ -384,6 +387,14 @@ LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
                                                    : LaneRelation::Strided;
     }
   }
+  if (auto expand = value.getDefiningOp<ExpandDimsOp>())
+    return classifyLaneRelation(expand.getInput(), coordinate);
+  if (auto broadcast = value.getDefiningOp<BroadcastToOp>())
+    return classifyLaneRelation(broadcast.getInput(), coordinate);
+  if (auto reshape = value.getDefiningOp<ReshapeOp>())
+    return classifyLaneRelation(reshape.getInput(), coordinate);
+  if (auto transpose = value.getDefiningOp<TransposeOp>())
+    return classifyLaneRelation(transpose.getInput(), coordinate);
   return isRegionValue(value.getType()) ? LaneRelation::NonAffine
                                         : LaneRelation::Independent;
 }
@@ -882,10 +893,18 @@ private:
         rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType()) : PtrType{};
     auto outputPointer =
         outputRoot ? mlir::dyn_cast<PtrType>(outputRoot.getType()) : PtrType{};
+    LaneRelation rhsRelation =
+        classifyLaneRelation(rhsLoad.getPointer(), coordinate);
+    LaneRelation outputRelation =
+        classifyLaneRelation(store.getPointer(), coordinate);
     if (!lhsPointer || !rhsPointer || !outputPointer ||
         !lhsPointer.getElementType().isF32() ||
         !rhsPointer.getElementType().isF32() ||
         !outputPointer.getElementType().isF32() ||
+        (rhsRelation != LaneRelation::UnitStride &&
+         rhsRelation != LaneRelation::Strided) ||
+        (outputRelation != LaneRelation::UnitStride &&
+         outputRelation != LaneRelation::Strided) ||
         !dependsOn(lhsLoad.getPointer(), rowAxis.getResult()) ||
         !dependsOn(lhsLoad.getPointer(), reductionAxis.getResult()) ||
         dependsOn(lhsLoad.getPointer(), coordinate) ||
@@ -895,7 +914,6 @@ private:
         !dependsOn(store.getPointer(), coordinate) ||
         !dependsOn(store.getPointer(), rowAxis.getResult()) ||
         dependsOn(store.getPointer(), reductionAxis.getResult()) ||
-        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult()) ||
         dependsOn(store.getWhere(), reductionAxis.getResult())) {
       contract.emitError(
           "RVV VLA contract memory relations are unavailable");
@@ -920,6 +938,14 @@ private:
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
     decision.lmul = 4;
+    decision.rhsMemoryMode = rhsRelation == LaneRelation::UnitStride
+                                 ? VLAMemoryMode::UnitStride
+                                 : VLAMemoryMode::Strided;
+    decision.outputMemoryMode = outputRelation == LaneRelation::UnitStride
+                                    ? VLAMemoryMode::UnitStride
+                                    : VLAMemoryMode::Strided;
+    decision.lhsPredicateVariesByReduction =
+        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
     decision.absorbed.append(absorbed.begin(), absorbed.end());
     return decision;
   }
@@ -2878,6 +2904,74 @@ private:
                              : std::optional<std::string>(projected);
   }
 
+  std::optional<std::string> projectVLALaneStride(
+      mlir::Value value, mlir::Value coordinate,
+      const llvm::DenseMap<mlir::Value, std::string> &axisValues) {
+    if (value == coordinate)
+      return "1";
+    if (axisValues.contains(value) || !dependsOn(value, coordinate))
+      return "0";
+    if (auto pointer = value.getDefiningOp<PtrAddOp>()) {
+      std::optional<std::string> base =
+          projectVLALaneStride(pointer.getBase(), coordinate, axisValues);
+      std::optional<std::string> offset =
+          projectVLALaneStride(pointer.getOffset(), coordinate, axisValues);
+      if (!base || !offset)
+        return std::nullopt;
+      if (*base == "0")
+        return offset;
+      if (*offset == "0")
+        return base;
+      return "(" + *base + " + " + *offset + ")";
+    }
+    if (auto binary = value.getDefiningOp<BinaryOp>()) {
+      bool lhsDependent = dependsOn(binary.getLhs(), coordinate);
+      bool rhsDependent = dependsOn(binary.getRhs(), coordinate);
+      if (binary.getKind() == "add" || binary.getKind() == "sub") {
+        std::optional<std::string> lhs = projectVLALaneStride(
+            binary.getLhs(), coordinate, axisValues);
+        std::optional<std::string> rhs = projectVLALaneStride(
+            binary.getRhs(), coordinate, axisValues);
+        if (!lhs || !rhs)
+          return std::nullopt;
+        if (*rhs == "0")
+          return lhs;
+        if (*lhs == "0")
+          return binary.getKind() == "add"
+                     ? rhs
+                     : std::optional<std::string>("(-" + *rhs + ")");
+        return "(" + *lhs + (binary.getKind() == "add" ? " + " : " - ") +
+               *rhs + ")";
+      }
+      if (binary.getKind() == "mul" && lhsDependent != rhsDependent) {
+        mlir::Value dependent =
+            lhsDependent ? binary.getLhs() : binary.getRhs();
+        mlir::Value factor = lhsDependent ? binary.getRhs() : binary.getLhs();
+        std::optional<std::string> stride =
+            projectVLALaneStride(dependent, coordinate, axisValues);
+        std::optional<std::string> scalar =
+            projectBlockScalar(factor, axisValues);
+        if (!stride || !scalar)
+          return std::nullopt;
+        if (*stride == "1")
+          return scalar;
+        return "(" + *stride + " * " + *scalar + ")";
+      }
+      return std::nullopt;
+    }
+    if (auto cast = value.getDefiningOp<CastOp>())
+      return projectVLALaneStride(cast.getInput(), coordinate, axisValues);
+    if (auto expand = value.getDefiningOp<ExpandDimsOp>())
+      return projectVLALaneStride(expand.getInput(), coordinate, axisValues);
+    if (auto broadcast = value.getDefiningOp<BroadcastToOp>())
+      return projectVLALaneStride(broadcast.getInput(), coordinate, axisValues);
+    if (auto reshape = value.getDefiningOp<ReshapeOp>())
+      return projectVLALaneStride(reshape.getInput(), coordinate, axisValues);
+    if (auto transpose = value.getDefiningOp<TransposeOp>())
+      return projectVLALaneStride(transpose.getInput(), coordinate, axisValues);
+    return std::nullopt;
+  }
+
   mlir::LogicalResult emitVLAContract(const VLAContractDecision &decision) {
     auto contract = mlir::cast<ContractOp>(decision.operation);
     auto store = mlir::cast<StoreOp>(decision.consumer);
@@ -2904,14 +2998,17 @@ private:
           projectBlockScalar(store.getWhere(), axes);
       std::optional<std::string> outputPointer =
           projectBlockScalar(store.getPointer(), axes);
-      if (!lhsPredicate || !outputPredicate || !outputPointer)
+      if ((!decision.lhsPredicateVariesByReduction && !lhsPredicate) ||
+          !outputPredicate || !outputPointer)
         return contract.emitError(
             "RVV VLA contract row projection is unavailable");
-      std::string lhsCondition = fresh("vla_contract_lhs_active");
       std::string outputCondition = fresh("vla_contract_store_active");
-      line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
+      if (!decision.lhsPredicateVariesByReduction) {
+        std::string lhsCondition = fresh("vla_contract_lhs_active");
+        line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
+        lhsActive.push_back(std::move(lhsCondition));
+      }
       line("const bool " + outputCondition + " = " + *outputPredicate + ";");
-      lhsActive.push_back(std::move(lhsCondition));
       storeActive.push_back(std::move(outputCondition));
       outputPointers.push_back(std::move(*outputPointer));
     }
@@ -2930,32 +3027,49 @@ private:
       rhsAxes[decision.reductionAxis] = reduction;
       std::optional<std::string> rhsPointer =
           projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-      if (!rhsPointer)
+      std::optional<std::string> rhsLaneStride = projectVLALaneStride(
+          rhsLoad.getPointer(), activeVLADecision->coordinate, rhsAxes);
+      if (!rhsPointer || !rhsLaneStride)
         return contract.emitError(
             "RVV VLA contract RHS projection is unavailable");
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
            extent + "; ++" + reduction + ") {");
       ++indent;
       std::string rhsVector = fresh("vla_contract_rhs");
-      line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
-           vectorSuffix + "(" + *rhsPointer + ", " + activeVL + ");");
+      if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride) {
+        line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+             vectorSuffix + "(" + *rhsPointer + ", " + activeVL + ");");
+      } else {
+        line(vectorType + " " + rhsVector + " = __riscv_vlse32_v_" +
+             vectorSuffix + "(" + *rhsPointer +
+             ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
+             activeVL + ");");
+      }
       for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
         llvm::DenseMap<mlir::Value, std::string> axes;
         axes[decision.rowAxis] = std::to_string(lane);
         axes[decision.reductionAxis] = reduction;
         std::optional<std::string> lhsPointer =
             projectBlockScalar(lhsLoad.getPointer(), axes);
-        if (!lhsPointer)
+        std::optional<std::string> lhsPredicate;
+        if (decision.lhsPredicateVariesByReduction)
+          lhsPredicate = projectBlockScalar(lhsLoad.getWhere(), axes);
+        if (!lhsPointer ||
+            (decision.lhsPredicateVariesByReduction && !lhsPredicate))
           return contract.emitError(
               "RVV VLA contract LHS projection is unavailable");
-        if (guarded) {
-          line("if (" + lhsActive[lane] + ") {");
+        bool guardedLoad = guarded || decision.lhsPredicateVariesByReduction;
+        if (guardedLoad) {
+          llvm::StringRef predicate = decision.lhsPredicateVariesByReduction
+                                          ? *lhsPredicate
+                                          : lhsActive[lane];
+          line("if (" + predicate.str() + ") {");
           ++indent;
         }
         line(accumulators[lane] + " = __riscv_vfmacc_vf_" + vectorSuffix +
              "(" + accumulators[lane] + ", *" + *lhsPointer + ", " +
              rhsVector + ", " + activeVL + ");");
-        if (guarded) {
+        if (guardedLoad) {
           --indent;
           line("}");
         }
@@ -2964,13 +3078,28 @@ private:
       line("}");
 
       for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
+        llvm::DenseMap<mlir::Value, std::string> axes;
+        axes[decision.rowAxis] = std::to_string(lane);
+        axes[decision.reductionAxis] = "0";
+        std::optional<std::string> outputLaneStride = projectVLALaneStride(
+            store.getPointer(), activeVLADecision->coordinate, axes);
+        if (!outputLaneStride)
+          return contract.emitError(
+              "RVV VLA contract output stride is unavailable");
         if (guarded) {
           line("if (" + storeActive[lane] + ") {");
           ++indent;
         }
-        line("__riscv_vse32_v_" + vectorSuffix + "(" +
-             outputPointers[lane] + ", " + accumulators[lane] + ", " +
-             activeVL + ");");
+        if (decision.outputMemoryMode == VLAMemoryMode::UnitStride) {
+          line("__riscv_vse32_v_" + vectorSuffix + "(" +
+               outputPointers[lane] + ", " + accumulators[lane] + ", " +
+               activeVL + ");");
+        } else {
+          line("__riscv_vsse32_v_" + vectorSuffix + "(" +
+               outputPointers[lane] +
+               ", (ptrdiff_t)(sizeof(float) * (" + *outputLaneStride + ")), " +
+               accumulators[lane] + ", " + activeVL + ");");
+        }
         if (guarded) {
           --indent;
           line("}");
@@ -2980,8 +3109,12 @@ private:
     };
 
     std::string fullTile = fresh("vla_contract_full_tile");
-    line("const bool " + fullTile + " = " + llvm::join(lhsActive, " && ") +
-         " && " + llvm::join(storeActive, " && ") + ";");
+    llvm::SmallVector<llvm::StringRef> fullConditions;
+    if (!decision.lhsPredicateVariesByReduction)
+      fullConditions.append(lhsActive.begin(), lhsActive.end());
+    fullConditions.append(storeActive.begin(), storeActive.end());
+    line("const bool " + fullTile + " = " +
+         llvm::join(fullConditions, " && ") + ";");
     line("if (" + fullTile + ") {");
     ++indent;
     if (mlir::failed(emitCompute(false)))
