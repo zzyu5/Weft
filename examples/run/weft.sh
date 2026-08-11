@@ -52,6 +52,14 @@ case "${kernel}" in
     dsl=examples/kernels/pointwise/silu.py
     runtime=examples/repro/weft/pointwise/silu_runtime.cpp
     ;;
+  swiglu)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 swiglu" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/pointwise/swiglu.py
+    runtime=examples/repro/weft/pointwise/swiglu_runtime.cpp
+    ;;
   rms_norm)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 rms_norm" >&2
@@ -118,6 +126,14 @@ case "${kernel}" in
     dsl=examples/kernels/gather/get_rows_q4_k.py
     runtime=examples/repro/weft/gather/get_rows_q4_k_runtime.cpp
     runtime_arguments=("$1")
+    ;;
+  get_rows_f32)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 get_rows_f32" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/gather/get_rows_f32.py
+    runtime=examples/repro/weft/gather/get_rows_f32_runtime.cpp
     ;;
   rope_neox)
     if [[ $# -ne 1 ]]; then
