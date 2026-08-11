@@ -35,6 +35,8 @@ trap cleanup_local EXIT
 
 quant=0
 multi=0
+multi_primary=
+multi_equivalent=
 runtime_arguments=()
 case "${kernel}" in
   add_bias)
@@ -101,6 +103,19 @@ case "${kernel}" in
     dsl=examples/kernels/selection/top_k.py
     runtime=examples/repro/weft/selection/top_k_runtime.cpp
     multi=1
+    multi_primary=top_k_f32
+    multi_equivalent=top_k_f32_equivalent
+    ;;
+  ssm_conv)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 ssm_conv" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/ssm_conv.py
+    runtime=examples/repro/weft/state/ssm_conv_runtime.cpp
+    multi=1
+    multi_primary=ssm_conv_f32
+    multi_equivalent=ssm_conv_f32_equivalent
     ;;
   softmax)
     if [[ $# -ne 0 ]]; then
@@ -283,14 +298,14 @@ else
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         --meta=BM=4 --meta=BN=8 --meta=BK=64 -o "${local_root}/kernel.c"
-  elif [[ ${kernel} == top_k ]]; then
+  elif [[ ${multi} -eq 1 ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
-      --kernel top_k_f32 |
+      --kernel "${multi_primary}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         -o "${local_root}/kernel.c"
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
-      --kernel top_k_f32_equivalent |
+      --kernel "${multi_equivalent}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         -o "${local_root}/kernel_equivalent.c"
