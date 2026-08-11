@@ -117,6 +117,14 @@ case "${kernel}" in
     multi_primary=ssm_conv_f32
     multi_equivalent=ssm_conv_f32_equivalent
     ;;
+  ssm_scan)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 ssm_scan" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/ssm_scan.py
+    runtime=examples/repro/weft/state/ssm_scan_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2

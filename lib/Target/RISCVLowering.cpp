@@ -2250,6 +2250,8 @@ private:
       expression = "(-" + input.spelling + ")";
     else if (op.getKind() == "exp")
       expression = "expf(" + input.spelling + ")";
+    else if (op.getKind() == "log")
+      expression = "logf(" + input.spelling + ")";
     else if (op.getKind() == "sqrt")
       expression = "sqrtf(" + input.spelling + ")";
     else if (op.getKind() == "rsqrt")
