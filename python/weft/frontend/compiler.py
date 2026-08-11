@@ -1864,6 +1864,25 @@ class FrontendCompiler:
             result_types=(operands[-1].type,),
         )[0]
 
+    def _intrinsic_grouped_affine_i4_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "packed_weight",
+            "scale_min",
+            "activation",
+            "activation_sum_bytes",
+            "dot_scale",
+            "minimum_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(self._value_argument(args[name], call) for name in names)
+        return self._emit(
+            "weft_ext.grouped_affine_i4_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[-1].type,),
+        )[0]
+
     def _intrinsic_range(self, call: ast.Call) -> Value:
         raise FrontendError("W.range is valid only in a for statement", self._location(call))
 

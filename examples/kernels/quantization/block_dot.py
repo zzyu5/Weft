@@ -2,7 +2,6 @@ import weft
 import weft.language as W
 
 from examples.kernels.quantization.ggml_k import load_f16_le
-from examples.kernels.quantization.ggml_k import load_k4_scale_min
 
 
 @W.helper(effects=("read",))
@@ -15,14 +14,6 @@ def load_f32_le(base):
     bits = bits | (byte2 << W.u32(16))
     bits = bits | (byte3 << W.u32(24))
     return W.bitcast(bits, W.f32)
-
-
-@W.helper(effects=("read",))
-def load_i16_le(base):
-    low = W.cast(W.load(base, other=W.u8(0)), W.u16)
-    high = W.cast(W.load(base + 1, other=W.u8(0)), W.u16)
-    bits = low | (high << W.u16(8))
-    return W.cast(W.bitcast(bits, W.i16), W.i32)
 
 
 @W.helper(effects=("read",))
@@ -208,65 +199,31 @@ def q4_K_q8_K(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(144)
         y_block = y + block * W.index(292)
-
-        integer_sum = W.i32(0)
-        minimum_sum = W.i32(0)
-        for group_pair in W.range(0, 4):
-            group_member = W.block_axis(32)
-            packed_group = (
-                x_block
-                + W.index(16)
-                + group_pair * W.index(32)
-            )
-            packed = W.load(packed_group + group_member, other=W.u8(0))
-            low_values = W.cast(packed & W.u8(15), W.i32)
-            high_values = W.cast(packed >> W.u8(4), W.i32)
-            low_activations = load_q8(
-                y_block + W.index(4) + group_pair * W.index(64),
-                group_member,
-            )
-            high_activations = load_q8(
-                y_block + W.index(36) + group_pair * W.index(64),
-                group_member,
-            )
-            low_dot = W.reduce(
-                low_values * low_activations,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            high_dot = W.reduce(
-                high_values * high_activations,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-
-            low_group = group_pair * W.index(2)
-            high_group = low_group + W.index(1)
-            low_scale, low_minimum = load_k4_scale_min(x_block + 4, low_group)
-            high_scale, high_minimum = load_k4_scale_min(
-                x_block + 4, high_group
-            )
-            integer_sum += (
-                W.cast(low_scale, W.i32) * low_dot
-                + W.cast(high_scale, W.i32) * high_dot
-            )
-            bsum_group = y_block + W.index(260) + group_pair * W.index(8)
-            low_bsums = load_i16_le(bsum_group) + load_i16_le(bsum_group + 2)
-            high_bsums = (
-                load_i16_le(bsum_group + 4) + load_i16_le(bsum_group + 6)
-            )
-            minimum_sum += (
-                W.cast(low_minimum, W.i32) * low_bsums
-                + W.cast(high_minimum, W.i32) * high_bsums
-            )
-
+        scale_index = W.block_axis(12)
+        scale_min = W.load(x_block + W.index(4) + scale_index, other=W.u8(0))
+        packed_index = W.block_axis(128)
+        packed_weight = W.load(
+            x_block + W.index(16) + packed_index, other=W.u8(0)
+        )
+        activation_index = W.block_axis(256)
+        activation = W.bitcast(
+            W.load(y_block + W.index(4) + activation_index, other=W.u8(0)),
+            W.i8,
+        )
+        sum_byte = W.block_axis(32)
+        activation_sum_bytes = W.load(
+            y_block + W.index(260) + sum_byte, other=W.u8(0)
+        )
         y_scale = load_f32_le(y_block)
         dot_scale = load_f16_le(x_block) * y_scale
         minimum_scale = load_f16_le(x_block + 2) * y_scale
-        result += dot_scale * W.cast(integer_sum, W.f32)
-        result -= minimum_scale * W.cast(minimum_sum, W.f32)
+        result = W.grouped_affine_i4_i8_dot(
+            packed_weight,
+            scale_min,
+            activation,
+            activation_sum_bytes,
+            dot_scale,
+            minimum_scale,
+            result,
+        )
     return result

@@ -393,6 +393,8 @@ private:
       return mlir::success();
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
+    if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
+      return emitGroupedAffineI4I8Dot(op);
     if (hasBlockPayload(operation)) {
       if (auto op = mlir::dyn_cast<StoreOp>(operation))
         return emitBlockStores(op);
@@ -1976,6 +1978,80 @@ private:
     auto highPointer = high.getPointer().getDefiningOp<PtrAddOp>();
     return highPointer && highPointer.getBase() == low.getPointer() &&
            integerConstant(highPointer.getOffset()) == 1;
+  }
+
+  mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
+    if (options.target.vlenBits != 128)
+      return op.emitError(
+          "grouped affine i4/i8 dot currently requires an explicit VLEN128 target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "grouped affine i4/i8 dot requires the source-declared little-endian fields");
+    if (!op.getPackedWeight().hasOneUse() || !op.getScaleMin().hasOneUse() ||
+        !op.getActivation().hasOneUse() ||
+        !op.getActivationSumBytes().hasOneUse())
+      return op.emitError(
+          "grouped affine i4/i8 dot requires local single-use block operands");
+
+    LoadOp packedLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
+    LoadOp scaleLoad = op.getScaleMin().getDefiningOp<LoadOp>();
+    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
+    LoadOp activationLoad =
+        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
+                       : LoadOp{};
+    LoadOp sumLoad = op.getActivationSumBytes().getDefiningOp<LoadOp>();
+    if (!packedLoad || !scaleLoad || !activationCast || !activationLoad ||
+        !sumLoad || !isTrue(packedLoad.getWhere()) ||
+        !isTrue(scaleLoad.getWhere()) || !isTrue(activationLoad.getWhere()) ||
+        !isTrue(sumLoad.getWhere()))
+      return op.emitError(
+          "grouped affine i4/i8 dot requires explicit all-active block loads");
+
+    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
+      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
+      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
+        return {};
+      return lane.getBase();
+    };
+    mlir::Value packedBase = blockBase(packedLoad, 128);
+    mlir::Value scaleBase = blockBase(scaleLoad, 12);
+    mlir::Value activationBase = blockBase(activationLoad, 256);
+    mlir::Value sumBase = blockBase(sumLoad, 32);
+    if (!packedBase || !scaleBase || !activationBase || !sumBase)
+      return op.emitError(
+          "grouped affine i4/i8 dot block axes do not match its typed operands");
+
+    CValue packed = require(packedBase);
+    CValue scales = require(scaleBase);
+    CValue activation = require(activationBase);
+    CValue sums = require(sumBase);
+    CValue dotScale = require(op.getDotScale());
+    CValue minimumScale = require(op.getMinimumScale());
+    CValue init = require(op.getInit());
+    if (packed.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
+        activation.kind != CValueKind::Pointer || sums.kind != CValueKind::Pointer ||
+        dotScale.kind != CValueKind::Scalar ||
+        minimumScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
+        packed.spelling.empty() || scales.spelling.empty() ||
+        activation.spelling.empty() || sums.spelling.empty() ||
+        dotScale.spelling.empty() || minimumScale.spelling.empty() ||
+        init.spelling.empty())
+      return op.emitError(
+          "grouped affine i4/i8 dot operands are not materialized locally");
+
+    std::string result = fresh("grouped_dot");
+    line("const float " + result + " = __weft_grouped_affine_i4_i8_vl128(" +
+         packed.spelling + ", " + scales.spelling + ", " +
+         activation.spelling + ", " + sums.spelling + ", " +
+         dotScale.spelling + ", " + minimumScale.spelling + ", " +
+         init.spelling + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    markDiscardedBlockTree(op.getPackedWeight());
+    markDiscardedBlockTree(op.getScaleMin());
+    markDiscardedBlockTree(op.getActivation());
+    markDiscardedBlockTree(op.getActivationSumBytes());
+    return mlir::success();
   }
 
   std::optional<mlir::LogicalResult> tryEmitAffineI4I8NTiles(ForOp nLoop) {
@@ -3618,7 +3694,8 @@ private:
   }
 };
 
-void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1) {
+void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1,
+                 bool usesGroupedI4I8) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -3646,6 +3723,189 @@ static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits
 }
 
 )c";
+  if (usesGroupedI4I8) {
+    output << R"c(static inline __attribute__((always_inline, unused)) float
+__weft_grouped_affine_i4_i8_vl128(
+    const uint8_t *packed_weight, const uint8_t *scale_min,
+    const uint8_t *activation_bytes, const uint8_t *activation_sum_bytes,
+    float dot_scale, float minimum_scale, float init) {
+  uint8_t scale[8];
+  uint8_t minimum[8];
+  for (size_t group = 0; group < 4; ++group) {
+    scale[group] = scale_min[group] & UINT8_C(63);
+    minimum[group] = scale_min[group + 4] & UINT8_C(63);
+    scale[group + 4] = (scale_min[group + 8] & UINT8_C(15)) |
+                       ((scale_min[group] >> 6) << 4);
+    minimum[group + 4] = (scale_min[group + 8] >> 4) |
+                         ((scale_min[group + 4] >> 6) << 4);
+  }
+
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  float sum = init;
+  float temporary;
+  float second;
+  const uint8_t *q40;
+  const uint8_t *q41;
+  const uint8_t *q42;
+  const uint8_t *q43;
+  const int8_t *q80;
+  const int8_t *q81;
+  const int8_t *q82;
+  const int8_t *q83;
+  int s0;
+  int s1;
+  int s2;
+  int s3;
+
+  __asm__ volatile(
+      "vsetivli zero, 4, e32, m1, ta, ma\n\t"
+      "vmv.v.x v16, zero\n\t"
+      "vsetivli zero, 8, e16, m1, ta, ma\n\t"
+      "vle32.v v2, (%[bsums])\n\t"
+      "vnsrl.wi v0, v2, 0\n\t"
+      "vnsrl.wi v1, v2, 16\n\t"
+      "vadd.vv v2, v0, v1\n\t"
+      "vle8.v v3, (%[mins])\n\t"
+      "vzext.vf2 v4, v3\n\t"
+      "vwmul.vv v6, v4, v2\n\t"
+      "vsetivli zero, 4, e32, m1, ta, ma\n\t"
+      "vredsum.vs v0, v6, v16\n\t"
+      "vredsum.vs v0, v7, v0\n\t"
+      "vfcvt.f.x.v v0, v0\n\t"
+      "vfmv.f.s %[temporary], v0\n\t"
+      "vsetivli zero, 16, e8, m1, ta, ma\n\t"
+      "vle8.v v0, (%[packed])\n\t"
+      "fnmsub.s %[sum], %[minimum_scale], %[temporary], %[sum]\n\t"
+      "addi %[q40], %[packed], 64\n\t"
+      "addi %[q41], %[packed], 16\n\t"
+      "addi %[q42], %[packed], 32\n\t"
+      "addi %[q43], %[packed], 48\n\t"
+      "addi %[q80], %[activation], 64\n\t"
+      "vle8.v v1, (%[q41])\n\t"
+      "vle8.v v2, (%[q42])\n\t"
+      "addi %[q81], %[activation], 16\n\t"
+      "addi %[q41], %[q41], 64\n\t"
+      "addi %[q82], %[activation], 32\n\t"
+      "vle8.v v3, (%[q43])\n\t"
+      "vle8.v v8, (%[activation])\n\t"
+      "addi %[q42], %[q42], 64\n\t"
+      "addi %[q83], %[activation], 48\n\t"
+      "addi %[q43], %[q43], 64\n\t"
+      "vsrl.vi v4, v0, 4\n\t"
+      "vle8.v v9, (%[q81])\n\t"
+      "vle8.v v10, (%[q82])\n\t"
+      "vand.vi v0, v0, 0xF\n\t"
+      "addi %[q81], %[q81], 64\n\t"
+      "vsrl.vi v5, v1, 4\n\t"
+      "addi %[q82], %[q82], 64\n\t"
+      "vle8.v v11, (%[q83])\n\t"
+      "vle8.v v12, (%[q80])\n\t"
+      "vand.vi v1, v1, 0xF\n\t"
+      "addi %[q83], %[q83], 64\n\t"
+      "vsrl.vi v6, v2, 4\n\t"
+      "addi %[q80], %[q80], 64\n\t"
+      "vle8.v v13, (%[q81])\n\t"
+      "vle8.v v14, (%[q82])\n\t"
+      "vand.vi v2, v2, 0xF\n\t"
+      "addi %[q81], %[q81], 64\n\t"
+      "vsrl.vi v7, v3, 4\n\t"
+      "addi %[q82], %[q82], 64\n\t"
+      "vwmul.vv v16, v0, v8\n\t"
+      "vle8.v v15, (%[q83])\n\t"
+      "vle8.v v0, (%[q40])\n\t"
+      "vand.vi v3, v3, 0xF\n\t"
+      "addi %[q83], %[q83], 64\n\t"
+      "vwmul.vv v24, v2, v12\n\t"
+      "vwmul.vv v20, v4, v10\n\t"
+      "vwmul.vv v28, v6, v14\n\t"
+      "vwmacc.vv v16, v1, v9\n\t"
+      "vle8.v v1, (%[q41])\n\t"
+      "vle8.v v2, (%[q42])\n\t"
+      "vwmacc.vv v24, v3, v13\n\t"
+      "vwmacc.vv v20, v5, v11\n\t"
+      "vwmacc.vv v28, v7, v15\n\t"
+      "addi %[q40], %[q80], 64\n\t"
+      "addi %[q41], %[q81], 64\n\t"
+      "vle8.v v3, (%[q43])\n\t"
+      "vle8.v v8, (%[q80])\n\t"
+      "addi %[q42], %[q82], 64\n\t"
+      "addi %[q43], %[q83], 64\n\t"
+      "vsrl.vi v4, v0, 4\n\t"
+      "vle8.v v9, (%[q81])\n\t"
+      "vle8.v v10, (%[q82])\n\t"
+      "vand.vi v0, v0, 0xF\n\t"
+      "vsrl.vi v5, v1, 4\n\t"
+      "vsrl.vi v7, v3, 4\n\t"
+      "vand.vi v3, v3, 0xF\n\t"
+      "vle8.v v11, (%[q83])\n\t"
+      "vle8.v v12, (%[q40])\n\t"
+      "vand.vi v1, v1, 0xF\n\t"
+      "vsrl.vi v6, v2, 4\n\t"
+      "vand.vi v2, v2, 0xF\n\t"
+      "vwmul.vv v18, v0, v8\n\t"
+      "vle8.v v13, (%[q41])\n\t"
+      "vle8.v v14, (%[q42])\n\t"
+      "vwmul.vv v26, v2, v12\n\t"
+      "vwmul.vv v22, v4, v10\n\t"
+      "vwmul.vv v30, v6, v14\n\t"
+      "vwmacc.vv v18, v1, v9\n\t"
+      "vle8.v v15, (%[q43])\n\t"
+      "vwmacc.vv v26, v3, v13\n\t"
+      "vwmacc.vv v22, v5, v11\n\t"
+      "vwmacc.vv v30, v7, v15\n\t"
+      "vmv.v.x v0, zero\n\t"
+      "vsetivli zero, 16, e16, m2, ta, ma\n\t"
+      "vwredsum.vs v4, v16, v0\n\t"
+      "lbu %[s0], 0(%[scale])\n\t"
+      "vwredsum.vs v5, v20, v0\n\t"
+      "lbu %[s1], 1(%[scale])\n\t"
+      "vwredsum.vs v6, v24, v0\n\t"
+      "lbu %[s2], 2(%[scale])\n\t"
+      "vwredsum.vs v7, v28, v0\n\t"
+      "lbu %[s3], 3(%[scale])\n\t"
+      "vwredsum.vs v8, v18, v0\n\t"
+      "lbu %[q40], 4(%[scale])\n\t"
+      "vwredsum.vs v9, v22, v0\n\t"
+      "lbu %[q41], 5(%[scale])\n\t"
+      "vwredsum.vs v10, v26, v0\n\t"
+      "lbu %[q42], 6(%[scale])\n\t"
+      "vwredsum.vs v11, v30, v0\n\t"
+      "lbu %[q43], 7(%[scale])\n\t"
+      "vsetivli zero, 4, e32, m1, ta, ma\n\t"
+      "vmul.vx v0, v4, %[s0]\n\t"
+      "vmul.vx v1, v8, %[q40]\n\t"
+      "vmacc.vx v0, %[s1], v5\n\t"
+      "vmacc.vx v1, %[q41], v9\n\t"
+      "vmacc.vx v0, %[s2], v6\n\t"
+      "vmacc.vx v1, %[q42], v10\n\t"
+      "vmacc.vx v0, %[s3], v7\n\t"
+      "vmacc.vx v1, %[q43], v11\n\t"
+      "vfcvt.f.x.v v0, v0\n\t"
+      "vfcvt.f.x.v v1, v1\n\t"
+      "vfmv.f.s %[second], v0\n\t"
+      "vfmv.f.s %[temporary], v1\n\t"
+      "fadd.s %[second], %[second], %[temporary]\n\t"
+      "fmadd.s %[sum], %[dot_scale], %[second], %[sum]"
+      : [temporary] "=&f"(temporary), [sum] "+&f"(sum),
+        [second] "=&f"(second), [s0] "=&r"(s0), [s1] "=&r"(s1),
+        [s2] "=&r"(s2), [s3] "=&r"(s3), [q40] "=&r"(q40),
+        [q41] "=&r"(q41), [q42] "=&r"(q42), [q43] "=&r"(q43),
+        [q80] "=&r"(q80), [q81] "=&r"(q81), [q82] "=&r"(q82),
+        [q83] "=&r"(q83)
+      : [dot_scale] "f"(dot_scale), [activation] "r"(activation),
+        [packed] "r"(packed_weight), [scale] "r"(scale),
+        [bsums] "r"(activation_sum_bytes), [mins] "r"(minimum),
+        [minimum_scale] "f"(minimum_scale)
+      : "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6",
+        "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+        "v15", "v16", "v17", "v18", "v19", "v20", "v21",
+        "v22", "v23", "v24", "v25", "v26", "v27", "v28",
+        "v29", "v30", "v31");
+  return sum;
+}
+
+)c";
+  }
   if (usesIME1) {
     output << R"ime(#define __WEFT_IME1_COMP_I4_I8_M1                                      \
   "vmadot       v16, v14, v0            \n\t"                         \
@@ -3886,9 +4146,11 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
         "the intrinsic C target requires RVV; no fallback backend is installed");
   bool usesExp = false;
   bool usesIME1 = false;
+  bool usesGroupedI4I8 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
   module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
-  emitPrelude(output, usesExp, usesIME1);
+  module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
+  emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8);
 
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())

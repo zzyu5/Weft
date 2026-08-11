@@ -37,4 +37,28 @@ def WeftExtension_AffineI4I8ContractOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_GroupedAffineI4I8DotOp
+    : WeftExtension_Op<"grouped_affine_i4_i8_dot", [Pure]> {
+  let summary = "Grouped affine packed-i4 by signed-i8 block dot";
+  let description = [{
+    Computes one 256-element packed-i4 by signed-i8 dot.  The packed weight
+    contains four 32-byte low/high-nibble pairs.  Eight logical 32-element
+    groups use the explicitly supplied twelve-byte 6-bit scale/minimum table.
+    Sixteen little-endian signed-i16 activation sums supply the affine minimum
+    correction.  dot_scale and minimum_scale are explicit numerical operands;
+    the result is added to init.
+
+    This is a local semantic primitive.  Block pointers, persistent 144/292
+    byte storage, outer reduction traversal, and the public ABI remain explicit
+    in Kernel IR.  VLEN, LMUL, unroll, register organization, and instruction
+    spelling belong only to target lowering.
+  }];
+  let arguments = (ins AnyType:$packed_weight, AnyType:$scale_min,
+                       AnyType:$activation, AnyType:$activation_sum_bytes,
+                       AnyType:$dot_scale, AnyType:$minimum_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 #endif // WEFT_DIALECT_EXTENSION_IR_EXTENSIONOPS_TD

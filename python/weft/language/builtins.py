@@ -121,3 +121,6 @@ neg_inf = _intrinsic("neg_inf")
 affine_i4_i8_contract = _intrinsic(
     "affine_i4_i8_contract", "weft_ext.affine_i4_i8_contract"
 )
+grouped_affine_i4_i8_dot = _intrinsic(
+    "grouped_affine_i4_i8_dot", "weft_ext.grouped_affine_i4_i8_dot"
+)

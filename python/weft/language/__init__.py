@@ -27,6 +27,7 @@ from .builtins import expand_dims
 from .builtins import fence
 from .builtins import fill
 from .builtins import full
+from .builtins import grouped_affine_i4_i8_dot
 from .builtins import helper
 from .builtins import invalid
 from .builtins import load
