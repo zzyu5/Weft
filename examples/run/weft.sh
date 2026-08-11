@@ -79,6 +79,14 @@ case "${kernel}" in
     dsl=examples/kernels/normalization/layer_norm.py
     runtime=examples/repro/weft/normalization/layer_norm_runtime.cpp
     ;;
+  rms_norm_backward)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 rms_norm_backward" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/normalization/rms_norm_backward.py
+    runtime=examples/repro/weft/normalization/rms_norm_backward_runtime.cpp
+    ;;
   cumsum)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 cumsum" >&2
@@ -206,6 +214,14 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/contraction/mul_mat_id.py
     runtime=examples/repro/weft/contraction/mul_mat_id_runtime.cpp
+    ;;
+  out_product)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 out_product" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/contraction/out_product.py
+    runtime=examples/repro/weft/contraction/out_product_runtime.cpp
     ;;
   contiguous_transpose)
     if [[ $# -ne 1 ]]; then

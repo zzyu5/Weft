@@ -377,6 +377,47 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
     return deriveExtentImpl(load.getPointer(), axis, visited);
   if (auto scan = mlir::dyn_cast<ScanOp>(definition))
     return deriveExtentImpl(scan.getInput(), axis, visited);
+  if (auto contract = mlir::dyn_cast<ContractOp>(definition)) {
+    mlir::Type lhsType = unwrapMasked(contract.getLhs().getType());
+    mlir::Type rhsType = unwrapMasked(contract.getRhs().getType());
+    bool lhsRegion = mlir::isa<RegionType>(lhsType);
+    bool rhsRegion = mlir::isa<RegionType>(rhsType);
+    int64_t canonicalAxis = axis;
+    if (!contract.getOutputOrder().empty()) {
+      if (axis >= static_cast<int64_t>(contract.getOutputOrder().size()))
+        return std::nullopt;
+      canonicalAxis = contract.getOutputOrder()[axis];
+    }
+    int64_t outputAxis = 0;
+    if (lhsRegion || rhsRegion) {
+      if (canonicalAxis == outputAxis)
+        return deriveExtentImpl(lhsRegion ? contract.getLhs()
+                                          : contract.getRhs(),
+                                0, visited);
+      ++outputAxis;
+    }
+    for (auto [inputAxis, dimension] :
+         llvm::enumerate(staticShapeOf(lhsType))) {
+      (void)dimension;
+      if (llvm::is_contained(contract.getLhsAxes(), inputAxis) ||
+          (lhsRegion && inputAxis == 0))
+        continue;
+      if (canonicalAxis == outputAxis)
+        return deriveExtentImpl(contract.getLhs(), inputAxis, visited);
+      ++outputAxis;
+    }
+    for (auto [inputAxis, dimension] :
+         llvm::enumerate(staticShapeOf(rhsType))) {
+      (void)dimension;
+      if (llvm::is_contained(contract.getRhsAxes(), inputAxis) ||
+          (rhsRegion && inputAxis == 0))
+        continue;
+      if (canonicalAxis == outputAxis)
+        return deriveExtentImpl(contract.getRhs(), inputAxis, visited);
+      ++outputAxis;
+    }
+    return std::nullopt;
+  }
   if (auto binary = mlir::dyn_cast<BinaryOp>(definition))
     return deriveBroadcastExtent(binary.getLhs(), binary.getRhs(), axis,
                                  visited);
@@ -415,19 +456,15 @@ mlir::LogicalResult verifyFootprint(mlir::Operation *operation,
                                     llvm::StringRef role) {
   if (shapeKindOf(value.getType()) == ShapeKind::Scalar)
     return mlir::success();
-  if (shapeKindOf(value.getType()) != shapeKindOf(footprint.getType()))
-    return operation->emitOpError() << role
-                                    << " must have the pointer shape kind";
+  auto broadcast = broadcastStaticShape(value.getType(), footprint.getType());
   auto valueShape = staticShapeOf(value.getType());
   auto footprintShape = staticShapeOf(footprint.getType());
-  if (valueShape.size() != footprintShape.size())
-    return operation->emitOpError() << role << " rank must match the pointer";
+  if (!broadcast ||
+      broadcastKind(value.getType(), footprint.getType()) !=
+          shapeKindOf(footprint.getType()) ||
+      llvm::ArrayRef<int64_t>(*broadcast) != footprintShape)
+    return operation->emitOpError() << role << " does not broadcast to the pointer";
   for (int64_t axis = 0; axis < static_cast<int64_t>(valueShape.size()); ++axis) {
-    if (valueShape[axis] == 1)
-      continue;
-    if (valueShape[axis] != footprintShape[axis])
-      return operation->emitOpError() << role
-                                      << " does not broadcast to the pointer";
     if (valueShape[axis] == -1 &&
         !haveSameExtent(value, axis, footprint, axis))
       return operation->emitOpError()
