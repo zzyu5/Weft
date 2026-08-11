@@ -11,3 +11,5 @@ staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RV
 mixed_attention,online_flash_attention_f32_f16,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,23.462027,,
 matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.256607,10.303494,GOP/s
 predicate_memory,causal_mask_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"attention[heads=32;Q=128;K=2048]",full-causal-score-mask,10,0,64,full,no,,,,,6.684719,1254.893138,MElements/s
+scan_state,cumsum_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"mamba_dt[sequences=1;heads=64;tokens=4096]",full-inclusive-prefix-scan,10,0,64,full,no,,,0,0,0.393851,665.591810,MElements/s
+normalization,layer_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,1.19986008e-06,7.21449121e-07,1.602827,327.102052,MElements/s

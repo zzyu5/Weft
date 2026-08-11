@@ -60,6 +60,22 @@ case "${kernel}" in
     dsl=examples/kernels/normalization/rms_norm.py
     runtime=examples/repro/weft/normalization/rms_norm_runtime.cpp
     ;;
+  layer_norm)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 layer_norm" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/normalization/layer_norm.py
+    runtime=examples/repro/weft/normalization/layer_norm_runtime.cpp
+    ;;
+  cumsum)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 cumsum" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/cumsum.py
+    runtime=examples/repro/weft/reduction/cumsum_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2
