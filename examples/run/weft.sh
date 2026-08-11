@@ -165,6 +165,14 @@ case "${kernel}" in
     dsl=examples/kernels/vision/bilinear_upscale.py
     runtime=examples/repro/weft/vision/bilinear_upscale_runtime.cpp
     ;;
+  window_partition)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 window_partition" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/window_partition.py
+    runtime=examples/repro/weft/vision/window_partition_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2
@@ -240,6 +248,14 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/gather/get_rows_back.py
     runtime=examples/repro/weft/gather/get_rows_back_runtime.cpp
+    ;;
+  set_rows)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 set_rows" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/gather/set_rows.py
+    runtime=examples/repro/weft/gather/set_rows_runtime.cpp
     ;;
   rope_neox)
     if [[ $# -ne 1 ]]; then
