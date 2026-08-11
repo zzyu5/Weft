@@ -40,3 +40,19 @@ def silu_f32(
 
 SiLU公式与 `math="fast"` 是source semantics。Target决定dynamic `vl`、LMUL、register reuse与
 exp realization；它不能根据entry名把任意pointwise graph替换成SiLU模板。
+
+## Mixed F16/F32 SwiGLU
+
+```python
+with W.vla(begin, end) as i:
+    gate_f32 = W.cast(W.load(gate_f16 + i), W.f32)
+    activated = gate_f32 / (
+        W.f32(1.0) + W.exp(-gate_f32, math="fast")
+    )
+    up_f32 = W.cast(W.load(up_f16 + i), W.f32)
+    W.store(output_f32 + i, activated * up_f32)
+```
+
+两个F16 load、显式F32 cast、source声明的gate→activation→up顺序与F32 output都是算法事实。
+Target分别为memory、cast、exp和arithmetic选择RVV realization；dtype不能从pointer use或
+kernel名推断。

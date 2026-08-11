@@ -39,6 +39,19 @@ equation、local fusion envelope 和 emission hook。当前实现可以先只有
 当它扩展成多个candidate时，candidate也只存在于本次lowering，不拥有独立IR schema、
 verifier、pipeline front door或长期provider registry。
 
+当前实现已经存在的transient physical decision包括：
+
+- 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
+  mode、activity、state realization和LMUL；
+- local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；
+- block decode的table extent、code/result vector shape与RVV gather realization；
+- symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
+  N16×K32 realization。
+
+这些decision不进入Kernel IR。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape
+和fragment；后续store、cast或leaf不能再根据use count、周围op数量或完整kernel source重新
+选择一次。
+
 一个 family 只能绑定：
 
 ```text
@@ -105,3 +118,12 @@ fragment同时存在。增加能力时扩展局部primitive lowering，而不是
 format route或whole-kernel emitter。一个local envelope可以跨多个相邻pure producer/
 consumer，甚至联合安排相邻primitive，但选择必须从明确canonical anchor出发，不能把整个
 loop nest的形状当作operator identity。
+
+## 当前实现边界
+
+逐实体VLA memory/predicate/state/narrow、codebook decode与symmetric IME fragment已经按上述
+模型工作。当前源码中仍有若干较早的exact closure fast path：F16 conversion/fill/dot/update/
+normalize、online-softmax producer-consumer envelope、F16 GEMM nested loop以及affine Q4_K
+IME N/K loop。它们不依赖kernel symbol，但仍要求较精确的region/use/loop closure；因此当前
+实现不能被描述为已经完全closure-free。新增能力不得沿这些路径继续增加整段case，已有
+路径应在对应primitive decision能够承载时被替换并删除。

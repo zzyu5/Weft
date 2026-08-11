@@ -25,6 +25,27 @@ Primitive只拥有这16个local affine dot的numerical relation。Activation qua
 persistent packed-weight address、outer M/N/K loop、N16/K32 traversal和public ABI必须在
 Kernel IR中显式存在。IME1或其他matrix fragment只是同一语义的target realization。
 
+## Symmetric i4×i8 block contraction
+
+```python
+result = W.symmetric_i4_i8_contract(
+    activation,             # block<32, i8>
+    packed_weight,          # block<16x16, u8>
+    activation_scale=...,   # scalar f32
+    weight_scale=...,       # block<16, f32>
+    init=...,               # block<16, f32>
+)
+```
+
+该primitive同样产生16个local dot，但packed nibble的数值是 `code - 8`，没有独立
+zero-point operand。对于 `p = half * 8 + lane`，low/high nibble分别乘
+`activation[half * 16 + lane]` 与 `activation[half * 16 + lane + 8]`；结果乘显式
+`activation_scale * weight_scale[n]` 后加到 `init[n]`。
+
+Q4_0 persistent block是否采用288-byte N16×K32 layout、当前block地址以及K recurrence仍由
+source表达。SpacemiT IME1 lowering只把一次该primitive实现成local N16×K32 asm fragment，
+不拥有activation quantize、outer loop或kernel ABI。
+
 ## Grouped affine i4×i8 block dot
 
 ```python

@@ -65,3 +65,28 @@ def gemm_worker(
 - block values 与 contraction axes 归 canonical semantics；
 - `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
 - 外部 runtime 决定每个 worker 的 `[m_begin,m_end)`。
+
+## F32 row microtile contract
+
+当前F32 workload保留另一种自然source结构：作者按6行遍历M、按单列遍历N，并用一个动态K
+block表达6个row dot：
+
+```python
+for row in W.range(m_begin, m_end, 6):
+    for column in W.range(0, n):
+        row_lane = W.block_axis(6)
+        inner = W.block_axis(k)
+        lhs = W.load(a + (row + row_lane[:, None]) * lda + inner[None, :],
+                     where=row + row_lane[:, None] < m_end,
+                     other=W.f32(0.0))
+        rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
+        value = W.contract(lhs, rhs, init=W.zeros((6,), dtype=W.f32),
+                           lhs_axes=(1,), rhs_axes=(0,),
+                           acc_dtype=W.f32, order="relaxed", math="native")
+        W.store(c + (row + row_lane) * ldc + column, value,
+                where=row + row_lane < m_end)
+```
+
+Target从contract、axis和memory relation选择F32 RVV row microtile与LMUL4，同一个K vector供6个
+row accumulator复用。`row step=6` 是当前source的cache/register blocking选择；它不是
+`gemm_f32` kernel类别，也没有把N/K loop或matrix layout从target反推回IR。

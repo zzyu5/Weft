@@ -44,9 +44,43 @@ W.store(high_output_group + member, high_value)
 Target可以选择indexed/unit-stride RVV、register unpack和local producer fusion；它不能把任意
 load/bitwise graph重新分类成Q4_K，也不能改变row lookup或persistent format。
 
+## Plain F32 indexed GetRows
+
+非量化GetRows使用同一条memory machinery而没有decode：source先把显式u32 row index cast为
+logical index，再形成 `table + row * table_stride + hidden`；每个token的hidden dimension是
+独立VLA。Target只根据pointer relation选择scalar indexed row base与unit-stride RVV copy，
+不能从embedding shape或entry名发明row lookup。
+
 `W.lookup` 与 `W.decode` 是更一般的canonical semantic anchors。Source只有在table/index或
 codebook relation本身就是算法语义时才使用它们；普通pointer arithmetic不会被compiler
 自动提升成这两个op。
+
+## Q8_0 activation quantization
+
+Q8_0 source显式拥有每个32-element block的全部observable relation：
+
+```text
+maximum = reduce(max(abs(x)))
+scale = maximum / 127
+inverse = 0 if maximum == 0 else 1 / scale
+store little-endian f16(scale) at byte 0
+store 32 RNE+saturating i8 codes at byte 2
+block stride = 34 bytes
+```
+
+两个VLA分别承担max reduction与narrow/store。Target为每个VLA、reduce和narrow独立选择LMUL，
+并用F32→I16→I8 narrowing intrinsic实现显式RNE/saturation；34-byte layout与zero-maximum
+branch不属于target推断。
+
+## IQ4_NL codebook decode
+
+IQ4_NL block是little-endian F16 scale加16个packed bytes，总计18 bytes。Source把固定16-entry
+signed-i8 codebook作为显式readonly pointer operand，拆出low/high nibble并调用
+`W.decode(code, table, out_dtype=W.i8)`，随后signed widen到F32、乘scale并写32个logical值。
+
+当前block-local decision只观察decode的table/code/result性质，选择一次16-lane
+`vrgather` realization；emitter从decision取得E8M1/E32M4 physical shape。它不检查kernel名，
+也不从packed byte pattern猜IQ4_NL。
 
 ## Activation quantize + affine contract
 
@@ -120,6 +154,27 @@ for column_begin in W.range(0, columns, W.index(16)):
 Target可以把local primitive映射到RVV dot或IME fragment，也可以在primitive envelope内做
 短生命周期repack；它不能自动创造activation quantization pass、scratch ABI、N16/K32
 outer loop或persistent weight layout。
+
+## Activation quantize + symmetric Q4_0 contract
+
+Q4_0 variant保留相同的activation max-reduce、scale/code scratch与source N/K recurrence，但
+persistent N16×K32 block是32-byte F16 scale field加256-byte packed nibble field，总计288
+bytes。每个K32 iteration调用：
+
+```python
+acc = W.symmetric_i4_i8_contract(
+    activation_codes,
+    packed_codes,
+    activation_scale=scale,
+    weight_scale=weight_scale,
+    init=acc,
+)
+```
+
+Canonical primitive只定义 `code - 8` 的16个local dot。当前K1 target把一次primitive lower成
+单个N16×K32 IME1 asm leaf；作者的128次K loop、memory-resident accumulator state、column
+loop、288-byte block address和最终store仍出现在生成C中。Leaf不遍历完整K、不量化activation、
+不选择persistent format，也不拥有public ABI。
 
 ## Grouped block dot
 

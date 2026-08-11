@@ -87,7 +87,7 @@ W.scan(value, op=..., identity=..., inclusive=True, where=True,
 
 W.summary_fold(value, identity=..., lift=pure_helper,
                merge=pure_helper, finalize=None,
-               where=True, order="preserve")
+               where=True, coordinate=None, order="preserve")
 ```
 
 普通 sequential carry使用 scalar `W.range` / Python `while`，不会被自动提升为 reduce、scan
@@ -138,6 +138,11 @@ W.affine_i4_i8_contract(
     activation, packed_weight,
     activation_scale=..., weight_scale=...,
     weight_zero_point=..., init=...,
+)
+
+W.symmetric_i4_i8_contract(
+    activation, packed_weight,
+    activation_scale=..., weight_scale=..., init=...,
 )
 
 W.grouped_affine_i4_i8_dot(

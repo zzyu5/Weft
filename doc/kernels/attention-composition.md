@@ -46,6 +46,21 @@ for position:
 sin/cos与VLA arithmetic选择不同realization，但不能把carry猜成scan，也不能自动创建或删除
 cache stage。
 
+## Causal masked memory
+
+```python
+for row in W.range(0, heads * queries):
+    query = row % queries
+    with W.vla(0, keys) as column:
+        masked = column > n_past + query
+        W.store(scores + row * stride + column,
+                W.neg_inf(W.f32), where=masked)
+```
+
+Row/query映射、causal predicate、logical key domain与masked store effect均在source中。
+Target为predicate选择mask realization，为store选择unit-stride memory与LMUL；physical tail
+不能被并入或替代causal predicate。
+
 ## Online FlashAttention
 
 Worker-local online attention保留完整algorithm skeleton：

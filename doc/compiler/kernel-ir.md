@@ -76,7 +76,8 @@ state and structured compute
 - entry argument kind只能是 `pointer`、`scalar` 或 `constexpr`；return为none或一个scalar。
 - VLA不能嵌套；active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出
   lexical region。
-- `summary_fold` 的lift/merge/finalize region必须闭合、pure并以 `yield` 终结。
+- `summary_fold` 的value、可选coordinate、identity与where都是显式operand；coordinate若存在
+  必须与value共享logical domain。Lift/merge/finalize region必须闭合、pure并以 `yield` 终结。
 - `contract` 的paired axes、where footprint、init/result shape与dtype必须由IR显式保存并局部
   verify。
 
@@ -89,7 +90,8 @@ weft_kernel
 weft_ext
 ```
 
-`weft_ext` 当前包含 `affine_i4_i8_contract` 与 `grouped_affine_i4_i8_dot`。Extension op必须
+`weft_ext` 当前包含 `affine_i4_i8_contract`、`symmetric_i4_i8_contract` 与
+`grouped_affine_i4_i8_dot`。Extension op必须
 能随module独立parse/verify；它只表达typed local numerical relation，不能持有public ABI、
 persistent pointer layout、outer traversal或target fragment。
 

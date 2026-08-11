@@ -23,16 +23,17 @@ Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写完�
 11. [构建期 tuning](compiler/tuning.md)
 12. [Legality 与错误边界](compiler/verification.md)
 
-典型 kernel 的 canonical 写法单独放在 `kernels/`：
+典型worker-local source的canonical组合方式单独放在 `kernels/`；这些文件是语言构造示例，
+不是target使用的kernel类别：
 
 - [Elementwise](kernels/elementwise.md)
-- [RMSNorm](kernels/rms-norm.md)
-- [Predicate reduction](kernels/predicate-reduction.md)
+- [Normalization workers](kernels/rms-norm.md)
+- [Predicate、scan 与 coordinate summary](kernels/predicate-reduction.md)
 - [Online softmax](kernels/online-softmax.md)
 - [Blocked GEMM](kernels/gemm.md)
 - [Extension primitive](kernels/extensions.md)
 - [Packed quantization 与 irregular access](kernels/quantized-local.md)
-- [Transpose、RoPE 与 online attention composition](kernels/attention-composition.md)
+- [Causal memory、Transpose、RoPE 与 online attention composition](kernels/attention-composition.md)
 
 ## 文档分工
 
@@ -40,7 +41,7 @@ Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写完�
 doc/
 ├── dsl/       source language 的构造与语义
 ├── compiler/  Kernel IR、target lowering、构建配置与产物
-└── kernels/   按 kernel 类型组织的 canonical DSL 模板
+└── kernels/   canonical DSL construct 的组合示例
 ```
 
 每个概念只有一个权威落点，其他文档只引用该定义，不复制第二套规则。实现中发现的问题、

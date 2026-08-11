@@ -198,6 +198,7 @@ state_or_result = W.summary_fold(
     merge=...,
     finalize=None,
     where=True,
+    coordinate=None,
     order="preserve",
 )
 ```
@@ -210,12 +211,19 @@ merge(state_a, state_b) -> state
 finalize(state) -> result
 ```
 
+若 summary state 需要逻辑位置，例如 first-index argmax，作者通过 `coordinate=` 显式传入
+与 `value` 同一 logical domain 的 coordinate。此时 lift 的签名是
+`lift(element, coordinate) -> state`。Coordinate 是算法输入；target 不能从 lane ID、use
+位置或周围 pointer expression重建。未提供时 canonical operand是 `none`，lift仍只接收
+element。
+
 它用于 online softmax、stable weighted merge、统计 summary、分块归一化等需要重标定的 monoid-like state。
 
 Online softmax 的 rescale 必须写在 `merge` 中，而不是隐藏在普通 carried loop 里。
 
 `lift`、`merge` 以及可选 `finalize` 必须是 `@W.pure` helper。Canonical regions 的参数分别是
-element、`(state,state)` 与 state；每个 region只返回一个闭合值，不能含 memory effect。
+element或`(element, coordinate)`、`(state,state)` 与 state；每个 region只返回一个闭合值，
+不能含 memory effect。
 
 ### Sequential carry
 
