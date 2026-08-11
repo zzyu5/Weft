@@ -42,6 +42,7 @@ enum class BlockValueKind {
   U16,
   I16,
   I32,
+  F32,
   Mask,
   Tuple,
 };
@@ -57,6 +58,10 @@ struct BlockValue {
   BlockValueKind narrowKind = BlockValueKind::Scalar;
   std::string narrowSpelling;
   std::optional<uint64_t> unsignedMaximum;
+  mlir::Value packedSource;
+  std::string packedTransform;
+  std::string packedTransformOperand;
+  std::string widenedSpelling;
 };
 
 struct CValue {
@@ -339,6 +344,7 @@ private:
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
   bool inVLA = false;
+  bool microBlockVectors = false;
   std::string activeVL;
 
   void line(llvm::Twine text) {
@@ -374,6 +380,8 @@ private:
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
     if (hasBlockPayload(operation)) {
+      if (auto op = mlir::dyn_cast<StoreOp>(operation))
+        return emitBlockStores(op);
       deferredBlockOps.insert(operation);
       return mlir::success();
     }
@@ -1484,18 +1492,18 @@ private:
 
   mlir::LogicalResult collectBlockClosure(
       mlir::Value value, llvm::DenseSet<mlir::Operation *> &closure,
-      llvm::SmallVectorImpl<BlockAxisOp> &axes, ReduceOp owner) {
+      llvm::SmallVectorImpl<BlockAxisOp> &axes, mlir::Operation *owner) {
     if (!containsBlockType(value.getType()))
       return mlir::success();
     mlir::Operation *definition = value.getDefiningOp();
     if (!definition)
-      return owner.emitError(
-          "block reduction cannot capture a block argument from another region");
+      return owner->emitError(
+          "block operation cannot capture a block argument from another region");
     if (!closure.insert(definition).second)
       return mlir::success();
     if (definition->getBlock() != owner->getBlock())
-      return owner.emitError(
-          "block reduction producer closure crosses a region boundary");
+      return owner->emitError(
+          "block producer closure crosses a region boundary");
     if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
       auto tuple = get.getInput().getDefiningOp<TupleOp>();
       if (!tuple)
@@ -1655,6 +1663,25 @@ private:
       BinaryOp op, BlockValue lhs, BlockValue rhs, BlockValueKind resultKind,
       llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
       llvm::StringRef vl) {
+    bool feedsOnlyF32Casts = !op.getResult().use_empty() && llvm::all_of(
+        op.getResult().getUsers(), [](mlir::Operation *user) {
+          auto cast = mlir::dyn_cast<CastOp>(user);
+          return cast && elementType(cast.getResult().getType()).isF32();
+        });
+    if (microBlockVectors && resultKind == BlockValueKind::U8 &&
+        lhs.kind == BlockValueKind::U8 && !lhs.spelling.empty() &&
+        rhs.kind == BlockValueKind::Scalar && !rhs.spelling.empty() &&
+        (op.getKind() == "and" || op.getKind() == "shr") &&
+        feedsOnlyF32Casts) {
+      BlockValue result;
+      result.type = op.getResult().getType();
+      result.kind = BlockValueKind::U8;
+      result.packedSource = op.getLhs();
+      result.packedTransform = op.getKind().str();
+      result.packedTransformOperand = rhs.spelling;
+      blockValues[op.getResult()] = std::move(result);
+      return mlir::success();
+    }
     bool lhsVector = lhs.kind == resultKind;
     bool rhsVector = rhs.kind == resultKind;
     if (!lhsVector && rhsVector &&
@@ -1705,8 +1732,8 @@ private:
     std::string suffix;
     std::string cType;
     if (resultKind == BlockValueKind::U8) {
-      suffix = "u8m1";
-      cType = "vuint8m1_t";
+      suffix = microBlockVectors ? "u8mf4" : "u8m1";
+      cType = microBlockVectors ? "vuint8mf4_t" : "vuint8m1_t";
     } else if (resultKind == BlockValueKind::U16) {
       suffix = "u16m2";
       cType = "vuint16m2_t";
@@ -1750,6 +1777,64 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult emitBlockFloatBinary(
+      BinaryOp op, BlockValue lhs, BlockValue rhs,
+      llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    bool lhsVector = lhs.kind == BlockValueKind::F32;
+    bool rhsVector = rhs.kind == BlockValueKind::F32;
+    std::string first = lhs.spelling;
+    std::string second = rhs.spelling;
+    std::string stem;
+    std::string form;
+    if (lhsVector && rhsVector) {
+      form = "vv";
+      stem = llvm::StringSwitch<std::string>(op.getKind())
+                 .Case("add", "vfadd")
+                 .Case("sub", "vfsub")
+                 .Case("mul", "vfmul")
+                 .Case("div", "vfdiv")
+                 .Case("max", "vfmax")
+                 .Case("min", "vfmin")
+                 .Default("");
+    } else if (lhsVector) {
+      form = "vf";
+      stem = llvm::StringSwitch<std::string>(op.getKind())
+                 .Case("add", "vfadd")
+                 .Case("sub", "vfsub")
+                 .Case("mul", "vfmul")
+                 .Case("div", "vfdiv")
+                 .Case("max", "vfmax")
+                 .Case("min", "vfmin")
+                 .Default("");
+    } else if (rhsVector) {
+      form = "vf";
+      stem = llvm::StringSwitch<std::string>(op.getKind())
+                 .Case("add", "vfadd")
+                 .Case("sub", "vfrsub")
+                 .Case("mul", "vfmul")
+                 .Case("div", "vfrdiv")
+                 .Case("max", "vfmax")
+                 .Case("min", "vfmin")
+                 .Default("");
+      std::swap(first, second);
+    } else {
+      return op.emitError("f32 block binary requires a vector operand");
+    }
+    if (stem.empty() || first.empty() || second.empty())
+      return op.emitError("RVV f32 block binary kind is unsupported");
+    std::string suffix = microBlockVectors ? "f32m1" : "f32m4";
+    std::string cType = microBlockVectors ? "vfloat32m1_t" : "vfloat32m4_t";
+    std::string intrinsic =
+        "__riscv_" + stem + "_" + form + "_" + suffix;
+    std::string name = fresh("block_f32");
+    line(cType + " " + name + " = " + intrinsic + "(" + first + ", " + second +
+         ", " + vl.str() + ");");
+    blockValues[op.getResult()] =
+        BlockValue{op.getResult().getType(), BlockValueKind::F32, name};
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitBlockBinary(
       BinaryOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
       llvm::StringRef vl) {
@@ -1767,6 +1852,8 @@ private:
     if (resultElement.isSignedInteger(32))
       return emitBlockIntegerBinary(op, lhs, rhs, BlockValueKind::I32,
                                     blockValues, vl);
+    if (resultElement.isF32())
+      return emitBlockFloatBinary(op, lhs, rhs, blockValues, vl);
     return op.emitError("RVV block binary element type is unsupported");
   }
 
@@ -1835,6 +1922,50 @@ private:
       kind = BlockValueKind::I32;
       line("vint32m4_t " + name + " = __riscv_vsext_vf2_i32m4(" +
            input.spelling + ", " + vl.str() + ");");
+    } else if (input.kind == BlockValueKind::U8 && target.isF32()) {
+      kind = BlockValueKind::F32;
+      std::string extended;
+      if (microBlockVectors) {
+        std::string sourceSpelling = input.spelling;
+        auto source = blockValues.find(input.packedSource);
+        if (input.packedSource && !input.packedTransform.empty()) {
+          if (source == blockValues.end() || source->second.spelling.empty())
+            return op.emitError("packed decode cast has no u8 source vector");
+          sourceSpelling = source->second.spelling;
+        }
+        std::string widened;
+        if (source != blockValues.end() &&
+            !source->second.widenedSpelling.empty()) {
+          widened = source->second.widenedSpelling;
+        } else {
+          widened = fresh("block_packed_u32");
+          line("vuint32m1_t " + widened +
+               " = __riscv_vzext_vf4_u32m1(" + sourceSpelling + ", " +
+               vl.str() + ");");
+          if (source != blockValues.end())
+            source->second.widenedSpelling = widened;
+        }
+        extended = widened;
+        if (!input.packedTransform.empty()) {
+          extended = fresh("block_code_u32");
+          std::string stem =
+              input.packedTransform == "and" ? "vand" : "vsrl";
+          line("vuint32m1_t " + extended + " = __riscv_" + stem +
+               "_vx_u32m1(" + widened + ", " +
+               input.packedTransformOperand + ", " + vl.str() + ");");
+        }
+        line("vfloat32m1_t " + name + " = __riscv_vfcvt_f_xu_v_f32m1(" +
+             extended + ", " + vl.str() + ");");
+      } else {
+        std::string u16Suffix = "u16m2";
+        std::string u16Type = "vuint16m2_t";
+        extended = fresh("block_u16");
+        line(u16Type + " " + extended + " = __riscv_vzext_vf2_" +
+             u16Suffix + "(" + input.spelling + ", " + vl.str() + ");");
+        line("vfloat32m4_t " + name +
+             " = __riscv_vfwcvt_f_xu_v_f32m4(" + extended + ", " + vl.str() +
+             ");");
+      }
     } else {
       return op.emitError("RVV block cast pair is unsupported");
     }
@@ -1883,21 +2014,23 @@ private:
     if (!elementType(op.getResult().getType()).isUnsignedInteger(8))
       return op.emitError("RVV block load currently supports u8 elements");
     std::string name = fresh("block_load");
+    std::string suffix = microBlockVectors ? "u8mf4" : "u8m1";
+    std::string cType = microBlockVectors ? "vuint8mf4_t" : "vuint8m1_t";
     bool allActive = isTrue(op.getWhere());
     if (allActive && !pointer.contiguousIndex.empty()) {
-      line("vuint8m1_t " + name + " = __riscv_vle8_v_u8m1(" +
+      line(cType + " " + name + " = __riscv_vle8_v_" + suffix + "(" +
            pointer.pointerBase + " + " + pointer.contiguousIndex + ", " +
            vl.str() + ");");
     } else if (allActive) {
-      line("vuint8m1_t " + name + " = __riscv_vluxei16_v_u8m1(" +
+      line(cType + " " + name + " = __riscv_vluxei16_v_" + suffix + "(" +
            pointer.pointerBase + ", " + pointer.pointerIndex + ", " + vl.str() +
            ");");
     } else if (where.kind == BlockValueKind::Mask &&
                !pointer.pointerIndex.empty() && !other.spelling.empty()) {
       std::string maskedOff = fresh("block_other");
-      line("vuint8m1_t " + maskedOff + " = __riscv_vmv_v_x_u8m1(" +
+      line(cType + " " + maskedOff + " = __riscv_vmv_v_x_" + suffix + "(" +
            other.spelling + ", " + vl.str() + ");");
-      line("vuint8m1_t " + name + " = __riscv_vluxei16_v_u8m1_mu(" +
+      line(cType + " " + name + " = __riscv_vluxei16_v_" + suffix + "_mu(" +
            where.spelling + ", " + maskedOff + ", " + pointer.pointerBase +
            ", " + pointer.pointerIndex + ", " + vl.str() + ");");
     } else {
@@ -1906,6 +2039,29 @@ private:
     BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
     result.unsignedMaximum = 255;
     blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockStore(
+      StoreOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue pointer = lookupBlockValue(op.getPointer(), blockValues);
+    BlockValue value = lookupBlockValue(op.getValue(), blockValues);
+    auto pointerType =
+        mlir::dyn_cast<PtrType>(elementType(op.getPointer().getType()));
+    if (!pointerType || !pointerType.getElementType().isF32() ||
+        pointer.kind != BlockValueKind::Pointer || pointer.pointerBase.empty() ||
+        pointer.contiguousIndex.empty())
+      return op.emitError(
+          "RVV block store requires a contiguous f32 vector address");
+    if (value.kind != BlockValueKind::F32 || value.spelling.empty() ||
+        !isTrue(op.getWhere()))
+      return op.emitError(
+          "RVV block store requires an all-active f32 vector value");
+    std::string suffix = microBlockVectors ? "f32m1" : "f32m4";
+    line("__riscv_vse32_v_" + suffix + "(" + pointer.pointerBase + " + " +
+         pointer.contiguousIndex + ", " + value.spelling + ", " + vl.str() +
+         ");");
     return mlir::success();
   }
 
@@ -1972,6 +2128,8 @@ private:
       return emitBlockBitcast(op, blockValues);
     if (auto op = mlir::dyn_cast<LoadOp>(operation))
       return emitBlockLoad(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<StoreOp>(operation))
+      return emitBlockStore(op, blockValues, vl);
     if (auto op = mlir::dyn_cast<SelectOp>(operation))
       return emitBlockSelect(op, blockValues, vl);
     if (auto op = mlir::dyn_cast<TupleOp>(operation))
@@ -1980,6 +2138,193 @@ private:
       return emitBlockTupleGet(op, blockValues);
     return operation->emitError(
         "RISC-V target does not implement this block producer primitive");
+  }
+
+  mlir::LogicalResult emitBlockStores(StoreOp op) {
+    auto blockExtent = [](mlir::Type type) -> std::optional<int64_t> {
+      if (auto masked = mlir::dyn_cast<MaskedType>(type))
+        type = masked.getValueType();
+      auto block = mlir::dyn_cast<BlockType>(type);
+      if (!block || block.getShape().size() != 1 ||
+          !block.getElementType().isF32())
+        return std::nullopt;
+      return block.getShape().front();
+    };
+
+    std::optional<int64_t> extent = blockExtent(op.getValue().getType());
+    if (!extent || *extent <= 0 || *extent > 65535 ||
+        !isTrue(op.getWhere()))
+      return op.emitError(
+          "RVV block store requires an all-active rank-one f32 value");
+
+    llvm::DenseSet<mlir::Operation *> closure;
+    llvm::SmallVector<BlockAxisOp> axes;
+    if (mlir::failed(collectBlockClosure(op.getPointer(), closure, axes,
+                                         op.getOperation())) ||
+        mlir::failed(collectBlockClosure(op.getValue(), closure, axes,
+                                         op.getOperation())))
+      return mlir::failure();
+    if (axes.size() != 1)
+      return op.emitError(
+          "RVV block store requires exactly one local logical block axis");
+    BlockAxisOp axis = axes.front();
+    auto axisType = axis.getResult().getType();
+    if (axisType.getShape().size() != 1 ||
+        axisType.getShape().front() != *extent)
+      return op.emitError("block store extent does not match its logical axis");
+
+    llvm::SmallVector<StoreOp> stores{op};
+    for (mlir::Operation *candidate = op->getNextNode(); candidate;
+         candidate = candidate->getNextNode()) {
+      if (auto store = mlir::dyn_cast<StoreOp>(candidate)) {
+        std::optional<int64_t> candidateExtent =
+            blockExtent(store.getValue().getType());
+        if (consumed.contains(candidate) || candidateExtent != extent ||
+            !isTrue(store.getWhere()))
+          break;
+        llvm::DenseSet<mlir::Operation *> candidateClosure;
+        llvm::SmallVector<BlockAxisOp> candidateAxes;
+        if (mlir::failed(collectBlockClosure(store.getPointer(),
+                                             candidateClosure, candidateAxes,
+                                             store.getOperation())) ||
+            mlir::failed(collectBlockClosure(store.getValue(), candidateClosure,
+                                             candidateAxes,
+                                             store.getOperation())) ||
+            candidateAxes.size() != 1 || candidateAxes.front() != axis)
+          break;
+        stores.push_back(store);
+        for (mlir::Operation *member : candidateClosure)
+          closure.insert(member);
+        continue;
+      }
+      if (hasBlockPayload(candidate))
+        continue;
+      if (mlir::isa<ConstantOp, InvalidOp, PtrAddOp, BinaryOp, CompareOp, CastOp,
+                    BitcastOp, SelectOp, TupleOp, TupleGetOp, SpecialValueOp>(
+              candidate)) {
+        if (mlir::failed(emitOperation(candidate)))
+          return mlir::failure();
+        consumed.insert(candidate);
+        continue;
+      }
+      break;
+    }
+
+    llvm::DenseSet<mlir::Operation *> storeOps;
+    for (StoreOp store : stores)
+      storeOps.insert(store.getOperation());
+    for (mlir::Operation *operation : closure)
+      for (mlir::Value result : operation->getResults())
+        if (containsBlockType(result.getType()))
+          for (mlir::Operation *user : result.getUsers())
+            if (!storeOps.contains(user) && !closure.contains(user) &&
+                !loweredBlockOps.contains(user) &&
+                !llvm::all_of(user->getResults(),
+                              [](mlir::Value value) { return value.use_empty(); }))
+              return op.emitError(
+                  "block producer escapes its operation-local store closure");
+
+    std::string offset = expression(axis.getOffset());
+    if (offset.empty())
+      return op.emitError("block store axis offset is unavailable");
+    std::string strip = fresh("block_i");
+    std::string vl = fresh("block_vl");
+    std::string lane = fresh("block_lane");
+    bool needsLaneVector = llvm::any_of(
+        axis.getResult().getUsers(), [&](mlir::Operation *user) {
+          if (!closure.contains(user))
+            return false;
+          auto pointer = mlir::dyn_cast<PtrAddOp>(user);
+          return !pointer || pointer.getOffset() != axis.getResult();
+        });
+    bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
+      return mlir::isa<BlockAxisOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
+          operation);
+    });
+    bool useMicroVectors =
+        !needsLaneVector && *extent == 32 && microClosure;
+
+    auto emitStrip = [&](llvm::StringRef stripOffset,
+                         llvm::StringRef activeVL) -> mlir::LogicalResult {
+      llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+      BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
+                            needsLaneVector ? lane : ""};
+      coordinate.contiguousIndex =
+          "(" + stripOffset.str() + " + " + offset + ")";
+      blockValues[axis.getResult()] = std::move(coordinate);
+      bool previousMicroBlockVectors = microBlockVectors;
+      microBlockVectors = useMicroVectors;
+      for (mlir::Operation &candidate : *op->getBlock()) {
+        if (mlir::isa<BlockAxisOp>(candidate) ||
+            (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
+          continue;
+        if (mlir::failed(emitBlockOperation(&candidate, blockValues, activeVL))) {
+          microBlockVectors = previousMicroBlockVectors;
+          return mlir::failure();
+        }
+      }
+      microBlockVectors = previousMicroBlockVectors;
+      return mlir::success();
+    };
+
+    if (useMicroVectors) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8mf4(4);");
+      llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
+          stripValues;
+      for (int64_t stripOffset : {int64_t{0}, int64_t{4}, int64_t{8},
+                                  int64_t{12}, int64_t{16}, int64_t{20},
+                                  int64_t{24}, int64_t{28}}) {
+        llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+        BlockValue coordinate{axis.getResult().getType(),
+                              BlockValueKind::Index, ""};
+        coordinate.contiguousIndex =
+            "(" + std::to_string(stripOffset) + " + " + offset + ")";
+        blockValues[axis.getResult()] = std::move(coordinate);
+        stripValues.push_back(std::move(blockValues));
+      }
+      bool previousMicroBlockVectors = microBlockVectors;
+      microBlockVectors = true;
+      for (mlir::Operation &candidate : *op->getBlock()) {
+        if (mlir::isa<BlockAxisOp>(candidate) ||
+            (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
+          continue;
+        for (auto &blockValues : stripValues)
+          if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl))) {
+            microBlockVectors = previousMicroBlockVectors;
+            return mlir::failure();
+          }
+      }
+      microBlockVectors = previousMicroBlockVectors;
+    } else if (!needsLaneVector && *extent == 32) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(16);");
+      if (mlir::failed(emitStrip("0", vl)) ||
+          mlir::failed(emitStrip("16", vl)))
+        return mlir::failure();
+    } else {
+      line("for (size_t " + strip + " = 0; " + strip + " < " +
+           std::to_string(*extent) + ";) {");
+      ++indent;
+      line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
+           std::to_string(*extent) + " - " + strip + ") < 16 ? (" +
+           std::to_string(*extent) + " - " + strip + ") : 16);");
+      if (needsLaneVector) {
+        line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl +
+             ");");
+        line(lane + " = __riscv_vadd_vx_u16m2(" + lane + ", " + strip +
+             " + " + offset + ", " + vl + ");");
+      }
+      if (mlir::failed(emitStrip(strip, vl)))
+        return mlir::failure();
+      line(strip + " += " + vl + ";");
+      --indent;
+      line("}");
+    }
+
+    for (mlir::Operation *operation : closure)
+      loweredBlockOps.insert(operation);
+    for (StoreOp store : stores)
+      consumed.insert(store.getOperation());
+    return mlir::success();
   }
 
   mlir::LogicalResult emitBlockReduce(ReduceOp op) {
@@ -2003,7 +2348,8 @@ private:
     llvm::DenseSet<mlir::Operation *> closure;
     llvm::SmallVector<BlockAxisOp> firstAxes;
     if (mlir::failed(
-            collectBlockClosure(op.getInput(), closure, firstAxes, op)))
+            collectBlockClosure(op.getInput(), closure, firstAxes,
+                                op.getOperation())))
       return mlir::failure();
     if (firstAxes.size() != 1)
       return op.emitError(
@@ -2024,7 +2370,7 @@ private:
         if (candidateType.getShape().front() != extent ||
             mlir::failed(collectBlockClosure(reduction.getInput(),
                                              candidateClosure, candidateAxes,
-                                             reduction)) ||
+                                             reduction.getOperation())) ||
             candidateAxes.size() != 1 || candidateAxes.front() != axis)
           break;
         reductions.push_back(reduction);
@@ -2076,7 +2422,7 @@ private:
 
     if (!needsLaneVector && extent == 32) {
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1(16);");
-      llvm::SmallVector<llvm::SmallVector<BlockValue>> stripInputs(
+      llvm::SmallVector<llvm::SmallVector<BlockValue, 2>, 2> stripInputs(
           reductions.size());
       llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
       for (auto [index, reduction] : llvm::enumerate(reductions))
