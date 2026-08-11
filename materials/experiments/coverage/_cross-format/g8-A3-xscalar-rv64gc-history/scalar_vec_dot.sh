@@ -34,7 +34,7 @@ ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirn
 # Relocated 2026-08 from tools/bench/cells/: driver assets live alongside
 # this script's new home (experiments/coverage/_cross-format/g8-A3-xscalar-rv64gc-history/).
 ASSETS="${SCALAR_VECDOT_ASSET_ROOT:-$SELF}"
-EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
+EXPORTER="$ROOT/materials/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-scalar-vec-dot.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }

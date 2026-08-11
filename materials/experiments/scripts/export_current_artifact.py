@@ -10,9 +10,11 @@ the registered artifact lowering to emit C.
 Historical note: this tool originally resolved its fixtures from the repo's
 ``test/`` tree and cross-checked its recipe table against the archived
 ``tools/bench/bench`` route dispatcher. Both of those have been retired; this
-script now lives entirely under ``experiments/scripts/`` and resolves its
-fixtures from the sibling ``fixtures/`` directory. It no longer requires or
-references the old measurement-schema runner.
+script now lives entirely under ``materials/experiments/scripts/`` and
+resolves its fixtures from the sibling ``fixtures/`` directory (found via
+``_find_repo_root``, so relocating this whole directory again does not break
+path resolution). It no longer requires or references the old
+measurement-schema runner.
 
 The cell harnesses call this tool with ``--require-clean`` and write the
 result only into an ephemeral ``mktemp`` directory. The emitted seal makes the
@@ -238,14 +240,12 @@ def _build_tools(build_dir: Path) -> None:
 def _check_clean(require_clean: bool) -> str:
     head = _git("rev-parse", "HEAD")
     if require_clean:
-        # The harness invocation itself writes measurement output into a
-        # gitignored history/scratch location; every other tracked or
-        # untracked repository path remains cleanliness-sensitive so the
-        # exported symbol is traceable to an exact committed compiler state.
-        dirty = _git(
-            "status", "--porcelain", "--untracked-files=all", "--", ".",
-            ":(exclude)experiments/_history/**",
-        )
+        # The harness contract writes no repository-side files at all (stdout
+        # only; any board-side build/log artifacts stay under the remote
+        # /tmp and are never scp'd back) -- so no exclude carve-out is
+        # needed here. The whole worktree stays cleanliness-sensitive, which
+        # makes the exported symbol traceable to an exact committed state.
+        dirty = _git("status", "--porcelain", "--untracked-files=all")
         if dirty:
             raise ExportError(
                 "current-artifact export requires a clean worktree; "

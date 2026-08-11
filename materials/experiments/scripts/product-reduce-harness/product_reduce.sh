@@ -38,7 +38,7 @@ ROOT="$SELF"; while [ ! -d "$ROOT/.git" ] && [ "$ROOT" != "/" ]; do ROOT="$(dirn
 # this script (experiments/scripts/product-reduce-harness/), not under the
 # old experiments/active/k-product-reduce/ campaign directory.
 ASSETS="${PRODUCT_REDUCE_ASSET_ROOT:-$SELF}"
-EXPORTER="$ROOT/experiments/scripts/export_current_artifact.py"
+EXPORTER="$ROOT/materials/experiments/scripts/export_current_artifact.py"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/weft-current-product-reduce.XXXXXX")" || {
   echo "# HARNESS-VOID cannot create current-artifact staging directory"; exit 3;
 }
