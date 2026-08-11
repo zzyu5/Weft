@@ -5,12 +5,13 @@
 ## 结论
 
 Weft 当前已经从完整 Python kernel 生成 canonical Kernel IR，再按 canonical anchor 生成
-Selected Execution IR，最后投影为可编译 C++ source。十个 GGML baseline 均已由生成源码在
-`ssh rvv` 上重新编译并执行通过。
+Selected Execution IR，最后投影为可编译 C++ source。十个现有手工 repro 均已由生成源码
+在 `ssh rvv` 上重新编译并执行通过；它们不是十个 GGML RISC-V 性能 baseline。
 
 这条路径不是从 GGML C/C++ graph 导入，也不识别“这是 RMSNorm、GEMM 或 q4_K”。
-`source/c/ggml/` 是 reference source corpus，用来固定算法、raw block layout 与运行输入；真正
-的 Weft source 是 `examples/kernels/` 中作者写出的完整 worker-local Python kernel。
+真正的 Weft source 是 `examples/kernels/` 中作者写出的完整 worker-local Python kernel。
+数值 runtime 位于 `examples/repro/weft/`；emitter 不读取或链接 `source/c/`。真实 GGML 与
+历史高性能 RISC-V source 的边界另见 `riscv-llm-source-corpus.md`。
 
 ## 编译边界
 
@@ -29,9 +30,9 @@ target facts。实现中没有 `KernelKind`、operator/q-format route、kernel-n
 kernel shape template。Scalar 与 RVV 都是显式候选；没有合法 provider 时 selection 立即报错。
 
 Emitter 只读取 canonical IR、对应 anchor 的 selected record 与 plan 中的 target facts。它不
-重新推导算法骨架，也不从 `source/c/ggml/` 调用或链接 donor 实现。
+重新推导算法骨架，也不从 `source/c/` 调用或链接 donor 实现。
 
-## 十个 baseline
+## 十个现有 repro
 
 统一命令为：
 
@@ -41,9 +42,9 @@ Emitter 只读取 canonical IR、对应 anchor 的 selected record 与 plan 中�
 
 该入口本地执行 frontend、selection 与 source emission，再把生成源码和相邻 runtime 放入
 远端临时目录。生成的 C++ kernel 统一由 Clang 17 以 `-march=rv64gcv -mabi=lp64d`
-编译；GGML reference runtime 保持 C11。每次执行结束都删除临时目录。
+编译；quant repro runtime 使用 C11。每次执行结束都删除临时目录。
 
-| Baseline | Python kernel | 当前 selected provider 摘要 | `ssh rvv` |
+| Repro | Python kernel | 当前 selected provider 摘要 | `ssh rvv` |
 | --- | --- | --- | --- |
 | `add_bias` | `examples/kernels/elementwise/add_bias.py` | VLA + 3 memory anchors：RVV | `PASS weft add_bias` |
 | `rms_norm` | `examples/kernels/normalization/rms_norm.py` | 2 VLA + memory + reduce：RVV；`rsqrt`：Scalar | `PASS weft rms_norm_worker` |

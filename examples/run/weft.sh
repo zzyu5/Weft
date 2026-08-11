@@ -27,19 +27,19 @@ quant=0
 case "${kernel}" in
   add_bias)
     dsl=examples/kernels/elementwise/add_bias.py
-    runtime=examples/kernels/elementwise/add_bias_runtime.cpp
+    runtime=examples/repro/weft/elementwise/add_bias_runtime.cpp
     ;;
   rms_norm)
     dsl=examples/kernels/normalization/rms_norm.py
-    runtime=examples/kernels/normalization/rms_norm_runtime.cpp
+    runtime=examples/repro/weft/normalization/rms_norm_runtime.cpp
     ;;
   online_softmax)
     dsl=examples/kernels/normalization/online_softmax.py
-    runtime=examples/kernels/normalization/online_softmax_runtime.cpp
+    runtime=examples/repro/weft/normalization/online_softmax_runtime.cpp
     ;;
   blocked_gemm)
     dsl=examples/kernels/contraction/blocked_gemm.py
-    runtime=examples/kernels/contraction/blocked_gemm_runtime.cpp
+    runtime=examples/repro/weft/contraction/blocked_gemm_runtime.cpp
     ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0 | q4_K_q8_K)
     dsl=examples/kernels/quantization/block_dot.py
@@ -62,9 +62,9 @@ if [[ ${quant} -eq 1 ]]; then
     "${compiler}" --emit=source --march=rv64gcv --abi=lp64d \
       -o "${local_root}/kernel.cpp"
   mkdir -p "${local_root}/leaf" "${local_root}/common"
-  cp "${project_root}/source/c/ggml/quantization/block_dot/${kernel}/${kernel}_runtime.c" \
+  cp "${project_root}/examples/repro/weft/quantization/block_dot/${kernel}/runtime.c" \
     "${local_root}/leaf/runtime.c"
-  cp "${project_root}/source/c/ggml/quantization/block_dot/common/ggml_quant.h" \
+  cp "${project_root}/examples/repro/weft/quantization/block_dot/common/ggml_quant.h" \
     "${local_root}/common/ggml_quant.h"
 else
   if [[ ${kernel} == blocked_gemm ]]; then
@@ -101,7 +101,7 @@ tar -C "${local_root}" -cf - . |
       clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
         -march=rv64gcv -mabi=lp64d -c kernel.cpp -o kernel.o
       clang -O2 -std=c11 -Wall -Wextra -Werror \
-        -Dggml_source_${kernel}=${kernel} -c leaf/runtime.c -o runtime.o
+        -c leaf/runtime.c -o runtime.o
       clang++ -march=rv64gcv -mabi=lp64d kernel.o runtime.o -lm -o weft_runtime
     else
       clang++ -O2 -std=c++17 -Wall -Wextra -Werror \
