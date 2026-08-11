@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <sg2044|k1> <mul_mat|vec_dot|quantize|dequantize|forward|ime1> <kernel> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <mul_mat|vec_dot|quantize|dequantize|forward|unfamiliar|ime1> <kernel> <repetitions>" >&2
   exit 2
 fi
 
@@ -57,6 +57,14 @@ case "${family}" in
     if [[ ${target} == k1 ]]; then
       remote_extra_define=-DGGML_BASELINE_K1=1
     fi
+    ;;
+  unfamiliar)
+    if [[ ${target} != sg2044 ]]; then
+      echo "unfamiliar public-op baselines are only recorded on sg2044" >&2
+      exit 2
+    fi
+    runtime=examples/repro/ggml/unfamiliar_runtime.cpp
+    remote_cpu=8
     ;;
   ime1)
     if [[ ${target} != k1 ]]; then
