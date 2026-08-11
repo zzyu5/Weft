@@ -109,6 +109,15 @@ case "${kernel}" in
     runtime=examples/repro/weft/contraction/blocked_gemm_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
+  blocked_gemm_f32)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: $0 blocked_gemm_f32 <decode|prefill> <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/contraction/blocked_gemm_f32.py
+    runtime=examples/repro/weft/contraction/blocked_gemm_f32_runtime.cpp
+    runtime_arguments=("$1" "$2")
+    ;;
   contiguous_transpose)
     if [[ $# -ne 1 ]]; then
       echo "usage: $0 contiguous_transpose <repetitions>" >&2

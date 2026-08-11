@@ -16,3 +16,5 @@ normalization,layer_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,h
 summary_state,argmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"logits[batch=128;vocab=128256]",full-first-index-argmax,10,0,64,full,no,,,,,16.925466,969.944816,MElements/s
 mixed_pointwise,swiglu_f16_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,ffn[128x14336],full-mixed-dtype-gated-activation,10,0,64,full,no,,,8.72287361e-07,2.40892492e-07,5.844536,313.969834,MElements/s
 indexed_memory,get_rows_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"TinyLlama_embedding[vocab=32000;hidden=2048;tokens=128]",full-indexed-row-copy,10,0,64,full,no,,,,,0.403822,5.193258,GB/s
+dense_contraction,gemm_f32_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-contract,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,17.742197,1.891222,GOP/s
+dense_contraction,gemm_f32_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-contract,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,854.746405,5.024844,GOP/s

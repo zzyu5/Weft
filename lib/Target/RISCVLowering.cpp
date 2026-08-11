@@ -143,6 +143,29 @@ struct VLARegionDecision {
   std::vector<VLAStateDecision> states;
 };
 
+enum class ContractRealization {
+  RVVF32RowMicrotile,
+};
+
+struct ContractDecision {
+  mlir::Operation *operation = nullptr;
+  ContractRealization realization = ContractRealization::RVVF32RowMicrotile;
+  mlir::Operation *consumer = nullptr;
+  mlir::Operation *lhsLoad = nullptr;
+  mlir::Operation *rhsLoad = nullptr;
+  mlir::Value reductionAxis;
+  mlir::Value reductionExtent;
+  mlir::Value rowCoordinate;
+  mlir::Value rowUpper;
+  mlir::Value columnCoordinate;
+  mlir::Value lhsRoot;
+  mlir::Value outputRoot;
+  mlir::Value lhsStride;
+  mlir::Value outputStride;
+  unsigned rowTile = 1;
+  unsigned lmul = 4;
+};
+
 std::string sanitize(llvm::StringRef input) {
   std::string result;
   result.reserve(input.size() + 1);
@@ -872,8 +895,9 @@ private:
     }
     if (auto op = mlir::dyn_cast<LoadOp>(operation))
       return emitLoad(op);
-    if (auto op = mlir::dyn_cast<StoreOp>(operation))
+    if (auto op = mlir::dyn_cast<StoreOp>(operation)) {
       return emitStore(op);
+    }
     if (auto op = mlir::dyn_cast<SummaryFoldOp>(operation))
       return op.emitError(
           "summary_fold must be lowered by its enclosing VLA region");
@@ -2302,6 +2326,268 @@ private:
       return op.emitError("special value kind is unsupported");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, value};
+    return mlir::success();
+  }
+
+  std::optional<std::string>
+  projectContiguousBlockPointer(mlir::Value value, mlir::Value axis) {
+    if (auto pointer = value.getDefiningOp<PtrAddOp>()) {
+      std::optional<std::string> base =
+          projectContiguousBlockPointer(pointer.getBase(), axis);
+      if (!base)
+        return std::nullopt;
+      if (pointer.getOffset() == axis)
+        return base;
+      if (containsBlockType(pointer.getOffset().getType()))
+        return std::nullopt;
+      std::string offset = expression(pointer.getOffset());
+      if (offset.empty())
+        return std::nullopt;
+      return "(" + *base + " + " + offset + ")";
+    }
+    CValue materialized = require(value);
+    if (materialized.kind != CValueKind::Pointer ||
+        materialized.spelling.empty())
+      return std::nullopt;
+    return materialized.spelling;
+  }
+
+  mlir::FailureOr<ContractDecision>
+  decideLocalF32RowMicrotile(StoreOp store, ContractOp contract) {
+    auto unwrapBlock = [](mlir::Type type) -> BlockType {
+      if (auto masked = mlir::dyn_cast<MaskedType>(type))
+        type = masked.getValueType();
+      return mlir::dyn_cast<BlockType>(type);
+    };
+    BlockType lhsType = unwrapBlock(contract.getLhs().getType());
+    BlockType rhsType = unwrapBlock(contract.getRhs().getType());
+    BlockType resultType = unwrapBlock(contract.getResult().getType());
+    auto init = contract.getInit().getDefiningOp<FullOp>();
+    if (store.getValue() != contract.getResult() || !lhsType || !rhsType ||
+        !resultType || lhsType.getShape().size() != 2 ||
+        rhsType.getShape().size() != 1 || resultType.getShape().size() != 1 ||
+        lhsType.getShape()[0] != resultType.getShape()[0] ||
+        lhsType.getShape()[1] != rhsType.getShape()[0] ||
+        resultType.getShape()[0] <= 0 || resultType.getShape()[0] > 6 ||
+        !lhsType.getElementType().isF32() ||
+        !rhsType.getElementType().isF32() ||
+        !resultType.getElementType().isF32() || !init ||
+        !isFloatConstant(init.getValue(), 0.0) ||
+        contract.getLhsAxes().size() != 1 ||
+        contract.getRhsAxes().size() != 1 ||
+        contract.getLhsAxes().front() != 1 ||
+        contract.getRhsAxes().front() != 0 ||
+        contract.getOrder() != "relaxed" || contract.getMath() != "native" ||
+        !contract.getAccDtype().isF32() || !contract.getOutDtype().isF32() ||
+        !isTrue(contract.getWhereLhs()) || !isTrue(contract.getWhereRhs())) {
+      contract.emitError(
+          "RVV row microtile requires a [BM,K] x [K] local f32 contract");
+      return mlir::failure();
+    }
+
+    LoadOp lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
+    LoadOp rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+    if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere())) {
+      contract.emitError("RVV row microtile load producers are unavailable");
+      return mlir::failure();
+    }
+
+    llvm::DenseSet<mlir::Operation *> lhsClosure;
+    llvm::DenseSet<mlir::Operation *> rhsClosure;
+    llvm::SmallVector<BlockAxisOp> lhsAxes;
+    llvm::SmallVector<BlockAxisOp> rhsAxes;
+    if (mlir::failed(collectBlockClosure(contract.getLhs(), lhsClosure, lhsAxes,
+                                         store.getOperation())) ||
+        mlir::failed(collectBlockClosure(contract.getRhs(), rhsClosure, rhsAxes,
+                                         store.getOperation())))
+      return mlir::failure();
+    if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
+        !llvm::is_contained(lhsAxes, rhsAxes.front())) {
+      contract.emitError(
+          "RVV row microtile requires explicit row and shared K block axes");
+      return mlir::failure();
+    }
+
+    ForOp innerLoop = store->getParentOfType<ForOp>();
+    ForOp outerLoop = innerLoop ? innerLoop->getParentOfType<ForOp>() : ForOp{};
+    if (!innerLoop || !outerLoop || outerLoop.getBody().empty() ||
+        innerLoop->getBlock() != &outerLoop.getBody().front()) {
+      contract.emitError(
+          "RVV row microtile requires explicit row and column source loops");
+      return mlir::failure();
+    }
+    mlir::Value outerCoordinate = outerLoop.getBody().front().getArgument(0);
+    mlir::Value innerCoordinate = innerLoop.getBody().front().getArgument(0);
+    auto matchesRoles = [&](mlir::Value rowCoordinate,
+                            mlir::Value columnCoordinate) {
+      return dependsOn(lhsLoad.getPointer(), rowCoordinate) &&
+             !dependsOn(lhsLoad.getPointer(), columnCoordinate) &&
+             dependsOn(rhsLoad.getPointer(), columnCoordinate) &&
+             !dependsOn(rhsLoad.getPointer(), rowCoordinate) &&
+             dependsOn(store.getPointer(), rowCoordinate) &&
+             dependsOn(store.getPointer(), columnCoordinate);
+    };
+    mlir::Value rowCoordinate;
+    mlir::Value columnCoordinate;
+    ForOp rowLoop;
+    if (matchesRoles(innerCoordinate, outerCoordinate)) {
+      rowCoordinate = innerCoordinate;
+      columnCoordinate = outerCoordinate;
+      rowLoop = innerLoop;
+    } else if (matchesRoles(outerCoordinate, innerCoordinate)) {
+      rowCoordinate = outerCoordinate;
+      columnCoordinate = innerCoordinate;
+      rowLoop = outerLoop;
+    } else {
+      contract.emitError(
+          "RVV row microtile access relations do not match its local axes");
+      return mlir::failure();
+    }
+
+    mlir::Value lhsRoot = pointerRoot(lhsLoad.getPointer());
+    mlir::Value rhsRoot = pointerRoot(rhsLoad.getPointer());
+    mlir::Value outputRoot = pointerRoot(store.getPointer());
+    mlir::Value lhsStride = blockStride(lhsLoad.getPointer());
+    mlir::Value outputStride = blockStride(store.getPointer());
+    auto lhsPointer = lhsRoot ? mlir::dyn_cast<PtrType>(lhsRoot.getType())
+                              : PtrType{};
+    auto rhsPointer = rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType())
+                              : PtrType{};
+    auto outputPointer =
+        outputRoot ? mlir::dyn_cast<PtrType>(outputRoot.getType()) : PtrType{};
+    if (!lhsPointer || !rhsPointer || !outputPointer || !lhsStride ||
+        !outputStride || !lhsPointer.getElementType().isF32() ||
+        !rhsPointer.getElementType().isF32() ||
+        !outputPointer.getElementType().isF32()) {
+      contract.emitError("RVV row microtile pointer facts are unavailable");
+      return mlir::failure();
+    }
+
+    ContractDecision decision;
+    decision.operation = contract.getOperation();
+    decision.realization = ContractRealization::RVVF32RowMicrotile;
+    decision.consumer = store.getOperation();
+    decision.lhsLoad = lhsLoad.getOperation();
+    decision.rhsLoad = rhsLoad.getOperation();
+    decision.reductionAxis = rhsAxes.front().getResult();
+    decision.reductionExtent = rhsAxes.front().getExtent();
+    decision.rowCoordinate = rowCoordinate;
+    decision.rowUpper = rowLoop.getUpper();
+    decision.columnCoordinate = columnCoordinate;
+    decision.lhsRoot = lhsRoot;
+    decision.outputRoot = outputRoot;
+    decision.lhsStride = lhsStride;
+    decision.outputStride = outputStride;
+    decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
+    decision.lmul = 4;
+    return decision;
+  }
+
+  std::optional<mlir::LogicalResult>
+  tryEmitLocalF32ContractBlockStore(StoreOp store) {
+    auto contract = store.getValue().getDefiningOp<ContractOp>();
+    if (!contract)
+      return std::nullopt;
+    mlir::FailureOr<ContractDecision> selected =
+        decideLocalF32RowMicrotile(store, contract);
+    if (mlir::failed(selected))
+      return mlir::failure();
+    ContractDecision decision = *selected;
+    auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
+    std::optional<std::string> rhs = projectContiguousBlockPointer(
+        rhsLoad.getPointer(), decision.reductionAxis);
+    CValue lhs = require(decision.lhsRoot);
+    CValue outputValue = require(decision.outputRoot);
+    CValue lhsStrideValue = require(decision.lhsStride);
+    CValue outputStrideValue = require(decision.outputStride);
+    CValue row = require(decision.rowCoordinate);
+    CValue rowUpper = require(decision.rowUpper);
+    CValue column = require(decision.columnCoordinate);
+    std::string extent = expression(decision.reductionExtent);
+    if (!rhs || lhs.spelling.empty() || outputValue.spelling.empty() ||
+        lhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty() ||
+        row.spelling.empty() || rowUpper.spelling.empty() ||
+        column.spelling.empty() || extent.empty())
+      return contract.emitError(
+          "RVV row microtile access projection is unavailable");
+
+    std::string rows = fresh("contract_rows");
+    std::string fullVL = fresh("contract_vlmax");
+    std::string vectorSuffix = "f32m" + std::to_string(decision.lmul);
+    std::string vectorType = "vfloat32m" + std::to_string(decision.lmul) + "_t";
+    line("const size_t " + rows + " = (" + rowUpper.spelling + " - " +
+         row.spelling + ") < " + std::to_string(decision.rowTile) + " ? (" +
+         rowUpper.spelling + " - " + row.spelling + ") : " +
+         std::to_string(decision.rowTile) + ";");
+    line("const size_t " + fullVL + " = __riscv_vsetvlmax_e32m" +
+         std::to_string(decision.lmul) + "();");
+
+    auto emitRows = [&](unsigned rowCount, bool first) {
+      line(std::string(first ? "if" : "else if") + " (" + rows + " == " +
+           std::to_string(rowCount) + ") {");
+      ++indent;
+      llvm::SmallVector<std::string> accumulators;
+      for (unsigned lane = 0; lane < rowCount; ++lane) {
+        std::string accumulator = fresh("contract_acc");
+        line(vectorType + " " + accumulator + " = __riscv_vfmv_v_f_" +
+             vectorSuffix + "(0.0f, " + fullVL + ");");
+        accumulators.push_back(accumulator);
+      }
+      std::string strip = fresh("contract_k");
+      std::string vl = fresh("contract_vl");
+      line("for (size_t " + strip + " = 0; " + strip + " < " + extent +
+           ";) {");
+      ++indent;
+      line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
+           std::to_string(decision.lmul) + "(" + extent + " - " + strip +
+           ");");
+      std::string rhsVector = fresh("contract_rhs");
+      line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+           vectorSuffix + "(" + *rhs + " + " + strip + ", " + vl + ");");
+      for (unsigned lane = 0; lane < rowCount; ++lane) {
+        std::string lhsVector = fresh("contract_lhs");
+        line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
+             vectorSuffix + "(" +
+             lhs.spelling + " + (" + row.spelling + " + " +
+             std::to_string(lane) + ") * " + lhsStrideValue.spelling + " + " +
+             strip + ", " + vl + ");");
+        line(accumulators[lane] + " = __riscv_vfmacc_vv_" + vectorSuffix +
+             "_tu(" +
+             accumulators[lane] + ", " + lhsVector + ", " + rhsVector + ", " +
+             vl + ");");
+      }
+      line(strip + " += " + vl + ";");
+      --indent;
+      line("}");
+      for (unsigned lane = 0; lane < rowCount; ++lane) {
+        std::string seed = fresh("contract_seed");
+        std::string reduced = fresh("contract_reduced");
+        line("vfloat32m1_t " + seed +
+             " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
+        line("vfloat32m1_t " + reduced +
+             " = __riscv_vfredusum_vs_" + vectorSuffix + "_f32m1(" +
+             accumulators[lane] + ", " + seed + ", " + fullVL + ");");
+        line("*(" + outputValue.spelling + " + (" + row.spelling + " + " +
+             std::to_string(lane) + ") * " + outputStrideValue.spelling + " + " +
+             column.spelling + ") = __riscv_vfmv_f_s_f32m1_f32(" + reduced +
+             ");");
+      }
+      --indent;
+      line("}");
+    };
+    for (unsigned count = decision.rowTile; count > 0; --count)
+      emitRows(count, count == decision.rowTile);
+
+    llvm::DenseSet<mlir::Operation *> closure;
+    llvm::SmallVector<BlockAxisOp> axes;
+    for (mlir::Value value : {store.getPointer(), store.getValue(),
+                              store.getWhere()})
+      if (containsBlockType(value.getType()) &&
+          mlir::failed(collectBlockClosure(value, closure, axes,
+                                           store.getOperation())))
+        return mlir::failure();
+    for (mlir::Operation *operation : closure)
+      loweredBlockOps.insert(operation);
     return mlir::success();
   }
 
@@ -3755,6 +4041,8 @@ private:
   }
 
   mlir::LogicalResult emitBlockStores(StoreOp op) {
+    if (auto lowered = tryEmitLocalF32ContractBlockStore(op))
+      return *lowered;
     auto blockExtent = [](mlir::Type type) -> std::optional<int64_t> {
       if (auto masked = mlir::dyn_cast<MaskedType>(type))
         type = masked.getValueType();
