@@ -37,6 +37,30 @@ def WeftExtension_AffineI4I8ContractOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_SymmetricI4I8ContractOp
+    : WeftExtension_Op<"symmetric_i4_i8_contract", [Pure]> {
+  let summary = "Symmetric packed-i4 by signed-i8 block contraction";
+  let description = [{
+    Computes sixteen independent dot products over a thirty-two-element
+    signed-i8 activation block.  packed_weight[n, p] contains two unsigned-i4
+    values whose numerical values are biased by eight.  For
+    p = half * 8 + lane, its low nibble multiplies activation
+    [half * 16 + lane] and its high nibble multiplies activation
+    [half * 16 + lane + 8].  The integer dot is scaled by activation_scale and
+    weight_scale[n], then added to init[n].
+
+    This operation defines only the local numerical relation.  Persistent
+    pointer layout and outer M/N/K traversal remain explicit in Kernel IR;
+    target fragments, registers, and instruction spelling are not represented
+    here.
+  }];
+  let arguments = (ins AnyType:$activation, AnyType:$packed_weight,
+                       AnyType:$activation_scale, AnyType:$weight_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_GroupedAffineI4I8DotOp
     : WeftExtension_Op<"grouped_affine_i4_i8_dot", [Pure]> {
   let summary = "Grouped affine packed-i4 by signed-i8 block dot";

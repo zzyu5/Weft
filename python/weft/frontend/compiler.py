@@ -1876,6 +1876,36 @@ class FrontendCompiler:
             result_types=(operands[-1].type,),
         )[0]
 
+    def _intrinsic_symmetric_i4_i8_contract(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(
+            call,
+            ("activation", "packed_weight"),
+            {
+                "activation_scale": None,
+                "weight_scale": None,
+                "init": None,
+            },
+        )
+        required = (
+            "activation",
+            "packed_weight",
+            "activation_scale",
+            "weight_scale",
+            "init",
+        )
+        if any(args[name] is None for name in required):
+            raise FrontendError(
+                "symmetric_i4_i8_contract requires packed operands, scales, and init",
+                self._location(call),
+            )
+        operands = tuple(self._value_argument(args[name], call) for name in required)
+        return self._emit(
+            "weft_ext.symmetric_i4_i8_contract",
+            call,
+            operands=operands,
+            result_types=(operands[-1].type,),
+        )[0]
+
     def _intrinsic_grouped_affine_i4_i8_dot(self, call: ast.Call) -> Value:
         names = (
             "packed_weight",

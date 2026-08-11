@@ -188,6 +188,24 @@ case "${kernel}" in
     remote_compile_flags=-fno-integrated-as
     remote_link_flags=-lm
     ;;
+  q4_0_projection_ime)
+    if [[ $# -ne 1 ]]; then
+      echo "usage: $0 q4_0_projection_ime <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/ime/q4_0_projection.py
+    runtime=examples/repro/weft/ime/q4_0_projection_runtime.cpp
+    runtime_arguments=("$1")
+    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    target_vlen_bits=256
+    matrix_extension=spacemit-ime1
+    remote_host=k1
+    remote_cpu=3
+    remote_cc=/usr/bin/clang-18
+    remote_cxx=/usr/bin/clang++-18
+    remote_compile_flags=-fno-integrated-as
+    remote_link_flags=-lm
+    ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 ${kernel}" >&2

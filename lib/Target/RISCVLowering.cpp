@@ -33,6 +33,7 @@ enum class CValueKind {
   F16Vector,
   F32Vector,
   I8Vector,
+  F32BlockStorage,
   Mask,
   Tuple,
 };
@@ -88,6 +89,20 @@ struct BlockDecodeDecision {
   int64_t tableExtent = 16;
   RVVBlockVectorShape codeShape = RVVBlockVectorShape::E8M1;
   RVVBlockVectorShape resultShape = RVVBlockVectorShape::E8M1;
+};
+
+enum class SymmetricI4I8Realization {
+  SpacemiTIME1N16K32,
+};
+
+struct SymmetricI4I8Decision {
+  SymmetricI4I8Realization realization =
+      SymmetricI4I8Realization::SpacemiTIME1N16K32;
+  mlir::Value activationBlockBase;
+  mlir::Value packedBlockBase;
+  mlir::Value activationScale;
+  mlir::Value init;
+  int64_t packedBlockBytes = 288;
 };
 
 struct CValue {
@@ -916,6 +931,19 @@ private:
       return op.emitError("scan must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
       return emitGroupedAffineI4I8Dot(op);
+    if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
+      return emitSymmetricI4I8Contract(op);
+    if (auto op = mlir::dyn_cast<FullOp>(operation)) {
+      auto block = mlir::dyn_cast<BlockType>(op.getResult().getType());
+      if (block && block.getShape() == llvm::ArrayRef<int64_t>({16}) &&
+          block.getElementType().isF32())
+        return emitMaterializedBlockFull(op);
+    }
+    if (auto op = mlir::dyn_cast<ForOp>(operation))
+      return emitFor(op);
+    if (auto op = mlir::dyn_cast<StoreOp>(operation))
+      if (auto lowered = tryEmitMaterializedF32BlockStore(op))
+        return *lowered;
     if (hasBlockPayload(operation)) {
       if (auto op = mlir::dyn_cast<StoreOp>(operation))
         return emitBlockStores(op);
@@ -928,8 +956,6 @@ private:
       return emitMeta(op);
     if (auto op = mlir::dyn_cast<IfOp>(operation))
       return emitIf(op);
-    if (auto op = mlir::dyn_cast<ForOp>(operation))
-      return emitFor(op);
     if (auto op = mlir::dyn_cast<VLAOp>(operation))
       return emitVLA(op);
     if (auto op = mlir::dyn_cast<PtrAddOp>(operation))
@@ -997,6 +1023,27 @@ private:
     std::string value = std::to_string(binding->second);
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, value};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitMaterializedBlockFull(FullOp op) {
+    auto block = mlir::dyn_cast<BlockType>(op.getResult().getType());
+    CValue fill = require(op.getValue());
+    if (!block || block.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+        !block.getElementType().isF32() || fill.kind != CValueKind::Scalar ||
+        fill.spelling.empty())
+      return op.emitError(
+          "materialized block full requires a scalar-filled f32 block<16>");
+    std::string storage = fresh("block_storage");
+    std::string lane = fresh("block_init");
+    line("float " + storage + "[16];");
+    line("for (size_t " + lane + " = 0; " + lane + " < 16; ++" + lane + ")");
+    ++indent;
+    line(storage + "[" + lane + "] = " + fill.spelling + ";");
+    --indent;
+    values[op.getResult()] = CValue{op.getResult().getType(),
+                                    CValueKind::F32BlockStorage, storage};
+    loweredBlockOps.insert(op.getOperation());
     return mlir::success();
   }
 
@@ -1072,12 +1119,25 @@ private:
     for (auto [result, initial] :
          llvm::zip(op.getResults(), op.getOperands().drop_front(3))) {
       CValue init = require(initial);
-      if (init.spelling.empty() || init.kind != CValueKind::Scalar)
+      if (init.spelling.empty())
+        return op.emitError("ordered range has an unavailable carried value");
+      CValue value;
+      if (init.kind == CValueKind::Scalar) {
+        value = CValue{result.getType(), CValueKind::Scalar, fresh("carry")};
+        line(scalarCType(result.getType()) + " " + value.spelling + " = " +
+             init.spelling + ";");
+      } else if (init.kind == CValueKind::F32BlockStorage) {
+        auto block = mlir::dyn_cast<BlockType>(result.getType());
+        if (!block || block.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+            !block.getElementType().isF32())
+          return op.emitError(
+              "ordered range block carry must be f32 block<16>");
+        value = init;
+        value.type = result.getType();
+      } else {
         return op.emitError(
-            "ordered range currently carries only scalar values");
-      CValue value{result.getType(), CValueKind::Scalar, fresh("carry")};
-      std::string type = scalarCType(result.getType());
-      line(type + " " + value.spelling + " = " + init.spelling + ";");
+            "ordered range carried value has no physical realization");
+      }
       values[result] = value;
       carried.push_back(value);
     }
@@ -1098,6 +1158,19 @@ private:
            llvm::zip(carried, yield.getOperands())) {
         CValue value = require(yielded);
         if (value.spelling.empty()) {
+          yield.emitError() << unavailableMessage;
+          return mlir::failure();
+        }
+        if (destination.kind == CValueKind::F32BlockStorage) {
+          if (value.kind != CValueKind::F32BlockStorage ||
+              value.spelling != destination.spelling) {
+            yield.emitError(
+                "ordered range block carry must update its selected storage");
+            return mlir::failure();
+          }
+          continue;
+        }
+        if (value.kind != CValueKind::Scalar) {
           yield.emitError() << unavailableMessage;
           return mlir::failure();
         }
@@ -2879,6 +2952,148 @@ private:
     auto highPointer = high.getPointer().getDefiningOp<PtrAddOp>();
     return highPointer && highPointer.getBase() == low.getPointer() &&
            integerConstant(highPointer.getOffset()) == 1;
+  }
+
+  mlir::LogicalResult decideSymmetricI4I8Contract(
+      SymmetricI4I8ContractOp op, SymmetricI4I8Decision &decision) {
+    if (options.target.matrixExtension != "spacemit-ime1")
+      return op.emitError(
+          "symmetric i4/i8 contraction requires --matrix-extension=spacemit-ime1");
+    if (options.target.vlenBits != 256)
+      return op.emitError(
+          "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "symmetric i4/i8 contraction requires little-endian packed fields");
+
+    LoadOp activationLoad = op.getActivation().getDefiningOp<LoadOp>();
+    LoadOp packedCodeLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
+    LoadOp scaleLow;
+    LoadOp scaleHigh;
+    if (!activationLoad || !packedCodeLoad ||
+        !matchF16LELoad(op.getWeightScale(), scaleLow, scaleHigh) ||
+        !isTrue(activationLoad.getWhere()) ||
+        !isTrue(packedCodeLoad.getWhere()))
+      return op.emitError(
+          "IME1 symmetric contraction requires explicit activation, scale, and packed-code loads");
+
+    auto activationLane = activationLoad.getPointer().getDefiningOp<PtrAddOp>();
+    if (!activationLane || !matchBlockAxis(activationLane.getOffset(), 32))
+      return op.emitError(
+          "IME1 symmetric contraction requires a contiguous K32 activation block");
+
+    auto scaleLane = scaleLow.getPointer().getDefiningOp<PtrAddOp>();
+    mlir::Value scaleColumn;
+    if (!scaleLane ||
+        !matchBinaryConstant(scaleLane.getOffset(), "mul", 2, scaleColumn) ||
+        !matchBlockAxis(scaleColumn, 16) ||
+        scalarPointerBase(scaleHigh.getPointer()) != scaleLane.getBase())
+      return op.emitError(
+          "IME1 symmetric contraction requires sixteen little-endian fp16 scales");
+    mlir::Value packedBase = scaleLane.getBase();
+
+    auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
+    auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
+                            : BinaryOp{};
+    auto columnAdd = withinAdd ? withinAdd.getBase().getDefiningOp<PtrAddOp>()
+                               : PtrAddOp{};
+    mlir::Value expandedColumn;
+    auto halfAdd = columnAdd ? columnAdd.getBase().getDefiningOp<PtrAddOp>()
+                             : PtrAddOp{};
+    mlir::Value halfIndex;
+    auto payloadBase = halfAdd ? halfAdd.getBase().getDefiningOp<PtrAddOp>()
+                               : PtrAddOp{};
+    if (!withinAdd || !within || within.getKind() != "mod" ||
+        integerConstant(within.getRhs()) != 8 || !columnAdd ||
+        !matchBinaryConstant(columnAdd.getOffset(), "mul", 8, expandedColumn) ||
+        !matchExpandedAxis(expandedColumn, scaleColumn, 1) || !halfAdd ||
+        !matchBinaryConstant(halfAdd.getOffset(), "mul", 128, halfIndex) ||
+        !payloadBase || payloadBase.getBase() != packedBase ||
+        integerConstant(payloadBase.getOffset()) != 32)
+      return op.emitError(
+          "IME1 symmetric contraction requires the explicit two-half packed-i4 payload");
+    auto half = halfIndex.getDefiningOp<BinaryOp>();
+    auto expandedByte = within.getLhs().getDefiningOp<ExpandDimsOp>();
+    auto expandedHalfByte =
+        half ? half.getLhs().getDefiningOp<ExpandDimsOp>() : ExpandDimsOp{};
+    if (!half || half.getKind() != "div" ||
+        integerConstant(half.getRhs()) != 8 || !expandedByte ||
+        expandedByte.getAxis() != 0 || !expandedHalfByte ||
+        expandedHalfByte.getAxis() != 0 ||
+        expandedHalfByte.getInput() != expandedByte.getInput() ||
+        !matchBlockAxis(expandedByte.getInput(), 16))
+      return op.emitError(
+          "IME1 symmetric contraction requires a local sixteen-byte packed axis");
+
+    decision = SymmetricI4I8Decision{};
+    decision.activationBlockBase = activationLane.getBase();
+    decision.packedBlockBase = packedBase;
+    decision.activationScale = op.getActivationScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitSymmetricI4I8Contract(
+      SymmetricI4I8ContractOp op) {
+    SymmetricI4I8Decision decision;
+    if (mlir::failed(decideSymmetricI4I8Contract(op, decision)))
+      return mlir::failure();
+    CValue activation = require(decision.activationBlockBase);
+    CValue packed = require(decision.packedBlockBase);
+    CValue scale = require(decision.activationScale);
+    CValue accumulator = require(decision.init);
+    if (decision.realization !=
+            SymmetricI4I8Realization::SpacemiTIME1N16K32 ||
+        decision.packedBlockBytes != 288 ||
+        activation.kind != CValueKind::Pointer ||
+        packed.kind != CValueKind::Pointer || scale.kind != CValueKind::Scalar ||
+        accumulator.kind != CValueKind::F32BlockStorage ||
+        activation.spelling.empty() || packed.spelling.empty() ||
+        scale.spelling.empty() || accumulator.spelling.empty())
+      return op.emitError(
+          "selected IME1 symmetric contraction operands are unavailable");
+    line("__weft_ime1_symmetric_i4_i8_n16_k32(" + scale.spelling + ", " +
+         activation.spelling + ", " + packed.spelling + ", " +
+         accumulator.spelling + ");");
+    for (mlir::Value operand :
+         {op.getActivation(), op.getPackedWeight(), op.getWeightScale(),
+          op.getInit()})
+      markDiscardedBlockTree(operand);
+    loweredBlockOps.insert(op.getOperation());
+    accumulator.type = op.getResult().getType();
+    values[op.getResult()] = std::move(accumulator);
+    return mlir::success();
+  }
+
+  std::optional<mlir::LogicalResult>
+  tryEmitMaterializedF32BlockStore(StoreOp op) {
+    auto stored = values.find(op.getValue());
+    if (stored == values.end() ||
+        stored->second.kind != CValueKind::F32BlockStorage)
+      return std::nullopt;
+    if (options.target.vlenBits != 256 || !isTrue(op.getWhere()))
+      return std::optional<mlir::LogicalResult>(op.emitError(
+          "materialized f32 block store requires an all-active VLEN256 target"));
+    auto lanePointer = op.getPointer().getDefiningOp<PtrAddOp>();
+    if (!lanePointer || !matchBlockAxis(lanePointer.getOffset(), 16))
+      return std::optional<mlir::LogicalResult>(op.emitError(
+          "materialized f32 block store requires a contiguous block<16> address"));
+    CValue destination = require(lanePointer.getBase());
+    if (destination.kind != CValueKind::Pointer ||
+        destination.spelling.empty())
+      return std::optional<mlir::LogicalResult>(op.emitError(
+          "materialized f32 block store has no scalar pointer base"));
+    std::string vl = fresh("ime_store_vl");
+    std::string value = fresh("ime_store_value");
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(16);");
+    line("vfloat32m2_t " + value + " = __riscv_vle32_v_f32m2(" +
+         stored->second.spelling + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + destination.spelling + ", " + value +
+         ", " + vl + ");");
+    markDiscardedBlockTree(op.getPointer());
+    loweredBlockOps.insert(op.getOperation());
+    consumed.insert(op.getOperation());
+    return std::optional<mlir::LogicalResult>(mlir::success());
   }
 
   mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
@@ -5074,7 +5289,78 @@ __weft_grouped_affine_i4_i8_vl128(
   "vrgather.vv  v11, v1, v13             \n\t"                          \
   "vadd.vi      v13, v13, -12            \n\t"
 
-static inline void __weft_ime1_affine_i4_i8_n16(
+static inline __attribute__((unused)) void
+__weft_ime1_symmetric_i4_i8_n16_k32(
+    float activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
+  __asm__ volatile(
+        "vsetvli      t0, zero, e32, mf2      \n\t"
+        "addi         s1, %[C], 16           \n\t"
+        "addi         s2, %[C], 32           \n\t"
+        "addi         s3, %[C], 48           \n\t"
+        "vle32.v      v28, (%[C])            \n\t"
+        "vle32.v      v29, (s1)              \n\t"
+        "vle32.v      v30, (s2)              \n\t"
+        "vle32.v      v31, (s3)              \n\t"
+        "addi         s1, %[B], 0            \n\t"
+        "addi         s2, %[B], 8            \n\t"
+        "addi         s3, %[B], 16           \n\t"
+        "addi         s4, %[B], 24           \n\t"
+        "vsetvli      t0, zero, e16, mf4     \n\t"
+        "vle16.v      v4, (s1)               \n\t"
+        "vle16.v      v5, (s2)               \n\t"
+        "vle16.v      v6, (s3)               \n\t"
+        "vle16.v      v7, (s4)               \n\t"
+        "vfwcvt.f.f.v v8, v4                 \n\t"
+        "vfwcvt.f.f.v v9, v5                 \n\t"
+        "vfwcvt.f.f.v v10, v6                \n\t"
+        "vfwcvt.f.f.v v11, v7                \n\t"
+        "vsetvli      t0, zero, e32, mf2     \n\t"
+        "vxor.vv      v16, v16, v16          \n\t"
+        "vxor.vv      v18, v18, v18          \n\t"
+        "vxor.vv      v20, v20, v20          \n\t"
+        "vxor.vv      v22, v22, v22          \n\t"
+        "vfmul.vf     v24, v8, %[AS]         \n\t"
+        "vfmul.vf     v25, v9, %[AS]         \n\t"
+        "vfmul.vf     v26, v10, %[AS]        \n\t"
+        "vfmul.vf     v27, v11, %[AS]        \n\t"
+        "addi         s1, %[B], 32           \n\t"
+        "addi         s2, %[B], 64           \n\t"
+        "addi         s3, %[B], 96           \n\t"
+        "addi         s4, %[B], 128          \n\t"
+        "addi         s5, %[A], 0            \n\t"
+        "addi         s6, %[A], 8            \n\t"
+        "li           t5, 2                  \n\t"
+        "vsetvli      t0, zero, e8, m1       \n\t"
+        "LOOP_INNER%=:                       \n\t"
+        __WEFT_IME1_LOAD_I4_I8_M1
+        "vadd.vi      v0, v0, -8             \n\t"
+        "vadd.vi      v1, v1, -8             \n\t"
+        "vadd.vi      v2, v2, -8             \n\t"
+        "vadd.vi      v3, v3, -8             \n\t"
+        "vadd.vi      v4, v4, -8             \n\t"
+        "vadd.vi      v5, v5, -8             \n\t"
+        "vadd.vi      v6, v6, -8             \n\t"
+        "vadd.vi      v7, v7, -8             \n\t"
+        __WEFT_IME1_COMP_I4_I8_M1
+        "bnez         t5, LOOP_INNER%=       \n\t"
+        "vsetvli      t0, zero, e32, mf2     \n\t"
+        __WEFT_IME1_ACC_I4_I8_M1
+        "addi         s1, %[C], 16           \n\t"
+        "addi         s2, %[C], 32           \n\t"
+        "addi         s3, %[C], 48           \n\t"
+        "vse32.v      v28, (%[C])            \n\t"
+        "vse32.v      v29, (s1)              \n\t"
+        "vse32.v      v30, (s2)              \n\t"
+        "vse32.v      v31, (s3)              \n\t"
+        :
+        : [AS] "f"(activation_scale), [A] "r"(activation_code),
+          [B] "r"(packed_weight), [C] "r"(accumulator)
+        : "cc", "memory", "t0", "t5", "s1", "s2", "s3", "s4", "s5",
+          "s6");
+}
+
+static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
     const float *activation_scale, const int8_t *activation_code,
     const uint8_t *packed_weight, float *output, size_t nblks,
     size_t block_count) {
@@ -5254,6 +5540,7 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
   bool usesGroupedI4I8 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
   module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
+  module.walk([&](SymmetricI4I8ContractOp) { usesIME1 = true; });
   module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
   emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8);
 

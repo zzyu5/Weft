@@ -20,3 +20,4 @@ dense_contraction,gemm_f32_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-
 dense_contraction,gemm_f32_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-contract,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,854.746405,5.024844,GOP/s
 quantization,quantize_q8_0,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-ggml-q8_0-block-quantization,10,0,64,full,no,0,0,0,0,4.126398,444.699711,MElements/s
 quantized_decode,dequantize_iq4_nl,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-IQ4_NL-dequantization,10,0,64,full,no,,,0,0,5.715355,733.865875,MElements/s
+matrix_extension,q4_0_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0.0312509537,0.0312504768,3.188198,10.524576,GOP/s
