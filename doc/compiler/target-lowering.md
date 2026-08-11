@@ -2,24 +2,25 @@
 
 ## Target profile
 
-每次 lowering 必须绑定一个 RISC-V target profile。它保存 architectural facts：
+每次 lowering 必须绑定一个 `RISCVTargetProfile`。当前 public profile由 `--march`、`--abi`、
+`--vlen-bits` 与 `--matrix-extension` 构造，保存：
 
 ```text
-XLEN / ABI / endianness
-ISA extension set
-supported scalar and vector element widths
-available LMUL set
+target triple / march / ABI / XLEN / endianness
+RVV availability
+fixed VLEN bits，或 0 表示 runtime-unknown
 architectural vector register count
-VLEN fixed value、范围或运行时未知标记
-mask/tail capability
-matrix/quant/vendor extension identity
-fragment shapes and accumulator classes
-rounding/saturation capability
-memory instruction classes
+matrix/vendor extension identity
 ```
 
-可以附加 cache、instruction throughput、latency、preferred unroll 等 microarchitecture hint。
-Hint 只能排序合法物理配置，不能让非法实现变合法。
+`march` 是ISA extension事实的当前载体。随着realization family扩展，profile可以解析出element
+width、LMUL、mask/tail、fragment、rounding与memory instruction等派生capability；这些仍是
+target facts，不形成新IR。Cache、throughput、latency与preferred unroll只能作为hint排序
+合法物理配置，不能让非法实现变合法。
+
+当前 `RISCVLoweringOptions` 的public输入只有target profile与source meta bindings。LMUL、
+microtile、unroll、fragment等物理参数由lowering内部选择；以后若暴露build-time backend
+config，它必须是显式、短生命周期的lowering option，不能进入canonical IR。
 
 ## 内部 realization families
 
@@ -34,8 +35,9 @@ memory permutation  -> RVV segment / indexed / extension permute
 ```
 
 每个 family 的内部定义可以包含 capability predicate、物理参数空间、legality、resource
-equation、local fusion envelope 和 emission hook。它们共同属于一次 target lowering，不拥有
-独立 IR schema、verifier、pipeline front door 或长期 provider registry。
+equation、local fusion envelope 和 emission hook。当前实现可以先只有一个固定合法配置；
+当它扩展成多个candidate时，candidate也只存在于本次lowering，不拥有独立IR schema、
+verifier、pipeline front door或长期provider registry。
 
 一个 family 只能绑定：
 
@@ -51,6 +53,10 @@ kernel name + operator name + model name + q-format route string
 
 Scalar realization若存在，也是明确的局部实现，不是兜底。目标要求 RVV/IME 而局部结构没有
 合法实现时，lowering 必须失败。
+
+当前 `intrinsic-c` backend在module入口整体要求RVV；其中的scalar control/memory仍生成普通
+C，但仓库尚无独立scalar-only target backend。缺少RVV时直接unsupported，不会把整个kernel
+切换到scalar fallback。
 
 ## 算法与物理自由度
 
@@ -73,24 +79,29 @@ Target lowering 拥有：
 - local pure producer/consumer fusion；
 - intrinsic/asm spelling。
 
-Target lowering不得改变 source outer loop、staging、ABI、logical predicate、state algebra 或
-observable numerical mode。
+Target lowering不得改变source-visible iteration/effect semantics、algorithmic loop boundary、
+staging、ABI、logical predicate、state algebra或observable numerical mode。在这些语义保持
+不变且legality成立时，可以改变物理loop形态，执行strip-mining、unroll、interchange、
+software pipeline与primitive-local fusion。
 
 ## 新语义与新硬件
 
-若新硬件只是更快实现现有语义，例如用 IME fragment 实现 `W.contract`，只增加 target-local
-realization。
+若新硬件只是更快实现现有语义，例如用矩阵fragment实现普通 `W.contract`，只增加
+target-local realization。
 
 若硬件引入可观察的新语义，例如 block-scaled accumulation、特有 codebook、saturation、
 rounding或 lane permutation，则增加一个局部 canonical primitive。禁止增加
 `softmax_kernel`、`q4_K_gemm_kernel` 等整算子 op。
 
-若扩展要求改变 outer traversal、cache blocking、persistent packing、多阶段 staging 或跨
-primitive state，作者或上游必须提供完整 source variant。Target lowering不自动发明算法
-variant。
+若扩展要求改变outer traversal、cache blocking、persistent packing、多阶段staging或跨
+primitive state，作者或上游必须提供完整source variant。Target lowering不自动发明算法
+variant。当前 `weft_ext.affine_i4_i8_contract` 与 `grouped_affine_i4_i8_dot` 都只定义局部
+observable quantized relation；它们周围的packing、pointer和loop仍属于Kernel IR。
 
 ## 组合判据
 
-同一 kernel 中必须自然允许多个 VLA、reduce、summary、irregular relation、contract 与扩展
-fragment同时存在。增加一种能力时扩展局部 primitive lowering，而不是增加互斥的
-`KernelKind`、format route 或 whole-kernel emitter。
+同一kernel中必须自然允许多个VLA、reduce、summary、irregular relation、contract与扩展
+fragment同时存在。增加能力时扩展局部primitive lowering，而不是增加互斥的`KernelKind`、
+format route或whole-kernel emitter。一个local envelope可以跨多个相邻pure producer/
+consumer，甚至联合安排相邻primitive，但选择必须从明确canonical anchor出发，不能把整个
+loop nest的形状当作operator identity。

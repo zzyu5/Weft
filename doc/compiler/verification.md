@@ -1,69 +1,62 @@
-# Verifier、作者义务与禁止退化
+# Legality 与错误边界
 
-## 24. Verifier 义务
+Weft只验证编译所需、局部可判定的结构事实，不建立证明、审批、认证或测试合同。
 
-Canonical verifier 必须检查：
+## Frontend 与 canonical IR
 
-- kernel ABI 与 type legality；
-- pointer arithmetic type；
-- VLA region lexical nesting；
-- VLA value 不非法逃逸；
-- VLA region 中无任意外层 state mutation；
-- block shape 与 broadcast；
-- dynamic extent identity；
-- contract paired axes 与 output shape；
-- reduce/scan/summary state type；
-- custom lift/merge/finalize purity；
-- masked value 只进入 validity-aware consumer；
-- meta parameter 不进入非法 runtime role；
-- extension primitive dialect 是否注册；
-- effect 与 atomic/fence 基本规则。
+Frontend和dialect verifier负责拒绝自相矛盾的IR，例如：
 
-Target lowering 必须在内部拒绝：
+- entry ABI、argument kind、return与type不一致；
+- pointer arithmetic、shape、broadcast、axis或tuple type不合法；
+- nested VLA、active VLA value逃逸或VLA body任意修改outer state；
+- masked value进入不理解validity的consumer；
+- reduce/scan/summary/contract的operand、state、axis、predicate或result shape不闭合；
+- summary region含memory effect或不以正确type yield；
+- extension dialect未链接，或extension operand不满足其typed local schema。
 
-- target 不支持所选 element width、LMUL、instruction 或 extension；
-- register、fragment、scratch 与 alignment 约束不合法；
-- local fusion envelope 跨越 effect 或改变 canonical algorithm；
-- 一个 primitive 没有明确的 target realization；
-- backend config 包含未知、冲突或非法物理参数。
+Verifier只检查IR内部已经存在的事实，不从tensor shape推导algorithm identity，也不检查它
+是否“像”GEMM、Softmax、Attention或某种q-format。
 
----
+## Target lowering
 
-## 25. 作者义务
+Target lowering针对本次target/profile/config检查：
 
-下列性质通常不能完全静态证明，由作者承担：
+- 所需RVV、fixed VLEN、element width或matrix extension是否存在；
+- 当前primitive closure是否有合法realization；
+- register/fragment/scratch/alignment与local fusion是否可实现；
+- meta/backend binding是否完整且合法。
 
-- `noalias`、alignment 与 bounds assertion 真实成立；
+任何一项不满足都直接返回明确unsupported/error。不存在legacy、GGML、旧emitter或默认
+scalar fallback；正式scalar primitive的普通C lowering不属于fallback。
+
+## 不由 verifier 证明的事实
+
+以下是source/caller语义前提，不建立额外证明系统：
+
+- `noalias`、alignment、bounds与pointer lifetime；
 - VLA non-atomic iteration effect independence；
-- custom summary `merge` 的 identity / associativity / commutativity 声明；
-- runtime work slices 之间无未同步数据竞争；
-- 外部 runtime 传入的 work descriptor 合法；
-- extension-specific semantic primitive 的参数满足其 source contract。
+- custom summary algebra的identity/associativity及声明的commutativity；
+- external worker slices之间的数据竞争与同步；
+- persistent packed storage确实符合source声明的格式。
 
-这些义务必须由文档和 diagnostics 明确，不建立额外审批系统。
+错误输入的行为由对应source contract决定；compiler不添加try/catch、default value或防御性
+fallback来伪装支持。
 
----
+## 工程验证边界
 
-## 26. 禁止退化方向
+实现质量使用手工可运行的真实repro检查：同一DSL source生成target代码，在目标机执行并
+对照数值与性能。Repro不形成新的IR authority、capability database、compatibility layer或
+长期测试框架。
 
-出现以下任一情况，说明实现偏离本规范：
+## 架构退化判据
 
-1. 在 canonical language 中重新引入 `program_id` / grid；
-2. Weft runtime 自行创建线程或把 OpenMP 变成语言语义；
-3. 把整个 worker kernel 当成一个静态 Triton-style tile；
-4. 暴露 `vl`、VLEN、LMUL、lane ID 或 vector register number 给普通 source；
-5. 把 logical block 等同于 register tile 或 IME fragment；
-6. 从普通 multiply/add graph 自动发现并替换成 contract；
-7. 根据 GEMM、Softmax、q4_K 等名字选择整段实现；
-8. 新增扩展时复制整算子 kernel 模板；
-9. target lowering 修改 source outer loop、staging、ABI 或 logical predicate；
-10. capability、legality、physical plan 或 target-local IR 成为第二份持久 authority；
-11. tuner 创造算法结构或让非法 config 合法；
-12. 把 physical tail 存成 canonical logical mask；
-13. 用普通 carried loop 假装 summary fold，同时期待 compiler 猜出 merge；
-14. 把所有 state construct 压成一个无 observable distinction 的 op；
-15. 把 numerical semantics 降成“测试时用容差”，却不给 compiler 合法 reassociation 权；
-16. 让 Python 成为运行时依赖或唯一可生成 IR 的入口；
-17. 将 extension evidence、approval 或 certification 变成 DSL 核心抽象。
+以下行为直接违反规范：
 
----
+- 在canonical language重新引入program grid、implicit worker/hart identity或physical lane ID；
+- target从普通SSA graph、完整shape、kernel/operator/q-format名字猜algorithm skeleton；
+- target创建source中不存在的algorithmic loop、staging、persistent layout或state algebra；
+- logical block、register microtile与ISA fragment被合并成同一层；
+- capability、legality、physical configuration或target-local state成为第二份持久authority；
+- extension primitive接管完整kernel outer loops，或inline asm变成whole-kernel emitter；
+- tuner改变observable numerical semantics或使architecturally illegal config变合法；
+- Python成为generated artifact的runtime依赖。

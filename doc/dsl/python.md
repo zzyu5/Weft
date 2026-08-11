@@ -1,8 +1,8 @@
 # Python eDSL 与控制流
 
-## 6. Python DSL 的地位
+## Python DSL 的地位
 
-### 6.1 参考前端，不是运行时发射器
+### 参考前端，不是运行时发射器
 
 Weft Python DSL 是规范化参考 source frontend：
 
@@ -11,14 +11,15 @@ Python Weft source
     → canonical Weft Kernel IR
     → RISC-V target lowering
     → intrinsic C / necessary inline asm
-    → object / static library / header
+    → system C compiler / archiver
+    → object / static library / ordinary C declaration
 ```
 
 Python 不参与生成物运行。运行期不得依赖 Python interpreter、LLVM JIT 或 Weft Python package。
 
 其他前端可以直接生成同一个 canonical Weft Kernel IR，不经过 Python。
 
-### 6.2 Kernel 定义
+### Kernel 定义
 
 ```python
 import weft
@@ -42,7 +43,7 @@ def saxpy(
 Entry 可以返回 `None` 或一个 scalar value；返回类型是 public C ABI 的一部分，不能由
 emitter 根据 kernel 名或 use context 改写。
 
-### 6.3 Kernel 参数类型
+### Kernel 参数类型
 
 核心参数类型：
 
@@ -60,9 +61,12 @@ W.constexpr[T]
 
 `W.index` 是地址和逻辑坐标使用的整数类型，不等于 physical lane index。
 
-`W.constexpr[T]` 是 specialization-time meta-parameter。它与普通 runtime scalar 必须在类型上区分。
+`W.constexpr[T]` 是 specialization-time meta-parameter。Kernel ABI 与 canonical IR 使用
+`!weft_kernel.constexpr<T>` 与普通 runtime scalar 区分；kernel body 通过
+`weft_kernel.meta_value` 读取其已绑定值。该值在 target lowering 前必须绑定，不会成为
+生成 entry 的 runtime 参数。
 
-### 6.4 Pointer qualifier
+### Pointer qualifier
 
 Pointer 参数可以声明：
 
@@ -82,7 +86,7 @@ x: W.ptr[W.f32, W.readonly, W.noalias, W.aligned(64)]
 
 具体 Python typing 形式可以调整，但 canonical IR 必须保存相同事实。
 
-### 6.5 Compile-time meta-parameter
+### Compile-time meta-parameter
 
 ```python
 @weft.kernel
@@ -90,15 +94,14 @@ def gemm_worker(..., BM: W.constexpr[W.index], BN: W.constexpr[W.index], BK: W.c
     ...
 ```
 
-Source 只声明 meta-parameter 的语义位置。候选值集合由 build specification 提供，不要求写进 kernel body。
+Source 声明 meta-parameter 的语义位置与使用位置。候选值集合由外部 build loop 提供，
+不写进 kernel body。基于 meta value 的 loop bound、shape 或 branch 是 specialization-time
+结构；lowering 不得把未绑定 meta value 留成 runtime data-dependent 输入。
 
-禁止在 runtime data-dependent branch 中把 `W.constexpr` 当作普通运行时输入。
 
----
+## Python 控制流
 
-## 7. Python 控制流
-
-### 7.1 Scalar range
+### Scalar range
 
 ```python
 for row in W.range(row_begin, row_end):
@@ -107,9 +110,10 @@ for row in W.range(row_begin, row_end):
 
 `W.range` 是普通有序 scalar loop。作者写出的 carried scalar / block state 必须保持逻辑迭代顺序，除非它被显式改写成 reduce、scan 或 summary fold。
 
-### 7.2 Scalar condition
+### Scalar condition
 
-Python `if` 条件必须是 scalar `i1`。
+Python `if` 条件必须是 scalar `i1`。分支后继续使用的赋值必须在两个分支中都定义，且
+两侧结果类型相同；frontend 将它们显式变成 `weft_kernel.if` 的 region results。
 
 对 VLA / block predicate 必须使用：
 
@@ -119,22 +123,33 @@ W.select(predicate, true_value, false_value)
 
 或 validity-aware memory / structured primitive，不能把 vector predicate 当作 Python 控制流。
 
-### 7.3 While 与 early exit
+### While 与 early exit
 
-`W.while_` 或受限 Python `while` 可以表达有序状态机。其 carried state 默认不可重排、不可跨 iteration 并行。
+受限 Python `while` 表达有序状态机，并 lowering 为 `weft_kernel.while`。条件必须是 scalar
+`i1`，carried state 默认不可重排、不可跨 iteration 并行；`while ... else` 不属于语言。
 
-### 7.4 Helper function
+### Helper function
 
-纯 helper 可以使用：
+纯 helper 使用：
 
 ```python
 @W.pure
 def merge(a, b):
     ...
+    return value
 ```
 
-Effectful helper 必须显式声明 effect，并遵守 kernel ABI / region 限制。
+Effectful helper 使用：
+
+```python
+@W.helper(effects=("read",))
+def load_f16_le(ptr):
+    ...
+    return value
+```
+
+允许声明的 effect 是 `read`、`write`、`atomic` 与 `fence`。Helper 必须以一个 value return
+结束；frontend 将普通 helper inline 到 caller，将 summary helper编译为 canonical region。
+Helper 不是第二份 IR，也不是运行时 Python call。
 
 任意 Python reflection、动态对象、文件 I/O、异常、generator 和运行时 monkey-patching 不属于 kernel language。
-
----

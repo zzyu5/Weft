@@ -1,6 +1,6 @@
 # 语言定位与程序模型
 
-## 0. 最终定义
+## 最终定义
 
 Weft 是一门面向**单个 RISC-V worker / hart** 的高性能 kernel DSL 与 AOT 编译器。
 
@@ -21,9 +21,8 @@ Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它
 - logical block 只作为局部数据域和 structured primitive 的 operand，不是整个程序的根执行单元；
 - RISC-V 的 V、矩阵、量化、重排及 vendor extension 在一次 primitive-local target lowering 中组合接入。
 
----
 
-## 1. 规范用词
+## 规范用词
 
 本文件使用以下约束词：
 
@@ -32,23 +31,22 @@ Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它
 - **应该 / SHOULD**：除非有明确且可说明的原因，否则应遵守；
 - **可以 / MAY**：可选能力，不影响核心语义。
 
----
 
-## 2. 设计目标与非目标
+## 设计目标与非目标
 
-### 2.1 设计目标
+### 设计目标
 
 Weft 必须同时满足：
 
 1. **worker-local kernel 可写性**：作者能直接表达循环、blocking、staging、pointer/index、mask、state 与 structured compute；
 2. **VLA 原生性**：source 不观察固定 VLEN、exact `vl` 或 hardware lane count；
-3. **高性能物理自由度**：target lowering 能决定 LMUL、register tile、unroll、packing、fragment 与 instruction family；
+3. **高性能物理自由度**：target lowering 能决定 LMUL、register microtile、unroll、packing、fragment 与 instruction family；
 4. **RISC-V 扩展局部接入**：新增扩展不要求新增完整 GEMM、Softmax、RMSNorm、量化算子模板；
 5. **AOT 可嵌入性**：产物是普通 object / static library / header，运行期不依赖 Python、LLVM 或 JIT；
 6. **外部 runtime 兼容性**：llama.cpp、ggml、框架线程池或应用自己的调度器可直接调用生成的 worker-local entry；
 7. **算法与 realization 分离**：source 与 Kernel IR 固定 worker-local 算法，物理选择只存在于一次 target lowering 调用中。
 
-### 2.2 非目标
+### 非目标
 
 Weft 不负责：
 
@@ -63,11 +61,10 @@ Weft 不负责：
 - 通用正确性证明、实现审批或 certification framework；
 - 用 kernel 名、格式名、route string 驱动 codegen。
 
----
 
-## 3. 根程序模型
+## 根程序模型
 
-### 3.1 Worker-local kernel
+### Worker-local kernel
 
 一个 Weft kernel 是一个普通可调用函数。它接收显式 pointer / scalar / descriptor 参数，并在当前 worker 上完成一段工作。
 
@@ -89,7 +86,7 @@ Weft 不规定 work slice 的统一形状。应用可以传入：
 
 因此，Weft ABI **不得**强制所有 kernel 使用 `work_begin/work_end`，但允许库提供该常见约定的 helper。
 
-### 3.2 无 program grid
+### 无 program grid
 
 Canonical Weft language 中不存在：
 
@@ -102,7 +99,7 @@ Canonical Weft language 中不存在：
 
 需要工作坐标时，调用者必须将其作为普通参数传入。
 
-### 3.3 普通控制流
+### 普通控制流
 
 作者显式拥有：
 
@@ -113,15 +110,17 @@ Canonical Weft language 中不存在：
 - block 之间的顺序与状态；
 - memory effect 与 atomic/fence。
 
-编译器可以做保持语义的 canonicalization、unroll、hoist、rematerialization 和局部 scheduling，但不得创建一套 source 中不存在的算法骨架。
+编译器可以做保持语义的 strip-mining、canonicalization、unroll、interchange、hoist、
+rematerialization、software pipelining 和局部 scheduling。它可以改变物理循环形态，但不得
+改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
+algorithmic loop、state 与 staging 骨架。
 
----
 
-## 4. 两类一等数据域
+## 两类一等数据域
 
 Weft 不把所有计算统一成一个 Triton 风格 tile。语言有两类互补的一等数据域。
 
-### 4.1 VLA iteration region
+### VLA iteration region
 
 VLA region 表示一个运行时长度的一维逻辑迭代域：
 
@@ -147,7 +146,7 @@ i ∈ [begin, end)
 
 VLA region 是普通 pointwise、memory、reduction、scan 与跨 strip summary 的主要执行域。
 
-### 4.2 Logical block value
+### Logical block value
 
 Logical block 是具有显式 shape 的局部 SSA region value，例如：
 
@@ -163,17 +162,17 @@ Logical block：
 - 可以由 block axis、broadcast、load、reshape、transpose 和 pointwise 产生；
 - 可以作为 `W.contract`、block reduction、permute、decode 等 primitive 的 operand；
 - 不等于 cache block；
-- 不等于 register tile；
+- 不等于 register microtile；
 - 不等于 IME fragment；
 - 不对应独立 worker、program instance 或 launch task；
 - 可以是编译器中的 lazy region value，不要求先物化为实际数组或寄存器集合。
 
-### 4.3 组合形态
+### 组合形态
 
 一个 region value 可以具有：
 
 - 零个或一个 VLA axis；
-- 零个或多个 specialization-time block axes。
+- 零个或多个 logical block axes；extent可以是static/meta，也可以由显式runtime value给出。
 
 Canonical 类型可概念性表示为：
 
@@ -181,40 +180,41 @@ Canonical 类型可概念性表示为：
 region<[* , D0, D1, ...], T>
 ```
 
-其中 `*` 表示当前 VLA axis，`Dk` 是 compile-time / meta block extent。
+其中 `*` 表示当前VLA axis；`Dk` 是static dimension，或以 `-1` 配合显式extent operand
+表示的dynamic/meta dimension。
 
-同一 lexical scope 中最多只能有一个活跃 VLA axis。嵌套第二个 VLA region 必须被 verifier 拒绝，除非未来规范显式引入新的多维 VLA 语义。
+当前 canonical language 在同一 lexical scope 中只允许一个活跃 VLA axis。嵌套第二个
+VLA region 必须被拒绝；这是当前语言能力边界，用来保持 region identity 与 state 语义
+唯一，并不是把 RVV lane count 暴露给 source。未来若引入多维 VLA，必须定义新的语言
+语义，不能由 target 自动猜测。
 
 `W.contract` 不得缩并 VLA axis；跨 VLA axis 的聚合必须使用 reduce、scan 或 summary fold。VLA axis 可以作为 contract 的 batch/free axis。
 
----
 
-## 5. Tile 与分块层次
+## Tile 与分块层次
 
 Weft 必须区分以下四层，不得混用同一个 `tile` 概念：
 
-### 5.1 Algorithmic / cache block
+### Algorithmic / cache block
 
 由作者决定是否存在、位于哪个循环层、如何影响 memory reuse。典型参数为 `BM/BN/BK`。
 
 这些参数可以是 build-time meta-parameter，但其**存在和使用位置**属于 source algorithm。
 
-### 5.2 Logical operand block
+### Logical operand block
 
 由 source 构造并由 structured primitive 消费的 shaped semantic value。
 
 它只描述局部坐标域与数据关系，不声明寄存器或 ISA fragment。
 
-### 5.3 Register microtile
+### Register microtile
 
 例如 `mr × nr` accumulator、register repeat、LMUL 组合及 K-unroll。
 
 它属于 target lowering 的物理配置空间，由 lowering 检查 legality，构建期 tuning 循环选择。
 
-### 5.4 ISA fragment
+### ISA fragment
 
 例如某个矩阵扩展规定的 `4×4×8`、accumulator register class 或 encoded operand tile。
 
 它是具体扩展的硬件叶子，只存在于 target lowering 的瞬态状态与生成代码中，不进入通用 source block 类型。
-
----

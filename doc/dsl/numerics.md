@@ -1,8 +1,8 @@
 # 数值语义
 
-## 14. Numerical semantics
+## Numerical semantics
 
-### 14.1 最小数值接口
+### 最小数值接口
 
 Weft 不建立全局 numerical contract framework。只有真正影响 observable semantics 与高性能 lowering 的属性进入 op：
 
@@ -14,7 +14,7 @@ Weft 不建立全局 numerical contract framework。只有真正影响 observabl
 - saturation；
 - exceptional-value policy（仅相关 op）。
 
-### 14.2 Reduction order
+### Reduction order
 
 `order` 至少支持：
 
@@ -24,7 +24,7 @@ Weft 不建立全局 numerical contract framework。只有真正影响 observabl
 
 Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA reduction。需要严格复现时，作者必须显式选择 `"ordered"`。
 
-### 14.3 跨 VLEN 可复现性
+### 跨 VLEN 可复现性
 
 对于 `order="relaxed"` 的 floating reduce、summary fold 或 contract：
 
@@ -33,7 +33,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 - Weft 不承诺 bitwise reproducibility；
 - 该差异是语言允许的实现自由，而不只是测试策略。
 
-### 14.4 Math mode
+### Math mode
 
 `math` 至少支持：
 
@@ -45,21 +45,25 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 近似 `exp`、`rsqrt`、activation 等 target realization 必须满足相应 primitive 定义的 value semantics；误差测试属于实现质量，不进入 source 认证流程。
 
-### 14.5 Quantization
+### Conversion、narrow 与 quantization
 
-窄化、量化与饱和 op 必须显式定义：
+四种 conversion 必须区分：
 
-- source / destination dtype；
-- scale / zero-point / codebook relation；
-- rounding mode；
-- saturation / wrap policy。
+- `W.cast(value, dtype)`：普通逐元素数值转换；
+- `W.widen(value, dtype)`：显式无损/增宽 conversion intent；
+- `W.narrow(value, dtype, rounding="rne", saturation=False)`：显式窄化、rounding 与 saturation；
+- `W.bitcast(value, dtype)`：等 bit width、逐元素保留 bit pattern。
 
-如果某个 RISC-V 扩展改变这些 observable semantics，必须增加新的局部 primitive 或显式属性，不能伪装成普通 cast/contract 的无差别 lowering。
+`W.narrow` 不隐含 scale、zero-point、codebook 或 packed storage。完整 quantization relation必须
+由 source 中的显式 scale/math与 `W.narrow` 共同表达，或由一个 typed local quantization/
+extension primitive表达。Persistent packed layout与写入位置仍属于 source algorithm。
+
+如果某个 RISC-V 扩展改变 observable scale、zero-point、codebook、rounding、saturation或
+accumulation语义，必须增加新的局部 primitive或显式属性，不能伪装成普通 cast/contract
+的无差别 lowering。
 
 `W.bitcast(value, dtype)` 只允许相同固定 bit width 的 scalar element type，并逐元素保留
-bit pattern。它不执行数值转换；普通数值转换继续使用 `W.cast`、`W.widen` 或 `W.narrow`。
+bit pattern。它不把多个 byte lane重组为宽 element，也不隐含端序 assembly。
 
 `&`、`|`、`^`、`<<` 与 `>>` 只接受 integer/index element。右移遵守 operand 的有符号性：
 signed integer 使用算术右移，unsigned integer 使用逻辑右移。
-
----

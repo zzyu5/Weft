@@ -17,11 +17,11 @@ Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写完�
 5. [数值语义](dsl/numerics.md)
 6. [Python DSL API 索引](dsl/api.md)
 7. [编译器总架构](compiler/architecture.md)
-8. [RISC-V target lowering](compiler/target-lowering.md)
-9. [构建期 tuning](compiler/tuning.md)
-10. [Canonical Kernel IR](compiler/kernel-ir.md)
-11. [Lowering 与 artifact](compiler/lowering-and-artifacts.md)
-12. [Verifier、作者义务与禁止退化](compiler/verification.md)
+8. [Canonical Kernel IR](compiler/kernel-ir.md)
+9. [RISC-V target lowering](compiler/target-lowering.md)
+10. [Lowering、工具与 artifact](compiler/lowering-and-artifacts.md)
+11. [构建期 tuning](compiler/tuning.md)
+12. [Legality 与错误边界](compiler/verification.md)
 
 典型 kernel 的 canonical 写法单独放在 `kernels/`：
 
@@ -31,6 +31,8 @@ Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写完�
 - [Online softmax](kernels/online-softmax.md)
 - [Blocked GEMM](kernels/gemm.md)
 - [Extension primitive](kernels/extensions.md)
+- [Packed quantization 与 irregular access](kernels/quantized-local.md)
+- [Transpose、RoPE 与 online attention composition](kernels/attention-composition.md)
 
 ## 文档分工
 

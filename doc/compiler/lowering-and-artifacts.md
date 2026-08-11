@@ -1,65 +1,90 @@
-# Lowering 与 Artifact
+# Lowering、工具与 Artifact
 
-## Target lowering
+## `weft-compile` 的当前边界
+
+`weft-compile` 接收一份可独立parse/verify的canonical Weft MLIR module。当前public emit只有：
+
+```text
+--emit=kernel-ir
+--emit=intrinsic-c
+```
+
+`kernel-ir` 打印canonical module；`intrinsic-c` 直接调用RISC-V target lowering。Target参数是
+`--march`、`--abi`、`--vlen-bits`、`--matrix-extension`，source meta通过
+`--meta=NAME=INTEGER`绑定。不存在selected IR、physical-plan输入、provider front door或
+legacy emitter。
 
 Target lowering 的完整事实来源只有：
 
 ```text
-Canonical Kernel IR + static target facts + explicit backend config
+canonical Kernel IR
++ linked local extension dialect
++ static RISC-V target facts
++ explicit meta/backend bindings
 ```
 
-它在一次调用内完成 capability、legality、resource calculation、物理参数选择与 emission。
-这些机制可以拆成内部 C++ 模块，但不能各自成为长期 stage、IR dialect 或可从外部注入的
-authority。
+它在一次调用内完成capability、legality、resource calculation、物理参数选择与emission。
+内部C++可以按primitive family拆分，但这些机制不能成为长期stage、可单独输入的dialect或
+第二份authority。
 
-Target lowering 可以决定：
+## Lowering 拥有的物理选择
 
-- VLA 的动态 `vl` mechanics、SEW、LMUL 与 unroll；
-- unit-stride、strided、indexed、segment 或 scalar memory realization；
-- reduction tree、widening accumulator 与跨 strip state；
-- contract 的 register microtile、K unroll、fragment 与短生命周期 packing；
-- decode、lookup、repack 与 contract 的局部 fusion；
-- RVV intrinsic、IME 或 vendor-extension inline asm leaf；
-- 由 backend config 明确绑定的物理参数。
+Target lowering可以决定：
+
+- VLA的dynamic `vl` mechanics、SEW、LMUL与unroll；
+- unit-stride、strided、indexed、segment或scalar memory realization；
+- reduction tree、widening accumulator与跨strip physical state；
+- contract的register microtile、K-unroll、fragment与短生命周期packing；
+- decode、lookup、repack与contract的local fusion；
+- RVV intrinsic、IME或vendor-extension inline asm leaf；
+- backend config显式绑定或target内部唯一合法的物理参数。
 
 它不得：
 
-- 根据 kernel 名、算子名、q-format 名或整体 shape 选择完整模板；
-- 从 tensor shape 猜 source loop、state boundary 或 contraction identity；
-- 创建 source 中不存在的 cache blocking、staging 或 persistent layout；
-- 从 `materials/`、GGML、旧 route registry 或旧 emitter 读取运行时代码；
-- 对 unsupported primitive 使用 catch-all、默认 scalar 或 legacy fallback。
+- 根据kernel名、operator名、q-format名或整体shape选择完整模板；
+- 从tensor shape猜source loop、state boundary或contraction identity；
+- 创建source中不存在的cache blocking、staging、persistent layout或state algebra；
+- 从`materials/`、GGML、旧route registry或旧emitter读取production代码；
+- 对unsupported primitive使用catch-all、legacy或GGML fallback。
+
+普通scalar control/memory的C lowering是canonical primitive的正式realization，不是fallback。
 
 ## Intrinsic C 与 inline asm
 
-正常输出是可读的 C translation unit：
+正常输出是可读的C translation unit：
 
-- 普通 ABI、scalar control 与 pointer arithmetic 使用 C11；
-- RVV 使用 `<riscv_vector.h>` intrinsic；
-- 只有 system intrinsic 无法表达的扩展 leaf 使用局部 inline asm；
-- 生成 kernel 内不得出现 `std::vector`、动态 tensor wrapper、逐元素临时容器或 C++ runtime；
-- local stack/scratch 只有在 target lowering 明确选择且资源合法时存在。
+- 普通ABI、scalar control与pointer arithmetic使用C11；
+- RVV使用 `<riscv_vector.h>` intrinsic；
+- system intrinsic无法表达或会破坏必要register organization的extension leaf可以使用局部
+  inline asm；
+- generated kernel不得出现`std::vector`、dynamic tensor wrapper、逐元素临时容器或C++
+  runtime；
+- local stack/scratch只在target明确选择且资源合法时存在。
 
-Inline asm 只能实现一个 typed primitive/fragment leaf，不能接管完整 kernel outer loops。
+一个typed leaf可以展开为多条目标指令，包括setup、decode、fragment operation和accumulator
+update；inline asm边界由semantic primitive决定，不以“一条指令”计数。它不能接管完整
+kernel outer loops或引入source中不存在的算法语义。
 
-## Artifact 类型
+## Build-owned artifact
 
-唯一主链必须能够形成：
+System C compiler与archiver从同一份generated source继续形成普通artifact：
 
 ```text
-canonical Kernel MLIR
-readable intrinsic C / necessary inline asm
-relocatable object
-static library
-C-compatible public header
+canonical Weft Kernel IR
+→ readable intrinsic C / necessary inline asm
+→ relocatable object
+→ optional static library
+→ application-owned C declaration/header
 ```
 
-Object 与 library 由系统 C compiler 和 archiver 从同一份 generated source 产生，不建立新的
-compiler IR stage。
+Object、archive与header不是新的compiler IR stage。当前 `weft-compile` CLI止于Kernel IR或
+intrinsic C；`examples/run/weft.sh` 展示的是build层继续调用target system compiler并形成
+executable的真实路径。Application可以从source-defined ABI维护普通declaration；不得让
+header反向成为第二份kernel semantics。
 
 ## Runtime ABI
 
-生成 entry 具有普通 C ABI。实际参数由 kernel source 决定，例如：
+Generated entry具有普通C ABI。实际参数由kernel source决定，例如：
 
 ```c
 void rms_norm_worker(
@@ -72,10 +97,11 @@ void rms_norm_worker(
     float eps);
 ```
 
-Weft artifact 不创建线程。外部 runtime 负责 worker ranges、thread pool、affinity 和多核调度。
+Weft artifact不创建线程。外部runtime负责worker ranges、thread pool、affinity与多核调度。
 
-## Extension 与 multiversion
+## Multiversion
 
-一个 target 可以构建多个 object variant；轻量 AOT dispatcher 可以根据 shape predicate、
-alignment、stride、fixed VLEN 或 extension fact 选择已经生成的 entry。Dispatcher 不管理
-线程，不调用 compiler，也不是 unsupported lowering 的 fallback。
+同一source可以针对shape/alignment/stride/fixed VLEN/extension fact构建多个AOT object。
+Lightweight dispatcher只在这些已生成entry中选择；shape predicate只能选择已声明算法的
+specialized artifact，不能推断primitive、loop或state identity。Dispatcher不管理线程、
+不调用compiler，也不是unsupported lowering的fallback。

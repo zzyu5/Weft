@@ -1,6 +1,6 @@
 # Worker-local Blocked GEMM
 
-### 23.5 Worker-local blocked GEMM
+## Worker-local blocked GEMM
 
 ```python
 @weft.kernel
@@ -37,7 +37,7 @@ def gemm_worker(
                 b_valid = (k_rhs < k) & (n_idx < n)
 
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
-                b_blk = W.load(b + k_rhs * ldb + n_idx, where=b_valid)
+                b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
                 acc = W.contract(
                     a_blk,
@@ -61,6 +61,7 @@ def gemm_worker(
 这里：
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
+- `a` 的logical layout是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major persistent layout；
 - block values 与 contraction axes 归 canonical semantics；
 - `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
 - 外部 runtime 决定每个 worker 的 `[m_begin,m_end)`。

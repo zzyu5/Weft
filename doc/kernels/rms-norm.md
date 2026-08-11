@@ -1,12 +1,12 @@
 # RMSNorm Worker
 
-### 23.2 RMSNorm worker
+## 两遍 RMSNorm worker
 
 ```python
 @weft.kernel
 def rms_norm_worker(
-    x: W.ptr[W.f32],
-    y: W.ptr[W.f32],
+    x: W.ptr[W.f32, W.readonly, W.noalias],
+    y: W.ptr[W.f32, W.writeonly, W.noalias],
     row_begin: W.index,
     row_end: W.index,
     cols: W.index,

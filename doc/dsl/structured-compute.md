@@ -1,8 +1,8 @@
 # Contraction 与 State Algebra
 
-## 12. Contraction 规范
+## Contraction 规范
 
-### 12.1 定义
+### 定义
 
 `W.contract` 表达当前 logical operand blocks 上的 tensor contraction：
 
@@ -27,7 +27,11 @@ acc = W.contract(
 - logical validity；
 - numerical mode。
 
-### 12.2 Operand 必须是 region value
+Canonical `weft_kernel.contract` 保存 `lhs/rhs/init`、`where_lhs/where_rhs`、paired axes、
+`output_order`、accumulator/output dtype、`order` 与 `math`。这些字段都是 source semantics，
+不能由 target 从 shape 或 use context补出。
+
+### Operand 必须是 region value
 
 `lhs` 与 `rhs` 必须是 logical block / region value。
 
@@ -42,7 +46,7 @@ for k in W.range(...):
 
 作者必须显式使用 `W.contract` 才把局部 contraction decomposition 权交给 target lowering。
 
-### 12.3 三层辖域
+### 三层辖域
 
 作者拥有：
 
@@ -70,7 +74,7 @@ Target lowering 拥有：
 - extension instruction family；
 - op-local software pipeline。
 
-### 12.4 Packing 边界
+### Packing 边界
 
 Target lowering 只能自动决定 contract-local、短生命周期且不会越过 primitive 边界的 packing/scratch。
 
@@ -82,7 +86,7 @@ Target lowering 只能自动决定 contract-local、短生命周期且不会越�
 - 跨 outer loop 保留的 transformed storage；
 - 改变 source-visible memory effect 的 staging。
 
-### 12.5 Shape 规则
+### Shape 规则
 
 Paired contraction axes 必须具有相同 logical extent identity。仅两个维度都打印为 `-1` 或运行时数值偶然相等，不构成相等证明。
 
@@ -92,11 +96,13 @@ Paired contraction axes 必须具有相同 logical extent identity。仅两个�
 lhs 未收缩轴，随后 rhs 未收缩轴
 ```
 
-可以通过 `output_order` 显式重排。
+可以通过 `output_order` 显式重排。若 operand 是 active VLA region，VLA axis 不能被收缩，
+必须作为结果的第一个 free/batch axis保留；`output_order` 也不能把它移出首位。
 
-`init` 必须是 scalar 或 output-shaped region value。
+`init` 必须是 scalar 或 output-shaped block/region value，element type 等于 `acc_dtype`。
+`where_lhs` 与 `where_rhs` 是显式 logical predicate，并必须能广播到对应 operand footprint。
 
-### 12.6 Python 签名
+### Python 签名
 
 ```python
 W.contract(
@@ -118,24 +124,27 @@ W.contract(
 
 `W.dot` 可以作为 rank-1/rank-2 convenience，但 canonical IR 必须统一为 contraction。
 
-### 12.7 Target lowering 不得做的事
+### Target lowering 不得做的事
 
 Contract lowering 禁止：
 
 - 创建 source 中不存在的 outer K loop；
 - 修改 cache block 位置；
 - 把普通 pointwise graph 改写成 contract；
-- 跨多个 source contract 合并成新的算法；
+- 把多个 source contract 改写成语义不同的新算法；
 - 改变 init、axes、output order、logical predicate 或 memory effect；
 - 用 kernel 名或格式名选择实现。
 
----
+Target 可以在 effect/alias/numerical legality成立时联合 lower相邻 contract、共享局部 loads、
+packing或instruction schedule，但每个 contract 的 axes、init、output、predicate与state boundary
+必须仍然成立。
 
-## 13. State algebra
+
+## State algebra
 
 Weft 表面提供四种 state construct，但它们共享清楚的代数基础。
 
-### 13.1 Reduce
+### Reduce
 
 ```python
 result = W.reduce(
@@ -151,11 +160,13 @@ result = W.reduce(
 
 语义：只观察最终聚合状态。
 
-对于当前 VLA region，`axis=None` 默认消去当前 VLA axis。对于 block value，必须显式给出 block axis 或使用无歧义默认。
+对于当前 VLA region，`axis=None` 消去 active VLA axis；canonical 记为 `axis=-1`。对于 block
+value必须显式给出有效 block axis。Built-in reduce kind 是 `add`、`max`、`min`、`mul`、
+`and` 与 `or`；masked/`where=false` 元素等价于 identity，不把 validity带到结果。
 
 Compiler 可以产生 lane-local reduction、tree reduction、cross-strip accumulator 与 extension reduction instruction。
 
-### 13.2 Scan
+### Scan
 
 ```python
 prefix = W.scan(
@@ -165,6 +176,8 @@ prefix = W.scan(
     inclusive=True,
     where=True,
     segment_start=None,
+    order="ordered",
+    acc_dtype=...,
 )
 ```
 
@@ -174,7 +187,7 @@ Scan 的 output order 是 source-observable，不能退化成只输出最终值�
 
 `segment_start` 是独立语义，不得由 logical mask 隐式猜测。
 
-### 13.3 Summary fold
+### Summary fold
 
 ```python
 state_or_result = W.summary_fold(
@@ -201,7 +214,10 @@ finalize(state) -> result
 
 Online softmax 的 rescale 必须写在 `merge` 中，而不是隐藏在普通 carried loop 里。
 
-### 13.4 Sequential carry
+`lift`、`merge` 以及可选 `finalize` 必须是 `@W.pure` helper。Canonical regions 的参数分别是
+element、`(state,state)` 与 state；每个 region只返回一个闭合值，不能含 memory effect。
+
+### Sequential carry
 
 普通 scalar loop 中的 carried state：
 
@@ -213,7 +229,7 @@ for i in W.range(begin, end):
 
 默认严格按 logical iteration order 执行。Compiler 不得将其视为 associative fold，也不得根据代码形状猜测结合律。
 
-### 13.5 共享 algebra interface
+### 共享 algebra interface
 
 Reduce、scan 与 summary fold 都可以实现共同的 associative-state interface：
 
@@ -235,7 +251,7 @@ observable mode: final | prefixes
 
 不得为了复用底层实现而把四种 source 语义合并成一个模糊 op。
 
-### 13.6 User obligation
+### User obligation
 
 对自定义 `merge`，作者必须保证：
 
@@ -246,5 +262,3 @@ observable mode: final | prefixes
 - `lift/merge/finalize` 无未声明 side effect。
 
 Compiler 必须检查类型、region capture 与 effect purity，但不要求证明结合律。代数性质属于显式 user obligation，不引入审批或证明系统。
-
----

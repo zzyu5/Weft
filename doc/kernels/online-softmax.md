@@ -1,6 +1,6 @@
 # Online Softmax Summary
 
-### 23.4 Online softmax summary
+## Closed summary state
 
 ```python
 @W.pure
@@ -11,21 +11,47 @@ def softmax_lift(x):
 def softmax_merge(a, b):
     ma, sa = a
     mb, sb = b
-    m = W.maximum(ma, mb)
-    s = sa * W.exp(ma - m, math="native") + sb * W.exp(mb - m, math="native")
-    return W.tuple(m, s)
-
-with W.vla(0, n) as i:
-    valid = i < logical_n
-    x = W.load(ptr + i, where=valid)
-    state = W.summary_fold(
-        x,
-        identity=W.tuple(W.neg_inf(W.f32), W.f32(0.0)),
-        lift=softmax_lift,
-        merge=softmax_merge,
-        finalize=None,
-        order="preserve",
+    maximum = W.maximum(ma, mb)
+    scaled_sum = sa * W.exp(ma - maximum, math="native") + sb * W.exp(
+        mb - maximum, math="native"
     )
+    return W.tuple(maximum, scaled_sum)
 ```
 
-编译器可以为每个 strip 形成局部 summary，再用 `softmax_merge` 合并。Rescale 是 merge 语义的一部分，不依赖源码中手写的 strip loop。
+`(maximum, scaled_sum)`、identity与rescale都由source定义。Compiler可以在strip内或strip间
+重新组合summary，但不能从一个普通carried loop猜出这个merge。
+
+## Full row softmax
+
+```python
+@weft.kernel
+def softmax_f32(
+    x: W.ptr[W.f32, W.readonly],
+    y: W.ptr[W.f32, W.writeonly],
+    row_begin: W.index,
+    row_end: W.index,
+    cols: W.index,
+    stride: W.index,
+) -> None:
+    for row in W.range(row_begin, row_end):
+        row_offset = row * stride
+        with W.vla(0, cols) as i:
+            value = W.load(x + row_offset + i)
+            state = W.summary_fold(
+                value,
+                identity=W.tuple(W.neg_inf(W.f32), W.f32(0.0)),
+                lift=softmax_lift,
+                merge=softmax_merge,
+                finalize=None,
+                order="preserve",
+            )
+
+        maximum, scaled_sum = state
+        with W.vla(0, cols) as i:
+            value = W.load(x + row_offset + i)
+            probability = W.exp(value - maximum, math="fast") / scaled_sum
+            W.store(y + row_offset + i, probability)
+```
+
+Row loop、第二遍normalize与store属于algorithm skeleton；summary lowering不能吸收并替换成
+一个按`softmax_f32` symbol选择的whole-kernel emitter。

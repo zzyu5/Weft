@@ -1,6 +1,6 @@
 # Predicate Reduction
 
-### 23.3 Predicate 与 reduce identity
+## Predicate 与 reduce identity
 
 ```python
 with W.vla(begin, end) as i:

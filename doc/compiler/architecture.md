@@ -12,8 +12,9 @@ Canonical worker-local Weft Kernel IR
   ├─ logical predicates / masked values
   ├─ logical block values
   ├─ reduce / scan / summary fold
-  ├─ contract / lookup / decode / extension primitives
-  └─ source meta-parameters
+  ├─ contract / lookup / decode / permute
+  ├─ source meta-parameters
+  └─ linked typed local extension primitives
                 │
                 ▼
 RISC-V target lowering
@@ -37,7 +38,8 @@ llama.cpp / ggml / framework / application runtime
   owns threads, work partition and multi-core scheduling
 ```
 
-Kernel IR 是唯一长期编译器表示。Capability query、legality、resource equation、候选枚举、
+Canonical Kernel IR及其已链接 sibling extension dialect是唯一长期编译器表示。
+Capability query、legality、resource equation、候选枚举、
 物理配置选择和 target-local owner data 可以存在于一次 lowering 调用中，但不形成独立
 pipeline stage、持久 IR、可单独输入的 front door 或第二份 authority。
 
@@ -71,9 +73,12 @@ canonical primitive
 + explicit backend config
 ```
 
-局部 lowering 可以吸收相邻的纯 decode、cast、scale、packing producer 或 consumer，但不得
-用完整 kernel shape 或 symbol 选择模板。无法合法生成时直接报 unsupported；不存在 legacy、
-scalar、GGML 或旧 emitter fallback。
+局部 lowering 可以吸收相邻的纯 decode、cast、scale、packing producer 或 consumer，也可
+在不改变 source loop/state boundary 的前提下联合安排相邻 primitive。选择 authority必须
+锚定 canonical primitive/interface及其局部 closure，不能把整个 loop nest归类成一个
+`KernelKind`，也不得用完整 kernel shape或symbol选择模板。无法合法生成时直接报
+unsupported；不存在 legacy、GGML 或旧 emitter fallback。普通 scalar control的 C lowering
+是正式 realization，不是 fallback。
 
 ## 定位一句话
 
