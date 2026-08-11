@@ -1,0 +1,12 @@
+category,kernel,phase,hardware,target,implementation,shape,scope,repetitions,warmup,eviction_mib,correctness_scope,preprocess_in_timed_region,activation_code_mismatches,activation_scale_max_absolute_error,max_absolute_error,max_relative_error,median_ms,throughput,throughput_unit
+pointwise,silu_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,ffn[128x14336],full-tensor-pointwise,10,0,64,full,no,,,1.23280222e-06,1.90230658e-07,4.197469,437.170114,MElements/s
+normalization,rms_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,1.17481629e-06,7.04065175e-07,1.601028,327.469703,MElements/s
+summary_state,softmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"attention[heads=32;Q=128;K=128]",full-attention-score-softmax,10,0,64,full,no,,,5.20255123e-08,5.16609979e-07,2.645742,198.162935,MElements/s
+dense_contraction,gemm_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,7.221713,4.646326,GOP/s
+dense_contraction,gemm_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,330.751278,12.985490,GOP/s
+quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-inline-asm-leaf,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,30,0,64,full,no,,,0,0,12.687497,9.256397,GOP/s
+irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"embedding[vocab=128256;hidden=4096];tokens=128",full-embedding-row-decode,10,0,64,full,no,,,0,0,0.890604,,
+memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,6.034178,0.695091,GB/s
+staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RVV-intrinsic-C,"tokens=128;heads=32;D=128",full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,0.994714,,
+mixed_attention,online_flash_attention_f32_f16,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,23.462027,,
+matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.256607,10.303494,GOP/s
