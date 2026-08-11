@@ -76,6 +76,58 @@ struct CValue {
   std::string laneStride;
 };
 
+enum class LaneRelation {
+  Independent,
+  UnitStride,
+  Strided,
+  NonAffine,
+};
+
+enum class VLAMemoryMode {
+  UnitStride,
+  Strided,
+};
+
+enum class VLAActivityMode {
+  AllActive,
+  PredicateMask,
+};
+
+enum class VLAStoreValueMode {
+  ScalarBroadcast,
+  Vector,
+};
+
+struct VLAPredicateDecision {
+  mlir::Operation *operation = nullptr;
+  mlir::Value coordinate;
+  mlir::Value scalar;
+  VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
+  std::string predicate;
+};
+
+struct VLAAccessDecision {
+  mlir::Operation *operation = nullptr;
+  mlir::Type elementType;
+  VLAMemoryMode memoryMode = VLAMemoryMode::UnitStride;
+  VLAActivityMode activityMode = VLAActivityMode::AllActive;
+  VLAStoreValueMode storeValueMode = VLAStoreValueMode::Vector;
+  mlir::Value predicate;
+  mlir::Value inactiveValue;
+};
+
+struct VLARegionDecision {
+  mlir::Operation *operation = nullptr;
+  mlir::Value coordinate;
+  unsigned dataSEW = 32;
+  unsigned dataLMUL = 2;
+  unsigned indexSEW = 64;
+  unsigned indexLMUL = 4;
+  unsigned maskRatio = 16;
+  std::vector<VLAPredicateDecision> predicates;
+  std::vector<VLAAccessDecision> accesses;
+};
+
 std::string sanitize(llvm::StringRef input) {
   std::string result;
   result.reserve(input.size() + 1);
@@ -172,6 +224,79 @@ bool isTrue(mlir::Value value) {
   auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
                           : mlir::IntegerAttr{};
   return value.getType().isInteger(1) && integer && !integer.getValue().isZero();
+}
+
+bool isRegionValue(mlir::Type type) {
+  if (auto masked = mlir::dyn_cast<MaskedType>(type))
+    type = masked.getValueType();
+  return mlir::isa<RegionType>(type);
+}
+
+std::optional<int64_t> integerConstantValue(mlir::Value value) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant
+                     ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                     : mlir::IntegerAttr{};
+  if (!integer)
+    return std::nullopt;
+  return integer.getInt();
+}
+
+LaneRelation combineLaneRelations(LaneRelation lhs, LaneRelation rhs) {
+  if (lhs == LaneRelation::NonAffine || rhs == LaneRelation::NonAffine)
+    return LaneRelation::NonAffine;
+  if (lhs == LaneRelation::Independent)
+    return rhs;
+  if (rhs == LaneRelation::Independent)
+    return lhs;
+  return LaneRelation::Strided;
+}
+
+LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
+  if (value == coordinate)
+    return LaneRelation::UnitStride;
+  if (auto pointer = value.getDefiningOp<PtrAddOp>())
+    return combineLaneRelations(
+        classifyLaneRelation(pointer.getBase(), coordinate),
+        classifyLaneRelation(pointer.getOffset(), coordinate));
+  if (auto binary = value.getDefiningOp<BinaryOp>()) {
+    LaneRelation lhs = classifyLaneRelation(binary.getLhs(), coordinate);
+    LaneRelation rhs = classifyLaneRelation(binary.getRhs(), coordinate);
+    if (binary.getKind() == "add" || binary.getKind() == "sub")
+      return combineLaneRelations(lhs, rhs);
+    if (binary.getKind() == "mul") {
+      if (lhs != LaneRelation::Independent &&
+          rhs != LaneRelation::Independent)
+        return LaneRelation::NonAffine;
+      LaneRelation dependent =
+          lhs == LaneRelation::Independent ? rhs : lhs;
+      mlir::Value scale =
+          lhs == LaneRelation::Independent ? binary.getLhs() : binary.getRhs();
+      if (dependent == LaneRelation::Independent)
+        return LaneRelation::Independent;
+      if (std::optional<int64_t> constant = integerConstantValue(scale)) {
+        if (*constant == 0)
+          return LaneRelation::Independent;
+        if (*constant == 1)
+          return dependent;
+      }
+      return dependent == LaneRelation::NonAffine ? LaneRelation::NonAffine
+                                                   : LaneRelation::Strided;
+    }
+  }
+  return isRegionValue(value.getType()) ? LaneRelation::NonAffine
+                                        : LaneRelation::Independent;
+}
+
+std::string reversePredicate(llvm::StringRef predicate) {
+  return llvm::StringSwitch<std::string>(predicate)
+      .Case("eq", "eq")
+      .Case("ne", "ne")
+      .Case("lt", "gt")
+      .Case("le", "ge")
+      .Case("gt", "lt")
+      .Case("ge", "le")
+      .Default("");
 }
 
 bool isFloatConstant(mlir::Value value, double expected) {
@@ -349,6 +474,7 @@ private:
   bool inVLA = false;
   bool microBlockVectors = false;
   std::string activeVL;
+  const VLARegionDecision *activeVLADecision = nullptr;
 
   void line(llvm::Twine text) {
     output.indent(indent * 2) << text << '\n';
@@ -386,6 +512,135 @@ private:
         return "NAN";
     }
     return require(value).spelling;
+  }
+
+  const VLAPredicateDecision *
+  findPredicateDecision(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeVLADecision->predicates,
+        [&](const VLAPredicateDecision &decision) {
+          return decision.operation == operation;
+        });
+    return found == activeVLADecision->predicates.end() ? nullptr : &*found;
+  }
+
+  const VLAAccessDecision *
+  findAccessDecision(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeVLADecision->accesses, [&](const VLAAccessDecision &decision) {
+          return decision.operation == operation;
+        });
+    return found == activeVLADecision->accesses.end() ? nullptr : &*found;
+  }
+
+  mlir::FailureOr<VLARegionDecision> decideVLARegion(VLAOp op) {
+    mlir::Block &body = op.getBody().front();
+    VLARegionDecision decision;
+    decision.operation = op.getOperation();
+    decision.coordinate = body.getArgument(0);
+    if (options.target.xlen == 32) {
+      decision.indexSEW = 32;
+      decision.indexLMUL = 2;
+    } else if (options.target.xlen != 64) {
+      op.emitError("VLA index realization requires a 32-bit or 64-bit target");
+      return mlir::failure();
+    }
+
+    for (mlir::Operation &nested : body.without_terminator()) {
+      auto compare = mlir::dyn_cast<CompareOp>(nested);
+      if (!compare || !isRegionValue(compare.getResult().getType()))
+        continue;
+      LaneRelation lhs =
+          classifyLaneRelation(compare.getLhs(), decision.coordinate);
+      LaneRelation rhs =
+          classifyLaneRelation(compare.getRhs(), decision.coordinate);
+      bool lhsCoordinate = lhs != LaneRelation::Independent &&
+                           lhs != LaneRelation::NonAffine;
+      bool rhsCoordinate = rhs != LaneRelation::Independent &&
+                           rhs != LaneRelation::NonAffine;
+      if (lhs == LaneRelation::NonAffine || rhs == LaneRelation::NonAffine ||
+          lhsCoordinate == rhsCoordinate ||
+          !elementType(lhsCoordinate ? compare.getLhs().getType()
+                                     : compare.getRhs().getType())
+               .isIndex()) {
+        compare.emitError(
+            "VLA predicate requires one affine index coordinate and one scalar");
+        return mlir::failure();
+      }
+      std::string predicate =
+          lhsCoordinate ? compare.getPredicate().str()
+                        : reversePredicate(compare.getPredicate());
+      if (predicate.empty()) {
+        compare.emitError("VLA predicate has an unsupported comparison");
+        return mlir::failure();
+      }
+      decision.predicates.push_back(VLAPredicateDecision{
+          compare.getOperation(),
+          lhsCoordinate ? compare.getLhs() : compare.getRhs(),
+          lhsCoordinate ? compare.getRhs() : compare.getLhs(),
+          (lhsCoordinate ? lhs : rhs) == LaneRelation::UnitStride
+              ? VLAMemoryMode::UnitStride
+              : VLAMemoryMode::Strided,
+          std::move(predicate)});
+    }
+
+    auto addAccess = [&](mlir::Operation *operation, mlir::Value pointer,
+                         mlir::Value predicate, mlir::Type accessedElement,
+                         VLAStoreValueMode storeValueMode,
+                         mlir::Value inactiveValue) -> mlir::LogicalResult {
+      LaneRelation relation =
+          classifyLaneRelation(pointer, decision.coordinate);
+      if (relation == LaneRelation::Independent)
+        return mlir::success();
+      if (relation == LaneRelation::NonAffine)
+        return operation->emitError(
+            "VLA memory access is neither affine-strided nor explicitly indexed");
+      VLAActivityMode activityMode = VLAActivityMode::AllActive;
+      if (!isTrue(predicate)) {
+        bool hasPredicateDecision = llvm::any_of(
+            decision.predicates, [&](const VLAPredicateDecision &candidate) {
+              return candidate.operation == predicate.getDefiningOp();
+            });
+        if (!hasPredicateDecision)
+          return operation->emitError(
+              "VLA memory predicate has no physical mask decision");
+        activityMode = VLAActivityMode::PredicateMask;
+      }
+      decision.accesses.push_back(VLAAccessDecision{
+          operation,
+          accessedElement,
+          relation == LaneRelation::UnitStride ? VLAMemoryMode::UnitStride
+                                               : VLAMemoryMode::Strided,
+          activityMode,
+          storeValueMode,
+          predicate,
+          inactiveValue});
+      return mlir::success();
+    };
+
+    for (mlir::Operation &nested : body.without_terminator()) {
+      if (auto load = mlir::dyn_cast<LoadOp>(nested)) {
+        if (mlir::failed(addAccess(
+                load.getOperation(), load.getPointer(), load.getWhere(),
+                elementType(load.getResult().getType()),
+                VLAStoreValueMode::Vector, load.getOther())))
+          return mlir::failure();
+      } else if (auto store = mlir::dyn_cast<StoreOp>(nested)) {
+        VLAStoreValueMode valueMode =
+            isRegionValue(store.getValue().getType())
+                ? VLAStoreValueMode::Vector
+                : VLAStoreValueMode::ScalarBroadcast;
+        if (mlir::failed(addAccess(
+                store.getOperation(), store.getPointer(), store.getWhere(),
+                elementType(store.getValue().getType()), valueMode, {})))
+          return mlir::failure();
+      }
+    }
+    return decision;
   }
 
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
@@ -1147,6 +1402,10 @@ private:
       return mlir::success();
     if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
       return mlir::success();
+    mlir::FailureOr<VLARegionDecision> selected = decideVLARegion(op);
+    if (mlir::failed(selected))
+      return mlir::failure();
+    VLARegionDecision decision = std::move(*selected);
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (mlir::Operation &nested : body.without_terminator()) {
@@ -1192,13 +1451,17 @@ private:
     line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
          " < " + end.spelling + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end.spelling +
-         " - " + strip + ");");
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(decision.dataSEW) + "m" +
+         std::to_string(decision.dataLMUL) + "(" + end.spelling + " - " +
+         strip + ");");
 
     bool previousInVLA = inVLA;
     std::string previousVL = activeVL;
+    const VLARegionDecision *previousDecision = activeVLADecision;
     inVLA = true;
     activeVL = vl;
+    activeVLADecision = &decision;
     CValue coordinate{body.getArgument(0).getType(), CValueKind::Coordinate,
                       strip};
     coordinate.laneStride = "1";
@@ -1222,6 +1485,7 @@ private:
     line(strip + " += " + vl + ";");
     inVLA = previousInVLA;
     activeVL = previousVL;
+    activeVLADecision = previousDecision;
     --indent;
     line("}");
 
@@ -1652,8 +1916,60 @@ private:
   mlir::LogicalResult emitCompare(CompareOp op) {
     CValue lhs = require(op.getLhs());
     CValue rhs = require(op.getRhs());
+    if (const VLAPredicateDecision *decision =
+            findPredicateDecision(op.getOperation())) {
+      CValue coordinate = require(decision->coordinate);
+      CValue scalar = require(decision->scalar);
+      if (coordinate.kind != CValueKind::Coordinate ||
+          scalar.kind != CValueKind::Scalar || coordinate.spelling.empty() ||
+          scalar.spelling.empty() || coordinate.laneStride.empty())
+        return op.emitError("VLA predicate projection is unavailable");
+
+      std::string vectorSuffix = "u" +
+                                 std::to_string(activeVLADecision->indexSEW) +
+                                 "m" +
+                                 std::to_string(activeVLADecision->indexLMUL);
+      std::string maskSuffix =
+          vectorSuffix + "_b" +
+          std::to_string(activeVLADecision->maskRatio);
+      std::string vectorType = "vuint" +
+                               std::to_string(activeVLADecision->indexSEW) +
+                               "m" +
+                               std::to_string(activeVLADecision->indexLMUL) +
+                               "_t";
+      std::string scalarType =
+          "uint" + std::to_string(activeVLADecision->indexSEW) + "_t";
+      std::string lane = fresh("lane_index");
+      line(vectorType + " " + lane + " = __riscv_vid_v_" + vectorSuffix +
+           "(" + activeVL + ");");
+      if (decision->coordinateMode == VLAMemoryMode::Strided)
+        line(lane + " = __riscv_vmul_vx_" + vectorSuffix + "(" + lane +
+             ", (" + scalarType + ")(" + coordinate.laneStride + "), " +
+             activeVL + ");");
+      line(lane + " = __riscv_vadd_vx_" + vectorSuffix + "(" + lane +
+           ", (" + scalarType + ")(" + coordinate.spelling + "), " + activeVL +
+           ");");
+      std::string intrinsic =
+          llvm::StringSwitch<std::string>(decision->predicate)
+              .Case("eq", "__riscv_vmseq_vx_")
+              .Case("ne", "__riscv_vmsne_vx_")
+              .Case("lt", "__riscv_vmsltu_vx_")
+              .Case("le", "__riscv_vmsleu_vx_")
+              .Case("gt", "__riscv_vmsgtu_vx_")
+              .Case("ge", "__riscv_vmsgeu_vx_")
+              .Default("");
+      if (intrinsic.empty())
+        return op.emitError("VLA predicate realization is unavailable");
+      std::string mask = fresh("mask");
+      line("vbool" + std::to_string(activeVLADecision->maskRatio) + "_t " +
+           mask + " = " + intrinsic + maskSuffix + "(" + lane + ", (" +
+           scalarType + ")(" + scalar.spelling + "), " + activeVL + ");");
+      values[op.getResult()] =
+          CValue{op.getResult().getType(), CValueKind::Mask, mask};
+      return mlir::success();
+    }
     if (lhs.kind != CValueKind::Scalar || rhs.kind != CValueKind::Scalar)
-      return op.emitError("RVV predicate lowering is not implemented yet");
+      return op.emitError("VLA predicate has no physical decision");
     llvm::StringRef spelling =
         llvm::StringSwitch<llvm::StringRef>(op.getPredicate())
             .Case("eq", "==")
@@ -1775,32 +2091,79 @@ private:
     if (pointer.kind != CValueKind::Pointer || pointer.spelling.empty())
       return op.emitError("load pointer is unavailable");
     if (inVLA && pointer.lanePointer) {
-      mlir::Type loadedElement = elementType(op.getResult().getType());
+      const VLAAccessDecision *decision =
+          findAccessDecision(op.getOperation());
+      if (!decision)
+        return op.emitError("VLA load has no physical memory decision");
+      mlir::Type loadedElement = decision->elementType;
       if ((!loadedElement.isF32() && !isF16(loadedElement)) ||
-          !isTrue(op.getWhere()) ||
-          !mlir::isa<mlir::NoneType>(op.getOther().getType()) ||
           pointer.laneStride.empty())
-        return op.emitError(
-            "RVV load currently requires an all-active f32 VLA value");
+        return op.emitError("VLA load element realization is unavailable");
+      CValue predicate;
+      std::string maskedOff;
+      if (decision->activityMode == VLAActivityMode::PredicateMask) {
+        predicate = require(decision->predicate);
+        if (predicate.kind != CValueKind::Mask || predicate.spelling.empty())
+          return op.emitError("VLA load mask projection is unavailable");
+        if (mlir::isa<mlir::NoneType>(decision->inactiveValue.getType()))
+          return op.emitError(
+              "masked VLA load requires an explicit inactive value");
+        std::string inactive = expression(decision->inactiveValue);
+        if (inactive.empty())
+          return op.emitError("VLA load inactive value is unavailable");
+        maskedOff = fresh("masked_off");
+        if (loadedElement.isF32())
+          line("vfloat32m2_t " + maskedOff +
+               " = __riscv_vfmv_v_f_f32m2(" + inactive + ", " + activeVL +
+               ");");
+        else
+          line("vfloat16m1_t " + maskedOff +
+               " = __riscv_vfmv_v_f_f16m1(" + inactive + ", " + activeVL +
+               ");");
+      }
       std::string name = fresh("load");
       if (loadedElement.isF32()) {
-        if (pointer.laneStride == "1")
-          line("vfloat32m2_t " + name + " = __riscv_vle32_v_f32m2(" +
-               pointer.spelling + ", " + activeVL + ");");
-        else
-          line("vfloat32m2_t " + name + " = __riscv_vlse32_v_f32m2(" +
-               pointer.spelling + ", (ptrdiff_t)(sizeof(float) * (" +
-               pointer.laneStride + ")), " + activeVL + ");");
+        std::string prefix = "vfloat32m2_t " + name + " = ";
+        if (decision->memoryMode == VLAMemoryMode::UnitStride) {
+          if (decision->activityMode == VLAActivityMode::AllActive)
+            line(prefix + "__riscv_vle32_v_f32m2(" + pointer.spelling + ", " +
+                 activeVL + ");");
+          else
+            line(prefix + "__riscv_vle32_v_f32m2_m(" + predicate.spelling +
+                 ", " + maskedOff + ", " + pointer.spelling + ", " + activeVL +
+                 ");");
+        } else if (decision->activityMode == VLAActivityMode::AllActive) {
+          line(prefix + "__riscv_vlse32_v_f32m2(" + pointer.spelling +
+               ", (ptrdiff_t)(sizeof(float) * (" + pointer.laneStride + ")), " +
+               activeVL + ");");
+        } else {
+          line(prefix + "__riscv_vlse32_v_f32m2_m(" + predicate.spelling +
+               ", " + maskedOff + ", " + pointer.spelling +
+               ", (ptrdiff_t)(sizeof(float) * (" + pointer.laneStride + ")), " +
+               activeVL + ");");
+        }
         values[op.getResult()] =
             CValue{op.getResult().getType(), CValueKind::F32Vector, name};
       } else {
-        if (pointer.laneStride == "1")
-          line("vfloat16m1_t " + name + " = __riscv_vle16_v_f16m1(" +
-               pointer.spelling + ", " + activeVL + ");");
-        else
-          line("vfloat16m1_t " + name + " = __riscv_vlse16_v_f16m1(" +
-               pointer.spelling + ", (ptrdiff_t)(sizeof(_Float16) * (" +
-               pointer.laneStride + ")), " + activeVL + ");");
+        std::string prefix = "vfloat16m1_t " + name + " = ";
+        if (decision->memoryMode == VLAMemoryMode::UnitStride) {
+          if (decision->activityMode == VLAActivityMode::AllActive)
+            line(prefix + "__riscv_vle16_v_f16m1(" + pointer.spelling + ", " +
+                 activeVL + ");");
+          else
+            line(prefix + "__riscv_vle16_v_f16m1_m(" + predicate.spelling +
+                 ", " + maskedOff + ", " + pointer.spelling + ", " + activeVL +
+                 ");");
+        } else if (decision->activityMode == VLAActivityMode::AllActive) {
+          line(prefix + "__riscv_vlse16_v_f16m1(" + pointer.spelling +
+               ", (ptrdiff_t)(sizeof(_Float16) * (" + pointer.laneStride +
+               ")), " + activeVL + ");");
+        } else {
+          line(prefix + "__riscv_vlse16_v_f16m1_m(" + predicate.spelling +
+               ", " + maskedOff + ", " + pointer.spelling +
+               ", (ptrdiff_t)(sizeof(_Float16) * (" + pointer.laneStride +
+               ")), " + activeVL + ");");
+        }
         values[op.getResult()] =
             CValue{op.getResult().getType(), CValueKind::F16Vector, name};
       }
@@ -1828,17 +2191,58 @@ private:
     if (pointer.kind != CValueKind::Pointer || pointer.spelling.empty())
       return op.emitError("store pointer is unavailable");
     if (inVLA && pointer.lanePointer) {
-      if (value.kind != CValueKind::F32Vector || !isTrue(op.getWhere()) ||
+      const VLAAccessDecision *decision =
+          findAccessDecision(op.getOperation());
+      if (!decision)
+        return op.emitError("VLA store has no physical memory decision");
+      if ((!decision->elementType.isF32() && !isF16(decision->elementType)) ||
           pointer.laneStride.empty())
-        return op.emitError(
-            "RVV store currently requires an all-active f32 VLA value");
-      if (pointer.laneStride == "1")
-        line("__riscv_vse32_v_f32m2(" + pointer.spelling + ", " +
+        return op.emitError("VLA store element realization is unavailable");
+
+      bool f32 = decision->elementType.isF32();
+      std::string vector = value.spelling;
+      CValueKind expectedKind = f32 ? CValueKind::F32Vector
+                                    : CValueKind::F16Vector;
+      if (decision->storeValueMode == VLAStoreValueMode::ScalarBroadcast) {
+        if (value.kind != CValueKind::Scalar || value.spelling.empty())
+          return op.emitError("VLA store scalar broadcast is unavailable");
+        vector = fresh("store_value");
+        line(std::string(f32 ? "vfloat32m2_t " : "vfloat16m1_t ") + vector +
+             " = " +
+             (f32 ? "__riscv_vfmv_v_f_f32m2(" :
+                    "__riscv_vfmv_v_f_f16m1(") +
              value.spelling + ", " + activeVL + ");");
-      else
-        line("__riscv_vsse32_v_f32m2(" + pointer.spelling +
-             ", (ptrdiff_t)(sizeof(float) * (" + pointer.laneStride + ")), " +
-             value.spelling + ", " + activeVL + ");");
+      } else if (value.kind != expectedKind || value.spelling.empty()) {
+        return op.emitError("VLA store vector projection is unavailable");
+      }
+
+      CValue predicate;
+      if (decision->activityMode == VLAActivityMode::PredicateMask) {
+        predicate = require(decision->predicate);
+        if (predicate.kind != CValueKind::Mask || predicate.spelling.empty())
+          return op.emitError("VLA store mask projection is unavailable");
+      }
+      std::string sew = f32 ? "32" : "16";
+      std::string suffix = f32 ? "f32m2" : "f16m1";
+      std::string elementCType = f32 ? "float" : "_Float16";
+      if (decision->memoryMode == VLAMemoryMode::UnitStride) {
+        if (decision->activityMode == VLAActivityMode::AllActive)
+          line("__riscv_vse" + sew + "_v_" + suffix + "(" + pointer.spelling +
+               ", " + vector + ", " + activeVL + ");");
+        else
+          line("__riscv_vse" + sew + "_v_" + suffix + "_m(" +
+               predicate.spelling + ", " + pointer.spelling + ", " + vector +
+               ", " + activeVL + ");");
+      } else if (decision->activityMode == VLAActivityMode::AllActive) {
+        line("__riscv_vsse" + sew + "_v_" + suffix + "(" + pointer.spelling +
+             ", (ptrdiff_t)(sizeof(" + elementCType + ") * (" +
+             pointer.laneStride + ")), " + vector + ", " + activeVL + ");");
+      } else {
+        line("__riscv_vsse" + sew + "_v_" + suffix + "_m(" +
+             predicate.spelling + ", " + pointer.spelling +
+             ", (ptrdiff_t)(sizeof(" + elementCType + ") * (" +
+             pointer.laneStride + ")), " + vector + ", " + activeVL + ");");
+      }
       return mlir::success();
     }
     CValue where = require(op.getWhere());

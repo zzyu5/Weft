@@ -10,3 +10,4 @@ memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,
 staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RVV-intrinsic-C,"tokens=128;heads=32;D=128",full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,0.994714,,
 mixed_attention,online_flash_attention_f32_f16,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,23.462027,,
 matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.256607,10.303494,GOP/s
+predicate_memory,causal_mask_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"attention[heads=32;Q=128;K=2048]",full-causal-score-mask,10,0,64,full,no,,,,,6.684719,1254.893138,MElements/s
