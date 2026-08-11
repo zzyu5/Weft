@@ -1020,6 +1020,10 @@ private:
       expression = "(1.0f / sqrtf(" + input.spelling + "))";
     else if (op.getKind() == "abs")
       expression = "fabsf(" + input.spelling + ")";
+    else if (op.getKind() == "sin")
+      expression = "sinf(" + input.spelling + ")";
+    else if (op.getKind() == "cos")
+      expression = "cosf(" + input.spelling + ")";
     else
       return op.emitError(
           "RISC-V scalar lowering does not implement unary kind");

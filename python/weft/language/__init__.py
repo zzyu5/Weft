@@ -18,6 +18,7 @@ from .builtins import block_scaled_contract
 from .builtins import broadcast_to
 from .builtins import cast
 from .builtins import contract
+from .builtins import cos
 from .builtins import decode
 from .builtins import dot
 from .builtins import exp
@@ -44,6 +45,7 @@ from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import scan
 from .builtins import select
+from .builtins import sin
 from .builtins import store
 from .builtins import summary_fold
 from .builtins import transpose

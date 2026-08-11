@@ -1243,6 +1243,12 @@ class FrontendCompiler:
     def _intrinsic_log(self, call: ast.Call) -> Value:
         return self._math_unary(call, "log")
 
+    def _intrinsic_sin(self, call: ast.Call) -> Value:
+        return self._math_unary(call, "sin")
+
+    def _intrinsic_cos(self, call: ast.Call) -> Value:
+        return self._math_unary(call, "cos")
+
     def _intrinsic_rsqrt(self, call: ast.Call) -> Value:
         return self._math_unary(call, "rsqrt")
 

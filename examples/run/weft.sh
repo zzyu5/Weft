@@ -87,6 +87,15 @@ case "${kernel}" in
     runtime=examples/repro/weft/gather/get_rows_q4_k_runtime.cpp
     runtime_arguments=("$1")
     ;;
+  rope_neox)
+    if [[ $# -ne 1 ]]; then
+      echo "usage: $0 rope_neox <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/rotation/rope_neox.py
+    runtime=examples/repro/weft/rotation/rope_neox_runtime.cpp
+    runtime_arguments=("$1")
+    ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 ${kernel}" >&2
