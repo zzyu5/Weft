@@ -169,6 +169,22 @@ case "${kernel}" in
     dsl=examples/kernels/gather/get_rows_f32.py
     runtime=examples/repro/weft/gather/get_rows_f32_runtime.cpp
     ;;
+  add_id)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 add_id" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/gather/add_id.py
+    runtime=examples/repro/weft/gather/add_id_runtime.cpp
+    ;;
+  get_rows_back)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 get_rows_back" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/gather/get_rows_back.py
+    runtime=examples/repro/weft/gather/get_rows_back_runtime.cpp
+    ;;
   rope_neox)
     if [[ $# -ne 1 ]]; then
       echo "usage: $0 rope_neox <repetitions>" >&2
