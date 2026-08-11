@@ -125,6 +125,14 @@ case "${kernel}" in
     dsl=examples/kernels/state/ssm_scan.py
     runtime=examples/repro/weft/state/ssm_scan_runtime.cpp
     ;;
+  rwkv_wkv6)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 rwkv_wkv6" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/rwkv_wkv6.py
+    runtime=examples/repro/weft/state/rwkv_wkv6_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2
