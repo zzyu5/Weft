@@ -37,6 +37,7 @@ struct built_case {
   const char *comparison = nullptr;
   const char *metric = nullptr;
   double work = 0.0;
+  double metricDivisor = 1.0e3;
 };
 
 std::size_t parseRepetitions(const char *text) {
@@ -225,6 +226,108 @@ built_case build(ggml_context *ctx, const char *name) {
     result.work = 5.0 * 256.0 * 256.0 * 64.0 * sizeof(float);
     return result;
   }
+  if (std::strcmp(name, "argsort") == 0) {
+    result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32000, 8);
+    result.output = ggml_argsort(ctx, result.a, GGML_SORT_ORDER_ASC);
+    result.model = "Batched-logits-sort";
+    result.modelShape = "rows=8,vocab=32000";
+    result.implementation = "ggml_cpu_std_sort";
+    result.comparison = "same_semantics_shape_and_layout";
+    return result;
+  }
+  if (std::strcmp(name, "set_rows") == 0) {
+    result.a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 4096, 8, 1);
+    result.b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, 8, 1);
+    result.c = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 128);
+    result.output = ggml_set_rows(ctx, result.a, result.b, result.c);
+    result.model = "KV-cache-row-update";
+    result.modelShape =
+        "heads=8,capacity=4096,updates=128,head_dim=128";
+    result.implementation = "ggml_cpu_set_rows";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_gbytes_s";
+    result.work = 2.0 * 8.0 * 128.0 * 128.0 * sizeof(float);
+    return result;
+  }
+  if (std::strcmp(name, "window_partition") == 0) {
+    result.a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 768, 64, 64, 1);
+    result.output = ggml_win_part(ctx, result.a, 14);
+    result.model = "SAM-window-partition";
+    result.modelShape = "C=768,H=64,W=64,window=14";
+    result.implementation = "ggml_cpu_win_part";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_gbytes_s";
+    result.work = (64.0 * 64.0 * 768.0 + 25.0 * 14.0 * 14.0 * 768.0) *
+                  sizeof(float);
+    return result;
+  }
+  if (std::strcmp(name, "dense_conv2d") == 0) {
+    result.a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 256, 256);
+    result.b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 64, 256, 1);
+    result.output =
+        ggml_conv_2d_direct(ctx, result.a, result.b, 1, 1, 1, 1, 1, 1);
+    result.model = "SAM-dense-convolution";
+    result.modelShape = "N=1,H=64,W=64,IC=256,OC=256,K=3x3,pad=1";
+    result.implementation = "ggml_cpu_direct_conv2d";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_gop_s";
+    result.work = 2.0 * 64.0 * 64.0 * 256.0 * 256.0 * 3.0 * 3.0;
+    return result;
+  }
+  if (std::strcmp(name, "conv_transpose2d") == 0) {
+    result.a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, 128, 256);
+    result.b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 256, 1);
+    result.output = ggml_conv_transpose_2d_p0(ctx, result.a, result.b, 2);
+    result.model = "Decoder-upsample";
+    result.modelShape =
+        "N=1,H=16,W=16,IC=256,OC=128,K=2x2,stride=2";
+    result.implementation = "ggml_cpu_conv_transpose2d";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_gop_s";
+    result.work = 2.0 * 16.0 * 16.0 * 256.0 * 128.0 * 2.0 * 2.0;
+    return result;
+  }
+  if (std::strcmp(name, "rms_norm_backward") == 0) {
+    result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 512);
+    result.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 512);
+    result.output = ggml_rms_norm_back(ctx, result.a, result.b, 1.0e-5F);
+    result.model = "Training-hidden-gradient";
+    result.modelShape = "rows=512,hidden=4096";
+    result.implementation = "ggml_cpu_rms_norm_back";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_melements_s";
+    result.work = 512.0 * 4096.0;
+    result.metricDivisor = 1.0;
+    return result;
+  }
+  if (std::strcmp(name, "out_product") == 0) {
+    result.a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5632, 32);
+    result.b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2048, 32);
+    result.output = ggml_out_prod(ctx, result.a, result.b);
+    result.model = "TinyLlama-linear-gradient";
+    result.modelShape = "rows=2048,columns=5632,samples=32";
+    result.implementation = "ggml_cpu_out_prod";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_gop_s";
+    result.work = 2.0 * 2048.0 * 5632.0 * 32.0;
+    return result;
+  }
+  if (std::strcmp(name, "im2col_backward") == 0) {
+    result.a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2304, 64, 64, 1);
+    result.b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 256, 1);
+    std::int64_t inputShape[4] = {64, 64, 256, 1};
+    result.output = ggml_im2col_back(ctx, result.a, result.b, inputShape, 1, 1,
+                                     1, 1, 1, 1, true);
+    result.model = "SAM-im2col-backward";
+    result.modelShape =
+        "N=1,H=64,W=64,IC=256,K=3x3,pad=1,stride=1";
+    result.implementation = "ggml_cpu_im2col_back";
+    result.comparison = "same_semantics_shape_and_layout";
+    result.metric = "cold_moutput_s";
+    result.work = 64.0 * 64.0 * 256.0;
+    result.metricDivisor = 1.0;
+    return result;
+  }
   return result;
 }
 
@@ -359,6 +462,75 @@ void initialize(const char *name, const built_case &operation) {
       const std::size_t spatial = index % plane;
       return centered(spatial * 64U + channel, 1021, 512.0F);
     });
+    return;
+  }
+  if (std::strcmp(name, "argsort") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      const std::size_t row = index / 32000U;
+      const std::size_t column = index % 32000U;
+      return static_cast<float>((row * 104729U + column * 65537U) %
+                                16777213U) +
+             static_cast<float>(column) / 65536.0F;
+    });
+    return;
+  }
+  if (std::strcmp(name, "set_rows") == 0) {
+    setF32(operation.a, [](std::size_t) { return -7.0F; });
+    setF32(operation.b, [](std::size_t index) {
+      return centered(index, 257, 128.0F);
+    });
+    setI32(operation.c, [](std::size_t update) {
+      return static_cast<std::int32_t>((update * 31U + 17U) % 4096U);
+    });
+    return;
+  }
+  if (std::strcmp(name, "window_partition") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index, 1021, 512.0F);
+    });
+    return;
+  }
+  if (std::strcmp(name, "dense_conv2d") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index * 5U, 131, 512.0F);
+    });
+    setF32(operation.b, [](std::size_t index) {
+      return centered(index, 127, 256.0F);
+    });
+    return;
+  }
+  if (std::strcmp(name, "conv_transpose2d") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index * 7U, 131, 512.0F);
+    });
+    setF32(operation.b, [](std::size_t index) {
+      return centered(index, 127, 256.0F);
+    });
+    return;
+  }
+  if (std::strcmp(name, "rms_norm_backward") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index * 17U, 251, 256.0F);
+    });
+    setF32(operation.b, [](std::size_t index) {
+      return centered(index, 257, 128.0F);
+    });
+    return;
+  }
+  if (std::strcmp(name, "out_product") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index * 3U, 131, 128.0F);
+    });
+    setF32(operation.b, [](std::size_t index) {
+      return centered(index, 127, 64.0F);
+    });
+    return;
+  }
+  if (std::strcmp(name, "im2col_backward") == 0) {
+    setF32(operation.a, [](std::size_t index) {
+      return centered(index * 11U, 251, 256.0F);
+    });
+    setF32(operation.b, [](std::size_t) { return 0.0F; });
   }
 }
 
@@ -393,6 +565,40 @@ bool validateTopK(ggml_tensor *output) {
       return false;
   }
   return true;
+}
+
+bool validateArgsort(ggml_tensor *output) {
+  constexpr std::size_t rows = 8;
+  constexpr std::size_t columns = 32000;
+  std::vector<std::int32_t> actual(rows * columns);
+  ggml_backend_tensor_get(output, actual.data(), 0,
+                          actual.size() * sizeof(std::int32_t));
+  std::vector<std::size_t> order(columns);
+  for (std::size_t row = 0; row < rows; ++row) {
+    std::iota(order.begin(), order.end(), 0U);
+    auto value = [row](std::size_t column) {
+      return static_cast<float>((row * 104729U + column * 65537U) %
+                                16777213U) +
+             static_cast<float>(column) / 65536.0F;
+    };
+    std::sort(order.begin(), order.end(), [&](std::size_t lhs,
+                                               std::size_t rhs) {
+      return value(lhs) < value(rhs);
+    });
+    for (std::size_t column = 0; column < columns; ++column)
+      if (actual[row * columns + column] !=
+          static_cast<std::int32_t>(order[column]))
+        return false;
+  }
+  return true;
+}
+
+bool validateI32(const char *name, ggml_tensor *output) {
+  if (std::strcmp(name, "top_k") == 0)
+    return validateTopK(output);
+  if (std::strcmp(name, "argsort") == 0)
+    return validateArgsort(output);
+  return false;
 }
 
 bool validateF32(ggml_tensor *output, float &sample) {
@@ -477,7 +683,7 @@ int main(int argc, char **argv) {
   float outputSample = 0.0F;
   const bool valid =
       operation.output->type == GGML_TYPE_I32
-          ? validateTopK(operation.output)
+          ? validateI32(argv[1], operation.output)
           : validateF32(operation.output, outputSample);
   if (!valid) {
     std::fprintf(stderr, "invalid output from %s\n", argv[1]);
@@ -523,7 +729,7 @@ int main(int argc, char **argv) {
   std::printf("cold_median_us=%.3f\n", coldMedianUs);
   if (operation.metric != nullptr)
     std::printf("%s=%.6f\n", operation.metric,
-                operation.work / coldMedianUs / 1.0e3);
+                operation.work / coldMedianUs / operation.metricDivisor);
   std::printf("output_sample=%.9g\n", outputSample);
 
   ggml_backend_buffer_free(buffer);
