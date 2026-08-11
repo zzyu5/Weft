@@ -213,6 +213,14 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/q8_0.py
     runtime=examples/repro/weft/quantization/q8_0_runtime.cpp
     ;;
+  dequantize_iq4_nl)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 dequantize_iq4_nl" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/iq4_nl.py
+    runtime=examples/repro/weft/quantization/iq4_nl_runtime.cpp
+    ;;
   *)
     echo "unsupported Weft kernel: ${kernel}" >&2
     exit 2

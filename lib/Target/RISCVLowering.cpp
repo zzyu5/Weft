@@ -51,6 +51,15 @@ enum class BlockValueKind {
   Tuple,
 };
 
+enum class RVVBlockVectorShape {
+  None,
+  E8MF4,
+  E8M1,
+  E16M2,
+  E32M1,
+  E32M4,
+};
+
 struct BlockValue {
   mlir::Type type;
   BlockValueKind kind = BlockValueKind::Scalar;
@@ -66,6 +75,19 @@ struct BlockValue {
   std::string packedTransform;
   std::string packedTransformOperand;
   std::string widenedSpelling;
+  RVVBlockVectorShape vectorShape = RVVBlockVectorShape::None;
+};
+
+enum class BlockDecodeRealization {
+  RVVI8TableGather,
+};
+
+struct BlockDecodeDecision {
+  BlockDecodeRealization realization =
+      BlockDecodeRealization::RVVI8TableGather;
+  int64_t tableExtent = 16;
+  RVVBlockVectorShape codeShape = RVVBlockVectorShape::E8M1;
+  RVVBlockVectorShape resultShape = RVVBlockVectorShape::E8M1;
 };
 
 struct CValue {
@@ -3675,6 +3697,13 @@ private:
          "_" + suffix + "(" + lhs.spelling + ", " + rhs.spelling + ", " +
          vl.str() + ");");
     BlockValue result{op.getResult().getType(), resultKind, name};
+    if (resultKind == BlockValueKind::U8)
+      result.vectorShape = microBlockVectors ? RVVBlockVectorShape::E8MF4
+                                             : RVVBlockVectorShape::E8M1;
+    else if (resultKind == BlockValueKind::U16)
+      result.vectorShape = RVVBlockVectorShape::E16M2;
+    else if (resultKind == BlockValueKind::I32)
+      result.vectorShape = RVVBlockVectorShape::E32M4;
     if (resultKind == BlockValueKind::U8 && op.getKind() == "and") {
       std::optional<int64_t> mask = integerConstant(op.getRhs());
       if (mask && *mask >= 0)
@@ -3735,15 +3764,28 @@ private:
     }
     if (stem.empty() || first.empty() || second.empty())
       return op.emitError("RVV f32 block binary kind is unsupported");
-    std::string suffix = microBlockVectors ? "f32m1" : "f32m4";
-    std::string cType = microBlockVectors ? "vfloat32m1_t" : "vfloat32m4_t";
+    RVVBlockVectorShape shape = lhsVector ? lhs.vectorShape : rhs.vectorShape;
+    if (lhsVector && rhsVector && lhs.vectorShape != rhs.vectorShape)
+      return op.emitError("f32 block binary has incompatible physical vectors");
+    std::string suffix;
+    std::string cType;
+    if (shape == RVVBlockVectorShape::E32M1) {
+      suffix = "f32m1";
+      cType = "vfloat32m1_t";
+    } else if (shape == RVVBlockVectorShape::E32M4) {
+      suffix = "f32m4";
+      cType = "vfloat32m4_t";
+    } else {
+      return op.emitError("f32 block binary has no physical RVV shape");
+    }
     std::string intrinsic =
         "__riscv_" + stem + "_" + form + "_" + suffix;
     std::string name = fresh("block_f32");
     line(cType + " " + name + " = " + intrinsic + "(" + first + ", " + second +
          ", " + vl.str() + ");");
-    blockValues[op.getResult()] =
-        BlockValue{op.getResult().getType(), BlockValueKind::F32, name};
+    BlockValue result{op.getResult().getType(), BlockValueKind::F32, name};
+    result.vectorShape = shape;
+    blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -3804,13 +3846,16 @@ private:
     mlir::Type target = elementType(op.getResult().getType());
     std::string name = fresh("block_cast");
     BlockValueKind kind;
+    RVVBlockVectorShape shape = RVVBlockVectorShape::None;
     if (input.kind == BlockValueKind::Index && target.isUnsignedInteger(8)) {
       kind = BlockValueKind::U8;
+      shape = RVVBlockVectorShape::E8M1;
       line("vuint8m1_t " + name + " = __riscv_vncvt_x_x_w_u8m1(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
                target.isUnsignedInteger(16)) {
       kind = BlockValueKind::U16;
+      shape = RVVBlockVectorShape::E16M2;
       line("vuint16m2_t " + name + " = __riscv_vzext_vf2_u16m2(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
@@ -3824,6 +3869,7 @@ private:
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(32)) {
       kind = BlockValueKind::I32;
+      shape = RVVBlockVectorShape::E32M4;
       std::string extended = fresh("block_u32");
       line("vuint32m4_t " + extended + " = __riscv_vzext_vf2_u32m4(" +
            input.spelling + ", " + vl.str() + ");");
@@ -3832,12 +3878,14 @@ private:
     } else if (input.kind == BlockValueKind::I16 &&
                target.isSignedInteger(32)) {
       kind = BlockValueKind::I32;
+      shape = RVVBlockVectorShape::E32M4;
       line("vint32m4_t " + name + " = __riscv_vsext_vf2_i32m4(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 && target.isF32()) {
       kind = BlockValueKind::F32;
       std::string extended;
       if (microBlockVectors) {
+        shape = RVVBlockVectorShape::E32M1;
         std::string sourceSpelling = input.spelling;
         auto source = blockValues.find(input.packedSource);
         if (input.packedSource && !input.packedTransform.empty()) {
@@ -3869,6 +3917,7 @@ private:
         line("vfloat32m1_t " + name + " = __riscv_vfcvt_f_xu_v_f32m1(" +
              extended + ", " + vl.str() + ");");
       } else {
+        shape = RVVBlockVectorShape::E32M4;
         std::string u16Suffix = "u16m2";
         std::string u16Type = "vuint16m2_t";
         extended = fresh("block_u16");
@@ -3878,10 +3927,21 @@ private:
              " = __riscv_vfwcvt_f_xu_v_f32m4(" + extended + ", " + vl.str() +
              ");");
       }
+    } else if (input.kind == BlockValueKind::I8 && target.isF32() &&
+               input.vectorShape == RVVBlockVectorShape::E8M1) {
+      kind = BlockValueKind::F32;
+      shape = RVVBlockVectorShape::E32M4;
+      std::string extended = fresh("block_i16");
+      line("vint16m2_t " + extended + " = __riscv_vsext_vf2_i16m2(" +
+           input.spelling + ", " + vl.str() + ");");
+      line("vfloat32m4_t " + name +
+           " = __riscv_vfwcvt_f_x_v_f32m4(" + extended + ", " + vl.str() +
+           ");");
     } else {
       return op.emitError("RVV block cast pair is unsupported");
     }
     BlockValue result{op.getResult().getType(), kind, name};
+    result.vectorShape = shape;
     if (kind == BlockValueKind::I32 && name.empty()) {
       result.narrowKind = input.kind;
       result.narrowSpelling = input.spelling;
@@ -3897,20 +3957,32 @@ private:
     mlir::Type target = elementType(op.getResult().getType());
     std::string name = fresh("block_bits");
     BlockValueKind kind;
+    RVVBlockVectorShape shape = RVVBlockVectorShape::None;
     if (input.kind == BlockValueKind::U8 && target.isSignedInteger(8)) {
       kind = BlockValueKind::I8;
-      line("vint8m1_t " + name +
-           " = __riscv_vreinterpret_v_u8m1_i8m1(" + input.spelling + ");");
+      shape = input.vectorShape;
+      if (shape == RVVBlockVectorShape::E8MF4)
+        line("vint8mf4_t " + name +
+             " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input.spelling +
+             ");");
+      else if (shape == RVVBlockVectorShape::E8M1)
+        line("vint8m1_t " + name +
+             " = __riscv_vreinterpret_v_u8m1_i8m1(" + input.spelling +
+             ");");
+      else
+        return op.emitError("u8 block bitcast has no physical RVV shape");
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(16)) {
       kind = BlockValueKind::I16;
+      shape = RVVBlockVectorShape::E16M2;
       line("vint16m2_t " + name +
            " = __riscv_vreinterpret_v_u16m2_i16m2(" + input.spelling + ");");
     } else {
       return op.emitError("RVV block bitcast pair is unsupported");
     }
-    blockValues[op.getResult()] =
-        BlockValue{op.getResult().getType(), kind, name};
+    BlockValue result{op.getResult().getType(), kind, name};
+    result.vectorShape = shape;
+    blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -3950,6 +4022,53 @@ private:
     }
     BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
     result.unsignedMaximum = 255;
+    result.vectorShape = microBlockVectors ? RVVBlockVectorShape::E8MF4
+                                           : RVVBlockVectorShape::E8M1;
+    blockValues[op.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult decideBlockDecode(DecodeOp op,
+                                        BlockDecodeDecision &decision) {
+    auto codes = mlir::dyn_cast<BlockType>(op.getCodes().getType());
+    auto table = mlir::dyn_cast<BlockType>(op.getTable().getType());
+    auto result = mlir::dyn_cast<BlockType>(op.getResult().getType());
+    if (!codes || !table || !result || codes.getShape().size() != 1 ||
+        table.getShape().size() != 1 || result.getShape() != codes.getShape())
+      return op.emitError(
+          "RVV block decode requires rank-one codes, table, and result");
+    if (codes.getShape().front() != 16 || table.getShape().front() != 16 ||
+        !codes.getElementType().isUnsignedInteger(8) ||
+        !table.getElementType().isSignedInteger(8) ||
+        !result.getElementType().isSignedInteger(8) || !isTrue(op.getWhere()))
+      return op.emitError(
+          "RVV block decode requires 16 all-active u8 codes and an i8 table");
+    decision = BlockDecodeDecision{};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockDecode(
+      DecodeOp op, const BlockDecodeDecision &decision,
+      llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      llvm::StringRef vl) {
+    BlockValue codes = lookupBlockValue(op.getCodes(), blockValues);
+    BlockValue table = lookupBlockValue(op.getTable(), blockValues);
+    if (decision.realization != BlockDecodeRealization::RVVI8TableGather ||
+        decision.tableExtent != 16 ||
+        decision.codeShape != RVVBlockVectorShape::E8M1 ||
+        decision.resultShape != RVVBlockVectorShape::E8M1 ||
+        codes.kind != BlockValueKind::U8 ||
+        codes.vectorShape != decision.codeShape ||
+        table.kind != BlockValueKind::I8 ||
+        table.vectorShape != RVVBlockVectorShape::E8M1 ||
+        codes.spelling.empty() || table.spelling.empty())
+      return op.emitError(
+          "RVV block decode operands do not match the selected realization");
+    std::string name = fresh("block_decode");
+    line("vint8m1_t " + name + " = __riscv_vrgather_vv_i8m1(" +
+         table.spelling + ", " + codes.spelling + ", " + vl.str() + ");");
+    BlockValue result{op.getResult().getType(), BlockValueKind::I8, name};
+    result.vectorShape = decision.resultShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -3970,7 +4089,13 @@ private:
         !isTrue(op.getWhere()))
       return op.emitError(
           "RVV block store requires an all-active f32 vector value");
-    std::string suffix = microBlockVectors ? "f32m1" : "f32m4";
+    std::string suffix;
+    if (value.vectorShape == RVVBlockVectorShape::E32M1)
+      suffix = "f32m1";
+    else if (value.vectorShape == RVVBlockVectorShape::E32M4)
+      suffix = "f32m4";
+    else
+      return op.emitError("f32 block store has no physical RVV shape");
     line("__riscv_vse32_v_" + suffix + "(" + pointer.pointerBase + " + " +
          pointer.contiguousIndex + ", " + value.spelling + ", " + vl.str() +
          ");");
@@ -4040,6 +4165,12 @@ private:
       return emitBlockBitcast(op, blockValues);
     if (auto op = mlir::dyn_cast<LoadOp>(operation))
       return emitBlockLoad(op, blockValues, vl);
+    if (auto op = mlir::dyn_cast<DecodeOp>(operation)) {
+      BlockDecodeDecision decision;
+      if (mlir::failed(decideBlockDecode(op, decision)))
+        return mlir::failure();
+      return emitBlockDecode(op, decision, blockValues, vl);
+    }
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       return emitBlockStore(op, blockValues, vl);
     if (auto op = mlir::dyn_cast<SelectOp>(operation))
