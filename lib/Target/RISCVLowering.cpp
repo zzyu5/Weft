@@ -65,6 +65,7 @@ struct CValue {
   std::string spelling;
   bool lanePointer = false;
   std::vector<CValue> fields;
+  std::string laneStride;
 };
 
 std::string sanitize(llvm::StringRef input) {
@@ -592,8 +593,10 @@ private:
     std::string previousVL = activeVL;
     inVLA = true;
     activeVL = vl;
-    values[body.getArgument(0)] =
-        CValue{body.getArgument(0).getType(), CValueKind::Coordinate, strip};
+    CValue coordinate{body.getArgument(0).getType(), CValueKind::Coordinate,
+                      strip};
+    coordinate.laneStride = "1";
+    values[body.getArgument(0)] = std::move(coordinate);
     for (mlir::Operation &nested : body.without_terminator()) {
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
         if (mlir::failed(emitVectorReduce(reduce,
@@ -637,13 +640,16 @@ private:
       return op.emitError("pointer addition has an unavailable operand");
     if (base.kind != CValueKind::Pointer)
       return op.emitError("pointer addition base is not a pointer");
-    bool lanePointer = offset.kind == CValueKind::Coordinate;
-    if (inVLA && offset.kind != CValueKind::Coordinate && base.lanePointer)
-      lanePointer = true;
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::Pointer,
-               "(" + base.spelling + " + " + offset.spelling + ")",
-               lanePointer};
+    CValue result{op.getResult().getType(), CValueKind::Pointer,
+                  "(" + base.spelling + " + " + offset.spelling + ")"};
+    if (offset.kind == CValueKind::Coordinate) {
+      result.lanePointer = true;
+      result.laneStride = offset.laneStride;
+    } else if (inVLA && base.lanePointer) {
+      result.lanePointer = true;
+      result.laneStride = base.laneStride;
+    }
+    values[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -885,6 +891,40 @@ private:
   mlir::LogicalResult emitBinary(BinaryOp op) {
     CValue lhs = require(op.getLhs());
     CValue rhs = require(op.getRhs());
+    bool lhsCoordinate = lhs.kind == CValueKind::Coordinate;
+    bool rhsCoordinate = rhs.kind == CValueKind::Coordinate;
+    if (lhsCoordinate || rhsCoordinate) {
+      if (lhsCoordinate && rhsCoordinate && op.getKind() == "mul")
+        return op.emitError(
+            "VLA coordinate multiplication is not an affine lane address");
+      if (op.getKind() != "add" && op.getKind() != "sub" &&
+          op.getKind() != "mul")
+        return op.emitError(
+            "VLA coordinate arithmetic must preserve an affine lane address");
+
+      std::string firstLane =
+          scalarBinary(op.getKind(), lhs.spelling, rhs.spelling);
+      std::string laneStride;
+      if (op.getKind() == "add") {
+        laneStride = lhsCoordinate && rhsCoordinate
+                         ? "(" + lhs.laneStride + " + " + rhs.laneStride + ")"
+                         : (lhsCoordinate ? lhs.laneStride : rhs.laneStride);
+      } else if (op.getKind() == "sub") {
+        laneStride = lhsCoordinate && rhsCoordinate
+                         ? "(" + lhs.laneStride + " - " + rhs.laneStride + ")"
+                         : (lhsCoordinate ? lhs.laneStride
+                                          : "(-" + rhs.laneStride + ")");
+      } else if (lhsCoordinate)
+        laneStride = "(" + lhs.laneStride + " * " + rhs.spelling + ")";
+      else
+        laneStride = "(" + lhs.spelling + " * " + rhs.laneStride + ")";
+
+      CValue result{op.getResult().getType(), CValueKind::Coordinate,
+                    firstLane};
+      result.laneStride = std::move(laneStride);
+      values[op.getResult()] = std::move(result);
+      return mlir::success();
+    }
     bool lhsVector = lhs.kind == CValueKind::F32Vector;
     bool rhsVector = rhs.kind == CValueKind::F32Vector;
     if (!lhsVector && !rhsVector) {
@@ -1099,12 +1139,18 @@ private:
     if (inVLA && pointer.lanePointer) {
       if (!elementType(op.getResult().getType()).isF32() ||
           !isTrue(op.getWhere()) ||
-          !mlir::isa<mlir::NoneType>(op.getOther().getType()))
+          !mlir::isa<mlir::NoneType>(op.getOther().getType()) ||
+          pointer.laneStride.empty())
         return op.emitError(
             "RVV load currently requires an all-active f32 VLA value");
       std::string name = fresh("load");
-      line("vfloat32m2_t " + name + " = __riscv_vle32_v_f32m2(" +
-           pointer.spelling + ", " + activeVL + ");");
+      if (pointer.laneStride == "1")
+        line("vfloat32m2_t " + name + " = __riscv_vle32_v_f32m2(" +
+             pointer.spelling + ", " + activeVL + ");");
+      else
+        line("vfloat32m2_t " + name + " = __riscv_vlse32_v_f32m2(" +
+             pointer.spelling + ", (ptrdiff_t)(sizeof(float) * (" +
+             pointer.laneStride + ")), " + activeVL + ");");
       values[op.getResult()] =
           CValue{op.getResult().getType(), CValueKind::F32Vector, name};
       return mlir::success();
@@ -1131,11 +1177,17 @@ private:
     if (pointer.kind != CValueKind::Pointer || pointer.spelling.empty())
       return op.emitError("store pointer is unavailable");
     if (inVLA && pointer.lanePointer) {
-      if (value.kind != CValueKind::F32Vector || !isTrue(op.getWhere()))
+      if (value.kind != CValueKind::F32Vector || !isTrue(op.getWhere()) ||
+          pointer.laneStride.empty())
         return op.emitError(
             "RVV store currently requires an all-active f32 VLA value");
-      line("__riscv_vse32_v_f32m2(" + pointer.spelling + ", " +
-           value.spelling + ", " + activeVL + ");");
+      if (pointer.laneStride == "1")
+        line("__riscv_vse32_v_f32m2(" + pointer.spelling + ", " +
+             value.spelling + ", " + activeVL + ");");
+      else
+        line("__riscv_vsse32_v_f32m2(" + pointer.spelling +
+             ", (ptrdiff_t)(sizeof(float) * (" + pointer.laneStride + ")), " +
+             value.spelling + ", " + activeVL + ");");
       return mlir::success();
     }
     CValue where = require(op.getWhere());
