@@ -7,11 +7,13 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <limits>
+#include <vector>
 
 namespace {
 
@@ -182,6 +184,7 @@ bool isRVVF16F32Contract(ContractOp contract,
 struct RVVBlockSelection {
   llvm::DenseSet<mlir::Operation *> axes;
   llvm::DenseSet<mlir::Operation *> unitStrideLoads;
+  llvm::DenseSet<mlir::Operation *> indexedLoads;
   llvm::DenseSet<mlir::Operation *> reductions;
 };
 
@@ -216,77 +219,393 @@ bool isZeroInteger(mlir::Value value, unsigned width, bool isSigned) {
          integer.getValue().isZero();
 }
 
-struct RVVBlockMatch {
-  BlockAxisOp axis;
-  llvm::DenseSet<mlir::Operation *> members;
-  llvm::DenseSet<mlir::Operation *> loads;
+enum class RVVBlockKind {
+  Index,
+  U8,
+  U16,
+  I8,
+  I16,
+  I32,
+  Predicate,
+  PointerU8,
+  Tuple,
 };
 
-bool matchUnitStrideI8Input(mlir::Value value, int64_t extent,
-                            RVVBlockMatch &match) {
-  auto cast = value.getDefiningOp<CastOp>();
-  if (!cast ||
-      !isRankOneBlock(cast.getResult().getType(), extent, [](mlir::Type type) {
-        return isInteger(type, 32, true);
-      }) ||
-      !isRankOneBlock(cast.getInput().getType(), extent, [](mlir::Type type) {
-        return isInteger(type, 8, true);
-      }))
-    return false;
+struct IntegerRange {
+  int64_t minimum;
+  int64_t maximum;
+};
 
-  auto bitcast = cast.getInput().getDefiningOp<BitcastOp>();
-  if (!bitcast ||
-      !isRankOneBlock(bitcast.getInput().getType(), extent, [](mlir::Type type) {
-        return isInteger(type, 8, false);
-      }) ||
-      !isRankOneBlock(bitcast.getResult().getType(), extent, [](mlir::Type type) {
-        return isInteger(type, 8, true);
-      }))
-    return false;
+struct RVVBlockValue {
+  RVVBlockKind kind;
+  BlockAxisOp axis;
+  int64_t extent = 0;
+  bool unitStride = false;
+  std::optional<IntegerRange> range;
+  std::vector<RVVBlockValue> fields;
+};
 
-  auto load = bitcast.getInput().getDefiningOp<LoadOp>();
-  if (!load ||
-      !isRankOneBlock(load.getResult().getType(), extent, [](mlir::Type type) {
-        return isInteger(type, 8, false);
-      }) ||
-      !isTrueScalarPredicate(load.getWhere()) ||
-      !isZeroInteger(load.getOther(), 8, false))
-    return false;
-
-  auto pointer = load.getPointer().getDefiningOp<PtrAddOp>();
-  auto pointerBlock = pointer
-                          ? mlir::dyn_cast<BlockType>(bareType(
-                                pointer.getResult().getType()))
-                          : BlockType{};
-  auto pointerElement = pointerBlock
-                            ? mlir::dyn_cast<PtrType>(
-                                  pointerBlock.getElementType())
-                            : PtrType{};
-  auto basePointer = pointer
-                         ? mlir::dyn_cast<PtrType>(
-                               bareType(pointer.getBase().getType()))
-                         : PtrType{};
-  auto axis = pointer ? pointer.getOffset().getDefiningOp<BlockAxisOp>()
-                      : BlockAxisOp{};
-  if (!pointer || !pointerBlock || pointerBlock.getShape().size() != 1 ||
-      pointerBlock.getShape().front() != extent || !pointerElement ||
-      !basePointer || pointerElement.getElementType() !=
-                          basePointer.getElementType() ||
-      !isInteger(pointerElement.getElementType(), 8, false) || !axis)
-    return false;
-  if (match.axis && match.axis != axis)
-    return false;
-  match.axis = axis;
-  match.members.insert(axis.getOperation());
-  match.members.insert(pointer.getOperation());
-  match.members.insert(load.getOperation());
-  match.members.insert(bitcast.getOperation());
-  match.members.insert(cast.getOperation());
-  match.loads.insert(load.getOperation());
-  return true;
+bool containsBlockPayload(mlir::Type type) {
+  type = bareType(type);
+  if (mlir::isa<BlockType>(type))
+    return true;
+  auto tuple = mlir::dyn_cast<TupleType>(type);
+  return tuple && llvm::any_of(tuple.getTypes(), containsBlockPayload);
 }
 
-bool matchI8DotReduction(ReduceOp reduce, RVVBlockMatch &match) {
+std::optional<RVVBlockKind> scalarKind(mlir::Type type) {
+  if (type.isIndex())
+    return RVVBlockKind::Index;
+  if (type.isInteger(1))
+    return RVVBlockKind::Predicate;
+  if (isInteger(type, 8, false))
+    return RVVBlockKind::U8;
+  if (isInteger(type, 16, false))
+    return RVVBlockKind::U16;
+  if (isInteger(type, 8, true))
+    return RVVBlockKind::I8;
+  if (isInteger(type, 16, true))
+    return RVVBlockKind::I16;
+  if (isInteger(type, 32, true))
+    return RVVBlockKind::I32;
+  if (auto pointer = mlir::dyn_cast<PtrType>(type);
+      pointer && isInteger(pointer.getElementType(), 8, false))
+    return RVVBlockKind::PointerU8;
+  return std::nullopt;
+}
+
+std::optional<RVVBlockKind> blockKind(mlir::Type type) {
+  auto block = mlir::dyn_cast<BlockType>(bareType(type));
+  return block ? scalarKind(block.getElementType()) : std::nullopt;
+}
+
+std::optional<IntegerRange> fullRange(RVVBlockKind kind) {
+  switch (kind) {
+  case RVVBlockKind::U8:
+    return IntegerRange{0, 255};
+  case RVVBlockKind::U16:
+    return IntegerRange{0, 65535};
+  case RVVBlockKind::I8:
+    return IntegerRange{-128, 127};
+  case RVVBlockKind::I16:
+    return IntegerRange{-32768, 32767};
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<IntegerRange> scalarRange(mlir::Value value) {
+  auto constant = value.getDefiningOp<ConstantOp>();
+  auto integer = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                          : mlir::IntegerAttr{};
+  if (!integer)
+    return std::nullopt;
+  int64_t scalar = integer.getInt();
+  return IntegerRange{scalar, scalar};
+}
+
+std::optional<IntegerRange> combineRange(llvm::StringRef kind,
+                                         IntegerRange lhs,
+                                         IntegerRange rhs) {
+  __int128 candidates[4];
+  if (kind == "add") {
+    candidates[0] = static_cast<__int128>(lhs.minimum) + rhs.minimum;
+    candidates[1] = static_cast<__int128>(lhs.minimum) + rhs.maximum;
+    candidates[2] = static_cast<__int128>(lhs.maximum) + rhs.minimum;
+    candidates[3] = static_cast<__int128>(lhs.maximum) + rhs.maximum;
+  } else if (kind == "sub") {
+    candidates[0] = static_cast<__int128>(lhs.minimum) - rhs.minimum;
+    candidates[1] = static_cast<__int128>(lhs.minimum) - rhs.maximum;
+    candidates[2] = static_cast<__int128>(lhs.maximum) - rhs.minimum;
+    candidates[3] = static_cast<__int128>(lhs.maximum) - rhs.maximum;
+  } else if (kind == "mul") {
+    candidates[0] = static_cast<__int128>(lhs.minimum) * rhs.minimum;
+    candidates[1] = static_cast<__int128>(lhs.minimum) * rhs.maximum;
+    candidates[2] = static_cast<__int128>(lhs.maximum) * rhs.minimum;
+    candidates[3] = static_cast<__int128>(lhs.maximum) * rhs.maximum;
+  } else {
+    return std::nullopt;
+  }
+  auto [minimum, maximum] = std::minmax_element(std::begin(candidates),
+                                                std::end(candidates));
+  if (*minimum < std::numeric_limits<int64_t>::min() ||
+      *maximum > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return IntegerRange{static_cast<int64_t>(*minimum),
+                      static_cast<int64_t>(*maximum)};
+}
+
+bool fitsI32(IntegerRange range) {
+  return range.minimum >= std::numeric_limits<int32_t>::min() &&
+         range.maximum <= std::numeric_limits<int32_t>::max();
+}
+
+class RVVBlockAnalyzer {
+public:
+  bool analyze(mlir::Value value, RVVBlockValue &result) {
+    if (auto found = values.find(value); found != values.end()) {
+      result = found->second;
+      return true;
+    }
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition || !visiting.insert(value).second)
+      return false;
+    bool matched = analyzeDefinition(value, definition, result);
+    visiting.erase(value);
+    if (!matched || !claimOwner(result))
+      return false;
+    members.insert(definition);
+    values[value] = result;
+    return true;
+  }
+
+  BlockAxisOp axis;
+  llvm::DenseSet<mlir::Operation *> members;
+  llvm::DenseSet<mlir::Operation *> unitStrideLoads;
+  llvm::DenseSet<mlir::Operation *> indexedLoads;
+
+private:
+  llvm::DenseMap<mlir::Value, RVVBlockValue> values;
+  llvm::DenseSet<mlir::Value> visiting;
+
+  bool claimOwner(const RVVBlockValue &value) {
+    if (value.kind == RVVBlockKind::Tuple) {
+      for (const RVVBlockValue &field : value.fields)
+        if (!claimOwner(field))
+          return false;
+      return true;
+    }
+    if (!value.axis || value.extent <= 0)
+      return false;
+    if (axis && axis != value.axis)
+      return false;
+    axis = value.axis;
+    return true;
+  }
+
+  bool sameOwner(const RVVBlockValue &lhs, const RVVBlockValue &rhs) {
+    return lhs.axis == rhs.axis && lhs.extent == rhs.extent;
+  }
+
+  bool scalarOperand(mlir::Value value, RVVBlockKind expected) {
+    auto kind = scalarKind(bareType(value.getType()));
+    return kind && *kind == expected;
+  }
+
+  bool analyzeDefinition(mlir::Value value, mlir::Operation *definition,
+                         RVVBlockValue &result) {
+    if (auto axisOp = mlir::dyn_cast<BlockAxisOp>(definition)) {
+      auto extent = constantIndexValue(axisOp.getExtent());
+      if (!extent || *extent <= 0 ||
+          !isRankOneBlock(value.getType(), *extent, [](mlir::Type type) {
+            return type.isIndex();
+          }))
+        return false;
+      result = RVVBlockValue{RVVBlockKind::Index, axisOp, *extent};
+      return true;
+    }
+
+    if (auto pointer = mlir::dyn_cast<PtrAddOp>(definition)) {
+      auto resultKind = blockKind(pointer.getResult().getType());
+      auto resultBlock = mlir::dyn_cast<BlockType>(bareType(
+          pointer.getResult().getType()));
+      if (!resultKind || *resultKind != RVVBlockKind::PointerU8 ||
+          !resultBlock || resultBlock.getShape().size() != 1)
+        return false;
+      if (mlir::isa<BlockType>(bareType(pointer.getOffset().getType()))) {
+        RVVBlockValue offset;
+        if (!analyze(pointer.getOffset(), offset) ||
+            offset.kind != RVVBlockKind::Index ||
+            !scalarOperand(pointer.getBase(), RVVBlockKind::PointerU8))
+          return false;
+        result = RVVBlockValue{RVVBlockKind::PointerU8, offset.axis,
+                               offset.extent,
+                               pointer.getOffset().getDefiningOp<BlockAxisOp>() !=
+                                   nullptr};
+        return true;
+      }
+      RVVBlockValue base;
+      if (!analyze(pointer.getBase(), base) ||
+          base.kind != RVVBlockKind::PointerU8 ||
+          !scalarOperand(pointer.getOffset(), RVVBlockKind::Index))
+        return false;
+      result = base;
+      return true;
+    }
+
+    if (auto load = mlir::dyn_cast<LoadOp>(definition)) {
+      RVVBlockValue pointer;
+      auto resultKind = blockKind(load.getResult().getType());
+      if (!resultKind || *resultKind != RVVBlockKind::U8 ||
+          !analyze(load.getPointer(), pointer) ||
+          pointer.kind != RVVBlockKind::PointerU8 ||
+          !isZeroInteger(load.getOther(), 8, false))
+        return false;
+      if (isTrueScalarPredicate(load.getWhere())) {
+      } else {
+        RVVBlockValue predicate;
+        if (!analyze(load.getWhere(), predicate) ||
+            predicate.kind != RVVBlockKind::Predicate ||
+            !sameOwner(pointer, predicate))
+          return false;
+      }
+      result = RVVBlockValue{RVVBlockKind::U8, pointer.axis, pointer.extent,
+                             false, fullRange(RVVBlockKind::U8)};
+      (pointer.unitStride ? unitStrideLoads : indexedLoads)
+          .insert(load.getOperation());
+      return true;
+    }
+
+    if (auto bitcast = mlir::dyn_cast<BitcastOp>(definition)) {
+      RVVBlockValue input;
+      auto source = blockKind(bitcast.getInput().getType());
+      auto target = blockKind(bitcast.getResult().getType());
+      if (!source || !target || !analyze(bitcast.getInput(), input))
+        return false;
+      if (*source == RVVBlockKind::U8 && *target == RVVBlockKind::I8)
+        result = RVVBlockValue{*target, input.axis, input.extent, false,
+                               fullRange(*target)};
+      else if (*source == RVVBlockKind::U16 && *target == RVVBlockKind::I16)
+        result = RVVBlockValue{*target, input.axis, input.extent, false,
+                               fullRange(*target)};
+      else
+        return false;
+      return true;
+    }
+
+    if (auto cast = mlir::dyn_cast<CastOp>(definition)) {
+      RVVBlockValue input;
+      auto source = blockKind(cast.getInput().getType());
+      auto target = blockKind(cast.getResult().getType());
+      if (!source || !target || !analyze(cast.getInput(), input))
+        return false;
+      bool supported =
+          (*source == RVVBlockKind::Index && *target == RVVBlockKind::U8) ||
+          (*source == RVVBlockKind::U8 && *target == RVVBlockKind::U16) ||
+          (*source == RVVBlockKind::U8 && *target == RVVBlockKind::I32) ||
+          (*source == RVVBlockKind::I8 && *target == RVVBlockKind::I32) ||
+          (*source == RVVBlockKind::I16 && *target == RVVBlockKind::I32);
+      if (!supported)
+        return false;
+      std::optional<IntegerRange> range = fullRange(*target);
+      if (*target == RVVBlockKind::I32)
+        range = input.range ? input.range : fullRange(*source);
+      result = RVVBlockValue{*target, input.axis, input.extent, false, range};
+      return true;
+    }
+
+    if (auto binary = mlir::dyn_cast<BinaryOp>(definition)) {
+      auto resultKind = blockKind(binary.getResult().getType());
+      if (!resultKind)
+        return false;
+      RVVBlockValue lhs;
+      RVVBlockValue rhs;
+      bool lhsBlock = containsBlockPayload(binary.getLhs().getType());
+      bool rhsBlock = containsBlockPayload(binary.getRhs().getType());
+      if (!lhsBlock ||
+          (lhsBlock && !analyze(binary.getLhs(), lhs)) ||
+          (rhsBlock && !analyze(binary.getRhs(), rhs)) ||
+          (lhsBlock && rhsBlock && !sameOwner(lhs, rhs)) ||
+          (!lhsBlock && !scalarOperand(binary.getLhs(), *resultKind)) ||
+          (!rhsBlock && !scalarOperand(binary.getRhs(), *resultKind)))
+        return false;
+      llvm::StringRef kind = binary.getKind();
+      bool supported = false;
+      if (*resultKind == RVVBlockKind::Index)
+        supported = llvm::is_contained({"add", "sub", "mul", "div", "mod"},
+                                       kind);
+      else if (*resultKind == RVVBlockKind::U8)
+        supported = llvm::is_contained({"add", "and", "or", "shl", "shr"},
+                                       kind);
+      else if (*resultKind == RVVBlockKind::U16)
+        supported = llvm::is_contained({"or", "shl"}, kind);
+      else if (*resultKind == RVVBlockKind::I32)
+        supported = llvm::is_contained({"add", "sub", "mul"}, kind);
+      if (!supported)
+        return false;
+      const RVVBlockValue &owner = lhsBlock ? lhs : rhs;
+      std::optional<IntegerRange> range = fullRange(*resultKind);
+      if (*resultKind == RVVBlockKind::I32) {
+        auto lhsRange = lhsBlock ? lhs.range : scalarRange(binary.getLhs());
+        auto rhsRange = rhsBlock ? rhs.range : scalarRange(binary.getRhs());
+        if (!lhsRange || !rhsRange)
+          return false;
+        range = combineRange(kind, *lhsRange, *rhsRange);
+        if (!range || !fitsI32(*range))
+          return false;
+      }
+      result = RVVBlockValue{*resultKind, owner.axis, owner.extent, false,
+                             range};
+      return true;
+    }
+
+    if (auto compare = mlir::dyn_cast<CompareOp>(definition)) {
+      RVVBlockValue lhs;
+      RVVBlockValue rhs;
+      bool lhsBlock = containsBlockPayload(compare.getLhs().getType());
+      bool rhsBlock = containsBlockPayload(compare.getRhs().getType());
+      if (!lhsBlock ||
+          (lhsBlock && !analyze(compare.getLhs(), lhs)) ||
+          (rhsBlock && !analyze(compare.getRhs(), rhs)) ||
+          (lhsBlock && rhsBlock && !sameOwner(lhs, rhs)) ||
+          (lhsBlock && lhs.kind != RVVBlockKind::Index) ||
+          (rhsBlock && rhs.kind != RVVBlockKind::Index) ||
+          (!lhsBlock && !scalarOperand(compare.getLhs(), RVVBlockKind::Index)) ||
+          (!rhsBlock && !scalarOperand(compare.getRhs(), RVVBlockKind::Index)) ||
+          !llvm::is_contained({"lt", "ge"}, compare.getPredicate()))
+        return false;
+      const RVVBlockValue &owner = lhsBlock ? lhs : rhs;
+      result = RVVBlockValue{RVVBlockKind::Predicate, owner.axis,
+                             owner.extent};
+      return true;
+    }
+
+    if (auto select = mlir::dyn_cast<SelectOp>(definition)) {
+      RVVBlockValue predicate;
+      RVVBlockValue trueValue;
+      RVVBlockValue falseValue;
+      if (!analyze(select.getPredicate(), predicate) ||
+          !analyze(select.getTrueValue(), trueValue) ||
+          !analyze(select.getFalseValue(), falseValue) ||
+          predicate.kind != RVVBlockKind::Predicate ||
+          trueValue.kind != RVVBlockKind::U8 ||
+          falseValue.kind != RVVBlockKind::U8 ||
+          !sameOwner(predicate, trueValue) ||
+          !sameOwner(trueValue, falseValue))
+        return false;
+      result = trueValue;
+      return true;
+    }
+
+    if (auto tuple = mlir::dyn_cast<TupleOp>(definition)) {
+      result = RVVBlockValue{RVVBlockKind::Tuple};
+      for (mlir::Value field : tuple.getOperands()) {
+        RVVBlockValue fieldValue;
+        if (!analyze(field, fieldValue))
+          return false;
+        result.fields.push_back(std::move(fieldValue));
+      }
+      for (mlir::Operation *user : tuple.getResult().getUsers())
+        if (auto get = mlir::dyn_cast<TupleGetOp>(user);
+            get && get.getResult().use_empty())
+          members.insert(user);
+      return !result.fields.empty();
+    }
+
+    if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
+      RVVBlockValue tuple;
+      if (!analyze(get.getInput(), tuple) ||
+          tuple.kind != RVVBlockKind::Tuple || get.getIndex() < 0 ||
+          static_cast<size_t>(get.getIndex()) >= tuple.fields.size())
+        return false;
+      result = tuple.fields[get.getIndex()];
+      return true;
+    }
+    return false;
+  }
+};
+
+bool matchRVVBlockReduction(ReduceOp reduce, RVVBlockAnalyzer &analyzer) {
   if (reduce.getAxis() != 0 || reduce.getKind() != "add" ||
       reduce.getOrder() != "relaxed" ||
       !isInteger(reduce.getAccDtype(), 32, true) ||
@@ -294,32 +613,28 @@ bool matchI8DotReduction(ReduceOp reduce, RVVBlockMatch &match) {
       !isZeroInteger(reduce.getIdentity(), 32, true) ||
       !isTrueScalarPredicate(reduce.getWhere()))
     return false;
-  auto input = mlir::dyn_cast<BlockType>(bareType(reduce.getInput().getType()));
-  if (!input || input.getShape().size() != 1 ||
-      input.getShape().front() <= 0 ||
-      !isInteger(input.getElementType(), 32, true))
+  RVVBlockValue input;
+  if (!analyzer.analyze(reduce.getInput(), input) ||
+      input.kind != RVVBlockKind::I32 || !analyzer.axis || !input.range)
     return false;
-  int64_t extent = input.getShape().front();
-  auto product = reduce.getInput().getDefiningOp<BinaryOp>();
-  if (!product || product.getKind() != "mul" ||
-      !matchUnitStrideI8Input(product.getLhs(), extent, match) ||
-      !matchUnitStrideI8Input(product.getRhs(), extent, match) || !match.axis)
+  auto extent = constantIndexValue(analyzer.axis.getExtent());
+  if (!extent || *extent != input.extent || *extent <= 0)
     return false;
-  auto axisExtent = constantIndexValue(match.axis.getExtent());
-  if (!axisExtent || *axisExtent != extent ||
-      extent > std::numeric_limits<int32_t>::max() / (128 * 128))
+  __int128 minimum = static_cast<__int128>(input.range->minimum) * *extent;
+  __int128 maximum = static_cast<__int128>(input.range->maximum) * *extent;
+  if (minimum < std::numeric_limits<int32_t>::min() ||
+      maximum > std::numeric_limits<int32_t>::max())
     return false;
 
-  match.members.insert(product.getOperation());
-  match.members.insert(reduce.getOperation());
-  for (mlir::Operation *member : match.members) {
+  analyzer.members.insert(reduce.getOperation());
+  for (mlir::Operation *member : analyzer.members) {
     if (member->getBlock() != reduce->getBlock())
       return false;
     for (mlir::Value result : member->getResults()) {
-      if (!mlir::isa<BlockType>(bareType(result.getType())))
+      if (!containsBlockPayload(result.getType()))
         continue;
       for (mlir::Operation *user : result.getUsers())
-        if (!match.members.contains(user))
+        if (!analyzer.members.contains(user))
           return false;
     }
   }
@@ -332,11 +647,14 @@ RVVBlockSelection findRVVBlocks(KernelOp kernel,
   if (!target.hasRVV)
     return selected;
   kernel.walk([&](ReduceOp reduce) {
-    RVVBlockMatch match;
-    if (!matchI8DotReduction(reduce, match))
+    RVVBlockAnalyzer analyzer;
+    if (!matchRVVBlockReduction(reduce, analyzer))
       return;
-    selected.axes.insert(match.axis.getOperation());
-    selected.unitStrideLoads.insert(match.loads.begin(), match.loads.end());
+    selected.axes.insert(analyzer.axis.getOperation());
+    selected.unitStrideLoads.insert(analyzer.unitStrideLoads.begin(),
+                                     analyzer.unitStrideLoads.end());
+    selected.indexedLoads.insert(analyzer.indexedLoads.begin(),
+                                 analyzer.indexedLoads.end());
     selected.reductions.insert(reduce.getOperation());
   });
   return selected;
@@ -378,6 +696,9 @@ buildCandidates(mlir::Operation *canonical,
   if (mlir::isa<LoadOp>(canonical) &&
       rvvBlocks.unitStrideLoads.contains(canonical))
     candidates.push_back({"rvv", {}, "rvv_block_unit_stride"});
+  if (mlir::isa<LoadOp>(canonical) &&
+      rvvBlocks.indexedLoads.contains(canonical))
+    candidates.push_back({"rvv", {}, "rvv_block_indexed"});
   if (auto reduce = mlir::dyn_cast<ReduceOp>(canonical);
       reduce && belongsToRVVVLA(canonical, rvvVLAs) &&
       reduce.getOrder() == "relaxed")

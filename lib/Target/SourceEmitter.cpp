@@ -85,6 +85,14 @@ bool isZeroInteger(mlir::Value value, unsigned width, bool isSigned) {
          integer.getValue().isZero();
 }
 
+bool containsBlockPayload(mlir::Type type) {
+  type = unwrapMasked(type);
+  if (mlir::isa<BlockType>(type))
+    return true;
+  auto tuple = mlir::dyn_cast<TupleType>(type);
+  return tuple && llvm::any_of(tuple.getTypes(), containsBlockPayload);
+}
+
 std::string sanitize(llvm::StringRef input) {
   std::string result;
   result.reserve(input.size() + 1);
@@ -340,7 +348,7 @@ private:
   mlir::LogicalResult collectRVVBlockDependencies(
       mlir::Value value, llvm::DenseSet<mlir::Operation *> &members,
       llvm::SmallVector<BlockAxisOp> &axes) {
-    if (!mlir::isa<BlockType>(unwrapMasked(value.getType())))
+    if (!containsBlockPayload(value.getType()))
       return mlir::success();
     mlir::Operation *definition = value.getDefiningOp();
     if (!definition)
@@ -352,12 +360,18 @@ private:
       axes.push_back(axis);
       return mlir::success();
     }
-    if (!mlir::isa<PtrAddOp, LoadOp, BitcastOp, CastOp, BinaryOp>(definition))
+    if (!mlir::isa<PtrAddOp, LoadOp, BitcastOp, CastOp, BinaryOp, CompareOp,
+                   SelectOp, TupleOp, TupleGetOp>(definition))
       return definition->emitError(
           "selected RVV block slice contains an unsupported primitive");
     for (mlir::Value operand : definition->getOperands())
       if (mlir::failed(collectRVVBlockDependencies(operand, members, axes)))
         return mlir::failure();
+    if (auto tuple = mlir::dyn_cast<TupleOp>(definition))
+      for (mlir::Operation *user : tuple.getResult().getUsers())
+        if (auto get = mlir::dyn_cast<TupleGetOp>(user);
+            get && get.getResult().use_empty())
+          members.insert(user);
     return mlir::success();
   }
 
@@ -419,15 +433,16 @@ private:
                                          : mlir::StringAttr{};
           if (!loadProvider || loadProvider.getValue() != "rvv" ||
               !loadStrategy ||
-              loadStrategy.getValue() != "rvv_block_unit_stride") {
+              (loadStrategy.getValue() != "rvv_block_unit_stride" &&
+               loadStrategy.getValue() != "rvv_block_indexed")) {
             load.emitError(
-                "selected RVV block slice requires unit-stride RVV loads");
+                "selected RVV block slice requires an RVV block load strategy");
             failed = true;
             return;
           }
         }
         for (mlir::Value result : member->getResults()) {
-          if (!mlir::isa<BlockType>(unwrapMasked(result.getType())))
+          if (!containsBlockPayload(result.getType()))
             continue;
           for (mlir::Operation *user : result.getUsers())
             if (!members.contains(user)) {
@@ -804,9 +819,23 @@ private:
   };
 
   struct RVVBlockValue {
-    enum class Kind { Coordinate, Pointer, U8, I8, I32 } kind;
+    enum class Kind {
+      Coordinate,
+      Index,
+      Pointer,
+      U8,
+      U16,
+      I8,
+      I16,
+      I32,
+      Predicate,
+      Tuple,
+    } kind;
     mlir::Type type;
     std::string value;
+    bool unitStride = false;
+    std::string indices;
+    std::vector<RVVBlockValue> fields;
   };
 
   mlir::LogicalResult emitRVVVLA(VLAOp op, AxisPlanOp axis) {
@@ -1072,6 +1101,21 @@ private:
     return mlir::success();
   }
 
+  mlir::FailureOr<RVVBlockValue>
+  materializeRVVBlockIndex(const RVVBlockValue &input, llvm::StringRef vl) {
+    if (input.kind == RVVBlockValue::Kind::Index)
+      return input;
+    if (input.kind != RVVBlockValue::Kind::Coordinate)
+      return mlir::failure();
+    std::string lanes = fresh("rvv_index");
+    std::string indices = fresh("rvv_index");
+    line("vuint64m2_t " + lanes + " = __riscv_vid_v_u64m2(" + vl.str() +
+         ");");
+    line("vuint64m2_t " + indices + " = __riscv_vadd_vx_u64m2(" + lanes +
+         ", " + input.value + ", " + vl.str() + ");");
+    return RVVBlockValue{RVVBlockValue::Kind::Index, input.type, indices};
+  }
+
   mlir::FailureOr<RVVBlockValue> emitRVVBlockValue(
       mlir::Value value, BlockAxisOp axis,
       llvm::DenseMap<mlir::Value, RVVBlockValue> &blockValues,
@@ -1087,39 +1131,68 @@ private:
     int64_t extent = axis.getResult().getType().getShape().front();
 
     if (auto pointer = mlir::dyn_cast<PtrAddOp>(definition)) {
-      mlir::FailureOr<RVVBlockValue> coordinate = emitRVVBlockValue(
-          pointer.getOffset(), axis, blockValues, vl);
-      ValueInfo base = lookup(pointer.getBase());
-      auto baseType = mlir::dyn_cast<PtrType>(unwrapMasked(
-          pointer.getBase().getType()));
       auto resultBlock = mlir::dyn_cast<BlockType>(unwrapMasked(
           pointer.getResult().getType()));
       auto resultPointer = resultBlock
                                ? mlir::dyn_cast<PtrType>(
                                      resultBlock.getElementType())
                                : PtrType{};
-      if (mlir::failed(coordinate) ||
-          coordinate->kind != RVVBlockValue::Kind::Coordinate ||
-          base.value.empty() || base.isShaped() || !baseType ||
-          !resultPointer ||
-          !isInteger(baseType.getElementType(), 8, false) ||
-          resultPointer.getElementType() != baseType.getElementType() ||
+      if (!resultPointer ||
+          !isInteger(resultPointer.getElementType(), 8, false) ||
           resultBlock.getShape().size() != 1 ||
           resultBlock.getShape().front() != extent) {
-        pointer.emitError(
-            "RVV block pointer requires a scalar u8 base plus its block axis");
+        pointer.emitError("RVV block pointer must retain rank-one u8 lanes");
         return mlir::failure();
       }
-      RVVBlockValue info{RVVBlockValue::Kind::Pointer,
-                         pointer.getResult().getType(),
-                         "(" + base.value + " + " + coordinate->value + ")"};
+      RVVBlockValue info;
+      if (containsBlockPayload(pointer.getOffset().getType())) {
+        mlir::FailureOr<RVVBlockValue> offset = emitRVVBlockValue(
+            pointer.getOffset(), axis, blockValues, vl);
+        ValueInfo base = lookup(pointer.getBase());
+        auto baseType = mlir::dyn_cast<PtrType>(unwrapMasked(
+            pointer.getBase().getType()));
+        if (mlir::failed(offset) || base.value.empty() || base.isShaped() ||
+            !baseType || !isInteger(baseType.getElementType(), 8, false)) {
+          pointer.emitError(
+              "RVV block pointer requires a scalar u8 base and block index");
+          return mlir::failure();
+        }
+        if (offset->kind == RVVBlockValue::Kind::Coordinate) {
+          info = RVVBlockValue{RVVBlockValue::Kind::Pointer,
+                               pointer.getResult().getType(),
+                               "(" + base.value + " + " + offset->value + ")",
+                               true};
+        } else if (offset->kind == RVVBlockValue::Kind::Index) {
+          info = RVVBlockValue{RVVBlockValue::Kind::Pointer,
+                               pointer.getResult().getType(), base.value, false,
+                               offset->value};
+        } else {
+          pointer.emitError("RVV block pointer offset is not an index value");
+          return mlir::failure();
+        }
+      } else if (containsBlockPayload(pointer.getBase().getType())) {
+        mlir::FailureOr<RVVBlockValue> base = emitRVVBlockValue(
+            pointer.getBase(), axis, blockValues, vl);
+        ValueInfo offset = lookup(pointer.getOffset());
+        if (mlir::failed(base) ||
+            base->kind != RVVBlockValue::Kind::Pointer ||
+            offset.value.empty() || offset.isShaped()) {
+          pointer.emitError(
+              "RVV block pointer scalar adjustment has unavailable operands");
+          return mlir::failure();
+        }
+        info = *base;
+        info.type = pointer.getResult().getType();
+        info.value = "(" + base->value + " + " + offset.value + ")";
+      } else {
+        pointer.emitError("RVV block pointer has no block-valued operand");
+        return mlir::failure();
+      }
       blockValues[pointer.getResult()] = info;
       return info;
     }
 
     if (auto load = mlir::dyn_cast<LoadOp>(definition)) {
-      if (mlir::failed(requireStrategy(load, "rvv_block_unit_stride")))
-        return mlir::failure();
       mlir::FailureOr<RVVBlockValue> pointer = emitRVVBlockValue(
           load.getPointer(), axis, blockValues, vl);
       if (mlir::failed(pointer) ||
@@ -1128,15 +1201,50 @@ private:
                           [](mlir::Type type) {
                             return isInteger(type, 8, false);
                           }) ||
-          !isTrueScalarPredicate(load.getWhere()) ||
           !isZeroInteger(load.getOther(), 8, false)) {
-        load.emitError(
-            "RVV block unit-stride load requires all-active filled u8 lanes");
+        load.emitError("RVV block load requires filled rank-one u8 lanes");
         return mlir::failure();
       }
+      llvm::StringRef strategy = pointer->unitStride
+                                    ? "rvv_block_unit_stride"
+                                    : "rvv_block_indexed";
+      if (mlir::failed(requireStrategy(load, strategy)))
+        return mlir::failure();
+      std::optional<RVVBlockValue> predicate;
+      if (!isTrueScalarPredicate(load.getWhere())) {
+        mlir::FailureOr<RVVBlockValue> materialized = emitRVVBlockValue(
+            load.getWhere(), axis, blockValues, vl);
+        if (mlir::failed(materialized) ||
+            materialized->kind != RVVBlockValue::Kind::Predicate) {
+          load.emitError("RVV block load predicate is not a lane mask");
+          return mlir::failure();
+        }
+        predicate = *materialized;
+      }
       std::string name = fresh("rvv_u8");
-      line("vuint8mf4_t " + name + " = __riscv_vle8_v_u8mf4(" +
-           pointer->value + ", " + vl.str() + ");");
+      if (!predicate) {
+        if (pointer->unitStride)
+          line("vuint8mf4_t " + name + " = __riscv_vle8_v_u8mf4(" +
+               pointer->value + ", " + vl.str() + ");");
+        else
+          line("vuint8mf4_t " + name +
+               " = __riscv_vluxei64_v_u8mf4(" + pointer->value + ", " +
+               pointer->indices + ", " + vl.str() + ");");
+      } else {
+        ValueInfo other = lookup(load.getOther());
+        std::string old = fresh("rvv_fill");
+        line("vuint8mf4_t " + old + " = __riscv_vmv_v_x_u8mf4(" +
+             other.value + ", " + vl.str() + ");");
+        if (pointer->unitStride)
+          line("vuint8mf4_t " + name + " = __riscv_vle8_v_u8mf4_mu(" +
+               predicate->value + ", " + old + ", " + pointer->value + ", " +
+               vl.str() + ");");
+        else
+          line("vuint8mf4_t " + name +
+               " = __riscv_vluxei64_v_u8mf4_mu(" + predicate->value + ", " +
+               old + ", " + pointer->value + ", " + pointer->indices + ", " +
+               vl.str() + ");");
+      }
       RVVBlockValue info{RVVBlockValue::Kind::U8, load.getResult().getType(),
                          name};
       blockValues[load.getResult()] = info;
@@ -1146,23 +1254,35 @@ private:
     if (auto bitcast = mlir::dyn_cast<BitcastOp>(definition)) {
       mlir::FailureOr<RVVBlockValue> input = emitRVVBlockValue(
           bitcast.getInput(), axis, blockValues, vl);
-      if (mlir::failed(input) || input->kind != RVVBlockValue::Kind::U8 ||
-          !isRankOneBlock(bitcast.getInput().getType(), extent,
-                          [](mlir::Type type) {
-                            return isInteger(type, 8, false);
-                          }) ||
-          !isRankOneBlock(bitcast.getResult().getType(), extent,
-                          [](mlir::Type type) {
-                            return isInteger(type, 8, true);
-                          })) {
-        bitcast.emitError("RVV block bitcast requires u8 lanes to i8 lanes");
+      if (mlir::failed(input))
+        return mlir::failure();
+      std::string name;
+      RVVBlockValue::Kind kind;
+      if (input->kind == RVVBlockValue::Kind::U8 &&
+          isRankOneBlock(bitcast.getResult().getType(), extent,
+                         [](mlir::Type type) {
+                           return isInteger(type, 8, true);
+                         })) {
+        name = fresh("rvv_i8");
+        line("vint8mf4_t " + name +
+             " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input->value +
+             ");");
+        kind = RVVBlockValue::Kind::I8;
+      } else if (input->kind == RVVBlockValue::Kind::U16 &&
+                 isRankOneBlock(bitcast.getResult().getType(), extent,
+                                [](mlir::Type type) {
+                                  return isInteger(type, 16, true);
+                                })) {
+        name = fresh("rvv_i16");
+        line("vint16mf2_t " + name +
+             " = __riscv_vreinterpret_v_u16mf2_i16mf2(" + input->value +
+             ");");
+        kind = RVVBlockValue::Kind::I16;
+      } else {
+        bitcast.emitError("RVV block bitcast has unsupported integer widths");
         return mlir::failure();
       }
-      std::string name = fresh("rvv_i8");
-      line("vint8mf4_t " + name +
-           " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input->value + ");");
-      RVVBlockValue info{RVVBlockValue::Kind::I8,
-                         bitcast.getResult().getType(), name};
+      RVVBlockValue info{kind, bitcast.getResult().getType(), name};
       blockValues[bitcast.getResult()] = info;
       return info;
     }
@@ -1170,48 +1290,263 @@ private:
     if (auto cast = mlir::dyn_cast<CastOp>(definition)) {
       mlir::FailureOr<RVVBlockValue> input = emitRVVBlockValue(
           cast.getInput(), axis, blockValues, vl);
-      if (mlir::failed(input) || input->kind != RVVBlockValue::Kind::I8 ||
-          !isRankOneBlock(cast.getInput().getType(), extent,
-                          [](mlir::Type type) {
-                            return isInteger(type, 8, true);
-                          }) ||
-          !isRankOneBlock(cast.getResult().getType(), extent,
-                          [](mlir::Type type) {
-                            return isInteger(type, 32, true);
-                          })) {
-        cast.emitError("RVV block cast requires sign extension from i8 to i32");
+      if (mlir::failed(input))
+        return mlir::failure();
+      RVVBlockValue info;
+      if ((input->kind == RVVBlockValue::Kind::Coordinate ||
+           input->kind == RVVBlockValue::Kind::Index) &&
+          isRankOneBlock(cast.getResult().getType(), extent,
+                         [](mlir::Type type) {
+                           return isInteger(type, 8, false);
+                         })) {
+        mlir::FailureOr<RVVBlockValue> indices =
+            materializeRVVBlockIndex(*input, vl);
+        if (mlir::failed(indices))
+          return cast.emitError("RVV block index cast could not materialize lanes");
+        std::string u32 = fresh("rvv_u32");
+        std::string u16 = fresh("rvv_u16");
+        std::string u8 = fresh("rvv_u8");
+        line("vuint32m1_t " + u32 + " = __riscv_vncvt_x_x_w_u32m1(" +
+             indices->value + ", " + vl.str() + ");");
+        line("vuint16mf2_t " + u16 + " = __riscv_vncvt_x_x_w_u16mf2(" +
+             u32 + ", " + vl.str() + ");");
+        line("vuint8mf4_t " + u8 + " = __riscv_vncvt_x_x_w_u8mf4(" + u16 +
+             ", " + vl.str() + ");");
+        info = RVVBlockValue{RVVBlockValue::Kind::U8,
+                             cast.getResult().getType(), u8};
+      } else if (input->kind == RVVBlockValue::Kind::U8 &&
+                 isRankOneBlock(cast.getResult().getType(), extent,
+                                [](mlir::Type type) {
+                                  return isInteger(type, 16, false);
+                                })) {
+        std::string name = fresh("rvv_u16");
+        line("vuint16mf2_t " + name + " = __riscv_vzext_vf2_u16mf2(" +
+             input->value + ", " + vl.str() + ");");
+        info = RVVBlockValue{RVVBlockValue::Kind::U16,
+                             cast.getResult().getType(), name};
+      } else if (input->kind == RVVBlockValue::Kind::U8 &&
+                 isRankOneBlock(cast.getResult().getType(), extent,
+                                [](mlir::Type type) {
+                                  return isInteger(type, 32, true);
+                                })) {
+        std::string u32 = fresh("rvv_u32");
+        std::string i32 = fresh("rvv_i32");
+        line("vuint32m1_t " + u32 + " = __riscv_vzext_vf4_u32m1(" +
+             input->value + ", " + vl.str() + ");");
+        line("vint32m1_t " + i32 +
+             " = __riscv_vreinterpret_v_u32m1_i32m1(" + u32 + ");");
+        info = RVVBlockValue{RVVBlockValue::Kind::I32,
+                             cast.getResult().getType(), i32};
+      } else if (input->kind == RVVBlockValue::Kind::I8 &&
+                 isRankOneBlock(cast.getResult().getType(), extent,
+                                [](mlir::Type type) {
+                                  return isInteger(type, 32, true);
+                                })) {
+        std::string name = fresh("rvv_i32");
+        line("vint32m1_t " + name + " = __riscv_vsext_vf4_i32m1(" +
+             input->value + ", " + vl.str() + ");");
+        info = RVVBlockValue{RVVBlockValue::Kind::I32,
+                             cast.getResult().getType(), name};
+      } else if (input->kind == RVVBlockValue::Kind::I16 &&
+                 isRankOneBlock(cast.getResult().getType(), extent,
+                                [](mlir::Type type) {
+                                  return isInteger(type, 32, true);
+                                })) {
+        std::string name = fresh("rvv_i32");
+        line("vint32m1_t " + name + " = __riscv_vsext_vf2_i32m1(" +
+             input->value + ", " + vl.str() + ");");
+        info = RVVBlockValue{RVVBlockValue::Kind::I32,
+                             cast.getResult().getType(), name};
+      } else {
+        cast.emitError("RVV block cast has unsupported integer widths");
         return mlir::failure();
       }
-      std::string name = fresh("rvv_i32");
-      line("vint32m1_t " + name + " = __riscv_vsext_vf4_i32m1(" +
-           input->value + ", " + vl.str() + ");");
-      RVVBlockValue info{RVVBlockValue::Kind::I32,
-                         cast.getResult().getType(), name};
       blockValues[cast.getResult()] = info;
       return info;
     }
 
     if (auto binary = mlir::dyn_cast<BinaryOp>(definition)) {
-      mlir::FailureOr<RVVBlockValue> lhs = emitRVVBlockValue(
-          binary.getLhs(), axis, blockValues, vl);
-      mlir::FailureOr<RVVBlockValue> rhs = emitRVVBlockValue(
-          binary.getRhs(), axis, blockValues, vl);
-      if (mlir::failed(lhs) || mlir::failed(rhs) ||
-          lhs->kind != RVVBlockValue::Kind::I32 ||
-          rhs->kind != RVVBlockValue::Kind::I32 || binary.getKind() != "mul" ||
-          !isRankOneBlock(binary.getResult().getType(), extent,
-                          [](mlir::Type type) {
-                            return isInteger(type, 32, true);
-                          })) {
-        binary.emitError("RVV block arithmetic requires an i32 vector multiply");
+      bool lhsBlock = containsBlockPayload(binary.getLhs().getType());
+      bool rhsBlock = containsBlockPayload(binary.getRhs().getType());
+      if (!lhsBlock) {
+        binary.emitError("RVV block binary requires its vector operand on the left");
         return mlir::failure();
       }
-      std::string name = fresh("rvv_product");
-      line("vint32m1_t " + name + " = __riscv_vmul_vv_i32m1(" + lhs->value +
-           ", " + rhs->value + ", " + vl.str() + ");");
-      RVVBlockValue info{RVVBlockValue::Kind::I32,
-                         binary.getResult().getType(), name};
+      mlir::FailureOr<RVVBlockValue> lhs = emitRVVBlockValue(
+          binary.getLhs(), axis, blockValues, vl);
+      mlir::FailureOr<RVVBlockValue> rhs = rhsBlock
+          ? emitRVVBlockValue(binary.getRhs(), axis, blockValues, vl)
+          : mlir::FailureOr<RVVBlockValue>(mlir::failure());
+      ValueInfo rhsScalar = rhsBlock ? ValueInfo{} : lookup(binary.getRhs());
+      if (mlir::failed(lhs) || (rhsBlock && mlir::failed(rhs)) ||
+          (!rhsBlock && rhsScalar.value.empty()))
+        return binary.emitError("RVV block binary operand is unavailable");
+
+      std::string intrinsic;
+      std::string type;
+      RVVBlockValue::Kind resultKind;
+      std::string lhsValue = lhs->value;
+      std::string rhsValue = rhsBlock ? rhs->value : rhsScalar.value;
+      llvm::StringRef suffix = rhsBlock ? "vv" : "vx";
+      if (isRankOneBlock(binary.getResult().getType(), extent,
+                         [](mlir::Type element) { return element.isIndex(); })) {
+        mlir::FailureOr<RVVBlockValue> lhsIndex =
+            materializeRVVBlockIndex(*lhs, vl);
+        mlir::FailureOr<RVVBlockValue> rhsIndex = rhsBlock
+            ? materializeRVVBlockIndex(*rhs, vl)
+            : mlir::FailureOr<RVVBlockValue>(mlir::failure());
+        if (mlir::failed(lhsIndex) || (rhsBlock && mlir::failed(rhsIndex)))
+          return binary.emitError("RVV block index arithmetic has non-index lanes");
+        lhsValue = lhsIndex->value;
+        if (rhsBlock)
+          rhsValue = rhsIndex->value;
+        intrinsic = llvm::StringSwitch<std::string>(binary.getKind())
+                        .Case("add", "__riscv_vadd_" + suffix.str() + "_u64m2")
+                        .Case("sub", "__riscv_vsub_" + suffix.str() + "_u64m2")
+                        .Case("mul", "__riscv_vmul_" + suffix.str() + "_u64m2")
+                        .Case("div", "__riscv_vdivu_" + suffix.str() + "_u64m2")
+                        .Case("mod", "__riscv_vremu_" + suffix.str() + "_u64m2")
+                        .Default("");
+        type = "vuint64m2_t";
+        resultKind = RVVBlockValue::Kind::Index;
+      } else if (isRankOneBlock(binary.getResult().getType(), extent,
+                                [](mlir::Type element) {
+                                  return isInteger(element, 8, false);
+                                }) &&
+                 lhs->kind == RVVBlockValue::Kind::U8 &&
+                 (!rhsBlock || rhs->kind == RVVBlockValue::Kind::U8)) {
+        intrinsic = llvm::StringSwitch<std::string>(binary.getKind())
+                        .Case("add", "__riscv_vadd_" + suffix.str() + "_u8mf4")
+                        .Case("and", "__riscv_vand_" + suffix.str() + "_u8mf4")
+                        .Case("or", "__riscv_vor_" + suffix.str() + "_u8mf4")
+                        .Case("shl", "__riscv_vsll_" + suffix.str() + "_u8mf4")
+                        .Case("shr", "__riscv_vsrl_" + suffix.str() + "_u8mf4")
+                        .Default("");
+        type = "vuint8mf4_t";
+        resultKind = RVVBlockValue::Kind::U8;
+      } else if (isRankOneBlock(binary.getResult().getType(), extent,
+                                [](mlir::Type element) {
+                                  return isInteger(element, 16, false);
+                                }) &&
+                 lhs->kind == RVVBlockValue::Kind::U16 &&
+                 (!rhsBlock || rhs->kind == RVVBlockValue::Kind::U16)) {
+        intrinsic = llvm::StringSwitch<std::string>(binary.getKind())
+                        .Case("or", "__riscv_vor_" + suffix.str() + "_u16mf2")
+                        .Case("shl", "__riscv_vsll_" + suffix.str() + "_u16mf2")
+                        .Default("");
+        type = "vuint16mf2_t";
+        resultKind = RVVBlockValue::Kind::U16;
+      } else if (isRankOneBlock(binary.getResult().getType(), extent,
+                                [](mlir::Type element) {
+                                  return isInteger(element, 32, true);
+                                }) &&
+                 lhs->kind == RVVBlockValue::Kind::I32 &&
+                 (!rhsBlock || rhs->kind == RVVBlockValue::Kind::I32)) {
+        intrinsic = llvm::StringSwitch<std::string>(binary.getKind())
+                        .Case("add", "__riscv_vadd_" + suffix.str() + "_i32m1")
+                        .Case("sub", "__riscv_vsub_" + suffix.str() + "_i32m1")
+                        .Case("mul", "__riscv_vmul_" + suffix.str() + "_i32m1")
+                        .Default("");
+        type = "vint32m1_t";
+        resultKind = RVVBlockValue::Kind::I32;
+      } else {
+        binary.emitError("RVV block binary has unsupported typed lanes");
+        return mlir::failure();
+      }
+      if (intrinsic.empty())
+        return binary.emitError("RVV block binary kind has no typed intrinsic");
+      std::string name = fresh("rvv_binary");
+      line(type + " " + name + " = " + intrinsic + "(" + lhsValue + ", " +
+           rhsValue + ", " + vl.str() + ");");
+      RVVBlockValue info{resultKind, binary.getResult().getType(), name};
       blockValues[binary.getResult()] = info;
+      return info;
+    }
+
+    if (auto compare = mlir::dyn_cast<CompareOp>(definition)) {
+      bool rhsBlock = containsBlockPayload(compare.getRhs().getType());
+      mlir::FailureOr<RVVBlockValue> lhs = emitRVVBlockValue(
+          compare.getLhs(), axis, blockValues, vl);
+      mlir::FailureOr<RVVBlockValue> rhs = rhsBlock
+          ? emitRVVBlockValue(compare.getRhs(), axis, blockValues, vl)
+          : mlir::FailureOr<RVVBlockValue>(mlir::failure());
+      ValueInfo rhsScalar = rhsBlock ? ValueInfo{} : lookup(compare.getRhs());
+      if (mlir::failed(lhs) || (rhsBlock && mlir::failed(rhs)) ||
+          (!rhsBlock && rhsScalar.value.empty()))
+        return compare.emitError("RVV block comparison operand is unavailable");
+      mlir::FailureOr<RVVBlockValue> lhsIndex =
+          materializeRVVBlockIndex(*lhs, vl);
+      mlir::FailureOr<RVVBlockValue> rhsIndex = rhsBlock
+          ? materializeRVVBlockIndex(*rhs, vl)
+          : mlir::FailureOr<RVVBlockValue>(mlir::failure());
+      if (mlir::failed(lhsIndex) || (rhsBlock && mlir::failed(rhsIndex)))
+        return compare.emitError("RVV block comparison requires index lanes");
+      llvm::StringRef suffix = rhsBlock ? "vv" : "vx";
+      std::string intrinsic =
+          llvm::StringSwitch<std::string>(compare.getPredicate())
+              .Case("lt", "__riscv_vmsltu_" + suffix.str() + "_u64m2_b32")
+              .Case("ge", "__riscv_vmsgeu_" + suffix.str() + "_u64m2_b32")
+              .Default("");
+      if (intrinsic.empty())
+        return compare.emitError("RVV block comparison predicate is unsupported");
+      std::string name = fresh("rvv_mask");
+      line("vbool32_t " + name + " = " + intrinsic + "(" + lhsIndex->value +
+           ", " + (rhsBlock ? rhsIndex->value : rhsScalar.value) + ", " +
+           vl.str() + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::Predicate,
+                         compare.getResult().getType(), name};
+      blockValues[compare.getResult()] = info;
+      return info;
+    }
+
+    if (auto select = mlir::dyn_cast<SelectOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> predicate = emitRVVBlockValue(
+          select.getPredicate(), axis, blockValues, vl);
+      mlir::FailureOr<RVVBlockValue> trueValue = emitRVVBlockValue(
+          select.getTrueValue(), axis, blockValues, vl);
+      mlir::FailureOr<RVVBlockValue> falseValue = emitRVVBlockValue(
+          select.getFalseValue(), axis, blockValues, vl);
+      if (mlir::failed(predicate) || mlir::failed(trueValue) ||
+          mlir::failed(falseValue) ||
+          predicate->kind != RVVBlockValue::Kind::Predicate ||
+          trueValue->kind != RVVBlockValue::Kind::U8 ||
+          falseValue->kind != RVVBlockValue::Kind::U8)
+        return select.emitError("RVV block select requires a u8 lane mask");
+      std::string name = fresh("rvv_select");
+      line("[[maybe_unused]] vuint8mf4_t " + name +
+           " = __riscv_vmerge_vvm_u8mf4(" +
+           falseValue->value + ", " + trueValue->value + ", " +
+           predicate->value + ", " + vl.str() + ");");
+      RVVBlockValue info{RVVBlockValue::Kind::U8,
+                         select.getResult().getType(), name};
+      blockValues[select.getResult()] = info;
+      return info;
+    }
+
+    if (auto tuple = mlir::dyn_cast<TupleOp>(definition)) {
+      RVVBlockValue info{RVVBlockValue::Kind::Tuple,
+                         tuple.getResult().getType(), {}};
+      for (mlir::Value field : tuple.getOperands()) {
+        mlir::FailureOr<RVVBlockValue> fieldValue = emitRVVBlockValue(
+            field, axis, blockValues, vl);
+        if (mlir::failed(fieldValue))
+          return mlir::failure();
+        info.fields.push_back(*fieldValue);
+      }
+      blockValues[tuple.getResult()] = info;
+      return info;
+    }
+
+    if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
+      mlir::FailureOr<RVVBlockValue> tuple = emitRVVBlockValue(
+          get.getInput(), axis, blockValues, vl);
+      if (mlir::failed(tuple) || tuple->kind != RVVBlockValue::Kind::Tuple ||
+          get.getIndex() < 0 ||
+          static_cast<size_t>(get.getIndex()) >= tuple->fields.size())
+        return get.emitError("RVV block tuple field is unavailable");
+      RVVBlockValue info = tuple->fields[get.getIndex()];
+      info.type = get.getResult().getType();
+      blockValues[get.getResult()] = info;
       return info;
     }
 
