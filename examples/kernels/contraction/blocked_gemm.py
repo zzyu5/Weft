@@ -36,7 +36,7 @@ def gemm_worker(
                 b_valid = (k_rhs < k) & (n_idx < n)
 
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
-                b_blk = W.load(b + k_rhs * ldb + n_idx, where=b_valid)
+                b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
                 acc = W.contract(
                     a_blk,

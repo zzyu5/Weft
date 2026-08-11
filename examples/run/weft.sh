@@ -61,12 +61,13 @@ case "${kernel}" in
     runtime=examples/repro/weft/normalization/online_softmax_runtime.cpp
     ;;
   blocked_gemm)
-    if [[ $# -ne 0 ]]; then
-      echo "usage: $0 blocked_gemm" >&2
+    if [[ $# -ne 2 ]]; then
+      echo "usage: $0 blocked_gemm <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/contraction/blocked_gemm.py
     runtime=examples/repro/weft/contraction/blocked_gemm_runtime.cpp
+    runtime_arguments=("$1" "$2")
     ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then
@@ -118,7 +119,7 @@ else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits=128 \
-        --meta=BM=16 --meta=BN=16 --meta=BK=16 -o "${local_root}/kernel.c"
+        --meta=BM=4 --meta=BN=8 --meta=BK=64 -o "${local_root}/kernel.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \

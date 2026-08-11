@@ -450,6 +450,8 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
+    if (auto lowered = tryEmitF16GemmNTiles(op))
+      return *lowered;
     llvm::SmallVector<CValue> carried;
     for (auto [result, initial] :
          llvm::zip(op.getResults(), op.getOperands().drop_front(3))) {
@@ -1144,6 +1146,250 @@ private:
     else
       line("if (" + where.spelling + ") *" + pointer.spelling + " = " +
            value.spelling + ";");
+    return mlir::success();
+  }
+
+  mlir::Value pointerRoot(mlir::Value value) const {
+    if (mlir::isa<PtrType>(value.getType()))
+      return value;
+    auto pointer = value.getDefiningOp<PtrAddOp>();
+    if (!pointer)
+      return {};
+    return pointerRoot(pointer.getBase());
+  }
+
+  mlir::Value blockStride(mlir::Value value,
+                          llvm::DenseSet<mlir::Value> &visited) const {
+    if (!value || !visited.insert(value).second)
+      return {};
+    if (auto binary = value.getDefiningOp<BinaryOp>()) {
+      bool lhsBlock = containsBlockType(binary.getLhs().getType());
+      bool rhsBlock = containsBlockType(binary.getRhs().getType());
+      if (binary.getKind() == "mul" && lhsBlock != rhsBlock)
+        return lhsBlock ? binary.getRhs() : binary.getLhs();
+    }
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return {};
+    for (mlir::Value operand : definition->getOperands())
+      if (containsBlockType(operand.getType()))
+        if (mlir::Value stride = blockStride(operand, visited))
+          return stride;
+    return {};
+  }
+
+  mlir::Value blockStride(mlir::Value value) const {
+    llvm::DenseSet<mlir::Value> visited;
+    return blockStride(value, visited);
+  }
+
+  bool dependsOn(mlir::Value value, mlir::Value target,
+                 llvm::DenseSet<mlir::Value> &visited) const {
+    if (value == target)
+      return true;
+    if (!value || !visited.insert(value).second)
+      return false;
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition)
+      return false;
+    return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
+      return dependsOn(operand, target, visited);
+    });
+  }
+
+  bool dependsOn(mlir::Value value, mlir::Value target) const {
+    llvm::DenseSet<mlir::Value> visited;
+    return dependsOn(value, target, visited);
+  }
+
+  std::optional<mlir::LogicalResult> tryEmitF16GemmNTiles(ForOp nLoop) {
+    if (nLoop.getNumResults() != 0)
+      return std::nullopt;
+    ForOp mLoop = nLoop->getParentOfType<ForOp>();
+    if (!mLoop || mLoop.getBody().empty() || nLoop->getBlock() != &mLoop.getBody().front())
+      return std::nullopt;
+
+    mlir::Block &nBody = nLoop.getBody().front();
+    ForOp kLoop;
+    StoreOp store;
+    for (mlir::Operation &operation : nBody.without_terminator()) {
+      if (auto candidate = mlir::dyn_cast<ForOp>(operation)) {
+        if (kLoop)
+          return std::nullopt;
+        kLoop = candidate;
+      }
+      if (auto candidate = mlir::dyn_cast<StoreOp>(operation)) {
+        if (store)
+          return std::nullopt;
+        store = candidate;
+      }
+    }
+    if (!kLoop || !store || kLoop.getNumResults() != 1 ||
+        store.getValue() != kLoop.getResult(0) ||
+        kLoop.getOperands().size() != 4)
+      return std::nullopt;
+
+    mlir::Block &kBody = kLoop.getBody().front();
+    ContractOp contract;
+    for (mlir::Operation &operation : kBody.without_terminator())
+      if (auto candidate = mlir::dyn_cast<ContractOp>(operation)) {
+        if (contract)
+          return std::nullopt;
+        contract = candidate;
+      }
+    if (!contract || contract.getResult() !=
+                         mlir::cast<YieldOp>(kBody.getTerminator()).getOperand(0) ||
+        contract.getInit() != kBody.getArgument(1) ||
+        contract.getLhsAxes().size() != 1 ||
+        contract.getRhsAxes().size() != 1 ||
+        contract.getLhsAxes().front() != 1 ||
+        contract.getRhsAxes().front() != 0 || contract.getOrder() != "relaxed" ||
+        contract.getMath() != "native" || !contract.getAccDtype().isF32() ||
+        !contract.getOutDtype().isF32() || !isTrue(contract.getWhereLhs()) ||
+        !isTrue(contract.getWhereRhs()))
+      return std::nullopt;
+
+    LoadOp lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
+    LoadOp rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+    auto init = kLoop.getOperand(3).getDefiningOp<FullOp>();
+    if (!lhsLoad || !rhsLoad || !init ||
+        !elementType(lhsLoad.getResult().getType()).isF16() ||
+        !elementType(rhsLoad.getResult().getType()).isF16() ||
+        !isFloatConstant(init.getValue(), 0.0))
+      return std::nullopt;
+
+    mlir::Value lhsRoot = pointerRoot(lhsLoad.getPointer());
+    mlir::Value rhsRoot = pointerRoot(rhsLoad.getPointer());
+    mlir::Value outputRoot = pointerRoot(store.getPointer());
+    if (!lhsRoot || !rhsRoot || !outputRoot)
+      return std::nullopt;
+    auto lhsPointer = mlir::dyn_cast<PtrType>(lhsRoot.getType());
+    auto rhsPointer = mlir::dyn_cast<PtrType>(rhsRoot.getType());
+    auto outputPointer = mlir::dyn_cast<PtrType>(outputRoot.getType());
+    mlir::Value lhsStride = blockStride(lhsLoad.getPointer());
+    mlir::Value rhsStride = blockStride(rhsLoad.getPointer());
+    mlir::Value outputStride = blockStride(store.getPointer());
+    if (!lhsPointer || !rhsPointer || !outputPointer ||
+        !lhsPointer.getElementType().isF16() ||
+        !rhsPointer.getElementType().isF16() ||
+        !outputPointer.getElementType().isF32() || !lhsStride || !rhsStride ||
+        !outputStride)
+      return std::nullopt;
+
+    mlir::Value mCoordinate = mLoop.getBody().front().getArgument(0);
+    mlir::Value nCoordinate = nBody.getArgument(0);
+    mlir::Value kCoordinate = kBody.getArgument(0);
+    if (!dependsOn(lhsLoad.getPointer(), mCoordinate) ||
+        !dependsOn(lhsLoad.getPointer(), kCoordinate) ||
+        dependsOn(lhsLoad.getPointer(), nCoordinate) ||
+        !dependsOn(rhsLoad.getPointer(), kCoordinate) ||
+        !dependsOn(rhsLoad.getPointer(), nCoordinate) ||
+        dependsOn(rhsLoad.getPointer(), mCoordinate) ||
+        !dependsOn(store.getPointer(), mCoordinate) ||
+        !dependsOn(store.getPointer(), nCoordinate) ||
+        dependsOn(store.getPointer(), kCoordinate))
+      return std::nullopt;
+
+    std::string mStep = expression(mLoop.getStep());
+    std::string nStep = expression(nLoop.getStep());
+    std::string nLower = expression(nLoop.getLower());
+    std::string nUpper = expression(nLoop.getUpper());
+    std::string kLower = expression(kLoop.getLower());
+    std::string kUpper = expression(kLoop.getUpper());
+    CValue mValue = require(mCoordinate);
+    CValue mUpper = require(mLoop.getUpper());
+    CValue lhs = require(lhsRoot);
+    CValue rhs = require(rhsRoot);
+    CValue outputValue = require(outputRoot);
+    CValue lhsStrideValue = require(lhsStride);
+    CValue rhsStrideValue = require(rhsStride);
+    CValue outputStrideValue = require(outputStride);
+    if (mStep != "4" || nStep != "8" || nLower.empty() || nUpper.empty() ||
+        kLower.empty() || kUpper.empty() || mValue.spelling.empty() ||
+        mUpper.spelling.empty() || lhs.spelling.empty() || rhs.spelling.empty() ||
+        outputValue.spelling.empty() || lhsStrideValue.spelling.empty() ||
+        rhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty())
+      return std::nullopt;
+
+    std::string nTile = fresh("gemm_n");
+    std::string vl = fresh("gemm_vl");
+    std::string rows = fresh("gemm_rows");
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(8);");
+    line("const size_t " + rows + " = (" + mUpper.spelling + " - " +
+         mValue.spelling + ") < 4 ? (" + mUpper.spelling + " - " +
+         mValue.spelling + ") : 4;");
+    line("for (size_t " + nTile + " = " + nLower + "; " + nTile + " < " +
+         nUpper + "; ++" + nTile + ") {");
+    ++indent;
+
+    auto emitRows = [&](unsigned rowCount, bool first) {
+      line(std::string(first ? "if" : "else if") + " (" + rows + " == " +
+           std::to_string(rowCount) + ") {");
+      ++indent;
+      llvm::SmallVector<std::string> accumulators;
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string accumulator = fresh("gemm_acc");
+        line("vfloat32m2_t " + accumulator +
+             " = __riscv_vfmv_v_f_f32m2(0.0f, " + vl + ");");
+        accumulators.push_back(std::move(accumulator));
+      }
+      std::string inner = fresh("gemm_k");
+      std::string fullEnd = fresh("gemm_k_end");
+      line("const size_t " + fullEnd + " = " + kUpper + " - ((" + kUpper +
+           " - " + kLower + ") % " + vl + ");");
+      line("for (size_t " + inner + " = " + kLower + "; " + inner + " < " +
+           fullEnd + "; " + inner + " += " + vl + ") {");
+      ++indent;
+      std::string rhsVector = fresh("gemm_b");
+      line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
+           rhs.spelling + " + " + nTile + " * " + rhsStrideValue.spelling +
+           " + " + inner + ", " + vl + ");");
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string lhsVector = fresh("gemm_a");
+        line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
+             lhs.spelling + " + (" +
+             mValue.spelling + " + " + std::to_string(row) + ") * " +
+             lhsStrideValue.spelling + " + " + inner + ", " + vl + ");");
+        line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m2(" +
+             accumulators[row] + ", " + lhsVector + ", " + rhsVector + ", " +
+             vl + ");");
+      }
+      --indent;
+      line("}");
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string seed = fresh("gemm_seed");
+        std::string partial = fresh("gemm_partial");
+        std::string scalar = fresh("gemm_sum");
+        line("vfloat32m1_t " + seed +
+             " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
+        line("vfloat32m1_t " + partial +
+             " = __riscv_vfredusum_vs_f32m2_f32m1(" + accumulators[row] +
+             ", " + seed + ", " + vl + ");");
+        line("float " + scalar + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
+             ");");
+        std::string tail = fresh("gemm_tail");
+        line("for (size_t " + tail + " = " + fullEnd + "; " + tail + " < " +
+             kUpper + "; ++" + tail + ")");
+        ++indent;
+        line(scalar + " += (float)*(" + lhs.spelling + " + (" +
+             mValue.spelling + " + " + std::to_string(row) + ") * " +
+             lhsStrideValue.spelling + " + " + tail + ") * (float)*(" +
+             rhs.spelling + " + " + nTile + " * " +
+             rhsStrideValue.spelling + " + " + tail + ");");
+        --indent;
+        line("*(" + outputValue.spelling + " + (" + mValue.spelling + " + " +
+             std::to_string(row) + ") * " + outputStrideValue.spelling + " + " +
+             nTile + ") = " + scalar + ";");
+      }
+      --indent;
+      line("}");
+    };
+    emitRows(4, true);
+    emitRows(3, false);
+    emitRows(2, false);
+    emitRows(1, false);
+    --indent;
+    line("}");
     return mlir::success();
   }
 
