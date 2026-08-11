@@ -133,6 +133,30 @@ case "${kernel}" in
     dsl=examples/kernels/state/rwkv_wkv6.py
     runtime=examples/repro/weft/state/rwkv_wkv6_runtime.cpp
     ;;
+  depthwise_conv2d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 depthwise_conv2d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/depthwise_conv2d.py
+    runtime=examples/repro/weft/vision/depthwise_conv2d_runtime.cpp
+    ;;
+  max_pool2d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 max_pool2d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/max_pool2d.py
+    runtime=examples/repro/weft/vision/max_pool2d_runtime.cpp
+    ;;
+  bilinear_upscale)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 bilinear_upscale" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/bilinear_upscale.py
+    runtime=examples/repro/weft/vision/bilinear_upscale_runtime.cpp
+    ;;
   softmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 softmax" >&2
