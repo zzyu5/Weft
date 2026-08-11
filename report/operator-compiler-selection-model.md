@@ -10,8 +10,8 @@ Selected Execution IR，最后投影为可编译 C++ source。十个现有手工
 
 这条路径不是从 GGML C/C++ graph 导入，也不识别“这是 RMSNorm、GEMM 或 q4_K”。
 真正的 Weft source 是 `examples/kernels/` 中作者写出的完整 worker-local Python kernel。
-数值 runtime 位于 `examples/repro/weft/`；emitter 不读取或链接 `source/c/`。真实 GGML 与
-历史高性能 RISC-V source 的边界另见 `riscv-llm-source-corpus.md`。
+数值 runtime 位于 `examples/repro/weft/`；emitter 不读取或链接 `source/c/`。真实 GGML
+RISC-V source 与模型级执行边界另见 `riscv-llm-source-corpus.md`。
 
 ## 编译边界
 

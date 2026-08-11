@@ -1,91 +1,142 @@
-# RISC-V LLM kernel source corpus
+# GGML RISC-V LLM source corpus
 
 ## 结论
 
-原先按十个 Weft repro 人工摘录的 `source/c/ggml` 已删除。它把 generic C 循环写成新的
-standalone 函数，既不是 GGML 手写 RISC-V source，也不能用于性能对比。
+`source/` 现在只包含 llama.cpp 的真实 GGML CPU/RISC-V source。上一轮误放入的
+`source/c/tianchenrv/` 已整棵删除；历史 TianchenRV 生成 kernel 只用于定位真实 GGML
+opponent，不再作为 source、baseline 或 donor 副本存在。
 
-现行 corpus 改为两种来源：
+旧的十项 standalone 摘录、scalar block-dot、副本 runtime 和 `examples/run/source.sh` 也已
+删除。所有空目录已清理。
 
-```text
-source/c/
-├── ggml/
-│   └── llama.cpp/ggml/       原样的 GGML CPU、arch/riscv 与 Spacemit source
-└── tianchenrv/
-    └── rvv/                  materials 中按 target 选定的最终高性能 kernel source
-```
-
-`examples/run/source.sh` 随旧摘录一并删除。新的 baseline/generated 性能 runner 必须直接
-调用这里的真实 entry，并在同一输入、ABI、layout、编译器与计时器中比较；本次整理不保留
-旧 runner 作为兼容入口。
-
-## GGML RISC-V 覆盖
-
-GGML 原始 source 现在完整保留以下 LLM inference 路径，不再局限于六个 block-dot：
-
-| 族 | 覆盖 | 选定 source |
-|---|---|---|
-| quantize | `q8_0`、`q8_1`、`q8_K` | `arch/riscv/quants.c` 的 RVV entry |
-| vec-dot | 24 个格式族 | 23 个格式使用 `arch/riscv/quants.c` 的 RVV/VLEN-specific entry；`nvfp4` 使用 generic scalar entry |
-| repack | q8_0 4×8 activation repack | `arch/riscv/repack.cpp` |
-| quantized GEMV | q4_0 8×8/16×1、q4_K、q2_K、q8_0、IQ4_NL | `arch/riscv/repack.cpp` |
-| quantized GEMM | q4_0 8×8/16×1、q4_K、q2_K、q8_0、IQ4_NL | `arch/riscv/repack.cpp` |
-| dequantize | 25 个 row-dequant 格式 | `src/ggml-quants.c`；没有专用 RVV 的格式保留实际 scalar/autovec 路径 |
-| forward math | add/sub/mul/div、scale、copy、GELU、SiLU、softmax、RoPE、Norm、RMSNorm 等 | `vec.*`、`binary-ops.cpp`、`unary-ops.cpp`、`ops.cpp` |
-| Spacemit RVV | FlashAttention、Norm、RMSNorm、binary、permuted copy/cont、repeat、sum-rows、get-rows、concat | `spacemit/rvv_kernels.cpp` 与 `ime.cpp` |
-| Spacemit IME | q4_0、q4_K、q8_0 quantized GEMM；IME1/IME2 | `spacemit/ime1_kernels.cpp`、`ime2_kernels.cpp`、`repack.cpp` |
-
-vec-dot 的 24 个格式族为：
+## 最终目录
 
 ```text
-q1_0 q2_K q3_K q4_0 q4_1 q4_K q5_0 q5_1 q5_K q6_K q8_0
-iq1_m iq1_s iq2_s iq2_xs iq2_xxs iq3_s iq3_xxs iq4_nl iq4_xs
-mxfp4 nvfp4 tq1_0 tq2_0
+source/c/ggml/
+├── LICENSE
+├── NOTICE.md
+└── llama.cpp/ggml/
+    ├── include/                  GGML CPU 必需 public ABI
+    └── src/
+        ├── ggml.c / common / quants / threading
+        └── ggml-cpu/
+            ├── generic CPU op、traits、vec、quants、repack
+            ├── arch/riscv/       真实 RVV quantize、vec-dot、repack、GEMV、GEMM
+            └── spacemit/         真实 RVV forward、FlashAttention、IME1/IME2
 ```
 
-这不是 24 份摘录文件。上游在一个 translation unit 内共享 block ABI、lookup tables、static
-helper 与 VLEN dispatch；保留完整原文件才能忠实保存真实实现。具体 wrapper 根据
-VLEN128/VLEN256/VLEN512/VLEN1024、Zvfh 或 XTheadVector 选择专用 body。
+共 51 个 llama.cpp source/header 文件。没有其他架构 backend、backend loader、optimizer、
+GGUF 工具、build artifact、generated source 或空目录。保留文件与 `ssh rvv` 上实际用于
+`llama-bench` 的 upstream-derived checkout 逐文件比较一致；远端 checkout 里的实验 CMake
+修改没有进入 corpus。
 
-## materials 中保留的最终 source
+## 量化路径
 
-`materials/` 中约百个“kernel 单元”实际混合了语义算子、dtype/layout、目标板、schedule、
-失败候选、driver 和 generated artifact。整理后只留下 26 个 kernel source：
+真实 production path 是：
 
-| 目录 | 数量 | 唯一选择 |
-|---|---:|---|
-| `rvv/forward/vlen256/` + `rvv/forward/vla/` | 4 | VLEN256 add/mul/copy；VLA RMSNorm |
-| `rvv/gemm/flat/vlen128/` | 3 | q4_1、q5_0、q5_1 packed GEMM |
-| `rvv/gemv/vlen256/` | 2 | q5_0、q5_1 deployed GEVM |
-| `rvv/gemm/kquant/vlen128/` | 5 | q2_K/q4_K/q5_K tiled；q3_K/q6_K plain |
-| `rvv/gemm/kquant/vlen256/` | 5 | q2_K/q4_K/q6_K unrolled；q3_K/q5_K rolled |
-| `rvv/gemm/iq/vlen256/` | 7 | IQ1_M/IQ1_S、IQ2_S/IQ2_XS/IQ2_XXS、IQ3_S/IQ3_XXS grid4 |
+```text
+GGUF tensor type
+  → ggml-cpu.c::type_traits_cpu
+  → GGML_OP_MUL_MAT / GGML_OP_MUL_MAT_ID
+  → target packed GEMV/GEMM（存在且 target 合法时）
+  → generic mul-mat traversal + format-specific ggml_vec_dot_*
+```
 
-这些是按相同实验族内部的最终选择做的去重。没有迁入：
+### RISC-V vec-dot
 
-- 旧 scalar/RVV/IME selector 与 whole-kernel route；
-- 被更快 schedule 替代的同 ABI 候选；
-- `raw/stock_*` 对手副本、objdump、日志、CSV、driver、fixture 与 MLIR；
-- 只有 cross-op 数字、layout 不同或数值错误的所谓 winner；
-- materials 中复制自 GGML 手写 vec-dot 的版本——GGML 原文件已经是唯一 source。
+`arch/riscv/quants.c` 包含 23 个 RISC-V entry：
 
-## 选择边界
+```text
+q1_0
+q4_0 q4_1 q5_0 q5_1 q8_0
+q2_K q3_K q4_K q5_K q6_K
+iq1_s iq1_m iq2_s iq2_xs iq2_xxs iq3_s iq3_xxs iq4_nl iq4_xs
+tq1_0 tq2_0 mxfp4
+```
 
-“最高性能”按 `语义 + dtype + block/packed layout + decode/prefill phase + target capability`
-定义，而不是只按 kernel 名定义。VLEN128、VLEN256 和 IME 是不同 target 域；同一语义在这些
-域中允许各保留一个 realization。不能用 VLEN256 的 source 替代 VLEN128，也不能把 GEMM
-对 block-dot 的 cross-op 数字当作同 ABI 胜负。
+它们使用直接 RVV intrinsic、VLEN-specific body 或 XTheadVector 实现。`nvfp4` 是当前唯一
+没有 RISC-V 专用 entry 的已登记格式，真实路径位于 `ggml-cpu/quants.c` 的 generic scalar
+implementation；没有为它伪造 RVV source。
 
-GGML source 是外部 as-shipped baseline。`source/c/tianchenrv` 是历史优化供体，不能冒充
-外部 baseline，也不进入现行 compiler。后续性能对比的对象应是“新 Weft generated artifact
-vs 真实 GGML entry”；历史 source 只帮助确认已经探索过的高性能结构与 target-specific
-realization。
+### Quantize、dequantize 与 packed matmul
 
-## 当前 artifact 边界
+- RISC-V activation quantize：`q8_0`、`q8_1`、`q8_K`；
+- row-dequant/reference quantize：`ggml-quants.c` 中 GGML 实际登记的全部格式；
+- RISC-V packed GEMV/GEMM：q4_0 8×8/16×1、q4_K 16×1、q2_K 16×1、IQ4_NL
+  16×1、q8_0 16×1；
+- q8_0 4×8 activation repack。
 
-本次完成的是 source corpus 整理与旧路径删除。GGML 文件保持原始相对 include 结构；现有
-十个 Weft 手工数值 repro 的 runtime 已移到 `examples/repro/weft/`，不再从 `source/` 借用
-算法或 reference symbol。
+q4_1、q5_0、q5_1、q3_K、q5_K、q6_K 以及多数 IQ/TQ 格式当前没有同名 RISC-V
+`ggml_gemm_*` entry。它们在完整模型中的真实 opponent 是 generic mul-mat traversal 加对应
+vec-dot，不能根据 TianchenRV 历史 kernel 名虚构一个 GGML GEMM。
 
-完整 corpus 的统一 runtime、同 harness 性能计时与逐 entry `ssh rvv` 执行尚未建立，因此
-这里不报告新的性能数值，也不把 materials 的历史数据写成当前结果。
+## 非量化路径
+
+保留的 generic/target source 覆盖：add/sub/mul/div、scale、copy、GELU、SiLU、softmax、
+RoPE、Norm、RMSNorm、FlashAttention、repeat、sum-rows、get-rows、concat，以及 Spacemit
+IME1/IME2 quantized GEMM。没有专用 RVV 的算子保留 llama.cpp 实际 scalar/autovec 路径，
+而不是为了目录整齐写一个假的 intrinsic kernel。
+
+## 模型级执行
+
+统一入口：
+
+```bash
+./examples/run/ggml.sh \
+  <remote-model.gguf> \
+  <prompt-tokens> \
+  <generation-tokens> \
+  <threads> \
+  <repetitions>
+```
+
+它在 `ssh rvv` 上直接运行真实 llama.cpp `llama-bench`，固定 `n_batch=2048`、
+`n_ubatch=512`，同时得到 prefill 与 decode。runner 不创建小数组，不复制 kernel，不读取
+TianchenRV 产物。
+
+### 标准模型级结果
+
+真实 TinyLlama Q4_0 模型：1,100,048,384 参数，模型数据 635,990,016 bytes；4 threads，
+`pp128/tg32`，各 3 次：
+
+| Phase | Tokens | 平均吞吐 |
+|---|---:|---:|
+| prompt/prefill | 128 | 5.244427 token/s |
+| generation/decode | 32 | 4.781877 token/s |
+
+这条命令实际执行成功：
+
+```bash
+./examples/run/ggml.sh \
+  /home/ubuntu/tcrv-llamacpp/models/tinyllama-q4_0.gguf \
+  128 32 4 3
+```
+
+### 8B K-quant 与格式覆盖
+
+DeepSeek-R1-Distill-Llama 8B Q4_K_M 模型具有 8,030,261,312 参数。真实 GGUF metadata 为
+`n_embd=4096`、`n_ff=14336`、32 layers；292 个 tensor 中包含 193 个 Q4_K、33 个 Q6_K
+和 66 个 F32 tensor。`pp8/tg2` 完整模型运行通过，分别为 2.426912 与 1.078821 token/s。
+
+远端现有真实模型还逐一完成了最短完整 dispatch：
+
+```text
+DeepSeek 8B Q2_K
+DeepSeek 8B Q4_1
+DeepSeek 8B Q5_0
+DeepSeek 8B Q5_1
+DeepSeek 8B Q5_K_M
+DeepSeek 8B Q6_K
+DeepSeek 8B IQ4_NL
+TinyLlama 1.1B Q8_0
+```
+
+每个模型都完成 prompt 与 generation 两个 phase；这些一次运行只证明 model load、graph
+dispatch 与对应 quant source 路径可执行，不作为性能 headline。
+
+## 边界
+
+`llama-bench` 给出完整 GGUF 模型基线。未来 Weft generated intrinsic C 与 GGML 的直接
+kernel ratio 必须另用同一真实 tensor、shape、layout 和计时器；完整模型 token/s 与单 kernel
+时间不能混成同一个分母。现有 `examples/repro/weft/` 中的小型数值 repro 仍只证明 compiler
+artifact 可执行，不再被称为 GGML source baseline。
