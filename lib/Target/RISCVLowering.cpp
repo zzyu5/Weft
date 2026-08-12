@@ -1831,9 +1831,6 @@ private:
           candidates = {2, 4, 1, 8};
         else if (candidateFacts.nestedScalarLoops > 0)
           candidates = {8, 4, 2, 1};
-        else if (candidateFacts.f32Loads + candidateFacts.f32Stores >= 6 ||
-                 candidateFacts.maxEntityF32Vectors >= 4)
-          candidates = {4, 2, 1, 8};
         else
           candidates = {4, 2, 8, 1};
       }
