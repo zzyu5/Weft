@@ -50,6 +50,7 @@ from .builtins import range
 from .builtins import reduce
 from .builtins import reshape
 from .builtins import rsqrt
+from .builtins import sqrt
 from .builtins import scan
 from .builtins import select
 from .builtins import sign_bit_i8_dot

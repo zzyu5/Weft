@@ -1252,6 +1252,9 @@ class FrontendCompiler:
     def _intrinsic_floor(self, call: ast.Call) -> Value:
         return self._math_unary(call, "floor")
 
+    def _intrinsic_sqrt(self, call: ast.Call) -> Value:
+        return self._math_unary(call, "sqrt")
+
     def _intrinsic_rsqrt(self, call: ast.Call) -> Value:
         return self._math_unary(call, "rsqrt")
 

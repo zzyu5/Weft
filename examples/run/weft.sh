@@ -85,6 +85,14 @@ case "${kernel}" in
     dsl=examples/kernels/normalization/layer_norm.py
     runtime=examples/repro/weft/normalization/layer_norm_runtime.cpp
     ;;
+  cross_entropy)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 cross_entropy" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/normalization/cross_entropy.py
+    runtime=examples/repro/weft/normalization/cross_entropy_runtime.cpp
+    ;;
   rms_norm_backward)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 rms_norm_backward" >&2
@@ -347,6 +355,25 @@ case "${kernel}" in
     dsl=examples/kernels/permutation/contiguous_transpose.py
     runtime=examples/repro/weft/permutation/contiguous_transpose_runtime.cpp
     runtime_arguments=("$1")
+    ;;
+  fwht)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 fwht" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/permutation/fwht.py
+    runtime=examples/repro/weft/permutation/fwht_runtime.cpp
+    ;;
+  adamw)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 adamw" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/optimization/adamw.py
+    runtime=examples/repro/weft/optimization/adamw_runtime.cpp
+    multi=1
+    multi_primary=adamw_f32
+    multi_equivalent=adamw_f32_equivalent
     ;;
   get_rows_q4_k)
     if [[ $# -ne 1 ]]; then

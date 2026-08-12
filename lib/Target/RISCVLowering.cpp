@@ -3672,6 +3672,9 @@ private:
       else if (op.getKind() == "abs")
         line(vectorType + " " + name + " = __riscv_vfabs_v_" + suffix + "(" +
              input.spelling + ", " + activeVL + ");");
+      else if (op.getKind() == "sqrt")
+        line(vectorType + " " + name + " = __riscv_vfsqrt_v_" + suffix +
+             "(" + input.spelling + ", " + activeVL + ");");
       else if (op.getKind() == "exp" && lmul == 2)
         line("vfloat32m2_t " + name + " = __weft_exp_f32m2(" +
              input.spelling + ", " + activeVL + ");");
