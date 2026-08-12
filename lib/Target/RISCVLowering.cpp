@@ -408,7 +408,9 @@ struct F16GemmNTileDecision {
   F16GemmNTileRealization realization =
       F16GemmNTileRealization::RVVRowMicrotile;
   mlir::Operation *operation = nullptr;
-  mlir::Operation *semanticOperation = nullptr;
+  mlir::Operation *sourceNLoop = nullptr;
+  mlir::Operation *sourceKLoop = nullptr;
+  mlir::Operation *consumer = nullptr;
   std::string row;
   std::string rowUpper;
   std::string lhs;
@@ -869,6 +871,16 @@ public:
     line(returnTypeSpelling + " " + sanitize(kernel.getSymName()) + "(" +
          llvm::join(parameters, ", ") + ") {");
     ++indent;
+    kernel.walk([&](ContractOp contract) {
+      ForOp kLoop = contract->getParentOfType<ForOp>();
+      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
+      if (!nLoop)
+        return;
+      auto [position, inserted] = f16ContractAnchors.try_emplace(
+          nLoop.getOperation(), contract.getOperation());
+      if (!inserted)
+        position->second = nullptr;
+    });
     for (mlir::Operation &operation : body) {
       if (auto returnOp = mlir::dyn_cast<ReturnOp>(operation)) {
         if (returnOp.getNumOperands() == 0)
@@ -897,6 +909,7 @@ private:
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> f16ContractAnchors;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -1906,9 +1919,13 @@ private:
     if (std::optional<AffineI4I8NTileDecision> decision =
             decideAffineI4I8NTiles(op))
       return emitAffineI4I8NTiles(*decision);
-    if (std::optional<F16GemmNTileDecision> decision =
-            decideF16GemmNTiles(op))
-      return emitF16GemmNTiles(*decision);
+    auto f16Anchor = f16ContractAnchors.find(op.getOperation());
+    if (f16Anchor != f16ContractAnchors.end() && f16Anchor->second) {
+      auto contract = mlir::cast<ContractOp>(f16Anchor->second);
+      if (std::optional<F16GemmNTileDecision> decision =
+              decideF16GemmNTiles(contract))
+        return emitF16GemmNTiles(*decision);
+    }
     mlir::Block &body = op.getBody().front();
     if (op.getInitArgs().size() != op.getNumResults() ||
         body.getNumArguments() != op.getNumResults() + 1)
@@ -4644,7 +4661,13 @@ private:
     return mlir::success();
   }
 
-  std::optional<F16GemmNTileDecision> decideF16GemmNTiles(ForOp nLoop) {
+  std::optional<F16GemmNTileDecision> decideF16GemmNTiles(ContractOp contract) {
+    ForOp kLoop = contract->getParentOfType<ForOp>();
+    if (!kLoop || contract->getBlock() != &kLoop.getBody().front())
+      return std::nullopt;
+    ForOp nLoop = kLoop->getParentOfType<ForOp>();
+    if (!nLoop || kLoop->getBlock() != &nLoop.getBody().front())
+      return std::nullopt;
     if (nLoop.getNumResults() != 0)
       return std::nullopt;
     ForOp mLoop = nLoop->getParentOfType<ForOp>();
@@ -4652,13 +4675,13 @@ private:
       return std::nullopt;
 
     mlir::Block &nBody = nLoop.getBody().front();
-    ForOp kLoop;
+    ForOp ownedKLoop;
     StoreOp store;
     for (mlir::Operation &operation : nBody.without_terminator()) {
       if (auto candidate = mlir::dyn_cast<ForOp>(operation)) {
-        if (kLoop)
+        if (ownedKLoop)
           return std::nullopt;
-        kLoop = candidate;
+        ownedKLoop = candidate;
       }
       if (auto candidate = mlir::dyn_cast<StoreOp>(operation)) {
         if (store)
@@ -4666,20 +4689,18 @@ private:
         store = candidate;
       }
     }
-    if (!kLoop || !store || kLoop.getNumResults() != 1 ||
+    if (!ownedKLoop || ownedKLoop != kLoop || !store ||
+        kLoop.getNumResults() != 1 ||
         store.getValue() != kLoop.getResult(0) ||
         kLoop.getOperands().size() != 4)
       return std::nullopt;
 
     mlir::Block &kBody = kLoop.getBody().front();
-    ContractOp contract;
-    for (mlir::Operation &operation : kBody.without_terminator())
-      if (auto candidate = mlir::dyn_cast<ContractOp>(operation)) {
-        if (contract)
-          return std::nullopt;
-        contract = candidate;
-      }
-    if (!contract || contract.getResult() !=
+    if (llvm::any_of(kBody.without_terminator(), [&](mlir::Operation &operation) {
+          auto candidate = mlir::dyn_cast<ContractOp>(operation);
+          return candidate && candidate != contract;
+        }) ||
+        contract.getResult() !=
                          mlir::cast<YieldOp>(kBody.getTerminator()).getOperand(0) ||
         contract.getInit() != kBody.getArgument(1) ||
         contract.getLhsAxes().size() != 1 ||
@@ -4754,8 +4775,10 @@ private:
       return std::nullopt;
 
     F16GemmNTileDecision decision;
-    decision.operation = nLoop.getOperation();
-    decision.semanticOperation = contract.getOperation();
+    decision.operation = contract.getOperation();
+    decision.sourceNLoop = nLoop.getOperation();
+    decision.sourceKLoop = kLoop.getOperation();
+    decision.consumer = store.getOperation();
     decision.row = mValue.spelling;
     decision.rowUpper = mUpper.spelling;
     decision.lhs = lhs.spelling;
