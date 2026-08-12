@@ -18,12 +18,12 @@ summary state、pointer relation 和 source-owned effects；不具备共享 prim
 | --- | --- | --- | --- |
 | Weighted EmbeddingBag | bag offsets、动态 entry traversal、weighted sum | VLA 内动态 scalar loop 与 f32 vector carry | 64.861903 ms，1.554945 GB/s |
 | Segmented inclusive scan | 显式 `segment_start` 与 ordered prefix | u8 load、typed predicate、segment scan state | 9.956464 ms，421.264417 MElements/s |
-| CSR SpMV | CSR row traversal、indexed vector lookup、row reduction | u32 index vector、`Indexed` load、f32 reduction | 42.275206 ms，0.146729 GOP/s |
+| CSR SpMV | CSR row traversal、indexed vector lookup、row reduction | u32 index vector、`Indexed` load、f32 reduction | 21.997717 ms，0.281985 GOP/s |
 | CSR sparse attention | CSR edge traversal、online max/sum、scratch accumulator | unit VLA load/reduce/store | 72.423638 ms，0.694608 GOP/s |
 | ROIAlign | box traversal、sampling grid、bilinear interpolation | scalar coordinates、VLA channel arithmetic | 51.974708 ms，4.201389 GB/s |
 | Greedy NMS | ordered selection、mutable suppression、IoU effects | scalar state/control/memory primitives | 9.271941 ms，226.182630 MPairChecks/s |
 | Top-p nucleus sampling | descending selection、ordered prefix、dynamic cutoff、uniform draw | argmax summary 与 scan state | 123.840724 ms，33.868536 MCandidates/s |
-| FWHT | stage、block、butterfly 与 in-place effect | unit-stride VLA load/store/arithmetic | 28.867527 ms，1.743539 GOP/s |
+| FWHT | stage、block、butterfly 与 in-place effect | unit-stride VLA load/store/arithmetic | 28.782566 ms，1.748685 GOP/s |
 | Cross-entropy loss+gradient | stable max/sum、label update、gradient store | reduce、vector exp、predicate/select | 22.636580 ms，185.288767 MElements/s |
 | AdamW | optimizer equations、moment/parameter effects | pointwise memory/arithmetic 与 `vfsqrt.v` | 68.661300 ms，6.841730 GB/s |
 
@@ -97,7 +97,7 @@ RISC-V realization 为局部 `vfsqrt.v`。算法方程、bias correction、weigh
 Top-p 的 123.840724 ms 来自作者显式 repeated selection；目前没有局部 sort/permutation primitive
 及其 physical candidate family。这个差距没有被 Top-k matcher、C library sort 或 whole-kernel
 emitter遮盖。NMS 当前同样是 scalar ordered selection/effect，尚未拥有局部 box-block overlap 的
-VLA realization。CSR SpMV 的 indexed gather 已正确但只有 0.146729 GOP/s，说明 indexed memory
+VLA realization。CSR SpMV 的 indexed gather 已正确但只有 0.281985 GOP/s，说明 indexed memory
 scheduling、prefetch 与 row-length-sensitive LMUL 仍需成为更成熟的共享候选维度。
 
 因此本轮证明的是：六十个累计 kernel 后，陌生组合仍可沿显式授权与逐实体事实进入唯一主链，
