@@ -1,25 +1,6 @@
 import weft
 import weft.language as W
 
-
-@W.pure
-def _winner(value, coordinate):
-    return W.tuple(value, coordinate)
-
-
-@W.pure
-def _merge_winner(a, b):
-    value_a, index_a = a
-    value_b, index_b = b
-    take_b = (value_b > value_a) | (
-        (value_b == value_a) & (index_b < index_a)
-    )
-    return W.tuple(
-        W.select(take_b, value_b, value_a),
-        W.select(take_b, index_b, index_a),
-    )
-
-
 @weft.kernel
 def top_k_f32(
     scores: W.ptr[W.f32, W.readonly, W.noalias],
@@ -49,12 +30,10 @@ def top_k_f32(
                     W.load(scores + row * score_stride + column),
                     W.neg_inf(W.f32),
                 )
-                state = W.summary_fold(
+                state = W.argmax(
                     candidate,
-                    identity=W.tuple(W.neg_inf(W.f32), W.index(0)),
-                    lift=_winner,
-                    merge=_merge_winner,
-                    coordinate=column,
+                    column,
+                    tie="lowest_coordinate",
                     order="relaxed",
                 )
             _, selected = state
@@ -92,12 +71,10 @@ def top_k_f32_equivalent(
                     W.load(score_row + column),
                     W.neg_inf(W.f32),
                 )
-                state = W.summary_fold(
+                state = W.argmax(
                     candidate,
-                    identity=W.tuple(W.neg_inf(W.f32), W.index(0)),
-                    lift=_winner,
-                    merge=_merge_winner,
-                    coordinate=column,
+                    column,
+                    tie="lowest_coordinate",
                     order="relaxed",
                 )
             _, selected = state

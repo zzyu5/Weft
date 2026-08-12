@@ -227,6 +227,30 @@ element。
 
 Online softmax 的 rescale 必须写在 `merge` 中，而不是隐藏在普通 carried loop 里。
 
+当算法需要固定且可观察的 summary 语义时，作者应直接使用对应的 typed primitive，而不是
+依赖 target 识别一段 helper closure：
+
+```python
+value, coordinate = W.argmax(
+    x,
+    i,
+    tie="lowest_coordinate",
+    order="relaxed",
+)
+
+maximum, scaled_sum = W.online_softmax_summary(
+    x,
+    math="native",
+    order="preserve",
+)
+```
+
+`W.argmax` 明确授权 maximum reduction、显式 coordinate 和最低 coordinate 的 tie 语义；
+`W.online_softmax_summary` 明确授权稳定的 `(maximum, scaled_sum)` 合并代数。两者都是局部
+state primitive，不拥有 surrounding traversal、memory、normalization consumer 或 kernel ABI。
+Generic `W.summary_fold` 继续承载作者自定义 algebra；target 不得根据 helper 内部 op 数量、
+SSA 排列或完整 closure 猜测它等价于某个 typed primitive。
+
 `lift`、`merge` 以及可选 `finalize` 必须是 `@W.pure` helper。Canonical regions 的参数分别是
 element或`(element, coordinate)`、`(state,state)` 与 state；每个 region只返回一个闭合值，
 不能含 memory effect。

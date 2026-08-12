@@ -1570,6 +1570,79 @@ class FrontendCompiler:
             regions=(lift_region, merge_region, finalize_region),
         )[0]
 
+    def _intrinsic_argmax(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(
+            call,
+            ("value", "coordinate"),
+            {"tie": "lowest_coordinate", "order": "relaxed"},
+        )
+        value = self._value_argument(args["value"], call)
+        coordinate = self._value_argument(args["coordinate"], call)
+        if element_type(value.type) != ScalarType(f32):
+            raise FrontendError("W.argmax value must contain f32", self._location(call))
+        if element_type(coordinate.type) != ScalarType(index):
+            raise FrontendError(
+                "W.argmax coordinate must contain index", self._location(call)
+            )
+        if shape_kind(coordinate.type) != shape_kind(value.type) or shape_of(
+            coordinate.type
+        ) != shape_of(value.type):
+            raise FrontendError(
+                "W.argmax coordinate must share the value logical domain",
+                self._location(call),
+            )
+        tie = args["tie"]
+        order = args["order"]
+        if isinstance(tie, ast.expr):
+            tie = self._eval_static(tie)
+        if isinstance(order, ast.expr):
+            order = self._eval_static(order)
+        if tie != "lowest_coordinate" or order != "relaxed":
+            raise FrontendError(
+                "W.argmax requires tie='lowest_coordinate' and order='relaxed'",
+                self._location(call),
+            )
+        result_type = TupleType((ScalarType(f32), ScalarType(index)))
+        return self._emit(
+            "weft_kernel.argmax",
+            call,
+            operands=(value, coordinate),
+            result_types=(result_type,),
+            attributes={"tie": _string(tie), "order": _string(order)},
+        )[0]
+
+    def _intrinsic_online_softmax_summary(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(
+            call,
+            ("value",),
+            {"math": "native", "order": "preserve"},
+        )
+        value = self._value_argument(args["value"], call)
+        if element_type(value.type) != ScalarType(f32) or shape_kind(value.type) == "scalar":
+            raise FrontendError(
+                "W.online_softmax_summary value must be a logical f32 domain",
+                self._location(call),
+            )
+        math = args["math"]
+        order = args["order"]
+        if isinstance(math, ast.expr):
+            math = self._eval_static(math)
+        if isinstance(order, ast.expr):
+            order = self._eval_static(order)
+        if math != "native" or order != "preserve":
+            raise FrontendError(
+                "W.online_softmax_summary requires math='native' and order='preserve'",
+                self._location(call),
+            )
+        result_type = TupleType((ScalarType(f32), ScalarType(f32)))
+        return self._emit(
+            "weft_kernel.online_softmax_summary",
+            call,
+            operands=(value,),
+            result_types=(result_type,),
+            attributes={"math": _string(math), "order": _string(order)},
+        )[0]
+
     def _resolve_helper_argument(
         self, argument: ast.expr | object, call: ast.Call, name: str
     ) -> HelperDefinition:

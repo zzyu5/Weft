@@ -746,187 +746,6 @@ bool isFloatConstant(mlir::Value value, double expected) {
   return floating && floating.getValueAsDouble() == expected;
 }
 
-bool isTupleField(mlir::Value value, mlir::BlockArgument tuple,
-                  int64_t index) {
-  auto get = value.getDefiningOp<TupleGetOp>();
-  return get && get.getInput() == tuple && get.getIndex() == index;
-}
-
-bool matchesScaledSummaryTerm(mlir::Value value, mlir::BlockArgument state,
-                              mlir::Value maximum) {
-  auto multiply = value.getDefiningOp<BinaryOp>();
-  if (!multiply || multiply.getKind() != "mul")
-    return false;
-  mlir::Value stateSum;
-  mlir::Value exponential;
-  if (isTupleField(multiply.getLhs(), state, 1)) {
-    stateSum = multiply.getLhs();
-    exponential = multiply.getRhs();
-  } else if (isTupleField(multiply.getRhs(), state, 1)) {
-    stateSum = multiply.getRhs();
-    exponential = multiply.getLhs();
-  } else {
-    return false;
-  }
-  (void)stateSum;
-  auto exp = exponential.getDefiningOp<UnaryOp>();
-  if (!exp || exp.getKind() != "exp")
-    return false;
-  auto subtract = exp.getInput().getDefiningOp<BinaryOp>();
-  return subtract && subtract.getKind() == "sub" &&
-         isTupleField(subtract.getLhs(), state, 0) &&
-         subtract.getRhs() == maximum;
-}
-
-bool isOnlineSoftmaxSummary(SummaryFoldOp op) {
-  if (op.getOrder() != "preserve" || !isTrue(op.getWhere()) ||
-      !mlir::isa<mlir::NoneType>(op.getCoordinate().getType()))
-    return false;
-  auto resultType = mlir::dyn_cast<TupleType>(op.getResult().getType());
-  if (!resultType || resultType.getTypes().size() != 2 ||
-      !resultType.getTypes()[0].isF32() || !resultType.getTypes()[1].isF32())
-    return false;
-
-  auto identity = op.getIdentity().getDefiningOp<TupleOp>();
-  if (!identity || identity.getNumOperands() != 2 ||
-      !identity.getOperand(0).getDefiningOp<SpecialValueOp>() ||
-      identity.getOperand(0).getDefiningOp<SpecialValueOp>().getKind() !=
-          "neg_inf" ||
-      !isFloatConstant(identity.getOperand(1), 0.0))
-    return false;
-
-  mlir::Block &lift = op.getLift().front();
-  auto liftYield = mlir::cast<YieldOp>(lift.getTerminator());
-  auto lifted = liftYield.getOperand(0).getDefiningOp<TupleOp>();
-  if (!lifted || lifted.getNumOperands() != 2 ||
-      lifted.getOperand(0) != lift.getArgument(0) ||
-      !isFloatConstant(lifted.getOperand(1), 1.0))
-    return false;
-
-  mlir::Block &merge = op.getMerge().front();
-  auto mergeYield = mlir::cast<YieldOp>(merge.getTerminator());
-  auto merged = mergeYield.getOperand(0).getDefiningOp<TupleOp>();
-  if (!merged || merged.getNumOperands() != 2)
-    return false;
-  auto maximum = merged.getOperand(0).getDefiningOp<BinaryOp>();
-  if (!maximum || maximum.getKind() != "max")
-    return false;
-  bool maxOperandsMatch =
-      (isTupleField(maximum.getLhs(), merge.getArgument(0), 0) &&
-       isTupleField(maximum.getRhs(), merge.getArgument(1), 0)) ||
-      (isTupleField(maximum.getLhs(), merge.getArgument(1), 0) &&
-       isTupleField(maximum.getRhs(), merge.getArgument(0), 0));
-  if (!maxOperandsMatch)
-    return false;
-  auto sum = merged.getOperand(1).getDefiningOp<BinaryOp>();
-  if (!sum || sum.getKind() != "add")
-    return false;
-  return (matchesScaledSummaryTerm(sum.getLhs(), merge.getArgument(0),
-                                   maximum.getResult()) &&
-          matchesScaledSummaryTerm(sum.getRhs(), merge.getArgument(1),
-                                   maximum.getResult())) ||
-         (matchesScaledSummaryTerm(sum.getLhs(), merge.getArgument(1),
-                                   maximum.getResult()) &&
-          matchesScaledSummaryTerm(sum.getRhs(), merge.getArgument(0),
-                                   maximum.getResult()));
-}
-
-bool matchesTupleFieldCompare(mlir::Value value, llvm::StringRef predicate,
-                              mlir::BlockArgument lhsState, int64_t lhsIndex,
-                              mlir::BlockArgument rhsState,
-                              int64_t rhsIndex) {
-  auto compare = value.getDefiningOp<CompareOp>();
-  return compare && compare.getPredicate() == predicate &&
-         isTupleField(compare.getLhs(), lhsState, lhsIndex) &&
-         isTupleField(compare.getRhs(), rhsState, rhsIndex);
-}
-
-bool matchesArgMaxTie(mlir::Value value, mlir::BlockArgument lhsState,
-                      mlir::BlockArgument rhsState) {
-  auto conjunction = value.getDefiningOp<BinaryOp>();
-  if (!conjunction || conjunction.getKind() != "and")
-    return false;
-  auto matchesEquality = [&](mlir::Value candidate) {
-    return matchesTupleFieldCompare(candidate, "eq", rhsState, 0, lhsState,
-                                    0);
-  };
-  auto matchesLowerIndex = [&](mlir::Value candidate) {
-    return matchesTupleFieldCompare(candidate, "lt", rhsState, 1, lhsState,
-                                    1);
-  };
-  return (matchesEquality(conjunction.getLhs()) &&
-          matchesLowerIndex(conjunction.getRhs())) ||
-         (matchesEquality(conjunction.getRhs()) &&
-          matchesLowerIndex(conjunction.getLhs()));
-}
-
-bool matchesArgMaxTakeRight(mlir::Value value, mlir::BlockArgument lhsState,
-                            mlir::BlockArgument rhsState) {
-  auto disjunction = value.getDefiningOp<BinaryOp>();
-  if (!disjunction || disjunction.getKind() != "or")
-    return false;
-  auto matchesGreater = [&](mlir::Value candidate) {
-    return matchesTupleFieldCompare(candidate, "gt", rhsState, 0, lhsState,
-                                    0);
-  };
-  return (matchesGreater(disjunction.getLhs()) &&
-          matchesArgMaxTie(disjunction.getRhs(), lhsState, rhsState)) ||
-         (matchesGreater(disjunction.getRhs()) &&
-          matchesArgMaxTie(disjunction.getLhs(), lhsState, rhsState));
-}
-
-bool isArgMaxSummary(SummaryFoldOp op) {
-  if (op.getOrder() != "relaxed" || !isTrue(op.getWhere()) ||
-      !elementType(op.getInput().getType()).isF32() ||
-      !elementType(op.getCoordinate().getType()).isIndex())
-    return false;
-  auto resultType = mlir::dyn_cast<TupleType>(op.getResult().getType());
-  if (!resultType || resultType.getTypes().size() != 2 ||
-      !resultType.getTypes()[0].isF32() ||
-      !resultType.getTypes()[1].isIndex())
-    return false;
-
-  auto identity = op.getIdentity().getDefiningOp<TupleOp>();
-  if (!identity || identity.getNumOperands() != 2 ||
-      !identity.getOperand(0).getDefiningOp<SpecialValueOp>() ||
-      identity.getOperand(0).getDefiningOp<SpecialValueOp>().getKind() !=
-          "neg_inf" ||
-      integerConstantValue(identity.getOperand(1)) != 0)
-    return false;
-
-  mlir::Block &lift = op.getLift().front();
-  auto liftYield = mlir::cast<YieldOp>(lift.getTerminator());
-  auto lifted = liftYield.getOperand(0).getDefiningOp<TupleOp>();
-  if (lift.getNumArguments() != 2 || !lifted ||
-      lifted.getNumOperands() != 2 ||
-      lifted.getOperand(0) != lift.getArgument(0) ||
-      lifted.getOperand(1) != lift.getArgument(1))
-    return false;
-
-  mlir::Block &merge = op.getMerge().front();
-  auto mergeYield = mlir::cast<YieldOp>(merge.getTerminator());
-  auto merged = mergeYield.getOperand(0).getDefiningOp<TupleOp>();
-  if (!merged || merged.getNumOperands() != 2)
-    return false;
-  auto valueSelect = merged.getOperand(0).getDefiningOp<SelectOp>();
-  auto indexSelect = merged.getOperand(1).getDefiningOp<SelectOp>();
-  if (!valueSelect || !indexSelect ||
-      valueSelect.getPredicate() != indexSelect.getPredicate() ||
-      !matchesArgMaxTakeRight(valueSelect.getPredicate(), merge.getArgument(0),
-                              merge.getArgument(1)) ||
-      !isTupleField(valueSelect.getTrueValue(), merge.getArgument(1), 0) ||
-      !isTupleField(valueSelect.getFalseValue(), merge.getArgument(0), 0) ||
-      !isTupleField(indexSelect.getTrueValue(), merge.getArgument(1), 1) ||
-      !isTupleField(indexSelect.getFalseValue(), merge.getArgument(0), 1))
-    return false;
-
-  mlir::Block &finalize = op.getFinalize().front();
-  auto finalizeYield = mlir::cast<YieldOp>(finalize.getTerminator());
-  return finalize.getNumArguments() == 1 &&
-         finalizeYield.getNumOperands() == 1 &&
-         finalizeYield.getOperand(0) == finalize.getArgument(0);
-}
-
 class KernelEmitter {
 public:
   KernelEmitter(KernelOp kernel, const RISCVLoweringOptions &options,
@@ -2200,8 +2019,7 @@ private:
                   ? segmentCompare.getLhs()
                   : segmentCompare.getRhs();
         decision.states.push_back(std::move(state));
-      } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
-        if (isArgMaxSummary(summary)) {
+      } else if (auto summary = mlir::dyn_cast<ArgMaxOp>(nested)) {
           LaneRelation coordinate =
               classifyLaneRelation(summary.getCoordinate(), decision.coordinate);
           if (coordinate != LaneRelation::UnitStride &&
@@ -2211,23 +2029,23 @@ private:
           }
           VLAStateDecision state{
               summary.getOperation(), VLAStateRealization::RVVArgMaxSummary,
-              summary.getResult().getType(), summary.getIdentity()};
+              summary.getResult().getType()};
           state.coordinateMode = coordinate == LaneRelation::UnitStride
                                      ? VLAMemoryMode::UnitStride
                                      : VLAMemoryMode::Strided;
           decision.states.push_back(state);
-        } else if (isOnlineSoftmaxSummary(summary)) {
+      } else if (auto summary =
+                     mlir::dyn_cast<OnlineSoftmaxSummaryOp>(nested)) {
           VLAStateDecision state{
               summary.getOperation(),
               VLAStateRealization::RVVOnlineSoftmaxSummary,
-              summary.getResult().getType(), summary.getIdentity()};
+              summary.getResult().getType()};
           state.consumer = decideOnlineSoftmaxConsumer(op, summary);
           decision.states.push_back(std::move(state));
-        } else {
-          summary.emitError(
-              "RISC-V target does not implement this summary algebra");
-          return mlir::failure();
-        }
+      } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        summary.emitError(
+            "RISC-V target does not implement this generic summary algebra");
+        return mlir::failure();
       }
     }
     if (!decision.narrows.empty() && !decision.states.empty()) {
@@ -2760,6 +2578,11 @@ private:
     if (auto op = mlir::dyn_cast<SummaryFoldOp>(operation))
       return op.emitError(
           "summary_fold must be lowered by its enclosing VLA region");
+    if (auto op = mlir::dyn_cast<ArgMaxOp>(operation))
+      return op.emitError("argmax must be lowered by its enclosing VLA region");
+    if (auto op = mlir::dyn_cast<OnlineSoftmaxSummaryOp>(operation))
+      return op.emitError(
+          "online_softmax_summary must be lowered by its enclosing VLA region");
     if (mlir::isa<YieldOp, ReturnOp>(operation))
       return mlir::success();
     return operation->emitError()
@@ -3280,16 +3103,13 @@ private:
         continue;
       }
       if (state.realization == VLAStateRealization::RVVArgMaxSummary) {
-        auto summary = mlir::cast<SummaryFoldOp>(state.operation);
-        auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
+        auto summary = mlir::cast<ArgMaxOp>(state.operation);
         CValue maximum{mlir::Float32Type::get(kernel.getContext()),
                        CValueKind::Scalar, fresh("argmax_value")};
         CValue index{mlir::IndexType::get(kernel.getContext()),
                      CValueKind::Scalar, fresh("argmax_index")};
-        line("float " + maximum.spelling + " = " +
-             expression(identity.getOperand(0)) + ";");
-        line("size_t " + index.spelling + " = " +
-             expression(identity.getOperand(1)) + ";");
+        line("float " + maximum.spelling + " = -INFINITY;");
+        line("size_t " + index.spelling + " = 0;");
         CValue aggregate{summary.getResult().getType(), CValueKind::Tuple, {}};
         aggregate.fields = {maximum, index};
         aggregates[state.operation] = aggregate;
@@ -3320,16 +3140,13 @@ private:
     for (const VLAStateDecision &state : decision.states) {
       if (state.realization ==
           VLAStateRealization::RVVOnlineSoftmaxSummary) {
-        auto summary = mlir::cast<SummaryFoldOp>(state.operation);
-        auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
+        auto summary = mlir::cast<OnlineSoftmaxSummaryOp>(state.operation);
         CValue maximum{mlir::Float32Type::get(kernel.getContext()),
                        CValueKind::Scalar, fresh("summary_max")};
         CValue sum{mlir::Float32Type::get(kernel.getContext()),
                    CValueKind::Scalar, fresh("summary_sum")};
-        line("float " + maximum.spelling + " = " +
-             expression(identity.getOperand(0)) + ";");
-        line("float " + sum.spelling + " = " +
-             expression(identity.getOperand(1)) + ";");
+        line("float " + maximum.spelling + " = -INFINITY;");
+        line("float " + sum.spelling + " = 0.0f;");
         CValue aggregate{summary.getResult().getType(), CValueKind::Tuple, {}};
         aggregate.fields = {maximum, sum};
         aggregates[summary.getOperation()] = aggregate;
@@ -3387,18 +3204,20 @@ private:
             return mlir::failure();
           continue;
         }
-        if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+        if (mlir::isa<ArgMaxOp, OnlineSoftmaxSummaryOp>(nested)) {
           const VLAStateDecision *state =
-              findStateDecision(summary.getOperation());
+              findStateDecision(&nested);
           if (!state)
-            return summary.emitError(
+            return nested.emitError(
                 "VLA summary has no physical state decision");
           mlir::LogicalResult lowered =
               state->realization == VLAStateRealization::RVVArgMaxSummary
                   ? emitVectorArgMaxSummary(
-                        summary, *state, aggregates[summary.getOperation()])
+                        mlir::cast<ArgMaxOp>(nested), *state,
+                        aggregates[&nested])
                   : emitOnlineSoftmaxSummary(
-                        summary, *state, aggregates[summary.getOperation()]);
+                        mlir::cast<OnlineSoftmaxSummaryOp>(nested), *state,
+                        aggregates[&nested]);
           if (mlir::failed(lowered))
             return mlir::failure();
           continue;
@@ -3643,7 +3462,7 @@ private:
   }
 
   std::optional<VLAStateConsumerDecision>
-  decideOnlineSoftmaxConsumer(VLAOp producer, SummaryFoldOp summary) {
+  decideOnlineSoftmaxConsumer(VLAOp producer, OnlineSoftmaxSummaryOp summary) {
     if (producer.getNumResults() != 1)
       return std::nullopt;
     auto producerYield =
@@ -8164,7 +7983,7 @@ private:
     --indent;
     line("}");
 
-    auto summary = mlir::cast<SummaryFoldOp>(state.operation);
+    auto summary = mlir::cast<OnlineSoftmaxSummaryOp>(state.operation);
     CValue maximumValue{mlir::Float32Type::get(kernel.getContext()),
                         CValueKind::Scalar, maximum};
     CValue sumValue{mlir::Float32Type::get(kernel.getContext()),
@@ -8293,7 +8112,7 @@ private:
   }
 
   mlir::LogicalResult emitVectorArgMaxSummary(
-      SummaryFoldOp op, const VLAStateDecision &decision,
+      ArgMaxOp op, const VLAStateDecision &decision,
       const CValue &aggregate) {
     CValue input = require(op.getInput());
     CValue coordinate = require(op.getCoordinate());
@@ -8345,7 +8164,7 @@ private:
   }
 
   mlir::LogicalResult emitOnlineSoftmaxSummary(
-      SummaryFoldOp op, const VLAStateDecision &decision,
+      OnlineSoftmaxSummaryOp op, const VLAStateDecision &decision,
       const CValue &aggregate) {
     CValue input = require(op.getInput());
     if (decision.realization !=

@@ -353,6 +353,22 @@ def WeftKernel_SummaryFoldOp : WeftKernel_Op<"summary_fold", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftKernel_ArgMaxOp : WeftKernel_Op<"argmax", [Pure]> {
+  let summary = "Maximum f32 value with explicit logical coordinate tie-breaking";
+  let arguments = (ins AnyType:$input, AnyType:$coordinate,
+                       StrAttr:$tie, StrAttr:$order);
+  let results = (outs WeftKernel_TupleType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_OnlineSoftmaxSummaryOp
+    : WeftKernel_Op<"online_softmax_summary", [Pure]> {
+  let summary = "Stable f32 maximum and exponentially rescaled sum";
+  let arguments = (ins AnyType:$input, StrAttr:$math, StrAttr:$order);
+  let results = (outs WeftKernel_TupleType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftKernel_ContractOp : WeftKernel_Op<"contract", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$init,
                        AnyType:$where_lhs, AnyType:$where_rhs,

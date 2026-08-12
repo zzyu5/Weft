@@ -12,6 +12,7 @@ from .annotations import writeonly
 from .builtins import HelperDefinition
 from .builtins import Intrinsic
 from .builtins import atomic_add
+from .builtins import argmax
 from .builtins import bitcast
 from .builtins import block_axis
 from .builtins import affine_i4_i8_contract
@@ -42,6 +43,7 @@ from .builtins import maximum
 from .builtins import minimum
 from .builtins import narrow
 from .builtins import neg_inf
+from .builtins import online_softmax_summary
 from .builtins import permute
 from .builtins import prefetch
 from .builtins import q6_k_i8_dot

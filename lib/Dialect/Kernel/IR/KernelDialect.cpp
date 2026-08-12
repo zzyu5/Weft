@@ -1172,6 +1172,36 @@ mlir::LogicalResult SummaryFoldOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult ArgMaxOp::verify() {
+  if (shapeKindOf(getInput().getType()) == ShapeKind::Scalar ||
+      elementTypeOf(getInput().getType()).isF32() == false ||
+      elementTypeOf(getCoordinate().getType()).isIndex() == false ||
+      shapeKindOf(getInput().getType()) !=
+          shapeKindOf(getCoordinate().getType()) ||
+      staticShapeOf(getInput().getType()) !=
+          staticShapeOf(getCoordinate().getType()))
+    return emitOpError("input and coordinate must be matching f32/index domains");
+  auto result = getResult().getType().getTypes();
+  if (result.size() != 2 || !result[0].isF32() || !result[1].isIndex())
+    return emitOpError("result must be tuple<f32,index>");
+  if (getTie() != "lowest_coordinate" || getOrder() != "relaxed")
+    return emitOpError(
+        "argmax requires lowest-coordinate tie and relaxed order");
+  return mlir::success();
+}
+
+mlir::LogicalResult OnlineSoftmaxSummaryOp::verify() {
+  if (shapeKindOf(getInput().getType()) == ShapeKind::Scalar ||
+      !elementTypeOf(getInput().getType()).isF32())
+    return emitOpError("input must be a logical f32 domain");
+  auto result = getResult().getType().getTypes();
+  if (result.size() != 2 || !result[0].isF32() || !result[1].isF32())
+    return emitOpError("result must be tuple<f32,f32>");
+  if (getMath() != "native" || getOrder() != "preserve")
+    return emitOpError("online softmax summary requires native math and preserve order");
+  return mlir::success();
+}
+
 mlir::LogicalResult ContractOp::verify() {
   if (!validOrder(getOrder()) || !validMath(getMath()))
     return emitOpError("invalid contract order or math mode");
