@@ -1743,13 +1743,15 @@ private:
         } else if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
           state.placement = reduce.getOrder() == "relaxed" &&
-                                    !integerConstantValue(op.getEnd())
+                                    !integerConstantValue(op.getEnd()) &&
+                                    !op->getParentOfType<IfOp>()
                                 ? VLAStatePlacement::VectorCarry
                                 : VLAStatePlacement::ScalarCarry;
         } else if (reduce.getKind() == "max") {
           state.realization = VLAStateRealization::RVVMaxReduction;
           state.placement = reduce.getOrder() == "relaxed" &&
-                                    !integerConstantValue(op.getEnd())
+                                    !integerConstantValue(op.getEnd()) &&
+                                    !op->getParentOfType<IfOp>()
                                 ? VLAStatePlacement::VectorCarry
                                 : VLAStatePlacement::ScalarCarry;
         } else {
