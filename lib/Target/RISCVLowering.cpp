@@ -4753,8 +4753,6 @@ private:
         dependsOn(store.getPointer(), kCoordinate))
       return std::nullopt;
 
-    std::string mStep = expression(mLoop.getStep());
-    std::string nStep = expression(nLoop.getStep());
     std::string nLower = expression(nLoop.getLower());
     std::string nUpper = expression(nLoop.getUpper());
     std::string kLower = expression(kLoop.getLower());
@@ -4767,8 +4765,28 @@ private:
     CValue lhsStrideValue = require(lhsStride);
     CValue rhsStrideValue = require(rhsStride);
     CValue outputStrideValue = require(outputStride);
-    if (mStep != "4" || nStep != "8" || nLower.empty() || nUpper.empty() ||
-        kLower.empty() || kUpper.empty() || mValue.spelling.empty() ||
+    auto physicalExtent = [&](mlir::Value value) -> std::optional<int64_t> {
+      if (std::optional<int64_t> constant = integerConstantValue(value))
+        return constant;
+      auto meta = value.getDefiningOp<MetaValueOp>();
+      auto argument = meta
+                          ? mlir::dyn_cast<mlir::BlockArgument>(meta.getInput())
+                          : mlir::BlockArgument{};
+      if (!argument)
+        return std::nullopt;
+      llvm::StringRef name = mlir::cast<mlir::StringAttr>(
+                                 kernel.getArgNames()[argument.getArgNumber()])
+                                 .getValue();
+      auto binding = options.metaBindings.find(name);
+      return binding == options.metaBindings.end()
+                 ? std::nullopt
+                 : std::optional<int64_t>(binding->second);
+    };
+    std::optional<int64_t> rowTile = physicalExtent(mLoop.getStep());
+    std::optional<int64_t> columnTile = physicalExtent(nLoop.getStep());
+    if (!rowTile || *rowTile <= 0 || *rowTile > 8 || !columnTile ||
+        *columnTile <= 0 || nLower.empty() || nUpper.empty() || kLower.empty() ||
+        kUpper.empty() || mValue.spelling.empty() ||
         mUpper.spelling.empty() || lhs.spelling.empty() || rhs.spelling.empty() ||
         outputValue.spelling.empty() || lhsStrideValue.spelling.empty() ||
         rhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty())
@@ -4791,6 +4809,8 @@ private:
     decision.nUpper = nUpper;
     decision.kLower = kLower;
     decision.kUpper = kUpper;
+    decision.rowTile = static_cast<unsigned>(*rowTile);
+    decision.vectorLength = static_cast<unsigned>(*columnTile);
     return decision;
   }
 
