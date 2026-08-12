@@ -20,8 +20,8 @@ def softmax_merge(a, b):
 
 @weft.kernel
 def softmax_f32(
-    x: W.ptr[W.f32, W.readonly],
-    y: W.ptr[W.f32, W.writeonly],
+    x: W.ptr[W.f32, W.readonly, W.noalias],
+    y: W.ptr[W.f32, W.writeonly, W.noalias],
     row_begin: W.index,
     row_end: W.index,
     cols: W.index,
