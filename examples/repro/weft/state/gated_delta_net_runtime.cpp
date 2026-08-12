@@ -72,7 +72,7 @@ int main() {
   };
   compare(output, expected_output);
   compare(state, expected_state);
-  if (max_abs > 4.0e-4f && max_rel > 3.0e-3f) {
+  if (max_abs > 4.0e-4f || max_rel > 3.0e-3f) {
     std::fprintf(stderr, "gated delta net mismatch\n");
     return 1;
   }

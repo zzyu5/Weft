@@ -69,7 +69,7 @@ int main() {
   };
   compare(output, expected_output);
   compare(state, expected_state);
-  if (max_abs > 2.0e-4f && max_rel > 2.0e-3f) {
+  if (max_abs > 2.0e-4f || max_rel > 2.0e-3f) {
     std::fprintf(stderr, "rwkv wkv7 mismatch\n");
     return 1;
   }

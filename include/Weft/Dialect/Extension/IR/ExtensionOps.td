@@ -130,4 +130,71 @@ def WeftExtension_E2M1E8M0I8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_IQ2SI8DotOp
+    : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
+  let summary = "IQ2_S codebook by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element IQ2_S by signed-i8 dot from explicit packed code,
+    high-bit, sign, scale, activation, weight-scale, activation-scale, and init
+    operands.  The four 8-element codebook vectors and their signs remain one
+    observable local numerical relation.  Persistent block storage and outer
+    traversal are not part of this operation.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$high_bits,
+                       AnyType:$sign_bits, AnyType:$scales,
+                       AnyType:$activation, AnyType:$weight_scale,
+                       AnyType:$activation_scale, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_IQ3SI8DotOp
+    : WeftExtension_Op<"iq3_s_i8_dot", [Pure]> {
+  let summary = "IQ3_S codebook by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element IQ3_S by signed-i8 dot from explicit packed code,
+    high-bit, sign, scale, activation, weight-scale, activation-scale, and init
+    operands.  Persistent block storage and outer traversal remain in Kernel IR.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$high_bits,
+                       AnyType:$sign_bits, AnyType:$scales,
+                       AnyType:$activation, AnyType:$weight_scale,
+                       AnyType:$activation_scale, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_IQ1MI8DotOp
+    : WeftExtension_Op<"iq1_m_i8_dot", [Pure]> {
+  let summary = "IQ1_M ternary codebook by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element IQ1_M by signed-i8 dot.  Code bytes, high/delta
+    bits, packed scale bytes, activation, activation scale, and init are explicit
+    operands.  The half scale reconstructed from the packed scale field is part
+    of this local numerical relation.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$high_delta_bits,
+                       AnyType:$scales, AnyType:$activation,
+                       AnyType:$activation_scale, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_Q6KI8DotOp
+    : WeftExtension_Op<"q6_k_i8_dot", [Pure]> {
+  let summary = "Q6_K grouped signed-6-bit by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element Q6_K by signed-i8 dot from explicit low-nibble,
+    high-bit, signed group-scale, activation, weight-scale, activation-scale, and
+    init operands.  Persistent 210/292-byte block storage and outer traversal
+    remain explicit outside the operation.
+  }];
+  let arguments = (ins AnyType:$low_bits, AnyType:$high_bits,
+                       AnyType:$group_scales, AnyType:$activation,
+                       AnyType:$weight_scale, AnyType:$activation_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 #endif // WEFT_DIALECT_EXTENSION_IR_EXTENSIONOPS_TD

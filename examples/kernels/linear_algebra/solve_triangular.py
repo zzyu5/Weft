@@ -20,12 +20,26 @@ def solve_lower_triangular_f32(
         solution_batch = solution + batch * rhs_batch_stride
         for row in W.range(0, rows):
             with W.vla(0, rhs_columns) as column:
-                residual = W.load(rhs_batch + row * rhs_columns + column)
-                for inner in W.range(0, row):
-                    residual = residual - W.load(
-                        matrix_batch + row * rows + inner
-                    ) * W.load(solution_batch + inner * rhs_columns + column)
+                inner = W.block_axis(row)
+                diagonal = W.load(matrix_batch + row * rows + row)
+                coefficient = -W.load(matrix_batch + row * rows + inner) / diagonal
+                previous = W.load(
+                    solution_batch
+                    + inner[None, :] * rhs_columns
+                    + column[:, None]
+                )
+                result = W.contract(
+                    previous,
+                    coefficient,
+                    init=W.load(rhs_batch + row * rhs_columns + column)
+                    / diagonal,
+                    lhs_axes=(1,),
+                    rhs_axes=(0,),
+                    acc_dtype=W.f32,
+                    order="relaxed",
+                    math="native",
+                )
                 W.store(
                     solution_batch + row * rhs_columns + column,
-                    residual / W.load(matrix_batch + row * rows + row),
+                    result,
                 )

@@ -52,7 +52,7 @@ int main() {
     max_abs = std::max(max_abs, error);
     max_rel = std::max(max_rel, error / std::max(1.0e-6f, std::abs(expected[i])));
   }
-  if (max_abs > 1.0e-5f && max_rel > 1.0e-4f) {
+  if (max_abs > 1.0e-5f || max_rel > 1.0e-4f) {
     std::fprintf(stderr, "triangular solve mismatch\n");
     return 1;
   }

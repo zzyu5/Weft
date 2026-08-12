@@ -132,3 +132,7 @@ sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot", "weft_ext.sign_bit_i8_dot")
 e2m1_e8m0_i8_dot = _intrinsic(
     "e2m1_e8m0_i8_dot", "weft_ext.e2m1_e8m0_i8_dot"
 )
+iq2_s_i8_dot = _intrinsic("iq2_s_i8_dot", "weft_ext.iq2_s_i8_dot")
+iq3_s_i8_dot = _intrinsic("iq3_s_i8_dot", "weft_ext.iq3_s_i8_dot")
+iq1_m_i8_dot = _intrinsic("iq1_m_i8_dot", "weft_ext.iq1_m_i8_dot")
+q6_k_i8_dot = _intrinsic("q6_k_i8_dot", "weft_ext.q6_k_i8_dot")

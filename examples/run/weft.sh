@@ -34,6 +34,8 @@ cleanup_local() {
 trap cleanup_local EXIT
 
 quant=0
+k_quant_dot=0
+k_quant_kind=0
 multi=0
 multi_primary=
 multi_equivalent=
@@ -460,6 +462,20 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/iq4_nl.py
     runtime=examples/repro/weft/quantization/iq4_nl_runtime.cpp
     ;;
+  iq2_S_q8_K | iq3_S_q8_K | iq1_M_q8_K | q6_K_q8_K)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/codebook_k.py
+    k_quant_dot=1
+    case "${kernel}" in
+      iq1_M_q8_K) k_quant_kind=1 ;;
+      iq2_S_q8_K) k_quant_kind=2 ;;
+      iq3_S_q8_K) k_quant_kind=3 ;;
+      q6_K_q8_K) k_quant_kind=6 ;;
+    esac
+    ;;
   *)
     echo "unsupported Weft kernel: ${kernel}" >&2
     exit 2
@@ -477,7 +493,17 @@ if [[ ! -x "${compiler}" ]]; then
   exit 1
 fi
 
-if [[ ${quant} -eq 1 ]]; then
+if [[ ${k_quant_dot} -eq 1 ]]; then
+  PYTHONPATH="${project_root}/python" python3 -m weft \
+    "${project_root}/${dsl}" --kernel "${kernel}" |
+    "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
+      --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
+      "${backend_arguments[@]}" -o "${local_root}/kernel.c"
+  cp "${project_root}/examples/repro/weft/quantization/codebook_k_runtime.cpp" \
+    "${local_root}/runtime.cpp"
+  cp "${project_root}/source/c/ggml/llama.cpp/ggml/src/ggml-common.h" \
+    "${local_root}/ggml-common.h"
+elif [[ ${quant} -eq 1 ]]; then
   PYTHONPATH="${project_root}/python" python3 -m weft \
     "${project_root}/${dsl}" --kernel "${kernel}" |
     "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
@@ -535,7 +561,15 @@ tar -C "${local_root}" -cf - . |
     cd \"\${remote_root}\"
     cc=${remote_cc}
     cxx=${remote_cxx}
-    if [ '${quant}' -eq 1 ]; then
+    if [ '${k_quant_dot}' -eq 1 ]; then
+      "\${cc}" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
+        -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
+      "\${cxx}" -O3 ${remote_compile_flags} -funroll-loops -std=c++17 -Wall -Wextra -Werror \
+        -DWEFT_QUANT_KIND=${k_quant_kind} -march=${target_march} -mabi=lp64d \
+        -c runtime.cpp -o runtime.o
+      "\${cxx}" -march=${target_march} -mabi=lp64d runtime.o kernel.o \
+        -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm -o weft_runtime
+    elif [ '${quant}' -eq 1 ]; then
       \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
       ar rcs libweft_kernel.a kernel.o

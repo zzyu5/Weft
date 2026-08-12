@@ -24,6 +24,8 @@
 
 namespace {
 
+#include "RISCVQuantCodebooks.inc"
+
 using namespace weft;
 using namespace weft::extension;
 using namespace weft::kernel;
@@ -196,6 +198,17 @@ struct GroupedAffineI4I8Decision {
   mlir::Value init;
 };
 
+enum class QuantCodebookI8Realization {
+  RVVVLEN128LocalBlockDot,
+};
+
+struct QuantCodebookI8Decision {
+  QuantCodebookI8Realization realization =
+      QuantCodebookI8Realization::RVVVLEN128LocalBlockDot;
+  llvm::SmallVector<mlir::Value> blockBases;
+  llvm::SmallVector<mlir::Value> scalars;
+};
+
 struct CValue {
   mlir::Type type;
   CValueKind kind = CValueKind::Scalar;
@@ -364,6 +377,13 @@ struct VLANarrowDecision {
 
 enum class VLAContractRealization {
   RVVF32FreeAxisMicrotile,
+  RVVF32FreeAxisVectorDot,
+};
+
+enum class VLAContractInitRealization {
+  ZeroVector,
+  ScalarBroadcast,
+  MaterializedRegion,
 };
 
 struct VLAContractDecision {
@@ -373,6 +393,9 @@ struct VLAContractDecision {
   mlir::Operation *consumer = nullptr;
   mlir::Operation *lhsLoad = nullptr;
   mlir::Operation *rhsLoad = nullptr;
+  mlir::Operation *freeLoad = nullptr;
+  mlir::Value blockedOperand;
+  mlir::Value init;
   mlir::Value rowAxis;
   mlir::Value reductionAxis;
   mlir::Value reductionExtent;
@@ -380,8 +403,11 @@ struct VLAContractDecision {
   unsigned lmul = 2;
   unsigned kUnroll = 1;
   VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
+  VLAMemoryMode freeMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
   bool lhsPredicateVariesByReduction = false;
+  VLAContractInitRealization initRealization =
+      VLAContractInitRealization::ZeroVector;
   llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
@@ -1037,6 +1063,49 @@ private:
       groupedAffineI4I8Decisions.try_emplace(op.getOperation(),
                                              std::move(decision));
     });
+    auto prepareQuantCodebookDot = [&](auto op,
+                                       llvm::ArrayRef<int64_t> extents,
+                                       llvm::ArrayRef<mlir::Value> blocks,
+                                       llvm::ArrayRef<mlir::Value> scalars) {
+      if (decisionFailure)
+        return;
+      QuantCodebookI8Decision decision;
+      if (mlir::failed(decideQuantCodebookI8Dot(op, extents, blocks, scalars,
+                                               decision))) {
+        decisionFailure = true;
+        return;
+      }
+      quantCodebookI8Decisions.try_emplace(op.getOperation(),
+                                           std::move(decision));
+    };
+    kernel.walk([&](IQ2SI8DotOp op) {
+      prepareQuantCodebookDot(
+          op, {32, 8, 32, 8, 256},
+          {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
+           op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
+    kernel.walk([&](IQ3SI8DotOp op) {
+      prepareQuantCodebookDot(
+          op, {64, 8, 32, 4, 256},
+          {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
+           op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
+    kernel.walk([&](IQ1MI8DotOp op) {
+      prepareQuantCodebookDot(
+          op, {32, 16, 8, 256},
+          {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
+           op.getActivation()},
+          {op.getActivationScale(), op.getInit()});
+    });
+    kernel.walk([&](Q6KI8DotOp op) {
+      prepareQuantCodebookDot(
+          op, {128, 64, 16, 256},
+          {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
+           op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
     kernel.walk([&](DecodeOp op) {
       if (decisionFailure)
         return;
@@ -1076,6 +1145,8 @@ private:
       e2m1E8M0I8Decisions;
   llvm::DenseMap<mlir::Operation *, GroupedAffineI4I8Decision>
       groupedAffineI4I8Decisions;
+  llvm::DenseMap<mlir::Operation *, QuantCodebookI8Decision>
+      quantCodebookI8Decisions;
   llvm::DenseMap<mlir::Operation *, BlockDecodeDecision> blockDecodeDecisions;
   llvm::DenseMap<mlir::Operation *, BlockStoreGroupDecision>
       blockStoreGroupDecisions;
@@ -1439,6 +1510,7 @@ private:
     decision.consumer = store.getOperation();
     decision.lhsLoad = lhsLoad.getOperation();
     decision.rhsLoad = rhsLoad.getOperation();
+    decision.init = contract.getInit();
     decision.rowAxis = rowAxis.getResult();
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
@@ -1461,6 +1533,149 @@ private:
                                     : VLAMemoryMode::Strided;
     decision.lhsPredicateVariesByReduction =
         dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+    decision.absorbed.append(absorbed.begin(), absorbed.end());
+    return decision;
+  }
+
+  mlir::FailureOr<VLAContractDecision>
+  decideVLAF32FreeAxisVectorDot(VLAOp vla, StoreOp store,
+                                ContractOp contract) {
+    auto unwrapBlock = [](mlir::Type type) -> BlockType {
+      if (auto masked = mlir::dyn_cast<MaskedType>(type))
+        type = masked.getValueType();
+      return mlir::dyn_cast<BlockType>(type);
+    };
+    auto unwrapRegion = [](mlir::Type type) -> RegionType {
+      if (auto masked = mlir::dyn_cast<MaskedType>(type))
+        type = masked.getValueType();
+      return mlir::dyn_cast<RegionType>(type);
+    };
+
+    RegionType lhsType = unwrapRegion(contract.getLhs().getType());
+    BlockType rhsType = unwrapBlock(contract.getRhs().getType());
+    RegionType initType = unwrapRegion(contract.getInit().getType());
+    RegionType resultType = unwrapRegion(contract.getResult().getType());
+    if (store.getValue() != contract.getResult() ||
+        !contract.getResult().hasOneUse() || !lhsType || !rhsType ||
+        !initType || !resultType || lhsType.getShape().size() != 2 ||
+        rhsType.getShape().size() != 1 || initType.getShape().size() != 1 ||
+        resultType.getShape().size() != 1 || lhsType.getShape()[0] != -1 ||
+        initType.getShape()[0] != -1 || resultType.getShape()[0] != -1 ||
+        lhsType.getShape()[1] != rhsType.getShape()[0] ||
+        !lhsType.getElementType().isF32() ||
+        !rhsType.getElementType().isF32() ||
+        !initType.getElementType().isF32() ||
+        !resultType.getElementType().isF32() ||
+        contract.getLhsAxes().size() != 1 ||
+        contract.getRhsAxes().size() != 1 ||
+        contract.getLhsAxes().front() != 1 ||
+        contract.getRhsAxes().front() != 0 ||
+        contract.getOrder() != "relaxed" || contract.getMath() != "native" ||
+        !contract.getAccDtype().isF32() || !contract.getOutDtype().isF32() ||
+        !isTrue(contract.getWhereLhs()) || !isTrue(contract.getWhereRhs())) {
+      contract.emitError(
+          "RVV VLA vector dot requires a [VLA,K] x [K] local f32 primitive");
+      return mlir::failure();
+    }
+
+    LoadOp freeLoad = contract.getLhs().getDefiningOp<LoadOp>();
+    if (!freeLoad || !isTrue(freeLoad.getWhere())) {
+      contract.emitError("RVV VLA vector-dot load facts are unavailable");
+      return mlir::failure();
+    }
+
+    mlir::Block &block = *store->getBlock();
+    llvm::DenseSet<mlir::Operation *> freeDefinitions;
+    llvm::DenseSet<mlir::Operation *> blockedDefinitions;
+    llvm::DenseSet<mlir::Operation *> outputDefinitions;
+    llvm::SmallVector<BlockAxisOp> freeAxes;
+    llvm::SmallVector<BlockAxisOp> blockedAxes;
+    llvm::SmallVector<BlockAxisOp> outputAxes;
+    collectLocalDefinitions(contract.getLhs(), block, freeDefinitions, freeAxes);
+    collectLocalDefinitions(contract.getRhs(), block, blockedDefinitions,
+                            blockedAxes);
+    collectLocalDefinitions(store.getPointer(), block, outputDefinitions,
+                            outputAxes);
+    collectLocalDefinitions(store.getWhere(), block, outputDefinitions,
+                            outputAxes);
+    if (freeAxes.size() != 1 || blockedAxes.size() != 1 ||
+        freeAxes.front() != blockedAxes.front() || !outputAxes.empty()) {
+      contract.emitError(
+          "RVV VLA vector dot requires one shared explicit reduction axis");
+      return mlir::failure();
+    }
+    BlockAxisOp reductionAxis = freeAxes.front();
+
+    mlir::Value coordinate = vla.getBody().front().getArgument(0);
+    mlir::Value freeRoot = pointerRoot(freeLoad.getPointer());
+    mlir::Value outputRoot = pointerRoot(store.getPointer());
+    auto freePointer =
+        freeRoot ? mlir::dyn_cast<PtrType>(freeRoot.getType()) : PtrType{};
+    auto outputPointer =
+        outputRoot ? mlir::dyn_cast<PtrType>(outputRoot.getType()) : PtrType{};
+    LaneRelation freeRelation =
+        classifyLaneRelation(freeLoad.getPointer(), coordinate);
+    LaneRelation outputRelation =
+        classifyLaneRelation(store.getPointer(), coordinate);
+    if (!freePointer || !outputPointer ||
+        !freePointer.getElementType().isF32() ||
+        !outputPointer.getElementType().isF32() ||
+        (freeRelation != LaneRelation::UnitStride &&
+         freeRelation != LaneRelation::Strided) ||
+        (outputRelation != LaneRelation::UnitStride &&
+         outputRelation != LaneRelation::Strided) ||
+        !dependsOn(freeLoad.getPointer(), coordinate) ||
+        !dependsOn(freeLoad.getPointer(), reductionAxis.getResult()) ||
+        !dependsOn(contract.getInit(), coordinate) ||
+        dependsOn(contract.getInit(), reductionAxis.getResult()) ||
+        !dependsOn(store.getPointer(), coordinate) ||
+        dependsOn(store.getPointer(), reductionAxis.getResult()) ||
+        !isTrue(store.getWhere()) ||
+        dependsOn(contract.getRhs(), coordinate) ||
+        !dependsOn(contract.getRhs(), reductionAxis.getResult())) {
+      contract.emitError("RVV VLA vector-dot memory relations are unavailable");
+      return mlir::failure();
+    }
+
+    llvm::DenseSet<mlir::Operation *> absorbed;
+    llvm::SmallVector<BlockAxisOp> absorbedAxes;
+    for (mlir::Value value : {store.getPointer(), store.getValue(),
+                              store.getWhere()})
+      collectLocalDefinitions(value, block, absorbed, absorbedAxes);
+    llvm::DenseSet<mlir::Operation *> initDefinitions;
+    llvm::SmallVector<BlockAxisOp> initAxes;
+    collectLocalDefinitions(contract.getInit(), block, initDefinitions, initAxes);
+    for (mlir::Operation *operation : initDefinitions)
+      absorbed.erase(operation);
+
+    VLAContractDecision decision;
+    decision.operation = contract.getOperation();
+    decision.realization = VLAContractRealization::RVVF32FreeAxisVectorDot;
+    decision.consumer = store.getOperation();
+    decision.freeLoad = freeLoad.getOperation();
+    decision.blockedOperand = contract.getRhs();
+    decision.init = contract.getInit();
+    decision.reductionAxis = reductionAxis.getResult();
+    decision.reductionExtent = reductionAxis.getExtent();
+    decision.rowTile = 1;
+    std::optional<F32ContractPhysicalConfig> physical =
+        selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
+                                        decision.rowTile, 1);
+    if (!physical) {
+      contract.emitError(
+          "RVV VLA vector dot has no legal register candidate");
+      return mlir::failure();
+    }
+    decision.lmul = physical->lmul;
+    decision.kUnroll = physical->kUnroll;
+    decision.freeMemoryMode = freeRelation == LaneRelation::UnitStride
+                                  ? VLAMemoryMode::UnitStride
+                                  : VLAMemoryMode::Strided;
+    decision.outputMemoryMode = outputRelation == LaneRelation::UnitStride
+                                    ? VLAMemoryMode::UnitStride
+                                    : VLAMemoryMode::Strided;
+    decision.initRealization =
+        VLAContractInitRealization::MaterializedRegion;
     decision.absorbed.append(absorbed.begin(), absorbed.end());
     return decision;
   }
@@ -1495,7 +1710,10 @@ private:
       if (!contract || !isRegionValue(contract.getResult().getType()))
         continue;
       mlir::FailureOr<VLAContractDecision> selected =
-          decideVLAF32FreeAxisMicrotile(op, store, contract);
+          isRegionValue(contract.getLhs().getType()) &&
+                  containsBlockType(contract.getRhs().getType())
+              ? decideVLAF32FreeAxisVectorDot(op, store, contract)
+              : decideVLAF32FreeAxisMicrotile(op, store, contract);
       if (mlir::failed(selected))
         return mlir::failure();
       decision.contracts.push_back(std::move(*selected));
@@ -2115,6 +2333,14 @@ private:
       return emitSignBitI8Dot(op);
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
       return emitE2M1E8M0I8Dot(op);
+    if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
+      return emitQuantCodebookI8Dot(op, "__weft_iq2_s_i8_vl128");
+    if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
+      return emitQuantCodebookI8Dot(op, "__weft_iq3_s_i8_vl128");
+    if (auto op = mlir::dyn_cast<IQ1MI8DotOp>(operation))
+      return emitQuantCodebookI8Dot(op, "__weft_iq1_m_i8_vl128");
+    if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
+      return emitQuantCodebookI8Dot(op, "__weft_q6_k_i8_vl128");
     if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
       return emitSymmetricI4I8Contract(op);
     if (auto op = mlir::dyn_cast<FullOp>(operation)) {
@@ -3548,6 +3774,33 @@ private:
         return std::nullopt;
       return "(" + *base + " + " + *offset + ")";
     }
+    if (auto load = value.getDefiningOp<LoadOp>()) {
+      std::optional<std::string> pointer =
+          projectBlockScalar(load.getPointer(), axisValues);
+      if (!pointer)
+        return std::nullopt;
+      std::string read = "(*" + *pointer + ")";
+      if (isTrue(load.getWhere()))
+        return read;
+      std::optional<std::string> predicate =
+          projectBlockScalar(load.getWhere(), axisValues);
+      std::optional<std::string> other =
+          projectBlockScalar(load.getOther(), axisValues);
+      if (!predicate || !other)
+        return std::nullopt;
+      return "(" + *predicate + " ? " + read + " : " + *other + ")";
+    }
+    if (auto unary = value.getDefiningOp<UnaryOp>()) {
+      std::optional<std::string> input =
+          projectBlockScalar(unary.getInput(), axisValues);
+      if (!input)
+        return std::nullopt;
+      if (unary.getKind() == "neg")
+        return "(-" + *input + ")";
+      if (unary.getKind() == "abs")
+        return "fabsf(" + *input + ")";
+      return std::nullopt;
+    }
     if (auto binary = value.getDefiningOp<BinaryOp>()) {
       std::optional<std::string> lhs =
           projectBlockScalar(binary.getLhs(), axisValues);
@@ -3667,6 +3920,86 @@ private:
   }
 
   mlir::LogicalResult emitVLAContract(const VLAContractDecision &decision) {
+    if (decision.realization ==
+        VLAContractRealization::RVVF32FreeAxisVectorDot) {
+      auto contract = mlir::cast<ContractOp>(decision.operation);
+      auto store = mlir::cast<StoreOp>(decision.consumer);
+      auto freeLoad = mlir::cast<LoadOp>(decision.freeLoad);
+      std::string extent = expression(decision.reductionExtent);
+      CValue init = require(decision.init);
+      if (extent.empty() || activeVL.empty() ||
+          decision.initRealization !=
+              VLAContractInitRealization::MaterializedRegion ||
+          init.kind != CValueKind::F32Vector || init.spelling.empty())
+        return contract.emitError(
+            "RVV VLA vector-dot physical operands are unavailable");
+
+      std::string vectorSuffix = "f32m" + std::to_string(decision.lmul);
+      std::string vectorType =
+          "vfloat32m" + std::to_string(decision.lmul) + "_t";
+      llvm::DenseMap<mlir::Value, std::string> baseAxes;
+      baseAxes[decision.reductionAxis] = "0";
+      std::optional<std::string> outputPointer =
+          projectBlockScalar(store.getPointer(), baseAxes);
+      std::optional<std::string> outputLaneStride = projectVLALaneStride(
+          store.getPointer(), activeVLADecision->coordinate, baseAxes);
+      if (!outputPointer || !outputLaneStride)
+        return contract.emitError(
+            "RVV VLA vector-dot output projection is unavailable");
+
+      std::string accumulator = fresh("vla_contract_acc");
+      line(vectorType + " " + accumulator + " = " + init.spelling + ";");
+      std::string reduction = fresh("vla_contract_k");
+      line("for (size_t " + reduction + " = 0; " + reduction + " < " +
+           extent + "; " + reduction + " += " +
+           std::to_string(decision.kUnroll) + ") {");
+      ++indent;
+      for (unsigned unroll = 0; unroll < decision.kUnroll; ++unroll) {
+        std::string coordinate =
+            unroll == 0 ? reduction
+                        : "(" + reduction + " + " + std::to_string(unroll) + ")";
+        line("if (" + coordinate + " < " + extent + ") {");
+        ++indent;
+        llvm::DenseMap<mlir::Value, std::string> axes;
+        axes[decision.reductionAxis] = coordinate;
+        std::optional<std::string> freePointer =
+            projectBlockScalar(freeLoad.getPointer(), axes);
+        std::optional<std::string> freeLaneStride = projectVLALaneStride(
+            freeLoad.getPointer(), activeVLADecision->coordinate, axes);
+        std::optional<std::string> blocked =
+            projectBlockScalar(decision.blockedOperand, axes);
+        if (!freePointer || !freeLaneStride || !blocked)
+          return contract.emitError(
+              "RVV VLA vector-dot operand projection is unavailable");
+        std::string vector = fresh("vla_contract_free");
+        if (decision.freeMemoryMode == VLAMemoryMode::UnitStride) {
+          line(vectorType + " " + vector + " = __riscv_vle32_v_" +
+               vectorSuffix + "(" + *freePointer + ", " + activeVL + ");");
+        } else {
+          line(vectorType + " " + vector + " = __riscv_vlse32_v_" +
+               vectorSuffix + "(" + *freePointer +
+               ", (ptrdiff_t)(sizeof(float) * (" + *freeLaneStride + ")), " +
+               activeVL + ");");
+        }
+        line(accumulator + " = __riscv_vfmacc_vf_" + vectorSuffix + "(" +
+             accumulator + ", " + *blocked + ", " + vector + ", " + activeVL +
+             ");");
+        --indent;
+        line("}");
+      }
+      --indent;
+      line("}");
+      if (decision.outputMemoryMode == VLAMemoryMode::UnitStride) {
+        line("__riscv_vse32_v_" + vectorSuffix + "(" + *outputPointer + ", " +
+             accumulator + ", " + activeVL + ");");
+      } else {
+        line("__riscv_vsse32_v_" + vectorSuffix + "(" + *outputPointer +
+             ", (ptrdiff_t)(sizeof(float) * (" + *outputLaneStride + ")), " +
+             accumulator + ", " + activeVL + ");");
+      }
+      return mlir::success();
+    }
+
     auto contract = mlir::cast<ContractOp>(decision.operation);
     auto store = mlir::cast<StoreOp>(decision.consumer);
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
@@ -4888,6 +5221,83 @@ private:
     markDiscardedBlockTree(op.getScaleMin());
     markDiscardedBlockTree(op.getActivation());
     markDiscardedBlockTree(op.getActivationSumBytes());
+    return mlir::success();
+  }
+
+  template <typename OpTy>
+  mlir::LogicalResult decideQuantCodebookI8Dot(
+      OpTy op, llvm::ArrayRef<int64_t> extents,
+      llvm::ArrayRef<mlir::Value> blocks, llvm::ArrayRef<mlir::Value> scalars,
+      QuantCodebookI8Decision &decision) {
+    if (options.target.vlenBits != 128)
+      return op.emitError(
+          "quant codebook/i8 dot requires an explicit VLEN128 target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "quant codebook/i8 dot requires little-endian packed fields");
+    if (extents.size() != blocks.size())
+      return op.emitError("quant codebook/i8 typed block facts are incomplete");
+
+    decision = QuantCodebookI8Decision{};
+    for (auto [block, extent] : llvm::zip(blocks, extents)) {
+      if (!block.hasOneUse())
+        return op.emitError(
+            "quant codebook/i8 dot requires local single-use block operands");
+      LoadOp load;
+      if (auto cast = block.template getDefiningOp<BitcastOp>())
+        load = cast.getInput().template getDefiningOp<LoadOp>();
+      else
+        load = block.template getDefiningOp<LoadOp>();
+      if (!load || !isTrue(load.getWhere()))
+        return op.emitError(
+            "quant codebook/i8 dot requires explicit all-active block loads");
+      auto lane = load.getPointer().template getDefiningOp<PtrAddOp>();
+      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
+        return op.emitError(
+            "quant codebook/i8 dot block axes do not match typed operands");
+      decision.blockBases.push_back(lane.getBase());
+    }
+    decision.scalars.append(scalars.begin(), scalars.end());
+    return mlir::success();
+  }
+
+  template <typename OpTy>
+  mlir::LogicalResult emitQuantCodebookI8Dot(OpTy op,
+                                              llvm::StringRef helper) {
+    auto prepared = quantCodebookI8Decisions.find(op.getOperation());
+    if (prepared == quantCodebookI8Decisions.end())
+      return op.emitError(
+          "quant codebook/i8 physical decision was not prepared");
+    const QuantCodebookI8Decision &decision = prepared->second;
+    if (decision.realization !=
+        QuantCodebookI8Realization::RVVVLEN128LocalBlockDot)
+      return op.emitError("quant codebook/i8 realization is unavailable");
+    llvm::SmallVector<CValue> operands;
+    for (mlir::Value base : decision.blockBases) {
+      CValue value = require(base);
+      if (value.kind != CValueKind::Pointer || value.spelling.empty())
+        return op.emitError(
+            "quant codebook/i8 block base was not materialized");
+      operands.push_back(std::move(value));
+    }
+    for (mlir::Value scalar : decision.scalars) {
+      CValue value = require(scalar);
+      if (value.kind != CValueKind::Scalar || value.spelling.empty())
+        return op.emitError(
+            "quant codebook/i8 scalar operand was not materialized");
+      operands.push_back(std::move(value));
+    }
+    std::string result = fresh("quant_dot");
+    llvm::SmallVector<std::string> spellings;
+    for (const CValue &operand : operands)
+      spellings.push_back(operand.spelling);
+    line("const float " + result + " = " + helper.str() + "(" +
+         llvm::join(spellings, ", ") + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    for (mlir::Value block : op->getOperands())
+      if (containsBlockType(block.getType()))
+        markDiscardedBlockTree(block);
     return mlir::success();
   }
 
@@ -7307,7 +7717,8 @@ private:
 };
 
 void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1,
-                 bool usesGroupedI4I8, bool usesE2M1E8M0I8) {
+                 bool usesGroupedI4I8, bool usesE2M1E8M0I8,
+                 bool usesQuantCodebookI8) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -7788,6 +8199,362 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
 
 )ime";
   }
+  if (usesQuantCodebookI8) {
+    auto emitI64Table = [&](llvm::StringRef name, const int64_t *values,
+                            size_t count) {
+      output << "static const int64_t " << name << "[" << count << "] = {\n";
+      for (size_t index = 0; index < count; ++index) {
+        if (index % 4 == 0)
+          output << "  ";
+        output << values[index];
+        if (index + 1 != count)
+          output << ", ";
+        output << (index % 4 == 3 ? "\n" : "");
+      }
+      if (count % 4 != 0)
+        output << "\n";
+      output << "};\n\n";
+    };
+    auto emitI32Table = [&](llvm::StringRef name, const int32_t *values,
+                            size_t count) {
+      output << "static const int32_t " << name << "[" << count << "] = {\n";
+      for (size_t index = 0; index < count; ++index) {
+        if (index % 8 == 0)
+          output << "  ";
+        output << values[index];
+        if (index + 1 != count)
+          output << ", ";
+        output << (index % 8 == 7 ? "\n" : "");
+      }
+      if (count % 8 != 0)
+        output << "\n";
+      output << "};\n\n";
+    };
+    emitI64Table("__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
+    emitI64Table("__weft_iq2_s_grid", __weft_iq2_s_grid, 1024);
+    emitI32Table("__weft_iq3_s_grid", __weft_iq3_s_grid, 512);
+    output << R"c(static inline __attribute__((always_inline, unused)) int32_t
+__weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
+  int32_t result = 0;
+  size_t offset = 0;
+  while (offset < count) {
+    const size_t vl = __riscv_vsetvl_e8m2(count - offset);
+    const vint8m2_t left = __riscv_vle8_v_i8m2(lhs + offset, vl);
+    const vint8m2_t right = __riscv_vle8_v_i8m2(rhs + offset, vl);
+    const vint16m4_t products = __riscv_vwmul_vv_i16m4(left, right, vl);
+    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+    result += __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m4_i32m1(products, zero, vl));
+    offset += vl;
+  }
+  return result;
+}
+
+static inline __attribute__((always_inline, unused)) vuint16m1_t
+__weft_get_u16m2_u16m1(vuint16m2_t value, size_t segment) {
+  return segment == 0 ? __riscv_vget_v_u16m2_u16m1(value, 0)
+                      : __riscv_vget_v_u16m2_u16m1(value, 1);
+}
+
+static inline __attribute__((always_inline, unused)) vint8m2_t
+__weft_get_i8m4_i8m2(vint8m4_t value, size_t segment) {
+  return segment == 0 ? __riscv_vget_v_i8m4_i8m2(value, 0)
+                      : __riscv_vget_v_i8m4_i8m2(value, 1);
+}
+
+static inline __attribute__((always_inline, unused)) vint8m2_t
+__weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
+  if (segment == 0)
+    return __riscv_vget_v_i8m8_i8m2(value, 0);
+  if (segment == 1)
+    return __riscv_vget_v_i8m8_i8m2(value, 1);
+  if (segment == 2)
+    return __riscv_vget_v_i8m8_i8m2(value, 2);
+  return __riscv_vget_v_i8m8_i8m2(value, 3);
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_iq2_s_i8_vl128(
+    const uint8_t *codes, const uint8_t *high_bits,
+    const uint8_t *sign_bits, const uint8_t *scales,
+    const uint8_t *activation_bytes, float weight_scale,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  const size_t vl32 = __riscv_vsetvl_e8m2(32);
+  const vuint8m2_t lane = __riscv_vid_v_u8m2(vl32);
+  const vuint8m2_t sign_source_index = __riscv_vsrl_vx_u8m2(lane, 3, vl32);
+  const vuint8m2_t sign_bit = __riscv_vsll_vv_u8m2(
+      __riscv_vmv_v_x_u8m2(1, vl32),
+      __riscv_vand_vx_u8m2(lane, 7, vl32), vl32);
+  int32_t integer_sum = 0;
+  for (size_t group = 0; group < 8; ++group) {
+    uint16_t byte_offsets[4];
+    for (size_t vector = 0; vector < 4; ++vector)
+      byte_offsets[vector] = (uint16_t)((codes[group * 4 + vector] |
+          (((uint16_t)high_bits[group] << (8 - 2 * vector)) & 0x300)) * 8);
+    const vuint16mf2_t offsets =
+        __riscv_vle16_v_u16mf2(byte_offsets, 4);
+    const vuint64m2_t packed = __riscv_vluxei16_v_u64m2(
+        (const uint64_t *)(const void *)__weft_iq2_s_grid, offsets, 4);
+    const vint8m2_t grid = __riscv_vreinterpret_v_u8m2_i8m2(
+        __riscv_vreinterpret_v_u64m2_u8m2(packed));
+    const vuint8mf4_t packed_signs =
+        __riscv_vle8_v_u8mf4(sign_bits + group * 4, 4);
+    const vuint8m2_t expanded_signs = __riscv_vrgather_vv_u8m2(
+        __riscv_vlmul_ext_v_u8mf4_u8m2(packed_signs), sign_source_index,
+        vl32);
+    const vbool4_t negative = __riscv_vmsne_vx_u8m2_b4(
+        __riscv_vand_vv_u8m2(expanded_signs, sign_bit, vl32), 0, vl32);
+    const vint8m2_t q8 = __riscv_vle8_v_i8m2(
+        activation + group * 32, vl32);
+    const vint8m2_t signed_q8 =
+        __riscv_vrsub_vx_i8m2_mu(negative, q8, q8, 0, vl32);
+    const vint16m4_t products =
+        __riscv_vwmul_vv_i16m4(grid, signed_q8, vl32);
+    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+    const int32_t first = __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(
+            __riscv_vget_v_i16m4_i16m2(products, 0), zero, 16));
+    const int32_t second = __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(
+            __riscv_vget_v_i16m4_i16m2(products, 1), zero, 16));
+    integer_sum += first * (1 + 2 * (scales[group] & 15));
+    integer_sum += second * (1 + 2 * (scales[group] >> 4));
+  }
+  return init + 0.125f * (float)integer_sum * weight_scale * activation_scale;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_iq3_s_i8_vl128(
+    const uint8_t *codes, const uint8_t *high_bits,
+    const uint8_t *sign_bits, const uint8_t *scales,
+    const uint8_t *activation_bytes, float weight_scale,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  int8_t decoded[32];
+  int32_t integer_sum = 0;
+  for (size_t group = 0; group < 8; ++group) {
+    for (size_t vector = 0; vector < 8; ++vector) {
+      const uint16_t index = (uint16_t)codes[group * 8 + vector] |
+          (uint16_t)(((uint16_t)high_bits[group] << (8 - vector)) & 0x100);
+      const int8_t *grid = (const int8_t *)(const void *)&__weft_iq3_s_grid[index];
+      const uint8_t signs = sign_bits[group * 4 + vector / 2];
+      const size_t sign_base = (vector & 1) * 4;
+      for (size_t lane = 0; lane < 4; ++lane)
+        decoded[vector * 4 + lane] =
+            (signs & (UINT8_C(1) << (sign_base + lane))) ? -grid[lane]
+                                                         : grid[lane];
+    }
+    const int32_t dot = __weft_i8_dot(decoded, activation + group * 32, 32);
+    const uint8_t packed_scale = scales[group / 2];
+    const int32_t scale =
+        1 + 2 * ((group & 1) ? (packed_scale >> 4) : (packed_scale & 15));
+    integer_sum += dot * scale;
+  }
+  return init + (float)integer_sum * weight_scale * activation_scale;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_iq1_m_i8_vl128(
+    const uint8_t *codes, const uint8_t *high_delta_bits,
+    const uint8_t *scales, const uint8_t *activation_bytes,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  const uint16_t *packed_scales = (const uint16_t *)(const void *)scales;
+  const uint16_t scale_bits =
+      (packed_scales[0] >> 12) | ((packed_scales[1] >> 8) & 0x00f0) |
+      ((packed_scales[2] >> 4) & 0x0f00) | (packed_scales[3] & 0xf000);
+  const float block_scale = (float)__weft_bitcast_u16_f16(scale_bits);
+  vint32m4_t grid_accumulator = __riscv_vmv_v_x_i32m4(0, 16);
+  vint32m4_t delta_accumulator = __riscv_vmv_v_x_i32m4(0, 16);
+  const uint16_t index_shift_values[16] = {
+      8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4, 8, 4};
+  const vuint16m2_t index_shifts =
+      __riscv_vle16_v_u16m2(index_shift_values, 16);
+  const uint16_t delta_mask_values[16] = {
+      0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80,
+      0x08, 0x80, 0x08, 0x80, 0x08, 0x80, 0x08, 0x80};
+  const vuint16m2_t delta_masks =
+      __riscv_vle16_v_u16m2(delta_mask_values, 16);
+  for (size_t half = 0; half < 2; ++half) {
+    const vuint8mf2_t high8 =
+        __riscv_vle8_v_u8mf2(high_delta_bits + half * 8, 8);
+    const vuint16m1_t high_low = __riscv_vzext_vf2_u16m1(high8, 8);
+    const vuint16m1_t high_high =
+        __riscv_vsll_vx_u16m1(high_low, 8, 8);
+    const vuint16m2_t high = __riscv_vzext_vf2_u16m2(
+        __riscv_vreinterpret_v_u16m1_u8m1(
+            __riscv_vor_vv_u16m1(high_low, high_high, 8)), 16);
+    const vuint16m2_t low = __riscv_vzext_vf2_u16m2(
+        __riscv_vle8_v_u8m1(codes + half * 16, 16), 16);
+    vuint16m2_t indices = __riscv_vor_vv_u16m2(
+        low,
+        __riscv_vand_vx_u16m2(
+            __riscv_vsll_vv_u16m2(high, index_shifts, 16), 0x700, 16),
+        16);
+    indices = __riscv_vsll_vx_u16m2(indices, 3, 16);
+    const vbool8_t negative = __riscv_vmsgtu_vx_u16m2_b8(
+        __riscv_vand_vv_u16m2(high, delta_masks, 16), 0, 16);
+    const vint64m8_t positive =
+        __riscv_vmv_v_x_i64m8(INT64_C(0x0101010101010101), 16);
+    const vint8m8_t delta = __riscv_vreinterpret_v_i64m8_i8m8(
+        __riscv_vmerge_vxm_i64m8(positive, INT64_C(-1), negative, 16));
+    for (size_t quarter = 0; quarter < 2; ++quarter) {
+      const vint8m4_t grid = __riscv_vreinterpret_v_i64m4_i8m4(
+          __riscv_vreinterpret_v_u64m4_i64m4(
+              __riscv_vluxei16_v_u64m4(
+                  (const uint64_t *)(const void *)__weft_iq1_m_grid,
+                  __weft_get_u16m2_u16m1(indices, quarter), 8)));
+      for (size_t pair = 0; pair < 2; ++pair) {
+        const size_t segment = quarter * 2 + pair;
+        const vint8m2_t q8 = __riscv_vle8_v_i8m2(
+            activation + half * 128 + segment * 32, 32);
+        const vint16m4_t grid_product = __riscv_vwmul_vv_i16m4(
+            __weft_get_i8m4_i8m2(grid, pair), q8, 32);
+        const vint16m4_t delta_product = __riscv_vwmul_vv_i16m4(
+            __weft_get_i8m8_i8m2(delta, segment), q8, 32);
+        const uint16_t scale_word = packed_scales[half * 2 + segment / 2];
+        const unsigned shift = 6 * (segment % 2);
+        const int16_t first_scale = 1 + 2 * ((scale_word >> shift) & 7);
+        const int16_t second_scale =
+            1 + 2 * ((scale_word >> (shift + 3)) & 7);
+        grid_accumulator = __riscv_vwmacc_vx_i32m4(
+            grid_accumulator, first_scale,
+            __riscv_vget_v_i16m4_i16m2(grid_product, 0), 16);
+        grid_accumulator = __riscv_vwmacc_vx_i32m4(
+            grid_accumulator, second_scale,
+            __riscv_vget_v_i16m4_i16m2(grid_product, 1), 16);
+        delta_accumulator = __riscv_vwmacc_vx_i32m4(
+            delta_accumulator, first_scale,
+            __riscv_vget_v_i16m4_i16m2(delta_product, 0), 16);
+        delta_accumulator = __riscv_vwmacc_vx_i32m4(
+            delta_accumulator, second_scale,
+            __riscv_vget_v_i16m4_i16m2(delta_product, 1), 16);
+      }
+    }
+  }
+  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+  const int32_t grid_sum = __riscv_vmv_x_s_i32m1_i32(
+      __riscv_vredsum_vs_i32m4_i32m1(grid_accumulator, zero, 16));
+  const int32_t delta_sum = __riscv_vmv_x_s_i32m1_i32(
+      __riscv_vredsum_vs_i32m4_i32m1(delta_accumulator, zero, 16));
+  return init + block_scale * activation_scale *
+                    ((float)grid_sum + 0.125f * (float)delta_sum);
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_q6_k_i8_vl128(
+    const uint8_t *low_bits, const uint8_t *high_bits,
+    const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
+    float weight_scale, float activation_scale, float init) {
+  const int8_t *group_scales =
+      (const int8_t *)(const void *)group_scale_bytes;
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  const uint8_t *low = low_bits;
+  const uint8_t *high = high_bits;
+  const int8_t *scale = group_scales;
+  const int8_t *q8 = activation;
+  int low_high;
+  float temporary;
+  float result = init;
+  const float combined_scale = weight_scale * activation_scale;
+  for (size_t half = 0; half < 2; ++half) {
+    __asm__ volatile(
+        "addi %[low_high], %[low], 32\n\t"
+        "ld t0, 0(%[scale])\n\t"
+        "addi %[scale], %[scale], 8\n\t"
+        "slli t6, t0, 1 * 8\n\t"
+        "lb zero, 0(%[low])\n\t"
+        "slli t5, t0, 2 * 8\n\t"
+        "slli t4, t0, 3 * 8\n\t"
+        "lb zero, 0(%[low_high])\n\t"
+        "slli t3, t0, 4 * 8\n\t"
+        "slli t2, t0, 5 * 8\n\t"
+        "lb zero, 0(%[high])\n\t"
+        "lb zero, 31(%[low_high])\n\t"
+        "slli t1, t0, 6 * 8\n\t"
+        "srai a7, t0, 56\n\t"
+        "vsetvli zero, %[vl32], e8, m2\n\t"
+        "vle8.v v8, (%[low])\n\t"
+        "srai t6, t6, 56\n\t"
+        "srai t5, t5, 56\n\t"
+        "srai t4, t4, 56\n\t"
+        "srai t3, t3, 56\n\t"
+        "vle8.v v10, (%[low_high])\n\t"
+        "addi %[low], %[low], 64\n\t"
+        "slli t0, t0, 7 * 8\n\t"
+        "srai t2, t2, 56\n\t"
+        "srai t1, t1, 56\n\t"
+        "srai t0, t0, 56\n\t"
+        "vle8.v v4, (%[high])\n\t"
+        "vsrl.vi v12, v8, 4\n\t"
+        "vsrl.vi v14, v10, 4\n\t"
+        "lb zero, 0(%[q8])\n\t"
+        "vand.vi v8, v8, 0xF\n\t"
+        "vand.vi v10, v10, 0xF\n\t"
+        "lb zero, 32(%[q8])\n\t"
+        "vsll.vi v0, v4, 4\n\t"
+        "vsll.vi v2, v4, 2\n\t"
+        "lb zero, 64(%[q8])\n\t"
+        "vsrl.vi v6, v4, 2\n\t"
+        "lb zero, 96(%[q8])\n\t"
+        "vand.vx v0, v0, %[mask]\n\t"
+        "vand.vx v2, v2, %[mask]\n\t"
+        "vand.vx v4, v4, %[mask]\n\t"
+        "vand.vx v6, v6, %[mask]\n\t"
+        "vor.vv v8, v8, v0\n\t"
+        "vor.vv v10, v10, v2\n\t"
+        "vor.vv v12, v12, v4\n\t"
+        "vor.vv v14, v14, v6\n\t"
+        "lb zero, 127(%[q8])\n\t"
+        "vsetvli zero, %[vl128], e8, m8\n\t"
+        "vle8.v v0, (%[q8])\n\t"
+        "vsub.vx v8, v8, %[vl32]\n\t"
+        "vsetvli zero, %[vl64], e8, m4\n\t"
+        "vwmul.vv v16, v0, v8\n\t"
+        "vwmul.vv v24, v4, v12\n\t"
+        "vsetivli zero, 16, e16, m2\n\t"
+        "vmv.v.x v0, zero\n\t"
+        "vwredsum.vs v10, v16, v0\n\t"
+        "vwredsum.vs v9, v18, v0\n\t"
+        "vwredsum.vs v8, v20, v0\n\t"
+        "vwredsum.vs v7, v22, v0\n\t"
+        "vwredsum.vs v11, v24, v0\n\t"
+        "vwredsum.vs v12, v26, v0\n\t"
+        "vwredsum.vs v13, v28, v0\n\t"
+        "vwredsum.vs v14, v30, v0\n\t"
+        "vsetivli zero, 4, e32, m1\n\t"
+        "vmul.vx v0, v10, t0\n\t"
+        "vmul.vx v1, v9, t1\n\t"
+        "vmacc.vx v0, t2, v8\n\t"
+        "vmacc.vx v1, t3, v7\n\t"
+        "vmacc.vx v0, t4, v11\n\t"
+        "vmacc.vx v1, t5, v12\n\t"
+        "vmacc.vx v0, t6, v13\n\t"
+        "vmacc.vx v1, a7, v14\n\t"
+        "vadd.vv v0, v0, v1\n\t"
+        "vfcvt.f.x.v v0, v0\n\t"
+        "vfmv.f.s %[temporary], v0\n\t"
+        "fmadd.s %[result], %[combined_scale], %[temporary], %[result]"
+        : [low] "+&r"(low), [low_high] "=&r"(low_high),
+          [scale] "+&r"(scale), [result] "+&f"(result),
+          [temporary] "=&f"(temporary)
+        : [high] "r"(high), [q8] "r"(q8), [vl32] "r"(32),
+          [vl64] "r"(64), [vl128] "r"(128), [mask] "r"(0x30),
+          [combined_scale] "f"(combined_scale)
+        : "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6",
+          "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+          "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22",
+          "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30",
+          "v31", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a7");
+    high += 32;
+    q8 += 128;
+  }
+  return result;
+}
+
+)c";
+  }
   if (!usesExp)
     return;
   output << R"c(static inline vfloat32m2_t __weft_exp_f32m2(
@@ -7872,13 +8639,18 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
   bool usesIME1 = false;
   bool usesGroupedI4I8 = false;
   bool usesE2M1E8M0I8 = false;
+  bool usesQuantCodebookI8 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
   module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
   module.walk([&](SymmetricI4I8ContractOp) { usesIME1 = true; });
   module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
   module.walk([&](E2M1E8M0I8DotOp) { usesE2M1E8M0I8 = true; });
+  module.walk([&](IQ2SI8DotOp) { usesQuantCodebookI8 = true; });
+  module.walk([&](IQ3SI8DotOp) { usesQuantCodebookI8 = true; });
+  module.walk([&](IQ1MI8DotOp) { usesQuantCodebookI8 = true; });
+  module.walk([&](Q6KI8DotOp) { usesQuantCodebookI8 = true; });
   emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8,
-              usesE2M1E8M0I8);
+              usesE2M1E8M0I8, usesQuantCodebookI8);
 
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())

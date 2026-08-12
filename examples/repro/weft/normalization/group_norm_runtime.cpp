@@ -55,7 +55,7 @@ int main() {
     max_abs = std::max(max_abs, error);
     max_rel = std::max(max_rel, error / std::max(1.0e-6f, std::abs(expected[i])));
   }
-  if (max_abs > 2.0e-4f && max_rel > 2.0e-3f) {
+  if (max_abs > 2.0e-4f || max_rel > 2.0e-3f) {
     std::fprintf(stderr, "group norm mismatch\n");
     return 1;
   }

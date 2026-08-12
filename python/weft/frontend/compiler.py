@@ -1962,6 +1962,79 @@ class FrontendCompiler:
             result_types=(operands[-1].type,),
         )[0]
 
+    def _extension_scalar_dot(
+        self, call: ast.Call, operation: str, names: tuple[str, ...]
+    ) -> Value:
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(self._value_argument(args[name], call) for name in names)
+        return self._emit(
+            operation,
+            call,
+            operands=operands,
+            result_types=(operands[-1].type,),
+        )[0]
+
+    def _intrinsic_iq2_s_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.iq2_s_i8_dot",
+            (
+                "codes",
+                "high_bits",
+                "sign_bits",
+                "scales",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+        )
+
+    def _intrinsic_iq3_s_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.iq3_s_i8_dot",
+            (
+                "codes",
+                "high_bits",
+                "sign_bits",
+                "scales",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+        )
+
+    def _intrinsic_iq1_m_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.iq1_m_i8_dot",
+            (
+                "codes",
+                "high_delta_bits",
+                "scales",
+                "activation",
+                "activation_scale",
+                "init",
+            ),
+        )
+
+    def _intrinsic_q6_k_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.q6_k_i8_dot",
+            (
+                "low_bits",
+                "high_bits",
+                "group_scales",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+        )
+
     def _intrinsic_range(self, call: ast.Call) -> Value:
         raise FrontendError("W.range is valid only in a for statement", self._location(call))
 

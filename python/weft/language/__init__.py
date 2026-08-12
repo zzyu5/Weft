@@ -30,6 +30,9 @@ from .builtins import fill
 from .builtins import floor
 from .builtins import full
 from .builtins import grouped_affine_i4_i8_dot
+from .builtins import iq1_m_i8_dot
+from .builtins import iq2_s_i8_dot
+from .builtins import iq3_s_i8_dot
 from .builtins import helper
 from .builtins import invalid
 from .builtins import load
@@ -41,6 +44,7 @@ from .builtins import narrow
 from .builtins import neg_inf
 from .builtins import permute
 from .builtins import prefetch
+from .builtins import q6_k_i8_dot
 from .builtins import pure
 from .builtins import range
 from .builtins import reduce
