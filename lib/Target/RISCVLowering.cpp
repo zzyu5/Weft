@@ -388,7 +388,9 @@ struct AffineI4I8NTileDecision {
   AffineI4I8NTileRealization realization =
       AffineI4I8NTileRealization::SpacemiTIME1N16K32;
   mlir::Operation *operation = nullptr;
-  mlir::Operation *semanticOperation = nullptr;
+  mlir::Operation *sourceNLoop = nullptr;
+  mlir::Operation *sourceKLoop = nullptr;
+  mlir::Operation *consumer = nullptr;
   std::string activationCodes;
   std::string activationScales;
   std::string packedWeight;
@@ -871,6 +873,16 @@ public:
     line(returnTypeSpelling + " " + sanitize(kernel.getSymName()) + "(" +
          llvm::join(parameters, ", ") + ") {");
     ++indent;
+    kernel.walk([&](AffineI4I8ContractOp contract) {
+      ForOp kLoop = contract->getParentOfType<ForOp>();
+      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
+      if (!nLoop)
+        return;
+      auto [position, inserted] = affineI4I8Anchors.try_emplace(
+          nLoop.getOperation(), contract.getOperation());
+      if (!inserted)
+        position->second = nullptr;
+    });
     kernel.walk([&](ContractOp contract) {
       ForOp kLoop = contract->getParentOfType<ForOp>();
       ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
@@ -909,6 +921,7 @@ private:
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> affineI4I8Anchors;
   llvm::DenseMap<mlir::Operation *, mlir::Operation *> f16ContractAnchors;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
@@ -1916,9 +1929,15 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
-    if (std::optional<AffineI4I8NTileDecision> decision =
-            decideAffineI4I8NTiles(op))
-      return emitAffineI4I8NTiles(*decision);
+    auto affineI4I8Anchor = affineI4I8Anchors.find(op.getOperation());
+    if (affineI4I8Anchor != affineI4I8Anchors.end() &&
+        affineI4I8Anchor->second) {
+      auto contract =
+          mlir::cast<AffineI4I8ContractOp>(affineI4I8Anchor->second);
+      if (std::optional<AffineI4I8NTileDecision> decision =
+              decideAffineI4I8NTiles(contract))
+        return emitAffineI4I8NTiles(*decision);
+    }
     auto f16Anchor = f16ContractAnchors.find(op.getOperation());
     if (f16Anchor != f16ContractAnchors.end() && f16Anchor->second) {
       auto contract = mlir::cast<ContractOp>(f16Anchor->second);
@@ -4394,33 +4413,36 @@ private:
     return mlir::success();
   }
 
-  std::optional<AffineI4I8NTileDecision> decideAffineI4I8NTiles(ForOp nLoop) {
+  std::optional<AffineI4I8NTileDecision>
+  decideAffineI4I8NTiles(AffineI4I8ContractOp contract) {
+    ForOp kLoop = contract->getParentOfType<ForOp>();
+    if (!kLoop || contract->getBlock() != &kLoop.getBody().front())
+      return std::nullopt;
+    ForOp nLoop = kLoop->getParentOfType<ForOp>();
+    if (!nLoop || kLoop->getBlock() != &nLoop.getBody().front())
+      return std::nullopt;
     mlir::Block &nBody = nLoop.getBody().front();
-    ForOp kLoop;
+    ForOp ownedKLoop;
     StoreOp store;
     for (mlir::Operation &operation : nBody.without_terminator()) {
       if (auto candidate = mlir::dyn_cast<ForOp>(operation)) {
-        if (kLoop)
+        if (ownedKLoop)
           return std::nullopt;
-        kLoop = candidate;
+        ownedKLoop = candidate;
       } else if (auto candidate = mlir::dyn_cast<StoreOp>(operation)) {
         if (store)
           return std::nullopt;
         store = candidate;
       }
     }
-    if (!kLoop)
+    if (!ownedKLoop || ownedKLoop != kLoop)
       return std::nullopt;
 
     mlir::Block &kBody = kLoop.getBody().front();
-    AffineI4I8ContractOp contract;
-    for (mlir::Operation &operation : kBody.without_terminator())
-      if (auto candidate = mlir::dyn_cast<AffineI4I8ContractOp>(operation)) {
-        if (contract)
-          return std::nullopt;
-        contract = candidate;
-      }
-    if (!contract)
+    if (llvm::any_of(kBody.without_terminator(), [&](mlir::Operation &operation) {
+          auto candidate = mlir::dyn_cast<AffineI4I8ContractOp>(operation);
+          return candidate && candidate != contract;
+        }))
       return std::nullopt;
 
     auto reject = [&](llvm::StringRef message)
@@ -4624,8 +4646,10 @@ private:
       return reject("IME1 lowering could not materialize the explicit source operands");
 
     AffineI4I8NTileDecision decision;
-    decision.operation = nLoop.getOperation();
-    decision.semanticOperation = contract.getOperation();
+    decision.operation = contract.getOperation();
+    decision.sourceNLoop = nLoop.getOperation();
+    decision.sourceKLoop = kLoop.getOperation();
+    decision.consumer = store.getOperation();
     decision.activationCodes = code.spelling;
     decision.activationScales = scales.spelling;
     decision.packedWeight = weights.spelling;
