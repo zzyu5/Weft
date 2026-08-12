@@ -387,6 +387,7 @@ struct VLAStateDecision {
   std::optional<VLAStateConsumerDecision> consumer;
   VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
   mlir::Value segmentStart;
+  mlir::Value segmentVector;
   unsigned segmentSEW = 0;
   unsigned segmentLMUL = 0;
 };
@@ -1909,6 +1910,20 @@ private:
                 VLAStoreValueMode::Vector)))
           return mlir::failure();
       } else if (auto store = mlir::dyn_cast<StoreOp>(nested)) {
+        LaneRelation storeRelation =
+            classifyLaneRelation(store.getPointer(), decision.coordinate);
+        mlir::Type storedElement = elementType(store.getValue().getType());
+        if (storeRelation == LaneRelation::Indexed) {
+          store.emitError(
+              "indexed VLA store has no selected target realization");
+          return mlir::failure();
+        }
+        if (storedElement.isUnsignedInteger(8) ||
+            storedElement.isUnsignedInteger(32)) {
+          store.emitError(
+              "unsigned VLA store has no selected target realization");
+          return mlir::failure();
+        }
         VLAStoreValueMode valueMode =
             isRegionValue(store.getValue().getType())
                 ? VLAStoreValueMode::Vector
@@ -2088,6 +2103,12 @@ private:
                       : VLAStateRealization::RVVInclusiveAddScan,
             elementType(scan.getResult().getType()), scan.getIdentity()};
         state.segmentStart = scan.getSegmentStart();
+        auto segmentCompare = scan.getSegmentStart().getDefiningOp<CompareOp>();
+        if (segmentCompare)
+          state.segmentVector =
+              isRegionValue(segmentCompare.getLhs().getType())
+                  ? segmentCompare.getLhs()
+                  : segmentCompare.getRhs();
         decision.states.push_back(std::move(state));
       } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
         if (isArgMaxSummary(summary)) {
@@ -2445,7 +2466,18 @@ private:
           return mlir::failure();
         }
         access.indexSEW = 32;
-        access.indexLMUL = decision.physical.dataLMUL;
+        auto selectedCast = llvm::find_if(
+            decision.casts, [&](const VLACastDecision &candidate) {
+              return candidate.operation == cast.getOperation();
+            });
+        if (selectedCast == decision.casts.end() ||
+            selectedCast->realization !=
+                VLACastRealization::RVVZeroExtendU32ToIndex) {
+          access.operation->emitError(
+              "indexed VLA memory has no matching index cast decision");
+          return mlir::failure();
+        }
+        access.indexLMUL = selectedCast->sourceLMUL;
       }
     }
 
@@ -3243,6 +3275,9 @@ private:
       return op.emitError("pointer addition has an unavailable operand");
     if (base.kind != CValueKind::Pointer)
       return op.emitError("pointer addition base is not a pointer");
+    if (base.indexedPointer)
+      return op.emitError(
+          "indexed VLA pointer cannot receive a second offset; combine the explicit index expression before pointer addition");
     CValue result{op.getResult().getType(), CValueKind::Pointer,
                   "(" + base.spelling + " + " + offset.spelling + ")"};
     if (offset.kind == CValueKind::Coordinate) {
@@ -3257,11 +3292,6 @@ private:
     } else if (inVLA && base.lanePointer) {
       result.lanePointer = true;
       result.laneStride = base.laneStride;
-    } else if (inVLA && base.indexedPointer) {
-      result.indexedPointer = true;
-      result.indexSpelling = base.indexSpelling;
-      result.vectorSEW = base.vectorSEW;
-      result.vectorLMUL = base.vectorLMUL;
     }
     values[op.getResult()] = std::move(result);
     return mlir::success();
@@ -7882,13 +7912,7 @@ private:
     CValue segmentValues;
     if (segmented) {
       segmentMask = require(decision.segmentStart);
-      auto compare = decision.segmentStart.getDefiningOp<CompareOp>();
-      if (!compare)
-        return op.emitError("segmented scan start is not a typed predicate");
-      mlir::Value vectorOperand =
-          isRegionValue(compare.getLhs().getType()) ? compare.getLhs()
-                                                    : compare.getRhs();
-      segmentValues = require(vectorOperand);
+      segmentValues = require(decision.segmentVector);
       if (segmentMask.kind != CValueKind::Mask ||
           segmentValues.kind != CValueKind::U8Vector ||
           segmentMask.spelling.empty() || segmentValues.spelling.empty() ||
