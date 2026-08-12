@@ -217,6 +217,21 @@ struct VLAAccessDecision {
   unsigned elementLMUL = 0;
 };
 
+enum class VLABinaryRealization {
+  RVVF16FusedMultiplyAdd,
+};
+
+struct VLABinaryDecision {
+  mlir::Operation *operation = nullptr;
+  VLABinaryRealization realization =
+      VLABinaryRealization::RVVF16FusedMultiplyAdd;
+  mlir::Operation *absorbedProducer = nullptr;
+  mlir::Value accumulator;
+  mlir::Value vector;
+  mlir::Value scalar;
+  unsigned lmul = 8;
+};
+
 struct VLAStateDecision {
   mlir::Operation *operation = nullptr;
   VLAStateRealization realization = VLAStateRealization::RVVAddReduction;
@@ -265,6 +280,7 @@ struct VLARegionDecision {
   VLAPhysicalConfig physical;
   std::vector<VLAPredicateDecision> predicates;
   std::vector<VLAAccessDecision> accesses;
+  std::vector<VLABinaryDecision> binaries;
   std::vector<VLAStateDecision> states;
   std::vector<VLANarrowDecision> narrows;
   std::vector<VLAContractDecision> contracts;
@@ -273,7 +289,6 @@ struct VLARegionDecision {
 enum class SpecializedVLARealization {
   F32ToF16,
   WideningF16Dot,
-  F16WeightedUpdate,
   F16ToF32Normalize,
   SoftmaxEnvelope,
 };
@@ -913,6 +928,26 @@ private:
     return found == activeVLADecision->accesses.end() ? nullptr : &*found;
   }
 
+  const VLABinaryDecision *
+  findBinaryDecision(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeVLADecision->binaries, [&](const VLABinaryDecision &decision) {
+          return decision.operation == operation;
+        });
+    return found == activeVLADecision->binaries.end() ? nullptr : &*found;
+  }
+
+  bool isAbsorbedBinaryProducer(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return false;
+    return llvm::any_of(
+        activeVLADecision->binaries, [&](const VLABinaryDecision &decision) {
+          return decision.absorbedProducer == operation;
+        });
+  }
+
   const VLAStateDecision *
   findStateDecision(mlir::Operation *operation) const {
     if (!activeVLADecision)
@@ -1400,6 +1435,54 @@ private:
       return mlir::failure();
     }
 
+    bool hasF32RegionValue = llvm::any_of(
+        physicalOperations, [](mlir::Operation *operation) {
+          return llvm::any_of(operation->getResultTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+        });
+    bool onlyF16Accesses = !decision.accesses.empty() &&
+                           llvm::all_of(decision.accesses,
+                                        [](const VLAAccessDecision &access) {
+                                          return isF16(access.elementType);
+                                        });
+    if (decision.contracts.empty() && decision.narrows.empty() &&
+        decision.states.empty() && decision.predicates.empty() &&
+        !hasF32RegionValue && onlyF16Accesses) {
+      decision.physical.dataSEW = 16;
+      decision.physical.dataLMUL = 8;
+    }
+
+    for (mlir::Operation *operation : physicalOperations) {
+      auto add = mlir::dyn_cast<BinaryOp>(operation);
+      if (!add || add.getKind() != "add" ||
+          !isF16(elementType(add.getResult().getType())))
+        continue;
+      BinaryOp multiply = add.getLhs().getDefiningOp<BinaryOp>();
+      mlir::Value accumulator = add.getRhs();
+      if (!multiply || multiply.getKind() != "mul" ||
+          !multiply.getResult().hasOneUse()) {
+        multiply = add.getRhs().getDefiningOp<BinaryOp>();
+        accumulator = add.getLhs();
+      }
+      if (!multiply || multiply.getKind() != "mul" ||
+          !multiply.getResult().hasOneUse() ||
+          !isF16(elementType(accumulator.getType())))
+        continue;
+      mlir::Value vector = multiply.getLhs();
+      mlir::Value scalar = multiply.getRhs();
+      if (!isRegionValue(vector.getType()))
+        std::swap(vector, scalar);
+      if (!isRegionValue(vector.getType()) || isRegionValue(scalar.getType()) ||
+          !isF16(elementType(vector.getType())) ||
+          !isF16(elementType(scalar.getType())))
+        continue;
+      decision.binaries.push_back(VLABinaryDecision{
+          add.getOperation(), VLABinaryRealization::RVVF16FusedMultiplyAdd,
+          multiply.getOperation(), accumulator, vector, scalar,
+          decision.physical.dataLMUL});
+    }
+
     decision.physical.maskRatio =
         decision.physical.dataSEW / decision.physical.dataLMUL;
     decision.physical.indexLMUL = 0;
@@ -1414,27 +1497,30 @@ private:
     }
 
     for (VLAAccessDecision &access : decision.accesses) {
-      unsigned divisor = 0;
       if (access.elementType.isF32()) {
         access.elementSEW = 32;
-        divisor = 1;
       } else if (isF16(access.elementType)) {
         access.elementSEW = 16;
-        divisor = 2;
       } else if (access.elementType.isSignedInteger(8)) {
         access.elementSEW = 8;
-        divisor = 4;
       } else {
         access.operation->emitError(
             "VLA memory element has no selected RVV vector shape");
         return mlir::failure();
       }
-      if (decision.physical.dataLMUL % divisor != 0) {
+      unsigned scaledLMUL =
+          decision.physical.dataLMUL * access.elementSEW;
+      if (scaledLMUL % decision.physical.dataSEW != 0) {
         access.operation->emitError(
             "VLA memory element has no compatible selected LMUL");
         return mlir::failure();
       }
-      access.elementLMUL = decision.physical.dataLMUL / divisor;
+      access.elementLMUL = scaledLMUL / decision.physical.dataSEW;
+      if (access.elementLMUL == 0 || access.elementLMUL > 8) {
+        access.operation->emitError(
+            "VLA memory element exceeds the legal RVV LMUL range");
+        return mlir::failure();
+      }
     }
 
     for (VLAStateDecision &state : decision.states) {
@@ -2121,135 +2207,6 @@ private:
     return mlir::success();
   }
 
-  std::optional<SpecializedVLADecision> decideF16WeightedUpdateVLA(VLAOp op) {
-    if (op.getNumResults() != 0)
-      return std::nullopt;
-    mlir::Block &body = op.getBody().front();
-    StoreOp store;
-    unsigned loadCount = 0;
-    unsigned binaryCount = 0;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
-        if (store)
-          return std::nullopt;
-        store = candidate;
-      } else if (mlir::isa<LoadOp>(nested))
-        ++loadCount;
-      else if (mlir::isa<BinaryOp>(nested))
-        ++binaryCount;
-      else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return std::nullopt;
-    }
-    if (loadCount != 2 || binaryCount != 2)
-      return std::nullopt;
-    if (!store || !isTrue(store.getWhere()) ||
-        !isF16(elementType(store.getValue().getType())))
-      return std::nullopt;
-    auto add = store.getValue().getDefiningOp<BinaryOp>();
-    if (!add || add.getKind() != "add")
-      return std::nullopt;
-
-    BinaryOp multiply = add.getLhs().getDefiningOp<BinaryOp>();
-    mlir::Value baseValue = add.getRhs();
-    if (!multiply || multiply.getKind() != "mul") {
-      multiply = add.getRhs().getDefiningOp<BinaryOp>();
-      baseValue = add.getLhs();
-    }
-    if (!multiply || multiply.getKind() != "mul")
-      return std::nullopt;
-    auto baseLoad = baseValue.getDefiningOp<LoadOp>();
-    if (!baseLoad || !isTrue(baseLoad.getWhere()) ||
-        !isF16(elementType(baseLoad.getResult().getType())))
-      return std::nullopt;
-
-    LoadOp productLoad = multiply.getLhs().getDefiningOp<LoadOp>();
-    mlir::Value weight = multiply.getRhs();
-    if (!productLoad) {
-      productLoad = multiply.getRhs().getDefiningOp<LoadOp>();
-      weight = multiply.getLhs();
-    }
-    if (!productLoad || !isTrue(productLoad.getWhere()) ||
-        !isF16(elementType(productLoad.getResult().getType())) ||
-        !isF16(elementType(weight.getType())))
-      return std::nullopt;
-
-    mlir::Value destinationRoot = pointerRoot(store.getPointer());
-    mlir::Value baseRoot = pointerRoot(baseLoad.getPointer());
-    mlir::Value productRoot = pointerRoot(productLoad.getPointer());
-    if (!destinationRoot ||
-        (destinationRoot != baseRoot && destinationRoot != productRoot))
-      return std::nullopt;
-
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(baseLoad.getPointer(), coordinate) ||
-        !valueDependsOn(productLoad.getPointer(), coordinate) ||
-        !valueDependsOn(store.getPointer(), coordinate))
-      return std::nullopt;
-    std::optional<std::string> base =
-        pointerBase(baseLoad.getPointer(), coordinate);
-    std::optional<std::string> product =
-        pointerBase(productLoad.getPointer(), coordinate);
-    std::optional<std::string> destination =
-        pointerBase(store.getPointer(), coordinate);
-    std::string weightExpression = expression(weight);
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    if (!base || !product || !destination || weightExpression.empty() ||
-        begin.spelling.empty() || end.spelling.empty())
-      return std::nullopt;
-
-    SpecializedVLADecision decision;
-    decision.realization = SpecializedVLARealization::F16WeightedUpdate;
-    decision.operation = op.getOperation();
-    decision.consumer = store.getOperation();
-    decision.begin = begin.spelling;
-    decision.end = end.spelling;
-    decision.firstPointer = *base;
-    decision.secondPointer = *product;
-    decision.destinationPointer = *destination;
-    decision.scalar = weightExpression;
-    decision.physical.input = {16, 8};
-    decision.physical.compute = {16, 8};
-    decision.physical.output = {16, 8};
-    return decision;
-  }
-
-  mlir::LogicalResult emitF16WeightedUpdateVLA(
-      const SpecializedVLADecision &decision) {
-    const RVVVectorConfig &input = decision.physical.input;
-    const RVVVectorConfig &compute = decision.physical.compute;
-    const RVVVectorConfig &output = decision.physical.output;
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string baseVector = fresh("update_base");
-    std::string productVector = fresh("update_value");
-    std::string result = fresh("update_f16");
-    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
-         " < " + decision.end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(compute.sew) + "m" + std::to_string(compute.lmul) +
-         "(" + decision.end + " - " + strip + ");");
-    line(rvvFloatType(input) + " " + baseVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.firstPointer +
-         " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(input) + " " + productVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.secondPointer + " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(compute) + " " + result + " = __riscv_vfmacc_vf_" +
-         rvvFloatSuffix(compute) + "(" +
-         baseVector + ", " + decision.scalar + ", " + productVector + ", " +
-         vl + ");");
-    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
-         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
-         strip + ", " + result + ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-    return mlir::success();
-  }
-
   std::optional<SpecializedVLADecision> decideF16ToF32NormalizeVLA(VLAOp op) {
     if (op.getNumResults() != 0)
       return std::nullopt;
@@ -2362,9 +2319,6 @@ private:
             decideWideningF16DotVLA(op))
       return decision;
     if (std::optional<SpecializedVLADecision> decision =
-            decideF16WeightedUpdateVLA(op))
-      return decision;
-    if (std::optional<SpecializedVLADecision> decision =
             decideF16ToF32NormalizeVLA(op))
       return decision;
     return decideSoftmaxEnvelope(op);
@@ -2377,8 +2331,6 @@ private:
       return emitF32ToF16VLA(decision);
     case SpecializedVLARealization::WideningF16Dot:
       return emitWideningF16DotVLA(decision);
-    case SpecializedVLARealization::F16WeightedUpdate:
-      return emitF16WeightedUpdateVLA(decision);
     case SpecializedVLARealization::F16ToF32Normalize:
       return emitF16ToF32NormalizeVLA(decision);
     case SpecializedVLARealization::SoftmaxEnvelope:
@@ -2852,6 +2804,8 @@ private:
   }
 
   mlir::LogicalResult emitBinary(BinaryOp op) {
+    if (isAbsorbedBinaryProducer(op.getOperation()))
+      return mlir::success();
     CValue lhs = require(op.getLhs());
     CValue rhs = require(op.getRhs());
     bool lhsCoordinate = lhs.kind == CValueKind::Coordinate;
@@ -2905,8 +2859,34 @@ private:
           CValue{op.getResult().getType(), CValueKind::Mask, name};
       return mlir::success();
     }
-    bool lhsVector = lhs.kind == CValueKind::F32Vector;
-    bool rhsVector = rhs.kind == CValueKind::F32Vector;
+    bool f32 = elementType(op.getResult().getType()).isF32();
+    bool f16 = isF16(elementType(op.getResult().getType()));
+    CValueKind vectorKind =
+        f32 ? CValueKind::F32Vector : CValueKind::F16Vector;
+    if (const VLABinaryDecision *decision =
+            findBinaryDecision(op.getOperation())) {
+      CValue accumulator = require(decision->accumulator);
+      CValue vector = require(decision->vector);
+      CValue scalar = require(decision->scalar);
+      if (decision->realization !=
+              VLABinaryRealization::RVVF16FusedMultiplyAdd ||
+          accumulator.kind != CValueKind::F16Vector ||
+          vector.kind != CValueKind::F16Vector ||
+          scalar.kind != CValueKind::Scalar || accumulator.spelling.empty() ||
+          vector.spelling.empty() || scalar.spelling.empty())
+        return op.emitError("selected f16 fused multiply-add is unavailable");
+      std::string suffix = "f16m" + std::to_string(decision->lmul);
+      std::string name = fresh("fma");
+      line("vfloat16m" + std::to_string(decision->lmul) + "_t " + name +
+           " = __riscv_vfmacc_vf_" + suffix + "(" + accumulator.spelling +
+           ", " + scalar.spelling + ", " + vector.spelling + ", " + activeVL +
+           ");");
+      values[op.getResult()] =
+          CValue{op.getResult().getType(), CValueKind::F16Vector, name};
+      return mlir::success();
+    }
+    bool lhsVector = lhs.kind == vectorKind;
+    bool rhsVector = rhs.kind == vectorKind;
     if (!lhsVector && !rhsVector) {
       std::string expression =
           scalarBinary(op.getKind(), lhs.spelling, rhs.spelling);
@@ -2916,9 +2896,9 @@ private:
           op.getResult(), std::move(expression), "scalar");
       return mlir::success();
     }
-    if (!inVLA || (!elementType(op.getResult().getType()).isF32()))
+    if (!inVLA || (!f32 && !f16))
       return op.emitError(
-          "RVV pointwise lowering currently requires VLA f32 values");
+          "RVV pointwise lowering requires a floating VLA result");
     std::string intrinsic;
     std::string first = lhs.spelling;
     std::string second = rhs.spelling;
@@ -2953,15 +2933,16 @@ private:
     }
     if (intrinsic.empty())
       return op.emitError("RVV pointwise lowering does not implement binary kind");
-    std::string suffix =
-        "f32m" + std::to_string(activeVLADecision->physical.dataLMUL);
+    unsigned lmul = activeVLADecision->physical.dataLMUL;
+    std::string element = f32 ? "f32m" : "f16m";
+    std::string vectorType = f32 ? "vfloat32m" : "vfloat16m";
+    std::string suffix = element + std::to_string(lmul);
     intrinsic += suffix;
     std::string name = fresh("v");
-    line("vfloat32m" + std::to_string(activeVLADecision->physical.dataLMUL) + "_t " +
-         name + " = " + intrinsic + "(" + first + ", " + second + ", " +
-         activeVL + ");");
+    line(vectorType + std::to_string(lmul) + "_t " + name + " = " +
+         intrinsic + "(" + first + ", " + second + ", " + activeVL + ");");
     values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+        CValue{op.getResult().getType(), vectorKind, name};
     return mlir::success();
   }
 
