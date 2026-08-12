@@ -134,6 +134,22 @@ struct E2M1E8M0I8Decision {
   mlir::Value init;
 };
 
+enum class GroupedAffineI4I8Realization {
+  RVVVLEN128GroupedDot,
+};
+
+struct GroupedAffineI4I8Decision {
+  GroupedAffineI4I8Realization realization =
+      GroupedAffineI4I8Realization::RVVVLEN128GroupedDot;
+  mlir::Value packedWeightBase;
+  mlir::Value scaleMinBase;
+  mlir::Value activationBase;
+  mlir::Value activationSumBase;
+  mlir::Value dotScale;
+  mlir::Value minimumScale;
+  mlir::Value init;
+};
+
 struct CValue {
   mlir::Type type;
   CValueKind kind = CValueKind::Scalar;
@@ -4342,7 +4358,8 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
+  mlir::LogicalResult decideGroupedAffineI4I8Dot(
+      GroupedAffineI4I8DotOp op, GroupedAffineI4I8Decision &decision) {
     if (options.target.vlenBits != 128)
       return op.emitError(
           "grouped affine i4/i8 dot currently requires an explicit VLEN128 target fact");
@@ -4383,14 +4400,32 @@ private:
       return op.emitError(
           "grouped affine i4/i8 dot block axes do not match its typed operands");
 
-    CValue packed = require(packedBase);
-    CValue scales = require(scaleBase);
-    CValue activation = require(activationBase);
-    CValue sums = require(sumBase);
-    CValue dotScale = require(op.getDotScale());
-    CValue minimumScale = require(op.getMinimumScale());
-    CValue init = require(op.getInit());
-    if (packed.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
+    decision = GroupedAffineI4I8Decision{};
+    decision.packedWeightBase = packedBase;
+    decision.scaleMinBase = scaleBase;
+    decision.activationBase = activationBase;
+    decision.activationSumBase = sumBase;
+    decision.dotScale = op.getDotScale();
+    decision.minimumScale = op.getMinimumScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
+    GroupedAffineI4I8Decision decision;
+    if (mlir::failed(decideGroupedAffineI4I8Dot(op, decision)))
+      return mlir::failure();
+
+    CValue packed = require(decision.packedWeightBase);
+    CValue scales = require(decision.scaleMinBase);
+    CValue activation = require(decision.activationBase);
+    CValue sums = require(decision.activationSumBase);
+    CValue dotScale = require(decision.dotScale);
+    CValue minimumScale = require(decision.minimumScale);
+    CValue init = require(decision.init);
+    if (decision.realization !=
+            GroupedAffineI4I8Realization::RVVVLEN128GroupedDot ||
+        packed.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
         activation.kind != CValueKind::Pointer || sums.kind != CValueKind::Pointer ||
         dotScale.kind != CValueKind::Scalar ||
         minimumScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
