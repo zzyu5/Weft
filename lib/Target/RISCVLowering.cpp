@@ -312,6 +312,7 @@ struct VLAAccessDecision {
   mlir::Value indexedOffset;
   unsigned indexSEW = 0;
   unsigned indexLMUL = 0;
+  unsigned indexedCompanionF32Vectors = 0;
 };
 
 enum class VLABinaryRealization {
@@ -465,6 +466,8 @@ struct VLACandidateFacts {
   unsigned f32Stores = 0;
   unsigned stridedAccesses = 0;
   unsigned indexedAccesses = 0;
+  unsigned maxIndexedElementSEW = 0;
+  unsigned maxIndexedCompanionF32Vectors = 0;
   unsigned maxEntityF32Vectors = 0;
   bool hasReductionState = false;
   bool hasOrderedScan = false;
@@ -1954,6 +1957,35 @@ private:
               "indexed VLA memory requires one scalar base and one typed index vector");
         }
         access.indexedOffset = pointerAdd.getOffset();
+        auto indexCast = access.indexedOffset.getDefiningOp<CastOp>();
+        if (!indexCast ||
+            !elementType(indexCast.getInput().getType()).isUnsignedInteger(32)) {
+          return operation->emitError(
+              "indexed VLA memory requires an explicit u32 index vector");
+        }
+        access.indexSEW = 32;
+        if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
+          mlir::Operation *indexDefinition = indexCast.getInput().getDefiningOp();
+          for (mlir::Operation *user : load.getResult().getUsers()) {
+            if (user == indexDefinition)
+              continue;
+            unsigned companions = llvm::count_if(
+                user->getOperands(), [&](mlir::Value operand) {
+                  return operand != load.getResult() &&
+                         isRegionValue(operand.getType()) &&
+                         elementType(operand.getType()).isF32();
+                });
+            bool feedsReduction = llvm::any_of(
+                user->getResults(), [](mlir::Value result) {
+                  return llvm::any_of(result.getUsers(), [](mlir::Operation *next) {
+                    return mlir::isa<ReduceOp>(next);
+                  });
+                });
+            access.indexedCompanionF32Vectors = std::max(
+                access.indexedCompanionF32Vectors,
+                companions + static_cast<unsigned>(feedsReduction));
+          }
+        }
       }
       decision.accesses.push_back(std::move(access));
       return mlir::success();
@@ -2244,6 +2276,23 @@ private:
           access.memoryMode == VLAMemoryMode::Strided;
       candidateFacts.indexedAccesses +=
           access.memoryMode == VLAMemoryMode::Indexed;
+      if (access.memoryMode == VLAMemoryMode::Indexed) {
+        unsigned elementSEW = access.elementType.isF32() ? 32
+                              : isF16(access.elementType) ? 16
+                              : access.elementType.isUnsignedInteger(8) ? 8
+                              : access.elementType.isUnsignedInteger(32) ? 32
+                                                                        : 0;
+        if (elementSEW == 0) {
+          access.operation->emitError(
+              "indexed VLA memory element has no typed resource model");
+          return mlir::failure();
+        }
+        candidateFacts.maxIndexedElementSEW =
+            std::max(candidateFacts.maxIndexedElementSEW, elementSEW);
+        candidateFacts.maxIndexedCompanionF32Vectors = std::max(
+            candidateFacts.maxIndexedCompanionF32Vectors,
+            access.indexedCompanionF32Vectors);
+      }
       if (access.elementType.isF32()) {
         candidateFacts.f32Loads += mlir::isa<LoadOp>(access.operation);
         candidateFacts.f32Stores += mlir::isa<StoreOp>(access.operation);
@@ -2343,7 +2392,15 @@ private:
                    VLAStateRealization::RVVOnlineSoftmaxSummary)
             primitiveGroups = std::max(primitiveGroups, 3 * candidate + 2);
         }
-        unsigned indexGroups = candidateFacts.indexedAccesses * candidate;
+        unsigned indexGroups = 0;
+        if (candidateFacts.indexedAccesses != 0) {
+          unsigned indexLMUL = candidate * 32 / decision.physical.dataSEW;
+          unsigned elementLMUL = candidate * candidateFacts.maxIndexedElementSEW /
+                                 decision.physical.dataSEW;
+          indexGroups = std::max(2 * indexLMUL + elementLMUL,
+                                 2 * candidate) +
+                        candidateFacts.maxIndexedCompanionF32Vectors * candidate;
+        }
         unsigned predicateGroups = 0;
         for (const VLAPredicateDecision &predicate : decision.predicates) {
           if (predicate.realization ==
@@ -5002,18 +5059,23 @@ private:
                ", (ptrdiff_t)(sizeof(" + cType +
                ") * (" + pointer.laneStride + ")), " + activeVL + ");");
         } else {
+          if (decision->indexSEW != 32)
+            return false;
+          std::string indexWidth = std::to_string(decision->indexSEW);
           std::string offsets = fresh("byte_offsets");
           std::string indexSuffix =
-              "u32m" + std::to_string(decision->indexLMUL);
-          line("vuint32m" + std::to_string(decision->indexLMUL) + "_t " +
+              "u" + indexWidth + "m" + std::to_string(decision->indexLMUL);
+          line("vuint" + indexWidth + "m" +
+               std::to_string(decision->indexLMUL) + "_t " +
                offsets + " = __riscv_vmul_vx_" + indexSuffix + "(" +
-               pointer.indexSpelling + ", (uint32_t)sizeof(" +
+               pointer.indexSpelling + ", (uint" + indexWidth + "_t)sizeof(" +
                std::string(f32 ? "float" : f16 ? "_Float16" : u8 ? "uint8_t"
                                                                         : "uint32_t") +
                "), " + activeVL + ");");
-          line(name + " = __riscv_vluxei32_v_" + suffix + "(" +
+          line(name + " = __riscv_vluxei" + indexWidth + "_v_" + suffix + "(" +
                pointer.spelling + ", " + offsets + ", " + activeVL + ");");
         }
+        return true;
       };
       line(vectorType + " " + name + ";");
       if (decision->activityMode == VLAActivityMode::ScalarPredicate) {
@@ -5025,7 +5087,9 @@ private:
               "scalar-predicated VLA load requires a scalar predicate and other");
         line("if (" + predicate.spelling + ") {");
         ++indent;
-        emitRead();
+        if (!emitRead())
+          return op.emitError(
+              "indexed VLA load decision has no intrinsic-C spelling");
         --indent;
         line("} else {");
         ++indent;
@@ -5036,7 +5100,9 @@ private:
         --indent;
         line("}");
       } else {
-        emitRead();
+        if (!emitRead())
+          return op.emitError(
+              "indexed VLA load decision has no intrinsic-C spelling");
       }
       if (f32) {
         values[op.getResult()] =
