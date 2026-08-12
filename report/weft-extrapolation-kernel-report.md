@@ -29,7 +29,7 @@ output-owned backward traversal、packed storage 和 outer reduction 都保留�
 初次引入后的三个明显缺口已经由显式source variant修正：Argsort使用作者声明的radix
 scratch/histogram，Dense Conv2D显式staging patch和weight，ConvTranspose2D显式选择
 input-owned traversal与contiguous input-channel packing。修正后八个public-op对照中七项更快，
-Dense Conv2D仍慢44.8%；Q1_0和MXFP4距固定手写RVV baseline分别为8.3%和11.1%。
+Dense Conv2D的时间差距缩至23.9%；Q1_0和MXFP4距固定手写RVV baseline分别为8.3%和11.1%。
 
 ## 十个 workload
 
@@ -78,7 +78,8 @@ Dense Conv2D、ConvTranspose2D 与 OutProd 共同扩展了 local F32 contract �
 Target 消费显式 `ContractOp`、block/VLA axis、pointer relation和predicate；它不根据
 `conv2d`、`out_product` 名字判断实现。Dense Conv的patch/weight staging以及ConvTranspose的
 input-owned traversal/packing均由source显式提供，现有local contract family无需增加分支即可
-消费。当前仍只有一个主要row-microtile配置，因此Dense Conv尚未获得成熟物理候选空间。
+消费。Dense Conv进一步用source-owned row8 blocking触发通用row-resource decision中的LMUL1；
+这没有增加卷积分支，但microtile、unroll和pipeline候选空间仍然较窄。
 
 ### Output-owned backward traversal
 
@@ -126,7 +127,7 @@ Weft更快。
 | Argsort | 5 | 8.958199 | 21.902416 | 0.409 | — | — |
 | SetRows | 10 | 0.355782 | 0.432772 | 0.822 | 2.947 GB/s | 2.423 GB/s |
 | Window Partition | 10 | 5.165583 | 5.575184 | 0.927 | 5.350 GB/s | 4.957 GB/s |
-| Dense Conv2D | 3 | 911.200486 | 629.354844 | 1.448 | 5.303 GOP/s | 7.677 GOP/s |
+| Dense Conv2D | 3 | 779.800666 | 629.354844 | 1.239 | 6.196 GOP/s | 7.677 GOP/s |
 | ConvTranspose2D | 5 | 16.333010 | 17.179675 | 0.951 | 4.109 GOP/s | 3.906 GOP/s |
 | RMSNorm backward | 10 | 6.358188 | 10.622016 | 0.599 | 329.835 MElements/s | 197.434 MElements/s |
 | OutProd | 3 | 128.860142 | 231.133128 | 0.558 | 5.729 GOP/s | 3.194 GOP/s |
@@ -147,9 +148,9 @@ Weft correctness口径：Argsort、SetRows、Window Partition、RMSNorm backward
   reduction和local contract在陌生上下文中已经能形成有效RVV realization。
 - Q1_0与MXFP4分别慢8.3%和11.1%。这是本组最强的对照：GGML两项都是真实手写RVV
   intrinsic实现。Weft已进入同一性能区间，但outer-loop overhead、load scheduling和寄存器组织仍有差距。
-- Dense Conv2D经显式patch/weight staging从2.025提升到5.303 GOP/s，但仍比GGML慢31.0%
-  （按时间为44.8%）。剩余差距是local contract只有固定LMUL4/row6，没有microtile、unroll、
-  packing和software-pipeline候选。
+- Dense Conv2D经显式patch/weight staging与row8/LMUL1 resource decision从2.025提升到
+  6.196 GOP/s；相对GGML吞吐仍低19.3%，按时间慢23.9%。剩余差距位于local contract的
+  microtile、unroll和software-pipeline候选，不再是固定LMUL4/row6或缺少staging。
 - ConvTranspose2D经显式input-owned traversal与packing从0.693提升到4.109 GOP/s，比GGML快
   4.9%。当前`stride=kernel=2`保证各input/kernel pair拥有不同output位置；重叠variant仍必须
   由source显式采用atomic或另一种ownership。

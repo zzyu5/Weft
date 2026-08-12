@@ -88,7 +88,8 @@ for row in W.range(m_begin, m_end, 6):
 ```
 
 Target从contract、block axis、typed operand以及pointer/access projection选择F32 RVV row
-microtile与LMUL4，同一个K vector供6个row accumulator复用。该选择不要求enclosing loop
+microtile与LMUL；当前row6选择LMUL4，row8选择LMUL1，同一个K vector供各row accumulator
+复用。该选择不要求enclosing loop
 形成固定row/column closure，所以同一local contract可以位于expert grouping等其他source
 context中。`row step=6` 是当前source的cache/register blocking选择；它不是`gemm_f32`
 kernel类别，也没有把N/K loop、grouping或matrix layout从target反推回IR。

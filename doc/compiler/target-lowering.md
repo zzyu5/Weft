@@ -44,7 +44,8 @@ verifier、pipeline front door或长期provider registry。
 
 - 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
   mode、activity、state realization和LMUL；位于nested scalar control中的access仍逐实体决策；
-- local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；
+- local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；含contract的
+  VLA region直接消费该LMUL来决定strip width、mask ratio与index LMUL，不保留第二份选择；
 - block decode的table extent、code/result vector shape与RVV gather realization；
 - symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
   N16×K32 realization；
@@ -136,7 +137,9 @@ kernel family。
 逐实体VLA memory/predicate/state/narrow、codebook decode、sign-bit/E2M1 local dot与symmetric
 IME fragment已经按上述模型工作。Local F32 contract根据block/VLA axis、typed operand、
 pointer/access与predicate projection选择row microtile，并已在dense/out-product及卷积坐标关系中
-复用；当前仍只支持一个较窄的F32 free-axis family。
+复用。Block row extent由source保留；lowering当前根据局部row resource在row6/LMUL4与
+row8/LMUL1等配置间形成唯一physical decision。F32 free-axis family的microtile、unroll与
+pipeline候选仍然较窄。
 
 较早的F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
 F16 GEMM nested loop与affine Q4_K IME N/K envelope仍要求较精确的region/use/loop closure；这些
