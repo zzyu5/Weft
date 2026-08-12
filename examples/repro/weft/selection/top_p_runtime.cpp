@@ -125,8 +125,8 @@ int main() {
   std::printf("cutoff_mismatches=0\n");
   std::printf("sample_mismatches=0\n");
   std::printf("median_ms=%.6f\n", milliseconds);
-  std::printf("million_candidates_s=%.6f\n",
-              static_cast<double>(kRows * kVocabulary * kVocabulary) /
-                  milliseconds / 1000.0);
+  std::printf("million_values_s=%.6f\n",
+              static_cast<double>(kRows * kVocabulary) / milliseconds /
+                  1000.0);
   return 0;
 }

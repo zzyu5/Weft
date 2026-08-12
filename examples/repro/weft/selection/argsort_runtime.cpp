@@ -8,7 +8,6 @@
 
 extern "C" void argsort_f32(
     const float *values, std::uint32_t *indices,
-    std::uint32_t *scratch_indices, std::uint32_t *histogram,
     std::size_t row_begin, std::size_t row_end, std::size_t columns,
     std::size_t value_row_stride, std::size_t index_row_stride);
 
@@ -38,8 +37,6 @@ int main() {
   std::vector<float> values(kElements);
   std::vector<std::uint32_t> expected(kElements);
   std::vector<std::uint32_t> actual(kElements);
-  std::vector<std::uint32_t> scratch(kColumns);
-  std::vector<std::uint32_t> histogram(256);
   for (std::size_t row = 0; row < kRows; ++row) {
     std::uint32_t *order = expected.data() + row * kColumns;
     std::iota(order, order + kColumns, 0U);
@@ -47,13 +44,18 @@ int main() {
       values[row * kColumns + column] =
           static_cast<float>((row * 104729U + column * 65537U) % 16777213U) +
           static_cast<float>(column) / 65536.0F;
+    values[row * kColumns + 3] = -0.0F;
+    values[row * kColumns + 7] = 0.0F;
+    values[row * kColumns + 11] = values[row * kColumns + 13];
     std::sort(order, order + kColumns, [&](std::uint32_t lhs, std::uint32_t rhs) {
-      return values[row * kColumns + lhs] < values[row * kColumns + rhs];
+      const float left = values[row * kColumns + lhs];
+      const float right = values[row * kColumns + rhs];
+      return left < right || (left == right && lhs < rhs);
     });
   }
 
-  argsort_f32(values.data(), actual.data(), scratch.data(), histogram.data(), 0,
-              kRows, kColumns, kColumns, kColumns);
+  argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
+              kColumns);
   if (actual != expected) {
     for (std::size_t index = 0; index < actual.size(); ++index)
       if (actual[index] != expected[index]) {
@@ -70,8 +72,8 @@ int main() {
   for (int repetition = 0; repetition < 5; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    argsort_f32(values.data(), actual.data(), scratch.data(), histogram.data(),
-                0, kRows, kColumns, kColumns, kColumns);
+    argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
+                kColumns);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
@@ -79,6 +81,9 @@ int main() {
 
   std::printf("kernel=argsort_f32\n");
   std::printf("model_shape=batched_logits[rows=8,vocab=32000]\n");
-  std::printf("median_ms=%.6f\n", median(samples));
+  const double milliseconds = median(samples);
+  std::printf("median_ms=%.6f\n", milliseconds);
+  std::printf("million_values_s=%.6f\n",
+              static_cast<double>(kElements) / milliseconds / 1000.0);
   return 0;
 }

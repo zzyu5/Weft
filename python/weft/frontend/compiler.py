@@ -18,6 +18,7 @@ from weft.language import PtrSpec
 from weft.language import f32
 from weft.language import i1
 from weft.language import index
+from weft.language import u32
 from weft.language.builtins import InvalidValue
 
 from .ir import IRBuilder
@@ -944,6 +945,73 @@ class FrontendCompiler:
             call,
             operands=(pointer, value, where),
             attributes={"alignment": str(alignment)},
+        )
+        return None
+
+    def _intrinsic_sort_indices(self, call: ast.Call) -> None:
+        self._require_effect("read", call)
+        self._require_effect("write", call)
+        args = self._positional_and_keywords(
+            call,
+            ("input", "output", "extent"),
+            {
+                "order": "ascending",
+                "nan": "last",
+                "tie": "index_ascending",
+            },
+        )
+        input_pointer = self._value_argument(args["input"], call)
+        output_pointer = self._value_argument(args["output"], call)
+        extent = self._value_argument(args["extent"], call)
+        if not isinstance(input_pointer.type, PointerType) or not isinstance(
+            output_pointer.type, PointerType
+        ):
+            raise FrontendError(
+                "W.sort_indices expects scalar typed pointers", self._location(call)
+            )
+        if input_pointer.type.element_type != ScalarType(f32):
+            raise FrontendError(
+                "W.sort_indices input must point to f32", self._location(call)
+            )
+        if output_pointer.type.element_type != ScalarType(u32):
+            raise FrontendError(
+                "W.sort_indices output must point to u32", self._location(call)
+            )
+        if not _is_index(extent.type) or not _is_scalar(extent.type):
+            raise FrontendError(
+                "W.sort_indices extent must be a scalar index", self._location(call)
+            )
+        order = args["order"]
+        nan = args["nan"]
+        tie = args["tie"]
+        if isinstance(order, ast.expr):
+            order = self._eval_static(order)
+        if isinstance(nan, ast.expr):
+            nan = self._eval_static(nan)
+        if isinstance(tie, ast.expr):
+            tie = self._eval_static(tie)
+        if order not in {"ascending", "descending"}:
+            raise FrontendError(
+                "W.sort_indices order must be ascending or descending",
+                self._location(call),
+            )
+        if nan != "last":
+            raise FrontendError(
+                "W.sort_indices nan must be last", self._location(call)
+            )
+        if tie != "index_ascending":
+            raise FrontendError(
+                "W.sort_indices tie must be index_ascending", self._location(call)
+            )
+        self._emit(
+            "weft_kernel.sort_indices",
+            call,
+            operands=(input_pointer, output_pointer, extent),
+            attributes={
+                "order": _string(order),
+                "nan": _string(nan),
+                "tie": _string(tie),
+            },
         )
         return None
 

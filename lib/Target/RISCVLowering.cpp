@@ -212,6 +212,18 @@ struct QuantCodebookI8Decision {
   llvm::SmallVector<mlir::Value> scalars;
 };
 
+enum class SortIndicesRealization {
+  StableF32Radix,
+};
+
+struct SortIndicesDecision {
+  SortIndicesRealization realization =
+      SortIndicesRealization::StableF32Radix;
+  bool descending = false;
+  unsigned radixBits = 8;
+  unsigned passes = 4;
+};
+
 struct CValue {
   mlir::Type type;
   CValueKind kind = CValueKind::Scalar;
@@ -986,6 +998,38 @@ public:
 private:
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
+    kernel.walk([&](SortIndicesOp op) {
+      if (decisionFailure)
+        return;
+      SortIndicesDecision decision;
+      if (!options.target.littleEndian || options.target.xlen != 64 ||
+          !options.target.hasRVV) {
+        op.emitError(
+            "RISC-V sort_indices requires a little-endian RV64 vector target");
+        decisionFailure = true;
+        return;
+      }
+      decision.descending = op.getOrder() == "descending";
+      if (options.backend.sortRadixBits != 0 &&
+          options.backend.sortRadixBits != 8 &&
+          options.backend.sortRadixBits != 11) {
+        op.emitError("sort_indices radix width must be 8 or 11 bits");
+        decisionFailure = true;
+        return;
+      }
+      decision.radixBits = options.backend.sortRadixBits == 0
+                               ? 8
+                               : static_cast<unsigned>(
+                                     options.backend.sortRadixBits);
+      decision.passes = (32 + decision.radixBits - 1) / decision.radixBits;
+      if (!sortIndicesDecisions
+               .try_emplace(op.getOperation(), std::move(decision))
+               .second) {
+        op.emitError(
+            "one sort_indices primitive cannot own multiple physical decisions");
+        decisionFailure = true;
+      }
+    });
     kernel.walk([&](VLAOp vla) {
       if (decisionFailure)
         return;
@@ -1183,6 +1227,7 @@ private:
   llvm::DenseMap<mlir::Operation *, QuantCodebookI8Decision>
       quantCodebookI8Decisions;
   llvm::DenseMap<mlir::Operation *, BlockDecodeDecision> blockDecodeDecisions;
+  llvm::DenseMap<mlir::Operation *, SortIndicesDecision> sortIndicesDecisions;
   llvm::DenseMap<mlir::Operation *, BlockStoreGroupDecision>
       blockStoreGroupDecisions;
   llvm::DenseMap<mlir::Operation *, BlockReduceGroupDecision>
@@ -2576,6 +2621,8 @@ private:
       return mlir::success();
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
+    if (auto op = mlir::dyn_cast<SortIndicesOp>(operation))
+      return emitSortIndices(op);
     if (auto op = mlir::dyn_cast<ScanOp>(operation))
       return op.emitError("scan must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
@@ -2669,6 +2716,127 @@ private:
       return op.emitError("RISC-V target cannot spell constant");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, literal};
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitSortIndices(SortIndicesOp op) {
+    auto found = sortIndicesDecisions.find(op.getOperation());
+    if (found == sortIndicesDecisions.end())
+      return op.emitError("sort_indices has no physical decision");
+    const SortIndicesDecision &decision = found->second;
+    if (decision.realization != SortIndicesRealization::StableF32Radix ||
+        (decision.radixBits != 8 && decision.radixBits != 11) ||
+        decision.passes !=
+            (32 + decision.radixBits - 1) / decision.radixBits)
+      return op.emitError("sort_indices decision has no intrinsic-C spelling");
+    CValue input = require(op.getInput());
+    CValue outputValue = require(op.getOutput());
+    CValue extent = require(op.getExtent());
+    if (input.kind != CValueKind::Pointer ||
+        outputValue.kind != CValueKind::Pointer ||
+        input.spelling.empty() || outputValue.spelling.empty() ||
+        extent.kind != CValueKind::Scalar || extent.spelling.empty())
+      return op.emitError("sort_indices operands are unavailable");
+
+    std::string scratch = fresh("sort_scratch");
+    std::string source = fresh("sort_source");
+    std::string destination = fresh("sort_destination");
+    std::string position = fresh("sort_position");
+    std::string pass = fresh("sort_pass");
+    std::string histogram = fresh("sort_histogram");
+    std::string offsets = fresh("sort_offsets");
+    std::string index = fresh("sort_index");
+    std::string bits = fresh("sort_bits");
+    std::string normalized = fresh("sort_normalized");
+    std::string ordered = fresh("sort_ordered");
+    std::string key = fresh("sort_key");
+    std::string digit = fresh("sort_digit");
+    std::string bucket = fresh("sort_bucket");
+    std::string running = fresh("sort_running");
+    std::string swap = fresh("sort_swap");
+    std::string descendingTransform = decision.descending ? "~" : "";
+    unsigned bucketCount = 1u << decision.radixBits;
+    std::string digitMask = std::to_string(bucketCount - 1) + "U";
+
+    line("uint32_t " + scratch + "[" + extent.spelling + "]; ");
+    line("for (size_t " + position + " = 0; " + position + " < " +
+         extent.spelling + "; ++" + position + ")");
+    ++indent;
+    line(outputValue.spelling + "[" + position + "] = (uint32_t)" +
+         position + ";");
+    --indent;
+    line("uint32_t *" + source + " = " + outputValue.spelling + ";");
+    line("uint32_t *" + destination + " = " + scratch + ";");
+    line("for (unsigned " + pass + " = 0; " + pass + " < " +
+         std::to_string(decision.passes) + "; ++" + pass + ") {");
+    ++indent;
+    line("size_t " + histogram + "[" + std::to_string(bucketCount) +
+         "] = {0};");
+    line("for (size_t " + position + " = 0; " + position + " < " +
+         extent.spelling + "; ++" + position + ") {");
+    ++indent;
+    line("const uint32_t " + index + " = " + source + "[" + position + "]; ");
+    line("const uint32_t " + bits + " = __weft_bitcast_f32_u32(" +
+         input.spelling + "[" + index + "]); ");
+    line("const uint32_t " + normalized + " = ((" + bits +
+         " & UINT32_C(0x7fffffff)) == 0) ? 0 : " + bits + ";");
+    line("const uint32_t " + ordered + " = " + normalized + " ^ ((" +
+         normalized +
+         " & UINT32_C(0x80000000)) ? UINT32_C(0xffffffff) : "
+         "UINT32_C(0x80000000));");
+    line("const uint32_t " + key + " = (((" + bits +
+         " & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000)) ? "
+         "UINT32_C(0xffffffff) : " + descendingTransform + ordered + ");");
+    line("const unsigned " + digit + " = (unsigned)((" + key + " >> (" +
+         pass + " * " + std::to_string(decision.radixBits) + "U)) & " +
+         digitMask + ");");
+    line("++" + histogram + "[" + digit + "]; ");
+    --indent;
+    line("}");
+    line("size_t " + offsets + "[" + std::to_string(bucketCount) + "]; ");
+    line("size_t " + running + " = 0;");
+    line("for (unsigned " + bucket + " = 0; " + bucket + " < " +
+         std::to_string(bucketCount) + "; ++" + bucket + ") {");
+    ++indent;
+    line(offsets + "[" + bucket + "] = " + running + ";");
+    line(running + " += " + histogram + "[" + bucket + "]; ");
+    --indent;
+    line("}");
+    line("for (size_t " + position + " = 0; " + position + " < " +
+         extent.spelling + "; ++" + position + ") {");
+    ++indent;
+    line("const uint32_t " + index + " = " + source + "[" + position + "]; ");
+    line("const uint32_t " + bits + " = __weft_bitcast_f32_u32(" +
+         input.spelling + "[" + index + "]); ");
+    line("const uint32_t " + normalized + " = ((" + bits +
+         " & UINT32_C(0x7fffffff)) == 0) ? 0 : " + bits + ";");
+    line("const uint32_t " + ordered + " = " + normalized + " ^ ((" +
+         normalized +
+         " & UINT32_C(0x80000000)) ? UINT32_C(0xffffffff) : "
+         "UINT32_C(0x80000000));");
+    line("const uint32_t " + key + " = (((" + bits +
+         " & UINT32_C(0x7fffffff)) > UINT32_C(0x7f800000)) ? "
+         "UINT32_C(0xffffffff) : " + descendingTransform + ordered + ");");
+    line("const unsigned " + digit + " = (unsigned)((" + key + " >> (" +
+         pass + " * " + std::to_string(decision.radixBits) + "U)) & " +
+         digitMask + ");");
+    line(destination + "[" + offsets + "[" + digit + "]++] = " + index +
+         ";");
+    --indent;
+    line("}");
+    line("uint32_t *" + swap + " = " + source + ";");
+    line(source + " = " + destination + ";");
+    line(destination + " = " + swap + ";");
+    --indent;
+    line("}");
+    if (decision.passes % 2 != 0) {
+      line("for (size_t " + position + " = 0; " + position + " < " +
+           extent.spelling + "; ++" + position + ")");
+      ++indent;
+      line(outputValue.spelling + "[" + position + "] = " + source + "[" +
+           position + "]; ");
+      --indent;
+    }
     return mlir::success();
   }
 

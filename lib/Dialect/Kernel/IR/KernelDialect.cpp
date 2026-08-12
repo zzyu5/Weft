@@ -992,6 +992,23 @@ mlir::LogicalResult StoreOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult SortIndicesOp::verify() {
+  PtrType input = getInput().getType();
+  PtrType output = getOutput().getType();
+  if (!input.getElementType().isF32() || input.getAccess() == "write")
+    return emitOpError("input must be a readable f32 pointer");
+  if (!output.getElementType().isUnsignedInteger(32) ||
+      output.getAccess() == "read")
+    return emitOpError("output must be a writable u32 pointer");
+  if (getOrder() != "ascending" && getOrder() != "descending")
+    return emitOpError("order must be ascending or descending");
+  if (getNan() != "last")
+    return emitOpError("nan must be last");
+  if (getTie() != "index_ascending")
+    return emitOpError("tie must be index_ascending");
+  return mlir::success();
+}
+
 mlir::LogicalResult PrefetchOp::verify() {
   if (!isPointerValue(getPointer().getType()) ||
       !isPredicateType(getWhere().getType()))

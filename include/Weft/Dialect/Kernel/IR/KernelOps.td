@@ -279,6 +279,19 @@ def WeftKernel_StoreOp : WeftKernel_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let hasVerifier = 1;
 }
 
+def WeftKernel_SortIndicesOp
+    : WeftKernel_Op<"sort_indices", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Stable local ordering of an f32 pointer slice into u32 indices";
+  let arguments = (ins WeftKernel_PtrType:$input,
+                       WeftKernel_PtrType:$output,
+                       Index:$extent,
+                       StrAttr:$order,
+                       StrAttr:$nan,
+                       StrAttr:$tie);
+  let results = (outs);
+  let hasVerifier = 1;
+}
+
 def WeftKernel_PrefetchOp : WeftKernel_Op<"prefetch", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$pointer, AnyType:$where,
                        StrAttr:$locality);

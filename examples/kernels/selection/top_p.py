@@ -1,25 +1,6 @@
 import weft
 import weft.language as W
 
-
-@W.pure
-def _winner(value, coordinate):
-    return W.tuple(value, coordinate)
-
-
-@W.pure
-def _merge_winner(a, b):
-    value_a, index_a = a
-    value_b, index_b = b
-    take_b = (value_b > value_a) | (
-        (value_b == value_a) & (index_b < index_a)
-    )
-    return W.tuple(
-        W.select(take_b, value_b, value_a),
-        W.select(take_b, index_b, index_a),
-    )
-
-
 @weft.kernel
 def top_p_nucleus_f32(
     probabilities: W.ptr[W.f32, W.readonly, W.noalias],
@@ -34,39 +15,28 @@ def top_p_nucleus_f32(
 ) -> None:
     for row in W.range(0, rows):
         row_offset = row * vocabulary
+        W.sort_indices(
+            probabilities + row_offset,
+            sorted_indices + row_offset,
+            vocabulary,
+            order="descending",
+            nan="last",
+            tie="index_ascending",
+        )
         for rank in W.range(0, vocabulary):
-            with W.vla(0, vocabulary) as token:
-                eligible = token >= W.index(0)
-                for previous_rank in W.range(0, rank):
-                    previous = W.cast(
-                        W.load(
-                            sorted_indices + row_offset + previous_rank,
-                            other=W.u32(0),
-                        ),
-                        W.index,
-                    )
-                    eligible = eligible & (token != previous)
-                candidate = W.select(
-                    eligible,
-                    W.load(probabilities + row_offset + token),
-                    W.neg_inf(W.f32),
-                )
-                state = W.summary_fold(
-                    candidate,
-                    identity=W.tuple(W.neg_inf(W.f32), W.index(0)),
-                    lift=_winner,
-                    merge=_merge_winner,
-                    coordinate=token,
-                    order="relaxed",
-                )
-            selected_probability, selected_index = state
-            W.store(
-                sorted_indices + row_offset + rank,
-                W.cast(selected_index, W.u32),
+            token = W.cast(
+                W.load(
+                    sorted_indices + row_offset + rank,
+                    other=W.u32(0),
+                ),
+                W.index,
             )
             W.store(
                 sorted_probabilities + row_offset + rank,
-                selected_probability,
+                W.load(
+                    probabilities + row_offset + token,
+                    other=W.f32(0.0),
+                ),
             )
 
         with W.vla(0, vocabulary) as rank:

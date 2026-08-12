@@ -58,6 +58,10 @@ llvm::cl::opt<int64_t> f16RowMicrotile(
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
     llvm::cl::init(0));
+llvm::cl::opt<int64_t> sortRadixBits(
+    "sort-radix-bits",
+    llvm::cl::desc("Requested stable f32 radix width; zero selects"),
+    llvm::cl::init(0));
 
 bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
   for (llvm::StringRef spelling : metaBindings) {
@@ -129,6 +133,7 @@ int main(int argc, char **argv) {
     options.backend.f16InputLMUL = f16InputLMUL;
     options.backend.f16RowMicrotile = f16RowMicrotile;
     options.backend.narrowLMUL = narrowLMUL;
+    options.backend.sortRadixBits = sortRadixBits;
     if (!parseMetaBindings(options.metaBindings) ||
         mlir::failed(
             weft::lowerToRISCVIntrinsicC(*module, options, output.os())))
