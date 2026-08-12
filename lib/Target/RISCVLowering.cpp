@@ -277,6 +277,26 @@ enum class SpecializedVLARealization {
   SoftmaxEnvelope,
 };
 
+enum class RVVTailPolicy {
+  Agnostic,
+  Undisturbed,
+};
+
+struct RVVVectorConfig {
+  unsigned sew = 32;
+  unsigned lmul = 2;
+};
+
+struct SpecializedVLAPhysicalConfig {
+  RVVVectorConfig input;
+  RVVVectorConfig compute;
+  RVVVectorConfig output;
+  RVVVectorConfig reduction;
+  VLAMemoryMode inputMemory = VLAMemoryMode::UnitStride;
+  VLAMemoryMode outputMemory = VLAMemoryMode::UnitStride;
+  RVVTailPolicy tail = RVVTailPolicy::Agnostic;
+};
+
 struct SpecializedVLADecision {
   SpecializedVLARealization realization = SpecializedVLARealization::F32ToF16;
   mlir::Operation *operation = nullptr;
@@ -290,7 +310,18 @@ struct SpecializedVLADecision {
   std::string secondPointer;
   std::string destinationPointer;
   std::string scalar;
+  SpecializedVLAPhysicalConfig physical;
 };
+
+std::string rvvFloatSuffix(const RVVVectorConfig &config) {
+  return "f" + std::to_string(config.sew) + "m" +
+         std::to_string(config.lmul);
+}
+
+std::string rvvFloatType(const RVVVectorConfig &config) {
+  return "vfloat" + std::to_string(config.sew) + "m" +
+         std::to_string(config.lmul) + "_t";
+}
 
 enum class AffineI4I8NTileRealization {
   SpacemiTIME1N16K32,
@@ -1842,11 +1873,16 @@ private:
     decision.end = end.spelling;
     decision.firstPointer = *source;
     decision.destinationPointer = *destination;
+    decision.physical.input = {32, 8};
+    decision.physical.compute = {32, 8};
+    decision.physical.output = {16, 4};
     return decision;
   }
 
   mlir::LogicalResult emitF32ToF16VLA(
       const SpecializedVLADecision &decision) {
+    const RVVVectorConfig &input = decision.physical.input;
+    const RVVVectorConfig &output = decision.physical.output;
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string wide = fresh("load_f32");
@@ -1854,14 +1890,18 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + decision.end +
-         " - " + strip + ");");
-    line("vfloat32m8_t " + wide + " = __riscv_vle32_v_f32m8(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(input.sew) + "m" + std::to_string(input.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(input) + " " + wide + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.firstPointer +
          " + " + strip + ", " + vl + ");");
-    line("vfloat16m4_t " + narrow +
-         " = __riscv_vfncvt_f_f_w_f16m4(" + wide + ", " + vl + ");");
-    line("__riscv_vse16_v_f16m4(" + decision.destinationPointer + " + " +
+    line(rvvFloatType(output) + " " + narrow +
+         " = __riscv_vfncvt_f_f_w_" + rvvFloatSuffix(output) + "(" + wide +
+         ", " + vl + ");");
+    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
+         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
          strip + ", " + narrow + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
@@ -1907,23 +1947,30 @@ private:
     decision.end = end.spelling;
     decision.destinationPointer = *destination;
     decision.scalar = fill;
+    decision.physical.input = {16, 8};
+    decision.physical.compute = {16, 8};
+    decision.physical.output = {16, 8};
     return decision;
   }
 
   mlir::LogicalResult emitF16FillVLA(
       const SpecializedVLADecision &decision) {
+    const RVVVectorConfig &output = decision.physical.output;
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string vector = fresh("fill_f16");
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + decision.end +
-         " - " + strip + ");");
-    line("vfloat16m8_t " + vector + " = __riscv_vfmv_v_f_f16m8(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(output.sew) + "m" + std::to_string(output.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(output) + " " + vector + " = __riscv_vfmv_v_f_" +
+         rvvFloatSuffix(output) + "(" +
          decision.scalar +
          ", " + vl + ");");
-    line("__riscv_vse16_v_f16m8(" + decision.destinationPointer + " + " +
+    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
+         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
          strip + ", " + vector + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
@@ -2004,6 +2051,11 @@ private:
     decision.firstPointer = *lhs;
     decision.secondPointer = *rhs;
     decision.scalar = identity;
+    decision.physical.input = {16, 1};
+    decision.physical.compute = {32, 2};
+    decision.physical.output = {32, 1};
+    decision.physical.reduction = {32, 1};
+    decision.physical.tail = RVVTailPolicy::Undisturbed;
     return decision;
   }
 
@@ -2011,6 +2063,9 @@ private:
       const SpecializedVLADecision &decision) {
     auto op = mlir::cast<VLAOp>(decision.operation);
     auto reduce = mlir::cast<ReduceOp>(decision.semanticOperation);
+    const RVVVectorConfig &input = decision.physical.input;
+    const RVVVectorConfig &compute = decision.physical.compute;
+    const RVVVectorConfig &reduction = decision.physical.reduction;
     std::string fullVL = fresh("dot_vl");
     std::string accumulator = fresh("dot_acc");
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
@@ -2020,45 +2075,59 @@ private:
     std::string seed = fresh("dot_seed");
     std::string reduced = fresh("dot_reduced");
     std::string result = fresh("dot");
-    line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m1();");
-    line("vfloat32m2_t " + accumulator +
-         " = __riscv_vfmv_v_f_f32m2(0.0f, " + fullVL + ");");
+    line("const size_t " + fullVL + " = __riscv_vsetvlmax_e" +
+         std::to_string(input.sew) + "m" + std::to_string(input.lmul) +
+         "();");
+    line(rvvFloatType(compute) + " " + accumulator +
+         " = __riscv_vfmv_v_f_" + rvvFloatSuffix(compute) + "(0.0f, " +
+         fullVL + ");");
     line("size_t " + strip + " = " + decision.begin + ";");
     line("for (; " + strip + " + " + fullVL + " <= " + decision.end + "; " +
          strip + " += " + fullVL + ") {");
     ++indent;
-    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
+    line(rvvFloatType(input) + " " + lhsVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.firstPointer +
          " + " + strip + ", " + fullVL + ");");
-    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
+    line(rvvFloatType(input) + " " + rhsVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.secondPointer +
          " + " + strip + ", " + fullVL + ");");
-    line(accumulator + " = __riscv_vfwmacc_vv_f32m2(" + accumulator + ", " +
-         lhsVector + ", " + rhsVector + ", " + fullVL + ");");
+    line(accumulator + " = __riscv_vfwmacc_vv_" + rvvFloatSuffix(compute) +
+         "(" + accumulator + ", " + lhsVector + ", " + rhsVector + ", " +
+         fullVL + ");");
     --indent;
     line("}");
     line("if (" + strip + " < " + decision.end + ") {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" + decision.end +
-         " - " + strip + ");");
-    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(input.sew) + "m" + std::to_string(input.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(input) + " " + lhsVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.firstPointer +
          " + " + strip + ", " + vl + ");");
-    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
+    line(rvvFloatType(input) + " " + rhsVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.secondPointer +
          " + " + strip + ", " + vl + ");");
-    line(accumulator + " = __riscv_vfwmacc_vv_f32m2_tu(" + accumulator +
-         ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
+    std::string tailSuffix =
+        decision.physical.tail == RVVTailPolicy::Undisturbed ? "_tu" : "";
+    line(accumulator + " = __riscv_vfwmacc_vv_" + rvvFloatSuffix(compute) +
+         tailSuffix + "(" + accumulator + ", " + lhsVector + ", " + rhsVector +
+         ", " + vl + ");");
     --indent;
     line("}");
-    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" +
+    line(rvvFloatType(reduction) + " " + seed + " = __riscv_vfmv_v_f_" +
+         rvvFloatSuffix(reduction) + "(" +
          decision.scalar +
          ", 1);");
-    line("vfloat32m1_t " + reduced +
-         " = __riscv_vfredusum_vs_f32m2_f32m1(" + accumulator + ", " + seed +
-         ", " + fullVL + ");");
-    line("const float " + result + " = __riscv_vfmv_f_s_f32m1_f32(" +
-         reduced + ");");
+    line(rvvFloatType(reduction) + " " + reduced +
+         " = __riscv_vfredusum_vs_" + rvvFloatSuffix(compute) + "_" +
+         rvvFloatSuffix(reduction) + "(" + accumulator + ", " + seed + ", " +
+         fullVL + ");");
+    line("const float " + result + " = __riscv_vfmv_f_s_" +
+         rvvFloatSuffix(reduction) + "_f32(" + reduced + ");");
     CValue materialized{op.getResult(0).getType(), CValueKind::Scalar, result};
     values[reduce.getResult()] = materialized;
     values[op.getResult(0)] = materialized;
@@ -2152,11 +2221,17 @@ private:
     decision.secondPointer = *product;
     decision.destinationPointer = *destination;
     decision.scalar = weightExpression;
+    decision.physical.input = {16, 8};
+    decision.physical.compute = {16, 8};
+    decision.physical.output = {16, 8};
     return decision;
   }
 
   mlir::LogicalResult emitF16WeightedUpdateVLA(
       const SpecializedVLADecision &decision) {
+    const RVVVectorConfig &input = decision.physical.input;
+    const RVVVectorConfig &compute = decision.physical.compute;
+    const RVVVectorConfig &output = decision.physical.output;
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string baseVector = fresh("update_base");
@@ -2165,18 +2240,22 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + decision.end +
-         " - " + strip + ");");
-    line("vfloat16m8_t " + baseVector + " = __riscv_vle16_v_f16m8(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(compute.sew) + "m" + std::to_string(compute.lmul) +
+         "(" + decision.end + " - " + strip + ");");
+    line(rvvFloatType(input) + " " + baseVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.firstPointer +
          " + " + strip + ", " + vl + ");");
-    line("vfloat16m8_t " + productVector +
-         " = __riscv_vle16_v_f16m8(" + decision.secondPointer + " + " +
-         strip + ", " + vl + ");");
-    line("vfloat16m8_t " + result + " = __riscv_vfmacc_vf_f16m8(" +
+    line(rvvFloatType(input) + " " + productVector + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
+         decision.secondPointer + " + " + strip + ", " + vl + ");");
+    line(rvvFloatType(compute) + " " + result + " = __riscv_vfmacc_vf_" +
+         rvvFloatSuffix(compute) + "(" +
          baseVector + ", " + decision.scalar + ", " + productVector + ", " +
          vl + ");");
-    line("__riscv_vse16_v_f16m8(" + decision.destinationPointer + " + " +
+    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
+         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
          strip + ", " + result + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
@@ -2247,11 +2326,17 @@ private:
     decision.firstPointer = *source;
     decision.destinationPointer = *destination;
     decision.scalar = divisor;
+    decision.physical.input = {16, 4};
+    decision.physical.compute = {32, 8};
+    decision.physical.output = {32, 8};
     return decision;
   }
 
   mlir::LogicalResult emitF16ToF32NormalizeVLA(
       const SpecializedVLADecision &decision) {
+    const RVVVectorConfig &input = decision.physical.input;
+    const RVVVectorConfig &compute = decision.physical.compute;
+    const RVVVectorConfig &output = decision.physical.output;
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string half = fresh("load_f16");
@@ -2260,16 +2345,21 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + decision.end +
-         " - " + strip + ");");
-    line("vfloat16m4_t " + half + " = __riscv_vle16_v_f16m4(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(compute.sew) + "m" + std::to_string(compute.lmul) +
+         "(" + decision.end + " - " + strip + ");");
+    line(rvvFloatType(input) + " " + half + " = __riscv_vle" +
+         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
          decision.firstPointer +
          " + " + strip + ", " + vl + ");");
-    line("vfloat32m8_t " + wide + " = __riscv_vfwcvt_f_f_v_f32m8(" + half +
+    line(rvvFloatType(compute) + " " + wide +
+         " = __riscv_vfwcvt_f_f_v_" + rvvFloatSuffix(compute) + "(" + half +
          ", " + vl + ");");
-    line("vfloat32m8_t " + normalized + " = __riscv_vfdiv_vf_f32m8(" + wide +
-         ", " + decision.scalar + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m8(" + decision.destinationPointer + " + " +
+    line(rvvFloatType(compute) + " " + normalized + " = __riscv_vfdiv_vf_" +
+         rvvFloatSuffix(compute) + "(" + wide + ", " + decision.scalar + ", " +
+         vl + ");");
+    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
+         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
          strip + ", " + normalized + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
@@ -2643,6 +2733,10 @@ private:
     decision.end = end;
     decision.firstPointer = *input;
     decision.destinationPointer = *outputPointer;
+    decision.physical.input = {32, 2};
+    decision.physical.compute = {32, 2};
+    decision.physical.output = {32, 2};
+    decision.physical.reduction = {32, 1};
     return decision;
   }
 
@@ -2650,6 +2744,8 @@ private:
       const SpecializedVLADecision &decision) {
     auto producer = mlir::cast<VLAOp>(decision.operation);
     auto summary = mlir::cast<SummaryFoldOp>(decision.semanticOperation);
+    const RVVVectorConfig &data = decision.physical.compute;
+    const RVVVectorConfig &reduction = decision.physical.reduction;
     std::string maximum = fresh("softmax_max");
     std::string strip = fresh("softmax_i");
     std::string vl = fresh("vl");
@@ -2660,17 +2756,20 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
-         " - " +
-         strip + ");");
-    line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(data) + " " + inputVector + " = __riscv_vle" +
+         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
          decision.firstPointer + " + " + strip + ", " + vl + ");");
-    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + maximum +
-         ", 1);");
-    line("vfloat32m1_t " + partial +
-         " = __riscv_vfredmax_vs_f32m2_f32m1(" + inputVector + ", " + seed +
-         ", " + vl + ");");
-    line(maximum + " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
+    line(rvvFloatType(reduction) + " " + seed + " = __riscv_vfmv_v_f_" +
+         rvvFloatSuffix(reduction) + "(" + maximum + ", 1);");
+    line(rvvFloatType(reduction) + " " + partial +
+         " = __riscv_vfredmax_vs_" + rvvFloatSuffix(data) + "_" +
+         rvvFloatSuffix(reduction) + "(" + inputVector + ", " + seed + ", " +
+         vl + ");");
+    line(maximum + " = __riscv_vfmv_f_s_" + rvvFloatSuffix(reduction) +
+         "_f32(" + partial + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
@@ -2684,23 +2783,29 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
-         " - " +
-         strip + ");");
-    line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(data) + " " + inputVector + " = __riscv_vle" +
+         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
          decision.firstPointer + " + " + strip + ", " + vl + ");");
-    line("vfloat32m2_t " + shifted + " = __riscv_vfsub_vf_f32m2(" +
+    line(rvvFloatType(data) + " " + shifted + " = __riscv_vfsub_vf_" +
+         rvvFloatSuffix(data) + "(" +
          inputVector + ", " + maximum + ", " + vl + ");");
-    line("vfloat32m2_t " + exponentials + " = __weft_exp_f32m2(" + shifted +
-         ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + decision.destinationPointer + " + " +
+    line(rvvFloatType(data) + " " + exponentials + " = __weft_exp_" +
+         rvvFloatSuffix(data) + "(" + shifted + ", " + vl + ");");
+    line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
+         rvvFloatSuffix(data) + "(" + decision.destinationPointer + " + " +
          strip + ", " + exponentials + ", " + vl + ");");
-    line("vfloat32m1_t " + sumSeed + " = __riscv_vfmv_v_f_f32m1(" + sum +
+    line(rvvFloatType(reduction) + " " + sumSeed +
+         " = __riscv_vfmv_v_f_" + rvvFloatSuffix(reduction) + "(" + sum +
          ", 1);");
-    line("vfloat32m1_t " + sumPartial +
-         " = __riscv_vfredusum_vs_f32m2_f32m1(" + exponentials + ", " +
-         sumSeed + ", " + vl + ");");
-    line(sum + " = __riscv_vfmv_f_s_f32m1_f32(" + sumPartial + ");");
+    line(rvvFloatType(reduction) + " " + sumPartial +
+         " = __riscv_vfredusum_vs_" + rvvFloatSuffix(data) + "_" +
+         rvvFloatSuffix(reduction) + "(" + exponentials + ", " + sumSeed +
+         ", " + vl + ");");
+    line(sum + " = __riscv_vfmv_f_s_" + rvvFloatSuffix(reduction) +
+         "_f32(" + sumPartial + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
@@ -2711,14 +2816,16 @@ private:
     line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
          " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
-         " - " +
-         strip + ");");
-    line("vfloat32m2_t " + outputVector + " = __riscv_vle32_v_f32m2(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
+         decision.end + " - " + strip + ");");
+    line(rvvFloatType(data) + " " + outputVector + " = __riscv_vle" +
+         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
          decision.destinationPointer + " + " + strip + ", " + vl + ");");
-    line(outputVector + " = __riscv_vfmul_vf_f32m2(" + outputVector + ", " +
-         inverse + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + decision.destinationPointer + " + " +
+    line(outputVector + " = __riscv_vfmul_vf_" + rvvFloatSuffix(data) + "(" +
+         outputVector + ", " + inverse + ", " + vl + ");");
+    line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
+         rvvFloatSuffix(data) + "(" + decision.destinationPointer + " + " +
          strip + ", " + outputVector + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
