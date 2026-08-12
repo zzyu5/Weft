@@ -327,6 +327,17 @@ case "${kernel}" in
     dsl=examples/kernels/gather/get_rows_f32.py
     runtime=examples/repro/weft/gather/get_rows_f32_runtime.cpp
     ;;
+  weighted_embedding_bag)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 weighted_embedding_bag" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/gather/weighted_embedding_bag.py
+    runtime=examples/repro/weft/gather/weighted_embedding_bag_runtime.cpp
+    multi=1
+    multi_primary=weighted_embedding_bag_f32
+    multi_equivalent=weighted_embedding_bag_f32_equivalent
+    ;;
   add_id)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 add_id" >&2
