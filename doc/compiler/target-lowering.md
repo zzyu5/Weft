@@ -43,10 +43,13 @@ verifier、pipeline front door或长期provider registry。
 当前实现已经存在的transient physical decision包括：
 
 - 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
-  mode、activity、state realization和LMUL；位于nested scalar control中的access仍逐实体决策；
-- local F32 contract的operand axes、row microtile、pointer/stride relation与LMUL；含contract的
+  mode、activity、state realization和LMUL；F16/F32 cast与F16 fused multiply-add也拥有逐op
+  vector shape decision；位于nested scalar control中的access仍逐实体决策；
+- local F32 contract的operand axes、row microtile、pointer/stride relation、LMUL和resource
+  footprint；含contract的
   VLA region直接消费该LMUL来决定strip width、mask ratio与index LMUL，不保留第二份选择；
-- block decode的table extent、code/result vector shape与RVV gather realization；
+- block store/reduce的strip family、byte-vector shape、active length和lane-index需求；block
+  decode的table extent、code/result vector shape与RVV gather realization；
 - symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
   N16×K32 realization；
 - sign-bit×i8 primitive的block bases、scale/init operands与VLEN128 widening-sign-sum
@@ -54,9 +57,9 @@ verifier、pipeline front door或长期provider registry。
 - E2M1/E8M0×i8 primitive的packed-code/activation bases、exponent/scale/init operands与
   VLEN128 table-dot realization。
 
-这些decision不进入Kernel IR。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape
-和fragment；后续store、cast或leaf不能再根据use count、周围op数量或完整kernel source重新
-选择一次。
+这些decision不进入Kernel IR。每个decision由对应canonical primitive/contract的唯一owner
+产生。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape和fragment；后续store、
+cast或leaf不能再根据use count、周围op数量或完整kernel source重新选择一次。
 
 一个 family 只能绑定：
 
@@ -104,6 +107,9 @@ staging、ABI、logical predicate、state algebra或observable numerical mode。
 不变且legality成立时，可以改变物理loop形态，执行strip-mining、unroll、interchange、
 software pipeline与primitive-local fusion。
 
+这里的strip-mining只适用于source已经显式授权的VLA logical axis，或contract-local
+realization中的局部轴；普通canonical `for` / `while`不得因此被改写成新的VLA axis。
+
 ## 新语义与新硬件
 
 若新硬件只是更快实现现有语义，例如用矩阵fragment实现普通 `W.contract`，只增加
@@ -134,16 +140,21 @@ kernel family。
 
 ## 当前实现边界
 
-逐实体VLA memory/predicate/state/narrow、codebook decode、sign-bit/E2M1 local dot与symmetric
-IME fragment已经按上述模型工作。Local F32 contract根据block/VLA axis、typed operand、
-pointer/access与predicate projection选择row microtile，并已在dense/out-product及卷积坐标关系中
-复用。Block row extent由source保留；lowering当前根据局部row resource在row6/LMUL4与
-row8/LMUL1等配置间形成唯一physical decision。F32 free-axis family的microtile、unroll与
-pipeline候选仍然较窄。
+逐实体VLA memory/predicate/state/narrow、F16/F32 cast、F16 arithmetic、codebook decode、
+sign-bit/E2M1 local dot与symmetric IME fragment已经按上述模型工作。此前F16 fill、F32→F16、
+F16 weighted update和F16→F32 normalize四条whole-region realization已经由generic VLA
+access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择也已移出emitter，
+成为明确physical decision。
 
-较早的F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
-F16 GEMM nested loop与affine Q4_K IME N/K envelope仍要求较精确的region/use/loop closure；这些
-closure现在只在analysis中形成短生命周期的typed physical decision，emitter只消费已经选定的
-pointer、bound、tile、stride、layout与realization，不再边打印边重建选择。它们因此已经消除
-emission-time第二authority，但尚未获得更宽的等价source接受范围。新增能力应扩展局部decision
-的语义输入和物理候选，不能重新增加whole-kernel try-emitter。
+Local F32 contract根据block/VLA axis、typed operand、pointer/access与predicate projection形成
+resource model，再从局部candidate中选择LMUL；当前local-row候选会随row extent选择LMUL4/2/1，
+VLA free-axis候选也共用同一selector。`kUnroll`已经物化但当前合法winner仍为1；multi-axis
+microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是
+开放注册表或通用搜索承诺。
+
+当前仍有两个精确的局部VLA fusion envelope：F16 widening dot将显式load/cast/multiply/reduce
+闭包实现为widening MAC，online-softmax envelope联合相邻summary producer与normalize
+consumer。F16 GEMM nested loop和affine Q4_K IME N/K closure也仍要求较精确的局部loop关系。
+它们都从typed source relation产生decision，不读取kernel名，也不接管public ABI或外围
+traversal；但尚未获得更宽的等价source接受范围。新增能力应扩展局部decision的合法语义输入
+与physical candidate，不能重新增加whole-kernel try-emitter。

@@ -45,6 +45,8 @@ for k in W.range(...):
 是普通顺序 carry，不会被自动提升为 `W.contract`，也不会获得 register microtile / matrix extension 的完整调优自由度。
 
 作者必须显式使用 `W.contract` 才把局部 contraction decomposition 权交给 target lowering。
+同理，普通scalar loop即使位于`W.vla`内部也仍是有序carry；target不能把它重新解释为第二个
+VLA axis、scan或contract。
 
 ### 三层辖域
 
@@ -77,6 +79,10 @@ Target lowering 拥有：
 ### Packing 边界
 
 Target lowering 只能自动决定 contract-local、短生命周期且不会越过 primitive 边界的 packing/scratch。
+
+Source-owned blocking、persistent layout、staging与algorithmic producer关系只由source和
+Kernel IR定义。Target可以消费这些关系形成local reuse或fusion decision，但不得重建、替换
+或跨越它们。
 
 以下行为必须进入 source 或独立显式 primitive：
 

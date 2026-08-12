@@ -73,12 +73,22 @@ canonical primitive
 + explicit backend config
 ```
 
+授权边界固定为：普通scalar loop保持作者写下的有序traversal，不能自动变成VLA；只有显式
+`weft_kernel.vla`授权SIMD logical axis；只有显式`weft_kernel.contract`授权局部contraction
+重组。Reduce、scan、summary fold与sequential carry是四种不同语义，不能按use graph互换。
+Blocking、staging、persistent packing、outer traversal和算法variant只由source/Kernel IR
+定义，target-local fusion不得重建或替换这些关系。
+
 局部 lowering 可以吸收相邻的纯 decode、cast、scale、packing producer 或 consumer，也可
 在不改变 source loop/state boundary 的前提下联合安排相邻 primitive。选择 authority必须
 锚定 canonical primitive/interface及其block axis、typed operand、access/use projection，
 不能把整个loop nest归类成一个`KernelKind`，也不得用完整 kernel shape或symbol选择模板。
 无法合法生成时直接报unsupported；不存在 legacy、GGML 或旧 emitter fallback。普通 scalar
 control的 C lowering是正式 realization，不是 fallback。
+
+每个physical decision只有一个producer。Analysis/selection可以读取typed operands、axis、
+effect、局部use relation和target facts来产生该decision；intrinsic-C/asm emitter只读取它，
+不得再按use-count、相邻op数量或完整kernel source重新选择物理形态。
 
 ## 定位一句话
 

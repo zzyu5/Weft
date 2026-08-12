@@ -110,9 +110,12 @@ Canonical Weft language 中不存在：
 - block 之间的顺序与状态；
 - memory effect 与 atomic/fence。
 
-编译器可以做保持语义的 strip-mining、canonicalization、unroll、interchange、hoist、
-rematerialization、software pipelining 和局部 scheduling。它可以改变物理循环形态，但不得
-改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
+普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器可以对它做保持语义的
+unroll、interchange、hoist、rematerialization、software pipelining 和局部 scheduling，
+但不得把它重新分类为 VLA logical axis，也不得从普通 scalar multiply/add 猜出 contract。
+只有 source 显式写出的 `W.vla` / `W.contract` 才分别授权 SIMD logical axis 与局部
+contraction domain。VLA 内部可以做 strip-mining；contract 内部可以重组 reduction。两者都
+不得改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
 algorithmic loop、state 与 staging 骨架。
 
 
