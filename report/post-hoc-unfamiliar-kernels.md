@@ -83,9 +83,9 @@ q6_k_i8_dot
 
 IQ2_S、IQ1_M 使用 RVV gather/widen/dot，IQ3_S 使用局部 decoded buffer 加 RVV dot；Q6_K 使用一个只拥有单个 256-element block 的 inline-asm leaf。它们都不拥有 outer block loop、完整 kernel ABI 或 persistent packing，也不调用 GGML 或 `materials/`。代码表和 RVV/asm 组织是从成熟实现重新吸收进 production lowering 的本地实现知识。
 
-## 最终连续重测
+## 最终有效重测
 
-所有数字来自同一次最终连续执行。每次样本前触碰 64 MiB eviction buffer；六个通用 kernel 取 10 次中位数，四个全投影量化 kernel 取 3 次中位数。Correctness 覆盖 runtime 声明的全部输出；量化四项比较全部 14336 rows，而不是抽样行。
+每个数字都来自对应 kernel 最后一次有效执行。每次样本前触碰 64 MiB eviction buffer；六个通用 kernel 取 10 次中位数，四个全投影量化 kernel 取 3 次中位数。Correctness 覆盖 runtime 声明的全部输出；量化四项比较全部 14336 rows，而不是抽样行。
 
 | Kernel | shape | realization | error（abs / rel） | median | throughput |
 |---|---|---|---:|---:|---:|
