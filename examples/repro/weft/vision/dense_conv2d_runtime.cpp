@@ -7,7 +7,8 @@
 #include <vector>
 
 extern "C" void dense_conv2d_f32(
-    const float *source, const float *weight, float *output, std::size_t batch,
+    const float *source, const float *weight, float *output,
+    float *packed_patches, float *packed_weight, std::size_t batch,
     std::size_t input_height, std::size_t input_width,
     std::size_t input_channels, std::size_t output_channels,
     std::size_t kernel_height, std::size_t kernel_width,
@@ -99,6 +100,10 @@ int main() {
   std::vector<float> source(inputElements);
   std::vector<float> weight(weightElements);
   std::vector<float> output(outputElements);
+  std::vector<float> packedPatches(kBatch * kOutputHeight * kOutputWidth *
+                                   kInputChannels * kKernelHeight *
+                                   kKernelWidth);
+  std::vector<float> packedWeight(weightElements);
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] =
         static_cast<float>(static_cast<int>(index % 127U) - 63) / 256.0F;
@@ -108,8 +113,9 @@ int main() {
         512.0F;
 
   dense_conv2d_f32(
-      source.data(), weight.data(), output.data(), kBatch, kInputHeight,
-      kInputWidth, kInputChannels, kOutputChannels, kKernelHeight,
+      source.data(), weight.data(), output.data(), packedPatches.data(),
+      packedWeight.data(), kBatch, kInputHeight, kInputWidth, kInputChannels,
+      kOutputChannels, kKernelHeight,
       kKernelWidth, kOutputHeight, kOutputWidth, 1, 1, kPadding, kPadding, 1,
       1);
   const std::size_t sampleChannels[] = {0, 127, 255};
@@ -140,8 +146,9 @@ int main() {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
     dense_conv2d_f32(
-        source.data(), weight.data(), output.data(), kBatch, kInputHeight,
-        kInputWidth, kInputChannels, kOutputChannels, kKernelHeight,
+        source.data(), weight.data(), output.data(), packedPatches.data(),
+        packedWeight.data(), kBatch, kInputHeight, kInputWidth, kInputChannels,
+        kOutputChannels, kKernelHeight,
         kKernelWidth, kOutputHeight, kOutputWidth, 1, 1, kPadding, kPadding, 1,
         1);
     const auto end = std::chrono::steady_clock::now();
