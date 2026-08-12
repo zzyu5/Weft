@@ -2285,8 +2285,27 @@ private:
                    VLAStateRealization::RVVOnlineSoftmaxSummary)
             primitiveGroups = std::max(primitiveGroups, 3 * candidate + 2);
         }
+        unsigned indexGroups = candidateFacts.indexedAccesses * candidate;
+        unsigned predicateGroups = 0;
+        for (const VLAPredicateDecision &predicate : decision.predicates) {
+          if (predicate.realization ==
+              VLAPredicateDecision::Realization::RVVVectorScalar) {
+            unsigned scaled = candidate * predicate.vectorSEW;
+            if (scaled % decision.physical.dataSEW != 0) {
+              predicateGroups = options.target.vectorRegisters;
+              break;
+            }
+            predicateGroups += scaled / decision.physical.dataSEW;
+          } else {
+            predicateGroups += options.target.xlen == 64 ? candidate * 2
+                                                         : candidate;
+          }
+        }
         unsigned regionGroups = maxEntityF32Vectors * candidate;
-        if (std::max(regionGroups, primitiveGroups) + 1 <
+        unsigned requiredGroups =
+            std::max(regionGroups,
+                     std::max(primitiveGroups, indexGroups + predicateGroups));
+        if (requiredGroups + 1 <
             static_cast<unsigned>(options.target.vectorRegisters)) {
           selected = candidate;
           break;
