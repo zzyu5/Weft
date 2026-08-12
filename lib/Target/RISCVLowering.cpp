@@ -302,10 +302,12 @@ struct VLAStateConsumerDecision {
   VLAStateConsumerRealization realization =
       VLAStateConsumerRealization::RVVStagedExpNormalize;
   mlir::Operation *consumerRegion = nullptr;
-  std::string begin;
-  std::string end;
-  std::string inputPointer;
-  std::string outputPointer;
+  mlir::Value begin;
+  mlir::Value end;
+  mlir::Value inputPointer;
+  mlir::Value inputCoordinate;
+  mlir::Value outputPointer;
+  mlir::Value outputCoordinate;
   RVVVectorConfig dataShape{32, 2};
   RVVVectorConfig reductionShape{32, 1};
   VLAStatePlacement placement = VLAStatePlacement::StackScratch;
@@ -372,6 +374,19 @@ struct VLARegionDecision {
   std::vector<VLAStateDecision> states;
   std::vector<VLANarrowDecision> narrows;
   std::vector<VLAContractDecision> contracts;
+};
+
+struct VLACandidateFacts {
+  unsigned f32Loads = 0;
+  unsigned f32Stores = 0;
+  unsigned stridedAccesses = 0;
+  unsigned nestedScalarLoops = 0;
+  unsigned reductionStates = 0;
+  unsigned maxEntityF32Vectors = 0;
+  bool hasOrderedScan = false;
+  bool hasCoordinateSummary = false;
+  bool hasOnlineSummary = false;
+  bool requiresF32M2Math = false;
 };
 
 std::string rvvFloatSuffix(const RVVVectorConfig &config) {
@@ -889,6 +904,20 @@ public:
 private:
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
+    kernel.walk([&](VLAOp vla) {
+      if (decisionFailure)
+        return;
+      mlir::FailureOr<VLARegionDecision> decision = decideVLARegion(vla);
+      if (mlir::failed(decision)) {
+        decisionFailure = true;
+        return;
+      }
+      if (!vlaDecisions.try_emplace(vla.getOperation(), std::move(*decision))
+               .second) {
+        vla.emitError("one VLA region cannot own multiple physical decisions");
+        decisionFailure = true;
+      }
+    });
     kernel.walk([&](AffineI4I8ContractOp contract) {
       if (decisionFailure)
         return;
@@ -925,6 +954,68 @@ private:
         f16ContractDecisions.try_emplace(nLoop.getOperation(),
                                          std::move(*decision));
     });
+    kernel.walk([&](StoreOp store) {
+      if (decisionFailure || isRegionValue(store.getValue().getType()))
+        return;
+      auto contract = store.getValue().getDefiningOp<ContractOp>();
+      if (!contract || !contract.getResult().hasOneUse())
+        return;
+      mlir::FailureOr<ContractDecision> decision =
+          decideLocalF32RowMicrotile(store, contract);
+      if (mlir::failed(decision)) {
+        decisionFailure = true;
+        return;
+      }
+      if (!localF32ContractDecisions
+               .try_emplace(store.getOperation(), std::move(*decision))
+               .second) {
+        store.emitError("one store cannot own multiple local contract decisions");
+        decisionFailure = true;
+      }
+    });
+    kernel.walk([&](SymmetricI4I8ContractOp op) {
+      if (decisionFailure)
+        return;
+      SymmetricI4I8Decision decision;
+      if (mlir::failed(decideSymmetricI4I8Contract(op, decision))) {
+        decisionFailure = true;
+        return;
+      }
+      symmetricI4I8Decisions.try_emplace(op.getOperation(),
+                                         std::move(decision));
+    });
+    kernel.walk([&](SignBitI8DotOp op) {
+      if (decisionFailure)
+        return;
+      SignBitI8Decision decision;
+      if (mlir::failed(decideSignBitI8Dot(op, decision))) {
+        decisionFailure = true;
+        return;
+      }
+      signBitI8Decisions.try_emplace(op.getOperation(), std::move(decision));
+    });
+    kernel.walk([&](E2M1E8M0I8DotOp op) {
+      if (decisionFailure)
+        return;
+      E2M1E8M0I8Decision decision;
+      if (mlir::failed(decideE2M1E8M0I8Dot(op, decision))) {
+        decisionFailure = true;
+        return;
+      }
+      e2m1E8M0I8Decisions.try_emplace(op.getOperation(),
+                                      std::move(decision));
+    });
+    kernel.walk([&](GroupedAffineI4I8DotOp op) {
+      if (decisionFailure)
+        return;
+      GroupedAffineI4I8Decision decision;
+      if (mlir::failed(decideGroupedAffineI4I8Dot(op, decision))) {
+        decisionFailure = true;
+        return;
+      }
+      groupedAffineI4I8Decisions.try_emplace(op.getOperation(),
+                                             std::move(decision));
+    });
     if (decisionFailure)
       return mlir::failure();
     return mlir::success();
@@ -933,10 +1024,20 @@ private:
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
+  llvm::DenseMap<mlir::Operation *, VLARegionDecision> vlaDecisions;
   llvm::DenseMap<mlir::Operation *, AffineI4I8NTileDecision>
       affineI4I8Decisions;
   llvm::DenseMap<mlir::Operation *, F16GemmNTileDecision>
       f16ContractDecisions;
+  llvm::DenseMap<mlir::Operation *, ContractDecision>
+      localF32ContractDecisions;
+  llvm::DenseMap<mlir::Operation *, SymmetricI4I8Decision>
+      symmetricI4I8Decisions;
+  llvm::DenseMap<mlir::Operation *, SignBitI8Decision> signBitI8Decisions;
+  llvm::DenseMap<mlir::Operation *, E2M1E8M0I8Decision>
+      e2m1E8M0I8Decisions;
+  llvm::DenseMap<mlir::Operation *, GroupedAffineI4I8Decision>
+      groupedAffineI4I8Decisions;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -1661,6 +1762,34 @@ private:
           return unary && unary.getKind() == "exp" &&
                  isRegionValue(unary.getResult().getType());
         });
+    VLACandidateFacts candidateFacts;
+    candidateFacts.maxEntityF32Vectors = maxEntityF32Vectors;
+    candidateFacts.requiresF32M2Math = requiresF32M2Math;
+    for (const VLAAccessDecision &access : decision.accesses) {
+      candidateFacts.stridedAccesses +=
+          access.memoryMode == VLAMemoryMode::Strided;
+      if (access.elementType.isF32()) {
+        candidateFacts.f32Loads += mlir::isa<LoadOp>(access.operation);
+        candidateFacts.f32Stores += mlir::isa<StoreOp>(access.operation);
+      }
+    }
+    for (mlir::Operation *operation : physicalOperations) {
+      auto loop = mlir::dyn_cast<ForOp>(operation);
+      if (!loop)
+        continue;
+      ++candidateFacts.nestedScalarLoops;
+    }
+    for (const VLAStateDecision &state : decision.states) {
+      candidateFacts.reductionStates +=
+          state.realization == VLAStateRealization::RVVAddReduction ||
+          state.realization == VLAStateRealization::RVVMaxReduction;
+      candidateFacts.hasOrderedScan |=
+          state.realization == VLAStateRealization::RVVInclusiveAddScan;
+      candidateFacts.hasCoordinateSummary |=
+          state.realization == VLAStateRealization::RVVArgMaxSummary;
+      candidateFacts.hasOnlineSummary |=
+          state.realization == VLAStateRealization::RVVOnlineSoftmaxSummary;
+    }
     if (decision.contracts.empty() && decision.narrows.empty() &&
         decision.states.empty() && decision.predicates.empty() &&
         !hasF32RegionValue && onlyF16Accesses) {
@@ -1687,34 +1816,26 @@ private:
         }
         candidates.push_back(requested);
       } else {
-        bool onlineSummary = llvm::any_of(
-            decision.states, [](const VLAStateDecision &state) {
-              return state.realization ==
-                     VLAStateRealization::RVVOnlineSoftmaxSummary;
-            });
-        bool orderedScan = llvm::any_of(
-            decision.states, [](const VLAStateDecision &state) {
-              return state.realization ==
-                     VLAStateRealization::RVVInclusiveAddScan;
-            });
-        bool coordinateSummary = llvm::any_of(
-            decision.states, [](const VLAStateDecision &state) {
-              return state.realization == VLAStateRealization::RVVArgMaxSummary;
-            });
-        bool hasStridedMemory = llvm::any_of(
-            decision.accesses, [](const VLAAccessDecision &access) {
-              return access.memoryMode == VLAMemoryMode::Strided;
-            });
-        if (requiresF32M2Math || onlineSummary)
+        if (candidateFacts.requiresF32M2Math ||
+            candidateFacts.hasOnlineSummary)
           candidates = {2};
-        else if (orderedScan)
+        else if (candidateFacts.hasOrderedScan)
           candidates = {1, 2, 4, 8};
-        else if (coordinateSummary)
+        else if (candidateFacts.hasCoordinateSummary)
           candidates = {4, 2, 1, 8};
-        else if (hasStridedMemory)
+        else if (candidateFacts.reductionStates > 0)
+          candidates = candidateFacts.reductionStates > 1
+                           ? llvm::SmallVector<unsigned>{4, 2, 1, 8}
+                           : llvm::SmallVector<unsigned>{8, 4, 2, 1};
+        else if (candidateFacts.stridedAccesses > 0)
           candidates = {2, 4, 1, 8};
-        else
+        else if (candidateFacts.nestedScalarLoops > 0)
           candidates = {8, 4, 2, 1};
+        else if (candidateFacts.f32Loads + candidateFacts.f32Stores >= 6 ||
+                 candidateFacts.maxEntityF32Vectors >= 4)
+          candidates = {4, 2, 1, 8};
+        else
+          candidates = {4, 2, 8, 1};
       }
       std::optional<unsigned> selected;
       for (unsigned candidate : candidates) {
@@ -2341,10 +2462,10 @@ private:
     if (!options.target.hasRVV)
       return op.emitError(
           "VLA requires RVV on the selected target; no scalar fallback exists");
-    mlir::FailureOr<VLARegionDecision> selected = decideVLARegion(op);
-    if (mlir::failed(selected))
-      return mlir::failure();
-    VLARegionDecision decision = std::move(*selected);
+    auto selected = vlaDecisions.find(op.getOperation());
+    if (selected == vlaDecisions.end())
+      return op.emitError("VLA physical decision was not prepared");
+    const VLARegionDecision &decision = selected->second;
     llvm::SmallVector<const VLAStateDecision *> fusedStates;
     for (const VLAStateDecision &state : decision.states)
       if (state.consumer)
@@ -2652,12 +2773,52 @@ private:
     return valueDependsOn(value, target, visited);
   }
 
-  bool sameBound(mlir::Value lhs, mlir::Value rhs) {
+  bool sameBound(mlir::Value lhs, mlir::Value rhs) const {
     if (lhs == rhs)
       return true;
-    std::string lhsExpression = expression(lhs);
-    std::string rhsExpression = expression(rhs);
-    return !lhsExpression.empty() && lhsExpression == rhsExpression;
+    auto lhsConstant = lhs.getDefiningOp<ConstantOp>();
+    auto rhsConstant = rhs.getDefiningOp<ConstantOp>();
+    if (lhsConstant && rhsConstant)
+      return lhsConstant.getValue() == rhsConstant.getValue();
+    auto lhsMeta = lhs.getDefiningOp<MetaValueOp>();
+    auto rhsMeta = rhs.getDefiningOp<MetaValueOp>();
+    return lhsMeta && rhsMeta && lhsMeta.getInput() == rhsMeta.getInput();
+  }
+
+  bool sameAddressFact(mlir::Value lhs, mlir::Value lhsCoordinate,
+                       mlir::Value rhs, mlir::Value rhsCoordinate) const {
+    if (lhs == lhsCoordinate || rhs == rhsCoordinate)
+      return lhs == lhsCoordinate && rhs == rhsCoordinate;
+    if (lhs == rhs)
+      return true;
+    auto lhsConstant = lhs.getDefiningOp<ConstantOp>();
+    auto rhsConstant = rhs.getDefiningOp<ConstantOp>();
+    if (lhsConstant || rhsConstant)
+      return lhsConstant && rhsConstant &&
+             lhsConstant.getValue() == rhsConstant.getValue();
+    auto lhsPointer = lhs.getDefiningOp<PtrAddOp>();
+    auto rhsPointer = rhs.getDefiningOp<PtrAddOp>();
+    if (lhsPointer || rhsPointer)
+      return lhsPointer && rhsPointer &&
+             sameAddressFact(lhsPointer.getBase(), lhsCoordinate,
+                             rhsPointer.getBase(), rhsCoordinate) &&
+             sameAddressFact(lhsPointer.getOffset(), lhsCoordinate,
+                             rhsPointer.getOffset(), rhsCoordinate);
+    auto lhsBinary = lhs.getDefiningOp<BinaryOp>();
+    auto rhsBinary = rhs.getDefiningOp<BinaryOp>();
+    if (lhsBinary || rhsBinary)
+      return lhsBinary && rhsBinary &&
+             lhsBinary.getKind() == rhsBinary.getKind() &&
+             sameAddressFact(lhsBinary.getLhs(), lhsCoordinate,
+                             rhsBinary.getLhs(), rhsCoordinate) &&
+             sameAddressFact(lhsBinary.getRhs(), lhsCoordinate,
+                             rhsBinary.getRhs(), rhsCoordinate);
+    auto lhsCast = lhs.getDefiningOp<CastOp>();
+    auto rhsCast = rhs.getDefiningOp<CastOp>();
+    return lhsCast && rhsCast &&
+           lhsCast.getResult().getType() == rhsCast.getResult().getType() &&
+           sameAddressFact(lhsCast.getInput(), lhsCoordinate,
+                           rhsCast.getInput(), rhsCoordinate);
   }
 
   std::optional<VLAStateConsumerDecision>
@@ -2744,16 +2905,8 @@ private:
                 (!outputType.getNoAlias() && !outputType.getRestrictLike()))
               continue;
 
-            std::optional<std::string> producerInput =
-                pointerBase(producerLoad.getPointer(), producerCoordinate);
-            std::optional<std::string> consumerInput =
-                pointerBase(load.getPointer(), consumerCoordinate);
-            std::optional<std::string> output =
-                pointerBase(store.getPointer(), consumerCoordinate);
-            std::string begin = expression(producer.getBegin());
-            std::string end = expression(producer.getEnd());
-            if (!producerInput || !consumerInput || !output ||
-                *producerInput != *consumerInput || begin.empty() || end.empty())
+            if (!sameAddressFact(producerLoad.getPointer(), producerCoordinate,
+                                 load.getPointer(), consumerCoordinate))
               continue;
             llvm::DenseSet<mlir::Operation *> absorbed;
             llvm::SmallVector<BlockAxisOp> axes;
@@ -2790,10 +2943,12 @@ private:
             VLAStateConsumerDecision decision;
             decision.placement = VLAStatePlacement::StackScratch;
             decision.consumerRegion = consumer.getOperation();
-            decision.begin = std::move(begin);
-            decision.end = std::move(end);
-            decision.inputPointer = std::move(*producerInput);
-            decision.outputPointer = std::move(*output);
+            decision.begin = producer.getBegin();
+            decision.end = producer.getEnd();
+            decision.inputPointer = producerLoad.getPointer();
+            decision.inputCoordinate = producerCoordinate;
+            decision.outputPointer = store.getPointer();
+            decision.outputCoordinate = consumerCoordinate;
             decision.absorbed.append(absorbed.begin(), absorbed.end());
             decision.absorbed.push_back(store.getOperation());
             return decision;
@@ -3675,14 +3830,11 @@ private:
 
   std::optional<mlir::LogicalResult>
   tryEmitLocalF32ContractBlockStore(StoreOp store) {
-    auto contract = store.getValue().getDefiningOp<ContractOp>();
-    if (!contract)
+    auto selected = localF32ContractDecisions.find(store.getOperation());
+    if (selected == localF32ContractDecisions.end())
       return std::nullopt;
-    mlir::FailureOr<ContractDecision> selected =
-        decideLocalF32RowMicrotile(store, contract);
-    if (mlir::failed(selected))
-      return mlir::failure();
-    ContractDecision decision = *selected;
+    const ContractDecision &decision = selected->second;
+    auto contract = mlir::cast<ContractOp>(decision.operation);
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
     std::string extent = expression(decision.reductionExtent);
@@ -4259,9 +4411,10 @@ private:
 
   mlir::LogicalResult emitSymmetricI4I8Contract(
       SymmetricI4I8ContractOp op) {
-    SymmetricI4I8Decision decision;
-    if (mlir::failed(decideSymmetricI4I8Contract(op, decision)))
-      return mlir::failure();
+    auto selected = symmetricI4I8Decisions.find(op.getOperation());
+    if (selected == symmetricI4I8Decisions.end())
+      return op.emitError("symmetric i4/i8 physical decision was not prepared");
+    const SymmetricI4I8Decision &decision = selected->second;
     CValue activation = require(decision.activationBlockBase);
     CValue packed = require(decision.packedBlockBase);
     CValue scale = require(decision.activationScale);
@@ -4364,9 +4517,10 @@ private:
   }
 
   mlir::LogicalResult emitSignBitI8Dot(SignBitI8DotOp op) {
-    SignBitI8Decision decision;
-    if (mlir::failed(decideSignBitI8Dot(op, decision)))
-      return mlir::failure();
+    auto prepared = signBitI8Decisions.find(op.getOperation());
+    if (prepared == signBitI8Decisions.end())
+      return op.emitError("sign-bit/i8 physical decision was not prepared");
+    const SignBitI8Decision &decision = prepared->second;
     CValue signBits = require(decision.signBitsBase);
     CValue activation = require(decision.activationBase);
     CValue activationScale = require(decision.activationScale);
@@ -4466,9 +4620,10 @@ private:
   }
 
   mlir::LogicalResult emitE2M1E8M0I8Dot(E2M1E8M0I8DotOp op) {
-    E2M1E8M0I8Decision decision;
-    if (mlir::failed(decideE2M1E8M0I8Dot(op, decision)))
-      return mlir::failure();
+    auto selected = e2m1E8M0I8Decisions.find(op.getOperation());
+    if (selected == e2m1E8M0I8Decisions.end())
+      return op.emitError("E2M1/E8M0 physical decision was not prepared");
+    const E2M1E8M0I8Decision &decision = selected->second;
     CValue packed = require(decision.packedCodesBase);
     CValue activation = require(decision.activationBase);
     CValue exponent = require(decision.exponent);
@@ -4588,9 +4743,10 @@ private:
   }
 
   mlir::LogicalResult emitGroupedAffineI4I8Dot(GroupedAffineI4I8DotOp op) {
-    GroupedAffineI4I8Decision decision;
-    if (mlir::failed(decideGroupedAffineI4I8Dot(op, decision)))
-      return mlir::failure();
+    auto selected = groupedAffineI4I8Decisions.find(op.getOperation());
+    if (selected == groupedAffineI4I8Decisions.end())
+      return op.emitError("grouped affine i4/i8 physical decision was not prepared");
+    const GroupedAffineI4I8Decision &decision = selected->second;
 
     CValue packed = require(decision.packedWeightBase);
     CValue scales = require(decision.scaleMinBase);
@@ -6605,6 +6761,16 @@ private:
     if (consumer.placement != VLAStatePlacement::StackScratch)
       return producer.emitError("online summary state placement is unavailable");
 
+    std::string begin = expression(consumer.begin);
+    std::string end = expression(consumer.end);
+    std::optional<std::string> inputPointer =
+        pointerBase(consumer.inputPointer, consumer.inputCoordinate);
+    std::optional<std::string> outputPointer =
+        pointerBase(consumer.outputPointer, consumer.outputCoordinate);
+    if (begin.empty() || end.empty() || !inputPointer || !outputPointer)
+      return producer.emitError(
+          "online summary physical operands could not be projected");
+
     const RVVVectorConfig &data = consumer.dataShape;
     const RVVVectorConfig &reduction = consumer.reductionShape;
     std::string maximum = fresh("summary_max");
@@ -6620,15 +6786,15 @@ private:
     std::string sumPartial = fresh("summary_sum_partial");
     std::string scratch = fresh("summary_scratch");
     line("float " + maximum + " = -INFINITY;");
-    line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
-         " < " + consumer.end + ";) {");
+    line("for (size_t " + strip + " = " + begin + "; " + strip +
+         " < " + end + ";) {");
     ++indent;
     line("const size_t " + vl + " = __riscv_vsetvl_e" +
          std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         consumer.end + " - " + strip + ");");
+         end + " - " + strip + ");");
     line(rvvFloatType(data) + " " + input + " = __riscv_vle" +
          std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         consumer.inputPointer + " + " + strip + ", " + vl + ");");
+         *inputPointer + " + " + strip + ", " + vl + ");");
     line(rvvFloatType(reduction) + " " + seed + " = __riscv_vfmv_v_f_" +
          rvvFloatSuffix(reduction) + "(" + maximum + ", 1);");
     line(rvvFloatType(reduction) + " " + partial +
@@ -6641,18 +6807,18 @@ private:
     --indent;
     line("}");
 
-    line("float " + scratch + "[" + consumer.end + " - " + consumer.begin +
+    line("float " + scratch + "[" + end + " - " + begin +
          "];");
     line("float " + sum + " = 0.0f;");
-    line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
-         " < " + consumer.end + ";) {");
+    line("for (size_t " + strip + " = " + begin + "; " + strip +
+         " < " + end + ";) {");
     ++indent;
     line("const size_t " + vl + " = __riscv_vsetvl_e" +
          std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         consumer.end + " - " + strip + ");");
+         end + " - " + strip + ");");
     line(rvvFloatType(data) + " " + input + " = __riscv_vle" +
          std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         consumer.inputPointer + " + " + strip + ", " + vl + ");");
+         *inputPointer + " + " + strip + ", " + vl + ");");
     line(rvvFloatType(data) + " " + shifted + " = __riscv_vfsub_vf_" +
          rvvFloatSuffix(data) + "(" + input + ", " + maximum + ", " + vl +
          ");");
@@ -6660,7 +6826,7 @@ private:
          rvvFloatSuffix(data) + "(" + shifted + ", " + vl + ");");
     line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
          rvvFloatSuffix(data) + "(" + scratch + " + " + strip + " - " +
-         consumer.begin + ", " + exponentials + ", " + vl + ");");
+         begin + ", " + exponentials + ", " + vl + ");");
     line(rvvFloatType(reduction) + " " + sumSeed +
          " = __riscv_vfmv_v_f_" + rvvFloatSuffix(reduction) + "(" + sum +
          ", 1);");
@@ -6676,20 +6842,20 @@ private:
 
     std::string inverse = fresh("summary_inverse");
     line("const float " + inverse + " = 1.0f / " + sum + ";");
-    line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
-         " < " + consumer.end + ";) {");
+    line("for (size_t " + strip + " = " + begin + "; " + strip +
+         " < " + end + ";) {");
     ++indent;
     line("const size_t " + vl + " = __riscv_vsetvl_e" +
          std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         consumer.end + " - " + strip + ");");
+         end + " - " + strip + ");");
     line(rvvFloatType(data) + " " + exponentials + " = __riscv_vle" +
          std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         scratch + " + " + strip + " - " + consumer.begin + ", " + vl +
+         scratch + " + " + strip + " - " + begin + ", " + vl +
          ");");
     line(exponentials + " = __riscv_vfmul_vf_" + rvvFloatSuffix(data) + "(" +
          exponentials + ", " + inverse + ", " + vl + ");");
     line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
-         rvvFloatSuffix(data) + "(" + consumer.outputPointer + " + " + strip +
+         rvvFloatSuffix(data) + "(" + *outputPointer + " + " + strip +
          ", " + exponentials + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
