@@ -4210,6 +4210,15 @@ private:
       return op.emitError(
           "IME1 symmetric contraction requires sixteen little-endian fp16 scales");
     mlir::Value packedBase = scaleLane.getBase();
+    auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
+    mlir::Value packedBlockIndex;
+    int64_t packedBlockBytes = 288;
+    if (!packedPointer ||
+        !matchBinaryConstant(packedPointer.getOffset(), "mul",
+                             packedBlockBytes, packedBlockIndex))
+      return op.emitError(
+          "IME1 symmetric contraction requires the explicit 288-byte persistent packed block");
+    (void)packedBlockIndex;
 
     auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
     auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
@@ -4249,6 +4258,7 @@ private:
     decision.packedBlockBase = packedBase;
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
+    decision.packedBlockBytes = packedBlockBytes;
     return mlir::success();
   }
 
@@ -4688,11 +4698,14 @@ private:
     auto init = kLoop.getInitArgs().front().getDefiningOp<FullOp>();
     if (!init || !isFloatConstant(init.getValue(), 0.0))
       return reject("IME1 lowering requires the explicit contraction accumulator to start at zero");
-    if (integerConstant(nLoop.getLower()) != 0 ||
-        integerConstant(nLoop.getStep()) != 16 ||
+    std::optional<int64_t> selectedNTile = integerConstant(nLoop.getStep());
+    int64_t kBlock = 32;
+    int64_t packedBlockBytes = 304;
+    if (integerConstant(nLoop.getLower()) != 0 || selectedNTile != 16 ||
         integerConstant(kLoop.getLower()) != 0 ||
         integerConstant(kLoop.getStep()) != 1)
       return reject("IME1 lowering requires the source-declared N16 and K-block traversal");
+    int64_t nTile = *selectedNTile;
 
     LoadOp activationLoad = contract.getActivation().getDefiningOp<LoadOp>();
     LoadOp activationScaleLoad =
@@ -4723,8 +4736,8 @@ private:
                        : PtrAddOp{};
     mlir::Value activationBlockIndex;
     if (!activationLane || !activationBlock ||
-        !matchBlockAxis(activationLane.getOffset(), 32) ||
-        !matchBinaryConstant(activationBlock.getOffset(), "mul", 32,
+        !matchBlockAxis(activationLane.getOffset(), kBlock) ||
+        !matchBinaryConstant(activationBlock.getOffset(), "mul", kBlock,
                              activationBlockIndex) ||
         activationBlockIndex != kCoordinate)
       return reject("IME1 lowering requires explicit contiguous K32 activation-code blocks");
@@ -4740,7 +4753,8 @@ private:
     auto outputLane = store.getPointer().getDefiningOp<PtrAddOp>();
     auto outputTile = outputLane ? outputLane.getBase().getDefiningOp<PtrAddOp>()
                                  : PtrAddOp{};
-    if (!outputLane || !outputTile || !matchBlockAxis(outputLane.getOffset(), 16) ||
+    if (!outputLane || !outputTile ||
+        !matchBlockAxis(outputLane.getOffset(), nTile) ||
         outputTile.getOffset() != nCoordinate)
       return reject("IME1 lowering requires an explicit contiguous N16 output tile");
     mlir::Value outputRow = outputTile.getBase();
@@ -4750,7 +4764,7 @@ private:
         zeroPointLane ? zeroPointLane.getBase().getDefiningOp<PtrAddOp>()
                       : PtrAddOp{};
     if (!zeroPointLane || !zeroPointBase ||
-        !matchBlockAxis(zeroPointLane.getOffset(), 16) ||
+        !matchBlockAxis(zeroPointLane.getOffset(), nTile) ||
         integerConstant(zeroPointBase.getOffset()) != 32)
       return reject("IME1 lowering requires the explicit sixteen-byte zero-point field");
     mlir::Value columnAxis = zeroPointLane.getOffset();
@@ -4791,13 +4805,13 @@ private:
         !expandedByte || expandedByte.getAxis() != 0 ||
         !expandedHalfByte || expandedHalfByte.getAxis() != 0 ||
         expandedHalfByte.getInput() != expandedByte.getInput() ||
-        !matchBlockAxis(expandedByte.getInput(), 16))
+        !matchBlockAxis(expandedByte.getInput(), nTile))
       return reject("IME1 lowering requires the source-declared packed-byte axis");
 
     auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
     mlir::Value linearBlock;
     if (!packedPointer ||
-        !matchBinaryConstant(packedPointer.getOffset(), "mul", 304,
+        !matchBinaryConstant(packedPointer.getOffset(), "mul", packedBlockBytes,
                              linearBlock))
       return reject("IME1 lowering requires the explicit 304-byte persistent packed block");
     auto blockAdd = linearBlock.getDefiningOp<BinaryOp>();
@@ -4823,7 +4837,7 @@ private:
     auto groupDivide = group.getDefiningOp<BinaryOp>();
     if (!groupDivide || groupDivide.getKind() != "div" ||
         groupDivide.getLhs() != nCoordinate ||
-        integerConstant(groupDivide.getRhs()) != 16)
+        integerConstant(groupDivide.getRhs()) != nTile)
       return reject("IME1 packed-block index must use the explicit N16 group");
 
     mlir::Value packedRoot = packedPointer.getBase();
@@ -4856,6 +4870,9 @@ private:
     decision.output = outputValue.spelling;
     decision.columns = columns;
     decision.blocks = blocks;
+    decision.nTile = static_cast<unsigned>(nTile);
+    decision.kBlock = static_cast<unsigned>(kBlock);
+    decision.packedBlockBytes = static_cast<unsigned>(packedBlockBytes);
     return decision;
   }
 
