@@ -119,6 +119,25 @@ struct BlockReducePhysicalDecision {
   bool needsLaneVector = false;
 };
 
+struct BlockStoreGroupDecision {
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *axis = nullptr;
+  int64_t extent = 0;
+  llvm::SmallVector<mlir::Operation *> stores;
+  llvm::SmallVector<mlir::Operation *> closure;
+  llvm::SmallVector<mlir::Operation *> interstitial;
+  BlockStorePhysicalDecision physical;
+};
+
+struct BlockReduceGroupDecision {
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *axis = nullptr;
+  int64_t extent = 0;
+  llvm::SmallVector<mlir::Operation *> reductions;
+  llvm::SmallVector<mlir::Operation *> closure;
+  BlockReducePhysicalDecision physical;
+};
+
 enum class SymmetricI4I8Realization {
   SpacemiTIME1N16K32,
 };
@@ -1031,6 +1050,8 @@ private:
         decisionFailure = true;
       }
     });
+    if (!decisionFailure && mlir::failed(prepareBlockGroupDecisions()))
+      decisionFailure = true;
     if (decisionFailure)
       return mlir::failure();
     return mlir::success();
@@ -1054,6 +1075,10 @@ private:
   llvm::DenseMap<mlir::Operation *, GroupedAffineI4I8Decision>
       groupedAffineI4I8Decisions;
   llvm::DenseMap<mlir::Operation *, BlockDecodeDecision> blockDecodeDecisions;
+  llvm::DenseMap<mlir::Operation *, BlockStoreGroupDecision>
+      blockStoreGroupDecisions;
+  llvm::DenseMap<mlir::Operation *, BlockReduceGroupDecision>
+      blockReduceGroupDecisions;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -5449,7 +5474,8 @@ private:
 
   mlir::LogicalResult collectBlockClosure(
       mlir::Value value, llvm::DenseSet<mlir::Operation *> &closure,
-      llvm::SmallVectorImpl<BlockAxisOp> &axes, mlir::Operation *owner) {
+      llvm::SmallVectorImpl<BlockAxisOp> &axes, mlir::Operation *owner,
+      bool markDiscarded = true) {
     if (!containsBlockType(value.getType()))
       return mlir::success();
     mlir::Operation *definition = value.getDefiningOp();
@@ -5469,7 +5495,8 @@ private:
       closure.insert(tuple.getOperation());
       for (auto [index, operand] : llvm::enumerate(tuple.getOperands())) {
         if (static_cast<int64_t>(index) == get.getIndex()) {
-          if (mlir::failed(collectBlockClosure(operand, closure, axes, owner)))
+          if (mlir::failed(collectBlockClosure(operand, closure, axes, owner,
+                                               markDiscarded)))
             return mlir::failure();
           continue;
         }
@@ -5480,7 +5507,7 @@ private:
                                      static_cast<int64_t>(index) &&
                      !otherGet.getResult().use_empty();
             });
-        if (!fieldIsLive)
+        if (!fieldIsLive && markDiscarded)
           markDiscardedBlockTree(operand);
       }
       return mlir::success();
@@ -5489,7 +5516,8 @@ private:
       axes.push_back(axis);
     for (mlir::Value operand : definition->getOperands())
       if (containsBlockType(operand.getType()) &&
-          mlir::failed(collectBlockClosure(operand, closure, axes, owner)))
+          mlir::failed(collectBlockClosure(operand, closure, axes, owner,
+                                           markDiscarded)))
         return mlir::failure();
     return mlir::success();
   }
@@ -6254,31 +6282,70 @@ private:
     return decision;
   }
 
-  mlir::LogicalResult emitBlockStores(StoreOp op) {
-    if (auto lowered = tryEmitLocalF32ContractBlockStore(op))
-      return *lowered;
-    auto blockExtent = [](mlir::Type type) -> std::optional<int64_t> {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      auto block = mlir::dyn_cast<BlockType>(type);
-      if (!block || block.getShape().size() != 1 ||
-          !block.getElementType().isF32())
-        return std::nullopt;
-      return block.getShape().front();
-    };
+  std::optional<int64_t> f32BlockExtent(mlir::Type type) const {
+    if (auto masked = mlir::dyn_cast<MaskedType>(type))
+      type = masked.getValueType();
+    auto block = mlir::dyn_cast<BlockType>(type);
+    if (!block || block.getShape().size() != 1 ||
+        !block.getElementType().isF32())
+      return std::nullopt;
+    return block.getShape().front();
+  }
 
-    std::optional<int64_t> extent = blockExtent(op.getValue().getType());
-    if (!extent || *extent <= 0 || *extent > 65535 ||
-        !isTrue(op.getWhere()))
+  bool isSupportedBlockReduction(ReduceOp reduction) const {
+    auto input = mlir::dyn_cast<BlockType>(reduction.getInput().getType());
+    return input && input.getShape().size() == 1 &&
+           reduction.getAxis() == 0 && reduction.getKind() == "add" &&
+           reduction.getResult().getType().isSignedInteger(32) &&
+           input.getElementType().isSignedInteger(32) &&
+           isTrue(reduction.getWhere());
+  }
+
+  bool isOwnedByPreparedRegion(mlir::Operation *operation) const {
+    if (operation->getParentOfType<VLAOp>())
+      return true;
+    for (mlir::Operation *parent = operation->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (affineI4I8Decisions.contains(parent) ||
+          f16ContractDecisions.contains(parent))
+        return true;
+    return false;
+  }
+
+  bool isMaterializedF32BlockStore(StoreOp store) const {
+    mlir::Operation *definition = store.getValue().getDefiningOp();
+    return mlir::isa_and_nonnull<FullOp, SymmetricI4I8ContractOp,
+                                 AffineI4I8ContractOp>(definition);
+  }
+
+  bool blockClosureEscapes(
+      const llvm::DenseSet<mlir::Operation *> &closure,
+      const llvm::DenseSet<mlir::Operation *> &owners) const {
+    for (mlir::Operation *operation : closure)
+      for (mlir::Value result : operation->getResults()) {
+        if (!containsBlockType(result.getType()))
+          continue;
+        for (mlir::Operation *user : result.getUsers())
+          if (!owners.contains(user) && !closure.contains(user) &&
+              !llvm::all_of(user->getResults(),
+                            [](mlir::Value value) { return value.use_empty(); }))
+            return true;
+      }
+    return false;
+  }
+
+  mlir::LogicalResult prepareBlockStoreGroup(
+      StoreOp op, llvm::DenseSet<mlir::Operation *> &plannedStores) {
+    std::optional<int64_t> extent = f32BlockExtent(op.getValue().getType());
+    if (!extent || *extent <= 0 || *extent > 65535 || !isTrue(op.getWhere()))
       return op.emitError(
           "RVV block store requires an all-active rank-one f32 value");
-
     llvm::DenseSet<mlir::Operation *> closure;
     llvm::SmallVector<BlockAxisOp> axes;
     if (mlir::failed(collectBlockClosure(op.getPointer(), closure, axes,
-                                         op.getOperation())) ||
+                                         op.getOperation(), false)) ||
         mlir::failed(collectBlockClosure(op.getValue(), closure, axes,
-                                         op.getOperation())))
+                                         op.getOperation(), false)))
       return mlir::failure();
     if (axes.size() != 1)
       return op.emitError(
@@ -6290,22 +6357,26 @@ private:
       return op.emitError("block store extent does not match its logical axis");
 
     llvm::SmallVector<StoreOp> stores{op};
+    llvm::SmallVector<mlir::Operation *> interstitial;
     for (mlir::Operation *candidate = op->getNextNode(); candidate;
          candidate = candidate->getNextNode()) {
       if (auto store = mlir::dyn_cast<StoreOp>(candidate)) {
         std::optional<int64_t> candidateExtent =
-            blockExtent(store.getValue().getType());
-        if (consumed.contains(candidate) || candidateExtent != extent ||
-            !isTrue(store.getWhere()))
+            f32BlockExtent(store.getValue().getType());
+        if (plannedStores.contains(candidate) || candidateExtent != extent ||
+            !isTrue(store.getWhere()) ||
+            localF32ContractDecisions.contains(candidate) ||
+            isOwnedByPreparedRegion(candidate) ||
+            isMaterializedF32BlockStore(store))
           break;
         llvm::DenseSet<mlir::Operation *> candidateClosure;
         llvm::SmallVector<BlockAxisOp> candidateAxes;
-        if (mlir::failed(collectBlockClosure(store.getPointer(),
-                                             candidateClosure, candidateAxes,
-                                             store.getOperation())) ||
+        if (mlir::failed(collectBlockClosure(store.getPointer(), candidateClosure,
+                                             candidateAxes,
+                                             store.getOperation(), false)) ||
             mlir::failed(collectBlockClosure(store.getValue(), candidateClosure,
                                              candidateAxes,
-                                             store.getOperation())) ||
+                                             store.getOperation(), false)) ||
             candidateAxes.size() != 1 || candidateAxes.front() != axis)
           break;
         stores.push_back(store);
@@ -6318,27 +6389,149 @@ private:
       if (mlir::isa<ConstantOp, InvalidOp, PtrAddOp, BinaryOp, CompareOp, CastOp,
                     BitcastOp, SelectOp, TupleOp, TupleGetOp, SpecialValueOp>(
               candidate)) {
-        if (mlir::failed(emitOperation(candidate)))
-          return mlir::failure();
-        consumed.insert(candidate);
+        interstitial.push_back(candidate);
         continue;
       }
       break;
     }
 
-    llvm::DenseSet<mlir::Operation *> storeOps;
+    llvm::DenseSet<mlir::Operation *> owners;
     for (StoreOp store : stores)
-      storeOps.insert(store.getOperation());
-    for (mlir::Operation *operation : closure)
-      for (mlir::Value result : operation->getResults())
-        if (containsBlockType(result.getType()))
-          for (mlir::Operation *user : result.getUsers())
-            if (!storeOps.contains(user) && !closure.contains(user) &&
-                !loweredBlockOps.contains(user) &&
-                !llvm::all_of(user->getResults(),
-                              [](mlir::Value value) { return value.use_empty(); }))
-              return op.emitError(
-                  "block producer escapes its operation-local store closure");
+      owners.insert(store.getOperation());
+    if (blockClosureEscapes(closure, owners))
+      return op.emitError(
+          "block producer escapes its operation-local store closure");
+
+    BlockStoreGroupDecision decision;
+    decision.operation = op.getOperation();
+    decision.axis = axis.getOperation();
+    decision.extent = *extent;
+    decision.physical = decideBlockStorePhysical(*extent, axis, closure);
+    for (StoreOp store : stores) {
+      decision.stores.push_back(store.getOperation());
+      plannedStores.insert(store.getOperation());
+    }
+    decision.closure.append(closure.begin(), closure.end());
+    decision.interstitial = std::move(interstitial);
+    blockStoreGroupDecisions.try_emplace(op.getOperation(), std::move(decision));
+    return mlir::success();
+  }
+
+  mlir::LogicalResult prepareBlockReduceGroup(
+      ReduceOp op, llvm::DenseSet<mlir::Operation *> &plannedReductions) {
+    auto inputType = mlir::cast<BlockType>(op.getInput().getType());
+    int64_t extent = inputType.getShape().front();
+    if (extent <= 0 || extent > 65535)
+      return op.emitError(
+          "RVV block reduction requires a static extent in [1, 65535]");
+    llvm::DenseSet<mlir::Operation *> closure;
+    llvm::SmallVector<BlockAxisOp> axes;
+    if (mlir::failed(collectBlockClosure(op.getInput(), closure, axes,
+                                         op.getOperation(), false)))
+      return mlir::failure();
+    if (axes.size() != 1)
+      return op.emitError(
+          "RVV block reduction requires exactly one local logical block axis");
+    BlockAxisOp axis = axes.front();
+    auto axisType = axis.getResult().getType();
+    if (axisType.getShape().size() != 1 ||
+        axisType.getShape().front() != extent)
+      return op.emitError("block reduction extent does not match its logical axis");
+
+    llvm::SmallVector<ReduceOp> reductions{op};
+    for (mlir::Operation *candidate = op->getNextNode(); candidate;
+         candidate = candidate->getNextNode()) {
+      if (auto reduction = mlir::dyn_cast<ReduceOp>(candidate)) {
+        if (plannedReductions.contains(candidate) ||
+            !isSupportedBlockReduction(reduction))
+          break;
+        auto candidateType = mlir::cast<BlockType>(reduction.getInput().getType());
+        llvm::DenseSet<mlir::Operation *> candidateClosure;
+        llvm::SmallVector<BlockAxisOp> candidateAxes;
+        if (candidateType.getShape().front() != extent ||
+            mlir::failed(collectBlockClosure(reduction.getInput(),
+                                             candidateClosure, candidateAxes,
+                                             reduction.getOperation(), false)) ||
+            candidateAxes.size() != 1 || candidateAxes.front() != axis)
+          break;
+        reductions.push_back(reduction);
+        for (mlir::Operation *member : candidateClosure)
+          closure.insert(member);
+        continue;
+      }
+      if (hasBlockPayload(candidate) || mlir::isa<ConstantOp, InvalidOp>(candidate))
+        continue;
+      break;
+    }
+    llvm::DenseSet<mlir::Operation *> owners;
+    for (ReduceOp reduction : reductions)
+      owners.insert(reduction.getOperation());
+    if (blockClosureEscapes(closure, owners))
+      return op.emitError(
+          "block producer escapes its operation-local reduction closure");
+
+    BlockReduceGroupDecision decision;
+    decision.operation = op.getOperation();
+    decision.axis = axis.getOperation();
+    decision.extent = extent;
+    decision.physical = decideBlockReducePhysical(extent, axis, closure);
+    for (ReduceOp reduction : reductions) {
+      decision.reductions.push_back(reduction.getOperation());
+      plannedReductions.insert(reduction.getOperation());
+    }
+    decision.closure.append(closure.begin(), closure.end());
+    blockReduceGroupDecisions.try_emplace(op.getOperation(), std::move(decision));
+    return mlir::success();
+  }
+
+  mlir::LogicalResult prepareBlockGroupDecisions() {
+    bool failed = false;
+    llvm::DenseSet<mlir::Operation *> plannedStores;
+    llvm::DenseSet<mlir::Operation *> plannedReductions;
+    kernel.walk([&](StoreOp store) {
+      if (failed || plannedStores.contains(store.getOperation()) ||
+          !hasBlockPayload(store.getOperation()) ||
+          localF32ContractDecisions.contains(store.getOperation()) ||
+          isOwnedByPreparedRegion(store.getOperation()) ||
+          isMaterializedF32BlockStore(store))
+        return;
+      if (mlir::failed(prepareBlockStoreGroup(store, plannedStores)))
+        failed = true;
+    });
+    kernel.walk([&](ReduceOp reduction) {
+      if (failed || plannedReductions.contains(reduction.getOperation()) ||
+          reduction->getParentOfType<VLAOp>())
+        return;
+      if (!isSupportedBlockReduction(reduction)) {
+        reduction.emitError(
+            "RVV block reduction currently requires all-active rank-one i32 add");
+        failed = true;
+        return;
+      }
+      if (mlir::failed(prepareBlockReduceGroup(reduction, plannedReductions)))
+        failed = true;
+    });
+    return failed ? mlir::failure() : mlir::success();
+  }
+
+  mlir::LogicalResult emitBlockStores(StoreOp op) {
+    if (auto lowered = tryEmitLocalF32ContractBlockStore(op))
+      return *lowered;
+    auto selected = blockStoreGroupDecisions.find(op.getOperation());
+    if (selected == blockStoreGroupDecisions.end())
+      return op.emitError("block store has no selected physical group decision");
+    const BlockStoreGroupDecision &decision = selected->second;
+    int64_t extent = decision.extent;
+    BlockAxisOp axis = mlir::cast<BlockAxisOp>(decision.axis);
+    llvm::DenseSet<mlir::Operation *> closure;
+    closure.insert(decision.closure.begin(), decision.closure.end());
+    llvm::DenseSet<mlir::Operation *> storeOps;
+    storeOps.insert(decision.stores.begin(), decision.stores.end());
+    for (mlir::Operation *interstitial : decision.interstitial) {
+      if (mlir::failed(emitOperation(interstitial)))
+        return mlir::failure();
+      consumed.insert(interstitial);
+    }
 
     std::string offset = expression(axis.getOffset());
     if (offset.empty())
@@ -6346,8 +6539,7 @@ private:
     std::string strip = fresh("block_i");
     std::string vl = fresh("block_vl");
     std::string lane = fresh("block_lane");
-    BlockStorePhysicalDecision physical =
-        decideBlockStorePhysical(*extent, axis, closure);
+    const BlockStorePhysicalDecision &physical = decision.physical;
 
     auto emitStrip = [&](llvm::StringRef stripOffset,
                          llvm::StringRef activeVL) -> mlir::LogicalResult {
@@ -6378,7 +6570,7 @@ private:
            std::to_string(physical.stripVL) + ");");
       llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
           stripValues;
-      for (int64_t stripOffset = 0; stripOffset < *extent;
+      for (int64_t stripOffset = 0; stripOffset < extent;
            stripOffset += physical.stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(),
@@ -6411,12 +6603,12 @@ private:
         return mlir::failure();
     } else {
       line("for (size_t " + strip + " = 0; " + strip + " < " +
-           std::to_string(*extent) + ";) {");
+           std::to_string(extent) + ";) {");
       ++indent;
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
-           std::to_string(*extent) + " - " + strip + ") < " +
+           std::to_string(extent) + " - " + strip + ") < " +
            std::to_string(physical.stripVL) + " ? (" +
-           std::to_string(*extent) + " - " + strip + ") : " +
+           std::to_string(extent) + " - " + strip + ") : " +
            std::to_string(physical.stripVL) + ");");
       if (physical.needsLaneVector) {
         line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl +
@@ -6433,80 +6625,23 @@ private:
 
     for (mlir::Operation *operation : closure)
       loweredBlockOps.insert(operation);
-    for (StoreOp store : stores)
-      consumed.insert(store.getOperation());
+    consumed.insert(decision.stores.begin(), decision.stores.end());
     return mlir::success();
   }
 
   mlir::LogicalResult emitBlockReduce(ReduceOp op) {
-    auto isSupportedReduction = [](ReduceOp reduction) {
-      auto input = mlir::dyn_cast<BlockType>(reduction.getInput().getType());
-      return input && input.getShape().size() == 1 &&
-             reduction.getAxis() == 0 && reduction.getKind() == "add" &&
-             reduction.getResult().getType().isSignedInteger(32) &&
-             input.getElementType().isSignedInteger(32) &&
-             isTrue(reduction.getWhere());
-    };
-    if (!isSupportedReduction(op))
+    auto selected = blockReduceGroupDecisions.find(op.getOperation());
+    if (selected == blockReduceGroupDecisions.end())
       return op.emitError(
-          "RVV block reduction currently requires all-active rank-one i32 add");
-    auto inputType = mlir::cast<BlockType>(op.getInput().getType());
-    int64_t extent = inputType.getShape().front();
-    if (extent <= 0 || extent > 65535)
-      return op.emitError(
-          "RVV block reduction requires a static extent in [1, 65535]");
-
+          "block reduction has no selected physical group decision");
+    const BlockReduceGroupDecision &decision = selected->second;
+    int64_t extent = decision.extent;
+    BlockAxisOp axis = mlir::cast<BlockAxisOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> closure;
-    llvm::SmallVector<BlockAxisOp> firstAxes;
-    if (mlir::failed(
-            collectBlockClosure(op.getInput(), closure, firstAxes,
-                                op.getOperation())))
-      return mlir::failure();
-    if (firstAxes.size() != 1)
-      return op.emitError(
-          "RVV block reduction requires exactly one local logical block axis");
-    BlockAxisOp axis = firstAxes.front();
-    auto axisType = axis.getResult().getType();
-    if (axisType.getShape().size() != 1 || axisType.getShape().front() != extent)
-      return op.emitError("block reduction extent does not match its logical axis");
-    llvm::SmallVector<ReduceOp> reductions{op};
-    for (mlir::Operation *candidate = op->getNextNode(); candidate;
-         candidate = candidate->getNextNode()) {
-      if (auto reduction = mlir::dyn_cast<ReduceOp>(candidate)) {
-        if (consumed.contains(candidate) || !isSupportedReduction(reduction))
-          break;
-        auto candidateType = mlir::cast<BlockType>(reduction.getInput().getType());
-        llvm::DenseSet<mlir::Operation *> candidateClosure;
-        llvm::SmallVector<BlockAxisOp> candidateAxes;
-        if (candidateType.getShape().front() != extent ||
-            mlir::failed(collectBlockClosure(reduction.getInput(),
-                                             candidateClosure, candidateAxes,
-                                             reduction.getOperation())) ||
-            candidateAxes.size() != 1 || candidateAxes.front() != axis)
-          break;
-        reductions.push_back(reduction);
-        for (mlir::Operation *member : candidateClosure)
-          closure.insert(member);
-        continue;
-      }
-      if (hasBlockPayload(candidate) || mlir::isa<ConstantOp, InvalidOp>(candidate))
-        continue;
-      break;
-    }
-
-    llvm::DenseSet<mlir::Operation *> reductionOps;
-    for (ReduceOp reduction : reductions)
-      reductionOps.insert(reduction.getOperation());
-    for (mlir::Operation *operation : closure)
-      for (mlir::Value result : operation->getResults())
-        if (containsBlockType(result.getType()))
-          for (mlir::Operation *user : result.getUsers())
-            if (!reductionOps.contains(user) && !closure.contains(user) &&
-                !loweredBlockOps.contains(user) &&
-                !llvm::all_of(user->getResults(),
-                              [](mlir::Value value) { return value.use_empty(); }))
-              return op.emitError(
-                  "block producer escapes its operation-local reduction closure");
+    closure.insert(decision.closure.begin(), decision.closure.end());
+    llvm::SmallVector<ReduceOp> reductions;
+    for (mlir::Operation *reduction : decision.reductions)
+      reductions.push_back(mlir::cast<ReduceOp>(reduction));
 
     std::string offset = expression(axis.getOffset());
     if (offset.empty())
@@ -6523,8 +6658,7 @@ private:
     std::string strip = fresh("block_i");
     std::string vl = fresh("block_vl");
     std::string lane = fresh("block_lane");
-    BlockReducePhysicalDecision physical =
-        decideBlockReducePhysical(extent, axis, closure);
+    const BlockReducePhysicalDecision &physical = decision.physical;
 
     if (physical.realization ==
         BlockReduceRealization::RVVE8M1FixedStrips) {
