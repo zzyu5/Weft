@@ -1,8 +1,7 @@
-# 以四十个真实 Kernel 冻结 Weft 能力边界
+# 四十个真实 Kernel 之后的 Weft
 
-这份报告合并此前四轮kernel推进和本轮固定语料重构，统一说明Weft从重建主链到当前状态
-究竟完成了什么。它记录实现事实、真机数字和仍存在的边界，不是设计规范、性能门槛或
-自动检查输入。
+这份报告合并此前四轮 kernel 推进记录，统一说明 Weft 从重建主链到当前状态究竟完成了
+什么。它记录实现事实、真机数字和仍存在的边界，不是设计规范、性能门槛或自动检查输入。
 
 固定 GGML/RISC-V 参照仍在 [`baseline/`](baseline/)；Weft 当前所有原始性能记录仍在
 [`weft-kernel-performance.csv`](weft-kernel-performance.csv)。二者都不由本文复制、同步或
@@ -30,10 +29,8 @@ natural Weft Python DSL
 - canonical Kernel IR 是唯一长期算法表示；
 - target lowering 只从 typed primitive、logical axes、local use/access relation、target facts
   与显式 config 形成瞬态 physical decision；
-- 常规VLA、contract与block路径的emitter消费已经决定的`vl`、LMUL、memory mode、
-  microtile、decode family与extension fragment，不再拥有第二套算法或物理选择；部分
-  extension decision producer仍贴近具体emit入口，这是代码组织成熟度问题，不是第二套
-  route或重复选择；
+- emitter 消费已经决定的 `vl`、LMUL、memory mode、microtile、decode family 与 extension
+  fragment，不再拥有第二套算法或物理选择；
 - GGML 和 `materials/` 没有进入 production link、runtime 或 fallback。
 
 四轮推进的核心不是累计四十个 case，而是逐步建立并压力验证同一组可组合能力：VLA、
@@ -130,12 +127,12 @@ RISC-V lowering 当前已经明确持有以下短生命周期 decision：
 - block decode 的 table extent、code/result vector shape 与 gather family；
 - symmetric i4×i8、sign-bit×i8、E2M1/E8M0×i8 的 typed operand closure、local layout relation
   与 RVV/IME realization；
-- generic F16 VLA cast/arithmetic，以及widening-dot、online-softmax、F16 GEMM与affine Q4_K
-  IME local envelope的typed transient decision。
+- 较早 F16 VLA、online-softmax、F16 GEMM 与 affine Q4_K IME envelope 的 typed transient
+  decision。
 
-最后一组仍要求较精确的region/use/loop envelope，但结构分析和代码发射已经分开：analysis
-形成pointer、bound、stride、tile、layout与realization，emitter只消费，不再边打印边重新
-匹配一次。Generic F16 fill/conversion/update已经退出这一组，由逐op VLA decision覆盖。
+最后一组仍要求较精确的 region/use/loop envelope，但结构分析和代码发射已经分开：analysis
+形成 pointer、bound、stride、tile、layout 与 realization，emitter 只消费，不再边打印边重新
+匹配一次。
 
 这些是已经落地的typed physical decisions，不等于成熟的多候选搜索。多数family目前仍只有
 固定配置或少量资源规则；candidate enumeration、实测调优与更宽的realization space尚未完成。
@@ -235,81 +232,10 @@ contraction、ConvTranspose 的 output-owned inverse traversal。修复遵守算
 
 本轮之后还完成两组 lowering authority 收敛：
 
-- F16 conversion/fill/dot/update/normalize、online-softmax、F16 GEMM与affine Q4_K IME先从
-  “matcher同时打印代码”拆成analysis decision加emitter消费；本轮又让其中fill、两向cast与
-  weighted update退出region matcher，进入generic逐op decision；
+- F16 conversion/fill/dot/update/normalize、online-softmax、F16 GEMM与affine Q4_K IME从
+  “matcher同时打印代码”拆成analysis decision加emitter消费；
 - VLA contract的LMUL成为enclosing VLA strip、mask/index relation与contract emitter的唯一
   来源，消除同一region内两份物理宽度选择。
-
-## 固定四十项后的能力边界重构
-
-本轮没有增加kernel，也没有改写四十项DSL来迁就backend。固定语料仍是四十个distinct
-kernel、四十二条phase记录；本轮只改变共享analysis/selection、physical decision和emission
-之间的责任边界。本轮主要lowering改动完成后重跑了四十二条真实phase；最后将block strip
-选择从emitter移入decision的等价责任拆分，又定向复跑了IQ4 block decode、Q8 block reduce与
-Q1/MXFP4量化路径。性能表统一采用同一轮全量sweep，定向复跑只用于确认最终拆分没有改变
-这些路径的结果与性能区间，不混入表中。
-
-### 授权边界已经固定
-
-| Source构造 | 作者明确拥有 | Target得到的授权 | Target不得做 |
-|---|---|---|---|
-| scalar `for` / `while` | 有序traversal、carry、effect与outer control | 保语义unroll、schedule、pipeline | 自动变成VLA、scan或contract |
-| `W.vla` | SIMD logical axis、logical bounds、predicate与memory关系 | `vl`、SEW/LMUL、strip、mask/index与memory form | 创建第二VLA轴、替换外围blocking |
-| `W.contract` | operands、axes、init、dtype、predicate与numerical policy | microtile、LMUL、unroll、fragment、短生命周期packing | 从普通乘加猜contract、创建outer K/staging |
-| reduce / scan / summary / carry | 四种各自可观察的state algebra | 对应跨strip或局部state realization | 按use graph互换语义 |
-| blocking / staging / persistent layout | source-visible算法variant与data organization | 消费显式关系做local reuse/fusion | 发明、替换或跨越这些关系 |
-
-因此Weft仍然是作者编写完整worker-local kernel program、target实现显式授权局部结构的算子
-编译器；不是从SSA图猜算法的图编译器，也不是自动发明高层schedule的系统。
-
-### Physical decision ownership 的实际变化
-
-- `VLAPhysicalConfig`现在是generic VLA内data/index SEW、LMUL和mask ratio的唯一来源；每个
-  access/state/narrow还持有自己的element shape、memory/activity和state realization；
-- F16/F32 cast形成逐op source/result shape decision，F16 multiply-add形成带absorbed producer
-  的local binary decision；FlashAttention此前四条F16 fill/conversion/update/normalize
-  whole-region realization已经删除，由generic access/cast/binary lowering自然组合；
-- grouped affine Q4_K、symmetric Q4_0、sign-bit Q1_0、E2M1 MXFP4与IME leaf都先形成typed
-  operand/layout/realization decision，再拼intrinsic或asm；
-- local-row和VLA-free-axis F32 contract共用resource selector。Local row candidate会在
-  LMUL4/2/1之间选择；row6当前选择LMUL2，row8选择LMUL1，VLA free-axis row6选择LMUL4；
-- block store/reduce此前在emitter内根据closure临时选择e8mf4/e8m1 strip，本轮已拆成
-  `BlockStorePhysicalDecision` / `BlockReducePhysicalDecision`；block operation emitter只消费
-  byte-vector shape、strip family、active length和lane-index需求。
-
-这些decision仍是一次lowering调用内的C++ transient，不进入Kernel IR，也没有新增physical
-IR、provider registry、validator或tuning stage。物化的含义是producer与consumer分离，而非
-再造一层长期authority。
-
-### Candidate space扩大了什么
-
-1. Generic F16 VLA不再只靠region specialization：纯F16 region可选e16/LMUL8；混合F16/F32
-   conversion按逐op shape生成f16m4↔f32m8；F16 weighted update由generic local FMA decision
-   发射；
-2. F32 contract用显式register/resource model比较LMUL candidate，conv-transpose row6由原先
-   LMUL4收敛到LMUL2，decode GEMM也获得更合适的register组织；
-3. Q8 saturating narrow扩大为f32m8→i16m4→i8m2候选，保持DSL写下的round/saturate语义，
-   没有为了追GGML的non-saturating sequence修改算法；
-4. IME N16/K32与288/304-byte local layout从source的显式axis/layout relation进入decision，
-   不再由emitter default构成第二份事实。
-
-实验过的F32 contract K-unroll=2在真实decode上从约16 ms退化到约77 ms，已经完整回退，未
-留下死分支。`kUnroll`字段虽已物化，当前winner仍为1；本轮没有用“候选更多”冒充性能更好。
-
-### 已经移除与仍然保留的窄 envelope
-
-已经移除的四条region matcher是F16 fill、F32→F16、F16 weighted update和F16→F32 normalize。
-当前specialized VLA只剩两个局部融合：
-
-- widening F16 dot：显式双load/cast/multiply/reduce closure实现为`vfwmacc`与延迟reduction；
-- online-softmax envelope：显式summary producer与相邻normalize consumer联合安排三遍traversal。
-
-两者都不读kernel名、不生成public ABI，也不接管outer traversal；但仍依赖精确local use
-closure。F16 GEMM的N-tile/K-loop和IME affine N16/K32也仍是窄局部loop envelope，不是
-whole-kernel route。Generic VLA当前仍未覆盖lane-varying masked load，nested analysis也只
-递归支持的`for`，没有声称覆盖VLA body中的任意`if/while`。固定四十项本身没有lane-varying
-masked-load样本，所以本轮没有另造case掩盖这个边界。
 
 ## 四十项真机性能
 
@@ -328,17 +254,17 @@ masked-load样本，所以本轮没有另造case掩盖这个边界。
 
 | Kernel / phase | Hardware | Weft ms | 对照 ms | Weft / 对照 | 读数 |
 |---|---|---:|---:|---:|---|
-| SiLU F32 | SG2044 | 4.206208 | 4.113 | 1.023 | 同档，慢2.3% |
-| RMSNorm F32 | SG2044 | 1.608407 | 2.637 | 0.610 | 快39.0% |
-| Softmax F32 | SG2044 | 2.646191 | 4.170 | 0.635 | 快36.5% |
-| F16 GEMM decode | SG2044 | 6.682329 | 7.387 | 0.905 | 快9.5% |
-| F16 GEMM prefill | SG2044 | 341.452654 | 299.138 | 1.141 | 慢14.1% |
-| Q4_K×Q8_K projection | SG2044 | 12.890796 | 13.009 | 0.991 | 固定表快0.9% |
-| Q4_K GetRows | SG2044 | 0.874823 | 0.825 | 1.060 | 慢6.0% |
-| Contiguous transpose | SG2044 | 5.602464 | 5.574 | 1.005 | 同档，慢0.5% |
-| RoPE NeoX | SG2044 | 1.069224 | 1.253 | 0.853 | 快14.7% |
-| FlashAttention F32/F16 | SG2044 | 23.543003 | 21.667 | 1.087 | 慢8.7% |
-| Q4_K IME projection | K1/X60 | 3.254460 | 3.436 | 0.947 | 快5.3% |
+| SiLU F32 | SG2044 | 4.197469 | 4.113 | 1.021 | 同档，慢2.1% |
+| RMSNorm F32 | SG2044 | 1.601028 | 2.637 | 0.607 | 快39.3% |
+| Softmax F32 | SG2044 | 2.645742 | 4.170 | 0.634 | 快36.6% |
+| F16 GEMM decode | SG2044 | 7.221713 | 7.387 | 0.978 | 快2.2% |
+| F16 GEMM prefill | SG2044 | 330.751278 | 299.138 | 1.106 | 慢10.6% |
+| Q4_K×Q8_K projection | SG2044 | 12.687497 | 13.009 | 0.975 | 固定表快2.5% |
+| Q4_K GetRows | SG2044 | 0.890604 | 0.825 | 1.080 | 慢8.0% |
+| Contiguous transpose | SG2044 | 6.034178 | 5.574 | 1.083 | 慢8.3% |
+| RoPE NeoX | SG2044 | 0.994714 | 1.253 | 0.794 | 快20.6% |
+| FlashAttention F32/F16 | SG2044 | 23.462027 | 21.667 | 1.083 | 慢8.3% |
+| Q4_K IME projection | K1/X60 | 3.256607 | 3.436 | 0.948 | 快5.2% |
 
 第一轮证明主链已经进入实际性能区间，不再存在旧Q4_K路径的数量级落后。F16 GEMM与
 FlashAttention采用代表点correctness；其余八个kernel使用全输出或完整离散结果对照。
@@ -347,17 +273,17 @@ FlashAttention采用代表点correctness；其余八个kernel使用全输出或�
 
 | Kernel / phase | Hardware | Weft ms | 同硬件同shape对照 ms | 比值 | 读数 |
 |---|---|---:|---:|---:|---|
-| Causal mask F32 | SG2044 | 6.713060 | — | — | 当前性能记录 |
-| Cumsum F32 | SG2044 | 0.392702 | — | — | 当前性能记录 |
-| LayerNorm F32 | SG2044 | 1.601767 | 3.507 | 0.457 | 快54.3% |
-| Argmax F32 | SG2044 | 16.926814 | — | — | 当前性能记录 |
-| SwiGLU F16/F32 | SG2044 | 5.845516 | — | — | 当前性能记录 |
-| GetRows F32 | SG2044 | 0.400092 | — | — | 固定表只有另一硬件，不跨硬件比较 |
-| GEMM F32 decode | SG2044 | 14.532404 | 20.612 | 0.705 | 快29.5% |
-| GEMM F32 prefill | SG2044 | 761.052490 | 574.193 | 1.325 | 慢32.5% |
-| Q8_0 quantize | SG2044 | 4.140899 | 3.292 | 1.258 | 慢25.8% |
-| IQ4_NL dequantize | SG2044 | 5.681335 | 25.982 | 0.219 | 快78.1% |
-| Q4_0 IME projection | K1/X60 | 3.192927 | 2.941 | 1.086 | 慢8.6% |
+| Causal mask F32 | SG2044 | 6.684719 | — | — | 当前性能记录 |
+| Cumsum F32 | SG2044 | 0.393851 | — | — | 当前性能记录 |
+| LayerNorm F32 | SG2044 | 1.602827 | 3.507 | 0.457 | 快54.3% |
+| Argmax F32 | SG2044 | 16.925466 | — | — | 当前性能记录 |
+| SwiGLU F16/F32 | SG2044 | 5.844536 | — | — | 当前性能记录 |
+| GetRows F32 | SG2044 | 0.403822 | — | — | 固定表只有另一硬件，不跨硬件比较 |
+| GEMM F32 decode | SG2044 | 17.742197 | 20.612 | 0.861 | 快13.9% |
+| GEMM F32 prefill | SG2044 | 854.746405 | 574.193 | 1.489 | 慢48.9% |
+| Q8_0 quantize | SG2044 | 4.126398 | 3.292 | 1.253 | 慢25.3% |
+| IQ4_NL dequantize | SG2044 | 5.715355 | 25.982 | 0.220 | 快78.0% |
+| Q4_0 IME projection | K1/X60 | 3.188198 | 2.941 | 1.084 | 慢8.4% |
 
 这轮的主要性能缺口是F32 prefill与Q8_0；明显优势来自IQ4_NL、LayerNorm与F32 decode。
 Q4_0 IME已进入同档，但memory-resident carried accumulator仍有开销。
@@ -366,16 +292,16 @@ Q4_0 IME已进入同档，但memory-resident carried accumulator仍有开销。
 
 | Kernel | Weft ms | GGML public-op ms | Weft / GGML | 可比边界 |
 |---|---:|---:|---:|---|
-| Top-K | 3.181154 | 1.021364 | 3.115 | 同一selection集合；GGML使用C++ partial sort |
-| SSM convolution | 2.831692 | 5.491962 | 0.516 | math、shape、layout相同 |
-| SSM scan | 4.742721 | 9.114867 | 0.520 | math/layout相同，output/state ABI对应 |
-| RWKV-WKV6 | 15.904670 | 16.707418 | 0.952 | math/layout相同 |
-| ADD_ID | 6.612489 | 6.746318 | 0.980 | math、shape、layout相同 |
-| GET_ROWS_BACK | 86.617519 | 89.849307 | 0.964 | duplicate scatter与zero-fill相同 |
-| MUL_MAT_ID F32 | 1012.079609 | 1134.325136 | 0.892 | grouping与完整contraction均计时 |
-| MaxPool2D | 1.754967 | 9.226990 | 0.190 | math、shape、WHCN layout相同 |
-| Depthwise Conv2D | 8.803279 | 113.517962 | 0.078 | 只作语义参照：两侧native layout不同 |
-| Bilinear upscale | 6.623429 | 84.307306 | 0.079 | 只作语义参照：output layout不同 |
+| Top-K | 3.184054 | 1.021364 | 3.117 | 同一selection集合；GGML使用C++ partial sort |
+| SSM convolution | 2.747092 | 5.491962 | 0.500 | math、shape、layout相同 |
+| SSM scan | 4.845841 | 9.114867 | 0.532 | math/layout相同，output/state ABI对应 |
+| RWKV-WKV6 | 16.281330 | 16.707418 | 0.974 | math/layout相同 |
+| ADD_ID | 6.572648 | 6.746318 | 0.974 | math、shape、layout相同 |
+| GET_ROWS_BACK | 86.614495 | 89.849307 | 0.964 | duplicate scatter与zero-fill相同 |
+| MUL_MAT_ID F32 | 939.236930 | 1134.325136 | 0.828 | grouping与完整contraction均计时 |
+| MaxPool2D | 1.795128 | 9.226990 | 0.195 | math、shape、WHCN layout相同 |
+| Depthwise Conv2D | 8.797379 | 113.517962 | 0.077 | 只作语义参照：两侧native layout不同 |
+| Bilinear upscale | 6.557349 | 84.307306 | 0.078 | 只作语义参照：output layout不同 |
 
 严格或近严格可比的前八项中七项更快，Top-K是唯一明显落后项。只在第三轮这十个GGML
 public-op对照里，`MUL_MAT_ID F32`走真实RVV intrinsic，其余是C++或scalar path；因此该轮
@@ -385,19 +311,19 @@ public-op对照里，`MUL_MAT_ID F32`走真实RVV intrinsic，其余是C++或sca
 
 | Kernel | Weft ms | 对照 ms | Weft / 对照 | 读数 |
 |---|---:|---:|---:|---|
-| Argsort F32 | 8.669298 | 21.902416 | 0.396 | 显式radix比GGML `std::sort` 快60.4% |
-| SetRows F32 | 0.353221 | 0.432772 | 0.816 | 快18.4% |
-| Window Partition | 5.165123 | 5.575184 | 0.926 | 快7.4% |
-| Dense Conv2D | 777.616083 | 629.354844 | 1.236 | 6.214 GOP/s；按时间慢23.6% |
-| ConvTranspose2D | 13.593719 | 17.179675 | 0.791 | 4.937 GOP/s；快20.9% |
-| RMSNorm backward | 6.363108 | 10.622016 | 0.599 | 快40.1% |
-| OutProd F32 | 128.813764 | 231.133128 | 0.557 | 快44.3% |
-| Im2Col backward | 35.829617 | 374.418412 | 0.096 | 快90.4% |
-| Q1_0×Q8_0 | 56.161806 | 51.859000 | 1.083 | 距手写RVV 8.3% |
-| MXFP4×Q8_0 | 19.522045 | 17.522000 | 1.114 | 距手写RVV 11.4% |
+| Argsort F32 | 8.958199 | 21.902416 | 0.409 | 显式radix比GGML `std::sort` 快59.1% |
+| SetRows F32 | 0.355782 | 0.432772 | 0.822 | 快17.8% |
+| Window Partition | 5.165583 | 5.575184 | 0.927 | 快7.3% |
+| Dense Conv2D | 779.800666 | 629.354844 | 1.239 | 6.196 GOP/s；按时间慢23.9% |
+| ConvTranspose2D | 16.333010 | 17.179675 | 0.951 | 4.109 GOP/s；快4.9% |
+| RMSNorm backward | 6.358188 | 10.622016 | 0.599 | 快40.1% |
+| OutProd F32 | 128.860142 | 231.133128 | 0.558 | 快44.2% |
+| Im2Col backward | 35.573495 | 374.418412 | 0.095 | 快90.5% |
+| Q1_0×Q8_0 | 56.174805 | 51.859000 | 1.083 | 距手写RVV 8.3% |
+| MXFP4×Q8_0 | 19.462305 | 17.522000 | 1.111 | 距手写RVV 11.1% |
 
 第四轮十项中七项快于对应public-op；Q1_0与MXFP4是更严格的手写RVV对照，已经进入12%
-以内。Dense Conv从最初约2.025提升到6.214 GOP/s，但仍未追平GGML；其剩余差距已从缺少
+以内。Dense Conv从最初约2.025提升到6.196 GOP/s，但仍未追平GGML；其剩余差距已从缺少
 staging和错误LMUL收敛为local-contract microtile、unroll和pipeline候选不足。
 
 ## Correctness 记录边界
@@ -422,9 +348,8 @@ kernel的comparison scope不同：
 ### 1. VLA 是逻辑轴，不是硬件 lane API
 
 Source只写逻辑`[begin,end)`；exact `vl`、strip、LMUL、mask/index group由target决定。普通
-scalar loop可以位于VLA body中，但它仍是作者的有序traversal，不会自动获得VLA语义；第二个
-active VLA也仍禁止。Causal、window、state、indexed memory与vision workload证明VLA不是
-某一类kernel的入口标签。
+scalar loop可以位于VLA body中，但第二个active VLA仍禁止。Causal、window、state、indexed
+memory与vision workload证明VLA不是某一类kernel的入口标签。
 
 ### 2. State 语义没有被压成一个模糊 graph pattern
 
@@ -462,22 +387,21 @@ compiler仍可令最终C/机器码和时间略有差异。
 
 ### Physical candidate space仍窄
 
-- F32 prefill GEMM比对照慢32.5%，Dense Conv按时间慢23.6%；local F32 contract虽然已有
-  row6/LMUL2与row8/LMUL1的resource decision，但还没有成熟的multi-axis microtile、K-unroll、
+- F32 prefill GEMM比对照慢48.9%，Dense Conv按时间慢23.9%；local F32 contract虽然已有
+  row6/LMUL4与row8/LMUL1的resource decision，但还没有成熟的multi-axis microtile、K-unroll、
   pointer scheduling和software-pipeline候选；
 - Top-K每个rank重新扫描完整expert域，没有candidate reuse、rank-level组织或selection-local
   register strategy；
-- Q8_0仍慢25.8%，Q1_0与MXFP4仍落后手写RVV 8.3%和11.4%；
+- Q8_0仍慢25.3%，Q1_0与MXFP4仍落后手写RVV 8.3%和11.1%；
 - SSM/RWKV缺state tiling与persistent register placement，short convolution缺tap unroll/reuse；
 - indexed memory仍缺prefetch、alias-aware scheduling与duplicate contention physical choice；
 - vision window路径缺spatial/channel tiling、sliding-window reuse与coordinate-hoist candidate。
 
 ### 一些合法source envelope仍较窄
 
-- F16 fill、conversion和weighted update已经由generic逐op decision覆盖；widening dot、
-  online-softmax producer/consumer、F16 GEMM与affine Q4_K IME仍只接受较精确的local
-  region/use/loop envelope；
-- generic VLA的lane-varying masked load、predicate组合以及nested reduce/scan/summary覆盖还不完整；
+- F16 conversion/fill/dot/update/normalize、online-softmax producer/consumer、F16 GEMM与affine
+  Q4_K IME已经有独立analysis decision，但仍只接受较精确的local region/use/loop envelope；
+- generic VLA的masked load、predicate组合、dtype以及nested reduce/scan/summary覆盖还不完整；
 - 第二个active VLA axis仍明确unsupported；
 - intrinsic-C backend在module入口整体要求RVV；kernel内普通scalar C是正式realization，但
   当前没有独立scalar-only target backend；
@@ -501,12 +425,9 @@ compiler仍可令最终C/机器码和时间略有差异。
 2. **可组合性开始成立。** 四十个结构不同的算法由同一组VLA、memory、state、contract、
    decode与extension anchors组合，第三、第四轮没有重新长出kernel-kind或whole-kernel
    fallback。
-3. **性能只部分成立。** 多项已超过对应public-op，F32 decode与ConvTranspose在共享contract
-   decision扩展后改善，generic F16 VLA替代region matcher后保持原有性能区间，RVV/IME量化
-   路径进入手写实现附近；但F32 prefill、Dense Conv、Top-K和若干量化/状态路径仍暴露明显
-   physical freedom缺口。
+3. **性能只部分成立。** 多项已超过对应public-op，RVV/IME量化路径进入手写实现附近；但
+   F32 prefill、Dense Conv、Top-K和若干量化/状态路径仍暴露明显physical freedom缺口。
 
 因此当前最准确的描述是：**Weft已经从旧项目骨架长成一门真实可执行、具有初步外推能力的
-RISC-V worker-local kernel DSL/compiler；scalar/VLA/contract/state的授权边界和唯一主链已经
-冻结，常规发射只消费显式physical decision，但primitive-local candidate space、一部分
-source-envelope通用性以及extension decision组织仍未完全成熟。**
+RISC-V worker-local kernel DSL/compiler；它的算法/编译器ownership和唯一主链已经正确，但
+primitive-local physical candidate space与一部分source-envelope通用性仍未完成。**
