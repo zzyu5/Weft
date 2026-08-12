@@ -139,6 +139,22 @@ case "${kernel}" in
     dsl=examples/kernels/selection/argsort.py
     runtime=examples/repro/weft/selection/argsort_runtime.cpp
     ;;
+  nms)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 nms" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/selection/nms.py
+    runtime=examples/repro/weft/selection/nms_runtime.cpp
+    ;;
+  top_p)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 top_p" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/selection/top_p.py
+    runtime=examples/repro/weft/selection/top_p_runtime.cpp
+    ;;
   ssm_conv)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 ssm_conv" >&2
