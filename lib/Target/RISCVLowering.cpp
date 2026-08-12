@@ -400,6 +400,7 @@ struct VLACandidateFacts {
   unsigned f32Stores = 0;
   unsigned stridedAccesses = 0;
   unsigned nestedScalarLoops = 0;
+  unsigned enclosingScalarLoads = 0;
   unsigned reductionStates = 0;
   unsigned maxEntityF32Vectors = 0;
   bool hasOrderedScan = false;
@@ -1263,10 +1264,16 @@ private:
       candidates = rowTile <= 4   ? llvm::ArrayRef<unsigned>(narrowRowCandidates)
                    : rowTile <= 6 ? llvm::ArrayRef<unsigned>(mediumRowCandidates)
                                   : llvm::ArrayRef<unsigned>(wideRowCandidates);
-    unsigned requestedUnroll = options.backend.contractKUnroll == 0
-                                   ? defaultUnroll
-                                   : static_cast<unsigned>(
-                                         options.backend.contractKUnroll);
+    llvm::SmallVector<unsigned> unrollCandidates;
+    if (options.backend.contractKUnroll != 0)
+      unrollCandidates.push_back(
+          static_cast<unsigned>(options.backend.contractKUnroll));
+    else {
+      unrollCandidates.push_back(defaultUnroll);
+      for (unsigned candidate : {1u, 2u, 4u})
+        if (!llvm::is_contained(unrollCandidates, candidate))
+          unrollCandidates.push_back(candidate);
+    }
     llvm::SmallVector<unsigned> requestedLMUL;
     if (options.backend.contractLMUL != 0) {
       requestedLMUL.push_back(
@@ -1279,22 +1286,24 @@ private:
     auto legalLMUL = [](unsigned value) {
       return value == 1 || value == 2 || value == 4 || value == 8;
     };
-    if (!legalUnroll(requestedUnroll))
-      return std::nullopt;
-    for (unsigned lmul : candidates) {
-      if (!legalLMUL(lmul))
+    for (unsigned unroll : unrollCandidates) {
+      if (!legalUnroll(unroll))
         continue;
-      unsigned accumulatorGroups = rowTile * lmul;
-      unsigned streamedOperandGroups =
-          (model == F32ContractResourceModel::LocalRow ? 2 : 1) *
-          requestedUnroll * lmul;
-      unsigned total = accumulatorGroups + streamedOperandGroups;
-      bool hasAllocatorHeadroom =
-          model == F32ContractResourceModel::VLAFreeAxis
-              ? total <= options.target.vectorRegisters
-              : total + 1 < options.target.vectorRegisters;
-      if (hasAllocatorHeadroom)
-        return F32ContractPhysicalConfig{lmul, requestedUnroll};
+      for (unsigned lmul : candidates) {
+        if (!legalLMUL(lmul))
+          continue;
+        unsigned accumulatorGroups = rowTile * lmul;
+        unsigned streamedOperandGroups =
+            (model == F32ContractResourceModel::LocalRow ? 2 : 1) * unroll *
+            lmul;
+        unsigned total = accumulatorGroups + streamedOperandGroups;
+        bool hasAllocatorHeadroom =
+            model == F32ContractResourceModel::VLAFreeAxis
+                ? total <= options.target.vectorRegisters
+                : total + 1 < options.target.vectorRegisters;
+        if (hasAllocatorHeadroom)
+          return F32ContractPhysicalConfig{lmul, unroll};
+      }
     }
     return std::nullopt;
   }
@@ -1618,6 +1627,24 @@ private:
       }
     }
 
+    unsigned maxEntityF32Vectors = 0;
+    for (mlir::Operation *operation : physicalOperations) {
+      unsigned entityVectors = llvm::count_if(
+          operation->getOperandTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+      entityVectors += llvm::count_if(
+          operation->getResultTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+      if (auto loop = mlir::dyn_cast<ForOp>(operation))
+        entityVectors += llvm::count_if(
+            loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
+              return isRegionValue(type) && elementType(type).isF32();
+            });
+      maxEntityF32Vectors = std::max(maxEntityF32Vectors, entityVectors);
+    }
+
     for (mlir::Operation *nested : physicalOperations) {
       if (isContractOwned(nested))
         continue;
@@ -1631,14 +1658,28 @@ private:
             "VLA narrow has no selected saturating f32-to-i8 realization");
         return mlir::failure();
       }
-      unsigned sourceLMUL = options.backend.narrowLMUL == 0
-                                ? 4
-                                : static_cast<unsigned>(
-                                      options.backend.narrowLMUL);
-      if (sourceLMUL != 4 && sourceLMUL != 8) {
+      llvm::SmallVector<unsigned> candidates;
+      if (options.backend.narrowLMUL != 0)
+        candidates.push_back(static_cast<unsigned>(options.backend.narrowLMUL));
+      else
+        candidates = {8, 4};
+      std::optional<unsigned> selected;
+      for (unsigned candidate : candidates) {
+        if (candidate != 4 && candidate != 8)
+          continue;
+        unsigned narrowGroups = candidate + candidate / 2 + candidate / 4;
+        unsigned regionGroups = maxEntityF32Vectors * candidate;
+        if (std::max(narrowGroups, regionGroups) + 1 <
+            static_cast<unsigned>(options.target.vectorRegisters)) {
+          selected = candidate;
+          break;
+        }
+      }
+      if (!selected) {
         narrow.emitError("VLA narrow requested an illegal f32 LMUL candidate");
         return mlir::failure();
       }
+      unsigned sourceLMUL = *selected;
       decision.physical.dataLMUL = sourceLMUL;
       decision.narrows.push_back(VLANarrowDecision{
           narrow.getOperation(), sourceLMUL, sourceLMUL / 2,
@@ -1765,23 +1806,6 @@ private:
           return state.realization ==
                  VLAStateRealization::RVVWideningF16DotReduction;
       });
-    unsigned maxEntityF32Vectors = 0;
-    for (mlir::Operation *operation : physicalOperations) {
-      unsigned entityVectors = llvm::count_if(
-          operation->getOperandTypes(), [](mlir::Type type) {
-            return isRegionValue(type) && elementType(type).isF32();
-          });
-      entityVectors += llvm::count_if(
-          operation->getResultTypes(), [](mlir::Type type) {
-            return isRegionValue(type) && elementType(type).isF32();
-          });
-      if (auto loop = mlir::dyn_cast<ForOp>(operation))
-        entityVectors += llvm::count_if(
-            loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
-              return isRegionValue(type) && elementType(type).isF32();
-            });
-      maxEntityF32Vectors = std::max(maxEntityF32Vectors, entityVectors);
-    }
     bool onlyF16Accesses = !decision.accesses.empty() &&
                            llvm::all_of(decision.accesses,
                                         [](const VLAAccessDecision &access) {
@@ -1819,6 +1843,19 @@ private:
       if (!loop)
         continue;
       ++candidateFacts.nestedScalarLoops;
+    }
+    for (mlir::Operation *ancestor = op->getParentOp(); ancestor;
+         ancestor = ancestor->getParentOp()) {
+      auto loop = mlir::dyn_cast<ForOp>(ancestor);
+      if (!loop)
+        continue;
+      for (mlir::Operation &operation : loop.getBody().front()) {
+        if (&operation == op.getOperation())
+          break;
+        auto load = mlir::dyn_cast<LoadOp>(operation);
+        if (load && !hasBlockPayload(load.getOperation()))
+          ++candidateFacts.enclosingScalarLoads;
+      }
     }
     for (const VLAStateDecision &state : decision.states) {
       candidateFacts.reductionStates +=
@@ -1870,6 +1907,8 @@ private:
                            : llvm::SmallVector<unsigned>{8, 4, 2, 1};
         else if (candidateFacts.stridedAccesses > 0)
           candidates = {2, 4, 1, 8};
+        else if (candidateFacts.enclosingScalarLoads > 0)
+          candidates = {1, 2, 4, 8};
         else if (candidateFacts.nestedScalarLoops > 0)
           candidates = {8, 4, 2, 1};
         else
@@ -5223,26 +5262,44 @@ private:
     decision.kUpper = kLoop.getUpper();
     decision.sourceKTile = static_cast<unsigned>(*reductionTile);
     decision.rowTile = static_cast<unsigned>(*rowTile);
-    unsigned requestedRows = options.backend.f16RowMicrotile == 0
-                                 ? decision.rowTile
-                                 : static_cast<unsigned>(
-                                       options.backend.f16RowMicrotile);
-    unsigned inputLMUL = options.backend.f16InputLMUL == 0
-                             ? 1
-                             : static_cast<unsigned>(
-                                   options.backend.f16InputLMUL);
-    if (requestedRows == 0 || requestedRows > decision.rowTile ||
-        decision.rowTile % requestedRows != 0 ||
-        (inputLMUL != 1 && inputLMUL != 2 && inputLMUL != 4))
+    llvm::SmallVector<unsigned> rowCandidates;
+    if (options.backend.f16RowMicrotile != 0)
+      rowCandidates.push_back(
+          static_cast<unsigned>(options.backend.f16RowMicrotile));
+    else
+      for (unsigned rows = decision.rowTile; rows > 0; --rows)
+        if (decision.rowTile % rows == 0)
+          rowCandidates.push_back(rows);
+    llvm::SmallVector<unsigned> lmulCandidates;
+    if (options.backend.f16InputLMUL != 0)
+      lmulCandidates.push_back(
+          static_cast<unsigned>(options.backend.f16InputLMUL));
+    else
+      lmulCandidates = {1, 2, 4};
+    std::optional<std::pair<unsigned, unsigned>> selected;
+    for (unsigned inputLMUL : lmulCandidates) {
+      if (inputLMUL != 1 && inputLMUL != 2 && inputLMUL != 4)
+        continue;
+      for (unsigned rows : rowCandidates) {
+        if (rows == 0 || rows > decision.rowTile ||
+            decision.rowTile % rows != 0)
+          continue;
+        unsigned registerGroups = (3 * rows + 1) * inputLMUL;
+        if (2 * inputLMUL <= 8 &&
+            registerGroups + 1 <
+                static_cast<unsigned>(options.target.vectorRegisters)) {
+          selected = std::make_pair(rows, inputLMUL);
+          break;
+        }
+      }
+      if (selected)
+        break;
+    }
+    if (!selected)
       return std::nullopt;
-    unsigned registerGroups = (3 * requestedRows + 1) * inputLMUL;
-    if (2 * inputLMUL > 8 ||
-        registerGroups + 1 >=
-            static_cast<unsigned>(options.target.vectorRegisters))
-      return std::nullopt;
-    decision.rowMicrotile = requestedRows;
-    decision.inputLMUL = inputLMUL;
-    decision.computeLMUL = 2 * inputLMUL;
+    decision.rowMicrotile = selected->first;
+    decision.inputLMUL = selected->second;
+    decision.computeLMUL = 2 * selected->second;
     decision.kStripSchedule = VLAStripSchedule::FullThenTail;
     return decision;
   }
