@@ -8,6 +8,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/raw_ostream.h"
@@ -211,9 +212,15 @@ enum class VLAStoreValueMode {
 enum class VLAStateRealization {
   RVVAddReduction,
   RVVMaxReduction,
+  RVVWideningF16DotReduction,
   RVVInclusiveAddScan,
   RVVArgMaxSummary,
   RVVOnlineSoftmaxSummary,
+};
+
+enum class VLAStripSchedule {
+  Dynamic,
+  FullThenTail,
 };
 
 struct VLAPhysicalConfig {
@@ -222,6 +229,7 @@ struct VLAPhysicalConfig {
   unsigned indexSEW = 64;
   unsigned indexLMUL = 4;
   unsigned maskRatio = 16;
+  VLAStripSchedule stripSchedule = VLAStripSchedule::Dynamic;
 };
 
 struct VLAPredicateDecision {
@@ -263,6 +271,16 @@ enum class VLACastRealization {
   RVVNarrowF32ToF16,
 };
 
+enum class RVVTailPolicy {
+  Agnostic,
+  Undisturbed,
+};
+
+struct RVVVectorConfig {
+  unsigned sew = 32;
+  unsigned lmul = 2;
+};
+
 struct VLACastDecision {
   mlir::Operation *operation = nullptr;
   VLACastRealization realization = VLACastRealization::RVVWidenF16ToF32;
@@ -281,6 +299,13 @@ struct VLAStateDecision {
   unsigned dataLMUL = 2;
   unsigned laneIndexLMUL = 2;
   unsigned maskRatio = 16;
+  mlir::Operation *lhsLoad = nullptr;
+  mlir::Operation *rhsLoad = nullptr;
+  RVVVectorConfig inputShape{16, 1};
+  RVVVectorConfig computeShape{32, 2};
+  RVVVectorConfig reductionShape{32, 1};
+  RVVTailPolicy tail = RVVTailPolicy::Undisturbed;
+  llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
 struct VLANarrowDecision {
@@ -328,18 +353,7 @@ struct VLARegionDecision {
 };
 
 enum class SpecializedVLARealization {
-  WideningF16Dot,
   SoftmaxEnvelope,
-};
-
-enum class RVVTailPolicy {
-  Agnostic,
-  Undisturbed,
-};
-
-struct RVVVectorConfig {
-  unsigned sew = 32;
-  unsigned lmul = 2;
 };
 
 struct SpecializedVLAPhysicalConfig {
@@ -354,7 +368,7 @@ struct SpecializedVLAPhysicalConfig {
 
 struct SpecializedVLADecision {
   SpecializedVLARealization realization =
-      SpecializedVLARealization::WideningF16Dot;
+      SpecializedVLARealization::SoftmaxEnvelope;
   mlir::Operation *operation = nullptr;
   mlir::Operation *semanticOperation = nullptr;
   mlir::Operation *consumer = nullptr;
@@ -903,6 +917,7 @@ private:
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
   bool inVLA = false;
+  bool activeVLAFullStrip = false;
   RVVBlockVectorShape activeBlockByteShape = RVVBlockVectorShape::E8M1;
   std::string activeVL;
   const VLARegionDecision *activeVLADecision = nullptr;
@@ -985,6 +1000,15 @@ private:
     return llvm::any_of(
         activeVLADecision->binaries, [&](const VLABinaryDecision &decision) {
           return decision.absorbedProducer == operation;
+        });
+  }
+
+  bool isVLAStateAbsorbed(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return false;
+    return llvm::any_of(
+        activeVLADecision->states, [&](const VLAStateDecision &decision) {
+          return llvm::is_contained(decision.absorbed, operation);
         });
   }
 
@@ -1426,18 +1450,54 @@ private:
               "VLA reduction has no selected f32 all-active realization");
           return mlir::failure();
         }
-        VLAStateRealization realization;
-        if (reduce.getKind() == "add")
-          realization = VLAStateRealization::RVVAddReduction;
-        else if (reduce.getKind() == "max")
-          realization = VLAStateRealization::RVVMaxReduction;
-        else {
+        VLAStateDecision state;
+        state.operation = reduce.getOperation();
+        state.elementType = reduce.getResult().getType();
+        state.identity = reduce.getIdentity();
+        auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
+        auto lhsCast = multiply && multiply.getKind() == "mul"
+                           ? multiply.getLhs().getDefiningOp<CastOp>()
+                           : CastOp{};
+        auto rhsCast = multiply && multiply.getKind() == "mul"
+                           ? multiply.getRhs().getDefiningOp<CastOp>()
+                           : CastOp{};
+        auto lhsLoad = lhsCast ? lhsCast.getInput().getDefiningOp<LoadOp>()
+                               : LoadOp{};
+        auto rhsLoad = rhsCast ? rhsCast.getInput().getDefiningOp<LoadOp>()
+                               : LoadOp{};
+        bool wideningF16Dot =
+            reduce.getKind() == "add" && multiply && lhsCast && rhsCast &&
+            lhsLoad && rhsLoad &&
+            elementType(lhsCast.getResult().getType()).isF32() &&
+            elementType(rhsCast.getResult().getType()).isF32() &&
+            isF16(elementType(lhsLoad.getResult().getType())) &&
+            isF16(elementType(rhsLoad.getResult().getType())) &&
+            isTrue(lhsLoad.getWhere()) && isTrue(rhsLoad.getWhere()) &&
+            lhsLoad.getResult().hasOneUse() &&
+            rhsLoad.getResult().hasOneUse() &&
+            lhsCast.getResult().hasOneUse() &&
+            rhsCast.getResult().hasOneUse() && multiply.getResult().hasOneUse() &&
+            classifyLaneRelation(lhsLoad.getPointer(), decision.coordinate) ==
+                LaneRelation::UnitStride &&
+            classifyLaneRelation(rhsLoad.getPointer(), decision.coordinate) ==
+                LaneRelation::UnitStride;
+        if (wideningF16Dot) {
+          state.realization =
+              VLAStateRealization::RVVWideningF16DotReduction;
+          state.lhsLoad = lhsLoad.getOperation();
+          state.rhsLoad = rhsLoad.getOperation();
+          state.absorbed = {lhsLoad.getOperation(), rhsLoad.getOperation(),
+                            lhsCast.getOperation(), rhsCast.getOperation(),
+                            multiply.getOperation()};
+        } else if (reduce.getKind() == "add") {
+          state.realization = VLAStateRealization::RVVAddReduction;
+        } else if (reduce.getKind() == "max") {
+          state.realization = VLAStateRealization::RVVMaxReduction;
+        } else {
           reduce.emitError("VLA reduction kind has no physical realization");
           return mlir::failure();
         }
-        decision.states.push_back(VLAStateDecision{
-            reduce.getOperation(), realization, reduce.getResult().getType(),
-            reduce.getIdentity()});
+        decision.states.push_back(std::move(state));
       } else if (auto scan = mlir::dyn_cast<ScanOp>(nested)) {
         if (!elementType(scan.getInput().getType()).isF32() ||
             !elementType(scan.getResult().getType()).isF32() ||
@@ -1492,6 +1552,11 @@ private:
             return isRegionValue(type) && elementType(type).isF32();
           });
         });
+    bool hasWideningF16Dot = llvm::any_of(
+        decision.states, [](const VLAStateDecision &state) {
+          return state.realization ==
+                 VLAStateRealization::RVVWideningF16DotReduction;
+        });
     bool onlyF16Accesses = !decision.accesses.empty() &&
                            llvm::all_of(decision.accesses,
                                         [](const VLAAccessDecision &access) {
@@ -1518,6 +1583,10 @@ private:
         !hasF32RegionValue && onlyF16Accesses) {
       decision.physical.dataSEW = 16;
       decision.physical.dataLMUL = 8;
+    } else if (hasWideningF16Dot) {
+      decision.physical.dataSEW = 32;
+      decision.physical.dataLMUL = 2;
+      decision.physical.stripSchedule = VLAStripSchedule::FullThenTail;
     } else if (decision.contracts.empty() && decision.narrows.empty() &&
                decision.states.empty() && decision.predicates.empty() &&
                hasFloatCast && !requiresF32M2Math) {
@@ -1630,6 +1699,9 @@ private:
     }
 
     for (VLAStateDecision &state : decision.states) {
+      if (state.realization ==
+          VLAStateRealization::RVVWideningF16DotReduction)
+        continue;
       state.dataLMUL = decision.physical.dataLMUL;
       state.laneIndexLMUL = decision.physical.dataLMUL;
       state.maskRatio = decision.physical.maskRatio;
@@ -1646,6 +1718,8 @@ private:
 
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
     if (consumed.contains(operation))
+      return mlir::success();
+    if (isVLAStateAbsorbed(operation))
       return mlir::success();
     if (const VLAContractDecision *decision =
             findVLAContractDecision(operation))
@@ -2069,174 +2143,13 @@ private:
     return mlir::success();
   }
 
-  std::optional<SpecializedVLADecision> decideWideningF16DotVLA(VLAOp op) {
-    if (op.getNumResults() != 1 || !op.getResult(0).getType().isF32())
-      return std::nullopt;
-    mlir::Block &body = op.getBody().front();
-    unsigned loadCount = 0;
-    unsigned castCount = 0;
-    unsigned binaryCount = 0;
-    unsigned reduceCount = 0;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        continue;
-      if (mlir::isa<LoadOp>(nested))
-        ++loadCount;
-      else if (mlir::isa<CastOp>(nested))
-        ++castCount;
-      else if (mlir::isa<BinaryOp>(nested))
-        ++binaryCount;
-      else if (mlir::isa<ReduceOp>(nested))
-        ++reduceCount;
-      else
-        return std::nullopt;
-    }
-    if (loadCount != 2 || castCount != 2 || binaryCount != 1 ||
-        reduceCount != 1)
-      return std::nullopt;
-    auto yield = mlir::cast<YieldOp>(body.getTerminator());
-    if (yield.getNumOperands() != 1)
-      return std::nullopt;
-    auto reduce = yield.getOperand(0).getDefiningOp<ReduceOp>();
-    if (!reduce || reduce.getKind() != "add" || reduce.getAxis() != -1 ||
-        !isTrue(reduce.getWhere()))
-      return std::nullopt;
-    auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
-    if (!multiply || multiply.getKind() != "mul")
-      return std::nullopt;
-    auto lhsCast = multiply.getLhs().getDefiningOp<CastOp>();
-    auto rhsCast = multiply.getRhs().getDefiningOp<CastOp>();
-    if (!lhsCast || !rhsCast ||
-        !elementType(lhsCast.getResult().getType()).isF32() ||
-        !elementType(rhsCast.getResult().getType()).isF32())
-      return std::nullopt;
-    auto lhsLoad = lhsCast.getInput().getDefiningOp<LoadOp>();
-    auto rhsLoad = rhsCast.getInput().getDefiningOp<LoadOp>();
-    if (!lhsLoad || !rhsLoad || !isTrue(lhsLoad.getWhere()) ||
-        !isTrue(rhsLoad.getWhere()) ||
-        !isF16(elementType(lhsLoad.getResult().getType())) ||
-        !isF16(elementType(rhsLoad.getResult().getType())))
-      return std::nullopt;
-
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(lhsLoad.getPointer(), coordinate) ||
-        !valueDependsOn(rhsLoad.getPointer(), coordinate))
-      return std::nullopt;
-    std::optional<std::string> lhs =
-        pointerBase(lhsLoad.getPointer(), coordinate);
-    std::optional<std::string> rhs =
-        pointerBase(rhsLoad.getPointer(), coordinate);
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    std::string identity = expression(reduce.getIdentity());
-    if (!lhs || !rhs || begin.spelling.empty() || end.spelling.empty() ||
-        identity.empty())
-      return std::nullopt;
-
-    SpecializedVLADecision decision;
-    decision.realization = SpecializedVLARealization::WideningF16Dot;
-    decision.operation = op.getOperation();
-    decision.semanticOperation = reduce.getOperation();
-    decision.begin = begin.spelling;
-    decision.end = end.spelling;
-    decision.firstPointer = *lhs;
-    decision.secondPointer = *rhs;
-    decision.scalar = identity;
-    decision.physical.input = {16, 1};
-    decision.physical.compute = {32, 2};
-    decision.physical.output = {32, 1};
-    decision.physical.reduction = {32, 1};
-    decision.physical.tail = RVVTailPolicy::Undisturbed;
-    return decision;
-  }
-
-  mlir::LogicalResult emitWideningF16DotVLA(
-      const SpecializedVLADecision &decision) {
-    auto op = mlir::cast<VLAOp>(decision.operation);
-    auto reduce = mlir::cast<ReduceOp>(decision.semanticOperation);
-    const RVVVectorConfig &input = decision.physical.input;
-    const RVVVectorConfig &compute = decision.physical.compute;
-    const RVVVectorConfig &reduction = decision.physical.reduction;
-    std::string fullVL = fresh("dot_vl");
-    std::string accumulator = fresh("dot_acc");
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string lhsVector = fresh("dot_lhs");
-    std::string rhsVector = fresh("dot_rhs");
-    std::string seed = fresh("dot_seed");
-    std::string reduced = fresh("dot_reduced");
-    std::string result = fresh("dot");
-    line("const size_t " + fullVL + " = __riscv_vsetvlmax_e" +
-         std::to_string(input.sew) + "m" + std::to_string(input.lmul) +
-         "();");
-    line(rvvFloatType(compute) + " " + accumulator +
-         " = __riscv_vfmv_v_f_" + rvvFloatSuffix(compute) + "(0.0f, " +
-         fullVL + ");");
-    line("size_t " + strip + " = " + decision.begin + ";");
-    line("for (; " + strip + " + " + fullVL + " <= " + decision.end + "; " +
-         strip + " += " + fullVL + ") {");
-    ++indent;
-    line(rvvFloatType(input) + " " + lhsVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.firstPointer +
-         " + " + strip + ", " + fullVL + ");");
-    line(rvvFloatType(input) + " " + rhsVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.secondPointer +
-         " + " + strip + ", " + fullVL + ");");
-    line(accumulator + " = __riscv_vfwmacc_vv_" + rvvFloatSuffix(compute) +
-         "(" + accumulator + ", " + lhsVector + ", " + rhsVector + ", " +
-         fullVL + ");");
-    --indent;
-    line("}");
-    line("if (" + strip + " < " + decision.end + ") {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(input.sew) + "m" + std::to_string(input.lmul) + "(" +
-         decision.end + " - " + strip + ");");
-    line(rvvFloatType(input) + " " + lhsVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.firstPointer +
-         " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(input) + " " + rhsVector + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.secondPointer +
-         " + " + strip + ", " + vl + ");");
-    std::string tailSuffix =
-        decision.physical.tail == RVVTailPolicy::Undisturbed ? "_tu" : "";
-    line(accumulator + " = __riscv_vfwmacc_vv_" + rvvFloatSuffix(compute) +
-         tailSuffix + "(" + accumulator + ", " + lhsVector + ", " + rhsVector +
-         ", " + vl + ");");
-    --indent;
-    line("}");
-    line(rvvFloatType(reduction) + " " + seed + " = __riscv_vfmv_v_f_" +
-         rvvFloatSuffix(reduction) + "(" +
-         decision.scalar +
-         ", 1);");
-    line(rvvFloatType(reduction) + " " + reduced +
-         " = __riscv_vfredusum_vs_" + rvvFloatSuffix(compute) + "_" +
-         rvvFloatSuffix(reduction) + "(" + accumulator + ", " + seed + ", " +
-         fullVL + ");");
-    line("const float " + result + " = __riscv_vfmv_f_s_" +
-         rvvFloatSuffix(reduction) + "_f32(" + reduced + ");");
-    CValue materialized{op.getResult(0).getType(), CValueKind::Scalar, result};
-    values[reduce.getResult()] = materialized;
-    values[op.getResult(0)] = materialized;
-    return mlir::success();
-  }
-
   std::optional<SpecializedVLADecision> decideSpecializedVLA(VLAOp op) {
-    if (std::optional<SpecializedVLADecision> decision =
-            decideWideningF16DotVLA(op))
-      return decision;
     return decideSoftmaxEnvelope(op);
   }
 
   mlir::LogicalResult
   emitSpecializedVLA(const SpecializedVLADecision &decision) {
     switch (decision.realization) {
-    case SpecializedVLARealization::WideningF16Dot:
-      return emitWideningF16DotVLA(decision);
     case SpecializedVLARealization::SoftmaxEnvelope:
       return emitSoftmaxEnvelope(decision);
     }
@@ -2260,6 +2173,24 @@ private:
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
+      if (state.realization ==
+          VLAStateRealization::RVVWideningF16DotReduction) {
+        std::string fullVL = fresh("dot_vl");
+        std::string accumulator = fresh("dot_acc");
+        line("const size_t " + fullVL + " = __riscv_vsetvlmax_e" +
+             std::to_string(state.inputShape.sew) + "m" +
+             std::to_string(state.inputShape.lmul) + "();");
+        line(rvvFloatType(state.computeShape) + " " + accumulator +
+             " = __riscv_vfmv_v_f_" + rvvFloatSuffix(state.computeShape) +
+             "(0.0f, " + fullVL + ");");
+        CValue aggregate{state.elementType, CValueKind::F32BlockStorage,
+                         accumulator};
+        aggregate.fields.push_back(
+            CValue{mlir::IndexType::get(kernel.getContext()),
+                   CValueKind::Scalar, fullVL});
+        aggregates[state.operation] = aggregate;
+        continue;
+      }
       if (state.realization == VLAStateRealization::RVVArgMaxSummary) {
         auto summary = mlir::cast<SummaryFoldOp>(state.operation);
         auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
@@ -2322,64 +2253,145 @@ private:
       return op.emitError("VLA bounds are unavailable");
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(decision.physical.dataSEW) + "m" +
-         std::to_string(decision.physical.dataLMUL) + "(" + end.spelling +
-         " - " + strip + ");");
-
     bool previousInVLA = inVLA;
     std::string previousVL = activeVL;
     const VLARegionDecision *previousDecision = activeVLADecision;
-    inVLA = true;
-    activeVL = vl;
-    activeVLADecision = &decision;
-    CValue coordinate{body.getArgument(0).getType(), CValueKind::Coordinate,
-                      strip};
-    coordinate.laneStride = "1";
-    values[body.getArgument(0)] = std::move(coordinate);
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
-        const VLAStateDecision *state =
-            findStateDecision(reduce.getOperation());
-        if (!state || mlir::failed(emitVectorReduce(
-                          reduce, *state, aggregates[reduce.getOperation()])))
+    auto emitStripBody = [&](bool fullStrip) -> mlir::LogicalResult {
+      bool previousFullStrip = activeVLAFullStrip;
+      inVLA = true;
+      activeVLAFullStrip = fullStrip;
+      activeVL = vl;
+      activeVLADecision = &decision;
+      auto restoreVLAState = llvm::make_scope_exit([&] {
+        inVLA = previousInVLA;
+        activeVLAFullStrip = previousFullStrip;
+        activeVL = previousVL;
+        activeVLADecision = previousDecision;
+      });
+      CValue coordinate{body.getArgument(0).getType(), CValueKind::Coordinate,
+                        strip};
+      coordinate.laneStride = "1";
+      values[body.getArgument(0)] = std::move(coordinate);
+      for (mlir::Operation &nested : body.without_terminator()) {
+        if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
+          const VLAStateDecision *state =
+              findStateDecision(reduce.getOperation());
+          if (!state)
+            return reduce.emitError(
+                "VLA reduction has no physical state decision");
+          mlir::LogicalResult lowered =
+              state->realization ==
+                      VLAStateRealization::RVVWideningF16DotReduction
+                  ? emitWideningF16DotStrip(
+                        reduce, *state, aggregates[reduce.getOperation()])
+                  : emitVectorReduce(reduce, *state,
+                                     aggregates[reduce.getOperation()]);
+          if (mlir::failed(lowered))
+            return mlir::failure();
+          continue;
+        }
+        if (auto scan = mlir::dyn_cast<ScanOp>(nested)) {
+          const VLAStateDecision *state = findStateDecision(scan.getOperation());
+          if (!state || mlir::failed(emitVectorScan(
+                            scan, *state, aggregates[scan.getOperation()])))
+            return mlir::failure();
+          continue;
+        }
+        if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
+          const VLAStateDecision *state =
+              findStateDecision(summary.getOperation());
+          if (!state)
+            return summary.emitError(
+                "VLA summary has no physical state decision");
+          mlir::LogicalResult lowered =
+              state->realization == VLAStateRealization::RVVArgMaxSummary
+                  ? emitVectorArgMaxSummary(
+                        summary, *state, aggregates[summary.getOperation()])
+                  : emitOnlineSoftmaxSummary(
+                        summary, *state, aggregates[summary.getOperation()]);
+          if (mlir::failed(lowered))
+            return mlir::failure();
+          continue;
+        }
+        if (mlir::failed(emitOperation(&nested)))
           return mlir::failure();
-        continue;
       }
-      if (auto scan = mlir::dyn_cast<ScanOp>(nested)) {
-        const VLAStateDecision *state = findStateDecision(scan.getOperation());
-        if (!state || mlir::failed(emitVectorScan(
-                          scan, *state, aggregates[scan.getOperation()])))
-          return mlir::failure();
-        continue;
-      }
-      if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
-        const VLAStateDecision *state =
-            findStateDecision(summary.getOperation());
-        if (!state)
-          return summary.emitError("VLA summary has no physical state decision");
-        mlir::LogicalResult lowered =
-            state->realization == VLAStateRealization::RVVArgMaxSummary
-                ? emitVectorArgMaxSummary(
-                      summary, *state, aggregates[summary.getOperation()])
-                : emitOnlineSoftmaxSummary(
-                      summary, *state, aggregates[summary.getOperation()]);
-        if (mlir::failed(lowered))
-          return mlir::failure();
-        continue;
-      }
-      if (mlir::failed(emitOperation(&nested)))
+      return mlir::success();
+    };
+
+    if (decision.physical.stripSchedule == VLAStripSchedule::FullThenTail) {
+      auto wideningState = llvm::find_if(
+          decision.states, [](const VLAStateDecision &state) {
+            return state.realization ==
+                   VLAStateRealization::RVVWideningF16DotReduction;
+          });
+      if (wideningState == decision.states.end())
+        return op.emitError("full-then-tail VLA has no owning state decision");
+      auto aggregate = aggregates.find(wideningState->operation);
+      if (aggregate == aggregates.end() || aggregate->second.fields.size() != 1 ||
+          aggregate->second.fields.front().spelling.empty())
+        return op.emitError("full-then-tail VLA has no selected full VL");
+      std::string fullVL = aggregate->second.fields.front().spelling;
+      line("size_t " + strip + " = " + begin.spelling + ";");
+      line("for (; " + strip + " + " + fullVL + " <= " + end.spelling + "; " +
+           strip + " += " + fullVL + ") {");
+      ++indent;
+      line("const size_t " + vl + " = " + fullVL + ";");
+      if (mlir::failed(emitStripBody(true)))
         return mlir::failure();
+      --indent;
+      line("}");
+      line("if (" + strip + " < " + end.spelling + ") {");
+      ++indent;
+      line("const size_t " + vl + " = __riscv_vsetvl_e" +
+           std::to_string(decision.physical.dataSEW) + "m" +
+           std::to_string(decision.physical.dataLMUL) + "(" + end.spelling +
+           " - " + strip + ");");
+      if (mlir::failed(emitStripBody(false)))
+        return mlir::failure();
+      --indent;
+      line("}");
+    } else {
+      line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+           " < " + end.spelling + ";) {");
+      ++indent;
+      line("const size_t " + vl + " = __riscv_vsetvl_e" +
+           std::to_string(decision.physical.dataSEW) + "m" +
+           std::to_string(decision.physical.dataLMUL) + "(" + end.spelling +
+           " - " + strip + ");");
+      if (mlir::failed(emitStripBody(false)))
+        return mlir::failure();
+      line(strip + " += " + vl + ";");
+      --indent;
+      line("}");
     }
-    line(strip + " += " + vl + ";");
-    inVLA = previousInVLA;
-    activeVL = previousVL;
-    activeVLADecision = previousDecision;
-    --indent;
-    line("}");
+
+    for (const VLAStateDecision &state : decision.states) {
+      if (state.realization !=
+          VLAStateRealization::RVVWideningF16DotReduction)
+        continue;
+      auto reduce = mlir::cast<ReduceOp>(state.operation);
+      CValue aggregate = aggregates[state.operation];
+      if (aggregate.fields.size() != 1 ||
+          aggregate.fields.front().spelling.empty())
+        return reduce.emitError("widening dot full VL is unavailable");
+      const std::string &fullVL = aggregate.fields.front().spelling;
+      std::string seed = fresh("dot_seed");
+      std::string reduced = fresh("dot_reduced");
+      std::string result = fresh("dot");
+      line(rvvFloatType(state.reductionShape) + " " + seed +
+           " = __riscv_vfmv_v_f_" + rvvFloatSuffix(state.reductionShape) +
+           "(" + expression(state.identity) + ", 1);");
+      line(rvvFloatType(state.reductionShape) + " " + reduced +
+           " = __riscv_vfredusum_vs_" + rvvFloatSuffix(state.computeShape) +
+           "_" + rvvFloatSuffix(state.reductionShape) + "(" +
+           aggregate.spelling + ", " + seed + ", " + fullVL + ");");
+      line("const float " + result + " = __riscv_vfmv_f_s_" +
+           rvvFloatSuffix(state.reductionShape) + "_f32(" + reduced + ");");
+      CValue materialized{reduce.getResult().getType(), CValueKind::Scalar,
+                          result};
+      values[reduce.getResult()] = materialized;
+    }
 
     auto yield = mlir::cast<YieldOp>(body.getTerminator());
     for (auto [result, yielded] :
@@ -6252,6 +6264,43 @@ private:
     line(aggregate.spelling + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
          ");");
     values[op.getResult()] = aggregate;
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitWideningF16DotStrip(
+      ReduceOp op, const VLAStateDecision &decision, CValue &aggregate) {
+    if (aggregate.kind != CValueKind::F32BlockStorage ||
+        aggregate.spelling.empty())
+      return op.emitError("widening dot accumulator is unavailable");
+    auto lhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.lhsLoad);
+    auto rhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.rhsLoad);
+    if (!lhsLoad || !rhsLoad)
+      return op.emitError("widening dot load facts are unavailable");
+    mlir::Value coordinate = activeVLADecision->coordinate;
+    std::optional<std::string> lhs = pointerBase(lhsLoad.getPointer(), coordinate);
+    std::optional<std::string> rhs = pointerBase(rhsLoad.getPointer(), coordinate);
+    if (!lhs || !rhs)
+      return op.emitError("widening dot pointer projection is unavailable");
+    std::string lhsVector = fresh("dot_lhs");
+    std::string rhsVector = fresh("dot_rhs");
+    line(rvvFloatType(decision.inputShape) + " " + lhsVector +
+         " = __riscv_vle" + std::to_string(decision.inputShape.sew) + "_v_" +
+         rvvFloatSuffix(decision.inputShape) + "(" + *lhs + " + " +
+         require(coordinate).spelling + ", " + activeVL + ");");
+    line(rvvFloatType(decision.inputShape) + " " + rhsVector +
+         " = __riscv_vle" + std::to_string(decision.inputShape.sew) + "_v_" +
+         rvvFloatSuffix(decision.inputShape) + "(" + *rhs + " + " +
+         require(coordinate).spelling + ", " + activeVL + ");");
+    std::string intrinsic = "__riscv_vfwmacc_vv_" +
+                            rvvFloatSuffix(decision.computeShape);
+    if (decision.tail == RVVTailPolicy::Undisturbed && !activeVLAFullStrip) {
+      line(aggregate.spelling + " = " + intrinsic + "_tu(" +
+           aggregate.spelling + ", " + lhsVector + ", " + rhsVector + ", " +
+           activeVL + ");");
+    } else {
+      line(aggregate.spelling + " = " + intrinsic + "(" + aggregate.spelling +
+           ", " + lhsVector + ", " + rhsVector + ", " + activeVL + ");");
+    }
     return mlir::success();
   }
 
