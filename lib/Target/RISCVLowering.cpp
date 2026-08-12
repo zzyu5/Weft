@@ -1016,6 +1016,21 @@ private:
       groupedAffineI4I8Decisions.try_emplace(op.getOperation(),
                                              std::move(decision));
     });
+    kernel.walk([&](DecodeOp op) {
+      if (decisionFailure)
+        return;
+      BlockDecodeDecision decision;
+      if (mlir::failed(decideBlockDecode(op, decision))) {
+        decisionFailure = true;
+        return;
+      }
+      if (!blockDecodeDecisions
+               .try_emplace(op.getOperation(), std::move(decision))
+               .second) {
+        op.emitError("one decode primitive cannot own multiple physical decisions");
+        decisionFailure = true;
+      }
+    });
     if (decisionFailure)
       return mlir::failure();
     return mlir::success();
@@ -1038,6 +1053,7 @@ private:
       e2m1E8M0I8Decisions;
   llvm::DenseMap<mlir::Operation *, GroupedAffineI4I8Decision>
       groupedAffineI4I8Decisions;
+  llvm::DenseMap<mlir::Operation *, BlockDecodeDecision> blockDecodeDecisions;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -6179,10 +6195,10 @@ private:
     if (auto op = mlir::dyn_cast<LoadOp>(operation))
       return emitBlockLoad(op, blockValues, vl);
     if (auto op = mlir::dyn_cast<DecodeOp>(operation)) {
-      BlockDecodeDecision decision;
-      if (mlir::failed(decideBlockDecode(op, decision)))
-        return mlir::failure();
-      return emitBlockDecode(op, decision, blockValues, vl);
+      auto found = blockDecodeDecisions.find(op.getOperation());
+      if (found == blockDecodeDecisions.end())
+        return op.emitError("block decode has no selected physical decision");
+      return emitBlockDecode(op, found->second, blockValues, vl);
     }
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       return emitBlockStore(op, blockValues, vl);
