@@ -114,7 +114,6 @@ enum class BlockReduceRealization {
 struct BlockReducePhysicalDecision {
   BlockReduceRealization realization =
       BlockReduceRealization::RVVE8M1DynamicStrips;
-  RVVBlockVectorShape inputShape = RVVBlockVectorShape::E8M1;
   unsigned stripVL = 16;
   bool needsLaneVector = false;
 };
@@ -5909,9 +5908,8 @@ private:
            std::to_string(physical.stripVL) + ");");
       llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
           stripValues;
-      for (int64_t stripOffset : {int64_t{0}, int64_t{4}, int64_t{8},
-                                  int64_t{12}, int64_t{16}, int64_t{20},
-                                  int64_t{24}, int64_t{28}}) {
+      for (int64_t stripOffset = 0; stripOffset < *extent;
+           stripOffset += physical.stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(),
                               BlockValueKind::Index, ""};
@@ -5938,15 +5936,18 @@ private:
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
            std::to_string(physical.stripVL) + ");");
       if (mlir::failed(emitStrip("0", vl)) ||
-          mlir::failed(emitStrip("16", vl)))
+          mlir::failed(
+              emitStrip(std::to_string(physical.stripVL), vl)))
         return mlir::failure();
     } else {
       line("for (size_t " + strip + " = 0; " + strip + " < " +
            std::to_string(*extent) + ";) {");
       ++indent;
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
-           std::to_string(*extent) + " - " + strip + ") < 16 ? (" +
-           std::to_string(*extent) + " - " + strip + ") : 16);");
+           std::to_string(*extent) + " - " + strip + ") < " +
+           std::to_string(physical.stripVL) + " ? (" +
+           std::to_string(*extent) + " - " + strip + ") : " +
+           std::to_string(physical.stripVL) + ");");
       if (physical.needsLaneVector) {
         line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl +
              ");");
@@ -6064,7 +6065,8 @@ private:
       llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
       for (auto [index, reduction] : llvm::enumerate(reductions))
         reductionIndices[reduction.getOperation()] = index;
-      for (int64_t stripOffset : {int64_t{0}, int64_t{16}}) {
+      for (int64_t stripOffset = 0; stripOffset < extent;
+           stripOffset += physical.stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
                               ""};
@@ -6143,8 +6145,10 @@ private:
          std::to_string(extent) + ";) {");
     ++indent;
     line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
-         std::to_string(extent) + " - " + strip + ") < 16 ? (" +
-         std::to_string(extent) + " - " + strip + ") : 16);");
+         std::to_string(extent) + " - " + strip + ") < " +
+         std::to_string(physical.stripVL) + " ? (" +
+         std::to_string(extent) + " - " + strip + ") : " +
+         std::to_string(physical.stripVL) + ");");
 
     if (physical.needsLaneVector) {
       line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl + ");");
