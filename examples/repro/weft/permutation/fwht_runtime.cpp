@@ -7,12 +7,13 @@
 #include <vector>
 
 extern "C" void fwht_f32(float *data, std::size_t batches,
-                          std::size_t extent);
+                          std::size_t extent, std::size_t stages);
 
 namespace {
 
 constexpr std::size_t kBatches = 1024;
 constexpr std::size_t kExtent = 4096;
+constexpr std::size_t kStages = 12;
 constexpr std::size_t kElements = kBatches * kExtent;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
 volatile std::uint64_t evictionSink = 0;
@@ -54,7 +55,7 @@ int main() {
   std::vector<float> expected = input;
   std::vector<float> output = input;
   reference(expected);
-  fwht_f32(output.data(), kBatches, kExtent);
+  fwht_f32(output.data(), kBatches, kExtent, kStages);
   double maxAbsolute = 0.0;
   double maxRelative = 0.0;
   for (std::size_t index = 0; index < kElements; ++index) {
@@ -78,7 +79,7 @@ int main() {
     output = input;
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    fwht_f32(output.data(), kBatches, kExtent);
+    fwht_f32(output.data(), kBatches, kExtent, kStages);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
