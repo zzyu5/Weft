@@ -1084,9 +1084,18 @@ private:
       decision.contracts.push_back(std::move(*selected));
     }
     if (!decision.contracts.empty()) {
-      decision.dataLMUL = 4;
-      decision.maskRatio = 8;
-      decision.indexLMUL = options.target.xlen == 64 ? 8 : 4;
+      decision.dataLMUL = decision.contracts.front().lmul;
+      if (!llvm::all_of(decision.contracts,
+                        [&](const VLAContractDecision &contract) {
+                          return contract.lmul == decision.dataLMUL;
+                        })) {
+        op.emitError("one VLA region requires one shared contract LMUL");
+        return mlir::failure();
+      }
+      decision.maskRatio = 32 / decision.dataLMUL;
+      decision.indexLMUL = options.target.xlen == 64
+                               ? decision.dataLMUL * 2
+                               : decision.dataLMUL;
     }
 
     auto isContractOwned = [&](mlir::Operation *operation) {
