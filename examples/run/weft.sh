@@ -101,6 +101,17 @@ case "${kernel}" in
     dsl=examples/kernels/reduction/cumsum.py
     runtime=examples/repro/weft/reduction/cumsum_runtime.cpp
     ;;
+  segmented_scan)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 segmented_scan" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/segmented_scan.py
+    runtime=examples/repro/weft/reduction/segmented_scan_runtime.cpp
+    multi=1
+    multi_primary=segmented_inclusive_scan_f32
+    multi_equivalent=segmented_inclusive_scan_f32_equivalent
+    ;;
   argmax)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 argmax" >&2
@@ -337,6 +348,14 @@ case "${kernel}" in
     multi=1
     multi_primary=weighted_embedding_bag_f32
     multi_equivalent=weighted_embedding_bag_f32_equivalent
+    ;;
+  csr_spmv)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 csr_spmv" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/sparse/csr_spmv.py
+    runtime=examples/repro/weft/sparse/csr_spmv_runtime.cpp
     ;;
   add_id)
     if [[ $# -ne 0 ]]; then
