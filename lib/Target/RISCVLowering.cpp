@@ -314,6 +314,8 @@ enum class VLAStateConsumerRealization {
 };
 
 enum class VLAStatePlacement {
+  ScalarCarry,
+  VectorCarry,
   StackScratch,
 };
 
@@ -350,6 +352,7 @@ struct VLAStateDecision {
   RVVTailPolicy tail = RVVTailPolicy::Undisturbed;
   llvm::SmallVector<mlir::Operation *> absorbed;
   std::optional<VLAStateConsumerDecision> consumer;
+  VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
 };
 
 struct VLANarrowDecision {
@@ -1736,10 +1739,19 @@ private:
           state.absorbed = {lhsLoad.getOperation(), rhsLoad.getOperation(),
                             lhsCast.getOperation(), rhsCast.getOperation(),
                             multiply.getOperation()};
+          state.placement = VLAStatePlacement::VectorCarry;
         } else if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
+          state.placement = reduce.getOrder() == "relaxed" &&
+                                    !integerConstantValue(op.getEnd())
+                                ? VLAStatePlacement::VectorCarry
+                                : VLAStatePlacement::ScalarCarry;
         } else if (reduce.getKind() == "max") {
           state.realization = VLAStateRealization::RVVMaxReduction;
+          state.placement = reduce.getOrder() == "relaxed" &&
+                                    !integerConstantValue(op.getEnd())
+                                ? VLAStatePlacement::VectorCarry
+                                : VLAStatePlacement::ScalarCarry;
         } else {
           reduce.emitError("VLA reduction kind has no physical realization");
           return mlir::failure();
@@ -2574,6 +2586,20 @@ private:
         aggregates[state.operation] = aggregate;
         continue;
       }
+      if ((state.realization == VLAStateRealization::RVVAddReduction ||
+           state.realization == VLAStateRealization::RVVMaxReduction) &&
+          state.placement == VLAStatePlacement::VectorCarry) {
+        std::string accumulator = fresh("reduce_acc");
+        std::string suffix = "f32m" + std::to_string(state.dataLMUL);
+        line("vfloat32m" + std::to_string(state.dataLMUL) + "_t " +
+             accumulator + " = __riscv_vfmv_v_f_" + suffix + "(" +
+             expression(state.identity) + ", __riscv_vsetvlmax_e32m" +
+             std::to_string(state.dataLMUL) + "());");
+        CValue aggregate{state.elementType, CValueKind::F32BlockStorage,
+                         accumulator};
+        aggregates[state.operation] = aggregate;
+        continue;
+      }
       if (state.realization == VLAStateRealization::RVVArgMaxSummary) {
         auto summary = mlir::cast<SummaryFoldOp>(state.operation);
         auto identity = summary.getIdentity().getDefiningOp<TupleOp>();
@@ -2747,6 +2773,34 @@ private:
       line(strip + " += " + vl + ";");
       --indent;
       line("}");
+    }
+
+    for (const VLAStateDecision &state : decision.states) {
+      if ((state.realization != VLAStateRealization::RVVAddReduction &&
+           state.realization != VLAStateRealization::RVVMaxReduction) ||
+          state.placement != VLAStatePlacement::VectorCarry)
+        continue;
+      auto reduce = mlir::cast<ReduceOp>(state.operation);
+      CValue aggregate = aggregates[state.operation];
+      std::string seed = fresh("reduce_seed");
+      std::string reduced = fresh("reduce_final");
+      std::string result = fresh("reduce_result");
+      std::string suffix = "f32m" + std::to_string(state.dataLMUL);
+      line("vfloat32m1_t " + seed +
+           " = __riscv_vfmv_v_f_f32m1(" + expression(state.identity) +
+           ", 1);");
+      std::string intrinsic =
+          state.realization == VLAStateRealization::RVVAddReduction
+              ? "__riscv_vfredusum_vs_"
+              : "__riscv_vfredmax_vs_";
+      line("vfloat32m1_t " + reduced + " = " + intrinsic + suffix +
+           "_f32m1(" + aggregate.spelling + ", " + seed +
+           ", __riscv_vsetvlmax_e32m" + std::to_string(state.dataLMUL) +
+           "());");
+      line("const float " + result +
+           " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
+      values[reduce.getResult()] =
+          CValue{reduce.getResult().getType(), CValueKind::Scalar, result};
     }
 
     for (const VLAStateDecision &state : decision.states) {
@@ -6892,9 +6946,26 @@ private:
                                        const VLAStateDecision &decision,
                                        const CValue &aggregate) {
     CValue input = require(op.getInput());
-    if (input.kind != CValueKind::F32Vector ||
-        aggregate.kind != CValueKind::Scalar || aggregate.spelling.empty())
+    if (input.kind != CValueKind::F32Vector || aggregate.spelling.empty())
       return op.emitError("RVV reduction projection is unavailable");
+    if (decision.placement == VLAStatePlacement::VectorCarry) {
+      if (aggregate.kind != CValueKind::F32BlockStorage)
+        return op.emitError("RVV vector reduction carry is unavailable");
+      std::string suffix = "f32m" + std::to_string(decision.dataLMUL);
+      if (decision.realization == VLAStateRealization::RVVAddReduction)
+        line(aggregate.spelling + " = __riscv_vfadd_vv_" + suffix + "_tu(" +
+             aggregate.spelling + ", " + aggregate.spelling + ", " +
+             input.spelling + ", " + activeVL + ");");
+      else if (decision.realization == VLAStateRealization::RVVMaxReduction)
+        line(aggregate.spelling + " = __riscv_vfmax_vv_" + suffix + "_tu(" +
+             aggregate.spelling + ", " + aggregate.spelling + ", " +
+             input.spelling + ", " + activeVL + ");");
+      else
+        return op.emitError("selected VLA state is not a reduction");
+      return mlir::success();
+    }
+    if (aggregate.kind != CValueKind::Scalar)
+      return op.emitError("RVV scalar reduction carry is unavailable");
     std::string seed = fresh("seed");
     std::string partial = fresh("partial");
     std::string inputSuffix = "f32m" + std::to_string(decision.dataLMUL);
