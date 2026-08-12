@@ -62,8 +62,8 @@ selected index，以及排序、cutoff 与 sampled token 全量零 mismatch；�
 | Segmented scan | LMUL=4 | 9.881044 ms | f32m4 + u8m1 segment state |
 | CSR SpMV | LMUL=1 | 23.999645 ms | u32m1 offsets + f32m1 indexed gather |
 | CSR SpMV | LMUL=4 | 20.758271 ms | u32m4 offsets + f32m4 indexed gather |
-| FWHT | LMUL=1 | 26.429536 ms | 更小 strip/butterfly vectors |
-| FWHT | LMUL=4 | 28.755026 ms | 更宽 strip/butterfly vectors |
+| FWHT | LMUL=1 | 25.026370 ms | 更小 strip/butterfly vectors |
+| FWHT | LMUL=4 | 28.729046 ms | 更宽 strip/butterfly vectors |
 | AdamW | LMUL=1 | 83.227385 ms | f32m1 pointwise/sqrt |
 | AdamW | LMUL=4 | 68.594461 ms | f32m4 pointwise/sqrt |
 | AdamW | LMUL=8 | 61.426150 ms | f32m8 pointwise/sqrt |
