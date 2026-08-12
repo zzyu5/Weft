@@ -9,7 +9,7 @@ irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"e
 memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,6.096647,0.687969,GB/s
 staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RVV-intrinsic-C,"tokens=128;heads=32;D=128",full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,1.060685,,
 mixed_attention,online_flash_attention_f32_f16,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,23.609423,,
-matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.256496,10.303846,GOP/s
+matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.238116,10.362332,GOP/s
 predicate_memory,causal_mask_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"attention[heads=32;Q=128;K=2048]",full-causal-score-mask,10,0,64,full,no,,,,,6.663109,1258.963046,MElements/s
 scan_state,cumsum_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,"mamba_dt[sequences=1;heads=64;tokens=4096]",full-inclusive-prefix-scan,10,0,64,full,no,,,0,0,0.377391,694.620838,MElements/s
 normalization,layer_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,7.75927274e-07,4.7606631e-07,0.982864,533.428837,MElements/s
