@@ -251,6 +251,8 @@ struct VLAContractDecision {
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
   unsigned lmul = 2;
+  unsigned kUnroll = 1;
+  unsigned vectorRegisterGroups = 0;
   VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
   bool lhsPredicateVariesByReduction = false;
@@ -383,6 +385,19 @@ struct ContractDecision {
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
   unsigned lmul = 4;
+  unsigned kUnroll = 1;
+  unsigned vectorRegisterGroups = 0;
+};
+
+struct F32ContractPhysicalConfig {
+  unsigned lmul = 1;
+  unsigned kUnroll = 1;
+  unsigned vectorRegisterGroups = 0;
+};
+
+enum class F32ContractResourceModel {
+  VLAFreeAxis,
+  LocalRow,
 };
 
 std::string sanitize(llvm::StringRef input) {
@@ -957,6 +972,35 @@ private:
       collectLocalDefinitions(operand, block, definitions, axes);
   }
 
+  std::optional<F32ContractPhysicalConfig>
+  selectF32ContractPhysicalConfig(F32ContractResourceModel model,
+                                  unsigned rowTile,
+                                  unsigned requestedUnroll) const {
+    constexpr unsigned vlaCandidates[] = {4, 2, 1};
+    constexpr unsigned narrowRowCandidates[] = {4, 2, 1};
+    constexpr unsigned mediumRowCandidates[] = {2, 4, 1};
+    constexpr unsigned wideRowCandidates[] = {1, 2, 4};
+    llvm::ArrayRef<unsigned> candidates = vlaCandidates;
+    if (model == F32ContractResourceModel::LocalRow)
+      candidates = rowTile <= 4   ? llvm::ArrayRef<unsigned>(narrowRowCandidates)
+                   : rowTile <= 6 ? llvm::ArrayRef<unsigned>(mediumRowCandidates)
+                                  : llvm::ArrayRef<unsigned>(wideRowCandidates);
+    for (unsigned lmul : candidates) {
+      unsigned accumulatorGroups = rowTile * lmul;
+      unsigned streamedOperandGroups =
+          (model == F32ContractResourceModel::LocalRow ? 2 : 1) *
+          requestedUnroll * lmul;
+      unsigned total = accumulatorGroups + streamedOperandGroups;
+      bool hasAllocatorHeadroom =
+          model == F32ContractResourceModel::VLAFreeAxis
+              ? total <= options.target.vectorRegisters
+              : total + 1 < options.target.vectorRegisters;
+      if (hasAllocatorHeadroom)
+        return F32ContractPhysicalConfig{lmul, requestedUnroll, total};
+    }
+    return std::nullopt;
+  }
+
   mlir::FailureOr<VLAContractDecision>
   decideVLAF32FreeAxisMicrotile(VLAOp vla, StoreOp store,
                                  ContractOp contract) {
@@ -1091,7 +1135,17 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
-    decision.lmul = 4;
+    std::optional<F32ContractPhysicalConfig> physical =
+        selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
+                                        decision.rowTile, 1);
+    if (!physical) {
+      contract.emitError(
+          "RVV VLA contract has no legal register microtile candidate");
+      return mlir::failure();
+    }
+    decision.lmul = physical->lmul;
+    decision.kUnroll = physical->kUnroll;
+    decision.vectorRegisterGroups = physical->vectorRegisterGroups;
     decision.rhsMemoryMode = rhsRelation == LaneRelation::UnitStride
                                  ? VLAMemoryMode::UnitStride
                                  : VLAMemoryMode::Strided;
@@ -3648,7 +3702,17 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
-    decision.lmul = decision.rowTile > 6 ? 1 : 4;
+    std::optional<F32ContractPhysicalConfig> physical =
+        selectF32ContractPhysicalConfig(F32ContractResourceModel::LocalRow,
+                                        decision.rowTile, 1);
+    if (!physical) {
+      contract.emitError(
+          "RVV row microtile has no legal register-resource candidate");
+      return mlir::failure();
+    }
+    decision.lmul = physical->lmul;
+    decision.kUnroll = physical->kUnroll;
+    decision.vectorRegisterGroups = physical->vectorRegisterGroups;
     return decision;
   }
 
