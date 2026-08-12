@@ -9,7 +9,8 @@
 
 extern "C" void top_p_nucleus_f32(
     const float *probabilities, std::uint32_t *sorted_indices,
-    float *sorted_probabilities, std::uint32_t *nucleus_count,
+    float *sorted_probabilities, const float *uniforms,
+    std::uint32_t *nucleus_count, std::uint32_t *sampled_tokens,
     std::size_t rows, std::size_t vocabulary, float threshold);
 
 namespace {
@@ -36,6 +37,7 @@ double median(std::vector<double> samples) {
 
 int main() {
   std::vector<float> probabilities(kRows * kVocabulary);
+  std::vector<float> uniforms(kRows);
   for (std::size_t row = 0; row < kRows; ++row) {
     double total = 0.0;
     for (std::size_t token = 0; token < kVocabulary; ++token) {
@@ -48,10 +50,14 @@ int main() {
     for (std::size_t token = 0; token < kVocabulary; ++token)
       probabilities[row * kVocabulary + token] =
           static_cast<float>(probabilities[row * kVocabulary + token] / total);
+    uniforms[row] =
+        static_cast<float>((row * 104729U + 15485863U) % 1000003U) /
+        1000003.0F;
   }
 
   std::vector<std::uint32_t> expectedIndices(kRows * kVocabulary);
   std::vector<std::uint32_t> expectedCounts(kRows);
+  std::vector<std::uint32_t> expectedSamples(kRows);
   for (std::size_t row = 0; row < kRows; ++row) {
     auto first = expectedIndices.begin() + row * kVocabulary;
     std::iota(first, first + kVocabulary, 0U);
@@ -70,16 +76,31 @@ int main() {
         break;
       }
     }
+    float nucleusMass = 0.0F;
+    for (std::size_t rank = 0; rank < expectedCounts[row]; ++rank)
+      nucleusMass += probabilities[row * kVocabulary + first[rank]];
+    const float draw = uniforms[row] * nucleusMass;
+    float samplePrefix = 0.0F;
+    expectedSamples[row] = first[0];
+    for (std::size_t rank = 0; rank < expectedCounts[row]; ++rank) {
+      samplePrefix += probabilities[row * kVocabulary + first[rank]];
+      if (samplePrefix >= draw) {
+        expectedSamples[row] = first[rank];
+        break;
+      }
+    }
   }
 
   std::vector<std::uint32_t> indices(kRows * kVocabulary, 0);
   std::vector<float> sortedProbabilities(kRows * kVocabulary, 0.0F);
   std::vector<std::uint32_t> counts(kRows, 0);
+  std::vector<std::uint32_t> sampledTokens(kRows, 0);
   top_p_nucleus_f32(probabilities.data(), indices.data(),
-                    sortedProbabilities.data(), counts.data(), kRows,
-                    kVocabulary, kThreshold);
-  if (indices != expectedIndices || counts != expectedCounts) {
-    std::fprintf(stderr, "top-p nucleus order or cutoff mismatch\n");
+                    sortedProbabilities.data(), uniforms.data(), counts.data(),
+                    sampledTokens.data(), kRows, kVocabulary, kThreshold);
+  if (indices != expectedIndices || counts != expectedCounts ||
+      sampledTokens != expectedSamples) {
+    std::fprintf(stderr, "top-p nucleus order, cutoff, or sample mismatch\n");
     return 1;
   }
 
@@ -90,8 +111,8 @@ int main() {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
     top_p_nucleus_f32(probabilities.data(), indices.data(),
-                      sortedProbabilities.data(), counts.data(), kRows,
-                      kVocabulary, kThreshold);
+                      sortedProbabilities.data(), uniforms.data(), counts.data(),
+                      sampledTokens.data(), kRows, kVocabulary, kThreshold);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
@@ -102,6 +123,7 @@ int main() {
               kRows, kVocabulary, kThreshold);
   std::printf("order_mismatches=0\n");
   std::printf("cutoff_mismatches=0\n");
+  std::printf("sample_mismatches=0\n");
   std::printf("median_ms=%.6f\n", milliseconds);
   std::printf("million_candidates_s=%.6f\n",
               static_cast<double>(kRows * kVocabulary * kVocabulary) /

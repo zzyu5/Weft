@@ -22,14 +22,14 @@ summary state、pointer relation 和 source-owned effects；不具备共享 prim
 | CSR sparse attention | CSR edge traversal、online max/sum、scratch accumulator | unit VLA load/reduce/store | 72.423638 ms，0.694608 GOP/s |
 | ROIAlign | box traversal、sampling grid、bilinear interpolation | scalar coordinates、VLA channel arithmetic | 51.974708 ms，4.201389 GB/s |
 | Greedy NMS | ordered selection、mutable suppression、IoU effects | scalar state/control/memory primitives | 9.271941 ms，226.182630 MPairChecks/s |
-| Top-p nucleus | descending selection、ordered prefix、dynamic cutoff | argmax summary 与 scan state | 123.047319 ms，34.086919 MCandidates/s |
+| Top-p nucleus sampling | descending selection、ordered prefix、dynamic cutoff、uniform draw | argmax summary 与 scan state | 123.840724 ms，33.868536 MCandidates/s |
 | FWHT | stage、block、butterfly 与 in-place effect | unit-stride VLA load/store/arithmetic | 28.867527 ms，1.743539 GOP/s |
 | Cross-entropy loss+gradient | stable max/sum、label update、gradient store | reduce、vector exp、predicate/select | 22.636580 ms，185.288767 MElements/s |
 | AdamW | optimizer equations、moment/parameter effects | pointwise memory/arithmetic 与 `vfsqrt.v` | 68.661300 ms，6.841730 GB/s |
 
 所有性能数字均为 SG2044 单核 RV64GCV、VLEN=128、64 MiB eviction 后的 median；完整 shape、
 repetition 和误差数字已写入 `weft-kernel-performance.csv`。NMS 与 Top-p 比较离散结果，分别为
-selected index、排序与 cutoff 全量零 mismatch；其余项比较完整数值输出。
+selected index，以及排序、cutoff 与 sampled token 全量零 mismatch；其余项比较完整数值输出。
 
 ## 等价 DSL 对 closure 的压力
 
@@ -94,7 +94,7 @@ RISC-V realization 为局部 `vfsqrt.v`。算法方程、bias correction、weigh
 
 ## 仍然暴露的性能缺口
 
-Top-p 的 123.047319 ms 来自作者显式 repeated selection；目前没有局部 sort/permutation primitive
+Top-p 的 123.840724 ms 来自作者显式 repeated selection；目前没有局部 sort/permutation primitive
 及其 physical candidate family。这个差距没有被 Top-k matcher、C library sort 或 whole-kernel
 emitter遮盖。NMS 当前同样是 scalar ordered selection/effect，尚未拥有局部 box-block overlap 的
 VLA realization。CSR SpMV 的 indexed gather 已正确但只有 0.146729 GOP/s，说明 indexed memory

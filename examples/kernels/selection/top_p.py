@@ -25,7 +25,9 @@ def top_p_nucleus_f32(
     probabilities: W.ptr[W.f32, W.readonly, W.noalias],
     sorted_indices: W.ptr[W.u32, W.noalias],
     sorted_probabilities: W.ptr[W.f32, W.noalias],
+    uniforms: W.ptr[W.f32, W.readonly, W.noalias],
     nucleus_count: W.ptr[W.u32, W.writeonly, W.noalias],
+    sampled_tokens: W.ptr[W.u32, W.writeonly, W.noalias],
     rows: W.index,
     vocabulary: W.index,
     threshold: W.f32,
@@ -91,3 +93,25 @@ def top_p_nucleus_f32(
         if found == W.i1(False):
             cutoff = vocabulary
         W.store(nucleus_count + row, W.cast(cutoff, W.u32))
+
+        last_nucleus_rank = cutoff - W.index(1)
+        nucleus_mass = W.load(
+            sorted_probabilities + row_offset + last_nucleus_rank,
+            other=W.f32(0.0),
+        )
+        draw = W.load(uniforms + row, other=W.f32(0.0)) * nucleus_mass
+        sampled_rank = W.index(0)
+        sampled = W.i1(False)
+        for rank in W.range(0, cutoff):
+            cumulative = W.load(
+                sorted_probabilities + row_offset + rank,
+                other=W.f32(0.0),
+            )
+            if (sampled == W.i1(False)) & (cumulative >= draw):
+                sampled_rank = rank
+                sampled = W.i1(True)
+        sampled_token = W.load(
+            sorted_indices + row_offset + sampled_rank,
+            other=W.u32(0),
+        )
+        W.store(sampled_tokens + row, sampled_token)
