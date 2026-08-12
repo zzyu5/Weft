@@ -350,7 +350,6 @@ struct VLAContractDecision {
   unsigned rowTile = 1;
   unsigned lmul = 2;
   unsigned kUnroll = 1;
-  unsigned vectorRegisterGroups = 0;
   VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
   bool lhsPredicateVariesByReduction = false;
@@ -423,10 +422,15 @@ struct F16GemmNTileDecision {
   std::string outputStride;
   std::string nLower;
   std::string nUpper;
+  unsigned sourceNTile = 8;
   std::string kLower;
   std::string kUpper;
+  unsigned sourceKTile = 64;
   unsigned rowTile = 4;
-  unsigned vectorLength = 8;
+  unsigned rowMicrotile = 4;
+  unsigned inputLMUL = 1;
+  unsigned computeLMUL = 2;
+  VLAStripSchedule kStripSchedule = VLAStripSchedule::FullThenTail;
 };
 
 enum class ContractRealization {
@@ -445,13 +449,11 @@ struct ContractDecision {
   unsigned rowTile = 1;
   unsigned lmul = 4;
   unsigned kUnroll = 1;
-  unsigned vectorRegisterGroups = 0;
 };
 
 struct F32ContractPhysicalConfig {
   unsigned lmul = 1;
   unsigned kUnroll = 1;
-  unsigned vectorRegisterGroups = 0;
 };
 
 enum class F32ContractResourceModel {
@@ -1138,7 +1140,7 @@ private:
               ? total <= options.target.vectorRegisters
               : total + 1 < options.target.vectorRegisters;
       if (hasAllocatorHeadroom)
-        return F32ContractPhysicalConfig{lmul, requestedUnroll, total};
+        return F32ContractPhysicalConfig{lmul, requestedUnroll};
     }
     return std::nullopt;
   }
@@ -1287,7 +1289,6 @@ private:
     }
     decision.lmul = physical->lmul;
     decision.kUnroll = physical->kUnroll;
-    decision.vectorRegisterGroups = physical->vectorRegisterGroups;
     decision.rhsMemoryMode = rhsRelation == LaneRelation::UnitStride
                                  ? VLAMemoryMode::UnitStride
                                  : VLAMemoryMode::Strided;
@@ -1469,10 +1470,10 @@ private:
         return mlir::failure();
       }
       unsigned sourceLMUL = options.backend.narrowLMUL == 0
-                                ? 8
+                                ? 4
                                 : static_cast<unsigned>(
                                       options.backend.narrowLMUL);
-      if (sourceLMUL != 2 && sourceLMUL != 4 && sourceLMUL != 8) {
+      if (sourceLMUL != 4 && sourceLMUL != 8) {
         narrow.emitError("VLA narrow requested an illegal f32 LMUL candidate");
         return mlir::failure();
       }
@@ -1601,7 +1602,41 @@ private:
         decision.states, [](const VLAStateDecision &state) {
           return state.realization ==
                  VLAStateRealization::RVVWideningF16DotReduction;
-        });
+      });
+    unsigned liveF32RegionValues = 0;
+    unsigned currentF32RegionValues = 0;
+    for (mlir::Operation &operation : body.without_terminator()) {
+      currentF32RegionValues += llvm::count_if(
+          operation.getResultTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+      liveF32RegionValues =
+          std::max(liveF32RegionValues, currentF32RegionValues);
+      llvm::DenseSet<mlir::Value> lastUses;
+      for (mlir::Value operand : operation.getOperands()) {
+        if (!isRegionValue(operand.getType()) ||
+            !elementType(operand.getType()).isF32())
+          continue;
+        if (llvm::all_of(operand.getUsers(), [&](mlir::Operation *user) {
+              return user == &operation ||
+                     user->getBlock() != operation.getBlock() ||
+                     user->isBeforeInBlock(&operation);
+            }))
+          lastUses.insert(operand);
+      }
+      currentF32RegionValues -= lastUses.size();
+    }
+    unsigned nestedRegionCarries = 0;
+    for (mlir::Operation *operation : physicalOperations) {
+      auto loop = mlir::dyn_cast<ForOp>(operation);
+      if (!loop)
+        continue;
+      nestedRegionCarries += llvm::count_if(
+          loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+    }
+    liveF32RegionValues += nestedRegionCarries;
     bool onlyF16Accesses = !decision.accesses.empty() &&
                            llvm::all_of(decision.accesses,
                                         [](const VLAAccessDecision &access) {
@@ -1637,12 +1672,112 @@ private:
                hasFloatCast && !requiresF32M2Math) {
       decision.physical.dataSEW = 32;
       decision.physical.dataLMUL = 8;
+    } else if (decision.contracts.empty() && decision.narrows.empty() &&
+               !hasWideningF16Dot && liveF32RegionValues > 0) {
+      llvm::SmallVector<unsigned> candidates;
+      if (options.backend.vlaLMUL != 0) {
+        unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
+        if (requested != 1 && requested != 2 && requested != 4 &&
+            requested != 8) {
+          op.emitError("VLA requested an illegal LMUL candidate");
+          return mlir::failure();
+        }
+        candidates.push_back(requested);
+      } else {
+        bool onlineSummary = llvm::any_of(
+            decision.states, [](const VLAStateDecision &state) {
+              return state.realization ==
+                     VLAStateRealization::RVVOnlineSoftmaxSummary;
+            });
+        bool orderedScan = llvm::any_of(
+            decision.states, [](const VLAStateDecision &state) {
+              return state.realization ==
+                     VLAStateRealization::RVVInclusiveAddScan;
+            });
+        bool coordinateSummary = llvm::any_of(
+            decision.states, [](const VLAStateDecision &state) {
+              return state.realization == VLAStateRealization::RVVArgMaxSummary;
+            });
+        bool hasStridedMemory = llvm::any_of(
+            decision.accesses, [](const VLAAccessDecision &access) {
+              return access.memoryMode == VLAMemoryMode::Strided;
+            });
+        if (requiresF32M2Math || onlineSummary)
+          candidates = {2};
+        else if (orderedScan)
+          candidates = {1, 2, 4, 8};
+        else if (coordinateSummary)
+          candidates = {4, 2, 1, 8};
+        else if (hasStridedMemory)
+          candidates = {2, 4, 1, 8};
+        else
+          candidates = {8, 4, 2, 1};
+      }
+      std::optional<unsigned> selected;
+      for (unsigned candidate : candidates) {
+        if (requiresF32M2Math && candidate != 2)
+          continue;
+        if (!decision.predicates.empty() && options.target.xlen == 64 &&
+            candidate * 2 > 8)
+          continue;
+        unsigned stateGroups = 0;
+        for (const VLAStateDecision &state : decision.states) {
+          if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
+            stateGroups += candidate;
+          else if (state.realization == VLAStateRealization::RVVArgMaxSummary ||
+                   state.realization == VLAStateRealization::RVVAddReduction ||
+                   state.realization == VLAStateRealization::RVVMaxReduction)
+            stateGroups += 1;
+          else if (state.realization ==
+                   VLAStateRealization::RVVOnlineSoftmaxSummary)
+            stateGroups += 2 * candidate + 2;
+        }
+        unsigned regionGroups = liveF32RegionValues * candidate;
+        if (regionGroups + stateGroups + 1 <
+            static_cast<unsigned>(options.target.vectorRegisters)) {
+          selected = candidate;
+          break;
+        }
+      }
+      if (!selected) {
+        op.emitError("VLA has no legal LMUL candidate for its entity resources");
+        return mlir::failure();
+      }
+      decision.physical.dataLMUL = *selected;
     }
     if (options.backend.vlaLMUL != 0 && decision.contracts.empty() &&
-        !hasWideningF16Dot && decision.narrows.empty()) {
+        !hasWideningF16Dot && decision.narrows.empty() &&
+        liveF32RegionValues == 0) {
       unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
-      if (requested != 1 && requested != 2 && requested != 4 && requested != 8) {
+      if (requested != 1 && requested != 2 && requested != 4 &&
+          requested != 8) {
         op.emitError("VLA requested an illegal LMUL candidate");
+        return mlir::failure();
+      }
+      unsigned registerGroups = decision.accesses.size() * requested;
+      if ((!decision.predicates.empty() && options.target.xlen == 64 &&
+           requested * 2 > 8) ||
+          registerGroups + 1 >=
+              static_cast<unsigned>(options.target.vectorRegisters)) {
+        op.emitError("VLA requested LMUL exceeds entity resources");
+        return mlir::failure();
+      }
+      decision.physical.dataLMUL = requested;
+    }
+    if (options.backend.vlaLMUL != 0 &&
+        decision.physical.dataSEW == 16 &&
+        decision.contracts.empty() && decision.narrows.empty() &&
+        !hasWideningF16Dot) {
+      unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
+      if (requested != 1 && requested != 2 && requested != 4 &&
+          requested != 8) {
+        op.emitError("VLA requested an illegal LMUL candidate");
+        return mlir::failure();
+      }
+      unsigned registerGroups = decision.accesses.size() * requested;
+      if (registerGroups + 1 >=
+          static_cast<unsigned>(options.target.vectorRegisters)) {
+        op.emitError("VLA requested LMUL exceeds entity resources");
         return mlir::failure();
       }
       decision.physical.dataLMUL = requested;
@@ -3326,56 +3461,66 @@ private:
       }
 
       std::string reduction = fresh("vla_contract_k");
-      llvm::DenseMap<mlir::Value, std::string> rhsAxes;
-      rhsAxes[decision.reductionAxis] = reduction;
-      std::optional<std::string> rhsPointer =
-          projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-      std::optional<std::string> rhsLaneStride = projectVLALaneStride(
-          rhsLoad.getPointer(), activeVLADecision->coordinate, rhsAxes);
-      if (!rhsPointer || !rhsLaneStride)
-        return contract.emitError(
-            "RVV VLA contract RHS projection is unavailable");
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
-           extent + "; ++" + reduction + ") {");
+           extent + "; " + reduction + " += " +
+           std::to_string(decision.kUnroll) + ") {");
       ++indent;
-      std::string rhsVector = fresh("vla_contract_rhs");
-      if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride) {
-        line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
-             vectorSuffix + "(" + *rhsPointer + ", " + activeVL + ");");
-      } else {
-        line(vectorType + " " + rhsVector + " = __riscv_vlse32_v_" +
-             vectorSuffix + "(" + *rhsPointer +
-             ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
-             activeVL + ");");
-      }
-      for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
-        llvm::DenseMap<mlir::Value, std::string> axes;
-        axes[decision.rowAxis] = std::to_string(lane);
-        axes[decision.reductionAxis] = reduction;
-        std::optional<std::string> lhsPointer =
-            projectBlockScalar(lhsLoad.getPointer(), axes);
-        std::optional<std::string> lhsPredicate;
-        if (decision.lhsPredicateVariesByReduction)
-          lhsPredicate = projectBlockScalar(lhsLoad.getWhere(), axes);
-        if (!lhsPointer ||
-            (decision.lhsPredicateVariesByReduction && !lhsPredicate))
+      for (unsigned unroll = 0; unroll < decision.kUnroll; ++unroll) {
+        std::string coordinate =
+            unroll == 0 ? reduction
+                        : "(" + reduction + " + " + std::to_string(unroll) + ")";
+        line("if (" + coordinate + " < " + extent + ") {");
+        ++indent;
+        llvm::DenseMap<mlir::Value, std::string> rhsAxes;
+        rhsAxes[decision.reductionAxis] = coordinate;
+        std::optional<std::string> rhsPointer =
+            projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
+        std::optional<std::string> rhsLaneStride = projectVLALaneStride(
+            rhsLoad.getPointer(), activeVLADecision->coordinate, rhsAxes);
+        if (!rhsPointer || !rhsLaneStride)
           return contract.emitError(
-              "RVV VLA contract LHS projection is unavailable");
-        bool guardedLoad = guarded || decision.lhsPredicateVariesByReduction;
-        if (guardedLoad) {
-          llvm::StringRef predicate = decision.lhsPredicateVariesByReduction
-                                          ? *lhsPredicate
-                                          : lhsActive[lane];
-          line("if (" + predicate.str() + ") {");
-          ++indent;
+              "RVV VLA contract RHS projection is unavailable");
+        std::string rhsVector = fresh("vla_contract_rhs");
+        if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride) {
+          line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+               vectorSuffix + "(" + *rhsPointer + ", " + activeVL + ");");
+        } else {
+          line(vectorType + " " + rhsVector + " = __riscv_vlse32_v_" +
+               vectorSuffix + "(" + *rhsPointer +
+               ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
+               activeVL + ");");
         }
-        line(accumulators[lane] + " = __riscv_vfmacc_vf_" + vectorSuffix +
-             "(" + accumulators[lane] + ", *" + *lhsPointer + ", " +
-             rhsVector + ", " + activeVL + ");");
-        if (guardedLoad) {
-          --indent;
-          line("}");
+        for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
+          llvm::DenseMap<mlir::Value, std::string> axes;
+          axes[decision.rowAxis] = std::to_string(lane);
+          axes[decision.reductionAxis] = coordinate;
+          std::optional<std::string> lhsPointer =
+              projectBlockScalar(lhsLoad.getPointer(), axes);
+          std::optional<std::string> lhsPredicate;
+          if (decision.lhsPredicateVariesByReduction)
+            lhsPredicate = projectBlockScalar(lhsLoad.getWhere(), axes);
+          if (!lhsPointer ||
+              (decision.lhsPredicateVariesByReduction && !lhsPredicate))
+            return contract.emitError(
+                "RVV VLA contract LHS projection is unavailable");
+          bool guardedLoad = guarded || decision.lhsPredicateVariesByReduction;
+          if (guardedLoad) {
+            llvm::StringRef predicate = decision.lhsPredicateVariesByReduction
+                                            ? *lhsPredicate
+                                            : lhsActive[lane];
+            line("if (" + predicate.str() + ") {");
+            ++indent;
+          }
+          line(accumulators[lane] + " = __riscv_vfmacc_vf_" + vectorSuffix +
+               "(" + accumulators[lane] + ", *" + *lhsPointer + ", " +
+               rhsVector + ", " + activeVL + ");");
+          if (guardedLoad) {
+            --indent;
+            line("}");
+          }
         }
+        --indent;
+        line("}");
       }
       --indent;
       line("}");
@@ -3532,7 +3677,6 @@ private:
     }
     decision.lmul = physical->lmul;
     decision.kUnroll = physical->kUnroll;
-    decision.vectorRegisterGroups = physical->vectorRegisterGroups;
     return decision;
   }
 
@@ -3594,47 +3738,85 @@ private:
       }
       std::string strip = fresh("contract_k");
       std::string vl = fresh("contract_vl");
-      llvm::DenseMap<mlir::Value, std::string> rhsAxes;
-      rhsAxes[decision.reductionAxis] = strip;
-      std::optional<std::string> rhs =
-          projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-      if (!rhs)
-        return contract.emitError(
-            "RVV row microtile RHS projection is unavailable");
+      auto emitChunk = [&](llvm::StringRef coordinate) -> mlir::LogicalResult {
+        llvm::DenseMap<mlir::Value, std::string> rhsAxes;
+        rhsAxes[decision.reductionAxis] = coordinate.str();
+        std::optional<std::string> rhs =
+            projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
+        if (!rhs)
+          return contract.emitError(
+              "RVV row microtile RHS projection is unavailable");
+        std::string rhsVector = fresh("contract_rhs");
+        line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+             vectorSuffix + "(" + *rhs + ", " + vl + ");");
+        for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
+          llvm::DenseMap<mlir::Value, std::string> axes;
+          axes[decision.rowAxis] = std::to_string(lane);
+          axes[decision.reductionAxis] = coordinate.str();
+          std::optional<std::string> lhs =
+              projectBlockScalar(lhsLoad.getPointer(), axes);
+          if (!lhs)
+            return contract.emitError(
+                "RVV row microtile LHS projection is unavailable");
+          if (guarded) {
+            line("if (" + lhsActive[lane] + ") {");
+            ++indent;
+          }
+          std::string lhsVector = fresh("contract_lhs");
+          line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
+               vectorSuffix + "(" + *lhs + ", " + vl + ");");
+          line(accumulators[lane] + " = __riscv_vfmacc_vv_" + vectorSuffix +
+               "_tu(" + accumulators[lane] + ", " + lhsVector + ", " +
+               rhsVector + ", " + vl + ");");
+          if (guarded) {
+            --indent;
+            line("}");
+          }
+        }
+        return mlir::success();
+      };
       line("for (size_t " + strip + " = 0; " + strip + " < " + extent +
            ";) {");
       ++indent;
-      line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
-           std::to_string(decision.lmul) + "(" + extent + " - " + strip +
-           ");");
-      std::string rhsVector = fresh("contract_rhs");
-      line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
-           vectorSuffix + "(" + *rhs + ", " + vl + ");");
-      for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
-        llvm::DenseMap<mlir::Value, std::string> axes;
-        axes[decision.rowAxis] = std::to_string(lane);
-        axes[decision.reductionAxis] = strip;
-        std::optional<std::string> lhs =
-            projectBlockScalar(lhsLoad.getPointer(), axes);
-        if (!lhs)
-          return contract.emitError(
-              "RVV row microtile LHS projection is unavailable");
-        if (guarded) {
-          line("if (" + lhsActive[lane] + ") {");
-          ++indent;
+      if (decision.kUnroll == 1) {
+        line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
+             std::to_string(decision.lmul) + "(" + extent + " - " + strip +
+             ");");
+        if (mlir::failed(emitChunk(strip)))
+          return mlir::failure();
+        line(strip + " += " + vl + ";");
+      } else {
+        std::string remaining = fresh("contract_remaining");
+        line("const size_t " + remaining + " = " + extent + " - " + strip +
+             ";");
+        line("if (" + remaining + " >= " +
+             std::to_string(decision.kUnroll) + ") {");
+        ++indent;
+        line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
+             std::to_string(decision.lmul) + "(" + remaining + " / " +
+             std::to_string(decision.kUnroll) + ");");
+        for (unsigned unroll = 0; unroll < decision.kUnroll; ++unroll) {
+          std::string coordinate =
+              unroll == 0
+                  ? strip
+                  : "(" + strip + " + " + std::to_string(unroll) + " * " + vl +
+                        ")";
+          if (mlir::failed(emitChunk(coordinate)))
+            return mlir::failure();
         }
-        std::string lhsVector = fresh("contract_lhs");
-        line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
-             vectorSuffix + "(" + *lhs + ", " + vl + ");");
-        line(accumulators[lane] + " = __riscv_vfmacc_vv_" + vectorSuffix +
-             "_tu(" + accumulators[lane] + ", " + lhsVector + ", " +
-             rhsVector + ", " + vl + ");");
-        if (guarded) {
-          --indent;
-          line("}");
-        }
+        line(strip + " += " + std::to_string(decision.kUnroll) + " * " + vl +
+             ";");
+        --indent;
+        line("} else {");
+        ++indent;
+        line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
+             std::to_string(decision.lmul) + "(" + remaining + ");");
+        if (mlir::failed(emitChunk(strip)))
+          return mlir::failure();
+        line(strip + " += " + vl + ";");
+        --indent;
+        line("}");
       }
-      line(strip + " += " + vl + ";");
       --indent;
       line("}");
       for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
@@ -4847,9 +5029,11 @@ private:
     };
     std::optional<int64_t> rowTile = physicalExtent(mLoop.getStep());
     std::optional<int64_t> columnTile = physicalExtent(nLoop.getStep());
+    std::optional<int64_t> reductionTile = physicalExtent(kLoop.getStep());
     if (!rowTile || *rowTile <= 0 || *rowTile > 8 || !columnTile ||
-        *columnTile <= 0 || nLower.empty() || nUpper.empty() || kLower.empty() ||
-        kUpper.empty() || mValue.spelling.empty() ||
+        *columnTile <= 0 || !reductionTile || *reductionTile <= 0 ||
+        nLower.empty() || nUpper.empty() || kLower.empty() || kUpper.empty() ||
+        mValue.spelling.empty() ||
         mUpper.spelling.empty() || lhs.spelling.empty() || rhs.spelling.empty() ||
         outputValue.spelling.empty() || lhsStrideValue.spelling.empty() ||
         rhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty())
@@ -4870,60 +5054,141 @@ private:
     decision.outputStride = outputStrideValue.spelling;
     decision.nLower = nLower;
     decision.nUpper = nUpper;
+    decision.sourceNTile = static_cast<unsigned>(*columnTile);
     decision.kLower = kLower;
     decision.kUpper = kUpper;
+    decision.sourceKTile = static_cast<unsigned>(*reductionTile);
     decision.rowTile = static_cast<unsigned>(*rowTile);
-    decision.vectorLength = static_cast<unsigned>(*columnTile);
+    unsigned requestedRows = options.backend.f16RowMicrotile == 0
+                                 ? decision.rowTile
+                                 : static_cast<unsigned>(
+                                       options.backend.f16RowMicrotile);
+    unsigned inputLMUL = options.backend.f16InputLMUL == 0
+                             ? 1
+                             : static_cast<unsigned>(
+                                   options.backend.f16InputLMUL);
+    if (requestedRows == 0 || requestedRows > decision.rowTile ||
+        decision.rowTile % requestedRows != 0 ||
+        (inputLMUL != 1 && inputLMUL != 2 && inputLMUL != 4))
+      return std::nullopt;
+    unsigned registerGroups = (3 * requestedRows + 1) * inputLMUL;
+    if (2 * inputLMUL > 8 ||
+        registerGroups + 1 >=
+            static_cast<unsigned>(options.target.vectorRegisters))
+      return std::nullopt;
+    decision.rowMicrotile = requestedRows;
+    decision.inputLMUL = inputLMUL;
+    decision.computeLMUL = 2 * inputLMUL;
+    decision.kStripSchedule = VLAStripSchedule::FullThenTail;
     return decision;
   }
 
   mlir::LogicalResult emitF16GemmNTiles(
       const F16GemmNTileDecision &decision) {
+    if (decision.kStripSchedule != VLAStripSchedule::FullThenTail)
+      return decision.operation->emitError(
+          "F16 contraction has no selected K strip schedule");
     std::string nTile = fresh("gemm_n");
-    std::string vl = fresh("gemm_vl");
     std::string rows = fresh("gemm_rows");
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" +
-         std::to_string(decision.vectorLength) + ");");
     line("const size_t " + rows + " = (" + decision.rowUpper + " - " +
          decision.row + ") < " + std::to_string(decision.rowTile) + " ? (" +
          decision.rowUpper + " - " + decision.row + ") : " +
          std::to_string(decision.rowTile) + ";");
     line("for (size_t " + nTile + " = " + decision.nLower + "; " + nTile +
-         " < " + decision.nUpper + "; ++" + nTile + ") {");
+         " < " + decision.nUpper + "; " + nTile + " += " +
+         std::to_string(decision.sourceNTile) + ") {");
+    ++indent;
+    std::string nTileEnd = fresh("gemm_n_tile_end");
+    line("const size_t " + nTileEnd + " = (" + decision.nUpper + " - " +
+         nTile + ") < " + std::to_string(decision.sourceNTile) + " ? " +
+         decision.nUpper + " : " + nTile + " + " +
+         std::to_string(decision.sourceNTile) + ";");
+    std::string nColumn = fresh("gemm_n_column");
+    line("for (size_t " + nColumn + " = " + nTile + "; " + nColumn + " < " +
+         nTileEnd + "; ++" + nColumn + ") {");
     ++indent;
 
-    auto emitRows = [&](unsigned rowCount, bool first) {
-      line(std::string(first ? "if" : "else if") + " (" + rows + " == " +
-           std::to_string(rowCount) + ") {");
+    auto emitRows = [&](unsigned rowCount, llvm::StringRef rowBase,
+                        llvm::StringRef condition, bool first) {
+      line(std::string(first ? "if" : "else if") + " (" +
+           condition.str() + ") {");
       ++indent;
       llvm::SmallVector<std::string> accumulators;
+      std::string fullVL = fresh("gemm_full_vl");
+      line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m" +
+           std::to_string(decision.inputLMUL) + "();");
       for (unsigned row = 0; row < rowCount; ++row) {
         std::string accumulator = fresh("gemm_acc");
-        line("vfloat32m2_t " + accumulator +
-             " = __riscv_vfmv_v_f_f32m2(0.0f, " + vl + ");");
+        line("vfloat32m" + std::to_string(decision.computeLMUL) + "_t " +
+             accumulator + " = __riscv_vfmv_v_f_f32m" +
+             std::to_string(decision.computeLMUL) + "(0.0f, " +
+             fullVL + ");");
         accumulators.push_back(std::move(accumulator));
       }
+      std::string sourceK = fresh("gemm_source_k");
+      std::string sourceKEnd = fresh("gemm_source_k_end");
+      line("for (size_t " + sourceK + " = " + decision.kLower + "; " +
+           sourceK + " < " + decision.kUpper + "; " + sourceK + " += " +
+           std::to_string(decision.sourceKTile) + ") {");
+      ++indent;
+      line("const size_t " + sourceKEnd + " = (" + decision.kUpper + " - " +
+           sourceK + ") < " + std::to_string(decision.sourceKTile) + " ? " +
+           decision.kUpper + " : " + sourceK + " + " +
+           std::to_string(decision.sourceKTile) + ";");
       std::string inner = fresh("gemm_k");
-      std::string fullEnd = fresh("gemm_k_end");
-      line("const size_t " + fullEnd + " = " + decision.kUpper + " - ((" +
-           decision.kUpper + " - " + decision.kLower + ") % " + vl + ");");
-      line("for (size_t " + inner + " = " + decision.kLower + "; " + inner + " < " +
-           fullEnd + "; " + inner + " += " + vl + ") {");
+      std::string fullEnd = fresh("gemm_k_full_end");
+      line("const size_t " + fullEnd + " = " + sourceKEnd + " - ((" +
+           sourceKEnd + " - " + sourceK + ") % " + fullVL + ");");
+      line("for (size_t " + inner + " = " + sourceK + "; " + inner +
+           " < " + fullEnd + "; " + inner + " += " + fullVL + ") {");
       ++indent;
       std::string rhsVector = fresh("gemm_b");
-      line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
-           decision.rhs + " + " + nTile + " * " + decision.rhsStride +
-           " + " + inner + ", " + vl + ");");
+      line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
+           rhsVector + " = __riscv_vle16_v_f16m" +
+           std::to_string(decision.inputLMUL) + "(" +
+           decision.rhs + " + " + nColumn + " * " + decision.rhsStride +
+           " + " + inner + ", " + fullVL + ");");
       for (unsigned row = 0; row < rowCount; ++row) {
         std::string lhsVector = fresh("gemm_a");
-        line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
-             decision.lhs + " + (" + decision.row + " + " +
+        line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
+             lhsVector + " = __riscv_vle16_v_f16m" +
+             std::to_string(decision.inputLMUL) + "(" +
+             decision.lhs + " + (" + rowBase.str() + " + " +
              std::to_string(row) + ") * " + decision.lhsStride + " + " +
-             inner + ", " + vl + ");");
-        line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m2(" +
+             inner + ", " + fullVL + ");");
+        line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
+             std::to_string(decision.computeLMUL) + "(" +
              accumulators[row] + ", " + lhsVector + ", " + rhsVector + ", " +
-             vl + ");");
+             fullVL + ");");
       }
+      --indent;
+      line("}");
+      line("if (" + fullEnd + " < " + sourceKEnd + ") {");
+      ++indent;
+      std::string tailVL = fresh("gemm_tail_vl");
+      line("const size_t " + tailVL + " = __riscv_vsetvl_e16m" +
+           std::to_string(decision.inputLMUL) + "(" + sourceKEnd + " - " +
+           fullEnd + ");");
+      std::string tailRhs = fresh("gemm_tail_b");
+      line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " + tailRhs +
+           " = __riscv_vle16_v_f16m" +
+           std::to_string(decision.inputLMUL) + "(" + decision.rhs + " + " +
+           nColumn + " * " + decision.rhsStride + " + " + fullEnd + ", " +
+           tailVL + ");");
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string tailLhs = fresh("gemm_tail_a");
+        line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
+             tailLhs + " = __riscv_vle16_v_f16m" +
+             std::to_string(decision.inputLMUL) + "(" + decision.lhs + " + (" +
+             rowBase.str() + " + " + std::to_string(row) + ") * " +
+             decision.lhsStride + " + " + fullEnd + ", " + tailVL + ");");
+        line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
+             std::to_string(decision.computeLMUL) + "_tu(" +
+             accumulators[row] + ", " + tailLhs + ", " + tailRhs + ", " +
+             tailVL + ");");
+      }
+      --indent;
+      line("}");
       --indent;
       line("}");
       for (unsigned row = 0; row < rowCount; ++row) {
@@ -4933,31 +5198,45 @@ private:
         line("vfloat32m1_t " + seed +
              " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
         line("vfloat32m1_t " + partial +
-             " = __riscv_vfredusum_vs_f32m2_f32m1(" + accumulators[row] +
-             ", " + seed + ", " + vl + ");");
+             " = __riscv_vfredusum_vs_f32m" +
+             std::to_string(decision.computeLMUL) + "_f32m1(" +
+             accumulators[row] + ", " + seed + ", " + fullVL + ");");
         line("float " + scalar + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
              ");");
-        std::string tail = fresh("gemm_tail");
-        line("for (size_t " + tail + " = " + fullEnd + "; " + tail + " < " +
-             decision.kUpper + "; ++" + tail + ")");
-        ++indent;
-        line(scalar + " += (float)*(" + decision.lhs + " + (" +
-             decision.row + " + " + std::to_string(row) + ") * " +
-             decision.lhsStride + " + " + tail + ") * (float)*(" +
-             decision.rhs + " + " + nTile + " * " + decision.rhsStride +
-             " + " + tail + ");");
-        --indent;
-        line("*(" + decision.output + " + (" + decision.row + " + " +
+        line("*(" + decision.output + " + (" + rowBase.str() + " + " +
              std::to_string(row) + ") * " + decision.outputStride + " + " +
-             nTile + ") = " + scalar + ";");
+             nColumn + ") = " + scalar + ";");
       }
       --indent;
       line("}");
     };
-    emitRows(4, true);
-    emitRows(3, false);
-    emitRows(2, false);
-    emitRows(1, false);
+    if (decision.rowMicrotile == decision.rowTile) {
+      for (unsigned rowCount = decision.rowMicrotile; rowCount > 0; --rowCount)
+        emitRows(rowCount, decision.row,
+                 rows + " == " + std::to_string(rowCount),
+                 rowCount == decision.rowMicrotile);
+    } else {
+      std::string rowBase = fresh("gemm_row");
+      line("for (size_t " + rowBase + " = 0; " + rowBase + " < " + rows +
+           "; " + rowBase + " += " +
+           std::to_string(decision.rowMicrotile) + ") {");
+      ++indent;
+      std::string localRows = fresh("gemm_local_rows");
+      line("const size_t " + localRows + " = " + rows + " - " + rowBase +
+           ";");
+      for (unsigned rowCount = decision.rowMicrotile; rowCount > 0; --rowCount)
+        emitRows(rowCount, "(" + decision.row + " + " + rowBase + ")",
+                 rowCount == decision.rowMicrotile
+                     ? "(" + localRows + " >= " +
+                           std::to_string(decision.rowMicrotile) + ")"
+                     : "(" + localRows + " == " + std::to_string(rowCount) +
+                           ")",
+                 rowCount == decision.rowMicrotile);
+      --indent;
+      line("}");
+    }
+    --indent;
+    line("}");
     --indent;
     line("}");
     return mlir::success();

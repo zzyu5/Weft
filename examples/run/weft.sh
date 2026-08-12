@@ -38,6 +38,10 @@ multi=0
 multi_primary=
 multi_equivalent=
 runtime_arguments=()
+backend_arguments=()
+if [[ -n ${WEFT_BACKEND_CONFIG:-} ]]; then
+  read -r -a backend_arguments <<< "${WEFT_BACKEND_CONFIG}"
+fi
 case "${kernel}" in
   add_bias)
     if [[ $# -ne 0 ]]; then
@@ -430,7 +434,7 @@ if [[ ${quant} -eq 1 ]]; then
     "${project_root}/${dsl}" --kernel "${kernel}" |
     "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
       --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-      -o "${local_root}/kernel.c"
+      "${backend_arguments[@]}" -o "${local_root}/kernel.c"
   mkdir -p "${local_root}/leaf" "${local_root}/common"
   cp "${project_root}/examples/repro/weft/quantization/block_dot/${kernel}/runtime.c" \
     "${local_root}/leaf/runtime.c"
@@ -441,23 +445,24 @@ else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        --meta=BM=4 --meta=BN=8 --meta=BK=64 -o "${local_root}/kernel.c"
+        --meta=BM=4 --meta=BN=8 --meta=BK=64 "${backend_arguments[@]}" \
+        -o "${local_root}/kernel.c"
   elif [[ ${multi} -eq 1 ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
       --kernel "${multi_primary}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        -o "${local_root}/kernel.c"
+        "${backend_arguments[@]}" -o "${local_root}/kernel.c"
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
       --kernel "${multi_equivalent}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        -o "${local_root}/kernel_equivalent.c"
+        "${backend_arguments[@]}" -o "${local_root}/kernel_equivalent.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
-        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        -o "${local_root}/kernel.c"
+      --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
+        "${backend_arguments[@]}" -o "${local_root}/kernel.c"
   fi
   cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 fi
