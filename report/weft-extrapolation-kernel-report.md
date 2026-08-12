@@ -26,20 +26,20 @@ natural Weft Python DSL
 fallback 或程序规范化 pass。作者写下的排序算法、row scatter、窗口顺序、卷积坐标、
 output-owned backward traversal、packed storage 和 outer reduction 都保留在 DSL/Kernel IR。
 
-外推结论是“编译与组合成立，性能只部分成立”：五项同形 public op 对照更快；Q1_0 和
-MXFP4 距固定手写 RVV baseline 分别为 8.3% 和 11.1%；Argsort、Dense Conv2D 与
-ConvTranspose2D 仍明显落后。失败没有被 fallback 隐藏，也没有被改写成三个 whole-kernel
-emitter。
+初次引入后的三个明显缺口已经由显式source variant修正：Argsort使用作者声明的radix
+scratch/histogram，Dense Conv2D显式staging patch和weight，ConvTranspose2D显式选择
+input-owned traversal与contiguous input-channel packing。修正后八个public-op对照中七项更快，
+Dense Conv2D仍慢44.8%；Q1_0和MXFP4距固定手写RVV baseline分别为8.3%和11.1%。
 
 ## 十个 workload
 
 | Kernel | 真实 workload / shape | 给编译器的结构压力 | source 明确保留的算法结构 |
 |---|---|---|---|
-| F32 Argsort | batched logits，`8 × 32000` | data-dependent ordered control、indexed permutation | heap construction、sift-down 与 row-local index storage |
+| F32 Argsort | batched logits，`8 × 32000` | integer key transform、indexed histogram/scatter | four-pass radix traversal、scratch/histogram ABI |
 | F32 SetRows | KV cache，`8 × 4096 × 128`，128 updates | indexed destination、VLA row copy | update 顺序、共享 row index、group/row strides |
 | SAM Window Partition | `C=768,H=W=64,w=14` | scalar window control、padding predicate、VLA memory | window order、zero padding 与 output layout |
-| Dense Conv2D | SAM，`64²,IC=OC=256,K=3,pad=1` | predicate-dependent contraction、strided weight free axis | spatial/block traversal、flattened reduction relation和layout |
-| ConvTranspose2D | decoder upsample，`16²×256 → 32²×128,K=2,S=2` | inverse coordinate predicate、contract in a different index relation | output-owned traversal、stride divisibility和kernel layout |
+| Dense Conv2D | SAM，`64²,IC=OC=256,K=3,pad=1` | source staging、contiguous local contract | im2col/weight packing、position microtile和layout |
+| ConvTranspose2D | decoder upsample，`16²×256 → 32²×128,K=2,S=2` | input-owned traversal、contiguous local contract | source/weight packing、non-overlap ownership和kernel traversal |
 | RMSNorm backward | `512 × 4096` | two reductions followed by a VLA consumer | exact backward equation、epsilon和row traversal |
 | F32 OutProd | TinyLlama linear gradient，`2048 × 5632 × 32` | contract free axis换位、短 reduction | samples/rows/columns relation与output layout |
 | Im2Col backward | SAM，`64²,IC=256,K=3,pad=1` | ordered window accumulation、strided VLA loads | output-owned dInput traversal与窗口边界 |
@@ -54,13 +54,10 @@ ConvTranspose2D 的 shape 是符合 GGML p0 输出公式的 decoder 级 workload
 
 ### Data-dependent ordered control
 
-Argsort 让 `while` 从静态控制补充为真正的 scalar loop-carried control。条件和 carried value
-都来自 canonical use-def；target 直接保留作者的执行顺序并生成普通 C control，不把它识别
-为“sort kernel”。同时修正了多次使用的 scalar load 必须物化一次的问题，避免生成 C 表达式
-重复读取可变 index storage。
-
-这项能力解决的是语义与可组合性，不自动把作者的 heapsort 换成 `std::sort`、radix sort 或
-RVV sorting network。算法替换仍是 source variant，不是 target 猜测。
+最初heapsort先证明了真正scalar loop-carried `while` 和data-dependent permutation可以忠实
+lower。性能修正没有让target识别“sort kernel”，而是作者显式改用four-pass F32 radix：
+sortable-key bit relation、256-bin histogram、prefix sum、ping-pong index scatter及scratch ABI
+全部进入Kernel IR。编译器只补齐通用scalar F32→U32 bitcast spelling。
 
 ### Indexed write 与 window memory 复用普通实体决策
 
@@ -79,9 +76,9 @@ Dense Conv2D、ConvTranspose2D 与 OutProd 共同扩展了 local F32 contract �
 - row microtile、LMUL、reduction axis、load/store projection成为一次local decision的事实。
 
 Target 消费显式 `ContractOp`、block/VLA axis、pointer relation和predicate；它不根据
-`conv2d`、`out_product` 名字判断实现。当前只有一个主要 row-microtile 配置，也没有自动创建
-im2col scratch或改变source traversal，因此“能进入同一 contract family”不等于卷积已经有
-成熟物理候选空间。
+`conv2d`、`out_product` 名字判断实现。Dense Conv的patch/weight staging以及ConvTranspose的
+input-owned traversal/packing均由source显式提供，现有local contract family无需增加分支即可
+消费。当前仍只有一个主要row-microtile配置，因此Dense Conv尚未获得成熟物理候选空间。
 
 ### Output-owned backward traversal
 
@@ -126,11 +123,11 @@ Weft更快。
 
 | Kernel | Repetitions | Weft ms | GGML ms | Weft / GGML | Weft throughput | GGML throughput |
 |---|---:|---:|---:|---:|---:|---:|
-| Argsort | 5 | 59.368179 | 21.902416 | 2.711 | — | — |
+| Argsort | 5 | 8.958199 | 21.902416 | 0.409 | — | — |
 | SetRows | 10 | 0.355782 | 0.432772 | 0.822 | 2.947 GB/s | 2.423 GB/s |
 | Window Partition | 10 | 5.165583 | 5.575184 | 0.927 | 5.350 GB/s | 4.957 GB/s |
-| Dense Conv2D | 3 | 2386.263326 | 629.354844 | 3.792 | 2.025 GOP/s | 7.677 GOP/s |
-| ConvTranspose2D | 5 | 96.806903 | 17.179675 | 5.635 | 0.693 GOP/s | 3.906 GOP/s |
+| Dense Conv2D | 3 | 911.200486 | 629.354844 | 1.448 | 5.303 GOP/s | 7.677 GOP/s |
+| ConvTranspose2D | 5 | 16.333010 | 17.179675 | 0.951 | 4.109 GOP/s | 3.906 GOP/s |
 | RMSNorm backward | 10 | 6.358188 | 10.622016 | 0.599 | 329.835 MElements/s | 197.434 MElements/s |
 | OutProd | 3 | 128.860142 | 231.133128 | 0.558 | 5.729 GOP/s | 3.194 GOP/s |
 | Im2Col backward | 5 | 35.573495 | 374.418412 | 0.095 | 29.476 MElements/s | 2.801 MElements/s |
@@ -143,19 +140,19 @@ Weft correctness口径：Argsort、SetRows、Window Partition、RMSNorm backward
 
 ### 性能含义
 
+- Argsort的显式radix variant比GGML `std::sort` 快59.1%；scratch与四次histogram/scatter均在
+  timed kernel内，没有把预处理藏到runtime。
 - SetRows、Window Partition、RMSNorm backward、OutProd和Im2Col backward分别比同形GGML
   public op快17.8%、7.3%、40.1%、44.2%和90.5%。这些结果说明普通indexed memory、VLA
   reduction和local contract在陌生上下文中已经能形成有效RVV realization。
 - Q1_0与MXFP4分别慢8.3%和11.1%。这是本组最强的对照：GGML两项都是真实手写RVV
   intrinsic实现。Weft已进入同一性能区间，但outer-loop overhead、load scheduling和寄存器组织仍有差距。
-- Argsort慢2.71倍。Weft faithfully执行作者写下的heapsort；GGML调用C++ `std::sort`。这里暴露的
-  首先是缺少更高性能source算法variant，而不是target应该偷偷替换算法。
-- Dense Conv2D慢3.79倍。GGML direct path会构造contiguous patch并进入成熟dot/GEMM组织；
-  Weft当前直接消费strided free-axis contract，没有spatial tile、patch reuse、packing候选或
-  多种microtile选择。
-- ConvTranspose2D慢5.63倍。Weft source是output-owned inverse mapping，许多reduction lane由
-  stride predicate屏蔽；GGML采用input-position与kernel-position遍历并执行contiguous
-  input-channel dot。把二者互换属于算法traversal选择，不能由target无条件猜测。
+- Dense Conv2D经显式patch/weight staging从2.025提升到5.303 GOP/s，但仍比GGML慢31.0%
+  （按时间为44.8%）。剩余差距是local contract只有固定LMUL4/row6，没有microtile、unroll、
+  packing和software-pipeline候选。
+- ConvTranspose2D经显式input-owned traversal与packing从0.693提升到4.109 GOP/s，比GGML快
+  4.9%。当前`stride=kernel=2`保证各input/kernel pair拥有不同output位置；重叠variant仍必须
+  由source显式采用atomic或另一种ownership。
 
 ## 架构审计
 
@@ -163,12 +160,12 @@ Weft correctness口径：Argsort、SetRows、Window Partition、RMSNorm backward
 链接，也没有“新路径失败后走旧实现”。Q1/MXFP4 extension、VLA contract和memory decision
 都以typed local entity为anchor。
 
-整个 `RISCVLowering` 仍不能描述为已经完全摆脱source closure。较早的F16 conversion/fill/
-dot/update/normalize、online-softmax envelope、F16 GEMM和部分IME1 N/K路径仍在emission期间
-检查较精确的loop/body结构。本轮没有利用这些路径，也没有为了十项成功继续扩大它们；这仍是
-后端重构尚未完成的明确边界。
+较早的F16 conversion/fill/dot/update/normalize、online-softmax envelope、F16 GEMM和affine
+IME1 N/K路径仍要求较精确的loop/use closure，但选择与发射已经拆开：analysis产生瞬态typed
+decision，emitter只消费bounds、pointers、strides、tiles、layout和realization。它们不再形成
+emission-time第二authority；尚未解决的是对等价source closure的接受范围仍窄。
 
 最终判断：**Weft已经能让十个事后选择、结构差异明显的自然worker-local程序通过同一条
-算子编译主链，并由局部语义事实生成可执行RVV实现；其中五项超过同形public op、两项量化
-dot进入手写RVV的12%以内。但排序source variant与两种卷积的物理/算法自由度仍不足，因此
-本轮证明了真实外推能力，也同时否定了“已经达到Triton级性能通用性”的过强结论。**
+算子编译主链，并由局部语义事实生成可执行RVV实现；其中七项超过同形public op、两项量化
+dot进入手写RVV的12%以内。Dense Conv的物理候选空间与旧specialized decision的source
+敏感性仍未达到Triton级通用性，但三个最明显性能缺口已由正确的source/compiler所有权修复。**

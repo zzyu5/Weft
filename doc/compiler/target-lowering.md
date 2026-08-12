@@ -136,8 +136,11 @@ kernel family。
 逐实体VLA memory/predicate/state/narrow、codebook decode、sign-bit/E2M1 local dot与symmetric
 IME fragment已经按上述模型工作。Local F32 contract根据block/VLA axis、typed operand、
 pointer/access与predicate projection选择row microtile，并已在dense/out-product及卷积坐标关系中
-复用；当前仍只支持一个较窄的F32 free-axis family。源码另外保留若干较早的exact closure
-fast path：F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
-F16 GEMM nested loop以及affine Q4_K IME N/K loop。它们不依赖kernel symbol，但仍要求较精确
-的region/use/loop closure；因此当前实现不能被描述为已经完全closure-free。新增能力不得
-沿这些路径继续增加整段case，已有路径应在对应primitive decision能够承载时被替换并删除。
+复用；当前仍只支持一个较窄的F32 free-axis family。
+
+较早的F16 conversion/fill/dot/update/normalize、online-softmax producer-consumer envelope、
+F16 GEMM nested loop与affine Q4_K IME N/K envelope仍要求较精确的region/use/loop closure；这些
+closure现在只在analysis中形成短生命周期的typed physical decision，emitter只消费已经选定的
+pointer、bound、tile、stride、layout与realization，不再边打印边重建选择。它们因此已经消除
+emission-time第二authority，但尚未获得更宽的等价source接受范围。新增能力应扩展局部decision
+的语义输入和物理候选，不能重新增加whole-kernel try-emitter。
