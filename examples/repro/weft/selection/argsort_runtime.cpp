@@ -7,9 +7,10 @@
 #include <vector>
 
 extern "C" void argsort_f32(
-    const float *values, std::uint32_t *indices, std::size_t row_begin,
-    std::size_t row_end, std::size_t columns, std::size_t value_row_stride,
-    std::size_t index_row_stride);
+    const float *values, std::uint32_t *indices,
+    std::uint32_t *scratch_indices, std::uint32_t *histogram,
+    std::size_t row_begin, std::size_t row_end, std::size_t columns,
+    std::size_t value_row_stride, std::size_t index_row_stride);
 
 namespace {
 
@@ -37,6 +38,8 @@ int main() {
   std::vector<float> values(kElements);
   std::vector<std::uint32_t> expected(kElements);
   std::vector<std::uint32_t> actual(kElements);
+  std::vector<std::uint32_t> scratch(kColumns);
+  std::vector<std::uint32_t> histogram(256);
   for (std::size_t row = 0; row < kRows; ++row) {
     std::uint32_t *order = expected.data() + row * kColumns;
     std::iota(order, order + kColumns, 0U);
@@ -49,8 +52,8 @@ int main() {
     });
   }
 
-  argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
-              kColumns);
+  argsort_f32(values.data(), actual.data(), scratch.data(), histogram.data(), 0,
+              kRows, kColumns, kColumns, kColumns);
   if (actual != expected) {
     for (std::size_t index = 0; index < actual.size(); ++index)
       if (actual[index] != expected[index]) {
@@ -67,8 +70,8 @@ int main() {
   for (int repetition = 0; repetition < 5; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
-                kColumns);
+    argsort_f32(values.data(), actual.data(), scratch.data(), histogram.data(),
+                0, kRows, kColumns, kColumns, kColumns);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());

@@ -2773,6 +2773,8 @@ private:
       helper = "__weft_bitcast_u16_f16";
     else if (isF16(source) && target.isUnsignedInteger(16))
       helper = "__weft_bitcast_f16_u16";
+    else if (source.isF32() && target.isUnsignedInteger(32))
+      helper = "__weft_bitcast_f32_u32";
     else if (source.isUnsignedInteger(32) && target.isF32())
       helper = "__weft_bitcast_u32_f32";
     else
@@ -6010,6 +6012,11 @@ static inline __attribute__((unused)) _Float16 __weft_bitcast_u16_f16(uint16_t b
 
 static inline __attribute__((unused)) uint16_t __weft_bitcast_f16_u16(_Float16 source) {
   union { uint16_t u; _Float16 f; } value = { .f = source };
+  return value.u;
+}
+
+static inline __attribute__((unused)) uint32_t __weft_bitcast_f32_u32(float source) {
+  union { uint32_t u; float f; } value = { .f = source };
   return value.u;
 }
 
