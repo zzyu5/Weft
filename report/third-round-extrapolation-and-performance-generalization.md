@@ -59,14 +59,14 @@ selected index、排序与 cutoff 全量零 mismatch；其余项比较完整数�
 | Kernel | 候选 | 结果 | 物理变化 |
 | --- | ---: | ---: | --- |
 | Segmented scan | LMUL=1 | illegal | u8/f32 同 lane footprint 无合法整数 LMUL，明确拒绝 |
-| Segmented scan | LMUL=4 | 10.133225 ms | f32m4 + u8m1 segment state |
-| CSR SpMV | LMUL=1 | 43.986092 ms | u32m1 offsets + f32m1 indexed gather |
-| CSR SpMV | LMUL=4 | 22.322758 ms | u32m4 offsets + f32m4 indexed gather |
-| FWHT | LMUL=1 | 24.910469 ms | 更小 strip/butterfly vectors |
-| FWHT | LMUL=4 | 28.575645 ms | 更宽 strip/butterfly vectors |
-| AdamW | LMUL=1 | 162.648593 ms | f32m1 pointwise/sqrt |
-| AdamW | LMUL=4 | 75.072088 ms | f32m4 pointwise/sqrt |
-| AdamW | LMUL=8 | 61.281709 ms | f32m8 pointwise/sqrt |
+| Segmented scan | LMUL=4 | 9.881044 ms | f32m4 + u8m1 segment state |
+| CSR SpMV | LMUL=1 | 23.999645 ms | u32m1 offsets + f32m1 indexed gather |
+| CSR SpMV | LMUL=4 | 20.758271 ms | u32m4 offsets + f32m4 indexed gather |
+| FWHT | LMUL=1 | 26.429536 ms | 更小 strip/butterfly vectors |
+| FWHT | LMUL=4 | 28.755026 ms | 更宽 strip/butterfly vectors |
+| AdamW | LMUL=1 | 83.227385 ms | f32m1 pointwise/sqrt |
+| AdamW | LMUL=4 | 68.594461 ms | f32m4 pointwise/sqrt |
+| AdamW | LMUL=8 | 61.426150 ms | f32m8 pointwise/sqrt |
 
 这证明 candidate 并非 kernel-specific 常量：相同 `vlaLMUL` 维度在 typed resource legality、memory
 relation 与局部 live vectors 下产生不同合法集合和不同实测最优。默认结果仍由 target facts 与资源
