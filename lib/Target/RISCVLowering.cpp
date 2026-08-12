@@ -3382,7 +3382,7 @@ private:
         rhsType.getShape().size() != 1 || resultType.getShape().size() != 1 ||
         lhsType.getShape()[0] != resultType.getShape()[0] ||
         lhsType.getShape()[1] != rhsType.getShape()[0] ||
-        resultType.getShape()[0] <= 0 || resultType.getShape()[0] > 6 ||
+        resultType.getShape()[0] <= 0 || resultType.getShape()[0] > 8 ||
         !lhsType.getElementType().isF32() ||
         !rhsType.getElementType().isF32() ||
         !resultType.getElementType().isF32() || !init ||
@@ -3456,7 +3456,7 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
-    decision.lmul = 4;
+    decision.lmul = decision.rowTile > 6 ? 1 : 4;
     return decision;
   }
 
