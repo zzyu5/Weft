@@ -37,6 +37,27 @@ llvm::cl::opt<std::string> matrixExtension(
 llvm::cl::list<std::string> metaBindings(
     "meta", llvm::cl::desc("Specialization binding NAME=INTEGER"),
     llvm::cl::ZeroOrMore);
+llvm::cl::opt<int64_t> vlaLMUL(
+    "vla-lmul", llvm::cl::desc("Requested VLA data LMUL; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> contractLMUL(
+    "contract-lmul", llvm::cl::desc("Requested contract LMUL; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> contractKUnroll(
+    "contract-k-unroll",
+    llvm::cl::desc("Requested contract K unroll; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> f16InputLMUL(
+    "f16-input-lmul",
+    llvm::cl::desc("Requested F16 contraction input LMUL; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> f16RowMicrotile(
+    "f16-row-microtile",
+    llvm::cl::desc("Requested F16 contraction row microtile; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> narrowLMUL(
+    "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
+    llvm::cl::init(0));
 
 bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
   for (llvm::StringRef spelling : metaBindings) {
@@ -102,6 +123,12 @@ int main(int argc, char **argv) {
       return 1;
     }
     options.target.matrixExtension = matrixExtension;
+    options.backend.vlaLMUL = vlaLMUL;
+    options.backend.contractLMUL = contractLMUL;
+    options.backend.contractKUnroll = contractKUnroll;
+    options.backend.f16InputLMUL = f16InputLMUL;
+    options.backend.f16RowMicrotile = f16RowMicrotile;
+    options.backend.narrowLMUL = narrowLMUL;
     if (!parseMetaBindings(options.metaBindings) ||
         mlir::failed(
             weft::lowerToRISCVIntrinsicC(*module, options, output.os())))

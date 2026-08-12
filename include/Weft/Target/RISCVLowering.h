@@ -13,9 +13,19 @@ class raw_ostream;
 
 namespace weft {
 
+struct RISCVBackendConfig {
+  int64_t vlaLMUL = 0;
+  int64_t contractLMUL = 0;
+  int64_t contractKUnroll = 0;
+  int64_t f16InputLMUL = 0;
+  int64_t f16RowMicrotile = 0;
+  int64_t narrowLMUL = 0;
+};
+
 struct RISCVLoweringOptions {
   RISCVTargetProfile target;
   llvm::StringMap<int64_t> metaBindings;
+  RISCVBackendConfig backend;
 };
 
 mlir::LogicalResult lowerToRISCVIntrinsicC(

@@ -1097,7 +1097,7 @@ private:
   std::optional<F32ContractPhysicalConfig>
   selectF32ContractPhysicalConfig(F32ContractResourceModel model,
                                   unsigned rowTile,
-                                  unsigned requestedUnroll) const {
+                                  unsigned defaultUnroll) const {
     constexpr unsigned vlaCandidates[] = {4, 2, 1};
     constexpr unsigned narrowRowCandidates[] = {4, 2, 1};
     constexpr unsigned mediumRowCandidates[] = {2, 4, 1};
@@ -1107,7 +1107,27 @@ private:
       candidates = rowTile <= 4   ? llvm::ArrayRef<unsigned>(narrowRowCandidates)
                    : rowTile <= 6 ? llvm::ArrayRef<unsigned>(mediumRowCandidates)
                                   : llvm::ArrayRef<unsigned>(wideRowCandidates);
+    unsigned requestedUnroll = options.backend.contractKUnroll == 0
+                                   ? defaultUnroll
+                                   : static_cast<unsigned>(
+                                         options.backend.contractKUnroll);
+    llvm::SmallVector<unsigned> requestedLMUL;
+    if (options.backend.contractLMUL != 0) {
+      requestedLMUL.push_back(
+          static_cast<unsigned>(options.backend.contractLMUL));
+      candidates = requestedLMUL;
+    }
+    auto legalUnroll = [](unsigned value) {
+      return value == 1 || value == 2 || value == 4;
+    };
+    auto legalLMUL = [](unsigned value) {
+      return value == 1 || value == 2 || value == 4 || value == 8;
+    };
+    if (!legalUnroll(requestedUnroll))
+      return std::nullopt;
     for (unsigned lmul : candidates) {
+      if (!legalLMUL(lmul))
+        continue;
       unsigned accumulatorGroups = rowTile * lmul;
       unsigned streamedOperandGroups =
           (model == F32ContractResourceModel::LocalRow ? 2 : 1) *
@@ -1448,8 +1468,18 @@ private:
             "VLA narrow has no selected saturating f32-to-i8 realization");
         return mlir::failure();
       }
-      decision.physical.dataLMUL = 8;
-      decision.narrows.push_back(VLANarrowDecision{narrow.getOperation()});
+      unsigned sourceLMUL = options.backend.narrowLMUL == 0
+                                ? 8
+                                : static_cast<unsigned>(
+                                      options.backend.narrowLMUL);
+      if (sourceLMUL != 2 && sourceLMUL != 4 && sourceLMUL != 8) {
+        narrow.emitError("VLA narrow requested an illegal f32 LMUL candidate");
+        return mlir::failure();
+      }
+      decision.physical.dataLMUL = sourceLMUL;
+      decision.narrows.push_back(VLANarrowDecision{
+          narrow.getOperation(), sourceLMUL, sourceLMUL / 2,
+          sourceLMUL / 4});
     }
 
     for (mlir::Operation &nested : body.without_terminator()) {
@@ -1607,6 +1637,15 @@ private:
                hasFloatCast && !requiresF32M2Math) {
       decision.physical.dataSEW = 32;
       decision.physical.dataLMUL = 8;
+    }
+    if (options.backend.vlaLMUL != 0 && decision.contracts.empty() &&
+        !hasWideningF16Dot && decision.narrows.empty()) {
+      unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
+      if (requested != 1 && requested != 2 && requested != 4 && requested != 8) {
+        op.emitError("VLA requested an illegal LMUL candidate");
+        return mlir::failure();
+      }
+      decision.physical.dataLMUL = requested;
     }
 
     for (mlir::Operation *operation : physicalOperations) {
