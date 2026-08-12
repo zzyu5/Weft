@@ -153,6 +153,54 @@ case "${kernel}" in
     dsl=examples/kernels/state/rwkv_wkv6.py
     runtime=examples/repro/weft/state/rwkv_wkv6_runtime.cpp
     ;;
+  gated_linear_attention)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 gated_linear_attention" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/gated_linear_attention.py
+    runtime=examples/repro/weft/state/gated_linear_attention_runtime.cpp
+    ;;
+  rwkv_wkv7)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 rwkv_wkv7" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/rwkv_wkv7.py
+    runtime=examples/repro/weft/state/rwkv_wkv7_runtime.cpp
+    ;;
+  gated_delta_net)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 gated_delta_net" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/gated_delta_net.py
+    runtime=examples/repro/weft/state/gated_delta_net_runtime.cpp
+    ;;
+  solve_triangular)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 solve_triangular" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/linear_algebra/solve_triangular.py
+    runtime=examples/repro/weft/linear_algebra/solve_triangular_runtime.cpp
+    ;;
+  group_norm)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 group_norm" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/normalization/group_norm.py
+    runtime=examples/repro/weft/normalization/group_norm_runtime.cpp
+    ;;
+  sam_relative_position)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 sam_relative_position" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/sam_relative_position.py
+    runtime=examples/repro/weft/vision/sam_relative_position_runtime.cpp
+    ;;
   depthwise_conv2d)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 depthwise_conv2d" >&2

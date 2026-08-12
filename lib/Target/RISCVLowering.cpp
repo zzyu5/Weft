@@ -402,10 +402,8 @@ struct VLACandidateFacts {
   unsigned f32Loads = 0;
   unsigned f32Stores = 0;
   unsigned stridedAccesses = 0;
-  unsigned nestedScalarLoops = 0;
-  unsigned enclosingScalarLoads = 0;
-  unsigned reductionStates = 0;
   unsigned maxEntityF32Vectors = 0;
+  bool hasReductionState = false;
   bool hasOrderedScan = false;
   bool hasCoordinateSummary = false;
   bool hasOnlineSummary = false;
@@ -1854,27 +1852,8 @@ private:
         candidateFacts.f32Stores += mlir::isa<StoreOp>(access.operation);
       }
     }
-    for (mlir::Operation *operation : physicalOperations) {
-      auto loop = mlir::dyn_cast<ForOp>(operation);
-      if (!loop)
-        continue;
-      ++candidateFacts.nestedScalarLoops;
-    }
-    for (mlir::Operation *ancestor = op->getParentOp(); ancestor;
-         ancestor = ancestor->getParentOp()) {
-      auto loop = mlir::dyn_cast<ForOp>(ancestor);
-      if (!loop)
-        continue;
-      for (mlir::Operation &operation : loop.getBody().front()) {
-        if (&operation == op.getOperation())
-          break;
-        auto load = mlir::dyn_cast<LoadOp>(operation);
-        if (load && !hasBlockPayload(load.getOperation()))
-          ++candidateFacts.enclosingScalarLoads;
-      }
-    }
     for (const VLAStateDecision &state : decision.states) {
-      candidateFacts.reductionStates +=
+      candidateFacts.hasReductionState |=
           state.realization == VLAStateRealization::RVVAddReduction ||
           state.realization == VLAStateRealization::RVVMaxReduction;
       candidateFacts.hasOrderedScan |=
@@ -1917,16 +1896,10 @@ private:
           candidates = {1, 2, 4, 8};
         else if (candidateFacts.hasCoordinateSummary)
           candidates = {4, 2, 1, 8};
-        else if (candidateFacts.reductionStates > 0)
-          candidates = candidateFacts.reductionStates > 1
-                           ? llvm::SmallVector<unsigned>{4, 2, 1, 8}
-                           : llvm::SmallVector<unsigned>{8, 4, 2, 1};
+        else if (candidateFacts.hasReductionState)
+          candidates = {8, 4, 2, 1};
         else if (candidateFacts.stridedAccesses > 0)
           candidates = {2, 4, 1, 8};
-        else if (candidateFacts.enclosingScalarLoads > 0)
-          candidates = {1, 2, 4, 8};
-        else if (candidateFacts.nestedScalarLoops > 0)
-          candidates = {8, 4, 2, 1};
         else
           candidates = {4, 2, 8, 1};
       }
