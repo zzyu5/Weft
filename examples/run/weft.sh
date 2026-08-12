@@ -238,6 +238,17 @@ case "${kernel}" in
     dsl=examples/kernels/vision/bilinear_upscale.py
     runtime=examples/repro/weft/vision/bilinear_upscale_runtime.cpp
     ;;
+  roi_align)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 roi_align" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/roi_align.py
+    runtime=examples/repro/weft/vision/roi_align_runtime.cpp
+    multi=1
+    multi_primary=roi_align_f32
+    multi_equivalent=roi_align_f32_equivalent
+    ;;
   window_partition)
     if [[ $# -ne 0 ]]; then
       echo "usage: $0 window_partition" >&2
@@ -398,6 +409,14 @@ case "${kernel}" in
     dsl=examples/kernels/attention/online_flash_attention.py
     runtime=examples/repro/weft/attention/online_flash_attention_runtime.cpp
     runtime_arguments=("$1")
+    ;;
+  csr_sparse_attention)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: $0 csr_sparse_attention" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/attention/csr_sparse_attention.py
+    runtime=examples/repro/weft/attention/csr_sparse_attention_runtime.cpp
     ;;
   causal_mask)
     if [[ $# -ne 0 ]]; then
