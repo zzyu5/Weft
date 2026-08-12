@@ -266,6 +266,51 @@ struct SpecializedVLADecision {
   std::string scalar;
 };
 
+enum class AffineI4I8NTileRealization {
+  SpacemiTIME1N16K32,
+};
+
+struct AffineI4I8NTileDecision {
+  AffineI4I8NTileRealization realization =
+      AffineI4I8NTileRealization::SpacemiTIME1N16K32;
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *semanticOperation = nullptr;
+  std::string activationCodes;
+  std::string activationScales;
+  std::string packedWeight;
+  std::string output;
+  std::string columns;
+  std::string blocks;
+  unsigned nTile = 16;
+  unsigned kBlock = 32;
+  unsigned packedBlockBytes = 304;
+};
+
+enum class F16GemmNTileRealization {
+  RVVRowMicrotile,
+};
+
+struct F16GemmNTileDecision {
+  F16GemmNTileRealization realization =
+      F16GemmNTileRealization::RVVRowMicrotile;
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *semanticOperation = nullptr;
+  std::string row;
+  std::string rowUpper;
+  std::string lhs;
+  std::string rhs;
+  std::string output;
+  std::string lhsStride;
+  std::string rhsStride;
+  std::string outputStride;
+  std::string nLower;
+  std::string nUpper;
+  std::string kLower;
+  std::string kUpper;
+  unsigned rowTile = 4;
+  unsigned vectorLength = 8;
+};
+
 enum class ContractRealization {
   RVVF32RowMicrotile,
 };
@@ -1432,10 +1477,12 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
-    if (auto lowered = tryEmitAffineI4I8NTiles(op))
-      return *lowered;
-    if (auto lowered = tryEmitF16GemmNTiles(op))
-      return *lowered;
+    if (std::optional<AffineI4I8NTileDecision> decision =
+            decideAffineI4I8NTiles(op))
+      return emitAffineI4I8NTiles(*decision);
+    if (std::optional<F16GemmNTileDecision> decision =
+            decideF16GemmNTiles(op))
+      return emitF16GemmNTiles(*decision);
     mlir::Block &body = op.getBody().front();
     if (op.getInitArgs().size() != op.getNumResults() ||
         body.getNumArguments() != op.getNumResults() + 1)
@@ -4304,7 +4351,7 @@ private:
     return mlir::success();
   }
 
-  std::optional<mlir::LogicalResult> tryEmitAffineI4I8NTiles(ForOp nLoop) {
+  std::optional<AffineI4I8NTileDecision> decideAffineI4I8NTiles(ForOp nLoop) {
     mlir::Block &nBody = nLoop.getBody().front();
     ForOp kLoop;
     StoreOp store;
@@ -4334,9 +4381,9 @@ private:
       return std::nullopt;
 
     auto reject = [&](llvm::StringRef message)
-        -> std::optional<mlir::LogicalResult> {
+        -> std::optional<AffineI4I8NTileDecision> {
       contract.emitError(message);
-      return std::optional<mlir::LogicalResult>(mlir::failure());
+      return std::nullopt;
     };
     for (mlir::Operation &operation : nBody.without_terminator()) {
       if (&operation == kLoop.getOperation() ||
@@ -4529,23 +4576,42 @@ private:
         outputValue.spelling.empty() || columns.empty() || blocks.empty())
       return reject("IME1 lowering could not materialize the explicit source operands");
 
-    std::string nTile = fresh("ime_n");
-    std::string nCount = fresh("ime_n_count");
-    line("for (size_t " + nTile + " = 0; " + nTile + " < " + columns +
-         "; " + nTile + " += 16) {");
-    ++indent;
-    line("const size_t " + nCount + " = (" + columns + " - " + nTile +
-         ") < 16 ? (" + columns + " - " + nTile + ") : 16;");
-    line("__weft_ime1_affine_i4_i8_n16(" + scales.spelling + ", " +
-         code.spelling + ", " + weights.spelling + " + (" + nTile +
-         " / 16) * " + blocks + " * 304, " + outputValue.spelling + " + " +
-         nTile + ", " + nCount + ", " + blocks + ");");
-    --indent;
-    line("}");
-    return std::optional<mlir::LogicalResult>(mlir::success());
+    AffineI4I8NTileDecision decision;
+    decision.operation = nLoop.getOperation();
+    decision.semanticOperation = contract.getOperation();
+    decision.activationCodes = code.spelling;
+    decision.activationScales = scales.spelling;
+    decision.packedWeight = weights.spelling;
+    decision.output = outputValue.spelling;
+    decision.columns = columns;
+    decision.blocks = blocks;
+    return decision;
   }
 
-  std::optional<mlir::LogicalResult> tryEmitF16GemmNTiles(ForOp nLoop) {
+  mlir::LogicalResult emitAffineI4I8NTiles(
+      const AffineI4I8NTileDecision &decision) {
+    std::string nTile = fresh("ime_n");
+    std::string nCount = fresh("ime_n_count");
+    line("for (size_t " + nTile + " = 0; " + nTile + " < " +
+         decision.columns + "; " + nTile + " += " +
+         std::to_string(decision.nTile) + ") {");
+    ++indent;
+    line("const size_t " + nCount + " = (" + decision.columns + " - " +
+         nTile + ") < " + std::to_string(decision.nTile) + " ? (" +
+         decision.columns + " - " + nTile + ") : " +
+         std::to_string(decision.nTile) + ";");
+    line("__weft_ime1_affine_i4_i8_n16(" + decision.activationScales + ", " +
+         decision.activationCodes + ", " + decision.packedWeight + " + (" +
+         nTile + " / " + std::to_string(decision.nTile) + ") * " +
+         decision.blocks + " * " + std::to_string(decision.packedBlockBytes) +
+         ", " + decision.output + " + " + nTile + ", " + nCount + ", " +
+         decision.blocks + ");");
+    --indent;
+    line("}");
+    return mlir::success();
+  }
+
+  std::optional<F16GemmNTileDecision> decideF16GemmNTiles(ForOp nLoop) {
     if (nLoop.getNumResults() != 0)
       return std::nullopt;
     ForOp mLoop = nLoop->getParentOfType<ForOp>();
@@ -4654,15 +4720,37 @@ private:
         rhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty())
       return std::nullopt;
 
+    F16GemmNTileDecision decision;
+    decision.operation = nLoop.getOperation();
+    decision.semanticOperation = contract.getOperation();
+    decision.row = mValue.spelling;
+    decision.rowUpper = mUpper.spelling;
+    decision.lhs = lhs.spelling;
+    decision.rhs = rhs.spelling;
+    decision.output = outputValue.spelling;
+    decision.lhsStride = lhsStrideValue.spelling;
+    decision.rhsStride = rhsStrideValue.spelling;
+    decision.outputStride = outputStrideValue.spelling;
+    decision.nLower = nLower;
+    decision.nUpper = nUpper;
+    decision.kLower = kLower;
+    decision.kUpper = kUpper;
+    return decision;
+  }
+
+  mlir::LogicalResult emitF16GemmNTiles(
+      const F16GemmNTileDecision &decision) {
     std::string nTile = fresh("gemm_n");
     std::string vl = fresh("gemm_vl");
     std::string rows = fresh("gemm_rows");
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(8);");
-    line("const size_t " + rows + " = (" + mUpper.spelling + " - " +
-         mValue.spelling + ") < 4 ? (" + mUpper.spelling + " - " +
-         mValue.spelling + ") : 4;");
-    line("for (size_t " + nTile + " = " + nLower + "; " + nTile + " < " +
-         nUpper + "; ++" + nTile + ") {");
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" +
+         std::to_string(decision.vectorLength) + ");");
+    line("const size_t " + rows + " = (" + decision.rowUpper + " - " +
+         decision.row + ") < " + std::to_string(decision.rowTile) + " ? (" +
+         decision.rowUpper + " - " + decision.row + ") : " +
+         std::to_string(decision.rowTile) + ";");
+    line("for (size_t " + nTile + " = " + decision.nLower + "; " + nTile +
+         " < " + decision.nUpper + "; ++" + nTile + ") {");
     ++indent;
 
     auto emitRows = [&](unsigned rowCount, bool first) {
@@ -4678,21 +4766,21 @@ private:
       }
       std::string inner = fresh("gemm_k");
       std::string fullEnd = fresh("gemm_k_end");
-      line("const size_t " + fullEnd + " = " + kUpper + " - ((" + kUpper +
-           " - " + kLower + ") % " + vl + ");");
-      line("for (size_t " + inner + " = " + kLower + "; " + inner + " < " +
+      line("const size_t " + fullEnd + " = " + decision.kUpper + " - ((" +
+           decision.kUpper + " - " + decision.kLower + ") % " + vl + ");");
+      line("for (size_t " + inner + " = " + decision.kLower + "; " + inner + " < " +
            fullEnd + "; " + inner + " += " + vl + ") {");
       ++indent;
       std::string rhsVector = fresh("gemm_b");
       line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
-           rhs.spelling + " + " + nTile + " * " + rhsStrideValue.spelling +
+           decision.rhs + " + " + nTile + " * " + decision.rhsStride +
            " + " + inner + ", " + vl + ");");
       for (unsigned row = 0; row < rowCount; ++row) {
         std::string lhsVector = fresh("gemm_a");
         line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
-             lhs.spelling + " + (" +
-             mValue.spelling + " + " + std::to_string(row) + ") * " +
-             lhsStrideValue.spelling + " + " + inner + ", " + vl + ");");
+             decision.lhs + " + (" + decision.row + " + " +
+             std::to_string(row) + ") * " + decision.lhsStride + " + " +
+             inner + ", " + vl + ");");
         line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m2(" +
              accumulators[row] + ", " + lhsVector + ", " + rhsVector + ", " +
              vl + ");");
@@ -4712,16 +4800,16 @@ private:
              ");");
         std::string tail = fresh("gemm_tail");
         line("for (size_t " + tail + " = " + fullEnd + "; " + tail + " < " +
-             kUpper + "; ++" + tail + ")");
+             decision.kUpper + "; ++" + tail + ")");
         ++indent;
-        line(scalar + " += (float)*(" + lhs.spelling + " + (" +
-             mValue.spelling + " + " + std::to_string(row) + ") * " +
-             lhsStrideValue.spelling + " + " + tail + ") * (float)*(" +
-             rhs.spelling + " + " + nTile + " * " +
-             rhsStrideValue.spelling + " + " + tail + ");");
+        line(scalar + " += (float)*(" + decision.lhs + " + (" +
+             decision.row + " + " + std::to_string(row) + ") * " +
+             decision.lhsStride + " + " + tail + ") * (float)*(" +
+             decision.rhs + " + " + nTile + " * " + decision.rhsStride +
+             " + " + tail + ");");
         --indent;
-        line("*(" + outputValue.spelling + " + (" + mValue.spelling + " + " +
-             std::to_string(row) + ") * " + outputStrideValue.spelling + " + " +
+        line("*(" + decision.output + " + (" + decision.row + " + " +
+             std::to_string(row) + ") * " + decision.outputStride + " + " +
              nTile + ") = " + scalar + ";");
       }
       --indent;
