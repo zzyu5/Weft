@@ -7,7 +7,8 @@
 #include <vector>
 
 extern "C" void conv_transpose2d_p0_f32(
-    const float *source, const float *weight, float *output, std::size_t batch,
+    const float *source, const float *weight, float *output,
+    float *packed_source, float *packed_weight, std::size_t batch,
     std::size_t input_height, std::size_t input_width,
     std::size_t input_channels, std::size_t output_channels,
     std::size_t kernel_height, std::size_t kernel_width, std::size_t stride);
@@ -100,6 +101,8 @@ int main() {
   std::vector<float> source(inputElements);
   std::vector<float> weight(weightElements);
   std::vector<float> output(outputElements);
+  std::vector<float> packedSource(inputElements);
+  std::vector<float> packedWeight(weightElements);
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] =
         static_cast<float>(static_cast<int>(index % 127U) - 63) / 256.0F;
@@ -109,9 +112,9 @@ int main() {
         512.0F;
 
   conv_transpose2d_p0_f32(
-      source.data(), weight.data(), output.data(), kBatch, kInputHeight,
-      kInputWidth, kInputChannels, kOutputChannels, kKernelHeight,
-      kKernelWidth, kStride);
+      source.data(), weight.data(), output.data(), packedSource.data(),
+      packedWeight.data(), kBatch, kInputHeight, kInputWidth, kInputChannels,
+      kOutputChannels, kKernelHeight, kKernelWidth, kStride);
   const std::size_t sampleChannels[] = {0, 63, 127};
   const std::size_t sampleY[] = {0, 1, 15, 31};
   const std::size_t sampleX[] = {0, 1, 16, 31};
@@ -140,9 +143,9 @@ int main() {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
     conv_transpose2d_p0_f32(
-        source.data(), weight.data(), output.data(), kBatch, kInputHeight,
-        kInputWidth, kInputChannels, kOutputChannels, kKernelHeight,
-        kKernelWidth, kStride);
+        source.data(), weight.data(), output.data(), packedSource.data(),
+        packedWeight.data(), kBatch, kInputHeight, kInputWidth, kInputChannels,
+        kOutputChannels, kKernelHeight, kKernelWidth, kStride);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
