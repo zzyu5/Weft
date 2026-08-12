@@ -6367,30 +6367,59 @@ private:
   BlockStorePhysicalDecision decideBlockStorePhysical(
       int64_t extent, BlockAxisOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
-    BlockStorePhysicalDecision decision;
-    decision.needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
+    bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
     bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
       return mlir::isa<BlockAxisOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
           operation);
     });
-    if (!decision.needsLaneVector && extent == 32 && microClosure) {
-      decision.realization = BlockStoreRealization::RVVE8MF4MicroStrips;
-      decision.byteShape = RVVBlockVectorShape::E8MF4;
-      decision.stripVL = 4;
-    } else if (!decision.needsLaneVector && extent == 32) {
-      decision.realization = BlockStoreRealization::RVVE8M1FixedStrips;
+    llvm::SmallVector<BlockStorePhysicalDecision> candidates;
+    candidates.push_back(BlockStorePhysicalDecision{
+        BlockStoreRealization::RVVE8MF4MicroStrips,
+        RVVBlockVectorShape::E8MF4, 4, false});
+    candidates.push_back(BlockStorePhysicalDecision{
+        BlockStoreRealization::RVVE8M1FixedStrips,
+        RVVBlockVectorShape::E8M1, 16, false});
+    candidates.push_back(BlockStorePhysicalDecision{
+        BlockStoreRealization::RVVE8M1DynamicStrips,
+        RVVBlockVectorShape::E8M1, 16, needsLaneVector});
+    for (const BlockStorePhysicalDecision &candidate : candidates) {
+      if (candidate.realization ==
+              BlockStoreRealization::RVVE8MF4MicroStrips &&
+          (needsLaneVector || extent != 32 || !microClosure))
+        continue;
+      if (candidate.realization == BlockStoreRealization::RVVE8M1FixedStrips &&
+          (needsLaneVector || extent != 32))
+        continue;
+      unsigned dataGroups =
+          candidate.byteShape == RVVBlockVectorShape::E8MF4 ? 4 : 8;
+      unsigned laneGroups = candidate.needsLaneVector ? 2 : 0;
+      if (dataGroups + laneGroups + 1 >=
+          static_cast<unsigned>(options.target.vectorRegisters))
+        continue;
+      return candidate;
     }
-    return decision;
+    return BlockStorePhysicalDecision{};
   }
 
   BlockReducePhysicalDecision decideBlockReducePhysical(
       int64_t extent, BlockAxisOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
-    BlockReducePhysicalDecision decision;
-    decision.needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
-    if (!decision.needsLaneVector && extent == 32)
-      decision.realization = BlockReduceRealization::RVVE8M1FixedStrips;
-    return decision;
+    bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
+    llvm::SmallVector<BlockReducePhysicalDecision> candidates{
+        {BlockReduceRealization::RVVE8M1FixedStrips, 16, false},
+        {BlockReduceRealization::RVVE8M1DynamicStrips, 16,
+         needsLaneVector}};
+    for (const BlockReducePhysicalDecision &candidate : candidates) {
+      if (candidate.realization == BlockReduceRealization::RVVE8M1FixedStrips &&
+          (needsLaneVector || extent != 32))
+        continue;
+      unsigned liveGroups = 8 + (candidate.needsLaneVector ? 2 : 0) + 1;
+      if (liveGroups + 1 >=
+          static_cast<unsigned>(options.target.vectorRegisters))
+        continue;
+      return candidate;
+    }
+    return BlockReducePhysicalDecision{};
   }
 
   std::optional<int64_t> f32BlockExtent(mlir::Type type) const {
