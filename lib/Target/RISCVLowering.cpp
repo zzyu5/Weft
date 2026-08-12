@@ -92,6 +92,33 @@ struct BlockDecodeDecision {
   RVVBlockVectorShape resultShape = RVVBlockVectorShape::E8M1;
 };
 
+enum class BlockStoreRealization {
+  RVVE8MF4MicroStrips,
+  RVVE8M1FixedStrips,
+  RVVE8M1DynamicStrips,
+};
+
+struct BlockStorePhysicalDecision {
+  BlockStoreRealization realization =
+      BlockStoreRealization::RVVE8M1DynamicStrips;
+  RVVBlockVectorShape byteShape = RVVBlockVectorShape::E8M1;
+  unsigned stripVL = 16;
+  bool needsLaneVector = false;
+};
+
+enum class BlockReduceRealization {
+  RVVE8M1FixedStrips,
+  RVVE8M1DynamicStrips,
+};
+
+struct BlockReducePhysicalDecision {
+  BlockReduceRealization realization =
+      BlockReduceRealization::RVVE8M1DynamicStrips;
+  RVVBlockVectorShape inputShape = RVVBlockVectorShape::E8M1;
+  unsigned stripVL = 16;
+  bool needsLaneVector = false;
+};
+
 enum class SymmetricI4I8Realization {
   SpacemiTIME1N16K32,
 };
@@ -877,7 +904,7 @@ private:
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
   bool inVLA = false;
-  bool microBlockVectors = false;
+  RVVBlockVectorShape activeBlockByteShape = RVVBlockVectorShape::E8M1;
   std::string activeVL;
   const VLARegionDecision *activeVLADecision = nullptr;
 
@@ -5129,7 +5156,8 @@ private:
           auto cast = mlir::dyn_cast<CastOp>(user);
           return cast && elementType(cast.getResult().getType()).isF32();
         });
-    if (microBlockVectors && resultKind == BlockValueKind::U8 &&
+    if (activeBlockByteShape == RVVBlockVectorShape::E8MF4 &&
+        resultKind == BlockValueKind::U8 &&
         lhs.kind == BlockValueKind::U8 && !lhs.spelling.empty() &&
         rhs.kind == BlockValueKind::Scalar && !rhs.spelling.empty() &&
         (op.getKind() == "and" || op.getKind() == "shr") &&
@@ -5193,8 +5221,11 @@ private:
     std::string suffix;
     std::string cType;
     if (resultKind == BlockValueKind::U8) {
-      suffix = microBlockVectors ? "u8mf4" : "u8m1";
-      cType = microBlockVectors ? "vuint8mf4_t" : "vuint8m1_t";
+      suffix = activeBlockByteShape == RVVBlockVectorShape::E8MF4 ? "u8mf4"
+                                                                  : "u8m1";
+      cType = activeBlockByteShape == RVVBlockVectorShape::E8MF4
+                  ? "vuint8mf4_t"
+                  : "vuint8m1_t";
     } else if (resultKind == BlockValueKind::U16) {
       suffix = "u16m2";
       cType = "vuint16m2_t";
@@ -5225,8 +5256,7 @@ private:
          vl.str() + ");");
     BlockValue result{op.getResult().getType(), resultKind, name};
     if (resultKind == BlockValueKind::U8)
-      result.vectorShape = microBlockVectors ? RVVBlockVectorShape::E8MF4
-                                             : RVVBlockVectorShape::E8M1;
+      result.vectorShape = activeBlockByteShape;
     else if (resultKind == BlockValueKind::U16)
       result.vectorShape = RVVBlockVectorShape::E16M2;
     else if (resultKind == BlockValueKind::I32)
@@ -5411,7 +5441,7 @@ private:
     } else if (input.kind == BlockValueKind::U8 && target.isF32()) {
       kind = BlockValueKind::F32;
       std::string extended;
-      if (microBlockVectors) {
+      if (activeBlockByteShape == RVVBlockVectorShape::E8MF4) {
         shape = RVVBlockVectorShape::E32M1;
         std::string sourceSpelling = input.spelling;
         auto source = blockValues.find(input.packedSource);
@@ -5525,8 +5555,12 @@ private:
     if (!elementType(op.getResult().getType()).isUnsignedInteger(8))
       return op.emitError("RVV block load currently supports u8 elements");
     std::string name = fresh("block_load");
-    std::string suffix = microBlockVectors ? "u8mf4" : "u8m1";
-    std::string cType = microBlockVectors ? "vuint8mf4_t" : "vuint8m1_t";
+    std::string suffix = activeBlockByteShape == RVVBlockVectorShape::E8MF4
+                             ? "u8mf4"
+                             : "u8m1";
+    std::string cType = activeBlockByteShape == RVVBlockVectorShape::E8MF4
+                            ? "vuint8mf4_t"
+                            : "vuint8m1_t";
     bool allActive = isTrue(op.getWhere());
     if (allActive && !pointer.contiguousIndex.empty()) {
       line(cType + " " + name + " = __riscv_vle8_v_" + suffix + "(" +
@@ -5549,8 +5583,7 @@ private:
     }
     BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
     result.unsignedMaximum = 255;
-    result.vectorShape = microBlockVectors ? RVVBlockVectorShape::E8MF4
-                                           : RVVBlockVectorShape::E8M1;
+    result.vectorShape = activeBlockByteShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -5710,6 +5743,48 @@ private:
         "RISC-V target does not implement this block producer primitive");
   }
 
+  bool blockClosureNeedsLaneVector(
+      BlockAxisOp axis,
+      const llvm::DenseSet<mlir::Operation *> &closure) const {
+    return llvm::any_of(axis.getResult().getUsers(),
+                        [&](mlir::Operation *user) {
+                          if (!closure.contains(user))
+                            return false;
+                          auto pointer = mlir::dyn_cast<PtrAddOp>(user);
+                          return !pointer ||
+                                 pointer.getOffset() != axis.getResult();
+                        });
+  }
+
+  BlockStorePhysicalDecision decideBlockStorePhysical(
+      int64_t extent, BlockAxisOp axis,
+      const llvm::DenseSet<mlir::Operation *> &closure) const {
+    BlockStorePhysicalDecision decision;
+    decision.needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
+    bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
+      return mlir::isa<BlockAxisOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
+          operation);
+    });
+    if (!decision.needsLaneVector && extent == 32 && microClosure) {
+      decision.realization = BlockStoreRealization::RVVE8MF4MicroStrips;
+      decision.byteShape = RVVBlockVectorShape::E8MF4;
+      decision.stripVL = 4;
+    } else if (!decision.needsLaneVector && extent == 32) {
+      decision.realization = BlockStoreRealization::RVVE8M1FixedStrips;
+    }
+    return decision;
+  }
+
+  BlockReducePhysicalDecision decideBlockReducePhysical(
+      int64_t extent, BlockAxisOp axis,
+      const llvm::DenseSet<mlir::Operation *> &closure) const {
+    BlockReducePhysicalDecision decision;
+    decision.needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
+    if (!decision.needsLaneVector && extent == 32)
+      decision.realization = BlockReduceRealization::RVVE8M1FixedStrips;
+    return decision;
+  }
+
   mlir::LogicalResult emitBlockStores(StoreOp op) {
     if (auto lowered = tryEmitLocalF32ContractBlockStore(op))
       return *lowered;
@@ -5802,45 +5877,36 @@ private:
     std::string strip = fresh("block_i");
     std::string vl = fresh("block_vl");
     std::string lane = fresh("block_lane");
-    bool needsLaneVector = llvm::any_of(
-        axis.getResult().getUsers(), [&](mlir::Operation *user) {
-          if (!closure.contains(user))
-            return false;
-          auto pointer = mlir::dyn_cast<PtrAddOp>(user);
-          return !pointer || pointer.getOffset() != axis.getResult();
-        });
-    bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
-      return mlir::isa<BlockAxisOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
-          operation);
-    });
-    bool useMicroVectors =
-        !needsLaneVector && *extent == 32 && microClosure;
+    BlockStorePhysicalDecision physical =
+        decideBlockStorePhysical(*extent, axis, closure);
 
     auto emitStrip = [&](llvm::StringRef stripOffset,
                          llvm::StringRef activeVL) -> mlir::LogicalResult {
       llvm::DenseMap<mlir::Value, BlockValue> blockValues;
       BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
-                            needsLaneVector ? lane : ""};
+                            physical.needsLaneVector ? lane : ""};
       coordinate.contiguousIndex =
           "(" + stripOffset.str() + " + " + offset + ")";
       blockValues[axis.getResult()] = std::move(coordinate);
-      bool previousMicroBlockVectors = microBlockVectors;
-      microBlockVectors = useMicroVectors;
+      RVVBlockVectorShape previousBlockByteShape = activeBlockByteShape;
+      activeBlockByteShape = physical.byteShape;
       for (mlir::Operation &candidate : *op->getBlock()) {
         if (mlir::isa<BlockAxisOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
           continue;
         if (mlir::failed(emitBlockOperation(&candidate, blockValues, activeVL))) {
-          microBlockVectors = previousMicroBlockVectors;
+          activeBlockByteShape = previousBlockByteShape;
           return mlir::failure();
         }
       }
-      microBlockVectors = previousMicroBlockVectors;
+      activeBlockByteShape = previousBlockByteShape;
       return mlir::success();
     };
 
-    if (useMicroVectors) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8mf4(4);");
+    if (physical.realization ==
+        BlockStoreRealization::RVVE8MF4MicroStrips) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8mf4(" +
+           std::to_string(physical.stripVL) + ");");
       llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
           stripValues;
       for (int64_t stripOffset : {int64_t{0}, int64_t{4}, int64_t{8},
@@ -5854,21 +5920,23 @@ private:
         blockValues[axis.getResult()] = std::move(coordinate);
         stripValues.push_back(std::move(blockValues));
       }
-      bool previousMicroBlockVectors = microBlockVectors;
-      microBlockVectors = true;
+      RVVBlockVectorShape previousBlockByteShape = activeBlockByteShape;
+      activeBlockByteShape = physical.byteShape;
       for (mlir::Operation &candidate : *op->getBlock()) {
         if (mlir::isa<BlockAxisOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
           continue;
         for (auto &blockValues : stripValues)
           if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl))) {
-            microBlockVectors = previousMicroBlockVectors;
+            activeBlockByteShape = previousBlockByteShape;
             return mlir::failure();
           }
       }
-      microBlockVectors = previousMicroBlockVectors;
-    } else if (!needsLaneVector && *extent == 32) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(16);");
+      activeBlockByteShape = previousBlockByteShape;
+    } else if (physical.realization ==
+               BlockStoreRealization::RVVE8M1FixedStrips) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
+           std::to_string(physical.stripVL) + ");");
       if (mlir::failed(emitStrip("0", vl)) ||
           mlir::failed(emitStrip("16", vl)))
         return mlir::failure();
@@ -5879,7 +5947,7 @@ private:
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
            std::to_string(*extent) + " - " + strip + ") < 16 ? (" +
            std::to_string(*extent) + " - " + strip + ") : 16);");
-      if (needsLaneVector) {
+      if (physical.needsLaneVector) {
         line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl +
              ");");
         line(lane + " = __riscv_vadd_vx_u16m2(" + lane + ", " + strip +
@@ -5984,16 +6052,13 @@ private:
     std::string strip = fresh("block_i");
     std::string vl = fresh("block_vl");
     std::string lane = fresh("block_lane");
-    bool needsLaneVector = llvm::any_of(
-        axis.getResult().getUsers(), [&](mlir::Operation *user) {
-          if (!closure.contains(user))
-            return false;
-          auto pointer = mlir::dyn_cast<PtrAddOp>(user);
-          return !pointer || pointer.getOffset() != axis.getResult();
-        });
+    BlockReducePhysicalDecision physical =
+        decideBlockReducePhysical(extent, axis, closure);
 
-    if (!needsLaneVector && extent == 32) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(16);");
+    if (physical.realization ==
+        BlockReduceRealization::RVVE8M1FixedStrips) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
+           std::to_string(physical.stripVL) + ");");
       llvm::SmallVector<llvm::SmallVector<BlockValue, 2>, 2> stripInputs(
           reductions.size());
       llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
@@ -6081,7 +6146,7 @@ private:
          std::to_string(extent) + " - " + strip + ") < 16 ? (" +
          std::to_string(extent) + " - " + strip + ") : 16);");
 
-    if (needsLaneVector) {
+    if (physical.needsLaneVector) {
       line("vuint16m2_t " + lane + " = __riscv_vid_v_u16m2(" + vl + ");");
       line(lane + " = __riscv_vadd_vx_u16m2(" + lane + ", " + strip + " + " +
            offset + ", " + vl + ");");
@@ -6089,7 +6154,7 @@ private:
 
     llvm::DenseMap<mlir::Value, BlockValue> blockValues;
     BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
-                          needsLaneVector ? lane : ""};
+                          physical.needsLaneVector ? lane : ""};
     coordinate.contiguousIndex = "(" + strip + " + " + offset + ")";
     blockValues[axis.getResult()] = std::move(coordinate);
     llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
