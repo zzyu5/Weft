@@ -272,7 +272,6 @@ struct VLARegionDecision {
 
 enum class SpecializedVLARealization {
   F32ToF16,
-  F16Fill,
   WideningF16Dot,
   F16WeightedUpdate,
   F16ToF32Normalize,
@@ -1966,75 +1965,6 @@ private:
     return mlir::success();
   }
 
-  std::optional<SpecializedVLADecision> decideF16FillVLA(VLAOp op) {
-    if (op.getNumResults() != 0)
-      return std::nullopt;
-    mlir::Block &body = op.getBody().front();
-    StoreOp store;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (mlir::isa<LoadOp>(nested))
-        return std::nullopt;
-      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
-        if (store)
-          return std::nullopt;
-        store = candidate;
-      } else if (!mlir::isa<PtrAddOp, ConstantOp>(nested))
-        return std::nullopt;
-    }
-    if (!store || !isTrue(store.getWhere()) ||
-        !isF16(elementType(store.getValue().getType())))
-      return std::nullopt;
-    std::string fill = expression(store.getValue());
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(store.getPointer(), coordinate))
-      return std::nullopt;
-    std::optional<std::string> destination =
-        pointerBase(store.getPointer(), coordinate);
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    if (fill.empty() || !destination || begin.spelling.empty() ||
-        end.spelling.empty())
-      return std::nullopt;
-
-    SpecializedVLADecision decision;
-    decision.realization = SpecializedVLARealization::F16Fill;
-    decision.operation = op.getOperation();
-    decision.consumer = store.getOperation();
-    decision.begin = begin.spelling;
-    decision.end = end.spelling;
-    decision.destinationPointer = *destination;
-    decision.scalar = fill;
-    decision.physical.input = {16, 8};
-    decision.physical.compute = {16, 8};
-    decision.physical.output = {16, 8};
-    return decision;
-  }
-
-  mlir::LogicalResult emitF16FillVLA(
-      const SpecializedVLADecision &decision) {
-    const RVVVectorConfig &output = decision.physical.output;
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string vector = fresh("fill_f16");
-    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
-         " < " + decision.end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(output.sew) + "m" + std::to_string(output.lmul) + "(" +
-         decision.end + " - " + strip + ");");
-    line(rvvFloatType(output) + " " + vector + " = __riscv_vfmv_v_f_" +
-         rvvFloatSuffix(output) + "(" +
-         decision.scalar +
-         ", " + vl + ");");
-    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
-         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
-         strip + ", " + vector + ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-    return mlir::success();
-  }
-
   std::optional<SpecializedVLADecision> decideWideningF16DotVLA(VLAOp op) {
     if (op.getNumResults() != 1 || !op.getResult(0).getType().isF32())
       return std::nullopt;
@@ -2428,8 +2358,6 @@ private:
     if (std::optional<SpecializedVLADecision> decision =
             decideF32ToF16VLA(op))
       return decision;
-    if (std::optional<SpecializedVLADecision> decision = decideF16FillVLA(op))
-      return decision;
     if (std::optional<SpecializedVLADecision> decision =
             decideWideningF16DotVLA(op))
       return decision;
@@ -2447,8 +2375,6 @@ private:
     switch (decision.realization) {
     case SpecializedVLARealization::F32ToF16:
       return emitF32ToF16VLA(decision);
-    case SpecializedVLARealization::F16Fill:
-      return emitF16FillVLA(decision);
     case SpecializedVLARealization::WideningF16Dot:
       return emitWideningF16DotVLA(decision);
     case SpecializedVLARealization::F16WeightedUpdate:
