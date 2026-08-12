@@ -294,6 +294,10 @@ enum class VLAStateConsumerRealization {
   RVVStagedExpNormalize,
 };
 
+enum class VLAStatePlacement {
+  StackScratch,
+};
+
 struct VLAStateConsumerDecision {
   VLAStateConsumerRealization realization =
       VLAStateConsumerRealization::RVVStagedExpNormalize;
@@ -304,6 +308,7 @@ struct VLAStateConsumerDecision {
   std::string outputPointer;
   RVVVectorConfig dataShape{32, 2};
   RVVVectorConfig reductionShape{32, 1};
+  VLAStatePlacement placement = VLAStatePlacement::StackScratch;
   llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
@@ -379,52 +384,33 @@ std::string rvvFloatType(const RVVVectorConfig &config) {
          std::to_string(config.lmul) + "_t";
 }
 
-enum class AffineI4I8NTileRealization {
-  SpacemiTIME1N16K32,
-};
-
 struct AffineI4I8NTileDecision {
-  AffineI4I8NTileRealization realization =
-      AffineI4I8NTileRealization::SpacemiTIME1N16K32;
   mlir::Operation *operation = nullptr;
-  mlir::Operation *sourceNLoop = nullptr;
-  mlir::Operation *sourceKLoop = nullptr;
-  mlir::Operation *consumer = nullptr;
-  std::string activationCodes;
-  std::string activationScales;
-  std::string packedWeight;
-  std::string output;
-  std::string columns;
-  std::string blocks;
+  mlir::Value activationCodes;
+  mlir::Value activationScales;
+  mlir::Value packedWeight;
+  mlir::Value output;
+  mlir::Value columns;
+  mlir::Value blocks;
   unsigned nTile = 16;
-  unsigned kBlock = 32;
   unsigned packedBlockBytes = 304;
 };
 
-enum class F16GemmNTileRealization {
-  RVVRowMicrotile,
-};
-
 struct F16GemmNTileDecision {
-  F16GemmNTileRealization realization =
-      F16GemmNTileRealization::RVVRowMicrotile;
   mlir::Operation *operation = nullptr;
-  mlir::Operation *sourceNLoop = nullptr;
-  mlir::Operation *sourceKLoop = nullptr;
-  mlir::Operation *consumer = nullptr;
-  std::string row;
-  std::string rowUpper;
-  std::string lhs;
-  std::string rhs;
-  std::string output;
-  std::string lhsStride;
-  std::string rhsStride;
-  std::string outputStride;
-  std::string nLower;
-  std::string nUpper;
+  mlir::Value row;
+  mlir::Value rowUpper;
+  mlir::Value lhs;
+  mlir::Value rhs;
+  mlir::Value output;
+  mlir::Value lhsStride;
+  mlir::Value rhsStride;
+  mlir::Value outputStride;
+  mlir::Value nLower;
+  mlir::Value nUpper;
   unsigned sourceNTile = 8;
-  std::string kLower;
-  std::string kUpper;
+  mlir::Value kLower;
+  mlir::Value kUpper;
   unsigned sourceKTile = 64;
   unsigned rowTile = 4;
   unsigned rowMicrotile = 4;
@@ -872,29 +858,11 @@ public:
     if (returnTypeSpelling.empty())
       return kernel.emitError(
           "RISC-V intrinsic C ABI has an unsupported return type");
+    if (mlir::failed(preparePhysicalDecisions()))
+      return mlir::failure();
     line(returnTypeSpelling + " " + sanitize(kernel.getSymName()) + "(" +
          llvm::join(parameters, ", ") + ") {");
     ++indent;
-    kernel.walk([&](AffineI4I8ContractOp contract) {
-      ForOp kLoop = contract->getParentOfType<ForOp>();
-      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
-      if (!nLoop)
-        return;
-      auto [position, inserted] = affineI4I8Anchors.try_emplace(
-          nLoop.getOperation(), contract.getOperation());
-      if (!inserted)
-        position->second = nullptr;
-    });
-    kernel.walk([&](ContractOp contract) {
-      ForOp kLoop = contract->getParentOfType<ForOp>();
-      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
-      if (!nLoop)
-        return;
-      auto [position, inserted] = f16ContractAnchors.try_emplace(
-          nLoop.getOperation(), contract.getOperation());
-      if (!inserted)
-        position->second = nullptr;
-    });
     for (mlir::Operation &operation : body) {
       if (auto returnOp = mlir::dyn_cast<ReturnOp>(operation)) {
         if (returnOp.getNumOperands() == 0)
@@ -919,12 +887,56 @@ public:
   }
 
 private:
+  mlir::LogicalResult preparePhysicalDecisions() {
+    bool decisionFailure = false;
+    kernel.walk([&](AffineI4I8ContractOp contract) {
+      if (decisionFailure)
+        return;
+      ForOp kLoop = contract->getParentOfType<ForOp>();
+      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
+      if (!nLoop)
+        return;
+      if (affineI4I8Decisions.contains(nLoop.getOperation())) {
+        contract.emitError("one source N loop cannot own multiple affine IME decisions");
+        decisionFailure = true;
+        return;
+      }
+      std::optional<AffineI4I8NTileDecision> decision =
+          decideAffineI4I8NTiles(contract);
+      if (decision)
+        affineI4I8Decisions.try_emplace(nLoop.getOperation(),
+                                       std::move(*decision));
+    });
+    kernel.walk([&](ContractOp contract) {
+      if (decisionFailure)
+        return;
+      ForOp kLoop = contract->getParentOfType<ForOp>();
+      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
+      if (!nLoop)
+        return;
+      if (f16ContractDecisions.contains(nLoop.getOperation())) {
+        contract.emitError("one source N loop cannot own multiple F16 contract decisions");
+        decisionFailure = true;
+        return;
+      }
+      std::optional<F16GemmNTileDecision> decision =
+          decideF16GemmNTiles(contract);
+      if (decision)
+        f16ContractDecisions.try_emplace(nLoop.getOperation(),
+                                         std::move(*decision));
+    });
+    if (decisionFailure)
+      return mlir::failure();
+    return mlir::success();
+  }
   KernelOp kernel;
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
-  llvm::DenseMap<mlir::Operation *, mlir::Operation *> affineI4I8Anchors;
-  llvm::DenseMap<mlir::Operation *, mlir::Operation *> f16ContractAnchors;
+  llvm::DenseMap<mlir::Operation *, AffineI4I8NTileDecision>
+      affineI4I8Decisions;
+  llvm::DenseMap<mlir::Operation *, F16GemmNTileDecision>
+      f16ContractDecisions;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -1455,6 +1467,14 @@ private:
           return mlir::failure();
       }
     }
+    for (const VLAAccessDecision &access : decision.accesses) {
+      if (mlir::isa<LoadOp>(access.operation) &&
+          access.activityMode == VLAActivityMode::PredicateMask) {
+        access.operation->emitError(
+            "masked VLA load has no selected target realization");
+        return mlir::failure();
+      }
+    }
 
     for (mlir::Operation *nested : physicalOperations) {
       if (isContractOwned(nested))
@@ -1603,40 +1623,23 @@ private:
           return state.realization ==
                  VLAStateRealization::RVVWideningF16DotReduction;
       });
-    unsigned liveF32RegionValues = 0;
-    unsigned currentF32RegionValues = 0;
-    for (mlir::Operation &operation : body.without_terminator()) {
-      currentF32RegionValues += llvm::count_if(
-          operation.getResultTypes(), [](mlir::Type type) {
-            return isRegionValue(type) && elementType(type).isF32();
-          });
-      liveF32RegionValues =
-          std::max(liveF32RegionValues, currentF32RegionValues);
-      llvm::DenseSet<mlir::Value> lastUses;
-      for (mlir::Value operand : operation.getOperands()) {
-        if (!isRegionValue(operand.getType()) ||
-            !elementType(operand.getType()).isF32())
-          continue;
-        if (llvm::all_of(operand.getUsers(), [&](mlir::Operation *user) {
-              return user == &operation ||
-                     user->getBlock() != operation.getBlock() ||
-                     user->isBeforeInBlock(&operation);
-            }))
-          lastUses.insert(operand);
-      }
-      currentF32RegionValues -= lastUses.size();
-    }
-    unsigned nestedRegionCarries = 0;
+    unsigned maxEntityF32Vectors = 0;
     for (mlir::Operation *operation : physicalOperations) {
-      auto loop = mlir::dyn_cast<ForOp>(operation);
-      if (!loop)
-        continue;
-      nestedRegionCarries += llvm::count_if(
-          loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
+      unsigned entityVectors = llvm::count_if(
+          operation->getOperandTypes(), [](mlir::Type type) {
             return isRegionValue(type) && elementType(type).isF32();
           });
+      entityVectors += llvm::count_if(
+          operation->getResultTypes(), [](mlir::Type type) {
+            return isRegionValue(type) && elementType(type).isF32();
+          });
+      if (auto loop = mlir::dyn_cast<ForOp>(operation))
+        entityVectors += llvm::count_if(
+            loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
+              return isRegionValue(type) && elementType(type).isF32();
+            });
+      maxEntityF32Vectors = std::max(maxEntityF32Vectors, entityVectors);
     }
-    liveF32RegionValues += nestedRegionCarries;
     bool onlyF16Accesses = !decision.accesses.empty() &&
                            llvm::all_of(decision.accesses,
                                         [](const VLAAccessDecision &access) {
@@ -1673,7 +1676,7 @@ private:
       decision.physical.dataSEW = 32;
       decision.physical.dataLMUL = 8;
     } else if (decision.contracts.empty() && decision.narrows.empty() &&
-               !hasWideningF16Dot && liveF32RegionValues > 0) {
+               !hasWideningF16Dot && maxEntityF32Vectors > 0) {
       llvm::SmallVector<unsigned> candidates;
       if (options.backend.vlaLMUL != 0) {
         unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
@@ -1720,20 +1723,20 @@ private:
         if (!decision.predicates.empty() && options.target.xlen == 64 &&
             candidate * 2 > 8)
           continue;
-        unsigned stateGroups = 0;
+        unsigned primitiveGroups = 0;
         for (const VLAStateDecision &state : decision.states) {
           if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
-            stateGroups += candidate;
+            primitiveGroups = std::max(primitiveGroups, 3 * candidate + 1);
           else if (state.realization == VLAStateRealization::RVVArgMaxSummary ||
                    state.realization == VLAStateRealization::RVVAddReduction ||
                    state.realization == VLAStateRealization::RVVMaxReduction)
-            stateGroups += 1;
+            primitiveGroups = std::max(primitiveGroups, candidate + 2);
           else if (state.realization ==
                    VLAStateRealization::RVVOnlineSoftmaxSummary)
-            stateGroups += 2 * candidate + 2;
+            primitiveGroups = std::max(primitiveGroups, 3 * candidate + 2);
         }
-        unsigned regionGroups = liveF32RegionValues * candidate;
-        if (regionGroups + stateGroups + 1 <
+        unsigned regionGroups = maxEntityF32Vectors * candidate;
+        if (std::max(regionGroups, primitiveGroups) + 1 <
             static_cast<unsigned>(options.target.vectorRegisters)) {
           selected = candidate;
           break;
@@ -1747,7 +1750,7 @@ private:
     }
     if (options.backend.vlaLMUL != 0 && decision.contracts.empty() &&
         !hasWideningF16Dot && decision.narrows.empty() &&
-        liveF32RegionValues == 0) {
+        maxEntityF32Vectors == 0) {
       unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
       if (requested != 1 && requested != 2 && requested != 4 &&
           requested != 8) {
@@ -2103,22 +2106,12 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
-    auto affineI4I8Anchor = affineI4I8Anchors.find(op.getOperation());
-    if (affineI4I8Anchor != affineI4I8Anchors.end() &&
-        affineI4I8Anchor->second) {
-      auto contract =
-          mlir::cast<AffineI4I8ContractOp>(affineI4I8Anchor->second);
-      if (std::optional<AffineI4I8NTileDecision> decision =
-              decideAffineI4I8NTiles(contract))
-        return emitAffineI4I8NTiles(*decision);
-    }
-    auto f16Anchor = f16ContractAnchors.find(op.getOperation());
-    if (f16Anchor != f16ContractAnchors.end() && f16Anchor->second) {
-      auto contract = mlir::cast<ContractOp>(f16Anchor->second);
-      if (std::optional<F16GemmNTileDecision> decision =
-              decideF16GemmNTiles(contract))
-        return emitF16GemmNTiles(*decision);
-    }
+    auto affineI4I8Decision = affineI4I8Decisions.find(op.getOperation());
+    if (affineI4I8Decision != affineI4I8Decisions.end())
+      return emitAffineI4I8NTiles(affineI4I8Decision->second);
+    auto f16Decision = f16ContractDecisions.find(op.getOperation());
+    if (f16Decision != f16ContractDecisions.end())
+      return emitF16GemmNTiles(f16Decision->second);
     mlir::Block &body = op.getBody().front();
     if (op.getInitArgs().size() != op.getNumResults() ||
         body.getNumArguments() != op.getNumResults() + 1)
@@ -2747,9 +2740,8 @@ private:
             if (!inputType || !outputType ||
                 inputType.getAccess() != "read" ||
                 outputType.getAccess() != "write" || inputRoot == outputRoot ||
-                (!inputType.getNoAlias() && !outputType.getNoAlias() &&
-                 !inputType.getRestrictLike() &&
-                 !outputType.getRestrictLike()))
+                (!inputType.getNoAlias() && !inputType.getRestrictLike()) ||
+                (!outputType.getNoAlias() && !outputType.getRestrictLike()))
               continue;
 
             std::optional<std::string> producerInput =
@@ -2796,6 +2788,7 @@ private:
               continue;
 
             VLAStateConsumerDecision decision;
+            decision.placement = VLAStatePlacement::StackScratch;
             decision.consumerRegion = consumer.getOperation();
             decision.begin = std::move(begin);
             decision.end = std::move(end);
@@ -4853,54 +4846,50 @@ private:
         dependsOn(outputRow, kCoordinate))
       return reject("IME1 lowering cannot change the source-declared row/N/K ownership");
 
-    CValue code = require(codeRow);
-    CValue scales = require(scaleRow);
-    CValue weights = require(packedRoot);
-    CValue outputValue = require(outputRow);
-    std::string columns = expression(nLoop.getUpper());
-    std::string blocks = expression(kLoop.getUpper());
-    if (code.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
-        weights.kind != CValueKind::Pointer ||
-        outputValue.kind != CValueKind::Pointer || code.spelling.empty() ||
-        scales.spelling.empty() || weights.spelling.empty() ||
-        outputValue.spelling.empty() || columns.empty() || blocks.empty())
-      return reject("IME1 lowering could not materialize the explicit source operands");
-
     AffineI4I8NTileDecision decision;
     decision.operation = contract.getOperation();
-    decision.sourceNLoop = nLoop.getOperation();
-    decision.sourceKLoop = kLoop.getOperation();
-    decision.consumer = store.getOperation();
-    decision.activationCodes = code.spelling;
-    decision.activationScales = scales.spelling;
-    decision.packedWeight = weights.spelling;
-    decision.output = outputValue.spelling;
-    decision.columns = columns;
-    decision.blocks = blocks;
+    decision.activationCodes = codeRow;
+    decision.activationScales = scaleRow;
+    decision.packedWeight = packedRoot;
+    decision.output = outputRow;
+    decision.columns = nLoop.getUpper();
+    decision.blocks = kLoop.getUpper();
     decision.nTile = static_cast<unsigned>(nTile);
-    decision.kBlock = static_cast<unsigned>(kBlock);
     decision.packedBlockBytes = static_cast<unsigned>(packedBlockBytes);
     return decision;
   }
 
   mlir::LogicalResult emitAffineI4I8NTiles(
       const AffineI4I8NTileDecision &decision) {
+    CValue code = require(decision.activationCodes);
+    CValue scales = require(decision.activationScales);
+    CValue weights = require(decision.packedWeight);
+    CValue outputValue = require(decision.output);
+    std::string columns = expression(decision.columns);
+    std::string blocks = expression(decision.blocks);
+    if (code.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
+        weights.kind != CValueKind::Pointer ||
+        outputValue.kind != CValueKind::Pointer || code.spelling.empty() ||
+        scales.spelling.empty() || weights.spelling.empty() ||
+        outputValue.spelling.empty() || columns.empty() || blocks.empty())
+      return decision.operation->emitError(
+          "IME1 emission could not project the selected source operands");
     std::string nTile = fresh("ime_n");
     std::string nCount = fresh("ime_n_count");
     line("for (size_t " + nTile + " = 0; " + nTile + " < " +
-         decision.columns + "; " + nTile + " += " +
+         columns + "; " + nTile + " += " +
          std::to_string(decision.nTile) + ") {");
     ++indent;
-    line("const size_t " + nCount + " = (" + decision.columns + " - " +
+    line("const size_t " + nCount + " = (" + columns + " - " +
          nTile + ") < " + std::to_string(decision.nTile) + " ? (" +
-         decision.columns + " - " + nTile + ") : " +
+         columns + " - " + nTile + ") : " +
          std::to_string(decision.nTile) + ";");
-    line("__weft_ime1_affine_i4_i8_n16(" + decision.activationScales + ", " +
-         decision.activationCodes + ", " + decision.packedWeight + " + (" +
+    line("__weft_ime1_affine_i4_i8_n16(" + scales.spelling + ", " +
+         code.spelling + ", " + weights.spelling + " + (" +
          nTile + " / " + std::to_string(decision.nTile) + ") * " +
-         decision.blocks + " * " + std::to_string(decision.packedBlockBytes) +
-         ", " + decision.output + " + " + nTile + ", " + nCount + ", " +
-         decision.blocks + ");");
+         blocks + " * " + std::to_string(decision.packedBlockBytes) +
+         ", " + outputValue.spelling + " + " + nTile + ", " + nCount + ", " +
+         blocks + ");");
     --indent;
     line("}");
     return mlir::success();
@@ -4998,18 +4987,6 @@ private:
         dependsOn(store.getPointer(), kCoordinate))
       return std::nullopt;
 
-    std::string nLower = expression(nLoop.getLower());
-    std::string nUpper = expression(nLoop.getUpper());
-    std::string kLower = expression(kLoop.getLower());
-    std::string kUpper = expression(kLoop.getUpper());
-    CValue mValue = require(mCoordinate);
-    CValue mUpper = require(mLoop.getUpper());
-    CValue lhs = require(lhsRoot);
-    CValue rhs = require(rhsRoot);
-    CValue outputValue = require(outputRoot);
-    CValue lhsStrideValue = require(lhsStride);
-    CValue rhsStrideValue = require(rhsStride);
-    CValue outputStrideValue = require(outputStride);
     auto physicalExtent = [&](mlir::Value value) -> std::optional<int64_t> {
       if (std::optional<int64_t> constant = integerConstantValue(value))
         return constant;
@@ -5032,31 +5009,24 @@ private:
     std::optional<int64_t> reductionTile = physicalExtent(kLoop.getStep());
     if (!rowTile || *rowTile <= 0 || *rowTile > 8 || !columnTile ||
         *columnTile <= 0 || !reductionTile || *reductionTile <= 0 ||
-        nLower.empty() || nUpper.empty() || kLower.empty() || kUpper.empty() ||
-        mValue.spelling.empty() ||
-        mUpper.spelling.empty() || lhs.spelling.empty() || rhs.spelling.empty() ||
-        outputValue.spelling.empty() || lhsStrideValue.spelling.empty() ||
-        rhsStrideValue.spelling.empty() || outputStrideValue.spelling.empty())
+        *columnTile <= 0 || !reductionTile || *reductionTile <= 0)
       return std::nullopt;
 
     F16GemmNTileDecision decision;
     decision.operation = contract.getOperation();
-    decision.sourceNLoop = nLoop.getOperation();
-    decision.sourceKLoop = kLoop.getOperation();
-    decision.consumer = store.getOperation();
-    decision.row = mValue.spelling;
-    decision.rowUpper = mUpper.spelling;
-    decision.lhs = lhs.spelling;
-    decision.rhs = rhs.spelling;
-    decision.output = outputValue.spelling;
-    decision.lhsStride = lhsStrideValue.spelling;
-    decision.rhsStride = rhsStrideValue.spelling;
-    decision.outputStride = outputStrideValue.spelling;
-    decision.nLower = nLower;
-    decision.nUpper = nUpper;
+    decision.row = mCoordinate;
+    decision.rowUpper = mLoop.getUpper();
+    decision.lhs = lhsRoot;
+    decision.rhs = rhsRoot;
+    decision.output = outputRoot;
+    decision.lhsStride = lhsStride;
+    decision.rhsStride = rhsStride;
+    decision.outputStride = outputStride;
+    decision.nLower = nLoop.getLower();
+    decision.nUpper = nLoop.getUpper();
     decision.sourceNTile = static_cast<unsigned>(*columnTile);
-    decision.kLower = kLower;
-    decision.kUpper = kUpper;
+    decision.kLower = kLoop.getLower();
+    decision.kUpper = kLoop.getUpper();
     decision.sourceKTile = static_cast<unsigned>(*reductionTile);
     decision.rowTile = static_cast<unsigned>(*rowTile);
     unsigned requestedRows = options.backend.f16RowMicrotile == 0
@@ -5088,20 +5058,49 @@ private:
     if (decision.kStripSchedule != VLAStripSchedule::FullThenTail)
       return decision.operation->emitError(
           "F16 contraction has no selected K strip schedule");
+    CValue rowValue = require(decision.row);
+    CValue lhsValue = require(decision.lhs);
+    CValue rhsValue = require(decision.rhs);
+    CValue outputValue = require(decision.output);
+    CValue lhsStrideValue = require(decision.lhsStride);
+    CValue rhsStrideValue = require(decision.rhsStride);
+    CValue outputStrideValue = require(decision.outputStride);
+    std::string rowUpper = expression(decision.rowUpper);
+    std::string nLower = expression(decision.nLower);
+    std::string nUpper = expression(decision.nUpper);
+    std::string kLower = expression(decision.kLower);
+    std::string kUpper = expression(decision.kUpper);
+    if (rowValue.spelling.empty() || rowUpper.empty() ||
+        lhsValue.kind != CValueKind::Pointer ||
+        rhsValue.kind != CValueKind::Pointer ||
+        outputValue.kind != CValueKind::Pointer || lhsValue.spelling.empty() ||
+        rhsValue.spelling.empty() || outputValue.spelling.empty() ||
+        lhsStrideValue.spelling.empty() || rhsStrideValue.spelling.empty() ||
+        outputStrideValue.spelling.empty() || nLower.empty() || nUpper.empty() ||
+        kLower.empty() || kUpper.empty())
+      return decision.operation->emitError(
+          "F16 emission could not project the selected source operands");
+    const std::string &row = rowValue.spelling;
+    const std::string &lhs = lhsValue.spelling;
+    const std::string &rhs = rhsValue.spelling;
+    const std::string &outputPointer = outputValue.spelling;
+    const std::string &lhsStride = lhsStrideValue.spelling;
+    const std::string &rhsStride = rhsStrideValue.spelling;
+    const std::string &outputStride = outputStrideValue.spelling;
     std::string nTile = fresh("gemm_n");
     std::string rows = fresh("gemm_rows");
-    line("const size_t " + rows + " = (" + decision.rowUpper + " - " +
-         decision.row + ") < " + std::to_string(decision.rowTile) + " ? (" +
-         decision.rowUpper + " - " + decision.row + ") : " +
+    line("const size_t " + rows + " = (" + rowUpper + " - " + row +
+         ") < " + std::to_string(decision.rowTile) + " ? (" + rowUpper +
+         " - " + row + ") : " +
          std::to_string(decision.rowTile) + ";");
-    line("for (size_t " + nTile + " = " + decision.nLower + "; " + nTile +
-         " < " + decision.nUpper + "; " + nTile + " += " +
+    line("for (size_t " + nTile + " = " + nLower + "; " + nTile + " < " +
+         nUpper + "; " + nTile + " += " +
          std::to_string(decision.sourceNTile) + ") {");
     ++indent;
     std::string nTileEnd = fresh("gemm_n_tile_end");
-    line("const size_t " + nTileEnd + " = (" + decision.nUpper + " - " +
+    line("const size_t " + nTileEnd + " = (" + nUpper + " - " +
          nTile + ") < " + std::to_string(decision.sourceNTile) + " ? " +
-         decision.nUpper + " : " + nTile + " + " +
+         nUpper + " : " + nTile + " + " +
          std::to_string(decision.sourceNTile) + ";");
     std::string nColumn = fresh("gemm_n_column");
     line("for (size_t " + nColumn + " = " + nTile + "; " + nColumn + " < " +
@@ -5127,13 +5126,13 @@ private:
       }
       std::string sourceK = fresh("gemm_source_k");
       std::string sourceKEnd = fresh("gemm_source_k_end");
-      line("for (size_t " + sourceK + " = " + decision.kLower + "; " +
-           sourceK + " < " + decision.kUpper + "; " + sourceK + " += " +
+      line("for (size_t " + sourceK + " = " + kLower + "; " + sourceK +
+           " < " + kUpper + "; " + sourceK + " += " +
            std::to_string(decision.sourceKTile) + ") {");
       ++indent;
-      line("const size_t " + sourceKEnd + " = (" + decision.kUpper + " - " +
+      line("const size_t " + sourceKEnd + " = (" + kUpper + " - " +
            sourceK + ") < " + std::to_string(decision.sourceKTile) + " ? " +
-           decision.kUpper + " : " + sourceK + " + " +
+           kUpper + " : " + sourceK + " + " +
            std::to_string(decision.sourceKTile) + ";");
       std::string inner = fresh("gemm_k");
       std::string fullEnd = fresh("gemm_k_full_end");
@@ -5146,15 +5145,15 @@ private:
       line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
            rhsVector + " = __riscv_vle16_v_f16m" +
            std::to_string(decision.inputLMUL) + "(" +
-           decision.rhs + " + " + nColumn + " * " + decision.rhsStride +
+           rhs + " + " + nColumn + " * " + rhsStride +
            " + " + inner + ", " + fullVL + ");");
       for (unsigned row = 0; row < rowCount; ++row) {
         std::string lhsVector = fresh("gemm_a");
         line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
              lhsVector + " = __riscv_vle16_v_f16m" +
              std::to_string(decision.inputLMUL) + "(" +
-             decision.lhs + " + (" + rowBase.str() + " + " +
-             std::to_string(row) + ") * " + decision.lhsStride + " + " +
+             lhs + " + (" + rowBase.str() + " + " +
+             std::to_string(row) + ") * " + lhsStride + " + " +
              inner + ", " + fullVL + ");");
         line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
              std::to_string(decision.computeLMUL) + "(" +
@@ -5172,16 +5171,16 @@ private:
       std::string tailRhs = fresh("gemm_tail_b");
       line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " + tailRhs +
            " = __riscv_vle16_v_f16m" +
-           std::to_string(decision.inputLMUL) + "(" + decision.rhs + " + " +
-           nColumn + " * " + decision.rhsStride + " + " + fullEnd + ", " +
+           std::to_string(decision.inputLMUL) + "(" + rhs + " + " +
+           nColumn + " * " + rhsStride + " + " + fullEnd + ", " +
            tailVL + ");");
       for (unsigned row = 0; row < rowCount; ++row) {
         std::string tailLhs = fresh("gemm_tail_a");
         line("vfloat16m" + std::to_string(decision.inputLMUL) + "_t " +
              tailLhs + " = __riscv_vle16_v_f16m" +
-             std::to_string(decision.inputLMUL) + "(" + decision.lhs + " + (" +
+             std::to_string(decision.inputLMUL) + "(" + lhs + " + (" +
              rowBase.str() + " + " + std::to_string(row) + ") * " +
-             decision.lhsStride + " + " + fullEnd + ", " + tailVL + ");");
+             lhsStride + " + " + fullEnd + ", " + tailVL + ");");
         line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
              std::to_string(decision.computeLMUL) + "_tu(" +
              accumulators[row] + ", " + tailLhs + ", " + tailRhs + ", " +
@@ -5203,8 +5202,8 @@ private:
              accumulators[row] + ", " + seed + ", " + fullVL + ");");
         line("float " + scalar + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
              ");");
-        line("*(" + decision.output + " + (" + rowBase.str() + " + " +
-             std::to_string(row) + ") * " + decision.outputStride + " + " +
+        line("*(" + outputPointer + " + (" + rowBase.str() + " + " +
+             std::to_string(row) + ") * " + outputStride + " + " +
              nColumn + ") = " + scalar + ";");
       }
       --indent;
@@ -5212,7 +5211,7 @@ private:
     };
     if (decision.rowMicrotile == decision.rowTile) {
       for (unsigned rowCount = decision.rowMicrotile; rowCount > 0; --rowCount)
-        emitRows(rowCount, decision.row,
+        emitRows(rowCount, row,
                  rows + " == " + std::to_string(rowCount),
                  rowCount == decision.rowMicrotile);
     } else {
@@ -5225,7 +5224,7 @@ private:
       line("const size_t " + localRows + " = " + rows + " - " + rowBase +
            ";");
       for (unsigned rowCount = decision.rowMicrotile; rowCount > 0; --rowCount)
-        emitRows(rowCount, "(" + decision.row + " + " + rowBase + ")",
+        emitRows(rowCount, "(" + row + " + " + rowBase + ")",
                  rowCount == decision.rowMicrotile
                      ? "(" + localRows + " >= " +
                            std::to_string(decision.rowMicrotile) + ")"
@@ -6603,6 +6602,8 @@ private:
     if (consumer.realization !=
         VLAStateConsumerRealization::RVVStagedExpNormalize)
       return producer.emitError("online summary consumer realization is unavailable");
+    if (consumer.placement != VLAStatePlacement::StackScratch)
+      return producer.emitError("online summary state placement is unavailable");
 
     const RVVVectorConfig &data = consumer.dataShape;
     const RVVVectorConfig &reduction = consumer.reductionShape;
@@ -6613,6 +6614,11 @@ private:
     std::string input = fresh("summary_x");
     std::string seed = fresh("summary_seed");
     std::string partial = fresh("summary_partial");
+    std::string shifted = fresh("summary_shifted");
+    std::string exponentials = fresh("summary_exp");
+    std::string sumSeed = fresh("summary_sum_seed");
+    std::string sumPartial = fresh("summary_sum_partial");
+    std::string scratch = fresh("summary_scratch");
     line("float " + maximum + " = -INFINITY;");
     line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
          " < " + consumer.end + ";) {");
@@ -6635,10 +6641,8 @@ private:
     --indent;
     line("}");
 
-    std::string shifted = fresh("summary_shifted");
-    std::string exponentials = fresh("summary_exp");
-    std::string sumSeed = fresh("summary_sum_seed");
-    std::string sumPartial = fresh("summary_sum_partial");
+    line("float " + scratch + "[" + consumer.end + " - " + consumer.begin +
+         "];");
     line("float " + sum + " = 0.0f;");
     line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
          " < " + consumer.end + ";) {");
@@ -6655,8 +6659,8 @@ private:
     line(rvvFloatType(data) + " " + exponentials + " = __weft_exp_" +
          rvvFloatSuffix(data) + "(" + shifted + ", " + vl + ");");
     line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
-         rvvFloatSuffix(data) + "(" + consumer.outputPointer + " + " + strip +
-         ", " + exponentials + ", " + vl + ");");
+         rvvFloatSuffix(data) + "(" + scratch + " + " + strip + " - " +
+         consumer.begin + ", " + exponentials + ", " + vl + ");");
     line(rvvFloatType(reduction) + " " + sumSeed +
          " = __riscv_vfmv_v_f_" + rvvFloatSuffix(reduction) + "(" + sum +
          ", 1);");
@@ -6671,7 +6675,6 @@ private:
     line("}");
 
     std::string inverse = fresh("summary_inverse");
-    std::string outputVector = fresh("summary_y");
     line("const float " + inverse + " = 1.0f / " + sum + ";");
     line("for (size_t " + strip + " = " + consumer.begin + "; " + strip +
          " < " + consumer.end + ";) {");
@@ -6679,14 +6682,15 @@ private:
     line("const size_t " + vl + " = __riscv_vsetvl_e" +
          std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
          consumer.end + " - " + strip + ");");
-    line(rvvFloatType(data) + " " + outputVector + " = __riscv_vle" +
+    line(rvvFloatType(data) + " " + exponentials + " = __riscv_vle" +
          std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         consumer.outputPointer + " + " + strip + ", " + vl + ");");
-    line(outputVector + " = __riscv_vfmul_vf_" + rvvFloatSuffix(data) + "(" +
-         outputVector + ", " + inverse + ", " + vl + ");");
+         scratch + " + " + strip + " - " + consumer.begin + ", " + vl +
+         ");");
+    line(exponentials + " = __riscv_vfmul_vf_" + rvvFloatSuffix(data) + "(" +
+         exponentials + ", " + inverse + ", " + vl + ");");
     line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
          rvvFloatSuffix(data) + "(" + consumer.outputPointer + " + " + strip +
-         ", " + outputVector + ", " + vl + ");");
+         ", " + exponentials + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
