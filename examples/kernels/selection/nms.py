@@ -49,42 +49,41 @@ def greedy_nms_f32(
             winner_area = W.maximum(
                 winner_x2 - winner_x1, W.f32(0.0)
             ) * W.maximum(winner_y2 - winner_y1, W.f32(0.0))
-            for candidate in W.range(0, candidates):
+            with W.vla(0, candidates) as candidate:
                 active = (
                     W.load(suppressed + candidate, other=W.u8(1))
                     == W.u8(0)
                 )
-                if active:
-                    x1 = W.load(
-                        boxes + candidate * 4 + 0, other=W.f32(0.0)
-                    )
-                    y1 = W.load(
-                        boxes + candidate * 4 + 1, other=W.f32(0.0)
-                    )
-                    x2 = W.load(
-                        boxes + candidate * 4 + 2, other=W.f32(0.0)
-                    )
-                    y2 = W.load(
-                        boxes + candidate * 4 + 3, other=W.f32(0.0)
-                    )
-                    right = W.minimum(winner_x2, x2)
-                    left = W.maximum(winner_x1, x1)
-                    bottom = W.minimum(winner_y2, y2)
-                    top = W.maximum(winner_y1, y1)
-                    intersection_width = W.maximum(right - left, W.f32(0.0))
-                    intersection_height = W.maximum(bottom - top, W.f32(0.0))
-                    intersection_area = (
-                        intersection_width * intersection_height
-                    )
-                    candidate_area = W.maximum(
-                        x2 - x1, W.f32(0.0)
-                    ) * W.maximum(y2 - y1, W.f32(0.0))
-                    union_area = (
-                        winner_area + candidate_area - intersection_area
-                    )
-                    overlap_ratio = intersection_area / union_area
-                    if overlap_ratio > iou_threshold:
-                        W.store(suppressed + candidate, W.u8(1))
+                x1 = W.load(
+                    boxes + candidate * 4 + 0, other=W.f32(0.0)
+                )
+                y1 = W.load(
+                    boxes + candidate * 4 + 1, other=W.f32(0.0)
+                )
+                x2 = W.load(
+                    boxes + candidate * 4 + 2, other=W.f32(0.0)
+                )
+                y2 = W.load(
+                    boxes + candidate * 4 + 3, other=W.f32(0.0)
+                )
+                right = W.minimum(winner_x2, x2)
+                left = W.maximum(winner_x1, x1)
+                bottom = W.minimum(winner_y2, y2)
+                top = W.maximum(winner_y1, y1)
+                intersection_width = W.maximum(right - left, W.f32(0.0))
+                intersection_height = W.maximum(bottom - top, W.f32(0.0))
+                intersection_area = intersection_width * intersection_height
+                candidate_area = W.maximum(
+                    x2 - x1, W.f32(0.0)
+                ) * W.maximum(y2 - y1, W.f32(0.0))
+                union_area = winner_area + candidate_area - intersection_area
+                overlap_ratio = intersection_area / union_area
+                suppress = active & (overlap_ratio > iou_threshold)
+                W.store(
+                    suppressed + candidate,
+                    W.u8(1),
+                    where=suppress,
+                )
             count = count + 1
         else:
             count = maximum_selected

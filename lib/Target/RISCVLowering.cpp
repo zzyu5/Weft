@@ -1857,11 +1857,25 @@ private:
             "VLA memory access is neither affine-strided nor explicitly indexed");
       VLAActivityMode activityMode = VLAActivityMode::AllActive;
       if (!isTrue(predicate)) {
-        bool hasPredicateDecision = llvm::any_of(
-            decision.predicates, [&](const VLAPredicateDecision &candidate) {
-              return candidate.operation == predicate.getDefiningOp();
-            });
-        if (hasPredicateDecision) {
+        llvm::DenseSet<mlir::Value> visitedPredicates;
+        std::function<bool(mlir::Value)> hasPredicateDecision =
+            [&](mlir::Value value) {
+              if (!value || !visitedPredicates.insert(value).second)
+                return false;
+              if (llvm::any_of(
+                      decision.predicates,
+                      [&](const VLAPredicateDecision &candidate) {
+                        return candidate.operation == value.getDefiningOp();
+                      }))
+                return true;
+              auto binary = value.getDefiningOp<BinaryOp>();
+              return binary &&
+                     (binary.getKind() == "and" || binary.getKind() == "or" ||
+                      binary.getKind() == "xor") &&
+                     hasPredicateDecision(binary.getLhs()) &&
+                     hasPredicateDecision(binary.getRhs());
+            };
+        if (hasPredicateDecision(predicate)) {
           activityMode = VLAActivityMode::PredicateMask;
         } else if (classifyLaneRelation(predicate, decision.coordinate) ==
                        LaneRelation::Independent &&
@@ -1918,8 +1932,7 @@ private:
               "indexed VLA store has no selected target realization");
           return mlir::failure();
         }
-        if (storedElement.isUnsignedInteger(8) ||
-            storedElement.isUnsignedInteger(32)) {
+        if (storedElement.isUnsignedInteger(32)) {
           store.emitError(
               "unsigned VLA store has no selected target realization");
           return mlir::failure();
@@ -4901,25 +4914,37 @@ private:
       bool f32 = decision->elementType.isF32();
       bool f16 = isF16(decision->elementType);
       bool i8 = decision->elementType.isSignedInteger(8);
-      if ((!f32 && !f16 && !i8) ||
+      bool u8 = decision->elementType.isUnsignedInteger(8);
+      if ((!f32 && !f16 && !i8 && !u8) ||
           pointer.laneStride.empty())
         return op.emitError("VLA store element realization is unavailable");
 
       std::string vector = value.spelling;
       CValueKind expectedKind = f32   ? CValueKind::F32Vector
                                 : f16 ? CValueKind::F16Vector
-                                      : CValueKind::I8Vector;
+                                : i8  ? CValueKind::I8Vector
+                                      : CValueKind::U8Vector;
       if (decision->storeValueMode == VLAStoreValueMode::ScalarBroadcast) {
-        if (i8 || value.kind != CValueKind::Scalar || value.spelling.empty())
+        if (value.kind != CValueKind::Scalar || value.spelling.empty())
           return op.emitError("VLA store scalar broadcast is unavailable");
         vector = fresh("store_value");
         unsigned lmul = decision->elementLMUL;
         std::string suffix =
-            std::string(f32 ? "f32m" : "f16m") + std::to_string(lmul);
-        line(std::string(f32 ? "vfloat32m" : "vfloat16m") +
-             std::to_string(lmul) + "_t " + vector +
-             " = __riscv_vfmv_v_f_" + suffix + "(" + value.spelling + ", " +
-             activeVL + ");");
+            std::string(f32   ? "f32m"
+                        : f16 ? "f16m"
+                        : i8  ? "i8m"
+                              : "u8m") +
+            std::to_string(lmul);
+        std::string vectorType =
+            std::string(f32   ? "vfloat32m"
+                        : f16 ? "vfloat16m"
+                        : i8  ? "vint8m"
+                              : "vuint8m") +
+            std::to_string(lmul) + "_t";
+        std::string broadcast = f32 || f16 ? "__riscv_vfmv_v_f_"
+                                          : "__riscv_vmv_v_x_";
+        line(vectorType + " " + vector + " = " + broadcast + suffix + "(" +
+             value.spelling + ", " + activeVL + ");");
       } else if (value.kind != expectedKind || value.spelling.empty()) {
         return op.emitError("VLA store vector projection is unavailable");
       }
@@ -4944,9 +4969,13 @@ private:
         return op.emitError("VLA store has no selected vector shape");
       std::string sew = std::to_string(decision->elementSEW);
       std::string suffix =
-          std::string(f32 ? "f32m" : f16 ? "f16m" : "i8m") +
+          std::string(f32   ? "f32m"
+                      : f16 ? "f16m"
+                      : i8  ? "i8m"
+                            : "u8m") +
           std::to_string(lmul);
-      std::string elementCType = f32 ? "float" : f16 ? "_Float16" : "int8_t";
+      std::string elementCType =
+          f32 ? "float" : f16 ? "_Float16" : i8 ? "int8_t" : "uint8_t";
       if (decision->memoryMode == VLAMemoryMode::UnitStride) {
         if (decision->activityMode != VLAActivityMode::PredicateMask)
           line("__riscv_vse" + sew + "_v_" + suffix + "(" + pointer.spelling +
