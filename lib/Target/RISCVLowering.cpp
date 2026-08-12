@@ -242,6 +242,30 @@ struct VLARegionDecision {
   std::vector<VLAContractDecision> contracts;
 };
 
+enum class SpecializedVLARealization {
+  F32ToF16,
+  F16Fill,
+  WideningF16Dot,
+  F16WeightedUpdate,
+  F16ToF32Normalize,
+  SoftmaxEnvelope,
+};
+
+struct SpecializedVLADecision {
+  SpecializedVLARealization realization = SpecializedVLARealization::F32ToF16;
+  mlir::Operation *operation = nullptr;
+  mlir::Operation *semanticOperation = nullptr;
+  mlir::Operation *consumer = nullptr;
+  mlir::Operation *firstAuxiliary = nullptr;
+  mlir::Operation *secondAuxiliary = nullptr;
+  std::string begin;
+  std::string end;
+  std::string firstPointer;
+  std::string secondPointer;
+  std::string destinationPointer;
+  std::string scalar;
+};
+
 enum class ContractRealization {
   RVVF32RowMicrotile,
 };
@@ -1635,9 +1659,9 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitF32ToF16VLA(VLAOp op) {
+  std::optional<SpecializedVLADecision> decideF32ToF16VLA(VLAOp op) {
     if (op.getNumResults() != 0)
-      return mlir::failure();
+      return std::nullopt;
     mlir::Block &body = op.getBody().front();
     LoadOp load;
     CastOp cast;
@@ -1645,30 +1669,30 @@ private:
     for (mlir::Operation &nested : body.without_terminator()) {
       if (auto candidate = mlir::dyn_cast<LoadOp>(nested)) {
         if (load)
-          return mlir::failure();
+          return std::nullopt;
         load = candidate;
       } else if (auto candidate = mlir::dyn_cast<CastOp>(nested)) {
         if (cast)
-          return mlir::failure();
+          return std::nullopt;
         cast = candidate;
       } else if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
         if (store)
-          return mlir::failure();
+          return std::nullopt;
         store = candidate;
       } else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return mlir::failure();
+        return std::nullopt;
     }
     if (!load || !cast || !store || cast.getInput() != load.getResult() ||
         store.getValue() != cast.getResult() || !isTrue(load.getWhere()) ||
         !isTrue(store.getWhere()) ||
         !elementType(load.getResult().getType()).isF32() ||
         !isF16(elementType(cast.getResult().getType())))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value coordinate = body.getArgument(0);
     if (!valueDependsOn(load.getPointer(), coordinate) ||
         !valueDependsOn(store.getPointer(), coordinate))
-      return mlir::failure();
+      return std::nullopt;
     std::optional<std::string> source =
         pointerBase(load.getPointer(), coordinate);
     std::optional<std::string> destination =
@@ -1676,80 +1700,109 @@ private:
     CValue begin = require(op.getBegin());
     CValue end = require(op.getEnd());
     if (!source || !destination || begin.spelling.empty() || end.spelling.empty())
-      return mlir::failure();
+      return std::nullopt;
 
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::F32ToF16;
+    decision.operation = op.getOperation();
+    decision.semanticOperation = cast.getOperation();
+    decision.consumer = store.getOperation();
+    decision.begin = begin.spelling;
+    decision.end = end.spelling;
+    decision.firstPointer = *source;
+    decision.destinationPointer = *destination;
+    return decision;
+  }
+
+  mlir::LogicalResult emitF32ToF16VLA(
+      const SpecializedVLADecision &decision) {
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string wide = fresh("load_f32");
     std::string narrow = fresh("narrow_f16");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + end.spelling +
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + decision.end +
          " - " + strip + ");");
-    line("vfloat32m8_t " + wide + " = __riscv_vle32_v_f32m8(" + *source +
+    line("vfloat32m8_t " + wide + " = __riscv_vle32_v_f32m8(" +
+         decision.firstPointer +
          " + " + strip + ", " + vl + ");");
     line("vfloat16m4_t " + narrow +
          " = __riscv_vfncvt_f_f_w_f16m4(" + wide + ", " + vl + ");");
-    line("__riscv_vse16_v_f16m4(" + *destination + " + " + strip + ", " +
-         narrow + ", " + vl + ");");
+    line("__riscv_vse16_v_f16m4(" + decision.destinationPointer + " + " +
+         strip + ", " + narrow + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitF16FillVLA(VLAOp op) {
+  std::optional<SpecializedVLADecision> decideF16FillVLA(VLAOp op) {
     if (op.getNumResults() != 0)
-      return mlir::failure();
+      return std::nullopt;
     mlir::Block &body = op.getBody().front();
     StoreOp store;
     for (mlir::Operation &nested : body.without_terminator()) {
       if (mlir::isa<LoadOp>(nested))
-        return mlir::failure();
+        return std::nullopt;
       if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
         if (store)
-          return mlir::failure();
+          return std::nullopt;
         store = candidate;
       } else if (!mlir::isa<PtrAddOp, ConstantOp>(nested))
-        return mlir::failure();
+        return std::nullopt;
     }
     if (!store || !isTrue(store.getWhere()) ||
         !isF16(elementType(store.getValue().getType())))
-      return mlir::failure();
+      return std::nullopt;
     std::string fill = expression(store.getValue());
     mlir::Value coordinate = body.getArgument(0);
     if (!valueDependsOn(store.getPointer(), coordinate))
-      return mlir::failure();
+      return std::nullopt;
     std::optional<std::string> destination =
         pointerBase(store.getPointer(), coordinate);
     CValue begin = require(op.getBegin());
     CValue end = require(op.getEnd());
     if (fill.empty() || !destination || begin.spelling.empty() ||
         end.spelling.empty())
-      return mlir::failure();
+      return std::nullopt;
 
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::F16Fill;
+    decision.operation = op.getOperation();
+    decision.consumer = store.getOperation();
+    decision.begin = begin.spelling;
+    decision.end = end.spelling;
+    decision.destinationPointer = *destination;
+    decision.scalar = fill;
+    return decision;
+  }
+
+  mlir::LogicalResult emitF16FillVLA(
+      const SpecializedVLADecision &decision) {
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string vector = fresh("fill_f16");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + end.spelling +
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + decision.end +
          " - " + strip + ");");
-    line("vfloat16m8_t " + vector + " = __riscv_vfmv_v_f_f16m8(" + fill +
+    line("vfloat16m8_t " + vector + " = __riscv_vfmv_v_f_f16m8(" +
+         decision.scalar +
          ", " + vl + ");");
-    line("__riscv_vse16_v_f16m8(" + *destination + " + " + strip + ", " +
-         vector + ", " + vl + ");");
+    line("__riscv_vse16_v_f16m8(" + decision.destinationPointer + " + " +
+         strip + ", " + vector + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitWideningF16DotVLA(VLAOp op) {
+  std::optional<SpecializedVLADecision> decideWideningF16DotVLA(VLAOp op) {
     if (op.getNumResults() != 1 || !op.getResult(0).getType().isF32())
-      return mlir::failure();
+      return std::nullopt;
     mlir::Block &body = op.getBody().front();
     unsigned loadCount = 0;
     unsigned castCount = 0;
@@ -1767,39 +1820,39 @@ private:
       else if (mlir::isa<ReduceOp>(nested))
         ++reduceCount;
       else
-        return mlir::failure();
+        return std::nullopt;
     }
     if (loadCount != 2 || castCount != 2 || binaryCount != 1 ||
         reduceCount != 1)
-      return mlir::failure();
+      return std::nullopt;
     auto yield = mlir::cast<YieldOp>(body.getTerminator());
     if (yield.getNumOperands() != 1)
-      return mlir::failure();
+      return std::nullopt;
     auto reduce = yield.getOperand(0).getDefiningOp<ReduceOp>();
     if (!reduce || reduce.getKind() != "add" || reduce.getAxis() != -1 ||
         !isTrue(reduce.getWhere()))
-      return mlir::failure();
+      return std::nullopt;
     auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
     if (!multiply || multiply.getKind() != "mul")
-      return mlir::failure();
+      return std::nullopt;
     auto lhsCast = multiply.getLhs().getDefiningOp<CastOp>();
     auto rhsCast = multiply.getRhs().getDefiningOp<CastOp>();
     if (!lhsCast || !rhsCast ||
         !elementType(lhsCast.getResult().getType()).isF32() ||
         !elementType(rhsCast.getResult().getType()).isF32())
-      return mlir::failure();
+      return std::nullopt;
     auto lhsLoad = lhsCast.getInput().getDefiningOp<LoadOp>();
     auto rhsLoad = rhsCast.getInput().getDefiningOp<LoadOp>();
     if (!lhsLoad || !rhsLoad || !isTrue(lhsLoad.getWhere()) ||
         !isTrue(rhsLoad.getWhere()) ||
         !isF16(elementType(lhsLoad.getResult().getType())) ||
         !isF16(elementType(rhsLoad.getResult().getType())))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value coordinate = body.getArgument(0);
     if (!valueDependsOn(lhsLoad.getPointer(), coordinate) ||
         !valueDependsOn(rhsLoad.getPointer(), coordinate))
-      return mlir::failure();
+      return std::nullopt;
     std::optional<std::string> lhs =
         pointerBase(lhsLoad.getPointer(), coordinate);
     std::optional<std::string> rhs =
@@ -1809,8 +1862,24 @@ private:
     std::string identity = expression(reduce.getIdentity());
     if (!lhs || !rhs || begin.spelling.empty() || end.spelling.empty() ||
         identity.empty())
-      return mlir::failure();
+      return std::nullopt;
 
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::WideningF16Dot;
+    decision.operation = op.getOperation();
+    decision.semanticOperation = reduce.getOperation();
+    decision.begin = begin.spelling;
+    decision.end = end.spelling;
+    decision.firstPointer = *lhs;
+    decision.secondPointer = *rhs;
+    decision.scalar = identity;
+    return decision;
+  }
+
+  mlir::LogicalResult emitWideningF16DotVLA(
+      const SpecializedVLADecision &decision) {
+    auto op = mlir::cast<VLAOp>(decision.operation);
+    auto reduce = mlir::cast<ReduceOp>(decision.semanticOperation);
     std::string fullVL = fresh("dot_vl");
     std::string accumulator = fresh("dot_acc");
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
@@ -1823,31 +1892,36 @@ private:
     line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m1();");
     line("vfloat32m2_t " + accumulator +
          " = __riscv_vfmv_v_f_f32m2(0.0f, " + fullVL + ");");
-    line("size_t " + strip + " = " + begin.spelling + ";");
-    line("for (; " + strip + " + " + fullVL + " <= " + end.spelling + "; " +
+    line("size_t " + strip + " = " + decision.begin + ";");
+    line("for (; " + strip + " + " + fullVL + " <= " + decision.end + "; " +
          strip + " += " + fullVL + ") {");
     ++indent;
-    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" + *lhs +
+    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
+         decision.firstPointer +
          " + " + strip + ", " + fullVL + ");");
-    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" + *rhs +
+    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
+         decision.secondPointer +
          " + " + strip + ", " + fullVL + ");");
     line(accumulator + " = __riscv_vfwmacc_vv_f32m2(" + accumulator + ", " +
          lhsVector + ", " + rhsVector + ", " + fullVL + ");");
     --indent;
     line("}");
-    line("if (" + strip + " < " + end.spelling + ") {");
+    line("if (" + strip + " < " + decision.end + ") {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" + end.spelling +
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m1(" + decision.end +
          " - " + strip + ");");
-    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" + *lhs +
+    line("vfloat16m1_t " + lhsVector + " = __riscv_vle16_v_f16m1(" +
+         decision.firstPointer +
          " + " + strip + ", " + vl + ");");
-    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" + *rhs +
+    line("vfloat16m1_t " + rhsVector + " = __riscv_vle16_v_f16m1(" +
+         decision.secondPointer +
          " + " + strip + ", " + vl + ");");
     line(accumulator + " = __riscv_vfwmacc_vv_f32m2_tu(" + accumulator +
          ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
     --indent;
     line("}");
-    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + identity +
+    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" +
+         decision.scalar +
          ", 1);");
     line("vfloat32m1_t " + reduced +
          " = __riscv_vfredusum_vs_f32m2_f32m1(" + accumulator + ", " + seed +
@@ -1860,9 +1934,9 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitF16WeightedUpdateVLA(VLAOp op) {
+  std::optional<SpecializedVLADecision> decideF16WeightedUpdateVLA(VLAOp op) {
     if (op.getNumResults() != 0)
-      return mlir::failure();
+      return std::nullopt;
     mlir::Block &body = op.getBody().front();
     StoreOp store;
     unsigned loadCount = 0;
@@ -1870,23 +1944,23 @@ private:
     for (mlir::Operation &nested : body.without_terminator()) {
       if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
         if (store)
-          return mlir::failure();
+          return std::nullopt;
         store = candidate;
       } else if (mlir::isa<LoadOp>(nested))
         ++loadCount;
       else if (mlir::isa<BinaryOp>(nested))
         ++binaryCount;
       else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return mlir::failure();
+        return std::nullopt;
     }
     if (loadCount != 2 || binaryCount != 2)
-      return mlir::failure();
+      return std::nullopt;
     if (!store || !isTrue(store.getWhere()) ||
         !isF16(elementType(store.getValue().getType())))
-      return mlir::failure();
+      return std::nullopt;
     auto add = store.getValue().getDefiningOp<BinaryOp>();
     if (!add || add.getKind() != "add")
-      return mlir::failure();
+      return std::nullopt;
 
     BinaryOp multiply = add.getLhs().getDefiningOp<BinaryOp>();
     mlir::Value baseValue = add.getRhs();
@@ -1895,11 +1969,11 @@ private:
       baseValue = add.getLhs();
     }
     if (!multiply || multiply.getKind() != "mul")
-      return mlir::failure();
+      return std::nullopt;
     auto baseLoad = baseValue.getDefiningOp<LoadOp>();
     if (!baseLoad || !isTrue(baseLoad.getWhere()) ||
         !isF16(elementType(baseLoad.getResult().getType())))
-      return mlir::failure();
+      return std::nullopt;
 
     LoadOp productLoad = multiply.getLhs().getDefiningOp<LoadOp>();
     mlir::Value weight = multiply.getRhs();
@@ -1910,20 +1984,20 @@ private:
     if (!productLoad || !isTrue(productLoad.getWhere()) ||
         !isF16(elementType(productLoad.getResult().getType())) ||
         !isF16(elementType(weight.getType())))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value destinationRoot = pointerRoot(store.getPointer());
     mlir::Value baseRoot = pointerRoot(baseLoad.getPointer());
     mlir::Value productRoot = pointerRoot(productLoad.getPointer());
     if (!destinationRoot ||
         (destinationRoot != baseRoot && destinationRoot != productRoot))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value coordinate = body.getArgument(0);
     if (!valueDependsOn(baseLoad.getPointer(), coordinate) ||
         !valueDependsOn(productLoad.getPointer(), coordinate) ||
         !valueDependsOn(store.getPointer(), coordinate))
-      return mlir::failure();
+      return std::nullopt;
     std::optional<std::string> base =
         pointerBase(baseLoad.getPointer(), coordinate);
     std::optional<std::string> product =
@@ -1935,37 +2009,53 @@ private:
     CValue end = require(op.getEnd());
     if (!base || !product || !destination || weightExpression.empty() ||
         begin.spelling.empty() || end.spelling.empty())
-      return mlir::failure();
+      return std::nullopt;
 
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::F16WeightedUpdate;
+    decision.operation = op.getOperation();
+    decision.consumer = store.getOperation();
+    decision.begin = begin.spelling;
+    decision.end = end.spelling;
+    decision.firstPointer = *base;
+    decision.secondPointer = *product;
+    decision.destinationPointer = *destination;
+    decision.scalar = weightExpression;
+    return decision;
+  }
+
+  mlir::LogicalResult emitF16WeightedUpdateVLA(
+      const SpecializedVLADecision &decision) {
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string baseVector = fresh("update_base");
     std::string productVector = fresh("update_value");
     std::string result = fresh("update_f16");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + end.spelling +
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m8(" + decision.end +
          " - " + strip + ");");
-    line("vfloat16m8_t " + baseVector + " = __riscv_vle16_v_f16m8(" + *base +
+    line("vfloat16m8_t " + baseVector + " = __riscv_vle16_v_f16m8(" +
+         decision.firstPointer +
          " + " + strip + ", " + vl + ");");
     line("vfloat16m8_t " + productVector +
-         " = __riscv_vle16_v_f16m8(" + *product + " + " + strip + ", " + vl +
-         ");");
+         " = __riscv_vle16_v_f16m8(" + decision.secondPointer + " + " +
+         strip + ", " + vl + ");");
     line("vfloat16m8_t " + result + " = __riscv_vfmacc_vf_f16m8(" +
-         baseVector + ", " + weightExpression + ", " + productVector + ", " +
+         baseVector + ", " + decision.scalar + ", " + productVector + ", " +
          vl + ");");
-    line("__riscv_vse16_v_f16m8(" + *destination + " + " + strip + ", " +
-         result + ", " + vl + ");");
+    line("__riscv_vse16_v_f16m8(" + decision.destinationPointer + " + " +
+         strip + ", " + result + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
     return mlir::success();
   }
 
-  mlir::LogicalResult tryEmitF16ToF32NormalizeVLA(VLAOp op) {
+  std::optional<SpecializedVLADecision> decideF16ToF32NormalizeVLA(VLAOp op) {
     if (op.getNumResults() != 0)
-      return mlir::failure();
+      return std::nullopt;
     mlir::Block &body = op.getBody().front();
     StoreOp store;
     unsigned loadCount = 0;
@@ -1974,7 +2064,7 @@ private:
     for (mlir::Operation &nested : body.without_terminator()) {
       if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
         if (store)
-          return mlir::failure();
+          return std::nullopt;
         store = candidate;
       } else if (mlir::isa<LoadOp>(nested))
         ++loadCount;
@@ -1983,28 +2073,28 @@ private:
       else if (mlir::isa<BinaryOp>(nested))
         ++binaryCount;
       else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return mlir::failure();
+        return std::nullopt;
     }
     if (loadCount != 1 || castCount != 1 || binaryCount != 1)
-      return mlir::failure();
+      return std::nullopt;
     if (!store || !isTrue(store.getWhere()) ||
         !elementType(store.getValue().getType()).isF32())
-      return mlir::failure();
+      return std::nullopt;
     auto divide = store.getValue().getDefiningOp<BinaryOp>();
     if (!divide || divide.getKind() != "div")
-      return mlir::failure();
+      return std::nullopt;
     auto cast = divide.getLhs().getDefiningOp<CastOp>();
     if (!cast || !elementType(cast.getResult().getType()).isF32())
-      return mlir::failure();
+      return std::nullopt;
     auto load = cast.getInput().getDefiningOp<LoadOp>();
     if (!load || !isTrue(load.getWhere()) ||
         !isF16(elementType(load.getResult().getType())))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value coordinate = body.getArgument(0);
     if (!valueDependsOn(load.getPointer(), coordinate) ||
         !valueDependsOn(store.getPointer(), coordinate))
-      return mlir::failure();
+      return std::nullopt;
     std::optional<std::string> source =
         pointerBase(load.getPointer(), coordinate);
     std::optional<std::string> destination =
@@ -2014,30 +2104,84 @@ private:
     CValue end = require(op.getEnd());
     if (!source || !destination || divisor.empty() || begin.spelling.empty() ||
         end.spelling.empty())
-      return mlir::failure();
+      return std::nullopt;
 
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::F16ToF32Normalize;
+    decision.operation = op.getOperation();
+    decision.semanticOperation = divide.getOperation();
+    decision.consumer = store.getOperation();
+    decision.begin = begin.spelling;
+    decision.end = end.spelling;
+    decision.firstPointer = *source;
+    decision.destinationPointer = *destination;
+    decision.scalar = divisor;
+    return decision;
+  }
+
+  mlir::LogicalResult emitF16ToF32NormalizeVLA(
+      const SpecializedVLADecision &decision) {
     std::string strip = "__weft_vla" + std::to_string(nextLoop++);
     std::string vl = fresh("vl");
     std::string half = fresh("load_f16");
     std::string wide = fresh("widen_f32");
     std::string normalized = fresh("normalize_f32");
-    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-         " < " + end.spelling + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + end.spelling +
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m8(" + decision.end +
          " - " + strip + ");");
-    line("vfloat16m4_t " + half + " = __riscv_vle16_v_f16m4(" + *source +
+    line("vfloat16m4_t " + half + " = __riscv_vle16_v_f16m4(" +
+         decision.firstPointer +
          " + " + strip + ", " + vl + ");");
     line("vfloat32m8_t " + wide + " = __riscv_vfwcvt_f_f_v_f32m8(" + half +
          ", " + vl + ");");
     line("vfloat32m8_t " + normalized + " = __riscv_vfdiv_vf_f32m8(" + wide +
-         ", " + divisor + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m8(" + *destination + " + " + strip + ", " +
-         normalized + ", " + vl + ");");
+         ", " + decision.scalar + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m8(" + decision.destinationPointer + " + " +
+         strip + ", " + normalized + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
     return mlir::success();
+  }
+
+  std::optional<SpecializedVLADecision> decideSpecializedVLA(VLAOp op) {
+    if (std::optional<SpecializedVLADecision> decision =
+            decideF32ToF16VLA(op))
+      return decision;
+    if (std::optional<SpecializedVLADecision> decision = decideF16FillVLA(op))
+      return decision;
+    if (std::optional<SpecializedVLADecision> decision =
+            decideWideningF16DotVLA(op))
+      return decision;
+    if (std::optional<SpecializedVLADecision> decision =
+            decideF16WeightedUpdateVLA(op))
+      return decision;
+    if (std::optional<SpecializedVLADecision> decision =
+            decideF16ToF32NormalizeVLA(op))
+      return decision;
+    return decideSoftmaxEnvelope(op);
+  }
+
+  mlir::LogicalResult
+  emitSpecializedVLA(const SpecializedVLADecision &decision) {
+    switch (decision.realization) {
+    case SpecializedVLARealization::F32ToF16:
+      return emitF32ToF16VLA(decision);
+    case SpecializedVLARealization::F16Fill:
+      return emitF16FillVLA(decision);
+    case SpecializedVLARealization::WideningF16Dot:
+      return emitWideningF16DotVLA(decision);
+    case SpecializedVLARealization::F16WeightedUpdate:
+      return emitF16WeightedUpdateVLA(decision);
+    case SpecializedVLARealization::F16ToF32Normalize:
+      return emitF16ToF32NormalizeVLA(decision);
+    case SpecializedVLARealization::SoftmaxEnvelope:
+      return emitSoftmaxEnvelope(decision);
+    }
+    return mlir::cast<VLAOp>(decision.operation)
+        .emitError("selected VLA realization is unavailable");
   }
 
   mlir::LogicalResult emitVLA(VLAOp op) {
@@ -2046,18 +2190,9 @@ private:
     if (!options.target.hasRVV)
       return op.emitError(
           "VLA requires RVV on the selected target; no scalar fallback exists");
-    if (mlir::succeeded(tryEmitF32ToF16VLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitF16FillVLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitWideningF16DotVLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitF16WeightedUpdateVLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitF16ToF32NormalizeVLA(op)))
-      return mlir::success();
-    if (mlir::succeeded(tryEmitSoftmaxEnvelope(op)))
-      return mlir::success();
+    if (std::optional<SpecializedVLADecision> decision =
+            decideSpecializedVLA(op))
+      return emitSpecializedVLA(*decision);
     mlir::FailureOr<VLARegionDecision> selected = decideVLARegion(op);
     if (mlir::failed(selected))
       return mlir::failure();
@@ -2267,51 +2402,51 @@ private:
     return !lhsExpression.empty() && lhsExpression == rhsExpression;
   }
 
-  mlir::LogicalResult tryEmitSoftmaxEnvelope(VLAOp producer) {
+  std::optional<SpecializedVLADecision> decideSoftmaxEnvelope(VLAOp producer) {
     SummaryFoldOp summary;
     for (mlir::Operation &operation :
          producer.getBody().front().without_terminator()) {
       if (auto candidate = mlir::dyn_cast<SummaryFoldOp>(operation)) {
         if (summary)
-          return mlir::failure();
+          return std::nullopt;
         summary = candidate;
       }
     }
     if (!summary || !isOnlineSoftmaxSummary(summary) ||
         producer.getNumResults() != 1)
-      return mlir::failure();
+      return std::nullopt;
 
     TupleGetOp maximumGet;
     TupleGetOp sumGet;
     for (mlir::Operation *user : producer.getResult(0).getUsers()) {
       auto get = mlir::dyn_cast<TupleGetOp>(user);
       if (!get)
-        return mlir::failure();
+        return std::nullopt;
       if (get.getIndex() == 0 && !maximumGet)
         maximumGet = get;
       else if (get.getIndex() == 1 && !sumGet)
         sumGet = get;
       else
-        return mlir::failure();
+        return std::nullopt;
     }
     if (!maximumGet || !sumGet || maximumGet.getResult().use_empty() ||
         sumGet.getResult().use_empty())
-      return mlir::failure();
+      return std::nullopt;
 
     VLAOp consumer;
     for (mlir::Operation *user : maximumGet.getResult().getUsers()) {
       auto parent = user->getParentOfType<VLAOp>();
       if (!parent || (consumer && consumer != parent))
-        return mlir::failure();
+        return std::nullopt;
       consumer = parent;
     }
     for (mlir::Operation *user : sumGet.getResult().getUsers())
       if (user->getParentOfType<VLAOp>() != consumer)
-        return mlir::failure();
+        return std::nullopt;
     if (!consumer || consumer->getBlock() != producer->getBlock() ||
         !sameBound(producer.getBegin(), consumer.getBegin()) ||
         !sameBound(producer.getEnd(), consumer.getEnd()))
-      return mlir::failure();
+      return std::nullopt;
 
     LoadOp consumerLoad;
     StoreOp consumerStore;
@@ -2319,22 +2454,22 @@ private:
          consumer.getBody().front().without_terminator()) {
       if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
         if (consumerLoad)
-          return mlir::failure();
+          return std::nullopt;
         consumerLoad = load;
       }
       if (auto store = mlir::dyn_cast<StoreOp>(operation)) {
         if (consumerStore)
-          return mlir::failure();
+          return std::nullopt;
         consumerStore = store;
       }
     }
     if (!consumerLoad || !consumerStore || !isTrue(consumerLoad.getWhere()) ||
         !isTrue(consumerStore.getWhere()))
-      return mlir::failure();
+      return std::nullopt;
     auto divide = consumerStore.getValue().getDefiningOp<BinaryOp>();
     if (!divide || divide.getKind() != "div" ||
         divide.getRhs() != sumGet.getResult())
-      return mlir::failure();
+      return std::nullopt;
     auto exponential = divide.getLhs().getDefiningOp<UnaryOp>();
     auto subtract = exponential
                         ? exponential.getInput().getDefiningOp<BinaryOp>()
@@ -2343,10 +2478,10 @@ private:
         subtract.getKind() != "sub" ||
         subtract.getLhs() != consumerLoad.getResult() ||
         subtract.getRhs() != maximumGet.getResult())
-      return mlir::failure();
+      return std::nullopt;
     auto producerLoad = summary.getInput().getDefiningOp<LoadOp>();
     if (!producerLoad || !isTrue(producerLoad.getWhere()))
-      return mlir::failure();
+      return std::nullopt;
 
     mlir::Value producerCoordinate =
         producer.getBody().front().getArgument(0);
@@ -2359,12 +2494,30 @@ private:
     std::optional<std::string> outputPointer =
         pointerBase(consumerStore.getPointer(), consumerCoordinate);
     if (!input || !consumerInput || !outputPointer || *input != *consumerInput)
-      return mlir::failure();
+      return std::nullopt;
 
     std::string begin = expression(producer.getBegin());
     std::string end = expression(producer.getEnd());
     if (begin.empty() || end.empty())
-      return mlir::failure();
+      return std::nullopt;
+    SpecializedVLADecision decision;
+    decision.realization = SpecializedVLARealization::SoftmaxEnvelope;
+    decision.operation = producer.getOperation();
+    decision.semanticOperation = summary.getOperation();
+    decision.consumer = consumer.getOperation();
+    decision.firstAuxiliary = maximumGet.getOperation();
+    decision.secondAuxiliary = sumGet.getOperation();
+    decision.begin = begin;
+    decision.end = end;
+    decision.firstPointer = *input;
+    decision.destinationPointer = *outputPointer;
+    return decision;
+  }
+
+  mlir::LogicalResult emitSoftmaxEnvelope(
+      const SpecializedVLADecision &decision) {
+    auto producer = mlir::cast<VLAOp>(decision.operation);
+    auto summary = mlir::cast<SummaryFoldOp>(decision.semanticOperation);
     std::string maximum = fresh("softmax_max");
     std::string strip = fresh("softmax_i");
     std::string vl = fresh("vl");
@@ -2372,13 +2525,14 @@ private:
     std::string seed = fresh("softmax_seed");
     std::string partial = fresh("softmax_partial");
     line("float " + maximum + " = -INFINITY;");
-    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
-         end + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
+         " - " +
          strip + ");");
     line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
-         *input + " + " + strip + ", " + vl + ");");
+         decision.firstPointer + " + " + strip + ", " + vl + ");");
     line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" + maximum +
          ", 1);");
     line("vfloat32m1_t " + partial +
@@ -2395,19 +2549,20 @@ private:
     std::string sumSeed = fresh("softmax_sum_seed");
     std::string sumPartial = fresh("softmax_sum_partial");
     line("float " + sum + " = 0.0f;");
-    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
-         end + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
+         " - " +
          strip + ");");
     line("vfloat32m2_t " + inputVector + " = __riscv_vle32_v_f32m2(" +
-         *input + " + " + strip + ", " + vl + ");");
+         decision.firstPointer + " + " + strip + ", " + vl + ");");
     line("vfloat32m2_t " + shifted + " = __riscv_vfsub_vf_f32m2(" +
          inputVector + ", " + maximum + ", " + vl + ");");
     line("vfloat32m2_t " + exponentials + " = __weft_exp_f32m2(" + shifted +
          ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + *outputPointer + " + " + strip + ", " +
-         exponentials + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + decision.destinationPointer + " + " +
+         strip + ", " + exponentials + ", " + vl + ");");
     line("vfloat32m1_t " + sumSeed + " = __riscv_vfmv_v_f_f32m1(" + sum +
          ", 1);");
     line("vfloat32m1_t " + sumPartial +
@@ -2421,17 +2576,18 @@ private:
     std::string inverse = fresh("softmax_inverse");
     std::string outputVector = fresh("softmax_y");
     line("const float " + inverse + " = 1.0f / " + sum + ";");
-    line("for (size_t " + strip + " = " + begin + "; " + strip + " < " +
-         end + ";) {");
+    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
+         " < " + decision.end + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + end + " - " +
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(" + decision.end +
+         " - " +
          strip + ");");
     line("vfloat32m2_t " + outputVector + " = __riscv_vle32_v_f32m2(" +
-         *outputPointer + " + " + strip + ", " + vl + ");");
+         decision.destinationPointer + " + " + strip + ", " + vl + ");");
     line(outputVector + " = __riscv_vfmul_vf_f32m2(" + outputVector + ", " +
          inverse + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + *outputPointer + " + " + strip + ", " +
-         outputVector + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + decision.destinationPointer + " + " +
+         strip + ", " + outputVector + ", " + vl + ");");
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
@@ -2444,9 +2600,9 @@ private:
     tuple.fields = {maxValue, sumValue};
     values[summary.getResult()] = tuple;
     values[producer.getResult(0)] = tuple;
-    consumed.insert(maximumGet.getOperation());
-    consumed.insert(sumGet.getOperation());
-    consumed.insert(consumer.getOperation());
+    consumed.insert(decision.firstAuxiliary);
+    consumed.insert(decision.secondAuxiliary);
+    consumed.insert(decision.consumer);
     return mlir::success();
   }
 
