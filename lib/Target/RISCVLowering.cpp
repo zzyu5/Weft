@@ -230,9 +230,9 @@ struct VLAStateDecision {
 
 struct VLANarrowDecision {
   mlir::Operation *operation = nullptr;
-  unsigned sourceLMUL = 4;
-  unsigned intermediateLMUL = 2;
-  unsigned resultLMUL = 1;
+  unsigned sourceLMUL = 8;
+  unsigned intermediateLMUL = 4;
+  unsigned resultLMUL = 2;
 };
 
 enum class VLAContractRealization {
@@ -1326,7 +1326,7 @@ private:
             "VLA narrow has no selected saturating f32-to-i8 realization");
         return mlir::failure();
       }
-      decision.physical.dataLMUL = 4;
+      decision.physical.dataLMUL = 8;
       decision.narrows.push_back(VLANarrowDecision{narrow.getOperation()});
     }
 
@@ -1403,12 +1403,15 @@ private:
 
     decision.physical.maskRatio =
         decision.physical.dataSEW / decision.physical.dataLMUL;
-    decision.physical.indexLMUL = options.target.xlen == 64
-                                      ? decision.physical.dataLMUL * 2
-                                      : decision.physical.dataLMUL;
-    if (decision.physical.indexLMUL > 8) {
-      op.emitError("selected VLA data LMUL has no legal index-vector LMUL");
-      return mlir::failure();
+    decision.physical.indexLMUL = 0;
+    if (!decision.predicates.empty()) {
+      decision.physical.indexLMUL = options.target.xlen == 64
+                                        ? decision.physical.dataLMUL * 2
+                                        : decision.physical.dataLMUL;
+      if (decision.physical.indexLMUL > 8) {
+        op.emitError("selected VLA data LMUL has no legal index-vector LMUL");
+        return mlir::failure();
+      }
     }
 
     for (VLAAccessDecision &access : decision.accesses) {
