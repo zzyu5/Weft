@@ -232,6 +232,20 @@ struct VLABinaryDecision {
   unsigned lmul = 8;
 };
 
+enum class VLACastRealization {
+  RVVWidenF16ToF32,
+  RVVNarrowF32ToF16,
+};
+
+struct VLACastDecision {
+  mlir::Operation *operation = nullptr;
+  VLACastRealization realization = VLACastRealization::RVVWidenF16ToF32;
+  unsigned sourceSEW = 16;
+  unsigned sourceLMUL = 1;
+  unsigned resultSEW = 32;
+  unsigned resultLMUL = 2;
+};
+
 struct VLAStateDecision {
   mlir::Operation *operation = nullptr;
   VLAStateRealization realization = VLAStateRealization::RVVAddReduction;
@@ -281,15 +295,14 @@ struct VLARegionDecision {
   std::vector<VLAPredicateDecision> predicates;
   std::vector<VLAAccessDecision> accesses;
   std::vector<VLABinaryDecision> binaries;
+  std::vector<VLACastDecision> casts;
   std::vector<VLAStateDecision> states;
   std::vector<VLANarrowDecision> narrows;
   std::vector<VLAContractDecision> contracts;
 };
 
 enum class SpecializedVLARealization {
-  F32ToF16,
   WideningF16Dot,
-  F16ToF32Normalize,
   SoftmaxEnvelope,
 };
 
@@ -314,7 +327,8 @@ struct SpecializedVLAPhysicalConfig {
 };
 
 struct SpecializedVLADecision {
-  SpecializedVLARealization realization = SpecializedVLARealization::F32ToF16;
+  SpecializedVLARealization realization =
+      SpecializedVLARealization::WideningF16Dot;
   mlir::Operation *operation = nullptr;
   mlir::Operation *semanticOperation = nullptr;
   mlir::Operation *consumer = nullptr;
@@ -948,6 +962,17 @@ private:
         });
   }
 
+  const VLACastDecision *
+  findCastDecision(mlir::Operation *operation) const {
+    if (!activeVLADecision)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeVLADecision->casts, [&](const VLACastDecision &decision) {
+          return decision.operation == operation;
+        });
+    return found == activeVLADecision->casts.end() ? nullptr : &*found;
+  }
+
   const VLAStateDecision *
   findStateDecision(mlir::Operation *operation) const {
     if (!activeVLADecision)
@@ -1446,11 +1471,66 @@ private:
                                         [](const VLAAccessDecision &access) {
                                           return isF16(access.elementType);
                                         });
+    bool hasFloatCast = llvm::any_of(
+        physicalOperations, [](mlir::Operation *operation) {
+          auto cast = mlir::dyn_cast<CastOp>(operation);
+          if (!cast || !isRegionValue(cast.getResult().getType()))
+            return false;
+          mlir::Type source = elementType(cast.getInput().getType());
+          mlir::Type result = elementType(cast.getResult().getType());
+          return (isF16(source) && result.isF32()) ||
+                 (source.isF32() && isF16(result));
+        });
+    bool requiresF32M2Math = llvm::any_of(
+        physicalOperations, [](mlir::Operation *operation) {
+          auto unary = mlir::dyn_cast<UnaryOp>(operation);
+          return unary && unary.getKind() == "exp" &&
+                 isRegionValue(unary.getResult().getType());
+        });
     if (decision.contracts.empty() && decision.narrows.empty() &&
         decision.states.empty() && decision.predicates.empty() &&
         !hasF32RegionValue && onlyF16Accesses) {
       decision.physical.dataSEW = 16;
       decision.physical.dataLMUL = 8;
+    } else if (decision.contracts.empty() && decision.narrows.empty() &&
+               decision.states.empty() && decision.predicates.empty() &&
+               hasFloatCast && !requiresF32M2Math) {
+      decision.physical.dataSEW = 32;
+      decision.physical.dataLMUL = 8;
+    }
+
+    for (mlir::Operation *operation : physicalOperations) {
+      auto cast = mlir::dyn_cast<CastOp>(operation);
+      if (!cast || !isRegionValue(cast.getResult().getType()))
+        continue;
+      mlir::Type source = elementType(cast.getInput().getType());
+      mlir::Type result = elementType(cast.getResult().getType());
+      VLACastDecision selected;
+      selected.operation = cast.getOperation();
+      if (isF16(source) && result.isF32()) {
+        selected.realization = VLACastRealization::RVVWidenF16ToF32;
+        selected.sourceSEW = 16;
+        selected.resultSEW = 32;
+      } else if (source.isF32() && isF16(result)) {
+        selected.realization = VLACastRealization::RVVNarrowF32ToF16;
+        selected.sourceSEW = 32;
+        selected.resultSEW = 16;
+      } else {
+        cast.emitError("VLA cast has no selected RVV conversion");
+        return mlir::failure();
+      }
+      selected.sourceLMUL =
+          decision.physical.dataLMUL * selected.sourceSEW /
+          decision.physical.dataSEW;
+      selected.resultLMUL =
+          decision.physical.dataLMUL * selected.resultSEW /
+          decision.physical.dataSEW;
+      if (selected.sourceLMUL == 0 || selected.sourceLMUL > 8 ||
+          selected.resultLMUL == 0 || selected.resultLMUL > 8) {
+        cast.emitError("VLA cast exceeds the legal RVV LMUL range");
+        return mlir::failure();
+      }
+      decision.casts.push_back(selected);
     }
 
     for (mlir::Operation *operation : physicalOperations) {
@@ -1963,94 +2043,6 @@ private:
     return mlir::success();
   }
 
-  std::optional<SpecializedVLADecision> decideF32ToF16VLA(VLAOp op) {
-    if (op.getNumResults() != 0)
-      return std::nullopt;
-    mlir::Block &body = op.getBody().front();
-    LoadOp load;
-    CastOp cast;
-    StoreOp store;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (auto candidate = mlir::dyn_cast<LoadOp>(nested)) {
-        if (load)
-          return std::nullopt;
-        load = candidate;
-      } else if (auto candidate = mlir::dyn_cast<CastOp>(nested)) {
-        if (cast)
-          return std::nullopt;
-        cast = candidate;
-      } else if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
-        if (store)
-          return std::nullopt;
-        store = candidate;
-      } else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return std::nullopt;
-    }
-    if (!load || !cast || !store || cast.getInput() != load.getResult() ||
-        store.getValue() != cast.getResult() || !isTrue(load.getWhere()) ||
-        !isTrue(store.getWhere()) ||
-        !elementType(load.getResult().getType()).isF32() ||
-        !isF16(elementType(cast.getResult().getType())))
-      return std::nullopt;
-
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(load.getPointer(), coordinate) ||
-        !valueDependsOn(store.getPointer(), coordinate))
-      return std::nullopt;
-    std::optional<std::string> source =
-        pointerBase(load.getPointer(), coordinate);
-    std::optional<std::string> destination =
-        pointerBase(store.getPointer(), coordinate);
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    if (!source || !destination || begin.spelling.empty() || end.spelling.empty())
-      return std::nullopt;
-
-    SpecializedVLADecision decision;
-    decision.realization = SpecializedVLARealization::F32ToF16;
-    decision.operation = op.getOperation();
-    decision.semanticOperation = cast.getOperation();
-    decision.consumer = store.getOperation();
-    decision.begin = begin.spelling;
-    decision.end = end.spelling;
-    decision.firstPointer = *source;
-    decision.destinationPointer = *destination;
-    decision.physical.input = {32, 8};
-    decision.physical.compute = {32, 8};
-    decision.physical.output = {16, 4};
-    return decision;
-  }
-
-  mlir::LogicalResult emitF32ToF16VLA(
-      const SpecializedVLADecision &decision) {
-    const RVVVectorConfig &input = decision.physical.input;
-    const RVVVectorConfig &output = decision.physical.output;
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string wide = fresh("load_f32");
-    std::string narrow = fresh("narrow_f16");
-    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
-         " < " + decision.end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(input.sew) + "m" + std::to_string(input.lmul) + "(" +
-         decision.end + " - " + strip + ");");
-    line(rvvFloatType(input) + " " + wide + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.firstPointer +
-         " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(output) + " " + narrow +
-         " = __riscv_vfncvt_f_f_w_" + rvvFloatSuffix(output) + "(" + wide +
-         ", " + vl + ");");
-    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
-         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
-         strip + ", " + narrow + ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-    return mlir::success();
-  }
-
   std::optional<SpecializedVLADecision> decideWideningF16DotVLA(VLAOp op) {
     if (op.getNumResults() != 1 || !op.getResult(0).getType().isF32())
       return std::nullopt;
@@ -2207,119 +2199,9 @@ private:
     return mlir::success();
   }
 
-  std::optional<SpecializedVLADecision> decideF16ToF32NormalizeVLA(VLAOp op) {
-    if (op.getNumResults() != 0)
-      return std::nullopt;
-    mlir::Block &body = op.getBody().front();
-    StoreOp store;
-    unsigned loadCount = 0;
-    unsigned castCount = 0;
-    unsigned binaryCount = 0;
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (auto candidate = mlir::dyn_cast<StoreOp>(nested)) {
-        if (store)
-          return std::nullopt;
-        store = candidate;
-      } else if (mlir::isa<LoadOp>(nested))
-        ++loadCount;
-      else if (mlir::isa<CastOp>(nested))
-        ++castCount;
-      else if (mlir::isa<BinaryOp>(nested))
-        ++binaryCount;
-      else if (!mlir::isa<PtrAddOp, ConstantOp, InvalidOp>(nested))
-        return std::nullopt;
-    }
-    if (loadCount != 1 || castCount != 1 || binaryCount != 1)
-      return std::nullopt;
-    if (!store || !isTrue(store.getWhere()) ||
-        !elementType(store.getValue().getType()).isF32())
-      return std::nullopt;
-    auto divide = store.getValue().getDefiningOp<BinaryOp>();
-    if (!divide || divide.getKind() != "div")
-      return std::nullopt;
-    auto cast = divide.getLhs().getDefiningOp<CastOp>();
-    if (!cast || !elementType(cast.getResult().getType()).isF32())
-      return std::nullopt;
-    auto load = cast.getInput().getDefiningOp<LoadOp>();
-    if (!load || !isTrue(load.getWhere()) ||
-        !isF16(elementType(load.getResult().getType())))
-      return std::nullopt;
-
-    mlir::Value coordinate = body.getArgument(0);
-    if (!valueDependsOn(load.getPointer(), coordinate) ||
-        !valueDependsOn(store.getPointer(), coordinate))
-      return std::nullopt;
-    std::optional<std::string> source =
-        pointerBase(load.getPointer(), coordinate);
-    std::optional<std::string> destination =
-        pointerBase(store.getPointer(), coordinate);
-    std::string divisor = expression(divide.getRhs());
-    CValue begin = require(op.getBegin());
-    CValue end = require(op.getEnd());
-    if (!source || !destination || divisor.empty() || begin.spelling.empty() ||
-        end.spelling.empty())
-      return std::nullopt;
-
-    SpecializedVLADecision decision;
-    decision.realization = SpecializedVLARealization::F16ToF32Normalize;
-    decision.operation = op.getOperation();
-    decision.semanticOperation = divide.getOperation();
-    decision.consumer = store.getOperation();
-    decision.begin = begin.spelling;
-    decision.end = end.spelling;
-    decision.firstPointer = *source;
-    decision.destinationPointer = *destination;
-    decision.scalar = divisor;
-    decision.physical.input = {16, 4};
-    decision.physical.compute = {32, 8};
-    decision.physical.output = {32, 8};
-    return decision;
-  }
-
-  mlir::LogicalResult emitF16ToF32NormalizeVLA(
-      const SpecializedVLADecision &decision) {
-    const RVVVectorConfig &input = decision.physical.input;
-    const RVVVectorConfig &compute = decision.physical.compute;
-    const RVVVectorConfig &output = decision.physical.output;
-    std::string strip = "__weft_vla" + std::to_string(nextLoop++);
-    std::string vl = fresh("vl");
-    std::string half = fresh("load_f16");
-    std::string wide = fresh("widen_f32");
-    std::string normalized = fresh("normalize_f32");
-    line("for (size_t " + strip + " = " + decision.begin + "; " + strip +
-         " < " + decision.end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(compute.sew) + "m" + std::to_string(compute.lmul) +
-         "(" + decision.end + " - " + strip + ");");
-    line(rvvFloatType(input) + " " + half + " = __riscv_vle" +
-         std::to_string(input.sew) + "_v_" + rvvFloatSuffix(input) + "(" +
-         decision.firstPointer +
-         " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(compute) + " " + wide +
-         " = __riscv_vfwcvt_f_f_v_" + rvvFloatSuffix(compute) + "(" + half +
-         ", " + vl + ");");
-    line(rvvFloatType(compute) + " " + normalized + " = __riscv_vfdiv_vf_" +
-         rvvFloatSuffix(compute) + "(" + wide + ", " + decision.scalar + ", " +
-         vl + ");");
-    line("__riscv_vse" + std::to_string(output.sew) + "_v_" +
-         rvvFloatSuffix(output) + "(" + decision.destinationPointer + " + " +
-         strip + ", " + normalized + ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-    return mlir::success();
-  }
-
   std::optional<SpecializedVLADecision> decideSpecializedVLA(VLAOp op) {
     if (std::optional<SpecializedVLADecision> decision =
-            decideF32ToF16VLA(op))
-      return decision;
-    if (std::optional<SpecializedVLADecision> decision =
             decideWideningF16DotVLA(op))
-      return decision;
-    if (std::optional<SpecializedVLADecision> decision =
-            decideF16ToF32NormalizeVLA(op))
       return decision;
     return decideSoftmaxEnvelope(op);
   }
@@ -2327,12 +2209,8 @@ private:
   mlir::LogicalResult
   emitSpecializedVLA(const SpecializedVLADecision &decision) {
     switch (decision.realization) {
-    case SpecializedVLARealization::F32ToF16:
-      return emitF32ToF16VLA(decision);
     case SpecializedVLARealization::WideningF16Dot:
       return emitWideningF16DotVLA(decision);
-    case SpecializedVLARealization::F16ToF32Normalize:
-      return emitF16ToF32NormalizeVLA(decision);
     case SpecializedVLARealization::SoftmaxEnvelope:
       return emitSoftmaxEnvelope(decision);
     }
@@ -3073,15 +2951,29 @@ private:
 
   mlir::LogicalResult emitCast(CastOp op) {
     CValue input = require(op.getInput());
-    if (input.kind == CValueKind::F16Vector &&
-        elementType(op.getResult().getType()).isF32()) {
-      std::string name = fresh("widen_f16");
-      unsigned lmul = activeVLADecision->physical.dataLMUL;
-      line("vfloat32m" + std::to_string(lmul) + "_t " + name +
-           " = __riscv_vfwcvt_f_f_v_f32m" + std::to_string(lmul) + "(" +
-           input.spelling + ", " + activeVL + ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+    if (const VLACastDecision *decision =
+            findCastDecision(op.getOperation())) {
+      CValueKind sourceKind =
+          decision->sourceSEW == 16 ? CValueKind::F16Vector
+                                    : CValueKind::F32Vector;
+      CValueKind resultKind =
+          decision->resultSEW == 16 ? CValueKind::F16Vector
+                                    : CValueKind::F32Vector;
+      if (input.kind != sourceKind || input.spelling.empty())
+        return op.emitError("selected VLA cast operand is unavailable");
+      std::string name = fresh(decision->resultSEW == 32 ? "widen_f16"
+                                                        : "narrow_f32");
+      std::string resultSuffix = "f" + std::to_string(decision->resultSEW) +
+                                 "m" + std::to_string(decision->resultLMUL);
+      std::string intrinsic =
+          decision->realization == VLACastRealization::RVVWidenF16ToF32
+              ? "__riscv_vfwcvt_f_f_v_"
+              : "__riscv_vfncvt_f_f_w_";
+      line("vfloat" + std::to_string(decision->resultSEW) + "m" +
+           std::to_string(decision->resultLMUL) + "_t " + name + " = " +
+           intrinsic + resultSuffix + "(" + input.spelling + ", " + activeVL +
+           ");");
+      values[op.getResult()] = CValue{op.getResult().getType(), resultKind, name};
       return mlir::success();
     }
     if (input.kind != CValueKind::Scalar)
