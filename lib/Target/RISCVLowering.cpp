@@ -157,15 +157,24 @@ struct SymmetricI4I8Decision {
   int64_t packedBlockBytes = 288;
 };
 
+struct LocalBlockMemoryFact {
+  mlir::Value semanticValue;
+  mlir::Value base;
+  BlockType semanticType;
+  BlockType storageType;
+  int64_t semanticExtent = 0;
+  int64_t storageExtent = 0;
+};
+
 enum class SignBitI8Realization {
-  RVVVLEN128WideningSignSum,
+  RVVWideningSignSum,
 };
 
 struct SignBitI8Decision {
   SignBitI8Realization realization =
-      SignBitI8Realization::RVVVLEN128WideningSignSum;
-  mlir::Value signBitsBase;
-  mlir::Value activationBase;
+      SignBitI8Realization::RVVWideningSignSum;
+  LocalBlockMemoryFact signBits;
+  LocalBlockMemoryFact activation;
   mlir::Value activationScale;
   mlir::Value signScale;
   mlir::Value init;
@@ -178,8 +187,8 @@ enum class E2M1E8M0I8Realization {
 struct E2M1E8M0I8Decision {
   E2M1E8M0I8Realization realization =
       E2M1E8M0I8Realization::RVVVLEN128TableDot;
-  mlir::Value packedCodesBase;
-  mlir::Value activationBase;
+  LocalBlockMemoryFact packedCodes;
+  LocalBlockMemoryFact activation;
   mlir::Value exponent;
   mlir::Value activationScale;
   mlir::Value init;
@@ -192,10 +201,10 @@ enum class GroupedAffineI4I8Realization {
 struct GroupedAffineI4I8Decision {
   GroupedAffineI4I8Realization realization =
       GroupedAffineI4I8Realization::RVVVLEN128GroupedDot;
-  mlir::Value packedWeightBase;
-  mlir::Value scaleMinBase;
-  mlir::Value activationBase;
-  mlir::Value activationSumBase;
+  LocalBlockMemoryFact packedWeight;
+  LocalBlockMemoryFact scaleMin;
+  LocalBlockMemoryFact activation;
+  LocalBlockMemoryFact activationSum;
   mlir::Value dotScale;
   mlir::Value minimumScale;
   mlir::Value init;
@@ -208,7 +217,7 @@ enum class QuantCodebookI8Realization {
 struct QuantCodebookI8Decision {
   QuantCodebookI8Realization realization =
       QuantCodebookI8Realization::RVVVLEN128LocalBlockDot;
-  llvm::SmallVector<mlir::Value> blockBases;
+  llvm::SmallVector<LocalBlockMemoryFact> blocks;
   llvm::SmallVector<mlir::Value> scalars;
 };
 
@@ -944,14 +953,13 @@ private:
                                              std::move(decision));
     });
     auto prepareQuantCodebookDot = [&](auto op,
-                                       llvm::ArrayRef<int64_t> extents,
                                        llvm::ArrayRef<mlir::Value> blocks,
                                        llvm::ArrayRef<mlir::Value> scalars) {
       if (decisionFailure)
         return;
       QuantCodebookI8Decision decision;
-      if (mlir::failed(decideQuantCodebookI8Dot(op, extents, blocks, scalars,
-                                               decision))) {
+      if (mlir::failed(
+              decideQuantCodebookI8Dot(op, blocks, scalars, decision))) {
         decisionFailure = true;
         return;
       }
@@ -960,28 +968,28 @@ private:
     };
     kernel.walk([&](IQ2SI8DotOp op) {
       prepareQuantCodebookDot(
-          op, {32, 8, 32, 8, 256},
+          op,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](IQ3SI8DotOp op) {
       prepareQuantCodebookDot(
-          op, {64, 8, 32, 4, 256},
+          op,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](IQ1MI8DotOp op) {
       prepareQuantCodebookDot(
-          op, {32, 16, 8, 256},
+          op,
           {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
            op.getActivation()},
           {op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](Q6KI8DotOp op) {
       prepareQuantCodebookDot(
-          op, {128, 64, 16, 256},
+          op,
           {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
@@ -4926,6 +4934,43 @@ private:
            integerConstant(axis.getOffset()) == 0;
   }
 
+  std::optional<LocalBlockMemoryFact>
+  resolveLocalBlockMemoryFact(mlir::Value semanticValue) const {
+    auto blockType = [](mlir::Type type) -> BlockType {
+      if (auto masked = mlir::dyn_cast<MaskedType>(type))
+        type = masked.getValueType();
+      return mlir::dyn_cast<BlockType>(type);
+    };
+
+    BlockType semanticType = blockType(semanticValue.getType());
+    if (!semanticType || semanticType.getShape().size() != 1 ||
+        semanticType.getShape().front() <= 0)
+      return std::nullopt;
+
+    mlir::Value storageValue = semanticValue;
+    while (auto bitcast = storageValue.getDefiningOp<BitcastOp>())
+      storageValue = bitcast.getInput();
+    LoadOp load = storageValue.getDefiningOp<LoadOp>();
+    BlockType storageType = blockType(storageValue.getType());
+    if (!load || !storageType || storageType.getShape().size() != 1 ||
+        storageType.getShape().front() <= 0 || !isTrue(load.getWhere()))
+      return std::nullopt;
+
+    auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
+    int64_t storageExtent = storageType.getShape().front();
+    if (!lane || !matchBlockAxis(lane.getOffset(), storageExtent))
+      return std::nullopt;
+
+    return LocalBlockMemoryFact{
+        semanticValue,
+        lane.getBase(),
+        semanticType,
+        storageType,
+        semanticType.getShape().front(),
+        storageExtent,
+    };
+  }
+
   mlir::Value scalarPointerBase(mlir::Value value) const {
     while (value && !mlir::isa<PtrType>(value.getType())) {
       auto pointer = value.getDefiningOp<PtrAddOp>();
@@ -5117,41 +5162,21 @@ private:
 
   mlir::LogicalResult decideSignBitI8Dot(SignBitI8DotOp op,
                                          SignBitI8Decision &decision) {
-    if (options.target.vlenBits != 128)
+    if (options.target.vlenBits < 128)
       return op.emitError(
-          "sign-bit/i8 dot requires an explicit VLEN128 target fact");
+          "sign-bit/i8 dot requires an explicit VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "sign-bit/i8 dot requires little-endian source bit order");
-    if (!op.getSignBits().hasOneUse() || !op.getActivation().hasOneUse())
+    auto signBits = resolveLocalBlockMemoryFact(op.getSignBits());
+    auto activation = resolveLocalBlockMemoryFact(op.getActivation());
+    if (!signBits || !activation)
       return op.emitError(
-          "sign-bit/i8 dot requires local single-use block operands");
-
-    LoadOp signLoad = op.getSignBits().getDefiningOp<LoadOp>();
-    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
-    LoadOp activationLoad =
-        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
-                       : LoadOp{};
-    if (!signLoad || !activationCast || !activationLoad ||
-        !isTrue(signLoad.getWhere()) || !isTrue(activationLoad.getWhere()))
-      return op.emitError(
-          "sign-bit/i8 dot requires explicit all-active block loads");
-
-    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
-      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
-      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
-        return {};
-      return lane.getBase();
-    };
-    mlir::Value signBase = blockBase(signLoad, 4);
-    mlir::Value activationBase = blockBase(activationLoad, 32);
-    if (!signBase || !activationBase)
-      return op.emitError(
-          "sign-bit/i8 dot block axes do not match its typed operands");
+          "sign-bit/i8 dot requires contiguous all-active local block memory facts");
 
     decision = SignBitI8Decision{};
-    decision.signBitsBase = signBase;
-    decision.activationBase = activationBase;
+    decision.signBits = *signBits;
+    decision.activation = *activation;
     decision.activationScale = op.getActivationScale();
     decision.signScale = op.getSignScale();
     decision.init = op.getInit();
@@ -5163,13 +5188,13 @@ private:
     if (prepared == signBitI8Decisions.end())
       return op.emitError("sign-bit/i8 physical decision was not prepared");
     const SignBitI8Decision &decision = prepared->second;
-    CValue signBits = require(decision.signBitsBase);
-    CValue activation = require(decision.activationBase);
+    CValue signBits = require(decision.signBits.base);
+    CValue activation = require(decision.activation.base);
     CValue activationScale = require(decision.activationScale);
     CValue signScale = require(decision.signScale);
     CValue init = require(decision.init);
     if (decision.realization !=
-            SignBitI8Realization::RVVVLEN128WideningSignSum ||
+            SignBitI8Realization::RVVWideningSignSum ||
         signBits.kind != CValueKind::Pointer ||
         activation.kind != CValueKind::Pointer ||
         activationScale.kind != CValueKind::Scalar ||
@@ -5213,8 +5238,8 @@ private:
          signScale.spelling + ";");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(op.getSignBits());
-    markDiscardedBlockTree(op.getActivation());
+    markDiscardedBlockTree(decision.signBits.semanticValue);
+    markDiscardedBlockTree(decision.activation.semanticValue);
     return mlir::success();
   }
 
@@ -5226,35 +5251,15 @@ private:
     if (!options.target.littleEndian)
       return op.emitError(
           "E2M1/E8M0 i8 dot requires little-endian packed nibbles");
-    if (!op.getPackedCodes().hasOneUse() || !op.getActivation().hasOneUse())
+    auto packedCodes = resolveLocalBlockMemoryFact(op.getPackedCodes());
+    auto activation = resolveLocalBlockMemoryFact(op.getActivation());
+    if (!packedCodes || !activation)
       return op.emitError(
-          "E2M1/E8M0 i8 dot requires local single-use block operands");
-
-    LoadOp packedLoad = op.getPackedCodes().getDefiningOp<LoadOp>();
-    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
-    LoadOp activationLoad =
-        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
-                       : LoadOp{};
-    if (!packedLoad || !activationCast || !activationLoad ||
-        !isTrue(packedLoad.getWhere()) || !isTrue(activationLoad.getWhere()))
-      return op.emitError(
-          "E2M1/E8M0 i8 dot requires explicit all-active block loads");
-
-    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
-      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
-      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
-        return {};
-      return lane.getBase();
-    };
-    mlir::Value packedBase = blockBase(packedLoad, 16);
-    mlir::Value activationBase = blockBase(activationLoad, 32);
-    if (!packedBase || !activationBase)
-      return op.emitError(
-          "E2M1/E8M0 i8 dot block axes do not match its typed operands");
+          "E2M1/E8M0 i8 dot requires contiguous all-active local block memory facts");
 
     decision = E2M1E8M0I8Decision{};
-    decision.packedCodesBase = packedBase;
-    decision.activationBase = activationBase;
+    decision.packedCodes = *packedCodes;
+    decision.activation = *activation;
     decision.exponent = op.getExponent();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
@@ -5266,8 +5271,8 @@ private:
     if (selected == e2m1E8M0I8Decisions.end())
       return op.emitError("E2M1/E8M0 physical decision was not prepared");
     const E2M1E8M0I8Decision &decision = selected->second;
-    CValue packed = require(decision.packedCodesBase);
-    CValue activation = require(decision.activationBase);
+    CValue packed = require(decision.packedCodes.base);
+    CValue activation = require(decision.activation.base);
     CValue exponent = require(decision.exponent);
     CValue activationScale = require(decision.activationScale);
     CValue init = require(decision.init);
@@ -5326,8 +5331,8 @@ private:
          activationScale.spelling + ";");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(op.getPackedCodes());
-    markDiscardedBlockTree(op.getActivation());
+    markDiscardedBlockTree(decision.packedCodes.semanticValue);
+    markDiscardedBlockTree(decision.activation.semanticValue);
     return mlir::success();
   }
 
@@ -5339,45 +5344,20 @@ private:
     if (!options.target.littleEndian)
       return op.emitError(
           "grouped affine i4/i8 dot requires the source-declared little-endian fields");
-    if (!op.getPackedWeight().hasOneUse() || !op.getScaleMin().hasOneUse() ||
-        !op.getActivation().hasOneUse() ||
-        !op.getActivationSumBytes().hasOneUse())
+    auto packedWeight = resolveLocalBlockMemoryFact(op.getPackedWeight());
+    auto scaleMin = resolveLocalBlockMemoryFact(op.getScaleMin());
+    auto activation = resolveLocalBlockMemoryFact(op.getActivation());
+    auto activationSum =
+        resolveLocalBlockMemoryFact(op.getActivationSumBytes());
+    if (!packedWeight || !scaleMin || !activation || !activationSum)
       return op.emitError(
-          "grouped affine i4/i8 dot requires local single-use block operands");
-
-    LoadOp packedLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
-    LoadOp scaleLoad = op.getScaleMin().getDefiningOp<LoadOp>();
-    auto activationCast = op.getActivation().getDefiningOp<BitcastOp>();
-    LoadOp activationLoad =
-        activationCast ? activationCast.getInput().getDefiningOp<LoadOp>()
-                       : LoadOp{};
-    LoadOp sumLoad = op.getActivationSumBytes().getDefiningOp<LoadOp>();
-    if (!packedLoad || !scaleLoad || !activationCast || !activationLoad ||
-        !sumLoad || !isTrue(packedLoad.getWhere()) ||
-        !isTrue(scaleLoad.getWhere()) || !isTrue(activationLoad.getWhere()) ||
-        !isTrue(sumLoad.getWhere()))
-      return op.emitError(
-          "grouped affine i4/i8 dot requires explicit all-active block loads");
-
-    auto blockBase = [&](LoadOp load, int64_t extent) -> mlir::Value {
-      auto lane = load.getPointer().getDefiningOp<PtrAddOp>();
-      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
-        return {};
-      return lane.getBase();
-    };
-    mlir::Value packedBase = blockBase(packedLoad, 128);
-    mlir::Value scaleBase = blockBase(scaleLoad, 12);
-    mlir::Value activationBase = blockBase(activationLoad, 256);
-    mlir::Value sumBase = blockBase(sumLoad, 32);
-    if (!packedBase || !scaleBase || !activationBase || !sumBase)
-      return op.emitError(
-          "grouped affine i4/i8 dot block axes do not match its typed operands");
+          "grouped affine i4/i8 dot requires contiguous all-active local block memory facts");
 
     decision = GroupedAffineI4I8Decision{};
-    decision.packedWeightBase = packedBase;
-    decision.scaleMinBase = scaleBase;
-    decision.activationBase = activationBase;
-    decision.activationSumBase = sumBase;
+    decision.packedWeight = *packedWeight;
+    decision.scaleMin = *scaleMin;
+    decision.activation = *activation;
+    decision.activationSum = *activationSum;
     decision.dotScale = op.getDotScale();
     decision.minimumScale = op.getMinimumScale();
     decision.init = op.getInit();
@@ -5390,10 +5370,10 @@ private:
       return op.emitError("grouped affine i4/i8 physical decision was not prepared");
     const GroupedAffineI4I8Decision &decision = selected->second;
 
-    CValue packed = require(decision.packedWeightBase);
-    CValue scales = require(decision.scaleMinBase);
-    CValue activation = require(decision.activationBase);
-    CValue sums = require(decision.activationSumBase);
+    CValue packed = require(decision.packedWeight.base);
+    CValue scales = require(decision.scaleMin.base);
+    CValue activation = require(decision.activation.base);
+    CValue sums = require(decision.activationSum.base);
     CValue dotScale = require(decision.dotScale);
     CValue minimumScale = require(decision.minimumScale);
     CValue init = require(decision.init);
@@ -5418,17 +5398,17 @@ private:
          init.spelling + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(op.getPackedWeight());
-    markDiscardedBlockTree(op.getScaleMin());
-    markDiscardedBlockTree(op.getActivation());
-    markDiscardedBlockTree(op.getActivationSumBytes());
+    markDiscardedBlockTree(decision.packedWeight.semanticValue);
+    markDiscardedBlockTree(decision.scaleMin.semanticValue);
+    markDiscardedBlockTree(decision.activation.semanticValue);
+    markDiscardedBlockTree(decision.activationSum.semanticValue);
     return mlir::success();
   }
 
   template <typename OpTy>
   mlir::LogicalResult decideQuantCodebookI8Dot(
-      OpTy op, llvm::ArrayRef<int64_t> extents,
-      llvm::ArrayRef<mlir::Value> blocks, llvm::ArrayRef<mlir::Value> scalars,
+      OpTy op, llvm::ArrayRef<mlir::Value> blocks,
+      llvm::ArrayRef<mlir::Value> scalars,
       QuantCodebookI8Decision &decision) {
     if (options.target.vlenBits != 128)
       return op.emitError(
@@ -5436,27 +5416,13 @@ private:
     if (!options.target.littleEndian)
       return op.emitError(
           "quant codebook/i8 dot requires little-endian packed fields");
-    if (extents.size() != blocks.size())
-      return op.emitError("quant codebook/i8 typed block facts are incomplete");
-
     decision = QuantCodebookI8Decision{};
-    for (auto [block, extent] : llvm::zip(blocks, extents)) {
-      if (!block.hasOneUse())
+    for (mlir::Value block : blocks) {
+      auto fact = resolveLocalBlockMemoryFact(block);
+      if (!fact)
         return op.emitError(
-            "quant codebook/i8 dot requires local single-use block operands");
-      LoadOp load;
-      if (auto cast = block.template getDefiningOp<BitcastOp>())
-        load = cast.getInput().template getDefiningOp<LoadOp>();
-      else
-        load = block.template getDefiningOp<LoadOp>();
-      if (!load || !isTrue(load.getWhere()))
-        return op.emitError(
-            "quant codebook/i8 dot requires explicit all-active block loads");
-      auto lane = load.getPointer().template getDefiningOp<PtrAddOp>();
-      if (!lane || !matchBlockAxis(lane.getOffset(), extent))
-        return op.emitError(
-            "quant codebook/i8 dot block axes do not match typed operands");
-      decision.blockBases.push_back(lane.getBase());
+            "quant codebook/i8 dot requires contiguous all-active local block memory facts");
+      decision.blocks.push_back(*fact);
     }
     decision.scalars.append(scalars.begin(), scalars.end());
     return mlir::success();
@@ -5474,8 +5440,8 @@ private:
         QuantCodebookI8Realization::RVVVLEN128LocalBlockDot)
       return op.emitError("quant codebook/i8 realization is unavailable");
     llvm::SmallVector<CValue> operands;
-    for (mlir::Value base : decision.blockBases) {
-      CValue value = require(base);
+    for (const LocalBlockMemoryFact &block : decision.blocks) {
+      CValue value = require(block.base);
       if (value.kind != CValueKind::Pointer || value.spelling.empty())
         return op.emitError(
             "quant codebook/i8 block base was not materialized");
@@ -5496,9 +5462,8 @@ private:
          llvm::join(spellings, ", ") + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    for (mlir::Value block : op->getOperands())
-      if (containsBlockType(block.getType()))
-        markDiscardedBlockTree(block);
+    for (const LocalBlockMemoryFact &block : decision.blocks)
+      markDiscardedBlockTree(block.semanticValue);
     return mlir::success();
   }
 
