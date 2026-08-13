@@ -143,13 +143,13 @@ struct BlockReduceGroupDecision {
   BlockReducePhysicalDecision physical;
 };
 
-enum class SymmetricI4I8Realization {
+enum class I4I8FragmentRealization {
+  RVVN16K32,
   SpacemiTIME1N16K32,
 };
 
 struct SymmetricI4I8Decision {
-  SymmetricI4I8Realization realization =
-      SymmetricI4I8Realization::SpacemiTIME1N16K32;
+  I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   mlir::Value activationBlockBase;
   mlir::Value packedBlockBase;
   mlir::Value activation;
@@ -480,6 +480,7 @@ std::string rvvFloatType(const RVVVectorConfig &config) {
 
 struct AffineI4I8Decision {
   mlir::Operation *operation = nullptr;
+  I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   mlir::Value activationBlockBase;
   mlir::Value packedBlockBase;
   mlir::Value activation;
@@ -5078,12 +5079,13 @@ private:
 
   mlir::LogicalResult decideSymmetricI4I8Contract(
       SymmetricI4I8ContractOp op, SymmetricI4I8Decision &decision) {
-    if (options.target.matrixExtension != "spacemit-ime1")
-      return op.emitError(
-          "symmetric i4/i8 contraction requires --matrix-extension=spacemit-ime1");
-    if (options.target.vlenBits != 256)
+    bool useIME1 = options.target.matrixExtension == "spacemit-ime1";
+    if (useIME1 && options.target.vlenBits != 256)
       return op.emitError(
           "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+    if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
+      return op.emitError(
+          "symmetric i4/i8 RVV contraction requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "symmetric i4/i8 contraction requires little-endian packed fields");
@@ -5157,6 +5159,9 @@ private:
           "IME1 symmetric contraction requires a local sixteen-byte packed axis");
 
     decision = SymmetricI4I8Decision{};
+    decision.realization = useIME1
+                               ? I4I8FragmentRealization::SpacemiTIME1N16K32
+                               : I4I8FragmentRealization::RVVN16K32;
     decision.activationBlockBase = activationLane.getBase();
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
@@ -5178,9 +5183,7 @@ private:
     CValue packed = require(decision.packedBlockBase);
     CValue scale = require(decision.activationScale);
     CValue accumulator = require(decision.init);
-    if (decision.realization !=
-            SymmetricI4I8Realization::SpacemiTIME1N16K32 ||
-        decision.packedBlockBytes != 288 ||
+    if (decision.packedBlockBytes != 288 ||
         activation.kind != CValueKind::Pointer ||
         packed.kind != CValueKind::Pointer || scale.kind != CValueKind::Scalar ||
         accumulator.kind != CValueKind::F32BlockStorage ||
@@ -5188,7 +5191,11 @@ private:
         scale.spelling.empty() || accumulator.spelling.empty())
       return op.emitError(
           "selected IME1 symmetric contraction operands are unavailable");
-    line("__weft_ime1_symmetric_i4_i8_n16_k32(" + scale.spelling + ", " +
+    llvm::StringRef helper =
+        decision.realization == I4I8FragmentRealization::SpacemiTIME1N16K32
+            ? "__weft_ime1_symmetric_i4_i8_n16_k32"
+            : "__weft_rvv_symmetric_i4_i8_n16_k32";
+    line(helper.str() + "(" + scale.spelling + ", " +
          activation.spelling + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
     for (mlir::Value operand :
@@ -5599,12 +5606,13 @@ private:
 
   mlir::LogicalResult decideAffineI4I8Contract(
       AffineI4I8ContractOp op, AffineI4I8Decision &decision) {
-    if (options.target.matrixExtension != "spacemit-ime1")
-      return op.emitError(
-          "affine i4/i8 contraction requires --matrix-extension=spacemit-ime1");
-    if (options.target.vlenBits != 256)
+    bool useIME1 = options.target.matrixExtension == "spacemit-ime1";
+    if (useIME1 && options.target.vlenBits != 256)
       return op.emitError(
           "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+    if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
+      return op.emitError(
+          "affine i4/i8 RVV contraction requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "affine i4/i8 contraction requires little-endian packed fields");
@@ -5693,6 +5701,9 @@ private:
 
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
+    decision.realization = useIME1
+                               ? I4I8FragmentRealization::SpacemiTIME1N16K32
+                               : I4I8FragmentRealization::RVVN16K32;
     decision.activationBlockBase = activationLane.getBase();
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
@@ -5722,7 +5733,11 @@ private:
         scale.spelling.empty() || accumulator.spelling.empty())
       return op.emitError(
           "selected IME1 affine contraction operands are unavailable");
-    line("__weft_ime1_affine_i4_i8_n16_k32(" + scale.spelling + ", " +
+    llvm::StringRef helper =
+        decision.realization == I4I8FragmentRealization::SpacemiTIME1N16K32
+            ? "__weft_ime1_affine_i4_i8_n16_k32"
+            : "__weft_rvv_affine_i4_i8_n16_k32";
+    line(helper.str() + "(" + scale.spelling + ", " +
          activation.spelling + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
     for (mlir::Value operand :
@@ -7715,9 +7730,9 @@ private:
   }
 };
 
-void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesIME1,
-                 bool usesGroupedI4I8, bool usesE2M1E8M0I8,
-                 bool usesQuantCodebookI8) {
+void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesRVVI4I8,
+                 bool usesIME1, bool usesGroupedI4I8,
+                 bool usesE2M1E8M0I8, bool usesQuantCodebookI8) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -7755,6 +7770,81 @@ static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits
 }
 
 )c";
+  if (usesRVVI4I8) {
+    output << R"c(static inline __attribute__((always_inline, unused)) int32_t
+__weft_rvv_i8_dot_32(const int8_t *lhs, const int8_t *rhs) {
+  int32_t sum = 0;
+  for (size_t offset = 0; offset < 32;) {
+    const size_t vl = __riscv_vsetvl_e8m2(32 - offset);
+    const vint8m2_t lhs_vector = __riscv_vle8_v_i8m2(lhs + offset, vl);
+    const vint8m2_t rhs_vector = __riscv_vle8_v_i8m2(rhs + offset, vl);
+    const vint16m4_t product =
+        __riscv_vwmul_vv_i16m4(lhs_vector, rhs_vector, vl);
+    const vint32m1_t seed = __riscv_vmv_v_x_i32m1(0, 1);
+    const vint32m1_t reduced =
+        __riscv_vwredsum_vs_i16m4_i32m1(product, seed, vl);
+    sum += __riscv_vmv_x_s_i32m1_i32(reduced);
+    offset += vl;
+  }
+  return sum;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_rvv_local_f16(const uint8_t *bytes) {
+  const uint16_t bits =
+      (uint16_t)bytes[0] | ((uint16_t)bytes[1] << UINT16_C(8));
+  return (float)__weft_bitcast_u16_f16(bits);
+}
+
+static inline __attribute__((always_inline, unused)) void
+__weft_rvv_symmetric_i4_i8_n16_k32(
+    float activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
+  int8_t decoded[32];
+  for (size_t column = 0; column < 16; ++column) {
+    for (size_t half = 0; half < 2; ++half) {
+      for (size_t lane = 0; lane < 8; ++lane) {
+        const uint8_t packed =
+            packed_weight[32 + half * 128 + column * 8 + lane];
+        decoded[half * 16 + lane] = (int8_t)(packed & UINT8_C(15)) - 8;
+        decoded[half * 16 + lane + 8] = (int8_t)(packed >> 4) - 8;
+      }
+    }
+    const float weight_scale =
+        __weft_rvv_local_f16(packed_weight + column * 2);
+    accumulator[column] +=
+        (float)__weft_rvv_i8_dot_32(decoded, activation_code) *
+        activation_scale * weight_scale;
+  }
+}
+
+static inline __attribute__((always_inline, unused)) void
+__weft_rvv_affine_i4_i8_n16_k32(
+    float activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
+  int8_t decoded[32];
+  for (size_t column = 0; column < 16; ++column) {
+    const int8_t zero_point = (int8_t)packed_weight[32 + column];
+    for (size_t half = 0; half < 2; ++half) {
+      for (size_t lane = 0; lane < 8; ++lane) {
+        const uint8_t packed =
+            packed_weight[48 + half * 128 + column * 8 + lane];
+        decoded[half * 16 + lane] =
+            (int8_t)(packed & UINT8_C(15)) - zero_point;
+        decoded[half * 16 + lane + 8] =
+            (int8_t)(packed >> 4) - zero_point;
+      }
+    }
+    const float weight_scale =
+        __weft_rvv_local_f16(packed_weight + column * 2);
+    accumulator[column] +=
+        (float)__weft_rvv_i8_dot_32(decoded, activation_code) *
+        activation_scale * weight_scale;
+  }
+}
+
+)c";
+  }
   if (usesE2M1E8M0I8) {
     output << R"c(static const int8_t __attribute__((unused))
 __weft_e2m1_doubled[16] = {
@@ -8616,20 +8706,23 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
     return module.emitError(
         "the intrinsic C target requires RVV; no fallback backend is installed");
   bool usesExp = false;
-  bool usesIME1 = false;
+  bool usesLocalI4I8 = false;
   bool usesGroupedI4I8 = false;
   bool usesE2M1E8M0I8 = false;
   bool usesQuantCodebookI8 = false;
   module.walk([&](UnaryOp op) { usesExp |= op.getKind() == "exp"; });
-  module.walk([&](AffineI4I8ContractOp) { usesIME1 = true; });
-  module.walk([&](SymmetricI4I8ContractOp) { usesIME1 = true; });
+  module.walk([&](AffineI4I8ContractOp) { usesLocalI4I8 = true; });
+  module.walk([&](SymmetricI4I8ContractOp) { usesLocalI4I8 = true; });
   module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
   module.walk([&](E2M1E8M0I8DotOp) { usesE2M1E8M0I8 = true; });
   module.walk([&](IQ2SI8DotOp) { usesQuantCodebookI8 = true; });
   module.walk([&](IQ3SI8DotOp) { usesQuantCodebookI8 = true; });
   module.walk([&](IQ1MI8DotOp) { usesQuantCodebookI8 = true; });
   module.walk([&](Q6KI8DotOp) { usesQuantCodebookI8 = true; });
-  emitPrelude(output, usesExp, usesIME1, usesGroupedI4I8,
+  bool usesIME1 =
+      usesLocalI4I8 && options.target.matrixExtension == "spacemit-ime1";
+  bool usesRVVI4I8 = usesLocalI4I8 && !usesIME1;
+  emitPrelude(output, usesExp, usesRVVI4I8, usesIME1, usesGroupedI4I8,
               usesE2M1E8M0I8, usesQuantCodebookI8);
 
   llvm::SmallVector<KernelOp> kernels;
