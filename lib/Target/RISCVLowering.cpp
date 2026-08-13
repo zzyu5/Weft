@@ -2777,7 +2777,11 @@ private:
       return mlir::success();
     };
 
-    line("if (" + condition.spelling + ") {");
+    std::string cCondition = condition.spelling;
+    if (!llvm::StringRef(cCondition).starts_with("(") ||
+        !llvm::StringRef(cCondition).ends_with(")"))
+      cCondition = "(" + cCondition + ")";
+    line("if " + cCondition + " {");
     ++indent;
     if (mlir::failed(emitBranch(op.getThenRegion())))
       return mlir::failure();
