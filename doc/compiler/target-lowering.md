@@ -68,7 +68,7 @@ state、primitive和pipeline footprint。当前没有显式pipeline语义的实�
 没有显式prefetch primitive时选择零prefetch-distance，存在该primitive时只记录它授权的局部
 handoff，不能被解释成编译器发明了staging。这个plan只存在于一次lowering调用中，不是新IR。
 
-这些decision不进入Kernel IR。每个decision由对应canonical primitive/contract的唯一owner
+这些decision不进入Kernel IR。每个decision由对应canonical primitive的唯一owner
 产生。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape和fragment；后续store、
 cast或leaf不能再根据use count、周围op数量或完整kernel source重新选择一次。
 
@@ -118,7 +118,7 @@ staging、ABI、logical predicate、state algebra或observable numerical mode。
 不变且legality成立时，可以改变物理loop形态，执行strip-mining、unroll、interchange、
 software pipeline与primitive-local fusion。
 
-这里的strip-mining只适用于source已经显式授权的VLA logical axis，或contract-local
+这里的strip-mining只适用于source已经显式授权的VLA logical axis，或dot/matmul-local
 realization中的局部轴；普通canonical `for` / `while`不得因此被改写成新的VLA axis。
 
 ## 新语义与新硬件
@@ -159,11 +159,19 @@ shape也已移出emitter，成为entity-owned physical decision；block emitter�
 vector shape。
 
 Local F32 dot/matmul根据block/VLA axis、typed operand、pointer/access与predicate projection形成
-resource model，再从局部candidate中选择LMUL；当前local-row候选会随row extent选择LMUL4/2/1，
+resource model，再结合target寄存器数、显式config与resource headroom从局部candidate中选择LMUL；
+当前local-row候选包含随row extent变化的LMUL4/2/1，
 VLA free-axis候选也共用同一selector。LMUL与K-unroll只物化在entity plan中，typed primitive
 payload不保存第二份选择；当前合法K-unroll winner仍为1。multi-axis
 microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是
 开放注册表或通用搜索承诺。
+
+Dot的physical owner是`weft_kernel.dot`本身；当前store只是已知的downstream handoff，不再拥有
+dot decision；store到dot的索引只把output handoff路由到已经选定的dot decision。VLA内dot仍与
+enclosing VLA entity联合选择LMUL/resource，但canonical授权anchor和物理decision identity保持
+在dot上。Core verifier、extension verifier与target复用同一组logical value/validity queries；
+core dot/matmul按自身语义处理masked operand，而未定义validity语义的extension primitive必须要求
+作者先显式`fill`。
 
 当前仍有一个精确的局部VLA fusion envelope：F16 widening dot将显式load/cast/multiply/reduce
 闭包实现为widening MAC。Online-softmax summary只拥有自身typed state，后续normalize VLA由

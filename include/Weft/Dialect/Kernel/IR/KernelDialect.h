@@ -20,6 +20,19 @@
 
 namespace weft::kernel {
 
+enum class LogicalShapeKind { Scalar, Block, Region };
+
+/// Shared canonical value queries used by the core dialect, linked extension
+/// dialects, and target realizers. Extension primitives are not a second value
+/// system: they consume the same scalar/block/region values and validity.
+mlir::Type unwrapLogicalValidity(mlir::Type type);
+mlir::Type logicalElementType(mlir::Type type);
+llvm::ArrayRef<int64_t> logicalShape(mlir::Type type);
+LogicalShapeKind logicalShapeKind(mlir::Type type);
+bool isLogicalValue(mlir::Type type);
+bool hasLogicalValidity(mlir::Type type);
+bool isLogicalPredicate(mlir::Type type);
+
 /// Recompute logical extent identity from canonical SSA producers. This is an
 /// analysis query, not a persisted shape schema.
 bool haveSameLogicalExtent(mlir::Value lhs, int64_t lhsAxis, mlir::Value rhs,

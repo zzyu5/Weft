@@ -40,20 +40,20 @@ llvm::cl::list<std::string> metaBindings(
 llvm::cl::opt<int64_t> vlaLMUL(
     "vla-lmul", llvm::cl::desc("Requested VLA data LMUL; zero selects"),
     llvm::cl::init(0));
-llvm::cl::opt<int64_t> contractLMUL(
-    "contract-lmul", llvm::cl::desc("Requested contract LMUL; zero selects"),
+llvm::cl::opt<int64_t> dotLMUL(
+    "dot-lmul", llvm::cl::desc("Requested dot LMUL; zero selects"),
     llvm::cl::init(0));
-llvm::cl::opt<int64_t> contractKUnroll(
-    "contract-k-unroll",
-    llvm::cl::desc("Requested contract K unroll; zero selects"),
+llvm::cl::opt<int64_t> dotKUnroll(
+    "dot-k-unroll",
+    llvm::cl::desc("Requested dot K unroll; zero selects"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> f16InputLMUL(
     "f16-input-lmul",
-    llvm::cl::desc("Requested F16 contraction input LMUL; zero selects"),
+    llvm::cl::desc("Requested F16 matmul input LMUL; zero selects"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> f16RowMicrotile(
     "f16-row-microtile",
-    llvm::cl::desc("Requested F16 contraction row microtile; zero selects"),
+    llvm::cl::desc("Requested F16 matmul row microtile; zero selects"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
@@ -128,8 +128,8 @@ int main(int argc, char **argv) {
     }
     options.target.matrixExtension = matrixExtension;
     options.backend.vlaLMUL = vlaLMUL;
-    options.backend.contractLMUL = contractLMUL;
-    options.backend.contractKUnroll = contractKUnroll;
+    options.backend.dotLMUL = dotLMUL;
+    options.backend.dotKUnroll = dotKUnroll;
     options.backend.f16InputLMUL = f16InputLMUL;
     options.backend.f16RowMicrotile = f16RowMicrotile;
     options.backend.narrowLMUL = narrowLMUL;

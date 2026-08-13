@@ -86,6 +86,19 @@ Blocking、staging、persistent packing、outer traversal和算法variant只由s
 无法合法生成时直接报unsupported；不存在 legacy、GGML 或旧 emitter fallback。普通 scalar
 control的 C lowering是正式 realization，不是 fallback。
 
+Realizer读取的统一事实分为四类：
+
+```text
+domain facts       lexical scalar/VLA scope, logical axes and extents
+value facts        shape kind, element type, validity and local use-def
+effect facts       pointer relation, predicate, read/write/atomic order and alias assertions
+primitive facts    explicit state/product/decode/extension semantics and numerical policy
+```
+
+它输出的统一瞬态决定是value/register shape、memory/handoff、primitive realization、loop-local
+schedule与resource budget。VLA、dot/matmul、state、quant和IME只是不同semantic anchor对同一
+physical entity model施加不同legality与resource约束，不建立各自的kernel model。
+
 每个physical decision只有一个producer。Analysis/selection可以读取typed operands、axis、
 effect、局部use relation和target facts来产生该decision；intrinsic-C/asm emitter只读取它，
 不得再按use-count、相邻op数量或完整kernel source重新选择物理形态。

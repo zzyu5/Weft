@@ -64,6 +64,18 @@ Weft 不负责：
 
 ## 根程序模型
 
+### 一个 kernel、一种组合规则
+
+Weft kernel不是scalar、VLA、block、state与extension几种kernel的并集。它只有一个根模型：
+作者写下一个由普通region、typed SSA value、显式memory effect和局部semantic primitive组成的
+worker-local程序。Scalar control与VLA决定logical execution domain；scalar、block与region只是
+同一value system中的shape kind；load/store、state algebra、dot/matmul和extension primitive都
+消费这些value，并服从同一extent、validity、use-def与effect规则。
+
+这些构造彼此正交：一个ordered loop可以包含VLA，一个VLA可以产生block-bearing region value，
+一个dot可以位于其中，dot两侧也可以来自indexed memory；sequential state update可以在相邻处
+使用reduce。出现组合不产生新的kernel类别，也不授权target接管外围结构。
+
 ### Worker-local kernel
 
 一个 Weft kernel 是一个普通可调用函数。它接收显式 pointer / scalar / descriptor 参数，并在当前 worker 上完成一段工作。

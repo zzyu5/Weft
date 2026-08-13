@@ -10,18 +10,62 @@ using namespace weft::extension;
 #define GET_OP_CLASSES
 #include "Weft/Dialect/Extension/IR/ExtensionOps.cpp.inc"
 
+namespace {
+mlir::LogicalResult requireUnmaskedLocalValue(mlir::Operation *op,
+                                               mlir::Value value,
+                                               llvm::StringRef name) {
+  if (!weft::kernel::isLogicalValue(value.getType()))
+    return op->emitError() << name << " must be a canonical logical value";
+  if (weft::kernel::hasLogicalValidity(value.getType()))
+    return op->emitError()
+           << name
+           << " carries logical validity; fill it before this extension primitive";
+  return mlir::success();
+}
+
+weft::kernel::BlockType localBlock(mlir::Operation *op, mlir::Value value,
+                                   llvm::StringRef name) {
+  if (mlir::failed(requireUnmaskedLocalValue(op, value, name)))
+    return {};
+  return mlir::dyn_cast<weft::kernel::BlockType>(
+      weft::kernel::unwrapLogicalValidity(value.getType()));
+}
+
+mlir::LogicalResult requireScalar(mlir::Operation *op, mlir::Value value,
+                                  mlir::Type expected,
+                                  llvm::StringRef name) {
+  if (mlir::failed(requireUnmaskedLocalValue(op, value, name)))
+    return mlir::failure();
+  if (weft::kernel::logicalShapeKind(value.getType()) !=
+          weft::kernel::LogicalShapeKind::Scalar ||
+      weft::kernel::logicalElementType(value.getType()) != expected)
+    return op->emitError() << name << " must be scalar " << expected;
+  return mlir::success();
+}
+
+mlir::LogicalResult verifyScalarDotResult(mlir::Operation *op,
+                                          mlir::Value init,
+                                          mlir::Value result) {
+  mlir::Type f32 = mlir::Float32Type::get(op->getContext());
+  if (mlir::failed(requireScalar(op, init, f32, "init")) ||
+      mlir::failed(requireScalar(op, result, f32, "result")))
+    return mlir::failure();
+  if (init.getType() != result.getType())
+    return op->emitError("init and result must be scalar f32");
+  if (!op->getParentOfType<weft::kernel::KernelOp>())
+    return op->emitError("must be nested in a canonical Weft kernel");
+  return mlir::success();
+}
+} // namespace
+
 mlir::LogicalResult AffineI4I8ContractOp::verify() {
-  auto blockType = [](mlir::Type type) {
-    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-      type = masked.getValueType();
-    return mlir::dyn_cast<weft::kernel::BlockType>(type);
-  };
-  auto activation = blockType(getActivation().getType());
-  auto packedWeight = blockType(getPackedWeight().getType());
-  auto weightScale = blockType(getWeightScale().getType());
-  auto weightZeroPoint = blockType(getWeightZeroPoint().getType());
-  auto init = blockType(getInit().getType());
-  auto result = blockType(getResult().getType());
+  auto activation = localBlock(*this, getActivation(), "activation");
+  auto packedWeight = localBlock(*this, getPackedWeight(), "packed_weight");
+  auto weightScale = localBlock(*this, getWeightScale(), "weight_scale");
+  auto weightZeroPoint =
+      localBlock(*this, getWeightZeroPoint(), "weight_zero_point");
+  auto init = localBlock(*this, getInit(), "init");
+  auto result = localBlock(*this, getResult(), "result");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
@@ -29,7 +73,9 @@ mlir::LogicalResult AffineI4I8ContractOp::verify() {
       packedWeight.getShape() != llvm::ArrayRef<int64_t>({16, 16}) ||
       !packedWeight.getElementType().isUnsignedInteger(8))
     return emitOpError("packed_weight must be a u8 block<16x16>");
-  if (!getActivationScale().getType().isF32())
+  if (mlir::failed(requireScalar(*this, getActivationScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
   if (!weightScale ||
       weightScale.getShape() != llvm::ArrayRef<int64_t>({16}) ||
@@ -49,16 +95,11 @@ mlir::LogicalResult AffineI4I8ContractOp::verify() {
 }
 
 mlir::LogicalResult SymmetricI4I8ContractOp::verify() {
-  auto blockType = [](mlir::Type type) {
-    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-      type = masked.getValueType();
-    return mlir::dyn_cast<weft::kernel::BlockType>(type);
-  };
-  auto activation = blockType(getActivation().getType());
-  auto packedWeight = blockType(getPackedWeight().getType());
-  auto weightScale = blockType(getWeightScale().getType());
-  auto init = blockType(getInit().getType());
-  auto result = blockType(getResult().getType());
+  auto activation = localBlock(*this, getActivation(), "activation");
+  auto packedWeight = localBlock(*this, getPackedWeight(), "packed_weight");
+  auto weightScale = localBlock(*this, getWeightScale(), "weight_scale");
+  auto init = localBlock(*this, getInit(), "init");
+  auto result = localBlock(*this, getResult(), "result");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
@@ -66,7 +107,9 @@ mlir::LogicalResult SymmetricI4I8ContractOp::verify() {
       packedWeight.getShape() != llvm::ArrayRef<int64_t>({16, 16}) ||
       !packedWeight.getElementType().isUnsignedInteger(8))
     return emitOpError("packed_weight must be a u8 block<16x16>");
-  if (!getActivationScale().getType().isF32())
+  if (mlir::failed(requireScalar(*this, getActivationScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
   if (!weightScale ||
       weightScale.getShape() != llvm::ArrayRef<int64_t>({16}) ||
@@ -82,15 +125,11 @@ mlir::LogicalResult SymmetricI4I8ContractOp::verify() {
 }
 
 mlir::LogicalResult GroupedAffineI4I8DotOp::verify() {
-  auto blockType = [](mlir::Type type) {
-    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-      type = masked.getValueType();
-    return mlir::dyn_cast<weft::kernel::BlockType>(type);
-  };
-  auto packedWeight = blockType(getPackedWeight().getType());
-  auto scaleMin = blockType(getScaleMin().getType());
-  auto activation = blockType(getActivation().getType());
-  auto activationSums = blockType(getActivationSumBytes().getType());
+  auto packedWeight = localBlock(*this, getPackedWeight(), "packed_weight");
+  auto scaleMin = localBlock(*this, getScaleMin(), "scale_min");
+  auto activation = localBlock(*this, getActivation(), "activation");
+  auto activationSums =
+      localBlock(*this, getActivationSumBytes(), "activation_sum_bytes");
   if (!packedWeight ||
       packedWeight.getShape() != llvm::ArrayRef<int64_t>({128}) ||
       !packedWeight.getElementType().isUnsignedInteger(8))
@@ -106,76 +145,60 @@ mlir::LogicalResult GroupedAffineI4I8DotOp::verify() {
       activationSums.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activationSums.getElementType().isUnsignedInteger(8))
     return emitOpError("activation_sum_bytes must be a u8 block<32>");
-  if (!getDotScale().getType().isF32() ||
-      !getMinimumScale().getType().isF32())
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getDotScale(), f32, "dot_scale")) ||
+      mlir::failed(requireScalar(*this, getMinimumScale(), f32,
+                                 "minimum_scale")))
     return emitOpError("dot_scale and minimum_scale must be scalar f32");
-  if (!getInit().getType().isF32() ||
-      getInit().getType() != getResult().getType())
-    return emitOpError("init and result must be scalar f32");
-  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
-    return emitOpError("must be nested in a canonical Weft kernel");
-  return mlir::success();
+  return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
 mlir::LogicalResult SignBitI8DotOp::verify() {
-  auto blockType = [](mlir::Type type) {
-    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-      type = masked.getValueType();
-    return mlir::dyn_cast<weft::kernel::BlockType>(type);
-  };
-  auto signBits = blockType(getSignBits().getType());
-  auto activation = blockType(getActivation().getType());
+  auto signBits = localBlock(*this, getSignBits(), "sign_bits");
+  auto activation = localBlock(*this, getActivation(), "activation");
   if (!signBits || signBits.getShape() != llvm::ArrayRef<int64_t>({4}) ||
       !signBits.getElementType().isUnsignedInteger(8))
     return emitOpError("sign_bits must be a u8 block<4>");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
-  if (!getActivationScale().getType().isF32() ||
-      !getSignScale().getType().isF32())
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")) ||
+      mlir::failed(requireScalar(*this, getSignScale(), f32, "sign_scale")))
     return emitOpError("activation_scale and sign_scale must be scalar f32");
-  if (!getInit().getType().isF32() ||
-      getInit().getType() != getResult().getType())
-    return emitOpError("init and result must be scalar f32");
-  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
-    return emitOpError("must be nested in a canonical Weft kernel");
-  return mlir::success();
+  return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
 mlir::LogicalResult E2M1E8M0I8DotOp::verify() {
-  auto blockType = [](mlir::Type type) {
-    if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-      type = masked.getValueType();
-    return mlir::dyn_cast<weft::kernel::BlockType>(type);
-  };
-  auto packedCodes = blockType(getPackedCodes().getType());
-  auto activation = blockType(getActivation().getType());
+  auto packedCodes = localBlock(*this, getPackedCodes(), "packed_codes");
+  auto activation = localBlock(*this, getActivation(), "activation");
   if (!packedCodes ||
       packedCodes.getShape() != llvm::ArrayRef<int64_t>({16}) ||
       !packedCodes.getElementType().isUnsignedInteger(8))
     return emitOpError("packed_codes must be a u8 block<16>");
-  if (!getExponent().getType().isUnsignedInteger(8))
+  if (mlir::failed(requireScalar(*this, getExponent(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 8,
+                                     mlir::IntegerType::Unsigned),
+                                 "exponent")))
     return emitOpError("exponent must be scalar u8");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
-  if (!getActivationScale().getType().isF32())
+  if (mlir::failed(requireScalar(*this, getActivationScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
-  if (!getInit().getType().isF32() ||
-      getInit().getType() != getResult().getType())
-    return emitOpError("init and result must be scalar f32");
-  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
-    return emitOpError("must be nested in a canonical Weft kernel");
-  return mlir::success();
+  return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
-namespace {
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {
-  mlir::Type type = value.getType();
-  if (auto masked = mlir::dyn_cast<weft::kernel::MaskedType>(type))
-    type = masked.getValueType();
+  if (mlir::failed(requireUnmaskedLocalValue(op, value, name)))
+    return mlir::failure();
+  mlir::Type type = weft::kernel::unwrapLogicalValidity(value.getType());
   auto block = mlir::dyn_cast<weft::kernel::BlockType>(type);
   if (!block || block.getShape() != llvm::ArrayRef<int64_t>({extent}) ||
       (signedElement ? !block.getElementType().isSignedInteger(8)
@@ -186,16 +209,6 @@ mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
   return mlir::success();
 }
 
-mlir::LogicalResult verifyScalarDotResult(mlir::Operation *op, mlir::Value init,
-                                          mlir::Value result) {
-  if (!init.getType().isF32() || init.getType() != result.getType())
-    return op->emitError("init and result must be scalar f32");
-  if (!op->getParentOfType<weft::kernel::KernelOp>())
-    return op->emitError("must be nested in a canonical Weft kernel");
-  return mlir::success();
-}
-} // namespace
-
 mlir::LogicalResult IQ2SI8DotOp::verify() {
   if (mlir::failed(verifyByteBlock(*this, getCodes(), 32, false, "codes")) ||
       mlir::failed(verifyByteBlock(*this, getHighBits(), 8, false, "high_bits")) ||
@@ -203,8 +216,11 @@ mlir::LogicalResult IQ2SI8DotOp::verify() {
       mlir::failed(verifyByteBlock(*this, getScales(), 8, false, "scales")) ||
       mlir::failed(verifyByteBlock(*this, getActivation(), 256, true, "activation")))
     return mlir::failure();
-  if (!getWeightScale().getType().isF32() ||
-      !getActivationScale().getType().isF32())
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
     return emitOpError("weight_scale and activation_scale must be scalar f32");
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
@@ -216,8 +232,11 @@ mlir::LogicalResult IQ3SI8DotOp::verify() {
       mlir::failed(verifyByteBlock(*this, getScales(), 4, false, "scales")) ||
       mlir::failed(verifyByteBlock(*this, getActivation(), 256, true, "activation")))
     return mlir::failure();
-  if (!getWeightScale().getType().isF32() ||
-      !getActivationScale().getType().isF32())
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
     return emitOpError("weight_scale and activation_scale must be scalar f32");
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
@@ -229,7 +248,9 @@ mlir::LogicalResult IQ1MI8DotOp::verify() {
       mlir::failed(verifyByteBlock(*this, getScales(), 8, false, "scales")) ||
       mlir::failed(verifyByteBlock(*this, getActivation(), 256, true, "activation")))
     return mlir::failure();
-  if (!getActivationScale().getType().isF32())
+  if (mlir::failed(requireScalar(*this, getActivationScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
@@ -241,8 +262,11 @@ mlir::LogicalResult Q6KI8DotOp::verify() {
                                   "group_scales")) ||
       mlir::failed(verifyByteBlock(*this, getActivation(), 256, true, "activation")))
     return mlir::failure();
-  if (!getWeightScale().getType().isF32() ||
-      !getActivationScale().getType().isF32())
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
     return emitOpError("weight_scale and activation_scale must be scalar f32");
   return verifyScalarDotResult(*this, getInit(), getResult());
 }

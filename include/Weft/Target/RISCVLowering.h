@@ -15,8 +15,8 @@ namespace weft {
 
 struct RISCVBackendConfig {
   int64_t vlaLMUL = 0;
-  int64_t contractLMUL = 0;
-  int64_t contractKUnroll = 0;
+  int64_t dotLMUL = 0;
+  int64_t dotKUnroll = 0;
   int64_t f16InputLMUL = 0;
   int64_t f16RowMicrotile = 0;
   int64_t narrowLMUL = 0;

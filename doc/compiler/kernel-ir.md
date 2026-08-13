@@ -35,6 +35,10 @@ IME fragment、instruction spelling、build measurement、thread count或launch 
 - `masked` 携带first-class logical validity，不能当普通value逃逸；
 - `tuple` 是reduce/summary/control carried state使用的闭合heterogeneous value。
 
+这些类型组成唯一的canonical value system。Sibling extension dialect不得重新定义block、region、
+masked validity、extent identity或state容器；extension operand必须直接使用上述类型和相同的
+use-def/effect规则。`weft_ext`是局部semantic primitive的命名空间，不是第二份execution IR。
+
 Dynamic logical block extent在shape中写为 `-1`，真实extent仍是对应op的显式operand。两个
 dynamic extent不能仅因都打印为 `-1` 就被视为同一logical identity。
 
@@ -80,6 +84,19 @@ state and structured compute
 - `dot`固定收缩双方最后一个logical block axis；`matmul`固定表达`[M,K] x [K,N]`。
   两者的init/result shape、accumulator dtype与numerical policy必须由IR显式保存并局部verify。
 
+因此canonical kernel可以统一描述为：
+
+```text
+ordered control regions
++ zero or one active VLA axis per lexical scope
++ scalar / block / region SSA values with explicit extent and validity
++ pointer/index relations and memory effects
++ explicit local semantic primitives
+```
+
+Reduce、scan、summary、dot/matmul与extension op不是独立执行路径；它们是在上述region/value/effect
+模型中授予某一局部domain重组权的anchor。普通SSA或loop carry没有这项授权。
+
 ## Extension dialect
 
 新的可观察局部语义可以放在编译时已链接的sibling dialect。当前正式输入注册：
@@ -92,7 +109,9 @@ weft_ext
 `weft_ext` 当前包含 `affine_i4_i8_contract`、`symmetric_i4_i8_contract`、
 `grouped_affine_i4_i8_dot`、`sign_bit_i8_dot` 与 `e2m1_e8m0_i8_dot`。Extension op必须
 能随module独立parse/verify；它只表达typed local numerical relation，不能持有public ABI、
-persistent pointer layout、outer traversal或target fragment。
+persistent pointer layout、outer traversal或target fragment。它必须复用`weft_kernel`的logical
+value queries与validity规则；若primitive没有定义masked语义，masked operand必须先由source
+显式`fill`，不能由extension verifier静默unwrap。
 
 ## Python frontend
 

@@ -41,52 +41,33 @@ std::optional<unsigned> fixedBitWidth(mlir::Type type) {
 }
 
 mlir::Type unwrapMasked(mlir::Type type) {
-  if (auto masked = mlir::dyn_cast<MaskedType>(type))
-    return masked.getValueType();
-  return type;
+  return weft::kernel::unwrapLogicalValidity(type);
 }
 
-bool isMasked(mlir::Type type) { return mlir::isa<MaskedType>(type); }
+bool isMasked(mlir::Type type) {
+  return weft::kernel::hasLogicalValidity(type);
+}
 
 mlir::Type elementTypeOf(mlir::Type type) {
-  type = unwrapMasked(type);
-  if (auto block = mlir::dyn_cast<BlockType>(type))
-    return block.getElementType();
-  if (auto region = mlir::dyn_cast<RegionType>(type))
-    return region.getElementType();
-  return type;
+  return weft::kernel::logicalElementType(type);
 }
 
 llvm::ArrayRef<int64_t> staticShapeOf(mlir::Type type) {
-  type = unwrapMasked(type);
-  if (auto block = mlir::dyn_cast<BlockType>(type))
-    return block.getShape();
-  if (auto region = mlir::dyn_cast<RegionType>(type))
-    return region.getShape();
-  return {};
+  return weft::kernel::logicalShape(type);
 }
 
-enum class ShapeKind { Scalar, Block, Region };
+using ShapeKind = weft::kernel::LogicalShapeKind;
 
 ShapeKind shapeKindOf(mlir::Type type) {
-  type = unwrapMasked(type);
-  if (mlir::isa<RegionType>(type))
-    return ShapeKind::Region;
-  if (mlir::isa<BlockType>(type))
-    return ShapeKind::Block;
-  return ShapeKind::Scalar;
+  return weft::kernel::logicalShapeKind(type);
 }
 
 bool isLogicalValueType(mlir::Type type) {
-  type = unwrapMasked(type);
-  return isScalarType(type) || mlir::isa<BlockType, RegionType, TupleType>(type);
+  return weft::kernel::isLogicalValue(type);
 }
 
 bool isPredicateType(mlir::Type type) {
-  if (isMasked(type))
-    return false;
-  auto integer = mlir::dyn_cast<mlir::IntegerType>(elementTypeOf(type));
-  return integer && integer.getWidth() == 1;
+  return weft::kernel::isLogicalPredicate(type);
 }
 
 bool isPointwiseValueType(mlir::Type type) {
@@ -478,6 +459,57 @@ bool validAtomicOrder(llvm::StringRef order) {
 }
 
 } // namespace
+
+mlir::Type weft::kernel::unwrapLogicalValidity(mlir::Type type) {
+  if (auto masked = mlir::dyn_cast<MaskedType>(type))
+    return masked.getValueType();
+  return type;
+}
+
+mlir::Type weft::kernel::logicalElementType(mlir::Type type) {
+  type = unwrapLogicalValidity(type);
+  if (auto block = mlir::dyn_cast<BlockType>(type))
+    return block.getElementType();
+  if (auto region = mlir::dyn_cast<RegionType>(type))
+    return region.getElementType();
+  return type;
+}
+
+llvm::ArrayRef<int64_t> weft::kernel::logicalShape(mlir::Type type) {
+  type = unwrapLogicalValidity(type);
+  if (auto block = mlir::dyn_cast<BlockType>(type))
+    return block.getShape();
+  if (auto region = mlir::dyn_cast<RegionType>(type))
+    return region.getShape();
+  return {};
+}
+
+LogicalShapeKind weft::kernel::logicalShapeKind(mlir::Type type) {
+  type = unwrapLogicalValidity(type);
+  if (mlir::isa<RegionType>(type))
+    return LogicalShapeKind::Region;
+  if (mlir::isa<BlockType>(type))
+    return LogicalShapeKind::Block;
+  return LogicalShapeKind::Scalar;
+}
+
+bool weft::kernel::isLogicalValue(mlir::Type type) {
+  type = unwrapLogicalValidity(type);
+  return type.isIndex() ||
+         mlir::isa<mlir::IntegerType, mlir::FloatType, BlockType, RegionType,
+                   TupleType>(type);
+}
+
+bool weft::kernel::hasLogicalValidity(mlir::Type type) {
+  return mlir::isa<MaskedType>(type);
+}
+
+bool weft::kernel::isLogicalPredicate(mlir::Type type) {
+  if (hasLogicalValidity(type))
+    return false;
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(logicalElementType(type));
+  return integer && integer.getWidth() == 1;
+}
 
 bool weft::kernel::haveSameLogicalExtent(mlir::Value lhs, int64_t lhsAxis,
                                          mlir::Value rhs, int64_t rhsAxis) {

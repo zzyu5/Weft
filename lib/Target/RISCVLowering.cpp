@@ -448,26 +448,26 @@ struct VLANarrowDecision {
   mlir::Operation *operation = nullptr;
 };
 
-struct F32ContractPhysicalConfig {
+struct F32DotPhysicalConfig {
   unsigned lmul = 1;
   unsigned kUnroll = 1;
 };
 
-enum class VLAContractRealization {
+enum class VLADotRealization {
   RVVF32FreeAxisMicrotile,
   RVVF32FreeAxisVectorDot,
 };
 
-enum class VLAContractInitRealization {
+enum class VLADotInitRealization {
   ZeroVector,
   ScalarBroadcast,
   MaterializedRegion,
 };
 
-struct VLAContractDecision {
+struct VLADotDecision {
   mlir::Operation *operation = nullptr;
-  VLAContractRealization realization =
-      VLAContractRealization::RVVF32FreeAxisMicrotile;
+  VLADotRealization realization =
+      VLADotRealization::RVVF32FreeAxisMicrotile;
   mlir::Operation *consumer = nullptr;
   mlir::Operation *lhsLoad = nullptr;
   mlir::Operation *rhsLoad = nullptr;
@@ -482,14 +482,14 @@ struct VLAContractDecision {
   VLAMemoryMode freeMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
   bool lhsPredicateVariesByReduction = false;
-  VLAContractInitRealization initRealization =
-      VLAContractInitRealization::ZeroVector;
+  VLADotInitRealization initRealization =
+      VLADotInitRealization::ZeroVector;
   llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
-struct VLAContractCandidate {
-  VLAContractDecision decision;
-  F32ContractPhysicalConfig physical;
+struct VLADotCandidate {
+  VLADotDecision decision;
+  F32DotPhysicalConfig physical;
 };
 
 enum class PhysicalHandoff {
@@ -624,7 +624,7 @@ struct VLARegionDecision {
   std::vector<VLACastDecision> casts;
   std::vector<VLAStateDecision> states;
   std::vector<VLANarrowDecision> narrows;
-  std::vector<VLAContractDecision> contracts;
+  std::vector<VLADotDecision> dots;
   bool hasExplicitPrefetch = false;
 };
 
@@ -655,13 +655,13 @@ struct F16GemmNTileDecision {
   unsigned reductionTile = 64;
 };
 
-enum class ContractRealization {
+enum class DotRealization {
   RVVF32RowMicrotile,
 };
 
-struct ContractDecision {
+struct DotDecision {
   mlir::Operation *operation = nullptr;
-  ContractRealization realization = ContractRealization::RVVF32RowMicrotile;
+  DotRealization realization = DotRealization::RVVF32RowMicrotile;
   mlir::Operation *consumer = nullptr;
   mlir::Operation *lhsLoad = nullptr;
   mlir::Operation *rhsLoad = nullptr;
@@ -687,8 +687,8 @@ struct RISCVPhysicalPlan {
       affineI4I8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<F16GemmNTileDecision>>
       f16Matmuls;
-  llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<ContractDecision>>
-      localF32Dots;
+  llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<DotDecision>> dots;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> dotOwnerForStore;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<SymmetricI4I8Decision>>
       symmetricI4I8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<SignBitI8Decision>>
@@ -718,7 +718,7 @@ struct RISCVPhysicalPlan {
       materializedBlockStores;
 };
 
-enum class F32ContractResourceModel {
+enum class F32DotResourceModel {
   VLAFreeAxis,
   LocalRow,
 };
@@ -736,18 +736,11 @@ std::string sanitize(llvm::StringRef input) {
 }
 
 mlir::Type elementType(mlir::Type type) {
-  if (auto masked = mlir::dyn_cast<MaskedType>(type))
-    type = masked.getValueType();
-  if (auto region = mlir::dyn_cast<RegionType>(type))
-    return region.getElementType();
-  if (auto block = mlir::dyn_cast<BlockType>(type))
-    return block.getElementType();
-  return type;
+  return logicalElementType(type);
 }
 
 bool containsBlockType(mlir::Type type) {
-  if (auto masked = mlir::dyn_cast<MaskedType>(type))
-    return containsBlockType(masked.getValueType());
+  type = unwrapLogicalValidity(type);
   if (mlir::isa<BlockType>(type))
     return true;
   if (auto tuple = mlir::dyn_cast<TupleType>(type))
@@ -822,9 +815,7 @@ bool isTrue(mlir::Value value) {
 }
 
 bool isRegionValue(mlir::Type type) {
-  if (auto masked = mlir::dyn_cast<MaskedType>(type))
-    type = masked.getValueType();
-  return mlir::isa<RegionType>(type);
+  return logicalShapeKind(type) == LogicalShapeKind::Region;
 }
 
 std::optional<int64_t> integerConstantValue(mlir::Value value) {
@@ -1096,24 +1087,37 @@ private:
         physicalPlan.f16Matmuls.try_emplace(matmul.getOperation(),
                                          std::move(*decision));
     });
-    kernel.walk([&](StoreOp store) {
-      if (decisionFailure || isRegionValue(store.getValue().getType()))
+    kernel.walk([&](DotOp dot) {
+      if (decisionFailure || isRegionValue(dot.getResult().getType()))
         return;
-      auto dot = store.getValue().getDefiningOp<DotOp>();
-      if (!dot || !dot.getResult().hasOneUse())
+      if (!dot.getResult().hasOneUse()) {
+        dot.emitError(
+            "local dot currently requires one explicit downstream consumer");
+        decisionFailure = true;
         return;
-      mlir::FailureOr<PlannedPhysicalDecision<ContractDecision>> decision =
+      }
+      auto store = mlir::dyn_cast<StoreOp>(*dot.getResult().getUsers().begin());
+      if (!store || store.getValue() != dot.getResult()) {
+        dot.emitError(
+            "local dot currently requires an explicit store handoff");
+        decisionFailure = true;
+        return;
+      }
+      mlir::FailureOr<PlannedPhysicalDecision<DotDecision>> decision =
           decideLocalF32RowMicrotile(store, dot);
       if (mlir::failed(decision)) {
         decisionFailure = true;
         return;
       }
-      if (!physicalPlan.localF32Dots
-               .try_emplace(store.getOperation(), std::move(*decision))
+      if (!physicalPlan.dots
+               .try_emplace(dot.getOperation(), std::move(*decision))
                .second) {
-        store.emitError("one store cannot own multiple local dot decisions");
+        dot.emitError("one dot cannot own multiple physical decisions");
         decisionFailure = true;
+        return;
       }
+      physicalPlan.dotOwnerForStore.try_emplace(store.getOperation(),
+                                                dot.getOperation());
     });
     kernel.walk([&](SymmetricI4I8ContractOp op) {
       if (decisionFailure)
@@ -1397,16 +1401,16 @@ private:
     return found == activeVLADecision->narrows.end() ? nullptr : &*found;
   }
 
-  const VLAContractDecision *
-  findVLAContractDecision(mlir::Operation *consumer) const {
+  const VLADotDecision *
+  findVLADotDecision(mlir::Operation *consumer) const {
     if (!activeVLADecision)
       return nullptr;
     auto found = llvm::find_if(
-        activeVLADecision->contracts,
-        [&](const VLAContractDecision &decision) {
+        activeVLADecision->dots,
+        [&](const VLADotDecision &decision) {
           return decision.consumer == consumer;
         });
-    return found == activeVLADecision->contracts.end() ? nullptr : &*found;
+    return found == activeVLADecision->dots.end() ? nullptr : &*found;
   }
 
   const BlockOperationDecision *
@@ -1534,12 +1538,12 @@ private:
     return mlir::success();
   }
 
-  bool isVLAContractAbsorbed(mlir::Operation *operation) const {
+  bool isVLADotAbsorbed(mlir::Operation *operation) const {
     if (!activeVLADecision)
       return false;
     return llvm::any_of(
-        activeVLADecision->contracts,
-        [&](const VLAContractDecision &decision) {
+        activeVLADecision->dots,
+        [&](const VLADotDecision &decision) {
           return llvm::is_contained(decision.absorbed, operation);
         });
   }
@@ -1558,8 +1562,8 @@ private:
       collectLocalDefinitions(operand, block, definitions, axes);
   }
 
-  std::optional<F32ContractPhysicalConfig>
-  selectF32ContractPhysicalConfig(F32ContractResourceModel model,
+  std::optional<F32DotPhysicalConfig>
+  selectF32DotPhysicalConfig(F32DotResourceModel model,
                                   unsigned rowTile,
                                   unsigned defaultUnroll) const {
     constexpr unsigned vla128Candidates[] = {4, 2, 1};
@@ -1571,7 +1575,7 @@ private:
     constexpr unsigned wideRowCandidates[] = {1, 2, 4};
     bool wideVector = options.target.vlenBits >= 256;
     llvm::ArrayRef<unsigned> candidates = vla128Candidates;
-    if (model == F32ContractResourceModel::VLAFreeAxis)
+    if (model == F32DotResourceModel::VLAFreeAxis)
       candidates = wideVector ? llvm::ArrayRef<unsigned>(vla256Candidates)
                               : llvm::ArrayRef<unsigned>(vla128Candidates);
     else if (rowTile <= 4)
@@ -1585,9 +1589,9 @@ private:
     else
       candidates = wideRowCandidates;
     llvm::SmallVector<unsigned> unrollCandidates;
-    if (options.backend.contractKUnroll != 0)
+    if (options.backend.dotKUnroll != 0)
       unrollCandidates.push_back(
-          static_cast<unsigned>(options.backend.contractKUnroll));
+          static_cast<unsigned>(options.backend.dotKUnroll));
     else {
       unsigned preferredUnroll = wideVector ? 4 : defaultUnroll;
       unrollCandidates.push_back(preferredUnroll);
@@ -1596,9 +1600,9 @@ private:
           unrollCandidates.push_back(candidate);
     }
     llvm::SmallVector<unsigned> requestedLMUL;
-    if (options.backend.contractLMUL != 0) {
+    if (options.backend.dotLMUL != 0) {
       requestedLMUL.push_back(
-          static_cast<unsigned>(options.backend.contractLMUL));
+          static_cast<unsigned>(options.backend.dotLMUL));
       candidates = requestedLMUL;
     }
     auto legalUnroll = [](unsigned value) {
@@ -1615,37 +1619,29 @@ private:
           continue;
         unsigned accumulatorGroups = rowTile * lmul;
         unsigned streamedOperandGroups =
-            (model == F32ContractResourceModel::LocalRow ? 2 : 1) * unroll *
+            (model == F32DotResourceModel::LocalRow ? 2 : 1) * unroll *
             lmul;
         unsigned total = accumulatorGroups + streamedOperandGroups;
         bool hasAllocatorHeadroom =
-            model == F32ContractResourceModel::VLAFreeAxis
+            model == F32DotResourceModel::VLAFreeAxis
                 ? total <= options.target.vectorRegisters
                 : total + 1 < options.target.vectorRegisters;
         if (hasAllocatorHeadroom)
-          return F32ContractPhysicalConfig{lmul, unroll};
+          return F32DotPhysicalConfig{lmul, unroll};
       }
     }
     return std::nullopt;
   }
 
-  mlir::FailureOr<VLAContractCandidate>
+  mlir::FailureOr<VLADotCandidate>
   decideVLAF32FreeAxisMicrotile(VLAOp vla, StoreOp store,
                                  DotOp dot) {
-    auto unwrapBlock = [](mlir::Type type) -> BlockType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<BlockType>(type);
-    };
-    auto unwrapRegion = [](mlir::Type type) -> RegionType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<RegionType>(type);
-    };
-
-    BlockType lhsType = unwrapBlock(dot.getLhs().getType());
-    RegionType rhsType = unwrapRegion(dot.getRhs().getType());
-    RegionType resultType = unwrapRegion(dot.getResult().getType());
+    BlockType lhsType =
+        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getLhs().getType()));
+    RegionType rhsType =
+        mlir::dyn_cast<RegionType>(unwrapLogicalValidity(dot.getRhs().getType()));
+    RegionType resultType = mlir::dyn_cast<RegionType>(
+        unwrapLogicalValidity(dot.getResult().getType()));
     if (store.getValue() != dot.getResult() ||
         !dot.getResult().hasOneUse() || !lhsType || !rhsType ||
         !resultType || lhsType.getShape().size() != 2 ||
@@ -1747,10 +1743,10 @@ private:
                               store.getWhere()})
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
 
-    VLAContractDecision decision;
+    VLADotDecision decision;
     decision.operation = dot.getOperation();
     decision.realization =
-        VLAContractRealization::RVVF32FreeAxisMicrotile;
+        VLADotRealization::RVVF32FreeAxisMicrotile;
     decision.consumer = store.getOperation();
     decision.lhsLoad = lhsLoad.getOperation();
     decision.rhsLoad = rhsLoad.getOperation();
@@ -1759,8 +1755,8 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
-    std::optional<F32ContractPhysicalConfig> physical =
-        selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
+    std::optional<F32DotPhysicalConfig> physical =
+        selectF32DotPhysicalConfig(F32DotResourceModel::VLAFreeAxis,
                                         decision.rowTile, 1);
     if (!physical) {
       dot.emitError(
@@ -1776,27 +1772,20 @@ private:
     decision.lhsPredicateVariesByReduction =
         dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
     decision.absorbed.append(absorbed.begin(), absorbed.end());
-    return VLAContractCandidate{std::move(decision), *physical};
+    return VLADotCandidate{std::move(decision), *physical};
   }
 
-  mlir::FailureOr<VLAContractCandidate>
+  mlir::FailureOr<VLADotCandidate>
   decideVLAF32FreeAxisVectorDot(VLAOp vla, StoreOp store,
                                 DotOp dot) {
-    auto unwrapBlock = [](mlir::Type type) -> BlockType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<BlockType>(type);
-    };
-    auto unwrapRegion = [](mlir::Type type) -> RegionType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<RegionType>(type);
-    };
-
-    RegionType lhsType = unwrapRegion(dot.getLhs().getType());
-    BlockType rhsType = unwrapBlock(dot.getRhs().getType());
-    RegionType initType = unwrapRegion(dot.getInit().getType());
-    RegionType resultType = unwrapRegion(dot.getResult().getType());
+    RegionType lhsType = mlir::dyn_cast<RegionType>(
+        unwrapLogicalValidity(dot.getLhs().getType()));
+    BlockType rhsType =
+        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getRhs().getType()));
+    RegionType initType = mlir::dyn_cast<RegionType>(
+        unwrapLogicalValidity(dot.getInit().getType()));
+    RegionType resultType = mlir::dyn_cast<RegionType>(
+        unwrapLogicalValidity(dot.getResult().getType()));
     if (store.getValue() != dot.getResult() ||
         !dot.getResult().hasOneUse() || !lhsType || !rhsType ||
         !initType || !resultType || lhsType.getShape().size() != 2 ||
@@ -1885,9 +1874,9 @@ private:
     for (mlir::Operation *operation : initDefinitions)
       absorbed.erase(operation);
 
-    VLAContractDecision decision;
+    VLADotDecision decision;
     decision.operation = dot.getOperation();
-    decision.realization = VLAContractRealization::RVVF32FreeAxisVectorDot;
+    decision.realization = VLADotRealization::RVVF32FreeAxisVectorDot;
     decision.consumer = store.getOperation();
     decision.freeLoad = freeLoad.getOperation();
     decision.blockedOperand = dot.getRhs();
@@ -1895,8 +1884,8 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = 1;
-    std::optional<F32ContractPhysicalConfig> physical =
-        selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
+    std::optional<F32DotPhysicalConfig> physical =
+        selectF32DotPhysicalConfig(F32DotResourceModel::VLAFreeAxis,
                                         decision.rowTile, 1);
     if (!physical) {
       dot.emitError(
@@ -1910,9 +1899,9 @@ private:
                                     ? VLAMemoryMode::UnitStride
                                     : VLAMemoryMode::Strided;
     decision.initRealization =
-        VLAContractInitRealization::MaterializedRegion;
+        VLADotInitRealization::MaterializedRegion;
     decision.absorbed.append(absorbed.begin(), absorbed.end());
-    return VLAContractCandidate{std::move(decision), *physical};
+    return VLADotCandidate{std::move(decision), *physical};
   }
 
   mlir::FailureOr<PlannedPhysicalDecision<VLARegionDecision>>
@@ -1939,8 +1928,8 @@ private:
         };
     collectPhysicalOperations(body);
 
-    llvm::DenseMap<mlir::Operation *, F32ContractPhysicalConfig>
-        contractPhysical;
+    llvm::DenseMap<mlir::Operation *, F32DotPhysicalConfig>
+        dotPhysical;
     llvm::DenseMap<mlir::Operation *, VLANarrowPhysicalConfig> narrowPhysical;
     for (mlir::Operation *nested : physicalOperations) {
       auto store = mlir::dyn_cast<StoreOp>(nested);
@@ -1948,27 +1937,27 @@ private:
           store ? store.getValue().getDefiningOp<DotOp>() : DotOp{};
       if (!dot || !isRegionValue(dot.getResult().getType()))
         continue;
-      mlir::FailureOr<VLAContractCandidate> selected =
+      mlir::FailureOr<VLADotCandidate> selected =
           isRegionValue(dot.getLhs().getType()) &&
                   containsBlockType(dot.getRhs().getType())
               ? decideVLAF32FreeAxisVectorDot(op, store, dot)
               : decideVLAF32FreeAxisMicrotile(op, store, dot);
       if (mlir::failed(selected))
         return mlir::failure();
-      contractPhysical.try_emplace(selected->decision.operation,
+      dotPhysical.try_emplace(selected->decision.operation,
                                    selected->physical);
-      decision.contracts.push_back(std::move(selected->decision));
+      decision.dots.push_back(std::move(selected->decision));
     }
-    auto isContractOwned = [&](mlir::Operation *operation) {
+    auto isDotOwned = [&](mlir::Operation *operation) {
       return llvm::any_of(
-          decision.contracts, [&](const VLAContractDecision &dot) {
+          decision.dots, [&](const VLADotDecision &dot) {
             return dot.consumer == operation ||
                    llvm::is_contained(dot.absorbed, operation);
           });
     };
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isContractOwned(nested))
+      if (isDotOwned(nested))
         continue;
       auto compare = mlir::dyn_cast<CompareOp>(nested);
       if (!compare || !isRegionValue(compare.getResult().getType()))
@@ -2138,7 +2127,7 @@ private:
     };
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isContractOwned(nested))
+      if (isDotOwned(nested))
         continue;
       if (auto load = mlir::dyn_cast<LoadOp>(nested)) {
         if (mlir::failed(addAccess(
@@ -2205,7 +2194,7 @@ private:
 
     unsigned maxEntityF32Vectors = 0;
     for (mlir::Operation *operation : physicalOperations) {
-      if (isContractOwned(operation))
+      if (isDotOwned(operation))
         continue;
       unsigned entityVectors = llvm::count_if(
           operation->getOperandTypes(), [](mlir::Type type) {
@@ -2224,7 +2213,7 @@ private:
     }
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isContractOwned(nested))
+      if (isDotOwned(nested))
         continue;
       auto narrow = mlir::dyn_cast<NarrowOp>(nested);
       if (!narrow)
@@ -2267,7 +2256,7 @@ private:
     }
 
     for (mlir::Operation &nested : body.without_terminator()) {
-      if (isContractOwned(&nested))
+      if (isDotOwned(&nested))
         continue;
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
         if (reduce.getAxis() != -1 ||
@@ -2319,18 +2308,12 @@ private:
           state.placement = VLAStatePlacement::VectorCarry;
         } else if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
-          state.placement = reduce.getOrder() == "relaxed" &&
-                                    !op.getEnd().getDefiningOp<BinaryOp>() &&
-                                    !integerConstantValue(op.getEnd()) &&
-                                    !op->getParentOfType<IfOp>()
+          state.placement = reduce.getOrder() == "relaxed"
                                 ? VLAStatePlacement::VectorCarry
                                 : VLAStatePlacement::ScalarCarry;
         } else if (reduce.getKind() == "max") {
           state.realization = VLAStateRealization::RVVMaxReduction;
-          state.placement = reduce.getOrder() == "relaxed" &&
-                                    !op.getEnd().getDefiningOp<BinaryOp>() &&
-                                    !integerConstantValue(op.getEnd()) &&
-                                    !op->getParentOfType<IfOp>()
+          state.placement = reduce.getOrder() == "relaxed"
                                 ? VLAStatePlacement::VectorCarry
                                 : VLAStatePlacement::ScalarCarry;
         } else {
@@ -2496,9 +2479,9 @@ private:
       requiredLMUL = value;
       return mlir::success();
     };
-    for (const VLAContractDecision &contract : decision.contracts)
+    for (const VLADotDecision &dot : decision.dots)
       if (mlir::failed(
-              requireLMUL(contractPhysical.lookup(contract.operation).lmul,
+              requireLMUL(dotPhysical.lookup(dot.operation).lmul,
                           "dot")))
         return mlir::failure();
     for (const VLANarrowDecision &narrow : decision.narrows)
@@ -2974,35 +2957,35 @@ private:
                             PhysicalHandoff::Convert, physical.sourceShape,
                             physical.resultShape);
     }
-    for (const VLAContractDecision &contract : decision.contracts) {
-      F32ContractPhysicalConfig physical =
-          contractPhysical.lookup(contract.operation);
-      unsigned contractGroups =
-          contract.rowTile * physical.lmul +
-          (contract.realization ==
-                   VLAContractRealization::RVVF32FreeAxisMicrotile
+    for (const VLADotDecision &dot : decision.dots) {
+      F32DotPhysicalConfig physical =
+          dotPhysical.lookup(dot.operation);
+      unsigned dotGroups =
+          dot.rowTile * physical.lmul +
+          (dot.realization ==
+                   VLADotRealization::RVVF32FreeAxisMicrotile
                ? 2
                : 1) *
               physical.kUnroll * physical.lmul;
       entity.resources.primitiveGroups =
-          std::max(entity.resources.primitiveGroups, contractGroups);
+          std::max(entity.resources.primitiveGroups, dotGroups);
       unsigned handoffGroups = entity.resources.memoryGroups +
                                entity.resources.predicateGroups;
       entity.resources.peakGroups =
           std::max(entity.resources.peakGroups,
-                   contractGroups + handoffGroups + 1);
+                   dotGroups + handoffGroups + 1);
       entity.schedule.unroll =
           std::max(entity.schedule.unroll, physical.kUnroll);
-      RVVVectorShape contractShape = rvvShape(32, physical.lmul);
-      recordPhysicalValue(entity, contract.init, contractShape);
-      if (auto dot = mlir::dyn_cast<DotOp>(contract.operation))
-        recordPhysicalValue(entity, dot.getResult(), contractShape);
-      recordPhysicalHandoff(entity, contract.consumer, contract.init,
-                            contract.initRealization ==
-                                    VLAContractInitRealization::MaterializedRegion
+      RVVVectorShape dotShape = rvvShape(32, physical.lmul);
+      recordPhysicalValue(entity, dot.init, dotShape);
+      if (auto operation = mlir::dyn_cast<DotOp>(dot.operation))
+        recordPhysicalValue(entity, operation.getResult(), dotShape);
+      recordPhysicalHandoff(entity, dot.consumer, dot.init,
+                            dot.initRealization ==
+                                    VLADotInitRealization::MaterializedRegion
                                 ? PhysicalHandoff::Share
                                 : PhysicalHandoff::Rematerialize,
-                            contractShape, contractShape);
+                            dotShape, dotShape);
     }
     if (entity.resources.peakGroups >=
         static_cast<unsigned>(options.target.vectorRegisters)) {
@@ -3018,10 +3001,10 @@ private:
       return mlir::success();
     if (isVLAStateAbsorbed(operation))
       return mlir::success();
-    if (const VLAContractDecision *decision =
-            findVLAContractDecision(operation))
-      return emitVLAContract(*decision);
-    if (isVLAContractAbsorbed(operation))
+    if (const VLADotDecision *decision =
+            findVLADotDecision(operation))
+      return emitVLADot(*decision);
+    if (isVLADotAbsorbed(operation))
       return mlir::success();
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
@@ -4763,7 +4746,7 @@ private:
     return std::nullopt;
   }
 
-  mlir::LogicalResult emitVLAContract(const VLAContractDecision &decision) {
+  mlir::LogicalResult emitVLADot(const VLADotDecision &decision) {
     const PhysicalHandoffDecision *handoff =
         findVLAHandoff(decision.consumer, decision.init);
     const PhysicalValueDecision *initShape =
@@ -4771,23 +4754,23 @@ private:
     if (!initShape)
       return decision.operation->emitError(
           "VLA dot physical value shape is unavailable");
-    RVVVectorShape contractShape = initShape->shape;
-    std::optional<unsigned> lmul = rvvIntegerLMUL(contractShape);
-    if (!lmul || contractShape.sew != 32 || !activePhysicalEntity)
+    RVVVectorShape dotShape = initShape->shape;
+    std::optional<unsigned> lmul = rvvIntegerLMUL(dotShape);
+    if (!lmul || dotShape.sew != 32 || !activePhysicalEntity)
       return decision.operation->emitError(
           "VLA dot physical entity is incomplete");
     PhysicalHandoff expected =
         decision.initRealization ==
-                VLAContractInitRealization::MaterializedRegion
+                VLADotInitRealization::MaterializedRegion
             ? PhysicalHandoff::Share
             : PhysicalHandoff::Rematerialize;
     if (!handoff || handoff->kind != expected ||
-        handoff->sourceShape != contractShape ||
-        handoff->resultShape != contractShape)
+        handoff->sourceShape != dotShape ||
+        handoff->resultShape != dotShape)
       return decision.operation->emitError(
           "VLA dot physical handoff is inconsistent");
     if (decision.realization ==
-        VLAContractRealization::RVVF32FreeAxisVectorDot) {
+        VLADotRealization::RVVF32FreeAxisVectorDot) {
       auto dot = mlir::cast<DotOp>(decision.operation);
       auto store = mlir::cast<StoreOp>(decision.consumer);
       auto freeLoad = mlir::cast<LoadOp>(decision.freeLoad);
@@ -4795,7 +4778,7 @@ private:
       CValue init = require(decision.init);
       if (extent.empty() || activeVL.empty() ||
           decision.initRealization !=
-              VLAContractInitRealization::MaterializedRegion ||
+              VLADotInitRealization::MaterializedRegion ||
           init.kind != CValueKind::F32Vector || init.spelling.empty())
         return dot.emitError(
             "RVV VLA vector-dot physical operands are unavailable");
@@ -4813,9 +4796,9 @@ private:
         return dot.emitError(
             "RVV VLA vector-dot output projection is unavailable");
 
-      std::string accumulator = fresh("vla_contract_acc");
+      std::string accumulator = fresh("vla_dot_acc");
       line(vectorType + " " + accumulator + " = " + init.spelling + ";");
-      std::string reduction = fresh("vla_contract_k");
+      std::string reduction = fresh("vla_dot_k");
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
            extent + "; " + reduction + " += " +
            std::to_string(activePhysicalEntity->schedule.unroll) + ") {");
@@ -4838,7 +4821,7 @@ private:
         if (!freePointer || !freeLaneStride || !blocked)
           return dot.emitError(
               "RVV VLA vector-dot operand projection is unavailable");
-        std::string vector = fresh("vla_contract_free");
+        std::string vector = fresh("vla_dot_free");
         if (decision.freeMemoryMode == VLAMemoryMode::UnitStride) {
           line(vectorType + " " + vector + " = __riscv_vle32_v_" +
                vectorSuffix + "(" + *freePointer + ", " + activeVL + ");");
@@ -4896,9 +4879,9 @@ private:
           !outputPredicate || !outputPointer)
         return dot.emitError(
             "RVV VLA dot row projection is unavailable");
-      std::string outputCondition = fresh("vla_contract_store_active");
+      std::string outputCondition = fresh("vla_dot_store_active");
       if (!decision.lhsPredicateVariesByReduction) {
-        std::string lhsCondition = fresh("vla_contract_lhs_active");
+        std::string lhsCondition = fresh("vla_dot_lhs_active");
         line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
         lhsActive.push_back(std::move(lhsCondition));
       }
@@ -4910,13 +4893,13 @@ private:
     auto emitCompute = [&](bool guarded) -> mlir::LogicalResult {
       llvm::SmallVector<std::string> accumulators;
       for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
-        std::string accumulator = fresh("vla_contract_acc");
+        std::string accumulator = fresh("vla_dot_acc");
         line(vectorType + " " + accumulator + " = __riscv_vfmv_v_f_" +
              vectorSuffix + "(0.0f, " + activeVL + ");");
         accumulators.push_back(std::move(accumulator));
       }
 
-      std::string reduction = fresh("vla_contract_k");
+      std::string reduction = fresh("vla_dot_k");
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
            extent + "; " + reduction + " += " +
            std::to_string(activePhysicalEntity->schedule.unroll) + ") {");
@@ -4937,7 +4920,7 @@ private:
         if (!rhsPointer || !rhsLaneStride)
           return dot.emitError(
               "RVV VLA dot RHS projection is unavailable");
-        std::string rhsVector = fresh("vla_contract_rhs");
+        std::string rhsVector = fresh("vla_dot_rhs");
         if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride) {
           line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
                vectorSuffix + "(" + *rhsPointer + ", " + activeVL + ");");
@@ -5013,7 +4996,7 @@ private:
       return mlir::success();
     };
 
-    std::string fullTile = fresh("vla_contract_full_tile");
+    std::string fullTile = fresh("vla_dot_full_tile");
     llvm::SmallVector<llvm::StringRef> fullConditions;
     if (!decision.lhsPredicateVariesByReduction)
       fullConditions.append(lhsActive.begin(), lhsActive.end());
@@ -5034,16 +5017,14 @@ private:
     return mlir::success();
   }
 
-  mlir::FailureOr<PlannedPhysicalDecision<ContractDecision>>
+  mlir::FailureOr<PlannedPhysicalDecision<DotDecision>>
   decideLocalF32RowMicrotile(StoreOp store, DotOp dot) {
-    auto unwrapBlock = [](mlir::Type type) -> BlockType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<BlockType>(type);
-    };
-    BlockType lhsType = unwrapBlock(dot.getLhs().getType());
-    BlockType rhsType = unwrapBlock(dot.getRhs().getType());
-    BlockType resultType = unwrapBlock(dot.getResult().getType());
+    BlockType lhsType =
+        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getLhs().getType()));
+    BlockType rhsType =
+        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getRhs().getType()));
+    BlockType resultType = mlir::dyn_cast<BlockType>(
+        unwrapLogicalValidity(dot.getResult().getType()));
     auto init = dot.getInit().getDefiningOp<FullOp>();
     if (store.getValue() != dot.getResult() || !lhsType || !rhsType ||
         !resultType || lhsType.getShape().size() != 2 ||
@@ -5109,10 +5090,10 @@ private:
       return mlir::failure();
     }
 
-    PlannedPhysicalDecision<ContractDecision> planned;
-    ContractDecision &decision = planned.realization;
+    PlannedPhysicalDecision<DotDecision> planned;
+    DotDecision &decision = planned.realization;
     decision.operation = dot.getOperation();
-    decision.realization = ContractRealization::RVVF32RowMicrotile;
+    decision.realization = DotRealization::RVVF32RowMicrotile;
     decision.consumer = store.getOperation();
     decision.lhsLoad = lhsLoad.getOperation();
     decision.rhsLoad = rhsLoad.getOperation();
@@ -5120,8 +5101,8 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
-    std::optional<F32ContractPhysicalConfig> physical =
-        selectF32ContractPhysicalConfig(F32ContractResourceModel::LocalRow,
+    std::optional<F32DotPhysicalConfig> physical =
+        selectF32DotPhysicalConfig(F32DotResourceModel::LocalRow,
                                         decision.rowTile, 1);
     if (!physical) {
       dot.emitError(
@@ -5153,13 +5134,16 @@ private:
   }
 
   std::optional<mlir::LogicalResult>
-  tryEmitLocalF32ContractBlockStore(StoreOp store) {
-    auto selected = physicalPlan.localF32Dots.find(store.getOperation());
-    if (selected == physicalPlan.localF32Dots.end())
+  tryEmitLocalF32DotStore(StoreOp store) {
+    auto owner = physicalPlan.dotOwnerForStore.find(store.getOperation());
+    if (owner == physicalPlan.dotOwnerForStore.end())
+      return std::nullopt;
+    auto selected = physicalPlan.dots.find(owner->second);
+    if (selected == physicalPlan.dots.end())
       return std::nullopt;
     if (mlir::failed(requireEntityPlan(store.getOperation(), selected->second)))
       return std::optional<mlir::LogicalResult>(mlir::failure());
-    const ContractDecision &decision = selected->second.realization;
+    const DotDecision &decision = selected->second.realization;
     const PhysicalEntityPlan &entity = selected->second.entity;
     auto dot = mlir::cast<DotOp>(decision.operation);
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
@@ -5179,7 +5163,7 @@ private:
     std::optional<unsigned> lmul = rvvIntegerLMUL(resultShape->shape);
     if (!lmul || resultShape->shape.sew != 32)
       return dot.emitError("RVV row microtile value shape is unavailable");
-    std::string fullVL = fresh("contract_vlmax");
+    std::string fullVL = fresh("dot_vlmax");
     std::string vectorSuffix = "f32m" + std::to_string(*lmul);
     std::string vectorType = "vfloat32m" + std::to_string(*lmul) + "_t";
     line("const size_t " + fullVL + " = __riscv_vsetvlmax_e32m" +
@@ -5201,8 +5185,8 @@ private:
       if (!lhsPredicate || !outputPredicate || !outputPointer)
         return dot.emitError(
             "RVV row microtile row projection is unavailable");
-      std::string lhsCondition = fresh("contract_lhs_active");
-      std::string outputCondition = fresh("contract_store_active");
+      std::string lhsCondition = fresh("dot_lhs_active");
+      std::string outputCondition = fresh("dot_store_active");
       line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
       line("const bool " + outputCondition + " = " + *outputPredicate + ";");
       lhsActive.push_back(std::move(lhsCondition));
@@ -5213,13 +5197,13 @@ private:
     auto emitCompute = [&](bool guarded) -> mlir::LogicalResult {
       llvm::SmallVector<std::string> accumulators;
       for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
-        std::string accumulator = fresh("contract_acc");
+        std::string accumulator = fresh("dot_acc");
         line(vectorType + " " + accumulator + " = __riscv_vfmv_v_f_" +
              vectorSuffix + "(0.0f, " + fullVL + ");");
         accumulators.push_back(std::move(accumulator));
       }
-      std::string strip = fresh("contract_k");
-      std::string vl = fresh("contract_vl");
+      std::string strip = fresh("dot_k");
+      std::string vl = fresh("dot_vl");
       auto emitChunk = [&](llvm::StringRef coordinate) -> mlir::LogicalResult {
         llvm::DenseMap<mlir::Value, std::string> rhsAxes;
         rhsAxes[decision.reductionAxis] = coordinate.str();
@@ -5228,7 +5212,7 @@ private:
         if (!rhs)
           return dot.emitError(
               "RVV row microtile RHS projection is unavailable");
-        std::string rhsVector = fresh("contract_rhs");
+        std::string rhsVector = fresh("dot_rhs");
         line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
              vectorSuffix + "(" + *rhs + ", " + vl + ");");
         for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
@@ -5244,7 +5228,7 @@ private:
             line("if (" + lhsActive[lane] + ") {");
             ++indent;
           }
-          std::string lhsVector = fresh("contract_lhs");
+          std::string lhsVector = fresh("dot_lhs");
           line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
                vectorSuffix + "(" + *lhs + ", " + vl + ");");
           line(accumulators[lane] + " = __riscv_vfmacc_vv_" + vectorSuffix +
@@ -5268,7 +5252,7 @@ private:
           return mlir::failure();
         line(strip + " += " + vl + ";");
       } else {
-        std::string remaining = fresh("contract_remaining");
+        std::string remaining = fresh("dot_remaining");
         line("const size_t " + remaining + " = " + extent + " - " + strip +
              ";");
         line("if (" + remaining + " >= " +
@@ -5306,8 +5290,8 @@ private:
           line("if (" + storeActive[lane] + ") {");
           ++indent;
         }
-        std::string seed = fresh("contract_seed");
-        std::string reduced = fresh("contract_reduced");
+        std::string seed = fresh("dot_seed");
+        std::string reduced = fresh("dot_reduced");
         line("vfloat32m1_t " + seed +
              " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
         line("vfloat32m1_t " + reduced +
@@ -5323,7 +5307,7 @@ private:
       return mlir::success();
     };
 
-    std::string fullTile = fresh("contract_full_tile");
+    std::string fullTile = fresh("dot_full_tile");
     line("const bool " + fullTile + " = " +
          llvm::join(lhsActive, " && ") + " && " +
          llvm::join(storeActive, " && ") + ";");
@@ -5890,9 +5874,7 @@ private:
   std::optional<LocalBlockMemoryFact>
   resolveLocalBlockMemoryFact(mlir::Value semanticValue) const {
     auto blockType = [](mlir::Type type) -> BlockType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
-      return mlir::dyn_cast<BlockType>(type);
+      return mlir::dyn_cast<BlockType>(unwrapLogicalValidity(type));
     };
 
     BlockType semanticType = blockType(semanticValue.getType());
@@ -6911,15 +6893,14 @@ private:
   decideF16GemmNTiles(MatmulOp matmul) {
     LoadOp lhsLoad = matmul.getLhs().getDefiningOp<LoadOp>();
     LoadOp rhsLoad = matmul.getRhs().getDefiningOp<LoadOp>();
-    auto unwrapBlock = [](mlir::Type type) -> BlockType {
-      if (auto masked = mlir::dyn_cast<MaskedType>(type))
-        type = masked.getValueType();
+    auto blockType = [](mlir::Type type) -> BlockType {
+      type = unwrapLogicalValidity(type);
       return mlir::dyn_cast<BlockType>(type);
     };
-    BlockType lhsType = unwrapBlock(matmul.getLhs().getType());
-    BlockType rhsType = unwrapBlock(matmul.getRhs().getType());
-    BlockType initType = unwrapBlock(matmul.getInit().getType());
-    BlockType resultType = unwrapBlock(matmul.getResult().getType());
+    BlockType lhsType = blockType(matmul.getLhs().getType());
+    BlockType rhsType = blockType(matmul.getRhs().getType());
+    BlockType initType = blockType(matmul.getInit().getType());
+    BlockType resultType = blockType(matmul.getResult().getType());
     if (!lhsLoad || !rhsLoad || !lhsType || !rhsType || !initType ||
         !resultType || lhsType.getShape().size() != 2 ||
         rhsType.getShape().size() != 2 || initType.getShape().size() != 2 ||
@@ -8264,8 +8245,7 @@ private:
   }
 
   std::optional<int64_t> f32BlockExtent(mlir::Type type) const {
-    if (auto masked = mlir::dyn_cast<MaskedType>(type))
-      type = masked.getValueType();
+    type = unwrapLogicalValidity(type);
     auto block = mlir::dyn_cast<BlockType>(type);
     if (!block || block.getShape().size() != 1 ||
         !block.getElementType().isF32())
@@ -8347,7 +8327,7 @@ private:
             f32BlockExtent(store.getValue().getType());
         if (plannedStores.contains(candidate) || candidateExtent != extent ||
             !isTrue(store.getWhere()) ||
-            physicalPlan.localF32Dots.contains(candidate) ||
+            physicalPlan.dotOwnerForStore.contains(candidate) ||
             isOwnedByPreparedRegion(candidate) ||
             isMaterializedF32BlockStore(store))
           break;
@@ -8520,7 +8500,7 @@ private:
     kernel.walk([&](StoreOp store) {
       if (failed || plannedStores.contains(store.getOperation()) ||
           !hasBlockPayload(store.getOperation()) ||
-          physicalPlan.localF32Dots.contains(store.getOperation()) ||
+          physicalPlan.dotOwnerForStore.contains(store.getOperation()) ||
           isOwnedByPreparedRegion(store.getOperation()) ||
           isMaterializedF32BlockStore(store))
         return;
@@ -8544,7 +8524,7 @@ private:
   }
 
   mlir::LogicalResult emitBlockStores(StoreOp op) {
-    if (auto lowered = tryEmitLocalF32ContractBlockStore(op))
+    if (auto lowered = tryEmitLocalF32DotStore(op))
       return *lowered;
     auto selected = physicalPlan.blockStoreGroups.find(op.getOperation());
     if (selected == physicalPlan.blockStoreGroups.end())
