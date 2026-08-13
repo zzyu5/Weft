@@ -79,7 +79,7 @@ for query_head:
 ```
 
 Query staging、causal bound、GQA mapping、key order与online `(maximum,total)` update都是
-source-observable。普通scalar carry保持key iteration order；它不是 `summary_fold`，因为每步
+source-observable。普通scalar carry保持key iteration order；它不是局部typed summary，因为每步
 还更新一个value accumulator和scratch-visible state。
 
 Target lowering可以分别实现并联合安排以下local closure：

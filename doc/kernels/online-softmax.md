@@ -3,19 +3,9 @@
 ## Closed summary state
 
 ```python
-@W.pure
-def softmax_lift(x):
-    return W.tuple(x, W.f32(1.0))
-
-@W.pure
-def softmax_merge(a, b):
-    ma, sa = a
-    mb, sb = b
-    maximum = W.maximum(ma, mb)
-    scaled_sum = sa * W.exp(ma - maximum, math="native") + sb * W.exp(
-        mb - maximum, math="native"
-    )
-    return W.tuple(maximum, scaled_sum)
+maximum, scaled_sum = W.online_softmax_summary(
+    value, math="native", order="preserve"
+)
 ```
 
 `(maximum, scaled_sum)`、identity与rescale都由source定义。Compiler可以在strip内或strip间
@@ -37,13 +27,8 @@ def softmax_f32(
         row_offset = row * stride
         with W.vla(0, cols) as i:
             value = W.load(x + row_offset + i)
-            state = W.summary_fold(
-                value,
-                identity=W.tuple(W.neg_inf(W.f32), W.f32(0.0)),
-                lift=softmax_lift,
-                merge=softmax_merge,
-                finalize=None,
-                order="preserve",
+            state = W.online_softmax_summary(
+                value, math="native", order="preserve"
             )
 
         maximum, scaled_sum = state

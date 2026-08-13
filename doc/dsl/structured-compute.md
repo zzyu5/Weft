@@ -27,7 +27,7 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 ```
 
 VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
-scan或summary fold。`init`与`acc_dtype`均为必填source semantics；init必须是scalar或与结果
+scan或显式typed summary primitive。`init`与`acc_dtype`均为必填source semantics；init必须是scalar或与结果
 同shape的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
 描述。结果element type等于accumulator dtype。
 
@@ -78,26 +78,9 @@ prefix = W.scan(value, op="add", identity=0.0, inclusive=True,
 Scan为每个logical position产生prefix；output order可观察。`segment_start`是独立语义，不能
 从logical mask猜测。
 
-### Summary fold
+### Typed summary
 
-```python
-state = W.summary_fold(value, identity=identity,
-                       lift=lift, merge=merge, finalize=finalize,
-                       where=True, coordinate=None, order="preserve")
-```
-
-其语义为：
-
-```text
-lift(element[, coordinate]) -> state
-merge(state_a, state_b)     -> state
-finalize(state)             -> result
-```
-
-需要逻辑位置时，作者通过`coordinate=`显式传入与value同domain的坐标；target不能以lane ID、
-pointer use或strip位置替代。
-
-固定且可观察的summary语义使用typed primitive：
+固定且可观察的summary语义必须使用显式typed primitive：
 
 ```python
 value, coordinate = W.argmax(x, i,
@@ -112,8 +95,8 @@ maximum, scaled_sum = W.online_softmax_summary(
 稳定的`(maximum, scaled_sum)`合并代数。二者不拥有surrounding traversal、memory、normalize
 consumer或kernel ABI。Target不得从helper closure或普通SSA graph猜出这些primitive。
 
-自定义`lift`、`merge`与`finalize`必须是pure helper，state type闭合。作者负责identity与声明
-order下所需的结合性质；compiler检查类型、capture与effect purity，不建立证明系统。
+Weft不提供任意`lift/merge/finalize` summary fold；现有真实kernel没有证明这种泛化是核心
+语言所需。新的summary只有在出现独立、完整且局部的可观察语义时才增加typed primitive。
 
 ### Sequential carry
 
@@ -123,5 +106,5 @@ for i in W.range(begin, end):
     state = step(state, i)
 ```
 
-普通loop carry按logical iteration order执行。Compiler不得将其替换为reduce、scan、summary
+普通loop carry按logical iteration order执行。Compiler不得将其替换为reduce、scan、typed summary
 或dot/matmul，也不得根据代码形状猜测结合律。

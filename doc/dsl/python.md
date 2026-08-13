@@ -108,7 +108,7 @@ for row in W.range(row_begin, row_end):
     ...
 ```
 
-`W.range` 是普通有序 scalar loop。作者写出的 carried scalar / block state 必须保持逻辑迭代顺序，除非它被显式改写成 reduce、scan 或 summary fold。
+`W.range` 是普通有序 scalar loop。作者写出的 carried scalar / block state 必须保持逻辑迭代顺序，除非它被显式改写成 reduce、scan 或typed summary primitive。
 
 ### Scalar condition
 

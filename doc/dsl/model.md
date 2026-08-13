@@ -195,7 +195,7 @@ VLA region 必须被拒绝；这是当前语言能力边界，用来保持 regio
 coordinate decode等有序scalar control可以嵌在VLA内；它们不会产生第二个lane domain，且
 其source-visible顺序、state与effect必须保持不变。
 
-`W.dot`与`W.matmul`不得缩并VLA axis；跨VLA axis的聚合必须使用reduce、scan或summary fold。
+`W.dot`与`W.matmul`不得缩并VLA axis；跨VLA axis的聚合必须使用reduce、scan或显式typed summary primitive。
 VLA axis只能作为dot的free/batch axis；当前matmul只接受local block operands。
 
 

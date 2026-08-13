@@ -185,6 +185,7 @@ struct SignBitI8Decision {
 
 enum class E2M1E8M0I8Realization {
   RVVVLEN128TableDot,
+  RVVScalableLocalBlockDot,
 };
 
 struct E2M1E8M0I8Decision {
@@ -199,6 +200,7 @@ struct E2M1E8M0I8Decision {
 
 enum class GroupedAffineI4I8Realization {
   RVVVLEN128GroupedDot,
+  RVVScalableLocalBlockDot,
 };
 
 struct GroupedAffineI4I8Decision {
@@ -1201,22 +1203,36 @@ private:
   selectF32ContractPhysicalConfig(F32ContractResourceModel model,
                                   unsigned rowTile,
                                   unsigned defaultUnroll) const {
-    constexpr unsigned vlaCandidates[] = {4, 2, 1};
-    constexpr unsigned narrowRowCandidates[] = {4, 2, 1};
-    constexpr unsigned mediumRowCandidates[] = {2, 4, 1};
+    constexpr unsigned vla128Candidates[] = {4, 2, 1};
+    constexpr unsigned vla256Candidates[] = {2, 4, 1};
+    constexpr unsigned narrowRow128Candidates[] = {4, 2, 1};
+    constexpr unsigned narrowRow256Candidates[] = {2, 4, 1};
+    constexpr unsigned mediumRow128Candidates[] = {2, 4, 1};
+    constexpr unsigned mediumRow256Candidates[] = {2, 1, 4};
     constexpr unsigned wideRowCandidates[] = {1, 2, 4};
-    llvm::ArrayRef<unsigned> candidates = vlaCandidates;
-    if (model == F32ContractResourceModel::LocalRow)
-      candidates = rowTile <= 4   ? llvm::ArrayRef<unsigned>(narrowRowCandidates)
-                   : rowTile <= 6 ? llvm::ArrayRef<unsigned>(mediumRowCandidates)
-                                  : llvm::ArrayRef<unsigned>(wideRowCandidates);
+    bool wideVector = options.target.vlenBits >= 256;
+    llvm::ArrayRef<unsigned> candidates = vla128Candidates;
+    if (model == F32ContractResourceModel::VLAFreeAxis)
+      candidates = wideVector ? llvm::ArrayRef<unsigned>(vla256Candidates)
+                              : llvm::ArrayRef<unsigned>(vla128Candidates);
+    else if (rowTile <= 4)
+      candidates = wideVector
+                       ? llvm::ArrayRef<unsigned>(narrowRow256Candidates)
+                       : llvm::ArrayRef<unsigned>(narrowRow128Candidates);
+    else if (rowTile <= 6)
+      candidates = wideVector
+                       ? llvm::ArrayRef<unsigned>(mediumRow256Candidates)
+                       : llvm::ArrayRef<unsigned>(mediumRow128Candidates);
+    else
+      candidates = wideRowCandidates;
     llvm::SmallVector<unsigned> unrollCandidates;
     if (options.backend.contractKUnroll != 0)
       unrollCandidates.push_back(
           static_cast<unsigned>(options.backend.contractKUnroll));
     else {
-      unrollCandidates.push_back(defaultUnroll);
-      for (unsigned candidate : {1u, 2u, 4u})
+      unsigned preferredUnroll = wideVector ? 4 : defaultUnroll;
+      unrollCandidates.push_back(preferredUnroll);
+      for (unsigned candidate : {defaultUnroll, 1u, 2u, 4u})
         if (!llvm::is_contained(unrollCandidates, candidate))
           unrollCandidates.push_back(candidate);
     }
@@ -1582,17 +1598,6 @@ private:
         return mlir::failure();
       decision.contracts.push_back(std::move(*selected));
     }
-    if (!decision.contracts.empty()) {
-      decision.physical.dataLMUL = decision.contracts.front().lmul;
-      if (!llvm::all_of(decision.contracts,
-                        [&](const VLAContractDecision &dot) {
-                          return dot.lmul == decision.physical.dataLMUL;
-                        })) {
-        op.emitError("one VLA region requires one shared dot LMUL");
-        return mlir::failure();
-      }
-    }
-
     auto isContractOwned = [&](mlir::Operation *operation) {
       return llvm::any_of(
           decision.contracts, [&](const VLAContractDecision &dot) {
@@ -1816,6 +1821,8 @@ private:
 
     unsigned maxEntityF32Vectors = 0;
     for (mlir::Operation *operation : physicalOperations) {
+      if (isContractOwned(operation))
+        continue;
       unsigned entityVectors = llvm::count_if(
           operation->getOperandTypes(), [](mlir::Type type) {
             return isRegionValue(type) && elementType(type).isF32();
@@ -2003,18 +2010,8 @@ private:
               VLAStateRealization::RVVOnlineSoftmaxSummary,
               summary.getResult().getType()};
           decision.states.push_back(std::move(state));
-      } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
-        summary.emitError(
-            "RISC-V target does not implement this generic summary algebra");
-        return mlir::failure();
       }
     }
-    if (!decision.narrows.empty() && !decision.states.empty()) {
-      op.emitError(
-          "one VLA region cannot currently share a narrow and aggregate realization");
-      return mlir::failure();
-    }
-
     bool hasF32RegionValue = llvm::any_of(
         physicalOperations, [](mlir::Operation *operation) {
           return llvm::any_of(operation->getResultTypes(), [](mlir::Type type) {
@@ -2090,164 +2087,171 @@ private:
       candidateFacts.hasOnlineSummary |=
           state.realization == VLAStateRealization::RVVOnlineSoftmaxSummary;
     }
-    if (decision.contracts.empty() && decision.narrows.empty() &&
-        decision.states.empty() && decision.predicates.empty() &&
-        !hasF32RegionValue && onlyF16Accesses) {
-      decision.physical.dataSEW = 16;
-      decision.physical.dataLMUL = 8;
-    } else if (hasWideningF16Dot) {
-      decision.physical.dataSEW = 32;
-      decision.physical.dataLMUL = 2;
+    decision.physical.dataSEW =
+        !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
+    if (hasWideningF16Dot)
       decision.physical.stripSchedule = VLAStripSchedule::FullThenTail;
-    } else if (decision.contracts.empty() && decision.narrows.empty() &&
-               decision.states.empty() && decision.predicates.empty() &&
-               hasFloatCast && !requiresF32M2Math) {
-      decision.physical.dataSEW = 32;
-      decision.physical.dataLMUL = 8;
-    } else if (decision.contracts.empty() && decision.narrows.empty() &&
-               !hasWideningF16Dot && maxEntityF32Vectors > 0) {
-      llvm::SmallVector<unsigned> candidates;
-      if (options.backend.vlaLMUL != 0) {
-        unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
-        if (requested != 1 && requested != 2 && requested != 4 &&
-            requested != 8) {
-          op.emitError("VLA requested an illegal LMUL candidate");
-          return mlir::failure();
-        }
-        candidates.push_back(requested);
-      } else {
-        if (candidateFacts.requiresF32M2Math ||
-            candidateFacts.hasOnlineSummary)
-          candidates = {2};
-        else if (candidateFacts.hasOrderedScan)
-          candidates = {1, 2, 4, 8};
-        else if (candidateFacts.hasCoordinateSummary)
-          candidates = {4, 2, 1, 8};
-        else if (candidateFacts.hasReductionState)
-          candidates = {8, 4, 2, 1};
-        else if (candidateFacts.stridedAccesses > 0)
-          candidates = {2, 4, 1, 8};
-        else
-          candidates = {4, 2, 8, 1};
-      }
-      std::optional<unsigned> selected;
-      for (unsigned candidate : candidates) {
-        if (requiresF32M2Math && candidate != 2)
-          continue;
-        bool hasAffinePredicate = llvm::any_of(
-            decision.predicates, [](const VLAPredicateDecision &predicate) {
-              return predicate.realization ==
-                     VLAPredicateDecision::Realization::RVVAffineIndexScalar;
-            });
-        if (hasAffinePredicate && options.target.xlen == 64 &&
-            candidate * 2 > 8)
-          continue;
-        bool elementShapesLegal = llvm::all_of(
-            decision.accesses, [&](const VLAAccessDecision &access) {
-              unsigned sew = access.elementType.isF32() ? 32
-                             : isF16(access.elementType) ? 16
-                             : access.elementType.isUnsignedInteger(8) ? 8
-                             : access.elementType.isUnsignedInteger(32) ? 32
-                             : access.elementType.isSignedInteger(8) ? 8
-                                                                    : 0;
-              return sew != 0 &&
-                     (candidate * sew) % decision.physical.dataSEW == 0 &&
-                     candidate * sew / decision.physical.dataSEW <= 8;
-            });
-        if (!elementShapesLegal)
-          continue;
-        unsigned primitiveGroups = 0;
-        for (const VLAStateDecision &state : decision.states) {
-          if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
-            primitiveGroups = std::max(primitiveGroups, 3 * candidate + 1);
-          else if (state.realization ==
-                   VLAStateRealization::RVVSegmentedInclusiveAddScan)
-            primitiveGroups = std::max(primitiveGroups, 4 * candidate + 2);
-          else if (state.realization == VLAStateRealization::RVVArgMaxSummary ||
-                   state.realization == VLAStateRealization::RVVAddReduction ||
-                   state.realization == VLAStateRealization::RVVMaxReduction)
-            primitiveGroups = std::max(primitiveGroups, candidate + 2);
-          else if (state.realization ==
-                   VLAStateRealization::RVVOnlineSoftmaxSummary)
-            primitiveGroups = std::max(primitiveGroups, 3 * candidate + 2);
-        }
-        unsigned indexGroups = 0;
-        if (candidateFacts.indexedAccesses != 0) {
-          unsigned indexLMUL = candidate * 32 / decision.physical.dataSEW;
-          unsigned elementLMUL = candidate * candidateFacts.maxIndexedElementSEW /
-                                 decision.physical.dataSEW;
-          indexGroups = std::max(2 * indexLMUL + elementLMUL,
-                                 2 * candidate) +
-                        candidateFacts.maxIndexedCompanionF32Vectors * candidate;
-        }
-        unsigned predicateGroups = 0;
-        for (const VLAPredicateDecision &predicate : decision.predicates) {
-          if (predicate.realization ==
-              VLAPredicateDecision::Realization::RVVVectorScalar) {
-            unsigned scaled = candidate * predicate.vectorSEW;
-            if (scaled % decision.physical.dataSEW != 0) {
-              predicateGroups = options.target.vectorRegisters;
-              break;
-            }
-            predicateGroups += scaled / decision.physical.dataSEW;
-          } else {
-            predicateGroups += options.target.xlen == 64 ? candidate * 2
-                                                         : candidate;
-          }
-        }
-        unsigned regionGroups = maxEntityF32Vectors * candidate;
-        unsigned requiredGroups =
-            std::max(regionGroups,
-                     std::max(primitiveGroups, indexGroups + predicateGroups));
-        if (requiredGroups + 1 <
-            static_cast<unsigned>(options.target.vectorRegisters)) {
-          selected = candidate;
-          break;
-        }
-      }
-      if (!selected) {
-        op.emitError("VLA has no legal LMUL candidate for its entity resources");
+    auto legalLMUL = [](unsigned value) {
+      return value == 1 || value == 2 || value == 4 || value == 8;
+    };
+    std::optional<unsigned> requiredLMUL;
+    auto requireLMUL = [&](unsigned value, llvm::StringRef source) {
+      if (!legalLMUL(value)) {
+        op.emitError() << source << " requires an invalid LMUL " << value;
         return mlir::failure();
       }
-      decision.physical.dataLMUL = *selected;
-    }
-    if (options.backend.vlaLMUL != 0 && decision.contracts.empty() &&
-        !hasWideningF16Dot && decision.narrows.empty() &&
-        maxEntityF32Vectors == 0) {
-      unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
-      if (requested != 1 && requested != 2 && requested != 4 &&
-          requested != 8) {
-        op.emitError("VLA requested an illegal LMUL candidate");
+      if (requiredLMUL && *requiredLMUL != value) {
+        op.emitError() << "VLA entity LMUL requirements conflict: "
+                       << *requiredLMUL << " versus " << value << " from "
+                       << source;
         return mlir::failure();
       }
-      unsigned registerGroups = decision.accesses.size() * requested;
-      if ((!decision.predicates.empty() && options.target.xlen == 64 &&
-           requested * 2 > 8) ||
-          registerGroups + 1 >=
-              static_cast<unsigned>(options.target.vectorRegisters)) {
-        op.emitError("VLA requested LMUL exceeds entity resources");
+      requiredLMUL = value;
+      return mlir::success();
+    };
+    for (const VLAContractDecision &contract : decision.contracts)
+      if (mlir::failed(requireLMUL(contract.lmul, "dot")))
         return mlir::failure();
-      }
-      decision.physical.dataLMUL = requested;
-    }
+    for (const VLANarrowDecision &narrow : decision.narrows)
+      if (mlir::failed(requireLMUL(narrow.sourceLMUL, "narrow")))
+        return mlir::failure();
+    if (hasWideningF16Dot && mlir::failed(requireLMUL(2, "widening dot")))
+      return mlir::failure();
+    if ((candidateFacts.requiresF32M2Math || candidateFacts.hasOnlineSummary) &&
+        mlir::failed(requireLMUL(2, "f32m2 math")))
+      return mlir::failure();
     if (options.backend.vlaLMUL != 0 &&
-        decision.physical.dataSEW == 16 &&
-        decision.contracts.empty() && decision.narrows.empty() &&
-        !hasWideningF16Dot) {
-      unsigned requested = static_cast<unsigned>(options.backend.vlaLMUL);
-      if (requested != 1 && requested != 2 && requested != 4 &&
-          requested != 8) {
-        op.emitError("VLA requested an illegal LMUL candidate");
-        return mlir::failure();
-      }
-      unsigned registerGroups = decision.accesses.size() * requested;
-      if (registerGroups + 1 >=
-          static_cast<unsigned>(options.target.vectorRegisters)) {
-        op.emitError("VLA requested LMUL exceeds entity resources");
-        return mlir::failure();
-      }
-      decision.physical.dataLMUL = requested;
+        mlir::failed(requireLMUL(
+            static_cast<unsigned>(options.backend.vlaLMUL),
+            "explicit backend config")))
+      return mlir::failure();
+
+    auto preferenceRank = [](unsigned candidate,
+                             llvm::ArrayRef<unsigned> order) {
+      auto found = llvm::find(order, candidate);
+      return static_cast<unsigned>(std::distance(order.begin(), found));
+    };
+    llvm::SmallVector<unsigned> candidates = {1, 2, 4, 8};
+    if (requiredLMUL) {
+      candidates = {*requiredLMUL};
+    } else {
+      constexpr unsigned base128[] = {4, 2, 8, 1};
+      constexpr unsigned base256[] = {2, 4, 1, 8};
+      constexpr unsigned f16OrCast[] = {8, 4, 2, 1};
+      constexpr unsigned scan[] = {1, 2, 4, 8};
+      constexpr unsigned coordinateSummary[] = {4, 2, 1, 8};
+      constexpr unsigned reduction[] = {8, 4, 2, 1};
+      constexpr unsigned strided[] = {2, 4, 1, 8};
+      llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
+        auto score = [&](unsigned candidate) {
+          unsigned value = preferenceRank(
+              candidate, options.target.vlenBits >= 256
+                             ? llvm::ArrayRef<unsigned>(base256)
+                             : llvm::ArrayRef<unsigned>(base128));
+          if (decision.physical.dataSEW == 16 || hasFloatCast)
+            value += 8 * preferenceRank(candidate, f16OrCast);
+          if (candidateFacts.hasOrderedScan)
+            value += 8 * preferenceRank(candidate, scan);
+          if (candidateFacts.hasCoordinateSummary)
+            value += 8 * preferenceRank(candidate, coordinateSummary);
+          if (candidateFacts.hasReductionState)
+            value += 8 * preferenceRank(candidate, reduction);
+          for (unsigned access = 0; access < candidateFacts.stridedAccesses;
+               ++access)
+            value += 8 * preferenceRank(candidate, strided);
+          return value;
+        };
+        unsigned lhsScore = score(lhs);
+        unsigned rhsScore = score(rhs);
+        return lhsScore != rhsScore ? lhsScore < rhsScore : lhs > rhs;
+      });
     }
+
+    std::optional<unsigned> selected;
+    for (unsigned candidate : candidates) {
+      bool hasAffinePredicate = llvm::any_of(
+          decision.predicates, [](const VLAPredicateDecision &predicate) {
+            return predicate.realization ==
+                   VLAPredicateDecision::Realization::RVVAffineIndexScalar;
+          });
+      if (hasAffinePredicate && options.target.xlen == 64 && candidate * 2 > 8)
+        continue;
+      bool elementShapesLegal = llvm::all_of(
+          decision.accesses, [&](const VLAAccessDecision &access) {
+            unsigned sew = access.elementType.isF32() ? 32
+                           : isF16(access.elementType) ? 16
+                           : access.elementType.isUnsignedInteger(8) ? 8
+                           : access.elementType.isUnsignedInteger(32) ? 32
+                           : access.elementType.isSignedInteger(8) ? 8
+                                                                  : 0;
+            return sew != 0 &&
+                   (candidate * sew) % decision.physical.dataSEW == 0 &&
+                   candidate * sew / decision.physical.dataSEW <= 8;
+          });
+      if (!elementShapesLegal)
+        continue;
+      unsigned primitiveGroups = 0;
+      for (const VLAStateDecision &state : decision.states) {
+        if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
+          primitiveGroups = std::max(primitiveGroups, 3 * candidate + 1);
+        else if (state.realization ==
+                 VLAStateRealization::RVVSegmentedInclusiveAddScan)
+          primitiveGroups = std::max(primitiveGroups, 4 * candidate + 2);
+        else if (state.realization == VLAStateRealization::RVVArgMaxSummary ||
+                 state.realization == VLAStateRealization::RVVAddReduction ||
+                 state.realization == VLAStateRealization::RVVMaxReduction)
+          primitiveGroups = std::max(primitiveGroups, candidate + 2);
+        else if (state.realization ==
+                 VLAStateRealization::RVVOnlineSoftmaxSummary)
+          primitiveGroups = std::max(primitiveGroups, 3 * candidate + 2);
+      }
+      for (const VLANarrowDecision &narrow : decision.narrows)
+        primitiveGroups =
+            std::max(primitiveGroups, narrow.sourceLMUL +
+                                          narrow.intermediateLMUL +
+                                          narrow.resultLMUL);
+      unsigned indexGroups = 0;
+      if (candidateFacts.indexedAccesses != 0) {
+        unsigned indexLMUL = candidate * 32 / decision.physical.dataSEW;
+        unsigned elementLMUL = candidate * candidateFacts.maxIndexedElementSEW /
+                               decision.physical.dataSEW;
+        indexGroups = std::max(2 * indexLMUL + elementLMUL, 2 * candidate) +
+                      candidateFacts.maxIndexedCompanionF32Vectors * candidate;
+      }
+      unsigned predicateGroups = 0;
+      for (const VLAPredicateDecision &predicate : decision.predicates) {
+        if (predicate.realization ==
+            VLAPredicateDecision::Realization::RVVVectorScalar) {
+          unsigned scaled = candidate * predicate.vectorSEW;
+          if (scaled % decision.physical.dataSEW != 0) {
+            predicateGroups = options.target.vectorRegisters;
+            break;
+          }
+          predicateGroups += scaled / decision.physical.dataSEW;
+        } else {
+          predicateGroups +=
+              options.target.xlen == 64 ? candidate * 2 : candidate;
+        }
+      }
+      unsigned regionGroups = maxEntityF32Vectors * candidate;
+      if (decision.physical.dataSEW == 16)
+        regionGroups = std::max(
+            regionGroups,
+            static_cast<unsigned>(decision.accesses.size()) * candidate);
+      unsigned requiredGroups =
+          std::max(regionGroups,
+                   std::max(primitiveGroups, indexGroups + predicateGroups));
+      if (requiredGroups + 1 <
+          static_cast<unsigned>(options.target.vectorRegisters)) {
+        selected = candidate;
+        break;
+      }
+    }
+    if (!selected) {
+      op.emitError("VLA has no legal LMUL candidate for its entity resources");
+      return mlir::failure();
+    }
+    decision.physical.dataLMUL = *selected;
 
     for (mlir::Operation *operation : physicalOperations) {
       auto cast = mlir::dyn_cast<CastOp>(operation);
@@ -2470,13 +2474,17 @@ private:
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
       return emitE2M1E8M0I8Dot(op);
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op, "__weft_iq2_s_i8_vl128");
+      return emitQuantCodebookI8Dot(
+          op, "__weft_iq2_s_i8_vl128", "__weft_iq2_s_i8_rvv");
     if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op, "__weft_iq3_s_i8_rvv");
+      return emitQuantCodebookI8Dot(
+          op, "__weft_iq3_s_i8_rvv", "__weft_iq3_s_i8_rvv");
     if (auto op = mlir::dyn_cast<IQ1MI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op, "__weft_iq1_m_i8_vl128");
+      return emitQuantCodebookI8Dot(
+          op, "__weft_iq1_m_i8_vl128", "__weft_iq1_m_i8_rvv");
     if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op, "__weft_q6_k_i8_vl128");
+      return emitQuantCodebookI8Dot(
+          op, "__weft_q6_k_i8_vl128", "__weft_q6_k_i8_rvv");
     if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
       return emitSymmetricI4I8Contract(op);
     if (auto op = mlir::dyn_cast<MatmulOp>(operation))
@@ -2539,9 +2547,6 @@ private:
     if (auto op = mlir::dyn_cast<StoreOp>(operation)) {
       return emitStore(op);
     }
-    if (auto op = mlir::dyn_cast<SummaryFoldOp>(operation))
-      return op.emitError(
-          "summary_fold must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<ArgMaxOp>(operation))
       return op.emitError("argmax must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<OnlineSoftmaxSummaryOp>(operation))
@@ -5303,9 +5308,9 @@ private:
       return std::optional<mlir::LogicalResult>(mlir::success());
     }
     if (block.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-        options.target.vlenBits != 256 || !isTrue(op.getWhere()))
+        options.target.vlenBits < 128 || !isTrue(op.getWhere()))
       return std::optional<mlir::LogicalResult>(op.emitError(
-          "materialized rank-one f32 block store requires all-active block<16> on VLEN256"));
+          "materialized rank-one f32 block store requires an all-active block<16> on RVV"));
     auto lanePointer = op.getPointer().getDefiningOp<PtrAddOp>();
     if (!lanePointer || !matchBlockAxis(lanePointer.getOffset(), 16))
       return std::optional<mlir::LogicalResult>(op.emitError(
@@ -5315,13 +5320,20 @@ private:
         destination.spelling.empty())
       return std::optional<mlir::LogicalResult>(op.emitError(
           "materialized f32 block store has no scalar pointer base"));
-    std::string vl = fresh("ime_store_vl");
-    std::string value = fresh("ime_store_value");
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(16);");
+    std::string offset = fresh("block_store_offset");
+    std::string vl = fresh("block_store_vl");
+    std::string value = fresh("block_store_value");
+    line("for (size_t " + offset + " = 0; " + offset + " < 16;) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(16 - " + offset +
+         ");");
     line("vfloat32m2_t " + value + " = __riscv_vle32_v_f32m2(" +
-         stored->second.spelling + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + destination.spelling + ", " + value +
-         ", " + vl + ");");
+         stored->second.spelling + " + " + offset + ", " + vl + ");");
+    line("__riscv_vse32_v_f32m2(" + destination.spelling + " + " + offset +
+         ", " + value + ", " + vl + ");");
+    line(offset + " += " + vl + ";");
+    --indent;
+    line("}");
     markDiscardedBlockTree(op.getPointer());
     loweredBlockOps.insert(op.getOperation());
     consumed.insert(op.getOperation());
@@ -5413,9 +5425,9 @@ private:
 
   mlir::LogicalResult decideE2M1E8M0I8Dot(
       E2M1E8M0I8DotOp op, E2M1E8M0I8Decision &decision) {
-    if (options.target.vlenBits != 128)
+    if (!options.target.hasRVV || options.target.vlenBits < 128)
       return op.emitError(
-          "E2M1/E8M0 i8 dot requires an explicit VLEN128 target fact");
+          "E2M1/E8M0 i8 dot requires RVV with VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "E2M1/E8M0 i8 dot requires little-endian packed nibbles");
@@ -5426,6 +5438,9 @@ private:
           "E2M1/E8M0 i8 dot requires contiguous all-active local block memory facts");
 
     decision = E2M1E8M0I8Decision{};
+    if (options.target.vlenBits > 128)
+      decision.realization =
+          E2M1E8M0I8Realization::RVVScalableLocalBlockDot;
     decision.packedCodes = *packedCodes;
     decision.activation = *activation;
     decision.exponent = op.getExponent();
@@ -5444,7 +5459,9 @@ private:
     CValue exponent = require(decision.exponent);
     CValue activationScale = require(decision.activationScale);
     CValue init = require(decision.init);
-    if (decision.realization != E2M1E8M0I8Realization::RVVVLEN128TableDot ||
+    if ((decision.realization != E2M1E8M0I8Realization::RVVVLEN128TableDot &&
+         decision.realization !=
+             E2M1E8M0I8Realization::RVVScalableLocalBlockDot) ||
         packed.kind != CValueKind::Pointer ||
         activation.kind != CValueKind::Pointer ||
         exponent.kind != CValueKind::Scalar ||
@@ -5454,6 +5471,20 @@ private:
         activationScale.spelling.empty() || init.spelling.empty())
       return op.emitError(
           "selected E2M1/E8M0 i8 dot operands are unavailable");
+
+    if (decision.realization ==
+        E2M1E8M0I8Realization::RVVScalableLocalBlockDot) {
+      std::string result = fresh("e2m1_dot");
+      line("const float " + result + " = __weft_e2m1_e8m0_i8_rvv(" +
+           packed.spelling + ", " + exponent.spelling + ", " +
+           activation.spelling + ", " + activationScale.spelling + ", " +
+           init.spelling + ");");
+      values[op.getResult()] =
+          CValue{op.getResult().getType(), CValueKind::Scalar, result};
+      markDiscardedBlockTree(decision.packedCodes.semanticValue);
+      markDiscardedBlockTree(decision.activation.semanticValue);
+      return mlir::success();
+    }
 
     std::string vl16 = fresh("e2m1_vl16");
     std::string vl32 = fresh("e2m1_vl32");
@@ -5506,9 +5537,9 @@ private:
 
   mlir::LogicalResult decideGroupedAffineI4I8Dot(
       GroupedAffineI4I8DotOp op, GroupedAffineI4I8Decision &decision) {
-    if (options.target.vlenBits != 128)
+    if (!options.target.hasRVV || options.target.vlenBits < 128)
       return op.emitError(
-          "grouped affine i4/i8 dot currently requires an explicit VLEN128 target fact");
+          "grouped affine i4/i8 dot requires RVV with VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "grouped affine i4/i8 dot requires the source-declared little-endian fields");
@@ -5522,6 +5553,9 @@ private:
           "grouped affine i4/i8 dot requires contiguous all-active local block memory facts");
 
     decision = GroupedAffineI4I8Decision{};
+    if (options.target.vlenBits > 128)
+      decision.realization =
+          GroupedAffineI4I8Realization::RVVScalableLocalBlockDot;
     decision.packedWeight = *packedWeight;
     decision.scaleMin = *scaleMin;
     decision.activation = *activation;
@@ -5545,8 +5579,10 @@ private:
     CValue dotScale = require(decision.dotScale);
     CValue minimumScale = require(decision.minimumScale);
     CValue init = require(decision.init);
-    if (decision.realization !=
-            GroupedAffineI4I8Realization::RVVVLEN128GroupedDot ||
+    if ((decision.realization !=
+             GroupedAffineI4I8Realization::RVVVLEN128GroupedDot &&
+         decision.realization !=
+             GroupedAffineI4I8Realization::RVVScalableLocalBlockDot) ||
         packed.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
         activation.kind != CValueKind::Pointer || sums.kind != CValueKind::Pointer ||
         dotScale.kind != CValueKind::Scalar ||
@@ -5559,7 +5595,12 @@ private:
           "grouped affine i4/i8 dot operands are not materialized locally");
 
     std::string result = fresh("grouped_dot");
-    line("const float " + result + " = __weft_grouped_affine_i4_i8_vl128(" +
+    llvm::StringRef helper =
+        decision.realization ==
+                GroupedAffineI4I8Realization::RVVScalableLocalBlockDot
+            ? "__weft_grouped_affine_i4_i8_rvv"
+            : "__weft_grouped_affine_i4_i8_vl128";
+    line("const float " + result + " = " + helper.str() + "(" +
          packed.spelling + ", " + scales.spelling + ", " +
          activation.spelling + ", " + sums.spelling + ", " +
          dotScale.spelling + ", " + minimumScale.spelling + ", " +
@@ -5578,16 +5619,15 @@ private:
       OpTy op, llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
       QuantCodebookI8Decision &decision) {
-    bool scalableIQ3 = mlir::isa<IQ3SI8DotOp>(op.getOperation());
-    if (options.target.vlenBits != 128 &&
-        !(scalableIQ3 && options.target.vlenBits >= 128))
+    if (!options.target.hasRVV || options.target.vlenBits < 128)
       return op.emitError(
-          "selected quant codebook/i8 realization requires VLEN128");
+          "quant codebook/i8 realization requires RVV with VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
           "quant codebook/i8 dot requires little-endian packed fields");
     decision = QuantCodebookI8Decision{};
-    if (scalableIQ3)
+    if (options.target.vlenBits > 128 ||
+        mlir::isa<IQ3SI8DotOp>(op.getOperation()))
       decision.realization =
           QuantCodebookI8Realization::RVVScalableLocalBlockDot;
     for (mlir::Value block : blocks) {
@@ -5603,7 +5643,8 @@ private:
 
   template <typename OpTy>
   mlir::LogicalResult emitQuantCodebookI8Dot(OpTy op,
-                                              llvm::StringRef helper) {
+                                              llvm::StringRef vlen128Helper,
+                                              llvm::StringRef scalableHelper) {
     auto prepared = quantCodebookI8Decisions.find(op.getOperation());
     if (prepared == quantCodebookI8Decisions.end())
       return op.emitError(
@@ -5633,6 +5674,11 @@ private:
     llvm::SmallVector<std::string> spellings;
     for (const CValue &operand : operands)
       spellings.push_back(operand.spelling);
+    llvm::StringRef helper =
+        decision.realization ==
+                QuantCodebookI8Realization::RVVScalableLocalBlockDot
+            ? scalableHelper
+            : vlen128Helper;
     line("const float " + result + " = " + helper.str() + "(" +
          llvm::join(spellings, ", ") + ");");
     values[op.getResult()] =
@@ -5873,6 +5919,12 @@ private:
           static_cast<unsigned>(options.backend.f16InputLMUL));
     else
       lmulCandidates = {1, 2, 4};
+    if (options.backend.f16RowMicrotile == 0 &&
+        options.target.vlenBits < 256 && decision.rowTile % 2 == 0) {
+      auto twoRows = llvm::find(rowCandidates, 2u);
+      if (twoRows != rowCandidates.end())
+        std::rotate(rowCandidates.begin(), twoRows, std::next(twoRows));
+    }
     std::optional<std::pair<unsigned, unsigned>> selected;
     for (unsigned inputLMUL : lmulCandidates) {
       if (inputLMUL != 1 && inputLMUL != 2 && inputLMUL != 4)
@@ -7902,6 +7954,37 @@ __weft_e8m0_half(uint8_t exponent) {
   return __weft_bitcast_u32_f32(bits);
 }
 
+static inline __attribute__((always_inline, unused)) int32_t
+__weft_local_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
+  int32_t result = 0;
+  size_t offset = 0;
+  while (offset < count) {
+    const size_t vl = __riscv_vsetvl_e8m1(count - offset);
+    const vint8m1_t left = __riscv_vle8_v_i8m1(lhs + offset, vl);
+    const vint8m1_t right = __riscv_vle8_v_i8m1(rhs + offset, vl);
+    const vint16m2_t products = __riscv_vwmul_vv_i16m2(left, right, vl);
+    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+    result += __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(products, zero, vl));
+    offset += vl;
+  }
+  return result;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_e2m1_e8m0_i8_rvv(
+    const uint8_t *packed_codes, uint8_t exponent,
+    const uint8_t *activation_bytes, float activation_scale, float init) {
+  int8_t decoded[32];
+  for (size_t byte = 0; byte < 16; ++byte) {
+    decoded[byte] = __weft_e2m1_doubled[packed_codes[byte] & UINT8_C(15)];
+    decoded[16 + byte] = __weft_e2m1_doubled[packed_codes[byte] >> 4];
+  }
+  const int32_t dot = __weft_local_i8_dot(
+      decoded, (const int8_t *)(const void *)activation_bytes, 32);
+  return init + (float)dot * __weft_e8m0_half(exponent) * activation_scale;
+}
+
 )c";
   }
   if (usesGroupedI4I8) {
@@ -8083,6 +8166,63 @@ __weft_grouped_affine_i4_i8_vl128(
         "v22", "v23", "v24", "v25", "v26", "v27", "v28",
         "v29", "v30", "v31");
   return sum;
+}
+
+static inline __attribute__((always_inline, unused)) int32_t
+__weft_grouped_i8_dot(
+    const int8_t *lhs, const int8_t *rhs, size_t count) {
+  int32_t result = 0;
+  size_t offset = 0;
+  while (offset < count) {
+    const size_t vl = __riscv_vsetvl_e8m1(count - offset);
+    const vint8m1_t left = __riscv_vle8_v_i8m1(lhs + offset, vl);
+    const vint8m1_t right = __riscv_vle8_v_i8m1(rhs + offset, vl);
+    const vint16m2_t products = __riscv_vwmul_vv_i16m2(left, right, vl);
+    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+    result += __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(products, zero, vl));
+    offset += vl;
+  }
+  return result;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_grouped_affine_i4_i8_rvv(
+    const uint8_t *packed_weight, const uint8_t *scale_min,
+    const uint8_t *activation_bytes, const uint8_t *activation_sum_bytes,
+    float dot_scale, float minimum_scale, float init) {
+  uint8_t scale[8];
+  uint8_t minimum[8];
+  for (size_t group = 0; group < 4; ++group) {
+    scale[group] = scale_min[group] & UINT8_C(63);
+    minimum[group] = scale_min[group + 4] & UINT8_C(63);
+    scale[group + 4] = (scale_min[group + 8] & UINT8_C(15)) |
+                       ((scale_min[group] >> 6) << 4);
+    minimum[group + 4] = (scale_min[group + 8] >> 4) |
+                         ((scale_min[group + 4] >> 6) << 4);
+  }
+  const int8_t *activation =
+      (const int8_t *)(const void *)activation_bytes;
+  const int16_t *activation_sum =
+      (const int16_t *)(const void *)activation_sum_bytes;
+  int8_t decoded[32];
+  int32_t weighted_dot = 0;
+  int32_t weighted_minimum = 0;
+  for (size_t group = 0; group < 8; ++group) {
+    const uint8_t *packed = packed_weight + (group / 2) * 32;
+    const bool high = (group & 1) != 0;
+    for (size_t lane = 0; lane < 32; ++lane) {
+      const uint8_t byte = packed[lane];
+      decoded[lane] = (int8_t)(high ? byte >> 4 : byte & UINT8_C(15));
+    }
+    weighted_dot += scale[group] * __weft_grouped_i8_dot(
+        decoded, activation + group * 32, 32);
+    weighted_minimum += minimum[group] *
+                        (activation_sum[2 * group] +
+                         activation_sum[2 * group + 1]);
+  }
+  return init + dot_scale * (float)weighted_dot -
+         minimum_scale * (float)weighted_minimum;
 }
 
 )c";
@@ -8439,6 +8579,35 @@ __weft_iq2_s_i8_vl128(
 }
 
 static inline __attribute__((always_inline, unused)) float
+__weft_iq2_s_i8_rvv(
+    const uint8_t *codes, const uint8_t *high_bits,
+    const uint8_t *sign_bits, const uint8_t *scales,
+    const uint8_t *activation_bytes, float weight_scale,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  int32_t integer_sum = 0;
+  int8_t decoded[32];
+  for (size_t group = 0; group < 8; ++group) {
+    for (size_t vector = 0; vector < 4; ++vector) {
+      const uint16_t index = (uint16_t)codes[group * 4 + vector] |
+          (uint16_t)(((uint16_t)high_bits[group] << (8 - 2 * vector)) & 0x300);
+      const int8_t *grid =
+          (const int8_t *)(const void *)&__weft_iq2_s_grid[index];
+      const uint8_t signs = sign_bits[group * 4 + vector];
+      for (size_t lane = 0; lane < 8; ++lane)
+        decoded[vector * 8 + lane] =
+            signs & (UINT8_C(1) << lane) ? -grid[lane] : grid[lane];
+    }
+    const int32_t first = __weft_i8_dot(decoded, activation + group * 32, 16);
+    const int32_t second =
+        __weft_i8_dot(decoded + 16, activation + group * 32 + 16, 16);
+    integer_sum += first * (1 + 2 * (scales[group] & UINT8_C(15)));
+    integer_sum += second * (1 + 2 * (scales[group] >> 4));
+  }
+  return init + 0.125f * (float)integer_sum * weight_scale * activation_scale;
+}
+
+static inline __attribute__((always_inline, unused)) float
 __weft_iq3_s_i8_rvv(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
@@ -8557,6 +8726,55 @@ __weft_iq1_m_i8_vl128(
 }
 
 static inline __attribute__((always_inline, unused)) float
+__weft_iq1_m_i8_rvv(
+    const uint8_t *codes, const uint8_t *high_delta_bits,
+    const uint8_t *scales, const uint8_t *activation_bytes,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  uint16_t scale_words[4];
+  for (size_t word = 0; word < 4; ++word)
+    scale_words[word] = (uint16_t)scales[2 * word] |
+                        ((uint16_t)scales[2 * word + 1] << 8);
+  const uint16_t scale_bits =
+      (scale_words[0] >> 12) | ((scale_words[1] >> 8) & 0x00f0) |
+      ((scale_words[2] >> 4) & 0x0f00) | (scale_words[3] & 0xf000);
+  int32_t grid_sum = 0;
+  int32_t delta_sum = 0;
+  int8_t grid_values[16];
+  int8_t delta_values[16];
+  for (size_t group = 0; group < 8; ++group) {
+    for (size_t vector = 0; vector < 4; ++vector) {
+      const uint8_t high = high_delta_bits[group * 2 + vector / 2];
+      const uint16_t index = (uint16_t)codes[group * 4 + vector] |
+          (uint16_t)(((uint16_t)high << (8 - 4 * (vector & 1))) & 0x700);
+      const int8_t *grid =
+          (const int8_t *)(const void *)&__weft_iq1_m_grid[index];
+      const int8_t delta =
+          high & ((vector & 1) ? UINT8_C(0x80) : UINT8_C(0x08)) ? -1 : 1;
+      for (size_t lane = 0; lane < 8; ++lane) {
+        const size_t local = (vector % 2) * 8 + lane;
+        grid_values[local] = grid[lane];
+        delta_values[local] = delta;
+      }
+      if ((vector & 1) != 0) {
+        const size_t half = vector / 2;
+        const int32_t grid_dot = __weft_i8_dot(
+            grid_values, activation + group * 32 + half * 16, 16);
+        const int32_t delta_dot = __weft_i8_dot(
+            delta_values, activation + group * 32 + half * 16, 16);
+        const unsigned shift = 6 * (group & 1);
+        const int32_t scale = 1 + 2 *
+            ((scale_words[group / 2] >> (shift + half * 3)) & 7);
+        grid_sum += grid_dot * scale;
+        delta_sum += delta_dot * scale;
+      }
+    }
+  }
+  return init + __weft_bitcast_u16_f16(scale_bits) * activation_scale *
+                    ((float)grid_sum + 0.125f * (float)delta_sum);
+}
+
+static inline __attribute__((always_inline, unused)) float
 __weft_q6_k_i8_vl128(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
@@ -8665,6 +8883,44 @@ __weft_q6_k_i8_vl128(
     q8 += 128;
   }
   return result;
+}
+
+static inline __attribute__((always_inline, unused)) float
+__weft_q6_k_i8_rvv(
+    const uint8_t *low_bits, const uint8_t *high_bits,
+    const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
+    float weight_scale, float activation_scale, float init) {
+  const int8_t *group_scales =
+      (const int8_t *)(const void *)group_scale_bytes;
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  int8_t decoded[32];
+  int32_t integer_sum = 0;
+  for (size_t half = 0; half < 2; ++half) {
+    for (size_t quarter = 0; quarter < 4; ++quarter) {
+      for (size_t lane = 0; lane < 32; ++lane) {
+        const uint8_t low0 = low_bits[half * 64 + lane];
+        const uint8_t low1 = low_bits[half * 64 + 32 + lane];
+        const uint8_t high = high_bits[half * 32 + lane];
+        uint8_t code;
+        if (quarter == 0)
+          code = (low0 & UINT8_C(15)) | (((high >> 0) & 3) << 4);
+        else if (quarter == 1)
+          code = (low1 & UINT8_C(15)) | (((high >> 2) & 3) << 4);
+        else if (quarter == 2)
+          code = (low0 >> 4) | (((high >> 4) & 3) << 4);
+        else
+          code = (low1 >> 4) | (((high >> 6) & 3) << 4);
+        decoded[lane] = (int8_t)code - 32;
+      }
+      const size_t base = half * 128 + quarter * 32;
+      const int32_t first = __weft_i8_dot(decoded, activation + base, 16);
+      const int32_t second =
+          __weft_i8_dot(decoded + 16, activation + base + 16, 16);
+      integer_sum += first * group_scales[base / 16];
+      integer_sum += second * group_scales[base / 16 + 1];
+    }
+  }
+  return init + (float)integer_sum * weight_scale * activation_scale;
 }
 
 )c";

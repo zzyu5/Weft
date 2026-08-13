@@ -343,16 +343,6 @@ def WeftKernel_ScanOp : WeftKernel_Op<"scan", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_SummaryFoldOp : WeftKernel_Op<"summary_fold", [Pure]> {
-  let arguments = (ins AnyType:$input, AnyType:$identity, AnyType:$where,
-                       AnyType:$coordinate, StrAttr:$order);
-  let results = (outs AnyType:$result);
-  let regions = (region SizedRegion<1>:$lift,
-                         SizedRegion<1>:$merge,
-                         SizedRegion<1>:$finalize);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_ArgMaxOp : WeftKernel_Op<"argmax", [Pure]> {
   let summary = "Maximum f32 value with explicit logical coordinate tie-breaking";
   let arguments = (ins AnyType:$input, AnyType:$coordinate,

@@ -59,7 +59,6 @@ from .builtins import sign_bit_i8_dot
 from .builtins import sin
 from .builtins import sort_indices
 from .builtins import store
-from .builtins import summary_fold
 from .builtins import symmetric_i4_i8_contract
 from .builtins import transpose
 from .builtins import tuple

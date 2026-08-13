@@ -1492,84 +1492,6 @@ class FrontendCompiler:
             },
         )[0]
 
-    def _intrinsic_summary_fold(self, call: ast.Call) -> Value:
-        args = self._positional_and_keywords(
-            call,
-            ("value",),
-            {
-                "identity": None,
-                "lift": None,
-                "merge": None,
-                "finalize": None,
-                "where": True,
-                "coordinate": None,
-                "order": "preserve",
-            },
-        )
-        value = self._value_argument(args["value"], call)
-        if args["identity"] is None:
-            raise FrontendError("summary_fold requires identity", self._location(call))
-        identity = self._value_argument(args["identity"], call)
-        where = self._value_argument(args["where"], call)
-        coordinate = self._value_argument(args["coordinate"], call)
-        lift = self._resolve_helper_argument(args["lift"], call, "lift")
-        merge = self._resolve_helper_argument(args["merge"], call, "merge")
-        finalize_static = args["finalize"]
-        if isinstance(finalize_static, ast.expr):
-            finalize_static = self._eval_static(finalize_static)
-        if finalize_static is not None and not isinstance(finalize_static, HelperDefinition):
-            raise FrontendError("finalize must be a pure helper or None", self._location(call))
-        order = args["order"]
-        if isinstance(order, ast.expr):
-            order = self._eval_static(order)
-
-        input_element = element_type(bare_type(value.type))
-        lift_arguments = (input_element,)
-        if not isinstance(coordinate.type, NoneType):
-            if shape_kind(coordinate.type) != shape_kind(value.type) or shape_of(
-                coordinate.type
-            ) != shape_of(value.type):
-                raise FrontendError(
-                    "summary coordinate must share the input logical domain",
-                    self._location(call),
-                )
-            lift_arguments += (element_type(bare_type(coordinate.type)),)
-        lift_region, lift_result = self._compile_helper_region(
-            lift, lift_arguments, call
-        )
-        if lift_result != identity.type:
-            raise FrontendError("lift result must match identity state", self._location(call))
-        merge_region, merge_result = self._compile_helper_region(
-            merge, (identity.type, identity.type), call
-        )
-        if merge_result != identity.type:
-            raise FrontendError("merge must be closed over state type", self._location(call))
-        if finalize_static is None:
-            finalize_region = self.builder.region((identity.type,), ("state",))
-            previous_block = self.block
-            self.block = finalize_region
-            self._emit(
-                "weft_kernel.yield",
-                call,
-                operands=(finalize_region.arguments[0],),
-            )
-            self.block = previous_block
-            result_type = identity.type
-        else:
-            if not finalize_static.pure:
-                raise FrontendError("summary finalize must be pure", self._location(call))
-            finalize_region, result_type = self._compile_helper_region(
-                finalize_static, (identity.type,), call
-            )
-        return self._emit(
-            "weft_kernel.summary_fold",
-            call,
-            operands=(value, identity, where, coordinate),
-            result_types=(result_type,),
-            attributes={"order": _string(str(order))},
-            regions=(lift_region, merge_region, finalize_region),
-        )[0]
-
     def _intrinsic_argmax(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(
             call,
@@ -2213,7 +2135,7 @@ class FrontendCompiler:
         if mutated:
             name = sorted(mutated)[0]
             raise FrontendError(
-                f"VLA body cannot mutate outer state {name!r}; use reduce/scan/summary_fold",
+                f"VLA body cannot mutate outer state {name!r}; use reduce/scan or an explicit summary primitive",
                 self._location(statement),
             )
         exported_names = sorted((assigned & live_after) - {item.optional_vars.id})

@@ -26,7 +26,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 ### 跨 VLEN 可复现性
 
-对于 `order="relaxed"` 的 floating reduce、summary fold、dot或matmul：
+对于 `order="relaxed"` 的 floating reduce、typed summary、dot或matmul：
 
 - 同一 source 在不同 VLEN、LMUL 或 target realization 上可以采用不同 parenthesization；
 - 结果低位可以不同；

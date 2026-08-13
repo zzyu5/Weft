@@ -52,7 +52,7 @@ VLA region body 不得任意修改外层 scalar / block state。
 
 - `W.reduce`；
 - `W.scan`；
-- `W.summary_fold`；
+- 显式typed summary primitive；
 - effectful memory operation；
 - atomic operation。
 
@@ -132,7 +132,7 @@ Masked value 只能：
 |---|---|
 | masked store | 不产生 store effect |
 | reduce | 不贡献，等价于该 reduce 的 identity |
-| summary fold | 不贡献，等价于 state identity |
+| typed summary | 由该primitive自身定义 |
 | dot / matmul | 不贡献，等价于乘加域的语义零元素 |
 | scan | 默认作为 identity；segment boundary 必须使用独立 `segment_start` |
 | ordinary sequential carry | 作者必须显式分支或 fill，compiler 不猜 |

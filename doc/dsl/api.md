@@ -85,13 +85,12 @@ W.reduce(value, op=..., identity=..., where=True,
 W.scan(value, op=..., identity=..., inclusive=True, where=True,
        segment_start=None, order="ordered", acc_dtype=...)
 
-W.summary_fold(value, identity=..., lift=pure_helper,
-               merge=pure_helper, finalize=None,
-               where=True, coordinate=None, order="preserve")
+W.argmax(value, coordinate, tie="lowest_coordinate", order="relaxed")
+W.online_softmax_summary(value, math="native", order="preserve")
 ```
 
 普通 sequential carry使用 scalar `W.range` / Python `while`，不会被自动提升为 reduce、scan
-或 summary fold。
+或typed summary。
 
 ## Structured compute 与 data relation
 

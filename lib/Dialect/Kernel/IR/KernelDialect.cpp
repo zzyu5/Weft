@@ -612,7 +612,7 @@ mlir::LogicalResult ReturnOp::verify() {
 mlir::LogicalResult YieldOp::verify() {
   mlir::Operation *parent = getOperation()->getBlock()->getParentOp();
   if (!parent ||
-      !mlir::isa<IfOp, ForOp, WhileOp, VLAOp, SummaryFoldOp>(parent))
+      !mlir::isa<IfOp, ForOp, WhileOp, VLAOp>(parent))
     return emitOpError("must terminate a structured Weft region");
   return mlir::success();
 }
@@ -1101,53 +1101,6 @@ mlir::LogicalResult ScanOp::verify() {
        mlir::failed(verifyFootprint(getOperation(), getSegmentStart(),
                                     getInput(), "segment_start"))))
     return mlir::failure();
-  return mlir::success();
-}
-
-mlir::LogicalResult SummaryFoldOp::verify() {
-  if (!validOrder(getOrder()) || !isPredicateType(getWhere().getType()))
-    return emitOpError("invalid summary order or predicate");
-  mlir::Type input = stateInputType(getInput().getType());
-  if (shapeKindOf(input) == ShapeKind::Scalar)
-    return emitOpError("summary_fold input must have a logical domain");
-  if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getInput(),
-                                   "where")))
-    return mlir::failure();
-  bool hasCoordinate =
-      !mlir::isa<mlir::NoneType>(getCoordinate().getType());
-  if (hasCoordinate &&
-      mlir::failed(verifyFootprint(getOperation(), getCoordinate(), getInput(),
-                                   "coordinate")))
-    return mlir::failure();
-  mlir::Type element = elementTypeOf(input);
-  mlir::Type state = getIdentity().getType();
-  mlir::Block &lift = getLift().front();
-  mlir::Block &merge = getMerge().front();
-  mlir::Block &finalize = getFinalize().front();
-  if (lift.getNumArguments() != (hasCoordinate ? 2U : 1U) ||
-      lift.getArgument(0).getType() != element ||
-      (hasCoordinate && lift.getArgument(1).getType() !=
-                            elementTypeOf(getCoordinate().getType())) ||
-      merge.getNumArguments() != 2 ||
-      merge.getArgument(0).getType() != state ||
-      merge.getArgument(1).getType() != state ||
-      finalize.getNumArguments() != 1 ||
-      finalize.getArgument(0).getType() != state)
-    return emitOpError("lift/merge/finalize argument types are inconsistent");
-  if (mlir::failed(verifyYieldBlock(getOperation(), lift, {state})) ||
-      mlir::failed(verifyYieldBlock(getOperation(), merge, {state})) ||
-      mlir::failed(verifyYieldBlock(getOperation(), finalize,
-                                    getOperation()->getResultTypes())))
-    return mlir::failure();
-  for (mlir::Region *region : {&getLift(), &getMerge(), &getFinalize()}) {
-    for (mlir::Operation &nested : region->front().getOperations()) {
-      if (mlir::isa<YieldOp>(nested))
-        continue;
-      if (!mlir::isMemoryEffectFree(&nested))
-        return emitOpError(
-            "lift/merge/finalize regions must contain only pure operations");
-    }
-  }
   return mlir::success();
 }
 

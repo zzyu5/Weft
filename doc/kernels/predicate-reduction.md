@@ -35,16 +35,11 @@ use猜测scan。
 First-index argmax通过显式coordinate形成 `(maximum, index)` state：
 
 ```python
-state = W.summary_fold(
-    value,
-    identity=W.tuple(W.neg_inf(W.f32), W.index(0)),
-    lift=argmax_lift,
-    merge=argmax_merge,
-    coordinate=i,
-    order="preserve",
+maximum, index = W.argmax(
+    value, i, tie="lowest_coordinate", order="relaxed"
 )
 ```
 
-Lift把value和logical index组成state，merge在值相等时选择较小index。RVV max reduction、
+`argmax`把value和logical index组成闭合state，并在值相等时选择较小index。RVV max reduction、
 equal mask与first-set-lane只是该summary algebra的target realization；index不是由physical
 lane number补出。

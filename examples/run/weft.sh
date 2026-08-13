@@ -23,6 +23,8 @@ case "${profile}" in
     remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
     remote_compile_flags=
     remote_link_flags="-L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm"
+    remote_ggml_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv/bin
+    remote_ggml_toolchain_lib=/opt/tcrv-toolchains/gcc-15.2.0/lib
     ;;
   k1-rvv256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -34,6 +36,8 @@ case "${profile}" in
     remote_cxx=/usr/bin/clang++-18
     remote_compile_flags=
     remote_link_flags=-lm
+    remote_ggml_build=/data/build-k1-q4k/bin
+    remote_ggml_toolchain_lib=
     ;;
   k1-ime256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -45,6 +49,8 @@ case "${profile}" in
     remote_cxx=/usr/bin/clang++-18
     remote_compile_flags=-fno-integrated-as
     remote_link_flags=-lm
+    remote_ggml_build=/data/build-k1-q4k/bin
+    remote_ggml_toolchain_lib=
     ;;
   *)
     echo "unsupported Weft target profile: ${profile}" >&2
@@ -683,9 +689,10 @@ tar -C "${local_root}" -cf - . |
         -march=${target_march} -mabi=lp64d \
         -c leaf/runtime.c -o runtime.o
       if [ '${kernel}' = q4_K_q8_K ]; then
-        ggml_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv/bin
+        ggml_build=${remote_ggml_build}
+        ggml_toolchain_lib=${remote_ggml_toolchain_lib}
         \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
-          -L/opt/tcrv-toolchains/gcc-15.2.0/lib \
+          \${ggml_toolchain_lib:+-L\"\${ggml_toolchain_lib}\"} \
           -L\"\${ggml_build}\" -Wl,-rpath,\"\${ggml_build}\" \
           -Wl,--no-as-needed -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
           -o weft_runtime
