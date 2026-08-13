@@ -1028,6 +1028,7 @@ private:
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
+  llvm::DenseSet<mlir::Operation *> materializedBlockFulls;
   unsigned indent = 0;
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
@@ -2482,7 +2483,8 @@ private:
       return emitF16Matmul(op);
     if (auto op = mlir::dyn_cast<FullOp>(operation))
       if (auto block = mlir::dyn_cast<BlockType>(op.getResult().getType());
-          block && block.getElementType().isF32())
+          block && block.getElementType().isF32() &&
+          materializedBlockFulls.contains(op.getOperation()))
         return emitMaterializedBlockFull(op);
     if (auto op = mlir::dyn_cast<ForOp>(operation))
       return emitFor(op);
@@ -4892,6 +4894,35 @@ private:
     return axes;
   }
 
+  FullOp findBlockFullRoot(mlir::Value value) const {
+    if (auto full = value.getDefiningOp<FullOp>())
+      return full;
+    if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+      auto loop =
+          mlir::dyn_cast_or_null<ForOp>(argument.getOwner()->getParentOp());
+      if (loop && argument.getArgNumber() > 0 &&
+          argument.getArgNumber() - 1 < loop.getInitArgs().size())
+        return findBlockFullRoot(
+            loop.getInitArgs()[argument.getArgNumber() - 1]);
+      return {};
+    }
+    if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+      if (auto loop = mlir::dyn_cast<ForOp>(result.getOwner());
+          loop && result.getResultNumber() < loop.getInitArgs().size())
+        return findBlockFullRoot(loop.getInitArgs()[result.getResultNumber()]);
+    return {};
+  }
+
+  mlir::LogicalResult selectMaterializedBlockStorage(mlir::Value value,
+                                                     mlir::Operation *owner) {
+    FullOp full = findBlockFullRoot(value);
+    if (!full)
+      return owner->emitError(
+          "selected local primitive has no explicit block accumulator root");
+    materializedBlockFulls.insert(full.getOperation());
+    return mlir::success();
+  }
+
   BlockAxisOp findDimensionAxis(mlir::Value value, int64_t dimension,
                                 llvm::ArrayRef<BlockAxisOp> axes) const {
     BlockAxisOp selected;
@@ -5170,6 +5201,9 @@ private:
     decision.weightScale = op.getWeightScale();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
+    if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
+                                                   op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
@@ -5713,6 +5747,9 @@ private:
     decision.weightZeroPoint = op.getWeightZeroPoint();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
+    if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
+                                                   op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
@@ -5857,6 +5894,9 @@ private:
     decision.inputLMUL = selected->second;
     decision.computeLMUL = 2 * selected->second;
     decision.kStripSchedule = VLAStripSchedule::FullThenTail;
+    if (mlir::failed(selectMaterializedBlockStorage(matmul.getInit(),
+                                                   matmul.getOperation())))
+      return std::nullopt;
     return decision;
   }
 
