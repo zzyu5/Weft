@@ -9,7 +9,7 @@ irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,em
 memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,6.288049,0.667028,GB/s
 staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RVV-intrinsic-C,tokens=128;heads=32;D=128,full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,1.101485,,
 mixed_attention,online_flash_attention_f32_f16,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,24.048709,,
-matrix_extension,q4_k_projection_ime,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,1.90734863e-06,7.62906268e-07,20.653332,1.624650,GOP/s
+matrix_extension,q4_k_projection_ime,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,1.90734863e-06,7.62906268e-07,20.572833,1.631007,GOP/s
 predicate_memory,causal_mask_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,attention[heads=32;Q=128;K=2048],full-causal-score-mask,10,0,64,full,no,,,,,11.656423,719.655421,MElements/s
 scan_state,cumsum_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,mamba_dt[sequences=1;heads=64;tokens=4096],full-inclusive-prefix-scan,10,0,64,full,no,,,0,0,0.375362,698.377431,MElements/s
 normalization,layer_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,8.64202953e-07,5.25826324e-07,0.993464,527.737291,MElements/s
@@ -20,7 +20,7 @@ dense_contraction,gemm_f32_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-
 dense_contraction,gemm_f32_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-contract,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,1558.790406,2.755321,GOP/s
 quantization,quantize_q8_0,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-ggml-q8_0-block-quantization,10,0,64,full,no,,,,,3.506476,523.319709,MElements/s
 quantized_decode,dequantize_iq4_nl,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-IQ4_NL-dequantization,10,0,64,full,no,,,0,0,5.720546,733.199943,MElements/s
-matrix_extension,q4_0_projection_ime,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,21.513736,1.559675,GOP/s
+matrix_extension,q4_0_projection_ime,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,21.503397,1.560425,GOP/s
 selection,top_k_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-summary,tokens=512;experts=256;k=8,full-router-top-k,10,0,64,full,no,,,,,2.911753,,
 state_convolution,ssm_conv_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,sequences=1;tokens=128;channels=2048;taps=4,full-short-convolution,10,0,64,full,no,,,,,2.839793,0.738488,GOP/s
 recurrent_state,ssm_scan_f32,forward,SG2044,RV64GCV-VLEN128,scalar-state-plus-RVV-intrinsic-C,sequences=1;tokens=128;heads=32;dim=64;state=16;groups=8,full-mamba2-recurrence,10,0,64,full,no,,,5.66244125e-07,5.66244125e-07,4.867462,,
@@ -71,7 +71,7 @@ irregular_decode,get_rows_q4_k,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,em
 memory_permutation,transpose_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,19.933360,0.210416,GB/s
 staged_rotation,rope_neox_f32,forward,K1/X60,RV64GCV-VLEN256,scalar-trig-plus-RVV-intrinsic-C,tokens=128;heads=32;D=128,full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,4.579574,,
 mixed_attention,online_flash_attention_f32_f16,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,Q=128;KV=128;H=32;Hkv=8;D=128,full-online-flash-attention,3,0,64,sampled,no,,,0.000451609492,0.00613875382,52.965450,,
-matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,44.155591,0.759914,GOP/s
+matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,44.174582,0.759587,GOP/s
 predicate_memory,causal_mask_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,attention[heads=32;Q=128;K=2048],full-causal-score-mask,10,0,64,full,no,,,,,12.625234,664.431857,MElements/s
 scan_state,cumsum_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,mamba_dt[sequences=1;heads=64;tokens=4096],full-inclusive-prefix-scan,10,0,64,full,no,,,0,0,1.292027,202.893593,MElements/s
 normalization,layer_norm_worker,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,hidden[128x4096],full-row-normalization,10,0,64,full,no,,,4.90550846e-07,3.08750631e-07,1.409484,371.971587,MElements/s
@@ -82,7 +82,7 @@ dense_contraction,gemm_f32_worker,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-
 dense_contraction,gemm_f32_worker,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-contract,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,5073.257008,0.846590,GOP/s
 quantization,quantize_q8_0,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-ggml-q8_0-block-quantization,10,0,64,full,no,,,,,6.410617,286.245146,MElements/s
 quantized_decode,dequantize_iq4_nl,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-IQ4_NL-dequantization,10,0,64,full,no,,,0,0,15.193561,276.057987,MElements/s
-matrix_extension,q4_0_projection_ime,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,45.606581,0.735737,GOP/s
+matrix_extension,q4_0_projection_ime,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=4096;K=4096,activation-quantize-plus-local-N16-K32-contract,10,3,64,full,yes,0,0,0,0,45.500568,0.737451,GOP/s
 selection,top_k_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-summary,tokens=512;experts=256;k=8,full-router-top-k,10,0,64,full,no,,,,,3.553878,,
 state_convolution,ssm_conv_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,sequences=1;tokens=128;channels=2048;taps=4,full-short-convolution,10,0,64,full,no,,,,,33.590298,0.062433,GOP/s
 recurrent_state,ssm_scan_f32,forward,K1/X60,RV64GCV-VLEN256,scalar-state-plus-RVV-intrinsic-C,sequences=1;tokens=128;heads=32;dim=64;state=16;groups=8,full-mamba2-recurrence,10,0,64,full,no,,,5.36441803e-07,5.36441803e-07,12.570279,,
@@ -123,5 +123,5 @@ selection,top_p_nucleus_f32,forward,K1/X60,RV64GCV-VLEN256,stable-f32-radix8-loc
 staged_transform,fwht_f32,forward,K1/X60,RV64GCV-VLEN256,source-stage-plus-RVV-intrinsic-C,batches=1024;extent=4096;stages=12,full-in-place-Walsh-Hadamard-transform,5,0,64,full,no,,,0,0,79.987938,0.629240,GOP/s
 normalization,cross_entropy_loss_gradient_f32,forward-backward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-reduce-exp-select,tokens=128;vocabulary=32768,full-stable-loss-and-gradient,5,0,64,full,no,,,1.90734863e-06,6.39154008e-07,54.883039,76.422590,MElements/s
 optimizer,adamw_f32,update,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-sqrt,parameters=16777216,full-parameter-and-moment-update,5,0,64,full,no,,,5.96046448e-08,5.82076609e-05,149.794195,3.136050,GB/s
-matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,production-activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,4.031000,8.324096,GOP/s
-matrix_extension,q4_0_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-local-fragment,M=1;N=4096;K=4096,production-activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,0.0312509537,0.0312504768,3.176424,10.563587,GOP/s
+matrix_extension,q4_k_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-leaf,M=1;N=4096;K=4096,production-activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,3.33786011e-06,3.28104943e-06,3.987958,8.413938,GOP/s
+matrix_extension,q4_0_projection_ime,decode,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-asm-local-fragment,M=1;N=4096;K=4096,production-activation-quantize-plus-ime1-gemm,10,3,64,full,yes,0,0,0.0312509537,0.0312504768,3.180467,10.550159,GOP/s
