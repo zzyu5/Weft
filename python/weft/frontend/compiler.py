@@ -1753,19 +1753,15 @@ class FrontendCompiler:
                 self.vla_outer_names,
             ) = previous
 
-    def _contract_arguments(self, call: ast.Call) -> tuple[dict[str, ast.expr | object], Value, Value]:
+    def _product_arguments(
+        self, call: ast.Call
+    ) -> tuple[dict[str, ast.expr | object], Value, Value]:
         args = self._positional_and_keywords(
             call,
             ("lhs", "rhs"),
             {
                 "init": None,
-                "lhs_axes": None,
-                "rhs_axes": None,
-                "output_order": None,
                 "acc_dtype": None,
-                "out_dtype": None,
-                "where_lhs": True,
-                "where_rhs": True,
                 "order": "relaxed",
                 "math": "native",
             },
@@ -1774,23 +1770,18 @@ class FrontendCompiler:
         rhs = self._value_argument(args["rhs"], call)
         return args, lhs, rhs
 
-    def _intrinsic_contract(self, call: ast.Call) -> Value:
-        args, lhs, rhs = self._contract_arguments(call)
-        return self._emit_contract(call, args, lhs, rhs)
-
     def _intrinsic_dot(self, call: ast.Call) -> Value:
-        args, lhs, rhs = self._contract_arguments(call)
-        lhs_shape = shape_of(lhs.type)
-        rhs_shape = shape_of(rhs.type)
-        if lhs_shape is None or rhs_shape is None or len(lhs_shape) not in {1, 2} or len(rhs_shape) not in {1, 2}:
-            raise FrontendError("W.dot supports rank-one or rank-two blocks", self._location(call))
-        args["lhs_axes"] = (len(lhs_shape) - 1,)
-        args["rhs_axes"] = (0,)
-        return self._emit_contract(call, args, lhs, rhs)
+        args, lhs, rhs = self._product_arguments(call)
+        return self._emit_product(call, "dot", args, lhs, rhs)
 
-    def _emit_contract(
+    def _intrinsic_matmul(self, call: ast.Call) -> Value:
+        args, lhs, rhs = self._product_arguments(call)
+        return self._emit_product(call, "matmul", args, lhs, rhs)
+
+    def _emit_product(
         self,
         call: ast.Call,
+        kind: str,
         args: dict[str, ast.expr | object],
         lhs: Value,
         rhs: Value,
@@ -1801,110 +1792,82 @@ class FrontendCompiler:
             rhs_bare, (BlockType, RegionType)
         ):
             raise FrontendError(
-                "contract operands must be logical block or VLA region values",
+                f"{kind} operands must be logical block or VLA region values",
                 self._location(call),
             )
         static: dict[str, object] = {}
-        for name in ("lhs_axes", "rhs_axes", "output_order", "acc_dtype", "out_dtype", "order", "math"):
+        for name in ("acc_dtype", "order", "math"):
             item = args[name]
             static[name] = self._eval_static(item) if isinstance(item, ast.expr) else item
-        lhs_axes = static["lhs_axes"]
-        rhs_axes = static["rhs_axes"]
-        if not isinstance(lhs_axes, tuple) or not isinstance(rhs_axes, tuple) or not lhs_axes:
-            raise FrontendError("contract requires non-empty axis tuples", self._location(call))
-        if len(lhs_axes) != len(rhs_axes) or any(
-            isinstance(axis, bool) or not isinstance(axis, int)
-            for axis in lhs_axes + rhs_axes
-        ):
-            raise FrontendError("contract axes must be equally sized integer tuples", self._location(call))
-        if isinstance(lhs_bare, RegionType) and 0 in lhs_axes:
-            raise FrontendError(
-                "the active VLA axis cannot be a contraction axis",
-                self._location(call),
-            )
-        if isinstance(rhs_bare, RegionType) and 0 in rhs_axes:
-            raise FrontendError(
-                "the active VLA axis cannot be a contraction axis",
-                self._location(call),
-            )
-        lhs_free = [
-            axis
-            for axis in range(len(lhs_bare.shape))
-            if axis not in lhs_axes
-            and not (isinstance(lhs_bare, RegionType) and axis == 0)
-        ]
-        rhs_free = [
-            axis
-            for axis in range(len(rhs_bare.shape))
-            if axis not in rhs_axes
-            and not (isinstance(rhs_bare, RegionType) and axis == 0)
-        ]
-        has_region = isinstance(lhs_bare, RegionType) or isinstance(
-            rhs_bare, RegionType
-        )
-        output_shape = ([-1] if has_region else []) + [
-            lhs_bare.shape[axis] for axis in lhs_free
-        ] + [
-            rhs_bare.shape[axis] for axis in rhs_free
-        ]
-        output_order = static["output_order"]
-        if output_order is not None:
-            if not isinstance(output_order, tuple) or sorted(output_order) != list(range(len(output_shape))):
-                raise FrontendError("output_order must permute output axes", self._location(call))
-            if has_region and output_order[0] != 0:
+        lhs_region = isinstance(lhs_bare, RegionType)
+        rhs_region = isinstance(rhs_bare, RegionType)
+        if kind == "dot":
+            rhs_is_vector = isinstance(rhs_bare, BlockType) and len(rhs_bare.shape) == 1
+            rhs_is_vla_rows = rhs_region and len(rhs_bare.shape) == 2
+            if (
+                len(lhs_bare.shape) != 2
+                or (not rhs_is_vector and not rhs_is_vla_rows)
+                or (lhs_region and not rhs_is_vector)
+                or (rhs_region and not isinstance(lhs_bare, BlockType))
+            ):
                 raise FrontendError(
-                    "output_order must keep the active VLA axis first",
+                    "W.dot supports [R,K] x [K], [VLA,K] x [K], or [R,K] x [VLA,K]",
                     self._location(call),
                 )
-            output_shape = [output_shape[axis] for axis in output_order]
+            output_shape = ([-1] if lhs_region or rhs_region else []) + (
+                [] if lhs_region else [lhs_bare.shape[0]]
+            )
+        elif kind == "matmul":
+            if (
+                not isinstance(lhs_bare, BlockType)
+                or not isinstance(rhs_bare, BlockType)
+                or len(lhs_bare.shape) != 2
+                or len(rhs_bare.shape) != 2
+            ):
+                raise FrontendError(
+                    "W.matmul requires local [M,K] x [K,N] block operands",
+                    self._location(call),
+                )
+            output_shape = [lhs_bare.shape[0], rhs_bare.shape[1]]
+        else:
+            raise AssertionError(f"unknown structured product {kind}")
+        has_region = lhs_region or rhs_region
         acc_dtype = static["acc_dtype"]
-        if acc_dtype is None:
-            if args["init"] is None:
-                acc_type = element_type(lhs.type)
-            else:
-                provisional_init = self._value_argument(args["init"], call)
-                acc_type = element_type(provisional_init.type)
-                args["init"] = provisional_init
-        elif isinstance(acc_dtype, DType):
+        if isinstance(acc_dtype, DType):
             acc_type = ScalarType(acc_dtype)
         else:
-            raise FrontendError("acc_dtype must be a Weft dtype", self._location(call))
-        out_dtype = static["out_dtype"]
-        out_type = ScalarType(out_dtype) if isinstance(out_dtype, DType) else acc_type
+            raise FrontendError(
+                f"W.{kind} requires an explicit acc_dtype", self._location(call)
+            )
         result_type: ValueType = (
-            RegionType(tuple(output_shape), out_type)
+            RegionType(tuple(output_shape), acc_type)
             if has_region
-            else BlockType(tuple(output_shape), out_type)
+            else BlockType(tuple(output_shape), acc_type)
             if output_shape
-            else out_type
+            else acc_type
         )
         init_arg = args["init"]
+        if init_arg is None:
+            raise FrontendError(
+                f"W.{kind} requires an explicit accumulator init",
+                self._location(call),
+            )
         if isinstance(init_arg, Value):
             init = init_arg
-        elif init_arg is None:
-            zero = 0.0 if isinstance(acc_type, ScalarType) and acc_type.dtype.category in {DTypeCategory.FLOAT, DTypeCategory.BFLOAT} else 0
-            assert isinstance(acc_type, ScalarType)
-            init = self._constant(zero, acc_type.dtype, call)
         else:
             init = self._value_argument(init_arg, call)
         if shape_kind(init.type) != "scalar" and bare_type(init.type) != result_type:
             raise FrontendError(
-                "contract init must be scalar or exactly output-shaped",
+                f"{kind} init must be scalar or exactly output-shaped",
                 self._location(call),
             )
-        where_lhs = self._value_argument(args["where_lhs"], call)
-        where_rhs = self._value_argument(args["where_rhs"], call)
         return self._emit(
-            "weft_kernel.contract",
+            f"weft_kernel.{kind}",
             call,
-            operands=(lhs, rhs, init, where_lhs, where_rhs),
+            operands=(lhs, rhs, init),
             result_types=(result_type,),
             attributes={
-                "lhs_axes": _dense_i64(lhs_axes),
-                "rhs_axes": _dense_i64(rhs_axes),
-                "output_order": _dense_i64(output_order or ()),
                 "acc_dtype": emit_type(acc_type),
-                "out_dtype": emit_type(out_type),
                 "order": _string(str(static["order"])),
                 "math": _string(str(static["math"])),
             },

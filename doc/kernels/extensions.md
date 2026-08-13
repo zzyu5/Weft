@@ -119,5 +119,5 @@ VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 r
 - public ABI、persistent layout、outer loop、staging与cross-primitive state仍在Kernel IR；
 - target可以为同一op提供多个local realization，不需要复制完整operator emitter。
 
-若新硬件只更快实现已有 `W.contract`、`W.reduce` 或memory semantics，应只增加target-local
+若新硬件只更快实现已有 `W.dot`、`W.matmul`、`W.reduce` 或memory semantics，应只增加target-local
 realization，不增加extension op。

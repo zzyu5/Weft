@@ -106,12 +106,10 @@ def mul_mat_id_f32(
                     activation_base + reduction,
                     other=W.f32(0.0),
                 )
-                value = W.contract(
+                value = W.dot(
                     lhs,
                     rhs,
                     init=W.zeros((6,), dtype=W.f32),
-                    lhs_axes=(1,),
-                    rhs_axes=(0,),
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",

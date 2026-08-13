@@ -42,7 +42,7 @@ Target lowering可以决定：
 它不得：
 
 - 根据kernel名、operator名、q-format名或整体shape选择完整模板；
-- 从tensor shape猜source loop、state boundary或contraction identity；
+- 从tensor shape猜source loop、state boundary或dot/matmul identity；
 - 创建source中不存在的cache blocking、staging、persistent layout或state algebra；
 - 从`materials/`、GGML、旧route registry或旧emitter读取production代码；
 - 对unsupported primitive使用catch-all、legacy或GGML fallback。

@@ -28,13 +28,11 @@ def solve_lower_triangular_f32(
                     + inner[None, :] * rhs_columns
                     + column[:, None]
                 )
-                result = W.contract(
+                result = W.dot(
                     previous,
                     coefficient,
                     init=W.load(rhs_batch + row * rhs_columns + column)
                     / diagonal,
-                    lhs_axes=(1,),
-                    rhs_axes=(0,),
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",

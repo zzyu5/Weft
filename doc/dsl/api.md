@@ -96,13 +96,10 @@ W.summary_fold(value, identity=..., lift=pure_helper,
 ## Structured compute 与 data relation
 
 ```python
-W.contract(lhs, rhs, init=...,
-           lhs_axes=(...), rhs_axes=(...), output_order=None,
-           acc_dtype=..., out_dtype=...,
-           where_lhs=True, where_rhs=True,
-           order="relaxed", math="native")
-
-W.dot(lhs, rhs, ...)          # rank-1/rank-2 contract sugar
+W.dot(lhs, rhs, init=..., acc_dtype=...,
+      order="relaxed", math="native")
+W.matmul(lhs, rhs, init=..., acc_dtype=...,
+         order="relaxed", math="native")
 W.permute(value, permutation)
 W.lookup(table, indices, where=True)
 W.decode(codes, table, where=True, out_dtype=...)

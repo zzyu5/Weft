@@ -26,7 +26,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 ### 跨 VLEN 可复现性
 
-对于 `order="relaxed"` 的 floating reduce、summary fold 或 contract：
+对于 `order="relaxed"` 的 floating reduce、summary fold、dot或matmul：
 
 - 同一 source 在不同 VLEN、LMUL 或 target realization 上可以采用不同 parenthesization；
 - 结果低位可以不同；
@@ -37,7 +37,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 `math` 至少支持：
 
-- `"strict"`：禁止未授权近似和 contraction；
+- `"strict"`：禁止未授权近似和乘加融合；
 - `"native"`：允许目标原生精度与已定义的 fused instruction；
 - `"fast"`：允许显式文档化的近似数学 realization。
 
@@ -63,7 +63,7 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 extension primitive表达。Persistent packed layout与写入位置仍属于 source algorithm。
 
 如果某个 RISC-V 扩展改变 observable scale、zero-point、codebook、rounding、saturation或
-accumulation语义，必须增加新的局部 primitive或显式属性，不能伪装成普通 cast/contract
+accumulation语义，必须增加新的局部 primitive或显式属性，不能伪装成普通 cast/dot
 的无差别 lowering。
 
 `W.bitcast(value, dtype)` 只允许相同固定 bit width 的 scalar element type，并逐元素保留

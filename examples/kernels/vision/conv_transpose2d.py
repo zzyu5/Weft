@@ -104,12 +104,10 @@ def conv_transpose2d_p0_f32(
                                 where=weight_channel < output_channels,
                                 other=W.f32(0.0),
                             )
-                            value = W.contract(
+                            value = W.dot(
                                 weight_value,
                                 input_value,
                                 init=W.zeros((6,), dtype=W.f32),
-                                lhs_axes=(1,),
-                                rhs_axes=(0,),
                                 acc_dtype=W.f32,
                                 order="relaxed",
                                 math="native",

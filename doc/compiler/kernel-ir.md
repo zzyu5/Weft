@@ -11,7 +11,7 @@ Canonical Kernel IR 保存完整 worker-local algorithm：
 - pointer/index、logical predicate、masked value与memory effect；
 - pointwise、conversion与special value；
 - reduce、scan、summary fold与sequential carry的observable distinction；
-- contract、lookup、decode、permute与typed local extension primitive；
+- dot、matmul、lookup、decode、permute与typed local extension primitive；
 - source meta value、source location与numerical attributes。
 
 它不得保存 exact `vl`、LMUL、register number、register microtile、target realization ID、
@@ -61,7 +61,7 @@ memory and validity
   weft_kernel.valid / fill
 
 state and structured compute
-  weft_kernel.reduce / scan / summary_fold / contract
+  weft_kernel.reduce / scan / summary_fold / dot / matmul
   weft_kernel.permute / lookup / decode
 ```
 
@@ -78,8 +78,8 @@ state and structured compute
   Active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出lexical region。
 - `summary_fold` 的value、可选coordinate、identity与where都是显式operand；coordinate若存在
   必须与value共享logical domain。Lift/merge/finalize region必须闭合、pure并以 `yield` 终结。
-- `contract` 的paired axes、where footprint、init/result shape与dtype必须由IR显式保存并局部
-  verify。
+- `dot`固定收缩双方最后一个logical block axis；`matmul`固定表达`[M,K] x [K,N]`。
+  两者的init/result shape、accumulator dtype与numerical policy必须由IR显式保存并局部verify。
 
 ## Extension dialect
 

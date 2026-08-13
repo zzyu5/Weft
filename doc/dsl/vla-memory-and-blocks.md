@@ -133,11 +133,11 @@ Masked value 只能：
 | masked store | 不产生 store effect |
 | reduce | 不贡献，等价于该 reduce 的 identity |
 | summary fold | 不贡献，等价于 state identity |
-| contract | 不贡献，等价于 contraction algebra 的语义零元素 |
+| dot / matmul | 不贡献，等价于乘加域的语义零元素 |
 | scan | 默认作为 identity；segment boundary 必须使用独立 `segment_start` |
 | ordinary sequential carry | 作者必须显式分支或 fill，compiler 不猜 |
 
-对于量化/编码 operand，contract 的“语义零”不一定是物理 bit pattern `0`。Target lowering 必须根据 primitive 语义处理。
+对于量化/编码operand，局部dot primitive的“语义零”不一定是物理bit pattern `0`。Target lowering必须根据primitive语义处理。
 
 ### Predicate 到物理长度的吸收
 
@@ -204,7 +204,7 @@ Target lowering 可以吸收 structured primitive 附近的纯 producer / consum
 - 不根据完整 kernel 名匹配；
 - 选择仍绑定到明确 primitive/interface。
 
-这允许实现 fused dequantize + contract，也允许在 effect、alias 与 numerical legality 成立时
+这允许实现 fused dequantize + dot/matmul，也允许在 effect、alias 与 numerical legality 成立时
 联合 lower 相邻 primitive、共享 load/register/schedule；每个 primitive 的 observable boundary
 必须保留。它不允许从任意 multiply/add graph 自动发现 GEMM。
 

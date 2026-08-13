@@ -884,20 +884,20 @@ private:
         affineI4I8Decisions.try_emplace(nLoop.getOperation(),
                                        std::move(*decision));
     });
-    kernel.walk([&](ContractOp contract) {
+    kernel.walk([&](MatmulOp matmul) {
       if (decisionFailure)
         return;
-      ForOp kLoop = contract->getParentOfType<ForOp>();
+      ForOp kLoop = matmul->getParentOfType<ForOp>();
       ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
       if (!nLoop)
         return;
       if (f16ContractDecisions.contains(nLoop.getOperation())) {
-        contract.emitError("one source N loop cannot own multiple F16 contract decisions");
+        matmul.emitError("one source N loop cannot own multiple F16 matmul decisions");
         decisionFailure = true;
         return;
       }
       std::optional<F16GemmNTileDecision> decision =
-          decideF16GemmNTiles(contract);
+          decideF16GemmNTiles(matmul);
       if (decision)
         f16ContractDecisions.try_emplace(nLoop.getOperation(),
                                          std::move(*decision));
@@ -905,11 +905,11 @@ private:
     kernel.walk([&](StoreOp store) {
       if (decisionFailure || isRegionValue(store.getValue().getType()))
         return;
-      auto contract = store.getValue().getDefiningOp<ContractOp>();
-      if (!contract || !contract.getResult().hasOneUse())
+      auto dot = store.getValue().getDefiningOp<DotOp>();
+      if (!dot || !dot.getResult().hasOneUse())
         return;
       mlir::FailureOr<ContractDecision> decision =
-          decideLocalF32RowMicrotile(store, contract);
+          decideLocalF32RowMicrotile(store, dot);
       if (mlir::failed(decision)) {
         decisionFailure = true;
         return;
@@ -917,7 +917,7 @@ private:
       if (!localF32ContractDecisions
                .try_emplace(store.getOperation(), std::move(*decision))
                .second) {
-        store.emitError("one store cannot own multiple local contract decisions");
+        store.emitError("one store cannot own multiple local dot decisions");
         decisionFailure = true;
       }
     });
@@ -1284,7 +1284,7 @@ private:
 
   mlir::FailureOr<VLAContractDecision>
   decideVLAF32FreeAxisMicrotile(VLAOp vla, StoreOp store,
-                                 ContractOp contract) {
+                                 DotOp dot) {
     auto unwrapBlock = [](mlir::Type type) -> BlockType {
       if (auto masked = mlir::dyn_cast<MaskedType>(type))
         type = masked.getValueType();
@@ -1296,11 +1296,11 @@ private:
       return mlir::dyn_cast<RegionType>(type);
     };
 
-    BlockType lhsType = unwrapBlock(contract.getLhs().getType());
-    RegionType rhsType = unwrapRegion(contract.getRhs().getType());
-    RegionType resultType = unwrapRegion(contract.getResult().getType());
-    if (store.getValue() != contract.getResult() ||
-        !contract.getResult().hasOneUse() || !lhsType || !rhsType ||
+    BlockType lhsType = unwrapBlock(dot.getLhs().getType());
+    RegionType rhsType = unwrapRegion(dot.getRhs().getType());
+    RegionType resultType = unwrapRegion(dot.getResult().getType());
+    if (store.getValue() != dot.getResult() ||
+        !dot.getResult().hasOneUse() || !lhsType || !rhsType ||
         !resultType || lhsType.getShape().size() != 2 ||
         rhsType.getShape().size() != 2 || resultType.getShape().size() != 2 ||
         rhsType.getShape()[0] != -1 || resultType.getShape()[0] != -1 ||
@@ -1310,25 +1310,20 @@ private:
         !lhsType.getElementType().isF32() ||
         !rhsType.getElementType().isF32() ||
         !resultType.getElementType().isF32() ||
-        !isFloatConstant(contract.getInit(), 0.0) ||
-        contract.getLhsAxes().size() != 1 ||
-        contract.getRhsAxes().size() != 1 ||
-        contract.getLhsAxes().front() != 1 ||
-        contract.getRhsAxes().front() != 1 ||
-        contract.getOrder() != "relaxed" || contract.getMath() != "native" ||
-        !contract.getAccDtype().isF32() || !contract.getOutDtype().isF32() ||
-        !isTrue(contract.getWhereLhs()) || !isTrue(contract.getWhereRhs())) {
-      contract.emitError(
-          "RVV VLA contract requires a [BM,K] x [VLA,K] local f32 primitive");
+        !isFloatConstant(dot.getInit(), 0.0) ||
+        dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
+        !dot.getAccDtype().isF32()) {
+      dot.emitError(
+          "RVV VLA dot requires a [BM,K] x [VLA,K] local f32 primitive");
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = dot.getLhs().getDefiningOp<LoadOp>();
+    LoadOp rhsLoad = dot.getRhs().getDefiningOp<LoadOp>();
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere()) ||
         (!isTrue(lhsLoad.getWhere()) &&
          !isFloatConstant(lhsLoad.getOther(), 0.0))) {
-      contract.emitError("RVV VLA contract load facts are unavailable");
+      dot.emitError("RVV VLA dot load facts are unavailable");
       return mlir::failure();
     }
 
@@ -1339,16 +1334,16 @@ private:
     llvm::SmallVector<BlockAxisOp> lhsAxes;
     llvm::SmallVector<BlockAxisOp> rhsAxes;
     llvm::SmallVector<BlockAxisOp> outputAxes;
-    collectLocalDefinitions(contract.getLhs(), block, lhsDefinitions, lhsAxes);
-    collectLocalDefinitions(contract.getRhs(), block, rhsDefinitions, rhsAxes);
+    collectLocalDefinitions(dot.getLhs(), block, lhsDefinitions, lhsAxes);
+    collectLocalDefinitions(dot.getRhs(), block, rhsDefinitions, rhsAxes);
     collectLocalDefinitions(store.getPointer(), block, outputDefinitions,
                             outputAxes);
     collectLocalDefinitions(store.getWhere(), block, outputDefinitions,
                             outputAxes);
     if (rhsAxes.size() != 1 || lhsAxes.size() != 2 || outputAxes.size() != 1 ||
         !llvm::is_contained(lhsAxes, rhsAxes.front())) {
-      contract.emitError(
-          "RVV VLA contract requires explicit row and shared reduction axes");
+      dot.emitError(
+          "RVV VLA dot requires explicit row and shared reduction axes");
       return mlir::failure();
     }
     BlockAxisOp reductionAxis = rhsAxes.front();
@@ -1357,8 +1352,8 @@ private:
                               : lhsAxes.front();
     if (outputAxes.front() != rowAxis ||
         integerConstantValue(rowAxis.getExtent()) != lhsType.getShape()[0]) {
-      contract.emitError(
-          "RVV VLA contract result axes do not preserve the local row block");
+      dot.emitError(
+          "RVV VLA dot result axes do not preserve the local row block");
       return mlir::failure();
     }
 
@@ -1394,8 +1389,8 @@ private:
         !dependsOn(store.getPointer(), rowAxis.getResult()) ||
         dependsOn(store.getPointer(), reductionAxis.getResult()) ||
         dependsOn(store.getWhere(), reductionAxis.getResult())) {
-      contract.emitError(
-          "RVV VLA contract memory relations are unavailable");
+      dot.emitError(
+          "RVV VLA dot memory relations are unavailable");
       return mlir::failure();
     }
 
@@ -1406,13 +1401,13 @@ private:
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
 
     VLAContractDecision decision;
-    decision.operation = contract.getOperation();
+    decision.operation = dot.getOperation();
     decision.realization =
         VLAContractRealization::RVVF32FreeAxisMicrotile;
     decision.consumer = store.getOperation();
     decision.lhsLoad = lhsLoad.getOperation();
     decision.rhsLoad = rhsLoad.getOperation();
-    decision.init = contract.getInit();
+    decision.init = dot.getInit();
     decision.rowAxis = rowAxis.getResult();
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
@@ -1421,8 +1416,8 @@ private:
         selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
                                         decision.rowTile, 1);
     if (!physical) {
-      contract.emitError(
-          "RVV VLA contract has no legal register microtile candidate");
+      dot.emitError(
+          "RVV VLA dot has no legal register microtile candidate");
       return mlir::failure();
     }
     decision.lmul = physical->lmul;
@@ -1441,7 +1436,7 @@ private:
 
   mlir::FailureOr<VLAContractDecision>
   decideVLAF32FreeAxisVectorDot(VLAOp vla, StoreOp store,
-                                ContractOp contract) {
+                                DotOp dot) {
     auto unwrapBlock = [](mlir::Type type) -> BlockType {
       if (auto masked = mlir::dyn_cast<MaskedType>(type))
         type = masked.getValueType();
@@ -1453,12 +1448,12 @@ private:
       return mlir::dyn_cast<RegionType>(type);
     };
 
-    RegionType lhsType = unwrapRegion(contract.getLhs().getType());
-    BlockType rhsType = unwrapBlock(contract.getRhs().getType());
-    RegionType initType = unwrapRegion(contract.getInit().getType());
-    RegionType resultType = unwrapRegion(contract.getResult().getType());
-    if (store.getValue() != contract.getResult() ||
-        !contract.getResult().hasOneUse() || !lhsType || !rhsType ||
+    RegionType lhsType = unwrapRegion(dot.getLhs().getType());
+    BlockType rhsType = unwrapBlock(dot.getRhs().getType());
+    RegionType initType = unwrapRegion(dot.getInit().getType());
+    RegionType resultType = unwrapRegion(dot.getResult().getType());
+    if (store.getValue() != dot.getResult() ||
+        !dot.getResult().hasOneUse() || !lhsType || !rhsType ||
         !initType || !resultType || lhsType.getShape().size() != 2 ||
         rhsType.getShape().size() != 1 || initType.getShape().size() != 1 ||
         resultType.getShape().size() != 1 || lhsType.getShape()[0] != -1 ||
@@ -1468,21 +1463,16 @@ private:
         !rhsType.getElementType().isF32() ||
         !initType.getElementType().isF32() ||
         !resultType.getElementType().isF32() ||
-        contract.getLhsAxes().size() != 1 ||
-        contract.getRhsAxes().size() != 1 ||
-        contract.getLhsAxes().front() != 1 ||
-        contract.getRhsAxes().front() != 0 ||
-        contract.getOrder() != "relaxed" || contract.getMath() != "native" ||
-        !contract.getAccDtype().isF32() || !contract.getOutDtype().isF32() ||
-        !isTrue(contract.getWhereLhs()) || !isTrue(contract.getWhereRhs())) {
-      contract.emitError(
+        dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
+        !dot.getAccDtype().isF32()) {
+      dot.emitError(
           "RVV VLA vector dot requires a [VLA,K] x [K] local f32 primitive");
       return mlir::failure();
     }
 
-    LoadOp freeLoad = contract.getLhs().getDefiningOp<LoadOp>();
+    LoadOp freeLoad = dot.getLhs().getDefiningOp<LoadOp>();
     if (!freeLoad || !isTrue(freeLoad.getWhere())) {
-      contract.emitError("RVV VLA vector-dot load facts are unavailable");
+      dot.emitError("RVV VLA vector-dot load facts are unavailable");
       return mlir::failure();
     }
 
@@ -1493,8 +1483,8 @@ private:
     llvm::SmallVector<BlockAxisOp> freeAxes;
     llvm::SmallVector<BlockAxisOp> blockedAxes;
     llvm::SmallVector<BlockAxisOp> outputAxes;
-    collectLocalDefinitions(contract.getLhs(), block, freeDefinitions, freeAxes);
-    collectLocalDefinitions(contract.getRhs(), block, blockedDefinitions,
+    collectLocalDefinitions(dot.getLhs(), block, freeDefinitions, freeAxes);
+    collectLocalDefinitions(dot.getRhs(), block, blockedDefinitions,
                             blockedAxes);
     collectLocalDefinitions(store.getPointer(), block, outputDefinitions,
                             outputAxes);
@@ -1502,7 +1492,7 @@ private:
                             outputAxes);
     if (freeAxes.size() != 1 || blockedAxes.size() != 1 ||
         freeAxes.front() != blockedAxes.front() || !outputAxes.empty()) {
-      contract.emitError(
+      dot.emitError(
           "RVV VLA vector dot requires one shared explicit reduction axis");
       return mlir::failure();
     }
@@ -1528,14 +1518,14 @@ private:
          outputRelation != LaneRelation::Strided) ||
         !dependsOn(freeLoad.getPointer(), coordinate) ||
         !dependsOn(freeLoad.getPointer(), reductionAxis.getResult()) ||
-        !dependsOn(contract.getInit(), coordinate) ||
-        dependsOn(contract.getInit(), reductionAxis.getResult()) ||
+        !dependsOn(dot.getInit(), coordinate) ||
+        dependsOn(dot.getInit(), reductionAxis.getResult()) ||
         !dependsOn(store.getPointer(), coordinate) ||
         dependsOn(store.getPointer(), reductionAxis.getResult()) ||
         !isTrue(store.getWhere()) ||
-        dependsOn(contract.getRhs(), coordinate) ||
-        !dependsOn(contract.getRhs(), reductionAxis.getResult())) {
-      contract.emitError("RVV VLA vector-dot memory relations are unavailable");
+        dependsOn(dot.getRhs(), coordinate) ||
+        !dependsOn(dot.getRhs(), reductionAxis.getResult())) {
+      dot.emitError("RVV VLA vector-dot memory relations are unavailable");
       return mlir::failure();
     }
 
@@ -1546,17 +1536,17 @@ private:
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
     llvm::DenseSet<mlir::Operation *> initDefinitions;
     llvm::SmallVector<BlockAxisOp> initAxes;
-    collectLocalDefinitions(contract.getInit(), block, initDefinitions, initAxes);
+    collectLocalDefinitions(dot.getInit(), block, initDefinitions, initAxes);
     for (mlir::Operation *operation : initDefinitions)
       absorbed.erase(operation);
 
     VLAContractDecision decision;
-    decision.operation = contract.getOperation();
+    decision.operation = dot.getOperation();
     decision.realization = VLAContractRealization::RVVF32FreeAxisVectorDot;
     decision.consumer = store.getOperation();
     decision.freeLoad = freeLoad.getOperation();
-    decision.blockedOperand = contract.getRhs();
-    decision.init = contract.getInit();
+    decision.blockedOperand = dot.getRhs();
+    decision.init = dot.getInit();
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = 1;
@@ -1564,7 +1554,7 @@ private:
         selectF32ContractPhysicalConfig(F32ContractResourceModel::VLAFreeAxis,
                                         decision.rowTile, 1);
     if (!physical) {
-      contract.emitError(
+      dot.emitError(
           "RVV VLA vector dot has no legal register candidate");
       return mlir::failure();
     }
@@ -1607,15 +1597,15 @@ private:
 
     for (mlir::Operation *nested : physicalOperations) {
       auto store = mlir::dyn_cast<StoreOp>(nested);
-      auto contract =
-          store ? store.getValue().getDefiningOp<ContractOp>() : ContractOp{};
-      if (!contract || !isRegionValue(contract.getResult().getType()))
+      auto dot =
+          store ? store.getValue().getDefiningOp<DotOp>() : DotOp{};
+      if (!dot || !isRegionValue(dot.getResult().getType()))
         continue;
       mlir::FailureOr<VLAContractDecision> selected =
-          isRegionValue(contract.getLhs().getType()) &&
-                  containsBlockType(contract.getRhs().getType())
-              ? decideVLAF32FreeAxisVectorDot(op, store, contract)
-              : decideVLAF32FreeAxisMicrotile(op, store, contract);
+          isRegionValue(dot.getLhs().getType()) &&
+                  containsBlockType(dot.getRhs().getType())
+              ? decideVLAF32FreeAxisVectorDot(op, store, dot)
+              : decideVLAF32FreeAxisMicrotile(op, store, dot);
       if (mlir::failed(selected))
         return mlir::failure();
       decision.contracts.push_back(std::move(*selected));
@@ -1623,19 +1613,19 @@ private:
     if (!decision.contracts.empty()) {
       decision.physical.dataLMUL = decision.contracts.front().lmul;
       if (!llvm::all_of(decision.contracts,
-                        [&](const VLAContractDecision &contract) {
-                          return contract.lmul == decision.physical.dataLMUL;
+                        [&](const VLAContractDecision &dot) {
+                          return dot.lmul == decision.physical.dataLMUL;
                         })) {
-        op.emitError("one VLA region requires one shared contract LMUL");
+        op.emitError("one VLA region requires one shared dot LMUL");
         return mlir::failure();
       }
     }
 
     auto isContractOwned = [&](mlir::Operation *operation) {
       return llvm::any_of(
-          decision.contracts, [&](const VLAContractDecision &contract) {
-            return contract.consumer == operation ||
-                   llvm::is_contained(contract.absorbed, operation);
+          decision.contracts, [&](const VLAContractDecision &dot) {
+            return dot.consumer == operation ||
+                   llvm::is_contained(dot.absorbed, operation);
           });
     };
 
@@ -2516,6 +2506,9 @@ private:
       return emitQuantCodebookI8Dot(op, "__weft_q6_k_i8_vl128");
     if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
       return emitSymmetricI4I8Contract(op);
+    if (mlir::isa<MatmulOp>(operation))
+      return operation->emitError(
+          "matmul must be consumed by its prepared local physical decision");
     if (auto op = mlir::dyn_cast<FullOp>(operation)) {
       auto block = mlir::dyn_cast<BlockType>(op.getResult().getType());
       if (block && block.getShape() == llvm::ArrayRef<int64_t>({16}) &&
@@ -4292,7 +4285,7 @@ private:
   mlir::LogicalResult emitVLAContract(const VLAContractDecision &decision) {
     if (decision.realization ==
         VLAContractRealization::RVVF32FreeAxisVectorDot) {
-      auto contract = mlir::cast<ContractOp>(decision.operation);
+      auto dot = mlir::cast<DotOp>(decision.operation);
       auto store = mlir::cast<StoreOp>(decision.consumer);
       auto freeLoad = mlir::cast<LoadOp>(decision.freeLoad);
       std::string extent = expression(decision.reductionExtent);
@@ -4301,7 +4294,7 @@ private:
           decision.initRealization !=
               VLAContractInitRealization::MaterializedRegion ||
           init.kind != CValueKind::F32Vector || init.spelling.empty())
-        return contract.emitError(
+        return dot.emitError(
             "RVV VLA vector-dot physical operands are unavailable");
 
       std::string vectorSuffix = "f32m" + std::to_string(decision.lmul);
@@ -4314,7 +4307,7 @@ private:
       std::optional<std::string> outputLaneStride = projectVLALaneStride(
           store.getPointer(), activeVLADecision->coordinate, baseAxes);
       if (!outputPointer || !outputLaneStride)
-        return contract.emitError(
+        return dot.emitError(
             "RVV VLA vector-dot output projection is unavailable");
 
       std::string accumulator = fresh("vla_contract_acc");
@@ -4339,7 +4332,7 @@ private:
         std::optional<std::string> blocked =
             projectBlockScalar(decision.blockedOperand, axes);
         if (!freePointer || !freeLaneStride || !blocked)
-          return contract.emitError(
+          return dot.emitError(
               "RVV VLA vector-dot operand projection is unavailable");
         std::string vector = fresh("vla_contract_free");
         if (decision.freeMemoryMode == VLAMemoryMode::UnitStride) {
@@ -4370,14 +4363,14 @@ private:
       return mlir::success();
     }
 
-    auto contract = mlir::cast<ContractOp>(decision.operation);
+    auto dot = mlir::cast<DotOp>(decision.operation);
     auto store = mlir::cast<StoreOp>(decision.consumer);
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
     std::string extent = expression(decision.reductionExtent);
     if (extent.empty() || activeVL.empty())
-      return contract.emitError(
-          "RVV VLA contract physical bounds are unavailable");
+      return dot.emitError(
+          "RVV VLA dot physical bounds are unavailable");
 
     std::string vectorSuffix = "f32m" + std::to_string(decision.lmul);
     std::string vectorType =
@@ -4397,8 +4390,8 @@ private:
           projectBlockScalar(store.getPointer(), axes);
       if ((!decision.lhsPredicateVariesByReduction && !lhsPredicate) ||
           !outputPredicate || !outputPointer)
-        return contract.emitError(
-            "RVV VLA contract row projection is unavailable");
+        return dot.emitError(
+            "RVV VLA dot row projection is unavailable");
       std::string outputCondition = fresh("vla_contract_store_active");
       if (!decision.lhsPredicateVariesByReduction) {
         std::string lhsCondition = fresh("vla_contract_lhs_active");
@@ -4437,8 +4430,8 @@ private:
         std::optional<std::string> rhsLaneStride = projectVLALaneStride(
             rhsLoad.getPointer(), activeVLADecision->coordinate, rhsAxes);
         if (!rhsPointer || !rhsLaneStride)
-          return contract.emitError(
-              "RVV VLA contract RHS projection is unavailable");
+          return dot.emitError(
+              "RVV VLA dot RHS projection is unavailable");
         std::string rhsVector = fresh("vla_contract_rhs");
         if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride) {
           line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
@@ -4460,8 +4453,8 @@ private:
             lhsPredicate = projectBlockScalar(lhsLoad.getWhere(), axes);
           if (!lhsPointer ||
               (decision.lhsPredicateVariesByReduction && !lhsPredicate))
-            return contract.emitError(
-                "RVV VLA contract LHS projection is unavailable");
+            return dot.emitError(
+                "RVV VLA dot LHS projection is unavailable");
           bool guardedLoad = guarded || decision.lhsPredicateVariesByReduction;
           if (guardedLoad) {
             llvm::StringRef predicate = decision.lhsPredicateVariesByReduction
@@ -4491,8 +4484,8 @@ private:
         std::optional<std::string> outputLaneStride = projectVLALaneStride(
             store.getPointer(), activeVLADecision->coordinate, axes);
         if (!outputLaneStride)
-          return contract.emitError(
-              "RVV VLA contract output stride is unavailable");
+          return dot.emitError(
+              "RVV VLA dot output stride is unavailable");
         if (guarded) {
           line("if (" + storeActive[lane] + ") {");
           ++indent;
@@ -4537,17 +4530,17 @@ private:
   }
 
   mlir::FailureOr<ContractDecision>
-  decideLocalF32RowMicrotile(StoreOp store, ContractOp contract) {
+  decideLocalF32RowMicrotile(StoreOp store, DotOp dot) {
     auto unwrapBlock = [](mlir::Type type) -> BlockType {
       if (auto masked = mlir::dyn_cast<MaskedType>(type))
         type = masked.getValueType();
       return mlir::dyn_cast<BlockType>(type);
     };
-    BlockType lhsType = unwrapBlock(contract.getLhs().getType());
-    BlockType rhsType = unwrapBlock(contract.getRhs().getType());
-    BlockType resultType = unwrapBlock(contract.getResult().getType());
-    auto init = contract.getInit().getDefiningOp<FullOp>();
-    if (store.getValue() != contract.getResult() || !lhsType || !rhsType ||
+    BlockType lhsType = unwrapBlock(dot.getLhs().getType());
+    BlockType rhsType = unwrapBlock(dot.getRhs().getType());
+    BlockType resultType = unwrapBlock(dot.getResult().getType());
+    auto init = dot.getInit().getDefiningOp<FullOp>();
+    if (store.getValue() != dot.getResult() || !lhsType || !rhsType ||
         !resultType || lhsType.getShape().size() != 2 ||
         rhsType.getShape().size() != 1 || resultType.getShape().size() != 1 ||
         lhsType.getShape()[0] != resultType.getShape()[0] ||
@@ -4557,22 +4550,17 @@ private:
         !rhsType.getElementType().isF32() ||
         !resultType.getElementType().isF32() || !init ||
         !isFloatConstant(init.getValue(), 0.0) ||
-        contract.getLhsAxes().size() != 1 ||
-        contract.getRhsAxes().size() != 1 ||
-        contract.getLhsAxes().front() != 1 ||
-        contract.getRhsAxes().front() != 0 ||
-        contract.getOrder() != "relaxed" || contract.getMath() != "native" ||
-        !contract.getAccDtype().isF32() || !contract.getOutDtype().isF32() ||
-        !isTrue(contract.getWhereLhs()) || !isTrue(contract.getWhereRhs())) {
-      contract.emitError(
-          "RVV row microtile requires a [BM,K] x [K] local f32 contract");
+        dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
+        !dot.getAccDtype().isF32()) {
+      dot.emitError(
+          "RVV row microtile requires a [BM,K] x [K] local f32 dot");
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = dot.getLhs().getDefiningOp<LoadOp>();
+    LoadOp rhsLoad = dot.getRhs().getDefiningOp<LoadOp>();
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere())) {
-      contract.emitError("RVV row microtile load producers are unavailable");
+      dot.emitError("RVV row microtile load producers are unavailable");
       return mlir::failure();
     }
 
@@ -4580,14 +4568,14 @@ private:
     llvm::DenseSet<mlir::Operation *> rhsClosure;
     llvm::SmallVector<BlockAxisOp> lhsAxes;
     llvm::SmallVector<BlockAxisOp> rhsAxes;
-    if (mlir::failed(collectBlockClosure(contract.getLhs(), lhsClosure, lhsAxes,
+    if (mlir::failed(collectBlockClosure(dot.getLhs(), lhsClosure, lhsAxes,
                                          store.getOperation())) ||
-        mlir::failed(collectBlockClosure(contract.getRhs(), rhsClosure, rhsAxes,
+        mlir::failed(collectBlockClosure(dot.getRhs(), rhsClosure, rhsAxes,
                                          store.getOperation())))
       return mlir::failure();
     if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
         !llvm::is_contained(lhsAxes, rhsAxes.front())) {
-      contract.emitError(
+      dot.emitError(
           "RVV row microtile requires explicit row and shared K block axes");
       return mlir::failure();
     }
@@ -4612,12 +4600,12 @@ private:
         dependsOn(store.getWhere(), reductionAxis.getResult()) ||
         (!isTrue(lhsLoad.getWhere()) &&
          !isFloatConstant(lhsLoad.getOther(), 0.0))) {
-      contract.emitError("RVV row microtile pointer facts are unavailable");
+      dot.emitError("RVV row microtile pointer facts are unavailable");
       return mlir::failure();
     }
 
     ContractDecision decision;
-    decision.operation = contract.getOperation();
+    decision.operation = dot.getOperation();
     decision.realization = ContractRealization::RVVF32RowMicrotile;
     decision.consumer = store.getOperation();
     decision.lhsLoad = lhsLoad.getOperation();
@@ -4630,7 +4618,7 @@ private:
         selectF32ContractPhysicalConfig(F32ContractResourceModel::LocalRow,
                                         decision.rowTile, 1);
     if (!physical) {
-      contract.emitError(
+      dot.emitError(
           "RVV row microtile has no legal register-resource candidate");
       return mlir::failure();
     }
@@ -4645,12 +4633,12 @@ private:
     if (selected == localF32ContractDecisions.end())
       return std::nullopt;
     const ContractDecision &decision = selected->second;
-    auto contract = mlir::cast<ContractOp>(decision.operation);
+    auto dot = mlir::cast<DotOp>(decision.operation);
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
     std::string extent = expression(decision.reductionExtent);
     if (extent.empty())
-      return contract.emitError(
+      return dot.emitError(
           "RVV row microtile access projection is unavailable");
 
     std::string fullVL = fresh("contract_vlmax");
@@ -4673,7 +4661,7 @@ private:
       std::optional<std::string> outputPointer =
           projectBlockScalar(store.getPointer(), axes);
       if (!lhsPredicate || !outputPredicate || !outputPointer)
-        return contract.emitError(
+        return dot.emitError(
             "RVV row microtile row projection is unavailable");
       std::string lhsCondition = fresh("contract_lhs_active");
       std::string outputCondition = fresh("contract_store_active");
@@ -4700,7 +4688,7 @@ private:
         std::optional<std::string> rhs =
             projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
         if (!rhs)
-          return contract.emitError(
+          return dot.emitError(
               "RVV row microtile RHS projection is unavailable");
         std::string rhsVector = fresh("contract_rhs");
         line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
@@ -4712,7 +4700,7 @@ private:
           std::optional<std::string> lhs =
               projectBlockScalar(lhsLoad.getPointer(), axes);
           if (!lhs)
-            return contract.emitError(
+            return dot.emitError(
                 "RVV row microtile LHS projection is unavailable");
           if (guarded) {
             line("if (" + lhsActive[lane] + ") {");
@@ -6000,9 +5988,9 @@ private:
     return mlir::success();
   }
 
-  std::optional<F16GemmNTileDecision> decideF16GemmNTiles(ContractOp contract) {
-    ForOp kLoop = contract->getParentOfType<ForOp>();
-    if (!kLoop || contract->getBlock() != &kLoop.getBody().front())
+  std::optional<F16GemmNTileDecision> decideF16GemmNTiles(MatmulOp matmul) {
+    ForOp kLoop = matmul->getParentOfType<ForOp>();
+    if (!kLoop || matmul->getBlock() != &kLoop.getBody().front())
       return std::nullopt;
     ForOp nLoop = kLoop->getParentOfType<ForOp>();
     if (!nLoop || kLoop->getBlock() != &nLoop.getBody().front())
@@ -6036,23 +6024,18 @@ private:
 
     mlir::Block &kBody = kLoop.getBody().front();
     if (llvm::any_of(kBody.without_terminator(), [&](mlir::Operation &operation) {
-          auto candidate = mlir::dyn_cast<ContractOp>(operation);
-          return candidate && candidate != contract;
+          auto candidate = mlir::dyn_cast<MatmulOp>(operation);
+          return candidate && candidate != matmul;
         }) ||
-        contract.getResult() !=
+        matmul.getResult() !=
                          mlir::cast<YieldOp>(kBody.getTerminator()).getOperand(0) ||
-        contract.getInit() != kBody.getArgument(1) ||
-        contract.getLhsAxes().size() != 1 ||
-        contract.getRhsAxes().size() != 1 ||
-        contract.getLhsAxes().front() != 1 ||
-        contract.getRhsAxes().front() != 0 || contract.getOrder() != "relaxed" ||
-        contract.getMath() != "native" || !contract.getAccDtype().isF32() ||
-        !contract.getOutDtype().isF32() || !isTrue(contract.getWhereLhs()) ||
-        !isTrue(contract.getWhereRhs()))
+        matmul.getInit() != kBody.getArgument(1) ||
+        matmul.getOrder() != "relaxed" || matmul.getMath() != "native" ||
+        !matmul.getAccDtype().isF32())
       return std::nullopt;
 
-    LoadOp lhsLoad = contract.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = contract.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = matmul.getLhs().getDefiningOp<LoadOp>();
+    LoadOp rhsLoad = matmul.getRhs().getDefiningOp<LoadOp>();
     auto init = kLoop.getOperand(3).getDefiningOp<FullOp>();
     if (!lhsLoad || !rhsLoad || !init ||
         !elementType(lhsLoad.getResult().getType()).isF16() ||
@@ -6118,7 +6101,7 @@ private:
       return std::nullopt;
 
     F16GemmNTileDecision decision;
-    decision.operation = contract.getOperation();
+    decision.operation = matmul.getOperation();
     decision.row = mCoordinate;
     decision.rowUpper = mLoop.getUpper();
     decision.lhs = lhsRoot;

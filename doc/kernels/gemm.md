@@ -39,12 +39,10 @@ def gemm_worker(
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
-                acc = W.contract(
+                acc = W.matmul(
                     a_blk,
                     b_blk,
                     init=acc,
-                    lhs_axes=(1,),
-                    rhs_axes=(0,),
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",
@@ -62,11 +60,11 @@ def gemm_worker(
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
 - `a` 的logical layout是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major persistent layout；
-- block values 与 contraction axes 归 canonical semantics；
+- block values 与matmul relation归canonical semantics；
 - `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
 - 外部 runtime 决定每个 worker 的 `[m_begin,m_end)`。
 
-## F32 row microtile contract
+## F32 row microtile dot
 
 当前F32 workload保留另一种自然source结构：作者按6行遍历M、按单列遍历N，并用一个动态K
 block表达6个row dot：
@@ -80,17 +78,16 @@ for row in W.range(m_begin, m_end, 6):
                      where=row + row_lane[:, None] < m_end,
                      other=W.f32(0.0))
         rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
-        value = W.contract(lhs, rhs, init=W.zeros((6,), dtype=W.f32),
-                           lhs_axes=(1,), rhs_axes=(0,),
-                           acc_dtype=W.f32, order="relaxed", math="native")
+        value = W.dot(lhs, rhs, init=W.zeros((6,), dtype=W.f32),
+                      acc_dtype=W.f32, order="relaxed", math="native")
         W.store(c + (row + row_lane) * ldc + column, value,
                 where=row + row_lane < m_end)
 ```
 
-Target从contract、block axis、typed operand以及pointer/access projection选择F32 RVV row
+Target从dot、block axis、typed operand以及pointer/access projection选择F32 RVV row
 microtile与LMUL；当前local-row resource model为row6选择LMUL2、row8选择LMUL1，同一个K
 vector供各row accumulator
 复用。该选择不要求enclosing loop
-形成固定row/column closure，所以同一local contract可以位于expert grouping等其他source
+形成固定row/column closure，所以同一local dot可以位于expert grouping等其他source
 context中。`row step=6` 是当前source的cache/register blocking选择；它不是`gemm_f32`
 kernel类别，也没有把N/K loop、grouping或matrix layout从target反推回IR。

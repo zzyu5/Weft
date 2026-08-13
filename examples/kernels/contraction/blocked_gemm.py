@@ -38,12 +38,10 @@ def gemm_worker(
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
-                acc = W.contract(
+                acc = W.matmul(
                     a_blk,
                     b_blk,
                     init=acc,
-                    lhs_axes=(1,),
-                    rhs_axes=(0,),
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",

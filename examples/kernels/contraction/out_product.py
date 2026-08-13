@@ -30,12 +30,10 @@ def out_product_f32(
                 + sample_axis[None, :] * rhs_sample_stride
                 + column[:, None]
             )
-            value = W.contract(
+            value = W.dot(
                 left,
                 right,
                 init=W.f32(0.0),
-                lhs_axes=(1,),
-                rhs_axes=(1,),
                 acc_dtype=W.f32,
                 order="relaxed",
                 math="native",

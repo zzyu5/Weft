@@ -369,14 +369,18 @@ def WeftKernel_OnlineSoftmaxSummaryOp
   let hasVerifier = 1;
 }
 
-def WeftKernel_ContractOp : WeftKernel_Op<"contract", [Pure]> {
+def WeftKernel_DotOp : WeftKernel_Op<"dot", [Pure]> {
+  let summary = "Dot over the final logical block axis of both operands";
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$init,
-                       AnyType:$where_lhs, AnyType:$where_rhs,
-                       DenseI64ArrayAttr:$lhs_axes,
-                       DenseI64ArrayAttr:$rhs_axes,
-                       DenseI64ArrayAttr:$output_order,
-                       TypeAttr:$acc_dtype, TypeAttr:$out_dtype,
-                       StrAttr:$order, StrAttr:$math);
+                       TypeAttr:$acc_dtype, StrAttr:$order, StrAttr:$math);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_MatmulOp : WeftKernel_Op<"matmul", [Pure]> {
+  let summary = "Local rank-two [M,K] x [K,N] matrix multiplication";
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$init,
+                       TypeAttr:$acc_dtype, StrAttr:$order, StrAttr:$math);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

@@ -4,7 +4,7 @@
 
 Weft 是一门面向**单个 RISC-V worker / hart** 的高性能 kernel DSL 与 AOT 编译器。
 
-作者使用普通控制流、一等 VLA iteration region、显式指针与逻辑 predicate、局部 logical block value、结构化 state algebra，以及 contraction / scan / lookup / decode 等 primitive 编写完整的 worker-local kernel。编译器把这些结构映射到动态 `vl`、LMUL、寄存器组织、memory instruction、register microtile、矩阵 fragment 和 RISC-V 扩展指令。
+作者使用普通控制流、一等 VLA iteration region、显式指针与逻辑 predicate、局部 logical block value、结构化 state algebra，以及 dot / matmul / scan / lookup / decode 等 primitive 编写完整的 worker-local kernel。编译器把这些结构映射到动态 `vl`、LMUL、寄存器组织、memory instruction、register microtile、矩阵 fragment 和 RISC-V 扩展指令。
 
 多核线程创建、工作切分、线程池、OpenMP、affinity 与 NUMA 均由外部 runtime 负责，不属于 Weft core。
 
@@ -112,9 +112,9 @@ Canonical Weft language 中不存在：
 
 普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器可以对它做保持语义的
 unroll、interchange、hoist、rematerialization、software pipelining 和局部 scheduling，
-但不得把它重新分类为 VLA logical axis，也不得从普通 scalar multiply/add 猜出 contract。
-只有 source 显式写出的 `W.vla` / `W.contract` 才分别授权 SIMD logical axis 与局部
-contraction domain。VLA 内部可以做 strip-mining；contract 内部可以重组 reduction。两者都
+但不得把它重新分类为 VLA logical axis，也不得从普通 scalar multiply/add 猜出dot/matmul。
+只有 source 显式写出的 `W.vla` / `W.dot` / `W.matmul` 才分别授权 SIMD logical axis 与局部
+乘加域。VLA 内部可以做 strip-mining；dot/matmul 内部可以重组 reduction。两者都
 不得改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
 algorithmic loop、state 与 staging 骨架。
 
@@ -163,7 +163,7 @@ Logical block：
 
 - 是局部数据域；
 - 可以由 block axis、broadcast、load、reshape、transpose 和 pointwise 产生；
-- 可以作为 `W.contract`、block reduction、permute、decode 等 primitive 的 operand；
+- 可以作为 `W.dot`、`W.matmul`、block reduction、permute、decode 等 primitive 的 operand；
 - 不等于 cache block；
 - 不等于 register microtile；
 - 不等于 IME fragment；
@@ -195,7 +195,8 @@ VLA region 必须被拒绝；这是当前语言能力边界，用来保持 regio
 coordinate decode等有序scalar control可以嵌在VLA内；它们不会产生第二个lane domain，且
 其source-visible顺序、state与effect必须保持不变。
 
-`W.contract` 不得缩并 VLA axis；跨 VLA axis 的聚合必须使用 reduce、scan 或 summary fold。VLA axis 可以作为 contract 的 batch/free axis。
+`W.dot`与`W.matmul`不得缩并VLA axis；跨VLA axis的聚合必须使用reduce、scan或summary fold。
+VLA axis只能作为dot的free/batch axis；当前matmul只接受local block operands。
 
 
 ## Tile 与分块层次

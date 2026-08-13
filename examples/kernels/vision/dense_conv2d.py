@@ -108,12 +108,10 @@ def dense_conv2d_f32(
                 packed_weight + output_channel * reduction_extent + reduction,
                 other=W.f32(0.0),
             )
-            value = W.contract(
+            value = W.dot(
                 patch,
                 filter_value,
                 init=W.zeros((8,), dtype=W.f32),
-                lhs_axes=(1,),
-                rhs_axes=(0,),
                 acc_dtype=W.f32,
                 order="relaxed",
                 math="native",

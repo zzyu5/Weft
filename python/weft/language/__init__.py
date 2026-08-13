@@ -18,7 +18,6 @@ from .builtins import block_axis
 from .builtins import affine_i4_i8_contract
 from .builtins import broadcast_to
 from .builtins import cast
-from .builtins import contract
 from .builtins import cos
 from .builtins import decode
 from .builtins import dot
@@ -39,6 +38,7 @@ from .builtins import invalid
 from .builtins import load
 from .builtins import log
 from .builtins import lookup
+from .builtins import matmul
 from .builtins import maximum
 from .builtins import minimum
 from .builtins import narrow

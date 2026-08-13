@@ -12,7 +12,7 @@ Canonical worker-local Weft Kernel IR
   ├─ logical predicates / masked values
   ├─ logical block values
   ├─ reduce / scan / summary fold
-  ├─ contract / lookup / decode / permute
+  ├─ dot / matmul / lookup / decode / permute
   ├─ source meta-parameters
   └─ linked typed local extension primitives
                 │
@@ -62,7 +62,7 @@ Weft 不回读上游 graph，也不从 target lowering 反向补算法骨架。
 ## Target lowering 的决策单位
 
 Target lowering 面对 kernel 内可组合的 canonical anchor：scalar control、VLA、memory、
-reduce、scan、summary、contract、decode、lookup 和 extension primitive。一个物理实现的输入
+reduce、scan、summary、dot、matmul、decode、lookup 和 extension primitive。一个物理实现的输入
 只能是：
 
 ```text
@@ -74,8 +74,8 @@ canonical primitive
 ```
 
 授权边界固定为：普通scalar loop保持作者写下的有序traversal，不能自动变成VLA；只有显式
-`weft_kernel.vla`授权SIMD logical axis；只有显式`weft_kernel.contract`授权局部contraction
-重组。Reduce、scan、summary fold与sequential carry是四种不同语义，不能按use graph互换。
+`weft_kernel.vla`授权SIMD logical axis；只有显式`weft_kernel.dot`或`weft_kernel.matmul`
+授权局部乘加域重组。Reduce、scan、summary fold与sequential carry是四种不同语义，不能按use graph互换。
 Blocking、staging、persistent packing、outer traversal和算法variant只由source/Kernel IR
 定义，target-local fusion不得重建或替换这些关系。
 

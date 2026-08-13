@@ -30,7 +30,7 @@ Target lowering 可以为同一 semantic primitive 实现多种局部 realizatio
 scalar control/math   -> ordinary C / target libm spelling
 VLA pointwise       -> RVV f32m2 / f32m4
 reduce              -> scalar ordered / RVV tree / widening RVV
-contract            -> RVV FMA microtile / RVV dot / IME fragment
+dot / matmul        -> RVV FMA microtile / RVV dot / IME fragment
 lookup/decode       -> scalar / indexed RVV / table gather
 memory permutation  -> RVV segment / indexed / extension permute
 ```
@@ -45,8 +45,8 @@ verifier、pipeline front door或长期provider registry。
 - 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
   mode、activity、state realization和LMUL；F16/F32 cast与F16 fused multiply-add也拥有逐op
   vector shape decision；位于nested scalar control中的access仍逐实体决策；
-- local F32 contract的operand axes、row microtile、pointer/stride relation、LMUL和resource
-  footprint；含contract的
+- local F32 dot/matmul的operand shape、row microtile、pointer/stride relation、LMUL和resource
+  footprint；含dot/matmul的
   VLA region直接消费该LMUL来决定strip width、mask ratio与index LMUL，不保留第二份选择；
 - block store/reduce的strip family、byte-vector shape、active length和lane-index需求；block
   decode的table extent、code/result vector shape与RVV gather realization；
@@ -112,7 +112,7 @@ realization中的局部轴；普通canonical `for` / `while`不得因此被改�
 
 ## 新语义与新硬件
 
-若新硬件只是更快实现现有语义，例如用矩阵fragment实现普通 `W.contract`，只增加
+若新硬件只是更快实现现有语义，例如用矩阵fragment实现普通 `W.matmul`，只增加
 target-local realization。
 
 若硬件引入可观察的新语义，例如 block-scaled accumulation、特有 codebook、saturation、
@@ -127,7 +127,7 @@ variant。当前 `weft_ext.affine_i4_i8_contract`、`grouped_affine_i4_i8_dot`�
 
 ## 组合判据
 
-同一kernel中必须自然允许多个VLA、reduce、summary、irregular relation、contract与扩展
+同一kernel中必须自然允许多个VLA、reduce、summary、irregular relation、dot/matmul与扩展
 fragment同时存在。增加能力时扩展局部primitive lowering，而不是增加互斥的`KernelKind`、
 format route或whole-kernel emitter。一个local envelope可以跨多个相邻pure producer/
 consumer，甚至联合安排相邻primitive，但选择必须从明确canonical anchor出发，不能把整个
@@ -135,7 +135,7 @@ loop nest的形状当作operator identity。
 
 同样的规则覆盖selection中的coordinate summary、ordered recurrence中的VLA memory、indexed
 base与unit-stride region、scalar coordinate/window与VLA channel，以及source-owned grouping
-中的local contract。它们是已有实体性质的新组合关系，不构成Top-K、SSM、MoE或vision
+中的local dot/matmul。它们是已有实体性质的新组合关系，不构成Top-K、SSM、MoE或vision
 kernel family。
 
 ## 当前实现边界
@@ -146,7 +146,7 @@ F16 weighted update和F16→F32 normalize四条whole-region realization已经由
 access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择也已移出emitter，
 成为明确physical decision。
 
-Local F32 contract根据block/VLA axis、typed operand、pointer/access与predicate projection形成
+Local F32 dot/matmul根据block/VLA axis、typed operand、pointer/access与predicate projection形成
 resource model，再从局部candidate中选择LMUL；当前local-row候选会随row extent选择LMUL4/2/1，
 VLA free-axis候选也共用同一selector。`kUnroll`已经物化但当前合法winner仍为1；multi-axis
 microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是

@@ -377,45 +377,24 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
     return deriveExtentImpl(load.getPointer(), axis, visited);
   if (auto scan = mlir::dyn_cast<ScanOp>(definition))
     return deriveExtentImpl(scan.getInput(), axis, visited);
-  if (auto contract = mlir::dyn_cast<ContractOp>(definition)) {
-    mlir::Type lhsType = unwrapMasked(contract.getLhs().getType());
-    mlir::Type rhsType = unwrapMasked(contract.getRhs().getType());
-    bool lhsRegion = mlir::isa<RegionType>(lhsType);
-    bool rhsRegion = mlir::isa<RegionType>(rhsType);
-    int64_t canonicalAxis = axis;
-    if (!contract.getOutputOrder().empty()) {
-      if (axis >= static_cast<int64_t>(contract.getOutputOrder().size()))
-        return std::nullopt;
-      canonicalAxis = contract.getOutputOrder()[axis];
-    }
-    int64_t outputAxis = 0;
+  if (auto dot = mlir::dyn_cast<DotOp>(definition)) {
+    bool lhsRegion = mlir::isa<RegionType>(unwrapMasked(dot.getLhs().getType()));
+    bool rhsRegion = mlir::isa<RegionType>(unwrapMasked(dot.getRhs().getType()));
     if (lhsRegion || rhsRegion) {
-      if (canonicalAxis == outputAxis)
-        return deriveExtentImpl(lhsRegion ? contract.getLhs()
-                                          : contract.getRhs(),
-                                0, visited);
-      ++outputAxis;
+      if (axis == 0)
+        return deriveExtentImpl(lhsRegion ? dot.getLhs() : dot.getRhs(), 0,
+                                visited);
+      --axis;
     }
-    for (auto [inputAxis, dimension] :
-         llvm::enumerate(staticShapeOf(lhsType))) {
-      (void)dimension;
-      if (llvm::is_contained(contract.getLhsAxes(), inputAxis) ||
-          (lhsRegion && inputAxis == 0))
-        continue;
-      if (canonicalAxis == outputAxis)
-        return deriveExtentImpl(contract.getLhs(), inputAxis, visited);
-      ++outputAxis;
-    }
-    for (auto [inputAxis, dimension] :
-         llvm::enumerate(staticShapeOf(rhsType))) {
-      (void)dimension;
-      if (llvm::is_contained(contract.getRhsAxes(), inputAxis) ||
-          (rhsRegion && inputAxis == 0))
-        continue;
-      if (canonicalAxis == outputAxis)
-        return deriveExtentImpl(contract.getRhs(), inputAxis, visited);
-      ++outputAxis;
-    }
+    if (!lhsRegion && axis == 0)
+      return deriveExtentImpl(dot.getLhs(), 0, visited);
+    return std::nullopt;
+  }
+  if (auto matmul = mlir::dyn_cast<MatmulOp>(definition)) {
+    if (axis == 0)
+      return deriveExtentImpl(matmul.getLhs(), 0, visited);
+    if (axis == 1)
+      return deriveExtentImpl(matmul.getRhs(), 1, visited);
     return std::nullopt;
   }
   if (auto binary = mlir::dyn_cast<BinaryOp>(definition))
@@ -1202,85 +1181,82 @@ mlir::LogicalResult OnlineSoftmaxSummaryOp::verify() {
   return mlir::success();
 }
 
-mlir::LogicalResult ContractOp::verify() {
-  if (!validOrder(getOrder()) || !validMath(getMath()))
-    return emitOpError("invalid contract order or math mode");
+static mlir::LogicalResult verifyProductResult(
+    mlir::Operation *operation, mlir::Value lhs, mlir::Value rhs,
+    mlir::Value init, mlir::Value result, mlir::Type accType,
+    llvm::StringRef order, llvm::StringRef math,
+    llvm::ArrayRef<int64_t> outputShape, ShapeKind resultKind,
+    int64_t lhsReductionAxis, int64_t rhsReductionAxis) {
+  if (!validOrder(order) || !validMath(math))
+    return operation->emitOpError("invalid structured-product order or math mode");
+  mlir::Type lhsElement = elementTypeOf(unwrapMasked(lhs.getType()));
+  mlir::Type rhsElement = elementTypeOf(unwrapMasked(rhs.getType()));
+  if (!mlir::isa<mlir::FloatType>(lhsElement) || lhsElement != rhsElement ||
+      !mlir::isa<mlir::FloatType>(accType))
+    return operation->emitOpError(
+        "dot/matmul operands must share a floating element type and use a floating accumulator");
+  auto lhsShape = staticShapeOf(unwrapMasked(lhs.getType()));
+  auto rhsShape = staticShapeOf(unwrapMasked(rhs.getType()));
+  if (lhsShape[lhsReductionAxis] != rhsShape[rhsReductionAxis] ||
+      (lhsShape[lhsReductionAxis] == -1 &&
+       !haveSameExtent(lhs, lhsReductionAxis, rhs, rhsReductionAxis)))
+    return operation->emitOpError(
+        "dot/matmul reduction extents must have the same logical identity");
+  mlir::Type bareInit = unwrapMasked(init.getType());
+  bool scalarInit = shapeKindOf(bareInit) == ShapeKind::Scalar;
+  bool shapedInit = shapeKindOf(bareInit) == resultKind &&
+                    staticShapeOf(bareInit) == outputShape;
+  if (mlir::failed(verifyResultShape(operation, result.getType(), resultKind,
+                                     outputShape)) ||
+      elementTypeOf(result.getType()) != accType ||
+      elementTypeOf(init.getType()) != accType || (!scalarInit && !shapedInit))
+    return operation->emitOpError(
+        "dot/matmul result and explicit accumulator init are inconsistent");
+  return mlir::success();
+}
+
+mlir::LogicalResult DotOp::verify() {
   mlir::Type lhsType = unwrapMasked(getLhs().getType());
   mlir::Type rhsType = unwrapMasked(getRhs().getType());
   auto lhsBlock = mlir::dyn_cast<BlockType>(lhsType);
-  auto rhsBlock = mlir::dyn_cast<BlockType>(rhsType);
   auto lhsRegion = mlir::dyn_cast<RegionType>(lhsType);
+  auto rhsBlock = mlir::dyn_cast<BlockType>(rhsType);
   auto rhsRegion = mlir::dyn_cast<RegionType>(rhsType);
-  if ((!lhsBlock && !lhsRegion) || (!rhsBlock && !rhsRegion) ||
-      getLhsAxes().empty() ||
-      getLhsAxes().size() != getRhsAxes().size())
+  bool rowVector = (lhsBlock || lhsRegion) && rhsBlock &&
+                   staticShapeOf(lhsType).size() == 2 &&
+                   staticShapeOf(rhsType).size() == 1;
+  bool rowBank = lhsBlock && rhsRegion &&
+                 staticShapeOf(lhsType).size() == 2 &&
+                 staticShapeOf(rhsType).size() == 2;
+  if (!rowVector && !rowBank)
     return emitOpError(
-        "contract requires logical block/region values and paired axes");
-  auto lhsShape = staticShapeOf(lhsType);
-  auto rhsShape = staticShapeOf(rhsType);
-  if (lhsRegion && llvm::is_contained(getLhsAxes(), 0))
-    return emitOpError("the active VLA axis is a batch/free axis, not a contract axis");
-  if (rhsRegion && llvm::is_contained(getRhsAxes(), 0))
-    return emitOpError("the active VLA axis is a batch/free axis, not a contract axis");
-  llvm::DenseSet<int64_t> lhsContracted, rhsContracted;
-  for (auto [a, b] : llvm::zip(getLhsAxes(), getRhsAxes())) {
-    if (a < 0 || a >= static_cast<int64_t>(lhsShape.size()) ||
-        b < 0 || b >= static_cast<int64_t>(rhsShape.size()) ||
-        !lhsContracted.insert(a).second || !rhsContracted.insert(b).second ||
-        lhsShape[a] != rhsShape[b])
-      return emitOpError("paired contraction axes are invalid or unequal");
-    if (lhsShape[a] == -1 && !haveSameExtent(getLhs(), a, getRhs(), b))
-      return emitOpError()
-             << "cannot prove paired dynamic extent identity for axes " << a
-             << " and " << b;
-  }
+        "dot requires [R,K] x [K], [VLA,K] x [K], or [R,K] x [VLA,K]");
   llvm::SmallVector<int64_t> outputShape;
-  bool hasRegion = lhsRegion || rhsRegion;
-  if (hasRegion)
+  ShapeKind resultKind;
+  if (lhsRegion || rhsRegion) {
     outputShape.push_back(-1);
-  for (auto [axis, dimension] : llvm::enumerate(lhsShape))
-    if (!lhsContracted.contains(axis) && (!lhsRegion || axis != 0))
-      outputShape.push_back(dimension);
-  for (auto [axis, dimension] : llvm::enumerate(rhsShape))
-    if (!rhsContracted.contains(axis) && (!rhsRegion || axis != 0))
-      outputShape.push_back(dimension);
-  if (!getOutputOrder().empty()) {
-    llvm::SmallVector<int64_t> reordered;
-    llvm::DenseSet<int64_t> seen;
-    for (int64_t axis : getOutputOrder()) {
-      if (axis < 0 || axis >= static_cast<int64_t>(outputShape.size()) ||
-          !seen.insert(axis).second)
-        return emitOpError("output_order is not a permutation");
-      reordered.push_back(outputShape[axis]);
-    }
-    if (reordered.size() != outputShape.size())
-      return emitOpError("output_order must contain every output axis");
-    if (hasRegion && getOutputOrder().front() != 0)
-      return emitOpError("output_order must keep the active VLA axis first");
-    outputShape = std::move(reordered);
+    if (lhsBlock)
+      outputShape.push_back(lhsBlock.getShape()[0]);
+    resultKind = ShapeKind::Region;
+  } else {
+    outputShape.push_back(lhsBlock.getShape()[0]);
+    resultKind = ShapeKind::Block;
   }
-  ShapeKind resultKind = hasRegion ? ShapeKind::Region
-                                   : outputShape.empty() ? ShapeKind::Scalar
-                                                         : ShapeKind::Block;
-  mlir::Type bareInit = unwrapMasked(getInit().getType());
-  bool scalarInit = shapeKindOf(bareInit) == ShapeKind::Scalar;
-  bool shapedInit = shapeKindOf(bareInit) == resultKind &&
-                    staticShapeOf(bareInit) ==
-                        llvm::ArrayRef<int64_t>(outputShape);
-  if (mlir::failed(verifyResultShape(getOperation(), getResult().getType(),
-                                     resultKind, outputShape)) ||
-      elementTypeOf(getResult().getType()) != getOutDtype() ||
-      elementTypeOf(getInit().getType()) != getAccDtype() ||
-      (!scalarInit && !shapedInit) ||
-      !isPredicateType(getWhereLhs().getType()) ||
-      !isPredicateType(getWhereRhs().getType()))
-    return emitOpError("contract result/init/predicate types are inconsistent");
-  if (mlir::failed(verifyFootprint(getOperation(), getWhereLhs(), getLhs(),
-                                   "where_lhs")) ||
-      mlir::failed(verifyFootprint(getOperation(), getWhereRhs(), getRhs(),
-                                   "where_rhs")))
-    return mlir::failure();
-  return mlir::success();
+  return verifyProductResult(getOperation(), getLhs(), getRhs(), getInit(),
+                             getResult(), getAccDtype(), getOrder(), getMath(),
+                             outputShape, resultKind, 1,
+                             staticShapeOf(rhsType).size() - 1);
+}
+
+mlir::LogicalResult MatmulOp::verify() {
+  auto lhs = mlir::dyn_cast<BlockType>(unwrapMasked(getLhs().getType()));
+  auto rhs = mlir::dyn_cast<BlockType>(unwrapMasked(getRhs().getType()));
+  if (!lhs || !rhs || lhs.getShape().size() != 2 || rhs.getShape().size() != 2)
+    return emitOpError("matmul requires local rank-two [M,K] x [K,N] blocks");
+  llvm::SmallVector<int64_t> outputShape{lhs.getShape()[0], rhs.getShape()[1]};
+  return verifyProductResult(getOperation(), getLhs(), getRhs(), getInit(),
+                             getResult(), getAccDtype(), getOrder(), getMath(),
+                             outputShape, ShapeKind::Block, 1, 0);
 }
 
 mlir::LogicalResult PermuteOp::verify() {
