@@ -8667,7 +8667,7 @@ __weft_q6_k_i8_vl128(
   }
   if (!usesExp)
     return;
-  output << R"c(static inline vfloat32m2_t __weft_exp_f32m2(
+  output << R"c(static inline __attribute__((unused)) vfloat32m2_t __weft_exp_f32m2(
     vfloat32m2_t x, size_t vl) {
   const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
   const vfloat32m2_t z =
