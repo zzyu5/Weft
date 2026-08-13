@@ -14,11 +14,13 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -104,6 +106,24 @@ std::string rvvShapeSuffix(const RVVVectorShape &shape) {
 
 unsigned rvvRegisterGroups(const RVVVectorShape &shape) {
   return static_cast<unsigned>((std::max(shape.lmulEighths, 0) + 7) / 8);
+}
+
+std::optional<RVVVectorShape>
+rvvShapeForSemanticLanes(unsigned sew, unsigned semanticLanes,
+                         int64_t vlenBits) {
+  if (sew == 0 || semanticLanes == 0 || vlenBits <= 0)
+    return std::nullopt;
+  uint64_t requiredBits = static_cast<uint64_t>(sew) * semanticLanes;
+  uint64_t lmulEighths =
+      (requiredBits * 8 + static_cast<uint64_t>(vlenBits) - 1) /
+      static_cast<uint64_t>(vlenBits);
+  constexpr int legalLMULEighths[] = {1, 2, 4, 8, 16, 32, 64};
+  auto legal = llvm::find_if(legalLMULEighths, [&](int value) {
+    return static_cast<uint64_t>(value) >= lmulEighths;
+  });
+  if (legal == std::end(legalLMULEighths))
+    return std::nullopt;
+  return RVVVectorShape{sew, *legal};
 }
 
 struct BlockValue {
@@ -282,15 +302,18 @@ struct GroupedAffineI4I8Decision {
 };
 
 enum class QuantCodebookI8Realization {
-  RVVVLEN128LocalBlockDot,
+  RVVFixedLaneLocalBlockDot,
   RVVScalableLocalBlockDot,
 };
 
 struct QuantCodebookI8Decision {
   QuantCodebookI8Realization realization =
-      QuantCodebookI8Realization::RVVVLEN128LocalBlockDot;
+      QuantCodebookI8Realization::RVVFixedLaneLocalBlockDot;
   llvm::SmallVector<LocalBlockMemoryFact> blocks;
   llvm::SmallVector<mlir::Value> scalars;
+  unsigned semanticLanes = 0;
+  RVVVectorShape byteShape;
+  unsigned reductionSegments = 0;
 };
 
 enum class SortIndicesRealization {
@@ -448,9 +471,28 @@ struct VLANarrowDecision {
   mlir::Operation *operation = nullptr;
 };
 
+enum class F32DotResourceModel {
+  VLAFreeAxis,
+  LocalRow,
+};
+
 struct F32DotPhysicalConfig {
   unsigned lmul = 1;
   unsigned kUnroll = 1;
+};
+
+struct F32DotCandidateFacts {
+  F32DotResourceModel model = F32DotResourceModel::LocalRow;
+  unsigned rowTile = 1;
+  std::optional<uint64_t> reductionExtent;
+  unsigned unitStrideOperands = 0;
+  unsigned stridedOperands = 0;
+  unsigned indexedOperands = 0;
+  unsigned predicateGroups = 0;
+  unsigned stateGroups = 0;
+  unsigned handoffGroups = 0;
+  bool reductionPredicate = false;
+  bool materializedInit = false;
 };
 
 enum class VLADotRealization {
@@ -716,11 +758,6 @@ struct RISCVPhysicalPlan {
   llvm::DenseMap<mlir::Operation *,
                  PlannedPhysicalDecision<MaterializedBlockStoreDecision>>
       materializedBlockStores;
-};
-
-enum class F32DotResourceModel {
-  VLAFreeAxis,
-  LocalRow,
 };
 
 std::string sanitize(llvm::StringRef input) {
@@ -1563,74 +1600,86 @@ private:
   }
 
   std::optional<F32DotPhysicalConfig>
-  selectF32DotPhysicalConfig(F32DotResourceModel model,
-                                  unsigned rowTile,
-                                  unsigned defaultUnroll) const {
-    constexpr unsigned vla128Candidates[] = {4, 2, 1};
-    constexpr unsigned vla256Candidates[] = {2, 4, 1};
-    constexpr unsigned narrowRow128Candidates[] = {4, 2, 1};
-    constexpr unsigned narrowRow256Candidates[] = {2, 4, 1};
-    constexpr unsigned mediumRow128Candidates[] = {2, 4, 1};
-    constexpr unsigned mediumRow256Candidates[] = {2, 1, 4};
-    constexpr unsigned wideRowCandidates[] = {1, 2, 4};
-    bool wideVector = options.target.vlenBits >= 256;
-    llvm::ArrayRef<unsigned> candidates = vla128Candidates;
-    if (model == F32DotResourceModel::VLAFreeAxis)
-      candidates = wideVector ? llvm::ArrayRef<unsigned>(vla256Candidates)
-                              : llvm::ArrayRef<unsigned>(vla128Candidates);
-    else if (rowTile <= 4)
-      candidates = wideVector
-                       ? llvm::ArrayRef<unsigned>(narrowRow256Candidates)
-                       : llvm::ArrayRef<unsigned>(narrowRow128Candidates);
-    else if (rowTile <= 6)
-      candidates = wideVector
-                       ? llvm::ArrayRef<unsigned>(mediumRow256Candidates)
-                       : llvm::ArrayRef<unsigned>(mediumRow128Candidates);
-    else
-      candidates = wideRowCandidates;
-    llvm::SmallVector<unsigned> unrollCandidates;
-    if (options.backend.dotKUnroll != 0)
-      unrollCandidates.push_back(
-          static_cast<unsigned>(options.backend.dotKUnroll));
-    else {
-      unsigned preferredUnroll = wideVector ? 4 : defaultUnroll;
-      unrollCandidates.push_back(preferredUnroll);
-      for (unsigned candidate : {defaultUnroll, 1u, 2u, 4u})
-        if (!llvm::is_contained(unrollCandidates, candidate))
-          unrollCandidates.push_back(candidate);
-    }
-    llvm::SmallVector<unsigned> requestedLMUL;
-    if (options.backend.dotLMUL != 0) {
-      requestedLMUL.push_back(
-          static_cast<unsigned>(options.backend.dotLMUL));
-      candidates = requestedLMUL;
-    }
+  selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts) const {
     auto legalUnroll = [](unsigned value) {
       return value == 1 || value == 2 || value == 4;
     };
     auto legalLMUL = [](unsigned value) {
       return value == 1 || value == 2 || value == 4 || value == 8;
     };
-    for (unsigned unroll : unrollCandidates) {
-      if (!legalUnroll(unroll))
+    llvm::SmallVector<unsigned> lmulCandidates = {1, 2, 4, 8};
+    llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
+    if (options.backend.dotLMUL != 0)
+      lmulCandidates = {static_cast<unsigned>(options.backend.dotLMUL)};
+    if (options.backend.dotKUnroll != 0)
+      unrollCandidates = {
+          static_cast<unsigned>(options.backend.dotKUnroll)};
+
+    bool wideVector = options.target.vlenBits >= 256;
+    unsigned preferredLMUL =
+        facts.model == F32DotResourceModel::VLAFreeAxis
+            ? (facts.rowTile == 1 ? 4 : 2)
+            : (wideVector ? 2 : (facts.rowTile >= 8 ? 1 : 2));
+    unsigned preferredUnroll = 1;
+    bool costlyHandoff = facts.materializedInit || facts.reductionPredicate ||
+                         facts.indexedOperands != 0;
+    if (!costlyHandoff) {
+      if (facts.model == F32DotResourceModel::VLAFreeAxis)
+        preferredUnroll = facts.rowTile == 1 ? 1 : (wideVector ? 4 : 2);
+      else if (wideVector)
+        preferredUnroll = facts.rowTile >= 8 ? 2 :
+                          facts.rowTile <= 4 ? 4 : 1;
+    }
+
+    struct Candidate {
+      F32DotPhysicalConfig physical;
+      unsigned tailPenalty = 0;
+      unsigned memoryPenalty = 0;
+      unsigned lmulPenalty = 0;
+      unsigned unrollPenalty = 0;
+      unsigned peakGroups = 0;
+    };
+    llvm::SmallVector<Candidate> legal;
+    for (unsigned lmul : lmulCandidates) {
+      if (!legalLMUL(lmul))
         continue;
-      for (unsigned lmul : candidates) {
-        if (!legalLMUL(lmul))
+      for (unsigned unroll : unrollCandidates) {
+        if (!legalUnroll(unroll))
           continue;
-        unsigned accumulatorGroups = rowTile * lmul;
-        unsigned streamedOperandGroups =
-            (model == F32DotResourceModel::LocalRow ? 2 : 1) * unroll *
-            lmul;
-        unsigned total = accumulatorGroups + streamedOperandGroups;
-        bool hasAllocatorHeadroom =
-            model == F32DotResourceModel::VLAFreeAxis
-                ? total <= options.target.vectorRegisters
-                : total + 1 < options.target.vectorRegisters;
-        if (hasAllocatorHeadroom)
-          return F32DotPhysicalConfig{lmul, unroll};
+        unsigned accumulatorGroups = facts.rowTile * lmul;
+        unsigned streamedOperands = std::max(
+            1u, facts.unitStrideOperands + facts.stridedOperands +
+                    facts.indexedOperands);
+        unsigned memoryGroups = streamedOperands * unroll * lmul;
+        unsigned primitiveGroups = accumulatorGroups + memoryGroups;
+        unsigned peakGroups = primitiveGroups + facts.predicateGroups +
+                              facts.stateGroups + facts.handoffGroups + 1;
+        if (peakGroups > static_cast<unsigned>(options.target.vectorRegisters))
+          continue;
+        unsigned tailPenalty =
+            facts.reductionExtent && *facts.reductionExtent % unroll != 0;
+        unsigned memoryPenalty =
+            facts.stridedOperands * unroll +
+            2 * facts.indexedOperands * unroll +
+            facts.predicateGroups + facts.handoffGroups;
+        legal.push_back(Candidate{
+            F32DotPhysicalConfig{lmul, unroll}, tailPenalty, memoryPenalty,
+            static_cast<unsigned>(std::abs(static_cast<int>(lmul) -
+                                           static_cast<int>(preferredLMUL))),
+            static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
+                                           static_cast<int>(preferredUnroll))),
+            peakGroups});
       }
     }
-    return std::nullopt;
+    if (legal.empty())
+      return std::nullopt;
+    llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+      return std::tie(lhs.tailPenalty, lhs.memoryPenalty, lhs.lmulPenalty,
+                      lhs.unrollPenalty, lhs.peakGroups) <
+             std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lmulPenalty,
+                      rhs.unrollPenalty, rhs.peakGroups);
+    });
+    return legal.front().physical;
   }
 
   mlir::FailureOr<VLADotCandidate>
@@ -1755,9 +1804,23 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
+    F32DotCandidateFacts candidateFacts;
+    candidateFacts.model = F32DotResourceModel::VLAFreeAxis;
+    candidateFacts.rowTile = decision.rowTile;
+    if (std::optional<int64_t> extent =
+            integerConstantValue(decision.reductionExtent);
+        extent && *extent >= 0)
+      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
+    candidateFacts.unitStrideOperands =
+        1 + (rhsRelation == LaneRelation::UnitStride ? 1 : 0);
+    candidateFacts.stridedOperands =
+        rhsRelation == LaneRelation::Strided ? 1 : 0;
+    candidateFacts.reductionPredicate =
+        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+    candidateFacts.predicateGroups =
+        candidateFacts.reductionPredicate ? 1 : 0;
     std::optional<F32DotPhysicalConfig> physical =
-        selectF32DotPhysicalConfig(F32DotResourceModel::VLAFreeAxis,
-                                        decision.rowTile, 1);
+        selectF32DotPhysicalConfig(candidateFacts);
     if (!physical) {
       dot.emitError(
           "RVV VLA dot has no legal register microtile candidate");
@@ -1884,9 +1947,21 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = 1;
+    F32DotCandidateFacts candidateFacts;
+    candidateFacts.model = F32DotResourceModel::VLAFreeAxis;
+    candidateFacts.rowTile = decision.rowTile;
+    if (std::optional<int64_t> extent =
+            integerConstantValue(decision.reductionExtent);
+        extent && *extent >= 0)
+      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
+    candidateFacts.unitStrideOperands =
+        freeRelation == LaneRelation::UnitStride ? 1 : 0;
+    candidateFacts.stridedOperands =
+        freeRelation == LaneRelation::Strided ? 1 : 0;
+    candidateFacts.handoffGroups = 1;
+    candidateFacts.materializedInit = true;
     std::optional<F32DotPhysicalConfig> physical =
-        selectF32DotPhysicalConfig(F32DotResourceModel::VLAFreeAxis,
-                                        decision.rowTile, 1);
+        selectF32DotPhysicalConfig(candidateFacts);
     if (!physical) {
       dot.emitError(
           "RVV VLA vector dot has no legal register candidate");
@@ -3022,7 +3097,7 @@ private:
       return emitE2M1E8M0I8Dot(op);
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
       return emitQuantCodebookI8Dot(
-          op, "__weft_iq2_s_i8_vl128", "__weft_iq2_s_i8_rvv");
+          op, "__weft_iq2_s_i8_fixed", "__weft_iq2_s_i8_rvv");
     if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
       return emitQuantCodebookI8Dot(
           op, "__weft_iq3_s_i8_rvv", "__weft_iq3_s_i8_rvv");
@@ -3031,7 +3106,7 @@ private:
           op, "__weft_iq1_m_i8_vl128", "__weft_iq1_m_i8_rvv");
     if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
       return emitQuantCodebookI8Dot(
-          op, "__weft_q6_k_i8_vl128", "__weft_q6_k_i8_rvv");
+          op, "__weft_q6_k_i8_fixed", "__weft_q6_k_i8_rvv");
     if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
       return emitSymmetricI4I8Contract(op);
     if (auto op = mlir::dyn_cast<MatmulOp>(operation))
@@ -5101,9 +5176,36 @@ private:
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
+    LaneRelation lhsRelation =
+        classifyLaneRelation(lhsLoad.getPointer(), reductionAxis.getResult());
+    LaneRelation rhsRelation =
+        classifyLaneRelation(rhsLoad.getPointer(), reductionAxis.getResult());
+    if ((lhsRelation != LaneRelation::UnitStride &&
+         lhsRelation != LaneRelation::Strided) ||
+        (rhsRelation != LaneRelation::UnitStride &&
+         rhsRelation != LaneRelation::Strided)) {
+      dot.emitError("RVV row microtile memory relations are unavailable");
+      return mlir::failure();
+    }
+    F32DotCandidateFacts candidateFacts;
+    candidateFacts.model = F32DotResourceModel::LocalRow;
+    candidateFacts.rowTile = decision.rowTile;
+    if (std::optional<int64_t> extent =
+            integerConstantValue(decision.reductionExtent);
+        extent && *extent >= 0)
+      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
+    candidateFacts.unitStrideOperands =
+        (lhsRelation == LaneRelation::UnitStride) +
+        (rhsRelation == LaneRelation::UnitStride);
+    candidateFacts.stridedOperands =
+        (lhsRelation == LaneRelation::Strided) +
+        (rhsRelation == LaneRelation::Strided);
+    candidateFacts.reductionPredicate =
+        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+    candidateFacts.predicateGroups =
+        candidateFacts.reductionPredicate ? 1 : 0;
     std::optional<F32DotPhysicalConfig> physical =
-        selectF32DotPhysicalConfig(F32DotResourceModel::LocalRow,
-                                        decision.rowTile, 1);
+        selectF32DotPhysicalConfig(candidateFacts);
     if (!physical) {
       dot.emitError(
           "RVV row microtile has no legal register-resource candidate");
@@ -6064,21 +6166,21 @@ private:
   void finalizeQuantCodebookI8Plan(
       OpTy op, PlannedPhysicalDecision<QuantCodebookI8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape shape = planned.realization.realization ==
-                                   QuantCodebookI8Realization::RVVVLEN128LocalBlockDot
-                               ? rvvShape(8, 2)
-                               : kRVVE8M1;
+    RVVVectorShape shape = planned.realization.byteShape;
     recordLocalBlockReloads(planned, op.getOperation(),
                             planned.realization.blocks, shape);
     planned.entity.resources.valueGroups = rvvRegisterGroups(shape) * 2;
     planned.entity.resources.memoryGroups = planned.entity.resources.valueGroups;
     planned.entity.resources.primitiveGroups =
         planned.realization.realization ==
-                QuantCodebookI8Realization::RVVVLEN128LocalBlockDot
-            ? 24
+                QuantCodebookI8Realization::RVVFixedLaneLocalBlockDot
+            ? 4 * planned.realization.reductionSegments +
+                  4 * rvvRegisterGroups(shape)
             : 6;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups;
+    planned.entity.schedule.microtile = planned.realization.semanticLanes;
+    planned.entity.schedule.unroll = planned.realization.reductionSegments;
   }
 
   void finalizeBlockDecodePlan(
@@ -6662,8 +6764,19 @@ private:
       return op.emitError(
           "quant codebook/i8 dot requires little-endian packed fields");
     decision = QuantCodebookI8Decision{};
-    if (options.target.vlenBits > 128 ||
-        mlir::isa<IQ3SI8DotOp>(op.getOperation()))
+    decision.semanticLanes = options.target.vlenBits >= 256 ? 64 : 32;
+    decision.byteShape =
+        rvvShapeForSemanticLanes(8, decision.semanticLanes,
+                                 options.target.vlenBits)
+            .value_or(RVVVectorShape{});
+    decision.reductionSegments = decision.semanticLanes / 16;
+    unsigned fixedLaneGroups = rvvRegisterGroups(decision.byteShape);
+    unsigned fixedLanePeak =
+        4 * decision.reductionSegments + 4 * fixedLaneGroups;
+    bool fixedLaneLeafAvailable =
+        mlir::isa<IQ2SI8DotOp, Q6KI8DotOp>(op.getOperation());
+    if (!decision.byteShape || !fixedLaneLeafAvailable ||
+        fixedLanePeak >= static_cast<unsigned>(options.target.vectorRegisters))
       decision.realization =
           QuantCodebookI8Realization::RVVScalableLocalBlockDot;
     for (mlir::Value block : blocks) {
@@ -6694,7 +6807,7 @@ private:
               PhysicalHandoff::Reload)))
         return mlir::failure();
     if (decision.realization !=
-            QuantCodebookI8Realization::RVVVLEN128LocalBlockDot &&
+            QuantCodebookI8Realization::RVVFixedLaneLocalBlockDot &&
         decision.realization !=
             QuantCodebookI8Realization::RVVScalableLocalBlockDot)
       return op.emitError("quant codebook/i8 realization is unavailable");
@@ -8274,10 +8387,8 @@ private:
   }
 
   bool isMaterializedF32BlockStore(StoreOp store) const {
-    mlir::Operation *definition = store.getValue().getDefiningOp();
-    return mlir::isa_and_nonnull<FullOp, SymmetricI4I8ContractOp,
-                                 AffineI4I8ContractOp, MatmulOp>(
-        definition);
+    FullOp root = findBlockFullRoot(store.getValue());
+    return root && materializedBlockFulls.contains(root.getOperation());
   }
 
   bool blockClosureEscapes(
@@ -9207,7 +9318,8 @@ private:
 
 void emitPrelude(llvm::raw_ostream &output, bool usesExp, bool usesRVVI4I8,
                  bool usesIME1, bool usesGroupedI4I8,
-                 bool usesE2M1E8M0I8, bool usesQuantCodebookI8) {
+                 bool usesE2M1E8M0I8, bool usesQuantCodebookI8,
+                 int64_t vlenBits) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -9833,6 +9945,20 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16_k32(
 )ime";
   }
   if (usesQuantCodebookI8) {
+    output << R"c(static const uint8_t __attribute__((unused))
+__weft_sign_gather_indices_64[64] = {
+    0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+    2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3,
+    4,4,4,4,4,4,4,4, 5,5,5,5,5,5,5,5,
+    6,6,6,6,6,6,6,6, 7,7,7,7,7,7,7,7};
+static const uint8_t __attribute__((unused))
+__weft_sign_bit_masks_64[64] = {
+    1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128,
+    1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128,
+    1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128,
+    1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
+
+)c";
     auto emitI64Table = [&](llvm::StringRef name, const int64_t *values,
                             size_t count) {
       output << "static const int64_t " << name << "[" << count << "] = {\n";
@@ -9907,12 +10033,85 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
 }
 
 static inline __attribute__((always_inline, unused)) float
-__weft_iq2_s_i8_vl128(
+__weft_iq2_s_i8_fixed(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
     float activation_scale, float init) {
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+ )c";
+    if (vlenBits >= 256) {
+      output << R"c(
+    const uint16_t gather_qh[8] = {0, 0, 0, 0, 1, 1, 1, 1};
+    const uint16_t shift_qh[8] = {11, 9, 7, 5, 11, 9, 7, 5};
+    const vuint16mf2_t gather =
+        __riscv_vle16_v_u16mf2(gather_qh, 8);
+    const vuint16mf2_t shifts =
+        __riscv_vle16_v_u16mf2(shift_qh, 8);
+    const vuint8m2_t sign_indices =
+        __riscv_vle8_v_u8m2(__weft_sign_gather_indices_64, 64);
+    const vuint8m2_t sign_masks =
+        __riscv_vle8_v_u8m2(__weft_sign_bit_masks_64, 64);
+    int32_t integer_sum = 0;
+    for (size_t group = 0; group < 4; ++group) {
+      const vuint8mf4_t code8 =
+          __riscv_vle8_v_u8mf4(codes + group * 8, 8);
+      const uint16_t high = (uint16_t)high_bits[group * 2] |
+                            ((uint16_t)high_bits[group * 2 + 1] << 8);
+      const vuint8mf8_t high8 =
+          __riscv_vle8_v_u8mf8((const uint8_t *)(const void *)&high, 2);
+      const vuint16mf4_t high16 =
+          __riscv_vwcvtu_x_x_v_u16mf4(high8, 2);
+      vuint16mf2_t expanded = __riscv_vrgather_vv_u16mf2(
+          __riscv_vlmul_ext_v_u16mf4_u16mf2(high16), gather, 8);
+      expanded = __riscv_vand_vx_u16mf2(
+          __riscv_vsll_vv_u16mf2(expanded, shifts, 8), 0x1800, 8);
+      vuint16mf2_t offsets = __riscv_vor_vv_u16mf2(
+          __riscv_vsll_vx_u16mf2(
+              __riscv_vwcvtu_x_x_v_u16mf2(code8, 8), 3, 8),
+          expanded, 8);
+      const vint8m2_t grid = __riscv_vreinterpret_v_u8m2_i8m2(
+          __riscv_vreinterpret_v_u64m2_u8m2(
+              __riscv_vluxei16_v_u64m2(
+                  (const uint64_t *)(const void *)__weft_iq2_s_grid,
+                  offsets, 8)));
+      const vuint8mf4_t packed_signs =
+          __riscv_vle8_v_u8mf4(sign_bits + group * 8, 8);
+      const vuint8m2_t expanded_signs = __riscv_vrgather_vv_u8m2(
+          __riscv_vlmul_ext_v_u8mf4_u8m2(packed_signs), sign_indices, 64);
+      const vbool4_t negative = __riscv_vmsne_vx_u8m2_b4(
+          __riscv_vand_vv_u8m2(expanded_signs, sign_masks, 64), 0, 64);
+      const vint8m2_t q8 =
+          __riscv_vle8_v_i8m2(activation + group * 64, 64);
+      const vint8m2_t signed_q8 =
+          __riscv_vrsub_vx_i8m2_mu(negative, q8, q8, 0, 64);
+      const vint16m4_t product =
+          __riscv_vwmul_vv_i16m4(grid, signed_q8, 64);
+      const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+      const int32_t partial0 = __riscv_vmv_x_s_i32m1_i32(
+          __riscv_vwredsum_vs_i16m1_i32m1(
+              __riscv_vget_v_i16m4_i16m1(product, 0), zero, 16));
+      const int32_t partial1 = __riscv_vmv_x_s_i32m1_i32(
+          __riscv_vwredsum_vs_i16m1_i32m1(
+              __riscv_vget_v_i16m4_i16m1(product, 1), zero, 16));
+      const int32_t partial2 = __riscv_vmv_x_s_i32m1_i32(
+          __riscv_vwredsum_vs_i16m1_i32m1(
+              __riscv_vget_v_i16m4_i16m1(product, 2), zero, 16));
+      const int32_t partial3 = __riscv_vmv_x_s_i32m1_i32(
+          __riscv_vwredsum_vs_i16m1_i32m1(
+              __riscv_vget_v_i16m4_i16m1(product, 3), zero, 16));
+      const uint8_t scale0 = scales[group * 2];
+      const uint8_t scale1 = scales[group * 2 + 1];
+      integer_sum += partial0 * (1 + 2 * (scale0 & 15));
+      integer_sum += partial1 * (1 + 2 * (scale0 >> 4));
+      integer_sum += partial2 * (1 + 2 * (scale1 & 15));
+      integer_sum += partial3 * (1 + 2 * (scale1 >> 4));
+    }
+    return init + 0.125f * (float)integer_sum *
+                      weight_scale * activation_scale;
+ )c";
+    } else {
+      output << R"c(
   const size_t vl32 = __riscv_vsetvl_e8m2(32);
   const vuint8m2_t lane = __riscv_vid_v_u8m2(vl32);
   const vuint8m2_t sign_source_index = __riscv_vsrl_vx_u8m2(lane, 3, vl32);
@@ -9955,7 +10154,9 @@ __weft_iq2_s_i8_vl128(
     integer_sum += second * (1 + 2 * (scales[group] >> 4));
   }
   return init + 0.125f * (float)integer_sum * weight_scale * activation_scale;
-}
+ )c";
+    }
+    output << R"c(}
 
 static inline __attribute__((always_inline, unused)) float
 __weft_iq2_s_i8_rvv(
@@ -10154,13 +10355,94 @@ __weft_iq1_m_i8_rvv(
 }
 
 static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_vl128(
+__weft_q6_k_i8_fixed(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
   const int8_t *group_scales =
       (const int8_t *)(const void *)group_scale_bytes;
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  const float combined_scale = weight_scale * activation_scale;
+ )c";
+    if (vlenBits >= 256) {
+      output << R"c(
+    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+    int32_t integer_sum = 0;
+    for (size_t half = 0; half < 2; ++half) {
+      const uint8_t *q6 = low_bits + half * 64;
+      const uint8_t *qh = high_bits + half * 32;
+      const int8_t *q8v = activation + half * 128;
+      const int8_t *sc = group_scales + half * 8;
+      const size_t vl32 = __riscv_vsetvl_e8m1(32);
+      const vuint8m1_t qh_value = __riscv_vle8_v_u8m1(qh, vl32);
+      const vuint8m1_t q6_0 = __riscv_vle8_v_u8m1(q6, vl32);
+      const vuint8m1_t q6_1 = __riscv_vle8_v_u8m1(q6 + 32, vl32);
+      const vuint8m1_t low_0 = __riscv_vand_vx_u8m1(q6_0, 0x0f, vl32);
+      const vuint8m1_t low_1 = __riscv_vand_vx_u8m1(q6_1, 0x0f, vl32);
+      const vuint8m1_t high_0 = __riscv_vsrl_vx_u8m1(q6_0, 4, vl32);
+      const vuint8m1_t high_1 = __riscv_vsrl_vx_u8m1(q6_1, 4, vl32);
+      const vuint8m1_t qh_0 = __riscv_vand_vx_u8m1(qh_value, 3, vl32);
+      const vuint8m1_t qh_1 = __riscv_vand_vx_u8m1(
+          __riscv_vsrl_vx_u8m1(qh_value, 2, vl32), 3, vl32);
+      const vuint8m1_t qh_2 = __riscv_vand_vx_u8m1(
+          __riscv_vsrl_vx_u8m1(qh_value, 4, vl32), 3, vl32);
+      const vuint8m1_t qh_3 = __riscv_vand_vx_u8m1(
+          __riscv_vsrl_vx_u8m1(qh_value, 6, vl32), 3, vl32);
+      const vint8m1_t value_0 = __riscv_vsub_vx_i8m1(
+          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
+              low_0, __riscv_vsll_vx_u8m1(qh_0, 4, vl32), vl32)),
+          32, vl32);
+      const vint8m1_t value_1 = __riscv_vsub_vx_i8m1(
+          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
+              low_1, __riscv_vsll_vx_u8m1(qh_1, 4, vl32), vl32)),
+          32, vl32);
+      const vint8m1_t value_2 = __riscv_vsub_vx_i8m1(
+          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
+              high_0, __riscv_vsll_vx_u8m1(qh_2, 4, vl32), vl32)),
+          32, vl32);
+      const vint8m1_t value_3 = __riscv_vsub_vx_i8m1(
+          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
+              high_1, __riscv_vsll_vx_u8m1(qh_3, 4, vl32), vl32)),
+          32, vl32);
+      const vint16m2_t product_0 = __riscv_vwmul_vv_i16m2(
+          value_0, __riscv_vle8_v_i8m1(q8v, vl32), vl32);
+      const vint16m2_t product_1 = __riscv_vwmul_vv_i16m2(
+          value_1, __riscv_vle8_v_i8m1(q8v + 32, vl32), vl32);
+      const vint16m2_t product_2 = __riscv_vwmul_vv_i16m2(
+          value_2, __riscv_vle8_v_i8m1(q8v + 64, vl32), vl32);
+      const vint16m2_t product_3 = __riscv_vwmul_vv_i16m2(
+          value_3, __riscv_vle8_v_i8m1(q8v + 96, vl32), vl32);
+      const size_t vl16 = __riscv_vsetvl_e16m1(16);
+      const vint32m2_t scaled_0 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_0, 0), sc[0], vl16);
+      const vint32m2_t scaled_1 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_0, 1), sc[1], vl16);
+      const vint32m2_t scaled_2 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_1, 0), sc[2], vl16);
+      const vint32m2_t scaled_3 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_1, 1), sc[3], vl16);
+      const vint32m2_t scaled_4 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_2, 0), sc[4], vl16);
+      const vint32m2_t scaled_5 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_2, 1), sc[5], vl16);
+      const vint32m2_t scaled_6 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_3, 0), sc[6], vl16);
+      const vint32m2_t scaled_7 = __riscv_vwmul_vx_i32m2(
+          __riscv_vget_v_i16m2_i16m1(product_3, 1), sc[7], vl16);
+      const vint32m1_t sum_0 = __riscv_vredsum_vs_i32m2_i32m1(
+          __riscv_vadd_vv_i32m2(scaled_0, scaled_1, vl16), zero, vl16);
+      const vint32m1_t sum_1 = __riscv_vredsum_vs_i32m2_i32m1(
+          __riscv_vadd_vv_i32m2(scaled_2, scaled_3, vl16), sum_0, vl16);
+      const vint32m1_t sum_2 = __riscv_vredsum_vs_i32m2_i32m1(
+          __riscv_vadd_vv_i32m2(scaled_4, scaled_5, vl16), sum_1, vl16);
+      const vint32m1_t sum_3 = __riscv_vredsum_vs_i32m2_i32m1(
+          __riscv_vadd_vv_i32m2(scaled_6, scaled_7, vl16), sum_2, vl16);
+      integer_sum += __riscv_vmv_x_s_i32m1_i32(sum_3);
+    }
+    return init + combined_scale * (float)integer_sum;
+ )c";
+    } else {
+      output << R"c(
   const uint8_t *low = low_bits;
   const uint8_t *high = high_bits;
   const int8_t *scale = group_scales;
@@ -10168,7 +10450,6 @@ __weft_q6_k_i8_vl128(
   int low_high;
   float temporary;
   float result = init;
-  const float combined_scale = weight_scale * activation_scale;
   for (size_t half = 0; half < 2; ++half) {
     __asm__ volatile(
         "addi %[low_high], %[low], 32\n\t"
@@ -10262,7 +10543,9 @@ __weft_q6_k_i8_vl128(
     q8 += 128;
   }
   return result;
-}
+ )c";
+    }
+    output << R"c(}
 
 static inline __attribute__((always_inline, unused)) float
 __weft_q6_k_i8_rvv(
@@ -10402,7 +10685,8 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
       usesLocalI4I8 && options.target.matrixExtension == "spacemit-ime1";
   bool usesRVVI4I8 = usesLocalI4I8 && !usesIME1;
   emitPrelude(output, usesExp, usesRVVI4I8, usesIME1, usesGroupedI4I8,
-              usesE2M1E8M0I8, usesQuantCodebookI8);
+              usesE2M1E8M0I8, usesQuantCodebookI8,
+              options.target.vlenBits);
 
   llvm::SmallVector<KernelOp> kernels;
   for (KernelOp kernel : module.getOps<KernelOp>())
