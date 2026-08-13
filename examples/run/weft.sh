@@ -25,6 +25,8 @@ case "${profile}" in
     remote_link_flags="-L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm"
     remote_ggml_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv/bin
     remote_ggml_toolchain_lib=/opt/tcrv-toolchains/gcc-15.2.0/lib
+    runtime_hardware=SG2044
+    projection_scope=activation-quantize-plus-local-N16-K32-contract
     ;;
   k1-rvv256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -38,6 +40,8 @@ case "${profile}" in
     remote_link_flags=-lm
     remote_ggml_build=/data/build-k1-q4k/bin
     remote_ggml_toolchain_lib=
+    runtime_hardware=K1/X60
+    projection_scope=activation-quantize-plus-local-N16-K32-contract
     ;;
   k1-ime256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -51,6 +55,8 @@ case "${profile}" in
     remote_link_flags=-lm
     remote_ggml_build=/data/build-k1-q4k/bin
     remote_ggml_toolchain_lib=
+    runtime_hardware=K1/X60
+    projection_scope=production-activation-quantize-plus-ime1-gemm
     ;;
   *)
     echo "unsupported Weft target profile: ${profile}" >&2
@@ -514,7 +520,7 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/ime/q4_k_projection.py
     runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
-    runtime_arguments=("$1")
+    runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
     ;;
   q4_0_projection_ime)
     if [[ $# -ne 1 ]]; then
@@ -523,7 +529,7 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/ime/q4_0_projection.py
     runtime=examples/repro/weft/ime/q4_0_projection_runtime.cpp
-    runtime_arguments=("$1")
+    runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
     ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then

@@ -231,22 +231,28 @@ void evict(std::vector<uint8_t> &buffer) {
     std::fprintf(stderr, "unreachable eviction sum\n");
 }
 
-size_t repetitions_from(int argc, char **argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: %s <repetitions>\n", argv[0]);
+struct RuntimeArguments {
+  size_t repetitions;
+  const char *hardware;
+  const char *scope;
+};
+
+RuntimeArguments runtime_arguments_from(int argc, char **argv) {
+  if (argc != 4) {
+    std::fprintf(stderr, "usage: %s <repetitions> <hardware> <scope>\n", argv[0]);
     std::exit(2);
   }
   char *end = nullptr;
   const long value = std::strtol(argv[1], &end, 10);
   if (*argv[1] == '\0' || *end != '\0' || value <= 0)
     std::exit(2);
-  return static_cast<size_t>(value);
+  return {static_cast<size_t>(value), argv[2], argv[3]};
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
-  const size_t repetitions = repetitions_from(argc, argv);
+  const RuntimeArguments runtime = runtime_arguments_from(argc, argv);
   std::vector<float> activation(kInner);
   for (size_t k = 0; k < kInner; ++k) {
     const int value = static_cast<int>((k * 37 + (k / 17) * 11) % 257) - 128;
@@ -291,8 +297,8 @@ int main(int argc, char **argv) {
 
   std::vector<uint8_t> eviction(64 * 1024 * 1024, 1);
   std::vector<double> milliseconds;
-  milliseconds.reserve(repetitions);
-  for (size_t repetition = 0; repetition < repetitions; ++repetition) {
+  milliseconds.reserve(runtime.repetitions);
+  for (size_t repetition = 0; repetition < runtime.repetitions; ++repetition) {
     evict(eviction);
     const auto start = std::chrono::steady_clock::now();
     q4_k_projection_ime(activation.data(), packed.data(), output.data(),
@@ -306,16 +312,16 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * kRows * kColumns * kInner;
 
   std::printf("kernel=q4_k_projection_ime\n");
-  std::printf("hardware=K1/X60\n");
+  std::printf("hardware=%s\n", runtime.hardware);
   std::printf("M=%zu,N=%zu,K=%zu\n", kRows, kColumns, kInner);
   std::printf("persistent_weight=q4_K_to_q4_1x16_K32_N16\n");
-  std::printf("scope=production-activation-quantize-plus-ime1-gemm\n");
+  std::printf("scope=%s\n", runtime.scope);
   std::printf("cold_protocol=64MiB-evict-then-single-kernel\n");
   std::printf("activation_code_mismatches=%zu\n", code_mismatches);
   std::printf("activation_scale_max_absolute_error=%.9g\n", scale_error);
   std::printf("max_absolute_error=%.9g\n", max_absolute_error);
   std::printf("max_relative_error=%.9g\n", max_relative_error);
-  std::printf("repetitions=%zu\n", repetitions);
+  std::printf("repetitions=%zu\n", runtime.repetitions);
   std::printf("median_ms=%.6f\n", median_ms);
   std::printf("gop_s=%.6f\n", operations / (median_ms * 1.0e6));
 
