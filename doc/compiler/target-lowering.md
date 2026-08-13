@@ -57,6 +57,13 @@ verifier、pipeline front door或长期provider registry。
 - E2M1/E8M0×i8 primitive的packed-code/activation bases、exponent/scale/init operands与
   VLEN128 table-dot realization。
 
+这些decision应由一个短生命周期的physical planning core联合形成。Planner先建立value/use
+physical shape、memory handoff、primitive realization、loop-local schedule和resource budget，
+再把selected fields投影到各operation owner。Load、cast、state、dot和store之间的SEW、LMUL、
+mask/index relation不能各选一遍；handoff必须明确为share、convert、rematerialize、reload、
+shuffle或primitive-local pack。候选的peak resource同时计入live value、memory/index、predicate、
+state、primitive和pipeline footprint。这个plan只存在于一次lowering调用中，不是新IR。
+
 这些decision不进入Kernel IR。每个decision由对应canonical primitive/contract的唯一owner
 产生。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape和fragment；后续store、
 cast或leaf不能再根据use count、周围op数量或完整kernel source重新选择一次。
