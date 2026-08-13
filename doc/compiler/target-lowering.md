@@ -18,9 +18,9 @@ width、LMUL、mask/tail、fragment、rounding与memory instruction等派生capa
 target facts，不形成新IR。Cache、throughput、latency与preferred unroll只能作为hint排序
 合法物理配置，不能让非法实现变合法。
 
-当前 `RISCVLoweringOptions` 的public输入只有target profile与source meta bindings。LMUL、
-microtile、unroll、fragment等物理参数由lowering内部选择；以后若暴露build-time backend
-config，它必须是显式、短生命周期的lowering option，不能进入canonical IR。
+当前 `RISCVLoweringOptions` 的public输入包括target profile、source meta bindings与显式的
+build-time backend config。后者只约束本次lowering中的LMUL、microtile、unroll与radix
+candidate；它不进入canonical IR，也不成为持久表示或第二份语义authority。
 
 ## 内部 realization families
 
@@ -57,12 +57,15 @@ verifier、pipeline front door或长期provider registry。
 - E2M1/E8M0×i8 primitive的packed-code/activation bases、exponent/scale/init operands与
   VLEN128 table-dot realization。
 
-这些decision应由一个短生命周期的physical planning core联合形成。Planner先建立value/use
+这些decision由一个短生命周期的physical planning core联合形成。每个显式VLA region或
+local primitive都拥有同样的typed entity plan，并在其中建立value/use
 physical shape、memory handoff、primitive realization、loop-local schedule和resource budget，
 再把selected fields投影到各operation owner。Load、cast、state、dot和store之间的SEW、LMUL、
 mask/index relation不能各选一遍；handoff必须明确为share、convert、rematerialize、reload、
 shuffle或primitive-local pack。候选的peak resource同时计入live value、memory/index、predicate、
-state、primitive和pipeline footprint。这个plan只存在于一次lowering调用中，不是新IR。
+state、primitive和pipeline footprint。当前没有显式pipeline语义的实体会明确选择单stage；
+没有显式prefetch primitive时选择零prefetch-distance，存在该primitive时只记录它授权的局部
+handoff，不能被解释成编译器发明了staging。这个plan只存在于一次lowering调用中，不是新IR。
 
 这些decision不进入Kernel IR。每个decision由对应canonical primitive/contract的唯一owner
 产生。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape和fragment；后续store、
@@ -155,7 +158,8 @@ access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择�
 
 Local F32 dot/matmul根据block/VLA axis、typed operand、pointer/access与predicate projection形成
 resource model，再从局部candidate中选择LMUL；当前local-row候选会随row extent选择LMUL4/2/1，
-VLA free-axis候选也共用同一selector。`kUnroll`已经物化但当前合法winner仍为1；multi-axis
+VLA free-axis候选也共用同一selector。LMUL与K-unroll只物化在entity plan中，typed primitive
+payload不保存第二份选择；当前合法K-unroll winner仍为1。multi-axis
 microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是
 开放注册表或通用搜索承诺。
 
