@@ -48,8 +48,9 @@ verifier、pipeline front door或长期provider registry。
 - local F32 dot/matmul的operand shape、row microtile、pointer/stride relation、LMUL和resource
   footprint；含dot/matmul的
   VLA region直接消费该LMUL来决定strip width、mask ratio与index LMUL，不保留第二份选择；
-- block store/reduce的strip family、byte-vector shape、active length和lane-index需求；block
-  decode的table extent、code/result vector shape与RVV gather realization；
+- block store/reduce的strip family、byte-vector shape、active length和lane-index需求；closure内
+  每个value、decode code/result与materialized store的vector shape只存在于entity plan，typed
+  payload只保留local realization和source provenance；
 - symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
   N16×K32 realization；
 - sign-bit×i8 primitive的block bases、scale/init operands与VLEN128 widening-sign-sum
@@ -153,8 +154,9 @@ kernel family。
 逐实体VLA memory/predicate/state/narrow、F16/F32 cast、F16 arithmetic、codebook decode、
 sign-bit/E2M1 local dot与symmetric IME fragment已经按上述模型工作。此前F16 fill、F32→F16、
 F16 weighted update和F16→F32 normalize四条whole-region realization已经由generic VLA
-access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择也已移出emitter，
-成为明确physical decision。
+access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择及closure内每个结果
+shape也已移出emitter，成为entity-owned physical decision；block emitter不再保存或重建第二份
+vector shape。
 
 Local F32 dot/matmul根据block/VLA axis、typed operand、pointer/access与predicate projection形成
 resource model，再从局部candidate中选择LMUL；当前local-row候选会随row extent选择LMUL4/2/1，

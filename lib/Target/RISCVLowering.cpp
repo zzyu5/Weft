@@ -132,8 +132,6 @@ struct BlockDecodeDecision {
   BlockDecodeRealization realization =
       BlockDecodeRealization::RVVI8TableGather;
   int64_t tableExtent = 16;
-  RVVVectorShape codeShape = kRVVE8M1;
-  RVVVectorShape resultShape = kRVVE8M1;
 };
 
 enum class BlockValueRealization {
@@ -144,8 +142,6 @@ enum class BlockValueRealization {
 
 struct BlockOperationDecision {
   mlir::Operation *operation = nullptr;
-  RVVVectorShape resultShape;
-  RVVVectorShape auxiliaryShape;
   BlockValueRealization realization = BlockValueRealization::Direct;
   mlir::Value source;
   std::string transform;
@@ -210,7 +206,6 @@ struct MaterializedBlockStoreDecision {
   mlir::Value columnAxis;
   int64_t rows = 0;
   int64_t columns = 0;
-  RVVVectorShape vectorShape;
   mlir::Value pointerBase;
 };
 
@@ -538,6 +533,7 @@ struct PhysicalResourceBudget {
 struct LoopLocalScheduleDecision {
   VLAStripSchedule stripSchedule = VLAStripSchedule::Dynamic;
   unsigned unroll = 1;
+  unsigned microtile = 1;
   unsigned pipelineStages = 1;
   unsigned prefetchDistance = 0;
 };
@@ -553,6 +549,7 @@ struct PhysicalEntityPlan {
   unsigned vlaMaskRatio = 0;
   std::optional<BlockStorePhysicalDecision> blockStore;
   std::optional<BlockReducePhysicalDecision> blockReduce;
+  bool hasValueShapeConflict = false;
 };
 
 struct VLACandidateFacts {
@@ -599,6 +596,8 @@ void recordPhysicalValue(PhysicalEntityPlan &plan, mlir::Value value,
   });
   if (found == plan.values.end())
     plan.values.push_back(PhysicalValueDecision{value, shape});
+  else if (found->shape != shape)
+    plan.hasValueShapeConflict = true;
 }
 
 void recordPhysicalHandoff(PhysicalEntityPlan &plan,
@@ -654,7 +653,6 @@ struct F16GemmNTileDecision {
   unsigned rowTile = 4;
   unsigned columnTile = 8;
   unsigned reductionTile = 64;
-  unsigned rowMicrotile = 4;
 };
 
 enum class ContractRealization {
@@ -1245,6 +1243,7 @@ private:
   RISCVPhysicalPlan physicalPlan;
   const llvm::SmallVector<BlockOperationDecision> *activeBlockOperations =
       nullptr;
+  const PhysicalEntityPlan *activeBlockEntity = nullptr;
   llvm::DenseSet<mlir::Operation *> consumed;
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
@@ -1421,6 +1420,30 @@ private:
     return found == activeBlockOperations->end() ? nullptr : &*found;
   }
 
+  const PhysicalValueDecision *
+  findBlockValueDecision(mlir::Value value) const {
+    if (!activeBlockEntity)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeBlockEntity->values,
+        [&](const PhysicalValueDecision &decision) {
+          return decision.value == value;
+        });
+    return found == activeBlockEntity->values.end() ? nullptr : &*found;
+  }
+
+  const PhysicalTemporaryDecision *
+  findBlockTemporaryDecision(mlir::Operation *owner) const {
+    if (!activeBlockEntity)
+      return nullptr;
+    auto found = llvm::find_if(
+        activeBlockEntity->temporaries,
+        [&](const PhysicalTemporaryDecision &decision) {
+          return decision.owner == owner;
+        });
+    return found == activeBlockEntity->temporaries.end() ? nullptr : &*found;
+  }
+
   const PhysicalHandoffDecision *
   findVLAHandoff(mlir::Operation *consumer, mlir::Value value) const {
     if (!activePhysicalEntity)
@@ -1480,8 +1503,10 @@ private:
       const PlannedPhysicalDecision<Decision> &planned) const {
     const PhysicalResourceBudget &resources = planned.entity.resources;
     if (resources.architecturalGroups != options.target.vectorRegisters ||
+        planned.entity.hasValueShapeConflict ||
         resources.pipelineGroups != 0 ||
         resources.peakGroups > resources.architecturalGroups ||
+        planned.entity.schedule.microtile == 0 ||
         planned.entity.schedule.pipelineStages != 1 ||
         planned.entity.schedule.prefetchDistance > 1)
       return owner->emitError("physical entity resource/schedule plan is invalid");
@@ -5720,7 +5745,6 @@ private:
       decision.realization =
           MaterializedBlockStoreRealization::RVVContiguousRankOne;
       decision.columns = 16;
-      decision.vectorShape = kRVVE32M2;
       decision.pointerBase = lanePointer.getBase();
     } else {
       return op.emitError(
@@ -5729,15 +5753,15 @@ private:
     PlannedPhysicalDecision<MaterializedBlockStoreDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
-    if (planned.realization.vectorShape) {
+    if (planned.realization.realization ==
+        MaterializedBlockStoreRealization::RVVContiguousRankOne) {
+      RVVVectorShape vectorShape = kRVVE32M2;
       recordPhysicalValue(planned.entity, op.getValue(),
-                          planned.realization.vectorShape);
+                          vectorShape);
       recordPhysicalHandoff(planned.entity, op.getOperation(), op.getValue(),
-                            PhysicalHandoff::Share,
-                            planned.realization.vectorShape,
-                            planned.realization.vectorShape);
+                            PhysicalHandoff::Share, vectorShape, vectorShape);
       planned.entity.resources.valueGroups =
-          rvvRegisterGroups(planned.realization.vectorShape);
+          rvvRegisterGroups(vectorShape);
       planned.entity.resources.memoryGroups =
           planned.entity.resources.valueGroups;
       planned.entity.resources.peakGroups =
@@ -6079,16 +6103,13 @@ private:
       DecodeOp op,
       PlannedPhysicalDecision<BlockDecodeDecision> &planned) const {
     initializeEntityPlan(planned.entity);
-    recordPhysicalValue(planned.entity, op.getCodes(),
-                        planned.realization.codeShape);
-    recordPhysicalValue(planned.entity, op.getTable(),
-                        planned.realization.resultShape);
-    recordPhysicalValue(planned.entity, op.getResult(),
-                        planned.realization.resultShape);
+    RVVVectorShape codeShape = kRVVE8M1;
+    RVVVectorShape resultShape = kRVVE8M1;
+    recordPhysicalValue(planned.entity, op.getCodes(), codeShape);
+    recordPhysicalValue(planned.entity, op.getTable(), resultShape);
+    recordPhysicalValue(planned.entity, op.getResult(), resultShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(), op.getCodes(),
-                          PhysicalHandoff::Share,
-                          planned.realization.codeShape,
-                          planned.realization.resultShape);
+                          PhysicalHandoff::Share, codeShape, resultShape);
     planned.entity.resources.valueGroups = 3;
     planned.entity.resources.primitiveGroups = 3;
     planned.entity.resources.peakGroups = 4;
@@ -6269,6 +6290,7 @@ private:
     if (mlir::failed(requireEntityPlan(op.getOperation(), selected->second)))
       return std::optional<mlir::LogicalResult>(mlir::failure());
     const MaterializedBlockStoreDecision &decision = selected->second.realization;
+    const PhysicalEntityPlan &entity = selected->second.entity;
     auto stored = values.find(op.getValue());
     if (stored == values.end() ||
         stored->second.kind != CValueKind::F32BlockStorage)
@@ -6309,9 +6331,16 @@ private:
     }
     if (decision.realization !=
             MaterializedBlockStoreRealization::RVVContiguousRankOne ||
-        decision.vectorShape != kRVVE32M2 || decision.columns != 16)
+        decision.columns != 16)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store decision has no spelling"));
+    auto valuePlan = llvm::find_if(
+        entity.values, [&](const PhysicalValueDecision &value) {
+          return value.value == op.getValue();
+        });
+    if (valuePlan == entity.values.end() || valuePlan->shape != kRVVE32M2)
+      return std::optional<mlir::LogicalResult>(
+          op.emitError("materialized block store has no physical value shape"));
     if (!decision.pointerBase)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized f32 store address is unavailable"));
@@ -6989,7 +7018,7 @@ private:
     }
     if (!selected)
       return std::nullopt;
-    decision.rowMicrotile = selected->first;
+    unsigned rowMicrotile = selected->first;
     unsigned inputLMUL = selected->second;
     unsigned computeLMUL = 2 * selected->second;
     if (mlir::failed(selectMaterializedBlockStorage(matmul.getInit(),
@@ -7010,14 +7039,15 @@ private:
     planned.entity.resources.architecturalGroups =
         options.target.vectorRegisters;
     planned.entity.resources.valueGroups =
-        decision.rowMicrotile * computeLMUL;
+        rowMicrotile * computeLMUL;
     planned.entity.resources.memoryGroups = 2 * inputLMUL;
     planned.entity.resources.primitiveGroups =
-        (3 * decision.rowMicrotile + 1) * inputLMUL;
+        (3 * rowMicrotile + 1) * inputLMUL;
     planned.entity.resources.pipelineGroups = 0;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
     planned.entity.schedule.stripSchedule = VLAStripSchedule::FullThenTail;
+    planned.entity.schedule.microtile = rowMicrotile;
     return planned;
   }
 
@@ -7092,9 +7122,9 @@ private:
          *tailRhsPredicate + ")) --" + activeK + ";");
 
     for (unsigned rowBase = 0; rowBase < decision.rowTile;
-         rowBase += decision.rowMicrotile) {
+         rowBase += entity.schedule.microtile) {
       unsigned rowCount =
-          std::min(decision.rowMicrotile, decision.rowTile - rowBase);
+          std::min(entity.schedule.microtile, decision.rowTile - rowBase);
       std::string fullVL = fresh("matmul_full_vl");
       line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m" +
            std::to_string(*inputLMUL) + "();");
@@ -7215,51 +7245,57 @@ private:
   }
 
   BlockOperationDecision decideBlockOperation(mlir::Operation *operation,
-                                              RVVVectorShape byteShape) const {
+                                              RVVVectorShape byteShape,
+                                              PhysicalEntityPlan &entity) const {
     BlockOperationDecision decision;
     decision.operation = operation;
+    auto setResultShape = [&](RVVVectorShape shape) {
+      if (!shape)
+        return;
+      for (mlir::Value result : operation->getResults())
+        recordPhysicalValue(entity, result, shape);
+    };
     if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
       if (elementType(load.getResult().getType()).isUnsignedInteger(8))
-        decision.resultShape = byteShape;
+        setResultShape(byteShape);
       return decision;
     }
     if (auto bitcast = mlir::dyn_cast<BitcastOp>(operation)) {
       mlir::Type target = elementType(bitcast.getResult().getType());
       if (target.isSignedInteger(8))
-        decision.resultShape = byteShape;
+        setResultShape(byteShape);
       else if (target.isSignedInteger(16))
-        decision.resultShape = kRVVE16M2;
+        setResultShape(kRVVE16M2);
       return decision;
     }
     if (auto compare = mlir::dyn_cast<CompareOp>(operation)) {
-      decision.resultShape = RVVVectorShape{1, 8};
+      setResultShape(RVVVectorShape{1, 8});
       return decision;
     }
     if (auto cast = mlir::dyn_cast<CastOp>(operation)) {
       mlir::Type source = elementType(cast.getInput().getType());
       mlir::Type target = elementType(cast.getResult().getType());
       if (target.isUnsignedInteger(8))
-        decision.resultShape = byteShape;
+        setResultShape(byteShape);
       else if (target.isUnsignedInteger(16))
-        decision.resultShape = kRVVE16M2;
+        setResultShape(kRVVE16M2);
       else if (target.isSignedInteger(32) &&
                (source.isUnsignedInteger(8) || source.isSignedInteger(8))) {
-        decision.resultShape = kRVVE32M4;
+        setResultShape(kRVVE32M4);
         decision.realization = BlockValueRealization::DeferredI32Widen;
-        decision.auxiliaryShape = byteShape;
+        recordPhysicalTemporary(entity, operation, byteShape);
       } else if (target.isSignedInteger(32))
-        decision.resultShape = kRVVE32M4;
+        setResultShape(kRVVE32M4);
       else if (target.isF32())
-        decision.resultShape = byteShape == kRVVE8MF4 ? kRVVE32M1
-                                                       : kRVVE32M4;
+        setResultShape(byteShape == kRVVE8MF4 ? kRVVE32M1 : kRVVE32M4);
       return decision;
     }
     if (auto binary = mlir::dyn_cast<BinaryOp>(operation)) {
       mlir::Type result = elementType(binary.getResult().getType());
       if (result.isIndex())
-        decision.resultShape = kRVVE16M2;
+        setResultShape(kRVVE16M2);
       else if (result.isUnsignedInteger(8)) {
-        decision.resultShape = byteShape;
+        setResultShape(byteShape);
         bool feedsOnlyF32Casts = !binary.getResult().use_empty() && llvm::all_of(
             binary.getResult().getUsers(), [](mlir::Operation *user) {
               auto cast = mlir::dyn_cast<CastOp>(user);
@@ -7279,19 +7315,24 @@ private:
             decision.unsignedMaximum = static_cast<uint64_t>(*mask);
         }
       } else if (result.isUnsignedInteger(16))
-        decision.resultShape = kRVVE16M2;
+        setResultShape(kRVVE16M2);
       else if (result.isSignedInteger(32))
-        decision.resultShape = kRVVE32M4;
+        setResultShape(kRVVE32M4);
       else if (result.isF32()) {
         for (mlir::Value operand : binary->getOperands()) {
           mlir::Operation *definition = operand.getDefiningOp();
           if (!definition)
             continue;
           BlockOperationDecision producer =
-              decideBlockOperation(definition, byteShape);
-          if (producer.resultShape == kRVVE32M1 ||
-              producer.resultShape == kRVVE32M4) {
-            decision.resultShape = producer.resultShape;
+              decideBlockOperation(definition, byteShape, entity);
+          auto producerShape = llvm::find_if(
+              entity.values, [&](const PhysicalValueDecision &value) {
+                return value.value == operand;
+              });
+          if (producerShape != entity.values.end() &&
+              (producerShape->shape == kRVVE32M1 ||
+               producerShape->shape == kRVVE32M4)) {
+            setResultShape(producerShape->shape);
             break;
           }
         }
@@ -7301,7 +7342,7 @@ private:
     if (auto select = mlir::dyn_cast<SelectOp>(operation)) {
       mlir::Type result = elementType(select.getResult().getType());
       if (result.isUnsignedInteger(8))
-        decision.resultShape = byteShape;
+        setResultShape(byteShape);
       return decision;
     }
     return decision;
@@ -7309,10 +7350,10 @@ private:
 
   llvm::SmallVector<BlockOperationDecision> decideBlockOperations(
       const llvm::DenseSet<mlir::Operation *> &closure,
-      RVVVectorShape byteShape) const {
+      RVVVectorShape byteShape, PhysicalEntityPlan &entity) const {
     llvm::SmallVector<BlockOperationDecision> decisions;
     for (mlir::Operation *operation : closure)
-      decisions.push_back(decideBlockOperation(operation, byteShape));
+      decisions.push_back(decideBlockOperation(operation, byteShape, entity));
     return decisions;
   }
 
@@ -7412,7 +7453,9 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || physical->resultShape != kRVVE16M2)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || valuePlan->shape != kRVVE16M2)
       return op.emitError("logical-index binary has no selected u16m2 shape");
     bool lhsVector = lhs.kind == BlockValueKind::Index;
     bool rhsVector = rhs.kind == BlockValueKind::Index;
@@ -7471,7 +7514,7 @@ private:
     line("vuint16m2_t " + name + " = " + intrinsic + "(" + lhs.spelling +
          ", " + rhsSpelling + ", " + vl.str() + ");");
     BlockValue result{op.getResult().getType(), BlockValueKind::Index, name};
-    result.vectorShape = physical->resultShape;
+    result.vectorShape = valuePlan->shape;
     if (!rhsVector && op.getKind() == "add" &&
         !lhs.contiguousIndex.empty())
       result.contiguousIndex =
@@ -7509,8 +7552,11 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("integer block binary has no physical value decision");
+    RVVVectorShape selectedShape = valuePlan->shape;
     if (physical->realization ==
         BlockValueRealization::DeferredPackedTransform) {
       if (resultKind != BlockValueKind::U8 || lhs.kind != BlockValueKind::U8 ||
@@ -7524,7 +7570,7 @@ private:
       result.packedSource = physical->source;
       result.packedTransform = physical->transform;
       result.packedTransformOperand = rhs.spelling;
-      result.vectorShape = physical->resultShape;
+      result.vectorShape = selectedShape;
       result.unsignedMaximum = physical->unsignedMaximum;
       blockValues[op.getResult()] = std::move(result);
       return mlir::success();
@@ -7579,11 +7625,11 @@ private:
     std::string suffix;
     std::string cType;
     if (resultKind == BlockValueKind::U8) {
-      std::string shape = rvvShapeSuffix(physical->resultShape);
-      if (shape.empty())
+      std::string shapeSuffix = rvvShapeSuffix(selectedShape);
+      if (shapeSuffix.empty())
         return op.emitError("u8 block binary has no RVV shape spelling");
-      suffix = "u" + shape;
-      cType = "vuint" + shape + "_t";
+      suffix = "u" + shapeSuffix;
+      cType = "vuint" + shapeSuffix + "_t";
     } else if (resultKind == BlockValueKind::U16) {
       suffix = "u16m2";
       cType = "vuint16m2_t";
@@ -7613,7 +7659,7 @@ private:
          "_" + suffix + "(" + lhs.spelling + ", " + rhs.spelling + ", " +
          vl.str() + ");");
     BlockValue result{op.getResult().getType(), resultKind, name};
-    result.vectorShape = physical->resultShape;
+    result.vectorShape = selectedShape;
     if (resultKind == BlockValueKind::U8 && op.getKind() == "and") {
       std::optional<int64_t> mask = integerConstant(op.getRhs());
       if (mask && *mask >= 0)
@@ -7634,7 +7680,9 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("f32 block binary has no physical value decision");
     bool lhsVector = lhs.kind == BlockValueKind::F32;
     bool rhsVector = rhs.kind == BlockValueKind::F32;
@@ -7678,7 +7726,7 @@ private:
     }
     if (stem.empty() || first.empty() || second.empty())
       return op.emitError("RVV f32 block binary kind is unsupported");
-    RVVVectorShape shape = physical->resultShape;
+    RVVVectorShape shape = valuePlan->shape;
     if (lhsVector && rhsVector && lhs.vectorShape != rhs.vectorShape)
       return op.emitError("f32 block binary has incompatible physical vectors");
     if ((lhsVector && lhs.vectorShape != shape) ||
@@ -7733,7 +7781,9 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("block comparison has no physical mask decision");
     BlockValue lhs = lookupBlockValue(op.getLhs(), blockValues);
     BlockValue rhs = lookupBlockValue(op.getRhs(), blockValues);
@@ -7765,22 +7815,22 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("block cast has no physical value decision");
     BlockValue input = lookupBlockValue(op.getInput(), blockValues);
     mlir::Type target = elementType(op.getResult().getType());
     std::string name = fresh("block_cast");
     BlockValueKind kind;
-    RVVVectorShape shape = RVVVectorShape{};
+    RVVVectorShape shape = valuePlan->shape;
     if (input.kind == BlockValueKind::Index && target.isUnsignedInteger(8)) {
       kind = BlockValueKind::U8;
-      shape = physical->resultShape;
       line("vuint8m1_t " + name + " = __riscv_vncvt_x_x_w_u8m1(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
                target.isUnsignedInteger(16)) {
       kind = BlockValueKind::U16;
-      shape = physical->resultShape;
       line("vuint16m2_t " + name + " = __riscv_vzext_vf2_u16m2(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
@@ -7794,7 +7844,6 @@ private:
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(32)) {
       kind = BlockValueKind::I32;
-      shape = physical->resultShape;
       std::string extended = fresh("block_u32");
       line("vuint32m4_t " + extended + " = __riscv_vzext_vf2_u32m4(" +
            input.spelling + ", " + vl.str() + ");");
@@ -7803,14 +7852,12 @@ private:
     } else if (input.kind == BlockValueKind::I16 &&
                target.isSignedInteger(32)) {
       kind = BlockValueKind::I32;
-      shape = physical->resultShape;
       line("vint32m4_t " + name + " = __riscv_vsext_vf2_i32m4(" +
            input.spelling + ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 && target.isF32()) {
       kind = BlockValueKind::F32;
       std::string extended;
-      if (physical->resultShape == kRVVE32M1) {
-        shape = physical->resultShape;
+      if (shape == kRVVE32M1) {
         std::string sourceSpelling = input.spelling;
         auto source = blockValues.find(input.packedSource);
         if (input.packedSource && !input.packedTransform.empty()) {
@@ -7842,7 +7889,6 @@ private:
         line("vfloat32m1_t " + name + " = __riscv_vfcvt_f_xu_v_f32m1(" +
              extended + ", " + vl.str() + ");");
       } else {
-        shape = physical->resultShape;
         std::string u16Suffix = "u16m2";
         std::string u16Type = "vuint16m2_t";
         extended = fresh("block_u16");
@@ -7855,7 +7901,6 @@ private:
     } else if (input.kind == BlockValueKind::I8 && target.isF32() &&
                input.vectorShape == kRVVE8M1) {
       kind = BlockValueKind::F32;
-      shape = physical->resultShape;
       std::string extended = fresh("block_i16");
       line("vint16m2_t " + extended + " = __riscv_vsext_vf2_i16m2(" +
            input.spelling + ", " + vl.str() + ");");
@@ -7880,16 +7925,17 @@ private:
       BitcastOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("block bitcast has no physical value decision");
     BlockValue input = lookupBlockValue(op.getInput(), blockValues);
     mlir::Type target = elementType(op.getResult().getType());
     std::string name = fresh("block_bits");
     BlockValueKind kind;
-    RVVVectorShape shape = RVVVectorShape{};
+    RVVVectorShape shape = valuePlan->shape;
     if (input.kind == BlockValueKind::U8 && target.isSignedInteger(8)) {
       kind = BlockValueKind::I8;
-      shape = physical->resultShape;
       if (shape == kRVVE8MF4)
         line("vint8mf4_t " + name +
              " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input.spelling +
@@ -7903,7 +7949,6 @@ private:
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(16)) {
       kind = BlockValueKind::I16;
-      shape = physical->resultShape;
       line("vint16m2_t " + name +
            " = __riscv_vreinterpret_v_u16m2_i16m2(" + input.spelling + ");");
     } else {
@@ -7920,7 +7965,9 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("block load has no physical memory handoff decision");
     BlockValue pointer = lookupBlockValue(op.getPointer(), blockValues);
     BlockValue where = lookupBlockValue(op.getWhere(), blockValues);
@@ -7931,11 +7978,12 @@ private:
     if (!elementType(op.getResult().getType()).isUnsignedInteger(8))
       return op.emitError("RVV block load currently supports u8 elements");
     std::string name = fresh("block_load");
-    std::string shape = rvvShapeSuffix(physical->resultShape);
-    if (shape.empty())
+    RVVVectorShape selectedShape = valuePlan->shape;
+    std::string shapeSuffix = rvvShapeSuffix(selectedShape);
+    if (shapeSuffix.empty())
       return op.emitError("block load has no RVV shape spelling");
-    std::string suffix = "u" + shape;
-    std::string cType = "vuint" + shape + "_t";
+    std::string suffix = "u" + shapeSuffix;
+    std::string cType = "vuint" + shapeSuffix + "_t";
     bool allActive = isTrue(op.getWhere());
     if (allActive && !pointer.contiguousIndex.empty()) {
       line(cType + " " + name + " = __riscv_vle8_v_" + suffix + "(" +
@@ -7958,7 +8006,7 @@ private:
     }
     BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
     result.unsignedMaximum = 255;
-    result.vectorShape = physical->resultShape;
+    result.vectorShape = selectedShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -7989,13 +8037,8 @@ private:
     BlockValue codes = lookupBlockValue(op.getCodes(), blockValues);
     BlockValue table = lookupBlockValue(op.getTable(), blockValues);
     if (decision.realization != BlockDecodeRealization::RVVI8TableGather ||
-        decision.tableExtent != 16 ||
-        decision.codeShape != kRVVE8M1 ||
-        decision.resultShape != kRVVE8M1 ||
-        codes.kind != BlockValueKind::U8 ||
-        codes.vectorShape != decision.codeShape ||
+        decision.tableExtent != 16 || codes.kind != BlockValueKind::U8 ||
         table.kind != BlockValueKind::I8 ||
-        table.vectorShape != kRVVE8M1 ||
         codes.spelling.empty() || table.spelling.empty())
       return op.emitError(
           "RVV block decode operands do not match the selected realization");
@@ -8006,15 +8049,21 @@ private:
     const PhysicalHandoffDecision *handoff =
         findPhysicalHandoff(planned->second.entity, op.getOperation(),
                             op.getCodes());
+    auto tableShape = llvm::find_if(
+        planned->second.entity.values,
+        [&](const PhysicalValueDecision &value) {
+          return value.value == op.getTable();
+        });
     if (!handoff || handoff->kind != PhysicalHandoff::Share ||
-        handoff->sourceShape != decision.codeShape ||
-        handoff->resultShape != decision.resultShape)
+        tableShape == planned->second.entity.values.end() ||
+        codes.vectorShape != handoff->sourceShape ||
+        table.vectorShape != tableShape->shape)
       return op.emitError("block decode physical handoff is incomplete");
     std::string name = fresh("block_decode");
     line("vint8m1_t " + name + " = __riscv_vrgather_vv_i8m1(" +
          table.spelling + ", " + codes.spelling + ", " + vl.str() + ");");
     BlockValue result{op.getResult().getType(), BlockValueKind::I8, name};
-    result.vectorShape = decision.resultShape;
+    result.vectorShape = handoff->resultShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -8053,27 +8102,30 @@ private:
       llvm::StringRef vl) {
     const BlockOperationDecision *physical =
         findBlockOperationDecision(op.getOperation());
-    if (!physical || !physical->resultShape)
+    const PhysicalValueDecision *valuePlan =
+        findBlockValueDecision(op.getResult());
+    if (!physical || !valuePlan || !valuePlan->shape)
       return op.emitError("block select has no physical value decision");
+    RVVVectorShape selectedShape = valuePlan->shape;
     BlockValue predicate = lookupBlockValue(op.getPredicate(), blockValues);
     BlockValue trueValue = lookupBlockValue(op.getTrueValue(), blockValues);
     BlockValue falseValue = lookupBlockValue(op.getFalseValue(), blockValues);
     if (predicate.kind != BlockValueKind::Mask ||
         trueValue.kind != BlockValueKind::U8 ||
         falseValue.kind != BlockValueKind::U8 ||
-        trueValue.vectorShape != physical->resultShape ||
-        falseValue.vectorShape != physical->resultShape)
+        trueValue.vectorShape != selectedShape ||
+        falseValue.vectorShape != selectedShape)
       return op.emitError("RVV block select currently requires mask and u8 values");
-    std::string shape = rvvShapeSuffix(physical->resultShape);
-    if (shape.empty())
+    std::string shapeSuffix = rvvShapeSuffix(selectedShape);
+    if (shapeSuffix.empty())
       return op.emitError("block select has no RVV shape spelling");
-    std::string suffix = "u" + shape;
+    std::string suffix = "u" + shapeSuffix;
     std::string name = fresh("block_select");
-    line("vuint" + shape + "_t " + name + " = __riscv_vmerge_vvm_" +
+    line("vuint" + shapeSuffix + "_t " + name + " = __riscv_vmerge_vvm_" +
          suffix + "(" + falseValue.spelling + ", " + trueValue.spelling +
          ", " + predicate.spelling + ", " + vl.str() + ");");
     BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
-    result.vectorShape = physical->resultShape;
+    result.vectorShape = selectedShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -8341,7 +8393,6 @@ private:
     if (physical.realization == BlockStoreRealization::Unsupported)
       return op.emitError(
           "RVV block store has no legal physical resource candidate");
-    decision.operations = decideBlockOperations(closure, physical.byteShape);
     for (StoreOp store : stores) {
       decision.stores.push_back(store.getOperation());
       plannedStores.insert(store.getOperation());
@@ -8351,24 +8402,17 @@ private:
     PlannedPhysicalDecision<BlockStoreGroupDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
+    planned.realization.operations =
+        decideBlockOperations(closure, physical.byteShape, planned.entity);
     planned.entity.blockStore = physical;
     planned.entity.schedule.stripSchedule =
         physical.realization == BlockStoreRealization::RVVE8M1DynamicStrips
             ? VLAStripSchedule::Dynamic
             : VLAStripSchedule::FullThenTail;
-    planned.entity.schedule.unroll =
-        physical.realization == BlockStoreRealization::RVVE8MF4MicroStrips
-            ? static_cast<unsigned>(planned.realization.extent) /
-                  physical.stripVL
-            : 1;
     planned.entity.resources.valueGroups =
         rvvRegisterGroups(physical.byteShape);
     planned.entity.resources.memoryGroups =
         physical.needsLaneVector ? 2 : 0;
-    for (const BlockOperationDecision &operation : planned.realization.operations)
-      if (operation.resultShape)
-        for (mlir::Value result : operation.operation->getResults())
-          recordPhysicalValue(planned.entity, result, operation.resultShape);
     planned.entity.resources.primitiveGroups =
         planned.entity.resources.valueGroups +
         planned.entity.resources.memoryGroups;
@@ -8441,7 +8485,6 @@ private:
     if (physical.realization == BlockReduceRealization::Unsupported)
       return op.emitError(
           "RVV block reduction has no legal physical resource candidate");
-    decision.operations = decideBlockOperations(closure, kRVVE8M1);
     for (ReduceOp reduction : reductions) {
       decision.reductions.push_back(reduction.getOperation());
       plannedReductions.insert(reduction.getOperation());
@@ -8450,6 +8493,8 @@ private:
     PlannedPhysicalDecision<BlockReduceGroupDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
+    planned.realization.operations =
+        decideBlockOperations(closure, kRVVE8M1, planned.entity);
     planned.entity.blockReduce = physical;
     planned.entity.schedule.stripSchedule =
         physical.realization == BlockReduceRealization::RVVE8M1DynamicStrips
@@ -8458,10 +8503,6 @@ private:
     planned.entity.resources.valueGroups = 8;
     planned.entity.resources.memoryGroups =
         physical.needsLaneVector ? 2 : 0;
-    for (const BlockOperationDecision &operation : planned.realization.operations)
-      if (operation.resultShape)
-        for (mlir::Value result : operation.operation->getResults())
-          recordPhysicalValue(planned.entity, result, operation.resultShape);
     planned.entity.resources.primitiveGroups =
         planned.entity.resources.valueGroups +
         planned.entity.resources.memoryGroups;
@@ -8543,17 +8584,21 @@ private:
       blockValues[axis.getResult()] = std::move(coordinate);
       const llvm::SmallVector<BlockOperationDecision> *previousOperations =
           activeBlockOperations;
+      const PhysicalEntityPlan *previousEntity = activeBlockEntity;
       activeBlockOperations = &decision.operations;
+      activeBlockEntity = &entity;
       for (mlir::Operation &candidate : *op->getBlock()) {
         if (mlir::isa<BlockAxisOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
           continue;
         if (mlir::failed(emitBlockOperation(&candidate, blockValues, activeVL))) {
           activeBlockOperations = previousOperations;
+          activeBlockEntity = previousEntity;
           return mlir::failure();
         }
       }
       activeBlockOperations = previousOperations;
+      activeBlockEntity = previousEntity;
       return mlir::success();
     };
 
@@ -8575,7 +8620,9 @@ private:
       }
       const llvm::SmallVector<BlockOperationDecision> *previousOperations =
           activeBlockOperations;
+      const PhysicalEntityPlan *previousEntity = activeBlockEntity;
       activeBlockOperations = &decision.operations;
+      activeBlockEntity = &entity;
       for (mlir::Operation &candidate : *op->getBlock()) {
         if (mlir::isa<BlockAxisOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
@@ -8583,10 +8630,12 @@ private:
         for (auto &blockValues : stripValues)
           if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl))) {
             activeBlockOperations = previousOperations;
+            activeBlockEntity = previousEntity;
             return mlir::failure();
           }
       }
       activeBlockOperations = previousOperations;
+      activeBlockEntity = previousEntity;
     } else if (physical.realization ==
                BlockStoreRealization::RVVE8M1FixedStrips) {
       line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
@@ -8660,9 +8709,14 @@ private:
     std::string lane = fresh("block_lane");
     const llvm::SmallVector<BlockOperationDecision> *previousOperations =
         activeBlockOperations;
+    const PhysicalEntityPlan *previousEntity = activeBlockEntity;
     activeBlockOperations = &decision.operations;
+    activeBlockEntity = &entity;
     auto restoreOperations = llvm::make_scope_exit(
-        [&]() { activeBlockOperations = previousOperations; });
+        [&]() {
+          activeBlockOperations = previousOperations;
+          activeBlockEntity = previousEntity;
+        });
 
     if (physical.realization ==
         BlockReduceRealization::RVVE8M1FixedStrips) {
