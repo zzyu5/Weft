@@ -1,24 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <kernel> [kernel-specific arguments]" >&2
+if [[ $# -lt 2 ]]; then
+  echo "usage: $0 <sg2044-rvv128|k1-rvv256|k1-ime256> <kernel> [kernel-specific arguments]" >&2
   exit 2
 fi
 
-kernel=$1
-shift
+profile=$1
+kernel=$2
+shift 2
+usage_prefix="$0 ${profile}"
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compiler="${project_root}/build/tools/weft-compile/weft-compile"
-target_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
-target_vlen_bits=128
-matrix_extension=none
-remote_host=rvv
-remote_cpu=8
-remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
-remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
-remote_compile_flags=
-remote_link_flags="-L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm"
+case "${profile}" in
+  sg2044-rvv128)
+    target_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
+    target_vlen_bits=128
+    matrix_extension=none
+    remote_host=rvv
+    remote_cpu=8
+    remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
+    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_compile_flags=
+    remote_link_flags="-L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm"
+    ;;
+  k1-rvv256)
+    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    target_vlen_bits=256
+    matrix_extension=none
+    remote_host=k1
+    remote_cpu=3
+    remote_cc=/usr/bin/clang-18
+    remote_cxx=/usr/bin/clang++-18
+    remote_compile_flags=
+    remote_link_flags=-lm
+    ;;
+  k1-ime256)
+    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    target_vlen_bits=256
+    matrix_extension=spacemit-ime1
+    remote_host=k1
+    remote_cpu=3
+    remote_cc=/usr/bin/clang-18
+    remote_cxx=/usr/bin/clang++-18
+    remote_compile_flags=-fno-integrated-as
+    remote_link_flags=-lm
+    ;;
+  *)
+    echo "unsupported Weft target profile: ${profile}" >&2
+    exit 2
+    ;;
+esac
 local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
 cleanup_local() {
   status=$?
@@ -47,7 +79,7 @@ fi
 case "${kernel}" in
   add_bias)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 add_bias" >&2
+      echo "usage: ${usage_prefix} add_bias" >&2
       exit 2
     fi
     dsl=examples/kernels/elementwise/add_bias.py
@@ -55,7 +87,7 @@ case "${kernel}" in
     ;;
   silu)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 silu" >&2
+      echo "usage: ${usage_prefix} silu" >&2
       exit 2
     fi
     dsl=examples/kernels/pointwise/silu.py
@@ -63,7 +95,7 @@ case "${kernel}" in
     ;;
   swiglu)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 swiglu" >&2
+      echo "usage: ${usage_prefix} swiglu" >&2
       exit 2
     fi
     dsl=examples/kernels/pointwise/swiglu.py
@@ -71,7 +103,7 @@ case "${kernel}" in
     ;;
   rms_norm)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 rms_norm" >&2
+      echo "usage: ${usage_prefix} rms_norm" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/rms_norm.py
@@ -79,7 +111,7 @@ case "${kernel}" in
     ;;
   layer_norm)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 layer_norm" >&2
+      echo "usage: ${usage_prefix} layer_norm" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/layer_norm.py
@@ -87,7 +119,7 @@ case "${kernel}" in
     ;;
   cross_entropy)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 cross_entropy" >&2
+      echo "usage: ${usage_prefix} cross_entropy" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/cross_entropy.py
@@ -95,7 +127,7 @@ case "${kernel}" in
     ;;
   rms_norm_backward)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 rms_norm_backward" >&2
+      echo "usage: ${usage_prefix} rms_norm_backward" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/rms_norm_backward.py
@@ -103,7 +135,7 @@ case "${kernel}" in
     ;;
   cumsum)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 cumsum" >&2
+      echo "usage: ${usage_prefix} cumsum" >&2
       exit 2
     fi
     dsl=examples/kernels/reduction/cumsum.py
@@ -111,7 +143,7 @@ case "${kernel}" in
     ;;
   segmented_scan)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 segmented_scan" >&2
+      echo "usage: ${usage_prefix} segmented_scan" >&2
       exit 2
     fi
     dsl=examples/kernels/reduction/segmented_scan.py
@@ -122,7 +154,7 @@ case "${kernel}" in
     ;;
   argmax)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 argmax" >&2
+      echo "usage: ${usage_prefix} argmax" >&2
       exit 2
     fi
     dsl=examples/kernels/reduction/argmax.py
@@ -130,7 +162,7 @@ case "${kernel}" in
     ;;
   top_k)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 top_k" >&2
+      echo "usage: ${usage_prefix} top_k" >&2
       exit 2
     fi
     dsl=examples/kernels/selection/top_k.py
@@ -141,7 +173,7 @@ case "${kernel}" in
     ;;
   argsort)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 argsort" >&2
+      echo "usage: ${usage_prefix} argsort" >&2
       exit 2
     fi
     dsl=examples/kernels/selection/argsort.py
@@ -149,7 +181,7 @@ case "${kernel}" in
     ;;
   nms)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 nms" >&2
+      echo "usage: ${usage_prefix} nms" >&2
       exit 2
     fi
     dsl=examples/kernels/selection/nms.py
@@ -157,7 +189,7 @@ case "${kernel}" in
     ;;
   top_p)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 top_p" >&2
+      echo "usage: ${usage_prefix} top_p" >&2
       exit 2
     fi
     dsl=examples/kernels/selection/top_p.py
@@ -165,7 +197,7 @@ case "${kernel}" in
     ;;
   ssm_conv)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 ssm_conv" >&2
+      echo "usage: ${usage_prefix} ssm_conv" >&2
       exit 2
     fi
     dsl=examples/kernels/state/ssm_conv.py
@@ -176,7 +208,7 @@ case "${kernel}" in
     ;;
   ssm_scan)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 ssm_scan" >&2
+      echo "usage: ${usage_prefix} ssm_scan" >&2
       exit 2
     fi
     dsl=examples/kernels/state/ssm_scan.py
@@ -184,7 +216,7 @@ case "${kernel}" in
     ;;
   rwkv_wkv6)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 rwkv_wkv6" >&2
+      echo "usage: ${usage_prefix} rwkv_wkv6" >&2
       exit 2
     fi
     dsl=examples/kernels/state/rwkv_wkv6.py
@@ -192,7 +224,7 @@ case "${kernel}" in
     ;;
   gated_linear_attention)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 gated_linear_attention" >&2
+      echo "usage: ${usage_prefix} gated_linear_attention" >&2
       exit 2
     fi
     dsl=examples/kernels/state/gated_linear_attention.py
@@ -200,7 +232,7 @@ case "${kernel}" in
     ;;
   rwkv_wkv7)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 rwkv_wkv7" >&2
+      echo "usage: ${usage_prefix} rwkv_wkv7" >&2
       exit 2
     fi
     dsl=examples/kernels/state/rwkv_wkv7.py
@@ -208,7 +240,7 @@ case "${kernel}" in
     ;;
   gated_delta_net)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 gated_delta_net" >&2
+      echo "usage: ${usage_prefix} gated_delta_net" >&2
       exit 2
     fi
     dsl=examples/kernels/state/gated_delta_net.py
@@ -216,7 +248,7 @@ case "${kernel}" in
     ;;
   solve_triangular)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 solve_triangular" >&2
+      echo "usage: ${usage_prefix} solve_triangular" >&2
       exit 2
     fi
     dsl=examples/kernels/linear_algebra/solve_triangular.py
@@ -224,7 +256,7 @@ case "${kernel}" in
     ;;
   group_norm)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 group_norm" >&2
+      echo "usage: ${usage_prefix} group_norm" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/group_norm.py
@@ -232,7 +264,7 @@ case "${kernel}" in
     ;;
   sam_relative_position)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 sam_relative_position" >&2
+      echo "usage: ${usage_prefix} sam_relative_position" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/sam_relative_position.py
@@ -240,7 +272,7 @@ case "${kernel}" in
     ;;
   depthwise_conv2d)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 depthwise_conv2d" >&2
+      echo "usage: ${usage_prefix} depthwise_conv2d" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/depthwise_conv2d.py
@@ -248,7 +280,7 @@ case "${kernel}" in
     ;;
   max_pool2d)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 max_pool2d" >&2
+      echo "usage: ${usage_prefix} max_pool2d" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/max_pool2d.py
@@ -256,7 +288,7 @@ case "${kernel}" in
     ;;
   bilinear_upscale)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 bilinear_upscale" >&2
+      echo "usage: ${usage_prefix} bilinear_upscale" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/bilinear_upscale.py
@@ -264,7 +296,7 @@ case "${kernel}" in
     ;;
   roi_align)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 roi_align" >&2
+      echo "usage: ${usage_prefix} roi_align" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/roi_align.py
@@ -275,7 +307,7 @@ case "${kernel}" in
     ;;
   window_partition)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 window_partition" >&2
+      echo "usage: ${usage_prefix} window_partition" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/window_partition.py
@@ -283,7 +315,7 @@ case "${kernel}" in
     ;;
   dense_conv2d)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 dense_conv2d" >&2
+      echo "usage: ${usage_prefix} dense_conv2d" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/dense_conv2d.py
@@ -291,7 +323,7 @@ case "${kernel}" in
     ;;
   conv_transpose2d)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 conv_transpose2d" >&2
+      echo "usage: ${usage_prefix} conv_transpose2d" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/conv_transpose2d.py
@@ -299,7 +331,7 @@ case "${kernel}" in
     ;;
   im2col_backward)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 im2col_backward" >&2
+      echo "usage: ${usage_prefix} im2col_backward" >&2
       exit 2
     fi
     dsl=examples/kernels/vision/im2col_backward.py
@@ -307,7 +339,7 @@ case "${kernel}" in
     ;;
   softmax)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 softmax" >&2
+      echo "usage: ${usage_prefix} softmax" >&2
       exit 2
     fi
     dsl=examples/kernels/normalization/online_softmax.py
@@ -315,7 +347,7 @@ case "${kernel}" in
     ;;
   blocked_gemm)
     if [[ $# -ne 2 ]]; then
-      echo "usage: $0 blocked_gemm <decode|prefill> <repetitions>" >&2
+      echo "usage: ${usage_prefix} blocked_gemm <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/contraction/blocked_gemm.py
@@ -324,7 +356,7 @@ case "${kernel}" in
     ;;
   blocked_gemm_f32)
     if [[ $# -ne 2 ]]; then
-      echo "usage: $0 blocked_gemm_f32 <decode|prefill> <repetitions>" >&2
+      echo "usage: ${usage_prefix} blocked_gemm_f32 <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/contraction/blocked_gemm_f32.py
@@ -333,7 +365,7 @@ case "${kernel}" in
     ;;
   mul_mat_id)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 mul_mat_id" >&2
+      echo "usage: ${usage_prefix} mul_mat_id" >&2
       exit 2
     fi
     dsl=examples/kernels/contraction/mul_mat_id.py
@@ -341,7 +373,7 @@ case "${kernel}" in
     ;;
   out_product)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 out_product" >&2
+      echo "usage: ${usage_prefix} out_product" >&2
       exit 2
     fi
     dsl=examples/kernels/contraction/out_product.py
@@ -349,7 +381,7 @@ case "${kernel}" in
     ;;
   contiguous_transpose)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 contiguous_transpose <repetitions>" >&2
+      echo "usage: ${usage_prefix} contiguous_transpose <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/permutation/contiguous_transpose.py
@@ -358,7 +390,7 @@ case "${kernel}" in
     ;;
   fwht)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 fwht" >&2
+      echo "usage: ${usage_prefix} fwht" >&2
       exit 2
     fi
     dsl=examples/kernels/permutation/fwht.py
@@ -366,7 +398,7 @@ case "${kernel}" in
     ;;
   adamw)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 adamw" >&2
+      echo "usage: ${usage_prefix} adamw" >&2
       exit 2
     fi
     dsl=examples/kernels/optimization/adamw.py
@@ -377,7 +409,7 @@ case "${kernel}" in
     ;;
   get_rows_q4_k)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 get_rows_q4_k <repetitions>" >&2
+      echo "usage: ${usage_prefix} get_rows_q4_k <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/get_rows_q4_k.py
@@ -386,7 +418,7 @@ case "${kernel}" in
     ;;
   get_rows_f32)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 get_rows_f32" >&2
+      echo "usage: ${usage_prefix} get_rows_f32" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/get_rows_f32.py
@@ -394,7 +426,7 @@ case "${kernel}" in
     ;;
   weighted_embedding_bag)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 weighted_embedding_bag" >&2
+      echo "usage: ${usage_prefix} weighted_embedding_bag" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/weighted_embedding_bag.py
@@ -405,7 +437,7 @@ case "${kernel}" in
     ;;
   csr_spmv)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 csr_spmv" >&2
+      echo "usage: ${usage_prefix} csr_spmv" >&2
       exit 2
     fi
     dsl=examples/kernels/sparse/csr_spmv.py
@@ -413,7 +445,7 @@ case "${kernel}" in
     ;;
   add_id)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 add_id" >&2
+      echo "usage: ${usage_prefix} add_id" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/add_id.py
@@ -421,7 +453,7 @@ case "${kernel}" in
     ;;
   get_rows_back)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 get_rows_back" >&2
+      echo "usage: ${usage_prefix} get_rows_back" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/get_rows_back.py
@@ -429,7 +461,7 @@ case "${kernel}" in
     ;;
   set_rows)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 set_rows" >&2
+      echo "usage: ${usage_prefix} set_rows" >&2
       exit 2
     fi
     dsl=examples/kernels/gather/set_rows.py
@@ -437,7 +469,7 @@ case "${kernel}" in
     ;;
   rope_neox)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 rope_neox <repetitions>" >&2
+      echo "usage: ${usage_prefix} rope_neox <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/rotation/rope_neox.py
@@ -446,7 +478,7 @@ case "${kernel}" in
     ;;
   flash_attention)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 flash_attention <repetitions>" >&2
+      echo "usage: ${usage_prefix} flash_attention <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/attention/online_flash_attention.py
@@ -455,7 +487,7 @@ case "${kernel}" in
     ;;
   csr_sparse_attention)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 csr_sparse_attention" >&2
+      echo "usage: ${usage_prefix} csr_sparse_attention" >&2
       exit 2
     fi
     dsl=examples/kernels/attention/csr_sparse_attention.py
@@ -463,7 +495,7 @@ case "${kernel}" in
     ;;
   causal_mask)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 causal_mask" >&2
+      echo "usage: ${usage_prefix} causal_mask" >&2
       exit 2
     fi
     dsl=examples/kernels/attention/causal_mask.py
@@ -471,43 +503,25 @@ case "${kernel}" in
     ;;
   q4_k_projection_ime)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 q4_k_projection_ime <repetitions>" >&2
+      echo "usage: ${usage_prefix} q4_k_projection_ime <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/ime/q4_k_projection.py
     runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
     runtime_arguments=("$1")
-    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
-    target_vlen_bits=256
-    matrix_extension=spacemit-ime1
-    remote_host=k1
-    remote_cpu=3
-    remote_cc=/usr/bin/clang-18
-    remote_cxx=/usr/bin/clang++-18
-    remote_compile_flags=-fno-integrated-as
-    remote_link_flags=-lm
     ;;
   q4_0_projection_ime)
     if [[ $# -ne 1 ]]; then
-      echo "usage: $0 q4_0_projection_ime <repetitions>" >&2
+      echo "usage: ${usage_prefix} q4_0_projection_ime <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/ime/q4_0_projection.py
     runtime=examples/repro/weft/ime/q4_0_projection_runtime.cpp
     runtime_arguments=("$1")
-    target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
-    target_vlen_bits=256
-    matrix_extension=spacemit-ime1
-    remote_host=k1
-    remote_cpu=3
-    remote_cc=/usr/bin/clang-18
-    remote_cxx=/usr/bin/clang++-18
-    remote_compile_flags=-fno-integrated-as
-    remote_link_flags=-lm
     ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 ${kernel}" >&2
+      echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/block_dot.py
@@ -515,7 +529,7 @@ case "${kernel}" in
     ;;
   q1_0_rows)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 q1_0_rows" >&2
+      echo "usage: ${usage_prefix} q1_0_rows" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/q1_0.py
@@ -523,7 +537,7 @@ case "${kernel}" in
     ;;
   mxfp4_rows)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 mxfp4_rows" >&2
+      echo "usage: ${usage_prefix} mxfp4_rows" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/mxfp4.py
@@ -531,7 +545,7 @@ case "${kernel}" in
     ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
-      echo "usage: $0 q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
+      echo "usage: ${usage_prefix} q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/block_dot.py
@@ -540,7 +554,7 @@ case "${kernel}" in
     ;;
   quantize_q8_0)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 quantize_q8_0" >&2
+      echo "usage: ${usage_prefix} quantize_q8_0" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/q8_0.py
@@ -548,7 +562,7 @@ case "${kernel}" in
     ;;
   dequantize_iq4_nl)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 dequantize_iq4_nl" >&2
+      echo "usage: ${usage_prefix} dequantize_iq4_nl" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/iq4_nl.py
@@ -556,7 +570,7 @@ case "${kernel}" in
     ;;
   iq2_S_q8_K | iq3_S_q8_K | iq1_M_q8_K | q6_K_q8_K)
     if [[ $# -ne 0 ]]; then
-      echo "usage: $0 ${kernel}" >&2
+      echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
     fi
     dsl=examples/kernels/quantization/codebook_k.py
@@ -660,7 +674,7 @@ tar -C "${local_root}" -cf - . |
         -DWEFT_QUANT_KIND=${k_quant_kind} -march=${target_march} -mabi=lp64d \
         -c runtime.cpp -o runtime.o
       "\${cxx}" -march=${target_march} -mabi=lp64d runtime.o kernel.o \
-        -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm -o weft_runtime
+        ${remote_link_flags} -o weft_runtime
     elif [ '${quant}' -eq 1 ]; then
       \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
@@ -677,7 +691,7 @@ tar -C "${local_root}" -cf - . |
           -o weft_runtime
       else
         \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
-          -L/opt/tcrv-toolchains/gcc-15.2.0/lib -lm -o weft_runtime
+          ${remote_link_flags} -o weft_runtime
       fi
     else
       \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
