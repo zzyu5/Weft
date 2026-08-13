@@ -152,7 +152,10 @@ struct SymmetricI4I8Decision {
       SymmetricI4I8Realization::SpacemiTIME1N16K32;
   mlir::Value activationBlockBase;
   mlir::Value packedBlockBase;
+  mlir::Value activation;
+  mlir::Value packedWeight;
   mlir::Value activationScale;
+  mlir::Value weightScale;
   mlir::Value init;
   int64_t packedBlockBytes = 288;
 };
@@ -474,15 +477,16 @@ std::string rvvFloatType(const RVVVectorConfig &config) {
          std::to_string(config.lmul) + "_t";
 }
 
-struct AffineI4I8NTileDecision {
+struct AffineI4I8Decision {
   mlir::Operation *operation = nullptr;
-  mlir::Value activationCodes;
-  mlir::Value activationScales;
+  mlir::Value activationBlockBase;
+  mlir::Value packedBlockBase;
+  mlir::Value activation;
   mlir::Value packedWeight;
-  mlir::Value output;
-  mlir::Value columns;
-  mlir::Value blocks;
-  unsigned nTile = 16;
+  mlir::Value activationScale;
+  mlir::Value weightScale;
+  mlir::Value weightZeroPoint;
+  mlir::Value init;
   unsigned packedBlockBytes = 304;
 };
 
@@ -851,20 +855,13 @@ private:
     kernel.walk([&](AffineI4I8ContractOp contract) {
       if (decisionFailure)
         return;
-      ForOp kLoop = contract->getParentOfType<ForOp>();
-      ForOp nLoop = kLoop ? kLoop->getParentOfType<ForOp>() : ForOp{};
-      if (!nLoop)
-        return;
-      if (affineI4I8Decisions.contains(nLoop.getOperation())) {
-        contract.emitError("one source N loop cannot own multiple affine IME decisions");
+      AffineI4I8Decision decision;
+      if (mlir::failed(decideAffineI4I8Contract(contract, decision))) {
         decisionFailure = true;
         return;
       }
-      std::optional<AffineI4I8NTileDecision> decision =
-          decideAffineI4I8NTiles(contract);
-      if (decision)
-        affineI4I8Decisions.try_emplace(nLoop.getOperation(),
-                                       std::move(*decision));
+      affineI4I8Decisions.try_emplace(contract.getOperation(),
+                                     std::move(decision));
     });
     kernel.walk([&](MatmulOp matmul) {
       if (decisionFailure)
@@ -1005,7 +1002,7 @@ private:
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
   llvm::DenseMap<mlir::Operation *, VLARegionDecision> vlaDecisions;
-  llvm::DenseMap<mlir::Operation *, AffineI4I8NTileDecision>
+  llvm::DenseMap<mlir::Operation *, AffineI4I8Decision>
       affineI4I8Decisions;
   llvm::DenseMap<mlir::Operation *, F16GemmNTileDecision>
       f16ContractDecisions;
@@ -2463,6 +2460,8 @@ private:
       return op.emitError("scan must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
       return emitGroupedAffineI4I8Dot(op);
+    if (auto op = mlir::dyn_cast<AffineI4I8ContractOp>(operation))
+      return emitAffineI4I8Contract(op);
     if (auto op = mlir::dyn_cast<SignBitI8DotOp>(operation))
       return emitSignBitI8Dot(op);
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
@@ -2792,9 +2791,6 @@ private:
   }
 
   mlir::LogicalResult emitFor(ForOp op) {
-    auto affineI4I8Decision = affineI4I8Decisions.find(op.getOperation());
-    if (affineI4I8Decision != affineI4I8Decisions.end())
-      return emitAffineI4I8NTiles(affineI4I8Decision->second);
     mlir::Block &body = op.getBody().front();
     if (op.getInitArgs().size() != op.getNumResults() ||
         body.getNumArguments() != op.getNumResults() + 1)
@@ -5162,7 +5158,10 @@ private:
     decision = SymmetricI4I8Decision{};
     decision.activationBlockBase = activationLane.getBase();
     decision.packedBlockBase = packedBase;
+    decision.activation = op.getActivation();
+    decision.packedWeight = op.getPackedWeight();
     decision.activationScale = op.getActivationScale();
+    decision.weightScale = op.getWeightScale();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
     return mlir::success();
@@ -5192,8 +5191,8 @@ private:
          activation.spelling + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
     for (mlir::Value operand :
-         {op.getActivation(), op.getPackedWeight(), op.getWeightScale(),
-          op.getInit()})
+         {decision.activation, decision.packedWeight, decision.weightScale,
+          decision.init})
       markDiscardedBlockTree(operand);
     loweredBlockOps.insert(op.getOperation());
     accumulator.type = op.getResult().getType();
@@ -5590,144 +5589,45 @@ private:
     return mlir::success();
   }
 
-  std::optional<AffineI4I8NTileDecision>
-  decideAffineI4I8NTiles(AffineI4I8ContractOp contract) {
-    ForOp kLoop = contract->getParentOfType<ForOp>();
-    if (!kLoop || contract->getBlock() != &kLoop.getBody().front())
-      return std::nullopt;
-    ForOp nLoop = kLoop->getParentOfType<ForOp>();
-    if (!nLoop || kLoop->getBlock() != &nLoop.getBody().front())
-      return std::nullopt;
-    mlir::Block &nBody = nLoop.getBody().front();
-    ForOp ownedKLoop;
-    StoreOp store;
-    for (mlir::Operation &operation : nBody.without_terminator()) {
-      if (auto candidate = mlir::dyn_cast<ForOp>(operation)) {
-        if (ownedKLoop)
-          return std::nullopt;
-        ownedKLoop = candidate;
-      } else if (auto candidate = mlir::dyn_cast<StoreOp>(operation)) {
-        if (store)
-          return std::nullopt;
-        store = candidate;
-      }
-    }
-    if (!ownedKLoop || ownedKLoop != kLoop)
-      return std::nullopt;
-
-    mlir::Block &kBody = kLoop.getBody().front();
-    if (llvm::any_of(kBody.without_terminator(), [&](mlir::Operation &operation) {
-          auto candidate = mlir::dyn_cast<AffineI4I8ContractOp>(operation);
-          return candidate && candidate != contract;
-        }))
-      return std::nullopt;
-
-    auto reject = [&](llvm::StringRef message)
-        -> std::optional<AffineI4I8NTileDecision> {
-      contract.emitError(message);
-      return std::nullopt;
-    };
-    for (mlir::Operation &operation : nBody.without_terminator()) {
-      if (&operation == kLoop.getOperation() ||
-          (store && &operation == store.getOperation()) ||
-          mlir::isa<ConstantOp, FullOp, BlockAxisOp, PtrAddOp>(operation))
-        continue;
-      return reject("IME1 N-tile lowering does not absorb additional source operations");
-    }
-    for (mlir::Operation &operation : kBody.without_terminator()) {
-      if (&operation == contract.getOperation() ||
-          mlir::isa<ConstantOp, BlockAxisOp, BinaryOp, PtrAddOp, LoadOp, CastOp,
-                    BitcastOp, ExpandDimsOp>(operation))
-        continue;
-      return reject("IME1 contraction lowering does not absorb additional source operations");
-    }
+  mlir::LogicalResult decideAffineI4I8Contract(
+      AffineI4I8ContractOp op, AffineI4I8Decision &decision) {
     if (options.target.matrixExtension != "spacemit-ime1")
-      return reject("affine i4/i8 contraction requires --matrix-extension=spacemit-ime1");
+      return op.emitError(
+          "affine i4/i8 contraction requires --matrix-extension=spacemit-ime1");
     if (options.target.vlenBits != 256)
-      return reject("SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
-    if (nLoop.getNumResults() != 0 || nBody.getNumArguments() != 1 || !store ||
-        !isTrue(store.getWhere()) || kLoop.getNumResults() != 1 ||
-        kLoop.getInitArgs().size() != 1 || kBody.getNumArguments() != 2 ||
-        store.getValue() != kLoop.getResult(0))
-      return reject("IME1 lowering requires one explicit N loop, K recurrence, and output store");
-    auto nYield = mlir::cast<YieldOp>(nBody.getTerminator());
-    auto kYield = mlir::cast<YieldOp>(kBody.getTerminator());
-    if (nYield.getNumOperands() != 0 || kYield.getNumOperands() != 1 ||
-        kYield.getOperand(0) != contract.getResult() ||
-        contract.getInit() != kBody.getArgument(1))
-      return reject("IME1 lowering requires the extension result to be the sole K-loop carry");
-    auto init = kLoop.getInitArgs().front().getDefiningOp<FullOp>();
-    if (!init || !isFloatConstant(init.getValue(), 0.0))
-      return reject("IME1 lowering requires the explicit contraction accumulator to start at zero");
-    std::optional<int64_t> selectedNTile = integerConstant(nLoop.getStep());
-    int64_t kBlock = 32;
-    int64_t packedBlockBytes = 304;
-    if (integerConstant(nLoop.getLower()) != 0 || selectedNTile != 16 ||
-        integerConstant(kLoop.getLower()) != 0 ||
-        integerConstant(kLoop.getStep()) != 1)
-      return reject("IME1 lowering requires the source-declared N16 and K-block traversal");
-    int64_t nTile = *selectedNTile;
+      return op.emitError(
+          "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+    if (!options.target.littleEndian)
+      return op.emitError(
+          "affine i4/i8 contraction requires little-endian packed fields");
 
-    LoadOp activationLoad = contract.getActivation().getDefiningOp<LoadOp>();
-    LoadOp activationScaleLoad =
-        contract.getActivationScale().getDefiningOp<LoadOp>();
-    LoadOp zeroPointLoad =
-        contract.getWeightZeroPoint().getDefiningOp<LoadOp>();
-    LoadOp packedCodeLoad = contract.getPackedWeight().getDefiningOp<LoadOp>();
+    LoadOp activationLoad = op.getActivation().getDefiningOp<LoadOp>();
+    LoadOp packedCodeLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
+    LoadOp zeroPointLoad = op.getWeightZeroPoint().getDefiningOp<LoadOp>();
     LoadOp scaleLow;
     LoadOp scaleHigh;
-    if (!activationLoad || !activationScaleLoad || !zeroPointLoad ||
-        !packedCodeLoad || !matchF16LELoad(contract.getWeightScale(), scaleLow,
-                                          scaleHigh) ||
+    if (!activationLoad || !packedCodeLoad || !zeroPointLoad ||
+        !matchF16LELoad(op.getWeightScale(), scaleLow, scaleHigh) ||
         !isTrue(activationLoad.getWhere()) ||
-        !isTrue(activationScaleLoad.getWhere()) ||
-        !isTrue(zeroPointLoad.getWhere()) || !isTrue(packedCodeLoad.getWhere()))
-      return reject("IME1 lowering requires explicit activation, scale, zero-point, and packed-code loads");
-
-    mlir::Value nCoordinate = nBody.getArgument(0);
-    mlir::Value kCoordinate = kBody.getArgument(0);
-    ForOp rowLoop = nLoop->getParentOfType<ForOp>();
-    if (!rowLoop || nLoop->getBlock() != &rowLoop.getBody().front())
-      return reject("IME1 lowering requires the source-declared row traversal to remain outside N/K");
-    mlir::Value rowCoordinate = rowLoop.getBody().front().getArgument(0);
+        !isTrue(packedCodeLoad.getWhere()) ||
+        !isTrue(zeroPointLoad.getWhere()))
+      return op.emitError(
+          "IME1 affine contraction requires explicit activation, scale, zero-point, and packed-code loads");
 
     auto activationLane = activationLoad.getPointer().getDefiningOp<PtrAddOp>();
-    auto activationBlock =
-        activationLane ? activationLane.getBase().getDefiningOp<PtrAddOp>()
-                       : PtrAddOp{};
-    mlir::Value activationBlockIndex;
-    if (!activationLane || !activationBlock ||
-        !matchBlockAxis(activationLane.getOffset(), kBlock) ||
-        !matchBinaryConstant(activationBlock.getOffset(), "mul", kBlock,
-                             activationBlockIndex) ||
-        activationBlockIndex != kCoordinate)
-      return reject("IME1 lowering requires explicit contiguous K32 activation-code blocks");
-    mlir::Value codeRow = activationBlock.getBase();
-
-    auto activationScalePointer =
-        activationScaleLoad.getPointer().getDefiningOp<PtrAddOp>();
-    if (!activationScalePointer ||
-        activationScalePointer.getOffset() != kCoordinate)
-      return reject("IME1 lowering requires one explicit f32 activation scale per K32 block");
-    mlir::Value scaleRow = activationScalePointer.getBase();
-
-    auto outputLane = store.getPointer().getDefiningOp<PtrAddOp>();
-    auto outputTile = outputLane ? outputLane.getBase().getDefiningOp<PtrAddOp>()
-                                 : PtrAddOp{};
-    if (!outputLane || !outputTile ||
-        !matchBlockAxis(outputLane.getOffset(), nTile) ||
-        outputTile.getOffset() != nCoordinate)
-      return reject("IME1 lowering requires an explicit contiguous N16 output tile");
-    mlir::Value outputRow = outputTile.getBase();
+    if (!activationLane || !matchBlockAxis(activationLane.getOffset(), 32))
+      return op.emitError(
+          "IME1 affine contraction requires a contiguous K32 activation block");
 
     auto zeroPointLane = zeroPointLoad.getPointer().getDefiningOp<PtrAddOp>();
     auto zeroPointBase =
         zeroPointLane ? zeroPointLane.getBase().getDefiningOp<PtrAddOp>()
                       : PtrAddOp{};
     if (!zeroPointLane || !zeroPointBase ||
-        !matchBlockAxis(zeroPointLane.getOffset(), nTile) ||
+        !matchBlockAxis(zeroPointLane.getOffset(), 16) ||
         integerConstant(zeroPointBase.getOffset()) != 32)
-      return reject("IME1 lowering requires the explicit sixteen-byte zero-point field");
+      return op.emitError(
+          "IME1 affine contraction requires an explicit N16 zero-point field");
     mlir::Value columnAxis = zeroPointLane.getOffset();
     mlir::Value packedBase = zeroPointBase.getBase();
 
@@ -5735,9 +5635,10 @@ private:
     mlir::Value scaleColumn;
     if (!scaleLane || scaleLane.getBase() != packedBase ||
         !matchBinaryConstant(scaleLane.getOffset(), "mul", 2, scaleColumn) ||
-        scaleColumn != columnAxis || scalarPointerBase(scaleHigh.getPointer()) !=
-                                          packedBase)
-      return reject("IME1 lowering requires the explicit little-endian fp16 scale field");
+        scaleColumn != columnAxis ||
+        scalarPointerBase(scaleHigh.getPointer()) != packedBase)
+      return op.emitError(
+          "IME1 affine contraction requires sixteen little-endian fp16 scales");
 
     auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
     auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
@@ -5757,104 +5658,72 @@ private:
         !matchBinaryConstant(halfAdd.getOffset(), "mul", 128, halfIndex) ||
         !payloadBase || payloadBase.getBase() != packedBase ||
         integerConstant(payloadBase.getOffset()) != 48)
-      return reject("IME1 lowering requires the explicit two-half packed-i4 payload layout");
+      return op.emitError(
+          "IME1 affine contraction requires the explicit two-half packed-i4 payload");
     auto half = halfIndex.getDefiningOp<BinaryOp>();
     auto expandedByte = within.getLhs().getDefiningOp<ExpandDimsOp>();
     auto expandedHalfByte =
         half ? half.getLhs().getDefiningOp<ExpandDimsOp>() : ExpandDimsOp{};
-    if (!half || half.getKind() != "div" || integerConstant(half.getRhs()) != 8 ||
-        !expandedByte || expandedByte.getAxis() != 0 ||
-        !expandedHalfByte || expandedHalfByte.getAxis() != 0 ||
+    if (!half || half.getKind() != "div" ||
+        integerConstant(half.getRhs()) != 8 || !expandedByte ||
+        expandedByte.getAxis() != 0 || !expandedHalfByte ||
+        expandedHalfByte.getAxis() != 0 ||
         expandedHalfByte.getInput() != expandedByte.getInput() ||
-        !matchBlockAxis(expandedByte.getInput(), nTile))
-      return reject("IME1 lowering requires the source-declared packed-byte axis");
+        !matchBlockAxis(expandedByte.getInput(), 16))
+      return op.emitError(
+          "IME1 affine contraction requires a local sixteen-byte packed axis");
 
     auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
-    mlir::Value linearBlock;
+    mlir::Value packedBlockIndex;
+    int64_t packedBlockBytes = 304;
     if (!packedPointer ||
         !matchBinaryConstant(packedPointer.getOffset(), "mul", packedBlockBytes,
-                             linearBlock))
-      return reject("IME1 lowering requires the explicit 304-byte persistent packed block");
-    auto blockAdd = linearBlock.getDefiningOp<BinaryOp>();
-    mlir::Value groupStride;
-    if (!blockAdd || blockAdd.getKind() != "add")
-      return reject("IME1 lowering requires the explicit packed-block index relation");
-    if (blockAdd.getLhs() == kCoordinate)
-      groupStride = blockAdd.getRhs();
-    else if (blockAdd.getRhs() == kCoordinate)
-      groupStride = blockAdd.getLhs();
-    else
-      return reject("IME1 packed-block index must include the explicit K block");
-    auto groupMultiply = groupStride.getDefiningOp<BinaryOp>();
-    mlir::Value group;
-    if (!groupMultiply || groupMultiply.getKind() != "mul")
-      return reject("IME1 packed-block index must include the explicit N-group stride");
-    if (groupMultiply.getLhs() == kLoop.getUpper())
-      group = groupMultiply.getRhs();
-    else if (groupMultiply.getRhs() == kLoop.getUpper())
-      group = groupMultiply.getLhs();
-    else
-      return reject("IME1 packed-block N stride must use the explicit K-block count");
-    auto groupDivide = group.getDefiningOp<BinaryOp>();
-    if (!groupDivide || groupDivide.getKind() != "div" ||
-        groupDivide.getLhs() != nCoordinate ||
-        integerConstant(groupDivide.getRhs()) != nTile)
-      return reject("IME1 packed-block index must use the explicit N16 group");
+                             packedBlockIndex))
+      return op.emitError(
+          "IME1 affine contraction requires the explicit 304-byte local packed block");
+    (void)packedBlockIndex;
 
-    mlir::Value packedRoot = packedPointer.getBase();
-    if (!dependsOn(codeRow, rowCoordinate) || !dependsOn(scaleRow, rowCoordinate) ||
-        !dependsOn(outputRow, rowCoordinate) ||
-        dependsOn(packedRoot, rowCoordinate) ||
-        dependsOn(codeRow, nCoordinate) || dependsOn(scaleRow, nCoordinate) ||
-        dependsOn(outputRow, kCoordinate))
-      return reject("IME1 lowering cannot change the source-declared row/N/K ownership");
-
-    AffineI4I8NTileDecision decision;
-    decision.operation = contract.getOperation();
-    decision.activationCodes = codeRow;
-    decision.activationScales = scaleRow;
-    decision.packedWeight = packedRoot;
-    decision.output = outputRow;
-    decision.columns = nLoop.getUpper();
-    decision.blocks = kLoop.getUpper();
-    decision.nTile = static_cast<unsigned>(nTile);
-    decision.packedBlockBytes = static_cast<unsigned>(packedBlockBytes);
-    return decision;
+    decision = AffineI4I8Decision{};
+    decision.operation = op.getOperation();
+    decision.activationBlockBase = activationLane.getBase();
+    decision.packedBlockBase = packedBase;
+    decision.activation = op.getActivation();
+    decision.packedWeight = op.getPackedWeight();
+    decision.activationScale = op.getActivationScale();
+    decision.weightScale = op.getWeightScale();
+    decision.weightZeroPoint = op.getWeightZeroPoint();
+    decision.init = op.getInit();
+    decision.packedBlockBytes = packedBlockBytes;
+    return mlir::success();
   }
 
-  mlir::LogicalResult emitAffineI4I8NTiles(
-      const AffineI4I8NTileDecision &decision) {
-    CValue code = require(decision.activationCodes);
-    CValue scales = require(decision.activationScales);
-    CValue weights = require(decision.packedWeight);
-    CValue outputValue = require(decision.output);
-    std::string columns = expression(decision.columns);
-    std::string blocks = expression(decision.blocks);
-    if (code.kind != CValueKind::Pointer || scales.kind != CValueKind::Pointer ||
-        weights.kind != CValueKind::Pointer ||
-        outputValue.kind != CValueKind::Pointer || code.spelling.empty() ||
-        scales.spelling.empty() || weights.spelling.empty() ||
-        outputValue.spelling.empty() || columns.empty() || blocks.empty())
-      return decision.operation->emitError(
-          "IME1 emission could not project the selected source operands");
-    std::string nTile = fresh("ime_n");
-    std::string nCount = fresh("ime_n_count");
-    line("for (size_t " + nTile + " = 0; " + nTile + " < " +
-         columns + "; " + nTile + " += " +
-         std::to_string(decision.nTile) + ") {");
-    ++indent;
-    line("const size_t " + nCount + " = (" + columns + " - " +
-         nTile + ") < " + std::to_string(decision.nTile) + " ? (" +
-         columns + " - " + nTile + ") : " +
-         std::to_string(decision.nTile) + ";");
-    line("__weft_ime1_affine_i4_i8_n16(" + scales.spelling + ", " +
-         code.spelling + ", " + weights.spelling + " + (" +
-         nTile + " / " + std::to_string(decision.nTile) + ") * " +
-         blocks + " * " + std::to_string(decision.packedBlockBytes) +
-         ", " + outputValue.spelling + " + " + nTile + ", " + nCount + ", " +
-         blocks + ");");
-    --indent;
-    line("}");
+  mlir::LogicalResult emitAffineI4I8Contract(AffineI4I8ContractOp op) {
+    auto selected = affineI4I8Decisions.find(op.getOperation());
+    if (selected == affineI4I8Decisions.end())
+      return op.emitError("affine i4/i8 physical decision was not prepared");
+    const AffineI4I8Decision &decision = selected->second;
+    CValue activation = require(decision.activationBlockBase);
+    CValue packed = require(decision.packedBlockBase);
+    CValue scale = require(decision.activationScale);
+    CValue accumulator = require(decision.init);
+    if (decision.packedBlockBytes != 304 ||
+        activation.kind != CValueKind::Pointer ||
+        packed.kind != CValueKind::Pointer || scale.kind != CValueKind::Scalar ||
+        accumulator.kind != CValueKind::F32BlockStorage ||
+        activation.spelling.empty() || packed.spelling.empty() ||
+        scale.spelling.empty() || accumulator.spelling.empty())
+      return op.emitError(
+          "selected IME1 affine contraction operands are unavailable");
+    line("__weft_ime1_affine_i4_i8_n16_k32(" + scale.spelling + ", " +
+         activation.spelling + ", " + packed.spelling + ", " +
+         accumulator.spelling + ");");
+    for (mlir::Value operand :
+         {decision.activation, decision.packedWeight, decision.weightScale,
+          decision.weightZeroPoint, decision.init})
+      markDiscardedBlockTree(operand);
+    loweredBlockOps.insert(op.getOperation());
+    accumulator.type = op.getResult().getType();
+    values[op.getResult()] = std::move(accumulator);
     return mlir::success();
   }
 
@@ -8210,19 +8079,22 @@ __weft_ime1_symmetric_i4_i8_n16_k32(
           "s6");
 }
 
-static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
-    const float *activation_scale, const int8_t *activation_code,
-    const uint8_t *packed_weight, float *output, size_t nblks,
-    size_t block_count) {
+static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16_k32(
+    float activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
   const size_t inner = 2;
   const uint8_t *weight = packed_weight;
-  float *destination = output;
-  const float *scale = activation_scale;
-  size_t count = block_count;
 
   __asm__ volatile(
+        "vsetvli      t0, zero, e32, mf2      \n\t"
+        "vle32.v      v28, (%[C])             \n\t"
+        "addi         s1, %[C], 16            \n\t"
+        "vle32.v      v29, (s1)               \n\t"
+        "addi         s1, %[C], 32            \n\t"
+        "vle32.v      v30, (s1)               \n\t"
+        "addi         s1, %[C], 48            \n\t"
+        "vle32.v      v31, (s1)               \n\t"
         "vsetvli      t0, zero, e32, m4       \n\t"
-        "vxor.vv      v28, v28, v28           \n\t"
         "vsetvli      t0, zero, e8, m1        \n\t"
         "vmv.v.i      v13, 3                  \n\t"
         "li           s1, 24                  \n\t"
@@ -8239,7 +8111,6 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
         "addi         s7, %[B], 32            \n\t"
         "addi         s5, %[A], 0             \n\t"
         "addi         s6, %[A], 8             \n\t"
-        "LOOP_K%=:                            \n\t"
         "vsetvli      t0, zero, e16, mf4      \n\t"
         "vle16.v      v4, (s1)                \n\t"
         "addi         s1, s1, 48              \n\t"
@@ -8249,8 +8120,7 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
         "addi         s3, s3, 96              \n\t"
         "vle16.v      v7, (s4)                \n\t"
         "addi         s4, s4, 120             \n\t"
-        "flw          f1, 0(%[AS])            \n\t"
-        "addi         %[AS], %[AS], 4         \n\t"
+        "fmv.s        f1, %[AS]                \n\t"
         "vfwcvt.f.f.v v8, v4                  \n\t"
         "vfwcvt.f.f.v v9, v5                  \n\t"
         "vfwcvt.f.f.v v10, v6                 \n\t"
@@ -8265,7 +8135,6 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
         "vfmul.vf     v25, v9, f1             \n\t"
         "vfmul.vf     v26, v10, f1            \n\t"
         "vfmul.vf     v27, v11, f1            \n\t"
-        "addi         %[CNT], %[CNT], -1      \n\t"
         __WEFT_IME1_LOAD_ZP_I4_I8_M1
         "LOOP_INNER%=:                        \n\t"
         __WEFT_IME1_LOAD_I4_I8_M1
@@ -8281,36 +8150,17 @@ static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16(
         "bnez         t5, LOOP_INNER%=        \n\t"
         "vsetvli      t0, zero, e32, mf2      \n\t"
         __WEFT_IME1_ACC_I4_I8_M1
-        "addi         s7, s1, 32              \n\t"
-        "bnez         %[CNT], LOOP_K%=        \n\t"
-        "addi         t3, zero, 16            \n\t"
         "addi         s1, %[C], 16            \n\t"
         "addi         s2, %[C], 32            \n\t"
         "addi         s3, %[C], 48            \n\t"
-        "blt          %[NBLKS], t3, ST_TAIL%= \n\t"
         "vse32.v      v28, (%[C])             \n\t"
         "vse32.v      v29, (s1)               \n\t"
         "vse32.v      v30, (s2)               \n\t"
         "vse32.v      v31, (s3)               \n\t"
-        "jal          x0, END%=               \n\t"
-        "ST_TAIL%=:                           \n\t"
-        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
-        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
-        "vse32.v      v28, (%[C])             \n\t"
-        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
-        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
-        "vse32.v      v29, (s1)               \n\t"
-        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
-        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
-        "vse32.v      v30, (s2)               \n\t"
-        "vsetvli      t0, %[NBLKS], e32, mf2  \n\t"
-        "sub          %[NBLKS], %[NBLKS], t0  \n\t"
-        "vse32.v      v31, (s3)               \n\t"
-        "END%=:                               \n\t"
-        : [CNT] "+r"(count), [NBLKS] "+r"(nblks), [AS] "+r"(scale)
+        :
         : [INNER] "r"(inner), [A] "r"(activation_code), [B] "r"(weight),
-          [C] "r"(destination)
-      : "cc", "memory", "t0", "t5", "t3", "f1", "s1", "s2", "s3",
+          [C] "r"(accumulator), [AS] "f"(activation_scale)
+      : "cc", "memory", "t0", "t5", "f1", "s1", "s2", "s3",
         "s4", "s5", "s6", "s7");
 }
 
