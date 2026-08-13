@@ -152,9 +152,10 @@ VLA free-axis候选也共用同一selector。`kUnroll`已经物化但当前合�
 microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是
 开放注册表或通用搜索承诺。
 
-当前仍有两个精确的局部VLA fusion envelope：F16 widening dot将显式load/cast/multiply/reduce
-闭包实现为widening MAC，online-softmax envelope联合相邻summary producer与normalize
-consumer。F16 GEMM nested loop和affine Q4_K IME N/K closure也仍要求较精确的局部loop关系。
+当前仍有一个精确的局部VLA fusion envelope：F16 widening dot将显式load/cast/multiply/reduce
+闭包实现为widening MAC。Online-softmax summary只拥有自身typed state，后续normalize VLA由
+其中的memory/pointwise实体独立lower。F16 GEMM nested loop和affine Q4_K IME N/K closure仍
+要求较精确的局部loop关系。
 它们都从typed source relation产生decision，不读取kernel名，也不接管public ABI或外围
 traversal；但尚未获得更宽的等价source接受范围。新增能力应扩展局部decision的合法语义输入
 与physical candidate，不能重新增加whole-kernel try-emitter。

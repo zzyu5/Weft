@@ -355,30 +355,10 @@ struct VLACastDecision {
   unsigned resultLMUL = 2;
 };
 
-enum class VLAStateConsumerRealization {
-  RVVStagedExpNormalize,
-};
-
 enum class VLAStatePlacement {
   ScalarCarry,
   VectorCarry,
   StackScratch,
-};
-
-struct VLAStateConsumerDecision {
-  VLAStateConsumerRealization realization =
-      VLAStateConsumerRealization::RVVStagedExpNormalize;
-  mlir::Operation *consumerRegion = nullptr;
-  mlir::Value begin;
-  mlir::Value end;
-  mlir::Value inputPointer;
-  mlir::Value inputCoordinate;
-  mlir::Value outputPointer;
-  mlir::Value outputCoordinate;
-  RVVVectorConfig dataShape{32, 2};
-  RVVVectorConfig reductionShape{32, 1};
-  VLAStatePlacement placement = VLAStatePlacement::StackScratch;
-  llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
 struct VLAStateDecision {
@@ -397,7 +377,6 @@ struct VLAStateDecision {
   RVVVectorConfig reductionShape{32, 1};
   RVVTailPolicy tail = RVVTailPolicy::Undisturbed;
   llvm::SmallVector<mlir::Operation *> absorbed;
-  std::optional<VLAStateConsumerDecision> consumer;
   VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
   mlir::Value segmentStart;
   mlir::Value segmentVector;
@@ -2030,7 +2009,6 @@ private:
               summary.getOperation(),
               VLAStateRealization::RVVOnlineSoftmaxSummary,
               summary.getResult().getType()};
-          state.consumer = decideOnlineSoftmaxConsumer(op, summary);
           decision.states.push_back(std::move(state));
       } else if (auto summary = mlir::dyn_cast<SummaryFoldOp>(nested)) {
         summary.emitError(
@@ -3050,16 +3028,6 @@ private:
     if (selected == vlaDecisions.end())
       return op.emitError("VLA physical decision was not prepared");
     const VLARegionDecision &decision = selected->second;
-    llvm::SmallVector<const VLAStateDecision *> fusedStates;
-    for (const VLAStateDecision &state : decision.states)
-      if (state.consumer)
-        fusedStates.push_back(&state);
-    if (!fusedStates.empty()) {
-      if (fusedStates.size() != 1 || decision.states.size() != 1)
-        return op.emitError(
-            "one VLA region cannot select multiple state-consumer realizations");
-      return emitOnlineSoftmaxConsumer(op, *fusedStates.front());
-    }
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
@@ -3404,192 +3372,6 @@ private:
   bool valueDependsOn(mlir::Value value, mlir::Value target) const {
     llvm::DenseSet<mlir::Value> visited;
     return valueDependsOn(value, target, visited);
-  }
-
-  bool sameBound(mlir::Value lhs, mlir::Value rhs) const {
-    if (lhs == rhs)
-      return true;
-    auto lhsConstant = lhs.getDefiningOp<ConstantOp>();
-    auto rhsConstant = rhs.getDefiningOp<ConstantOp>();
-    if (lhsConstant && rhsConstant)
-      return lhsConstant.getValue() == rhsConstant.getValue();
-    auto lhsMeta = lhs.getDefiningOp<MetaValueOp>();
-    auto rhsMeta = rhs.getDefiningOp<MetaValueOp>();
-    return lhsMeta && rhsMeta && lhsMeta.getInput() == rhsMeta.getInput();
-  }
-
-  bool sameAddressFact(mlir::Value lhs, mlir::Value lhsCoordinate,
-                       mlir::Value rhs, mlir::Value rhsCoordinate) const {
-    if (lhs == lhsCoordinate || rhs == rhsCoordinate)
-      return lhs == lhsCoordinate && rhs == rhsCoordinate;
-    if (lhs == rhs)
-      return true;
-    auto lhsConstant = lhs.getDefiningOp<ConstantOp>();
-    auto rhsConstant = rhs.getDefiningOp<ConstantOp>();
-    if (lhsConstant || rhsConstant)
-      return lhsConstant && rhsConstant &&
-             lhsConstant.getValue() == rhsConstant.getValue();
-    auto lhsPointer = lhs.getDefiningOp<PtrAddOp>();
-    auto rhsPointer = rhs.getDefiningOp<PtrAddOp>();
-    if (lhsPointer || rhsPointer)
-      return lhsPointer && rhsPointer &&
-             sameAddressFact(lhsPointer.getBase(), lhsCoordinate,
-                             rhsPointer.getBase(), rhsCoordinate) &&
-             sameAddressFact(lhsPointer.getOffset(), lhsCoordinate,
-                             rhsPointer.getOffset(), rhsCoordinate);
-    auto lhsBinary = lhs.getDefiningOp<BinaryOp>();
-    auto rhsBinary = rhs.getDefiningOp<BinaryOp>();
-    if (lhsBinary || rhsBinary)
-      return lhsBinary && rhsBinary &&
-             lhsBinary.getKind() == rhsBinary.getKind() &&
-             sameAddressFact(lhsBinary.getLhs(), lhsCoordinate,
-                             rhsBinary.getLhs(), rhsCoordinate) &&
-             sameAddressFact(lhsBinary.getRhs(), lhsCoordinate,
-                             rhsBinary.getRhs(), rhsCoordinate);
-    auto lhsCast = lhs.getDefiningOp<CastOp>();
-    auto rhsCast = rhs.getDefiningOp<CastOp>();
-    return lhsCast && rhsCast &&
-           lhsCast.getResult().getType() == rhsCast.getResult().getType() &&
-           sameAddressFact(lhsCast.getInput(), lhsCoordinate,
-                           rhsCast.getInput(), rhsCoordinate);
-  }
-
-  std::optional<VLAStateConsumerDecision>
-  decideOnlineSoftmaxConsumer(VLAOp producer, OnlineSoftmaxSummaryOp summary) {
-    if (producer.getNumResults() != 1)
-      return std::nullopt;
-    auto producerYield =
-        mlir::cast<YieldOp>(producer.getBody().front().getTerminator());
-    if (producerYield.getNumOperands() != 1 ||
-        producerYield.getOperand(0) != summary.getResult())
-      return std::nullopt;
-
-    for (mlir::Operation *maximumUser : producer.getResult(0).getUsers()) {
-      auto maximumGet = mlir::dyn_cast<TupleGetOp>(maximumUser);
-      if (!maximumGet || maximumGet.getIndex() != 0)
-        continue;
-      for (mlir::Operation *sumUser : producer.getResult(0).getUsers()) {
-        auto sumGet = mlir::dyn_cast<TupleGetOp>(sumUser);
-        if (!sumGet || sumGet.getIndex() != 1)
-          continue;
-        for (mlir::Operation *maximumUse : maximumGet.getResult().getUsers()) {
-          auto consumer = maximumUse->getParentOfType<VLAOp>();
-          if (!consumer || consumer->getBlock() != producer->getBlock() ||
-              consumer.getNumResults() != 0 ||
-              !sameBound(producer.getBegin(), consumer.getBegin()) ||
-              !sameBound(producer.getEnd(), consumer.getEnd()))
-            continue;
-
-          for (mlir::Operation &nested :
-               consumer.getBody().front().without_terminator()) {
-            auto store = mlir::dyn_cast<StoreOp>(nested);
-            if (!store || !isTrue(store.getWhere()))
-              continue;
-            auto divide = store.getValue().getDefiningOp<BinaryOp>();
-            auto exponential = divide && divide.getKind() == "div" &&
-                                       divide.getRhs() == sumGet.getResult()
-                                   ? divide.getLhs().getDefiningOp<UnaryOp>()
-                                   : UnaryOp{};
-            auto subtract = exponential && exponential.getKind() == "exp" &&
-                                    exponential.getMath() == "fast"
-                                ? exponential.getInput().getDefiningOp<BinaryOp>()
-                                : BinaryOp{};
-            auto load = subtract && subtract.getKind() == "sub" &&
-                                subtract.getRhs() == maximumGet.getResult()
-                            ? subtract.getLhs().getDefiningOp<LoadOp>()
-                            : LoadOp{};
-            if (!divide || !exponential || !subtract || !load ||
-                !isTrue(load.getWhere()) || !divide.getResult().hasOneUse() ||
-                !exponential.getResult().hasOneUse() ||
-                !subtract.getResult().hasOneUse() || !load.getResult().hasOneUse())
-              continue;
-            if (!maximumGet.getResult().hasOneUse() ||
-                !sumGet.getResult().hasOneUse() ||
-                *maximumGet.getResult().user_begin() != subtract.getOperation() ||
-                *sumGet.getResult().user_begin() != divide.getOperation())
-              continue;
-
-            auto producerLoad = summary.getInput().getDefiningOp<LoadOp>();
-            mlir::Value producerCoordinate =
-                producer.getBody().front().getArgument(0);
-            mlir::Value consumerCoordinate =
-                consumer.getBody().front().getArgument(0);
-            if (!producerLoad || !isTrue(producerLoad.getWhere()) ||
-                classifyLaneRelation(producerLoad.getPointer(),
-                                     producerCoordinate) !=
-                    LaneRelation::UnitStride ||
-                classifyLaneRelation(load.getPointer(), consumerCoordinate) !=
-                    LaneRelation::UnitStride ||
-                classifyLaneRelation(store.getPointer(), consumerCoordinate) !=
-                    LaneRelation::UnitStride)
-              continue;
-            mlir::Value inputRoot = pointerRoot(producerLoad.getPointer());
-            mlir::Value outputRoot = pointerRoot(store.getPointer());
-            auto inputType = inputRoot
-                                 ? mlir::dyn_cast<PtrType>(inputRoot.getType())
-                                 : PtrType{};
-            auto outputType = outputRoot
-                                  ? mlir::dyn_cast<PtrType>(outputRoot.getType())
-                                  : PtrType{};
-            if (!inputType || !outputType ||
-                inputType.getAccess() != "read" ||
-                outputType.getAccess() != "write" || inputRoot == outputRoot ||
-                (!inputType.getNoAlias() && !inputType.getRestrictLike()) ||
-                (!outputType.getNoAlias() && !outputType.getRestrictLike()))
-              continue;
-
-            if (!sameAddressFact(producerLoad.getPointer(), producerCoordinate,
-                                 load.getPointer(), consumerCoordinate))
-              continue;
-            llvm::DenseSet<mlir::Operation *> absorbed;
-            llvm::SmallVector<BlockAxisOp> axes;
-            collectLocalDefinitions(store.getValue(),
-                                    consumer.getBody().front(), absorbed, axes);
-            collectLocalDefinitions(store.getPointer(),
-                                    consumer.getBody().front(), absorbed, axes);
-            collectLocalDefinitions(store.getWhere(),
-                                    consumer.getBody().front(), absorbed, axes);
-            if (llvm::any_of(absorbed, [&](mlir::Operation *operation) {
-                  return operation->getBlock() != &consumer.getBody().front() ||
-                         mlir::isa<ForOp, WhileOp, VLAOp, IfOp, StoreOp>(operation);
-                }))
-              continue;
-
-            bool producerHasExtraEffect = llvm::any_of(
-                producer.getBody().front().without_terminator(),
-                [&](mlir::Operation &operation) {
-                  return &operation != summary.getOperation() &&
-                         !mlir::isa<LoadOp>(operation) &&
-                         !mlir::isMemoryEffectFree(&operation);
-                });
-            bool consumerHasExtraEffect = llvm::any_of(
-                consumer.getBody().front().without_terminator(),
-                [&](mlir::Operation &operation) {
-                  return &operation != store.getOperation() &&
-                         !mlir::isa<LoadOp>(operation) &&
-                         !llvm::is_contained(absorbed, &operation) &&
-                         !mlir::isMemoryEffectFree(&operation);
-                });
-            if (producerHasExtraEffect || consumerHasExtraEffect)
-              continue;
-
-            VLAStateConsumerDecision decision;
-            decision.placement = VLAStatePlacement::StackScratch;
-            decision.consumerRegion = consumer.getOperation();
-            decision.begin = producer.getBegin();
-            decision.end = producer.getEnd();
-            decision.inputPointer = producerLoad.getPointer();
-            decision.inputCoordinate = producerCoordinate;
-            decision.outputPointer = store.getPointer();
-            decision.outputCoordinate = consumerCoordinate;
-            decision.absorbed.append(absorbed.begin(), absorbed.end());
-            decision.absorbed.push_back(store.getOperation());
-            return decision;
-          }
-        }
-      }
-    }
-    return std::nullopt;
   }
 
   std::string scalarBinary(llvm::StringRef kind, llvm::StringRef lhs,
@@ -7851,131 +7633,6 @@ private:
       line(aggregate.spelling + " = " + intrinsic + "(" + aggregate.spelling +
            ", " + lhsVector + ", " + rhsVector + ", " + activeVL + ");");
     }
-    return mlir::success();
-  }
-
-  mlir::LogicalResult emitOnlineSoftmaxConsumer(
-      VLAOp producer, const VLAStateDecision &state) {
-    if (state.realization != VLAStateRealization::RVVOnlineSoftmaxSummary ||
-        !state.consumer)
-      return producer.emitError("online summary consumer decision is unavailable");
-    const VLAStateConsumerDecision &consumer = *state.consumer;
-    if (consumer.realization !=
-        VLAStateConsumerRealization::RVVStagedExpNormalize)
-      return producer.emitError("online summary consumer realization is unavailable");
-    if (consumer.placement != VLAStatePlacement::StackScratch)
-      return producer.emitError("online summary state placement is unavailable");
-
-    std::string begin = expression(consumer.begin);
-    std::string end = expression(consumer.end);
-    std::optional<std::string> inputPointer =
-        pointerBase(consumer.inputPointer, consumer.inputCoordinate);
-    std::optional<std::string> outputPointer =
-        pointerBase(consumer.outputPointer, consumer.outputCoordinate);
-    if (begin.empty() || end.empty() || !inputPointer || !outputPointer)
-      return producer.emitError(
-          "online summary physical operands could not be projected");
-
-    const RVVVectorConfig &data = consumer.dataShape;
-    const RVVVectorConfig &reduction = consumer.reductionShape;
-    std::string maximum = fresh("summary_max");
-    std::string sum = fresh("summary_sum");
-    std::string strip = fresh("summary_i");
-    std::string vl = fresh("vl");
-    std::string input = fresh("summary_x");
-    std::string seed = fresh("summary_seed");
-    std::string partial = fresh("summary_partial");
-    std::string shifted = fresh("summary_shifted");
-    std::string exponentials = fresh("summary_exp");
-    std::string sumSeed = fresh("summary_sum_seed");
-    std::string sumPartial = fresh("summary_sum_partial");
-    std::string scratch = fresh("summary_scratch");
-    line("float " + maximum + " = -INFINITY;");
-    line("for (size_t " + strip + " = " + begin + "; " + strip +
-         " < " + end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         end + " - " + strip + ");");
-    line(rvvFloatType(data) + " " + input + " = __riscv_vle" +
-         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         *inputPointer + " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(reduction) + " " + seed + " = __riscv_vfmv_v_f_" +
-         rvvFloatSuffix(reduction) + "(" + maximum + ", 1);");
-    line(rvvFloatType(reduction) + " " + partial +
-         " = __riscv_vfredmax_vs_" + rvvFloatSuffix(data) + "_" +
-         rvvFloatSuffix(reduction) + "(" + input + ", " + seed + ", " + vl +
-         ");");
-    line(maximum + " = __riscv_vfmv_f_s_" + rvvFloatSuffix(reduction) +
-         "_f32(" + partial + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-
-    line("float " + scratch + "[" + end + " - " + begin +
-         "];");
-    line("float " + sum + " = 0.0f;");
-    line("for (size_t " + strip + " = " + begin + "; " + strip +
-         " < " + end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         end + " - " + strip + ");");
-    line(rvvFloatType(data) + " " + input + " = __riscv_vle" +
-         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         *inputPointer + " + " + strip + ", " + vl + ");");
-    line(rvvFloatType(data) + " " + shifted + " = __riscv_vfsub_vf_" +
-         rvvFloatSuffix(data) + "(" + input + ", " + maximum + ", " + vl +
-         ");");
-    line(rvvFloatType(data) + " " + exponentials + " = __weft_exp_" +
-         rvvFloatSuffix(data) + "(" + shifted + ", " + vl + ");");
-    line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
-         rvvFloatSuffix(data) + "(" + scratch + " + " + strip + " - " +
-         begin + ", " + exponentials + ", " + vl + ");");
-    line(rvvFloatType(reduction) + " " + sumSeed +
-         " = __riscv_vfmv_v_f_" + rvvFloatSuffix(reduction) + "(" + sum +
-         ", 1);");
-    line(rvvFloatType(reduction) + " " + sumPartial +
-         " = __riscv_vfredusum_vs_" + rvvFloatSuffix(data) + "_" +
-         rvvFloatSuffix(reduction) + "(" + exponentials + ", " + sumSeed +
-         ", " + vl + ");");
-    line(sum + " = __riscv_vfmv_f_s_" + rvvFloatSuffix(reduction) + "_f32(" +
-         sumPartial + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-
-    std::string inverse = fresh("summary_inverse");
-    line("const float " + inverse + " = 1.0f / " + sum + ";");
-    line("for (size_t " + strip + " = " + begin + "; " + strip +
-         " < " + end + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(data.sew) + "m" + std::to_string(data.lmul) + "(" +
-         end + " - " + strip + ");");
-    line(rvvFloatType(data) + " " + exponentials + " = __riscv_vle" +
-         std::to_string(data.sew) + "_v_" + rvvFloatSuffix(data) + "(" +
-         scratch + " + " + strip + " - " + begin + ", " + vl +
-         ");");
-    line(exponentials + " = __riscv_vfmul_vf_" + rvvFloatSuffix(data) + "(" +
-         exponentials + ", " + inverse + ", " + vl + ");");
-    line("__riscv_vse" + std::to_string(data.sew) + "_v_" +
-         rvvFloatSuffix(data) + "(" + *outputPointer + " + " + strip +
-         ", " + exponentials + ", " + vl + ");");
-    line(strip + " += " + vl + ";");
-    --indent;
-    line("}");
-
-    auto summary = mlir::cast<OnlineSoftmaxSummaryOp>(state.operation);
-    CValue maximumValue{mlir::Float32Type::get(kernel.getContext()),
-                        CValueKind::Scalar, maximum};
-    CValue sumValue{mlir::Float32Type::get(kernel.getContext()),
-                    CValueKind::Scalar, sum};
-    CValue tuple{summary.getResult().getType(), CValueKind::Tuple, {}};
-    tuple.fields = {maximumValue, sumValue};
-    values[summary.getResult()] = tuple;
-    values[producer.getResult(0)] = tuple;
-    consumed.insert(consumer.consumerRegion);
     return mlir::success();
   }
 
