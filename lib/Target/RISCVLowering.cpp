@@ -215,6 +215,7 @@ struct GroupedAffineI4I8Decision {
 
 enum class QuantCodebookI8Realization {
   RVVVLEN128LocalBlockDot,
+  RVVScalableLocalBlockDot,
 };
 
 struct QuantCodebookI8Decision {
@@ -2469,7 +2470,7 @@ private:
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
       return emitQuantCodebookI8Dot(op, "__weft_iq2_s_i8_vl128");
     if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op, "__weft_iq3_s_i8_vl128");
+      return emitQuantCodebookI8Dot(op, "__weft_iq3_s_i8_rvv");
     if (auto op = mlir::dyn_cast<IQ1MI8DotOp>(operation))
       return emitQuantCodebookI8Dot(op, "__weft_iq1_m_i8_vl128");
     if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
@@ -5532,13 +5533,18 @@ private:
       OpTy op, llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
       QuantCodebookI8Decision &decision) {
-    if (options.target.vlenBits != 128)
+    bool scalableIQ3 = mlir::isa<IQ3SI8DotOp>(op.getOperation());
+    if (options.target.vlenBits != 128 &&
+        !(scalableIQ3 && options.target.vlenBits >= 128))
       return op.emitError(
-          "quant codebook/i8 dot requires an explicit VLEN128 target fact");
+          "selected quant codebook/i8 realization requires VLEN128");
     if (!options.target.littleEndian)
       return op.emitError(
           "quant codebook/i8 dot requires little-endian packed fields");
     decision = QuantCodebookI8Decision{};
+    if (scalableIQ3)
+      decision.realization =
+          QuantCodebookI8Realization::RVVScalableLocalBlockDot;
     for (mlir::Value block : blocks) {
       auto fact = resolveLocalBlockMemoryFact(block);
       if (!fact)
@@ -5559,7 +5565,9 @@ private:
           "quant codebook/i8 physical decision was not prepared");
     const QuantCodebookI8Decision &decision = prepared->second;
     if (decision.realization !=
-        QuantCodebookI8Realization::RVVVLEN128LocalBlockDot)
+            QuantCodebookI8Realization::RVVVLEN128LocalBlockDot &&
+        decision.realization !=
+            QuantCodebookI8Realization::RVVScalableLocalBlockDot)
       return op.emitError("quant codebook/i8 realization is unavailable");
     llvm::SmallVector<CValue> operands;
     for (const LocalBlockMemoryFact &block : decision.blocks) {
@@ -8297,7 +8305,7 @@ __weft_iq2_s_i8_vl128(
 }
 
 static inline __attribute__((always_inline, unused)) float
-__weft_iq3_s_i8_vl128(
+__weft_iq3_s_i8_rvv(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
