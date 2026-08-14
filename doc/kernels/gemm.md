@@ -59,7 +59,8 @@ def gemm_worker(
 这里：
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
-- `a` 的logical layout是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major persistent layout；
+- `a` 的logical relation是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major relation；只有source
+  使用`W.persistent(format)`显式声明的caller-provided packed object才具有persistent身份；
 - block values 与matmul relation归canonical semantics；
 - `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
 - 外部 runtime 决定每个 worker 的 `[m_begin,m_end)`。

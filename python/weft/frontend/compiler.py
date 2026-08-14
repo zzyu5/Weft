@@ -191,6 +191,8 @@ def _annotation_type(annotation: object, location: SourceLocation) -> tuple[Valu
                 annotation.noalias,
                 annotation.alignment,
                 annotation.restrict_like,
+                annotation.storage_class,
+                annotation.storage_format,
             ),
             "pointer",
         )
@@ -255,6 +257,7 @@ class FrontendCompiler:
         self.source: SourceUnit | HelperSource = self.unit
         self.builder = IRBuilder()
         self.block: Region | None = None
+        self.entry_block: Region | None = None
         self.env: dict[str, Value] = {}
         self.active_vla = False
         self.vla_outer_names: set[str] | None = None
@@ -304,6 +307,7 @@ class FrontendCompiler:
             tuple(argument_types), tuple(parameter.name for parameter in parameters)
         )
         self.block = body
+        self.entry_block = body
         for parameter, argument, kind in zip(parameters, body.arguments, argument_kinds):
             if kind == "constexpr":
                 constexpr_type = argument.type
@@ -1015,80 +1019,39 @@ class FrontendCompiler:
         )
         return None
 
-    def _intrinsic_prefetch(self, call: ast.Call) -> None:
-        self._require_effect("read", call)
-        args = self._positional_and_keywords(
-            call, ("ptr",), {"where": True, "locality": "default"}
-        )
+    def _intrinsic_storage(self, call: ast.Call) -> None:
+        if self.block is not self.entry_block:
+            raise FrontendError(
+                "W.storage must be declared directly in the kernel entry body",
+                self._location(call),
+            )
+        args = self._positional_and_keywords(call, ("ptr", "shape"), {})
         pointer = self._value_argument(args["ptr"], call)
-        where = self._value_argument(args["where"], call)
-        locality = args["locality"]
-        if isinstance(locality, ast.expr):
-            locality = self._eval_static(locality)
+        if not isinstance(pointer.type, PointerType):
+            raise FrontendError(
+                "W.storage requires one entry pointer", self._location(call)
+            )
+        if self.entry_block is None or pointer not in self.entry_block.arguments:
+            raise FrontendError(
+                "W.storage must bind a kernel entry pointer directly",
+                self._location(call),
+            )
+        if pointer.type.storage_class not in {"persistent", "workspace"}:
+            raise FrontendError(
+                "W.storage is required only for persistent or workspace pointers",
+                self._location(call),
+            )
+        shape_node = args["shape"]
+        if not isinstance(shape_node, ast.expr):
+            raise FrontendError("storage shape must be source syntax", self._location(call))
+        shape = self._shape_spec(shape_node)
         self._emit(
-            "weft_kernel.prefetch",
+            "weft_kernel.storage",
             call,
-            operands=(pointer, where),
-            attributes={"locality": _string(str(locality))},
+            operands=(pointer,) + shape.extents,
+            attributes={"shape": _dense_i64(shape.dimensions)},
         )
         return None
-
-    def _intrinsic_atomic_add(self, call: ast.Call) -> Value:
-        self._require_effect("atomic", call)
-        args = self._positional_and_keywords(
-            call, ("ptr", "value"), {"where": True, "order": "relaxed"}
-        )
-        pointer = self._value_argument(args["ptr"], call)
-        value = self._value_argument(args["value"], call)
-        where = self._value_argument(args["where"], call)
-        order = args["order"]
-        if isinstance(order, ast.expr):
-            order = self._eval_static(order)
-        result_type = with_element_type(pointer.type, element_type(value.type))
-        return self._emit(
-            "weft_kernel.atomic_add",
-            call,
-            operands=(pointer, value, where),
-            result_types=(result_type,),
-            attributes={"order": _string(str(order))},
-        )[0]
-
-    def _intrinsic_fence(self, call: ast.Call) -> None:
-        self._require_effect("fence", call)
-        args = self._positional_and_keywords(call, (), {"order": "acq_rel"})
-        order = args["order"]
-        if isinstance(order, ast.expr):
-            order = self._eval_static(order)
-        self._emit(
-            "weft_kernel.fence", call, attributes={"order": _string(str(order))}
-        )
-        return None
-
-    def _intrinsic_valid(self, call: ast.Call) -> Value:
-        args = self._positional_and_keywords(call, ("value",), {})
-        value = self._value_argument(args["value"], call)
-        if not isinstance(value.type, MaskedType):
-            raise FrontendError("W.valid expects a masked value", self._location(call))
-        result_type = with_element_type(value.type.value_type, ScalarType(i1))
-        return self._emit(
-            "weft_kernel.valid",
-            call,
-            operands=(value,),
-            result_types=(result_type,),
-        )[0]
-
-    def _intrinsic_fill(self, call: ast.Call) -> Value:
-        args = self._positional_and_keywords(call, ("value", "fill_value"), {})
-        value = self._value_argument(args["value"], call)
-        fill_value = self._value_argument(args["fill_value"], call)
-        if not isinstance(value.type, MaskedType):
-            raise FrontendError("W.fill expects a masked value", self._location(call))
-        return self._emit(
-            "weft_kernel.fill",
-            call,
-            operands=(value, fill_value),
-            result_types=(value.type.value_type,),
-        )[0]
 
     def _intrinsic_block_axis(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("extent",), {"offset": 0})
@@ -1230,9 +1193,6 @@ class FrontendCompiler:
 
     def _intrinsic_transpose(self, call: ast.Call) -> Value:
         return self._permutation(call, "weft_kernel.transpose")
-
-    def _intrinsic_permute(self, call: ast.Call) -> Value:
-        return self._permutation(call, "weft_kernel.permute")
 
     def _intrinsic_cast(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("value", "dtype"), {})
@@ -1839,41 +1799,36 @@ class FrontendCompiler:
             attributes={"out_dtype": emit_type(ScalarType(dtype))},
         )[0]
 
-    def _convert(self, call: ast.Call, operation: str, narrow: bool) -> Value:
-        defaults = {"rounding": "rne", "saturation": False} if narrow else {}
-        args = self._positional_and_keywords(call, ("value", "dtype"), defaults)
+    def _intrinsic_narrow(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(
+            call,
+            ("value", "dtype"),
+            {"rounding": "rne", "saturation": False},
+        )
         value = self._value_argument(args["value"], call)
         dtype = args["dtype"]
         if isinstance(dtype, ast.expr):
             dtype = self._eval_static(dtype)
         if not isinstance(dtype, DType):
             raise FrontendError("conversion dtype must be a Weft type", self._location(call))
-        attributes: dict[str, str] = {}
-        if narrow:
-            rounding = args["rounding"]
-            saturation = args["saturation"]
-            if isinstance(rounding, ast.expr):
-                rounding = self._eval_static(rounding)
-            if isinstance(saturation, ast.expr):
-                saturation = self._eval_static(saturation)
-            attributes = {
-                "rounding": _string(str(rounding)),
-                "saturation": _bool(bool(saturation)),
-            }
+        rounding = args["rounding"]
+        saturation = args["saturation"]
+        if isinstance(rounding, ast.expr):
+            rounding = self._eval_static(rounding)
+        if isinstance(saturation, ast.expr):
+            saturation = self._eval_static(saturation)
+        attributes = {
+            "rounding": _string(str(rounding)),
+            "saturation": _bool(bool(saturation)),
+        }
         result_type = with_element_type(value.type, ScalarType(dtype))
         return self._emit(
-            operation,
+            "weft_kernel.narrow",
             call,
             operands=(value,),
             result_types=(result_type,),
             attributes=attributes,
         )[0]
-
-    def _intrinsic_widen(self, call: ast.Call) -> Value:
-        return self._convert(call, "weft_kernel.widen", False)
-
-    def _intrinsic_narrow(self, call: ast.Call) -> Value:
-        return self._convert(call, "weft_kernel.narrow", True)
 
     def _intrinsic_affine_i4_i8_contract(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(

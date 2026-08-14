@@ -2,7 +2,10 @@
 
 ## 最终定义
 
-Weft 是一门面向**单个 RISC-V worker / hart** 的高性能 kernel DSL 与 AOT 编译器。
+Weft 是一门面向**单个 RISC-V worker / hart** 的高性能 kernel DSL 与 AOT 编译器。它的根
+程序是一份在一次 invocation 中持续执行的 core-local blocked program：一个 worker 顺序处理
+一个或多个 block，并让 SSA accumulator、state、显式 staging 与 workspace 跨 loop 存活、更新
+和复用。
 
 作者使用普通控制流、一等 VLA iteration region、显式指针与逻辑 predicate、局部 logical block value、结构化 state algebra，以及 dot / matmul / scan / lookup / decode 等 primitive 编写完整的 worker-local kernel。编译器把这些结构映射到动态 `vl`、LMUL、寄存器组织、memory instruction、register microtile、矩阵 fragment 和 RISC-V 扩展指令。
 
@@ -12,13 +15,18 @@ Weft 的扩展原则是：
 
 > **已有语义扩展局部 target realization；新增可观察语义增加一个局部 primitive；永不为某个完整算子、模型格式或 kernel 名增加整段后端模板。**
 
-Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它与 Triton 的关键区别是：
+Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它与 Triton 的关键区别
+不是有没有 tile，而是 block 的 owner、control contract 与 lifetime：
 
 - Weft 没有 program grid、`program_id` 或隐式 launch identity；
-- Weft 的入口是一个普通 worker-local callable kernel；
+- Weft 的入口是一个由当前 worker 持续执行的普通 callable kernel，而不是 grid 中的一次性
+  program instance；
 - VLA region 的 strip 边界与 `vl` 在 source 中不可观察；
 - 跨 strip 的 reduce、scan、summary state 是一等语义；
-- logical block 只作为局部数据域和 structured primitive 的 operand，不是整个程序的根执行单元；
+- logical block 是普通 SSA value，由 worker control program 持有，可以跨 loop carry、多 use、
+  pointwise、state、memory 与 structured primitive 自然组合；
+- caller-provided external/persistent/workspace 与 compiler-private primitive temporary 具有互不
+  混淆的 ownership/lifetime；
 - RISC-V 的 V、矩阵、量化、重排及 vendor extension 在一次 primitive-local target lowering 中组合接入。
 
 
@@ -67,10 +75,10 @@ Weft 不负责：
 ### 一个 kernel、一种组合规则
 
 Weft kernel不是scalar、VLA、block、state与extension几种kernel的并集。它只有一个根模型：
-作者写下一个由普通region、typed SSA value、显式memory effect和局部semantic primitive组成的
-worker-local程序。Scalar control与VLA决定logical execution domain；scalar、block与region只是
-同一value system中的shape kind；load/store、state algebra、dot/matmul和extension primitive都
-消费这些value，并服从同一extent、validity、use-def与effect规则。
+作者写下一个由普通region、typed SSA value、显式storage/memory effect和局部semantic primitive
+组成的worker-local持续有序程序。Scalar control与VLA决定logical execution domain；scalar、
+block与region只是同一value system中的shape kind；load/store、state algebra、dot/matmul和
+extension primitive都消费这些value，并服从同一extent、validity、use-def与effect规则。
 
 这些构造彼此正交：一个ordered loop可以包含VLA，一个VLA可以产生block-bearing region value，
 一个dot可以位于其中，dot两侧也可以来自indexed memory；sequential state update可以在相邻处
@@ -78,7 +86,10 @@ worker-local程序。Scalar control与VLA决定logical execution domain；scalar
 
 ### Worker-local kernel
 
-一个 Weft kernel 是一个普通可调用函数。它接收显式 pointer / scalar / descriptor 参数，并在当前 worker 上完成一段工作。
+一个 Weft kernel 是一个普通可调用函数。它接收显式 pointer / scalar / descriptor 参数，并由
+当前 worker 从入口到返回持续执行。一次调用可以顺序遍历多个 cache/output block；block、
+accumulator、state 与 source-visible workspace 的 lifetime 不受某个 VLA strip 或 local primitive
+边界限制，而由作者写下的 lexical/control/storage relation 决定。
 
 ```text
 external runtime
@@ -120,7 +131,7 @@ Canonical Weft language 中不存在：
 - staging 与重算骨架；
 - outer K loop；
 - block 之间的顺序与状态；
-- memory effect 与 atomic/fence。
+- memory effect 及其顺序。
 
 普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器可以对它做保持语义的
 unroll、interchange、hoist、rematerialization、software pipelining 和局部 scheduling，
@@ -175,12 +186,21 @@ Logical block：
 
 - 是局部数据域；
 - 可以由 block axis、broadcast、load、reshape、transpose 和 pointwise 产生；
-- 可以作为 `W.dot`、`W.matmul`、block reduction、permute、decode 等 primitive 的 operand；
+- 是普通 SSA value，可以有多个 consumer，可以进入 pointwise、state、memory、control carry
+  或另一个 structured primitive；
+- 可以作为 `W.dot`、`W.matmul`、block reduction、transpose、decode 等 primitive 的 operand，
+  也可以是它们的 result；
+- 可以作为 `for` / `while` 的 accumulator 或 state 跨 logical iteration 存活；
 - 不等于 cache block；
 - 不等于 register microtile；
 - 不等于 IME fragment；
 - 不对应独立 worker、program instance 或 launch task；
 - 可以是编译器中的 lazy region value，不要求先物化为实际数组或寄存器集合。
+
+Structured primitive result 不能成为 fast-path terminal。`dot → add → store`、一个 result 的
+多个 consumer、`matmul → pointwise → store` 和 block/state loop carry 都服从普通 SSA
+composition。Target 若不能为合法 composition 建立 physical handoff，必须明确 unsupported；
+不得靠要求精确 producer/use closure 来改变语言语义。
 
 ### 组合形态
 
@@ -238,3 +258,32 @@ Weft 必须区分以下四层，不得混用同一个 `tile` 概念：
 例如某个矩阵扩展规定的 `4×4×8`、accumulator register class 或 encoded operand tile。
 
 它是具体扩展的硬件叶子，只存在于 target lowering 的瞬态状态与生成代码中，不进入通用 source block 类型。
+
+
+## Storage 与 lifetime
+
+作者可观察的 memory object 都由 caller 分配并作为 entry pointer 传入。语言固定三类
+source-visible storage：普通 external buffer/state、带显式 format identity 且跨调用复用的
+persistent object，以及当前 worker 在一次调用内独占并可跨 loop/primitive 复用的 workspace。
+Target 只可在 local primitive 内创建 source 不可观察的 primitive-private temporary。
+
+Weft 没有源级隐式 allocation；storage class、shape、alignment、alias 与 lifetime 的完整合同见
+[Storage ownership 与 lifetime](storage-and-lifetime.md)。这条边界保证 target 不会为了命中某个
+实现偷造 workspace ABI、persistent repack 或另一份算法 state。
+
+
+## GEMM 判据：不是 Triton-CPU 的另一层语法
+
+一个 blocked GEMM worker 的 source 必须显式拥有 M/N/K traversal、BM/BN/BK 的使用位置、
+operand block、accumulator、mask、staging、persistent packing 和 store。Accumulator 是普通
+block SSA value，由同一个 worker 持有并跨作者写下的 K loop 更新；这个 worker还可以在外围
+control 中继续处理下一个 M/N block。
+
+`W.matmul(lhs, rhs, init=acc)` 只授权当前 `[BM,BK] × [BK,BN] + [BM,BN]` local block
+product 的物理化。Realizer可以在该边界内选择 LMUL、register microtile、multiple
+accumulators、K-unroll、短生命周期 packing、pipeline 与 RVV/IME fragment；它不得创建 outer
+K loop、persistent repack、另一种 traversal 或新的 GEMM algorithm。
+
+Triton 的典型 program/CTA 围绕一个逻辑拥有的 result tile 组织 collective execution；Weft
+围绕一个 CPU worker 的持续 ordered control program 组织多个 block 及其 lifetime。两者都可
+使用 tile 和 autotuned block size，但 owner 与授权边界不同，这才是 Weft 独立的程序模型。

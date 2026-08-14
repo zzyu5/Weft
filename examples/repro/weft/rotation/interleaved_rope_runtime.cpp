@@ -7,10 +7,6 @@
 #include <riscv_vector.h>
 #include <vector>
 
-extern "C" void interleaved_rope_f32(
-    const float *, const float *, float *, std::size_t, std::size_t, std::size_t,
-    std::size_t, std::size_t);
-
 namespace {
 constexpr std::size_t kTokens = 128;
 constexpr std::size_t kHeads = 32;

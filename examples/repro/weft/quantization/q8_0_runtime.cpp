@@ -7,10 +7,6 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void quantize_q8_0(const float *x, std::int8_t *output,
-                              std::size_t block_begin,
-                              std::size_t block_end);
-
 namespace {
 
 constexpr std::size_t kRows = 128;

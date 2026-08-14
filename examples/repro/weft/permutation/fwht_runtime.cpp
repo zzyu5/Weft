@@ -6,9 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void fwht_f32(float *data, std::size_t batches,
-                          std::size_t extent, std::size_t stages);
-
 namespace {
 
 constexpr std::size_t kBatches = 1024;

@@ -38,10 +38,10 @@ class HelperDefinition:
     def __init__(self, function: Callable[..., object], effects: tuple[str, ...]) -> None:
         if not isinstance(function, FunctionType):
             raise DefinitionError("Weft helpers must decorate a Python function")
-        allowed = {"read", "write", "atomic", "fence"}
+        allowed = {"read", "write"}
         if any(effect not in allowed for effect in effects):
             raise DefinitionError(
-                "helper effects must be read, write, atomic, or fence"
+                "helper effects must be read or write"
             )
         self.python_function = function
         self.effects = python_builtins.tuple(dict.fromkeys(effects))
@@ -84,12 +84,8 @@ vla = _intrinsic("vla")
 select = _intrinsic("select")
 load = _intrinsic("load")
 store = _intrinsic("store")
+storage = _intrinsic("storage")
 sort_indices = _intrinsic("sort_indices")
-prefetch = _intrinsic("prefetch")
-atomic_add = _intrinsic("atomic_add")
-fence = _intrinsic("fence")
-valid = _intrinsic("valid")
-fill = _intrinsic("fill")
 block_axis = _intrinsic("block_axis")
 full = _intrinsic("full")
 zeros = _intrinsic("zeros")
@@ -103,10 +99,8 @@ argmax = _intrinsic("argmax")
 online_softmax_summary = _intrinsic("online_softmax_summary")
 dot = _intrinsic("dot")
 matmul = _intrinsic("matmul")
-permute = _intrinsic("permute")
 lookup = _intrinsic("lookup")
 decode = _intrinsic("decode")
-widen = _intrinsic("widen")
 narrow = _intrinsic("narrow")
 cast = _intrinsic("cast")
 bitcast = _intrinsic("bitcast")

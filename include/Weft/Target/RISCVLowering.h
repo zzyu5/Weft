@@ -33,6 +33,10 @@ mlir::LogicalResult lowerToRISCVIntrinsicC(
     mlir::ModuleOp module, const RISCVLoweringOptions &options,
     llvm::raw_ostream &output);
 
+mlir::LogicalResult emitRISCVArtifactHeader(
+    mlir::ModuleOp module, const RISCVLoweringOptions &options,
+    llvm::raw_ostream &output);
+
 } // namespace weft
 
 #endif // WEFT_TARGET_RISCVLOWERING_H

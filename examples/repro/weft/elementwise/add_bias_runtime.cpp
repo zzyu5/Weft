@@ -2,13 +2,6 @@
 #include <cstddef>
 #include <cstdio>
 
-extern "C" void add_bias(
-    float *x,
-    float *bias,
-    float *y,
-    std::size_t begin,
-    std::size_t end);
-
 int main() {
   constexpr std::size_t count = 16;
   constexpr std::size_t begin = 3;

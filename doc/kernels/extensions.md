@@ -42,7 +42,7 @@ zero-point operand。对于 `p = half * 8 + lane`，low/high nibble分别乘
 `activation[half * 16 + lane]` 与 `activation[half * 16 + lane + 8]`；结果乘显式
 `activation_scale * weight_scale[n]` 后加到 `init[n]`。
 
-Q4_0 persistent block是否采用288-byte N16×K32 layout、当前block地址以及K recurrence仍由
+Q4_0 persistent block是否采用288-byte N16×K32 format、当前block地址以及K recurrence仍由
 source表达。SpacemiT IME1 lowering只把一次该primitive实现成local N16×K32 asm fragment，
 不拥有activation quantize、outer loop或kernel ABI。
 
@@ -116,7 +116,7 @@ VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 r
 
 - 存在普通canonical primitive无法无差别表达的observable local semantics；
 - operands/results足以独立定义该语义，不依赖kernel symbol或whole-kernel shape；
-- public ABI、persistent layout、outer loop、staging与cross-primitive state仍在Kernel IR；
+- public ABI、persistent format、outer loop、staging与cross-primitive state仍在Kernel IR；
 - target可以为同一op提供多个local realization，不需要复制完整operator emitter。
 
 若新硬件只更快实现已有 `W.dot`、`W.matmul`、`W.reduce` 或memory semantics，应只增加target-local

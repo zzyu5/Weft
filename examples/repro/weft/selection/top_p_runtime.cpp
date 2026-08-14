@@ -7,12 +7,6 @@
 #include <numeric>
 #include <vector>
 
-extern "C" void top_p_nucleus_f32(
-    const float *probabilities, std::uint32_t *sorted_indices,
-    float *sorted_probabilities, const float *uniforms,
-    std::uint32_t *nucleus_count, std::uint32_t *sampled_tokens,
-    std::size_t rows, std::size_t vocabulary, float threshold);
-
 namespace {
 
 constexpr std::size_t kRows = 64;

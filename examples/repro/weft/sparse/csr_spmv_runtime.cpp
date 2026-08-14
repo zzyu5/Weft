@@ -6,12 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void csr_spmv_f32(const std::uint32_t *row_offsets,
-                              const std::uint32_t *column_indices,
-                              const float *values, const float *vector,
-                              float *output, std::size_t row_begin,
-                              std::size_t row_end);
-
 namespace {
 
 constexpr std::size_t kRows = 65536;

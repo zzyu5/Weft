@@ -7,11 +7,6 @@
 #include <cstdlib>
 #include <vector>
 
-extern "C" void transpose_f32(const float *source, float *destination,
-                               std::size_t rows, std::size_t columns,
-                               std::size_t source_stride,
-                               std::size_t destination_stride);
-
 namespace {
 
 constexpr std::size_t kRows = 128;

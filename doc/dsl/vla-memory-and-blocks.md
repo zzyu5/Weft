@@ -53,8 +53,7 @@ VLA region body 不得任意修改外层 scalar / block state。
 - `W.reduce`；
 - `W.scan`；
 - 显式typed summary primitive；
-- effectful memory operation；
-- atomic operation。
+- 满足 lane independence 的 effectful memory operation。
 
 任意依赖上一逻辑元素的 recurrence 必须写成有序 scalar loop，或使用显式 `W.scan`。这样可以防止 source 行为依赖编译器选择的 strip 边界。
 
@@ -64,11 +63,12 @@ VLA region body 不得任意修改外层 scalar / block state。
 
 ### VLA effect independence
 
-非 atomic 的 VLA memory effect 必须满足 lane independence：
+VLA memory effect 必须满足 lane independence：
 
 - 两个 active logical indices 不得写同一地址；
 - 一个 iteration 不得依赖另一个 active iteration 写入的结果；
-- 若存在可能冲突，作者必须使用 atomic、scalar loop 或显式 ordered primitive。
+- 若存在可能冲突，作者必须使用 scalar ordered loop；当前 core surface 不提供 atomic VLA
+  effect。未来只有在定义完整可观察 ordering/effect 语义后，才能增加相应 local primitive。
 
 该性质一般无法完全静态证明，属于作者义务；编译器可以利用 noalias、affine pointer 和 effect analysis 尽量检查。
 
@@ -121,10 +121,11 @@ Masked value 只能：
 
 - 由 validity-aware structured primitive 消费；
 - 由 masked store 消费；
-- 通过 `W.fill(masked, value)` 转成普通 value；
-- 通过 `W.valid(masked)` 取出逻辑 predicate。
+- 继续经过会传播相同 logical validity 的 pointwise chain。
 
-禁止将未填充 masked value 作为普通 scalar / block value逃逸到不理解 validity 的 op。
+禁止将未填充 masked value 作为普通 scalar / block value逃逸到不理解 validity 的 op。普通
+consumer需要 filled value 时，作者必须在原始 `W.load` 提供 `other`，或用显式 predicate 与
+`W.select` 构造普通 value；语言不提供从 masked value 事后猜回 predicate/fill 的第二套 API。
 
 ### Consumer-specific invalid semantics
 
@@ -135,7 +136,7 @@ Masked value 只能：
 | typed summary | 由该primitive自身定义 |
 | dot / matmul | 不贡献，等价于乘加域的语义零元素 |
 | scan | 默认作为 identity；segment boundary 必须使用独立 `segment_start` |
-| ordinary sequential carry | 作者必须显式分支或 fill，compiler 不猜 |
+| ordinary sequential carry | 作者必须在 producer 处显式提供 filled value，compiler 不猜 |
 
 对于量化/编码operand，局部dot primitive的“语义零”不一定是物理bit pattern `0`。Target lowering必须根据primitive语义处理。
 
@@ -167,7 +168,7 @@ Target lowering 决定：
 - scalar、unit-stride、strided、indexed 或 segment memory；
 - vector grouping；
 - mask realization；
-- prefetch instruction；
+- source 不可观察的 physical prefetch instruction/schedule；
 - local address strength reduction。
 
 若access或predicate位于VLA内的nested scalar control中，target仍按每个实体的pointer、
@@ -181,9 +182,6 @@ lane relation、predicate与effect选择memory realization。该physical scan只
 ```python
 W.load(ptr, *, where=True, other=W.invalid, alignment=None)
 W.store(ptr, value, *, where=True, alignment=None)
-W.prefetch(ptr, *, where=True, locality="default")
-W.atomic_add(ptr, value, *, where=True, order="relaxed")
-W.fence(order="acq_rel")
 ```
 
 `alignment` 是 source assertion，不是 physical layout 选择。
@@ -260,3 +258,8 @@ m = W.block_axis(BM)
 k = W.block_axis(BK)
 a_blk = W.load(a + (m0 + m[:, None]) * lda + (k0 + k[None, :]), where=...)
 ```
+
+Block load、pointwise、state 与 structured primitive 的结果都进入同一普通 SSA value system。
+Block value可以有多个consumer，也可作为`for`/`while` carry跨iteration存活；它不必立即被某个
+primitive消费或store。Target负责合法的register/memory handoff，但不得要求一个固定terminal
+use closure来重新定义 source legality。

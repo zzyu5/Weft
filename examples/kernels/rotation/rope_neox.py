@@ -7,7 +7,7 @@ def rope_neox_f32(
     source: W.ptr[W.f32, W.readonly, W.noalias],
     positions: W.ptr[W.i32, W.readonly, W.noalias],
     destination: W.ptr[W.f32, W.writeonly, W.noalias],
-    angle_cache: W.ptr[W.f32, W.noalias],
+    angle_cache: W.ptr[W.f32, W.workspace, W.noalias],
     tokens: W.index,
     heads: W.index,
     half_dimension: W.index,
@@ -15,6 +15,8 @@ def rope_neox_f32(
     token_stride: W.index,
     theta_scale: W.f32,
 ) -> None:
+    W.storage(angle_cache, (2, half_dimension))
+
     for token in W.range(0, tokens):
         theta = W.cast(
             W.load(positions + token, other=W.i32(0)), W.f32

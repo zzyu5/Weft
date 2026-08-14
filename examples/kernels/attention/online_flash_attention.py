@@ -9,8 +9,8 @@ def online_flash_attention_f32_f16(
     value: W.ptr[W.f16, W.readonly, W.noalias],
     mask: W.ptr[W.f16, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    query_scratch: W.ptr[W.f16, W.noalias],
-    accumulator_scratch: W.ptr[W.f16, W.noalias],
+    query_scratch: W.ptr[W.f16, W.workspace, W.noalias],
+    accumulator_scratch: W.ptr[W.f16, W.workspace, W.noalias],
     head_begin: W.index,
     head_end: W.index,
     queries: W.index,
@@ -19,6 +19,8 @@ def online_flash_attention_f32_f16(
     group_size: W.index,
     scale: W.f32,
 ) -> None:
+    W.storage(query_scratch, shape=(head_dimension,))
+    W.storage(accumulator_scratch, shape=(head_dimension,))
     for query_head in W.range(head_begin, head_end):
         key_value_head = query_head // group_size
         query_head_offset = query_head * queries * head_dimension

@@ -6,6 +6,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -337,23 +338,14 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
   if (auto transpose = mlir::dyn_cast<TransposeOp>(definition))
     return deriveExtentImpl(transpose.getInput(), transpose.getPermutation()[axis],
                             visited);
-  if (auto permute = mlir::dyn_cast<PermuteOp>(definition))
-    return deriveExtentImpl(permute.getInput(), permute.getPermutation()[axis],
-                            visited);
   if (auto unary = mlir::dyn_cast<UnaryOp>(definition))
     return deriveExtentImpl(unary.getInput(), axis, visited);
   if (auto cast = mlir::dyn_cast<CastOp>(definition))
     return deriveExtentImpl(cast.getInput(), axis, visited);
   if (auto bitcast = mlir::dyn_cast<BitcastOp>(definition))
     return deriveExtentImpl(bitcast.getInput(), axis, visited);
-  if (auto widen = mlir::dyn_cast<WidenOp>(definition))
-    return deriveExtentImpl(widen.getInput(), axis, visited);
   if (auto narrow = mlir::dyn_cast<NarrowOp>(definition))
     return deriveExtentImpl(narrow.getInput(), axis, visited);
-  if (auto valid = mlir::dyn_cast<ValidOp>(definition))
-    return deriveExtentImpl(valid.getInput(), axis, visited);
-  if (auto fill = mlir::dyn_cast<FillOp>(definition))
-    return deriveExtentImpl(fill.getInput(), axis, visited);
   if (auto load = mlir::dyn_cast<LoadOp>(definition))
     return deriveExtentImpl(load.getPointer(), axis, visited);
   if (auto scan = mlir::dyn_cast<ScanOp>(definition))
@@ -454,12 +446,6 @@ bool validRounding(llvm::StringRef mode) {
       .Default(false);
 }
 
-bool validAtomicOrder(llvm::StringRef order) {
-  return llvm::StringSwitch<bool>(order)
-      .Cases("relaxed", "acquire", "release", "acq_rel", "seq_cst", true)
-      .Default(false);
-}
-
 } // namespace
 
 mlir::Type weft::kernel::unwrapLogicalValidity(mlir::Type type) {
@@ -521,7 +507,8 @@ bool weft::kernel::haveSameLogicalExtent(mlir::Value lhs, int64_t lhsAxis,
 mlir::LogicalResult PtrType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     mlir::Type elementType, llvm::StringRef addressSpace,
-    llvm::StringRef access, bool, int64_t alignment, bool) {
+    llvm::StringRef access, bool noAlias, int64_t alignment, bool,
+    llvm::StringRef storageClass, llvm::StringRef storageFormat) {
   if (!isScalarType(elementType) || elementType.isIndex())
     return emitError() << "pointer element type must be a non-index scalar";
   if (addressSpace.empty())
@@ -531,6 +518,29 @@ mlir::LogicalResult PtrType::verify(
   if (alignment < 0 ||
       (alignment != 0 && !llvm::isPowerOf2_64(static_cast<uint64_t>(alignment))))
     return emitError() << "pointer alignment must be zero or a power of two";
+  if (storageClass != "external" && storageClass != "persistent" &&
+      storageClass != "workspace")
+    return emitError()
+           << "pointer storage class must be external, persistent, or workspace";
+  if (storageClass == "persistent") {
+    if (storageFormat.empty())
+      return emitError() << "persistent pointer requires a storage format identity";
+    for (unsigned char character : storageFormat) {
+      bool alphaNumeric =
+          (character >= 'a' && character <= 'z') ||
+          (character >= 'A' && character <= 'Z') ||
+          (character >= '0' && character <= '9');
+      if (!alphaNumeric && character != '_' && character != '-' &&
+          character != '.')
+        return emitError()
+               << "persistent storage format identity contains an unsupported character";
+    }
+  } else if (!storageFormat.empty()) {
+    return emitError()
+           << "only persistent pointers may carry a storage format identity";
+  }
+  if (storageClass == "workspace" && !noAlias)
+    return emitError() << "workspace pointer must be noalias";
   return mlir::success();
 }
 
@@ -594,6 +604,16 @@ mlir::LogicalResult KernelOp::verify() {
       getArgKinds().size() != entry.getNumArguments())
     return emitOpError("arg_names and arg_kinds must match entry arguments");
   llvm::DenseSet<llvm::StringRef> seen;
+  llvm::DenseMap<mlir::Value, StorageOp> storageContracts;
+  for (StorageOp storage : entry.getOps<StorageOp>()) {
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(storage.getPointer());
+    if (!argument || argument.getOwner() != &entry)
+      return storage.emitOpError(
+          "storage contract must bind one kernel entry pointer directly");
+    if (!storageContracts.try_emplace(argument, storage).second)
+      return storage.emitOpError(
+          "one entry pointer cannot have multiple storage contracts");
+  }
   for (auto [nameAttr, kindAttr, argument] :
        llvm::zip(getArgNames(), getArgKinds(), entry.getArguments())) {
     auto name = mlir::dyn_cast<mlir::StringAttr>(nameAttr);
@@ -610,6 +630,15 @@ mlir::LogicalResult KernelOp::verify() {
                      : false;
     if (!valid)
       return emitOpError("argument kind is incompatible with its canonical type");
+    if (auto pointer = mlir::dyn_cast<PtrType>(type)) {
+      bool requiresContract = pointer.getStorageClass() != "external";
+      bool hasContract = storageContracts.contains(argument);
+      if (requiresContract != hasContract)
+        return emitOpError(
+            requiresContract
+                ? "persistent/workspace pointer requires one storage contract"
+                : "external pointer cannot have a storage contract");
+    }
   }
   if (!mlir::isa<ReturnOp>(entry.getTerminator()))
     return emitOpError("entry must terminate with weft_kernel.return");
@@ -623,6 +652,30 @@ mlir::LogicalResult KernelOp::verify() {
   } else if (returnOp.getValues().size() != 1 ||
              returnOp.getValues().front().getType() != returnType) {
     return emitOpError("kernel return must match return_type");
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult StorageOp::verify() {
+  if (mlir::failed(requireKernelAncestor(getOperation())))
+    return mlir::failure();
+  if (!mlir::isa<KernelOp>(getOperation()->getBlock()->getParentOp()))
+    return emitOpError("storage contract must be in the kernel entry block");
+  PtrType pointer = mlir::cast<PtrType>(getPointer().getType());
+  if (pointer.getStorageClass() == "external")
+    return emitOpError(
+        "external pointer range is defined by the public ABI and memory uses");
+  if (getShape().empty() || getShape().size() != getExtents().size())
+    return emitOpError("storage shape and extent count must be equal and nonzero");
+  for (auto [dimension, extent] : llvm::zip(getShape(), getExtents())) {
+    if (dimension != -1 && dimension <= 0)
+      return emitOpError("storage dimensions must be positive or -1");
+    std::optional<int64_t> constant = constantIndex(extent);
+    if (constant && *constant <= 0)
+      return emitOpError("storage extent constants must be positive");
+    if (dimension > 0 && (!constant || *constant != dimension))
+      return emitOpError(
+          "static storage dimension must match its constant extent operand");
   }
   return mlir::success();
 }
@@ -1022,58 +1075,6 @@ mlir::LogicalResult SortIndicesOp::verify() {
   return mlir::success();
 }
 
-mlir::LogicalResult PrefetchOp::verify() {
-  if (!isPointerValue(getPointer().getType()) ||
-      !isPredicateType(getWhere().getType()))
-    return emitOpError("prefetch requires a pointer and predicate");
-  if (!llvm::StringSwitch<bool>(getLocality())
-           .Cases("default", "low", "moderate", "high", true)
-           .Default(false))
-    return emitOpError("unsupported locality");
-  if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getPointer(),
-                                   "where")))
-    return mlir::failure();
-  return mlir::success();
-}
-
-mlir::LogicalResult AtomicAddOp::verify() {
-  if (!isPointerValue(getPointer().getType()) ||
-      elementTypeOf(getValue().getType()) != pointerTypeOf(getPointer().getType()).getElementType() ||
-      !isPredicateType(getWhere().getType()) ||
-      elementTypeOf(getResult().getType()) != elementTypeOf(getValue().getType()) ||
-      !validAtomicOrder(getOrder()))
-    return emitOpError("invalid atomic_add types or memory order");
-  if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getPointer(),
-                                   "where")) ||
-      mlir::failed(verifyFootprint(getOperation(), getValue(), getPointer(),
-                                   "value")))
-    return mlir::failure();
-  return mlir::success();
-}
-
-mlir::LogicalResult FenceOp::verify() {
-  if (!validAtomicOrder(getOrder()) || getOrder() == "relaxed")
-    return emitOpError("fence order must be acquire, release, acq_rel, or seq_cst");
-  return mlir::success();
-}
-
-mlir::LogicalResult ValidOp::verify() {
-  mlir::Type value = getInput().getType().getValueType();
-  mlir::Type result = getResult().getType();
-  if (!isPredicateType(result) || shapeKindOf(value) != shapeKindOf(result) ||
-      staticShapeOf(value) != staticShapeOf(result))
-    return emitOpError("valid must return an i1 predicate over the same shape");
-  return mlir::success();
-}
-
-mlir::LogicalResult FillOp::verify() {
-  mlir::Type value = getInput().getType().getValueType();
-  if (getResult().getType() != value ||
-      elementTypeOf(getFillValue().getType()) != elementTypeOf(value))
-    return emitOpError("fill must remove validity without changing value type");
-  return mlir::success();
-}
-
 static mlir::Type stateInputType(mlir::Type type) {
   return unwrapMasked(type);
 }
@@ -1246,11 +1247,6 @@ mlir::LogicalResult MatmulOp::verify() {
                              outputShape, ShapeKind::Block, 1, 0);
 }
 
-mlir::LogicalResult PermuteOp::verify() {
-  return verifyPermutation(getOperation(), getInput(), getResult(),
-                           getPermutation());
-}
-
 mlir::LogicalResult LookupOp::verify() {
   if (!mlir::isa<BlockType>(unwrapMasked(getTable().getType())) ||
       !isIntegerLike(elementTypeOf(getIndices().getType())) ||
@@ -1275,16 +1271,6 @@ mlir::LogicalResult DecodeOp::verify() {
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getCodes(),
                                    "where")))
     return mlir::failure();
-  return mlir::success();
-}
-
-mlir::LogicalResult WidenOp::verify() {
-  if (!isPointwiseValueType(getInput().getType()) ||
-      !isPointwiseValueType(getResult().getType()) ||
-      shapeKindOf(getInput().getType()) != shapeKindOf(getResult().getType()) ||
-      staticShapeOf(getInput().getType()) != staticShapeOf(getResult().getType()) ||
-      isMasked(getInput().getType()) != isMasked(getResult().getType()))
-    return emitOpError("widen must preserve shape and validity");
   return mlir::success();
 }
 

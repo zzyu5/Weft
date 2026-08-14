@@ -21,6 +21,8 @@ llvm::cl::opt<std::string> inputFilename(
     llvm::cl::init("-"));
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
+llvm::cl::opt<std::string> headerFilename(
+    "header", llvm::cl::desc("Generated public C header path"));
 llvm::cl::opt<std::string> emitKind(
     "emit", llvm::cl::desc("kernel-ir or intrinsic-c"),
     llvm::cl::init("intrinsic-c"));
@@ -88,6 +90,17 @@ int main(int argc, char **argv) {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
   }
+  if (emitKind == "intrinsic-c" &&
+      (headerFilename.empty() || headerFilename == "-" ||
+       headerFilename == outputFilename)) {
+    llvm::errs()
+        << "--emit=intrinsic-c requires a distinct file path in --header\n";
+    return 1;
+  }
+  if (emitKind == "kernel-ir" && !headerFilename.empty()) {
+    llvm::errs() << "--header is valid only with --emit=intrinsic-c\n";
+    return 1;
+  }
 
   auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(inputFilename);
   if (!buffer) {
@@ -134,10 +147,21 @@ int main(int argc, char **argv) {
     options.backend.f16RowMicrotile = f16RowMicrotile;
     options.backend.narrowLMUL = narrowLMUL;
     options.backend.sortRadixBits = sortRadixBits;
+    std::error_code headerError;
+    llvm::ToolOutputFile header(headerFilename, headerError,
+                                llvm::sys::fs::OF_Text);
+    if (headerError) {
+      llvm::errs() << "cannot open header output: " << headerError.message()
+                   << "\n";
+      return 1;
+    }
     if (!parseMetaBindings(options.metaBindings) ||
         mlir::failed(
-            weft::lowerToRISCVIntrinsicC(*module, options, output.os())))
+            weft::lowerToRISCVIntrinsicC(*module, options, output.os())) ||
+        mlir::failed(
+            weft::emitRISCVArtifactHeader(*module, options, header.os())))
       return 1;
+    header.keep();
   } else {
     module->print(output.os());
     output.os() << '\n';

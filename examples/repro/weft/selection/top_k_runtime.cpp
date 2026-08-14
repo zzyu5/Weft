@@ -5,16 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void top_k_f32(const float *scores, std::uint32_t *indices,
-                          std::size_t row_begin, std::size_t row_end,
-                          std::size_t columns, std::size_t k,
-                          std::size_t score_stride,
-                          std::size_t index_stride);
-extern "C" void top_k_f32_equivalent(
-    const float *scores, std::uint32_t *indices, std::size_t row_begin,
-    std::size_t row_end, std::size_t columns, std::size_t k,
-    std::size_t score_stride, std::size_t index_stride);
-
 namespace {
 
 constexpr std::size_t kTokens = 512;

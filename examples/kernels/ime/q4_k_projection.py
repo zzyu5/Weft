@@ -7,10 +7,12 @@ from examples.kernels.quantization.ggml_k import load_f16_le
 @weft.kernel
 def q4_k_projection_ime(
     activation: W.ptr[W.f32, W.readonly, W.noalias],
-    packed_weight: W.ptr[W.u8, W.readonly, W.noalias],
+    packed_weight: W.ptr[
+        W.u8, W.persistent("q4_k_n16_k32_304b"), W.readonly, W.noalias
+    ],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    activation_scale: W.ptr[W.f32, W.noalias],
-    activation_code: W.ptr[W.i8, W.noalias],
+    activation_scale: W.ptr[W.f32, W.workspace, W.noalias],
+    activation_code: W.ptr[W.i8, W.workspace, W.noalias],
     row_begin: W.index,
     row_end: W.index,
     columns: W.index,
@@ -19,6 +21,12 @@ def q4_k_projection_ime(
     block_extent = W.index(32)
     packed_column_extent = W.index(16)
     blocks = inner // block_extent
+    W.storage(
+        packed_weight,
+        shape=(columns // packed_column_extent, blocks, 304),
+    )
+    W.storage(activation_scale, shape=(row_end, blocks))
+    W.storage(activation_code, shape=(row_end, inner))
 
     for row in W.range(row_begin, row_end):
         activation_row = activation + row * inner

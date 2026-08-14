@@ -6,21 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void roi_align_f32(
-    const float *source, const float *boxes,
-    const std::uint32_t *batch_indices, float *output, std::size_t box_begin,
-    std::size_t box_end, std::size_t input_height, std::size_t input_width,
-    std::size_t channels, std::size_t pooled_height,
-    std::size_t pooled_width, std::size_t samples_y, std::size_t samples_x,
-    float spatial_scale);
-extern "C" void roi_align_f32_equivalent(
-    const float *source, const float *boxes,
-    const std::uint32_t *batch_indices, float *output, std::size_t box_begin,
-    std::size_t box_end, std::size_t input_height, std::size_t input_width,
-    std::size_t channels, std::size_t pooled_height,
-    std::size_t pooled_width, std::size_t samples_y, std::size_t samples_x,
-    float spatial_scale);
-
 namespace {
 
 constexpr std::size_t kBatch = 2;

@@ -9,7 +9,8 @@
 --emit=intrinsic-c
 ```
 
-`kernel-ir` 打印canonical module；`intrinsic-c` 直接调用RISC-V target lowering。Target参数是
+`kernel-ir` 打印canonical module；`intrinsic-c` 直接调用RISC-V target lowering，并要求
+`--header=<path>`在同一次调用中生成public C header。Target参数是
 `--march`、`--abi`、`--vlen-bits`、`--matrix-extension`，source meta通过
 `--meta=NAME=INTEGER`绑定。不存在selected IR、physical-plan输入、provider front door或
 legacy emitter。
@@ -34,8 +35,8 @@ Target lowering可以决定：
 - VLA的dynamic `vl` mechanics、SEW、LMUL与unroll；
 - unit-stride、strided、indexed、segment或scalar memory realization；
 - reduction tree、widening accumulator与跨strip physical state；
-- contract的register microtile、K-unroll、fragment与短生命周期packing；
-- decode、lookup、repack与contract的local fusion；
+- dot/matmul的register microtile、K-unroll、fragment与短生命周期packing；
+- decode、lookup、repack与dot/matmul的local fusion；
 - RVV intrinsic、IME或vendor-extension inline asm leaf；
 - backend config显式绑定或target内部唯一合法的物理参数。
 
@@ -59,7 +60,8 @@ Target lowering可以决定：
   inline asm；
 - generated kernel不得出现`std::vector`、dynamic tensor wrapper、逐元素临时容器或C++
   runtime；
-- local stack/scratch只在target明确选择且资源合法时存在。
+- compiler-private local stack/temporary只在target为一个local primitive明确选择且资源合法时
+  存在；source-declared workspace绝不是这类temporary。
 
 一个typed leaf可以展开为多条目标指令，包括setup、decode、fragment operation和accumulator
 update；inline asm边界由semantic primitive决定，不以“一条指令”计数。它不能接管完整
@@ -71,16 +73,16 @@ System C compiler与archiver从同一份generated source继续形成普通artifa
 
 ```text
 canonical Weft Kernel IR
-→ readable intrinsic C / necessary inline asm
+→ readable intrinsic C / necessary inline asm + generated public C header
 → relocatable object
 → optional static library
-→ application-owned C declaration/header
 ```
 
-Object、archive与header不是新的compiler IR stage。当前 `weft-compile` CLI止于Kernel IR或
-intrinsic C；`examples/run/weft.sh` 展示的是build层继续调用target system compiler并形成
-executable的真实路径。Application可以从source-defined ABI维护普通declaration；不得让
-header反向成为第二份kernel semantics。
+Object、archive与header不是新的compiler IR stage。`weft-compile --emit=intrinsic-c`同时生成
+C translation unit与header；`examples/run/weft.sh`展示build层继续调用target system compiler并
+形成executable的真实路径。Generated C和caller runtime都消费这份header，使definition与call
+site使用同一个ABI投影。Header由canonical IR投影，application不得手写另一份相互漂移的
+entry/storage contract，也不得让header反向成为第二份kernel semantics。
 
 ## Runtime ABI
 
@@ -98,6 +100,12 @@ void rms_norm_worker(
 ```
 
 Weft artifact不创建线程。外部runtime负责worker ranges、thread pool、affinity与多核调度。
+
+所有source-visible storage都是caller-provided pointer参数。Generated header对每个pointer记录
+storage class、persistent format、minimum alignment与noalias/restrict；对persistent/workspace另外生成
+rank、逐维extent与element-count query。Caller必须在调用前分配满足这些query和pointer facts的
+object。Workspace由当前worker在一次invocation内独占，但可由作者代码跨loop/primitive复用；
+primitive-private temporary不进入header或ABI。
 
 ## Multiversion
 

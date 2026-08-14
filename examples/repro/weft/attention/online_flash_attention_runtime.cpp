@@ -7,13 +7,6 @@
 #include <cstdlib>
 #include <vector>
 
-extern "C" void online_flash_attention_f32_f16(
-    const float *query, const std::uint16_t *key, const std::uint16_t *value,
-    const std::uint16_t *mask, float *output, std::uint16_t *query_scratch,
-    std::uint16_t *accumulator_scratch, std::size_t head_begin,
-    std::size_t head_end, std::size_t queries, std::size_t keys,
-    std::size_t head_dimension, std::size_t group_size, float scale);
-
 namespace {
 
 constexpr std::size_t kQueryHeads = 32;

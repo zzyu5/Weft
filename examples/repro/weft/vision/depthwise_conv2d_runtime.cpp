@@ -6,15 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void depthwise_conv2d_f32(
-    const float *source, const float *weight, float *output,
-    std::size_t batch, std::size_t input_height, std::size_t input_width,
-    std::size_t channels, std::size_t output_height,
-    std::size_t output_width, std::size_t kernel_height,
-    std::size_t kernel_width, std::size_t stride_y, std::size_t stride_x,
-    std::size_t padding_y, std::size_t padding_x, std::size_t dilation_y,
-    std::size_t dilation_x);
-
 namespace {
 
 constexpr std::size_t kBatch = 1;

@@ -5,9 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void group_norm_f32(
-    const float *, float *, size_t, size_t, size_t, size_t, size_t, float);
-
 static double median(std::vector<double> values) {
   std::sort(values.begin(), values.end());
   return values[values.size() / 2];

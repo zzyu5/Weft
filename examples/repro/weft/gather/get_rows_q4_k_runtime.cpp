@@ -8,13 +8,6 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void get_rows_q4_k(const std::uint8_t *packed_rows,
-                               const std::int32_t *row_indices, float *output,
-                               std::size_t tokens,
-                               std::size_t blocks_per_row,
-                               std::size_t row_stride_bytes,
-                               std::size_t output_stride);
-
 namespace {
 
 constexpr std::size_t kVocabulary = 128256;

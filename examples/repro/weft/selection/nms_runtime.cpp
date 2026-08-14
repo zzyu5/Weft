@@ -7,13 +7,6 @@
 #include <limits>
 #include <vector>
 
-extern "C" void greedy_nms_f32(const float *boxes, const float *scores,
-                                std::uint8_t *suppressed,
-                                std::uint32_t *selected,
-                                std::size_t candidates,
-                                std::size_t maximum_selected,
-                                float iou_threshold);
-
 namespace {
 
 constexpr std::size_t kCandidates = 4096;

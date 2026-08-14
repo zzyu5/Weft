@@ -22,13 +22,14 @@ Tuning 不形成新 IR、不向 target lowering 插入第二份 legality，也�
 
 ### Source structural knobs
 
-例如 `BM/BN/BK`、显式prefetch distance、staging depth和算法variant。它们的存在与使用
+例如 `BM/BN/BK`、staging depth和算法variant。它们的存在与使用
 位置属于source，候选值由build specification绑定；当前CLI通过 `--meta=NAME=INTEGER`
 materialize source meta。
 
 ### Backend physical config
 
-例如LMUL、register microtile、unroll、fragment、local packing与instruction family。Target
+例如LMUL、register microtile、unroll、physical prefetch、pipeline、fragment、local packing与
+instruction family。Target
 lowering定义合法值和资源关系；没有external knob时可以选择唯一合法配置。若将这些候选
 暴露给build loop，必须是显式backend config，不能伪装成source meta或新的IR。
 

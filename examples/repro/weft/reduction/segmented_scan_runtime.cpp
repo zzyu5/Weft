@@ -6,13 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void segmented_inclusive_scan_f32(
-    const float *values, const std::uint8_t *segment_starts, float *output,
-    std::size_t begin, std::size_t end);
-extern "C" void segmented_inclusive_scan_f32_equivalent(
-    const float *values, const std::uint8_t *segment_starts, float *output,
-    std::size_t begin, std::size_t end);
-
 namespace {
 
 constexpr std::size_t kElements = 4U * 1024U * 1024U;

@@ -6,12 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void codebook_lookup_affine_f32(
-    const std::uint8_t *, const float *, const float *, const float *, float *,
-    std::size_t);
-extern "C" void codebook_lookup_affine_f32_equivalent(
-    const std::uint8_t *, const float *, const float *, const float *, float *,
-    std::size_t);
 namespace {
 constexpr std::size_t kElements = 1U << 20U;
 constexpr std::size_t kEvictionBytes = 64U << 20U;

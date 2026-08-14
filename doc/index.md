@@ -5,23 +5,25 @@
 
 它定义 Weft 最终成品的目标状态；与旧设计、历史材料或实现注释冲突时，以这里为准。
 
-Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写完整的 worker-local
-算法，编译器补全 source 不可观察的 VLA、寄存器、指令与扩展 realization。
+Weft 是一门面向单个 RISC-V worker/hart 的 AOT kernel DSL：作者写一份持续执行的
+core-local blocked program，显式拥有 ordered control、block/state 与 source-visible storage
+生命周期；编译器只补全 source 不可观察的 VLA、寄存器、指令与局部扩展 realization。
 
 ## 阅读顺序
 
 1. [语言定位与程序模型](dsl/model.md)
 2. [Python eDSL 与控制流](dsl/python.md)
-3. [VLA、predicate、memory 与 logical block](dsl/vla-memory-and-blocks.md)
-4. [Contraction 与 state algebra](dsl/structured-compute.md)
-5. [数值语义](dsl/numerics.md)
-6. [Python DSL API 索引](dsl/api.md)
-7. [编译器总架构](compiler/architecture.md)
-8. [Canonical Kernel IR](compiler/kernel-ir.md)
-9. [RISC-V target lowering](compiler/target-lowering.md)
-10. [Lowering、工具与 artifact](compiler/lowering-and-artifacts.md)
-11. [构建期 tuning](compiler/tuning.md)
-12. [Legality 与错误边界](compiler/verification.md)
+3. [Storage ownership 与 lifetime](dsl/storage-and-lifetime.md)
+4. [VLA、predicate、memory 与 logical block](dsl/vla-memory-and-blocks.md)
+5. [Dot、Matmul 与 state algebra](dsl/structured-compute.md)
+6. [数值语义](dsl/numerics.md)
+7. [Python DSL API 索引](dsl/api.md)
+8. [编译器总架构](compiler/architecture.md)
+9. [Canonical Kernel IR](compiler/kernel-ir.md)
+10. [RISC-V target lowering](compiler/target-lowering.md)
+11. [Lowering、工具与 artifact](compiler/lowering-and-artifacts.md)
+12. [构建期 tuning](compiler/tuning.md)
+13. [Legality 与错误边界](compiler/verification.md)
 
 典型worker-local source的canonical组合方式单独放在 `kernels/`；这些文件是语言构造示例，
 不是target使用的kernel类别：

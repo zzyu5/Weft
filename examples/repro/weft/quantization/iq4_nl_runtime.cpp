@@ -7,11 +7,6 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void dequantize_iq4_nl(
-    const std::uint8_t *packed, const std::uint8_t *codebook, float *output,
-    std::size_t rows, std::size_t blocks_per_row,
-    std::size_t input_stride_bytes, std::size_t output_stride);
-
 namespace {
 
 constexpr std::size_t kRows = 1024;

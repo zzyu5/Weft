@@ -7,8 +7,8 @@ def dense_conv2d_f32(
     source: W.ptr[W.f32, W.readonly, W.noalias],
     weight: W.ptr[W.f32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    packed_patches: W.ptr[W.f32, W.noalias],
-    packed_weight: W.ptr[W.f32, W.noalias],
+    packed_patches: W.ptr[W.f32, W.workspace, W.noalias],
+    packed_weight: W.ptr[W.f32, W.workspace, W.noalias],
     batch: W.index,
     input_height: W.index,
     input_width: W.index,
@@ -29,6 +29,8 @@ def dense_conv2d_f32(
     positions = batch * output_plane
     kernel_plane = kernel_height * kernel_width
     reduction_extent = input_channels * kernel_plane
+    W.storage(packed_patches, shape=(positions, reduction_extent))
+    W.storage(packed_weight, shape=(output_channels, reduction_extent))
 
     for position in W.range(0, positions):
         image = position / output_plane

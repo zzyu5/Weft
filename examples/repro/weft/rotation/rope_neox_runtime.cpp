@@ -7,12 +7,6 @@
 #include <cstdlib>
 #include <vector>
 
-extern "C" void rope_neox_f32(
-    const float *source, const std::int32_t *positions, float *destination,
-    float *angle_cache, std::size_t tokens, std::size_t heads,
-    std::size_t half_dimension, std::size_t head_stride,
-    std::size_t token_stride, float theta_scale);
-
 namespace {
 
 constexpr std::size_t kTokens = 128;

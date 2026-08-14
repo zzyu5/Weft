@@ -7,11 +7,6 @@
 #include <limits>
 #include <vector>
 
-extern "C" void cross_entropy_loss_gradient_f32(
-    const float *logits, const std::uint32_t *labels, float *gradient,
-    float *loss, std::size_t row_begin, std::size_t row_end,
-    std::size_t classes);
-
 namespace {
 
 constexpr std::size_t kRows = 128;

@@ -1,8 +1,12 @@
 # Packed Quantization 与 Irregular Access
 
-Packed quantized kernel必须把persistent storage、decode relation、scale/zero-point与outer
+Packed quantized kernel必须把storage ownership、decode relation、scale/zero-point与outer
 traversal写在source中。Target可以融合局部decode与compute，但不能从byte pointer、shape或
 q-format名字猜出这些语义。
+
+普通packed input仍可声明为external；只有caller按显式format identity构建并跨调用复用的
+target-compatible object才声明`W.persistent(format)`，并用`W.storage`给出shape。Packed byte
+内容本身不会让target自动授予persistent身份。
 
 ## Q4_K GetRows
 
@@ -118,7 +122,7 @@ source algorithm
   activation max-reduce
   explicit scale computation
   W.narrow(..., rounding="rne", saturation=True)
-  persistent scale/code scratch store
+  worker-local scale/code workspace store
   outer row / N / K traversal
 
 local semantic primitive
@@ -178,9 +182,10 @@ for column_begin in W.range(0, columns, W.index(16)):
     W.store(output_row + column_begin + W.block_axis(16), acc)
 ```
 
-Target可以把local primitive映射到RVV dot或IME fragment，也可以在primitive envelope内做
-短生命周期repack；它不能自动创造activation quantization pass、scratch ABI、N16/K32
-outer loop或persistent weight layout。
+`scale_scratch`与`code_scratch`是source-declared workspace pointer：caller分配，shape进入artifact
+header，并由当前worker跨quantization与dot loops复用。Target可以把local primitive映射到RVV
+dot或IME fragment，也可以在primitive envelope内做短生命周期repack；它不能自动创造
+activation quantization pass、workspace ABI、N16/K32 outer loop或persistent weight format。
 
 ## Activation quantize + symmetric Q4_0 contract
 

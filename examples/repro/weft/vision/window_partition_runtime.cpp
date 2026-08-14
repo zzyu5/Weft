@@ -5,11 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void window_partition_f32(
-    const float *source, float *output, std::size_t height, std::size_t width,
-    std::size_t channels, std::size_t window, std::size_t windows_y,
-    std::size_t windows_x);
-
 namespace {
 
 constexpr std::size_t kHeight = 64;

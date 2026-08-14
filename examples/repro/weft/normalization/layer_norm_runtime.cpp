@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void layer_norm_worker(const float *x, float *y,
-                                  std::size_t row_begin,
-                                  std::size_t row_end, std::size_t cols,
-                                  std::size_t stride, float eps);
-
 namespace {
 
 constexpr std::size_t kRows = 128;

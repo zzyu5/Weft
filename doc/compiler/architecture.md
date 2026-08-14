@@ -11,8 +11,9 @@ Canonical worker-local Weft Kernel IR
   ├─ VLA iteration regions
   ├─ logical predicates / masked values
   ├─ logical block values
+  ├─ source-visible storage ownership / shape / lifetime
   ├─ reduce / scan / typed summary
-  ├─ dot / matmul / lookup / decode / permute
+  ├─ dot / matmul / lookup / decode / transpose
   ├─ source meta-parameters
   └─ linked typed local extension primitives
                 │
@@ -25,7 +26,7 @@ RISC-V target lowering
   └─ RVV / IME / vendor-extension spelling
                 │
                 ▼
-intrinsic C / necessary inline asm
+intrinsic C / necessary inline asm + generated public C header
                 │
                 ▼
 system C compiler
@@ -38,7 +39,8 @@ llama.cpp / ggml / framework / application runtime
   owns threads, work partition and multi-core scheduling
 ```
 
-Canonical Kernel IR及其已链接 sibling extension dialect是唯一长期编译器表示。
+Canonical Kernel IR及其已链接 sibling extension dialect是唯一长期编译器表示；最终C/header/
+object是唯一artifact contract。Header只投影同一份entry/storage ABI，不形成第二份语言语义。
 Capability query、legality、resource equation、候选枚举、
 物理配置选择和 target-local owner data 可以存在于一次 lowering 调用中，但不形成独立
 pipeline stage、持久 IR、可单独输入的 front door 或第二份 authority。
@@ -91,11 +93,12 @@ Realizer读取的统一事实分为四类：
 ```text
 domain facts       lexical scalar/VLA scope, logical axes and extents
 value facts        shape kind, element type, validity and local use-def
-effect facts       pointer relation, predicate, read/write/atomic order and alias assertions
+effect facts       storage ownership/lifetime, pointer relation, predicate, read/write order and alias assertions
 primitive facts    explicit state/product/decode/extension semantics and numerical policy
 ```
 
-它输出的统一瞬态决定是value/register shape、memory/handoff、primitive realization、loop-local
+它输出的统一瞬态决定是value/register shape、memory/handoff、primitive-private temporary、
+primitive realization、loop-local
 schedule与resource budget。VLA、dot/matmul、state、quant和IME只是不同semantic anchor对同一
 physical entity model施加不同legality与resource约束，不建立各自的kernel model。
 

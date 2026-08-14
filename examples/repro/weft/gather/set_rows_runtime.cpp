@@ -5,13 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void set_rows_f32(
-    float *destination, const float *source, const std::uint32_t *indices,
-    std::size_t groups, std::size_t updates, std::size_t width,
-    std::size_t destination_group_stride,
-    std::size_t destination_row_stride, std::size_t source_group_stride,
-    std::size_t source_row_stride);
-
 namespace {
 
 constexpr std::size_t kGroups = 8;

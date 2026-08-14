@@ -14,7 +14,7 @@ def WEFT_Kernel_Dialect : Dialect {
     The dialect is the sole algorithm representation consumed by Weft.  It
     records worker-local scalar control, one-dimensional VLA regions, logical
     blocks, predicates, state algebra and structured compute.  It deliberately
-    contains no launch grid, hardware lanes, vector length, LMUL, layout,
+    contains no launch grid, hardware lanes, vector length, LMUL, physical layout,
     register tile, provider identity or instruction spelling.
   }];
   let useDefaultTypePrinterParser = 1;
@@ -36,9 +36,11 @@ def WeftKernel_PtrType : WeftKernel_Type<"Ptr", "ptr"> {
     StringRefParameter<"read, write, or readwrite">:$access,
     "bool":$noAlias,
     "int64_t":$alignment,
-    "bool":$restrictLike
+    "bool":$restrictLike,
+    StringRefParameter<"external, persistent, or workspace">:$storageClass,
+    StringRefParameter<"persistent storage format identity, otherwise empty">:$storageFormat
   );
-  let assemblyFormat = "`<` $elementType `,` $addressSpace `,` $access `,` $noAlias `,` $alignment `,` $restrictLike `>`";
+  let assemblyFormat = "`<` $elementType `,` $addressSpace `,` $access `,` $noAlias `,` $alignment `,` $restrictLike `,` $storageClass `,` $storageFormat `>`";
   let genVerifyDecl = 1;
 }
 
@@ -124,6 +126,15 @@ def WeftKernel_ConstantOp : WeftKernel_Op<"constant", [Pure]> {
 def WeftKernel_MetaValueOp : WeftKernel_Op<"meta_value", [Pure]> {
   let arguments = (ins WeftKernel_ConstexprType:$input);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_StorageOp : WeftKernel_Op<"storage"> {
+  let summary = "Source-visible persistent or worker-local storage contract";
+  let arguments = (ins WeftKernel_PtrType:$pointer,
+                       Variadic<Index>:$extents,
+                       DenseI64ArrayAttr:$shape);
+  let results = (outs);
   let hasVerifier = 1;
 }
 
@@ -292,40 +303,6 @@ def WeftKernel_SortIndicesOp
   let hasVerifier = 1;
 }
 
-def WeftKernel_PrefetchOp : WeftKernel_Op<"prefetch", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$pointer, AnyType:$where,
-                       StrAttr:$locality);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_AtomicAddOp
-    : WeftKernel_Op<"atomic_add", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins AnyType:$pointer, AnyType:$value, AnyType:$where,
-                       StrAttr:$order);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_FenceOp
-    : WeftKernel_Op<"fence", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let arguments = (ins StrAttr:$order);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_ValidOp : WeftKernel_Op<"valid", [Pure]> {
-  let arguments = (ins WeftKernel_MaskedType:$input);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_FillOp : WeftKernel_Op<"fill", [Pure]> {
-  let arguments = (ins WeftKernel_MaskedType:$input, AnyType:$fill_value);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_ReduceOp : WeftKernel_Op<"reduce", [Pure]> {
   let arguments = (ins AnyType:$input, AnyType:$identity, AnyType:$where,
                        StrAttr:$kind, I64Attr:$axis, StrAttr:$order,
@@ -375,12 +352,6 @@ def WeftKernel_MatmulOp : WeftKernel_Op<"matmul", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_PermuteOp : WeftKernel_Op<"permute", [Pure]> {
-  let arguments = (ins AnyType:$input, DenseI64ArrayAttr:$permutation);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_LookupOp : WeftKernel_Op<"lookup", [Pure]> {
   let arguments = (ins AnyType:$table, AnyType:$indices, AnyType:$where);
   let results = (outs AnyType:$result);
@@ -390,12 +361,6 @@ def WeftKernel_LookupOp : WeftKernel_Op<"lookup", [Pure]> {
 def WeftKernel_DecodeOp : WeftKernel_Op<"decode", [Pure]> {
   let arguments = (ins AnyType:$codes, AnyType:$table, AnyType:$where,
                        TypeAttr:$out_dtype);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_WidenOp : WeftKernel_Op<"widen", [Pure]> {
-  let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

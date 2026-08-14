@@ -6,11 +6,6 @@
 #include <numeric>
 #include <vector>
 
-extern "C" void argsort_f32(
-    const float *values, std::uint32_t *indices,
-    std::size_t row_begin, std::size_t row_end, std::size_t columns,
-    std::size_t value_row_stride, std::size_t index_row_stride);
-
 namespace {
 
 constexpr std::size_t kRows = 8;

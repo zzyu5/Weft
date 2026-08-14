@@ -373,17 +373,6 @@ enum class VLAStoreValueMode {
   Vector,
 };
 
-enum class PrefetchRealization {
-  BuiltinRead,
-};
-
-struct PrefetchDecision {
-  mlir::Operation *operation = nullptr;
-  PrefetchRealization realization = PrefetchRealization::BuiltinRead;
-  VLAActivityMode activityMode = VLAActivityMode::AllActive;
-  unsigned locality = 3;
-};
-
 enum class VLAStateRealization {
   RVVAddReduction,
   RVVMaxReduction,
@@ -699,13 +688,11 @@ struct VLARegionDecision {
   std::vector<VLAAccessDecision> accesses;
   std::vector<VLASegment2Decision> segment2;
   std::vector<VLALookupDecision> lookups;
-  std::vector<PrefetchDecision> prefetches;
   std::vector<VLABinaryDecision> binaries;
   std::vector<VLACastDecision> casts;
   std::vector<VLAStateDecision> states;
   std::vector<VLANarrowDecision> narrows;
   std::vector<VLADotDecision> dots;
-  bool hasExplicitPrefetch = false;
 };
 
 struct AffineI4I8Decision {
@@ -785,8 +772,6 @@ struct RISCVPhysicalPlan {
       blockDecodes;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<SortIndicesDecision>>
       sortIndices;
-  llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<PrefetchDecision>>
-      prefetches;
   llvm::DenseMap<mlir::Operation *,
                  PlannedPhysicalDecision<BlockStoreGroupDecision>>
       blockStoreGroups;
@@ -839,6 +824,9 @@ std::string scalarCType(mlir::Type type) {
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
     if (integer.getWidth() == 1)
       return "bool";
+    if (integer.getWidth() != 8 && integer.getWidth() != 16 &&
+        integer.getWidth() != 32 && integer.getWidth() != 64)
+      return {};
     std::string prefix = integer.isUnsigned() ? "uint" : "int";
     return prefix + std::to_string(integer.getWidth()) + "_t";
   }
@@ -1010,7 +998,7 @@ public:
       if (auto pointer = mlir::dyn_cast<PtrType>(type)) {
         cType = pointerCType(pointer);
         valueKind = CValueKind::Pointer;
-        if (pointer.getNoAlias())
+        if (pointer.getNoAlias() || pointer.getRestrictLike())
           cType += " restrict";
       } else {
         cType = scalarCType(type);
@@ -1060,34 +1048,6 @@ public:
 private:
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
-    kernel.walk([&](PrefetchOp op) {
-      if (decisionFailure || op->getParentOfType<VLAOp>())
-        return;
-      if (!isTrue(op.getWhere())) {
-        op.emitError(
-            "top-level RISC-V prefetch requires an all-active predicate");
-        decisionFailure = true;
-        return;
-      }
-      unsigned locality = llvm::StringSwitch<unsigned>(op.getLocality())
-                              .Case("low", 0)
-                              .Case("moderate", 1)
-                              .Case("high", 3)
-                              .Case("default", 3)
-                              .Default(4);
-      if (locality > 3) {
-        op.emitError("RISC-V prefetch locality is unsupported");
-        decisionFailure = true;
-        return;
-      }
-      PlannedPhysicalDecision<PrefetchDecision> planned;
-      planned.realization = PrefetchDecision{
-          op.getOperation(), PrefetchRealization::BuiltinRead,
-          VLAActivityMode::AllActive, locality};
-      planned.entity.resources.architecturalGroups =
-          options.target.vectorRegisters;
-      physicalPlan.prefetches.try_emplace(op.getOperation(), std::move(planned));
-    });
     kernel.walk([&](SortIndicesOp op) {
       if (decisionFailure)
         return;
@@ -1419,23 +1379,6 @@ private:
           return decision.operation == operation;
         });
     return found == activeVLADecision->lookups.end() ? nullptr : &*found;
-  }
-
-  const PrefetchDecision *
-  findPrefetchDecision(mlir::Operation *operation) const {
-    if (activeVLADecision) {
-      auto found = llvm::find_if(
-          activeVLADecision->prefetches,
-          [&](const PrefetchDecision &decision) {
-            return decision.operation == operation;
-          });
-      if (found != activeVLADecision->prefetches.end())
-        return &*found;
-    }
-    auto found = physicalPlan.prefetches.find(operation);
-    return found == physicalPlan.prefetches.end()
-               ? nullptr
-               : &found->second.realization;
   }
 
   const VLABinaryDecision *
@@ -2294,30 +2237,6 @@ private:
                 store.getOperation(), store.getPointer(), store.getWhere(),
                 elementType(store.getValue().getType()), valueMode)))
           return mlir::failure();
-      } else if (auto prefetch = mlir::dyn_cast<PrefetchOp>(nested)) {
-        LaneRelation relation =
-            classifyLaneRelation(prefetch.getPointer(), decision.coordinate);
-        if (relation != LaneRelation::Independent ||
-            !isTrue(prefetch.getWhere())) {
-          prefetch.emitError(
-              "RISC-V prefetch requires one explicit scalar local address");
-          return mlir::failure();
-        }
-        unsigned locality =
-            llvm::StringSwitch<unsigned>(prefetch.getLocality())
-                .Case("low", 0)
-                .Case("moderate", 1)
-                .Case("high", 3)
-                .Case("default", 3)
-                .Default(4);
-        if (locality > 3) {
-          prefetch.emitError("RISC-V prefetch locality is unsupported");
-          return mlir::failure();
-        }
-        decision.prefetches.push_back(PrefetchDecision{
-            prefetch.getOperation(), PrefetchRealization::BuiltinRead,
-            VLAActivityMode::AllActive, locality});
-        decision.hasExplicitPrefetch = true;
       }
     }
 
@@ -2905,7 +2824,7 @@ private:
     entity.schedule.stripSchedule = selected->stripSchedule;
     entity.schedule.unroll = 1;
     entity.schedule.pipelineStages = 1;
-    entity.schedule.prefetchDistance = decision.hasExplicitPrefetch ? 1 : 0;
+    entity.schedule.prefetchDistance = 0;
 
     auto regionShape = [&](mlir::Type type) -> RVVVectorShape {
       if (!isRegionValue(type))
@@ -3328,6 +3247,8 @@ private:
       return emitConstant(op);
     if (auto op = mlir::dyn_cast<MetaValueOp>(operation))
       return emitMeta(op);
+    if (mlir::isa<StorageOp>(operation))
+      return mlir::success();
     if (auto op = mlir::dyn_cast<IfOp>(operation))
       return emitIf(op);
     if (auto op = mlir::dyn_cast<VLAOp>(operation))
@@ -3364,8 +3285,6 @@ private:
     if (auto op = mlir::dyn_cast<StoreOp>(operation)) {
       return emitStore(op);
     }
-    if (auto op = mlir::dyn_cast<PrefetchOp>(operation))
-      return emitPrefetch(op);
     if (auto op = mlir::dyn_cast<ArgMaxOp>(operation))
       return op.emitError("argmax must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<OnlineSoftmaxSummaryOp>(operation))
@@ -5854,21 +5773,6 @@ private:
       return op.emitError("masked scalar load requires an explicit other value");
     values[op.getResult()] = scalarExpression(
         op.getResult(), std::move(expression), "load", true);
-    return mlir::success();
-  }
-
-  mlir::LogicalResult emitPrefetch(PrefetchOp op) {
-    const PrefetchDecision *decision = findPrefetchDecision(op.getOperation());
-    if (!decision)
-      return op.emitError("prefetch has no selected physical decision");
-    CValue pointer = require(op.getPointer());
-    if (decision->realization != PrefetchRealization::BuiltinRead ||
-        decision->activityMode != VLAActivityMode::AllActive ||
-        pointer.kind != CValueKind::Pointer || pointer.spelling.empty() ||
-        decision->locality > 3)
-      return op.emitError("prefetch decision has no intrinsic-C spelling");
-    line("__builtin_prefetch(" + pointer.spelling + ", 0, " +
-         std::to_string(decision->locality) + ");");
     return mlir::success();
   }
 

@@ -6,9 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void dilated_causal_conv1d_f32(const float *, const float *, float *,
-                                            std::size_t, std::size_t,
-                                            std::size_t, std::size_t);
 namespace {
 constexpr std::size_t kTokens = 2048;
 constexpr std::size_t kChannels = 256;

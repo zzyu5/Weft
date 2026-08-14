@@ -24,6 +24,8 @@ class PointerType(ValueType):
     noalias: bool
     alignment: int
     restrict_like: bool
+    storage_class: str
+    storage_format: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +79,9 @@ def emit_type(value_type: ValueType) -> str:
             f"!weft_kernel.ptr<{emit_type(value_type.element_type)}, "
             f"{json.dumps(value_type.address_space)}, {json.dumps(value_type.access)}, "
             f"{str(value_type.noalias).lower()}, {value_type.alignment}, "
-            f"{str(value_type.restrict_like).lower()}>"
+            f"{str(value_type.restrict_like).lower()}, "
+            f"{json.dumps(value_type.storage_class)}, "
+            f"{json.dumps(value_type.storage_format)}>"
         )
     if isinstance(value_type, ConstexprType):
         return f"!weft_kernel.constexpr<{emit_type(value_type.value_type)}>"

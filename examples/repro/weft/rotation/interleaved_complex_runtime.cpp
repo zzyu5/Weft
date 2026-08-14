@@ -7,11 +7,6 @@
 #include <riscv_vector.h>
 #include <vector>
 
-extern "C" void interleaved_complex_mul_f32(const float *, const float *,
-                                               float *, std::size_t);
-extern "C" void interleaved_complex_mul_f32_equivalent(
-    const float *, const float *, float *, std::size_t);
-
 namespace {
 constexpr std::size_t kPairs = 1U << 20U;
 constexpr std::size_t kEvictionBytes = 64U << 20U;

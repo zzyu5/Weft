@@ -23,7 +23,16 @@ W.noalias
 W.restrict
 W.aligned(bytes)
 W.address_space(name)
+W.external
+W.workspace
+W.persistent(format)
+
+W.storage(pointer, shape)
 ```
+
+External 是默认 storage class。Persistent/workspace pointer 必须在 entry body各有一个
+`W.storage`；workspace 同时要求 `W.noalias`。`W.storage` 描述 caller-provided object，不执行
+allocation。
 
 ## Control 与 helper
 
@@ -37,7 +46,7 @@ W.select(predicate, true_value, false_value)
 def pure_helper(...):
     return value
 
-@W.helper(effects=("read", "write", "atomic", "fence"))
+@W.helper(effects=("read", "write"))
 def effectful_helper(...):
     return value
 ```
@@ -53,12 +62,6 @@ with W.vla(begin, end) as i:
 
 W.load(ptr, where=True, other=W.invalid, alignment=None)
 W.store(ptr, value, where=True, alignment=None)
-W.prefetch(ptr, where=True, locality="default")
-W.atomic_add(ptr, value, where=True, order="relaxed")
-W.fence(order="acq_rel")
-
-W.valid(masked_value)
-W.fill(masked_value, fill_value)
 W.select(predicate, true_value, false_value)
 ```
 
@@ -87,6 +90,8 @@ W.scan(value, op=..., identity=..., inclusive=True, where=True,
 
 W.argmax(value, coordinate, tie="lowest_coordinate", order="relaxed")
 W.online_softmax_summary(value, math="native", order="preserve")
+W.sort_indices(input_ptr, output_ptr, extent,
+               order="ascending", nan="last", tie="index_ascending")
 ```
 
 普通 sequential carry使用 scalar `W.range` / Python `while`，不会被自动提升为 reduce、scan
@@ -99,7 +104,6 @@ W.dot(lhs, rhs, init=..., acc_dtype=...,
       order="relaxed", math="native")
 W.matmul(lhs, rhs, init=..., acc_dtype=...,
          order="relaxed", math="native")
-W.permute(value, permutation)
 W.lookup(table, indices, where=True)
 W.decode(codes, table, where=True, out_dtype=...)
 ```
@@ -115,12 +119,12 @@ W.log(x, math="native")
 W.floor(x)
 W.sin(x, math="native")
 W.cos(x, math="native")
+W.sqrt(x, math="native")
 W.rsqrt(x, math="native")
 W.neg_inf(dtype)
 W.tuple(a, b, ...)
 
 W.cast(value, dtype)
-W.widen(value, dtype)
 W.narrow(value, dtype, rounding="rne", saturation=False)
 W.bitcast(value, dtype)
 ```
@@ -154,8 +158,13 @@ W.sign_bit_i8_dot(
 W.e2m1_e8m0_i8_dot(
     packed_codes, exponent, activation, activation_scale, init,
 )
+
+W.iq2_s_i8_dot(...)
+W.iq3_s_i8_dot(...)
+W.iq1_m_i8_dot(...)
+W.q6_k_i8_dot(...)
 ```
 
 它们在 Python source 中通过 `W` 暴露，在 canonical IR 中属于 sibling `weft_ext` dialect。
-Extension 必须保持 local、typed、可组合；完整 kernel、persistent layout和outer traversal不能
+Extension 必须保持 local、typed、可组合；完整 kernel、persistent format和outer traversal不能
 进入 extension op。

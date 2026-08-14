@@ -6,10 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void softmax_f32(const float *x, float *y,
-                            std::size_t row_begin, std::size_t row_end,
-                            std::size_t cols, std::size_t stride);
-
 namespace {
 
 constexpr std::size_t kRows = 32 * 128;

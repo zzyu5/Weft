@@ -6,10 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void swiglu_f16_f32(const _Float16 *gate, const _Float16 *up,
-                               float *output, std::size_t begin,
-                               std::size_t end);
-
 namespace {
 
 constexpr std::size_t kRows = 128;

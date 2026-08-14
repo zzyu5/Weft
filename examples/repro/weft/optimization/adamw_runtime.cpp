@@ -6,17 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void adamw_f32(
-    float *parameters, const float *gradients, float *first_moment,
-    float *second_moment, std::size_t begin, std::size_t end,
-    float learning_rate, float beta1, float beta2, float inverse_bias1,
-    float inverse_bias2, float epsilon, float weight_decay);
-extern "C" void adamw_f32_equivalent(
-    float *parameters, const float *gradients, float *first_moment,
-    float *second_moment, std::size_t begin, std::size_t end,
-    float learning_rate, float beta1, float beta2, float inverse_bias1,
-    float inverse_bias2, float epsilon, float weight_decay);
-
 namespace {
 
 constexpr std::size_t kElements = 16U * 1024U * 1024U;

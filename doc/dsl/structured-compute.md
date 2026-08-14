@@ -34,6 +34,11 @@ scan或显式typed summary primitive。`init`与`acc_dtype`均为必填source se
 普通scalar loop中的multiply/add是作者写下的有序carry，不会被自动识别成dot或matmul。
 只有显式primitive才授权target重组其局部K domain。
 
+`dot`/`matmul`的result是普通SSA value，而不是terminal microkernel result。它可以进入
+pointwise、多个consumer、state update、loop carry、memory store或另一个合法primitive；`init`
+也可以是跨作者循环存活的block accumulator。Realizer必须为这些use建立明确physical handoff，
+不能以“必须紧接一个store”等精确closure作为该primitive的语义入口。
+
 作者拥有：
 
 - outer traversal与cache blocking；
@@ -48,10 +53,18 @@ Target只在当前dot/matmul内部决定：
 - multiple accumulators与K-unroll；
 - load schedule、prefetch与local pipeline；
 - RVV或矩阵extension realization；
-- 不越过primitive边界的短生命周期packing/scratch。
+- 不越过primitive边界的短生命周期packing/temporary。
 
-Target不得创建source中不存在的outer loop，改变blocking/staging/persistent layout，或从kernel
+Target不得创建source中不存在的outer loop，改变blocking/staging/persistent format，或从kernel
 名、格式名、完整loop nest与普通SSA graph选择实现。
+
+### Blocked GEMM 的授权边界
+
+Blocked GEMM 的 M/N/K loop、BM/BN/BK、operand block、accumulator lifetime、staging、packing和
+store都由作者显式写出。同一个worker可以持有accumulator跨K loop，并在外围control中顺序处理
+多个M/N block。`W.matmul`只授权当前local block product的物理重组；它不能替作者创建outer
+K loop、persistent repack或另一种GEMM traversal。这一持续worker-owned lifetime是Weft与典型
+Triton program/CTA-owned result tile合同的核心差异。
 
 ## State algebra
 

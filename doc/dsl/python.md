@@ -12,7 +12,7 @@ Python Weft source
     → RISC-V target lowering
     → intrinsic C / necessary inline asm
     → system C compiler / archiver
-    → object / static library / ordinary C declaration
+    → object / static library / generated public C header
 ```
 
 Python 不参与生成物运行。运行期不得依赖 Python interpreter、LLVM JIT 或 Weft Python package。
@@ -70,21 +70,31 @@ W.constexpr[T]
 
 Pointer 参数可以声明：
 
+- storage class：external、persistent(format) 或 workspace；
 - address space；
 - readonly / writeonly；
 - noalias；
 - minimum alignment；
 - restrict-like ownership facts。
 
-这些 qualifier 是作者承诺。编译器可以用其进行 vector memory、hoist、prefetch 和 local fusion；运行时违反承诺属于调用方错误。
+这些 qualifier 是作者承诺。编译器可以用其进行 vector memory、hoist、physical prefetch 和
+local fusion；运行时违反承诺属于调用方错误。External 是默认 storage class；persistent 与
+workspace 必须在 entry body 使用 `W.storage` 声明 shape，workspace 还必须声明 `W.noalias`。
 
 概念语法：
 
 ```python
 x: W.ptr[W.f32, W.readonly, W.noalias, W.aligned(64)]
+packed: W.ptr[W.u8, W.readonly, W.persistent("q4_k_n16_k32_304b")]
+scratch: W.ptr[W.f32, W.workspace, W.noalias]
+
+W.storage(packed, (n_blocks, k_blocks, 304))
+W.storage(scratch, (rows, columns))
 ```
 
-具体 Python typing 形式可以调整，但 canonical IR 必须保存相同事实。
+`W.storage` 必须直接出现在 kernel entry body；它不是 allocation。所有 source-visible object 都
+由 caller 分配并作为普通 pointer 参数传入。完整 ownership/lifetime 合同见
+[Storage ownership 与 lifetime](storage-and-lifetime.md)。
 
 ### Compile-time meta-parameter
 
@@ -148,7 +158,7 @@ def load_f16_le(ptr):
     return value
 ```
 
-允许声明的 effect 是 `read`、`write`、`atomic` 与 `fence`。Helper 必须以一个 value return
+允许声明的 effect 是 `read` 与 `write`。Helper 必须以一个 value return
 结束；frontend 将普通 helper inline 到 caller，将 summary helper编译为 canonical region。
 Helper 不是第二份 IR，也不是运行时 Python call。
 

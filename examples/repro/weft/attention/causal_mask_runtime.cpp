@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void causal_mask_f32(float *scores, std::size_t row_begin,
-                                std::size_t row_end, std::size_t cols,
-                                std::size_t stride, std::size_t queries,
-                                std::size_t n_past);
-
 namespace {
 
 constexpr std::size_t kHeads = 32;

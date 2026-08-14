@@ -6,17 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void mul_mat_id_f32(
-    const float *weights, const float *activations, const std::uint32_t *ids,
-    float *output, std::uint32_t *expert_counts,
-    std::uint32_t *expert_offsets, std::uint32_t *expert_cursors,
-    std::uint32_t *expert_items, std::size_t experts, std::size_t tokens,
-    std::size_t slots, std::size_t rows, std::size_t inner,
-    std::size_t weight_expert_stride, std::size_t weight_row_stride,
-    std::size_t activation_slot_stride,
-    std::size_t activation_token_stride, std::size_t id_token_stride,
-    std::size_t output_slot_stride, std::size_t output_token_stride);
-
 namespace {
 
 constexpr std::size_t kExperts = 8;

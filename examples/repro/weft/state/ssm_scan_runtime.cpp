@@ -6,13 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void ssm_scan_f32(
-    const float *initial_state, const std::uint32_t *state_ids, const float *x,
-    const float *dt, const float *decay, const float *b, const float *c,
-    float *output, float *final_state, std::size_t sequences,
-    std::size_t tokens, std::size_t heads, std::size_t groups,
-    std::size_t dimensions, std::size_t state_width);
-
 namespace {
 
 constexpr std::size_t kSequences = 1;

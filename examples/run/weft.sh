@@ -639,6 +639,10 @@ case "${kernel}" in
 esac
 
 runtime_command=./weft_runtime
+runtime_header_flags="-include kernel.h"
+if [[ ${multi} -eq 1 ]]; then
+  runtime_header_flags+=" -include kernel_equivalent.h"
+fi
 for argument in "${runtime_arguments[@]}"; do
   printf -v escaped_argument '%q' "${argument}"
   runtime_command+=" ${escaped_argument}"
@@ -654,7 +658,8 @@ if [[ ${k_quant_dot} -eq 1 ]]; then
     "${project_root}/${dsl}" --kernel "${kernel}" |
     "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
       --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-      "${backend_arguments[@]}" -o "${local_root}/kernel.c"
+      "${backend_arguments[@]}" --header="${local_root}/kernel.h" \
+      -o "${local_root}/kernel.c"
   cp "${project_root}/examples/repro/weft/quantization/codebook_k_runtime.cpp" \
     "${local_root}/runtime.cpp"
   cp "${project_root}/source/c/ggml/llama.cpp/ggml/src/ggml-common.h" \
@@ -664,7 +669,8 @@ elif [[ ${quant} -eq 1 ]]; then
     "${project_root}/${dsl}" --kernel "${kernel}" |
     "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
       --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-      "${backend_arguments[@]}" -o "${local_root}/kernel.c"
+      "${backend_arguments[@]}" --header="${local_root}/kernel.h" \
+      -o "${local_root}/kernel.c"
   mkdir -p "${local_root}/leaf" "${local_root}/common"
   cp "${project_root}/examples/repro/weft/quantization/block_dot/${kernel}/runtime.c" \
     "${local_root}/leaf/runtime.c"
@@ -676,23 +682,27 @@ else
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
         --meta=BM=4 --meta=BN=8 --meta=BK=64 "${backend_arguments[@]}" \
-        -o "${local_root}/kernel.c"
+        --header="${local_root}/kernel.h" -o "${local_root}/kernel.c"
   elif [[ ${multi} -eq 1 ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
       --kernel "${multi_primary}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        "${backend_arguments[@]}" -o "${local_root}/kernel.c"
+        "${backend_arguments[@]}" --header="${local_root}/kernel.h" \
+        -o "${local_root}/kernel.c"
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
       --kernel "${multi_equivalent}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        "${backend_arguments[@]}" -o "${local_root}/kernel_equivalent.c"
+        "${backend_arguments[@]}" \
+        --header="${local_root}/kernel_equivalent.h" \
+        -o "${local_root}/kernel_equivalent.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
       --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        "${backend_arguments[@]}" -o "${local_root}/kernel.c"
+        "${backend_arguments[@]}" --header="${local_root}/kernel.h" \
+        -o "${local_root}/kernel.c"
   fi
   cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 fi
@@ -719,18 +729,22 @@ tar -C "${local_root}" -cf - . |
     cxx=${remote_cxx}
     if [ '${k_quant_dot}' -eq 1 ]; then
       "\${cc}" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
-        -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
+        -march=${target_march} -mabi=lp64d -include kernel.h \
+        -c kernel.c -o kernel.o
       "\${cxx}" -O3 ${remote_compile_flags} -funroll-loops -std=c++17 -Wall -Wextra -Werror \
         -DWEFT_QUANT_KIND=${k_quant_kind} -march=${target_march} -mabi=lp64d \
+        -include kernel.h \
         -c runtime.cpp -o runtime.o
       "\${cxx}" -march=${target_march} -mabi=lp64d runtime.o kernel.o \
         ${remote_link_flags} -o weft_runtime
     elif [ '${quant}' -eq 1 ]; then
       \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
-        -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
+        -march=${target_march} -mabi=lp64d -include kernel.h \
+        -c kernel.c -o kernel.o
       ar rcs libweft_kernel.a kernel.o
       \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d \
+        -include kernel.h \
         -c leaf/runtime.c -o runtime.o
       if [ '${kernel}' = q4_K_q8_K ]; then
         ggml_build=${remote_ggml_build}
@@ -746,17 +760,20 @@ tar -C "${local_root}" -cf - . |
       fi
     else
       \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
-        -march=${target_march} -mabi=lp64d -c kernel.c -o kernel.o
+        -march=${target_march} -mabi=lp64d -include kernel.h \
+        -c kernel.c -o kernel.o
       if [ '${multi}' -eq 1 ]; then
         \"\${cc}\" -O3 ${remote_compile_flags} -std=c11 -Wall -Wextra -Werror \
-          -march=${target_march} -mabi=lp64d -c kernel_equivalent.c \
+          -march=${target_march} -mabi=lp64d -include kernel_equivalent.h \
+          -c kernel_equivalent.c \
           -o kernel_equivalent.o
         ar rcs libweft_kernel.a kernel.o kernel_equivalent.o
       else
         ar rcs libweft_kernel.a kernel.o
       fi
       \"\${cxx}\" -O3 ${remote_compile_flags} -std=c++17 -Wall -Wextra -Werror \
-        -march=${target_march} -mabi=lp64d -c runtime.cpp -o runtime.o
+        -march=${target_march} -mabi=lp64d ${runtime_header_flags} \
+        -c runtime.cpp -o runtime.o
       \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
         ${remote_link_flags} \
         -o weft_runtime

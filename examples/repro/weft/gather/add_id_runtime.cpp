@@ -5,14 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void add_id_f32(
-    const float *a, const float *b, const std::uint32_t *ids, float *output,
-    std::size_t token_begin, std::size_t token_end, std::size_t slots,
-    std::size_t hidden, std::size_t a_slot_stride,
-    std::size_t a_token_stride, std::size_t b_expert_stride,
-    std::size_t id_token_stride, std::size_t output_slot_stride,
-    std::size_t output_token_stride);
-
 namespace {
 
 constexpr std::size_t kTokens = 128;

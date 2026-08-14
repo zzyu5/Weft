@@ -6,17 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void weighted_embedding_bag_f32(
-    const float *table, const std::uint32_t *indices, const float *weights,
-    const std::uint32_t *offsets, float *output, std::size_t bag_begin,
-    std::size_t bag_end, std::size_t embedding_dim, std::size_t table_stride,
-    std::size_t output_stride);
-extern "C" void weighted_embedding_bag_f32_equivalent(
-    const float *table, const std::uint32_t *indices, const float *weights,
-    const std::uint32_t *offsets, float *output, std::size_t bag_begin,
-    std::size_t bag_end, std::size_t embedding_dim, std::size_t table_stride,
-    std::size_t output_stride);
-
 namespace {
 
 constexpr std::size_t kBags = 2048;

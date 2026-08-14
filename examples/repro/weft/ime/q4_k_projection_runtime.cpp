@@ -8,11 +8,6 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void q4_k_projection_ime(
-    const float *activation, const uint8_t *packed_weight, float *output,
-    float *activation_scale, int8_t *activation_code, size_t row_begin,
-    size_t row_end, size_t columns, size_t inner);
-
 namespace {
 
 constexpr size_t kRows = 1;

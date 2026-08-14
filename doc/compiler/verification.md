@@ -7,11 +7,13 @@ Weft只验证编译所需、局部可判定的结构事实，不建立证明、�
 Frontend和dialect verifier负责拒绝自相矛盾的IR，例如：
 
 - entry ABI、argument kind、return与type不一致；
+- pointer storage class/format不合法，workspace未声明noalias，persistent/workspace缺失或重复
+  entry storage contract，或storage shape/extent不闭合；
 - pointer arithmetic、shape、broadcast、axis或tuple type不合法；
 - nested active VLA、active VLA value逃逸或VLA body任意修改outer state；VLA中的普通
   scalar control本身合法；
 - masked value进入不理解validity的consumer；
-- reduce/scan/summary/contract的operand、state、axis、predicate或result shape不闭合；
+- reduce/scan/summary/dot/matmul的operand、state、axis、predicate或result shape不闭合；
 - summary region含memory effect或不以正确type yield；
 - extension dialect未链接，或extension operand不满足其typed local schema。
 
@@ -24,7 +26,7 @@ Target lowering针对本次target/profile/config检查：
 
 - 所需RVV、fixed VLEN、element width或matrix extension是否存在；
 - 当前primitive closure是否有合法realization；
-- register/fragment/scratch/alignment与local fusion是否可实现；
+- register/fragment/primitive-private temporary/alignment与local fusion是否可实现；
 - meta/backend binding是否完整且合法。
 
 任何一项不满足都直接返回明确unsupported/error。不存在legacy、GGML、旧emitter或默认
@@ -36,10 +38,11 @@ fallback，也不授权把整个kernel静默切换到scalar-only路径。
 以下是source/caller语义前提，不建立额外证明系统：
 
 - `noalias`、alignment、bounds与pointer lifetime；
-- VLA non-atomic iteration effect independence；
-- custom summary algebra的identity/associativity及声明的commutativity；
+- VLA iteration effect independence；
 - external worker slices之间的数据竞争与同步；
-- persistent packed storage确实符合source声明的格式。
+- persistent packed storage确实符合source声明的格式；
+- external/persistent pointer与workspace的实际bounds、alignment、lifetime和worker-exclusive
+  ownership。
 
 错误输入的行为由对应source contract决定；compiler不添加try/catch、default value或防御性
 fallback来伪装支持。
@@ -57,6 +60,7 @@ fallback来伪装支持。
 - 在canonical language重新引入program grid、implicit worker/hart identity或physical lane ID；
 - target从普通SSA graph、完整shape、kernel/operator/q-format名字猜algorithm skeleton；
 - target创建source中不存在的algorithmic loop、staging、persistent layout或state algebra；
+- target创建source-visible workspace/ABI，或把compiler-private temporary暴露成canonical storage；
 - logical block、register microtile与ISA fragment被合并成同一层；
 - capability、legality、physical configuration或target-local state成为第二份持久authority；
 - extension primitive接管完整kernel outer loops，或inline asm变成whole-kernel emitter；

@@ -8,18 +8,6 @@
 #include <cstring>
 #include <vector>
 
-extern "C" void gemm_worker(
-    const std::uint16_t *a,
-    const std::uint16_t *b,
-    float *c,
-    std::size_t m_begin,
-    std::size_t m_end,
-    std::size_t n,
-    std::size_t k,
-    std::size_t lda,
-    std::size_t ldb,
-    std::size_t ldc);
-
 namespace {
 
 constexpr std::size_t kN = 4096;

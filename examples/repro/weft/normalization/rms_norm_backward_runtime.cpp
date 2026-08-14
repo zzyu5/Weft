@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void rms_norm_backward_f32(
-    const float *gradient, const float *source, float *output,
-    std::size_t row_begin, std::size_t row_end, std::size_t columns,
-    std::size_t row_stride, float eps);
-
 namespace {
 
 constexpr std::size_t kRows = 512;

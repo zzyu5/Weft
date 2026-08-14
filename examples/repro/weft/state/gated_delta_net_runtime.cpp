@@ -5,10 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void gated_delta_net_kda_f32(
-    const float *, const float *, const float *, const float *, const float *,
-    const float *, float *, float *, size_t, size_t, size_t);
-
 static double median(std::vector<double> values) {
   std::sort(values.begin(), values.end());
   return values[values.size() / 2];

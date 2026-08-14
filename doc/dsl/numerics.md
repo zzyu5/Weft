@@ -51,16 +51,15 @@ Built-in floating reduce 的默认值是 `"relaxed"`，以允许高性能 VLA re
 
 ### Conversion、narrow 与 quantization
 
-四种 conversion 必须区分：
+三种 conversion 必须区分：
 
-- `W.cast(value, dtype)`：普通逐元素数值转换；
-- `W.widen(value, dtype)`：显式无损/增宽 conversion intent；
+- `W.cast(value, dtype)`：普通逐元素数值转换，包括 widening；
 - `W.narrow(value, dtype, rounding="rne", saturation=False)`：显式窄化、rounding 与 saturation；
 - `W.bitcast(value, dtype)`：等 bit width、逐元素保留 bit pattern。
 
 `W.narrow` 不隐含 scale、zero-point、codebook 或 packed storage。完整 quantization relation必须
 由 source 中的显式 scale/math与 `W.narrow` 共同表达，或由一个 typed local quantization/
-extension primitive表达。Persistent packed layout与写入位置仍属于 source algorithm。
+extension primitive表达。Persistent packed format与写入位置仍属于 source algorithm。
 
 如果某个 RISC-V 扩展改变 observable scale、zero-point、codebook、rounding、saturation或
 accumulation语义，必须增加新的局部 primitive或显式属性，不能伪装成普通 cast/dot

@@ -1,7 +1,7 @@
 # Transpose、RoPE 与 Online Attention Composition
 
 Attention相关kernel展示的是多个canonical construct如何组合，不是让Weft导入或融合一个
-attention graph。每个worker-local entry都显式拥有自己的loop、pointer、scratch与state。
+attention graph。每个worker-local entry都显式拥有自己的loop、pointer、workspace与state。
 
 ## Contiguous transpose
 
@@ -42,7 +42,8 @@ for position:
       store both halves
 ```
 
-`theta` 是ordered sequential carry；angle cache的lifetime与layout属于source。Target可以为
+`theta` 是ordered sequential carry；angle cache是source-declared worker-local workspace，其
+shape与lifetime进入entry storage contract。Target可以为
 sin/cos与VLA arithmetic选择不同realization，但不能把carry猜成scan，也不能自动创建或删除
 cache stage。
 
@@ -69,7 +70,7 @@ Worker-local online attention保留完整algorithm skeleton：
 for query_head:
   map to explicit KV head
   for query:
-    stage query F32 -> F16 scratch
+    stage query F32 -> F16 workspace
     initialize maximum, total and output accumulator
     for key within causal bound:
       score = load F16 query/key, widen to F32, multiply + F32 reduce
@@ -80,7 +81,9 @@ for query_head:
 
 Query staging、causal bound、GQA mapping、key order与online `(maximum,total)` update都是
 source-observable。普通scalar carry保持key iteration order；它不是局部typed summary，因为每步
-还更新一个value accumulator和scratch-visible state。
+还更新一个value accumulator和workspace-visible state。Query与accumulator workspace均由caller
+按generated header分配，由当前worker在一次invocation内独占；它们可跨key loop复用，不是
+target可偷造的primitive temporary。
 
 Target lowering可以分别实现并联合安排以下local closure：
 

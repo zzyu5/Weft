@@ -6,19 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void ssm_conv_f32(
-    const float *state, const float *weight, float *output,
-    std::size_t sequences, std::size_t tokens, std::size_t channels,
-    std::size_t taps, std::size_t state_channel_stride,
-    std::size_t state_sequence_stride, std::size_t weight_channel_stride,
-    std::size_t output_token_stride, std::size_t output_sequence_stride);
-extern "C" void ssm_conv_f32_equivalent(
-    const float *state, const float *weight, float *output,
-    std::size_t sequences, std::size_t tokens, std::size_t channels,
-    std::size_t taps, std::size_t state_channel_stride,
-    std::size_t state_sequence_stride, std::size_t weight_channel_stride,
-    std::size_t output_token_stride, std::size_t output_sequence_stride);
-
 namespace {
 
 constexpr std::size_t kSequences = 1;

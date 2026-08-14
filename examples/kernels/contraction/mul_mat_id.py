@@ -8,10 +8,10 @@ def mul_mat_id_f32(
     activations: W.ptr[W.f32, W.readonly, W.noalias],
     ids: W.ptr[W.u32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    expert_counts: W.ptr[W.u32, W.noalias],
-    expert_offsets: W.ptr[W.u32, W.noalias],
-    expert_cursors: W.ptr[W.u32, W.noalias],
-    expert_items: W.ptr[W.u32, W.noalias],
+    expert_counts: W.ptr[W.u32, W.workspace, W.noalias],
+    expert_offsets: W.ptr[W.u32, W.workspace, W.noalias],
+    expert_cursors: W.ptr[W.u32, W.workspace, W.noalias],
+    expert_items: W.ptr[W.u32, W.workspace, W.noalias],
     experts: W.index,
     tokens: W.index,
     slots: W.index,
@@ -25,6 +25,11 @@ def mul_mat_id_f32(
     output_slot_stride: W.index,
     output_token_stride: W.index,
 ) -> None:
+    W.storage(expert_counts, (experts,))
+    W.storage(expert_offsets, (experts + 1,))
+    W.storage(expert_cursors, (experts,))
+    W.storage(expert_items, (tokens, slots))
+
     for expert in W.range(0, experts):
         W.store(expert_counts + expert, W.u32(0))
 

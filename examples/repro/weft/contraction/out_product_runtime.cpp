@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void out_product_f32(
-    const float *lhs, const float *rhs, float *output, std::size_t rows,
-    std::size_t columns, std::size_t samples, std::size_t lhs_sample_stride,
-    std::size_t rhs_sample_stride, std::size_t output_row_stride);
-
 namespace {
 
 constexpr std::size_t kRows = 2048;

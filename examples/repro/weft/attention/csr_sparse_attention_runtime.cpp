@@ -7,12 +7,6 @@
 #include <limits>
 #include <vector>
 
-extern "C" void csr_sparse_attention_f32(
-    const float *query, const float *key, const float *value,
-    const std::uint32_t *row_offsets, const std::uint32_t *key_indices,
-    float *output, float *accumulator_scratch, std::size_t row_begin,
-    std::size_t row_end, std::size_t head_dimension, float scale);
-
 namespace {
 
 constexpr std::size_t kRows = 2048;

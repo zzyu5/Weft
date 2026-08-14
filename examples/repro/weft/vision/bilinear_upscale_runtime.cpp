@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void bilinear_upscale_f32(
-    const float *source, float *output, std::size_t batch,
-    std::size_t input_height, std::size_t input_width, std::size_t channels,
-    std::size_t output_height, std::size_t output_width);
-
 namespace {
 
 constexpr std::size_t kBatch = 1;

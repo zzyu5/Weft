@@ -40,33 +40,24 @@ equation、local fusion envelope 和 emission hook。当前实现可以先只有
 当它扩展成多个candidate时，candidate也只存在于本次lowering，不拥有独立IR schema、
 verifier、pipeline front door或长期provider registry。
 
-当前实现已经存在的transient physical decision包括：
+所有transient decision由一个短生命周期的physical planning core联合形成。Planner读取每个
+VLA、value/use、memory access、state与local primitive自身的typed facts，在一个共同resource
+budget下建立：
 
-- 每个VLA predicate、load/store、reduce/scan/summary与narrow各自的lane relation、memory
-  mode、activity、state realization和LMUL；F16/F32 cast与F16 fused multiply-add也拥有逐op
-  vector shape decision；位于nested scalar control中的access仍逐实体决策；
-- local F32 dot/matmul的operand shape、row microtile、pointer/stride relation、LMUL和resource
-  footprint；含dot/matmul的
-  VLA region直接消费该LMUL来决定strip width、mask ratio与index LMUL，不保留第二份选择；
-- block store/reduce的strip family、byte-vector shape、active length和lane-index需求；closure内
-  每个value、decode code/result与materialized store的vector shape只存在于entity plan，typed
-  payload只保留local realization和source provenance；
-- symmetric i4×i8 primitive的typed operand closure、288-byte local block relation与IME1
-  N16×K32 realization；
-- sign-bit×i8 primitive的block bases、scale/init operands与VLEN128 widening-sign-sum
-  realization；
-- E2M1/E8M0×i8 primitive的packed-code/activation bases、exponent/scale/init operands与
-  VLEN128 table-dot realization。
+```text
+value/register physical shape
++ memory and handoff
++ primitive realization
++ loop-local schedule/pipeline
++ peak live resource
+```
 
-这些decision由一个短生命周期的physical planning core联合形成。每个显式VLA region或
-local primitive都拥有同样的typed entity plan，并在其中建立value/use
-physical shape、memory handoff、primitive realization、loop-local schedule和resource budget，
-再把selected fields投影到各operation owner。Load、cast、state、dot和store之间的SEW、LMUL、
-mask/index relation不能各选一遍；handoff必须明确为share、convert、rematerialize、reload、
-shuffle或primitive-local pack。候选的peak resource同时计入live value、memory/index、predicate、
-state、primitive和pipeline footprint。当前没有显式pipeline语义的实体会明确选择单stage；
-没有显式prefetch primitive时选择零prefetch-distance，存在该primitive时只记录它授权的局部
-handoff，不能被解释成编译器发明了staging。这个plan只存在于一次lowering调用中，不是新IR。
+Load、cast、state、dot/matmul、extension result与store之间的SEW、LMUL、mask/index relation不能
+各选一遍；冲突必须明确选择share、convert、rematerialize、reload、shuffle或primitive-local
+pack。Peak resource同时计入live value、memory/index、predicate、state、primitive-private
+temporary和pipeline footprint。Physical prefetch是source不可观察的schedule candidate，不要求
+也不产生source prefetch op，且不得创造algorithmic staging。这个plan只存在于一次lowering
+调用中，不是语言抽象、新IR或artifact contract。
 
 这些decision不进入Kernel IR。每个decision由对应canonical primitive的唯一owner
 产生。Intrinsic/asm emitter消费已经选定的mode、LMUL、vector shape和fragment；后续store、
@@ -99,6 +90,7 @@ fallback。
 - worker-local ABI；
 - scalar loop、outer traversal 与 cache blocking；
 - staging、recomputation 与 persistent packed storage；
+- external/persistent/workspace ownership、shape与lifetime；
 - VLA logical domain；
 - pointer/index/mask/effect；
 - structured primitive、axes、state 与 numerical policy；
@@ -109,7 +101,7 @@ Target lowering 拥有：
 - dynamic `vl` placement；
 - LMUL、register repeat、microtile 与 K unroll；
 - instruction/fragment family；
-- primitive-local packing、scratch 与 software pipeline；
+- primitive-private packing/temporary 与 software pipeline；
 - local pure producer/consumer fusion；
 - intrinsic/asm spelling。
 
@@ -117,6 +109,10 @@ Target lowering不得改变source-visible iteration/effect semantics、algorithm
 staging、ABI、logical predicate、state algebra或observable numerical mode。在这些语义保持
 不变且legality成立时，可以改变物理loop形态，执行strip-mining、unroll、interchange、
 software pipeline与primitive-local fusion。
+
+Target不得分配或隐藏source-visible workspace。External、persistent与workspace都是普通entry
+pointer并由caller分配；target只消费其pointer/storage facts。只有local primitive内部不可观察的
+temporary可由physical plan创建，且不得进入canonical IR、generated header或public ABI。
 
 这里的strip-mining只适用于source已经显式授权的VLA logical axis，或dot/matmul-local
 realization中的局部轴；普通canonical `for` / `while`不得因此被改写成新的VLA axis。
@@ -149,34 +145,15 @@ base与unit-stride region、scalar coordinate/window与VLA channel，以及sourc
 中的local dot/matmul。它们是已有实体性质的新组合关系，不构成Top-K、SSM、MoE或vision
 kernel family。
 
-## 当前实现边界
+## 正式 target 能力边界
 
-逐实体VLA memory/predicate/state/narrow、F16/F32 cast、F16 arithmetic、codebook decode、
-sign-bit/E2M1 local dot与symmetric IME fragment已经按上述模型工作。此前F16 fill、F32→F16、
-F16 weighted update和F16→F32 normalize四条whole-region realization已经由generic VLA
-access/cast/binary decision替代。Block store/reduce的e8mf4/e8m1 strip选择及closure内每个结果
-shape也已移出emitter，成为entity-owned physical decision；block emitter不再保存或重建第二份
-vector shape。
+Public `intrinsic-c` backend绑定一个RVV target profile，并可选择性绑定`spacemit-ime1`矩阵扩展。
+它只接受同一份canonical core-local program：scalar ordered control以普通C realization嵌在RVV
+module中；VLA、memory、state、dot/matmul、ordering/decode/quant与extension primitive分别按自身
+facts查询local capability。某个profile没有合法realization时，对该local structure明确报
+unsupported，不能切换到另一种kernel模型、scalar-only backend或whole-kernel emitter。
 
-Local F32 dot/matmul根据block/VLA axis、typed operand、pointer/access与predicate projection形成
-resource model，再结合target寄存器数、显式config与resource headroom从局部candidate中选择LMUL；
-当前local-row候选包含随row extent变化的LMUL4/2/1，
-VLA free-axis候选也共用同一selector。LMUL与K-unroll只物化在entity plan中，typed primitive
-payload不保存第二份选择；当前合法K-unroll winner仍为1。multi-axis
-microtile、pointer schedule、prefetch、reuse和pipeline候选仍窄。这些固定内部candidate不是
-开放注册表或通用搜索承诺。
-
-Dot的physical owner是`weft_kernel.dot`本身；当前store只是已知的downstream handoff，不再拥有
-dot decision；store到dot的索引只把output handoff路由到已经选定的dot decision。VLA内dot仍与
-enclosing VLA entity联合选择LMUL/resource，但canonical授权anchor和物理decision identity保持
-在dot上。Core verifier、extension verifier与target复用同一组logical value/validity queries；
-core dot/matmul按自身语义处理masked operand，而未定义validity语义的extension primitive必须要求
-作者先显式`fill`。
-
-当前仍有一个精确的局部VLA fusion envelope：F16 widening dot将显式load/cast/multiply/reduce
-闭包实现为widening MAC。Online-softmax summary只拥有自身typed state，后续normalize VLA由
-其中的memory/pointwise实体独立lower。F16 GEMM nested loop和affine Q4_K IME N/K closure仍
-要求较精确的局部loop关系。
-它们都从typed source relation产生decision，不读取kernel名，也不接管public ABI或外围
-traversal；但尚未获得更宽的等价source接受范围。新增能力应扩展局部decision的合法语义输入
-与physical candidate，不能重新增加whole-kernel try-emitter。
+同一canonical kernel换到SG2044/VLEN128、K1/VLEN256或K1+IME时，改变的只能是physical plan、
+intrinsic/asm leaf与artifact target flags；ordered traversal、block/state/storage lifetime、entry ABI
+与local primitive semantics保持不变。实现阶段的具体已覆盖case、窄closure与性能数字只记录在
+当轮`report/`，不进入本规范。

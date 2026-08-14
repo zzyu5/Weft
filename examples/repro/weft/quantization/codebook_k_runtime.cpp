@@ -16,19 +16,15 @@
 #endif
 
 #if WEFT_QUANT_KIND == 2
-extern "C" float iq2_S_q8_K(const uint8_t *, const uint8_t *, size_t);
 using WeightBlock = block_iq2_s;
 static constexpr const char *kernel_name = "iq2_S_q8_K";
 #elif WEFT_QUANT_KIND == 3
-extern "C" float iq3_S_q8_K(const uint8_t *, const uint8_t *, size_t);
 using WeightBlock = block_iq3_s;
 static constexpr const char *kernel_name = "iq3_S_q8_K";
 #elif WEFT_QUANT_KIND == 1
-extern "C" float iq1_M_q8_K(const uint8_t *, const uint8_t *, size_t);
 using WeightBlock = block_iq1_m;
 static constexpr const char *kernel_name = "iq1_M_q8_K";
 #elif WEFT_QUANT_KIND == 6
-extern "C" float q6_K_q8_K(const uint8_t *, const uint8_t *, size_t);
 using WeightBlock = block_q6_K;
 static constexpr const char *kernel_name = "q6_K_q8_K";
 #else

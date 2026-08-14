@@ -7,8 +7,8 @@ def conv_transpose2d_p0_f32(
     source: W.ptr[W.f32, W.readonly, W.noalias],
     weight: W.ptr[W.f32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    packed_source: W.ptr[W.f32, W.noalias],
-    packed_weight: W.ptr[W.f32, W.noalias],
+    packed_source: W.ptr[W.f32, W.workspace, W.noalias],
+    packed_weight: W.ptr[W.f32, W.workspace, W.noalias],
     batch: W.index,
     input_height: W.index,
     input_width: W.index,
@@ -20,6 +20,14 @@ def conv_transpose2d_p0_f32(
 ) -> None:
     output_height = (input_height - 1) * stride + kernel_height
     output_width = (input_width - 1) * stride + kernel_width
+    W.storage(
+        packed_source,
+        shape=(batch, input_height, input_width, input_channels),
+    )
+    W.storage(
+        packed_weight,
+        shape=(output_channels, kernel_height, kernel_width, input_channels),
+    )
 
     for image in W.range(0, batch):
         for input_y in W.range(0, input_height):

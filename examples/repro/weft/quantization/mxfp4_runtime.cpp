@@ -6,10 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void mxfp4_q8_0_rows(
-    const std::uint8_t *weight, const std::uint8_t *activation, float *output,
-    std::size_t row_begin, std::size_t row_end, std::size_t elements);
-
 namespace {
 
 constexpr std::size_t kRows = 14336;

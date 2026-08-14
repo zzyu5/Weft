@@ -5,11 +5,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void get_rows_back_f32(
-    const float *source, const std::uint32_t *indices, float *output,
-    std::size_t rows, std::size_t items, std::size_t hidden,
-    std::size_t source_stride, std::size_t output_stride);
-
 namespace {
 
 constexpr std::size_t kRows = 32000;

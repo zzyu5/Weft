@@ -10,12 +10,13 @@ def csr_sparse_attention_f32(
     row_offsets: W.ptr[W.u32, W.readonly, W.noalias],
     key_indices: W.ptr[W.u32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    accumulator_scratch: W.ptr[W.f32, W.noalias],
+    accumulator_scratch: W.ptr[W.f32, W.workspace, W.noalias],
     row_begin: W.index,
     row_end: W.index,
     head_dimension: W.index,
     scale: W.f32,
 ) -> None:
+    W.storage(accumulator_scratch, shape=(head_dimension,))
     for row in W.range(row_begin, row_end):
         query_row = query + row * head_dimension
         output_row = output + row * head_dimension

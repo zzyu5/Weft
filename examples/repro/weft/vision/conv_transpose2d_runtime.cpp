@@ -6,13 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void conv_transpose2d_p0_f32(
-    const float *source, const float *weight, float *output,
-    float *packed_source, float *packed_weight, std::size_t batch,
-    std::size_t input_height, std::size_t input_width,
-    std::size_t input_channels, std::size_t output_channels,
-    std::size_t kernel_height, std::size_t kernel_width, std::size_t stride);
-
 namespace {
 
 constexpr std::size_t kBatch = 1;

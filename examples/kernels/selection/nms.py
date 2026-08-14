@@ -6,12 +6,14 @@ import weft.language as W
 def greedy_nms_f32(
     boxes: W.ptr[W.f32, W.readonly, W.noalias],
     scores: W.ptr[W.f32, W.readonly, W.noalias],
-    suppressed: W.ptr[W.u8, W.noalias],
+    suppressed: W.ptr[W.u8, W.workspace, W.noalias],
     selected: W.ptr[W.u32, W.writeonly, W.noalias],
     candidates: W.index,
     maximum_selected: W.index,
     iou_threshold: W.f32,
 ) -> None:
+    W.storage(suppressed, (candidates,))
+
     for candidate in W.range(0, candidates):
         W.store(suppressed + candidate, W.u8(0))
 

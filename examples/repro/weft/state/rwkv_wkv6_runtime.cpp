@@ -6,12 +6,6 @@
 #include <cstdio>
 #include <vector>
 
-extern "C" void rwkv_wkv6_f32(
-    const float *k, const float *v, const float *r, const float *time_decay,
-    const float *time_first, const float *initial_state, float *output,
-    float *final_state, std::size_t tokens, std::size_t heads,
-    std::size_t width);
-
 namespace {
 
 constexpr std::size_t kTokens = 128;
