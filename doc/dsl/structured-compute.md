@@ -20,16 +20,21 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 [R,K]   x [VLA,K] -> [VLA,R]
 ```
 
+当前public dot要求f32 multiplicand与f32 accumulator。
+
 `W.matmul`固定表达local block relation：
 
 ```text
 [M,K] x [K,N] -> [M,N]
 ```
 
+当前public matmul要求f16 multiplicand与f32 accumulator。
+
 VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
 scan或显式typed summary primitive。`init`与`acc_dtype`均为必填source semantics；init必须是scalar或与结果
 同shape的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
-描述。结果element type等于accumulator dtype。
+描述；masked multiplicand在乘加域中按语义零贡献，`init`与result本身必须是普通unmasked
+accumulator value。结果element type等于accumulator dtype。
 
 普通scalar loop中的multiply/add是作者写下的有序carry，不会被自动识别成dot或matmul。
 只有显式primitive才授权target重组其局部K domain。

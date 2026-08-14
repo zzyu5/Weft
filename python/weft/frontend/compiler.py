@@ -15,9 +15,12 @@ from weft.language import DTypeCategory
 from weft.language import HelperDefinition
 from weft.language import Intrinsic
 from weft.language import PtrSpec
+from weft.language import f16
 from weft.language import f32
 from weft.language import i1
+from weft.language import i8
 from weft.language import index
+from weft.language import u8
 from weft.language import u32
 from weft.language.builtins import InvalidValue
 
@@ -262,6 +265,8 @@ class FrontendCompiler:
         self.active_vla = False
         self.vla_outer_names: set[str] | None = None
         self.helper_effects: tuple[str, ...] | None = None
+        self.constant_values: dict[Value, object] = {}
+        self.storage_contracts: dict[Value, _ShapeSpec] = {}
 
     def compile(self) -> str:
         signature = self.unit.definition.signature
@@ -650,17 +655,35 @@ class FrontendCompiler:
             if not any(marker in literal for marker in (".", "e", "E")):
                 literal += ".0"
             spelling = f"{literal} : {emit_type(value_type)}"
-        return self._emit(
+        result = self._emit(
             "weft_kernel.constant",
             node,
             result_types=(value_type,),
             attributes={"value": spelling},
         )[0]
+        self.constant_values[result] = value
+        return result
 
     def _invalid(self, node: ast.AST) -> Value:
         return self._emit(
             "weft_kernel.invalid", node, result_types=(NONE_TYPE,)
         )[0]
+
+    def _is_true_value(self, value: Value) -> bool:
+        return self.constant_values.get(value) is True
+
+    def _same_index_extent(self, lhs: Value, rhs: Value) -> bool:
+        if lhs == rhs:
+            return True
+        lhs_constant = self.constant_values.get(lhs)
+        rhs_constant = self.constant_values.get(rhs)
+        return (
+            isinstance(lhs_constant, int)
+            and not isinstance(lhs_constant, bool)
+            and isinstance(rhs_constant, int)
+            and not isinstance(rhs_constant, bool)
+            and lhs_constant == rhs_constant
+        )
 
     def _compile_binary_operands(self, lhs_node: ast.expr, rhs_node: ast.expr) -> tuple[Value, Value]:
         if isinstance(lhs_node, ast.Constant) and not isinstance(rhs_node, ast.Constant):
@@ -905,9 +928,11 @@ class FrontendCompiler:
         pointer_type = element_type(pointer.type)
         assert isinstance(pointer_type, PointerType)
         result_type = with_element_type(pointer.type, pointer_type.element_type)
-        if isinstance(other.type, NoneType):
+        if isinstance(other.type, NoneType) and not self._is_true_value(where):
             result_type = MaskedType(result_type)
-        elif element_type(other.type) != pointer_type.element_type:
+        elif not isinstance(other.type, NoneType) and (
+            is_masked(other.type) or element_type(other.type) != pointer_type.element_type
+        ):
             raise FrontendError("W.load other must match pointer element type", self._location(call))
         alignment = args["alignment"]
         if isinstance(alignment, ast.expr):
@@ -938,6 +963,11 @@ class FrontendCompiler:
         assert isinstance(pointer_type, PointerType)
         if element_type(value.type) != pointer_type.element_type:
             raise FrontendError("W.store value must match pointer element type", self._location(call))
+        if is_masked(value.type):
+            raise FrontendError(
+                "W.store requires an explicit filled value, not validity-carrying data",
+                self._location(call),
+            )
         alignment = args["alignment"]
         if isinstance(alignment, ast.expr):
             alignment = self._eval_static(alignment)
@@ -957,7 +987,7 @@ class FrontendCompiler:
         self._require_effect("write", call)
         args = self._positional_and_keywords(
             call,
-            ("input", "output", "extent"),
+            ("input", "output", "scratch", "extent"),
             {
                 "order": "ascending",
                 "nan": "last",
@@ -966,10 +996,11 @@ class FrontendCompiler:
         )
         input_pointer = self._value_argument(args["input"], call)
         output_pointer = self._value_argument(args["output"], call)
+        scratch_pointer = self._value_argument(args["scratch"], call)
         extent = self._value_argument(args["extent"], call)
         if not isinstance(input_pointer.type, PointerType) or not isinstance(
             output_pointer.type, PointerType
-        ):
+        ) or not isinstance(scratch_pointer.type, PointerType):
             raise FrontendError(
                 "W.sort_indices expects scalar typed pointers", self._location(call)
             )
@@ -981,9 +1012,28 @@ class FrontendCompiler:
             raise FrontendError(
                 "W.sort_indices output must point to u32", self._location(call)
             )
+        if (
+            scratch_pointer.type.element_type != ScalarType(u32)
+            or scratch_pointer.type.storage_class != "workspace"
+            or not scratch_pointer.type.noalias
+        ):
+            raise FrontendError(
+                "W.sort_indices scratch must be a noalias u32 workspace pointer",
+                self._location(call),
+            )
         if not _is_index(extent.type) or not _is_scalar(extent.type):
             raise FrontendError(
                 "W.sort_indices extent must be a scalar index", self._location(call)
+            )
+        scratch_contract = self.storage_contracts.get(scratch_pointer)
+        if (
+            scratch_contract is None
+            or len(scratch_contract.extents) != 1
+            or not self._same_index_extent(scratch_contract.extents[0], extent)
+        ):
+            raise FrontendError(
+                "W.sort_indices scratch storage must be rank-one with the same extent",
+                self._location(call),
             )
         order = args["order"]
         nan = args["nan"]
@@ -1010,7 +1060,7 @@ class FrontendCompiler:
         self._emit(
             "weft_kernel.sort_indices",
             call,
-            operands=(input_pointer, output_pointer, extent),
+            operands=(input_pointer, output_pointer, scratch_pointer, extent),
             attributes={
                 "order": _string(order),
                 "nan": _string(nan),
@@ -1045,12 +1095,18 @@ class FrontendCompiler:
         if not isinstance(shape_node, ast.expr):
             raise FrontendError("storage shape must be source syntax", self._location(call))
         shape = self._shape_spec(shape_node)
+        if pointer in self.storage_contracts:
+            raise FrontendError(
+                "one entry pointer cannot have multiple W.storage contracts",
+                self._location(call),
+            )
         self._emit(
             "weft_kernel.storage",
             call,
             operands=(pointer,) + shape.extents,
             attributes={"shape": _dense_i64(shape.dimensions)},
         )
+        self.storage_contracts[pointer] = shape
         return None
 
     def _intrinsic_block_axis(self, call: ast.Call) -> Value:
@@ -1131,68 +1187,6 @@ class FrontendCompiler:
             result_types=(result_type,),
             attributes={"axis": str(axis)},
         )[0]
-
-    def _intrinsic_expand_dims(self, call: ast.Call) -> Value:
-        args = self._positional_and_keywords(call, ("value", "axis"), {})
-        value = self._value_argument(args["value"], call)
-        axis = args["axis"]
-        if isinstance(axis, ast.expr):
-            axis = self._eval_static(axis)
-        if isinstance(axis, bool) or not isinstance(axis, int):
-            raise FrontendError("axis must be a constant integer", self._location(call))
-        return self._expand_dims(value, axis, call)
-
-    def _shape_transform(self, call: ast.Call, operation: str) -> Value:
-        args = self._positional_and_keywords(call, ("value", "shape"), {})
-        value = self._value_argument(args["value"], call)
-        if not isinstance(args["shape"], ast.expr):
-            raise FrontendError("shape must be source syntax", self._location(call))
-        shape = self._shape_spec(args["shape"])
-        result_type = shaped_type(shape_kind(value.type), shape.dimensions, element_type(value.type))
-        if is_masked(value.type):
-            result_type = MaskedType(result_type)
-        return self._emit(
-            operation,
-            call,
-            operands=(value,) + shape.extents,
-            result_types=(result_type,),
-            attributes={"shape": _dense_i64(shape.dimensions)},
-        )[0]
-
-    def _intrinsic_broadcast_to(self, call: ast.Call) -> Value:
-        return self._shape_transform(call, "weft_kernel.broadcast_to")
-
-    def _intrinsic_reshape(self, call: ast.Call) -> Value:
-        return self._shape_transform(call, "weft_kernel.reshape")
-
-    def _permutation(self, call: ast.Call, operation: str) -> Value:
-        args = self._positional_and_keywords(call, ("value", "permutation"), {})
-        value = self._value_argument(args["value"], call)
-        permutation = args["permutation"]
-        if not isinstance(permutation, ast.expr):
-            raise FrontendError("permutation must be source syntax", self._location(call))
-        static = self._eval_static(permutation)
-        if not isinstance(static, tuple) or any(
-            isinstance(axis, bool) or not isinstance(axis, int) for axis in static
-        ):
-            raise FrontendError("permutation must be a tuple of integers", self._location(call))
-        shape = shape_of(value.type)
-        if shape is None or sorted(static) != list(range(len(shape))):
-            raise FrontendError("permutation must contain every logical axis", self._location(call))
-        result_shape = tuple(shape[axis] for axis in static)
-        result_type = shaped_type(shape_kind(value.type), result_shape, element_type(value.type))
-        if is_masked(value.type):
-            result_type = MaskedType(result_type)
-        return self._emit(
-            operation,
-            call,
-            operands=(value,),
-            result_types=(result_type,),
-            attributes={"permutation": _dense_i64(static)},
-        )[0]
-
-    def _intrinsic_transpose(self, call: ast.Call) -> Value:
-        return self._permutation(call, "weft_kernel.transpose")
 
     def _intrinsic_cast(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("value", "dtype"), {})
@@ -1684,6 +1678,12 @@ class FrontendCompiler:
         lhs_region = isinstance(lhs_bare, RegionType)
         rhs_region = isinstance(rhs_bare, RegionType)
         if kind == "dot":
+            if element_type(lhs.type) != ScalarType(f32) or element_type(
+                rhs.type
+            ) != ScalarType(f32):
+                raise FrontendError(
+                    "W.dot requires f32 multiplicands", self._location(call)
+                )
             rhs_is_vector = isinstance(rhs_bare, BlockType) and len(rhs_bare.shape) == 1
             rhs_is_vla_rows = rhs_region and len(rhs_bare.shape) == 2
             if (
@@ -1700,6 +1700,12 @@ class FrontendCompiler:
                 [] if lhs_region else [lhs_bare.shape[0]]
             )
         elif kind == "matmul":
+            if element_type(lhs.type) != ScalarType(f16) or element_type(
+                rhs.type
+            ) != ScalarType(f16):
+                raise FrontendError(
+                    "W.matmul requires f16 multiplicands", self._location(call)
+                )
             if (
                 not isinstance(lhs_bare, BlockType)
                 or not isinstance(rhs_bare, BlockType)
@@ -1720,6 +1726,10 @@ class FrontendCompiler:
         else:
             raise FrontendError(
                 f"W.{kind} requires an explicit acc_dtype", self._location(call)
+            )
+        if acc_type != ScalarType(f32):
+            raise FrontendError(
+                f"W.{kind} requires f32 accumulation", self._location(call)
             )
         result_type: ValueType = (
             RegionType(tuple(output_shape), acc_type)
@@ -1743,6 +1753,11 @@ class FrontendCompiler:
                 f"{kind} init must be scalar or exactly output-shaped",
                 self._location(call),
             )
+        if is_masked(init.type):
+            raise FrontendError(
+                f"W.{kind} accumulator init cannot carry validity",
+                self._location(call),
+            )
         return self._emit(
             f"weft_kernel.{kind}",
             call,
@@ -1762,9 +1777,24 @@ class FrontendCompiler:
         table = self._value_argument(args["table"], call)
         indices = self._value_argument(args["indices"], call)
         where = self._value_argument(args["where"], call)
-        if not isinstance(bare_type(table.type), BlockType):
+        table_type = bare_type(table.type)
+        if (
+            not isinstance(table_type, BlockType)
+            or table_type.shape != (16,)
+            or element_type(table.type) != ScalarType(f32)
+            or not isinstance(bare_type(indices.type), RegionType)
+            or element_type(indices.type) != ScalarType(u8)
+            or is_masked(table.type)
+            or is_masked(indices.type)
+            or not _is_predicate(where.type)
+        ):
             raise FrontendError(
-                "W.lookup table must be a logical block", self._location(call)
+                "W.lookup requires block<16xf32>, an unmasked VLA u8 index, and a predicate",
+                self._location(call),
+            )
+        if not self._is_true_value(where):
+            raise FrontendError(
+                "W.lookup currently requires where=True", self._location(call)
             )
         result_type = with_element_type(indices.type, element_type(table.type))
         return self._emit(
@@ -1781,15 +1811,32 @@ class FrontendCompiler:
         codes = self._value_argument(args["codes"], call)
         table = self._value_argument(args["table"], call)
         where = self._value_argument(args["where"], call)
-        if not isinstance(bare_type(table.type), BlockType):
+        codes_type = bare_type(codes.type)
+        table_type = bare_type(table.type)
+        if (
+            not isinstance(codes_type, BlockType)
+            or codes_type.shape != (16,)
+            or element_type(codes.type) != ScalarType(u8)
+            or not isinstance(table_type, BlockType)
+            or table_type.shape != (16,)
+            or element_type(table.type) != ScalarType(i8)
+            or is_masked(codes.type)
+            or is_masked(table.type)
+            or not _is_predicate(where.type)
+        ):
             raise FrontendError(
-                "W.decode table must be a logical block", self._location(call)
+                "W.decode requires block<16xu8> codes, block<16xi8> table, and a predicate",
+                self._location(call),
+            )
+        if not self._is_true_value(where):
+            raise FrontendError(
+                "W.decode currently requires where=True", self._location(call)
             )
         dtype = args["out_dtype"]
         if isinstance(dtype, ast.expr):
             dtype = self._eval_static(dtype)
-        if not isinstance(dtype, DType):
-            raise FrontendError("W.decode requires out_dtype", self._location(call))
+        if dtype != i8:
+            raise FrontendError("W.decode requires out_dtype=W.i8", self._location(call))
         result_type = with_element_type(codes.type, ScalarType(dtype))
         return self._emit(
             "weft_kernel.decode",

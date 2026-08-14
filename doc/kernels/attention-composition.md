@@ -21,7 +21,7 @@ def transpose_f32(
             W.store(destination + column * destination_stride + row, value)
 ```
 
-这里的permutation是显式pointer relation，不是block `W.transpose`。Target可以选择unit-stride
+这里的permutation是显式pointer relation，不是block shape-transform primitive。Target可以选择unit-stride
 load加strided/indexed store，但不能改变row/column mapping。
 
 ## RoPE NeoX
@@ -58,7 +58,7 @@ for row in W.range(0, heads * queries):
                 W.neg_inf(W.f32), where=masked)
 ```
 
-Row/query映射、causal predicate、logical key domain与masked store effect均在source中。
+Row/query映射、causal predicate、logical key domain与predicated store effect均在source中。
 Target为predicate选择mask realization，为store选择unit-stride memory与LMUL；physical tail
 不能被并入或替代causal predicate。
 

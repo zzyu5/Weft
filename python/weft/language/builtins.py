@@ -38,6 +38,10 @@ class HelperDefinition:
     def __init__(self, function: Callable[..., object], effects: tuple[str, ...]) -> None:
         if not isinstance(function, FunctionType):
             raise DefinitionError("Weft helpers must decorate a Python function")
+        if function.__annotations__:
+            raise DefinitionError(
+                "Weft helper annotations are not a type contract; omit them"
+            )
         allowed = {"read", "write"}
         if any(effect not in allowed for effect in effects):
             raise DefinitionError(
@@ -89,10 +93,6 @@ sort_indices = _intrinsic("sort_indices")
 block_axis = _intrinsic("block_axis")
 full = _intrinsic("full")
 zeros = _intrinsic("zeros")
-expand_dims = _intrinsic("expand_dims")
-broadcast_to = _intrinsic("broadcast_to")
-reshape = _intrinsic("reshape")
-transpose = _intrinsic("transpose")
 reduce = _intrinsic("reduce")
 scan = _intrinsic("scan")
 argmax = _intrinsic("argmax")

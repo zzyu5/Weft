@@ -49,7 +49,8 @@ int main() {
     });
   }
 
-  argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
+  std::vector<std::uint32_t> scratch(kColumns, 0);
+  argsort_f32(values.data(), actual.data(), scratch.data(), 0, kRows, kColumns, kColumns,
               kColumns);
   if (actual != expected) {
     for (std::size_t index = 0; index < actual.size(); ++index)
@@ -67,7 +68,7 @@ int main() {
   for (int repetition = 0; repetition < 5; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    argsort_f32(values.data(), actual.data(), 0, kRows, kColumns, kColumns,
+    argsort_f32(values.data(), actual.data(), scratch.data(), 0, kRows, kColumns, kColumns,
                 kColumns);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(

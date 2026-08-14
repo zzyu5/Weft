@@ -185,10 +185,10 @@ block<BM × BN, f32>
 Logical block：
 
 - 是局部数据域；
-- 可以由 block axis、broadcast、load、reshape、transpose 和 pointwise 产生；
+- 可以由block axis、singleton-axis view、full/zeros、load、pointwise与structured result产生；
 - 是普通 SSA value，可以有多个 consumer，可以进入 pointwise、state、memory、control carry
   或另一个 structured primitive；
-- 可以作为 `W.dot`、`W.matmul`、block reduction、transpose、decode 等 primitive 的 operand，
+- 可以作为 `W.dot`、`W.matmul`、block reduction、decode 等 primitive 的 operand，
   也可以是它们的 result；
 - 可以作为 `for` / `while` 的 accumulator 或 state 跨 logical iteration 存活；
 - 不等于 cache block；

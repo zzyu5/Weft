@@ -6,6 +6,7 @@ def top_p_nucleus_f32(
     probabilities: W.ptr[W.f32, W.readonly, W.noalias],
     sorted_indices: W.ptr[W.u32, W.workspace, W.noalias],
     sorted_probabilities: W.ptr[W.f32, W.workspace, W.noalias],
+    sort_scratch: W.ptr[W.u32, W.workspace, W.noalias],
     uniforms: W.ptr[W.f32, W.readonly, W.noalias],
     nucleus_count: W.ptr[W.u32, W.writeonly, W.noalias],
     sampled_tokens: W.ptr[W.u32, W.writeonly, W.noalias],
@@ -15,12 +16,14 @@ def top_p_nucleus_f32(
 ) -> None:
     W.storage(sorted_indices, (rows, vocabulary))
     W.storage(sorted_probabilities, (rows, vocabulary))
+    W.storage(sort_scratch, (vocabulary,))
 
     for row in W.range(0, rows):
         row_offset = row * vocabulary
         W.sort_indices(
             probabilities + row_offset,
             sorted_indices + row_offset,
+            sort_scratch,
             vocabulary,
             order="descending",
             nan="last",

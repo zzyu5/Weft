@@ -87,10 +87,12 @@ int main() {
 
   std::vector<std::uint32_t> indices(kRows * kVocabulary, 0);
   std::vector<float> sortedProbabilities(kRows * kVocabulary, 0.0F);
+  std::vector<std::uint32_t> sortScratch(kVocabulary, 0);
   std::vector<std::uint32_t> counts(kRows, 0);
   std::vector<std::uint32_t> sampledTokens(kRows, 0);
   top_p_nucleus_f32(probabilities.data(), indices.data(),
-                    sortedProbabilities.data(), uniforms.data(), counts.data(),
+                    sortedProbabilities.data(), sortScratch.data(),
+                    uniforms.data(), counts.data(),
                     sampledTokens.data(), kRows, kVocabulary, kThreshold);
   if (indices != expectedIndices || counts != expectedCounts ||
       sampledTokens != expectedSamples) {
@@ -105,7 +107,8 @@ int main() {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
     top_p_nucleus_f32(probabilities.data(), indices.data(),
-                      sortedProbabilities.data(), uniforms.data(), counts.data(),
+                      sortedProbabilities.data(), sortScratch.data(),
+                      uniforms.data(), counts.data(),
                       sampledTokens.data(), kRows, kVocabulary, kThreshold);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(

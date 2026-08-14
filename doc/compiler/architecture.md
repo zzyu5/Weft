@@ -13,7 +13,7 @@ Canonical worker-local Weft Kernel IR
   ├─ logical block values
   ├─ source-visible storage ownership / shape / lifetime
   ├─ reduce / scan / typed summary
-  ├─ dot / matmul / lookup / decode / transpose
+  ├─ dot / matmul / lookup / decode
   ├─ source meta-parameters
   └─ linked typed local extension primitives
                 │

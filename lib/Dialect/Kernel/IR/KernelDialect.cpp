@@ -12,6 +12,8 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <tuple>
+
 using namespace weft::kernel;
 
 #include "Weft/Dialect/Kernel/IR/KernelOpsDialect.cpp.inc"
@@ -297,6 +299,11 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
       if (carried < init.size())
         return deriveExtentImpl(init[carried], axis, visited);
     }
+    if (auto loop = mlir::dyn_cast_or_null<WhileOp>(parent)) {
+      auto init = loop.getInitArgs();
+      if (argument.getArgNumber() < init.size())
+        return deriveExtentImpl(init[argument.getArgNumber()], axis, visited);
+    }
     // The VLA coordinate itself is the canonical identity of its lexical
     // logical domain. Pointwise users preserve it through their producers.
     return LogicalExtent{std::nullopt, value};
@@ -323,21 +330,6 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
     return deriveExtentImpl(expand.getInput(),
                             axis < inserted ? axis : axis - 1, visited);
   }
-  if (auto broadcast = mlir::dyn_cast<BroadcastToOp>(definition)) {
-    if (axis >= static_cast<int64_t>(broadcast.getExtents().size()))
-      return std::nullopt;
-    mlir::Value extent = broadcast.getExtents()[axis];
-    return LogicalExtent{constantIndex(extent), extent};
-  }
-  if (auto reshape = mlir::dyn_cast<ReshapeOp>(definition)) {
-    if (axis >= static_cast<int64_t>(reshape.getExtents().size()))
-      return std::nullopt;
-    mlir::Value extent = reshape.getExtents()[axis];
-    return LogicalExtent{constantIndex(extent), extent};
-  }
-  if (auto transpose = mlir::dyn_cast<TransposeOp>(definition))
-    return deriveExtentImpl(transpose.getInput(), transpose.getPermutation()[axis],
-                            visited);
   if (auto unary = mlir::dyn_cast<UnaryOp>(definition))
     return deriveExtentImpl(unary.getInput(), axis, visited);
   if (auto cast = mlir::dyn_cast<CastOp>(definition))
@@ -390,6 +382,12 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
       return deriveExtentImpl(loop.getInitArgs()[result.getResultNumber()], axis,
                               visited);
   }
+  if (auto loop = mlir::dyn_cast<WhileOp>(definition)) {
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    if (result && result.getResultNumber() < loop.getInitArgs().size())
+      return deriveExtentImpl(loop.getInitArgs()[result.getResultNumber()], axis,
+                              visited);
+  }
   return std::nullopt;
 }
 
@@ -408,19 +406,27 @@ bool haveSameExtent(mlir::Value lhs, int64_t lhsAxis, mlir::Value rhs,
 mlir::LogicalResult verifyFootprint(mlir::Operation *operation,
                                     mlir::Value value, mlir::Value footprint,
                                     llvm::StringRef role) {
-  if (shapeKindOf(value.getType()) == ShapeKind::Scalar)
+  ShapeKind valueKind = shapeKindOf(value.getType());
+  ShapeKind footprintKind = shapeKindOf(footprint.getType());
+  if (footprintKind == ShapeKind::Scalar)
+    return valueKind == ShapeKind::Scalar
+               ? mlir::success()
+               : operation->emitOpError()
+                     << role << " cannot widen a scalar pointer footprint";
+  if (valueKind == ShapeKind::Scalar)
     return mlir::success();
   auto broadcast = broadcastStaticShape(value.getType(), footprint.getType());
   auto valueShape = staticShapeOf(value.getType());
   auto footprintShape = staticShapeOf(footprint.getType());
   if (!broadcast ||
       broadcastKind(value.getType(), footprint.getType()) !=
-          shapeKindOf(footprint.getType()) ||
+          footprintKind ||
       llvm::ArrayRef<int64_t>(*broadcast) != footprintShape)
     return operation->emitOpError() << role << " does not broadcast to the pointer";
-  for (int64_t axis = 0; axis < static_cast<int64_t>(valueShape.size()); ++axis) {
-    if (valueShape[axis] == -1 &&
-        !haveSameExtent(value, axis, footprint, axis))
+  for (int64_t axis = 0; axis < static_cast<int64_t>(footprintShape.size());
+       ++axis) {
+    if (footprintShape[axis] == -1 && valueShape[axis] != 1 &&
+        !haveSameExtent(footprint, axis, value, axis))
       return operation->emitOpError()
              << "cannot prove " << role << " dynamic extent identity at axis "
              << axis;
@@ -592,9 +598,9 @@ mlir::LogicalResult TupleType::verify(
   if (types.empty())
     return emitError() << "state tuple must not be empty";
   if (llvm::any_of(types, [](mlir::Type type) {
-        return mlir::isa<PtrType, ConstexprType>(type);
+        return mlir::isa<PtrType, ConstexprType, mlir::NoneType>(type);
       }))
-    return emitError() << "state tuple cannot contain ABI-only types";
+    return emitError() << "state tuple cannot contain ABI-only or absent values";
   return mlir::success();
 }
 
@@ -756,6 +762,15 @@ mlir::LogicalResult ForOp::verify() {
       return emitOpError("carried block arguments must match init types");
   if (mlir::failed(verifyYieldBlock(getOperation(), body, getResultTypes())))
     return mlir::failure();
+  auto yield = mlir::cast<YieldOp>(body.getTerminator());
+  for (auto [initial, yielded] : llvm::zip(init, yield.getValues())) {
+    auto shape = staticShapeOf(initial.getType());
+    for (auto [axis, dimension] : llvm::enumerate(shape))
+      if (dimension == -1 &&
+          !haveSameExtent(initial, axis, yielded, axis))
+        return emitOpError()
+               << "carried dynamic extent changes identity at axis " << axis;
+  }
   if (auto step = constantIndex(getStep()); step && *step == 0)
     return emitOpError("step must not be zero");
   return mlir::success();
@@ -783,7 +798,21 @@ mlir::LogicalResult WhileOp::verify() {
   for (auto [value, result] : llvm::zip(terminator.getValues(), getResults()))
     if (value.getType() != result.getType())
       return emitOpError("condition forwarded types must match results");
-  return verifyYieldBlock(getOperation(), body, getResultTypes());
+  if (mlir::failed(verifyYieldBlock(getOperation(), body, getResultTypes())))
+    return mlir::failure();
+  auto yield = mlir::cast<YieldOp>(body.getTerminator());
+  for (auto [initial, forwarded, yielded] :
+       llvm::zip(init, terminator.getValues(), yield.getValues())) {
+    auto shape = staticShapeOf(initial.getType());
+    for (auto [axis, dimension] : llvm::enumerate(shape))
+      if (dimension == -1 &&
+          (!haveSameExtent(initial, axis, forwarded, axis) ||
+           !haveSameExtent(initial, axis, yielded, axis)))
+        return emitOpError()
+               << "while-carried dynamic extent changes identity at axis "
+               << axis;
+  }
+  return mlir::success();
 }
 
 mlir::LogicalResult VLAOp::verify() {
@@ -827,6 +856,16 @@ mlir::LogicalResult FullOp::verify() {
     return emitOpError("shape attribute must match result type");
   if (getValue().getType() != result.getElementType())
     return emitOpError("fill value must match result element type");
+  for (auto [dimension, extent] : llvm::zip(getShape(), getExtents())) {
+    if (dimension != -1 && dimension <= 0)
+      return emitOpError("full dimensions must be positive or -1");
+    std::optional<int64_t> constant = constantIndex(extent);
+    if (constant && *constant <= 0)
+      return emitOpError("full extent constants must be positive");
+    if (dimension > 0 && (!constant || *constant != dimension))
+      return emitOpError(
+          "static full dimension must match its constant extent operand");
+  }
   return mlir::success();
 }
 
@@ -846,56 +885,6 @@ mlir::LogicalResult ExpandDimsOp::verify() {
       isMasked(getInput().getType()) != isMasked(getResult().getType()))
     return emitOpError("expand_dims must only insert one singleton axis");
   return mlir::success();
-}
-
-mlir::LogicalResult BroadcastToOp::verify() {
-  if (getShape().size() != getExtents().size() ||
-      getShape() != staticShapeOf(getResult().getType()))
-    return emitOpError("shape operands, attribute and result must agree");
-  if (shapeKindOf(getInput().getType()) != shapeKindOf(getResult().getType()) ||
-      elementTypeOf(getInput().getType()) != elementTypeOf(getResult().getType()) ||
-      isMasked(getInput().getType()) != isMasked(getResult().getType()))
-    return emitOpError("broadcast_to must preserve value kind, element and validity");
-  return mlir::success();
-}
-
-mlir::LogicalResult ReshapeOp::verify() {
-  if (getShape().size() != getExtents().size() ||
-      getShape() != staticShapeOf(getResult().getType()))
-    return emitOpError("shape operands, attribute and result must agree");
-  if (shapeKindOf(getInput().getType()) != shapeKindOf(getResult().getType()) ||
-      elementTypeOf(getInput().getType()) != elementTypeOf(getResult().getType()) ||
-      isMasked(getInput().getType()) != isMasked(getResult().getType()))
-    return emitOpError("reshape must preserve value kind, element and validity");
-  return mlir::success();
-}
-
-static mlir::LogicalResult verifyPermutation(mlir::Operation *operation,
-                                             mlir::Value input,
-                                             mlir::Value result,
-                                             llvm::ArrayRef<int64_t> permutation) {
-  auto shape = staticShapeOf(input.getType());
-  if (permutation.size() != shape.size())
-    return operation->emitOpError("permutation length must match logical rank");
-  llvm::SmallVector<int64_t> expected;
-  llvm::DenseSet<int64_t> seen;
-  for (int64_t axis : permutation) {
-    if (axis < 0 || axis >= static_cast<int64_t>(shape.size()) ||
-        !seen.insert(axis).second)
-      return operation->emitOpError("permutation must contain every axis once");
-    expected.push_back(shape[axis]);
-  }
-  if (mlir::failed(verifyResultShape(operation, result.getType(),
-                                     shapeKindOf(input.getType()), expected)) ||
-      elementTypeOf(input.getType()) != elementTypeOf(result.getType()) ||
-      isMasked(input.getType()) != isMasked(result.getType()))
-    return operation->emitOpError("permutation result type is inconsistent");
-  return mlir::success();
-}
-
-mlir::LogicalResult TransposeOp::verify() {
-  return verifyPermutation(getOperation(), getInput(), getResult(),
-                           getPermutation());
 }
 
 mlir::LogicalResult PtrAddOp::verify() {
@@ -1011,6 +1000,20 @@ mlir::LogicalResult SpecialValueOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult InvalidOp::verify() {
+  for (mlir::OpOperand &use : getResult().getUses()) {
+    mlir::Operation *owner = use.getOwner();
+    bool optionalLoadFill = mlir::isa<LoadOp>(owner) &&
+                            use.getOperandNumber() == 2;
+    bool optionalScanSegment = mlir::isa<ScanOp>(owner) &&
+                               use.getOperandNumber() == 3;
+    if (!optionalLoadFill && !optionalScanSegment)
+      return emitOpError(
+          "absent value is valid only for load.other or scan.segment_start");
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult LoadOp::verify() {
   if (!isPointerValue(getPointer().getType()) ||
       !isPredicateType(getWhere().getType()))
@@ -1024,9 +1027,17 @@ mlir::LogicalResult LoadOp::verify() {
       staticShapeOf(bareResult) != staticShapeOf(getPointer().getType()))
     return emitOpError("result must follow the pointer footprint and element type");
   bool noOther = mlir::isa<mlir::NoneType>(getOther().getType());
-  if (noOther != isMasked(getResult().getType()))
-    return emitOpError("omitted other must produce a validity-carrying result");
-  if (!noOther && elementTypeOf(getOther().getType()) != pointer.getElementType())
+  auto whereConstant = getWhere().getDefiningOp<ConstantOp>();
+  auto whereValue =
+      whereConstant
+          ? mlir::dyn_cast<mlir::IntegerAttr>(whereConstant.getValue())
+          : mlir::IntegerAttr{};
+  bool allActive = whereValue && !whereValue.getValue().isZero();
+  if ((noOther && !allActive) != isMasked(getResult().getType()))
+    return emitOpError(
+        "an unfilled conditional load must produce a validity-carrying result");
+  if (!noOther && (isMasked(getOther().getType()) ||
+                   elementTypeOf(getOther().getType()) != pointer.getElementType()))
     return emitOpError("other element type must match the pointer");
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getPointer(),
                                    "where")) ||
@@ -1046,6 +1057,9 @@ mlir::LogicalResult StoreOp::verify() {
   PtrType pointer = pointerTypeOf(getPointer().getType());
   if (pointer.getAccess() == "read")
     return emitOpError("cannot store through a readonly pointer");
+  if (isMasked(getValue().getType()))
+    return emitOpError(
+        "validity-carrying values require an explicit filled value before store");
   if (elementTypeOf(getValue().getType()) != pointer.getElementType())
     return emitOpError("stored element type must match the pointer");
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getPointer(),
@@ -1061,11 +1075,35 @@ mlir::LogicalResult StoreOp::verify() {
 mlir::LogicalResult SortIndicesOp::verify() {
   PtrType input = getInput().getType();
   PtrType output = getOutput().getType();
+  PtrType scratch = getScratch().getType();
   if (!input.getElementType().isF32() || input.getAccess() == "write")
     return emitOpError("input must be a readable f32 pointer");
   if (!output.getElementType().isUnsignedInteger(32) ||
       output.getAccess() == "read")
     return emitOpError("output must be a writable u32 pointer");
+  if (!scratch.getElementType().isUnsignedInteger(32) ||
+      scratch.getAccess() == "read" ||
+      scratch.getStorageClass() != "workspace" || !scratch.getNoAlias())
+    return emitOpError("scratch must be a writable noalias u32 workspace pointer");
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  StorageOp scratchStorage;
+  if (kernel)
+    for (StorageOp storage : kernel.getBody().front().getOps<StorageOp>())
+      if (storage.getPointer() == getScratch()) {
+        scratchStorage = storage;
+        break;
+      }
+  if (!scratchStorage || scratchStorage.getExtents().size() != 1)
+    return emitOpError(
+        "scratch must bind a rank-one workspace storage contract directly");
+  mlir::Value storageExtent = scratchStorage.getExtents().front();
+  std::optional<int64_t> storageConstant = constantIndex(storageExtent);
+  std::optional<int64_t> operationConstant = constantIndex(getExtent());
+  if (storageExtent != getExtent() &&
+      (!storageConstant || !operationConstant ||
+       *storageConstant != *operationConstant))
+    return emitOpError(
+        "scratch storage extent must equal the sort extent");
   if (getOrder() != "ascending" && getOrder() != "descending")
     return emitOpError("order must be ascending or descending");
   if (getNan() != "last")
@@ -1177,6 +1215,9 @@ static mlir::LogicalResult verifyProductResult(
     int64_t lhsReductionAxis, int64_t rhsReductionAxis) {
   if (!validOrder(order) || !validMath(math))
     return operation->emitOpError("invalid structured-product order or math mode");
+  if (isMasked(init.getType()) || isMasked(result.getType()))
+    return operation->emitOpError(
+        "dot/matmul validity applies only to multiplicand elements");
   mlir::Type lhsElement = elementTypeOf(unwrapMasked(lhs.getType()));
   mlir::Type rhsElement = elementTypeOf(unwrapMasked(rhs.getType()));
   if (!mlir::isa<mlir::FloatType>(lhsElement) || lhsElement != rhsElement ||
@@ -1200,6 +1241,12 @@ static mlir::LogicalResult verifyProductResult(
       elementTypeOf(init.getType()) != accType || (!scalarInit && !shapedInit))
     return operation->emitOpError(
         "dot/matmul result and explicit accumulator init are inconsistent");
+  if (shapedInit)
+    for (auto [axis, dimension] : llvm::enumerate(outputShape))
+      if (dimension == -1 && !haveSameExtent(init, axis, result, axis))
+        return operation->emitOpError()
+               << "dot/matmul accumulator extent identity is invalid at axis "
+               << axis;
   return mlir::success();
 }
 
@@ -1230,10 +1277,24 @@ mlir::LogicalResult DotOp::verify() {
     outputShape.push_back(lhsBlock.getShape()[0]);
     resultKind = ShapeKind::Block;
   }
-  return verifyProductResult(getOperation(), getLhs(), getRhs(), getInit(),
-                             getResult(), getAccDtype(), getOrder(), getMath(),
-                             outputShape, resultKind, 1,
-                             staticShapeOf(rhsType).size() - 1);
+  if (!elementTypeOf(lhsType).isF32() || !getAccDtype().isF32())
+    return emitOpError("dot target contract is f32 multiplicands with f32 accumulation");
+  if (mlir::failed(verifyProductResult(
+          getOperation(), getLhs(), getRhs(), getInit(), getResult(),
+          getAccDtype(), getOrder(), getMath(), outputShape, resultKind, 1,
+          staticShapeOf(rhsType).size() - 1)))
+    return mlir::failure();
+  if (lhsRegion && !haveSameExtent(getLhs(), 0, getResult(), 0))
+    return emitOpError("dot result VLA extent must inherit the lhs identity");
+  if (rhsRegion && !haveSameExtent(getRhs(), 0, getResult(), 0))
+    return emitOpError("dot result VLA extent must inherit the rhs identity");
+  if (lhsBlock && lhsBlock.getShape()[0] == -1) {
+    int64_t resultAxis = rowBank ? 1 : 0;
+    if (!haveSameExtent(getLhs(), 0, getResult(), resultAxis))
+      return emitOpError(
+          "dot result row extent must inherit the lhs row identity");
+  }
+  return mlir::success();
 }
 
 mlir::LogicalResult MatmulOp::verify() {
@@ -1241,19 +1302,50 @@ mlir::LogicalResult MatmulOp::verify() {
   auto rhs = mlir::dyn_cast<BlockType>(unwrapMasked(getRhs().getType()));
   if (!lhs || !rhs || lhs.getShape().size() != 2 || rhs.getShape().size() != 2)
     return emitOpError("matmul requires local rank-two [M,K] x [K,N] blocks");
+  if (!lhs.getElementType().isF16() || !rhs.getElementType().isF16() ||
+      !getAccDtype().isF32())
+    return emitOpError("matmul target contract is f16 x f16 with f32 accumulation");
   llvm::SmallVector<int64_t> outputShape{lhs.getShape()[0], rhs.getShape()[1]};
-  return verifyProductResult(getOperation(), getLhs(), getRhs(), getInit(),
-                             getResult(), getAccDtype(), getOrder(), getMath(),
-                             outputShape, ShapeKind::Block, 1, 0);
+  if (mlir::failed(verifyProductResult(
+          getOperation(), getLhs(), getRhs(), getInit(), getResult(),
+          getAccDtype(), getOrder(), getMath(), outputShape, ShapeKind::Block, 1,
+          0)))
+    return mlir::failure();
+  for (auto [resultAxis, operand, operandAxis] :
+       {std::tuple<int64_t, mlir::Value, int64_t>{0, getLhs(), 0},
+        std::tuple<int64_t, mlir::Value, int64_t>{1, getRhs(), 1}})
+    if (outputShape[resultAxis] == -1 &&
+        !haveSameExtent(getResult(), resultAxis, operand, operandAxis))
+      return emitOpError()
+             << "matmul output extent identity is invalid at axis "
+             << resultAxis;
+  return mlir::success();
 }
 
 mlir::LogicalResult LookupOp::verify() {
-  if (!mlir::isa<BlockType>(unwrapMasked(getTable().getType())) ||
-      !isIntegerLike(elementTypeOf(getIndices().getType())) ||
+  auto table = mlir::dyn_cast<BlockType>(getTable().getType());
+  if (!table || table.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+      !table.getElementType().isF32() ||
+      !elementTypeOf(getIndices().getType()).isUnsignedInteger(8) ||
+      isMasked(getIndices().getType()) || isMasked(getResult().getType()) ||
       !isPredicateType(getWhere().getType()) ||
+      shapeKindOf(getIndices().getType()) != ShapeKind::Region ||
       shapeKindOf(getResult().getType()) != shapeKindOf(getIndices().getType()) ||
-      staticShapeOf(getResult().getType()) != staticShapeOf(getIndices().getType()))
+      staticShapeOf(getResult().getType()) != staticShapeOf(getIndices().getType()) ||
+      !elementTypeOf(getResult().getType()).isF32())
     return emitOpError("lookup indices, predicate, and result footprint are invalid");
+  auto constant = getWhere().getDefiningOp<ConstantOp>();
+  auto value = constant
+                   ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                   : mlir::IntegerAttr{};
+  if (!value || value.getValue().isZero())
+    return emitOpError("lookup currently requires an all-active predicate");
+  auto resultShape = staticShapeOf(getResult().getType());
+  for (auto [axis, dimension] : llvm::enumerate(resultShape))
+    if (dimension == -1 &&
+        !haveSameExtent(getResult(), axis, getIndices(), axis))
+      return emitOpError()
+             << "lookup result extent identity is invalid at axis " << axis;
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getIndices(),
                                    "where")))
     return mlir::failure();
@@ -1261,13 +1353,24 @@ mlir::LogicalResult LookupOp::verify() {
 }
 
 mlir::LogicalResult DecodeOp::verify() {
-  if (!mlir::isa<BlockType>(unwrapMasked(getTable().getType())) ||
-      !isIntegerLike(elementTypeOf(getCodes().getType())) ||
+  auto table = mlir::dyn_cast<BlockType>(getTable().getType());
+  auto codes = mlir::dyn_cast<BlockType>(getCodes().getType());
+  if (!table || !codes || table.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+      codes.getShape() != llvm::ArrayRef<int64_t>({16}) ||
+      !table.getElementType().isSignedInteger(8) ||
+      !codes.getElementType().isUnsignedInteger(8) ||
+      !getOutDtype().isSignedInteger(8) || isMasked(getResult().getType()) ||
       !isPredicateType(getWhere().getType()) ||
       elementTypeOf(getResult().getType()) != getOutDtype() ||
       shapeKindOf(getResult().getType()) != shapeKindOf(getCodes().getType()) ||
       staticShapeOf(getResult().getType()) != staticShapeOf(getCodes().getType()))
     return emitOpError("decode codes, predicate, output dtype, and shape are invalid");
+  auto constant = getWhere().getDefiningOp<ConstantOp>();
+  auto value = constant
+                   ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                   : mlir::IntegerAttr{};
+  if (!value || value.getValue().isZero())
+    return emitOpError("decode currently requires an all-active predicate");
   if (mlir::failed(verifyFootprint(getOperation(), getWhere(), getCodes(),
                                    "where")))
     return mlir::failure();

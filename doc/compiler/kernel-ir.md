@@ -12,7 +12,7 @@ Canonical Kernel IR 保存完整 worker-local algorithm：
 - pointer/index、logical predicate、masked value与memory effect；
 - pointwise、conversion与special value；
 - reduce、scan、typed summary与sequential carry的observable distinction；
-- dot、matmul、lookup、decode、transpose与typed local extension primitive；
+- dot、matmul、lookup、decode与typed local extension primitive；
 - source meta value、source location与numerical attributes。
 
 它不得保存 exact `vl`、LMUL、register number、register microtile、target realization ID、
@@ -63,7 +63,7 @@ storage
 
 value/domain
   weft_kernel.constant / meta_value / block_axis / full
-  weft_kernel.expand_dims / broadcast_to / reshape / transpose
+  weft_kernel.expand_dims
   weft_kernel.tuple / tuple_get / special_value / invalid
 
 scalar, block and region compute
@@ -78,9 +78,10 @@ state and structured compute
   weft_kernel.sort_indices / lookup / decode
 ```
 
-不存在 `weft_kernel.range`、`weft_kernel.mask`、generic atomic或source prefetch op：Python
+`expand_dims`只承载Python singleton-axis slicing的canonical view，不是public任意shape-transform
+入口。不存在 `weft_kernel.range`、`weft_kernel.mask`、generic atomic或source prefetch op：Python
 `W.range`生成`weft_kernel.for`；logical validity由`masked` type传播，ordinary consumer需要
-filled value时必须由source在load处提供`other`或显式select。Physical prefetch只属于Realizer
+filled value时必须由source在load处提供`other`。Physical prefetch只属于Realizer
 schedule；当前VLA memory effect要求lane independence。
 
 ## Region 与 entry 边界
@@ -90,6 +91,8 @@ schedule；当前VLA memory effect要求lane independence。
 - entry argument kind只能是 `pointer`、`scalar` 或 `constexpr`；return为none或一个scalar。
 - persistent/workspace pointer的storage contract必须直接位于entry block，shape必须为正并可由
   constant、bound meta或runtime index ABI事实求得；workspace必须noalias。
+- primitive对workspace的访问extent必须与storage extent具有可证明identity；例如
+  `sort_indices`的rank-one u32 scratch必须与排序extent相同。
 - 第二个active VLA region不能嵌套；普通scalar `for` / `while` / `if`可以位于VLA body中。
   Active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出lexical region。
 - `argmax`与`online_softmax_summary`保存完整局部summary语义；target不得从普通SSA graph猜出。

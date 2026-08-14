@@ -129,17 +129,11 @@ int main(int argc, char **argv) {
   if (emitKind == "intrinsic-c") {
     weft::RISCVLoweringOptions options;
     std::string error;
-    if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, options.target,
-                                       error)) {
+    if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, matrixExtension,
+                                       options.target, error)) {
       llvm::errs() << error << "\n";
       return 1;
     }
-    if (matrixExtension != "none" && matrixExtension != "spacemit-ime1") {
-      llvm::errs() << "unsupported --matrix-extension value: "
-                   << matrixExtension << "\n";
-      return 1;
-    }
-    options.target.matrixExtension = matrixExtension;
     options.backend.vlaLMUL = vlaLMUL;
     options.backend.dotLMUL = dotLMUL;
     options.backend.dotKUnroll = dotKUnroll;

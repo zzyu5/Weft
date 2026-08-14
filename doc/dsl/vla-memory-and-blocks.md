@@ -105,7 +105,8 @@ mask。
 x = W.load(ptr, where=valid)
 ```
 
-当 `other` 省略时，结果是一个带 logical validity 的 masked value。
+当 `other` 省略且`where`不是静态`True`时，结果是一个带logical validity的masked value。
+`where=True`的无填充值load覆盖整个逻辑domain，因此产生普通all-active value。
 
 ```python
 x = W.load(ptr, where=valid, other=0.0)
@@ -120,18 +121,17 @@ Pointwise op 对 masked operand 传播 validity。多个 masked operand 的默�
 Masked value 只能：
 
 - 由 validity-aware structured primitive 消费；
-- 由 masked store 消费；
 - 继续经过会传播相同 logical validity 的 pointwise chain。
 
 禁止将未填充 masked value 作为普通 scalar / block value逃逸到不理解 validity 的 op。普通
-consumer需要 filled value 时，作者必须在原始 `W.load` 提供 `other`，或用显式 predicate 与
-`W.select` 构造普通 value；语言不提供从 masked value 事后猜回 predicate/fill 的第二套 API。
+consumer和store需要filled value时，作者必须在原始 `W.load` 提供 `other`。语言不提供从masked
+value事后猜回predicate/fill的第二套API，当前public store也不接受masked value。
 
 ### Consumer-specific invalid semantics
 
 | Consumer | invalid element 的语义 |
 |---|---|
-| masked store | 不产生 store effect |
+| store | 不接受masked value；作者使用独立`where`并在producer处给出fill |
 | reduce | 不贡献，等价于该 reduce 的 identity |
 | typed summary | 由该primitive自身定义 |
 | dot / matmul | 不贡献，等价于乘加域的语义零元素 |
@@ -231,23 +231,18 @@ m[:, None]
 k[None, :]
 ```
 
-并提供等价显式 API：
-
-```python
-W.expand_dims(value, axis)
-W.broadcast_to(value, shape)
-```
+这两种slicing只插入singleton logical axis；它们不授权任意broadcast或shape重写。
 
 ### Block constructors
 
 ```python
 W.full(shape, value, dtype=...)
 W.zeros(shape, dtype=...)
-W.reshape(value, shape)
-W.transpose(value, permutation)
 ```
 
-这些构造只定义 logical value。是否 materialize、如何分寄存器、是否重新生成，由 target lowering 决定。
+这些构造只定义logical value。当前public surface没有任意reshape/transpose；算法需要的坐标变换
+由作者显式写入pointer/index relation。是否materialize、如何分寄存器、是否重新生成，由target
+lowering决定。
 
 ### Block load/store
 

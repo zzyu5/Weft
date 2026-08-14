@@ -13,11 +13,11 @@ namespace {
 constexpr std::size_t kN = 4096;
 constexpr std::size_t kK = 4096;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
-constexpr std::uint16_t kHalfValues[] = {
-    0x3c00U,
-    0x3800U,
-    0xbc00U,
-    0x4000U,
+constexpr _Float16 kHalfValues[] = {
+    static_cast<_Float16>(1.0F),
+    static_cast<_Float16>(0.5F),
+    static_cast<_Float16>(-1.0F),
+    static_cast<_Float16>(2.0F),
 };
 constexpr float kFloatValues[] = {1.0F, 0.5F, -1.0F, 2.0F};
 volatile std::uint64_t evictionSink;
@@ -77,8 +77,8 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::vector<std::uint16_t> a(m * kK);
-  std::vector<std::uint16_t> b(kK * kN);
+  std::vector<_Float16> a(m * kK);
+  std::vector<_Float16> b(kK * kN);
   std::vector<float> c(m * kN, 0.0F);
   for (std::size_t row = 0; row < m; ++row)
     for (std::size_t inner = 0; inner < kK; ++inner)

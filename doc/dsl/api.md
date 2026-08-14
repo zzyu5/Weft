@@ -52,7 +52,8 @@ def effectful_helper(...):
 ```
 
 `for ... else` 与 `while ... else` 不属于语言。Integer/index value支持 `&`、`|`、`^`、
-`<<` 与 `>>`。
+`<<` 与 `>>`。Helper参数和返回值不写Python type annotation；其typed schema来自每个调用点，
+只有kernel entry annotation定义public ABI。
 
 ## VLA、predicate 与 memory
 
@@ -71,13 +72,10 @@ W.select(predicate, true_value, false_value)
 W.block_axis(extent, offset=0)
 W.full(shape, value, dtype=None)
 W.zeros(shape, dtype)
-W.expand_dims(value, axis)
-W.broadcast_to(value, shape)
-W.reshape(value, shape)
-W.transpose(value, permutation)
 ```
 
-Python `value[:, None]` / `value[None, :]` 是 `expand_dims` 的 source sugar。
+Python `value[:, None]` / `value[None, :]` 构造singleton logical axis。当前public surface没有
+任意broadcast、reshape或transpose op；坐标重排必须由作者写成显式pointer/index relation。
 
 ## State algebra
 
@@ -90,9 +88,12 @@ W.scan(value, op=..., identity=..., inclusive=True, where=True,
 
 W.argmax(value, coordinate, tie="lowest_coordinate", order="relaxed")
 W.online_softmax_summary(value, math="native", order="preserve")
-W.sort_indices(input_ptr, output_ptr, extent,
+W.sort_indices(input_ptr, output_ptr, scratch_workspace_ptr, extent,
                order="ascending", nan="last", tie="index_ascending")
 ```
+
+`sort_indices`的scratch必须是rank-one `u32` workspace，其`W.storage` extent与排序extent相同；
+它是caller提供的算法workspace，不是target隐藏的stack ABI。
 
 普通 sequential carry使用 scalar `W.range` / Python `while`，不会被自动提升为 reduce、scan
 或typed summary。
@@ -107,6 +108,10 @@ W.matmul(lhs, rhs, init=..., acc_dtype=...,
 W.lookup(table, indices, where=True)
 W.decode(codes, table, where=True, out_dtype=...)
 ```
+
+当前canonical/public形态为：`dot`使用f32 multiplicand与f32 accumulator；`matmul`使用
+f16 `[M,K] × [K,N]`与f32 accumulator；`lookup`是all-active VLA u8 index查询
+`block<16xf32>`；`decode`是all-active `block<16xu8>`通过`block<16xi8>`表得到i8 block。
 
 ## Pointwise、special value 与 conversion
 

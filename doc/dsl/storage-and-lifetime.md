@@ -70,6 +70,10 @@ Workspace 是算法可观察的 memory state：作者决定何时写入、跨哪
 `constexpr` 或 runtime `index` ABI 参数的显式算术表达式求得。它描述逻辑容量，不赋予 target
 改变 blocking、packing 或 lifetime 的权限。
 
+显式消费workspace的primitive必须把自己的访问extent与该storage合同建立可证明关系。例如
+`W.sort_indices(..., scratch, extent)`要求`scratch`的rank-one storage extent与`extent`为同一
+SSA identity或同值常量；无法证明时在frontend/canonical边界拒绝，而不是生成可能越界的artifact。
+
 ## Pointer facts 与 lifetime
 
 Storage class 与以下 pointer facts 正交：
@@ -102,6 +106,8 @@ persistent format identity：
 
 `weft_kernel.storage` 只绑定 kernel entry 的 persistent/workspace pointer，并保存 shape 与显式
 extent operands。Primitive-private temporary 不进入 pointer type、`storage` op 或 entry ABI。
+Target primitive若要求特定persistent representation，必须在physical selection前核对pointer的
+format identity；caller仍负责传入内容、bounds、alignment与lifetime确实满足已声明合同。
 
 同一次 `weft-compile --emit=intrinsic-c` 必须同时生成 intrinsic C 和 public C header。Header
 保存 entry declaration；为每个 pointer给出 storage class、format、alignment、noalias/restrict metadata；

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -26,6 +27,13 @@ constexpr float kFloatValues[] = {0.125F, 0.0625F, -0.125F, 0.25F};
 constexpr std::uint16_t kHalfZero = 0x0000U;
 constexpr std::uint16_t kHalfNegativeInfinity = 0xfc00U;
 volatile std::uint64_t evictionSink;
+
+_Float16 halfFromBits(std::uint16_t bits) {
+  static_assert(sizeof(_Float16) == sizeof(bits));
+  _Float16 value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
 
 std::size_t repetitions(const char *text) {
   char *end = nullptr;
@@ -98,12 +106,12 @@ int main(int argc, char **argv) {
   const std::size_t keyValueElements =
       kKeyValueHeads * kKeys * kHeadDimension;
   std::vector<float> query(queryElements);
-  std::vector<std::uint16_t> key(keyValueElements);
-  std::vector<std::uint16_t> value(keyValueElements);
-  std::vector<std::uint16_t> mask(kQueries * kKeys);
+  std::vector<_Float16> key(keyValueElements);
+  std::vector<_Float16> value(keyValueElements);
+  std::vector<_Float16> mask(kQueries * kKeys);
   std::vector<float> output(queryElements, 0.0F);
-  std::vector<std::uint16_t> queryScratch(kHeadDimension);
-  std::vector<std::uint16_t> accumulatorScratch(kHeadDimension);
+  std::vector<_Float16> queryScratch(kHeadDimension);
+  std::vector<_Float16> accumulatorScratch(kHeadDimension);
 
   for (std::size_t head = 0; head < kQueryHeads; ++head)
     for (std::size_t row = 0; row < kQueries; ++row)
@@ -115,14 +123,15 @@ int main(int argc, char **argv) {
       for (std::size_t dimension = 0; dimension < kHeadDimension; ++dimension) {
         const std::size_t offset =
             (head * kKeys + row) * kHeadDimension + dimension;
-        key[offset] = kHalfValues[(head + 5 * row + dimension + 2) % 4];
-        value[offset] =
-            kHalfValues[(head + 7 * row + 3 * dimension + 3) % 4];
+        key[offset] = halfFromBits(
+            kHalfValues[(head + 5 * row + dimension + 2) % 4]);
+        value[offset] = halfFromBits(
+            kHalfValues[(head + 7 * row + 3 * dimension + 3) % 4]);
       }
   for (std::size_t queryIndex = 0; queryIndex < kQueries; ++queryIndex)
     for (std::size_t keyIndex = 0; keyIndex < kKeys; ++keyIndex)
-      mask[queryIndex * kKeys + keyIndex] =
-          keyIndex <= queryIndex ? kHalfZero : kHalfNegativeInfinity;
+      mask[queryIndex * kKeys + keyIndex] = halfFromBits(
+          keyIndex <= queryIndex ? kHalfZero : kHalfNegativeInfinity);
 
   const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDimension));
   online_flash_attention_f32_f16(

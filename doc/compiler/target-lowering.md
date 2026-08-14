@@ -7,16 +7,18 @@
 
 ```text
 target triple / march / ABI / XLEN / endianness
-RVV availability
-fixed VLEN bits，或 0 表示 runtime-unknown
+strict ABI kind、full RVV availability与fixed VLEN bits
+scalar/vector f16、supported SEW与legal LMUL
+indexed/segment memory与integer/float widening capability
 architectural vector register count
 matrix/vendor extension identity
 ```
 
-`march` 是ISA extension事实的当前载体。随着realization family扩展，profile可以解析出element
-width、LMUL、mask/tail、fragment、rounding与memory instruction等派生capability；这些仍是
-target facts，不形成新IR。Cache、throughput、latency与preferred unroll只能作为hint排序
-合法物理配置，不能让非法实现变合法。
+Parser只为它能证明的ISA事实赋能：当前backend要求full `V`，不会把`Zve`子集冒充完整RVV；
+`spacemit-ime1`要求RV64与精确VLEN256。Profile可保留原始march作诊断，但lowering legality读取
+typed facts而不是散落的字符串判断。当前`intrinsic-c` target要求显式fixed VLEN；0只可作为
+尚未绑定的profile值，不能进入codegen。Cache、throughput、latency与preferred unroll只能
+作为hint排序合法物理配置，不能让非法实现变合法。
 
 当前 `RISCVLoweringOptions` 的public输入包括target profile、source meta bindings与显式的
 build-time backend config。后者只约束本次lowering中的LMUL、microtile、unroll与radix

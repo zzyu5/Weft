@@ -8,8 +8,8 @@ Frontend和dialect verifier负责拒绝自相矛盾的IR，例如：
 
 - entry ABI、argument kind、return与type不一致；
 - pointer storage class/format不合法，workspace未声明noalias，persistent/workspace缺失或重复
-  entry storage contract，或storage shape/extent不闭合；
-- pointer arithmetic、shape、broadcast、axis或tuple type不合法；
+  entry storage contract，storage shape/extent不闭合，或primitive workspace访问extent与合同不一致；
+- pointer arithmetic、shape、singleton-axis view、axis或tuple type不合法；
 - nested active VLA、active VLA value逃逸或VLA body任意修改outer state；VLA中的普通
   scalar control本身合法；
 - masked value进入不理解validity的consumer；
@@ -25,7 +25,7 @@ Verifier只检查IR内部已经存在的事实，不从tensor shape推导algorit
 Target lowering针对本次target/profile/config检查：
 
 - 所需RVV、fixed VLEN、element width或matrix extension是否存在；
-- 当前primitive closure是否有合法realization；
+- 当前primitive、typed operand/use relation与storage handoff是否有合法realization；
 - register/fragment/primitive-private temporary/alignment与local fusion是否可实现；
 - meta/backend binding是否完整且合法。
 
@@ -40,7 +40,7 @@ fallback，也不授权把整个kernel静默切换到scalar-only路径。
 - `noalias`、alignment、bounds与pointer lifetime；
 - VLA iteration effect independence；
 - external worker slices之间的数据竞争与同步；
-- persistent packed storage确实符合source声明的格式；
+- persistent packed storage的实际内容确实符合source声明且target已核对的格式identity；
 - external/persistent pointer与workspace的实际bounds、alignment、lifetime和worker-exclusive
   ownership。
 

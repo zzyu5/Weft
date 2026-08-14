@@ -188,26 +188,6 @@ def WeftKernel_ExpandDimsOp : WeftKernel_Op<"expand_dims", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_BroadcastToOp : WeftKernel_Op<"broadcast_to", [Pure]> {
-  let arguments = (ins AnyType:$input, Variadic<Index>:$extents,
-                       DenseI64ArrayAttr:$shape);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_ReshapeOp : WeftKernel_Op<"reshape", [Pure]> {
-  let arguments = (ins AnyType:$input, Variadic<Index>:$extents,
-                       DenseI64ArrayAttr:$shape);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_TransposeOp : WeftKernel_Op<"transpose", [Pure]> {
-  let arguments = (ins AnyType:$input, DenseI64ArrayAttr:$permutation);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_PtrAddOp : WeftKernel_Op<"ptr_add", [Pure]> {
   let arguments = (ins AnyType:$base, AnyType:$offset);
   let results = (outs AnyType:$result);
@@ -274,6 +254,7 @@ def WeftKernel_InvalidOp : WeftKernel_Op<"invalid", [Pure]> {
   let summary = "Explicit absence of a filled value or optional predicate";
   let arguments = (ins);
   let results = (outs NoneType:$result);
+  let hasVerifier = 1;
 }
 
 def WeftKernel_LoadOp : WeftKernel_Op<"load", [MemoryEffects<[MemRead]>]> {
@@ -295,6 +276,7 @@ def WeftKernel_SortIndicesOp
   let summary = "Stable local ordering of an f32 pointer slice into u32 indices";
   let arguments = (ins WeftKernel_PtrType:$input,
                        WeftKernel_PtrType:$output,
+                       WeftKernel_PtrType:$scratch,
                        Index:$extent,
                        StrAttr:$order,
                        StrAttr:$nan,

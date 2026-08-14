@@ -18,7 +18,6 @@ from .builtins import argmax
 from .builtins import bitcast
 from .builtins import block_axis
 from .builtins import affine_i4_i8_contract
-from .builtins import broadcast_to
 from .builtins import cast
 from .builtins import cos
 from .builtins import decode
@@ -26,7 +25,6 @@ from .builtins import dot
 from .builtins import e2m1_e8m0_i8_dot
 from .builtins import exp
 from .builtins import exp2
-from .builtins import expand_dims
 from .builtins import floor
 from .builtins import full
 from .builtins import grouped_affine_i4_i8_dot
@@ -48,7 +46,6 @@ from .builtins import q6_k_i8_dot
 from .builtins import pure
 from .builtins import range
 from .builtins import reduce
-from .builtins import reshape
 from .builtins import rsqrt
 from .builtins import sqrt
 from .builtins import scan
@@ -59,7 +56,6 @@ from .builtins import sort_indices
 from .builtins import store
 from .builtins import storage
 from .builtins import symmetric_i4_i8_contract
-from .builtins import transpose
 from .builtins import tuple
 from .builtins import vla
 from .builtins import zeros
