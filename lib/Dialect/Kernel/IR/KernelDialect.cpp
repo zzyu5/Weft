@@ -358,6 +358,8 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
     return deriveExtentImpl(load.getPointer(), axis, visited);
   if (auto scan = mlir::dyn_cast<ScanOp>(definition))
     return deriveExtentImpl(scan.getInput(), axis, visited);
+  if (auto lookup = mlir::dyn_cast<LookupOp>(definition))
+    return deriveExtentImpl(lookup.getIndices(), axis, visited);
   if (auto dot = mlir::dyn_cast<DotOp>(definition)) {
     bool lhsRegion = mlir::isa<RegionType>(unwrapMasked(dot.getLhs().getType()));
     bool rhsRegion = mlir::isa<RegionType>(unwrapMasked(dot.getRhs().getType()));

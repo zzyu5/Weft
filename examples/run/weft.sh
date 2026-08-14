@@ -488,6 +488,44 @@ case "${kernel}" in
     runtime=examples/repro/weft/rotation/rope_neox_runtime.cpp
     runtime_arguments=("$1")
     ;;
+  interleaved_complex)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} interleaved_complex" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/rotation/interleaved_complex.py
+    runtime=examples/repro/weft/rotation/interleaved_complex_runtime.cpp
+    multi=1
+    multi_primary=interleaved_complex_mul_f32
+    multi_equivalent=interleaved_complex_mul_f32_equivalent
+    ;;
+  interleaved_rope)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} interleaved_rope" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/rotation/interleaved_rope.py
+    runtime=examples/repro/weft/rotation/interleaved_rope_runtime.cpp
+    ;;
+  dilated_causal_conv1d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} dilated_causal_conv1d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/state/dilated_causal_conv1d.py
+    runtime=examples/repro/weft/state/dilated_causal_conv1d_runtime.cpp
+    ;;
+  codebook_lookup_affine)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} codebook_lookup_affine" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/codebook_lookup_affine.py
+    runtime=examples/repro/weft/quantization/codebook_lookup_affine_runtime.cpp
+    multi=1
+    multi_primary=codebook_lookup_affine_f32
+    multi_equivalent=codebook_lookup_affine_f32_equivalent
+    ;;
   flash_attention)
     if [[ $# -ne 1 ]]; then
       echo "usage: ${usage_prefix} flash_attention <repetitions>" >&2
