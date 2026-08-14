@@ -1259,6 +1259,9 @@ class FrontendCompiler:
     def _intrinsic_exp(self, call: ast.Call) -> Value:
         return self._math_unary(call, "exp")
 
+    def _intrinsic_tanh(self, call: ast.Call) -> Value:
+        return self._math_unary(call, "tanh")
+
     def _intrinsic_exp2(self, call: ast.Call) -> Value:
         return self._math_unary(call, "exp2")
 

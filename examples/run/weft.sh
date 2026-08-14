@@ -121,6 +121,17 @@ case "${kernel}" in
     dsl=examples/kernels/normalization/rms_norm.py
     runtime=examples/repro/weft/normalization/rms_norm_runtime.cpp
     ;;
+  rms_norm_mul)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} rms_norm_mul" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/normalization/rms_norm_mul.py
+    runtime=examples/repro/weft/normalization/rms_norm_mul_runtime.cpp
+    multi=1
+    multi_primary=rms_norm_mul_f32
+    multi_equivalent=rms_norm_mul_f32_equivalent
+    ;;
   layer_norm)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} layer_norm" >&2
@@ -333,6 +344,14 @@ case "${kernel}" in
     dsl=examples/kernels/vision/dense_conv2d.py
     runtime=examples/repro/weft/vision/dense_conv2d_runtime.cpp
     ;;
+  conv3d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} conv3d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/conv3d.py
+    runtime=examples/repro/weft/vision/conv3d_runtime.cpp
+    ;;
   conv_transpose2d)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} conv_transpose2d" >&2
@@ -348,6 +367,17 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/vision/im2col_backward.py
     runtime=examples/repro/weft/vision/im2col_backward_runtime.cpp
+    ;;
+  col2im_1d)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} col2im_1d" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/vision/col2im_1d.py
+    runtime=examples/repro/weft/vision/col2im_1d_runtime.cpp
+    multi=1
+    multi_primary=col2im_1d_f32
+    multi_equivalent=col2im_1d_f32_equivalent
     ;;
   softmax)
     if [[ $# -ne 0 ]]; then
@@ -488,6 +518,14 @@ case "${kernel}" in
     runtime=examples/repro/weft/rotation/rope_neox_runtime.cpp
     runtime_arguments=("$1")
     ;;
+  qwen3vl_mrope)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} qwen3vl_mrope" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/rotation/qwen3vl_mrope.py
+    runtime=examples/repro/weft/rotation/qwen3vl_mrope_runtime.cpp
+    ;;
   interleaved_complex)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} interleaved_complex" >&2
@@ -535,6 +573,14 @@ case "${kernel}" in
     runtime=examples/repro/weft/attention/online_flash_attention_runtime.cpp
     runtime_arguments=("$1")
     ;;
+  flash_attn_ext)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} flash_attn_ext" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/attention/flash_attn_ext.py
+    runtime=examples/repro/weft/attention/flash_attn_ext_runtime.cpp
+    ;;
   csr_sparse_attention)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} csr_sparse_attention" >&2
@@ -559,6 +605,23 @@ case "${kernel}" in
     dsl=examples/kernels/ime/q4_k_projection.py
     runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
     runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
+    ;;
+  q4_k_mul_mat_id)
+    if [[ $# -ne 1 ]]; then
+      echo "usage: ${usage_prefix} q4_k_mul_mat_id <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/contraction/q4_k_mul_mat_id.py
+    runtime=examples/repro/weft/contraction/q4_k_mul_mat_id_runtime.cpp
+    runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
+    ;;
+  timestep_embedding)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} timestep_embedding" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/embedding/timestep_embedding.py
+    runtime=examples/repro/weft/embedding/timestep_embedding_runtime.cpp
     ;;
   q4_0_projection_ime)
     if [[ $# -ne 1 ]]; then

@@ -24,6 +24,7 @@ from .builtins import decode
 from .builtins import dot
 from .builtins import e2m1_e8m0_i8_dot
 from .builtins import exp
+from .builtins import tanh
 from .builtins import exp2
 from .builtins import floor
 from .builtins import full
