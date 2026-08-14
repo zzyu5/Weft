@@ -475,6 +475,7 @@ struct VLABinaryDecision {
 };
 
 enum class VLACastRealization {
+  RVVIdentity,
   RVVWidenF16ToF32,
   RVVNarrowF32ToF16,
   RVVZeroExtendU32ToIndex,
@@ -909,6 +910,17 @@ bool isTrue(mlir::Value value) {
 
 bool isRegionValue(mlir::Type type) {
   return logicalShapeKind(type) == LogicalShapeKind::Region;
+}
+
+LoadOp traceIdentityCastLoad(mlir::Value value) {
+  while (true) {
+    if (auto load = value.getDefiningOp<LoadOp>())
+      return load;
+    auto cast = value.getDefiningOp<CastOp>();
+    if (!cast || cast.getInput().getType() != cast.getResult().getType())
+      return {};
+    value = cast.getInput();
+  }
 }
 
 std::optional<int64_t> integerConstantValue(mlir::Value value) {
@@ -1756,8 +1768,8 @@ private:
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = dot.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = dot.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = traceIdentityCastLoad(dot.getLhs());
+    LoadOp rhsLoad = traceIdentityCastLoad(dot.getRhs());
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere()) ||
         (!isTrue(lhsLoad.getWhere()) &&
          !isFloatConstant(lhsLoad.getOther(), 0.0))) {
@@ -1888,7 +1900,7 @@ private:
       return mlir::failure();
     }
 
-    LoadOp freeLoad = dot.getLhs().getDefiningOp<LoadOp>();
+    LoadOp freeLoad = traceIdentityCastLoad(dot.getLhs());
     if (!freeLoad || !isTrue(freeLoad.getWhere())) {
       dot.emitError("RVV VLA vector-dot load facts are unavailable");
       return mlir::failure();
@@ -2882,6 +2894,20 @@ private:
       mlir::Type result = elementType(cast.getResult().getType());
       VLACastDecision selectedCast;
       selectedCast.operation = cast.getOperation();
+      if (cast.getInput().getType() == cast.getResult().getType()) {
+        selectedCast.realization = VLACastRealization::RVVIdentity;
+        RVVVectorShape shape = regionShape(cast.getInput().getType());
+        if (!shape) {
+          cast.emitError("VLA identity cast has no selected RVV shape");
+          return mlir::failure();
+        }
+        recordPhysicalValue(entity, cast.getInput(), shape);
+        recordPhysicalValue(entity, cast.getResult(), shape);
+        recordPhysicalHandoff(entity, cast.getOperation(), cast.getInput(),
+                              PhysicalHandoff::Share, shape, shape);
+        decision.casts.push_back(selectedCast);
+        continue;
+      }
       unsigned sourceSEW = 0;
       unsigned resultSEW = 0;
       if (isF16(source) && result.isF32()) {
@@ -4710,6 +4736,15 @@ private:
           findVLAHandoff(op.getOperation(), op.getInput());
       const PhysicalValueDecision *resultShape =
           findVLAValueDecision(op.getResult());
+      if (decision->realization == VLACastRealization::RVVIdentity) {
+        if (!handoff || handoff->kind != PhysicalHandoff::Share ||
+            !resultShape || handoff->sourceShape != handoff->resultShape ||
+            handoff->resultShape != resultShape->shape)
+          return op.emitError("VLA identity cast handoff is inconsistent");
+        input.type = op.getResult().getType();
+        values[op.getResult()] = std::move(input);
+        return mlir::success();
+      }
       if (!handoff || handoff->kind != PhysicalHandoff::Convert ||
           !resultShape || handoff->resultShape != resultShape->shape)
         return op.emitError("VLA cast physical handoff is inconsistent");
@@ -5299,8 +5334,8 @@ private:
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = dot.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = dot.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = traceIdentityCastLoad(dot.getLhs());
+    LoadOp rhsLoad = traceIdentityCastLoad(dot.getRhs());
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere())) {
       dot.emitError("RVV row microtile load producers are unavailable");
       return mlir::failure();
@@ -7729,8 +7764,8 @@ private:
   decideF16GemmNTiles(MatmulOp matmul) {
     if (!options.target.hasVectorF16 || !options.target.hasWideningFloat)
       return std::nullopt;
-    LoadOp lhsLoad = matmul.getLhs().getDefiningOp<LoadOp>();
-    LoadOp rhsLoad = matmul.getRhs().getDefiningOp<LoadOp>();
+    LoadOp lhsLoad = traceIdentityCastLoad(matmul.getLhs());
+    LoadOp rhsLoad = traceIdentityCastLoad(matmul.getRhs());
     auto blockType = [](mlir::Type type) -> BlockType {
       type = unwrapLogicalValidity(type);
       return mlir::dyn_cast<BlockType>(type);

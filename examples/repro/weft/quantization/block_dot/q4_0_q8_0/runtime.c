@@ -22,7 +22,8 @@ int main(void) {
     expected += high * (float)y.qs[i + GGML_QK32 / 2] * 0.5f;
   }
 
-  const float actual = q4_0_q8_0(&x, &y, 1);
+  const float actual =
+      q4_0_q8_0((const uint8_t *)&x, (const uint8_t *)&y, 1);
   if (fabsf(actual - expected) > 1.0e-6f) {
     return 1;
   }

@@ -309,7 +309,7 @@ int main(int argc, char **argv) {
   std::printf("kernel=q4_k_projection_ime\n");
   std::printf("hardware=%s\n", runtime.hardware);
   std::printf("M=%zu,N=%zu,K=%zu\n", kRows, kColumns, kInner);
-  std::printf("persistent_weight=q4_K_to_q4_1x16_K32_N16\n");
+  std::printf("persistent_weight=q4_k_n16_k32_304b\n");
   std::printf("scope=%s\n", runtime.scope);
   std::printf("cold_protocol=64MiB-evict-then-single-kernel\n");
   std::printf("activation_code_mismatches=%zu\n", code_mismatches);

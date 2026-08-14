@@ -743,6 +743,7 @@ tar -C "${local_root}" -cf - . |
         -c kernel.c -o kernel.o
       ar rcs libweft_kernel.a kernel.o
       \"\${cc}\" -O3 ${remote_compile_flags} -funroll-loops -std=c11 -Wall -Wextra -Werror \
+        -D_POSIX_C_SOURCE=200809L \
         -march=${target_march} -mabi=lp64d \
         -include kernel.h \
         -c leaf/runtime.c -o runtime.o

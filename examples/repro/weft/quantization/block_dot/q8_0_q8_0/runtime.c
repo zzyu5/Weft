@@ -15,7 +15,8 @@ int main(void) {
   }
 
   const float expected = (float)integer_sum * 0.5f * 0.25f;
-  const float actual = q8_0_q8_0(&x, &y, 1);
+  const float actual =
+      q8_0_q8_0((const uint8_t *)&x, (const uint8_t *)&y, 1);
   if (fabsf(actual - expected) > 1.0e-6f) {
     return 1;
   }

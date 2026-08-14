@@ -85,11 +85,4 @@ static inline void repro_get_scale_min_k4(
   }
 }
 
-float q4_0_q8_0(const block_q4_0 *x, const block_q8_0 *y, size_t blocks);
-float q4_1_q8_1(const block_q4_1 *x, const block_q8_1 *y, size_t blocks);
-float q5_0_q8_0(const block_q5_0 *x, const block_q8_0 *y, size_t blocks);
-float q5_1_q8_1(const block_q5_1 *x, const block_q8_1 *y, size_t blocks);
-float q8_0_q8_0(const block_q8_0 *x, const block_q8_0 *y, size_t blocks);
-float q4_K_q8_K(const block_q4_K *x, const block_q8_K *y, size_t blocks);
-
 #endif

@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "../common/ggml_quant.h"
 
 #include <math.h>
@@ -137,7 +135,10 @@ static void run_weft(
     const block_q8_K *activation = activations + row * k_blocks;
     for (size_t column = 0; column < n; ++column) {
       const block_q4_K *weight = weights + column * k_blocks;
-      output[row * n + column] = q4_K_q8_K(weight, activation, k_blocks);
+      output[row * n + column] =
+          q4_K_q8_K((const uint8_t *)weight,
+                    (const uint8_t *)activation,
+                    k_blocks);
     }
   }
 }
