@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <riscv_vector.h>
 #include <vector>
 
 extern "C" void interleaved_rope_f32(
@@ -29,12 +30,67 @@ double median(std::vector<double> samples) {
   std::sort(samples.begin(), samples.end());
   return samples[samples.size() / 2];
 }
+using Kernel = void (*)(const float *, const float *, float *, std::size_t,
+                        std::size_t, std::size_t, std::size_t, std::size_t);
+void interleaved_rope_f32_strided_baseline(
+    const float *source, const float *angles, float *destination,
+    std::size_t tokens, std::size_t heads, std::size_t pairs,
+    std::size_t tokenStride, std::size_t headStride) {
+  constexpr std::ptrdiff_t kStride = 2 * sizeof(float);
+  for (std::size_t token = 0; token < tokens; ++token) {
+    const float *tokenSource = source + token * tokenStride;
+    float *tokenDestination = destination + token * tokenStride;
+    const float *tokenAngles = angles + 2 * token * pairs;
+    for (std::size_t head = 0; head < heads; ++head) {
+      const float *headSource = tokenSource + head * headStride;
+      float *headDestination = tokenDestination + head * headStride;
+      for (std::size_t offset = 0; offset < pairs;) {
+        const std::size_t vl = __riscv_vsetvl_e32m4(pairs - offset);
+        const vfloat32m4_t real = __riscv_vlse32_v_f32m4(
+            headSource + 2 * offset, kStride, vl);
+        const vfloat32m4_t imag = __riscv_vlse32_v_f32m4(
+            headSource + 2 * offset + 1, kStride, vl);
+        const vfloat32m4_t cosine = __riscv_vlse32_v_f32m4(
+            tokenAngles + 2 * offset, kStride, vl);
+        const vfloat32m4_t sine = __riscv_vlse32_v_f32m4(
+            tokenAngles + 2 * offset + 1, kStride, vl);
+        const vfloat32m4_t rotatedReal = __riscv_vfsub_vv_f32m4(
+            __riscv_vfmul_vv_f32m4(real, cosine, vl),
+            __riscv_vfmul_vv_f32m4(imag, sine, vl), vl);
+        const vfloat32m4_t rotatedImag = __riscv_vfadd_vv_f32m4(
+            __riscv_vfmul_vv_f32m4(real, sine, vl),
+            __riscv_vfmul_vv_f32m4(imag, cosine, vl), vl);
+        __riscv_vsse32_v_f32m4(headDestination + 2 * offset, kStride,
+                               rotatedReal, vl);
+        __riscv_vsse32_v_f32m4(headDestination + 2 * offset + 1, kStride,
+                               rotatedImag, vl);
+        offset += vl;
+      }
+    }
+  }
+}
+double run(Kernel kernel, const std::vector<float> &source,
+           const std::vector<float> &angles, std::vector<float> &output,
+           std::vector<std::uint8_t> &eviction) {
+  std::vector<double> samples;
+  for (int repetition = 0; repetition < 7; ++repetition) {
+    evict(eviction);
+    const auto begin = std::chrono::steady_clock::now();
+    kernel(source.data(), angles.data(), output.data(), kTokens, kHeads, kPairs,
+           kTokenStride, kHeadStride);
+    const auto end = std::chrono::steady_clock::now();
+    samples.push_back(
+        std::chrono::duration<double, std::milli>(end - begin).count());
+  }
+  return median(samples);
+}
 } // namespace
 
 int main() {
   std::vector<float> source(kElements);
   std::vector<float> angles(2 * kTokens * kPairs);
   std::vector<float> output(kElements);
+  std::vector<float> baseline(kElements);
   std::vector<float> reference(kElements);
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] = static_cast<float>(static_cast<int>((index * 13) % 257) - 128) /
@@ -57,33 +113,39 @@ int main() {
       }
   interleaved_rope_f32(source.data(), angles.data(), output.data(), kTokens,
                        kHeads, kPairs, kTokenStride, kHeadStride);
+  interleaved_rope_f32_strided_baseline(
+      source.data(), angles.data(), baseline.data(), kTokens, kHeads, kPairs,
+      kTokenStride, kHeadStride);
   double maximum = 0.0;
-  for (std::size_t index = 0; index < output.size(); ++index)
+  double baselineMaximum = 0.0;
+  for (std::size_t index = 0; index < output.size(); ++index) {
     maximum = std::max(maximum, std::abs(static_cast<double>(output[index]) -
                                          reference[index]));
-  if (maximum > 1.0e-6) {
-    std::fprintf(stderr, "interleaved rope mismatch: %g\n", maximum);
+    baselineMaximum =
+        std::max(baselineMaximum,
+                 std::abs(static_cast<double>(baseline[index]) -
+                          reference[index]));
+  }
+  if (maximum > 1.0e-6 || baselineMaximum > 1.0e-6) {
+    std::fprintf(stderr, "interleaved rope mismatch: %g %g\n", maximum,
+                 baselineMaximum);
     return 1;
   }
   std::vector<std::uint8_t> eviction(kEvictionBytes, 1);
-  std::vector<double> samples;
-  for (int repetition = 0; repetition < 7; ++repetition) {
-    evict(eviction);
-    const auto begin = std::chrono::steady_clock::now();
-    interleaved_rope_f32(source.data(), angles.data(), output.data(), kTokens,
-                         kHeads, kPairs, kTokenStride, kHeadStride);
-    const auto end = std::chrono::steady_clock::now();
-    samples.push_back(
-        std::chrono::duration<double, std::milli>(end - begin).count());
-  }
-  const double milliseconds = median(samples);
+  const double milliseconds =
+      run(interleaved_rope_f32, source, angles, output, eviction);
+  const double baselineMilliseconds = run(
+      interleaved_rope_f32_strided_baseline, source, angles, baseline, eviction);
+  const double bytes = static_cast<double>(kElements) * 3.0 * sizeof(float);
   std::printf("kernel=interleaved_rope_f32\n");
   std::printf("model_shape=rope[tokens=%zu;heads=%zu;D=%zu]\n", kTokens, kHeads,
               2 * kPairs);
   std::printf("max_absolute_error=%.9g\n", maximum);
+  std::printf("strided_baseline_max_absolute_error=%.9g\n", baselineMaximum);
   std::printf("median_ms=%.6f\n", milliseconds);
-  std::printf("logical_gbs=%.6f\n",
-              static_cast<double>(kElements) * 3.0 * sizeof(float) /
-                  milliseconds / 1.0e6);
+  std::printf("strided_baseline_median_ms=%.6f\n", baselineMilliseconds);
+  std::printf("logical_gbs=%.6f\n", bytes / milliseconds / 1.0e6);
+  std::printf("strided_baseline_logical_gbs=%.6f\n",
+              bytes / baselineMilliseconds / 1.0e6);
   return 0;
 }
