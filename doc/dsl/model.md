@@ -133,9 +133,9 @@ Canonical Weft language 中不存在：
 - block 之间的顺序与状态；
 - memory effect 及其顺序。
 
-普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器可以对它做保持语义的
-unroll、interchange、hoist、rematerialization、software pipelining 和局部 scheduling，
-但不得把它重新分类为 VLA logical axis，也不得从普通 scalar multiply/add 猜出dot/matmul。
+普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器只能做不改变 source-visible
+iteration、carry 与 effect order 的普通实现优化，不能重新分类、交换或替换作者的 traversal，
+也不得从普通 scalar multiply/add 猜出dot/matmul。
 只有 source 显式写出的 `W.vla` / `W.dot` / `W.matmul` 才分别授权 SIMD logical axis 与局部
 乘加域。VLA 内部可以做 strip-mining；dot/matmul 内部可以重组 reduction。两者都
 不得改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
@@ -182,10 +182,14 @@ block<BK × BN, f16>
 block<BM × BN, f32>
 ```
 
+Shape不是block的完整identity。每次`W.block(extent)`建立一个唯一source axis，并产生该轴的
+logical index block；block/region type同时保存shape与axis identity。两个extent相等但来自不同
+`W.block`调用的axis不能互换。`W.full/W.zeros`直接消费这些axis value，而不是裸整数shape。
+
 Logical block：
 
 - 是局部数据域；
-- 可以由block axis、singleton-axis view、full/zeros、load、pointwise与structured result产生；
+- 可以由`W.block`、singleton-axis view、full/zeros、load、pointwise与structured result产生；
 - 是普通 SSA value，可以有多个 consumer，可以进入 pointwise、state、memory、control carry
   或另一个 structured primitive；
 - 可以作为 `W.dot`、`W.matmul`、block reduction、decode 等 primitive 的 operand，
@@ -212,11 +216,12 @@ composition。Target 若不能为合法 composition 建立 physical handoff，�
 Canonical 类型可概念性表示为：
 
 ```text
-region<[* , D0, D1, ...], T>
+region<[* , D0, D1, ...], [vla, a0, a1, ...], T>
 ```
 
 其中 `*` 表示当前VLA axis；`Dk` 是static dimension，或以 `-1` 配合显式extent operand
-表示的dynamic/meta dimension。
+表示的dynamic/meta dimension；`ak`是source-owned block axis identity。显式singleton broadcast
+使用axis identity `0`，不能伪装成另一条真实axis。
 
 当前 canonical language 在同一 lexical scope 中只允许一个活跃 VLA axis。嵌套第二个
 VLA region 必须被拒绝；这是当前语言能力边界，用来保持 region identity 与 state 语义

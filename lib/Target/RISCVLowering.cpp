@@ -1724,12 +1724,12 @@ private:
   void collectLocalDefinitions(
       mlir::Value value, mlir::Block &block,
       llvm::DenseSet<mlir::Operation *> &definitions,
-      llvm::SmallVectorImpl<BlockAxisOp> &axes) const {
+      llvm::SmallVectorImpl<BlockIndexOp> &axes) const {
     mlir::Operation *definition = value.getDefiningOp();
     if (!definition || definition->getBlock() != &block ||
         !definitions.insert(definition).second)
       return;
-    if (auto axis = mlir::dyn_cast<BlockAxisOp>(definition))
+    if (auto axis = mlir::dyn_cast<BlockIndexOp>(definition))
       axes.push_back(axis);
     for (mlir::Value operand : definition->getOperands())
       collectLocalDefinitions(operand, block, definitions, axes);
@@ -1876,8 +1876,8 @@ private:
     mlir::Block &block = *dot->getBlock();
     llvm::DenseSet<mlir::Operation *> lhsDefinitions;
     llvm::DenseSet<mlir::Operation *> rhsDefinitions;
-    llvm::SmallVector<BlockAxisOp> lhsAxes;
-    llvm::SmallVector<BlockAxisOp> rhsAxes;
+    llvm::SmallVector<BlockIndexOp> lhsAxes;
+    llvm::SmallVector<BlockIndexOp> rhsAxes;
     collectLocalDefinitions(dot.getLhs(), block, lhsDefinitions, lhsAxes);
     collectLocalDefinitions(dot.getRhs(), block, rhsDefinitions, rhsAxes);
     if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
@@ -1886,8 +1886,8 @@ private:
           "RVV VLA dot requires explicit row and shared reduction axes");
       return mlir::failure();
     }
-    BlockAxisOp reductionAxis = rhsAxes.front();
-    BlockAxisOp rowAxis = lhsAxes.front() == reductionAxis
+    BlockIndexOp reductionAxis = rhsAxes.front();
+    BlockIndexOp rowAxis = lhsAxes.front() == reductionAxis
                               ? lhsAxes.back()
                               : lhsAxes.front();
     if (integerConstantValue(rowAxis.getExtent()) != lhsType.getShape()[0]) {
@@ -1922,7 +1922,7 @@ private:
     }
 
     llvm::DenseSet<mlir::Operation *> absorbed;
-    llvm::SmallVector<BlockAxisOp> absorbedAxes;
+    llvm::SmallVector<BlockIndexOp> absorbedAxes;
     for (mlir::Value value : {dot.getLhs(), dot.getRhs()})
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
 
@@ -2005,8 +2005,8 @@ private:
     mlir::Block &block = *dot->getBlock();
     llvm::DenseSet<mlir::Operation *> freeDefinitions;
     llvm::DenseSet<mlir::Operation *> blockedDefinitions;
-    llvm::SmallVector<BlockAxisOp> freeAxes;
-    llvm::SmallVector<BlockAxisOp> blockedAxes;
+    llvm::SmallVector<BlockIndexOp> freeAxes;
+    llvm::SmallVector<BlockIndexOp> blockedAxes;
     collectLocalDefinitions(dot.getLhs(), block, freeDefinitions, freeAxes);
     collectLocalDefinitions(dot.getRhs(), block, blockedDefinitions,
                             blockedAxes);
@@ -2016,7 +2016,7 @@ private:
           "RVV VLA vector dot requires one shared explicit reduction axis");
       return mlir::failure();
     }
-    BlockAxisOp reductionAxis = freeAxes.front();
+    BlockIndexOp reductionAxis = freeAxes.front();
 
     mlir::Value coordinate = vla.getBody().front().getArgument(0);
     mlir::Value freeRoot = pointerRoot(freeLoad.getPointer());
@@ -2038,11 +2038,11 @@ private:
     }
 
     llvm::DenseSet<mlir::Operation *> absorbed;
-    llvm::SmallVector<BlockAxisOp> absorbedAxes;
+    llvm::SmallVector<BlockIndexOp> absorbedAxes;
     for (mlir::Value value : {dot.getLhs(), dot.getRhs()})
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
     llvm::DenseSet<mlir::Operation *> initDefinitions;
-    llvm::SmallVector<BlockAxisOp> initAxes;
+    llvm::SmallVector<BlockIndexOp> initAxes;
     collectLocalDefinitions(dot.getInit(), block, initDefinitions, initAxes);
     for (mlir::Operation *operation : initDefinitions)
       absorbed.erase(operation);
@@ -2413,10 +2413,10 @@ private:
             unwrapLogicalValidity(store.getValue().getType()));
         if (storedRegion && storedRegion.getShape().size() == 2) {
           int64_t vectors = storedRegion.getShape()[1];
-          llvm::SmallVector<BlockAxisOp> axes =
+          llvm::SmallVector<BlockIndexOp> axes =
               collectBlockAxes(store.getPointer());
-          BlockAxisOp bundleAxis;
-          for (BlockAxisOp axis : axes) {
+          BlockIndexOp bundleAxis;
+          for (BlockIndexOp axis : axes) {
             if (!haveSameLogicalExtent(store.getValue(), 1, axis.getResult(), 0))
               continue;
             if (bundleAxis && bundleAxis != axis) {
@@ -3771,7 +3771,7 @@ private:
         llvm::any_of(block.getShape(), [](int64_t extent) {
           return extent == 0 || extent < -1;
         }) ||
-        op.getExtents().size() != block.getShape().size())
+        op.getAxes().size() != block.getShape().size())
       return op.emitError(
           "materialized block full requires a rank-one or rank-two f32 block");
     auto selected = materializedBlockElements.find(op.getOperation());
@@ -5817,8 +5817,8 @@ private:
 
     llvm::DenseSet<mlir::Operation *> lhsClosure;
     llvm::DenseSet<mlir::Operation *> rhsClosure;
-    llvm::SmallVector<BlockAxisOp> lhsAxes;
-    llvm::SmallVector<BlockAxisOp> rhsAxes;
+    llvm::SmallVector<BlockIndexOp> lhsAxes;
+    llvm::SmallVector<BlockIndexOp> rhsAxes;
     if (mlir::failed(collectBlockClosure(dot.getLhs(), lhsClosure, lhsAxes,
                                          dot.getOperation())) ||
         mlir::failed(collectBlockClosure(dot.getRhs(), rhsClosure, rhsAxes,
@@ -5830,8 +5830,8 @@ private:
           "RVV row microtile requires explicit row and shared K block axes");
       return mlir::failure();
     }
-    BlockAxisOp reductionAxis = rhsAxes.front();
-    BlockAxisOp rowAxis = lhsAxes.front() == reductionAxis
+    BlockIndexOp reductionAxis = rhsAxes.front();
+    BlockIndexOp rowAxis = lhsAxes.front() == reductionAxis
                               ? lhsAxes.back()
                               : lhsAxes.front();
     mlir::Value lhsRoot = pointerRoot(lhsLoad.getPointer());
@@ -6634,10 +6634,10 @@ private:
 
   void collectBlockAxes(mlir::Value value,
                         llvm::DenseSet<mlir::Value> &visited,
-                        llvm::SmallVectorImpl<BlockAxisOp> &axes) const {
+                        llvm::SmallVectorImpl<BlockIndexOp> &axes) const {
     if (!value || !visited.insert(value).second)
       return;
-    if (auto axis = value.getDefiningOp<BlockAxisOp>()) {
+    if (auto axis = value.getDefiningOp<BlockIndexOp>()) {
       if (!llvm::is_contained(axes, axis))
         axes.push_back(axis);
       return;
@@ -6658,9 +6658,9 @@ private:
       collectBlockAxes(operand, visited, axes);
   }
 
-  llvm::SmallVector<BlockAxisOp> collectBlockAxes(mlir::Value value) const {
+  llvm::SmallVector<BlockIndexOp> collectBlockAxes(mlir::Value value) const {
     llvm::DenseSet<mlir::Value> visited;
-    llvm::SmallVector<BlockAxisOp> axes;
+    llvm::SmallVector<BlockIndexOp> axes;
     collectBlockAxes(value, visited, axes);
     return axes;
   }
@@ -6691,8 +6691,10 @@ private:
       return owner->emitError(
           "selected local primitive has no explicit block accumulator root");
     int64_t elements = 1;
-    for (mlir::Value extentValue : full.getExtents()) {
-      std::optional<int64_t> extent = physicalExtent(extentValue);
+    for (mlir::Value axisValue : full.getAxes()) {
+      auto axis = axisValue.getDefiningOp<BlockIndexOp>();
+      std::optional<int64_t> extent =
+          axis ? physicalExtent(axis.getExtent()) : std::nullopt;
       if (!extent || *extent <= 0 ||
           elements > options.target.maxPrivateStackBytes /
                          static_cast<int64_t>(sizeof(float)) / *extent)
@@ -6861,8 +6863,8 @@ private:
         block.getShape() == llvm::ArrayRef<int64_t>({16}) &&
         options.target.supportsVLENAtLeast(128) && isTrue(op.getWhere());
     if (block.getShape().size() == 1 && !canUseContiguous16) {
-      llvm::SmallVector<BlockAxisOp> axes = collectBlockAxes(op.getPointer());
-      BlockAxisOp axis = findDimensionAxis(op.getPointer(), 0, axes);
+      llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(op.getPointer());
+      BlockIndexOp axis = findDimensionAxis(op.getPointer(), 0, axes);
       std::optional<int64_t> elements = materializedF32ElementCount(op.getValue());
       if (!axis || !elements || *elements <= 0 ||
           !isContiguousPrefixPredicate(op.getWhere(), axis.getResult()))
@@ -6872,9 +6874,9 @@ private:
       decision.rowAxis = axis.getResult();
       decision.columns = *elements;
     } else if (block.getShape().size() == 2) {
-      llvm::SmallVector<BlockAxisOp> axes = collectBlockAxes(op.getPointer());
-      BlockAxisOp rowAxis = findDimensionAxis(op.getPointer(), 0, axes);
-      BlockAxisOp columnAxis = findDimensionAxis(op.getPointer(), 1, axes);
+      llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(op.getPointer());
+      BlockIndexOp rowAxis = findDimensionAxis(op.getPointer(), 0, axes);
+      BlockIndexOp columnAxis = findDimensionAxis(op.getPointer(), 1, axes);
       std::optional<int64_t> rows =
           rowAxis ? physicalExtent(rowAxis.getExtent()) : std::nullopt;
       std::optional<int64_t> columns =
@@ -6929,10 +6931,10 @@ private:
     return mlir::success();
   }
 
-  BlockAxisOp findDimensionAxis(mlir::Value value, int64_t dimension,
-                                llvm::ArrayRef<BlockAxisOp> axes) const {
-    BlockAxisOp selected;
-    for (BlockAxisOp axis : axes) {
+  BlockIndexOp findDimensionAxis(mlir::Value value, int64_t dimension,
+                                llvm::ArrayRef<BlockIndexOp> axes) const {
+    BlockIndexOp selected;
+    for (BlockIndexOp axis : axes) {
       if (!haveSameLogicalExtent(value, dimension, axis.getResult(), 0))
         continue;
       if (selected && selected != axis)
@@ -7042,7 +7044,7 @@ private:
   }
 
   bool matchBlockAxis(mlir::Value value, int64_t extent) const {
-    auto axis = value.getDefiningOp<BlockAxisOp>();
+    auto axis = value.getDefiningOp<BlockIndexOp>();
     return axis && integerConstant(axis.getExtent()) == extent &&
            integerConstant(axis.getOffset()) == 0;
   }
@@ -8278,12 +8280,12 @@ private:
         !matmul.getAccDtype().isF32())
       return std::nullopt;
 
-    llvm::SmallVector<BlockAxisOp> lhsAxes = collectBlockAxes(matmul.getLhs());
-    llvm::SmallVector<BlockAxisOp> rhsAxes = collectBlockAxes(matmul.getRhs());
-    BlockAxisOp lhsRowAxis = findDimensionAxis(matmul.getLhs(), 0, lhsAxes);
-    BlockAxisOp lhsReductionAxis = findDimensionAxis(matmul.getLhs(), 1, lhsAxes);
-    BlockAxisOp rhsReductionAxis = findDimensionAxis(matmul.getRhs(), 0, rhsAxes);
-    BlockAxisOp rhsColumnAxis = findDimensionAxis(matmul.getRhs(), 1, rhsAxes);
+    llvm::SmallVector<BlockIndexOp> lhsAxes = collectBlockAxes(matmul.getLhs());
+    llvm::SmallVector<BlockIndexOp> rhsAxes = collectBlockAxes(matmul.getRhs());
+    BlockIndexOp lhsRowAxis = findDimensionAxis(matmul.getLhs(), 0, lhsAxes);
+    BlockIndexOp lhsReductionAxis = findDimensionAxis(matmul.getLhs(), 1, lhsAxes);
+    BlockIndexOp rhsReductionAxis = findDimensionAxis(matmul.getRhs(), 0, rhsAxes);
+    BlockIndexOp rhsColumnAxis = findDimensionAxis(matmul.getRhs(), 1, rhsAxes);
     if (!lhsRowAxis || !lhsReductionAxis || !rhsReductionAxis ||
         !rhsColumnAxis ||
         !haveSameLogicalExtent(lhsReductionAxis.getResult(), 0,
@@ -8716,19 +8718,22 @@ private:
 
   mlir::LogicalResult collectBlockClosure(
       mlir::Value value, llvm::DenseSet<mlir::Operation *> &closure,
-      llvm::SmallVectorImpl<BlockAxisOp> &axes, mlir::Operation *owner,
-      bool markDiscarded = true) {
+      llvm::SmallVectorImpl<BlockIndexOp> &axes, mlir::Operation *owner,
+      bool markDiscarded = true, bool allowCaptured = false) {
     if (!containsBlockType(value.getType()))
       return mlir::success();
     mlir::Operation *definition = value.getDefiningOp();
     if (!definition)
       return owner->emitError(
           "block operation cannot capture a block argument from another region");
-    if (!closure.insert(definition).second)
-      return mlir::success();
-    if (definition->getBlock() != owner->getBlock())
+    if (definition->getBlock() != owner->getBlock()) {
+      if (allowCaptured)
+        return mlir::success();
       return owner->emitError(
           "block producer closure crosses a region boundary");
+    }
+    if (!closure.insert(definition).second)
+      return mlir::success();
     if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
       auto tuple = get.getInput().getDefiningOp<TupleOp>();
       if (!tuple)
@@ -8738,7 +8743,8 @@ private:
       for (auto [index, operand] : llvm::enumerate(tuple.getOperands())) {
         if (static_cast<int64_t>(index) == get.getIndex()) {
           if (mlir::failed(collectBlockClosure(operand, closure, axes, owner,
-                                               markDiscarded)))
+                                               markDiscarded,
+                                               allowCaptured)))
             return mlir::failure();
           continue;
         }
@@ -8754,12 +8760,12 @@ private:
       }
       return mlir::success();
     }
-    if (auto axis = mlir::dyn_cast<BlockAxisOp>(definition))
+    if (auto axis = mlir::dyn_cast<BlockIndexOp>(definition))
       axes.push_back(axis);
     for (mlir::Value operand : definition->getOperands())
       if (containsBlockType(operand.getType()) &&
           mlir::failed(collectBlockClosure(operand, closure, axes, owner,
-                                           markDiscarded)))
+                                           markDiscarded, allowCaptured)))
         return mlir::failure();
     return mlir::success();
   }
@@ -8767,12 +8773,13 @@ private:
   mlir::LogicalResult markDiscardedPrivateBlockTrees(
       llvm::ArrayRef<mlir::Value> values, mlir::Operation *consumer) {
     llvm::DenseSet<mlir::Operation *> closure;
-    llvm::SmallVector<BlockAxisOp> axes;
+    llvm::SmallVector<BlockIndexOp> axes;
     for (mlir::Value value : values) {
       if (!containsBlockType(value.getType()) && !isRegionValue(value.getType()))
         continue;
       if (mlir::failed(
-              collectBlockClosure(value, closure, axes, consumer, false)))
+              collectBlockClosure(value, closure, axes, consumer, false,
+                                  true)))
         return mlir::failure();
     }
     retainOnlyPrivateDefinitions(closure, consumer);
@@ -9531,7 +9538,7 @@ private:
   mlir::LogicalResult emitBlockOperation(
       mlir::Operation *operation,
       llvm::DenseMap<mlir::Value, BlockValue> &blockValues, llvm::StringRef vl) {
-    if (mlir::isa<BlockAxisOp>(operation))
+    if (mlir::isa<BlockIndexOp>(operation))
       return mlir::success();
     if (auto op = mlir::dyn_cast<PtrAddOp>(operation))
       return emitBlockPtrAdd(op, blockValues, vl);
@@ -9564,7 +9571,7 @@ private:
   }
 
   bool blockClosureNeedsLaneVector(
-      BlockAxisOp axis,
+      BlockIndexOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
     return llvm::any_of(axis.getResult().getUsers(),
                         [&](mlir::Operation *user) {
@@ -9577,11 +9584,11 @@ private:
   }
 
   BlockStorePhysicalDecision decideBlockStorePhysical(
-      int64_t extent, BlockAxisOp axis,
+      int64_t extent, BlockIndexOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
     bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
     bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
-      return mlir::isa<BlockAxisOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
+      return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
           operation);
     });
     llvm::SmallVector<BlockStorePhysicalDecision> candidates;
@@ -9615,7 +9622,7 @@ private:
   }
 
   BlockReducePhysicalDecision decideBlockReducePhysical(
-      int64_t extent, BlockAxisOp axis,
+      int64_t extent, BlockIndexOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
     bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
     llvm::SmallVector<BlockReducePhysicalDecision> candidates{
@@ -9675,7 +9682,7 @@ private:
       return op.emitError(
           "RVV block store requires an all-active rank-one f32 value");
     llvm::DenseSet<mlir::Operation *> closure;
-    llvm::SmallVector<BlockAxisOp> axes;
+    llvm::SmallVector<BlockIndexOp> axes;
     if (mlir::failed(collectBlockClosure(op.getPointer(), closure, axes,
                                          op.getOperation(), false)) ||
         mlir::failed(collectBlockClosure(op.getValue(), closure, axes,
@@ -9684,7 +9691,7 @@ private:
     if (axes.size() != 1)
       return op.emitError(
           "RVV block store requires exactly one local logical block axis");
-    BlockAxisOp axis = axes.front();
+    BlockIndexOp axis = axes.front();
     auto axisType = axis.getResult().getType();
     if (axisType.getShape().size() != 1 ||
         axisType.getShape().front() != *extent)
@@ -9748,14 +9755,14 @@ private:
       return op.emitError(
           "RVV block reduction requires a static extent in [1, 65535]");
     llvm::DenseSet<mlir::Operation *> closure;
-    llvm::SmallVector<BlockAxisOp> axes;
+    llvm::SmallVector<BlockIndexOp> axes;
     if (mlir::failed(collectBlockClosure(op.getInput(), closure, axes,
                                          op.getOperation(), false)))
       return mlir::failure();
     if (axes.size() != 1)
       return op.emitError(
           "RVV block reduction requires exactly one local logical block axis");
-    BlockAxisOp axis = axes.front();
+    BlockIndexOp axis = axes.front();
     auto axisType = axis.getResult().getType();
     if (axisType.getShape().size() != 1 ||
         axisType.getShape().front() != extent)
@@ -9855,7 +9862,7 @@ private:
       return op.emitError("block store physical handoff is incomplete");
     const BlockStorePhysicalDecision &physical = *entity.blockStore;
     int64_t extent = decision.extent;
-    BlockAxisOp axis = mlir::cast<BlockAxisOp>(decision.axis);
+    BlockIndexOp axis = mlir::cast<BlockIndexOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> closure;
     closure.insert(decision.closure.begin(), decision.closure.end());
     llvm::DenseSet<mlir::Operation *> storeOps;
@@ -9886,7 +9893,7 @@ private:
       activeBlockOperations = &decision.operations;
       activeBlockEntity = &entity;
       for (mlir::Operation &candidate : *op->getBlock()) {
-        if (mlir::isa<BlockAxisOp>(candidate) ||
+        if (mlir::isa<BlockIndexOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
           continue;
         if (mlir::failed(emitBlockOperation(&candidate, blockValues, activeVL))) {
@@ -9922,7 +9929,7 @@ private:
       activeBlockOperations = &decision.operations;
       activeBlockEntity = &entity;
       for (mlir::Operation &candidate : *op->getBlock()) {
-        if (mlir::isa<BlockAxisOp>(candidate) ||
+        if (mlir::isa<BlockIndexOp>(candidate) ||
             (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
           continue;
         for (auto &blockValues : stripValues)
@@ -9993,7 +10000,7 @@ private:
       return op.emitError("block reduction physical handoff is incomplete");
     const BlockReducePhysicalDecision &physical = *entity.blockReduce;
     int64_t extent = decision.extent;
-    BlockAxisOp axis = mlir::cast<BlockAxisOp>(decision.axis);
+    BlockIndexOp axis = mlir::cast<BlockIndexOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> closure;
     closure.insert(decision.closure.begin(), decision.closure.end());
     llvm::SmallVector<ReduceOp> reductions;
@@ -10063,7 +10070,7 @@ private:
             continue;
           }
           if (!closure.contains(&candidate) ||
-              mlir::isa<BlockAxisOp>(candidate))
+              mlir::isa<BlockIndexOp>(candidate))
             continue;
           if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl)))
             return mlir::failure();
@@ -10177,7 +10184,7 @@ private:
       if (&candidate == reductions.back().getOperation())
         break;
       if (!closure.contains(&candidate) ||
-          mlir::isa<BlockAxisOp>(candidate))
+          mlir::isa<BlockIndexOp>(candidate))
         continue;
       if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl)))
         return mlir::failure();

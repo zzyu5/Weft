@@ -24,8 +24,8 @@ IME fragment、instruction spelling、build measurement、thread count或launch 
 !weft_kernel.ptr<T, address-space, access, noalias, alignment, restrict,
                  storage-class, storage-format>
 !weft_kernel.constexpr<T>
-!weft_kernel.block<[D0, D1, ...], T>
-!weft_kernel.region<[-1, D0, D1, ...], T>
+!weft_kernel.block<[D0, D1, ...], [a0, a1, ...], T>
+!weft_kernel.region<[-1, D0, D1, ...], [-1, a0, a1, ...], T>
 !weft_kernel.masked<ValueType>
 !weft_kernel.tuple<[T0, T1, ...]>
 ```
@@ -33,10 +33,11 @@ IME fragment、instruction spelling、build measurement、thread count或launch 
 - `ptr` 保存作者声明的element、address space、access、alias/alignment、external/persistent/
   workspace class与persistent format identity；
 - `constexpr` 只用于entry ABI，body通过 `meta_value` 读取已绑定值；
-- `block` 是零个或多个logical block axes，不是register microtile；
-- `region` 的首个 `-1` 表示当前active VLA axis；
+- `block` 的positive axis ID由唯一`block_index`定义；`0`只表示显式singleton broadcast；
+- `region` 的shape/axis首个 `-1`表示当前active VLA axis，余下字段服从同一block identity；
 - `masked` 携带first-class logical validity，不能当普通value逃逸；
-- `tuple` 是reduce/summary/control carried state使用的闭合heterogeneous value。
+- `tuple` 只保存reduce/summary/control使用的闭合scalar state；block state直接通过control
+  region argument/result carry，不进入第二种opaque state容器。
 
 Persistent/workspace pointer还必须由entry block中唯一的`weft_kernel.storage`绑定shape与显式
 extent operands；external pointer禁止该op。Source-visible三类storage都是caller-provided entry
@@ -62,7 +63,7 @@ storage
   weft_kernel.storage
 
 value/domain
-  weft_kernel.constant / meta_value / block_axis / full
+  weft_kernel.constant / meta_value / block_index / full
   weft_kernel.expand_dims
   weft_kernel.tuple / tuple_get / special_value / invalid
 
@@ -97,7 +98,8 @@ schedule；当前VLA memory effect要求lane independence。
   Active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出lexical region。
 - `argmax`与`online_softmax_summary`保存完整局部summary语义；target不得从普通SSA graph猜出。
 - `dot`固定收缩双方最后一个logical block axis；`matmul`固定表达`[M,K] x [K,N]`。
-  两者的init/result shape、accumulator dtype与numerical policy必须由IR显式保存并局部verify。
+  两者的init/result domain（shape与axis identity）、accumulator dtype与numerical policy必须由IR
+  显式保存并局部verify；reduction/K axis必须引用同一个block_index identity。
 
 因此canonical kernel可以统一描述为：
 
@@ -133,5 +135,5 @@ value queries与validity规则；若primitive没有定义masked语义，source�
 ## Python frontend
 
 Python frontend直接从 `@weft.kernel` source构造上述IR，没有长期typed Python IR、selection
-IR或第二份algorithm authority。`@W.helper` 默认inline；只有需要一等region semantics的
-helper（例如summary lift/merge/finalize）进入canonical region。
+IR或第二份algorithm authority。`@W.helper`始终按调用点typed value inline；显式summary
+primitive直接进入canonical op，不存在helper-region兼容路径。

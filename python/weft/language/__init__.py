@@ -16,7 +16,7 @@ from .builtins import HelperDefinition
 from .builtins import Intrinsic
 from .builtins import argmax
 from .builtins import bitcast
-from .builtins import block_axis
+from .builtins import block
 from .builtins import affine_i4_i8_contract
 from .builtins import cast
 from .builtins import cos

@@ -36,12 +36,14 @@ class ConstexprType(ValueType):
 @dataclass(frozen=True, slots=True)
 class BlockType(ValueType):
     shape: tuple[int, ...]
+    axes: tuple[int, ...]
     element_type: ValueType
 
 
 @dataclass(frozen=True, slots=True)
 class RegionType(ValueType):
     shape: tuple[int, ...]
+    axes: tuple[int, ...]
     element_type: ValueType
 
 
@@ -87,10 +89,18 @@ def emit_type(value_type: ValueType) -> str:
         return f"!weft_kernel.constexpr<{emit_type(value_type.value_type)}>"
     if isinstance(value_type, BlockType):
         shape = ", ".join(str(dimension) for dimension in value_type.shape)
-        return f"!weft_kernel.block<[{shape}], {emit_type(value_type.element_type)}>"
+        axes = ", ".join(str(axis) for axis in value_type.axes)
+        return (
+            f"!weft_kernel.block<[{shape}], [{axes}], "
+            f"{emit_type(value_type.element_type)}>"
+        )
     if isinstance(value_type, RegionType):
         shape = ", ".join(str(dimension) for dimension in value_type.shape)
-        return f"!weft_kernel.region<[{shape}], {emit_type(value_type.element_type)}>"
+        axes = ", ".join(str(axis) for axis in value_type.axes)
+        return (
+            f"!weft_kernel.region<[{shape}], [{axes}], "
+            f"{emit_type(value_type.element_type)}>"
+        )
     if isinstance(value_type, MaskedType):
         return f"!weft_kernel.masked<{emit_type(value_type.value_type)}>"
     if isinstance(value_type, TupleType):
@@ -123,6 +133,13 @@ def shape_of(value_type: ValueType) -> tuple[int, ...] | None:
     return None
 
 
+def axes_of(value_type: ValueType) -> tuple[int, ...] | None:
+    value_type = bare_type(value_type)
+    if isinstance(value_type, (BlockType, RegionType)):
+        return value_type.axes
+    return None
+
+
 def shape_kind(value_type: ValueType) -> str:
     value_type = bare_type(value_type)
     if isinstance(value_type, RegionType):
@@ -132,13 +149,18 @@ def shape_kind(value_type: ValueType) -> str:
     return "scalar"
 
 
-def shaped_type(kind: str, shape: tuple[int, ...], element: ValueType) -> ValueType:
+def shaped_type(
+    kind: str,
+    shape: tuple[int, ...],
+    axes: tuple[int, ...],
+    element: ValueType,
+) -> ValueType:
     if kind == "region":
-        return RegionType(shape, element)
+        return RegionType(shape, axes, element)
     if kind == "block":
-        return BlockType(shape, element)
-    if shape:
-        raise ValueError("scalar type cannot carry a shape")
+        return BlockType(shape, axes, element)
+    if shape or axes:
+        raise ValueError("scalar type cannot carry a logical domain")
     return element
 
 
@@ -146,9 +168,9 @@ def with_element_type(value_type: ValueType, new_element: ValueType) -> ValueTyp
     masked = is_masked(value_type)
     bare = bare_type(value_type)
     if isinstance(bare, BlockType):
-        result: ValueType = BlockType(bare.shape, new_element)
+        result: ValueType = BlockType(bare.shape, bare.axes, new_element)
     elif isinstance(bare, RegionType):
-        result = RegionType(bare.shape, new_element)
+        result = RegionType(bare.shape, bare.axes, new_element)
     else:
         result = new_element
     return MaskedType(result) if masked else result

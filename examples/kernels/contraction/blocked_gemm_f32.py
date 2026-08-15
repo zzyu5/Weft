@@ -17,8 +17,8 @@ def gemm_f32_worker(
 ) -> None:
     for row in W.range(m_begin, m_end, 6):
         for column in W.range(0, n):
-            row_lane = W.block_axis(6)
-            inner = W.block_axis(k)
+            row_lane = W.block(6)
+            inner = W.block(k)
             row_index = row + row_lane[:, None]
             inner_index = inner[None, :]
             row_valid = row_index < m_end
@@ -31,13 +31,16 @@ def gemm_f32_worker(
             value = W.dot(
                 lhs,
                 rhs,
-                init=W.zeros((6,), dtype=W.f32),
+                init=W.zeros((row_lane,), dtype=W.f32),
                 acc_dtype=W.f32,
                 order="relaxed",
                 math="native",
             )
+            shifted = value + W.f32(0.0)
+            scaled = value * W.f32(1.0)
+            combined = W.maximum(shifted, scaled)
             W.store(
                 c + (row + row_lane) * ldc + column,
-                value,
+                combined,
                 where=row + row_lane < m_end,
             )

@@ -1,7 +1,8 @@
 # Weft 设计文档
 
-这组文档是 Weft 当前唯一的语言与编译器设计规范。它描述最终语义和模块边界，不记录
-实现进度、历史版本、测试清单或迁移过程。
+[`WEFT_CORE_LOCAL_BLOCKED_PROGRAM_MODEL.md`](../report/WEFT_CORE_LOCAL_BLOCKED_PROGRAM_MODEL.md)
+是当前唯一源语言与编程模型说明。本目录只保存该模型在Python surface、canonical IR、target
+lowering与artifact上的模块投影，不得定义另一套根模型。
 
 它定义 Weft 最终成品的目标状态；与旧设计、历史材料或实现注释冲突时，以这里为准。
 
@@ -11,19 +12,20 @@ core-local blocked program，显式拥有 ordered control、block/state 与 sour
 
 ## 阅读顺序
 
-1. [语言定位与程序模型](dsl/model.md)
-2. [Python eDSL 与控制流](dsl/python.md)
-3. [Storage ownership 与 lifetime](dsl/storage-and-lifetime.md)
-4. [VLA、predicate、memory 与 logical block](dsl/vla-memory-and-blocks.md)
-5. [Dot、Matmul 与 state algebra](dsl/structured-compute.md)
-6. [数值语义](dsl/numerics.md)
-7. [Python DSL API 索引](dsl/api.md)
-8. [编译器总架构](compiler/architecture.md)
-9. [Canonical Kernel IR](compiler/kernel-ir.md)
-10. [RISC-V target lowering](compiler/target-lowering.md)
-11. [Lowering、工具与 artifact](compiler/lowering-and-artifacts.md)
-12. [构建期 tuning](compiler/tuning.md)
-13. [Legality 与错误边界](compiler/verification.md)
+1. [Core-local blocked编程模型](../report/WEFT_CORE_LOCAL_BLOCKED_PROGRAM_MODEL.md)
+2. [语言定位与程序模型投影](dsl/model.md)
+3. [Python eDSL 与控制流](dsl/python.md)
+4. [Storage ownership 与 lifetime](dsl/storage-and-lifetime.md)
+5. [VLA、predicate、memory 与 logical block](dsl/vla-memory-and-blocks.md)
+6. [Dot、Matmul 与 state algebra](dsl/structured-compute.md)
+7. [数值语义](dsl/numerics.md)
+8. [Python DSL API 索引](dsl/api.md)
+9. [编译器总架构](compiler/architecture.md)
+10. [Canonical Kernel IR](compiler/kernel-ir.md)
+11. [RISC-V target lowering](compiler/target-lowering.md)
+12. [Lowering、工具与 artifact](compiler/lowering-and-artifacts.md)
+13. [构建期 tuning](compiler/tuning.md)
+14. [Legality 与错误边界](compiler/verification.md)
 
 典型worker-local source的canonical组合方式单独放在 `kernels/`；这些文件是语言构造示例，
 不是target使用的kernel类别：
@@ -46,5 +48,5 @@ doc/
 └── kernels/   canonical DSL construct 的组合示例
 ```
 
-每个概念只有一个权威落点，其他文档只引用该定义，不复制第二套规则。实现中发现的问题、
-阶段结果和阻塞写入顶层 `report/`，不得反向成为设计规范。
+每个概念只有一个权威落点；本轮由上面的Core-local blocked文档冻结根语义，其他文件只说明
+对应模块怎样兑现它。其余工作报告仍然只是一次性快照。

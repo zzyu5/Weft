@@ -62,17 +62,17 @@ def q4_k_projection_ime(
                 W.store(code_row + k, quantized)
 
         for column_begin in W.range(0, columns, packed_column_extent):
-            accumulator = W.zeros((16,), dtype=W.f32)
+            column = W.block(16)
+            accumulator = W.zeros((column,), dtype=W.f32)
             for block in W.range(0, blocks):
-                k = W.block_axis(32)
+                k = W.block(32)
                 activation_codes = W.load(
                     code_row + block * block_extent + k,
                     other=W.i8(0),
                 )
                 scale = W.load(scale_row + block, other=W.f32(0.0))
 
-                column = W.block_axis(16)
-                packed_byte = W.block_axis(16)
+                packed_byte = W.block(16)
                 packed_block = (
                     (column_begin // packed_column_extent) * blocks + block
                 )
@@ -101,5 +101,4 @@ def q4_k_projection_ime(
                     init=accumulator,
                 )
 
-            column = W.block_axis(16)
             W.store(output_row + column_begin + column, accumulator)

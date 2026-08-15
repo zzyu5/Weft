@@ -20,12 +20,12 @@ def gemm_worker(
 ) -> None:
     for m0 in W.range(m_begin, m_end, BM):
         for n0 in W.range(0, n, BN):
-            acc = W.zeros((BM, BN), dtype=W.f32)
+            mi = W.block(BM)
+            ni = W.block(BN)
+            acc = W.zeros((mi, ni), dtype=W.f32)
 
             for k0 in W.range(0, k, BK):
-                mi = W.block_axis(BM)
-                ni = W.block_axis(BN)
-                ki = W.block_axis(BK)
+                ki = W.block(BK)
 
                 m_idx = m0 + mi[:, None]
                 n_idx = n0 + ni[None, :]
@@ -47,8 +47,7 @@ def gemm_worker(
                     math="native",
                 )
 
-            mi = W.block_axis(BM)
-            ni = W.block_axis(BN)
+            acc = acc + W.f32(0.0)
             m_idx = m0 + mi[:, None]
             n_idx = n0 + ni[None, :]
             out_valid = (m_idx < m_end) & (n_idx < n)

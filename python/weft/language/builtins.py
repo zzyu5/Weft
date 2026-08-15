@@ -14,7 +14,6 @@ from weft.diagnostics import LanguageUseError
 @dataclass(frozen=True, slots=True)
 class Intrinsic:
     name: str
-    canonical_name: str
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise LanguageUseError(
@@ -79,8 +78,8 @@ def helper(
     return HelperDefinition(function, effects)
 
 
-def _intrinsic(name: str, canonical_name: str | None = None) -> Intrinsic:
-    return Intrinsic(name, canonical_name or f"weft_kernel.{name}")
+def _intrinsic(name: str) -> Intrinsic:
+    return Intrinsic(name)
 
 
 range = _intrinsic("range")
@@ -90,7 +89,7 @@ load = _intrinsic("load")
 store = _intrinsic("store")
 storage = _intrinsic("storage")
 sort_indices = _intrinsic("sort_indices")
-block_axis = _intrinsic("block_axis")
+block = _intrinsic("block")
 full = _intrinsic("full")
 zeros = _intrinsic("zeros")
 reduce = _intrinsic("reduce")
@@ -117,20 +116,12 @@ floor = _intrinsic("floor")
 sqrt = _intrinsic("sqrt")
 rsqrt = _intrinsic("rsqrt")
 neg_inf = _intrinsic("neg_inf")
-affine_i4_i8_contract = _intrinsic(
-    "affine_i4_i8_contract", "weft_ext.affine_i4_i8_contract"
-)
-symmetric_i4_i8_contract = _intrinsic(
-    "symmetric_i4_i8_contract", "weft_ext.symmetric_i4_i8_contract"
-)
-grouped_affine_i4_i8_dot = _intrinsic(
-    "grouped_affine_i4_i8_dot", "weft_ext.grouped_affine_i4_i8_dot"
-)
-sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot", "weft_ext.sign_bit_i8_dot")
-e2m1_e8m0_i8_dot = _intrinsic(
-    "e2m1_e8m0_i8_dot", "weft_ext.e2m1_e8m0_i8_dot"
-)
-iq2_s_i8_dot = _intrinsic("iq2_s_i8_dot", "weft_ext.iq2_s_i8_dot")
-iq3_s_i8_dot = _intrinsic("iq3_s_i8_dot", "weft_ext.iq3_s_i8_dot")
-iq1_m_i8_dot = _intrinsic("iq1_m_i8_dot", "weft_ext.iq1_m_i8_dot")
-q6_k_i8_dot = _intrinsic("q6_k_i8_dot", "weft_ext.q6_k_i8_dot")
+affine_i4_i8_contract = _intrinsic("affine_i4_i8_contract")
+symmetric_i4_i8_contract = _intrinsic("symmetric_i4_i8_contract")
+grouped_affine_i4_i8_dot = _intrinsic("grouped_affine_i4_i8_dot")
+sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot")
+e2m1_e8m0_i8_dot = _intrinsic("e2m1_e8m0_i8_dot")
+iq2_s_i8_dot = _intrinsic("iq2_s_i8_dot")
+iq3_s_i8_dot = _intrinsic("iq3_s_i8_dot")
+iq1_m_i8_dot = _intrinsic("iq1_m_i8_dot")
+q6_k_i8_dot = _intrinsic("q6_k_i8_dot")

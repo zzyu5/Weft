@@ -52,12 +52,13 @@ def WeftKernel_ConstexprType : WeftKernel_Type<"Constexpr", "constexpr"> {
 }
 
 def WeftKernel_BlockType : WeftKernel_Type<"Block", "block"> {
-  let summary = "Static logical block axes, independent of physical layout";
+  let summary = "Logical block domain with explicit source axis identity";
   let parameters = (ins
     ArrayRefParameter<"int64_t">:$shape,
+    ArrayRefParameter<"int64_t">:$axisIds,
     "::mlir::Type":$elementType
   );
-  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` `[` $axisIds `]` `,` $elementType `>`";
   let genVerifyDecl = 1;
 }
 
@@ -65,9 +66,10 @@ def WeftKernel_RegionType : WeftKernel_Type<"Region", "region"> {
   let summary = "Value over the active VLA axis plus zero or more block axes";
   let parameters = (ins
     ArrayRefParameter<"int64_t">:$shape,
+    ArrayRefParameter<"int64_t">:$axisIds,
     "::mlir::Type":$elementType
   );
-  let assemblyFormat = "`<` `[` $shape `]` `,` $elementType `>`";
+  let assemblyFormat = "`<` `[` $shape `]` `,` `[` $axisIds `]` `,` $elementType `>`";
   let genVerifyDecl = 1;
 }
 
@@ -169,15 +171,16 @@ def WeftKernel_VLAOp : WeftKernel_Op<"vla", [RecursiveMemoryEffects]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_BlockAxisOp : WeftKernel_Op<"block_axis", [Pure]> {
-  let arguments = (ins Index:$extent, Index:$offset);
+def WeftKernel_BlockIndexOp : WeftKernel_Op<"block_index", [Pure]> {
+  let summary = "One source-owned logical block axis and its coordinates";
+  let arguments = (ins Index:$extent, Index:$offset, I64Attr:$axis);
   let results = (outs WeftKernel_BlockType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_FullOp : WeftKernel_Op<"full", [Pure]> {
-  let arguments = (ins AnyType:$value, Variadic<Index>:$extents,
-                       DenseI64ArrayAttr:$shape);
+  let arguments = (ins AnyType:$value,
+                       Variadic<WeftKernel_BlockType>:$axes);
   let results = (outs WeftKernel_BlockType:$result);
   let hasVerifier = 1;
 }

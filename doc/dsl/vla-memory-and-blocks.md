@@ -209,18 +209,17 @@ Target lowering 可以吸收 structured primitive 附近的纯 producer / consum
 
 ## Block value API
 
-### Block axis
+### Block domain与index
 
 ```python
-m = W.block_axis(BM)
-k = W.block_axis(BK)
+m = W.block(BM)
+k = W.block(BK)
 ```
 
-`W.block_axis(D, offset=0)` 产生shape `[D]` 的logical index block。当前Python frontend只把
-source integer literal写成static dimension；meta或runtime extent在canonical type中记为
-`-1`，真实逻辑长度仍由显式operand保存。Target可以使用已绑定meta value，但不能仅从
-surrounding shape猜一个extent。每个realization可以要求static extent或明确上界；不满足时
-直接unsupported。
+`W.block(D, offset=0)`同时建立一个唯一logical axis identity并产生shape `[D]` 的index block。
+每次调用都是不同axis；相同extent不代表相同domain。Source integer literal写成static dimension；
+meta或runtime extent在canonical type中记为`-1`，真实长度由block_index operand保存。Target
+不能从相等shape猜axis identity。
 
 ### Broadcasting
 
@@ -231,26 +230,28 @@ m[:, None]
 k[None, :]
 ```
 
-这两种slicing只插入singleton logical axis；它们不授权任意broadcast或shape重写。
+这两种slicing只插入axis identity为`0`的singleton logical axis；它们不授权任意broadcast或
+shape重写。Pointwise join只能合并同一source axis、显式singleton或scalar；同shape不同axis
+在frontend/canonical边界拒绝。
 
 ### Block constructors
 
 ```python
-W.full(shape, value, dtype=...)
-W.zeros(shape, dtype=...)
+W.full((axis0, axis1, ...), value, dtype=...)
+W.zeros((axis0, axis1, ...), dtype=...)
 ```
 
-这些构造只定义logical value。当前public surface没有任意reshape/transpose；算法需要的坐标变换
-由作者显式写入pointer/index relation。是否materialize、如何分寄存器、是否重新生成，由target
-lowering决定。
+Shape entry必须是direct `W.block` value，不接受裸整数。同一个block domain因此在constructor、
+operand、result和loop carry中保持同一axis identity。当前public surface没有任意reshape/transpose；
+算法需要的坐标变换由作者显式写入pointer/index relation。
 
 ### Block load/store
 
 `W.load` 与 `W.store` 对 block-shaped pointer 自动产生 block value/effect，不需要独立 `block_load` 语义。
 
 ```python
-m = W.block_axis(BM)
-k = W.block_axis(BK)
+m = W.block(BM)
+k = W.block(BK)
 a_blk = W.load(a + (m0 + m[:, None]) * lda + (k0 + k[None, :]), where=...)
 ```
 

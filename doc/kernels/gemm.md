@@ -21,12 +21,12 @@ def gemm_worker(
 ) -> None:
     for m0 in W.range(m_begin, m_end, BM):
         for n0 in W.range(0, n, BN):
-            acc = W.zeros((BM, BN), dtype=W.f32)
+            mi = W.block(BM)
+            ni = W.block(BN)
+            acc = W.zeros((mi, ni), dtype=W.f32)
 
             for k0 in W.range(0, k, BK):
-                mi = W.block_axis(BM)
-                ni = W.block_axis(BN)
-                ki = W.block_axis(BK)
+                ki = W.block(BK)
 
                 m_idx = m0 + mi[:, None]
                 n_idx = n0 + ni[None, :]
@@ -48,8 +48,7 @@ def gemm_worker(
                     math="native",
                 )
 
-            mi = W.block_axis(BM)
-            ni = W.block_axis(BN)
+            acc = acc + W.f32(0.0)
             m_idx = m0 + mi[:, None]
             n_idx = n0 + ni[None, :]
             out_valid = (m_idx < m_end) & (n_idx < n)
@@ -59,6 +58,7 @@ def gemm_worker(
 这里：
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
+- `mi/ni/ki`是三个不同source axis；A/B显式共享同一个`ki`，accumulator显式拥有`[mi,ni]`；
 - `a` 的logical relation是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major relation；只有source
   使用`W.persistent(format)`显式声明的caller-provided packed object才具有persistent身份；
 - block values 与matmul relation归canonical semantics；
@@ -73,15 +73,18 @@ block表达6个row dot：
 ```python
 for row in W.range(m_begin, m_end, 6):
     for column in W.range(0, n):
-        row_lane = W.block_axis(6)
-        inner = W.block_axis(k)
+        row_lane = W.block(6)
+        inner = W.block(k)
         lhs = W.load(a + (row + row_lane[:, None]) * lda + inner[None, :],
                      where=row + row_lane[:, None] < m_end,
                      other=W.f32(0.0))
         rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
-        value = W.dot(lhs, rhs, init=W.zeros((6,), dtype=W.f32),
+        value = W.dot(lhs, rhs, init=W.zeros((row_lane,), dtype=W.f32),
                       acc_dtype=W.f32, order="relaxed", math="native")
-        W.store(c + (row + row_lane) * ldc + column, value,
+        shifted = value + W.f32(0.0)
+        scaled = value * W.f32(1.0)
+        W.store(c + (row + row_lane) * ldc + column,
+                W.maximum(shifted, scaled),
                 where=row + row_lane < m_end)
 ```
 

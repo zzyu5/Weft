@@ -28,6 +28,7 @@ enum class LogicalShapeKind { Scalar, Block, Region };
 mlir::Type unwrapLogicalValidity(mlir::Type type);
 mlir::Type logicalElementType(mlir::Type type);
 llvm::ArrayRef<int64_t> logicalShape(mlir::Type type);
+llvm::ArrayRef<int64_t> logicalAxisIds(mlir::Type type);
 LogicalShapeKind logicalShapeKind(mlir::Type type);
 bool isLogicalValue(mlir::Type type);
 bool hasLogicalValidity(mlir::Type type);

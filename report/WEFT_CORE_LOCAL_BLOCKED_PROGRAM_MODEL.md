@@ -1,560 +1,497 @@
-# Weft Core-Local Blocked Programming Model
+# Weft Core-local Blocked Programming Model
 
-> **状态：本轮设计输入快照。** 稳定语义已经吸收到 `doc/index.md` 所链接的现行规范；本文保留问题来源、审计反例与设计推导，不再作为第二份持续维护的规范 authority。
+> **状态：当前唯一源语言与编程模型说明。** Canonical Kernel IR、RISC-V lowering、示例和其他文档只能投影本文定义的语义，不得另行发明第二套 block、state、storage 或 execution model。
 
----
+## 1. 最终定义
 
-## 1. 项目目标
+Weft 是一门面向单个 RISC-V CPU worker/hart 的 AOT kernel DSL。
 
-Weft 要解决的是一个具体问题：
+> 一个 Weft kernel 是由当前 worker 从入口到返回持续执行的一份有序程序。作者显式写出 traversal、blocking、staging、局部数据布局、state lifetime 与 local structured operations；编译器只在这些显式结构内部选择 SIMD、寄存器微内核和 RISC-V 扩展 realization。
 
-> RISC-V CPU 需要一门真正的高性能算子 DSL/编译器；它既要适合单个 hart 上的 SIMD、状态、控制流、blocking 与 packing，又要能在 RVV、矩阵扩展、量化扩展及 vendor extension 持续碎片化时，局部接入新能力，而不是重新实现整套算子。
-
-Weft 的正式产物是：
+正式主链只有：
 
 ```text
-Weft DSL kernel
-→ canonical worker-local Kernel IR
-→ RISC-V physical realization
-→ intrinsic C / primitive-local inline asm
-→ GCC / Clang
+Weft Python DSL
+→ canonical Core-local Kernel IR
+→ one target-specific RISC-V lowering
+→ intrinsic C / primitive-local inline asm + C header
+→ system C compiler
 → object / library
 ```
 
 Weft 不是：
 
-- 从算子图自动选择算法的图编译器；
-- 根据 kernel 名或 q-format 调手写实现的 dispatch library；
-- 只给 RVV intrinsic 套 Python 外壳；
-- 多核线程池、模型图或设备 runtime；
-- 让编译器从普通乘加、普通循环中猜出 matmul、scan、online softmax 或量化格式的模式机。
+- graph compiler；
+- operator catalog 或按 kernel/q-format 选择手写函数的 dispatch library；
+- GPU program grid 在 CPU 上的语法翻译；
+- 自动从普通 loop/SSA 猜 GEMM、scan、summary 或量化格式的模式机；
+- 多核线程池、work stealing、NUMA 或模型 runtime。
 
----
+## 2. 根执行合同
 
-## 2. 核心编程模型：Core-local blocked program
-
-Weft 的根对象不是 GPU grid 中的 program instance，也不是一个孤立的 VLA loop，而是：
-
-> **由一个 CPU worker/hart 执行的一份持续存在的有序 kernel 程序。该程序可以顺序处理多个数据块，持有局部 block、state 与 storage，使它们跨循环存活、更新和复用。**
-
-一个 Weft kernel 由以下结构共同组成：
+一个 kernel entry 是普通 C ABI callable。外部 runtime 选择当前 worker 的 work slice，并将它作为普通 pointer/scalar 参数传入：
 
 ```text
-有序 scalar control
-+ logical blocks and state
-+ explicit memory/storage lifetime
-+ explicit wide/local primitives
+runtime
+  → 选择 row range / tile / expert range / descriptor
+  → 在当前 hart 调用一个 Weft entry
+  → entry 顺序执行 scalar control、VLA、block compute 和 memory effect
+  → 返回 caller
 ```
 
-### 2.1 有序控制程序
+Weft 不提供：
 
-作者显式写：
+- grid rank；
+- `program_id`；
+- worker/hart ID；
+- 隐式 launch coordinate；
+- 多个 hart 协作同一 logical block 的 core-level barrier。
 
-- `for / while / if`；
-- worker 负责的数据范围或 descriptor；
-- loop order；
-- cache/algorithm blocking；
-- 一遍或多遍算法；
-- state 的更新顺序；
-- staging、scratch 与 persistent packing 的位置和生命周期。
+需要 work identity 时，caller 将它作为普通 ABI 参数传入。不同 kernel 可以使用不同 descriptor；语言不强制统一 `work_begin/work_end`。
 
-这些是 kernel 实现结构，不是后端可以从数据流中重新发明的内容。
+一次 invocation 可以顺序处理多个 output/cache block。Block、accumulator、state 和 workspace 的 lifetime 由作者写下的 control/use/storage relation 决定，不随某个 VLA strip或primitive调用自动结束。
 
-### 2.2 Logical block 与 state
+## 3. 与 Triton 的区别
 
-Block 是固定或参数化 shape 的逻辑 SSA 值。它可以：
-
-- 从 pointer/index/load 构造；
-- 被 pointwise、reduce、scan、dot/matmul、lookup/decode 等消费；
-- 跨 loop iteration 作为 accumulator 或 state 存活；
-- 被多个普通 SSA consumer 使用；
-- 最终写回 memory，或进入另一个 structured primitive。
-
-Block 不预先绑定：
-
-- RVV lane；
-- LMUL；
-- 物理寄存器；
-- IME fragment；
-- 具体 intrinsic。
-
-但 block 的逻辑 shape、axis、extent、validity、dtype 和数值关系必须明确。
-
-### 2.3 Explicit local primitive
-
-局部 structured primitive 是作者显式授予编译器物理重组权的边界，例如：
-
-- `W.vla`：显式一维 SIMD/VLA logical domain；
-- `W.reduce / W.scan / W.argmax / W.online_softmax_summary`；
-- `W.dot / W.matmul`；
-- `W.lookup / W.decode`；
-- 具有独立可观察数值语义的 packed/quant/extension primitive。
-
-没有显式 primitive，target 不得从普通 SSA 图中猜测它。
-
-局部 primitive 可以拥有 primitive 内部、短生命周期、对外不可观察的 packing、temporary 和 asm sequence；它不能拥有完整 kernel 的 ABI、outer traversal、algorithmic staging、persistent layout 或完整状态机。
-
----
-
-## 3. Weft 与 Triton 的真正区别
-
-Weft 不以“我们不用 tile”区别 Triton。Tile 是强大且可跨硬件使用的思想；Weft 也使用 block/tile 和可调 BM/BN/BK。
-
-真正差异是 **tile/block 的执行合同和生命周期**。
-
-### 3.1 Triton 的合同
-
-Triton 的典型模型是：
+区别不是 Weft “没有 tile”。两种语言都可以让作者写 block algorithm、BM/BN/BK 和 local product。
 
 ```text
-grid
-→ program instance
-→ program 逻辑拥有一个结果 tile
-→ compiler 将 tile 分布到 warp / lane / register / shared memory
+Triton
+  grid 中一个 program/CTA instance逻辑拥有一个或几个result tile
+  compiler把tile分布到协作线程、warp、register和shared memory
+
+Weft
+  一个CPU worker持续执行普通ordered program
+  同一worker可顺序处理多个block
+  block、accumulator、state与workspace可跨作者loop存活和复用
+  compiler把local block operation实现为SIMD register、microkernel或extension fragment
 ```
 
-作者写 block algorithm、pointer、mask、K loop 和 `tl.dot`；具体 tile layout、线程分布、shared-memory conversion、MMA 和 pipeline 由 GPU backend 决定。
+因此，Weft 的独立合同是：
 
-### 3.2 Weft 的合同
+- block 的 owner 是 worker control program；
+- outer traversal、cache blocking、staging 和 persistent packing 是 source program；
+- VLA、dot/matmul 和 extension op 只是局部 realization 授权点；
+- block/state/storage lifetime 必须能从 DSL 与 canonical IR 本身读出。
 
-Weft 的模型是：
+如果一个实现仍需查看 emitter matcher 或 Physical Plan 才能解释“这个 block 属于谁、活多久”，它不符合本模型。
+
+## 4. 一种程序，不是几种 kernel 的拼接
+
+Weft kernel 统一由以下部分构成：
 
 ```text
-external runtime 将一段工作交给一个 worker
-→ worker 顺序执行一份持久 control program
-→ program 可连续处理多个 cache blocks
-→ block/state/storage 可跨循环存活和复用
-→ compiler 将 block operation 映射到 SIMD registers、多个 accumulators 或扩展 fragment
+ordered scalar control
++ scalar / block / VLA-region SSA values
++ explicit pointer, predicate and memory effects
++ explicit source-visible storage
++ explicit local semantic primitives
 ```
 
-因此 Weft 与 Triton 的差异不是“都有无 tile”，而是：
+Scalar、block、VLA、state、quant 和 IME 不是不同的 kernel 类别。它们服从同一 lexical scope、SSA use-def、logical domain、validity、effect 与 control-carry 规则。
 
-| | Triton | Weft |
-|---|---|---|
-| 根执行单位 | grid 中的 blocked program instance | 一个 CPU worker/hart 上的持续有序程序 |
-| block 的拥有者 | program/CTA 逻辑拥有 | worker control program 持有并跨循环复用 |
-| 多个 output blocks | 通常由多个 program instances 分担 | 一个 worker 可顺序处理多个 blocks |
-| storage 生命周期 | 主要围绕一个 program/tile 与 GPU memory hierarchy | caller/persistent/worker-local/primitive-local 生命周期必须明确 |
-| 物理化 | tile → warp/lane/register/shared/MMA | block/state → SIMD/register microkernel/extension fragment |
-| 多核 | grid/launch 属于模型 | 外部 runtime 负责 |
+一个 ordinary loop 可以包含 VLA；VLA value 可以带额外 block axes；dot operands 可以来自 indexed memory；dot result 可以进入 pointwise、另一个 consumer、loop carry 或 store。出现新组合不会产生新的 whole-kernel 类别。
 
-Weft 的独立价值不在于语法不同，而在于：
+## 5. Ordered control 与 state
 
-> **它让作者直接表达 CPU 高性能 kernel 中 backend 无法可靠恢复的 block/state/storage 生命周期与有序复用结构，同时让编译器隐藏 ISA、寄存器和扩展细节。**
+Python `for / while / if` 是当前 worker 的普通有序控制。
 
-如果 Weft 只保留静态 block + `W.matmul`，却不正式表达 worker-local storage/lifetime 和自然 SSA composition，它就不足以区别于 Triton CPU backend。
+```python
+state = initial
+for step in W.range(begin, end):
+    state = update(state, step)
+```
 
----
+这里的赋值按照普通 Python source semantics 形成 canonical loop-carried SSA。Frontend 将被更新的 local 投影成 region argument、yield 和 loop result；这是 source 到 SSA 的机械转换，不是 target 推测算法。
 
-## 4. GEMM：当前 DSL 应表达什么
+作者拥有：
 
-当前 `gemm_worker` 已经体现了 Core-local blocked program 的一部分：
+- loop 是否存在；
+- iteration order 与 step；
+- 哪些 value/state 跨 iteration carry；
+- blocking 所在的 loop level；
+- branch、effect 和 state update 顺序。
+
+Compiler不得把 scalar loop 改成新的 VLA domain，也不得把普通 carry 猜成 reduce、scan 或 summary。
+
+Block state 直接作为普通 block SSA value跨 `for/while/if` carry，不包装进 opaque state object。`W.tuple` 只表示闭合的 scalar state tuple；block state 仍由普通 control carry表达，从而保留其 domain identity和consumer关系。
+
+Reduce、scan、argmax、online summary 与 sequential carry 保持不同的可观察语义：
+
+- `reduce` 只观察最终聚合值；
+- `scan` 为每个 logical position产生有序prefix；
+- `argmax` 显式定义coordinate与tie policy；
+- `online_softmax_summary` 显式定义稳定 `(maximum, scaled_sum)` 合并代数；
+- ordinary carry 按作者 loop order执行。
+
+它们不能互相猜测或替换。
+
+## 6. Logical block：显式 domain 的普通 SSA value
+
+### 6.1 `W.block` 同时定义 axis identity 与坐标
+
+每一次 `W.block(extent, offset=0)` 创建一个新的 source-owned logical block axis，并产生该轴上的 index block：
+
+```python
+m = W.block(BM)
+n = W.block(BN)
+k = W.block(BK)
+```
+
+这里 `m`、`n`、`k` 不只是三个长度；它们是三个不同的 logical axis identity。即使 `BM == BN == BK`，三个轴也不能互换。
+
+同一个 axis value 可以被多个 operand共享：
+
+```python
+a_index = m[:, None] * lda + k[None, :]
+b_index = k[:, None] * ldb + n[None, :]
+```
+
+因此，`W.matmul` 的 K relation来自两个 operand显式共享同一个 `k`，而不是 backend看到两个相等的静态维度后猜测它们是 contraction axis。
+
+旧 `W.block_axis` 不再属于语言；它只有 shape 而没有稳定 axis identity，不能作为 canonical block 模型继续保留。
+
+### 6.2 Block constructor 直接消费 axis values
+
+Block constructor 不接受裸整数 shape。作者用实际 axis value定义 block domain：
+
+```python
+m = W.block(BM)
+n = W.block(BN)
+acc = W.zeros((m, n), dtype=W.f32)
+bias = W.full((n,), W.f32(1.0))
+```
+
+这样，accumulator的 `[M,N]` identity 在创建时即已确定。Frontend、canonical verifier 与target都不能把另一个同长 axis替换进来。
+
+### 6.3 Explicit singleton-axis broadcast
+
+`None` slicing只插入一个显式 singleton broadcast dimension：
+
+```python
+m[:, None]   # [M, 1]
+n[None, :]   # [1, N]
+```
+
+Singleton broadcast axis在 canonical type中使用专用 identity `0`，不等于任何真正的 source axis。Pointwise join只有在以下条件之一成立时合法：
+
+- 两个位置携带同一个 source axis identity；
+- 一侧是显式 singleton broadcast；
+- 一侧是 scalar。
+
+同 shape、不同 identity 的两个 block 不能 pointwise 合并。这使同形不同轴的错误在 source/canonical 边界失败，而不是到 emitter才暴露。
+
+### 6.4 Canonical block type
+
+Canonical type同时保存静态/动态 shape 与 logical axis identity：
 
 ```text
-worker 接收 m_begin / m_end
-→ 顺序遍历多个 M/N cache blocks
-→ accumulator block 跨 K loop 存活
-→ A/B block 每个 BK 被构造和消费
-→ W.matmul 只负责当前局部 block product
-→ 最后由同一个 worker 写回
+!weft_kernel.block<[D0, D1, ...], [a0, a1, ...], T>
+!weft_kernel.region<[-1, D0, ...], [-1, a0, ...], T>
 ```
 
-### 4.1 作者在 GEMM 中控制
+- positive `ak` 是由某个唯一 `weft_kernel.block_index` 定义的 block axis；
+- `0` 是 explicit singleton broadcast；
+- region首轴的 `-1` 是当前 lexical VLA axis；
+- dynamic dimension仍使用 shape `-1`，但 axis identity不因动态长度而丢失。
 
-- worker 的 M 范围；
-- M/N/K loop order；
-- BM/BN/BK blocking 的存在、位置与 meta-parameter；
-- A/B/C pointer 与 index relation；
-- mask；
-- accumulator 的 shape 与跨 K-loop 生命周期；
-- algorithmic staging；
-- persistent packed A/B layout；
-- 算法 variant。
+Block value不绑定 RVV lane、VLEN、LMUL、register number、microtile或IME fragment。
 
-这些信息比数学上的 `C=A×B` 更低，已经是具体 CPU kernel 结构。
+### 6.5 Ordinary SSA composition
 
-### 4.2 `W.matmul` 控制的边界
-
-`W.matmul(a_blk, b_blk, init=acc)` 只声明当前：
-
-```text
-[BM, BK] × [BK, BN] + [BM, BN]
-```
-
-的局部 block product。
-
-Realizer 可以在该 primitive 内决定：
-
-- RVV register microkernel；
-- vectorized 方向与合法 memory realization；
-- register microtile；
-- multiple accumulators；
-- K-unroll；
-- primitive-local load schedule、packing 与 software pipeline；
-- RVV、IME 或未来 tensor extension realization。
-
-Realizer不得决定：
-
-- 是否存在 outer K loop；
-- 是否增加 persistent repack；
-- 是否把 GEMM 改成另一种 traversal；
-- 是否增加跨 primitive 的 staging；
-- 是否改变 BM/BN/BK 在算法中的角色。
-
-### 4.3 与 Triton GEMM 的核心区别
-
-Triton 与 Weft 都允许作者写 BM/BN/BK，也都可以 autotune 具体值。两者的差异不是参数。
-
-Triton GEMM 通常让一个 program instance负责一个 output tile，后端围绕 GPU collective execution 分配 tile。
-
-Weft GEMM 让一个 worker 在普通 control flow 中持有 accumulator、顺序遍历多个 blocks，并显式拥有 storage/reuse lifetime。后端只把 `W.matmul` 等局部 block operation 物理化成 SIMD/microkernel/extension。
-
-因此 Weft 对 CPU 作者真正简化的不是“替他选择 GEMM 算法”，而是：
-
-- 不手写 RVV strip 与 tail；
-- 不手写每种 dtype/width 的 intrinsic 链；
-- 不为每个 MR×NR、LMUL、unroll、pipeline 候选复制内核；
-- 不为 RVV 与矩阵扩展复制完整 GEMM/Conv/Attention；
-- 不手工维持 load、cast、accumulator、reduce、store 之间的物理兼容；
-- 不自己承担最终寄存器分配和机器调度。
-
-但作者仍需写出高性能所需的 blocking、staging、persistent packing 和算法 variant。
-
----
-
-## 5. DSL、Realizer、Tuner、Leaf 的严格分工
-
-### 5.1 DSL 作者拥有
-
-```text
-worker-local ABI
-ordered control and traversal
-algorithm/cache blocking
-block/state shape and lifetime
-VLA logical domain
-pointer/index/predicate/effect
-algorithmic staging and workspace
-persistent packing/layout
-state algebra and numerical policy
-explicit local primitive
-algorithm variant
-```
-
-判断标准：若优化改变 loop/pass、blocking、staging、persistent data organization、state algorithm 或 traversal，它属于 DSL。
-
-### 5.2 Weft Realizer 拥有
-
-```text
-dynamic vl / SEW / LMUL
-value/register physical shape
-unit/strided/indexed/segment memory realization
-state scalar/vector placement
-block handoff and ordinary SSA composition
-register microtile / multiple accumulators
-K-unroll / prefetch / primitive-local pipeline
-short-lived local packing
-RVV / IME / vendor extension realization
-resource legality
-```
-
-判断标准：若优化不改变作者程序，只改变显式 block/primitive 的机器执行，它属于 Realizer。
-
-### 5.3 Tuner 拥有
-
-Tuner 只在 Realizer 已证明合法的实现族中实测选择，例如：
-
-```text
-BM / BN / BK meta values
-LMUL
-microtile
-multiple accumulator count
-unroll
-prefetch distance
-pipeline depth
-fragment family
-local packing strategy
-```
-
-Tuner不创造结构，也不能让非法实现合法。
-
-### 5.4 Primitive-local leaf 与 system compiler
-
-手写 intrinsic/asm microkernel 可以存在，但只能实现明确的局部 primitive。
-
-Leaf 不得拥有：
-
-- public kernel ABI；
-- outer loop；
--完整 blocking；
-- persistent layout；
--完整 algorithm state。
-
-GCC/Clang 继续负责：
-
-- 物理寄存器分配；
-- 最终 `vsetvli` 与机器调度；
-- spill；
-- peephole；
-- 常量折叠与机器码。
-
----
-
-## 6. Storage、workspace 与 lifetime 是核心，不是附件
-
-`Core-local blocked program` 要成立，作者必须能表达“谁持有数据，以及持有多久”。至少需要以下语义类别：
-
-### 6.1 External/public storage
-
-输入、输出和必须保持调用 ABI 的 buffer。
-
-### 6.2 Persistent packed storage
-
-在构建期或模型加载阶段形成，并跨 kernel 调用复用的 target-compatible representation。
-
-作者/上游 runtime拥有是否允许 repack、packed layout identity 和部署生命周期。Target 不得偷偷创造 persistent ABI。
-
-### 6.3 Worker-local algorithmic workspace
-
-作者显式使用、可跨 loop 或 primitive 存活的 staging/scratch，例如：
-
-- attention query/accumulator scratch；
-- convolution packed patch；
-- invocation-local per-worker state；
-- 算法可见的 ping-pong buffer。
-
-它必须有 shape、alignment、alias 和 lifetime contract，并进入 artifact ABI/metadata。
-
-### 6.4 Compiler-private primitive temporary
-
-只在一个 primitive 内部存在、不可观察的 register/local pack、temporary 或 buffer。它不进入 DSL public ABI。
-
-本轮实现将表面语法冻结为 caller-provided entry pointer：external为默认class；persistent使用
-`W.persistent(format)`，workspace使用`W.workspace, W.noalias`；后二者各由entry body中唯一的
-`W.storage(pointer, shape)`闭合。Primitive-private temporary不进入DSL/Kernel IR/artifact ABI。
-
----
-
-## 7. Block 与 structured primitive 必须自然组合
-
-这是当前模型是否真实成立的最硬判据。
-
-一个合法 primitive result 必须是普通 SSA value，而不是 fast-path terminal。至少以下程序应由同一模型支持：
+Block load、pointwise、state carry和structured result都进入同一 SSA value system：
 
 ```text
 dot → add → store
-dot → two consumers
-dot → state update
-matmul → pointwise activation → store
-block transform → pointwise → store
-state → indexed memory
-workspace value跨loop复用
-persistent packed operand → RVV/IME local primitive
+dot → consumer A and consumer B
+matmul → pointwise → store
+block → loop carry → block
+block + scalar state in one ordered program
 ```
 
-若在 primitive 后插入一个合法 pointwise consumer就失去 lowering，说明 backend仍依赖精确 source closure，而不是编译 block program。
+同一个 value允许多个 consumer。One-use 可以影响是否复用 physical storage，但不能决定 source是否合法，也不能成为 primitive fast path入口。
 
-不能通过再增加 closure matcher修复。正确修复位置是：
+## 7. VLA 是显式 SIMD logical domain，不是根模型
+
+```python
+with W.vla(begin, end) as i:
+    value = W.load(source + i)
+    W.store(output + i, value)
+```
+
+`i` 表示 `[begin,end)` 中每个逻辑位置，不是 lane ID。Target可以把它分成任意数量的动态 `vl` strip，但 source不能观察：
+
+- exact `vl`；
+- VLEN；
+- strip ordinal；
+- lane ID；
+- LMUL。
+
+一个 lexical scope 当前只允许一个 active VLA axis。普通 scalar loop可以出现在 VLA body内；第二个 VLA 不可以。
+
+VLA body不能任意更新 outer state。跨完整 VLA domain 的状态必须由 reduce、scan 或显式 typed summary primitive产生；否则 strip choice会变成 source-observable。
+
+VLA axis可以与 block axes组合：
 
 ```text
-producer physical result
-→ explicit handoff
-→ ordinary consumer realization
+region<[VLA, K], [vla, k], T>
 ```
 
----
+Dot/matmul不能缩并 VLA axis；跨 VLA 的聚合必须由相应 state primitive显式授权。
 
-## 8. RISC-V 碎片化与新扩展
+## 8. Pointer、predicate、memory 与 validity
 
-Weft 的扩展性遵守三条规则。
+作者显式写 pointer/index relation：
 
-### 8.1 已有语义的新硬件实现
+```python
+pointer = base + row * stride_row + column * stride_column
+```
 
-新 tensor/segment/quant/permute instruction如果实现已有 primitive，只增加：
+Typed pointer expression传播完整 block/VLA domain。Load/store的 predicate、fill与value必须是 scalar，或能显式 broadcast到同一个 pointer domain；同 shape不同 axis不会被接受。
+
+```python
+x = W.load(ptr, where=valid)
+```
+
+当 `where` 非恒真且没有 `other` 时，结果携带 first-class logical validity。
+
+```python
+x = W.load(ptr, where=valid, other=0.0)
+```
+
+提供 `other` 后得到普通 filled value。未填充 masked value不能直接进入不理解 validity 的普通 consumer或store。
+
+Target可以选择 unit/strided/indexed/segment memory、mask form、地址strength reduction和physical prefetch，但不能改变 source-visible pointer relation、effect order或storage ownership。
+
+## 9. Storage、staging 与 lifetime
+
+Source-visible memory object均由 caller分配并作为 entry pointer传入。语言只有四类 ownership：
+
+| 类别 | Source表达 | Lifetime与owner |
+| --- | --- | --- |
+| external | 默认 pointer | caller持有的普通input/output/state |
+| persistent | `W.persistent(format)` + `W.storage` | caller/model loader持有，按明确format跨调用复用 |
+| workspace | `W.workspace, W.noalias` + `W.storage` | 当前worker本次invocation独占，可跨loop/primitive复用 |
+| primitive-private temporary | 不进入DSL | target只在一个local primitive realization内部创建 |
+
+Workspace示例：
+
+```python
+scratch: W.ptr[W.f32, W.workspace, W.noalias]
+W.storage(scratch, shape=(rows, columns))
+```
+
+作者决定何时写入scratch、跨哪些loop复用、何时失效。Target不能因为某个fast path需要scratch就偷偷增加ABI参数。
+
+Persistent示例：
+
+```python
+packed_weight: W.ptr[
+    W.u8,
+    W.readonly,
+    W.noalias,
+    W.persistent("q4_k_n16_k32_304b"),
+]
+W.storage(packed_weight, shape=(column_blocks, k_blocks, 304))
+```
+
+Format identity是caller和consumer共享的长期ABI，不是LMUL、register layout或IME fragment。Consumer lowering不得在内部创建persistent repack；需要builder时，builder是另一份显式kernel或应用构建步骤。
+
+纯 SSA block/state不需要为了跨 loop存活而自动写进workspace。Register、rematerialize、reload与target-local spill是physical realization；只有作者明确选择algorithmic staging时才使用workspace。
+
+## 10. Structured primitive 的授权边界
+
+### 10.1 Dot
+
+`W.dot`固定收缩双方共享的最后一个 block axis。当前公开数值域是F32 multiplicand/F32 accumulator，合法关系是：
 
 ```text
-target capability facts
-legality and resource equations
-physical candidates
-handoff / pipeline constraints
-intrinsic C or typed asm leaf
+[R,K] × [K]       → [R]
+[VLA,K] × [K]     → [VLA]
+[R,K] × [VLA,K]   → [VLA,R]
 ```
 
-例如新 tensor extension 实现 `W.matmul` 后，GEMM、Conv、MoE、Attention 等所有使用该局部 primitive 的 kernel都可获得新 candidate；不增加完整算子后端。
+两侧 K 不仅extent相同，还必须来自同一个 `W.block` identity。
 
-### 8.2 新的局部可观察语义
+### 10.2 Matmul
 
-如果硬件引入普通 primitive无法表达的：
-
-- block scale；
-- minimum/zero correction；
-- codebook；
-- saturation/rounding；
-- sign-bit mapping；
-
-可以增加一个局部 typed semantic primitive，但它仍不得拥有 outer traversal、persistent layout或kernel ABI。
-
-### 8.3 新的完整算法结构
-
-若峰值性能需要新的 outer traversal、persistent packing、staging 或 state algorithm，作者显式提供新的 DSL kernel variant。Target不得暗中改写旧程序。
-
----
-
-## 9. Intrinsic C 是正式后端边界
-
-Weft 面向 RISC-V 及其碎片化扩展，正式生成：
+`W.matmul`固定表达：
 
 ```text
-standard RVV intrinsic C
-vendor intrinsic
-necessary typed inline asm leaf
-ordinary scalar C
+[M,K] × [K,N] + [M,N] → [M,N]
 ```
 
-然后交给系统 C 编译器。
+当前公开数值域是F16 multiplicand/F32 accumulator。M、N、K relationship由operand与init的axis identity完整定义。
 
-这个边界使 Weft 能：
+### 10.3 Result 与 init
 
-- 精确表达向量类型、mask、memory form和extension intrinsic；
-- 保留可读、可审查、可嵌入的产物；
-- 复用现有 RISC-V 编译器完成最终后端；
-- 避免自己维护 LLVM machine backend。
+`init` 是必填 source semantics，可以是scalar或与result完全同domain的 accumulator。Dot/matmul result是普通 block/region SSA value，可以：
 
-它不意味着 Weft lowering 很薄。Block layout、state、microkernel、packing、pipeline和extension realization仍由 Weft决定。
+- 多次使用；
+- 进入pointwise；
+- 作为loop-carried accumulator；
+- 进入state或memory；
+- 成为另一个合法local primitive的operand。
 
----
+Target只在当前 primitive 内决定：
 
-## 10. `materials/`：高性能知识资产的学习与复用
+- SIMD方向与LMUL；
+- register microtile/multiple accumulators；
+- K-unroll；
+- primitive-local load schedule与packing；
+- RVV/IME/vendor extension realization。
 
-`materials/` 不是旧 backend，也不是 fallback。它是经过真实硬件验证的高性能知识 donor。
+Target不得创建outer loop、改变blocking、增加source-visible staging、创造persistent packing，或选择另一种GEMM算法。
 
-每当现有 kernel出现性能瓶颈，应主动审查相关 materials，而不是从零猜测；但必须按所有权提取，不能复制完整旧路径。
+## 11. GEMM 中心判据
 
-### 10.1 算法/DSL 知识
+一份符合本模型的F16 blocked GEMM如下：
 
-进入 DSL kernel 或显式 variant：
+```python
+for m0 in W.range(m_begin, m_end, BM):
+    for n0 in W.range(0, n, BN):
+        m = W.block(BM)
+        n_block = W.block(BN)
+        acc = W.zeros((m, n_block), dtype=W.f32)
+        m_index = m0 + m[:, None]
+        n_index = n0 + n_block[None, :]
 
-- outer traversal；
-- cache blocking；
-- algorithmic staging；
-- persistent repack；
-- 跨 loop reuse；
-- scale/min 分离累加等作者可观察的算法组织。
+        for k0 in W.range(0, k, BK):
+            k_block = W.block(BK)
 
-### 10.2 Realizer 物理知识
+            k_lhs = k0 + k_block[None, :]
+            k_rhs = k0 + k_block[:, None]
 
-进入共享 candidate、legality、resource 和 schedule：
+            a_block = W.load(
+                a + m_index * lda + k_lhs,
+                where=(m_index < m_end) & (k_lhs < k),
+            )
+            b_block = W.load(
+                b + n_index * ldb + k_rhs,
+                where=(k_rhs < k) & (n_index < n),
+            )
 
-- MR×NR register blocking；
-- multiple accumulators；
-- LMUL/SEW/resource relation；
-- 8×32 subblock 等局部组织；
-- decode/widen/reduce 连接；
-- codebook gather；
-- load schedule、prefetch、pipeline；
-- fragment 与 handoff。
+            acc = W.matmul(
+                a_block,
+                b_block,
+                init=acc,
+                acc_dtype=W.f32,
+                order="relaxed",
+                math="native",
+            )
 
-### 10.3 Leaf 拼写知识
+        acc = acc + W.f32(0.0)
+        W.store(c + m_index * ldc + n_index, acc,
+                where=(m_index < m_end) & (n_index < n))
+```
 
-进入 primitive-local intrinsic/asm：
+仅从source即可回答：
 
-- RVV intrinsic sequence；
-- `vmadot` 等 asm leaf；
-- operand constraint / clobber；
-- exp polynomial 等局部数学实现。
+- 当前worker遍历`m0/n0/k0`；
+- BM/BN/BK位于哪些loop；
+- `acc`由当前worker持有并跨K-loop carry；
+- A/B block如何构造和mask；
+- M/N/K轴分别是谁，两个operand共享哪个K；
+- source没有staging或persistent packing；
+- `W.matmul`只覆盖当前local `[M,K]×[K,N]` product；
+- matmul result在loop后仍是普通block value，可继续pointwise后store。
 
-### 10.4 必须建立复用台账
+Realizer若只在M/N/K静态shape和direct-store closure成立时才能解释这个程序，错误在Realizer，不在source模型。
 
-每项吸收的知识应能回答：
+## 12. Quant、lookup 与 RISC-V extension
+
+一个extension primitive只有在以下条件同时成立时才属于DSL：
+
+- 它表达独立、完整、局部且可观察的数值关系；
+- operand/result使用core block/region/validity/storage system；
+- 它不拥有entry ABI、outer traversal、blocking、staging或persistent layout；
+- 普通SSA图不会被target猜成该primitive。
+
+Packed bit ordering、scale/minimum、zero-point、codebook、rounding/saturation等确实可观察的关系可以拥有typed local primitive。LMUL、register grouping、local narrow/widen sequence、fragment和asm spelling不进入DSL。
+
+已有semantic primitive获得新的RVV/IME/vendor指令时，只增加target realization；不能增加完整kernel route。
+
+## 13. Canonical IR 与 Realizer 边界
+
+Canonical Kernel IR持久保存：
+
+- ordered control与carry；
+- scalar/block/VLA-region values；
+- block axis identity、extent与singleton broadcast；
+- pointer、predicate、validity与effects；
+- external/persistent/workspace contracts；
+- reduce/scan/summary/dot/matmul与local extension semantics。
+
+它禁止保存：
+
+- exact `vl`；
+- VLEN/LMUL；
+- register number或microtile；
+- instruction/leaf identity；
+- candidate winner或measurement；
+- launch/thread policy。
+
+一次 target lowering可以产生短生命周期physical facts与decisions，但它们只能实现上述source semantics，不能补写缺失算法。
+
+Emitter负责intrinsic C、ABI与typed local asm拼写。System compiler负责最终register allocation、machine scheduling、spill、peephole和machine code。
+
+## 14. 当前唯一 public model
+
+核心surface按职责分为：
 
 ```text
-来自materials的哪项事实
-→ 归属DSL / Realizer / leaf哪一层
-→ 进入哪个共享能力
-→ 被哪些不同kernel复用
-→ 是否删除了对应旧生产authority
+entry/control
+  @weft.kernel
+  W.range
+  Python if / while
+  W.vla
+
+block/domain
+  W.block
+  singleton slicing [:, None] / [None, :]
+  W.full / W.zeros
+
+memory/storage
+  W.load / W.store
+  W.storage
+  W.external / W.workspace / W.persistent
+
+state
+  W.reduce / W.scan
+  W.argmax / W.online_softmax_summary
+  ordinary scalar or block control carry
+
+structured local compute
+  W.dot / W.matmul
+  W.lookup / W.decode
+  typed quant and extension primitives
 ```
 
-禁止：
+核心surface没有：
 
-- 直接链接 materials 函数；
-- 恢复旧 route/variant；
-- 用 kernel 名或 q-format 进入整段实现；
-- 把旧常数原样搬到新位置并称为编译器能力。
+- `W.block_axis`；
+- arbitrary reshape/transpose/broadcast；
+- source-visible lane/VL/LMUL；
+- generic contraction；
+- generic summary fold；
+- atomic/prefetch/fence等尚未闭合的假能力；
+- compatibility alias或legacy route。
 
----
+## 15. 关闭判据
 
-## 11. 当前实现的真实状态
+一个语言/IR实现只有在以下问题能由source和canonical IR直接回答时才符合本模型：
 
-最新审计表明，当前 Weft 已经有真实 worker-local AOT compiler 主干，但编程模型尚未闭合。审计中的“支持”要求完整经过：DSL → Kernel IR → RISC-V lowering → intrinsic C/asm → system compiler → 真实执行；只到 Python、IR 或特定 closure 都不算支持。
+1. 当前kernel由谁执行；
+2. 当前worker负责什么work slice；
+3. 每个block axis在哪里创建，与哪些operand共享；
+4. block/state跨哪些loop与branch存活；
+5. staging/workspace/persistent object由谁持有、何时有效；
+6. 哪个显式construct授权VLA、state合并、local product或extension realization；
+7. 哪些内容仍属于target physical choice；
+8. 为什么插入普通pointwise或增加第二个consumer不会改变primitive的语言类别。
 
-### 已经成立
+答案不得依赖kernel名、完整source closure、Physical Plan字段或emitter内部假设。
 
-- Python AST → canonical Kernel IR；
-- scalar ordered control；
-- 一条清楚的 `W.vla` 路径；
-- canonical type/control/value 骨架；
-- 部分 VLA/state/dot/matmul/quant/IME physical decisions；
-- intrinsic C / local asm 主链；
-- unsupported fail-closed；
-- `source/` 和 `materials/` 不进入 production fallback。
+最终定义是：
 
-### 仍未闭合
-
-- `dot → add → store` 等自然 SSA composition；
-- block result 多 use、state/memory consumer；
-- workspace、storage lifetime 与 persistent packed ABI；
-- public DSL 与 canonical schema/target artifact 一致性；
-- verifier 中 validity/extent/lookup/decode/masked-dot 合同；
-- family-specific exact closure matcher；
-- emitter 中残留的 shape/layout/resource决定；
-- 真实 multiple accumulators、prefetch和software-pipeline candidate；
-- 正式 target profile；
-- object/header/workspace metadata 与通用 compiler front door；
-- 与同 target、同算法、同 shape、同 preprocessing ownership 的 baseline闭合比较。
-
----
-
-## 12. 不可妥协的关闭判据
-
-后续重构必须满足：
-
-1. **公开能力 = canonical语义 = 正式target artifact。**
-2. **Structured primitive result 是普通可组合 SSA value。**
-3. **Storage ownership、shape、alignment与lifetime从source/artifact唯一可知。**
-4. **作者算法结构不被target猜测或替换。**
-5. **每项physical fact只有一个producer，emitter只消费。**
-6. **性能能力来自共享block/state/memory/primitive lowering，不来自精确closure。**
-7. **新扩展增加local realization，不增加整kernel route。**
-8. **性能瓶颈必须检查并分类吸收materials知识。**
-9. **Tuner只在资源和语义均合法的候选中选点。**
-10. **SG2044与K1分别和各自`source/` baseline比较；跨机只分析decision变化。**
-
----
-
-## 13. 本轮冻结的单一决定
-
-- Workspace不使用源级allocation；caller按generated header分配，作为`W.workspace,
-  W.noalias` entry pointer传入，并由`W.storage`声明shape。
-- Persistent packed object同样由caller提供；`W.persistent(format)`保存稳定format identity，
-  `W.storage`保存shape。Builder若存在，是另一份显式kernel或应用构建步骤，consumer target不得
-  偷偷创建。
-- Local block继续由`W.block_axis`、`W.full/zeros`、load、broadcast/reshape/transpose与pointwise
-  组成普通SSA value system，不增加opaque block object或第二条执行路径。
-- Physical decisions只存在于一次lowering；可以打印非规范化诊断文本，但不提供可重输入、可
-  验证或持久化的debug schema。
-- Compile-and-measure tuner是外部build loop，重复调用唯一编译主链，不形成compiler stage。
-- Public primitive必须同时具有Python surface、canonical op/schema与target-local capability入口；
-  某target缺少合法realization时明确unsupported，不保留只到frontend的假能力，也不静默替换
-  算法。
-
----
-
-## 14. 最终定义
-
-> **Weft 是一门面向 RISC-V 的 Core-local blocked kernel DSL。作者编写由一个 worker/hart 执行的完整有序程序，显式组织 cache blocking、局部 block、state、staging、workspace、persistent layout 与 local structured primitives；这些 block和state可以跨循环存活、更新和复用，并像普通SSA值一样组合。Weft compiler在不改变作者算法的前提下，将 block operations物理化为RVV SIMD、寄存器微内核、局部pipeline和RISC-V扩展，并生成intrinsic C或primitive-local asm。**
-
-最简洁的 Triton 对照是：
-
-> **Triton围绕GPU program/CTA拥有的tile组织程序；Weft围绕CPU worker的持久控制程序所持有的block、state和storage lifetime组织程序。**
-
-这个差异只有在 storage/lifetime、自然 composition 和 extension-local realization 真正进入 DSL/IR/artifact 后才成立。否则 Weft 仍只是一个具有若干 RISC-V fast path 的原型，而不是一门完成的 CPU 算子编译语言。
+> **Weft 作者写一份由单个CPU worker/hart持续执行的Core-local blocked program。Ordered control、block domain与axis identity、state、staging、workspace、persistent layout和local semantic primitives均由作者显式拥有；compiler只把这些结构实现为RVV SIMD、register microkernel和primitive-local RISC-V extension。**

@@ -108,9 +108,9 @@ Target lowering 拥有：
 - intrinsic/asm spelling。
 
 Target lowering不得改变source-visible iteration/effect semantics、algorithmic loop boundary、
-staging、ABI、logical predicate、state algebra或observable numerical mode。在这些语义保持
-不变且legality成立时，可以改变物理loop形态，执行strip-mining、unroll、interchange、
-software pipeline与primitive-local fusion。
+staging、ABI、logical predicate、state algebra或observable numerical mode。它只能在显式
+`W.vla`、dot/matmul或其他local primitive授权的domain内部执行strip-mining、K-unroll、
+software pipeline与primitive-local fusion，不能交换或替换作者的ordinary scalar traversal。
 
 Target不得分配或隐藏source-visible workspace。External、persistent与workspace都是普通entry
 pointer并由caller分配；target只消费其pointer/storage facts。只有local primitive内部不可观察的

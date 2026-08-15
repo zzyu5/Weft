@@ -40,6 +40,7 @@ from .types import RegionType
 from .types import ScalarType
 from .types import TupleType
 from .types import ValueType
+from .types import axes_of
 from .types import bare_type
 from .types import element_type
 from .types import emit_type
@@ -54,6 +55,13 @@ from .types import with_element_type
 class _ShapeSpec:
     dimensions: tuple[int, ...]
     extents: tuple[Value, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockShapeSpec:
+    dimensions: tuple[int, ...]
+    axis_ids: tuple[int, ...]
+    coordinates: tuple[Value, ...]
 
 
 class _AssignedNames(ast.NodeVisitor):
@@ -229,29 +237,47 @@ def _is_pointer(value_type: ValueType) -> bool:
     return isinstance(element_type(value_type), PointerType)
 
 
-def _join_shapes(lhs: ValueType, rhs: ValueType, location: SourceLocation) -> tuple[str, tuple[int, ...]]:
+def _join_shapes(
+    lhs: ValueType, rhs: ValueType, location: SourceLocation
+) -> tuple[str, tuple[int, ...], tuple[int, ...]]:
     lhs_kind = shape_kind(lhs)
     rhs_kind = shape_kind(rhs)
     lhs_shape = shape_of(lhs)
     rhs_shape = shape_of(rhs)
+    lhs_axes = axes_of(lhs)
+    rhs_axes = axes_of(rhs)
     if lhs_kind == "scalar":
-        return rhs_kind, rhs_shape or ()
+        return rhs_kind, rhs_shape or (), rhs_axes or ()
     if rhs_kind == "scalar":
-        return lhs_kind, lhs_shape or ()
-    if lhs_shape is None or rhs_shape is None or len(lhs_shape) != len(rhs_shape):
+        return lhs_kind, lhs_shape or (), lhs_axes or ()
+    if (
+        lhs_shape is None
+        or rhs_shape is None
+        or lhs_axes is None
+        or rhs_axes is None
+        or len(lhs_shape) != len(rhs_shape)
+    ):
         raise FrontendError("logical ranks are not broadcast-compatible", location)
     result: list[int] = []
-    for left, right in zip(lhs_shape, rhs_shape):
-        if left == right:
-            result.append(left)
-        elif left == 1:
+    result_axes: list[int] = []
+    for left, right, left_axis, right_axis in zip(
+        lhs_shape, rhs_shape, lhs_axes, rhs_axes
+    ):
+        if left == 1 and left_axis == 0:
             result.append(right)
-        elif right == 1:
+            result_axes.append(right_axis)
+        elif right == 1 and right_axis == 0:
             result.append(left)
+            result_axes.append(left_axis)
+        elif left == right and left_axis == right_axis:
+            result.append(left)
+            result_axes.append(left_axis)
         else:
-            raise FrontendError("logical shapes are not broadcast-compatible", location)
+            raise FrontendError(
+                "logical values do not share the same block axes", location
+            )
     kind = "region" if "region" in {lhs_kind, rhs_kind} else "block"
-    return kind, tuple(result)
+    return kind, tuple(result), tuple(result_axes)
 
 
 class FrontendCompiler:
@@ -267,6 +293,8 @@ class FrontendCompiler:
         self.helper_effects: tuple[str, ...] | None = None
         self.constant_values: dict[Value, object] = {}
         self.storage_contracts: dict[Value, _ShapeSpec] = {}
+        self.block_axes: dict[Value, tuple[int, Value]] = {}
+        self.next_block_axis = 1
 
     def compile(self) -> str:
         signature = self.unit.definition.signature
@@ -595,8 +623,12 @@ class FrontendCompiler:
             predicate = predicates.get(type(expression.ops[0]))
             if predicate is None:
                 raise FrontendError("unsupported comparison", self._location(expression))
-            kind, shape = _join_shapes(lhs.type, rhs.type, self._location(expression))
-            result_type: ValueType = shaped_type(kind, shape, ScalarType(i1))
+            kind, shape, axes = _join_shapes(
+                lhs.type, rhs.type, self._location(expression)
+            )
+            result_type: ValueType = shaped_type(
+                kind, shape, axes, ScalarType(i1)
+            )
             if is_masked(lhs.type) or is_masked(rhs.type):
                 result_type = MaskedType(result_type)
             return self._emit(
@@ -685,6 +717,33 @@ class FrontendCompiler:
             and lhs_constant == rhs_constant
         )
 
+    def _require_footprint(
+        self, value: Value, footprint: Value, role: str, node: ast.AST
+    ) -> None:
+        value_kind = shape_kind(value.type)
+        footprint_kind = shape_kind(footprint.type)
+        if footprint_kind == "scalar":
+            if value_kind != "scalar":
+                raise FrontendError(
+                    f"{role} cannot widen a scalar pointer footprint",
+                    self._location(node),
+                )
+            return
+        if value_kind == "scalar":
+            return
+        kind, shape, axes = _join_shapes(
+            value.type, footprint.type, self._location(node)
+        )
+        if (
+            kind != footprint_kind
+            or shape != shape_of(footprint.type)
+            or axes != axes_of(footprint.type)
+        ):
+            raise FrontendError(
+                f"{role} does not broadcast to the pointer domain",
+                self._location(node),
+            )
+
     def _compile_binary_operands(self, lhs_node: ast.expr, rhs_node: ast.expr) -> tuple[Value, Value]:
         if isinstance(lhs_node, ast.Constant) and not isinstance(rhs_node, ast.Constant):
             rhs = self._expect_value(self._compile_expr(rhs_node), rhs_node)
@@ -710,8 +769,12 @@ class FrontendCompiler:
                 raise FrontendError(
                     "pointer addition requires an index offset", self._location(expression)
                 )
-            kind, shape = _join_shapes(lhs.type, rhs.type, self._location(expression))
-            result_type = shaped_type(kind, shape, element_type(lhs.type))
+            kind, shape, axes = _join_shapes(
+                lhs.type, rhs.type, self._location(expression)
+            )
+            result_type = shaped_type(
+                kind, shape, axes, element_type(lhs.type)
+            )
             return self._emit(
                 "weft_kernel.ptr_add",
                 expression,
@@ -758,9 +821,11 @@ class FrontendCompiler:
                     "bitwise operands must contain integer elements",
                     self._location(node),
                 )
-        result_kind, result_shape = _join_shapes(lhs.type, rhs.type, self._location(node))
+        result_kind, result_shape, result_axes = _join_shapes(
+            lhs.type, rhs.type, self._location(node)
+        )
         result_type: ValueType = shaped_type(
-            result_kind, result_shape, element_type(lhs.type)
+            result_kind, result_shape, result_axes, element_type(lhs.type)
         )
         if is_masked(lhs.type) or is_masked(rhs.type):
             result_type = MaskedType(result_type)
@@ -891,6 +956,40 @@ class FrontendCompiler:
                 extents.append(extent)
         return _ShapeSpec(tuple(dimensions), tuple(extents))
 
+    def _block_shape_spec(self, node: ast.expr) -> _BlockShapeSpec:
+        elements = node.elts if isinstance(node, (ast.Tuple, ast.List)) else [node]
+        dimensions: list[int] = []
+        axis_ids: list[int] = []
+        coordinates: list[Value] = []
+        for element in elements:
+            coordinate = self._expect_value(self._compile_expr(element), element)
+            axis = self.block_axes.get(coordinate)
+            coordinate_type = bare_type(coordinate.type)
+            if (
+                axis is None
+                or not isinstance(coordinate_type, BlockType)
+                or len(coordinate_type.shape) != 1
+                or coordinate_type.axes != (axis[0],)
+                or coordinate_type.element_type != ScalarType(index)
+            ):
+                raise FrontendError(
+                    "block shape entries must be direct W.block values",
+                    self._location(element),
+                )
+            if axis[0] in axis_ids:
+                raise FrontendError(
+                    "one logical block axis cannot appear twice in a block shape",
+                    self._location(element),
+                )
+            dimensions.append(coordinate_type.shape[0])
+            axis_ids.append(axis[0])
+            coordinates.append(coordinate)
+        if not coordinates:
+            raise FrontendError("block shape must contain at least one W.block", self._location(node))
+        return _BlockShapeSpec(
+            tuple(dimensions), tuple(axis_ids), tuple(coordinates)
+        )
+
     def _intrinsic_select(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("predicate", "a", "b"), {})
         predicate = self._value_argument(args["predicate"], call)
@@ -900,10 +999,27 @@ class FrontendCompiler:
             raise FrontendError("W.select predicate must contain i1", self._location(call))
         if element_type(true_value.type) != element_type(false_value.type):
             raise FrontendError("W.select value types must match", self._location(call))
-        kind, shape = _join_shapes(true_value.type, false_value.type, self._location(call))
-        result_type: ValueType = shaped_type(kind, shape, element_type(true_value.type))
+        kind, shape, axes = _join_shapes(
+            true_value.type, false_value.type, self._location(call)
+        )
+        result_type: ValueType = shaped_type(
+            kind, shape, axes, element_type(true_value.type)
+        )
         if is_masked(true_value.type) or is_masked(false_value.type):
             result_type = MaskedType(result_type)
+        if shape_kind(predicate.type) != "scalar":
+            predicate_kind, predicate_shape, predicate_axes = _join_shapes(
+                predicate.type, result_type, self._location(call)
+            )
+            if (
+                predicate_kind != shape_kind(result_type)
+                or predicate_shape != shape_of(result_type)
+                or predicate_axes != axes_of(result_type)
+            ):
+                raise FrontendError(
+                    "W.select predicate must broadcast to the result domain",
+                    self._location(call),
+                )
         return self._emit(
             "weft_kernel.select",
             call,
@@ -934,6 +1050,9 @@ class FrontendCompiler:
             is_masked(other.type) or element_type(other.type) != pointer_type.element_type
         ):
             raise FrontendError("W.load other must match pointer element type", self._location(call))
+        self._require_footprint(where, pointer, "W.load where", call)
+        if not isinstance(other.type, NoneType):
+            self._require_footprint(other, pointer, "W.load other", call)
         alignment = args["alignment"]
         if isinstance(alignment, ast.expr):
             alignment = self._eval_static(alignment)
@@ -968,6 +1087,8 @@ class FrontendCompiler:
                 "W.store requires an explicit filled value, not validity-carrying data",
                 self._location(call),
             )
+        self._require_footprint(where, pointer, "W.store where", call)
+        self._require_footprint(value, pointer, "W.store value", call)
         alignment = args["alignment"]
         if isinstance(alignment, ast.expr):
             alignment = self._eval_static(alignment)
@@ -1109,23 +1230,43 @@ class FrontendCompiler:
         self.storage_contracts[pointer] = shape
         return None
 
-    def _intrinsic_block_axis(self, call: ast.Call) -> Value:
+    def _intrinsic_block(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("extent",), {"offset": 0})
         extent = self._value_argument(args["extent"], call)
         offset = self._value_argument(args["offset"], call)
-        if not _is_index(extent.type) or not _is_index(offset.type):
-            raise FrontendError("block axis extent/offset must be index", self._location(call))
+        if (
+            not _is_index(extent.type)
+            or not _is_scalar(extent.type)
+            or not _is_index(offset.type)
+            or not _is_scalar(offset.type)
+        ):
+            raise FrontendError(
+                "W.block extent/offset must be scalar index", self._location(call)
+            )
         dimension = -1
         extent_node = args["extent"]
-        if isinstance(extent_node, ast.Constant) and isinstance(extent_node.value, int):
+        if (
+            isinstance(extent_node, ast.Constant)
+            and isinstance(extent_node.value, int)
+            and not isinstance(extent_node.value, bool)
+        ):
+            if extent_node.value <= 0:
+                raise FrontendError(
+                    "W.block extent must be positive", self._location(extent_node)
+                )
             dimension = extent_node.value
-        result_type = BlockType((dimension,), ScalarType(index))
-        return self._emit(
-            "weft_kernel.block_axis",
+        axis_id = self.next_block_axis
+        self.next_block_axis += 1
+        result_type = BlockType((dimension,), (axis_id,), ScalarType(index))
+        result = self._emit(
+            "weft_kernel.block_index",
             call,
             operands=(extent, offset),
             result_types=(result_type,),
+            attributes={"axis": str(axis_id)},
         )[0]
+        self.block_axes[result] = (axis_id, extent)
+        return result
 
     def _intrinsic_full(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(
@@ -1133,7 +1274,7 @@ class FrontendCompiler:
         )
         if not isinstance(args["shape"], ast.expr):
             raise FrontendError("shape must be source syntax", self._location(call))
-        shape = self._shape_spec(args["shape"])
+        shape = self._block_shape_spec(args["shape"])
         value = self._value_argument(args["value"], call)
         dtype = args["dtype"]
         if isinstance(dtype, ast.expr):
@@ -1145,13 +1286,12 @@ class FrontendCompiler:
                 value = self._cast_value(value, dtype, call)
         if not isinstance(value.type, ScalarType):
             raise FrontendError("W.full fill value must be scalar", self._location(call))
-        result_type = BlockType(shape.dimensions, value.type)
+        result_type = BlockType(shape.dimensions, shape.axis_ids, value.type)
         return self._emit(
             "weft_kernel.full",
             call,
-            operands=(value,) + shape.extents,
+            operands=(value,) + shape.coordinates,
             result_types=(result_type,),
-            attributes={"shape": _dense_i64(shape.dimensions)},
         )[0]
 
     def _intrinsic_zeros(self, call: ast.Call) -> Value:
@@ -1174,10 +1314,19 @@ class FrontendCompiler:
 
     def _expand_dims(self, value: Value, axis: int, node: ast.AST) -> Value:
         shape = shape_of(value.type)
-        if shape is None or axis < 0 or axis > len(shape):
+        axes = axes_of(value.type)
+        if shape is None or axes is None or axis < 0 or axis > len(shape):
             raise FrontendError("expand_dims axis is outside logical rank", self._location(node))
+        if shape_kind(value.type) == "region" and axis == 0:
+            raise FrontendError(
+                "the active VLA axis must remain the first region axis",
+                self._location(node),
+            )
         result_shape = shape[:axis] + (1,) + shape[axis:]
-        result_type = shaped_type(shape_kind(value.type), result_shape, element_type(value.type))
+        result_axes = axes[:axis] + (0,) + axes[axis:]
+        result_type = shaped_type(
+            shape_kind(value.type), result_shape, result_axes, element_type(value.type)
+        )
         if is_masked(value.type):
             result_type = MaskedType(result_type)
         return self._emit(
@@ -1244,6 +1393,16 @@ class FrontendCompiler:
             math = self._eval_static(math)
         if isinstance(exceptional, ast.expr):
             exceptional = self._eval_static(exceptional)
+        if math not in {"strict", "native", "fast"}:
+            raise FrontendError(
+                "unary math must be strict, native, or fast",
+                self._location(call),
+            )
+        if exceptional != "preserve":
+            raise FrontendError(
+                "unary exceptional policy must be preserve",
+                self._location(call),
+            )
         return self._emit(
             "weft_kernel.unary",
             call,
@@ -1315,6 +1474,11 @@ class FrontendCompiler:
     def _emit_tuple(self, values: tuple[Value, ...], node: ast.AST) -> Value:
         if not values:
             raise FrontendError("W.tuple requires at least one field", self._location(node))
+        if any(not _is_scalar(value.type) or is_masked(value.type) for value in values):
+            raise FrontendError(
+                "W.tuple is a closed scalar state tuple; block state uses ordinary loop carry",
+                self._location(node),
+            )
         result_type = TupleType(tuple(value.type for value in values))
         return self._emit(
             "weft_kernel.tuple",
@@ -1374,18 +1538,25 @@ class FrontendCompiler:
         if identity.type != acc_type:
             raise FrontendError("identity type must equal acc_dtype", self._location(call))
         bare = bare_type(value.type)
-        shape = shape_of(bare)
         if isinstance(bare, RegionType) and axis is None:
             remaining_shape = bare.shape[1:]
+            remaining_axes = bare.axes[1:]
             result_type: ValueType = (
-                BlockType(remaining_shape, acc_type) if remaining_shape else acc_type
+                BlockType(remaining_shape, remaining_axes, acc_type)
+                if remaining_shape
+                else acc_type
             )
             axis_value = -1
         elif isinstance(bare, BlockType) and isinstance(axis, int) and not isinstance(axis, bool):
             if axis < 0 or axis >= len(bare.shape):
                 raise FrontendError("reduce axis is outside logical rank", self._location(call))
             result_shape = bare.shape[:axis] + bare.shape[axis + 1 :]
-            result_type = BlockType(result_shape, acc_type) if result_shape else acc_type
+            result_axes = bare.axes[:axis] + bare.axes[axis + 1 :]
+            result_type = (
+                BlockType(result_shape, result_axes, acc_type)
+                if result_shape
+                else acc_type
+            )
             axis_value = axis
         else:
             raise FrontendError(
@@ -1465,7 +1636,7 @@ class FrontendCompiler:
             )
         if shape_kind(coordinate.type) != shape_kind(value.type) or shape_of(
             coordinate.type
-        ) != shape_of(value.type):
+        ) != shape_of(value.type) or axes_of(coordinate.type) != axes_of(value.type):
             raise FrontendError(
                 "W.argmax coordinate must share the value logical domain",
                 self._location(call),
@@ -1521,39 +1692,6 @@ class FrontendCompiler:
             result_types=(result_type,),
             attributes={"math": _string(math), "order": _string(order)},
         )[0]
-
-    def _resolve_helper_argument(
-        self, argument: ast.expr | object, call: ast.Call, name: str
-    ) -> HelperDefinition:
-        value = self._eval_static(argument) if isinstance(argument, ast.expr) else argument
-        if not isinstance(value, HelperDefinition) or not value.pure:
-            raise FrontendError(f"{name} must be a @W.pure helper", self._location(call))
-        return value
-
-    def _compile_helper_region(
-        self,
-        definition: HelperDefinition,
-        argument_types: tuple[ValueType, ...],
-        call: ast.Call,
-    ) -> tuple[Region, ValueType]:
-        source = HelperSource.from_definition(definition)
-        parameters = source.function.args.args
-        if len(parameters) != len(argument_types):
-            raise FrontendError(
-                f"helper {definition.__name__} argument count mismatch",
-                self._location(call),
-            )
-        region = self.builder.region(
-            argument_types, tuple(parameter.arg for parameter in parameters)
-        )
-        result = self._compile_helper_body(
-            definition, source, region, region.arguments, call
-        )
-        previous_block = self.block
-        self.block = region
-        self._emit("weft_kernel.yield", call, operands=(result,))
-        self.block = previous_block
-        return region, result.type
 
     def _inline_helper(self, definition: HelperDefinition, call: ast.Call) -> Value:
         source = HelperSource.from_definition(definition)
@@ -1678,6 +1816,16 @@ class FrontendCompiler:
         for name in ("acc_dtype", "order", "math"):
             item = args[name]
             static[name] = self._eval_static(item) if isinstance(item, ast.expr) else item
+        if static["order"] not in {"ordered", "preserve", "relaxed"}:
+            raise FrontendError(
+                f"W.{kind} order must be ordered, preserve, or relaxed",
+                self._location(call),
+            )
+        if static["math"] not in {"strict", "native", "fast"}:
+            raise FrontendError(
+                f"W.{kind} math must be strict, native, or fast",
+                self._location(call),
+            )
         lhs_region = isinstance(lhs_bare, RegionType)
         rhs_region = isinstance(rhs_bare, RegionType)
         if kind == "dot":
@@ -1699,8 +1847,18 @@ class FrontendCompiler:
                     "W.dot supports [R,K] x [K], [VLA,K] x [K], or [R,K] x [VLA,K]",
                     self._location(call),
                 )
+            lhs_reduction_axis = lhs_bare.axes[-1]
+            rhs_reduction_axis = rhs_bare.axes[-1]
+            if lhs_reduction_axis != rhs_reduction_axis:
+                raise FrontendError(
+                    "W.dot operands must share one explicit reduction block",
+                    self._location(call),
+                )
             output_shape = ([-1] if lhs_region or rhs_region else []) + (
                 [] if lhs_region else [lhs_bare.shape[0]]
+            )
+            output_axes = ([-1] if lhs_region or rhs_region else []) + (
+                [] if lhs_region else [lhs_bare.axes[0]]
             )
         elif kind == "matmul":
             if element_type(lhs.type) != ScalarType(f16) or element_type(
@@ -1719,7 +1877,13 @@ class FrontendCompiler:
                     "W.matmul requires local [M,K] x [K,N] block operands",
                     self._location(call),
                 )
+            if lhs_bare.axes[1] != rhs_bare.axes[0]:
+                raise FrontendError(
+                    "W.matmul operands must share one explicit K block",
+                    self._location(call),
+                )
             output_shape = [lhs_bare.shape[0], rhs_bare.shape[1]]
+            output_axes = [lhs_bare.axes[0], rhs_bare.axes[1]]
         else:
             raise AssertionError(f"unknown structured product {kind}")
         has_region = lhs_region or rhs_region
@@ -1735,9 +1899,9 @@ class FrontendCompiler:
                 f"W.{kind} requires f32 accumulation", self._location(call)
             )
         result_type: ValueType = (
-            RegionType(tuple(output_shape), acc_type)
+            RegionType(tuple(output_shape), tuple(output_axes), acc_type)
             if has_region
-            else BlockType(tuple(output_shape), acc_type)
+            else BlockType(tuple(output_shape), tuple(output_axes), acc_type)
             if output_shape
             else acc_type
         )
@@ -2145,7 +2309,8 @@ class FrontendCompiler:
             )
         exported_names = sorted((assigned & live_after) - {item.optional_vars.id})
         body = self.builder.region(
-            (RegionType((-1,), ScalarType(index)),), (item.optional_vars.id,)
+            (RegionType((-1,), (-1,), ScalarType(index)),),
+            (item.optional_vars.id,),
         )
         previous = (self.block, self.env, self.active_vla, self.vla_outer_names)
         self.block = body

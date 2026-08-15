@@ -23,10 +23,10 @@ for token:
 ```
 
 Token-to-row relation、packed row stride、block size、scale/minimum decode和output位置都是
-source-visible。Logical `block_axis(32)` 可以描述一次局部nibble group：
+source-visible。Logical `block(32)` 可以描述一次局部nibble group：
 
 ```python
-member = W.block_axis(32)
+member = W.block(32)
 packed = W.load(
     packed_block + W.index(16) + group_pair * W.index(32) + member,
     other=W.u8(0),
@@ -148,15 +148,15 @@ for block in W.range(0, k_blocks):
         W.store(code_scratch + block * W.index(32) + lane, code)
 
 for column_begin in W.range(0, columns, W.index(16)):
-    acc = W.zeros((16,), dtype=W.f32)
+    column = W.block(16)
+    acc = W.zeros((column,), dtype=W.f32)
     for block in W.range(0, k_blocks):
-        k = W.block_axis(32)
+        k = W.block(32)
         activation_codes = W.load(
             code_scratch + block * W.index(32) + k,
             other=W.i8(0),
         )
-        column = W.block_axis(16)
-        packed_byte = W.block_axis(16)
+        packed_byte = W.block(16)
         packed_block = (column_begin // W.index(16)) * k_blocks + block
         packed_base = packed_weight + packed_block * W.index(304)
         weight_scale = load_f16_le(packed_base + column * W.index(2))
@@ -179,7 +179,7 @@ for column_begin in W.range(0, columns, W.index(16)):
             weight_zero_point=weight_zero_point,
             init=acc,
         )
-    W.store(output_row + column_begin + W.block_axis(16), acc)
+    W.store(output_row + column_begin + column, acc)
 ```
 
 `scale_scratch`与`code_scratch`是source-declared workspace pointer：caller分配，shape进入artifact

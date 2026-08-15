@@ -12,7 +12,8 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
                  order="relaxed", math="native")
 ```
 
-`W.dot`固定收缩双方最后一个logical block axis，当前合法shape为：
+`W.dot`固定收缩双方最后一个logical block axis；两侧必须引用同一个`W.block` identity，不能只
+具有相等extent。当前合法shape为：
 
 ```text
 [R,K]   x [K]     -> [R]
@@ -22,7 +23,7 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 
 当前public dot要求f32 multiplicand与f32 accumulator。
 
-`W.matmul`固定表达local block relation：
+`W.matmul`固定表达local block relation；lhs K与rhs K必须是同一个source axis：
 
 ```text
 [M,K] x [K,N] -> [M,N]
@@ -32,7 +33,7 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 
 VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
 scan或显式typed summary primitive。`init`与`acc_dtype`均为必填source semantics；init必须是scalar或与结果
-同shape的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
+同domain（shape与axis identity均相同）的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
 描述；masked multiplicand在乘加域中按语义零贡献，`init`与result本身必须是普通unmasked
 accumulator value。结果element type等于accumulator dtype。
 

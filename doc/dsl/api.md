@@ -69,12 +69,13 @@ W.select(predicate, true_value, false_value)
 ## Logical block
 
 ```python
-W.block_axis(extent, offset=0)
-W.full(shape, value, dtype=None)
-W.zeros(shape, dtype)
+axis = W.block(extent, offset=0)
+W.full((axis0, axis1, ...), value, dtype=None)
+W.zeros((axis0, axis1, ...), dtype)
 ```
 
-Python `value[:, None]` / `value[None, :]` 构造singleton logical axis。当前public surface没有
+每次`W.block`创建唯一source axis identity；constructor的shape entry必须是direct block value，
+不接受裸整数。Python `value[:, None]` / `value[None, :]` 构造identity为0的singleton logical axis。当前public surface没有
 任意broadcast、reshape或transpose op；坐标重排必须由作者写成显式pointer/index relation。
 
 ## State algebra
@@ -136,6 +137,8 @@ W.bitcast(value, dtype)
 
 普通 Python arithmetic、comparison 与 integer bitwise operator直接形成 canonical unary/
 binary/compare op。
+
+`W.tuple`只接受scalar field；block state直接作为普通SSA value通过`for/while/if` carry。
 
 ## 当前 extension source surface
 

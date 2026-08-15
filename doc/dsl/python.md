@@ -159,7 +159,8 @@ def load_f16_le(ptr):
 ```
 
 允许声明的 effect 是 `read` 与 `write`。Helper 必须以一个 value return
-结束；frontend 将普通 helper inline 到 caller，将 summary helper编译为 canonical region。
-Helper 不是第二份 IR，也不是运行时 Python call。
+结束，并且不接受Python参数/返回annotation；typed schema来自每个调用点。Frontend始终将helper
+inline到caller。Typed summary使用自己的显式canonical primitive，不存在第二条helper-region语义。
+Helper不是第二份IR，也不是运行时Python call。
 
 任意 Python reflection、动态对象、文件 I/O、异常、generator 和运行时 monkey-patching 不属于 kernel language。
