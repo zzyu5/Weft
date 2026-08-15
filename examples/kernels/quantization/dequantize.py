@@ -1091,3 +1091,154 @@ def dequantize_iq2_s(
                     W.f32(1.0) - W.f32(2.0) * W.cast(sign_bit, W.f32)
                 )
                 W.store(output_block + group * W.index(32) + member, value)
+
+
+@weft.kernel
+def dequantize_iq3_xxs(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(98)
+            output_block = output_row + block * W.index(256)
+            block_scale = W.load_f16_le(input_block)
+            for group in W.range(0, 8):
+                metadata = _load_u32_le(
+                    input_block + W.index(66) + group * W.index(4)
+                )
+                scale = block_scale * (
+                    W.f32(0.5) + W.cast(metadata >> W.u32(28), W.f32)
+                ) * W.f32(0.5)
+                member = W.block(32)
+                field = member // W.index(8)
+                subrow = (member % W.index(8)) // W.index(4)
+                lane = member % W.index(4)
+                code_offset = field * W.index(2) + subrow
+                grid_code = W.load(
+                    input_block
+                    + W.index(2)
+                    + group * W.index(8)
+                    + code_offset,
+                    other=W.u8(0),
+                )
+                sign0 = W.load(
+                    sign_table
+                    + W.cast(metadata & W.u32(127), W.index),
+                    other=W.u8(0),
+                )
+                sign1 = W.load(
+                    sign_table
+                    + W.cast((metadata >> W.u32(7)) & W.u32(127), W.index),
+                    other=W.u8(0),
+                )
+                sign2 = W.load(
+                    sign_table
+                    + W.cast((metadata >> W.u32(14)) & W.u32(127), W.index),
+                    other=W.u8(0),
+                )
+                sign3 = W.load(
+                    sign_table
+                    + W.cast((metadata >> W.u32(21)) & W.u32(127), W.index),
+                    other=W.u8(0),
+                )
+                sign0_block = (grid_code ^ grid_code) | sign0
+                sign1_block = (grid_code ^ grid_code) | sign1
+                sign2_block = (grid_code ^ grid_code) | sign2
+                sign3_block = (grid_code ^ grid_code) | sign3
+                signs = W.select(
+                    field == W.index(0),
+                    sign0_block,
+                    W.select(
+                        field == W.index(1),
+                        sign1_block,
+                        W.select(
+                            field == W.index(2), sign2_block, sign3_block
+                        ),
+                    ),
+                )
+                grid_offset = W.cast(grid_code, W.index) * W.index(4) + lane
+                grid = W.load(grid_table + grid_offset, other=W.u8(0))
+                sign_bit = (
+                    signs >> W.cast(member % W.index(8), W.u8)
+                ) & W.u8(1)
+                value = scale * W.cast(grid, W.f32) * (
+                    W.f32(1.0) - W.f32(2.0) * W.cast(sign_bit, W.f32)
+                )
+                W.store(output_block + group * W.index(32) + member, value)
+
+
+@weft.kernel
+def dequantize_iq3_s(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(110)
+            output_block = output_row + block * W.index(256)
+            block_scale = W.load_f16_le(input_block)
+            for group in W.range(0, 8):
+                scale_byte = W.load(
+                    input_block + W.index(106) + group // W.index(2),
+                    other=W.u8(0),
+                )
+                scale_shift = W.cast(
+                    (group % W.index(2)) * W.index(4), W.u8
+                )
+                local_scale = (scale_byte >> scale_shift) & W.u8(15)
+                scale = block_scale * (
+                    W.f32(1.0) + W.f32(2.0) * W.cast(local_scale, W.f32)
+                )
+                high_bits = W.load(
+                    input_block + W.index(66) + group, other=W.u8(0)
+                )
+                member = W.block(32)
+                field = member // W.index(8)
+                subrow = (member % W.index(8)) // W.index(4)
+                lane = member % W.index(4)
+                code_offset = field * W.index(2) + subrow
+                grid_code = W.load(
+                    input_block
+                    + W.index(2)
+                    + group * W.index(8)
+                    + code_offset,
+                    other=W.u8(0),
+                )
+                high_vector = (grid_code ^ grid_code) | high_bits
+                high_shift = W.cast(code_offset, W.u8)
+                high_index = W.cast(
+                    (high_vector >> high_shift) & W.u8(1), W.index
+                ) << W.index(8)
+                grid_index = W.cast(grid_code, W.index) | high_index
+                grid_offset = grid_index * W.index(4) + lane
+                grid = W.load(grid_table + grid_offset, other=W.u8(0))
+                signs = W.load(
+                    input_block
+                    + W.index(74)
+                    + group * W.index(4)
+                    + field,
+                    other=W.u8(0),
+                )
+                sign_bit = (
+                    signs >> W.cast(member % W.index(8), W.u8)
+                ) & W.u8(1)
+                value = scale * W.cast(grid, W.f32) * (
+                    W.f32(1.0) - W.f32(2.0) * W.cast(sign_bit, W.f32)
+                )
+                W.store(output_block + group * W.index(32) + member, value)
