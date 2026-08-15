@@ -226,3 +226,130 @@ def q4_K_q8_K(
             result,
         )
     return result
+
+
+@weft.kernel
+def tq2_0_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(66)
+        y = activation + block * W.index(292)
+        integer_sum = W.i32(0)
+        for half in W.range(0, 2):
+            member = W.block(32)
+            packed_codes = W.load(
+                x + half * W.index(32) + member, other=W.u8(0)
+            )
+            for field in W.range(0, 4):
+                shift = W.cast(field * W.index(2), W.u8)
+                code = W.cast(
+                    (packed_codes >> shift) & W.u8(3), W.i32
+                ) - W.i32(1)
+                activation_values = load_q8(
+                    y
+                    + W.index(4)
+                    + half * W.index(128)
+                    + field * W.index(32),
+                    member,
+                )
+                integer_sum = integer_sum + W.reduce(
+                    code * activation_values,
+                    identity=W.i32(0),
+                    axis=0,
+                    acc_dtype=W.i32,
+                    order="relaxed",
+                )
+        result = result + (
+            W.load_f16_le(x + W.index(64))
+            * load_f32_le(y)
+            * W.cast(integer_sum, W.f32)
+        )
+    return result
+
+
+@weft.kernel
+def tq1_0_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(54)
+        y = activation + block * W.index(292)
+        integer_sum = W.i32(0)
+
+        power = W.u8(1)
+        for digit in W.range(0, 5):
+            member = W.block(32)
+            encoded = W.load(x + member, other=W.u8(0)) * power
+            ternary = (
+                W.cast(encoded, W.u16) * W.u16(3)
+            ) >> W.u16(8)
+            code = W.cast(ternary, W.i32) - W.i32(1)
+            activation_values = load_q8(
+                y + W.index(4) + digit * W.index(32), member
+            )
+            integer_sum = integer_sum + W.reduce(
+                code * activation_values,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            power = power * W.u8(3)
+
+        power = W.u8(1)
+        for digit in W.range(0, 5):
+            member = W.block(16)
+            encoded = W.load(
+                x + W.index(32) + member, other=W.u8(0)
+            ) * power
+            ternary = (
+                W.cast(encoded, W.u16) * W.u16(3)
+            ) >> W.u16(8)
+            code = W.cast(ternary, W.i32) - W.i32(1)
+            activation_values = load_q8(
+                y + W.index(164) + digit * W.index(16), member
+            )
+            integer_sum = integer_sum + W.reduce(
+                code * activation_values,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            power = power * W.u8(3)
+
+        power = W.u8(1)
+        for digit in W.range(0, 4):
+            member = W.block(4)
+            encoded = W.load(
+                x + W.index(48) + member, other=W.u8(0)
+            ) * power
+            ternary = (
+                W.cast(encoded, W.u16) * W.u16(3)
+            ) >> W.u16(8)
+            code = W.cast(ternary, W.i32) - W.i32(1)
+            activation_values = load_q8(
+                y + W.index(244) + digit * W.index(4), member
+            )
+            integer_sum = integer_sum + W.reduce(
+                code * activation_values,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            power = power * W.u8(3)
+
+        result = result + (
+            W.load_f16_le(x + W.index(52))
+            * load_f32_le(y)
+            * W.cast(integer_sum, W.f32)
+        )
+    return result

@@ -10437,7 +10437,7 @@ private:
     llvm::DenseSet<mlir::Operation *> closure;
     llvm::SmallVector<BlockIndexOp> axes;
     if (mlir::failed(collectBlockClosure(op.getInput(), closure, axes,
-                                         op.getOperation(), false)))
+                                         op.getOperation(), true)))
       return mlir::failure();
     if (axes.size() != 1)
       return op.emitError(
@@ -10775,6 +10775,14 @@ private:
         coordinate.contiguousIndex =
             "(" + std::to_string(stripOffset) + " + " + offset + ")";
         blockValues[axis.getResult()] = std::move(coordinate);
+        for (const BlockOperationDecision &captured : decision.operations) {
+          mlir::Operation *candidate = captured.operation;
+          if (!candidate || candidate->getBlock() == op->getBlock() ||
+              mlir::isa<BlockIndexOp>(candidate))
+            continue;
+          if (mlir::failed(emitBlockOperation(candidate, blockValues, vl)))
+            return mlir::failure();
+        }
         for (mlir::Operation &candidate : *op->getBlock()) {
           auto reduction = reductionIndices.find(&candidate);
           if (reduction != reductionIndices.end()) {
@@ -10882,6 +10890,14 @@ private:
       coordinate.vectorShape = physical.laneShape;
     coordinate.contiguousIndex = "(" + strip + " + " + offset + ")";
     blockValues[axis.getResult()] = std::move(coordinate);
+    for (const BlockOperationDecision &captured : decision.operations) {
+      mlir::Operation *candidate = captured.operation;
+      if (!candidate || candidate->getBlock() == op->getBlock() ||
+          mlir::isa<BlockIndexOp>(candidate))
+        continue;
+      if (mlir::failed(emitBlockOperation(candidate, blockValues, vl)))
+        return mlir::failure();
+    }
     llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
     for (auto [index, reduction] : llvm::enumerate(reductions))
       reductionIndices[reduction.getOperation()] = index;

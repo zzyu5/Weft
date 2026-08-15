@@ -768,6 +768,23 @@ case "${kernel}" in
         ;;
     esac
     ;;
+  tq1_0_q8_K|tq2_0_q8_K)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/block_dot.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/ternary_dot_runtime.cpp
+    case "${kernel}" in
+      tq1_0_q8_K)
+        runtime_compile_flags="-DWEFT_TERNARY_DOT_KIND=0 -DWEFT_TERNARY_DOT_ENTRY=tq1_0_q8_K"
+        ;;
+      tq2_0_q8_K)
+        runtime_compile_flags="-DWEFT_TERNARY_DOT_KIND=1 -DWEFT_TERNARY_DOT_ENTRY=tq2_0_q8_K"
+        ;;
+    esac
+    ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
       echo "usage: ${usage_prefix} q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
