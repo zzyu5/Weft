@@ -75,12 +75,15 @@ def ssm_conv_f32_equivalent(
             value = W.load(
                 state_position + token
             ) * W.load(weight + channel * weight_channel_stride)
-            for tap in W.range(1, taps):
-                sample = W.load(
-                    state_position + token + tap
-                )
-                coefficient = W.load(
-                    weight + channel * weight_channel_stride + tap
-                )
-                value = value + sample * coefficient
+            tap = W.index(1)
+            if taps > tap:
+                while tap < taps:
+                    sample = W.load(state_position + token + tap)
+                    coefficient = W.load(
+                        weight + channel * weight_channel_stride + tap
+                    )
+                    value = value + sample * coefficient
+                    tap = tap + W.index(1)
+            else:
+                value = value + W.f32(0.0)
             W.store(output_position + token * output_token_stride, value)

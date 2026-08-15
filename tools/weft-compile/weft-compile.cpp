@@ -65,6 +65,11 @@ llvm::cl::opt<int64_t> f16PipelineStages(
     "f16-pipeline-stages",
     llvm::cl::desc("Requested F16 matmul load/compute stages; zero selects"),
     llvm::cl::init(0));
+llvm::cl::opt<int64_t> reductionStatePlacement(
+    "reduction-state-placement",
+    llvm::cl::desc(
+        "Requested VLA reduction state placement: 0 selects, 1 scalar, 2 vector"),
+    llvm::cl::init(0));
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
     llvm::cl::init(0));
@@ -149,6 +154,7 @@ int main(int argc, char **argv) {
     options.backend.f16RowMicrotile = f16RowMicrotile;
     options.backend.f16KUnroll = f16KUnroll;
     options.backend.f16PipelineStages = f16PipelineStages;
+    options.backend.reductionStatePlacement = reductionStatePlacement;
     options.backend.narrowLMUL = narrowLMUL;
     options.backend.sortRadixBits = sortRadixBits;
     std::error_code headerError;

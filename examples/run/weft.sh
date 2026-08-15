@@ -858,5 +858,5 @@ tar -C "${local_root}" -cf - . |
         ${remote_link_flags} \
         -o weft_runtime
     fi
-    exec taskset -c ${remote_cpu} ${runtime_command}
+    taskset -c ${remote_cpu} ${runtime_command}
   "

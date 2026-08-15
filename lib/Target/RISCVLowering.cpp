@@ -129,6 +129,35 @@ rvvShapeForSemanticLanes(unsigned sew, unsigned semanticLanes,
   return RVVVectorShape{sew, *legal};
 }
 
+std::optional<RVVVectorShape>
+rvvShapeForSameLanes(const RVVVectorShape &source, unsigned resultSEW,
+                     const RISCVTargetProfile &target) {
+  if (!source || resultSEW == 0)
+    return std::nullopt;
+  int64_t scaled = static_cast<int64_t>(source.lmulEighths) * resultSEW;
+  if (scaled % source.sew != 0)
+    return std::nullopt;
+  RVVVectorShape result{resultSEW,
+                        static_cast<int>(scaled / source.sew)};
+  return target.supportsVectorShape(result.sew, result.lmulEighths)
+             ? std::optional<RVVVectorShape>(result)
+             : std::nullopt;
+}
+
+std::optional<unsigned> rvvMaskRatio(const RVVVectorShape &dataShape) {
+  if (!dataShape || dataShape.lmulEighths <= 0)
+    return std::nullopt;
+  unsigned scaledSEW = dataShape.sew * 8;
+  if (scaledSEW % static_cast<unsigned>(dataShape.lmulEighths) != 0)
+    return std::nullopt;
+  unsigned ratio =
+      scaledSEW / static_cast<unsigned>(dataShape.lmulEighths);
+  constexpr unsigned legalRatios[] = {1, 2, 4, 8, 16, 32, 64};
+  return llvm::is_contained(legalRatios, ratio)
+             ? std::optional<unsigned>(ratio)
+             : std::nullopt;
+}
+
 struct BlockValue {
   mlir::Type type;
   BlockValueKind kind = BlockValueKind::Scalar;
@@ -172,6 +201,7 @@ enum class BlockValueRealization {
   Direct,
   DeferredPackedTransform,
   DeferredI32Widen,
+  WideningI8Product,
 };
 
 struct BlockOperationDecision {
@@ -180,6 +210,7 @@ struct BlockOperationDecision {
   mlir::Value source;
   std::string transform;
   std::optional<uint64_t> unsignedMaximum;
+  unsigned maskRatio = 0;
 };
 
 enum class BlockStoreRealization {
@@ -220,6 +251,14 @@ struct BlockStoreGroupDecision {
   llvm::SmallVector<BlockOperationDecision> operations;
 };
 
+struct BlockReductionValueDecision {
+  mlir::Operation *operation = nullptr;
+  RVVVectorShape inputShape;
+  RVVVectorShape combinedShape;
+  RVVVectorShape seedShape;
+  bool wideningCombine = false;
+};
+
 struct BlockReduceGroupDecision {
   mlir::Operation *operation = nullptr;
   mlir::Operation *axis = nullptr;
@@ -227,6 +266,7 @@ struct BlockReduceGroupDecision {
   llvm::SmallVector<mlir::Operation *> reductions;
   llvm::SmallVector<mlir::Operation *> closure;
   llvm::SmallVector<BlockOperationDecision> operations;
+  llvm::SmallVector<BlockReductionValueDecision> values;
 };
 
 enum class MaterializedBlockStoreRealization {
@@ -531,6 +571,11 @@ struct VLALookupDecision {
   LocalBlockMemoryFact table;
   mlir::Value indices;
   int64_t tableExtent = 16;
+  RVVVectorShape codeShape;
+  RVVVectorShape index16Shape;
+  RVVVectorShape index32Shape;
+  RVVVectorShape tableShape;
+  RVVVectorShape resultShape;
 };
 
 enum class VLABinaryRealization {
@@ -594,7 +639,6 @@ struct VLAUnaryDecision {
 enum class VLAStatePlacement {
   ScalarCarry,
   VectorCarry,
-  StackScratch,
 };
 
 struct VLAStateDecision {
@@ -726,7 +770,6 @@ struct LoopLocalScheduleDecision {
   unsigned unroll = 1;
   unsigned microtile = 1;
   unsigned pipelineStages = 1;
-  unsigned prefetchDistance = 0;
 };
 
 struct PhysicalEntityPlan {
@@ -1877,8 +1920,7 @@ private:
         planned.entity.hasValueShapeConflict ||
         resources.peakGroups > resources.architecturalGroups ||
         planned.entity.schedule.microtile == 0 ||
-        invalidPipeline ||
-        planned.entity.schedule.prefetchDistance > 1)
+        invalidPipeline)
       return owner->emitError("physical entity resource/schedule plan is invalid");
     return mlir::success();
   }
@@ -2319,8 +2361,11 @@ private:
         [&](mlir::Block &block) {
           for (mlir::Operation &nested : block.without_terminator()) {
             physicalOperations.push_back(&nested);
-            if (auto loop = mlir::dyn_cast<ForOp>(nested))
-              collectPhysicalOperations(loop.getBody().front());
+            if (!mlir::isa<ForOp, IfOp, WhileOp>(nested))
+              continue;
+            for (mlir::Region &region : nested.getRegions())
+              for (mlir::Block &nestedBlock : region)
+                collectPhysicalOperations(nestedBlock);
           }
         };
     collectPhysicalOperations(body);
@@ -2514,9 +2559,10 @@ private:
             "VLA memory access is neither affine-strided nor explicitly indexed");
       VLAActivityMode activityMode = VLAActivityMode::AllActive;
       if (!isTrue(predicate)) {
-        llvm::DenseSet<mlir::Value> visitedPredicates;
-        std::function<bool(mlir::Value)> hasPredicateDecision =
-            [&](mlir::Value value) {
+        std::function<bool(mlir::Value, llvm::DenseSet<mlir::Value>)>
+            hasPredicateDecision =
+                [&](mlir::Value value,
+                    llvm::DenseSet<mlir::Value> visitedPredicates) {
               if (!value || !visitedPredicates.insert(value).second)
                 return false;
               if (llvm::any_of(
@@ -2525,14 +2571,77 @@ private:
                         return candidate.operation == value.getDefiningOp();
                       }))
                 return true;
-              auto binary = value.getDefiningOp<BinaryOp>();
-              return binary &&
-                     (binary.getKind() == "and" || binary.getKind() == "or" ||
-                      binary.getKind() == "xor") &&
-                     hasPredicateDecision(binary.getLhs()) &&
-                     hasPredicateDecision(binary.getRhs());
+              if (auto binary = value.getDefiningOp<BinaryOp>())
+                return (binary.getKind() == "and" ||
+                        binary.getKind() == "or" ||
+                        binary.getKind() == "xor") &&
+                       hasPredicateDecision(binary.getLhs(), visitedPredicates) &&
+                       hasPredicateDecision(binary.getRhs(), visitedPredicates);
+              if (auto conditional = value.getDefiningOp<IfOp>()) {
+                auto result = mlir::dyn_cast<mlir::OpResult>(value);
+                if (!result)
+                  return false;
+                unsigned number = result.getResultNumber();
+                auto thenYield = mlir::cast<YieldOp>(
+                    conditional.getThenRegion().front().getTerminator());
+                auto elseYield = mlir::cast<YieldOp>(
+                    conditional.getElseRegion().front().getTerminator());
+                return number < thenYield.getNumOperands() &&
+                       number < elseYield.getNumOperands() &&
+                       hasPredicateDecision(thenYield.getOperand(number),
+                                            visitedPredicates) &&
+                       hasPredicateDecision(elseYield.getOperand(number),
+                                            visitedPredicates);
+              }
+              if (auto loop = value.getDefiningOp<ForOp>()) {
+                auto result = mlir::dyn_cast<mlir::OpResult>(value);
+                auto yield =
+                    mlir::cast<YieldOp>(loop.getBody().front().getTerminator());
+                unsigned number = result ? result.getResultNumber() : 0;
+                return result && number < loop.getInitArgs().size() &&
+                       number < yield.getNumOperands() &&
+                       hasPredicateDecision(loop.getInitArgs()[number],
+                                            visitedPredicates) &&
+                       hasPredicateDecision(yield.getOperand(number),
+                                            visitedPredicates);
+              }
+              if (auto loop = value.getDefiningOp<WhileOp>()) {
+                auto result = mlir::dyn_cast<mlir::OpResult>(value);
+                auto condition = mlir::cast<ConditionOp>(
+                    loop.getConditionRegion().front().getTerminator());
+                auto yield = mlir::cast<YieldOp>(
+                    loop.getBodyRegion().front().getTerminator());
+                unsigned number = result ? result.getResultNumber() : 0;
+                return result && number < loop.getInitArgs().size() &&
+                       number < condition.getValues().size() &&
+                       number < yield.getNumOperands() &&
+                       hasPredicateDecision(loop.getInitArgs()[number],
+                                            visitedPredicates) &&
+                       hasPredicateDecision(condition.getValues()[number],
+                                            visitedPredicates) &&
+                       hasPredicateDecision(yield.getOperand(number),
+                                            visitedPredicates);
+              }
+              if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+                mlir::Operation *parent = argument.getOwner()->getParentOp();
+                if (auto loop = mlir::dyn_cast_or_null<ForOp>(parent)) {
+                  if (argument.getArgNumber() == 0)
+                    return false;
+                  unsigned number = argument.getArgNumber() - 1;
+                  return number < loop.getInitArgs().size() &&
+                         hasPredicateDecision(loop.getInitArgs()[number],
+                                              visitedPredicates);
+                }
+                if (auto loop = mlir::dyn_cast_or_null<WhileOp>(parent)) {
+                  unsigned number = argument.getArgNumber();
+                  return number < loop.getInitArgs().size() &&
+                         hasPredicateDecision(loop.getInitArgs()[number],
+                                              visitedPredicates);
+                }
+              }
+              return false;
             };
-        if (hasPredicateDecision(predicate)) {
+        if (hasPredicateDecision(predicate, {})) {
           activityMode = VLAActivityMode::PredicateMask;
         } else if (classifyLaneRelation(predicate, decision.coordinate) ==
                        LaneRelation::Independent &&
@@ -2747,6 +2856,26 @@ private:
       lookupDecision.operation = lookup.getOperation();
       lookupDecision.table = *table;
       lookupDecision.indices = lookup.getIndices();
+      lookupDecision.codeShape =
+          rvvShapeForSemanticLanes(8, lookupDecision.tableExtent,
+                                   options.target)
+              .value_or(RVVVectorShape{});
+      lookupDecision.index16Shape =
+          rvvShapeForSemanticLanes(16, lookupDecision.tableExtent,
+                                   options.target)
+              .value_or(RVVVectorShape{});
+      lookupDecision.index32Shape =
+          rvvShapeForSemanticLanes(32, lookupDecision.tableExtent,
+                                   options.target)
+              .value_or(RVVVectorShape{});
+      lookupDecision.tableShape = lookupDecision.index32Shape;
+      lookupDecision.resultShape = lookupDecision.index32Shape;
+      if (!lookupDecision.codeShape || !lookupDecision.index16Shape ||
+          !lookupDecision.index32Shape) {
+        lookup.emitError(
+            "RVV VLA lookup has no legal target shapes for 16 semantic lanes");
+        return mlir::failure();
+      }
       decision.lookups.push_back(std::move(lookupDecision));
       if (mlir::failed(markRematerializedBlockTrees(
               {lookup.getTable()}, lookup.getOperation())))
@@ -2830,18 +2959,29 @@ private:
           state.validity = VLAStateValidityRealization::ReductionIdentity;
         if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
-          state.placement = reduce.getOrder() == "relaxed"
-                                ? VLAStatePlacement::VectorCarry
-                                : VLAStatePlacement::ScalarCarry;
         } else if (reduce.getKind() == "max") {
           state.realization = VLAStateRealization::RVVMaxReduction;
-          state.placement = reduce.getOrder() == "relaxed"
-                                ? VLAStatePlacement::VectorCarry
-                                : VLAStatePlacement::ScalarCarry;
         } else {
           reduce.emitError("VLA reduction kind has no physical realization");
           return mlir::failure();
         }
+        if (options.backend.reductionStatePlacement < 0 ||
+            options.backend.reductionStatePlacement > 2) {
+          reduce.emitError(
+              "VLA reduction state placement config must be 0, 1, or 2");
+          return mlir::failure();
+        }
+        bool vectorPlacement =
+            options.backend.reductionStatePlacement == 2 ||
+            (options.backend.reductionStatePlacement == 0 &&
+             reduce.getOrder() == "relaxed");
+        if (vectorPlacement && reduce.getOrder() != "relaxed") {
+          reduce.emitError(
+              "ordered VLA reduction cannot use vector state placement");
+          return mlir::failure();
+        }
+        state.placement = vectorPlacement ? VLAStatePlacement::VectorCarry
+                                          : VLAStatePlacement::ScalarCarry;
         decision.states.push_back(std::move(state));
       } else if (auto scan = mlir::dyn_cast<ScanOp>(nested)) {
         bool unsegmented =
@@ -2907,6 +3047,19 @@ private:
             state.validity = VLAStateValidityRealization::OnlineSoftmax;
           decision.states.push_back(std::move(state));
       }
+    }
+    if (options.backend.reductionStatePlacement == 0 &&
+        options.target.vlenBits >= 256) {
+      unsigned reductionStates = llvm::count_if(
+          decision.states, [](const VLAStateDecision &state) {
+            return state.realization == VLAStateRealization::RVVAddReduction ||
+                   state.realization == VLAStateRealization::RVVMaxReduction;
+          });
+      if (reductionStates == 1)
+        for (VLAStateDecision &state : decision.states)
+          if (state.realization == VLAStateRealization::RVVAddReduction ||
+              state.realization == VLAStateRealization::RVVMaxReduction)
+            state.placement = VLAStatePlacement::ScalarCarry;
     }
     bool hasF32RegionValue = llvm::any_of(
         physicalOperations, [](mlir::Operation *operation) {
@@ -3041,6 +3194,10 @@ private:
                   .value_or(0),
               "narrow")))
         return mlir::failure();
+    for (const VLALookupDecision &lookup : decision.lookups)
+      if (mlir::failed(requireLMUL(
+              rvvIntegerLMUL(lookup.resultShape).value_or(0), "lookup")))
+        return mlir::failure();
     if ((candidateFacts.requiresF32M2Math || candidateFacts.hasOnlineSummary) &&
         mlir::failed(requireLMUL(2, "f32m2 math")))
       return mlir::failure();
@@ -3139,8 +3296,6 @@ private:
           !options.target.supportsSegmentVectorMemory(
               2, 32, static_cast<int>(candidate * 8)))
         continue;
-      if (candidateFacts.hasF32TableLookup && candidate != 4)
-        continue;
       unsigned stateGroups = 0;
       for (const VLAStateDecision &state : decision.states) {
         if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
@@ -3148,9 +3303,14 @@ private:
         else if (state.realization ==
                  VLAStateRealization::RVVSegmentedInclusiveAddScan)
           stateGroups = std::max(stateGroups, 4 * candidate + 2);
-        else if (state.realization == VLAStateRealization::RVVArgMaxSummary ||
-                 state.realization == VLAStateRealization::RVVAddReduction ||
+        else if (state.realization == VLAStateRealization::RVVAddReduction ||
                  state.realization == VLAStateRealization::RVVMaxReduction)
+          stateGroups = std::max(
+              stateGroups,
+              state.placement == VLAStatePlacement::VectorCarry
+                  ? std::max(2 * candidate, candidate + 2)
+                  : candidate + 2);
+        else if (state.realization == VLAStateRealization::RVVArgMaxSummary)
           stateGroups = std::max(stateGroups, candidate + 2);
         else if (state.realization ==
                  VLAStateRealization::RVVOnlineSoftmaxSummary)
@@ -3200,7 +3360,18 @@ private:
           2 * candidate *
           std::max(candidateFacts.segmentLoadPairs,
                    candidateFacts.segmentStorePairs);
-      unsigned lookupGroups = candidateFacts.hasF32TableLookup ? 12 : 0;
+      unsigned lookupGroups = 0;
+      for (const VLALookupDecision &lookup : decision.lookups) {
+        unsigned conversionGroups =
+            rvvRegisterGroups(lookup.codeShape) +
+            rvvRegisterGroups(lookup.index16Shape) +
+            rvvRegisterGroups(lookup.index32Shape);
+        unsigned gatherGroups = rvvRegisterGroups(lookup.tableShape) +
+                                rvvRegisterGroups(lookup.index32Shape) +
+                                rvvRegisterGroups(lookup.resultShape);
+        lookupGroups =
+            std::max(lookupGroups, std::max(conversionGroups, gatherGroups));
+      }
       unsigned sharedGroups = valueGroups + memoryGroups;
       unsigned requiredGroups =
           std::max(sharedGroups,
@@ -3248,7 +3419,6 @@ private:
     entity.schedule.stripSchedule = selected->stripSchedule;
     entity.schedule.unroll = 1;
     entity.schedule.pipelineStages = 1;
-    entity.schedule.prefetchDistance = 0;
 
     auto regionShape = [&](mlir::Type type) -> RVVVectorShape {
       if (!isRegionValue(type))
@@ -3279,6 +3449,12 @@ private:
         for (mlir::BlockArgument argument :
              loop.getBody().front().getArguments().drop_front())
           recordPhysicalValue(entity, argument, regionShape(argument.getType()));
+      if (auto loop = mlir::dyn_cast<WhileOp>(operation))
+        for (mlir::Region *region :
+             {&loop.getConditionRegion(), &loop.getBodyRegion()})
+          for (mlir::BlockArgument argument : region->front().getArguments())
+            recordPhysicalValue(entity, argument,
+                                regionShape(argument.getType()));
     }
 
     for (mlir::Operation *operation : physicalOperations) {
@@ -3530,18 +3706,17 @@ private:
 
     for (VLALookupDecision &lookup : decision.lookups) {
       auto operation = mlir::cast<LookupOp>(lookup.operation);
-      RVVVectorShape codeShape = rvvShape(8, 1);
-      RVVVectorShape index32Shape = rvvShape(32, 4);
-      RVVVectorShape tableShape = rvvShape(32, 4);
-      RVVVectorShape resultShape = rvvShape(32, 4);
-      recordPhysicalValue(entity, operation.getIndices(), codeShape);
-      recordPhysicalValue(entity, operation.getTable(), tableShape);
-      recordPhysicalValue(entity, operation.getResult(), resultShape);
-      recordPhysicalTemporary(entity, lookup.operation, index32Shape);
+      recordPhysicalValue(entity, operation.getIndices(), lookup.codeShape);
+      recordPhysicalValue(entity, operation.getTable(), lookup.tableShape);
+      recordPhysicalValue(entity, operation.getResult(), lookup.resultShape);
+      recordPhysicalTemporary(entity, lookup.operation, lookup.index16Shape);
+      recordPhysicalTemporary(entity, lookup.operation, lookup.index32Shape);
       recordPhysicalHandoff(entity, lookup.operation, operation.getIndices(),
-                            PhysicalHandoff::Convert, codeShape, index32Shape);
+                            PhysicalHandoff::Convert, lookup.codeShape,
+                            lookup.index32Shape);
       recordPhysicalHandoff(entity, lookup.operation, operation.getTable(),
-                            PhysicalHandoff::Reload, tableShape, tableShape);
+                            PhysicalHandoff::Reload, lookup.tableShape,
+                            lookup.tableShape);
     }
 
     for (VLAPredicateDecision &predicate : decision.predicates) {
@@ -4036,6 +4211,36 @@ private:
         results.push_back(std::move(value));
         continue;
       }
+      if (inVLA && isRegionValue(result.getType()) &&
+          elementType(result.getType()).isF32()) {
+        std::optional<unsigned> lmul = physicalValueLMUL(result);
+        if (!lmul)
+          return op.emitError(
+              "RISC-V conditional VLA result has no physical value shape");
+        CValue value{result.getType(), CValueKind::F32Vector,
+                     result.use_empty() ? std::string{} : fresh("if_vector")};
+        value.vectorSEW = 32;
+        value.vectorLMUL = *lmul;
+        if (!value.spelling.empty())
+          line("vfloat32m" + std::to_string(*lmul) + "_t " + value.spelling +
+               ";");
+        results.push_back(std::move(value));
+        continue;
+      }
+      if (inVLA && isRegionValue(result.getType()) &&
+          elementType(result.getType()).isInteger(1)) {
+        if (!activePhysicalEntity || activePhysicalEntity->vlaMaskRatio == 0)
+          return op.emitError(
+              "RISC-V conditional VLA mask has no physical shape");
+        CValue value{result.getType(), CValueKind::Mask,
+                     result.use_empty() ? std::string{} : fresh("if_mask")};
+        if (!value.spelling.empty())
+          line("vbool" +
+               std::to_string(activePhysicalEntity->vlaMaskRatio) + "_t " +
+               value.spelling + ";");
+        results.push_back(std::move(value));
+        continue;
+      }
       auto selected = controlBlockElements.find(result);
       if (selected == controlBlockElements.end())
         return op.emitError(
@@ -4064,6 +4269,24 @@ private:
             yield.emitError(
                 "RISC-V conditional yielded an unavailable scalar value");
             return mlir::failure();
+          }
+          line(destination.spelling + " = " + value.spelling + ";");
+          continue;
+        }
+        if (destination.kind == CValueKind::F32Vector ||
+            destination.kind == CValueKind::Mask) {
+          if (value.kind != destination.kind || value.spelling.empty()) {
+            yield.emitError(
+                "RISC-V conditional yielded an unavailable VLA value");
+            return mlir::failure();
+          }
+          if (destination.kind == CValueKind::F32Vector) {
+            std::optional<unsigned> lmul = physicalValueLMUL(yielded);
+            if (!lmul || *lmul != destination.vectorLMUL) {
+              yield.emitError(
+                  "RISC-V conditional yielded an incompatible VLA vector");
+              return mlir::failure();
+            }
           }
           line(destination.spelling + " = " + value.spelling + ";");
           continue;
@@ -4120,6 +4343,8 @@ private:
         if (!lmul)
           return op.emitError("ordered VLA carry has no physical value shape");
         value = CValue{result.getType(), CValueKind::F32Vector, fresh("carry")};
+        value.vectorSEW = 32;
+        value.vectorLMUL = *lmul;
         line("vfloat32m" + std::to_string(*lmul) +
              "_t " + value.spelling + " = " + init.spelling + ";");
       } else if (inVLA && init.kind == CValueKind::Mask) {
@@ -4283,6 +4508,27 @@ private:
                        fresh("while_carry")};
         line(scalarCType(elementType(result.getType())) + " " + value.spelling +
              " = " + init.spelling + ";");
+      } else if (inVLA && init.kind == CValueKind::F32Vector &&
+                 isRegionValue(result.getType())) {
+        std::optional<unsigned> lmul = physicalValueLMUL(initial);
+        if (!lmul)
+          return op.emitError(
+              "ordered VLA while carry has no physical value shape");
+        value = CValue{result.getType(), CValueKind::F32Vector,
+                       fresh("while_vector_carry")};
+        value.vectorSEW = 32;
+        value.vectorLMUL = *lmul;
+        line("vfloat32m" + std::to_string(*lmul) + "_t " + value.spelling +
+             " = " + init.spelling + ";");
+      } else if (inVLA && init.kind == CValueKind::Mask &&
+                 isRegionValue(result.getType())) {
+        if (!activePhysicalEntity || activePhysicalEntity->vlaMaskRatio == 0)
+          return op.emitError(
+              "ordered VLA while mask carry has no physical shape");
+        value = CValue{result.getType(), CValueKind::Mask,
+                       fresh("while_mask_carry")};
+        line("vbool" + std::to_string(activePhysicalEntity->vlaMaskRatio) +
+             "_t " + value.spelling + " = " + init.spelling + ";");
       } else if (init.kind == CValueKind::F32BlockStorage) {
         auto selected = controlBlockElements.find(result);
         if (selected == controlBlockElements.end())
@@ -4317,6 +4563,19 @@ private:
         if (emitted.kind == CValueKind::Scalar) {
           line(scalarCType(elementType(emitted.type)) + " " + next.spelling +
                " = " + emitted.spelling + ";");
+        } else if (inVLA && emitted.kind == CValueKind::F32Vector) {
+          std::optional<unsigned> lmul = physicalValueLMUL(value);
+          if (!lmul || expected.vectorLMUL != *lmul)
+            return mlir::failure();
+          next.vectorSEW = 32;
+          next.vectorLMUL = *lmul;
+          line("vfloat32m" + std::to_string(*lmul) + "_t " + next.spelling +
+               " = " + emitted.spelling + ";");
+        } else if (inVLA && emitted.kind == CValueKind::Mask) {
+          if (!activePhysicalEntity || activePhysicalEntity->vlaMaskRatio == 0)
+            return mlir::failure();
+          line("vbool" + std::to_string(activePhysicalEntity->vlaMaskRatio) +
+               "_t " + next.spelling + " = " + emitted.spelling + ";");
         } else if (emitted.kind == CValueKind::F32BlockStorage) {
           std::optional<int64_t> elements =
               physicalBlockElementCount(emitted.type);
@@ -4339,7 +4598,9 @@ private:
                             llvm::ArrayRef<CValue> source,
                             mlir::Operation *owner) {
       for (auto [target, value] : llvm::zip(destination, source)) {
-        if (target.kind == CValueKind::Scalar) {
+        if (target.kind == CValueKind::Scalar ||
+            target.kind == CValueKind::F32Vector ||
+            target.kind == CValueKind::Mask) {
           line(target.spelling + " = " + value.spelling + ";");
           continue;
         }
@@ -6641,42 +6902,64 @@ private:
         findVLAHandoff(op.getOperation(), op.getIndices());
     const PhysicalHandoffDecision *tableHandoff =
         findVLAHandoff(op.getOperation(), op.getTable());
-    const PhysicalTemporaryDecision *indexTemporary =
-        findVLATemporaryDecision(op.getOperation());
     const PhysicalValueDecision *codeValue =
         findVLAValueDecision(op.getIndices());
     const PhysicalValueDecision *tableValue =
         findVLAValueDecision(op.getTable());
     const PhysicalValueDecision *resultValue =
         findVLAValueDecision(op.getResult());
+    auto hasTemporary = [&](RVVVectorShape shape) {
+      return activePhysicalEntity &&
+             llvm::any_of(activePhysicalEntity->temporaries,
+                          [&](const PhysicalTemporaryDecision &temporary) {
+                            return temporary.owner == op.getOperation() &&
+                                   temporary.shape == shape;
+                          });
+    };
     if (!indexHandoff || indexHandoff->kind != PhysicalHandoff::Convert ||
-        !codeValue || codeValue->shape != kRVVE8M1 ||
+        !codeValue || codeValue->shape != decision->codeShape ||
         indexHandoff->sourceShape != codeValue->shape ||
-        indexHandoff->resultShape != kRVVE32M4 ||
+        indexHandoff->resultShape != decision->index32Shape ||
         !tableHandoff || tableHandoff->kind != PhysicalHandoff::Reload ||
-        !tableValue || tableValue->shape != kRVVE32M4 ||
+        !tableValue || tableValue->shape != decision->tableShape ||
         tableHandoff->sourceShape != tableValue->shape ||
         tableHandoff->resultShape != tableValue->shape ||
-        !resultValue || resultValue->shape != kRVVE32M4 ||
-        !indexTemporary || indexTemporary->shape != kRVVE32M4)
+        !resultValue || resultValue->shape != decision->resultShape ||
+        !hasTemporary(decision->index16Shape) ||
+        !hasTemporary(decision->index32Shape))
       return op.emitError("VLA lookup handoff plan is incomplete");
+    std::string index16Suffix = rvvShapeSuffix(decision->index16Shape);
+    std::string index32Suffix = rvvShapeSuffix(decision->index32Shape);
+    std::string tableSuffix = rvvShapeSuffix(decision->tableShape);
+    std::string resultSuffix = rvvShapeSuffix(decision->resultShape);
+    if (decision->index16Shape.sew != 16 ||
+        decision->index32Shape.sew != 32 || decision->tableShape.sew != 32 ||
+        decision->resultShape.sew != 32 || index16Suffix.empty() ||
+        index32Suffix.empty() || tableSuffix.empty() || resultSuffix.empty())
+      return op.emitError("VLA lookup shapes have no RVV spelling");
     std::string tableVL = fresh("lookup_table_vl");
     std::string table = fresh("lookup_table");
     std::string indices16 = fresh("lookup_u16");
     std::string indices32 = fresh("lookup_u32");
     std::string gathered = fresh("lookup");
-    line("const size_t " + tableVL + " = __riscv_vsetvl_e32m4(16);");
-    line("vfloat32m4_t " + table + " = __riscv_vle32_v_f32m4(" +
-         tableBase.spelling + ", " + tableVL + ");");
-    line("vuint16m2_t " + indices16 + " = __riscv_vzext_vf2_u16m2(" +
-         indices.spelling + ", " + activeVL + ");");
-    line("vuint32m4_t " + indices32 + " = __riscv_vzext_vf2_u32m4(" +
-         indices16 + ", " + activeVL + ");");
-    line("vfloat32m4_t " + gathered +
-         " = __riscv_vrgather_vv_f32m4(" + table + ", " + indices32 +
+    line("const size_t " + tableVL + " = __riscv_vsetvl_e" + tableSuffix +
+         "(" + std::to_string(decision->tableExtent) + ");");
+    line("vfloat" + tableSuffix + "_t " + table +
+         " = __riscv_vle32_v_f" + tableSuffix + "(" + tableBase.spelling +
+         ", " + tableVL + ");");
+    line("vuint" + index16Suffix + "_t " + indices16 +
+         " = __riscv_vzext_vf2_u" + index16Suffix + "(" + indices.spelling +
          ", " + activeVL + ");");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::F32Vector, gathered};
+    line("vuint" + index32Suffix + "_t " + indices32 +
+         " = __riscv_vzext_vf2_u" + index32Suffix + "(" + indices16 + ", " +
+         activeVL + ");");
+    line("vfloat" + resultSuffix + "_t " + gathered +
+         " = __riscv_vrgather_vv_f" + resultSuffix + "(" + table + ", " +
+         indices32 + ", " + activeVL + ");");
+    CValue result{op.getResult().getType(), CValueKind::F32Vector, gathered};
+    result.vectorSEW = decision->resultShape.sew;
+    result.vectorLMUL = rvvIntegerLMUL(decision->resultShape).value_or(0);
+    values[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -7019,6 +7302,14 @@ private:
                                            : mlir::cast<mlir::BlockArgument>(
                                                  fact.value)
                                                  .getOwner();
+        if (definitionBlock != &block) {
+          mlir::Operation *nestedDefinition =
+              definition ? definition : definitionBlock->getParentOp();
+          while (nestedDefinition && nestedDefinition->getBlock() != &block)
+            nestedDefinition = nestedDefinition->getParentOp();
+          if (nestedDefinition)
+            continue;
+        }
         unsigned begin = 0;
         bool participates = false;
         if (definitionBlock == &block) {
@@ -7824,7 +8115,6 @@ private:
     entity.resources.architecturalGroups = options.target.vectorRegisters;
     entity.resources.pipelineGroups = 0;
     entity.schedule.pipelineStages = 1;
-    entity.schedule.prefetchDistance = 0;
   }
 
   template <typename Decision>
@@ -7847,7 +8137,7 @@ private:
                                        I4I8FragmentRealization::SpacemiTIME1N16K32
                                    ? kRVVE8MF4
                                    : rvvShape(8, 2);
-    RVVVectorShape accumulatorShape{32, 4};
+    RVVVectorShape accumulatorShape = rvvShape(32, 4);
     recordPhysicalValue(planned.entity, planned.realization.activation,
                         codeShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(),
@@ -7864,7 +8154,7 @@ private:
         planned.realization.realization ==
                 I4I8FragmentRealization::SpacemiTIME1N16K32
             ? 28
-            : 10;
+            : 12;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
     planned.entity.schedule.unroll = 2;
@@ -7878,7 +8168,7 @@ private:
                                        I4I8FragmentRealization::SpacemiTIME1N16K32
                                    ? kRVVE8MF4
                                    : rvvShape(8, 2);
-    RVVVectorShape accumulatorShape{32, 4};
+    RVVVectorShape accumulatorShape = rvvShape(32, 4);
     recordPhysicalValue(planned.entity, planned.realization.activation,
                         codeShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(),
@@ -7895,7 +8185,7 @@ private:
         planned.realization.realization ==
                 I4I8FragmentRealization::SpacemiTIME1N16K32
             ? 28
-            : 10;
+            : 13;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
     planned.entity.schedule.unroll = 2;
@@ -8004,12 +8294,23 @@ private:
     planned.entity.resources.peakGroups = 4;
   }
 
+  bool supportsRVVI4I8N16K32() const {
+    return options.target.hasF && options.target.hasVectorF16 &&
+           options.target.hasWideningInteger &&
+           options.target.hasWideningFloat &&
+           options.target.supportsVLENAtLeast(128) &&
+           options.target.supportsVectorShape(8, 8) &&
+           options.target.supportsVectorShape(16, 16) &&
+           options.target.supportsVectorShape(32, 32);
+  }
+
   mlir::LogicalResult decideSymmetricI4I8Dot(
       SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
     bool useIME1 = options.target.supportsSpacemitIME1I4I8N16K32();
-    if (!useIME1 && !options.target.supportsVLENAtLeast(128))
+    if (!useIME1 && !supportsRVVI4I8N16K32())
       return op.emitError(
-          "symmetric i4/i8 RVV dot requires VLEN of at least 128 bits");
+          "symmetric i4/i8 RVV dot requires legal e8m1/e16m2/e32m4 "
+          "integer-widening and f16-to-f32 vector shapes");
     if (!options.target.littleEndian)
       return op.emitError(
           "symmetric i4/i8 dot requires little-endian packed fields");
@@ -8710,9 +9011,10 @@ private:
   mlir::LogicalResult decideAffineI4I8Dot(
       AffineI4I8DotOp op, AffineI4I8Decision &decision) {
     bool useIME1 = options.target.supportsSpacemitIME1I4I8N16K32();
-    if (!useIME1 && !options.target.supportsVLENAtLeast(128))
+    if (!useIME1 && !supportsRVVI4I8N16K32())
       return op.emitError(
-          "affine i4/i8 RVV dot requires VLEN of at least 128 bits");
+          "affine i4/i8 RVV dot requires legal e8m1/e16m2/e32m4 "
+          "integer-widening and f16-to-f32 vector shapes");
     if (!options.target.littleEndian)
       return op.emitError(
           "affine i4/i8 dot requires little-endian packed fields");
@@ -9332,7 +9634,11 @@ private:
 
   BlockOperationDecision decideBlockOperation(mlir::Operation *operation,
                                               RVVVectorShape byteShape,
-                                              PhysicalEntityPlan &entity) const {
+                                              PhysicalEntityPlan &entity,
+                                              const llvm::DenseMap<
+                                                  mlir::Operation *,
+                                                  BlockOperationDecision>
+                                                  &prior) const {
     BlockOperationDecision decision;
     decision.operation = operation;
     auto setResultShape = [&](RVVVectorShape shape) {
@@ -9341,6 +9647,21 @@ private:
       for (mlir::Value result : operation->getResults())
         recordPhysicalValue(entity, result, shape);
     };
+    auto sameLanes = [&](unsigned sew) {
+      return rvvShapeForSameLanes(byteShape, sew, options.target)
+          .value_or(RVVVectorShape{});
+    };
+    auto valueShape = [&](mlir::Value value) {
+      auto found = llvm::find_if(
+          entity.values, [&](const PhysicalValueDecision &physical) {
+            return physical.value == value;
+          });
+      return found == entity.values.end() ? RVVVectorShape{} : found->shape;
+    };
+    if (mlir::isa<BlockIndexOp>(operation)) {
+      setResultShape(sameLanes(16));
+      return decision;
+    }
     if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
       if (elementType(load.getResult().getType()).isUnsignedInteger(8))
         setResultShape(byteShape);
@@ -9351,35 +9672,61 @@ private:
       if (target.isSignedInteger(8))
         setResultShape(byteShape);
       else if (target.isSignedInteger(16))
-        setResultShape(kRVVE16M2);
+        setResultShape(sameLanes(16));
       return decision;
     }
     if (auto compare = mlir::dyn_cast<CompareOp>(operation)) {
-      setResultShape(RVVVectorShape{1, 8});
+      RVVVectorShape inputShape = valueShape(compare.getLhs());
+      if (!inputShape)
+        inputShape = valueShape(compare.getRhs());
+      setResultShape(inputShape);
+      decision.maskRatio = rvvMaskRatio(inputShape).value_or(0);
       return decision;
     }
     if (auto cast = mlir::dyn_cast<CastOp>(operation)) {
       mlir::Type source = elementType(cast.getInput().getType());
       mlir::Type target = elementType(cast.getResult().getType());
-      if (target.isUnsignedInteger(8))
-        setResultShape(byteShape);
-      else if (target.isUnsignedInteger(16))
-        setResultShape(kRVVE16M2);
-      else if (target.isSignedInteger(32) &&
+      RVVVectorShape sourceShape = valueShape(cast.getInput());
+      if (!sourceShape &&
+          (source.isUnsignedInteger(8) || source.isSignedInteger(8)))
+        sourceShape = byteShape;
+      if (!sourceShape && source.isIndex())
+        sourceShape = sameLanes(16);
+      unsigned targetSEW = target.isUnsignedInteger(8) ? 8
+                           : target.isUnsignedInteger(16) ||
+                                   target.isSignedInteger(16)
+                               ? 16
+                           : target.isSignedInteger(32) || target.isF32() ? 32
+                                                                          : 0;
+      RVVVectorShape resultShape =
+          rvvShapeForSameLanes(sourceShape, targetSEW, options.target)
+              .value_or(RVVVectorShape{});
+      if (targetSEW != 0)
+        setResultShape(resultShape);
+      if (target.isUnsignedInteger(8)) {
+        return decision;
+      } else if (target.isUnsignedInteger(16)) {
+        return decision;
+      } else if (target.isSignedInteger(32) &&
                (source.isUnsignedInteger(8) || source.isSignedInteger(8))) {
-        setResultShape(kRVVE32M4);
         decision.realization = BlockValueRealization::DeferredI32Widen;
-        recordPhysicalTemporary(entity, operation, byteShape);
-      } else if (target.isSignedInteger(32))
-        setResultShape(kRVVE32M4);
-      else if (target.isF32())
-        setResultShape(byteShape == kRVVE8MF4 ? kRVVE32M1 : kRVVE32M4);
+        recordPhysicalTemporary(entity, operation, resultShape);
+      } else if (target.isSignedInteger(32) && source.isUnsignedInteger(16)) {
+        recordPhysicalTemporary(entity, operation, resultShape);
+      } else if (target.isF32()) {
+        RVVVectorShape intermediate = resultShape == kRVVE32M1
+                                          ? resultShape
+                                          : rvvShapeForSameLanes(
+                                                sourceShape, 16, options.target)
+                                                .value_or(RVVVectorShape{});
+        recordPhysicalTemporary(entity, operation, intermediate);
+      }
       return decision;
     }
     if (auto binary = mlir::dyn_cast<BinaryOp>(operation)) {
       mlir::Type result = elementType(binary.getResult().getType());
       if (result.isIndex())
-        setResultShape(kRVVE16M2);
+        setResultShape(sameLanes(16));
       else if (result.isUnsignedInteger(8)) {
         setResultShape(byteShape);
         if (byteShape == kRVVE8MF4 &&
@@ -9395,24 +9742,45 @@ private:
             decision.unsignedMaximum = static_cast<uint64_t>(*mask);
         }
       } else if (result.isUnsignedInteger(16))
-        setResultShape(kRVVE16M2);
-      else if (result.isSignedInteger(32))
-        setResultShape(kRVVE32M4);
-      else if (result.isF32()) {
+        setResultShape(sameLanes(16));
+      else if (result.isSignedInteger(32)) {
+        auto narrowSource = [](mlir::Value value) -> mlir::Value {
+          auto cast = value.getDefiningOp<CastOp>();
+          return cast && elementType(cast.getResult().getType()).isSignedInteger(32)
+                     ? cast.getInput()
+                     : mlir::Value{};
+        };
+        mlir::Value lhsNarrow = narrowSource(binary.getLhs());
+        mlir::Value rhsNarrow = narrowSource(binary.getRhs());
+        auto unsignedMaximum = [&](mlir::Value value)
+            -> std::optional<uint64_t> {
+          mlir::Operation *definition = value.getDefiningOp();
+          auto found = definition ? prior.find(definition) : prior.end();
+          return found == prior.end() ? std::nullopt
+                                      : found->second.unsignedMaximum;
+        };
+        bool lhsSmallU8 = lhsNarrow &&
+                          elementType(lhsNarrow.getType()).isUnsignedInteger(8) &&
+                          unsignedMaximum(lhsNarrow).value_or(256) <= 15;
+        bool rhsSmallU8 = rhsNarrow &&
+                          elementType(rhsNarrow.getType()).isUnsignedInteger(8) &&
+                          unsignedMaximum(rhsNarrow).value_or(256) <= 15;
+        bool lhsI8 = lhsNarrow &&
+                     elementType(lhsNarrow.getType()).isSignedInteger(8);
+        bool rhsI8 = rhsNarrow &&
+                     elementType(rhsNarrow.getType()).isSignedInteger(8);
+        if (binary.getKind() == "mul" &&
+            ((lhsSmallU8 && rhsI8) || (rhsSmallU8 && lhsI8))) {
+          decision.realization = BlockValueRealization::WideningI8Product;
+          setResultShape(sameLanes(16));
+        } else {
+          setResultShape(sameLanes(32));
+        }
+      } else if (result.isF32()) {
         for (mlir::Value operand : binary->getOperands()) {
-          mlir::Operation *definition = operand.getDefiningOp();
-          if (!definition)
-            continue;
-          BlockOperationDecision producer =
-              decideBlockOperation(definition, byteShape, entity);
-          auto producerShape = llvm::find_if(
-              entity.values, [&](const PhysicalValueDecision &value) {
-                return value.value == operand;
-              });
-          if (producerShape != entity.values.end() &&
-              (producerShape->shape == kRVVE32M1 ||
-               producerShape->shape == kRVVE32M4)) {
-            setResultShape(producerShape->shape);
+          RVVVectorShape producerShape = valueShape(operand);
+          if (producerShape && producerShape.sew == 32) {
+            setResultShape(producerShape);
             break;
           }
         }
@@ -9431,9 +9799,18 @@ private:
   llvm::SmallVector<BlockOperationDecision> decideBlockOperations(
       const llvm::DenseSet<mlir::Operation *> &closure,
       RVVVectorShape byteShape, PhysicalEntityPlan &entity) const {
+    llvm::SmallVector<mlir::Operation *> ordered(closure.begin(), closure.end());
+    llvm::sort(ordered, [](mlir::Operation *lhs, mlir::Operation *rhs) {
+      return lhs->isBeforeInBlock(rhs);
+    });
     llvm::SmallVector<BlockOperationDecision> decisions;
-    for (mlir::Operation *operation : closure)
-      decisions.push_back(decideBlockOperation(operation, byteShape, entity));
+    llvm::DenseMap<mlir::Operation *, BlockOperationDecision> prior;
+    for (mlir::Operation *operation : ordered) {
+      BlockOperationDecision decision =
+          decideBlockOperation(operation, byteShape, entity, prior);
+      prior.try_emplace(operation, decision);
+      decisions.push_back(std::move(decision));
+    }
     return decisions;
   }
 
@@ -9459,6 +9836,9 @@ private:
       if (!tuple)
         return get.emitError(
             "block tuple projection requires a local tuple producer");
+      if (tuple->getBlock() != owner->getBlock() && !allowCaptured)
+        return owner->emitError(
+            "block tuple producer closure crosses a region boundary");
       closure.insert(tuple.getOperation());
       for (auto [index, operand] : llvm::enumerate(tuple.getOperands())) {
         if (static_cast<int64_t>(index) == get.getIndex()) {
@@ -9533,8 +9913,12 @@ private:
         findBlockOperationDecision(op.getOperation());
     const PhysicalValueDecision *valuePlan =
         findBlockValueDecision(op.getResult());
-    if (!physical || !valuePlan || valuePlan->shape != kRVVE16M2)
-      return op.emitError("logical-index binary has no selected u16m2 shape");
+    if (!physical || !valuePlan || valuePlan->shape.sew != 16)
+      return op.emitError("logical-index binary has no selected u16 shape");
+    std::string shape = rvvShapeSuffix(valuePlan->shape);
+    if (shape.empty())
+      return op.emitError("logical-index binary shape has no RVV spelling");
+    std::string suffix = "u" + shape;
     bool lhsVector = lhs.kind == BlockValueKind::Index;
     bool rhsVector = rhs.kind == BlockValueKind::Index;
     if (!lhsVector && rhsVector &&
@@ -9548,13 +9932,15 @@ private:
     std::string intrinsic;
     std::string rhsSpelling = rhs.spelling;
     if (rhsVector) {
-      intrinsic = llvm::StringSwitch<std::string>(op.getKind())
-                      .Case("add", "__riscv_vadd_vv_u16m2")
-                      .Case("sub", "__riscv_vsub_vv_u16m2")
-                      .Case("mul", "__riscv_vmul_vv_u16m2")
-                      .Case("and", "__riscv_vand_vv_u16m2")
-                      .Case("or", "__riscv_vor_vv_u16m2")
-                      .Default("");
+      std::string stem = llvm::StringSwitch<std::string>(op.getKind())
+                             .Case("add", "vadd")
+                             .Case("sub", "vsub")
+                             .Case("mul", "vmul")
+                             .Case("and", "vand")
+                             .Case("or", "vor")
+                             .Default("");
+      if (!stem.empty())
+        intrinsic = "__riscv_" + stem + "_vv_" + suffix;
     } else {
       if (rhs.spelling.empty())
         return op.emitError("logical-index binary has an unavailable scalar");
@@ -9566,30 +9952,32 @@ private:
              value >>= 1)
           ++shift;
         if (op.getKind() == "div") {
-          intrinsic = "__riscv_vsrl_vx_u16m2";
+          intrinsic = "__riscv_vsrl_vx_" + suffix;
           rhsSpelling = std::to_string(shift);
         } else {
-          intrinsic = "__riscv_vand_vx_u16m2";
+          intrinsic = "__riscv_vand_vx_" + suffix;
           rhsSpelling = std::to_string(*constant - 1);
         }
       } else {
-        intrinsic = llvm::StringSwitch<std::string>(op.getKind())
-                        .Case("add", "__riscv_vadd_vx_u16m2")
-                        .Case("sub", "__riscv_vsub_vx_u16m2")
-                        .Case("mul", "__riscv_vmul_vx_u16m2")
-                        .Case("div", "__riscv_vdivu_vx_u16m2")
-                        .Case("mod", "__riscv_vremu_vx_u16m2")
-                        .Case("and", "__riscv_vand_vx_u16m2")
-                        .Case("or", "__riscv_vor_vx_u16m2")
-                        .Case("shl", "__riscv_vsll_vx_u16m2")
-                        .Case("shr", "__riscv_vsrl_vx_u16m2")
-                        .Default("");
+        std::string stem = llvm::StringSwitch<std::string>(op.getKind())
+                               .Case("add", "vadd")
+                               .Case("sub", "vsub")
+                               .Case("mul", "vmul")
+                               .Case("div", "vdivu")
+                               .Case("mod", "vremu")
+                               .Case("and", "vand")
+                               .Case("or", "vor")
+                               .Case("shl", "vsll")
+                               .Case("shr", "vsrl")
+                               .Default("");
+        if (!stem.empty())
+          intrinsic = "__riscv_" + stem + "_vx_" + suffix;
       }
     }
     if (intrinsic.empty())
       return op.emitError("RVV logical-index binary kind is unsupported");
     std::string name = fresh("block_index");
-    line("vuint16m2_t " + name + " = " + intrinsic + "(" + lhs.spelling +
+    line("vuint" + shape + "_t " + name + " = " + intrinsic + "(" + lhs.spelling +
          ", " + rhsSpelling + ", " + vl.str() + ");");
     BlockValue result{op.getResult().getType(), BlockValueKind::Index, name};
     result.vectorShape = valuePlan->shape;
@@ -9606,15 +9994,23 @@ private:
                                      llvm::StringRef vl) {
     if (value.kind != BlockValueKind::I32 || !value.spelling.empty())
       return mlir::success();
+    if (value.vectorShape.sew != 32)
+      return owner->emitError("deferred i32 block value has no selected shape");
+    std::string resultShape = rvvShapeSuffix(value.vectorShape);
+    if (resultShape.empty())
+      return owner->emitError("deferred i32 block shape has no RVV spelling");
     std::string name = fresh("block_i32");
     if (value.narrowKind == BlockValueKind::U8) {
       std::string extended = fresh("block_u32");
-      line("vuint32m4_t " + extended + " = __riscv_vzext_vf4_u32m4(" +
+      line("vuint" + resultShape + "_t " + extended +
+           " = __riscv_vzext_vf4_u" + resultShape + "(" +
            value.narrowSpelling + ", " + vl.str() + ");");
-      line("vint32m4_t " + name +
-           " = __riscv_vreinterpret_v_u32m4_i32m4(" + extended + ");");
+      line("vint" + resultShape + "_t " + name +
+           " = __riscv_vreinterpret_v_u" + resultShape + "_i" +
+           resultShape + "(" + extended + ");");
     } else if (value.narrowKind == BlockValueKind::I8) {
-      line("vint32m4_t " + name + " = __riscv_vsext_vf4_i32m4(" +
+      line("vint" + resultShape + "_t " + name +
+           " = __riscv_vsext_vf4_i" + resultShape + "(" +
            value.narrowSpelling + ", " + vl.str() + ");");
     } else {
       return owner->emitError(
@@ -9684,22 +10080,37 @@ private:
              !value.narrowSpelling.empty() && value.unsignedMaximum &&
              *value.unsignedMaximum <= 15;
     };
-    if (resultKind == BlockValueKind::I32 && rhsVector &&
-        op.getKind() == "mul" &&
-        ((isSmallU8(lhs) && isNarrowI8(rhs)) ||
-         (isNarrowI8(lhs) && isSmallU8(rhs)))) {
+    if (physical->realization == BlockValueRealization::WideningI8Product) {
+      if (resultKind != BlockValueKind::I32 || !rhsVector ||
+          op.getKind() != "mul" ||
+          !((isSmallU8(lhs) && isNarrowI8(rhs)) ||
+            (isNarrowI8(lhs) && isSmallU8(rhs))))
+        return op.emitError(
+            "widening i8 product operands do not match its decision");
       BlockValue small = isSmallU8(lhs) ? lhs : rhs;
       BlockValue signedValue = isNarrowI8(lhs) ? lhs : rhs;
+      RVVVectorShape productShape = selectedShape;
+      RVVVectorShape sourceShape =
+          rvvShapeForSameLanes(productShape, 8, options.target)
+              .value_or(RVVVectorShape{});
+      std::string productSuffix = rvvShapeSuffix(productShape);
+      std::string sourceSuffix = rvvShapeSuffix(sourceShape);
+      if (productShape.sew != 16 || sourceShape.sew != 8 ||
+          productSuffix.empty() || sourceSuffix.empty())
+        return op.emitError(
+            "widening i8 product has no physical RVV spelling");
       std::string signedSmall = fresh("block_i8");
       std::string name = fresh("block_i16_product");
-      line("vint8m1_t " + signedSmall +
-           " = __riscv_vreinterpret_v_u8m1_i8m1(" + small.narrowSpelling +
-           ");");
-      line("vint16m2_t " + name + " = __riscv_vwmul_vv_i16m2(" +
+      line("vint" + sourceSuffix + "_t " + signedSmall +
+           " = __riscv_vreinterpret_v_u" + sourceSuffix + "_i" +
+           sourceSuffix + "(" + small.narrowSpelling + ");");
+      line("vint" + productSuffix + "_t " + name +
+           " = __riscv_vwmul_vv_i" + productSuffix + "(" +
            signedSmall + ", " + signedValue.narrowSpelling + ", " + vl.str() +
            ");");
-      blockValues[op.getResult()] =
-          BlockValue{op.getResult().getType(), BlockValueKind::I16, name};
+      BlockValue result{op.getResult().getType(), BlockValueKind::I16, name};
+      result.vectorShape = productShape;
+      blockValues[op.getResult()] = std::move(result);
       return mlir::success();
     }
     if (resultKind == BlockValueKind::I32) {
@@ -9710,21 +10121,17 @@ private:
 
     std::string suffix;
     std::string cType;
-    if (resultKind == BlockValueKind::U8) {
-      std::string shapeSuffix = rvvShapeSuffix(selectedShape);
-      if (shapeSuffix.empty())
-        return op.emitError("u8 block binary has no RVV shape spelling");
-      suffix = "u" + shapeSuffix;
-      cType = "vuint" + shapeSuffix + "_t";
-    } else if (resultKind == BlockValueKind::U16) {
-      suffix = "u16m2";
-      cType = "vuint16m2_t";
-    } else if (resultKind == BlockValueKind::I32) {
-      suffix = "i32m4";
-      cType = "vint32m4_t";
-    } else {
+    unsigned expectedSEW = resultKind == BlockValueKind::U8 ? 8
+                           : resultKind == BlockValueKind::U16 ? 16
+                           : resultKind == BlockValueKind::I32 ? 32
+                                                               : 0;
+    std::string shapeSuffix = rvvShapeSuffix(selectedShape);
+    if (expectedSEW == 0 || selectedShape.sew != expectedSEW ||
+        shapeSuffix.empty())
       return op.emitError("integer block type has no physical RVV mapping");
-    }
+    bool signedResult = resultKind == BlockValueKind::I32;
+    suffix = std::string(signedResult ? "i" : "u") + shapeSuffix;
+    cType = std::string(signedResult ? "vint" : "vuint") + shapeSuffix + "_t";
     llvm::StringRef form = rhsVector ? "vv" : "vx";
     std::string stem = llvm::StringSwitch<std::string>(op.getKind())
                            .Case("add", "vadd")
@@ -9818,17 +10225,11 @@ private:
     if ((lhsVector && lhs.vectorShape != shape) ||
         (rhsVector && rhs.vectorShape != shape))
       return op.emitError("f32 block binary operands do not match its decision");
-    std::string suffix;
-    std::string cType;
-    if (shape == kRVVE32M1) {
-      suffix = "f32m1";
-      cType = "vfloat32m1_t";
-    } else if (shape == kRVVE32M4) {
-      suffix = "f32m4";
-      cType = "vfloat32m4_t";
-    } else {
+    std::string shapeSuffix = rvvShapeSuffix(shape);
+    if (shape.sew != 32 || shapeSuffix.empty())
       return op.emitError("f32 block binary has no physical RVV shape");
-    }
+    std::string suffix = "f" + shapeSuffix;
+    std::string cType = "vfloat" + shapeSuffix + "_t";
     std::string intrinsic =
         "__riscv_" + stem + "_" + form + "_" + suffix;
     std::string name = fresh("block_f32");
@@ -9877,22 +10278,29 @@ private:
         rhs.kind != BlockValueKind::Scalar || rhs.spelling.empty())
       return op.emitError(
           "RVV block comparison currently requires index-vector vs scalar");
-    std::string intrinsic =
-        llvm::StringSwitch<std::string>(op.getPredicate())
-            .Case("lt", "__riscv_vmsltu_vx_u16m2_b8")
-            .Case("le", "__riscv_vmsleu_vx_u16m2_b8")
-            .Case("gt", "__riscv_vmsgtu_vx_u16m2_b8")
-            .Case("ge", "__riscv_vmsgeu_vx_u16m2_b8")
-            .Case("eq", "__riscv_vmseq_vx_u16m2_b8")
-            .Case("ne", "__riscv_vmsne_vx_u16m2_b8")
-            .Default("");
-    if (intrinsic.empty())
+    RVVVectorShape inputShape = valuePlan->shape;
+    std::string inputSuffix = rvvShapeSuffix(inputShape);
+    std::string stem = llvm::StringSwitch<std::string>(op.getPredicate())
+                           .Case("lt", "vmsltu")
+                           .Case("le", "vmsleu")
+                           .Case("gt", "vmsgtu")
+                           .Case("ge", "vmsgeu")
+                           .Case("eq", "vmseq")
+                           .Case("ne", "vmsne")
+                           .Default("");
+    if (stem.empty() || inputShape.sew != 16 || inputSuffix.empty() ||
+        physical->maskRatio == 0 ||
+        (lhs.vectorShape && lhs.vectorShape != inputShape))
       return op.emitError("RVV block comparison predicate is unsupported");
+    std::string intrinsic = "__riscv_" + stem + "_vx_u" + inputSuffix +
+                            "_b" + std::to_string(physical->maskRatio);
     std::string name = fresh("block_mask");
-    line("vbool8_t " + name + " = " + intrinsic + "(" + lhs.spelling + ", " +
-         rhs.spelling + ", " + vl.str() + ");");
-    blockValues[op.getResult()] =
-        BlockValue{op.getResult().getType(), BlockValueKind::Mask, name};
+    line("vbool" + std::to_string(physical->maskRatio) + "_t " + name +
+         " = " + intrinsic + "(" + lhs.spelling + ", " + rhs.spelling +
+         ", " + vl.str() + ");");
+    BlockValue result{op.getResult().getType(), BlockValueKind::Mask, name};
+    result.vectorShape = inputShape;
+    blockValues[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -9910,40 +10318,67 @@ private:
     std::string name = fresh("block_cast");
     BlockValueKind kind;
     RVVVectorShape shape = valuePlan->shape;
+    std::string shapeSuffix = rvvShapeSuffix(shape);
+    if (shapeSuffix.empty())
+      return op.emitError("block cast result shape has no RVV spelling");
+    const PhysicalTemporaryDecision *temporary =
+        findBlockTemporaryDecision(op.getOperation());
     if (input.kind == BlockValueKind::Index && target.isUnsignedInteger(8)) {
+      if (shape.sew != 8 || input.spelling.empty())
+        return op.emitError("logical index to u8 cast has no selected vectors");
       kind = BlockValueKind::U8;
-      line("vuint8m1_t " + name + " = __riscv_vncvt_x_x_w_u8m1(" +
-           input.spelling + ", " + vl.str() + ");");
+      line("vuint" + shapeSuffix + "_t " + name +
+           " = __riscv_vncvt_x_x_w_u" + shapeSuffix + "(" + input.spelling +
+           ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
                target.isUnsignedInteger(16)) {
+      if (shape.sew != 16 || input.spelling.empty())
+        return op.emitError("u8 to u16 cast has no selected vectors");
       kind = BlockValueKind::U16;
-      line("vuint16m2_t " + name + " = __riscv_vzext_vf2_u16m2(" +
-           input.spelling + ", " + vl.str() + ");");
+      line("vuint" + shapeSuffix + "_t " + name +
+           " = __riscv_vzext_vf2_u" + shapeSuffix + "(" + input.spelling +
+           ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
                target.isSignedInteger(32)) {
+      if (physical->realization != BlockValueRealization::DeferredI32Widen ||
+          shape.sew != 32 || !temporary || temporary->shape != shape)
+        return op.emitError("deferred u8 to i32 cast decision is incomplete");
       kind = BlockValueKind::I32;
       name.clear();
     } else if (input.kind == BlockValueKind::I8 &&
                target.isSignedInteger(32)) {
+      if (physical->realization != BlockValueRealization::DeferredI32Widen ||
+          shape.sew != 32 || !temporary || temporary->shape != shape)
+        return op.emitError("deferred i8 to i32 cast decision is incomplete");
       kind = BlockValueKind::I32;
       name.clear();
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(32)) {
+      if (shape.sew != 32 || input.spelling.empty() || !temporary ||
+          temporary->shape != shape)
+        return op.emitError("u16 to i32 cast decision is incomplete");
       kind = BlockValueKind::I32;
       std::string extended = fresh("block_u32");
-      line("vuint32m4_t " + extended + " = __riscv_vzext_vf2_u32m4(" +
-           input.spelling + ", " + vl.str() + ");");
-      line("vint32m4_t " + name +
-           " = __riscv_vreinterpret_v_u32m4_i32m4(" + extended + ");");
+      line("vuint" + shapeSuffix + "_t " + extended +
+           " = __riscv_vzext_vf2_u" + shapeSuffix + "(" + input.spelling +
+           ", " + vl.str() + ");");
+      line("vint" + shapeSuffix + "_t " + name +
+           " = __riscv_vreinterpret_v_u" + shapeSuffix + "_i" + shapeSuffix +
+           "(" + extended + ");");
     } else if (input.kind == BlockValueKind::I16 &&
                target.isSignedInteger(32)) {
+      if (shape.sew != 32 || input.spelling.empty())
+        return op.emitError("i16 to i32 cast decision is incomplete");
       kind = BlockValueKind::I32;
-      line("vint32m4_t " + name + " = __riscv_vsext_vf2_i32m4(" +
-           input.spelling + ", " + vl.str() + ");");
+      line("vint" + shapeSuffix + "_t " + name +
+           " = __riscv_vsext_vf2_i" + shapeSuffix + "(" + input.spelling +
+           ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 && target.isF32()) {
+      if (shape.sew != 32 || input.spelling.empty() || !temporary)
+        return op.emitError("u8 to f32 cast decision is incomplete");
       kind = BlockValueKind::F32;
       std::string extended;
-      if (shape == kRVVE32M1) {
+      if (temporary->shape == shape) {
         std::string sourceSpelling = input.spelling;
         auto source = blockValues.find(input.packedSource);
         if (input.packedSource && !input.packedTransform.empty()) {
@@ -9957,9 +10392,9 @@ private:
           widened = source->second.widenedSpelling;
         } else {
           widened = fresh("block_packed_u32");
-          line("vuint32m1_t " + widened +
-               " = __riscv_vzext_vf4_u32m1(" + sourceSpelling + ", " +
-               vl.str() + ");");
+          line("vuint" + shapeSuffix + "_t " + widened +
+               " = __riscv_vzext_vf4_u" + shapeSuffix + "(" +
+               sourceSpelling + ", " + vl.str() + ");");
           if (source != blockValues.end())
             source->second.widenedSpelling = widened;
         }
@@ -9968,31 +10403,41 @@ private:
           extended = fresh("block_code_u32");
           std::string stem =
               input.packedTransform == "and" ? "vand" : "vsrl";
-          line("vuint32m1_t " + extended + " = __riscv_" + stem +
-               "_vx_u32m1(" + widened + ", " +
+          line("vuint" + shapeSuffix + "_t " + extended + " = __riscv_" +
+               stem + "_vx_u" + shapeSuffix + "(" + widened + ", " +
                input.packedTransformOperand + ", " + vl.str() + ");");
         }
-        line("vfloat32m1_t " + name + " = __riscv_vfcvt_f_xu_v_f32m1(" +
-             extended + ", " + vl.str() + ");");
+        line("vfloat" + shapeSuffix + "_t " + name +
+             " = __riscv_vfcvt_f_xu_v_f" + shapeSuffix + "(" + extended +
+             ", " + vl.str() + ");");
       } else {
-        std::string u16Suffix = "u16m2";
-        std::string u16Type = "vuint16m2_t";
+        RVVVectorShape intermediateShape = temporary->shape;
+        std::string intermediateSuffix = rvvShapeSuffix(intermediateShape);
+        if (intermediateShape.sew != 16 || intermediateSuffix.empty())
+          return op.emitError("u8 to f32 intermediate has no RVV spelling");
         extended = fresh("block_u16");
-        line(u16Type + " " + extended + " = __riscv_vzext_vf2_" +
-             u16Suffix + "(" + input.spelling + ", " + vl.str() + ");");
-        line("vfloat32m4_t " + name +
-             " = __riscv_vfwcvt_f_xu_v_f32m4(" + extended + ", " + vl.str() +
-             ");");
+        line("vuint" + intermediateSuffix + "_t " + extended +
+             " = __riscv_vzext_vf2_u" + intermediateSuffix + "(" +
+             input.spelling + ", " + vl.str() + ");");
+        line("vfloat" + shapeSuffix + "_t " + name +
+             " = __riscv_vfwcvt_f_xu_v_f" + shapeSuffix + "(" + extended +
+             ", " + vl.str() + ");");
       }
-    } else if (input.kind == BlockValueKind::I8 && target.isF32() &&
-               input.vectorShape == kRVVE8M1) {
+    } else if (input.kind == BlockValueKind::I8 && target.isF32()) {
+      if (shape.sew != 32 || input.spelling.empty() || !temporary)
+        return op.emitError("i8 to f32 cast decision is incomplete");
+      RVVVectorShape intermediateShape = temporary->shape;
+      std::string intermediateSuffix = rvvShapeSuffix(intermediateShape);
+      if (intermediateShape.sew != 16 || intermediateSuffix.empty())
+        return op.emitError("i8 to f32 intermediate has no RVV spelling");
       kind = BlockValueKind::F32;
       std::string extended = fresh("block_i16");
-      line("vint16m2_t " + extended + " = __riscv_vsext_vf2_i16m2(" +
+      line("vint" + intermediateSuffix + "_t " + extended +
+           " = __riscv_vsext_vf2_i" + intermediateSuffix + "(" +
            input.spelling + ", " + vl.str() + ");");
-      line("vfloat32m4_t " + name +
-           " = __riscv_vfwcvt_f_x_v_f32m4(" + extended + ", " + vl.str() +
-           ");");
+      line("vfloat" + shapeSuffix + "_t " + name +
+           " = __riscv_vfwcvt_f_x_v_f" + shapeSuffix + "(" + extended +
+           ", " + vl.str() + ");");
     } else {
       return op.emitError("RVV block cast pair is unsupported");
     }
@@ -10020,23 +10465,24 @@ private:
     std::string name = fresh("block_bits");
     BlockValueKind kind;
     RVVVectorShape shape = valuePlan->shape;
+    std::string shapeSuffix = rvvShapeSuffix(shape);
+    if (shapeSuffix.empty() || input.vectorShape != shape)
+      return op.emitError("block bitcast operands do not match its decision");
     if (input.kind == BlockValueKind::U8 && target.isSignedInteger(8)) {
-      kind = BlockValueKind::I8;
-      if (shape == kRVVE8MF4)
-        line("vint8mf4_t " + name +
-             " = __riscv_vreinterpret_v_u8mf4_i8mf4(" + input.spelling +
-             ");");
-      else if (shape == kRVVE8M1)
-        line("vint8m1_t " + name +
-             " = __riscv_vreinterpret_v_u8m1_i8m1(" + input.spelling +
-             ");");
-      else
+      if (shape.sew != 8)
         return op.emitError("u8 block bitcast has no physical RVV shape");
+      kind = BlockValueKind::I8;
+      line("vint" + shapeSuffix + "_t " + name +
+           " = __riscv_vreinterpret_v_u" + shapeSuffix + "_i" + shapeSuffix +
+           "(" + input.spelling + ");");
     } else if (input.kind == BlockValueKind::U16 &&
                target.isSignedInteger(16)) {
+      if (shape.sew != 16)
+        return op.emitError("u16 block bitcast has no physical RVV shape");
       kind = BlockValueKind::I16;
-      line("vint16m2_t " + name +
-           " = __riscv_vreinterpret_v_u16m2_i16m2(" + input.spelling + ");");
+      line("vint" + shapeSuffix + "_t " + name +
+           " = __riscv_vreinterpret_v_u" + shapeSuffix + "_i" + shapeSuffix +
+           "(" + input.spelling + ");");
     } else {
       return op.emitError("RVV block bitcast pair is unsupported");
     }
@@ -10112,6 +10558,11 @@ private:
         !result.getElementType().isSignedInteger(8) || !isTrue(op.getWhere()))
       return op.emitError(
           "RVV block decode requires 16 all-active u8 codes and an i8 table");
+    if (options.target.vlenBits < 128 ||
+        !options.target.supportsVectorShape(kRVVE8M1.sew,
+                                            kRVVE8M1.lmulEighths))
+      return op.emitError(
+          "RVV block decode requires a legal e8m1 vector with 16 lanes");
     decision = BlockDecodeDecision{};
     return mlir::success();
   }
@@ -10178,14 +10629,10 @@ private:
         !isTrue(op.getWhere()))
       return op.emitError(
           "RVV block store requires an all-active f32 vector value");
-    std::string suffix;
-    if (value.vectorShape == kRVVE32M1)
-      suffix = "f32m1";
-    else if (value.vectorShape == kRVVE32M4)
-      suffix = "f32m4";
-    else
+    std::string shapeSuffix = rvvShapeSuffix(value.vectorShape);
+    if (value.vectorShape.sew != 32 || shapeSuffix.empty())
       return op.emitError("f32 block store has no physical RVV shape");
-    line("__riscv_vse32_v_" + suffix + "(" + pointer.pointerBase + " + " +
+    line("__riscv_vse32_v_f" + shapeSuffix + "(" + pointer.pointerBase + " + " +
          pointer.contiguousIndex + ", " + value.spelling + ", " + vl.str() +
          ");");
     return mlir::success();
@@ -10525,16 +10972,49 @@ private:
         planned.entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == op.getInput();
         });
-    if (reducedValue != planned.entity.values.end())
-      recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInput(),
-                            PhysicalHandoff::Rematerialize,
-                            reducedValue->shape, reducedValue->shape);
+    if (reducedValue == planned.entity.values.end())
+      return op.emitError("block reduction input has no physical value decision");
+    BlockReductionValueDecision reductionValue;
+    reductionValue.operation = op.getOperation();
+    reductionValue.inputShape = reducedValue->shape;
+    reductionValue.combinedShape = reducedValue->shape;
+    if (physical.realization == BlockReduceRealization::RVVE8M1FixedStrips &&
+        reducedValue->shape.sew == 16) {
+      reductionValue.combinedShape =
+          rvvShapeForSameLanes(reducedValue->shape, 32, options.target)
+              .value_or(RVVVectorShape{});
+      reductionValue.wideningCombine = true;
+    }
+    reductionValue.seedShape = RVVVectorShape{
+        reductionValue.combinedShape.sew, 8};
+    if (!reductionValue.inputShape || !reductionValue.combinedShape ||
+        !options.target.supportsVectorShape(
+            reductionValue.seedShape.sew,
+            reductionValue.seedShape.lmulEighths))
+      return op.emitError(
+          "block reduction has no legal input/combine/seed vector shapes");
+    recordPhysicalHandoff(
+        planned.entity, op.getOperation(), op.getInput(),
+        reductionValue.wideningCombine ? PhysicalHandoff::Convert
+                                       : PhysicalHandoff::Rematerialize,
+        reductionValue.inputShape, reductionValue.combinedShape);
+    recordPhysicalTemporary(planned.entity, op.getOperation(),
+                            reductionValue.seedShape);
+    planned.realization.values.push_back(reductionValue);
     planned.entity.blockReduce = physical;
     planned.entity.schedule.stripSchedule =
         physical.realization == BlockReduceRealization::RVVE8M1DynamicStrips
             ? VLAStripSchedule::Dynamic
             : VLAStripSchedule::FullThenTail;
-    planned.entity.resources.valueGroups = 8;
+    unsigned inputCopies =
+        physical.realization == BlockReduceRealization::RVVE8M1FixedStrips ? 2
+                                                                           : 1;
+    planned.entity.resources.valueGroups =
+        inputCopies * rvvRegisterGroups(reductionValue.inputShape) +
+        (physical.realization == BlockReduceRealization::RVVE8M1FixedStrips
+             ? rvvRegisterGroups(reductionValue.combinedShape)
+             : 0) +
+        rvvRegisterGroups(reductionValue.seedShape);
     planned.entity.resources.memoryGroups =
         rvvRegisterGroups(physical.laneShape);
     planned.entity.resources.primitiveGroups =
@@ -10616,6 +11096,8 @@ private:
       llvm::DenseMap<mlir::Value, BlockValue> blockValues;
       BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
                             physical.needsLaneVector ? lane : ""};
+      if (physical.needsLaneVector)
+        coordinate.vectorShape = physical.laneShape;
       coordinate.contiguousIndex =
           "(" + stripOffset.str() + " + " + offset + ")";
       blockValues[axis.getResult()] = std::move(coordinate);
@@ -10726,9 +11208,22 @@ private:
       return op.emitError("block reduction physical entity is incomplete");
     const PhysicalHandoffDecision *reduceHandoff =
         findPhysicalHandoff(entity, op.getOperation(), op.getInput());
-    if (!reduceHandoff ||
-        reduceHandoff->kind != PhysicalHandoff::Rematerialize ||
-        reduceHandoff->sourceShape != reduceHandoff->resultShape)
+    auto selectedReduction = llvm::find_if(
+        decision.values, [&](const BlockReductionValueDecision &value) {
+          return value.operation == op.getOperation();
+        });
+    auto seedTemporary = llvm::find_if(
+        entity.temporaries, [&](const PhysicalTemporaryDecision &temporary) {
+          return temporary.owner == op.getOperation();
+        });
+    if (selectedReduction == decision.values.end() || !reduceHandoff ||
+        seedTemporary == entity.temporaries.end() ||
+        seedTemporary->shape != selectedReduction->seedShape ||
+        reduceHandoff->kind !=
+            (selectedReduction->wideningCombine ? PhysicalHandoff::Convert
+                                                : PhysicalHandoff::Rematerialize) ||
+        reduceHandoff->sourceShape != selectedReduction->inputShape ||
+        reduceHandoff->resultShape != selectedReduction->combinedShape)
       return op.emitError("block reduction physical handoff is incomplete");
     const BlockReducePhysicalDecision &physical = *entity.blockReduce;
     int64_t extent = decision.extent;
@@ -10809,36 +11304,48 @@ private:
         }
       }
       for (auto [index, reduction] : llvm::enumerate(reductions)) {
+        auto reductionValue = llvm::find_if(
+            decision.values, [&](const BlockReductionValueDecision &value) {
+              return value.operation == reduction.getOperation();
+            });
         if (stripInputs[index].size() != 2 ||
-            stripInputs[index][0].kind != stripInputs[index][1].kind)
+            stripInputs[index][0].kind != stripInputs[index][1].kind ||
+            reductionValue == decision.values.end() ||
+            stripInputs[index][0].vectorShape != reductionValue->inputShape ||
+            stripInputs[index][1].vectorShape != reductionValue->inputShape)
           return reduction.emitError(
               "fixed-strip reduction produced incompatible physical values");
-        BlockValueKind kind = stripInputs[index][0].kind;
+        std::string inputSuffix = rvvShapeSuffix(reductionValue->inputShape);
+        std::string combinedSuffix =
+            rvvShapeSuffix(reductionValue->combinedShape);
+        std::string seedSuffix = rvvShapeSuffix(reductionValue->seedShape);
+        if (inputSuffix.empty() || combinedSuffix.empty() || seedSuffix.empty())
+          return reduction.emitError(
+              "fixed-strip reduction shapes have no RVV spelling");
         std::string combined = fresh("block_combined");
         std::string seed = fresh("block_seed");
         std::string partial = fresh("block_partial");
-        if (kind == BlockValueKind::I16) {
-          line("vint32m4_t " + combined + " = __riscv_vwadd_vv_i32m4(" +
-               stripInputs[index][0].spelling + ", " +
-               stripInputs[index][1].spelling + ", " + vl + ");");
-          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
-          line("vint32m1_t " + partial +
-               " = __riscv_vredsum_vs_i32m4_i32m1(" + combined + ", " + seed +
-               ", " + vl + ");");
-        } else if (kind == BlockValueKind::I32) {
-          line("vint32m4_t " + combined + " = __riscv_vadd_vv_i32m4(" +
-               stripInputs[index][0].spelling + ", " +
-               stripInputs[index][1].spelling + ", " + vl + ");");
-          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
-          line("vint32m1_t " + partial +
-               " = __riscv_vredsum_vs_i32m4_i32m1(" + combined + ", " + seed +
-               ", " + vl + ");");
-        } else {
+        BlockValueKind expectedKind = reductionValue->wideningCombine
+                                          ? BlockValueKind::I16
+                                          : BlockValueKind::I32;
+        if (stripInputs[index][0].kind != expectedKind ||
+            reductionValue->combinedShape.sew != 32 ||
+            reductionValue->seedShape.sew != 32)
           return reduction.emitError(
               "fixed-strip reduction physical type is unsupported");
-        }
-        line(accumulators[index] + " += __riscv_vmv_x_s_i32m1_i32(" +
-             partial + ");");
+        std::string addStem =
+            reductionValue->wideningCombine ? "vwadd" : "vadd";
+        line("vint" + combinedSuffix + "_t " + combined + " = __riscv_" +
+             addStem + "_vv_i" + combinedSuffix + "(" +
+             stripInputs[index][0].spelling + ", " +
+             stripInputs[index][1].spelling + ", " + vl + ");");
+        line("vint" + seedSuffix + "_t " + seed + " = __riscv_vmv_v_x_i" +
+             seedSuffix + "(0, 1);");
+        line("vint" + seedSuffix + "_t " + partial +
+             " = __riscv_vredsum_vs_i" + combinedSuffix + "_i" + seedSuffix +
+             "(" + combined + ", " + seed + ", " + vl + ");");
+        line(accumulators[index] + " += __riscv_vmv_x_s_i" + seedSuffix +
+             "_i32(" + partial + ");");
         values[reduction.getResult()] =
             CValue{reduction.getResult().getType(), CValueKind::Scalar,
                    accumulators[index]};
@@ -10873,6 +11380,8 @@ private:
     llvm::DenseMap<mlir::Value, BlockValue> blockValues;
     BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
                           physical.needsLaneVector ? lane : ""};
+    if (physical.needsLaneVector)
+      coordinate.vectorShape = physical.laneShape;
     coordinate.contiguousIndex = "(" + strip + " + " + offset + ")";
     blockValues[axis.getResult()] = std::move(coordinate);
     llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
@@ -10882,33 +11391,44 @@ private:
       auto reduction = reductionIndices.find(&candidate);
       if (reduction != reductionIndices.end()) {
         ReduceOp current = reductions[reduction->second];
+        auto reductionValue = llvm::find_if(
+            decision.values, [&](const BlockReductionValueDecision &value) {
+              return value.operation == current.getOperation();
+            });
         BlockValue input = lookupBlockValue(current.getInput(), blockValues);
         if (input.kind == BlockValueKind::I32 &&
             mlir::failed(materializeI32(input, current.getOperation(), vl)))
           return mlir::failure();
-        if ((input.kind != BlockValueKind::I32 &&
+        if (reductionValue == decision.values.end() ||
+            (input.kind != BlockValueKind::I32 &&
              input.kind != BlockValueKind::I16) ||
-            input.spelling.empty())
+            input.spelling.empty() ||
+            input.vectorShape != reductionValue->inputShape ||
+            reductionValue->combinedShape != reductionValue->inputShape)
           return current.emitError(
               "RVV block reduction input is not an integer vector");
+        std::string inputSuffix = rvvShapeSuffix(reductionValue->inputShape);
+        std::string seedSuffix = rvvShapeSuffix(reductionValue->seedShape);
+        if (inputSuffix.empty() || seedSuffix.empty() ||
+            reductionValue->seedShape.sew != reductionValue->inputShape.sew)
+          return current.emitError(
+              "RVV block reduction shapes have no compatible spelling");
         std::string seed = fresh("block_seed");
         std::string partial = fresh("block_partial");
         const std::string &accumulator = accumulators[reduction->second];
-        if (input.kind == BlockValueKind::I16) {
-          line("vint16m1_t " + seed + " = __riscv_vmv_v_x_i16m1(0, 1);");
-          line("vint16m1_t " + partial +
-               " = __riscv_vredsum_vs_i16m2_i16m1(" + input.spelling + ", " +
-               seed + ", " + vl + ");");
-          line(accumulator +
-               " += (int32_t)__riscv_vmv_x_s_i16m1_i16(" + partial + ");");
-        } else {
-          line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
-          line("vint32m1_t " + partial +
-               " = __riscv_vredsum_vs_i32m4_i32m1(" + input.spelling + ", " +
-               seed + ", " + vl + ");");
-          line(accumulator + " += __riscv_vmv_x_s_i32m1_i32(" + partial +
-               ");");
-        }
+        line("vint" + seedSuffix + "_t " + seed + " = __riscv_vmv_v_x_i" +
+             seedSuffix + "(0, 1);");
+        line("vint" + seedSuffix + "_t " + partial +
+             " = __riscv_vredsum_vs_i" + inputSuffix + "_i" + seedSuffix +
+             "(" + input.spelling + ", " + seed + ", " + vl + ");");
+        std::string extracted = "__riscv_vmv_x_s_i" + seedSuffix + "_i" +
+                                std::to_string(reductionValue->seedShape.sew) +
+                                "(" + partial + ")";
+        line(accumulator + " += " +
+             (reductionValue->seedShape.sew == 16
+                  ? "(int32_t)" + extracted
+                  : extracted) +
+             ";");
         if (&candidate == reductions.back().getOperation())
           break;
         continue;
@@ -11345,76 +11865,94 @@ __weft_load_f16_le(const uint8_t *bytes) {
 
 )c";
   if (usesRVVI4I8) {
-    output << R"c(static inline __attribute__((always_inline, unused)) int32_t
-__weft_rvv_i8_dot_32(const int8_t *lhs, const int8_t *rhs) {
-  int32_t sum = 0;
-  for (size_t offset = 0; offset < 32;) {
-    const size_t vl = __riscv_vsetvl_e8m2(32 - offset);
-    const vint8m2_t lhs_vector = __riscv_vle8_v_i8m2(lhs + offset, vl);
-    const vint8m2_t rhs_vector = __riscv_vle8_v_i8m2(rhs + offset, vl);
-    const vint16m4_t product =
-        __riscv_vwmul_vv_i16m4(lhs_vector, rhs_vector, vl);
-    const vint32m1_t seed = __riscv_vmv_v_x_i32m1(0, 1);
-    const vint32m1_t reduced =
-        __riscv_vwredsum_vs_i16m4_i32m1(product, seed, vl);
-    sum += __riscv_vmv_x_s_i32m1_i32(reduced);
-    offset += vl;
-  }
-  return sum;
-}
-
-static inline __attribute__((always_inline, unused)) float
-__weft_rvv_local_f16(const uint8_t *bytes) {
-  const uint16_t bits =
-      (uint16_t)bytes[0] | ((uint16_t)bytes[1] << UINT16_C(8));
-  return (float)__weft_bitcast_u16_f16(bits);
-}
-
-static inline __attribute__((always_inline, unused)) void
+    output << R"c(static inline __attribute__((always_inline, unused)) void
 __weft_rvv_symmetric_i4_i8_n16_k32(
     float activation_scale, const int8_t *activation_code,
     const uint8_t *packed_weight, float *accumulator) {
-  int8_t decoded[32];
-  for (size_t column = 0; column < 16; ++column) {
-    for (size_t half = 0; half < 2; ++half) {
-      for (size_t lane = 0; lane < 8; ++lane) {
-        const uint8_t packed =
-            packed_weight[32 + half * 128 + column * 8 + lane];
-        decoded[half * 16 + lane] = (int8_t)(packed & UINT8_C(15)) - 8;
-        decoded[half * 16 + lane + 8] = (int8_t)(packed >> 4) - 8;
-      }
+  const size_t vl = __riscv_vsetvl_e8m1(16);
+  vint32m4_t integer_dot = __riscv_vmv_v_x_i32m4(0, vl);
+  for (size_t half = 0; half < 2; ++half) {
+    const uint8_t *codes = packed_weight + 32 + half * 128;
+    const int8_t *activation = activation_code + half * 16;
+    for (size_t byte = 0; byte < 8; ++byte) {
+      const vuint8m1_t packed =
+          __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
+      const vuint8m1_t low =
+          __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl);
+      const vuint8m1_t high = __riscv_vsrl_vx_u8m1(packed, 4, vl);
+      const vint16m2_t low_centered = __riscv_vsub_vx_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(
+              __riscv_vzext_vf2_u16m2(low, vl)),
+          8, vl);
+      const vint16m2_t high_centered = __riscv_vsub_vx_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(
+              __riscv_vzext_vf2_u16m2(high, vl)),
+          8, vl);
+      integer_dot = __riscv_vwmacc_vx_i32m4(
+          integer_dot, activation[byte], low_centered, vl);
+      integer_dot = __riscv_vwmacc_vx_i32m4(
+          integer_dot, activation[byte + 8], high_centered, vl);
     }
-    const float weight_scale =
-        __weft_rvv_local_f16(packed_weight + column * 2);
-    accumulator[column] +=
-        (float)__weft_rvv_i8_dot_32(decoded, activation_code) *
-        activation_scale * weight_scale;
   }
+  const vfloat16m2_t packed_scale = __riscv_vle16_v_f16m2(
+      (const _Float16 *)(const void *)packed_weight, vl);
+  const vfloat32m4_t weight_scale =
+      __riscv_vfwcvt_f_f_v_f32m4(packed_scale, vl);
+  vfloat32m4_t contribution =
+      __riscv_vfcvt_f_x_v_f32m4(integer_dot, vl);
+  contribution =
+      __riscv_vfmul_vf_f32m4(contribution, activation_scale, vl);
+  vfloat32m4_t result = __riscv_vle32_v_f32m4(accumulator, vl);
+  result = __riscv_vfmacc_vv_f32m4(
+      result, contribution, weight_scale, vl);
+  __riscv_vse32_v_f32m4(accumulator, result, vl);
 }
 
 static inline __attribute__((always_inline, unused)) void
 __weft_rvv_affine_i4_i8_n16_k32(
     float activation_scale, const int8_t *activation_code,
     const uint8_t *packed_weight, float *accumulator) {
-  int8_t decoded[32];
-  for (size_t column = 0; column < 16; ++column) {
-    const int8_t zero_point = (int8_t)packed_weight[32 + column];
-    for (size_t half = 0; half < 2; ++half) {
-      for (size_t lane = 0; lane < 8; ++lane) {
-        const uint8_t packed =
-            packed_weight[48 + half * 128 + column * 8 + lane];
-        decoded[half * 16 + lane] =
-            (int8_t)(packed & UINT8_C(15)) - zero_point;
-        decoded[half * 16 + lane + 8] =
-            (int8_t)(packed >> 4) - zero_point;
-      }
+  const size_t vl = __riscv_vsetvl_e8m1(16);
+  const vuint16m2_t zero_unsigned = __riscv_vzext_vf2_u16m2(
+      __riscv_vle8_v_u8m1(packed_weight + 32, vl), vl);
+  const vint16m2_t zero_point =
+      __riscv_vreinterpret_v_u16m2_i16m2(zero_unsigned);
+  vint32m4_t integer_dot = __riscv_vmv_v_x_i32m4(0, vl);
+  for (size_t half = 0; half < 2; ++half) {
+    const uint8_t *codes = packed_weight + 48 + half * 128;
+    const int8_t *activation = activation_code + half * 16;
+    for (size_t byte = 0; byte < 8; ++byte) {
+      const vuint8m1_t packed =
+          __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
+      const vuint8m1_t low =
+          __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl);
+      const vuint8m1_t high = __riscv_vsrl_vx_u8m1(packed, 4, vl);
+      const vint16m2_t low_centered = __riscv_vsub_vv_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(
+              __riscv_vzext_vf2_u16m2(low, vl)),
+          zero_point, vl);
+      const vint16m2_t high_centered = __riscv_vsub_vv_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(
+              __riscv_vzext_vf2_u16m2(high, vl)),
+          zero_point, vl);
+      integer_dot = __riscv_vwmacc_vx_i32m4(
+          integer_dot, activation[byte], low_centered, vl);
+      integer_dot = __riscv_vwmacc_vx_i32m4(
+          integer_dot, activation[byte + 8], high_centered, vl);
     }
-    const float weight_scale =
-        __weft_rvv_local_f16(packed_weight + column * 2);
-    accumulator[column] +=
-        (float)__weft_rvv_i8_dot_32(decoded, activation_code) *
-        activation_scale * weight_scale;
   }
+  const vfloat16m2_t packed_scale = __riscv_vle16_v_f16m2(
+      (const _Float16 *)(const void *)packed_weight, vl);
+  const vfloat32m4_t weight_scale =
+      __riscv_vfwcvt_f_f_v_f32m4(packed_scale, vl);
+  vfloat32m4_t contribution =
+      __riscv_vfcvt_f_x_v_f32m4(integer_dot, vl);
+  contribution =
+      __riscv_vfmul_vf_f32m4(contribution, activation_scale, vl);
+  vfloat32m4_t result = __riscv_vle32_v_f32m4(accumulator, vl);
+  result = __riscv_vfmacc_vv_f32m4(
+      result, contribution, weight_scale, vl);
+  __riscv_vse32_v_f32m4(accumulator, result, vl);
 }
 
 )c";

@@ -168,7 +168,6 @@ Target lowering 决定：
 - scalar、unit-stride、strided、indexed 或 segment memory；
 - vector grouping；
 - mask realization；
-- DSL kernel 不可观察的 physical prefetch instruction/schedule；
 - local address strength reduction。
 
 若access或predicate位于VLA内的nested scalar control中，target仍按每个实体的pointer、

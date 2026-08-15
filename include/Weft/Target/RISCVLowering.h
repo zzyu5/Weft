@@ -21,6 +21,7 @@ struct RISCVBackendConfig {
   int64_t f16RowMicrotile = 0;
   int64_t f16KUnroll = 0;
   int64_t f16PipelineStages = 0;
+  int64_t reductionStatePlacement = 0;
   int64_t narrowLMUL = 0;
   int64_t sortRadixBits = 0;
 };

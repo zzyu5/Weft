@@ -74,7 +74,10 @@ bool weft::RISCVTargetProfile::hasMatrixExtension(
 
 bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8N16K32() const {
   return matrixExtension == RISCVMatrixExtension::SpacemitIME1 &&
-         littleEndian && xlen == 64 && supportsFixedRVV() && vlenBits == 256;
+         littleEndian && xlen == 64 && hasF && hasVectorF16 &&
+         hasWideningInteger && hasWideningFloat && supportsFixedRVV() &&
+         vlenBits == 256 && supportsVectorShape(8, 2) &&
+         supportsVectorShape(32, 32);
 }
 
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

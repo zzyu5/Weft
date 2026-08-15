@@ -76,7 +76,7 @@ Pointer 参数可以声明：
 - minimum alignment；
 - restrict-like ownership facts。
 
-这些 qualifier 是作者承诺。编译器可以用其进行 vector memory、hoist、physical prefetch 和
+这些 qualifier 是作者承诺。编译器可以用其进行 vector memory、hoist 和
 local fusion；运行时违反承诺属于调用方错误。External 是默认 storage class；persistent 与
 workspace 必须在 entry body 使用 `W.storage` 声明 shape，workspace 还必须声明 `W.noalias`。
 

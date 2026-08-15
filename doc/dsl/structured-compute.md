@@ -57,7 +57,7 @@ Target只在当前dot/matmul内部决定：
 
 - LMUL与register microtile；
 - multiple accumulators与K-unroll；
-- load schedule、prefetch与local pipeline；
+- load schedule与local pipeline；
 - RVV或矩阵extension realization；
 - 不越过primitive边界的短生命周期packing/temporary。
 

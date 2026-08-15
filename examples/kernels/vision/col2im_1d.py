@@ -66,7 +66,10 @@ def col2im_1d_f32_equivalent(
             accumulator = W.cast(output_step, W.f32) * W.f32(0.0)
             for kernel_step in W.range(0, kernel):
                 numerator = absolute_step - kernel_step
-                aligned = numerator % stride == W.index(0)
+                if stride == W.index(1):
+                    aligned = output_step >= W.index(0)
+                else:
+                    aligned = numerator % stride == W.index(0)
                 candidate_input = numerator / stride
                 valid = (
                     (candidate_input < input_steps)

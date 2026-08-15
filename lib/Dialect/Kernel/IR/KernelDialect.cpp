@@ -482,6 +482,28 @@ deriveExtentImpl(mlir::Value value, int64_t axis,
   if (auto select = mlir::dyn_cast<SelectOp>(definition))
     return deriveBroadcastExtent(select.getTrueValue(), select.getFalseValue(),
                                  axis, visited);
+  if (auto conditional = mlir::dyn_cast<IfOp>(definition)) {
+    auto result = mlir::dyn_cast<mlir::OpResult>(value);
+    if (!result)
+      return std::nullopt;
+    auto thenYield =
+        mlir::cast<YieldOp>(conditional.getThenRegion().front().getTerminator());
+    auto elseYield =
+        mlir::cast<YieldOp>(conditional.getElseRegion().front().getTerminator());
+    unsigned number = result.getResultNumber();
+    if (number >= thenYield.getNumOperands() ||
+        number >= elseYield.getNumOperands())
+      return std::nullopt;
+    llvm::DenseSet<mlir::Value> thenVisited = visited;
+    llvm::DenseSet<mlir::Value> elseVisited = visited;
+    auto thenExtent =
+        deriveExtentImpl(thenYield.getOperand(number), axis, thenVisited);
+    auto elseExtent =
+        deriveExtentImpl(elseYield.getOperand(number), axis, elseVisited);
+    if (!thenExtent || !elseExtent || !sameExtent(*thenExtent, *elseExtent))
+      return std::nullopt;
+    return thenExtent;
+  }
   if (auto loop = mlir::dyn_cast<ForOp>(definition)) {
     auto result = mlir::dyn_cast<mlir::OpResult>(value);
     if (result && result.getResultNumber() < loop.getInitArgs().size())

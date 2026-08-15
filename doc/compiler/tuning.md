@@ -1,8 +1,10 @@
 # 构建期选择
 
 Weft 不在 Kernel IR 中保存 measurement 或 winner。作者可以通过 `W.constexpr` 暴露算法级
-block size；target lowering 可以通过 backend config 暴露 LMUL、microtile、unroll、prefetch、
-packing 与 fragment 候选。
+block size；当前 target lowering 的 backend config 只暴露已经具有多个可生成实现的 VLA/dot/
+matmul LMUL、reduction state placement、row microtile、K-unroll、pipeline stage、narrow LMUL 与
+sort radix 候选。Extension fragment 由 target profile 在同一局部 primitive 内选择，不伪装成
+尚不存在的可调维度。
 
 构建系统可以重复执行：
 
