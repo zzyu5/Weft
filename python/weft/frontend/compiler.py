@@ -1398,14 +1398,25 @@ class FrontendCompiler:
         source_dtype = source.dtype
         scalar_pairs = {
             (u8, i8),
+            (i8, u8),
             (u16, i16),
+            (i16, u16),
             (u16, f16),
             (f16, u16),
             (f32, u32),
             (u32, f32),
         }
-        block_pairs = {(u8, i8), (u16, i16), (u16, f16)}
-        allowed = scalar_pairs if kind == "scalar" else block_pairs if kind == "block" else set()
+        byte_pairs = {(u8, i8), (i8, u8)}
+        block_pairs = byte_pairs | {(u16, i16), (i16, u16), (u16, f16)}
+        allowed = (
+            scalar_pairs
+            if kind == "scalar"
+            else block_pairs
+            if kind == "block"
+            else byte_pairs
+            if kind == "region"
+            else set()
+        )
         if (source_dtype, dtype) not in allowed:
             raise FrontendError(
                 f"W.bitcast has no {kind} realization for {source_dtype} to {dtype}",

@@ -95,15 +95,22 @@ bool isSupportedBitcastPair(ShapeKind kind, mlir::Type source,
                             mlir::Type target) {
   if (kind == ShapeKind::Scalar)
     return (source.isUnsignedInteger(8) && target.isSignedInteger(8)) ||
+           (source.isSignedInteger(8) && target.isUnsignedInteger(8)) ||
            (source.isUnsignedInteger(16) && target.isSignedInteger(16)) ||
+           (source.isSignedInteger(16) && target.isUnsignedInteger(16)) ||
            (source.isUnsignedInteger(16) && target.isF16()) ||
            (source.isF16() && target.isUnsignedInteger(16)) ||
            (source.isF32() && target.isUnsignedInteger(32)) ||
            (source.isUnsignedInteger(32) && target.isF32());
+  if (kind == ShapeKind::Region)
+    return (source.isUnsignedInteger(8) && target.isSignedInteger(8)) ||
+           (source.isSignedInteger(8) && target.isUnsignedInteger(8));
   if (kind != ShapeKind::Block)
     return false;
   return (source.isUnsignedInteger(8) && target.isSignedInteger(8)) ||
+         (source.isSignedInteger(8) && target.isUnsignedInteger(8)) ||
          (source.isUnsignedInteger(16) && target.isSignedInteger(16)) ||
+         (source.isSignedInteger(16) && target.isUnsignedInteger(16)) ||
          (source.isUnsignedInteger(16) && target.isF16());
 }
 

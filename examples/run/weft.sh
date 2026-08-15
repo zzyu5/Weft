@@ -751,13 +751,25 @@ case "${kernel}" in
     quant=1
     runtime_arguments=("$1" "$2" "$3")
     ;;
-  quantize_q8_0)
+  quantize_q8_0|quantize_q8_1|quantize_q8_K)
     if [[ $# -ne 0 ]]; then
-      echo "usage: ${usage_prefix} quantize_q8_0" >&2
+      echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
     fi
-    dsl=examples/kernels/quantization/q8_0.py
-    runtime=examples/repro/weft/quantization/q8_0_runtime.cpp
+    dsl=examples/kernels/quantization/q8.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/q8_runtime.cpp
+    case "${kernel}" in
+      quantize_q8_0)
+        runtime_compile_flags="-DWEFT_QUANTIZE_KIND=0 -DWEFT_QUANTIZE_ENTRY=quantize_q8_0"
+        ;;
+      quantize_q8_1)
+        runtime_compile_flags="-DWEFT_QUANTIZE_KIND=1 -DWEFT_QUANTIZE_ENTRY=quantize_q8_1"
+        ;;
+      quantize_q8_K)
+        runtime_compile_flags="-DWEFT_QUANTIZE_KIND=2 -DWEFT_QUANTIZE_ENTRY=quantize_q8_K"
+        ;;
+    esac
     ;;
   dequantize_iq4_nl)
     if [[ $# -ne 0 ]]; then

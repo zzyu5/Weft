@@ -351,6 +351,7 @@ enum class VLAStateValidityRealization {
 enum class VLAStateRealization {
   RVVAddReduction,
   RVVMaxReduction,
+  RVVI8AddReductionI32,
   RVVInclusiveAddScan,
   RVVSegmentedInclusiveAddScan,
   RVVArgMaxSummary,
@@ -2478,20 +2479,42 @@ private:
       llvm::SmallVector<unsigned> candidates;
       if (options.backend.narrowLMUL != 0)
         candidates.push_back(static_cast<unsigned>(options.backend.narrowLMUL));
-      else
-        candidates = {8, 4};
+      else {
+        candidates = {8, 4, 2, 1};
+        std::optional<int64_t> lower = integerConstantValue(op.getBegin());
+        std::optional<int64_t> upper = integerConstantValue(op.getEnd());
+        if (lower && upper && *upper > *lower) {
+          const uint64_t lanes = static_cast<uint64_t>(*upper - *lower);
+          llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
+            auto covers = [&](unsigned candidate) {
+              return static_cast<uint64_t>(options.target.vlenBits) * candidate >=
+                     lanes * 32;
+            };
+            bool lhsCovers = covers(lhs);
+            bool rhsCovers = covers(rhs);
+            if (lhsCovers != rhsCovers)
+              return lhsCovers;
+            return lhsCovers ? lhs < rhs : lhs > rhs;
+          });
+        }
+      }
       std::optional<unsigned> selected;
       for (unsigned candidate : candidates) {
-        if (candidate != 4 && candidate != 8)
+        if (candidate != 1 && candidate != 2 && candidate != 4 &&
+            candidate != 8)
           continue;
-        if (!options.target.supportsVectorShape(
-                32, static_cast<int>(candidate * 8)) ||
-            !options.target.supportsVectorShape(
-                16, static_cast<int>(candidate / 2 * 8)) ||
-            !options.target.supportsVectorShape(
-                8, static_cast<int>(candidate / 4 * 8)))
+        RVVVectorShape sourceShape = rvvShape(32, candidate);
+        std::optional<RVVVectorShape> intermediateShape =
+            rvvShapeForSameLanes(sourceShape, 16, options.target);
+        std::optional<RVVVectorShape> resultShape =
+            rvvShapeForSameLanes(sourceShape, 8, options.target);
+        if (!options.target.supportsVectorShape(sourceShape.sew,
+                                                sourceShape.lmulEighths) ||
+            !intermediateShape || !resultShape)
           continue;
-        unsigned narrowGroups = candidate + candidate / 2 + candidate / 4;
+        unsigned narrowGroups = rvvRegisterGroups(sourceShape) +
+                                rvvRegisterGroups(*intermediateShape) +
+                                rvvRegisterGroups(*resultShape);
         unsigned regionGroups = maxEntityF32Vectors * candidate;
         if (std::max(narrowGroups, regionGroups) + 1 <
             static_cast<unsigned>(options.target.vectorRegisters)) {
@@ -2504,23 +2527,31 @@ private:
         return mlir::failure();
       }
       unsigned sourceLMUL = *selected;
+      RVVVectorShape sourceShape = rvvShape(32, sourceLMUL);
       decision.narrows.push_back(VLANarrowDecision{narrow.getOperation()});
       narrowPhysical.try_emplace(
           narrow.getOperation(),
-          VLANarrowPhysicalConfig{rvvShape(32, sourceLMUL),
-                                  rvvShape(16, sourceLMUL / 2),
-                                  rvvShape(8, sourceLMUL / 4)});
+          VLANarrowPhysicalConfig{
+              sourceShape,
+              *rvvShapeForSameLanes(sourceShape, 16, options.target),
+              *rvvShapeForSameLanes(sourceShape, 8, options.target)});
     }
 
     for (mlir::Operation &nested : body.without_terminator()) {
       if (isDotOwned(&nested))
         continue;
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
+        bool f32Reduction =
+            elementType(reduce.getInput().getType()).isF32() &&
+            reduce.getResult().getType().isF32();
+        bool i8ToI32Reduction =
+            elementType(reduce.getInput().getType()).isSignedInteger(8) &&
+            reduce.getResult().getType().isSignedInteger(32);
         if (reduce.getAxis() != -1 ||
-            !elementType(reduce.getInput().getType()).isF32() ||
-            !reduce.getResult().getType().isF32() || !isTrue(reduce.getWhere())) {
+            (!f32Reduction && !i8ToI32Reduction) ||
+            !isTrue(reduce.getWhere())) {
           reduce.emitError(
-              "VLA reduction has no selected f32 all-active realization");
+              "VLA reduction has no selected all-active f32 or i8-to-i32 realization");
           return mlir::failure();
         }
         VLAStateDecision state;
@@ -2531,7 +2562,9 @@ private:
             mlir::isa<MaskedType>(reduce.getInput().getType());
         if (maskedInput)
           state.validity = VLAStateValidityRealization::ReductionIdentity;
-        if (reduce.getKind() == "add") {
+        if (i8ToI32Reduction && reduce.getKind() == "add") {
+          state.realization = VLAStateRealization::RVVI8AddReductionI32;
+        } else if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
         } else if (reduce.getKind() == "max") {
           state.realization = VLAStateRealization::RVVMaxReduction;
@@ -2892,6 +2925,11 @@ private:
                 std::max(transientStateGroups, candidate + 2);
           }
         } else if (state.realization ==
+                   VLAStateRealization::RVVI8AddReductionI32)
+          transientStateGroups =
+              std::max(transientStateGroups,
+                       std::max(1u, candidate / 4) + 1);
+        else if (state.realization ==
                    VLAStateRealization::RVVArgMaxSummary)
           transientStateGroups =
               std::max(transientStateGroups, candidate + 2);
@@ -3356,8 +3394,12 @@ private:
             "online softmax summary requires the selected f32m2 exp realization");
         return mlir::failure();
       }
+      unsigned stateInputSEW =
+          state.realization == VLAStateRealization::RVVI8AddReductionI32 ? 8
+                                                                         : 32;
       RVVVectorShape stateShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, 32, options.target)
+          rvvShapeForSameLanes(entity.vlaDataShape, stateInputSEW,
+                               options.target)
               .value_or(RVVVectorShape{});
       recordPhysicalValue(entity, state.operation->getOperand(0), stateShape);
       recordPhysicalHandoff(
@@ -5278,26 +5320,24 @@ private:
         findVLATemporaryDecision(op.getOperation());
     const PhysicalValueDecision *resultShape =
         findVLAValueDecision(op.getResult());
-    std::optional<unsigned> sourceLMUL =
-        handoff ? rvvIntegerLMUL(handoff->sourceShape) : std::nullopt;
-    std::optional<unsigned> intermediateLMUL =
-        intermediateShape ? rvvIntegerLMUL(intermediateShape->shape)
-                          : std::nullopt;
-    std::optional<unsigned> resultLMUL =
-        resultShape ? rvvIntegerLMUL(resultShape->shape) : std::nullopt;
+    std::string sourceSuffix =
+        handoff ? rvvShapeSuffix(handoff->sourceShape) : std::string{};
+    std::string intermediateSuffix =
+        intermediateShape ? rvvShapeSuffix(intermediateShape->shape)
+                          : std::string{};
+    std::string resultSuffix =
+        resultShape ? rvvShapeSuffix(resultShape->shape) : std::string{};
     if (!decision || input.kind != CValueKind::F32Vector || !handoff ||
-        handoff->kind != PhysicalHandoff::Convert || !sourceLMUL ||
-        !intermediateLMUL || !resultLMUL)
+        handoff->kind != PhysicalHandoff::Convert || sourceSuffix.empty() ||
+        intermediateSuffix.empty() || resultSuffix.empty())
       return op.emitError("VLA narrow projection is unavailable");
     std::string intermediate = fresh("narrow_i16");
     std::string result = fresh("narrow_i8");
-    line("vint16m" + std::to_string(*intermediateLMUL) + "_t " +
-         intermediate + " = __riscv_vfncvt_x_f_w_i16m" +
-         std::to_string(*intermediateLMUL) + "(" + input.spelling +
-         ", " + activeVL + ");");
-    line("vint8m" + std::to_string(*resultLMUL) + "_t " + result +
-         " = __riscv_vnclip_wx_i8m" +
-         std::to_string(*resultLMUL) + "(" + intermediate +
+    line("vint" + intermediateSuffix + "_t " + intermediate +
+         " = __riscv_vfncvt_x_f_w_i" + intermediateSuffix + "(" +
+         input.spelling + ", " + activeVL + ");");
+    line("vint" + resultSuffix + "_t " + result +
+         " = __riscv_vnclip_wx_i" + resultSuffix + "(" + intermediate +
          ", 0, __RISCV_VXRM_RNE, " + activeVL + ");");
     CValue value{op.getResult().getType(), CValueKind::I8Vector, result};
     if (mlir::failed(attachLogicalValidity(
@@ -5309,10 +5349,42 @@ private:
 
   mlir::LogicalResult emitBitcast(BitcastOp op) {
     CValue input = require(op.getInput());
-    if (input.kind != CValueKind::Scalar || input.spelling.empty())
-      return op.emitError("RVV bitcast lowering requires a scalar input");
     mlir::Type source = elementType(op.getInput().getType());
     mlir::Type target = elementType(op.getResult().getType());
+    if (inVLA &&
+        ((input.kind == CValueKind::I8Vector &&
+          target.isUnsignedInteger(8)) ||
+         (input.kind == CValueKind::U8Vector &&
+          target.isSignedInteger(8)))) {
+      const PhysicalValueDecision *sourceShape =
+          findVLAValueDecision(op.getInput());
+      const PhysicalValueDecision *resultShape =
+          findVLAValueDecision(op.getResult());
+      std::string shapeSuffix =
+          resultShape ? rvvShapeSuffix(resultShape->shape) : std::string{};
+      if (!sourceShape || !resultShape ||
+          sourceShape->shape != resultShape->shape || shapeSuffix.empty() ||
+          input.spelling.empty())
+        return op.emitError("RVV byte bitcast has no shared physical shape");
+      bool toUnsigned = target.isUnsignedInteger(8);
+      std::string name = fresh("reinterpret_i8");
+      std::string sourcePrefix = toUnsigned ? "i" : "u";
+      std::string resultPrefix = toUnsigned ? "u" : "i";
+      line("v" + std::string(toUnsigned ? "uint" : "int") + shapeSuffix +
+           "_t " + name + " = __riscv_vreinterpret_v_" + sourcePrefix +
+           shapeSuffix + "_" + resultPrefix + shapeSuffix + "(" +
+           input.spelling + ");");
+      CValue value{op.getResult().getType(),
+                   toUnsigned ? CValueKind::U8Vector : CValueKind::I8Vector,
+                   name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), value, {input})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(value);
+      return mlir::success();
+    }
+    if (input.kind != CValueKind::Scalar || input.spelling.empty())
+      return op.emitError("RVV bitcast lowering requires a scalar input");
     std::string helper;
     if (source.isUnsignedInteger(8) && target.isSignedInteger(8))
       helper = "__weft_bitcast_u8_i8";
@@ -5326,7 +5398,16 @@ private:
       helper = "__weft_bitcast_f32_u32";
     else if (source.isUnsignedInteger(32) && target.isF32())
       helper = "__weft_bitcast_u32_f32";
-    else
+    else if (source.isSignedInteger(8) && target.isUnsignedInteger(8)) {
+      values[op.getResult()] = scalarExpression(
+          op.getResult(), "((uint8_t)(" + input.spelling + "))", "bitcast");
+      return mlir::success();
+    } else if (source.isSignedInteger(16) &&
+               target.isUnsignedInteger(16)) {
+      values[op.getResult()] = scalarExpression(
+          op.getResult(), "((uint16_t)(" + input.spelling + "))", "bitcast");
+      return mlir::success();
+    } else
       return op.emitError("RISC-V scalar bitcast pair is unsupported");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar,
@@ -10788,6 +10869,32 @@ private:
                                        const VLAStateDecision &decision,
                                        const CValue &aggregate) {
     CValue input = require(op.getInput());
+    if (decision.realization ==
+        VLAStateRealization::RVVI8AddReductionI32) {
+      if (input.kind != CValueKind::I8Vector ||
+          aggregate.kind != CValueKind::Scalar ||
+          aggregate.type != op.getResult().getType() ||
+          aggregate.spelling.empty() || !input.logicalValidity.empty())
+        return op.emitError("RVV i8-to-i32 reduction projection is unavailable");
+      const PhysicalValueDecision *inputShape =
+          findVLAValueDecision(op.getInput());
+      std::string shapeSuffix =
+          inputShape ? rvvShapeSuffix(inputShape->shape) : std::string{};
+      if (!inputShape || inputShape->shape.sew != 8 || shapeSuffix.empty())
+        return op.emitError("RVV i8 reduction has no physical input shape");
+      std::string seed = fresh("i8_reduce_seed");
+      std::string partial = fresh("i8_reduce_partial");
+      std::string suffix = "i" + shapeSuffix;
+      line("vint16m1_t " + seed +
+           " = __riscv_vmv_v_x_i16m1(0, 1);");
+      line("vint16m1_t " + partial + " = __riscv_vwredsum_vs_" + suffix +
+           "_i16m1(" + input.spelling + ", " + seed + ", " + activeVL +
+           ");");
+      line(aggregate.spelling + " += (int32_t)__riscv_vmv_x_s_i16m1_i16(" +
+           partial + ");");
+      values[op.getResult()] = aggregate;
+      return mlir::success();
+    }
     if (input.kind != CValueKind::F32Vector || aggregate.spelling.empty())
       return op.emitError("RVV reduction projection is unavailable");
     mlir::FailureOr<std::string> projected = materializeVLAStateInput(
