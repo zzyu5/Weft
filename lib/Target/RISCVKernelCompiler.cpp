@@ -9167,6 +9167,12 @@ private:
         setResultShape(byteShape);
       else if (result.isIndex())
         setResultShape(sameLanes(16));
+      else if (result.isF32()) {
+        RVVVectorShape selectedShape = valueShape(select.getTrueValue());
+        if (!selectedShape)
+          selectedShape = valueShape(select.getFalseValue());
+        setResultShape(selectedShape);
+      }
       return decision;
     }
     return decision;
@@ -10064,7 +10070,8 @@ private:
     if (predicate.kind != BlockValueKind::Mask ||
         trueValue.kind != falseValue.kind ||
         (trueValue.kind != BlockValueKind::U8 &&
-         trueValue.kind != BlockValueKind::Index) ||
+         trueValue.kind != BlockValueKind::Index &&
+         trueValue.kind != BlockValueKind::F32) ||
         trueValue.vectorShape != selectedShape ||
         falseValue.vectorShape != selectedShape)
       return op.emitError(
@@ -10072,9 +10079,12 @@ private:
     std::string shapeSuffix = rvvShapeSuffix(selectedShape);
     if (shapeSuffix.empty())
       return op.emitError("block select has no RVV shape spelling");
-    std::string suffix = "u" + shapeSuffix;
+    const bool isFloat = trueValue.kind == BlockValueKind::F32;
+    std::string suffix = (isFloat ? "f" : "u") + shapeSuffix;
+    std::string vectorType =
+        (isFloat ? "vfloat" : "vuint") + shapeSuffix + "_t";
     std::string name = fresh("block_select");
-    line("vuint" + shapeSuffix + "_t " + name + " = __riscv_vmerge_vvm_" +
+    line(vectorType + " " + name + " = __riscv_vmerge_vvm_" +
          suffix + "(" + falseValue.spelling + ", " + trueValue.spelling +
          ", " + predicate.spelling + ", " + vl.str() + ");");
     BlockValue result{op.getResult().getType(), trueValue.kind, name};

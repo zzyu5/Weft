@@ -1242,3 +1242,165 @@ def dequantize_iq3_s(
                     W.f32(1.0) - W.f32(2.0) * W.cast(sign_bit, W.f32)
                 )
                 W.store(output_block + group * W.index(32) + member, value)
+
+
+@weft.kernel
+def dequantize_iq1_s(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(50)
+            output_block = output_row + block * W.index(256)
+            block_scale = W.load_f16_le(input_block)
+            for group in W.range(0, 8):
+                metadata = _load_u16_le(
+                    input_block + W.index(34) + group * W.index(2)
+                )
+                scale = block_scale * (
+                    W.f32(1.0)
+                    + W.f32(2.0)
+                    * W.cast((metadata >> W.u16(12)) & W.u16(7), W.f32)
+                )
+                delta = W.select(
+                    (metadata & W.u16(0x8000)) != W.u16(0),
+                    W.f32(-0.125),
+                    W.f32(0.125),
+                )
+                member = W.block(32)
+                field = member // W.index(8)
+                lane = member % W.index(8)
+                low_index = W.load(
+                    input_block
+                    + W.index(2)
+                    + group * W.index(4)
+                    + field,
+                    other=W.u8(0),
+                )
+                high0 = W.cast(metadata & W.u16(7), W.index) << W.index(8)
+                high1 = W.cast(
+                    (metadata >> W.u16(3)) & W.u16(7), W.index
+                ) << W.index(8)
+                high2 = W.cast(
+                    (metadata >> W.u16(6)) & W.u16(7), W.index
+                ) << W.index(8)
+                high3 = W.cast(
+                    (metadata >> W.u16(9)) & W.u16(7), W.index
+                ) << W.index(8)
+                zero_index = field - field
+                selected_high = W.select(
+                    field == W.index(0),
+                    zero_index | high0,
+                    W.select(
+                        field == W.index(1),
+                        zero_index | high1,
+                        W.select(
+                            field == W.index(2),
+                            zero_index | high2,
+                            zero_index | high3,
+                        ),
+                    ),
+                )
+                grid_index = W.cast(low_index, W.index) | selected_high
+                grid_offset = grid_index * W.index(8) + lane
+                grid = W.bitcast(
+                    W.load(grid_table + grid_offset, other=W.u8(0)), W.i8
+                )
+                value = scale * (W.cast(grid, W.f32) + delta)
+                W.store(output_block + group * W.index(32) + member, value)
+
+
+@weft.kernel
+def dequantize_iq1_m(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(56)
+            output_block = output_row + block * W.index(256)
+            scale0 = _load_u16_le(input_block + W.index(48))
+            scale1 = _load_u16_le(input_block + W.index(50))
+            scale2 = _load_u16_le(input_block + W.index(52))
+            scale3 = _load_u16_le(input_block + W.index(54))
+            scale_bits = (
+                (scale0 >> W.u16(12))
+                | ((scale1 >> W.u16(8)) & W.u16(0x00F0))
+                | ((scale2 >> W.u16(4)) & W.u16(0x0F00))
+                | (scale3 & W.u16(0xF000))
+            )
+            block_scale = W.cast(W.bitcast(scale_bits, W.f16), W.f32)
+            for group in W.range(0, 8):
+                local_scales = _load_u16_le(
+                    input_block
+                    + W.index(48)
+                    + (group // W.index(2)) * W.index(2)
+                )
+                scale_base_shift = W.cast(
+                    (group % W.index(2)) * W.index(6), W.u16
+                )
+                scale_low = block_scale * (
+                    W.f32(1.0)
+                    + W.f32(2.0)
+                    * W.cast(
+                        (local_scales >> scale_base_shift) & W.u16(7), W.f32
+                    )
+                )
+                scale_high = block_scale * (
+                    W.f32(1.0)
+                    + W.f32(2.0)
+                    * W.cast(
+                        (local_scales >> (scale_base_shift + W.u16(3)))
+                        & W.u16(7),
+                        W.f32,
+                    )
+                )
+                member = W.block(32)
+                field = member // W.index(8)
+                lane = member % W.index(8)
+                low_index = W.load(
+                    input_block + group * W.index(4) + field,
+                    other=W.u8(0),
+                )
+                high_byte = W.load(
+                    input_block
+                    + W.index(32)
+                    + group * W.index(2)
+                    + field // W.index(2),
+                    other=W.u8(0),
+                )
+                field_in_byte = field % W.index(2)
+                high_shift = W.cast(field_in_byte * W.index(4), W.u8)
+                high_index = W.cast(
+                    (high_byte >> high_shift) & W.u8(7), W.index
+                ) << W.index(8)
+                grid_index = W.cast(low_index, W.index) | high_index
+                grid_offset = grid_index * W.index(8) + lane
+                grid = W.bitcast(
+                    W.load(grid_table + grid_offset, other=W.u8(0)), W.i8
+                )
+                delta_shift = high_shift + W.u8(3)
+                delta_bit = (high_byte >> delta_shift) & W.u8(1)
+                delta = W.f32(0.125) - W.f32(0.25) * W.cast(
+                    delta_bit, W.f32
+                )
+                decoded = W.cast(grid, W.f32) + delta
+                low_value = scale_low * decoded
+                high_value = scale_high * decoded
+                value = W.select(field < W.index(2), low_value, high_value)
+                W.store(output_block + group * W.index(32) + member, value)
