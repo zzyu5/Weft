@@ -10294,7 +10294,10 @@ private:
       for (mlir::Operation *between = op->getNextNode();
            between && between != candidateOperation;
            between = between->getNextNode())
-        if (!mlir::isMemoryEffectFree(between)) {
+        if (!llvm::any_of(stores, [&](StoreOp selected) {
+              return selected.getOperation() == between;
+            }) &&
+            !mlir::isMemoryEffectFree(between)) {
           interveningEffect = true;
           break;
         }

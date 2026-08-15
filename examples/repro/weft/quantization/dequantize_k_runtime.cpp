@@ -7,12 +7,29 @@
 #include <cstring>
 #include <vector>
 
+#ifndef WEFT_K_DEQUANT_KIND
+#error "WEFT_K_DEQUANT_KIND is required"
+#endif
+
+#ifndef WEFT_K_DEQUANT_ENTRY
+#error "WEFT_K_DEQUANT_ENTRY is required"
+#endif
+
+#define WEFT_STRINGIFY_INNER(value) #value
+#define WEFT_STRINGIFY(value) WEFT_STRINGIFY_INNER(value)
+
 namespace {
 
 constexpr std::size_t kRows = 1024;
 constexpr std::size_t kColumns = 4096;
 constexpr std::size_t kBlockSize = 256;
+#if WEFT_K_DEQUANT_KIND == 2
+constexpr std::size_t kBlockBytes = 84;
+#elif WEFT_K_DEQUANT_KIND == 6
+constexpr std::size_t kBlockBytes = 210;
+#else
 constexpr std::size_t kBlockBytes = 144;
+#endif
 constexpr std::size_t kBlocksPerRow = kColumns / kBlockSize;
 constexpr std::size_t kInputStride = kBlocksPerRow * kBlockBytes;
 constexpr std::size_t kElements = kRows * kColumns;
@@ -54,6 +71,77 @@ int main() {
     for (std::size_t block = 0; block < kBlocksPerRow; ++block) {
       const std::size_t inputBase = row * kInputStride + block * kBlockBytes;
       const std::size_t outputBase = row * kColumns + block * kBlockSize;
+#if WEFT_K_DEQUANT_KIND == 2
+      const float d =
+          static_cast<float>(1 + ((row * 7 + block * 3) % 15)) / 64.0F;
+      const float dmin =
+          static_cast<float>(1 + ((row * 5 + block * 11) % 7)) / 32.0F;
+      storeF16(packed, inputBase + 80, d);
+      storeF16(packed, inputBase + 82, dmin);
+      for (std::size_t half = 0; half < 2; ++half) {
+        for (std::size_t field = 0; field < 4; ++field) {
+          for (std::size_t laneGroup = 0; laneGroup < 2; ++laneGroup) {
+            const std::size_t metadataIndex =
+                half * 8 + field * 2 + laneGroup;
+            const std::uint8_t scale = static_cast<std::uint8_t>(
+                1 + ((row * 3 + block * 5 + metadataIndex * 7) % 15));
+            const std::uint8_t minimum = static_cast<std::uint8_t>(
+                1 + ((row * 11 + block * 13 + metadataIndex * 5) % 15));
+            packed[inputBase + metadataIndex] =
+                static_cast<std::uint8_t>(scale | (minimum << 4));
+            for (std::size_t member = 0; member < 16; ++member) {
+              const std::uint8_t code = static_cast<std::uint8_t>(
+                  (row * 3 + block * 5 + half * 7 + field * 11 +
+                   laneGroup * 13 + member) &
+                  3U);
+              packed[inputBase + 16 + half * 32 + laneGroup * 16 + member] |=
+                  static_cast<std::uint8_t>(code << (2 * field));
+              reference[outputBase + half * 128 + field * 32 +
+                        laneGroup * 16 + member] =
+                  d * scale * code - dmin * minimum;
+            }
+          }
+        }
+      }
+#elif WEFT_K_DEQUANT_KIND == 6
+      const float d =
+          static_cast<float>(1 + ((row * 7 + block * 3) % 15)) / 128.0F;
+      storeF16(packed, inputBase + 208, d);
+      std::int8_t scales[16];
+      for (std::size_t index = 0; index < 16; ++index) {
+        scales[index] = static_cast<std::int8_t>(
+            static_cast<int>((row * 5 + block * 7 + index * 11) % 31) - 15);
+        packed[inputBase + 192 + index] =
+            static_cast<std::uint8_t>(scales[index]);
+      }
+      for (std::size_t half = 0; half < 2; ++half) {
+        for (std::size_t member = 0; member < 32; ++member) {
+          std::uint8_t codes[4];
+          for (std::size_t field = 0; field < 4; ++field)
+            codes[field] = static_cast<std::uint8_t>(
+                (row * 3 + block * 5 + half * 7 + member * 11 + field * 13) &
+                63U);
+          packed[inputBase + half * 64 + member] = static_cast<std::uint8_t>(
+              (codes[0] & 15U) | ((codes[2] & 15U) << 4));
+          packed[inputBase + half * 64 + 32 + member] =
+              static_cast<std::uint8_t>((codes[1] & 15U) |
+                                        ((codes[3] & 15U) << 4));
+          packed[inputBase + 128 + half * 32 + member] =
+              static_cast<std::uint8_t>((codes[0] >> 4) |
+                                        ((codes[1] >> 4) << 2) |
+                                        ((codes[2] >> 4) << 4) |
+                                        ((codes[3] >> 4) << 6));
+          const std::size_t scaleLane = member / 16;
+          for (std::size_t field = 0; field < 4; ++field) {
+            const std::size_t scaleIndex =
+                half * 8 + scaleLane + field * 2;
+            reference[outputBase + half * 128 + field * 32 + member] =
+                d * scales[scaleIndex] *
+                static_cast<float>(static_cast<int>(codes[field]) - 32);
+          }
+        }
+      }
+#else
       const float d =
           static_cast<float>(1 + ((row * 7 + block * 3) % 15)) / 64.0F;
       const float dmin =
@@ -100,12 +188,13 @@ int main() {
               d * scales[highGroup] * high - dmin * minima[highGroup];
         }
       }
+#endif
     }
   }
 
   auto invoke = [&]() {
-    dequantize_q4_K(packed.data(), output.data(), kRows, kBlocksPerRow,
-                    kInputStride, kColumns);
+    WEFT_K_DEQUANT_ENTRY(packed.data(), output.data(), kRows, kBlocksPerRow,
+                         kInputStride, kColumns);
   };
   invoke();
 
@@ -120,9 +209,8 @@ int main() {
     maxRelativeError = std::max(maxRelativeError, relative);
   }
   if (maxAbsoluteError != 0.0) {
-    std::fprintf(stderr,
-                 "dequantize_q4_K mismatch: max_absolute_error=%.9g\n",
-                 maxAbsoluteError);
+    std::fprintf(stderr, "%s mismatch: max_absolute_error=%.9g\n",
+                 WEFT_STRINGIFY(WEFT_K_DEQUANT_ENTRY), maxAbsoluteError);
     return 1;
   }
 
@@ -139,7 +227,7 @@ int main() {
   }
 
   const double milliseconds = median(samples);
-  std::printf("kernel=dequantize_q4_K\n");
+  std::printf("kernel=%s\n", WEFT_STRINGIFY(WEFT_K_DEQUANT_ENTRY));
   std::printf("model_shape=N=1024;K=4096\n");
   std::printf("elements=%zu\n", kElements);
   std::printf("max_absolute_error=%.9g\n", maxAbsoluteError);

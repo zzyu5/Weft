@@ -266,6 +266,176 @@ def dequantize_q4_K(
 
 
 @weft.kernel
+def dequantize_q2_K(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(84)
+            output_block = output_row + block * W.index(256)
+            block_scale = W.load_f16_le(input_block + W.index(80))
+            block_minimum = W.load_f16_le(input_block + W.index(82))
+            for half in W.range(0, 2):
+                for field in W.range(0, 4):
+                    shift = W.cast(field * W.index(2), W.u8)
+                    for lane_group in W.range(0, 2):
+                        metadata_index = (
+                            half * W.index(8)
+                            + field * W.index(2)
+                            + lane_group
+                        )
+                        metadata = W.load(
+                            input_block + metadata_index, other=W.u8(0)
+                        )
+                        scale = block_scale * W.cast(
+                            metadata & W.u8(15), W.f32
+                        )
+                        minimum = block_minimum * W.cast(
+                            metadata >> W.u8(4), W.f32
+                        )
+                        member = W.block(16)
+                        packed_codes = W.load(
+                            input_block
+                            + W.index(16)
+                            + half * W.index(32)
+                            + lane_group * W.index(16)
+                            + member,
+                            other=W.u8(0),
+                        )
+                        code = (packed_codes >> shift) & W.u8(3)
+                        value = scale * W.cast(code, W.f32) - minimum
+                        W.store(
+                            output_block
+                            + half * W.index(128)
+                            + field * W.index(32)
+                            + lane_group * W.index(16)
+                            + member,
+                            value,
+                        )
+
+
+@weft.kernel
+def dequantize_q6_K(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(210)
+            output_block = output_row + block * W.index(256)
+            block_scale = W.load_f16_le(input_block + W.index(208))
+            for half in W.range(0, 2):
+                member = W.block(32)
+                low_a = W.load(
+                    input_block + half * W.index(64) + member,
+                    other=W.u8(0),
+                )
+                low_b = W.load(
+                    input_block
+                    + half * W.index(64)
+                    + W.index(32)
+                    + member,
+                    other=W.u8(0),
+                )
+                high = W.load(
+                    input_block
+                    + W.index(128)
+                    + half * W.index(32)
+                    + member,
+                    other=W.u8(0),
+                )
+                scale_index = member // W.index(16)
+                scale_base = input_block + W.index(192) + half * W.index(8)
+
+                scale_1 = W.cast(
+                    W.bitcast(
+                        W.load(scale_base + scale_index, other=W.u8(0)), W.i8
+                    ),
+                    W.f32,
+                )
+                scale_2 = W.cast(
+                    W.bitcast(
+                        W.load(
+                            scale_base + W.index(2) + scale_index,
+                            other=W.u8(0),
+                        ),
+                        W.i8,
+                    ),
+                    W.f32,
+                )
+                scale_3 = W.cast(
+                    W.bitcast(
+                        W.load(
+                            scale_base + W.index(4) + scale_index,
+                            other=W.u8(0),
+                        ),
+                        W.i8,
+                    ),
+                    W.f32,
+                )
+                scale_4 = W.cast(
+                    W.bitcast(
+                        W.load(
+                            scale_base + W.index(6) + scale_index,
+                            other=W.u8(0),
+                        ),
+                        W.i8,
+                    ),
+                    W.f32,
+                )
+                code_1 = W.cast(
+                    (low_a & W.u8(15))
+                    | (((high >> W.u8(0)) & W.u8(3)) << W.u8(4)),
+                    W.f32,
+                ) - W.f32(32.0)
+                code_2 = W.cast(
+                    (low_b & W.u8(15))
+                    | (((high >> W.u8(2)) & W.u8(3)) << W.u8(4)),
+                    W.f32,
+                ) - W.f32(32.0)
+                code_3 = W.cast(
+                    (low_a >> W.u8(4))
+                    | (((high >> W.u8(4)) & W.u8(3)) << W.u8(4)),
+                    W.f32,
+                ) - W.f32(32.0)
+                code_4 = W.cast(
+                    (low_b >> W.u8(4))
+                    | (((high >> W.u8(6)) & W.u8(3)) << W.u8(4)),
+                    W.f32,
+                ) - W.f32(32.0)
+                output_half = output_block + half * W.index(128)
+                W.store(
+                    output_half + member,
+                    block_scale * scale_1 * code_1,
+                )
+                W.store(
+                    output_half + W.index(32) + member,
+                    block_scale * scale_2 * code_2,
+                )
+                W.store(
+                    output_half + W.index(64) + member,
+                    block_scale * scale_3 * code_3,
+                )
+                W.store(
+                    output_half + W.index(96) + member,
+                    block_scale * scale_4 * code_4,
+                )
+
+
+@weft.kernel
 def dequantize_iq4_xs(
     packed: W.ptr[W.u8, W.readonly, W.noalias],
     codebook: W.ptr[W.u8, W.readonly, W.noalias],
