@@ -742,6 +742,15 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/mxfp4.py
     runtime=examples/repro/weft/quantization/mxfp4_runtime.cpp
     ;;
+  nvfp4_q8_0)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} nvfp4_q8_0" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/mxfp4.py
+    dsl_entry=nvfp4_q8_0
+    runtime=examples/repro/weft/quantization/nvfp4_runtime.cpp
+    ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
       echo "usage: ${usage_prefix} q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
