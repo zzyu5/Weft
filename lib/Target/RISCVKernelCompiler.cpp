@@ -584,6 +584,7 @@ struct VLACandidateFacts {
   bool hasCoordinateSummary = false;
   bool hasOnlineSummary = false;
   bool requiresF32M2Math = false;
+  bool hasF32Division = false;
   bool hasIndexVector = false;
 };
 
@@ -2665,6 +2666,13 @@ private:
     VLACandidateFacts candidateFacts;
     candidateFacts.maxEntityF32Vectors = maxEntityF32Vectors;
     candidateFacts.requiresF32M2Math = requiresF32M2Math;
+    candidateFacts.hasF32Division = llvm::any_of(
+        physicalOperations, [](mlir::Operation *operation) {
+          auto binary = mlir::dyn_cast<BinaryOp>(operation);
+          return binary && binary.getKind() == "div" &&
+                 isRegionValue(binary.getResult().getType()) &&
+                 elementType(binary.getResult().getType()).isF32();
+        });
     candidateFacts.hasIndexVector =
         !decision.indexBinaries.empty() || !decision.indexSelects.empty() ||
         llvm::any_of(lifetimeSnapshots,
@@ -2781,11 +2789,12 @@ private:
       candidates = {*requiredLMUL};
     } else {
       constexpr unsigned base128[] = {4, 2, 8, 1};
-      constexpr unsigned base256[] = {2, 4, 1, 8};
+      constexpr unsigned base256[] = {4, 2, 1, 8};
       constexpr unsigned f16OrCast[] = {8, 4, 2, 1};
       constexpr unsigned scan[] = {1, 2, 4, 8};
       constexpr unsigned coordinateSummary[] = {4, 2, 1, 8};
       constexpr unsigned reduction[] = {8, 4, 2, 1};
+      constexpr unsigned division[] = {2, 1, 4, 8};
       constexpr unsigned strided[] = {2, 4, 1, 8};
       llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
         auto score = [&](unsigned candidate) {
@@ -2801,6 +2810,8 @@ private:
             value += 8 * preferenceRank(candidate, coordinateSummary);
           if (candidateFacts.hasReductionState)
             value += 8 * preferenceRank(candidate, reduction);
+          if (candidateFacts.hasF32Division)
+            value += 8 * preferenceRank(candidate, division);
           for (unsigned access = 0; access < candidateFacts.stridedAccesses;
                ++access)
             value += 8 * preferenceRank(candidate, strided);
@@ -3773,6 +3784,14 @@ private:
         results.push_back(std::move(value));
         continue;
       }
+      if (auto pointer = mlir::dyn_cast<PtrType>(result.getType())) {
+        CValue value{result.getType(), CValueKind::Pointer,
+                     result.use_empty() ? std::string{} : fresh("if_pointer")};
+        if (!value.spelling.empty())
+          line(pointerCType(pointer) + " " + value.spelling + ";");
+        results.push_back(std::move(value));
+        continue;
+      }
       if (inVLA && isRegionValue(result.getType()) &&
           elementType(result.getType()).isF32()) {
         std::optional<unsigned> lmul = physicalValueLMUL(result);
@@ -3826,10 +3845,11 @@ private:
         if (destination.spelling.empty())
           continue;
         CValue value = require(yielded);
-        if (destination.kind == CValueKind::Scalar) {
-          if (value.kind != CValueKind::Scalar || value.spelling.empty()) {
+        if (destination.kind == CValueKind::Scalar ||
+            destination.kind == CValueKind::Pointer) {
+          if (value.kind != destination.kind || value.spelling.empty()) {
             yield.emitError(
-                "RISC-V conditional yielded an unavailable scalar value");
+                "RISC-V conditional yielded an unavailable scalar or pointer value");
             return mlir::failure();
           }
           line(destination.spelling + " = " + value.spelling + ";");

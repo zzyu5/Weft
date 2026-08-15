@@ -18,7 +18,7 @@ case "${profile}" in
     target_vlen_bits=128
     matrix_extension=none
     remote_host=rvv
-    remote_cpu=8
+    remote_cpu=48
     remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
     remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
     remote_compile_flags=
@@ -83,19 +83,53 @@ k_quant_kind=0
 multi=0
 multi_primary=
 multi_equivalent=
+dsl_entry=
+runtime_compile_flags=
 runtime_arguments=()
 backend_arguments=()
 if [[ -n ${WEFT_BACKEND_CONFIG:-} ]]; then
   read -r -a backend_arguments <<< "${WEFT_BACKEND_CONFIG}"
 fi
 case "${kernel}" in
-  add_bias)
+  add|sub|mul|div|scale)
     if [[ $# -ne 0 ]]; then
-      echo "usage: ${usage_prefix} add_bias" >&2
+      echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
     fi
-    dsl=examples/kernels/elementwise/add_bias.py
-    runtime=examples/repro/weft/elementwise/add_bias_runtime.cpp
+    dsl=examples/kernels/elementwise/binary.py
+    runtime=examples/repro/weft/forward/forward_runtime.cpp
+    case "${kernel}" in
+      add)
+        dsl_entry=add_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=0 -DWEFT_FORWARD_ENTRY=add_f32"
+        ;;
+      sub)
+        dsl_entry=sub_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=1 -DWEFT_FORWARD_ENTRY=sub_f32"
+        ;;
+      mul)
+        dsl_entry=mul_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=2 -DWEFT_FORWARD_ENTRY=mul_f32"
+        ;;
+      div)
+        dsl_entry=div_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=3 -DWEFT_FORWARD_ENTRY=div_f32"
+        ;;
+      scale)
+        dsl_entry=scale_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=4 -DWEFT_FORWARD_ENTRY=scale_f32"
+        ;;
+    esac
+    ;;
+  gelu)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} gelu" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/pointwise/gelu.py
+    dsl_entry=gelu_f32
+    runtime=examples/repro/weft/forward/forward_runtime.cpp
+    runtime_compile_flags="-DWEFT_FORWARD_KIND=5 -DWEFT_FORWARD_ENTRY=gelu_f32"
     ;;
   silu)
     if [[ $# -ne 0 ]]; then
@@ -139,6 +173,42 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/normalization/layer_norm.py
     runtime=examples/repro/weft/normalization/layer_norm_runtime.cpp
+    ;;
+  sum_rows)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} sum_rows" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/sum_rows.py
+    dsl_entry=sum_rows_f32
+    runtime=examples/repro/weft/forward/forward_runtime.cpp
+    runtime_compile_flags="-DWEFT_FORWARD_KIND=6 -DWEFT_FORWARD_ENTRY=sum_rows_f32"
+    ;;
+  cpy|repeat|concat|concat_dim0)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/permutation/layout.py
+    runtime=examples/repro/weft/forward/forward_runtime.cpp
+    case "${kernel}" in
+      cpy)
+        dsl_entry=copy_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=7 -DWEFT_FORWARD_ENTRY=copy_f32"
+        ;;
+      repeat)
+        dsl_entry=repeat_rows_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=8 -DWEFT_FORWARD_ENTRY=repeat_rows_f32"
+        ;;
+      concat)
+        dsl_entry=concat_rows_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=9 -DWEFT_FORWARD_ENTRY=concat_rows_f32"
+        ;;
+      concat_dim0)
+        dsl_entry=concat_columns_f32
+        runtime_compile_flags="-DWEFT_FORWARD_KIND=10 -DWEFT_FORWARD_ENTRY=concat_columns_f32"
+        ;;
+    esac
     ;;
   cross_entropy)
     if [[ $# -ne 0 ]]; then
@@ -776,6 +846,13 @@ else
         "${backend_arguments[@]}" \
         --header="${local_root}/kernel_equivalent.h" \
         -o "${local_root}/kernel_equivalent.c"
+  elif [[ -n ${dsl_entry} ]]; then
+    PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
+      --kernel "${dsl_entry}" |
+      "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
+        --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
+        "${backend_arguments[@]}" --header="${local_root}/kernel.h" \
+        -o "${local_root}/kernel.c"
   else
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
@@ -851,7 +928,7 @@ tar -C "${local_root}" -cf - . |
       else
         ar rcs libweft_kernel.a kernel.o
       fi
-      \"\${cxx}\" -O3 ${remote_compile_flags} -std=c++17 -Wall -Wextra -Werror \
+      \"\${cxx}\" -O3 ${remote_compile_flags} ${runtime_compile_flags} -std=c++17 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d ${runtime_header_flags} \
         -c runtime.cpp -o runtime.o
       \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
