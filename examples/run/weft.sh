@@ -850,6 +850,26 @@ case "${kernel}" in
     dsl_entry=dequantize_iq4_xs
     runtime=examples/repro/weft/quantization/dequantize_iq4_xs_runtime.cpp
     ;;
+  dequantize_iq2_xxs|dequantize_iq2_xs|dequantize_iq2_s)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/dequantize.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/dequantize_iq2_runtime.cpp
+    case "${kernel}" in
+      dequantize_iq2_xxs)
+        runtime_compile_flags="-DWEFT_IQ2_DEQUANT_KIND=0 -DWEFT_IQ2_DEQUANT_ENTRY=dequantize_iq2_xxs"
+        ;;
+      dequantize_iq2_xs)
+        runtime_compile_flags="-DWEFT_IQ2_DEQUANT_KIND=1 -DWEFT_IQ2_DEQUANT_ENTRY=dequantize_iq2_xs"
+        ;;
+      dequantize_iq2_s)
+        runtime_compile_flags="-DWEFT_IQ2_DEQUANT_KIND=2 -DWEFT_IQ2_DEQUANT_ENTRY=dequantize_iq2_s"
+        ;;
+    esac
+    ;;
   dequantize_mxfp4|dequantize_nvfp4)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} ${kernel}" >&2

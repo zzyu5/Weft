@@ -9065,7 +9065,7 @@ private:
       if (!sourceShape && source.isIndex())
         sourceShape = sameLanes(16);
       unsigned targetSEW = target.isUnsignedInteger(8) ? 8
-                           : target.isUnsignedInteger(16) ||
+                           : target.isIndex() || target.isUnsignedInteger(16) ||
                                    target.isSignedInteger(16)
                                ? 16
                            : target.isSignedInteger(32) || target.isF32() ? 32
@@ -9165,6 +9165,8 @@ private:
       mlir::Type result = elementType(select.getResult().getType());
       if (result.isUnsignedInteger(8))
         setResultShape(byteShape);
+      else if (result.isIndex())
+        setResultShape(sameLanes(16));
       return decision;
     }
     return decision;
@@ -9712,6 +9714,13 @@ private:
       line("vuint" + shapeSuffix + "_t " + name +
            " = __riscv_vncvt_x_x_w_u" + shapeSuffix + "(" + input.spelling +
            ", " + vl.str() + ");");
+    } else if (input.kind == BlockValueKind::U8 && target.isIndex()) {
+      if (shape.sew != 16 || input.spelling.empty())
+        return op.emitError("u8 to logical index cast has no selected vectors");
+      kind = BlockValueKind::Index;
+      line("vuint" + shapeSuffix + "_t " + name +
+           " = __riscv_vzext_vf2_u" + shapeSuffix + "(" + input.spelling +
+           ", " + vl.str() + ");");
     } else if (input.kind == BlockValueKind::U8 &&
                target.isUnsignedInteger(16)) {
       if (shape.sew != 16 || input.spelling.empty())
@@ -10053,11 +10062,13 @@ private:
     BlockValue trueValue = lookupBlockValue(op.getTrueValue(), blockValues);
     BlockValue falseValue = lookupBlockValue(op.getFalseValue(), blockValues);
     if (predicate.kind != BlockValueKind::Mask ||
-        trueValue.kind != BlockValueKind::U8 ||
-        falseValue.kind != BlockValueKind::U8 ||
+        trueValue.kind != falseValue.kind ||
+        (trueValue.kind != BlockValueKind::U8 &&
+         trueValue.kind != BlockValueKind::Index) ||
         trueValue.vectorShape != selectedShape ||
         falseValue.vectorShape != selectedShape)
-      return op.emitError("RVV block select currently requires mask and u8 values");
+      return op.emitError(
+          "RVV block select requires a mask and equal unsigned vector values");
     std::string shapeSuffix = rvvShapeSuffix(selectedShape);
     if (shapeSuffix.empty())
       return op.emitError("block select has no RVV shape spelling");
@@ -10066,7 +10077,7 @@ private:
     line("vuint" + shapeSuffix + "_t " + name + " = __riscv_vmerge_vvm_" +
          suffix + "(" + falseValue.spelling + ", " + trueValue.spelling +
          ", " + predicate.spelling + ", " + vl.str() + ");");
-    BlockValue result{op.getResult().getType(), BlockValueKind::U8, name};
+    BlockValue result{op.getResult().getType(), trueValue.kind, name};
     result.vectorShape = selectedShape;
     blockValues[op.getResult()] = std::move(result);
     return mlir::success();

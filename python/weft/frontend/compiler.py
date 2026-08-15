@@ -1445,6 +1445,7 @@ class FrontendCompiler:
         elif kind == "block":
             allowed = {
                 (index, u8),
+                (u8, index),
                 (u8, u16),
                 (u8, i32),
                 (u8, f32),

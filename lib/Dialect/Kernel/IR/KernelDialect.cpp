@@ -81,6 +81,7 @@ bool isSupportedCastPair(ShapeKind kind, mlir::Type source,
   if (kind != ShapeKind::Block)
     return false;
   return (source.isIndex() && target.isUnsignedInteger(8)) ||
+         (source.isUnsignedInteger(8) && target.isIndex()) ||
          (source.isUnsignedInteger(8) && target.isUnsignedInteger(16)) ||
          (source.isUnsignedInteger(8) && target.isSignedInteger(32)) ||
          (source.isUnsignedInteger(8) && target.isF32()) ||
