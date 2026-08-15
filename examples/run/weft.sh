@@ -812,7 +812,7 @@ case "${kernel}" in
     dsl_entry=dequantize_iq4_nl
     runtime=examples/repro/weft/quantization/iq4_nl_runtime.cpp
     ;;
-  dequantize_q2_K|dequantize_q4_K|dequantize_q6_K)
+  dequantize_q2_K|dequantize_q3_K|dequantize_q4_K|dequantize_q5_K|dequantize_q6_K)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
@@ -826,6 +826,12 @@ case "${kernel}" in
         ;;
       dequantize_q4_K)
         runtime_compile_flags="-DWEFT_K_DEQUANT_KIND=4 -DWEFT_K_DEQUANT_ENTRY=dequantize_q4_K"
+        ;;
+      dequantize_q3_K)
+        runtime_compile_flags="-DWEFT_K_DEQUANT_KIND=3 -DWEFT_K_DEQUANT_ENTRY=dequantize_q3_K"
+        ;;
+      dequantize_q5_K)
+        runtime_compile_flags="-DWEFT_K_DEQUANT_KIND=5 -DWEFT_K_DEQUANT_ENTRY=dequantize_q5_K"
         ;;
       dequantize_q6_K)
         runtime_compile_flags="-DWEFT_K_DEQUANT_KIND=6 -DWEFT_K_DEQUANT_ENTRY=dequantize_q6_K"

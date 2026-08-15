@@ -25,6 +25,10 @@ constexpr std::size_t kColumns = 4096;
 constexpr std::size_t kBlockSize = 256;
 #if WEFT_K_DEQUANT_KIND == 2
 constexpr std::size_t kBlockBytes = 84;
+#elif WEFT_K_DEQUANT_KIND == 3
+constexpr std::size_t kBlockBytes = 110;
+#elif WEFT_K_DEQUANT_KIND == 5
+constexpr std::size_t kBlockBytes = 176;
 #elif WEFT_K_DEQUANT_KIND == 6
 constexpr std::size_t kBlockBytes = 210;
 #else
@@ -103,6 +107,50 @@ int main() {
           }
         }
       }
+#elif WEFT_K_DEQUANT_KIND == 3
+      const float d =
+          static_cast<float>(1 + ((row * 7 + block * 3) % 15)) / 128.0F;
+      storeF16(packed, inputBase + 108, d);
+      std::uint8_t scales[16];
+      for (std::size_t index = 0; index < 16; ++index)
+        scales[index] = static_cast<std::uint8_t>(
+            (row * 3 + block * 5 + index * 7) & 63U);
+      for (std::size_t index = 0; index < 16; ++index) {
+        const std::size_t quarter = index / 4;
+        const std::size_t lane = index % 4;
+        const std::size_t base = inputBase + 96 + (quarter % 2) * 4 + lane;
+        if (quarter < 2)
+          packed[base] |= scales[index] & 15U;
+        else
+          packed[base] |= static_cast<std::uint8_t>((scales[index] & 15U) << 4);
+        packed[inputBase + 104 + lane] |= static_cast<std::uint8_t>(
+            (scales[index] >> 4) << (2 * quarter));
+      }
+      for (std::size_t half = 0; half < 2; ++half) {
+        for (std::size_t field = 0; field < 4; ++field) {
+          for (std::size_t laneGroup = 0; laneGroup < 2; ++laneGroup) {
+            const std::size_t scaleIndex =
+                half * 8 + field * 2 + laneGroup;
+            for (std::size_t member = 0; member < 16; ++member) {
+              const std::int8_t code = static_cast<std::int8_t>(
+                  static_cast<int>((row * 3 + block * 5 + half * 7 +
+                                    field * 11 + laneGroup * 13 + member) %
+                                   8) -
+                  4);
+              const std::uint8_t low = static_cast<std::uint8_t>(
+                  code < 0 ? code + 4 : code);
+              packed[inputBase + 32 + half * 32 + laneGroup * 16 + member] |=
+                  static_cast<std::uint8_t>(low << (2 * field));
+              if (code >= 0)
+                packed[inputBase + laneGroup * 16 + member] |=
+                    static_cast<std::uint8_t>(1U << (half * 4 + field));
+              reference[outputBase + half * 128 + field * 32 +
+                        laneGroup * 16 + member] =
+                  d * (static_cast<int>(scales[scaleIndex]) - 32) * code;
+            }
+          }
+        }
+      }
 #elif WEFT_K_DEQUANT_KIND == 6
       const float d =
           static_cast<float>(1 + ((row * 7 + block * 3) % 15)) / 128.0F;
@@ -177,11 +225,26 @@ int main() {
         const std::size_t highGroup = lowGroup + 1;
         for (std::size_t member = 0; member < 32; ++member) {
           const std::uint8_t low = static_cast<std::uint8_t>(
-              (row * 3 + block * 5 + pair * 7 + member * 11) & 15U);
+              (row * 3 + block * 5 + pair * 7 + member * 11) &
+#if WEFT_K_DEQUANT_KIND == 5
+              31U);
+#else
+              15U);
+#endif
           const std::uint8_t high = static_cast<std::uint8_t>(
-              (row * 13 + block * 3 + pair * 5 + member * 7 + 1) & 15U);
+              (row * 13 + block * 3 + pair * 5 + member * 7 + 1) &
+#if WEFT_K_DEQUANT_KIND == 5
+              31U);
+          packed[inputBase + 16 + member] |= static_cast<std::uint8_t>(
+              ((low >> 4) << (2 * pair)) |
+              ((high >> 4) << (2 * pair + 1)));
+          packed[inputBase + 48 + pair * 32 + member] =
+              static_cast<std::uint8_t>((low & 15U) | ((high & 15U) << 4));
+#else
+              15U);
           packed[inputBase + 16 + pair * 32 + member] =
               static_cast<std::uint8_t>(low | (high << 4));
+#endif
           reference[outputBase + lowGroup * 32 + member] =
               d * scales[lowGroup] * low - dmin * minima[lowGroup];
           reference[outputBase + highGroup * 32 + member] =
