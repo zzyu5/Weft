@@ -771,7 +771,7 @@ case "${kernel}" in
         ;;
     esac
     ;;
-  dequantize_q4_0|dequantize_q4_1|dequantize_q8_0)
+  dequantize_q4_0|dequantize_q4_1|dequantize_q5_0|dequantize_q5_1|dequantize_q8_0|dequantize_q1_0|dequantize_tq2_0)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
@@ -788,6 +788,18 @@ case "${kernel}" in
         ;;
       dequantize_q8_0)
         runtime_compile_flags="-DWEFT_DEQUANT_KIND=2 -DWEFT_DEQUANT_ENTRY=dequantize_q8_0"
+        ;;
+      dequantize_q5_0)
+        runtime_compile_flags="-DWEFT_DEQUANT_KIND=3 -DWEFT_DEQUANT_ENTRY=dequantize_q5_0"
+        ;;
+      dequantize_q5_1)
+        runtime_compile_flags="-DWEFT_DEQUANT_KIND=4 -DWEFT_DEQUANT_ENTRY=dequantize_q5_1"
+        ;;
+      dequantize_q1_0)
+        runtime_compile_flags="-DWEFT_DEQUANT_KIND=5 -DWEFT_DEQUANT_ENTRY=dequantize_q1_0"
+        ;;
+      dequantize_tq2_0)
+        runtime_compile_flags="-DWEFT_DEQUANT_KIND=6 -DWEFT_DEQUANT_ENTRY=dequantize_tq2_0"
         ;;
     esac
     ;;

@@ -161,6 +161,7 @@ struct BlockStoreGroupDecision {
   mlir::Operation *operation = nullptr;
   mlir::Operation *axis = nullptr;
   int64_t extent = 0;
+  llvm::SmallVector<mlir::Operation *> scalarPreamble;
   llvm::SmallVector<mlir::Operation *> stores;
   llvm::SmallVector<mlir::Operation *> closure;
   llvm::SmallVector<BlockOperationDecision> operations;
@@ -9170,10 +9171,18 @@ private:
   llvm::SmallVector<BlockOperationDecision> decideBlockOperations(
       const llvm::DenseSet<mlir::Operation *> &closure,
       RVVVectorShape byteShape, PhysicalEntityPlan &entity) const {
-    llvm::SmallVector<mlir::Operation *> ordered(closure.begin(), closure.end());
-    llvm::sort(ordered, [](mlir::Operation *lhs, mlir::Operation *rhs) {
-      return lhs->isBeforeInBlock(rhs);
-    });
+    llvm::SmallVector<mlir::Operation *> ordered;
+    llvm::DenseSet<mlir::Operation *> visited;
+    std::function<void(mlir::Operation *)> visit = [&](mlir::Operation *operation) {
+      if (!operation || !closure.contains(operation) ||
+          !visited.insert(operation).second)
+        return;
+      for (mlir::Value operand : operation->getOperands())
+        visit(operand.getDefiningOp());
+      ordered.push_back(operation);
+    };
+    for (mlir::Operation *operation : closure)
+      visit(operation);
     llvm::SmallVector<BlockOperationDecision> decisions;
     llvm::DenseMap<mlir::Operation *, BlockOperationDecision> prior;
     for (mlir::Operation *operation : ordered) {
@@ -10257,9 +10266,9 @@ private:
     llvm::DenseSet<mlir::Operation *> closure;
     llvm::SmallVector<BlockIndexOp> axes;
     if (mlir::failed(collectBlockClosure(op.getPointer(), closure, axes,
-                                         op.getOperation(), false)) ||
+                                         op.getOperation(), true)) ||
         mlir::failed(collectBlockClosure(op.getValue(), closure, axes,
-                                         op.getOperation(), false)))
+                                         op.getOperation(), true)))
       return mlir::failure();
     if (axes.size() != 1)
       return op.emitError(
@@ -10271,11 +10280,86 @@ private:
       return op.emitError("block store extent does not match its logical axis");
 
     llvm::SmallVector<StoreOp> stores{op};
+    llvm::SmallVector<mlir::Operation *> scalarPreamble;
+    llvm::DenseSet<mlir::Operation *> scalarPreambleSet;
+    for (mlir::Operation *candidateOperation = op->getNextNode();
+         candidateOperation;
+         candidateOperation = candidateOperation->getNextNode()) {
+      auto candidate = mlir::dyn_cast<StoreOp>(candidateOperation);
+      if (!candidate || plannedStores.contains(candidateOperation) ||
+          !hasBlockPayload(candidateOperation) ||
+          isMaterializedF32BlockStore(candidate) || !isTrue(candidate.getWhere()))
+        continue;
+      bool interveningEffect = false;
+      for (mlir::Operation *between = op->getNextNode();
+           between && between != candidateOperation;
+           between = between->getNextNode())
+        if (!mlir::isMemoryEffectFree(between)) {
+          interveningEffect = true;
+          break;
+        }
+      if (interveningEffect)
+        continue;
+      llvm::DenseSet<mlir::Operation *> candidateClosure;
+      llvm::SmallVector<BlockIndexOp> candidateAxes;
+      if (mlir::failed(collectBlockClosure(candidate.getPointer(),
+                                           candidateClosure, candidateAxes,
+                                           candidateOperation, true)) ||
+          mlir::failed(collectBlockClosure(candidate.getValue(),
+                                           candidateClosure, candidateAxes,
+                                           candidateOperation, true)))
+        return mlir::failure();
+      if (f32BlockExtent(candidate.getValue().getType()) != extent ||
+          candidateAxes.size() != 1 ||
+          candidateAxes.front().getOperation() != axis.getOperation())
+        continue;
+      bool sharesProducer = llvm::any_of(
+          candidateClosure, [&](mlir::Operation *producer) {
+            return !mlir::isa<BlockIndexOp>(producer) && closure.contains(producer);
+          });
+      if (!sharesProducer)
+        continue;
+      llvm::SmallVector<mlir::Operation *> candidatePreamble;
+      llvm::DenseSet<mlir::Operation *> candidatePreambleSet;
+      bool scalarProjectionLegal = true;
+      std::function<void(mlir::Value)> collectScalar = [&](mlir::Value value) {
+        mlir::Operation *definition = value.getDefiningOp();
+        if (!definition || definition->getBlock() != op->getBlock() ||
+            definition == op.getOperation() ||
+            definition->isBeforeInBlock(op.getOperation()))
+          return;
+        if (hasBlockPayload(definition) ||
+            candidatePreambleSet.contains(definition))
+          return;
+        if (!mlir::isa<ConstantOp, MetaValueOp, SpecialValueOp, BinaryOp,
+                       CastOp, PtrAddOp>(definition)) {
+          scalarProjectionLegal = false;
+          return;
+        }
+        for (mlir::Value operand : definition->getOperands())
+          collectScalar(operand);
+        if (scalarProjectionLegal && candidatePreambleSet.insert(definition).second)
+          candidatePreamble.push_back(definition);
+      };
+      for (mlir::Operation *producer : candidateClosure)
+        for (mlir::Value operand : producer->getOperands())
+          if (!containsBlockType(operand.getType()) &&
+              !isRegionValue(operand.getType()))
+            collectScalar(operand);
+      if (!scalarProjectionLegal)
+        continue;
+      closure.insert(candidateClosure.begin(), candidateClosure.end());
+      for (mlir::Operation *preamble : candidatePreamble)
+        if (scalarPreambleSet.insert(preamble).second)
+          scalarPreamble.push_back(preamble);
+      stores.push_back(candidate);
+    }
 
     BlockStoreGroupDecision decision;
     decision.operation = op.getOperation();
     decision.axis = axis.getOperation();
     decision.extent = *extent;
+    decision.scalarPreamble = scalarPreamble;
     SelectedBlockStorePhysical selected =
         decideBlockStorePhysical(*extent, axis, closure);
     if (selected.decision.realization == BlockStoreRealization::Unsupported)
@@ -10292,14 +10376,16 @@ private:
     planned.realization.operations =
         decideBlockOperations(closure, selected.decision.byteShape,
                               planned.entity);
-    auto storedValue = llvm::find_if(
-        planned.entity.values, [&](const PhysicalValueDecision &value) {
-          return value.value == op.getValue();
-        });
-    if (storedValue != planned.entity.values.end())
-      recordPhysicalHandoff(planned.entity, op.getOperation(), op.getValue(),
-                            PhysicalHandoff::Rematerialize,
-                            storedValue->shape, storedValue->shape);
+    for (StoreOp store : stores) {
+      auto storedValue = llvm::find_if(
+          planned.entity.values, [&](const PhysicalValueDecision &value) {
+            return value.value == store.getValue();
+          });
+      if (storedValue != planned.entity.values.end())
+        recordPhysicalHandoff(planned.entity, store.getOperation(),
+                              store.getValue(), PhysicalHandoff::Rematerialize,
+                              storedValue->shape, storedValue->shape);
+    }
     planned.entity.blockStore = selected.decision;
     planned.entity.resources = selected.resources;
     physicalPlan.blockStoreGroups.try_emplace(op.getOperation(),
@@ -10429,19 +10515,24 @@ private:
     const PhysicalEntityPlan &entity = selected->second.entity;
     if (!entity.blockStore)
       return op.emitError("block store physical entity is incomplete");
-    const PhysicalHandoffDecision *storeHandoff =
-        findPhysicalHandoff(entity, op.getOperation(), op.getValue());
-    if (!storeHandoff ||
-        storeHandoff->kind != PhysicalHandoff::Rematerialize ||
-        storeHandoff->sourceShape != storeHandoff->resultShape)
-      return op.emitError("block store physical handoff is incomplete");
+    for (mlir::Operation *storeOperation : decision.stores) {
+      auto store = mlir::cast<StoreOp>(storeOperation);
+      const PhysicalHandoffDecision *storeHandoff =
+          findPhysicalHandoff(entity, storeOperation, store.getValue());
+      if (!storeHandoff ||
+          storeHandoff->kind != PhysicalHandoff::Rematerialize ||
+          storeHandoff->sourceShape != storeHandoff->resultShape)
+        return store.emitError("block store physical handoff is incomplete");
+    }
     const BlockStorePhysicalDecision &physical = *entity.blockStore;
     int64_t extent = decision.extent;
     BlockIndexOp axis = mlir::cast<BlockIndexOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> closure;
     closure.insert(decision.closure.begin(), decision.closure.end());
-    llvm::DenseSet<mlir::Operation *> storeOps;
-    storeOps.insert(decision.stores.begin(), decision.stores.end());
+
+    for (mlir::Operation *preamble : decision.scalarPreamble)
+      if (mlir::failed(emitOperation(preamble)))
+        return mlir::failure();
 
     std::string offset = expression(axis.getOffset());
     if (offset.empty())
@@ -10464,16 +10555,22 @@ private:
       const PhysicalEntityPlan *previousEntity = activeBlockEntity;
       activeBlockOperations = &decision.operations;
       activeBlockEntity = &entity;
-      for (mlir::Operation &candidate : *op->getBlock()) {
-        if (mlir::isa<BlockIndexOp>(candidate) ||
-            (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
+      for (const BlockOperationDecision &operation : decision.operations) {
+        if (mlir::isa<BlockIndexOp>(operation.operation))
           continue;
-        if (mlir::failed(emitBlockOperation(&candidate, blockValues, activeVL))) {
+        if (mlir::failed(
+                emitBlockOperation(operation.operation, blockValues, activeVL))) {
           activeBlockOperations = previousOperations;
           activeBlockEntity = previousEntity;
           return mlir::failure();
         }
       }
+      for (mlir::Operation *store : decision.stores)
+        if (mlir::failed(emitBlockOperation(store, blockValues, activeVL))) {
+          activeBlockOperations = previousOperations;
+          activeBlockEntity = previousEntity;
+          return mlir::failure();
+        }
       activeBlockOperations = previousOperations;
       activeBlockEntity = previousEntity;
       return mlir::success();
@@ -10500,17 +10597,24 @@ private:
       const PhysicalEntityPlan *previousEntity = activeBlockEntity;
       activeBlockOperations = &decision.operations;
       activeBlockEntity = &entity;
-      for (mlir::Operation &candidate : *op->getBlock()) {
-        if (mlir::isa<BlockIndexOp>(candidate) ||
-            (!closure.contains(&candidate) && !storeOps.contains(&candidate)))
+      for (const BlockOperationDecision &operation : decision.operations) {
+        if (mlir::isa<BlockIndexOp>(operation.operation))
           continue;
         for (auto &blockValues : stripValues)
-          if (mlir::failed(emitBlockOperation(&candidate, blockValues, vl))) {
+          if (mlir::failed(
+                  emitBlockOperation(operation.operation, blockValues, vl))) {
             activeBlockOperations = previousOperations;
             activeBlockEntity = previousEntity;
             return mlir::failure();
           }
       }
+      for (mlir::Operation *store : decision.stores)
+        for (auto &blockValues : stripValues)
+          if (mlir::failed(emitBlockOperation(store, blockValues, vl))) {
+            activeBlockOperations = previousOperations;
+            activeBlockEntity = previousEntity;
+            return mlir::failure();
+          }
       activeBlockOperations = previousOperations;
       activeBlockEntity = previousEntity;
     } else if (physical.realization ==
@@ -10549,6 +10653,8 @@ private:
 
     for (mlir::Operation *operation : closure)
       loweredBlockOps.insert(operation);
+    consumed.insert(decision.scalarPreamble.begin(),
+                    decision.scalarPreamble.end());
     consumed.insert(decision.stores.begin(), decision.stores.end());
     return mlir::success();
   }

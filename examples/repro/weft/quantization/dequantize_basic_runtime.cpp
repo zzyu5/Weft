@@ -22,11 +22,23 @@ namespace {
 
 constexpr std::size_t kRows = 1024;
 constexpr std::size_t kColumns = 4096;
+#if WEFT_DEQUANT_KIND == 5
+constexpr std::size_t kBlockSize = 128;
+#elif WEFT_DEQUANT_KIND == 6
+constexpr std::size_t kBlockSize = 256;
+#else
 constexpr std::size_t kBlockSize = 32;
+#endif
 #if WEFT_DEQUANT_KIND == 1
 constexpr std::size_t kBlockBytes = 20;
 #elif WEFT_DEQUANT_KIND == 2
 constexpr std::size_t kBlockBytes = 34;
+#elif WEFT_DEQUANT_KIND == 3
+constexpr std::size_t kBlockBytes = 22;
+#elif WEFT_DEQUANT_KIND == 4
+constexpr std::size_t kBlockBytes = 24;
+#elif WEFT_DEQUANT_KIND == 6
+constexpr std::size_t kBlockBytes = 66;
 #else
 constexpr std::size_t kBlockBytes = 18;
 #endif
@@ -73,7 +85,11 @@ int main() {
       const std::size_t outputBase = row * kColumns + block * kBlockSize;
       const float scaleValue =
           static_cast<float>(1 + ((row * 17 + block * 13) % 31)) / 64.0F;
+#if WEFT_DEQUANT_KIND == 6
+      storeF16(packed, inputBase + 64, scaleValue);
+#else
       storeF16(packed, inputBase, scaleValue);
+#endif
       const float scale = scaleValue;
 #if WEFT_DEQUANT_KIND == 1
       const float minimumValue =
@@ -96,6 +112,64 @@ int main() {
             127);
         packed[inputBase + 2 + member] = static_cast<std::uint8_t>(code);
         reference[outputBase + member] = scale * static_cast<float>(code);
+      }
+#elif WEFT_DEQUANT_KIND == 3 || WEFT_DEQUANT_KIND == 4
+#if WEFT_DEQUANT_KIND == 4
+      constexpr std::size_t kHighOffset = 4;
+      constexpr std::size_t kCodeOffset = 8;
+      const float minimumValue =
+          -static_cast<float>(1 + ((row * 5 + block * 3) % 7)) / 8.0F;
+      storeF16(packed, inputBase + 2, minimumValue);
+#else
+      constexpr std::size_t kHighOffset = 2;
+      constexpr std::size_t kCodeOffset = 6;
+#endif
+      std::uint32_t highBits = 0;
+      for (std::size_t member = 0; member < 16; ++member) {
+        const std::uint8_t low = static_cast<std::uint8_t>(
+            (row * 3 + block * 5 + member * 7) & 31U);
+        const std::uint8_t high = static_cast<std::uint8_t>(
+            (row * 11 + block * 3 + member * 13 + 1) & 31U);
+        packed[inputBase + kCodeOffset + member] = static_cast<std::uint8_t>(
+            (low & 15U) | ((high & 15U) << 4));
+        highBits |= static_cast<std::uint32_t>(low >> 4) << member;
+        highBits |= static_cast<std::uint32_t>(high >> 4) << (16 + member);
+#if WEFT_DEQUANT_KIND == 4
+        reference[outputBase + member] = scale * low + minimumValue;
+        reference[outputBase + 16 + member] = scale * high + minimumValue;
+#else
+        reference[outputBase + member] =
+            scale * static_cast<float>(static_cast<int>(low) - 16);
+        reference[outputBase + 16 + member] =
+            scale * static_cast<float>(static_cast<int>(high) - 16);
+#endif
+      }
+      for (std::size_t byte = 0; byte < 4; ++byte)
+        packed[inputBase + kHighOffset + byte] =
+            static_cast<std::uint8_t>(highBits >> (8 * byte));
+#elif WEFT_DEQUANT_KIND == 5
+      for (std::size_t byte = 0; byte < 16; ++byte) {
+        const std::uint8_t signs = static_cast<std::uint8_t>(
+            row * 7 + block * 11 + byte * 29 + 0x5aU);
+        packed[inputBase + 2 + byte] = signs;
+        for (std::size_t bit = 0; bit < 8; ++bit)
+          reference[outputBase + byte * 8 + bit] =
+              scale * ((signs >> bit) & 1U ? 1.0F : -1.0F);
+      }
+#elif WEFT_DEQUANT_KIND == 6
+      for (std::size_t half = 0; half < 2; ++half) {
+        for (std::size_t member = 0; member < 32; ++member) {
+          std::uint8_t packedCodes = 0;
+          for (std::size_t field = 0; field < 4; ++field) {
+            const std::uint8_t code = static_cast<std::uint8_t>(
+                (row * 3 + block * 5 + half * 7 + member * 11 + field) %
+                3);
+            packedCodes |= static_cast<std::uint8_t>(code << (2 * field));
+            reference[outputBase + half * 128 + field * 32 + member] =
+                scale * static_cast<float>(static_cast<int>(code) - 1);
+          }
+          packed[inputBase + half * 32 + member] = packedCodes;
+        }
       }
 #else
       for (std::size_t member = 0; member < 16; ++member) {
