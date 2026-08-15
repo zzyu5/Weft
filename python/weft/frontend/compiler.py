@@ -1451,6 +1451,7 @@ class FrontendCompiler:
                 (i8, i32),
                 (i8, f32),
                 (u16, i32),
+                (u16, f32),
                 (i16, i32),
                 (f16, f32),
             }

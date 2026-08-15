@@ -771,7 +771,7 @@ case "${kernel}" in
         ;;
     esac
     ;;
-  dequantize_q4_0|dequantize_q4_1|dequantize_q5_0|dequantize_q5_1|dequantize_q8_0|dequantize_q1_0|dequantize_tq2_0)
+  dequantize_q4_0|dequantize_q4_1|dequantize_q5_0|dequantize_q5_1|dequantize_q8_0|dequantize_q1_0|dequantize_tq1_0|dequantize_tq2_0)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} ${kernel}" >&2
       exit 2
@@ -800,6 +800,9 @@ case "${kernel}" in
         ;;
       dequantize_tq2_0)
         runtime_compile_flags="-DWEFT_DEQUANT_KIND=6 -DWEFT_DEQUANT_ENTRY=dequantize_tq2_0"
+        ;;
+      dequantize_tq1_0)
+        runtime_compile_flags="-DWEFT_DEQUANT_KIND=7 -DWEFT_DEQUANT_ENTRY=dequantize_tq1_0"
         ;;
     esac
     ;;
@@ -846,6 +849,23 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/dequantize.py
     dsl_entry=dequantize_iq4_xs
     runtime=examples/repro/weft/quantization/dequantize_iq4_xs_runtime.cpp
+    ;;
+  dequantize_mxfp4|dequantize_nvfp4)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/dequantize.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/dequantize_fp4_runtime.cpp
+    case "${kernel}" in
+      dequantize_mxfp4)
+        runtime_compile_flags="-DWEFT_FP4_DEQUANT_KIND=0 -DWEFT_FP4_DEQUANT_ENTRY=dequantize_mxfp4"
+        ;;
+      dequantize_nvfp4)
+        runtime_compile_flags="-DWEFT_FP4_DEQUANT_KIND=1 -DWEFT_FP4_DEQUANT_ENTRY=dequantize_nvfp4"
+        ;;
+    esac
     ;;
   iq2_S_q8_K | iq3_S_q8_K | iq1_M_q8_K | q6_K_q8_K)
     if [[ $# -ne 0 ]]; then

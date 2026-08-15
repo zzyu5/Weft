@@ -9086,11 +9086,13 @@ private:
       } else if (target.isSignedInteger(32) && source.isUnsignedInteger(16)) {
         recordPhysicalTemporary(entity, operation, resultShape);
       } else if (target.isF32()) {
-        RVVVectorShape intermediate = resultShape == kRVVE32M1
-                                          ? resultShape
-                                          : rvvShapeForSameLanes(
-                                                sourceShape, 16, options.target)
-                                                .value_or(RVVVectorShape{});
+        RVVVectorShape intermediate =
+            source.isUnsignedInteger(16)
+                ? sourceShape
+                : resultShape == kRVVE32M1
+                      ? resultShape
+                      : rvvShapeForSameLanes(sourceShape, 16, options.target)
+                            .value_or(RVVVectorShape{});
         recordPhysicalTemporary(entity, operation, intermediate);
       }
       return decision;
@@ -9818,6 +9820,14 @@ private:
       line("vfloat" + shapeSuffix + "_t " + name +
            " = __riscv_vfwcvt_f_x_v_f" + shapeSuffix + "(" + extended +
            ", " + vl.str() + ");");
+    } else if (input.kind == BlockValueKind::U16 && target.isF32()) {
+      if (shape.sew != 32 || input.spelling.empty() || !temporary ||
+          temporary->shape != input.vectorShape)
+        return op.emitError("u16 to f32 cast decision is incomplete");
+      kind = BlockValueKind::F32;
+      line("vfloat" + shapeSuffix + "_t " + name +
+           " = __riscv_vfwcvt_f_xu_v_f" + shapeSuffix + "(" +
+           input.spelling + ", " + vl.str() + ");");
     } else {
       return op.emitError("RVV block cast pair is unsupported");
     }

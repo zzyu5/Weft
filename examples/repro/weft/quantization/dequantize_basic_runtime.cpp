@@ -24,7 +24,7 @@ constexpr std::size_t kRows = 1024;
 constexpr std::size_t kColumns = 4096;
 #if WEFT_DEQUANT_KIND == 5
 constexpr std::size_t kBlockSize = 128;
-#elif WEFT_DEQUANT_KIND == 6
+#elif WEFT_DEQUANT_KIND == 6 || WEFT_DEQUANT_KIND == 7
 constexpr std::size_t kBlockSize = 256;
 #else
 constexpr std::size_t kBlockSize = 32;
@@ -39,6 +39,8 @@ constexpr std::size_t kBlockBytes = 22;
 constexpr std::size_t kBlockBytes = 24;
 #elif WEFT_DEQUANT_KIND == 6
 constexpr std::size_t kBlockBytes = 66;
+#elif WEFT_DEQUANT_KIND == 7
+constexpr std::size_t kBlockBytes = 54;
 #else
 constexpr std::size_t kBlockBytes = 18;
 #endif
@@ -87,6 +89,8 @@ int main() {
           static_cast<float>(1 + ((row * 17 + block * 13) % 31)) / 64.0F;
 #if WEFT_DEQUANT_KIND == 6
       storeF16(packed, inputBase + 64, scaleValue);
+#elif WEFT_DEQUANT_KIND == 7
+      storeF16(packed, inputBase + 52, scaleValue);
 #else
       storeF16(packed, inputBase, scaleValue);
 #endif
@@ -169,6 +173,38 @@ int main() {
                 scale * static_cast<float>(static_cast<int>(code) - 1);
           }
           packed[inputBase + half * 32 + member] = packedCodes;
+        }
+      }
+#elif WEFT_DEQUANT_KIND == 7
+      constexpr std::uint8_t powers[5] = {1, 3, 9, 27, 81};
+      for (std::size_t byte = 0; byte < 48; ++byte)
+        packed[inputBase + byte] = static_cast<std::uint8_t>(
+            row * 7 + block * 11 + byte * 29 + 0x5aU);
+      for (std::size_t byte = 0; byte < 4; ++byte)
+        packed[inputBase + 48 + byte] = static_cast<std::uint8_t>(
+            row * 13 + block * 3 + byte * 37 + 0x2dU);
+      std::size_t outputIndex = outputBase;
+      for (std::size_t begin = 0; begin < 48; begin += 32) {
+        const std::size_t count = std::min<std::size_t>(32, 48 - begin);
+        for (std::uint8_t power : powers) {
+          for (std::size_t member = 0; member < count; ++member) {
+            const std::uint8_t encoded = static_cast<std::uint8_t>(
+                packed[inputBase + begin + member] * power);
+            const std::uint16_t ternary =
+                static_cast<std::uint16_t>(encoded) * 3U >> 8;
+            reference[outputIndex++] =
+                scale * (static_cast<float>(ternary) - 1.0F);
+          }
+        }
+      }
+      for (std::size_t digit = 0; digit < 4; ++digit) {
+        for (std::size_t member = 0; member < 4; ++member) {
+          const std::uint8_t encoded = static_cast<std::uint8_t>(
+              packed[inputBase + 48 + member] * powers[digit]);
+          const std::uint16_t ternary =
+              static_cast<std::uint16_t>(encoded) * 3U >> 8;
+          reference[outputIndex++] =
+              scale * (static_cast<float>(ternary) - 1.0F);
         }
       }
 #else

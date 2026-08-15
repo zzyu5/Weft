@@ -11,6 +11,33 @@ def _load_u16_le(pointer):
     return low | (high << W.u16(8))
 
 
+@W.helper(effects=())
+def _e8m0_half(exponent):
+    bits = W.u32(0)
+    if exponent < W.u8(2):
+        bits = W.u32(0x00200000) << W.cast(exponent, W.u32)
+    else:
+        bits = (W.cast(exponent, W.u32) - W.u32(1)) << W.u32(23)
+    return W.bitcast(bits, W.f32)
+
+
+@W.helper(effects=())
+def _ue4m3_half(encoded):
+    result = W.f32(0.0)
+    if encoded != W.u8(0):
+        if encoded != W.u8(127):
+            exponent = (encoded >> W.u8(3)) & W.u8(15)
+            mantissa = encoded & W.u8(7)
+            if exponent == W.u8(0):
+                result = W.cast(mantissa, W.f32) * W.f32(0.0009765625)
+            else:
+                bits = (
+                    (W.cast(exponent, W.u32) + W.u32(119)) << W.u32(23)
+                ) | (W.cast(mantissa, W.u32) << W.u32(20))
+                result = W.bitcast(bits, W.f32)
+    return result
+
+
 @weft.kernel
 def dequantize_q4_0(
     packed: W.ptr[W.u8, W.readonly, W.noalias],
@@ -212,6 +239,149 @@ def dequantize_tq2_0(
                         + member,
                         value,
                     )
+
+
+@weft.kernel
+def dequantize_tq1_0(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(54)
+            output_block = output_row + block * W.index(256)
+            scale = W.load_f16_le(input_block + W.index(52))
+
+            power = W.u8(1)
+            for digit in W.range(0, 5):
+                member = W.block(32)
+                encoded = W.load(input_block + member, other=W.u8(0)) * power
+                ternary = (
+                    W.cast(encoded, W.u16) * W.u16(3)
+                ) >> W.u16(8)
+                value = scale * (
+                    W.cast(ternary, W.f32) - W.f32(1.0)
+                )
+                W.store(output_block + digit * W.index(32) + member, value)
+                power = power * W.u8(3)
+
+            power = W.u8(1)
+            for digit in W.range(0, 5):
+                member = W.block(16)
+                encoded = W.load(
+                    input_block + W.index(32) + member, other=W.u8(0)
+                ) * power
+                ternary = (
+                    W.cast(encoded, W.u16) * W.u16(3)
+                ) >> W.u16(8)
+                value = scale * (
+                    W.cast(ternary, W.f32) - W.f32(1.0)
+                )
+                W.store(
+                    output_block + W.index(160) + digit * W.index(16) + member,
+                    value,
+                )
+                power = power * W.u8(3)
+
+            power = W.u8(1)
+            for digit in W.range(0, 4):
+                member = W.block(4)
+                encoded = W.load(
+                    input_block + W.index(48) + member, other=W.u8(0)
+                ) * power
+                ternary = (
+                    W.cast(encoded, W.u16) * W.u16(3)
+                ) >> W.u16(8)
+                value = scale * (
+                    W.cast(ternary, W.f32) - W.f32(1.0)
+                )
+                W.store(
+                    output_block + W.index(240) + digit * W.index(4) + member,
+                    value,
+                )
+                power = power * W.u8(3)
+
+
+@weft.kernel
+def dequantize_mxfp4(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(17)
+            output_block = output_row + block * W.index(32)
+            scale = _e8m0_half(W.load(input_block, other=W.u8(0)))
+            member = W.block(16)
+            codes = W.load(
+                input_block + W.index(1) + member, other=W.u8(0)
+            )
+            table = W.bitcast(
+                W.load(codebook + member, other=W.u8(0)), W.i8
+            )
+            low = W.decode(codes & W.u8(15), table, out_dtype=W.i8)
+            high = W.decode(codes >> W.u8(4), table, out_dtype=W.i8)
+            W.store(output_block + member, scale * W.cast(low, W.f32))
+            W.store(
+                output_block + W.index(16) + member,
+                scale * W.cast(high, W.f32),
+            )
+
+
+@weft.kernel
+def dequantize_nvfp4(
+    packed: W.ptr[W.u8, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    rows: W.index,
+    blocks_per_row: W.index,
+    input_stride_bytes: W.index,
+    output_stride: W.index,
+) -> None:
+    for row in W.range(0, rows):
+        input_row = packed + row * input_stride_bytes
+        output_row = output + row * output_stride
+        for block in W.range(0, blocks_per_row):
+            input_block = input_row + block * W.index(36)
+            output_block = output_row + block * W.index(64)
+            for subblock in W.range(0, 4):
+                scale = _ue4m3_half(
+                    W.load(input_block + subblock, other=W.u8(0))
+                )
+                member = W.block(16)
+                packed_index = member % W.index(8)
+                shift = W.cast((member // W.index(8)) * W.index(4), W.u8)
+                codes = (
+                    W.load(
+                        input_block
+                        + W.index(4)
+                        + subblock * W.index(8)
+                        + packed_index,
+                        other=W.u8(0),
+                    )
+                    >> shift
+                ) & W.u8(15)
+                table = W.bitcast(
+                    W.load(codebook + member, other=W.u8(0)), W.i8
+                )
+                decoded = W.decode(codes, table, out_dtype=W.i8)
+                W.store(
+                    output_block + subblock * W.index(16) + member,
+                    scale * W.cast(decoded, W.f32),
+                )
 
 
 @weft.kernel

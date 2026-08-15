@@ -87,6 +87,7 @@ bool isSupportedCastPair(ShapeKind kind, mlir::Type source,
          (source.isSignedInteger(8) && target.isSignedInteger(32)) ||
          (source.isSignedInteger(8) && target.isF32()) ||
          (source.isUnsignedInteger(16) && target.isSignedInteger(32)) ||
+         (source.isUnsignedInteger(16) && target.isF32()) ||
          (source.isSignedInteger(16) && target.isSignedInteger(32)) ||
          (source.isF16() && target.isF32());
 }
