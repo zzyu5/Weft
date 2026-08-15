@@ -96,8 +96,8 @@ int main() {
     }
   }
 
-  q1_0_q8_0_rows(weight.data(), activation.data(), output.data(), 0, kRows,
-                  kElements);
+  q1_0_q8_0(weight.data(), activation.data(), output.data(), 0, kRows,
+            kElements);
   const std::size_t sampleRows[] = {0, kRows / 2, kRows - 1};
   double maxAbsoluteError = 0.0;
   double maxRelativeError = 0.0;
@@ -110,7 +110,7 @@ int main() {
     maxRelativeError = std::fmax(maxRelativeError, relative);
   }
   if (maxRelativeError > 1.0e-5) {
-    std::fprintf(stderr, "q1_0_q8_0_rows mismatch: abs=%g rel=%g\n",
+    std::fprintf(stderr, "q1_0_q8_0 mismatch: abs=%g rel=%g\n",
                  maxAbsoluteError, maxRelativeError);
     return 1;
   }
@@ -121,15 +121,15 @@ int main() {
   for (int repetition = 0; repetition < 3; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    q1_0_q8_0_rows(weight.data(), activation.data(), output.data(), 0, kRows,
-                    kElements);
+    q1_0_q8_0(weight.data(), activation.data(), output.data(), 0, kRows,
+              kElements);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
   }
   const double milliseconds = median(samples);
   const double operations = 2.0 * static_cast<double>(kRows * kElements);
-  std::printf("kernel=q1_0_q8_0_rows\n");
+  std::printf("kernel=q1_0_q8_0\n");
   std::printf("model_shape=Llama_FFN[N=14336,K=4096]\n");
   std::printf("max_absolute_error=%.9g\n", maxAbsoluteError);
   std::printf("max_relative_error=%.9g\n", maxRelativeError);

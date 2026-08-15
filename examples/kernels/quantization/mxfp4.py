@@ -4,7 +4,7 @@ import weft.language as W
 
 
 @weft.kernel
-def mxfp4_q8_0_rows(
+def mxfp4_q8_0(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
