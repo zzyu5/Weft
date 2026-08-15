@@ -1,6 +1,18 @@
 add_library(WeftRISCVTarget STATIC
   RISCVTargetProfile.cpp
   RISCVHeader.cpp
+  RISCVKernelFacts.cpp
+  RISCVPhysicalPlanning.cpp
+  RISCVIntrinsicC.cpp
+  RISCVKernelCompiler.cpp
+  RISCVIntrinsicCPrelude.cpp
+  RISCVRVVIntrinsicC.cpp
+  RISCVQuantIntrinsicC.cpp
+  RISCVQuantIQ2IntrinsicC.cpp
+  RISCVQuantIQ3IntrinsicC.cpp
+  RISCVQuantIQ1IntrinsicC.cpp
+  RISCVQuantQ6IntrinsicC.cpp
+  RISCVIMEIntrinsicC.cpp
   RISCVLowering.cpp
 )
 
