@@ -751,6 +751,23 @@ case "${kernel}" in
     dsl_entry=nvfp4_q8_0
     runtime=examples/repro/weft/quantization/nvfp4_runtime.cpp
     ;;
+  iq4_nl_q8_0|iq4_xs_q8_K)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/codebook_k.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/iq4_dot_runtime.cpp
+    case "${kernel}" in
+      iq4_nl_q8_0)
+        runtime_compile_flags="-DWEFT_IQ4_DOT_KIND=0 -DWEFT_IQ4_DOT_ENTRY=iq4_nl_q8_0"
+        ;;
+      iq4_xs_q8_K)
+        runtime_compile_flags="-DWEFT_IQ4_DOT_KIND=1 -DWEFT_IQ4_DOT_ENTRY=iq4_xs_q8_K"
+        ;;
+    esac
+    ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
       echo "usage: ${usage_prefix} q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2

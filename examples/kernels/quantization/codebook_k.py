@@ -115,3 +115,141 @@ def q6_K_q8_K(
             result,
         )
     return result
+
+
+@weft.kernel
+def iq4_nl_q8_0(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    elements: W.index,
+) -> None:
+    blocks = elements / W.index(32)
+    weight_row_stride = blocks * W.index(18)
+    for row in W.range(row_begin, row_end):
+        result = W.f32(0.0)
+        for block in W.range(0, blocks):
+            x = weight + row * weight_row_stride + block * W.index(18)
+            y = activation + block * W.index(34)
+            member = W.block(16)
+            packed_codes = W.load(x + W.index(2) + member, other=W.u8(0))
+            table = W.bitcast(
+                W.load(codebook + member, other=W.u8(0)), W.i8
+            )
+            low = W.decode(packed_codes & W.u8(15), table, out_dtype=W.i8)
+            high = W.decode(packed_codes >> W.u8(4), table, out_dtype=W.i8)
+            activation_low = W.bitcast(
+                W.load(y + W.index(2) + member, other=W.u8(0)), W.i8
+            )
+            activation_high = W.bitcast(
+                W.load(y + W.index(18) + member, other=W.u8(0)), W.i8
+            )
+            low_sum = W.reduce(
+                W.cast(low, W.i32) * W.cast(activation_low, W.i32),
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            high_sum = W.reduce(
+                W.cast(high, W.i32) * W.cast(activation_high, W.i32),
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            scale = W.load_f16_le(x) * W.load_f16_le(y)
+            result = result + scale * W.cast(low_sum + high_sum, W.f32)
+        W.store(output + row, result)
+
+
+@weft.kernel
+def iq4_xs_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    elements: W.index,
+) -> None:
+    blocks = elements / W.index(256)
+    weight_row_stride = blocks * W.index(136)
+    for row in W.range(row_begin, row_end):
+        result = W.f32(0.0)
+        for block in W.range(0, blocks):
+            x = weight + row * weight_row_stride + block * W.index(136)
+            y = activation + block * W.index(292)
+            block_scale = W.load_f16_le(x)
+            activation_scale = load_f32_le(y)
+            scales_high = W.cast(W.load(x + W.index(2), other=W.u8(0)), W.u16) | (
+                W.cast(W.load(x + W.index(3), other=W.u8(0)), W.u16)
+                << W.u16(8)
+            )
+            for group in W.range(0, 8):
+                scales_low = W.load(
+                    x + W.index(4) + group // W.index(2), other=W.u8(0)
+                )
+                low_shift = W.cast(
+                    (group % W.index(2)) * W.index(4), W.u8
+                )
+                low_scale = (scales_low >> low_shift) & W.u8(15)
+                high_shift = W.cast(group * W.index(2), W.u16)
+                high_scale = W.cast(
+                    (scales_high >> high_shift) & W.u16(3), W.u8
+                )
+                local_scale = W.cast(
+                    low_scale | (high_scale << W.u8(4)), W.f32
+                ) - W.f32(32.0)
+                member = W.block(16)
+                packed_codes = W.load(
+                    x + W.index(8) + group * W.index(16) + member,
+                    other=W.u8(0),
+                )
+                table = W.bitcast(
+                    W.load(codebook + member, other=W.u8(0)), W.i8
+                )
+                low = W.decode(
+                    packed_codes & W.u8(15), table, out_dtype=W.i8
+                )
+                high = W.decode(
+                    packed_codes >> W.u8(4), table, out_dtype=W.i8
+                )
+                activation_low = W.bitcast(
+                    W.load(
+                        y + W.index(4) + group * W.index(32) + member,
+                        other=W.u8(0),
+                    ),
+                    W.i8,
+                )
+                activation_high = W.bitcast(
+                    W.load(
+                        y + W.index(20) + group * W.index(32) + member,
+                        other=W.u8(0),
+                    ),
+                    W.i8,
+                )
+                low_sum = W.reduce(
+                    W.cast(low, W.i32) * W.cast(activation_low, W.i32),
+                    identity=W.i32(0),
+                    axis=0,
+                    acc_dtype=W.i32,
+                    order="relaxed",
+                )
+                high_sum = W.reduce(
+                    W.cast(high, W.i32) * W.cast(activation_high, W.i32),
+                    identity=W.i32(0),
+                    axis=0,
+                    acc_dtype=W.i32,
+                    order="relaxed",
+                )
+                result = result + (
+                    block_scale
+                    * activation_scale
+                    * local_scale
+                    * W.cast(low_sum + high_sum, W.f32)
+                )
+        W.store(output + row, result)
