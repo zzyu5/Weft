@@ -16,12 +16,12 @@ Weft 的扩展原则是：
 > **已有语义扩展局部 target realization；新增可观察语义增加一个局部 primitive；永不为某个完整算子、模型格式或 kernel 名增加整段后端模板。**
 
 Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它与 Triton 的关键区别
-不是有没有 tile，而是 block 的 owner、control contract 与 lifetime：
+不是有没有 tile，而是 block 的 owner、control ownership 与 lifetime：
 
 - Weft 没有 program grid、`program_id` 或隐式 launch identity；
 - Weft 的入口是一个由当前 worker 持续执行的普通 callable kernel，而不是 grid 中的一次性
   program instance；
-- VLA region 的 strip 边界与 `vl` 在 source 中不可观察；
+- VLA region 的 strip 边界与 `vl` 在 DSL kernel 中不可观察；
 - 跨 strip 的 reduce、scan、summary state 是一等语义；
 - logical block 是普通 SSA value，由 worker control program 持有，可以跨 loop carry、多 use、
   pointwise、state、memory 与 structured primitive 自然组合；
@@ -47,12 +47,12 @@ Weft 不是 Tensor graph compiler，也不是 Triton CPU backend 的重写。它
 Weft 必须同时满足：
 
 1. **worker-local kernel 可写性**：作者能直接表达循环、blocking、staging、pointer/index、mask、state 与 structured compute；
-2. **VLA 原生性**：source 不观察固定 VLEN、exact `vl` 或 hardware lane count；
+2. **VLA 原生性**：DSL kernel 不观察固定 VLEN、exact `vl` 或 hardware lane count；
 3. **高性能物理自由度**：target lowering 能决定 LMUL、register microtile、unroll、packing、fragment 与 instruction family；
 4. **RISC-V 扩展局部接入**：新增扩展不要求新增完整 GEMM、Softmax、RMSNorm、量化算子模板；
-5. **AOT 可嵌入性**：产物是普通 object / static library / header，运行期不依赖 Python、LLVM 或 JIT；
+5. **AOT 可嵌入性**：生成普通 object / static library / C header，运行期不依赖 Python、LLVM 或 JIT；
 6. **外部 runtime 兼容性**：llama.cpp、ggml、框架线程池或应用自己的调度器可直接调用生成的 worker-local entry；
-7. **算法与 realization 分离**：source 与 Kernel IR 固定 worker-local 算法，物理选择只存在于一次 target lowering 调用中。
+7. **算法与 realization 分离**：DSL kernel 与 Kernel IR 固定 worker-local 算法，物理选择只存在于一次 target lowering 调用中。
 
 ### 非目标
 
@@ -88,7 +88,7 @@ extension primitive都消费这些value，并服从同一extent、validity、use
 
 一个 Weft kernel 是一个普通可调用函数。它接收显式 pointer / scalar / descriptor 参数，并由
 当前 worker 从入口到返回持续执行。一次调用可以顺序遍历多个 cache/output block；block、
-accumulator、state 与 source-visible workspace 的 lifetime 不受某个 VLA strip 或 local primitive
+accumulator、state 与 author-visible workspace 的 lifetime 不受某个 VLA strip 或 local primitive
 边界限制，而由作者写下的 lexical/control/storage relation 决定。
 
 ```text
@@ -133,12 +133,12 @@ Canonical Weft language 中不存在：
 - block 之间的顺序与状态；
 - memory effect 及其顺序。
 
-普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器只能做不改变 source-visible
+普通 scalar `for` / `while` 是作者写下的有序 traversal。编译器只能做不改变 author-visible
 iteration、carry 与 effect order 的普通实现优化，不能重新分类、交换或替换作者的 traversal，
 也不得从普通 scalar multiply/add 猜出dot/matmul。
-只有 source 显式写出的 `W.vla` / `W.dot` / `W.matmul` 才分别授权 SIMD logical axis 与局部
+只有 DSL kernel 显式写出的 `W.vla` / `W.dot` / `W.matmul` 才分别授权 SIMD logical axis 与局部
 乘加域。VLA 内部可以做 strip-mining；dot/matmul 内部可以重组 reduction。两者都
-不得改变 source-visible iteration/effect 语义、显式算法边界，或创建 source 中不存在的
+不得改变 author-visible iteration/effect 语义、显式算法边界，或创建 DSL kernel 中不存在的
 algorithmic loop、state 与 staging 骨架。
 
 
@@ -161,7 +161,7 @@ with W.vla(begin, end) as i:
 i ∈ [begin, end)
 ```
 
-该逻辑域由编译器和目标实现分解为任意数量的连续动态 `vl` strip。source 不得观察：
+该逻辑域由编译器和目标实现分解为任意数量的连续动态 `vl` strip。DSL kernel 不得观察：
 
 - strip 数量；
 - 当前 `vl`；
@@ -182,7 +182,7 @@ block<BK × BN, f16>
 block<BM × BN, f32>
 ```
 
-Shape不是block的完整identity。每次`W.block(extent)`建立一个唯一source axis，并产生该轴的
+Shape不是block的完整identity。每次`W.block(extent)`建立一个唯一 DSL axis，并产生该轴的
 logical index block；block/region type同时保存shape与axis identity。两个extent相等但来自不同
 `W.block`调用的axis不能互换。`W.full/W.zeros`直接消费这些axis value，而不是裸整数shape。
 
@@ -220,17 +220,17 @@ region<[* , D0, D1, ...], [vla, a0, a1, ...], T>
 ```
 
 其中 `*` 表示当前VLA axis；`Dk` 是static dimension，或以 `-1` 配合显式extent operand
-表示的dynamic/meta dimension；`ak`是source-owned block axis identity。显式singleton broadcast
+表示的dynamic/meta dimension；`ak`是 author-owned block axis identity。显式singleton broadcast
 使用axis identity `0`，不能伪装成另一条真实axis。
 
 当前 canonical language 在同一 lexical scope 中只允许一个活跃 VLA axis。嵌套第二个
 VLA region 必须被拒绝；这是当前语言能力边界，用来保持 region identity 与 state 语义
-唯一，并不是把 RVV lane count 暴露给 source。未来若引入多维 VLA，必须定义新的语言
+唯一，并不是把 RVV lane count 暴露给 DSL kernel。未来若引入多维 VLA，必须定义新的语言
 语义，不能由 target 自动猜测。
 
 该限制不禁止VLA body中的普通scalar `for` / `while` / `if`。短window、此前已选元素检查、
 coordinate decode等有序scalar control可以嵌在VLA内；它们不会产生第二个lane domain，且
-其source-visible顺序、state与effect必须保持不变。
+其 author-visible 顺序、state与effect必须保持不变。
 
 `W.dot`与`W.matmul`不得缩并VLA axis；跨VLA axis的聚合必须使用reduce、scan或显式typed summary primitive。
 VLA axis只能作为dot的free/batch axis；当前matmul只接受local block operands。
@@ -244,11 +244,11 @@ Weft 必须区分以下四层，不得混用同一个 `tile` 概念：
 
 由作者决定是否存在、位于哪个循环层、如何影响 memory reuse。典型参数为 `BM/BN/BK`。
 
-这些参数可以是 build-time meta-parameter，但其**存在和使用位置**属于 source algorithm。
+这些参数可以是 build-time meta-parameter，但其**存在和使用位置**属于 DSL algorithm。
 
 ### Logical operand block
 
-由 source 构造并由 structured primitive 消费的 shaped semantic value。
+由 DSL kernel 构造并由 structured primitive 消费的 shaped semantic value。
 
 它只描述局部坐标域与数据关系，不声明寄存器或 ISA fragment。
 
@@ -262,30 +262,30 @@ Weft 必须区分以下四层，不得混用同一个 `tile` 概念：
 
 例如某个矩阵扩展规定的 `4×4×8`、accumulator register class 或 encoded operand tile。
 
-它是具体扩展的硬件叶子，只存在于 target lowering 的瞬态状态与生成代码中，不进入通用 source block 类型。
+它是具体扩展的硬件叶子，只存在于 target lowering 的瞬态状态与生成代码中，不进入通用 DSL block 类型。
 
 
 ## Storage 与 lifetime
 
 作者可观察的 memory object 都由 caller 分配并作为 entry pointer 传入。语言固定三类
-source-visible storage：普通 external buffer/state、带显式 format identity 且跨调用复用的
+author-visible storage：普通 external buffer/state、带显式 format identity 且跨调用复用的
 persistent object，以及当前 worker 在一次调用内独占并可跨 loop/primitive 复用的 workspace。
-Target 只可在 local primitive 内创建 source 不可观察的 primitive-private temporary。
+Target 只可在 local primitive 内创建 DSL kernel 不可观察的 primitive-private temporary。
 
-Weft 没有源级隐式 allocation；storage class、shape、alignment、alias 与 lifetime 的完整合同见
+Weft 没有源级隐式 allocation；storage class、shape、alignment、alias 与 lifetime 的完整说明见
 [Storage ownership 与 lifetime](storage-and-lifetime.md)。这条边界保证 target 不会为了命中某个
 实现偷造 workspace ABI、persistent repack 或另一份算法 state。
 
 
 ## GEMM 判据：不是 Triton-CPU 的另一层语法
 
-一个 blocked GEMM worker 的 source 必须显式拥有 M/N/K traversal、BM/BN/BK 的使用位置、
+一个 blocked GEMM worker 的 DSL kernel 必须显式拥有 M/N/K traversal、BM/BN/BK 的使用位置、
 operand block、accumulator、mask、staging、persistent packing 和 store。Accumulator 是普通
 block SSA value，由同一个 worker 持有并跨作者写下的 K loop 更新；这个 worker还可以在外围
 control 中继续处理下一个 M/N block。
 
 `W.matmul(lhs, rhs, init=acc)` 只授权当前 `[BM,BK] × [BK,BN] + [BM,BN]` local block
-product 的物理化。Realizer可以在该边界内选择 LMUL、register microtile、multiple
+product 的物理化。Target lowering 可以在该边界内选择 LMUL、register microtile、multiple
 accumulators、K-unroll、短生命周期 packing、pipeline 与 RVV/IME fragment；它不得创建 outer
 K loop、persistent repack、另一种 traversal 或新的 GEMM algorithm。
 

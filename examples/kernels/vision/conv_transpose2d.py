@@ -89,8 +89,8 @@ def conv_transpose2d_p0_f32(
                         for output_channel_base in W.range(
                             0, output_channels, 6
                         ):
-                            output_channel = W.block_axis(6)
-                            reduction = W.block_axis(input_channels)
+                            output_channel = W.block(6)
+                            reduction = W.block(input_channels)
                             input_value = W.load(
                                 packed_source
                                 + reduction
@@ -115,7 +115,7 @@ def conv_transpose2d_p0_f32(
                             value = W.dot(
                                 weight_value,
                                 input_value,
-                                init=W.zeros((6,), dtype=W.f32),
+                                init=W.zeros((output_channel,), dtype=W.f32),
                                 acc_dtype=W.f32,
                                 order="relaxed",
                                 math="native",

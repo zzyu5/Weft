@@ -20,7 +20,7 @@ def solve_lower_triangular_f32(
         solution_batch = solution + batch * rhs_batch_stride
         for row in W.range(0, rows):
             with W.vla(0, rhs_columns) as column:
-                inner = W.block_axis(row)
+                inner = W.block(row)
                 diagonal = W.load(matrix_batch + row * rows + row)
                 coefficient = -W.load(matrix_batch + row * rows + inner) / diagonal
                 previous = W.load(

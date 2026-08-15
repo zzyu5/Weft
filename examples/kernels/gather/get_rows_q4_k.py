@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 from examples.kernels.quantization.ggml_k import load_k4_scale_min
 
 
@@ -25,8 +24,8 @@ def get_rows_q4_k(
         for block in W.range(0, blocks_per_row):
             packed_block = row_base + block * W.index(144)
             output_block = output_row + block * W.index(256)
-            block_scale = load_f16_le(packed_block)
-            block_minimum = load_f16_le(packed_block + W.index(2))
+            block_scale = W.load_f16_le(packed_block)
+            block_minimum = W.load_f16_le(packed_block + W.index(2))
 
             for group_pair in W.range(0, 4):
                 low_group = group_pair * W.index(2)
@@ -40,7 +39,7 @@ def get_rows_q4_k(
                 output_group = output_block + group_pair * W.index(64)
                 high_output_group = output_group + W.index(32)
 
-                member = W.block_axis(32)
+                member = W.block(32)
                 packed = W.load(
                     packed_block
                     + W.index(16)

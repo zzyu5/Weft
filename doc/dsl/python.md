@@ -4,15 +4,15 @@
 
 ### 参考前端，不是运行时发射器
 
-Weft Python DSL 是规范化参考 source frontend：
+Weft Python DSL 是规范化参考前端：
 
 ```text
-Python Weft source
+Weft Python DSL kernel
     → canonical Weft Kernel IR
     → RISC-V target lowering
     → intrinsic C / necessary inline asm
     → system C compiler / archiver
-    → object / static library / generated public C header
+    → object / static library / generated C header
 ```
 
 Python 不参与生成物运行。运行期不得依赖 Python interpreter、LLVM JIT 或 Weft Python package。
@@ -40,7 +40,7 @@ def saxpy(
 ```
 
 `@weft.kernel` 定义一个 worker-local entry。它不是 Python callable 的 eager 执行语义。
-Entry 可以返回 `None` 或一个 scalar value；返回类型是 public C ABI 的一部分，不能由
+Entry 可以返回 `None` 或一个 scalar value；返回类型是 C ABI 的一部分，不能由
 emitter 根据 kernel 名或 use context 改写。
 
 ### Kernel 参数类型
@@ -71,7 +71,6 @@ W.constexpr[T]
 Pointer 参数可以声明：
 
 - storage class：external、persistent(format) 或 workspace；
-- address space；
 - readonly / writeonly；
 - noalias；
 - minimum alignment；
@@ -92,8 +91,8 @@ W.storage(packed, (n_blocks, k_blocks, 304))
 W.storage(scratch, (rows, columns))
 ```
 
-`W.storage` 必须直接出现在 kernel entry body；它不是 allocation。所有 source-visible object 都
-由 caller 分配并作为普通 pointer 参数传入。完整 ownership/lifetime 合同见
+`W.storage` 必须直接出现在 kernel entry body；它不是 allocation。所有 author-visible object 都
+由 caller 分配并作为普通 pointer 参数传入。完整 ownership/lifetime 说明见
 [Storage ownership 与 lifetime](storage-and-lifetime.md)。
 
 ### Compile-time meta-parameter
@@ -104,7 +103,7 @@ def gemm_worker(..., BM: W.constexpr[W.index], BN: W.constexpr[W.index], BK: W.c
     ...
 ```
 
-Source 声明 meta-parameter 的语义位置与使用位置。候选值集合由外部 build loop 提供，
+DSL kernel 声明 meta-parameter 的语义位置与使用位置。候选值集合由外部 build loop 提供，
 不写进 kernel body。基于 meta value 的 loop bound、shape 或 branch 是 specialization-time
 结构；lowering 不得把未绑定 meta value 留成 runtime data-dependent 输入。
 
@@ -153,9 +152,8 @@ Effectful helper 使用：
 
 ```python
 @W.helper(effects=("read",))
-def load_f16_le(ptr):
-    ...
-    return value
+def load_pair_sum(ptr):
+    return W.load(ptr) + W.load(ptr + W.index(1))
 ```
 
 允许声明的 effect 是 `read` 与 `write`。Helper 必须以一个 value return

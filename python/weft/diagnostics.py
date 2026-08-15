@@ -8,7 +8,7 @@ class WeftError(Exception):
 
 
 class DefinitionError(WeftError):
-    """Raised when a Python definition is not valid Weft source."""
+    """Raised when a Python definition is not a valid Weft DSL kernel."""
 
 
 class LanguageUseError(WeftError):

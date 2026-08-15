@@ -42,7 +42,8 @@ int main() {
   std::vector<float> output(elements);
   std::vector<float> expected(elements);
   std::vector<std::int32_t> positions(4U * kTokens);
-  std::vector<float> angleCache(2U * kHalfDimension);
+  std::vector<float> angleCache(
+      qwen3vl_mrope_f32__angle_cache_elements(kRotaryDimension));
   for (std::size_t index = 0; index < elements; ++index)
     source[index] =
         static_cast<float>(static_cast<int>((index * 11U) % 257U) - 128) /

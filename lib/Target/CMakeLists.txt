@@ -1,6 +1,6 @@
 add_library(WeftRISCVTarget STATIC
   RISCVTargetProfile.cpp
-  RISCVArtifacts.cpp
+  RISCVHeader.cpp
   RISCVLowering.cpp
 )
 

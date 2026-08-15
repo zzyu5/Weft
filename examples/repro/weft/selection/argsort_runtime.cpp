@@ -49,7 +49,8 @@ int main() {
     });
   }
 
-  std::vector<std::uint32_t> scratch(kColumns, 0);
+  std::vector<std::uint32_t> scratch(
+      argsort_f32__scratch_elements(kColumns), 0);
   argsort_f32(values.data(), actual.data(), scratch.data(), 0, kRows, kColumns, kColumns,
               kColumns);
   if (actual != expected) {

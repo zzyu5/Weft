@@ -1,139 +1,75 @@
 # Canonical Weft Kernel IR
 
-## 唯一算法表示
+## 作用
 
-Canonical Kernel IR 保存完整 worker-local algorithm：
+Kernel IR 是 Python DSL 与 RISC-V target lowering 之间唯一长期保存的表示。它记录作者程序的
+可观察语义，不记录目标机器的一次选择。
 
-- kernel symbol、普通 C ABI、argument name/kind与scalar return；
-- scalar、typed pointer与specialization-time constexpr parameter；
-- external/persistent/workspace ownership、persistent format identity与source-visible storage shape；
-- scalar `if` / `for` / `while` control与carried state；
-- 一个 active VLA axis、logical block axis与region value；
-- pointer/index、logical predicate、masked value与memory effect；
-- pointwise、conversion与special value；
-- reduce、scan、typed summary与sequential carry的observable distinction；
-- dot、matmul、lookup、decode与typed local extension primitive；
-- source meta value、source location与numerical attributes。
+一个 module 包含一个或多个 `weft_kernel.kernel`。每个 kernel 保存 entry name、参数类型、
+返回类型和一个有序 region。未知 `weft_kernel.*` 或 `weft_ext.*` operation 会在解析时失败。
 
-它不得保存 exact `vl`、LMUL、register number、register microtile、target realization ID、
-IME fragment、instruction spelling、build measurement、thread count或launch policy。
+## 类型
 
-## 持久类型
+核心类型为：
 
 ```text
-!weft_kernel.ptr<T, address-space, access, noalias, alignment, restrict,
-                 storage-class, storage-format>
+scalar T
+!weft_kernel.ptr<T, access, noalias, alignment,
+                 restrict, external|workspace|persistent, format>
 !weft_kernel.constexpr<T>
-!weft_kernel.block<[D0, D1, ...], [a0, a1, ...], T>
-!weft_kernel.region<[-1, D0, D1, ...], [-1, a0, a1, ...], T>
-!weft_kernel.masked<ValueType>
-!weft_kernel.tuple<[T0, T1, ...]>
+!weft_kernel.block<[D0, ...], [a0, ...], T>
+!weft_kernel.region<[D0, ...], [a0, ...], T>
+!weft_kernel.masked<T>
+tuple<T0, ...>
 ```
 
-- `ptr` 保存作者声明的element、address space、access、alias/alignment、external/persistent/
-  workspace class与persistent format identity；
-- `constexpr` 只用于entry ABI，body通过 `meta_value` 读取已绑定值；
-- `block` 的positive axis ID由唯一`block_index`定义；`0`只表示显式singleton broadcast；
-- `region` 的shape/axis首个 `-1`表示当前active VLA axis，余下字段服从同一block identity；
-- `masked` 携带first-class logical validity，不能当普通value逃逸；
-- `tuple` 只保存reduce/summary/control使用的闭合scalar state；block state直接通过control
-  region argument/result carry，不进入第二种opaque state容器。
+`block` 与 `region` 同时保存 shape 和 axis identity。正 axis ID 必须对应唯一
+`weft_kernel.block_index`；`0` 只表示显式 singleton dimension；VLA 维使用 `-1`。相同 extent
+不等于相同 axis。
 
-Persistent/workspace pointer还必须由entry block中唯一的`weft_kernel.storage`绑定shape与显式
-extent operands；external pointer禁止该op。Source-visible三类storage都是caller-provided entry
-pointer。Compiler-private primitive temporary不进入canonical type/op/ABI。
+## 控制与 SSA
 
-这些类型组成唯一的canonical value system。Sibling extension dialect不得重新定义block、region、
-masked validity、extent identity或state容器；extension operand必须直接使用上述类型和相同的
-use-def/effect规则。`weft_ext`是局部semantic primitive的命名空间，不是第二份execution IR。
+- `weft_kernel.for` 保存有序 scalar range 与任意 scalar/block carry；
+- `weft_kernel.while` 的 condition/body region 显式传递同一组 carry；
+- `weft_kernel.if` 的两个 region 产生同类型 results；
+- `weft_kernel.vla` 保存逻辑 `[begin,end)` 与跨完整 VLA 域产生的 state results；
+- `weft_kernel.yield`、`condition` 与普通 SSA use-def 完成所有值传递。
 
-Dynamic logical block extent在shape中写为 `-1`，真实extent仍是对应op的显式operand。两个
-dynamic extent不能仅因都打印为 `-1` 就被视为同一logical identity。
+Block result 可以多 use、进入 pointwise、memory、state、控制 carry 或另一个合法局部运算。
+IR 不编码 one-use、direct-store、相邻 consumer 或某个后端闭包。
 
-## Canonical op families
+## Storage
 
-下面是可parse的核心mnemonic，而不是按kernel类型划分的catalog：
+`weft_kernel.storage` 只声明 entry 中 workspace/persistent pointer 的 shape。Pointer type 同时保存
+element type、access、alignment、alias、storage class 与 persistent format。普通 input/output
+使用 external pointer，不需要 `storage`。
 
-```text
-entry/control
-  weft_kernel.kernel / return / yield / condition
-  weft_kernel.if / for / while / vla
+Primitive-private temporary 不进入 Kernel IR，也不能成为 entry 参数。
 
-storage
-  weft_kernel.storage
+## 运算
 
-value/domain
-  weft_kernel.constant / meta_value / block_index / full
-  weft_kernel.expand_dims
-  weft_kernel.tuple / tuple_get / special_value / invalid
+Kernel dialect 包含：
 
-scalar, block and region compute
-  weft_kernel.ptr_add / unary / binary / compare / select
-  weft_kernel.cast / bitcast / narrow
+- scalar constant/meta value、cast/bitcast、unary/binary/compare/select；
+- pointer arithmetic、load/store、block index、singleton-axis view、full；
+- reduce、scan、argmax、online softmax summary、sort indices；
+- dot、matmul、lookup、decode、narrow；
+- for、while、if、VLA 与 entry return。
 
-memory and validity
-  weft_kernel.load / store
+`weft_ext` 只保存普通 Kernel op 无法无差别表达的局部语义：标量 little-endian f16 load、
+packed quantized dot 与 RISC-V 扩展相关局部运算。Affine/symmetric i4×i8 dot 自身完整定义当前
+N16×K32 packed byte relation；不另设只能在特定 consumer 中生效的 packed block view op。
 
-state and structured compute
-  weft_kernel.reduce / scan / argmax / online_softmax_summary / dot / matmul
-  weft_kernel.sort_indices / lookup / decode
-```
+## Verifier
 
-`expand_dims`只承载Python singleton-axis slicing的canonical view，不是public任意shape-transform
-入口。不存在 `weft_kernel.range`、`weft_kernel.mask`、generic atomic或source prefetch op：Python
-`W.range`生成`weft_kernel.for`；logical validity由`masked` type传播，ordinary consumer需要
-filled value时必须由source在load处提供`other`。Physical prefetch只属于Realizer
-schedule；当前VLA memory effect要求lane independence。
+Verifier 在最早能判断的位置拒绝：
 
-## Region 与 entry 边界
+- axis identity、shape/domain、dtype 或 validity 不一致；
+- 非 scalar Python control condition；
+- VLA 中非法 outer-state mutation 或 nested VLA；
+- storage class、shape、workspace alias 或 persistent format 缺失；
+- dot/matmul reduction axis、init/result domain 或 numerical attributes 不完整；
+- extension operand 不足以独立定义其局部语义。
 
-- 一个 module可以包含多个kernel symbol，但每个 `weft_kernel.kernel` 是独立worker-local
-  entry；CLI选择symbol不参与target realization选择。
-- entry argument kind只能是 `pointer`、`scalar` 或 `constexpr`；return为none或一个scalar。
-- persistent/workspace pointer的storage contract必须直接位于entry block，shape必须为正并可由
-  constant、bound meta或runtime index ABI事实求得；workspace必须noalias。
-- primitive对workspace的访问extent必须与storage extent具有可证明identity；例如
-  `sort_indices`的rank-one u32 scratch必须与排序extent相同。
-- 第二个active VLA region不能嵌套；普通scalar `for` / `while` / `if`可以位于VLA body中。
-  Active VLA coordinate是 `region<[-1], index>`，保留VLA axis的value不能逃出lexical region。
-- `argmax`与`online_softmax_summary`保存完整局部summary语义；target不得从普通SSA graph猜出。
-- `dot`固定收缩双方最后一个logical block axis；`matmul`固定表达`[M,K] x [K,N]`。
-  两者的init/result domain（shape与axis identity）、accumulator dtype与numerical policy必须由IR
-  显式保存并局部verify；reduction/K axis必须引用同一个block_index identity。
-
-因此canonical kernel可以统一描述为：
-
-```text
-ordered control regions
-+ zero or one active VLA axis per lexical scope
-+ scalar / block / region SSA values with explicit extent and validity
-+ pointer/index relations and memory effects
-+ explicit local semantic primitives
-```
-
-Reduce、scan、summary、dot/matmul与extension op不是独立执行路径；它们是在上述region/value/effect
-模型中授予某一局部domain重组权的anchor。其operand与result仍是普通SSA value，可以multi-use、
-进入pointwise/state/memory或作为control carry。普通SSA或loop carry本身没有局部domain重组授权。
-
-## Extension dialect
-
-新的可观察局部语义可以放在编译时已链接的sibling dialect。当前正式输入注册：
-
-```text
-weft_kernel
-weft_ext
-```
-
-`weft_ext` 当前包含 `affine_i4_i8_contract`、`symmetric_i4_i8_contract`、
-`grouped_affine_i4_i8_dot`、`sign_bit_i8_dot`、`e2m1_e8m0_i8_dot`、`iq2_s_i8_dot`、
-`iq3_s_i8_dot`、`iq1_m_i8_dot`与`q6_k_i8_dot`。Extension op必须
-能随module独立parse/verify；它只表达typed local numerical relation，不能持有public ABI、
-persistent pointer format、outer traversal或target fragment。它必须复用`weft_kernel`的logical
-value queries与validity规则；若primitive没有定义masked语义，source必须在operand producer处
-构造普通filled value，extension verifier不能静默unwrap。
-
-## Python frontend
-
-Python frontend直接从 `@weft.kernel` source构造上述IR，没有长期typed Python IR、selection
-IR或第二份algorithm authority。`@W.helper`始终按调用点typed value inline；显式summary
-primitive直接进入canonical op，不存在helper-region兼容路径。
+Verifier 不验证 LMUL、register 数、fragment 或 instruction legality；这些由一次 target lowering
+根据 target profile 判断。

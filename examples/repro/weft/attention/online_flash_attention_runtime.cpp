@@ -110,8 +110,11 @@ int main(int argc, char **argv) {
   std::vector<_Float16> value(keyValueElements);
   std::vector<_Float16> mask(kQueries * kKeys);
   std::vector<float> output(queryElements, 0.0F);
-  std::vector<_Float16> queryScratch(kHeadDimension);
-  std::vector<_Float16> accumulatorScratch(kHeadDimension);
+  std::vector<_Float16> queryScratch(
+      online_flash_attention_f32_f16__query_scratch_elements(kHeadDimension));
+  std::vector<_Float16> accumulatorScratch(
+      online_flash_attention_f32_f16__accumulator_scratch_elements(
+          kHeadDimension));
 
   for (std::size_t head = 0; head < kQueryHeads; ++head)
     for (std::size_t row = 0; row < kQueries; ++row)

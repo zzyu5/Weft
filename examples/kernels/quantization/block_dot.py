@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @W.helper(effects=("read",))
@@ -62,7 +61,7 @@ def q4_0_q8_0(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(18)
         y_block = y + block * W.index(34)
-        logical_index = W.block_axis(32)
+        logical_index = W.block(32)
         x_values = unpack_q4(x_block + 2, logical_index, W.i32(-8))
         y_values = load_q8(y_block + 2, logical_index)
         integer_sum = W.reduce(
@@ -72,7 +71,7 @@ def q4_0_q8_0(
             acc_dtype=W.i32,
             order="relaxed",
         )
-        scale = load_f16_le(x_block) * load_f16_le(y_block)
+        scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
         result += W.cast(integer_sum, W.f32) * scale
     return result
 
@@ -87,7 +86,7 @@ def q4_1_q8_1(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(20)
         y_block = y + block * W.index(36)
-        logical_index = W.block_axis(32)
+        logical_index = W.block(32)
         x_values = unpack_q4(x_block + 4, logical_index, W.i32(0))
         y_values = load_q8(y_block + 4, logical_index)
         integer_sum = W.reduce(
@@ -97,8 +96,8 @@ def q4_1_q8_1(
             acc_dtype=W.i32,
             order="relaxed",
         )
-        dot_scale = load_f16_le(x_block) * load_f16_le(y_block)
-        correction = load_f16_le(x_block + 2) * load_f16_le(y_block + 2)
+        dot_scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
+        correction = W.load_f16_le(x_block + 2) * W.load_f16_le(y_block + 2)
         result += W.cast(integer_sum, W.f32) * dot_scale + correction
     return result
 
@@ -113,7 +112,7 @@ def q5_0_q8_0(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(22)
         y_block = y + block * W.index(34)
-        logical_index = W.block_axis(32)
+        logical_index = W.block(32)
         x_values = unpack_q5(
             x_block + 6,
             x_block + 2,
@@ -128,7 +127,7 @@ def q5_0_q8_0(
             acc_dtype=W.i32,
             order="relaxed",
         )
-        scale = load_f16_le(x_block) * load_f16_le(y_block)
+        scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
         result += W.cast(integer_sum, W.f32) * scale
     return result
 
@@ -143,7 +142,7 @@ def q5_1_q8_1(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(24)
         y_block = y + block * W.index(36)
-        logical_index = W.block_axis(32)
+        logical_index = W.block(32)
         x_values = unpack_q5(
             x_block + 8,
             x_block + 4,
@@ -158,8 +157,8 @@ def q5_1_q8_1(
             acc_dtype=W.i32,
             order="relaxed",
         )
-        dot_scale = load_f16_le(x_block) * load_f16_le(y_block)
-        correction = load_f16_le(x_block + 2) * load_f16_le(y_block + 2)
+        dot_scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
+        correction = W.load_f16_le(x_block + 2) * W.load_f16_le(y_block + 2)
         result += W.cast(integer_sum, W.f32) * dot_scale + correction
     return result
 
@@ -174,7 +173,7 @@ def q8_0_q8_0(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(34)
         y_block = y + block * W.index(34)
-        logical_index = W.block_axis(32)
+        logical_index = W.block(32)
         x_values = load_q8(x_block + 2, logical_index)
         y_values = load_q8(y_block + 2, logical_index)
         integer_sum = W.reduce(
@@ -184,7 +183,7 @@ def q8_0_q8_0(
             acc_dtype=W.i32,
             order="relaxed",
         )
-        scale = load_f16_le(x_block) * load_f16_le(y_block)
+        scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
         result += W.cast(integer_sum, W.f32) * scale
     return result
 
@@ -199,24 +198,24 @@ def q4_K_q8_K(
     for block in W.range(0, blocks):
         x_block = x + block * W.index(144)
         y_block = y + block * W.index(292)
-        scale_index = W.block_axis(12)
+        scale_index = W.block(12)
         scale_min = W.load(x_block + W.index(4) + scale_index, other=W.u8(0))
-        packed_index = W.block_axis(128)
+        packed_index = W.block(128)
         packed_weight = W.load(
             x_block + W.index(16) + packed_index, other=W.u8(0)
         )
-        activation_index = W.block_axis(256)
+        activation_index = W.block(256)
         activation = W.bitcast(
             W.load(y_block + W.index(4) + activation_index, other=W.u8(0)),
             W.i8,
         )
-        sum_byte = W.block_axis(32)
+        sum_byte = W.block(32)
         activation_sum_bytes = W.load(
             y_block + W.index(260) + sum_byte, other=W.u8(0)
         )
         y_scale = load_f32_le(y_block)
-        dot_scale = load_f16_le(x_block) * y_scale
-        minimum_scale = load_f16_le(x_block + 2) * y_scale
+        dot_scale = W.load_f16_le(x_block) * y_scale
+        minimum_scale = W.load_f16_le(x_block + 2) * y_scale
         result = W.grouped_affine_i4_i8_dot(
             packed_weight,
             scale_min,

@@ -158,6 +158,14 @@ struct BlockDecodeDecision {
   RVVVectorShape resultShape;
 };
 
+enum class LoadF16LERealization {
+  ScalarBytes,
+};
+
+struct LoadF16LEDecision {
+  LoadF16LERealization realization = LoadF16LERealization::ScalarBytes;
+};
+
 enum class BlockValueRealization {
   Direct,
   DeferredPackedTransform,
@@ -246,7 +254,6 @@ struct MaterializedF32PointwiseDecision {
   MaterializedF32PointwiseRealization realization =
       MaterializedF32PointwiseRealization::Binary;
   int64_t elements = 0;
-  mlir::Value reusedStorage;
 };
 
 enum class I4I8FragmentRealization {
@@ -259,9 +266,7 @@ struct SymmetricI4I8Decision {
   mlir::Value activationBlockBase;
   mlir::Value packedBlockBase;
   mlir::Value activation;
-  mlir::Value packedWeight;
   mlir::Value activationScale;
-  mlir::Value weightScale;
   mlir::Value init;
   int64_t packedBlockBytes = 288;
 };
@@ -359,6 +364,7 @@ struct CValue {
   std::string indexSpelling;
   unsigned vectorSEW = 0;
   unsigned vectorLMUL = 0;
+  std::string logicalValidity;
 };
 
 enum class LaneRelation {
@@ -391,6 +397,18 @@ enum class VLAActivityMode {
 enum class VLAStoreValueMode {
   ScalarBroadcast,
   Vector,
+};
+
+enum class VLAInactiveLaneRealization {
+  ExplicitPassthrough,
+  ZeroCarrierWithLogicalValidity,
+};
+
+enum class VLAStateValidityRealization {
+  AllActive,
+  ReductionIdentity,
+  NegativeInfinity,
+  OnlineSoftmax,
 };
 
 enum class VLAStateRealization {
@@ -433,6 +451,8 @@ struct VLAAccessDecision {
   mlir::Value bundleAxis;
   unsigned bundleVectors = 0;
   unsigned indexedCompanionF32Vectors = 0;
+  VLAInactiveLaneRealization inactiveLane =
+      VLAInactiveLaneRealization::ExplicitPassthrough;
 };
 
 enum class VLASegment2AccessKind {
@@ -543,6 +563,8 @@ struct VLAStateDecision {
   VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
   mlir::Value segmentStart;
   mlir::Value segmentVector;
+  VLAStateValidityRealization validity =
+      VLAStateValidityRealization::AllActive;
 };
 
 struct VLANarrowDecision {
@@ -769,10 +791,7 @@ struct AffineI4I8Decision {
   mlir::Value activationBlockBase;
   mlir::Value packedBlockBase;
   mlir::Value activation;
-  mlir::Value packedWeight;
   mlir::Value activationScale;
-  mlir::Value weightScale;
-  mlir::Value weightZeroPoint;
   mlir::Value init;
   unsigned packedBlockBytes = 304;
 };
@@ -836,6 +855,8 @@ struct RISCVPhysicalPlan {
       quantCodebookI8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<BlockDecodeDecision>>
       blockDecodes;
+  llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<LoadF16LEDecision>>
+      f16LELoads;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<SortIndicesDecision>>
       sortIndices;
   llvm::DenseMap<mlir::Operation *,
@@ -1120,6 +1141,9 @@ public:
          llvm::join(parameters, ", ") + ") {");
     ++indent;
     for (mlir::Operation &operation : body) {
+      llvm::DenseSet<mlir::Operation *> visiting;
+      if (isStorageShapeOnly(&operation, visiting))
+        continue;
       if (auto returnOp = mlir::dyn_cast<ReturnOp>(operation)) {
         if (returnOp.getNumOperands() == 0)
           line("return;");
@@ -1143,8 +1167,33 @@ public:
   }
 
 private:
+  bool isStorageShapeOnly(
+      mlir::Operation *operation,
+      llvm::DenseSet<mlir::Operation *> &visiting) const {
+    if (!mlir::isa<ConstantOp, MetaValueOp, BinaryOp, CastOp>(operation) ||
+        operation->getNumResults() == 0 || !visiting.insert(operation).second)
+      return false;
+    bool hasUse = false;
+    for (mlir::Value result : operation->getResults()) {
+      for (mlir::OpOperand &use : result.getUses()) {
+        hasUse = true;
+        mlir::Operation *owner = use.getOwner();
+        if (mlir::isa<StorageOp>(owner))
+          continue;
+        if (!isStorageShapeOnly(owner, visiting)) {
+          visiting.erase(operation);
+          return false;
+        }
+      }
+    }
+    visiting.erase(operation);
+    return hasUse;
+  }
+
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
+    if (mlir::failed(prepareMaterializedBlockValues()))
+      return mlir::failure();
     kernel.walk([&](SortIndicesOp op) {
       if (decisionFailure)
         return;
@@ -1194,6 +1243,24 @@ private:
         decisionFailure = true;
       }
     });
+    kernel.walk([&](LoadF16LEOp op) {
+      if (decisionFailure)
+        return;
+      if (!options.target.littleEndian) {
+        op.emitError("load_f16_le requires a little-endian target");
+        decisionFailure = true;
+        return;
+      }
+      PlannedPhysicalDecision<LoadF16LEDecision> planned;
+      initializeEntityPlan(planned.entity);
+      planned.realization.realization = LoadF16LERealization::ScalarBytes;
+      if (!physicalPlan.f16LELoads
+               .try_emplace(op.getOperation(), std::move(planned))
+               .second) {
+        op.emitError("one load_f16_le cannot own multiple physical decisions");
+        decisionFailure = true;
+      }
+    });
     kernel.walk([&](VLAOp vla) {
       if (decisionFailure)
         return;
@@ -1209,17 +1276,17 @@ private:
         decisionFailure = true;
       }
     });
-    kernel.walk([&](AffineI4I8ContractOp contract) {
+    kernel.walk([&](AffineI4I8DotOp dot) {
       if (decisionFailure)
         return;
       PlannedPhysicalDecision<AffineI4I8Decision> planned;
       if (mlir::failed(
-              decideAffineI4I8Contract(contract, planned.realization))) {
+              decideAffineI4I8Dot(dot, planned.realization))) {
         decisionFailure = true;
         return;
       }
-      finalizeAffineI4I8Plan(contract, planned);
-      physicalPlan.affineI4I8.try_emplace(contract.getOperation(),
+      finalizeAffineI4I8Plan(dot, planned);
+      physicalPlan.affineI4I8.try_emplace(dot.getOperation(),
                                          std::move(planned));
     });
     kernel.walk([&](MatmulOp matmul) {
@@ -1248,12 +1315,12 @@ private:
         return;
       }
     });
-    kernel.walk([&](SymmetricI4I8ContractOp op) {
+    kernel.walk([&](SymmetricI4I8DotOp op) {
       if (decisionFailure)
         return;
       PlannedPhysicalDecision<SymmetricI4I8Decision> planned;
       if (mlir::failed(
-              decideSymmetricI4I8Contract(op, planned.realization))) {
+              decideSymmetricI4I8Dot(op, planned.realization))) {
         decisionFailure = true;
         return;
       }
@@ -1383,6 +1450,7 @@ private:
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
   llvm::DenseMap<mlir::Operation *, int64_t> materializedBlockElements;
+  llvm::DenseMap<mlir::Value, int64_t> controlBlockElements;
   unsigned indent = 0;
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
@@ -1402,7 +1470,7 @@ private:
 
   CValue scalarExpression(mlir::Value result, std::string expression,
                           llvm::StringRef prefix, bool force = false) {
-    if (force || (!result.use_empty() && !result.hasOneUse())) {
+    if (force || !result.use_empty()) {
       std::string name = fresh(prefix);
       line("const " + scalarCType(elementType(result.getType())) + " " + name +
            " = " + expression + ";");
@@ -1414,6 +1482,52 @@ private:
   CValue require(mlir::Value value) const {
     auto found = values.find(value);
     return found == values.end() ? CValue{} : found->second;
+  }
+
+  mlir::FailureOr<std::string>
+  combineLogicalValidity(mlir::Operation *owner,
+                         llvm::ArrayRef<CValue> operands) {
+    llvm::SmallVector<std::string> predicates;
+    for (const CValue &operand : operands) {
+      if (operand.logicalValidity.empty() ||
+          llvm::is_contained(predicates, operand.logicalValidity))
+        continue;
+      predicates.push_back(operand.logicalValidity);
+    }
+    if (predicates.empty())
+      return std::string{};
+    if (!activePhysicalEntity || activePhysicalEntity->vlaMaskRatio == 0 ||
+        activeVL.empty()) {
+      owner->emitError(
+          "logical validity has no selected physical mask realization");
+      return mlir::failure();
+    }
+    std::string merged = predicates.front();
+    std::string ratio =
+        std::to_string(activePhysicalEntity->vlaMaskRatio);
+    for (llvm::StringRef predicate : llvm::drop_begin(predicates)) {
+      std::string next = fresh("valid");
+      line("vbool" + ratio + "_t " + next + " = __riscv_vmand_mm_b" +
+           ratio + "(" + merged + ", " + predicate.str() + ", " + activeVL +
+           ");");
+      merged = std::move(next);
+    }
+    return merged;
+  }
+
+  mlir::LogicalResult
+  attachLogicalValidity(mlir::Operation *owner, mlir::Type resultType,
+                        CValue &result, llvm::ArrayRef<CValue> operands) {
+    mlir::FailureOr<std::string> validity =
+        combineLogicalValidity(owner, operands);
+    if (mlir::failed(validity))
+      return mlir::failure();
+    bool resultIsMasked = mlir::isa<MaskedType>(resultType);
+    if (resultIsMasked != !validity->empty())
+      return owner->emitError(
+          "physical logical-validity projection disagrees with the Kernel IR type");
+    result.logicalValidity = std::move(*validity);
+    return mlir::success();
   }
 
   std::string expression(mlir::Value value) const {
@@ -1739,11 +1853,14 @@ private:
       llvm::DenseSet<mlir::Operation *> &definitions,
       mlir::Operation *consumer) const {
     llvm::SmallVector<mlir::Operation *> required;
-    for (mlir::Operation *definition : definitions)
+    for (mlir::Operation *definition : definitions) {
+      if (mlir::isa<BlockIndexOp>(definition))
+        continue;
       if (llvm::any_of(definition->getUsers(), [&](mlir::Operation *user) {
             return user != consumer && !definitions.contains(user);
           }))
         required.push_back(definition);
+    }
     while (!required.empty()) {
       mlir::Operation *operation = required.pop_back_val();
       if (!definitions.erase(operation))
@@ -2141,6 +2258,12 @@ private:
       if (auto unary = mlir::dyn_cast<UnaryOp>(nested)) {
         if (isRegionValue(unary.getResult().getType()) &&
             elementType(unary.getResult().getType()).isF32()) {
+          if (unary.getMath() == "strict" &&
+              (unary.getKind() == "exp" || unary.getKind() == "tanh")) {
+            unary.emitError(
+                "strict VLA exp/tanh has no exact RISC-V realization");
+            return mlir::failure();
+          }
           std::optional<VLAUnaryRealization> realization =
               llvm::StringSwitch<std::optional<VLAUnaryRealization>>(
                   unary.getKind())
@@ -2334,6 +2457,19 @@ private:
       access.activityMode = activityMode;
       access.storeValueMode = storeValueMode;
       access.predicate = predicate;
+      if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
+        bool carriesValidity =
+            mlir::isa<MaskedType>(load.getResult().getType());
+        if (carriesValidity) {
+          if (activityMode == VLAActivityMode::AllActive) {
+            load.emitError(
+                "masked VLA load requires a nontrivial logical predicate");
+            return mlir::failure();
+          }
+          access.inactiveLane =
+              VLAInactiveLaneRealization::ZeroCarrierWithLogicalValidity;
+        }
+      }
       if (relation == LaneRelation::Indexed) {
         if (!options.target.hasIndexedMemory)
           return operation->emitError(
@@ -2532,7 +2668,9 @@ private:
       lookupDecision.table = *table;
       lookupDecision.indices = lookup.getIndices();
       decision.lookups.push_back(std::move(lookupDecision));
-      markDiscardedBlockTree(lookup.getTable());
+      if (mlir::failed(markRematerializedBlockTrees(
+              {lookup.getTable()}, lookup.getOperation())))
+        return mlir::failure();
     }
 
     unsigned maxEntityF32Vectors = 0;
@@ -2613,6 +2751,10 @@ private:
         state.operation = reduce.getOperation();
         state.elementType = reduce.getResult().getType();
         state.identity = reduce.getIdentity();
+        bool maskedInput =
+            mlir::isa<MaskedType>(reduce.getInput().getType());
+        if (maskedInput)
+          state.validity = VLAStateValidityRealization::ReductionIdentity;
         auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
         auto lhsCast = multiply && multiply.getKind() == "mul"
                            ? multiply.getLhs().getDefiningOp<CastOp>()
@@ -2625,7 +2767,7 @@ private:
         auto rhsLoad = rhsCast ? rhsCast.getInput().getDefiningOp<LoadOp>()
                                : LoadOp{};
         bool wideningF16Dot =
-            reduce.getKind() == "add" && multiply && lhsCast && rhsCast &&
+            !maskedInput && reduce.getKind() == "add" && multiply && lhsCast && rhsCast &&
             lhsLoad && rhsLoad &&
             elementType(lhsCast.getResult().getType()).isF32() &&
             elementType(rhsCast.getResult().getType()).isF32() &&
@@ -2676,7 +2818,8 @@ private:
                                return predicate.operation ==
                                       scan.getSegmentStart().getDefiningOp();
                              });
-        if (!elementType(scan.getInput().getType()).isF32() ||
+        if (mlir::isa<MaskedType>(scan.getInput().getType()) ||
+            !elementType(scan.getInput().getType()).isF32() ||
             !elementType(scan.getResult().getType()).isF32() ||
             !scan.getIdentity().getType().isF32() || !isTrue(scan.getWhere()) ||
             (!unsegmented && !segmented) ||
@@ -2710,6 +2853,8 @@ private:
           VLAStateDecision state{
               summary.getOperation(), VLAStateRealization::RVVArgMaxSummary,
               summary.getResult().getType()};
+          if (mlir::isa<MaskedType>(summary.getInput().getType()))
+            state.validity = VLAStateValidityRealization::NegativeInfinity;
           state.coordinateMode = coordinate == LaneRelation::UnitStride
                                      ? VLAMemoryMode::UnitStride
                                      : VLAMemoryMode::Strided;
@@ -2720,6 +2865,8 @@ private:
               summary.getOperation(),
               VLAStateRealization::RVVOnlineSoftmaxSummary,
               summary.getResult().getType()};
+          if (mlir::isa<MaskedType>(summary.getInput().getType()))
+            state.validity = VLAStateValidityRealization::OnlineSoftmax;
           decision.states.push_back(std::move(state));
       }
     }
@@ -3222,10 +3369,14 @@ private:
           !isF16(elementType(vector.getType())) ||
           !isF16(elementType(scalar.getType())))
         continue;
+      llvm::DenseSet<mlir::Operation *> absorbed{multiply.getOperation()};
+      retainOnlyPrivateDefinitions(absorbed, add.getOperation());
+      mlir::Operation *absorbedProducer =
+          absorbed.contains(multiply.getOperation()) ? multiply.getOperation()
+                                                     : nullptr;
       decision.binaries.push_back(VLABinaryDecision{
           add.getOperation(), VLABinaryRealization::RVVF16FusedMultiplyAdd,
-          multiply.getResult().hasOneUse() ? multiply.getOperation() : nullptr,
-          accumulator, vector, scalar});
+          absorbedProducer, accumulator, vector, scalar});
       RVVVectorShape fmaShape = rvvShape(16, selected->dataLMUL);
       recordPhysicalValue(entity, accumulator, fmaShape);
       recordPhysicalValue(entity, vector, fmaShape);
@@ -3483,8 +3634,8 @@ private:
       return op.emitError("scan must be lowered by its enclosing VLA region");
     if (auto op = mlir::dyn_cast<GroupedAffineI4I8DotOp>(operation))
       return emitGroupedAffineI4I8Dot(op);
-    if (auto op = mlir::dyn_cast<AffineI4I8ContractOp>(operation))
-      return emitAffineI4I8Contract(op);
+    if (auto op = mlir::dyn_cast<AffineI4I8DotOp>(operation))
+      return emitAffineI4I8Dot(op);
     if (auto op = mlir::dyn_cast<SignBitI8DotOp>(operation))
       return emitSignBitI8Dot(op);
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
@@ -3501,22 +3652,25 @@ private:
     if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
       return emitQuantCodebookI8Dot(
           op, "__weft_q6_k_i8_fixed", "__weft_q6_k_i8_rvv");
-    if (auto op = mlir::dyn_cast<SymmetricI4I8ContractOp>(operation))
-      return emitSymmetricI4I8Contract(op);
+    if (auto op = mlir::dyn_cast<SymmetricI4I8DotOp>(operation))
+      return emitSymmetricI4I8Dot(op);
     if (auto op = mlir::dyn_cast<DotOp>(operation))
       if (!isRegionValue(op.getResult().getType()))
         return emitLocalF32Dot(op);
     if (auto op = mlir::dyn_cast<MatmulOp>(operation))
       return emitF16Matmul(op);
-    if (auto op = mlir::dyn_cast<FullOp>(operation))
+    if (auto op = mlir::dyn_cast<FullOp>(operation)) {
       if (auto block = mlir::dyn_cast<BlockType>(op.getResult().getType());
           block && block.getElementType().isF32() &&
           materializedBlockElements.contains(op.getOperation()))
         return emitMaterializedBlockFull(op);
+    }
     if (auto op = mlir::dyn_cast<ForOp>(operation))
       return emitFor(op);
     if (auto op = mlir::dyn_cast<WhileOp>(operation))
       return emitWhile(op);
+    if (auto op = mlir::dyn_cast<IfOp>(operation))
+      return emitIf(op);
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       if (auto lowered = tryEmitMaterializedF32BlockStore(op))
         return *lowered;
@@ -3541,6 +3695,8 @@ private:
       if (auto op = mlir::dyn_cast<StoreOp>(operation))
         return emitStore(op);
     }
+    if (auto op = mlir::dyn_cast<LoadF16LEOp>(operation))
+      return emitScalarLoadF16LE(op);
     if (hasBlockPayload(operation)) {
       if (auto op = mlir::dyn_cast<StoreOp>(operation))
         return emitBlockStores(op);
@@ -3553,8 +3709,6 @@ private:
       return emitMeta(op);
     if (mlir::isa<StorageOp>(operation))
       return mlir::success();
-    if (auto op = mlir::dyn_cast<IfOp>(operation))
-      return emitIf(op);
     if (auto op = mlir::dyn_cast<VLAOp>(operation))
       return emitVLA(op);
     if (auto op = mlir::dyn_cast<PtrAddOp>(operation))
@@ -3793,6 +3947,27 @@ private:
     return mlir::success();
   }
 
+  mlir::LogicalResult copyF32Block(mlir::Operation *owner,
+                                   const CValue &destination,
+                                   const CValue &source, int64_t elements,
+                                   llvm::StringRef prefix) {
+    if (destination.kind != CValueKind::F32BlockStorage ||
+        source.kind != CValueKind::F32BlockStorage ||
+        destination.spelling.empty() || source.spelling.empty() ||
+        elements <= 0)
+      return owner->emitError("block control handoff has no f32 storage");
+    if (destination.spelling == source.spelling)
+      return mlir::success();
+    std::string lane = fresh(prefix);
+    line("for (size_t " + lane + " = 0; " + lane + " < " +
+         std::to_string(elements) + "; ++" + lane + ")");
+    ++indent;
+    line(destination.spelling + "[" + lane + "] = " + source.spelling +
+         "[" + lane + "];");
+    --indent;
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitIf(IfOp op) {
     CValue condition = require(op.getCondition());
     if (condition.kind != CValueKind::Scalar || condition.spelling.empty())
@@ -3807,18 +3982,25 @@ private:
 
     llvm::SmallVector<CValue> results;
     for (mlir::Value result : op.getResults()) {
-      if (!mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
-              result.getType()))
-        return op.emitError(
-            "RISC-V conditional currently yields only scalar values");
-      if (result.use_empty()) {
-        results.push_back(
-            CValue{result.getType(), CValueKind::Scalar, std::string{}});
+      if (mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
+              result.getType())) {
+        CValue value{result.getType(), CValueKind::Scalar,
+                     result.use_empty() ? std::string{} : fresh("if_result")};
+        if (!value.spelling.empty())
+          line(scalarCType(result.getType()) + " " + value.spelling + ";");
+        results.push_back(std::move(value));
         continue;
       }
-      CValue value{result.getType(), CValueKind::Scalar, fresh("if_result")};
-      line(scalarCType(result.getType()) + " " + value.spelling + ";");
-      results.push_back(value);
+      auto selected = controlBlockElements.find(result);
+      if (selected == controlBlockElements.end())
+        return op.emitError(
+            "RISC-V conditional block result has no physical storage decision");
+      CValue value{result.getType(), CValueKind::F32BlockStorage,
+                   result.use_empty() ? std::string{} : fresh("if_block")};
+      if (!value.spelling.empty())
+        line("float " + value.spelling + "[" +
+             std::to_string(selected->second) + "];");
+      results.push_back(std::move(value));
     }
 
     auto emitBranch = [&](mlir::Region &region) {
@@ -3832,12 +4014,21 @@ private:
         if (destination.spelling.empty())
           continue;
         CValue value = require(yielded);
-        if (value.kind != CValueKind::Scalar || value.spelling.empty()) {
-          yield.emitError(
-              "RISC-V conditional yielded an unavailable scalar value");
-          return mlir::failure();
+        if (destination.kind == CValueKind::Scalar) {
+          if (value.kind != CValueKind::Scalar || value.spelling.empty()) {
+            yield.emitError(
+                "RISC-V conditional yielded an unavailable scalar value");
+            return mlir::failure();
+          }
+          line(destination.spelling + " = " + value.spelling + ";");
+          continue;
         }
-        line(destination.spelling + " = " + value.spelling + ";");
+        std::optional<int64_t> elements =
+            physicalBlockElementCount(destination.type);
+        if (!elements ||
+            mlir::failed(copyF32Block(yield.getOperation(), destination, value,
+                                      *elements, "if_copy")))
+          return mlir::failure();
       }
       return mlir::success();
     };
@@ -3894,12 +4085,19 @@ private:
              value.spelling + " = " + init.spelling + ";");
       } else if (init.kind == CValueKind::F32BlockStorage) {
         auto block = mlir::dyn_cast<BlockType>(result.getType());
+        auto selected = controlBlockElements.find(result);
         if (!block || block.getShape().empty() || block.getShape().size() > 2 ||
-            !block.getElementType().isF32())
+            !block.getElementType().isF32() ||
+            selected == controlBlockElements.end())
           return op.emitError(
               "ordered range block carry must be rank-one or rank-two f32");
-        value = init;
-        value.type = result.getType();
+        value = CValue{result.getType(), CValueKind::F32BlockStorage,
+                       fresh("for_block_carry")};
+        line("float " + value.spelling + "[" +
+             std::to_string(selected->second) + "];");
+        if (mlir::failed(copyF32Block(op.getOperation(), value, init,
+                                      selected->second, "for_init")))
+          return mlir::failure();
       } else {
         return op.emitError(
             "ordered range carried value has no physical realization");
@@ -3928,12 +4126,12 @@ private:
           return mlir::failure();
         }
         if (destination.kind == CValueKind::F32BlockStorage) {
-          if (value.kind != CValueKind::F32BlockStorage ||
-              value.spelling != destination.spelling) {
-            yield.emitError(
-                "ordered range block carry must update its selected storage");
+          std::optional<int64_t> elements =
+              physicalBlockElementCount(destination.type);
+          if (!elements ||
+              mlir::failed(copyF32Block(yield.getOperation(), destination,
+                                        value, *elements, "for_next")))
             return mlir::failure();
-          }
           continue;
         }
         if (value.kind != destination.kind ||
@@ -4030,31 +4228,82 @@ private:
     llvm::SmallVector<CValue> carried;
     for (auto [result, initial] : llvm::zip(op.getResults(), op.getInitArgs())) {
       CValue init = require(initial);
-      if (init.kind != CValueKind::Scalar || init.spelling.empty() ||
-          !mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
-              result.getType()))
+      if (init.spelling.empty())
+        return op.emitError("ordered while has an unavailable carried value");
+      CValue value;
+      if (init.kind == CValueKind::Scalar &&
+          mlir::isa<mlir::IndexType, mlir::IntegerType, mlir::FloatType>(
+              result.getType())) {
+        value = CValue{result.getType(), CValueKind::Scalar,
+                       fresh("while_carry")};
+        line(scalarCType(elementType(result.getType())) + " " + value.spelling +
+             " = " + init.spelling + ";");
+      } else if (init.kind == CValueKind::F32BlockStorage) {
+        auto selected = controlBlockElements.find(result);
+        if (selected == controlBlockElements.end())
+          return op.emitError(
+              "ordered while block carry has no physical storage decision");
+        value = CValue{result.getType(), CValueKind::F32BlockStorage,
+                       fresh("while_block_carry")};
+        line("float " + value.spelling + "[" +
+             std::to_string(selected->second) + "];");
+        if (mlir::failed(copyF32Block(op.getOperation(), value, init,
+                                      selected->second, "while_init")))
+          return mlir::failure();
+      } else {
         return op.emitError(
-            "ordered while currently carries only available scalar values");
-      CValue value{result.getType(), CValueKind::Scalar, fresh("while_carry")};
-      line(scalarCType(elementType(result.getType())) + " " + value.spelling +
-           " = " + init.spelling + ";");
+            "ordered while carried value has no physical realization");
+      }
       values[result] = value;
       carried.push_back(value);
     }
 
-    auto stageScalars = [&](mlir::ValueRange source, llvm::StringRef prefix,
-                            llvm::SmallVectorImpl<CValue> &staged) {
+    auto stageValues = [&](mlir::ValueRange source, llvm::StringRef prefix,
+                           mlir::Operation *owner,
+                           llvm::SmallVectorImpl<CValue> &staged) {
       if (source.size() != carried.size())
         return mlir::failure();
       for (auto [expected, value] : llvm::zip(carried, source)) {
         CValue emitted = require(value);
-        if (emitted.kind != CValueKind::Scalar || emitted.spelling.empty() ||
+        if (emitted.kind != expected.kind || emitted.spelling.empty() ||
             emitted.type != expected.type)
           return mlir::failure();
-        CValue next{emitted.type, CValueKind::Scalar, fresh(prefix)};
-        line(scalarCType(elementType(emitted.type)) + " " + next.spelling +
-             " = " + emitted.spelling + ";");
+        CValue next{emitted.type, emitted.kind, fresh(prefix)};
+        if (emitted.kind == CValueKind::Scalar) {
+          line(scalarCType(elementType(emitted.type)) + " " + next.spelling +
+               " = " + emitted.spelling + ";");
+        } else if (emitted.kind == CValueKind::F32BlockStorage) {
+          std::optional<int64_t> elements =
+              physicalBlockElementCount(emitted.type);
+          if (!elements)
+            return mlir::failure();
+          line("float " + next.spelling + "[" + std::to_string(*elements) +
+               "];");
+          if (mlir::failed(copyF32Block(owner, next, emitted, *elements,
+                                        "while_stage")))
+            return mlir::failure();
+        } else {
+          return mlir::failure();
+        }
         staged.push_back(next);
+      }
+      return mlir::success();
+    };
+
+    auto assignValues = [&](llvm::ArrayRef<CValue> destination,
+                            llvm::ArrayRef<CValue> source,
+                            mlir::Operation *owner) {
+      for (auto [target, value] : llvm::zip(destination, source)) {
+        if (target.kind == CValueKind::Scalar) {
+          line(target.spelling + " = " + value.spelling + ";");
+          continue;
+        }
+        std::optional<int64_t> elements =
+            physicalBlockElementCount(target.type);
+        if (!elements ||
+            mlir::failed(copyF32Block(owner, target, value, *elements,
+                                      "while_assign")))
+          return mlir::failure();
       }
       return mlir::success();
     };
@@ -4073,15 +4322,18 @@ private:
       return conditionTerminator.emitError(
           "ordered while condition has no scalar realization");
     llvm::SmallVector<CValue> forwarded;
-    if (mlir::failed(stageScalars(conditionTerminator.getValues(),
-                                  "while_forward", forwarded)))
+    if (mlir::failed(stageValues(conditionTerminator.getValues(),
+                                 "while_forward",
+                                 conditionTerminator.getOperation(),
+                                 forwarded)))
       return conditionTerminator.emitError(
-          "ordered while condition forwarded an unavailable scalar value");
+          "ordered while condition forwarded an unavailable value");
 
     line("if (!(" + predicate.spelling + ")) {");
     ++indent;
-    for (auto [destination, value] : llvm::zip(carried, forwarded))
-      line(destination.spelling + " = " + value.spelling + ";");
+    if (mlir::failed(assignValues(carried, forwarded,
+                                  conditionTerminator.getOperation())))
+      return mlir::failure();
     line("break;");
     --indent;
     line("}");
@@ -4093,11 +4345,12 @@ private:
         return mlir::failure();
     auto yield = mlir::cast<YieldOp>(body.getTerminator());
     llvm::SmallVector<CValue> updated;
-    if (mlir::failed(stageScalars(yield.getValues(), "while_next", updated)))
+    if (mlir::failed(stageValues(yield.getValues(), "while_next",
+                                 yield.getOperation(), updated)))
       return yield.emitError(
-          "ordered while body yielded an unavailable scalar value");
-    for (auto [destination, value] : llvm::zip(carried, updated))
-      line(destination.spelling + " = " + value.spelling + ";");
+          "ordered while body yielded an unavailable value");
+    if (mlir::failed(assignValues(carried, updated, yield.getOperation())))
+      return mlir::failure();
     --indent;
     line("}");
     return mlir::success();
@@ -4661,6 +4914,9 @@ private:
         result.fields.push_back(
             CValue{op.getResult().getType(), CValueKind::F32Vector, name});
       }
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {lhs, rhs})))
+        return mlir::failure();
       values[op.getResult()] = std::move(result);
       return mlir::success();
     }
@@ -4732,6 +4988,9 @@ private:
       CValue result{op.getResult().getType(), CValueKind::IndexVector, name};
       result.vectorSEW = resultShape->shape.sew;
       result.vectorLMUL = *resultLMUL;
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {lhs, rhs})))
+        return mlir::failure();
       values[op.getResult()] = std::move(result);
       return mlir::success();
     }
@@ -4784,8 +5043,11 @@ private:
       std::string ratio = std::to_string(activePhysicalEntity->vlaMaskRatio);
       line("vbool" + ratio + "_t " + name + " = " + intrinsic + ratio + "(" +
            lhs.spelling + ", " + rhs.spelling + ", " + activeVL + ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::Mask, name};
+      CValue result{op.getResult().getType(), CValueKind::Mask, name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {lhs, rhs})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     bool f32 = elementType(op.getResult().getType()).isF32();
@@ -4813,8 +5075,12 @@ private:
            " = __riscv_vfmacc_vf_" + suffix + "(" + accumulator.spelling +
            ", " + scalar.spelling + ", " + vector.spelling + ", " + activeVL +
            ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::F16Vector, name};
+      CValue result{op.getResult().getType(), CValueKind::F16Vector, name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result,
+              {accumulator, vector, scalar})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     bool lhsVector = lhs.kind == vectorKind;
@@ -4876,8 +5142,11 @@ private:
     std::string name = fresh("v");
     line(vectorType + std::to_string(lmul) + "_t " + name + " = " +
          intrinsic + "(" + first + ", " + second + ", " + activeVL + ");");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), vectorKind, name};
+    CValue result{op.getResult().getType(), vectorKind, name};
+    if (mlir::failed(attachLogicalValidity(
+            op.getOperation(), op.getResult().getType(), result, {lhs, rhs})))
+      return mlir::failure();
+    values[op.getResult()] = std::move(result);
     return mlir::success();
   }
 
@@ -4907,6 +5176,9 @@ private:
         result.fields.push_back(
             CValue{op.getResult().getType(), CValueKind::F32Vector, name});
       }
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {input})))
+        return mlir::failure();
       values[op.getResult()] = std::move(result);
       return mlir::success();
     }
@@ -4955,8 +5227,11 @@ private:
       else
         return op.emitError(
             "RVV pointwise lowering does not implement unary kind");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+      CValue result{op.getResult().getType(), CValueKind::F32Vector, name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {input})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     std::string expression;
@@ -5054,8 +5329,12 @@ private:
              mask + " = " + intrinsic + maskSuffix + "(" +
              coordinate.spelling + ", " + scalar.spelling + ", " + activeVL +
              ");");
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::Mask, mask};
+        CValue result{op.getResult().getType(), CValueKind::Mask, mask};
+        if (mlir::failed(attachLogicalValidity(
+                op.getOperation(), op.getResult().getType(), result,
+                {lhs, rhs})))
+          return mlir::failure();
+        values[op.getResult()] = std::move(result);
         return mlir::success();
       }
       if (coordinate.kind != CValueKind::Coordinate ||
@@ -5107,8 +5386,11 @@ private:
       line("vbool" + std::to_string(activePhysicalEntity->vlaMaskRatio) + "_t " +
            mask + " = " + intrinsic + maskSuffix + "(" + lane + ", (" +
            scalarType + ")(" + scalar.spelling + "), " + activeVL + ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::Mask, mask};
+      CValue result{op.getResult().getType(), CValueKind::Mask, mask};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {lhs, rhs})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     if (lhs.kind != CValueKind::Scalar || rhs.kind != CValueKind::Scalar)
@@ -5172,8 +5454,11 @@ private:
         line("vfloat32m" + std::to_string(*resultLMUL) + "_t " + name +
              " = " + intrinsic + suffix + "(" + index.spelling + ", " +
              activeVL + ");");
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+        CValue result{op.getResult().getType(), CValueKind::F32Vector, name};
+        if (mlir::failed(attachLogicalValidity(
+                op.getOperation(), op.getResult().getType(), result, {input})))
+          return mlir::failure();
+        values[op.getResult()] = std::move(result);
         return mlir::success();
       }
       if (decision->realization ==
@@ -5185,6 +5470,9 @@ private:
                       input.spelling};
         result.vectorSEW = handoff->sourceShape.sew;
         result.vectorLMUL = *sourceLMUL;
+        if (mlir::failed(attachLogicalValidity(
+                op.getOperation(), op.getResult().getType(), result, {input})))
+          return mlir::failure();
         values[op.getResult()] = std::move(result);
         return mlir::success();
       }
@@ -5209,7 +5497,11 @@ private:
            std::to_string(*resultLMUL) + "_t " + name + " = " +
            intrinsic + resultSuffix + "(" + input.spelling + ", " + activeVL +
            ");");
-      values[op.getResult()] = CValue{op.getResult().getType(), resultKind, name};
+      CValue result{op.getResult().getType(), resultKind, name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result, {input})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     if (input.kind != CValueKind::Scalar)
@@ -5254,8 +5546,11 @@ private:
          " = __riscv_vnclip_wx_i8m" +
          std::to_string(*resultLMUL) + "(" + intermediate +
          ", 0, __RISCV_VXRM_RNE, " + activeVL + ");");
-    values[op.getResult()] =
-        CValue{op.getResult().getType(), CValueKind::I8Vector, result};
+    CValue value{op.getResult().getType(), CValueKind::I8Vector, result};
+    if (mlir::failed(attachLogicalValidity(
+            op.getOperation(), op.getResult().getType(), value, {input})))
+      return mlir::failure();
+    values[op.getResult()] = std::move(value);
     return mlir::success();
   }
 
@@ -5339,6 +5634,10 @@ private:
       CValue result{op.getResult().getType(), CValueKind::IndexVector, name};
       result.vectorSEW = resultShape->shape.sew;
       result.vectorLMUL = *lmul;
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result,
+              {predicate, trueValue, falseValue})))
+        return mlir::failure();
       values[op.getResult()] = std::move(result);
       return mlir::success();
     }
@@ -5371,8 +5670,12 @@ private:
       line("vfloat32m" + std::to_string(lmul) + "_t " + name +
            " = __riscv_vmerge_vvm_" + suffix + "(" + *falseVector + ", " +
            *trueVector + ", " + predicate.spelling + ", " + activeVL + ");");
-      values[op.getResult()] =
-          CValue{op.getResult().getType(), CValueKind::F32Vector, name};
+      CValue result{op.getResult().getType(), CValueKind::F32Vector, name};
+      if (mlir::failed(attachLogicalValidity(
+              op.getOperation(), op.getResult().getType(), result,
+              {predicate, trueValue, falseValue})))
+        return mlir::failure();
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     if (predicate.kind != CValueKind::Scalar ||
@@ -5790,7 +6093,6 @@ private:
         mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getRhs().getType()));
     BlockType resultType = mlir::dyn_cast<BlockType>(
         unwrapLogicalValidity(dot.getResult().getType()));
-    auto init = dot.getInit().getDefiningOp<FullOp>();
     if (!lhsType || !rhsType || !resultType ||
         lhsType.getShape().size() != 2 ||
         rhsType.getShape().size() != 1 || resultType.getShape().size() != 1 ||
@@ -5798,9 +6100,15 @@ private:
         lhsType.getShape()[1] != rhsType.getShape()[0] ||
         resultType.getShape()[0] <= 0 || resultType.getShape()[0] > 8 ||
         !lhsType.getElementType().isF32() ||
-        !rhsType.getElementType().isF32() ||
-        !resultType.getElementType().isF32() || !init ||
-        !isFloatConstant(init.getValue(), 0.0) ||
+        !rhsType.getElementType().isF32() || !resultType.getElementType().isF32() ||
+        !mlir::isa<BlockType>(dot.getInit().getType()) ||
+        mlir::cast<BlockType>(dot.getInit().getType()).getShape() !=
+            resultType.getShape() ||
+        mlir::cast<BlockType>(dot.getInit().getType()).getAxisIds() !=
+            resultType.getAxisIds() ||
+        !mlir::cast<BlockType>(dot.getInit().getType())
+             .getElementType()
+             .isF32() ||
         dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
         !dot.getAccDtype().isF32()) {
       dot.emitError(
@@ -5815,15 +6123,10 @@ private:
       return mlir::failure();
     }
 
-    llvm::DenseSet<mlir::Operation *> lhsClosure;
-    llvm::DenseSet<mlir::Operation *> rhsClosure;
-    llvm::SmallVector<BlockIndexOp> lhsAxes;
-    llvm::SmallVector<BlockIndexOp> rhsAxes;
-    if (mlir::failed(collectBlockClosure(dot.getLhs(), lhsClosure, lhsAxes,
-                                         dot.getOperation())) ||
-        mlir::failed(collectBlockClosure(dot.getRhs(), rhsClosure, rhsAxes,
-                                         dot.getOperation())))
-      return mlir::failure();
+    llvm::SmallVector<BlockIndexOp> lhsAxes =
+        blockAxesForType(dot.getLhs().getType());
+    llvm::SmallVector<BlockIndexOp> rhsAxes =
+        blockAxesForType(dot.getRhs().getType());
     if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
         !llvm::is_contained(lhsAxes, rhsAxes.front())) {
       dot.emitError(
@@ -5896,12 +6199,15 @@ private:
       return mlir::failure();
     }
     RVVVectorShape computeShape = rvvShape(32, physical->lmul);
-    for (mlir::Value value : {dot.getLhs(), dot.getRhs(), dot.getResult()})
+    for (mlir::Value value :
+         {dot.getLhs(), dot.getRhs(), dot.getInit(), dot.getResult()})
       recordPhysicalValue(planned.entity, value, computeShape);
     recordPhysicalHandoff(planned.entity, dot.getOperation(), dot.getLhs(),
                           PhysicalHandoff::Reload, computeShape, computeShape);
     recordPhysicalHandoff(planned.entity, dot.getOperation(), dot.getRhs(),
                           PhysicalHandoff::Reload, computeShape, computeShape);
+    recordPhysicalHandoff(planned.entity, dot.getOperation(), dot.getInit(),
+                          PhysicalHandoff::Share, computeShape, computeShape);
     recordPhysicalHandoff(planned.entity, dot.getOperation(), dot.getResult(),
                           PhysicalHandoff::LocalPack, computeShape,
                           computeShape);
@@ -5930,6 +6236,12 @@ private:
       return mlir::failure();
     const DotDecision &decision = selected->second.realization;
     const PhysicalEntityPlan &entity = selected->second.entity;
+    if (mlir::failed(requirePhysicalHandoff(
+            dot.getOperation(), entity, dot.getInit(), PhysicalHandoff::Share)))
+      return mlir::failure();
+    CValue init = require(dot.getInit());
+    if (init.kind != CValueKind::F32BlockStorage || init.spelling.empty())
+      return dot.emitError("local dot init block storage is unavailable");
     auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
     std::string extent = expression(decision.reductionExtent);
@@ -6077,8 +6389,9 @@ private:
         line("vfloat32m1_t " + reduced +
              " = __riscv_vfredusum_vs_" + vectorSuffix + "_f32m1(" +
              accumulators[lane] + ", " + seed + ", " + fullVL + ");");
-        line(storage + "[" + std::to_string(lane) +
-             "] = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
+        line(storage + "[" + std::to_string(lane) + "] = " + init.spelling +
+             "[" + std::to_string(lane) +
+             "] + __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
       }
       return mlir::success();
     };
@@ -6098,7 +6411,7 @@ private:
     --indent;
     line("}");
 
-    if (mlir::failed(markDiscardedPrivateBlockTrees(
+    if (mlir::failed(markRematerializedBlockTrees(
             {dot.getLhs(), dot.getRhs(), dot.getInit()}, dot.getOperation())))
       return mlir::failure();
     loweredBlockOps.insert(dot.getOperation());
@@ -6239,16 +6552,26 @@ private:
         return true;
       };
       line(vectorType + " " + name + ";");
+      std::string logicalValidity;
+      bool carriesLogicalValidity =
+          decision->inactiveLane ==
+          VLAInactiveLaneRealization::ZeroCarrierWithLogicalValidity;
       if (decision->activityMode == VLAActivityMode::PredicateMask) {
         CValue predicate = require(decision->predicate);
         CValue other = require(op.getOther());
-        if (predicate.kind != CValueKind::Mask || predicate.spelling.empty() ||
-            other.kind != CValueKind::Scalar || other.spelling.empty())
+        if (predicate.kind != CValueKind::Mask || predicate.spelling.empty())
           return op.emitError(
-              "masked VLA load requires a physical mask and scalar passthrough");
+              "masked VLA load requires a selected physical predicate mask");
+        if (!carriesLogicalValidity &&
+            (other.kind != CValueKind::Scalar || other.spelling.empty()))
+          return op.emitError(
+              "predicated VLA load requires an explicit scalar passthrough");
         std::string broadcast = f32 || f16 ? "__riscv_vfmv_v_f_"
                                           : "__riscv_vmv_v_x_";
-        line(name + " = " + broadcast + suffix + "(" + other.spelling + ", " +
+        std::string passthrough = carriesLogicalValidity
+                                      ? (f32 || f16 ? "0.0f" : "0")
+                                      : other.spelling;
+        line(name + " = " + broadcast + suffix + "(" + passthrough + ", " +
              activeVL + ");");
         std::string intrinsic;
         std::string arguments;
@@ -6291,13 +6614,18 @@ private:
                       pointer.spelling + ", " + offsets + ", " + activeVL;
         }
         line(name + " = " + intrinsic + "(" + arguments + ");");
+        if (carriesLogicalValidity)
+          logicalValidity = predicate.spelling;
       } else if (decision->activityMode == VLAActivityMode::ScalarPredicate) {
         CValue predicate = require(decision->predicate);
         CValue other = require(op.getOther());
-        if (predicate.kind != CValueKind::Scalar || predicate.spelling.empty() ||
-            other.kind != CValueKind::Scalar || other.spelling.empty())
+        if (predicate.kind != CValueKind::Scalar || predicate.spelling.empty())
           return op.emitError(
-              "scalar-predicated VLA load requires a scalar predicate and other");
+              "scalar-predicated VLA load requires a selected scalar predicate");
+        if (!carriesLogicalValidity &&
+            (other.kind != CValueKind::Scalar || other.spelling.empty()))
+          return op.emitError(
+              "scalar-predicated VLA load requires an explicit passthrough");
         line("if (" + predicate.spelling + ") {");
         ++indent;
         if (!emitRead())
@@ -6308,28 +6636,42 @@ private:
         ++indent;
         std::string broadcast = f32 || f16 ? "__riscv_vfmv_v_f_"
                                           : "__riscv_vmv_v_x_";
-        line(name + " = " + broadcast + suffix + "(" + other.spelling + ", " +
+        std::string passthrough = carriesLogicalValidity
+                                      ? (f32 || f16 ? "0.0f" : "0")
+                                      : other.spelling;
+        line(name + " = " + broadcast + suffix + "(" + passthrough + ", " +
              activeVL + ");");
         --indent;
         line("}");
+        if (carriesLogicalValidity) {
+          if (!activePhysicalEntity || activePhysicalEntity->vlaMaskRatio == 0)
+            return op.emitError(
+                "logical validity has no selected physical mask shape");
+          std::string ratio =
+              std::to_string(activePhysicalEntity->vlaMaskRatio);
+          logicalValidity = fresh("valid");
+          line("vbool" + ratio + "_t " + logicalValidity + " = " +
+               predicate.spelling + " ? __riscv_vmset_m_b" + ratio + "(" +
+               activeVL + ") : __riscv_vmclr_m_b" + ratio + "(" + activeVL +
+               ");");
+        }
       } else {
         if (!emitRead())
           return op.emitError(
               "indexed VLA load decision has no intrinsic-C spelling");
       }
-      if (f32) {
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::F32Vector, name};
-      } else if (f16) {
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::F16Vector, name};
-      } else if (u8) {
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::U8Vector, name};
-      } else {
-        values[op.getResult()] =
-            CValue{op.getResult().getType(), CValueKind::U32Vector, name};
-      }
+      CValue result{op.getResult().getType(),
+                    f32   ? CValueKind::F32Vector
+                    : f16 ? CValueKind::F16Vector
+                    : u8  ? CValueKind::U8Vector
+                          : CValueKind::U32Vector,
+                    name};
+      result.logicalValidity = std::move(logicalValidity);
+      if (mlir::isa<MaskedType>(op.getResult().getType()) !=
+          !result.logicalValidity.empty())
+        return op.emitError(
+            "VLA load physical validity disagrees with its Kernel IR result");
+      values[op.getResult()] = std::move(result);
       return mlir::success();
     }
     CValue where = require(op.getWhere());
@@ -6345,6 +6687,25 @@ private:
       return op.emitError("masked scalar load requires an explicit other value");
     values[op.getResult()] = scalarExpression(
         op.getResult(), std::move(expression), "load", true);
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitScalarLoadF16LE(LoadF16LEOp op) {
+    auto selected = physicalPlan.f16LELoads.find(op.getOperation());
+    if (selected == physicalPlan.f16LELoads.end() ||
+        selected->second.realization.realization !=
+            LoadF16LERealization::ScalarBytes)
+      return op.emitError("scalar load_f16_le has no physical decision");
+    if (mlir::failed(requireEntityPlan(op.getOperation(), selected->second)))
+      return mlir::failure();
+    CValue base = require(op.getBase());
+    if (base.kind != CValueKind::Pointer || base.spelling.empty())
+      return op.emitError("scalar load_f16_le base pointer is unavailable");
+    std::string result = fresh("f16_le");
+    line("const float " + result + " = __weft_load_f16_le(" +
+         base.spelling + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
     return mlir::success();
   }
 
@@ -6448,8 +6809,9 @@ private:
         --indent;
         line("}");
       }
-      markDiscardedBlockTree(op.getPointer());
-      markDiscardedBlockTree(op.getWhere());
+      if (mlir::failed(markRematerializedBlockTrees(
+              {op.getPointer(), op.getWhere()}, op.getOperation())))
+        return mlir::failure();
       return mlir::success();
     }
     CValue pointer = require(op.getPointer());
@@ -6665,48 +7027,97 @@ private:
     return axes;
   }
 
-  FullOp findBlockFullRoot(mlir::Value value) const {
-    if (auto full = value.getDefiningOp<FullOp>())
-      return full;
-    if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
-      auto loop =
-          mlir::dyn_cast_or_null<ForOp>(argument.getOwner()->getParentOp());
-      if (loop && argument.getArgNumber() > 0 &&
-          argument.getArgNumber() - 1 < loop.getInitArgs().size())
-        return findBlockFullRoot(
-            loop.getInitArgs()[argument.getArgNumber() - 1]);
-      return {};
+  BlockIndexOp findBlockAxisDefinition(int64_t identity) {
+    BlockIndexOp definition;
+    kernel.walk([&](BlockIndexOp axis) {
+      if (axis.getAxis() == identity)
+        definition = axis;
+    });
+    return definition;
+  }
+
+  llvm::SmallVector<BlockIndexOp> blockAxesForType(mlir::Type type) {
+    llvm::SmallVector<BlockIndexOp> axes;
+    for (int64_t identity : logicalAxisIds(type)) {
+      if (identity <= 0)
+        continue;
+      BlockIndexOp axis = findBlockAxisDefinition(identity);
+      if (axis && !llvm::is_contained(axes, axis))
+        axes.push_back(axis);
     }
-    if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
-      if (auto loop = mlir::dyn_cast<ForOp>(result.getOwner());
-          loop && result.getResultNumber() < loop.getInitArgs().size())
-        return findBlockFullRoot(loop.getInitArgs()[result.getResultNumber()]);
-    return {};
+    return axes;
+  }
+
+  std::optional<int64_t> physicalBlockElementCount(mlir::Type type) {
+    auto block = mlir::dyn_cast<BlockType>(unwrapLogicalValidity(type));
+    if (!block || !block.getElementType().isF32() || block.getShape().empty() ||
+        block.getShape().size() > 2)
+      return std::nullopt;
+    int64_t elements = 1;
+    for (auto [dimension, identity] :
+         llvm::zip(block.getShape(), block.getAxisIds())) {
+      std::optional<int64_t> extent;
+      if (dimension > 0)
+        extent = dimension;
+      else if (identity > 0) {
+        BlockIndexOp axis = findBlockAxisDefinition(identity);
+        if (axis)
+          extent = physicalExtent(axis.getExtent());
+      }
+      if (!extent || *extent <= 0 ||
+          elements > options.target.maxPrivateStackBytes /
+                         static_cast<int64_t>(sizeof(float)) / *extent)
+        return std::nullopt;
+      elements *= *extent;
+    }
+    return elements;
+  }
+
+  mlir::LogicalResult prepareMaterializedBlockValues() {
+    bool failed = false;
+    kernel.walk([&](FullOp full) {
+      if (failed)
+        return;
+      auto block = mlir::dyn_cast<BlockType>(full.getResult().getType());
+      if (!block || !block.getElementType().isF32())
+        return;
+      std::optional<int64_t> elements =
+          physicalBlockElementCount(full.getResult().getType());
+      if (!elements) {
+        full.emitError(
+            "f32 block constructor has no bounded compiler-private storage realization");
+        failed = true;
+        return;
+      }
+      materializedBlockElements.try_emplace(full.getOperation(), *elements);
+    });
+    kernel.walk([&](mlir::Operation *operation) {
+      if (failed || !mlir::isa<IfOp, ForOp, WhileOp>(operation))
+        return;
+      for (mlir::Value result : operation->getResults()) {
+        auto block =
+            mlir::dyn_cast<BlockType>(unwrapLogicalValidity(result.getType()));
+        if (!block)
+          continue;
+        std::optional<int64_t> elements =
+            physicalBlockElementCount(result.getType());
+        if (!elements) {
+          operation->emitError(
+              "block control carry has no bounded f32 storage realization");
+          failed = true;
+          return;
+        }
+        controlBlockElements.try_emplace(result, *elements);
+      }
+    });
+    return failed ? mlir::failure() : mlir::success();
   }
 
   mlir::LogicalResult selectMaterializedBlockStorage(mlir::Value value,
                                                      mlir::Operation *owner) {
-    FullOp full = findBlockFullRoot(value);
-    if (!full)
+    if (!physicalBlockElementCount(value.getType()))
       return owner->emitError(
-          "selected local primitive has no explicit block accumulator root");
-    int64_t elements = 1;
-    for (mlir::Value axisValue : full.getAxes()) {
-      auto axis = axisValue.getDefiningOp<BlockIndexOp>();
-      std::optional<int64_t> extent =
-          axis ? physicalExtent(axis.getExtent()) : std::nullopt;
-      if (!extent || *extent <= 0 ||
-          elements > options.target.maxPrivateStackBytes /
-                         static_cast<int64_t>(sizeof(float)) / *extent)
-        return owner->emitError(
-            "local accumulator has no bounded compiler-private storage realization");
-      elements *= *extent;
-    }
-    auto [selected, inserted] = materializedBlockElements.try_emplace(
-        full.getOperation(), elements);
-    if (!inserted && selected->second != elements)
-      return owner->emitError(
-          "local accumulator has conflicting physical storage decisions");
+          "selected local primitive has no bounded f32 accumulator domain");
     return mlir::success();
   }
 
@@ -6715,12 +7126,20 @@ private:
                               llvm::DenseSet<mlir::Value> &visited) const {
     if (!value || !visited.insert(value).second)
       return std::nullopt;
+    if (auto selected = controlBlockElements.find(value);
+        selected != controlBlockElements.end())
+      return selected->second;
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
-      auto loop = mlir::dyn_cast_or_null<ForOp>(argument.getOwner()->getParentOp());
-      if (loop && argument.getArgNumber() > 0 &&
+      mlir::Operation *parent = argument.getOwner()->getParentOp();
+      if (auto loop = mlir::dyn_cast_or_null<ForOp>(parent);
+          loop && argument.getArgNumber() > 0 &&
           argument.getArgNumber() - 1 < loop.getInitArgs().size())
         return materializedF32ElementCount(
             loop.getInitArgs()[argument.getArgNumber() - 1], visited);
+      if (auto loop = mlir::dyn_cast_or_null<WhileOp>(parent);
+          loop && argument.getArgNumber() < loop.getInitArgs().size())
+        return materializedF32ElementCount(
+            loop.getInitArgs()[argument.getArgNumber()], visited);
       return std::nullopt;
     }
     mlir::Operation *definition = value.getDefiningOp();
@@ -6749,12 +7168,11 @@ private:
     auto pointwise = physicalPlan.materializedF32Pointwise.find(definition);
     if (pointwise != physicalPlan.materializedF32Pointwise.end())
       return pointwise->second.realization.elements;
-    if (auto result = mlir::dyn_cast<mlir::OpResult>(value)) {
-      if (auto loop = mlir::dyn_cast<ForOp>(result.getOwner());
-          loop && result.getResultNumber() < loop.getInitArgs().size())
-        return materializedF32ElementCount(
-            loop.getInitArgs()[result.getResultNumber()], visited);
-    }
+    if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+      if (mlir::isa<IfOp, ForOp, WhileOp>(result.getOwner()))
+        if (auto selected = controlBlockElements.find(value);
+            selected != controlBlockElements.end())
+          return selected->second;
     auto block = mlir::dyn_cast<BlockType>(unwrapLogicalValidity(value.getType()));
     if (!block || !block.getElementType().isF32())
       return std::nullopt;
@@ -6794,7 +7212,6 @@ private:
       if (!resultType || !resultType.getElementType().isF32())
         return;
       std::optional<int64_t> elements;
-      mlir::Value reusedStorage;
       for (mlir::Value operand : operation->getOperands()) {
         if (!containsBlockType(operand.getType()))
           continue;
@@ -6815,8 +7232,6 @@ private:
           return;
         }
         elements = operandElements;
-        if (!reusedStorage && operand.hasOneUse())
-          reusedStorage = operand;
       }
       if (!elements)
         return;
@@ -6834,12 +7249,11 @@ private:
                                  ? MaterializedF32PointwiseRealization::Binary
                                  : MaterializedF32PointwiseRealization::Unary;
       decision.elements = *elements;
-      decision.reusedStorage = reusedStorage;
       PlannedPhysicalDecision<MaterializedF32PointwiseDecision> planned(
           std::move(decision));
       initializeEntityPlan(planned.entity);
       planned.entity.storages.push_back(PhysicalStorageDecision{
-          result, reusedStorage, *elements, 16});
+          result, {}, *elements, 16});
       if (!physicalPlan.materializedF32Pointwise
                .try_emplace(operation, std::move(planned))
                .second) {
@@ -7153,7 +7567,7 @@ private:
   }
 
   void finalizeSymmetricI4I8Plan(
-      SymmetricI4I8ContractOp op,
+      SymmetricI4I8DotOp op,
       PlannedPhysicalDecision<SymmetricI4I8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
     RVVVectorShape codeShape = planned.realization.realization ==
@@ -7161,12 +7575,11 @@ private:
                                    ? kRVVE8MF4
                                    : rvvShape(8, 2);
     RVVVectorShape accumulatorShape{32, 4};
-    for (mlir::Value value :
-         {planned.realization.activation, planned.realization.packedWeight}) {
-      recordPhysicalValue(planned.entity, value, codeShape);
-      recordPhysicalHandoff(planned.entity, op.getOperation(), value,
-                            PhysicalHandoff::LocalPack, codeShape, codeShape);
-    }
+    recordPhysicalValue(planned.entity, planned.realization.activation,
+                        codeShape);
+    recordPhysicalHandoff(planned.entity, op.getOperation(),
+                          planned.realization.activation,
+                          PhysicalHandoff::LocalPack, codeShape, codeShape);
     recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
     recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
@@ -7185,7 +7598,7 @@ private:
   }
 
   void finalizeAffineI4I8Plan(
-      AffineI4I8ContractOp op,
+      AffineI4I8DotOp op,
       PlannedPhysicalDecision<AffineI4I8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
     RVVVectorShape codeShape = planned.realization.realization ==
@@ -7193,20 +7606,18 @@ private:
                                    ? kRVVE8MF4
                                    : rvvShape(8, 2);
     RVVVectorShape accumulatorShape{32, 4};
-    for (mlir::Value value :
-         {planned.realization.activation, planned.realization.packedWeight,
-          planned.realization.weightZeroPoint}) {
-      recordPhysicalValue(planned.entity, value, codeShape);
-      recordPhysicalHandoff(planned.entity, op.getOperation(), value,
-                            PhysicalHandoff::LocalPack, codeShape, codeShape);
-    }
+    recordPhysicalValue(planned.entity, planned.realization.activation,
+                        codeShape);
+    recordPhysicalHandoff(planned.entity, op.getOperation(),
+                          planned.realization.activation,
+                          PhysicalHandoff::LocalPack, codeShape, codeShape);
     recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
     recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
                           PhysicalHandoff::Share, accumulatorShape,
                           accumulatorShape);
     planned.entity.resources.valueGroups = 4;
-    planned.entity.resources.memoryGroups = 3;
+    planned.entity.resources.memoryGroups = 2;
     planned.entity.resources.primitiveGroups =
         planned.realization.realization ==
                 I4I8FragmentRealization::SpacemiTIME1N16K32
@@ -7320,130 +7731,46 @@ private:
     planned.entity.resources.peakGroups = 4;
   }
 
-  bool matchF16LELoad(mlir::Value value, LoadOp &low, LoadOp &high) const {
-    auto widen = value.getDefiningOp<CastOp>();
-    auto bits = widen ? widen.getInput().getDefiningOp<BitcastOp>() : BitcastOp{};
-    auto combine = bits ? bits.getInput().getDefiningOp<BinaryOp>() : BinaryOp{};
-    if (!widen || !bits || !combine || combine.getKind() != "or" ||
-        !isF16(elementType(bits.getResult().getType())) ||
-        !elementType(widen.getResult().getType()).isF32())
-      return false;
-
-    auto lowCast = combine.getLhs().getDefiningOp<CastOp>();
-    auto shift = combine.getRhs().getDefiningOp<BinaryOp>();
-    if (!lowCast || !shift || shift.getKind() != "shl" ||
-        integerConstant(shift.getRhs()) != 8)
-      return false;
-    auto highCast = shift.getLhs().getDefiningOp<CastOp>();
-    low = lowCast.getInput().getDefiningOp<LoadOp>();
-    high = highCast ? highCast.getInput().getDefiningOp<LoadOp>() : LoadOp{};
-    if (!low || !high || !isTrue(low.getWhere()) || !isTrue(high.getWhere()) ||
-        !elementType(low.getResult().getType()).isUnsignedInteger(8) ||
-        !elementType(high.getResult().getType()).isUnsignedInteger(8))
-      return false;
-    auto highPointer = high.getPointer().getDefiningOp<PtrAddOp>();
-    return highPointer && highPointer.getBase() == low.getPointer() &&
-           integerConstant(highPointer.getOffset()) == 1;
-  }
-
-  mlir::LogicalResult decideSymmetricI4I8Contract(
-      SymmetricI4I8ContractOp op, SymmetricI4I8Decision &decision) {
+  mlir::LogicalResult decideSymmetricI4I8Dot(
+      SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
     bool useIME1 = options.target.hasMatrixExtension(RISCVMatrixExtension::SpacemitIME1);
     if (useIME1 && options.target.vlenBits != 256)
       return op.emitError(
-          "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+          "SpacemiT IME1 dot requires an explicit 256-bit VLEN target fact");
     if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
       return op.emitError(
-          "symmetric i4/i8 RVV contraction requires VLEN of at least 128 bits");
+          "symmetric i4/i8 RVV dot requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
-          "symmetric i4/i8 contraction requires little-endian packed fields");
+          "symmetric i4/i8 dot requires little-endian packed fields");
 
-    LoadOp activationLoad = op.getActivation().getDefiningOp<LoadOp>();
-    LoadOp packedCodeLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
-    LoadOp scaleLow;
-    LoadOp scaleHigh;
-    if (!activationLoad || !packedCodeLoad ||
-        !matchF16LELoad(op.getWeightScale(), scaleLow, scaleHigh) ||
-        !isTrue(activationLoad.getWhere()) ||
-        !isTrue(packedCodeLoad.getWhere()))
+    std::optional<LocalBlockMemoryFact> activation =
+        resolveLocalBlockMemoryFact(op.getActivation());
+    if (!activation)
       return op.emitError(
-          "IME1 symmetric contraction requires explicit activation, scale, and packed-code loads");
-
-    auto activationLane = activationLoad.getPointer().getDefiningOp<PtrAddOp>();
-    if (!activationLane || !matchBlockAxis(activationLane.getOffset(), 32))
+          "symmetric i4/i8 dot requires one typed K32 activation memory fact");
+    if (activation->semanticExtent != 32 || activation->storageExtent != 32 ||
+        !activation->semanticType.getElementType().isSignedInteger(8) ||
+        !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "IME1 symmetric contraction requires a contiguous K32 activation block");
-
-    auto scaleLane = scaleLow.getPointer().getDefiningOp<PtrAddOp>();
-    mlir::Value scaleColumn;
-    if (!scaleLane ||
-        !matchBinaryConstant(scaleLane.getOffset(), "mul", 2, scaleColumn) ||
-        !matchBlockAxis(scaleColumn, 16) ||
-        scalarPointerBase(scaleHigh.getPointer()) != scaleLane.getBase())
-      return op.emitError(
-          "IME1 symmetric contraction requires sixteen little-endian fp16 scales");
-    mlir::Value packedBase = scaleLane.getBase();
-    auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
-    mlir::Value packedBlockIndex;
+          "symmetric i4/i8 dot requires contiguous signed-i8 K32 activation memory");
+    mlir::Value packedBase = op.getPackedBase();
     int64_t packedBlockBytes = 288;
-    if (!packedPointer ||
-        !matchBinaryConstant(packedPointer.getOffset(), "mul",
-                             packedBlockBytes, packedBlockIndex))
-      return op.emitError(
-          "IME1 symmetric contraction requires the explicit 288-byte persistent packed block");
     mlir::Value packedRoot = pointerRoot(packedBase);
     auto packedType =
         packedRoot ? mlir::dyn_cast<PtrType>(packedRoot.getType()) : PtrType{};
     if (!packedType || packedType.getStorageClass() != "persistent" ||
         packedType.getStorageFormat() != "q4_0_n16_k32_288b")
       return op.emitError(
-          "symmetric i4/i8 contraction requires persistent format q4_0_n16_k32_288b");
-    (void)packedBlockIndex;
-
-    auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
-    auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
-                            : BinaryOp{};
-    auto columnAdd = withinAdd ? withinAdd.getBase().getDefiningOp<PtrAddOp>()
-                               : PtrAddOp{};
-    mlir::Value expandedColumn;
-    auto halfAdd = columnAdd ? columnAdd.getBase().getDefiningOp<PtrAddOp>()
-                             : PtrAddOp{};
-    mlir::Value halfIndex;
-    auto payloadBase = halfAdd ? halfAdd.getBase().getDefiningOp<PtrAddOp>()
-                               : PtrAddOp{};
-    if (!withinAdd || !within || within.getKind() != "mod" ||
-        integerConstant(within.getRhs()) != 8 || !columnAdd ||
-        !matchBinaryConstant(columnAdd.getOffset(), "mul", 8, expandedColumn) ||
-        !matchExpandedAxis(expandedColumn, scaleColumn, 1) || !halfAdd ||
-        !matchBinaryConstant(halfAdd.getOffset(), "mul", 128, halfIndex) ||
-        !payloadBase || payloadBase.getBase() != packedBase ||
-        integerConstant(payloadBase.getOffset()) != 32)
-      return op.emitError(
-          "IME1 symmetric contraction requires the explicit two-half packed-i4 payload");
-    auto half = halfIndex.getDefiningOp<BinaryOp>();
-    auto expandedByte = within.getLhs().getDefiningOp<ExpandDimsOp>();
-    auto expandedHalfByte =
-        half ? half.getLhs().getDefiningOp<ExpandDimsOp>() : ExpandDimsOp{};
-    if (!half || half.getKind() != "div" ||
-        integerConstant(half.getRhs()) != 8 || !expandedByte ||
-        expandedByte.getAxis() != 0 || !expandedHalfByte ||
-        expandedHalfByte.getAxis() != 0 ||
-        expandedHalfByte.getInput() != expandedByte.getInput() ||
-        !matchBlockAxis(expandedByte.getInput(), 16))
-      return op.emitError(
-          "IME1 symmetric contraction requires a local sixteen-byte packed axis");
-
+          "symmetric i4/i8 dot requires persistent format q4_0_n16_k32_288b");
     decision = SymmetricI4I8Decision{};
     decision.realization = useIME1
                                ? I4I8FragmentRealization::SpacemiTIME1N16K32
                                : I4I8FragmentRealization::RVVN16K32;
-    decision.activationBlockBase = activationLane.getBase();
+    decision.activationBlockBase = activation->base;
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
-    decision.packedWeight = op.getPackedWeight();
     decision.activationScale = op.getActivationScale();
-    decision.weightScale = op.getWeightScale();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
@@ -7452,19 +7779,18 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult emitSymmetricI4I8Contract(
-      SymmetricI4I8ContractOp op) {
+  mlir::LogicalResult emitSymmetricI4I8Dot(
+      SymmetricI4I8DotOp op) {
     auto selected = physicalPlan.symmetricI4I8.find(op.getOperation());
     if (selected == physicalPlan.symmetricI4I8.end())
       return op.emitError("symmetric i4/i8 physical decision was not prepared");
     if (mlir::failed(requireEntityPlan(op.getOperation(), selected->second)))
       return mlir::failure();
     const SymmetricI4I8Decision &decision = selected->second.realization;
-    for (mlir::Value value : {decision.activation, decision.packedWeight})
-      if (mlir::failed(requirePhysicalHandoff(
-              op.getOperation(), selected->second.entity, value,
-              PhysicalHandoff::LocalPack)))
-        return mlir::failure();
+    if (mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, decision.activation,
+            PhysicalHandoff::LocalPack)))
+      return mlir::failure();
     CValue activation = require(decision.activationBlockBase);
     CValue packed = require(decision.packedBlockBase);
     CValue scale = require(decision.activationScale);
@@ -7476,7 +7802,7 @@ private:
         activation.spelling.empty() || packed.spelling.empty() ||
         scale.spelling.empty() || accumulator.spelling.empty())
       return op.emitError(
-          "selected IME1 symmetric contraction operands are unavailable");
+          "selected IME1 symmetric dot operands are unavailable");
     llvm::StringRef helper =
         decision.realization == I4I8FragmentRealization::SpacemiTIME1N16K32
             ? "__weft_ime1_symmetric_i4_i8_n16_k32"
@@ -7484,10 +7810,9 @@ private:
     line(helper.str() + "(" + scale.spelling + ", " +
          activation.spelling + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
-    for (mlir::Value operand :
-         {decision.activation, decision.packedWeight, decision.weightScale,
-          decision.init})
-      markDiscardedBlockTree(operand);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.activation, decision.init}, op.getOperation())))
+      return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
     accumulator.type = op.getResult().getType();
     values[op.getResult()] = std::move(accumulator);
@@ -7511,24 +7836,14 @@ private:
         });
     if (storageDecision == selected->second.entity.storages.end() ||
         storageDecision->elements != decision.elements ||
-        storageDecision->reusedStorage != decision.reusedStorage ||
+        storageDecision->reusedStorage ||
         decision.elements <= 0)
       return operation->emitError(
           "materialized pointwise storage decision is incomplete");
 
-    std::string storage;
-    if (decision.reusedStorage) {
-      CValue reused = require(decision.reusedStorage);
-      if (reused.kind != CValueKind::F32BlockStorage ||
-          reused.spelling.empty())
-        return operation->emitError(
-            "selected pointwise input storage is unavailable");
-      storage = reused.spelling;
-    } else {
-      storage = fresh("pointwise_result");
-      line("float " + storage + "[" + std::to_string(decision.elements) +
-           "];");
-    }
+    std::string storage = fresh("pointwise_result");
+    line("float " + storage + "[" + std::to_string(decision.elements) +
+         "];");
     std::string lane = fresh("pointwise_lane");
     auto operandAt = [&](mlir::Value value) -> std::optional<std::string> {
       CValue operand = require(value);
@@ -7543,9 +7858,14 @@ private:
     if (auto binary = mlir::dyn_cast<BinaryOp>(operation)) {
       std::optional<std::string> lhs = operandAt(binary.getLhs());
       std::optional<std::string> rhs = operandAt(binary.getRhs());
-      if (!lhs || !rhs)
-        return binary.emitError(
-            "materialized binary operands are unavailable");
+      if (!lhs || !rhs) {
+        CValue lhsValue = require(binary.getLhs());
+        CValue rhsValue = require(binary.getRhs());
+        return binary.emitError()
+               << "materialized binary operands are unavailable (lhs kind "
+               << static_cast<int>(lhsValue.kind) << ", rhs kind "
+               << static_cast<int>(rhsValue.kind) << ")";
+      }
       rhsExpression = llvm::StringSwitch<std::string>(binary.getKind())
                           .Case("add", "(" + *lhs + " + " + *rhs + ")")
                           .Case("sub", "(" + *lhs + " - " + *rhs + ")")
@@ -7563,7 +7883,6 @@ private:
                           .Case("neg", "(-" + *input + ")")
                           .Case("exp", "expf(" + *input + ")")
                           .Case("tanh", "tanhf(" + *input + ")")
-                          .Case("exp2", "exp2f(" + *input + ")")
                           .Case("log", "logf(" + *input + ")")
                           .Case("sqrt", "sqrtf(" + *input + ")")
                           .Case("rsqrt", "(1.0f / sqrtf(" + *input + "))")
@@ -7620,8 +7939,9 @@ private:
            stored->second.spelling + "[" + lane + "];");
       --indent;
       line("}");
-      markDiscardedBlockTree(op.getPointer());
-      markDiscardedBlockTree(op.getWhere());
+      if (mlir::failed(markRematerializedBlockTrees(
+              {op.getPointer(), op.getWhere()}, op.getOperation())))
+        return mlir::failure();
       loweredBlockOps.insert(op.getOperation());
       consumed.insert(op.getOperation());
       return std::optional<mlir::LogicalResult>(mlir::success());
@@ -7653,8 +7973,9 @@ private:
       line("}");
       --indent;
       line("}");
-      markDiscardedBlockTree(op.getPointer());
-      markDiscardedBlockTree(op.getWhere());
+      if (mlir::failed(markRematerializedBlockTrees(
+              {op.getPointer(), op.getWhere()}, op.getOperation())))
+        return mlir::failure();
       loweredBlockOps.insert(op.getOperation());
       consumed.insert(op.getOperation());
       return std::optional<mlir::LogicalResult>(mlir::success());
@@ -7693,7 +8014,9 @@ private:
     line(offset + " += " + vl + ";");
     --indent;
     line("}");
-    markDiscardedBlockTree(op.getPointer());
+    if (mlir::failed(markRematerializedBlockTrees(
+            {op.getPointer()}, op.getOperation())))
+      return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
     consumed.insert(op.getOperation());
     return std::optional<mlir::LogicalResult>(mlir::success());
@@ -7785,8 +8108,11 @@ private:
          signScale.spelling + ";");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(decision.signBits.semanticValue);
-    markDiscardedBlockTree(decision.activation.semanticValue);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.signBits.semanticValue,
+             decision.activation.semanticValue},
+            op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
@@ -7856,8 +8182,11 @@ private:
            init.spelling + ");");
       values[op.getResult()] =
           CValue{op.getResult().getType(), CValueKind::Scalar, result};
-      markDiscardedBlockTree(decision.packedCodes.semanticValue);
-      markDiscardedBlockTree(decision.activation.semanticValue);
+      if (mlir::failed(markRematerializedBlockTrees(
+              {decision.packedCodes.semanticValue,
+               decision.activation.semanticValue},
+              op.getOperation())))
+        return mlir::failure();
       return mlir::success();
     }
 
@@ -7905,8 +8234,11 @@ private:
          activationScale.spelling + ";");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(decision.packedCodes.semanticValue);
-    markDiscardedBlockTree(decision.activation.semanticValue);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.packedCodes.semanticValue,
+             decision.activation.semanticValue},
+            op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
@@ -7991,10 +8323,13 @@ private:
          init.spelling + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
-    markDiscardedBlockTree(decision.packedWeight.semanticValue);
-    markDiscardedBlockTree(decision.scaleMin.semanticValue);
-    markDiscardedBlockTree(decision.activation.semanticValue);
-    markDiscardedBlockTree(decision.activationSum.semanticValue);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.packedWeight.semanticValue,
+             decision.scaleMin.semanticValue,
+             decision.activation.semanticValue,
+             decision.activationSum.semanticValue},
+            op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
@@ -8084,125 +8419,56 @@ private:
          llvm::join(spellings, ", ") + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    llvm::SmallVector<mlir::Value> blockValues;
     for (const LocalBlockMemoryFact &block : decision.blocks)
-      markDiscardedBlockTree(block.semanticValue);
+      blockValues.push_back(block.semanticValue);
+    if (mlir::failed(
+            markRematerializedBlockTrees(blockValues, op.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
-  mlir::LogicalResult decideAffineI4I8Contract(
-      AffineI4I8ContractOp op, AffineI4I8Decision &decision) {
+  mlir::LogicalResult decideAffineI4I8Dot(
+      AffineI4I8DotOp op, AffineI4I8Decision &decision) {
     bool useIME1 = options.target.hasMatrixExtension(RISCVMatrixExtension::SpacemitIME1);
     if (useIME1 && options.target.vlenBits != 256)
       return op.emitError(
-          "SpacemiT IME1 contraction requires an explicit 256-bit VLEN target fact");
+          "SpacemiT IME1 dot requires an explicit 256-bit VLEN target fact");
     if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
       return op.emitError(
-          "affine i4/i8 RVV contraction requires VLEN of at least 128 bits");
+          "affine i4/i8 RVV dot requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
       return op.emitError(
-          "affine i4/i8 contraction requires little-endian packed fields");
+          "affine i4/i8 dot requires little-endian packed fields");
 
-    LoadOp activationLoad = op.getActivation().getDefiningOp<LoadOp>();
-    LoadOp packedCodeLoad = op.getPackedWeight().getDefiningOp<LoadOp>();
-    LoadOp zeroPointLoad = op.getWeightZeroPoint().getDefiningOp<LoadOp>();
-    LoadOp scaleLow;
-    LoadOp scaleHigh;
-    if (!activationLoad || !packedCodeLoad || !zeroPointLoad ||
-        !matchF16LELoad(op.getWeightScale(), scaleLow, scaleHigh) ||
-        !isTrue(activationLoad.getWhere()) ||
-        !isTrue(packedCodeLoad.getWhere()) ||
-        !isTrue(zeroPointLoad.getWhere()))
+    std::optional<LocalBlockMemoryFact> activation =
+        resolveLocalBlockMemoryFact(op.getActivation());
+    if (!activation)
       return op.emitError(
-          "IME1 affine contraction requires explicit activation, scale, zero-point, and packed-code loads");
-
-    auto activationLane = activationLoad.getPointer().getDefiningOp<PtrAddOp>();
-    if (!activationLane || !matchBlockAxis(activationLane.getOffset(), 32))
+          "affine i4/i8 dot requires one typed K32 activation memory fact");
+    if (activation->semanticExtent != 32 || activation->storageExtent != 32 ||
+        !activation->semanticType.getElementType().isSignedInteger(8) ||
+        !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "IME1 affine contraction requires a contiguous K32 activation block");
-
-    auto zeroPointLane = zeroPointLoad.getPointer().getDefiningOp<PtrAddOp>();
-    auto zeroPointBase =
-        zeroPointLane ? zeroPointLane.getBase().getDefiningOp<PtrAddOp>()
-                      : PtrAddOp{};
-    if (!zeroPointLane || !zeroPointBase ||
-        !matchBlockAxis(zeroPointLane.getOffset(), 16) ||
-        integerConstant(zeroPointBase.getOffset()) != 32)
-      return op.emitError(
-          "IME1 affine contraction requires an explicit N16 zero-point field");
-    mlir::Value columnAxis = zeroPointLane.getOffset();
-    mlir::Value packedBase = zeroPointBase.getBase();
-
-    auto scaleLane = scaleLow.getPointer().getDefiningOp<PtrAddOp>();
-    mlir::Value scaleColumn;
-    if (!scaleLane || scaleLane.getBase() != packedBase ||
-        !matchBinaryConstant(scaleLane.getOffset(), "mul", 2, scaleColumn) ||
-        scaleColumn != columnAxis ||
-        scalarPointerBase(scaleHigh.getPointer()) != packedBase)
-      return op.emitError(
-          "IME1 affine contraction requires sixteen little-endian fp16 scales");
-
-    auto withinAdd = packedCodeLoad.getPointer().getDefiningOp<PtrAddOp>();
-    auto within = withinAdd ? withinAdd.getOffset().getDefiningOp<BinaryOp>()
-                            : BinaryOp{};
-    auto columnAdd = withinAdd ? withinAdd.getBase().getDefiningOp<PtrAddOp>()
-                               : PtrAddOp{};
-    mlir::Value expandedColumn;
-    auto halfAdd = columnAdd ? columnAdd.getBase().getDefiningOp<PtrAddOp>()
-                             : PtrAddOp{};
-    mlir::Value halfIndex;
-    auto payloadBase = halfAdd ? halfAdd.getBase().getDefiningOp<PtrAddOp>()
-                               : PtrAddOp{};
-    if (!withinAdd || !within || within.getKind() != "mod" ||
-        integerConstant(within.getRhs()) != 8 || !columnAdd ||
-        !matchBinaryConstant(columnAdd.getOffset(), "mul", 8, expandedColumn) ||
-        !matchExpandedAxis(expandedColumn, columnAxis, 1) || !halfAdd ||
-        !matchBinaryConstant(halfAdd.getOffset(), "mul", 128, halfIndex) ||
-        !payloadBase || payloadBase.getBase() != packedBase ||
-        integerConstant(payloadBase.getOffset()) != 48)
-      return op.emitError(
-          "IME1 affine contraction requires the explicit two-half packed-i4 payload");
-    auto half = halfIndex.getDefiningOp<BinaryOp>();
-    auto expandedByte = within.getLhs().getDefiningOp<ExpandDimsOp>();
-    auto expandedHalfByte =
-        half ? half.getLhs().getDefiningOp<ExpandDimsOp>() : ExpandDimsOp{};
-    if (!half || half.getKind() != "div" ||
-        integerConstant(half.getRhs()) != 8 || !expandedByte ||
-        expandedByte.getAxis() != 0 || !expandedHalfByte ||
-        expandedHalfByte.getAxis() != 0 ||
-        expandedHalfByte.getInput() != expandedByte.getInput() ||
-        !matchBlockAxis(expandedByte.getInput(), 16))
-      return op.emitError(
-          "IME1 affine contraction requires a local sixteen-byte packed axis");
-
-    auto packedPointer = packedBase.getDefiningOp<PtrAddOp>();
-    mlir::Value packedBlockIndex;
+          "affine i4/i8 dot requires contiguous signed-i8 K32 activation memory");
+    mlir::Value packedBase = op.getPackedBase();
     int64_t packedBlockBytes = 304;
-    if (!packedPointer ||
-        !matchBinaryConstant(packedPointer.getOffset(), "mul", packedBlockBytes,
-                             packedBlockIndex))
-      return op.emitError(
-          "IME1 affine contraction requires the explicit 304-byte local packed block");
     mlir::Value packedRoot = pointerRoot(packedBase);
     auto packedType =
         packedRoot ? mlir::dyn_cast<PtrType>(packedRoot.getType()) : PtrType{};
     if (!packedType || packedType.getStorageClass() != "persistent" ||
         packedType.getStorageFormat() != "q4_k_n16_k32_304b")
       return op.emitError(
-          "affine i4/i8 contraction requires persistent format q4_k_n16_k32_304b");
-    (void)packedBlockIndex;
-
+          "affine i4/i8 dot requires persistent format q4_k_n16_k32_304b");
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
     decision.realization = useIME1
                                ? I4I8FragmentRealization::SpacemiTIME1N16K32
                                : I4I8FragmentRealization::RVVN16K32;
-    decision.activationBlockBase = activationLane.getBase();
+    decision.activationBlockBase = activation->base;
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
-    decision.packedWeight = op.getPackedWeight();
     decision.activationScale = op.getActivationScale();
-    decision.weightScale = op.getWeightScale();
-    decision.weightZeroPoint = op.getWeightZeroPoint();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
@@ -8211,20 +8477,17 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult emitAffineI4I8Contract(AffineI4I8ContractOp op) {
+  mlir::LogicalResult emitAffineI4I8Dot(AffineI4I8DotOp op) {
     auto selected = physicalPlan.affineI4I8.find(op.getOperation());
     if (selected == physicalPlan.affineI4I8.end())
       return op.emitError("affine i4/i8 physical decision was not prepared");
     if (mlir::failed(requireEntityPlan(op.getOperation(), selected->second)))
       return mlir::failure();
     const AffineI4I8Decision &decision = selected->second.realization;
-    for (mlir::Value value :
-         {decision.activation, decision.packedWeight,
-          decision.weightZeroPoint})
-      if (mlir::failed(requirePhysicalHandoff(
-              op.getOperation(), selected->second.entity, value,
-              PhysicalHandoff::LocalPack)))
-        return mlir::failure();
+    if (mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, decision.activation,
+            PhysicalHandoff::LocalPack)))
+      return mlir::failure();
     CValue activation = require(decision.activationBlockBase);
     CValue packed = require(decision.packedBlockBase);
     CValue scale = require(decision.activationScale);
@@ -8236,7 +8499,7 @@ private:
         activation.spelling.empty() || packed.spelling.empty() ||
         scale.spelling.empty() || accumulator.spelling.empty())
       return op.emitError(
-          "selected IME1 affine contraction operands are unavailable");
+          "selected IME1 affine dot operands are unavailable");
     llvm::StringRef helper =
         decision.realization == I4I8FragmentRealization::SpacemiTIME1N16K32
             ? "__weft_ime1_affine_i4_i8_n16_k32"
@@ -8244,10 +8507,9 @@ private:
     line(helper.str() + "(" + scale.spelling + ", " +
          activation.spelling + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
-    for (mlir::Value operand :
-         {decision.activation, decision.packedWeight, decision.weightScale,
-          decision.weightZeroPoint, decision.init})
-      markDiscardedBlockTree(operand);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.activation, decision.init}, op.getOperation())))
+      return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
     accumulator.type = op.getResult().getType();
     values[op.getResult()] = std::move(accumulator);
@@ -8559,7 +8821,7 @@ private:
     line("}");
     values[op.getResult()] = accumulator;
     values[op.getResult()].type = op.getResult().getType();
-    if (mlir::failed(markDiscardedPrivateBlockTrees(
+    if (mlir::failed(markRematerializedBlockTrees(
             {op.getLhs(), op.getRhs()}, op.getOperation())))
       return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
@@ -8645,14 +8907,8 @@ private:
         setResultShape(kRVVE16M2);
       else if (result.isUnsignedInteger(8)) {
         setResultShape(byteShape);
-        bool feedsOnlyF32Casts = !binary.getResult().use_empty() && llvm::all_of(
-            binary.getResult().getUsers(), [](mlir::Operation *user) {
-              auto cast = mlir::dyn_cast<CastOp>(user);
-              return cast && elementType(cast.getResult().getType()).isF32();
-            });
         if (byteShape == kRVVE8MF4 &&
-            (binary.getKind() == "and" || binary.getKind() == "shr") &&
-            feedsOnlyF32Casts) {
+            (binary.getKind() == "and" || binary.getKind() == "shr")) {
           decision.realization =
               BlockValueRealization::DeferredPackedTransform;
           decision.source = binary.getLhs();
@@ -8706,32 +8962,21 @@ private:
     return decisions;
   }
 
-  void markDiscardedBlockTree(mlir::Value value) {
-    if (!containsBlockType(value.getType()) && !isRegionValue(value.getType()))
-      return;
-    mlir::Operation *definition = value.getDefiningOp();
-    if (!definition || !loweredBlockOps.insert(definition).second)
-      return;
-    for (mlir::Value operand : definition->getOperands())
-      markDiscardedBlockTree(operand);
-  }
-
   mlir::LogicalResult collectBlockClosure(
       mlir::Value value, llvm::DenseSet<mlir::Operation *> &closure,
       llvm::SmallVectorImpl<BlockIndexOp> &axes, mlir::Operation *owner,
-      bool markDiscarded = true, bool allowCaptured = false) {
-    if (!containsBlockType(value.getType()))
+      bool allowCaptured = false) {
+    if (!containsBlockType(value.getType()) && !isRegionValue(value.getType()))
       return mlir::success();
     mlir::Operation *definition = value.getDefiningOp();
+    if (!definition && allowCaptured)
+      return mlir::success();
     if (!definition)
       return owner->emitError(
           "block operation cannot capture a block argument from another region");
-    if (definition->getBlock() != owner->getBlock()) {
-      if (allowCaptured)
-        return mlir::success();
+    if (definition->getBlock() != owner->getBlock() && !allowCaptured)
       return owner->emitError(
           "block producer closure crosses a region boundary");
-    }
     if (!closure.insert(definition).second)
       return mlir::success();
     if (auto get = mlir::dyn_cast<TupleGetOp>(definition)) {
@@ -8743,34 +8988,24 @@ private:
       for (auto [index, operand] : llvm::enumerate(tuple.getOperands())) {
         if (static_cast<int64_t>(index) == get.getIndex()) {
           if (mlir::failed(collectBlockClosure(operand, closure, axes, owner,
-                                               markDiscarded,
                                                allowCaptured)))
             return mlir::failure();
-          continue;
         }
-        bool fieldIsLive = llvm::any_of(
-            tuple.getResult().getUsers(), [&](mlir::Operation *user) {
-              auto otherGet = mlir::dyn_cast<TupleGetOp>(user);
-              return otherGet && otherGet.getIndex() ==
-                                     static_cast<int64_t>(index) &&
-                     !otherGet.getResult().use_empty();
-            });
-        if (!fieldIsLive && markDiscarded)
-          markDiscardedBlockTree(operand);
       }
       return mlir::success();
     }
     if (auto axis = mlir::dyn_cast<BlockIndexOp>(definition))
       axes.push_back(axis);
     for (mlir::Value operand : definition->getOperands())
-      if (containsBlockType(operand.getType()) &&
+      if ((containsBlockType(operand.getType()) ||
+           isRegionValue(operand.getType())) &&
           mlir::failed(collectBlockClosure(operand, closure, axes, owner,
-                                           markDiscarded, allowCaptured)))
+                                           allowCaptured)))
         return mlir::failure();
     return mlir::success();
   }
 
-  mlir::LogicalResult markDiscardedPrivateBlockTrees(
+  mlir::LogicalResult markRematerializedBlockTrees(
       llvm::ArrayRef<mlir::Value> values, mlir::Operation *consumer) {
     llvm::DenseSet<mlir::Operation *> closure;
     llvm::SmallVector<BlockIndexOp> axes;
@@ -8778,11 +9013,9 @@ private:
       if (!containsBlockType(value.getType()) && !isRegionValue(value.getType()))
         continue;
       if (mlir::failed(
-              collectBlockClosure(value, closure, axes, consumer, false,
-                                  true)))
+              collectBlockClosure(value, closure, axes, consumer, true)))
         return mlir::failure();
     }
-    retainOnlyPrivateDefinitions(closure, consumer);
     loweredBlockOps.insert(closure.begin(), closure.end());
     return mlir::success();
   }
@@ -8937,6 +9170,14 @@ private:
       BlockValue result;
       result.type = op.getResult().getType();
       result.kind = BlockValueKind::U8;
+      std::string suffix = rvvShapeSuffix(selectedShape);
+      std::string stem = physical->transform == "and" ? "vand" : "vsrl";
+      std::string name = fresh("block_packed_u8");
+      line("__attribute__((unused)) vuint" + suffix + "_t " + name +
+           " = __riscv_" + stem +
+           "_vx_u" + suffix + "(" + lhs.spelling + ", " + rhs.spelling +
+           ", " + vl.str() + ");");
+      result.spelling = name;
       result.packedSource = physical->source;
       result.packedTransform = physical->transform;
       result.packedTransformOperand = rhs.spelling;
@@ -10209,12 +10450,62 @@ private:
     return emitBlockReduce(op);
   }
 
+  mlir::FailureOr<std::string>
+  materializeVLAStateInput(mlir::Operation *owner, mlir::Value semanticInput,
+                           const CValue &input,
+                           const VLAStateDecision &decision) {
+    if (decision.validity == VLAStateValidityRealization::AllActive) {
+      if (!input.logicalValidity.empty()) {
+        owner->emitError(
+            "masked VLA state input has no selected validity realization");
+        return mlir::failure();
+      }
+      return input.spelling;
+    }
+    if (input.logicalValidity.empty()) {
+      owner->emitError(
+          "selected VLA state validity requires a logical predicate mask");
+      return mlir::failure();
+    }
+    std::optional<unsigned> dataLMUL = physicalValueLMUL(semanticInput);
+    if (!dataLMUL) {
+      owner->emitError("VLA state validity has no physical input shape");
+      return mlir::failure();
+    }
+    std::string fill;
+    if (decision.validity == VLAStateValidityRealization::ReductionIdentity)
+      fill = expression(decision.identity);
+    else if (decision.validity ==
+                 VLAStateValidityRealization::NegativeInfinity ||
+             decision.validity == VLAStateValidityRealization::OnlineSoftmax)
+      fill = "-INFINITY";
+    if (fill.empty()) {
+      owner->emitError("VLA state validity has no selected inactive value");
+      return mlir::failure();
+    }
+    std::string suffix = "f32m" + std::to_string(*dataLMUL);
+    std::string inactive = fresh("state_inactive");
+    std::string projected = fresh("state_input");
+    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + inactive +
+         " = __riscv_vfmv_v_f_" + suffix + "(" + fill + ", " + activeVL +
+         ");");
+    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + projected +
+         " = __riscv_vmerge_vvm_" + suffix + "(" + inactive + ", " +
+         input.spelling + ", " + input.logicalValidity + ", " + activeVL +
+         ");");
+    return projected;
+  }
+
   mlir::LogicalResult emitVectorReduce(ReduceOp op,
                                        const VLAStateDecision &decision,
                                        const CValue &aggregate) {
     CValue input = require(op.getInput());
     if (input.kind != CValueKind::F32Vector || aggregate.spelling.empty())
       return op.emitError("RVV reduction projection is unavailable");
+    mlir::FailureOr<std::string> projected = materializeVLAStateInput(
+        op.getOperation(), op.getInput(), input, decision);
+    if (mlir::failed(projected))
+      return mlir::failure();
     std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
     if (!dataLMUL)
       return op.emitError("RVV reduction has no physical input shape");
@@ -10225,11 +10516,11 @@ private:
       if (decision.realization == VLAStateRealization::RVVAddReduction)
         line(aggregate.spelling + " = __riscv_vfadd_vv_" + suffix + "_tu(" +
              aggregate.spelling + ", " + aggregate.spelling + ", " +
-             input.spelling + ", " + activeVL + ");");
+             *projected + ", " + activeVL + ");");
       else if (decision.realization == VLAStateRealization::RVVMaxReduction)
         line(aggregate.spelling + " = __riscv_vfmax_vv_" + suffix + "_tu(" +
              aggregate.spelling + ", " + aggregate.spelling + ", " +
-             input.spelling + ", " + activeVL + ");");
+             *projected + ", " + activeVL + ");");
       else
         return op.emitError("selected VLA state is not a reduction");
       return mlir::success();
@@ -10244,11 +10535,11 @@ private:
     if (decision.realization == VLAStateRealization::RVVAddReduction)
       line("vfloat32m1_t " + partial +
            " = __riscv_vfredusum_vs_" + inputSuffix + "_f32m1(" +
-           input.spelling + ", " + seed + ", " + activeVL + ");");
+           *projected + ", " + seed + ", " + activeVL + ");");
     else if (decision.realization == VLAStateRealization::RVVMaxReduction)
       line("vfloat32m1_t " + partial +
            " = __riscv_vfredmax_vs_" + inputSuffix + "_f32m1(" +
-           input.spelling + ", " + seed + ", " + activeVL + ");");
+           *projected + ", " + seed + ", " + activeVL + ");");
     else
       return op.emitError("selected VLA state is not a reduction");
     line(aggregate.spelling + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
@@ -10453,6 +10744,10 @@ private:
         activePhysicalEntity->vlaMaskRatio == 0)
       return op.emitError("RVV argmax has no physical data/mask shape");
     unsigned maskRatio = activePhysicalEntity->vlaMaskRatio;
+    mlir::FailureOr<std::string> projected = materializeVLAStateInput(
+        op.getOperation(), op.getInput(), input, decision);
+    if (mlir::failed(projected))
+      return mlir::failure();
 
     const CValue &maximum = aggregate.fields[0];
     const CValue &index = aggregate.fields[1];
@@ -10467,13 +10762,17 @@ private:
          " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
     line("vfloat32m1_t " + reduced +
          " = __riscv_vfredmax_vs_" + dataSuffix + "_f32m1(" +
-         input.spelling + ", " + seed + ", " + activeVL + ");");
+         *projected + ", " + seed + ", " + activeVL + ");");
     line("const float " + stripMaximum +
          " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
     line("vbool" + std::to_string(maskRatio) + "_t " + equal +
          " = __riscv_vmfeq_vf_" + dataSuffix + "_b" +
-         std::to_string(maskRatio) + "(" + input.spelling + ", " +
+         std::to_string(maskRatio) + "(" + *projected + ", " +
          stripMaximum + ", " + activeVL + ");");
+    if (!input.logicalValidity.empty())
+      line(equal + " = __riscv_vmand_mm_b" + std::to_string(maskRatio) +
+           "(" + equal + ", " + input.logicalValidity + ", " + activeVL +
+           ");");
     line("const long " + first + " = __riscv_vfirst_m_b" +
          std::to_string(maskRatio) + "(" + equal + ", " + activeVL +
          ");");
@@ -10507,6 +10806,10 @@ private:
     std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
     if (!dataLMUL)
       return op.emitError("online summary has no physical input shape");
+    mlir::FailureOr<std::string> projected = materializeVLAStateInput(
+        op.getOperation(), op.getInput(), input, decision);
+    if (mlir::failed(projected))
+      return mlir::failure();
     const CValue &maximum = aggregate.fields[0];
     const CValue &sum = aggregate.fields[1];
     std::string maxSeed = fresh("summary_max_seed");
@@ -10522,15 +10825,27 @@ private:
          " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
     line("vfloat32m1_t " + maxVector +
          " = __riscv_vfredmax_vs_" + dataSuffix + "_f32m1(" +
-         input.spelling + ", " + maxSeed + ", " + activeVL + ");");
+         *projected + ", " + maxSeed + ", " + activeVL + ");");
     line("const float " + stripMaximum +
          " = __riscv_vfmv_f_s_f32m1_f32(" + maxVector + ");");
     line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + shifted +
-         " = __riscv_vfsub_vf_" + dataSuffix + "(" + input.spelling + ", " +
+         " = __riscv_vfsub_vf_" + dataSuffix + "(" + *projected + ", " +
          stripMaximum + ", " + activeVL + ");");
     line("vfloat32m" + std::to_string(*dataLMUL) + "_t " +
          exponentials + " = __weft_exp_f32m2(" + shifted + ", " + activeVL +
          ");");
+    if (!input.logicalValidity.empty()) {
+      std::string zero = fresh("summary_zero");
+      std::string validExponentials = fresh("summary_valid_exp");
+      line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + zero +
+           " = __riscv_vfmv_v_f_" + dataSuffix + "(0.0f, " + activeVL +
+           ");");
+      line("vfloat32m" + std::to_string(*dataLMUL) + "_t " +
+           validExponentials + " = __riscv_vmerge_vvm_" + dataSuffix + "(" +
+           zero + ", " + exponentials + ", " + input.logicalValidity + ", " +
+           activeVL + ");");
+      exponentials = std::move(validExponentials);
+    }
     line("vfloat32m1_t " + sumSeed +
          " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
     line("vfloat32m1_t " + sumVector +
@@ -10583,6 +10898,13 @@ static inline __attribute__((unused)) uint32_t __weft_bitcast_f32_u32(float sour
 static inline __attribute__((unused)) float __weft_bitcast_u32_f32(uint32_t bits) {
   union { uint32_t u; float f; } value = { .u = bits };
   return value.f;
+}
+
+static inline __attribute__((unused)) float
+__weft_load_f16_le(const uint8_t *bytes) {
+  const uint16_t bits =
+      (uint16_t)bytes[0] | ((uint16_t)bytes[1] << UINT16_C(8));
+  return (float)__weft_bitcast_u16_f16(bits);
 }
 
 )c";
@@ -11939,8 +12261,9 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
     usesExp |= op.getKind() == "exp" || op.getKind() == "tanh" ||
                op.getKind() == "sin" || op.getKind() == "cos";
   });
-  module.walk([&](AffineI4I8ContractOp) { usesLocalI4I8 = true; });
-  module.walk([&](SymmetricI4I8ContractOp) { usesLocalI4I8 = true; });
+  module.walk([&](OnlineSoftmaxSummaryOp) { usesExp = true; });
+  module.walk([&](AffineI4I8DotOp) { usesLocalI4I8 = true; });
+  module.walk([&](SymmetricI4I8DotOp) { usesLocalI4I8 = true; });
   module.walk([&](GroupedAffineI4I8DotOp) { usesGroupedI4I8 = true; });
   module.walk([&](E2M1E8M0I8DotOp) { usesE2M1E8M0I8 = true; });
   module.walk([&](IQ2SI8DotOp) { usesQuantCodebookI8 = true; });

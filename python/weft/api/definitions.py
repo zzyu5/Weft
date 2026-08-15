@@ -26,7 +26,7 @@ class DefinitionSource:
 
 
 class KernelDefinition(Generic[P, R]):
-    """Captured AOT source for one worker-local Weft entry."""
+    """Captured Python text for one worker-local Weft DSL kernel."""
 
     def __init__(self, function: Callable[P, R]) -> None:
         if not isinstance(function, FunctionType):
@@ -36,7 +36,7 @@ class KernelDefinition(Generic[P, R]):
             _, source_start = inspect.getsourcelines(function)
         except (OSError, TypeError) as error:
             raise DefinitionError(
-                "Weft must be able to inspect the decorated kernel source"
+                "Weft must be able to inspect the decorated DSL kernel"
             ) from error
         self.source = DefinitionSource(
             filename=inspect.getsourcefile(function) or function.__code__.co_filename,
@@ -58,7 +58,7 @@ class KernelDefinition(Generic[P, R]):
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         raise LanguageUseError(
-            f"kernel {self.__name__} is AOT Weft source and cannot run as Python"
+            f"kernel {self.__name__} is an AOT Weft DSL kernel and cannot run as Python"
         )
 
     def __repr__(self) -> str:

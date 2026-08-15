@@ -38,16 +38,9 @@ def aligned(minimum: int) -> PointerQualifier:
     return PointerQualifier("alignment", minimum)
 
 
-def address_space(name: str) -> PointerQualifier:
-    if not isinstance(name, str) or not name:
-        raise TypeError("W.address_space expects a non-empty string")
-    return PointerQualifier("address_space", name)
-
-
 @dataclass(frozen=True, slots=True)
 class PtrSpec:
     dtype: DType
-    address_space: str = "global"
     access: str = "readwrite"
     noalias: bool = False
     alignment: int = 0
@@ -62,7 +55,6 @@ class ptr:
         items = parameters if isinstance(parameters, tuple) else (parameters,)
         if not items or not isinstance(items[0], DType):
             raise TypeError("W.ptr expects a Weft dtype as its first parameter")
-        address = "global"
         access = "readwrite"
         alias = False
         alignment = 0
@@ -76,9 +68,7 @@ class ptr:
             if qualifier.kind in seen and qualifier.kind != "noalias":
                 raise TypeError(f"duplicate pointer qualifier {qualifier.kind!r}")
             seen.add(qualifier.kind)
-            if qualifier.kind == "address_space":
-                address = str(qualifier.value)
-            elif qualifier.kind == "access":
+            if qualifier.kind == "access":
                 access = str(qualifier.value)
             elif qualifier.kind == "noalias":
                 alias = True
@@ -94,7 +84,6 @@ class ptr:
             raise TypeError("W.workspace pointers must also declare W.noalias")
         return PtrSpec(
             dtype=items[0],
-            address_space=address,
             access=access,
             noalias=alias,
             alignment=alignment,

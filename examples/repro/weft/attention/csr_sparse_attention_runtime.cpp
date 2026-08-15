@@ -87,7 +87,9 @@ int main() {
   }
 
   std::vector<float> output(expected.size(), 0.0F);
-  std::vector<float> scratch(kDimension, 0.0F);
+  std::vector<float> scratch(
+      csr_sparse_attention_f32__accumulator_scratch_elements(kDimension),
+      0.0F);
   csr_sparse_attention_f32(
       query.data(), key.data(), value.data(), rowOffsets.data(),
       keyIndices.data(), output.data(), scratch.data(), 0, kRows, kDimension,

@@ -1,7 +1,7 @@
 # Packed Quantization 与 Irregular Access
 
 Packed quantized kernel必须把storage ownership、decode relation、scale/zero-point与outer
-traversal写在source中。Target可以融合局部decode与compute，但不能从byte pointer、shape或
+traversal写在 DSL kernel 中。Target可以融合局部decode与compute，但不能从byte pointer、shape或
 q-format名字猜出这些语义。
 
 普通packed input仍可声明为external；只有caller按显式format identity构建并跨调用复用的
@@ -23,7 +23,7 @@ for token:
 ```
 
 Token-to-row relation、packed row stride、block size、scale/minimum decode和output位置都是
-source-visible。Logical `block(32)` 可以描述一次局部nibble group：
+author-visible。Logical `block(32)` 可以描述一次局部nibble group：
 
 ```python
 member = W.block(32)
@@ -50,18 +50,18 @@ load/bitwise graph重新分类成Q4_K，也不能改变row lookup或persistent f
 
 ## Plain F32 indexed GetRows
 
-非量化GetRows使用同一条memory machinery而没有decode：source先把显式u32 row index cast为
+非量化GetRows使用同一条memory machinery而没有decode：DSL kernel 先把显式u32 row index cast为
 logical index，再形成 `table + row * table_stride + hidden`；每个token的hidden dimension是
 独立VLA。Target只根据pointer relation选择scalar indexed row base与unit-stride RVV copy，
 不能从embedding shape或entry名发明row lookup。
 
-`W.lookup` 与 `W.decode` 是更一般的canonical semantic anchors。Source只有在table/index或
+`W.lookup` 与 `W.decode` 是更一般的 Kernel IR semantic anchors。DSL kernel 只有在table/index或
 codebook relation本身就是算法语义时才使用它们；普通pointer arithmetic不会被compiler
 自动提升成这两个op。
 
 ## Q8_0 activation quantization
 
-Q8_0 source显式拥有每个32-element block的全部observable relation：
+Q8_0 DSL kernel 显式拥有每个32-element block的全部observable relation：
 
 ```text
 maximum = reduce(max(abs(x)))
@@ -78,7 +78,7 @@ branch不属于target推断。
 
 ## IQ4_NL codebook decode
 
-IQ4_NL block是little-endian F16 scale加16个packed bytes，总计18 bytes。Source把固定16-entry
+IQ4_NL block是little-endian F16 scale加16个packed bytes，总计18 bytes。DSL kernel 把固定16-entry
 signed-i8 codebook作为显式readonly pointer operand，拆出low/high nibble并调用
 `W.decode(code, table, out_dtype=W.i8)`，随后signed widen到F32、乘scale并写32个logical值。
 
@@ -88,8 +88,8 @@ signed-i8 codebook作为显式readonly pointer operand，拆出low/high nibble�
 
 ## Q1_0 × Q8_0 row dot
 
-Q1_0 persistent block覆盖128个logical weight，总计18 bytes：little-endian F16 scale加16个
-sign bytes。一个Q1 block显式对应四个34-byte Q8_0 block；source负责：
+Q1_0 packed input block覆盖128个logical weight，总计18 bytes：little-endian F16 scale加16个
+sign bytes。一个Q1 block显式对应四个34-byte Q8_0 block；DSL kernel 负责：
 
 ```text
 weight row stride = (K / 128) * 18
@@ -105,20 +105,20 @@ Q8 scale、outer block reduction与row output不会被target从format名或byte 
 
 ## MXFP4 × Q8_0 row dot
 
-MXFP4 persistent block覆盖32个logical weight，总计17 bytes：一个E8M0 exponent byte加16个
-packed E2M1 bytes。Source显式形成17/34-byte block地址，分别load exponent、packed codes和
+MXFP4 packed input block覆盖32个logical weight，总计17 bytes：一个E8M0 exponent byte加16个
+packed E2M1 bytes。DSL kernel 显式形成17/34-byte block地址，分别load exponent、packed codes和
 Q8_0 scale/codes，然后调用一次 `e2m1_e8m0_i8_dot`。
 
 E2M1 codebook与E8M0 scale是local primitive的可观察数值语义；row stride、block traversal、
-activation layout和public ABI仍是Kernel IR事实。Target可以选择table/register organization，
+activation layout和 C ABI仍是Kernel IR事实。Target可以选择table/register organization，
 不能恢复whole-kernel `mxfp4` route。
 
-## Activation quantize + affine contract
+## Activation quantize + affine local dot
 
 Quantized projection通常包含两个不同层次：
 
 ```text
-source algorithm
+DSL algorithm
   activation max-reduce
   explicit scale computation
   W.narrow(..., rounding="rne", saturation=True)
@@ -126,12 +126,12 @@ source algorithm
   outer row / N / K traversal
 
 local semantic primitive
-  W.affine_i4_i8_contract(...)
+  W.affine_i4_i8_dot(...)
 ```
 
-这一source variant要求 `inner % 32 == 0`，且每个activation block的maximum非零。若算法要
+这一 DSL variant要求 `inner % 32 == 0`，且每个activation block的maximum非零。若算法要
 定义partial K32或all-zero block，必须在DSL中显式写出predicate/scale规则；target不能增加
-默认值或防御性branch。下面是省略entry signature与byte-assembly helper的source excerpt：
+默认值或防御性branch。下面是省略entry signature的 DSL excerpt：
 
 ```python
 for block in W.range(0, k_blocks):
@@ -156,63 +156,47 @@ for column_begin in W.range(0, columns, W.index(16)):
             code_scratch + block * W.index(32) + k,
             other=W.i8(0),
         )
-        packed_byte = W.block(16)
         packed_block = (column_begin // W.index(16)) * k_blocks + block
         packed_base = packed_weight + packed_block * W.index(304)
-        weight_scale = load_f16_le(packed_base + column * W.index(2))
-        weight_zero_point = W.load(
-            packed_base + W.index(32) + column, other=W.u8(0)
-        )
-        packed_codes = W.load(
-            packed_base
-            + W.index(48)
-            + (packed_byte[None, :] // W.index(8)) * W.index(128)
-            + column[:, None] * W.index(8)
-            + packed_byte[None, :] % W.index(8),
-            other=W.u8(0),
-        )
-        acc = W.affine_i4_i8_contract(
+        acc = W.affine_i4_i8_dot(
             activation_codes,
-            packed_codes,
+            packed_base,
             activation_scale=W.load(scale_scratch + block, other=W.f32(0.0)),
-            weight_scale=weight_scale,
-            weight_zero_point=weight_zero_point,
             init=acc,
         )
     W.store(output_row + column_begin + column, acc)
 ```
 
-`scale_scratch`与`code_scratch`是source-declared workspace pointer：caller分配，shape进入artifact
+`scale_scratch`与`code_scratch`是 DSL-declared workspace pointer：caller分配，shape进入 C
 header，并由当前worker跨quantization与dot loops复用。Target可以把local primitive映射到RVV
 dot或IME fragment，也可以在primitive envelope内做短生命周期repack；它不能自动创造
 activation quantization pass、workspace ABI、N16/K32 outer loop或persistent weight format。
 
-## Activation quantize + symmetric Q4_0 contract
+## Activation quantize + symmetric Q4_0 local dot
 
-Q4_0 variant保留相同的activation max-reduce、scale/code scratch与source N/K recurrence，但
+Q4_0 variant保留相同的activation max-reduce、scale/code scratch与 DSL N/K recurrence，但
 persistent N16×K32 block是32-byte F16 scale field加256-byte packed nibble field，总计288
 bytes。每个K32 iteration调用：
 
 ```python
-acc = W.symmetric_i4_i8_contract(
+acc = W.symmetric_i4_i8_dot(
     activation_codes,
-    packed_codes,
+    packed_base,
     activation_scale=scale,
-    weight_scale=weight_scale,
     init=acc,
 )
 ```
 
-Canonical primitive只定义 `code - 8` 的16个local dot。当前K1 target把一次primitive lower成
+该 primitive定义 little-endian scale、`code - 8` 与16个local dot。当前K1 target把一次primitive lower成
 单个N16×K32 IME1 asm leaf；作者的128次K loop、memory-resident accumulator state、column
 loop、288-byte block address和最终store仍出现在生成C中。Leaf不遍历完整K、不量化activation、
-不选择persistent format，也不拥有public ABI。
+不选择persistent format，也不拥有 C ABI。
 
 ## Grouped block dot
 
-若persistent Q4_K与Q8_K block已经由caller提供，source显式遍历block并加载四个semantic
-operand，再调用 `W.grouped_affine_i4_i8_dot`。Activation quantization是否计入kernel由source
+若persistent Q4_K与Q8_K block已经由caller提供，DSL kernel 显式遍历block并加载四个semantic
+operand，再调用 `W.grouped_affine_i4_i8_dot`。Activation quantization是否计入kernel由 DSL
 ABI决定，target不能在两种scope之间自动切换。
 
-这三个模式共享packed decode与local contraction machinery，但不形成按format分派的
+这三个模式共享packed decode与local dot machinery，但不形成按format分派的
 whole-kernel route。

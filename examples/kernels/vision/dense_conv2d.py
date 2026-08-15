@@ -98,8 +98,8 @@ def dense_conv2d_f32(
 
     for position in W.range(0, positions, 8):
         for output_channel in W.range(0, output_channels):
-            position_lane = W.block_axis(8)
-            reduction = W.block_axis(reduction_extent)
+            position_lane = W.block(8)
+            reduction = W.block(reduction_extent)
             position_index = position + position_lane[:, None]
             patch = W.load(
                 packed_patches + position_index * reduction_extent + reduction[None, :],
@@ -113,7 +113,7 @@ def dense_conv2d_f32(
             value = W.dot(
                 patch,
                 filter_value,
-                init=W.zeros((8,), dtype=W.f32),
+                init=W.zeros((position_lane,), dtype=W.f32),
                 acc_dtype=W.f32,
                 order="relaxed",
                 math="native",

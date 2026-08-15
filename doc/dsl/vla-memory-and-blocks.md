@@ -2,7 +2,7 @@
 
 ## VLA region 规范
 
-### Source 语法
+### DSL 语法
 
 ```python
 with W.vla(begin, end) as i:
@@ -28,11 +28,11 @@ while remaining > 0:
     remaining -= vl
 ```
 
-上述循环只是物理 realization，不是 canonical source 结构。
+上述循环只是物理 realization，不是 Kernel IR 结构。
 
 ### Strip 不可观察性
 
-Source 与 canonical IR 禁止提供：
+Python DSL 与 Kernel IR 禁止提供：
 
 - `W.vl()`；
 - `W.vlen()`；
@@ -55,7 +55,7 @@ VLA region body 不得任意修改外层 scalar / block state。
 - 显式typed summary primitive；
 - 满足 lane independence 的 effectful memory operation。
 
-任意依赖上一逻辑元素的 recurrence 必须写成有序 scalar loop，或使用显式 `W.scan`。这样可以防止 source 行为依赖编译器选择的 strip 边界。
+任意依赖上一逻辑元素的 recurrence 必须写成有序 scalar loop，或使用显式 `W.scan`。这样可以防止 DSL kernel 行为依赖编译器选择的 strip 边界。
 
 普通有序scalar `for` / `while`可以出现在VLA body中；禁止的是第二个active VLA region，
 不是scalar control。Target可以逐physical strip执行这些scalar loops，但不得把它们重排为
@@ -67,7 +67,7 @@ VLA memory effect 必须满足 lane independence：
 
 - 两个 active logical indices 不得写同一地址；
 - 一个 iteration 不得依赖另一个 active iteration 写入的结果；
-- 若存在可能冲突，作者必须使用 scalar ordered loop；当前 core surface 不提供 atomic VLA
+- 若存在可能冲突，作者必须使用 scalar ordered loop；当前 DSL 不提供 atomic VLA
   effect。未来只有在定义完整可观察 ordering/effect 语义后，才能增加相应 local primitive。
 
 该性质一般无法完全静态证明，属于作者义务；编译器可以利用 noalias、affine pointer 和 effect analysis 尽量检查。
@@ -82,7 +82,7 @@ VLA region内可以构造额外的logical block axis，形成：
 
 Target lowering 可以把 logical block axes 映射到唯一 RVV lane domain、serial loop、register
 repeat、register microtile、extension fragment或这些机制的合法组合，但不能把一个 block
-axis 暴露成第二个独立、source-observable 的 physical lane domain。
+axis 暴露成第二个独立、author-observable 的 physical lane domain。
 
 
 ## Logical predicate、masked value 与 physical tail
@@ -96,7 +96,7 @@ Weft 必须严格区分：
 3. **physical tail**：最后一个 strip 的 `remaining` 小于最大可用 `vl`。
 
 Physical tail 不进入 canonical logical predicate。Target lowering可以使用缩短 AVL/`vl`、
-内部 physical mask，或二者组合实现尾部；这些 mechanics 不得反向成为 source-observable
+内部 physical mask，或二者组合实现尾部；这些 mechanics 不得反向成为 author-observable
 mask。
 
 ### Masked load
@@ -125,7 +125,7 @@ Masked value 只能：
 
 禁止将未填充 masked value 作为普通 scalar / block value逃逸到不理解 validity 的 op。普通
 consumer和store需要filled value时，作者必须在原始 `W.load` 提供 `other`。语言不提供从masked
-value事后猜回predicate/fill的第二套API，当前public store也不接受masked value。
+value事后猜回predicate/fill的第二套API，当前 store 也不接受masked value。
 
 ### Consumer-specific invalid semantics
 
@@ -157,7 +157,7 @@ i < N
 
 ### Pointer arithmetic
 
-Source 显式表达 pointer/index arithmetic：
+DSL kernel 显式表达 pointer/index arithmetic：
 
 ```python
 ptr = base + row * stride_row + col * stride_col
@@ -168,7 +168,7 @@ Target lowering 决定：
 - scalar、unit-stride、strided、indexed 或 segment memory；
 - vector grouping；
 - mask realization；
-- source 不可观察的 physical prefetch instruction/schedule；
+- DSL kernel 不可观察的 physical prefetch instruction/schedule；
 - local address strength reduction。
 
 若access或predicate位于VLA内的nested scalar control中，target仍按每个实体的pointer、
@@ -184,7 +184,7 @@ W.load(ptr, *, where=True, other=W.invalid, alignment=None)
 W.store(ptr, value, *, where=True, alignment=None)
 ```
 
-`alignment` 是 source assertion，不是 physical layout 选择。
+`alignment` 是 DSL assertion，不是 physical layout 选择。
 
 ### Local rematerialization
 
@@ -198,7 +198,7 @@ Target lowering 可以吸收 structured primitive 附近的纯 producer / consum
 
 - 所有被吸收 value 的 use 都在该局部 envelope 内，或仍能正确 materialize；
 - 不发明新的算法级 loop、state 或 staging；
-- 不改变 source staging 与 memory effect；
+- 不改变作者写下的 staging 与 memory effect；
 - 不根据完整 kernel 名匹配；
 - 选择仍绑定到明确 primitive/interface。
 
@@ -217,7 +217,7 @@ k = W.block(BK)
 ```
 
 `W.block(D, offset=0)`同时建立一个唯一logical axis identity并产生shape `[D]` 的index block。
-每次调用都是不同axis；相同extent不代表相同domain。Source integer literal写成static dimension；
+每次调用都是不同axis；相同extent不代表相同domain。DSL integer literal写成static dimension；
 meta或runtime extent在canonical type中记为`-1`，真实长度由block_index operand保存。Target
 不能从相等shape猜axis identity。
 
@@ -231,7 +231,7 @@ k[None, :]
 ```
 
 这两种slicing只插入axis identity为`0`的singleton logical axis；它们不授权任意broadcast或
-shape重写。Pointwise join只能合并同一source axis、显式singleton或scalar；同shape不同axis
+shape重写。Pointwise join只能合并同一 DSL axis、显式singleton或scalar；同shape不同axis
 在frontend/canonical边界拒绝。
 
 ### Block constructors
@@ -242,7 +242,7 @@ W.zeros((axis0, axis1, ...), dtype=...)
 ```
 
 Shape entry必须是direct `W.block` value，不接受裸整数。同一个block domain因此在constructor、
-operand、result和loop carry中保持同一axis identity。当前public surface没有任意reshape/transpose；
+operand、result和loop carry中保持同一axis identity。当前 DSL 没有任意reshape/transpose；
 算法需要的坐标变换由作者显式写入pointer/index relation。
 
 ### Block load/store
@@ -258,4 +258,4 @@ a_blk = W.load(a + (m0 + m[:, None]) * lda + (k0 + k[None, :]), where=...)
 Block load、pointwise、state 与 structured primitive 的结果都进入同一普通 SSA value system。
 Block value可以有多个consumer，也可作为`for`/`while` carry跨iteration存活；它不必立即被某个
 primitive消费或store。Target负责合法的register/memory handoff，但不得要求一个固定terminal
-use closure来重新定义 source legality。
+use closure来重新定义 DSL legality。

@@ -2,7 +2,7 @@
 
 ## Dot 与 matmul 授权点
 
-Weft不提供任意轴tensor contraction。现有真实kernel只需要两种明确的局部乘加域：
+Weft不提供任意轴乘加。现有真实kernel只需要两种明确的局部乘加域：
 
 ```python
 value = W.dot(lhs, rhs, init=acc, acc_dtype=W.f32,
@@ -21,18 +21,18 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 [R,K]   x [VLA,K] -> [VLA,R]
 ```
 
-当前public dot要求f32 multiplicand与f32 accumulator。
+当前 dot 要求 f32 multiplicand 与 f32 accumulator。
 
-`W.matmul`固定表达local block relation；lhs K与rhs K必须是同一个source axis：
+`W.matmul`固定表达local block relation；lhs K与rhs K必须是同一个 DSL axis：
 
 ```text
 [M,K] x [K,N] -> [M,N]
 ```
 
-当前public matmul要求f16 multiplicand与f32 accumulator。
+当前 matmul 要求 f16 multiplicand 与 f32 accumulator。
 
 VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
-scan或显式typed summary primitive。`init`与`acc_dtype`均为必填source semantics；init必须是scalar或与结果
+scan或显式typed summary primitive。`init`与`acc_dtype`均为必填 DSL semantics；init必须是scalar或与结果
 同domain（shape与axis identity均相同）的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
 描述；masked multiplicand在乘加域中按语义零贡献，`init`与result本身必须是普通unmasked
 accumulator value。结果element type等于accumulator dtype。
@@ -42,7 +42,7 @@ accumulator value。结果element type等于accumulator dtype。
 
 `dot`/`matmul`的result是普通SSA value，而不是terminal microkernel result。它可以进入
 pointwise、多个consumer、state update、loop carry、memory store或另一个合法primitive；`init`
-也可以是跨作者循环存活的block accumulator。Realizer必须为这些use建立明确physical handoff，
+也可以是跨作者循环存活的block accumulator。Target lowering 必须为这些use建立明确physical handoff，
 不能以“必须紧接一个store”等精确closure作为该primitive的语义入口。
 
 作者拥有：
@@ -50,7 +50,7 @@ pointwise、多个consumer、state update、loop carry、memory store或另一�
 - outer traversal与cache blocking；
 - staging、recomputation和persistent packing；
 - operand block、pointer/index、logical predicate与memory effect；
-- source-visible accumulator及跨block carry；
+- author-visible accumulator及跨block carry；
 - numerical order与math policy。
 
 Target只在当前dot/matmul内部决定：
@@ -61,7 +61,7 @@ Target只在当前dot/matmul内部决定：
 - RVV或矩阵extension realization；
 - 不越过primitive边界的短生命周期packing/temporary。
 
-Target不得创建source中不存在的outer loop，改变blocking/staging/persistent format，或从kernel
+Target不得创建 DSL kernel 中不存在的outer loop，改变blocking/staging/persistent format，或从kernel
 名、格式名、完整loop nest与普通SSA graph选择实现。
 
 ### Blocked GEMM 的授权边界
@@ -70,7 +70,7 @@ Blocked GEMM 的 M/N/K loop、BM/BN/BK、operand block、accumulator lifetime、
 store都由作者显式写出。同一个worker可以持有accumulator跨K loop，并在外围control中顺序处理
 多个M/N block。`W.matmul`只授权当前local block product的物理重组；它不能替作者创建outer
 K loop、persistent repack或另一种GEMM traversal。这一持续worker-owned lifetime是Weft与典型
-Triton program/CTA-owned result tile合同的核心差异。
+Triton program/CTA-owned result tile 的核心差异。
 
 ## State algebra
 

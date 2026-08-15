@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
         mlir::failed(
             weft::lowerToRISCVIntrinsicC(*module, options, output.os())) ||
         mlir::failed(
-            weft::emitRISCVArtifactHeader(*module, options, header.os())))
+            weft::emitRISCVHeader(*module, options, header.os())))
       return 1;
     header.keep();
   } else {

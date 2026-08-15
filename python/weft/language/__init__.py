@@ -1,7 +1,6 @@
 from .annotations import ConstexprSpec
 from .annotations import PointerQualifier
 from .annotations import PtrSpec
-from .annotations import address_space
 from .annotations import aligned
 from .annotations import constexpr
 from .annotations import external
@@ -17,7 +16,7 @@ from .builtins import Intrinsic
 from .builtins import argmax
 from .builtins import bitcast
 from .builtins import block
-from .builtins import affine_i4_i8_contract
+from .builtins import affine_i4_i8_dot
 from .builtins import cast
 from .builtins import cos
 from .builtins import decode
@@ -25,7 +24,6 @@ from .builtins import dot
 from .builtins import e2m1_e8m0_i8_dot
 from .builtins import exp
 from .builtins import tanh
-from .builtins import exp2
 from .builtins import floor
 from .builtins import full
 from .builtins import grouped_affine_i4_i8_dot
@@ -35,6 +33,7 @@ from .builtins import iq3_s_i8_dot
 from .builtins import helper
 from .builtins import invalid
 from .builtins import load
+from .builtins import load_f16_le
 from .builtins import log
 from .builtins import lookup
 from .builtins import matmul
@@ -56,7 +55,7 @@ from .builtins import sin
 from .builtins import sort_indices
 from .builtins import store
 from .builtins import storage
-from .builtins import symmetric_i4_i8_contract
+from .builtins import symmetric_i4_i8_dot
 from .builtins import tuple
 from .builtins import vla
 from .builtins import zeros

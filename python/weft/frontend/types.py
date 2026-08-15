@@ -19,7 +19,6 @@ class ScalarType(ValueType):
 @dataclass(frozen=True, slots=True)
 class PointerType(ValueType):
     element_type: ScalarType
-    address_space: str
     access: str
     noalias: bool
     alignment: int
@@ -79,7 +78,7 @@ def emit_type(value_type: ValueType) -> str:
     if isinstance(value_type, PointerType):
         return (
             f"!weft_kernel.ptr<{emit_type(value_type.element_type)}, "
-            f"{json.dumps(value_type.address_space)}, {json.dumps(value_type.access)}, "
+            f"{json.dumps(value_type.access)}, "
             f"{str(value_type.noalias).lower()}, {value_type.alignment}, "
             f"{str(value_type.restrict_like).lower()}, "
             f"{json.dumps(value_type.storage_class)}, "

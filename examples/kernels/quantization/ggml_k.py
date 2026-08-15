@@ -1,14 +1,5 @@
 import weft.language as W
 
-
-@W.helper(effects=("read",))
-def load_f16_le(base):
-    low = W.cast(W.load(base, other=W.u8(0)), W.u16)
-    high = W.cast(W.load(base + 1, other=W.u8(0)), W.u16)
-    bits = low | (high << W.u16(8))
-    return W.cast(W.bitcast(bits, W.f16), W.f32)
-
-
 @W.helper(effects=("read",))
 def load_k4_scale_min(scales, scale_index):
     low_group = scale_index < W.index(4)

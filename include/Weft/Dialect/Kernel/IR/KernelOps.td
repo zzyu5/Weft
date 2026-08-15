@@ -29,10 +29,9 @@ class WeftKernel_Op<string mnemonic, list<Trait> traits = []>
     : Op<WEFT_Kernel_Dialect, mnemonic, traits>;
 
 def WeftKernel_PtrType : WeftKernel_Type<"Ptr", "ptr"> {
-  let summary = "Typed pointer and source-declared alias/access facts";
+  let summary = "Typed pointer and author-declared alias/access facts";
   let parameters = (ins
     "::mlir::Type":$elementType,
-    StringRefParameter<"address space">:$addressSpace,
     StringRefParameter<"read, write, or readwrite">:$access,
     "bool":$noAlias,
     "int64_t":$alignment,
@@ -40,7 +39,7 @@ def WeftKernel_PtrType : WeftKernel_Type<"Ptr", "ptr"> {
     StringRefParameter<"external, persistent, or workspace">:$storageClass,
     StringRefParameter<"persistent storage format identity, otherwise empty">:$storageFormat
   );
-  let assemblyFormat = "`<` $elementType `,` $addressSpace `,` $access `,` $noAlias `,` $alignment `,` $restrictLike `,` $storageClass `,` $storageFormat `>`";
+  let assemblyFormat = "`<` $elementType `,` $access `,` $noAlias `,` $alignment `,` $restrictLike `,` $storageClass `,` $storageFormat `>`";
   let genVerifyDecl = 1;
 }
 
@@ -52,7 +51,7 @@ def WeftKernel_ConstexprType : WeftKernel_Type<"Constexpr", "constexpr"> {
 }
 
 def WeftKernel_BlockType : WeftKernel_Type<"Block", "block"> {
-  let summary = "Logical block domain with explicit source axis identity";
+  let summary = "Logical block domain with explicit author axis identity";
   let parameters = (ins
     ArrayRefParameter<"int64_t">:$shape,
     ArrayRefParameter<"int64_t">:$axisIds,
@@ -132,7 +131,7 @@ def WeftKernel_MetaValueOp : WeftKernel_Op<"meta_value", [Pure]> {
 }
 
 def WeftKernel_StorageOp : WeftKernel_Op<"storage"> {
-  let summary = "Source-visible persistent or worker-local storage contract";
+  let summary = "Source-visible persistent or worker-local storage shape";
   let arguments = (ins WeftKernel_PtrType:$pointer,
                        Variadic<Index>:$extents,
                        DenseI64ArrayAttr:$shape);
@@ -198,8 +197,7 @@ def WeftKernel_PtrAddOp : WeftKernel_Op<"ptr_add", [Pure]> {
 }
 
 def WeftKernel_UnaryOp : WeftKernel_Op<"unary", [Pure]> {
-  let arguments = (ins AnyType:$input, StrAttr:$kind, StrAttr:$math,
-                       StrAttr:$exceptional);
+  let arguments = (ins AnyType:$input, StrAttr:$kind, StrAttr:$math);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

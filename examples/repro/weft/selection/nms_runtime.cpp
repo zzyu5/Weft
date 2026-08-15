@@ -81,7 +81,8 @@ int main() {
         expectedSuppressed[candidate] = 1;
   }
 
-  std::vector<std::uint8_t> suppressed(kCandidates, 0);
+  std::vector<std::uint8_t> suppressed(
+      greedy_nms_f32__suppressed_elements(kCandidates), 0);
   std::vector<std::uint32_t> selected(kSelected, 0);
   greedy_nms_f32(boxes.data(), scores.data(), suppressed.data(), selected.data(),
                  kCandidates, kSelected, kThreshold);

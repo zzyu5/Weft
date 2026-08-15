@@ -58,8 +58,8 @@ def gemm_worker(
 这里：
 
 - `m0/n0/k0`、BM/BN/BK 与 staging skeleton 归作者；
-- `mi/ni/ki`是三个不同source axis；A/B显式共享同一个`ki`，accumulator显式拥有`[mi,ni]`；
-- `a` 的logical relation是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major relation；只有source
+- `mi/ni/ki`是三个不同 DSL axis；A/B显式共享同一个`ki`，accumulator显式拥有`[mi,ni]`；
+- `a` 的logical relation是 `[M,K]`，`b` 是供dot使用的 `[N,K]` row-major relation；只有 DSL kernel
   使用`W.persistent(format)`显式声明的caller-provided packed object才具有persistent身份；
 - block values 与matmul relation归canonical semantics；
 - `mr×nr`、LMUL、RVV microkernel 或 IME fragment 归 target lowering 与构建期 tuning；
@@ -67,7 +67,7 @@ def gemm_worker(
 
 ## F32 row microtile dot
 
-当前F32 workload保留另一种自然source结构：作者按6行遍历M、按单列遍历N，并用一个动态K
+当前F32 workload保留另一种自然 DSL 结构：作者按6行遍历M、按单列遍历N，并用一个动态K
 block表达6个row dot：
 
 ```python
@@ -92,6 +92,6 @@ Target从dot、block axis、typed operand以及pointer/access projection选择F3
 microtile与LMUL；当前local-row resource model为row6选择LMUL2、row8选择LMUL1，同一个K
 vector供各row accumulator
 复用。该选择不要求enclosing loop
-形成固定row/column closure，所以同一local dot可以位于expert grouping等其他source
-context中。`row step=6` 是当前source的cache/register blocking选择；它不是`gemm_f32`
+形成固定row/column producer shape，所以同一local dot可以位于expert grouping等其他 DSL
+context中。`row step=6` 是当前 DSL kernel 的cache/register blocking选择；它不是`gemm_f32`
 kernel类别，也没有把N/K loop、grouping或matrix layout从target反推回IR。

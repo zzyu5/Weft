@@ -39,7 +39,8 @@ float f16Value(const std::uint8_t *address) {
 }
 
 std::vector<std::uint8_t> makePackedWeights() {
-  std::vector<std::uint8_t> packed(kExperts * kExpertPackedBytes);
+  std::vector<std::uint8_t> packed(
+      q4_k_mul_mat_id__packed_weight_elements(kExperts, kRows, kInner));
   for (std::size_t expert = 0; expert < kExperts; ++expert)
     for (std::size_t rowTile = 0; rowTile < kRowTiles; ++rowTile)
       for (std::size_t block = 0; block < kBlocks; ++block) {
@@ -173,15 +174,21 @@ int main(int argc, char **argv) {
     }
   }
   const std::vector<std::uint8_t> packed = makePackedWeights();
-  std::vector<float> activationScale(items * kBlocks);
-  std::vector<std::int8_t> activationCode(items * kInner);
+  std::vector<float> activationScale(
+      q4_k_mul_mat_id__activation_scale_elements(kTokens, kSlots, kInner));
+  std::vector<std::int8_t> activationCode(
+      q4_k_mul_mat_id__activation_code_elements(kTokens, kSlots, kInner));
   std::vector<float> referenceScale(items * kBlocks);
   std::vector<std::int8_t> referenceCode(items * kInner);
   std::vector<float> output(items * kRows);
-  std::vector<std::uint32_t> expertCounts(kExperts);
-  std::vector<std::uint32_t> expertOffsets(kExperts + 1U);
-  std::vector<std::uint32_t> expertCursors(kExperts);
-  std::vector<std::uint32_t> expertItems(items);
+  std::vector<std::uint32_t> expertCounts(
+      q4_k_mul_mat_id__expert_counts_elements(kExperts));
+  std::vector<std::uint32_t> expertOffsets(
+      q4_k_mul_mat_id__expert_offsets_elements(kExperts));
+  std::vector<std::uint32_t> expertCursors(
+      q4_k_mul_mat_id__expert_cursors_elements(kExperts));
+  std::vector<std::uint32_t> expertItems(
+      q4_k_mul_mat_id__expert_items_elements(kTokens, kSlots));
   referenceQuantize(activation, referenceScale, referenceCode);
 
   q4_k_mul_mat_id(

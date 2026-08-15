@@ -39,7 +39,7 @@ class HelperDefinition:
             raise DefinitionError("Weft helpers must decorate a Python function")
         if function.__annotations__:
             raise DefinitionError(
-                "Weft helper annotations are not a type contract; omit them"
+                "Weft helper annotations do not declare types; omit them"
             )
         allowed = {"read", "write"}
         if any(effect not in allowed for effect in effects):
@@ -60,7 +60,7 @@ class HelperDefinition:
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise LanguageUseError(
-            f"helper {self.__name__} is AOT Weft source and cannot run as Python"
+            f"helper {self.__name__} belongs to an AOT Weft DSL kernel and cannot run as Python"
         )
 
 
@@ -86,6 +86,7 @@ range = _intrinsic("range")
 vla = _intrinsic("vla")
 select = _intrinsic("select")
 load = _intrinsic("load")
+load_f16_le = _intrinsic("load_f16_le")
 store = _intrinsic("store")
 storage = _intrinsic("storage")
 sort_indices = _intrinsic("sort_indices")
@@ -108,7 +109,6 @@ maximum = _intrinsic("maximum")
 minimum = _intrinsic("minimum")
 exp = _intrinsic("exp")
 tanh = _intrinsic("tanh")
-exp2 = _intrinsic("exp2")
 log = _intrinsic("log")
 sin = _intrinsic("sin")
 cos = _intrinsic("cos")
@@ -116,8 +116,8 @@ floor = _intrinsic("floor")
 sqrt = _intrinsic("sqrt")
 rsqrt = _intrinsic("rsqrt")
 neg_inf = _intrinsic("neg_inf")
-affine_i4_i8_contract = _intrinsic("affine_i4_i8_contract")
-symmetric_i4_i8_contract = _intrinsic("symmetric_i4_i8_contract")
+affine_i4_i8_dot = _intrinsic("affine_i4_i8_dot")
+symmetric_i4_i8_dot = _intrinsic("symmetric_i4_i8_dot")
 grouped_affine_i4_i8_dot = _intrinsic("grouped_affine_i4_i8_dot")
 sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot")
 e2m1_e8m0_i8_dot = _intrinsic("e2m1_e8m0_i8_dot")

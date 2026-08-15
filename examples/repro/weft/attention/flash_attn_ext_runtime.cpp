@@ -130,8 +130,10 @@ int main() {
   std::vector<_Float16> mask(maskElements);
   std::vector<float> sinks(kQueryHeads);
   std::vector<float> output(outputElements);
-  std::vector<float> queryScratch(kKeyDimension);
-  std::vector<float> accumulatorScratch(kValueDimension);
+  std::vector<float> queryScratch(
+      flash_attn_ext_f32_f16__query_scratch_elements(kKeyDimension));
+  std::vector<float> accumulatorScratch(
+      flash_attn_ext_f32_f16__accumulator_scratch_elements(kValueDimension));
   for (std::size_t index = 0; index < query.size(); ++index)
     query[index] =
         static_cast<float>(static_cast<int>((index * 7U) % 61U) - 30) /

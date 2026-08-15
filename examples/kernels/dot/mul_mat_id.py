@@ -95,8 +95,8 @@ def mul_mat_id_f32(
                     + token * output_token_stride
                     + slot * output_slot_stride
                 )
-                row_lane = W.block_axis(6)
-                reduction = W.block_axis(inner)
+                row_lane = W.block(6)
+                reduction = W.block(inner)
                 row_index = row + row_lane[:, None]
                 reduction_index = reduction[None, :]
                 row_valid = row_index < rows
@@ -114,7 +114,7 @@ def mul_mat_id_f32(
                 value = W.dot(
                     lhs,
                     rhs,
-                    init=W.zeros((6,), dtype=W.f32),
+                    init=W.zeros((row_lane,), dtype=W.f32),
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",

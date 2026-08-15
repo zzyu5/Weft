@@ -69,6 +69,44 @@ ShapeKind shapeKindOf(mlir::Type type) {
   return weft::kernel::logicalShapeKind(type);
 }
 
+bool isSupportedCastPair(ShapeKind kind, mlir::Type source,
+                         mlir::Type target) {
+  if (kind == ShapeKind::Scalar)
+    return isScalarType(source) && isScalarType(target);
+  if (kind == ShapeKind::Region)
+    return (source.isF16() && target.isF32()) ||
+           (source.isF32() && target.isF16()) ||
+           (source.isUnsignedInteger(32) && target.isIndex()) ||
+           (source.isIndex() && target.isF32());
+  if (kind != ShapeKind::Block)
+    return false;
+  return (source.isIndex() && target.isUnsignedInteger(8)) ||
+         (source.isUnsignedInteger(8) && target.isUnsignedInteger(16)) ||
+         (source.isUnsignedInteger(8) && target.isSignedInteger(32)) ||
+         (source.isUnsignedInteger(8) && target.isF32()) ||
+         (source.isSignedInteger(8) && target.isSignedInteger(32)) ||
+         (source.isSignedInteger(8) && target.isF32()) ||
+         (source.isUnsignedInteger(16) && target.isSignedInteger(32)) ||
+         (source.isSignedInteger(16) && target.isSignedInteger(32)) ||
+         (source.isF16() && target.isF32());
+}
+
+bool isSupportedBitcastPair(ShapeKind kind, mlir::Type source,
+                            mlir::Type target) {
+  if (kind == ShapeKind::Scalar)
+    return (source.isUnsignedInteger(8) && target.isSignedInteger(8)) ||
+           (source.isUnsignedInteger(16) && target.isSignedInteger(16)) ||
+           (source.isUnsignedInteger(16) && target.isF16()) ||
+           (source.isF16() && target.isUnsignedInteger(16)) ||
+           (source.isF32() && target.isUnsignedInteger(32)) ||
+           (source.isUnsignedInteger(32) && target.isF32());
+  if (kind != ShapeKind::Block)
+    return false;
+  return (source.isUnsignedInteger(8) && target.isSignedInteger(8)) ||
+         (source.isUnsignedInteger(16) && target.isSignedInteger(16)) ||
+         (source.isUnsignedInteger(16) && target.isF16());
+}
+
 bool isLogicalValueType(mlir::Type type) {
   return weft::kernel::isLogicalValue(type);
 }
@@ -598,13 +636,11 @@ bool weft::kernel::haveSameLogicalExtent(mlir::Value lhs, int64_t lhsAxis,
 
 mlir::LogicalResult PtrType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-    mlir::Type elementType, llvm::StringRef addressSpace,
-    llvm::StringRef access, bool noAlias, int64_t alignment, bool,
+    mlir::Type elementType, llvm::StringRef access, bool noAlias,
+    int64_t alignment, bool,
     llvm::StringRef storageClass, llvm::StringRef storageFormat) {
   if (!isScalarType(elementType) || elementType.isIndex())
     return emitError() << "pointer element type must be a non-index scalar";
-  if (addressSpace.empty())
-    return emitError() << "pointer address space must not be empty";
   if (access != "read" && access != "write" && access != "readwrite")
     return emitError() << "pointer access must be read, write, or readwrite";
   if (alignment < 0 ||
@@ -721,7 +757,7 @@ mlir::LogicalResult KernelOp::verify() {
       getArgKinds().size() != entry.getNumArguments())
     return emitOpError("arg_names and arg_kinds must match entry arguments");
   llvm::DenseSet<llvm::StringRef> seen;
-  llvm::DenseMap<mlir::Value, StorageOp> storageContracts;
+  llvm::DenseMap<mlir::Value, StorageOp> storageShapes;
   llvm::DenseMap<int64_t, BlockIndexOp> axisDefinitions;
   mlir::LogicalResult axisStatus = mlir::success();
   getOperation()->walk([&](BlockIndexOp axis) {
@@ -759,10 +795,10 @@ mlir::LogicalResult KernelOp::verify() {
     auto argument = mlir::dyn_cast<mlir::BlockArgument>(storage.getPointer());
     if (!argument || argument.getOwner() != &entry)
       return storage.emitOpError(
-          "storage contract must bind one kernel entry pointer directly");
-    if (!storageContracts.try_emplace(argument, storage).second)
+          "storage declaration must bind one kernel entry pointer directly");
+    if (!storageShapes.try_emplace(argument, storage).second)
       return storage.emitOpError(
-          "one entry pointer cannot have multiple storage contracts");
+          "one entry pointer cannot have multiple storage declarations");
   }
   for (auto [nameAttr, kindAttr, argument] :
        llvm::zip(getArgNames(), getArgKinds(), entry.getArguments())) {
@@ -781,13 +817,13 @@ mlir::LogicalResult KernelOp::verify() {
     if (!valid)
       return emitOpError("argument kind is incompatible with its canonical type");
     if (auto pointer = mlir::dyn_cast<PtrType>(type)) {
-      bool requiresContract = pointer.getStorageClass() != "external";
-      bool hasContract = storageContracts.contains(argument);
-      if (requiresContract != hasContract)
+      bool requiresShape = pointer.getStorageClass() != "external";
+      bool hasShape = storageShapes.contains(argument);
+      if (requiresShape != hasShape)
         return emitOpError(
-            requiresContract
-                ? "persistent/workspace pointer requires one storage contract"
-                : "external pointer cannot have a storage contract");
+            requiresShape
+                ? "persistent/workspace pointer requires one storage declaration"
+                : "external pointer cannot have a storage declaration");
     }
   }
   if (!mlir::isa<ReturnOp>(entry.getTerminator()))
@@ -810,7 +846,7 @@ mlir::LogicalResult StorageOp::verify() {
   if (mlir::failed(requireKernelAncestor(getOperation())))
     return mlir::failure();
   if (!mlir::isa<KernelOp>(getOperation()->getBlock()->getParentOp()))
-    return emitOpError("storage contract must be in the kernel entry block");
+    return emitOpError("storage declaration must be in the kernel entry block");
   PtrType pointer = mlir::cast<PtrType>(getPointer().getType());
   if (pointer.getStorageClass() == "external")
     return emitOpError(
@@ -998,6 +1034,9 @@ mlir::LogicalResult BlockIndexOp::verify() {
 
 mlir::LogicalResult FullOp::verify() {
   auto result = getResult().getType();
+  if (!result.getElementType().isF32() || result.getShape().empty() ||
+      result.getShape().size() > 2)
+    return emitOpError("full currently creates rank-one or rank-two f32 blocks");
   if (getAxes().size() != result.getShape().size())
     return emitOpError("block axes and result rank must match");
   if (getValue().getType() != result.getElementType())
@@ -1054,7 +1093,7 @@ mlir::LogicalResult PtrAddOp::verify() {
 
 mlir::LogicalResult UnaryOp::verify() {
   if (!llvm::StringSwitch<bool>(getKind())
-           .Cases("neg", "exp", "tanh", "exp2", "log", "sqrt", "rsqrt", "sin", true)
+           .Cases("neg", "exp", "tanh", "log", "sqrt", "rsqrt", "sin", true)
            .Cases("cos", "floor", true)
            .Default(false))
     return emitOpError("unsupported unary kind");
@@ -1098,6 +1137,10 @@ mlir::LogicalResult CastOp::verify() {
       !isScalarType(elementTypeOf(getInput().getType())) ||
       !isScalarType(elementTypeOf(getResult().getType())))
     return emitOpError("cast must preserve logical shape and validity");
+  if (!isSupportedCastPair(shapeKindOf(getInput().getType()),
+                           elementTypeOf(getInput().getType()),
+                           elementTypeOf(getResult().getType())))
+    return emitOpError("cast element pair has no current realization");
   return mlir::success();
 }
 
@@ -1111,6 +1154,10 @@ mlir::LogicalResult BitcastOp::verify() {
   auto resultWidth = fixedBitWidth(elementTypeOf(getResult().getType()));
   if (!inputWidth || !resultWidth || inputWidth != resultWidth)
     return emitOpError("bitcast element types must have equal fixed width");
+  if (!isSupportedBitcastPair(shapeKindOf(getInput().getType()),
+                              elementTypeOf(getInput().getType()),
+                              elementTypeOf(getResult().getType())))
+    return emitOpError("bitcast element pair has no current realization");
   return mlir::success();
 }
 
@@ -1247,7 +1294,7 @@ mlir::LogicalResult SortIndicesOp::verify() {
       }
   if (!scratchStorage || scratchStorage.getExtents().size() != 1)
     return emitOpError(
-        "scratch must bind a rank-one workspace storage contract directly");
+        "scratch must bind a rank-one workspace storage declaration directly");
   mlir::Value storageExtent = scratchStorage.getExtents().front();
   std::optional<int64_t> storageConstant = constantIndex(storageExtent);
   std::optional<int64_t> operationConstant = constantIndex(getExtent());
@@ -1314,6 +1361,9 @@ mlir::LogicalResult ScanOp::verify() {
   if (!validOrder(getOrder()) || !isPredicateType(getWhere().getType()) ||
       getIdentity().getType() != getAccDtype())
     return emitOpError("invalid scan order, identity, or predicate");
+  if (isMasked(getInput().getType()))
+    return emitOpError(
+        "scan does not define a logical-validity realization; fill the input first");
   mlir::Type input = stateInputType(getInput().getType());
   if (shapeKindOf(input) == ShapeKind::Scalar ||
       shapeKindOf(getResult().getType()) != shapeKindOf(input) ||
@@ -1446,7 +1496,7 @@ mlir::LogicalResult DotOp::verify() {
     resultKind = ShapeKind::Block;
   }
   if (!elementTypeOf(lhsType).isF32() || !getAccDtype().isF32())
-    return emitOpError("dot target contract is f32 multiplicands with f32 accumulation");
+    return emitOpError("dot supports only f32 multiplicands with f32 accumulation");
   if (mlir::failed(verifyProductResult(
           getOperation(), getLhs(), getRhs(), getInit(), getResult(),
           getAccDtype(), getOrder(), getMath(), outputShape, resultKind,
@@ -1473,7 +1523,7 @@ mlir::LogicalResult MatmulOp::verify() {
     return emitOpError("matmul requires local rank-two [M,K] x [K,N] blocks");
   if (!lhs.getElementType().isF16() || !rhs.getElementType().isF16() ||
       !getAccDtype().isF32())
-    return emitOpError("matmul target contract is f16 x f16 with f32 accumulation");
+    return emitOpError("matmul supports only f16 x f16 with f32 accumulation");
   llvm::SmallVector<int64_t> outputShape{lhs.getShape()[0], rhs.getShape()[1]};
   llvm::SmallVector<int64_t> outputAxes{lhs.getAxisIds()[0],
                                         rhs.getAxisIds()[1]};
@@ -1551,14 +1601,18 @@ mlir::LogicalResult DecodeOp::verify() {
 }
 
 mlir::LogicalResult NarrowOp::verify() {
-  if (!validRounding(getRounding()) ||
+  if (getRounding() != "rne" || !getSaturation() ||
       !isPointwiseValueType(getInput().getType()) ||
       !isPointwiseValueType(getResult().getType()) ||
+      shapeKindOf(getInput().getType()) != ShapeKind::Region ||
+      !elementTypeOf(getInput().getType()).isF32() ||
+      !elementTypeOf(getResult().getType()).isSignedInteger(8) ||
       shapeKindOf(getInput().getType()) != shapeKindOf(getResult().getType()) ||
       staticShapeOf(getInput().getType()) != staticShapeOf(getResult().getType()) ||
       axisIdsOf(getInput().getType()) != axisIdsOf(getResult().getType()) ||
       isMasked(getInput().getType()) != isMasked(getResult().getType()))
-    return emitOpError("narrow must preserve shape/validity and use a known rounding mode");
+    return emitOpError(
+        "narrow requires VLA f32 to i8, rne, saturation, and preserved validity");
   return mlir::success();
 }
 

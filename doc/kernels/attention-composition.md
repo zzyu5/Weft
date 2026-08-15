@@ -8,16 +8,16 @@ attention graph。每个worker-local entry都显式拥有自己的loop、pointer
 ```python
 @weft.kernel
 def transpose_f32(
-    source: W.ptr[W.f32, W.readonly],
+    input: W.ptr[W.f32, W.readonly],
     destination: W.ptr[W.f32, W.writeonly],
     rows: W.index,
     columns: W.index,
-    source_stride: W.index,
+    input_stride: W.index,
     destination_stride: W.index,
 ) -> None:
     for row in W.range(0, rows):
         with W.vla(0, columns) as column:
-            value = W.load(source + row * source_stride + column)
+            value = W.load(input + row * input_stride + column)
             W.store(destination + column * destination_stride + row, value)
 ```
 
@@ -26,11 +26,11 @@ load加strided/indexed store，但不能改变row/column mapping。
 
 ## RoPE NeoX
 
-RoPE source显式分成angle preparation与rotation：
+RoPE DSL kernel 显式分成angle preparation与rotation：
 
 ```text
 for position:
-  theta = source-defined initial state
+  theta = DSL-defined initial state
   for pair:
     cache cos(theta), sin(theta)
     theta = theta * theta_scale
@@ -42,8 +42,8 @@ for position:
       store both halves
 ```
 
-`theta` 是ordered sequential carry；angle cache是source-declared worker-local workspace，其
-shape与lifetime进入entry storage contract。Target可以为
+`theta` 是ordered sequential carry；angle cache是 DSL-declared worker-local workspace，其
+shape与lifetime进入entry storage declaration。Target可以为
 sin/cos与VLA arithmetic选择不同realization，但不能把carry猜成scan，也不能自动创建或删除
 cache stage。
 
@@ -58,7 +58,7 @@ for row in W.range(0, heads * queries):
                 W.neg_inf(W.f32), where=masked)
 ```
 
-Row/query映射、causal predicate、logical key domain与predicated store effect均在source中。
+Row/query映射、causal predicate、logical key domain与predicated store effect均在 DSL kernel 中。
 Target为predicate选择mask realization，为store选择unit-stride memory与LMUL；physical tail
 不能被并入或替代causal predicate。
 
@@ -80,12 +80,12 @@ for query_head:
 ```
 
 Query staging、causal bound、GQA mapping、key order与online `(maximum,total)` update都是
-source-observable。普通scalar carry保持key iteration order；它不是局部typed summary，因为每步
+author-observable。普通scalar carry保持key iteration order；它不是局部typed summary，因为每步
 还更新一个value accumulator和workspace-visible state。Query与accumulator workspace均由caller
 按generated header分配，由当前worker在一次invocation内独占；它们可跨key loop复用，不是
 target可偷造的primitive temporary。
 
-Target lowering可以分别实现并联合安排以下local closure：
+Target lowering可以分别实现并联合安排以下局部运算：
 
 - F32→F16 query staging；
 - widening F16 dot reduction；
@@ -98,4 +98,4 @@ whole-kernel emitter，也不能从一个framework attention graph发明上述lo
 
 Transpose、RoPE与FlashAttention在application中可以相邻调用，但Weft core不执行跨entry
 graph fusion。若上游要构造新的fused worker-local algorithm，必须生成一份新的完整canonical
-Kernel IR source，而不是要求target猜测。
+Kernel IR，而不是要求target猜测。

@@ -13,13 +13,13 @@ def main() -> int:
         prog="python -m weft",
         description="Lower one @weft.kernel definition to canonical Weft MLIR",
     )
-    parser.add_argument("source", type=Path, help="Python source containing the kernel")
+    parser.add_argument("dsl_kernel", type=Path, help="Python file containing the DSL kernel")
     parser.add_argument(
-        "--kernel", dest="kernel_name", help="kernel name when the source defines several"
+        "--kernel", dest="kernel_name", help="kernel name when the file defines several"
     )
     arguments = parser.parse_args()
 
-    scope = runpy.run_path(str(arguments.source))
+    scope = runpy.run_path(str(arguments.dsl_kernel))
     kernels = {
         name: value
         for name, value in scope.items()
@@ -29,13 +29,13 @@ def main() -> int:
         try:
             definition = kernels[arguments.kernel_name]
         except KeyError:
-            parser.error(f"source has no @weft.kernel named {arguments.kernel_name!r}")
+            parser.error(f"DSL file has no @weft.kernel named {arguments.kernel_name!r}")
     elif len(kernels) == 1:
         definition = next(iter(kernels.values()))
     elif not kernels:
-        parser.error("source does not define an @weft.kernel")
+        parser.error("DSL file does not define an @weft.kernel")
     else:
-        parser.error("source defines several kernels; pass --kernel NAME")
+        parser.error("DSL file defines several kernels; pass --kernel NAME")
     print(lower_to_mlir(definition), end="")
     return 0
 

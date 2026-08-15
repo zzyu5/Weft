@@ -16,8 +16,8 @@ def out_product_f32(
 ) -> None:
     for row in W.range(0, rows, 6):
         with W.vla(0, columns) as column:
-            row_lane = W.block_axis(6)
-            sample_axis = W.block_axis(samples)
+            row_lane = W.block(6)
+            sample_axis = W.block(samples)
             row_index = row + row_lane[:, None]
             sample_index = sample_axis[None, :]
             left = W.load(

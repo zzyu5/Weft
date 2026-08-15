@@ -20,7 +20,7 @@ with W.vla(begin, end) as i:
 
 ```python
 with W.vla(row_begin, row_end) as i:
-    value = W.load(source + i)
+    value = W.load(input + i)
     prefix = W.scan(value, op="add", identity=W.f32(0.0),
                     inclusive=True, order="ordered", acc_dtype=W.f32)
     W.store(destination + i, prefix)

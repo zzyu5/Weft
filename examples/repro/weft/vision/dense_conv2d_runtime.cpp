@@ -90,10 +90,13 @@ int main() {
   std::vector<float> source(inputElements);
   std::vector<float> weight(weightElements);
   std::vector<float> output(outputElements);
-  std::vector<float> packedPatches(kBatch * kOutputHeight * kOutputWidth *
-                                   kInputChannels * kKernelHeight *
-                                   kKernelWidth);
-  std::vector<float> packedWeight(weightElements);
+  std::vector<float> packedPatches(
+      dense_conv2d_f32__packed_patches_elements(
+          kBatch, kInputChannels, kKernelHeight, kKernelWidth, kOutputHeight,
+          kOutputWidth));
+  std::vector<float> packedWeight(
+      dense_conv2d_f32__packed_weight_elements(
+          kInputChannels, kOutputChannels, kKernelHeight, kKernelWidth));
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] =
         static_cast<float>(static_cast<int>(index % 127U) - 63) / 256.0F;

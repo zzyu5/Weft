@@ -26,7 +26,7 @@ case "${profile}" in
     remote_ggml_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv/bin
     remote_ggml_toolchain_lib=/opt/tcrv-toolchains/gcc-15.2.0/lib
     runtime_hardware=SG2044
-    projection_scope=activation-quantize-plus-local-N16-K32-contract
+    projection_scope=activation-quantize-plus-local-N16-K32-dot
     ;;
   k1-rvv256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -41,7 +41,7 @@ case "${profile}" in
     remote_ggml_build=/data/build-k1-q4k/bin
     remote_ggml_toolchain_lib=
     runtime_hardware=K1/X60
-    projection_scope=activation-quantize-plus-local-N16-K32-contract
+    projection_scope=activation-quantize-plus-local-N16-K32-dot
     ;;
   k1-ime256)
     target_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
@@ -182,6 +182,22 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/reduction/argmax.py
     runtime=examples/repro/weft/reduction/argmax_runtime.cpp
+    ;;
+  online_softmax_summary)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} online_softmax_summary" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/online_softmax_summary.py
+    runtime=examples/repro/weft/reduction/online_softmax_summary_runtime.cpp
+    ;;
+  predicate_reduce)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} predicate_reduce" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/reduction/predicate_reduce.py
+    runtime=examples/repro/weft/reduction/predicate_reduce_runtime.cpp
     ;;
   top_k)
     if [[ $# -ne 0 ]]; then
@@ -392,8 +408,8 @@ case "${kernel}" in
       echo "usage: ${usage_prefix} blocked_gemm <decode|prefill> <repetitions>" >&2
       exit 2
     fi
-    dsl=examples/kernels/contraction/blocked_gemm.py
-    runtime=examples/repro/weft/contraction/blocked_gemm_runtime.cpp
+    dsl=examples/kernels/dot/blocked_gemm.py
+    runtime=examples/repro/weft/dot/blocked_gemm_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
   blocked_gemm_f32)
@@ -401,8 +417,8 @@ case "${kernel}" in
       echo "usage: ${usage_prefix} blocked_gemm_f32 <decode|prefill> <repetitions>" >&2
       exit 2
     fi
-    dsl=examples/kernels/contraction/blocked_gemm_f32.py
-    runtime=examples/repro/weft/contraction/blocked_gemm_f32_runtime.cpp
+    dsl=examples/kernels/dot/blocked_gemm_f32.py
+    runtime=examples/repro/weft/dot/blocked_gemm_f32_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
   mul_mat_id)
@@ -410,16 +426,16 @@ case "${kernel}" in
       echo "usage: ${usage_prefix} mul_mat_id" >&2
       exit 2
     fi
-    dsl=examples/kernels/contraction/mul_mat_id.py
-    runtime=examples/repro/weft/contraction/mul_mat_id_runtime.cpp
+    dsl=examples/kernels/dot/mul_mat_id.py
+    runtime=examples/repro/weft/dot/mul_mat_id_runtime.cpp
     ;;
   out_product)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} out_product" >&2
       exit 2
     fi
-    dsl=examples/kernels/contraction/out_product.py
-    runtime=examples/repro/weft/contraction/out_product_runtime.cpp
+    dsl=examples/kernels/dot/out_product.py
+    runtime=examples/repro/weft/dot/out_product_runtime.cpp
     ;;
   contiguous_transpose)
     if [[ $# -ne 1 ]]; then
@@ -611,8 +627,8 @@ case "${kernel}" in
       echo "usage: ${usage_prefix} q4_k_mul_mat_id <repetitions>" >&2
       exit 2
     fi
-    dsl=examples/kernels/contraction/q4_k_mul_mat_id.py
-    runtime=examples/repro/weft/contraction/q4_k_mul_mat_id_runtime.cpp
+    dsl=examples/kernels/dot/q4_k_mul_mat_id.py
+    runtime=examples/repro/weft/dot/q4_k_mul_mat_id_runtime.cpp
     runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
     ;;
   timestep_embedding)

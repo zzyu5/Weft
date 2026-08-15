@@ -24,7 +24,8 @@ def gemm_worker(
             ni = W.block(BN)
             acc = W.zeros((mi, ni), dtype=W.f32)
 
-            for k0 in W.range(0, k, BK):
+            k0 = W.index(0)
+            while k0 < k:
                 ki = W.block(BK)
 
                 m_idx = m0 + mi[:, None]
@@ -46,6 +47,7 @@ def gemm_worker(
                     order="relaxed",
                     math="native",
                 )
+                k0 = k0 + BK
 
             acc = acc + W.f32(0.0)
             m_idx = m0 + mi[:, None]

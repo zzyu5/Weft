@@ -94,8 +94,12 @@ int main() {
   std::vector<float> source(inputElements);
   std::vector<float> weight(weightElements);
   std::vector<float> output(outputElements);
-  std::vector<float> packedSource(inputElements);
-  std::vector<float> packedWeight(weightElements);
+  std::vector<float> packedSource(
+      conv_transpose2d_p0_f32__packed_source_elements(
+          kBatch, kInputHeight, kInputWidth, kInputChannels));
+  std::vector<float> packedWeight(
+      conv_transpose2d_p0_f32__packed_weight_elements(
+          kInputChannels, kOutputChannels, kKernelHeight, kKernelWidth));
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] =
         static_cast<float>(static_cast<int>(index % 127U) - 63) / 256.0F;

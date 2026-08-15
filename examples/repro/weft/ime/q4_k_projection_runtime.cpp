@@ -111,8 +111,8 @@ std::vector<uint8_t> repack_q4_k_16x32(
     const std::vector<CanonicalQ4KBlock> &canonical) {
   constexpr size_t superblocks = kInner / kQ4KExtent;
   constexpr size_t blocks = kInner / kBlockExtent;
-  std::vector<uint8_t> packed((kColumns / kColumnTile) * blocks *
-                              kPackedBlockBytes);
+  std::vector<uint8_t> packed(
+      q4_k_projection_ime__packed_weight_elements(kColumns, kInner));
   for (size_t column_group = 0; column_group < kColumns / kColumnTile;
        ++column_group) {
     for (size_t superblock = 0; superblock < superblocks; ++superblock) {
@@ -257,8 +257,10 @@ int main(int argc, char **argv) {
 
   const std::vector<CanonicalQ4KBlock> canonical = make_canonical_weights();
   const std::vector<uint8_t> packed = repack_q4_k_16x32(canonical);
-  std::vector<float> scale(kInner / kBlockExtent);
-  std::vector<int8_t> code(kInner);
+  std::vector<float> scale(
+      q4_k_projection_ime__activation_scale_elements(1, kInner));
+  std::vector<int8_t> code(
+      q4_k_projection_ime__activation_code_elements(1, kInner));
   std::vector<float> output(kColumns);
   std::vector<float> reference_scale(kInner / kBlockExtent);
   std::vector<int8_t> reference_code(kInner);

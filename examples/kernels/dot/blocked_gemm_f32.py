@@ -28,14 +28,19 @@ def gemm_f32_worker(
                 other=W.f32(0.0),
             )
             rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
-            value = W.dot(
-                lhs,
-                rhs,
-                init=W.zeros((row_lane,), dtype=W.f32),
-                acc_dtype=W.f32,
-                order="relaxed",
-                math="native",
-            )
+            value = W.zeros((row_lane,), dtype=W.f32)
+            value = value + W.f32(0.0)
+            if k > W.index(0):
+                value = W.dot(
+                    lhs,
+                    rhs,
+                    init=value,
+                    acc_dtype=W.f32,
+                    order="relaxed",
+                    math="native",
+                )
+            else:
+                value = value + W.f32(0.0)
             shifted = value + W.f32(0.0)
             scaled = value * W.f32(1.0)
             combined = W.maximum(shifted, scaled)

@@ -1,54 +1,21 @@
-# 构建期 Tuning
+# 构建期选择
 
-## Tuning 不是 compiler stage
+Weft 不在 Kernel IR 中保存 measurement 或 winner。作者可以通过 `W.constexpr` 暴露算法级
+block size；target lowering 可以通过 backend config 暴露 LMUL、microtile、unroll、prefetch、
+packing 与 fragment 候选。
 
-Tuning若被使用，就是可选的外部构建循环：用不同source meta binding或显式backend config
-重复调用同一条编译主链，生成object，真机测量，再保留最快合法artifact。
+构建系统可以重复执行：
 
 ```text
-DSL meta / backend config candidate
-  -> Kernel IR
-  -> target lowering
-  -> intrinsic C / asm
-  -> system compiler
-  -> object
-  -> benchmark
-  -> retain fastest artifact
+bind meta values / backend config
+→ generate intrinsic C
+→ compile object
+→ run on the target
+→ retain the fastest legal object
 ```
 
-Tuning 不形成新 IR、不向 target lowering 插入第二份 legality，也不成为运行期依赖。
+候选必须先由 typed facts、target profile 与 resource budget 判定合法。某次编译或运行失败只删除
+该候选，不能删除整个物理维度，也不能创建 kernel-name、format-name 或 whole-kernel route。
 
-## 三类变量
-
-### Source structural knobs
-
-例如 `BM/BN/BK`、staging depth和算法variant。它们的存在与使用
-位置属于source，候选值由build specification绑定；当前CLI通过 `--meta=NAME=INTEGER`
-materialize source meta。
-
-### Backend physical config
-
-例如LMUL、register microtile、unroll、physical prefetch、pipeline、fragment、local packing与
-instruction family。Target
-lowering定义合法值和资源关系；没有external knob时可以选择唯一合法配置。若将这些候选
-暴露给build loop，必须是显式backend config，不能伪装成source meta或新的IR。
-
-### Compiler-derived mechanics
-
-每次strip的actual `vl`、physical tail、内部mask realization与pointer strength reduction等
-由target lowering直接推导，不是tuning knob。
-
-## 允许的 specialization
-
-构建期可以对target、exact/range shape、alignment、stride class、source-declared persistent
-data layout、fixed VLEN和extension capability生成多个普通AOT object。Runtime dispatcher
-只在这些现成artifact中选择；shape specialization不能发明source中不存在的loop、state或
-primitive identity。
-
-Tuning 禁止：
-
-- 创造 source 中不存在的 loop、primitive 或 persistent layout；
-- 让 architectural-illegal config 合法；
-- 改变 numerical policy；
-- 将 benchmark winner 物化成新的 compiler IR authority；
-- 为失败候选启用default scalar、legacy或GGML fallback。
+选择结果属于当前 build，不反写 DSL kernel 或 Kernel IR，也不改变作者写下的 traversal、blocking、
+staging、persistent layout 或算法 variant。

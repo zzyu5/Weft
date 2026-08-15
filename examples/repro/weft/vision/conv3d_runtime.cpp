@@ -102,15 +102,16 @@ int main() {
       kKernelWidth;
   const std::size_t outputElements = kBatch * kOutputChannels * kOutputDepth *
                                      kOutputHeight * kOutputWidth;
-  const std::size_t positions =
-      kBatch * kOutputDepth * kOutputHeight * kOutputWidth;
-  const std::size_t reduction =
-      kInputChannels * kKernelDepth * kKernelHeight * kKernelWidth;
   std::vector<float> source(inputElements);
   std::vector<float> weight(weightElements);
   std::vector<float> output(outputElements);
-  std::vector<float> packedPatches(positions * reduction);
-  std::vector<float> packedWeight(weightElements);
+  std::vector<float> packedPatches(
+      conv3d_f32__packed_patches_elements(
+          kBatch, kInputChannels, kKernelDepth, kKernelHeight, kKernelWidth,
+          kOutputDepth, kOutputHeight, kOutputWidth));
+  std::vector<float> packedWeight(conv3d_f32__packed_weight_elements(
+      kInputChannels, kOutputChannels, kKernelDepth, kKernelHeight,
+      kKernelWidth));
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] =
         static_cast<float>(static_cast<int>((index * 7U) % 127U) - 63) /
@@ -167,8 +168,8 @@ int main() {
         std::chrono::duration<double, std::milli>(end - begin).count());
   }
   const double milliseconds = median(samples);
-  const double operations = 2.0 * static_cast<double>(
-      positions * kOutputChannels * reduction);
+  const double operations =
+      2.0 * static_cast<double>(packedPatches.size() * kOutputChannels);
   std::printf("kernel=conv3d_f32\n");
   std::printf(
       "model_shape=video_conv3d[N=1,D=8,H=32,W=32,IC=32,OC=64,K=3x3x3,pad=1]\n");

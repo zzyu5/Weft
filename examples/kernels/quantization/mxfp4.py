@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @weft.kernel
@@ -21,14 +20,14 @@ def mxfp4_q8_0_rows(
         for block in W.range(0, blocks):
             weight_block = weight + row * weight_row_stride + block * W.index(17)
             exponent = W.load(weight_block, other=W.u8(0))
-            code_lane = W.block_axis(16)
+            code_lane = W.block(16)
             packed_codes = W.load(
                 weight_block + W.index(1) + code_lane,
                 other=W.u8(0),
             )
             activation_block = activation + block * W.index(34)
-            activation_scale = load_f16_le(activation_block)
-            activation_lane = W.block_axis(32)
+            activation_scale = W.load_f16_le(activation_block)
+            activation_lane = W.block(32)
             activation_values = W.bitcast(
                 W.load(
                     activation_block + W.index(2) + activation_lane,

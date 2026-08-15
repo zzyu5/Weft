@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @weft.kernel
@@ -72,32 +71,14 @@ def q4_k_projection_ime(
                 )
                 scale = W.load(scale_row + block, other=W.f32(0.0))
 
-                packed_byte = W.block(16)
                 packed_block = (
                     (column_begin // packed_column_extent) * blocks + block
                 )
                 packed_base = packed_weight + packed_block * W.index(304)
-                weight_scale = load_f16_le(
-                    packed_base + column * W.index(2)
-                )
-                weight_zero_point = W.load(
-                    packed_base + W.index(32) + column,
-                    other=W.u8(0),
-                )
-                packed_codes = W.load(
-                    packed_base
-                    + W.index(48)
-                    + (packed_byte[None, :] // W.index(8)) * W.index(128)
-                    + column[:, None] * W.index(8)
-                    + packed_byte[None, :] % W.index(8),
-                    other=W.u8(0),
-                )
-                accumulator = W.affine_i4_i8_contract(
+                accumulator = W.affine_i4_i8_dot(
                     activation_codes,
-                    packed_codes,
+                    packed_base,
                     activation_scale=scale,
-                    weight_scale=weight_scale,
-                    weight_zero_point=weight_zero_point,
                     init=accumulator,
                 )
 

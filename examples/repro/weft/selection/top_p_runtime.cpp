@@ -85,9 +85,13 @@ int main() {
     }
   }
 
-  std::vector<std::uint32_t> indices(kRows * kVocabulary, 0);
-  std::vector<float> sortedProbabilities(kRows * kVocabulary, 0.0F);
-  std::vector<std::uint32_t> sortScratch(kVocabulary, 0);
+  std::vector<std::uint32_t> indices(
+      top_p_nucleus_f32__sorted_indices_elements(kRows, kVocabulary), 0);
+  std::vector<float> sortedProbabilities(
+      top_p_nucleus_f32__sorted_probabilities_elements(kRows, kVocabulary),
+      0.0F);
+  std::vector<std::uint32_t> sortScratch(
+      top_p_nucleus_f32__sort_scratch_elements(kVocabulary), 0);
   std::vector<std::uint32_t> counts(kRows, 0);
   std::vector<std::uint32_t> sampledTokens(kRows, 0);
   top_p_nucleus_f32(probabilities.data(), indices.data(),

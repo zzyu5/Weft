@@ -33,7 +33,7 @@ mlir::LogicalResult lowerToRISCVIntrinsicC(
     mlir::ModuleOp module, const RISCVLoweringOptions &options,
     llvm::raw_ostream &output);
 
-mlir::LogicalResult emitRISCVArtifactHeader(
+mlir::LogicalResult emitRISCVHeader(
     mlir::ModuleOp module, const RISCVLoweringOptions &options,
     llvm::raw_ostream &output);
 

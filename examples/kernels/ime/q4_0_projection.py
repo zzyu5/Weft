@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @weft.kernel
@@ -62,39 +61,24 @@ def q4_0_projection_ime(
                 W.store(code_row + k, quantized)
 
         for column_begin in W.range(0, columns, packed_column_extent):
-            accumulator = W.zeros((16,), dtype=W.f32)
+            column = W.block(16)
+            accumulator = W.zeros((column,), dtype=W.f32)
             for block in W.range(0, blocks):
-                k = W.block_axis(32)
+                k = W.block(32)
                 activation_codes = W.load(
                     code_row + block * block_extent + k,
                     other=W.i8(0),
                 )
                 scale = W.load(scale_row + block, other=W.f32(0.0))
 
-                column = W.block_axis(16)
-                packed_byte = W.block_axis(16)
                 packed_block = (
                     (column_begin // packed_column_extent) * blocks + block
                 )
                 packed_base = packed_weight + packed_block * W.index(288)
-                weight_scale = load_f16_le(
-                    packed_base + column * W.index(2)
-                )
-                packed_codes = W.load(
-                    packed_base
-                    + W.index(32)
-                    + (packed_byte[None, :] // W.index(8)) * W.index(128)
-                    + column[:, None] * W.index(8)
-                    + packed_byte[None, :] % W.index(8),
-                    other=W.u8(0),
-                )
-                accumulator = W.symmetric_i4_i8_contract(
+                accumulator = W.symmetric_i4_i8_dot(
                     activation_codes,
-                    packed_codes,
+                    packed_base,
                     activation_scale=scale,
-                    weight_scale=weight_scale,
                     init=accumulator,
                 )
-
-            column = W.block_axis(16)
             W.store(output_row + column_begin + column, accumulator)

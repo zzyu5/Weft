@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @weft.kernel
@@ -21,9 +20,9 @@ def dequantize_iq4_nl(
         for block in W.range(0, blocks_per_row):
             input_block = input_row + block * W.index(18)
             output_block = output_row + block * W.index(32)
-            scale = load_f16_le(input_block)
+            scale = W.load_f16_le(input_block)
 
-            member = W.block_axis(16)
+            member = W.block(16)
             packed_codes = W.load(
                 input_block + W.index(2) + member,
                 other=W.u8(0),

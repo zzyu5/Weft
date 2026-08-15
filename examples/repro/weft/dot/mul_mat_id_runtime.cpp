@@ -54,10 +54,14 @@ int main() {
   std::vector<float> activations(kActivationElements);
   std::vector<std::uint32_t> ids(kTokens * kSlots);
   std::vector<float> output(kOutputElements);
-  std::vector<std::uint32_t> expertCounts(kExperts);
-  std::vector<std::uint32_t> expertOffsets(kExperts + 1U);
-  std::vector<std::uint32_t> expertCursors(kExperts);
-  std::vector<std::uint32_t> expertItems(kTokens * kSlots);
+  std::vector<std::uint32_t> expertCounts(
+      mul_mat_id_f32__expert_counts_elements(kExperts));
+  std::vector<std::uint32_t> expertOffsets(
+      mul_mat_id_f32__expert_offsets_elements(kExperts));
+  std::vector<std::uint32_t> expertCursors(
+      mul_mat_id_f32__expert_cursors_elements(kExperts));
+  std::vector<std::uint32_t> expertItems(
+      mul_mat_id_f32__expert_items_elements(kTokens, kSlots));
   for (std::size_t expert = 0; expert < kExperts; ++expert)
     for (std::size_t row = 0; row < kRows; ++row)
       for (std::size_t inner = 0; inner < kInner; ++inner)
@@ -121,7 +125,7 @@ int main() {
   const double operations =
       2.0 * static_cast<double>(kTokens * kSlots * kRows * kInner);
   std::printf("kernel=mul_mat_id_f32\n");
-  std::printf("model_shape=moe_indexed_contract[tokens=64,slots=2,experts=8,N=4096,K=4096]\n");
+  std::printf("model_shape=moe_indexed_dot[tokens=64,slots=2,experts=8,N=4096,K=4096]\n");
   std::printf("max_absolute_error=%.9g\n", maxAbsoluteError);
   std::printf("max_relative_error=%.9g\n", maxRelativeError);
   std::printf("median_ms=%.6f\n", milliseconds);

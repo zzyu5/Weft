@@ -13,50 +13,65 @@ def WEFT_Extension_Dialect : Dialect {
 class WeftExtension_Op<string mnemonic, list<Trait> traits = []>
     : Op<WEFT_Extension_Dialect, mnemonic, traits>;
 
-def WeftExtension_AffineI4I8ContractOp
-    : WeftExtension_Op<"affine_i4_i8_contract", [Pure]> {
-  let summary = "Affine packed-i4 by signed-i8 block contraction";
+def WeftExtension_LoadF16LEOp
+    : WeftExtension_Op<"load_f16_le", [MemoryEffects<[MemRead]>]> {
+  let summary = "Load one little-endian f16 value and expose it as f32";
   let description = [{
-    Computes sixteen independent affine dot products over a thirty-two-element
-    signed-i8 activation block.  packed_weight[n, p] contains two unsigned-i4
-    values.  For p = half * 8 + lane, its low nibble multiplies activation
-    [half * 16 + lane] and its high nibble multiplies activation
-    [half * 16 + lane + 8].  Both nibbles are biased by
-    weight_zero_point[n].  The integer dot is scaled by activation_scale and
-    weight_scale[n], then added to init[n].
-
-    This operation defines only the local numerical relation.  Persistent
-    pointer layout and outer M/N/K traversal remain explicit in Kernel IR;
-    target fragments, registers, and instruction spelling are not represented
-    here.
+    Reads one scalar f16 value from a byte pointer.  The little-endian byte
+    interpretation is observable semantics.  Storage ownership, persistent
+    format, surrounding traversal, and target realization remain outside this
+    operation.
   }];
-  let arguments = (ins AnyType:$activation, AnyType:$packed_weight,
-                       AnyType:$activation_scale, AnyType:$weight_scale,
-                       AnyType:$weight_zero_point, AnyType:$init);
+  let arguments = (ins AnyType:$base);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftExtension_SymmetricI4I8ContractOp
-    : WeftExtension_Op<"symmetric_i4_i8_contract", [Pure]> {
-  let summary = "Symmetric packed-i4 by signed-i8 block contraction";
+def WeftExtension_AffineI4I8DotOp
+    : WeftExtension_Op<"affine_i4_i8_dot", [MemoryEffects<[MemRead]>]> {
+  let summary = "Affine packed-i4 by signed-i8 block dot";
   let description = [{
-    Computes sixteen independent dot products over a thirty-two-element
-    signed-i8 activation block.  packed_weight[n, p] contains two unsigned-i4
-    values whose numerical values are biased by eight.  For
-    p = half * 8 + lane, its low nibble multiplies activation
-    [half * 16 + lane] and its high nibble multiplies activation
-    [half * 16 + lane + 8].  The integer dot is scaled by activation_scale and
-    weight_scale[n], then added to init[n].
+    Computes sixteen independent affine dot products over a thirty-two-element
+    signed-i8 activation block.  packed_base addresses one local 304-byte N16
+    by K32 field: sixteen little-endian f16 scales start at byte 0, sixteen u8
+    zero points start at byte 32, and packed codes start at byte 48.  For
+    p = half * 8 + lane, the byte at 48 + half * 128 + n * 8 + lane supplies
+    low/high unsigned-i4 values for activation positions half * 16 + lane and
+    half * 16 + lane + 8.  Both codes are biased by the zero point.  The
+    integer dot is scaled by activation_scale and the local f16 scale, then
+    added to init[n].
 
     This operation defines only the local numerical relation.  Persistent
     pointer layout and outer M/N/K traversal remain explicit in Kernel IR;
     target fragments, registers, and instruction spelling are not represented
     here.
   }];
-  let arguments = (ins AnyType:$activation, AnyType:$packed_weight,
-                       AnyType:$activation_scale, AnyType:$weight_scale,
-                       AnyType:$init);
+  let arguments = (ins AnyType:$activation, AnyType:$packed_base,
+                       AnyType:$activation_scale, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_SymmetricI4I8DotOp
+    : WeftExtension_Op<"symmetric_i4_i8_dot", [MemoryEffects<[MemRead]>]> {
+  let summary = "Symmetric packed-i4 by signed-i8 block dot";
+  let description = [{
+    Computes sixteen independent dot products over a thirty-two-element
+    signed-i8 activation block.  packed_base addresses one local 288-byte N16
+    by K32 field: sixteen little-endian f16 scales start at byte 0 and packed
+    codes start at byte 32.  For p = half * 8 + lane, the byte at
+    32 + half * 128 + n * 8 + lane supplies low/high unsigned-i4 values for
+    activation positions half * 16 + lane and half * 16 + lane + 8; each code
+    is biased by eight.  The integer dot is scaled by activation_scale and the
+    local f16 scale, then added to init[n].
+
+    This operation defines only the local numerical relation.  Persistent
+    pointer layout and outer M/N/K traversal remain explicit in Kernel IR;
+    target fragments, registers, and instruction spelling are not represented
+    here.
+  }];
+  let arguments = (ins AnyType:$activation, AnyType:$packed_base,
+                       AnyType:$activation_scale, AnyType:$init);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

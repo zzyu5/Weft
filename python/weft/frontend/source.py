@@ -31,12 +31,12 @@ class SourceUnit:
         )
         if len(functions) != 1:
             raise FrontendError(
-                "Weft source must contain exactly one synchronous function", location
+                "a Weft DSL kernel must contain exactly one synchronous function", location
             )
         function = functions[0]
         if function.name != definition.__name__:
             raise FrontendError(
-                "decorated function name does not match captured source", location
+                "decorated function name does not match the captured DSL kernel", location
             )
         closure = inspect.getclosurevars(definition.python_function)
         bindings = dict(definition.python_function.__globals__)
@@ -96,7 +96,7 @@ class HelperSource:
         tree = ast.parse(textwrap.dedent("".join(lines)), filename=filename)
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
         if len(functions) != 1:
-            raise FrontendError("helper source must contain exactly one function")
+            raise FrontendError("a DSL helper must contain exactly one function")
         closure = inspect.getclosurevars(function)
         bindings = dict(function.__globals__)
         bindings.update(closure.globals)

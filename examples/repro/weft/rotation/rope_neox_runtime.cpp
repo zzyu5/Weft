@@ -57,7 +57,8 @@ int main(int argc, char **argv) {
   std::vector<float> source(kElements);
   std::vector<float> destination(kElements, 0.0F);
   std::vector<float> reference(kElements, 0.0F);
-  std::vector<float> angleCache(kHeadDimension, 0.0F);
+  std::vector<float> angleCache(
+      rope_neox_f32__angle_cache_elements(kHalfDimension), 0.0F);
   std::vector<std::int32_t> positions(kTokens);
   for (std::size_t index = 0; index < source.size(); ++index)
     source[index] = static_cast<float>(static_cast<int>(index % 31) - 15) /

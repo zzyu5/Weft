@@ -43,6 +43,29 @@ mlir::LogicalResult requireScalar(mlir::Operation *op, mlir::Value value,
   return mlir::success();
 }
 
+mlir::LogicalResult requireReadableU8Pointer(mlir::Operation *op,
+                                             mlir::Value value,
+                                             llvm::StringRef name) {
+  auto pointer = mlir::dyn_cast<weft::kernel::PtrType>(value.getType());
+  if (!pointer || !pointer.getElementType().isUnsignedInteger(8) ||
+      pointer.getAccess() == "write")
+    return op->emitError() << name << " must be a readable scalar u8 pointer";
+  return mlir::success();
+}
+
+mlir::LogicalResult requirePersistentU8Pointer(
+    mlir::Operation *op, mlir::Value value, llvm::StringRef name,
+    llvm::StringRef storageFormat) {
+  if (mlir::failed(requireReadableU8Pointer(op, value, name)))
+    return mlir::failure();
+  auto pointer = mlir::cast<weft::kernel::PtrType>(value.getType());
+  if (pointer.getStorageClass() != "persistent" ||
+      pointer.getStorageFormat() != storageFormat)
+    return op->emitError()
+           << name << " must use persistent format " << storageFormat;
+  return mlir::success();
+}
+
 mlir::LogicalResult verifyScalarDotResult(mlir::Operation *op,
                                           mlir::Value init,
                                           mlir::Value result) {
@@ -58,35 +81,34 @@ mlir::LogicalResult verifyScalarDotResult(mlir::Operation *op,
 }
 } // namespace
 
-mlir::LogicalResult AffineI4I8ContractOp::verify() {
+mlir::LogicalResult LoadF16LEOp::verify() {
+  if (mlir::failed(requireReadableU8Pointer(*this, getBase(), "base")))
+    return mlir::failure();
+  if (weft::kernel::logicalShapeKind(getResult().getType()) !=
+          weft::kernel::LogicalShapeKind::Scalar ||
+      !weft::kernel::logicalElementType(getResult().getType()).isF32())
+    return emitOpError("result must be scalar f32");
+  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
+    return emitOpError("must be nested in a canonical Weft kernel");
+  return mlir::success();
+}
+
+mlir::LogicalResult AffineI4I8DotOp::verify() {
   auto activation = localBlock(*this, getActivation(), "activation");
-  auto packedWeight = localBlock(*this, getPackedWeight(), "packed_weight");
-  auto weightScale = localBlock(*this, getWeightScale(), "weight_scale");
-  auto weightZeroPoint =
-      localBlock(*this, getWeightZeroPoint(), "weight_zero_point");
   auto init = localBlock(*this, getInit(), "init");
   auto result = localBlock(*this, getResult(), "result");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
-  if (!packedWeight ||
-      packedWeight.getShape() != llvm::ArrayRef<int64_t>({16, 16}) ||
-      !packedWeight.getElementType().isUnsignedInteger(8))
-    return emitOpError("packed_weight must be a u8 block<16x16>");
+  if (mlir::failed(requirePersistentU8Pointer(
+          *this, getPackedBase(), "packed_base", "q4_k_n16_k32_304b")))
+    return mlir::failure();
   if (mlir::failed(requireScalar(*this, getActivationScale(),
                                  mlir::Float32Type::get(getContext()),
                                  "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
-  if (!weightScale ||
-      weightScale.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      !weightScale.getElementType().isF32())
-    return emitOpError("weight_scale must be an f32 block<16>");
-  if (!weightZeroPoint ||
-      weightZeroPoint.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      !weightZeroPoint.getElementType().isUnsignedInteger(8))
-    return emitOpError("weight_zero_point must be a u8 block<16>");
   if (!init || !result || init.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      init.getElementType() != mlir::Float32Type::get(getContext()) ||
+      !init.getElementType().isF32() ||
       getInit().getType() != getResult().getType())
     return emitOpError("init and result must be the same f32 block<16>");
   if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
@@ -94,29 +116,22 @@ mlir::LogicalResult AffineI4I8ContractOp::verify() {
   return mlir::success();
 }
 
-mlir::LogicalResult SymmetricI4I8ContractOp::verify() {
+mlir::LogicalResult SymmetricI4I8DotOp::verify() {
   auto activation = localBlock(*this, getActivation(), "activation");
-  auto packedWeight = localBlock(*this, getPackedWeight(), "packed_weight");
-  auto weightScale = localBlock(*this, getWeightScale(), "weight_scale");
   auto init = localBlock(*this, getInit(), "init");
   auto result = localBlock(*this, getResult(), "result");
   if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
-  if (!packedWeight ||
-      packedWeight.getShape() != llvm::ArrayRef<int64_t>({16, 16}) ||
-      !packedWeight.getElementType().isUnsignedInteger(8))
-    return emitOpError("packed_weight must be a u8 block<16x16>");
+  if (mlir::failed(requirePersistentU8Pointer(
+          *this, getPackedBase(), "packed_base", "q4_0_n16_k32_288b")))
+    return mlir::failure();
   if (mlir::failed(requireScalar(*this, getActivationScale(),
                                  mlir::Float32Type::get(getContext()),
                                  "activation_scale")))
     return emitOpError("activation_scale must be scalar f32");
-  if (!weightScale ||
-      weightScale.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      !weightScale.getElementType().isF32())
-    return emitOpError("weight_scale must be an f32 block<16>");
   if (!init || !result || init.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      init.getElementType() != mlir::Float32Type::get(getContext()) ||
+      !init.getElementType().isF32() ||
       getInit().getType() != getResult().getType())
     return emitOpError("init and result must be the same f32 block<16>");
   if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())

@@ -139,7 +139,7 @@ mlir::FailureOr<std::string> kernelDeclaration(KernelOp kernel) {
     else
       type = scalarCType(argument.getType());
     if (type.empty()) {
-      kernel.emitError("artifact header has an unsupported ABI argument type");
+      kernel.emitError("generated header has an unsupported ABI argument type");
       return mlir::failure();
     }
     parameters.push_back(type + " " + sanitize(argumentName(kernel, index)));
@@ -148,7 +148,7 @@ mlir::FailureOr<std::string> kernelDeclaration(KernelOp kernel) {
                                ? "void"
                                : scalarCType(kernel.getReturnType());
   if (returnType.empty()) {
-    kernel.emitError("artifact header has an unsupported return type");
+    kernel.emitError("generated header has an unsupported return type");
     return mlir::failure();
   }
   return returnType + " " + sanitize(kernel.getSymName()) + "(" +
@@ -286,14 +286,14 @@ std::string queryParameters(KernelOp kernel,
   return parameters.empty() ? "void" : llvm::join(parameters, ", ");
 }
 
-mlir::LogicalResult emitStorageContract(
+mlir::LogicalResult emitStorageMetadata(
     KernelOp kernel, StorageOp storage,
     const weft::RISCVLoweringOptions &options, llvm::raw_ostream &output) {
   std::optional<unsigned> pointerIndex =
       entryArgumentIndex(kernel, storage.getPointer());
   if (!pointerIndex)
     return storage.emitError(
-        "artifact storage contract must bind an entry pointer");
+        "generated storage metadata must bind an entry pointer");
   PtrType pointer = mlir::cast<PtrType>(storage.getPointer().getType());
   std::string symbol = sanitize(kernel.getSymName());
   std::string argument = sanitize(argumentName(kernel, *pointerIndex));
@@ -367,13 +367,13 @@ void emitPointerMetadata(KernelOp kernel, unsigned index, PtrType pointer,
 
 } // namespace
 
-mlir::LogicalResult weft::emitRISCVArtifactHeader(
+mlir::LogicalResult weft::emitRISCVHeader(
     mlir::ModuleOp module, const RISCVLoweringOptions &options,
     llvm::raw_ostream &output) {
   llvm::SmallVector<KernelOp> kernels;
   module.walk([&](KernelOp kernel) { kernels.push_back(kernel); });
   if (kernels.empty()) {
-    module.emitError("Weft artifact header requires at least one kernel");
+    module.emitError("Weft generated header requires at least one kernel");
     return mlir::failure();
   }
 
@@ -383,42 +383,43 @@ mlir::LogicalResult weft::emitRISCVArtifactHeader(
     llvm::StringRef symbol = kernel.getSymName();
     if (!isPortableABIIdentifier(symbol))
       return kernel.emitError(
-          "artifact symbol must be a portable non-keyword C/C++ identifier");
+          "generated symbol must be a portable non-keyword C/C++ identifier");
     if (!publicSymbols.insert(symbol).second)
-      return kernel.emitError("artifact contains duplicate C entry symbols");
+      return kernel.emitError("generated header contains duplicate C entry symbols");
     llvm::StringSet<> parameterNames;
     for (auto [index, nameAttr] : llvm::enumerate(kernel.getArgNames())) {
       llvm::StringRef name = mlir::cast<mlir::StringAttr>(nameAttr).getValue();
       if (!isPortableABIIdentifier(name))
         return kernel.emitError(
-            "artifact parameter must be a portable non-keyword C/C++ identifier");
+            "generated parameter must be a portable non-keyword C/C++ identifier");
       if (!parameterNames.insert(name).second)
-        return kernel.emitError("artifact contains duplicate C parameter names");
+        return kernel.emitError(
+            "generated header contains duplicate C parameter names");
       mlir::Type type = kernel.getBody().front().getArgument(index).getType();
       if (!mlir::isa<PtrType>(type))
         continue;
       std::string prefix = macroName(symbol.str() + "_" + name.str());
       if (!metadataPrefixes.insert(prefix).second)
         return kernel.emitError(
-            "artifact pointer metadata names collide after C macro projection");
+            "generated pointer metadata names collide after C macro projection");
     }
     for (StorageOp storage : kernel.getBody().front().getOps<StorageOp>()) {
       std::optional<unsigned> pointerIndex =
           entryArgumentIndex(kernel, storage.getPointer());
       if (!pointerIndex)
         return storage.emitError(
-            "artifact storage contract must bind an entry pointer");
+            "generated storage metadata must bind an entry pointer");
       std::string base = symbol.str() + "__" +
                          argumentName(kernel, *pointerIndex).str();
       for (unsigned extent = 0; extent < storage.getShape().size(); ++extent) {
         std::string helper = base + "_extent_" + std::to_string(extent);
         if (!publicSymbols.insert(helper).second)
           return storage.emitError(
-              "artifact storage extent query collides with a public symbol");
+              "storage extent query collides with a public symbol");
       }
       if (!publicSymbols.insert(base + "_elements").second)
         return storage.emitError(
-            "artifact storage element query collides with a public symbol");
+            "storage element query collides with a public symbol");
     }
   }
 
@@ -454,7 +455,7 @@ mlir::LogicalResult weft::emitRISCVArtifactHeader(
           pointer && pointer.getStorageClass() == "external")
         emitPointerMetadata(kernel, index, pointer, output);
     for (StorageOp storage : entry.getOps<StorageOp>())
-      if (mlir::failed(emitStorageContract(kernel, storage, options, output)))
+      if (mlir::failed(emitStorageMetadata(kernel, storage, options, output)))
         return mlir::failure();
   }
   output << "#endif\n";

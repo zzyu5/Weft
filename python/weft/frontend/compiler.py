@@ -18,9 +18,12 @@ from weft.language import PtrSpec
 from weft.language import f16
 from weft.language import f32
 from weft.language import i1
+from weft.language import i16
+from weft.language import i32
 from weft.language import i8
 from weft.language import index
 from weft.language import u8
+from weft.language import u16
 from weft.language import u32
 from weft.language.builtins import InvalidValue
 
@@ -197,7 +200,6 @@ def _annotation_type(annotation: object, location: SourceLocation) -> tuple[Valu
         return (
             PointerType(
                 ScalarType(annotation.dtype),
-                annotation.address_space,
                 annotation.access,
                 annotation.noalias,
                 annotation.alignment,
@@ -292,9 +294,9 @@ class FrontendCompiler:
         self.vla_outer_names: set[str] | None = None
         self.helper_effects: tuple[str, ...] | None = None
         self.constant_values: dict[Value, object] = {}
-        self.storage_contracts: dict[Value, _ShapeSpec] = {}
+        self.storage_shapes: dict[Value, _ShapeSpec] = {}
         self.block_axes: dict[Value, tuple[int, Value]] = {}
-        self.next_block_axis = 1
+        self.next_axis_id = 1
 
     def compile(self) -> str:
         signature = self.unit.definition.signature
@@ -469,7 +471,7 @@ class FrontendCompiler:
         if isinstance(statement, ast.Assign):
             if len(statement.targets) != 1:
                 raise FrontendError(
-                    "chained assignment is not part of Weft source",
+                    "chained assignment is not part of the Weft DSL",
                     self._location(statement),
                 )
             value = self._expect_value(self._compile_expr(statement.value), statement.value)
@@ -596,7 +598,6 @@ class FrontendCompiler:
                     attributes={
                         "kind": _string("neg"),
                         "math": _string("strict"),
-                        "exceptional": _string("preserve"),
                     },
                 )[0]
             if isinstance(expression.op, ast.Invert):
@@ -606,7 +607,7 @@ class FrontendCompiler:
         if isinstance(expression, ast.Compare):
             if len(expression.ops) != 1 or len(expression.comparators) != 1:
                 raise FrontendError(
-                    "chained comparisons are not part of Weft source",
+                    "chained comparisons are not part of the Weft DSL",
                     self._location(expression),
                 )
             lhs, rhs = self._compile_binary_operands(
@@ -1068,6 +1069,26 @@ class FrontendCompiler:
             attributes={"alignment": str(alignment)},
         )[0]
 
+    def _intrinsic_load_f16_le(self, call: ast.Call) -> Value:
+        self._require_effect("read", call)
+        args = self._positional_and_keywords(call, ("base",), {})
+        base = self._value_argument(args["base"], call)
+        if (
+            not isinstance(base.type, PointerType)
+            or base.type.element_type != ScalarType(u8)
+            or base.type.access == "write"
+        ):
+            raise FrontendError(
+                "W.load_f16_le base must be a readable scalar u8 pointer",
+                self._location(call),
+            )
+        return self._emit(
+            "weft_ext.load_f16_le",
+            call,
+            operands=(base,),
+            result_types=(ScalarType(f32),),
+        )[0]
+
     def _intrinsic_store(self, call: ast.Call) -> None:
         self._require_effect("write", call)
         args = self._positional_and_keywords(
@@ -1146,11 +1167,11 @@ class FrontendCompiler:
             raise FrontendError(
                 "W.sort_indices extent must be a scalar index", self._location(call)
             )
-        scratch_contract = self.storage_contracts.get(scratch_pointer)
+        scratch_shape = self.storage_shapes.get(scratch_pointer)
         if (
-            scratch_contract is None
-            or len(scratch_contract.extents) != 1
-            or not self._same_index_extent(scratch_contract.extents[0], extent)
+            scratch_shape is None
+            or len(scratch_shape.extents) != 1
+            or not self._same_index_extent(scratch_shape.extents[0], extent)
         ):
             raise FrontendError(
                 "W.sort_indices scratch storage must be rank-one with the same extent",
@@ -1214,11 +1235,11 @@ class FrontendCompiler:
             )
         shape_node = args["shape"]
         if not isinstance(shape_node, ast.expr):
-            raise FrontendError("storage shape must be source syntax", self._location(call))
+            raise FrontendError("storage shape must be explicit DSL syntax", self._location(call))
         shape = self._shape_spec(shape_node)
-        if pointer in self.storage_contracts:
+        if pointer in self.storage_shapes:
             raise FrontendError(
-                "one entry pointer cannot have multiple W.storage contracts",
+                "one entry pointer cannot have multiple W.storage declarations",
                 self._location(call),
             )
         self._emit(
@@ -1227,7 +1248,7 @@ class FrontendCompiler:
             operands=(pointer,) + shape.extents,
             attributes={"shape": _dense_i64(shape.dimensions)},
         )
-        self.storage_contracts[pointer] = shape
+        self.storage_shapes[pointer] = shape
         return None
 
     def _intrinsic_block(self, call: ast.Call) -> Value:
@@ -1255,8 +1276,8 @@ class FrontendCompiler:
                     "W.block extent must be positive", self._location(extent_node)
                 )
             dimension = extent_node.value
-        axis_id = self.next_block_axis
-        self.next_block_axis += 1
+        axis_id = self.next_axis_id
+        self.next_axis_id += 1
         result_type = BlockType((dimension,), (axis_id,), ScalarType(index))
         result = self._emit(
             "weft_kernel.block_index",
@@ -1273,7 +1294,7 @@ class FrontendCompiler:
             call, ("shape", "value"), {"dtype": None}
         )
         if not isinstance(args["shape"], ast.expr):
-            raise FrontendError("shape must be source syntax", self._location(call))
+            raise FrontendError("shape must be explicit DSL syntax", self._location(call))
         shape = self._block_shape_spec(args["shape"])
         value = self._value_argument(args["value"], call)
         dtype = args["dtype"]
@@ -1286,6 +1307,11 @@ class FrontendCompiler:
                 value = self._cast_value(value, dtype, call)
         if not isinstance(value.type, ScalarType):
             raise FrontendError("W.full fill value must be scalar", self._location(call))
+        if value.type != ScalarType(f32) or len(shape.dimensions) not in {1, 2}:
+            raise FrontendError(
+                "W.full currently creates rank-one or rank-two f32 blocks",
+                self._location(call),
+            )
         result_type = BlockType(shape.dimensions, shape.axis_ids, value.type)
         return self._emit(
             "weft_kernel.full",
@@ -1298,7 +1324,7 @@ class FrontendCompiler:
         args = self._positional_and_keywords(call, ("shape", "dtype"), {})
         dtype = args["dtype"]
         if not isinstance(dtype, ast.expr):
-            raise FrontendError("dtype must be source syntax", self._location(call))
+            raise FrontendError("dtype must be explicit DSL syntax", self._location(call))
         resolved = self._eval_static(dtype)
         if not isinstance(resolved, DType):
             raise FrontendError("W.zeros dtype must be a Weft scalar type", self._location(call))
@@ -1368,6 +1394,23 @@ class FrontendCompiler:
                 "W.bitcast requires equal-width scalar element types",
                 self._location(call),
             )
+        kind = shape_kind(value.type)
+        source_dtype = source.dtype
+        scalar_pairs = {
+            (u8, i8),
+            (u16, i16),
+            (u16, f16),
+            (f16, u16),
+            (f32, u32),
+            (u32, f32),
+        }
+        block_pairs = {(u8, i8), (u16, i16), (u16, f16)}
+        allowed = scalar_pairs if kind == "scalar" else block_pairs if kind == "block" else set()
+        if (source_dtype, dtype) not in allowed:
+            raise FrontendError(
+                f"W.bitcast has no {kind} realization for {source_dtype} to {dtype}",
+                self._location(call),
+            )
         result_type = with_element_type(value.type, ScalarType(dtype))
         return self._emit(
             "weft_kernel.bitcast",
@@ -1377,6 +1420,36 @@ class FrontendCompiler:
         )[0]
 
     def _cast_value(self, value: Value, dtype: DType, node: ast.AST) -> Value:
+        source = element_type(value.type)
+        if not isinstance(source, ScalarType):
+            raise FrontendError("W.cast requires scalar elements", self._location(node))
+        kind = shape_kind(value.type)
+        if kind == "region":
+            allowed = {
+                (f16, f32),
+                (f32, f16),
+                (u32, index),
+                (index, f32),
+            }
+        elif kind == "block":
+            allowed = {
+                (index, u8),
+                (u8, u16),
+                (u8, i32),
+                (u8, f32),
+                (i8, i32),
+                (i8, f32),
+                (u16, i32),
+                (i16, i32),
+                (f16, f32),
+            }
+        else:
+            allowed = None
+        if allowed is not None and (source.dtype, dtype) not in allowed:
+            raise FrontendError(
+                f"W.cast has no {kind} realization for {source.dtype} to {dtype}",
+                self._location(node),
+            )
         result_type = with_element_type(value.type, ScalarType(dtype))
         return self._emit(
             "weft_kernel.cast", node, operands=(value,), result_types=(result_type,)
@@ -1384,23 +1457,15 @@ class FrontendCompiler:
 
     def _math_unary(self, call: ast.Call, kind: str) -> Value:
         args = self._positional_and_keywords(
-            call, ("value",), {"math": "native", "exceptional": "preserve"}
+            call, ("value",), {"math": "native"}
         )
         value = self._value_argument(args["value"], call)
         math = args["math"]
-        exceptional = args["exceptional"]
         if isinstance(math, ast.expr):
             math = self._eval_static(math)
-        if isinstance(exceptional, ast.expr):
-            exceptional = self._eval_static(exceptional)
         if math not in {"strict", "native", "fast"}:
             raise FrontendError(
                 "unary math must be strict, native, or fast",
-                self._location(call),
-            )
-        if exceptional != "preserve":
-            raise FrontendError(
-                "unary exceptional policy must be preserve",
                 self._location(call),
             )
         return self._emit(
@@ -1411,7 +1476,6 @@ class FrontendCompiler:
             attributes={
                 "kind": _string(kind),
                 "math": _string(str(math)),
-                "exceptional": _string(str(exceptional)),
             },
         )[0]
 
@@ -1420,9 +1484,6 @@ class FrontendCompiler:
 
     def _intrinsic_tanh(self, call: ast.Call) -> Value:
         return self._math_unary(call, "tanh")
-
-    def _intrinsic_exp2(self, call: ast.Call) -> Value:
-        return self._math_unary(call, "exp2")
 
     def _intrinsic_log(self, call: ast.Call) -> Value:
         return self._math_unary(call, "log")
@@ -1591,6 +1652,11 @@ class FrontendCompiler:
             },
         )
         value = self._value_argument(args["value"], call)
+        if is_masked(value.type):
+            raise FrontendError(
+                "W.scan does not define a logical-validity realization; fill the value before scanning",
+                self._location(call),
+            )
         if args["identity"] is None:
             raise FrontendError("W.scan requires an explicit identity", self._location(call))
         identity = self._value_argument(args["identity"], call)
@@ -2031,6 +2097,17 @@ class FrontendCompiler:
             rounding = self._eval_static(rounding)
         if isinstance(saturation, ast.expr):
             saturation = self._eval_static(saturation)
+        if (
+            not isinstance(bare_type(value.type), RegionType)
+            or element_type(value.type) != ScalarType(f32)
+            or dtype != i8
+            or rounding != "rne"
+            or saturation is not True
+        ):
+            raise FrontendError(
+                "W.narrow currently requires VLA f32 to i8 with rounding='rne' and saturation=True",
+                self._location(call),
+            )
         attributes = {
             "rounding": _string(str(rounding)),
             "saturation": _bool(bool(saturation)),
@@ -2044,64 +2121,115 @@ class FrontendCompiler:
             attributes=attributes,
         )[0]
 
-    def _intrinsic_affine_i4_i8_contract(self, call: ast.Call) -> Value:
+    def _require_extension_block(
+        self, value: Value, name: str, extent: int, dtype: DType, call: ast.Call
+    ) -> None:
+        value_type = bare_type(value.type)
+        if (
+            is_masked(value.type)
+            or not isinstance(value_type, BlockType)
+            or value_type.shape != (extent,)
+            or value_type.element_type != ScalarType(dtype)
+        ):
+            raise FrontendError(
+                f"{name} must be an unmasked {dtype} block<{extent}>",
+                self._location(call),
+            )
+
+    def _require_extension_scalar(
+        self, value: Value, name: str, dtype: DType, call: ast.Call
+    ) -> None:
+        if is_masked(value.type) or value.type != ScalarType(dtype):
+            raise FrontendError(
+                f"{name} must be scalar {dtype}", self._location(call)
+            )
+
+    def _require_persistent_u8_pointer(
+        self, value: Value, name: str, storage_format: str, call: ast.Call
+    ) -> None:
+        pointer = value.type if isinstance(value.type, PointerType) else None
+        if (
+            pointer is None
+            or pointer.element_type != ScalarType(u8)
+            or pointer.access == "write"
+            or pointer.storage_class != "persistent"
+            or pointer.storage_format != storage_format
+        ):
+            raise FrontendError(
+                f"{name} must be a readable persistent u8 pointer with format "
+                f"{storage_format!r}",
+                self._location(call),
+            )
+
+    def _intrinsic_affine_i4_i8_dot(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(
             call,
-            ("activation", "packed_weight"),
+            ("activation", "packed_base"),
             {
                 "activation_scale": None,
-                "weight_scale": None,
-                "weight_zero_point": None,
                 "init": None,
             },
         )
         required = (
             "activation",
-            "packed_weight",
+            "packed_base",
             "activation_scale",
-            "weight_scale",
-            "weight_zero_point",
             "init",
         )
         if any(args[name] is None for name in required):
             raise FrontendError(
-                "affine_i4_i8_contract requires packed operands, scales, "
-                "zero point, and init",
+                "affine_i4_i8_dot requires activation, packed_base, "
+                "activation_scale, and init",
                 self._location(call),
             )
         operands = tuple(self._value_argument(args[name], call) for name in required)
+        self._require_extension_block(operands[0], "activation", 32, i8, call)
+        self._require_persistent_u8_pointer(
+            operands[1], "packed_base", "q4_k_n16_k32_304b", call
+        )
+        self._require_extension_scalar(
+            operands[2], "activation_scale", f32, call
+        )
+        self._require_extension_block(operands[3], "init", 16, f32, call)
         return self._emit(
-            "weft_ext.affine_i4_i8_contract",
+            "weft_ext.affine_i4_i8_dot",
             call,
             operands=operands,
             result_types=(operands[-1].type,),
         )[0]
 
-    def _intrinsic_symmetric_i4_i8_contract(self, call: ast.Call) -> Value:
+    def _intrinsic_symmetric_i4_i8_dot(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(
             call,
-            ("activation", "packed_weight"),
+            ("activation", "packed_base"),
             {
                 "activation_scale": None,
-                "weight_scale": None,
                 "init": None,
             },
         )
         required = (
             "activation",
-            "packed_weight",
+            "packed_base",
             "activation_scale",
-            "weight_scale",
             "init",
         )
         if any(args[name] is None for name in required):
             raise FrontendError(
-                "symmetric_i4_i8_contract requires packed operands, scales, and init",
+                "symmetric_i4_i8_dot requires activation, packed_base, "
+                "activation_scale, and init",
                 self._location(call),
             )
         operands = tuple(self._value_argument(args[name], call) for name in required)
+        self._require_extension_block(operands[0], "activation", 32, i8, call)
+        self._require_persistent_u8_pointer(
+            operands[1], "packed_base", "q4_0_n16_k32_288b", call
+        )
+        self._require_extension_scalar(
+            operands[2], "activation_scale", f32, call
+        )
+        self._require_extension_block(operands[3], "init", 16, f32, call)
         return self._emit(
-            "weft_ext.symmetric_i4_i8_contract",
+            "weft_ext.symmetric_i4_i8_dot",
             call,
             operands=operands,
             result_types=(operands[-1].type,),
@@ -2119,6 +2247,19 @@ class FrontendCompiler:
         )
         args = self._positional_and_keywords(call, names, {})
         operands = tuple(self._value_argument(args[name], call) for name in names)
+        for value, name, extent, dtype in (
+            (operands[0], "packed_weight", 128, u8),
+            (operands[1], "scale_min", 12, u8),
+            (operands[2], "activation", 256, i8),
+            (operands[3], "activation_sum_bytes", 32, u8),
+        ):
+            self._require_extension_block(value, name, extent, dtype, call)
+        for value, name in (
+            (operands[4], "dot_scale"),
+            (operands[5], "minimum_scale"),
+            (operands[6], "init"),
+        ):
+            self._require_extension_scalar(value, name, f32, call)
         return self._emit(
             "weft_ext.grouped_affine_i4_i8_dot",
             call,
@@ -2136,6 +2277,13 @@ class FrontendCompiler:
         )
         args = self._positional_and_keywords(call, names, {})
         operands = tuple(self._value_argument(args[name], call) for name in names)
+        self._require_extension_block(operands[0], "sign_bits", 4, u8, call)
+        self._require_extension_block(operands[1], "activation", 32, i8, call)
+        self._require_extension_scalar(
+            operands[2], "activation_scale", f32, call
+        )
+        self._require_extension_scalar(operands[3], "sign_scale", f32, call)
+        self._require_extension_scalar(operands[4], "init", f32, call)
         return self._emit(
             "weft_ext.sign_bit_i8_dot",
             call,
@@ -2153,6 +2301,13 @@ class FrontendCompiler:
         )
         args = self._positional_and_keywords(call, names, {})
         operands = tuple(self._value_argument(args[name], call) for name in names)
+        self._require_extension_block(operands[0], "packed_codes", 16, u8, call)
+        self._require_extension_scalar(operands[1], "exponent", u8, call)
+        self._require_extension_block(operands[2], "activation", 32, i8, call)
+        self._require_extension_scalar(
+            operands[3], "activation_scale", f32, call
+        )
+        self._require_extension_scalar(operands[4], "init", f32, call)
         return self._emit(
             "weft_ext.e2m1_e8m0_i8_dot",
             call,
@@ -2161,10 +2316,24 @@ class FrontendCompiler:
         )[0]
 
     def _extension_scalar_dot(
-        self, call: ast.Call, operation: str, names: tuple[str, ...]
+        self,
+        call: ast.Call,
+        operation: str,
+        names: tuple[str, ...],
+        block_specs: tuple[tuple[str, int, DType], ...],
+        scalar_specs: tuple[tuple[str, DType], ...],
     ) -> Value:
         args = self._positional_and_keywords(call, names, {})
-        operands = tuple(self._value_argument(args[name], call) for name in names)
+        operands_by_name = {
+            name: self._value_argument(args[name], call) for name in names
+        }
+        for name, extent, dtype in block_specs:
+            self._require_extension_block(
+                operands_by_name[name], name, extent, dtype, call
+            )
+        for name, dtype in scalar_specs:
+            self._require_extension_scalar(operands_by_name[name], name, dtype, call)
+        operands = tuple(operands_by_name[name] for name in names)
         return self._emit(
             operation,
             call,
@@ -2186,6 +2355,18 @@ class FrontendCompiler:
                 "activation_scale",
                 "init",
             ),
+            (
+                ("codes", 32, u8),
+                ("high_bits", 8, u8),
+                ("sign_bits", 32, u8),
+                ("scales", 8, u8),
+                ("activation", 256, i8),
+            ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
         )
 
     def _intrinsic_iq3_s_i8_dot(self, call: ast.Call) -> Value:
@@ -2202,6 +2383,18 @@ class FrontendCompiler:
                 "activation_scale",
                 "init",
             ),
+            (
+                ("codes", 64, u8),
+                ("high_bits", 8, u8),
+                ("sign_bits", 32, u8),
+                ("scales", 4, u8),
+                ("activation", 256, i8),
+            ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
         )
 
     def _intrinsic_iq1_m_i8_dot(self, call: ast.Call) -> Value:
@@ -2216,6 +2409,13 @@ class FrontendCompiler:
                 "activation_scale",
                 "init",
             ),
+            (
+                ("codes", 32, u8),
+                ("high_delta_bits", 16, u8),
+                ("scales", 8, u8),
+                ("activation", 256, i8),
+            ),
+            (("activation_scale", f32), ("init", f32)),
         )
 
     def _intrinsic_q6_k_i8_dot(self, call: ast.Call) -> Value:
@@ -2231,6 +2431,17 @@ class FrontendCompiler:
                 "activation_scale",
                 "init",
             ),
+            (
+                ("low_bits", 128, u8),
+                ("high_bits", 64, u8),
+                ("group_scales", 16, i8),
+                ("activation", 256, i8),
+            ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
         )
 
     def _intrinsic_range(self, call: ast.Call) -> Value:
@@ -2241,7 +2452,7 @@ class FrontendCompiler:
 
     def _compile_for(self, statement: ast.For) -> None:
         if statement.orelse:
-            raise FrontendError("for-else is not part of Weft source", self._location(statement))
+            raise FrontendError("for-else is not part of the Weft DSL", self._location(statement))
         if not isinstance(statement.target, ast.Name) or not isinstance(statement.iter, ast.Call):
             raise FrontendError("for must use `for name in W.range(...)`", self._location(statement))
         callee = self._resolve_static(statement.iter.func)
@@ -2388,7 +2599,7 @@ class FrontendCompiler:
 
     def _compile_while(self, statement: ast.While) -> None:
         if statement.orelse:
-            raise FrontendError("while-else is not part of Weft source", self._location(statement))
+            raise FrontendError("while-else is not part of the Weft DSL", self._location(statement))
         carried_names = sorted(_assigned_names(statement.body) & self.env.keys())
         init_values = tuple(self.env[name] for name in carried_names)
         condition_region = self.builder.region(

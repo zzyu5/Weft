@@ -8,7 +8,7 @@ maximum, scaled_sum = W.online_softmax_summary(
 )
 ```
 
-`(maximum, scaled_sum)`、identity与rescale都由source定义。Compiler可以在strip内或strip间
+`(maximum, scaled_sum)`、identity与rescale都由 DSL kernel 定义。Compiler可以在strip内或strip间
 重新组合summary，但不能从一个普通carried loop猜出这个merge。
 
 ## Full row softmax

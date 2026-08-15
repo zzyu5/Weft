@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.ggml_k import load_f16_le
 
 
 @weft.kernel
@@ -20,9 +19,9 @@ def q1_0_q8_0_rows(
         result = W.f32(0.0)
         for block in W.range(0, blocks):
             weight_block = weight + row * weight_row_stride + block * W.index(18)
-            sign_scale = load_f16_le(weight_block)
+            sign_scale = W.load_f16_le(weight_block)
             for sub_block in W.range(0, 4):
-                sign_byte = W.block_axis(4)
+                sign_byte = W.block(4)
                 sign_bits = W.load(
                     weight_block
                     + W.index(2)
@@ -33,8 +32,8 @@ def q1_0_q8_0_rows(
                 activation_block = (
                     activation + (block * W.index(4) + sub_block) * W.index(34)
                 )
-                activation_scale = load_f16_le(activation_block)
-                activation_lane = W.block_axis(32)
+                activation_scale = W.load_f16_le(activation_block)
+                activation_lane = W.block(32)
                 activation_values = W.bitcast(
                     W.load(
                         activation_block + W.index(2) + activation_lane,
