@@ -19,9 +19,62 @@ bool weft::RISCVTargetProfile::supportsVLENAtLeast(unsigned bits) const {
   return hasRVV && vlenBits > 0 && static_cast<uint64_t>(vlenBits) >= bits;
 }
 
+bool weft::RISCVTargetProfile::supportsFixedRVV() const {
+  return hasRVV && vlenBits > 0 && vectorRegisters > 0;
+}
+
+bool weft::RISCVTargetProfile::supportsVectorShape(unsigned sew,
+                                                   int lmulEighths) const {
+  if (!supportsFixedRVV() || !supportsSEW(sew) ||
+      !supportsLMULEighths(lmulEighths))
+    return false;
+  if (lmulEighths <= 0 ||
+      (lmulEighths >= 8 && lmulEighths % 8 != 0))
+    return false;
+  uint64_t registerGroups =
+      (static_cast<uint64_t>(lmulEighths) + 7) / 8;
+  return registerGroups <= static_cast<uint64_t>(vectorRegisters);
+}
+
+bool weft::RISCVTargetProfile::supportsIndexedVectorMemory(
+    unsigned elementSEW, int elementLMULEighths, unsigned indexSEW,
+    int indexLMULEighths) const {
+  if (!hasIndexedMemory || (indexSEW != 32 && indexSEW != 64) ||
+      !supportsVectorShape(elementSEW, elementLMULEighths) ||
+      !supportsVectorShape(indexSEW, indexLMULEighths))
+    return false;
+  uint64_t elementLanes =
+      static_cast<uint64_t>(vlenBits) * elementLMULEighths /
+      (8 * static_cast<uint64_t>(elementSEW));
+  uint64_t indexLanes =
+      static_cast<uint64_t>(vlenBits) * indexLMULEighths /
+      (8 * static_cast<uint64_t>(indexSEW));
+  return elementLanes != 0 && elementLanes == indexLanes;
+}
+
+bool weft::RISCVTargetProfile::supportsSegmentVectorMemory(
+    unsigned fields, unsigned sew, int lmulEighths) const {
+  if (!hasSegmentMemory || fields < 2 || fields > 8 ||
+      !supportsVectorShape(sew, lmulEighths))
+    return false;
+  if (static_cast<uint64_t>(fields) *
+          static_cast<uint64_t>(lmulEighths) >
+      64)
+    return false;
+  uint64_t registerGroups =
+      (static_cast<uint64_t>(lmulEighths) + 7) / 8;
+  return fields * registerGroups <=
+         static_cast<uint64_t>(vectorRegisters);
+}
+
 bool weft::RISCVTargetProfile::hasMatrixExtension(
     RISCVMatrixExtension extension) const {
   return matrixExtension == extension;
+}
+
+bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8N16K32() const {
+  return matrixExtension == RISCVMatrixExtension::SpacemitIME1 &&
+         littleEndian && xlen == 64 && supportsFixedRVV() && vlenBits == 256;
 }
 
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

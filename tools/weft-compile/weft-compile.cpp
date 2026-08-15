@@ -30,7 +30,7 @@ llvm::cl::opt<std::string> march("march", llvm::cl::desc("RISC-V ISA string"));
 llvm::cl::opt<std::string> abi("abi", llvm::cl::desc("RISC-V ABI"));
 llvm::cl::opt<int64_t> vlenBits(
     "vlen-bits",
-    llvm::cl::desc("Fixed VLEN in bits, or zero when runtime-unknown"),
+    llvm::cl::desc("Explicit fixed VLEN in bits"),
     llvm::cl::init(0));
 llvm::cl::opt<std::string> matrixExtension(
     "matrix-extension",
@@ -56,6 +56,14 @@ llvm::cl::opt<int64_t> f16InputLMUL(
 llvm::cl::opt<int64_t> f16RowMicrotile(
     "f16-row-microtile",
     llvm::cl::desc("Requested F16 matmul row microtile; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> f16KUnroll(
+    "f16-k-unroll",
+    llvm::cl::desc("Requested F16 matmul K unroll; zero selects"),
+    llvm::cl::init(0));
+llvm::cl::opt<int64_t> f16PipelineStages(
+    "f16-pipeline-stages",
+    llvm::cl::desc("Requested F16 matmul load/compute stages; zero selects"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
@@ -139,6 +147,8 @@ int main(int argc, char **argv) {
     options.backend.dotKUnroll = dotKUnroll;
     options.backend.f16InputLMUL = f16InputLMUL;
     options.backend.f16RowMicrotile = f16RowMicrotile;
+    options.backend.f16KUnroll = f16KUnroll;
+    options.backend.f16PipelineStages = f16PipelineStages;
     options.backend.narrowLMUL = narrowLMUL;
     options.backend.sortRadixBits = sortRadixBits;
     std::error_code headerError;

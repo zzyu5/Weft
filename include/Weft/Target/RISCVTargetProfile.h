@@ -49,7 +49,16 @@ struct RISCVTargetProfile {
   bool supportsSEW(unsigned sew) const;
   bool supportsLMULEighths(int lmulEighths) const;
   bool supportsVLENAtLeast(unsigned bits) const;
+  bool supportsFixedRVV() const;
+  bool supportsVectorShape(unsigned sew, int lmulEighths) const;
+  bool supportsIndexedVectorMemory(unsigned elementSEW,
+                                   int elementLMULEighths,
+                                   unsigned indexSEW,
+                                   int indexLMULEighths) const;
+  bool supportsSegmentVectorMemory(unsigned fields, unsigned sew,
+                                   int lmulEighths) const;
   bool hasMatrixExtension(RISCVMatrixExtension extension) const;
+  bool supportsSpacemitIME1I4I8N16K32() const;
 };
 
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

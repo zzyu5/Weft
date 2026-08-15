@@ -5,6 +5,7 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -120,7 +121,8 @@ rvvShapeForSemanticLanes(unsigned sew, unsigned semanticLanes,
       (requiredBits * 8 + static_cast<uint64_t>(target.vlenBits) - 1) /
       static_cast<uint64_t>(target.vlenBits);
   auto legal = llvm::find_if(target.legalLMULEighths, [&](int value) {
-    return static_cast<uint64_t>(value) >= lmulEighths;
+    return static_cast<uint64_t>(value) >= lmulEighths &&
+           target.supportsVectorShape(sew, value);
   });
   if (legal == target.legalLMULEighths.end())
     return std::nullopt;
@@ -375,6 +377,58 @@ enum class LaneRelation {
   NonAffine,
 };
 
+struct LogicalAxisFact {
+  mlir::Value coordinate;
+  mlir::Value lowerBound;
+  mlir::Value upperBound;
+  mlir::Value extent;
+  int64_t identity = 0;
+  bool vla = false;
+  llvm::SmallVector<mlir::Operation *> orderedParents;
+};
+
+struct ValueUseFact {
+  mlir::Value value;
+  mlir::Operation *reloadSource = nullptr;
+  llvm::SmallVector<mlir::Value> logicalAxes;
+  llvm::SmallVector<mlir::Value> axisDependencies;
+  llvm::SmallVector<mlir::Operation *> consumers;
+  unsigned definitionOrdinal = 0;
+  unsigned lastUseOrdinal = 0;
+  bool multipleConsumers = false;
+  bool crossesRegion = false;
+  bool controlCarried = false;
+};
+
+struct MemoryAccessFact {
+  mlir::Operation *operation = nullptr;
+  mlir::Value pointer;
+  mlir::Value root;
+  mlir::Value predicate;
+  mlir::Type elementType;
+  bool write = false;
+  llvm::DenseMap<mlir::Value, LaneRelation> axisRelations;
+};
+
+struct KernelPhysicalFacts {
+  llvm::DenseMap<int64_t, mlir::Value> blockAxes;
+  llvm::DenseMap<mlir::Value, LogicalAxisFact> axes;
+  llvm::DenseMap<mlir::Value, ValueUseFact> values;
+  llvm::DenseMap<mlir::Operation *, MemoryAccessFact> memory;
+  llvm::DenseMap<mlir::Operation *, unsigned> operationOrdinals;
+};
+
+struct StructuredProductFacts {
+  llvm::SmallVector<mlir::Value> lhsAxes;
+  llvm::SmallVector<mlir::Value> rhsAxes;
+  llvm::SmallVector<mlir::Value> resultAxes;
+  llvm::SmallVector<mlir::Value> lhsFreeAxes;
+  llvm::SmallVector<mlir::Value> rhsFreeAxes;
+  llvm::SmallVector<mlir::Value> reductionAxes;
+  llvm::SmallVector<mlir::Value> lhsBroadcastAxes;
+  llvm::SmallVector<mlir::Value> rhsBroadcastAxes;
+};
+
 enum class VLAMemoryMode {
   UnitStride,
   Strided,
@@ -414,7 +468,6 @@ enum class VLAStateValidityRealization {
 enum class VLAStateRealization {
   RVVAddReduction,
   RVVMaxReduction,
-  RVVWideningF16DotReduction,
   RVVInclusiveAddScan,
   RVVSegmentedInclusiveAddScan,
   RVVArgMaxSummary,
@@ -450,7 +503,6 @@ struct VLAAccessDecision {
   unsigned indexedSEW = 0;
   mlir::Value bundleAxis;
   unsigned bundleVectors = 0;
-  unsigned indexedCompanionF32Vectors = 0;
   VLAInactiveLaneRealization inactiveLane =
       VLAInactiveLaneRealization::ExplicitPassthrough;
 };
@@ -503,11 +555,6 @@ enum class VLACastRealization {
   RVVIndexToF32,
 };
 
-enum class RVVTailPolicy {
-  Agnostic,
-  Undisturbed,
-};
-
 struct VLACastDecision {
   mlir::Operation *operation = nullptr;
   VLACastRealization realization = VLACastRealization::RVVWidenF16ToF32;
@@ -556,10 +603,6 @@ struct VLAStateDecision {
   mlir::Type elementType;
   mlir::Value identity;
   VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
-  mlir::Operation *lhsLoad = nullptr;
-  mlir::Operation *rhsLoad = nullptr;
-  RVVTailPolicy tail = RVVTailPolicy::Undisturbed;
-  llvm::SmallVector<mlir::Operation *> absorbed;
   VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
   mlir::Value segmentStart;
   mlir::Value segmentVector;
@@ -708,7 +751,6 @@ struct VLACandidateFacts {
   unsigned indexedAccesses = 0;
   unsigned maxIndexedElementSEW = 0;
   unsigned maxIndexedOffsetSEW = 0;
-  unsigned maxIndexedCompanionF32Vectors = 0;
   unsigned maxEntityF32Vectors = 0;
   unsigned segmentLoadPairs = 0;
   unsigned segmentStorePairs = 0;
@@ -719,6 +761,15 @@ struct VLACandidateFacts {
   bool hasOnlineSummary = false;
   bool requiresF32M2Math = false;
   bool hasIndexVector = false;
+};
+
+struct VLAValueLifetimeSnapshot {
+  unsigned f32 = 0;
+  unsigned f16 = 0;
+  unsigned index = 0;
+  unsigned byte = 0;
+  unsigned u32 = 0;
+  unsigned mask = 0;
 };
 
 struct VLAPlanCandidate {
@@ -739,6 +790,21 @@ struct VLANarrowPhysicalConfig {
 
 RVVVectorShape rvvShape(unsigned sew, unsigned lmul) {
   return RVVVectorShape{sew, static_cast<int>(lmul * 8)};
+}
+
+llvm::SmallVector<unsigned>
+integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
+                      unsigned maximum = 8) {
+  llvm::SmallVector<unsigned> candidates;
+  for (int eighths : target.legalLMULEighths) {
+    if (eighths < 8 || eighths % 8 != 0)
+      continue;
+    unsigned lmul = static_cast<unsigned>(eighths / 8);
+    if (lmul <= maximum && target.supportsVectorShape(sew, eighths))
+      candidates.push_back(lmul);
+  }
+  llvm::sort(candidates);
+  return candidates;
 }
 
 void recordPhysicalValue(PhysicalEntityPlan &plan, mlir::Value value,
@@ -796,6 +862,21 @@ struct AffineI4I8Decision {
   unsigned packedBlockBytes = 304;
 };
 
+enum class F16MatmulLoadSchedule {
+  StreamRHSThenRows,
+  BatchLoadsThenCompute,
+};
+
+struct F16MatmulPhysicalConfig {
+  unsigned rowMicrotile = 1;
+  unsigned inputLMUL = 1;
+  unsigned kUnroll = 1;
+  unsigned pipelineStages = 1;
+  F16MatmulLoadSchedule loadSchedule =
+      F16MatmulLoadSchedule::StreamRHSThenRows;
+  PhysicalResourceBudget resources;
+};
+
 struct F16GemmNTileDecision {
   mlir::Operation *operation = nullptr;
   mlir::Operation *lhsLoad = nullptr;
@@ -807,6 +888,8 @@ struct F16GemmNTileDecision {
   unsigned rowTile = 4;
   unsigned columnTile = 8;
   unsigned reductionTile = 64;
+  F16MatmulLoadSchedule loadSchedule =
+      F16MatmulLoadSchedule::StreamRHSThenRows;
 };
 
 enum class DotRealization {
@@ -971,17 +1054,6 @@ bool isRegionValue(mlir::Type type) {
   return logicalShapeKind(type) == LogicalShapeKind::Region;
 }
 
-LoadOp traceIdentityCastLoad(mlir::Value value) {
-  while (true) {
-    if (auto load = value.getDefiningOp<LoadOp>())
-      return load;
-    auto cast = value.getDefiningOp<CastOp>();
-    if (!cast || cast.getInput().getType() != cast.getResult().getType())
-      return {};
-    value = cast.getInput();
-  }
-}
-
 std::optional<int64_t> integerConstantValue(mlir::Value value) {
   auto constant = value.getDefiningOp<ConstantOp>();
   auto integer = constant
@@ -1007,6 +1079,13 @@ LaneRelation combineLaneRelations(LaneRelation lhs, LaneRelation rhs) {
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
   if (value == coordinate)
     return LaneRelation::UnitStride;
+  if (value.getDefiningOp<BlockIndexOp>())
+    return LaneRelation::Independent;
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    mlir::Operation *parent = argument.getOwner()->getParentOp();
+    if (mlir::isa_and_nonnull<VLAOp>(parent) && argument.getArgNumber() == 0)
+      return LaneRelation::Independent;
+  }
   if (auto pointer = value.getDefiningOp<PtrAddOp>())
     return combineLaneRelations(
         classifyLaneRelation(pointer.getBase(), coordinate),
@@ -1192,6 +1271,8 @@ private:
 
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
+    if (mlir::failed(analyzeKernelPhysicalFacts()))
+      return mlir::failure();
     if (mlir::failed(prepareMaterializedBlockValues()))
       return mlir::failure();
     kernel.walk([&](SortIndicesOp op) {
@@ -1442,6 +1523,7 @@ private:
   const RISCVLoweringOptions &options;
   llvm::raw_ostream &output;
   llvm::DenseMap<mlir::Value, CValue> values;
+  KernelPhysicalFacts kernelFacts;
   RISCVPhysicalPlan physicalPlan;
   const llvm::SmallVector<BlockOperationDecision> *activeBlockOperations =
       nullptr;
@@ -1455,7 +1537,6 @@ private:
   unsigned nextValue = 0;
   unsigned nextLoop = 0;
   bool inVLA = false;
-  bool activeVLAFullStrip = false;
   std::string activeVL;
   const VLARegionDecision *activeVLADecision = nullptr;
   const PhysicalEntityPlan *activePhysicalEntity = nullptr;
@@ -1646,15 +1727,6 @@ private:
         });
   }
 
-  bool isVLAStateAbsorbed(mlir::Operation *operation) const {
-    if (!activeVLADecision)
-      return false;
-    return llvm::any_of(
-        activeVLADecision->states, [&](const VLAStateDecision &decision) {
-          return llvm::is_contained(decision.absorbed, operation);
-        });
-  }
-
   const VLACastDecision *
   findCastDecision(mlir::Operation *operation) const {
     if (!activeVLADecision)
@@ -1793,12 +1865,19 @@ private:
       mlir::Operation *owner,
       const PlannedPhysicalDecision<Decision> &planned) const {
     const PhysicalResourceBudget &resources = planned.entity.resources;
+    bool invalidPipeline =
+        planned.entity.schedule.pipelineStages == 0 ||
+        planned.entity.schedule.pipelineStages > 2 ||
+        (planned.entity.schedule.pipelineStages == 1 &&
+         resources.pipelineGroups != 0) ||
+        (planned.entity.schedule.pipelineStages == 2 &&
+         (resources.pipelineGroups == 0 ||
+          planned.entity.schedule.unroll < 2));
     if (resources.architecturalGroups != options.target.vectorRegisters ||
         planned.entity.hasValueShapeConflict ||
-        resources.pipelineGroups != 0 ||
         resources.peakGroups > resources.architecturalGroups ||
         planned.entity.schedule.microtile == 0 ||
-        planned.entity.schedule.pipelineStages != 1 ||
+        invalidPipeline ||
         planned.entity.schedule.prefetchDistance > 1)
       return owner->emitError("physical entity resource/schedule plan is invalid");
     return mlir::success();
@@ -1877,10 +1956,8 @@ private:
     auto legalUnroll = [](unsigned value) {
       return value == 1 || value == 2 || value == 4;
     };
-    auto legalLMUL = [](unsigned value) {
-      return value == 1 || value == 2 || value == 4 || value == 8;
-    };
-    llvm::SmallVector<unsigned> lmulCandidates = {1, 2, 4, 8};
+    llvm::SmallVector<unsigned> lmulCandidates =
+        integerLMULCandidates(options.target, 32);
     llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
     if (options.backend.dotLMUL != 0)
       lmulCandidates = {static_cast<unsigned>(options.backend.dotLMUL)};
@@ -1914,7 +1991,8 @@ private:
     };
     llvm::SmallVector<Candidate> legal;
     for (unsigned lmul : lmulCandidates) {
-      if (!legalLMUL(lmul))
+      if (!options.target.supportsVectorShape(32,
+                                              static_cast<int>(lmul * 8)))
         continue;
       for (unsigned unroll : unrollCandidates) {
         if (!legalUnroll(unroll))
@@ -1981,8 +2059,8 @@ private:
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = traceIdentityCastLoad(dot.getLhs());
-    LoadOp rhsLoad = traceIdentityCastLoad(dot.getRhs());
+    LoadOp lhsLoad = reloadableLoad(dot.getLhs());
+    LoadOp rhsLoad = reloadableLoad(dot.getRhs());
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere()) ||
         (!isTrue(lhsLoad.getWhere()) &&
          !isFloatConstant(lhsLoad.getOther(), 0.0))) {
@@ -1991,48 +2069,60 @@ private:
     }
 
     mlir::Block &block = *dot->getBlock();
-    llvm::DenseSet<mlir::Operation *> lhsDefinitions;
-    llvm::DenseSet<mlir::Operation *> rhsDefinitions;
-    llvm::SmallVector<BlockIndexOp> lhsAxes;
-    llvm::SmallVector<BlockIndexOp> rhsAxes;
-    collectLocalDefinitions(dot.getLhs(), block, lhsDefinitions, lhsAxes);
-    collectLocalDefinitions(dot.getRhs(), block, rhsDefinitions, rhsAxes);
-    if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
-        !llvm::is_contained(lhsAxes, rhsAxes.front())) {
+    std::optional<StructuredProductFacts> product =
+        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+    mlir::Value coordinate = vla.getBody().front().getArgument(0);
+    if (!product || product->lhsFreeAxes.size() != 1 ||
+        product->rhsFreeAxes.size() != 1 ||
+        product->rhsFreeAxes.front() != coordinate ||
+        product->reductionAxes.size() != 1 ||
+        product->resultAxes.size() != 2) {
       dot.emitError(
           "RVV VLA dot requires explicit row and shared reduction axes");
       return mlir::failure();
     }
-    BlockIndexOp reductionAxis = rhsAxes.front();
-    BlockIndexOp rowAxis = lhsAxes.front() == reductionAxis
-                              ? lhsAxes.back()
-                              : lhsAxes.front();
+    BlockIndexOp reductionAxis =
+        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
+    BlockIndexOp rowAxis =
+        product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!reductionAxis || !rowAxis) {
+      dot.emitError("RVV VLA dot block-axis facts are unavailable");
+      return mlir::failure();
+    }
     if (integerConstantValue(rowAxis.getExtent()) != lhsType.getShape()[0]) {
       dot.emitError(
           "RVV VLA dot result axes do not preserve the local row block");
       return mlir::failure();
     }
 
-    mlir::Value coordinate = vla.getBody().front().getArgument(0);
-    mlir::Value lhsRoot = pointerRoot(lhsLoad.getPointer());
-    mlir::Value rhsRoot = pointerRoot(rhsLoad.getPointer());
+    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
+    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
+    if (!lhsAccess || !rhsAccess) {
+      dot.emitError("RVV VLA dot typed memory facts are unavailable");
+      return mlir::failure();
+    }
+    mlir::Value lhsRoot = lhsAccess->root;
+    mlir::Value rhsRoot = rhsAccess->root;
     auto lhsPointer =
         lhsRoot ? mlir::dyn_cast<PtrType>(lhsRoot.getType()) : PtrType{};
     auto rhsPointer =
         rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType()) : PtrType{};
-    LaneRelation rhsRelation =
-        classifyLaneRelation(rhsLoad.getPointer(), coordinate);
+    LaneRelation rhsRelation = memoryRelation(*rhsAccess, coordinate);
     if (!lhsPointer || !rhsPointer ||
         !lhsPointer.getElementType().isF32() ||
         !rhsPointer.getElementType().isF32() ||
         (rhsRelation != LaneRelation::UnitStride &&
          rhsRelation != LaneRelation::Strided) ||
-        !dependsOn(lhsLoad.getPointer(), rowAxis.getResult()) ||
-        !dependsOn(lhsLoad.getPointer(), reductionAxis.getResult()) ||
-        dependsOn(lhsLoad.getPointer(), coordinate) ||
-        !dependsOn(rhsLoad.getPointer(), coordinate) ||
-        !dependsOn(rhsLoad.getPointer(), reductionAxis.getResult()) ||
-        dependsOn(rhsLoad.getPointer(), rowAxis.getResult())) {
+        memoryRelation(*lhsAccess, rowAxis.getResult()) ==
+            LaneRelation::Independent ||
+        memoryRelation(*lhsAccess, reductionAxis.getResult()) ==
+            LaneRelation::Independent ||
+        memoryRelation(*lhsAccess, coordinate) != LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, coordinate) == LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, reductionAxis.getResult()) ==
+            LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, rowAxis.getResult()) !=
+            LaneRelation::Independent) {
       dot.emitError(
           "RVV VLA dot memory relations are unavailable");
       return mlir::failure();
@@ -2066,7 +2156,7 @@ private:
     candidateFacts.stridedOperands =
         rhsRelation == LaneRelation::Strided ? 1 : 0;
     candidateFacts.reductionPredicate =
-        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+        valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
     candidateFacts.predicateGroups =
         candidateFacts.reductionPredicate ? 1 : 0;
     std::optional<F32DotPhysicalConfig> physical =
@@ -2080,7 +2170,7 @@ private:
                                  ? VLAMemoryMode::UnitStride
                                  : VLAMemoryMode::Strided;
     decision.lhsPredicateVariesByReduction =
-        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+        valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
     retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
     decision.absorbed.append(absorbed.begin(), absorbed.end());
     return VLADotCandidate{std::move(decision), *physical};
@@ -2113,43 +2203,51 @@ private:
       return mlir::failure();
     }
 
-    LoadOp freeLoad = traceIdentityCastLoad(dot.getLhs());
+    LoadOp freeLoad = reloadableLoad(dot.getLhs());
     if (!freeLoad || !isTrue(freeLoad.getWhere())) {
       dot.emitError("RVV VLA vector-dot load facts are unavailable");
       return mlir::failure();
     }
 
     mlir::Block &block = *dot->getBlock();
-    llvm::DenseSet<mlir::Operation *> freeDefinitions;
-    llvm::DenseSet<mlir::Operation *> blockedDefinitions;
-    llvm::SmallVector<BlockIndexOp> freeAxes;
-    llvm::SmallVector<BlockIndexOp> blockedAxes;
-    collectLocalDefinitions(dot.getLhs(), block, freeDefinitions, freeAxes);
-    collectLocalDefinitions(dot.getRhs(), block, blockedDefinitions,
-                            blockedAxes);
-    if (freeAxes.size() != 1 || blockedAxes.size() != 1 ||
-        freeAxes.front() != blockedAxes.front()) {
+    std::optional<StructuredProductFacts> product =
+        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+    mlir::Value coordinate = vla.getBody().front().getArgument(0);
+    if (!product || product->lhsFreeAxes.size() != 1 ||
+        product->lhsFreeAxes.front() != coordinate ||
+        !product->rhsFreeAxes.empty() ||
+        product->reductionAxes.size() != 1 ||
+        product->resultAxes.size() != 1) {
       dot.emitError(
           "RVV VLA vector dot requires one shared explicit reduction axis");
       return mlir::failure();
     }
-    BlockIndexOp reductionAxis = freeAxes.front();
+    BlockIndexOp reductionAxis =
+        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!reductionAxis) {
+      dot.emitError("RVV VLA vector dot block-axis fact is unavailable");
+      return mlir::failure();
+    }
 
-    mlir::Value coordinate = vla.getBody().front().getArgument(0);
-    mlir::Value freeRoot = pointerRoot(freeLoad.getPointer());
+    const MemoryAccessFact *freeAccess = memoryFact(freeLoad.getOperation());
+    if (!freeAccess) {
+      dot.emitError("RVV VLA vector-dot typed memory fact is unavailable");
+      return mlir::failure();
+    }
+    mlir::Value freeRoot = freeAccess->root;
     auto freePointer =
         freeRoot ? mlir::dyn_cast<PtrType>(freeRoot.getType()) : PtrType{};
-    LaneRelation freeRelation =
-        classifyLaneRelation(freeLoad.getPointer(), coordinate);
+    LaneRelation freeRelation = memoryRelation(*freeAccess, coordinate);
     if (!freePointer || !freePointer.getElementType().isF32() ||
         (freeRelation != LaneRelation::UnitStride &&
          freeRelation != LaneRelation::Strided) ||
-        !dependsOn(freeLoad.getPointer(), coordinate) ||
-        !dependsOn(freeLoad.getPointer(), reductionAxis.getResult()) ||
-        !dependsOn(dot.getInit(), coordinate) ||
-        dependsOn(dot.getInit(), reductionAxis.getResult()) ||
-        dependsOn(dot.getRhs(), coordinate) ||
-        !dependsOn(dot.getRhs(), reductionAxis.getResult())) {
+        memoryRelation(*freeAccess, coordinate) == LaneRelation::Independent ||
+        memoryRelation(*freeAccess, reductionAxis.getResult()) ==
+            LaneRelation::Independent ||
+        !valueDependsOnAxis(dot.getInit(), coordinate) ||
+        valueDependsOnAxis(dot.getInit(), reductionAxis.getResult()) ||
+        valueDependsOnAxis(dot.getRhs(), coordinate) ||
+        !valueDependsOnAxis(dot.getRhs(), reductionAxis.getResult())) {
       dot.emitError("RVV VLA vector-dot memory relations are unavailable");
       return mlir::failure();
     }
@@ -2471,9 +2569,6 @@ private:
         }
       }
       if (relation == LaneRelation::Indexed) {
-        if (!options.target.hasIndexedMemory)
-          return operation->emitError(
-              "indexed VLA memory is not legal for this target profile");
         access.indexedOffset =
             findIndexedOffset(pointer, decision.coordinate);
         if (!access.indexedOffset) {
@@ -2486,29 +2581,6 @@ private:
                     elementType(indexCast.getInput().getType()).isUnsignedInteger(32)
                 ? 32
                 : static_cast<unsigned>(options.target.xlen);
-        if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
-          mlir::Operation *indexDefinition =
-              access.indexedOffset.getDefiningOp();
-          for (mlir::Operation *user : load.getResult().getUsers()) {
-            if (user == indexDefinition)
-              continue;
-            unsigned companions = llvm::count_if(
-                user->getOperands(), [&](mlir::Value operand) {
-                  return operand != load.getResult() &&
-                         isRegionValue(operand.getType()) &&
-                         elementType(operand.getType()).isF32();
-                });
-            bool feedsReduction = llvm::any_of(
-                user->getResults(), [](mlir::Value result) {
-                  return llvm::any_of(result.getUsers(), [](mlir::Operation *next) {
-                    return mlir::isa<ReduceOp>(next);
-                  });
-                });
-            access.indexedCompanionF32Vectors = std::max(
-                access.indexedCompanionF32Vectors,
-                companions + static_cast<unsigned>(feedsReduction));
-          }
-        }
       }
       decision.accesses.push_back(std::move(access));
       return mlir::success();
@@ -2592,6 +2664,17 @@ private:
         segmentFields.push_back(SegmentFieldCandidate{&access, *address});
     }
     llvm::DenseSet<mlir::Operation *> pairedSegmentAccesses;
+    auto hasInterveningEffect = [](mlir::Operation *lhs,
+                                   mlir::Operation *rhs) {
+      mlir::Operation *first = lhs->isBeforeInBlock(rhs) ? lhs : rhs;
+      mlir::Operation *second = first == lhs ? rhs : lhs;
+      for (mlir::Operation *operation = first->getNextNode();
+           operation && operation != second;
+           operation = operation->getNextNode())
+        if (!mlir::isMemoryEffectFree(operation))
+          return true;
+      return false;
+    };
     for (SegmentFieldCandidate &first : segmentFields) {
       if (pairedSegmentAccesses.contains(first.access->operation))
         continue;
@@ -2604,7 +2687,9 @@ private:
             first.address.base != second.address.base ||
             first.address.field == second.address.field ||
             mlir::isa<LoadOp>(first.access->operation) !=
-                mlir::isa<LoadOp>(second.access->operation))
+                mlir::isa<LoadOp>(second.access->operation) ||
+            hasInterveningEffect(first.access->operation,
+                                 second.access->operation))
           continue;
         VLAAccessDecision *field0 =
             first.address.field == 0 ? first.access : second.access;
@@ -2628,11 +2713,6 @@ private:
         segment.emission = emission;
         segment.base = first.address.base;
         decision.segment2.push_back(std::move(segment));
-        if (!options.target.hasSegmentMemory) {
-          emission->emitError(
-              "segment memory is not legal for this target profile");
-          return mlir::failure();
-        }
         field0->memoryMode = VLAMemoryMode::Segment2;
         field1->memoryMode = VLAMemoryMode::Segment2;
         pairedSegmentAccesses.insert(field0->operation);
@@ -2673,25 +2753,11 @@ private:
         return mlir::failure();
     }
 
+    llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimeSnapshots =
+        vlaValueLifetimeSnapshots(op);
     unsigned maxEntityF32Vectors = 0;
-    for (mlir::Operation *operation : physicalOperations) {
-      if (isDotOwned(operation))
-        continue;
-      unsigned entityVectors = llvm::count_if(
-          operation->getOperandTypes(), [](mlir::Type type) {
-            return isRegionValue(type) && elementType(type).isF32();
-          });
-      entityVectors += llvm::count_if(
-          operation->getResultTypes(), [](mlir::Type type) {
-            return isRegionValue(type) && elementType(type).isF32();
-          });
-      if (auto loop = mlir::dyn_cast<ForOp>(operation))
-        entityVectors += llvm::count_if(
-            loop.getBody().front().getArgumentTypes(), [](mlir::Type type) {
-              return isRegionValue(type) && elementType(type).isF32();
-            });
-      maxEntityF32Vectors = std::max(maxEntityF32Vectors, entityVectors);
-    }
+    for (const VLAValueLifetimeSnapshot &snapshot : lifetimeSnapshots)
+      maxEntityF32Vectors = std::max(maxEntityF32Vectors, snapshot.f32);
 
     for (mlir::Operation *nested : physicalOperations) {
       if (isDotOwned(nested))
@@ -2714,6 +2780,13 @@ private:
       std::optional<unsigned> selected;
       for (unsigned candidate : candidates) {
         if (candidate != 4 && candidate != 8)
+          continue;
+        if (!options.target.supportsVectorShape(
+                32, static_cast<int>(candidate * 8)) ||
+            !options.target.supportsVectorShape(
+                16, static_cast<int>(candidate / 2 * 8)) ||
+            !options.target.supportsVectorShape(
+                8, static_cast<int>(candidate / 4 * 8)))
           continue;
         unsigned narrowGroups = candidate + candidate / 2 + candidate / 4;
         unsigned regionGroups = maxEntityF32Vectors * candidate;
@@ -2755,42 +2828,7 @@ private:
             mlir::isa<MaskedType>(reduce.getInput().getType());
         if (maskedInput)
           state.validity = VLAStateValidityRealization::ReductionIdentity;
-        auto multiply = reduce.getInput().getDefiningOp<BinaryOp>();
-        auto lhsCast = multiply && multiply.getKind() == "mul"
-                           ? multiply.getLhs().getDefiningOp<CastOp>()
-                           : CastOp{};
-        auto rhsCast = multiply && multiply.getKind() == "mul"
-                           ? multiply.getRhs().getDefiningOp<CastOp>()
-                           : CastOp{};
-        auto lhsLoad = lhsCast ? lhsCast.getInput().getDefiningOp<LoadOp>()
-                               : LoadOp{};
-        auto rhsLoad = rhsCast ? rhsCast.getInput().getDefiningOp<LoadOp>()
-                               : LoadOp{};
-        bool wideningF16Dot =
-            !maskedInput && reduce.getKind() == "add" && multiply && lhsCast && rhsCast &&
-            lhsLoad && rhsLoad &&
-            elementType(lhsCast.getResult().getType()).isF32() &&
-            elementType(rhsCast.getResult().getType()).isF32() &&
-            isF16(elementType(lhsLoad.getResult().getType())) &&
-            isF16(elementType(rhsLoad.getResult().getType())) &&
-            isTrue(lhsLoad.getWhere()) && isTrue(rhsLoad.getWhere()) &&
-            classifyLaneRelation(lhsLoad.getPointer(), decision.coordinate) ==
-                LaneRelation::UnitStride &&
-            classifyLaneRelation(rhsLoad.getPointer(), decision.coordinate) ==
-                LaneRelation::UnitStride;
-        if (wideningF16Dot) {
-          state.realization =
-              VLAStateRealization::RVVWideningF16DotReduction;
-          state.lhsLoad = lhsLoad.getOperation();
-          state.rhsLoad = rhsLoad.getOperation();
-          llvm::DenseSet<mlir::Operation *> absorbed{
-              lhsLoad.getOperation(), lhsCast.getOperation(),
-              rhsLoad.getOperation(), rhsCast.getOperation(),
-              multiply.getOperation()};
-          retainOnlyPrivateDefinitions(absorbed, reduce.getOperation());
-          state.absorbed.append(absorbed.begin(), absorbed.end());
-          state.placement = VLAStatePlacement::VectorCarry;
-        } else if (reduce.getKind() == "add") {
+        if (reduce.getKind() == "add") {
           state.realization = VLAStateRealization::RVVAddReduction;
           state.placement = reduce.getOrder() == "relaxed"
                                 ? VLAStatePlacement::VectorCarry
@@ -2876,11 +2914,6 @@ private:
             return isRegionValue(type) && elementType(type).isF32();
           });
         });
-    bool hasWideningF16Dot = llvm::any_of(
-        decision.states, [](const VLAStateDecision &state) {
-          return state.realization ==
-                 VLAStateRealization::RVVWideningF16DotReduction;
-      });
     bool onlyF16Accesses = !decision.accesses.empty() &&
                            llvm::all_of(decision.accesses,
                                         [](const VLAAccessDecision &access) {
@@ -2911,6 +2944,10 @@ private:
     candidateFacts.requiresF32M2Math = requiresF32M2Math;
     candidateFacts.hasIndexVector =
         !decision.indexBinaries.empty() || !decision.indexSelects.empty() ||
+        llvm::any_of(lifetimeSnapshots,
+                     [](const VLAValueLifetimeSnapshot &snapshot) {
+                       return snapshot.index != 0;
+                     }) ||
         llvm::any_of(decision.predicates,
                      [&](const VLAPredicateDecision &predicate) {
                        return predicate.realization ==
@@ -2943,9 +2980,6 @@ private:
             std::max(candidateFacts.maxIndexedElementSEW, elementSEW);
         candidateFacts.maxIndexedOffsetSEW = std::max(
             candidateFacts.maxIndexedOffsetSEW, access.indexedSEW);
-        candidateFacts.maxIndexedCompanionF32Vectors = std::max(
-            candidateFacts.maxIndexedCompanionF32Vectors,
-            access.indexedCompanionF32Vectors);
       }
       if (access.elementType.isF32()) {
         candidateFacts.f32Loads += mlir::isa<LoadOp>(access.operation);
@@ -2976,11 +3010,10 @@ private:
     }
     const unsigned dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
-    const VLAStripSchedule stripSchedule =
-        hasWideningF16Dot ? VLAStripSchedule::FullThenTail
-                          : VLAStripSchedule::Dynamic;
-    auto legalLMUL = [](unsigned value) {
-      return value == 1 || value == 2 || value == 4 || value == 8;
+    const VLAStripSchedule stripSchedule = VLAStripSchedule::Dynamic;
+    auto legalLMUL = [&](unsigned value) {
+      return options.target.supportsVectorShape(
+          dataSEW, static_cast<int>(value * 8));
     };
     std::optional<unsigned> requiredLMUL;
     auto requireLMUL = [&](unsigned value, llvm::StringRef source) {
@@ -3008,8 +3041,6 @@ private:
                   .value_or(0),
               "narrow")))
         return mlir::failure();
-    if (hasWideningF16Dot && mlir::failed(requireLMUL(2, "widening dot")))
-      return mlir::failure();
     if ((candidateFacts.requiresF32M2Math || candidateFacts.hasOnlineSummary) &&
         mlir::failed(requireLMUL(2, "f32m2 math")))
       return mlir::failure();
@@ -3024,7 +3055,8 @@ private:
       auto found = llvm::find(order, candidate);
       return static_cast<unsigned>(std::distance(order.begin(), found));
     };
-    llvm::SmallVector<unsigned> candidates = {1, 2, 4, 8};
+    llvm::SmallVector<unsigned> candidates =
+        integerLMULCandidates(options.target, dataSEW);
     if (requiredLMUL) {
       candidates = {*requiredLMUL};
     } else {
@@ -3068,10 +3100,19 @@ private:
                    VLAPredicateDecision::Realization::RVVAffineIndexScalar;
           });
       if ((hasAffinePredicate || candidateFacts.hasIndexVector) &&
-          (candidate * static_cast<unsigned>(options.target.xlen)) % dataSEW != 0)
+          (candidate * 8 * static_cast<unsigned>(options.target.xlen)) %
+                  dataSEW !=
+              0)
         continue;
       if ((hasAffinePredicate || candidateFacts.hasIndexVector) &&
           candidate * static_cast<unsigned>(options.target.xlen) / dataSEW > 8)
+        continue;
+      if ((hasAffinePredicate || candidateFacts.hasIndexVector) &&
+          !options.target.supportsVectorShape(
+              static_cast<unsigned>(options.target.xlen),
+              static_cast<int>(candidate *
+                               static_cast<unsigned>(options.target.xlen) /
+                               dataSEW * 8)))
         continue;
       if (candidateFacts.indexedAccesses != 0 &&
           ((candidate * candidateFacts.maxIndexedOffsetSEW) % dataSEW != 0 ||
@@ -3085,15 +3126,18 @@ private:
                            : access.elementType.isUnsignedInteger(32) ? 32
                            : access.elementType.isSignedInteger(8) ? 8
                                                                   : 0;
-            return sew != 0 &&
-                   (candidate * sew) % dataSEW == 0 &&
-                   candidate * sew / dataSEW <= 8;
+            if (sew == 0 || (candidate * 8 * sew) % dataSEW != 0)
+              return false;
+            int lmulEighths =
+                static_cast<int>(candidate * 8 * sew / dataSEW);
+            return options.target.supportsVectorShape(sew, lmulEighths);
           });
       if (!elementShapesLegal)
         continue;
       if ((candidateFacts.segmentLoadPairs != 0 ||
            candidateFacts.segmentStorePairs != 0) &&
-          candidate > 4)
+          !options.target.supportsSegmentVectorMemory(
+              2, 32, static_cast<int>(candidate * 8)))
         continue;
       if (candidateFacts.hasF32TableLookup && candidate != 4)
         continue;
@@ -3126,44 +3170,38 @@ private:
       if (candidateFacts.indexedAccesses != 0) {
         unsigned indexLMUL =
             candidate * candidateFacts.maxIndexedOffsetSEW / dataSEW;
-        unsigned elementLMUL = candidate * candidateFacts.maxIndexedElementSEW /
-                               dataSEW;
-        indexGroups = std::max(2 * indexLMUL + elementLMUL, 2 * candidate) +
-                      candidateFacts.maxIndexedCompanionF32Vectors * candidate;
+        indexGroups = indexLMUL;
       }
-      if (candidateFacts.hasIndexVector)
-        indexGroups = std::max(
-            indexGroups,
-            candidate * static_cast<unsigned>(options.target.xlen) / dataSEW *
-                (decision.indexSelects.empty() ? 1u : 2u));
+      auto groupsFor = [&](unsigned sew, unsigned count) {
+        if (count == 0)
+          return 0u;
+        unsigned scaled = candidate * 8 * sew;
+        if (scaled % dataSEW != 0)
+          return static_cast<unsigned>(options.target.vectorRegisters);
+        int lmulEighths = static_cast<int>(scaled / dataSEW);
+        if (!options.target.supportsVectorShape(sew, lmulEighths))
+          return static_cast<unsigned>(options.target.vectorRegisters);
+        return count * rvvRegisterGroups(RVVVectorShape{sew, lmulEighths});
+      };
+      unsigned valueGroups = 0;
       unsigned predicateGroups = 0;
-      for (const VLAPredicateDecision &predicate : decision.predicates) {
-        if (predicate.realization ==
-            VLAPredicateDecision::Realization::RVVVectorScalar) {
-          unsigned scaled = candidate * predicate.vectorSEW;
-          if (scaled % dataSEW != 0) {
-            predicateGroups = options.target.vectorRegisters;
-            break;
-          }
-          predicateGroups += scaled / dataSEW;
-        } else {
-          predicateGroups +=
-              options.target.xlen == 64 ? candidate * 2 : candidate;
-        }
+      for (const VLAValueLifetimeSnapshot &snapshot : lifetimeSnapshots) {
+        unsigned snapshotGroups =
+            groupsFor(32, snapshot.f32) + groupsFor(16, snapshot.f16) +
+            groupsFor(8, snapshot.byte) + groupsFor(32, snapshot.u32) +
+            groupsFor(static_cast<unsigned>(options.target.xlen),
+                      snapshot.index) +
+            snapshot.mask;
+        valueGroups = std::max(valueGroups, snapshotGroups);
+        predicateGroups = std::max(predicateGroups, snapshot.mask);
       }
-      unsigned valueGroups = maxEntityF32Vectors * candidate;
-      if (dataSEW == 16)
-        valueGroups = std::max(
-            valueGroups,
-            static_cast<unsigned>(decision.accesses.size()) * candidate);
       unsigned memoryGroups = indexGroups;
       memoryGroups +=
           2 * candidate *
           std::max(candidateFacts.segmentLoadPairs,
                    candidateFacts.segmentStorePairs);
       unsigned lookupGroups = candidateFacts.hasF32TableLookup ? 12 : 0;
-      unsigned sharedGroups =
-          valueGroups + memoryGroups + predicateGroups + stateGroups;
+      unsigned sharedGroups = valueGroups + memoryGroups;
       unsigned requiredGroups =
           std::max(sharedGroups,
                    std::max(primitiveGroups, lookupGroups) + memoryGroups);
@@ -3195,7 +3233,9 @@ private:
       }
     }
     if (!selected) {
-      op.emitError("VLA has no legal LMUL candidate for its entity resources");
+      op.emitError() << "VLA has no legal LMUL candidate for "
+                     << maxEntityF32Vectors
+                     << " simultaneously live f32 values and its typed memory/state resources";
       return mlir::failure();
     }
     entity.vlaDataShape = rvvShape(selected->dataSEW, selected->dataLMUL);
@@ -3221,10 +3261,14 @@ private:
                          ? 8
                      : element.isUnsignedInteger(32) ? 32
                                                      : 0;
-      if (sew == 0 || (selected->dataLMUL * sew) % selected->dataSEW != 0)
+      unsigned scaled = selected->dataLMUL * 8 * sew;
+      if (sew == 0 || scaled % selected->dataSEW != 0)
         return {};
-      unsigned lmul = selected->dataLMUL * sew / selected->dataSEW;
-      return lmul == 0 || lmul > 8 ? RVVVectorShape{} : rvvShape(sew, lmul);
+      RVVVectorShape shape{
+          sew, static_cast<int>(scaled / selected->dataSEW)};
+      return options.target.supportsVectorShape(shape.sew, shape.lmulEighths)
+                 ? shape
+                 : RVVVectorShape{};
     };
     for (mlir::Operation *operation : physicalOperations) {
       for (mlir::Value operand : operation->getOperands())
@@ -3282,17 +3326,26 @@ private:
         cast.emitError("VLA cast has no selected RVV conversion");
         return mlir::failure();
       }
-      unsigned sourceLMUL = selected->dataLMUL * sourceSEW / selected->dataSEW;
-      unsigned resultLMUL = selected->dataLMUL * resultSEW / selected->dataSEW;
-      if (sourceLMUL == 0 || sourceLMUL > 8 || resultLMUL == 0 ||
-          resultLMUL > 8) {
+      unsigned sourceScaled = selected->dataLMUL * 8 * sourceSEW;
+      unsigned resultScaled = selected->dataLMUL * 8 * resultSEW;
+      if (sourceScaled % selected->dataSEW != 0 ||
+          resultScaled % selected->dataSEW != 0) {
         cast.emitError("VLA cast exceeds the legal RVV LMUL range");
         return mlir::failure();
       }
       RVVVectorShape sourceShape =
-          rvvShape(sourceSEW, sourceLMUL);
+          RVVVectorShape{sourceSEW,
+                         static_cast<int>(sourceScaled / selected->dataSEW)};
       RVVVectorShape resultShape =
-          rvvShape(resultSEW, resultLMUL);
+          RVVVectorShape{resultSEW,
+                         static_cast<int>(resultScaled / selected->dataSEW)};
+      if (!options.target.supportsVectorShape(sourceShape.sew,
+                                              sourceShape.lmulEighths) ||
+          !options.target.supportsVectorShape(resultShape.sew,
+                                              resultShape.lmulEighths)) {
+        cast.emitError("VLA cast exceeds the legal RVV LMUL range");
+        return mlir::failure();
+      }
       recordPhysicalValue(entity, cast.getInput(), sourceShape);
       recordPhysicalValue(entity, cast.getResult(), resultShape);
       recordPhysicalHandoff(entity, cast.getOperation(), cast.getInput(),
@@ -3416,20 +3469,21 @@ private:
                                access.elementType.isUnsignedInteger(8))
                                 ? 8
                                 : 32;
-      unsigned scaledLMUL = selected->dataLMUL * elementSEW;
+      unsigned scaledLMUL = selected->dataLMUL * 8 * elementSEW;
       if (scaledLMUL % selected->dataSEW != 0) {
         access.operation->emitError(
             "VLA memory element has no compatible selected LMUL");
         return mlir::failure();
       }
-      unsigned elementLMUL = scaledLMUL / selected->dataSEW;
-      if (elementLMUL == 0 || elementLMUL > 8) {
+      int elementLMULEighths =
+          static_cast<int>(scaledLMUL / selected->dataSEW);
+      if (!options.target.supportsVectorShape(elementSEW,
+                                              elementLMULEighths)) {
         access.operation->emitError(
             "VLA memory element exceeds the legal RVV LMUL range");
         return mlir::failure();
       }
-      RVVVectorShape elementShape =
-          rvvShape(elementSEW, elementLMUL);
+      RVVVectorShape elementShape{elementSEW, elementLMULEighths};
       if (auto load = mlir::dyn_cast<LoadOp>(access.operation)) {
         recordPhysicalValue(entity, load.getResult(), elementShape);
         recordPhysicalHandoff(entity, access.operation, load.getResult(),
@@ -3461,6 +3515,13 @@ private:
           return mlir::failure();
         }
         RVVVectorShape indexShape = indexValue->shape;
+        if (!options.target.supportsIndexedVectorMemory(
+                elementShape.sew, elementShape.lmulEighths,
+                indexShape.sew, indexShape.lmulEighths)) {
+          access.operation->emitError(
+              "indexed VLA memory shapes are illegal for the target profile");
+          return mlir::failure();
+        }
         recordPhysicalHandoff(entity, access.operation,
                               access.indexedOffset, PhysicalHandoff::Share,
                               indexShape, indexShape);
@@ -3488,15 +3549,21 @@ private:
           VLAPredicateDecision::Realization::RVVVectorScalar)
         continue;
       unsigned scaledLMUL =
-          selected->dataLMUL * predicate.vectorSEW;
+          selected->dataLMUL * 8 * predicate.vectorSEW;
       if (scaledLMUL % selected->dataSEW != 0) {
         predicate.operation->emitError(
             "typed VLA predicate has no compatible selected LMUL");
         return mlir::failure();
       }
-      unsigned vectorLMUL = scaledLMUL / selected->dataSEW;
-      RVVVectorShape predicateShape =
-          rvvShape(predicate.vectorSEW, vectorLMUL);
+      RVVVectorShape predicateShape{
+          predicate.vectorSEW,
+          static_cast<int>(scaledLMUL / selected->dataSEW)};
+      if (!options.target.supportsVectorShape(
+              predicateShape.sew, predicateShape.lmulEighths)) {
+        predicate.operation->emitError(
+            "typed VLA predicate has no legal selected vector shape");
+        return mlir::failure();
+      }
       recordPhysicalValue(entity, predicate.coordinate, predicateShape);
       recordPhysicalHandoff(entity, predicate.operation, predicate.coordinate,
                             PhysicalHandoff::Share, predicateShape,
@@ -3504,26 +3571,6 @@ private:
     }
 
     for (VLAStateDecision &state : decision.states) {
-      if (state.realization ==
-          VLAStateRealization::RVVWideningF16DotReduction) {
-        RVVVectorShape inputShape = rvvShape(16, 1);
-        RVVVectorShape computeShape = rvvShape(32, 2);
-        RVVVectorShape reductionShape = rvvShape(32, 1);
-        if (!state.lhsLoad || !state.rhsLoad) {
-          state.operation->emitError(
-              "widening dot has no physical operand owner");
-          return mlir::failure();
-        }
-        recordPhysicalValue(
-            entity, mlir::cast<LoadOp>(state.lhsLoad).getResult(), inputShape);
-        recordPhysicalValue(
-            entity, mlir::cast<LoadOp>(state.rhsLoad).getResult(), inputShape);
-        recordPhysicalTemporary(entity, state.operation, computeShape);
-        recordPhysicalHandoff(entity, state.operation, state.identity,
-                              PhysicalHandoff::Rematerialize,
-                              reductionShape, reductionShape);
-        continue;
-      }
       if (state.realization ==
           VLAStateRealization::RVVSegmentedInclusiveAddScan) {
         const VLAPredicateDecision *segmentPredicate = nullptr;
@@ -3618,8 +3665,6 @@ private:
 
   mlir::LogicalResult emitOperation(mlir::Operation *operation) {
     if (consumed.contains(operation))
-      return mlir::success();
-    if (isVLAStateAbsorbed(operation))
       return mlir::success();
     if (const VLADotDecision *decision =
             findVLADotDecision(operation))
@@ -4359,9 +4404,6 @@ private:
   mlir::LogicalResult emitVLA(VLAOp op) {
     if (inVLA)
       return op.emitError("nested VLA regions are not supported");
-    if (!options.target.hasRVV)
-      return op.emitError(
-          "VLA requires RVV on the selected target; no scalar fallback exists");
     auto selected = physicalPlan.vlaRegions.find(op.getOperation());
     if (selected == physicalPlan.vlaRegions.end())
       return op.emitError("VLA physical decision was not prepared");
@@ -4375,46 +4417,6 @@ private:
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
-      if (state.realization ==
-          VLAStateRealization::RVVWideningF16DotReduction) {
-        auto lhsLoad = mlir::cast<LoadOp>(state.lhsLoad);
-        auto input = llvm::find_if(
-            entity.values, [&](const PhysicalValueDecision &value) {
-              return value.value == lhsLoad.getResult();
-            });
-        auto compute = llvm::find_if(
-            entity.temporaries, [&](const PhysicalTemporaryDecision &value) {
-              return value.owner == state.operation;
-            });
-        const PhysicalHandoffDecision *reduction =
-            findPhysicalHandoff(entity, state.operation, state.identity);
-        if (input == entity.values.end() ||
-            compute == entity.temporaries.end() || !reduction)
-          return state.operation->emitError(
-              "widening dot physical value plan is incomplete");
-        std::optional<unsigned> inputLMUL = rvvIntegerLMUL(input->shape);
-        std::optional<unsigned> computeLMUL = rvvIntegerLMUL(compute->shape);
-        if (!inputLMUL || !computeLMUL)
-          return state.operation->emitError(
-              "widening dot vector shape has no intrinsic-C spelling");
-        std::string fullVL = fresh("dot_vl");
-        std::string accumulator = fresh("dot_acc");
-        line("const size_t " + fullVL + " = __riscv_vsetvlmax_e" +
-             std::to_string(input->shape.sew) + "m" +
-             std::to_string(*inputLMUL) + "();");
-        line("vfloat" + std::to_string(compute->shape.sew) + "m" +
-             std::to_string(*computeLMUL) + "_t " + accumulator +
-             " = __riscv_vfmv_v_f_f" + std::to_string(compute->shape.sew) +
-             "m" + std::to_string(*computeLMUL) +
-             "(0.0f, " + fullVL + ");");
-        CValue aggregate{state.elementType, CValueKind::F32BlockStorage,
-                         accumulator};
-        aggregate.fields.push_back(
-            CValue{mlir::IndexType::get(kernel.getContext()),
-                   CValueKind::Scalar, fullVL});
-        aggregates[state.operation] = aggregate;
-        continue;
-      }
       if ((state.realization == VLAStateRealization::RVVAddReduction ||
            state.realization == VLAStateRealization::RVVMaxReduction) &&
           state.placement == VLAStatePlacement::VectorCarry) {
@@ -4491,16 +4493,13 @@ private:
     std::string previousVL = activeVL;
     const VLARegionDecision *previousDecision = activeVLADecision;
     const PhysicalEntityPlan *previousEntity = activePhysicalEntity;
-    auto emitStripBody = [&](bool fullStrip) -> mlir::LogicalResult {
-      bool previousFullStrip = activeVLAFullStrip;
+    auto emitStripBody = [&]() -> mlir::LogicalResult {
       inVLA = true;
-      activeVLAFullStrip = fullStrip;
       activeVL = vl;
       activeVLADecision = &decision;
       activePhysicalEntity = &entity;
       auto restoreVLAState = llvm::make_scope_exit([&] {
         inVLA = previousInVLA;
-        activeVLAFullStrip = previousFullStrip;
         activeVL = previousVL;
         activeVLADecision = previousDecision;
         activePhysicalEntity = previousEntity;
@@ -4516,13 +4515,8 @@ private:
           if (!state)
             return reduce.emitError(
                 "VLA reduction has no physical state decision");
-          mlir::LogicalResult lowered =
-              state->realization ==
-                      VLAStateRealization::RVVWideningF16DotReduction
-                  ? emitWideningF16DotStrip(
-                        reduce, *state, aggregates[reduce.getOperation()])
-                  : emitVectorReduce(reduce, *state,
-                                     aggregates[reduce.getOperation()]);
+          mlir::LogicalResult lowered = emitVectorReduce(
+              reduce, *state, aggregates[reduce.getOperation()]);
           if (mlir::failed(lowered))
             return mlir::failure();
           continue;
@@ -4558,52 +4552,18 @@ private:
       return mlir::success();
     };
 
-    if (entity.schedule.stripSchedule == VLAStripSchedule::FullThenTail) {
-      auto wideningState = llvm::find_if(
-          decision.states, [](const VLAStateDecision &state) {
-            return state.realization ==
-                   VLAStateRealization::RVVWideningF16DotReduction;
-          });
-      if (wideningState == decision.states.end())
-        return op.emitError("full-then-tail VLA has no owning state decision");
-      auto aggregate = aggregates.find(wideningState->operation);
-      if (aggregate == aggregates.end() || aggregate->second.fields.size() != 1 ||
-          aggregate->second.fields.front().spelling.empty())
-        return op.emitError("full-then-tail VLA has no selected full VL");
-      std::string fullVL = aggregate->second.fields.front().spelling;
-      line("size_t " + strip + " = " + begin.spelling + ";");
-      line("for (; " + strip + " + " + fullVL + " <= " + end.spelling + "; " +
-           strip + " += " + fullVL + ") {");
-      ++indent;
-      line("const size_t " + vl + " = " + fullVL + ";");
-      if (mlir::failed(emitStripBody(true)))
-        return mlir::failure();
-      --indent;
-      line("}");
-      line("if (" + strip + " < " + end.spelling + ") {");
-      ++indent;
-      line("const size_t " + vl + " = __riscv_vsetvl_e" +
-           std::to_string(entity.vlaDataShape.sew) + "m" +
-           std::to_string(*dataLMUL) + "(" + end.spelling +
-           " - " + strip + ");");
-      if (mlir::failed(emitStripBody(false)))
-        return mlir::failure();
-      --indent;
-      line("}");
-    } else {
-      line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
-           " < " + end.spelling + ";) {");
-      ++indent;
-      line("const size_t " + vl + " = __riscv_vsetvl_e" +
-           std::to_string(entity.vlaDataShape.sew) + "m" +
-           std::to_string(*dataLMUL) + "(" + end.spelling +
-           " - " + strip + ");");
-      if (mlir::failed(emitStripBody(false)))
-        return mlir::failure();
-      line(strip + " += " + vl + ";");
-      --indent;
-      line("}");
-    }
+    line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
+         " < " + end.spelling + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e" +
+         std::to_string(entity.vlaDataShape.sew) + "m" +
+         std::to_string(*dataLMUL) + "(" + end.spelling +
+         " - " + strip + ");");
+    if (mlir::failed(emitStripBody()))
+      return mlir::failure();
+    line(strip + " += " + vl + ";");
+    --indent;
+    line("}");
 
     for (const VLAStateDecision &state : decision.states) {
       if ((state.realization != VLAStateRealization::RVVAddReduction &&
@@ -4631,56 +4591,6 @@ private:
            " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
       values[reduce.getResult()] =
           CValue{reduce.getResult().getType(), CValueKind::Scalar, result};
-    }
-
-    for (const VLAStateDecision &state : decision.states) {
-      if (state.realization !=
-          VLAStateRealization::RVVWideningF16DotReduction)
-        continue;
-      auto reduce = mlir::cast<ReduceOp>(state.operation);
-      CValue aggregate = aggregates[state.operation];
-      if (aggregate.fields.size() != 1 ||
-          aggregate.fields.front().spelling.empty())
-        return reduce.emitError("widening dot full VL is unavailable");
-      const std::string &fullVL = aggregate.fields.front().spelling;
-      auto compute = llvm::find_if(
-          entity.temporaries, [&](const PhysicalTemporaryDecision &value) {
-            return value.owner == state.operation;
-          });
-      const PhysicalHandoffDecision *reduction =
-          findPhysicalHandoff(entity, state.operation, state.identity);
-      if (compute == entity.temporaries.end() || !reduction)
-        return reduce.emitError(
-            "widening dot reduction shape is unavailable");
-      std::optional<unsigned> computeLMUL = rvvIntegerLMUL(compute->shape);
-      std::optional<unsigned> reductionLMUL =
-          rvvIntegerLMUL(reduction->resultShape);
-      if (!computeLMUL || !reductionLMUL)
-        return reduce.emitError(
-            "widening dot reduction shape has no intrinsic-C spelling");
-      std::string seed = fresh("dot_seed");
-      std::string reduced = fresh("dot_reduced");
-      std::string result = fresh("dot");
-      std::string reductionSuffix =
-          "f" + std::to_string(reduction->resultShape.sew) + "m" +
-          std::to_string(*reductionLMUL);
-      std::string computeSuffix = "f" + std::to_string(compute->shape.sew) +
-                                  "m" + std::to_string(*computeLMUL);
-      std::string reductionType =
-          "vfloat" + std::to_string(reduction->resultShape.sew) + "m" +
-          std::to_string(*reductionLMUL) + "_t";
-      line(reductionType + " " + seed +
-           " = __riscv_vfmv_v_f_" + reductionSuffix +
-           "(" + expression(state.identity) + ", 1);");
-      line(reductionType + " " + reduced +
-           " = __riscv_vfredusum_vs_" + computeSuffix + "_" +
-           reductionSuffix + "(" +
-           aggregate.spelling + ", " + seed + ", " + fullVL + ");");
-      line("const float " + result + " = __riscv_vfmv_f_s_" +
-           reductionSuffix + "_f32(" + reduced + ");");
-      CValue materialized{reduce.getResult().getType(), CValueKind::Scalar,
-                          result};
-      values[reduce.getResult()] = materialized;
     }
 
     auto yield = mlir::cast<YieldOp>(body.getTerminator());
@@ -5276,8 +5186,8 @@ private:
             findVLAValueDecision(decision->coordinate);
         const PhysicalHandoffDecision *handoff =
             findVLAHandoff(op.getOperation(), decision->coordinate);
-        std::optional<unsigned> vectorLMUL =
-            vectorShape ? rvvIntegerLMUL(vectorShape->shape) : std::nullopt;
+        std::string shapeSuffix =
+            vectorShape ? rvvShapeSuffix(vectorShape->shape) : std::string{};
         bool indexVector =
             elementType(decision->coordinate.getType()).isIndex();
         CValueKind expected = indexVector
@@ -5287,7 +5197,8 @@ private:
                                         : CValueKind::F32Vector;
         if (coordinate.kind != expected || scalar.kind != CValueKind::Scalar ||
             coordinate.spelling.empty() || scalar.spelling.empty() ||
-            !vectorLMUL || !handoff || handoff->kind != PhysicalHandoff::Share ||
+            shapeSuffix.empty() || !handoff ||
+            handoff->kind != PhysicalHandoff::Share ||
             handoff->sourceShape != vectorShape->shape ||
             handoff->resultShape != vectorShape->shape || !activePhysicalEntity ||
             activePhysicalEntity->vlaMaskRatio == 0)
@@ -5296,8 +5207,7 @@ private:
         std::string maskSuffix;
         std::string intrinsic;
         if (decision->vectorSEW == 8 || indexVector) {
-          vectorSuffix = "u" + std::to_string(decision->vectorSEW) + "m" +
-                         std::to_string(*vectorLMUL);
+          vectorSuffix = "u" + shapeSuffix;
           maskSuffix = vectorSuffix + "_b" +
                        std::to_string(activePhysicalEntity->vlaMaskRatio);
           intrinsic = llvm::StringSwitch<std::string>(decision->predicate)
@@ -5309,7 +5219,7 @@ private:
                           .Case("ge", "__riscv_vmsgeu_vx_")
                           .Default("");
         } else {
-          vectorSuffix = "f32m" + std::to_string(*vectorLMUL);
+          vectorSuffix = "f" + shapeSuffix;
           maskSuffix = vectorSuffix + "_b" +
                        std::to_string(activePhysicalEntity->vlaMaskRatio);
           intrinsic = llvm::StringSwitch<std::string>(decision->predicate)
@@ -6116,29 +6026,35 @@ private:
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = traceIdentityCastLoad(dot.getLhs());
-    LoadOp rhsLoad = traceIdentityCastLoad(dot.getRhs());
+    LoadOp lhsLoad = reloadableLoad(dot.getLhs());
+    LoadOp rhsLoad = reloadableLoad(dot.getRhs());
     if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere())) {
       dot.emitError("RVV row microtile load producers are unavailable");
       return mlir::failure();
     }
 
-    llvm::SmallVector<BlockIndexOp> lhsAxes =
-        blockAxesForType(dot.getLhs().getType());
-    llvm::SmallVector<BlockIndexOp> rhsAxes =
-        blockAxesForType(dot.getRhs().getType());
-    if (rhsAxes.size() != 1 || lhsAxes.size() != 2 ||
-        !llvm::is_contained(lhsAxes, rhsAxes.front())) {
+    std::optional<StructuredProductFacts> product =
+        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+    if (!product || product->lhsFreeAxes.size() != 1 ||
+        !product->rhsFreeAxes.empty() || product->reductionAxes.size() != 1 ||
+        product->resultAxes.size() != 1) {
       dot.emitError(
           "RVV row microtile requires explicit row and shared K block axes");
       return mlir::failure();
     }
-    BlockIndexOp reductionAxis = rhsAxes.front();
-    BlockIndexOp rowAxis = lhsAxes.front() == reductionAxis
-                              ? lhsAxes.back()
-                              : lhsAxes.front();
-    mlir::Value lhsRoot = pointerRoot(lhsLoad.getPointer());
-    mlir::Value rhsRoot = pointerRoot(rhsLoad.getPointer());
+    mlir::Value rowCoordinate = product->lhsFreeAxes.front();
+    mlir::Value reductionCoordinate = product->reductionAxes.front();
+    BlockIndexOp rowAxis = rowCoordinate.getDefiningOp<BlockIndexOp>();
+    BlockIndexOp reductionAxis =
+        reductionCoordinate.getDefiningOp<BlockIndexOp>();
+    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
+    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
+    if (!rowAxis || !reductionAxis || !lhsAccess || !rhsAccess) {
+      dot.emitError("RVV row microtile typed axis/access facts are unavailable");
+      return mlir::failure();
+    }
+    mlir::Value lhsRoot = lhsAccess->root;
+    mlir::Value rhsRoot = rhsAccess->root;
     auto lhsPointer = lhsRoot ? mlir::dyn_cast<PtrType>(lhsRoot.getType())
                               : PtrType{};
     auto rhsPointer = rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType())
@@ -6146,7 +6062,7 @@ private:
     if (!lhsPointer || !rhsPointer ||
         !lhsPointer.getElementType().isF32() ||
         !rhsPointer.getElementType().isF32() ||
-        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult()) ||
+        valueDependsOnAxis(lhsLoad.getWhere(), reductionCoordinate) ||
         (!isTrue(lhsLoad.getWhere()) &&
          !isFloatConstant(lhsLoad.getOther(), 0.0))) {
       dot.emitError("RVV row microtile pointer facts are unavailable");
@@ -6164,13 +6080,17 @@ private:
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
     LaneRelation lhsRelation =
-        classifyLaneRelation(lhsLoad.getPointer(), reductionAxis.getResult());
+        memoryRelation(*lhsAccess, reductionCoordinate);
     LaneRelation rhsRelation =
-        classifyLaneRelation(rhsLoad.getPointer(), reductionAxis.getResult());
+        memoryRelation(*rhsAccess, reductionCoordinate);
     if ((lhsRelation != LaneRelation::UnitStride &&
          lhsRelation != LaneRelation::Strided) ||
         (rhsRelation != LaneRelation::UnitStride &&
-         rhsRelation != LaneRelation::Strided)) {
+         rhsRelation != LaneRelation::Strided) ||
+        memoryRelation(*lhsAccess, rowCoordinate) ==
+            LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, rowCoordinate) !=
+            LaneRelation::Independent) {
       dot.emitError("RVV row microtile memory relations are unavailable");
       return mlir::failure();
     }
@@ -6188,7 +6108,7 @@ private:
         (lhsRelation == LaneRelation::Strided) +
         (rhsRelation == LaneRelation::Strided);
     candidateFacts.reductionPredicate =
-        dependsOn(lhsLoad.getWhere(), reductionAxis.getResult());
+        valueDependsOnAxis(lhsLoad.getWhere(), reductionCoordinate);
     candidateFacts.predicateGroups =
         candidateFacts.reductionPredicate ? 1 : 0;
     std::optional<F32DotPhysicalConfig> physical =
@@ -6441,9 +6361,9 @@ private:
       std::string name = fresh("load");
       const PhysicalValueDecision *valueShape =
           findVLAValueDecision(op.getResult());
-      std::optional<unsigned> selectedLMUL =
-          valueShape ? rvvIntegerLMUL(valueShape->shape) : std::nullopt;
-      if (!valueShape || !selectedLMUL)
+      std::string shapeSuffix =
+          valueShape ? rvvShapeSuffix(valueShape->shape) : std::string{};
+      if (!valueShape || shapeSuffix.empty())
         return op.emitError("VLA load has no selected vector shape");
       if (decision->memoryMode == VLAMemoryMode::Indexed) {
         const PhysicalValueDecision *indexShape =
@@ -6457,7 +6377,6 @@ private:
           return op.emitError(
               "indexed VLA load physical handoff is incomplete");
       }
-      unsigned lmul = *selectedLMUL;
       unsigned elementSEW = valueShape->shape.sew;
       if (decision->memoryMode == VLAMemoryMode::Segment2) {
         const VLASegment2Decision *segment =
@@ -6467,7 +6386,7 @@ private:
         if (segment->emission != op.getOperation())
           return mlir::success();
         if (segment->kind != VLASegment2AccessKind::Load || !f32 ||
-            elementSEW != 32 || lmul > 4)
+            elementSEW != 32)
           return op.emitError("segment2 load decision has no intrinsic-C spelling");
         auto field0 = mlir::cast<LoadOp>(segment->field0);
         auto field1 = mlir::cast<LoadOp>(segment->field1);
@@ -6479,14 +6398,14 @@ private:
         std::string tuple = fresh("segment2");
         std::string first = fresh("segment2_field0");
         std::string second = fresh("segment2_field1");
-        std::string suffix = "f32m" + std::to_string(lmul);
-        line("vfloat32m" + std::to_string(lmul) + "x2_t " + tuple +
+        std::string suffix = "f" + shapeSuffix;
+        line("vfloat" + shapeSuffix + "x2_t " + tuple +
              " = __riscv_vlseg2e32_v_" + suffix + "x2(" + base.spelling +
              " + 2 * " + coordinate.spelling + ", " + activeVL + ");");
-        line("vfloat32m" + std::to_string(lmul) + "_t " + first +
+        line("vfloat" + shapeSuffix + "_t " + first +
              " = __riscv_vget_v_" + suffix + "x2_" + suffix + "(" + tuple +
              ", 0);");
-        line("vfloat32m" + std::to_string(lmul) + "_t " + second +
+        line("vfloat" + shapeSuffix + "_t " + second +
              " = __riscv_vget_v_" + suffix + "x2_" + suffix + "(" + tuple +
              ", 1);");
         values[field0.getResult()] =
@@ -6497,17 +6416,13 @@ private:
         consumed.insert(segment->field1);
         return mlir::success();
       }
-      std::string element = f32   ? "f32m"
-                            : f16 ? "f16m"
-                            : u8  ? "u8m"
-                                  : "u32m";
+      std::string element = f32   ? "f"
+                            : f16 ? "f"
+                            : u8  ? "u"
+                                  : "u";
       std::string vectorType =
-          std::string(f32   ? "vfloat32m"
-                      : f16 ? "vfloat16m"
-                      : u8  ? "vuint8m"
-                            : "vuint32m") +
-          std::to_string(lmul) + "_t";
-      std::string suffix = element + std::to_string(lmul);
+          std::string(f32 || f16 ? "vfloat" : "vuint") + shapeSuffix + "_t";
+      std::string suffix = element + shapeSuffix;
       auto emitRead = [&]() {
         if (decision->memoryMode == VLAMemoryMode::UnitStride) {
           line(name + " = __riscv_vle" +
@@ -6831,11 +6746,10 @@ private:
         return op.emitError("VLA store element realization is unavailable");
       const PhysicalHandoffDecision *handoff =
           findVLAHandoff(op.getOperation(), op.getValue());
-      std::optional<unsigned> selectedLMUL =
-          handoff ? rvvIntegerLMUL(handoff->resultShape) : std::nullopt;
-      if (!handoff || !selectedLMUL)
+      std::string shapeSuffix =
+          handoff ? rvvShapeSuffix(handoff->resultShape) : std::string{};
+      if (!handoff || shapeSuffix.empty())
         return op.emitError("VLA store has no physical value handoff");
-      unsigned lmul = *selectedLMUL;
       unsigned elementSEW = handoff->resultShape.sew;
 
       std::string vector = value.spelling;
@@ -6848,17 +6762,11 @@ private:
           return op.emitError("VLA store scalar broadcast is unavailable");
         vector = fresh("store_value");
         std::string suffix =
-            std::string(f32   ? "f32m"
-                        : f16 ? "f16m"
-                        : i8  ? "i8m"
-                              : "u8m") +
-            std::to_string(lmul);
+            std::string(f32 || f16 ? "f" : i8 ? "i" : "u") +
+            shapeSuffix;
         std::string vectorType =
-            std::string(f32   ? "vfloat32m"
-                        : f16 ? "vfloat16m"
-                        : i8  ? "vint8m"
-                              : "vuint8m") +
-            std::to_string(lmul) + "_t";
+            std::string(f32 || f16 ? "vfloat" : i8 ? "vint" : "vuint") +
+            shapeSuffix + "_t";
         std::string broadcast = f32 || f16 ? "__riscv_vfmv_v_f_"
                                           : "__riscv_vmv_v_x_";
         line(vectorType + " " + vector + " = " + broadcast + suffix + "(" +
@@ -6876,7 +6784,7 @@ private:
         if (segment->emission != op.getOperation())
           return mlir::success();
         if (segment->kind != VLASegment2AccessKind::Store || !f32 ||
-            elementSEW != 32 || lmul > 4)
+            elementSEW != 32)
           return op.emitError("segment2 store decision has no intrinsic-C spelling");
         auto field0 = mlir::cast<StoreOp>(segment->field0);
         auto field1 = mlir::cast<StoreOp>(segment->field1);
@@ -6894,8 +6802,8 @@ private:
                                 << static_cast<int>(second.kind) << " names="
                                 << first.spelling << "/" << second.spelling;
         std::string tuple = fresh("segment2_store");
-        std::string suffix = "f32m" + std::to_string(lmul);
-        line("vfloat32m" + std::to_string(lmul) + "x2_t " + tuple +
+        std::string suffix = "f" + shapeSuffix;
+        line("vfloat" + shapeSuffix + "x2_t " + tuple +
              " = __riscv_vcreate_v_" + suffix + "x2(" + first.spelling + ", " +
              second.spelling + ");");
         line("__riscv_vsseg2e32_v_" + suffix + "x2(" + base.spelling +
@@ -6923,11 +6831,7 @@ private:
       }
       std::string sew = std::to_string(elementSEW);
       std::string suffix =
-          std::string(f32   ? "f32m"
-                      : f16 ? "f16m"
-                      : i8  ? "i8m"
-                            : "u8m") +
-          std::to_string(lmul);
+          std::string(f32 || f16 ? "f" : i8 ? "i" : "u") + shapeSuffix;
       std::string elementCType =
           f32 ? "float" : f16 ? "_Float16" : i8 ? "int8_t" : "uint8_t";
       if (decision->memoryMode == VLAMemoryMode::UnitStride) {
@@ -6964,6 +6868,361 @@ private:
     else
       line("if (" + where.spelling + ") *" + pointer.spelling + " = " +
            value.spelling + ";");
+    return mlir::success();
+  }
+
+  mlir::Value containingVLACoordinate(mlir::Value value) const {
+    mlir::Operation *anchor = value.getDefiningOp();
+    if (!anchor) {
+      auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+      anchor = argument ? argument.getOwner()->getParentOp() : nullptr;
+    }
+    if (!anchor)
+      return {};
+    VLAOp vla = mlir::dyn_cast<VLAOp>(anchor);
+    if (!vla)
+      vla = anchor->getParentOfType<VLAOp>();
+    return vla ? vla.getBody().front().getArgument(0) : mlir::Value{};
+  }
+
+  llvm::SmallVector<mlir::Value> logicalAxesForValue(mlir::Value value) const {
+    llvm::SmallVector<mlir::Value> axes;
+    mlir::Type logicalType = unwrapLogicalValidity(value.getType());
+    bool regionValue = mlir::isa<RegionType>(logicalType);
+    for (int64_t identity : logicalAxisIds(logicalType)) {
+      mlir::Value axis;
+      if (identity > 0) {
+        auto found = kernelFacts.blockAxes.find(identity);
+        if (found != kernelFacts.blockAxes.end())
+          axis = found->second;
+      } else if (regionValue && identity < 0) {
+        axis = containingVLACoordinate(value);
+      }
+      if (axis && !llvm::is_contained(axes, axis))
+        axes.push_back(axis);
+    }
+    return axes;
+  }
+
+  bool valueDependsOnAxis(mlir::Value value, mlir::Value axis) const {
+    auto found = kernelFacts.values.find(value);
+    return found != kernelFacts.values.end() &&
+           llvm::is_contained(found->second.axisDependencies, axis);
+  }
+
+  LoadOp reloadableLoad(mlir::Value value) const {
+    auto found = kernelFacts.values.find(value);
+    return found == kernelFacts.values.end() || !found->second.reloadSource
+               ? LoadOp{}
+               : mlir::dyn_cast<LoadOp>(found->second.reloadSource);
+  }
+
+  const MemoryAccessFact *memoryFact(mlir::Operation *operation) const {
+    auto found = kernelFacts.memory.find(operation);
+    return found == kernelFacts.memory.end() ? nullptr : &found->second;
+  }
+
+  LaneRelation memoryRelation(const MemoryAccessFact &access,
+                              mlir::Value axis) const {
+    auto found = access.axisRelations.find(axis);
+    return found == access.axisRelations.end() ? LaneRelation::Independent
+                                               : found->second;
+  }
+
+  std::optional<StructuredProductFacts>
+  structuredProductFacts(mlir::Value lhs, mlir::Value rhs,
+                         mlir::Value result) const {
+    auto lhsFact = kernelFacts.values.find(lhs);
+    auto rhsFact = kernelFacts.values.find(rhs);
+    auto resultFact = kernelFacts.values.find(result);
+    if (lhsFact == kernelFacts.values.end() ||
+        rhsFact == kernelFacts.values.end() ||
+        resultFact == kernelFacts.values.end())
+      return std::nullopt;
+    StructuredProductFacts facts;
+    facts.lhsAxes = lhsFact->second.logicalAxes;
+    facts.rhsAxes = rhsFact->second.logicalAxes;
+    facts.resultAxes = resultFact->second.logicalAxes;
+    for (mlir::Value axis : facts.lhsAxes) {
+      bool rhsHas = llvm::is_contained(facts.rhsAxes, axis);
+      bool resultHas = llvm::is_contained(facts.resultAxes, axis);
+      if (rhsHas && !resultHas)
+        facts.reductionAxes.push_back(axis);
+      else if (resultHas && !rhsHas)
+        facts.lhsFreeAxes.push_back(axis);
+    }
+    for (mlir::Value axis : facts.rhsAxes) {
+      bool lhsHas = llvm::is_contained(facts.lhsAxes, axis);
+      bool resultHas = llvm::is_contained(facts.resultAxes, axis);
+      if (resultHas && !lhsHas)
+        facts.rhsFreeAxes.push_back(axis);
+    }
+    for (mlir::Value axis : facts.resultAxes) {
+      if (!llvm::is_contained(facts.lhsAxes, axis))
+        facts.lhsBroadcastAxes.push_back(axis);
+      if (!llvm::is_contained(facts.rhsAxes, axis))
+        facts.rhsBroadcastAxes.push_back(axis);
+    }
+    return facts;
+  }
+
+  llvm::SmallVector<VLAValueLifetimeSnapshot>
+  vlaValueLifetimeSnapshots(VLAOp owner) const {
+    mlir::Value coordinate = owner.getBody().front().getArgument(0);
+    llvm::SmallVector<VLAValueLifetimeSnapshot> snapshots;
+    std::function<void(mlir::Block &)> analyzeBlock =
+        [&](mlir::Block &block) {
+      llvm::SmallVector<mlir::Operation *> operations;
+      for (mlir::Operation &operation : block.without_terminator())
+        operations.push_back(&operation);
+      for (mlir::Operation *operation : operations)
+        for (mlir::Region &region : operation->getRegions())
+          for (mlir::Block &nested : region)
+            analyzeBlock(nested);
+      if (operations.empty())
+        return;
+
+      llvm::DenseMap<mlir::Operation *, unsigned> positions;
+      for (auto [position, operation] : llvm::enumerate(operations))
+        positions.try_emplace(operation, static_cast<unsigned>(position));
+      llvm::SmallVector<VLAValueLifetimeSnapshot> blockSnapshots(
+          operations.size());
+      for (const auto &entry : kernelFacts.values) {
+        const ValueUseFact &fact = entry.second;
+        if (!isRegionValue(fact.value.getType()) ||
+            containingVLACoordinate(fact.value) != coordinate)
+          continue;
+        mlir::Type element = elementType(fact.value.getType());
+        enum class Kind { F32, F16, Index, Byte, U32, Mask } kind;
+        if (element.isF32())
+          kind = Kind::F32;
+        else if (isF16(element))
+          kind = Kind::F16;
+        else if (element.isIndex()) {
+          if (classifyLaneRelation(fact.value, coordinate) !=
+              LaneRelation::Indexed)
+            continue;
+          kind = Kind::Index;
+        }
+        else if (element.isSignedInteger(8) ||
+                 element.isUnsignedInteger(8))
+          kind = Kind::Byte;
+        else if (element.isUnsignedInteger(32))
+          kind = Kind::U32;
+        else if (element.isInteger(1))
+          kind = Kind::Mask;
+        else
+          continue;
+        mlir::Operation *definition = fact.value.getDefiningOp();
+        mlir::Block *definitionBlock = definition
+                                           ? definition->getBlock()
+                                           : mlir::cast<mlir::BlockArgument>(
+                                                 fact.value)
+                                                 .getOwner();
+        unsigned begin = 0;
+        bool participates = false;
+        if (definitionBlock == &block) {
+          if (definition) {
+            auto found = positions.find(definition);
+            if (found != positions.end()) {
+              begin = found->second;
+              participates = true;
+            }
+          } else {
+            participates = true;
+          }
+        }
+        unsigned end = begin;
+        for (mlir::Operation *consumer : fact.consumers) {
+          mlir::Operation *anchor = consumer;
+          while (anchor && anchor->getBlock() != &block)
+            anchor = anchor->getParentOp();
+          if (!anchor)
+            continue;
+          participates = true;
+          auto found = positions.find(anchor);
+          end = found == positions.end()
+                    ? static_cast<unsigned>(operations.size() - 1)
+                    : std::max(end, found->second);
+        }
+        if (!participates)
+          continue;
+        for (unsigned position = begin; position <= end; ++position) {
+          VLAValueLifetimeSnapshot &snapshot = blockSnapshots[position];
+          switch (kind) {
+          case Kind::F32:
+            ++snapshot.f32;
+            break;
+          case Kind::F16:
+            ++snapshot.f16;
+            break;
+          case Kind::Index:
+            ++snapshot.index;
+            break;
+          case Kind::Byte:
+            ++snapshot.byte;
+            break;
+          case Kind::U32:
+            ++snapshot.u32;
+            break;
+          case Kind::Mask:
+            ++snapshot.mask;
+            break;
+          }
+        }
+      }
+      snapshots.append(blockSnapshots.begin(), blockSnapshots.end());
+    };
+    analyzeBlock(owner.getBody().front());
+    return snapshots;
+  }
+
+  mlir::LogicalResult analyzeKernelPhysicalFacts() {
+    kernelFacts.blockAxes.clear();
+    kernelFacts.axes.clear();
+    kernelFacts.values.clear();
+    kernelFacts.memory.clear();
+    kernelFacts.operationOrdinals.clear();
+    unsigned ordinal = 0;
+    kernel.walk([&](mlir::Operation *operation) {
+      if (operation != kernel.getOperation())
+        kernelFacts.operationOrdinals.try_emplace(operation, ordinal++);
+    });
+
+    bool failed = false;
+    kernel.walk([&](BlockIndexOp axis) {
+      if (failed)
+        return;
+      LogicalAxisFact fact;
+      fact.coordinate = axis.getResult();
+      fact.lowerBound = axis.getOffset();
+      fact.extent = axis.getExtent();
+      fact.identity = axis.getAxis();
+      for (mlir::Operation *parent = axis->getParentOp();
+           parent && parent != kernel.getOperation();
+           parent = parent->getParentOp())
+        if (mlir::isa<ForOp, WhileOp, IfOp>(parent))
+          fact.orderedParents.push_back(parent);
+      if (!kernelFacts.blockAxes.try_emplace(fact.identity, fact.coordinate)
+               .second ||
+          !kernelFacts.axes.try_emplace(fact.coordinate, std::move(fact))
+               .second) {
+        axis.emitError("logical block axis has multiple physical fact owners");
+        failed = true;
+      }
+    });
+    kernel.walk([&](VLAOp vla) {
+      if (failed)
+        return;
+      LogicalAxisFact fact;
+      fact.coordinate = vla.getBody().front().getArgument(0);
+      fact.lowerBound = vla.getBegin();
+      fact.upperBound = vla.getEnd();
+      fact.vla = true;
+      for (mlir::Operation *parent = vla->getParentOp();
+           parent && parent != kernel.getOperation();
+           parent = parent->getParentOp())
+        if (mlir::isa<ForOp, WhileOp, IfOp>(parent))
+          fact.orderedParents.push_back(parent);
+      if (!kernelFacts.axes.try_emplace(fact.coordinate, std::move(fact)).second) {
+        vla.emitError("VLA axis has multiple physical fact owners");
+        failed = true;
+      }
+    });
+    if (failed)
+      return mlir::failure();
+
+    auto analyzeValue = [&](mlir::Value value) {
+      if (!value || kernelFacts.values.contains(value))
+        return;
+      ValueUseFact fact;
+      fact.value = value;
+      fact.logicalAxes = logicalAxesForValue(value);
+      mlir::Value reloadValue = value;
+      while (auto cast = reloadValue.getDefiningOp<CastOp>()) {
+        if (cast.getInput().getType() != cast.getResult().getType())
+          break;
+        reloadValue = cast.getInput();
+      }
+      if (auto load = reloadValue.getDefiningOp<LoadOp>())
+        fact.reloadSource = load.getOperation();
+      mlir::Block *definitionBlock = nullptr;
+      if (mlir::Operation *definition = value.getDefiningOp()) {
+        definitionBlock = definition->getBlock();
+        fact.definitionOrdinal =
+            kernelFacts.operationOrdinals.lookup(definition);
+      } else if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+        definitionBlock = argument.getOwner();
+        mlir::Operation *parent = definitionBlock->getParentOp();
+        fact.definitionOrdinal =
+            parent ? kernelFacts.operationOrdinals.lookup(parent) : 0;
+        fact.controlCarried =
+            parent && mlir::isa<ForOp, WhileOp, IfOp>(parent);
+      }
+      fact.lastUseOrdinal = fact.definitionOrdinal;
+      for (mlir::OpOperand &use : value.getUses()) {
+        mlir::Operation *consumer = use.getOwner();
+        if (!llvm::is_contained(fact.consumers, consumer))
+          fact.consumers.push_back(consumer);
+        fact.lastUseOrdinal = std::max(
+            fact.lastUseOrdinal,
+            kernelFacts.operationOrdinals.lookup(consumer));
+        fact.crossesRegion |= definitionBlock &&
+                              consumer->getBlock() != definitionBlock;
+        fact.controlCarried |=
+            mlir::isa<YieldOp, ConditionOp>(consumer);
+      }
+      fact.multipleConsumers = fact.consumers.size() > 1;
+      if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+        fact.controlCarried |=
+            mlir::isa<ForOp, WhileOp, IfOp>(result.getOwner());
+      for (const auto &axis : kernelFacts.axes)
+        if (dependsOn(value, axis.first) ||
+            llvm::is_contained(fact.logicalAxes, axis.first))
+          fact.axisDependencies.push_back(axis.first);
+      kernelFacts.values.try_emplace(value, std::move(fact));
+    };
+
+    for (mlir::BlockArgument argument : kernel.getBody().front().getArguments())
+      analyzeValue(argument);
+    kernel.walk([&](mlir::Operation *operation) {
+      for (mlir::Value result : operation->getResults())
+        analyzeValue(result);
+      for (mlir::Region &region : operation->getRegions())
+        for (mlir::Block &block : region)
+          for (mlir::BlockArgument argument : block.getArguments())
+            analyzeValue(argument);
+    });
+
+    kernel.walk([&](mlir::Operation *operation) {
+      mlir::Value pointer;
+      mlir::Value predicate;
+      mlir::Type accessedType;
+      bool write = false;
+      if (auto load = mlir::dyn_cast<LoadOp>(operation)) {
+        pointer = load.getPointer();
+        predicate = load.getWhere();
+        accessedType = elementType(load.getResult().getType());
+      } else if (auto store = mlir::dyn_cast<StoreOp>(operation)) {
+        pointer = store.getPointer();
+        predicate = store.getWhere();
+        accessedType = elementType(store.getValue().getType());
+        write = true;
+      } else {
+        return;
+      }
+      MemoryAccessFact fact;
+      fact.operation = operation;
+      fact.pointer = pointer;
+      fact.root = pointerRoot(pointer);
+      fact.predicate = predicate;
+      fact.elementType = accessedType;
+      fact.write = write;
+      for (const auto &axis : kernelFacts.axes)
+        fact.axisRelations.try_emplace(
+            axis.first, classifyLaneRelation(pointer, axis.first));
+      kernelFacts.memory.try_emplace(operation, std::move(fact));
+    });
     return mlir::success();
   }
 
@@ -7028,12 +7287,10 @@ private:
   }
 
   BlockIndexOp findBlockAxisDefinition(int64_t identity) {
-    BlockIndexOp definition;
-    kernel.walk([&](BlockIndexOp axis) {
-      if (axis.getAxis() == identity)
-        definition = axis;
-    });
-    return definition;
+    auto found = kernelFacts.blockAxes.find(identity);
+    return found == kernelFacts.blockAxes.end()
+               ? BlockIndexOp{}
+               : found->second.getDefiningOp<BlockIndexOp>();
   }
 
   llvm::SmallVector<BlockIndexOp> blockAxesForType(mlir::Type type) {
@@ -7041,7 +7298,10 @@ private:
     for (int64_t identity : logicalAxisIds(type)) {
       if (identity <= 0)
         continue;
-      BlockIndexOp axis = findBlockAxisDefinition(identity);
+      auto found = kernelFacts.blockAxes.find(identity);
+      BlockIndexOp axis = found == kernelFacts.blockAxes.end()
+                              ? BlockIndexOp{}
+                              : found->second.getDefiningOp<BlockIndexOp>();
       if (axis && !llvm::is_contained(axes, axis))
         axes.push_back(axis);
     }
@@ -7252,8 +7512,21 @@ private:
       PlannedPhysicalDecision<MaterializedF32PointwiseDecision> planned(
           std::move(decision));
       initializeEntityPlan(planned.entity);
+      mlir::Value reusedStorage;
+      for (mlir::Value operand : operation->getOperands()) {
+        if (!containsBlockType(operand.getType()) ||
+            materializedF32ElementCount(operand) != elements)
+          continue;
+        auto use = kernelFacts.values.find(operand);
+        if (use == kernelFacts.values.end() || use->second.crossesRegion ||
+            use->second.controlCarried || use->second.consumers.size() != 1 ||
+            use->second.consumers.front() != operation)
+          continue;
+        reusedStorage = operand;
+        break;
+      }
       planned.entity.storages.push_back(PhysicalStorageDecision{
-          result, {}, *elements, 16});
+          result, reusedStorage, *elements, 16});
       if (!physicalPlan.materializedF32Pointwise
                .try_emplace(operation, std::move(planned))
                .second) {
@@ -7733,11 +8006,8 @@ private:
 
   mlir::LogicalResult decideSymmetricI4I8Dot(
       SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
-    bool useIME1 = options.target.hasMatrixExtension(RISCVMatrixExtension::SpacemitIME1);
-    if (useIME1 && options.target.vlenBits != 256)
-      return op.emitError(
-          "SpacemiT IME1 dot requires an explicit 256-bit VLEN target fact");
-    if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
+    bool useIME1 = options.target.supportsSpacemitIME1I4I8N16K32();
+    if (!useIME1 && !options.target.supportsVLENAtLeast(128))
       return op.emitError(
           "symmetric i4/i8 RVV dot requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
@@ -7836,14 +8106,23 @@ private:
         });
     if (storageDecision == selected->second.entity.storages.end() ||
         storageDecision->elements != decision.elements ||
-        storageDecision->reusedStorage ||
         decision.elements <= 0)
       return operation->emitError(
           "materialized pointwise storage decision is incomplete");
 
-    std::string storage = fresh("pointwise_result");
-    line("float " + storage + "[" + std::to_string(decision.elements) +
-         "];");
+    std::string storage;
+    if (storageDecision->reusedStorage) {
+      CValue reused = require(storageDecision->reusedStorage);
+      if (reused.kind != CValueKind::F32BlockStorage ||
+          reused.spelling.empty())
+        return operation->emitError(
+            "materialized pointwise reused storage is unavailable");
+      storage = reused.spelling;
+    } else {
+      storage = fresh("pointwise_result");
+      line("float " + storage + "[" + std::to_string(decision.elements) +
+           "];");
+    }
     std::string lane = fresh("pointwise_lane");
     auto operandAt = [&](mlir::Value value) -> std::optional<std::string> {
       CValue operand = require(value);
@@ -8430,11 +8709,8 @@ private:
 
   mlir::LogicalResult decideAffineI4I8Dot(
       AffineI4I8DotOp op, AffineI4I8Decision &decision) {
-    bool useIME1 = options.target.hasMatrixExtension(RISCVMatrixExtension::SpacemitIME1);
-    if (useIME1 && options.target.vlenBits != 256)
-      return op.emitError(
-          "SpacemiT IME1 dot requires an explicit 256-bit VLEN target fact");
-    if (!useIME1 && (!options.target.hasRVV || options.target.vlenBits < 128))
+    bool useIME1 = options.target.supportsSpacemitIME1I4I8N16K32();
+    if (!useIME1 && !options.target.supportsVLENAtLeast(128))
       return op.emitError(
           "affine i4/i8 RVV dot requires VLEN of at least 128 bits");
     if (!options.target.littleEndian)
@@ -8516,12 +8792,138 @@ private:
     return mlir::success();
   }
 
+  std::optional<F16MatmulPhysicalConfig>
+  selectF16MatmulPhysicalConfig(const F16GemmNTileDecision &logical) const {
+    llvm::SmallVector<unsigned> rowCandidates;
+    if (options.backend.f16RowMicrotile != 0) {
+      rowCandidates.push_back(
+          static_cast<unsigned>(options.backend.f16RowMicrotile));
+    } else {
+      for (unsigned rows = logical.rowTile; rows > 0; --rows)
+        if (logical.rowTile % rows == 0)
+          rowCandidates.push_back(rows);
+      unsigned preferredRows = options.target.vlenBits >= 256
+                                   ? std::min(4u, logical.rowTile)
+                                   : std::min(2u, logical.rowTile);
+      auto preferred = llvm::find(rowCandidates, preferredRows);
+      if (preferred != rowCandidates.end())
+        std::rotate(rowCandidates.begin(), preferred, std::next(preferred));
+    }
+
+    llvm::SmallVector<unsigned> lmulCandidates =
+        integerLMULCandidates(options.target, 16, 4);
+    if (options.backend.f16InputLMUL != 0)
+      lmulCandidates = {
+          static_cast<unsigned>(options.backend.f16InputLMUL)};
+
+    llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
+    if (options.backend.f16KUnroll != 0)
+      unrollCandidates = {
+          static_cast<unsigned>(options.backend.f16KUnroll)};
+
+    llvm::SmallVector<unsigned> stageCandidates = {1, 2};
+    if (options.backend.f16PipelineStages != 0)
+      stageCandidates = {
+          static_cast<unsigned>(options.backend.f16PipelineStages)};
+
+    const unsigned preferredLMUL = 1;
+    const unsigned preferredUnroll = logical.reductionTile >= 32 ? 2 : 1;
+    const unsigned preferredStages =
+        logical.reductionTile >= 32 && options.target.vlenBits >= 256 ? 2 : 1;
+    struct Candidate {
+      F16MatmulPhysicalConfig physical;
+      unsigned tailPenalty = 0;
+      unsigned rowPenalty = 0;
+      unsigned lmulPenalty = 0;
+      unsigned unrollPenalty = 0;
+      unsigned stagePenalty = 0;
+    };
+    llvm::SmallVector<Candidate> legal;
+    for (unsigned rows : rowCandidates) {
+      if (rows == 0 || rows > logical.rowTile ||
+          logical.rowTile % rows != 0)
+        continue;
+      for (unsigned inputLMUL : lmulCandidates) {
+        if (!options.target.supportsVectorShape(
+                16, static_cast<int>(inputLMUL * 8)) ||
+            !options.target.supportsVectorShape(
+                32, static_cast<int>(2 * inputLMUL * 8)))
+          continue;
+        unsigned computeLMUL = 2 * inputLMUL;
+        unsigned lanes = static_cast<unsigned>(
+            options.target.vlenBits * inputLMUL / 16);
+        if (lanes == 0)
+          continue;
+        for (unsigned unroll : unrollCandidates) {
+          if (unroll != 1 && unroll != 2 && unroll != 4)
+            continue;
+          for (unsigned stages : stageCandidates) {
+            if (stages != 1 && stages != 2)
+              continue;
+            if (stages == 2 && unroll < 2)
+              continue;
+            F16MatmulPhysicalConfig physical;
+            physical.rowMicrotile = rows;
+            physical.inputLMUL = inputLMUL;
+            physical.kUnroll = unroll;
+            physical.pipelineStages = stages;
+            physical.loadSchedule =
+                stages == 2
+                    ? F16MatmulLoadSchedule::BatchLoadsThenCompute
+                    : F16MatmulLoadSchedule::StreamRHSThenRows;
+            PhysicalResourceBudget &resources = physical.resources;
+            resources.architecturalGroups = options.target.vectorRegisters;
+            resources.valueGroups = rows * computeLMUL;
+            resources.memoryGroups = 2 * inputLMUL;
+            resources.pipelineGroups =
+                stages == 2 ? 2 * unroll * inputLMUL : 0;
+            unsigned operandGroups = stages == 2
+                                         ? resources.pipelineGroups
+                                         : resources.memoryGroups;
+            resources.primitiveGroups =
+                resources.valueGroups + operandGroups;
+            resources.peakGroups = resources.primitiveGroups + 1;
+            if (resources.peakGroups >
+                static_cast<unsigned>(options.target.vectorRegisters))
+              continue;
+            legal.push_back(Candidate{
+                physical,
+                static_cast<unsigned>(
+                    logical.reductionTile % (unroll * lanes) != 0),
+                static_cast<unsigned>(std::abs(
+                    static_cast<int>(rows) -
+                    static_cast<int>(options.target.vlenBits >= 256
+                                         ? std::min(4u, logical.rowTile)
+                                         : std::min(2u, logical.rowTile)))),
+                static_cast<unsigned>(std::abs(static_cast<int>(inputLMUL) -
+                                               static_cast<int>(preferredLMUL))),
+                static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
+                                               static_cast<int>(preferredUnroll))),
+                static_cast<unsigned>(std::abs(static_cast<int>(stages) -
+                                               static_cast<int>(preferredStages)))});
+          }
+        }
+      }
+    }
+    if (legal.empty())
+      return std::nullopt;
+    llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+      return std::tie(lhs.tailPenalty, lhs.rowPenalty, lhs.lmulPenalty,
+                      lhs.unrollPenalty, lhs.stagePenalty,
+                      lhs.physical.resources.peakGroups) <
+             std::tie(rhs.tailPenalty, rhs.rowPenalty, rhs.lmulPenalty,
+                      rhs.unrollPenalty, rhs.stagePenalty,
+                      rhs.physical.resources.peakGroups);
+    });
+    return legal.front().physical;
+  }
+
   std::optional<PlannedPhysicalDecision<F16GemmNTileDecision>>
   decideF16GemmNTiles(MatmulOp matmul) {
     if (!options.target.hasVectorF16 || !options.target.hasWideningFloat)
       return std::nullopt;
-    LoadOp lhsLoad = traceIdentityCastLoad(matmul.getLhs());
-    LoadOp rhsLoad = traceIdentityCastLoad(matmul.getRhs());
+    LoadOp lhsLoad = reloadableLoad(matmul.getLhs());
+    LoadOp rhsLoad = reloadableLoad(matmul.getRhs());
     auto blockType = [](mlir::Type type) -> BlockType {
       type = unwrapLogicalValidity(type);
       return mlir::dyn_cast<BlockType>(type);
@@ -8542,35 +8944,52 @@ private:
         !matmul.getAccDtype().isF32())
       return std::nullopt;
 
-    llvm::SmallVector<BlockIndexOp> lhsAxes = collectBlockAxes(matmul.getLhs());
-    llvm::SmallVector<BlockIndexOp> rhsAxes = collectBlockAxes(matmul.getRhs());
-    BlockIndexOp lhsRowAxis = findDimensionAxis(matmul.getLhs(), 0, lhsAxes);
-    BlockIndexOp lhsReductionAxis = findDimensionAxis(matmul.getLhs(), 1, lhsAxes);
-    BlockIndexOp rhsReductionAxis = findDimensionAxis(matmul.getRhs(), 0, rhsAxes);
-    BlockIndexOp rhsColumnAxis = findDimensionAxis(matmul.getRhs(), 1, rhsAxes);
-    if (!lhsRowAxis || !lhsReductionAxis || !rhsReductionAxis ||
-        !rhsColumnAxis ||
-        !haveSameLogicalExtent(lhsReductionAxis.getResult(), 0,
-                               rhsReductionAxis.getResult(), 0))
+    std::optional<StructuredProductFacts> product = structuredProductFacts(
+        matmul.getLhs(), matmul.getRhs(), matmul.getResult());
+    if (!product || product->lhsFreeAxes.size() != 1 ||
+        product->rhsFreeAxes.size() != 1 ||
+        product->reductionAxes.size() != 1 ||
+        product->resultAxes.size() != 2)
+      return std::nullopt;
+    BlockIndexOp lhsRowAxis =
+        product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    BlockIndexOp reductionAxis =
+        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
+    BlockIndexOp rhsColumnAxis =
+        product->rhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!lhsRowAxis || !reductionAxis || !rhsColumnAxis)
       return std::nullopt;
     std::optional<int64_t> rowTile =
         physicalExtent(lhsRowAxis.getExtent());
     std::optional<int64_t> columnTile =
         physicalExtent(rhsColumnAxis.getExtent());
     std::optional<int64_t> reductionTile =
-        physicalExtent(lhsReductionAxis.getExtent());
-    std::optional<int64_t> rhsReductionTile =
-        physicalExtent(rhsReductionAxis.getExtent());
+        physicalExtent(reductionAxis.getExtent());
     if (!rowTile || *rowTile <= 0 || *rowTile > 8 || !columnTile ||
-        *columnTile <= 0 || !reductionTile || *reductionTile <= 0 ||
-        reductionTile != rhsReductionTile)
+        *columnTile <= 0 || !reductionTile || *reductionTile <= 0)
+      return std::nullopt;
+    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
+    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
+    if (!lhsAccess || !rhsAccess ||
+        memoryRelation(*lhsAccess, reductionAxis.getResult()) !=
+            LaneRelation::UnitStride ||
+        memoryRelation(*rhsAccess, reductionAxis.getResult()) !=
+            LaneRelation::UnitStride ||
+        memoryRelation(*lhsAccess, lhsRowAxis.getResult()) ==
+            LaneRelation::Independent ||
+        memoryRelation(*lhsAccess, rhsColumnAxis.getResult()) !=
+            LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, rhsColumnAxis.getResult()) ==
+            LaneRelation::Independent ||
+        memoryRelation(*rhsAccess, lhsRowAxis.getResult()) !=
+            LaneRelation::Independent)
       return std::nullopt;
     if (!isContiguousPrefixPredicate(lhsLoad.getWhere(),
                                      lhsRowAxis.getResult()) ||
         !isContiguousPrefixPredicate(lhsLoad.getWhere(),
-                                     lhsReductionAxis.getResult()) ||
+                                     reductionAxis.getResult()) ||
         !isContiguousPrefixPredicate(rhsLoad.getWhere(),
-                                     rhsReductionAxis.getResult()) ||
+                                     reductionAxis.getResult()) ||
         !isContiguousPrefixPredicate(rhsLoad.getWhere(),
                                      rhsColumnAxis.getResult()))
       return std::nullopt;
@@ -8581,56 +9000,20 @@ private:
     decision.lhsLoad = lhsLoad.getOperation();
     decision.rhsLoad = rhsLoad.getOperation();
     decision.lhsRowAxis = lhsRowAxis.getResult();
-    decision.lhsReductionAxis = lhsReductionAxis.getResult();
-    decision.rhsReductionAxis = rhsReductionAxis.getResult();
+    decision.lhsReductionAxis = reductionAxis.getResult();
+    decision.rhsReductionAxis = reductionAxis.getResult();
     decision.rhsColumnAxis = rhsColumnAxis.getResult();
     decision.rowTile = static_cast<unsigned>(*rowTile);
     decision.columnTile = static_cast<unsigned>(*columnTile);
     decision.reductionTile = static_cast<unsigned>(*reductionTile);
-    llvm::SmallVector<unsigned> rowCandidates;
-    if (options.backend.f16RowMicrotile != 0)
-      rowCandidates.push_back(
-          static_cast<unsigned>(options.backend.f16RowMicrotile));
-    else
-      for (unsigned rows = decision.rowTile; rows > 0; --rows)
-        if (decision.rowTile % rows == 0)
-          rowCandidates.push_back(rows);
-    llvm::SmallVector<unsigned> lmulCandidates;
-    if (options.backend.f16InputLMUL != 0)
-      lmulCandidates.push_back(
-          static_cast<unsigned>(options.backend.f16InputLMUL));
-    else
-      lmulCandidates = {1, 2, 4};
-    if (options.backend.f16RowMicrotile == 0 &&
-        options.target.vlenBits < 256 && decision.rowTile % 2 == 0) {
-      auto twoRows = llvm::find(rowCandidates, 2u);
-      if (twoRows != rowCandidates.end())
-        std::rotate(rowCandidates.begin(), twoRows, std::next(twoRows));
-    }
-    std::optional<std::pair<unsigned, unsigned>> selected;
-    for (unsigned inputLMUL : lmulCandidates) {
-      if (inputLMUL != 1 && inputLMUL != 2 && inputLMUL != 4)
-        continue;
-      for (unsigned rows : rowCandidates) {
-        if (rows == 0 || rows > decision.rowTile ||
-            decision.rowTile % rows != 0)
-          continue;
-        unsigned registerGroups = (3 * rows + 1) * inputLMUL;
-        if (2 * inputLMUL <= 8 &&
-            registerGroups + 1 <
-                static_cast<unsigned>(options.target.vectorRegisters)) {
-          selected = std::make_pair(rows, inputLMUL);
-          break;
-        }
-      }
-      if (selected)
-        break;
-    }
+    std::optional<F16MatmulPhysicalConfig> selected =
+        selectF16MatmulPhysicalConfig(decision);
     if (!selected)
       return std::nullopt;
-    unsigned rowMicrotile = selected->first;
-    unsigned inputLMUL = selected->second;
-    unsigned computeLMUL = 2 * selected->second;
+    unsigned rowMicrotile = selected->rowMicrotile;
+    unsigned inputLMUL = selected->inputLMUL;
+    unsigned computeLMUL = 2 * selected->inputLMUL;
+    decision.loadSchedule = selected->loadSchedule;
     if (mlir::failed(selectMaterializedBlockStorage(matmul.getInit(),
                                                    matmul.getOperation())))
       return std::nullopt;
@@ -8646,18 +9029,11 @@ private:
                           PhysicalHandoff::Reload, inputShape, inputShape);
     recordPhysicalHandoff(planned.entity, matmul.getOperation(), matmul.getInit(),
                           PhysicalHandoff::LocalPack, computeShape, computeShape);
-    planned.entity.resources.architecturalGroups =
-        options.target.vectorRegisters;
-    planned.entity.resources.valueGroups =
-        rowMicrotile * computeLMUL;
-    planned.entity.resources.memoryGroups = 2 * inputLMUL;
-    planned.entity.resources.primitiveGroups =
-        (3 * rowMicrotile + 1) * inputLMUL;
-    planned.entity.resources.pipelineGroups = 0;
-    planned.entity.resources.peakGroups =
-        planned.entity.resources.primitiveGroups + 1;
+    planned.entity.resources = selected->resources;
     planned.entity.schedule.stripSchedule = VLAStripSchedule::FullThenTail;
     planned.entity.schedule.microtile = rowMicrotile;
+    planned.entity.schedule.unroll = selected->kUnroll;
+    planned.entity.schedule.pipelineStages = selected->pipelineStages;
     return planned;
   }
 
@@ -8669,7 +9045,15 @@ private:
       return mlir::failure();
     const F16GemmNTileDecision &decision = prepared->second.realization;
     const PhysicalEntityPlan &entity = prepared->second.entity;
+    bool scheduleMismatch =
+        (entity.schedule.pipelineStages == 1 &&
+         decision.loadSchedule !=
+             F16MatmulLoadSchedule::StreamRHSThenRows) ||
+        (entity.schedule.pipelineStages == 2 &&
+         decision.loadSchedule !=
+             F16MatmulLoadSchedule::BatchLoadsThenCompute);
     if (entity.schedule.stripSchedule != VLAStripSchedule::FullThenTail ||
+        scheduleMismatch ||
         entity.resources.peakGroups > entity.resources.architecturalGroups)
       return op.emitError("F16 matmul has no selected K strip schedule");
     auto inputShape = llvm::find_if(
@@ -8758,41 +9142,132 @@ private:
       }
       std::string reduction = fresh("matmul_k");
       std::string vl = fresh("matmul_vl");
+      auto coordinateAt = [&](llvm::StringRef base, unsigned unroll) {
+        return unroll == 0
+                   ? base.str()
+                   : "(" + base.str() + " + " +
+                         std::to_string(unroll) + " * " + vl + ")";
+      };
+      auto emitStreamedChunk = [&](llvm::StringRef coordinate)
+          -> mlir::LogicalResult {
+        std::optional<std::string> rhsPointer =
+            project(rhsLoad.getPointer(), "0", coordinate, column);
+        if (!rhsPointer)
+          return op.emitError("F16 matmul RHS address projection is unavailable");
+        std::string rhsVector = fresh("matmul_rhs");
+        line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+             rhsVector + " = __riscv_vle16_v_f16m" +
+             std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
+             ");");
+        for (unsigned row = 0; row < rowCount; ++row) {
+          std::string rowIndex = std::to_string(rowBase + row);
+          std::optional<std::string> lhsPointer =
+              project(lhsLoad.getPointer(), rowIndex, coordinate, column);
+          if (!lhsPointer)
+            return op.emitError("F16 matmul LHS address projection is unavailable");
+          line("if (" + rowPredicates[row] + ") {");
+          ++indent;
+          std::string lhsVector = fresh("matmul_lhs");
+          line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+               lhsVector + " = __riscv_vle16_v_f16m" +
+               std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
+               ");");
+          line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
+               std::to_string(*computeLMUL) + "_tu(" + accumulators[row] +
+               ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
+          --indent;
+          line("}");
+        }
+        return mlir::success();
+      };
+      auto emitBatchedChunks = [&](llvm::StringRef base, unsigned count)
+          -> mlir::LogicalResult {
+        llvm::SmallVector<std::string> rhsVectors;
+        for (unsigned unroll = 0; unroll < count; ++unroll) {
+          std::string coordinate = coordinateAt(base, unroll);
+          std::optional<std::string> rhsPointer =
+              project(rhsLoad.getPointer(), "0", coordinate, column);
+          if (!rhsPointer)
+            return op.emitError("F16 matmul RHS address projection is unavailable");
+          std::string rhsVector = fresh("matmul_rhs_stage");
+          line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+               rhsVector + " = __riscv_vle16_v_f16m" +
+               std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
+               ");");
+          rhsVectors.push_back(std::move(rhsVector));
+        }
+        for (unsigned row = 0; row < rowCount; ++row) {
+          line("if (" + rowPredicates[row] + ") {");
+          ++indent;
+          llvm::SmallVector<std::string> lhsVectors;
+          for (unsigned unroll = 0; unroll < count; ++unroll) {
+            std::string coordinate = coordinateAt(base, unroll);
+            std::optional<std::string> lhsPointer =
+                project(lhsLoad.getPointer(),
+                        std::to_string(rowBase + row), coordinate, column);
+            if (!lhsPointer)
+              return op.emitError("F16 matmul LHS address projection is unavailable");
+            std::string lhsVector = fresh("matmul_lhs_stage");
+            line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+                 lhsVector + " = __riscv_vle16_v_f16m" +
+                 std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
+                 ");");
+            lhsVectors.push_back(std::move(lhsVector));
+          }
+          for (unsigned unroll = 0; unroll < count; ++unroll)
+            line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
+                 std::to_string(*computeLMUL) + "_tu(" + accumulators[row] +
+                 ", " + lhsVectors[unroll] + ", " + rhsVectors[unroll] +
+                 ", " + vl + ");");
+          --indent;
+          line("}");
+        }
+        return mlir::success();
+      };
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
            activeK + ";) {");
       ++indent;
-      line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
-           std::to_string(*inputLMUL) + "(" + activeK + " - " +
-           reduction + ");");
-      std::optional<std::string> rhsPointer =
-          project(rhsLoad.getPointer(), "0", reduction, column);
-      if (!rhsPointer)
-        return op.emitError("F16 matmul RHS address projection is unavailable");
-      std::string rhsVector = fresh("matmul_rhs");
-      line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-           rhsVector + " = __riscv_vle16_v_f16m" +
-           std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
-           ");");
-      for (unsigned row = 0; row < rowCount; ++row) {
-        std::string rowIndex = std::to_string(rowBase + row);
-        std::optional<std::string> lhsPointer =
-            project(lhsLoad.getPointer(), rowIndex, reduction, column);
-        if (!lhsPointer)
-          return op.emitError("F16 matmul LHS address projection is unavailable");
-        line("if (" + rowPredicates[row] + ") {");
+      if (entity.schedule.unroll == 1) {
+        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+             std::to_string(*inputLMUL) + "(" + activeK + " - " +
+             reduction + ");");
+        if (mlir::failed(emitStreamedChunk(reduction)))
+          return mlir::failure();
+        line(reduction + " += " + vl + ";");
+      } else {
+        std::string remaining = fresh("matmul_remaining");
+        line("const size_t " + remaining + " = " + activeK + " - " +
+             reduction + ";");
+        line("if (" + remaining + " >= " +
+             std::to_string(entity.schedule.unroll) + ") {");
         ++indent;
-        std::string lhsVector = fresh("matmul_lhs");
-        line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-             lhsVector + " = __riscv_vle16_v_f16m" +
-             std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
-             ");");
-        line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
-             std::to_string(*computeLMUL) + "_tu(" + accumulators[row] +
-             ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
+        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+             std::to_string(*inputLMUL) + "(" + remaining + " / " +
+             std::to_string(entity.schedule.unroll) + ");");
+        if (decision.loadSchedule ==
+            F16MatmulLoadSchedule::BatchLoadsThenCompute) {
+          if (mlir::failed(
+                  emitBatchedChunks(reduction, entity.schedule.unroll)))
+            return mlir::failure();
+        } else {
+          for (unsigned unroll = 0; unroll < entity.schedule.unroll; ++unroll)
+            if (mlir::failed(
+                    emitStreamedChunk(coordinateAt(reduction, unroll))))
+              return mlir::failure();
+        }
+        line(reduction + " += " + std::to_string(entity.schedule.unroll) +
+             " * " + vl + ";");
+        --indent;
+        line("} else {");
+        ++indent;
+        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+             std::to_string(*inputLMUL) + "(" + remaining + ");");
+        if (mlir::failed(emitStreamedChunk(reduction)))
+          return mlir::failure();
+        line(reduction + " += " + vl + ";");
         --indent;
         line("}");
       }
-      line(reduction + " += " + vl + ";");
       --indent;
       line("}");
       for (unsigned row = 0; row < rowCount; ++row) {
@@ -9824,14 +10299,20 @@ private:
                         });
   }
 
+  bool supportsBlockByteShape(mlir::Operation *operation,
+                              RVVVectorShape byteShape) const {
+    if (byteShape == kRVVE8MF4)
+      return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
+          operation);
+    return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CompareOp,
+                     CastOp, BitcastOp, DecodeOp, SelectOp, TupleOp,
+                     TupleGetOp>(operation);
+  }
+
   BlockStorePhysicalDecision decideBlockStorePhysical(
       int64_t extent, BlockIndexOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
     bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
-    bool microClosure = llvm::all_of(closure, [](mlir::Operation *operation) {
-      return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
-          operation);
-    });
     llvm::SmallVector<BlockStorePhysicalDecision> candidates;
     candidates.push_back(BlockStorePhysicalDecision{
         BlockStoreRealization::RVVE8MF4MicroStrips,
@@ -9844,9 +10325,15 @@ private:
         kRVVE8M1, 16, needsLaneVector,
         needsLaneVector ? kRVVE16M2 : RVVVectorShape{}});
     for (const BlockStorePhysicalDecision &candidate : candidates) {
+      bool operationsLegal = llvm::all_of(
+          closure, [&](mlir::Operation *operation) {
+            return supportsBlockByteShape(operation, candidate.byteShape);
+          });
+      if (!operationsLegal)
+        continue;
       if (candidate.realization ==
               BlockStoreRealization::RVVE8MF4MicroStrips &&
-          (needsLaneVector || extent != 32 || !microClosure))
+          (needsLaneVector || extent != 32))
         continue;
       if (candidate.realization == BlockStoreRealization::RVVE8M1FixedStrips &&
           (needsLaneVector || extent != 32))
@@ -9866,6 +10353,10 @@ private:
       int64_t extent, BlockIndexOp axis,
       const llvm::DenseSet<mlir::Operation *> &closure) const {
     bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
+    if (!llvm::all_of(closure, [&](mlir::Operation *operation) {
+          return supportsBlockByteShape(operation, kRVVE8M1);
+        }))
+      return BlockReducePhysicalDecision{};
     llvm::SmallVector<BlockReducePhysicalDecision> candidates{
         {BlockReduceRealization::RVVE8M1FixedStrips, 16, false, {}},
         {BlockReduceRealization::RVVE8M1DynamicStrips, 16,
@@ -10548,58 +11039,6 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult emitWideningF16DotStrip(
-      ReduceOp op, const VLAStateDecision &decision, CValue &aggregate) {
-    if (aggregate.kind != CValueKind::F32BlockStorage ||
-        aggregate.spelling.empty())
-      return op.emitError("widening dot accumulator is unavailable");
-    auto lhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.lhsLoad);
-    auto rhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.rhsLoad);
-    if (!lhsLoad || !rhsLoad)
-      return op.emitError("widening dot load facts are unavailable");
-    const PhysicalValueDecision *inputShape =
-        findVLAValueDecision(lhsLoad.getResult());
-    const PhysicalTemporaryDecision *computeShape =
-        findVLATemporaryDecision(op.getOperation());
-    std::optional<unsigned> inputLMUL =
-        inputShape ? rvvIntegerLMUL(inputShape->shape) : std::nullopt;
-    std::optional<unsigned> computeLMUL =
-        computeShape ? rvvIntegerLMUL(computeShape->shape) : std::nullopt;
-    if (!inputShape || !computeShape || !inputLMUL || !computeLMUL)
-      return op.emitError("widening dot physical shape is unavailable");
-    mlir::Value coordinate = activeVLADecision->coordinate;
-    std::optional<std::string> lhs = pointerBase(lhsLoad.getPointer(), coordinate);
-    std::optional<std::string> rhs = pointerBase(rhsLoad.getPointer(), coordinate);
-    if (!lhs || !rhs)
-      return op.emitError("widening dot pointer projection is unavailable");
-    std::string lhsVector = fresh("dot_lhs");
-    std::string rhsVector = fresh("dot_rhs");
-    std::string inputSuffix = "f" + std::to_string(inputShape->shape.sew) +
-                              "m" + std::to_string(*inputLMUL);
-    std::string inputType = "vfloat" + std::to_string(inputShape->shape.sew) +
-                            "m" + std::to_string(*inputLMUL) + "_t";
-    line(inputType + " " + lhsVector + " = __riscv_vle" +
-         std::to_string(inputShape->shape.sew) + "_v_" + inputSuffix + "(" +
-         *lhs + " + " +
-         require(coordinate).spelling + ", " + activeVL + ");");
-    line(inputType + " " + rhsVector + " = __riscv_vle" +
-         std::to_string(inputShape->shape.sew) + "_v_" + inputSuffix + "(" +
-         *rhs + " + " +
-         require(coordinate).spelling + ", " + activeVL + ");");
-    std::string intrinsic =
-        "__riscv_vfwmacc_vv_f" + std::to_string(computeShape->shape.sew) +
-        "m" + std::to_string(*computeLMUL);
-    if (decision.tail == RVVTailPolicy::Undisturbed && !activeVLAFullStrip) {
-      line(aggregate.spelling + " = " + intrinsic + "_tu(" +
-           aggregate.spelling + ", " + lhsVector + ", " + rhsVector + ", " +
-           activeVL + ");");
-    } else {
-      line(aggregate.spelling + " = " + intrinsic + "(" + aggregate.spelling +
-           ", " + lhsVector + ", " + rhsVector + ", " + activeVL + ");");
-    }
-    return mlir::success();
-  }
-
   mlir::LogicalResult emitVectorScan(ScanOp op,
                                      const VLAStateDecision &decision,
                                      const CValue &carry) {
@@ -10621,17 +11060,19 @@ private:
 
     CValue segmentMask;
     CValue segmentValues;
+    std::string segmentShapeSuffix;
     if (segmented) {
       segmentMask = require(decision.segmentStart);
       segmentValues = require(decision.segmentVector);
       const PhysicalValueDecision *segmentShape =
           findVLAValueDecision(decision.segmentVector);
-      std::optional<unsigned> segmentLMUL =
-          segmentShape ? rvvIntegerLMUL(segmentShape->shape) : std::nullopt;
+      segmentShapeSuffix =
+          segmentShape ? rvvShapeSuffix(segmentShape->shape) : std::string{};
       if (segmentMask.kind != CValueKind::Mask ||
           segmentValues.kind != CValueKind::U8Vector ||
           segmentMask.spelling.empty() || segmentValues.spelling.empty() ||
-          !segmentShape || segmentShape->shape.sew != 8 || !segmentLMUL)
+          !segmentShape || segmentShape->shape.sew != 8 ||
+          segmentShapeSuffix.empty())
         return op.emitError("segmented scan start projection is unavailable");
     }
 
@@ -10651,9 +11092,7 @@ private:
     std::string propagatedSegments;
     if (segmented) {
       propagatedSegments = fresh("scan_segments");
-      std::optional<unsigned> segmentLMUL =
-          physicalValueLMUL(decision.segmentVector);
-      line("vuint8m" + std::to_string(*segmentLMUL) + "_t " +
+      line("vuint" + segmentShapeSuffix + "_t " +
            propagatedSegments + " = " + segmentValues.spelling + ";");
     }
     line("for (size_t " + offset + " = 1; " + offset + " < " + activeVL +
@@ -10670,8 +11109,7 @@ private:
          ", (uint32_t)" + offset + ", " + activeVL + ");");
     if (segmented) {
       std::string noSegment = fresh("scan_no_segment");
-      std::string segmentSuffix =
-          "u8m" + std::to_string(*physicalValueLMUL(decision.segmentVector));
+      std::string segmentSuffix = "u" + segmentShapeSuffix;
       std::string segmentMaskSuffix =
           segmentSuffix + "_b" + std::to_string(maskRatio);
       line("vbool" + std::to_string(maskRatio) + "_t " + noSegment +
@@ -10685,10 +11123,8 @@ private:
          ", " + prefix + ", " + shifted + ", " + activeVL + ");");
     if (segmented) {
       std::string shiftedSegments = fresh("scan_shifted_segments");
-      std::string segmentSuffix =
-          "u8m" + std::to_string(*physicalValueLMUL(decision.segmentVector));
-      line("vuint8m" +
-           std::to_string(*physicalValueLMUL(decision.segmentVector)) + "_t " +
+      std::string segmentSuffix = "u" + segmentShapeSuffix;
+      line("vuint" + segmentShapeSuffix + "_t " +
            shiftedSegments + " = __riscv_vslideup_vx_" + segmentSuffix +
            "(" + propagatedSegments + ", " + propagatedSegments + ", " +
            offset + ", " + activeVL + ");");
@@ -12246,12 +12682,9 @@ __weft_online_summary_merge_f32(
 mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
     mlir::ModuleOp module, const RISCVLoweringOptions &options,
     llvm::raw_ostream &output) {
-  if (!options.target.hasRVV)
+  if (!options.target.supportsFixedRVV())
     return module.emitError(
-        "the intrinsic C target requires RVV; no fallback backend is installed");
-  if (options.target.vlenBits <= 0)
-    return module.emitError(
-        "the current intrinsic C target requires an explicit fixed VLEN");
+        "the intrinsic C target requires RVV with an explicit fixed VLEN; no fallback backend is installed");
   bool usesExp = false;
   bool usesLocalI4I8 = false;
   bool usesGroupedI4I8 = false;
@@ -12271,7 +12704,7 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
   module.walk([&](IQ1MI8DotOp) { usesQuantCodebookI8 = true; });
   module.walk([&](Q6KI8DotOp) { usesQuantCodebookI8 = true; });
   bool usesIME1 =
-      usesLocalI4I8 && options.target.hasMatrixExtension(RISCVMatrixExtension::SpacemitIME1);
+      usesLocalI4I8 && options.target.supportsSpacemitIME1I4I8N16K32();
   bool usesRVVI4I8 = usesLocalI4I8 && !usesIME1;
   emitPrelude(output, usesExp, usesRVVI4I8, usesIME1, usesGroupedI4I8,
               usesE2M1E8M0I8, usesQuantCodebookI8,
