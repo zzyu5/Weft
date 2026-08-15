@@ -194,9 +194,18 @@ loop、288-byte block address和最终store仍出现在生成C中。Leaf不遍�
 
 ## Grouped block dot
 
-若persistent Q4_K与Q8_K block已经由caller提供，DSL kernel 显式遍历block并加载四个semantic
-operand，再调用 `W.grouped_affine_i4_i8_dot`。Activation quantization是否计入kernel由 DSL
-ABI决定，target不能在两种scope之间自动切换。
+若Q4_K与Q8_K packed block已经由caller提供，DSL kernel显式声明它们是普通external还是
+persistent storage，并显式遍历block、形成field offset、加载四个semantic operand，再调用
+`W.grouped_affine_i4_i8_dot`。Primitive verifier只检查local operands的type/shape；storage identity、
+packed byte extent和outer pointer relation由外围DSL与`W.storage`负责。Activation quantization是否
+计入kernel由DSL ABI决定，target不能在两种scope之间自动切换。
 
-这三个模式共享packed decode与local dot machinery，但不形成按format分派的
+Target为这一局部语义选择完整的operand shape、decode/reduction组织和exact leaf。VLEN128
+realization使用固定宽局部RVV/asm序列；VLEN256 realization用32-lane nibble decode、signed
+widening multiply和i32 reduction，metadata只解包当前八组scale/minimum。显式VLEN大于128且
+满足shape/resource条件的其他target使用scalable leaf。选择在physical planning中完成，
+intrinsic C生成不再读取VLEN二次分派。
+
+这些模式与IQ2/IQ3/IQ1/Q6 codebook dot共享vector shape、widening、reduction和resource
+machinery，但每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的
 whole-kernel route。

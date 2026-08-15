@@ -8,6 +8,7 @@ void emitRVVIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesRVVSymmetricI4I8,
                              bool usesRVVAffineI4I8,
                              bool usesGroupedI4I8VLEN128,
+                             bool usesGroupedI4I8VLEN256,
                              bool usesGroupedI4I8Scalable,
                              bool usesE2M1VLEN128, bool usesE2M1VLEN256,
                              bool usesE2M1Scalable) {
@@ -410,6 +411,66 @@ __weft_grouped_affine_i4_i8_vl128(
         "v22", "v23", "v24", "v25", "v26", "v27", "v28",
         "v29", "v30", "v31");
   return sum;
+}
+
+)c";
+  }
+  if (usesGroupedI4I8VLEN256) {
+    output << R"c(
+static inline __attribute__((always_inline, unused)) float
+__weft_grouped_affine_i4_i8_vl256(
+    const uint8_t *packed_weight, const uint8_t *scale_min,
+    const uint8_t *activation_bytes, const uint8_t *activation_sum_bytes,
+    float dot_scale, float minimum_scale, float init) {
+  uint8_t scale[8];
+  uint8_t minimum[8];
+  for (size_t group = 0; group < 4; ++group) {
+    scale[group] = scale_min[group] & UINT8_C(63);
+    minimum[group] = scale_min[group + 4] & UINT8_C(63);
+    scale[group + 4] = (scale_min[group + 8] & UINT8_C(15)) |
+                       ((scale_min[group] >> 6) << 4);
+    minimum[group + 4] = (scale_min[group + 8] >> 4) |
+                         ((scale_min[group + 4] >> 6) << 4);
+  }
+
+  const int8_t *activation =
+      (const int8_t *)(const void *)activation_bytes;
+  const int16_t *activation_sum =
+      (const int16_t *)(const void *)activation_sum_bytes;
+  const size_t vl = __riscv_vsetvl_e8m1(32);
+  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+  int32_t weighted_dot = 0;
+  int32_t weighted_minimum = 0;
+  for (size_t pair = 0; pair < 4; ++pair) {
+    const vuint8m1_t packed =
+        __riscv_vle8_v_u8m1(packed_weight + pair * 32, vl);
+    const vint8m1_t low = __riscv_vreinterpret_v_u8m1_i8m1(
+        __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl));
+    const vint8m1_t high = __riscv_vreinterpret_v_u8m1_i8m1(
+        __riscv_vsrl_vx_u8m1(packed, 4, vl));
+    const vint8m1_t activation_low =
+        __riscv_vle8_v_i8m1(activation + pair * 64, vl);
+    const vint8m1_t activation_high =
+        __riscv_vle8_v_i8m1(activation + pair * 64 + 32, vl);
+    const vint16m2_t products_low =
+        __riscv_vwmul_vv_i16m2(low, activation_low, vl);
+    const vint16m2_t products_high =
+        __riscv_vwmul_vv_i16m2(high, activation_high, vl);
+    const int32_t dot_low = __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(products_low, zero, vl));
+    const int32_t dot_high = __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m2_i32m1(products_high, zero, vl));
+    weighted_dot += scale[2 * pair] * dot_low;
+    weighted_dot += scale[2 * pair + 1] * dot_high;
+    weighted_minimum +=
+        minimum[2 * pair] *
+        (activation_sum[4 * pair] + activation_sum[4 * pair + 1]);
+    weighted_minimum +=
+        minimum[2 * pair + 1] *
+        (activation_sum[4 * pair + 2] + activation_sum[4 * pair + 3]);
+  }
+  return init + dot_scale * (float)weighted_dot -
+         minimum_scale * (float)weighted_minimum;
 }
 
 )c";

@@ -163,7 +163,6 @@ struct BlockStoreGroupDecision {
   int64_t extent = 0;
   llvm::SmallVector<mlir::Operation *> stores;
   llvm::SmallVector<mlir::Operation *> closure;
-  llvm::SmallVector<mlir::Operation *> interstitial;
   llvm::SmallVector<BlockOperationDecision> operations;
 };
 
@@ -262,15 +261,15 @@ struct E2M1E8M0I8Decision {
   mlir::Value init;
 };
 
-enum class GroupedAffineI4I8Realization {
-  RVVVLEN128GroupedDot,
-  RVVScalableLocalBlockDot,
-};
-
 struct GroupedAffineI4I8Decision {
   GroupedAffineI4I8Realization realization =
       GroupedAffineI4I8Realization::RVVVLEN128GroupedDot;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  RVVVectorShape packedShape;
+  RVVVectorShape scaleShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape activationSumShape;
+  PhysicalResourceBudget resources;
   LocalBlockMemoryFact packedWeight;
   LocalBlockMemoryFact scaleMin;
   LocalBlockMemoryFact activation;
@@ -2861,26 +2860,36 @@ private:
           !options.target.supportsSegmentVectorMemory(
               2, 32, static_cast<int>(candidate * 8)))
         continue;
-      unsigned stateGroups = 0;
+      unsigned carriedStateGroups = 0;
+      unsigned transientStateGroups = 0;
       for (const VLAStateDecision &state : decision.states) {
         if (state.realization == VLAStateRealization::RVVInclusiveAddScan)
-          stateGroups = std::max(stateGroups, 3 * candidate + 1);
+          transientStateGroups =
+              std::max(transientStateGroups, 3 * candidate + 1);
         else if (state.realization ==
                  VLAStateRealization::RVVSegmentedInclusiveAddScan)
-          stateGroups = std::max(stateGroups, 4 * candidate + 2);
+          transientStateGroups =
+              std::max(transientStateGroups, 4 * candidate + 2);
         else if (state.realization == VLAStateRealization::RVVAddReduction ||
-                 state.realization == VLAStateRealization::RVVMaxReduction)
-          stateGroups = std::max(
-              stateGroups,
-              state.placement == VLAStatePlacement::VectorCarry
-                  ? std::max(2 * candidate, candidate + 2)
-                  : candidate + 2);
-        else if (state.realization == VLAStateRealization::RVVArgMaxSummary)
-          stateGroups = std::max(stateGroups, candidate + 2);
+                 state.realization == VLAStateRealization::RVVMaxReduction) {
+          if (state.placement == VLAStatePlacement::VectorCarry) {
+            carriedStateGroups += candidate;
+            transientStateGroups =
+                std::max(transientStateGroups, std::max(candidate, 2u));
+          } else {
+            transientStateGroups =
+                std::max(transientStateGroups, candidate + 2);
+          }
+        } else if (state.realization ==
+                   VLAStateRealization::RVVArgMaxSummary)
+          transientStateGroups =
+              std::max(transientStateGroups, candidate + 2);
         else if (state.realization ==
                  VLAStateRealization::RVVOnlineSoftmaxSummary)
-          stateGroups = std::max(stateGroups, 3 * candidate + 2);
+          transientStateGroups =
+              std::max(transientStateGroups, 3 * candidate + 2);
       }
+      unsigned stateGroups = carriedStateGroups + transientStateGroups;
       unsigned primitiveGroups = stateGroups;
       for (const VLANarrowDecision &narrow : decision.narrows) {
         const VLANarrowPhysicalConfig &physical =
@@ -2985,7 +2994,6 @@ private:
     entity.vlaIndexShape = selected->indexShape;
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
-    entity.resources.pipelineGroups = 0;
 
     auto regionShape = [&](mlir::Type type) -> RVVVectorShape {
       if (!isRegionValue(type))
@@ -5972,7 +5980,6 @@ private:
     planned.entity.resources.primitiveGroups =
         planned.entity.resources.valueGroups +
         planned.entity.resources.memoryGroups;
-    planned.entity.resources.pipelineGroups = 0;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
     return planned;
@@ -7544,7 +7551,6 @@ private:
 
   void initializeEntityPlan(PhysicalEntityPlan &entity) const {
     entity.resources.architecturalGroups = options.target.vectorRegisters;
-    entity.resources.pipelineGroups = 0;
   }
 
   template <typename Decision>
@@ -7650,21 +7656,19 @@ private:
       GroupedAffineI4I8DotOp op,
       PlannedPhysicalDecision<GroupedAffineI4I8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape shape = kRVVE8M1;
-    recordLocalBlockReloads(
-        planned, op.getOperation(),
-        {planned.realization.packedWeight, planned.realization.scaleMin,
-         planned.realization.activation, planned.realization.activationSum},
-        shape);
-    planned.entity.resources.valueGroups = 4;
-    planned.entity.resources.memoryGroups = 4;
-    planned.entity.resources.primitiveGroups =
-        planned.realization.realization ==
-                GroupedAffineI4I8Realization::RVVVLEN128GroupedDot
-            ? 32
-            : 6;
-    planned.entity.resources.peakGroups =
-        planned.entity.resources.primitiveGroups;
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.packedWeight},
+                            planned.realization.packedShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.scaleMin},
+                            planned.realization.scaleShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.activation},
+                            planned.realization.activationShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.activationSum},
+                            planned.realization.activationSumShape);
+    planned.entity.resources = planned.realization.resources;
   }
 
   template <typename OpTy>
@@ -8173,12 +8177,6 @@ private:
 
   mlir::LogicalResult decideGroupedAffineI4I8Dot(
       GroupedAffineI4I8DotOp op, GroupedAffineI4I8Decision &decision) {
-    if (!options.target.hasRVV || options.target.vlenBits < 128)
-      return op.emitError(
-          "grouped affine i4/i8 dot requires RVV with VLEN of at least 128 bits");
-    if (!options.target.littleEndian)
-      return op.emitError(
-          "grouped affine i4/i8 dot requires the source-declared little-endian fields");
     auto packedWeight = resolveLocalBlockMemoryFact(op.getPackedWeight());
     auto scaleMin = resolveLocalBlockMemoryFact(op.getScaleMin());
     auto activation = resolveLocalBlockMemoryFact(op.getActivation());
@@ -8188,13 +8186,29 @@ private:
       return op.emitError(
           "grouped affine i4/i8 dot requires contiguous all-active local block memory facts");
 
+    std::optional<SelectedGroupedAffineI4I8Physical> selected =
+        selectGroupedAffineI4I8Physical(options.target);
+    if (!selected)
+      return op.emitError(
+          "grouped affine i4/i8 dot has no resource-legal RVV realization for the target");
+
     decision = GroupedAffineI4I8Decision{};
-    if (options.target.vlenBits > 128) {
-      decision.realization =
-          GroupedAffineI4I8Realization::RVVScalableLocalBlockDot;
-      decision.leaf = IntrinsicCLeaf::GroupedAffineI4I8Scalable;
-    } else {
+    decision.realization = selected->realization;
+    decision.packedShape = selected->packedShape;
+    decision.scaleShape = selected->scaleShape;
+    decision.activationShape = selected->activationShape;
+    decision.activationSumShape = selected->activationSumShape;
+    decision.resources = selected->resources;
+    switch (selected->realization) {
+    case GroupedAffineI4I8Realization::RVVVLEN128GroupedDot:
       decision.leaf = IntrinsicCLeaf::GroupedAffineI4I8VLEN128;
+      break;
+    case GroupedAffineI4I8Realization::RVVVLEN256GroupedDot:
+      decision.leaf = IntrinsicCLeaf::GroupedAffineI4I8VLEN256;
+      break;
+    case GroupedAffineI4I8Realization::RVVScalableLocalBlockDot:
+      decision.leaf = IntrinsicCLeaf::GroupedAffineI4I8Scalable;
+      break;
     }
     decision.packedWeight = *packedWeight;
     decision.scaleMin = *scaleMin;
@@ -8234,6 +8248,8 @@ private:
     CValue init = require(decision.init);
     if ((decision.realization !=
              GroupedAffineI4I8Realization::RVVVLEN128GroupedDot &&
+         decision.realization !=
+             GroupedAffineI4I8Realization::RVVVLEN256GroupedDot &&
          decision.realization !=
              GroupedAffineI4I8Realization::RVVScalableLocalBlockDot) ||
         !packed || !scales || !activation || !sums ||
@@ -8286,10 +8302,18 @@ private:
     decision.resources = selected->resources;
     switch (semantic) {
     case QuantI8DotSemantic::IQ2S:
-      decision.leaf = decision.realization ==
-                              QuantI8DotRealization::RVVFixedLaneLocalBlockDot
-                          ? IntrinsicCLeaf::IQ2SI8Fixed
-                          : IntrinsicCLeaf::IQ2SI8Scalable;
+      if (decision.realization ==
+          QuantI8DotRealization::RVVFixedLaneLocalBlockDot) {
+        if (decision.semanticLanes == 32)
+          decision.leaf = IntrinsicCLeaf::IQ2SI8FixedLanes32;
+        else if (decision.semanticLanes == 64)
+          decision.leaf = IntrinsicCLeaf::IQ2SI8FixedLanes64;
+        else
+          return op.emitError(
+              "fixed-lane IQ2_S/i8 dot requires 32 or 64 semantic lanes");
+      } else {
+        decision.leaf = IntrinsicCLeaf::IQ2SI8Scalable;
+      }
       break;
     case QuantI8DotSemantic::IQ3S:
       decision.leaf = IntrinsicCLeaf::IQ3SI8Scalable;
@@ -8301,10 +8325,18 @@ private:
                           : IntrinsicCLeaf::IQ1MI8Scalable;
       break;
     case QuantI8DotSemantic::Q6K:
-      decision.leaf = decision.realization ==
-                              QuantI8DotRealization::RVVFixedLaneLocalBlockDot
-                          ? IntrinsicCLeaf::Q6KI8Fixed
-                          : IntrinsicCLeaf::Q6KI8Scalable;
+      if (decision.realization ==
+          QuantI8DotRealization::RVVFixedLaneLocalBlockDot) {
+        if (decision.semanticLanes == 32)
+          decision.leaf = IntrinsicCLeaf::Q6KI8FixedLanes32;
+        else if (decision.semanticLanes == 64)
+          decision.leaf = IntrinsicCLeaf::Q6KI8FixedLanes64;
+        else
+          return op.emitError(
+              "fixed-lane Q6_K/i8 dot requires 32 or 64 semantic lanes");
+      } else {
+        decision.leaf = IntrinsicCLeaf::Q6KI8Scalable;
+      }
       break;
     }
     for (mlir::Value block : blocks) {
@@ -10138,7 +10170,6 @@ private:
       return op.emitError("block store extent does not match its logical axis");
 
     llvm::SmallVector<StoreOp> stores{op};
-    llvm::SmallVector<mlir::Operation *> interstitial;
 
     BlockStoreGroupDecision decision;
     decision.operation = op.getOperation();
@@ -10154,7 +10185,6 @@ private:
       plannedStores.insert(store.getOperation());
     }
     decision.closure.append(closure.begin(), closure.end());
-    decision.interstitial = std::move(interstitial);
     PlannedPhysicalDecision<BlockStoreGroupDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
@@ -10311,11 +10341,6 @@ private:
     closure.insert(decision.closure.begin(), decision.closure.end());
     llvm::DenseSet<mlir::Operation *> storeOps;
     storeOps.insert(decision.stores.begin(), decision.stores.end());
-    for (mlir::Operation *interstitial : decision.interstitial) {
-      if (mlir::failed(emitOperation(interstitial)))
-        return mlir::failure();
-      consumed.insert(interstitial);
-    }
 
     std::string offset = expression(axis.getOffset());
     if (offset.empty())

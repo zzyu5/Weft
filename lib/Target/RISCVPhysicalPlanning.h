@@ -50,7 +50,6 @@ struct PhysicalResourceBudget {
   unsigned predicateGroups = 0;
   unsigned stateGroups = 0;
   unsigned primitiveGroups = 0;
-  unsigned pipelineGroups = 0;
   unsigned peakGroups = 0;
 };
 
@@ -122,6 +121,25 @@ struct SelectedE2M1E8M0I8Physical {
 
 std::optional<SelectedE2M1E8M0I8Physical>
 selectE2M1E8M0I8Physical(const RISCVTargetProfile &target);
+
+enum class GroupedAffineI4I8Realization {
+  RVVVLEN128GroupedDot,
+  RVVVLEN256GroupedDot,
+  RVVScalableLocalBlockDot,
+};
+
+struct SelectedGroupedAffineI4I8Physical {
+  GroupedAffineI4I8Realization realization =
+      GroupedAffineI4I8Realization::RVVScalableLocalBlockDot;
+  RVVVectorShape packedShape;
+  RVVVectorShape scaleShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape activationSumShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedGroupedAffineI4I8Physical>
+selectGroupedAffineI4I8Physical(const RISCVTargetProfile &target);
 
 enum class F32DotResourceModel {
   VLAFreeAxis,

@@ -88,10 +88,10 @@ for row in W.range(m_begin, m_end, 6):
                 where=row + row_lane < m_end)
 ```
 
-Target从dot、block axis、typed operand以及pointer/access projection选择F32 RVV row
-microtile与LMUL；当前local-row resource model为row6选择LMUL2、row8选择LMUL1，同一个K
-vector供各row accumulator
-复用。该选择不要求enclosing loop
+Target从dot、block axis、typed operand、pointer/access projection、普通uses与target profile
+构造F32 RVV LMUL/K-unroll候选。每个row accumulator、展开后的streamed operands、predicate、
+state与handoff都进入register-group预算；不同VLEN、row tile和K relation因此可以选择不同
+LMUL或unroll，同一个K vector仍供各row accumulator复用。该选择不要求enclosing loop
 形成固定row/column producer shape，所以同一local dot可以位于expert grouping等其他 DSL
 context中。`row step=6` 是当前 DSL kernel 的cache/register blocking选择；它不是`gemm_f32`
 kernel类别，也没有把N/K loop、grouping或matrix layout从target反推回IR。

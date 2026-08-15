@@ -33,6 +33,8 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_ime1_affine_i4_i8_n16_k32";
   case IntrinsicCLeaf::GroupedAffineI4I8VLEN128:
     return "__weft_grouped_affine_i4_i8_vl128";
+  case IntrinsicCLeaf::GroupedAffineI4I8VLEN256:
+    return "__weft_grouped_affine_i4_i8_vl256";
   case IntrinsicCLeaf::GroupedAffineI4I8Scalable:
     return "__weft_grouped_affine_i4_i8_rvv";
   case IntrinsicCLeaf::E2M1E8M0I8VLEN128:
@@ -41,8 +43,10 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_e2m1_e8m0_i8_vl256";
   case IntrinsicCLeaf::E2M1E8M0I8Scalable:
     return "__weft_e2m1_e8m0_i8_rvv";
-  case IntrinsicCLeaf::IQ2SI8Fixed:
-    return "__weft_iq2_s_i8_fixed";
+  case IntrinsicCLeaf::IQ2SI8FixedLanes32:
+    return "__weft_iq2_s_i8_lanes32";
+  case IntrinsicCLeaf::IQ2SI8FixedLanes64:
+    return "__weft_iq2_s_i8_lanes64";
   case IntrinsicCLeaf::IQ2SI8Scalable:
     return "__weft_iq2_s_i8_rvv";
   case IntrinsicCLeaf::IQ3SI8Scalable:
@@ -51,8 +55,10 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_iq1_m_i8_vl128";
   case IntrinsicCLeaf::IQ1MI8Scalable:
     return "__weft_iq1_m_i8_rvv";
-  case IntrinsicCLeaf::Q6KI8Fixed:
-    return "__weft_q6_k_i8_fixed";
+  case IntrinsicCLeaf::Q6KI8FixedLanes32:
+    return "__weft_q6_k_i8_lanes32";
+  case IntrinsicCLeaf::Q6KI8FixedLanes64:
+    return "__weft_q6_k_i8_lanes64";
   case IntrinsicCLeaf::Q6KI8Scalable:
     return "__weft_q6_k_i8_rvv";
   case IntrinsicCLeaf::RVVF32M2Math:

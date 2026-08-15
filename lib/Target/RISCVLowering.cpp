@@ -21,8 +21,7 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
           module, options, bodyOutput, selectedLeaves)))
     return mlir::failure();
   bodyOutput.flush();
-  riscv_internal::emitIntrinsicCPrelude(output, selectedLeaves,
-                                        options.target.vlenBits);
+  riscv_internal::emitIntrinsicCPrelude(output, selectedLeaves);
   output << body;
   return mlir::success();
 }

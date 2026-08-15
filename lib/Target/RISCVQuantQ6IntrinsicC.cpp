@@ -4,11 +4,11 @@
 
 namespace weft::riscv_internal {
 
-void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixed,
-                            bool scalable, int64_t vlenBits) {
-  if (fixed) {
+void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
+                            bool fixedLanes64, bool scalable) {
+  if (fixedLanes64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_fixed(
+__weft_q6_k_i8_lanes64(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -16,9 +16,6 @@ __weft_q6_k_i8_fixed(
       (const int8_t *)(const void *)group_scale_bytes;
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
   const float combined_scale = weight_scale * activation_scale;
- )c";
-    if (vlenBits >= 256) {
-      output << R"c(
     const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
     int32_t integer_sum = 0;
     for (size_t half = 0; half < 2; ++half) {
@@ -93,9 +90,19 @@ __weft_q6_k_i8_fixed(
       integer_sum += __riscv_vmv_x_s_i32m1_i32(sum_3);
     }
     return init + combined_scale * (float)integer_sum;
- )c";
-    } else {
-      output << R"c(
+}
+)c";
+  }
+  if (fixedLanes32) {
+    output << R"c(static inline __attribute__((always_inline, unused)) float
+__weft_q6_k_i8_lanes32(
+    const uint8_t *low_bits, const uint8_t *high_bits,
+    const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
+    float weight_scale, float activation_scale, float init) {
+  const int8_t *group_scales =
+      (const int8_t *)(const void *)group_scale_bytes;
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
+  const float combined_scale = weight_scale * activation_scale;
   const uint8_t *low = low_bits;
   const uint8_t *high = high_bits;
   const int8_t *scale = group_scales;
@@ -196,9 +203,8 @@ __weft_q6_k_i8_fixed(
     q8 += 128;
   }
   return result;
- )c";
-    }
-    output << "}\n\n";
+}
+)c";
   }
   if (scalable) {
     output << R"c(static inline __attribute__((always_inline, unused)) float

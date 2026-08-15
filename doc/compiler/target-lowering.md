@@ -17,7 +17,7 @@
 ```text
 VLA: logical extent, coordinate, predicates, carried state
 memory: pointer relation, element type, alignment, access/effect, validity
-block value: shape, axis identity, dtype, ordinary uses
+block value: shape, axis identity, dtype, definition/last use, ordinary consumers, control carry
 state: reduce/scan/summary algebra and numerical policy
 dot/matmul: operand domains, reduction axis, init/result, dtype
 quant/extension: complete local numerical and byte relation
@@ -35,13 +35,20 @@ Lowering 联合决定：
 - VLA strip schedule、SEW/LMUL、mask 与 state placement；
 - unit/strided/indexed/segment memory；
 - value/register shape 与 share/reload/rematerialize/local-pack handoff；
-- dot/matmul microtile、multiple accumulators、K-unroll、load schedule 与 local pipeline；
+- F32 dot 的 LMUL/K-unroll 与 F16 matmul 的 row microtile、input LMUL、K-unroll、load schedule；
+- F16 matmul 已实现的单阶段 stream 与双阶段 batch-load/compute pipeline；
 - quant decode/register organization；
 - RVV 或 IME fragment 与局部 asm leaf；
 - primitive-private temporary 的大小、alignment 与 resource budget。
 
-每项决定只有一个 producer。资源不足或 target 没有等价实现时立即返回 unsupported，不切换到
-旧 emitter、标量实现或外部函数。
+Resource budget按同一时间活跃的value、memory operand、predicate、loop-carried state、primitive
+temporary与extension fragment组成。多个vector carry会累加占用；只有互不同时存活的瞬态工作
+取峰值。资源不足或target没有等价实现时立即返回unsupported，不切换到旧emitter、标量实现或
+外部函数。
+
+每项决定只有一个 producer。对 fixed-lane codebook dot，semantic lanes、vector shape与最终
+32-lane/64-lane leaf在选择阶段一起确定；对grouped affine i4×i8，VLEN128、VLEN256与scalable
+leaf同样是不同的selected realization。生成阶段不能再从target VLEN推一次helper版本。
 
 ## Intrinsic C 与局部 asm
 

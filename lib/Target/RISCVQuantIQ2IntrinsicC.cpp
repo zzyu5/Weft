@@ -4,9 +4,9 @@
 
 namespace weft::riscv_internal {
 
-void emitIQ2IntrinsicCLeaves(llvm::raw_ostream &output, bool fixed,
-                             bool scalable, int64_t vlenBits) {
-  if (fixed) {
+void emitIQ2IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
+                             bool fixedLanes64, bool scalable) {
+  if (fixedLanes32 || fixedLanes64) {
     output << R"c(static const uint8_t __attribute__((unused))
 __weft_sign_gather_indices_64[64] = {
     0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
@@ -21,16 +21,16 @@ __weft_sign_bit_masks_64[64] = {
     1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
 
 )c";
+  }
+  if (fixedLanes64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq2_s_i8_fixed(
+__weft_iq2_s_i8_lanes64(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
     float activation_scale, float init) {
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
- )c";
-    if (vlenBits >= 256) {
-      output << R"c(
+
     const uint16_t gather_qh[8] = {0, 0, 0, 0, 1, 1, 1, 1};
     const uint16_t shift_qh[8] = {11, 9, 7, 5, 11, 9, 7, 5};
     const vuint16mf2_t gather =
@@ -98,9 +98,17 @@ __weft_iq2_s_i8_fixed(
     }
     return init + 0.125f * (float)integer_sum *
                       weight_scale * activation_scale;
- )c";
-    } else {
-      output << R"c(
+}
+)c";
+  }
+  if (fixedLanes32) {
+    output << R"c(static inline __attribute__((always_inline, unused)) float
+__weft_iq2_s_i8_lanes32(
+    const uint8_t *codes, const uint8_t *high_bits,
+    const uint8_t *sign_bits, const uint8_t *scales,
+    const uint8_t *activation_bytes, float weight_scale,
+    float activation_scale, float init) {
+  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
   const size_t vl32 = __riscv_vsetvl_e8m2(32);
   const vuint8m2_t lane = __riscv_vid_v_u8m2(vl32);
   const vuint8m2_t sign_source_index = __riscv_vsrl_vx_u8m2(lane, 3, vl32);
@@ -143,9 +151,8 @@ __weft_iq2_s_i8_fixed(
     integer_sum += second * (1 + 2 * (scales[group] >> 4));
   }
   return init + 0.125f * (float)integer_sum * weight_scale * activation_scale;
- )c";
-    }
-    output << "}\n\n";
+}
+)c";
   }
   if (scalable) {
     output << R"c(static inline __attribute__((always_inline, unused)) float

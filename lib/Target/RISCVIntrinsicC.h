@@ -25,16 +25,19 @@ enum class IntrinsicCLeaf {
   IME1SymmetricI4I8N16K32,
   IME1AffineI4I8N16K32,
   GroupedAffineI4I8VLEN128,
+  GroupedAffineI4I8VLEN256,
   GroupedAffineI4I8Scalable,
   E2M1E8M0I8VLEN128,
   E2M1E8M0I8VLEN256,
   E2M1E8M0I8Scalable,
-  IQ2SI8Fixed,
+  IQ2SI8FixedLanes32,
+  IQ2SI8FixedLanes64,
   IQ2SI8Scalable,
   IQ3SI8Scalable,
   IQ1MI8Fixed,
   IQ1MI8Scalable,
-  Q6KI8Fixed,
+  Q6KI8FixedLanes32,
+  Q6KI8FixedLanes64,
   Q6KI8Scalable,
 };
 
@@ -58,18 +61,17 @@ void emitRVVIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesRVVSymmetricI4I8,
                              bool usesRVVAffineI4I8,
                              bool usesGroupedI4I8VLEN128,
+                             bool usesGroupedI4I8VLEN256,
                              bool usesGroupedI4I8Scalable,
                              bool usesE2M1VLEN128, bool usesE2M1VLEN256,
                              bool usesE2M1Scalable);
 void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
-                               const SelectedIntrinsicCLeaves &leaves,
-                               int64_t vlenBits);
+                               const SelectedIntrinsicCLeaves &leaves);
 void emitIMEIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesIME1SymmetricI4I8,
                              bool usesIME1AffineI4I8);
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
-                           const SelectedIntrinsicCLeaves &leaves,
-                           int64_t vlenBits);
+                           const SelectedIntrinsicCLeaves &leaves);
 
 } // namespace weft::riscv_internal
 

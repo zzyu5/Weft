@@ -4,7 +4,7 @@ normalization,rms_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hid
 summary_state,softmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,attention[heads=32;Q=128;K=128],full-attention-score-softmax,10,0,64,full,no,,,4.89512e-08,4.02709696e-07,4.520210,115.987532,MElements/s
 dense_dot,gemm_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,16.656145,2.014538,GOP/s
 dense_dot,gemm_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,770.720239,5.572667,GOP/s
-quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,30,0,64,full,no,,,0,0,12.246615,9.589630,GOP/s
+quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-fragment,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,30,0,64,full,no,,,0,0,11.910492,9.860257,GOP/s
 irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,embedding[vocab=128256;hidden=4096];tokens=128,full-embedding-row-decode,10,0,64,full,no,,,0,0,0.906954,,
 memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,4.127589,1.016163,GB/s
 staged_rotation,rope_neox_f32,forward,SG2044,RV64GCV-VLEN128,scalar-trig-plus-RVV-intrinsic-C,tokens=128;heads=32;D=128,full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,1.118295,,
@@ -66,7 +66,7 @@ normalization,rms_norm_worker,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,hid
 summary_state,softmax_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,attention[heads=32;Q=128;K=128],full-attention-score-softmax,10,0,64,full,no,,,2.98362148e-08,3.97185709e-07,8.184400,64.059426,MElements/s
 dense_dot,gemm_worker,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,40.378719,0.830993,GOP/s
 dense_dot,gemm_worker,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,2365.731292,1.815492,GOP/s
-quantized_dot,q4_K_q8_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=14336;K=4096,activation-quantize-plus-local-N16-K32-dot,30,0,64,full,no,,,0,0,128.870178,0.911309,GOP/s
+quantized_dot,q4_K_q8_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-fragment,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,30,0,64,full,no,,,0,0,52.460979,2.238626,GOP/s
 irregular_decode,get_rows_q4_k,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,embedding[vocab=128256;hidden=4096];tokens=128,full-embedding-row-decode,10,0,64,full,no,,,0,0,2.123032,,
 memory_permutation,transpose_f32,forward,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,20.310100,,
 staged_rotation,rope_neox_f32,forward,K1/X60,RV64GCV-VLEN256,scalar-trig-plus-RVV-intrinsic-C,tokens=128;heads=32;D=128,full-rope-transform,10,0,64,full,no,,,1.1920929e-07,1.19208678e-07,4.229585,,

@@ -62,9 +62,9 @@ table；`activation_sum_bytes` 是十六个little-endian signed-i16 activation s
 encoding，用于affine minimum correction。`dot_scale`、`minimum_scale`和`init`都是显式
 numerical operand。
 
-Persistent 144/292-byte block storage、pointer field offset和outer reduction loop由作者拥有；
-primitive不保存这些pointer relation。VLEN、LMUL、register organization与RVV asm spelling
-属于target。
+External或persistent packed-block storage、pointer field offset和outer reduction loop由作者
+拥有；具体byte extent与storage identity由外围DSL和`W.storage`声明，primitive只验证收到的
+四个local block operands。VLEN、LMUL、register organization与RVV asm spelling属于target。
 
 ## Sign-bit × signed-i8 local dot
 
@@ -105,6 +105,18 @@ block scale，code zero采用f32 bit pattern `0x00400000`。Decoded dot乘
 
 External 17-byte MXFP4 packed input block、34-byte Q8_0 block和outer reduction由作者拥有。当前
 VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 reduction。
+
+## Codebook / grouped integer local dot
+
+`W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
+code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
+operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer
+row/block traversal和activation workspace仍在普通Kernel IR中。
+
+Target从typed operands与target profile选择semantic lanes、byte vector shape、reduction segments
+和resource budget。IQ2_S与Q6_K的fixed realization进一步选成明确的32-lane或64-lane leaf；
+scalable realization、IQ3_S与IQ1_M各自选择对应local leaf。Leaf只拼写当前decode/widen/reduce
+序列，不读取kernel名、格式名或外围source closure。
 
 ## Extension 判据
 

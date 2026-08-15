@@ -8,6 +8,7 @@ void emitPrelude(llvm::raw_ostream &output, bool usesExp,
                  bool usesRVVSymmetricI4I8, bool usesRVVAffineI4I8,
                  bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
                  bool usesGroupedI4I8VLEN128,
+                 bool usesGroupedI4I8VLEN256,
                  bool usesGroupedI4I8Scalable,
                  bool usesE2M1VLEN128, bool usesE2M1VLEN256,
                  bool usesE2M1Scalable) {
@@ -57,7 +58,7 @@ __weft_load_f16_le(const uint8_t *bytes) {
 )c";
   emitRVVIntrinsicCLeaves(output, usesRVVSymmetricI4I8,
                           usesRVVAffineI4I8, usesGroupedI4I8VLEN128,
-                          usesGroupedI4I8Scalable,
+                          usesGroupedI4I8VLEN256, usesGroupedI4I8Scalable,
                           usesE2M1VLEN128, usesE2M1VLEN256,
                           usesE2M1Scalable);
   emitIMEIntrinsicCLeaves(output, usesIME1SymmetricI4I8,
@@ -166,8 +167,7 @@ __weft_online_summary_merge_f32(
 }
 
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
-                           const SelectedIntrinsicCLeaves &leaves,
-                           int64_t vlenBits) {
+                           const SelectedIntrinsicCLeaves &leaves) {
   bool usesExp = leaves.contains(IntrinsicCLeaf::RVVF32M2Math);
   bool usesRVVSymmetricI4I8 =
       leaves.contains(IntrinsicCLeaf::RVVSymmetricI4I8N16K32);
@@ -179,6 +179,8 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
       leaves.contains(IntrinsicCLeaf::IME1AffineI4I8N16K32);
   bool usesGroupedI4I8VLEN128 =
       leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8VLEN128);
+  bool usesGroupedI4I8VLEN256 =
+      leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8VLEN256);
   bool usesGroupedI4I8Scalable =
       leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8Scalable);
   bool usesE2M1VLEN128 =
@@ -189,9 +191,10 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
       leaves.contains(IntrinsicCLeaf::E2M1E8M0I8Scalable);
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
-              usesGroupedI4I8VLEN128, usesGroupedI4I8Scalable,
+              usesGroupedI4I8VLEN128, usesGroupedI4I8VLEN256,
+              usesGroupedI4I8Scalable,
               usesE2M1VLEN128, usesE2M1VLEN256, usesE2M1Scalable);
-  emitQuantIntrinsicCLeaves(output, leaves, vlenBits);
+  emitQuantIntrinsicCLeaves(output, leaves);
 }
 
 } // namespace weft::riscv_internal

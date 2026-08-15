@@ -204,6 +204,66 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
   return selected;
 }
 
+std::optional<SelectedGroupedAffineI4I8Physical>
+selectGroupedAffineI4I8Physical(const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasWideningInteger ||
+      target.vlenBits < 128 || !target.littleEndian)
+    return std::nullopt;
+
+  std::optional<RVVVectorShape> scaleShape =
+      rvvShapeForSemanticLanes(8, 12, target);
+  std::optional<RVVVectorShape> activationSumShape =
+      rvvShapeForSemanticLanes(8, 32, target);
+  if (!scaleShape || !activationSumShape)
+    return std::nullopt;
+
+  SelectedGroupedAffineI4I8Physical selected;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.scaleShape = *scaleShape;
+  selected.activationSumShape = *activationSumShape;
+  if (target.vlenBits == 128 && target.supportsVectorShape(8, 8) &&
+      target.supportsVectorShape(16, 16) &&
+      target.supportsVectorShape(32, 8)) {
+    selected.realization =
+        GroupedAffineI4I8Realization::RVVVLEN128GroupedDot;
+    selected.packedShape = RVVVectorShape{8, 8};
+    selected.activationShape = RVVVectorShape{8, 8};
+    selected.resources.primitiveGroups = 32;
+  } else if (target.vlenBits == 256 &&
+             target.supportsVectorShape(8, 8) &&
+             target.supportsVectorShape(16, 16) &&
+             target.supportsVectorShape(32, 8)) {
+    selected.realization =
+        GroupedAffineI4I8Realization::RVVVLEN256GroupedDot;
+    selected.packedShape = RVVVectorShape{8, 8};
+    selected.activationShape = RVVVectorShape{8, 8};
+    selected.resources.primitiveGroups = 8;
+  } else if (target.vlenBits > 128 &&
+             target.supportsVectorShape(8, 8) &&
+             target.supportsVectorShape(16, 16) &&
+             target.supportsVectorShape(32, 8)) {
+    selected.realization =
+        GroupedAffineI4I8Realization::RVVScalableLocalBlockDot;
+    selected.packedShape = RVVVectorShape{8, 8};
+    selected.activationShape = RVVVectorShape{8, 8};
+    selected.resources.primitiveGroups = 6;
+  } else {
+    return std::nullopt;
+  }
+
+  selected.resources.valueGroups =
+      rvvRegisterGroups(selected.packedShape) +
+      rvvRegisterGroups(selected.scaleShape) +
+      rvvRegisterGroups(selected.activationShape) +
+      rvvRegisterGroups(selected.activationSumShape);
+  selected.resources.memoryGroups = selected.resources.valueGroups;
+  selected.resources.peakGroups = selected.resources.primitiveGroups;
+  if (selected.resources.peakGroups >
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
 std::optional<F32DotPhysicalConfig>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
@@ -360,10 +420,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
           resources.architecturalGroups = target.vectorRegisters;
           resources.valueGroups = rows * computeLMUL;
           resources.memoryGroups = 2 * inputLMUL;
-          resources.pipelineGroups =
+          unsigned pipelineGroups =
               stages == 2 ? 2 * unroll * inputLMUL : 0;
           unsigned operandGroups =
-              stages == 2 ? resources.pipelineGroups : resources.memoryGroups;
+              stages == 2 ? pipelineGroups : resources.memoryGroups;
           resources.primitiveGroups = resources.valueGroups + operandGroups;
           resources.peakGroups = resources.primitiveGroups + 1;
           if (resources.peakGroups >

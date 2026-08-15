@@ -26,6 +26,11 @@ PYTHONPATH=python python3 -m weft examples/kernels/elementwise/add_bias.py |
 `weft-compile` 解析并验证 Kernel IR，建立一次 RISC-V 物理决定，然后生成 intrinsic C 与
 C header。没有旧 IR reader、兼容入口、备用 emitter 或 silent scalar 路径。
 
+Kernel body生成前，lowering已经选定每个value/handoff和structured primitive的物理实现，并
+收集本模块实际使用的exact leaf。Prelude只输出这些leaf所需的RVV helper或typed local asm；
+例如32-lane与64-lane codebook dot、VLEN128与VLEN256 grouped dot是不同leaf，不由C生成阶段
+检查VLEN后再分派。
+
 ## C header
 
 C header 直接给出：

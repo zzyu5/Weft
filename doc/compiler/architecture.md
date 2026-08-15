@@ -31,7 +31,7 @@ RISC-V target lowering 拥有：
 
 - VLA strip、`vl`、LMUL、mask 与 memory instruction；
 - value/register shape、handoff、reload、rematerialize 与短期 local pack；
-- dot/matmul microtile、unroll、load schedule 与 local pipeline；
+- dot/matmul microtile、multiple accumulators、K-unroll 与已实现的 load/pipeline schedule；
 - RVV、IME 和其他扩展的局部实现；
 - intrinsic C 与 typed inline asm 的生成。
 
@@ -46,6 +46,23 @@ producer/use 形状选择整段实现。
 
 一个 value 的物理 shape 与每次 handoff 只有一个决定来源。后续生成 intrinsic C 时只能读取
 这些决定，不能再次推导 LMUL、microtile、layout 或 fragment。
+
+## 当前实现的信息流
+
+`RISCVKernelFacts` 从 Kernel IR 记录 axis identity、ordered parent、普通 consumers、definition/last
+use、control carry，以及每次 memory access 相对各轴的 unit/strided/indexed/non-affine relation。
+这些是后续所有实现共同读取的程序事实，不按 example 或量化格式分组。
+
+`RISCVPhysicalPlanning` 根据上述事实、target profile 和显式 backend config 枚举并过滤当前真正
+存在的候选。F32 dot 已有 LMUL 与 K-unroll 候选；F16 matmul 已有 row microtile、input LMUL、
+K-unroll、单/双阶段 load schedule；state、codebook dot、grouped affine dot 与 IME/RVV fragment
+也在这里形成 target-specific 决定和 resource budget。
+
+`RISCVKernelCompiler` 把相连 value 的 selected shape、memory form、state placement、primitive
+realization 与 handoff 组成一次瞬态 physical plan。所有决定准备完成后才生成 kernel body，并同时
+收集实际使用的 exact intrinsic/asm leaf。`RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、
+`RISCVQuant*IntrinsicC` 与 `RISCVIMEIntrinsicC` 只按这组 exact leaf 拼写 helper；它们不再读取
+VLEN、kernel 名或外围 IR 来重新选择实现。
 
 ## 仓库边界
 
