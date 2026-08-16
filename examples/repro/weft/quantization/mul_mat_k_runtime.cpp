@@ -44,6 +44,10 @@ constexpr std::size_t kWeightBlockBytes = 144;
 constexpr std::size_t kWeightBlockBytes = 176;
 #elif WEFT_MUL_MAT_K_KIND == 6
 constexpr std::size_t kWeightBlockBytes = 210;
+#elif WEFT_MUL_MAT_K_KIND == 7
+constexpr std::size_t kWeightBlockBytes = 54;
+#elif WEFT_MUL_MAT_K_KIND == 8
+constexpr std::size_t kWeightBlockBytes = 66;
 #else
 #error "unsupported WEFT_MUL_MAT_K_KIND"
 #endif
@@ -105,8 +109,12 @@ void initializeWeightRow(std::uint8_t *row) {
 #elif WEFT_MUL_MAT_K_KIND == 4 || WEFT_MUL_MAT_K_KIND == 5
     writeHalf(packed, 0.015625F);
     writeHalf(packed + 2, 0.0078125F);
-#else
+#elif WEFT_MUL_MAT_K_KIND == 6
     writeHalf(packed + 208, 0.015625F);
+#elif WEFT_MUL_MAT_K_KIND == 7
+    writeHalf(packed + 52, 0.015625F);
+#else
+    writeHalf(packed + 64, 0.015625F);
 #endif
   }
 }

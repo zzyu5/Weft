@@ -522,7 +522,7 @@ case "${kernel}" in
         ;;
     esac
     ;;
-  mul_mat_q2_K|mul_mat_q3_K|mul_mat_q4_K|mul_mat_q5_K|mul_mat_q6_K)
+  mul_mat_q2_K|mul_mat_q3_K|mul_mat_q4_K|mul_mat_q5_K|mul_mat_q6_K|mul_mat_tq1_0|mul_mat_tq2_0)
     if [[ $# -ne 2 ]]; then
       echo "usage: ${usage_prefix} ${kernel} <decode|prefill> <repetitions>" >&2
       exit 2
@@ -547,6 +547,12 @@ case "${kernel}" in
         ;;
       mul_mat_q6_K)
         runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=6 -DWEFT_MUL_MAT_ENTRY=mul_mat_q6_K -DWEFT_GGML_DOT=ggml_vec_dot_q6_K_q8_K"
+        ;;
+      mul_mat_tq1_0)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=7 -DWEFT_MUL_MAT_ENTRY=mul_mat_tq1_0 -DWEFT_GGML_DOT=ggml_vec_dot_tq1_0_q8_K"
+        ;;
+      mul_mat_tq2_0)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=8 -DWEFT_MUL_MAT_ENTRY=mul_mat_tq2_0 -DWEFT_GGML_DOT=ggml_vec_dot_tq2_0_q8_K"
         ;;
     esac
     ;;
