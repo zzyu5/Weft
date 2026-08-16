@@ -1870,10 +1870,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   if (config.parameters.f16KUnroll != 0)
     unrollCandidates = {
         static_cast<unsigned>(config.parameters.f16KUnroll)};
-  llvm::SmallVector<unsigned> depthCandidates = {1, 2};
-  if (config.parameters.f16PipelineDepth != 0)
-    depthCandidates = {
-        static_cast<unsigned>(config.parameters.f16PipelineDepth)};
+  llvm::SmallVector<unsigned> bufferCandidates = {1, 2};
+  if (config.parameters.f16LoadBufferCount != 0)
+    bufferCandidates = {
+        static_cast<unsigned>(config.parameters.f16LoadBufferCount)};
 
   llvm::SmallVector<unsigned> columnCandidates;
   if (config.parameters.f16ColumnMicrotile != 0) {
@@ -1888,7 +1888,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   const unsigned preferredLMUL = 1;
   const unsigned preferredUnroll =
       facts.reductionTile < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
-  const unsigned preferredDepth = facts.reductionTile >= 64 ? 2 : 1;
+  const unsigned preferredBuffers = facts.reductionTile >= 64 ? 2 : 1;
   const unsigned preferredColumns =
       baseInputLanes <= 8 && facts.columnTile >= 2 &&
               facts.columnTile % 2 == 0
@@ -1903,7 +1903,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     unsigned columnPenalty = 0;
     unsigned lmulPenalty = 0;
     unsigned unrollPenalty = 0;
-    unsigned stagePenalty = 0;
+    unsigned bufferPenalty = 0;
   };
   llvm::SmallVector<Candidate> legal;
   for (unsigned rows : rowCandidates) {
@@ -1927,28 +1927,32 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
       for (unsigned unroll : unrollCandidates) {
         if (unroll != 1 && unroll != 2 && unroll != 4)
           continue;
-        for (unsigned depth : depthCandidates) {
-          if ((depth != 1 && depth != 2) || (depth == 2 && unroll < 2))
+        for (unsigned buffers : bufferCandidates) {
+          if ((buffers != 1 && buffers != 2) ||
+              (buffers == 2 && unroll < 2))
             continue;
           F16MatmulParameters parameters;
           parameters.rowMicrotile = rows;
           parameters.columnMicrotile = columns;
           parameters.inputLMUL = inputLMUL;
           parameters.kUnroll = unroll;
-          parameters.pipelineDepth = depth;
-          parameters.loadLookahead = depth == 2 ? 1 : 0;
+          parameters.loadBufferCount = buffers;
           DenseLoadSchedule loadSchedule =
-              depth == 2 ? DenseLoadSchedule::DoubleBuffered
-                         : DenseLoadSchedule::Streamed;
+              buffers == 2 ? DenseLoadSchedule::RegisterDoubleBuffered
+                           : DenseLoadSchedule::Streamed;
           std::optional<PhysicalResourceBudget> resources =
               calculateDenseMicrokernelResources(
                   {rvvShape(16, inputLMUL), rvvShape(32, computeLMUL),
                    rows * columns,
-                   loadSchedule == DenseLoadSchedule::DoubleBuffered ? rows
-                                                                      : 1,
+                   loadSchedule ==
+                           DenseLoadSchedule::RegisterDoubleBuffered
+                       ? rows
+                       : 1,
                    columns,
-                   loadSchedule == DenseLoadSchedule::DoubleBuffered ? 2u
-                                                                      : 1u},
+                   loadSchedule ==
+                           DenseLoadSchedule::RegisterDoubleBuffered
+                       ? 2u
+                       : 1u},
                   target);
           if (!resources)
             continue;
@@ -1968,8 +1972,9 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                                              static_cast<int>(preferredLMUL))),
               static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
                                              static_cast<int>(preferredUnroll))),
-              static_cast<unsigned>(std::abs(static_cast<int>(depth) -
-                                             static_cast<int>(preferredDepth)))});
+              static_cast<unsigned>(std::abs(
+                  static_cast<int>(buffers) -
+                  static_cast<int>(preferredBuffers)))});
       }
     }
   }
@@ -1980,11 +1985,11 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
     return std::tie(lhs.tailPenalty, lhs.rowPenalty, lhs.columnPenalty,
                     lhs.lmulPenalty,
-                    lhs.unrollPenalty, lhs.stagePenalty,
+                    lhs.unrollPenalty, lhs.bufferPenalty,
                     lhs.resources.peakGroups) <
            std::tie(rhs.tailPenalty, rhs.rowPenalty, rhs.columnPenalty,
                     rhs.lmulPenalty,
-                    rhs.unrollPenalty, rhs.stagePenalty,
+                    rhs.unrollPenalty, rhs.bufferPenalty,
                     rhs.resources.peakGroups);
   });
   return SelectedF16MatmulPhysical{

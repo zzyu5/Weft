@@ -886,7 +886,7 @@ enum class DenseVectorOrganization {
 
 enum class DenseLoadSchedule {
   Streamed,
-  DoubleBuffered,
+  RegisterDoubleBuffered,
 };
 
 struct DenseMicrokernelResourceFacts {
@@ -945,8 +945,7 @@ struct F16MatmulParameters {
   unsigned columnMicrotile = 1;
   unsigned inputLMUL = 1;
   unsigned kUnroll = 1;
-  unsigned pipelineDepth = 1;
-  unsigned loadLookahead = 0;
+  unsigned loadBufferCount = 1;
 };
 
 struct F16MatmulCandidateFacts {

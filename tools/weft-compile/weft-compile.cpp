@@ -65,9 +65,10 @@ llvm::cl::opt<int64_t> f16KUnroll(
     "f16-k-unroll",
     llvm::cl::desc("Requested F16 matmul K unroll; zero selects"),
     llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16PipelineDepth(
-    "f16-pipeline-depth",
-    llvm::cl::desc("Requested F16 matmul register pipeline depth; zero selects"),
+llvm::cl::opt<int64_t> f16LoadBufferCount(
+    "f16-load-buffer-count",
+    llvm::cl::desc(
+        "Requested F16 matmul register load buffers: zero selects, one or two"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> reductionStatePlacement(
     "reduction-state-placement",
@@ -163,7 +164,7 @@ int main(int argc, char **argv) {
     options.backend.parameters.f16RowMicrotile = f16RowMicrotile;
     options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;
     options.backend.parameters.f16KUnroll = f16KUnroll;
-    options.backend.parameters.f16PipelineDepth = f16PipelineDepth;
+    options.backend.parameters.f16LoadBufferCount = f16LoadBufferCount;
     options.backend.structures.reductionStatePlacement = reductionStatePlacement;
     options.backend.structures.i4I8FragmentImplementation =
         i4I8FragmentImplementation;

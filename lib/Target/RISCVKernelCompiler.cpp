@@ -9093,8 +9093,8 @@ private:
           llvm::SmallVector<std::string> lhs;
           llvm::SmallVector<std::string> rhs;
         };
-        auto emitDoubleBufferedChunks = [&](llvm::StringRef base,
-                                             unsigned count)
+        auto emitRegisterBufferedChunks = [&](llvm::StringRef base,
+                                               unsigned count)
             -> mlir::LogicalResult {
           RegisterLoadBank banks[2];
           const std::string inputType =
@@ -9163,7 +9163,7 @@ private:
           if (mlir::failed(loadBank(0, coordinateAt(base, 0))))
             return mlir::failure();
           for (unsigned step = 0; step < count; ++step) {
-            const unsigned next = step + physical.loadLookahead;
+            const unsigned next = step + 1;
             if (next < count &&
                 mlir::failed(loadBank(next % 2, coordinateAt(base, next))))
               return mlir::failure();
@@ -9192,9 +9192,10 @@ private:
           line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
                std::to_string(*inputLMUL) + "(" + remaining + " / " +
                std::to_string(physical.kUnroll) + ");");
-          if (decision.loadSchedule == DenseLoadSchedule::DoubleBuffered) {
+          if (decision.loadSchedule ==
+              DenseLoadSchedule::RegisterDoubleBuffered) {
             if (mlir::failed(
-                    emitDoubleBufferedChunks(reduction, physical.kUnroll)))
+                    emitRegisterBufferedChunks(reduction, physical.kUnroll)))
               return mlir::failure();
           } else {
             for (unsigned unroll = 0; unroll < physical.kUnroll; ++unroll)
