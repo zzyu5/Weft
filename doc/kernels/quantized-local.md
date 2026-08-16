@@ -228,10 +228,11 @@ persistent storage，并显式遍历block、形成field offset、加载四个sem
 packed byte extent和outer pointer relation由外围DSL与`W.storage`负责。Activation quantization是否
 计入kernel由DSL ABI决定，target不能在两种scope之间自动切换。
 
-Target为这一局部语义选择完整的operand shape、decode/reduction组织和exact leaf。VLEN128
-realization使用固定宽局部RVV/asm序列；VLEN256 realization用32-lane nibble decode、signed
-widening multiply和i32 reduction，metadata只解包当前八组scale/minimum。显式VLEN大于128且
-满足shape/resource条件的其他target使用scalable leaf。选择在physical planning中完成，
+Target为这一局部语义选择实际被handoff和emission消费的operand shape、exact leaf与resource
+budget。Decode/reduction的具体局部序列属于该leaf本身，不另存一份未被消费的topology决定。
+VLEN128 realization使用固定宽局部RVV/asm序列；VLEN256 realization用32-lane nibble decode、
+signed widening multiply和i32 reduction，metadata只解包当前八组scale/minimum。显式VLEN大于
+128且满足shape/resource条件的其他target使用scalable leaf。选择在physical planning中完成，
 intrinsic C生成不再读取VLEN二次分派。
 
 这些模式与IQ2/IQ3/IQ1/Q6 codebook dot共享vector shape、indexed gather、widening、reduction
@@ -246,3 +247,7 @@ Packed three-bit grouped-scale关系通过`W.packed_i3_grouped_i8_dot`进入既�
 physical family，不由target从普通bitwise/reduce closure中猜测。
 每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel
 route。
+
+Quant resource facts只记录真实loaded/index/temporary value的shape与multiplicity，以及predicate
+占用；不存在未实现的carried-resource维度。跨loop accumulator、workspace与persistent object仍
+由DSL kernel和普通lifetime facts拥有，不能用quant helper内的假资源字段代替。

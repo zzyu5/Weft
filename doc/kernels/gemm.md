@@ -88,10 +88,12 @@ for row in W.range(m_begin, m_end, 6):
                 where=row + row_lane < m_end)
 ```
 
-Target从dot、block axis、typed operand、pointer/access projection、普通uses与target profile
-构造F32 RVV LMUL/K-unroll候选。每个row accumulator、展开后的streamed operands、predicate、
-state与handoff都进入register-group预算；不同VLEN、row tile和K relation因此可以选择不同
-LMUL或unroll，同一个K vector仍供各row accumulator复用。该选择不要求enclosing loop
+Target先从dot的typed axis facts确定structure：lhs拥有VLA free axis时选择VLA vector-dot，rhs
+拥有VLA free axis时选择VLA microtile，两侧均无VLA free axis时选择local-row microkernel；这不是
+由example或外围loop名称给出的family标签。随后在该structure内构造F32 RVV LMUL/K-unroll实例。
+每个row accumulator、展开后的streamed operands、predicate、state与per-consumer handoff都进入
+register-group预算；不同VLEN、row tile和K relation因此可以选择不同LMUL或unroll，同一个K
+vector仍供各row accumulator复用。该选择不要求enclosing loop
 形成固定row/column producer shape，所以同一local dot可以位于expert grouping等其他 DSL
 context中。`row step=6` 是当前 DSL kernel 的cache/register blocking选择；它不是`gemm_f32`
 kernel类别，也没有把N/K loop、grouping或matrix layout从target反推回IR。

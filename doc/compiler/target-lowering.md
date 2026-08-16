@@ -28,6 +28,12 @@ producer 集合、精确 operation 数量、one-use、direct-store、邻接关�
 一个纯 producer 是否可安全 fusion/rematerialize 可以读取其普通 uses，但增加另一个 consumer
 不能让原 primitive 失去合法实现。
 
+Facts先形成唯一的轴、memory relation、validity和legality推导，再构造结构候选。Dense dot的
+structure直接由free-axis事实决定：lhs拥有VLA free axis时是VLA vector-dot，rhs拥有VLA free
+axis时是VLA microtile，两侧均无VLA free axis时是local-row microkernel；两侧同时拥有VLA
+free axis则当前target明确unsupported。Structure确定后才实例化LMUL、K-unroll、microtile与
+load schedule等参数。
+
 ## 瞬态物理决定
 
 Lowering 联合决定：
@@ -41,6 +47,11 @@ Lowering 联合决定：
 - RVV 或 IME fragment 与局部 asm leaf；
 - primitive-private temporary 的大小、alignment 与 resource budget。
 
+Segment memory的selected record同时保存access kind、field count、element SEW、coordinate
+scale与最终vector shape。VLA state直接保存同一个`SelectedVLAStatePhysical`，其中包含carry
+representation、strip update、finalize与whole-VLA lifetime；entity resource planning与emitter
+都消费这份结果，不再拆出第二份state resource schema。
+
 Resource budget按同一时间活跃的value、memory operand、predicate、loop-carried state、primitive
 temporary与extension fragment组成。多个vector carry会累加占用；只有互不同时存活的瞬态工作
 取峰值。资源不足或target没有等价实现时立即返回unsupported，不切换到旧emitter、标量实现或
@@ -49,6 +60,9 @@ temporary与extension fragment组成。多个vector carry会累加占用；只�
 每项决定只有一个 producer。对 fixed-lane codebook dot，semantic lanes、vector shape与最终
 32-lane/64-lane leaf在选择阶段一起确定；对grouped affine i4×i8，VLEN128、VLEN256与scalable
 leaf同样是不同的selected realization。生成阶段不能再从target VLEN推一次helper版本。
+
+每个consumer对每个value只能有一条handoff记录。若handoff kind、source shape或result shape
+发生冲突，physical plan直接非法；emitter不从C value当前拼写反推新的转换方式。
 
 ## Intrinsic C 与局部 asm
 

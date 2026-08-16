@@ -44,8 +44,21 @@ Target lowering 逐个读取 VLA、memory、predicate、state、dot/matmul、dec
 它不能先判断完整 kernel 属于哪一类，也不能用 kernel 名、格式 route、外围 loop 数量或精确
 producer/use 形状选择整段实现。
 
-一个 value 的物理 shape 与每次 handoff 只有一个决定来源。后续生成 intrinsic C 时只能读取
-这些决定，不能再次推导 LMUL、microtile、layout 或 fragment。
+一次 target lowering 内部只有以下信息流，不产生新的持久 IR：
+
+```text
+typed program/target facts
+→ 唯一合法性与轴关系推导
+→ structural implementation candidates
+→ parameter instances 与 resource filtering
+→ selected physical decisions
+→ intrinsic C / typed local asm
+```
+
+一个 value 的 physical shape 只有一个决定来源；每个 `(consumer, value)` 也只有一个 handoff。
+重复记录若在 Share/Convert/Reload/Rematerialize/LocalPack、source shape 或 result shape 上冲突，
+lowering 必须在 emission 前失败。生成 intrinsic C 时只能读取 selected decisions，不能再次推导
+LMUL、microtile、layout、fragment、table width 或 pipeline。
 
 ## 当前实现的信息流
 
@@ -54,15 +67,17 @@ use、control carry，以及每次 memory access 相对各轴的 unit/strided/in
 这些是后续所有实现共同读取的程序事实，不按 example 或量化格式分组。
 
 `RISCVPhysicalPlanning` 根据上述事实、target profile 和显式 backend config 枚举并过滤当前真正
-存在的候选。F32 dot 已有 LMUL 与 K-unroll 候选；F16 matmul 已有 row microtile、input LMUL、
-K-unroll、单/双阶段 load schedule；state、codebook dot、grouped affine dot 与 IME/RVV fragment
-也在这里形成 target-specific 决定和 resource budget。
+存在的候选。F32 dot 先由 lhs/rhs free-axis identity 推导 VLA vector-dot、VLA microtile 或 local-row
+structure，再枚举 LMUL 与 K-unroll；F16 matmul枚举 row/column microtile、input LMUL、K-unroll与
+单/双 register-load buffer。State直接携带选定的carry、strip update、finalize和lifetime；quant与
+RVV/IME local leaf只保存后续handoff/emission实际消费的operand shape、leaf和resource budget。
 
 `RISCVKernelCompiler` 把相连 value 的 selected shape、memory form、state placement、primitive
 realization 与 handoff 组成一次瞬态 physical plan。所有决定准备完成后才生成 kernel body，并同时
 收集实际使用的 exact intrinsic/asm leaf。`RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、
 `RISCVQuant*IntrinsicC` 与 `RISCVIMEIntrinsicC` 只按这组 exact leaf 拼写 helper；它们不再读取
-VLEN、kernel 名或外围 IR 来重新选择实现。
+VLEN、kernel 名或外围 IR 来重新选择实现。Segment memory的field count、element SEW、coordinate
+scale与最终vector shape也在plan中确定，emitter不再从pointer pattern重新推导。
 
 ## 仓库边界
 

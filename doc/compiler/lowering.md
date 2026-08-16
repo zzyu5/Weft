@@ -3,7 +3,8 @@
 ## Python DSL kernel 到 Kernel IR
 
 ```bash
-PYTHONPATH=python python3 -m weft examples/kernels/elementwise/add_bias.py
+PYTHONPATH=python python3 -m weft \
+  examples/kernels/elementwise/binary.py --kernel add_f32
 ```
 
 包含多个 `@weft.kernel` 时使用 `--kernel NAME` 选择一个 entry。`W.constexpr` 参数在生成
@@ -12,7 +13,8 @@ intrinsic C 前用 `--meta=NAME=INTEGER` 绑定。
 ## Kernel IR 到 intrinsic C
 
 ```bash
-PYTHONPATH=python python3 -m weft examples/kernels/elementwise/add_bias.py |
+PYTHONPATH=python python3 -m weft \
+  examples/kernels/elementwise/binary.py --kernel add_f32 |
   build/tools/weft-compile/weft-compile \
     --emit=intrinsic-c \
     --march=rv64gcv_zfh_zvfh \
@@ -23,11 +25,13 @@ PYTHONPATH=python python3 -m weft examples/kernels/elementwise/add_bias.py |
     -o /tmp/kernel.c
 ```
 
-`weft-compile` 解析并验证 Kernel IR，建立一次 RISC-V 物理决定，然后生成 intrinsic C 与
-C header。没有旧 IR reader、兼容入口、备用 emitter 或 silent scalar 路径。
+`weft-compile`解析并验证Kernel IR，收集typed facts，完成唯一合法性推导、结构候选、参数实例、
+target/resource过滤与selected physical decisions，然后生成intrinsic C与C header。没有旧IR
+reader、兼容入口、备用emitter或silent scalar路径。
 
-Kernel body生成前，lowering已经选定每个value/handoff和structured primitive的物理实现，并
-收集本模块实际使用的exact leaf。Prelude只输出这些leaf所需的RVV helper或typed local asm；
+Kernel body生成前，lowering已经选定每个value shape、每个`(consumer,value)` handoff、segment
+field/SEW/shape、VLA state与structured primitive的物理实现，并收集本模块实际使用的exact leaf。
+Prelude只输出这些leaf所需的RVV helper或typed local asm；
 例如32-lane与64-lane codebook dot、VLEN128与VLEN256 grouped dot是不同leaf，不由C生成阶段
 检查VLEN后再分派。
 
