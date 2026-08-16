@@ -865,6 +865,7 @@ case "${kernel}" in
       exit 2
     fi
     dsl=examples/kernels/quantization/mxfp4.py
+    dsl_entry=mxfp4_q8_0
     runtime=examples/repro/weft/quantization/mxfp4_runtime.cpp
     ;;
   nvfp4_q8_0)
