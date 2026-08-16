@@ -491,6 +491,16 @@ case "${kernel}" in
     runtime=examples/repro/weft/dot/blocked_gemm_f32_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
+  mul_mat_q4_0)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} mul_mat_q4_0 <decode|prefill> <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/mul_mat.py
+    dsl_entry=mul_mat_q4_0
+    runtime=examples/repro/weft/quantization/mul_mat_q4_0_runtime.cpp
+    runtime_arguments=("$1" "$2")
+    ;;
   mul_mat_id)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} mul_mat_id" >&2

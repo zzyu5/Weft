@@ -61,12 +61,8 @@ def load_q8(qs, logical_index):
     )
 
 
-@weft.kernel
-def q4_0_q8_0(
-    x: W.ptr[W.u8, W.readonly],
-    y: W.ptr[W.u8, W.readonly],
-    blocks: W.index,
-) -> W.f32:
+@W.helper(effects=("read",))
+def q4_0_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(18)
@@ -84,6 +80,15 @@ def q4_0_q8_0(
         scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
         result += W.cast(integer_sum, W.f32) * scale
     return result
+
+
+@weft.kernel
+def q4_0_q8_0(
+    x: W.ptr[W.u8, W.readonly],
+    y: W.ptr[W.u8, W.readonly],
+    blocks: W.index,
+) -> W.f32:
+    return q4_0_row_dot(x, y, blocks)
 
 
 @weft.kernel
