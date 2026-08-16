@@ -452,6 +452,9 @@ enum class VLADotInitRealization {
 struct VLADotDecision {
   mlir::Operation *operation = nullptr;
   F32DotStructure structure = F32DotStructure::RVVVLAMicrotile;
+  DenseVectorOrganization vectorOrganization =
+      DenseVectorOrganization::ReductionAxis;
+  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
   mlir::Operation *lhsLoad = nullptr;
   mlir::Operation *rhsLoad = nullptr;
   mlir::Operation *freeLoad = nullptr;
@@ -594,14 +597,18 @@ struct F16GemmNTileDecision {
   unsigned rowTile = 4;
   unsigned columnTile = 8;
   unsigned reductionTile = 64;
-  F16MatmulStructure structure =
-      F16MatmulStructure::StreamedRegisterMicrokernel;
+  DenseVectorOrganization vectorOrganization =
+      DenseVectorOrganization::ReductionAxis;
+  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
   F16MatmulParameters physical;
 };
 
 struct DotDecision {
   mlir::Operation *operation = nullptr;
   F32DotStructure structure = F32DotStructure::RVVLocalRowMicrokernel;
+  DenseVectorOrganization vectorOrganization =
+      DenseVectorOrganization::ReductionAxis;
+  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
   mlir::Operation *lhsLoad = nullptr;
   mlir::Operation *rhsLoad = nullptr;
   mlir::Value rowAxis;
@@ -1902,6 +1909,8 @@ private:
     decision.lhsPredicateVariesByReduction =
         valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
     decision.structure = physical->structure;
+    decision.vectorOrganization = physical->vectorOrganization;
+    decision.loadSchedule = physical->loadSchedule;
     decision.physical = physical->parameters;
     decision.resources = physical->resources;
     retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
@@ -2036,6 +2045,8 @@ private:
     decision.initRealization =
         VLADotInitRealization::MaterializedRegion;
     decision.structure = physical->structure;
+    decision.vectorOrganization = physical->vectorOrganization;
+    decision.loadSchedule = physical->loadSchedule;
     decision.physical = physical->parameters;
     decision.resources = physical->resources;
     retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
@@ -5876,6 +5887,8 @@ private:
       return mlir::failure();
     }
     decision.structure = physical->structure;
+    decision.vectorOrganization = physical->vectorOrganization;
+    decision.loadSchedule = physical->loadSchedule;
     decision.physical = physical->parameters;
     RVVVectorShape computeShape = rvvShape(32, physical->parameters.lmul);
     for (mlir::Value value :
@@ -9034,7 +9047,8 @@ private:
       return std::nullopt;
     unsigned inputLMUL = selected->parameters.inputLMUL;
     unsigned computeLMUL = 2 * selected->parameters.inputLMUL;
-    decision.structure = selected->structure;
+    decision.vectorOrganization = selected->vectorOrganization;
+    decision.loadSchedule = selected->loadSchedule;
     decision.physical = selected->parameters;
     if (mlir::failed(selectMaterializedBlockStorage(matmul.getInit(),
                                                    matmul.getOperation())))
@@ -9222,58 +9236,85 @@ private:
           }
           return mlir::success();
         };
-        auto emitBatchedChunks = [&](llvm::StringRef base, unsigned count)
+        struct RegisterLoadBank {
+          llvm::SmallVector<std::string> lhs;
+          llvm::SmallVector<std::string> rhs;
+        };
+        auto emitDoubleBufferedChunks = [&](llvm::StringRef base,
+                                             unsigned count)
             -> mlir::LogicalResult {
-          llvm::SmallVector<std::string> rhsVectors;
-          for (unsigned unroll = 0; unroll < count; ++unroll) {
-            std::string coordinate = coordinateAt(base, unroll);
-            for (llvm::StringRef column : groupColumns) {
-              std::optional<std::string> rhsPointer =
-                  project(rhsLoad.getPointer(), "0", coordinate, column);
+          RegisterLoadBank banks[2];
+          const std::string inputType =
+              "vfloat16m" + std::to_string(*inputLMUL) + "_t";
+          for (unsigned bank = 0; bank < 2; ++bank) {
+            for (unsigned row = 0; row < rowCount; ++row) {
+              banks[bank].lhs.push_back(fresh("matmul_lhs_bank"));
+              line(inputType + " " + banks[bank].lhs.back() + ";");
+            }
+            for (unsigned column = 0; column < groupColumns.size(); ++column) {
+              banks[bank].rhs.push_back(fresh("matmul_rhs_bank"));
+              line(inputType + " " + banks[bank].rhs.back() + ";");
+            }
+          }
+          auto loadBank = [&](unsigned bank, llvm::StringRef coordinate)
+              -> mlir::LogicalResult {
+            for (unsigned column = 0; column < groupColumns.size(); ++column) {
+              std::optional<std::string> rhsPointer = project(
+                  rhsLoad.getPointer(), "0", coordinate, groupColumns[column]);
               if (!rhsPointer)
                 return op.emitError(
                     "F16 matmul RHS address projection is unavailable");
-              std::string rhsVector = fresh("matmul_rhs_stage");
-              line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-                   rhsVector + " = __riscv_vle16_v_f16m" +
+              line(banks[bank].rhs[column] + " = __riscv_vle16_v_f16m" +
                    std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
                    ");");
-              rhsVectors.push_back(std::move(rhsVector));
             }
-          }
-          for (unsigned row = 0; row < rowCount; ++row) {
-            line("if (" + anyRowPredicate(row) + ") {");
-            ++indent;
-            llvm::SmallVector<std::string> lhsVectors;
-            for (unsigned unroll = 0; unroll < count; ++unroll) {
-              std::string coordinate = coordinateAt(base, unroll);
+            for (unsigned row = 0; row < rowCount; ++row) {
               std::optional<std::string> lhsPointer = project(
                   lhsLoad.getPointer(), std::to_string(rowBase + row),
                   coordinate, groupColumns.front());
               if (!lhsPointer)
                 return op.emitError(
                     "F16 matmul LHS address projection is unavailable");
-              std::string lhsVector = fresh("matmul_lhs_stage");
-              line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-                   lhsVector + " = __riscv_vle16_v_f16m" +
+              line("if (" + anyRowPredicate(row) + ")");
+              ++indent;
+              line(banks[bank].lhs[row] + " = __riscv_vle16_v_f16m" +
                    std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
                    ");");
-              lhsVectors.push_back(std::move(lhsVector));
+              --indent;
+              line("else");
+              ++indent;
+              line(banks[bank].lhs[row] + " = __riscv_vfmv_v_f_f16m" +
+                   std::to_string(*inputLMUL) + "(0.0f, " + vl + ");");
+              --indent;
             }
-            for (unsigned unroll = 0; unroll < count; ++unroll)
+            return mlir::success();
+          };
+          auto computeBank = [&](unsigned bank) {
+            for (unsigned row = 0; row < rowCount; ++row) {
+              line("if (" + anyRowPredicate(row) + ") {");
+              ++indent;
               for (unsigned column = 0; column < groupColumns.size(); ++column) {
                 unsigned index = flatIndex(row, column);
                 line("if (" + rowPredicates[index] + ")");
                 ++indent;
                 line(accumulators[index] + " = __riscv_vfwmacc_vv_f32m" +
                      std::to_string(*computeLMUL) + "_tu(" +
-                     accumulators[index] + ", " + lhsVectors[unroll] + ", " +
-                     rhsVectors[unroll * groupColumns.size() + column] + ", " +
-                     vl + ");");
+                     accumulators[index] + ", " + banks[bank].lhs[row] + ", " +
+                     banks[bank].rhs[column] + ", " + vl + ");");
                 --indent;
               }
-            --indent;
-            line("}");
+              --indent;
+              line("}");
+            }
+          };
+          if (mlir::failed(loadBank(0, coordinateAt(base, 0))))
+            return mlir::failure();
+          for (unsigned step = 0; step < count; ++step) {
+            const unsigned next = step + physical.loadLookahead;
+            if (next < count &&
+                mlir::failed(loadBank(next % 2, coordinateAt(base, next))))
+              return mlir::failure();
+            computeBank(step % 2);
           }
           return mlir::success();
         };
@@ -9298,9 +9339,9 @@ private:
           line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
                std::to_string(*inputLMUL) + "(" + remaining + " / " +
                std::to_string(physical.kUnroll) + ");");
-          if (decision.structure ==
-              F16MatmulStructure::PipelinedRegisterMicrokernel) {
-            if (mlir::failed(emitBatchedChunks(reduction, physical.kUnroll)))
+          if (decision.loadSchedule == DenseLoadSchedule::DoubleBuffered) {
+            if (mlir::failed(
+                    emitDoubleBufferedChunks(reduction, physical.kUnroll)))
               return mlir::failure();
           } else {
             for (unsigned unroll = 0; unroll < physical.kUnroll; ++unroll)

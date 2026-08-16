@@ -1462,6 +1462,35 @@ selectGroupedAffineI4I8Physical(
   return selected;
 }
 
+std::optional<PhysicalResourceBudget>
+calculateDenseMicrokernelResources(
+    const DenseMicrokernelResourceFacts &facts,
+    const RISCVTargetProfile &target) {
+  if (!facts.inputShape || !facts.accumulatorShape ||
+      facts.accumulatorVectors == 0 || facts.loadWindow == 0 ||
+      !target.supportsVectorShape(facts.inputShape.sew,
+                                  facts.inputShape.lmulEighths) ||
+      !target.supportsVectorShape(facts.accumulatorShape.sew,
+                                  facts.accumulatorShape.lmulEighths))
+    return std::nullopt;
+  PhysicalResourceBudget resources;
+  resources.architecturalGroups = target.vectorRegisters;
+  resources.valueGroups =
+      facts.accumulatorVectors * rvvRegisterGroups(facts.accumulatorShape);
+  resources.memoryGroups =
+      (facts.lhsVectorsPerWindow + facts.rhsVectorsPerWindow) *
+      facts.loadWindow * rvvRegisterGroups(facts.inputShape);
+  resources.predicateGroups = facts.predicateGroups;
+  resources.stateGroups = facts.stateGroups;
+  resources.primitiveGroups = resources.valueGroups + resources.memoryGroups;
+  resources.peakGroups = resources.primitiveGroups + resources.predicateGroups +
+                         resources.stateGroups + facts.handoffGroups + 1;
+  if (resources.peakGroups >
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return resources;
+}
+
 std::optional<SelectedF32DotPhysical>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
@@ -1509,26 +1538,19 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     for (unsigned unroll : unrollCandidates) {
       if (!legalUnroll(unroll))
         continue;
-      unsigned accumulatorGroups = facts.rowTile * lmul;
       unsigned streamedOperands =
           std::max(1u, facts.unitStrideOperands + facts.stridedOperands +
                            facts.indexedOperands);
-      unsigned memoryGroups = streamedOperands * unroll * lmul;
-      unsigned primitiveGroups = accumulatorGroups + memoryGroups;
-      unsigned peakGroups = primitiveGroups + facts.predicateGroups +
-                            facts.stateGroups + facts.handoffGroups + 1;
-      if (peakGroups > static_cast<unsigned>(target.vectorRegisters))
+      std::optional<PhysicalResourceBudget> resources =
+          calculateDenseMicrokernelResources(
+              {vectorShape, vectorShape, facts.rowTile, streamedOperands, 0,
+               unroll, facts.predicateGroups, facts.stateGroups,
+               facts.handoffGroups},
+              target);
+      if (!resources)
         continue;
-      PhysicalResourceBudget resources;
-      resources.architecturalGroups = target.vectorRegisters;
-      resources.valueGroups = accumulatorGroups;
-      resources.memoryGroups = memoryGroups;
-      resources.predicateGroups = facts.predicateGroups;
-      resources.stateGroups = facts.stateGroups;
-      resources.primitiveGroups = primitiveGroups;
-      resources.peakGroups = peakGroups;
       legal.push_back(Candidate{
-          F32DotParameters{lmul, unroll}, resources,
+          F32DotParameters{lmul, unroll}, *resources,
           static_cast<unsigned>(facts.reductionExtent &&
                                 *facts.reductionExtent % unroll != 0),
           facts.stridedOperands * unroll +
@@ -1538,7 +1560,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                                          static_cast<int>(desiredLanes))),
           static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
                                          static_cast<int>(preferredUnroll))),
-          peakGroups});
+          resources->peakGroups});
     }
   }
   if (legal.empty())
@@ -1554,8 +1576,16 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
           ? F32DotStructure::RVVLocalRowMicrokernel
           : facts.vlaVectorFreeAxis ? F32DotStructure::RVVVLAVectorDot
                                     : F32DotStructure::RVVVLAMicrotile;
-  return SelectedF32DotPhysical{structure, legal.front().parameters,
-                                legal.front().resources};
+  const DenseVectorOrganization vectorOrganization =
+      structure == F32DotStructure::RVVVLAVectorDot
+          ? DenseVectorOrganization::FreeMAxis
+          : structure == F32DotStructure::RVVVLAMicrotile
+                ? DenseVectorOrganization::FreeNAxis
+                : DenseVectorOrganization::ReductionAxis;
+  return SelectedF32DotPhysical{
+      structure, vectorOrganization, DenseLoadSchedule::Streamed,
+      legal.front().parameters,
+      legal.front().resources};
 }
 
 std::optional<SelectedF16MatmulPhysical>
@@ -1593,10 +1623,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   if (config.parameters.f16KUnroll != 0)
     unrollCandidates = {
         static_cast<unsigned>(config.parameters.f16KUnroll)};
-  llvm::SmallVector<unsigned> stageCandidates = {1, 2};
-  if (config.parameters.f16PipelineStages != 0)
-    stageCandidates = {
-        static_cast<unsigned>(config.parameters.f16PipelineStages)};
+  llvm::SmallVector<unsigned> depthCandidates = {1, 2};
+  if (config.parameters.f16PipelineDepth != 0)
+    depthCandidates = {
+        static_cast<unsigned>(config.parameters.f16PipelineDepth)};
 
   llvm::SmallVector<unsigned> columnCandidates;
   if (config.parameters.f16ColumnMicrotile != 0) {
@@ -1611,14 +1641,14 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   const unsigned preferredLMUL = 1;
   const unsigned preferredUnroll =
       facts.reductionTile < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
-  const unsigned preferredStages = 1;
+  const unsigned preferredDepth = facts.reductionTile >= 64 ? 2 : 1;
   const unsigned preferredColumns =
       baseInputLanes <= 8 && facts.columnTile >= 2 &&
               facts.columnTile % 2 == 0
           ? 2
           : 1;
   struct Candidate {
-    F16MatmulStructure structure;
+    DenseLoadSchedule loadSchedule;
     F16MatmulParameters parameters;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
@@ -1650,34 +1680,35 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
       for (unsigned unroll : unrollCandidates) {
         if (unroll != 1 && unroll != 2 && unroll != 4)
           continue;
-        for (unsigned stages : stageCandidates) {
-          if ((stages != 1 && stages != 2) || (stages == 2 && unroll < 2))
+        for (unsigned depth : depthCandidates) {
+          if ((depth != 1 && depth != 2) || (depth == 2 && unroll < 2))
             continue;
           F16MatmulParameters parameters;
           parameters.rowMicrotile = rows;
           parameters.columnMicrotile = columns;
           parameters.inputLMUL = inputLMUL;
           parameters.kUnroll = unroll;
-          parameters.pipelineStages = stages;
-          PhysicalResourceBudget resources;
-          resources.architecturalGroups = target.vectorRegisters;
-          resources.valueGroups = rows * columns * computeLMUL;
-          resources.memoryGroups = (1 + columns) * inputLMUL;
-          unsigned pipelineGroups =
-              stages == 2 ? (1 + columns) * unroll * inputLMUL : 0;
-          unsigned operandGroups =
-              stages == 2 ? pipelineGroups : resources.memoryGroups;
-          resources.primitiveGroups = resources.valueGroups + operandGroups;
-          resources.peakGroups = resources.primitiveGroups + 1;
-          if (resources.peakGroups >
-              static_cast<unsigned>(target.vectorRegisters))
+          parameters.pipelineDepth = depth;
+          parameters.loadLookahead = depth == 2 ? 1 : 0;
+          DenseLoadSchedule loadSchedule =
+              depth == 2 ? DenseLoadSchedule::DoubleBuffered
+                         : DenseLoadSchedule::Streamed;
+          std::optional<PhysicalResourceBudget> resources =
+              calculateDenseMicrokernelResources(
+                  {rvvShape(16, inputLMUL), rvvShape(32, computeLMUL),
+                   rows * columns,
+                   loadSchedule == DenseLoadSchedule::DoubleBuffered ? rows
+                                                                      : 1,
+                   columns,
+                   loadSchedule == DenseLoadSchedule::DoubleBuffered ? 2u
+                                                                      : 1u},
+                  target);
+          if (!resources)
             continue;
           legal.push_back(Candidate{
-              stages == 2
-                  ? F16MatmulStructure::PipelinedRegisterMicrokernel
-                  : F16MatmulStructure::StreamedRegisterMicrokernel,
+              loadSchedule,
               parameters,
-              resources,
+              *resources,
               static_cast<unsigned>(facts.reductionTile % (unroll * lanes) !=
                                     0),
               static_cast<unsigned>(std::abs(
@@ -1690,8 +1721,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                                              static_cast<int>(preferredLMUL))),
               static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
                                              static_cast<int>(preferredUnroll))),
-              static_cast<unsigned>(std::abs(static_cast<int>(stages) -
-                                             static_cast<int>(preferredStages)))});
+              static_cast<unsigned>(std::abs(static_cast<int>(depth) -
+                                             static_cast<int>(preferredDepth)))});
       }
     }
   }
@@ -1709,9 +1740,9 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.unrollPenalty, rhs.stagePenalty,
                     rhs.resources.peakGroups);
   });
-  return SelectedF16MatmulPhysical{legal.front().structure,
-                                  legal.front().parameters,
-                                  legal.front().resources};
+  return SelectedF16MatmulPhysical{
+      DenseVectorOrganization::ReductionAxis, legal.front().loadSchedule,
+      legal.front().parameters, legal.front().resources};
 }
 
 } // namespace weft::riscv_internal

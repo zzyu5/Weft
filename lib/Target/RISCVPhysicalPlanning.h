@@ -799,6 +799,34 @@ enum class F32DotStructure {
   RVVLocalRowMicrokernel,
 };
 
+enum class DenseVectorOrganization {
+  ReductionAxis,
+  FreeMAxis,
+  FreeNAxis,
+};
+
+enum class DenseLoadSchedule {
+  Streamed,
+  DoubleBuffered,
+};
+
+struct DenseMicrokernelResourceFacts {
+  RVVVectorShape inputShape;
+  RVVVectorShape accumulatorShape;
+  unsigned accumulatorVectors = 0;
+  unsigned lhsVectorsPerWindow = 0;
+  unsigned rhsVectorsPerWindow = 0;
+  unsigned loadWindow = 1;
+  unsigned predicateGroups = 0;
+  unsigned stateGroups = 0;
+  unsigned handoffGroups = 0;
+};
+
+std::optional<PhysicalResourceBudget>
+calculateDenseMicrokernelResources(
+    const DenseMicrokernelResourceFacts &facts,
+    const RISCVTargetProfile &target);
+
 struct F32DotParameters {
   unsigned lmul = 1;
   unsigned kUnroll = 1;
@@ -821,6 +849,9 @@ struct F32DotCandidateFacts {
 
 struct SelectedF32DotPhysical {
   F32DotStructure structure = F32DotStructure::RVVLocalRowMicrokernel;
+  DenseVectorOrganization vectorOrganization =
+      DenseVectorOrganization::ReductionAxis;
+  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
   F32DotParameters parameters;
   PhysicalResourceBudget resources;
 };
@@ -830,17 +861,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config);
 
-enum class F16MatmulStructure {
-  StreamedRegisterMicrokernel,
-  PipelinedRegisterMicrokernel,
-};
-
 struct F16MatmulParameters {
   unsigned rowMicrotile = 1;
   unsigned columnMicrotile = 1;
   unsigned inputLMUL = 1;
   unsigned kUnroll = 1;
-  unsigned pipelineStages = 1;
+  unsigned pipelineDepth = 1;
+  unsigned loadLookahead = 0;
 };
 
 struct F16MatmulCandidateFacts {
@@ -850,8 +877,9 @@ struct F16MatmulCandidateFacts {
 };
 
 struct SelectedF16MatmulPhysical {
-  F16MatmulStructure structure =
-      F16MatmulStructure::StreamedRegisterMicrokernel;
+  DenseVectorOrganization vectorOrganization =
+      DenseVectorOrganization::ReductionAxis;
+  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
   F16MatmulParameters parameters;
   PhysicalResourceBudget resources;
 };
