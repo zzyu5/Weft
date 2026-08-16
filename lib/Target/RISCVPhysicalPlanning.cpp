@@ -849,11 +849,13 @@ selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
 
 std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
-                           const RISCVTargetProfile &target) {
-  if (!target.littleEndian || (facts.rowTile != 1 && facts.rowTile != 4))
+                           const RISCVTargetProfile &target,
+                           const RISCVBackendConfig &config) {
+  if (!target.littleEndian || (facts.rowTile != 1 && facts.rowTile != 4) ||
+      config.structures.i4I8FragmentImplementation < 0 ||
+      config.structures.i4I8FragmentImplementation > 2)
     return std::nullopt;
-  SelectedI4I8FragmentPhysical selected;
-  const bool ime =
+  const bool supportsIME =
       facts.rowTile == 4
           ? target.supportsSpacemitIME1I4I8M4N16K32()
           : target.supportsSpacemitIME1I4I8N16K32();
@@ -863,42 +865,67 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       target.supportsVectorShape(8, 8) &&
       target.supportsVectorShape(16, 16) &&
       target.supportsVectorShape(32, 32);
-  if (!ime && !supportsRVV)
-    return std::nullopt;
+  struct Candidate {
+    SelectedI4I8FragmentPhysical physical;
+    unsigned instructionCost = 0;
+  };
+  llvm::SmallVector<Candidate> candidates;
+  auto appendCandidate = [&](LocalImplementationStructure structure,
+                             unsigned instructionCost) {
+    const bool ime =
+        structure == LocalImplementationStructure::SpacemitIME1Fragment;
+    if ((ime && !supportsIME) || (!ime && !supportsRVV))
+      return;
+    SelectedI4I8FragmentPhysical selected;
+    selected.implementation.primitive =
+        facts.affine ? LocalPrimitiveKind::AffineI4I8
+                     : LocalPrimitiveKind::SymmetricI4I8;
+    selected.implementation.structure = structure;
+    selected.implementation.parameters.rowMicrotile = facts.rowTile;
+    selected.implementation.parameters.semanticLanes = 16;
+    selected.codeShape = kRVVE8M1;
+    selected.activationScaleShape = kRVVE32M1;
+    selected.accumulatorShape = kRVVE32M4;
+    selected.implementation.parameters.primaryShape = selected.codeShape;
+    selected.implementation.parameters.secondaryShape =
+        selected.accumulatorShape;
+    if (!selectLocalImplementationLeaf(selected.implementation))
+      return;
+    for (RVVVectorShape shape : {selected.codeShape,
+                                 selected.activationScaleShape,
+                                 selected.accumulatorShape})
+      if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
+        return;
 
-  selected.implementation.primitive =
-      facts.affine ? LocalPrimitiveKind::AffineI4I8
-                   : LocalPrimitiveKind::SymmetricI4I8;
-  selected.implementation.structure =
-      ime ? LocalImplementationStructure::SpacemitIME1Fragment
-          : LocalImplementationStructure::RVVRegisterMicrokernel;
-  selected.implementation.parameters.rowMicrotile = facts.rowTile;
-  selected.implementation.parameters.semanticLanes = 16;
-  selected.codeShape = kRVVE8M1;
-  selected.activationScaleShape = kRVVE32M1;
-  selected.accumulatorShape = kRVVE32M4;
-  selected.implementation.parameters.primaryShape = selected.codeShape;
-  selected.implementation.parameters.secondaryShape =
-      selected.accumulatorShape;
-  if (!selectLocalImplementationLeaf(selected.implementation))
+    selected.resources.architecturalGroups = target.vectorRegisters;
+    selected.resources.valueGroups = facts.rowTile == 4 ? 20 : 4;
+    selected.resources.memoryGroups = facts.rowTile == 4 ? 5 : 2;
+    selected.resources.primitiveGroups =
+        ime ? 28 : facts.rowTile == 4 ? (facts.affine ? 25 : 24)
+                                      : (facts.affine ? 13 : 12);
+    selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
+    if (selected.resources.peakGroups >=
+        static_cast<unsigned>(target.vectorRegisters))
+      return;
+    candidates.push_back(Candidate{std::move(selected), instructionCost});
+  };
+  appendCandidate(LocalImplementationStructure::RVVRegisterMicrokernel,
+                  facts.rowTile == 4 ? 16 : 4);
+  appendCandidate(LocalImplementationStructure::SpacemitIME1Fragment, 1);
+  const int64_t requested = config.structures.i4I8FragmentImplementation;
+  if (requested != 0)
+    llvm::erase_if(candidates, [&](const Candidate &candidate) {
+      const bool ime = candidate.physical.implementation.structure ==
+                       LocalImplementationStructure::SpacemitIME1Fragment;
+      return requested == 1 ? ime : !ime;
+    });
+  if (candidates.empty())
     return std::nullopt;
-  for (RVVVectorShape shape : {selected.codeShape,
-                               selected.activationScaleShape,
-                               selected.accumulatorShape})
-    if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
-      return std::nullopt;
-
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups = facts.rowTile == 4 ? 20 : 4;
-  selected.resources.memoryGroups = facts.rowTile == 4 ? 5 : 2;
-  selected.resources.primitiveGroups =
-      ime ? 28 : facts.rowTile == 4 ? (facts.affine ? 25 : 24)
-                                    : (facts.affine ? 13 : 12);
-  selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
-  if (selected.resources.peakGroups >=
-      static_cast<unsigned>(target.vectorRegisters))
-    return std::nullopt;
-  return selected;
+  llvm::sort(candidates, [](const Candidate &lhs, const Candidate &rhs) {
+    return std::tie(lhs.instructionCost, lhs.physical.resources.peakGroups) <
+           std::tie(rhs.instructionCost, rhs.physical.resources.peakGroups);
+  });
+  return candidates.front().physical;
 }
 
 std::optional<SelectedVLAEntityPhysical>

@@ -7604,7 +7604,8 @@ private:
             "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({rowTile, false}, options.target);
+        selectI4I8FragmentPhysical({rowTile, false}, options.target,
+                                   options.backend);
     if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
@@ -8712,7 +8713,8 @@ private:
             "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({rowTile, true}, options.target);
+        selectI4I8FragmentPhysical({rowTile, true}, options.target,
+                                   options.backend);
     if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");

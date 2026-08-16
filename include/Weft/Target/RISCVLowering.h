@@ -15,6 +15,7 @@ namespace weft {
 
 struct RISCVStructuralConfig {
   int64_t reductionStatePlacement = 0;
+  int64_t i4I8FragmentImplementation = 0;
 };
 
 struct RISCVCandidateParameters {
