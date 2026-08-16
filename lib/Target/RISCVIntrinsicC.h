@@ -38,6 +38,8 @@ enum class IntrinsicCLeaf {
   PackedI4I8VLEN256,
   PackedI5I8VLEN128,
   PackedI5I8VLEN256,
+  PackedI3GroupedI8VLEN128,
+  PackedI3GroupedI8VLEN256,
   Base3TernaryI8VLEN128,
   Base3TernaryI8VLEN256,
   PackedI2TernaryI8VLEN128,

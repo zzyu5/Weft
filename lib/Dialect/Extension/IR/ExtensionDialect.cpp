@@ -384,6 +384,24 @@ mlir::LogicalResult NibbleCodebookI8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult PackedI3GroupedI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getLowBits(), 64, false,
+                                  "low_bits")) ||
+      mlir::failed(verifyByteBlock(*this, getHighBits(), 32, false,
+                                  "high_bits")) ||
+      mlir::failed(verifyByteBlock(*this, getScales(), 12, false, "scales")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 256, true,
+                                  "activation")))
+    return mlir::failure();
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
+    return emitOpError("weight_scale and activation_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {

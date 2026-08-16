@@ -59,6 +59,10 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_packed_i5_i8_vl128";
   case IntrinsicCLeaf::PackedI5I8VLEN256:
     return "__weft_packed_i5_i8_vl256";
+  case IntrinsicCLeaf::PackedI3GroupedI8VLEN128:
+    return "__weft_packed_i3_grouped_i8_vl128";
+  case IntrinsicCLeaf::PackedI3GroupedI8VLEN256:
+    return "__weft_packed_i3_grouped_i8_vl256";
   case IntrinsicCLeaf::Base3TernaryI8VLEN128:
     return "__weft_base3_ternary_i8_vl128";
   case IntrinsicCLeaf::Base3TernaryI8VLEN256:

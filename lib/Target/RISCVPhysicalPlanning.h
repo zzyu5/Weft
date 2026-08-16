@@ -182,6 +182,7 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target);
 enum class QuantI8DotSemantic {
   PackedI4,
   PackedI5,
+  PackedI3Grouped,
   IQ2S,
   IQ3S,
   IQ1M,

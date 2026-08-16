@@ -47,6 +47,7 @@ from .builtins import online_softmax_summary
 from .builtins import packed_i4_i8_dot
 from .builtins import packed_i5_i8_dot
 from .builtins import packed_i2_ternary_i8_dot
+from .builtins import packed_i3_grouped_i8_dot
 from .builtins import packed_u9_u7_codebook_i8_dot
 from .builtins import packed_u11_grid_delta_i8_dot
 from .builtins import q6_k_i8_dot

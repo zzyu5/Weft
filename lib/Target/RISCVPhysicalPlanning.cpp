@@ -384,6 +384,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
 
   bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI4 ||
                    facts.semantic == QuantI8DotSemantic::PackedI5 ||
+                   facts.semantic == QuantI8DotSemantic::PackedI3Grouped ||
                    facts.semantic == QuantI8DotSemantic::IQ2S ||
                    facts.semantic == QuantI8DotSemantic::Q6K ||
                    facts.semantic == QuantI8DotSemantic::IQ1M ||

@@ -321,6 +321,27 @@ def WeftExtension_NibbleCodebookI8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_PackedI3GroupedI8DotOp
+    : WeftExtension_Op<"packed_i3_grouped_i8_dot", [Pure]> {
+  let summary = "Packed three-bit grouped-scale by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element signed integer dot.  Sixty-four packed bytes
+    provide four two-bit fields, one thirty-two-byte high-bit plane selects the
+    subtractive four correction, and twelve packed scale bytes define sixteen
+    signed six-bit group scales.  All packed fields, activation, scales, and
+    init are explicit operands.
+
+    External block stride, activation workspace, outer traversal, target vector
+    shape, and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$low_bits, AnyType:$high_bits,
+                       AnyType:$scales, AnyType:$activation,
+                       AnyType:$weight_scale, AnyType:$activation_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

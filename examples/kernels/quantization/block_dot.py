@@ -1,7 +1,6 @@
 import weft
 import weft.language as W
 
-from examples.kernels.quantization.dequantize import _load_q3_k_scale
 from examples.kernels.quantization.ggml_k import load_k4_scale_min
 
 
@@ -375,50 +374,22 @@ def q3_K_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(110)
         y = activation + block * W.index(292)
-        scale_product = W.load_f16_le(x + W.index(108)) * load_f32_le(y)
-        for half in W.range(0, 2):
-            for field in W.range(0, 4):
-                low_shift = W.cast(field * W.index(2), W.u8)
-                high_shift = W.cast(half * W.index(4) + field, W.u8)
-                for lane_group in W.range(0, 2):
-                    group = (
-                        half * W.index(8)
-                        + field * W.index(2)
-                        + lane_group
-                    )
-                    local_scale = _load_q3_k_scale(x + W.index(96), group)
-                    member = W.block(16)
-                    packed_codes = W.load(
-                        x
-                        + W.index(32)
-                        + half * W.index(32)
-                        + lane_group * W.index(16)
-                        + member,
-                        other=W.u8(0),
-                    )
-                    high_bits = W.load(
-                        x + lane_group * W.index(16) + member,
-                        other=W.u8(0),
-                    )
-                    low = (packed_codes >> low_shift) & W.u8(3)
-                    present = (high_bits >> high_shift) & W.u8(1)
-                    correction = (present ^ W.u8(1)) << W.u8(2)
-                    code = W.cast(low, W.i32) - W.cast(correction, W.i32)
-                    activation_values = load_q8(
-                        y + W.index(4) + group * W.index(16), member
-                    )
-                    q_sum = W.reduce(
-                        code * activation_values,
-                        identity=W.i32(0),
-                        axis=0,
-                        acc_dtype=W.i32,
-                        order="relaxed",
-                    )
-                    result = result + (
-                        scale_product
-                        * (W.cast(local_scale, W.f32) - W.f32(32.0))
-                        * W.cast(q_sum, W.f32)
-                    )
+        low_axis = W.block(64)
+        high_axis = W.block(32)
+        scale_axis = W.block(12)
+        activation_axis = W.block(256)
+        result = W.packed_i3_grouped_i8_dot(
+            W.load(x + W.index(32) + low_axis, other=W.u8(0)),
+            W.load(x + high_axis, other=W.u8(0)),
+            W.load(x + W.index(96) + scale_axis, other=W.u8(0)),
+            W.bitcast(
+                W.load(y + W.index(4) + activation_axis, other=W.u8(0)),
+                W.i8,
+            ),
+            W.load_f16_le(x + W.index(108)),
+            load_f32_le(y),
+            result,
+        )
     return result
 
 

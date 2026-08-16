@@ -2642,6 +2642,32 @@ class FrontendCompiler:
             (("dot_scale", f32), ("init", f32)),
         )
 
+    def _intrinsic_packed_i3_grouped_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.packed_i3_grouped_i8_dot",
+            (
+                "low_bits",
+                "high_bits",
+                "scales",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+            (
+                ("low_bits", 64, u8),
+                ("high_bits", 32, u8),
+                ("scales", 12, u8),
+                ("activation", 256, i8),
+            ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
+        )
+
     def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(
             call,

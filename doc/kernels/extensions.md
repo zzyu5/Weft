@@ -192,6 +192,11 @@ activation sum在Q8 workspace中的地址、八组traversal和block scale仍由D
 product与reduction；
 18-byte/136-byte packed block、scale与outer traversal仍由DSL kernel拥有。
 
+`W.packed_i3_grouped_i8_dot`显式接收64-byte two-bit fields、32-byte high-bit plane、12-byte
+packed six-bit scales和256-element i8 activation。Primitive只拥有当前256-element
+decode、subtractive-four correction、group-scale fold与integer dot；110/292-byte block stride、
+block traversal和activation workspace仍由DSL kernel拥有。
+
 `W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
 code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
 operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer

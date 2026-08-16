@@ -209,6 +209,11 @@ W.nibble_codebook_i8_dot(
     packed_codes, table, activation, dot_scale, init,
 )
 
+W.packed_i3_grouped_i8_dot(
+    low_bits, high_bits, scales, activation,
+    weight_scale, activation_scale, init,
+)
+
 W.iq2_s_i8_dot(...)
 W.iq3_s_i8_dot(...)
 W.iq1_m_i8_dot(...)

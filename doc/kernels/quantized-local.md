@@ -242,5 +242,7 @@ IQ1_S通过`W.packed_u11_grid_delta_i8_dot`显式保留u11 grid index、local sc
 correction关系。
 IQ4_NL与IQ4_XS通过`W.nibble_codebook_i8_dot`共享16-entry nibble table decode、widening dot和
 reduction，格式各自的block stride与scale层次仍在DSL kernel。
+Packed three-bit grouped-scale关系通过`W.packed_i3_grouped_i8_dot`进入既有quant local-dot
+physical family，不由target从普通bitwise/reduce closure中猜测。
 每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel
 route。

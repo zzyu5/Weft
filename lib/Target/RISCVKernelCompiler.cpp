@@ -1376,6 +1376,13 @@ private:
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
+    kernel.walk([&](PackedI3GroupedI8DotOp op) {
+      prepareQuantI8Dot(
+          op, QuantI8DotSemantic::PackedI3Grouped,
+          {op.getLowBits(), op.getHighBits(), op.getScales(),
+           op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
     kernel.walk([&](PackedI4I8DotOp op) {
       if (decisionFailure)
         return;
@@ -3741,6 +3748,8 @@ private:
     if (auto op = mlir::dyn_cast<PackedI4I8DotOp>(operation))
       return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI5I8DotOp>(operation))
+      return emitQuantI8Dot(op);
+    if (auto op = mlir::dyn_cast<PackedI3GroupedI8DotOp>(operation))
       return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
       return emitQuantI8Dot(op);
@@ -9303,6 +9312,19 @@ private:
       else
         return op.emitError(
             "packed i5/i8 dot has no intrinsic leaf for the selected byte shape");
+      break;
+    case QuantI8DotSemantic::PackedI3Grouped:
+      if (decision.realization !=
+          QuantI8DotRealization::RVVFixedLaneLocalBlockDot)
+        return op.emitError(
+            "packed i3 grouped/i8 dot requires a fixed-lane realization");
+      if (decision.semanticLanes == 32)
+        decision.leaf = IntrinsicCLeaf::PackedI3GroupedI8VLEN128;
+      else if (decision.semanticLanes == 64)
+        decision.leaf = IntrinsicCLeaf::PackedI3GroupedI8VLEN256;
+      else
+        return op.emitError(
+            "packed i3 grouped/i8 dot has no intrinsic leaf for the selected byte shape");
       break;
     case QuantI8DotSemantic::IQ2S:
       if (decision.realization ==
