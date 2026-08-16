@@ -8,13 +8,40 @@
 #include <cstring>
 #include <vector>
 
+#ifndef WEFT_MUL_MAT_KIND
+#error "WEFT_MUL_MAT_KIND is required"
+#endif
+
+#ifndef WEFT_MUL_MAT_ENTRY
+#error "WEFT_MUL_MAT_ENTRY is required"
+#endif
+
+#define WEFT_STRINGIFY_INNER(value) #value
+#define WEFT_STRINGIFY(value) WEFT_STRINGIFY_INNER(value)
+
 namespace {
 
 constexpr std::size_t kN = 4096;
 constexpr std::size_t kK = 4096;
 constexpr std::size_t kBlock = 32;
+#if WEFT_MUL_MAT_KIND == 0
 constexpr std::size_t kWeightBlockBytes = 18;
 constexpr std::size_t kActivationBlockBytes = 34;
+#elif WEFT_MUL_MAT_KIND == 1
+constexpr std::size_t kWeightBlockBytes = 20;
+constexpr std::size_t kActivationBlockBytes = 36;
+#elif WEFT_MUL_MAT_KIND == 2
+constexpr std::size_t kWeightBlockBytes = 22;
+constexpr std::size_t kActivationBlockBytes = 34;
+#elif WEFT_MUL_MAT_KIND == 3
+constexpr std::size_t kWeightBlockBytes = 24;
+constexpr std::size_t kActivationBlockBytes = 36;
+#elif WEFT_MUL_MAT_KIND == 4
+constexpr std::size_t kWeightBlockBytes = 34;
+constexpr std::size_t kActivationBlockBytes = 34;
+#else
+#error "unsupported WEFT_MUL_MAT_KIND"
+#endif
 constexpr std::size_t kBlocks = kK / kBlock;
 constexpr std::size_t kWeightRowBytes = kBlocks * kWeightBlockBytes;
 constexpr std::size_t kActivationRowBytes = kBlocks * kActivationBlockBytes;
@@ -70,6 +97,7 @@ float readHalf(const std::uint8_t *bytes) {
 
 void initializeWeightRow(std::uint8_t *row) {
   for (std::size_t block = 0; block < kBlocks; ++block) {
+#if WEFT_MUL_MAT_KIND == 0
     float source[kBlock];
     float absoluteMaximum = 0.0F;
     float signedMaximum = 0.0F;
@@ -93,6 +121,44 @@ void initializeWeightRow(std::uint8_t *row) {
           15, static_cast<int>(source[lane + 16] * inverse + 8.5F)));
       packed[2 + lane] = static_cast<std::uint8_t>(low | (high << 4));
     }
+#elif WEFT_MUL_MAT_KIND == 1
+    std::uint8_t *packed = row + block * kWeightBlockBytes;
+    writeHalf(packed, 0.125F);
+    writeHalf(packed + 2, -0.25F);
+    for (std::size_t lane = 0; lane < 16; ++lane) {
+      const std::uint8_t low = static_cast<std::uint8_t>((3 * lane + block) & 15U);
+      const std::uint8_t high =
+          static_cast<std::uint8_t>((5 * lane + block + 1) & 15U);
+      packed[4 + lane] = static_cast<std::uint8_t>(low | (high << 4));
+    }
+#elif WEFT_MUL_MAT_KIND == 2 || WEFT_MUL_MAT_KIND == 3
+    std::uint8_t *packed = row + block * kWeightBlockBytes;
+    writeHalf(packed, 0.0625F);
+#if WEFT_MUL_MAT_KIND == 2
+    constexpr std::size_t highOffset = 2;
+    constexpr std::size_t codeOffset = 6;
+#else
+    writeHalf(packed + 2, -0.125F);
+    constexpr std::size_t highOffset = 4;
+    constexpr std::size_t codeOffset = 8;
+#endif
+    for (std::size_t byte = 0; byte < 4; ++byte)
+      packed[highOffset + byte] =
+          static_cast<std::uint8_t>(0x96U ^ (block + byte));
+    for (std::size_t lane = 0; lane < 16; ++lane) {
+      const std::uint8_t low = static_cast<std::uint8_t>((lane + block) & 15U);
+      const std::uint8_t high =
+          static_cast<std::uint8_t>((7 * lane + block + 3) & 15U);
+      packed[codeOffset + lane] =
+          static_cast<std::uint8_t>(low | (high << 4));
+    }
+#else
+    std::uint8_t *packed = row + block * kWeightBlockBytes;
+    writeHalf(packed, 0.125F);
+    for (std::size_t lane = 0; lane < 32; ++lane)
+      packed[2 + lane] = static_cast<std::uint8_t>(
+          static_cast<std::int8_t>((lane + 3 * block) % 31 - 15));
+#endif
   }
 }
 
@@ -119,11 +185,27 @@ bool validateQuantizedActivation(const std::vector<float> &activation,
       const _Float16 expectedScale = static_cast<_Float16>(scale);
       if (readHalf(packed) != static_cast<float>(expectedScale))
         return false;
+#if WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3
+      std::int32_t codeSum = 0;
+#endif
       for (std::size_t lane = 0; lane < kBlock; ++lane) {
-        const auto actual = static_cast<std::int8_t>(packed[2 + lane]);
-        if (actual != expectedQ8(input[lane], inverse))
+        const std::size_t codeOffset =
+            WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3 ? 4 : 2;
+        const auto actual =
+            static_cast<std::int8_t>(packed[codeOffset + lane]);
+        const std::int8_t expected = expectedQ8(input[lane], inverse);
+        if (actual != expected)
           return false;
+#if WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3
+        codeSum += expected;
+#endif
       }
+#if WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3
+      const _Float16 expectedSumScale =
+          static_cast<_Float16>(static_cast<float>(codeSum) * scale);
+      if (readHalf(packed + 2) != static_cast<float>(expectedSumScale))
+        return false;
+#endif
     }
   }
   return true;
@@ -136,14 +218,56 @@ float reference(const std::uint8_t *weight,
     const std::uint8_t *x = weight + block * kWeightBlockBytes;
     const std::uint8_t *y = activation + block * kActivationBlockBytes;
     std::int32_t integerSum = 0;
+#if WEFT_MUL_MAT_KIND == 0 || WEFT_MUL_MAT_KIND == 1
     for (std::size_t lane = 0; lane < 16; ++lane) {
-      const std::uint8_t packed = x[2 + lane];
-      integerSum += (static_cast<int>(packed & 15U) - 8) *
-                    static_cast<std::int8_t>(y[2 + lane]);
-      integerSum += (static_cast<int>(packed >> 4) - 8) *
-                    static_cast<std::int8_t>(y[18 + lane]);
+      const std::size_t weightCodeOffset = WEFT_MUL_MAT_KIND == 0 ? 2 : 4;
+      const std::size_t activationCodeOffset = WEFT_MUL_MAT_KIND == 0 ? 2 : 4;
+      const std::uint8_t packed = x[weightCodeOffset + lane];
+      const int zero = WEFT_MUL_MAT_KIND == 0 ? -8 : 0;
+      integerSum += (static_cast<int>(packed & 15U) + zero) *
+                    static_cast<std::int8_t>(y[activationCodeOffset + lane]);
+      integerSum += (static_cast<int>(packed >> 4) + zero) *
+                    static_cast<std::int8_t>(
+                        y[activationCodeOffset + 16 + lane]);
     }
     result += readHalf(x) * readHalf(y) * static_cast<float>(integerSum);
+#if WEFT_MUL_MAT_KIND == 1
+    result += readHalf(x + 2) * readHalf(y + 2);
+#endif
+#elif WEFT_MUL_MAT_KIND == 2 || WEFT_MUL_MAT_KIND == 3
+#if WEFT_MUL_MAT_KIND == 2
+    constexpr std::size_t highOffset = 2;
+    constexpr std::size_t codeOffset = 6;
+    constexpr std::size_t activationCodeOffset = 2;
+#else
+    constexpr std::size_t highOffset = 4;
+    constexpr std::size_t codeOffset = 8;
+    constexpr std::size_t activationCodeOffset = 4;
+#endif
+    const std::uint32_t highBits =
+        static_cast<std::uint32_t>(x[highOffset]) |
+        static_cast<std::uint32_t>(x[highOffset + 1]) << 8 |
+        static_cast<std::uint32_t>(x[highOffset + 2]) << 16 |
+        static_cast<std::uint32_t>(x[highOffset + 3]) << 24;
+    for (std::size_t lane = 0; lane < 32; ++lane) {
+      const std::uint8_t packed = x[codeOffset + lane % 16];
+      const unsigned shift = lane < 16 ? 0 : 4;
+      const int low = (packed >> shift) & 15U;
+      const int high = (highBits >> lane) & 1U;
+      const int value = low | (high << 4);
+      integerSum += (value + (WEFT_MUL_MAT_KIND == 2 ? -16 : 0)) *
+                    static_cast<std::int8_t>(y[activationCodeOffset + lane]);
+    }
+    result += readHalf(x) * readHalf(y) * static_cast<float>(integerSum);
+#if WEFT_MUL_MAT_KIND == 3
+    result += readHalf(x + 2) * readHalf(y + 2);
+#endif
+#else
+    for (std::size_t lane = 0; lane < 32; ++lane)
+      integerSum += static_cast<std::int8_t>(x[2 + lane]) *
+                    static_cast<std::int8_t>(y[2 + lane]);
+    result += readHalf(x) * readHalf(y) * static_cast<float>(integerSum);
+#endif
   }
   return result;
 }
@@ -174,10 +298,10 @@ int main(int argc, char **argv) {
     activation[index] =
         static_cast<float>(static_cast<int>(index % 17) - 8) / 9.0F;
 
-  mul_mat_q4_0(weight.data(), activation.data(), output.data(),
-               workspace.data(), 0, rows, kN, kK);
+  WEFT_MUL_MAT_ENTRY(weight.data(), activation.data(), output.data(),
+                     workspace.data(), 0, rows, kN, kK);
   if (!validateQuantizedActivation(activation, workspace, rows)) {
-    std::fprintf(stderr, "generated Q8_0 workspace differs from DSL semantics\n");
+    std::fprintf(stderr, "generated Q8 workspace differs from DSL semantics\n");
     return 1;
   }
 
@@ -210,8 +334,8 @@ int main(int argc, char **argv) {
   for (std::size_t repetition = 0; repetition < repeatCount; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    mul_mat_q4_0(weight.data(), activation.data(), output.data(),
-                 workspace.data(), 0, rows, kN, kK);
+    WEFT_MUL_MAT_ENTRY(weight.data(), activation.data(), output.data(),
+                       workspace.data(), 0, rows, kN, kK);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::micro>(end - begin).count());
@@ -221,9 +345,9 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(rows) *
                             static_cast<double>(kN) * static_cast<double>(kK);
   std::printf("family=mul_mat\n");
-  std::printf("kernel=mul_mat_q4_0\n");
+  std::printf("kernel=%s\n", WEFT_STRINGIFY(WEFT_MUL_MAT_ENTRY));
   std::printf("phase=%s\n", argv[1]);
-  std::printf("implementation=weft_core_local_q8_0_rvv\n");
+  std::printf("implementation=weft_core_local_q8_rvv\n");
   std::printf("model_shape=Llama-8B.hidden_projection\n");
   std::printf("M=%zu\nN=%zu\nK=%zu\n", rows, kN, kK);
   std::printf("cold_protocol=64MiB-evict-then-single-kernel\n");

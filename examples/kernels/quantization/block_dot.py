@@ -91,12 +91,8 @@ def q4_0_q8_0(
     return q4_0_row_dot(x, y, blocks)
 
 
-@weft.kernel
-def q4_1_q8_1(
-    x: W.ptr[W.u8, W.readonly],
-    y: W.ptr[W.u8, W.readonly],
-    blocks: W.index,
-) -> W.f32:
+@W.helper(effects=("read",))
+def q4_1_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(20)
@@ -118,11 +114,16 @@ def q4_1_q8_1(
 
 
 @weft.kernel
-def q5_0_q8_0(
+def q4_1_q8_1(
     x: W.ptr[W.u8, W.readonly],
     y: W.ptr[W.u8, W.readonly],
     blocks: W.index,
 ) -> W.f32:
+    return q4_1_row_dot(x, y, blocks)
+
+
+@W.helper(effects=("read",))
+def q5_0_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(22)
@@ -148,11 +149,16 @@ def q5_0_q8_0(
 
 
 @weft.kernel
-def q5_1_q8_1(
+def q5_0_q8_0(
     x: W.ptr[W.u8, W.readonly],
     y: W.ptr[W.u8, W.readonly],
     blocks: W.index,
 ) -> W.f32:
+    return q5_0_row_dot(x, y, blocks)
+
+
+@W.helper(effects=("read",))
+def q5_1_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(24)
@@ -179,11 +185,16 @@ def q5_1_q8_1(
 
 
 @weft.kernel
-def q8_0_q8_0(
+def q5_1_q8_1(
     x: W.ptr[W.u8, W.readonly],
     y: W.ptr[W.u8, W.readonly],
     blocks: W.index,
 ) -> W.f32:
+    return q5_1_row_dot(x, y, blocks)
+
+
+@W.helper(effects=("read",))
+def q8_0_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(34)
@@ -201,6 +212,15 @@ def q8_0_q8_0(
         scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
         result += W.cast(integer_sum, W.f32) * scale
     return result
+
+
+@weft.kernel
+def q8_0_q8_0(
+    x: W.ptr[W.u8, W.readonly],
+    y: W.ptr[W.u8, W.readonly],
+    blocks: W.index,
+) -> W.f32:
+    return q8_0_row_dot(x, y, blocks)
 
 
 @weft.kernel
