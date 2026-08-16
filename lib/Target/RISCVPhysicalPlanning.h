@@ -526,6 +526,41 @@ enum class LocalImplementationStructure {
   SpacemitIME1Fragment,
 };
 
+enum class LocalImplementationLeaf {
+  None,
+  RVVF32Math,
+  RVVSymmetricI4I8N16,
+  RVVSymmetricI4I8M4N16,
+  IME1SymmetricI4I8N16,
+  IME1SymmetricI4I8M4N16,
+  RVVAffineI4I8N16,
+  RVVAffineI4I8M4N16,
+  IME1AffineI4I8N16,
+  IME1AffineI4I8M4N16,
+  RVVGroupedAffineI4I8Strip,
+  RVVE2M1E8M0I8RegisterMF2,
+  RVVE2M1E8M0I8RegisterM1M2,
+  RVVE2M1E8M0I8Strip,
+  RVVPackedI4I8Register,
+  RVVPackedI5I8Register,
+  RVVPackedI3GroupedI8Register,
+  RVVBase3TernaryI8Register,
+  RVVPackedI2TernaryI8Register,
+  RVVSignedCodebook8I8Register,
+  RVVSignedCodebook4I8Register,
+  RVVPackedU9U7CodebookI8Register,
+  RVVPackedU11GridDeltaI8Register,
+  RVVNibbleCodebookI8Register,
+  RVVIQ2SI8Register,
+  RVVIQ2SI8Strip,
+  RVVIQ3SI8Register,
+  RVVIQ3SI8Strip,
+  RVVIQ1MI8Register,
+  RVVIQ1MI8Strip,
+  RVVQ6KI8Register,
+  RVVQ6KI8Strip,
+};
+
 struct LocalImplementationParameters {
   unsigned rowMicrotile = 1;
   unsigned semanticLanes = 0;
@@ -553,19 +588,22 @@ struct LocalImplementation {
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
   LocalImplementationStructure structure =
       LocalImplementationStructure::None;
+  LocalImplementationLeaf leaf = LocalImplementationLeaf::None;
   LocalImplementationParameters parameters;
 
   explicit operator bool() const {
     return primitive != LocalPrimitiveKind::None &&
-           structure != LocalImplementationStructure::None;
+           structure != LocalImplementationStructure::None &&
+           leaf != LocalImplementationLeaf::None;
   }
   bool operator==(const LocalImplementation &other) const {
     return primitive == other.primitive && structure == other.structure &&
-           parameters == other.parameters;
+           leaf == other.leaf && parameters == other.parameters;
   }
   bool operator<(const LocalImplementation &other) const {
-    return std::tie(primitive, structure, parameters) <
-           std::tie(other.primitive, other.structure, other.parameters);
+    return std::tie(primitive, structure, leaf, parameters) <
+           std::tie(other.primitive, other.structure, other.leaf,
+                    other.parameters);
   }
 };
 

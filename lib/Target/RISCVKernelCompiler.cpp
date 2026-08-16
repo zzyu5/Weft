@@ -956,6 +956,19 @@ private:
 
   mlir::LogicalResult preparePhysicalDecisions() {
     bool decisionFailure = false;
+    auto registerDecision = [&](auto &decisions, mlir::Operation *operation,
+                                auto &&planned, llvm::StringRef primitive) {
+      if (decisions
+              .try_emplace(operation,
+                           std::forward<decltype(planned)>(planned))
+              .second)
+        return true;
+      operation->emitError()
+          << "one " << primitive
+          << " primitive cannot own multiple physical decisions";
+      decisionFailure = true;
+      return false;
+    };
     if (mlir::failed(weft::riscv_internal::analyzeKernelPhysicalFacts(
             kernel, kernelFacts)))
       return mlir::failure();
@@ -981,13 +994,8 @@ private:
       planned.entity.storages.push_back(
           PhysicalStorageDecision{{}, {}, selected->privateElements,
                                   selected->privateAlignment});
-      if (!physicalPlan.sortIndices
-               .try_emplace(op.getOperation(), std::move(planned))
-               .second) {
-        op.emitError(
-            "one sort_indices primitive cannot own multiple physical decisions");
-        decisionFailure = true;
-      }
+      registerDecision(physicalPlan.sortIndices, op.getOperation(),
+                       std::move(planned), "sort_indices");
     });
     kernel.walk([&](LoadF16LEOp op) {
       if (decisionFailure)
@@ -1003,12 +1011,8 @@ private:
       PlannedPhysicalDecision<LoadF16LEDecision> planned;
       initializeEntityPlan(planned.entity);
       planned.realization = *selected;
-      if (!physicalPlan.f16LELoads
-               .try_emplace(op.getOperation(), std::move(planned))
-               .second) {
-        op.emitError("one load_f16_le cannot own multiple physical decisions");
-        decisionFailure = true;
-      }
+      registerDecision(physicalPlan.f16LELoads, op.getOperation(),
+                       std::move(planned), "load_f16_le");
     });
     kernel.walk([&](VLAOp vla) {
       if (decisionFailure)
@@ -1019,11 +1023,8 @@ private:
         decisionFailure = true;
         return;
       }
-      if (!physicalPlan.vlaRegions.try_emplace(vla.getOperation(), std::move(*decision))
-               .second) {
-        vla.emitError("one VLA region cannot own multiple physical decisions");
-        decisionFailure = true;
-      }
+      registerDecision(physicalPlan.vlaRegions, vla.getOperation(),
+                       std::move(*decision), "VLA region");
     });
     kernel.walk([&](AffineI4I8DotOp dot) {
       if (decisionFailure)
@@ -1035,17 +1036,22 @@ private:
         return;
       }
       finalizeAffineI4I8Plan(dot, planned);
-      physicalPlan.affineI4I8.try_emplace(dot.getOperation(),
-                                         std::move(planned));
+      registerDecision(physicalPlan.affineI4I8, dot.getOperation(),
+                       std::move(planned), "affine_i4_i8_dot");
     });
     kernel.walk([&](MatmulOp matmul) {
       if (decisionFailure)
         return;
       std::optional<PlannedPhysicalDecision<F16GemmNTileDecision>> decision =
           decideF16GemmNTiles(matmul);
-      if (decision)
-        physicalPlan.f16Matmuls.try_emplace(matmul.getOperation(),
-                                         std::move(*decision));
+      if (!decision) {
+        matmul.emitError(
+            "matmul has no legal local microkernel for its typed axes, shape, target, and backend config");
+        decisionFailure = true;
+        return;
+      }
+      registerDecision(physicalPlan.f16Matmuls, matmul.getOperation(),
+                       std::move(*decision), "matmul");
     });
     kernel.walk([&](DotOp dot) {
       if (decisionFailure || isRegionValue(dot.getResult().getType()))
@@ -1056,13 +1062,8 @@ private:
         decisionFailure = true;
         return;
       }
-      if (!physicalPlan.dots
-               .try_emplace(dot.getOperation(), std::move(*decision))
-               .second) {
-        dot.emitError("one dot cannot own multiple physical decisions");
-        decisionFailure = true;
-        return;
-      }
+      registerDecision(physicalPlan.dots, dot.getOperation(),
+                       std::move(*decision), "dot");
     });
     kernel.walk([&](SymmetricI4I8DotOp op) {
       if (decisionFailure)
@@ -1074,8 +1075,8 @@ private:
         return;
       }
       finalizeSymmetricI4I8Plan(op, planned);
-      physicalPlan.symmetricI4I8.try_emplace(op.getOperation(),
-                                             std::move(planned));
+      registerDecision(physicalPlan.symmetricI4I8, op.getOperation(),
+                       std::move(planned), "symmetric_i4_i8_dot");
     });
     kernel.walk([&](SignBitI8DotOp op) {
       if (decisionFailure)
@@ -1086,7 +1087,8 @@ private:
         return;
       }
       finalizeSignBitI8Plan(op, planned);
-      physicalPlan.signBitI8.try_emplace(op.getOperation(), std::move(planned));
+      registerDecision(physicalPlan.signBitI8, op.getOperation(),
+                       std::move(planned), "sign_bit_i8_dot");
     });
     kernel.walk([&](E2M1E8M0I8DotOp op) {
       if (decisionFailure)
@@ -1097,8 +1099,8 @@ private:
         return;
       }
       finalizeE2M1E8M0I8Plan(op, planned);
-      physicalPlan.e2m1E8M0I8.try_emplace(op.getOperation(),
-                                          std::move(planned));
+      registerDecision(physicalPlan.e2m1E8M0I8, op.getOperation(),
+                       std::move(planned), "e2m1_e8m0_i8_dot");
     });
     kernel.walk([&](GroupedAffineI4I8DotOp op) {
       if (decisionFailure)
@@ -1109,8 +1111,8 @@ private:
         return;
       }
       finalizeGroupedAffineI4I8Plan(op, planned);
-      physicalPlan.groupedAffineI4I8.try_emplace(op.getOperation(),
-                                                 std::move(planned));
+      registerDecision(physicalPlan.groupedAffineI4I8, op.getOperation(),
+                       std::move(planned), "grouped_affine_i4_i8_dot");
     });
     auto prepareTernaryDot = [&](auto op, TernaryI8DotSemantic semantic,
                                  llvm::ArrayRef<mlir::Value> blocks,
@@ -1124,7 +1126,8 @@ private:
         return;
       }
       finalizeTernaryI8Plan(op, planned);
-      physicalPlan.ternaryI8.try_emplace(op.getOperation(), std::move(planned));
+      registerDecision(physicalPlan.ternaryI8, op.getOperation(),
+                       std::move(planned), "ternary_i8_dot");
     };
     kernel.walk([&](Base3TernaryI8DotOp op) {
       prepareTernaryDot(
@@ -1148,8 +1151,8 @@ private:
         return;
       }
       finalizeSignedCodebookI8Plan(op, planned);
-      physicalPlan.signedCodebookI8.try_emplace(op.getOperation(),
-                                                std::move(planned));
+      registerDecision(physicalPlan.signedCodebookI8, op.getOperation(),
+                       std::move(planned), "signed_codebook_i8_dot");
     });
     kernel.walk([&](PackedU9U7CodebookI8DotOp op) {
       if (decisionFailure)
@@ -1161,8 +1164,8 @@ private:
         return;
       }
       finalizePackedU9U7CodebookI8Plan(op, planned);
-      physicalPlan.packedU9U7CodebookI8.try_emplace(op.getOperation(),
-                                                   std::move(planned));
+      registerDecision(physicalPlan.packedU9U7CodebookI8, op.getOperation(),
+                       std::move(planned), "packed_u9_u7_codebook_i8_dot");
     });
     kernel.walk([&](PackedU11GridDeltaI8DotOp op) {
       if (decisionFailure)
@@ -1174,8 +1177,8 @@ private:
         return;
       }
       finalizePackedU11GridDeltaI8Plan(op, planned);
-      physicalPlan.packedU11GridDeltaI8.try_emplace(op.getOperation(),
-                                                   std::move(planned));
+      registerDecision(physicalPlan.packedU11GridDeltaI8, op.getOperation(),
+                       std::move(planned), "packed_u11_grid_delta_i8_dot");
     });
     kernel.walk([&](NibbleCodebookI8DotOp op) {
       if (decisionFailure)
@@ -1186,8 +1189,8 @@ private:
         return;
       }
       finalizeNibbleCodebookI8Plan(op, planned);
-      physicalPlan.nibbleCodebookI8.try_emplace(op.getOperation(),
-                                               std::move(planned));
+      registerDecision(physicalPlan.nibbleCodebookI8, op.getOperation(),
+                       std::move(planned), "nibble_codebook_i8_dot");
     });
     auto prepareQuantI8Dot = [&](auto op,
                                        QuantI8DotSemantic semantic,
@@ -1203,8 +1206,8 @@ private:
         return;
       }
       finalizeQuantI8Plan(op, planned);
-      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
-                                               std::move(planned));
+      registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
+                       std::move(planned), "quant_i8_dot");
     };
     kernel.walk([&](IQ2SI8DotOp op) {
       prepareQuantI8Dot(
@@ -1234,8 +1237,8 @@ private:
         return;
       }
       finalizeQuantI8Plan(op, planned);
-      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
-                                               std::move(planned));
+      registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
+                       std::move(planned), "packed_i4_i8_dot");
     });
     kernel.walk([&](PackedI5I8DotOp op) {
       if (decisionFailure)
@@ -1251,8 +1254,8 @@ private:
         return;
       }
       finalizeQuantI8Plan(op, planned);
-      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
-                                               std::move(planned));
+      registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
+                       std::move(planned), "packed_i5_i8_dot");
     });
     kernel.walk([&](IQ3SI8DotOp op) {
       prepareQuantI8Dot(
@@ -1284,12 +1287,8 @@ private:
         return;
       }
       finalizeBlockDecodePlan(op, planned);
-      if (!physicalPlan.blockDecodes
-               .try_emplace(op.getOperation(), std::move(planned))
-               .second) {
-        op.emitError("one decode primitive cannot own multiple physical decisions");
-        decisionFailure = true;
-      }
+      registerDecision(physicalPlan.blockDecodes, op.getOperation(),
+                       std::move(planned), "decode");
     });
     if (!decisionFailure && mlir::failed(prepareMaterializedF32Pointwise()))
       decisionFailure = true;

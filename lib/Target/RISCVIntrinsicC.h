@@ -24,12 +24,9 @@ public:
   bool contains(const LocalImplementation &implementation) const {
     return implementations.find(implementation) != implementations.end();
   }
-  bool contains(LocalPrimitiveKind primitive) const;
-  bool contains(LocalPrimitiveKind primitive,
-                LocalImplementationStructure structure) const;
-  bool contains(LocalPrimitiveKind primitive,
-                LocalImplementationStructure structure,
-                unsigned semanticLanes, RVVVectorShape primaryShape = {}) const;
+  bool contains(LocalImplementationLeaf leaf) const;
+  bool contains(LocalImplementationLeaf leaf, unsigned semanticLanes,
+                RVVVectorShape primaryShape = {}) const;
   bool empty() const { return implementations.empty(); }
 
 private:

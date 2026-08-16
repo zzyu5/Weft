@@ -180,60 +180,32 @@ __weft_online_summary_merge_f32(
 
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations) {
-  auto fragment = [&](LocalPrimitiveKind primitive,
-                      LocalImplementationStructure structure,
-                      unsigned rows) {
-    LocalImplementation implementation;
-    implementation.primitive = primitive;
-    implementation.structure = structure;
-    implementation.parameters.rowMicrotile = rows;
-    implementation.parameters.semanticLanes = 16;
-    implementation.parameters.primaryShape = kRVVE8M1;
-    implementation.parameters.secondaryShape = kRVVE32M4;
-    return implementations.contains(implementation);
-  };
-  LocalImplementation f32Math;
-  f32Math.primitive = LocalPrimitiveKind::F32Math;
-  f32Math.structure =
-      LocalImplementationStructure::RVVRegisterMicrokernel;
-  f32Math.parameters.primaryShape = kRVVE32M2;
-  bool usesExp = implementations.contains(f32Math);
-  bool usesRVVSymmetricI4I8 = fragment(
-      LocalPrimitiveKind::SymmetricI4I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 1);
-  bool usesRVVAffineI4I8 = fragment(
-      LocalPrimitiveKind::AffineI4I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 1);
-  bool usesRVVSymmetricI4I8M4 = fragment(
-      LocalPrimitiveKind::SymmetricI4I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 4);
-  bool usesRVVAffineI4I8M4 = fragment(
-      LocalPrimitiveKind::AffineI4I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 4);
-  bool usesIME1SymmetricI4I8 = fragment(
-      LocalPrimitiveKind::SymmetricI4I8,
-      LocalImplementationStructure::SpacemitIME1Fragment, 1);
-  bool usesIME1AffineI4I8 = fragment(
-      LocalPrimitiveKind::AffineI4I8,
-      LocalImplementationStructure::SpacemitIME1Fragment, 1);
-  bool usesIME1SymmetricI4I8M4 = fragment(
-      LocalPrimitiveKind::SymmetricI4I8,
-      LocalImplementationStructure::SpacemitIME1Fragment, 4);
-  bool usesIME1AffineI4I8M4 = fragment(
-      LocalPrimitiveKind::AffineI4I8,
-      LocalImplementationStructure::SpacemitIME1Fragment, 4);
+  bool usesExp =
+      implementations.contains(LocalImplementationLeaf::RVVF32Math);
+  bool usesRVVSymmetricI4I8 = implementations.contains(
+      LocalImplementationLeaf::RVVSymmetricI4I8N16);
+  bool usesRVVAffineI4I8 = implementations.contains(
+      LocalImplementationLeaf::RVVAffineI4I8N16);
+  bool usesRVVSymmetricI4I8M4 = implementations.contains(
+      LocalImplementationLeaf::RVVSymmetricI4I8M4N16);
+  bool usesRVVAffineI4I8M4 = implementations.contains(
+      LocalImplementationLeaf::RVVAffineI4I8M4N16);
+  bool usesIME1SymmetricI4I8 = implementations.contains(
+      LocalImplementationLeaf::IME1SymmetricI4I8N16);
+  bool usesIME1AffineI4I8 = implementations.contains(
+      LocalImplementationLeaf::IME1AffineI4I8N16);
+  bool usesIME1SymmetricI4I8M4 = implementations.contains(
+      LocalImplementationLeaf::IME1SymmetricI4I8M4N16);
+  bool usesIME1AffineI4I8M4 = implementations.contains(
+      LocalImplementationLeaf::IME1AffineI4I8M4N16);
   bool usesGroupedI4I8Strip = implementations.contains(
-      LocalPrimitiveKind::GroupedAffineI4I8,
-      LocalImplementationStructure::RVVStripLoop);
+      LocalImplementationLeaf::RVVGroupedAffineI4I8Strip);
   bool usesE2M1RegisterE8M1M2 = implementations.contains(
-      LocalPrimitiveKind::E2M1E8M0I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 32, {8, 8});
+      LocalImplementationLeaf::RVVE2M1E8M0I8RegisterM1M2);
   bool usesE2M1RegisterE8MF2 = implementations.contains(
-      LocalPrimitiveKind::E2M1E8M0I8,
-      LocalImplementationStructure::RVVRegisterMicrokernel, 32, {8, 4});
+      LocalImplementationLeaf::RVVE2M1E8M0I8RegisterMF2);
   bool usesE2M1Strip = implementations.contains(
-      LocalPrimitiveKind::E2M1E8M0I8,
-      LocalImplementationStructure::RVVStripLoop);
+      LocalImplementationLeaf::RVVE2M1E8M0I8Strip);
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,

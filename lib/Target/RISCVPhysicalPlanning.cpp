@@ -81,6 +81,161 @@ rvvLaneCapacity(const RVVVectorShape &shape,
   return static_cast<unsigned>(bits / shape.sew);
 }
 
+static bool selectLocalImplementationLeaf(LocalImplementation &implementation) {
+  const LocalImplementationParameters &parameters = implementation.parameters;
+  const bool rvvRegister =
+      implementation.structure ==
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  const bool ime = implementation.structure ==
+                   LocalImplementationStructure::SpacemitIME1Fragment;
+  const bool strip =
+      implementation.structure == LocalImplementationStructure::RVVStripLoop;
+  const bool register32E8M1OrM2 =
+      rvvRegister && parameters.semanticLanes == 32 &&
+      (parameters.primaryShape == RVVVectorShape{8, 8} ||
+       parameters.primaryShape == RVVVectorShape{8, 16});
+  const bool register32Or64E8M2 =
+      rvvRegister &&
+      (parameters.semanticLanes == 32 || parameters.semanticLanes == 64) &&
+      parameters.primaryShape == RVVVectorShape{8, 16};
+  const bool strip16E8M2 =
+      strip && parameters.semanticLanes == 16 &&
+      parameters.primaryShape == RVVVectorShape{8, 16};
+
+  switch (implementation.primitive) {
+  case LocalPrimitiveKind::None:
+    return false;
+  case LocalPrimitiveKind::F32Math:
+    if (rvvRegister && parameters.primaryShape == kRVVE32M2)
+      implementation.leaf = LocalImplementationLeaf::RVVF32Math;
+    break;
+  case LocalPrimitiveKind::SymmetricI4I8:
+  case LocalPrimitiveKind::AffineI4I8:
+    if (parameters.semanticLanes != 16 ||
+        parameters.primaryShape != kRVVE8M1 ||
+        parameters.secondaryShape != kRVVE32M4 ||
+        (parameters.rowMicrotile != 1 && parameters.rowMicrotile != 4))
+      break;
+    if (implementation.primitive == LocalPrimitiveKind::SymmetricI4I8)
+      implementation.leaf =
+          ime ? (parameters.rowMicrotile == 4
+                     ? LocalImplementationLeaf::IME1SymmetricI4I8M4N16
+                     : LocalImplementationLeaf::IME1SymmetricI4I8N16)
+              : rvvRegister
+                    ? (parameters.rowMicrotile == 4
+                           ? LocalImplementationLeaf::RVVSymmetricI4I8M4N16
+                           : LocalImplementationLeaf::RVVSymmetricI4I8N16)
+                    : LocalImplementationLeaf::None;
+    else
+      implementation.leaf =
+          ime ? (parameters.rowMicrotile == 4
+                     ? LocalImplementationLeaf::IME1AffineI4I8M4N16
+                     : LocalImplementationLeaf::IME1AffineI4I8N16)
+              : rvvRegister
+                    ? (parameters.rowMicrotile == 4
+                           ? LocalImplementationLeaf::RVVAffineI4I8M4N16
+                           : LocalImplementationLeaf::RVVAffineI4I8N16)
+                    : LocalImplementationLeaf::None;
+    break;
+  case LocalPrimitiveKind::GroupedAffineI4I8:
+    if (strip && parameters.semanticLanes == 32 &&
+        parameters.primaryShape == kRVVE8M1 &&
+        parameters.secondaryShape == kRVVE16M2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVGroupedAffineI4I8Strip;
+    break;
+  case LocalPrimitiveKind::E2M1E8M0I8:
+    if (strip && parameters.semanticLanes == 0 &&
+        parameters.primaryShape == kRVVE8M1 && !parameters.secondaryShape)
+      implementation.leaf = LocalImplementationLeaf::RVVE2M1E8M0I8Strip;
+    else if (rvvRegister && parameters.semanticLanes == 32 &&
+             parameters.primaryShape == RVVVectorShape{8, 4} &&
+             parameters.secondaryShape == RVVVectorShape{8, 4})
+      implementation.leaf =
+          LocalImplementationLeaf::RVVE2M1E8M0I8RegisterMF2;
+    else if (rvvRegister && parameters.semanticLanes == 32 &&
+             parameters.primaryShape == kRVVE8M1 &&
+             parameters.secondaryShape == RVVVectorShape{8, 16})
+      implementation.leaf =
+          LocalImplementationLeaf::RVVE2M1E8M0I8RegisterM1M2;
+    break;
+  case LocalPrimitiveKind::PackedI4I8:
+    if (register32E8M1OrM2)
+      implementation.leaf = LocalImplementationLeaf::RVVPackedI4I8Register;
+    break;
+  case LocalPrimitiveKind::PackedI5I8:
+    if (register32E8M1OrM2)
+      implementation.leaf = LocalImplementationLeaf::RVVPackedI5I8Register;
+    break;
+  case LocalPrimitiveKind::PackedI3GroupedI8:
+    if (register32Or64E8M2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVPackedI3GroupedI8Register;
+    break;
+  case LocalPrimitiveKind::Base3TernaryI8:
+    if (register32E8M1OrM2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVBase3TernaryI8Register;
+    break;
+  case LocalPrimitiveKind::PackedI2TernaryI8:
+    if (register32E8M1OrM2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVPackedI2TernaryI8Register;
+    break;
+  case LocalPrimitiveKind::SignedCodebook8I8:
+    if (register32E8M1OrM2 && parameters.entryWidth == 8)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVSignedCodebook8I8Register;
+    break;
+  case LocalPrimitiveKind::SignedCodebook4I8:
+    if (register32E8M1OrM2 && parameters.entryWidth == 4)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVSignedCodebook4I8Register;
+    break;
+  case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    if (register32E8M1OrM2 && parameters.entryWidth == 8)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVPackedU9U7CodebookI8Register;
+    break;
+  case LocalPrimitiveKind::PackedU11GridDeltaI8:
+    if (register32E8M1OrM2 && parameters.entryWidth == 8)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVPackedU11GridDeltaI8Register;
+    break;
+  case LocalPrimitiveKind::NibbleCodebookI8:
+    if (register32E8M1OrM2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVNibbleCodebookI8Register;
+    break;
+  case LocalPrimitiveKind::IQ2SI8:
+    if (strip16E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVIQ2SI8Strip;
+    else if (register32Or64E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVIQ2SI8Register;
+    break;
+  case LocalPrimitiveKind::IQ3SI8:
+    if (strip16E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVIQ3SI8Strip;
+    else if (rvvRegister && parameters.semanticLanes == 64 &&
+             parameters.primaryShape == RVVVectorShape{8, 16})
+      implementation.leaf = LocalImplementationLeaf::RVVIQ3SI8Register;
+    break;
+  case LocalPrimitiveKind::IQ1MI8:
+    if (strip16E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVIQ1MI8Strip;
+    else if (register32Or64E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVIQ1MI8Register;
+    break;
+  case LocalPrimitiveKind::Q6KI8:
+    if (strip16E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVQ6KI8Strip;
+    else if (register32Or64E8M2)
+      implementation.leaf = LocalImplementationLeaf::RVVQ6KI8Register;
+    break;
+  }
+  return implementation.leaf != LocalImplementationLeaf::None;
+}
+
 RVVVectorShape rvvShape(unsigned sew, unsigned lmul) {
   return RVVVectorShape{sew, static_cast<int>(lmul * 8)};
 }
@@ -676,6 +831,8 @@ selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
   implementation.structure =
       LocalImplementationStructure::RVVRegisterMicrokernel;
   implementation.parameters.primaryShape = kRVVE32M2;
+  if (!selectLocalImplementationLeaf(implementation))
+    return std::nullopt;
   return implementation;
 }
 
@@ -723,6 +880,8 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   selected.implementation.parameters.primaryShape = selected.codeShape;
   selected.implementation.parameters.secondaryShape =
       selected.accumulatorShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   for (RVVVectorShape shape : {selected.codeShape,
                                selected.activationScaleShape,
                                selected.accumulatorShape})
@@ -1095,6 +1254,8 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   selected.implementation.parameters.semanticLanes = 32;
   selected.implementation.parameters.primaryShape = *byte32;
   selected.implementation.parameters.secondaryShape = *byte16;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.byteShape32 = *byte32;
   selected.byteShape16 = *byte16;
   selected.widenedShape32 = *widened32;
@@ -1173,6 +1334,8 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   selected.implementation.parameters.entryWidth = facts.entryWidth;
   selected.implementation.parameters.primaryShape = *activationShape;
   selected.implementation.parameters.secondaryShape = *tableShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.entryWidth = facts.entryWidth;
   selected.codeShape = *codeShape;
   selected.indexShape = *indexShape;
@@ -1226,6 +1389,8 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
   selected.implementation.parameters.semanticLanes = 32;
   selected.implementation.parameters.primaryShape = *activationShape;
   selected.implementation.parameters.secondaryShape = *packedShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.packedShape = *packedShape;
   selected.tableShape = combined ? *activationShape : *packedShape;
   selected.activationShape = *activationShape;
@@ -1298,36 +1463,15 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     const unsigned segments = lanes / 16;
     const unsigned registerGroups = rvvRegisterGroups(*byteShape);
     const unsigned registerPeak = 4 * segments + 4 * registerGroups;
-    const bool registerImplementation =
-        facts.semantic == QuantI8DotSemantic::PackedI4 ||
-        facts.semantic == QuantI8DotSemantic::PackedI5 ||
-        facts.semantic == QuantI8DotSemantic::PackedI3Grouped ||
-        facts.semantic == QuantI8DotSemantic::IQ2S ||
-        facts.semantic == QuantI8DotSemantic::Q6K ||
-        facts.semantic == QuantI8DotSemantic::IQ1M ||
-        (facts.semantic == QuantI8DotSemantic::IQ3S && lanes == 64);
-    const bool shapeHasEmitter =
-        ((facts.semantic == QuantI8DotSemantic::PackedI4 ||
-          facts.semantic == QuantI8DotSemantic::PackedI5) &&
-         lanes == 32 &&
-         (*byteShape == RVVVectorShape{8, 16} ||
-          *byteShape == RVVVectorShape{8, 8})) ||
-        (facts.semantic == QuantI8DotSemantic::PackedI3Grouped &&
-         (lanes == 32 || lanes == 64) &&
-         *byteShape == RVVVectorShape{8, 16}) ||
-        ((facts.semantic == QuantI8DotSemantic::IQ2S ||
-          facts.semantic == QuantI8DotSemantic::IQ1M ||
-          facts.semantic == QuantI8DotSemantic::Q6K ||
-          facts.semantic == QuantI8DotSemantic::IQ3S) &&
-         *byteShape == RVVVectorShape{8, 16});
-    if (registerImplementation && shapeHasEmitter &&
-        registerPeak < static_cast<unsigned>(target.vectorRegisters)) {
+    if (registerPeak < static_cast<unsigned>(target.vectorRegisters)) {
       SelectedQuantI8DotPhysical selected;
       selected.implementation.primitive = primitive;
       selected.implementation.structure =
           LocalImplementationStructure::RVVRegisterMicrokernel;
       selected.implementation.parameters.semanticLanes = lanes;
       selected.implementation.parameters.primaryShape = *byteShape;
+      if (!selectLocalImplementationLeaf(selected.implementation))
+        continue;
       selected.semanticLanes = lanes;
       selected.byteShape = *byteShape;
       selected.reductionSegments = segments;
@@ -1353,6 +1497,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
   selected.implementation.parameters.semanticLanes = 16;
   selected.implementation.parameters.primaryShape = stripShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.semanticLanes = 16;
   selected.byteShape = stripShape;
   selected.reductionSegments = 1;
@@ -1398,6 +1544,8 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
     selected.implementation.parameters.semanticLanes = 32;
     selected.implementation.parameters.primaryShape = candidate.packed;
     selected.implementation.parameters.secondaryShape = candidate.activation;
+    if (!selectLocalImplementationLeaf(selected.implementation))
+      continue;
     selected.packedShape = candidate.packed;
     selected.activationShape = candidate.activation;
     selected.resources.architecturalGroups = target.vectorRegisters;
@@ -1421,6 +1569,8 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
   selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
   selected.implementation.parameters.semanticLanes = 0;
   selected.implementation.parameters.primaryShape = stripShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.packedShape = stripShape;
   selected.activationShape = stripShape;
   selected.resources.architecturalGroups = target.vectorRegisters;
@@ -1460,6 +1610,8 @@ selectGroupedAffineI4I8Physical(
   selected.implementation.parameters.semanticLanes = 32;
   selected.implementation.parameters.primaryShape = kRVVE8M1;
   selected.implementation.parameters.secondaryShape = kRVVE16M2;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.scaleShape = *scaleShape;
   selected.activationSumShape = *activationSumShape;

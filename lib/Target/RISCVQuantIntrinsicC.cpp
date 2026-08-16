@@ -47,63 +47,83 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 
 void emitQuantLocalImplementations(llvm::raw_ostream &output,
                                    const SelectedLocalImplementations &selected) {
-  auto reg = [&](LocalPrimitiveKind primitive, unsigned lanes,
+  auto reg = [&](LocalImplementationLeaf leaf, unsigned lanes,
                  RVVVectorShape shape) {
-    return selected.contains(
-        primitive, LocalImplementationStructure::RVVRegisterMicrokernel,
-        lanes, shape);
+    return selected.contains(leaf, lanes, shape);
   };
-  auto strip = [&](LocalPrimitiveKind primitive) {
-    return selected.contains(primitive,
-                             LocalImplementationStructure::RVVStripLoop);
+  auto strip = [&](LocalImplementationLeaf leaf) {
+    return selected.contains(leaf);
   };
-  const bool iq2Register32 = reg(LocalPrimitiveKind::IQ2SI8, 32, {8, 16});
-  const bool iq2Register64 = reg(LocalPrimitiveKind::IQ2SI8, 64, {8, 16});
-  const bool iq2Strip = strip(LocalPrimitiveKind::IQ2SI8);
-  const bool iq3Register64 = reg(LocalPrimitiveKind::IQ3SI8, 64, {8, 16});
-  const bool iq3Strip = strip(LocalPrimitiveKind::IQ3SI8);
-  const bool iq1Register32 = reg(LocalPrimitiveKind::IQ1MI8, 32, {8, 16});
-  const bool iq1Register64 = reg(LocalPrimitiveKind::IQ1MI8, 64, {8, 16});
-  const bool iq1Strip = strip(LocalPrimitiveKind::IQ1MI8);
-  const bool q6Register32 = reg(LocalPrimitiveKind::Q6KI8, 32, {8, 16});
-  const bool q6Register64 = reg(LocalPrimitiveKind::Q6KI8, 64, {8, 16});
-  const bool q6Strip = strip(LocalPrimitiveKind::Q6KI8);
-  const bool packedI4E8M2 = reg(LocalPrimitiveKind::PackedI4I8, 32, {8, 16});
-  const bool packedI4E8M1 = reg(LocalPrimitiveKind::PackedI4I8, 32, {8, 8});
-  const bool packedI5E8M2 = reg(LocalPrimitiveKind::PackedI5I8, 32, {8, 16});
-  const bool packedI5E8M1 = reg(LocalPrimitiveKind::PackedI5I8, 32, {8, 8});
+  const bool iq2Register32 =
+      reg(LocalImplementationLeaf::RVVIQ2SI8Register, 32, {8, 16});
+  const bool iq2Register64 =
+      reg(LocalImplementationLeaf::RVVIQ2SI8Register, 64, {8, 16});
+  const bool iq2Strip = strip(LocalImplementationLeaf::RVVIQ2SI8Strip);
+  const bool iq3Register64 =
+      reg(LocalImplementationLeaf::RVVIQ3SI8Register, 64, {8, 16});
+  const bool iq3Strip = strip(LocalImplementationLeaf::RVVIQ3SI8Strip);
+  const bool iq1Register32 =
+      reg(LocalImplementationLeaf::RVVIQ1MI8Register, 32, {8, 16});
+  const bool iq1Register64 =
+      reg(LocalImplementationLeaf::RVVIQ1MI8Register, 64, {8, 16});
+  const bool iq1Strip = strip(LocalImplementationLeaf::RVVIQ1MI8Strip);
+  const bool q6Register32 =
+      reg(LocalImplementationLeaf::RVVQ6KI8Register, 32, {8, 16});
+  const bool q6Register64 =
+      reg(LocalImplementationLeaf::RVVQ6KI8Register, 64, {8, 16});
+  const bool q6Strip = strip(LocalImplementationLeaf::RVVQ6KI8Strip);
+  const bool packedI4E8M2 =
+      reg(LocalImplementationLeaf::RVVPackedI4I8Register, 32, {8, 16});
+  const bool packedI4E8M1 =
+      reg(LocalImplementationLeaf::RVVPackedI4I8Register, 32, {8, 8});
+  const bool packedI5E8M2 =
+      reg(LocalImplementationLeaf::RVVPackedI5I8Register, 32, {8, 16});
+  const bool packedI5E8M1 =
+      reg(LocalImplementationLeaf::RVVPackedI5I8Register, 32, {8, 8});
   const bool packedI3L32 =
-      reg(LocalPrimitiveKind::PackedI3GroupedI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVPackedI3GroupedI8Register, 32,
+          {8, 16});
   const bool packedI3L64 =
-      reg(LocalPrimitiveKind::PackedI3GroupedI8, 64, {8, 16});
+      reg(LocalImplementationLeaf::RVVPackedI3GroupedI8Register, 64,
+          {8, 16});
   const bool nibbleE8M2 =
-      reg(LocalPrimitiveKind::NibbleCodebookI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVNibbleCodebookI8Register, 32,
+          {8, 16});
   const bool nibbleE8M1 =
-      reg(LocalPrimitiveKind::NibbleCodebookI8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVNibbleCodebookI8Register, 32, {8, 8});
   const bool base3E8M2 =
-      reg(LocalPrimitiveKind::Base3TernaryI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVBase3TernaryI8Register, 32, {8, 16});
   const bool base3E8M1 =
-      reg(LocalPrimitiveKind::Base3TernaryI8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVBase3TernaryI8Register, 32, {8, 8});
   const bool packedI2E8M2 =
-      reg(LocalPrimitiveKind::PackedI2TernaryI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVPackedI2TernaryI8Register, 32,
+          {8, 16});
   const bool packedI2E8M1 =
-      reg(LocalPrimitiveKind::PackedI2TernaryI8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVPackedI2TernaryI8Register, 32, {8, 8});
   const bool signed8E8M2 =
-      reg(LocalPrimitiveKind::SignedCodebook8I8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVSignedCodebook8I8Register, 32,
+          {8, 16});
   const bool signed8E8M1 =
-      reg(LocalPrimitiveKind::SignedCodebook8I8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVSignedCodebook8I8Register, 32,
+          {8, 8});
   const bool signed4E8M2 =
-      reg(LocalPrimitiveKind::SignedCodebook4I8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVSignedCodebook4I8Register, 32,
+          {8, 16});
   const bool signed4E8M1 =
-      reg(LocalPrimitiveKind::SignedCodebook4I8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVSignedCodebook4I8Register, 32,
+          {8, 8});
   const bool packedU9U7E8M2 =
-      reg(LocalPrimitiveKind::PackedU9U7CodebookI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVPackedU9U7CodebookI8Register, 32,
+          {8, 16});
   const bool packedU9U7E8M1 =
-      reg(LocalPrimitiveKind::PackedU9U7CodebookI8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVPackedU9U7CodebookI8Register, 32,
+          {8, 8});
   const bool packedU11E8M2 =
-      reg(LocalPrimitiveKind::PackedU11GridDeltaI8, 32, {8, 16});
+      reg(LocalImplementationLeaf::RVVPackedU11GridDeltaI8Register, 32,
+          {8, 16});
   const bool packedU11E8M1 =
-      reg(LocalPrimitiveKind::PackedU11GridDeltaI8, 32, {8, 8});
+      reg(LocalImplementationLeaf::RVVPackedU11GridDeltaI8Register, 32,
+          {8, 8});
   if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
