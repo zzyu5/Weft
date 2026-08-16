@@ -240,5 +240,7 @@ intrinsic C生成不再读取VLEN二次分派。
 IQ2_XS通过`W.packed_u9_u7_codebook_i8_dot`显式保留u9/u7 packed index和双nibble scale关系。
 IQ1_S通过`W.packed_u11_grid_delta_i8_dot`显式保留u11 grid index、local scale和activation-sum
 correction关系。
+IQ4_NL与IQ4_XS通过`W.nibble_codebook_i8_dot`共享16-entry nibble table decode、widening dot和
+reduction，格式各自的block stride与scale层次仍在DSL kernel。
 每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel
 route。

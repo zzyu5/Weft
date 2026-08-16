@@ -73,6 +73,10 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
       leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN128);
   bool packedI5VLEN256 =
       leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN256);
+  bool nibbleCodebookVLEN128 =
+      leaves.contains(IntrinsicCLeaf::NibbleCodebookI8VLEN128);
+  bool nibbleCodebookVLEN256 =
+      leaves.contains(IntrinsicCLeaf::NibbleCodebookI8VLEN256);
   bool base3VLEN128 =
       leaves.contains(IntrinsicCLeaf::Base3TernaryI8VLEN128);
   bool base3VLEN256 =
@@ -102,6 +106,7 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
       !iq1FixedLanes64 && !iq1Scalable && !q6FixedLanes32 &&
       !q6FixedLanes64 && !q6Scalable && !packedI4VLEN128 &&
       !packedI4VLEN256 && !packedI5VLEN128 && !packedI5VLEN256 &&
+      !nibbleCodebookVLEN128 && !nibbleCodebookVLEN256 &&
       !base3VLEN128 && !base3VLEN256 &&
       !packedI2VLEN128 && !packedI2VLEN256 &&
       !signedCodebook8VLEN128 && !signedCodebook8VLEN256 &&
@@ -171,6 +176,8 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
                          q6Scalable);
   emitPackedI4IntrinsicCLeaves(output, packedI4VLEN128, packedI4VLEN256);
   emitPackedI5IntrinsicCLeaves(output, packedI5VLEN128, packedI5VLEN256);
+  emitNibbleCodebookIntrinsicCLeaves(output, nibbleCodebookVLEN128,
+                                     nibbleCodebookVLEN256);
   emitTernaryIntrinsicCLeaves(output, base3VLEN128, base3VLEN256,
                               packedI2VLEN128, packedI2VLEN256);
   emitSignedCodebookIntrinsicCLeaves(

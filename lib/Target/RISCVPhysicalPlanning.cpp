@@ -315,6 +315,53 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   return selected;
 }
 
+std::optional<SelectedNibbleCodebookI8Physical>
+selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
+      (target.vlenBits != 128 && target.vlenBits != 256))
+    return std::nullopt;
+  std::optional<RVVVectorShape> packedShape =
+      rvvShapeForSemanticLanes(8, 16, target);
+  std::optional<RVVVectorShape> activationShape =
+      rvvShapeForSemanticLanes(8, 32, target);
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSemanticLanes(16, target.vlenBits == 128 ? 32 : 16, target);
+  if (!packedShape || !activationShape || !productShape ||
+      !target.supportsVectorShape(kRVVE32M1.sew,
+                                  kRVVE32M1.lmulEighths))
+    return std::nullopt;
+
+  SelectedNibbleCodebookI8Physical selected;
+  selected.realization =
+      target.vlenBits == 128
+          ? NibbleCodebookI8Realization::RVVVLEN128TableDot
+          : NibbleCodebookI8Realization::RVVVLEN256TableDot;
+  selected.packedShape = *packedShape;
+  selected.tableShape =
+      target.vlenBits == 128 ? *activationShape : *packedShape;
+  selected.activationShape = *activationShape;
+  selected.productShape = *productShape;
+  selected.reductionShape = kRVVE32M1;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups =
+      rvvRegisterGroups(*packedShape) +
+      rvvRegisterGroups(selected.tableShape) +
+      rvvRegisterGroups(*activationShape);
+  selected.resources.memoryGroups = selected.resources.valueGroups;
+  unsigned productGroups = rvvRegisterGroups(*productShape) *
+                           (target.vlenBits == 128 ? 1 : 2);
+  selected.resources.primitiveGroups =
+      rvvRegisterGroups(*packedShape) +
+      rvvRegisterGroups(selected.tableShape) +
+      rvvRegisterGroups(*activationShape) +
+      productGroups + 2;
+  selected.resources.peakGroups = selected.resources.primitiveGroups;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
 std::optional<SelectedQuantI8DotPhysical>
 selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {

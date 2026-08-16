@@ -302,6 +302,25 @@ def WeftExtension_PackedU11GridDeltaI8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_NibbleCodebookI8DotOp
+    : WeftExtension_Op<"nibble_codebook_i8_dot", [Pure]> {
+  let summary = "Nibble-selected codebook by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element signed integer dot.  Sixteen packed bytes
+    select low- and high-nibble entries from an explicit sixteen-element signed
+    i8 table.  The two decoded sixteen-element halves are paired with the two
+    halves of activation, multiplied by dot_scale, and accumulated into init.
+
+    Packed block layout, table storage, outer traversal, target vector shape,
+    and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$packed_codes, AnyType:$table,
+                       AnyType:$activation, AnyType:$dot_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

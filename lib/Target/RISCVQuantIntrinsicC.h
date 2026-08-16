@@ -19,6 +19,8 @@ void emitPackedI4IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
                                   bool vlen256);
 void emitPackedI5IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
                                   bool vlen256);
+void emitNibbleCodebookIntrinsicCLeaves(llvm::raw_ostream &output,
+                                        bool vlen128, bool vlen256);
 void emitTernaryIntrinsicCLeaves(llvm::raw_ostream &output,
                                  bool base3VLEN128, bool base3VLEN256,
                                  bool packedI2VLEN128,

@@ -370,6 +370,20 @@ mlir::LogicalResult PackedU11GridDeltaI8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult NibbleCodebookI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getPackedCodes(), 16, false,
+                                  "packed_codes")) ||
+      mlir::failed(verifyByteBlock(*this, getTable(), 16, true, "table")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 32, true,
+                                  "activation")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getDotScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "dot_scale")))
+    return emitOpError("dot_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {

@@ -160,6 +160,25 @@ std::optional<SelectedCodebookGatherI8Physical>
 selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
                                const RISCVTargetProfile &target);
 
+enum class NibbleCodebookI8Realization {
+  RVVVLEN128TableDot,
+  RVVVLEN256TableDot,
+};
+
+struct SelectedNibbleCodebookI8Physical {
+  NibbleCodebookI8Realization realization =
+      NibbleCodebookI8Realization::RVVVLEN128TableDot;
+  RVVVectorShape packedShape;
+  RVVVectorShape tableShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedNibbleCodebookI8Physical>
+selectNibbleCodebookI8Physical(const RISCVTargetProfile &target);
+
 enum class QuantI8DotSemantic {
   PackedI4,
   PackedI5,

@@ -151,32 +151,20 @@ def iq4_nl_row_dot(weight, activation, codebook, blocks):
         x = weight + block * W.index(18)
         y = activation + block * W.index(34)
         member = W.block(16)
+        activation_member = W.block(32)
         packed_codes = W.load(x + W.index(2) + member, other=W.u8(0))
         table = W.bitcast(W.load(codebook + member, other=W.u8(0)), W.i8)
-        low = W.decode(packed_codes & W.u8(15), table, out_dtype=W.i8)
-        high = W.decode(packed_codes >> W.u8(4), table, out_dtype=W.i8)
-        activation_low = W.bitcast(
-            W.load(y + W.index(2) + member, other=W.u8(0)), W.i8
-        )
-        activation_high = W.bitcast(
-            W.load(y + W.index(18) + member, other=W.u8(0)), W.i8
-        )
-        low_sum = W.reduce(
-            W.cast(low, W.i32) * W.cast(activation_low, W.i32),
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
-        )
-        high_sum = W.reduce(
-            W.cast(high, W.i32) * W.cast(activation_high, W.i32),
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
-        )
         scale = W.load_f16_le(x) * W.load_f16_le(y)
-        result = result + scale * W.cast(low_sum + high_sum, W.f32)
+        result = W.nibble_codebook_i8_dot(
+            packed_codes,
+            table,
+            W.bitcast(
+                W.load(y + W.index(2) + activation_member, other=W.u8(0)),
+                W.i8,
+            ),
+            scale,
+            result,
+        )
     return result
 
 
@@ -232,6 +220,7 @@ def iq4_xs_row_dot(weight, activation, codebook, blocks):
                     low_scale | (high_scale << W.u8(4)), W.f32
                 ) - W.f32(32.0)
                 member = W.block(16)
+                activation_member = W.block(32)
                 packed_codes = W.load(
                     x + W.index(8) + group * W.index(16) + member,
                     other=W.u8(0),
@@ -239,45 +228,23 @@ def iq4_xs_row_dot(weight, activation, codebook, blocks):
                 table = W.bitcast(
                     W.load(codebook + member, other=W.u8(0)), W.i8
                 )
-                low = W.decode(
-                    packed_codes & W.u8(15), table, out_dtype=W.i8
-                )
-                high = W.decode(
-                    packed_codes >> W.u8(4), table, out_dtype=W.i8
-                )
-                activation_low = W.bitcast(
-                    W.load(
-                        y + W.index(4) + group * W.index(32) + member,
-                        other=W.u8(0),
+                result = W.nibble_codebook_i8_dot(
+                    packed_codes,
+                    table,
+                    W.bitcast(
+                        W.load(
+                            y
+                            + W.index(4)
+                            + group * W.index(32)
+                            + activation_member,
+                            other=W.u8(0),
+                        ),
+                        W.i8,
                     ),
-                    W.i8,
-                )
-                activation_high = W.bitcast(
-                    W.load(
-                        y + W.index(20) + group * W.index(32) + member,
-                        other=W.u8(0),
-                    ),
-                    W.i8,
-                )
-                low_sum = W.reduce(
-                    W.cast(low, W.i32) * W.cast(activation_low, W.i32),
-                    identity=W.i32(0),
-                    axis=0,
-                    acc_dtype=W.i32,
-                    order="relaxed",
-                )
-                high_sum = W.reduce(
-                    W.cast(high, W.i32) * W.cast(activation_high, W.i32),
-                    identity=W.i32(0),
-                    axis=0,
-                    acc_dtype=W.i32,
-                    order="relaxed",
-                )
-                result = result + (
                     block_scale
                     * activation_scale
-                    * local_scale
-                    * W.cast(low_sum + high_sum, W.f32)
+                    * local_scale,
+                    result,
                 )
     return result
 

@@ -42,6 +42,7 @@ from .builtins import maximum
 from .builtins import minimum
 from .builtins import narrow
 from .builtins import neg_inf
+from .builtins import nibble_codebook_i8_dot
 from .builtins import online_softmax_summary
 from .builtins import packed_i4_i8_dot
 from .builtins import packed_i5_i8_dot

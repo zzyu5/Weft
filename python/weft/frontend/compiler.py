@@ -2629,6 +2629,19 @@ class FrontendCompiler:
             result_types=(operands[6].type,),
         )[0]
 
+    def _intrinsic_nibble_codebook_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.nibble_codebook_i8_dot",
+            ("packed_codes", "table", "activation", "dot_scale", "init"),
+            (
+                ("packed_codes", 16, u8),
+                ("table", 16, i8),
+                ("activation", 32, i8),
+            ),
+            (("dot_scale", f32), ("init", f32)),
+        )
+
     def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(
             call,

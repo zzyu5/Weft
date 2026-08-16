@@ -205,6 +205,10 @@ W.packed_u11_grid_delta_i8_dot(
     grid_table, activation_sum, dot_scale, init,
 )
 
+W.nibble_codebook_i8_dot(
+    packed_codes, table, activation, dot_scale, init,
+)
+
 W.iq2_s_i8_dot(...)
 W.iq3_s_i8_dot(...)
 W.iq1_m_i8_dot(...)
