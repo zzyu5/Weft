@@ -838,6 +838,48 @@ selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
   return implementation;
 }
 
+namespace {
+
+struct I4I8FragmentResourceFacts {
+  RVVVectorShape codeShape;
+  RVVVectorShape scaleShape;
+  RVVVectorShape accumulatorShape;
+  unsigned rowTile = 1;
+  unsigned privateGroups = 0;
+};
+
+std::optional<PhysicalResourceBudget>
+calculateI4I8FragmentResources(const I4I8FragmentResourceFacts &facts,
+                               const RISCVTargetProfile &target) {
+  if (!facts.codeShape || !facts.scaleShape || !facts.accumulatorShape ||
+      facts.rowTile == 0 || facts.privateGroups == 0)
+    return std::nullopt;
+  for (RVVVectorShape shape :
+       {facts.codeShape, facts.scaleShape, facts.accumulatorShape})
+    if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
+      return std::nullopt;
+
+  const unsigned codeGroups =
+      facts.rowTile * rvvRegisterGroups(facts.codeShape);
+  const unsigned scaleGroups = rvvRegisterGroups(facts.scaleShape);
+  const unsigned accumulatorGroups =
+      facts.rowTile * rvvRegisterGroups(facts.accumulatorShape);
+  PhysicalResourceBudget resources;
+  resources.architecturalGroups = target.vectorRegisters;
+  resources.valueGroups =
+      accumulatorGroups +
+      (facts.rowTile == 1 ? 0 : facts.rowTile * scaleGroups);
+  resources.memoryGroups = codeGroups + scaleGroups;
+  resources.primitiveGroups = facts.privateGroups;
+  resources.peakGroups = resources.primitiveGroups + 1;
+  if (resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return resources;
+}
+
+} // namespace
+
 std::optional<SelectedVLALookupPhysical>
 selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
                         const RISCVTargetProfile &target) {
@@ -893,22 +935,18 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
         selected.accumulatorShape;
     if (!selectLocalImplementationLeaf(selected.implementation))
       return;
-    for (RVVVectorShape shape : {selected.codeShape,
-                                 selected.activationScaleShape,
-                                 selected.accumulatorShape})
-      if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
-        return;
-
-    selected.resources.architecturalGroups = target.vectorRegisters;
-    selected.resources.valueGroups = facts.rowTile == 4 ? 20 : 4;
-    selected.resources.memoryGroups = facts.rowTile == 4 ? 5 : 2;
-    selected.resources.primitiveGroups =
-        ime ? 28 : facts.rowTile == 4 ? (facts.affine ? 25 : 24)
-                                      : (facts.affine ? 13 : 12);
-    selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
-    if (selected.resources.peakGroups >=
-        static_cast<unsigned>(target.vectorRegisters))
+    const unsigned privateGroups =
+        ime ? 28
+            : facts.rowTile * rvvRegisterGroups(selected.accumulatorShape) +
+                  8 + static_cast<unsigned>(facts.affine);
+    std::optional<PhysicalResourceBudget> resources =
+        calculateI4I8FragmentResources(
+            {selected.codeShape, selected.activationScaleShape,
+             selected.accumulatorShape, facts.rowTile, privateGroups},
+            target);
+    if (!resources)
       return;
+    selected.resources = *resources;
     candidates.push_back(Candidate{std::move(selected), instructionCost});
   };
   appendCandidate(LocalImplementationStructure::RVVRegisterMicrokernel,
