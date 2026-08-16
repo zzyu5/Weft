@@ -716,14 +716,6 @@ struct SelectedSignBitI8Physical {
 std::optional<SelectedSignBitI8Physical>
 selectSignBitI8Physical(const RISCVTargetProfile &target);
 
-struct RVVWideningChain {
-  RVVVectorShape sourceShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  unsigned semanticLanes = 0;
-  unsigned reductionSegments = 0;
-};
-
 struct RVVShapeMultiplicity {
   RVVVectorShape shape;
   unsigned count = 0;
@@ -757,8 +749,8 @@ enum class TernaryDecodeTopology {
 struct SelectedTernaryI8DotPhysical {
   LocalImplementation implementation;
   TernaryDecodeTopology decode = TernaryDecodeTopology::Base3Digits;
-  RVVWideningChain primaryWidening;
-  RVVWideningChain secondaryWidening;
+  RVVVectorShape primarySourceShape;
+  RVVVectorShape secondarySourceShape;
   PhysicalResourceBudget resources;
 };
 
@@ -772,20 +764,10 @@ struct CodebookGatherI8CandidateFacts {
   unsigned entryWidth = 0;
 };
 
-struct CodebookGatherTopology {
-  unsigned codeCount = 0;
-  unsigned indexShift = 0;
-  unsigned tableSEW = 0;
-  unsigned gatherByteStride = 0;
-};
-
 struct SelectedCodebookGatherI8Physical {
   LocalImplementation implementation;
-  CodebookGatherTopology gather;
   RVVVectorShape codeShape;
-  RVVVectorShape indexShape;
-  RVVVectorShape tableShape;
-  RVVWideningChain widening;
+  RVVVectorShape activationShape;
   PhysicalResourceBudget resources;
 };
 
@@ -797,7 +779,7 @@ struct SelectedNibbleCodebookI8Physical {
   LocalImplementation implementation;
   RVVVectorShape packedShape;
   RVVVectorShape tableShape;
-  RVVWideningChain widening;
+  RVVVectorShape activationShape;
   PhysicalResourceBudget resources;
 };
 
@@ -814,16 +796,6 @@ enum class QuantI8DotSemantic {
   Q6K,
 };
 
-enum class QuantDecodeTopology {
-  PackedNibble,
-  PackedNibbleHighBit,
-  GroupedBitPlane,
-  GridSignLookup,
-  GridSignHighBitLookup,
-  GridDeltaLookup,
-  SplitBitPlane,
-};
-
 struct QuantI8DotCandidateFacts {
   QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
   unsigned semanticExtent = 256;
@@ -831,8 +803,7 @@ struct QuantI8DotCandidateFacts {
 
 struct SelectedQuantI8DotPhysical {
   LocalImplementation implementation;
-  QuantDecodeTopology decode = QuantDecodeTopology::PackedNibble;
-  RVVWideningChain widening;
+  RVVVectorShape operandShape;
   PhysicalResourceBudget resources;
 };
 

@@ -1336,10 +1336,8 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   selected.decode = facts.semantic == TernaryI8DotSemantic::Base3Digits
                         ? TernaryDecodeTopology::Base3Digits
                         : TernaryDecodeTopology::PackedI2Fields;
-  selected.primaryWidening =
-      RVVWideningChain{*byte32, *widened32, kRVVE32M1, 32, 2};
-  selected.secondaryWidening =
-      RVVWideningChain{*byte16, *widened16, kRVVE32M1, 16, 1};
+  selected.primarySourceShape = *byte32;
+  selected.secondarySourceShape = *byte16;
 
   QuantDecodeResourceFacts resources;
   resources.loadedValues = {{*byte32, 1}, {*byte16, 1}};
@@ -1414,15 +1412,8 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   selected.implementation.parameters.secondaryShape = *tableShape;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.gather.codeCount = codeCount;
-  selected.gather.indexShift = facts.entryWidth == 8 ? 3 : 2;
-  selected.gather.tableSEW = tableSEW;
-  selected.gather.gatherByteStride = facts.entryWidth;
   selected.codeShape = *codeShape;
-  selected.indexShape = *indexShape;
-  selected.tableShape = *tableShape;
-  selected.widening =
-      RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
+  selected.activationShape = *activationShape;
   QuantDecodeResourceFacts resources;
   resources.loadedValues =
       {{*codeShape, 1}, {*tableShape, 1}, {*activationShape, 1}};
@@ -1471,8 +1462,7 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
     return std::nullopt;
   selected.packedShape = *packedShape;
   selected.tableShape = combined ? *activationShape : *packedShape;
-  selected.widening =
-      RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
+  selected.activationShape = *activationShape;
   QuantDecodeResourceFacts resources;
   resources.loadedValues =
       {{*packedShape, 1}, {selected.tableShape, 1}, {*activationShape, 1}};
@@ -1497,35 +1487,27 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   if (facts.semanticExtent == 0)
     return std::nullopt;
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
-  QuantDecodeTopology decode = QuantDecodeTopology::PackedNibble;
   switch (facts.semantic) {
   case QuantI8DotSemantic::PackedI4:
     primitive = LocalPrimitiveKind::PackedI4I8;
-    decode = QuantDecodeTopology::PackedNibble;
     break;
   case QuantI8DotSemantic::PackedI5:
     primitive = LocalPrimitiveKind::PackedI5I8;
-    decode = QuantDecodeTopology::PackedNibbleHighBit;
     break;
   case QuantI8DotSemantic::PackedI3Grouped:
     primitive = LocalPrimitiveKind::PackedI3GroupedI8;
-    decode = QuantDecodeTopology::GroupedBitPlane;
     break;
   case QuantI8DotSemantic::IQ2S:
     primitive = LocalPrimitiveKind::IQ2SI8;
-    decode = QuantDecodeTopology::GridSignLookup;
     break;
   case QuantI8DotSemantic::IQ3S:
     primitive = LocalPrimitiveKind::IQ3SI8;
-    decode = QuantDecodeTopology::GridSignHighBitLookup;
     break;
   case QuantI8DotSemantic::IQ1M:
     primitive = LocalPrimitiveKind::IQ1MI8;
-    decode = QuantDecodeTopology::GridDeltaLookup;
     break;
   case QuantI8DotSemantic::Q6K:
     primitive = LocalPrimitiveKind::Q6KI8;
-    decode = QuantDecodeTopology::SplitBitPlane;
     break;
   }
 
@@ -1560,9 +1542,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       selected.implementation.parameters.primaryShape = *byteShape;
       if (!selectLocalImplementationLeaf(selected.implementation))
         continue;
-      selected.decode = decode;
-      selected.widening = RVVWideningChain{*byteShape, *productShape,
-                                           kRVVE32M1, lanes, segments};
+      selected.operandShape = *byteShape;
       selected.resources = *budget;
       return selected;
     }
@@ -1583,9 +1563,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.implementation.parameters.primaryShape = stripShape;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.decode = decode;
-  selected.widening = RVVWideningChain{stripShape, RVVVectorShape{16, 32},
-                                       kRVVE32M1, 16, 1};
+  selected.operandShape = stripShape;
   QuantDecodeResourceFacts stripResources;
   stripResources.loadedValues = {{stripShape, 2}};
   stripResources.temporaryValues = {{kRVVE32M1, 2}};

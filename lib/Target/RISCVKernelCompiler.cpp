@@ -7531,14 +7531,14 @@ private:
     const TernaryI8Decision &decision = planned.realization;
     if (decision.physical.decode == TernaryDecodeTopology::Base3Digits) {
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[0]},
-                              decision.physical.primaryWidening.sourceShape);
+                              decision.physical.primarySourceShape);
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[1]},
-                              decision.physical.secondaryWidening.sourceShape);
+                              decision.physical.secondarySourceShape);
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[2]},
-                              decision.physical.primaryWidening.sourceShape);
+                              decision.physical.primarySourceShape);
     } else {
       recordLocalBlockReloads(planned, op.getOperation(), decision.blocks,
-                              decision.physical.primaryWidening.sourceShape);
+                              decision.physical.primarySourceShape);
     }
     planned.entity.resources = decision.physical.resources;
   }
@@ -7552,7 +7552,7 @@ private:
                             planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.physical.widening.sourceShape);
+                            planned.realization.physical.activationShape);
     planned.entity.resources = planned.realization.physical.resources;
   }
 
@@ -7565,7 +7565,7 @@ private:
                             planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.physical.widening.sourceShape);
+                            planned.realization.physical.activationShape);
     planned.entity.resources = planned.realization.physical.resources;
   }
 
@@ -7578,7 +7578,7 @@ private:
                             planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.physical.widening.sourceShape);
+                            planned.realization.physical.activationShape);
     planned.entity.resources = planned.realization.physical.resources;
   }
 
@@ -7594,7 +7594,7 @@ private:
                             planned.realization.physical.tableShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.physical.widening.sourceShape);
+                            planned.realization.physical.activationShape);
     planned.entity.resources = planned.realization.physical.resources;
   }
 
@@ -7602,8 +7602,7 @@ private:
   void finalizeQuantI8Plan(
       OpTy op, PlannedPhysicalDecision<QuantI8DotDecision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape shape =
-        planned.realization.physical.widening.sourceShape;
+    RVVVectorShape shape = planned.realization.physical.operandShape;
     recordLocalBlockReloads(planned, op.getOperation(),
                             planned.realization.blocks, shape);
     planned.entity.resources = planned.realization.physical.resources;
