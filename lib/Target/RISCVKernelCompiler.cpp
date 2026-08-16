@@ -4035,16 +4035,30 @@ private:
     std::optional<unsigned> dataLMUL = rvvIntegerLMUL(entity.vlaDataShape);
     if (!dataLMUL || entity.vlaMaskRatio == 0)
       return op.emitError("VLA entity has no selected data or mask shape");
+    const std::string dataType =
+        rvvVectorType(RVVElementCategory::Floating, entity.vlaDataShape);
+    const std::string dataSuffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::Floating, entity.vlaDataShape);
+    const std::string setVL = rvvSetVLIntrinsic(entity.vlaDataShape);
+    const std::string setVLMax = rvvSetVLMaxIntrinsic(entity.vlaDataShape);
+    const std::string scalarF32Type =
+        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+    const std::string scalarF32Suffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+    if (dataType.empty() || dataSuffix.empty() || setVL.empty() ||
+        setVLMax.empty() || scalarF32Type.empty() || scalarF32Suffix.empty())
+      return op.emitError("VLA entity has no intrinsic-C RVV spelling");
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
       if (state.carry == VLAStateCarryRepresentation::Vector) {
+        if (entity.vlaDataShape.sew != 32)
+          return state.operation->emitError(
+              "vector state carry requires the selected f32 VLA shape");
         std::string accumulator = fresh("reduce_acc");
-        std::string suffix = "f32m" + std::to_string(*dataLMUL);
-        line("vfloat32m" + std::to_string(*dataLMUL) + "_t " +
-             accumulator + " = __riscv_vfmv_v_f_" + suffix + "(" +
-             expression(state.identity) + ", __riscv_vsetvlmax_e32m" +
-             std::to_string(*dataLMUL) + "());");
+        line(dataType + " " + accumulator + " = __riscv_vfmv_v_f_" +
+             dataSuffix + "(" + expression(state.identity) + ", " +
+             setVLMax + "());");
         CValue aggregate{state.elementType, CValueKind::F32BlockStorage,
                          accumulator};
         aggregates[state.operation] = aggregate;
@@ -4174,9 +4188,7 @@ private:
     line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
          " < " + end.spelling + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" +
-         std::to_string(entity.vlaDataShape.sew) + "m" +
-         std::to_string(*dataLMUL) + "(" + end.spelling +
+    line("const size_t " + vl + " = " + setVL + "(" + end.spelling +
          " - " + strip + ");");
     if (mlir::failed(emitStripBody()))
       return mlir::failure();
@@ -4193,18 +4205,15 @@ private:
       std::string seed = fresh("reduce_seed");
       std::string reduced = fresh("reduce_final");
       std::string result = fresh("reduce_result");
-      std::string suffix = "f32m" + std::to_string(*dataLMUL);
-      line("vfloat32m1_t " + seed +
-           " = __riscv_vfmv_v_f_f32m1(" + expression(state.identity) +
-           ", 1);");
+      line(scalarF32Type + " " + seed + " = __riscv_vfmv_v_f_" +
+           scalarF32Suffix + "(" + expression(state.identity) + ", 1);");
       std::string intrinsic =
           state.finalize == VLAStateFinalize::HorizontalAdd
               ? "__riscv_vfredusum_vs_"
               : "__riscv_vfredmax_vs_";
-      line("vfloat32m1_t " + reduced + " = " + intrinsic + suffix +
-           "_f32m1(" + aggregate.spelling + ", " + seed +
-           ", __riscv_vsetvlmax_e32m" + std::to_string(*dataLMUL) +
-           "());");
+      line(scalarF32Type + " " + reduced + " = " + intrinsic + dataSuffix +
+           "_" + scalarF32Suffix + "(" + aggregate.spelling + ", " + seed +
+           ", " + setVLMax + "());");
       line("const float " + result +
            " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
       values[reduce.getResult()] =
@@ -10523,8 +10532,11 @@ private:
     }
     planned.entity.blockStore = selected->decision;
     planned.entity.resources = selected->resources;
-    physicalPlan.blockStoreGroups.try_emplace(op.getOperation(),
-                                               std::move(planned));
+    if (!physicalPlan.blockStoreGroups
+             .try_emplace(op.getOperation(), std::move(planned))
+             .second)
+      return op.emitError(
+          "one block store group cannot own multiple physical decisions");
     return mlir::success();
   }
 
@@ -10604,8 +10616,11 @@ private:
     planned.realization.values.push_back(reductionValue);
     planned.entity.blockReduce = selected->decision;
     planned.entity.resources = selected->resources;
-    physicalPlan.blockReduceGroups.try_emplace(op.getOperation(),
-                                                std::move(planned));
+    if (!physicalPlan.blockReduceGroups
+             .try_emplace(op.getOperation(), std::move(planned))
+             .second)
+      return op.emitError(
+          "one block reduction group cannot own multiple physical decisions");
     return mlir::success();
   }
 
@@ -11100,8 +11115,9 @@ private:
           "selected VLA state validity requires a logical predicate mask");
       return mlir::failure();
     }
-    std::optional<unsigned> dataLMUL = physicalValueLMUL(semanticInput);
-    if (!dataLMUL) {
+    const PhysicalValueDecision *inputShape =
+        findVLAValueDecision(semanticInput);
+    if (!inputShape || inputShape->shape.sew != 32) {
       owner->emitError("VLA state validity has no physical input shape");
       return mlir::failure();
     }
@@ -11116,13 +11132,20 @@ private:
       owner->emitError("VLA state validity has no selected inactive value");
       return mlir::failure();
     }
-    std::string suffix = "f32m" + std::to_string(*dataLMUL);
+    std::string suffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::Floating, inputShape->shape);
+    std::string vectorType =
+        rvvVectorType(RVVElementCategory::Floating, inputShape->shape);
+    if (suffix.empty() || vectorType.empty()) {
+      owner->emitError("VLA state validity has no RVV intrinsic spelling");
+      return mlir::failure();
+    }
     std::string inactive = fresh("state_inactive");
     std::string projected = fresh("state_input");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + inactive +
+    line(vectorType + " " + inactive +
          " = __riscv_vfmv_v_f_" + suffix + "(" + fill + ", " + activeVL +
          ");");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + projected +
+    line(vectorType + " " + projected +
          " = __riscv_vmerge_vvm_" + suffix + "(" + inactive + ", " +
          input.spelling + ", " + input.logicalValidity + ", " + activeVL +
          ");");
@@ -11141,20 +11164,27 @@ private:
         return op.emitError("RVV i8-to-i32 reduction projection is unavailable");
       const PhysicalValueDecision *inputShape =
           findVLAValueDecision(op.getInput());
-      std::string shapeSuffix =
-          inputShape ? rvvShapeSuffix(inputShape->shape) : std::string{};
-      if (!inputShape || inputShape->shape.sew != 8 || shapeSuffix.empty())
+      std::string inputSuffix =
+          inputShape ? rvvIntrinsicTypeSuffix(
+                           RVVElementCategory::SignedInteger, inputShape->shape)
+                     : std::string{};
+      const RVVVectorShape seedShape{16, 8};
+      std::string seedSuffix = rvvIntrinsicTypeSuffix(
+          RVVElementCategory::SignedInteger, seedShape);
+      std::string seedType =
+          rvvVectorType(RVVElementCategory::SignedInteger, seedShape);
+      if (!inputShape || inputShape->shape.sew != 8 || inputSuffix.empty() ||
+          seedSuffix.empty() || seedType.empty())
         return op.emitError("RVV i8 reduction has no physical input shape");
       std::string seed = fresh("i8_reduce_seed");
       std::string partial = fresh("i8_reduce_partial");
-      std::string suffix = "i" + shapeSuffix;
-      line("vint16m1_t " + seed +
-           " = __riscv_vmv_v_x_i16m1(0, 1);");
-      line("vint16m1_t " + partial + " = __riscv_vwredsum_vs_" + suffix +
-           "_i16m1(" + input.spelling + ", " + seed + ", " + activeVL +
-           ");");
-      line(aggregate.spelling + " += (int32_t)__riscv_vmv_x_s_i16m1_i16(" +
-           partial + ");");
+      line(seedType + " " + seed + " = __riscv_vmv_v_x_" + seedSuffix +
+           "(0, 1);");
+      line(seedType + " " + partial + " = __riscv_vwredsum_vs_" +
+           inputSuffix + "_" + seedSuffix + "(" + input.spelling + ", " +
+           seed + ", " + activeVL + ");");
+      line(aggregate.spelling + " += (int32_t)__riscv_vmv_x_s_" +
+           seedSuffix + "_i16(" + partial + ");");
       values[op.getResult()] = aggregate;
       return mlir::success();
     }
@@ -11164,20 +11194,29 @@ private:
         op.getOperation(), op.getInput(), input, decision);
     if (mlir::failed(projected))
       return mlir::failure();
-    std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
-    if (!dataLMUL)
+    const PhysicalValueDecision *inputShape =
+        findVLAValueDecision(op.getInput());
+    std::string inputSuffix =
+        inputShape ? rvvIntrinsicTypeSuffix(RVVElementCategory::Floating,
+                                            inputShape->shape)
+                   : std::string{};
+    std::string scalarSuffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+    std::string scalarType =
+        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+    if (!inputShape || inputShape->shape.sew != 32 || inputSuffix.empty() ||
+        scalarSuffix.empty() || scalarType.empty())
       return op.emitError("RVV reduction has no physical input shape");
     if (decision.carry == VLAStateCarryRepresentation::Vector) {
       if (aggregate.kind != CValueKind::F32BlockStorage)
         return op.emitError("RVV vector reduction carry is unavailable");
-      std::string suffix = "f32m" + std::to_string(*dataLMUL);
       if (decision.stripUpdate == VLAStateStripUpdate::AddReduction)
-        line(aggregate.spelling + " = __riscv_vfadd_vv_" + suffix + "_tu(" +
-             aggregate.spelling + ", " + aggregate.spelling + ", " +
+        line(aggregate.spelling + " = __riscv_vfadd_vv_" + inputSuffix +
+             "_tu(" + aggregate.spelling + ", " + aggregate.spelling + ", " +
              *projected + ", " + activeVL + ");");
       else if (decision.stripUpdate == VLAStateStripUpdate::MaxReduction)
-        line(aggregate.spelling + " = __riscv_vfmax_vv_" + suffix + "_tu(" +
-             aggregate.spelling + ", " + aggregate.spelling + ", " +
+        line(aggregate.spelling + " = __riscv_vfmax_vv_" + inputSuffix +
+             "_tu(" + aggregate.spelling + ", " + aggregate.spelling + ", " +
              *projected + ", " + activeVL + ");");
       else
         return op.emitError("selected VLA state is not a reduction");
@@ -11188,21 +11227,20 @@ private:
       return op.emitError("RVV scalar reduction carry is unavailable");
     std::string seed = fresh("seed");
     std::string partial = fresh("partial");
-    std::string inputSuffix = "f32m" + std::to_string(*dataLMUL);
-    line("vfloat32m1_t " + seed + " = __riscv_vfmv_v_f_f32m1(" +
-         aggregate.spelling + ", 1);");
+    line(scalarType + " " + seed + " = __riscv_vfmv_v_f_" + scalarSuffix +
+         "(" + aggregate.spelling + ", 1);");
     if (decision.stripUpdate == VLAStateStripUpdate::AddReduction)
-      line("vfloat32m1_t " + partial +
-           " = __riscv_vfredusum_vs_" + inputSuffix + "_f32m1(" +
+      line(scalarType + " " + partial + " = __riscv_vfredusum_vs_" +
+           inputSuffix + "_" + scalarSuffix + "(" +
            *projected + ", " + seed + ", " + activeVL + ");");
     else if (decision.stripUpdate == VLAStateStripUpdate::MaxReduction)
-      line("vfloat32m1_t " + partial +
-           " = __riscv_vfredmax_vs_" + inputSuffix + "_f32m1(" +
+      line(scalarType + " " + partial + " = __riscv_vfredmax_vs_" +
+           inputSuffix + "_" + scalarSuffix + "(" +
            *projected + ", " + seed + ", " + activeVL + ");");
     else
       return op.emitError("selected VLA state is not a reduction");
-    line(aggregate.spelling + " = __riscv_vfmv_f_s_f32m1_f32(" + partial +
-         ");");
+    line(aggregate.spelling + " = __riscv_vfmv_f_s_" + scalarSuffix +
+         "_f32(" + partial + ");");
     values[op.getResult()] = aggregate;
     return mlir::success();
   }
@@ -11219,81 +11257,92 @@ private:
         input.kind != CValueKind::F32Vector ||
         carry.kind != CValueKind::Scalar || carry.spelling.empty())
         return op.emitError("RVV scan projection is unavailable");
-    std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
-    if (!dataLMUL || !activePhysicalEntity ||
+    const PhysicalValueDecision *dataShape =
+        findVLAValueDecision(op.getInput());
+    if (!dataShape || dataShape->shape.sew != 32 || !activePhysicalEntity ||
         activePhysicalEntity->vlaMaskRatio == 0)
       return op.emitError("RVV scan has no physical data/mask shape");
     unsigned maskRatio = activePhysicalEntity->vlaMaskRatio;
-    unsigned laneIndexLMUL = *dataLMUL;
+    std::string dataSuffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::Floating, dataShape->shape);
+    std::string dataType =
+        rvvVectorType(RVVElementCategory::Floating, dataShape->shape);
+    std::string indexSuffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::UnsignedInteger, dataShape->shape);
+    std::string indexType =
+        rvvVectorType(RVVElementCategory::UnsignedInteger, dataShape->shape);
+    std::string maskType = rvvMaskType(maskRatio);
+    std::string maskOnlySuffix = rvvMaskSuffix(maskRatio);
+    if (dataSuffix.empty() || dataType.empty() || indexSuffix.empty() ||
+        indexType.empty() || maskType.empty() || maskOnlySuffix.empty())
+      return op.emitError("RVV scan has no intrinsic-C spelling");
 
     CValue segmentMask;
     CValue segmentValues;
-    std::string segmentShapeSuffix;
+    std::string segmentSuffix;
+    std::string segmentType;
     if (segmented) {
       segmentMask = require(decision.segmentStart);
       segmentValues = require(decision.segmentVector);
       const PhysicalValueDecision *segmentShape =
           findVLAValueDecision(decision.segmentVector);
-      segmentShapeSuffix =
-          segmentShape ? rvvShapeSuffix(segmentShape->shape) : std::string{};
+      segmentSuffix =
+          segmentShape ? rvvIntrinsicTypeSuffix(
+                             RVVElementCategory::UnsignedInteger,
+                             segmentShape->shape)
+                       : std::string{};
+      segmentType =
+          segmentShape ? rvvVectorType(RVVElementCategory::UnsignedInteger,
+                                       segmentShape->shape)
+                       : std::string{};
       if (segmentMask.kind != CValueKind::Mask ||
           segmentValues.kind != CValueKind::U8Vector ||
           segmentMask.spelling.empty() || segmentValues.spelling.empty() ||
           !segmentShape || segmentShape->shape.sew != 8 ||
-          segmentShapeSuffix.empty())
+          segmentSuffix.empty() || segmentType.empty())
         return op.emitError("segmented scan start projection is unavailable");
     }
 
     std::string indices = fresh("scan_indices");
     std::string prefix = fresh("scan_prefix");
     std::string offset = fresh("scan_offset");
-    std::string dataSuffix = "f32m" + std::to_string(*dataLMUL);
-    std::string indexSuffix =
-        "u32m" + std::to_string(laneIndexLMUL);
-    std::string maskSuffix =
-        indexSuffix + "_b" + std::to_string(maskRatio);
-    line("vuint32m" + std::to_string(laneIndexLMUL) + "_t " +
-         indices + " = __riscv_vid_v_" + indexSuffix + "(" + activeVL +
-         ");");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + prefix +
-         " = " + input.spelling + ";");
+    std::string maskSuffix = indexSuffix + "_" + maskOnlySuffix;
+    line(indexType + " " + indices + " = __riscv_vid_v_" + indexSuffix +
+         "(" + activeVL + ");");
+    line(dataType + " " + prefix + " = " + input.spelling + ";");
     std::string propagatedSegments;
     if (segmented) {
       propagatedSegments = fresh("scan_segments");
-      line("vuint" + segmentShapeSuffix + "_t " +
-           propagatedSegments + " = " + segmentValues.spelling + ";");
+      line(segmentType + " " + propagatedSegments + " = " +
+           segmentValues.spelling + ";");
     }
     line("for (size_t " + offset + " = 1; " + offset + " < " + activeVL +
          "; " + offset + " <<= 1) {");
     ++indent;
     std::string shifted = fresh("scan_shifted");
     std::string active = fresh("scan_active");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + shifted +
-         " = __riscv_vslideup_vx_" + dataSuffix +
+    line(dataType + " " + shifted + " = __riscv_vslideup_vx_" + dataSuffix +
          "(__riscv_vundefined_" + dataSuffix + "(), " + prefix + ", " +
          offset + ", " + activeVL + ");");
-    line("vbool" + std::to_string(maskRatio) + "_t " + active +
-         " = __riscv_vmsgeu_vx_" + maskSuffix + "(" + indices +
-         ", (uint32_t)" + offset + ", " + activeVL + ");");
+    line(maskType + " " + active + " = __riscv_vmsgeu_vx_" + maskSuffix +
+         "(" + indices + ", (uint32_t)" + offset + ", " + activeVL +
+         ");");
     if (segmented) {
       std::string noSegment = fresh("scan_no_segment");
-      std::string segmentSuffix = "u" + segmentShapeSuffix;
       std::string segmentMaskSuffix =
-          segmentSuffix + "_b" + std::to_string(maskRatio);
-      line("vbool" + std::to_string(maskRatio) + "_t " + noSegment +
-           " = __riscv_vmseq_vx_" + segmentMaskSuffix + "(" +
+          segmentSuffix + "_" + maskOnlySuffix;
+      line(maskType + " " + noSegment + " = __riscv_vmseq_vx_" +
+           segmentMaskSuffix + "(" +
            propagatedSegments + ", 0, " + activeVL + ");");
-      line(active + " = __riscv_vmand_mm_b" +
-           std::to_string(maskRatio) + "(" + active + ", " +
+      line(active + " = __riscv_vmand_mm_" + maskOnlySuffix + "(" + active + ", " +
            noSegment + ", " + activeVL + ");");
     }
     line(prefix + " = __riscv_vfadd_vv_" + dataSuffix + "_m(" + active +
          ", " + prefix + ", " + shifted + ", " + activeVL + ");");
     if (segmented) {
       std::string shiftedSegments = fresh("scan_shifted_segments");
-      std::string segmentSuffix = "u" + segmentShapeSuffix;
-      line("vuint" + segmentShapeSuffix + "_t " +
-           shiftedSegments + " = __riscv_vslideup_vx_" + segmentSuffix +
+      line(segmentType + " " + shiftedSegments +
+           " = __riscv_vslideup_vx_" + segmentSuffix +
            "(" + propagatedSegments + ", " + propagatedSegments + ", " +
            offset + ", " + activeVL + ");");
       line(propagatedSegments + " = __riscv_vor_vv_" + segmentSuffix + "(" +
@@ -11306,13 +11355,13 @@ private:
       std::string firstSegment = fresh("scan_first_segment");
       std::string continuationLength = fresh("scan_continuation_length");
       std::string continuation = fresh("scan_continuation");
-      line("const long " + firstSegment + " = __riscv_vfirst_m_b" +
-           std::to_string(maskRatio) + "(" + segmentMask.spelling +
+      line("const long " + firstSegment + " = __riscv_vfirst_m_" +
+           maskOnlySuffix + "(" + segmentMask.spelling +
            ", " + activeVL + ");");
       line("const size_t " + continuationLength + " = " + firstSegment +
            " < 0 ? " + activeVL + " : (size_t)" + firstSegment + ";");
-      line("vbool" + std::to_string(maskRatio) + "_t " + continuation +
-           " = __riscv_vmsltu_vx_" + maskSuffix + "(" + indices +
+      line(maskType + " " + continuation + " = __riscv_vmsltu_vx_" +
+           maskSuffix + "(" + indices +
            ", (uint32_t)" + continuationLength + ", " + activeVL + ");");
       line(prefix + " = __riscv_vfadd_vf_" + dataSuffix + "_m(" +
            continuation + ", " + prefix + ", " + carry.spelling + ", " +
@@ -11322,8 +11371,8 @@ private:
            ", " + carry.spelling + ", " + activeVL + ");");
     }
     std::string last = fresh("scan_last");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + last +
-         " = __riscv_vslidedown_vx_" + dataSuffix + "(" + prefix + ", " +
+    line(dataType + " " + last + " = __riscv_vslidedown_vx_" + dataSuffix +
+         "(" + prefix + ", " +
          activeVL + " - 1, " + activeVL + ");");
     line(carry.spelling + " = __riscv_vfmv_f_s_" + dataSuffix + "_f32(" +
          last + ");");
@@ -11344,11 +11393,23 @@ private:
         coordinate.spelling.empty() || coordinate.laneStride.empty() ||
         aggregate.kind != CValueKind::Tuple || aggregate.fields.size() != 2)
       return op.emitError("RVV argmax summary projection is unavailable");
-    std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
-    if (!dataLMUL || !activePhysicalEntity ||
+    const PhysicalValueDecision *dataShape =
+        findVLAValueDecision(op.getInput());
+    if (!dataShape || dataShape->shape.sew != 32 || !activePhysicalEntity ||
         activePhysicalEntity->vlaMaskRatio == 0)
       return op.emitError("RVV argmax has no physical data/mask shape");
     unsigned maskRatio = activePhysicalEntity->vlaMaskRatio;
+    std::string dataSuffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::Floating, dataShape->shape);
+    std::string scalarSuffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+    std::string scalarType =
+        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+    std::string maskType = rvvMaskType(maskRatio);
+    std::string maskSuffix = rvvMaskSuffix(maskRatio);
+    if (dataSuffix.empty() || scalarSuffix.empty() || scalarType.empty() ||
+        maskType.empty() || maskSuffix.empty())
+      return op.emitError("RVV argmax has no intrinsic-C spelling");
     mlir::FailureOr<std::string> projected = materializeVLAStateInput(
         op.getOperation(), op.getInput(), input, decision);
     if (mlir::failed(projected))
@@ -11362,24 +11423,23 @@ private:
     std::string equal = fresh("argmax_equal");
     std::string first = fresh("argmax_first");
     std::string stripIndex = fresh("argmax_strip_index");
-    std::string dataSuffix = "f32m" + std::to_string(*dataLMUL);
-    line("vfloat32m1_t " + seed +
-         " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
-    line("vfloat32m1_t " + reduced +
-         " = __riscv_vfredmax_vs_" + dataSuffix + "_f32m1(" +
+    line(scalarType + " " + seed + " = __riscv_vfmv_v_f_" + scalarSuffix +
+         "(-INFINITY, 1);");
+    line(scalarType + " " + reduced + " = __riscv_vfredmax_vs_" +
+         dataSuffix + "_" + scalarSuffix + "(" +
          *projected + ", " + seed + ", " + activeVL + ");");
     line("const float " + stripMaximum +
-         " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
-    line("vbool" + std::to_string(maskRatio) + "_t " + equal +
-         " = __riscv_vmfeq_vf_" + dataSuffix + "_b" +
-         std::to_string(maskRatio) + "(" + *projected + ", " +
+         " = __riscv_vfmv_f_s_" + scalarSuffix + "_f32(" + reduced +
+         ");");
+    line(maskType + " " + equal + " = __riscv_vmfeq_vf_" + dataSuffix +
+         "_" + maskSuffix + "(" + *projected + ", " +
          stripMaximum + ", " + activeVL + ");");
     if (!input.logicalValidity.empty())
-      line(equal + " = __riscv_vmand_mm_b" + std::to_string(maskRatio) +
+      line(equal + " = __riscv_vmand_mm_" + maskSuffix +
            "(" + equal + ", " + input.logicalValidity + ", " + activeVL +
            ");");
-    line("const long " + first + " = __riscv_vfirst_m_b" +
-         std::to_string(maskRatio) + "(" + equal + ", " + activeVL +
+    line("const long " + first + " = __riscv_vfirst_m_" + maskSuffix +
+         "(" + equal + ", " + activeVL +
          ");");
     std::string laneOffset = first;
     if (decision.coordinateMode == VLAMemoryMode::Strided)
@@ -11408,12 +11468,23 @@ private:
         aggregate.kind != CValueKind::Tuple || aggregate.fields.size() != 2)
       return op.emitError(
           "online summary requires an all-active f32 VLA input");
-    std::optional<unsigned> dataLMUL = physicalValueLMUL(op.getInput());
+    const PhysicalValueDecision *dataShape =
+        findVLAValueDecision(op.getInput());
     std::optional<RVVVectorShape> mathShape = activeF32MathShape();
-    std::optional<unsigned> mathLMUL =
-        mathShape ? rvvIntegerLMUL(*mathShape) : std::nullopt;
-    if (!dataLMUL || !mathShape || !mathLMUL || *dataLMUL != *mathLMUL)
+    if (!dataShape || dataShape->shape.sew != 32 || !mathShape ||
+        dataShape->shape != *mathShape)
       return op.emitError("online summary has no physical input shape");
+    std::string dataSuffix = rvvIntrinsicTypeSuffix(
+        RVVElementCategory::Floating, dataShape->shape);
+    std::string dataType =
+        rvvVectorType(RVVElementCategory::Floating, dataShape->shape);
+    std::string scalarSuffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+    std::string scalarType =
+        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+    if (dataSuffix.empty() || dataType.empty() || scalarSuffix.empty() ||
+        scalarType.empty())
+      return op.emitError("online summary has no intrinsic-C spelling");
     mlir::FailureOr<std::string> projected = materializeVLAStateInput(
         op.getOperation(), op.getInput(), input, decision);
     if (mlir::failed(projected))
@@ -11428,40 +11499,40 @@ private:
     std::string sumSeed = fresh("summary_sum_seed");
     std::string sumVector = fresh("summary_sum_vector");
     std::string stripSum = fresh("summary_strip_sum");
-    std::string dataSuffix = "f32m" + std::to_string(*dataLMUL);
     std::string expHelper = "__weft_exp_" + dataSuffix;
-    line("vfloat32m1_t " + maxSeed +
-         " = __riscv_vfmv_v_f_f32m1(-INFINITY, 1);");
-    line("vfloat32m1_t " + maxVector +
-         " = __riscv_vfredmax_vs_" + dataSuffix + "_f32m1(" +
+    line(scalarType + " " + maxSeed + " = __riscv_vfmv_v_f_" +
+         scalarSuffix + "(-INFINITY, 1);");
+    line(scalarType + " " + maxVector + " = __riscv_vfredmax_vs_" +
+         dataSuffix + "_" + scalarSuffix + "(" +
          *projected + ", " + maxSeed + ", " + activeVL + ");");
     line("const float " + stripMaximum +
-         " = __riscv_vfmv_f_s_f32m1_f32(" + maxVector + ");");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + shifted +
-         " = __riscv_vfsub_vf_" + dataSuffix + "(" + *projected + ", " +
+         " = __riscv_vfmv_f_s_" + scalarSuffix + "_f32(" + maxVector +
+         ");");
+    line(dataType + " " + shifted + " = __riscv_vfsub_vf_" + dataSuffix +
+         "(" + *projected + ", " +
          stripMaximum + ", " + activeVL + ");");
-    line("vfloat32m" + std::to_string(*dataLMUL) + "_t " +
-         exponentials + " = " + expHelper + "(" + shifted + ", " +
+    line(dataType + " " + exponentials + " = " + expHelper + "(" + shifted + ", " +
          activeVL + ");");
     if (!input.logicalValidity.empty()) {
       std::string zero = fresh("summary_zero");
       std::string validExponentials = fresh("summary_valid_exp");
-      line("vfloat32m" + std::to_string(*dataLMUL) + "_t " + zero +
-           " = __riscv_vfmv_v_f_" + dataSuffix + "(0.0f, " + activeVL +
+      line(dataType + " " + zero + " = __riscv_vfmv_v_f_" + dataSuffix +
+           "(0.0f, " + activeVL +
            ");");
-      line("vfloat32m" + std::to_string(*dataLMUL) + "_t " +
-           validExponentials + " = __riscv_vmerge_vvm_" + dataSuffix + "(" +
+      line(dataType + " " + validExponentials +
+           " = __riscv_vmerge_vvm_" + dataSuffix + "(" +
            zero + ", " + exponentials + ", " + input.logicalValidity + ", " +
            activeVL + ");");
       exponentials = std::move(validExponentials);
     }
-    line("vfloat32m1_t " + sumSeed +
-         " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
-    line("vfloat32m1_t " + sumVector +
-         " = __riscv_vfredusum_vs_" + dataSuffix + "_f32m1(" +
+    line(scalarType + " " + sumSeed + " = __riscv_vfmv_v_f_" +
+         scalarSuffix + "(0.0f, 1);");
+    line(scalarType + " " + sumVector + " = __riscv_vfredusum_vs_" +
+         dataSuffix + "_" + scalarSuffix + "(" +
          exponentials + ", " + sumSeed + ", " + activeVL + ");");
     line("const float " + stripSum +
-         " = __riscv_vfmv_f_s_f32m1_f32(" + sumVector + ");");
+         " = __riscv_vfmv_f_s_" + scalarSuffix + "_f32(" + sumVector +
+         ");");
     line("__weft_online_summary_merge_f32(&" + maximum.spelling + ", &" +
          sum.spelling + ", " + stripMaximum + ", " + stripSum + ");");
     values[op.getResult()] = aggregate;

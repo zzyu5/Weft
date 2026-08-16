@@ -2,23 +2,6 @@
 
 namespace weft::riscv_internal {
 
-std::string rvvShapeSuffix(const RVVVectorShape &shape) {
-  if (!shape)
-    return {};
-  std::string lmul;
-  if (shape.lmulEighths == 1)
-    lmul = "mf8";
-  else if (shape.lmulEighths == 2)
-    lmul = "mf4";
-  else if (shape.lmulEighths == 4)
-    lmul = "mf2";
-  else if (std::optional<unsigned> integer = rvvIntegerLMUL(shape))
-    lmul = "m" + std::to_string(*integer);
-  else
-    return {};
-  return std::to_string(shape.sew) + lmul;
-}
-
 bool SelectedLocalImplementations::contains(LocalImplementationLeaf leaf) const {
   for (const LocalImplementation &implementation : implementations)
     if (implementation.leaf == leaf)

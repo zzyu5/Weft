@@ -2,6 +2,7 @@
 #define WEFT_LIB_TARGET_RISCVINTRINSICC_H
 
 #include "RISCVPhysicalPlanning.h"
+#include "RISCVRVVSpelling.h"
 
 #include <cstdint>
 #include <set>
@@ -12,8 +13,6 @@ class raw_ostream;
 }
 
 namespace weft::riscv_internal {
-
-std::string rvvShapeSuffix(const RVVVectorShape &shape);
 
 class SelectedLocalImplementations {
 public:

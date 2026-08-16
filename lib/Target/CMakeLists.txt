@@ -4,6 +4,7 @@ add_library(WeftRISCVTarget STATIC
   RISCVHeader.cpp
   RISCVKernelFacts.cpp
   RISCVPhysicalPlanning.cpp
+  RISCVRVVSpelling.cpp
   RISCVIntrinsicC.cpp
   RISCVKernelCompiler.cpp
   RISCVIntrinsicCPrelude.cpp
