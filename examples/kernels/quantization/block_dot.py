@@ -223,12 +223,8 @@ def q8_0_q8_0(
     return q8_0_row_dot(x, y, blocks)
 
 
-@weft.kernel
-def q4_K_q8_K(
-    x: W.ptr[W.u8, W.readonly, W.noalias],
-    y: W.ptr[W.u8, W.readonly, W.noalias],
-    blocks: W.index,
-) -> W.f32:
+@W.helper(effects=("read",))
+def q4_K_row_dot(x, y, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x_block = x + block * W.index(144)
@@ -264,11 +260,16 @@ def q4_K_q8_K(
 
 
 @weft.kernel
-def tq2_0_q8_K(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
-    activation: W.ptr[W.u8, W.readonly, W.noalias],
+def q4_K_q8_K(
+    x: W.ptr[W.u8, W.readonly, W.noalias],
+    y: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return q4_K_row_dot(x, y, blocks)
+
+
+@W.helper(effects=("read",))
+def tq2_0_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(66)
@@ -307,11 +308,16 @@ def tq2_0_q8_K(
 
 
 @weft.kernel
-def tq1_0_q8_K(
+def tq2_0_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return tq2_0_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def tq1_0_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(54)
@@ -391,11 +397,16 @@ def tq1_0_q8_K(
 
 
 @weft.kernel
-def q2_K_q8_K(
+def tq1_0_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return tq1_0_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def q2_K_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(84)
@@ -450,11 +461,16 @@ def q2_K_q8_K(
 
 
 @weft.kernel
-def q3_K_q8_K(
+def q2_K_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return q2_K_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def q3_K_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(110)
@@ -507,11 +523,16 @@ def q3_K_q8_K(
 
 
 @weft.kernel
-def q5_K_q8_K(
+def q3_K_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return q3_K_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def q5_K_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(176)
@@ -593,3 +614,12 @@ def q5_K_q8_K(
                 * W.cast(high_activation_sum, W.f32)
             )
     return result
+
+
+@weft.kernel
+def q5_K_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    return q5_K_row_dot(weight, activation, blocks)

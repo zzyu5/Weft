@@ -80,6 +80,7 @@ trap cleanup_local EXIT
 quant=0
 k_quant_dot=0
 k_quant_kind=0
+ggml_reference=0
 multi=0
 multi_primary=
 multi_equivalent=
@@ -518,6 +519,34 @@ case "${kernel}" in
         ;;
       mul_mat_q1_0)
         runtime_compile_flags="-DWEFT_MUL_MAT_KIND=5 -DWEFT_MUL_MAT_ENTRY=mul_mat_q1_0"
+        ;;
+    esac
+    ;;
+  mul_mat_q2_K|mul_mat_q3_K|mul_mat_q4_K|mul_mat_q5_K|mul_mat_q6_K)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} ${kernel} <decode|prefill> <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/mul_mat.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/mul_mat_k_runtime.cpp
+    runtime_arguments=("$1" "$2")
+    ggml_reference=1
+    case "${kernel}" in
+      mul_mat_q2_K)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=2 -DWEFT_MUL_MAT_ENTRY=mul_mat_q2_K -DWEFT_GGML_DOT=ggml_vec_dot_q2_K_q8_K"
+        ;;
+      mul_mat_q3_K)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=3 -DWEFT_MUL_MAT_ENTRY=mul_mat_q3_K -DWEFT_GGML_DOT=ggml_vec_dot_q3_K_q8_K"
+        ;;
+      mul_mat_q4_K)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=4 -DWEFT_MUL_MAT_ENTRY=mul_mat_q4_K -DWEFT_GGML_DOT=ggml_vec_dot_q4_K_q8_K"
+        ;;
+      mul_mat_q5_K)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=5 -DWEFT_MUL_MAT_ENTRY=mul_mat_q5_K -DWEFT_GGML_DOT=ggml_vec_dot_q5_K_q8_K"
+        ;;
+      mul_mat_q6_K)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=6 -DWEFT_MUL_MAT_ENTRY=mul_mat_q6_K -DWEFT_GGML_DOT=ggml_vec_dot_q6_K_q8_K"
         ;;
     esac
     ;;
@@ -1201,9 +1230,19 @@ tar -C "${local_root}" -cf - . |
       \"\${cxx}\" -O3 ${remote_compile_flags} ${runtime_compile_flags} -std=c++17 -Wall -Wextra -Werror \
         -march=${target_march} -mabi=lp64d ${runtime_header_flags} \
         -c runtime.cpp -o runtime.o
-      \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
-        ${remote_link_flags} \
-        -o weft_runtime
+      if [ '${ggml_reference}' -eq 1 ]; then
+        ggml_build=${remote_ggml_build}
+        ggml_toolchain_lib=${remote_ggml_toolchain_lib}
+        \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
+          \${ggml_toolchain_lib:+-L\"\${ggml_toolchain_lib}\"} \
+          -L\"\${ggml_build}\" -Wl,-rpath,\"\${ggml_build}\" \
+          -Wl,--no-as-needed -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
+          -o weft_runtime
+      else
+        \"\${cxx}\" -march=${target_march} -mabi=lp64d runtime.o libweft_kernel.a \
+          ${remote_link_flags} \
+          -o weft_runtime
+      fi
     fi
     taskset -c ${remote_cpu} ${runtime_command}
   "

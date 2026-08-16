@@ -98,12 +98,8 @@ def iq1_M_q8_K(
     return result
 
 
-@weft.kernel
-def q6_K_q8_K(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
-    activation: W.ptr[W.u8, W.readonly, W.noalias],
-    blocks: W.index,
-) -> W.f32:
+@W.helper(effects=("read",))
+def q6_K_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(210)
@@ -122,6 +118,15 @@ def q6_K_q8_K(
             result,
         )
     return result
+
+
+@weft.kernel
+def q6_K_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    return q6_K_row_dot(weight, activation, blocks)
 
 
 @weft.kernel
