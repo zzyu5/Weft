@@ -1,6 +1,9 @@
 import weft
 import weft.language as W
 
+from examples.kernels.quantization.dequantize import _load_q3_k_scale
+from examples.kernels.quantization.ggml_k import load_k4_scale_min
+
 
 
 @W.helper(effects=("read",))
@@ -13,6 +16,13 @@ def load_f32_le(base):
     bits = bits | (byte2 << W.u32(16))
     bits = bits | (byte3 << W.u32(24))
     return W.bitcast(bits, W.f32)
+
+
+@W.helper(effects=("read",))
+def load_i16_le(base):
+    low = W.cast(W.load(base, other=W.u8(0)), W.u16)
+    high = W.cast(W.load(base + W.index(1), other=W.u8(0)), W.u16)
+    return W.cast(W.bitcast(low | (high << W.u16(8)), W.i16), W.i32)
 
 
 @W.helper(effects=("read",))
@@ -352,4 +362,209 @@ def tq1_0_q8_K(
             * load_f32_le(y)
             * W.cast(integer_sum, W.f32)
         )
+    return result
+
+
+@weft.kernel
+def q2_K_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(84)
+        y = activation + block * W.index(292)
+        weight_scale = W.load_f16_le(x + W.index(80))
+        weight_minimum = W.load_f16_le(x + W.index(82))
+        activation_scale = load_f32_le(y)
+        for half in W.range(0, 2):
+            for field in W.range(0, 4):
+                shift = W.cast(field * W.index(2), W.u8)
+                for lane_group in W.range(0, 2):
+                    group = (
+                        half * W.index(8)
+                        + field * W.index(2)
+                        + lane_group
+                    )
+                    metadata = W.load(x + group, other=W.u8(0))
+                    member = W.block(16)
+                    packed_codes = W.load(
+                        x
+                        + W.index(16)
+                        + half * W.index(32)
+                        + lane_group * W.index(16)
+                        + member,
+                        other=W.u8(0),
+                    )
+                    code = W.cast(
+                        (packed_codes >> shift) & W.u8(3), W.i32
+                    )
+                    activation_values = load_q8(
+                        y + W.index(4) + group * W.index(16), member
+                    )
+                    q_sum = W.reduce(
+                        code * activation_values,
+                        identity=W.i32(0),
+                        axis=0,
+                        acc_dtype=W.i32,
+                        order="relaxed",
+                    )
+                    activation_sum = load_i16_le(
+                        y + W.index(260) + group * W.index(2)
+                    )
+                    scale = W.cast(metadata & W.u8(15), W.f32)
+                    minimum = W.cast(metadata >> W.u8(4), W.f32)
+                    result = result + activation_scale * (
+                        weight_scale * scale * W.cast(q_sum, W.f32)
+                        - weight_minimum
+                        * minimum
+                        * W.cast(activation_sum, W.f32)
+                    )
+    return result
+
+
+@weft.kernel
+def q3_K_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(110)
+        y = activation + block * W.index(292)
+        scale_product = W.load_f16_le(x + W.index(108)) * load_f32_le(y)
+        for half in W.range(0, 2):
+            for field in W.range(0, 4):
+                low_shift = W.cast(field * W.index(2), W.u8)
+                high_shift = W.cast(half * W.index(4) + field, W.u8)
+                for lane_group in W.range(0, 2):
+                    group = (
+                        half * W.index(8)
+                        + field * W.index(2)
+                        + lane_group
+                    )
+                    local_scale = _load_q3_k_scale(x + W.index(96), group)
+                    member = W.block(16)
+                    packed_codes = W.load(
+                        x
+                        + W.index(32)
+                        + half * W.index(32)
+                        + lane_group * W.index(16)
+                        + member,
+                        other=W.u8(0),
+                    )
+                    high_bits = W.load(
+                        x + lane_group * W.index(16) + member,
+                        other=W.u8(0),
+                    )
+                    low = (packed_codes >> low_shift) & W.u8(3)
+                    present = (high_bits >> high_shift) & W.u8(1)
+                    correction = (present ^ W.u8(1)) << W.u8(2)
+                    code = W.cast(low, W.i32) - W.cast(correction, W.i32)
+                    activation_values = load_q8(
+                        y + W.index(4) + group * W.index(16), member
+                    )
+                    q_sum = W.reduce(
+                        code * activation_values,
+                        identity=W.i32(0),
+                        axis=0,
+                        acc_dtype=W.i32,
+                        order="relaxed",
+                    )
+                    result = result + (
+                        scale_product
+                        * (W.cast(local_scale, W.f32) - W.f32(32.0))
+                        * W.cast(q_sum, W.f32)
+                    )
+    return result
+
+
+@weft.kernel
+def q5_K_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(176)
+        y = activation + block * W.index(292)
+        weight_scale = W.load_f16_le(x)
+        weight_minimum = W.load_f16_le(x + W.index(2))
+        activation_scale = load_f32_le(y)
+        for pair in W.range(0, 4):
+            low_group = pair * W.index(2)
+            high_group = low_group + W.index(1)
+            low_scale, low_minimum = load_k4_scale_min(
+                x + W.index(4), low_group
+            )
+            high_scale, high_minimum = load_k4_scale_min(
+                x + W.index(4), high_group
+            )
+            low_shift = W.cast(pair * W.index(2), W.u8)
+            high_shift = low_shift + W.u8(1)
+            member = W.block(32)
+            high_bits = W.load(x + W.index(16) + member, other=W.u8(0))
+            packed_codes = W.load(
+                x + W.index(48) + pair * W.index(32) + member,
+                other=W.u8(0),
+            )
+            low_code = W.cast(
+                (packed_codes & W.u8(15))
+                | (((high_bits >> low_shift) & W.u8(1)) << W.u8(4)),
+                W.i32,
+            )
+            high_code = W.cast(
+                (packed_codes >> W.u8(4))
+                | (((high_bits >> high_shift) & W.u8(1)) << W.u8(4)),
+                W.i32,
+            )
+            activation_low = load_q8(
+                y + W.index(4) + pair * W.index(64), member
+            )
+            activation_high = load_q8(
+                y + W.index(36) + pair * W.index(64), member
+            )
+            low_q_sum = W.reduce(
+                low_code * activation_low,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            high_q_sum = W.reduce(
+                high_code * activation_high,
+                identity=W.i32(0),
+                axis=0,
+                acc_dtype=W.i32,
+                order="relaxed",
+            )
+            low_activation_sum = load_i16_le(
+                y + W.index(260) + pair * W.index(8)
+            )
+            low_activation_sum = low_activation_sum + load_i16_le(
+                y + W.index(262) + pair * W.index(8)
+            )
+            high_activation_sum = load_i16_le(
+                y + W.index(264) + pair * W.index(8)
+            )
+            high_activation_sum = high_activation_sum + load_i16_le(
+                y + W.index(266) + pair * W.index(8)
+            )
+            result = result + activation_scale * (
+                weight_scale
+                * W.cast(low_scale, W.f32)
+                * W.cast(low_q_sum, W.f32)
+                - weight_minimum
+                * W.cast(low_minimum, W.f32)
+                * W.cast(low_activation_sum, W.f32)
+                + weight_scale
+                * W.cast(high_scale, W.f32)
+                * W.cast(high_q_sum, W.f32)
+                - weight_minimum
+                * W.cast(high_minimum, W.f32)
+                * W.cast(high_activation_sum, W.f32)
+            )
     return result
