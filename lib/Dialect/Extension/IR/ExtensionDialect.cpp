@@ -240,6 +240,56 @@ mlir::LogicalResult PackedI5I8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult PackedI4I8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getPackedCodes(), 16, false,
+                                  "packed_codes")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 32, true,
+                                  "activation")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getZeroPoint(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 32,
+                                     mlir::IntegerType::Signed),
+                                 "zero_point")))
+    return emitOpError("zero_point must be scalar i32");
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getDotScale(), f32, "dot_scale")) ||
+      mlir::failed(requireScalar(*this, getAdditiveBias(), f32,
+                                 "additive_bias")))
+    return emitOpError("dot_scale and additive_bias must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
+mlir::LogicalResult Base3TernaryI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getCodes(), 48, false, "codes")) ||
+      mlir::failed(verifyByteBlock(*this, getHighDigits(), 4, false,
+                                  "high_digits")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 256, true,
+                                  "activation")))
+    return mlir::failure();
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
+    return emitOpError("weight_scale and activation_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
+mlir::LogicalResult PackedI2TernaryI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getCodes(), 64, false, "codes")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 256, true,
+                                  "activation")))
+    return mlir::failure();
+  mlir::Type f32 = mlir::Float32Type::get(getContext());
+  if (mlir::failed(requireScalar(*this, getWeightScale(), f32,
+                                 "weight_scale")) ||
+      mlir::failed(requireScalar(*this, getActivationScale(), f32,
+                                 "activation_scale")))
+    return emitOpError("weight_scale and activation_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {

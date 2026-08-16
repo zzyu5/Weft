@@ -17,13 +17,6 @@ constexpr std::size_t kKeys = 128;
 constexpr std::size_t kHeadDimension = 128;
 constexpr std::size_t kGroupSize = kQueryHeads / kKeyValueHeads;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
-constexpr std::uint16_t kHalfValues[] = {
-    0x3000U,
-    0x2c00U,
-    0xb000U,
-    0x3400U,
-};
-constexpr float kFloatValues[] = {0.125F, 0.0625F, -0.125F, 0.25F};
 constexpr std::uint16_t kHalfZero = 0x0000U;
 constexpr std::uint16_t kHalfNegativeInfinity = 0xfc00U;
 volatile std::uint64_t evictionSink;
@@ -58,6 +51,26 @@ double median(std::vector<double> samples) {
              : samples[middle];
 }
 
+float queryValue(std::size_t head, std::size_t row,
+                 std::size_t dimension) {
+  const std::size_t offset =
+      (head * kQueries + row) * kHeadDimension + dimension;
+  return static_cast<float>(static_cast<int>(offset % 31) - 15) / 16.0F;
+}
+
+float keyValue(std::size_t head, std::size_t row, std::size_t dimension) {
+  const std::size_t offset =
+      (head * kKeys + row) * kHeadDimension + dimension;
+  return static_cast<float>(static_cast<int>(offset % 17) - 8) / 9.0F;
+}
+
+float valueValue(std::size_t head, std::size_t row,
+                 std::size_t dimension) {
+  const std::size_t offset =
+      (head * kKeys + row) * kHeadDimension + dimension;
+  return static_cast<float>(static_cast<int>(offset % 13) - 6) / 7.0F;
+}
+
 float referenceElement(std::size_t queryHead, std::size_t queryIndex,
                        std::size_t outputDimension) {
   const std::size_t keyValueHead = queryHead / kGroupSize;
@@ -68,10 +81,8 @@ float referenceElement(std::size_t queryHead, std::size_t queryIndex,
   for (std::size_t keyIndex = 0; keyIndex <= queryIndex; ++keyIndex) {
     float dot = 0.0F;
     for (std::size_t dimension = 0; dimension < kHeadDimension; ++dimension) {
-      const float queryElement =
-          kFloatValues[(queryHead + queryIndex + 3 * dimension + 1) % 4];
-      const float keyElement =
-          kFloatValues[(keyValueHead + 5 * keyIndex + dimension + 2) % 4];
+      const float queryElement = queryValue(queryHead, queryIndex, dimension);
+      const float keyElement = keyValue(keyValueHead, keyIndex, dimension);
       dot += queryElement * keyElement;
     }
     const float score = dot * scale;
@@ -79,8 +90,7 @@ float referenceElement(std::size_t queryHead, std::size_t queryIndex,
     const float oldWeight = std::exp(maximum - nextMaximum);
     const float newWeight = std::exp(score - nextMaximum);
     const float valueElement =
-        kFloatValues[(keyValueHead + 7 * keyIndex +
-                      3 * outputDimension + 3) % 4];
+        valueValue(keyValueHead, keyIndex, outputDimension);
     accumulated = accumulated * oldWeight + valueElement * newWeight;
     total = total * oldWeight + newWeight;
     maximum = nextMaximum;
@@ -120,16 +130,14 @@ int main(int argc, char **argv) {
     for (std::size_t row = 0; row < kQueries; ++row)
       for (std::size_t dimension = 0; dimension < kHeadDimension; ++dimension)
         query[(head * kQueries + row) * kHeadDimension + dimension] =
-            kFloatValues[(head + row + 3 * dimension + 1) % 4];
+            queryValue(head, row, dimension);
   for (std::size_t head = 0; head < kKeyValueHeads; ++head)
     for (std::size_t row = 0; row < kKeys; ++row)
       for (std::size_t dimension = 0; dimension < kHeadDimension; ++dimension) {
         const std::size_t offset =
             (head * kKeys + row) * kHeadDimension + dimension;
-        key[offset] = halfFromBits(
-            kHalfValues[(head + 5 * row + dimension + 2) % 4]);
-        value[offset] = halfFromBits(
-            kHalfValues[(head + 7 * row + 3 * dimension + 3) % 4]);
+        key[offset] = static_cast<_Float16>(keyValue(head, row, dimension));
+        value[offset] = static_cast<_Float16>(valueValue(head, row, dimension));
       }
   for (std::size_t queryIndex = 0; queryIndex < kQueries; ++queryIndex)
     for (std::size_t keyIndex = 0; keyIndex < kKeys; ++keyIndex)

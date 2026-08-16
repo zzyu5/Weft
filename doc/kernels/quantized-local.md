@@ -103,6 +103,33 @@ for sub_block in 0..4:
 `sign_bit_i8_dot`只定义当前32 elements的bit-to-sign relation。128-element grouping、四个独立
 Q8 scale、outer block reduction与row output不会被target从format名或byte stride推断。
 
+## Q4_0 / Q4_1 / Q5_0 / Q5_1 × Q8 local dot
+
+Q4_0与Q4_1分别使用18-byte和20-byte packed weight block。DSL kernel显式形成block地址，加载
+16-byte nibble field与32-element signed-i8 activation，然后调用`W.packed_i4_i8_dot`。Q4_0
+传入zero point 8；Q4_1传入zero point 0和weight minimum×activation sum correction。
+
+Q5_0与Q5_1分别使用22-byte和24-byte packed weight block。DSL kernel显式形成block地址，
+加载16-byte low-nibble field、4-byte high-bit field与32-element signed-i8 activation，然后调用
+`W.packed_i5_i8_dot`。Q5_0显式传入zero point 16；Q5_1显式传入zero point 0以及由weight/activation
+offset形成的additive bias。
+
+Primitive只拥有当前32-element unsigned-i4/i5 decode与signed-i8 dot。Weight/Q8 block stride、
+scale/bias来源、outer block traversal和row accumulator由DSL kernel拥有。Target根据相同typed
+operand关系选择VLEN128或VLEN256 local leaf，并决定nibble拼接、high-bit merge、widening multiply
+与reduction；不会从22/24-byte stride或kernel名恢复Q5 route。
+
+## TQ1_0 / TQ2_0 × Q8_K row dot
+
+两种row dot都由DSL kernel显式遍历256-element block、形成weight/Q8_K地址、加载两个scale并
+carry scalar accumulator。区别只落在两个局部semantic primitive：TQ1_0调用
+`W.base3_ternary_i8_dot`消费48-byte base-3 codes与4-byte high digits；TQ2_0调用
+`W.packed_i2_ternary_i8_dot`消费64-byte packed two-bit fields。
+
+54/66-byte weight stride、292-byte Q8_K stride、scale field地址和outer row/block traversal不进入
+primitive。Target共享byte/widen/reduction shape与resource选择，但为两种不同数值关系选择各自的
+VLEN128/VLEN256 local leaf；这不是按TQ格式接管完整row dot。
+
 ## MXFP4 × Q8_0 row dot
 
 MXFP4 packed input block覆盖32个logical weight，总计17 bytes：一个E8M0 exponent byte加16个

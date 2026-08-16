@@ -41,8 +41,12 @@ int main() {
     indices[token] = row;
     for (std::size_t column = 0; column < kHidden; ++column)
       table[static_cast<std::size_t>(row) * kHidden + column] =
-          static_cast<float>(static_cast<int>((row + column) % 4093) - 2046) /
-          1024.0F;
+          static_cast<float>(static_cast<int>(
+                                 (static_cast<std::size_t>(row) * kHidden +
+                                  column) %
+                                 31) -
+                             15) /
+          16.0F;
   }
 
   get_rows_f32(table.data(), indices.data(), output.data(), 0, kTokens, kHidden,

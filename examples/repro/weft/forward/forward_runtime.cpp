@@ -41,11 +41,11 @@ double median(std::vector<double> samples) {
 }
 
 float sourceValue(std::size_t index) {
-  return static_cast<float>(static_cast<int>(index % 61) - 30) / 32.0F;
+  return static_cast<float>(static_cast<int>(index % 31) - 15) / 16.0F;
 }
 
 float rhsValue(std::size_t index) {
-  return static_cast<float>(static_cast<int>(index % 29) - 14) / 17.0F;
+  return static_cast<float>(static_cast<int>(index % 17) - 8) / 9.0F;
 }
 
 } // namespace

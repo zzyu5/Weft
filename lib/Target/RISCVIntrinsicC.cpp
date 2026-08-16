@@ -51,10 +51,22 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_e2m1_e8m0_i8_vl256";
   case IntrinsicCLeaf::E2M1E8M0I8Scalable:
     return "__weft_e2m1_e8m0_i8_rvv";
+  case IntrinsicCLeaf::PackedI4I8VLEN128:
+    return "__weft_packed_i4_i8_vl128";
+  case IntrinsicCLeaf::PackedI4I8VLEN256:
+    return "__weft_packed_i4_i8_vl256";
   case IntrinsicCLeaf::PackedI5I8VLEN128:
     return "__weft_packed_i5_i8_vl128";
   case IntrinsicCLeaf::PackedI5I8VLEN256:
     return "__weft_packed_i5_i8_vl256";
+  case IntrinsicCLeaf::Base3TernaryI8VLEN128:
+    return "__weft_base3_ternary_i8_vl128";
+  case IntrinsicCLeaf::Base3TernaryI8VLEN256:
+    return "__weft_base3_ternary_i8_vl256";
+  case IntrinsicCLeaf::PackedI2TernaryI8VLEN128:
+    return "__weft_packed_i2_ternary_i8_vl128";
+  case IntrinsicCLeaf::PackedI2TernaryI8VLEN256:
+    return "__weft_packed_i2_ternary_i8_vl256";
   case IntrinsicCLeaf::IQ2SI8FixedLanes32:
     return "__weft_iq2_s_i8_lanes32";
   case IntrinsicCLeaf::IQ2SI8FixedLanes64:

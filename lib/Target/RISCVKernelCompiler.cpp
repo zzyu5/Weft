@@ -199,6 +199,7 @@ struct MaterializedBlockStoreDecision {
   mlir::Value columnAxis;
   int64_t rows = 0;
   int64_t columns = 0;
+  RVVVectorShape vectorShape;
 };
 
 enum class MaterializedF32PointwiseRealization {
@@ -226,6 +227,10 @@ struct LocalBlockMemoryFact {
 struct SymmetricI4I8Decision {
   I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  RVVVectorShape codeShape;
+  RVVVectorShape activationScaleShape;
+  RVVVectorShape accumulatorShape;
+  PhysicalResourceBudget resources;
   LocalBlockMemoryFact activationBlock;
   LocalBlockMemoryFact activationScaleBlock;
   mlir::Value packedBlockBase;
@@ -243,6 +248,11 @@ enum class SignBitI8Realization {
 struct SignBitI8Decision {
   SignBitI8Realization realization =
       SignBitI8Realization::RVVWideningSignSum;
+  RVVVectorShape activationShape;
+  RVVVectorShape widenedShape;
+  RVVVectorShape reductionShape;
+  unsigned maskRatio = 0;
+  PhysicalResourceBudget resources;
   LocalBlockMemoryFact signBits;
   LocalBlockMemoryFact activation;
   mlir::Value activationScale;
@@ -282,7 +292,7 @@ struct GroupedAffineI4I8Decision {
   mlir::Value init;
 };
 
-struct QuantCodebookI8Decision {
+struct QuantI8DotDecision {
   QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
   QuantI8DotRealization realization =
       QuantI8DotRealization::RVVFixedLaneLocalBlockDot;
@@ -292,6 +302,21 @@ struct QuantCodebookI8Decision {
   unsigned semanticLanes = 0;
   RVVVectorShape byteShape;
   unsigned reductionSegments = 0;
+  PhysicalResourceBudget resources;
+};
+
+struct TernaryI8Decision {
+  TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
+  TernaryI8DotRealization realization =
+      TernaryI8DotRealization::RVVVLEN128LocalBlockDot;
+  IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  llvm::SmallVector<LocalBlockMemoryFact> blocks;
+  llvm::SmallVector<mlir::Value> scalars;
+  RVVVectorShape byteShape32;
+  RVVVectorShape byteShape16;
+  RVVVectorShape widenedShape32;
+  RVVVectorShape widenedShape16;
+  RVVVectorShape reductionShape;
   PhysicalResourceBudget resources;
 };
 
@@ -662,6 +687,10 @@ struct AffineI4I8Decision {
   mlir::Operation *operation = nullptr;
   I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  RVVVectorShape codeShape;
+  RVVVectorShape activationScaleShape;
+  RVVVectorShape accumulatorShape;
+  PhysicalResourceBudget resources;
   LocalBlockMemoryFact activationBlock;
   LocalBlockMemoryFact activationScaleBlock;
   mlir::Value packedBlockBase;
@@ -729,8 +758,10 @@ struct RISCVPhysicalPlan {
                  PlannedPhysicalDecision<GroupedAffineI4I8Decision>>
       groupedAffineI4I8;
   llvm::DenseMap<mlir::Operation *,
-                 PlannedPhysicalDecision<QuantCodebookI8Decision>>
-      quantCodebookI8;
+                 PlannedPhysicalDecision<QuantI8DotDecision>>
+      quantI8Dots;
+  llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<TernaryI8Decision>>
+      ternaryI8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<BlockDecodeDecision>>
       blockDecodes;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<LoadF16LEDecision>>
@@ -1154,35 +1185,78 @@ private:
       physicalPlan.groupedAffineI4I8.try_emplace(op.getOperation(),
                                                  std::move(planned));
     });
-    auto prepareQuantCodebookDot = [&](auto op,
+    auto prepareTernaryDot = [&](auto op, TernaryI8DotSemantic semantic,
+                                 llvm::ArrayRef<mlir::Value> blocks,
+                                 llvm::ArrayRef<mlir::Value> scalars) {
+      if (decisionFailure)
+        return;
+      PlannedPhysicalDecision<TernaryI8Decision> planned;
+      if (mlir::failed(decideTernaryI8Dot(op, semantic, blocks, scalars,
+                                         planned.realization))) {
+        decisionFailure = true;
+        return;
+      }
+      finalizeTernaryI8Plan(op, planned);
+      physicalPlan.ternaryI8.try_emplace(op.getOperation(), std::move(planned));
+    };
+    kernel.walk([&](Base3TernaryI8DotOp op) {
+      prepareTernaryDot(
+          op, TernaryI8DotSemantic::Base3Digits,
+          {op.getCodes(), op.getHighDigits(), op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
+    kernel.walk([&](PackedI2TernaryI8DotOp op) {
+      prepareTernaryDot(
+          op, TernaryI8DotSemantic::PackedI2Fields,
+          {op.getCodes(), op.getActivation()},
+          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+    });
+    auto prepareQuantI8Dot = [&](auto op,
                                        QuantI8DotSemantic semantic,
                                        llvm::ArrayRef<mlir::Value> blocks,
                                        llvm::ArrayRef<mlir::Value> scalars) {
       if (decisionFailure)
         return;
-      PlannedPhysicalDecision<QuantCodebookI8Decision> planned;
+      PlannedPhysicalDecision<QuantI8DotDecision> planned;
       if (mlir::failed(
-              decideQuantCodebookI8Dot(op, semantic, blocks, scalars,
+              decideQuantI8Dot(op, semantic, blocks, scalars,
                                        planned.realization))) {
         decisionFailure = true;
         return;
       }
-      finalizeQuantCodebookI8Plan(op, planned);
-      physicalPlan.quantCodebookI8.try_emplace(op.getOperation(),
+      finalizeQuantI8Plan(op, planned);
+      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
                                                std::move(planned));
     };
     kernel.walk([&](IQ2SI8DotOp op) {
-      prepareQuantCodebookDot(
+      prepareQuantI8Dot(
           op, QuantI8DotSemantic::IQ2S,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
+    kernel.walk([&](PackedI4I8DotOp op) {
+      if (decisionFailure)
+        return;
+      PlannedPhysicalDecision<QuantI8DotDecision> planned;
+      if (mlir::failed(decideQuantI8Dot(
+              op, QuantI8DotSemantic::PackedI4,
+              {op.getPackedCodes(), op.getActivation()},
+              {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+               op.getInit()},
+              planned.realization, 32))) {
+        decisionFailure = true;
+        return;
+      }
+      finalizeQuantI8Plan(op, planned);
+      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
+                                               std::move(planned));
+    });
     kernel.walk([&](PackedI5I8DotOp op) {
       if (decisionFailure)
         return;
-      PlannedPhysicalDecision<QuantCodebookI8Decision> planned;
-      if (mlir::failed(decideQuantCodebookI8Dot(
+      PlannedPhysicalDecision<QuantI8DotDecision> planned;
+      if (mlir::failed(decideQuantI8Dot(
               op, QuantI8DotSemantic::PackedI5,
               {op.getLowBits(), op.getHighBits(), op.getActivation()},
               {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
@@ -1191,26 +1265,26 @@ private:
         decisionFailure = true;
         return;
       }
-      finalizeQuantCodebookI8Plan(op, planned);
-      physicalPlan.quantCodebookI8.try_emplace(op.getOperation(),
+      finalizeQuantI8Plan(op, planned);
+      physicalPlan.quantI8Dots.try_emplace(op.getOperation(),
                                                std::move(planned));
     });
     kernel.walk([&](IQ3SI8DotOp op) {
-      prepareQuantCodebookDot(
+      prepareQuantI8Dot(
           op, QuantI8DotSemantic::IQ3S,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](IQ1MI8DotOp op) {
-      prepareQuantCodebookDot(
+      prepareQuantI8Dot(
           op, QuantI8DotSemantic::IQ1M,
           {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
            op.getActivation()},
           {op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](Q6KI8DotOp op) {
-      prepareQuantCodebookDot(
+      prepareQuantI8Dot(
           op, QuantI8DotSemantic::Q6K,
           {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
            op.getActivation()},
@@ -1265,7 +1339,9 @@ private:
       selectedLeaves.add(entry.second.realization.leaf);
     for (const auto &entry : physicalPlan.groupedAffineI4I8)
       selectedLeaves.add(entry.second.realization.leaf);
-    for (const auto &entry : physicalPlan.quantCodebookI8)
+    for (const auto &entry : physicalPlan.quantI8Dots)
+      selectedLeaves.add(entry.second.realization.leaf);
+    for (const auto &entry : physicalPlan.ternaryI8)
       selectedLeaves.add(entry.second.realization.leaf);
   }
 
@@ -3501,16 +3577,22 @@ private:
       return emitSignBitI8Dot(op);
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
       return emitE2M1E8M0I8Dot(op);
+    if (auto op = mlir::dyn_cast<Base3TernaryI8DotOp>(operation))
+      return emitTernaryI8Dot(op);
+    if (auto op = mlir::dyn_cast<PackedI2TernaryI8DotOp>(operation))
+      return emitTernaryI8Dot(op);
+    if (auto op = mlir::dyn_cast<PackedI4I8DotOp>(operation))
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI5I8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op);
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op);
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op);
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ1MI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op);
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<Q6KI8DotOp>(operation))
-      return emitQuantCodebookI8Dot(op);
+      return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<SymmetricI4I8DotOp>(operation))
       return emitSymmetricI4I8Dot(op);
     if (auto op = mlir::dyn_cast<DotOp>(operation))
@@ -7381,9 +7463,11 @@ private:
           "materialized f32 store requires a typed f32 block value");
     MaterializedBlockStoreDecision decision;
     decision.operation = op.getOperation();
+    std::optional<RVVVectorShape> contiguous16Shape =
+        rvvShapeForSemanticLanes(32, 16, options.target);
     bool canUseContiguous16 =
         block.getShape() == llvm::ArrayRef<int64_t>({16}) &&
-        options.target.supportsVLENAtLeast(128) && isTrue(op.getWhere());
+        contiguous16Shape && isTrue(op.getWhere());
     if (block.getShape().size() == 1 && !canUseContiguous16) {
       llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(op.getPointer());
       BlockIndexOp axis = findDimensionAxis(op.getPointer(), 0, axes);
@@ -7428,6 +7512,7 @@ private:
           MaterializedBlockStoreRealization::RVVContiguousRankOne;
       decision.columns = 16;
       decision.columnAxis = columnAxis.getResult();
+      decision.vectorShape = *contiguous16Shape;
     } else {
       return op.emitError(
           "materialized f32 block store has no selected target realization");
@@ -7437,7 +7522,7 @@ private:
     initializeEntityPlan(planned.entity);
     if (planned.realization.realization ==
         MaterializedBlockStoreRealization::RVVContiguousRankOne) {
-      RVVVectorShape vectorShape = kRVVE32M2;
+      RVVVectorShape vectorShape = planned.realization.vectorShape;
       recordPhysicalValue(planned.entity, op.getValue(),
                           vectorShape);
       recordPhysicalHandoff(planned.entity, op.getOperation(), op.getValue(),
@@ -7690,82 +7775,42 @@ private:
     }
   }
 
+  template <typename OpTy, typename Decision>
+  void finalizeI4I8Plan(
+      OpTy op, PlannedPhysicalDecision<Decision> &planned) const {
+    initializeEntityPlan(planned.entity);
+    recordPhysicalValue(planned.entity, planned.realization.activation,
+                        planned.realization.codeShape);
+    recordPhysicalHandoff(planned.entity, op.getOperation(),
+                          planned.realization.activation,
+                          PhysicalHandoff::LocalPack,
+                          planned.realization.codeShape,
+                          planned.realization.codeShape);
+    if (planned.realization.rowTile == 4)
+      recordLocalBlockReloads(planned, op.getOperation(),
+                              {planned.realization.activationScaleBlock},
+                              planned.realization.activationScaleShape);
+    recordPhysicalValue(planned.entity, op.getInit(),
+                        planned.realization.accumulatorShape);
+    recordPhysicalValue(planned.entity, op.getResult(),
+                        planned.realization.accumulatorShape);
+    recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
+                          PhysicalHandoff::Share,
+                          planned.realization.accumulatorShape,
+                          planned.realization.accumulatorShape);
+    planned.entity.resources = planned.realization.resources;
+  }
+
   void finalizeSymmetricI4I8Plan(
       SymmetricI4I8DotOp op,
       PlannedPhysicalDecision<SymmetricI4I8Decision> &planned) const {
-    initializeEntityPlan(planned.entity);
-    bool rowFour = planned.realization.rowTile == 4;
-    RVVVectorShape codeShape =
-        rowFour ? rvvShape(8, options.target.vlenBits >= 256 ? 4 : 8)
-                : planned.realization.realization ==
-                          I4I8FragmentRealization::SpacemiTIME1N16K32
-                      ? kRVVE8MF4
-                      : rvvShape(8, 2);
-    RVVVectorShape accumulatorShape = rvvShape(32, 4);
-    recordPhysicalValue(planned.entity, planned.realization.activation,
-                        codeShape);
-    recordPhysicalHandoff(planned.entity, op.getOperation(),
-                          planned.realization.activation,
-                          PhysicalHandoff::LocalPack, codeShape, codeShape);
-    if (rowFour)
-      recordLocalBlockReloads(planned, op.getOperation(),
-                              {planned.realization.activationScaleBlock},
-                              kRVVE32M1);
-    recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
-    recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
-    recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
-                          PhysicalHandoff::Share, accumulatorShape,
-                          accumulatorShape);
-    planned.entity.resources.valueGroups = rowFour ? 20 : 4;
-    planned.entity.resources.memoryGroups = rowFour ? 5 : 2;
-    planned.entity.resources.primitiveGroups =
-        planned.realization.realization ==
-                    I4I8FragmentRealization::SpacemiTIME1N16K32 ||
-                planned.realization.realization ==
-                    I4I8FragmentRealization::SpacemiTIME1M4N16K32
-            ? 28
-            : rowFour ? 24 : 12;
-    planned.entity.resources.peakGroups =
-        planned.entity.resources.primitiveGroups + 1;
+    finalizeI4I8Plan(op, planned);
   }
 
   void finalizeAffineI4I8Plan(
       AffineI4I8DotOp op,
       PlannedPhysicalDecision<AffineI4I8Decision> &planned) const {
-    initializeEntityPlan(planned.entity);
-    bool rowFour = planned.realization.rowTile == 4;
-    RVVVectorShape codeShape =
-        rowFour ? rvvShape(8, options.target.vlenBits >= 256 ? 4 : 8)
-                : planned.realization.realization ==
-                          I4I8FragmentRealization::SpacemiTIME1N16K32
-                      ? kRVVE8MF4
-                      : rvvShape(8, 2);
-    RVVVectorShape accumulatorShape = rvvShape(32, 4);
-    recordPhysicalValue(planned.entity, planned.realization.activation,
-                        codeShape);
-    recordPhysicalHandoff(planned.entity, op.getOperation(),
-                          planned.realization.activation,
-                          PhysicalHandoff::LocalPack, codeShape, codeShape);
-    if (rowFour)
-      recordLocalBlockReloads(planned, op.getOperation(),
-                              {planned.realization.activationScaleBlock},
-                              kRVVE32M1);
-    recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
-    recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
-    recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
-                          PhysicalHandoff::Share, accumulatorShape,
-                          accumulatorShape);
-    planned.entity.resources.valueGroups = rowFour ? 20 : 4;
-    planned.entity.resources.memoryGroups = rowFour ? 5 : 2;
-    planned.entity.resources.primitiveGroups =
-        planned.realization.realization ==
-                    I4I8FragmentRealization::SpacemiTIME1N16K32 ||
-                planned.realization.realization ==
-                    I4I8FragmentRealization::SpacemiTIME1M4N16K32
-            ? 28
-            : rowFour ? 25 : 13;
-    planned.entity.resources.peakGroups =
-        planned.entity.resources.primitiveGroups + 1;
+    finalizeI4I8Plan(op, planned);
   }
 
   void finalizeSignBitI8Plan(
@@ -7775,11 +7820,8 @@ private:
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.signBits,
                              planned.realization.activation},
-                            rvvShape(8, 2));
-    planned.entity.resources.valueGroups = 4;
-    planned.entity.resources.memoryGroups = 4;
-    planned.entity.resources.primitiveGroups = 9;
-    planned.entity.resources.peakGroups = 10;
+                            planned.realization.activationShape);
+    planned.entity.resources = planned.realization.resources;
   }
 
   void finalizeE2M1E8M0I8Plan(
@@ -7815,8 +7857,27 @@ private:
   }
 
   template <typename OpTy>
-  void finalizeQuantCodebookI8Plan(
-      OpTy op, PlannedPhysicalDecision<QuantCodebookI8Decision> &planned) const {
+  void finalizeTernaryI8Plan(
+      OpTy op, PlannedPhysicalDecision<TernaryI8Decision> &planned) const {
+    initializeEntityPlan(planned.entity);
+    const TernaryI8Decision &decision = planned.realization;
+    if (decision.semantic == TernaryI8DotSemantic::Base3Digits) {
+      recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[0]},
+                              decision.byteShape32);
+      recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[1]},
+                              decision.byteShape16);
+      recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[2]},
+                              decision.byteShape32);
+    } else {
+      recordLocalBlockReloads(planned, op.getOperation(), decision.blocks,
+                              decision.byteShape32);
+    }
+    planned.entity.resources = decision.resources;
+  }
+
+  template <typename OpTy>
+  void finalizeQuantI8Plan(
+      OpTy op, PlannedPhysicalDecision<QuantI8DotDecision> &planned) const {
     initializeEntityPlan(planned.entity);
     RVVVectorShape shape = planned.realization.byteShape;
     recordLocalBlockReloads(planned, op.getOperation(),
@@ -7867,10 +7928,9 @@ private:
         return op.emitError(
             "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
-    std::optional<I4I8FragmentRealization> fragment =
-        weft::riscv_internal::selectI4I8FragmentRealization(options.target,
-                                                            rowTile);
-    if (!fragment)
+    std::optional<SelectedI4I8FragmentPhysical> physical =
+        selectI4I8FragmentPhysical({rowTile, false}, options.target);
+    if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
@@ -7883,8 +7943,12 @@ private:
       return op.emitError(
           "symmetric i4/i8 dot requires persistent format q4_0_n16_k32_288b");
     decision = SymmetricI4I8Decision{};
-    decision.realization = *fragment;
-    switch (*fragment) {
+    decision.realization = physical->realization;
+    decision.codeShape = physical->codeShape;
+    decision.activationScaleShape = physical->activationScaleShape;
+    decision.accumulatorShape = physical->accumulatorShape;
+    decision.resources = physical->resources;
+    switch (physical->realization) {
     case I4I8FragmentRealization::RVVN16K32:
       decision.leaf = IntrinsicCLeaf::RVVSymmetricI4I8N16K32;
       break;
@@ -8145,14 +8209,15 @@ private:
     }
     if (decision.realization !=
             MaterializedBlockStoreRealization::RVVContiguousRankOne ||
-        decision.columns != 16)
+        decision.columns != 16 || !decision.vectorShape)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store decision has no spelling"));
     auto valuePlan = llvm::find_if(
         entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == op.getValue();
         });
-    if (valuePlan == entity.values.end() || valuePlan->shape != kRVVE32M2)
+    if (valuePlan == entity.values.end() ||
+        valuePlan->shape != decision.vectorShape)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store has no physical value shape"));
     llvm::DenseMap<mlir::Value, std::string> axes;
@@ -8165,14 +8230,19 @@ private:
     std::string offset = fresh("block_store_offset");
     std::string vl = fresh("block_store_vl");
     std::string value = fresh("block_store_value");
+    std::string shapeSuffix = rvvShapeSuffix(decision.vectorShape);
+    if (shapeSuffix.empty())
+      return std::optional<mlir::LogicalResult>(op.emitError(
+          "materialized block store vector shape has no RVV spelling"));
     line("for (size_t " + offset + " = 0; " + offset + " < 16;) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e32m2(16 - " + offset +
-         ");");
-    line("vfloat32m2_t " + value + " = __riscv_vle32_v_f32m2(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" + shapeSuffix +
+         "(16 - " + offset + ");");
+    line("vfloat" + shapeSuffix + "_t " + value +
+         " = __riscv_vle32_v_f" + shapeSuffix + "(" +
          stored->second.spelling + " + " + offset + ", " + vl + ");");
-    line("__riscv_vse32_v_f32m2(" + *destination + " + " + offset +
-         ", " + value + ", " + vl + ");");
+    line("__riscv_vse32_v_f" + shapeSuffix + "(" + *destination + " + " +
+         offset + ", " + value + ", " + vl + ");");
     line(offset + " += " + vl + ";");
     --indent;
     line("}");
@@ -8186,19 +8256,23 @@ private:
 
   mlir::LogicalResult decideSignBitI8Dot(SignBitI8DotOp op,
                                          SignBitI8Decision &decision) {
-    if (options.target.vlenBits < 128)
-      return op.emitError(
-          "sign-bit/i8 dot requires an explicit VLEN of at least 128 bits");
-    if (!options.target.littleEndian)
-      return op.emitError(
-          "sign-bit/i8 dot requires little-endian source bit order");
     auto signBits = resolveLocalBlockMemoryFact(op.getSignBits());
     auto activation = resolveLocalBlockMemoryFact(op.getActivation());
     if (!signBits || !activation)
       return op.emitError(
           "sign-bit/i8 dot requires contiguous all-active local block memory facts");
+    std::optional<SelectedSignBitI8Physical> selected =
+        selectSignBitI8Physical(options.target);
+    if (!selected)
+      return op.emitError(
+          "sign-bit/i8 dot has no resource-legal RVV realization for the target");
 
     decision = SignBitI8Decision{};
+    decision.activationShape = selected->activationShape;
+    decision.widenedShape = selected->widenedShape;
+    decision.reductionShape = selected->reductionShape;
+    decision.maskRatio = selected->maskRatio;
+    decision.resources = selected->resources;
     decision.signBits = *signBits;
     decision.activation = *activation;
     decision.activationScale = op.getActivationScale();
@@ -8229,6 +8303,8 @@ private:
     CValue init = require(decision.init);
     if (decision.realization !=
             SignBitI8Realization::RVVWideningSignSum ||
+        !decision.activationShape || !decision.widenedShape ||
+        !decision.reductionShape || decision.maskRatio == 0 ||
         !signBits || !activation ||
         activationScale.kind != CValueKind::Scalar ||
         signScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
@@ -8236,6 +8312,13 @@ private:
         init.spelling.empty())
       return op.emitError(
           "selected sign-bit/i8 dot operands are unavailable");
+
+    std::string activationSuffix = rvvShapeSuffix(decision.activationShape);
+    std::string widenedSuffix = rvvShapeSuffix(decision.widenedShape);
+    std::string reductionSuffix = rvvShapeSuffix(decision.reductionShape);
+    if (activationSuffix.empty() || widenedSuffix.empty() ||
+        reductionSuffix.empty())
+      return op.emitError("selected sign-bit/i8 vector shapes have no RVV spelling");
 
     std::string vl = fresh("sign_dot_vl");
     std::string codes = fresh("sign_dot_codes");
@@ -8247,24 +8330,33 @@ private:
     std::string reduced = fresh("sign_dot_reduced");
     std::string integerSum = fresh("sign_dot_sum");
     std::string result = fresh("sign_dot");
-    line("const size_t " + vl + " = __riscv_vsetvl_e8m2(32);");
-    line("vint8m2_t " + codes + " = __riscv_vle8_v_i8m2(" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" + activationSuffix +
+         "(32);");
+    line("vint" + activationSuffix + "_t " + codes +
+         " = __riscv_vle8_v_i" + activationSuffix + "(" +
          "(const int8_t *)(const void *)" + *activation + ", " + vl +
          ");");
-    line("vint16m4_t " + wide + " = __riscv_vsext_vf2_i16m4(" + codes +
-         ", " + vl + ");");
-    line("vbool4_t " + mask + " = __riscv_vlm_v_b4(" + *signBits +
-         ", " + vl + ");");
-    line("vint16m4_t " + negative + " = __riscv_vneg_v_i16m4(" + wide +
-         ", " + vl + ");");
-    line("vint16m4_t " + selected + " = __riscv_vmerge_vvm_i16m4(" +
-         negative + ", " + wide + ", " + mask + ", " + vl + ");");
-    line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
-    line("vint32m1_t " + reduced +
-         " = __riscv_vwredsum_vs_i16m4_i32m1(" + selected + ", " + seed +
-         ", " + vl + ");");
+    line("vint" + widenedSuffix + "_t " + wide +
+         " = __riscv_vsext_vf2_i" + widenedSuffix + "(" + codes + ", " +
+         vl + ");");
+    std::string maskSuffix = std::to_string(decision.maskRatio);
+    line("vbool" + maskSuffix + "_t " + mask + " = __riscv_vlm_v_b" +
+         maskSuffix + "(" + *signBits + ", " + vl + ");");
+    line("vint" + widenedSuffix + "_t " + negative +
+         " = __riscv_vneg_v_i" + widenedSuffix + "(" + wide + ", " + vl +
+         ");");
+    line("vint" + widenedSuffix + "_t " + selected +
+         " = __riscv_vmerge_vvm_i" + widenedSuffix + "(" + negative + ", " +
+         wide + ", " + mask + ", " + vl + ");");
+    line("vint" + reductionSuffix + "_t " + seed +
+         " = __riscv_vmv_v_x_i" + reductionSuffix + "(0, 1);");
+    line("vint" + reductionSuffix + "_t " + reduced +
+         " = __riscv_vwredsum_vs_i" + widenedSuffix + "_i" +
+         reductionSuffix + "(" + selected + ", " + seed + ", " + vl +
+         ");");
     line("const int32_t " + integerSum +
-         " = __riscv_vmv_x_s_i32m1_i32(" + reduced + ");");
+         " = __riscv_vmv_x_s_i" + reductionSuffix + "_i32(" + reduced +
+         ");");
     line("const float " + result + " = " + init.spelling + " + (float)" +
          integerSum + " * " + activationScale.spelling + " * " +
          signScale.spelling + ";");
@@ -8472,18 +8564,111 @@ private:
   }
 
   template <typename OpTy>
-  mlir::LogicalResult decideQuantCodebookI8Dot(
+  mlir::LogicalResult decideTernaryI8Dot(
+      OpTy op, TernaryI8DotSemantic semantic,
+      llvm::ArrayRef<mlir::Value> blocks,
+      llvm::ArrayRef<mlir::Value> scalars, TernaryI8Decision &decision) {
+    std::optional<SelectedTernaryI8DotPhysical> selected =
+        weft::riscv_internal::selectTernaryI8DotPhysical({semantic},
+                                                         options.target);
+    if (!selected)
+      return op.emitError(
+          "ternary/i8 dot has no legal target realization");
+
+    decision = TernaryI8Decision{};
+    decision.semantic = semantic;
+    decision.realization = selected->realization;
+    decision.byteShape32 = selected->byteShape32;
+    decision.byteShape16 = selected->byteShape16;
+    decision.widenedShape32 = selected->widenedShape32;
+    decision.widenedShape16 = selected->widenedShape16;
+    decision.reductionShape = selected->reductionShape;
+    decision.resources = selected->resources;
+    switch (semantic) {
+    case TernaryI8DotSemantic::Base3Digits:
+      decision.leaf =
+          selected->realization ==
+                  TernaryI8DotRealization::RVVVLEN128LocalBlockDot
+              ? IntrinsicCLeaf::Base3TernaryI8VLEN128
+              : IntrinsicCLeaf::Base3TernaryI8VLEN256;
+      break;
+    case TernaryI8DotSemantic::PackedI2Fields:
+      decision.leaf =
+          selected->realization ==
+                  TernaryI8DotRealization::RVVVLEN128LocalBlockDot
+              ? IntrinsicCLeaf::PackedI2TernaryI8VLEN128
+              : IntrinsicCLeaf::PackedI2TernaryI8VLEN256;
+      break;
+    }
+    for (mlir::Value block : blocks) {
+      std::optional<LocalBlockMemoryFact> fact =
+          resolveLocalBlockMemoryFact(block);
+      if (!fact)
+        return op.emitError(
+            "ternary/i8 dot requires contiguous all-active local block memory facts");
+      decision.blocks.push_back(*fact);
+    }
+    decision.scalars.append(scalars.begin(), scalars.end());
+    return mlir::success();
+  }
+
+  template <typename OpTy>
+  mlir::LogicalResult emitTernaryI8Dot(OpTy op) {
+    auto prepared = physicalPlan.ternaryI8.find(op.getOperation());
+    if (prepared == physicalPlan.ternaryI8.end())
+      return op.emitError("ternary/i8 physical decision was not prepared");
+    if (mlir::failed(requireEntityPlan(op.getOperation(), prepared->second)))
+      return mlir::failure();
+    const TernaryI8Decision &decision = prepared->second.realization;
+    for (const LocalBlockMemoryFact &block : decision.blocks)
+      if (mlir::failed(requirePhysicalHandoff(
+              op.getOperation(), prepared->second.entity, block.semanticValue,
+              PhysicalHandoff::Reload)))
+        return mlir::failure();
+
+    llvm::SmallVector<std::string> operands;
+    for (const LocalBlockMemoryFact &block : decision.blocks) {
+      std::optional<std::string> value = projectLocalBlockMemoryBase(block);
+      if (!value)
+        return op.emitError("ternary/i8 block base was not materialized");
+      operands.push_back(std::move(*value));
+    }
+    for (mlir::Value scalar : decision.scalars) {
+      CValue value = require(scalar);
+      if (value.kind != CValueKind::Scalar || value.spelling.empty())
+        return op.emitError("ternary/i8 scalar operand was not materialized");
+      operands.push_back(std::move(value.spelling));
+    }
+    llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
+    if (helper.empty())
+      return op.emitError("ternary/i8 leaf spelling was not selected");
+    std::string result = fresh("ternary_dot");
+    line("const float " + result + " = " + helper.str() + "(" +
+         llvm::join(operands, ", ") + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    llvm::SmallVector<mlir::Value> blockValues;
+    for (const LocalBlockMemoryFact &block : decision.blocks)
+      blockValues.push_back(block.semanticValue);
+    if (mlir::failed(
+            markRematerializedBlockTrees(blockValues, op.getOperation())))
+      return mlir::failure();
+    return mlir::success();
+  }
+
+  template <typename OpTy>
+  mlir::LogicalResult decideQuantI8Dot(
       OpTy op, QuantI8DotSemantic semantic,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
-      QuantCodebookI8Decision &decision, unsigned semanticExtent = 256) {
+      QuantI8DotDecision &decision, unsigned semanticExtent = 256) {
     std::optional<SelectedQuantI8DotPhysical> selected =
         weft::riscv_internal::selectQuantI8DotPhysical(
             QuantI8DotCandidateFacts{semantic, semanticExtent}, options.target);
     if (!selected)
       return op.emitError(
-          "quant codebook/i8 dot has no legal target realization");
-    decision = QuantCodebookI8Decision{};
+          "quant/i8 dot has no legal target realization");
+    decision = QuantI8DotDecision{};
     decision.semantic = semantic;
     decision.realization = selected->realization;
     decision.semanticLanes = selected->semanticLanes;
@@ -8491,6 +8676,20 @@ private:
     decision.reductionSegments = selected->reductionSegments;
     decision.resources = selected->resources;
     switch (semantic) {
+    case QuantI8DotSemantic::PackedI4:
+      if (decision.realization !=
+              QuantI8DotRealization::RVVFixedLaneLocalBlockDot ||
+          decision.semanticLanes != 32)
+        return op.emitError(
+            "packed i4/i8 dot requires a fixed thirty-two-lane realization");
+      if (decision.byteShape == RVVVectorShape{8, 16})
+        decision.leaf = IntrinsicCLeaf::PackedI4I8VLEN128;
+      else if (decision.byteShape == RVVVectorShape{8, 8})
+        decision.leaf = IntrinsicCLeaf::PackedI4I8VLEN256;
+      else
+        return op.emitError(
+            "packed i4/i8 dot has no intrinsic leaf for the selected byte shape");
+      break;
     case QuantI8DotSemantic::PackedI5:
       if (decision.realization !=
               QuantI8DotRealization::RVVFixedLaneLocalBlockDot ||
@@ -8559,7 +8758,7 @@ private:
       auto fact = resolveLocalBlockMemoryFact(block);
       if (!fact)
         return op.emitError(
-            "quant codebook/i8 dot requires contiguous all-active local block memory facts");
+            "quant/i8 dot requires contiguous all-active local block memory facts");
       decision.blocks.push_back(*fact);
     }
     decision.scalars.append(scalars.begin(), scalars.end());
@@ -8567,14 +8766,14 @@ private:
   }
 
   template <typename OpTy>
-  mlir::LogicalResult emitQuantCodebookI8Dot(OpTy op) {
-    auto prepared = physicalPlan.quantCodebookI8.find(op.getOperation());
-    if (prepared == physicalPlan.quantCodebookI8.end())
+  mlir::LogicalResult emitQuantI8Dot(OpTy op) {
+    auto prepared = physicalPlan.quantI8Dots.find(op.getOperation());
+    if (prepared == physicalPlan.quantI8Dots.end())
       return op.emitError(
-          "quant codebook/i8 physical decision was not prepared");
+          "quant/i8 physical decision was not prepared");
     if (mlir::failed(requireEntityPlan(op.getOperation(), prepared->second)))
       return mlir::failure();
-    const QuantCodebookI8Decision &decision = prepared->second.realization;
+    const QuantI8DotDecision &decision = prepared->second.realization;
     for (const LocalBlockMemoryFact &block : decision.blocks)
       if (mlir::failed(requirePhysicalHandoff(
               op.getOperation(), prepared->second.entity, block.semanticValue,
@@ -8584,26 +8783,26 @@ private:
             QuantI8DotRealization::RVVFixedLaneLocalBlockDot &&
         decision.realization !=
             QuantI8DotRealization::RVVScalableLocalBlockDot)
-      return op.emitError("quant codebook/i8 realization is unavailable");
+      return op.emitError("quant/i8 realization is unavailable");
     llvm::SmallVector<std::string> operands;
     for (const LocalBlockMemoryFact &block : decision.blocks) {
       std::optional<std::string> value = projectLocalBlockMemoryBase(block);
       if (!value)
         return op.emitError(
-            "quant codebook/i8 block base was not materialized");
+            "quant/i8 block base was not materialized");
       operands.push_back(std::move(*value));
     }
     for (mlir::Value scalar : decision.scalars) {
       CValue value = require(scalar);
       if (value.kind != CValueKind::Scalar || value.spelling.empty())
         return op.emitError(
-            "quant codebook/i8 scalar operand was not materialized");
+            "quant/i8 scalar operand was not materialized");
       operands.push_back(std::move(value.spelling));
     }
     std::string result = fresh("quant_dot");
     llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
     if (helper.empty())
-      return op.emitError("quant codebook/i8 leaf spelling was not selected");
+      return op.emitError("quant/i8 leaf spelling was not selected");
     line("const float " + result + " = " + helper.str() + "(" +
          llvm::join(operands, ", ") + ");");
     values[op.getResult()] =
@@ -8646,10 +8845,9 @@ private:
         return op.emitError(
             "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
-    std::optional<I4I8FragmentRealization> fragment =
-        weft::riscv_internal::selectI4I8FragmentRealization(options.target,
-                                                            rowTile);
-    if (!fragment)
+    std::optional<SelectedI4I8FragmentPhysical> physical =
+        selectI4I8FragmentPhysical({rowTile, true}, options.target);
+    if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
@@ -8663,8 +8861,12 @@ private:
           "affine i4/i8 dot requires persistent format affine_i4_n16_k32_304b");
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
-    decision.realization = *fragment;
-    switch (*fragment) {
+    decision.realization = physical->realization;
+    decision.codeShape = physical->codeShape;
+    decision.activationScaleShape = physical->activationScaleShape;
+    decision.accumulatorShape = physical->accumulatorShape;
+    decision.resources = physical->resources;
+    switch (physical->realization) {
     case I4I8FragmentRealization::RVVN16K32:
       decision.leaf = IntrinsicCLeaf::RVVAffineI4I8N16K32;
       break;
@@ -10387,19 +10589,29 @@ private:
 
   SelectedBlockReducePhysical decideBlockReducePhysical(
       int64_t extent, BlockIndexOp axis,
-      const llvm::DenseSet<mlir::Operation *> &closure) const {
+      const llvm::DenseSet<mlir::Operation *> &closure,
+      RVVVectorShape inputShape) const {
     bool needsLaneVector = blockClosureNeedsLaneVector(axis, closure);
     if (!llvm::all_of(closure, [&](mlir::Operation *operation) {
           return supportsBlockByteShape(operation, kRVVE8M1);
         }))
       return SelectedBlockReducePhysical{};
-    llvm::SmallVector<BlockReducePhysicalDecision> candidates{
-        {BlockReduceRealization::RVVE8M1FixedStrips, 16, false, {}},
-        {BlockReduceRealization::RVVE8M1DynamicStrips, 16,
-         needsLaneVector, needsLaneVector ? kRVVE16M2 : RVVVectorShape{}}};
+    BlockReducePhysicalDecision fixed{
+        BlockReduceRealization::RVVE8M1FixedStrips, 16, false, {}};
+    BlockReducePhysicalDecision dynamic{
+        BlockReduceRealization::RVVE8M1DynamicStrips, 16, needsLaneVector,
+        needsLaneVector ? kRVVE16M2 : RVVVectorShape{}};
+    llvm::SmallVector<BlockReducePhysicalDecision> candidates;
+    if (extent == 16 && inputShape.sew == 16) {
+      candidates.push_back(dynamic);
+      candidates.push_back(fixed);
+    } else {
+      candidates.push_back(fixed);
+      candidates.push_back(dynamic);
+    }
     for (const BlockReducePhysicalDecision &candidate : candidates) {
       if (candidate.realization == BlockReduceRealization::RVVE8M1FixedStrips &&
-          (needsLaneVector || extent != 32))
+          (needsLaneVector || (extent != 16 && extent != 32)))
         continue;
       unsigned liveGroups = 8 + rvvRegisterGroups(candidate.laneShape) + 1;
       PhysicalResourceBudget resources;
@@ -10615,11 +10827,6 @@ private:
     decision.operation = op.getOperation();
     decision.axis = axis.getOperation();
     decision.extent = extent;
-    SelectedBlockReducePhysical selected =
-        decideBlockReducePhysical(extent, axis, closure);
-    if (selected.decision.realization == BlockReduceRealization::Unsupported)
-      return op.emitError(
-          "RVV block reduction has no legal physical resource candidate");
     for (ReduceOp reduction : reductions) {
       decision.reductions.push_back(reduction.getOperation());
       plannedReductions.insert(reduction.getOperation());
@@ -10636,6 +10843,11 @@ private:
         });
     if (reducedValue == planned.entity.values.end())
       return op.emitError("block reduction input has no physical value decision");
+    SelectedBlockReducePhysical selected = decideBlockReducePhysical(
+        extent, axis, closure, reducedValue->shape);
+    if (selected.decision.realization == BlockReduceRealization::Unsupported)
+      return op.emitError(
+          "RVV block reduction has no legal physical resource candidate");
     BlockReductionValueDecision reductionValue;
     reductionValue.operation = op.getOperation();
     reductionValue.inputShape = reducedValue->shape;
@@ -10975,11 +11187,16 @@ private:
             decision.values, [&](const BlockReductionValueDecision &value) {
               return value.operation == reduction.getOperation();
             });
-        if (stripInputs[index].size() != 2 ||
-            stripInputs[index][0].kind != stripInputs[index][1].kind ||
+        if ((stripInputs[index].size() != 1 &&
+             stripInputs[index].size() != 2) ||
             reductionValue == decision.values.end() ||
             stripInputs[index][0].vectorShape != reductionValue->inputShape ||
-            stripInputs[index][1].vectorShape != reductionValue->inputShape)
+            llvm::any_of(llvm::drop_begin(stripInputs[index]),
+                         [&](const BlockValue &input) {
+                           return input.kind != stripInputs[index][0].kind ||
+                                  input.vectorShape !=
+                                      reductionValue->inputShape;
+                         }))
           return reduction.emitError(
               "fixed-strip reduction produced incompatible physical values");
         std::string inputSuffix = rvvShapeSuffix(reductionValue->inputShape);
@@ -10989,7 +11206,6 @@ private:
         if (inputSuffix.empty() || combinedSuffix.empty() || seedSuffix.empty())
           return reduction.emitError(
               "fixed-strip reduction shapes have no RVV spelling");
-        std::string combined = fresh("block_combined");
         std::string seed = fresh("block_seed");
         std::string partial = fresh("block_partial");
         BlockValueKind expectedKind = reductionValue->wideningCombine
@@ -11000,17 +11216,28 @@ private:
             reductionValue->seedShape.sew != 32)
           return reduction.emitError(
               "fixed-strip reduction physical type is unsupported");
-        std::string addStem =
-            reductionValue->wideningCombine ? "vwadd" : "vadd";
-        line("vint" + combinedSuffix + "_t " + combined + " = __riscv_" +
-             addStem + "_vv_i" + combinedSuffix + "(" +
-             stripInputs[index][0].spelling + ", " +
-             stripInputs[index][1].spelling + ", " + vl + ");");
         line("vint" + seedSuffix + "_t " + seed + " = __riscv_vmv_v_x_i" +
              seedSuffix + "(0, 1);");
-        line("vint" + seedSuffix + "_t " + partial +
-             " = __riscv_vredsum_vs_i" + combinedSuffix + "_i" + seedSuffix +
-             "(" + combined + ", " + seed + ", " + vl + ");");
+        if (stripInputs[index].size() == 2) {
+          std::string combined = fresh("block_combined");
+          std::string addStem =
+              reductionValue->wideningCombine ? "vwadd" : "vadd";
+          line("vint" + combinedSuffix + "_t " + combined + " = __riscv_" +
+               addStem + "_vv_i" + combinedSuffix + "(" +
+               stripInputs[index][0].spelling + ", " +
+               stripInputs[index][1].spelling + ", " + vl + ");");
+          line("vint" + seedSuffix + "_t " + partial +
+               " = __riscv_vredsum_vs_i" + combinedSuffix + "_i" +
+               seedSuffix + "(" + combined + ", " + seed + ", " + vl +
+               ");");
+        } else {
+          std::string reductionStem =
+              reductionValue->wideningCombine ? "vwredsum" : "vredsum";
+          line("vint" + seedSuffix + "_t " + partial + " = __riscv_" +
+               reductionStem + "_vs_i" + inputSuffix + "_i" + seedSuffix +
+               "(" + stripInputs[index][0].spelling + ", " + seed + ", " +
+               vl + ");");
+        }
         line(accumulators[index] + " += __riscv_vmv_x_s_i" + seedSuffix +
              "_i32(" + partial + ");");
         values[reduction.getResult()] =

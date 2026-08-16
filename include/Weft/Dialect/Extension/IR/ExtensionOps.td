@@ -151,6 +151,27 @@ def WeftExtension_E2M1E8M0I8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_PackedI4I8DotOp
+    : WeftExtension_Op<"packed_i4_i8_dot", [Pure]> {
+  let summary = "Packed unsigned-i4 by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element dot.  packed_codes contains sixteen bytes;
+    low nibbles encode elements 0..15 and high nibbles encode elements 16..31.
+    zero_point is subtracted from every decoded code.  The integer dot is
+    multiplied by dot_scale, additive_bias is added once, and the result is
+    accumulated into init.
+
+    Enclosing block storage, outer traversal, vector shape, reduction
+    organization, and instruction spelling remain outside this local semantic
+    primitive.
+  }];
+  let arguments = (ins AnyType:$packed_codes, AnyType:$activation,
+                       AnyType:$zero_point, AnyType:$dot_scale,
+                       AnyType:$additive_bias, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_PackedI5I8DotOp
     : WeftExtension_Op<"packed_i5_i8_dot", [Pure]> {
   let summary = "Packed unsigned-i5 by signed-i8 local dot";
@@ -170,6 +191,46 @@ def WeftExtension_PackedI5I8DotOp
   let arguments = (ins AnyType:$low_bits, AnyType:$high_bits,
                        AnyType:$activation, AnyType:$zero_point,
                        AnyType:$dot_scale, AnyType:$additive_bias,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_Base3TernaryI8DotOp
+    : WeftExtension_Op<"base3_ternary_i8_dot", [Pure]> {
+  let summary = "Packed base-3 ternary by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element ternary by signed-i8 dot.  codes contains a
+    thirty-two-byte five-digit base-3 field followed by a sixteen-byte
+    five-digit field.  high_digits contains four bytes that define the final
+    sixteen values through four base-3 digits.  activation, both scales, and
+    init are explicit operands.
+
+    The 48/4-byte decode relation is local numerical semantics.  Its enclosing
+    packed block, Q8 block, outer traversal, target vector shape, reduction
+    organization, and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$high_digits,
+                       AnyType:$activation, AnyType:$weight_scale,
+                       AnyType:$activation_scale, AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftExtension_PackedI2TernaryI8DotOp
+    : WeftExtension_Op<"packed_i2_ternary_i8_dot", [Pure]> {
+  let summary = "Packed two-bit ternary by signed-i8 local dot";
+  let description = [{
+    Computes one 256-element ternary by signed-i8 dot.  Each of sixty-four
+    packed bytes contributes four two-bit fields; each field decodes as
+    code - 1 and is paired with the corresponding activation element.
+    Both scales and init are explicit operands.
+
+    The local decode and dot do not own the enclosing packed block, Q8 block,
+    outer traversal, target vector shape, or instruction spelling.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$activation,
+                       AnyType:$weight_scale, AnyType:$activation_scale,
                        AnyType:$init);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;

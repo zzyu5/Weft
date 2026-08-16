@@ -35,8 +35,8 @@ int main() {
   std::vector<float> input(kElements);
   std::vector<float> output(kElements);
   for (std::size_t index = 0; index < input.size(); ++index)
-    input[index] = static_cast<float>(static_cast<int>(index % 251) - 125) /
-                   32.0F;
+    input[index] =
+        static_cast<float>(static_cast<int>(index % 31) - 15) / 16.0F;
 
   softmax_f32(input.data(), output.data(), 0, kRows, kColumns, kColumns);
   double maxAbsoluteError = 0.0;

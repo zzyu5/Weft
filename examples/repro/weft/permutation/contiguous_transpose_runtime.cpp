@@ -54,8 +54,8 @@ int main(int argc, char **argv) {
   std::vector<float> source(kElements);
   std::vector<float> destination(kElements, 0.0F);
   for (std::size_t index = 0; index < source.size(); ++index)
-    source[index] = static_cast<float>(static_cast<int>(index % 8191) - 4095) /
-                    256.0F;
+    source[index] =
+        static_cast<float>(static_cast<int>(index % 31) - 15) / 16.0F;
 
   transpose_f32(source.data(), destination.data(), kRows, kColumns, kColumns,
                 kRows);

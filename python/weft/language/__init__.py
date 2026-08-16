@@ -17,6 +17,7 @@ from .builtins import argmax
 from .builtins import bitcast
 from .builtins import block
 from .builtins import affine_i4_i8_dot
+from .builtins import base3_ternary_i8_dot
 from .builtins import cast
 from .builtins import cos
 from .builtins import decode
@@ -42,7 +43,9 @@ from .builtins import minimum
 from .builtins import narrow
 from .builtins import neg_inf
 from .builtins import online_softmax_summary
+from .builtins import packed_i4_i8_dot
 from .builtins import packed_i5_i8_dot
+from .builtins import packed_i2_ternary_i8_dot
 from .builtins import q6_k_i8_dot
 from .builtins import pure
 from .builtins import range

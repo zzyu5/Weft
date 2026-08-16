@@ -60,9 +60,22 @@ enum class I4I8FragmentRealization {
   SpacemiTIME1M4N16K32,
 };
 
-std::optional<I4I8FragmentRealization>
-selectI4I8FragmentRealization(const RISCVTargetProfile &target,
-                              unsigned rowTile);
+struct I4I8FragmentCandidateFacts {
+  unsigned rowTile = 1;
+  bool affine = false;
+};
+
+struct SelectedI4I8FragmentPhysical {
+  I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
+  RVVVectorShape codeShape;
+  RVVVectorShape activationScaleShape;
+  RVVVectorShape accumulatorShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedI4I8FragmentPhysical>
+selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
+                           const RISCVTargetProfile &target);
 
 enum class VLAStatePlacement {
   ScalarCarry,
@@ -79,7 +92,48 @@ selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
                               const RISCVTargetProfile &target,
                               const RISCVBackendConfig &config);
 
+struct SelectedSignBitI8Physical {
+  RVVVectorShape activationShape;
+  RVVVectorShape widenedShape;
+  RVVVectorShape reductionShape;
+  unsigned maskRatio = 0;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedSignBitI8Physical>
+selectSignBitI8Physical(const RISCVTargetProfile &target);
+
+enum class TernaryI8DotSemantic {
+  Base3Digits,
+  PackedI2Fields,
+};
+
+enum class TernaryI8DotRealization {
+  RVVVLEN128LocalBlockDot,
+  RVVVLEN256LocalBlockDot,
+};
+
+struct TernaryI8DotCandidateFacts {
+  TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
+};
+
+struct SelectedTernaryI8DotPhysical {
+  TernaryI8DotRealization realization =
+      TernaryI8DotRealization::RVVVLEN128LocalBlockDot;
+  RVVVectorShape byteShape32;
+  RVVVectorShape byteShape16;
+  RVVVectorShape widenedShape32;
+  RVVVectorShape widenedShape16;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedTernaryI8DotPhysical>
+selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
+                           const RISCVTargetProfile &target);
+
 enum class QuantI8DotSemantic {
+  PackedI4,
   PackedI5,
   IQ2S,
   IQ3S,

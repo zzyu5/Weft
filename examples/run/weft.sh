@@ -500,7 +500,7 @@ case "${kernel}" in
     fi
     dsl=examples/kernels/quantization/mul_mat.py
     dsl_entry=${kernel}
-    runtime=examples/repro/weft/quantization/mul_mat_legacy_runtime.cpp
+    runtime=examples/repro/weft/quantization/mul_mat_basic_runtime.cpp
     runtime_arguments=("$1" "$2")
     case "${kernel}" in
       mul_mat_q4_0)

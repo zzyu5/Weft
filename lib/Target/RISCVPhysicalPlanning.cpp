@@ -84,15 +84,19 @@ integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
   return candidates;
 }
 
-std::optional<I4I8FragmentRealization>
-selectI4I8FragmentRealization(const RISCVTargetProfile &target,
-                              unsigned rowTile) {
-  if (rowTile != 1 && rowTile != 4)
+std::optional<SelectedI4I8FragmentPhysical>
+selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
+                           const RISCVTargetProfile &target) {
+  if (facts.rowTile != 1 && facts.rowTile != 4)
     return std::nullopt;
-  if (rowTile == 4 && target.supportsSpacemitIME1I4I8M4N16K32())
-    return I4I8FragmentRealization::SpacemiTIME1M4N16K32;
-  if (rowTile == 1 && target.supportsSpacemitIME1I4I8N16K32())
-    return I4I8FragmentRealization::SpacemiTIME1N16K32;
+  SelectedI4I8FragmentPhysical selected;
+  if (facts.rowTile == 4 && target.supportsSpacemitIME1I4I8M4N16K32())
+    selected.realization =
+        I4I8FragmentRealization::SpacemiTIME1M4N16K32;
+  else if (facts.rowTile == 1 &&
+           target.supportsSpacemitIME1I4I8N16K32())
+    selected.realization = I4I8FragmentRealization::SpacemiTIME1N16K32;
+  else {
   bool supportsRVV = target.hasF && target.hasVectorF16 &&
                      target.hasWideningInteger && target.hasWideningFloat &&
                      target.supportsVLENAtLeast(128) &&
@@ -101,8 +105,40 @@ selectI4I8FragmentRealization(const RISCVTargetProfile &target,
                      target.supportsVectorShape(32, 32);
   if (!supportsRVV)
     return std::nullopt;
-  return rowTile == 4 ? I4I8FragmentRealization::RVVM4N16K32
-                      : I4I8FragmentRealization::RVVN16K32;
+    selected.realization = facts.rowTile == 4
+                               ? I4I8FragmentRealization::RVVM4N16K32
+                               : I4I8FragmentRealization::RVVN16K32;
+  }
+
+  selected.codeShape = facts.rowTile == 4
+                           ? rvvShape(8, target.vlenBits >= 256 ? 4 : 8)
+                           : selected.realization ==
+                                     I4I8FragmentRealization::SpacemiTIME1N16K32
+                                 ? kRVVE8MF4
+                                 : rvvShape(8, 2);
+  selected.activationScaleShape = kRVVE32M1;
+  selected.accumulatorShape = kRVVE32M4;
+  for (RVVVectorShape shape : {selected.codeShape,
+                               selected.activationScaleShape,
+                               selected.accumulatorShape})
+    if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
+      return std::nullopt;
+
+  bool ime = selected.realization ==
+                 I4I8FragmentRealization::SpacemiTIME1N16K32 ||
+             selected.realization ==
+                 I4I8FragmentRealization::SpacemiTIME1M4N16K32;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups = facts.rowTile == 4 ? 20 : 4;
+  selected.resources.memoryGroups = facts.rowTile == 4 ? 5 : 2;
+  selected.resources.primitiveGroups =
+      ime ? 28 : facts.rowTile == 4 ? (facts.affine ? 25 : 24)
+                                    : (facts.affine ? 13 : 12);
+  selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
 }
 
 std::optional<VLAStatePlacement>
@@ -126,6 +162,94 @@ selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
                      : VLAStatePlacement::ScalarCarry;
 }
 
+std::optional<SelectedSignBitI8Physical>
+selectSignBitI8Physical(const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.littleEndian || target.vlenBits < 128 ||
+      !target.hasWideningInteger)
+    return std::nullopt;
+  std::optional<RVVVectorShape> activation =
+      rvvShapeForSemanticLanes(8, 32, target);
+  if (!activation)
+    return std::nullopt;
+  std::optional<RVVVectorShape> widened =
+      rvvShapeForSameLanes(*activation, 16, target);
+  std::optional<unsigned> maskRatio =
+      widened ? rvvMaskRatio(*widened) : std::nullopt;
+  if (!widened || !maskRatio ||
+      !target.supportsVectorShape(kRVVE32M1.sew,
+                                  kRVVE32M1.lmulEighths))
+    return std::nullopt;
+
+  SelectedSignBitI8Physical selected;
+  selected.activationShape = *activation;
+  selected.widenedShape = *widened;
+  selected.reductionShape = kRVVE32M1;
+  selected.maskRatio = *maskRatio;
+  unsigned activationGroups = rvvRegisterGroups(*activation);
+  unsigned widenedGroups = rvvRegisterGroups(*widened);
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups = widenedGroups;
+  selected.resources.memoryGroups = activationGroups;
+  selected.resources.predicateGroups = 1;
+  selected.resources.primitiveGroups = 3 * widenedGroups + 1;
+  selected.resources.peakGroups = selected.resources.primitiveGroups;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
+std::optional<SelectedTernaryI8DotPhysical>
+selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
+                           const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
+      (target.vlenBits != 128 && target.vlenBits != 256))
+    return std::nullopt;
+
+  std::optional<RVVVectorShape> byte32 =
+      rvvShapeForSemanticLanes(8, 32, target);
+  std::optional<RVVVectorShape> byte16 =
+      rvvShapeForSemanticLanes(8, 16, target);
+  std::optional<RVVVectorShape> widened32 =
+      byte32 ? rvvShapeForSameLanes(*byte32, 16, target) : std::nullopt;
+  std::optional<RVVVectorShape> widened16 =
+      byte16 ? rvvShapeForSameLanes(*byte16, 16, target) : std::nullopt;
+  if (!byte32 || !byte16 || !widened32 || !widened16 ||
+      !target.supportsVectorShape(kRVVE32M1.sew,
+                                  kRVVE32M1.lmulEighths))
+    return std::nullopt;
+
+  SelectedTernaryI8DotPhysical selected;
+  selected.realization =
+      target.vlenBits == 128
+          ? TernaryI8DotRealization::RVVVLEN128LocalBlockDot
+          : TernaryI8DotRealization::RVVVLEN256LocalBlockDot;
+  selected.byteShape32 = *byte32;
+  selected.byteShape16 = *byte16;
+  selected.widenedShape32 = *widened32;
+  selected.widenedShape16 = *widened16;
+  selected.reductionShape = kRVVE32M1;
+
+  unsigned byteGroups = rvvRegisterGroups(*byte32);
+  unsigned widenedGroups = rvvRegisterGroups(*widened32);
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups = byteGroups + widenedGroups;
+  selected.resources.memoryGroups = 2 * byteGroups;
+  switch (facts.semantic) {
+  case TernaryI8DotSemantic::Base3Digits:
+    selected.resources.primitiveGroups = byteGroups + 3 * widenedGroups + 1;
+    break;
+  case TernaryI8DotSemantic::PackedI2Fields:
+    selected.resources.primitiveGroups = 3 * byteGroups + widenedGroups + 1;
+    break;
+  }
+  selected.resources.peakGroups = selected.resources.primitiveGroups;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
 std::optional<SelectedQuantI8DotPhysical>
 selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
@@ -146,7 +270,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.resources.valueGroups = rvvRegisterGroups(*byteShape) * 2;
   selected.resources.memoryGroups = selected.resources.valueGroups;
 
-  bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI5 ||
+  bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI4 ||
+                   facts.semantic == QuantI8DotSemantic::PackedI5 ||
                    facts.semantic == QuantI8DotSemantic::IQ2S ||
                    facts.semantic == QuantI8DotSemantic::Q6K ||
                    facts.semantic == QuantI8DotSemantic::IQ1M ||

@@ -26,15 +26,6 @@ def load_i16_le(base):
 
 
 @W.helper(effects=("read",))
-def unpack_q4(qs, logical_index, zero):
-    packed_index = logical_index % W.index(16)
-    shift = W.cast((logical_index // W.index(16)) * W.index(4), W.u8)
-    packed = W.load(qs + packed_index, other=W.u8(0))
-    code = (packed >> shift) & W.u8(15)
-    return W.cast(code, W.i32) + zero
-
-
-@W.helper(effects=("read",))
 def load_q8(qs, logical_index):
     return W.cast(
         W.bitcast(W.load(qs + logical_index, other=W.u8(0)), W.i8),
@@ -48,18 +39,19 @@ def q4_0_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(18)
         y_block = y + block * W.index(34)
-        logical_index = W.block(32)
-        x_values = unpack_q4(x_block + 2, logical_index, W.i32(-8))
-        y_values = load_q8(y_block + 2, logical_index)
-        integer_sum = W.reduce(
-            x_values * y_values,
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
+        packed_axis = W.block(16)
+        activation_axis = W.block(32)
+        result = W.packed_i4_i8_dot(
+            W.load(x_block + W.index(2) + packed_axis, other=W.u8(0)),
+            W.bitcast(
+                W.load(y_block + W.index(2) + activation_axis, other=W.u8(0)),
+                W.i8,
+            ),
+            W.i32(8),
+            W.load_f16_le(x_block) * W.load_f16_le(y_block),
+            W.f32(0.0),
+            result,
         )
-        scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
-        result += W.cast(integer_sum, W.f32) * scale
     return result
 
 
@@ -78,19 +70,19 @@ def q4_1_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(20)
         y_block = y + block * W.index(36)
-        logical_index = W.block(32)
-        x_values = unpack_q4(x_block + 4, logical_index, W.i32(0))
-        y_values = load_q8(y_block + 4, logical_index)
-        integer_sum = W.reduce(
-            x_values * y_values,
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
+        packed_axis = W.block(16)
+        activation_axis = W.block(32)
+        result = W.packed_i4_i8_dot(
+            W.load(x_block + W.index(4) + packed_axis, other=W.u8(0)),
+            W.bitcast(
+                W.load(y_block + W.index(4) + activation_axis, other=W.u8(0)),
+                W.i8,
+            ),
+            W.i32(0),
+            W.load_f16_le(x_block) * W.load_f16_le(y_block),
+            W.load_f16_le(x_block + 2) * W.load_f16_le(y_block + 2),
+            result,
         )
-        dot_scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
-        correction = W.load_f16_le(x_block + 2) * W.load_f16_le(y_block + 2)
-        result += W.cast(integer_sum, W.f32) * dot_scale + correction
     return result
 
 
@@ -257,35 +249,17 @@ def tq2_0_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(66)
         y = activation + block * W.index(292)
-        integer_sum = W.i32(0)
-        for half in W.range(0, 2):
-            member = W.block(32)
-            packed_codes = W.load(
-                x + half * W.index(32) + member, other=W.u8(0)
-            )
-            for field in W.range(0, 4):
-                shift = W.cast(field * W.index(2), W.u8)
-                code = W.cast(
-                    (packed_codes >> shift) & W.u8(3), W.i32
-                ) - W.i32(1)
-                activation_values = load_q8(
-                    y
-                    + W.index(4)
-                    + half * W.index(128)
-                    + field * W.index(32),
-                    member,
-                )
-                integer_sum = integer_sum + W.reduce(
-                    code * activation_values,
-                    identity=W.i32(0),
-                    axis=0,
-                    acc_dtype=W.i32,
-                    order="relaxed",
-                )
-        result = result + (
-            W.load_f16_le(x + W.index(64))
-            * load_f32_le(y)
-            * W.cast(integer_sum, W.f32)
+        code = W.block(64)
+        activation_element = W.block(256)
+        result = W.packed_i2_ternary_i8_dot(
+            W.load(x + code, other=W.u8(0)),
+            W.bitcast(
+                W.load(y + W.index(4) + activation_element, other=W.u8(0)),
+                W.i8,
+            ),
+            W.load_f16_le(x + W.index(64)),
+            load_f32_le(y),
+            result,
         )
     return result
 
@@ -305,76 +279,19 @@ def tq1_0_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(54)
         y = activation + block * W.index(292)
-        integer_sum = W.i32(0)
-
-        power = W.u8(1)
-        for digit in W.range(0, 5):
-            member = W.block(32)
-            encoded = W.load(x + member, other=W.u8(0)) * power
-            ternary = (
-                W.cast(encoded, W.u16) * W.u16(3)
-            ) >> W.u16(8)
-            code = W.cast(ternary, W.i32) - W.i32(1)
-            activation_values = load_q8(
-                y + W.index(4) + digit * W.index(32), member
-            )
-            integer_sum = integer_sum + W.reduce(
-                code * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            power = power * W.u8(3)
-
-        power = W.u8(1)
-        for digit in W.range(0, 5):
-            member = W.block(16)
-            encoded = W.load(
-                x + W.index(32) + member, other=W.u8(0)
-            ) * power
-            ternary = (
-                W.cast(encoded, W.u16) * W.u16(3)
-            ) >> W.u16(8)
-            code = W.cast(ternary, W.i32) - W.i32(1)
-            activation_values = load_q8(
-                y + W.index(164) + digit * W.index(16), member
-            )
-            integer_sum = integer_sum + W.reduce(
-                code * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            power = power * W.u8(3)
-
-        power = W.u8(1)
-        for digit in W.range(0, 4):
-            member = W.block(4)
-            encoded = W.load(
-                x + W.index(48) + member, other=W.u8(0)
-            ) * power
-            ternary = (
-                W.cast(encoded, W.u16) * W.u16(3)
-            ) >> W.u16(8)
-            code = W.cast(ternary, W.i32) - W.i32(1)
-            activation_values = load_q8(
-                y + W.index(244) + digit * W.index(4), member
-            )
-            integer_sum = integer_sum + W.reduce(
-                code * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            power = power * W.u8(3)
-
-        result = result + (
-            W.load_f16_le(x + W.index(52))
-            * load_f32_le(y)
-            * W.cast(integer_sum, W.f32)
+        code = W.block(48)
+        high_digit = W.block(4)
+        activation_element = W.block(256)
+        result = W.base3_ternary_i8_dot(
+            W.load(x + code, other=W.u8(0)),
+            W.load(x + W.index(48) + high_digit, other=W.u8(0)),
+            W.bitcast(
+                W.load(y + W.index(4) + activation_element, other=W.u8(0)),
+                W.i8,
+            ),
+            W.load_f16_le(x + W.index(52)),
+            load_f32_le(y),
+            result,
         )
     return result
 

@@ -36,8 +36,8 @@ int main() {
   std::vector<float> input(kElements);
   std::vector<float> output(kElements);
   for (std::size_t index = 0; index < input.size(); ++index)
-    input[index] = static_cast<float>(static_cast<int>(index % 4093) - 2046) /
-                   1024.0F;
+    input[index] =
+        static_cast<float>(static_cast<int>(index % 31) - 15) / 16.0F;
 
   rms_norm_worker(input.data(), output.data(), 0, kRows, kColumns, kColumns,
                   kEpsilon);

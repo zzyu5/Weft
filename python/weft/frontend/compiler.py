@@ -2384,6 +2384,27 @@ class FrontendCompiler:
             result_types=(operands[-1].type,),
         )[0]
 
+    def _intrinsic_packed_i4_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.packed_i4_i8_dot",
+            (
+                "packed_codes",
+                "activation",
+                "zero_point",
+                "dot_scale",
+                "additive_bias",
+                "init",
+            ),
+            (("packed_codes", 16, u8), ("activation", 32, i8)),
+            (
+                ("zero_point", i32),
+                ("dot_scale", f32),
+                ("additive_bias", f32),
+                ("init", f32),
+            ),
+        )
+
     def _intrinsic_packed_i5_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(
             call,
@@ -2457,6 +2478,49 @@ class FrontendCompiler:
                 ("scales", 8, u8),
                 ("activation", 256, i8),
             ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
+        )
+
+    def _intrinsic_base3_ternary_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.base3_ternary_i8_dot",
+            (
+                "codes",
+                "high_digits",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+            (
+                ("codes", 48, u8),
+                ("high_digits", 4, u8),
+                ("activation", 256, i8),
+            ),
+            (
+                ("weight_scale", f32),
+                ("activation_scale", f32),
+                ("init", f32),
+            ),
+        )
+
+    def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
+        return self._extension_scalar_dot(
+            call,
+            "weft_ext.packed_i2_ternary_i8_dot",
+            (
+                "codes",
+                "activation",
+                "weight_scale",
+                "activation_scale",
+                "init",
+            ),
+            (("codes", 64, u8), ("activation", 256, i8)),
             (
                 ("weight_scale", f32),
                 ("activation_scale", f32),

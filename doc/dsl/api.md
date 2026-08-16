@@ -170,6 +170,26 @@ W.e2m1_e8m0_i8_dot(
     packed_codes, exponent, activation, activation_scale, init,
 )
 
+W.packed_i4_i8_dot(
+    packed_codes, activation,
+    zero_point, dot_scale, additive_bias, init,
+)
+
+W.packed_i5_i8_dot(
+    low_bits, high_bits, activation,
+    zero_point, dot_scale, additive_bias, init,
+)
+
+W.base3_ternary_i8_dot(
+    codes, high_digits, activation,
+    weight_scale, activation_scale, init,
+)
+
+W.packed_i2_ternary_i8_dot(
+    codes, activation,
+    weight_scale, activation_scale, init,
+)
+
 W.iq2_s_i8_dot(...)
 W.iq3_s_i8_dot(...)
 W.iq1_m_i8_dot(...)
