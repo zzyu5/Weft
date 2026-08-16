@@ -805,6 +805,29 @@ case "${kernel}" in
         ;;
     esac
     ;;
+  iq2_xxs_q8_K|iq2_xs_q8_K|iq3_xxs_q8_K|iq1_s_q8_K)
+    if [[ $# -ne 0 ]]; then
+      echo "usage: ${usage_prefix} ${kernel}" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/codebook_k.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/iq_lowbit_dot_runtime.cpp
+    case "${kernel}" in
+      iq2_xxs_q8_K)
+        runtime_compile_flags="-DWEFT_IQ_LOWBIT_DOT_KIND=0 -DWEFT_IQ_LOWBIT_DOT_ENTRY=iq2_xxs_q8_K"
+        ;;
+      iq2_xs_q8_K)
+        runtime_compile_flags="-DWEFT_IQ_LOWBIT_DOT_KIND=1 -DWEFT_IQ_LOWBIT_DOT_ENTRY=iq2_xs_q8_K"
+        ;;
+      iq3_xxs_q8_K)
+        runtime_compile_flags="-DWEFT_IQ_LOWBIT_DOT_KIND=2 -DWEFT_IQ_LOWBIT_DOT_ENTRY=iq3_xxs_q8_K"
+        ;;
+      iq1_s_q8_K)
+        runtime_compile_flags="-DWEFT_IQ_LOWBIT_DOT_KIND=3 -DWEFT_IQ_LOWBIT_DOT_ENTRY=iq1_s_q8_K"
+        ;;
+    esac
+    ;;
   q4_K_q8_K)
     if [[ $# -ne 3 ]]; then
       echo "usage: ${usage_prefix} q4_K_q8_K <attn_q|attn_k|attn_output|ffn_gate|ffn_up> <decode|prefill> <repetitions>" >&2
