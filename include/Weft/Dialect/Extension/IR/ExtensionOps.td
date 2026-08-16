@@ -259,6 +259,28 @@ def WeftExtension_SignedCodebookI8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_PackedU9U7CodebookI8DotOp
+    : WeftExtension_Op<"packed_u9_u7_codebook_i8_dot", [Pure]> {
+  let summary = "Packed u9/u7 codebook entry by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element signed codebook dot from four little-endian
+    sixteen-bit code words.  Each word uses its low nine bits as an index into
+    an eight-element grid table and its high seven bits as an index into a sign
+    mask table.  The low and high nibbles of scale_byte provide the odd integer
+    scales for the first and second sixteen-element halves.  The scaled integer
+    dot is multiplied by dot_scale and accumulated into init.
+
+    Packed block layout outside the eight local code bytes, outer traversal,
+    target gather shape, and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$packed_codes, AnyType:$scale_byte,
+                       AnyType:$activation, AnyType:$grid_table,
+                       AnyType:$sign_table, AnyType:$dot_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

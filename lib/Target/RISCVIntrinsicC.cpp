@@ -75,6 +75,10 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_signed_codebook4_i8_vl128";
   case IntrinsicCLeaf::SignedCodebook4I8VLEN256:
     return "__weft_signed_codebook4_i8_vl256";
+  case IntrinsicCLeaf::PackedU9U7CodebookI8VLEN128:
+    return "__weft_packed_u9_u7_codebook_i8_vl128";
+  case IntrinsicCLeaf::PackedU9U7CodebookI8VLEN256:
+    return "__weft_packed_u9_u7_codebook_i8_vl256";
   case IntrinsicCLeaf::IQ2SI8FixedLanes32:
     return "__weft_iq2_s_i8_lanes32";
   case IntrinsicCLeaf::IQ2SI8FixedLanes64:

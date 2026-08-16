@@ -236,5 +236,7 @@ intrinsic C生成不再读取VLEN二次分派。
 
 这些模式与IQ2/IQ3/IQ1/Q6 codebook dot共享vector shape、indexed gather、widening、reduction
 和resource machinery。IQ2_XXS与IQ3_XXS把各自packed layout和scale extraction留在DSL kernel，
-并通过同一个`W.signed_codebook_i8_dot`表达32-element signed-table lookup与integer dot。每个
-extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel route。
+并通过同一个`W.signed_codebook_i8_dot`表达32-element signed-table lookup与integer dot。
+IQ2_XS通过`W.packed_u9_u7_codebook_i8_dot`显式保留u9/u7 packed index和双nibble scale关系。
+每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel
+route。

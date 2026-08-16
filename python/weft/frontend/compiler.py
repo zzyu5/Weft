@@ -2565,6 +2565,38 @@ class FrontendCompiler:
             result_types=(operands[6].type,),
         )[0]
 
+    def _intrinsic_packed_u9_u7_codebook_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "packed_codes",
+            "scale_byte",
+            "activation",
+            "grid_table",
+            "sign_table",
+            "dot_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(
+            self._value_argument(args[name], call) for name in names
+        )
+        self._require_extension_block(
+            operands[0], "packed_codes", 8, u8, call
+        )
+        self._require_extension_scalar(operands[1], "scale_byte", u8, call)
+        self._require_extension_block(
+            operands[2], "activation", 32, i8, call
+        )
+        self._require_readable_u8_pointer(operands[3], "grid_table", call)
+        self._require_readable_u8_pointer(operands[4], "sign_table", call)
+        self._require_extension_scalar(operands[5], "dot_scale", f32, call)
+        self._require_extension_scalar(operands[6], "init", f32, call)
+        return self._emit(
+            "weft_ext.packed_u9_u7_codebook_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[6].type,),
+        )[0]
+
     def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(
             call,

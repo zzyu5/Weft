@@ -89,6 +89,10 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
       leaves.contains(IntrinsicCLeaf::SignedCodebook4I8VLEN128);
   bool signedCodebook4VLEN256 =
       leaves.contains(IntrinsicCLeaf::SignedCodebook4I8VLEN256);
+  bool packedU9U7CodebookVLEN128 =
+      leaves.contains(IntrinsicCLeaf::PackedU9U7CodebookI8VLEN128);
+  bool packedU9U7CodebookVLEN256 =
+      leaves.contains(IntrinsicCLeaf::PackedU9U7CodebookI8VLEN256);
   if (!iq2FixedLanes32 && !iq2FixedLanes64 && !iq2Scalable &&
       !iq3FixedLanes64 && !iq3Scalable && !iq1FixedLanes32 &&
       !iq1FixedLanes64 && !iq1Scalable && !q6FixedLanes32 &&
@@ -97,7 +101,8 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
       !base3VLEN128 && !base3VLEN256 &&
       !packedI2VLEN128 && !packedI2VLEN256 &&
       !signedCodebook8VLEN128 && !signedCodebook8VLEN256 &&
-      !signedCodebook4VLEN128 && !signedCodebook4VLEN256)
+      !signedCodebook4VLEN128 && !signedCodebook4VLEN256 &&
+      !packedU9U7CodebookVLEN128 && !packedU9U7CodebookVLEN256)
     return;
 
   if (iq2Scalable || iq3Scalable || iq1Scalable || q6Scalable) {
@@ -166,6 +171,8 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitSignedCodebookIntrinsicCLeaves(
       output, signedCodebook8VLEN128, signedCodebook8VLEN256,
       signedCodebook4VLEN128, signedCodebook4VLEN256);
+  emitPackedU9U7CodebookIntrinsicCLeaves(
+      output, packedU9U7CodebookVLEN128, packedU9U7CodebookVLEN256);
 }
 
 } // namespace weft::riscv_internal

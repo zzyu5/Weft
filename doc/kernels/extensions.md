@@ -175,6 +175,12 @@ table、`block<32,i8>` activation、`dot_scale`与`init`都是显式operand。Pa
 local-scale extraction和outer traversal仍由DSL kernel拥有；target只选择当前局部gather、
 sign、widening dot与reduction的VLEN128/VLEN256 realization。
 
+`W.packed_u9_u7_codebook_i8_dot`接收八个local packed bytes，并把它们解释为四个little-endian
+u16 code word：low 9 bits选择8-element grid entry，high 7 bits选择sign mask。显式
+`scale_byte`的low/high nibble形成两个odd integer scale，分别作用于前后16个activation元素。
+它只拥有这一个32-element lookup、sign与scaled integer dot；74-byte packed block、八组
+traversal和block scale仍由DSL kernel拥有。
+
 `W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
 code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
 operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer

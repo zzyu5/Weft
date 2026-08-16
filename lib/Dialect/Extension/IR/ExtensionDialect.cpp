@@ -319,6 +319,30 @@ mlir::LogicalResult SignedCodebookI8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult PackedU9U7CodebookI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getPackedCodes(), 8, false,
+                                  "packed_codes")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 32, true,
+                                  "activation")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getScaleByte(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 8,
+                                     mlir::IntegerType::Unsigned),
+                                 "scale_byte")))
+    return emitOpError("scale_byte must be scalar u8");
+  if (mlir::failed(requireReadableU8Pointer(*this, getGridTable(),
+                                           "grid_table")) ||
+      mlir::failed(requireReadableU8Pointer(*this, getSignTable(),
+                                           "sign_table")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getDotScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "dot_scale")))
+    return emitOpError("dot_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {

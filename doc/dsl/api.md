@@ -195,6 +195,11 @@ W.signed_codebook_i8_dot(
     grid_table, sign_table, dot_scale, init,
 )
 
+W.packed_u9_u7_codebook_i8_dot(
+    packed_codes, scale_byte, activation,
+    grid_table, sign_table, dot_scale, init,
+)
+
 W.iq2_s_i8_dot(...)
 W.iq3_s_i8_dot(...)
 W.iq1_m_i8_dot(...)

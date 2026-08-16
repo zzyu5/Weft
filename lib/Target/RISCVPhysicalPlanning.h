@@ -159,6 +159,26 @@ std::optional<SelectedSignedCodebookI8Physical>
 selectSignedCodebookI8Physical(const SignedCodebookI8CandidateFacts &facts,
                                const RISCVTargetProfile &target);
 
+enum class PackedU9U7CodebookI8Realization {
+  RVVVLEN128GatherDot,
+  RVVVLEN256GatherDot,
+};
+
+struct SelectedPackedU9U7CodebookI8Physical {
+  PackedU9U7CodebookI8Realization realization =
+      PackedU9U7CodebookI8Realization::RVVVLEN128GatherDot;
+  RVVVectorShape packedShape;
+  RVVVectorShape indexShape;
+  RVVVectorShape tableShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedPackedU9U7CodebookI8Physical>
+selectPackedU9U7CodebookI8Physical(const RISCVTargetProfile &target);
+
 enum class QuantI8DotSemantic {
   PackedI4,
   PackedI5,
