@@ -187,9 +187,10 @@ acc = W.symmetric_i4_i8_dot(
 )
 ```
 
-该 primitive定义 little-endian scale、`code - 8` 与16个local dot。当前K1 target把一次primitive lower成
-单个N16×K32 IME1 asm leaf；作者的128次K loop、memory-resident accumulator state、column
-loop、288-byte block address和最终store仍出现在生成C中。Leaf不遍历完整K、不量化activation、
+该 primitive定义 little-endian scale、`code - 8` 与每行16个local dot，persistent storage
+identity为 `q4_0_n16_k32_288b`。Target由typed activation/init shape和target facts选择
+N16×K32或M4N16×K32的RVV/IME1 realization；作者的K loop、accumulator state、column loop、
+288-byte block address和最终store仍出现在生成C中。Leaf不遍历完整K、不量化activation、
 不选择persistent format，也不拥有 C ABI。
 
 ## Grouped block dot

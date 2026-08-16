@@ -66,6 +66,46 @@ mlir::LogicalResult requirePersistentU8Pointer(
   return mlir::success();
 }
 
+mlir::LogicalResult verifyI4I8FragmentOperands(
+    mlir::Operation *op, mlir::Value activation, mlir::Value packedBase,
+    mlir::Value activationScale, mlir::Value init, mlir::Value result,
+    llvm::StringRef storageFormat) {
+  auto activationBlock = localBlock(op, activation, "activation");
+  auto scaleBlock = localBlock(op, activationScale, "activation_scale");
+  auto initBlock = localBlock(op, init, "init");
+  auto resultBlock = localBlock(op, result, "result");
+  bool rowOne =
+      activationBlock &&
+      activationBlock.getShape() == llvm::ArrayRef<int64_t>({32}) &&
+      activationBlock.getElementType().isSignedInteger(8) && initBlock &&
+      resultBlock && initBlock.getShape() == llvm::ArrayRef<int64_t>({16}) &&
+      initBlock.getElementType().isF32() && init.getType() == result.getType() &&
+      mlir::succeeded(requireScalar(
+          op, activationScale, mlir::Float32Type::get(op->getContext()),
+          "activation_scale"));
+  bool rowFour =
+      activationBlock &&
+      activationBlock.getShape() == llvm::ArrayRef<int64_t>({128}) &&
+      activationBlock.getElementType().isSignedInteger(8) && scaleBlock &&
+      scaleBlock.getShape() == llvm::ArrayRef<int64_t>({4}) &&
+      scaleBlock.getElementType().isF32() && initBlock && resultBlock &&
+      initBlock.getShape() == llvm::ArrayRef<int64_t>({4, 16}) &&
+      initBlock.getElementType().isF32() && init.getType() == result.getType() &&
+      scaleBlock.getAxisIds() ==
+          llvm::ArrayRef<int64_t>({initBlock.getAxisIds()[0]});
+  if (!rowOne && !rowFour)
+    return op->emitError(
+        "requires either signed i8 block<32>, scalar f32 scale, f32 "
+        "block<16> init or interleaved signed i8 block<128>, matching f32 "
+        "block<4> scales, f32 block<4,16> init");
+  if (mlir::failed(requirePersistentU8Pointer(
+          op, packedBase, "packed_base", storageFormat)))
+    return mlir::failure();
+  if (!op->getParentOfType<weft::kernel::KernelOp>())
+    return op->emitError("must be nested in a canonical Weft kernel");
+  return mlir::success();
+}
+
 mlir::LogicalResult verifyScalarDotResult(mlir::Operation *op,
                                           mlir::Value init,
                                           mlir::Value result) {
@@ -94,50 +134,15 @@ mlir::LogicalResult LoadF16LEOp::verify() {
 }
 
 mlir::LogicalResult AffineI4I8DotOp::verify() {
-  auto activation = localBlock(*this, getActivation(), "activation");
-  auto init = localBlock(*this, getInit(), "init");
-  auto result = localBlock(*this, getResult(), "result");
-  if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
-      !activation.getElementType().isSignedInteger(8))
-    return emitOpError("activation must be a signed i8 block<32>");
-  if (mlir::failed(requirePersistentU8Pointer(
-          *this, getPackedBase(), "packed_base",
-          "affine_i4_n16_k32_304b")))
-    return mlir::failure();
-  if (mlir::failed(requireScalar(*this, getActivationScale(),
-                                 mlir::Float32Type::get(getContext()),
-                                 "activation_scale")))
-    return emitOpError("activation_scale must be scalar f32");
-  if (!init || !result || init.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      !init.getElementType().isF32() ||
-      getInit().getType() != getResult().getType())
-    return emitOpError("init and result must be the same f32 block<16>");
-  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
-    return emitOpError("must be nested in a canonical Weft kernel");
-  return mlir::success();
+  return verifyI4I8FragmentOperands(
+      *this, getActivation(), getPackedBase(), getActivationScale(), getInit(),
+      getResult(), "affine_i4_n16_k32_304b");
 }
 
 mlir::LogicalResult SymmetricI4I8DotOp::verify() {
-  auto activation = localBlock(*this, getActivation(), "activation");
-  auto init = localBlock(*this, getInit(), "init");
-  auto result = localBlock(*this, getResult(), "result");
-  if (!activation || activation.getShape() != llvm::ArrayRef<int64_t>({32}) ||
-      !activation.getElementType().isSignedInteger(8))
-    return emitOpError("activation must be a signed i8 block<32>");
-  if (mlir::failed(requirePersistentU8Pointer(
-          *this, getPackedBase(), "packed_base", "q4_0_n16_k32_288b")))
-    return mlir::failure();
-  if (mlir::failed(requireScalar(*this, getActivationScale(),
-                                 mlir::Float32Type::get(getContext()),
-                                 "activation_scale")))
-    return emitOpError("activation_scale must be scalar f32");
-  if (!init || !result || init.getShape() != llvm::ArrayRef<int64_t>({16}) ||
-      !init.getElementType().isF32() ||
-      getInit().getType() != getResult().getType())
-    return emitOpError("init and result must be the same f32 block<16>");
-  if (!getOperation()->getParentOfType<weft::kernel::KernelOp>())
-    return emitOpError("must be nested in a canonical Weft kernel");
-  return mlir::success();
+  return verifyI4I8FragmentOperands(
+      *this, getActivation(), getPackedBase(), getActivationScale(), getInit(),
+      getResult(), "q4_0_n16_k32_288b");
 }
 
 mlir::LogicalResult GroupedAffineI4I8DotOp::verify() {

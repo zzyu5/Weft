@@ -55,11 +55,14 @@ struct PhysicalResourceBudget {
 
 enum class I4I8FragmentRealization {
   RVVN16K32,
+  RVVM4N16K32,
   SpacemiTIME1N16K32,
+  SpacemiTIME1M4N16K32,
 };
 
 std::optional<I4I8FragmentRealization>
-selectI4I8FragmentRealization(const RISCVTargetProfile &target);
+selectI4I8FragmentRealization(const RISCVTargetProfile &target,
+                              unsigned rowTile);
 
 enum class VLAStatePlacement {
   ScalarCarry,

@@ -85,8 +85,13 @@ integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
 }
 
 std::optional<I4I8FragmentRealization>
-selectI4I8FragmentRealization(const RISCVTargetProfile &target) {
-  if (target.supportsSpacemitIME1I4I8N16K32())
+selectI4I8FragmentRealization(const RISCVTargetProfile &target,
+                              unsigned rowTile) {
+  if (rowTile != 1 && rowTile != 4)
+    return std::nullopt;
+  if (rowTile == 4 && target.supportsSpacemitIME1I4I8M4N16K32())
+    return I4I8FragmentRealization::SpacemiTIME1M4N16K32;
+  if (rowTile == 1 && target.supportsSpacemitIME1I4I8N16K32())
     return I4I8FragmentRealization::SpacemiTIME1N16K32;
   bool supportsRVV = target.hasF && target.hasVectorF16 &&
                      target.hasWideningInteger && target.hasWideningFloat &&
@@ -94,10 +99,10 @@ selectI4I8FragmentRealization(const RISCVTargetProfile &target) {
                      target.supportsVectorShape(8, 8) &&
                      target.supportsVectorShape(16, 16) &&
                      target.supportsVectorShape(32, 32);
-  return supportsRVV
-             ? std::optional<I4I8FragmentRealization>(
-                   I4I8FragmentRealization::RVVN16K32)
-             : std::nullopt;
+  if (!supportsRVV)
+    return std::nullopt;
+  return rowTile == 4 ? I4I8FragmentRealization::RVVM4N16K32
+                      : I4I8FragmentRealization::RVVN16K32;
 }
 
 std::optional<VLAStatePlacement>

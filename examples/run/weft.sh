@@ -800,13 +800,13 @@ case "${kernel}" in
     runtime=examples/repro/weft/attention/causal_mask_runtime.cpp
     ;;
   q4_k_projection_ime)
-    if [[ $# -ne 1 ]]; then
-      echo "usage: ${usage_prefix} q4_k_projection_ime <repetitions>" >&2
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} q4_k_projection_ime <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/ime/q4_k_projection.py
     runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
-    runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
+    runtime_arguments=("$1" "$2" "${runtime_hardware}" "${projection_scope}")
     ;;
   q4_1_projection_ime)
     if [[ $# -ne 2 ]]; then
@@ -835,13 +835,13 @@ case "${kernel}" in
     runtime=examples/repro/weft/embedding/timestep_embedding_runtime.cpp
     ;;
   q4_0_projection_ime)
-    if [[ $# -ne 1 ]]; then
-      echo "usage: ${usage_prefix} q4_0_projection_ime <repetitions>" >&2
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} q4_0_projection_ime <decode|prefill> <repetitions>" >&2
       exit 2
     fi
     dsl=examples/kernels/ime/q4_0_projection.py
     runtime=examples/repro/weft/ime/q4_0_projection_runtime.cpp
-    runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
+    runtime_arguments=("$1" "$2" "${runtime_hardware}" "${projection_scope}")
     ;;
   q4_0_q8_0 | q4_1_q8_1 | q5_0_q8_0 | q5_1_q8_1 | q8_0_q8_0)
     if [[ $# -ne 0 ]]; then

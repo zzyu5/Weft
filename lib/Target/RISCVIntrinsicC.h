@@ -22,8 +22,12 @@ enum class IntrinsicCLeaf {
   RVVF32M2Math,
   RVVSymmetricI4I8N16K32,
   RVVAffineI4I8N16K32,
+  RVVSymmetricI4I8M4N16K32,
+  RVVAffineI4I8M4N16K32,
   IME1SymmetricI4I8N16K32,
   IME1AffineI4I8N16K32,
+  IME1SymmetricI4I8M4N16K32,
+  IME1AffineI4I8M4N16K32,
   GroupedAffineI4I8VLEN128,
   GroupedAffineI4I8VLEN256,
   GroupedAffineI4I8Scalable,
@@ -62,6 +66,8 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf);
 void emitRVVIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesRVVSymmetricI4I8,
                              bool usesRVVAffineI4I8,
+                             bool usesRVVSymmetricI4I8M4,
+                             bool usesRVVAffineI4I8M4,
                              bool usesGroupedI4I8VLEN128,
                              bool usesGroupedI4I8VLEN256,
                              bool usesGroupedI4I8Scalable,
@@ -71,7 +77,9 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
                                const SelectedIntrinsicCLeaves &leaves);
 void emitIMEIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesIME1SymmetricI4I8,
-                             bool usesIME1AffineI4I8);
+                             bool usesIME1AffineI4I8,
+                             bool usesIME1SymmetricI4I8M4,
+                             bool usesIME1AffineI4I8M4);
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedIntrinsicCLeaves &leaves);
 

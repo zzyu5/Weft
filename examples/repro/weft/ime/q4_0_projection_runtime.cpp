@@ -10,7 +10,6 @@
 
 namespace {
 
-constexpr std::size_t kRows = 1;
 constexpr std::size_t kColumns = 4096;
 constexpr std::size_t kInner = 4096;
 constexpr std::size_t kBlockExtent = 32;
@@ -23,6 +22,14 @@ struct CanonicalQ40Block {
 };
 
 static_assert(sizeof(CanonicalQ40Block) == 18);
+
+std::size_t phase_rows(const char *phase) {
+  if (std::strcmp(phase, "decode") == 0)
+    return 1;
+  if (std::strcmp(phase, "prefill") == 0)
+    return 128;
+  return 0;
+}
 
 std::uint16_t f16_bits(float value) {
   std::uint32_t bits;
@@ -110,52 +117,76 @@ std::vector<std::uint8_t> repack_q4_0_16x32(
 
 void reference_quantize(const std::vector<float> &activation,
                         std::vector<float> &scale,
-                        std::vector<std::int8_t> &code) {
-  for (std::size_t block = 0; block < kInner / kBlockExtent; ++block) {
-    float maximum = 0.0F;
-    for (std::size_t k = 0; k < kBlockExtent; ++k)
-      maximum = std::max(
-          maximum, std::fabs(activation[block * kBlockExtent + k]));
-    scale[block] = maximum / 127.0F;
-    const float inverse = 1.0F / scale[block];
-    for (std::size_t k = 0; k < kBlockExtent; ++k) {
-      const float rounded =
-          std::nearbyint(activation[block * kBlockExtent + k] * inverse);
-      code[block * kBlockExtent + k] = static_cast<std::int8_t>(
-          std::max(-128.0F, std::min(127.0F, rounded)));
+                        std::vector<std::int8_t> &code,
+                        std::size_t rows) {
+  constexpr std::size_t blocks = kInner / kBlockExtent;
+  const std::size_t full_rows = (rows / 4) * 4;
+  for (std::size_t row = 0; row < rows; ++row) {
+    for (std::size_t block = 0; block < blocks; ++block) {
+      const std::size_t base = row * kInner + block * kBlockExtent;
+      float maximum = 0.0F;
+      for (std::size_t lane = 0; lane < kBlockExtent; ++lane)
+        maximum = std::max(maximum, std::fabs(activation[base + lane]));
+      const std::size_t row_group = row - row % 4;
+      const std::size_t scale_index =
+          row < full_rows ? row_group * blocks + block * 4 + row % 4
+                          : row * blocks + block;
+      scale[scale_index] = maximum / 127.0F;
+      const float inverse = 1.0F / scale[scale_index];
+      for (std::size_t lane = 0; lane < kBlockExtent; ++lane) {
+        const float rounded = std::nearbyint(activation[base + lane] * inverse);
+        const std::size_t code_index =
+            row < full_rows
+                ? row_group * kInner + block * 128 + (lane / 8) * 32 +
+                      (row % 4) * 8 + lane % 8
+                : base + lane;
+        code[code_index] = static_cast<std::int8_t>(
+            std::max(-128.0F, std::min(127.0F, rounded)));
+      }
     }
   }
 }
 
-void reference_projection(const std::vector<std::uint8_t> &packed,
-                          const std::vector<float> &scale,
-                          const std::vector<std::int8_t> &code,
-                          std::vector<float> &output) {
+float reference_value(const std::vector<std::uint8_t> &packed,
+                      const std::vector<float> &scale,
+                      const std::vector<std::int8_t> &code,
+                      std::size_t row, std::size_t column) {
   constexpr std::size_t blocks = kInner / kBlockExtent;
-  for (std::size_t column = 0; column < kColumns; ++column) {
-    const std::size_t group = column / kColumnTile;
-    const std::size_t lane = column % kColumnTile;
-    float accumulator = 0.0F;
-    for (std::size_t block = 0; block < blocks; ++block) {
-      const std::uint8_t *weight =
-          packed.data() + (group * blocks + block) * kPackedBlockBytes;
-      const float weightScale = f16_value(weight + lane * 2);
-      std::int32_t dot = 0;
-      for (std::size_t byte = 0; byte < 16; ++byte) {
-        const std::size_t half = byte / 8;
-        const std::size_t within = byte % 8;
-        const std::uint8_t packedValue =
-            weight[32 + half * 128 + lane * 8 + within];
-        const std::size_t lowIndex = half * 16 + within;
-        dot += (static_cast<std::int32_t>(packedValue & 15) - 8) *
-               code[block * kBlockExtent + lowIndex];
-        dot += (static_cast<std::int32_t>(packedValue >> 4) - 8) *
-               code[block * kBlockExtent + lowIndex + 8];
-      }
-      accumulator += static_cast<float>(dot) * scale[block] * weightScale;
+  const std::size_t group = column / kColumnTile;
+  const std::size_t column_lane = column % kColumnTile;
+  const std::size_t full_rows = (scale.size() / blocks / 4) * 4;
+  const std::size_t row_group = row - row % 4;
+  float accumulator = 0.0F;
+  for (std::size_t block = 0; block < blocks; ++block) {
+    const std::uint8_t *weight =
+        packed.data() + (group * blocks + block) * kPackedBlockBytes;
+    const float weight_scale = f16_value(weight + column_lane * 2);
+    std::int32_t dot = 0;
+    for (std::size_t byte = 0; byte < 16; ++byte) {
+      const std::size_t half = byte / 8;
+      const std::size_t within = byte % 8;
+      const std::uint8_t packed_value =
+          weight[32 + half * 128 + column_lane * 8 + within];
+      const std::size_t low_index = half * 16 + within;
+      const auto activation_code = [&](std::size_t local) {
+        const std::size_t index =
+            row < full_rows
+                ? row_group * kInner + block * 128 + (local / 8) * 32 +
+                      (row % 4) * 8 + local % 8
+                : row * kInner + block * kBlockExtent + local;
+        return code[index];
+      };
+      dot += (static_cast<std::int32_t>(packed_value & 15U) - 8) *
+             activation_code(low_index);
+      dot += (static_cast<std::int32_t>(packed_value >> 4) - 8) *
+             activation_code(low_index + 8);
     }
-    output[column] = accumulator;
+    const std::size_t scale_index =
+        row < full_rows ? row_group * blocks + block * 4 + row % 4
+                        : row * blocks + block;
+    accumulator += dot * scale[scale_index] * weight_scale;
   }
+  return accumulator;
 }
 
 void evict(std::vector<std::uint8_t> &buffer) {
@@ -167,49 +198,57 @@ void evict(std::vector<std::uint8_t> &buffer) {
 }
 
 struct RuntimeArguments {
+  const char *phase;
+  std::size_t rows;
   std::size_t repetitions;
   const char *hardware;
   const char *scope;
 };
 
 RuntimeArguments runtime_arguments_from(int argc, char **argv) {
-  if (argc != 4) {
-    std::fprintf(stderr, "usage: %s <repetitions> <hardware> <scope>\n", argv[0]);
+  if (argc != 5) {
+    std::fprintf(stderr,
+                 "usage: %s <decode|prefill> <repetitions> <hardware> <scope>\n",
+                 argv[0]);
     std::exit(2);
   }
+  const std::size_t rows = phase_rows(argv[1]);
   char *end = nullptr;
-  const long value = std::strtol(argv[1], &end, 10);
-  if (*argv[1] == '\0' || *end != '\0' || value <= 0)
+  const unsigned long repetitions = std::strtoul(argv[2], &end, 10);
+  if (rows == 0 || *argv[2] == '\0' || *end != '\0' || repetitions == 0)
     std::exit(2);
-  return {static_cast<std::size_t>(value), argv[2], argv[3]};
+  return {argv[1], rows, static_cast<std::size_t>(repetitions), argv[3],
+          argv[4]};
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
   const RuntimeArguments runtime = runtime_arguments_from(argc, argv);
-  std::vector<float> activation(kInner);
-  for (std::size_t k = 0; k < kInner; ++k) {
-    const int value = static_cast<int>((k * 37 + (k / 17) * 11) % 257) - 128;
-    activation[k] = static_cast<float>(value) / 96.0F +
-                    static_cast<float>(static_cast<int>(k % 7) - 3) * 0.0005F;
+  constexpr std::size_t blocks = kInner / kBlockExtent;
+  std::vector<float> activation(runtime.rows * kInner);
+  for (std::size_t index = 0; index < activation.size(); ++index) {
+    const int value =
+        static_cast<int>((index * 37 + (index / 17) * 11) % 257) - 128;
+    activation[index] =
+        static_cast<float>(value) / 96.0F +
+        static_cast<float>(static_cast<int>(index % 7) - 3) * 0.0005F;
   }
 
   const std::vector<CanonicalQ40Block> canonical = make_canonical_weights();
   const std::vector<std::uint8_t> packed = repack_q4_0_16x32(canonical);
   std::vector<float> scale(
-      q4_0_projection_ime__activation_scale_elements(1, kInner));
+      q4_0_projection_ime__activation_scale_elements(runtime.rows, kInner));
   std::vector<std::int8_t> code(
-      q4_0_projection_ime__activation_code_elements(1, kInner));
-  std::vector<float> output(kColumns);
-  std::vector<float> referenceScale(kInner / kBlockExtent);
-  std::vector<std::int8_t> referenceCode(kInner);
-  std::vector<float> reference(kColumns);
+      q4_0_projection_ime__activation_code_elements(runtime.rows, kInner));
+  std::vector<float> output(runtime.rows * kColumns);
+  std::vector<float> referenceScale(runtime.rows * blocks);
+  std::vector<std::int8_t> referenceCode(runtime.rows * kInner);
 
-  reference_quantize(activation, referenceScale, referenceCode);
-  reference_projection(packed, referenceScale, referenceCode, reference);
+  reference_quantize(activation, referenceScale, referenceCode, runtime.rows);
   q4_0_projection_ime(activation.data(), packed.data(), output.data(),
-                      scale.data(), code.data(), 0, kRows, kColumns, kInner);
+                      scale.data(), code.data(), 0, runtime.rows, kColumns,
+                      kInner);
 
   std::size_t codeMismatches = 0;
   float scaleError = 0.0F;
@@ -219,18 +258,25 @@ int main(int argc, char **argv) {
   for (std::size_t k = 0; k < code.size(); ++k)
     codeMismatches += code[k] != referenceCode[k];
 
+  const std::size_t sampleRows[] = {0, runtime.rows / 2, runtime.rows - 1};
+  const std::size_t sampleColumns[] = {0, 1, kColumns / 2, kColumns - 1};
   float maxAbsoluteError = 0.0F;
   float maxRelativeError = 0.0F;
-  for (std::size_t column = 0; column < kColumns; ++column) {
-    const float absolute = std::fabs(output[column] - reference[column]);
-    const float relative =
-        absolute / std::max(1.0F, std::fabs(reference[column]));
-    maxAbsoluteError = std::max(maxAbsoluteError, absolute);
-    maxRelativeError = std::max(maxRelativeError, relative);
+  for (std::size_t row : sampleRows) {
+    for (std::size_t column : sampleColumns) {
+      const float expected =
+          reference_value(packed, referenceScale, referenceCode, row, column);
+      const float actual = output[row * kColumns + column];
+      const float absolute = std::fabs(actual - expected);
+      const float relative = absolute / std::max(1.0F, std::fabs(expected));
+      maxAbsoluteError = std::max(maxAbsoluteError, absolute);
+      maxRelativeError = std::max(maxRelativeError, relative);
+    }
   }
   for (std::size_t warmup = 0; warmup < 3; ++warmup)
     q4_0_projection_ime(activation.data(), packed.data(), output.data(),
-                        scale.data(), code.data(), 0, kRows, kColumns, kInner);
+                        scale.data(), code.data(), 0, runtime.rows, kColumns,
+                        kInner);
 
   std::vector<std::uint8_t> eviction(64U * 1024U * 1024U, 1);
   std::vector<double> milliseconds;
@@ -240,18 +286,20 @@ int main(int argc, char **argv) {
     evict(eviction);
     const auto start = std::chrono::steady_clock::now();
     q4_0_projection_ime(activation.data(), packed.data(), output.data(),
-                        scale.data(), code.data(), 0, kRows, kColumns, kInner);
+                        scale.data(), code.data(), 0, runtime.rows, kColumns,
+                        kInner);
     const auto end = std::chrono::steady_clock::now();
     milliseconds.push_back(
         std::chrono::duration<double, std::milli>(end - start).count());
   }
   std::sort(milliseconds.begin(), milliseconds.end());
   const double medianMs = milliseconds[milliseconds.size() / 2];
-  const double operations = 2.0 * kRows * kColumns * kInner;
+  const double operations = 2.0 * runtime.rows * kColumns * kInner;
 
   std::printf("kernel=q4_0_projection_ime\n");
+  std::printf("phase=%s\n", runtime.phase);
   std::printf("hardware=%s\n", runtime.hardware);
-  std::printf("M=%zu,N=%zu,K=%zu\n", kRows, kColumns, kInner);
+  std::printf("M=%zu,N=%zu,K=%zu\n", runtime.rows, kColumns, kInner);
   std::printf("persistent_weight=q4_0_n16_k32_288b\n");
   std::printf("scope=%s\n", runtime.scope);
   std::printf("cold_protocol=64MiB-evict-then-single-kernel\n");

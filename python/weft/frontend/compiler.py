@@ -2196,14 +2196,42 @@ class FrontendCompiler:
                 self._location(call),
             )
         operands = tuple(self._value_argument(args[name], call) for name in required)
-        self._require_extension_block(operands[0], "activation", 32, i8, call)
         self._require_persistent_u8_pointer(
             operands[1], "packed_base", "affine_i4_n16_k32_304b", call
         )
-        self._require_extension_scalar(
-            operands[2], "activation_scale", f32, call
-        )
-        self._require_extension_block(operands[3], "init", 16, f32, call)
+        activation_type = bare_type(operands[0].type)
+        scale_type = bare_type(operands[2].type)
+        init_type = bare_type(operands[3].type)
+        if (
+            not is_masked(operands[0].type)
+            and isinstance(activation_type, BlockType)
+            and activation_type.shape == (32,)
+            and activation_type.element_type == ScalarType(i8)
+        ):
+            self._require_extension_scalar(
+                operands[2], "activation_scale", f32, call
+            )
+            self._require_extension_block(operands[3], "init", 16, f32, call)
+        elif not any(is_masked(value.type) for value in (operands[0], operands[2], operands[3])) and (
+            isinstance(activation_type, BlockType)
+            and activation_type.shape == (128,)
+            and activation_type.element_type == ScalarType(i8)
+            and isinstance(scale_type, BlockType)
+            and scale_type.shape == (4,)
+            and scale_type.element_type == ScalarType(f32)
+            and isinstance(init_type, BlockType)
+            and init_type.shape == (4, 16)
+            and init_type.element_type == ScalarType(f32)
+            and scale_type.axes == (init_type.axes[0],)
+        ):
+            pass
+        else:
+            raise FrontendError(
+                "affine_i4_i8_dot requires either block<32> i8, scalar f32, "
+                "block<16> f32 or interleaved block<128> i8, matching "
+                "block<4> f32 scales, block<4,16> f32 init",
+                self._location(call),
+            )
         return self._emit(
             "weft_ext.affine_i4_i8_dot",
             call,
@@ -2233,14 +2261,42 @@ class FrontendCompiler:
                 self._location(call),
             )
         operands = tuple(self._value_argument(args[name], call) for name in required)
-        self._require_extension_block(operands[0], "activation", 32, i8, call)
         self._require_persistent_u8_pointer(
             operands[1], "packed_base", "q4_0_n16_k32_288b", call
         )
-        self._require_extension_scalar(
-            operands[2], "activation_scale", f32, call
-        )
-        self._require_extension_block(operands[3], "init", 16, f32, call)
+        activation_type = bare_type(operands[0].type)
+        scale_type = bare_type(operands[2].type)
+        init_type = bare_type(operands[3].type)
+        if (
+            not is_masked(operands[0].type)
+            and isinstance(activation_type, BlockType)
+            and activation_type.shape == (32,)
+            and activation_type.element_type == ScalarType(i8)
+        ):
+            self._require_extension_scalar(
+                operands[2], "activation_scale", f32, call
+            )
+            self._require_extension_block(operands[3], "init", 16, f32, call)
+        elif not any(is_masked(value.type) for value in (operands[0], operands[2], operands[3])) and (
+            isinstance(activation_type, BlockType)
+            and activation_type.shape == (128,)
+            and activation_type.element_type == ScalarType(i8)
+            and isinstance(scale_type, BlockType)
+            and scale_type.shape == (4,)
+            and scale_type.element_type == ScalarType(f32)
+            and isinstance(init_type, BlockType)
+            and init_type.shape == (4, 16)
+            and init_type.element_type == ScalarType(f32)
+            and scale_type.axes == (init_type.axes[0],)
+        ):
+            pass
+        else:
+            raise FrontendError(
+                "symmetric_i4_i8_dot requires either block<32> i8, scalar f32, "
+                "block<16> f32 or interleaved block<128> i8, matching "
+                "block<4> f32 scales, block<4,16> f32 init",
+                self._location(call),
+            )
         return self._emit(
             "weft_ext.symmetric_i4_i8_dot",
             call,

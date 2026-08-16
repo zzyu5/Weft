@@ -41,7 +41,7 @@ packed_weight: W.ptr[
     W.u8,
     W.readonly,
     W.noalias,
-    W.persistent("q4_k_n16_k32_304b"),
+    W.persistent("affine_i4_n16_k32_304b"),
 ]
 
 W.storage(packed_weight, (column_blocks, k_blocks, 304))

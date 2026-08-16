@@ -108,17 +108,27 @@ void reference_quantize(const std::vector<float> &activation,
                         std::vector<std::int8_t> &code,
                         std::size_t rows) {
   constexpr std::size_t blocks = kInner / kBlockExtent;
+  const std::size_t full_rows = (rows / 4) * 4;
   for (std::size_t row = 0; row < rows; ++row) {
     for (std::size_t block = 0; block < blocks; ++block) {
       const std::size_t base = row * kInner + block * kBlockExtent;
       float maximum = 0.0F;
       for (std::size_t lane = 0; lane < kBlockExtent; ++lane)
         maximum = std::max(maximum, std::fabs(activation[base + lane]));
-      scale[row * blocks + block] = maximum / 127.0F;
-      const float inverse = 1.0F / scale[row * blocks + block];
+      const std::size_t row_group = row - row % 4;
+      const std::size_t scale_index =
+          row < full_rows ? row_group * blocks + block * 4 + row % 4
+                          : row * blocks + block;
+      scale[scale_index] = maximum / 127.0F;
+      const float inverse = 1.0F / scale[scale_index];
       for (std::size_t lane = 0; lane < kBlockExtent; ++lane) {
         const float rounded = std::nearbyint(activation[base + lane] * inverse);
-        code[base + lane] = static_cast<std::int8_t>(
+        const std::size_t code_index =
+            row < full_rows
+                ? row_group * kInner + block * 128 + (lane / 8) * 32 +
+                      (row % 4) * 8 + lane % 8
+                : base + lane;
+        code[code_index] = static_cast<std::int8_t>(
             std::max(-128.0F, std::min(127.0F, rounded)));
       }
     }
@@ -132,6 +142,8 @@ float reference_value(const std::vector<std::uint8_t> &packed,
   constexpr std::size_t blocks = kInner / kBlockExtent;
   const std::size_t column_group = column / kColumnTile;
   const std::size_t lane = column % kColumnTile;
+  const std::size_t full_rows = (scale.size() / blocks / 4) * 4;
+  const std::size_t row_group = row - row % 4;
   float accumulator = 0.0F;
   for (std::size_t block = 0; block < blocks; ++block) {
     const std::uint8_t *weight =
@@ -146,14 +158,23 @@ float reference_value(const std::vector<std::uint8_t> &packed,
       const std::uint8_t packed_value =
           weight[48 + half * 128 + lane * 8 + within];
       const std::size_t low_index = half * 16 + within;
-      const std::size_t activation_base =
-          row * kInner + block * kBlockExtent;
+      const auto activation_code = [&](std::size_t local) {
+        const std::size_t index =
+            row < full_rows
+                ? row_group * kInner + block * 128 + (local / 8) * 32 +
+                      (row % 4) * 8 + local % 8
+                : row * kInner + block * kBlockExtent + local;
+        return code[index];
+      };
       dot += (static_cast<std::int32_t>(packed_value & 15U) - zero_point) *
-             code[activation_base + low_index];
+             activation_code(low_index);
       dot += (static_cast<std::int32_t>(packed_value >> 4) - zero_point) *
-             code[activation_base + low_index + 8];
+             activation_code(low_index + 8);
     }
-    accumulator += dot * scale[row * blocks + block] * weight_scale;
+    const std::size_t scale_index =
+        row < full_rows ? row_group * blocks + block * 4 + row % 4
+                        : row * blocks + block;
+    accumulator += dot * scale[scale_index] * weight_scale;
   }
   return accumulator;
 }

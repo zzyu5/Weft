@@ -7,17 +7,19 @@ DSL 通过 `W.*` 暴露，Kernel IR operation属于 `weft_ext` sibling dialect�
 
 ```python
 result = W.affine_i4_i8_dot(
-    activation,             # block<32, i8>
+    activation,             # block<32, i8> 或 interleaved block<128, i8>
     packed_base,            # scalar ptr<u8>
-    activation_scale=...,   # scalar f32
-    init=...,               # block<16, f32>
+    activation_scale=...,   # scalar f32 或 block<4, f32>
+    init=...,               # block<16, f32> 或 block<4,16, f32>
 )
 ```
 
 `packed_base` 指向一个局部 304-byte N16×K32 field：byte 0 开始是十六个 little-endian f16
 scale，byte 32 开始是十六个 u8 zero point，byte 48 开始是 two-half packed nibble。每个 code
 减去本列 zero point，与32-element signed-i8 activation做dot，再乘显式 activation scale 和
-本列 f16 scale，最后加 `init[n]`。Result是 `block<16,f32>`。
+本列 f16 scale，最后加 `init[n]`。M1形式返回 `block<16,f32>`；M4形式用四行显式
+activation scale和四路交错K32 code计算四组相同的N16关系，返回普通
+`block<4,16,f32>`。
 
 Primitive只拥有这16个local affine dot和上述局部byte relation。Activation quantization、
 persistent packed-weight base、outer M/N/K loop、N16/K32 traversal和 C ABI必须在
@@ -27,20 +29,22 @@ Kernel IR中显式存在。IME1或其他matrix fragment只是同一语义的targ
 
 ```python
 result = W.symmetric_i4_i8_dot(
-    activation,             # block<32, i8>
+    activation,             # block<32, i8> 或 interleaved block<128, i8>
     packed_base,            # scalar ptr<u8>
-    activation_scale=...,   # scalar f32
-    init=...,               # block<16, f32>
+    activation_scale=...,   # scalar f32 或 block<4, f32>
+    init=...,               # block<16, f32> 或 block<4,16, f32>
 )
 ```
 
-该primitive同样产生16个local dot。`packed_base`指向一个局部288-byte N16×K32 field：
+该primitive同样产生一行或四行的16个local dot。`packed_base`指向一个局部288-byte
+N16×K32 field：
 byte 0 开始是十六个 little-endian f16 scale，byte 32 开始是 two-half packed nibble。Nibble
 数值是 `code - 8`；结果乘 activation scale 和本列 f16 scale 后加到 `init[n]`。
 
-Q4_0 persistent block是否采用288-byte N16×K32 format、当前block地址以及K recurrence仍由
-DSL kernel 表达。SpacemiT IME1 lowering只把一次该primitive实现成local N16×K32 asm fragment，
-不拥有activation quantize、outer loop或kernel ABI。
+Q4_0 persistent block使用 `q4_0_n16_k32_288b` identity；affine Q4_1/Q4_K packed block使用
+`affine_i4_n16_k32_304b` identity。当前block地址、K recurrence以及M4 activation staging仍由
+DSL kernel表达。Target按row tile与target facts选择local N16×K32或M4N16×K32 RVV/IME1
+realization，不拥有activation quantize、outer loop或kernel ABI。
 
 ## Grouped affine i4×i8 block dot
 

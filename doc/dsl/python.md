@@ -84,7 +84,7 @@ workspace 必须在 entry body 使用 `W.storage` 声明 shape，workspace 还�
 
 ```python
 x: W.ptr[W.f32, W.readonly, W.noalias, W.aligned(64)]
-packed: W.ptr[W.u8, W.readonly, W.persistent("q4_k_n16_k32_304b")]
+packed: W.ptr[W.u8, W.readonly, W.persistent("affine_i4_n16_k32_304b")]
 scratch: W.ptr[W.f32, W.workspace, W.noalias]
 
 W.storage(packed, (n_blocks, k_blocks, 304))

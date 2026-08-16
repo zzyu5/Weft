@@ -77,7 +77,14 @@ bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8N16K32() const {
          littleEndian && xlen == 64 && hasF && hasVectorF16 &&
          hasWideningInteger && hasWideningFloat && supportsFixedRVV() &&
          vlenBits == 256 && supportsVectorShape(8, 2) &&
-         supportsVectorShape(32, 32);
+         supportsVectorShape(8, 4) && supportsVectorShape(8, 8) &&
+         supportsVectorShape(16, 2) && supportsVectorShape(32, 4) &&
+         supportsVectorShape(32, 8) && supportsVectorShape(32, 32);
+}
+
+bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8M4N16K32() const {
+  return supportsSpacemitIME1I4I8N16K32() &&
+         supportsVectorShape(16, 4) && supportsVectorShape(32, 64);
 }
 
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

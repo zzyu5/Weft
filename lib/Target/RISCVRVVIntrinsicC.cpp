@@ -7,6 +7,8 @@ namespace weft::riscv_internal {
 void emitRVVIntrinsicCLeaves(llvm::raw_ostream &output,
                              bool usesRVVSymmetricI4I8,
                              bool usesRVVAffineI4I8,
+                             bool usesRVVSymmetricI4I8M4,
+                             bool usesRVVAffineI4I8M4,
                              bool usesGroupedI4I8VLEN128,
                              bool usesGroupedI4I8VLEN256,
                              bool usesGroupedI4I8Scalable,
@@ -105,6 +107,127 @@ __weft_rvv_affine_i4_i8_n16_k32(
   result = __riscv_vfmacc_vv_f32m4(
       result, contribution, weight_scale, vl);
   __riscv_vse32_v_f32m4(accumulator, result, vl);
+}
+
+)c";
+  }
+  if (usesRVVSymmetricI4I8M4) {
+    output << R"c(
+static inline __attribute__((always_inline, unused)) void
+__weft_rvv_symmetric_i4_i8_m4_n16_k32(
+    const float *activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
+  const size_t vl = __riscv_vsetvl_e8m1(16);
+  vint32m4_t dot0 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot1 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot2 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot3 = __riscv_vmv_v_x_i32m4(0, vl);
+  for (size_t half = 0; half < 2; ++half) {
+    const uint8_t *codes = packed_weight + 32 + half * 128;
+    const size_t first_fragment = 2 * half;
+    for (size_t byte = 0; byte < 8; ++byte) {
+      const vuint8m1_t packed =
+          __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
+      const vint16m2_t low = __riscv_vsub_vx_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(__riscv_vzext_vf2_u16m2(
+              __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl), vl)),
+          8, vl);
+      const vint16m2_t high = __riscv_vsub_vx_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(__riscv_vzext_vf2_u16m2(
+              __riscv_vsrl_vx_u8m1(packed, 4, vl), vl)),
+          8, vl);
+      const size_t low_base = first_fragment * 32 + byte;
+      const size_t high_base = low_base + 32;
+      dot0 = __riscv_vwmacc_vx_i32m4(dot0, activation_code[low_base], low, vl);
+      dot0 = __riscv_vwmacc_vx_i32m4(dot0, activation_code[high_base], high, vl);
+      dot1 = __riscv_vwmacc_vx_i32m4(dot1, activation_code[low_base + 8], low, vl);
+      dot1 = __riscv_vwmacc_vx_i32m4(dot1, activation_code[high_base + 8], high, vl);
+      dot2 = __riscv_vwmacc_vx_i32m4(dot2, activation_code[low_base + 16], low, vl);
+      dot2 = __riscv_vwmacc_vx_i32m4(dot2, activation_code[high_base + 16], high, vl);
+      dot3 = __riscv_vwmacc_vx_i32m4(dot3, activation_code[low_base + 24], low, vl);
+      dot3 = __riscv_vwmacc_vx_i32m4(dot3, activation_code[high_base + 24], high, vl);
+    }
+  }
+  const vfloat32m4_t weight_scale = __riscv_vfwcvt_f_f_v_f32m4(
+      __riscv_vle16_v_f16m2((const _Float16 *)(const void *)packed_weight, vl),
+      vl);
+#define __WEFT_RVV_ACCUMULATE_M4(ROW, DOT)                                  \
+  do {                                                                       \
+    vfloat32m4_t contribution = __riscv_vfcvt_f_x_v_f32m4(DOT, vl);         \
+    contribution = __riscv_vfmul_vf_f32m4(                                  \
+        contribution, activation_scale[ROW], vl);                            \
+    vfloat32m4_t result =                                                    \
+        __riscv_vle32_v_f32m4(accumulator + (ROW) * 16, vl);                 \
+    result = __riscv_vfmacc_vv_f32m4(result, contribution, weight_scale, vl);\
+    __riscv_vse32_v_f32m4(accumulator + (ROW) * 16, result, vl);             \
+  } while (0)
+  __WEFT_RVV_ACCUMULATE_M4(0, dot0);
+  __WEFT_RVV_ACCUMULATE_M4(1, dot1);
+  __WEFT_RVV_ACCUMULATE_M4(2, dot2);
+  __WEFT_RVV_ACCUMULATE_M4(3, dot3);
+#undef __WEFT_RVV_ACCUMULATE_M4
+}
+
+)c";
+  }
+  if (usesRVVAffineI4I8M4) {
+    output << R"c(
+static inline __attribute__((always_inline, unused)) void
+__weft_rvv_affine_i4_i8_m4_n16_k32(
+    const float *activation_scale, const int8_t *activation_code,
+    const uint8_t *packed_weight, float *accumulator) {
+  const size_t vl = __riscv_vsetvl_e8m1(16);
+  const vint16m2_t zero_point = __riscv_vreinterpret_v_u16m2_i16m2(
+      __riscv_vzext_vf2_u16m2(
+          __riscv_vle8_v_u8m1(packed_weight + 32, vl), vl));
+  vint32m4_t dot0 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot1 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot2 = __riscv_vmv_v_x_i32m4(0, vl);
+  vint32m4_t dot3 = __riscv_vmv_v_x_i32m4(0, vl);
+  for (size_t half = 0; half < 2; ++half) {
+    const uint8_t *codes = packed_weight + 48 + half * 128;
+    const size_t first_fragment = 2 * half;
+    for (size_t byte = 0; byte < 8; ++byte) {
+      const vuint8m1_t packed =
+          __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
+      const vint16m2_t low = __riscv_vsub_vv_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(__riscv_vzext_vf2_u16m2(
+              __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl), vl)),
+          zero_point, vl);
+      const vint16m2_t high = __riscv_vsub_vv_i16m2(
+          __riscv_vreinterpret_v_u16m2_i16m2(__riscv_vzext_vf2_u16m2(
+              __riscv_vsrl_vx_u8m1(packed, 4, vl), vl)),
+          zero_point, vl);
+      const size_t low_base = first_fragment * 32 + byte;
+      const size_t high_base = low_base + 32;
+      dot0 = __riscv_vwmacc_vx_i32m4(dot0, activation_code[low_base], low, vl);
+      dot0 = __riscv_vwmacc_vx_i32m4(dot0, activation_code[high_base], high, vl);
+      dot1 = __riscv_vwmacc_vx_i32m4(dot1, activation_code[low_base + 8], low, vl);
+      dot1 = __riscv_vwmacc_vx_i32m4(dot1, activation_code[high_base + 8], high, vl);
+      dot2 = __riscv_vwmacc_vx_i32m4(dot2, activation_code[low_base + 16], low, vl);
+      dot2 = __riscv_vwmacc_vx_i32m4(dot2, activation_code[high_base + 16], high, vl);
+      dot3 = __riscv_vwmacc_vx_i32m4(dot3, activation_code[low_base + 24], low, vl);
+      dot3 = __riscv_vwmacc_vx_i32m4(dot3, activation_code[high_base + 24], high, vl);
+    }
+  }
+  const vfloat32m4_t weight_scale = __riscv_vfwcvt_f_f_v_f32m4(
+      __riscv_vle16_v_f16m2((const _Float16 *)(const void *)packed_weight, vl),
+      vl);
+#define __WEFT_RVV_AFFINE_ACCUMULATE_M4(ROW, DOT)                           \
+  do {                                                                       \
+    vfloat32m4_t contribution = __riscv_vfcvt_f_x_v_f32m4(DOT, vl);         \
+    contribution = __riscv_vfmul_vf_f32m4(                                  \
+        contribution, activation_scale[ROW], vl);                            \
+    vfloat32m4_t result =                                                    \
+        __riscv_vle32_v_f32m4(accumulator + (ROW) * 16, vl);                 \
+    result = __riscv_vfmacc_vv_f32m4(result, contribution, weight_scale, vl);\
+    __riscv_vse32_v_f32m4(accumulator + (ROW) * 16, result, vl);             \
+  } while (0)
+  __WEFT_RVV_AFFINE_ACCUMULATE_M4(0, dot0);
+  __WEFT_RVV_AFFINE_ACCUMULATE_M4(1, dot1);
+  __WEFT_RVV_AFFINE_ACCUMULATE_M4(2, dot2);
+  __WEFT_RVV_AFFINE_ACCUMULATE_M4(3, dot3);
+#undef __WEFT_RVV_AFFINE_ACCUMULATE_M4
 }
 
 )c";

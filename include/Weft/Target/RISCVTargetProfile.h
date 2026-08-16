@@ -59,6 +59,7 @@ struct RISCVTargetProfile {
                                    int lmulEighths) const;
   bool hasMatrixExtension(RISCVMatrixExtension extension) const;
   bool supportsSpacemitIME1I4I8N16K32() const;
+  bool supportsSpacemitIME1I4I8M4N16K32() const;
 };
 
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

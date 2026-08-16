@@ -227,11 +227,13 @@ struct SymmetricI4I8Decision {
   I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
   LocalBlockMemoryFact activationBlock;
+  LocalBlockMemoryFact activationScaleBlock;
   mlir::Value packedBlockBase;
   mlir::Value activation;
   mlir::Value activationScale;
   mlir::Value init;
   int64_t packedBlockBytes = 288;
+  unsigned rowTile = 1;
 };
 
 enum class SignBitI8Realization {
@@ -661,11 +663,13 @@ struct AffineI4I8Decision {
   I4I8FragmentRealization realization = I4I8FragmentRealization::RVVN16K32;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
   LocalBlockMemoryFact activationBlock;
+  LocalBlockMemoryFact activationScaleBlock;
   mlir::Value packedBlockBase;
   mlir::Value activation;
   mlir::Value activationScale;
   mlir::Value init;
   unsigned packedBlockBytes = 304;
+  unsigned rowTile = 1;
 };
 
 struct F16GemmNTileDecision {
@@ -7690,28 +7694,37 @@ private:
       SymmetricI4I8DotOp op,
       PlannedPhysicalDecision<SymmetricI4I8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape codeShape = planned.realization.realization ==
-                                       I4I8FragmentRealization::SpacemiTIME1N16K32
-                                   ? kRVVE8MF4
-                                   : rvvShape(8, 2);
+    bool rowFour = planned.realization.rowTile == 4;
+    RVVVectorShape codeShape =
+        rowFour ? rvvShape(8, options.target.vlenBits >= 256 ? 4 : 8)
+                : planned.realization.realization ==
+                          I4I8FragmentRealization::SpacemiTIME1N16K32
+                      ? kRVVE8MF4
+                      : rvvShape(8, 2);
     RVVVectorShape accumulatorShape = rvvShape(32, 4);
     recordPhysicalValue(planned.entity, planned.realization.activation,
                         codeShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(),
                           planned.realization.activation,
                           PhysicalHandoff::LocalPack, codeShape, codeShape);
+    if (rowFour)
+      recordLocalBlockReloads(planned, op.getOperation(),
+                              {planned.realization.activationScaleBlock},
+                              kRVVE32M1);
     recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
     recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
                           PhysicalHandoff::Share, accumulatorShape,
                           accumulatorShape);
-    planned.entity.resources.valueGroups = 4;
-    planned.entity.resources.memoryGroups = 2;
+    planned.entity.resources.valueGroups = rowFour ? 20 : 4;
+    planned.entity.resources.memoryGroups = rowFour ? 5 : 2;
     planned.entity.resources.primitiveGroups =
         planned.realization.realization ==
-                I4I8FragmentRealization::SpacemiTIME1N16K32
+                    I4I8FragmentRealization::SpacemiTIME1N16K32 ||
+                planned.realization.realization ==
+                    I4I8FragmentRealization::SpacemiTIME1M4N16K32
             ? 28
-            : 12;
+            : rowFour ? 24 : 12;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
   }
@@ -7720,28 +7733,37 @@ private:
       AffineI4I8DotOp op,
       PlannedPhysicalDecision<AffineI4I8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape codeShape = planned.realization.realization ==
-                                       I4I8FragmentRealization::SpacemiTIME1N16K32
-                                   ? kRVVE8MF4
-                                   : rvvShape(8, 2);
+    bool rowFour = planned.realization.rowTile == 4;
+    RVVVectorShape codeShape =
+        rowFour ? rvvShape(8, options.target.vlenBits >= 256 ? 4 : 8)
+                : planned.realization.realization ==
+                          I4I8FragmentRealization::SpacemiTIME1N16K32
+                      ? kRVVE8MF4
+                      : rvvShape(8, 2);
     RVVVectorShape accumulatorShape = rvvShape(32, 4);
     recordPhysicalValue(planned.entity, planned.realization.activation,
                         codeShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(),
                           planned.realization.activation,
                           PhysicalHandoff::LocalPack, codeShape, codeShape);
+    if (rowFour)
+      recordLocalBlockReloads(planned, op.getOperation(),
+                              {planned.realization.activationScaleBlock},
+                              kRVVE32M1);
     recordPhysicalValue(planned.entity, op.getInit(), accumulatorShape);
     recordPhysicalValue(planned.entity, op.getResult(), accumulatorShape);
     recordPhysicalHandoff(planned.entity, op.getOperation(), op.getInit(),
                           PhysicalHandoff::Share, accumulatorShape,
                           accumulatorShape);
-    planned.entity.resources.valueGroups = 4;
-    planned.entity.resources.memoryGroups = 2;
+    planned.entity.resources.valueGroups = rowFour ? 20 : 4;
+    planned.entity.resources.memoryGroups = rowFour ? 5 : 2;
     planned.entity.resources.primitiveGroups =
         planned.realization.realization ==
-                I4I8FragmentRealization::SpacemiTIME1N16K32
+                    I4I8FragmentRealization::SpacemiTIME1N16K32 ||
+                planned.realization.realization ==
+                    I4I8FragmentRealization::SpacemiTIME1M4N16K32
             ? 28
-            : 13;
+            : rowFour ? 25 : 13;
     planned.entity.resources.peakGroups =
         planned.entity.resources.primitiveGroups + 1;
   }
@@ -7818,12 +7840,6 @@ private:
 
   mlir::LogicalResult decideSymmetricI4I8Dot(
       SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
-    std::optional<I4I8FragmentRealization> fragment =
-        weft::riscv_internal::selectI4I8FragmentRealization(options.target);
-    if (!fragment)
-      return op.emitError(
-          "symmetric i4/i8 RVV dot requires legal e8m1/e16m2/e32m4 "
-          "integer-widening and f16-to-f32 vector shapes");
     if (!options.target.littleEndian)
       return op.emitError(
           "symmetric i4/i8 dot requires little-endian packed fields");
@@ -7833,11 +7849,30 @@ private:
     if (!activation)
       return op.emitError(
           "symmetric i4/i8 dot requires one typed K32 activation memory fact");
-    if (activation->semanticExtent != 32 || activation->storageExtent != 32 ||
+    unsigned rowTile = activation->semanticExtent == 128 ? 4 : 1;
+    if ((activation->semanticExtent != 32 &&
+         activation->semanticExtent != 128) ||
+        activation->storageExtent != activation->semanticExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "symmetric i4/i8 dot requires contiguous signed-i8 K32 activation memory");
+          "symmetric i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
+    std::optional<LocalBlockMemoryFact> activationScale;
+    if (rowTile == 4) {
+      activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
+      if (!activationScale || activationScale->semanticExtent != 4 ||
+          activationScale->storageExtent != 4 ||
+          !activationScale->semanticType.getElementType().isF32() ||
+          !activationScale->storageType.getElementType().isF32())
+        return op.emitError(
+            "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
+    }
+    std::optional<I4I8FragmentRealization> fragment =
+        weft::riscv_internal::selectI4I8FragmentRealization(options.target,
+                                                            rowTile);
+    if (!fragment)
+      return op.emitError(
+          "symmetric i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
     int64_t packedBlockBytes = 288;
     mlir::Value packedRoot = pointerRoot(packedBase);
@@ -7849,15 +7884,29 @@ private:
           "symmetric i4/i8 dot requires persistent format q4_0_n16_k32_288b");
     decision = SymmetricI4I8Decision{};
     decision.realization = *fragment;
-    bool useIME1 = *fragment == I4I8FragmentRealization::SpacemiTIME1N16K32;
-    decision.leaf = useIME1 ? IntrinsicCLeaf::IME1SymmetricI4I8N16K32
-                            : IntrinsicCLeaf::RVVSymmetricI4I8N16K32;
+    switch (*fragment) {
+    case I4I8FragmentRealization::RVVN16K32:
+      decision.leaf = IntrinsicCLeaf::RVVSymmetricI4I8N16K32;
+      break;
+    case I4I8FragmentRealization::RVVM4N16K32:
+      decision.leaf = IntrinsicCLeaf::RVVSymmetricI4I8M4N16K32;
+      break;
+    case I4I8FragmentRealization::SpacemiTIME1N16K32:
+      decision.leaf = IntrinsicCLeaf::IME1SymmetricI4I8N16K32;
+      break;
+    case I4I8FragmentRealization::SpacemiTIME1M4N16K32:
+      decision.leaf = IntrinsicCLeaf::IME1SymmetricI4I8M4N16K32;
+      break;
+    }
     decision.activationBlock = *activation;
+    if (activationScale)
+      decision.activationScaleBlock = *activationScale;
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
+    decision.rowTile = rowTile;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();
@@ -7876,27 +7925,47 @@ private:
             op.getOperation(), selected->second.entity, decision.activation,
             PhysicalHandoff::LocalPack)))
       return mlir::failure();
+    if (decision.rowTile == 4 &&
+        mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity,
+            decision.activationScale, PhysicalHandoff::Reload)))
+      return mlir::failure();
     std::optional<std::string> activation =
         projectLocalBlockMemoryBase(decision.activationBlock);
     CValue packed = require(decision.packedBlockBase);
-    CValue scale = require(decision.activationScale);
+    std::optional<std::string> scaleBlock;
+    CValue scale;
+    if (decision.rowTile == 4)
+      scaleBlock =
+          projectLocalBlockMemoryBase(decision.activationScaleBlock);
+    else
+      scale = require(decision.activationScale);
     CValue accumulator = require(decision.init);
     if (decision.packedBlockBytes != 288 ||
         !activation ||
-        packed.kind != CValueKind::Pointer || scale.kind != CValueKind::Scalar ||
+        packed.kind != CValueKind::Pointer ||
+        (decision.rowTile == 1 && scale.kind != CValueKind::Scalar) ||
+        (decision.rowTile == 4 && !scaleBlock) ||
         accumulator.kind != CValueKind::F32BlockStorage ||
         packed.spelling.empty() ||
-        scale.spelling.empty() || accumulator.spelling.empty())
+        (decision.rowTile == 1 && scale.spelling.empty()) ||
+        accumulator.spelling.empty())
       return op.emitError(
           "selected symmetric i4/i8 fragment operands are unavailable");
     llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
     if (helper.empty())
       return op.emitError("symmetric i4/i8 leaf spelling was not selected");
-    line(helper.str() + "(" + scale.spelling + ", " +
+    std::string scaleSpelling =
+        decision.rowTile == 4 ? *scaleBlock : scale.spelling;
+    line(helper.str() + "(" + scaleSpelling + ", " +
          *activation + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
-    if (mlir::failed(markRematerializedBlockTrees(
-            {decision.activation, decision.init}, op.getOperation())))
+    llvm::SmallVector<mlir::Value> rematerialized = {decision.activation,
+                                                     decision.init};
+    if (decision.rowTile == 4)
+      rematerialized.push_back(decision.activationScale);
+    if (mlir::failed(markRematerializedBlockTrees(rematerialized,
+                                                  op.getOperation())))
       return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
     accumulator.type = op.getResult().getType();
@@ -8538,12 +8607,6 @@ private:
 
   mlir::LogicalResult decideAffineI4I8Dot(
       AffineI4I8DotOp op, AffineI4I8Decision &decision) {
-    std::optional<I4I8FragmentRealization> fragment =
-        weft::riscv_internal::selectI4I8FragmentRealization(options.target);
-    if (!fragment)
-      return op.emitError(
-          "affine i4/i8 RVV dot requires legal e8m1/e16m2/e32m4 "
-          "integer-widening and f16-to-f32 vector shapes");
     if (!options.target.littleEndian)
       return op.emitError(
           "affine i4/i8 dot requires little-endian packed fields");
@@ -8553,11 +8616,30 @@ private:
     if (!activation)
       return op.emitError(
           "affine i4/i8 dot requires one typed K32 activation memory fact");
-    if (activation->semanticExtent != 32 || activation->storageExtent != 32 ||
+    unsigned rowTile = activation->semanticExtent == 128 ? 4 : 1;
+    if ((activation->semanticExtent != 32 &&
+         activation->semanticExtent != 128) ||
+        activation->storageExtent != activation->semanticExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "affine i4/i8 dot requires contiguous signed-i8 K32 activation memory");
+          "affine i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
+    std::optional<LocalBlockMemoryFact> activationScale;
+    if (rowTile == 4) {
+      activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
+      if (!activationScale || activationScale->semanticExtent != 4 ||
+          activationScale->storageExtent != 4 ||
+          !activationScale->semanticType.getElementType().isF32() ||
+          !activationScale->storageType.getElementType().isF32())
+        return op.emitError(
+            "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
+    }
+    std::optional<I4I8FragmentRealization> fragment =
+        weft::riscv_internal::selectI4I8FragmentRealization(options.target,
+                                                            rowTile);
+    if (!fragment)
+      return op.emitError(
+          "affine i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
     int64_t packedBlockBytes = 304;
     mlir::Value packedRoot = pointerRoot(packedBase);
@@ -8570,15 +8652,29 @@ private:
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
     decision.realization = *fragment;
-    bool useIME1 = *fragment == I4I8FragmentRealization::SpacemiTIME1N16K32;
-    decision.leaf = useIME1 ? IntrinsicCLeaf::IME1AffineI4I8N16K32
-                            : IntrinsicCLeaf::RVVAffineI4I8N16K32;
+    switch (*fragment) {
+    case I4I8FragmentRealization::RVVN16K32:
+      decision.leaf = IntrinsicCLeaf::RVVAffineI4I8N16K32;
+      break;
+    case I4I8FragmentRealization::RVVM4N16K32:
+      decision.leaf = IntrinsicCLeaf::RVVAffineI4I8M4N16K32;
+      break;
+    case I4I8FragmentRealization::SpacemiTIME1N16K32:
+      decision.leaf = IntrinsicCLeaf::IME1AffineI4I8N16K32;
+      break;
+    case I4I8FragmentRealization::SpacemiTIME1M4N16K32:
+      decision.leaf = IntrinsicCLeaf::IME1AffineI4I8M4N16K32;
+      break;
+    }
     decision.activationBlock = *activation;
+    if (activationScale)
+      decision.activationScaleBlock = *activationScale;
     decision.packedBlockBase = packedBase;
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
     decision.packedBlockBytes = packedBlockBytes;
+    decision.rowTile = rowTile;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();
@@ -8596,27 +8692,47 @@ private:
             op.getOperation(), selected->second.entity, decision.activation,
             PhysicalHandoff::LocalPack)))
       return mlir::failure();
+    if (decision.rowTile == 4 &&
+        mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity,
+            decision.activationScale, PhysicalHandoff::Reload)))
+      return mlir::failure();
     std::optional<std::string> activation =
         projectLocalBlockMemoryBase(decision.activationBlock);
     CValue packed = require(decision.packedBlockBase);
-    CValue scale = require(decision.activationScale);
+    std::optional<std::string> scaleBlock;
+    CValue scale;
+    if (decision.rowTile == 4)
+      scaleBlock =
+          projectLocalBlockMemoryBase(decision.activationScaleBlock);
+    else
+      scale = require(decision.activationScale);
     CValue accumulator = require(decision.init);
     if (decision.packedBlockBytes != 304 ||
         !activation ||
-        packed.kind != CValueKind::Pointer || scale.kind != CValueKind::Scalar ||
+        packed.kind != CValueKind::Pointer ||
+        (decision.rowTile == 1 && scale.kind != CValueKind::Scalar) ||
+        (decision.rowTile == 4 && !scaleBlock) ||
         accumulator.kind != CValueKind::F32BlockStorage ||
         packed.spelling.empty() ||
-        scale.spelling.empty() || accumulator.spelling.empty())
+        (decision.rowTile == 1 && scale.spelling.empty()) ||
+        accumulator.spelling.empty())
       return op.emitError(
           "selected affine i4/i8 fragment operands are unavailable");
     llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
     if (helper.empty())
       return op.emitError("affine i4/i8 leaf spelling was not selected");
-    line(helper.str() + "(" + scale.spelling + ", " +
+    std::string scaleSpelling =
+        decision.rowTile == 4 ? *scaleBlock : scale.spelling;
+    line(helper.str() + "(" + scaleSpelling + ", " +
          *activation + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
-    if (mlir::failed(markRematerializedBlockTrees(
-            {decision.activation, decision.init}, op.getOperation())))
+    llvm::SmallVector<mlir::Value> rematerialized = {decision.activation,
+                                                     decision.init};
+    if (decision.rowTile == 4)
+      rematerialized.push_back(decision.activationScale);
+    if (mlir::failed(markRematerializedBlockTrees(rematerialized,
+                                                  op.getOperation())))
       return mlir::failure();
     loweredBlockOps.insert(op.getOperation());
     accumulator.type = op.getResult().getType();

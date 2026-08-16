@@ -27,10 +27,18 @@ llvm::StringRef intrinsicCLeafName(IntrinsicCLeaf leaf) {
     return "__weft_rvv_symmetric_i4_i8_n16_k32";
   case IntrinsicCLeaf::RVVAffineI4I8N16K32:
     return "__weft_rvv_affine_i4_i8_n16_k32";
+  case IntrinsicCLeaf::RVVSymmetricI4I8M4N16K32:
+    return "__weft_rvv_symmetric_i4_i8_m4_n16_k32";
+  case IntrinsicCLeaf::RVVAffineI4I8M4N16K32:
+    return "__weft_rvv_affine_i4_i8_m4_n16_k32";
   case IntrinsicCLeaf::IME1SymmetricI4I8N16K32:
     return "__weft_ime1_symmetric_i4_i8_n16_k32";
   case IntrinsicCLeaf::IME1AffineI4I8N16K32:
     return "__weft_ime1_affine_i4_i8_n16_k32";
+  case IntrinsicCLeaf::IME1SymmetricI4I8M4N16K32:
+    return "__weft_ime1_symmetric_i4_i8_m4_n16_k32";
+  case IntrinsicCLeaf::IME1AffineI4I8M4N16K32:
+    return "__weft_ime1_affine_i4_i8_m4_n16_k32";
   case IntrinsicCLeaf::GroupedAffineI4I8VLEN128:
     return "__weft_grouped_affine_i4_i8_vl128";
   case IntrinsicCLeaf::GroupedAffineI4I8VLEN256:

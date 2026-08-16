@@ -31,9 +31,12 @@ def WeftExtension_AffineI4I8DotOp
     : WeftExtension_Op<"affine_i4_i8_dot", [MemoryEffects<[MemRead]>]> {
   let summary = "Affine packed-i4 by signed-i8 block dot";
   let description = [{
-    Computes sixteen independent affine dot products over a thirty-two-element
-    signed-i8 activation block.  packed_base addresses one local 304-byte N16
-    by K32 field: sixteen little-endian f16 scales start at byte 0, sixteen u8
+    Computes either one or four rows of sixteen independent affine dot products.
+    The one-row form accepts a signed-i8 block<32>, scalar activation scale, and
+    f32 block<16> init/result.  The four-row form accepts a fragment-interleaved
+    signed-i8 block<128>, f32 block<4> activation scales, and f32 block<4,16>
+    init/result.  packed_base addresses one local 304-byte N16 by K32 field:
+    sixteen little-endian f16 scales start at byte 0, sixteen u8
     zero points start at byte 32, and packed codes start at byte 48.  For
     p = half * 8 + lane, the byte at 48 + half * 128 + n * 8 + lane supplies
     low/high unsigned-i4 values for activation positions half * 16 + lane and
@@ -56,9 +59,12 @@ def WeftExtension_SymmetricI4I8DotOp
     : WeftExtension_Op<"symmetric_i4_i8_dot", [MemoryEffects<[MemRead]>]> {
   let summary = "Symmetric packed-i4 by signed-i8 block dot";
   let description = [{
-    Computes sixteen independent dot products over a thirty-two-element
-    signed-i8 activation block.  packed_base addresses one local 288-byte N16
-    by K32 field: sixteen little-endian f16 scales start at byte 0 and packed
+    Computes either one or four rows of sixteen independent dot products.  The
+    one-row form accepts a signed-i8 block<32>, scalar activation scale, and f32
+    block<16> init/result.  The four-row form accepts a fragment-interleaved
+    signed-i8 block<128>, f32 block<4> activation scales, and f32 block<4,16>
+    init/result.  packed_base addresses one local 288-byte N16 by K32 field:
+    sixteen little-endian f16 scales start at byte 0 and packed
     codes start at byte 32.  For p = half * 8 + lane, the byte at
     32 + half * 128 + n * 8 + lane supplies low/high unsigned-i4 values for
     activation positions half * 16 + lane and half * 16 + lane + 8; each code

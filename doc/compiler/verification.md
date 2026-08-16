@@ -6,7 +6,7 @@ Weft 只保留一类复核：把一个 DSL kernel 生成 intrinsic C/C header，
 ```bash
 ./examples/run/weft.sh sg2044-rvv128 add_bias
 ./examples/run/weft.sh k1-rvv256 add_bias
-./examples/run/weft.sh k1-ime256 q4_0_projection_ime 1
+./examples/run/weft.sh k1-ime256 q4_0_projection_ime prefill 3
 ```
 
 每个 examples 分支指定唯一 DSL kernel、runtime、target profile 与真实 workload shape。Runtime

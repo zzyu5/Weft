@@ -6,7 +6,9 @@ namespace weft::riscv_internal {
 
 void emitPrelude(llvm::raw_ostream &output, bool usesExp,
                  bool usesRVVSymmetricI4I8, bool usesRVVAffineI4I8,
+                 bool usesRVVSymmetricI4I8M4, bool usesRVVAffineI4I8M4,
                  bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
+                 bool usesIME1SymmetricI4I8M4, bool usesIME1AffineI4I8M4,
                  bool usesGroupedI4I8VLEN128,
                  bool usesGroupedI4I8VLEN256,
                  bool usesGroupedI4I8Scalable,
@@ -57,12 +59,14 @@ __weft_load_f16_le(const uint8_t *bytes) {
 
 )c";
   emitRVVIntrinsicCLeaves(output, usesRVVSymmetricI4I8,
-                          usesRVVAffineI4I8, usesGroupedI4I8VLEN128,
+                          usesRVVAffineI4I8, usesRVVSymmetricI4I8M4,
+                          usesRVVAffineI4I8M4, usesGroupedI4I8VLEN128,
                           usesGroupedI4I8VLEN256, usesGroupedI4I8Scalable,
                           usesE2M1VLEN128, usesE2M1VLEN256,
                           usesE2M1Scalable);
   emitIMEIntrinsicCLeaves(output, usesIME1SymmetricI4I8,
-                          usesIME1AffineI4I8);
+                          usesIME1AffineI4I8, usesIME1SymmetricI4I8M4,
+                          usesIME1AffineI4I8M4);
   if (!usesExp)
     return;
   output << R"c(static inline __attribute__((unused)) vfloat32m2_t __weft_exp_f32m2(
@@ -173,10 +177,18 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
       leaves.contains(IntrinsicCLeaf::RVVSymmetricI4I8N16K32);
   bool usesRVVAffineI4I8 =
       leaves.contains(IntrinsicCLeaf::RVVAffineI4I8N16K32);
+  bool usesRVVSymmetricI4I8M4 =
+      leaves.contains(IntrinsicCLeaf::RVVSymmetricI4I8M4N16K32);
+  bool usesRVVAffineI4I8M4 =
+      leaves.contains(IntrinsicCLeaf::RVVAffineI4I8M4N16K32);
   bool usesIME1SymmetricI4I8 =
       leaves.contains(IntrinsicCLeaf::IME1SymmetricI4I8N16K32);
   bool usesIME1AffineI4I8 =
       leaves.contains(IntrinsicCLeaf::IME1AffineI4I8N16K32);
+  bool usesIME1SymmetricI4I8M4 =
+      leaves.contains(IntrinsicCLeaf::IME1SymmetricI4I8M4N16K32);
+  bool usesIME1AffineI4I8M4 =
+      leaves.contains(IntrinsicCLeaf::IME1AffineI4I8M4N16K32);
   bool usesGroupedI4I8VLEN128 =
       leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8VLEN128);
   bool usesGroupedI4I8VLEN256 =
@@ -190,7 +202,9 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
   bool usesE2M1Scalable =
       leaves.contains(IntrinsicCLeaf::E2M1E8M0I8Scalable);
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
+              usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
+              usesIME1SymmetricI4I8M4, usesIME1AffineI4I8M4,
               usesGroupedI4I8VLEN128, usesGroupedI4I8VLEN256,
               usesGroupedI4I8Scalable,
               usesE2M1VLEN128, usesE2M1VLEN256, usesE2M1Scalable);
