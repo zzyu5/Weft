@@ -816,7 +816,8 @@ selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
     const bool vectorCarry =
         config.structures.reductionStatePlacement == 2 ||
         (config.structures.reductionStatePlacement == 0 &&
-         facts.relaxedOrder && facts.reductionStateCount > 1);
+         facts.relaxedOrder &&
+         (target.vlenBits < 256 || facts.reductionStateCount > 1));
     if (vectorCarry) {
       selected.carry = VLAStateCarryRepresentation::Vector;
       selected.finalize =
@@ -1015,9 +1016,17 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                  state.stripUpdate ==
                      VLAStateStripUpdate::SegmentedInclusiveAddScan;
         });
-    if (facts.dataSEW == 16 || facts.hasFloatCast || hasReductionState ||
-        facts.hasNarrow)
+    if (facts.dataSEW == 16 || hasReductionState || facts.hasNarrow)
       desiredLanes = 32;
+    if (facts.dataSEW == 32 && facts.hasFloatCast &&
+        !facts.localPrimitiveResources.empty()) {
+      const unsigned preferredCastLMUL = target.vlenBits >= 256 ? 4 : 2;
+      const unsigned castLanes =
+          rvvLaneCapacity(rvvShape(32, preferredCastLMUL), target).value_or(0);
+      if (castLanes == 0)
+        return std::nullopt;
+      desiredLanes = std::min(desiredLanes, castLanes);
+    }
     if (hasOrderedScan || facts.hasF32Division)
       desiredLanes = 8;
     llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
@@ -1818,13 +1827,22 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
   if (facts.lhsVLAFreeAxis && facts.rhsVLAFreeAxis)
     return std::nullopt;
   const bool hasVLAFreeAxis = facts.lhsVLAFreeAxis || facts.rhsVLAFreeAxis;
+  const unsigned baseF32Lanes =
+      rvvLaneCapacity(rvvShape(32, 1), target).value_or(0);
+  if (baseF32Lanes == 0)
+    return std::nullopt;
   const unsigned desiredLanes = hasVLAFreeAxis
                                     ? (facts.rowTile == 1 ? 16 : 8)
-                                    : (facts.rowTile >= 8 ? 4 : 8);
+                                    : (facts.rowTile >= 8
+                                           ? 4
+                                           : std::max(8u, 2 * baseF32Lanes));
   unsigned preferredUnroll = 1;
   bool costlyHandoff = facts.materializedInit || facts.reductionPredicate ||
                        facts.indexedOperands != 0;
-  if (!costlyHandoff && facts.reductionExtent)
+  const bool localRowsFillWideVector =
+      !hasVLAFreeAxis && facts.rowTile > 1 && baseF32Lanes >= 8;
+  if (!costlyHandoff && facts.reductionExtent &&
+      !localRowsFillWideVector)
     preferredUnroll = *facts.reductionExtent >= 64
                           ? 4
                           : *facts.reductionExtent >= 32 ? 2 : 1;
