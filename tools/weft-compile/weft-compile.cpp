@@ -57,6 +57,10 @@ llvm::cl::opt<int64_t> f16RowMicrotile(
     "f16-row-microtile",
     llvm::cl::desc("Requested F16 matmul row microtile; zero selects"),
     llvm::cl::init(0));
+llvm::cl::opt<int64_t> f16ColumnMicrotile(
+    "f16-column-microtile",
+    llvm::cl::desc("Requested F16 matmul column microtile; zero selects"),
+    llvm::cl::init(0));
 llvm::cl::opt<int64_t> f16KUnroll(
     "f16-k-unroll",
     llvm::cl::desc("Requested F16 matmul K unroll; zero selects"),
@@ -152,6 +156,7 @@ int main(int argc, char **argv) {
     options.backend.dotKUnroll = dotKUnroll;
     options.backend.f16InputLMUL = f16InputLMUL;
     options.backend.f16RowMicrotile = f16RowMicrotile;
+    options.backend.f16ColumnMicrotile = f16ColumnMicrotile;
     options.backend.f16KUnroll = f16KUnroll;
     options.backend.f16PipelineStages = f16PipelineStages;
     options.backend.reductionStatePlacement = reductionStatePlacement;

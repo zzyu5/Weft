@@ -9714,8 +9714,8 @@ private:
     decision.rowTile = static_cast<unsigned>(*rowTile);
     decision.columnTile = static_cast<unsigned>(*columnTile);
     decision.reductionTile = static_cast<unsigned>(*reductionTile);
-    F16MatmulCandidateFacts candidateFacts{decision.rowTile,
-                                           decision.reductionTile};
+    F16MatmulCandidateFacts candidateFacts{
+        decision.rowTile, decision.columnTile, decision.reductionTile};
     std::optional<SelectedF16MatmulPhysical> selected =
         weft::riscv_internal::selectF16MatmulPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -9759,7 +9759,9 @@ private:
         (physical.pipelineStages == 2 &&
          physical.loadSchedule !=
              F16MatmulLoadSchedule::BatchLoadsThenCompute);
-    if (physical.rowMicrotile == 0 || physical.kUnroll == 0 ||
+    if (physical.rowMicrotile == 0 || physical.columnMicrotile == 0 ||
+        decision.columnTile % physical.columnMicrotile != 0 ||
+        physical.kUnroll == 0 ||
         physical.pipelineStages == 0 || physical.pipelineStages > 2 ||
         scheduleMismatch ||
         entity.resources.peakGroups > entity.resources.architecturalGroups)
@@ -9798,208 +9800,284 @@ private:
       return projectBlockScalar(value, axes);
     };
 
-    std::string column = fresh("matmul_n");
-    line("for (size_t " + column + " = 0; " + column + " < " +
-         std::to_string(decision.columnTile) + "; ++" + column + ") {");
+    std::string columnBase = fresh("matmul_n");
+    line("for (size_t " + columnBase + " = 0; " + columnBase + " < " +
+         std::to_string(decision.columnTile) + "; " + columnBase + " += " +
+         std::to_string(physical.columnMicrotile) + ") {");
     ++indent;
-    std::optional<std::string> finalPredicate =
-        project(lhsLoad.getWhere(), "0", "(" +
-                    std::to_string(decision.reductionTile) + " - 1)",
-                column);
-    std::optional<std::string> finalRhsPredicate =
-        project(rhsLoad.getWhere(), "0", "(" +
-                    std::to_string(decision.reductionTile) + " - 1)",
-                column);
-    if (!finalPredicate || !finalRhsPredicate)
-      return op.emitError("F16 matmul predicate projection is unavailable");
-    std::string activeK = fresh("matmul_active_k");
-    line("size_t " + activeK + " = " +
-         std::to_string(decision.reductionTile) + ";");
-    std::optional<std::string> tailPredicate =
-        project(lhsLoad.getWhere(), "0", "(" + activeK + " - 1)", column);
-    std::optional<std::string> tailRhsPredicate =
-        project(rhsLoad.getWhere(), "0", "(" + activeK + " - 1)", column);
-    if (!tailPredicate || !tailRhsPredicate)
-      return op.emitError("F16 matmul tail predicate projection is unavailable");
-    line("while (" + activeK + " > 0 && !(" + *tailPredicate + " && " +
-         *tailRhsPredicate + ")) --" + activeK + ";");
+    llvm::SmallVector<std::string> columns;
+    llvm::SmallVector<std::string> activeKs;
+    for (unsigned column = 0; column < physical.columnMicrotile; ++column) {
+      columns.push_back(column == 0
+                            ? columnBase
+                            : "(" + columnBase + " + " +
+                                  std::to_string(column) + ")");
+      std::string activeK = fresh("matmul_active_k");
+      line("size_t " + activeK + " = " +
+           std::to_string(decision.reductionTile) + ";");
+      std::optional<std::string> tailPredicate = project(
+          lhsLoad.getWhere(), "0", "(" + activeK + " - 1)", columns.back());
+      std::optional<std::string> tailRhsPredicate = project(
+          rhsLoad.getWhere(), "0", "(" + activeK + " - 1)", columns.back());
+      if (!tailPredicate || !tailRhsPredicate)
+        return op.emitError("F16 matmul tail predicate projection is unavailable");
+      line("while (" + activeK + " > 0 && !(" + *tailPredicate + " && " +
+           *tailRhsPredicate + ")) --" + activeK + ";");
+      activeKs.push_back(std::move(activeK));
+    }
 
-    for (unsigned rowBase = 0; rowBase < decision.rowTile;
-         rowBase += physical.rowMicrotile) {
-      unsigned rowCount =
-          std::min(physical.rowMicrotile, decision.rowTile - rowBase);
-      std::string fullVL = fresh("matmul_full_vl");
-      line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m" +
-           std::to_string(*inputLMUL) + "();");
-      llvm::SmallVector<std::string> accumulators;
-      llvm::SmallVector<std::string> rowPredicates;
-      for (unsigned row = 0; row < rowCount; ++row) {
-        std::string rowIndex = std::to_string(rowBase + row);
-        std::optional<std::string> active =
-            project(lhsLoad.getWhere(), rowIndex, "0", column);
-        std::optional<std::string> rhsActive =
-            project(rhsLoad.getWhere(), rowIndex, "0", column);
-        if (!active || !rhsActive)
-          return op.emitError("F16 matmul row predicate projection is unavailable");
-        rowPredicates.push_back("(" + *active + " && " + *rhsActive + ")");
-        std::string vector = fresh("matmul_acc");
-        line("vfloat32m" + std::to_string(*computeLMUL) + "_t " +
-             vector + " = __riscv_vfmv_v_f_f32m" +
-             std::to_string(*computeLMUL) + "(0.0f, " + fullVL +
-             ");");
-        accumulators.push_back(std::move(vector));
-      }
-      std::string reduction = fresh("matmul_k");
-      std::string vl = fresh("matmul_vl");
-      auto coordinateAt = [&](llvm::StringRef base, unsigned unroll) {
-        return unroll == 0
-                   ? base.str()
-                   : "(" + base.str() + " + " +
-                         std::to_string(unroll) + " * " + vl + ")";
-      };
-      auto emitStreamedChunk = [&](llvm::StringRef coordinate)
-          -> mlir::LogicalResult {
-        std::optional<std::string> rhsPointer =
-            project(rhsLoad.getPointer(), "0", coordinate, column);
-        if (!rhsPointer)
-          return op.emitError("F16 matmul RHS address projection is unavailable");
-        std::string rhsVector = fresh("matmul_rhs");
-        line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-             rhsVector + " = __riscv_vle16_v_f16m" +
-             std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
-             ");");
+    auto emitColumnGroup = [&](llvm::ArrayRef<std::string> groupColumns,
+                               llvm::StringRef activeK)
+        -> mlir::LogicalResult {
+      for (unsigned rowBase = 0; rowBase < decision.rowTile;
+           rowBase += physical.rowMicrotile) {
+        unsigned rowCount =
+            std::min(physical.rowMicrotile, decision.rowTile - rowBase);
+        std::string fullVL = fresh("matmul_full_vl");
+        line("const size_t " + fullVL + " = __riscv_vsetvlmax_e16m" +
+             std::to_string(*inputLMUL) + "();");
+        llvm::SmallVector<std::string> accumulators;
+        llvm::SmallVector<std::string> rowPredicates;
         for (unsigned row = 0; row < rowCount; ++row) {
           std::string rowIndex = std::to_string(rowBase + row);
-          std::optional<std::string> lhsPointer =
-              project(lhsLoad.getPointer(), rowIndex, coordinate, column);
-          if (!lhsPointer)
-            return op.emitError("F16 matmul LHS address projection is unavailable");
-          line("if (" + rowPredicates[row] + ") {");
-          ++indent;
-          std::string lhsVector = fresh("matmul_lhs");
-          line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-               lhsVector + " = __riscv_vle16_v_f16m" +
-               std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
-               ");");
-          line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
-               std::to_string(*computeLMUL) + "_tu(" + accumulators[row] +
-               ", " + lhsVector + ", " + rhsVector + ", " + vl + ");");
-          --indent;
-          line("}");
+          for (llvm::StringRef column : groupColumns) {
+            std::optional<std::string> active =
+                project(lhsLoad.getWhere(), rowIndex, "0", column);
+            std::optional<std::string> rhsActive =
+                project(rhsLoad.getWhere(), rowIndex, "0", column);
+            if (!active || !rhsActive)
+              return op.emitError(
+                  "F16 matmul row predicate projection is unavailable");
+            rowPredicates.push_back("(" + *active + " && " + *rhsActive +
+                                    ")");
+            std::string vector = fresh("matmul_acc");
+            line("vfloat32m" + std::to_string(*computeLMUL) + "_t " +
+                 vector + " = __riscv_vfmv_v_f_f32m" +
+                 std::to_string(*computeLMUL) + "(0.0f, " + fullVL +
+                 ");");
+            accumulators.push_back(std::move(vector));
+          }
         }
-        return mlir::success();
-      };
-      auto emitBatchedChunks = [&](llvm::StringRef base, unsigned count)
-          -> mlir::LogicalResult {
-        llvm::SmallVector<std::string> rhsVectors;
-        for (unsigned unroll = 0; unroll < count; ++unroll) {
-          std::string coordinate = coordinateAt(base, unroll);
-          std::optional<std::string> rhsPointer =
-              project(rhsLoad.getPointer(), "0", coordinate, column);
-          if (!rhsPointer)
-            return op.emitError("F16 matmul RHS address projection is unavailable");
-          std::string rhsVector = fresh("matmul_rhs_stage");
-          line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-               rhsVector + " = __riscv_vle16_v_f16m" +
-               std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
-               ");");
-          rhsVectors.push_back(std::move(rhsVector));
-        }
-        for (unsigned row = 0; row < rowCount; ++row) {
-          line("if (" + rowPredicates[row] + ") {");
-          ++indent;
-          llvm::SmallVector<std::string> lhsVectors;
-          for (unsigned unroll = 0; unroll < count; ++unroll) {
-            std::string coordinate = coordinateAt(base, unroll);
-            std::optional<std::string> lhsPointer =
-                project(lhsLoad.getPointer(),
-                        std::to_string(rowBase + row), coordinate, column);
-            if (!lhsPointer)
-              return op.emitError("F16 matmul LHS address projection is unavailable");
-            std::string lhsVector = fresh("matmul_lhs_stage");
+        auto flatIndex = [&](unsigned row, unsigned column) {
+          return row * groupColumns.size() + column;
+        };
+        auto anyRowPredicate = [&](unsigned row) {
+          std::string result = "(";
+          for (unsigned column = 0; column < groupColumns.size(); ++column) {
+            if (column != 0)
+              result += " || ";
+            result += rowPredicates[flatIndex(row, column)];
+          }
+          return result + ")";
+        };
+
+        std::string reduction = fresh("matmul_k");
+        std::string vl = fresh("matmul_vl");
+        auto coordinateAt = [&](llvm::StringRef base, unsigned unroll) {
+          return unroll == 0
+                     ? base.str()
+                     : "(" + base.str() + " + " +
+                           std::to_string(unroll) + " * " + vl + ")";
+        };
+        auto emitStreamedChunk = [&](llvm::StringRef coordinate)
+            -> mlir::LogicalResult {
+          llvm::SmallVector<std::string> rhsVectors;
+          for (llvm::StringRef column : groupColumns) {
+            std::optional<std::string> rhsPointer =
+                project(rhsLoad.getPointer(), "0", coordinate, column);
+            if (!rhsPointer)
+              return op.emitError(
+                  "F16 matmul RHS address projection is unavailable");
+            std::string rhsVector = fresh("matmul_rhs");
             line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
-                 lhsVector + " = __riscv_vle16_v_f16m" +
+                 rhsVector + " = __riscv_vle16_v_f16m" +
+                 std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
+                 ");");
+            rhsVectors.push_back(std::move(rhsVector));
+          }
+          for (unsigned row = 0; row < rowCount; ++row) {
+            std::optional<std::string> lhsPointer = project(
+                lhsLoad.getPointer(), std::to_string(rowBase + row), coordinate,
+                groupColumns.front());
+            if (!lhsPointer)
+              return op.emitError(
+                  "F16 matmul LHS address projection is unavailable");
+            line("if (" + anyRowPredicate(row) + ") {");
+            ++indent;
+            std::string lhsVector = fresh("matmul_lhs");
+            line("vfloat16m" + std::to_string(*inputLMUL) + "_t " + lhsVector +
+                 " = __riscv_vle16_v_f16m" +
                  std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
                  ");");
-            lhsVectors.push_back(std::move(lhsVector));
+            for (unsigned column = 0; column < groupColumns.size(); ++column) {
+              unsigned index = flatIndex(row, column);
+              line("if (" + rowPredicates[index] + ")");
+              ++indent;
+              line(accumulators[index] + " = __riscv_vfwmacc_vv_f32m" +
+                   std::to_string(*computeLMUL) + "_tu(" + accumulators[index] +
+                   ", " + lhsVector + ", " + rhsVectors[column] + ", " + vl +
+                   ");");
+              --indent;
+            }
+            --indent;
+            line("}");
           }
-          for (unsigned unroll = 0; unroll < count; ++unroll)
-            line(accumulators[row] + " = __riscv_vfwmacc_vv_f32m" +
-                 std::to_string(*computeLMUL) + "_tu(" + accumulators[row] +
-                 ", " + lhsVectors[unroll] + ", " + rhsVectors[unroll] +
-                 ", " + vl + ");");
+          return mlir::success();
+        };
+        auto emitBatchedChunks = [&](llvm::StringRef base, unsigned count)
+            -> mlir::LogicalResult {
+          llvm::SmallVector<std::string> rhsVectors;
+          for (unsigned unroll = 0; unroll < count; ++unroll) {
+            std::string coordinate = coordinateAt(base, unroll);
+            for (llvm::StringRef column : groupColumns) {
+              std::optional<std::string> rhsPointer =
+                  project(rhsLoad.getPointer(), "0", coordinate, column);
+              if (!rhsPointer)
+                return op.emitError(
+                    "F16 matmul RHS address projection is unavailable");
+              std::string rhsVector = fresh("matmul_rhs_stage");
+              line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+                   rhsVector + " = __riscv_vle16_v_f16m" +
+                   std::to_string(*inputLMUL) + "(" + *rhsPointer + ", " + vl +
+                   ");");
+              rhsVectors.push_back(std::move(rhsVector));
+            }
+          }
+          for (unsigned row = 0; row < rowCount; ++row) {
+            line("if (" + anyRowPredicate(row) + ") {");
+            ++indent;
+            llvm::SmallVector<std::string> lhsVectors;
+            for (unsigned unroll = 0; unroll < count; ++unroll) {
+              std::string coordinate = coordinateAt(base, unroll);
+              std::optional<std::string> lhsPointer = project(
+                  lhsLoad.getPointer(), std::to_string(rowBase + row),
+                  coordinate, groupColumns.front());
+              if (!lhsPointer)
+                return op.emitError(
+                    "F16 matmul LHS address projection is unavailable");
+              std::string lhsVector = fresh("matmul_lhs_stage");
+              line("vfloat16m" + std::to_string(*inputLMUL) + "_t " +
+                   lhsVector + " = __riscv_vle16_v_f16m" +
+                   std::to_string(*inputLMUL) + "(" + *lhsPointer + ", " + vl +
+                   ");");
+              lhsVectors.push_back(std::move(lhsVector));
+            }
+            for (unsigned unroll = 0; unroll < count; ++unroll)
+              for (unsigned column = 0; column < groupColumns.size(); ++column) {
+                unsigned index = flatIndex(row, column);
+                line("if (" + rowPredicates[index] + ")");
+                ++indent;
+                line(accumulators[index] + " = __riscv_vfwmacc_vv_f32m" +
+                     std::to_string(*computeLMUL) + "_tu(" +
+                     accumulators[index] + ", " + lhsVectors[unroll] + ", " +
+                     rhsVectors[unroll * groupColumns.size() + column] + ", " +
+                     vl + ");");
+                --indent;
+              }
+            --indent;
+            line("}");
+          }
+          return mlir::success();
+        };
+
+        line("for (size_t " + reduction + " = 0; " + reduction + " < " +
+             activeK.str() + ";) {");
+        ++indent;
+        if (physical.kUnroll == 1) {
+          line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+               std::to_string(*inputLMUL) + "(" + activeK.str() + " - " +
+               reduction + ");");
+          if (mlir::failed(emitStreamedChunk(reduction)))
+            return mlir::failure();
+          line(reduction + " += " + vl + ";");
+        } else {
+          std::string remaining = fresh("matmul_remaining");
+          line("const size_t " + remaining + " = " + activeK.str() + " - " +
+               reduction + ";");
+          line("if (" + remaining + " >= " +
+               std::to_string(physical.kUnroll) + ") {");
+          ++indent;
+          line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+               std::to_string(*inputLMUL) + "(" + remaining + " / " +
+               std::to_string(physical.kUnroll) + ");");
+          if (physical.loadSchedule ==
+              F16MatmulLoadSchedule::BatchLoadsThenCompute) {
+            if (mlir::failed(emitBatchedChunks(reduction, physical.kUnroll)))
+              return mlir::failure();
+          } else {
+            for (unsigned unroll = 0; unroll < physical.kUnroll; ++unroll)
+              if (mlir::failed(
+                      emitStreamedChunk(coordinateAt(reduction, unroll))))
+                return mlir::failure();
+          }
+          line(reduction + " += " + std::to_string(physical.kUnroll) +
+               " * " + vl + ";");
+          --indent;
+          line("} else {");
+          ++indent;
+          line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+               std::to_string(*inputLMUL) + "(" + remaining + ");");
+          if (mlir::failed(emitStreamedChunk(reduction)))
+            return mlir::failure();
+          line(reduction + " += " + vl + ";");
           --indent;
           line("}");
         }
-        return mlir::success();
-      };
-      line("for (size_t " + reduction + " = 0; " + reduction + " < " +
-           activeK + ";) {");
-      ++indent;
-      if (physical.kUnroll == 1) {
-        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
-             std::to_string(*inputLMUL) + "(" + activeK + " - " +
-             reduction + ");");
-        if (mlir::failed(emitStreamedChunk(reduction)))
-          return mlir::failure();
-        line(reduction + " += " + vl + ";");
-      } else {
-        std::string remaining = fresh("matmul_remaining");
-        line("const size_t " + remaining + " = " + activeK + " - " +
-             reduction + ";");
-        line("if (" + remaining + " >= " +
-             std::to_string(physical.kUnroll) + ") {");
-        ++indent;
-        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
-             std::to_string(*inputLMUL) + "(" + remaining + " / " +
-             std::to_string(physical.kUnroll) + ");");
-        if (physical.loadSchedule ==
-            F16MatmulLoadSchedule::BatchLoadsThenCompute) {
-          if (mlir::failed(
-                  emitBatchedChunks(reduction, physical.kUnroll)))
-            return mlir::failure();
-        } else {
-          for (unsigned unroll = 0; unroll < physical.kUnroll; ++unroll)
-            if (mlir::failed(
-                    emitStreamedChunk(coordinateAt(reduction, unroll))))
-              return mlir::failure();
-        }
-        line(reduction + " += " + std::to_string(physical.kUnroll) +
-             " * " + vl + ";");
-        --indent;
-        line("} else {");
-        ++indent;
-        line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
-             std::to_string(*inputLMUL) + "(" + remaining + ");");
-        if (mlir::failed(emitStreamedChunk(reduction)))
-          return mlir::failure();
-        line(reduction + " += " + vl + ";");
         --indent;
         line("}");
+
+        for (unsigned row = 0; row < rowCount; ++row) {
+          for (unsigned column = 0; column < groupColumns.size(); ++column) {
+            unsigned index = flatIndex(row, column);
+            std::string seed = fresh("matmul_seed");
+            std::string partial = fresh("matmul_partial");
+            std::string scalar = fresh("matmul_sum");
+            line("if (" + rowPredicates[index] + ") {");
+            ++indent;
+            line("vfloat32m1_t " + seed +
+                 " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
+            line("vfloat32m1_t " + partial +
+                 " = __riscv_vfredusum_vs_f32m" +
+                 std::to_string(*computeLMUL) + "_f32m1(" +
+                 accumulators[index] + ", " + seed + ", " + fullVL + ");");
+            line("const float " + scalar +
+                 " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
+            line(accumulator.spelling + "[" +
+                 std::to_string(rowBase + row) + " * " +
+                 std::to_string(decision.columnTile) + " + " +
+                 groupColumns[column] + "] += " + scalar + ";");
+            --indent;
+            line("}");
+          }
+        }
+      }
+      return mlir::success();
+    };
+
+    if (columns.size() == 1) {
+      if (mlir::failed(emitColumnGroup(columns, activeKs.front())))
+        return mlir::failure();
+    } else {
+      std::string sameActiveK;
+      for (unsigned column = 1; column < activeKs.size(); ++column) {
+        if (column != 1)
+          sameActiveK += " && ";
+        sameActiveK += activeKs.front() + " == " + activeKs[column];
+      }
+      line("if (" + sameActiveK + ") {");
+      ++indent;
+      if (mlir::failed(emitColumnGroup(columns, activeKs.front())))
+        return mlir::failure();
+      --indent;
+      line("} else {");
+      ++indent;
+      for (unsigned column = 0; column < columns.size(); ++column) {
+        llvm::SmallVector<std::string> singleColumn = {columns[column]};
+        if (mlir::failed(emitColumnGroup(singleColumn, activeKs[column])))
+          return mlir::failure();
       }
       --indent;
       line("}");
-      for (unsigned row = 0; row < rowCount; ++row) {
-        std::string seed = fresh("matmul_seed");
-        std::string partial = fresh("matmul_partial");
-        std::string scalar = fresh("matmul_sum");
-        line("if (" + rowPredicates[row] + ") {");
-        ++indent;
-        line("vfloat32m1_t " + seed +
-             " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
-        line("vfloat32m1_t " + partial +
-             " = __riscv_vfredusum_vs_f32m" +
-             std::to_string(*computeLMUL) + "_f32m1(" +
-             accumulators[row] + ", " + seed + ", " + fullVL + ");");
-        line("const float " + scalar +
-             " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
-        line(accumulator.spelling + "[" +
-             std::to_string(rowBase + row) + " * " +
-             std::to_string(decision.columnTile) + " + " + column + "] += " +
-             scalar + ";");
-        --indent;
-        line("}");
-      }
     }
     --indent;
     line("}");

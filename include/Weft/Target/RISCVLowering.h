@@ -19,6 +19,7 @@ struct RISCVBackendConfig {
   int64_t dotKUnroll = 0;
   int64_t f16InputLMUL = 0;
   int64_t f16RowMicrotile = 0;
+  int64_t f16ColumnMicrotile = 0;
   int64_t f16KUnroll = 0;
   int64_t f16PipelineStages = 0;
   int64_t reductionStatePlacement = 0;

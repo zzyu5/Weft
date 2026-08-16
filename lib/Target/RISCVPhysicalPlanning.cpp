@@ -623,15 +623,31 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   if (config.f16PipelineStages != 0)
     stageCandidates = {static_cast<unsigned>(config.f16PipelineStages)};
 
+  llvm::SmallVector<unsigned> columnCandidates;
+  if (config.f16ColumnMicrotile != 0) {
+    columnCandidates.push_back(
+        static_cast<unsigned>(config.f16ColumnMicrotile));
+  } else {
+    columnCandidates.push_back(1);
+    if (facts.columnTile >= 2 && facts.columnTile % 2 == 0)
+      columnCandidates.insert(columnCandidates.begin(), 2);
+  }
+
   const unsigned preferredLMUL = 1;
   const unsigned preferredUnroll =
       facts.reductionTile < 32 ? 1 : target.vlenBits >= 256 ? 4 : 2;
   const unsigned preferredStages = 1;
+  const unsigned preferredColumns =
+      target.vlenBits < 256 && facts.columnTile >= 2 &&
+              facts.columnTile % 2 == 0
+          ? 2
+          : 1;
   struct Candidate {
     F16MatmulPhysicalConfig physical;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned rowPenalty = 0;
+    unsigned columnPenalty = 0;
     unsigned lmulPenalty = 0;
     unsigned unrollPenalty = 0;
     unsigned stagePenalty = 0;
@@ -640,7 +656,11 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   for (unsigned rows : rowCandidates) {
     if (rows == 0 || rows > facts.rowTile || facts.rowTile % rows != 0)
       continue;
-    for (unsigned inputLMUL : lmulCandidates) {
+    for (unsigned columns : columnCandidates) {
+      if (columns == 0 || columns > facts.columnTile ||
+          facts.columnTile % columns != 0)
+        continue;
+      for (unsigned inputLMUL : lmulCandidates) {
       if (!target.supportsVectorShape(16, static_cast<int>(inputLMUL * 8)) ||
           !target.supportsVectorShape(32,
                                       static_cast<int>(2 * inputLMUL * 8)))
@@ -658,6 +678,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
             continue;
           F16MatmulPhysicalConfig physical;
           physical.rowMicrotile = rows;
+          physical.columnMicrotile = columns;
           physical.inputLMUL = inputLMUL;
           physical.kUnroll = unroll;
           physical.pipelineStages = stages;
@@ -666,10 +687,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                           : F16MatmulLoadSchedule::StreamRHSThenRows;
           PhysicalResourceBudget resources;
           resources.architecturalGroups = target.vectorRegisters;
-          resources.valueGroups = rows * computeLMUL;
-          resources.memoryGroups = 2 * inputLMUL;
+          resources.valueGroups = rows * columns * computeLMUL;
+          resources.memoryGroups = (1 + columns) * inputLMUL;
           unsigned pipelineGroups =
-              stages == 2 ? 2 * unroll * inputLMUL : 0;
+              stages == 2 ? (1 + columns) * unroll * inputLMUL : 0;
           unsigned operandGroups =
               stages == 2 ? pipelineGroups : resources.memoryGroups;
           resources.primitiveGroups = resources.valueGroups + operandGroups;
@@ -687,23 +708,29 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                   static_cast<int>(target.vlenBits >= 256
                                        ? std::min(4u, facts.rowTile)
                                        : std::min(2u, facts.rowTile)))),
+              static_cast<unsigned>(std::abs(
+                  static_cast<int>(columns) -
+                  static_cast<int>(preferredColumns))),
               static_cast<unsigned>(std::abs(static_cast<int>(inputLMUL) -
                                              static_cast<int>(preferredLMUL))),
               static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
                                              static_cast<int>(preferredUnroll))),
               static_cast<unsigned>(std::abs(static_cast<int>(stages) -
                                              static_cast<int>(preferredStages)))});
-        }
       }
+    }
+  }
     }
   }
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.tailPenalty, lhs.rowPenalty, lhs.lmulPenalty,
+    return std::tie(lhs.tailPenalty, lhs.rowPenalty, lhs.columnPenalty,
+                    lhs.lmulPenalty,
                     lhs.unrollPenalty, lhs.stagePenalty,
                     lhs.resources.peakGroups) <
-           std::tie(rhs.tailPenalty, rhs.rowPenalty, rhs.lmulPenalty,
+           std::tie(rhs.tailPenalty, rhs.rowPenalty, rhs.columnPenalty,
+                    rhs.lmulPenalty,
                     rhs.unrollPenalty, rhs.stagePenalty,
                     rhs.resources.peakGroups);
   });

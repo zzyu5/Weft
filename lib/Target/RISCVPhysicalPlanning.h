@@ -284,6 +284,7 @@ enum class F16MatmulLoadSchedule {
 
 struct F16MatmulPhysicalConfig {
   unsigned rowMicrotile = 1;
+  unsigned columnMicrotile = 1;
   unsigned inputLMUL = 1;
   unsigned kUnroll = 1;
   unsigned pipelineStages = 1;
@@ -293,6 +294,7 @@ struct F16MatmulPhysicalConfig {
 
 struct F16MatmulCandidateFacts {
   unsigned rowTile = 1;
+  unsigned columnTile = 1;
   unsigned reductionTile = 1;
 };
 
