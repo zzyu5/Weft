@@ -4,9 +4,10 @@ import weft.language as W
 
 @weft.kernel
 def gemm_worker(
-    a: W.ptr[W.f16, W.readonly, W.noalias],
+    a: W.ptr[W.f32, W.readonly, W.noalias],
     b: W.ptr[W.f16, W.readonly, W.noalias],
     c: W.ptr[W.f32, W.writeonly, W.noalias],
+    a_f16: W.ptr[W.f16, W.workspace, W.noalias],
     m_begin: W.index,
     m_end: W.index,
     n: W.index,
@@ -18,6 +19,12 @@ def gemm_worker(
     BN: W.constexpr[W.index],
     BK: W.constexpr[W.index],
 ) -> None:
+    W.storage(a_f16, shape=(m_end, k))
+    for row in W.range(m_begin, m_end):
+        with W.vla(0, k) as inner:
+            value = W.load(a + row * lda + inner)
+            W.store(a_f16 + row * lda + inner, W.cast(value, W.f16))
+
     for m0 in W.range(m_begin, m_end, BM):
         for n0 in W.range(0, n, BN):
             mi = W.block(BM)
@@ -36,7 +43,7 @@ def gemm_worker(
                 a_valid = (m_idx < m_end) & (k_lhs < k)
                 b_valid = (k_rhs < k) & (n_idx < n)
 
-                a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
+                a_blk = W.load(a_f16 + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
                 acc = W.matmul(

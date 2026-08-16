@@ -77,18 +77,20 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::vector<_Float16> a(m * kK);
+  std::vector<float> a(m * kK);
   std::vector<_Float16> b(kK * kN);
   std::vector<float> c(m * kN, 0.0F);
+  std::vector<_Float16> aF16(m * kK);
   for (std::size_t row = 0; row < m; ++row)
     for (std::size_t inner = 0; inner < kK; ++inner)
-      a[row * kK + inner] = kHalfValues[(row + 3 * inner + 1) % 4];
+      a[row * kK + inner] = kFloatValues[(row + 3 * inner + 1) % 4];
   for (std::size_t column = 0; column < kN; ++column)
     for (std::size_t inner = 0; inner < kK; ++inner)
       b[column * kK + inner] =
           kHalfValues[(5 * column + 3 * inner + 2) % 4];
 
-  gemm_worker(a.data(), b.data(), c.data(), 0, m, kN, kK, kK, kN, kN);
+  gemm_worker(a.data(), b.data(), c.data(), aF16.data(), 0, m, kN, kK, kK,
+              kN, kN);
   const std::size_t sampleRows[] = {0, m / 2, m - 1};
   const std::size_t sampleColumns[] = {0, 1, kN / 2, kN - 1};
   double maxAbsoluteError = 0.0;
@@ -121,7 +123,8 @@ int main(int argc, char **argv) {
   for (std::size_t repetition = 0; repetition < repeatCount; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
-    gemm_worker(a.data(), b.data(), c.data(), 0, m, kN, kK, kK, kN, kN);
+    gemm_worker(a.data(), b.data(), c.data(), aF16.data(), 0, m, kN, kK, kK,
+                kN, kN);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());
