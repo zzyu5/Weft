@@ -596,44 +596,73 @@ selectVLAUnaryPhysical(VLAUnarySemantic semantic,
   return std::nullopt;
 }
 
-std::optional<VLAStateRealization>
-selectVLAStatePhysical(VLAStateSemantic semantic,
-                       const RISCVTargetProfile &target) {
-  if (!target.hasRVV)
+std::optional<SelectedVLAStatePhysical>
+selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
+                       const RISCVTargetProfile &target,
+                       const RISCVBackendConfig &config) {
+  if (!target.hasRVV || config.structures.reductionStatePlacement < 0 ||
+      config.structures.reductionStatePlacement > 2)
     return std::nullopt;
-  switch (semantic) {
+  SelectedVLAStatePhysical selected;
+  switch (facts.semantic) {
   case VLAStateSemantic::F32AddReduction:
-    return target.hasF ? std::optional<VLAStateRealization>(
-                             VLAStateRealization::RVVAddReduction)
-                       : std::nullopt;
+    if (!target.hasF)
+      return std::nullopt;
+    selected.stripUpdate = VLAStateStripUpdate::AddReduction;
+    break;
   case VLAStateSemantic::F32MaxReduction:
-    return target.hasF ? std::optional<VLAStateRealization>(
-                             VLAStateRealization::RVVMaxReduction)
-                       : std::nullopt;
+    if (!target.hasF)
+      return std::nullopt;
+    selected.stripUpdate = VLAStateStripUpdate::MaxReduction;
+    break;
   case VLAStateSemantic::I8AddReductionI32:
-    return target.hasWideningInteger
-               ? std::optional<VLAStateRealization>(
-                     VLAStateRealization::RVVI8AddReductionI32)
-               : std::nullopt;
+    if (!target.hasWideningInteger)
+      return std::nullopt;
+    selected.stripUpdate = VLAStateStripUpdate::WideningAddReduction;
+    break;
   case VLAStateSemantic::InclusiveAddScan:
-    return target.hasF ? std::optional<VLAStateRealization>(
-                             VLAStateRealization::RVVInclusiveAddScan)
-                       : std::nullopt;
+    if (!target.hasF || facts.relaxedOrder)
+      return std::nullopt;
+    selected.stripUpdate = VLAStateStripUpdate::InclusiveAddScan;
+    break;
   case VLAStateSemantic::SegmentedInclusiveAddScan:
-    return target.hasF
-               ? std::optional<VLAStateRealization>(
-                     VLAStateRealization::RVVSegmentedInclusiveAddScan)
-               : std::nullopt;
+    if (!target.hasF || facts.relaxedOrder)
+      return std::nullopt;
+    selected.stripUpdate = VLAStateStripUpdate::SegmentedInclusiveAddScan;
+    break;
   case VLAStateSemantic::ArgMaxSummary:
-    return target.hasF ? std::optional<VLAStateRealization>(
-                             VLAStateRealization::RVVArgMaxSummary)
-                       : std::nullopt;
+    if (!target.hasF)
+      return std::nullopt;
+    selected.carry = VLAStateCarryRepresentation::ScalarTuple;
+    selected.stripUpdate = VLAStateStripUpdate::ArgMaxSummary;
+    return selected;
   case VLAStateSemantic::OnlineSoftmaxSummary:
-    return target.hasF ? std::optional<VLAStateRealization>(
-                             VLAStateRealization::RVVOnlineSoftmaxSummary)
-                       : std::nullopt;
+    if (!target.hasF || facts.relaxedOrder)
+      return std::nullopt;
+    selected.carry = VLAStateCarryRepresentation::ScalarTuple;
+    selected.stripUpdate = VLAStateStripUpdate::OnlineSoftmaxSummary;
+    return selected;
   }
-  return std::nullopt;
+  const bool f32Reduction =
+      facts.semantic == VLAStateSemantic::F32AddReduction ||
+      facts.semantic == VLAStateSemantic::F32MaxReduction;
+  if (f32Reduction) {
+    if (config.structures.reductionStatePlacement == 2 &&
+        !facts.relaxedOrder)
+      return std::nullopt;
+    const bool vectorCarry =
+        config.structures.reductionStatePlacement == 2 ||
+        (config.structures.reductionStatePlacement == 0 &&
+         facts.relaxedOrder && facts.reductionStateCount > 1);
+    if (vectorCarry) {
+      selected.carry = VLAStateCarryRepresentation::Vector;
+      selected.finalize =
+          facts.semantic == VLAStateSemantic::F32AddReduction
+              ? VLAStateFinalize::HorizontalAdd
+              : VLAStateFinalize::HorizontalMax;
+    }
+  }
+  return selected;
 }
 
 std::optional<LocalImplementation>
@@ -713,26 +742,6 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   return selected;
 }
 
-std::optional<VLAStatePlacement>
-selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
-                              const RISCVTargetProfile &target,
-                              const RISCVBackendConfig &config) {
-  (void)target;
-  if (config.structures.reductionStatePlacement < 0 ||
-      config.structures.reductionStatePlacement > 2)
-    return std::nullopt;
-  if (config.structures.reductionStatePlacement == 2)
-    return facts.relaxedOrder
-               ? std::optional<VLAStatePlacement>(
-                     VLAStatePlacement::VectorCarry)
-               : std::nullopt;
-  if (config.structures.reductionStatePlacement == 1)
-    return VLAStatePlacement::ScalarCarry;
-  return facts.relaxedOrder && facts.reductionStateCount > 1
-             ? VLAStatePlacement::VectorCarry
-             : VLAStatePlacement::ScalarCarry;
-}
-
 std::optional<SelectedVLAEntityPhysical>
 selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                         const RISCVTargetProfile &target) {
@@ -761,10 +770,23 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     candidates = {*requiredLMUL};
   } else {
     unsigned desiredLanes = 16;
-    if (facts.dataSEW == 16 || facts.hasFloatCast ||
-        facts.hasReductionState || facts.hasNarrow)
+    const bool hasReductionState = llvm::any_of(
+        facts.states, [](const VLAStateResourceFact &state) {
+          return state.stripUpdate == VLAStateStripUpdate::AddReduction ||
+                 state.stripUpdate == VLAStateStripUpdate::MaxReduction ||
+                 state.stripUpdate ==
+                     VLAStateStripUpdate::WideningAddReduction;
+        });
+    const bool hasOrderedScan = llvm::any_of(
+        facts.states, [](const VLAStateResourceFact &state) {
+          return state.stripUpdate == VLAStateStripUpdate::InclusiveAddScan ||
+                 state.stripUpdate ==
+                     VLAStateStripUpdate::SegmentedInclusiveAddScan;
+        });
+    if (facts.dataSEW == 16 || facts.hasFloatCast || hasReductionState ||
+        facts.hasNarrow)
       desiredLanes = 32;
-    if (facts.hasOrderedScan || facts.hasF32Division)
+    if (hasOrderedScan || facts.hasF32Division)
       desiredLanes = 8;
     llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
       auto score = [&](unsigned candidate) {
@@ -842,17 +864,19 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     unsigned carriedStateGroups = 0;
     unsigned transientStateGroups = 0;
     for (const VLAStateResourceFact &state : facts.states) {
-      switch (state.kind) {
-      case VLAStateResourceKind::InclusiveAddScan:
+      switch (state.stripUpdate) {
+      case VLAStateStripUpdate::InclusiveAddScan:
         transientStateGroups =
             std::max(transientStateGroups, 3 * candidate + 1);
         break;
-      case VLAStateResourceKind::SegmentedInclusiveAddScan:
+      case VLAStateStripUpdate::SegmentedInclusiveAddScan:
         transientStateGroups =
             std::max(transientStateGroups, 4 * candidate + 2);
         break;
-      case VLAStateResourceKind::Reduction:
-        if (state.placement == VLAStatePlacement::VectorCarry) {
+      case VLAStateStripUpdate::AddReduction:
+      case VLAStateStripUpdate::MaxReduction:
+        if (state.carry == VLAStateCarryRepresentation::Vector &&
+            state.wholeVLALifetime) {
           carriedStateGroups += candidate;
           transientStateGroups =
               std::max(transientStateGroups, std::max(candidate, 2u));
@@ -861,16 +885,16 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
               std::max(transientStateGroups, candidate + 2);
         }
         break;
-      case VLAStateResourceKind::I8AddReductionI32:
+      case VLAStateStripUpdate::WideningAddReduction:
         transientStateGroups =
             std::max(transientStateGroups,
                      std::max(1u, candidate / 4) + 1);
         break;
-      case VLAStateResourceKind::ArgMaxSummary:
+      case VLAStateStripUpdate::ArgMaxSummary:
         transientStateGroups =
             std::max(transientStateGroups, candidate + 2);
         break;
-      case VLAStateResourceKind::OnlineSoftmaxSummary:
+      case VLAStateStripUpdate::OnlineSoftmaxSummary:
         transientStateGroups =
             std::max(transientStateGroups, 3 * candidate + 2);
         break;

@@ -444,19 +444,27 @@ enum class VLAStateSemantic {
   OnlineSoftmaxSummary,
 };
 
-enum class VLAStateRealization {
-  RVVAddReduction,
-  RVVMaxReduction,
-  RVVI8AddReductionI32,
-  RVVInclusiveAddScan,
-  RVVSegmentedInclusiveAddScan,
-  RVVArgMaxSummary,
-  RVVOnlineSoftmaxSummary,
+enum class VLAStateCarryRepresentation {
+  Scalar,
+  Vector,
+  ScalarTuple,
 };
 
-std::optional<VLAStateRealization>
-selectVLAStatePhysical(VLAStateSemantic semantic,
-                       const RISCVTargetProfile &target);
+enum class VLAStateStripUpdate {
+  AddReduction,
+  MaxReduction,
+  WideningAddReduction,
+  InclusiveAddScan,
+  SegmentedInclusiveAddScan,
+  ArgMaxSummary,
+  OnlineSoftmaxSummary,
+};
+
+enum class VLAStateFinalize {
+  Direct,
+  HorizontalAdd,
+  HorizontalMax,
+};
 
 enum class VLALookupRealization {
   RVVTableGather,
@@ -581,33 +589,28 @@ std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
                            const RISCVTargetProfile &target);
 
-enum class VLAStatePlacement {
-  ScalarCarry,
-  VectorCarry,
-};
-
-struct ReductionStatePlacementFacts {
+struct VLAStateCandidateFacts {
+  VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
   bool relaxedOrder = false;
   unsigned reductionStateCount = 0;
 };
 
-std::optional<VLAStatePlacement>
-selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
-                              const RISCVTargetProfile &target,
-                              const RISCVBackendConfig &config);
-
-enum class VLAStateResourceKind {
-  InclusiveAddScan,
-  SegmentedInclusiveAddScan,
-  Reduction,
-  I8AddReductionI32,
-  ArgMaxSummary,
-  OnlineSoftmaxSummary,
+struct SelectedVLAStatePhysical {
+  VLAStateCarryRepresentation carry = VLAStateCarryRepresentation::Scalar;
+  VLAStateStripUpdate stripUpdate = VLAStateStripUpdate::AddReduction;
+  VLAStateFinalize finalize = VLAStateFinalize::Direct;
+  bool wholeVLALifetime = true;
 };
 
+std::optional<SelectedVLAStatePhysical>
+selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
+                       const RISCVTargetProfile &target,
+                       const RISCVBackendConfig &config);
+
 struct VLAStateResourceFact {
-  VLAStateResourceKind kind = VLAStateResourceKind::Reduction;
-  VLAStatePlacement placement = VLAStatePlacement::ScalarCarry;
+  VLAStateCarryRepresentation carry = VLAStateCarryRepresentation::Scalar;
+  VLAStateStripUpdate stripUpdate = VLAStateStripUpdate::AddReduction;
+  bool wholeVLALifetime = true;
 };
 
 struct VLAIndexedMemoryFact {
@@ -630,9 +633,6 @@ struct VLAEntityCandidateFacts {
   unsigned segmentLoadPairs = 0;
   unsigned segmentStorePairs = 0;
   unsigned lookupCount = 0;
-  bool hasReductionState = false;
-  bool hasOrderedScan = false;
-  bool hasOnlineSummary = false;
   bool hasF32Division = false;
   bool hasFloatCast = false;
   bool hasIndexVector = false;
