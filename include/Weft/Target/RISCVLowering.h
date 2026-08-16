@@ -13,7 +13,11 @@ class raw_ostream;
 
 namespace weft {
 
-struct RISCVBackendConfig {
+struct RISCVStructuralConfig {
+  int64_t reductionStatePlacement = 0;
+};
+
+struct RISCVCandidateParameters {
   int64_t vlaLMUL = 0;
   int64_t dotLMUL = 0;
   int64_t dotKUnroll = 0;
@@ -22,9 +26,13 @@ struct RISCVBackendConfig {
   int64_t f16ColumnMicrotile = 0;
   int64_t f16KUnroll = 0;
   int64_t f16PipelineStages = 0;
-  int64_t reductionStatePlacement = 0;
   int64_t narrowLMUL = 0;
   int64_t sortRadixBits = 0;
+};
+
+struct RISCVBackendConfig {
+  RISCVStructuralConfig structures;
+  RISCVCandidateParameters parameters;
 };
 
 struct RISCVLoweringOptions {

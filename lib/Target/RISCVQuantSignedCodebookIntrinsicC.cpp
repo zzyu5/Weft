@@ -4,12 +4,12 @@
 
 namespace weft::riscv_internal {
 
-void emitSignedCodebookIntrinsicCLeaves(
-    llvm::raw_ostream &output, bool entry8VLEN128, bool entry8VLEN256,
-    bool entry4VLEN128, bool entry4VLEN256) {
-  if (entry8VLEN128) {
+void emitSignedCodebookLocalImplementations(
+    llvm::raw_ostream &output, bool entry8E8M2, bool entry8E8M1,
+    bool entry4E8M2, bool entry4E8M1) {
+  if (entry8E8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_signed_codebook8_i8_vl128(
+__weft_signed_codebook8_i8_register_l32_e8m2(
     const uint8_t *codes, uint32_t sign_metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -54,9 +54,9 @@ __weft_signed_codebook8_i8_vl128(
 )c";
   }
 
-  if (entry8VLEN256) {
+  if (entry8E8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_signed_codebook8_i8_vl256(
+__weft_signed_codebook8_i8_register_l32_e8m1(
     const uint8_t *codes, uint32_t sign_metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -101,9 +101,9 @@ __weft_signed_codebook8_i8_vl256(
 )c";
   }
 
-  if (entry4VLEN128) {
+  if (entry4E8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_signed_codebook4_i8_vl128(
+__weft_signed_codebook4_i8_register_l32_e8m2(
     const uint8_t *codes, uint32_t sign_metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -148,9 +148,9 @@ __weft_signed_codebook4_i8_vl128(
 )c";
   }
 
-  if (entry4VLEN256) {
+  if (entry4E8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_signed_codebook4_i8_vl256(
+__weft_signed_codebook4_i8_register_l32_e8m1(
     const uint8_t *codes, uint32_t sign_metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -196,11 +196,11 @@ __weft_signed_codebook4_i8_vl256(
   }
 }
 
-void emitPackedU9U7CodebookIntrinsicCLeaves(llvm::raw_ostream &output,
-                                            bool vlen128, bool vlen256) {
-  if (vlen128) {
+void emitPackedU9U7CodebookLocalImplementations(llvm::raw_ostream &output,
+                                            bool registerE8M2, bool registerE8M1) {
+  if (registerE8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_u9_u7_codebook_i8_vl128(
+__weft_packed_u9_u7_codebook_i8_register_l32_e8m2(
     const uint8_t *packed_codes, uint8_t scale_byte,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -262,9 +262,9 @@ __weft_packed_u9_u7_codebook_i8_vl128(
 )c";
   }
 
-  if (vlen256) {
+  if (registerE8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_u9_u7_codebook_i8_vl256(
+__weft_packed_u9_u7_codebook_i8_register_l32_e8m1(
     const uint8_t *packed_codes, uint8_t scale_byte,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     const uint8_t *sign_table, float dot_scale, float init) {
@@ -327,11 +327,11 @@ __weft_packed_u9_u7_codebook_i8_vl256(
   }
 }
 
-void emitPackedU11GridDeltaIntrinsicCLeaves(llvm::raw_ostream &output,
-                                            bool vlen128, bool vlen256) {
-  if (vlen128) {
+void emitPackedU11GridDeltaLocalImplementations(llvm::raw_ostream &output,
+                                            bool registerE8M2, bool registerE8M1) {
+  if (registerE8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_u11_grid_delta_i8_vl128(
+__weft_packed_u11_grid_delta_i8_register_l32_e8m2(
     const uint8_t *codes, uint16_t metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     int32_t activation_sum, float dot_scale, float init) {
@@ -371,9 +371,9 @@ __weft_packed_u11_grid_delta_i8_vl128(
 )c";
   }
 
-  if (vlen256) {
+  if (registerE8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_u11_grid_delta_i8_vl256(
+__weft_packed_u11_grid_delta_i8_register_l32_e8m1(
     const uint8_t *codes, uint16_t metadata,
     const uint8_t *activation_bytes, const uint8_t *grid_table,
     int32_t activation_sum, float dot_scale, float init) {

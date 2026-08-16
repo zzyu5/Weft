@@ -7,33 +7,39 @@ class raw_ostream;
 
 namespace weft::riscv_internal {
 
-void emitIQ2IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
-                             bool fixedLanes64, bool scalable);
-void emitIQ3IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes64,
-                             bool scalable);
-void emitIQ1IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
-                             bool fixedLanes64, bool scalable);
-void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
-                            bool fixedLanes64, bool scalable);
-void emitPackedI4IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
-                                  bool vlen256);
-void emitPackedI5IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
-                                  bool vlen256);
-void emitPackedI3GroupedIntrinsicCLeaves(llvm::raw_ostream &output,
-                                         bool vlen128, bool vlen256);
-void emitNibbleCodebookIntrinsicCLeaves(llvm::raw_ostream &output,
-                                        bool vlen128, bool vlen256);
-void emitTernaryIntrinsicCLeaves(llvm::raw_ostream &output,
-                                 bool base3VLEN128, bool base3VLEN256,
-                                 bool packedI2VLEN128,
-                                 bool packedI2VLEN256);
-void emitSignedCodebookIntrinsicCLeaves(
-    llvm::raw_ostream &output, bool entry8VLEN128, bool entry8VLEN256,
-    bool entry4VLEN128, bool entry4VLEN256);
-void emitPackedU9U7CodebookIntrinsicCLeaves(llvm::raw_ostream &output,
-                                            bool vlen128, bool vlen256);
-void emitPackedU11GridDeltaIntrinsicCLeaves(llvm::raw_ostream &output,
-                                            bool vlen128, bool vlen256);
+void emitIQ2LocalImplementations(llvm::raw_ostream &output, bool registerL32,
+                                 bool registerL64, bool strip);
+void emitIQ3LocalImplementations(llvm::raw_ostream &output, bool registerL64,
+                                 bool strip);
+void emitIQ1LocalImplementations(llvm::raw_ostream &output, bool registerL32,
+                                 bool registerL64, bool strip);
+void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,
+                                bool registerL64, bool strip);
+void emitPackedI4LocalImplementations(llvm::raw_ostream &output,
+                                      bool registerE8M2,
+                                      bool registerE8M1);
+void emitPackedI5LocalImplementations(llvm::raw_ostream &output,
+                                      bool registerE8M2,
+                                      bool registerE8M1);
+void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
+                                             bool registerL32,
+                                             bool registerL64);
+void emitNibbleCodebookLocalImplementations(llvm::raw_ostream &output,
+                                            bool registerE8M2,
+                                            bool registerE8M1);
+void emitTernaryLocalImplementations(llvm::raw_ostream &output,
+                                     bool base3E8M2, bool base3E8M1,
+                                     bool packedI2E8M2,
+                                     bool packedI2E8M1);
+void emitSignedCodebookLocalImplementations(
+    llvm::raw_ostream &output, bool entry8E8M2, bool entry8E8M1,
+    bool entry4E8M2, bool entry4E8M1);
+void emitPackedU9U7CodebookLocalImplementations(llvm::raw_ostream &output,
+                                                bool registerE8M2,
+                                                bool registerE8M1);
+void emitPackedU11GridDeltaLocalImplementations(llvm::raw_ostream &output,
+                                                bool registerE8M2,
+                                                bool registerE8M1);
 
 } // namespace weft::riscv_internal
 

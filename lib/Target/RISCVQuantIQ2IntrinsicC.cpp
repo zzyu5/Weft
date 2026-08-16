@@ -4,9 +4,9 @@
 
 namespace weft::riscv_internal {
 
-void emitIQ2IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
-                             bool fixedLanes64, bool scalable) {
-  if (fixedLanes32 || fixedLanes64) {
+void emitIQ2LocalImplementations(llvm::raw_ostream &output, bool registerL32,
+                             bool registerL64, bool strip) {
+  if (registerL32 || registerL64) {
     output << R"c(static const uint8_t __attribute__((unused))
 __weft_sign_gather_indices_64[64] = {
     0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
@@ -22,9 +22,9 @@ __weft_sign_bit_masks_64[64] = {
 
 )c";
   }
-  if (fixedLanes64) {
+  if (registerL64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq2_s_i8_lanes64(
+__weft_iq2_s_i8_register_l64_e8m2(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
@@ -101,9 +101,9 @@ __weft_iq2_s_i8_lanes64(
 }
 )c";
   }
-  if (fixedLanes32) {
+  if (registerL32) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq2_s_i8_lanes32(
+__weft_iq2_s_i8_register_l32_e8m2(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
@@ -154,9 +154,9 @@ __weft_iq2_s_i8_lanes32(
 }
 )c";
   }
-  if (scalable) {
+  if (strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq2_s_i8_rvv(
+__weft_iq2_s_i8_strip(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,

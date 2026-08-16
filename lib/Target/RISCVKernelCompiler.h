@@ -17,7 +17,7 @@ mlir::LogicalResult
 compileRISCVKernelsToIntrinsicC(mlir::ModuleOp module,
                                 const RISCVLoweringOptions &options,
                                 llvm::raw_ostream &output,
-                                SelectedIntrinsicCLeaves &selectedLeaves);
+                                SelectedLocalImplementations &selectedImplementations);
 
 } // namespace weft::riscv_internal
 

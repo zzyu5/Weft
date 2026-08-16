@@ -9,11 +9,10 @@ void emitPrelude(llvm::raw_ostream &output, bool usesExp,
                  bool usesRVVSymmetricI4I8M4, bool usesRVVAffineI4I8M4,
                  bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
                  bool usesIME1SymmetricI4I8M4, bool usesIME1AffineI4I8M4,
-                 bool usesGroupedI4I8VLEN128,
-                 bool usesGroupedI4I8VLEN256,
-                 bool usesGroupedI4I8Scalable,
-                 bool usesE2M1VLEN128, bool usesE2M1VLEN256,
-                 bool usesE2M1Scalable) {
+                 bool usesGroupedI4I8Strip,
+                 bool usesE2M1RegisterE8M1M2,
+                 bool usesE2M1RegisterE8MF2,
+                 bool usesE2M1Strip) {
   output << R"c(#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -67,15 +66,15 @@ __weft_load_f16_le_aligned(const uint8_t *bytes) {
 }
 
 )c";
-  emitRVVIntrinsicCLeaves(output, usesRVVSymmetricI4I8,
-                          usesRVVAffineI4I8, usesRVVSymmetricI4I8M4,
-                          usesRVVAffineI4I8M4, usesGroupedI4I8VLEN128,
-                          usesGroupedI4I8VLEN256, usesGroupedI4I8Scalable,
-                          usesE2M1VLEN128, usesE2M1VLEN256,
-                          usesE2M1Scalable);
-  emitIMEIntrinsicCLeaves(output, usesIME1SymmetricI4I8,
-                          usesIME1AffineI4I8, usesIME1SymmetricI4I8M4,
-                          usesIME1AffineI4I8M4);
+  emitRVVLocalImplementations(
+      output, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
+      usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
+      usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
+      usesE2M1RegisterE8MF2, usesE2M1Strip);
+  emitIMELocalImplementations(output, usesIME1SymmetricI4I8,
+                              usesIME1AffineI4I8,
+                              usesIME1SymmetricI4I8M4,
+                              usesIME1AffineI4I8M4);
   if (!usesExp)
     return;
   output << R"c(static inline __attribute__((unused)) vfloat32m2_t __weft_exp_f32m2(
@@ -180,44 +179,68 @@ __weft_online_summary_merge_f32(
 }
 
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
-                           const SelectedIntrinsicCLeaves &leaves) {
-  bool usesExp = leaves.contains(IntrinsicCLeaf::RVVF32M2Math);
-  bool usesRVVSymmetricI4I8 =
-      leaves.contains(IntrinsicCLeaf::RVVSymmetricI4I8N16K32);
-  bool usesRVVAffineI4I8 =
-      leaves.contains(IntrinsicCLeaf::RVVAffineI4I8N16K32);
-  bool usesRVVSymmetricI4I8M4 =
-      leaves.contains(IntrinsicCLeaf::RVVSymmetricI4I8M4N16K32);
-  bool usesRVVAffineI4I8M4 =
-      leaves.contains(IntrinsicCLeaf::RVVAffineI4I8M4N16K32);
-  bool usesIME1SymmetricI4I8 =
-      leaves.contains(IntrinsicCLeaf::IME1SymmetricI4I8N16K32);
-  bool usesIME1AffineI4I8 =
-      leaves.contains(IntrinsicCLeaf::IME1AffineI4I8N16K32);
-  bool usesIME1SymmetricI4I8M4 =
-      leaves.contains(IntrinsicCLeaf::IME1SymmetricI4I8M4N16K32);
-  bool usesIME1AffineI4I8M4 =
-      leaves.contains(IntrinsicCLeaf::IME1AffineI4I8M4N16K32);
-  bool usesGroupedI4I8VLEN128 =
-      leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8VLEN128);
-  bool usesGroupedI4I8VLEN256 =
-      leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8VLEN256);
-  bool usesGroupedI4I8Scalable =
-      leaves.contains(IntrinsicCLeaf::GroupedAffineI4I8Scalable);
-  bool usesE2M1VLEN128 =
-      leaves.contains(IntrinsicCLeaf::E2M1E8M0I8VLEN128);
-  bool usesE2M1VLEN256 =
-      leaves.contains(IntrinsicCLeaf::E2M1E8M0I8VLEN256);
-  bool usesE2M1Scalable =
-      leaves.contains(IntrinsicCLeaf::E2M1E8M0I8Scalable);
+                           const SelectedLocalImplementations &implementations) {
+  auto fragment = [&](LocalPrimitiveKind primitive,
+                      LocalImplementationStructure structure,
+                      unsigned rows) {
+    LocalImplementation implementation;
+    implementation.primitive = primitive;
+    implementation.structure = structure;
+    implementation.parameters.rowMicrotile = rows;
+    implementation.parameters.semanticLanes = 16;
+    implementation.parameters.primaryShape = kRVVE8M1;
+    implementation.parameters.secondaryShape = kRVVE32M4;
+    return implementations.contains(implementation);
+  };
+  LocalImplementation f32Math;
+  f32Math.primitive = LocalPrimitiveKind::F32Math;
+  f32Math.structure =
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  f32Math.parameters.primaryShape = kRVVE32M2;
+  bool usesExp = implementations.contains(f32Math);
+  bool usesRVVSymmetricI4I8 = fragment(
+      LocalPrimitiveKind::SymmetricI4I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 1);
+  bool usesRVVAffineI4I8 = fragment(
+      LocalPrimitiveKind::AffineI4I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 1);
+  bool usesRVVSymmetricI4I8M4 = fragment(
+      LocalPrimitiveKind::SymmetricI4I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 4);
+  bool usesRVVAffineI4I8M4 = fragment(
+      LocalPrimitiveKind::AffineI4I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 4);
+  bool usesIME1SymmetricI4I8 = fragment(
+      LocalPrimitiveKind::SymmetricI4I8,
+      LocalImplementationStructure::SpacemitIME1Fragment, 1);
+  bool usesIME1AffineI4I8 = fragment(
+      LocalPrimitiveKind::AffineI4I8,
+      LocalImplementationStructure::SpacemitIME1Fragment, 1);
+  bool usesIME1SymmetricI4I8M4 = fragment(
+      LocalPrimitiveKind::SymmetricI4I8,
+      LocalImplementationStructure::SpacemitIME1Fragment, 4);
+  bool usesIME1AffineI4I8M4 = fragment(
+      LocalPrimitiveKind::AffineI4I8,
+      LocalImplementationStructure::SpacemitIME1Fragment, 4);
+  bool usesGroupedI4I8Strip = implementations.contains(
+      LocalPrimitiveKind::GroupedAffineI4I8,
+      LocalImplementationStructure::RVVStripLoop);
+  bool usesE2M1RegisterE8M1M2 = implementations.contains(
+      LocalPrimitiveKind::E2M1E8M0I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 32, {8, 8});
+  bool usesE2M1RegisterE8MF2 = implementations.contains(
+      LocalPrimitiveKind::E2M1E8M0I8,
+      LocalImplementationStructure::RVVRegisterMicrokernel, 32, {8, 4});
+  bool usesE2M1Strip = implementations.contains(
+      LocalPrimitiveKind::E2M1E8M0I8,
+      LocalImplementationStructure::RVVStripLoop);
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
               usesIME1SymmetricI4I8M4, usesIME1AffineI4I8M4,
-              usesGroupedI4I8VLEN128, usesGroupedI4I8VLEN256,
-              usesGroupedI4I8Scalable,
-              usesE2M1VLEN128, usesE2M1VLEN256, usesE2M1Scalable);
-  emitQuantIntrinsicCLeaves(output, leaves);
+              usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
+              usesE2M1RegisterE8MF2, usesE2M1Strip);
+  emitQuantLocalImplementations(output, implementations);
 }
 
 } // namespace weft::riscv_internal

@@ -14,14 +14,14 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
     return module.emitError(
         "the intrinsic C target requires RVV with an explicit fixed VLEN; no fallback backend is installed");
 
-  riscv_internal::SelectedIntrinsicCLeaves selectedLeaves;
+  riscv_internal::SelectedLocalImplementations selectedImplementations;
   std::string body;
   llvm::raw_string_ostream bodyOutput(body);
   if (mlir::failed(riscv_internal::compileRISCVKernelsToIntrinsicC(
-          module, options, bodyOutput, selectedLeaves)))
+          module, options, bodyOutput, selectedImplementations)))
     return mlir::failure();
   bodyOutput.flush();
-  riscv_internal::emitIntrinsicCPrelude(output, selectedLeaves);
+  riscv_internal::emitIntrinsicCPrelude(output, selectedImplementations);
   output << body;
   return mlir::success();
 }

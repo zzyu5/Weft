@@ -4,7 +4,7 @@
 
 namespace weft::riscv_internal {
 
-void emitIMEIntrinsicCLeaves(llvm::raw_ostream &output,
+void emitIMELocalImplementations(llvm::raw_ostream &output,
                              bool usesIME1SymmetricI4I8,
                              bool usesIME1AffineI4I8,
                              bool usesIME1SymmetricI4I8M4,

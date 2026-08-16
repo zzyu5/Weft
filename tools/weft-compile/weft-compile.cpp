@@ -151,17 +151,17 @@ int main(int argc, char **argv) {
       llvm::errs() << error << "\n";
       return 1;
     }
-    options.backend.vlaLMUL = vlaLMUL;
-    options.backend.dotLMUL = dotLMUL;
-    options.backend.dotKUnroll = dotKUnroll;
-    options.backend.f16InputLMUL = f16InputLMUL;
-    options.backend.f16RowMicrotile = f16RowMicrotile;
-    options.backend.f16ColumnMicrotile = f16ColumnMicrotile;
-    options.backend.f16KUnroll = f16KUnroll;
-    options.backend.f16PipelineStages = f16PipelineStages;
-    options.backend.reductionStatePlacement = reductionStatePlacement;
-    options.backend.narrowLMUL = narrowLMUL;
-    options.backend.sortRadixBits = sortRadixBits;
+    options.backend.parameters.vlaLMUL = vlaLMUL;
+    options.backend.parameters.dotLMUL = dotLMUL;
+    options.backend.parameters.dotKUnroll = dotKUnroll;
+    options.backend.parameters.f16InputLMUL = f16InputLMUL;
+    options.backend.parameters.f16RowMicrotile = f16RowMicrotile;
+    options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;
+    options.backend.parameters.f16KUnroll = f16KUnroll;
+    options.backend.parameters.f16PipelineStages = f16PipelineStages;
+    options.backend.structures.reductionStatePlacement = reductionStatePlacement;
+    options.backend.parameters.narrowLMUL = narrowLMUL;
+    options.backend.parameters.sortRadixBits = sortRadixBits;
     std::error_code headerError;
     llvm::ToolOutputFile header(headerFilename, headerError,
                                 llvm::sys::fs::OF_Text);

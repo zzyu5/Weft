@@ -4,11 +4,11 @@
 
 namespace weft::riscv_internal {
 
-void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
-                            bool fixedLanes64, bool scalable) {
-  if (fixedLanes64) {
+void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,
+                            bool registerL64, bool strip) {
+  if (registerL64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_lanes64(
+__weft_q6_k_i8_register_l64_e8m2(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -93,9 +93,9 @@ __weft_q6_k_i8_lanes64(
 }
 )c";
   }
-  if (fixedLanes32) {
+  if (registerL32) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_lanes32(
+__weft_q6_k_i8_register_l32_e8m2(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -206,9 +206,9 @@ __weft_q6_k_i8_lanes32(
 }
 )c";
   }
-  if (scalable) {
+  if (strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_rvv(
+__weft_q6_k_i8_strip(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {

@@ -1,11 +1,14 @@
 #include "RISCVPhysicalPlanning.h"
 
+#include "RISCVKernelFacts.h"
+
 #include "llvm/ADT/STLExtras.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <tuple>
 
 namespace weft::riscv_internal {
@@ -65,6 +68,19 @@ std::optional<unsigned> rvvMaskRatio(const RVVVectorShape &dataShape) {
              : std::nullopt;
 }
 
+std::optional<unsigned>
+rvvLaneCapacity(const RVVVectorShape &shape,
+                const RISCVTargetProfile &target) {
+  if (!shape || target.vlenBits <= 0 ||
+      !target.supportsVectorShape(shape.sew, shape.lmulEighths))
+    return std::nullopt;
+  const uint64_t bits = static_cast<uint64_t>(target.vlenBits) *
+                        static_cast<uint64_t>(shape.lmulEighths) / 8;
+  if (bits < shape.sew || bits % shape.sew != 0)
+    return std::nullopt;
+  return static_cast<unsigned>(bits / shape.sew);
+}
+
 RVVVectorShape rvvShape(unsigned sew, unsigned lmul) {
   return RVVVectorShape{sew, static_cast<int>(lmul * 8)};
 }
@@ -84,50 +100,606 @@ integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
   return candidates;
 }
 
+bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
+                        const RISCVTargetProfile &target) {
+  return elements > 0 && elementBytes > 0 &&
+         elements <= target.maxPrivateStackBytes /
+                         static_cast<int64_t>(elementBytes);
+}
+
+std::optional<int64_t>
+extendPrivateStorageElementCount(int64_t currentElements, int64_t extent,
+                                 unsigned elementBytes,
+                                 const RISCVTargetProfile &target) {
+  if (currentElements <= 0 || extent <= 0 || elementBytes == 0 ||
+      currentElements > target.maxPrivateStackBytes /
+                            static_cast<int64_t>(elementBytes) / extent)
+    return std::nullopt;
+  return currentElements * extent;
+}
+
+std::optional<LoadF16LEDecision>
+selectLoadF16LEPhysical(bool knownAligned,
+                        const RISCVTargetProfile &target) {
+  if (!target.littleEndian)
+    return std::nullopt;
+  return LoadF16LEDecision{
+      knownAligned ? LoadF16LERealization::ScalarAlignedHalf
+                   : LoadF16LERealization::ScalarBytes};
+}
+
+std::optional<SelectedBlockDecodePhysical>
+selectBlockDecodePhysical(const BlockDecodeCandidateFacts &facts,
+                          const RISCVTargetProfile &target) {
+  if (!target.hasRVV || target.vlenBits < 128 || facts.codeExtent != 16 ||
+      facts.tableExtent != 16 ||
+      !target.supportsVectorShape(kRVVE8M1.sew,
+                                  kRVVE8M1.lmulEighths))
+    return std::nullopt;
+  SelectedBlockDecodePhysical selected;
+  selected.codeShape = kRVVE8M1;
+  selected.tableShape = kRVVE8M1;
+  selected.resultShape = kRVVE8M1;
+  selected.tableExtent = facts.tableExtent;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups = 3;
+  selected.resources.primitiveGroups = 3;
+  selected.resources.peakGroups = 4;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
+std::optional<SelectedBlockOperationPhysical>
+selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
+                             const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !facts.byteShape ||
+      !target.supportsVectorShape(facts.byteShape.sew,
+                                  facts.byteShape.lmulEighths))
+    return std::nullopt;
+  auto sameLanes = [&](unsigned sew) {
+    return rvvShapeForSameLanes(facts.byteShape, sew, target);
+  };
+  SelectedBlockOperationPhysical selected;
+  switch (facts.operation) {
+  case BlockOperationSemantic::Axis:
+    selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+    break;
+  case BlockOperationSemantic::Load:
+    if (facts.resultType == BlockPhysicalType::U8)
+      selected.resultShape = facts.byteShape;
+    break;
+  case BlockOperationSemantic::Bitcast:
+    if (facts.targetType == BlockPhysicalType::I8)
+      selected.resultShape = facts.byteShape;
+    else if (facts.targetType == BlockPhysicalType::I16)
+      selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+    break;
+  case BlockOperationSemantic::Compare:
+    selected.resultShape = facts.lhsShape ? facts.lhsShape : facts.rhsShape;
+    selected.maskRatio = rvvMaskRatio(selected.resultShape).value_or(0);
+    if (!selected.resultShape || selected.maskRatio == 0)
+      return std::nullopt;
+    break;
+  case BlockOperationSemantic::Cast: {
+    RVVVectorShape sourceShape = facts.sourceShape;
+    if (!sourceShape && (facts.sourceType == BlockPhysicalType::U8 ||
+                         facts.sourceType == BlockPhysicalType::I8))
+      sourceShape = facts.byteShape;
+    if (!sourceShape && facts.sourceType == BlockPhysicalType::Index)
+      sourceShape = sameLanes(16).value_or(RVVVectorShape{});
+    unsigned targetSEW =
+        facts.targetType == BlockPhysicalType::U8
+            ? 8
+            : (facts.targetType == BlockPhysicalType::Index ||
+               facts.targetType == BlockPhysicalType::U16 ||
+               facts.targetType == BlockPhysicalType::I16)
+                  ? 16
+                  : (facts.targetType == BlockPhysicalType::I32 ||
+                     facts.targetType == BlockPhysicalType::F32)
+                        ? 32
+                        : 0;
+    if (targetSEW != 0)
+      selected.resultShape =
+          rvvShapeForSameLanes(sourceShape, targetSEW, target)
+              .value_or(RVVVectorShape{});
+    if (targetSEW != 0 && !selected.resultShape)
+      return std::nullopt;
+    if (facts.targetType == BlockPhysicalType::I32 &&
+        (facts.sourceType == BlockPhysicalType::U8 ||
+         facts.sourceType == BlockPhysicalType::I8)) {
+      selected.realization = BlockValueRealization::DeferredI32Widen;
+      selected.temporaryShape = selected.resultShape;
+    } else if (facts.targetType == BlockPhysicalType::I32 &&
+               facts.sourceType == BlockPhysicalType::U16) {
+      selected.temporaryShape = selected.resultShape;
+    } else if (facts.targetType == BlockPhysicalType::F32) {
+      selected.temporaryShape =
+          facts.sourceType == BlockPhysicalType::U16
+              ? sourceShape
+              : selected.resultShape == kRVVE32M1
+                    ? selected.resultShape
+                    : rvvShapeForSameLanes(sourceShape, 16, target)
+                          .value_or(RVVVectorShape{});
+      if (!selected.temporaryShape)
+        return std::nullopt;
+    }
+    break;
+  }
+  case BlockOperationSemantic::Binary:
+    selected.unsignedMaximum = facts.resultUnsignedMaximum;
+    if (facts.resultType == BlockPhysicalType::U8 &&
+        facts.binary == BlockBinarySemantic::ShiftRight && facts.shiftAmount &&
+        *facts.shiftAmount < 8)
+      selected.unsignedMaximum =
+          facts.lhsUnsignedMaximum.value_or(255) >> *facts.shiftAmount;
+    if (facts.resultType == BlockPhysicalType::Index)
+      selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+    else if (facts.resultType == BlockPhysicalType::U8) {
+      selected.resultShape = facts.byteShape;
+      if (facts.byteShape == kRVVE8MF4 &&
+          (facts.binary == BlockBinarySemantic::And ||
+           facts.binary == BlockBinarySemantic::ShiftRight))
+        selected.realization = BlockValueRealization::DeferredPackedTransform;
+    } else if (facts.resultType == BlockPhysicalType::U16) {
+      selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+    } else if (facts.resultType == BlockPhysicalType::I32) {
+      bool lhsSmallU8 = facts.lhsNarrowU8 &&
+                        facts.lhsUnsignedMaximum.value_or(256) <= 15;
+      bool rhsSmallU8 = facts.rhsNarrowU8 &&
+                        facts.rhsUnsignedMaximum.value_or(256) <= 15;
+      bool wideningProduct =
+          facts.binary == BlockBinarySemantic::Multiply &&
+          ((lhsSmallU8 && facts.rhsNarrowI8) ||
+           (rhsSmallU8 && facts.lhsNarrowI8));
+      if (wideningProduct) {
+        selected.realization = BlockValueRealization::WideningI8Product;
+        selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+        selected.temporaryShape = sameLanes(8).value_or(RVVVectorShape{});
+      } else {
+        selected.resultShape = sameLanes(32).value_or(RVVVectorShape{});
+      }
+    } else if (facts.resultType == BlockPhysicalType::F32) {
+      selected.resultShape =
+          facts.lhsShape && facts.lhsShape.sew == 32 ? facts.lhsShape
+          : facts.rhsShape && facts.rhsShape.sew == 32
+              ? facts.rhsShape
+              : RVVVectorShape{};
+    }
+    break;
+  case BlockOperationSemantic::Select:
+    if (facts.resultType == BlockPhysicalType::U8)
+      selected.resultShape = facts.byteShape;
+    else if (facts.resultType == BlockPhysicalType::Index)
+      selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
+    else if (facts.resultType == BlockPhysicalType::F32)
+      selected.resultShape = facts.trueShape ? facts.trueShape : facts.falseShape;
+    break;
+  case BlockOperationSemantic::Other:
+    break;
+  }
+  return selected;
+}
+
+std::optional<SelectedBlockStorePhysical>
+selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
+                         const RISCVTargetProfile &target) {
+  llvm::SmallVector<BlockStorePhysicalDecision> candidates;
+  if (facts.supportsMicroStripOperations &&
+      target.supportsVectorShape(kRVVE8MF4.sew,
+                                 kRVVE8MF4.lmulEighths))
+    candidates.push_back(BlockStorePhysicalDecision{
+        BlockStoreRealization::RVVMicroStrips, kRVVE8MF4, 4, false, {}});
+  if (facts.supportsStandardOperations &&
+      target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths)) {
+    candidates.push_back(BlockStorePhysicalDecision{
+        BlockStoreRealization::RVVFixedStrips, kRVVE8M1, 16, false, {}});
+    if (!facts.needsLaneVector ||
+        target.supportsVectorShape(kRVVE16M2.sew,
+                                   kRVVE16M2.lmulEighths))
+      candidates.push_back(BlockStorePhysicalDecision{
+          BlockStoreRealization::RVVDynamicStrips, kRVVE8M1, 16,
+          facts.needsLaneVector,
+          facts.needsLaneVector ? kRVVE16M2 : RVVVectorShape{}});
+  }
+  for (const BlockStorePhysicalDecision &candidate : candidates) {
+    if (candidate.realization == BlockStoreRealization::RVVMicroStrips &&
+        (facts.needsLaneVector || facts.extent != 32))
+      continue;
+    if (candidate.realization == BlockStoreRealization::RVVFixedStrips &&
+        (facts.needsLaneVector || facts.extent != 32))
+      continue;
+    unsigned dataGroups = candidate.byteShape == kRVVE8MF4 ? 4 : 8;
+    unsigned laneGroups = rvvRegisterGroups(candidate.laneShape);
+    PhysicalResourceBudget resources;
+    resources.architecturalGroups = target.vectorRegisters;
+    resources.valueGroups = dataGroups;
+    resources.memoryGroups = laneGroups;
+    resources.primitiveGroups = dataGroups + laneGroups;
+    resources.peakGroups = resources.primitiveGroups + 1;
+    if (resources.peakGroups >=
+        static_cast<unsigned>(target.vectorRegisters))
+      continue;
+    return SelectedBlockStorePhysical{candidate, resources};
+  }
+  return std::nullopt;
+}
+
+std::optional<SelectedBlockReducePhysical>
+selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
+                          const RISCVTargetProfile &target) {
+  if (!facts.supportsStandardOperations || !facts.inputShape ||
+      !target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths))
+    return std::nullopt;
+  BlockReducePhysicalDecision fixed{
+      BlockReduceRealization::RVVFixedStrips, 16, false, {}};
+  BlockReducePhysicalDecision dynamic{
+      BlockReduceRealization::RVVDynamicStrips, 16, facts.needsLaneVector,
+      facts.needsLaneVector ? kRVVE16M2 : RVVVectorShape{}};
+  llvm::SmallVector<BlockReducePhysicalDecision> candidates;
+  if (facts.extent == 16 && facts.inputShape.sew == 16) {
+    candidates.push_back(dynamic);
+    candidates.push_back(fixed);
+  } else {
+    candidates.push_back(fixed);
+    candidates.push_back(dynamic);
+  }
+  for (const BlockReducePhysicalDecision &candidate : candidates) {
+    if (candidate.needsLaneVector &&
+        !target.supportsVectorShape(candidate.laneShape.sew,
+                                    candidate.laneShape.lmulEighths))
+      continue;
+    if (candidate.realization == BlockReduceRealization::RVVFixedStrips &&
+        (facts.needsLaneVector || (facts.extent != 16 && facts.extent != 32)))
+      continue;
+
+    SelectedBlockReducePhysical selected;
+    selected.decision = candidate;
+    selected.inputShape = facts.inputShape;
+    selected.combinedShape = facts.inputShape;
+    if (candidate.realization == BlockReduceRealization::RVVFixedStrips &&
+        facts.inputShape.sew == 16) {
+      std::optional<RVVVectorShape> combined =
+          rvvShapeForSameLanes(facts.inputShape, 32, target);
+      if (!combined)
+        continue;
+      selected.combinedShape = *combined;
+      selected.wideningCombine = true;
+    }
+    selected.seedShape = RVVVectorShape{selected.combinedShape.sew, 8};
+    if (!target.supportsVectorShape(selected.seedShape.sew,
+                                    selected.seedShape.lmulEighths))
+      continue;
+
+    unsigned liveGroups = 8 + rvvRegisterGroups(candidate.laneShape) + 1;
+    selected.resources.architecturalGroups = target.vectorRegisters;
+    selected.resources.valueGroups = 8;
+    selected.resources.memoryGroups = rvvRegisterGroups(candidate.laneShape);
+    selected.resources.primitiveGroups = liveGroups;
+    selected.resources.peakGroups = liveGroups + 1;
+    if (selected.resources.peakGroups >=
+        static_cast<unsigned>(target.vectorRegisters))
+      continue;
+    return selected;
+  }
+  return std::nullopt;
+}
+
+std::optional<SelectedMaterializedBlockStorePhysical>
+selectMaterializedBlockStorePhysical(
+    const MaterializedBlockStoreCandidateFacts &facts,
+    const RISCVTargetProfile &target) {
+  SelectedMaterializedBlockStorePhysical selected;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.rows = facts.rows;
+  selected.columns = facts.columns;
+  if (facts.rank == 1 && facts.columns == 16 && facts.allActive &&
+      facts.unitStride) {
+    std::optional<RVVVectorShape> shape =
+        rvvShapeForSemanticLanes(32, 16, target);
+    if (!shape)
+      return std::nullopt;
+    selected.realization =
+        MaterializedBlockStoreRealization::RVVContiguousRankOne;
+    selected.vectorShape = *shape;
+    selected.resources.valueGroups = rvvRegisterGroups(*shape);
+    selected.resources.memoryGroups = selected.resources.valueGroups;
+    selected.resources.peakGroups = selected.resources.valueGroups + 1;
+  } else if (facts.rank == 1 && facts.columns > 0 &&
+             facts.prefixPredicated) {
+    selected.realization = MaterializedBlockStoreRealization::ScalarRankOne;
+  } else if (facts.rank == 2 && facts.rows > 0 && facts.columns > 0 &&
+             facts.prefixPredicated) {
+    selected.realization = MaterializedBlockStoreRealization::ScalarRankTwo;
+  } else {
+    return std::nullopt;
+  }
+  if (selected.resources.peakGroups >
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
+std::optional<SelectedSortIndicesPhysical>
+selectSortIndicesPhysical(const SortIndicesCandidateFacts &facts,
+                          const RISCVTargetProfile &target) {
+  if (!target.littleEndian || target.xlen != 64 || !target.hasRVV ||
+      (facts.configuredRadixBits != 0 && facts.configuredRadixBits != 8 &&
+       facts.configuredRadixBits != 11))
+    return std::nullopt;
+  SelectedSortIndicesPhysical selected;
+  selected.descending = facts.descending;
+  selected.radixBits = facts.configuredRadixBits == 0
+                           ? 8
+                           : static_cast<unsigned>(facts.configuredRadixBits);
+  selected.passes = (32 + selected.radixBits - 1) / selected.radixBits;
+  selected.privateElements = 2 * (int64_t{1} << selected.radixBits);
+  selected.privateAlignment = target.xlen / 8;
+  int64_t privateBytes = selected.privateElements * target.xlen / 8;
+  if (privateBytes > target.maxPrivateStackBytes)
+    return std::nullopt;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  return selected;
+}
+
+std::optional<SelectedVLAAccessPhysical>
+selectVLAAccessPhysical(const VLAAccessCandidateFacts &facts,
+                        const RISCVTargetProfile &target) {
+  if (!target.hasRVV || facts.relation == LaneRelation::Independent ||
+      facts.relation == LaneRelation::NonAffine ||
+      (facts.write && facts.relation == LaneRelation::Indexed))
+    return std::nullopt;
+  SelectedVLAAccessPhysical selected;
+  switch (facts.relation) {
+  case LaneRelation::UnitStride:
+    selected.memoryMode = VLAMemoryMode::UnitStride;
+    break;
+  case LaneRelation::Strided:
+    selected.memoryMode = VLAMemoryMode::Strided;
+    break;
+  case LaneRelation::Indexed:
+    if (!target.hasIndexedMemory)
+      return std::nullopt;
+    selected.memoryMode = VLAMemoryMode::Indexed;
+    selected.indexedSEW =
+        facts.indexedOffsetFromU32 ? 32 : static_cast<unsigned>(target.xlen);
+    if (selected.indexedSEW != 32 && selected.indexedSEW != 64)
+      return std::nullopt;
+    break;
+  case LaneRelation::Independent:
+  case LaneRelation::NonAffine:
+    return std::nullopt;
+  }
+  if (facts.predicateAllActive)
+    selected.activityMode = VLAActivityMode::AllActive;
+  else if (facts.predicateVector)
+    selected.activityMode = VLAActivityMode::PredicateMask;
+  else if (facts.predicateScalar)
+    selected.activityMode = VLAActivityMode::ScalarPredicate;
+  else
+    return std::nullopt;
+  if (facts.carriesLogicalValidity) {
+    if (selected.activityMode == VLAActivityMode::AllActive)
+      return std::nullopt;
+    selected.inactiveLane =
+        VLAInactiveLaneRealization::ZeroCarrierWithLogicalValidity;
+  }
+  return selected;
+}
+
+std::optional<SelectedVLASegment2Physical>
+selectVLASegment2Physical(bool load,
+                          const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasSegmentMemory)
+    return std::nullopt;
+  return SelectedVLASegment2Physical{
+      load ? VLASegment2AccessKind::Load : VLASegment2AccessKind::Store,
+      load};
+}
+
+std::optional<SelectedVLAPredicatePhysical>
+selectVLAPredicatePhysical(const VLAPredicateCandidateFacts &facts,
+                           const RISCVTargetProfile &target) {
+  if (!target.hasRVV || (!facts.affineIndex && !facts.vectorScalar))
+    return std::nullopt;
+  SelectedVLAPredicatePhysical selected;
+  if (facts.affineIndex) {
+    if (facts.coordinateRelation != LaneRelation::UnitStride &&
+        facts.coordinateRelation != LaneRelation::Strided)
+      return std::nullopt;
+    selected.realization = VLAPredicateRealization::RVVAffineIndexScalar;
+    selected.coordinateMode =
+        facts.coordinateRelation == LaneRelation::UnitStride
+            ? VLAMemoryMode::UnitStride
+            : VLAMemoryMode::Strided;
+    return selected;
+  }
+  if (facts.vectorSEW != 8 && facts.vectorSEW != 32 &&
+      facts.vectorSEW != static_cast<unsigned>(target.xlen))
+    return std::nullopt;
+  selected.realization = VLAPredicateRealization::RVVVectorScalar;
+  selected.vectorSEW = facts.vectorSEW;
+  return selected;
+}
+
+std::optional<VLAIndexBinaryRealization>
+selectVLAIndexBinaryPhysical(const VLAIndexBinaryCandidateFacts &facts) {
+  if ((!facts.lhsVector && !facts.rhsVector) || facts.scalarLeftDivision)
+    return std::nullopt;
+  return facts.lhsVector && facts.rhsVector
+             ? VLAIndexBinaryRealization::RVVUnsignedVectorVector
+             : VLAIndexBinaryRealization::RVVUnsignedVectorScalar;
+}
+
+std::optional<SelectedVLACastPhysical>
+selectVLACastPhysical(const VLACastCandidateFacts &facts,
+                      const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !facts.dataShape)
+    return std::nullopt;
+  SelectedVLACastPhysical selected;
+  unsigned sourceSEW = 0;
+  unsigned resultSEW = 0;
+  switch (facts.semantic) {
+  case VLACastSemantic::Identity:
+    selected.realization = VLACastRealization::RVVIdentity;
+    sourceSEW = resultSEW = facts.identitySEW;
+    break;
+  case VLACastSemantic::F16ToF32:
+    selected.realization = VLACastRealization::RVVWidenF16ToF32;
+    sourceSEW = 16;
+    resultSEW = 32;
+    break;
+  case VLACastSemantic::F32ToF16:
+    selected.realization = VLACastRealization::RVVNarrowF32ToF16;
+    sourceSEW = 32;
+    resultSEW = 16;
+    break;
+  case VLACastSemantic::U32ToIndex:
+    selected.realization = VLACastRealization::RVVZeroExtendU32ToIndex;
+    sourceSEW = resultSEW = 32;
+    break;
+  case VLACastSemantic::IndexToF32:
+    selected.realization = VLACastRealization::RVVIndexToF32;
+    sourceSEW = target.xlen;
+    resultSEW = 32;
+    break;
+  }
+  selected.sourceShape =
+      rvvShapeForSameLanes(facts.dataShape, sourceSEW, target)
+          .value_or(RVVVectorShape{});
+  selected.resultShape =
+      rvvShapeForSameLanes(facts.dataShape, resultSEW, target)
+          .value_or(RVVVectorShape{});
+  if (!selected.sourceShape || !selected.resultShape)
+    return std::nullopt;
+  return selected;
+}
+
+std::optional<VLAUnaryRealization>
+selectVLAUnaryPhysical(VLAUnarySemantic semantic,
+                       const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasF ||
+      !target.supportsVectorShape(kRVVE32M2.sew,
+                                  kRVVE32M2.lmulEighths))
+    return std::nullopt;
+  switch (semantic) {
+  case VLAUnarySemantic::Exp:
+    return VLAUnaryRealization::RVVExpPolynomial;
+  case VLAUnarySemantic::Tanh:
+    return VLAUnaryRealization::RVVTanhViaExp;
+  case VLAUnarySemantic::Sin:
+    return VLAUnaryRealization::RVVScalarLibmSin;
+  case VLAUnarySemantic::Cos:
+    return VLAUnaryRealization::RVVScalarLibmCos;
+  }
+  return std::nullopt;
+}
+
+std::optional<VLAStateRealization>
+selectVLAStatePhysical(VLAStateSemantic semantic,
+                       const RISCVTargetProfile &target) {
+  if (!target.hasRVV)
+    return std::nullopt;
+  switch (semantic) {
+  case VLAStateSemantic::F32AddReduction:
+    return target.hasF ? std::optional<VLAStateRealization>(
+                             VLAStateRealization::RVVAddReduction)
+                       : std::nullopt;
+  case VLAStateSemantic::F32MaxReduction:
+    return target.hasF ? std::optional<VLAStateRealization>(
+                             VLAStateRealization::RVVMaxReduction)
+                       : std::nullopt;
+  case VLAStateSemantic::I8AddReductionI32:
+    return target.hasWideningInteger
+               ? std::optional<VLAStateRealization>(
+                     VLAStateRealization::RVVI8AddReductionI32)
+               : std::nullopt;
+  case VLAStateSemantic::InclusiveAddScan:
+    return target.hasF ? std::optional<VLAStateRealization>(
+                             VLAStateRealization::RVVInclusiveAddScan)
+                       : std::nullopt;
+  case VLAStateSemantic::SegmentedInclusiveAddScan:
+    return target.hasF
+               ? std::optional<VLAStateRealization>(
+                     VLAStateRealization::RVVSegmentedInclusiveAddScan)
+               : std::nullopt;
+  case VLAStateSemantic::ArgMaxSummary:
+    return target.hasF ? std::optional<VLAStateRealization>(
+                             VLAStateRealization::RVVArgMaxSummary)
+                       : std::nullopt;
+  case VLAStateSemantic::OnlineSoftmaxSummary:
+    return target.hasF ? std::optional<VLAStateRealization>(
+                             VLAStateRealization::RVVOnlineSoftmaxSummary)
+                       : std::nullopt;
+  }
+  return std::nullopt;
+}
+
+std::optional<LocalImplementation>
+selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasF ||
+      !target.supportsVectorShape(kRVVE32M2.sew,
+                                  kRVVE32M2.lmulEighths))
+    return std::nullopt;
+  LocalImplementation implementation;
+  implementation.primitive = LocalPrimitiveKind::F32Math;
+  implementation.structure =
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  implementation.parameters.primaryShape = kRVVE32M2;
+  return implementation;
+}
+
+std::optional<SelectedVLALookupPhysical>
+selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
+                        const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasIndexedMemory || target.vlenBits < 128 ||
+      facts.tableExtent != 16 || !facts.tableF32 || !facts.resultF32 ||
+      !facts.indicesU8 || !facts.allActive)
+    return std::nullopt;
+  return SelectedVLALookupPhysical{VLALookupRealization::RVVTableGather,
+                                   facts.tableExtent};
+}
+
 std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
                            const RISCVTargetProfile &target) {
-  if (facts.rowTile != 1 && facts.rowTile != 4)
+  if (!target.littleEndian || (facts.rowTile != 1 && facts.rowTile != 4))
     return std::nullopt;
   SelectedI4I8FragmentPhysical selected;
-  if (facts.rowTile == 4 && target.supportsSpacemitIME1I4I8M4N16K32())
-    selected.realization =
-        I4I8FragmentRealization::SpacemiTIME1M4N16K32;
-  else if (facts.rowTile == 1 &&
-           target.supportsSpacemitIME1I4I8N16K32())
-    selected.realization = I4I8FragmentRealization::SpacemiTIME1N16K32;
-  else {
-  bool supportsRVV = target.hasF && target.hasVectorF16 &&
-                     target.hasWideningInteger && target.hasWideningFloat &&
-                     target.supportsVLENAtLeast(128) &&
-                     target.supportsVectorShape(8, 8) &&
-                     target.supportsVectorShape(16, 16) &&
-                     target.supportsVectorShape(32, 32);
-  if (!supportsRVV)
+  const bool ime =
+      facts.rowTile == 4
+          ? target.supportsSpacemitIME1I4I8M4N16K32()
+          : target.supportsSpacemitIME1I4I8N16K32();
+  const bool supportsRVV =
+      target.hasF && target.hasVectorF16 && target.hasWideningInteger &&
+      target.hasWideningFloat && target.supportsVLENAtLeast(128) &&
+      target.supportsVectorShape(8, 8) &&
+      target.supportsVectorShape(16, 16) &&
+      target.supportsVectorShape(32, 32);
+  if (!ime && !supportsRVV)
     return std::nullopt;
-    selected.realization = facts.rowTile == 4
-                               ? I4I8FragmentRealization::RVVM4N16K32
-                               : I4I8FragmentRealization::RVVN16K32;
-  }
 
-  selected.codeShape = facts.rowTile == 4
-                           ? rvvShape(8, target.vlenBits >= 256 ? 4 : 8)
-                           : selected.realization ==
-                                     I4I8FragmentRealization::SpacemiTIME1N16K32
-                                 ? kRVVE8MF4
-                                 : rvvShape(8, 2);
+  selected.implementation.primitive =
+      facts.affine ? LocalPrimitiveKind::AffineI4I8
+                   : LocalPrimitiveKind::SymmetricI4I8;
+  selected.implementation.structure =
+      ime ? LocalImplementationStructure::SpacemitIME1Fragment
+          : LocalImplementationStructure::RVVRegisterMicrokernel;
+  selected.implementation.parameters.rowMicrotile = facts.rowTile;
+  selected.implementation.parameters.semanticLanes = 16;
+  selected.codeShape = kRVVE8M1;
   selected.activationScaleShape = kRVVE32M1;
   selected.accumulatorShape = kRVVE32M4;
+  selected.implementation.parameters.primaryShape = selected.codeShape;
+  selected.implementation.parameters.secondaryShape =
+      selected.accumulatorShape;
   for (RVVVectorShape shape : {selected.codeShape,
                                selected.activationScaleShape,
                                selected.accumulatorShape})
     if (!target.supportsVectorShape(shape.sew, shape.lmulEighths))
       return std::nullopt;
 
-  bool ime = selected.realization ==
-                 I4I8FragmentRealization::SpacemiTIME1N16K32 ||
-             selected.realization ==
-                 I4I8FragmentRealization::SpacemiTIME1M4N16K32;
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.resources.valueGroups = facts.rowTile == 4 ? 20 : 4;
   selected.resources.memoryGroups = facts.rowTile == 4 ? 5 : 2;
@@ -145,21 +717,287 @@ std::optional<VLAStatePlacement>
 selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
                               const RISCVTargetProfile &target,
                               const RISCVBackendConfig &config) {
-  if (config.reductionStatePlacement < 0 ||
-      config.reductionStatePlacement > 2)
+  (void)target;
+  if (config.structures.reductionStatePlacement < 0 ||
+      config.structures.reductionStatePlacement > 2)
     return std::nullopt;
-  if (config.reductionStatePlacement == 2)
+  if (config.structures.reductionStatePlacement == 2)
     return facts.relaxedOrder
                ? std::optional<VLAStatePlacement>(
                      VLAStatePlacement::VectorCarry)
                : std::nullopt;
-  if (config.reductionStatePlacement == 1)
+  if (config.structures.reductionStatePlacement == 1)
     return VLAStatePlacement::ScalarCarry;
-  bool vectorCarry = facts.relaxedOrder;
-  if (target.vlenBits >= 256 && facts.reductionStateCount == 1)
-    vectorCarry = false;
-  return vectorCarry ? VLAStatePlacement::VectorCarry
-                     : VLAStatePlacement::ScalarCarry;
+  return facts.relaxedOrder && facts.reductionStateCount > 1
+             ? VLAStatePlacement::VectorCarry
+             : VLAStatePlacement::ScalarCarry;
+}
+
+std::optional<SelectedVLAEntityPhysical>
+selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
+                        const RISCVTargetProfile &target) {
+  if ((facts.dataSEW != 16 && facts.dataSEW != 32) || !target.hasRVV ||
+      target.vectorRegisters <= 0)
+    return std::nullopt;
+  if (facts.requiredDataShape &&
+      (facts.requiredDataShape.sew != facts.dataSEW ||
+       !target.supportsVectorShape(facts.requiredDataShape.sew,
+                                   facts.requiredDataShape.lmulEighths)))
+    return std::nullopt;
+
+  std::optional<unsigned> requiredLMUL;
+  for (unsigned lmul : facts.requiredLMULs) {
+    if (lmul == 0 ||
+        !target.supportsVectorShape(facts.dataSEW,
+                                    static_cast<int>(lmul * 8)) ||
+        (requiredLMUL && *requiredLMUL != lmul))
+      return std::nullopt;
+    requiredLMUL = lmul;
+  }
+
+  llvm::SmallVector<unsigned> candidates =
+      integerLMULCandidates(target, facts.dataSEW);
+  if (requiredLMUL) {
+    candidates = {*requiredLMUL};
+  } else {
+    unsigned desiredLanes = 16;
+    if (facts.dataSEW == 16 || facts.hasFloatCast ||
+        facts.hasReductionState || facts.hasNarrow)
+      desiredLanes = 32;
+    if (facts.hasOrderedScan || facts.hasF32Division)
+      desiredLanes = 8;
+    llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
+      auto score = [&](unsigned candidate) {
+        const std::optional<unsigned> lanes =
+            rvvLaneCapacity(rvvShape(facts.dataSEW, candidate), target);
+        if (!lanes)
+          return std::numeric_limits<unsigned>::max();
+        unsigned value = static_cast<unsigned>(std::abs(
+            static_cast<int>(*lanes) - static_cast<int>(desiredLanes)));
+        value += facts.stridedAccesses * candidate;
+        value += facts.indexedAccesses * 2 * candidate;
+        return value;
+      };
+      unsigned lhsScore = score(lhs);
+      unsigned rhsScore = score(rhs);
+      return lhsScore != rhsScore ? lhsScore < rhsScore : lhs > rhs;
+    });
+  }
+
+  for (unsigned candidate : candidates) {
+    RVVVectorShape dataShape = rvvShape(facts.dataSEW, candidate);
+    if (facts.requiredDataShape && dataShape != facts.requiredDataShape)
+      continue;
+    const bool needsIndexShape =
+        facts.hasAffinePredicate || facts.hasIndexVector;
+    if (needsIndexShape &&
+        (candidate * 8 * static_cast<unsigned>(target.xlen)) %
+                facts.dataSEW !=
+            0)
+      continue;
+    if (needsIndexShape &&
+        candidate * static_cast<unsigned>(target.xlen) / facts.dataSEW > 8)
+      continue;
+    if (needsIndexShape &&
+        !target.supportsVectorShape(
+            static_cast<unsigned>(target.xlen),
+            static_cast<int>(candidate * static_cast<unsigned>(target.xlen) /
+                             facts.dataSEW * 8)))
+      continue;
+    if (facts.indexedAccesses != 0 &&
+        ((candidate * facts.maxIndexedOffsetSEW) % facts.dataSEW != 0 ||
+         candidate * facts.maxIndexedOffsetSEW / facts.dataSEW > 8))
+      continue;
+
+    bool elementShapesLegal =
+        llvm::all_of(facts.accessElementSEWs, [&](unsigned sew) {
+          if (sew == 16 && !target.hasVectorF16)
+            return false;
+          if (sew == 0 || (candidate * 8 * sew) % facts.dataSEW != 0)
+            return false;
+          return target.supportsVectorShape(
+              sew, static_cast<int>(candidate * 8 * sew / facts.dataSEW));
+        });
+    if (!elementShapesLegal)
+      continue;
+    bool indexedShapesLegal =
+        llvm::all_of(facts.indexedMemory,
+                     [&](const VLAIndexedMemoryFact &memory) {
+          std::optional<RVVVectorShape> elementShape =
+              rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+          std::optional<RVVVectorShape> indexShape =
+              rvvShapeForSameLanes(dataShape, memory.offsetSEW, target);
+          return elementShape && indexShape &&
+                 target.supportsIndexedVectorMemory(
+                     elementShape->sew, elementShape->lmulEighths,
+                     indexShape->sew, indexShape->lmulEighths);
+        });
+    if (!indexedShapesLegal)
+      continue;
+    if ((facts.segmentLoadPairs != 0 || facts.segmentStorePairs != 0) &&
+        !target.supportsSegmentVectorMemory(2, 32,
+                                            static_cast<int>(candidate * 8)))
+      continue;
+
+    unsigned carriedStateGroups = 0;
+    unsigned transientStateGroups = 0;
+    for (const VLAStateResourceFact &state : facts.states) {
+      switch (state.kind) {
+      case VLAStateResourceKind::InclusiveAddScan:
+        transientStateGroups =
+            std::max(transientStateGroups, 3 * candidate + 1);
+        break;
+      case VLAStateResourceKind::SegmentedInclusiveAddScan:
+        transientStateGroups =
+            std::max(transientStateGroups, 4 * candidate + 2);
+        break;
+      case VLAStateResourceKind::Reduction:
+        if (state.placement == VLAStatePlacement::VectorCarry) {
+          carriedStateGroups += candidate;
+          transientStateGroups =
+              std::max(transientStateGroups, std::max(candidate, 2u));
+        } else {
+          transientStateGroups =
+              std::max(transientStateGroups, candidate + 2);
+        }
+        break;
+      case VLAStateResourceKind::I8AddReductionI32:
+        transientStateGroups =
+            std::max(transientStateGroups,
+                     std::max(1u, candidate / 4) + 1);
+        break;
+      case VLAStateResourceKind::ArgMaxSummary:
+        transientStateGroups =
+            std::max(transientStateGroups, candidate + 2);
+        break;
+      case VLAStateResourceKind::OnlineSoftmaxSummary:
+        transientStateGroups =
+            std::max(transientStateGroups, 3 * candidate + 2);
+        break;
+      }
+    }
+    unsigned stateGroups = carriedStateGroups + transientStateGroups;
+    unsigned primitiveGroups = stateGroups;
+
+    std::optional<VLANarrowPhysical> narrow;
+    if (facts.hasNarrow) {
+      if (facts.dataSEW != 32)
+        continue;
+      std::optional<RVVVectorShape> intermediateShape =
+          rvvShapeForSameLanes(dataShape, 16, target);
+      std::optional<RVVVectorShape> resultShape =
+          rvvShapeForSameLanes(dataShape, 8, target);
+      if (!intermediateShape || !resultShape)
+        continue;
+      VLANarrowPhysical selected;
+      selected.sourceShape = dataShape;
+      selected.intermediateShape = *intermediateShape;
+      selected.resultShape = *resultShape;
+      selected.resources.architecturalGroups = target.vectorRegisters;
+      selected.resources.valueGroups = rvvRegisterGroups(dataShape);
+      selected.resources.primitiveGroups =
+          rvvRegisterGroups(dataShape) +
+          rvvRegisterGroups(*intermediateShape) +
+          rvvRegisterGroups(*resultShape);
+      selected.resources.peakGroups =
+          selected.resources.primitiveGroups + 1;
+      primitiveGroups =
+          std::max(primitiveGroups, selected.resources.primitiveGroups);
+      narrow = selected;
+    }
+
+    for (const PhysicalResourceBudget &resource :
+         facts.localPrimitiveResources)
+      primitiveGroups =
+          std::max(primitiveGroups, resource.primitiveGroups);
+
+    unsigned indexGroups = 0;
+    if (facts.indexedAccesses != 0)
+      indexGroups =
+          candidate * facts.maxIndexedOffsetSEW / facts.dataSEW;
+
+    auto groupsFor = [&](unsigned sew, unsigned count) {
+      if (count == 0)
+        return 0u;
+      unsigned scaled = candidate * 8 * sew;
+      if (scaled % facts.dataSEW != 0)
+        return static_cast<unsigned>(target.vectorRegisters);
+      int lmulEighths = static_cast<int>(scaled / facts.dataSEW);
+      if (!target.supportsVectorShape(sew, lmulEighths))
+        return static_cast<unsigned>(target.vectorRegisters);
+      return count * rvvRegisterGroups(RVVVectorShape{sew, lmulEighths});
+    };
+    unsigned valueGroups = 0;
+    unsigned predicateGroups = 0;
+    for (const VLAValueLifetimeSnapshot &snapshot : facts.lifetimes) {
+      unsigned snapshotGroups =
+          groupsFor(32, snapshot.f32) + groupsFor(16, snapshot.f16) +
+          groupsFor(8, snapshot.byte) + groupsFor(32, snapshot.u32) +
+          groupsFor(static_cast<unsigned>(target.xlen), snapshot.index) +
+          snapshot.mask;
+      valueGroups = std::max(valueGroups, snapshotGroups);
+      predicateGroups = std::max(predicateGroups, snapshot.mask);
+    }
+
+    unsigned memoryGroups = indexGroups;
+    memoryGroups +=
+        2 * candidate *
+        std::max(facts.segmentLoadPairs, facts.segmentStorePairs);
+
+    unsigned lookupGroups = 0;
+    if (facts.lookupCount != 0) {
+      std::optional<RVVVectorShape> codeShape =
+          rvvShapeForSameLanes(dataShape, 8, target);
+      std::optional<RVVVectorShape> index16Shape =
+          rvvShapeForSameLanes(dataShape, 16, target);
+      std::optional<RVVVectorShape> index32Shape =
+          rvvShapeForSameLanes(dataShape, 32, target);
+      if (!codeShape || !index16Shape || !index32Shape)
+        continue;
+      unsigned conversionGroups = rvvRegisterGroups(*codeShape) +
+                                  rvvRegisterGroups(*index16Shape) +
+                                  rvvRegisterGroups(*index32Shape);
+      unsigned gatherGroups = 3 * rvvRegisterGroups(*index32Shape);
+      lookupGroups = std::max(conversionGroups, gatherGroups);
+      primitiveGroups = std::max(primitiveGroups, lookupGroups);
+    }
+
+    unsigned sharedGroups = valueGroups + memoryGroups;
+    unsigned requiredGroups =
+        std::max(sharedGroups, primitiveGroups + memoryGroups);
+    unsigned peakGroups = requiredGroups + 1;
+    for (const PhysicalResourceBudget &resource :
+         facts.localPrimitiveResources) {
+      unsigned handoffGroups = memoryGroups + predicateGroups;
+      peakGroups =
+          std::max(peakGroups,
+                   std::max(resource.peakGroups,
+                            resource.primitiveGroups + handoffGroups + 1));
+    }
+    if (peakGroups >= static_cast<unsigned>(target.vectorRegisters))
+      continue;
+
+    SelectedVLAEntityPhysical selected;
+    selected.dataShape = dataShape;
+    if (needsIndexShape)
+      selected.indexShape =
+          rvvShapeForSameLanes(dataShape, target.xlen, target)
+              .value_or(RVVVectorShape{});
+    selected.maskRatio = rvvMaskRatio(dataShape).value_or(0);
+    if (selected.maskRatio == 0)
+      continue;
+    selected.narrow = narrow;
+    selected.resources.architecturalGroups = target.vectorRegisters;
+    selected.resources.valueGroups = valueGroups;
+    selected.resources.memoryGroups = memoryGroups;
+    selected.resources.indexGroups = indexGroups;
+    selected.resources.predicateGroups = predicateGroups;
+    selected.resources.stateGroups = stateGroups;
+    selected.resources.primitiveGroups = primitiveGroups;
+    selected.resources.peakGroups = peakGroups;
+    return selected;
+  }
+  return std::nullopt;
 }
 
 std::optional<SelectedSignBitI8Physical>
@@ -203,7 +1041,7 @@ std::optional<SelectedTernaryI8DotPhysical>
 selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
-      (target.vlenBits != 128 && target.vlenBits != 256))
+      target.vlenBits < 128)
     return std::nullopt;
 
   std::optional<RVVVectorShape> byte32 =
@@ -219,11 +1057,20 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
 
+  if (*byte32 != RVVVectorShape{8, 16} &&
+      *byte32 != RVVVectorShape{8, 8})
+    return std::nullopt;
+
   SelectedTernaryI8DotPhysical selected;
-  selected.realization =
-      target.vlenBits == 128
-          ? TernaryI8DotRealization::RVVVLEN128LocalBlockDot
-          : TernaryI8DotRealization::RVVVLEN256LocalBlockDot;
+  selected.implementation.primitive =
+      facts.semantic == TernaryI8DotSemantic::Base3Digits
+          ? LocalPrimitiveKind::Base3TernaryI8
+          : LocalPrimitiveKind::PackedI2TernaryI8;
+  selected.implementation.structure =
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  selected.implementation.parameters.semanticLanes = 32;
+  selected.implementation.parameters.primaryShape = *byte32;
+  selected.implementation.parameters.secondaryShape = *byte16;
   selected.byteShape32 = *byte32;
   selected.byteShape16 = *byte16;
   selected.widenedShape32 = *widened32;
@@ -253,9 +1100,14 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
 std::optional<SelectedCodebookGatherI8Physical>
 selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
                                const RISCVTargetProfile &target) {
+  const bool supportedPrimitive =
+      facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
+      facts.primitive == LocalPrimitiveKind::SignedCodebook4I8 ||
+      facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8 ||
+      facts.primitive == LocalPrimitiveKind::PackedU11GridDeltaI8;
   if (!target.hasRVV || !target.hasIndexedMemory ||
       !target.hasWideningInteger || !target.littleEndian ||
-      (target.vlenBits != 128 && target.vlenBits != 256) ||
+      target.vlenBits < 128 || !supportedPrimitive ||
       (facts.entryWidth != 4 && facts.entryWidth != 8))
     return std::nullopt;
 
@@ -285,11 +1137,18 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
           indexShape->lmulEighths))
     return std::nullopt;
 
+  if (*activationShape != RVVVectorShape{8, 16} &&
+      *activationShape != RVVVectorShape{8, 8})
+    return std::nullopt;
+
   SelectedCodebookGatherI8Physical selected;
-  selected.realization =
-      target.vlenBits == 128
-          ? CodebookGatherI8Realization::RVVVLEN128GatherDot
-          : CodebookGatherI8Realization::RVVVLEN256GatherDot;
+  selected.implementation.primitive = facts.primitive;
+  selected.implementation.structure =
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  selected.implementation.parameters.semanticLanes = 32;
+  selected.implementation.parameters.entryWidth = facts.entryWidth;
+  selected.implementation.parameters.primaryShape = *activationShape;
+  selected.implementation.parameters.secondaryShape = *tableShape;
   selected.entryWidth = facts.entryWidth;
   selected.codeShape = *codeShape;
   selected.indexShape = *indexShape;
@@ -318,27 +1177,33 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
 std::optional<SelectedNibbleCodebookI8Physical>
 selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
-      (target.vlenBits != 128 && target.vlenBits != 256))
+      target.vlenBits < 128)
     return std::nullopt;
   std::optional<RVVVectorShape> packedShape =
       rvvShapeForSemanticLanes(8, 16, target);
   std::optional<RVVVectorShape> activationShape =
       rvvShapeForSemanticLanes(8, 32, target);
+  if (!activationShape ||
+      (*activationShape != RVVVectorShape{8, 16} &&
+       *activationShape != RVVVectorShape{8, 8}))
+    return std::nullopt;
+  const bool combined = *activationShape == RVVVectorShape{8, 16};
   std::optional<RVVVectorShape> productShape =
-      rvvShapeForSemanticLanes(16, target.vlenBits == 128 ? 32 : 16, target);
+      rvvShapeForSemanticLanes(16, combined ? 32 : 16, target);
   if (!packedShape || !activationShape || !productShape ||
       !target.supportsVectorShape(kRVVE32M1.sew,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
 
   SelectedNibbleCodebookI8Physical selected;
-  selected.realization =
-      target.vlenBits == 128
-          ? NibbleCodebookI8Realization::RVVVLEN128TableDot
-          : NibbleCodebookI8Realization::RVVVLEN256TableDot;
+  selected.implementation.primitive = LocalPrimitiveKind::NibbleCodebookI8;
+  selected.implementation.structure =
+      LocalImplementationStructure::RVVRegisterMicrokernel;
+  selected.implementation.parameters.semanticLanes = 32;
+  selected.implementation.parameters.primaryShape = *activationShape;
+  selected.implementation.parameters.secondaryShape = *packedShape;
   selected.packedShape = *packedShape;
-  selected.tableShape =
-      target.vlenBits == 128 ? *activationShape : *packedShape;
+  selected.tableShape = combined ? *activationShape : *packedShape;
   selected.activationShape = *activationShape;
   selected.productShape = *productShape;
   selected.reductionShape = kRVVE32M1;
@@ -348,8 +1213,8 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
       rvvRegisterGroups(selected.tableShape) +
       rvvRegisterGroups(*activationShape);
   selected.resources.memoryGroups = selected.resources.valueGroups;
-  unsigned productGroups = rvvRegisterGroups(*productShape) *
-                           (target.vlenBits == 128 ? 1 : 2);
+  unsigned productGroups =
+      rvvRegisterGroups(*productShape) * (combined ? 1 : 2);
   selected.resources.primitiveGroups =
       rvvRegisterGroups(*packedShape) +
       rvvRegisterGroups(selected.tableShape) +
@@ -369,38 +1234,108 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     return std::nullopt;
   if (facts.semanticExtent == 0)
     return std::nullopt;
-  SelectedQuantI8DotPhysical selected;
-  selected.semanticLanes =
-      std::min(facts.semanticExtent, target.vlenBits >= 256 ? 64u : 32u);
-  std::optional<RVVVectorShape> byteShape =
-      rvvShapeForSemanticLanes(8, selected.semanticLanes, target);
-  if (!byteShape)
-    return std::nullopt;
-  selected.byteShape = *byteShape;
-  selected.reductionSegments = selected.semanticLanes / 16;
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups = rvvRegisterGroups(*byteShape) * 2;
-  selected.resources.memoryGroups = selected.resources.valueGroups;
-
-  bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI4 ||
-                   facts.semantic == QuantI8DotSemantic::PackedI5 ||
-                   facts.semantic == QuantI8DotSemantic::PackedI3Grouped ||
-                   facts.semantic == QuantI8DotSemantic::IQ2S ||
-                   facts.semantic == QuantI8DotSemantic::Q6K ||
-                   facts.semantic == QuantI8DotSemantic::IQ1M ||
-                   (facts.semantic == QuantI8DotSemantic::IQ3S &&
-                    selected.semanticLanes == 64);
-  unsigned fixedPeak = 4 * selected.reductionSegments +
-                       4 * rvvRegisterGroups(*byteShape);
-  if (fixedLeaf && fixedPeak < static_cast<unsigned>(target.vectorRegisters)) {
-    selected.realization =
-        QuantI8DotRealization::RVVFixedLaneLocalBlockDot;
-    selected.resources.primitiveGroups = fixedPeak;
-  } else {
-    selected.realization =
-        QuantI8DotRealization::RVVScalableLocalBlockDot;
-    selected.resources.primitiveGroups = 6;
+  LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
+  switch (facts.semantic) {
+  case QuantI8DotSemantic::PackedI4:
+    primitive = LocalPrimitiveKind::PackedI4I8;
+    break;
+  case QuantI8DotSemantic::PackedI5:
+    primitive = LocalPrimitiveKind::PackedI5I8;
+    break;
+  case QuantI8DotSemantic::PackedI3Grouped:
+    primitive = LocalPrimitiveKind::PackedI3GroupedI8;
+    break;
+  case QuantI8DotSemantic::IQ2S:
+    primitive = LocalPrimitiveKind::IQ2SI8;
+    break;
+  case QuantI8DotSemantic::IQ3S:
+    primitive = LocalPrimitiveKind::IQ3SI8;
+    break;
+  case QuantI8DotSemantic::IQ1M:
+    primitive = LocalPrimitiveKind::IQ1MI8;
+    break;
+  case QuantI8DotSemantic::Q6K:
+    primitive = LocalPrimitiveKind::Q6KI8;
+    break;
   }
+
+  llvm::SmallVector<unsigned> laneCandidates;
+  for (unsigned lanes : {64u, 32u})
+    if (lanes <= facts.semanticExtent && facts.semanticExtent % lanes == 0)
+      laneCandidates.push_back(lanes);
+  if (laneCandidates.empty())
+    return std::nullopt;
+
+  for (unsigned lanes : laneCandidates) {
+    std::optional<RVVVectorShape> byteShape =
+        rvvShapeForSemanticLanes(8, lanes, target);
+    if (!byteShape)
+      continue;
+    const unsigned segments = lanes / 16;
+    const unsigned registerGroups = rvvRegisterGroups(*byteShape);
+    const unsigned registerPeak = 4 * segments + 4 * registerGroups;
+    const bool registerImplementation =
+        facts.semantic == QuantI8DotSemantic::PackedI4 ||
+        facts.semantic == QuantI8DotSemantic::PackedI5 ||
+        facts.semantic == QuantI8DotSemantic::PackedI3Grouped ||
+        facts.semantic == QuantI8DotSemantic::IQ2S ||
+        facts.semantic == QuantI8DotSemantic::Q6K ||
+        facts.semantic == QuantI8DotSemantic::IQ1M ||
+        (facts.semantic == QuantI8DotSemantic::IQ3S && lanes == 64);
+    const bool shapeHasEmitter =
+        ((facts.semantic == QuantI8DotSemantic::PackedI4 ||
+          facts.semantic == QuantI8DotSemantic::PackedI5) &&
+         lanes == 32 &&
+         (*byteShape == RVVVectorShape{8, 16} ||
+          *byteShape == RVVVectorShape{8, 8})) ||
+        (facts.semantic == QuantI8DotSemantic::PackedI3Grouped &&
+         (lanes == 32 || lanes == 64) &&
+         *byteShape == RVVVectorShape{8, 16}) ||
+        ((facts.semantic == QuantI8DotSemantic::IQ2S ||
+          facts.semantic == QuantI8DotSemantic::IQ1M ||
+          facts.semantic == QuantI8DotSemantic::Q6K ||
+          facts.semantic == QuantI8DotSemantic::IQ3S) &&
+         *byteShape == RVVVectorShape{8, 16});
+    if (registerImplementation && shapeHasEmitter &&
+        registerPeak < static_cast<unsigned>(target.vectorRegisters)) {
+      SelectedQuantI8DotPhysical selected;
+      selected.implementation.primitive = primitive;
+      selected.implementation.structure =
+          LocalImplementationStructure::RVVRegisterMicrokernel;
+      selected.implementation.parameters.semanticLanes = lanes;
+      selected.implementation.parameters.primaryShape = *byteShape;
+      selected.semanticLanes = lanes;
+      selected.byteShape = *byteShape;
+      selected.reductionSegments = segments;
+      selected.resources.architecturalGroups = target.vectorRegisters;
+      selected.resources.valueGroups = registerGroups * 2;
+      selected.resources.memoryGroups = selected.resources.valueGroups;
+      selected.resources.primitiveGroups = registerPeak;
+      selected.resources.peakGroups = registerPeak;
+      return selected;
+    }
+  }
+
+  if (facts.semantic == QuantI8DotSemantic::PackedI4 ||
+      facts.semantic == QuantI8DotSemantic::PackedI5 ||
+      facts.semantic == QuantI8DotSemantic::PackedI3Grouped)
+    return std::nullopt;
+  const RVVVectorShape stripShape{8, 16};
+  if (!target.supportsVectorShape(stripShape.sew, stripShape.lmulEighths) ||
+      !target.supportsVectorShape(16, 32))
+    return std::nullopt;
+  SelectedQuantI8DotPhysical selected;
+  selected.implementation.primitive = primitive;
+  selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
+  selected.implementation.parameters.semanticLanes = 16;
+  selected.implementation.parameters.primaryShape = stripShape;
+  selected.semanticLanes = 16;
+  selected.byteShape = stripShape;
+  selected.reductionSegments = 1;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups = rvvRegisterGroups(stripShape) * 2;
+  selected.resources.memoryGroups = selected.resources.valueGroups;
+  selected.resources.primitiveGroups = 6;
   selected.resources.peakGroups = selected.resources.primitiveGroups;
   if (selected.resources.peakGroups >
       static_cast<unsigned>(target.vectorRegisters))
@@ -413,38 +1348,63 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
   if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian)
     return std::nullopt;
 
-  SelectedE2M1E8M0I8Physical selected;
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  if (target.vlenBits == 128 && target.supportsVectorShape(8, 8) &&
-      target.supportsVectorShape(8, 16) &&
-      target.supportsVectorShape(16, 32)) {
-    selected.realization = E2M1E8M0I8Realization::RVVVLEN128TableDot;
-    selected.packedShape = RVVVectorShape{8, 8};
-    selected.activationShape = RVVVectorShape{8, 16};
-    selected.resources.primitiveGroups = 12;
-  } else if (target.vlenBits == 256 &&
-             target.supportsVectorShape(8, 4) &&
-             target.supportsVectorShape(16, 8)) {
-    selected.realization = E2M1E8M0I8Realization::RVVVLEN256TableDot;
-    selected.packedShape = RVVVectorShape{8, 4};
-    selected.activationShape = RVVVectorShape{8, 4};
-    selected.resources.primitiveGroups = 8;
-  } else if (target.vlenBits > 128 &&
-             target.supportsVectorShape(8, 8) &&
-             target.supportsVectorShape(16, 16)) {
-    selected.realization =
-        E2M1E8M0I8Realization::RVVScalableLocalBlockDot;
-    selected.packedShape = RVVVectorShape{8, 8};
-    selected.activationShape = RVVVectorShape{8, 8};
-    selected.resources.primitiveGroups = 4;
-  } else {
-    return std::nullopt;
+  struct Candidate {
+    RVVVectorShape packed;
+    RVVVectorShape activation;
+    unsigned primitiveGroups;
+  };
+  llvm::SmallVector<Candidate> candidates = {
+      {{8, 4}, {8, 4}, 8},
+      {{8, 8}, {8, 16}, 12},
+  };
+  for (const Candidate &candidate : candidates) {
+    const std::optional<unsigned> packedLanes =
+        rvvLaneCapacity(candidate.packed, target);
+    const std::optional<unsigned> activationLanes =
+        rvvLaneCapacity(candidate.activation, target);
+    if (!packedLanes || !activationLanes || *packedLanes < 16 ||
+        *activationLanes < 16 ||
+        !target.supportsVectorShape(16,
+                                    candidate.activation.lmulEighths * 2))
+      continue;
+    SelectedE2M1E8M0I8Physical selected;
+    selected.implementation.primitive = LocalPrimitiveKind::E2M1E8M0I8;
+    selected.implementation.structure =
+        LocalImplementationStructure::RVVRegisterMicrokernel;
+    selected.implementation.parameters.semanticLanes = 32;
+    selected.implementation.parameters.primaryShape = candidate.packed;
+    selected.implementation.parameters.secondaryShape = candidate.activation;
+    selected.packedShape = candidate.packed;
+    selected.activationShape = candidate.activation;
+    selected.resources.architecturalGroups = target.vectorRegisters;
+    selected.resources.primitiveGroups = candidate.primitiveGroups;
+    selected.resources.valueGroups =
+        rvvRegisterGroups(selected.packedShape) +
+        rvvRegisterGroups(selected.activationShape);
+    selected.resources.memoryGroups = selected.resources.valueGroups;
+    selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
+    if (selected.resources.peakGroups <=
+        static_cast<unsigned>(target.vectorRegisters))
+      return selected;
   }
 
+  const RVVVectorShape stripShape{8, 8};
+  if (!target.supportsVectorShape(stripShape.sew, stripShape.lmulEighths) ||
+      !target.supportsVectorShape(16, 16))
+    return std::nullopt;
+  SelectedE2M1E8M0I8Physical selected;
+  selected.implementation.primitive = LocalPrimitiveKind::E2M1E8M0I8;
+  selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
+  selected.implementation.parameters.semanticLanes = 0;
+  selected.implementation.parameters.primaryShape = stripShape;
+  selected.packedShape = stripShape;
+  selected.activationShape = stripShape;
+  selected.resources.architecturalGroups = target.vectorRegisters;
   selected.resources.valueGroups =
       rvvRegisterGroups(selected.packedShape) +
       rvvRegisterGroups(selected.activationShape);
   selected.resources.memoryGroups = selected.resources.valueGroups;
+  selected.resources.primitiveGroups = 4;
   selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
   if (selected.resources.peakGroups >
       static_cast<unsigned>(target.vectorRegisters))
@@ -453,9 +1413,14 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
 }
 
 std::optional<SelectedGroupedAffineI4I8Physical>
-selectGroupedAffineI4I8Physical(const RISCVTargetProfile &target) {
+selectGroupedAffineI4I8Physical(
+    const GroupedAffineI4I8CandidateFacts &facts,
+    const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasWideningInteger ||
       target.vlenBits < 128 || !target.littleEndian)
+    return std::nullopt;
+  if (facts.packedExtent != 128 || facts.scaleExtent != 12 ||
+      facts.activationExtent != 256 || facts.activationSumExtent != 32)
     return std::nullopt;
 
   std::optional<RVVVectorShape> scaleShape =
@@ -466,38 +1431,23 @@ selectGroupedAffineI4I8Physical(const RISCVTargetProfile &target) {
     return std::nullopt;
 
   SelectedGroupedAffineI4I8Physical selected;
+  selected.implementation.primitive = LocalPrimitiveKind::GroupedAffineI4I8;
+  selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
+  selected.implementation.parameters.semanticLanes = 32;
+  selected.implementation.parameters.primaryShape = kRVVE8M1;
+  selected.implementation.parameters.secondaryShape = kRVVE16M2;
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.scaleShape = *scaleShape;
   selected.activationSumShape = *activationSumShape;
-  if (target.vlenBits == 128 && target.supportsVectorShape(8, 8) &&
-      target.supportsVectorShape(16, 16) &&
-      target.supportsVectorShape(32, 8)) {
-    selected.realization =
-        GroupedAffineI4I8Realization::RVVVLEN128GroupedDot;
-    selected.packedShape = RVVVectorShape{8, 8};
-    selected.activationShape = RVVVectorShape{8, 8};
-    selected.resources.primitiveGroups = 32;
-  } else if (target.vlenBits == 256 &&
-             target.supportsVectorShape(8, 8) &&
-             target.supportsVectorShape(16, 16) &&
-             target.supportsVectorShape(32, 8)) {
-    selected.realization =
-        GroupedAffineI4I8Realization::RVVVLEN256GroupedDot;
-    selected.packedShape = RVVVectorShape{8, 8};
-    selected.activationShape = RVVVectorShape{8, 8};
-    selected.resources.primitiveGroups = 8;
-  } else if (target.vlenBits > 128 &&
-             target.supportsVectorShape(8, 8) &&
-             target.supportsVectorShape(16, 16) &&
-             target.supportsVectorShape(32, 8)) {
-    selected.realization =
-        GroupedAffineI4I8Realization::RVVScalableLocalBlockDot;
-    selected.packedShape = RVVVectorShape{8, 8};
-    selected.activationShape = RVVVectorShape{8, 8};
-    selected.resources.primitiveGroups = 6;
-  } else {
+  if (!target.supportsVectorShape(8, 8) ||
+      !target.supportsVectorShape(16, 16) ||
+      !target.supportsVectorShape(32, 8))
     return std::nullopt;
-  }
+  selected.packedShape = kRVVE8M1;
+  selected.activationShape = kRVVE8M1;
+  selected.widenedShape = kRVVE16M2;
+  selected.reductionShape = kRVVE32M1;
+  selected.resources.primitiveGroups = 6;
 
   selected.resources.valueGroups =
       rvvRegisterGroups(selected.packedShape) +
@@ -512,7 +1462,7 @@ selectGroupedAffineI4I8Physical(const RISCVTargetProfile &target) {
   return selected;
 }
 
-std::optional<F32DotPhysicalConfig>
+std::optional<SelectedF32DotPhysical>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config) {
@@ -522,38 +1472,39 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
   llvm::SmallVector<unsigned> lmulCandidates =
       integerLMULCandidates(target, 32);
   llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
-  if (config.dotLMUL != 0)
-    lmulCandidates = {static_cast<unsigned>(config.dotLMUL)};
-  if (config.dotKUnroll != 0)
-    unrollCandidates = {static_cast<unsigned>(config.dotKUnroll)};
+  if (config.parameters.dotLMUL != 0)
+    lmulCandidates = {static_cast<unsigned>(config.parameters.dotLMUL)};
+  if (config.parameters.dotKUnroll != 0)
+    unrollCandidates = {
+        static_cast<unsigned>(config.parameters.dotKUnroll)};
 
-  bool wideVector = target.vlenBits >= 256;
-  unsigned preferredLMUL =
+  const unsigned desiredLanes =
       facts.model == F32DotResourceModel::VLAFreeAxis
-          ? (facts.rowTile == 1 ? 4 : 2)
-          : (wideVector ? 2 : (facts.rowTile >= 8 ? 1 : 2));
+          ? (facts.rowTile == 1 ? 16 : 8)
+          : (facts.rowTile >= 8 ? 4 : 8);
   unsigned preferredUnroll = 1;
   bool costlyHandoff = facts.materializedInit || facts.reductionPredicate ||
                        facts.indexedOperands != 0;
-  if (!costlyHandoff) {
-    if (facts.model == F32DotResourceModel::VLAFreeAxis)
-      preferredUnroll = facts.rowTile == 1 ? 1 : (wideVector ? 4 : 2);
-    else if (wideVector)
-      preferredUnroll =
-          facts.rowTile >= 8 ? 2 : facts.rowTile <= 4 ? 4 : 1;
-  }
+  if (!costlyHandoff && facts.reductionExtent)
+    preferredUnroll = *facts.reductionExtent >= 64
+                          ? 4
+                          : *facts.reductionExtent >= 32 ? 2 : 1;
 
   struct Candidate {
-    F32DotPhysicalConfig physical;
+    F32DotParameters parameters;
+    PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned memoryPenalty = 0;
-    unsigned lmulPenalty = 0;
+    unsigned lanePenalty = 0;
     unsigned unrollPenalty = 0;
     unsigned peakGroups = 0;
   };
   llvm::SmallVector<Candidate> legal;
   for (unsigned lmul : lmulCandidates) {
-    if (!target.supportsVectorShape(32, static_cast<int>(lmul * 8)))
+    const RVVVectorShape vectorShape = rvvShape(32, lmul);
+    const std::optional<unsigned> laneCapacity =
+        rvvLaneCapacity(vectorShape, target);
+    if (!laneCapacity)
       continue;
     for (unsigned unroll : unrollCandidates) {
       if (!legalUnroll(unroll))
@@ -568,15 +1519,23 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                             facts.stateGroups + facts.handoffGroups + 1;
       if (peakGroups > static_cast<unsigned>(target.vectorRegisters))
         continue;
+      PhysicalResourceBudget resources;
+      resources.architecturalGroups = target.vectorRegisters;
+      resources.valueGroups = accumulatorGroups;
+      resources.memoryGroups = memoryGroups;
+      resources.predicateGroups = facts.predicateGroups;
+      resources.stateGroups = facts.stateGroups;
+      resources.primitiveGroups = primitiveGroups;
+      resources.peakGroups = peakGroups;
       legal.push_back(Candidate{
-          F32DotPhysicalConfig{lmul, unroll},
+          F32DotParameters{lmul, unroll}, resources,
           static_cast<unsigned>(facts.reductionExtent &&
                                 *facts.reductionExtent % unroll != 0),
           facts.stridedOperands * unroll +
               2 * facts.indexedOperands * unroll + facts.predicateGroups +
               facts.handoffGroups,
-          static_cast<unsigned>(std::abs(static_cast<int>(lmul) -
-                                         static_cast<int>(preferredLMUL))),
+          static_cast<unsigned>(std::abs(static_cast<int>(*laneCapacity) -
+                                         static_cast<int>(desiredLanes))),
           static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
                                          static_cast<int>(preferredUnroll))),
           peakGroups});
@@ -585,28 +1544,41 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.tailPenalty, lhs.memoryPenalty, lhs.lmulPenalty,
+    return std::tie(lhs.tailPenalty, lhs.memoryPenalty, lhs.lanePenalty,
                     lhs.unrollPenalty, lhs.peakGroups) <
-           std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lmulPenalty,
+           std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lanePenalty,
                     rhs.unrollPenalty, rhs.peakGroups);
   });
-  return legal.front().physical;
+  const F32DotStructure structure =
+      facts.model == F32DotResourceModel::LocalRow
+          ? F32DotStructure::RVVLocalRowMicrokernel
+          : facts.vlaVectorFreeAxis ? F32DotStructure::RVVVLAVectorDot
+                                    : F32DotStructure::RVVVLAMicrotile;
+  return SelectedF32DotPhysical{structure, legal.front().parameters,
+                                legal.front().resources};
 }
 
 std::optional<SelectedF16MatmulPhysical>
 selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                               const RISCVTargetProfile &target,
                               const RISCVBackendConfig &config) {
+  if (!target.hasRVV || !target.hasF || !target.hasVectorF16 ||
+      !target.hasWideningFloat)
+    return std::nullopt;
+  const unsigned baseInputLanes =
+      rvvLaneCapacity(rvvShape(16, 1), target).value_or(0);
+  if (baseInputLanes == 0)
+    return std::nullopt;
+  const unsigned preferredRows =
+      std::min(facts.rowTile, std::max(1u, baseInputLanes / 4));
   llvm::SmallVector<unsigned> rowCandidates;
-  if (config.f16RowMicrotile != 0) {
-    rowCandidates.push_back(static_cast<unsigned>(config.f16RowMicrotile));
+  if (config.parameters.f16RowMicrotile != 0) {
+    rowCandidates.push_back(
+        static_cast<unsigned>(config.parameters.f16RowMicrotile));
   } else {
     for (unsigned rows = facts.rowTile; rows > 0; --rows)
       if (facts.rowTile % rows == 0)
         rowCandidates.push_back(rows);
-    unsigned preferredRows = target.vlenBits >= 256
-                                 ? std::min(4u, facts.rowTile)
-                                 : std::min(2u, facts.rowTile);
     auto preferred = llvm::find(rowCandidates, preferredRows);
     if (preferred != rowCandidates.end())
       std::rotate(rowCandidates.begin(), preferred, std::next(preferred));
@@ -614,19 +1586,22 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
 
   llvm::SmallVector<unsigned> lmulCandidates =
       integerLMULCandidates(target, 16, 4);
-  if (config.f16InputLMUL != 0)
-    lmulCandidates = {static_cast<unsigned>(config.f16InputLMUL)};
+  if (config.parameters.f16InputLMUL != 0)
+    lmulCandidates = {
+        static_cast<unsigned>(config.parameters.f16InputLMUL)};
   llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
-  if (config.f16KUnroll != 0)
-    unrollCandidates = {static_cast<unsigned>(config.f16KUnroll)};
+  if (config.parameters.f16KUnroll != 0)
+    unrollCandidates = {
+        static_cast<unsigned>(config.parameters.f16KUnroll)};
   llvm::SmallVector<unsigned> stageCandidates = {1, 2};
-  if (config.f16PipelineStages != 0)
-    stageCandidates = {static_cast<unsigned>(config.f16PipelineStages)};
+  if (config.parameters.f16PipelineStages != 0)
+    stageCandidates = {
+        static_cast<unsigned>(config.parameters.f16PipelineStages)};
 
   llvm::SmallVector<unsigned> columnCandidates;
-  if (config.f16ColumnMicrotile != 0) {
+  if (config.parameters.f16ColumnMicrotile != 0) {
     columnCandidates.push_back(
-        static_cast<unsigned>(config.f16ColumnMicrotile));
+        static_cast<unsigned>(config.parameters.f16ColumnMicrotile));
   } else {
     columnCandidates.push_back(1);
     if (facts.columnTile >= 2 && facts.columnTile % 2 == 0)
@@ -635,15 +1610,16 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
 
   const unsigned preferredLMUL = 1;
   const unsigned preferredUnroll =
-      facts.reductionTile < 32 ? 1 : target.vlenBits >= 256 ? 4 : 2;
+      facts.reductionTile < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
   const unsigned preferredStages = 1;
   const unsigned preferredColumns =
-      target.vlenBits < 256 && facts.columnTile >= 2 &&
+      baseInputLanes <= 8 && facts.columnTile >= 2 &&
               facts.columnTile % 2 == 0
           ? 2
           : 1;
   struct Candidate {
-    F16MatmulPhysicalConfig physical;
+    F16MatmulStructure structure;
+    F16MatmulParameters parameters;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned rowPenalty = 0;
@@ -666,25 +1642,23 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                                       static_cast<int>(2 * inputLMUL * 8)))
         continue;
       unsigned computeLMUL = 2 * inputLMUL;
-      unsigned lanes =
-          static_cast<unsigned>(target.vlenBits * inputLMUL / 16);
-      if (lanes == 0)
+      const std::optional<unsigned> laneCapacity =
+          rvvLaneCapacity(rvvShape(16, inputLMUL), target);
+      if (!laneCapacity)
         continue;
+      const unsigned lanes = *laneCapacity;
       for (unsigned unroll : unrollCandidates) {
         if (unroll != 1 && unroll != 2 && unroll != 4)
           continue;
         for (unsigned stages : stageCandidates) {
           if ((stages != 1 && stages != 2) || (stages == 2 && unroll < 2))
             continue;
-          F16MatmulPhysicalConfig physical;
-          physical.rowMicrotile = rows;
-          physical.columnMicrotile = columns;
-          physical.inputLMUL = inputLMUL;
-          physical.kUnroll = unroll;
-          physical.pipelineStages = stages;
-          physical.loadSchedule =
-              stages == 2 ? F16MatmulLoadSchedule::BatchLoadsThenCompute
-                          : F16MatmulLoadSchedule::StreamRHSThenRows;
+          F16MatmulParameters parameters;
+          parameters.rowMicrotile = rows;
+          parameters.columnMicrotile = columns;
+          parameters.inputLMUL = inputLMUL;
+          parameters.kUnroll = unroll;
+          parameters.pipelineStages = stages;
           PhysicalResourceBudget resources;
           resources.architecturalGroups = target.vectorRegisters;
           resources.valueGroups = rows * columns * computeLMUL;
@@ -699,15 +1673,16 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
               static_cast<unsigned>(target.vectorRegisters))
             continue;
           legal.push_back(Candidate{
-              physical,
+              stages == 2
+                  ? F16MatmulStructure::PipelinedRegisterMicrokernel
+                  : F16MatmulStructure::StreamedRegisterMicrokernel,
+              parameters,
               resources,
               static_cast<unsigned>(facts.reductionTile % (unroll * lanes) !=
                                     0),
               static_cast<unsigned>(std::abs(
                   static_cast<int>(rows) -
-                  static_cast<int>(target.vlenBits >= 256
-                                       ? std::min(4u, facts.rowTile)
-                                       : std::min(2u, facts.rowTile)))),
+                  static_cast<int>(preferredRows))),
               static_cast<unsigned>(std::abs(
                   static_cast<int>(columns) -
                   static_cast<int>(preferredColumns))),
@@ -734,7 +1709,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.unrollPenalty, rhs.stagePenalty,
                     rhs.resources.peakGroups);
   });
-  return SelectedF16MatmulPhysical{legal.front().physical,
+  return SelectedF16MatmulPhysical{legal.front().structure,
+                                  legal.front().parameters,
                                   legal.front().resources};
 }
 

@@ -4,13 +4,13 @@
 
 namespace weft::riscv_internal {
 
-void emitTernaryIntrinsicCLeaves(llvm::raw_ostream &output,
-                                 bool base3VLEN128, bool base3VLEN256,
-                                 bool packedI2VLEN128,
-                                 bool packedI2VLEN256) {
-  if (base3VLEN128) {
+void emitTernaryLocalImplementations(llvm::raw_ostream &output,
+                                 bool base3E8M2, bool base3E8M1,
+                                 bool packedI2E8M2,
+                                 bool packedI2E8M1) {
+  if (base3E8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_base3_ternary_i8_vl128(
+__weft_base3_ternary_i8_register_l32_e8m2(
     const uint8_t *codes, const uint8_t *high_digits,
     const uint8_t *activation_bytes, float weight_scale,
     float activation_scale, float init) {
@@ -102,9 +102,9 @@ __weft_base3_ternary_i8_vl128(
 )c";
   }
 
-  if (base3VLEN256) {
+  if (base3E8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_base3_ternary_i8_vl256(
+__weft_base3_ternary_i8_register_l32_e8m1(
     const uint8_t *codes, const uint8_t *high_digits,
     const uint8_t *activation_bytes, float weight_scale,
     float activation_scale, float init) {
@@ -196,9 +196,9 @@ __weft_base3_ternary_i8_vl256(
 )c";
   }
 
-  if (packedI2VLEN128) {
+  if (packedI2E8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i2_ternary_i8_vl128(
+__weft_packed_i2_ternary_i8_register_l32_e8m2(
     const uint8_t *codes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
@@ -229,9 +229,9 @@ __weft_packed_i2_ternary_i8_vl128(
 )c";
   }
 
-  if (packedI2VLEN256) {
+  if (packedI2E8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i2_ternary_i8_vl256(
+__weft_packed_i2_ternary_i8_register_l32_e8m1(
     const uint8_t *codes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
   const int8_t *activation = (const int8_t *)(const void *)activation_bytes;

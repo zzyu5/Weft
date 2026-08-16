@@ -45,82 +45,78 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 
 } // namespace
 
-void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
-                               const SelectedIntrinsicCLeaves &leaves) {
-  bool iq2FixedLanes32 =
-      leaves.contains(IntrinsicCLeaf::IQ2SI8FixedLanes32);
-  bool iq2FixedLanes64 =
-      leaves.contains(IntrinsicCLeaf::IQ2SI8FixedLanes64);
-  bool iq2Scalable = leaves.contains(IntrinsicCLeaf::IQ2SI8Scalable);
-  bool iq3FixedLanes64 =
-      leaves.contains(IntrinsicCLeaf::IQ3SI8FixedLanes64);
-  bool iq3Scalable = leaves.contains(IntrinsicCLeaf::IQ3SI8Scalable);
-  bool iq1FixedLanes32 =
-      leaves.contains(IntrinsicCLeaf::IQ1MI8FixedLanes32);
-  bool iq1FixedLanes64 =
-      leaves.contains(IntrinsicCLeaf::IQ1MI8FixedLanes64);
-  bool iq1Scalable = leaves.contains(IntrinsicCLeaf::IQ1MI8Scalable);
-  bool q6FixedLanes32 =
-      leaves.contains(IntrinsicCLeaf::Q6KI8FixedLanes32);
-  bool q6FixedLanes64 =
-      leaves.contains(IntrinsicCLeaf::Q6KI8FixedLanes64);
-  bool q6Scalable = leaves.contains(IntrinsicCLeaf::Q6KI8Scalable);
-  bool packedI4VLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedI4I8VLEN128);
-  bool packedI4VLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedI4I8VLEN256);
-  bool packedI5VLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN128);
-  bool packedI5VLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN256);
-  bool packedI3GroupedVLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedI3GroupedI8VLEN128);
-  bool packedI3GroupedVLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedI3GroupedI8VLEN256);
-  bool nibbleCodebookVLEN128 =
-      leaves.contains(IntrinsicCLeaf::NibbleCodebookI8VLEN128);
-  bool nibbleCodebookVLEN256 =
-      leaves.contains(IntrinsicCLeaf::NibbleCodebookI8VLEN256);
-  bool base3VLEN128 =
-      leaves.contains(IntrinsicCLeaf::Base3TernaryI8VLEN128);
-  bool base3VLEN256 =
-      leaves.contains(IntrinsicCLeaf::Base3TernaryI8VLEN256);
-  bool packedI2VLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedI2TernaryI8VLEN128);
-  bool packedI2VLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedI2TernaryI8VLEN256);
-  bool signedCodebook8VLEN128 =
-      leaves.contains(IntrinsicCLeaf::SignedCodebook8I8VLEN128);
-  bool signedCodebook8VLEN256 =
-      leaves.contains(IntrinsicCLeaf::SignedCodebook8I8VLEN256);
-  bool signedCodebook4VLEN128 =
-      leaves.contains(IntrinsicCLeaf::SignedCodebook4I8VLEN128);
-  bool signedCodebook4VLEN256 =
-      leaves.contains(IntrinsicCLeaf::SignedCodebook4I8VLEN256);
-  bool packedU9U7CodebookVLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedU9U7CodebookI8VLEN128);
-  bool packedU9U7CodebookVLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedU9U7CodebookI8VLEN256);
-  bool packedU11GridDeltaVLEN128 =
-      leaves.contains(IntrinsicCLeaf::PackedU11GridDeltaI8VLEN128);
-  bool packedU11GridDeltaVLEN256 =
-      leaves.contains(IntrinsicCLeaf::PackedU11GridDeltaI8VLEN256);
-  if (!iq2FixedLanes32 && !iq2FixedLanes64 && !iq2Scalable &&
-      !iq3FixedLanes64 && !iq3Scalable && !iq1FixedLanes32 &&
-      !iq1FixedLanes64 && !iq1Scalable && !q6FixedLanes32 &&
-      !q6FixedLanes64 && !q6Scalable && !packedI4VLEN128 &&
-      !packedI4VLEN256 && !packedI5VLEN128 && !packedI5VLEN256 &&
-      !packedI3GroupedVLEN128 && !packedI3GroupedVLEN256 &&
-      !nibbleCodebookVLEN128 && !nibbleCodebookVLEN256 &&
-      !base3VLEN128 && !base3VLEN256 &&
-      !packedI2VLEN128 && !packedI2VLEN256 &&
-      !signedCodebook8VLEN128 && !signedCodebook8VLEN256 &&
-      !signedCodebook4VLEN128 && !signedCodebook4VLEN256 &&
-      !packedU9U7CodebookVLEN128 && !packedU9U7CodebookVLEN256 &&
-      !packedU11GridDeltaVLEN128 && !packedU11GridDeltaVLEN256)
+void emitQuantLocalImplementations(llvm::raw_ostream &output,
+                                   const SelectedLocalImplementations &selected) {
+  auto reg = [&](LocalPrimitiveKind primitive, unsigned lanes,
+                 RVVVectorShape shape) {
+    return selected.contains(
+        primitive, LocalImplementationStructure::RVVRegisterMicrokernel,
+        lanes, shape);
+  };
+  auto strip = [&](LocalPrimitiveKind primitive) {
+    return selected.contains(primitive,
+                             LocalImplementationStructure::RVVStripLoop);
+  };
+  const bool iq2Register32 = reg(LocalPrimitiveKind::IQ2SI8, 32, {8, 16});
+  const bool iq2Register64 = reg(LocalPrimitiveKind::IQ2SI8, 64, {8, 16});
+  const bool iq2Strip = strip(LocalPrimitiveKind::IQ2SI8);
+  const bool iq3Register64 = reg(LocalPrimitiveKind::IQ3SI8, 64, {8, 16});
+  const bool iq3Strip = strip(LocalPrimitiveKind::IQ3SI8);
+  const bool iq1Register32 = reg(LocalPrimitiveKind::IQ1MI8, 32, {8, 16});
+  const bool iq1Register64 = reg(LocalPrimitiveKind::IQ1MI8, 64, {8, 16});
+  const bool iq1Strip = strip(LocalPrimitiveKind::IQ1MI8);
+  const bool q6Register32 = reg(LocalPrimitiveKind::Q6KI8, 32, {8, 16});
+  const bool q6Register64 = reg(LocalPrimitiveKind::Q6KI8, 64, {8, 16});
+  const bool q6Strip = strip(LocalPrimitiveKind::Q6KI8);
+  const bool packedI4E8M2 = reg(LocalPrimitiveKind::PackedI4I8, 32, {8, 16});
+  const bool packedI4E8M1 = reg(LocalPrimitiveKind::PackedI4I8, 32, {8, 8});
+  const bool packedI5E8M2 = reg(LocalPrimitiveKind::PackedI5I8, 32, {8, 16});
+  const bool packedI5E8M1 = reg(LocalPrimitiveKind::PackedI5I8, 32, {8, 8});
+  const bool packedI3L32 =
+      reg(LocalPrimitiveKind::PackedI3GroupedI8, 32, {8, 16});
+  const bool packedI3L64 =
+      reg(LocalPrimitiveKind::PackedI3GroupedI8, 64, {8, 16});
+  const bool nibbleE8M2 =
+      reg(LocalPrimitiveKind::NibbleCodebookI8, 32, {8, 16});
+  const bool nibbleE8M1 =
+      reg(LocalPrimitiveKind::NibbleCodebookI8, 32, {8, 8});
+  const bool base3E8M2 =
+      reg(LocalPrimitiveKind::Base3TernaryI8, 32, {8, 16});
+  const bool base3E8M1 =
+      reg(LocalPrimitiveKind::Base3TernaryI8, 32, {8, 8});
+  const bool packedI2E8M2 =
+      reg(LocalPrimitiveKind::PackedI2TernaryI8, 32, {8, 16});
+  const bool packedI2E8M1 =
+      reg(LocalPrimitiveKind::PackedI2TernaryI8, 32, {8, 8});
+  const bool signed8E8M2 =
+      reg(LocalPrimitiveKind::SignedCodebook8I8, 32, {8, 16});
+  const bool signed8E8M1 =
+      reg(LocalPrimitiveKind::SignedCodebook8I8, 32, {8, 8});
+  const bool signed4E8M2 =
+      reg(LocalPrimitiveKind::SignedCodebook4I8, 32, {8, 16});
+  const bool signed4E8M1 =
+      reg(LocalPrimitiveKind::SignedCodebook4I8, 32, {8, 8});
+  const bool packedU9U7E8M2 =
+      reg(LocalPrimitiveKind::PackedU9U7CodebookI8, 32, {8, 16});
+  const bool packedU9U7E8M1 =
+      reg(LocalPrimitiveKind::PackedU9U7CodebookI8, 32, {8, 8});
+  const bool packedU11E8M2 =
+      reg(LocalPrimitiveKind::PackedU11GridDeltaI8, 32, {8, 16});
+  const bool packedU11E8M1 =
+      reg(LocalPrimitiveKind::PackedU11GridDeltaI8, 32, {8, 8});
+  if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
+      !iq3Register64 && !iq3Strip && !iq1Register32 &&
+      !iq1Register64 && !iq1Strip && !q6Register32 &&
+      !q6Register64 && !q6Strip && !packedI4E8M2 && !packedI4E8M1 &&
+      !packedI5E8M2 && !packedI5E8M1 && !packedI3L32 && !packedI3L64 &&
+      !nibbleE8M2 && !nibbleE8M1 && !base3E8M2 && !base3E8M1 &&
+      !packedI2E8M2 && !packedI2E8M1 && !signed8E8M2 &&
+      !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
+      !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
+      !packedU11E8M1)
     return;
 
-  if (iq2Scalable || iq3Scalable || iq1Scalable || q6Scalable) {
+  if (iq2Strip || iq3Strip || iq1Strip || q6Strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) int32_t
 __weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
   int32_t result = 0;
@@ -139,7 +135,7 @@ __weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
 }
 )c";
   }
-  if (iq1FixedLanes32) {
+  if (iq1Register32) {
     output << R"c(static inline __attribute__((always_inline, unused)) vuint16m1_t
 __weft_get_u16m2_u16m1(vuint16m2_t value, size_t segment) {
   return segment == 0 ? __riscv_vget_v_u16m2_u16m1(value, 0)
@@ -165,35 +161,29 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
 )c";
   }
 
-  if (iq1FixedLanes32 || iq1FixedLanes64 || iq1Scalable)
+  if (iq1Register32 || iq1Register64 || iq1Strip)
     emitI64Table(output, "__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
-  if (iq2FixedLanes32 || iq2FixedLanes64 || iq2Scalable)
+  if (iq2Register32 || iq2Register64 || iq2Strip)
     emitI64Table(output, "__weft_iq2_s_grid", __weft_iq2_s_grid, 1024);
-  if (iq3FixedLanes64 || iq3Scalable)
+  if (iq3Register64 || iq3Strip)
     emitI32Table(output, "__weft_iq3_s_grid", __weft_iq3_s_grid, 512);
 
-  emitIQ2IntrinsicCLeaves(output, iq2FixedLanes32, iq2FixedLanes64,
-                          iq2Scalable);
-  emitIQ3IntrinsicCLeaves(output, iq3FixedLanes64, iq3Scalable);
-  emitIQ1IntrinsicCLeaves(output, iq1FixedLanes32, iq1FixedLanes64,
-                          iq1Scalable);
-  emitQ6IntrinsicCLeaves(output, q6FixedLanes32, q6FixedLanes64,
-                         q6Scalable);
-  emitPackedI4IntrinsicCLeaves(output, packedI4VLEN128, packedI4VLEN256);
-  emitPackedI5IntrinsicCLeaves(output, packedI5VLEN128, packedI5VLEN256);
-  emitPackedI3GroupedIntrinsicCLeaves(
-      output, packedI3GroupedVLEN128, packedI3GroupedVLEN256);
-  emitNibbleCodebookIntrinsicCLeaves(output, nibbleCodebookVLEN128,
-                                     nibbleCodebookVLEN256);
-  emitTernaryIntrinsicCLeaves(output, base3VLEN128, base3VLEN256,
-                              packedI2VLEN128, packedI2VLEN256);
-  emitSignedCodebookIntrinsicCLeaves(
-      output, signedCodebook8VLEN128, signedCodebook8VLEN256,
-      signedCodebook4VLEN128, signedCodebook4VLEN256);
-  emitPackedU9U7CodebookIntrinsicCLeaves(
-      output, packedU9U7CodebookVLEN128, packedU9U7CodebookVLEN256);
-  emitPackedU11GridDeltaIntrinsicCLeaves(
-      output, packedU11GridDeltaVLEN128, packedU11GridDeltaVLEN256);
+  emitIQ2LocalImplementations(output, iq2Register32, iq2Register64, iq2Strip);
+  emitIQ3LocalImplementations(output, iq3Register64, iq3Strip);
+  emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
+  emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
+  emitPackedI4LocalImplementations(output, packedI4E8M2, packedI4E8M1);
+  emitPackedI5LocalImplementations(output, packedI5E8M2, packedI5E8M1);
+  emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
+  emitNibbleCodebookLocalImplementations(output, nibbleE8M2, nibbleE8M1);
+  emitTernaryLocalImplementations(output, base3E8M2, base3E8M1,
+                                  packedI2E8M2, packedI2E8M1);
+  emitSignedCodebookLocalImplementations(
+      output, signed8E8M2, signed8E8M1, signed4E8M2, signed4E8M1);
+  emitPackedU9U7CodebookLocalImplementations(
+      output, packedU9U7E8M2, packedU9U7E8M1);
+  emitPackedU11GridDeltaLocalImplementations(
+      output, packedU11E8M2, packedU11E8M1);
 }
 
 } // namespace weft::riscv_internal

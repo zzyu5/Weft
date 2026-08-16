@@ -4,11 +4,11 @@
 
 namespace weft::riscv_internal {
 
-void emitIQ3IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes64,
-                             bool scalable) {
-  if (fixedLanes64) {
+void emitIQ3LocalImplementations(llvm::raw_ostream &output, bool registerL64,
+                             bool strip) {
+  if (registerL64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq3_s_i8_lanes64(
+__weft_iq3_s_i8_register_l64_e8m2(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,
@@ -77,9 +77,9 @@ __weft_iq3_s_i8_lanes64(
 }
 )c";
   }
-  if (scalable) {
+  if (strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_iq3_s_i8_rvv(
+__weft_iq3_s_i8_strip(
     const uint8_t *codes, const uint8_t *high_bits,
     const uint8_t *sign_bits, const uint8_t *scales,
     const uint8_t *activation_bytes, float weight_scale,

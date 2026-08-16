@@ -4,11 +4,11 @@
 
 namespace weft::riscv_internal {
 
-void emitPackedI4IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
-                                  bool vlen256) {
-  if (vlen128) {
+void emitPackedI4LocalImplementations(llvm::raw_ostream &output, bool registerE8M2,
+                                  bool registerE8M1) {
+  if (registerE8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i4_i8_vl128(
+__weft_packed_i4_i8_register_l32_e8m2(
     const uint8_t *packed_codes, const uint8_t *activation_bytes,
     int32_t zero_point, float dot_scale, float additive_bias, float init) {
   const size_t vl16 = __riscv_vsetvl_e8m1(16);
@@ -32,9 +32,9 @@ __weft_packed_i4_i8_vl128(
 
 )c";
   }
-  if (vlen256) {
+  if (registerE8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i4_i8_vl256(
+__weft_packed_i4_i8_register_l32_e8m1(
     const uint8_t *packed_codes, const uint8_t *activation_bytes,
     int32_t zero_point, float dot_scale, float additive_bias, float init) {
   const size_t vl16 = __riscv_vsetvl_e8m1(16);
@@ -60,11 +60,11 @@ __weft_packed_i4_i8_vl256(
   }
 }
 
-void emitPackedI5IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
-                                  bool vlen256) {
-  if (vlen128) {
+void emitPackedI5LocalImplementations(llvm::raw_ostream &output, bool registerE8M2,
+                                  bool registerE8M1) {
+  if (registerE8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i5_i8_vl128(
+__weft_packed_i5_i8_register_l32_e8m2(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *activation_bytes, int32_t zero_point,
     float dot_scale, float additive_bias, float init) {
@@ -92,9 +92,9 @@ __weft_packed_i5_i8_vl128(
 
 )c";
   }
-  if (vlen256) {
+  if (registerE8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i5_i8_vl256(
+__weft_packed_i5_i8_register_l32_e8m1(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *activation_bytes, int32_t zero_point,
     float dot_scale, float additive_bias, float init) {
@@ -125,11 +125,11 @@ __weft_packed_i5_i8_vl256(
   }
 }
 
-void emitNibbleCodebookIntrinsicCLeaves(llvm::raw_ostream &output,
-                                        bool vlen128, bool vlen256) {
-  if (vlen128) {
+void emitNibbleCodebookLocalImplementations(llvm::raw_ostream &output,
+                                        bool registerE8M2, bool registerE8M1) {
+  if (registerE8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_nibble_codebook_i8_vl128(
+__weft_nibble_codebook_i8_register_l32_e8m2(
     const uint8_t *packed_codes, const uint8_t *table_bytes,
     const uint8_t *activation_bytes, float dot_scale, float init) {
   const size_t vl16 = __riscv_vsetvl_e8m1(16);
@@ -158,9 +158,9 @@ __weft_nibble_codebook_i8_vl128(
 )c";
   }
 
-  if (vlen256) {
+  if (registerE8M1) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_nibble_codebook_i8_vl256(
+__weft_nibble_codebook_i8_register_l32_e8m1(
     const uint8_t *packed_codes, const uint8_t *table_bytes,
     const uint8_t *activation_bytes, float dot_scale, float init) {
   const size_t vl16 = __riscv_vsetvl_e8mf2(16);

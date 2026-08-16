@@ -4,9 +4,9 @@
 
 namespace weft::riscv_internal {
 
-void emitPackedI3GroupedIntrinsicCLeaves(llvm::raw_ostream &output,
-                                         bool vlen128, bool vlen256) {
-  if (!vlen128 && !vlen256)
+void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
+                                         bool registerL32, bool registerL64) {
+  if (!registerL32 && !registerL64)
     return;
   output << R"c(static inline __attribute__((always_inline, unused)) int32_t
 __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
@@ -21,9 +21,9 @@ __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
 
 )c";
 
-  if (vlen128) {
+  if (registerL32) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i3_grouped_i8_vl128(
+__weft_packed_i3_grouped_i8_register_l32_e8m2(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *scales, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -62,9 +62,9 @@ __weft_packed_i3_grouped_i8_vl128(
 )c";
   }
 
-  if (vlen256) {
+  if (registerL64) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i3_grouped_i8_vl256(
+__weft_packed_i3_grouped_i8_register_l64_e8m2(
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *scales, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
