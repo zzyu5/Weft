@@ -52,8 +52,13 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
   bool iq2FixedLanes64 =
       leaves.contains(IntrinsicCLeaf::IQ2SI8FixedLanes64);
   bool iq2Scalable = leaves.contains(IntrinsicCLeaf::IQ2SI8Scalable);
+  bool iq3FixedLanes64 =
+      leaves.contains(IntrinsicCLeaf::IQ3SI8FixedLanes64);
   bool iq3Scalable = leaves.contains(IntrinsicCLeaf::IQ3SI8Scalable);
-  bool iq1Fixed = leaves.contains(IntrinsicCLeaf::IQ1MI8Fixed);
+  bool iq1FixedLanes32 =
+      leaves.contains(IntrinsicCLeaf::IQ1MI8FixedLanes32);
+  bool iq1FixedLanes64 =
+      leaves.contains(IntrinsicCLeaf::IQ1MI8FixedLanes64);
   bool iq1Scalable = leaves.contains(IntrinsicCLeaf::IQ1MI8Scalable);
   bool q6FixedLanes32 =
       leaves.contains(IntrinsicCLeaf::Q6KI8FixedLanes32);
@@ -65,7 +70,8 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
   bool packedI5VLEN256 =
       leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN256);
   if (!iq2FixedLanes32 && !iq2FixedLanes64 && !iq2Scalable &&
-      !iq3Scalable && !iq1Fixed && !iq1Scalable && !q6FixedLanes32 &&
+      !iq3FixedLanes64 && !iq3Scalable && !iq1FixedLanes32 &&
+      !iq1FixedLanes64 && !iq1Scalable && !q6FixedLanes32 &&
       !q6FixedLanes64 && !q6Scalable && !packedI5VLEN128 &&
       !packedI5VLEN256)
     return;
@@ -89,7 +95,7 @@ __weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
 }
 )c";
   }
-  if (iq1Fixed) {
+  if (iq1FixedLanes32) {
     output << R"c(static inline __attribute__((always_inline, unused)) vuint16m1_t
 __weft_get_u16m2_u16m1(vuint16m2_t value, size_t segment) {
   return segment == 0 ? __riscv_vget_v_u16m2_u16m1(value, 0)
@@ -115,17 +121,18 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
 )c";
   }
 
-  if (iq1Fixed || iq1Scalable)
+  if (iq1FixedLanes32 || iq1FixedLanes64 || iq1Scalable)
     emitI64Table(output, "__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
   if (iq2FixedLanes32 || iq2FixedLanes64 || iq2Scalable)
     emitI64Table(output, "__weft_iq2_s_grid", __weft_iq2_s_grid, 1024);
-  if (iq3Scalable)
+  if (iq3FixedLanes64 || iq3Scalable)
     emitI32Table(output, "__weft_iq3_s_grid", __weft_iq3_s_grid, 512);
 
   emitIQ2IntrinsicCLeaves(output, iq2FixedLanes32, iq2FixedLanes64,
                           iq2Scalable);
-  emitIQ3IntrinsicCLeaves(output, iq3Scalable);
-  emitIQ1IntrinsicCLeaves(output, iq1Fixed, iq1Scalable);
+  emitIQ3IntrinsicCLeaves(output, iq3FixedLanes64, iq3Scalable);
+  emitIQ1IntrinsicCLeaves(output, iq1FixedLanes32, iq1FixedLanes64,
+                          iq1Scalable);
   emitQ6IntrinsicCLeaves(output, q6FixedLanes32, q6FixedLanes64,
                          q6Scalable);
   emitPackedI5IntrinsicCLeaves(output, packedI5VLEN128, packedI5VLEN256);

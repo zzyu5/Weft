@@ -9,9 +9,10 @@ namespace weft::riscv_internal {
 
 void emitIQ2IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
                              bool fixedLanes64, bool scalable);
-void emitIQ3IntrinsicCLeaves(llvm::raw_ostream &output, bool scalable);
-void emitIQ1IntrinsicCLeaves(llvm::raw_ostream &output, bool fixed,
+void emitIQ3IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes64,
                              bool scalable);
+void emitIQ1IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
+                             bool fixedLanes64, bool scalable);
 void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
                             bool fixedLanes64, bool scalable);
 void emitPackedI5IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,

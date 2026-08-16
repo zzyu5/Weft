@@ -8520,13 +8520,25 @@ private:
       }
       break;
     case QuantI8DotSemantic::IQ3S:
-      decision.leaf = IntrinsicCLeaf::IQ3SI8Scalable;
+      decision.leaf =
+          decision.realization ==
+                  QuantI8DotRealization::RVVFixedLaneLocalBlockDot
+              ? IntrinsicCLeaf::IQ3SI8FixedLanes64
+              : IntrinsicCLeaf::IQ3SI8Scalable;
       break;
     case QuantI8DotSemantic::IQ1M:
-      decision.leaf = decision.realization ==
-                              QuantI8DotRealization::RVVFixedLaneLocalBlockDot
-                          ? IntrinsicCLeaf::IQ1MI8Fixed
-                          : IntrinsicCLeaf::IQ1MI8Scalable;
+      if (decision.realization ==
+          QuantI8DotRealization::RVVFixedLaneLocalBlockDot) {
+        if (decision.semanticLanes == 32)
+          decision.leaf = IntrinsicCLeaf::IQ1MI8FixedLanes32;
+        else if (decision.semanticLanes == 64)
+          decision.leaf = IntrinsicCLeaf::IQ1MI8FixedLanes64;
+        else
+          return op.emitError(
+              "fixed-lane IQ1_M/i8 dot requires 32 or 64 semantic lanes");
+      } else {
+        decision.leaf = IntrinsicCLeaf::IQ1MI8Scalable;
+      }
       break;
     case QuantI8DotSemantic::Q6K:
       if (decision.realization ==

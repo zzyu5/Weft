@@ -149,8 +149,9 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI5 ||
                    facts.semantic == QuantI8DotSemantic::IQ2S ||
                    facts.semantic == QuantI8DotSemantic::Q6K ||
-                   (facts.semantic == QuantI8DotSemantic::IQ1M &&
-                    target.vlenBits == 128);
+                   facts.semantic == QuantI8DotSemantic::IQ1M ||
+                   (facts.semantic == QuantI8DotSemantic::IQ3S &&
+                    selected.semanticLanes == 64);
   unsigned fixedPeak = 4 * selected.reductionSegments +
                        4 * rvvRegisterGroups(*byteShape);
   if (fixedLeaf && fixedPeak < static_cast<unsigned>(target.vectorRegisters)) {
