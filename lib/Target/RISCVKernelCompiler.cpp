@@ -506,8 +506,20 @@ void recordPhysicalHandoff(PhysicalEntityPlan &plan,
                            mlir::Operation *consumer, mlir::Value value,
                            PhysicalHandoff kind, RVVVectorShape source,
                            RVVVectorShape result) {
-  plan.handoffs.push_back(
-      PhysicalHandoffDecision{consumer, value, kind, source, result});
+  if (!consumer || !value || !source || !result)
+    return;
+  auto found = llvm::find_if(
+      plan.handoffs, [&](const PhysicalHandoffDecision &handoff) {
+        return handoff.consumer == consumer && handoff.value == value;
+      });
+  if (found == plan.handoffs.end()) {
+    plan.handoffs.push_back(
+        PhysicalHandoffDecision{consumer, value, kind, source, result});
+    return;
+  }
+  if (found->kind != kind || found->sourceShape != source ||
+      found->resultShape != result)
+    plan.hasValueShapeConflict = true;
 }
 
 void recordPhysicalTemporary(PhysicalEntityPlan &plan, mlir::Operation *owner,
@@ -3142,6 +3154,9 @@ private:
                                options.target)
               .value_or(RVVVectorShape{});
       recordPhysicalValue(entity, state.operation->getOperand(0), stateShape);
+      recordPhysicalHandoff(entity, state.operation,
+                            state.operation->getOperand(0),
+                            PhysicalHandoff::Share, stateShape, stateShape);
       recordPhysicalHandoff(
           entity, state.operation, state.identity,
           state.carry == VLAStateCarryRepresentation::Vector
@@ -3172,6 +3187,44 @@ private:
                                 ? PhysicalHandoff::Share
                                 : PhysicalHandoff::Rematerialize,
                             dotShape, dotShape);
+    }
+    auto selectedValueShape = [&](mlir::Value value) -> RVVVectorShape {
+      auto found = llvm::find_if(
+          entity.values, [&](const PhysicalValueDecision &decision) {
+            return decision.value == value;
+          });
+      return found == entity.values.end() ? RVVVectorShape{} : found->shape;
+    };
+    for (mlir::Operation *operation : physicalOperations) {
+      auto resultType = operation->getNumResults() == 1
+                            ? mlir::dyn_cast<RegionType>(
+                                  unwrapLogicalValidity(
+                                      operation->getResult(0).getType()))
+                            : RegionType{};
+      if (!mlir::isa<UnaryOp, BinaryOp>(operation) ||
+          !resultType || !resultType.getElementType().isF32() ||
+          llvm::none_of(resultType.getAxisIds(),
+                        [](int64_t axis) { return axis > 0; }))
+        continue;
+      RVVVectorShape resultShape = selectedValueShape(operation->getResult(0));
+      if (!resultShape) {
+        operation->emitError(
+            "VLA pointwise result has no selected physical value shape");
+        return mlir::failure();
+      }
+      for (mlir::Value operand : operation->getOperands()) {
+        if (!isRegionValue(operand.getType()))
+          continue;
+        RVVVectorShape sourceShape = selectedValueShape(operand);
+        if (!sourceShape || sourceShape != resultShape) {
+          operation->emitError(
+              "VLA pointwise operand has no compatible physical handoff");
+          return mlir::failure();
+        }
+        recordPhysicalHandoff(entity, operation, operand,
+                              PhysicalHandoff::Share, sourceShape,
+                              resultShape);
+      }
     }
     return planned;
   }
@@ -4397,6 +4450,16 @@ private:
       if (!lmul || fields == 0)
         return op.emitError(
             "VLA structured pointwise result has no physical shape");
+      if (!activePhysicalEntity ||
+          (lhsBundle &&
+           mlir::failed(requirePhysicalHandoff(
+               op.getOperation(), *activePhysicalEntity, op.getLhs(),
+               PhysicalHandoff::Share))) ||
+          (rhsBundle &&
+           mlir::failed(requirePhysicalHandoff(
+               op.getOperation(), *activePhysicalEntity, op.getRhs(),
+               PhysicalHandoff::Share))))
+        return mlir::failure();
       std::string suffix = "f32m" + std::to_string(*lmul);
       CValue result{op.getResult().getType(), CValueKind::F32VectorBundle, {}};
       for (size_t index = 0; index < fields; ++index) {
@@ -4694,6 +4757,11 @@ private:
       std::optional<unsigned> lmul = physicalValueLMUL(op.getResult());
       if (!inVLA || !lmul || input.fields.empty())
         return op.emitError("VLA structured unary has no physical shape");
+      if (!activePhysicalEntity ||
+          mlir::failed(requirePhysicalHandoff(
+              op.getOperation(), *activePhysicalEntity, op.getInput(),
+              PhysicalHandoff::Share)))
+        return mlir::failure();
       std::string suffix = "f32m" + std::to_string(*lmul);
       CValue result{op.getResult().getType(), CValueKind::F32VectorBundle, {}};
       for (const CValue &field : input.fields) {
