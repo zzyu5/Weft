@@ -5052,13 +5052,11 @@ private:
       if (!handoff || handoff->kind != PhysicalHandoff::Convert ||
           !resultShape || handoff->resultShape != resultShape->shape)
         return op.emitError("VLA cast physical handoff is inconsistent");
-      std::optional<unsigned> sourceLMUL =
-          rvvIntegerLMUL(handoff->sourceShape);
-      std::optional<unsigned> resultLMUL =
-          rvvIntegerLMUL(handoff->resultShape);
-      if (!sourceLMUL || !resultLMUL)
-        return op.emitError("VLA cast shape has no intrinsic-C spelling");
       if (decision->realization == VLACastRealization::RVVIndexToF32) {
+        std::optional<unsigned> resultLMUL =
+            rvvIntegerLMUL(handoff->resultShape);
+        if (!resultLMUL)
+          return op.emitError("VLA index cast shape has no intrinsic-C spelling");
         CValue index =
             materializeIndexVector(op.getOperation(), op.getInput(), input);
         if (index.kind != CValueKind::IndexVector || index.spelling.empty() ||
@@ -5082,6 +5080,10 @@ private:
       }
       if (decision->realization ==
           VLACastRealization::RVVZeroExtendU32ToIndex) {
+        std::optional<unsigned> sourceLMUL =
+            rvvIntegerLMUL(handoff->sourceShape);
+        if (!sourceLMUL)
+          return op.emitError("VLA index cast shape has no intrinsic-C spelling");
         if (input.kind != CValueKind::U32Vector || input.spelling.empty())
           return op.emitError(
               "selected u32-to-index VLA cast operand is unavailable");
@@ -5103,19 +5105,22 @@ private:
                                          : CValueKind::F32Vector;
       if (input.kind != sourceKind || input.spelling.empty())
         return op.emitError("selected VLA cast operand is unavailable");
+      std::string sourceType = rvvVectorType(
+          RVVElementCategory::Floating, handoff->sourceShape);
+      std::string resultType = rvvVectorType(
+          RVVElementCategory::Floating, handoff->resultShape);
+      std::string resultSuffix = rvvIntrinsicTypeSuffix(
+          RVVElementCategory::Floating, handoff->resultShape);
+      if (sourceType.empty() || resultType.empty() || resultSuffix.empty())
+        return op.emitError("VLA cast shape has no intrinsic-C spelling");
       std::string name = fresh(handoff->resultShape.sew == 32 ? "widen_f16"
                                                               : "narrow_f32");
-      std::string resultSuffix =
-          "f" + std::to_string(handoff->resultShape.sew) + "m" +
-          std::to_string(*resultLMUL);
       std::string intrinsic =
           decision->realization == VLACastRealization::RVVWidenF16ToF32
               ? "__riscv_vfwcvt_f_f_v_"
               : "__riscv_vfncvt_f_f_w_";
-      line("vfloat" + std::to_string(handoff->resultShape.sew) + "m" +
-           std::to_string(*resultLMUL) + "_t " + name + " = " +
-           intrinsic + resultSuffix + "(" + input.spelling + ", " + activeVL +
-           ");");
+      line(resultType + " " + name + " = " + intrinsic + resultSuffix + "(" +
+           input.spelling + ", " + activeVL + ");");
       CValue result{op.getResult().getType(), resultKind, name};
       if (mlir::failed(attachLogicalValidity(
               op.getOperation(), op.getResult().getType(), result, {input})))
