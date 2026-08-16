@@ -357,8 +357,11 @@ struct VLAAccessDecision {
   VLAActivityMode activityMode = VLAActivityMode::AllActive;
   VLAStoreValueMode storeValueMode = VLAStoreValueMode::Vector;
   mlir::Value predicate;
+  std::optional<AffineScalarExpression> laneStride;
   mlir::Value indexedOffset;
   unsigned indexedSEW = 0;
+  RVVVectorShape indexedShape;
+  unsigned elementBytes = 0;
   mlir::Value bundleAxis;
   unsigned bundleVectors = 0;
   VLAInactiveLaneRealization inactiveLane =
@@ -371,6 +374,7 @@ struct VLASegment2Decision {
   mlir::Operation *field1 = nullptr;
   mlir::Operation *emission = nullptr;
   mlir::Value base;
+  int64_t coordinateScale = 2;
 };
 
 struct VLALookupDecision {
@@ -460,6 +464,8 @@ struct VLADotDecision {
   VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode freeMemoryMode = VLAMemoryMode::UnitStride;
   VLAMemoryMode outputMemoryMode = VLAMemoryMode::UnitStride;
+  std::optional<AffineScalarExpression> rhsLaneStride;
+  std::optional<AffineScalarExpression> freeLaneStride;
   bool lhsPredicateVariesByReduction = false;
   F32DotParameters physical;
   PhysicalResourceBudget resources;
@@ -1828,6 +1834,7 @@ private:
     auto rhsPointer =
         rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType()) : PtrType{};
     LaneRelation rhsRelation = memoryRelation(*rhsAccess, coordinate);
+    const MemoryAxisFact *rhsAxis = memoryAxisFact(*rhsAccess, coordinate);
     if (!lhsPointer || !rhsPointer ||
         !lhsPointer.getElementType().isF32() ||
         !rhsPointer.getElementType().isF32() ||
@@ -1842,7 +1849,9 @@ private:
         memoryRelation(*rhsAccess, reductionAxis.getResult()) ==
             LaneRelation::Independent ||
         memoryRelation(*rhsAccess, rowAxis.getResult()) !=
-            LaneRelation::Independent) {
+            LaneRelation::Independent ||
+        (rhsRelation == LaneRelation::Strided &&
+         (!rhsAxis || !rhsAxis->laneStride))) {
       dot.emitError(
           "RVV VLA dot memory relations are unavailable");
       return mlir::failure();
@@ -1888,6 +1897,8 @@ private:
     decision.rhsMemoryMode = rhsRelation == LaneRelation::UnitStride
                                  ? VLAMemoryMode::UnitStride
                                  : VLAMemoryMode::Strided;
+    if (rhsAxis)
+      decision.rhsLaneStride = rhsAxis->laneStride;
     decision.lhsPredicateVariesByReduction =
         valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
     decision.structure = physical->structure;
@@ -1960,12 +1971,15 @@ private:
     auto freePointer =
         freeRoot ? mlir::dyn_cast<PtrType>(freeRoot.getType()) : PtrType{};
     LaneRelation freeRelation = memoryRelation(*freeAccess, coordinate);
+    const MemoryAxisFact *freeAxis = memoryAxisFact(*freeAccess, coordinate);
     if (!freePointer || !freePointer.getElementType().isF32() ||
         (freeRelation != LaneRelation::UnitStride &&
          freeRelation != LaneRelation::Strided) ||
         memoryRelation(*freeAccess, coordinate) == LaneRelation::Independent ||
         memoryRelation(*freeAccess, reductionAxis.getResult()) ==
             LaneRelation::Independent ||
+        (freeRelation == LaneRelation::Strided &&
+         (!freeAxis || !freeAxis->laneStride)) ||
         !valueDependsOnAxis(dot.getInit(), coordinate) ||
         valueDependsOnAxis(dot.getInit(), reductionAxis.getResult()) ||
         valueDependsOnAxis(dot.getRhs(), coordinate) ||
@@ -2017,6 +2031,8 @@ private:
     decision.freeMemoryMode = freeRelation == LaneRelation::UnitStride
                                   ? VLAMemoryMode::UnitStride
                                   : VLAMemoryMode::Strided;
+    if (freeAxis)
+      decision.freeLaneStride = freeAxis->laneStride;
     decision.initRealization =
         VLADotInitRealization::MaterializedRegion;
     decision.structure = physical->structure;
@@ -2237,17 +2253,25 @@ private:
       decision.predicates.push_back(std::move(predicateDecision));
     }
 
-    auto addAccess = [&](mlir::Operation *operation, mlir::Value pointer,
-                         mlir::Value predicate, mlir::Type accessedElement,
+    auto addAccess = [&](mlir::Operation *operation, mlir::Value predicate,
+                         mlir::Type accessedElement,
                          VLAStoreValueMode storeValueMode)
         -> mlir::LogicalResult {
-      LaneRelation relation =
-          classifyLaneRelation(pointer, decision.coordinate);
+      const MemoryAccessFact *memory = memoryFact(operation);
+      const MemoryAxisFact *axis =
+          memory ? memoryAxisFact(*memory, decision.coordinate) : nullptr;
+      if (!axis)
+        return operation->emitError(
+            "VLA memory access has no axis/address program facts");
+      LaneRelation relation = axis->relation;
       if (relation == LaneRelation::Independent)
         return mlir::success();
       if (relation == LaneRelation::NonAffine)
         return operation->emitError(
             "VLA memory access is neither affine-strided nor explicitly indexed");
+      if (relation == LaneRelation::Strided && !axis->laneStride)
+        return operation->emitError(
+            "VLA strided memory has no canonical lane-stride fact");
       const bool predicateAllActive = isTrue(predicate);
       bool predicateVector = false;
       bool predicateScalar = false;
@@ -2351,13 +2375,13 @@ private:
       access.elementType = accessedElement;
       access.storeValueMode = storeValueMode;
       access.predicate = predicate;
+      access.laneStride = axis->laneStride;
       const bool carriesValidity =
           mlir::isa<LoadOp>(operation) &&
           mlir::isa<MaskedType>(operation->getResult(0).getType());
       bool indexedOffsetFromU32 = false;
       if (relation == LaneRelation::Indexed) {
-        access.indexedOffset =
-            findIndexedOffset(pointer, decision.coordinate);
+        access.indexedOffset = axis->indexedOffset;
         if (!access.indexedOffset) {
           return operation->emitError(
               "indexed VLA memory requires one scalar base and one typed index vector");
@@ -2389,13 +2413,18 @@ private:
         continue;
       if (auto load = mlir::dyn_cast<LoadOp>(nested)) {
         if (mlir::failed(addAccess(
-                load.getOperation(), load.getPointer(), load.getWhere(),
+                load.getOperation(), load.getWhere(),
                 elementType(load.getResult().getType()),
                 VLAStoreValueMode::Vector)))
           return mlir::failure();
       } else if (auto store = mlir::dyn_cast<StoreOp>(nested)) {
-        LaneRelation storeRelation =
-            classifyLaneRelation(store.getPointer(), decision.coordinate);
+        const MemoryAccessFact *memory = memoryFact(store.getOperation());
+        const MemoryAxisFact *axis =
+            memory ? memoryAxisFact(*memory, decision.coordinate) : nullptr;
+        if (!axis)
+          return store.emitError(
+              "VLA store has no axis/address program facts");
+        LaneRelation storeRelation = axis->relation;
         mlir::Type storedElement = elementType(store.getValue().getType());
         if (storeRelation == LaneRelation::Indexed) {
           store.emitError(
@@ -2412,7 +2441,7 @@ private:
                 ? VLAStoreValueMode::Vector
                 : VLAStoreValueMode::ScalarBroadcast;
         if (mlir::failed(addAccess(
-                store.getOperation(), store.getPointer(), store.getWhere(),
+                store.getOperation(), store.getWhere(),
                 elementType(store.getValue().getType()), valueMode)))
           return mlir::failure();
         auto storedRegion = mlir::dyn_cast<RegionType>(
@@ -2514,6 +2543,7 @@ private:
         segment.emission = emission;
         segment.base = first.address.field == 0 ? first.address.pointer
                                                 : second.address.pointer;
+        segment.coordinateScale = physical->coordinateScale;
         decision.segment2.push_back(std::move(segment));
         field0->memoryMode = VLAMemoryMode::Segment2;
         field1->memoryMode = VLAMemoryMode::Segment2;
@@ -3091,6 +3121,7 @@ private:
                                access.elementType.isUnsignedInteger(8))
                                 ? 8
                                 : 32;
+      access.elementBytes = elementSEW / 8;
       RVVVectorShape elementShape =
           rvvShapeForSameLanes(entity.vlaDataShape, elementSEW, options.target)
               .value_or(RVVVectorShape{});
@@ -3130,6 +3161,7 @@ private:
           return mlir::failure();
         }
         RVVVectorShape indexShape = indexValue->shape;
+        access.indexedShape = indexShape;
         recordPhysicalHandoff(entity, access.operation,
                               access.indexedOffset, PhysicalHandoff::Share,
                               indexShape, indexShape);
@@ -5482,65 +5514,32 @@ private:
     return projectBlockScalar(fact.pointer, axes);
   }
 
-  std::optional<std::string> projectVLALaneStride(
-      mlir::Value value, mlir::Value coordinate,
+  std::optional<std::string> spellAffineScalarExpression(
+      const AffineScalarExpression &expression,
       const llvm::DenseMap<mlir::Value, std::string> &axisValues) {
-    if (value == coordinate)
-      return "1";
-    if (axisValues.contains(value) || !dependsOn(value, coordinate))
-      return "0";
-    if (auto pointer = value.getDefiningOp<PtrAddOp>()) {
-      std::optional<std::string> base =
-          projectVLALaneStride(pointer.getBase(), coordinate, axisValues);
-      std::optional<std::string> offset =
-          projectVLALaneStride(pointer.getOffset(), coordinate, axisValues);
-      if (!base || !offset)
+    switch (expression.kind) {
+    case AffineScalarExpressionKind::Constant:
+      return std::to_string(expression.constant);
+    case AffineScalarExpressionKind::Value:
+      return projectBlockScalar(expression.value, axisValues);
+    case AffineScalarExpressionKind::Add:
+    case AffineScalarExpressionKind::Subtract:
+    case AffineScalarExpressionKind::Multiply: {
+      if (!expression.lhs || !expression.rhs)
         return std::nullopt;
-      if (*base == "0")
-        return offset;
-      if (*offset == "0")
-        return base;
-      return "(" + *base + " + " + *offset + ")";
+      std::optional<std::string> lhs =
+          spellAffineScalarExpression(*expression.lhs, axisValues);
+      std::optional<std::string> rhs =
+          spellAffineScalarExpression(*expression.rhs, axisValues);
+      if (!lhs || !rhs)
+        return std::nullopt;
+      llvm::StringRef token =
+          expression.kind == AffineScalarExpressionKind::Add        ? " + "
+          : expression.kind == AffineScalarExpressionKind::Subtract ? " - "
+                                                                     : " * ";
+      return "(" + *lhs + token.str() + *rhs + ")";
     }
-    if (auto binary = value.getDefiningOp<BinaryOp>()) {
-      bool lhsDependent = dependsOn(binary.getLhs(), coordinate);
-      bool rhsDependent = dependsOn(binary.getRhs(), coordinate);
-      if (binary.getKind() == "add" || binary.getKind() == "sub") {
-        std::optional<std::string> lhs = projectVLALaneStride(
-            binary.getLhs(), coordinate, axisValues);
-        std::optional<std::string> rhs = projectVLALaneStride(
-            binary.getRhs(), coordinate, axisValues);
-        if (!lhs || !rhs)
-          return std::nullopt;
-        if (*rhs == "0")
-          return lhs;
-        if (*lhs == "0")
-          return binary.getKind() == "add"
-                     ? rhs
-                     : std::optional<std::string>("(-" + *rhs + ")");
-        return "(" + *lhs + (binary.getKind() == "add" ? " + " : " - ") +
-               *rhs + ")";
-      }
-      if (binary.getKind() == "mul" && lhsDependent != rhsDependent) {
-        mlir::Value dependent =
-            lhsDependent ? binary.getLhs() : binary.getRhs();
-        mlir::Value factor = lhsDependent ? binary.getRhs() : binary.getLhs();
-        std::optional<std::string> stride =
-            projectVLALaneStride(dependent, coordinate, axisValues);
-        std::optional<std::string> scalar =
-            projectBlockScalar(factor, axisValues);
-        if (!stride || !scalar)
-          return std::nullopt;
-        if (*stride == "1")
-          return scalar;
-        return "(" + *stride + " * " + *scalar + ")";
-      }
-      return std::nullopt;
     }
-    if (auto cast = value.getDefiningOp<CastOp>())
-      return projectVLALaneStride(cast.getInput(), coordinate, axisValues);
-    if (auto expand = value.getDefiningOp<ExpandDimsOp>())
-      return projectVLALaneStride(expand.getInput(), coordinate, axisValues);
     return std::nullopt;
   }
 
@@ -5602,8 +5601,10 @@ private:
         axes[decision.reductionAxis] = coordinate;
         std::optional<std::string> freePointer =
             projectBlockScalar(freeLoad.getPointer(), axes);
-        std::optional<std::string> freeLaneStride = projectVLALaneStride(
-            freeLoad.getPointer(), activeVLADecision->coordinate, axes);
+        std::optional<std::string> freeLaneStride =
+            decision.freeLaneStride
+                ? spellAffineScalarExpression(*decision.freeLaneStride, axes)
+                : std::optional<std::string>("1");
         std::optional<std::string> blocked =
             projectBlockScalar(decision.blockedOperand, axes);
         if (!freePointer || !freeLaneStride || !blocked)
@@ -5686,8 +5687,10 @@ private:
         rhsAxes[decision.reductionAxis] = coordinate;
         std::optional<std::string> rhsPointer =
             projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-        std::optional<std::string> rhsLaneStride = projectVLALaneStride(
-            rhsLoad.getPointer(), activeVLADecision->coordinate, rhsAxes);
+        std::optional<std::string> rhsLaneStride =
+            decision.rhsLaneStride
+                ? spellAffineScalarExpression(*decision.rhsLaneStride, rhsAxes)
+                : std::optional<std::string>("1");
         if (!rhsPointer || !rhsLaneStride)
           return dot.emitError(
               "RVV VLA dot RHS projection is unavailable");
@@ -6099,9 +6102,16 @@ private:
       bool f16 = isF16(loadedElement);
       bool u8 = loadedElement.isUnsignedInteger(8);
       bool u32 = loadedElement.isUnsignedInteger(32);
+      llvm::DenseMap<mlir::Value, std::string> noProjectedAxes;
+      std::optional<std::string> selectedLaneStride =
+          decision->laneStride
+              ? spellAffineScalarExpression(*decision->laneStride,
+                                             noProjectedAxes)
+              : std::optional<std::string>("1");
       if ((!f32 && !f16 && !u8 && !u32) ||
           (!pointer.lanePointer && !pointer.indexedPointer) ||
-          (pointer.lanePointer && pointer.laneStride.empty()))
+          (decision->memoryMode == VLAMemoryMode::Strided &&
+           !selectedLaneStride))
         return op.emitError("VLA load element realization is unavailable");
       std::string name = fresh("load");
       const PhysicalValueDecision *valueShape =
@@ -6110,15 +6120,17 @@ private:
           valueShape ? rvvShapeSuffix(valueShape->shape) : std::string{};
       if (!valueShape || shapeSuffix.empty())
         return op.emitError("VLA load has no selected vector shape");
+      CValue indexedOffset;
       if (decision->memoryMode == VLAMemoryMode::Indexed) {
-        const PhysicalValueDecision *indexShape =
-            findVLAValueDecision(decision->indexedOffset);
+        indexedOffset = require(decision->indexedOffset);
         const PhysicalHandoffDecision *indexHandoff =
             findVLAHandoff(op.getOperation(), decision->indexedOffset);
-        if (!indexShape || !indexHandoff ||
+        if (!decision->indexedShape || decision->elementBytes == 0 ||
+            indexedOffset.kind != CValueKind::IndexVector ||
+            indexedOffset.spelling.empty() || !indexHandoff ||
             indexHandoff->kind != PhysicalHandoff::Share ||
-            indexHandoff->sourceShape != indexShape->shape ||
-            indexHandoff->resultShape != indexShape->shape)
+            indexHandoff->sourceShape != decision->indexedShape ||
+            indexHandoff->resultShape != decision->indexedShape)
           return op.emitError(
               "indexed VLA load physical handoff is incomplete");
       }
@@ -6149,7 +6161,8 @@ private:
         std::string suffix = "f" + shapeSuffix;
         line("vfloat" + shapeSuffix + "x2_t " + tuple +
              " = __riscv_vlseg2e32_v_" + suffix + "x2(" + *base +
-             " + 2 * " + coordinate.spelling + ", " + activeVL + ");");
+             " + " + std::to_string(segment->coordinateScale) + " * " +
+             coordinate.spelling + ", " + activeVL + ");");
         line("vfloat" + shapeSuffix + "_t " + first +
              " = __riscv_vget_v_" + suffix + "x2_" + suffix + "(" + tuple +
              ", 0);");
@@ -6186,27 +6199,24 @@ private:
                std::to_string(elementSEW) +
                "_v_" + suffix + "(" + pointer.spelling +
                ", (ptrdiff_t)(sizeof(" + cType +
-               ") * (" + pointer.laneStride + ")), " + activeVL + ");");
+               ") * (" + *selectedLaneStride + ")), " + activeVL + ");");
         } else if (decision->memoryMode == VLAMemoryMode::Indexed) {
-          const PhysicalValueDecision *indexShape =
-              findVLAValueDecision(decision->indexedOffset);
           std::optional<unsigned> indexLMUL =
-              indexShape ? rvvIntegerLMUL(indexShape->shape) : std::nullopt;
-          if (!indexShape ||
-              (indexShape->shape.sew != 32 && indexShape->shape.sew != 64) ||
+              rvvIntegerLMUL(decision->indexedShape);
+          if ((decision->indexedShape.sew != 32 &&
+               decision->indexedShape.sew != 64) ||
               !indexLMUL)
             return false;
-          std::string indexWidth = std::to_string(indexShape->shape.sew);
+          std::string indexWidth = std::to_string(decision->indexedShape.sew);
           std::string offsets = fresh("byte_offsets");
           std::string indexSuffix =
               "u" + indexWidth + "m" + std::to_string(*indexLMUL);
           line("vuint" + indexWidth + "m" +
                std::to_string(*indexLMUL) + "_t " +
                offsets + " = __riscv_vmul_vx_" + indexSuffix + "(" +
-               pointer.indexSpelling + ", (uint" + indexWidth + "_t)sizeof(" +
-               std::string(f32 ? "float" : f16 ? "_Float16" : u8 ? "uint8_t"
-                                                                        : "uint32_t") +
-               "), " + activeVL + ");");
+               indexedOffset.spelling + ", (uint" + indexWidth + "_t)" +
+               std::to_string(decision->elementBytes) + ", " + activeVL +
+               ");");
           line(name + " = __riscv_vluxei" + indexWidth + "_v_" + suffix + "(" +
                pointer.spelling + ", " + offsets + ", " + activeVL + ");");
         } else {
@@ -6252,25 +6262,22 @@ private:
                       suffix + "_tumu";
           arguments = predicate.spelling + ", " + name + ", " +
                       pointer.spelling + ", (ptrdiff_t)(sizeof(" + cType +
-                      ") * (" + pointer.laneStride + ")), " + activeVL;
+                      ") * (" + *selectedLaneStride + ")), " + activeVL;
         } else {
-          const PhysicalValueDecision *indexShape =
-              findVLAValueDecision(decision->indexedOffset);
           std::optional<unsigned> indexLMUL =
-              indexShape ? rvvIntegerLMUL(indexShape->shape) : std::nullopt;
-          if (!indexShape ||
-              (indexShape->shape.sew != 32 && indexShape->shape.sew != 64) ||
+              rvvIntegerLMUL(decision->indexedShape);
+          if ((decision->indexedShape.sew != 32 &&
+               decision->indexedShape.sew != 64) ||
               !indexLMUL)
             return op.emitError("masked indexed load has no physical index shape");
-          std::string indexWidth = std::to_string(indexShape->shape.sew);
+          std::string indexWidth = std::to_string(decision->indexedShape.sew);
           std::string offsets = fresh("byte_offsets");
           line("vuint" + indexWidth + "m" + std::to_string(*indexLMUL) +
                "_t " + offsets + " = __riscv_vmul_vx_u" + indexWidth + "m" +
-               std::to_string(*indexLMUL) + "(" + pointer.indexSpelling +
-               ", (uint" + indexWidth + "_t)sizeof(" +
-               std::string(f32 ? "float" : f16 ? "_Float16" : u8 ? "uint8_t"
-                                                                        : "uint32_t") +
-               "), " + activeVL + ");");
+               std::to_string(*indexLMUL) + "(" + indexedOffset.spelling +
+               ", (uint" + indexWidth + "_t)" +
+               std::to_string(decision->elementBytes) + ", " + activeVL +
+               ");");
           intrinsic = "__riscv_vluxei" + indexWidth + "_v_" + suffix +
                       "_tumu";
           arguments = predicate.spelling + ", " + name + ", " +
@@ -6487,8 +6494,10 @@ private:
             projectBlockScalar(op.getPointer(), axes);
         std::optional<std::string> predicate =
             projectBlockScalar(op.getWhere(), axes);
-        std::optional<std::string> stride = projectVLALaneStride(
-            op.getPointer(), activeVLADecision->coordinate, axes);
+        std::optional<std::string> stride =
+            decision->laneStride
+                ? spellAffineScalarExpression(*decision->laneStride, axes)
+                : std::optional<std::string>("1");
         if (field.kind != CValueKind::F32Vector || field.spelling.empty() ||
             !pointer || !predicate || !stride)
           return op.emitError(
@@ -6522,8 +6531,15 @@ private:
       bool f16 = isF16(decision->elementType);
       bool i8 = decision->elementType.isSignedInteger(8);
       bool u8 = decision->elementType.isUnsignedInteger(8);
+      llvm::DenseMap<mlir::Value, std::string> noProjectedAxes;
+      std::optional<std::string> selectedLaneStride =
+          decision->laneStride
+              ? spellAffineScalarExpression(*decision->laneStride,
+                                             noProjectedAxes)
+              : std::optional<std::string>("1");
       if ((!f32 && !f16 && !i8 && !u8) ||
-          pointer.laneStride.empty())
+          (decision->memoryMode == VLAMemoryMode::Strided &&
+           !selectedLaneStride))
         return op.emitError("VLA store element realization is unavailable");
       const PhysicalHandoffDecision *handoff =
           findVLAHandoff(op.getOperation(), op.getValue());
@@ -6591,8 +6607,8 @@ private:
              " = __riscv_vcreate_v_" + suffix + "x2(" + first.spelling + ", " +
              second.spelling + ");");
         line("__riscv_vsseg2e32_v_" + suffix + "x2(" + *base +
-             " + 2 * " + coordinate.spelling + ", " + tuple + ", " + activeVL +
-             ");");
+             " + " + std::to_string(segment->coordinateScale) + " * " +
+             coordinate.spelling + ", " + tuple + ", " + activeVL + ");");
         consumed.insert(segment->field0);
         consumed.insert(segment->field1);
         return mlir::success();
@@ -6630,12 +6646,12 @@ private:
                  decision->activityMode != VLAActivityMode::PredicateMask) {
         line("__riscv_vsse" + sew + "_v_" + suffix + "(" + pointer.spelling +
              ", (ptrdiff_t)(sizeof(" + elementCType + ") * (" +
-             pointer.laneStride + ")), " + vector + ", " + activeVL + ");");
+             *selectedLaneStride + ")), " + vector + ", " + activeVL + ");");
       } else if (decision->memoryMode == VLAMemoryMode::Strided) {
         line("__riscv_vsse" + sew + "_v_" + suffix + "_m(" +
              predicate.spelling + ", " + pointer.spelling +
              ", (ptrdiff_t)(sizeof(" + elementCType + ") * (" +
-             pointer.laneStride + ")), " + vector + ", " + activeVL + ");");
+             *selectedLaneStride + ")), " + vector + ", " + activeVL + ");");
       } else
         return op.emitError("VLA store memory decision has no intrinsic spelling");
       if (scalarPredicated) {
@@ -6687,11 +6703,16 @@ private:
     return found == kernelFacts.memory.end() ? nullptr : &found->second;
   }
 
+  const MemoryAxisFact *memoryAxisFact(const MemoryAccessFact &access,
+                                       mlir::Value axis) const {
+    auto found = access.axes.find(axis);
+    return found == access.axes.end() ? nullptr : &found->second;
+  }
+
   LaneRelation memoryRelation(const MemoryAccessFact &access,
                               mlir::Value axis) const {
-    auto found = access.axisRelations.find(axis);
-    return found == access.axisRelations.end() ? LaneRelation::Independent
-                                               : found->second;
+    const MemoryAxisFact *fact = memoryAxisFact(access, axis);
+    return fact ? fact->relation : LaneRelation::Independent;
   }
 
   std::optional<StructuredProductFacts>

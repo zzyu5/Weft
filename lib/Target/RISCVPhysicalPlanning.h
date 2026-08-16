@@ -5,6 +5,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <cstdint>
 #include <optional>
 #include <tuple>
 
@@ -339,6 +340,7 @@ enum class VLASegment2AccessKind {
 struct SelectedVLASegment2Physical {
   VLASegment2AccessKind kind = VLASegment2AccessKind::Load;
   bool emitAtEarlierAccess = true;
+  int64_t coordinateScale = 2;
 };
 
 std::optional<SelectedVLASegment2Physical>

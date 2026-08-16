@@ -37,6 +37,46 @@ LaneRelation combineLaneRelations(LaneRelation lhs, LaneRelation rhs) {
   return LaneRelation::Strided;
 }
 
+AffineScalarExpression constantExpression(int64_t value) {
+  AffineScalarExpression expression;
+  expression.kind = AffineScalarExpressionKind::Constant;
+  expression.constant = value;
+  return expression;
+}
+
+AffineScalarExpression valueExpression(mlir::Value value) {
+  AffineScalarExpression expression;
+  expression.kind = AffineScalarExpressionKind::Value;
+  expression.value = value;
+  return expression;
+}
+
+AffineScalarExpression binaryExpression(AffineScalarExpressionKind kind,
+                                        AffineScalarExpression lhs,
+                                        AffineScalarExpression rhs) {
+  if (kind == AffineScalarExpressionKind::Add &&
+      lhs.kind == AffineScalarExpressionKind::Constant && lhs.constant == 0)
+    return rhs;
+  if ((kind == AffineScalarExpressionKind::Add ||
+       kind == AffineScalarExpressionKind::Subtract) &&
+      rhs.kind == AffineScalarExpressionKind::Constant && rhs.constant == 0)
+    return lhs;
+  if (kind == AffineScalarExpressionKind::Multiply) {
+    if ((lhs.kind == AffineScalarExpressionKind::Constant && lhs.constant == 0) ||
+        (rhs.kind == AffineScalarExpressionKind::Constant && rhs.constant == 0))
+      return constantExpression(0);
+    if (lhs.kind == AffineScalarExpressionKind::Constant && lhs.constant == 1)
+      return rhs;
+    if (rhs.kind == AffineScalarExpressionKind::Constant && rhs.constant == 1)
+      return lhs;
+  }
+  AffineScalarExpression expression;
+  expression.kind = kind;
+  expression.lhs = std::make_shared<const AffineScalarExpression>(std::move(lhs));
+  expression.rhs = std::make_shared<const AffineScalarExpression>(std::move(rhs));
+  return expression;
+}
+
 bool dependsOn(mlir::Value value, mlir::Value target,
                llvm::DenseSet<mlir::Value> &visited) {
   if (value == target)
@@ -54,6 +94,64 @@ bool dependsOn(mlir::Value value, mlir::Value target,
 bool dependsOn(mlir::Value value, mlir::Value target) {
   llvm::DenseSet<mlir::Value> visited;
   return dependsOn(value, target, visited);
+}
+
+std::optional<AffineScalarExpression>
+deriveLaneStride(mlir::Value value, mlir::Value coordinate) {
+  if (value == coordinate)
+    return constantExpression(1);
+  if (!dependsOn(value, coordinate))
+    return constantExpression(0);
+  if (auto pointer = value.getDefiningOp<PtrAddOp>()) {
+    std::optional<AffineScalarExpression> base =
+        deriveLaneStride(pointer.getBase(), coordinate);
+    std::optional<AffineScalarExpression> offset =
+        deriveLaneStride(pointer.getOffset(), coordinate);
+    if (!base || !offset)
+      return std::nullopt;
+    return binaryExpression(AffineScalarExpressionKind::Add, std::move(*base),
+                            std::move(*offset));
+  }
+  if (auto binary = value.getDefiningOp<BinaryOp>()) {
+    if (binary.getKind() == "add" || binary.getKind() == "sub") {
+      std::optional<AffineScalarExpression> lhs =
+          deriveLaneStride(binary.getLhs(), coordinate);
+      std::optional<AffineScalarExpression> rhs =
+          deriveLaneStride(binary.getRhs(), coordinate);
+      if (!lhs || !rhs)
+        return std::nullopt;
+      return binaryExpression(binary.getKind() == "add"
+                                  ? AffineScalarExpressionKind::Add
+                                  : AffineScalarExpressionKind::Subtract,
+                              std::move(*lhs), std::move(*rhs));
+    }
+    if (binary.getKind() == "mul") {
+      const bool lhsDependent = dependsOn(binary.getLhs(), coordinate);
+      const bool rhsDependent = dependsOn(binary.getRhs(), coordinate);
+      if (lhsDependent == rhsDependent)
+        return std::nullopt;
+      mlir::Value dependent =
+          lhsDependent ? binary.getLhs() : binary.getRhs();
+      mlir::Value factor = lhsDependent ? binary.getRhs() : binary.getLhs();
+      std::optional<AffineScalarExpression> stride =
+          deriveLaneStride(dependent, coordinate);
+      if (!stride)
+        return std::nullopt;
+      AffineScalarExpression factorExpression =
+          integerConstantValue(factor)
+              ? constantExpression(*integerConstantValue(factor))
+              : valueExpression(factor);
+      return binaryExpression(AffineScalarExpressionKind::Multiply,
+                              std::move(*stride),
+                              std::move(factorExpression));
+    }
+    return std::nullopt;
+  }
+  if (auto cast = value.getDefiningOp<CastOp>())
+    return deriveLaneStride(cast.getInput(), coordinate);
+  if (auto expand = value.getDefiningOp<ExpandDimsOp>())
+    return deriveLaneStride(expand.getInput(), coordinate);
+  return std::nullopt;
 }
 
 mlir::Value pointerRoot(mlir::Value value) {
@@ -305,9 +403,16 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
     fact.predicate = predicate;
     fact.elementType = accessedType;
     fact.write = write;
-    for (const auto &axis : facts.axes)
-      fact.axisRelations.try_emplace(
-          axis.first, classifyLaneRelation(pointer, axis.first));
+    for (const auto &axis : facts.axes) {
+      MemoryAxisFact axisFact;
+      axisFact.relation = classifyLaneRelation(pointer, axis.first);
+      if (axisFact.relation == LaneRelation::UnitStride ||
+          axisFact.relation == LaneRelation::Strided)
+        axisFact.laneStride = deriveLaneStride(pointer, axis.first);
+      if (axisFact.relation == LaneRelation::Indexed)
+        axisFact.indexedOffset = findIndexedOffset(pointer, axis.first);
+      fact.axes.try_emplace(axis.first, std::move(axisFact));
+    }
     facts.memory.try_emplace(operation, std::move(fact));
   });
   return mlir::success();

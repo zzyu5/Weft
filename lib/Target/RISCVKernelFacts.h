@@ -8,6 +8,8 @@
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 
 namespace weft::riscv_internal {
 
@@ -17,6 +19,28 @@ enum class LaneRelation {
   Strided,
   Indexed,
   NonAffine,
+};
+
+enum class AffineScalarExpressionKind {
+  Constant,
+  Value,
+  Add,
+  Subtract,
+  Multiply,
+};
+
+struct AffineScalarExpression {
+  AffineScalarExpressionKind kind = AffineScalarExpressionKind::Constant;
+  int64_t constant = 0;
+  mlir::Value value;
+  std::shared_ptr<const AffineScalarExpression> lhs;
+  std::shared_ptr<const AffineScalarExpression> rhs;
+};
+
+struct MemoryAxisFact {
+  LaneRelation relation = LaneRelation::Independent;
+  std::optional<AffineScalarExpression> laneStride;
+  mlir::Value indexedOffset;
 };
 
 struct LogicalAxisFact {
@@ -49,7 +73,7 @@ struct MemoryAccessFact {
   mlir::Value predicate;
   mlir::Type elementType;
   bool write = false;
-  llvm::DenseMap<mlir::Value, LaneRelation> axisRelations;
+  llvm::DenseMap<mlir::Value, MemoryAxisFact> axes;
 };
 
 struct KernelPhysicalFacts {
