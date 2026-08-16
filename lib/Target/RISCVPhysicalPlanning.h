@@ -654,12 +654,6 @@ selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
                        const RISCVTargetProfile &target,
                        const RISCVBackendConfig &config);
 
-struct VLAStateResourceFact {
-  VLAStateCarryRepresentation carry = VLAStateCarryRepresentation::Scalar;
-  VLAStateStripUpdate stripUpdate = VLAStateStripUpdate::AddReduction;
-  bool wholeVLALifetime = true;
-};
-
 struct VLAIndexedMemoryFact {
   unsigned elementSEW = 0;
   unsigned offsetSEW = 0;
@@ -695,7 +689,7 @@ struct VLAEntityCandidateFacts {
   llvm::SmallVector<VLAIndexedMemoryFact> indexedMemory;
   llvm::SmallVector<VLASegmentMemoryFact> segmentMemory;
   llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimes;
-  llvm::SmallVector<VLAStateResourceFact> states;
+  llvm::SmallVector<SelectedVLAStatePhysical> states;
   llvm::SmallVector<PhysicalResourceBudget> localPrimitiveResources;
 };
 
@@ -737,7 +731,6 @@ struct RVVShapeMultiplicity {
 
 struct QuantDecodeResourceFacts {
   llvm::SmallVector<RVVShapeMultiplicity> loadedValues;
-  llvm::SmallVector<RVVShapeMultiplicity> carriedValues;
   llvm::SmallVector<RVVShapeMultiplicity> indexValues;
   llvm::SmallVector<RVVShapeMultiplicity> temporaryValues;
   unsigned predicateGroups = 0;

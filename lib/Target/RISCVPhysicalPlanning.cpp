@@ -959,14 +959,14 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
   } else {
     unsigned desiredLanes = 16;
     const bool hasReductionState = llvm::any_of(
-        facts.states, [](const VLAStateResourceFact &state) {
+        facts.states, [](const SelectedVLAStatePhysical &state) {
           return state.stripUpdate == VLAStateStripUpdate::AddReduction ||
                  state.stripUpdate == VLAStateStripUpdate::MaxReduction ||
                  state.stripUpdate ==
                      VLAStateStripUpdate::WideningAddReduction;
         });
     const bool hasOrderedScan = llvm::any_of(
-        facts.states, [](const VLAStateResourceFact &state) {
+        facts.states, [](const SelectedVLAStatePhysical &state) {
           return state.stripUpdate == VLAStateStripUpdate::InclusiveAddScan ||
                  state.stripUpdate ==
                      VLAStateStripUpdate::SegmentedInclusiveAddScan;
@@ -1056,7 +1056,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
 
     unsigned carriedStateGroups = 0;
     unsigned transientStateGroups = 0;
-    for (const VLAStateResourceFact &state : facts.states) {
+    for (const SelectedVLAStatePhysical &state : facts.states) {
       switch (state.stripUpdate) {
       case VLAStateStripUpdate::InclusiveAddScan:
         transientStateGroups =
@@ -1277,15 +1277,14 @@ calculateQuantDecodeResources(const QuantDecodeResourceFacts &facts,
     return total;
   };
   std::optional<unsigned> loaded = groups(facts.loadedValues);
-  std::optional<unsigned> carried = groups(facts.carriedValues);
   std::optional<unsigned> indices = groups(facts.indexValues);
   std::optional<unsigned> temporaries = groups(facts.temporaryValues);
-  if (!loaded || !carried || !indices || !temporaries)
+  if (!loaded || !indices || !temporaries)
     return std::nullopt;
 
   PhysicalResourceBudget resources;
   resources.architecturalGroups = target.vectorRegisters;
-  resources.valueGroups = *loaded + *carried;
+  resources.valueGroups = *loaded;
   resources.memoryGroups = *loaded;
   resources.indexGroups = *indices;
   resources.predicateGroups = facts.predicateGroups;

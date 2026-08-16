@@ -392,14 +392,11 @@ struct VLAUnaryDecision {
 struct VLAStateDecision {
   mlir::Operation *operation = nullptr;
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
-  VLAStateCarryRepresentation carry = VLAStateCarryRepresentation::Scalar;
-  VLAStateStripUpdate stripUpdate = VLAStateStripUpdate::AddReduction;
-  VLAStateFinalize finalize = VLAStateFinalize::Direct;
+  SelectedVLAStatePhysical physical;
   mlir::Type elementType;
   mlir::Value identity;
   VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
   bool relaxedOrder = false;
-  bool wholeVLALifetime = true;
   mlir::Value segmentStart;
   mlir::Value segmentVector;
   VLAStateValidityRealization validity =
@@ -2700,15 +2697,12 @@ private:
               "VLA state has no legal target implementation for its ordering and target facts");
         return mlir::failure();
       }
-      state.carry = selected->carry;
-      state.stripUpdate = selected->stripUpdate;
-      state.finalize = selected->finalize;
-      state.wholeVLALifetime = selected->wholeVLALifetime;
+      state.physical = *selected;
     }
     const bool needsF32MathImplementation =
         !decision.unaries.empty() ||
         llvm::any_of(decision.states, [](const VLAStateDecision &state) {
-          return state.stripUpdate ==
+          return state.physical.stripUpdate ==
                  VLAStateStripUpdate::OnlineSoftmaxSummary;
         });
     if (needsF32MathImplementation) {
@@ -2806,9 +2800,7 @@ private:
           segment.elementSEW});
     candidateFacts.lookupCount = decision.lookups.size();
     for (const VLAStateDecision &state : decision.states)
-      candidateFacts.states.push_back(
-          VLAStateResourceFact{state.carry, state.stripUpdate,
-                               state.wholeVLALifetime});
+      candidateFacts.states.push_back(state.physical);
     candidateFacts.dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
     if (decision.f32MathImplementation)
@@ -3136,7 +3128,7 @@ private:
     }
 
     for (VLAStateDecision &state : decision.states) {
-      if (state.stripUpdate ==
+      if (state.physical.stripUpdate ==
           VLAStateStripUpdate::SegmentedInclusiveAddScan) {
         const VLAPredicateDecision *segmentPredicate = nullptr;
         auto found = llvm::find_if(
@@ -3162,7 +3154,7 @@ private:
         }
       }
       unsigned stateInputSEW =
-          state.stripUpdate == VLAStateStripUpdate::WideningAddReduction
+          state.physical.stripUpdate == VLAStateStripUpdate::WideningAddReduction
               ? 8
               : 32;
       RVVVectorShape stateShape =
@@ -3175,7 +3167,7 @@ private:
                             PhysicalHandoff::Share, stateShape, stateShape);
       recordPhysicalHandoff(
           entity, state.operation, state.identity,
-          state.carry == VLAStateCarryRepresentation::Vector
+          state.physical.carry == VLAStateCarryRepresentation::Vector
               ? PhysicalHandoff::Share
               : PhysicalHandoff::Rematerialize,
           stateShape, stateShape);
@@ -4121,7 +4113,7 @@ private:
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
-      if (state.carry == VLAStateCarryRepresentation::Vector) {
+      if (state.physical.carry == VLAStateCarryRepresentation::Vector) {
         if (entity.vlaDataShape.sew != 32)
           return state.operation->emitError(
               "vector state carry requires the selected f32 VLA shape");
@@ -4134,8 +4126,8 @@ private:
         aggregates[state.operation] = aggregate;
         continue;
       }
-      if (state.carry == VLAStateCarryRepresentation::ScalarTuple &&
-          state.stripUpdate == VLAStateStripUpdate::ArgMaxSummary) {
+      if (state.physical.carry == VLAStateCarryRepresentation::ScalarTuple &&
+          state.physical.stripUpdate == VLAStateStripUpdate::ArgMaxSummary) {
         auto summary = mlir::cast<ArgMaxOp>(state.operation);
         CValue maximum{mlir::Float32Type::get(kernel.getContext()),
                        CValueKind::Scalar, fresh("argmax_value")};
@@ -4149,8 +4141,8 @@ private:
         values[summary.getResult()] = aggregate;
         continue;
       }
-      if (state.carry == VLAStateCarryRepresentation::ScalarTuple &&
-          state.stripUpdate == VLAStateStripUpdate::OnlineSoftmaxSummary) {
+      if (state.physical.carry == VLAStateCarryRepresentation::ScalarTuple &&
+          state.physical.stripUpdate == VLAStateStripUpdate::OnlineSoftmaxSummary) {
         auto summary = mlir::cast<OnlineSoftmaxSummaryOp>(state.operation);
         CValue maximum{mlir::Float32Type::get(kernel.getContext()),
                        CValueKind::Scalar, fresh("summary_max")};
@@ -4164,15 +4156,15 @@ private:
         values[summary.getResult()] = aggregate;
         continue;
       }
-      if (state.carry != VLAStateCarryRepresentation::Scalar)
+      if (state.physical.carry != VLAStateCarryRepresentation::Scalar)
         return state.operation->emitError(
             "VLA state carry representation has no intrinsic C spelling");
       std::string identity = expression(state.identity);
       if (identity.empty())
         return state.operation->emitError("VLA state identity is unavailable");
       llvm::StringRef prefix =
-          state.stripUpdate == VLAStateStripUpdate::InclusiveAddScan ||
-                  state.stripUpdate ==
+          state.physical.stripUpdate == VLAStateStripUpdate::InclusiveAddScan ||
+                  state.physical.stripUpdate ==
                       VLAStateStripUpdate::SegmentedInclusiveAddScan
               ? "scan_carry"
               : "reduce";
@@ -4238,7 +4230,7 @@ private:
             return nested.emitError(
                 "VLA summary has no physical state decision");
           mlir::LogicalResult lowered =
-              state->stripUpdate == VLAStateStripUpdate::ArgMaxSummary
+              state->physical.stripUpdate == VLAStateStripUpdate::ArgMaxSummary
                   ? emitVectorArgMaxSummary(
                         mlir::cast<ArgMaxOp>(nested), *state,
                         aggregates[&nested])
@@ -4267,8 +4259,8 @@ private:
     line("}");
 
     for (const VLAStateDecision &state : decision.states) {
-      if (state.carry != VLAStateCarryRepresentation::Vector ||
-          state.finalize == VLAStateFinalize::Direct)
+      if (state.physical.carry != VLAStateCarryRepresentation::Vector ||
+          state.physical.finalize == VLAStateFinalize::Direct)
         continue;
       auto reduce = mlir::cast<ReduceOp>(state.operation);
       CValue aggregate = aggregates[state.operation];
@@ -4278,7 +4270,7 @@ private:
       line(scalarF32Type + " " + seed + " = __riscv_vfmv_v_f_" +
            scalarF32Suffix + "(" + expression(state.identity) + ", 1);");
       std::string intrinsic =
-          state.finalize == VLAStateFinalize::HorizontalAdd
+          state.physical.finalize == VLAStateFinalize::HorizontalAdd
               ? "__riscv_vfredusum_vs_"
               : "__riscv_vfredmax_vs_";
       line(scalarF32Type + " " + reduced + " = " + intrinsic + dataSuffix +
@@ -11216,7 +11208,7 @@ private:
                                        const VLAStateDecision &decision,
                                        const CValue &aggregate) {
     CValue input = require(op.getInput());
-    if (decision.stripUpdate == VLAStateStripUpdate::WideningAddReduction) {
+    if (decision.physical.stripUpdate == VLAStateStripUpdate::WideningAddReduction) {
       if (input.kind != CValueKind::I8Vector ||
           aggregate.kind != CValueKind::Scalar ||
           aggregate.type != op.getResult().getType() ||
@@ -11267,14 +11259,14 @@ private:
     if (!inputShape || inputShape->shape.sew != 32 || inputSuffix.empty() ||
         scalarSuffix.empty() || scalarType.empty())
       return op.emitError("RVV reduction has no physical input shape");
-    if (decision.carry == VLAStateCarryRepresentation::Vector) {
+    if (decision.physical.carry == VLAStateCarryRepresentation::Vector) {
       if (aggregate.kind != CValueKind::F32BlockStorage)
         return op.emitError("RVV vector reduction carry is unavailable");
-      if (decision.stripUpdate == VLAStateStripUpdate::AddReduction)
+      if (decision.physical.stripUpdate == VLAStateStripUpdate::AddReduction)
         line(aggregate.spelling + " = __riscv_vfadd_vv_" + inputSuffix +
              "_tu(" + aggregate.spelling + ", " + aggregate.spelling + ", " +
              *projected + ", " + activeVL + ");");
-      else if (decision.stripUpdate == VLAStateStripUpdate::MaxReduction)
+      else if (decision.physical.stripUpdate == VLAStateStripUpdate::MaxReduction)
         line(aggregate.spelling + " = __riscv_vfmax_vv_" + inputSuffix +
              "_tu(" + aggregate.spelling + ", " + aggregate.spelling + ", " +
              *projected + ", " + activeVL + ");");
@@ -11282,18 +11274,18 @@ private:
         return op.emitError("selected VLA state is not a reduction");
       return mlir::success();
     }
-    if (decision.carry != VLAStateCarryRepresentation::Scalar ||
+    if (decision.physical.carry != VLAStateCarryRepresentation::Scalar ||
         aggregate.kind != CValueKind::Scalar)
       return op.emitError("RVV scalar reduction carry is unavailable");
     std::string seed = fresh("seed");
     std::string partial = fresh("partial");
     line(scalarType + " " + seed + " = __riscv_vfmv_v_f_" + scalarSuffix +
          "(" + aggregate.spelling + ", 1);");
-    if (decision.stripUpdate == VLAStateStripUpdate::AddReduction)
+    if (decision.physical.stripUpdate == VLAStateStripUpdate::AddReduction)
       line(scalarType + " " + partial + " = __riscv_vfredusum_vs_" +
            inputSuffix + "_" + scalarSuffix + "(" +
            *projected + ", " + seed + ", " + activeVL + ");");
-    else if (decision.stripUpdate == VLAStateStripUpdate::MaxReduction)
+    else if (decision.physical.stripUpdate == VLAStateStripUpdate::MaxReduction)
       line(scalarType + " " + partial + " = __riscv_vfredmax_vs_" +
            inputSuffix + "_" + scalarSuffix + "(" +
            *projected + ", " + seed + ", " + activeVL + ");");
@@ -11309,11 +11301,11 @@ private:
                                      const VLAStateDecision &decision,
                                      const CValue &carry) {
     CValue input = require(op.getInput());
-    bool segmented = decision.stripUpdate ==
+    bool segmented = decision.physical.stripUpdate ==
                      VLAStateStripUpdate::SegmentedInclusiveAddScan;
-    if ((decision.stripUpdate != VLAStateStripUpdate::InclusiveAddScan &&
+    if ((decision.physical.stripUpdate != VLAStateStripUpdate::InclusiveAddScan &&
          !segmented) ||
-        decision.carry != VLAStateCarryRepresentation::Scalar ||
+        decision.physical.carry != VLAStateCarryRepresentation::Scalar ||
         input.kind != CValueKind::F32Vector ||
         carry.kind != CValueKind::Scalar || carry.spelling.empty())
         return op.emitError("RVV scan projection is unavailable");
@@ -11446,8 +11438,8 @@ private:
       const CValue &aggregate) {
     CValue input = require(op.getInput());
     CValue coordinate = require(op.getCoordinate());
-    if (decision.stripUpdate != VLAStateStripUpdate::ArgMaxSummary ||
-        decision.carry != VLAStateCarryRepresentation::ScalarTuple ||
+    if (decision.physical.stripUpdate != VLAStateStripUpdate::ArgMaxSummary ||
+        decision.physical.carry != VLAStateCarryRepresentation::ScalarTuple ||
         input.kind != CValueKind::F32Vector ||
         coordinate.kind != CValueKind::Coordinate ||
         coordinate.spelling.empty() || coordinate.laneStride.empty() ||
@@ -11522,8 +11514,8 @@ private:
       OnlineSoftmaxSummaryOp op, const VLAStateDecision &decision,
       const CValue &aggregate) {
     CValue input = require(op.getInput());
-    if (decision.stripUpdate != VLAStateStripUpdate::OnlineSoftmaxSummary ||
-        decision.carry != VLAStateCarryRepresentation::ScalarTuple ||
+    if (decision.physical.stripUpdate != VLAStateStripUpdate::OnlineSoftmaxSummary ||
+        decision.physical.carry != VLAStateCarryRepresentation::ScalarTuple ||
         input.kind != CValueKind::F32Vector ||
         aggregate.kind != CValueKind::Tuple || aggregate.fields.size() != 2)
       return op.emitError(
