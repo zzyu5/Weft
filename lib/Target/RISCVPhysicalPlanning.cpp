@@ -1247,6 +1247,43 @@ selectSignBitI8Physical(const RISCVTargetProfile &target) {
   return selected;
 }
 
+std::optional<PhysicalResourceBudget>
+calculateQuantDecodeResources(const QuantDecodeResourceFacts &facts,
+                              const RISCVTargetProfile &target) {
+  auto groups = [&](llvm::ArrayRef<RVVShapeMultiplicity> values)
+      -> std::optional<unsigned> {
+    unsigned total = 0;
+    for (const RVVShapeMultiplicity &value : values) {
+      if (!value.shape || value.count == 0 ||
+          !target.supportsVectorShape(value.shape.sew,
+                                      value.shape.lmulEighths))
+        return std::nullopt;
+      total += value.count * rvvRegisterGroups(value.shape);
+    }
+    return total;
+  };
+  std::optional<unsigned> loaded = groups(facts.loadedValues);
+  std::optional<unsigned> carried = groups(facts.carriedValues);
+  std::optional<unsigned> indices = groups(facts.indexValues);
+  std::optional<unsigned> temporaries = groups(facts.temporaryValues);
+  if (!loaded || !carried || !indices || !temporaries)
+    return std::nullopt;
+
+  PhysicalResourceBudget resources;
+  resources.architecturalGroups = target.vectorRegisters;
+  resources.valueGroups = *loaded + *carried;
+  resources.memoryGroups = *loaded;
+  resources.indexGroups = *indices;
+  resources.predicateGroups = facts.predicateGroups;
+  resources.primitiveGroups =
+      resources.valueGroups + resources.indexGroups + *temporaries;
+  resources.peakGroups = resources.primitiveGroups + resources.predicateGroups;
+  if (resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return resources;
+}
+
 std::optional<SelectedTernaryI8DotPhysical>
 selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target) {
@@ -1291,23 +1328,22 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   selected.secondaryWidening =
       RVVWideningChain{*byte16, *widened16, kRVVE32M1, 16, 1};
 
-  unsigned byteGroups = rvvRegisterGroups(*byte32);
-  unsigned widenedGroups = rvvRegisterGroups(*widened32);
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups = byteGroups + widenedGroups;
-  selected.resources.memoryGroups = 2 * byteGroups;
+  QuantDecodeResourceFacts resources;
+  resources.loadedValues = {{*byte32, 1}, {*byte16, 1}};
   switch (facts.semantic) {
   case TernaryI8DotSemantic::Base3Digits:
-    selected.resources.primitiveGroups = byteGroups + 3 * widenedGroups + 1;
+    resources.temporaryValues = {{*widened32, 3}, {kRVVE32M1, 1}};
     break;
   case TernaryI8DotSemantic::PackedI2Fields:
-    selected.resources.primitiveGroups = 3 * byteGroups + widenedGroups + 1;
+    resources.temporaryValues =
+        {{*byte32, 2}, {*widened32, 1}, {kRVVE32M1, 1}};
     break;
   }
-  selected.resources.peakGroups = selected.resources.primitiveGroups;
-  if (selected.resources.peakGroups >=
-      static_cast<unsigned>(target.vectorRegisters))
+  std::optional<PhysicalResourceBudget> budget =
+      calculateQuantDecodeResources(resources, target);
+  if (!budget)
     return std::nullopt;
+  selected.resources = *budget;
   return selected;
 }
 
@@ -1374,21 +1410,19 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   selected.tableShape = *tableShape;
   selected.widening =
       RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups =
-      rvvRegisterGroups(*tableShape) + rvvRegisterGroups(*activationShape);
-  selected.resources.memoryGroups =
-      rvvRegisterGroups(*codeShape) + rvvRegisterGroups(*activationShape);
-  selected.resources.indexGroups = rvvRegisterGroups(*indexShape);
-  selected.resources.predicateGroups = 1;
-  selected.resources.primitiveGroups =
-      rvvRegisterGroups(*indexShape) + 2 * rvvRegisterGroups(*tableShape) +
-      2 * rvvRegisterGroups(*activationShape) +
-      rvvRegisterGroups(*productShape) + 2;
-  selected.resources.peakGroups = selected.resources.primitiveGroups;
-  if (selected.resources.peakGroups >=
-      static_cast<unsigned>(target.vectorRegisters))
+  QuantDecodeResourceFacts resources;
+  resources.loadedValues =
+      {{*codeShape, 1}, {*tableShape, 1}, {*activationShape, 1}};
+  resources.indexValues = {{*indexShape, 1}};
+  resources.temporaryValues =
+      {{*tableShape, 1}, {*activationShape, 1}, {*productShape, 1},
+       {kRVVE32M1, 2}};
+  resources.predicateGroups = 1;
+  std::optional<PhysicalResourceBudget> budget =
+      calculateQuantDecodeResources(resources, target);
+  if (!budget)
     return std::nullopt;
+  selected.resources = *budget;
   return selected;
 }
 
@@ -1426,23 +1460,16 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
   selected.tableShape = combined ? *activationShape : *packedShape;
   selected.widening =
       RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups =
-      rvvRegisterGroups(*packedShape) +
-      rvvRegisterGroups(selected.tableShape) +
-      rvvRegisterGroups(*activationShape);
-  selected.resources.memoryGroups = selected.resources.valueGroups;
-  unsigned productGroups =
-      rvvRegisterGroups(*productShape) * (combined ? 1 : 2);
-  selected.resources.primitiveGroups =
-      rvvRegisterGroups(*packedShape) +
-      rvvRegisterGroups(selected.tableShape) +
-      rvvRegisterGroups(*activationShape) +
-      productGroups + 2;
-  selected.resources.peakGroups = selected.resources.primitiveGroups;
-  if (selected.resources.peakGroups >=
-      static_cast<unsigned>(target.vectorRegisters))
+  QuantDecodeResourceFacts resources;
+  resources.loadedValues =
+      {{*packedShape, 1}, {selected.tableShape, 1}, {*activationShape, 1}};
+  resources.temporaryValues =
+      {{*productShape, combined ? 1u : 2u}, {kRVVE32M1, 2}};
+  std::optional<PhysicalResourceBudget> budget =
+      calculateQuantDecodeResources(resources, target);
+  if (!budget)
     return std::nullopt;
+  selected.resources = *budget;
   return selected;
 }
 
@@ -1505,9 +1532,13 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     if (!byteShape || !productShape)
       continue;
     const unsigned segments = lanes / 16;
-    const unsigned registerGroups = rvvRegisterGroups(*byteShape);
-    const unsigned registerPeak = 4 * segments + 4 * registerGroups;
-    if (registerPeak < static_cast<unsigned>(target.vectorRegisters)) {
+    QuantDecodeResourceFacts resources;
+    resources.loadedValues = {{*byteShape, 2}};
+    resources.temporaryValues =
+        {{*byteShape, 2}, {kRVVE32M1, 4 * segments}};
+    std::optional<PhysicalResourceBudget> budget =
+        calculateQuantDecodeResources(resources, target);
+    if (budget) {
       SelectedQuantI8DotPhysical selected;
       selected.implementation.primitive = primitive;
       selected.implementation.structure =
@@ -1519,11 +1550,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       selected.decode = decode;
       selected.widening = RVVWideningChain{*byteShape, *productShape,
                                            kRVVE32M1, lanes, segments};
-      selected.resources.architecturalGroups = target.vectorRegisters;
-      selected.resources.valueGroups = registerGroups * 2;
-      selected.resources.memoryGroups = selected.resources.valueGroups;
-      selected.resources.primitiveGroups = registerPeak;
-      selected.resources.peakGroups = registerPeak;
+      selected.resources = *budget;
       return selected;
     }
   }
@@ -1546,14 +1573,14 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.decode = decode;
   selected.widening = RVVWideningChain{stripShape, RVVVectorShape{16, 32},
                                        kRVVE32M1, 16, 1};
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups = rvvRegisterGroups(stripShape) * 2;
-  selected.resources.memoryGroups = selected.resources.valueGroups;
-  selected.resources.primitiveGroups = 6;
-  selected.resources.peakGroups = selected.resources.primitiveGroups;
-  if (selected.resources.peakGroups >
-      static_cast<unsigned>(target.vectorRegisters))
+  QuantDecodeResourceFacts stripResources;
+  stripResources.loadedValues = {{stripShape, 2}};
+  stripResources.temporaryValues = {{kRVVE32M1, 2}};
+  std::optional<PhysicalResourceBudget> stripBudget =
+      calculateQuantDecodeResources(stripResources, target);
+  if (!stripBudget)
     return std::nullopt;
+  selected.resources = *stripBudget;
   return selected;
 }
 
@@ -1565,11 +1592,10 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
   struct Candidate {
     RVVVectorShape packed;
     RVVVectorShape activation;
-    unsigned primitiveGroups;
   };
   llvm::SmallVector<Candidate> candidates = {
-      {{8, 4}, {8, 4}, 8},
-      {{8, 8}, {8, 16}, 12},
+      {{8, 4}, {8, 4}},
+      {{8, 8}, {8, 16}},
   };
   for (const Candidate &candidate : candidates) {
     const std::optional<unsigned> packedLanes =
@@ -1580,6 +1606,18 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
         *activationLanes < 16 ||
         !target.supportsVectorShape(16,
                                     candidate.activation.lmulEighths * 2))
+      continue;
+    RVVVectorShape productShape{16,
+                                candidate.activation.lmulEighths * 2};
+    QuantDecodeResourceFacts resources;
+    resources.loadedValues =
+        {{candidate.packed, 1}, {candidate.activation, 1}};
+    resources.temporaryValues =
+        {{candidate.packed, 2}, {candidate.activation, 2},
+         {productShape, 1}, {kRVVE32M1, 2}};
+    std::optional<PhysicalResourceBudget> budget =
+        calculateQuantDecodeResources(resources, target);
+    if (!budget)
       continue;
     SelectedE2M1E8M0I8Physical selected;
     selected.implementation.primitive = LocalPrimitiveKind::E2M1E8M0I8;
@@ -1592,16 +1630,8 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
       continue;
     selected.packedShape = candidate.packed;
     selected.activationShape = candidate.activation;
-    selected.resources.architecturalGroups = target.vectorRegisters;
-    selected.resources.primitiveGroups = candidate.primitiveGroups;
-    selected.resources.valueGroups =
-        rvvRegisterGroups(selected.packedShape) +
-        rvvRegisterGroups(selected.activationShape);
-    selected.resources.memoryGroups = selected.resources.valueGroups;
-    selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
-    if (selected.resources.peakGroups <=
-        static_cast<unsigned>(target.vectorRegisters))
-      return selected;
+    selected.resources = *budget;
+    return selected;
   }
 
   const RVVVectorShape stripShape{8, 8};
@@ -1617,16 +1647,15 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
     return std::nullopt;
   selected.packedShape = stripShape;
   selected.activationShape = stripShape;
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.resources.valueGroups =
-      rvvRegisterGroups(selected.packedShape) +
-      rvvRegisterGroups(selected.activationShape);
-  selected.resources.memoryGroups = selected.resources.valueGroups;
-  selected.resources.primitiveGroups = 4;
-  selected.resources.peakGroups = selected.resources.primitiveGroups + 1;
-  if (selected.resources.peakGroups >
-      static_cast<unsigned>(target.vectorRegisters))
+  QuantDecodeResourceFacts stripResources;
+  stripResources.loadedValues = {{stripShape, 2}};
+  stripResources.temporaryValues = {{RVVVectorShape{16, 16}, 1},
+                                    {kRVVE32M1, 2}};
+  std::optional<PhysicalResourceBudget> stripBudget =
+      calculateQuantDecodeResources(stripResources, target);
+  if (!stripBudget)
     return std::nullopt;
+  selected.resources = *stripBudget;
   return selected;
 }
 
@@ -1656,7 +1685,6 @@ selectGroupedAffineI4I8Physical(
   selected.implementation.parameters.secondaryShape = kRVVE16M2;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.resources.architecturalGroups = target.vectorRegisters;
   selected.scaleShape = *scaleShape;
   selected.activationSumShape = *activationSumShape;
   if (!target.supportsVectorShape(8, 8) ||
@@ -1667,18 +1695,17 @@ selectGroupedAffineI4I8Physical(
   selected.activationShape = kRVVE8M1;
   selected.widenedShape = kRVVE16M2;
   selected.reductionShape = kRVVE32M1;
-  selected.resources.primitiveGroups = 6;
-
-  selected.resources.valueGroups =
-      rvvRegisterGroups(selected.packedShape) +
-      rvvRegisterGroups(selected.scaleShape) +
-      rvvRegisterGroups(selected.activationShape) +
-      rvvRegisterGroups(selected.activationSumShape);
-  selected.resources.memoryGroups = selected.resources.valueGroups;
-  selected.resources.peakGroups = selected.resources.primitiveGroups;
-  if (selected.resources.peakGroups >
-      static_cast<unsigned>(target.vectorRegisters))
+  QuantDecodeResourceFacts resources;
+  resources.loadedValues =
+      {{selected.packedShape, 1}, {selected.scaleShape, 1},
+       {selected.activationShape, 1}, {selected.activationSumShape, 1}};
+  resources.temporaryValues =
+      {{selected.widenedShape, 1}, {selected.reductionShape, 2}};
+  std::optional<PhysicalResourceBudget> budget =
+      calculateQuantDecodeResources(resources, target);
+  if (!budget)
     return std::nullopt;
+  selected.resources = *budget;
   return selected;
 }
 

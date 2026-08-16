@@ -717,6 +717,23 @@ struct RVVWideningChain {
   unsigned reductionSegments = 0;
 };
 
+struct RVVShapeMultiplicity {
+  RVVVectorShape shape;
+  unsigned count = 0;
+};
+
+struct QuantDecodeResourceFacts {
+  llvm::SmallVector<RVVShapeMultiplicity> loadedValues;
+  llvm::SmallVector<RVVShapeMultiplicity> carriedValues;
+  llvm::SmallVector<RVVShapeMultiplicity> indexValues;
+  llvm::SmallVector<RVVShapeMultiplicity> temporaryValues;
+  unsigned predicateGroups = 0;
+};
+
+std::optional<PhysicalResourceBudget>
+calculateQuantDecodeResources(const QuantDecodeResourceFacts &facts,
+                              const RISCVTargetProfile &target);
+
 enum class TernaryI8DotSemantic {
   Base3Digits,
   PackedI2Fields,
