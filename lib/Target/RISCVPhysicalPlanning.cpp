@@ -138,7 +138,13 @@ static bool selectLocalImplementationLeaf(LocalImplementation &implementation) {
                     : LocalImplementationLeaf::None;
     break;
   case LocalPrimitiveKind::GroupedAffineI4I8:
-    if (strip && parameters.semanticLanes == 32 &&
+    if (rvvRegister &&
+        (parameters.semanticLanes == 16 || parameters.semanticLanes == 32) &&
+        parameters.primaryShape == kRVVE8M1 &&
+        parameters.secondaryShape == kRVVE16M2)
+      implementation.leaf =
+          LocalImplementationLeaf::RVVGroupedAffineI4I8Register;
+    else if (strip && parameters.semanticLanes == 32 &&
         parameters.primaryShape == kRVVE8M1 &&
         parameters.secondaryShape == kRVVE16M2)
       implementation.leaf =
@@ -1707,13 +1713,6 @@ selectGroupedAffineI4I8Physical(
     return std::nullopt;
 
   SelectedGroupedAffineI4I8Physical selected;
-  selected.implementation.primitive = LocalPrimitiveKind::GroupedAffineI4I8;
-  selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
-  selected.implementation.parameters.semanticLanes = 32;
-  selected.implementation.parameters.primaryShape = kRVVE8M1;
-  selected.implementation.parameters.secondaryShape = kRVVE16M2;
-  if (!selectLocalImplementationLeaf(selected.implementation))
-    return std::nullopt;
   selected.scaleShape = *scaleShape;
   selected.activationSumShape = *activationSumShape;
   if (!target.supportsVectorShape(8, 8) ||
@@ -1724,6 +1723,39 @@ selectGroupedAffineI4I8Physical(
   selected.activationShape = kRVVE8M1;
   selected.widenedShape = kRVVE16M2;
   selected.reductionShape = kRVVE32M1;
+  selected.implementation.primitive = LocalPrimitiveKind::GroupedAffineI4I8;
+
+  std::optional<unsigned> nativeLanes =
+      rvvLaneCapacity(selected.packedShape, target);
+  if (nativeLanes && (*nativeLanes == 16 || *nativeLanes == 32)) {
+    selected.implementation.structure =
+        LocalImplementationStructure::RVVRegisterMicrokernel;
+    selected.implementation.parameters.semanticLanes = *nativeLanes;
+    selected.implementation.parameters.primaryShape = selected.packedShape;
+    selected.implementation.parameters.secondaryShape = selected.widenedShape;
+    if (!selectLocalImplementationLeaf(selected.implementation))
+      return std::nullopt;
+    selected.resources.architecturalGroups = target.vectorRegisters;
+    selected.resources.valueGroups =
+        rvvRegisterGroups(selected.packedShape) +
+        rvvRegisterGroups(selected.scaleShape) +
+        rvvRegisterGroups(selected.activationShape) +
+        rvvRegisterGroups(selected.activationSumShape);
+    selected.resources.memoryGroups = selected.resources.valueGroups;
+    selected.resources.primitiveGroups = *nativeLanes == 16 ? 32 : 8;
+    selected.resources.peakGroups = selected.resources.primitiveGroups;
+    if (selected.resources.peakGroups >
+        static_cast<unsigned>(target.vectorRegisters))
+      return std::nullopt;
+    return selected;
+  }
+
+  selected.implementation.structure = LocalImplementationStructure::RVVStripLoop;
+  selected.implementation.parameters.semanticLanes = 32;
+  selected.implementation.parameters.primaryShape = selected.packedShape;
+  selected.implementation.parameters.secondaryShape = selected.widenedShape;
+  if (!selectLocalImplementationLeaf(selected.implementation))
+    return std::nullopt;
   QuantDecodeResourceFacts resources;
   resources.loadedValues =
       {{selected.packedShape, 1}, {selected.scaleShape, 1},

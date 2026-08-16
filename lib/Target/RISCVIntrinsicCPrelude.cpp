@@ -9,6 +9,8 @@ void emitPrelude(llvm::raw_ostream &output, bool usesExp,
                  bool usesRVVSymmetricI4I8M4, bool usesRVVAffineI4I8M4,
                  bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
                  bool usesIME1SymmetricI4I8M4, bool usesIME1AffineI4I8M4,
+                 bool usesGroupedI4I8RegisterL16,
+                 bool usesGroupedI4I8RegisterL32,
                  bool usesGroupedI4I8Strip,
                  bool usesE2M1RegisterE8M1M2,
                  bool usesE2M1RegisterE8MF2,
@@ -69,6 +71,7 @@ __weft_load_f16_le_aligned(const uint8_t *bytes) {
   emitRVVLocalImplementations(
       output, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
       usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
+      usesGroupedI4I8RegisterL16, usesGroupedI4I8RegisterL32,
       usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
       usesE2M1RegisterE8MF2, usesE2M1Strip);
   emitIMELocalImplementations(output, usesIME1SymmetricI4I8,
@@ -198,6 +201,10 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
       LocalImplementationLeaf::IME1SymmetricI4I8M4N16);
   bool usesIME1AffineI4I8M4 = implementations.contains(
       LocalImplementationLeaf::IME1AffineI4I8M4N16);
+  bool usesGroupedI4I8RegisterL16 = implementations.contains(
+      LocalImplementationLeaf::RVVGroupedAffineI4I8Register, 16, kRVVE8M1);
+  bool usesGroupedI4I8RegisterL32 = implementations.contains(
+      LocalImplementationLeaf::RVVGroupedAffineI4I8Register, 32, kRVVE8M1);
   bool usesGroupedI4I8Strip = implementations.contains(
       LocalImplementationLeaf::RVVGroupedAffineI4I8Strip);
   bool usesE2M1RegisterE8M1M2 = implementations.contains(
@@ -210,6 +217,7 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
               usesIME1SymmetricI4I8M4, usesIME1AffineI4I8M4,
+              usesGroupedI4I8RegisterL16, usesGroupedI4I8RegisterL32,
               usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
               usesE2M1RegisterE8MF2, usesE2M1Strip);
   emitQuantLocalImplementations(output, implementations);

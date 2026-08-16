@@ -46,6 +46,8 @@ std::string localImplementationName(const LocalImplementation &implementation) {
     return "__weft_ime1_affine_i4_i8_n16_k32";
   case LocalImplementationLeaf::IME1AffineI4I8M4N16:
     return "__weft_ime1_affine_i4_i8_m4_n16_k32";
+  case LocalImplementationLeaf::RVVGroupedAffineI4I8Register:
+    return "__weft_grouped_affine_i4_i8" + registerSuffix;
   case LocalImplementationLeaf::RVVGroupedAffineI4I8Strip:
     return "__weft_grouped_affine_i4_i8_strip";
   case LocalImplementationLeaf::RVVE2M1E8M0I8RegisterMF2:

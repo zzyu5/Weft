@@ -545,6 +545,7 @@ enum class LocalImplementationLeaf {
   RVVAffineI4I8M4N16,
   IME1AffineI4I8N16,
   IME1AffineI4I8M4N16,
+  RVVGroupedAffineI4I8Register,
   RVVGroupedAffineI4I8Strip,
   RVVE2M1E8M0I8RegisterMF2,
   RVVE2M1E8M0I8RegisterM1M2,
