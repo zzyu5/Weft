@@ -23,7 +23,7 @@ namespace {
 
 constexpr std::size_t kN = 4096;
 constexpr std::size_t kK = 4096;
-constexpr std::size_t kBlock = 32;
+constexpr std::size_t kActivationBlock = 32;
 #if WEFT_MUL_MAT_KIND == 0
 constexpr std::size_t kWeightBlockBytes = 18;
 constexpr std::size_t kActivationBlockBytes = 34;
@@ -39,12 +39,19 @@ constexpr std::size_t kActivationBlockBytes = 36;
 #elif WEFT_MUL_MAT_KIND == 4
 constexpr std::size_t kWeightBlockBytes = 34;
 constexpr std::size_t kActivationBlockBytes = 34;
+#elif WEFT_MUL_MAT_KIND == 5
+constexpr std::size_t kWeightBlockBytes = 18;
+constexpr std::size_t kActivationBlockBytes = 34;
 #else
 #error "unsupported WEFT_MUL_MAT_KIND"
 #endif
-constexpr std::size_t kBlocks = kK / kBlock;
-constexpr std::size_t kWeightRowBytes = kBlocks * kWeightBlockBytes;
-constexpr std::size_t kActivationRowBytes = kBlocks * kActivationBlockBytes;
+constexpr std::size_t kWeightLogicalBlock =
+    WEFT_MUL_MAT_KIND == 5 ? 128 : 32;
+constexpr std::size_t kWeightBlocks = kK / kWeightLogicalBlock;
+constexpr std::size_t kActivationBlocks = kK / kActivationBlock;
+constexpr std::size_t kWeightRowBytes = kWeightBlocks * kWeightBlockBytes;
+constexpr std::size_t kActivationRowBytes =
+    kActivationBlocks * kActivationBlockBytes;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
 volatile std::uint64_t evictionSink;
 
@@ -96,13 +103,13 @@ float readHalf(const std::uint8_t *bytes) {
 }
 
 void initializeWeightRow(std::uint8_t *row) {
-  for (std::size_t block = 0; block < kBlocks; ++block) {
+  for (std::size_t block = 0; block < kWeightBlocks; ++block) {
 #if WEFT_MUL_MAT_KIND == 0
-    float source[kBlock];
+    float source[kWeightLogicalBlock];
     float absoluteMaximum = 0.0F;
     float signedMaximum = 0.0F;
-    for (std::size_t lane = 0; lane < kBlock; ++lane) {
-      const std::size_t inner = block * kBlock + lane;
+    for (std::size_t lane = 0; lane < kWeightLogicalBlock; ++lane) {
+      const std::size_t inner = block * kWeightLogicalBlock + lane;
       source[lane] =
           static_cast<float>(static_cast<int>(inner % 31) - 15) / 16.0F;
       if (absoluteMaximum < std::fabs(source[lane])) {
@@ -114,7 +121,7 @@ void initializeWeightRow(std::uint8_t *row) {
     const float inverse = scale == 0.0F ? 0.0F : 1.0F / scale;
     std::uint8_t *packed = row + block * kWeightBlockBytes;
     writeHalf(packed, scale);
-    for (std::size_t lane = 0; lane < kBlock / 2; ++lane) {
+    for (std::size_t lane = 0; lane < kWeightLogicalBlock / 2; ++lane) {
       const auto low = static_cast<std::uint8_t>(std::min(
           15, static_cast<int>(source[lane] * inverse + 8.5F)));
       const auto high = static_cast<std::uint8_t>(std::min(
@@ -152,12 +159,18 @@ void initializeWeightRow(std::uint8_t *row) {
       packed[codeOffset + lane] =
           static_cast<std::uint8_t>(low | (high << 4));
     }
-#else
+#elif WEFT_MUL_MAT_KIND == 4
     std::uint8_t *packed = row + block * kWeightBlockBytes;
     writeHalf(packed, 0.125F);
     for (std::size_t lane = 0; lane < 32; ++lane)
       packed[2 + lane] = static_cast<std::uint8_t>(
           static_cast<std::int8_t>((lane + 3 * block) % 31 - 15));
+#else
+    std::uint8_t *packed = row + block * kWeightBlockBytes;
+    writeHalf(packed, 0.125F);
+    for (std::size_t byte = 0; byte < 16; ++byte)
+      packed[2 + byte] = static_cast<std::uint8_t>(
+          0x5aU ^ static_cast<unsigned>(block + 7 * byte));
 #endif
   }
 }
@@ -172,13 +185,14 @@ bool validateQuantizedActivation(const std::vector<float> &activation,
                                  const std::vector<std::uint8_t> &workspace,
                                  std::size_t rows) {
   for (std::size_t row = 0; row < rows; ++row) {
-    for (std::size_t block = 0; block < kBlocks; ++block) {
-      const float *input = activation.data() + row * kK + block * kBlock;
+    for (std::size_t block = 0; block < kActivationBlocks; ++block) {
+      const float *input =
+          activation.data() + row * kK + block * kActivationBlock;
       const std::uint8_t *packed =
           workspace.data() + row * kActivationRowBytes +
           block * kActivationBlockBytes;
       float maximum = 0.0F;
-      for (std::size_t lane = 0; lane < kBlock; ++lane)
+      for (std::size_t lane = 0; lane < kActivationBlock; ++lane)
         maximum = std::max(maximum, std::fabs(input[lane]));
       const float scale = maximum / 127.0F;
       const float inverse = maximum == 0.0F ? 0.0F : 1.0F / scale;
@@ -188,7 +202,7 @@ bool validateQuantizedActivation(const std::vector<float> &activation,
 #if WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3
       std::int32_t codeSum = 0;
 #endif
-      for (std::size_t lane = 0; lane < kBlock; ++lane) {
+      for (std::size_t lane = 0; lane < kActivationBlock; ++lane) {
         const std::size_t codeOffset =
             WEFT_MUL_MAT_KIND == 1 || WEFT_MUL_MAT_KIND == 3 ? 4 : 2;
         const auto actual =
@@ -214,10 +228,12 @@ bool validateQuantizedActivation(const std::vector<float> &activation,
 float reference(const std::uint8_t *weight,
                 const std::uint8_t *activation) {
   float result = 0.0F;
-  for (std::size_t block = 0; block < kBlocks; ++block) {
+  for (std::size_t block = 0; block < kWeightBlocks; ++block) {
     const std::uint8_t *x = weight + block * kWeightBlockBytes;
+#if WEFT_MUL_MAT_KIND != 5
     const std::uint8_t *y = activation + block * kActivationBlockBytes;
     std::int32_t integerSum = 0;
+#endif
 #if WEFT_MUL_MAT_KIND == 0 || WEFT_MUL_MAT_KIND == 1
     for (std::size_t lane = 0; lane < 16; ++lane) {
       const std::size_t weightCodeOffset = WEFT_MUL_MAT_KIND == 0 ? 2 : 4;
@@ -262,11 +278,25 @@ float reference(const std::uint8_t *weight,
 #if WEFT_MUL_MAT_KIND == 3
     result += readHalf(x + 2) * readHalf(y + 2);
 #endif
-#else
+#elif WEFT_MUL_MAT_KIND == 4
     for (std::size_t lane = 0; lane < 32; ++lane)
       integerSum += static_cast<std::int8_t>(x[2 + lane]) *
                     static_cast<std::int8_t>(y[2 + lane]);
     result += readHalf(x) * readHalf(y) * static_cast<float>(integerSum);
+#else
+    const float weightScale = readHalf(x);
+    for (std::size_t subblock = 0; subblock < 4; ++subblock) {
+      const std::uint8_t *q8 =
+          activation + (block * 4 + subblock) * kActivationBlockBytes;
+      std::int32_t localSum = 0;
+      for (std::size_t lane = 0; lane < 32; ++lane) {
+        const std::size_t bit = subblock * 32 + lane;
+        const bool positive = ((x[2 + bit / 8] >> (bit % 8)) & 1U) != 0;
+        const int sign = positive ? 1 : -1;
+        localSum += sign * static_cast<std::int8_t>(q8[2 + lane]);
+      }
+      result += weightScale * readHalf(q8) * static_cast<float>(localSum);
+    }
 #endif
   }
   return result;

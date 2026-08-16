@@ -491,7 +491,7 @@ case "${kernel}" in
     runtime=examples/repro/weft/dot/blocked_gemm_f32_runtime.cpp
     runtime_arguments=("$1" "$2")
     ;;
-  mul_mat_q4_0|mul_mat_q4_1|mul_mat_q5_0|mul_mat_q5_1|mul_mat_q8_0)
+  mul_mat_q1_0|mul_mat_q4_0|mul_mat_q4_1|mul_mat_q5_0|mul_mat_q5_1|mul_mat_q8_0)
     if [[ $# -ne 2 ]]; then
       echo "usage: ${usage_prefix} ${kernel} <decode|prefill> <repetitions>" >&2
       exit 2
@@ -515,6 +515,9 @@ case "${kernel}" in
         ;;
       mul_mat_q8_0)
         runtime_compile_flags="-DWEFT_MUL_MAT_KIND=4 -DWEFT_MUL_MAT_ENTRY=mul_mat_q8_0"
+        ;;
+      mul_mat_q1_0)
+        runtime_compile_flags="-DWEFT_MUL_MAT_KIND=5 -DWEFT_MUL_MAT_ENTRY=mul_mat_q1_0"
         ;;
     esac
     ;;

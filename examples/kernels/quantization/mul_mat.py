@@ -8,6 +8,7 @@ from examples.kernels.quantization.block_dot import (
     q5_1_row_dot,
     q8_0_row_dot,
 )
+from examples.kernels.quantization.q1_0 import q1_0_row_dot
 
 
 @W.helper(effects=("read", "write"))
@@ -286,5 +287,43 @@ def mul_mat_q8_0(
                     weight + column * row_bytes,
                     activation_row,
                     blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_q1_0(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    activation_blocks = inner // W.index(32)
+    weight_blocks = inner // W.index(128)
+    activation_row_bytes = activation_blocks * W.index(34)
+    weight_row_bytes = weight_blocks * W.index(18)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+
+    for row in W.range(row_begin, row_end):
+        quantize_q8_0_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            activation_blocks,
+        )
+
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                q1_0_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    weight_blocks,
                 ),
             )
