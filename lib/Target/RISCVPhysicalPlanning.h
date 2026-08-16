@@ -867,11 +867,6 @@ selectGroupedAffineI4I8Physical(
     const GroupedAffineI4I8CandidateFacts &facts,
     const RISCVTargetProfile &target);
 
-enum class F32DotResourceModel {
-  VLAFreeAxis,
-  LocalRow,
-};
-
 enum class F32DotStructure {
   RVVVLAMicrotile,
   RVVVLAVectorDot,
@@ -912,7 +907,8 @@ struct F32DotParameters {
 };
 
 struct F32DotCandidateFacts {
-  F32DotResourceModel model = F32DotResourceModel::LocalRow;
+  bool lhsVLAFreeAxis = false;
+  bool rhsVLAFreeAxis = false;
   unsigned rowTile = 1;
   std::optional<uint64_t> reductionExtent;
   unsigned unitStrideOperands = 0;
@@ -923,7 +919,6 @@ struct F32DotCandidateFacts {
   unsigned handoffGroups = 0;
   bool reductionPredicate = false;
   bool materializedInit = false;
-  bool vlaVectorFreeAxis = false;
 };
 
 struct SelectedF32DotPhysical {

@@ -271,6 +271,44 @@ mlir::Value findIndexedOffset(mlir::Value pointer, mlir::Value coordinate) {
   return {};
 }
 
+std::optional<StructuredProductFacts>
+analyzeStructuredProductFacts(const KernelPhysicalFacts &kernelFacts,
+                              mlir::Value lhs, mlir::Value rhs,
+                              mlir::Value result) {
+  auto lhsFact = kernelFacts.values.find(lhs);
+  auto rhsFact = kernelFacts.values.find(rhs);
+  auto resultFact = kernelFacts.values.find(result);
+  if (lhsFact == kernelFacts.values.end() ||
+      rhsFact == kernelFacts.values.end() ||
+      resultFact == kernelFacts.values.end())
+    return std::nullopt;
+  StructuredProductFacts facts;
+  facts.lhsAxes = lhsFact->second.logicalAxes;
+  facts.rhsAxes = rhsFact->second.logicalAxes;
+  facts.resultAxes = resultFact->second.logicalAxes;
+  for (mlir::Value axis : facts.lhsAxes) {
+    bool rhsHas = llvm::is_contained(facts.rhsAxes, axis);
+    bool resultHas = llvm::is_contained(facts.resultAxes, axis);
+    if (rhsHas && !resultHas)
+      facts.reductionAxes.push_back(axis);
+    else if (resultHas && !rhsHas)
+      facts.lhsFreeAxes.push_back(axis);
+  }
+  for (mlir::Value axis : facts.rhsAxes) {
+    bool lhsHas = llvm::is_contained(facts.lhsAxes, axis);
+    bool resultHas = llvm::is_contained(facts.resultAxes, axis);
+    if (resultHas && !lhsHas)
+      facts.rhsFreeAxes.push_back(axis);
+  }
+  for (mlir::Value axis : facts.resultAxes) {
+    if (!llvm::is_contained(facts.lhsAxes, axis))
+      facts.lhsBroadcastAxes.push_back(axis);
+    if (!llvm::is_contained(facts.rhsAxes, axis))
+      facts.rhsBroadcastAxes.push_back(axis);
+  }
+  return facts;
+}
+
 mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
                                                KernelPhysicalFacts &facts) {
   facts.blockAxes.clear();

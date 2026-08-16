@@ -95,6 +95,10 @@ struct StructuredProductFacts {
   llvm::SmallVector<mlir::Value> rhsBroadcastAxes;
 };
 
+std::optional<StructuredProductFacts>
+analyzeStructuredProductFacts(const KernelPhysicalFacts &facts, mlir::Value lhs,
+                              mlir::Value rhs, mlir::Value result);
+
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate);
 mlir::Value findIndexedOffset(mlir::Value pointer, mlir::Value coordinate);
 

@@ -1754,10 +1754,12 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     unrollCandidates = {
         static_cast<unsigned>(config.parameters.dotKUnroll)};
 
-  const unsigned desiredLanes =
-      facts.model == F32DotResourceModel::VLAFreeAxis
-          ? (facts.rowTile == 1 ? 16 : 8)
-          : (facts.rowTile >= 8 ? 4 : 8);
+  if (facts.lhsVLAFreeAxis && facts.rhsVLAFreeAxis)
+    return std::nullopt;
+  const bool hasVLAFreeAxis = facts.lhsVLAFreeAxis || facts.rhsVLAFreeAxis;
+  const unsigned desiredLanes = hasVLAFreeAxis
+                                    ? (facts.rowTile == 1 ? 16 : 8)
+                                    : (facts.rowTile >= 8 ? 4 : 8);
   unsigned preferredUnroll = 1;
   bool costlyHandoff = facts.materializedInit || facts.reductionPredicate ||
                        facts.indexedOperands != 0;
@@ -1818,11 +1820,11 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
            std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lanePenalty,
                     rhs.unrollPenalty, rhs.peakGroups);
   });
-  const F32DotStructure structure =
-      facts.model == F32DotResourceModel::LocalRow
-          ? F32DotStructure::RVVLocalRowMicrokernel
-          : facts.vlaVectorFreeAxis ? F32DotStructure::RVVVLAVectorDot
-                                    : F32DotStructure::RVVVLAMicrotile;
+  const F32DotStructure structure = facts.lhsVLAFreeAxis
+                                        ? F32DotStructure::RVVVLAVectorDot
+                                    : facts.rhsVLAFreeAxis
+                                        ? F32DotStructure::RVVVLAMicrotile
+                                        : F32DotStructure::RVVLocalRowMicrokernel;
   const DenseVectorOrganization vectorOrganization =
       structure == F32DotStructure::RVVVLAVectorDot
           ? DenseVectorOrganization::FreeMAxis

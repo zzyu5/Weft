@@ -1728,7 +1728,8 @@ private:
 
     mlir::Block &block = *dot->getBlock();
     std::optional<StructuredProductFacts> product =
-        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
+                                      dot.getResult());
     mlir::Value coordinate = vla.getBody().front().getArgument(0);
     if (!product || product->lhsFreeAxes.size() != 1 ||
         product->rhsFreeAxes.size() != 1 ||
@@ -1804,7 +1805,7 @@ private:
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
     F32DotCandidateFacts candidateFacts;
-    candidateFacts.model = F32DotResourceModel::VLAFreeAxis;
+    candidateFacts.rhsVLAFreeAxis = true;
     candidateFacts.rowTile = decision.rowTile;
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
@@ -1878,7 +1879,8 @@ private:
 
     mlir::Block &block = *dot->getBlock();
     std::optional<StructuredProductFacts> product =
-        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
+                                      dot.getResult());
     mlir::Value coordinate = vla.getBody().front().getArgument(0);
     if (!product || product->lhsFreeAxes.size() != 1 ||
         product->lhsFreeAxes.front() != coordinate ||
@@ -1941,7 +1943,7 @@ private:
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = 1;
     F32DotCandidateFacts candidateFacts;
-    candidateFacts.model = F32DotResourceModel::VLAFreeAxis;
+    candidateFacts.lhsVLAFreeAxis = true;
     candidateFacts.rowTile = decision.rowTile;
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
@@ -1953,7 +1955,6 @@ private:
         freeRelation == LaneRelation::Strided ? 1 : 0;
     candidateFacts.handoffGroups = 1;
     candidateFacts.materializedInit = true;
-    candidateFacts.vlaVectorFreeAxis = true;
     std::optional<SelectedF32DotPhysical> physical =
         weft::riscv_internal::selectF32DotPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -5689,7 +5690,8 @@ private:
     }
 
     std::optional<StructuredProductFacts> product =
-        structuredProductFacts(dot.getLhs(), dot.getRhs(), dot.getResult());
+        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
+                                      dot.getResult());
     if (!product || product->lhsFreeAxes.size() != 1 ||
         !product->rhsFreeAxes.empty() || product->reductionAxes.size() != 1 ||
         product->resultAxes.size() != 1) {
@@ -5749,7 +5751,6 @@ private:
       return mlir::failure();
     }
     F32DotCandidateFacts candidateFacts;
-    candidateFacts.model = F32DotResourceModel::LocalRow;
     candidateFacts.rowTile = decision.rowTile;
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
@@ -6613,43 +6614,6 @@ private:
                               mlir::Value axis) const {
     const MemoryAxisFact *fact = memoryAxisFact(access, axis);
     return fact ? fact->relation : LaneRelation::Independent;
-  }
-
-  std::optional<StructuredProductFacts>
-  structuredProductFacts(mlir::Value lhs, mlir::Value rhs,
-                         mlir::Value result) const {
-    auto lhsFact = kernelFacts.values.find(lhs);
-    auto rhsFact = kernelFacts.values.find(rhs);
-    auto resultFact = kernelFacts.values.find(result);
-    if (lhsFact == kernelFacts.values.end() ||
-        rhsFact == kernelFacts.values.end() ||
-        resultFact == kernelFacts.values.end())
-      return std::nullopt;
-    StructuredProductFacts facts;
-    facts.lhsAxes = lhsFact->second.logicalAxes;
-    facts.rhsAxes = rhsFact->second.logicalAxes;
-    facts.resultAxes = resultFact->second.logicalAxes;
-    for (mlir::Value axis : facts.lhsAxes) {
-      bool rhsHas = llvm::is_contained(facts.rhsAxes, axis);
-      bool resultHas = llvm::is_contained(facts.resultAxes, axis);
-      if (rhsHas && !resultHas)
-        facts.reductionAxes.push_back(axis);
-      else if (resultHas && !rhsHas)
-        facts.lhsFreeAxes.push_back(axis);
-    }
-    for (mlir::Value axis : facts.rhsAxes) {
-      bool lhsHas = llvm::is_contained(facts.lhsAxes, axis);
-      bool resultHas = llvm::is_contained(facts.resultAxes, axis);
-      if (resultHas && !lhsHas)
-        facts.rhsFreeAxes.push_back(axis);
-    }
-    for (mlir::Value axis : facts.resultAxes) {
-      if (!llvm::is_contained(facts.lhsAxes, axis))
-        facts.lhsBroadcastAxes.push_back(axis);
-      if (!llvm::is_contained(facts.rhsAxes, axis))
-        facts.rhsBroadcastAxes.push_back(axis);
-    }
-    return facts;
   }
 
   llvm::SmallVector<VLAValueLifetimeSnapshot>
@@ -8829,8 +8793,9 @@ private:
         !matmul.getAccDtype().isF32())
       return std::nullopt;
 
-    std::optional<StructuredProductFacts> product = structuredProductFacts(
-        matmul.getLhs(), matmul.getRhs(), matmul.getResult());
+    std::optional<StructuredProductFacts> product =
+        analyzeStructuredProductFacts(kernelFacts, matmul.getLhs(),
+                                      matmul.getRhs(), matmul.getResult());
     if (!product || product->lhsFreeAxes.size() != 1 ||
         product->rhsFreeAxes.size() != 1 ||
         product->reductionAxes.size() != 1 ||
