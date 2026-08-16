@@ -1256,11 +1256,13 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   selected.implementation.parameters.secondaryShape = *byte16;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.byteShape32 = *byte32;
-  selected.byteShape16 = *byte16;
-  selected.widenedShape32 = *widened32;
-  selected.widenedShape16 = *widened16;
-  selected.reductionShape = kRVVE32M1;
+  selected.decode = facts.semantic == TernaryI8DotSemantic::Base3Digits
+                        ? TernaryDecodeTopology::Base3Digits
+                        : TernaryDecodeTopology::PackedI2Fields;
+  selected.primaryWidening =
+      RVVWideningChain{*byte32, *widened32, kRVVE32M1, 32, 2};
+  selected.secondaryWidening =
+      RVVWideningChain{*byte16, *widened16, kRVVE32M1, 16, 1};
 
   unsigned byteGroups = rvvRegisterGroups(*byte32);
   unsigned widenedGroups = rvvRegisterGroups(*widened32);
@@ -1336,13 +1338,15 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   selected.implementation.parameters.secondaryShape = *tableShape;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.entryWidth = facts.entryWidth;
+  selected.gather.codeCount = codeCount;
+  selected.gather.indexShift = facts.entryWidth == 8 ? 3 : 2;
+  selected.gather.tableSEW = tableSEW;
+  selected.gather.gatherByteStride = facts.entryWidth;
   selected.codeShape = *codeShape;
   selected.indexShape = *indexShape;
   selected.tableShape = *tableShape;
-  selected.activationShape = *activationShape;
-  selected.productShape = *productShape;
-  selected.reductionShape = kRVVE32M1;
+  selected.widening =
+      RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.resources.valueGroups =
       rvvRegisterGroups(*tableShape) + rvvRegisterGroups(*activationShape);
@@ -1393,9 +1397,8 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
     return std::nullopt;
   selected.packedShape = *packedShape;
   selected.tableShape = combined ? *activationShape : *packedShape;
-  selected.activationShape = *activationShape;
-  selected.productShape = *productShape;
-  selected.reductionShape = kRVVE32M1;
+  selected.widening =
+      RVVWideningChain{*activationShape, *productShape, kRVVE32M1, 32, 2};
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.resources.valueGroups =
       rvvRegisterGroups(*packedShape) +
@@ -1419,32 +1422,43 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
 std::optional<SelectedQuantI8DotPhysical>
 selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
-  if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian)
+  if (!target.hasRVV || !target.hasWideningInteger || target.vlenBits < 128 ||
+      !target.littleEndian ||
+      !target.supportsVectorShape(kRVVE32M1.sew,
+                                  kRVVE32M1.lmulEighths))
     return std::nullopt;
   if (facts.semanticExtent == 0)
     return std::nullopt;
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
+  QuantDecodeTopology decode = QuantDecodeTopology::PackedNibble;
   switch (facts.semantic) {
   case QuantI8DotSemantic::PackedI4:
     primitive = LocalPrimitiveKind::PackedI4I8;
+    decode = QuantDecodeTopology::PackedNibble;
     break;
   case QuantI8DotSemantic::PackedI5:
     primitive = LocalPrimitiveKind::PackedI5I8;
+    decode = QuantDecodeTopology::PackedNibbleHighBit;
     break;
   case QuantI8DotSemantic::PackedI3Grouped:
     primitive = LocalPrimitiveKind::PackedI3GroupedI8;
+    decode = QuantDecodeTopology::GroupedBitPlane;
     break;
   case QuantI8DotSemantic::IQ2S:
     primitive = LocalPrimitiveKind::IQ2SI8;
+    decode = QuantDecodeTopology::GridSignLookup;
     break;
   case QuantI8DotSemantic::IQ3S:
     primitive = LocalPrimitiveKind::IQ3SI8;
+    decode = QuantDecodeTopology::GridSignHighBitLookup;
     break;
   case QuantI8DotSemantic::IQ1M:
     primitive = LocalPrimitiveKind::IQ1MI8;
+    decode = QuantDecodeTopology::GridDeltaLookup;
     break;
   case QuantI8DotSemantic::Q6K:
     primitive = LocalPrimitiveKind::Q6KI8;
+    decode = QuantDecodeTopology::SplitBitPlane;
     break;
   }
 
@@ -1458,7 +1472,10 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   for (unsigned lanes : laneCandidates) {
     std::optional<RVVVectorShape> byteShape =
         rvvShapeForSemanticLanes(8, lanes, target);
-    if (!byteShape)
+    std::optional<RVVVectorShape> productShape =
+        byteShape ? rvvShapeForSameLanes(*byteShape, 16, target)
+                  : std::nullopt;
+    if (!byteShape || !productShape)
       continue;
     const unsigned segments = lanes / 16;
     const unsigned registerGroups = rvvRegisterGroups(*byteShape);
@@ -1472,9 +1489,9 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       selected.implementation.parameters.primaryShape = *byteShape;
       if (!selectLocalImplementationLeaf(selected.implementation))
         continue;
-      selected.semanticLanes = lanes;
-      selected.byteShape = *byteShape;
-      selected.reductionSegments = segments;
+      selected.decode = decode;
+      selected.widening = RVVWideningChain{*byteShape, *productShape,
+                                           kRVVE32M1, lanes, segments};
       selected.resources.architecturalGroups = target.vectorRegisters;
       selected.resources.valueGroups = registerGroups * 2;
       selected.resources.memoryGroups = selected.resources.valueGroups;
@@ -1499,9 +1516,9 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.implementation.parameters.primaryShape = stripShape;
   if (!selectLocalImplementationLeaf(selected.implementation))
     return std::nullopt;
-  selected.semanticLanes = 16;
-  selected.byteShape = stripShape;
-  selected.reductionSegments = 1;
+  selected.decode = decode;
+  selected.widening = RVVWideningChain{stripShape, RVVVectorShape{16, 32},
+                                       kRVVE32M1, 16, 1};
   selected.resources.architecturalGroups = target.vectorRegisters;
   selected.resources.valueGroups = rvvRegisterGroups(stripShape) * 2;
   selected.resources.memoryGroups = selected.resources.valueGroups;

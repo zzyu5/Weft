@@ -708,6 +708,14 @@ struct SelectedSignBitI8Physical {
 std::optional<SelectedSignBitI8Physical>
 selectSignBitI8Physical(const RISCVTargetProfile &target);
 
+struct RVVWideningChain {
+  RVVVectorShape sourceShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  unsigned semanticLanes = 0;
+  unsigned reductionSegments = 0;
+};
+
 enum class TernaryI8DotSemantic {
   Base3Digits,
   PackedI2Fields,
@@ -717,13 +725,16 @@ struct TernaryI8DotCandidateFacts {
   TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
 };
 
+enum class TernaryDecodeTopology {
+  Base3Digits,
+  PackedI2Fields,
+};
+
 struct SelectedTernaryI8DotPhysical {
   LocalImplementation implementation;
-  RVVVectorShape byteShape32;
-  RVVVectorShape byteShape16;
-  RVVVectorShape widenedShape32;
-  RVVVectorShape widenedShape16;
-  RVVVectorShape reductionShape;
+  TernaryDecodeTopology decode = TernaryDecodeTopology::Base3Digits;
+  RVVWideningChain primaryWidening;
+  RVVWideningChain secondaryWidening;
   PhysicalResourceBudget resources;
 };
 
@@ -737,15 +748,20 @@ struct CodebookGatherI8CandidateFacts {
   unsigned entryWidth = 0;
 };
 
+struct CodebookGatherTopology {
+  unsigned codeCount = 0;
+  unsigned indexShift = 0;
+  unsigned tableSEW = 0;
+  unsigned gatherByteStride = 0;
+};
+
 struct SelectedCodebookGatherI8Physical {
   LocalImplementation implementation;
-  unsigned entryWidth = 0;
+  CodebookGatherTopology gather;
   RVVVectorShape codeShape;
   RVVVectorShape indexShape;
   RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
+  RVVWideningChain widening;
   PhysicalResourceBudget resources;
 };
 
@@ -757,9 +773,7 @@ struct SelectedNibbleCodebookI8Physical {
   LocalImplementation implementation;
   RVVVectorShape packedShape;
   RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
+  RVVWideningChain widening;
   PhysicalResourceBudget resources;
 };
 
@@ -776,6 +790,16 @@ enum class QuantI8DotSemantic {
   Q6K,
 };
 
+enum class QuantDecodeTopology {
+  PackedNibble,
+  PackedNibbleHighBit,
+  GroupedBitPlane,
+  GridSignLookup,
+  GridSignHighBitLookup,
+  GridDeltaLookup,
+  SplitBitPlane,
+};
+
 struct QuantI8DotCandidateFacts {
   QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
   unsigned semanticExtent = 256;
@@ -783,9 +807,8 @@ struct QuantI8DotCandidateFacts {
 
 struct SelectedQuantI8DotPhysical {
   LocalImplementation implementation;
-  unsigned semanticLanes = 0;
-  RVVVectorShape byteShape;
-  unsigned reductionSegments = 0;
+  QuantDecodeTopology decode = QuantDecodeTopology::PackedNibble;
+  RVVWideningChain widening;
   PhysicalResourceBudget resources;
 };
 

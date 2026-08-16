@@ -220,39 +220,19 @@ struct GroupedAffineI4I8Decision {
 };
 
 struct QuantI8DotDecision {
-  QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
-  LocalImplementation implementation;
+  SelectedQuantI8DotPhysical physical;
   llvm::SmallVector<LocalBlockMemoryFact> blocks;
   llvm::SmallVector<mlir::Value> scalars;
-  unsigned semanticLanes = 0;
-  RVVVectorShape byteShape;
-  unsigned reductionSegments = 0;
-  PhysicalResourceBudget resources;
 };
 
 struct TernaryI8Decision {
-  TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
-  LocalImplementation implementation;
+  SelectedTernaryI8DotPhysical physical;
   llvm::SmallVector<LocalBlockMemoryFact> blocks;
   llvm::SmallVector<mlir::Value> scalars;
-  RVVVectorShape byteShape32;
-  RVVVectorShape byteShape16;
-  RVVVectorShape widenedShape32;
-  RVVVectorShape widenedShape16;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
 };
 
 struct SignedCodebookI8Decision {
-  LocalImplementation implementation;
-  unsigned entryWidth = 0;
-  RVVVectorShape codeShape;
-  RVVVectorShape indexShape;
-  RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
+  SelectedCodebookGatherI8Physical physical;
   LocalBlockMemoryFact codes;
   LocalBlockMemoryFact activation;
   mlir::Value signMetadata;
@@ -263,14 +243,7 @@ struct SignedCodebookI8Decision {
 };
 
 struct PackedU9U7CodebookI8Decision {
-  LocalImplementation implementation;
-  RVVVectorShape packedShape;
-  RVVVectorShape indexShape;
-  RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
+  SelectedCodebookGatherI8Physical physical;
   LocalBlockMemoryFact packedCodes;
   LocalBlockMemoryFact activation;
   mlir::Value scaleByte;
@@ -281,14 +254,7 @@ struct PackedU9U7CodebookI8Decision {
 };
 
 struct PackedU11GridDeltaI8Decision {
-  LocalImplementation implementation;
-  RVVVectorShape codeShape;
-  RVVVectorShape indexShape;
-  RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
+  SelectedCodebookGatherI8Physical physical;
   LocalBlockMemoryFact codes;
   LocalBlockMemoryFact activation;
   mlir::Value metadata;
@@ -299,13 +265,7 @@ struct PackedU11GridDeltaI8Decision {
 };
 
 struct NibbleCodebookI8Decision {
-  LocalImplementation implementation;
-  RVVVectorShape packedShape;
-  RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
+  SelectedNibbleCodebookI8Physical physical;
   LocalBlockMemoryFact packedCodes;
   LocalBlockMemoryFact table;
   LocalBlockMemoryFact activation;
@@ -1277,17 +1237,23 @@ private:
     for (const auto &entry : physicalPlan.groupedAffineI4I8)
       selectedImplementations.add(entry.second.realization.implementation);
     for (const auto &entry : physicalPlan.quantI8Dots)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
     for (const auto &entry : physicalPlan.ternaryI8)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
     for (const auto &entry : physicalPlan.signedCodebookI8)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
     for (const auto &entry : physicalPlan.packedU9U7CodebookI8)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
     for (const auto &entry : physicalPlan.packedU11GridDeltaI8)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
     for (const auto &entry : physicalPlan.nibbleCodebookI8)
-      selectedImplementations.add(entry.second.realization.implementation);
+      selectedImplementations.add(
+          entry.second.realization.physical.implementation);
   }
 
   KernelOp kernel;
@@ -7506,18 +7472,18 @@ private:
       OpTy op, PlannedPhysicalDecision<TernaryI8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
     const TernaryI8Decision &decision = planned.realization;
-    if (decision.semantic == TernaryI8DotSemantic::Base3Digits) {
+    if (decision.physical.decode == TernaryDecodeTopology::Base3Digits) {
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[0]},
-                              decision.byteShape32);
+                              decision.physical.primaryWidening.sourceShape);
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[1]},
-                              decision.byteShape16);
+                              decision.physical.secondaryWidening.sourceShape);
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[2]},
-                              decision.byteShape32);
+                              decision.physical.primaryWidening.sourceShape);
     } else {
       recordLocalBlockReloads(planned, op.getOperation(), decision.blocks,
-                              decision.byteShape32);
+                              decision.physical.primaryWidening.sourceShape);
     }
-    planned.entity.resources = decision.resources;
+    planned.entity.resources = decision.physical.resources;
   }
 
   void finalizeSignedCodebookI8Plan(
@@ -7526,11 +7492,11 @@ private:
     initializeEntityPlan(planned.entity);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.codes},
-                            planned.realization.codeShape);
+                            planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.activationShape);
-    planned.entity.resources = planned.realization.resources;
+                            planned.realization.physical.widening.sourceShape);
+    planned.entity.resources = planned.realization.physical.resources;
   }
 
   void finalizePackedU9U7CodebookI8Plan(
@@ -7539,11 +7505,11 @@ private:
     initializeEntityPlan(planned.entity);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.packedCodes},
-                            planned.realization.packedShape);
+                            planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.activationShape);
-    planned.entity.resources = planned.realization.resources;
+                            planned.realization.physical.widening.sourceShape);
+    planned.entity.resources = planned.realization.physical.resources;
   }
 
   void finalizePackedU11GridDeltaI8Plan(
@@ -7552,11 +7518,11 @@ private:
     initializeEntityPlan(planned.entity);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.codes},
-                            planned.realization.codeShape);
+                            planned.realization.physical.codeShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.activationShape);
-    planned.entity.resources = planned.realization.resources;
+                            planned.realization.physical.widening.sourceShape);
+    planned.entity.resources = planned.realization.physical.resources;
   }
 
   void finalizeNibbleCodebookI8Plan(
@@ -7564,23 +7530,26 @@ private:
       PlannedPhysicalDecision<NibbleCodebookI8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
     recordLocalBlockReloads(planned, op.getOperation(),
-                            {planned.realization.packedCodes,
-                             planned.realization.table},
-                            planned.realization.packedShape);
+                            {planned.realization.packedCodes},
+                            planned.realization.physical.packedShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.table},
+                            planned.realization.physical.tableShape);
     recordLocalBlockReloads(planned, op.getOperation(),
                             {planned.realization.activation},
-                            planned.realization.activationShape);
-    planned.entity.resources = planned.realization.resources;
+                            planned.realization.physical.widening.sourceShape);
+    planned.entity.resources = planned.realization.physical.resources;
   }
 
   template <typename OpTy>
   void finalizeQuantI8Plan(
       OpTy op, PlannedPhysicalDecision<QuantI8DotDecision> &planned) const {
     initializeEntityPlan(planned.entity);
-    RVVVectorShape shape = planned.realization.byteShape;
+    RVVVectorShape shape =
+        planned.realization.physical.widening.sourceShape;
     recordLocalBlockReloads(planned, op.getOperation(),
                             planned.realization.blocks, shape);
-    planned.entity.resources = planned.realization.resources;
+    planned.entity.resources = planned.realization.physical.resources;
   }
 
   void finalizeBlockDecodePlan(
@@ -8231,14 +8200,7 @@ private:
           "ternary/i8 dot has no legal target realization");
 
     decision = TernaryI8Decision{};
-    decision.semantic = semantic;
-    decision.implementation = selected->implementation;
-    decision.byteShape32 = selected->byteShape32;
-    decision.byteShape16 = selected->byteShape16;
-    decision.widenedShape32 = selected->widenedShape32;
-    decision.widenedShape16 = selected->widenedShape16;
-    decision.reductionShape = selected->reductionShape;
-    decision.resources = selected->resources;
+    decision.physical = *selected;
     for (mlir::Value block : blocks) {
       std::optional<LocalBlockMemoryFact> fact =
           resolveLocalBlockMemoryFact(block);
@@ -8278,7 +8240,8 @@ private:
         return op.emitError("ternary/i8 scalar operand was not materialized");
       operands.push_back(std::move(value.spelling));
     }
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError("ternary/i8 leaf spelling was not selected");
     std::string result = fresh("ternary_dot");
@@ -8321,15 +8284,7 @@ private:
           "signed codebook/i8 dot has no legal target realization");
 
     decision = SignedCodebookI8Decision{};
-    decision.implementation = selected->implementation;
-    decision.entryWidth = selected->entryWidth;
-    decision.codeShape = selected->codeShape;
-    decision.indexShape = selected->indexShape;
-    decision.tableShape = selected->tableShape;
-    decision.activationShape = selected->activationShape;
-    decision.productShape = selected->productShape;
-    decision.reductionShape = selected->reductionShape;
-    decision.resources = selected->resources;
+    decision.physical = *selected;
     decision.codes = *codes;
     decision.activation = *activation;
     decision.signMetadata = op.getSignMetadata();
@@ -8374,7 +8329,8 @@ private:
       return op.emitError(
           "signed codebook/i8 operands are not materialized locally");
 
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError(
           "signed codebook/i8 leaf spelling was not selected");
@@ -8415,14 +8371,7 @@ private:
           "packed u9/u7 codebook/i8 dot has no legal target realization");
 
     decision = PackedU9U7CodebookI8Decision{};
-    decision.implementation = selected->implementation;
-    decision.packedShape = selected->codeShape;
-    decision.indexShape = selected->indexShape;
-    decision.tableShape = selected->tableShape;
-    decision.activationShape = selected->activationShape;
-    decision.productShape = selected->productShape;
-    decision.reductionShape = selected->reductionShape;
-    decision.resources = selected->resources;
+    decision.physical = *selected;
     decision.packedCodes = *packedCodes;
     decision.activation = *activation;
     decision.scaleByte = op.getScaleByte();
@@ -8469,7 +8418,8 @@ private:
       return op.emitError(
           "packed u9/u7 codebook/i8 operands are not materialized locally");
 
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError(
           "packed u9/u7 codebook/i8 leaf spelling was not selected");
@@ -8510,14 +8460,7 @@ private:
           "packed u11 grid-delta/i8 dot has no legal target realization");
 
     decision = PackedU11GridDeltaI8Decision{};
-    decision.implementation = selected->implementation;
-    decision.codeShape = selected->codeShape;
-    decision.indexShape = selected->indexShape;
-    decision.tableShape = selected->tableShape;
-    decision.activationShape = selected->activationShape;
-    decision.productShape = selected->productShape;
-    decision.reductionShape = selected->reductionShape;
-    decision.resources = selected->resources;
+    decision.physical = *selected;
     decision.codes = *codes;
     decision.activation = *activation;
     decision.metadata = op.getMetadata();
@@ -8564,7 +8507,8 @@ private:
       return op.emitError(
           "packed u11 grid-delta/i8 operands are not materialized locally");
 
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError(
           "packed u11 grid-delta/i8 leaf spelling was not selected");
@@ -8604,13 +8548,7 @@ private:
           "nibble codebook/i8 dot has no legal target realization");
 
     decision = NibbleCodebookI8Decision{};
-    decision.implementation = selected->implementation;
-    decision.packedShape = selected->packedShape;
-    decision.tableShape = selected->tableShape;
-    decision.activationShape = selected->activationShape;
-    decision.productShape = selected->productShape;
-    decision.reductionShape = selected->reductionShape;
-    decision.resources = selected->resources;
+    decision.physical = *selected;
     decision.packedCodes = *packedCodes;
     decision.table = *table;
     decision.activation = *activation;
@@ -8648,7 +8586,8 @@ private:
       return op.emitError(
           "nibble codebook/i8 operands are not materialized locally");
 
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError(
           "nibble codebook/i8 leaf spelling was not selected");
@@ -8679,15 +8618,7 @@ private:
       return op.emitError(
           "quant/i8 dot has no legal target realization");
     decision = QuantI8DotDecision{};
-    decision.semantic = semantic;
-    decision.implementation = selected->implementation;
-    decision.semanticLanes = selected->semanticLanes;
-    decision.byteShape = selected->byteShape;
-    decision.reductionSegments = selected->reductionSegments;
-    decision.resources = selected->resources;
-    if (localImplementationName(decision.implementation).empty())
-      return op.emitError(
-          "quant/i8 selected implementation has no intrinsic-C realization");
+    decision.physical = *selected;
     for (mlir::Value block : blocks) {
       auto fact = resolveLocalBlockMemoryFact(block);
       if (!fact)
@@ -8713,8 +8644,6 @@ private:
               op.getOperation(), prepared->second.entity, block.semanticValue,
               PhysicalHandoff::Reload)))
         return mlir::failure();
-    if (!decision.implementation)
-      return op.emitError("quant/i8 realization is unavailable");
     llvm::SmallVector<std::string> operands;
     for (const LocalBlockMemoryFact &block : decision.blocks) {
       std::optional<std::string> value = projectLocalBlockMemoryBase(block);
@@ -8731,7 +8660,8 @@ private:
       operands.push_back(std::move(value.spelling));
     }
     std::string result = fresh("quant_dot");
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper =
+        localImplementationName(decision.physical.implementation);
     if (helper.empty())
       return op.emitError("quant/i8 leaf spelling was not selected");
     line("const float " + result + " = " + helper + "(" +
