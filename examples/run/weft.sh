@@ -808,6 +808,15 @@ case "${kernel}" in
     runtime=examples/repro/weft/ime/q4_k_projection_runtime.cpp
     runtime_arguments=("$1" "${runtime_hardware}" "${projection_scope}")
     ;;
+  q4_1_projection_ime)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} q4_1_projection_ime <decode|prefill> <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/ime/q4_1_projection.py
+    runtime=examples/repro/weft/ime/q4_1_projection_runtime.cpp
+    runtime_arguments=("$1" "$2" "${runtime_hardware}" "${projection_scope}")
+    ;;
   q4_k_mul_mat_id)
     if [[ $# -ne 1 ]]; then
       echo "usage: ${usage_prefix} q4_k_mul_mat_id <repetitions>" >&2

@@ -101,7 +101,8 @@ mlir::LogicalResult AffineI4I8DotOp::verify() {
       !activation.getElementType().isSignedInteger(8))
     return emitOpError("activation must be a signed i8 block<32>");
   if (mlir::failed(requirePersistentU8Pointer(
-          *this, getPackedBase(), "packed_base", "q4_k_n16_k32_304b")))
+          *this, getPackedBase(), "packed_base",
+          "affine_i4_n16_k32_304b")))
     return mlir::failure();
   if (mlir::failed(requireScalar(*this, getActivationScale(),
                                  mlir::Float32Type::get(getContext()),

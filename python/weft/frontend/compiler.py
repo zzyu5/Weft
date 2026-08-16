@@ -2198,7 +2198,7 @@ class FrontendCompiler:
         operands = tuple(self._value_argument(args[name], call) for name in required)
         self._require_extension_block(operands[0], "activation", 32, i8, call)
         self._require_persistent_u8_pointer(
-            operands[1], "packed_base", "q4_k_n16_k32_304b", call
+            operands[1], "packed_base", "affine_i4_n16_k32_304b", call
         )
         self._require_extension_scalar(
             operands[2], "activation_scale", f32, call

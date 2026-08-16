@@ -257,7 +257,7 @@ int main(int argc, char **argv) {
   std::printf("hardware=%s\n", runtime.hardware);
   std::printf(
       "model_shape=MoE[tokens=64,slots=2,experts=8,N=4096,K=4096]\n");
-  std::printf("persistent_weight=q4_k_n16_k32_304b\n");
+  std::printf("persistent_weight=affine_i4_n16_k32_304b\n");
   std::printf("scope=%s\n", runtime.scope);
   std::printf("activation_code_mismatches=%zu\n", codeMismatches);
   std::printf("activation_scale_max_absolute_error=%.9g\n", scaleError);

@@ -7,7 +7,7 @@ import weft.language as W
 def q4_k_mul_mat_id(
     activation: W.ptr[W.f32, W.readonly, W.noalias],
     packed_weight: W.ptr[
-        W.u8, W.persistent("q4_k_n16_k32_304b"), W.readonly, W.noalias
+        W.u8, W.persistent("affine_i4_n16_k32_304b"), W.readonly, W.noalias
     ],
     ids: W.ptr[W.u32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],

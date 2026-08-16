@@ -8564,9 +8564,9 @@ private:
     auto packedType =
         packedRoot ? mlir::dyn_cast<PtrType>(packedRoot.getType()) : PtrType{};
     if (!packedType || packedType.getStorageClass() != "persistent" ||
-        packedType.getStorageFormat() != "q4_k_n16_k32_304b")
+        packedType.getStorageFormat() != "affine_i4_n16_k32_304b")
       return op.emitError(
-          "affine i4/i8 dot requires persistent format q4_k_n16_k32_304b");
+          "affine i4/i8 dot requires persistent format affine_i4_n16_k32_304b");
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
     decision.realization = *fragment;

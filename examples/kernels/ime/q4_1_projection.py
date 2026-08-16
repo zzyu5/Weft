@@ -2,9 +2,8 @@ import weft
 import weft.language as W
 
 
-
 @weft.kernel
-def q4_k_projection_ime(
+def q4_1_projection_ime(
     activation: W.ptr[W.f32, W.readonly, W.noalias],
     packed_weight: W.ptr[
         W.u8, W.persistent("affine_i4_n16_k32_304b"), W.readonly, W.noalias
@@ -38,9 +37,8 @@ def q4_k_projection_ime(
             block_end = block_begin + block_extent
             with W.vla(block_begin, block_end) as k:
                 value = W.load(activation_row + k)
-                magnitude = W.maximum(value, -value)
                 maximum = W.reduce(
-                    magnitude,
+                    W.maximum(value, -value),
                     op="max",
                     identity=W.f32(0.0),
                     order="relaxed",
@@ -70,7 +68,6 @@ def q4_k_projection_ime(
                     other=W.i8(0),
                 )
                 scale = W.load(scale_row + block, other=W.f32(0.0))
-
                 packed_block = (
                     (column_begin // packed_column_extent) * blocks + block
                 )
