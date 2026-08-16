@@ -1,5 +1,6 @@
 #include "Weft/Target/RISCVLowering.h"
 
+#include "RISCVCABI.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -23,20 +24,8 @@ using namespace weft::kernel;
 
 namespace {
 
-std::string sanitize(llvm::StringRef input) {
-  std::string result;
-  result.reserve(input.size() + 1);
-  for (char character : input) {
-    unsigned char byte = static_cast<unsigned char>(character);
-    result.push_back(std::isalnum(byte) || character == '_' ? character : '_');
-  }
-  if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front())))
-    result.insert(result.begin(), '_');
-  return result;
-}
-
 std::string macroName(llvm::StringRef input) {
-  std::string result = sanitize(input);
+  std::string result = weft::riscv_internal::cABIIdentifier(input);
   llvm::transform(result, result.begin(), [](char character) {
     return static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
   });
@@ -80,40 +69,6 @@ bool isPortableABIIdentifier(llvm::StringRef input) {
   });
 }
 
-std::string scalarCType(mlir::Type type) {
-  if (type.isIndex())
-    return "size_t";
-  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    if (integer.getWidth() == 1)
-      return "bool";
-    if (integer.getWidth() != 8 && integer.getWidth() != 16 &&
-        integer.getWidth() != 32 && integer.getWidth() != 64)
-      return {};
-    return std::string(integer.isUnsigned() ? "uint" : "int") +
-           std::to_string(integer.getWidth()) + "_t";
-  }
-  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type)) {
-    if (floating.getWidth() == 16)
-      return "_Float16";
-    if (floating.getWidth() == 32)
-      return "float";
-    if (floating.getWidth() == 64)
-      return "double";
-  }
-  return {};
-}
-
-std::string pointerCType(PtrType pointer) {
-  std::string element = scalarCType(pointer.getElementType());
-  if (element.empty())
-    return {};
-  std::string result =
-      (pointer.getAccess() == "read" ? "const " : "") + element + " *";
-  if (pointer.getNoAlias() || pointer.getRestrictLike())
-    result += " WEFT_GENERATED_RESTRICT";
-  return result;
-}
-
 llvm::StringRef argumentName(KernelOp kernel, unsigned index) {
   return mlir::cast<mlir::StringAttr>(kernel.getArgNames()[index]).getValue();
 }
@@ -135,23 +90,29 @@ mlir::FailureOr<std::string> kernelDeclaration(KernelOp kernel) {
       continue;
     std::string type;
     if (auto pointer = mlir::dyn_cast<PtrType>(argument.getType()))
-      type = pointerCType(pointer);
+      type = weft::riscv_internal::cABIPointerType(
+          pointer,
+          weft::riscv_internal::CPointerSpelling::PublicDeclaration);
     else
-      type = scalarCType(argument.getType());
+      type = weft::riscv_internal::cABIScalarType(argument.getType());
     if (type.empty()) {
       kernel.emitError("generated header has an unsupported ABI argument type");
       return mlir::failure();
     }
-    parameters.push_back(type + " " + sanitize(argumentName(kernel, index)));
+    parameters.push_back(
+        type + " " +
+        weft::riscv_internal::cABIIdentifier(argumentName(kernel, index)));
   }
   std::string returnType = mlir::isa<mlir::NoneType>(kernel.getReturnType())
                                ? "void"
-                               : scalarCType(kernel.getReturnType());
+                               : weft::riscv_internal::cABIScalarType(
+                                     kernel.getReturnType());
   if (returnType.empty()) {
     kernel.emitError("generated header has an unsupported return type");
     return mlir::failure();
   }
-  return returnType + " " + sanitize(kernel.getSymName()) + "(" +
+  return returnType + " " +
+         weft::riscv_internal::cABIIdentifier(kernel.getSymName()) + "(" +
          llvm::join(parameters, ", ") + ");";
 }
 
@@ -178,8 +139,9 @@ storageExpression(KernelOp kernel, mlir::Value value,
       kernel.emitError("storage extent depends on a non-index ABI argument");
       return finish(mlir::failure());
     }
-    HeaderExpression result{sanitize(argumentName(kernel, *index)), {*index},
-                            std::nullopt};
+    HeaderExpression result{
+        weft::riscv_internal::cABIIdentifier(argumentName(kernel, *index)),
+        {*index}, std::nullopt};
     return finish(std::move(result));
   }
   if (auto constant = value.getDefiningOp<ConstantOp>()) {
@@ -280,8 +242,8 @@ std::string queryParameters(KernelOp kernel,
   llvm::SmallVector<std::string> parameters;
   mlir::Block &entry = kernel.getBody().front();
   for (unsigned index : dependencies) {
-    std::string type = scalarCType(entry.getArgument(index).getType());
-    parameters.push_back(type + " " + sanitize(argumentName(kernel, index)));
+    std::string type = weft::riscv_internal::cABIScalarType(entry.getArgument(index).getType());
+    parameters.push_back(type + " " + weft::riscv_internal::cABIIdentifier(argumentName(kernel, index)));
   }
   return parameters.empty() ? "void" : llvm::join(parameters, ", ");
 }
@@ -295,8 +257,8 @@ mlir::LogicalResult emitStorageMetadata(
     return storage.emitError(
         "generated storage metadata must bind an entry pointer");
   PtrType pointer = mlir::cast<PtrType>(storage.getPointer().getType());
-  std::string symbol = sanitize(kernel.getSymName());
-  std::string argument = sanitize(argumentName(kernel, *pointerIndex));
+  std::string symbol = weft::riscv_internal::cABIIdentifier(kernel.getSymName());
+  std::string argument = weft::riscv_internal::cABIIdentifier(argumentName(kernel, *pointerIndex));
   std::string prefix = macroName(symbol + "_" + argument);
   output << "#define WEFT_" << prefix << "_STORAGE_CLASS WEFT_STORAGE_"
          << macroName(pointer.getStorageClass()) << "\n";
@@ -349,8 +311,8 @@ mlir::LogicalResult emitStorageMetadata(
 
 void emitPointerMetadata(KernelOp kernel, unsigned index, PtrType pointer,
                          llvm::raw_ostream &output) {
-  std::string prefix = macroName(sanitize(kernel.getSymName()) + "_" +
-                                 sanitize(argumentName(kernel, index)));
+  std::string prefix = macroName(weft::riscv_internal::cABIIdentifier(kernel.getSymName()) + "_" +
+                                 weft::riscv_internal::cABIIdentifier(argumentName(kernel, index)));
   output << "#define WEFT_" << prefix << "_STORAGE_CLASS WEFT_STORAGE_"
          << macroName(pointer.getStorageClass()) << "\n";
   output << "#define WEFT_" << prefix << "_FORMAT \""

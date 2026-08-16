@@ -1,5 +1,6 @@
 #include "Weft/Target/RISCVLowering.h"
 
+#include "RISCVCABI.h"
 #include "RISCVIntrinsicC.h"
 #include "RISCVKernelCompiler.h"
 #include "RISCVKernelFacts.h"
@@ -19,7 +20,6 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cctype>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
@@ -687,18 +687,6 @@ struct RISCVPhysicalPlan {
       materializedF32Pointwise;
 };
 
-std::string sanitize(llvm::StringRef input) {
-  std::string result;
-  result.reserve(input.size() + 1);
-  for (char character : input) {
-    unsigned char byte = static_cast<unsigned char>(character);
-    result.push_back(std::isalnum(byte) || character == '_' ? character : '_');
-  }
-  if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front())))
-    result.insert(result.begin(), '_');
-  return result;
-}
-
 mlir::Type elementType(mlir::Type type) {
   return logicalElementType(type);
 }
@@ -720,36 +708,6 @@ bool hasBlockPayload(mlir::Operation *operation) {
 bool isF16(mlir::Type type) {
   auto floating = mlir::dyn_cast<mlir::FloatType>(type);
   return floating && floating.getWidth() == 16;
-}
-
-std::string scalarCType(mlir::Type type) {
-  if (type.isIndex())
-    return "size_t";
-  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
-    if (integer.getWidth() == 1)
-      return "bool";
-    if (integer.getWidth() != 8 && integer.getWidth() != 16 &&
-        integer.getWidth() != 32 && integer.getWidth() != 64)
-      return {};
-    std::string prefix = integer.isUnsigned() ? "uint" : "int";
-    return prefix + std::to_string(integer.getWidth()) + "_t";
-  }
-  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type)) {
-    if (floating.getWidth() == 16)
-      return "_Float16";
-    if (floating.getWidth() == 32)
-      return "float";
-    if (floating.getWidth() == 64)
-      return "double";
-  }
-  return {};
-}
-
-std::string pointerCType(PtrType pointer) {
-  std::string element = scalarCType(pointer.getElementType());
-  if (element.empty())
-    return {};
-  return (pointer.getAccess() == "read" ? "const " : "") + element + " *";
 }
 
 std::string floatLiteral(mlir::FloatAttr attribute) {
@@ -871,18 +829,16 @@ public:
           mlir::cast<mlir::StringAttr>(kinds[index]).getValue();
       if (kind == "constexpr")
         continue;
-      std::string name = sanitize(
+      std::string name = cABIIdentifier(
           mlir::cast<mlir::StringAttr>(names[index]).getValue());
       mlir::Type type = argument.getType();
       std::string cType;
       CValueKind valueKind = CValueKind::Scalar;
       if (auto pointer = mlir::dyn_cast<PtrType>(type)) {
-        cType = pointerCType(pointer);
+        cType = cABIPointerType(pointer, CPointerSpelling::FunctionDefinition);
         valueKind = CValueKind::Pointer;
-        if (pointer.getNoAlias() || pointer.getRestrictLike())
-          cType += " restrict";
       } else {
-        cType = scalarCType(type);
+        cType = cABIScalarType(type);
       }
       if (cType.empty())
         return kernel.emitError(
@@ -894,15 +850,15 @@ public:
     mlir::Type returnType = kernel.getReturnType();
     std::string returnTypeSpelling = mlir::isa<mlir::NoneType>(returnType)
                                          ? "void"
-                                         : scalarCType(returnType);
+                                         : cABIScalarType(returnType);
     if (returnTypeSpelling.empty())
       return kernel.emitError(
           "RISC-V intrinsic C ABI has an unsupported return type");
     if (mlir::failed(preparePhysicalDecisions()))
       return mlir::failure();
     collectSelectedLocalImplementations();
-    line(returnTypeSpelling + " " + sanitize(kernel.getSymName()) + "(" +
-         llvm::join(parameters, ", ") + ") {");
+    line(returnTypeSpelling + " " + cABIIdentifier(kernel.getSymName()) +
+         "(" + llvm::join(parameters, ", ") + ") {");
     ++indent;
     for (mlir::Operation &operation : body) {
       llvm::DenseSet<mlir::Operation *> visiting;
@@ -1369,7 +1325,7 @@ private:
                           llvm::StringRef prefix, bool force = false) {
     if (force || !result.use_empty()) {
       std::string name = fresh(prefix);
-      line("const " + scalarCType(elementType(result.getType())) + " " + name +
+      line("const " + cABIScalarType(elementType(result.getType())) + " " + name +
            " = " + expression + ";");
       expression = std::move(name);
     }
@@ -3636,7 +3592,7 @@ private:
         CValue value{result.getType(), CValueKind::Scalar,
                      result.use_empty() ? std::string{} : fresh("if_result")};
         if (!value.spelling.empty())
-          line(scalarCType(result.getType()) + " " + value.spelling + ";");
+          line(cABIScalarType(result.getType()) + " " + value.spelling + ";");
         results.push_back(std::move(value));
         continue;
       }
@@ -3644,7 +3600,7 @@ private:
         CValue value{result.getType(), CValueKind::Pointer,
                      result.use_empty() ? std::string{} : fresh("if_pointer")};
         if (!value.spelling.empty())
-          line(pointerCType(pointer) + " " + value.spelling + ";");
+          line(cABIPointerType(pointer) + " " + value.spelling + ";");
         results.push_back(std::move(value));
         continue;
       }
@@ -3774,7 +3730,7 @@ private:
       CValue value;
       if (init.kind == CValueKind::Scalar) {
         value = CValue{result.getType(), CValueKind::Scalar, fresh("carry")};
-        line(scalarCType(elementType(result.getType())) + " " + value.spelling + " = " +
+        line(cABIScalarType(elementType(result.getType())) + " " + value.spelling + " = " +
              init.spelling + ";");
       } else if (inVLA && init.kind == CValueKind::F32Vector) {
         std::optional<unsigned> lmul = physicalValueLMUL(initial);
@@ -3852,7 +3808,7 @@ private:
         std::string next = fresh("next");
         std::string type;
         if (destination.kind == CValueKind::Scalar)
-          type = scalarCType(elementType(destination.type));
+          type = cABIScalarType(elementType(destination.type));
         else if (destination.kind == CValueKind::F32Vector) {
           std::optional<unsigned> lmul = physicalValueLMUL(yielded);
           if (!lmul) {
@@ -3944,7 +3900,7 @@ private:
               result.getType())) {
         value = CValue{result.getType(), CValueKind::Scalar,
                        fresh("while_carry")};
-        line(scalarCType(elementType(result.getType())) + " " + value.spelling +
+        line(cABIScalarType(elementType(result.getType())) + " " + value.spelling +
              " = " + init.spelling + ";");
       } else if (inVLA && init.kind == CValueKind::F32Vector &&
                  isRegionValue(result.getType())) {
@@ -3999,7 +3955,7 @@ private:
           return mlir::failure();
         CValue next{emitted.type, emitted.kind, fresh(prefix)};
         if (emitted.kind == CValueKind::Scalar) {
-          line(scalarCType(elementType(emitted.type)) + " " + next.spelling +
+          line(cABIScalarType(elementType(emitted.type)) + " " + next.spelling +
                " = " + emitted.spelling + ";");
         } else if (inVLA && emitted.kind == CValueKind::F32Vector) {
           std::optional<unsigned> lmul = physicalValueLMUL(value);
@@ -4171,7 +4127,7 @@ private:
               ? "scan_carry"
               : "reduce";
       CValue aggregate{state.elementType, CValueKind::Scalar, fresh(prefix)};
-      std::string type = scalarCType(state.elementType);
+      std::string type = cABIScalarType(state.elementType);
       if (type.empty())
         return state.operation->emitError("VLA state type is unavailable");
       line(type + " " + aggregate.spelling + " = " + identity + ";");
@@ -5117,7 +5073,7 @@ private:
     }
     if (input.kind != CValueKind::Scalar)
       return op.emitError("RVV cast lowering is not implemented yet");
-    std::string target = scalarCType(elementType(op.getResult().getType()));
+    std::string target = cABIScalarType(elementType(op.getResult().getType()));
     if (target.empty())
       return op.emitError("cast target type is unsupported");
     values[op.getResult()] = scalarExpression(
@@ -5460,7 +5416,7 @@ private:
     if (auto cast = value.getDefiningOp<CastOp>()) {
       std::optional<std::string> input =
           projectBlockScalar(cast.getInput(), axisValues);
-      std::string type = scalarCType(elementType(cast.getResult().getType()));
+      std::string type = cABIScalarType(elementType(cast.getResult().getType()));
       if (!input || type.empty())
         return std::nullopt;
       return "((" + type + ")(" + *input + "))";
