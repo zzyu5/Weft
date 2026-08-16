@@ -35,25 +35,6 @@ def unpack_q4(qs, logical_index, zero):
 
 
 @W.helper(effects=("read",))
-def unpack_q5(qs, qh, logical_index, zero):
-    packed_index = logical_index % W.index(16)
-    nibble_shift = W.cast(
-        (logical_index // W.index(16)) * W.index(4), W.u8
-    )
-    packed = W.load(qs + packed_index, other=W.u8(0))
-    low_bits = (packed >> nibble_shift) & W.u8(15)
-
-    # logical_index 16..31 selects qh bits 16..31, matching GGML's
-    # ((qh & (1u << (j + 16))) >> (j + 12)) high-half extraction.
-    high_byte = W.load(
-        qh + logical_index // W.index(8), other=W.u8(0)
-    )
-    high_shift = W.cast(logical_index % W.index(8), W.u8)
-    high_bit = ((high_byte >> high_shift) & W.u8(1)) << W.u8(4)
-    return W.cast(low_bits | high_bit, W.i32) + zero
-
-
-@W.helper(effects=("read",))
 def load_q8(qs, logical_index):
     return W.cast(
         W.bitcast(W.load(qs + logical_index, other=W.u8(0)), W.i8),
@@ -128,23 +109,24 @@ def q5_0_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(22)
         y_block = y + block * W.index(34)
-        logical_index = W.block(32)
-        x_values = unpack_q5(
-            x_block + 6,
-            x_block + 2,
-            logical_index,
-            W.i32(-16),
+        packed_axis = W.block(16)
+        high_axis = W.block(4)
+        activation_axis = W.block(32)
+        low_bits = W.load(x_block + W.index(6) + packed_axis, other=W.u8(0))
+        high_bits = W.load(x_block + W.index(2) + high_axis, other=W.u8(0))
+        activation = W.bitcast(
+            W.load(y_block + W.index(2) + activation_axis, other=W.u8(0)),
+            W.i8,
         )
-        y_values = load_q8(y_block + 2, logical_index)
-        integer_sum = W.reduce(
-            x_values * y_values,
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
+        result = W.packed_i5_i8_dot(
+            low_bits,
+            high_bits,
+            activation,
+            W.i32(16),
+            W.load_f16_le(x_block) * W.load_f16_le(y_block),
+            W.f32(0.0),
+            result,
         )
-        scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
-        result += W.cast(integer_sum, W.f32) * scale
     return result
 
 
@@ -163,24 +145,25 @@ def q5_1_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(24)
         y_block = y + block * W.index(36)
-        logical_index = W.block(32)
-        x_values = unpack_q5(
-            x_block + 8,
-            x_block + 4,
-            logical_index,
+        packed_axis = W.block(16)
+        high_axis = W.block(4)
+        activation_axis = W.block(32)
+        low_bits = W.load(x_block + W.index(8) + packed_axis, other=W.u8(0))
+        high_bits = W.load(x_block + W.index(4) + high_axis, other=W.u8(0))
+        activation = W.bitcast(
+            W.load(y_block + W.index(4) + activation_axis, other=W.u8(0)),
+            W.i8,
+        )
+        result = W.packed_i5_i8_dot(
+            low_bits,
+            high_bits,
+            activation,
             W.i32(0),
+            W.load_f16_le(x_block) * W.load_f16_le(y_block),
+            W.load_f16_le(x_block + W.index(2))
+            * W.load_f16_le(y_block + W.index(2)),
+            result,
         )
-        y_values = load_q8(y_block + 4, logical_index)
-        integer_sum = W.reduce(
-            x_values * y_values,
-            identity=W.i32(0),
-            axis=0,
-            acc_dtype=W.i32,
-            order="relaxed",
-        )
-        dot_scale = W.load_f16_le(x_block) * W.load_f16_le(y_block)
-        correction = W.load_f16_le(x_block + 2) * W.load_f16_le(y_block + 2)
-        result += W.cast(integer_sum, W.f32) * dot_scale + correction
     return result
 
 

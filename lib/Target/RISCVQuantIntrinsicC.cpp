@@ -60,9 +60,14 @@ void emitQuantIntrinsicCLeaves(llvm::raw_ostream &output,
   bool q6FixedLanes64 =
       leaves.contains(IntrinsicCLeaf::Q6KI8FixedLanes64);
   bool q6Scalable = leaves.contains(IntrinsicCLeaf::Q6KI8Scalable);
+  bool packedI5VLEN128 =
+      leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN128);
+  bool packedI5VLEN256 =
+      leaves.contains(IntrinsicCLeaf::PackedI5I8VLEN256);
   if (!iq2FixedLanes32 && !iq2FixedLanes64 && !iq2Scalable &&
       !iq3Scalable && !iq1Fixed && !iq1Scalable && !q6FixedLanes32 &&
-      !q6FixedLanes64 && !q6Scalable)
+      !q6FixedLanes64 && !q6Scalable && !packedI5VLEN128 &&
+      !packedI5VLEN256)
     return;
 
   if (iq2Scalable || iq3Scalable || iq1Scalable || q6Scalable) {
@@ -123,6 +128,7 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ1IntrinsicCLeaves(output, iq1Fixed, iq1Scalable);
   emitQ6IntrinsicCLeaves(output, q6FixedLanes32, q6FixedLanes64,
                          q6Scalable);
+  emitPackedI5IntrinsicCLeaves(output, packedI5VLEN128, packedI5VLEN256);
 }
 
 } // namespace weft::riscv_internal

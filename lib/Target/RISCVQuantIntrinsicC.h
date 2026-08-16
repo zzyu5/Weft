@@ -14,6 +14,8 @@ void emitIQ1IntrinsicCLeaves(llvm::raw_ostream &output, bool fixed,
                              bool scalable);
 void emitQ6IntrinsicCLeaves(llvm::raw_ostream &output, bool fixedLanes32,
                             bool fixedLanes64, bool scalable);
+void emitPackedI5IntrinsicCLeaves(llvm::raw_ostream &output, bool vlen128,
+                                  bool vlen256);
 
 } // namespace weft::riscv_internal
 

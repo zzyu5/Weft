@@ -12,6 +12,7 @@ add_library(WeftRISCVTarget STATIC
   RISCVQuantIQ3IntrinsicC.cpp
   RISCVQuantIQ1IntrinsicC.cpp
   RISCVQuantQ6IntrinsicC.cpp
+  RISCVQuantI5IntrinsicC.cpp
   RISCVIMEIntrinsicC.cpp
   RISCVLowering.cpp
 )

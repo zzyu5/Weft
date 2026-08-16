@@ -145,6 +145,30 @@ def WeftExtension_E2M1E8M0I8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_PackedI5I8DotOp
+    : WeftExtension_Op<"packed_i5_i8_dot", [Pure]> {
+  let summary = "Packed unsigned-i5 by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element dot.  low_bits contains sixteen bytes whose
+    low nibbles encode elements 0..15 and high nibbles encode elements 16..31.
+    high_bits contains one little-endian bit for each element and contributes
+    bit four of the unsigned five-bit code.  zero_point is subtracted from each
+    decoded code.  The integer dot is multiplied by dot_scale, additive_bias is
+    added once, and the result is accumulated into init.
+
+    The packed fields, activation block, affine numerical operands, and init are
+    explicit.  Their enclosing block storage, outer traversal, target vector
+    shape, reduction organization, and instruction spelling remain outside this
+    local semantic primitive.
+  }];
+  let arguments = (ins AnyType:$low_bits, AnyType:$high_bits,
+                       AnyType:$activation, AnyType:$zero_point,
+                       AnyType:$dot_scale, AnyType:$additive_bias,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

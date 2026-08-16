@@ -1174,6 +1174,23 @@ private:
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
+    kernel.walk([&](PackedI5I8DotOp op) {
+      if (decisionFailure)
+        return;
+      PlannedPhysicalDecision<QuantCodebookI8Decision> planned;
+      if (mlir::failed(decideQuantCodebookI8Dot(
+              op, QuantI8DotSemantic::PackedI5,
+              {op.getLowBits(), op.getHighBits(), op.getActivation()},
+              {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+               op.getInit()},
+              planned.realization, 32))) {
+        decisionFailure = true;
+        return;
+      }
+      finalizeQuantCodebookI8Plan(op, planned);
+      physicalPlan.quantCodebookI8.try_emplace(op.getOperation(),
+                                               std::move(planned));
+    });
     kernel.walk([&](IQ3SI8DotOp op) {
       prepareQuantCodebookDot(
           op, QuantI8DotSemantic::IQ3S,
@@ -3480,6 +3497,8 @@ private:
       return emitSignBitI8Dot(op);
     if (auto op = mlir::dyn_cast<E2M1E8M0I8DotOp>(operation))
       return emitE2M1E8M0I8Dot(op);
+    if (auto op = mlir::dyn_cast<PackedI5I8DotOp>(operation))
+      return emitQuantCodebookI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ2SI8DotOp>(operation))
       return emitQuantCodebookI8Dot(op);
     if (auto op = mlir::dyn_cast<IQ3SI8DotOp>(operation))
@@ -8388,10 +8407,10 @@ private:
       OpTy op, QuantI8DotSemantic semantic,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
-      QuantCodebookI8Decision &decision) {
+      QuantCodebookI8Decision &decision, unsigned semanticExtent = 256) {
     std::optional<SelectedQuantI8DotPhysical> selected =
         weft::riscv_internal::selectQuantI8DotPhysical(
-            QuantI8DotCandidateFacts{semantic}, options.target);
+            QuantI8DotCandidateFacts{semantic, semanticExtent}, options.target);
     if (!selected)
       return op.emitError(
           "quant codebook/i8 dot has no legal target realization");
@@ -8403,6 +8422,20 @@ private:
     decision.reductionSegments = selected->reductionSegments;
     decision.resources = selected->resources;
     switch (semantic) {
+    case QuantI8DotSemantic::PackedI5:
+      if (decision.realization !=
+              QuantI8DotRealization::RVVFixedLaneLocalBlockDot ||
+          decision.semanticLanes != 32)
+        return op.emitError(
+            "packed i5/i8 dot requires a fixed thirty-two-lane realization");
+      if (decision.byteShape == RVVVectorShape{8, 16})
+        decision.leaf = IntrinsicCLeaf::PackedI5I8VLEN128;
+      else if (decision.byteShape == RVVVectorShape{8, 8})
+        decision.leaf = IntrinsicCLeaf::PackedI5I8VLEN256;
+      else
+        return op.emitError(
+            "packed i5/i8 dot has no intrinsic leaf for the selected byte shape");
+      break;
     case QuantI8DotSemantic::IQ2S:
       if (decision.realization ==
           QuantI8DotRealization::RVVFixedLaneLocalBlockDot) {

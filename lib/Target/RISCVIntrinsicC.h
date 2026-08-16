@@ -30,6 +30,8 @@ enum class IntrinsicCLeaf {
   E2M1E8M0I8VLEN128,
   E2M1E8M0I8VLEN256,
   E2M1E8M0I8Scalable,
+  PackedI5I8VLEN128,
+  PackedI5I8VLEN256,
   IQ2SI8FixedLanes32,
   IQ2SI8FixedLanes64,
   IQ2SI8Scalable,

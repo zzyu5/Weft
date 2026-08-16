@@ -126,8 +126,11 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
   if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian)
     return std::nullopt;
+  if (facts.semanticExtent == 0)
+    return std::nullopt;
   SelectedQuantI8DotPhysical selected;
-  selected.semanticLanes = target.vlenBits >= 256 ? 64 : 32;
+  selected.semanticLanes =
+      std::min(facts.semanticExtent, target.vlenBits >= 256 ? 64u : 32u);
   std::optional<RVVVectorShape> byteShape =
       rvvShapeForSemanticLanes(8, selected.semanticLanes, target);
   if (!byteShape)
@@ -138,7 +141,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   selected.resources.valueGroups = rvvRegisterGroups(*byteShape) * 2;
   selected.resources.memoryGroups = selected.resources.valueGroups;
 
-  bool fixedLeaf = facts.semantic == QuantI8DotSemantic::IQ2S ||
+  bool fixedLeaf = facts.semantic == QuantI8DotSemantic::PackedI5 ||
+                   facts.semantic == QuantI8DotSemantic::IQ2S ||
                    facts.semantic == QuantI8DotSemantic::Q6K ||
                    (facts.semantic == QuantI8DotSemantic::IQ1M &&
                     target.vlenBits == 128);

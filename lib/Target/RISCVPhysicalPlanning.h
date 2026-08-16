@@ -77,6 +77,7 @@ selectReductionStatePlacement(const ReductionStatePlacementFacts &facts,
                               const RISCVBackendConfig &config);
 
 enum class QuantI8DotSemantic {
+  PackedI5,
   IQ2S,
   IQ3S,
   IQ1M,
@@ -90,6 +91,7 @@ enum class QuantI8DotRealization {
 
 struct QuantI8DotCandidateFacts {
   QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
+  unsigned semanticExtent = 256;
 };
 
 struct SelectedQuantI8DotPhysical {
