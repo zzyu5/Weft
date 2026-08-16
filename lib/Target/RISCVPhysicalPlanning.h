@@ -337,14 +337,22 @@ enum class VLASegment2AccessKind {
   Store,
 };
 
+struct VLASegment2CandidateFacts {
+  bool load = true;
+  unsigned fields = 2;
+  unsigned elementSEW = 0;
+};
+
 struct SelectedVLASegment2Physical {
   VLASegment2AccessKind kind = VLASegment2AccessKind::Load;
   bool emitAtEarlierAccess = true;
   int64_t coordinateScale = 2;
+  unsigned fields = 2;
+  unsigned elementSEW = 0;
 };
 
 std::optional<SelectedVLASegment2Physical>
-selectVLASegment2Physical(bool load,
+selectVLASegment2Physical(const VLASegment2CandidateFacts &facts,
                           const RISCVTargetProfile &target);
 
 enum class VLAPredicateRealization {
@@ -657,6 +665,12 @@ struct VLAIndexedMemoryFact {
   unsigned offsetSEW = 0;
 };
 
+struct VLASegmentMemoryFact {
+  bool write = false;
+  unsigned fields = 0;
+  unsigned elementSEW = 0;
+};
+
 struct VLANarrowPhysical {
   RVVVectorShape sourceShape;
   RVVVectorShape intermediateShape;
@@ -669,8 +683,6 @@ struct VLAEntityCandidateFacts {
   unsigned stridedAccesses = 0;
   unsigned indexedAccesses = 0;
   unsigned maxIndexedOffsetSEW = 0;
-  unsigned segmentLoadPairs = 0;
-  unsigned segmentStorePairs = 0;
   unsigned lookupCount = 0;
   bool hasF32Division = false;
   bool hasFloatCast = false;
@@ -681,6 +693,7 @@ struct VLAEntityCandidateFacts {
   llvm::SmallVector<unsigned> requiredLMULs;
   llvm::SmallVector<unsigned> accessElementSEWs;
   llvm::SmallVector<VLAIndexedMemoryFact> indexedMemory;
+  llvm::SmallVector<VLASegmentMemoryFact> segmentMemory;
   llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimes;
   llvm::SmallVector<VLAStateResourceFact> states;
   llvm::SmallVector<PhysicalResourceBudget> localPrimitiveResources;

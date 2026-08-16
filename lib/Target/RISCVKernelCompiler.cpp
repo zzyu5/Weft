@@ -335,6 +335,9 @@ struct VLASegment2Decision {
   mlir::Operation *emission = nullptr;
   mlir::Value base;
   int64_t coordinateScale = 2;
+  unsigned fields = 2;
+  unsigned elementSEW = 0;
+  RVVVectorShape vectorShape;
 };
 
 struct VLALookupDecision {
@@ -2473,7 +2476,8 @@ private:
             first.address.field == 1 ? first.access : second.access;
         bool loadPair = mlir::isa<LoadOp>(field0->operation);
         std::optional<SelectedVLASegment2Physical> physical =
-            selectVLASegment2Physical(loadPair, options.target);
+            selectVLASegment2Physical(
+                {loadPair, 2, static_cast<unsigned>(32)}, options.target);
         if (!physical)
           continue;
         mlir::Operation *earlier =
@@ -2493,6 +2497,8 @@ private:
         segment.base = first.address.field == 0 ? first.address.pointer
                                                 : second.address.pointer;
         segment.coordinateScale = physical->coordinateScale;
+        segment.fields = physical->fields;
+        segment.elementSEW = physical->elementSEW;
         decision.segment2.push_back(std::move(segment));
         field0->memoryMode = VLAMemoryMode::Segment2;
         field1->memoryMode = VLAMemoryMode::Segment2;
@@ -2794,14 +2800,10 @@ private:
             VLAIndexedMemoryFact{elementSEW, access.indexedSEW});
       }
     }
-    candidateFacts.segmentLoadPairs = llvm::count_if(
-        decision.segment2, [](const VLASegment2Decision &segment) {
-          return segment.kind == VLASegment2AccessKind::Load;
-        });
-    candidateFacts.segmentStorePairs = llvm::count_if(
-        decision.segment2, [](const VLASegment2Decision &segment) {
-          return segment.kind == VLASegment2AccessKind::Store;
-        });
+    for (const VLASegment2Decision &segment : decision.segment2)
+      candidateFacts.segmentMemory.push_back(VLASegmentMemoryFact{
+          segment.kind == VLASegment2AccessKind::Store, segment.fields,
+          segment.elementSEW});
     candidateFacts.lookupCount = decision.lookups.size();
     for (const VLAStateDecision &state : decision.states)
       candidateFacts.states.push_back(
@@ -2837,6 +2839,20 @@ private:
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
     narrowPhysical = selected->narrow;
+    for (VLASegment2Decision &segment : decision.segment2) {
+      segment.vectorShape =
+          rvvShapeForSameLanes(entity.vlaDataShape, segment.elementSEW,
+                               options.target)
+              .value_or(RVVVectorShape{});
+      if (!segment.vectorShape ||
+          !options.target.supportsSegmentVectorMemory(
+              segment.fields, segment.vectorShape.sew,
+              segment.vectorShape.lmulEighths)) {
+        segment.emission->emitError(
+            "segment memory has no selected vector shape");
+        return mlir::failure();
+      }
+    }
     if (!decision.narrows.empty() && !narrowPhysical) {
       op.emitError("VLA narrow has no selected physical shape");
       return mlir::failure();
@@ -6111,8 +6127,12 @@ private:
           return op.emitError("segment2 load has no owning physical decision");
         if (segment->emission != op.getOperation())
           return mlir::success();
-        if (segment->kind != VLASegment2AccessKind::Load || !f32 ||
-            elementSEW != 32)
+        std::string segmentShapeSuffix =
+            rvvShapeSuffix(segment->vectorShape);
+        if (segment->kind != VLASegment2AccessKind::Load ||
+            segment->fields != 2 || segment->elementSEW != 32 ||
+            segment->vectorShape != valueShape->shape || !f32 ||
+            elementSEW != segment->elementSEW || segmentShapeSuffix.empty())
           return op.emitError("segment2 load decision has no intrinsic-C spelling");
         auto field0 = mlir::cast<LoadOp>(segment->field0);
         auto field1 = mlir::cast<LoadOp>(segment->field1);
@@ -6127,15 +6147,15 @@ private:
         std::string tuple = fresh("segment2");
         std::string first = fresh("segment2_field0");
         std::string second = fresh("segment2_field1");
-        std::string suffix = "f" + shapeSuffix;
-        line("vfloat" + shapeSuffix + "x2_t " + tuple +
+        std::string suffix = "f" + segmentShapeSuffix;
+        line("vfloat" + segmentShapeSuffix + "x2_t " + tuple +
              " = __riscv_vlseg2e32_v_" + suffix + "x2(" + *base +
              " + " + std::to_string(segment->coordinateScale) + " * " +
              coordinate.spelling + ", " + activeVL + ");");
-        line("vfloat" + shapeSuffix + "_t " + first +
+        line("vfloat" + segmentShapeSuffix + "_t " + first +
              " = __riscv_vget_v_" + suffix + "x2_" + suffix + "(" + tuple +
              ", 0);");
-        line("vfloat" + shapeSuffix + "_t " + second +
+        line("vfloat" + segmentShapeSuffix + "_t " + second +
              " = __riscv_vget_v_" + suffix + "x2_" + suffix + "(" + tuple +
              ", 1);");
         values[field0.getResult()] =
@@ -6549,8 +6569,12 @@ private:
           return op.emitError("segment2 store has no owning physical decision");
         if (segment->emission != op.getOperation())
           return mlir::success();
-        if (segment->kind != VLASegment2AccessKind::Store || !f32 ||
-            elementSEW != 32)
+        std::string segmentShapeSuffix =
+            rvvShapeSuffix(segment->vectorShape);
+        if (segment->kind != VLASegment2AccessKind::Store ||
+            segment->fields != 2 || segment->elementSEW != 32 ||
+            segment->vectorShape != handoff->resultShape || !f32 ||
+            elementSEW != segment->elementSEW || segmentShapeSuffix.empty())
           return op.emitError("segment2 store decision has no intrinsic-C spelling");
         auto field0 = mlir::cast<StoreOp>(segment->field0);
         auto field1 = mlir::cast<StoreOp>(segment->field1);
@@ -6571,8 +6595,8 @@ private:
                                 << static_cast<int>(second.kind) << " names="
                                 << first.spelling << "/" << second.spelling;
         std::string tuple = fresh("segment2_store");
-        std::string suffix = "f" + shapeSuffix;
-        line("vfloat" + shapeSuffix + "x2_t " + tuple +
+        std::string suffix = "f" + segmentShapeSuffix;
+        line("vfloat" + segmentShapeSuffix + "x2_t " + tuple +
              " = __riscv_vcreate_v_" + suffix + "x2(" + first.spelling + ", " +
              second.spelling + ");");
         line("__riscv_vsseg2e32_v_" + suffix + "x2(" + *base +

@@ -644,13 +644,15 @@ selectVLAAccessPhysical(const VLAAccessCandidateFacts &facts,
 }
 
 std::optional<SelectedVLASegment2Physical>
-selectVLASegment2Physical(bool load,
+selectVLASegment2Physical(const VLASegment2CandidateFacts &facts,
                           const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasSegmentMemory)
+  if (!target.hasRVV || !target.hasSegmentMemory || facts.fields != 2 ||
+      facts.elementSEW != 32)
     return std::nullopt;
   return SelectedVLASegment2Physical{
-      load ? VLASegment2AccessKind::Load : VLASegment2AccessKind::Store,
-      load};
+      facts.load ? VLASegment2AccessKind::Load
+                 : VLASegment2AccessKind::Store,
+      facts.load, 2, facts.fields, facts.elementSEW};
 }
 
 std::optional<SelectedVLAPredicatePhysical>
@@ -1042,9 +1044,14 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         });
     if (!indexedShapesLegal)
       continue;
-    if ((facts.segmentLoadPairs != 0 || facts.segmentStorePairs != 0) &&
-        !target.supportsSegmentVectorMemory(2, 32,
-                                            static_cast<int>(candidate * 8)))
+    bool segmentShapesLegal = llvm::all_of(
+        facts.segmentMemory, [&](const VLASegmentMemoryFact &memory) {
+          return memory.fields != 0 && memory.elementSEW != 0 &&
+                 target.supportsSegmentVectorMemory(
+                     memory.fields, memory.elementSEW,
+                     static_cast<int>(candidate * 8));
+        });
+    if (!segmentShapesLegal)
       continue;
 
     unsigned carriedStateGroups = 0;
@@ -1150,9 +1157,16 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     }
 
     unsigned memoryGroups = indexGroups;
-    memoryGroups +=
-        2 * candidate *
-        std::max(facts.segmentLoadPairs, facts.segmentStorePairs);
+    unsigned segmentLoadGroups = 0;
+    unsigned segmentStoreGroups = 0;
+    for (const VLASegmentMemoryFact &memory : facts.segmentMemory) {
+      unsigned groups = memory.fields * candidate;
+      if (memory.write)
+        segmentStoreGroups += groups;
+      else
+        segmentLoadGroups += groups;
+    }
+    memoryGroups += std::max(segmentLoadGroups, segmentStoreGroups);
 
     unsigned lookupGroups = 0;
     if (facts.lookupCount != 0) {
