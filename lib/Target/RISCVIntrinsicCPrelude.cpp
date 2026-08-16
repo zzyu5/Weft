@@ -57,6 +57,15 @@ __weft_load_f16_le(const uint8_t *bytes) {
   return (float)__weft_bitcast_u16_f16(bits);
 }
 
+static inline __attribute__((unused)) float
+__weft_load_f16_le_aligned(const uint8_t *bytes) {
+  const uint8_t *aligned =
+      (const uint8_t *)__builtin_assume_aligned(bytes, 2);
+  uint16_t bits;
+  __builtin_memcpy(&bits, aligned, sizeof(bits));
+  return (float)__weft_bitcast_u16_f16(bits);
+}
+
 )c";
   emitRVVIntrinsicCLeaves(output, usesRVVSymmetricI4I8,
                           usesRVVAffineI4I8, usesRVVSymmetricI4I8M4,

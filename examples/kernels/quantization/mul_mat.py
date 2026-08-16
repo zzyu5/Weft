@@ -276,10 +276,10 @@ def mul_mat_q4_1(
 
 @weft.kernel
 def mul_mat_q5_0(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    weight: W.ptr[W.u8, W.readonly, W.noalias, W.aligned(2)],
     activation: W.ptr[W.f32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias, W.aligned(2)],
     row_begin: W.index,
     row_end: W.index,
     columns: W.index,
@@ -313,10 +313,10 @@ def mul_mat_q5_0(
 
 @weft.kernel
 def mul_mat_q5_1(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    weight: W.ptr[W.u8, W.readonly, W.noalias, W.aligned(2)],
     activation: W.ptr[W.f32, W.readonly, W.noalias],
     output: W.ptr[W.f32, W.writeonly, W.noalias],
-    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias, W.aligned(2)],
     row_begin: W.index,
     row_end: W.index,
     columns: W.index,

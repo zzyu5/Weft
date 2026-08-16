@@ -123,8 +123,8 @@ def q5_0_row_dot(x, y, blocks):
 
 @weft.kernel
 def q5_0_q8_0(
-    x: W.ptr[W.u8, W.readonly],
-    y: W.ptr[W.u8, W.readonly],
+    x: W.ptr[W.u8, W.readonly, W.aligned(2)],
+    y: W.ptr[W.u8, W.readonly, W.aligned(2)],
     blocks: W.index,
 ) -> W.f32:
     return q5_0_row_dot(x, y, blocks)
@@ -160,8 +160,8 @@ def q5_1_row_dot(x, y, blocks):
 
 @weft.kernel
 def q5_1_q8_1(
-    x: W.ptr[W.u8, W.readonly],
-    y: W.ptr[W.u8, W.readonly],
+    x: W.ptr[W.u8, W.readonly, W.aligned(2)],
+    y: W.ptr[W.u8, W.readonly, W.aligned(2)],
     blocks: W.index,
 ) -> W.f32:
     return q5_1_row_dot(x, y, blocks)

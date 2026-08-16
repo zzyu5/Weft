@@ -97,6 +97,7 @@ struct BlockDecodeDecision {
 
 enum class LoadF16LERealization {
   ScalarBytes,
+  ScalarAlignedHalf,
 };
 
 struct LoadF16LEDecision {
@@ -980,6 +981,45 @@ std::optional<int64_t> integerConstantValue(mlir::Value value) {
   return integer.getInt();
 }
 
+bool isKnownMultipleOf(mlir::Value value, int64_t divisor,
+                       llvm::DenseSet<mlir::Value> &visited) {
+  if (!value || divisor <= 0 || !visited.insert(value).second)
+    return false;
+  if (std::optional<int64_t> constant = integerConstantValue(value))
+    return *constant % divisor == 0;
+  if (auto cast = value.getDefiningOp<CastOp>())
+    return isKnownMultipleOf(cast.getInput(), divisor, visited);
+  auto binary = value.getDefiningOp<BinaryOp>();
+  if (!binary)
+    return false;
+  if (binary.getKind() == "add" || binary.getKind() == "sub") {
+    llvm::DenseSet<mlir::Value> lhsVisited = visited;
+    llvm::DenseSet<mlir::Value> rhsVisited = visited;
+    return isKnownMultipleOf(binary.getLhs(), divisor, lhsVisited) &&
+           isKnownMultipleOf(binary.getRhs(), divisor, rhsVisited);
+  }
+  if (binary.getKind() == "mul") {
+    llvm::DenseSet<mlir::Value> lhsVisited = visited;
+    llvm::DenseSet<mlir::Value> rhsVisited = visited;
+    return isKnownMultipleOf(binary.getLhs(), divisor, lhsVisited) ||
+           isKnownMultipleOf(binary.getRhs(), divisor, rhsVisited);
+  }
+  return false;
+}
+
+bool isKnownMultipleOf(mlir::Value value, int64_t divisor) {
+  llvm::DenseSet<mlir::Value> visited;
+  return isKnownMultipleOf(value, divisor, visited);
+}
+
+bool isKnownAlignedF16Pointer(mlir::Value pointer) {
+  if (auto add = pointer.getDefiningOp<PtrAddOp>())
+    return isKnownAlignedF16Pointer(add.getBase()) &&
+           isKnownMultipleOf(add.getOffset(), 2);
+  auto type = mlir::dyn_cast<PtrType>(pointer.getType());
+  return type && type.getAlignment() >= 2;
+}
+
 std::string reversePredicate(llvm::StringRef predicate) {
   return llvm::StringSwitch<std::string>(predicate)
       .Case("eq", "eq")
@@ -1165,7 +1205,10 @@ private:
       }
       PlannedPhysicalDecision<LoadF16LEDecision> planned;
       initializeEntityPlan(planned.entity);
-      planned.realization.realization = LoadF16LERealization::ScalarBytes;
+      planned.realization.realization =
+          isKnownAlignedF16Pointer(op.getBase())
+              ? LoadF16LERealization::ScalarAlignedHalf
+              : LoadF16LERealization::ScalarBytes;
       if (!physicalPlan.f16LELoads
                .try_emplace(op.getOperation(), std::move(planned))
                .second) {
@@ -6821,17 +6864,24 @@ private:
 
   mlir::LogicalResult emitScalarLoadF16LE(LoadF16LEOp op) {
     auto selected = physicalPlan.f16LELoads.find(op.getOperation());
-    if (selected == physicalPlan.f16LELoads.end() ||
-        selected->second.realization.realization !=
-            LoadF16LERealization::ScalarBytes)
+    if (selected == physicalPlan.f16LELoads.end())
       return op.emitError("scalar load_f16_le has no physical decision");
     if (mlir::failed(requireEntityPlan(op.getOperation(), selected->second)))
       return mlir::failure();
     CValue base = require(op.getBase());
     if (base.kind != CValueKind::Pointer || base.spelling.empty())
       return op.emitError("scalar load_f16_le base pointer is unavailable");
+    llvm::StringRef helper;
+    switch (selected->second.realization.realization) {
+    case LoadF16LERealization::ScalarBytes:
+      helper = "__weft_load_f16_le";
+      break;
+    case LoadF16LERealization::ScalarAlignedHalf:
+      helper = "__weft_load_f16_le_aligned";
+      break;
+    }
     std::string result = fresh("f16_le");
-    line("const float " + result + " = __weft_load_f16_le(" +
+    line("const float " + result + " = " + helper.str() + "(" +
          base.spelling + ");");
     values[op.getResult()] =
         CValue{op.getResult().getType(), CValueKind::Scalar, result};

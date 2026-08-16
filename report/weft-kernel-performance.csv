@@ -153,8 +153,8 @@ source_mul_mat,mul_mat_f16,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-m
 source_mul_mat,mul_mat_q1_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,17.142376,1.957397,GOP/s
 source_mul_mat,mul_mat_q4_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,1.10268593e-06,1.10268593e-06,15.340749,2.187275,GOP/s
 source_mul_mat,mul_mat_q4_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,16.080672,2.086631,GOP/s
-source_mul_mat,mul_mat_q5_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,17.315658,1.937809,GOP/s
-source_mul_mat,mul_mat_q5_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,17.779000,1.887307,GOP/s
+source_mul_mat,mul_mat_q5_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,16.745635,2.003772,GOP/s
+source_mul_mat,mul_mat_q5_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,16.643534,2.016064,GOP/s
 source_mul_mat,mul_mat_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,7.210132,4.653789,GOP/s
 source_mul_mat,mul_mat_q2_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,4.17232513e-06,2.64732035e-06,9.966285,3.366794,GOP/s
 source_mul_mat,mul_mat_q3_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,9.53674316e-07,9.09338166e-08,8.702499,3.855724,GOP/s
@@ -179,8 +179,8 @@ source_mul_mat,mul_mat_f16,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-m
 source_mul_mat,mul_mat_q1_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,14.285429,2.348857,GOP/s
 source_mul_mat,mul_mat_q4_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,1.10268593e-06,1.10268593e-06,16.952695,1.979298,GOP/s
 source_mul_mat,mul_mat_q4_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,20.779313,1.614800,GOP/s
-source_mul_mat,mul_mat_q5_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,17.157358,1.955688,GOP/s
-source_mul_mat,mul_mat_q5_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,20.657296,1.624338,GOP/s
+source_mul_mat,mul_mat_q5_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,17.083421,1.964152,GOP/s
+source_mul_mat,mul_mat_q5_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,18.599055,1.804093,GOP/s
 source_mul_mat,mul_mat_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,28.185288,1.190495,GOP/s
 source_mul_mat,mul_mat_q2_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,4.17232513e-06,2.64732035e-06,38.815214,0.864466,GOP/s
 source_mul_mat,mul_mat_q3_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=1;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,19.191701,1.748382,GOP/s
@@ -205,8 +205,8 @@ source_mul_mat,mul_mat_f16,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-
 source_mul_mat,mul_mat_q1_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2013.218100,2.133384,GOP/s
 source_mul_mat,mul_mat_q4_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,1.10268593e-06,1.10268593e-06,1961.821690,2.189275,GOP/s
 source_mul_mat,mul_mat_q4_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2059.724549,2.085214,GOP/s
-source_mul_mat,mul_mat_q5_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2215.382767,1.938702,GOP/s
-source_mul_mat,mul_mat_q5_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2274.000369,1.888728,GOP/s
+source_mul_mat,mul_mat_q5_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,2142.386637,2.004758,GOP/s
+source_mul_mat,mul_mat_q5_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,2130.331892,2.016102,GOP/s
 source_mul_mat,mul_mat_q8_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,1.90734863e-06,1.90734863e-06,918.486167,4.676137,GOP/s
 source_mul_mat,mul_mat_q2_K,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,5.7220459e-06,2.64732035e-06,1277.735414,3.361390,GOP/s
 source_mul_mat,mul_mat_q3_K,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,3.81469727e-06,1.07396551e-07,1114.174263,3.854843,GOP/s
@@ -231,8 +231,8 @@ source_mul_mat,mul_mat_f16,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-
 source_mul_mat,mul_mat_q1_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,1822.905795,2.356110,GOP/s
 source_mul_mat,mul_mat_q4_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,1.10268593e-06,1.10268593e-06,2164.987539,1.983830,GOP/s
 source_mul_mat,mul_mat_q4_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2665.097664,1.611561,GOP/s
-source_mul_mat,mul_mat_q5_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2201.687290,1.950762,GOP/s
-source_mul_mat,mul_mat_q5_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2646.654449,1.622791,GOP/s
+source_mul_mat,mul_mat_q5_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,2189.504723,1.961616,GOP/s
+source_mul_mat,mul_mat_q5_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,10,0,64,sampled,yes,,,0,0,2380.546792,1.804194,GOP/s
 source_mul_mat,mul_mat_q8_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,3617.224104,1.187366,GOP/s
 source_mul_mat,mul_mat_q2_K,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,5.7220459e-06,2.64732035e-06,4965.545878,0.864954,GOP/s
 source_mul_mat,mul_mat_q3_K,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-core-local-quant,M=128;N=4096;K=4096,full-direct-generated-matrix-multiplication,3,0,64,sampled,yes,,,0,0,2451.230668,1.752168,GOP/s
@@ -261,8 +261,8 @@ source_mul_mat_ime,mul_mat_q4_K,prefill,K1/X60,RV64GCV-IME1-VLEN256,IME1-inline-
 source_vec_dot,q1_0_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,56.952353,2.062084,GOP/s
 source_vec_dot,q4_0_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,44.673268,2.628877,GOP/s
 source_vec_dot,q4_1_q8_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,57.008643,2.060047,GOP/s
-source_vec_dot,q5_0_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,46.533457,2.523787,GOP/s
-source_vec_dot,q5_1_q8_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,61.126752,1.921262,GOP/s
+source_vec_dot,q5_0_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,44.052347,2.665931,GOP/s
+source_vec_dot,q5_1_q8_1,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,45.391753,2.587265,GOP/s
 source_vec_dot,q8_0_q8_0,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,31.440120,3.735371,GOP/s
 source_vec_dot,q2_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,34.409513,3.413025,GOP/s
 source_vec_dot,q3_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,40.135760,2.926082,GOP/s
@@ -301,8 +301,8 @@ source_vec_dot,tq1_0_q8_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-pr
 source_vec_dot,tq2_0_q8_K,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,25.774792,4.556410,GOP/s
 source_vec_dot,q4_0_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,59.078397,1.987876,GOP/s
 source_vec_dot,q4_1_q8_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,72.690114,1.615633,GOP/s
-source_vec_dot,q5_0_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,60.199667,1.950850,GOP/s
-source_vec_dot,q5_1_q8_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,72.270500,1.625013,GOP/s
+source_vec_dot,q5_0_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,59.779567,1.964559,GOP/s
+source_vec_dot,q5_1_q8_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,65.078239,1.804605,GOP/s
 source_vec_dot,q8_0_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,93.987326,1.249536,GOP/s
 source_vec_dot,mxfp4_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,54.729815,2.145823,GOP/s
 source_vec_dot,nvfp4_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,335.329550,0.350224,GOP/s
