@@ -133,18 +133,19 @@ std::optional<SelectedTernaryI8DotPhysical>
 selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target);
 
-enum class SignedCodebookI8Realization {
+enum class CodebookGatherI8Realization {
   RVVVLEN128GatherDot,
   RVVVLEN256GatherDot,
 };
 
-struct SignedCodebookI8CandidateFacts {
+struct CodebookGatherI8CandidateFacts {
+  unsigned codeByteExtent = 0;
   unsigned entryWidth = 0;
 };
 
-struct SelectedSignedCodebookI8Physical {
-  SignedCodebookI8Realization realization =
-      SignedCodebookI8Realization::RVVVLEN128GatherDot;
+struct SelectedCodebookGatherI8Physical {
+  CodebookGatherI8Realization realization =
+      CodebookGatherI8Realization::RVVVLEN128GatherDot;
   unsigned entryWidth = 0;
   RVVVectorShape codeShape;
   RVVVectorShape indexShape;
@@ -155,29 +156,9 @@ struct SelectedSignedCodebookI8Physical {
   PhysicalResourceBudget resources;
 };
 
-std::optional<SelectedSignedCodebookI8Physical>
-selectSignedCodebookI8Physical(const SignedCodebookI8CandidateFacts &facts,
+std::optional<SelectedCodebookGatherI8Physical>
+selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
                                const RISCVTargetProfile &target);
-
-enum class PackedU9U7CodebookI8Realization {
-  RVVVLEN128GatherDot,
-  RVVVLEN256GatherDot,
-};
-
-struct SelectedPackedU9U7CodebookI8Physical {
-  PackedU9U7CodebookI8Realization realization =
-      PackedU9U7CodebookI8Realization::RVVVLEN128GatherDot;
-  RVVVectorShape packedShape;
-  RVVVectorShape indexShape;
-  RVVVectorShape tableShape;
-  RVVVectorShape activationShape;
-  RVVVectorShape productShape;
-  RVVVectorShape reductionShape;
-  PhysicalResourceBudget resources;
-};
-
-std::optional<SelectedPackedU9U7CodebookI8Physical>
-selectPackedU9U7CodebookI8Physical(const RISCVTargetProfile &target);
 
 enum class QuantI8DotSemantic {
   PackedI4,

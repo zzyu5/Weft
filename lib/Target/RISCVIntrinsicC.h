@@ -48,6 +48,8 @@ enum class IntrinsicCLeaf {
   SignedCodebook4I8VLEN256,
   PackedU9U7CodebookI8VLEN128,
   PackedU9U7CodebookI8VLEN256,
+  PackedU11GridDeltaI8VLEN128,
+  PackedU11GridDeltaI8VLEN256,
   IQ2SI8FixedLanes32,
   IQ2SI8FixedLanes64,
   IQ2SI8Scalable,

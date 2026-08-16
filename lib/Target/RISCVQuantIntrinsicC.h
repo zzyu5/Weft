@@ -28,6 +28,8 @@ void emitSignedCodebookIntrinsicCLeaves(
     bool entry4VLEN128, bool entry4VLEN256);
 void emitPackedU9U7CodebookIntrinsicCLeaves(llvm::raw_ostream &output,
                                             bool vlen128, bool vlen256);
+void emitPackedU11GridDeltaIntrinsicCLeaves(llvm::raw_ostream &output,
+                                            bool vlen128, bool vlen256);
 
 } // namespace weft::riscv_internal
 

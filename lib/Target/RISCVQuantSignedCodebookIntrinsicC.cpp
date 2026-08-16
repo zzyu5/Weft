@@ -327,4 +327,91 @@ __weft_packed_u9_u7_codebook_i8_vl256(
   }
 }
 
+void emitPackedU11GridDeltaIntrinsicCLeaves(llvm::raw_ostream &output,
+                                            bool vlen128, bool vlen256) {
+  if (vlen128) {
+    output << R"c(static inline __attribute__((always_inline, unused)) float
+__weft_packed_u11_grid_delta_i8_vl128(
+    const uint8_t *codes, uint16_t metadata,
+    const uint8_t *activation_bytes, const uint8_t *grid_table,
+    int32_t activation_sum, float dot_scale, float init) {
+  const size_t code_count = 4;
+  const size_t vl32 = __riscv_vsetvl_e8m2(32);
+  const vuint8mf4_t code8 = __riscv_vle8_v_u8mf4(codes, code_count);
+  const vuint16mf2_t low =
+      __riscv_vwcvtu_x_x_v_u16mf2(code8, code_count);
+  const vuint16mf2_t field = __riscv_vid_v_u16mf2(code_count);
+  const vuint16mf2_t shift =
+      __riscv_vmul_vx_u16mf2(field, 3, code_count);
+  const vuint16mf2_t high = __riscv_vand_vx_u16mf2(
+      __riscv_vsrl_vv_u16mf2(
+          __riscv_vmv_v_x_u16mf2(metadata, code_count), shift, code_count),
+      7, code_count);
+  const vuint16mf2_t index = __riscv_vor_vv_u16mf2(
+      low, __riscv_vsll_vx_u16mf2(high, 8, code_count), code_count);
+  const vuint16mf2_t offsets =
+      __riscv_vsll_vx_u16mf2(index, 3, code_count);
+  const vuint64m2_t packed_grid = __riscv_vluxei16_v_u64m2(
+      (const uint64_t *)(const void *)grid_table, offsets, code_count);
+  const vint8m2_t grid = __riscv_vreinterpret_v_u8m2_i8m2(
+      __riscv_vreinterpret_v_u64m2_u8m2(packed_grid));
+  const vint8m2_t activation = __riscv_vle8_v_i8m2(
+      (const int8_t *)(const void *)activation_bytes, vl32);
+  const vint16m4_t product =
+      __riscv_vwmul_vv_i16m4(grid, activation, vl32);
+  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+  const int32_t grid_dot = __riscv_vmv_x_s_i32m1_i32(
+      __riscv_vwredsum_vs_i16m4_i32m1(product, zero, vl32));
+  const int32_t local_scale = 1 + 2 * (int32_t)((metadata >> 12) & 7);
+  const float delta = (metadata & 0x8000u) ? -0.125f : 0.125f;
+  return init + dot_scale * (float)local_scale *
+                    ((float)grid_dot + delta * (float)activation_sum);
+}
+
+)c";
+  }
+
+  if (vlen256) {
+    output << R"c(static inline __attribute__((always_inline, unused)) float
+__weft_packed_u11_grid_delta_i8_vl256(
+    const uint8_t *codes, uint16_t metadata,
+    const uint8_t *activation_bytes, const uint8_t *grid_table,
+    int32_t activation_sum, float dot_scale, float init) {
+  const size_t code_count = 4;
+  const size_t vl32 = __riscv_vsetvl_e8m1(32);
+  const vuint8mf8_t code8 = __riscv_vle8_v_u8mf8(codes, code_count);
+  const vuint16mf4_t low =
+      __riscv_vwcvtu_x_x_v_u16mf4(code8, code_count);
+  const vuint16mf4_t field = __riscv_vid_v_u16mf4(code_count);
+  const vuint16mf4_t shift =
+      __riscv_vmul_vx_u16mf4(field, 3, code_count);
+  const vuint16mf4_t high = __riscv_vand_vx_u16mf4(
+      __riscv_vsrl_vv_u16mf4(
+          __riscv_vmv_v_x_u16mf4(metadata, code_count), shift, code_count),
+      7, code_count);
+  const vuint16mf4_t index = __riscv_vor_vv_u16mf4(
+      low, __riscv_vsll_vx_u16mf4(high, 8, code_count), code_count);
+  const vuint16mf4_t offsets =
+      __riscv_vsll_vx_u16mf4(index, 3, code_count);
+  const vuint64m1_t packed_grid = __riscv_vluxei16_v_u64m1(
+      (const uint64_t *)(const void *)grid_table, offsets, code_count);
+  const vint8m1_t grid = __riscv_vreinterpret_v_u8m1_i8m1(
+      __riscv_vreinterpret_v_u64m1_u8m1(packed_grid));
+  const vint8m1_t activation = __riscv_vle8_v_i8m1(
+      (const int8_t *)(const void *)activation_bytes, vl32);
+  const vint16m2_t product =
+      __riscv_vwmul_vv_i16m2(grid, activation, vl32);
+  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
+  const int32_t grid_dot = __riscv_vmv_x_s_i32m1_i32(
+      __riscv_vwredsum_vs_i16m2_i32m1(product, zero, vl32));
+  const int32_t local_scale = 1 + 2 * (int32_t)((metadata >> 12) & 7);
+  const float delta = (metadata & 0x8000u) ? -0.125f : 0.125f;
+  return init + dot_scale * (float)local_scale *
+                    ((float)grid_dot + delta * (float)activation_sum);
+}
+
+)c";
+  }
+}
+
 } // namespace weft::riscv_internal

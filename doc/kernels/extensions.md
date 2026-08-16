@@ -181,6 +181,11 @@ u16 code word：low 9 bits选择8-element grid entry，high 7 bits选择sign mas
 它只拥有这一个32-element lookup、sign与scaled integer dot；74-byte packed block、八组
 traversal和block scale仍由DSL kernel拥有。
 
+`W.packed_u11_grid_delta_i8_dot`接收四个low code bytes和一个u16 metadata。四个3-bit field
+补成u11 grid index；metadata同时定义odd local scale和作用于显式`activation_sum`的
+`+/-0.125` correction。它返回一个32-element corrected grid dot；50-byte packed block、
+activation sum在Q8 workspace中的地址、八组traversal和block scale仍由DSL kernel拥有。
+
 `W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
 code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
 operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer

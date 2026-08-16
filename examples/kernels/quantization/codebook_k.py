@@ -522,40 +522,17 @@ def iq1_s_row_dot(weight, activation, grid_table, blocks):
                 W.u16,
             )
             metadata = metadata_low | (metadata_high << W.u16(8))
+            code = W.block(4)
             member = W.block(32)
-            field = member // W.index(8)
-            lane = member % W.index(8)
-            low_index = W.load(
-                x + W.index(2) + group * W.index(4) + field,
-                other=W.u8(0),
-            )
-            high0 = W.cast(metadata & W.u16(7), W.index) << W.index(8)
-            high1 = W.cast((metadata >> W.u16(3)) & W.u16(7), W.index) << W.index(8)
-            high2 = W.cast((metadata >> W.u16(6)) & W.u16(7), W.index) << W.index(8)
-            high3 = W.cast((metadata >> W.u16(9)) & W.u16(7), W.index) << W.index(8)
-            zero_index = field - field
-            selected_high = W.select(
-                field == W.index(0),
-                zero_index | high0,
-                W.select(
-                    field == W.index(1),
-                    zero_index | high1,
-                    W.select(
-                        field == W.index(2),
-                        zero_index | high2,
-                        zero_index | high3,
-                    ),
+            activation_sum = load_i16_le(
+                y + W.index(260) + group * W.index(4)
+            ) + load_i16_le(y + W.index(262) + group * W.index(4))
+            result = W.packed_u11_grid_delta_i8_dot(
+                W.load(
+                    x + W.index(2) + group * W.index(4) + code,
+                    other=W.u8(0),
                 ),
-            )
-            grid_index = W.cast(low_index, W.index) | selected_high
-            grid_offset = grid_index * W.index(8) + lane
-            grid = W.cast(
-                W.bitcast(
-                    W.load(grid_table + grid_offset, other=W.u8(0)), W.i8
-                ),
-                W.i32,
-            )
-            activation_values = W.cast(
+                metadata,
                 W.bitcast(
                     W.load(
                         y + W.index(4) + group * W.index(32) + member,
@@ -563,29 +540,10 @@ def iq1_s_row_dot(weight, activation, grid_table, blocks):
                     ),
                     W.i8,
                 ),
-                W.i32,
-            )
-            grid_sum = W.reduce(
-                grid * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            activation_sum = load_i16_le(
-                y + W.index(260) + group * W.index(4)
-            ) + load_i16_le(y + W.index(262) + group * W.index(4))
-            local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
-                (metadata >> W.u16(12)) & W.u16(7), W.f32
-            )
-            delta = W.select(
-                (metadata & W.u16(0x8000)) != W.u16(0),
-                W.f32(-0.125),
-                W.f32(0.125),
-            )
-            result = result + block_scale * local_scale * (
-                W.cast(grid_sum, W.f32)
-                + delta * W.cast(activation_sum, W.f32)
+                grid_table,
+                activation_sum,
+                block_scale,
+                result,
             )
     return result
 

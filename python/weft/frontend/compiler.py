@@ -2597,6 +2597,38 @@ class FrontendCompiler:
             result_types=(operands[6].type,),
         )[0]
 
+    def _intrinsic_packed_u11_grid_delta_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "codes",
+            "metadata",
+            "activation",
+            "grid_table",
+            "activation_sum",
+            "dot_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(
+            self._value_argument(args[name], call) for name in names
+        )
+        self._require_extension_block(operands[0], "codes", 4, u8, call)
+        self._require_extension_scalar(operands[1], "metadata", u16, call)
+        self._require_extension_block(
+            operands[2], "activation", 32, i8, call
+        )
+        self._require_readable_u8_pointer(operands[3], "grid_table", call)
+        self._require_extension_scalar(
+            operands[4], "activation_sum", i32, call
+        )
+        self._require_extension_scalar(operands[5], "dot_scale", f32, call)
+        self._require_extension_scalar(operands[6], "init", f32, call)
+        return self._emit(
+            "weft_ext.packed_u11_grid_delta_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[6].type,),
+        )[0]
+
     def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(
             call,

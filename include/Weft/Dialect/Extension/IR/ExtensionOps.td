@@ -281,6 +281,27 @@ def WeftExtension_PackedU9U7CodebookI8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_PackedU11GridDeltaI8DotOp
+    : WeftExtension_Op<"packed_u11_grid_delta_i8_dot", [Pure]> {
+  let summary = "Packed u11 grid and delta-corrected signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element grid dot from four low code bytes and one
+    metadata word.  Four three-bit metadata fields provide the high bits of the
+    grid indices.  The same metadata word defines one odd integer local scale
+    and a signed one-eighth correction applied to the explicit activation sum.
+    The corrected dot is multiplied by dot_scale and accumulated into init.
+
+    Packed block layout, activation-sum storage, outer traversal, target gather
+    shape, and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$metadata,
+                       AnyType:$activation, AnyType:$grid_table,
+                       AnyType:$activation_sum, AnyType:$dot_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

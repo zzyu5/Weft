@@ -321,8 +321,8 @@ struct TernaryI8Decision {
 };
 
 struct SignedCodebookI8Decision {
-  SignedCodebookI8Realization realization =
-      SignedCodebookI8Realization::RVVVLEN128GatherDot;
+  CodebookGatherI8Realization realization =
+      CodebookGatherI8Realization::RVVVLEN128GatherDot;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
   unsigned entryWidth = 0;
   RVVVectorShape codeShape;
@@ -342,8 +342,8 @@ struct SignedCodebookI8Decision {
 };
 
 struct PackedU9U7CodebookI8Decision {
-  PackedU9U7CodebookI8Realization realization =
-      PackedU9U7CodebookI8Realization::RVVVLEN128GatherDot;
+  CodebookGatherI8Realization realization =
+      CodebookGatherI8Realization::RVVVLEN128GatherDot;
   IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
   RVVVectorShape packedShape;
   RVVVectorShape indexShape;
@@ -357,6 +357,26 @@ struct PackedU9U7CodebookI8Decision {
   mlir::Value scaleByte;
   mlir::Value gridTable;
   mlir::Value signTable;
+  mlir::Value dotScale;
+  mlir::Value init;
+};
+
+struct PackedU11GridDeltaI8Decision {
+  CodebookGatherI8Realization realization =
+      CodebookGatherI8Realization::RVVVLEN128GatherDot;
+  IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  RVVVectorShape codeShape;
+  RVVVectorShape indexShape;
+  RVVVectorShape tableShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+  LocalBlockMemoryFact codes;
+  LocalBlockMemoryFact activation;
+  mlir::Value metadata;
+  mlir::Value gridTable;
+  mlir::Value activationSum;
   mlir::Value dotScale;
   mlir::Value init;
 };
@@ -809,6 +829,9 @@ struct RISCVPhysicalPlan {
   llvm::DenseMap<mlir::Operation *,
                  PlannedPhysicalDecision<PackedU9U7CodebookI8Decision>>
       packedU9U7CodebookI8;
+  llvm::DenseMap<mlir::Operation *,
+                 PlannedPhysicalDecision<PackedU11GridDeltaI8Decision>>
+      packedU11GridDeltaI8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<BlockDecodeDecision>>
       blockDecodes;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<LoadF16LEDecision>>
@@ -1284,6 +1307,19 @@ private:
       physicalPlan.packedU9U7CodebookI8.try_emplace(op.getOperation(),
                                                    std::move(planned));
     });
+    kernel.walk([&](PackedU11GridDeltaI8DotOp op) {
+      if (decisionFailure)
+        return;
+      PlannedPhysicalDecision<PackedU11GridDeltaI8Decision> planned;
+      if (mlir::failed(
+              decidePackedU11GridDeltaI8Dot(op, planned.realization))) {
+        decisionFailure = true;
+        return;
+      }
+      finalizePackedU11GridDeltaI8Plan(op, planned);
+      physicalPlan.packedU11GridDeltaI8.try_emplace(op.getOperation(),
+                                                   std::move(planned));
+    });
     auto prepareQuantI8Dot = [&](auto op,
                                        QuantI8DotSemantic semantic,
                                        llvm::ArrayRef<mlir::Value> blocks,
@@ -1419,6 +1455,8 @@ private:
     for (const auto &entry : physicalPlan.signedCodebookI8)
       selectedLeaves.add(entry.second.realization.leaf);
     for (const auto &entry : physicalPlan.packedU9U7CodebookI8)
+      selectedLeaves.add(entry.second.realization.leaf);
+    for (const auto &entry : physicalPlan.packedU11GridDeltaI8)
       selectedLeaves.add(entry.second.realization.leaf);
   }
 
@@ -3662,6 +3700,8 @@ private:
       return emitSignedCodebookI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedU9U7CodebookI8DotOp>(operation))
       return emitPackedU9U7CodebookI8Dot(op);
+    if (auto op = mlir::dyn_cast<PackedU11GridDeltaI8DotOp>(operation))
+      return emitPackedU11GridDeltaI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI4I8DotOp>(operation))
       return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI5I8DotOp>(operation))
@@ -7982,6 +8022,19 @@ private:
     planned.entity.resources = planned.realization.resources;
   }
 
+  void finalizePackedU11GridDeltaI8Plan(
+      PackedU11GridDeltaI8DotOp op,
+      PlannedPhysicalDecision<PackedU11GridDeltaI8Decision> &planned) const {
+    initializeEntityPlan(planned.entity);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.codes},
+                            planned.realization.codeShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.activation},
+                            planned.realization.activationShape);
+    planned.entity.resources = planned.realization.resources;
+  }
+
   template <typename OpTy>
   void finalizeQuantI8Plan(
       OpTy op, PlannedPhysicalDecision<QuantI8DotDecision> &planned) const {
@@ -8776,8 +8829,10 @@ private:
       return op.emitError(
           "signed codebook/i8 dot requires four or eight code entries");
     unsigned entryWidth = 32 / codes->semanticExtent;
-    std::optional<SelectedSignedCodebookI8Physical> selected =
-        selectSignedCodebookI8Physical({entryWidth}, options.target);
+    std::optional<SelectedCodebookGatherI8Physical> selected =
+        selectCodebookGatherI8Physical(
+            {static_cast<unsigned>(codes->semanticExtent), entryWidth},
+            options.target);
     if (!selected)
       return op.emitError(
           "signed codebook/i8 dot has no legal target realization");
@@ -8795,13 +8850,13 @@ private:
     if (entryWidth == 8)
       decision.leaf =
           selected->realization ==
-                  SignedCodebookI8Realization::RVVVLEN128GatherDot
+                  CodebookGatherI8Realization::RVVVLEN128GatherDot
               ? IntrinsicCLeaf::SignedCodebook8I8VLEN128
               : IntrinsicCLeaf::SignedCodebook8I8VLEN256;
     else
       decision.leaf =
           selected->realization ==
-                  SignedCodebookI8Realization::RVVVLEN128GatherDot
+                  CodebookGatherI8Realization::RVVVLEN128GatherDot
               ? IntrinsicCLeaf::SignedCodebook4I8VLEN128
               : IntrinsicCLeaf::SignedCodebook4I8VLEN256;
     decision.codes = *codes;
@@ -8880,8 +8935,8 @@ private:
         activation->semanticExtent != 32)
       return op.emitError(
           "packed u9/u7 codebook/i8 dot requires eight packed bytes and thirty-two activations");
-    std::optional<SelectedPackedU9U7CodebookI8Physical> selected =
-        selectPackedU9U7CodebookI8Physical(options.target);
+    std::optional<SelectedCodebookGatherI8Physical> selected =
+        selectCodebookGatherI8Physical({8, 8}, options.target);
     if (!selected)
       return op.emitError(
           "packed u9/u7 codebook/i8 dot has no legal target realization");
@@ -8890,10 +8945,10 @@ private:
     decision.realization = selected->realization;
     decision.leaf =
         selected->realization ==
-                PackedU9U7CodebookI8Realization::RVVVLEN128GatherDot
+                CodebookGatherI8Realization::RVVVLEN128GatherDot
             ? IntrinsicCLeaf::PackedU9U7CodebookI8VLEN128
             : IntrinsicCLeaf::PackedU9U7CodebookI8VLEN256;
-    decision.packedShape = selected->packedShape;
+    decision.packedShape = selected->codeShape;
     decision.indexShape = selected->indexShape;
     decision.tableShape = selected->tableShape;
     decision.activationShape = selected->activationShape;
@@ -8960,6 +9015,103 @@ private:
     if (mlir::failed(markRematerializedBlockTrees(
             {decision.packedCodes.semanticValue,
              decision.activation.semanticValue},
+            op.getOperation())))
+      return mlir::failure();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult decidePackedU11GridDeltaI8Dot(
+      PackedU11GridDeltaI8DotOp op,
+      PackedU11GridDeltaI8Decision &decision) {
+    std::optional<LocalBlockMemoryFact> codes =
+        resolveLocalBlockMemoryFact(op.getCodes());
+    std::optional<LocalBlockMemoryFact> activation =
+        resolveLocalBlockMemoryFact(op.getActivation());
+    if (!codes || !activation)
+      return op.emitError(
+          "packed u11 grid-delta/i8 dot requires contiguous all-active local block memory facts");
+    if (codes->semanticExtent != 4 || activation->semanticExtent != 32)
+      return op.emitError(
+          "packed u11 grid-delta/i8 dot requires four code bytes and thirty-two activations");
+    std::optional<SelectedCodebookGatherI8Physical> selected =
+        selectCodebookGatherI8Physical({4, 8}, options.target);
+    if (!selected)
+      return op.emitError(
+          "packed u11 grid-delta/i8 dot has no legal target realization");
+
+    decision = PackedU11GridDeltaI8Decision{};
+    decision.realization = selected->realization;
+    decision.leaf =
+        selected->realization ==
+                CodebookGatherI8Realization::RVVVLEN128GatherDot
+            ? IntrinsicCLeaf::PackedU11GridDeltaI8VLEN128
+            : IntrinsicCLeaf::PackedU11GridDeltaI8VLEN256;
+    decision.codeShape = selected->codeShape;
+    decision.indexShape = selected->indexShape;
+    decision.tableShape = selected->tableShape;
+    decision.activationShape = selected->activationShape;
+    decision.productShape = selected->productShape;
+    decision.reductionShape = selected->reductionShape;
+    decision.resources = selected->resources;
+    decision.codes = *codes;
+    decision.activation = *activation;
+    decision.metadata = op.getMetadata();
+    decision.gridTable = op.getGridTable();
+    decision.activationSum = op.getActivationSum();
+    decision.dotScale = op.getDotScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitPackedU11GridDeltaI8Dot(
+      PackedU11GridDeltaI8DotOp op) {
+    auto prepared = physicalPlan.packedU11GridDeltaI8.find(op.getOperation());
+    if (prepared == physicalPlan.packedU11GridDeltaI8.end())
+      return op.emitError(
+          "packed u11 grid-delta/i8 physical decision was not prepared");
+    if (mlir::failed(requireEntityPlan(op.getOperation(), prepared->second)))
+      return mlir::failure();
+    const PackedU11GridDeltaI8Decision &decision =
+        prepared->second.realization;
+    for (const LocalBlockMemoryFact *block :
+         {&decision.codes, &decision.activation})
+      if (mlir::failed(requirePhysicalHandoff(
+              op.getOperation(), prepared->second.entity,
+              block->semanticValue, PhysicalHandoff::Reload)))
+        return mlir::failure();
+
+    std::optional<std::string> codes =
+        projectLocalBlockMemoryBase(decision.codes);
+    std::optional<std::string> activation =
+        projectLocalBlockMemoryBase(decision.activation);
+    CValue metadata = require(decision.metadata);
+    CValue gridTable = require(decision.gridTable);
+    CValue activationSum = require(decision.activationSum);
+    CValue dotScale = require(decision.dotScale);
+    CValue init = require(decision.init);
+    if (!codes || !activation || metadata.kind != CValueKind::Scalar ||
+        gridTable.kind != CValueKind::Pointer ||
+        activationSum.kind != CValueKind::Scalar ||
+        dotScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
+        metadata.spelling.empty() || gridTable.spelling.empty() ||
+        activationSum.spelling.empty() || dotScale.spelling.empty() ||
+        init.spelling.empty())
+      return op.emitError(
+          "packed u11 grid-delta/i8 operands are not materialized locally");
+
+    llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
+    if (helper.empty())
+      return op.emitError(
+          "packed u11 grid-delta/i8 leaf spelling was not selected");
+    std::string result = fresh("grid_delta_dot");
+    line("const float " + result + " = " + helper.str() + "(" + *codes +
+         ", " + metadata.spelling + ", " + *activation + ", " +
+         gridTable.spelling + ", " + activationSum.spelling + ", " +
+         dotScale.spelling + ", " + init.spelling + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.codes.semanticValue, decision.activation.semanticValue},
             op.getOperation())))
       return mlir::failure();
     return mlir::success();

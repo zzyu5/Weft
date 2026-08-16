@@ -343,6 +343,33 @@ mlir::LogicalResult PackedU9U7CodebookI8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult PackedU11GridDeltaI8DotOp::verify() {
+  if (mlir::failed(verifyByteBlock(*this, getCodes(), 4, false, "codes")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 32, true,
+                                  "activation")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getMetadata(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 16,
+                                     mlir::IntegerType::Unsigned),
+                                 "metadata")))
+    return emitOpError("metadata must be scalar u16");
+  if (mlir::failed(requireReadableU8Pointer(*this, getGridTable(),
+                                           "grid_table")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getActivationSum(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 32,
+                                     mlir::IntegerType::Signed),
+                                 "activation_sum")))
+    return emitOpError("activation_sum must be scalar i32");
+  if (mlir::failed(requireScalar(*this, getDotScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "dot_scale")))
+    return emitOpError("dot_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {
