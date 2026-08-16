@@ -585,6 +585,28 @@ case "${kernel}" in
         ;;
     esac
     ;;
+  mul_mat_iq4_nl|mul_mat_mxfp4|mul_mat_nvfp4)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: ${usage_prefix} ${kernel} <decode|prefill> <repetitions>" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/mul_mat.py
+    dsl_entry=${kernel}
+    runtime=examples/repro/weft/quantization/mul_mat_fp4_runtime.cpp
+    runtime_arguments=("$1" "$2")
+    ggml_reference=1
+    case "${kernel}" in
+      mul_mat_iq4_nl)
+        runtime_compile_flags="-DWEFT_MUL_MAT_FP4_KIND=0 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq4_nl -DWEFT_GGML_DOT=ggml_vec_dot_iq4_nl_q8_0"
+        ;;
+      mul_mat_mxfp4)
+        runtime_compile_flags="-DWEFT_MUL_MAT_FP4_KIND=1 -DWEFT_MUL_MAT_ENTRY=mul_mat_mxfp4 -DWEFT_GGML_DOT=ggml_vec_dot_mxfp4_q8_0"
+        ;;
+      mul_mat_nvfp4)
+        runtime_compile_flags="-DWEFT_MUL_MAT_FP4_KIND=2 -DWEFT_MUL_MAT_ENTRY=mul_mat_nvfp4 -DWEFT_GGML_DOT=ggml_vec_dot_nvfp4_q8_0"
+        ;;
+    esac
+    ;;
   mul_mat_id)
     if [[ $# -ne 0 ]]; then
       echo "usage: ${usage_prefix} mul_mat_id" >&2

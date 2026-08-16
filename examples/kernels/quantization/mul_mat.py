@@ -22,9 +22,11 @@ from examples.kernels.quantization.codebook_k import (
     iq2_xxs_row_dot,
     iq3_S_row_dot,
     iq3_xxs_row_dot,
+    iq4_nl_row_dot,
     iq4_xs_row_dot,
     q6_K_row_dot,
 )
+from examples.kernels.quantization.mxfp4 import mxfp4_row_dot, nvfp4_row_dot
 from examples.kernels.quantization.q1_0 import q1_0_row_dot
 
 
@@ -957,5 +959,115 @@ def mul_mat_iq1_s(
                     activation_row,
                     grid_table,
                     blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq4_nl(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(32)
+    activation_row_bytes = blocks * W.index(34)
+    weight_row_bytes = blocks * W.index(18)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_0_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq4_nl_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    codebook,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_mxfp4(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(32)
+    activation_row_bytes = blocks * W.index(34)
+    weight_row_bytes = blocks * W.index(17)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_0_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                mxfp4_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_nvfp4(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    activation_blocks = inner // W.index(32)
+    superblocks = inner // W.index(64)
+    activation_row_bytes = activation_blocks * W.index(34)
+    weight_row_bytes = superblocks * W.index(36)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_0_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            activation_blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                nvfp4_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    codebook,
+                    superblocks,
                 ),
             )
