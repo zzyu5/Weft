@@ -81,6 +81,7 @@ quant=0
 k_quant_dot=0
 k_quant_kind=0
 ggml_reference=0
+ggml_common=0
 multi=0
 multi_primary=
 multi_equivalent=
@@ -522,7 +523,7 @@ case "${kernel}" in
         ;;
     esac
     ;;
-  mul_mat_q2_K|mul_mat_q3_K|mul_mat_q4_K|mul_mat_q5_K|mul_mat_q6_K|mul_mat_tq1_0|mul_mat_tq2_0)
+  mul_mat_q2_K|mul_mat_q3_K|mul_mat_q4_K|mul_mat_q5_K|mul_mat_q6_K|mul_mat_tq1_0|mul_mat_tq2_0|mul_mat_iq2_s|mul_mat_iq3_s|mul_mat_iq1_m|mul_mat_iq4_xs|mul_mat_iq2_xxs|mul_mat_iq2_xs|mul_mat_iq3_xxs|mul_mat_iq1_s)
     if [[ $# -ne 2 ]]; then
       echo "usage: ${usage_prefix} ${kernel} <decode|prefill> <repetitions>" >&2
       exit 2
@@ -553,6 +554,34 @@ case "${kernel}" in
         ;;
       mul_mat_tq2_0)
         runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=8 -DWEFT_MUL_MAT_ENTRY=mul_mat_tq2_0 -DWEFT_GGML_DOT=ggml_vec_dot_tq2_0_q8_K"
+        ;;
+      mul_mat_iq2_s)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=10 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq2_s -DWEFT_GGML_DOT=ggml_vec_dot_iq2_s_q8_K"
+        ;;
+      mul_mat_iq3_s)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=11 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq3_s -DWEFT_GGML_DOT=ggml_vec_dot_iq3_s_q8_K"
+        ;;
+      mul_mat_iq1_m)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=12 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq1_m -DWEFT_GGML_DOT=ggml_vec_dot_iq1_m_q8_K"
+        ;;
+      mul_mat_iq4_xs)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=13 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq4_xs -DWEFT_GGML_DOT=ggml_vec_dot_iq4_xs_q8_K"
+        ;;
+      mul_mat_iq2_xxs)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=14 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq2_xxs -DWEFT_GGML_DOT=ggml_vec_dot_iq2_xxs_q8_K"
+        ggml_common=1
+        ;;
+      mul_mat_iq2_xs)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=15 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq2_xs -DWEFT_GGML_DOT=ggml_vec_dot_iq2_xs_q8_K"
+        ggml_common=1
+        ;;
+      mul_mat_iq3_xxs)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=16 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq3_xxs -DWEFT_GGML_DOT=ggml_vec_dot_iq3_xxs_q8_K"
+        ggml_common=1
+        ;;
+      mul_mat_iq1_s)
+        runtime_compile_flags="-DWEFT_MUL_MAT_K_KIND=17 -DWEFT_MUL_MAT_ENTRY=mul_mat_iq1_s -DWEFT_GGML_DOT=ggml_vec_dot_iq1_s_q8_K"
+        ggml_common=1
         ;;
     esac
     ;;
@@ -1166,6 +1195,10 @@ else
         -o "${local_root}/kernel.c"
   fi
   cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
+  if [[ ${ggml_common} -eq 1 ]]; then
+    cp "${project_root}/source/c/ggml/llama.cpp/ggml/src/ggml-common.h" \
+      "${local_root}/ggml-common.h"
+  fi
 fi
 
 tar -C "${local_root}" -cf - . |

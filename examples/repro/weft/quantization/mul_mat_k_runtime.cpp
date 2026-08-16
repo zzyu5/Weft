@@ -18,6 +18,12 @@
 #error "WEFT_GGML_DOT is required"
 #endif
 
+#if WEFT_MUL_MAT_K_KIND >= 14 && WEFT_MUL_MAT_K_KIND <= 17
+#define GGML_COMMON_DECL_C
+#define GGML_COMMON_IMPL_C
+#include "ggml-common.h"
+#endif
+
 #define WEFT_STRINGIFY_INNER(value) #value
 #define WEFT_STRINGIFY(value) WEFT_STRINGIFY_INNER(value)
 
@@ -48,12 +54,32 @@ constexpr std::size_t kWeightBlockBytes = 210;
 constexpr std::size_t kWeightBlockBytes = 54;
 #elif WEFT_MUL_MAT_K_KIND == 8
 constexpr std::size_t kWeightBlockBytes = 66;
+#elif WEFT_MUL_MAT_K_KIND == 10
+constexpr std::size_t kWeightBlockBytes = 82;
+#elif WEFT_MUL_MAT_K_KIND == 11
+constexpr std::size_t kWeightBlockBytes = 110;
+#elif WEFT_MUL_MAT_K_KIND == 12
+constexpr std::size_t kWeightBlockBytes = 56;
+#elif WEFT_MUL_MAT_K_KIND == 13
+constexpr std::size_t kWeightBlockBytes = 136;
+#elif WEFT_MUL_MAT_K_KIND == 14
+constexpr std::size_t kWeightBlockBytes = 66;
+#elif WEFT_MUL_MAT_K_KIND == 15
+constexpr std::size_t kWeightBlockBytes = 74;
+#elif WEFT_MUL_MAT_K_KIND == 16
+constexpr std::size_t kWeightBlockBytes = 98;
+#elif WEFT_MUL_MAT_K_KIND == 17
+constexpr std::size_t kWeightBlockBytes = 50;
 #else
 #error "unsupported WEFT_MUL_MAT_K_KIND"
 #endif
 constexpr std::size_t kWeightRowBytes = kBlocks * kWeightBlockBytes;
 constexpr std::size_t kEvictionBytes = 64U * 1024U * 1024U;
 volatile std::uint64_t evictionSink;
+[[maybe_unused]] constexpr std::int8_t kIQ4Codebook[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1,    13,   25,  38,  53,  69,  89,  113,
+};
 
 std::size_t phaseRows(const char *phase) {
   if (std::strcmp(phase, "decode") == 0)
@@ -71,7 +97,7 @@ std::size_t parseRepetitions(const char *text) {
   return static_cast<std::size_t>(value);
 }
 
-void writeHalf(std::uint8_t *bytes, float value) {
+[[maybe_unused]] void writeHalf(std::uint8_t *bytes, float value) {
   const _Float16 half = static_cast<_Float16>(value);
   std::uint16_t bits = 0;
   std::memcpy(&bits, &half, sizeof(bits));
@@ -113,8 +139,17 @@ void initializeWeightRow(std::uint8_t *row) {
     writeHalf(packed + 208, 0.015625F);
 #elif WEFT_MUL_MAT_K_KIND == 7
     writeHalf(packed + 52, 0.015625F);
-#else
+#elif WEFT_MUL_MAT_K_KIND == 8
     writeHalf(packed + 64, 0.015625F);
+#elif WEFT_MUL_MAT_K_KIND == 10 || WEFT_MUL_MAT_K_KIND == 11 || \
+    WEFT_MUL_MAT_K_KIND == 13 || WEFT_MUL_MAT_K_KIND == 14 || \
+    WEFT_MUL_MAT_K_KIND == 15 || WEFT_MUL_MAT_K_KIND == 16 || \
+    WEFT_MUL_MAT_K_KIND == 17
+    writeHalf(packed, 0.015625F);
+#else
+    for (std::size_t byte = 48; byte < 56; ++byte)
+      packed[byte] = 0;
+    packed[55] = 0x3cU;
 #endif
   }
 }
@@ -209,8 +244,38 @@ int main(int argc, char **argv) {
     activation[index] =
         static_cast<float>(static_cast<int>(index % 127) - 63) / 64.0F;
 
+#if WEFT_MUL_MAT_K_KIND == 13
+  WEFT_MUL_MAT_ENTRY(
+      weight.data(), activation.data(),
+      reinterpret_cast<const std::uint8_t *>(kIQ4Codebook), output.data(),
+      workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 14
+  WEFT_MUL_MAT_ENTRY(
+      weight.data(), activation.data(),
+      reinterpret_cast<const std::uint8_t *>(iq2xxs_grid),
+      reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+      workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 15
+  WEFT_MUL_MAT_ENTRY(
+      weight.data(), activation.data(),
+      reinterpret_cast<const std::uint8_t *>(iq2xs_grid),
+      reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+      workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 16
+  WEFT_MUL_MAT_ENTRY(
+      weight.data(), activation.data(),
+      reinterpret_cast<const std::uint8_t *>(iq3xxs_grid),
+      reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+      workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 17
+  WEFT_MUL_MAT_ENTRY(
+      weight.data(), activation.data(),
+      reinterpret_cast<const std::uint8_t *>(iq1s_grid), output.data(),
+      workspace.data(), 0, rows, kN, kK);
+#else
   WEFT_MUL_MAT_ENTRY(weight.data(), activation.data(), output.data(),
                      workspace.data(), 0, rows, kN, kK);
+#endif
   if (!validateWorkspace(activation, workspace, rows)) {
     std::fprintf(stderr, "generated Q8_K workspace differs from DSL semantics\n");
     return 1;
@@ -247,8 +312,38 @@ int main(int argc, char **argv) {
   for (std::size_t repetition = 0; repetition < repeatCount; ++repetition) {
     evict(eviction);
     const auto begin = std::chrono::steady_clock::now();
+#if WEFT_MUL_MAT_K_KIND == 13
+    WEFT_MUL_MAT_ENTRY(
+        weight.data(), activation.data(),
+        reinterpret_cast<const std::uint8_t *>(kIQ4Codebook), output.data(),
+        workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 14
+    WEFT_MUL_MAT_ENTRY(
+        weight.data(), activation.data(),
+        reinterpret_cast<const std::uint8_t *>(iq2xxs_grid),
+        reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+        workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 15
+    WEFT_MUL_MAT_ENTRY(
+        weight.data(), activation.data(),
+        reinterpret_cast<const std::uint8_t *>(iq2xs_grid),
+        reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+        workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 16
+    WEFT_MUL_MAT_ENTRY(
+        weight.data(), activation.data(),
+        reinterpret_cast<const std::uint8_t *>(iq3xxs_grid),
+        reinterpret_cast<const std::uint8_t *>(ksigns_iq2xs), output.data(),
+        workspace.data(), 0, rows, kN, kK);
+#elif WEFT_MUL_MAT_K_KIND == 17
+    WEFT_MUL_MAT_ENTRY(
+        weight.data(), activation.data(),
+        reinterpret_cast<const std::uint8_t *>(iq1s_grid), output.data(),
+        workspace.data(), 0, rows, kN, kK);
+#else
     WEFT_MUL_MAT_ENTRY(weight.data(), activation.data(), output.data(),
                        workspace.data(), 0, rows, kN, kK);
+#endif
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::micro>(end - begin).count());

@@ -14,7 +14,17 @@ from examples.kernels.quantization.block_dot import (
     tq1_0_row_dot,
     tq2_0_row_dot,
 )
-from examples.kernels.quantization.codebook_k import q6_K_row_dot
+from examples.kernels.quantization.codebook_k import (
+    iq1_M_row_dot,
+    iq1_s_row_dot,
+    iq2_S_row_dot,
+    iq2_xs_row_dot,
+    iq2_xxs_row_dot,
+    iq3_S_row_dot,
+    iq3_xxs_row_dot,
+    iq4_xs_row_dot,
+    q6_K_row_dot,
+)
 from examples.kernels.quantization.q1_0 import q1_0_row_dot
 
 
@@ -650,6 +660,302 @@ def mul_mat_tq2_0(
                 tq2_0_row_dot(
                     weight + column * weight_row_bytes,
                     activation_row,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq2_s(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(82)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq2_S_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq3_s(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(110)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq3_S_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq1_m(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(56)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq1_M_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq4_xs(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(136)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq4_xs_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    codebook,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq2_xxs(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(66)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq2_xxs_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    grid_table,
+                    sign_table,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq2_xs(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(74)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq2_xs_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    grid_table,
+                    sign_table,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq3_xxs(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(98)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq3_xxs_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    grid_table,
+                    sign_table,
+                    blocks,
+                ),
+            )
+
+
+@weft.kernel
+def mul_mat_iq1_s(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.f32, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    activation_q8: W.ptr[W.u8, W.workspace, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    columns: W.index,
+    inner: W.index,
+) -> None:
+    blocks = inner // W.index(256)
+    activation_row_bytes = blocks * W.index(292)
+    weight_row_bytes = blocks * W.index(50)
+    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    for row in W.range(row_begin, row_end):
+        quantize_q8_K_row(
+            activation + row * inner,
+            activation_q8 + row * activation_row_bytes,
+            blocks,
+        )
+    for row in W.range(row_begin, row_end):
+        activation_row = activation_q8 + row * activation_row_bytes
+        output_row = output + row * columns
+        for column in W.range(0, columns):
+            W.store(
+                output_row + column,
+                iq1_s_row_dot(
+                    weight + column * weight_row_bytes,
+                    activation_row,
+                    grid_table,
                     blocks,
                 ),
             )

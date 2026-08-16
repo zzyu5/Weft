@@ -17,12 +17,8 @@ def load_i16_le(pointer):
     return W.cast(W.bitcast(low | (high << W.u16(8)), W.i16), W.i32)
 
 
-@weft.kernel
-def iq2_S_q8_K(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
-    activation: W.ptr[W.u8, W.readonly, W.noalias],
-    blocks: W.index,
-) -> W.f32:
+@W.helper(effects=("read",))
+def iq2_S_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(82)
@@ -46,11 +42,16 @@ def iq2_S_q8_K(
 
 
 @weft.kernel
-def iq3_S_q8_K(
+def iq2_S_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return iq2_S_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def iq3_S_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(110)
@@ -74,11 +75,16 @@ def iq3_S_q8_K(
 
 
 @weft.kernel
-def iq1_M_q8_K(
+def iq3_S_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return iq3_S_row_dot(weight, activation, blocks)
+
+
+@W.helper(effects=("read",))
+def iq1_M_row_dot(weight, activation, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(56)
@@ -96,6 +102,15 @@ def iq1_M_q8_K(
             result,
         )
     return result
+
+
+@weft.kernel
+def iq1_M_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    return iq1_M_row_dot(weight, activation, blocks)
 
 
 @W.helper(effects=("read",))
@@ -129,6 +144,42 @@ def q6_K_q8_K(
     return q6_K_row_dot(weight, activation, blocks)
 
 
+@W.helper(effects=("read",))
+def iq4_nl_row_dot(weight, activation, codebook, blocks):
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+        x = weight + block * W.index(18)
+        y = activation + block * W.index(34)
+        member = W.block(16)
+        packed_codes = W.load(x + W.index(2) + member, other=W.u8(0))
+        table = W.bitcast(W.load(codebook + member, other=W.u8(0)), W.i8)
+        low = W.decode(packed_codes & W.u8(15), table, out_dtype=W.i8)
+        high = W.decode(packed_codes >> W.u8(4), table, out_dtype=W.i8)
+        activation_low = W.bitcast(
+            W.load(y + W.index(2) + member, other=W.u8(0)), W.i8
+        )
+        activation_high = W.bitcast(
+            W.load(y + W.index(18) + member, other=W.u8(0)), W.i8
+        )
+        low_sum = W.reduce(
+            W.cast(low, W.i32) * W.cast(activation_low, W.i32),
+            identity=W.i32(0),
+            axis=0,
+            acc_dtype=W.i32,
+            order="relaxed",
+        )
+        high_sum = W.reduce(
+            W.cast(high, W.i32) * W.cast(activation_high, W.i32),
+            identity=W.i32(0),
+            axis=0,
+            acc_dtype=W.i32,
+            order="relaxed",
+        )
+        scale = W.load_f16_le(x) * W.load_f16_le(y)
+        result = result + scale * W.cast(low_sum + high_sum, W.f32)
+    return result
+
+
 @weft.kernel
 def iq4_nl_q8_0(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
@@ -142,58 +193,22 @@ def iq4_nl_q8_0(
     blocks = elements / W.index(32)
     weight_row_stride = blocks * W.index(18)
     for row in W.range(row_begin, row_end):
-        result = W.f32(0.0)
-        for block in W.range(0, blocks):
-            x = weight + row * weight_row_stride + block * W.index(18)
-            y = activation + block * W.index(34)
-            member = W.block(16)
-            packed_codes = W.load(x + W.index(2) + member, other=W.u8(0))
-            table = W.bitcast(
-                W.load(codebook + member, other=W.u8(0)), W.i8
-            )
-            low = W.decode(packed_codes & W.u8(15), table, out_dtype=W.i8)
-            high = W.decode(packed_codes >> W.u8(4), table, out_dtype=W.i8)
-            activation_low = W.bitcast(
-                W.load(y + W.index(2) + member, other=W.u8(0)), W.i8
-            )
-            activation_high = W.bitcast(
-                W.load(y + W.index(18) + member, other=W.u8(0)), W.i8
-            )
-            low_sum = W.reduce(
-                W.cast(low, W.i32) * W.cast(activation_low, W.i32),
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            high_sum = W.reduce(
-                W.cast(high, W.i32) * W.cast(activation_high, W.i32),
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            scale = W.load_f16_le(x) * W.load_f16_le(y)
-            result = result + scale * W.cast(low_sum + high_sum, W.f32)
-        W.store(output + row, result)
+        W.store(
+            output + row,
+            iq4_nl_row_dot(
+                weight + row * weight_row_stride,
+                activation,
+                codebook,
+                blocks,
+            ),
+        )
 
 
-@weft.kernel
-def iq4_xs_q8_K(
-    weight: W.ptr[W.u8, W.readonly, W.noalias],
-    activation: W.ptr[W.u8, W.readonly, W.noalias],
-    codebook: W.ptr[W.u8, W.readonly, W.noalias],
-    output: W.ptr[W.f32, W.writeonly, W.noalias],
-    row_begin: W.index,
-    row_end: W.index,
-    elements: W.index,
-) -> None:
-    blocks = elements / W.index(256)
-    weight_row_stride = blocks * W.index(136)
-    for row in W.range(row_begin, row_end):
-        result = W.f32(0.0)
-        for block in W.range(0, blocks):
-            x = weight + row * weight_row_stride + block * W.index(136)
+@W.helper(effects=("read",))
+def iq4_xs_row_dot(weight, activation, codebook, blocks):
+    result = W.f32(0.0)
+    for block in W.range(0, blocks):
+            x = weight + block * W.index(136)
             y = activation + block * W.index(292)
             block_scale = W.load_f16_le(x)
             activation_scale = load_f32_le(y)
@@ -264,17 +279,35 @@ def iq4_xs_q8_K(
                     * local_scale
                     * W.cast(low_sum + high_sum, W.f32)
                 )
-        W.store(output + row, result)
+    return result
 
 
 @weft.kernel
-def iq2_xxs_q8_K(
+def iq4_xs_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
-    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
-    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
-    blocks: W.index,
-) -> W.f32:
+    codebook: W.ptr[W.u8, W.readonly, W.noalias],
+    output: W.ptr[W.f32, W.writeonly, W.noalias],
+    row_begin: W.index,
+    row_end: W.index,
+    elements: W.index,
+) -> None:
+    blocks = elements / W.index(256)
+    weight_row_stride = blocks * W.index(136)
+    for row in W.range(row_begin, row_end):
+        W.store(
+            output + row,
+            iq4_xs_row_dot(
+                weight + row * weight_row_stride,
+                activation,
+                codebook,
+                blocks,
+            ),
+        )
+
+
+@W.helper(effects=("read",))
+def iq2_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(66)
@@ -337,13 +370,18 @@ def iq2_xxs_q8_K(
 
 
 @weft.kernel
-def iq2_xs_q8_K(
+def iq2_xxs_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     grid_table: W.ptr[W.u8, W.readonly, W.noalias],
     sign_table: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return iq2_xxs_row_dot(weight, activation, grid_table, sign_table, blocks)
+
+
+@W.helper(effects=("read",))
+def iq2_xs_row_dot(weight, activation, grid_table, sign_table, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(74)
@@ -405,13 +443,18 @@ def iq2_xs_q8_K(
 
 
 @weft.kernel
-def iq3_xxs_q8_K(
+def iq2_xs_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     grid_table: W.ptr[W.u8, W.readonly, W.noalias],
     sign_table: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return iq2_xs_row_dot(weight, activation, grid_table, sign_table, blocks)
+
+
+@W.helper(effects=("read",))
+def iq3_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(98)
@@ -478,12 +521,18 @@ def iq3_xxs_q8_K(
 
 
 @weft.kernel
-def iq1_s_q8_K(
+def iq3_xxs_q8_K(
     weight: W.ptr[W.u8, W.readonly, W.noalias],
     activation: W.ptr[W.u8, W.readonly, W.noalias],
     grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    sign_table: W.ptr[W.u8, W.readonly, W.noalias],
     blocks: W.index,
 ) -> W.f32:
+    return iq3_xxs_row_dot(weight, activation, grid_table, sign_table, blocks)
+
+
+@W.helper(effects=("read",))
+def iq1_s_row_dot(weight, activation, grid_table, blocks):
     result = W.f32(0.0)
     for block in W.range(0, blocks):
         x = weight + block * W.index(50)
@@ -565,3 +614,13 @@ def iq1_s_q8_K(
                 + delta * W.cast(activation_sum, W.f32)
             )
     return result
+
+
+@weft.kernel
+def iq1_s_q8_K(
+    weight: W.ptr[W.u8, W.readonly, W.noalias],
+    activation: W.ptr[W.u8, W.readonly, W.noalias],
+    grid_table: W.ptr[W.u8, W.readonly, W.noalias],
+    blocks: W.index,
+) -> W.f32:
+    return iq1_s_row_dot(weight, activation, grid_table, blocks)
