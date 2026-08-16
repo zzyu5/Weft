@@ -168,6 +168,13 @@ VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 r
 
 ## Codebook / grouped integer local dot
 
+`W.signed_codebook_i8_dot`计算一个32-element signed codebook dot。`codes`是unmasked
+`block<4,u8>`或`block<8,u8>`，分别选择四个8-element entry或八个4-element entry；scalar
+`u32 sign_metadata`的四个7-bit field选择caller-provided sign table中的mask。Grid table、sign
+table、`block<32,i8>` activation、`dot_scale`与`init`都是显式operand。Packed block layout、
+local-scale extraction和outer traversal仍由DSL kernel拥有；target只选择当前局部gather、
+sign、widening dot与reduction的VLEN128/VLEN256 realization。
+
 `W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
 code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
 operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer

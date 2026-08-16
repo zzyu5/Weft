@@ -236,6 +236,29 @@ def WeftExtension_PackedI2TernaryI8DotOp
   let hasVerifier = 1;
 }
 
+def WeftExtension_SignedCodebookI8DotOp
+    : WeftExtension_Op<"signed_codebook_i8_dot", [Pure]> {
+  let summary = "Signed codebook entry by signed-i8 local dot";
+  let description = [{
+    Computes one thirty-two-element codebook by signed-i8 dot.  Four code bytes
+    select four eight-element entries, or eight code bytes select eight
+    four-element entries.  sign_metadata contains four seven-bit indices into a
+    caller-provided table of sign masks.  The selected grid values receive those
+    signs, are dotted with activation, multiplied by dot_scale, and accumulated
+    into init.
+
+    The two tables, code bytes, metadata, activation, scale, and init are explicit
+    operands.  Packed block layout, local-scale extraction, outer traversal,
+    target gather shape, and instruction spelling remain outside this operation.
+  }];
+  let arguments = (ins AnyType:$codes, AnyType:$sign_metadata,
+                       AnyType:$activation, AnyType:$grid_table,
+                       AnyType:$sign_table, AnyType:$dot_scale,
+                       AnyType:$init);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftExtension_IQ2SI8DotOp
     : WeftExtension_Op<"iq2_s_i8_dot", [Pure]> {
   let summary = "IQ2_S codebook by signed-i8 local dot";

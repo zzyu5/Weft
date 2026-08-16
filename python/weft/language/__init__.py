@@ -54,6 +54,7 @@ from .builtins import rsqrt
 from .builtins import sqrt
 from .builtins import scan
 from .builtins import select
+from .builtins import signed_codebook_i8_dot
 from .builtins import sign_bit_i8_dot
 from .builtins import sin
 from .builtins import sort_indices

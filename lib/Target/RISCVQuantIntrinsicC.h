@@ -23,6 +23,9 @@ void emitTernaryIntrinsicCLeaves(llvm::raw_ostream &output,
                                  bool base3VLEN128, bool base3VLEN256,
                                  bool packedI2VLEN128,
                                  bool packedI2VLEN256);
+void emitSignedCodebookIntrinsicCLeaves(
+    llvm::raw_ostream &output, bool entry8VLEN128, bool entry8VLEN256,
+    bool entry4VLEN128, bool entry4VLEN256);
 
 } // namespace weft::riscv_internal
 

@@ -234,6 +234,7 @@ widening multiply和i32 reduction，metadata只解包当前八组scale/minimum�
 满足shape/resource条件的其他target使用scalable leaf。选择在physical planning中完成，
 intrinsic C生成不再读取VLEN二次分派。
 
-这些模式与IQ2/IQ3/IQ1/Q6 codebook dot共享vector shape、widening、reduction和resource
-machinery，但每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的
-whole-kernel route。
+这些模式与IQ2/IQ3/IQ1/Q6 codebook dot共享vector shape、indexed gather、widening、reduction
+和resource machinery。IQ2_XXS与IQ3_XXS把各自packed layout和scale extraction留在DSL kernel，
+并通过同一个`W.signed_codebook_i8_dot`表达32-element signed-table lookup与integer dot。每个
+extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel route。

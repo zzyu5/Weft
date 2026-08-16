@@ -290,6 +290,35 @@ mlir::LogicalResult PackedI2TernaryI8DotOp::verify() {
   return verifyScalarDotResult(*this, getInit(), getResult());
 }
 
+mlir::LogicalResult SignedCodebookI8DotOp::verify() {
+  auto codes = localBlock(*this, getCodes(), "codes");
+  if (!codes ||
+      (codes.getShape() != llvm::ArrayRef<int64_t>({4}) &&
+       codes.getShape() != llvm::ArrayRef<int64_t>({8})) ||
+      !codes.getElementType().isUnsignedInteger(8))
+    return emitOpError("codes must be a u8 block<4> or block<8>");
+  if (mlir::failed(requireUnmaskedLocalValue(*this, getCodes(), "codes")) ||
+      mlir::failed(verifyByteBlock(*this, getActivation(), 32, true,
+                                  "activation")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getSignMetadata(),
+                                 mlir::IntegerType::get(
+                                     getContext(), 32,
+                                     mlir::IntegerType::Unsigned),
+                                 "sign_metadata")))
+    return emitOpError("sign_metadata must be scalar u32");
+  if (mlir::failed(requireReadableU8Pointer(*this, getGridTable(),
+                                           "grid_table")) ||
+      mlir::failed(requireReadableU8Pointer(*this, getSignTable(),
+                                           "sign_table")))
+    return mlir::failure();
+  if (mlir::failed(requireScalar(*this, getDotScale(),
+                                 mlir::Float32Type::get(getContext()),
+                                 "dot_scale")))
+    return emitOpError("dot_scale must be scalar f32");
+  return verifyScalarDotResult(*this, getInit(), getResult());
+}
+
 mlir::LogicalResult verifyByteBlock(mlir::Operation *op, mlir::Value value,
                                     int64_t extent, bool signedElement,
                                     llvm::StringRef name) {

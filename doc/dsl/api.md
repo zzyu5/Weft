@@ -190,6 +190,11 @@ W.packed_i2_ternary_i8_dot(
     weight_scale, activation_scale, init,
 )
 
+W.signed_codebook_i8_dot(
+    codes, sign_metadata, activation,
+    grid_table, sign_table, dot_scale, init,
+)
+
 W.iq2_s_i8_dot(...)
 W.iq3_s_i8_dot(...)
 W.iq1_m_i8_dot(...)

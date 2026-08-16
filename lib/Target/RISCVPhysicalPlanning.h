@@ -47,6 +47,7 @@ struct PhysicalResourceBudget {
   unsigned architecturalGroups = 0;
   unsigned valueGroups = 0;
   unsigned memoryGroups = 0;
+  unsigned indexGroups = 0;
   unsigned predicateGroups = 0;
   unsigned stateGroups = 0;
   unsigned primitiveGroups = 0;
@@ -131,6 +132,32 @@ struct SelectedTernaryI8DotPhysical {
 std::optional<SelectedTernaryI8DotPhysical>
 selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target);
+
+enum class SignedCodebookI8Realization {
+  RVVVLEN128GatherDot,
+  RVVVLEN256GatherDot,
+};
+
+struct SignedCodebookI8CandidateFacts {
+  unsigned entryWidth = 0;
+};
+
+struct SelectedSignedCodebookI8Physical {
+  SignedCodebookI8Realization realization =
+      SignedCodebookI8Realization::RVVVLEN128GatherDot;
+  unsigned entryWidth = 0;
+  RVVVectorShape codeShape;
+  RVVVectorShape indexShape;
+  RVVVectorShape tableShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+};
+
+std::optional<SelectedSignedCodebookI8Physical>
+selectSignedCodebookI8Physical(const SignedCodebookI8CandidateFacts &facts,
+                               const RISCVTargetProfile &target);
 
 enum class QuantI8DotSemantic {
   PackedI4,

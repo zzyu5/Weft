@@ -250,6 +250,68 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   return selected;
 }
 
+std::optional<SelectedSignedCodebookI8Physical>
+selectSignedCodebookI8Physical(const SignedCodebookI8CandidateFacts &facts,
+                               const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasIndexedMemory ||
+      !target.hasWideningInteger || !target.littleEndian ||
+      (target.vlenBits != 128 && target.vlenBits != 256) ||
+      (facts.entryWidth != 4 && facts.entryWidth != 8))
+    return std::nullopt;
+
+  unsigned codeCount = 32 / facts.entryWidth;
+  unsigned tableSEW = facts.entryWidth * 8;
+  std::optional<RVVVectorShape> codeShape =
+      rvvShapeForSemanticLanes(8, codeCount, target);
+  std::optional<RVVVectorShape> indexShape =
+      rvvShapeForSemanticLanes(16, codeCount, target);
+  std::optional<RVVVectorShape> tableShape =
+      rvvShapeForSemanticLanes(tableSEW, codeCount, target);
+  std::optional<RVVVectorShape> activationShape =
+      rvvShapeForSemanticLanes(8, 32, target);
+  std::optional<RVVVectorShape> productShape =
+      activationShape
+          ? rvvShapeForSameLanes(*activationShape, 16, target)
+          : std::nullopt;
+  if (!codeShape || !indexShape || !tableShape || !activationShape ||
+      !productShape ||
+      !target.supportsVectorShape(kRVVE32M1.sew,
+                                  kRVVE32M1.lmulEighths) ||
+      !target.supportsIndexedVectorMemory(
+          tableShape->sew, tableShape->lmulEighths, indexShape->sew,
+          indexShape->lmulEighths))
+    return std::nullopt;
+
+  SelectedSignedCodebookI8Physical selected;
+  selected.realization =
+      target.vlenBits == 128
+          ? SignedCodebookI8Realization::RVVVLEN128GatherDot
+          : SignedCodebookI8Realization::RVVVLEN256GatherDot;
+  selected.entryWidth = facts.entryWidth;
+  selected.codeShape = *codeShape;
+  selected.indexShape = *indexShape;
+  selected.tableShape = *tableShape;
+  selected.activationShape = *activationShape;
+  selected.productShape = *productShape;
+  selected.reductionShape = kRVVE32M1;
+  selected.resources.architecturalGroups = target.vectorRegisters;
+  selected.resources.valueGroups =
+      rvvRegisterGroups(*tableShape) + rvvRegisterGroups(*activationShape);
+  selected.resources.memoryGroups =
+      rvvRegisterGroups(*codeShape) + rvvRegisterGroups(*activationShape);
+  selected.resources.indexGroups = rvvRegisterGroups(*indexShape);
+  selected.resources.predicateGroups = 1;
+  selected.resources.primitiveGroups =
+      rvvRegisterGroups(*indexShape) + 2 * rvvRegisterGroups(*tableShape) +
+      2 * rvvRegisterGroups(*activationShape) +
+      rvvRegisterGroups(*productShape) + 2;
+  selected.resources.peakGroups = selected.resources.primitiveGroups;
+  if (selected.resources.peakGroups >=
+      static_cast<unsigned>(target.vectorRegisters))
+    return std::nullopt;
+  return selected;
+}
+
 std::optional<SelectedQuantI8DotPhysical>
 selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {

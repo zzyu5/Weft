@@ -39,7 +39,8 @@ bool weft::RISCVTargetProfile::supportsVectorShape(unsigned sew,
 bool weft::RISCVTargetProfile::supportsIndexedVectorMemory(
     unsigned elementSEW, int elementLMULEighths, unsigned indexSEW,
     int indexLMULEighths) const {
-  if (!hasIndexedMemory || (indexSEW != 32 && indexSEW != 64) ||
+  if (!hasIndexedMemory ||
+      (indexSEW != 16 && indexSEW != 32 && indexSEW != 64) ||
       !supportsVectorShape(elementSEW, elementLMULEighths) ||
       !supportsVectorShape(indexSEW, indexLMULEighths))
     return false;

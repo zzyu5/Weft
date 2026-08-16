@@ -2157,6 +2157,20 @@ class FrontendCompiler:
                 f"{name} must be scalar {dtype}", self._location(call)
             )
 
+    def _require_readable_u8_pointer(
+        self, value: Value, name: str, call: ast.Call
+    ) -> None:
+        pointer = value.type if isinstance(value.type, PointerType) else None
+        if (
+            pointer is None
+            or pointer.element_type != ScalarType(u8)
+            or pointer.access == "write"
+        ):
+            raise FrontendError(
+                f"{name} must be a readable scalar u8 pointer",
+                self._location(call),
+            )
+
     def _require_persistent_u8_pointer(
         self, value: Value, name: str, storage_format: str, call: ast.Call
     ) -> None:
@@ -2508,6 +2522,48 @@ class FrontendCompiler:
                 ("init", f32),
             ),
         )
+
+    def _intrinsic_signed_codebook_i8_dot(self, call: ast.Call) -> Value:
+        names = (
+            "codes",
+            "sign_metadata",
+            "activation",
+            "grid_table",
+            "sign_table",
+            "dot_scale",
+            "init",
+        )
+        args = self._positional_and_keywords(call, names, {})
+        operands = tuple(
+            self._value_argument(args[name], call) for name in names
+        )
+        code_type = bare_type(operands[0].type)
+        if (
+            is_masked(operands[0].type)
+            or not isinstance(code_type, BlockType)
+            or code_type.shape not in ((4,), (8,))
+            or code_type.element_type != ScalarType(u8)
+        ):
+            raise FrontendError(
+                "codes must be an unmasked W.u8 block<4> or block<8>",
+                self._location(call),
+            )
+        self._require_extension_scalar(
+            operands[1], "sign_metadata", u32, call
+        )
+        self._require_extension_block(
+            operands[2], "activation", 32, i8, call
+        )
+        self._require_readable_u8_pointer(operands[3], "grid_table", call)
+        self._require_readable_u8_pointer(operands[4], "sign_table", call)
+        self._require_extension_scalar(operands[5], "dot_scale", f32, call)
+        self._require_extension_scalar(operands[6], "init", f32, call)
+        return self._emit(
+            "weft_ext.signed_codebook_i8_dot",
+            call,
+            operands=operands,
+            result_types=(operands[6].type,),
+        )[0]
 
     def _intrinsic_packed_i2_ternary_i8_dot(self, call: ast.Call) -> Value:
         return self._extension_scalar_dot(

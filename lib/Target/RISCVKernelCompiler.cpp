@@ -320,6 +320,27 @@ struct TernaryI8Decision {
   PhysicalResourceBudget resources;
 };
 
+struct SignedCodebookI8Decision {
+  SignedCodebookI8Realization realization =
+      SignedCodebookI8Realization::RVVVLEN128GatherDot;
+  IntrinsicCLeaf leaf = IntrinsicCLeaf::None;
+  unsigned entryWidth = 0;
+  RVVVectorShape codeShape;
+  RVVVectorShape indexShape;
+  RVVVectorShape tableShape;
+  RVVVectorShape activationShape;
+  RVVVectorShape productShape;
+  RVVVectorShape reductionShape;
+  PhysicalResourceBudget resources;
+  LocalBlockMemoryFact codes;
+  LocalBlockMemoryFact activation;
+  mlir::Value signMetadata;
+  mlir::Value gridTable;
+  mlir::Value signTable;
+  mlir::Value dotScale;
+  mlir::Value init;
+};
+
 enum class SortIndicesRealization {
   StableF32Radix,
 };
@@ -762,6 +783,9 @@ struct RISCVPhysicalPlan {
       quantI8Dots;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<TernaryI8Decision>>
       ternaryI8;
+  llvm::DenseMap<mlir::Operation *,
+                 PlannedPhysicalDecision<SignedCodebookI8Decision>>
+      signedCodebookI8;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<BlockDecodeDecision>>
       blockDecodes;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<LoadF16LEDecision>>
@@ -1211,6 +1235,19 @@ private:
           {op.getCodes(), op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
+    kernel.walk([&](SignedCodebookI8DotOp op) {
+      if (decisionFailure)
+        return;
+      PlannedPhysicalDecision<SignedCodebookI8Decision> planned;
+      if (mlir::failed(
+              decideSignedCodebookI8Dot(op, planned.realization))) {
+        decisionFailure = true;
+        return;
+      }
+      finalizeSignedCodebookI8Plan(op, planned);
+      physicalPlan.signedCodebookI8.try_emplace(op.getOperation(),
+                                                std::move(planned));
+    });
     auto prepareQuantI8Dot = [&](auto op,
                                        QuantI8DotSemantic semantic,
                                        llvm::ArrayRef<mlir::Value> blocks,
@@ -1342,6 +1379,8 @@ private:
     for (const auto &entry : physicalPlan.quantI8Dots)
       selectedLeaves.add(entry.second.realization.leaf);
     for (const auto &entry : physicalPlan.ternaryI8)
+      selectedLeaves.add(entry.second.realization.leaf);
+    for (const auto &entry : physicalPlan.signedCodebookI8)
       selectedLeaves.add(entry.second.realization.leaf);
   }
 
@@ -3581,6 +3620,8 @@ private:
       return emitTernaryI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI2TernaryI8DotOp>(operation))
       return emitTernaryI8Dot(op);
+    if (auto op = mlir::dyn_cast<SignedCodebookI8DotOp>(operation))
+      return emitSignedCodebookI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI4I8DotOp>(operation))
       return emitQuantI8Dot(op);
     if (auto op = mlir::dyn_cast<PackedI5I8DotOp>(operation))
@@ -7875,6 +7916,19 @@ private:
     planned.entity.resources = decision.resources;
   }
 
+  void finalizeSignedCodebookI8Plan(
+      SignedCodebookI8DotOp op,
+      PlannedPhysicalDecision<SignedCodebookI8Decision> &planned) const {
+    initializeEntityPlan(planned.entity);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.codes},
+                            planned.realization.codeShape);
+    recordLocalBlockReloads(planned, op.getOperation(),
+                            {planned.realization.activation},
+                            planned.realization.activationShape);
+    planned.entity.resources = planned.realization.resources;
+  }
+
   template <typename OpTy>
   void finalizeQuantI8Plan(
       OpTy op, PlannedPhysicalDecision<QuantI8DotDecision> &planned) const {
@@ -8652,6 +8706,109 @@ private:
       blockValues.push_back(block.semanticValue);
     if (mlir::failed(
             markRematerializedBlockTrees(blockValues, op.getOperation())))
+      return mlir::failure();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult decideSignedCodebookI8Dot(
+      SignedCodebookI8DotOp op, SignedCodebookI8Decision &decision) {
+    std::optional<LocalBlockMemoryFact> codes =
+        resolveLocalBlockMemoryFact(op.getCodes());
+    std::optional<LocalBlockMemoryFact> activation =
+        resolveLocalBlockMemoryFact(op.getActivation());
+    if (!codes || !activation)
+      return op.emitError(
+          "signed codebook/i8 dot requires contiguous all-active local block memory facts");
+    if (codes->semanticExtent != 4 && codes->semanticExtent != 8)
+      return op.emitError(
+          "signed codebook/i8 dot requires four or eight code entries");
+    unsigned entryWidth = 32 / codes->semanticExtent;
+    std::optional<SelectedSignedCodebookI8Physical> selected =
+        selectSignedCodebookI8Physical({entryWidth}, options.target);
+    if (!selected)
+      return op.emitError(
+          "signed codebook/i8 dot has no legal target realization");
+
+    decision = SignedCodebookI8Decision{};
+    decision.realization = selected->realization;
+    decision.entryWidth = selected->entryWidth;
+    decision.codeShape = selected->codeShape;
+    decision.indexShape = selected->indexShape;
+    decision.tableShape = selected->tableShape;
+    decision.activationShape = selected->activationShape;
+    decision.productShape = selected->productShape;
+    decision.reductionShape = selected->reductionShape;
+    decision.resources = selected->resources;
+    if (entryWidth == 8)
+      decision.leaf =
+          selected->realization ==
+                  SignedCodebookI8Realization::RVVVLEN128GatherDot
+              ? IntrinsicCLeaf::SignedCodebook8I8VLEN128
+              : IntrinsicCLeaf::SignedCodebook8I8VLEN256;
+    else
+      decision.leaf =
+          selected->realization ==
+                  SignedCodebookI8Realization::RVVVLEN128GatherDot
+              ? IntrinsicCLeaf::SignedCodebook4I8VLEN128
+              : IntrinsicCLeaf::SignedCodebook4I8VLEN256;
+    decision.codes = *codes;
+    decision.activation = *activation;
+    decision.signMetadata = op.getSignMetadata();
+    decision.gridTable = op.getGridTable();
+    decision.signTable = op.getSignTable();
+    decision.dotScale = op.getDotScale();
+    decision.init = op.getInit();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emitSignedCodebookI8Dot(SignedCodebookI8DotOp op) {
+    auto prepared = physicalPlan.signedCodebookI8.find(op.getOperation());
+    if (prepared == physicalPlan.signedCodebookI8.end())
+      return op.emitError(
+          "signed codebook/i8 physical decision was not prepared");
+    if (mlir::failed(requireEntityPlan(op.getOperation(), prepared->second)))
+      return mlir::failure();
+    const SignedCodebookI8Decision &decision = prepared->second.realization;
+    for (const LocalBlockMemoryFact *block :
+         {&decision.codes, &decision.activation})
+      if (mlir::failed(requirePhysicalHandoff(
+              op.getOperation(), prepared->second.entity,
+              block->semanticValue, PhysicalHandoff::Reload)))
+        return mlir::failure();
+
+    std::optional<std::string> codes =
+        projectLocalBlockMemoryBase(decision.codes);
+    std::optional<std::string> activation =
+        projectLocalBlockMemoryBase(decision.activation);
+    CValue metadata = require(decision.signMetadata);
+    CValue gridTable = require(decision.gridTable);
+    CValue signTable = require(decision.signTable);
+    CValue dotScale = require(decision.dotScale);
+    CValue init = require(decision.init);
+    if (!codes || !activation || metadata.kind != CValueKind::Scalar ||
+        gridTable.kind != CValueKind::Pointer ||
+        signTable.kind != CValueKind::Pointer ||
+        dotScale.kind != CValueKind::Scalar || init.kind != CValueKind::Scalar ||
+        metadata.spelling.empty() || gridTable.spelling.empty() ||
+        signTable.spelling.empty() || dotScale.spelling.empty() ||
+        init.spelling.empty())
+      return op.emitError(
+          "signed codebook/i8 operands are not materialized locally");
+
+    llvm::StringRef helper = intrinsicCLeafName(decision.leaf);
+    if (helper.empty())
+      return op.emitError(
+          "signed codebook/i8 leaf spelling was not selected");
+    std::string result = fresh("codebook_dot");
+    line("const float " + result + " = " + helper.str() + "(" + *codes +
+         ", " + metadata.spelling + ", " + *activation + ", " +
+         gridTable.spelling + ", " + signTable.spelling + ", " +
+         dotScale.spelling + ", " + init.spelling + ");");
+    values[op.getResult()] =
+        CValue{op.getResult().getType(), CValueKind::Scalar, result};
+    if (mlir::failed(markRematerializedBlockTrees(
+            {decision.codes.semanticValue, decision.activation.semanticValue},
+            op.getOperation())))
       return mlir::failure();
     return mlir::success();
   }

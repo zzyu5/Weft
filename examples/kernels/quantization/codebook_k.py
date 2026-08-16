@@ -314,38 +314,50 @@ def iq2_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
         y = activation + block * W.index(292)
         block_scale = W.load_f16_le(x) * load_f32_le(y) * W.f32(0.125)
         for group in W.range(0, 8):
-            metadata = W.cast(W.load(x + W.index(6) + group * W.index(8), other=W.u8(0)), W.u32)
-            metadata = metadata | (W.cast(W.load(x + W.index(7) + group * W.index(8), other=W.u8(0)), W.u32) << W.u32(8))
-            metadata = metadata | (W.cast(W.load(x + W.index(8) + group * W.index(8), other=W.u8(0)), W.u32) << W.u32(16))
-            metadata = metadata | (W.cast(W.load(x + W.index(9) + group * W.index(8), other=W.u8(0)), W.u32) << W.u32(24))
-            member = W.block(32)
-            field = member // W.index(8)
-            lane = member % W.index(8)
-            grid_code = W.load(
-                x + W.index(2) + group * W.index(8) + field,
-                other=W.u8(0),
-            )
-            sign0 = W.load(sign_table + W.cast(metadata & W.u32(127), W.index), other=W.u8(0))
-            sign1 = W.load(sign_table + W.cast((metadata >> W.u32(7)) & W.u32(127), W.index), other=W.u8(0))
-            sign2 = W.load(sign_table + W.cast((metadata >> W.u32(14)) & W.u32(127), W.index), other=W.u8(0))
-            sign3 = W.load(sign_table + W.cast((metadata >> W.u32(21)) & W.u32(127), W.index), other=W.u8(0))
-            zero = grid_code ^ grid_code
-            signs = W.select(
-                field == W.index(0),
-                zero | sign0,
-                W.select(
-                    field == W.index(1),
-                    zero | sign1,
-                    W.select(field == W.index(2), zero | sign2, zero | sign3),
+            metadata = W.cast(
+                W.load(
+                    x + W.index(6) + group * W.index(8), other=W.u8(0)
                 ),
+                W.u32,
             )
-            grid_offset = W.cast(grid_code, W.index) * W.index(8) + lane
-            grid = W.load(grid_table + grid_offset, other=W.u8(0))
-            sign_bit = (signs >> W.cast(lane, W.u8)) & W.u8(1)
-            signed_grid = W.cast(grid, W.i32) * (
-                W.cast(sign_bit, W.i32) * W.i32(-2) + W.i32(1)
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(7) + group * W.index(8), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(8)
             )
-            activation_values = W.cast(
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(8) + group * W.index(8), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(16)
+            )
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(9) + group * W.index(8), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(24)
+            )
+            code = W.block(4)
+            member = W.block(32)
+            local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
+                metadata >> W.u32(28), W.f32
+            )
+            result = W.signed_codebook_i8_dot(
+                W.load(
+                    x + W.index(2) + group * W.index(8) + code,
+                    other=W.u8(0),
+                ),
+                metadata,
                 W.bitcast(
                     W.load(
                         y + W.index(4) + group * W.index(32) + member,
@@ -353,19 +365,11 @@ def iq2_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
                     ),
                     W.i8,
                 ),
-                W.i32,
+                grid_table,
+                sign_table,
+                block_scale * local_scale,
+                result,
             )
-            integer_sum = W.reduce(
-                signed_grid * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
-                metadata >> W.u32(28), W.f32
-            )
-            result = result + block_scale * local_scale * W.cast(integer_sum, W.f32)
     return result
 
 
@@ -461,42 +465,50 @@ def iq3_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
         y = activation + block * W.index(292)
         block_scale = W.load_f16_le(x) * load_f32_le(y) * W.f32(0.25)
         for group in W.range(0, 8):
-            metadata = W.cast(W.load(x + W.index(66) + group * W.index(4), other=W.u8(0)), W.u32)
-            metadata = metadata | (W.cast(W.load(x + W.index(67) + group * W.index(4), other=W.u8(0)), W.u32) << W.u32(8))
-            metadata = metadata | (W.cast(W.load(x + W.index(68) + group * W.index(4), other=W.u8(0)), W.u32) << W.u32(16))
-            metadata = metadata | (W.cast(W.load(x + W.index(69) + group * W.index(4), other=W.u8(0)), W.u32) << W.u32(24))
-            member = W.block(32)
-            field = member // W.index(8)
-            subrow = (member % W.index(8)) // W.index(4)
-            lane = member % W.index(4)
-            code_offset = field * W.index(2) + subrow
-            grid_code = W.load(
-                x + W.index(2) + group * W.index(8) + code_offset,
-                other=W.u8(0),
-            )
-            sign0 = W.load(sign_table + W.cast(metadata & W.u32(127), W.index), other=W.u8(0))
-            sign1 = W.load(sign_table + W.cast((metadata >> W.u32(7)) & W.u32(127), W.index), other=W.u8(0))
-            sign2 = W.load(sign_table + W.cast((metadata >> W.u32(14)) & W.u32(127), W.index), other=W.u8(0))
-            sign3 = W.load(sign_table + W.cast((metadata >> W.u32(21)) & W.u32(127), W.index), other=W.u8(0))
-            zero = grid_code ^ grid_code
-            signs = W.select(
-                field == W.index(0),
-                zero | sign0,
-                W.select(
-                    field == W.index(1),
-                    zero | sign1,
-                    W.select(field == W.index(2), zero | sign2, zero | sign3),
+            metadata = W.cast(
+                W.load(
+                    x + W.index(66) + group * W.index(4), other=W.u8(0)
                 ),
+                W.u32,
             )
-            grid_offset = W.cast(grid_code, W.index) * W.index(4) + lane
-            grid = W.load(grid_table + grid_offset, other=W.u8(0))
-            sign_bit = (
-                signs >> W.cast(member % W.index(8), W.u8)
-            ) & W.u8(1)
-            signed_grid = W.cast(grid, W.i32) * (
-                W.cast(sign_bit, W.i32) * W.i32(-2) + W.i32(1)
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(67) + group * W.index(4), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(8)
             )
-            activation_values = W.cast(
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(68) + group * W.index(4), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(16)
+            )
+            metadata = metadata | (
+                W.cast(
+                    W.load(
+                        x + W.index(69) + group * W.index(4), other=W.u8(0)
+                    ),
+                    W.u32,
+                )
+                << W.u32(24)
+            )
+            code = W.block(8)
+            member = W.block(32)
+            local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
+                metadata >> W.u32(28), W.f32
+            )
+            result = W.signed_codebook_i8_dot(
+                W.load(
+                    x + W.index(2) + group * W.index(8) + code,
+                    other=W.u8(0),
+                ),
+                metadata,
                 W.bitcast(
                     W.load(
                         y + W.index(4) + group * W.index(32) + member,
@@ -504,19 +516,11 @@ def iq3_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
                     ),
                     W.i8,
                 ),
-                W.i32,
+                grid_table,
+                sign_table,
+                block_scale * local_scale,
+                result,
             )
-            integer_sum = W.reduce(
-                signed_grid * activation_values,
-                identity=W.i32(0),
-                axis=0,
-                acc_dtype=W.i32,
-                order="relaxed",
-            )
-            local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
-                metadata >> W.u32(28), W.f32
-            )
-            result = result + block_scale * local_scale * W.cast(integer_sum, W.f32)
     return result
 
 

@@ -14,6 +14,7 @@ add_library(WeftRISCVTarget STATIC
   RISCVQuantQ6IntrinsicC.cpp
   RISCVQuantPackedIntrinsicC.cpp
   RISCVQuantTernaryIntrinsicC.cpp
+  RISCVQuantSignedCodebookIntrinsicC.cpp
   RISCVIMEIntrinsicC.cpp
   RISCVLowering.cpp
 )
