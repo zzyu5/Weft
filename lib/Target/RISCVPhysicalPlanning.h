@@ -562,13 +562,9 @@ struct VLANarrowPhysical {
 };
 
 struct VLAEntityCandidateFacts {
+  CoreMappingProblem mapping;
   unsigned dataSEW = 32;
-  unsigned stridedAccesses = 0;
-  unsigned indexedAccesses = 0;
-  unsigned maxIndexedOffsetSEW = 0;
   unsigned lookupCount = 0;
-  bool hasF32Division = false;
-  bool hasFloatCast = false;
   bool hasIndexVector = false;
   bool hasAffinePredicate = false;
   bool hasNarrow = false;
@@ -583,6 +579,7 @@ struct VLAEntityCandidateFacts {
 };
 
 struct SelectedVLAEntityPhysical {
+  CorePhysicalMapping mapping;
   RVVVectorShape dataShape;
   RVVVectorShape indexShape;
   unsigned maskRatio = 0;

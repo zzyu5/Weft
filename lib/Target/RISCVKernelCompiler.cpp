@@ -526,6 +526,7 @@ void recordPhysicalTemporary(PhysicalEntityPlan &plan, mlir::Operation *owner,
 
 struct VLARegionDecision {
   mlir::Operation *operation = nullptr;
+  CorePhysicalMapping mapping;
   mlir::Value coordinate;
   std::vector<VLAPredicateDecision> predicates;
   std::vector<VLAAccessDecision> accesses;
@@ -2735,16 +2736,8 @@ private:
                  (source.isIndex() && result.isF32());
         });
     VLAEntityCandidateFacts candidateFacts;
-    candidateFacts.hasFloatCast = hasFloatCast;
     candidateFacts.hasNarrow = !decision.narrows.empty();
     candidateFacts.lifetimes = lifetimeSnapshots;
-    candidateFacts.hasF32Division = llvm::any_of(
-        physicalOperations, [](mlir::Operation *operation) {
-          auto binary = mlir::dyn_cast<BinaryOp>(operation);
-          return binary && binary.getKind() == "div" &&
-                 isRegionValue(binary.getResult().getType()) &&
-                 elementType(binary.getResult().getType()).isF32();
-        });
     candidateFacts.hasIndexVector =
         !decision.indexBinaries.empty() || !decision.indexSelects.empty() ||
         llvm::any_of(lifetimeSnapshots,
@@ -2769,10 +2762,6 @@ private:
                  VLAPredicateRealization::RVVAffineIndexScalar;
         });
     for (const VLAAccessDecision &access : decision.accesses) {
-      candidateFacts.stridedAccesses +=
-          access.memoryMode == VLAMemoryMode::Strided;
-      candidateFacts.indexedAccesses +=
-          access.memoryMode == VLAMemoryMode::Indexed;
       unsigned elementSEW = access.elementType.isF32() ? 32
                             : isF16(access.elementType) ? 16
                             : access.elementType.isUnsignedInteger(8) ? 8
@@ -2786,8 +2775,6 @@ private:
       }
       candidateFacts.accessElementSEWs.push_back(elementSEW);
       if (access.memoryMode == VLAMemoryMode::Indexed) {
-        candidateFacts.maxIndexedOffsetSEW = std::max(
-            candidateFacts.maxIndexedOffsetSEW, access.indexedSEW);
         candidateFacts.indexedMemory.push_back(
             VLAIndexedMemoryFact{elementSEW, access.indexedSEW});
       }
@@ -2801,6 +2788,12 @@ private:
       candidateFacts.states.push_back(state.physical);
     candidateFacts.dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
+    candidateFacts.mapping.axes = {
+        LogicalAxisConstraint{kCoreAxisVLA, LogicalAxisRole::Free,
+                              std::nullopt, false, true, true, {1}}};
+    candidateFacts.mapping.laneSEW = candidateFacts.dataSEW;
+    candidateFacts.mapping.laneInstruction =
+        CoreInstructionKind::RVVElementwise;
     if (decision.f32MathImplementation)
       candidateFacts.requiredDataShape =
           decision.f32MathImplementation.valueShapes.front();
@@ -2833,6 +2826,7 @@ private:
     entity.vlaIndexShape = selected->indexShape;
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
+    decision.mapping = selected->mapping;
     narrowPhysical = selected->narrow;
     for (VLASegment2Decision &segment : decision.segment2) {
       segment.vectorShape =

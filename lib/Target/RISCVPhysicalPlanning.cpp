@@ -875,7 +875,9 @@ std::optional<SelectedVLAEntityPhysical>
 selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                         const RISCVTargetProfile &target) {
   if ((facts.dataSEW != 16 && facts.dataSEW != 32) || !target.hasRVV ||
-      target.vectorRegisters <= 0)
+      target.vectorRegisters <= 0 || facts.mapping.axes.size() != 1 ||
+      facts.mapping.axes.front().id != kCoreAxisVLA ||
+      !facts.mapping.axes.front().requireLane)
     return std::nullopt;
   if (facts.requiredDataShape &&
       (facts.requiredDataShape.sew != facts.dataSEW ||
@@ -883,6 +885,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                                    facts.requiredDataShape.lmulEighths)))
     return std::nullopt;
 
+  CoreMappingProblem problem = facts.mapping;
+  problem.laneSEW = facts.dataSEW;
+  problem.laneInstruction = CoreInstructionKind::RVVElementwise;
   std::optional<unsigned> requiredLMUL;
   for (unsigned lmul : facts.requiredLMULs) {
     if (lmul == 0 ||
@@ -892,90 +897,46 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       return std::nullopt;
     requiredLMUL = lmul;
   }
+  if (facts.requiredDataShape)
+    problem.laneShapeCandidates = {facts.requiredDataShape};
+  else if (requiredLMUL)
+    problem.laneLMULCandidates = {*requiredLMUL};
+  else if (problem.laneShapeCandidates.empty() &&
+           problem.laneLMULCandidates.empty())
+    problem.laneLMULCandidates =
+        integerLMULCandidates(target, facts.dataSEW);
 
-  llvm::SmallVector<unsigned> candidates =
-      integerLMULCandidates(target, facts.dataSEW);
-  if (requiredLMUL) {
-    candidates = {*requiredLMUL};
-  } else {
-    unsigned desiredLanes = 16;
-    const bool hasReductionState = llvm::any_of(
-        facts.states, [](const SelectedVLAStatePhysical &state) {
-          return state.stripUpdate == VLAStateStripUpdate::AddReduction ||
-                 state.stripUpdate == VLAStateStripUpdate::MaxReduction ||
-                 state.stripUpdate ==
-                     VLAStateStripUpdate::WideningAddReduction;
-        });
-    const bool hasOrderedScan = llvm::any_of(
-        facts.states, [](const SelectedVLAStatePhysical &state) {
-          return state.stripUpdate == VLAStateStripUpdate::InclusiveAddScan ||
-                 state.stripUpdate ==
-                     VLAStateStripUpdate::SegmentedInclusiveAddScan;
-        });
-    if (facts.dataSEW == 16 || hasReductionState || facts.hasNarrow)
-      desiredLanes = 32;
-    if (facts.dataSEW == 32 && facts.hasFloatCast &&
-        !facts.localPrimitiveResources.empty()) {
-      const unsigned preferredCastLMUL = target.vlenBits >= 256 ? 4 : 2;
-      const unsigned castLanes =
-          rvvLaneCapacity(rvvShape(32, preferredCastLMUL), target).value_or(0);
-      if (castLanes == 0)
-        return std::nullopt;
-      desiredLanes = std::min(desiredLanes, castLanes);
-    }
-    if (hasOrderedScan || facts.hasF32Division)
-      desiredLanes = 8;
-    llvm::sort(candidates, [&](unsigned lhs, unsigned rhs) {
-      auto score = [&](unsigned candidate) {
-        const std::optional<unsigned> lanes =
-            rvvLaneCapacity(rvvShape(facts.dataSEW, candidate), target);
-        if (!lanes)
-          return std::numeric_limits<unsigned>::max();
-        unsigned value = static_cast<unsigned>(std::abs(
-            static_cast<int>(*lanes) - static_cast<int>(desiredLanes)));
-        value += facts.stridedAccesses * candidate;
-        value += facts.indexedAccesses * 2 * candidate;
-        return value;
-      };
-      unsigned lhsScore = score(lhs);
-      unsigned rhsScore = score(rhs);
-      return lhsScore != rhsScore ? lhsScore < rhsScore : lhs > rhs;
-    });
-  }
-
-  for (unsigned candidate : candidates) {
-    RVVVectorShape dataShape = rvvShape(facts.dataSEW, candidate);
-    if (facts.requiredDataShape && dataShape != facts.requiredDataShape)
+  struct Candidate {
+    SelectedVLAEntityPhysical physical;
+    unsigned lanePenalty = 0;
+    unsigned peakGroups = 0;
+    unsigned inverseLanes = 0;
+  };
+  llvm::SmallVector<Candidate, 8> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(problem, target)) {
+    RVVVectorShape dataShape = mapping.laneShape;
+    const PhysicalAxisDecomposition *vlaAxis =
+        findAxisMapping(mapping, kCoreAxisVLA);
+    if (!vlaAxis || vlaAxis->laneFactor == 0 ||
+        (facts.requiredDataShape && dataShape != facts.requiredDataShape))
       continue;
+    const unsigned mappedLaneFactor = vlaAxis->laneFactor;
     const bool needsIndexShape =
         facts.hasAffinePredicate || facts.hasIndexVector;
-    if (needsIndexShape &&
-        (candidate * 8 * static_cast<unsigned>(target.xlen)) %
-                facts.dataSEW !=
-            0)
-      continue;
-    if (needsIndexShape &&
-        candidate * static_cast<unsigned>(target.xlen) / facts.dataSEW > 8)
-      continue;
-    if (needsIndexShape &&
-        !target.supportsVectorShape(
-            static_cast<unsigned>(target.xlen),
-            static_cast<int>(candidate * static_cast<unsigned>(target.xlen) /
-                             facts.dataSEW * 8)))
-      continue;
-    if (facts.indexedAccesses != 0 &&
-        ((candidate * facts.maxIndexedOffsetSEW) % facts.dataSEW != 0 ||
-         candidate * facts.maxIndexedOffsetSEW / facts.dataSEW > 8))
+    std::optional<RVVVectorShape> indexShape =
+        needsIndexShape
+            ? rvvShapeForSameLanes(dataShape,
+                                   static_cast<unsigned>(target.xlen), target)
+            : std::optional<RVVVectorShape>{};
+    if (needsIndexShape && !indexShape)
       continue;
 
     bool elementShapesLegal =
         llvm::all_of(facts.accessElementSEWs, [&](unsigned sew) {
           if (sew == 16 && !target.hasVectorF16)
             return false;
-          if (sew == 0 || (candidate * 8 * sew) % facts.dataSEW != 0)
-            return false;
-          return target.supportsVectorShape(
-              sew, static_cast<int>(candidate * 8 * sew / facts.dataSEW));
+          return sew != 0 && rvvShapeForSameLanes(dataShape, sew, target);
         });
     if (!elementShapesLegal)
       continue;
@@ -995,55 +956,116 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       continue;
     bool segmentShapesLegal = llvm::all_of(
         facts.segmentMemory, [&](const VLASegmentMemoryFact &memory) {
-          return memory.fields != 0 && memory.elementSEW != 0 &&
+          std::optional<RVVVectorShape> elementShape =
+              rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+          return memory.fields != 0 && elementShape &&
                  target.supportsSegmentVectorMemory(
-                     memory.fields, memory.elementSEW,
-                     static_cast<int>(candidate * 8));
+                     memory.fields, elementShape->sew,
+                     elementShape->lmulEighths);
         });
     if (!segmentShapesLegal)
       continue;
 
-    unsigned carriedStateGroups = 0;
-    unsigned transientStateGroups = 0;
-    for (const SelectedVLAStatePhysical &state : facts.states) {
-      switch (state.stripUpdate) {
-      case VLAStateStripUpdate::InclusiveAddScan:
-        transientStateGroups =
-            std::max(transientStateGroups, 3 * candidate + 1);
-        break;
-      case VLAStateStripUpdate::SegmentedInclusiveAddScan:
-        transientStateGroups =
-            std::max(transientStateGroups, 4 * candidate + 2);
-        break;
-      case VLAStateStripUpdate::AddReduction:
-      case VLAStateStripUpdate::MaxReduction:
-        if (state.carry == VLAStateCarryRepresentation::Vector &&
-            state.wholeVLALifetime) {
-          carriedStateGroups += candidate;
-          transientStateGroups =
-              std::max(transientStateGroups, std::max(candidate, 2u));
-        } else {
-          transientStateGroups =
-              std::max(transientStateGroups, candidate + 2);
-        }
-        break;
-      case VLAStateStripUpdate::WideningAddReduction:
-        transientStateGroups =
-            std::max(transientStateGroups,
-                     std::max(1u, candidate / 4) + 1);
-        break;
-      case VLAStateStripUpdate::ArgMaxSummary:
-        transientStateGroups =
-            std::max(transientStateGroups, candidate + 2);
-        break;
-      case VLAStateStripUpdate::OnlineSoftmaxSummary:
-        transientStateGroups =
-            std::max(transientStateGroups, 3 * candidate + 2);
+    llvm::SmallVector<PhysicalLiveRange, 8> persistent;
+    for (const SelectedVLAStatePhysical &state : facts.states)
+      if (state.carry == VLAStateCarryRepresentation::Vector &&
+          state.wholeVLALifetime)
+        persistent.push_back(
+            {PhysicalLiveClass::State, dataShape, 1, 0});
+
+    PhysicalResourceBudget aggregate;
+    aggregate.architecturalGroups = target.vectorRegisters;
+    auto mergeBudget = [&](const PhysicalResourceBudget &budget) {
+      aggregate.valueGroups =
+          std::max(aggregate.valueGroups, budget.valueGroups);
+      aggregate.memoryGroups =
+          std::max(aggregate.memoryGroups, budget.memoryGroups);
+      aggregate.indexGroups =
+          std::max(aggregate.indexGroups, budget.indexGroups);
+      aggregate.predicateGroups =
+          std::max(aggregate.predicateGroups, budget.predicateGroups);
+      aggregate.stateGroups =
+          std::max(aggregate.stateGroups, budget.stateGroups);
+      aggregate.primitiveGroups =
+          std::max(aggregate.primitiveGroups, budget.primitiveGroups);
+      aggregate.peakGroups =
+          std::max(aggregate.peakGroups, budget.peakGroups);
+    };
+    auto appendSnapshot = [&](PhysicalResourceRequirements &requirements,
+                              const VLAValueLifetimeSnapshot &snapshot) {
+      auto append = [&](PhysicalLiveClass kind, unsigned sew, unsigned count) {
+        if (count == 0)
+          return true;
+        std::optional<RVVVectorShape> shape =
+            rvvShapeForSameLanes(dataShape, sew, target);
+        if (!shape)
+          return false;
+        requirements.live.push_back({kind, *shape, count, 0});
+        return true;
+      };
+      if (!append(PhysicalLiveClass::Value, 32, snapshot.f32) ||
+          !append(PhysicalLiveClass::Value, 16, snapshot.f16) ||
+          !append(PhysicalLiveClass::Value, 8, snapshot.byte) ||
+          !append(PhysicalLiveClass::Value, 32, snapshot.u32) ||
+          !append(PhysicalLiveClass::Index,
+                  static_cast<unsigned>(target.xlen), snapshot.index))
+        return false;
+      if (snapshot.mask != 0)
+        requirements.live.push_back(
+            {PhysicalLiveClass::Predicate, {}, 1, snapshot.mask});
+      return true;
+    };
+    auto applyPhase = [&](llvm::ArrayRef<PhysicalLiveRange> extra) {
+      VLAValueLifetimeSnapshot empty;
+      llvm::ArrayRef<VLAValueLifetimeSnapshot> snapshots = facts.lifetimes;
+      if (snapshots.empty())
+        snapshots = llvm::ArrayRef<VLAValueLifetimeSnapshot>(&empty, 1);
+      for (const VLAValueLifetimeSnapshot &snapshot : snapshots) {
+        PhysicalResourceRequirements requirements;
+        requirements.live.append(persistent.begin(), persistent.end());
+        requirements.live.append(extra.begin(), extra.end());
+        if (!appendSnapshot(requirements, snapshot))
+          return false;
+        std::optional<PhysicalResourceBudget> budget =
+            calculatePhysicalResources(requirements, target);
+        if (!budget)
+          return false;
+        mergeBudget(*budget);
+      }
+      return true;
+    };
+    if (!applyPhase({}))
+      continue;
+
+    bool resourceLegal = true;
+    for (const VLAIndexedMemoryFact &memory : facts.indexedMemory) {
+      std::optional<RVVVectorShape> elementShape =
+          rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+      std::optional<RVVVectorShape> offsetShape =
+          rvvShapeForSameLanes(dataShape, memory.offsetSEW, target);
+      if (!elementShape || !offsetShape ||
+          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
+                                        *elementShape, 1, 0},
+                      PhysicalLiveRange{PhysicalLiveClass::Index,
+                                        *offsetShape, 1, 0}})) {
+        resourceLegal = false;
         break;
       }
     }
-    unsigned stateGroups = carriedStateGroups + transientStateGroups;
-    unsigned primitiveGroups = stateGroups;
+    if (!resourceLegal)
+      continue;
+    for (const VLASegmentMemoryFact &memory : facts.segmentMemory) {
+      std::optional<RVVVectorShape> elementShape =
+          rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+      if (!elementShape ||
+          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
+                                        *elementShape, memory.fields, 0}})) {
+        resourceLegal = false;
+        break;
+      }
+    }
+    if (!resourceLegal)
+      continue;
 
     std::optional<VLANarrowPhysical> narrow;
     if (facts.hasNarrow) {
@@ -1059,65 +1081,73 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       selected.sourceShape = dataShape;
       selected.intermediateShape = *intermediateShape;
       selected.resultShape = *resultShape;
-      selected.resources.architecturalGroups = target.vectorRegisters;
-      selected.resources.valueGroups = rvvRegisterGroups(dataShape);
-      selected.resources.primitiveGroups =
-          rvvRegisterGroups(dataShape) +
-          rvvRegisterGroups(*intermediateShape) +
-          rvvRegisterGroups(*resultShape);
-      selected.resources.peakGroups =
-          selected.resources.primitiveGroups + 1;
-      primitiveGroups =
-          std::max(primitiveGroups, selected.resources.primitiveGroups);
+      PhysicalResourceRequirements narrowRequirements;
+      narrowRequirements.live = {
+          {PhysicalLiveClass::Temporary, dataShape, 1, 0},
+          {PhysicalLiveClass::Temporary, *intermediateShape, 1, 0},
+          {PhysicalLiveClass::Temporary, *resultShape, 1, 0}};
+      std::optional<PhysicalResourceBudget> narrowResources =
+          calculatePhysicalResources(narrowRequirements, target);
+      if (!narrowResources || !applyPhase(narrowRequirements.live))
+        continue;
+      selected.resources = *narrowResources;
       narrow = selected;
     }
 
-    for (const PhysicalResourceBudget &resource :
-         facts.localPrimitiveResources)
-      primitiveGroups =
-          std::max(primitiveGroups, resource.primitiveGroups);
-
-    unsigned indexGroups = 0;
-    if (facts.indexedAccesses != 0)
-      indexGroups =
-          candidate * facts.maxIndexedOffsetSEW / facts.dataSEW;
-
-    auto groupsFor = [&](unsigned sew, unsigned count) {
-      if (count == 0)
-        return 0u;
-      unsigned scaled = candidate * 8 * sew;
-      if (scaled % facts.dataSEW != 0)
-        return static_cast<unsigned>(target.vectorRegisters);
-      int lmulEighths = static_cast<int>(scaled / facts.dataSEW);
-      if (!target.supportsVectorShape(sew, lmulEighths))
-        return static_cast<unsigned>(target.vectorRegisters);
-      return count * rvvRegisterGroups(RVVVectorShape{sew, lmulEighths});
-    };
-    unsigned valueGroups = 0;
-    unsigned predicateGroups = 0;
-    for (const VLAValueLifetimeSnapshot &snapshot : facts.lifetimes) {
-      unsigned snapshotGroups =
-          groupsFor(32, snapshot.f32) + groupsFor(16, snapshot.f16) +
-          groupsFor(8, snapshot.byte) + groupsFor(32, snapshot.u32) +
-          groupsFor(static_cast<unsigned>(target.xlen), snapshot.index) +
-          snapshot.mask;
-      valueGroups = std::max(valueGroups, snapshotGroups);
-      predicateGroups = std::max(predicateGroups, snapshot.mask);
+    for (const SelectedVLAStatePhysical &state : facts.states) {
+      llvm::SmallVector<PhysicalLiveRange, 6> transient;
+      switch (state.stripUpdate) {
+      case VLAStateStripUpdate::InclusiveAddScan:
+        transient = {{PhysicalLiveClass::Temporary, dataShape, 3, 0},
+                     {PhysicalLiveClass::Predicate, {}, 1, 1}};
+        break;
+      case VLAStateStripUpdate::SegmentedInclusiveAddScan:
+        transient = {{PhysicalLiveClass::Temporary, dataShape, 4, 0},
+                     {PhysicalLiveClass::Predicate, {}, 1, 2}};
+        break;
+      case VLAStateStripUpdate::AddReduction:
+      case VLAStateStripUpdate::MaxReduction:
+        transient = {{PhysicalLiveClass::Temporary, dataShape, 1, 0}};
+        if (state.carry != VLAStateCarryRepresentation::Vector ||
+            rvvRegisterGroups(dataShape) < 2)
+          transient.push_back({PhysicalLiveClass::Temporary, {}, 1, 2});
+        break;
+      case VLAStateStripUpdate::WideningAddReduction: {
+        std::optional<RVVVectorShape> byteShape =
+            rvvShapeForSameLanes(dataShape, 8, target);
+        if (!byteShape) {
+          resourceLegal = false;
+          break;
+        }
+        transient = {{PhysicalLiveClass::Temporary, *byteShape, 1, 0},
+                     {PhysicalLiveClass::Temporary, {}, 1, 1}};
+        break;
+      }
+      case VLAStateStripUpdate::ArgMaxSummary:
+        if (!indexShape) {
+          indexShape = rvvShapeForSameLanes(
+              dataShape, static_cast<unsigned>(target.xlen), target);
+        }
+        if (!indexShape) {
+          resourceLegal = false;
+          break;
+        }
+        transient = {{PhysicalLiveClass::Temporary, dataShape, 1, 0},
+                     {PhysicalLiveClass::Index, *indexShape, 1, 0}};
+        break;
+      case VLAStateStripUpdate::OnlineSoftmaxSummary:
+        transient = {{PhysicalLiveClass::Temporary, dataShape, 3, 0},
+                     {PhysicalLiveClass::Temporary, {}, 1, 2}};
+        break;
+      }
+      if (!resourceLegal || !applyPhase(transient)) {
+        resourceLegal = false;
+        break;
+      }
     }
+    if (!resourceLegal)
+      continue;
 
-    unsigned memoryGroups = indexGroups;
-    unsigned segmentLoadGroups = 0;
-    unsigned segmentStoreGroups = 0;
-    for (const VLASegmentMemoryFact &memory : facts.segmentMemory) {
-      unsigned groups = memory.fields * candidate;
-      if (memory.write)
-        segmentStoreGroups += groups;
-      else
-        segmentLoadGroups += groups;
-    }
-    memoryGroups += std::max(segmentLoadGroups, segmentStoreGroups);
-
-    unsigned lookupGroups = 0;
     if (facts.lookupCount != 0) {
       std::optional<RVVVectorShape> codeShape =
           rvvShapeForSameLanes(dataShape, 8, target);
@@ -1127,50 +1157,62 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
           rvvShapeForSameLanes(dataShape, 32, target);
       if (!codeShape || !index16Shape || !index32Shape)
         continue;
-      unsigned conversionGroups = rvvRegisterGroups(*codeShape) +
-                                  rvvRegisterGroups(*index16Shape) +
-                                  rvvRegisterGroups(*index32Shape);
-      unsigned gatherGroups = 3 * rvvRegisterGroups(*index32Shape);
-      lookupGroups = std::max(conversionGroups, gatherGroups);
-      primitiveGroups = std::max(primitiveGroups, lookupGroups);
+      if (!applyPhase({
+              {PhysicalLiveClass::Temporary, *codeShape, 1, 0},
+              {PhysicalLiveClass::Temporary, *index16Shape, 1, 0},
+              {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}}) ||
+          !applyPhase({
+              {PhysicalLiveClass::Index, *index32Shape, 1, 0},
+              {PhysicalLiveClass::Memory, *index32Shape, 1, 0},
+              {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}}))
+        continue;
     }
 
-    unsigned sharedGroups = valueGroups + memoryGroups;
-    unsigned requiredGroups =
-        std::max(sharedGroups, primitiveGroups + memoryGroups);
-    unsigned peakGroups = requiredGroups + 1;
     for (const PhysicalResourceBudget &resource :
          facts.localPrimitiveResources) {
-      unsigned handoffGroups = memoryGroups + predicateGroups;
-      peakGroups =
-          std::max(peakGroups,
-                   std::max(resource.peakGroups,
-                            resource.primitiveGroups + handoffGroups + 1));
+      if (resource.peakGroups > static_cast<unsigned>(target.vectorRegisters)) {
+        resourceLegal = false;
+        break;
+      }
+      mergeBudget(resource);
+      if (resource.primitiveGroups != 0 &&
+          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Temporary, {}, 1,
+                                        resource.primitiveGroups}})) {
+        resourceLegal = false;
+        break;
+      }
     }
-    if (peakGroups >= static_cast<unsigned>(target.vectorRegisters))
+    if (!resourceLegal)
       continue;
 
     SelectedVLAEntityPhysical selected;
+    selected.mapping = std::move(mapping);
     selected.dataShape = dataShape;
     if (needsIndexShape)
-      selected.indexShape =
-          rvvShapeForSameLanes(dataShape, target.xlen, target)
-              .value_or(RVVVectorShape{});
+      selected.indexShape = *indexShape;
     selected.maskRatio = rvvMaskRatio(dataShape).value_or(0);
     if (selected.maskRatio == 0)
       continue;
     selected.narrow = narrow;
-    selected.resources.architecturalGroups = target.vectorRegisters;
-    selected.resources.valueGroups = valueGroups;
-    selected.resources.memoryGroups = memoryGroups;
-    selected.resources.indexGroups = indexGroups;
-    selected.resources.predicateGroups = predicateGroups;
-    selected.resources.stateGroups = stateGroups;
-    selected.resources.primitiveGroups = primitiveGroups;
-    selected.resources.peakGroups = peakGroups;
-    return selected;
+    selected.resources = aggregate;
+    const unsigned preferredGroups =
+        std::max(1u, std::min(4u, static_cast<unsigned>(target.vectorRegisters) /
+                                      8u));
+    const unsigned laneGroups = rvvRegisterGroups(dataShape);
+    legal.push_back(Candidate{
+        std::move(selected),
+        static_cast<unsigned>(std::abs(static_cast<int>(laneGroups) -
+                                       static_cast<int>(preferredGroups))),
+        aggregate.peakGroups,
+        std::numeric_limits<unsigned>::max() - mappedLaneFactor});
   }
-  return std::nullopt;
+  if (legal.empty())
+    return std::nullopt;
+  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+    return std::tie(lhs.lanePenalty, lhs.peakGroups, lhs.inverseLanes) <
+           std::tie(rhs.lanePenalty, rhs.peakGroups, rhs.inverseLanes);
+  });
+  return std::move(legal.front().physical);
 }
 
 std::optional<SelectedSignBitI8Physical>
