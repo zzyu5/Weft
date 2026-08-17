@@ -757,6 +757,8 @@ calculateDenseMicrokernelResources(
 
 struct F32DotCandidateFacts {
   CoreMappingProblem mapping;
+  llvm::SmallVector<unsigned, 3> lhsAxes;
+  llvm::SmallVector<unsigned, 3> rhsAxes;
   std::optional<uint64_t> reductionExtent;
   unsigned unitStrideOperands = 0;
   unsigned stridedOperands = 0;

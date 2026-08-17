@@ -2307,16 +2307,23 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     for (const PhysicalAxisDecomposition &axis : mapping.axes)
       if (axis.role == LogicalAxisRole::Free)
         accumulatorVectors *= axis.registerFactor;
-    unsigned lhsVectorsPerWindow = 0;
-    unsigned rhsVectorsPerWindow = 0;
-    if (laneAxis->id == kCoreAxisK) {
-      lhsVectorsPerWindow = accumulatorVectors;
-      rhsVectorsPerWindow = 1;
-    } else if (laneAxis->id == kCoreAxisM) {
-      lhsVectorsPerWindow = 1;
-    } else if (laneAxis->id == kCoreAxisN) {
-      rhsVectorsPerWindow = 1;
-    }
+    auto operandVectorsPerWindow = [&](llvm::ArrayRef<unsigned> operandAxes) {
+      if (!llvm::is_contained(operandAxes, laneAxis->id))
+        return 0u;
+      unsigned vectors = 1;
+      for (const PhysicalAxisDecomposition &axis : mapping.axes)
+        if (axis.id != laneAxis->id &&
+            axis.role == LogicalAxisRole::Free &&
+            llvm::is_contained(operandAxes, axis.id))
+          vectors *= axis.registerFactor;
+      return vectors;
+    };
+    const unsigned lhsVectorsPerWindow =
+        operandVectorsPerWindow(facts.lhsAxes);
+    const unsigned rhsVectorsPerWindow =
+        operandVectorsPerWindow(facts.rhsAxes);
+    if (lhsVectorsPerWindow == 0 && rhsVectorsPerWindow == 0)
+      continue;
     DenseMicrokernelResourceFacts resourceFacts{
         mapping.laneShape, mapping.laneShape, accumulatorVectors,
         lhsVectorsPerWindow, rhsVectorsPerWindow,
