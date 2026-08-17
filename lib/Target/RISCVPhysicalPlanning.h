@@ -201,7 +201,7 @@ struct BlockReducePhysicalDecision {
 struct BlockReduceCandidateFacts {
   CoreMappingProblem mapping;
   bool needsLaneVector = false;
-  RVVVectorShape inputShape;
+  unsigned inputSEW = 0;
 };
 
 struct SelectedBlockReducePhysical {
@@ -473,8 +473,7 @@ enum class LocalPrimitiveKind {
 
 enum class LocalHardwareOperationKind {
   None,
-  RVVRegister,
-  RVVStrip,
+  RVVIntrinsic,
   RVVInlineAsm,
   MatrixFragment,
 };
@@ -492,22 +491,19 @@ enum class LocalOperationProjection {
 
 struct LocalHardwareOperation {
   LocalHardwareOperationKind kind = LocalHardwareOperationKind::None;
-  unsigned lanes = 0;
   unsigned rows = 1;
-  RVVVectorShape primaryShape;
   LocalOperationProjection projection = LocalOperationProjection::None;
 
   explicit operator bool() const {
     return kind != LocalHardwareOperationKind::None;
   }
   bool operator==(const LocalHardwareOperation &other) const {
-    return kind == other.kind && lanes == other.lanes && rows == other.rows &&
-           primaryShape == other.primaryShape && projection == other.projection;
+    return kind == other.kind && rows == other.rows &&
+           projection == other.projection;
   }
   bool operator<(const LocalHardwareOperation &other) const {
-    return std::tie(kind, lanes, rows, primaryShape, projection) <
-           std::tie(other.kind, other.lanes, other.rows, other.primaryShape,
-                    other.projection);
+    return std::tie(kind, rows, projection) <
+           std::tie(other.kind, other.rows, other.projection);
   }
 };
 
@@ -553,6 +549,9 @@ selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
 struct I4I8FragmentCandidateFacts {
   CoreMappingProblem mapping;
   bool affine = false;
+  unsigned rowsAxis = 0;
+  unsigned columnsAxis = 0;
+  unsigned reductionAxis = 0;
 };
 
 struct SelectedI4I8FragmentPhysical {
@@ -638,8 +637,14 @@ struct VLAEntityCandidateFacts {
       localPrimitiveRequirements;
 };
 
+struct VLAElementPhysicalShape {
+  unsigned sew = 0;
+  RVVVectorShape shape;
+};
+
 struct SelectedVLAEntityPhysical {
   CorePhysicalMapping mapping;
+  llvm::SmallVector<VLAElementPhysicalShape, 4> elementShapes;
   llvm::SmallVector<SelectedVLAStatePhysical, 4> states;
   RVVVectorShape indexShape;
   unsigned maskRatio = 0;
@@ -673,7 +678,7 @@ struct AxisMappedLiveValue {
   PhysicalLiveClass liveClass = PhysicalLiveClass::Value;
   RVVVectorShape shape;
   AxisMappedMultiplicity multiplicity = AxisMappedMultiplicity::Fixed;
-  unsigned axis = kCoreAxisK;
+  std::optional<unsigned> axis;
   unsigned factor = 1;
   unsigned chunk = 1;
 };
@@ -688,26 +693,15 @@ std::optional<PhysicalResourceBudget>
 calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
                              const RISCVTargetProfile &target);
 
-enum class TernaryI8DotSemantic {
-  Base3Digits,
-  PackedI2Fields,
-};
-
 struct TernaryI8DotCandidateFacts {
   CoreMappingProblem mapping;
-  TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
+  LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
   unsigned primaryExtent = 0;
   unsigned secondaryExtent = 0;
 };
 
-enum class TernaryDecodeTopology {
-  Base3Digits,
-  PackedI2Fields,
-};
-
 struct SelectedTernaryI8DotPhysical {
   LocalImplementation implementation;
-  TernaryDecodeTopology decode = TernaryDecodeTopology::Base3Digits;
   RVVVectorShape primarySourceShape;
   RVVVectorShape secondarySourceShape;
   PhysicalResourceBudget resources;
@@ -753,19 +747,9 @@ std::optional<SelectedNibbleCodebookI8Physical>
 selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
                                const RISCVTargetProfile &target);
 
-enum class QuantI8DotSemantic {
-  PackedI4,
-  PackedI5,
-  PackedI3Grouped,
-  IQ2S,
-  IQ3S,
-  IQ1M,
-  Q6K,
-};
-
 struct QuantI8DotCandidateFacts {
   CoreMappingProblem mapping;
-  QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
+  LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
 };
 
 struct SelectedQuantI8DotPhysical {
@@ -846,6 +830,7 @@ struct F32DotCandidateFacts {
   CoreMappingProblem mapping;
   llvm::SmallVector<unsigned, 3> lhsAxes;
   llvm::SmallVector<unsigned, 3> rhsAxes;
+  unsigned reductionAxis = 0;
   std::optional<uint64_t> reductionExtent;
   unsigned unitStrideOperands = 0;
   unsigned stridedOperands = 0;
@@ -871,12 +856,16 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
 
 struct F16MatmulCandidateFacts {
   CoreMappingProblem mapping;
+  unsigned lhsFreeAxis = 0;
+  unsigned rhsFreeAxis = 0;
+  unsigned reductionAxis = 0;
   bool nLaneStrided = false;
   LocalPipelineDependenceFacts pipeline;
 };
 
 struct SelectedF16MatmulPhysical {
   CorePhysicalMapping mapping;
+  RVVVectorShape accumulatorShape;
   PhysicalResourceBudget resources;
 };
 

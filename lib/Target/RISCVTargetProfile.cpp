@@ -15,10 +15,6 @@ bool weft::RISCVTargetProfile::supportsLMULEighths(int lmulEighths) const {
   return llvm::is_contained(legalLMULEighths, lmulEighths);
 }
 
-bool weft::RISCVTargetProfile::supportsVLENAtLeast(unsigned bits) const {
-  return hasRVV && vlenBits > 0 && static_cast<uint64_t>(vlenBits) >= bits;
-}
-
 bool weft::RISCVTargetProfile::supportsFixedRVV() const {
   return hasRVV && vlenBits > 0 && vectorRegisters > 0;
 }
@@ -66,11 +62,6 @@ bool weft::RISCVTargetProfile::supportsSegmentVectorMemory(
       (static_cast<uint64_t>(lmulEighths) + 7) / 8;
   return fields * registerGroups <=
          static_cast<uint64_t>(vectorRegisters);
-}
-
-bool weft::RISCVTargetProfile::hasMatrixExtension(
-    RISCVMatrixExtension extension) const {
-  return matrixExtension == extension;
 }
 
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
@@ -209,20 +200,18 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
     error = "--vlen-bits requires an ISA string with the vector extension";
     return false;
   }
-  if (matrixExtension == "none") {
-    profile.matrixExtension = RISCVMatrixExtension::None;
-  } else if (matrixExtension == "spacemit-ime1") {
+  const bool spacemitIME1 = matrixExtension == "spacemit-ime1";
+  if (matrixExtension != "none" && !spacemitIME1) {
+    error = "unsupported --matrix-extension value: " + matrixExtension.str();
+    return false;
+  }
+  if (spacemitIME1) {
     if (profile.xlen != 64 || !profile.hasRVV || profile.vlenBits != 256) {
       error = "spacemit-ime1 requires RV64, RVV, and an explicit VLEN of exactly 256 bits";
       return false;
     }
-    profile.matrixExtension = RISCVMatrixExtension::SpacemitIME1;
-  } else {
-    error = "unsupported --matrix-extension value: " + matrixExtension.str();
-    return false;
   }
-  if (profile.matrixExtension == RISCVMatrixExtension::SpacemitIME1 &&
-      profile.littleEndian && profile.xlen == 64 && profile.hasF &&
+  if (spacemitIME1 && profile.littleEndian && profile.xlen == 64 && profile.hasF &&
       profile.hasVectorF16 && profile.hasWideningInteger &&
       profile.hasWideningFloat && profile.supportsFixedRVV() &&
       profile.vlenBits == 256 && profile.supportsVectorShape(8, 2) &&

@@ -353,41 +353,26 @@ findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis) {
   return found == mapping.axes.end() ? nullptr : &*found;
 }
 
+const PhysicalAxisDecomposition *
+findUniqueAxisMapping(const CorePhysicalMapping &mapping,
+                      LogicalAxisRole role) {
+  const PhysicalAxisDecomposition *result = nullptr;
+  for (const PhysicalAxisDecomposition &axis : mapping.axes) {
+    if (axis.role != role)
+      continue;
+    if (result)
+      return nullptr;
+    result = &axis;
+  }
+  return result;
+}
+
 unsigned mappedLaneSpan(const CorePhysicalMapping &mapping) {
   if (!mapping.laneAxis)
     return 0;
   const PhysicalAxisDecomposition *axis =
       findAxisMapping(mapping, *mapping.laneAxis);
   return axis ? axis->laneFactor * axis->registerFactor : 0;
-}
-
-unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping) {
-  if (!mapping.laneAxis)
-    return 0;
-  const PhysicalAxisDecomposition *axis =
-      findAxisMapping(mapping, *mapping.laneAxis);
-  return axis ? axis->laneFactor : 0;
-}
-
-unsigned mappedRegisterFactor(const CorePhysicalMapping &mapping,
-                              unsigned axis) {
-  const PhysicalAxisDecomposition *decomposition =
-      findAxisMapping(mapping, axis);
-  return decomposition ? decomposition->registerFactor : 1;
-}
-
-unsigned mappedFragmentFactor(const CorePhysicalMapping &mapping,
-                              unsigned axis) {
-  const PhysicalAxisDecomposition *decomposition =
-      findAxisMapping(mapping, axis);
-  return decomposition ? decomposition->fragmentFactor : 1;
-}
-
-bool mappedAxisHasSequentialIteration(const CorePhysicalMapping &mapping,
-                                      unsigned axis) {
-  const PhysicalAxisDecomposition *decomposition =
-      findAxisMapping(mapping, axis);
-  return decomposition && decomposition->sequentialFactor > 1;
 }
 
 std::optional<PhysicalResourceBudget>

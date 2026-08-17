@@ -10,11 +10,11 @@ bool emitPackedI3GroupedLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 3)
     return false;
   const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape productShape = implementation.valueShapes[1];
   const RVVVectorShape segmentProductShape = implementation.valueShapes[2];

@@ -313,6 +313,7 @@ struct VLAPredicateDecision {
   VLAPredicateRealization realization =
       VLAPredicateRealization::RVVAffineIndexScalar;
   unsigned vectorSEW = 0;
+  RVVVectorShape vectorShape;
 };
 
 struct VLAAccessDecision {
@@ -325,6 +326,7 @@ struct VLAAccessDecision {
   std::optional<AffineScalarExpression> laneStride;
   mlir::Value indexedOffset;
   unsigned indexedSEW = 0;
+  RVVVectorShape elementShape;
   RVVVectorShape indexedShape;
   unsigned elementBytes = 0;
   mlir::Value bundleAxis;
@@ -352,6 +354,9 @@ struct VLALookupDecision {
   LocalBlockMemoryFact table;
   mlir::Value indices;
   int64_t tableExtent = 16;
+  RVVVectorShape codeShape;
+  RVVVectorShape index16Shape;
+  RVVVectorShape index32Shape;
 };
 
 struct VLACastDecision {
@@ -418,7 +423,9 @@ struct VLADotDecision {
   VLADotOperandDecision rhs;
   mlir::Value init;
   mlir::Value rowAxis;
+  std::optional<unsigned> rowMappingAxis;
   mlir::Value reductionAxis;
+  unsigned reductionMappingAxis = 0;
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
   PhysicalResourceRequirements resourceRequirements;
@@ -558,6 +565,9 @@ struct F16GemmNTileDecision {
   mlir::Value lhsReductionAxis;
   mlir::Value rhsReductionAxis;
   mlir::Value rhsColumnAxis;
+  unsigned lhsFreeMappingAxis = 0;
+  unsigned rhsFreeMappingAxis = 0;
+  unsigned reductionMappingAxis = 0;
   unsigned rowTile = 4;
   unsigned columnTile = 8;
   unsigned reductionTile = 64;
@@ -580,8 +590,9 @@ struct DotDecision {
   LocalDotOperandDecision lhs;
   LocalDotOperandDecision rhs;
   mlir::Value rowAxis;
-  unsigned rowMappingAxis = kCoreAxisM;
+  unsigned rowMappingAxis = 0;
   mlir::Value reductionAxis;
+  unsigned reductionMappingAxis = 0;
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
 };
@@ -625,6 +636,7 @@ struct StructuredProductAxisProjection {
   llvm::SmallVector<unsigned, 4> lhsAxes;
   llvm::SmallVector<unsigned, 4> rhsAxes;
   llvm::SmallVector<unsigned, 4> resultAxes;
+  llvm::SmallVector<unsigned, 4> reductionAxes;
 
   const StructuredProductAxisBinding *find(mlir::Value coordinate) const {
     auto found = llvm::find_if(
@@ -852,12 +864,12 @@ i4I8BlockProductMapping(BlockType result,
   const int64_t reductionExtent = activation.semanticExtent / rowExtent;
   CoreMappingProblem problem;
   problem.axes = {
-      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, rowExtent,
+      LogicalAxisConstraint{0, LogicalAxisRole::Free, rowExtent,
                             false, false, false,
                             {static_cast<unsigned>(rowExtent)}},
-      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, columnExtent,
+      LogicalAxisConstraint{1, LogicalAxisRole::Free, columnExtent,
                             false, false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
+      LogicalAxisConstraint{2, LogicalAxisRole::Reduction,
                             reductionExtent, false, false, false, {1}}};
   return problem;
 }
@@ -881,13 +893,13 @@ std::optional<CoreMappingProblem> groupedAffineI4I8Mapping(
   const int64_t reductionExtent = activation.semanticExtent / groupExtent;
   CoreMappingProblem problem;
   problem.axes = {
-      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, 1, false,
+      LogicalAxisConstraint{0, LogicalAxisRole::Free, 1, false,
                             false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
+      LogicalAxisConstraint{1, LogicalAxisRole::Reduction,
                             reductionExtent, false, false, false, {1, 2}},
-      LogicalAxisConstraint{kCoreAxisGroup, LogicalAxisRole::Group,
+      LogicalAxisConstraint{2, LogicalAxisRole::Group,
                             groupExtent, false, false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed,
+      LogicalAxisConstraint{3, LogicalAxisRole::Packed,
                             packedFactor, false, false, false, {1}}};
   return problem;
 }
@@ -895,7 +907,7 @@ std::optional<CoreMappingProblem> groupedAffineI4I8Mapping(
 CoreMappingProblem localReductionMapping(uint64_t extent) {
   CoreMappingProblem problem;
   problem.axes = {LogicalAxisConstraint{
-      kCoreAxisK, LogicalAxisRole::Reduction, extent, false, true, true,
+      0, LogicalAxisRole::Reduction, extent, false, true, true,
       registerFactorCandidates(extent,
                                static_cast<unsigned>(
                                    std::min<uint64_t>(extent, 8)))}};
@@ -1028,11 +1040,11 @@ private:
       if (std::optional<int64_t> extent = integerConstantValue(op.getExtent());
           extent && *extent > 0)
         facts.mapping.axes = {LogicalAxisConstraint{
-            kCoreAxisBlock, LogicalAxisRole::Free,
+            0, LogicalAxisRole::Free,
             static_cast<uint64_t>(*extent), true, false, false, {1}}};
       else
         facts.mapping.axes = {LogicalAxisConstraint{
-            kCoreAxisBlock, LogicalAxisRole::Free, std::nullopt, true, false,
+            0, LogicalAxisRole::Free, std::nullopt, true, false,
             false, {1}}};
       facts.descending = op.getOrder() == "descending";
       facts.configuredRadixBits = options.backend.parameters.sortRadixBits;
@@ -1176,13 +1188,13 @@ private:
       registerDecision(physicalPlan.groupedAffineI4I8, op.getOperation(),
                        std::move(planned), "grouped_affine_i4_i8_dot");
     });
-    auto prepareTernaryDot = [&](auto op, TernaryI8DotSemantic semantic,
+    auto prepareTernaryDot = [&](auto op, LocalPrimitiveKind primitive,
                                  llvm::ArrayRef<mlir::Value> blocks,
                                  llvm::ArrayRef<mlir::Value> scalars) {
       if (decisionFailure)
         return;
       PlannedPhysicalDecision<TernaryI8Decision> planned;
-      if (mlir::failed(decideTernaryI8Dot(op, semantic, blocks, scalars,
+      if (mlir::failed(decideTernaryI8Dot(op, primitive, blocks, scalars,
                                          planned.realization))) {
         decisionFailure = true;
         return;
@@ -1193,13 +1205,13 @@ private:
     };
     kernel.walk([&](Base3TernaryI8DotOp op) {
       prepareTernaryDot(
-          op, TernaryI8DotSemantic::Base3Digits,
+          op, LocalPrimitiveKind::Base3TernaryI8,
           {op.getCodes(), op.getHighDigits(), op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](PackedI2TernaryI8DotOp op) {
       prepareTernaryDot(
-          op, TernaryI8DotSemantic::PackedI2Fields,
+          op, LocalPrimitiveKind::PackedI2TernaryI8,
           {op.getCodes(), op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
@@ -1255,14 +1267,14 @@ private:
                        std::move(planned), "nibble_codebook_i8_dot");
     });
     auto prepareQuantI8Dot = [&](auto op,
-                                       QuantI8DotSemantic semantic,
+                                       LocalPrimitiveKind primitive,
                                        llvm::ArrayRef<mlir::Value> blocks,
                                        llvm::ArrayRef<mlir::Value> scalars) {
       if (decisionFailure)
         return;
       PlannedPhysicalDecision<QuantI8DotDecision> planned;
       if (mlir::failed(
-              decideQuantI8Dot(op, semantic, blocks, scalars,
+              decideQuantI8Dot(op, primitive, blocks, scalars,
                                        planned.realization))) {
         decisionFailure = true;
         return;
@@ -1273,69 +1285,49 @@ private:
     };
     kernel.walk([&](IQ2SI8DotOp op) {
       prepareQuantI8Dot(
-          op, QuantI8DotSemantic::IQ2S,
+          op, LocalPrimitiveKind::IQ2SI8,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](PackedI3GroupedI8DotOp op) {
       prepareQuantI8Dot(
-          op, QuantI8DotSemantic::PackedI3Grouped,
+          op, LocalPrimitiveKind::PackedI3GroupedI8,
           {op.getLowBits(), op.getHighBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](PackedI4I8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<QuantI8DotDecision> planned;
-      if (mlir::failed(decideQuantI8Dot(
-              op, QuantI8DotSemantic::PackedI4,
-              {op.getPackedCodes(), op.getActivation()},
-              {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
-               op.getInit()},
-              planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeQuantI8Plan(op, planned);
-      registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
-                       std::move(planned), "packed_i4_i8_dot");
+      prepareQuantI8Dot(
+          op, LocalPrimitiveKind::PackedI4I8,
+          {op.getPackedCodes(), op.getActivation()},
+          {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+           op.getInit()});
     });
     kernel.walk([&](PackedI5I8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<QuantI8DotDecision> planned;
-      if (mlir::failed(decideQuantI8Dot(
-              op, QuantI8DotSemantic::PackedI5,
-              {op.getLowBits(), op.getHighBits(), op.getActivation()},
-              {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
-               op.getInit()},
-              planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeQuantI8Plan(op, planned);
-      registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
-                       std::move(planned), "packed_i5_i8_dot");
+      prepareQuantI8Dot(
+          op, LocalPrimitiveKind::PackedI5I8,
+          {op.getLowBits(), op.getHighBits(), op.getActivation()},
+          {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+           op.getInit()});
     });
     kernel.walk([&](IQ3SI8DotOp op) {
       prepareQuantI8Dot(
-          op, QuantI8DotSemantic::IQ3S,
+          op, LocalPrimitiveKind::IQ3SI8,
           {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](IQ1MI8DotOp op) {
       prepareQuantI8Dot(
-          op, QuantI8DotSemantic::IQ1M,
+          op, LocalPrimitiveKind::IQ1MI8,
           {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
            op.getActivation()},
           {op.getActivationScale(), op.getInit()});
     });
     kernel.walk([&](Q6KI8DotOp op) {
       prepareQuantI8Dot(
-          op, QuantI8DotSemantic::Q6K,
+          op, LocalPrimitiveKind::Q6KI8,
           {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
@@ -1868,10 +1860,7 @@ private:
         axisProjection->find(reductionAxis.getResult());
     const StructuredProductAxisBinding *projectedRegister =
         registerAxis ? axisProjection->find(registerAxis.getResult()) : nullptr;
-    if (!projectedReduction || projectedReduction->physicalAxis != kCoreAxisK ||
-        (registerAxis &&
-         (!projectedRegister ||
-          projectedRegister->physicalAxis != kCoreAxisM))) {
+    if (!projectedReduction || (registerAxis && !projectedRegister)) {
       dot.emitError("RVV VLA dot axis projection is incomplete");
       return mlir::failure();
     }
@@ -1896,10 +1885,13 @@ private:
     decision.operation = dot.getOperation();
     decision.init = dot.getInit();
     decision.reductionAxis = reductionAxis.getResult();
+    decision.reductionMappingAxis = projectedReduction->physicalAxis;
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = rowTile;
-    if (registerAxis)
+    if (registerAxis) {
       decision.rowAxis = registerAxis.getResult();
+      decision.rowMappingAxis = projectedRegister->physicalAxis;
+    }
 
     auto analyzeOperand = [&](mlir::Value value,
                               llvm::ArrayRef<mlir::Value> logicalAxes,
@@ -2004,6 +1996,7 @@ private:
         extent && *extent >= 0)
       candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
     candidateFacts.mapping = axisProjection->mapping;
+    candidateFacts.reductionAxis = projectedReduction->physicalAxis;
     candidateFacts.lhsAxes.append(axisProjection->lhsAxes.begin(),
                                   axisProjection->lhsAxes.end());
     candidateFacts.rhsAxes.append(axisProjection->rhsAxes.begin(),
@@ -2839,7 +2832,7 @@ private:
     candidateFacts.dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
     candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{kCoreAxisVLA, LogicalAxisRole::Free,
+        LogicalAxisConstraint{0, LogicalAxisRole::Free,
                               std::nullopt, false, true, true, {1}}};
     candidateFacts.mapping.laneSEW = candidateFacts.dataSEW;
     candidateFacts.mapping.laneInstruction =
@@ -2893,6 +2886,15 @@ private:
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
     decision.mapping = entity.mapping;
+    auto selectedElementShape = [&](unsigned sew) -> RVVVectorShape {
+      auto found = llvm::find_if(
+          selected->elementShapes,
+          [&](const VLAElementPhysicalShape &physical) {
+            return physical.sew == sew;
+          });
+      return found == selected->elementShapes.end() ? RVVVectorShape{}
+                                                    : found->shape;
+    };
     if (needsF32MathImplementation) {
       std::optional<LocalImplementation> implementation =
           selectF32MathLocalImplementation(entity.mapping, options.target);
@@ -2905,10 +2907,7 @@ private:
     }
     narrowPhysical = selected->narrow;
     for (VLASegment2Decision &segment : decision.segment2) {
-      segment.vectorShape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, segment.elementSEW,
-                               options.target)
-              .value_or(RVVVectorShape{});
+      segment.vectorShape = selectedElementShape(segment.elementSEW);
       if (!segment.vectorShape ||
           !options.target.supportsSegmentVectorMemory(
               segment.fields, segment.vectorShape.sew,
@@ -2941,11 +2940,7 @@ private:
                          ? 8
                      : element.isUnsignedInteger(32) ? 32
                                                      : 0;
-      return sew == 0
-                 ? RVVVectorShape{}
-                 : rvvShapeForSameLanes(entity.mapping.laneShape, sew,
-                                        options.target)
-                       .value_or(RVVVectorShape{});
+      return sew == 0 ? RVVVectorShape{} : selectedElementShape(sew);
     };
     for (mlir::Operation *operation : physicalOperations) {
       for (mlir::Value operand : operation->getOperands())
@@ -3103,14 +3098,13 @@ private:
                                 ? 8
                                 : 32;
       access.elementBytes = elementSEW / 8;
-      RVVVectorShape elementShape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, elementSEW, options.target)
-              .value_or(RVVVectorShape{});
+      RVVVectorShape elementShape = selectedElementShape(elementSEW);
       if (!elementShape) {
         access.operation->emitError(
             "VLA memory element exceeds the legal RVV LMUL range");
         return mlir::failure();
       }
+      access.elementShape = elementShape;
       if (auto load = mlir::dyn_cast<LoadOp>(access.operation)) {
         if (mlir::failed(requireMappedValueShape(
                 access.operation, entity, load.getResult(), elementShape)))
@@ -3156,20 +3150,17 @@ private:
 
     for (VLALookupDecision &lookup : decision.lookups) {
       auto operation = mlir::cast<LookupOp>(lookup.operation);
-      RVVVectorShape codeShape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, 8, options.target)
-              .value_or(RVVVectorShape{});
-      RVVVectorShape index16Shape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, 16, options.target)
-              .value_or(RVVVectorShape{});
-      RVVVectorShape index32Shape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, 32, options.target)
-              .value_or(RVVVectorShape{});
+      RVVVectorShape codeShape = selectedElementShape(8);
+      RVVVectorShape index16Shape = selectedElementShape(16);
+      RVVVectorShape index32Shape = selectedElementShape(32);
       if (!codeShape || !index16Shape || !index32Shape) {
         lookup.operation->emitError(
             "RVV VLA lookup has no legal typed value shapes");
         return mlir::failure();
       }
+      lookup.codeShape = codeShape;
+      lookup.index16Shape = index16Shape;
+      lookup.index32Shape = index32Shape;
       auto bindLookupValue = [&](mlir::Value value,
                                  RVVVectorShape shape) -> mlir::LogicalResult {
         if (isRegionValue(value.getType()))
@@ -3194,15 +3185,13 @@ private:
       if (predicate.realization !=
           VLAPredicateRealization::RVVVectorScalar)
         continue;
-      RVVVectorShape predicateShape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, predicate.vectorSEW,
-                               options.target)
-              .value_or(RVVVectorShape{});
+      RVVVectorShape predicateShape = selectedElementShape(predicate.vectorSEW);
       if (!predicateShape) {
         predicate.operation->emitError(
             "typed VLA predicate has no legal selected vector shape");
         return mlir::failure();
       }
+      predicate.vectorShape = predicateShape;
       if (mlir::failed(requireMappedValueShape(
               predicate.operation, entity, predicate.coordinate,
               predicateShape)))
@@ -3531,7 +3520,7 @@ private:
       return mlir::failure();
     const SelectedSortIndicesPhysical &decision = found->second.realization;
     const PhysicalAxisDecomposition *orderedAxis =
-        findAxisMapping(decision.mapping, kCoreAxisBlock);
+        findUniqueAxisMapping(decision.mapping, LogicalAxisRole::Free);
     if (decision.mapping.instruction != CoreInstructionKind::Scalar ||
         !orderedAxis || !orderedAxis->ordered || orderedAxis->laneFactor != 1 ||
         orderedAxis->registerFactor != 1 ||
@@ -4197,10 +4186,12 @@ private:
     const VLARegionDecision &decision = selected->second.realization;
     const PhysicalEntityPlan &entity = selected->second.entity;
     const PhysicalAxisDecomposition *vlaAxis =
-        findAxisMapping(entity.mapping, kCoreAxisVLA);
+        entity.mapping.laneAxis
+            ? findAxisMapping(entity.mapping, *entity.mapping.laneAxis)
+            : nullptr;
     std::optional<unsigned> dataLMUL = rvvIntegerLMUL(entity.mapping.laneShape);
-    if (entity.mapping.laneAxis != std::optional<unsigned>(kCoreAxisVLA) ||
-        !vlaAxis || vlaAxis->laneFactor == 0 || !dataLMUL ||
+    if (!entity.mapping.laneAxis || !vlaAxis || vlaAxis->laneFactor == 0 ||
+        !dataLMUL ||
         entity.vlaMaskRatio == 0)
       return op.emitError("VLA entity has no selected data or mask shape");
     const std::string dataType =
@@ -4980,12 +4971,9 @@ private:
       CValue scalar = require(decision->scalar);
       if (decision->realization ==
           VLAPredicateRealization::RVVVectorScalar) {
-        const PhysicalValueDecision *vectorShape =
-            findVLAValueDecision(decision->coordinate);
         const PhysicalHandoffDecision *handoff =
             findVLAHandoff(op.getOperation(), decision->coordinate);
-        std::string shapeSuffix =
-            vectorShape ? rvvShapeSuffix(vectorShape->shape) : std::string{};
+        std::string shapeSuffix = rvvShapeSuffix(decision->vectorShape);
         bool indexVector =
             elementType(decision->coordinate.getType()).isIndex();
         CValueKind expected = indexVector
@@ -4995,10 +4983,10 @@ private:
                                         : CValueKind::F32Vector;
         if (coordinate.kind != expected || scalar.kind != CValueKind::Scalar ||
             coordinate.spelling.empty() || scalar.spelling.empty() ||
-            shapeSuffix.empty() || !handoff ||
+            !decision->vectorShape || shapeSuffix.empty() || !handoff ||
             handoff->kind != PhysicalHandoff::Share ||
-            handoff->sourceShape != vectorShape->shape ||
-            handoff->resultShape != vectorShape->shape || !activePhysicalEntity ||
+            handoff->sourceShape != decision->vectorShape ||
+            handoff->resultShape != decision->vectorShape || !activePhysicalEntity ||
             activePhysicalEntity->vlaMaskRatio == 0)
           return op.emitError("typed VLA predicate projection is unavailable");
         std::string vectorSuffix;
@@ -5647,12 +5635,14 @@ private:
             ? findAxisMapping(decision.mapping, *decision.mapping.laneAxis)
             : nullptr;
     const PhysicalAxisDecomposition *mAxis =
-        findAxisMapping(decision.mapping, kCoreAxisM);
+        decision.rowMappingAxis
+            ? findAxisMapping(decision.mapping, *decision.rowMappingAxis)
+            : nullptr;
     const PhysicalAxisDecomposition *reductionAxis =
-        findAxisMapping(decision.mapping, kCoreAxisK);
+        findAxisMapping(decision.mapping, decision.reductionMappingAxis);
     if (!lmul || dotShape.sew != 32 || !activePhysicalEntity ||
         dotShape != decision.mapping.laneShape ||
-        !laneAxis || laneAxis->id != kCoreAxisN || !reductionAxis ||
+        !laneAxis || !reductionAxis ||
         reductionAxis->unrollFactor == 0 ||
         decision.mapping.pipeline.bufferCount != 1 ||
         (mAxis && (mAxis->registerFactor == 0 || !decision.rowAxis)))
@@ -5819,25 +5809,11 @@ private:
   projectStructuredProductAxes(const StructuredProductFacts &product,
                                mlir::Value laneCoordinate = {}) {
     StructuredProductAxisProjection projection;
-    unsigned nextPhysicalAxis = kCoreAxisBlock + 1;
-    auto physicalAxisAvailable = [&](unsigned physicalAxis) {
-      return llvm::none_of(
-          projection.bindings,
-          [&](const StructuredProductAxisBinding &binding) {
-            return binding.physicalAxis == physicalAxis;
-          });
-    };
-    auto nextAvailablePhysicalAxis = [&]() {
-      while (!physicalAxisAvailable(nextPhysicalAxis))
-        ++nextPhysicalAxis;
-      return nextPhysicalAxis++;
-    };
-    auto addAxis = [&](mlir::Value coordinate, unsigned physicalAxis,
+    unsigned nextPhysicalAxis = 0;
+    auto addAxis = [&](mlir::Value coordinate,
                        LogicalAxisRole role) -> bool {
       if (projection.find(coordinate))
         return true;
-      if (!physicalAxisAvailable(physicalAxis))
-        return false;
       auto logical = kernelFacts.axes.find(coordinate);
       if (logical == kernelFacts.axes.end())
         return false;
@@ -5850,7 +5826,7 @@ private:
           extent = static_cast<uint64_t>(*value);
       }
       LogicalAxisConstraint constraint;
-      constraint.id = physicalAxis;
+      constraint.id = nextPhysicalAxis++;
       constraint.role = role;
       constraint.extent = extent;
       constraint.registerFactors = {1};
@@ -5861,73 +5837,35 @@ private:
             registerFactorCandidates(*extent, maximum);
       }
       projection.bindings.push_back(
-          StructuredProductAxisBinding{coordinate, physicalAxis, role, extent});
+          StructuredProductAxisBinding{coordinate, constraint.id, role, extent});
       projection.mapping.axes.push_back(std::move(constraint));
       return true;
     };
 
+    for (mlir::Value coordinate : product.resultAxes)
+      if (!addAxis(coordinate, LogicalAxisRole::Free))
+        return std::nullopt;
+
+    for (mlir::Value coordinate : product.reductionAxes) {
+      if (!addAxis(coordinate, LogicalAxisRole::Reduction))
+        return std::nullopt;
+      const StructuredProductAxisBinding *binding = projection.find(coordinate);
+      if (!binding)
+        return std::nullopt;
+      if (!projection.mapping.unrollAxis)
+        projection.mapping.unrollAxis = binding->physicalAxis;
+    }
+
     if (laneCoordinate) {
       if (!llvm::is_contained(product.resultAxes, laneCoordinate) ||
           (!llvm::is_contained(product.lhsFreeAxes, laneCoordinate) &&
-           !llvm::is_contained(product.rhsFreeAxes, laneCoordinate)) ||
-          !addAxis(laneCoordinate, kCoreAxisN, LogicalAxisRole::Free))
+           !llvm::is_contained(product.rhsFreeAxes, laneCoordinate)))
         return std::nullopt;
       LogicalAxisConstraint *lane = projection.findConstraint(laneCoordinate);
       if (!lane)
         return std::nullopt;
       lane->allowLane = true;
       lane->requireLane = true;
-      bool assignedRegisterAxis = false;
-      for (mlir::Value coordinate : product.resultAxes) {
-        if (coordinate == laneCoordinate)
-          continue;
-        const unsigned physicalAxis =
-            !assignedRegisterAxis && physicalAxisAvailable(kCoreAxisM)
-                ? kCoreAxisM
-                : nextAvailablePhysicalAxis();
-        assignedRegisterAxis = true;
-        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
-          return std::nullopt;
-      }
-    } else {
-      bool assignedLHSFreeAxis = false;
-      for (mlir::Value coordinate : product.lhsFreeAxes) {
-        const unsigned physicalAxis =
-            !assignedLHSFreeAxis && physicalAxisAvailable(kCoreAxisM)
-                ? kCoreAxisM
-                : nextAvailablePhysicalAxis();
-        assignedLHSFreeAxis = true;
-        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
-          return std::nullopt;
-      }
-      bool assignedRHSFreeAxis = false;
-      for (mlir::Value coordinate : product.rhsFreeAxes) {
-        const unsigned physicalAxis =
-            !assignedRHSFreeAxis && physicalAxisAvailable(kCoreAxisN)
-                ? kCoreAxisN
-                : nextAvailablePhysicalAxis();
-        assignedRHSFreeAxis = true;
-        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
-          return std::nullopt;
-      }
-      for (mlir::Value coordinate : product.resultAxes)
-        if (!projection.find(coordinate) &&
-            !addAxis(coordinate, nextAvailablePhysicalAxis(),
-                     LogicalAxisRole::Free))
-          return std::nullopt;
-    }
-
-    bool assignedReductionAxis = false;
-    for (mlir::Value coordinate : product.reductionAxes) {
-      const unsigned physicalAxis =
-          !assignedReductionAxis && physicalAxisAvailable(kCoreAxisK)
-              ? kCoreAxisK
-              : nextAvailablePhysicalAxis();
-      assignedReductionAxis = true;
-      if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Reduction))
-        return std::nullopt;
-      if (!projection.mapping.unrollAxis)
-        projection.mapping.unrollAxis = physicalAxis;
     }
 
     auto projectAxes = [&](llvm::ArrayRef<mlir::Value> logicalAxes,
@@ -5942,7 +5880,8 @@ private:
     };
     if (!projectAxes(product.lhsAxes, projection.lhsAxes) ||
         !projectAxes(product.rhsAxes, projection.rhsAxes) ||
-        !projectAxes(product.resultAxes, projection.resultAxes))
+        !projectAxes(product.resultAxes, projection.resultAxes) ||
+        !projectAxes(product.reductionAxes, projection.reductionAxes))
       return std::nullopt;
 
     llvm::sort(projection.bindings,
@@ -6099,7 +6038,6 @@ private:
             LaneRelation::Independent;
     if (!row || !reduction || !rowAxis || !reductionAxis || !projectedRow ||
         !projectedReduction || !reductionConstraint ||
-        projectedReduction->physicalAxis != kCoreAxisK ||
         !row->staticExtent ||
         *row->staticExtent > std::numeric_limits<unsigned>::max() ||
         !rowMemoryLegal ||
@@ -6133,6 +6071,7 @@ private:
     decision.rowAxis = rowAxis.getResult();
     decision.rowMappingAxis = projectedRow->physicalAxis;
     decision.reductionAxis = reductionAxis.getResult();
+    decision.reductionMappingAxis = projectedReduction->physicalAxis;
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = rowExtent;
     for (const LocalDotOperandDecision *operand :
@@ -6157,6 +6096,7 @@ private:
     reductionConstraint->allowLane = true;
     reductionConstraint->requireLane = true;
     candidateFacts.mapping = axisProjection->mapping;
+    candidateFacts.reductionAxis = projectedReduction->physicalAxis;
     candidateFacts.lhsAxes.append(axisProjection->lhsAxes.begin(),
                                   axisProjection->lhsAxes.end());
     candidateFacts.rhsAxes.append(axisProjection->rhsAxes.begin(),
@@ -6237,7 +6177,7 @@ private:
     const PhysicalAxisDecomposition *rowMapping =
         findAxisMapping(decision.mapping, decision.rowMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
-        findAxisMapping(decision.mapping, kCoreAxisK);
+        findAxisMapping(decision.mapping, decision.reductionMappingAxis);
     if (!lmul || resultShape->shape.sew != 32 ||
         resultShape->shape != decision.mapping.laneShape || !rowMapping ||
         !kAxis || rowMapping->role != LogicalAxisRole::Free ||
@@ -6531,9 +6471,9 @@ private:
       std::string name = fresh("load");
       const PhysicalValueDecision *valueShape =
           findVLAValueDecision(op.getResult());
-      std::string shapeSuffix =
-          valueShape ? rvvShapeSuffix(valueShape->shape) : std::string{};
-      if (!valueShape || shapeSuffix.empty())
+      std::string shapeSuffix = rvvShapeSuffix(decision->elementShape);
+      if (!decision->elementShape || !valueShape ||
+          valueShape->shape != decision->elementShape || shapeSuffix.empty())
         return op.emitError("VLA load has no selected vector shape");
       CValue indexedOffset;
       if (decision->memoryMode == PhysicalMemoryMode::Indexed) {
@@ -6549,7 +6489,7 @@ private:
           return op.emitError(
               "indexed VLA load physical handoff is incomplete");
       }
-      unsigned elementSEW = valueShape->shape.sew;
+      unsigned elementSEW = decision->elementShape.sew;
       if (decision->memoryMode == PhysicalMemoryMode::Segment2) {
         const VLASegment2Decision *segment =
             findSegment2AccessDecision(op.getOperation());
@@ -6842,22 +6782,26 @@ private:
     };
     const PhysicalTemporaryDecision *index16 = findTemporary(16);
     const PhysicalTemporaryDecision *index32 = findTemporary(32);
-    if (!indexHandoff || indexHandoff->kind != PhysicalHandoff::Convert ||
-        !codeValue || codeValue->shape != indexHandoff->sourceShape ||
-        indexHandoff->sourceShape != codeValue->shape ||
-        !index32 || indexHandoff->resultShape != index32->shape ||
+    if (!decision->codeShape || !decision->index16Shape ||
+        !decision->index32Shape || !indexHandoff ||
+        indexHandoff->kind != PhysicalHandoff::Convert || !codeValue ||
+        codeValue->shape != decision->codeShape ||
+        indexHandoff->sourceShape != decision->codeShape || !index32 ||
+        index32->shape != decision->index32Shape ||
+        indexHandoff->resultShape != decision->index32Shape ||
         !tableHandoff || tableHandoff->kind != PhysicalHandoff::Reload ||
-        !tableValue || tableValue->shape != index32->shape ||
+        !tableValue || tableValue->shape != decision->index32Shape ||
         tableHandoff->sourceShape != tableValue->shape ||
         tableHandoff->resultShape != tableValue->shape ||
-        !resultValue || resultValue->shape != index32->shape || !index16)
+        !resultValue || resultValue->shape != decision->index32Shape ||
+        !index16 || index16->shape != decision->index16Shape)
       return op.emitError("VLA lookup handoff plan is incomplete");
-    std::string index16Suffix = rvvShapeSuffix(index16->shape);
-    std::string index32Suffix = rvvShapeSuffix(index32->shape);
-    std::string tableSuffix = rvvShapeSuffix(tableValue->shape);
-    std::string resultSuffix = rvvShapeSuffix(resultValue->shape);
-    if (index16->shape.sew != 16 || index32->shape.sew != 32 ||
-        tableValue->shape.sew != 32 || resultValue->shape.sew != 32 ||
+    std::string index16Suffix = rvvShapeSuffix(decision->index16Shape);
+    std::string index32Suffix = rvvShapeSuffix(decision->index32Shape);
+    std::string tableSuffix = rvvShapeSuffix(decision->index32Shape);
+    std::string resultSuffix = rvvShapeSuffix(decision->index32Shape);
+    if (decision->index16Shape.sew != 16 ||
+        decision->index32Shape.sew != 32 ||
         index16Suffix.empty() ||
         index32Suffix.empty() || tableSuffix.empty() || resultSuffix.empty())
       return op.emitError("VLA lookup shapes have no RVV spelling");
@@ -6881,8 +6825,8 @@ private:
          " = __riscv_vrgather_vv_f" + resultSuffix + "(" + table + ", " +
          indices32 + ", " + activeVL + ");");
     CValue result{op.getResult().getType(), CValueKind::F32Vector, gathered};
-    result.vectorSEW = resultValue->shape.sew;
-    result.vectorLMUL = rvvIntegerLMUL(resultValue->shape).value_or(0);
+    result.vectorSEW = decision->index32Shape.sew;
+    result.vectorLMUL = rvvIntegerLMUL(decision->index32Shape).value_or(0);
     values[op.getResult()] = std::move(result);
     return mlir::success();
   }
@@ -6895,9 +6839,10 @@ private:
       const PhysicalHandoffDecision *handoff =
           findVLAHandoff(op.getOperation(), op.getValue());
       std::optional<unsigned> selectedLMUL =
-          handoff ? rvvIntegerLMUL(handoff->resultShape) : std::nullopt;
+          decision ? rvvIntegerLMUL(decision->elementShape) : std::nullopt;
       if (!decision || !handoff || !selectedLMUL ||
           !decision->elementType.isF32() || !decision->bundleAxis ||
+          handoff->resultShape != decision->elementShape ||
           decision->bundleVectors != value.fields.size() ||
           decision->activityMode == PhysicalActivityMode::PredicateMask ||
           (decision->memoryMode != PhysicalMemoryMode::UnitStride &&
@@ -6962,11 +6907,11 @@ private:
         return op.emitError("VLA store element realization is unavailable");
       const PhysicalHandoffDecision *handoff =
           findVLAHandoff(op.getOperation(), op.getValue());
-      std::string shapeSuffix =
-          handoff ? rvvShapeSuffix(handoff->resultShape) : std::string{};
-      if (!handoff || shapeSuffix.empty())
+      std::string shapeSuffix = rvvShapeSuffix(decision->elementShape);
+      if (!decision->elementShape || !handoff ||
+          handoff->resultShape != decision->elementShape || shapeSuffix.empty())
         return op.emitError("VLA store has no physical value handoff");
-      unsigned elementSEW = handoff->resultShape.sew;
+      unsigned elementSEW = decision->elementShape.sew;
 
       std::string vector = value.spelling;
       CValueKind expectedKind = f32   ? CValueKind::F32Vector
@@ -7617,7 +7562,7 @@ private:
         return op.emitError(
             "materialized rank-one f32 store requires one bounded typed local axis");
       facts.mapping.axes = {LogicalAxisConstraint{
-          kCoreAxisN, LogicalAxisRole::Free,
+          0, LogicalAxisRole::Free,
           static_cast<uint64_t>(*elements), false, false, false, {1}}};
       facts.prefixPredicated =
           isContiguousPrefixPredicate(op.getWhere(), axis.getResult());
@@ -7642,10 +7587,10 @@ private:
         return op.emitError(
             "materialized rank-two f32 store requires bounded typed local axes");
       facts.mapping.axes = {
-          LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free,
+          LogicalAxisConstraint{0, LogicalAxisRole::Free,
                                 static_cast<uint64_t>(*rows), false, false,
                                 false, {1}},
-          LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free,
+          LogicalAxisConstraint{1, LogicalAxisRole::Free,
                                 static_cast<uint64_t>(*columns), false, false,
                                 false, {1}}};
       facts.prefixPredicated =
@@ -7918,7 +7863,8 @@ private:
       OpTy op, PlannedPhysicalDecision<TernaryI8Decision> &planned) const {
     initializeEntityPlan(planned.entity);
     const TernaryI8Decision &decision = planned.realization;
-    if (decision.physical.decode == TernaryDecodeTopology::Base3Digits) {
+    if (decision.physical.implementation.primitive ==
+        LocalPrimitiveKind::Base3TernaryI8) {
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[0]},
                               decision.physical.primarySourceShape);
       recordLocalBlockReloads(planned, op.getOperation(), {decision.blocks[1]},
@@ -8045,8 +7991,14 @@ private:
         return op.emitError(
             "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
+    I4I8FragmentCandidateFacts candidateFacts;
+    candidateFacts.mapping = *mapping;
+    candidateFacts.affine = false;
+    candidateFacts.rowsAxis = 0;
+    candidateFacts.columnsAxis = 1;
+    candidateFacts.reductionAxis = 2;
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({*mapping, false}, options.target);
+        selectI4I8FragmentPhysical(candidateFacts, options.target);
     if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
@@ -8320,7 +8272,9 @@ private:
     const bool rankOneVector = decision.mapping.axes.size() == 1;
     const bool rankTwoVector = decision.mapping.axes.size() == 2;
     const PhysicalAxisDecomposition *laneAxis =
-        findAxisMapping(decision.mapping, kCoreAxisN);
+        decision.mapping.laneAxis
+            ? findAxisMapping(decision.mapping, *decision.mapping.laneAxis)
+            : nullptr;
     if (decision.mapping.instruction != CoreInstructionKind::RVVElementwise ||
         (!rankOneVector && !rankTwoVector) || !decision.mapping.laneShape ||
         !laneAxis || laneAxis->laneFactor == 0)
@@ -8687,7 +8641,7 @@ private:
 
   template <typename OpTy>
   mlir::LogicalResult decideTernaryI8Dot(
-      OpTy op, TernaryI8DotSemantic semantic,
+      OpTy op, LocalPrimitiveKind primitive,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars, TernaryI8Decision &decision) {
     decision = TernaryI8Decision{};
@@ -8700,8 +8654,8 @@ private:
       decision.blocks.push_back(*fact);
     }
     TernaryI8DotCandidateFacts facts;
-    facts.semantic = semantic;
-    if (semantic == TernaryI8DotSemantic::Base3Digits) {
+    facts.primitive = primitive;
+    if (primitive == LocalPrimitiveKind::Base3TernaryI8) {
       if (decision.blocks.size() != 3)
         return op.emitError("base3 ternary/i8 dot requires three block operands");
       facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
@@ -8709,13 +8663,14 @@ private:
           static_cast<unsigned>(decision.blocks[1].semanticExtent);
       facts.mapping = localReductionMapping(
           static_cast<uint64_t>(decision.blocks[2].semanticExtent));
-    } else {
+    } else if (primitive == LocalPrimitiveKind::PackedI2TernaryI8) {
       if (decision.blocks.size() != 2)
         return op.emitError("packed ternary/i8 dot requires two block operands");
       facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
       facts.mapping = localReductionMapping(
           static_cast<uint64_t>(decision.blocks[1].semanticExtent));
-    }
+    } else
+      return op.emitError("ternary/i8 op has no explicit primitive rule");
     std::optional<SelectedTernaryI8DotPhysical> selected =
         weft::riscv_internal::selectTernaryI8DotPhysical(facts, options.target);
     if (!selected)
@@ -9132,7 +9087,7 @@ private:
 
   template <typename OpTy>
   mlir::LogicalResult decideQuantI8Dot(
-      OpTy op, QuantI8DotSemantic semantic,
+      OpTy op, LocalPrimitiveKind primitive,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
       QuantI8DotDecision &decision) {
@@ -9151,7 +9106,7 @@ private:
             QuantI8DotCandidateFacts{
                 localReductionMapping(static_cast<uint64_t>(
                     decision.blocks.back().semanticExtent)),
-                semantic},
+                primitive},
             options.target);
     if (!selected)
       return op.emitError(
@@ -9239,8 +9194,14 @@ private:
         return op.emitError(
             "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
+    I4I8FragmentCandidateFacts candidateFacts;
+    candidateFacts.mapping = *mapping;
+    candidateFacts.affine = true;
+    candidateFacts.rowsAxis = 0;
+    candidateFacts.columnsAxis = 1;
+    candidateFacts.reductionAxis = 2;
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({*mapping, true}, options.target);
+        selectI4I8FragmentPhysical(candidateFacts, options.target);
     if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");
@@ -9403,9 +9364,7 @@ private:
     if (!lhsFree || !rhsFree || !reduction || !lhsFreeAxis ||
         !rhsFreeAxis || !reductionAxis || !projectedLHSFree ||
         !projectedRHSFree || !projectedReduction || !nConstraint ||
-        !kConstraint || projectedLHSFree->physicalAxis != kCoreAxisM ||
-        projectedRHSFree->physicalAxis != kCoreAxisN ||
-        projectedReduction->physicalAxis != kCoreAxisK ||
+        !kConstraint ||
         !lhsFree->staticExtent ||
         !rhsFree->staticExtent || !reduction->staticExtent ||
         *lhsFree->staticExtent > std::numeric_limits<unsigned>::max() ||
@@ -9443,6 +9402,9 @@ private:
     decision.lhsReductionAxis = reductionCoordinate;
     decision.rhsReductionAxis = reductionCoordinate;
     decision.rhsColumnAxis = rhsFreeCoordinate;
+    decision.lhsFreeMappingAxis = projectedLHSFree->physicalAxis;
+    decision.rhsFreeMappingAxis = projectedRHSFree->physicalAxis;
+    decision.reductionMappingAxis = projectedReduction->physicalAxis;
     decision.rowTile = rowTile;
     decision.columnTile = columnTile;
     decision.reductionTile = reductionTile;
@@ -9455,6 +9417,9 @@ private:
     nConstraint->allowLane = rhsColumnLegal;
     kConstraint->allowLane = true;
     candidateFacts.mapping = axisProjection->mapping;
+    candidateFacts.lhsFreeAxis = projectedLHSFree->physicalAxis;
+    candidateFacts.rhsFreeAxis = projectedRHSFree->physicalAxis;
+    candidateFacts.reductionAxis = projectedReduction->physicalAxis;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
         {matmul.getLhs(), matmul.getRhs()},
@@ -9466,8 +9431,7 @@ private:
             candidateFacts, options.target, options.backend);
     if (!selected)
       return std::nullopt;
-    std::optional<RVVVectorShape> computeShape = rvvShapeForSameLanes(
-        selected->mapping.laneShape, 32, options.target);
+    RVVVectorShape computeShape = selected->accumulatorShape;
     if (!computeShape)
       return std::nullopt;
     decision.mapping = selected->mapping;
@@ -9482,18 +9446,18 @@ private:
     RVVVectorShape inputShape = selected->mapping.laneShape;
     recordPhysicalValue(planned.entity, matmul.getLhs(), inputShape);
     recordPhysicalValue(planned.entity, matmul.getRhs(), inputShape);
-    recordPhysicalValue(planned.entity, matmul.getInit(), *computeShape);
-    recordPhysicalValue(planned.entity, matmul.getResult(), *computeShape);
+    recordPhysicalValue(planned.entity, matmul.getInit(), computeShape);
+    recordPhysicalValue(planned.entity, matmul.getResult(), computeShape);
     recordPhysicalHandoff(planned.entity, matmul.getOperation(), matmul.getLhs(),
                           PhysicalHandoff::Reload, inputShape, inputShape);
     recordPhysicalHandoff(planned.entity, matmul.getOperation(), matmul.getRhs(),
                           PhysicalHandoff::Reload, inputShape, inputShape);
     recordPhysicalHandoff(planned.entity, matmul.getOperation(), matmul.getInit(),
-                          PhysicalHandoff::LocalPack, *computeShape,
-                          *computeShape);
+                          PhysicalHandoff::LocalPack, computeShape,
+                          computeShape);
     recordPhysicalHandoff(planned.entity, matmul.getOperation(),
                           matmul.getResult(), PhysicalHandoff::LocalPack,
-                          *computeShape, *computeShape);
+                          computeShape, computeShape);
     planned.entity.storages.push_back(std::move(*resultStorage));
     planned.entity.resources = selected->resources;
     return planned;
@@ -9504,12 +9468,13 @@ private:
       const PhysicalStorageDecision &resultStorage, const CValue &accumulator,
       unsigned inputLMUL, unsigned computeLMUL) {
     const PhysicalAxisDecomposition *mAxis =
-        findAxisMapping(decision.mapping, kCoreAxisM);
+        findAxisMapping(decision.mapping, decision.lhsFreeMappingAxis);
     const PhysicalAxisDecomposition *nAxis =
-        findAxisMapping(decision.mapping, kCoreAxisN);
+        findAxisMapping(decision.mapping, decision.rhsFreeMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
-        findAxisMapping(decision.mapping, kCoreAxisK);
-    if (decision.mapping.laneAxis != std::optional<unsigned>(kCoreAxisN) ||
+        findAxisMapping(decision.mapping, decision.reductionMappingAxis);
+    if (decision.mapping.laneAxis !=
+            std::optional<unsigned>(decision.rhsFreeMappingAxis) ||
         !mAxis || !nAxis ||
         !kAxis || nAxis->laneFactor == 0 || nAxis->registerFactor != 1 ||
         kAxis->laneFactor != 1 || kAxis->unrollFactor == 0 ||
@@ -9673,11 +9638,11 @@ private:
     const F16GemmNTileDecision &decision = prepared->second.realization;
     const PhysicalEntityPlan &entity = prepared->second.entity;
     const PhysicalAxisDecomposition *mAxis =
-        findAxisMapping(decision.mapping, kCoreAxisM);
+        findAxisMapping(decision.mapping, decision.lhsFreeMappingAxis);
     const PhysicalAxisDecomposition *nAxis =
-        findAxisMapping(decision.mapping, kCoreAxisN);
+        findAxisMapping(decision.mapping, decision.rhsFreeMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
-        findAxisMapping(decision.mapping, kCoreAxisK);
+        findAxisMapping(decision.mapping, decision.reductionMappingAxis);
     if (!mAxis || !nAxis || !kAxis || mAxis->registerFactor == 0 ||
         nAxis->registerFactor == 0 || kAxis->unrollFactor == 0 ||
         decision.mapping.pipeline.bufferCount == 0)
@@ -9728,10 +9693,12 @@ private:
     if (accumulator.kind != CValueKind::F32BlockStorage ||
         accumulator.spelling.empty())
       return op.emitError("F16 matmul accumulator storage is unavailable");
-    if (decision.mapping.laneAxis == std::optional<unsigned>(kCoreAxisN))
+    if (decision.mapping.laneAxis ==
+        std::optional<unsigned>(decision.rhsFreeMappingAxis))
       return emitF16MatmulColumnLane(op, decision, *resultStorage, accumulator,
                                      *inputLMUL, *computeLMUL);
-    if (decision.mapping.laneAxis != std::optional<unsigned>(kCoreAxisK))
+    if (decision.mapping.laneAxis !=
+        std::optional<unsigned>(decision.reductionMappingAxis))
       return op.emitError("F16 matmul lane axis has no intrinsic-C projection");
     LoadOp lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     LoadOp rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
@@ -11246,7 +11213,9 @@ private:
 
   bool supportsBlockByteShape(mlir::Operation *operation,
                               RVVVectorShape byteShape) const {
-    if (byteShape == kRVVE8MF4)
+    if (!byteShape || byteShape.sew != 8)
+      return false;
+    if (byteShape.lmulEighths < 8)
       return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CastOp>(
           operation);
     return mlir::isa<BlockIndexOp, PtrAddOp, LoadOp, BinaryOp, CompareOp,
@@ -11316,25 +11285,18 @@ private:
     decision.extent = *extent;
     const bool needsLaneVector =
         blockValueSliceNeedsLaneVector(axis, valueSlice);
-    const bool supportsMicroStripOperations =
-        llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
-          return supportsBlockByteShape(operation, kRVVE8MF4);
-        });
-    const bool supportsStandardOperations =
-        llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
-          return supportsBlockByteShape(operation, kRVVE8M1);
-        });
     CoreMappingProblem mapping;
     mapping.axes = {LogicalAxisConstraint{
-        kCoreAxisBlock, LogicalAxisRole::Free,
+        0, LogicalAxisRole::Free,
         static_cast<uint64_t>(*extent), false, true, true,
         registerFactorCandidates(static_cast<uint64_t>(*extent), 8)}};
     mapping.laneSEW = 8;
     mapping.laneInstruction = CoreInstructionKind::RVVElementwise;
-    if (supportsMicroStripOperations)
-      mapping.laneShapeCandidates.push_back(kRVVE8MF4);
-    if (supportsStandardOperations)
-      mapping.laneShapeCandidates.push_back(kRVVE8M1);
+    for (RVVVectorShape shape : rvvShapeCandidates(options.target, 8))
+      if (llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
+            return supportsBlockByteShape(operation, shape);
+          }))
+        mapping.laneShapeCandidates.push_back(shape);
     std::optional<SelectedBlockStorePhysical> selected =
         selectBlockStorePhysical({std::move(mapping), needsLaneVector},
                                  options.target);
@@ -11429,12 +11391,33 @@ private:
       plannedReductions.insert(reduction.getOperation());
     }
     decision.valueSlice.append(valueSlice.begin(), valueSlice.end());
+    const bool needsLaneVector =
+        blockValueSliceNeedsLaneVector(axis, valueSlice);
+    CoreMappingProblem mapping;
+    mapping.axes = {LogicalAxisConstraint{
+        0, LogicalAxisRole::Reduction,
+        static_cast<uint64_t>(extent), true, true, true,
+        registerFactorCandidates(static_cast<uint64_t>(extent), 2)}};
+    mapping.laneSEW = 8;
+    mapping.laneInstruction = CoreInstructionKind::RVVReduction;
+    for (RVVVectorShape shape : rvvShapeCandidates(options.target, 8))
+      if (llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
+            return supportsBlockByteShape(operation, shape);
+          }))
+        mapping.laneShapeCandidates.push_back(shape);
+    std::optional<SelectedBlockReducePhysical> selected =
+        selectBlockReducePhysical(
+            {std::move(mapping), needsLaneVector, 32},
+            options.target);
+    if (!selected)
+      return op.emitError(
+          "RVV block reduction has no legal physical resource candidate");
     PlannedPhysicalDecision<BlockReduceGroupDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
     mlir::FailureOr<llvm::SmallVector<BlockOperationDecision>> operations =
-        decideBlockOperations(valueSlice, kRVVE8M1, axis.getResult(),
-                              planned.entity);
+        decideBlockOperations(valueSlice, selected->decision.mapping.laneShape,
+                              axis.getResult(), planned.entity);
     if (mlir::failed(operations))
       return mlir::failure();
     planned.realization.operations = std::move(*operations);
@@ -11442,30 +11425,10 @@ private:
         planned.entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == op.getInput();
         });
-    if (reducedValue == planned.entity.values.end())
-      return op.emitError("block reduction input has no physical value decision");
-    const bool needsLaneVector =
-        blockValueSliceNeedsLaneVector(axis, valueSlice);
-    const bool supportsStandardOperations =
-        llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
-          return supportsBlockByteShape(operation, kRVVE8M1);
-        });
-    CoreMappingProblem mapping;
-    mapping.axes = {LogicalAxisConstraint{
-        kCoreAxisBlock, LogicalAxisRole::Reduction,
-        static_cast<uint64_t>(extent), true, true, true,
-        registerFactorCandidates(static_cast<uint64_t>(extent), 2)}};
-    mapping.laneSEW = 8;
-    mapping.laneInstruction = CoreInstructionKind::RVVReduction;
-    if (supportsStandardOperations)
-      mapping.laneShapeCandidates = {kRVVE8M1};
-    std::optional<SelectedBlockReducePhysical> selected =
-        selectBlockReducePhysical(
-            {std::move(mapping), needsLaneVector, reducedValue->shape},
-            options.target);
-    if (!selected)
+    if (reducedValue == planned.entity.values.end() ||
+        reducedValue->shape != selected->inputShape)
       return op.emitError(
-          "RVV block reduction has no legal physical resource candidate");
+          "block reduction input disagrees with its selected axis mapping");
     BlockReductionValueDecision reductionValue;
     reductionValue.operation = op.getOperation();
     reductionValue.inputShape = selected->inputShape;
@@ -11540,7 +11503,7 @@ private:
     }
     const BlockStorePhysicalDecision &physical = *entity.blockStore;
     const PhysicalAxisDecomposition *axisMapping =
-        findAxisMapping(physical.mapping, kCoreAxisBlock);
+        findUniqueAxisMapping(physical.mapping, LogicalAxisRole::Free);
     const std::string byteShape = rvvShapeSuffix(physical.mapping.laneShape);
     if (!axisMapping || physical.mapping.laneShape.sew != 8 ||
         byteShape.empty() || axisMapping->laneFactor == 0 ||
@@ -11708,7 +11671,7 @@ private:
       return op.emitError("block reduction physical handoff is incomplete");
     const BlockReducePhysicalDecision &physical = *entity.blockReduce;
     const PhysicalAxisDecomposition *axisMapping =
-        findAxisMapping(physical.mapping, kCoreAxisBlock);
+        findUniqueAxisMapping(physical.mapping, LogicalAxisRole::Reduction);
     const std::string byteShape = rvvShapeSuffix(physical.mapping.laneShape);
     if (!axisMapping || physical.mapping.laneShape.sew != 8 ||
         byteShape.empty() || axisMapping->laneFactor == 0 ||

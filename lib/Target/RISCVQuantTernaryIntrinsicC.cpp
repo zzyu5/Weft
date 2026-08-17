@@ -10,7 +10,7 @@ bool emitBase3TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::Base3TernaryI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -209,11 +209,11 @@ bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 2)
     return false;
   const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape widenedShape = implementation.valueShapes[1];
   const std::string unsignedType =

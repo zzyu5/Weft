@@ -10,11 +10,11 @@ bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::IQ1MI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 6)
     return false;
   const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape indexShape = implementation.valueShapes[1];
   const RVVVectorShape tableShape = implementation.valueShapes[2];

@@ -258,11 +258,16 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
       return;
     }
     const LocalHardwareOperation &operation = implementation.operation;
+    const unsigned lanes = mappedLaneSpan(implementation.mapping);
+    const PhysicalAxisDecomposition *reduction =
+        findUniqueAxisMapping(implementation.mapping,
+                              LogicalAxisRole::Reduction);
+    const bool sequential = reduction && reduction->sequentialFactor > 1;
     if (implementation.primitive == LocalPrimitiveKind::SymmetricI4I8) {
       if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
         (operation.rows == 4 ? usesIME1SymmetricI4I8M4
                              : usesIME1SymmetricI4I8) = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVRegister)
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic)
         (operation.rows == 4 ? usesRVVSymmetricI4I8M4
                              : usesRVVSymmetricI4I8) = true;
       else
@@ -271,7 +276,7 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
       if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
         (operation.rows == 4 ? usesIME1AffineI4I8M4
                              : usesIME1AffineI4I8) = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVRegister)
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic)
         (operation.rows == 4 ? usesRVVAffineI4I8M4
                              : usesRVVAffineI4I8) = true;
       else
@@ -279,24 +284,26 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
     } else if (implementation.primitive ==
                LocalPrimitiveKind::GroupedAffineI4I8) {
       if (operation.kind == LocalHardwareOperationKind::RVVInlineAsm &&
-          operation.lanes == 16)
+          lanes == 16)
         usesGroupedI4I8RegisterL16 = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
-               operation.lanes == 32)
-        usesGroupedI4I8RegisterL32 = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
+               sequential)
         usesGroupedI4I8Strip = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
+               lanes == 32)
+        usesGroupedI4I8RegisterL32 = true;
       else
         supported = false;
     } else if (implementation.primitive ==
                LocalPrimitiveKind::E2M1E8M0I8) {
-      if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+      if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
+          sequential)
         usesE2M1Strip = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
-               operation.primaryShape == RVVVectorShape{8, 4})
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
+               implementation.mapping.laneShape == RVVVectorShape{8, 4})
         usesE2M1RegisterE8MF2 = true;
-      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
-               operation.primaryShape == kRVVE8M1)
+      else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
+               implementation.mapping.laneShape == kRVVE8M1)
         usesE2M1RegisterE8M1M2 = true;
       else
         supported = false;

@@ -14,20 +14,20 @@ bool emitPackedDotLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation,
     bool hasHighBits) {
   const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const LocalPrimitiveKind expectedPrimitive =
       hasHighBits ? LocalPrimitiveKind::PackedI5I8
                   : LocalPrimitiveKind::PackedI4I8;
   if (implementation.primitive != expectedPrimitive ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.operation.projection == LocalOperationProjection::None ||
-      implementation.valueShapes.size() < 2 || !reduction)
+      implementation.valueShapes.size() < 3 || !reduction)
     return false;
 
   const RVVVectorShape shape = implementation.mapping.laneShape;
   const RVVVectorShape decodeShape = implementation.valueShapes[1];
-  const RVVVectorShape widened{16, shape.lmulEighths * 2};
+  const RVVVectorShape widened = implementation.valueShapes[2];
   const std::string unsignedType =
       rvvVectorType(RVVElementCategory::UnsignedInteger, shape);
   const std::string signedType =
@@ -177,7 +177,7 @@ bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 4)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];

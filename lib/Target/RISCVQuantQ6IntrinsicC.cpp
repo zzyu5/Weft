@@ -131,7 +131,7 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
       (implementation.operation.kind !=
            LocalHardwareOperationKind::RVVInlineAsm &&
        implementation.operation.kind !=
-           LocalHardwareOperationKind::RVVRegister) ||
+           LocalHardwareOperationKind::RVVIntrinsic) ||
       implementation.valueShapes.size() < 4)
     return false;
   if (implementation.operation.kind ==
@@ -140,11 +140,11 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
     return true;
   }
   if (implementation.operation.kind !=
-      LocalHardwareOperationKind::RVVRegister)
+      LocalHardwareOperationKind::RVVIntrinsic)
     return false;
 
   const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape chunkShape = implementation.valueShapes[1];
   const RVVVectorShape productShape = implementation.valueShapes[2];

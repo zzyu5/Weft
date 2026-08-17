@@ -11,12 +11,12 @@ bool emitSignedCodebookLocalImplementation(
   if ((implementation.primitive != LocalPrimitiveKind::SignedCodebook8I8 &&
        implementation.primitive != LocalPrimitiveKind::SignedCodebook4I8) ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       (implementation.operation.projection !=
            LocalOperationProjection::SignSourceDirect &&
        implementation.operation.projection !=
            LocalOperationProjection::SignSourceExtend) ||
-      implementation.valueShapes.size() < 6)
+      implementation.valueShapes.size() < 7)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -24,7 +24,7 @@ bool emitSignedCodebookLocalImplementation(
   const RVVVectorShape tableShape = implementation.valueShapes[3];
   const RVVVectorShape productShape = implementation.valueShapes[4];
   const RVVVectorShape signSourceShape = implementation.valueShapes[5];
-  const RVVVectorShape signWordShape{32, signSourceShape.lmulEighths};
+  const RVVVectorShape signWordShape = implementation.valueShapes[6];
   const unsigned codeCount = 32 / implementation.entryWidth;
   const unsigned offsetShift = implementation.entryWidth == 8 ? 3 : 2;
 
@@ -146,12 +146,12 @@ bool emitPackedU9U7CodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedU9U7CodebookI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       (implementation.operation.projection !=
            LocalOperationProjection::SignSourceDirect &&
        implementation.operation.projection !=
            LocalOperationProjection::SignSourceExtend) ||
-      implementation.valueShapes.size() < 7)
+      implementation.valueShapes.size() < 8)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape wordShape = implementation.valueShapes[2];
@@ -159,7 +159,7 @@ bool emitPackedU9U7CodebookLocalImplementation(
   const RVVVectorShape productShape = implementation.valueShapes[4];
   const RVVVectorShape signSourceShape = implementation.valueShapes[5];
   const RVVVectorShape halfProductShape = implementation.valueShapes[6];
-  const RVVVectorShape signWordShape{32, signSourceShape.lmulEighths};
+  const RVVVectorShape signWordShape = implementation.valueShapes[7];
   const std::string wordType =
       rvvVectorType(RVVElementCategory::UnsignedInteger, wordShape);
   const std::string wordSuffix =
@@ -297,7 +297,7 @@ bool emitPackedU11GridDeltaLocalImplementation(
   if (implementation.primitive !=
           LocalPrimitiveKind::PackedU11GridDeltaI8 ||
       implementation.operation.kind !=
-          LocalHardwareOperationKind::RVVRegister ||
+          LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.valueShapes.size() < 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];

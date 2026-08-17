@@ -11,14 +11,6 @@
 
 namespace weft::riscv_internal {
 
-inline constexpr unsigned kCoreAxisM = 0;
-inline constexpr unsigned kCoreAxisN = 1;
-inline constexpr unsigned kCoreAxisK = 2;
-inline constexpr unsigned kCoreAxisGroup = 3;
-inline constexpr unsigned kCoreAxisPacked = 4;
-inline constexpr unsigned kCoreAxisVLA = 5;
-inline constexpr unsigned kCoreAxisBlock = 6;
-
 struct RVVVectorShape {
   unsigned sew = 0;
   int lmulEighths = 0;
@@ -94,7 +86,7 @@ enum class CoreInstructionKind {
   RVVIndexedGather,
   RVVReduction,
   RVVSegmentMemory,
-  SpacemitIME1MMA,
+  MatrixFragment,
 };
 
 struct LogicalAxisConstraint {
@@ -176,14 +168,10 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
 
 const PhysicalAxisDecomposition *
 findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis);
+const PhysicalAxisDecomposition *
+findUniqueAxisMapping(const CorePhysicalMapping &mapping,
+                      LogicalAxisRole role);
 unsigned mappedLaneSpan(const CorePhysicalMapping &mapping);
-unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping);
-unsigned mappedRegisterFactor(const CorePhysicalMapping &mapping,
-                              unsigned axis);
-unsigned mappedFragmentFactor(const CorePhysicalMapping &mapping,
-                              unsigned axis);
-bool mappedAxisHasSequentialIteration(const CorePhysicalMapping &mapping,
-                                      unsigned axis);
 
 enum class PhysicalLiveClass {
   Value,

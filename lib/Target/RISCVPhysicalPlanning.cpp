@@ -22,27 +22,6 @@ static unsigned localLaneFactor(const LocalImplementation &implementation) {
   return axis ? axis->laneFactor * axis->registerFactor : 0;
 }
 
-static unsigned localRegisterFactor(const LocalImplementation &implementation,
-                                    unsigned axis) {
-  const PhysicalAxisDecomposition *mapping =
-      findAxisMapping(implementation.mapping, axis);
-  return mapping ? mapping->registerFactor : 1;
-}
-
-static unsigned localFragmentFactor(const LocalImplementation &implementation,
-                                    unsigned axis) {
-  const PhysicalAxisDecomposition *mapping =
-      findAxisMapping(implementation.mapping, axis);
-  return mapping ? mapping->fragmentFactor : 1;
-}
-
-static unsigned localSequentialFactor(const LocalImplementation &implementation,
-                                      unsigned axis) {
-  const PhysicalAxisDecomposition *mapping =
-      findAxisMapping(implementation.mapping, axis);
-  return mapping ? mapping->sequentialFactor : 0;
-}
-
 struct LocalAxisMappingCandidate {
   CorePhysicalMapping mapping;
   PhysicalAxisDecomposition axis;
@@ -91,13 +70,32 @@ findLogicalAxisConstraint(const CoreMappingProblem &problem, unsigned axis) {
   return found == problem.axes.end() ? nullptr : &*found;
 }
 
+static const LogicalAxisConstraint *
+findUniqueLogicalAxisConstraint(const CoreMappingProblem &problem,
+                                LogicalAxisRole role) {
+  const LogicalAxisConstraint *result = nullptr;
+  for (const LogicalAxisConstraint &axis : problem.axes) {
+    if (axis.role != role)
+      continue;
+    if (result)
+      return nullptr;
+    result = &axis;
+  }
+  return result;
+}
+
 std::string localImplementationSymbol(
     const LocalImplementation &implementation) {
   const LocalHardwareOperation &operation = implementation.operation;
-  const std::string shape = rvvShapeSuffix(operation.primaryShape);
+  const RVVVectorShape laneShape = implementation.mapping.laneShape;
+  const unsigned lanes = localLaneFactor(implementation);
+  const PhysicalAxisDecomposition *reduction =
+      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
+  const bool sequential = reduction && reduction->sequentialFactor > 1;
+  const std::string shape = rvvShapeSuffix(laneShape);
   const std::string registerSuffix =
-      operation.lanes && !shape.empty()
-          ? "_register_l" + std::to_string(operation.lanes) + "_e" + shape
+      lanes && !shape.empty()
+          ? "_register_l" + std::to_string(lanes) + "_e" + shape
           : std::string{};
   switch (implementation.primitive) {
   case LocalPrimitiveKind::None:
@@ -108,7 +106,8 @@ std::string localImplementationSymbol(
     const bool affine = implementation.primitive == LocalPrimitiveKind::AffineI4I8;
     const bool fragment =
         operation.kind == LocalHardwareOperationKind::MatrixFragment;
-    if ((!fragment && operation.kind != LocalHardwareOperationKind::RVVRegister) ||
+    if ((!fragment && operation.kind !=
+                          LocalHardwareOperationKind::RVVIntrinsic) ||
         (operation.rows != 1 && operation.rows != 4))
       return {};
     return std::string("__weft_") + (fragment ? "ime1_" : "rvv_") +
@@ -116,90 +115,90 @@ std::string localImplementationSymbol(
            (operation.rows == 4 ? "m4_" : "") + "n16_k32";
   }
   case LocalPrimitiveKind::GroupedAffineI4I8:
-    if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+    if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic && sequential)
       return "__weft_grouped_affine_i4_i8_strip";
-    return (operation.kind == LocalHardwareOperationKind::RVVRegister ||
+    return (operation.kind == LocalHardwareOperationKind::RVVIntrinsic ||
             operation.kind == LocalHardwareOperationKind::RVVInlineAsm) &&
                    !registerSuffix.empty()
                ? "__weft_grouped_affine_i4_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::E2M1E8M0I8:
-    if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+    if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic && sequential)
       return "__weft_e2m1_e8m0_i8_strip";
-    if (operation.kind != LocalHardwareOperationKind::RVVRegister)
+    if (operation.kind != LocalHardwareOperationKind::RVVIntrinsic)
       return {};
-    if (operation.primaryShape == RVVVectorShape{8, 4})
+    if (laneShape == RVVVectorShape{8, 4})
       return "__weft_e2m1_e8m0_i8_register_e8mf2";
-    if (operation.primaryShape == kRVVE8M1)
+    if (laneShape == kRVVE8M1)
       return "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
     return {};
   case LocalPrimitiveKind::PackedI4I8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_i4_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::PackedI5I8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_i5_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::PackedI3GroupedI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_i3_grouped_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::Base3TernaryI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_base3_ternary_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::PackedI2TernaryI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_i2_ternary_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::SignedCodebook8I8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_signed_codebook8_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::SignedCodebook4I8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_signed_codebook4_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_u9_u7_codebook_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_packed_u11_grid_delta_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::NibbleCodebookI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_nibble_codebook_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::IQ2SI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_iq2_s_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::IQ3SI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_iq3_s_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::IQ1MI8:
-    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_iq1_m_i8" + registerSuffix
                : std::string{};
   case LocalPrimitiveKind::Q6KI8:
-    return (operation.kind == LocalHardwareOperationKind::RVVRegister ||
+    return (operation.kind == LocalHardwareOperationKind::RVVIntrinsic ||
             operation.kind == LocalHardwareOperationKind::RVVInlineAsm) &&
                    !registerSuffix.empty()
                ? "__weft_q6_k_i8" + registerSuffix
@@ -211,12 +210,8 @@ std::string localImplementationSymbol(
 static void selectLocalHardwareOperation(
     LocalImplementation &implementation, LocalHardwareOperationKind kind,
     LocalOperationProjection projection = LocalOperationProjection::None,
-    unsigned rows = 1, unsigned lanes = 0) {
-  implementation.operation = LocalHardwareOperation{
-      kind, lanes ? lanes : localLaneFactor(implementation), rows,
-      implementation.valueShapes.empty() ? RVVVectorShape{}
-                                         : implementation.valueShapes.front(),
-      projection};
+    unsigned rows = 1) {
+  implementation.operation = LocalHardwareOperation{kind, rows, projection};
 }
 
 static bool finalizeLocalHardwareOperation(
@@ -260,7 +255,7 @@ selectLoadF16LEPhysical(bool knownAligned,
 std::optional<SelectedBlockDecodePhysical>
 selectBlockDecodePhysical(const BlockDecodeCandidateFacts &facts,
                           const RISCVTargetProfile &target) {
-  if (!target.hasRVV || target.vlenBits < 128 || facts.codeExtent != 16 ||
+  if (!target.hasRVV || facts.codeExtent != 16 ||
       facts.tableExtent != 16)
     return std::nullopt;
   std::optional<RVVVectorShape> laneShape =
@@ -269,7 +264,7 @@ selectBlockDecodePhysical(const BlockDecodeCandidateFacts &facts,
     return std::nullopt;
   CoreMappingProblem problem;
   problem.axes = {
-      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed,
+      LogicalAxisConstraint{0, LogicalAxisRole::Packed,
                             facts.codeExtent, false, true, true, {1}}};
   problem.laneSEW = 8;
   problem.laneInstruction = CoreInstructionKind::RVVIndexedGather;
@@ -369,7 +364,7 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
       selected.temporaryShape =
           facts.sourceType == BlockPhysicalType::U16
               ? sourceShape
-              : selected.resultShape == kRVVE32M1
+              : rvvRegisterGroups(selected.resultShape) == 1
                     ? selected.resultShape
                     : rvvShapeForSameLanes(sourceShape, 16, target)
                           .value_or(RVVVectorShape{});
@@ -389,7 +384,7 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
       selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
     else if (facts.resultType == BlockPhysicalType::U8) {
       selected.resultShape = facts.byteShape;
-      if (facts.byteShape == kRVVE8MF4 &&
+      if (facts.byteShape.lmulEighths < 8 &&
           (facts.binary == BlockBinarySemantic::And ||
            facts.binary == BlockBinarySemantic::ShiftRight))
         selected.realization = BlockValueRealization::DeferredPackedTransform;
@@ -467,7 +462,6 @@ std::optional<SelectedBlockStorePhysical>
 selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
   if (facts.mapping.axes.size() != 1 ||
-      facts.mapping.axes.front().id != kCoreAxisBlock ||
       facts.mapping.axes.front().role != LogicalAxisRole::Free ||
       !facts.mapping.axes.front().extent ||
       !facts.mapping.axes.front().requireLane)
@@ -481,7 +475,7 @@ selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(facts.mapping, target)) {
     const PhysicalAxisDecomposition *axis =
-        findAxisMapping(mapping, kCoreAxisBlock);
+        findUniqueAxisMapping(mapping, LogicalAxisRole::Free);
     if (!axis || !mapping.laneShape || mapping.laneShape.sew != 8 ||
         axis->laneFactor == 0 || axis->registerFactor == 0)
       continue;
@@ -516,7 +510,7 @@ selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
     selected.decision.mapping = std::move(mapping);
     selected.decision.needsLaneVector = facts.needsLaneVector;
     selected.decision.laneShape = laneShape;
-    if (selected.decision.mapping.laneShape == kRVVE8MF4 &&
+    if (selected.decision.mapping.laneShape.lmulEighths < 8 &&
         sequentialFactor == 1 && registerFactor > 1)
       selected.decision.realization = BlockStoreRealization::MultiStripValues;
     else if (sequentialFactor == 1)
@@ -539,8 +533,7 @@ selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
 std::optional<SelectedBlockReducePhysical>
 selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
                           const RISCVTargetProfile &target) {
-  if (!facts.inputShape || facts.mapping.axes.size() != 1 ||
-      facts.mapping.axes.front().id != kCoreAxisBlock ||
+  if (facts.inputSEW == 0 || facts.mapping.axes.size() != 1 ||
       facts.mapping.axes.front().role != LogicalAxisRole::Reduction ||
       !facts.mapping.axes.front().extent ||
       !facts.mapping.axes.front().requireLane)
@@ -554,8 +547,9 @@ selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(facts.mapping, target)) {
     const PhysicalAxisDecomposition *axis =
-        findAxisMapping(mapping, kCoreAxisBlock);
-    if (!axis || mapping.laneShape != kRVVE8M1 || axis->laneFactor == 0 ||
+        findUniqueAxisMapping(mapping, LogicalAxisRole::Reduction);
+    if (!axis || !mapping.laneShape || mapping.laneShape.sew != 8 ||
+        axis->laneFactor == 0 ||
         axis->registerFactor == 0 || axis->registerFactor > 2)
       continue;
     const unsigned laneFactor = axis->laneFactor;
@@ -575,16 +569,20 @@ selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
         continue;
       laneShape = *selectedLane;
     }
+    std::optional<RVVVectorShape> inputShape =
+        rvvShapeForSameLanes(mapping.laneShape, facts.inputSEW, target);
+    if (!inputShape)
+      continue;
 
     SelectedBlockReducePhysical selected;
     selected.decision.mapping = std::move(mapping);
     selected.decision.needsLaneVector = facts.needsLaneVector;
     selected.decision.laneShape = laneShape;
-    selected.inputShape = facts.inputShape;
-    selected.combinedShape = facts.inputShape;
-    if (sequentialFactor == 1 && facts.inputShape.sew == 16) {
+    selected.inputShape = *inputShape;
+    selected.combinedShape = *inputShape;
+    if (sequentialFactor == 1 && inputShape->sew == 16) {
       std::optional<RVVVectorShape> combined =
-          rvvShapeForSameLanes(facts.inputShape, 32, target);
+          rvvShapeForSameLanes(*inputShape, 32, target);
       if (!combined)
         continue;
       selected.combinedShape = *combined;
@@ -597,7 +595,7 @@ selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
 
     PhysicalResourceRequirements requirements;
     requirements.live = {
-        {PhysicalLiveClass::Value, facts.inputShape, registerFactor, 0},
+        {PhysicalLiveClass::Value, *inputShape, registerFactor, 0},
         {PhysicalLiveClass::Temporary, selected.seedShape, 1, 0}};
     if (laneShape)
       requirements.live.push_back(
@@ -625,15 +623,12 @@ selectMaterializedBlockStorePhysical(
     const RISCVTargetProfile &target) {
   const bool rankOne =
       facts.mapping.axes.size() == 1 &&
-      facts.mapping.axes.front().id == kCoreAxisN &&
       facts.mapping.axes.front().role == LogicalAxisRole::Free &&
       facts.mapping.axes.front().extent;
   const bool rankTwo =
       facts.mapping.axes.size() == 2 &&
-      facts.mapping.axes[0].id == kCoreAxisM &&
       facts.mapping.axes[0].role == LogicalAxisRole::Free &&
       facts.mapping.axes[0].extent &&
-      facts.mapping.axes[1].id == kCoreAxisN &&
       facts.mapping.axes[1].role == LogicalAxisRole::Free &&
       facts.mapping.axes[1].extent;
   if ((!rankOne && !rankTwo) || !facts.prefixPredicated)
@@ -709,7 +704,6 @@ selectSortIndicesPhysical(const SortIndicesCandidateFacts &facts,
        facts.configuredRadixBits != 11))
     return std::nullopt;
   if (facts.mapping.axes.size() != 1 ||
-      facts.mapping.axes.front().id != kCoreAxisBlock ||
       !facts.mapping.axes.front().ordered ||
       facts.mapping.axes.front().allowLane ||
       facts.mapping.axes.front().requireLane)
@@ -1031,7 +1025,7 @@ selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
 std::optional<SelectedVLALookupPhysical>
 selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
                         const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasIndexedMemory || target.vlenBits < 128 ||
+  if (!target.hasRVV || !target.hasIndexedMemory ||
       facts.tableExtent != 16 || !facts.tableF32 || !facts.resultF32 ||
       !facts.indicesU8 || !facts.allActive)
     return std::nullopt;
@@ -1049,9 +1043,9 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
                                });
     return found == facts.mapping.axes.end() ? nullptr : &*found;
   };
-  const LogicalAxisConstraint *rows = axis(kCoreAxisM);
-  const LogicalAxisConstraint *columns = axis(kCoreAxisN);
-  const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
+  const LogicalAxisConstraint *rows = axis(facts.rowsAxis);
+  const LogicalAxisConstraint *columns = axis(facts.columnsAxis);
+  const LogicalAxisConstraint *reduction = axis(facts.reductionAxis);
   if (!target.littleEndian || !rows || !columns || !reduction ||
       !rows->extent || *rows->extent == 0 ||
       *rows->extent > std::numeric_limits<unsigned>::max() ||
@@ -1066,16 +1060,17 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       *reduction->extent == 32;
   const bool supportsRVV =
       target.hasF && target.hasVectorF16 && target.hasWideningInteger &&
-      target.hasWideningFloat && target.supportsVLENAtLeast(128) &&
+      target.hasWideningFloat &&
       target.supportsVectorShape(8, 8) &&
       target.supportsVectorShape(16, 16) &&
-      target.supportsVectorShape(32, 32) && rvvLeafShape;
+      target.supportsVectorShape(32, 32) &&
+      rvvLaneCapacity(kRVVE8M1, target).value_or(0) >= 16 && rvvLeafShape;
   CoreMappingProblem problem = facts.mapping;
   for (LogicalAxisConstraint &constraint : problem.axes) {
-    constraint.allowLane = constraint.id == kCoreAxisN && supportsRVV;
+    constraint.allowLane = constraint.id == facts.columnsAxis && supportsRVV;
     constraint.requireLane = constraint.allowLane;
     constraint.registerFactors =
-        constraint.id == kCoreAxisM
+        constraint.id == facts.rowsAxis
             ? llvm::SmallVector<unsigned, 4>{rowExtent}
             : llvm::SmallVector<unsigned, 4>{1};
   }
@@ -1093,10 +1088,10 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
         capability.kFactor != *reduction->extent)
       continue;
     problem.fragments.push_back(FragmentMappingConstraint{
-        CoreInstructionKind::SpacemitIME1MMA,
-        {{kCoreAxisM, capability.mFactor},
-         {kCoreAxisN, capability.nFactor},
-         {kCoreAxisK, capability.kFactor}},
+        CoreInstructionKind::MatrixFragment,
+        {{facts.rowsAxis, capability.mFactor},
+         {facts.columnsAxis, capability.nFactor},
+         {facts.reductionAxis, capability.kFactor}},
         capability.fixedResourceGroups});
   }
 
@@ -1108,7 +1103,7 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
     const bool fragmentMapping =
-        mapping.instruction == CoreInstructionKind::SpacemitIME1MMA;
+        mapping.instruction == CoreInstructionKind::MatrixFragment;
     if (!fragmentMapping && !supportsRVV)
       continue;
     SelectedI4I8FragmentPhysical selected;
@@ -1122,13 +1117,13 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
     selected.implementation.valueShapes = {selected.codeShape,
                                            selected.accumulatorShape};
     const PhysicalAxisDecomposition *mappedRows =
-        findAxisMapping(selected.implementation.mapping, kCoreAxisM);
+        findAxisMapping(selected.implementation.mapping, facts.rowsAxis);
     if (!mappedRows)
       continue;
     selectLocalHardwareOperation(
         selected.implementation,
         fragmentMapping ? LocalHardwareOperationKind::MatrixFragment
-                        : LocalHardwareOperationKind::RVVRegister,
+                        : LocalHardwareOperationKind::RVVIntrinsic,
         LocalOperationProjection::None,
         fragmentMapping ? mappedRows->fragmentFactor
                         : mappedRows->registerFactor);
@@ -1167,7 +1162,6 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                         const RISCVTargetProfile &target) {
   if ((facts.dataSEW != 16 && facts.dataSEW != 32) || !target.hasRVV ||
       target.vectorRegisters <= 0 || facts.mapping.axes.size() != 1 ||
-      facts.mapping.axes.front().id != kCoreAxisVLA ||
       !facts.mapping.axes.front().requireLane)
     return std::nullopt;
   if (facts.requiredDataShape &&
@@ -1222,8 +1216,28 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
     RVVVectorShape dataShape = mapping.laneShape;
+    llvm::SmallVector<VLAElementPhysicalShape, 4> elementShapes;
+    auto selectElementShape = [&](unsigned sew)
+        -> std::optional<RVVVectorShape> {
+      auto found = llvm::find_if(
+          elementShapes, [&](const VLAElementPhysicalShape &selected) {
+            return selected.sew == sew;
+          });
+      if (found != elementShapes.end())
+        return found->shape;
+      if (sew == 0 || (sew == 16 && !target.hasVectorF16))
+        return std::nullopt;
+      std::optional<RVVVectorShape> shape =
+          rvvShapeForSameLanes(dataShape, sew, target);
+      if (!shape)
+        return std::nullopt;
+      elementShapes.push_back(VLAElementPhysicalShape{sew, *shape});
+      return shape;
+    };
+    if (!selectElementShape(facts.dataSEW))
+      continue;
     const PhysicalAxisDecomposition *vlaAxis =
-        findAxisMapping(mapping, kCoreAxisVLA);
+        mapping.laneAxis ? findAxisMapping(mapping, *mapping.laneAxis) : nullptr;
     if (!vlaAxis || vlaAxis->laneFactor == 0 ||
         (facts.requiredDataShape && dataShape != facts.requiredDataShape))
       continue;
@@ -1232,17 +1246,14 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         facts.hasAffinePredicate || facts.hasIndexVector;
     std::optional<RVVVectorShape> indexShape =
         needsIndexShape
-            ? rvvShapeForSameLanes(dataShape,
-                                   static_cast<unsigned>(target.xlen), target)
+            ? selectElementShape(static_cast<unsigned>(target.xlen))
             : std::optional<RVVVectorShape>{};
     if (needsIndexShape && !indexShape)
       continue;
 
     bool elementShapesLegal =
         llvm::all_of(facts.accessElementSEWs, [&](unsigned sew) {
-          if (sew == 16 && !target.hasVectorF16)
-            return false;
-          return sew != 0 && rvvShapeForSameLanes(dataShape, sew, target);
+          return selectElementShape(sew).has_value();
         });
     if (!elementShapesLegal)
       continue;
@@ -1250,9 +1261,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         llvm::all_of(facts.indexedMemory,
                      [&](const VLAIndexedMemoryFact &memory) {
           std::optional<RVVVectorShape> elementShape =
-              rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+              selectElementShape(memory.elementSEW);
           std::optional<RVVVectorShape> indexShape =
-              rvvShapeForSameLanes(dataShape, memory.offsetSEW, target);
+              selectElementShape(memory.offsetSEW);
           return elementShape && indexShape &&
                  target.supportsIndexedVectorMemory(
                      elementShape->sew, elementShape->lmulEighths,
@@ -1263,7 +1274,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     bool segmentShapesLegal = llvm::all_of(
         facts.segmentMemory, [&](const VLASegmentMemoryFact &memory) {
           std::optional<RVVVectorShape> elementShape =
-              rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+              selectElementShape(memory.elementSEW);
           return memory.fields != 0 && elementShape &&
                  target.supportsSegmentVectorMemory(
                      memory.fields, elementShape->sew,
@@ -1310,7 +1321,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         if (count == 0)
           return true;
         std::optional<RVVVectorShape> shape =
-            rvvShapeForSameLanes(dataShape, sew, target);
+            selectElementShape(sew);
         if (!shape)
           return false;
         requirements.live.push_back({kind, *shape, count, 0});
@@ -1355,9 +1366,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     bool resourceLegal = true;
     for (const VLAIndexedMemoryFact &memory : facts.indexedMemory) {
       std::optional<RVVVectorShape> elementShape =
-          rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+          selectElementShape(memory.elementSEW);
       std::optional<RVVVectorShape> offsetShape =
-          rvvShapeForSameLanes(dataShape, memory.offsetSEW, target);
+          selectElementShape(memory.offsetSEW);
       if (!elementShape || !offsetShape ||
           !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
                                         *elementShape, 1, 0},
@@ -1371,7 +1382,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       continue;
     for (const VLASegmentMemoryFact &memory : facts.segmentMemory) {
       std::optional<RVVVectorShape> elementShape =
-          rvvShapeForSameLanes(dataShape, memory.elementSEW, target);
+          selectElementShape(memory.elementSEW);
       if (!elementShape ||
           !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
                                         *elementShape, memory.fields, 0}})) {
@@ -1387,9 +1398,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       if (facts.dataSEW != 32)
         continue;
       std::optional<RVVVectorShape> intermediateShape =
-          rvvShapeForSameLanes(dataShape, 16, target);
+          selectElementShape(16);
       std::optional<RVVVectorShape> resultShape =
-          rvvShapeForSameLanes(dataShape, 8, target);
+          selectElementShape(8);
       if (!intermediateShape || !resultShape)
         continue;
       VLANarrowPhysical selected;
@@ -1434,8 +1445,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         break;
       case VLAStateStripUpdate::ArgMaxSummary:
         if (!indexShape) {
-          indexShape = rvvShapeForSameLanes(
-              dataShape, static_cast<unsigned>(target.xlen), target);
+          indexShape = selectElementShape(static_cast<unsigned>(target.xlen));
         }
         if (!indexShape) {
           resourceLegal = false;
@@ -1460,11 +1470,11 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
 
     if (facts.lookupCount != 0) {
       std::optional<RVVVectorShape> codeShape =
-          rvvShapeForSameLanes(dataShape, 8, target);
+          selectElementShape(8);
       std::optional<RVVVectorShape> index16Shape =
-          rvvShapeForSameLanes(dataShape, 16, target);
+          selectElementShape(16);
       std::optional<RVVVectorShape> index32Shape =
-          rvvShapeForSameLanes(dataShape, 32, target);
+          selectElementShape(32);
       if (!codeShape || !index16Shape || !index32Shape)
         continue;
       if (!applyPhase({
@@ -1490,6 +1500,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
 
     SelectedVLAEntityPhysical selected;
     selected.mapping = mapping;
+    selected.elementShapes = elementShapes;
     selected.states = states;
     if (needsIndexShape)
       selected.indexShape = *indexShape;
@@ -1530,7 +1541,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
 
 std::optional<SelectedSignBitI8Physical>
 selectSignBitI8Physical(const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.littleEndian || target.vlenBits < 128 ||
+  if (!target.hasRVV || !target.littleEndian ||
       !target.hasWideningInteger)
     return std::nullopt;
   std::optional<RVVVectorShape> activation =
@@ -1573,7 +1584,7 @@ calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
   PhysicalResourceRequirements requirements;
   for (const AxisMappedLiveValue &value : facts.values) {
     const PhysicalAxisDecomposition *axis =
-        findAxisMapping(*facts.mapping, value.axis);
+        value.axis ? findAxisMapping(*facts.mapping, *value.axis) : nullptr;
     unsigned count = value.factor;
     switch (value.multiplicity) {
     case AxisMappedMultiplicity::Fixed:
@@ -1615,26 +1626,27 @@ calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
 std::optional<SelectedTernaryI8DotPhysical>
 selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
-      target.vlenBits < 128)
+  if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian)
     return std::nullopt;
 
   const LogicalAxisConstraint *reduction =
-      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+      findUniqueLogicalAxisConstraint(facts.mapping, LogicalAxisRole::Reduction);
   if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
       !reduction->extent)
     return std::nullopt;
-  switch (facts.semantic) {
-  case TernaryI8DotSemantic::Base3Digits:
+  const bool base3 = facts.primitive == LocalPrimitiveKind::Base3TernaryI8;
+  const bool packedI2 =
+      facts.primitive == LocalPrimitiveKind::PackedI2TernaryI8;
+  if (!base3 && !packedI2)
+    return std::nullopt;
+  if (base3) {
     if (facts.primaryExtent != 48 || facts.secondaryExtent != 4 ||
         *reduction->extent != 256)
       return std::nullopt;
-    break;
-  case TernaryI8DotSemantic::PackedI2Fields:
+  } else {
     if (facts.primaryExtent != 64 || facts.secondaryExtent != 0 ||
         *reduction->extent != 256)
       return std::nullopt;
-    break;
   }
 
   std::optional<RVVVectorShape> byte16 =
@@ -1643,10 +1655,6 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
       !target.supportsVectorShape(kRVVE32M1.sew,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
-  LocalPrimitiveKind primitive =
-      facts.semantic == TernaryI8DotSemantic::Base3Digits
-          ? LocalPrimitiveKind::Base3TernaryI8
-          : LocalPrimitiveKind::PackedI2TernaryI8;
   struct Candidate {
     SelectedTernaryI8DotPhysical physical;
     unsigned registerFactor = 0;
@@ -1654,11 +1662,11 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           kCoreAxisK, 8, target)) {
+           reduction->id, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     const unsigned logicalLanes =
         candidate.axis.laneFactor * candidate.axis.registerFactor;
-    if (facts.semantic == TernaryI8DotSemantic::Base3Digits) {
+    if (base3) {
       if (candidate.axis.laneFactor != 32 ||
           candidate.axis.registerFactor != 1 ||
           candidate.axis.sequentialFactor != 8)
@@ -1677,38 +1685,35 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
         !target.supportsVectorShape(highWord.sew, highWord.lmulEighths))
       continue;
     LocalImplementation implementation;
-    implementation.primitive = primitive;
+    implementation.primitive = facts.primitive;
     implementation.mapping = std::move(candidate.mapping);
     implementation.valueShapes =
-        facts.semantic == TernaryI8DotSemantic::PackedI2Fields
+        packedI2
             ? llvm::SmallVector<RVVVectorShape, 4>{laneShape, *widened}
             : llvm::SmallVector<RVVVectorShape, 4>{
                   laneShape, *byte16, *widened, *halfWidened, highWord};
     selectLocalHardwareOperation(implementation,
-                                 LocalHardwareOperationKind::RVVRegister);
+                                 LocalHardwareOperationKind::RVVIntrinsic);
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
     resources.mapping = &implementation.mapping;
     resources.values = {
         {PhysicalLiveClass::Memory, laneShape,
-         AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 1},
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 1},
         {PhysicalLiveClass::Memory, *byte16}};
-    switch (facts.semantic) {
-    case TernaryI8DotSemantic::Base3Digits:
+    if (base3) {
       resources.values.append(
           {{PhysicalLiveClass::Temporary, *widened,
-            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 3},
+            AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 3},
            {PhysicalLiveClass::Temporary, kRVVE32M1}});
-      break;
-    case TernaryI8DotSemantic::PackedI2Fields:
+    } else {
       resources.values.append(
           {{PhysicalLiveClass::Temporary, laneShape,
-            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+            AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 2},
            {PhysicalLiveClass::Temporary, *widened,
-            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 1},
+            AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 1},
            {PhysicalLiveClass::Temporary, kRVVE32M1}});
-      break;
     }
     std::optional<PhysicalResourceBudget> budget =
         calculateAxisMappedResources(resources, target);
@@ -1716,9 +1721,6 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
       continue;
     SelectedTernaryI8DotPhysical selected;
     selected.implementation = std::move(implementation);
-    selected.decode = facts.semantic == TernaryI8DotSemantic::Base3Digits
-                          ? TernaryDecodeTopology::Base3Digits
-                          : TernaryDecodeTopology::PackedI2Fields;
     selected.primarySourceShape = laneShape;
     selected.secondarySourceShape = *byte16;
     selected.resources = *budget;
@@ -1744,13 +1746,13 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
       facts.primitive == LocalPrimitiveKind::PackedU11GridDeltaI8;
   if (!target.hasRVV || !target.hasIndexedMemory ||
       !target.hasWideningInteger || !target.littleEndian ||
-      target.vlenBits < 128 || !supportedPrimitive ||
+      !supportedPrimitive ||
       (facts.entryWidth != 4 && facts.entryWidth != 8) ||
       !target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths))
     return std::nullopt;
 
   const LogicalAxisConstraint *reduction =
-      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+      findUniqueLogicalAxisConstraint(facts.mapping, LogicalAxisRole::Reduction);
   if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
       reduction->extent != std::optional<uint64_t>(32))
     return std::nullopt;
@@ -1779,8 +1781,8 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   };
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           facts.mapping, CoreInstructionKind::RVVIndexedGather, kCoreAxisK, 8,
-           target)) {
+           facts.mapping, CoreInstructionKind::RVVIndexedGather,
+           reduction->id, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     if (candidate.axis.laneFactor != 32 ||
         candidate.axis.registerFactor != 1 ||
@@ -1795,16 +1797,20 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     implementation.mapping = std::move(candidate.mapping);
     std::optional<RVVVectorShape> halfProductShape =
         rvvShapeForSemanticLanes(16, 16, target);
-    if (!halfProductShape)
+    RVVVectorShape signWordShape{32, kRVVE8M1.lmulEighths};
+    if (!halfProductShape ||
+        !target.supportsVectorShape(signWordShape.sew,
+                                    signWordShape.lmulEighths))
       continue;
     if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
         facts.primitive == LocalPrimitiveKind::SignedCodebook4I8)
       implementation.valueShapes = {laneShape, *codeShape, *indexShape,
-                                    *tableShape, *productShape, kRVVE8M1};
+                                    *tableShape, *productShape, kRVVE8M1,
+                                    signWordShape};
     else if (facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
       implementation.valueShapes = {laneShape, *codeShape, *indexShape,
                                     *tableShape, *productShape, kRVVE8M1,
-                                    *halfProductShape};
+                                    *halfProductShape, signWordShape};
     else if (facts.primitive ==
              LocalPrimitiveKind::PackedU11GridDeltaI8)
       implementation.valueShapes = {laneShape, *codeShape, *indexShape,
@@ -1820,7 +1826,7 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
                        ? LocalOperationProjection::SignSourceDirect
                        : LocalOperationProjection::SignSourceExtend;
     selectLocalHardwareOperation(implementation,
-                                 LocalHardwareOperationKind::RVVRegister,
+                                 LocalHardwareOperationKind::RVVIntrinsic,
                                  projection);
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
@@ -1830,15 +1836,15 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
         {PhysicalLiveClass::Memory, *codeShape},
         {PhysicalLiveClass::Memory, *tableShape},
         {PhysicalLiveClass::Memory, laneShape,
-         AxisMappedMultiplicity::RegisterFactor},
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
         {PhysicalLiveClass::Index, *indexShape},
         {PhysicalLiveClass::Temporary, *tableShape},
         {PhysicalLiveClass::Temporary, laneShape,
-         AxisMappedMultiplicity::RegisterFactor},
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
         {PhysicalLiveClass::Temporary, *productShape,
-         AxisMappedMultiplicity::RegisterFactor},
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
         {PhysicalLiveClass::Temporary, kRVVE32M1,
-         AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
+         AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
     resources.predicateGroups = 1;
     std::optional<PhysicalResourceBudget> budget =
         calculateAxisMappedResources(resources, target);
@@ -1865,11 +1871,11 @@ std::optional<SelectedNibbleCodebookI8Physical>
 selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
                                const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
-      target.vlenBits < 128 || facts.packedExtent != 16 ||
+      facts.packedExtent != 16 ||
       facts.tableExtent != 16)
     return std::nullopt;
   const LogicalAxisConstraint *reduction =
-      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+      findUniqueLogicalAxisConstraint(facts.mapping, LogicalAxisRole::Reduction);
   if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
       reduction->extent != std::optional<uint64_t>(32))
     return std::nullopt;
@@ -1886,7 +1892,7 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           kCoreAxisK, 8, target)) {
+           reduction->id, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     const unsigned logicalLanes =
         candidate.axis.laneFactor * candidate.axis.registerFactor;
@@ -1909,7 +1915,7 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
     implementation.valueShapes = {laneShape, *packedShape, tableShape,
                                   *productShape};
     selectLocalHardwareOperation(
-        implementation, LocalHardwareOperationKind::RVVRegister,
+        implementation, LocalHardwareOperationKind::RVVIntrinsic,
         combined ? LocalOperationProjection::NibbleCodebookCombined
                  : LocalOperationProjection::NibbleCodebookSplit);
     if (!finalizeLocalHardwareOperation(implementation))
@@ -1920,12 +1926,12 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
         {PhysicalLiveClass::Memory, *packedShape},
         {PhysicalLiveClass::Memory, tableShape},
         {PhysicalLiveClass::Memory, laneShape,
-         AxisMappedMultiplicity::RegisterFactor},
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
         {PhysicalLiveClass::Temporary, *productShape,
-         AxisMappedMultiplicity::RegisterFactor, kCoreAxisK,
+         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id,
          combined ? 1u : 2u},
         {PhysicalLiveClass::Temporary, kRVVE32M1,
-         AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
+         AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
     std::optional<PhysicalResourceBudget> budget =
         calculateAxisMappedResources(resources, target);
     if (!budget)
@@ -1948,43 +1954,301 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
   return std::move(legal.front().physical);
 }
 
+struct QuantPrimitivePhysicalRule {
+  llvm::SmallVector<RVVVectorShape, 8> valueShapes;
+  LocalHardwareOperationKind operation =
+      LocalHardwareOperationKind::RVVIntrinsic;
+  LocalOperationProjection projection = LocalOperationProjection::None;
+  llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
+  unsigned predicateGroups = 0;
+  std::optional<PhysicalResourceRequirements> directResources;
+};
+
+static std::optional<QuantPrimitivePhysicalRule>
+derivePackedQuantRule(LocalPrimitiveKind primitive,
+                      const LocalAxisMappingCandidate &candidate,
+                      const RISCVTargetProfile &target) {
+  if (primitive != LocalPrimitiveKind::PackedI4I8 &&
+      primitive != LocalPrimitiveKind::PackedI5I8)
+    return std::nullopt;
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  const unsigned logicalLanes =
+      candidate.axis.laneFactor * candidate.axis.registerFactor;
+  if ((candidate.axis.laneFactor != 16 &&
+       candidate.axis.laneFactor != 32) ||
+      logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
+    return std::nullopt;
+  RVVVectorShape decodeShape = laneShape;
+  if (candidate.axis.laneFactor == 32) {
+    std::optional<RVVVectorShape> halfShape =
+        rvvShapeForSemanticLanes(8, 16, target);
+    if (halfShape && halfShape->lmulEighths >= 8 &&
+        halfShape->lmulEighths * 2 == laneShape.lmulEighths)
+      decodeShape = *halfShape;
+  }
+  std::optional<RVVVectorShape> widenedShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  if (!widenedShape)
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, decodeShape, *widenedShape};
+  rule.projection =
+      candidate.axis.laneFactor != 32
+          ? LocalOperationProjection::PackedDotRegisterChunks
+          : decodeShape == laneShape
+                ? LocalOperationProjection::PackedDotLaneSlide
+                : LocalOperationProjection::PackedDotLaneCreate;
+  rule.liveValues = {
+      {PhysicalLiveClass::Memory, laneShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 2},
+      {PhysicalLiveClass::Temporary, *widenedShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 2},
+      {PhysicalLiveClass::Temporary, kRVVE32M1,
+       AxisMappedMultiplicity::LogicalChunk, candidate.axis.id, 4, 16}};
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+derivePackedI3QuantRule(const LocalAxisMappingCandidate &candidate,
+                        const RISCVTargetProfile &target) {
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  const unsigned logicalLanes =
+      candidate.axis.laneFactor * candidate.axis.registerFactor;
+  if ((candidate.axis.laneFactor != 16 &&
+       candidate.axis.laneFactor != 32) ||
+      logicalLanes == 0 || (256 % logicalLanes) != 0 ||
+      candidate.axis.sequentialFactor != 256 / logicalLanes)
+    return std::nullopt;
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  std::optional<RVVVectorShape> segmentProductShape =
+      rvvShapeForSemanticLanes(16, 16, target);
+  if (!productShape || !segmentProductShape)
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, *productShape, *segmentProductShape};
+  rule.liveValues = {
+      {PhysicalLiveClass::Memory, laneShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 3},
+      {PhysicalLiveClass::Temporary, laneShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+      {PhysicalLiveClass::Temporary, *productShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+      {PhysicalLiveClass::Temporary, *segmentProductShape,
+       AxisMappedMultiplicity::RegisterFactor, candidate.axis.id,
+       candidate.axis.laneFactor / 16},
+      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+  rule.predicateGroups = 1;
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+deriveIQ2QuantRule(const LocalAxisMappingCandidate &candidate,
+                   const RISCVTargetProfile &target) {
+  if ((candidate.axis.laneFactor != 32 &&
+       candidate.axis.laneFactor != 64) ||
+      candidate.axis.registerFactor != 1 ||
+      candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
+    return std::nullopt;
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
+  std::optional<RVVVectorShape> indexShape =
+      rvvShapeForSemanticLanes(16, 4 * groupsPerVector, target);
+  RVVVectorShape tableShape{64, laneShape.lmulEighths};
+  std::optional<RVVVectorShape> signShape =
+      rvvShapeForSemanticLanes(8, 4 * groupsPerVector, target);
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  std::optional<RVVVectorShape> segmentProductShape =
+      rvvShapeForSemanticLanes(16, 16, target);
+  if (!target.hasIndexedMemory || !indexShape || !signShape || !productShape ||
+      !segmentProductShape ||
+      !target.supportsIndexedVectorMemory(
+          tableShape.sew, tableShape.lmulEighths, indexShape->sew,
+          indexShape->lmulEighths))
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, *indexShape, tableShape, *signShape,
+                      *productShape, *segmentProductShape};
+  rule.liveValues = {
+      {PhysicalLiveClass::Index, *indexShape},
+      {PhysicalLiveClass::Memory, tableShape},
+      {PhysicalLiveClass::Memory, *signShape},
+      {PhysicalLiveClass::Memory, laneShape},
+      {PhysicalLiveClass::Temporary, *productShape},
+      {PhysicalLiveClass::Temporary, *segmentProductShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt,
+       candidate.axis.laneFactor / 16},
+      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+  rule.predicateGroups = 1;
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+deriveIQ3QuantRule(const LocalAxisMappingCandidate &candidate,
+                   const RISCVTargetProfile &target) {
+  if (candidate.axis.laneFactor != 64 ||
+      candidate.axis.registerFactor != 1 ||
+      candidate.axis.sequentialFactor != 4)
+    return std::nullopt;
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  std::optional<RVVVectorShape> codeShape =
+      rvvShapeForSemanticLanes(8, 16, target);
+  std::optional<RVVVectorShape> indexShape =
+      rvvShapeForSemanticLanes(16, 16, target);
+  RVVVectorShape tableShape{32, laneShape.lmulEighths};
+  std::optional<RVVVectorShape> signShape =
+      rvvShapeForSemanticLanes(8, 8, target);
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  std::optional<RVVVectorShape> halfProductShape =
+      rvvShapeForSemanticLanes(16, 32, target);
+  if (!target.hasIndexedMemory || !codeShape || !indexShape || !signShape ||
+      !productShape || !halfProductShape ||
+      !target.supportsIndexedVectorMemory(
+          tableShape.sew, tableShape.lmulEighths, indexShape->sew,
+          indexShape->lmulEighths))
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, *codeShape, *indexShape, tableShape,
+                      *signShape, *productShape, *halfProductShape};
+  rule.liveValues = {
+      {PhysicalLiveClass::Memory, *codeShape},
+      {PhysicalLiveClass::Index, *indexShape},
+      {PhysicalLiveClass::Memory, tableShape},
+      {PhysicalLiveClass::Memory, *signShape},
+      {PhysicalLiveClass::Memory, laneShape},
+      {PhysicalLiveClass::Temporary, *productShape},
+      {PhysicalLiveClass::Temporary, *halfProductShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt, 2},
+      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+  rule.predicateGroups = 1;
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+deriveIQ1QuantRule(const LocalAxisMappingCandidate &candidate,
+                   const RISCVTargetProfile &target) {
+  if ((candidate.axis.laneFactor != 32 &&
+       candidate.axis.laneFactor != 64) ||
+      candidate.axis.registerFactor != 1 ||
+      candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
+    return std::nullopt;
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
+  std::optional<RVVVectorShape> indexShape =
+      rvvShapeForSemanticLanes(16, 4 * groupsPerVector, target);
+  RVVVectorShape tableShape{64, laneShape.lmulEighths};
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  std::optional<RVVVectorShape> segmentProductShape =
+      rvvShapeForSemanticLanes(16, 16, target);
+  if (!target.hasIndexedMemory || !indexShape || !productShape ||
+      !segmentProductShape ||
+      !target.supportsIndexedVectorMemory(
+          tableShape.sew, tableShape.lmulEighths, indexShape->sew,
+          indexShape->lmulEighths))
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, *indexShape, tableShape, tableShape,
+                      *productShape, *segmentProductShape};
+  rule.liveValues = {
+      {PhysicalLiveClass::Index, *indexShape},
+      {PhysicalLiveClass::Memory, tableShape},
+      {PhysicalLiveClass::Memory, tableShape},
+      {PhysicalLiveClass::Memory, laneShape},
+      {PhysicalLiveClass::Temporary, *productShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt, 2},
+      {PhysicalLiveClass::Temporary, *segmentProductShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt,
+       2 * (candidate.axis.laneFactor / 16)},
+      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+deriveQ6QuantRule(const LocalAxisMappingCandidate &candidate,
+                  const RISCVTargetProfile &target) {
+  if ((candidate.axis.laneFactor != 32 &&
+       candidate.axis.laneFactor != 64) ||
+      candidate.axis.registerFactor != 1 ||
+      candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
+    return std::nullopt;
+  const RVVVectorShape laneShape = candidate.mapping.laneShape;
+  std::optional<RVVVectorShape> chunkShape =
+      rvvShapeForSemanticLanes(8, 32, target);
+  std::optional<RVVVectorShape> productShape =
+      rvvShapeForSameLanes(laneShape, 16, target);
+  std::optional<RVVVectorShape> segmentProductShape =
+      rvvShapeForSemanticLanes(16, 16, target);
+  if (!chunkShape || !productShape || !segmentProductShape)
+    return std::nullopt;
+  QuantPrimitivePhysicalRule rule;
+  rule.valueShapes = {laneShape, *chunkShape, *productShape,
+                      *segmentProductShape};
+  const unsigned logicalLanes =
+      candidate.axis.laneFactor * candidate.axis.registerFactor;
+  if (logicalLanes == 32 && laneShape == RVVVectorShape{8, 16}) {
+    rule.operation = LocalHardwareOperationKind::RVVInlineAsm;
+    PhysicalResourceRequirements resources;
+    resources.reservedGroups = 0;
+    resources.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
+    rule.directResources = std::move(resources);
+    return rule;
+  }
+  rule.liveValues = {
+      {PhysicalLiveClass::Memory, *chunkShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt,
+       3 * (candidate.axis.laneFactor / 32)},
+      {PhysicalLiveClass::Temporary, *chunkShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt,
+       2 * (candidate.axis.laneFactor / 32)},
+      {PhysicalLiveClass::Memory, laneShape},
+      {PhysicalLiveClass::Temporary, *productShape},
+      {PhysicalLiveClass::Temporary, *segmentProductShape,
+       AxisMappedMultiplicity::Fixed, std::nullopt,
+       candidate.axis.laneFactor / 16},
+      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+  return rule;
+}
+
+static std::optional<QuantPrimitivePhysicalRule>
+deriveQuantPrimitiveRule(LocalPrimitiveKind primitive,
+                         const LocalAxisMappingCandidate &candidate,
+                         const RISCVTargetProfile &target) {
+  switch (primitive) {
+  case LocalPrimitiveKind::PackedI4I8:
+  case LocalPrimitiveKind::PackedI5I8:
+    return derivePackedQuantRule(primitive, candidate, target);
+  case LocalPrimitiveKind::PackedI3GroupedI8:
+    return derivePackedI3QuantRule(candidate, target);
+  case LocalPrimitiveKind::IQ2SI8:
+    return deriveIQ2QuantRule(candidate, target);
+  case LocalPrimitiveKind::IQ3SI8:
+    return deriveIQ3QuantRule(candidate, target);
+  case LocalPrimitiveKind::IQ1MI8:
+    return deriveIQ1QuantRule(candidate, target);
+  case LocalPrimitiveKind::Q6KI8:
+    return deriveQ6QuantRule(candidate, target);
+  default:
+    return std::nullopt;
+  }
+}
+
 std::optional<SelectedQuantI8DotPhysical>
 selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasWideningInteger || target.vlenBits < 128 ||
+  if (!target.hasRVV || !target.hasWideningInteger ||
       !target.littleEndian ||
       !target.supportsVectorShape(kRVVE32M1.sew,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
   const LogicalAxisConstraint *reduction =
-      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+      findUniqueLogicalAxisConstraint(facts.mapping, LogicalAxisRole::Reduction);
   if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
       !reduction->extent || *reduction->extent == 0)
     return std::nullopt;
-  LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
-  switch (facts.semantic) {
-  case QuantI8DotSemantic::PackedI4:
-    primitive = LocalPrimitiveKind::PackedI4I8;
-    break;
-  case QuantI8DotSemantic::PackedI5:
-    primitive = LocalPrimitiveKind::PackedI5I8;
-    break;
-  case QuantI8DotSemantic::PackedI3Grouped:
-    primitive = LocalPrimitiveKind::PackedI3GroupedI8;
-    break;
-  case QuantI8DotSemantic::IQ2S:
-    primitive = LocalPrimitiveKind::IQ2SI8;
-    break;
-  case QuantI8DotSemantic::IQ3S:
-    primitive = LocalPrimitiveKind::IQ3SI8;
-    break;
-  case QuantI8DotSemantic::IQ1M:
-    primitive = LocalPrimitiveKind::IQ1MI8;
-    break;
-  case QuantI8DotSemantic::Q6K:
-    primitive = LocalPrimitiveKind::Q6KI8;
-    break;
-  }
+  const LocalPrimitiveKind primitive = facts.primitive;
 
   struct Candidate {
     SelectedQuantI8DotPhysical physical;
@@ -1995,276 +2259,31 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   llvm::SmallVector<Candidate, 16> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           kCoreAxisK, 8, target)) {
+           reduction->id, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
-    const unsigned logicalLanes =
-        candidate.axis.laneFactor * candidate.axis.registerFactor;
+    std::optional<QuantPrimitivePhysicalRule> rule =
+        deriveQuantPrimitiveRule(primitive, candidate, target);
+    if (!rule)
+      continue;
     LocalImplementation implementation;
     implementation.primitive = primitive;
     implementation.mapping = std::move(candidate.mapping);
-    if (primitive == LocalPrimitiveKind::PackedI4I8 ||
-        primitive == LocalPrimitiveKind::PackedI5I8) {
-      RVVVectorShape decodeShape = laneShape;
-      if (candidate.axis.laneFactor == 32) {
-        std::optional<RVVVectorShape> halfShape =
-            rvvShapeForSemanticLanes(8, 16, target);
-        if (halfShape && halfShape->lmulEighths >= 8 &&
-            halfShape->lmulEighths * 2 == laneShape.lmulEighths)
-          decodeShape = *halfShape;
-      }
-      implementation.valueShapes = {laneShape, decodeShape};
-    } else if (primitive == LocalPrimitiveKind::PackedI3GroupedI8) {
-      if (candidate.axis.laneFactor != 16 && candidate.axis.laneFactor != 32)
-        continue;
-      std::optional<RVVVectorShape> productShape =
-          rvvShapeForSameLanes(laneShape, 16, target);
-      std::optional<RVVVectorShape> segmentProductShape =
-          rvvShapeForSemanticLanes(16, 16, target);
-      if (!productShape || !segmentProductShape)
-        continue;
-      implementation.valueShapes = {laneShape, *productShape,
-                                    *segmentProductShape};
-    } else if (primitive == LocalPrimitiveKind::IQ2SI8) {
-      const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
-      if ((candidate.axis.laneFactor != 32 &&
-           candidate.axis.laneFactor != 64) ||
-          candidate.axis.registerFactor != 1)
-        continue;
-      std::optional<RVVVectorShape> indexShape =
-          rvvShapeForSemanticLanes(16, 4 * groupsPerVector, target);
-      RVVVectorShape tableShape{64, laneShape.lmulEighths};
-      std::optional<RVVVectorShape> signShape =
-          rvvShapeForSemanticLanes(8, 4 * groupsPerVector, target);
-      std::optional<RVVVectorShape> productShape =
-          rvvShapeForSameLanes(laneShape, 16, target);
-      std::optional<RVVVectorShape> segmentProductShape =
-          rvvShapeForSemanticLanes(16, 16, target);
-      if (!target.hasIndexedMemory || !indexShape || !signShape ||
-          !productShape || !segmentProductShape ||
-          !target.supportsIndexedVectorMemory(
-              tableShape.sew, tableShape.lmulEighths, indexShape->sew,
-              indexShape->lmulEighths))
-        continue;
-      implementation.valueShapes = {laneShape, *indexShape, tableShape,
-                                    *signShape, *productShape,
-                                    *segmentProductShape};
-    } else if (primitive == LocalPrimitiveKind::IQ3SI8) {
-      std::optional<RVVVectorShape> codeShape =
-          rvvShapeForSemanticLanes(8, 16, target);
-      std::optional<RVVVectorShape> indexShape =
-          rvvShapeForSemanticLanes(16, 16, target);
-      RVVVectorShape tableShape{32, laneShape.lmulEighths};
-      std::optional<RVVVectorShape> signShape =
-          rvvShapeForSemanticLanes(8, 8, target);
-      std::optional<RVVVectorShape> productShape =
-          rvvShapeForSameLanes(laneShape, 16, target);
-      std::optional<RVVVectorShape> halfProductShape =
-          rvvShapeForSemanticLanes(16, 32, target);
-      if (!target.hasIndexedMemory || !codeShape || !indexShape || !signShape ||
-          !productShape || !halfProductShape ||
-          !target.supportsIndexedVectorMemory(
-              tableShape.sew, tableShape.lmulEighths, indexShape->sew,
-              indexShape->lmulEighths))
-        continue;
-      implementation.valueShapes = {
-          laneShape, *codeShape, *indexShape, tableShape,
-          *signShape, *productShape, *halfProductShape};
-    } else if (primitive == LocalPrimitiveKind::IQ1MI8) {
-      const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
-      if ((candidate.axis.laneFactor != 32 &&
-           candidate.axis.laneFactor != 64) ||
-          candidate.axis.registerFactor != 1)
-        continue;
-      std::optional<RVVVectorShape> indexShape =
-          rvvShapeForSemanticLanes(16, 4 * groupsPerVector, target);
-      RVVVectorShape tableShape{64, laneShape.lmulEighths};
-      std::optional<RVVVectorShape> productShape =
-          rvvShapeForSameLanes(laneShape, 16, target);
-      std::optional<RVVVectorShape> segmentProductShape =
-          rvvShapeForSemanticLanes(16, 16, target);
-      if (!target.hasIndexedMemory || !indexShape || !productShape ||
-          !segmentProductShape ||
-          !target.supportsIndexedVectorMemory(
-              tableShape.sew, tableShape.lmulEighths, indexShape->sew,
-              indexShape->lmulEighths))
-        continue;
-      implementation.valueShapes = {laneShape, *indexShape, tableShape,
-                                    tableShape, *productShape,
-                                    *segmentProductShape};
-    } else if (primitive == LocalPrimitiveKind::Q6KI8) {
-      if ((candidate.axis.laneFactor != 32 &&
-           candidate.axis.laneFactor != 64) ||
-          candidate.axis.registerFactor != 1)
-        continue;
-      std::optional<RVVVectorShape> chunkShape =
-          rvvShapeForSemanticLanes(8, 32, target);
-      std::optional<RVVVectorShape> productShape =
-          rvvShapeForSameLanes(laneShape, 16, target);
-      std::optional<RVVVectorShape> segmentProductShape =
-          rvvShapeForSemanticLanes(16, 16, target);
-      if (!chunkShape || !productShape || !segmentProductShape)
-        continue;
-      implementation.valueShapes = {laneShape, *chunkShape, *productShape,
-                                    *segmentProductShape};
-    } else {
-      implementation.valueShapes = {laneShape};
-    }
-    LocalOperationProjection projection = LocalOperationProjection::None;
-    LocalHardwareOperationKind operationKind =
-        LocalHardwareOperationKind::RVVRegister;
-    switch (primitive) {
-    case LocalPrimitiveKind::PackedI4I8:
-    case LocalPrimitiveKind::PackedI5I8:
-      if ((candidate.axis.laneFactor != 16 &&
-           candidate.axis.laneFactor != 32) ||
-          logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
-        continue;
-      if (candidate.axis.laneFactor != 32)
-        projection = LocalOperationProjection::PackedDotRegisterChunks;
-      else if (implementation.valueShapes[1] == laneShape)
-        projection = LocalOperationProjection::PackedDotLaneSlide;
-      else
-        projection = LocalOperationProjection::PackedDotLaneCreate;
-      break;
-    case LocalPrimitiveKind::PackedI3GroupedI8:
-      if ((candidate.axis.laneFactor != 16 &&
-           candidate.axis.laneFactor != 32) ||
-          logicalLanes == 0 || (256 % logicalLanes) != 0 ||
-          candidate.axis.sequentialFactor != 256 / logicalLanes)
-        continue;
-      break;
-    case LocalPrimitiveKind::IQ2SI8:
-    case LocalPrimitiveKind::IQ1MI8:
-      if ((candidate.axis.laneFactor != 32 &&
-           candidate.axis.laneFactor != 64) ||
-          candidate.axis.registerFactor != 1 ||
-          candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
-        continue;
-      break;
-    case LocalPrimitiveKind::IQ3SI8:
-      if (candidate.axis.laneFactor != 64 ||
-          candidate.axis.registerFactor != 1 ||
-          candidate.axis.sequentialFactor != 4)
-        continue;
-      break;
-    case LocalPrimitiveKind::Q6KI8:
-      if ((candidate.axis.laneFactor != 32 &&
-           candidate.axis.laneFactor != 64) ||
-          candidate.axis.registerFactor != 1 ||
-          candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
-        continue;
-      operationKind =
-          logicalLanes == 32 && laneShape == RVVVectorShape{8, 16}
-              ? LocalHardwareOperationKind::RVVInlineAsm
-              : LocalHardwareOperationKind::RVVRegister;
-      break;
-    default:
-      break;
-    }
-    selectLocalHardwareOperation(implementation, operationKind, projection);
+    implementation.valueShapes.append(rule->valueShapes.begin(),
+                                      rule->valueShapes.end());
+    selectLocalHardwareOperation(implementation, rule->operation,
+                                 rule->projection);
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
-    AxisMappedResourceFacts resources;
-    resources.mapping = &implementation.mapping;
-    if (primitive == LocalPrimitiveKind::IQ2SI8) {
-      resources.values = {
-          {PhysicalLiveClass::Index, implementation.valueShapes[1]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[2]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[3]},
-          {PhysicalLiveClass::Memory, laneShape},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[4]},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[5],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK,
-           candidate.axis.laneFactor / 16},
-          {PhysicalLiveClass::Temporary, kRVVE32M1}};
-      resources.predicateGroups = 1;
-    } else if (primitive == LocalPrimitiveKind::PackedI3GroupedI8) {
-      resources.values = {
-          {PhysicalLiveClass::Memory, laneShape,
-           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 3},
-          {PhysicalLiveClass::Temporary, laneShape,
-           AxisMappedMultiplicity::RegisterFactor},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[1],
-           AxisMappedMultiplicity::RegisterFactor},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[2],
-           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK,
-           candidate.axis.laneFactor / 16},
-          {PhysicalLiveClass::Temporary, kRVVE32M1}};
-      resources.predicateGroups = 1;
-    } else if (primitive == LocalPrimitiveKind::IQ3SI8) {
-      resources.values = {
-          {PhysicalLiveClass::Memory, implementation.valueShapes[1]},
-          {PhysicalLiveClass::Index, implementation.valueShapes[2]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[3]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[4]},
-          {PhysicalLiveClass::Memory, laneShape},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[5]},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[6],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2},
-          {PhysicalLiveClass::Temporary, kRVVE32M1}};
-      resources.predicateGroups = 1;
-    } else if (primitive == LocalPrimitiveKind::IQ1MI8) {
-      resources.values = {
-          {PhysicalLiveClass::Index, implementation.valueShapes[1]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[2]},
-          {PhysicalLiveClass::Memory, implementation.valueShapes[3]},
-          {PhysicalLiveClass::Memory, laneShape},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[4],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[5],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK,
-           2 * (candidate.axis.laneFactor / 16)},
-          {PhysicalLiveClass::Temporary, kRVVE32M1}};
-    } else if (primitive == LocalPrimitiveKind::Q6KI8) {
-      if (implementation.operation.kind ==
-          LocalHardwareOperationKind::RVVInlineAsm) {
-        PhysicalResourceRequirements requirements;
-        requirements.reservedGroups = 0;
-        requirements.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
-        std::optional<PhysicalResourceBudget> budget =
-            calculatePhysicalResources(requirements, target);
-        if (!budget)
-          continue;
-        SelectedQuantI8DotPhysical selected;
-        selected.implementation = std::move(implementation);
-        selected.operandShape = laneShape;
-        selected.resources = *budget;
-        legal.push_back(Candidate{std::move(selected),
-                                  candidate.axis.sequentialFactor,
-                                  rvvRegisterGroups(laneShape),
-                                  candidate.axis.registerFactor});
-        continue;
-      }
-      resources.values = {
-          {PhysicalLiveClass::Memory, implementation.valueShapes[1],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK,
-           3 * (candidate.axis.laneFactor / 32)},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[1],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK,
-           2 * (candidate.axis.laneFactor / 32)},
-          {PhysicalLiveClass::Memory, laneShape},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[2]},
-          {PhysicalLiveClass::Temporary, implementation.valueShapes[3],
-           AxisMappedMultiplicity::Fixed, kCoreAxisK,
-           candidate.axis.laneFactor / 16},
-          {PhysicalLiveClass::Temporary, kRVVE32M1}};
-    } else if (candidate.axis.sequentialFactor > 1 && logicalLanes == 16) {
-      resources.values = {
-          {PhysicalLiveClass::Memory, laneShape,
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2},
-          {PhysicalLiveClass::Temporary, kRVVE32M1,
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
-    } else {
-      resources.values = {
-          {PhysicalLiveClass::Memory, laneShape,
-           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
-          {PhysicalLiveClass::Temporary, laneShape,
-           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
-          {PhysicalLiveClass::Temporary, kRVVE32M1,
-           AxisMappedMultiplicity::LogicalChunk, kCoreAxisK, 4, 16}};
+    std::optional<PhysicalResourceBudget> budget;
+    if (rule->directResources)
+      budget = calculatePhysicalResources(*rule->directResources, target);
+    else {
+      AxisMappedResourceFacts resources;
+      resources.mapping = &implementation.mapping;
+      resources.values.append(rule->liveValues.begin(), rule->liveValues.end());
+      resources.predicateGroups = rule->predicateGroups;
+      budget = calculateAxisMappedResources(resources, target);
     }
-    std::optional<PhysicalResourceBudget> budget =
-        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     SelectedQuantI8DotPhysical selected;
@@ -2290,11 +2309,11 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
 std::optional<SelectedE2M1E8M0I8Physical>
 selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
                          const RISCVTargetProfile &target) {
-  if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian ||
+  if (!target.hasRVV || !target.littleEndian ||
       facts.packedExtent != 16)
     return std::nullopt;
   const LogicalAxisConstraint *reduction =
-      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+      findUniqueLogicalAxisConstraint(facts.mapping, LogicalAxisRole::Reduction);
   if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
       reduction->extent != std::optional<uint64_t>(32))
     return std::nullopt;
@@ -2309,7 +2328,7 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
       rvvShapeCandidates(target, 8);
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           kCoreAxisK, 8, target)) {
+           reduction->id, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     llvm::SmallVector<RVVVectorShape, 9> activationShapes(
         laneShapes.begin(), laneShapes.end());
@@ -2334,9 +2353,8 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
                          !activationShape;
       if (!registerMF2 && !registerM1M2 && !strip)
         continue;
-      selectLocalHardwareOperation(
-          implementation, strip ? LocalHardwareOperationKind::RVVStrip
-                                : LocalHardwareOperationKind::RVVRegister);
+      selectLocalHardwareOperation(implementation,
+                                   LocalHardwareOperationKind::RVVIntrinsic);
       if (!finalizeLocalHardwareOperation(implementation))
         continue;
       RVVVectorShape selectedActivation =
@@ -2349,17 +2367,17 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
       resources.mapping = &implementation.mapping;
       resources.values = {
           {PhysicalLiveClass::Memory, laneShape,
-           AxisMappedMultiplicity::RegisterFactor},
+           AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
           {PhysicalLiveClass::Memory, selectedActivation,
-           AxisMappedMultiplicity::LaneCapacity},
+           AxisMappedMultiplicity::LaneCapacity, candidate.axis.id},
           {PhysicalLiveClass::Temporary, laneShape,
-           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+           AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 2},
           {PhysicalLiveClass::Temporary, selectedActivation,
-           AxisMappedMultiplicity::LaneCapacity, kCoreAxisK, 2},
+           AxisMappedMultiplicity::LaneCapacity, candidate.axis.id, 2},
           {PhysicalLiveClass::Temporary, *productShape,
-           AxisMappedMultiplicity::LaneCapacity},
+           AxisMappedMultiplicity::LaneCapacity, candidate.axis.id},
           {PhysicalLiveClass::Temporary, kRVVE32M1,
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
+           AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
       std::optional<PhysicalResourceBudget> budget =
           calculateAxisMappedResources(resources, target);
       if (!budget)
@@ -2389,20 +2407,16 @@ std::optional<SelectedGroupedAffineI4I8Physical>
 selectGroupedAffineI4I8Physical(
     const GroupedAffineI4I8CandidateFacts &facts,
     const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasWideningInteger ||
-      target.vlenBits < 128 || !target.littleEndian)
+  if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian)
     return std::nullopt;
-  auto axis = [&](unsigned id) -> const LogicalAxisConstraint * {
-    auto found = llvm::find_if(facts.mapping.axes,
-                               [&](const LogicalAxisConstraint &candidate) {
-                                 return candidate.id == id;
-                               });
-    return found == facts.mapping.axes.end() ? nullptr : &*found;
-  };
-  const LogicalAxisConstraint *rows = axis(kCoreAxisM);
-  const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
-  const LogicalAxisConstraint *groups = axis(kCoreAxisGroup);
-  const LogicalAxisConstraint *packed = axis(kCoreAxisPacked);
+  const LogicalAxisConstraint *rows = findUniqueLogicalAxisConstraint(
+      facts.mapping, LogicalAxisRole::Free);
+  const LogicalAxisConstraint *reduction = findUniqueLogicalAxisConstraint(
+      facts.mapping, LogicalAxisRole::Reduction);
+  const LogicalAxisConstraint *groups = findUniqueLogicalAxisConstraint(
+      facts.mapping, LogicalAxisRole::Group);
+  const LogicalAxisConstraint *packed = findUniqueLogicalAxisConstraint(
+      facts.mapping, LogicalAxisRole::Packed);
   if (!rows || !rows->extent || *rows->extent == 0 ||
       rows->role != LogicalAxisRole::Free || !reduction ||
       !reduction->extent || *reduction->extent == 0 ||
@@ -2435,10 +2449,10 @@ selectGroupedAffineI4I8Physical(
 
   CoreMappingProblem problem = facts.mapping;
   for (LogicalAxisConstraint &constraint : problem.axes) {
-    constraint.allowLane = constraint.id == kCoreAxisK;
+    constraint.allowLane = constraint.id == reduction->id;
     constraint.requireLane = constraint.allowLane;
     constraint.registerFactors =
-        constraint.id == kCoreAxisK
+        constraint.id == reduction->id
             ? llvm::SmallVector<unsigned, 4>{1, 2}
             : llvm::SmallVector<unsigned, 4>{1};
   }
@@ -2452,10 +2466,10 @@ selectGroupedAffineI4I8Physical(
   llvm::SmallVector<Candidate, 4> legal;
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
-    const PhysicalAxisDecomposition *reduction =
-        findAxisMapping(mapping, kCoreAxisK);
-    if (!reduction ||
-        reduction->laneFactor * reduction->registerFactor > 32)
+    const PhysicalAxisDecomposition *mappedReduction =
+        findAxisMapping(mapping, reduction->id);
+    if (!mappedReduction ||
+        mappedReduction->laneFactor * mappedReduction->registerFactor > 32)
       continue;
     SelectedGroupedAffineI4I8Physical candidate = selected;
     candidate.implementation.primitive =
@@ -2464,15 +2478,12 @@ selectGroupedAffineI4I8Physical(
     candidate.implementation.valueShapes = {candidate.packedShape,
                                             candidate.widenedShape};
     const bool registerAsm =
-        reduction->sequentialFactor == 1 && reduction->laneFactor == 16;
+        mappedReduction->sequentialFactor == 1 &&
+        mappedReduction->laneFactor == 16;
     selectLocalHardwareOperation(
         candidate.implementation,
-        reduction->sequentialFactor > 1
-            ? LocalHardwareOperationKind::RVVStrip
-            : registerAsm ? LocalHardwareOperationKind::RVVInlineAsm
-                          : LocalHardwareOperationKind::RVVRegister,
-        LocalOperationProjection::None, 1,
-        mappedHardwareLaneFactor(candidate.implementation.mapping));
+        registerAsm ? LocalHardwareOperationKind::RVVInlineAsm
+                    : LocalHardwareOperationKind::RVVIntrinsic);
     if (!finalizeLocalHardwareOperation(candidate.implementation))
       continue;
     if (registerAsm) {
@@ -2491,15 +2502,15 @@ selectGroupedAffineI4I8Physical(
       resources.mapping = &candidate.implementation.mapping;
       resources.values = {
           {PhysicalLiveClass::Memory, candidate.packedShape,
-           AxisMappedMultiplicity::RegisterFactor},
+           AxisMappedMultiplicity::RegisterFactor, mappedReduction->id},
           {PhysicalLiveClass::Memory, candidate.scaleShape},
           {PhysicalLiveClass::Memory, candidate.activationShape,
-           AxisMappedMultiplicity::RegisterFactor},
+           AxisMappedMultiplicity::RegisterFactor, mappedReduction->id},
           {PhysicalLiveClass::Memory, candidate.activationSumShape},
           {PhysicalLiveClass::Temporary, candidate.widenedShape,
-           AxisMappedMultiplicity::RegisterFactor},
+           AxisMappedMultiplicity::RegisterFactor, mappedReduction->id},
           {PhysicalLiveClass::Temporary, candidate.reductionShape,
-           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
+           AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
       std::optional<PhysicalResourceBudget> budget =
           calculateAxisMappedResources(resources, target);
       if (!budget)
@@ -2507,7 +2518,7 @@ selectGroupedAffineI4I8Physical(
       candidate.resources = *budget;
     }
     legal.push_back(
-        Candidate{std::move(candidate), reduction->sequentialFactor});
+        Candidate{std::move(candidate), mappedReduction->sequentialFactor});
   }
   if (legal.empty())
     return std::nullopt;
@@ -2630,7 +2641,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     const PhysicalAxisDecomposition *laneAxis =
         mapping.laneAxis ? findAxisMapping(mapping, *mapping.laneAxis) : nullptr;
     const PhysicalAxisDecomposition *reduction =
-        findAxisMapping(mapping, kCoreAxisK);
+        findAxisMapping(mapping, facts.reductionAxis);
     if (!laneAxis || !reduction ||
         (reduction->unrollFactor != 1 && reduction->unrollFactor != 2 &&
          reduction->unrollFactor != 4) ||
@@ -2708,7 +2719,9 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
             facts.reductionExtent &&
             *facts.reductionExtent %
                     (reduction->unrollFactor *
-                     (laneAxis->id == kCoreAxisK ? laneAxis->laneFactor : 1)) !=
+                     (laneAxis->id == facts.reductionAxis
+                          ? laneAxis->laneFactor
+                          : 1)) !=
                 0),
         sequentialPenalty,
         facts.stridedOperands * reduction->unrollFactor +
@@ -2771,9 +2784,9 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   LogicalAxisConstraint *mConstraint = nullptr;
   LogicalAxisConstraint *nConstraint = nullptr;
   for (LogicalAxisConstraint &axis : problem.axes) {
-    if (axis.id == kCoreAxisM)
+    if (axis.id == facts.lhsFreeAxis)
       mConstraint = &axis;
-    if (axis.id == kCoreAxisN)
+    if (axis.id == facts.rhsFreeAxis)
       nConstraint = &axis;
   }
   if (!mConstraint || !nConstraint || !mConstraint->extent ||
@@ -2792,7 +2805,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   const unsigned preferredLMUL = 1;
   std::optional<uint64_t> reductionExtent;
   for (const LogicalAxisConstraint &axis : problem.axes)
-    if (axis.id == kCoreAxisK)
+    if (axis.id == facts.reductionAxis)
       reductionExtent = axis.extent;
   if (!reductionExtent)
     return std::nullopt;
@@ -2805,6 +2818,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
           : 1;
   struct Candidate {
     CorePhysicalMapping mapping;
+    RVVVectorShape accumulatorShape;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned lanePenalty = 0;
@@ -2819,18 +2833,20 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
     const PhysicalAxisDecomposition *m =
-        findAxisMapping(mapping, kCoreAxisM);
+        findAxisMapping(mapping, facts.lhsFreeAxis);
     const PhysicalAxisDecomposition *n =
-        findAxisMapping(mapping, kCoreAxisN);
+        findAxisMapping(mapping, facts.rhsFreeAxis);
     const PhysicalAxisDecomposition *k =
-        findAxisMapping(mapping, kCoreAxisK);
+        findAxisMapping(mapping, facts.reductionAxis);
     const PhysicalAxisDecomposition *lane =
         mapping.laneAxis ? findAxisMapping(mapping, *mapping.laneAxis) : nullptr;
     std::optional<unsigned> inputLMUL = rvvIntegerLMUL(mapping.laneShape);
     std::optional<RVVVectorShape> accumulatorShape =
         rvvShapeForSameLanes(mapping.laneShape, 32, target);
     if (!m || !n || !k || !lane ||
-        (lane->id != kCoreAxisN && lane->id != kCoreAxisK) || !inputLMUL ||
+        (lane->id != facts.rhsFreeAxis &&
+         lane->id != facts.reductionAxis) ||
+        !inputLMUL ||
         !accumulatorShape ||
         (k->unrollFactor != 1 && k->unrollFactor != 2 &&
          k->unrollFactor != 4) ||
@@ -2844,13 +2860,13 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
           !facts.pipeline.allLoadsFeedPrimitive ||
           facts.pipeline.addressDependsOnAccumulator ||
           facts.pipeline.predicateDependsOnAccumulator)) ||
-        (lane->id == kCoreAxisN &&
+        (lane->id == facts.rhsFreeAxis &&
          (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
       continue;
     const unsigned rows = m->registerFactor;
     const unsigned columns = n->registerFactor;
     const unsigned bufferCount = mapping.pipeline.bufferCount;
-    const bool columnLane = lane->id == kCoreAxisN;
+    const bool columnLane = lane->id == facts.rhsFreeAxis;
     const unsigned accumulatorVectors =
         columnLane ? rows : rows * columns;
     const unsigned lhsVectors = columnLane ? 0 : (bufferCount > 1 ? rows : 1);
@@ -2874,7 +2890,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     const unsigned preferredRealizedColumns =
         columnLane ? std::min(columnTile, lane->laneFactor) : preferredColumns;
     legal.push_back(Candidate{
-        std::move(mapping), *resources, tailPenalty,
+        std::move(mapping), *accumulatorShape, *resources, tailPenalty,
         static_cast<unsigned>(!columnLane),
         static_cast<unsigned>(std::abs(static_cast<int>(rows) -
                                        static_cast<int>(preferredRows))),
@@ -2901,6 +2917,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.resources.peakGroups);
   });
   return SelectedF16MatmulPhysical{std::move(legal.front().mapping),
+                                   legal.front().accumulatorShape,
                                    legal.front().resources};
 }
 
