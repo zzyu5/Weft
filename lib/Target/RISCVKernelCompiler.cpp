@@ -588,22 +588,30 @@ struct DotDecision {
   unsigned rowTile = 1;
 };
 
+struct LocalDenseAxisAnalysis {
+  mlir::Value coordinate;
+  bool vla = false;
+  mlir::Value extent;
+  std::optional<uint64_t> staticExtent;
+  LaneRelation lhsRelation = LaneRelation::Independent;
+  LaneRelation rhsRelation = LaneRelation::Independent;
+  std::optional<AffineScalarExpression> lhsStride;
+  std::optional<AffineScalarExpression> rhsStride;
+};
+
 struct LocalDenseProductAnalysis {
   LoadOp lhsLoad;
   LoadOp rhsLoad;
-  BlockIndexOp lhsFreeAxis;
-  BlockIndexOp rhsFreeAxis;
-  BlockIndexOp reductionAxis;
-  unsigned lhsFreeExtent = 1;
-  unsigned rhsFreeExtent = 1;
-  std::optional<uint64_t> reductionExtent;
-  LaneRelation lhsReductionRelation = LaneRelation::Independent;
-  LaneRelation rhsReductionRelation = LaneRelation::Independent;
-  LaneRelation rhsFreeRelation = LaneRelation::Independent;
-  std::optional<AffineScalarExpression> lhsReductionStride;
-  std::optional<AffineScalarExpression> rhsReductionStride;
-  std::optional<AffineScalarExpression> rhsFreeStride;
-  CoreMappingProblem mapping;
+  StructuredProductFacts product;
+  llvm::SmallVector<LocalDenseAxisAnalysis> axes;
+
+  const LocalDenseAxisAnalysis *findAxis(mlir::Value coordinate) const {
+    auto found = llvm::find_if(
+        axes, [&](const LocalDenseAxisAnalysis &axis) {
+          return axis.coordinate == coordinate;
+        });
+    return found == axes.end() ? nullptr : &*found;
+  }
 };
 
 template <typename Decision>
@@ -5729,126 +5737,54 @@ private:
                            mlir::Value result) {
     std::optional<StructuredProductFacts> product =
         analyzeStructuredProductFacts(kernelFacts, lhs, rhs, result);
-    if (!product || product->reductionAxes.size() != 1 ||
-        product->lhsFreeAxes.size() > 1 || product->rhsFreeAxes.size() > 1 ||
-        product->resultAxes.size() !=
-            product->lhsFreeAxes.size() + product->rhsFreeAxes.size())
+    if (!product)
       return std::nullopt;
-    for (mlir::Value axis : product->lhsFreeAxes)
-      if (!llvm::is_contained(product->resultAxes, axis))
-        return std::nullopt;
-    for (mlir::Value axis : product->rhsFreeAxes)
-      if (!llvm::is_contained(product->resultAxes, axis))
-        return std::nullopt;
-
     LocalDenseProductAnalysis analysis;
     analysis.lhsLoad = reloadableLoad(lhs);
     analysis.rhsLoad = reloadableLoad(rhs);
-    analysis.reductionAxis =
-        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!product->lhsFreeAxes.empty())
-      analysis.lhsFreeAxis =
-          product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!product->rhsFreeAxes.empty())
-      analysis.rhsFreeAxis =
-          product->rhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!analysis.lhsLoad || !analysis.rhsLoad || !analysis.reductionAxis ||
-        (!product->lhsFreeAxes.empty() && !analysis.lhsFreeAxis) ||
-        (!product->rhsFreeAxes.empty() && !analysis.rhsFreeAxis))
+    if (!analysis.lhsLoad || !analysis.rhsLoad)
       return std::nullopt;
-
-    auto staticExtent = [&](BlockIndexOp axis) -> std::optional<unsigned> {
-      if (!axis)
-        return 1;
-      std::optional<int64_t> extent = physicalExtent(axis.getExtent());
-      if (!extent || *extent <= 0 ||
-          static_cast<uint64_t>(*extent) >
-              static_cast<uint64_t>(std::numeric_limits<unsigned>::max()))
-        return std::nullopt;
-      return static_cast<unsigned>(*extent);
-    };
-    std::optional<unsigned> lhsFreeExtent = staticExtent(analysis.lhsFreeAxis);
-    std::optional<unsigned> rhsFreeExtent = staticExtent(analysis.rhsFreeAxis);
-    if (!lhsFreeExtent || !rhsFreeExtent)
-      return std::nullopt;
-    analysis.lhsFreeExtent = *lhsFreeExtent;
-    analysis.rhsFreeExtent = *rhsFreeExtent;
-    if (std::optional<int64_t> extent =
-            physicalExtent(analysis.reductionAxis.getExtent());
-        extent && *extent > 0)
-      analysis.reductionExtent = static_cast<uint64_t>(*extent);
-
     const MemoryAccessFact *lhsAccess =
         memoryFact(analysis.lhsLoad.getOperation());
     const MemoryAccessFact *rhsAccess =
         memoryFact(analysis.rhsLoad.getOperation());
     if (!lhsAccess || !rhsAccess)
       return std::nullopt;
-    analysis.lhsReductionRelation =
-        memoryRelation(*lhsAccess, analysis.reductionAxis.getResult());
-    analysis.rhsReductionRelation =
-        memoryRelation(*rhsAccess, analysis.reductionAxis.getResult());
-    auto legalReductionRelation = [](LaneRelation relation) {
-      return relation == LaneRelation::UnitStride ||
-             relation == LaneRelation::Strided;
+    analysis.product = std::move(*product);
+    llvm::SmallVector<mlir::Value> logicalAxes = analysis.product.lhsAxes;
+    auto appendUnique = [&](llvm::ArrayRef<mlir::Value> axes) {
+      for (mlir::Value axis : axes)
+        if (!llvm::is_contained(logicalAxes, axis))
+          logicalAxes.push_back(axis);
     };
-    if (!legalReductionRelation(analysis.lhsReductionRelation) ||
-        !legalReductionRelation(analysis.rhsReductionRelation))
-      return std::nullopt;
-    if (analysis.lhsFreeAxis &&
-        (memoryRelation(*lhsAccess, analysis.lhsFreeAxis.getResult()) ==
-             LaneRelation::Independent ||
-         memoryRelation(*rhsAccess, analysis.lhsFreeAxis.getResult()) !=
-             LaneRelation::Independent))
-      return std::nullopt;
-    if (analysis.rhsFreeAxis &&
-        memoryRelation(*lhsAccess, analysis.rhsFreeAxis.getResult()) !=
-            LaneRelation::Independent)
-      return std::nullopt;
-    if (analysis.rhsFreeAxis) {
-      analysis.rhsFreeRelation =
-          memoryRelation(*rhsAccess, analysis.rhsFreeAxis.getResult());
-      if (analysis.rhsFreeRelation == LaneRelation::Independent)
-        return std::nullopt;
-      if (analysis.rhsFreeRelation == LaneRelation::Strided) {
-        const MemoryAxisFact *axis =
-            memoryAxisFact(*rhsAccess, analysis.rhsFreeAxis.getResult());
-        if (!axis || !axis->laneStride)
-          return std::nullopt;
-        analysis.rhsFreeStride = axis->laneStride;
-      }
-    }
-    if (analysis.lhsReductionRelation == LaneRelation::Strided) {
-      const MemoryAxisFact *axis =
-          memoryAxisFact(*lhsAccess, analysis.reductionAxis.getResult());
-      if (!axis || !axis->laneStride)
-        return std::nullopt;
-      analysis.lhsReductionStride = axis->laneStride;
-    }
-    if (analysis.rhsReductionRelation == LaneRelation::Strided) {
-      const MemoryAxisFact *axis =
-          memoryAxisFact(*rhsAccess, analysis.reductionAxis.getResult());
-      if (!axis || !axis->laneStride)
-        return std::nullopt;
-      analysis.rhsReductionStride = axis->laneStride;
-    }
+    appendUnique(analysis.product.rhsAxes);
+    appendUnique(analysis.product.resultAxes);
 
-    if (analysis.lhsFreeAxis)
-      analysis.mapping.axes.push_back(LogicalAxisConstraint{
-          kCoreAxisM, LogicalAxisRole::Free, analysis.lhsFreeExtent, false,
-          false, false,
-          registerFactorCandidates(analysis.lhsFreeExtent,
-                                   std::min(analysis.lhsFreeExtent, 8u))});
-    if (analysis.rhsFreeAxis)
-      analysis.mapping.axes.push_back(LogicalAxisConstraint{
-          kCoreAxisN, LogicalAxisRole::Free, analysis.rhsFreeExtent, false,
-          false, false,
-          registerFactorCandidates(analysis.rhsFreeExtent,
-                                   std::min(analysis.rhsFreeExtent, 8u))});
-    analysis.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisK, LogicalAxisRole::Reduction, analysis.reductionExtent,
-        false, true, true, {1}});
-    analysis.mapping.unrollAxis = kCoreAxisK;
+    auto strideFor = [&](const MemoryAccessFact &access,
+                         mlir::Value coordinate)
+        -> std::optional<AffineScalarExpression> {
+      const MemoryAxisFact *axis = memoryAxisFact(access, coordinate);
+      return axis ? axis->laneStride : std::nullopt;
+    };
+    for (mlir::Value coordinate : logicalAxes) {
+      auto logical = kernelFacts.axes.find(coordinate);
+      if (logical == kernelFacts.axes.end())
+        return std::nullopt;
+      LocalDenseAxisAnalysis axis;
+      axis.coordinate = coordinate;
+      axis.vla = logical->second.vla;
+      axis.extent = logical->second.extent;
+      if (axis.extent) {
+        std::optional<int64_t> extent = physicalExtent(axis.extent);
+        if (extent && *extent > 0)
+          axis.staticExtent = static_cast<uint64_t>(*extent);
+      }
+      axis.lhsRelation = memoryRelation(*lhsAccess, coordinate);
+      axis.rhsRelation = memoryRelation(*rhsAccess, coordinate);
+      axis.lhsStride = strideFor(*lhsAccess, coordinate);
+      axis.rhsStride = strideFor(*rhsAccess, coordinate);
+      analysis.axes.push_back(std::move(axis));
+    }
     return analysis;
   }
 
@@ -5895,37 +5831,73 @@ private:
     }
     std::optional<LocalDenseProductAnalysis> analysis =
         analyzeLocalDenseProduct(dot.getLhs(), dot.getRhs(), dot.getResult());
-    if (!analysis || static_cast<bool>(analysis->lhsFreeAxis) ==
-                         static_cast<bool>(analysis->rhsFreeAxis)) {
+    if (!analysis || analysis->product.reductionAxes.size() != 1 ||
+        analysis->product.resultAxes.size() != 1 ||
+        !((analysis->product.lhsFreeAxes.size() == 1 &&
+           analysis->product.rhsFreeAxes.empty()) ||
+          (analysis->product.lhsFreeAxes.empty() &&
+           analysis->product.rhsFreeAxes.size() == 1))) {
       dot.emitError(
-          "local f32 dot requires one free block axis and one reduction axis");
+          "local f32 dot realization requires one mapped free axis and one reduction axis");
       return mlir::failure();
     }
-    const bool freeOnLHS = static_cast<bool>(analysis->lhsFreeAxis);
-    BlockIndexOp rowAxis =
-        freeOnLHS ? analysis->lhsFreeAxis : analysis->rhsFreeAxis;
+    const bool freeOnLHS = analysis->product.lhsFreeAxes.size() == 1;
+    mlir::Value rowCoordinate =
+        freeOnLHS ? analysis->product.lhsFreeAxes.front()
+                  : analysis->product.rhsFreeAxes.front();
+    mlir::Value reductionCoordinate =
+        analysis->product.reductionAxes.front();
+    const LocalDenseAxisAnalysis *row = analysis->findAxis(rowCoordinate);
+    const LocalDenseAxisAnalysis *reduction =
+        analysis->findAxis(reductionCoordinate);
+    BlockIndexOp rowAxis = rowCoordinate.getDefiningOp<BlockIndexOp>();
+    BlockIndexOp reductionAxis =
+        reductionCoordinate.getDefiningOp<BlockIndexOp>();
+    auto legalReductionRelation = [](LaneRelation relation) {
+      return relation == LaneRelation::UnitStride ||
+             relation == LaneRelation::Strided;
+    };
+    const bool rowMemoryLegal =
+        row && (freeOnLHS ? row->lhsRelation : row->rhsRelation) !=
+                   LaneRelation::Independent &&
+        (freeOnLHS ? row->rhsRelation : row->lhsRelation) ==
+            LaneRelation::Independent;
+    if (!row || !reduction || !rowAxis || !reductionAxis ||
+        !row->staticExtent ||
+        *row->staticExtent > std::numeric_limits<unsigned>::max() ||
+        !rowMemoryLegal ||
+        !legalReductionRelation(reduction->lhsRelation) ||
+        !legalReductionRelation(reduction->rhsRelation) ||
+        (reduction->lhsRelation == LaneRelation::Strided &&
+         !reduction->lhsStride) ||
+        (reduction->rhsRelation == LaneRelation::Strided &&
+         !reduction->rhsStride)) {
+      dot.emitError(
+          "local f32 dot axes have no legal register microkernel mapping");
+      return mlir::failure();
+    }
+    const unsigned rowExtent = static_cast<unsigned>(*row->staticExtent);
 
     PlannedPhysicalDecision<DotDecision> planned;
     DotDecision &decision = planned.realization;
     decision.operation = dot.getOperation();
     decision.lhs = LocalDotOperandDecision{
         dot.getLhs(), analysis->lhsLoad.getOperation(), freeOnLHS,
-        analysis->lhsReductionRelation == LaneRelation::UnitStride
+        reduction->lhsRelation == LaneRelation::UnitStride
             ? PhysicalMemoryMode::UnitStride
             : PhysicalMemoryMode::Strided,
-        analysis->lhsReductionStride};
+        reduction->lhsStride};
     decision.rhs = LocalDotOperandDecision{
         dot.getRhs(), analysis->rhsLoad.getOperation(), !freeOnLHS,
-        analysis->rhsReductionRelation == LaneRelation::UnitStride
+        reduction->rhsRelation == LaneRelation::UnitStride
             ? PhysicalMemoryMode::UnitStride
             : PhysicalMemoryMode::Strided,
-        analysis->rhsReductionStride};
+        reduction->rhsStride};
     decision.rowAxis = rowAxis.getResult();
     decision.rowMappingAxis = freeOnLHS ? kCoreAxisM : kCoreAxisN;
-    decision.reductionAxis = analysis->reductionAxis.getResult();
-    decision.reductionExtent = analysis->reductionAxis.getExtent();
-    decision.rowTile = freeOnLHS ? analysis->lhsFreeExtent
-                                 : analysis->rhsFreeExtent;
+    decision.reductionAxis = reductionAxis.getResult();
+    decision.reductionExtent = reductionAxis.getExtent();
+    decision.rowTile = rowExtent;
     for (const LocalDotOperandDecision *operand :
          {&decision.lhs, &decision.rhs}) {
       auto load = mlir::cast<LoadOp>(operand->load);
@@ -5942,23 +5914,30 @@ private:
     F32DotCandidateFacts candidateFacts;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
-        {dot.getLhs(), dot.getRhs()}, analysis->reductionAxis.getResult(),
+        {dot.getLhs(), dot.getRhs()}, reductionCoordinate,
         dot.getInit());
-    candidateFacts.reductionExtent = analysis->reductionExtent;
-    candidateFacts.mapping = analysis->mapping;
+    candidateFacts.reductionExtent = reduction->staticExtent;
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        decision.rowMappingAxis, LogicalAxisRole::Free, rowExtent, false,
+        false, false,
+        registerFactorCandidates(rowExtent, std::min(rowExtent, 8u))});
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisK, LogicalAxisRole::Reduction, reduction->staticExtent,
+        false, true, true, {1}});
+    candidateFacts.mapping.unrollAxis = kCoreAxisK;
     if (freeOnLHS) {
-      candidateFacts.lhsAxes = {kCoreAxisM, kCoreAxisK};
+      candidateFacts.lhsAxes = {decision.rowMappingAxis, kCoreAxisK};
       candidateFacts.rhsAxes = {kCoreAxisK};
     } else {
       candidateFacts.lhsAxes = {kCoreAxisK};
-      candidateFacts.rhsAxes = {kCoreAxisM, kCoreAxisK};
+      candidateFacts.rhsAxes = {decision.rowMappingAxis, kCoreAxisK};
     }
     candidateFacts.unitStrideOperands =
-        (analysis->lhsReductionRelation == LaneRelation::UnitStride) +
-        (analysis->rhsReductionRelation == LaneRelation::UnitStride);
+        (reduction->lhsRelation == LaneRelation::UnitStride) +
+        (reduction->rhsRelation == LaneRelation::UnitStride);
     candidateFacts.stridedOperands =
-        (analysis->lhsReductionRelation == LaneRelation::Strided) +
-        (analysis->rhsReductionRelation == LaneRelation::Strided);
+        (reduction->lhsRelation == LaneRelation::Strided) +
+        (reduction->rhsRelation == LaneRelation::Strided);
     std::optional<SelectedF32DotPhysical> physical =
         weft::riscv_internal::selectF32DotPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -9120,58 +9099,103 @@ private:
     std::optional<LocalDenseProductAnalysis> analysis =
         analyzeLocalDenseProduct(matmul.getLhs(), matmul.getRhs(),
                                  matmul.getResult());
-    if (!analysis || !analysis->lhsFreeAxis || !analysis->rhsFreeAxis ||
-        !analysis->reductionExtent ||
-        analysis->lhsReductionRelation != LaneRelation::UnitStride ||
-        analysis->rhsReductionRelation != LaneRelation::UnitStride)
+    if (!analysis || analysis->product.lhsFreeAxes.size() != 1 ||
+        analysis->product.rhsFreeAxes.size() != 1 ||
+        analysis->product.reductionAxes.size() != 1 ||
+        analysis->product.resultAxes.size() != 2)
+      return std::nullopt;
+    mlir::Value lhsFreeCoordinate = analysis->product.lhsFreeAxes.front();
+    mlir::Value rhsFreeCoordinate = analysis->product.rhsFreeAxes.front();
+    mlir::Value reductionCoordinate =
+        analysis->product.reductionAxes.front();
+    const LocalDenseAxisAnalysis *lhsFree =
+        analysis->findAxis(lhsFreeCoordinate);
+    const LocalDenseAxisAnalysis *rhsFree =
+        analysis->findAxis(rhsFreeCoordinate);
+    const LocalDenseAxisAnalysis *reduction =
+        analysis->findAxis(reductionCoordinate);
+    BlockIndexOp lhsFreeAxis =
+        lhsFreeCoordinate.getDefiningOp<BlockIndexOp>();
+    BlockIndexOp rhsFreeAxis =
+        rhsFreeCoordinate.getDefiningOp<BlockIndexOp>();
+    BlockIndexOp reductionAxis =
+        reductionCoordinate.getDefiningOp<BlockIndexOp>();
+    const bool rhsColumnLegal =
+        rhsFree &&
+        (rhsFree->rhsRelation == LaneRelation::UnitStride ||
+         (rhsFree->rhsRelation == LaneRelation::Strided &&
+          rhsFree->rhsStride));
+    if (!lhsFree || !rhsFree || !reduction || !lhsFreeAxis ||
+        !rhsFreeAxis || !reductionAxis || !lhsFree->staticExtent ||
+        !rhsFree->staticExtent || !reduction->staticExtent ||
+        *lhsFree->staticExtent > std::numeric_limits<unsigned>::max() ||
+        *rhsFree->staticExtent > std::numeric_limits<unsigned>::max() ||
+        *reduction->staticExtent > std::numeric_limits<unsigned>::max() ||
+        lhsFree->lhsRelation == LaneRelation::Independent ||
+        lhsFree->rhsRelation != LaneRelation::Independent ||
+        rhsFree->lhsRelation != LaneRelation::Independent || !rhsColumnLegal ||
+        reduction->lhsRelation != LaneRelation::UnitStride ||
+        reduction->rhsRelation != LaneRelation::UnitStride)
       return std::nullopt;
     if (!isContiguousPrefixPredicate(analysis->lhsLoad.getWhere(),
-                                     analysis->lhsFreeAxis.getResult()) ||
+                                     lhsFreeCoordinate) ||
         !isContiguousPrefixPredicate(analysis->lhsLoad.getWhere(),
-                                     analysis->reductionAxis.getResult()) ||
+                                     reductionCoordinate) ||
         !isContiguousPrefixPredicate(analysis->rhsLoad.getWhere(),
-                                     analysis->reductionAxis.getResult()) ||
+                                     reductionCoordinate) ||
         !isContiguousPrefixPredicate(analysis->rhsLoad.getWhere(),
-                                     analysis->rhsFreeAxis.getResult()))
+                                     rhsFreeCoordinate))
       return std::nullopt;
+
+    const unsigned rowTile =
+        static_cast<unsigned>(*lhsFree->staticExtent);
+    const unsigned columnTile =
+        static_cast<unsigned>(*rhsFree->staticExtent);
+    const unsigned reductionTile =
+        static_cast<unsigned>(*reduction->staticExtent);
 
     PlannedPhysicalDecision<F16GemmNTileDecision> planned;
     F16GemmNTileDecision &decision = planned.realization;
     decision.operation = matmul.getOperation();
     decision.lhsLoad = analysis->lhsLoad.getOperation();
     decision.rhsLoad = analysis->rhsLoad.getOperation();
-    decision.lhsRowAxis = analysis->lhsFreeAxis.getResult();
-    decision.lhsReductionAxis = analysis->reductionAxis.getResult();
-    decision.rhsReductionAxis = analysis->reductionAxis.getResult();
-    decision.rhsColumnAxis = analysis->rhsFreeAxis.getResult();
-    decision.rowTile = analysis->lhsFreeExtent;
-    decision.columnTile = analysis->rhsFreeExtent;
-    decision.reductionTile = static_cast<unsigned>(*analysis->reductionExtent);
+    decision.lhsRowAxis = lhsFreeCoordinate;
+    decision.lhsReductionAxis = reductionCoordinate;
+    decision.rhsReductionAxis = reductionCoordinate;
+    decision.rhsColumnAxis = rhsFreeCoordinate;
+    decision.rowTile = rowTile;
+    decision.columnTile = columnTile;
+    decision.reductionTile = reductionTile;
     decision.rhsColumnMemoryMode =
-        analysis->rhsFreeRelation == LaneRelation::UnitStride
+        rhsFree->rhsRelation == LaneRelation::UnitStride
             ? PhysicalMemoryMode::UnitStride
             : PhysicalMemoryMode::Strided;
-    decision.rhsColumnStride = analysis->rhsFreeStride;
+    decision.rhsColumnStride = rhsFree->rhsStride;
     F16MatmulCandidateFacts candidateFacts;
-    candidateFacts.mapping = analysis->mapping;
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisM, LogicalAxisRole::Free, rowTile, false, false, false,
+        registerFactorCandidates(rowTile, std::min(rowTile, 8u))});
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisN, LogicalAxisRole::Free, columnTile, false, false, false,
+        registerFactorCandidates(columnTile, std::min(columnTile, 8u))});
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisK, LogicalAxisRole::Reduction, reduction->staticExtent,
+        false, true, true, {1}});
+    candidateFacts.mapping.unrollAxis = kCoreAxisK;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
         {matmul.getLhs(), matmul.getRhs()},
-        analysis->reductionAxis.getResult(), matmul.getInit());
-    const bool legalColumnLane =
-        analysis->rhsFreeRelation == LaneRelation::UnitStride ||
-        (analysis->rhsFreeRelation == LaneRelation::Strided &&
-         analysis->rhsFreeStride);
+        reductionCoordinate, matmul.getInit());
     for (LogicalAxisConstraint &axis : candidateFacts.mapping.axes) {
       if (axis.id == kCoreAxisK)
         axis.requireLane = false;
       if (axis.id == kCoreAxisN) {
-        axis.allowLane = legalColumnLane;
+        axis.allowLane = rhsColumnLegal;
         axis.requireLane = false;
       }
     }
     candidateFacts.nLaneStrided =
-        analysis->rhsFreeRelation == LaneRelation::Strided;
+        rhsFree->rhsRelation == LaneRelation::Strided;
     std::optional<SelectedF16MatmulPhysical> selected =
         weft::riscv_internal::selectF16MatmulPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -9185,8 +9209,8 @@ private:
     std::optional<PhysicalStorageDecision> resultStorage =
         deriveMaterializedBlockStorage(matmul.getResult(), matmul.getInit(), 16);
     llvm::SmallVector<int64_t, 2> expectedResultAxes = {
-        static_cast<int64_t>(analysis->lhsFreeAxis.getAxis()),
-        static_cast<int64_t>(analysis->rhsFreeAxis.getAxis())};
+        static_cast<int64_t>(lhsFreeAxis.getAxis()),
+        static_cast<int64_t>(rhsFreeAxis.getAxis())};
     if (!resultStorage || resultStorage->axisIds != expectedResultAxes ||
         resultStorage->strides.size() != 2)
       return std::nullopt;
