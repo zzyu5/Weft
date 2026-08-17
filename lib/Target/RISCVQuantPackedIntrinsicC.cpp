@@ -160,71 +160,104 @@ bool emitPackedI5LocalImplementation(
          emitPackedDotLocalImplementation(output, implementation, true);
 }
 
-void emitNibbleCodebookLocalImplementations(llvm::raw_ostream &output,
-                                        bool registerE8M2, bool registerE8M1) {
-  if (registerE8M2) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_nibble_codebook_i8_register_l32_e8m2(
-    const uint8_t *packed_codes, const uint8_t *table_bytes,
-    const uint8_t *activation_bytes, float dot_scale, float init) {
-  const size_t vl16 = __riscv_vsetvl_e8m1(16);
-  const vuint8m1_t packed = __riscv_vle8_v_u8m1(packed_codes, vl16);
-  const vint8m2_t table = __riscv_vle8_v_i8m2(
-      (const int8_t *)(const void *)table_bytes, vl16);
-  const vuint8m1_t low_index =
-      __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl16);
-  const vuint8m1_t high_index =
-      __riscv_vsrl_vx_u8m1(packed, 4, vl16);
-  const size_t vl32 = __riscv_vsetvl_e8m2(32);
-  const vuint8m2_t index =
-      __riscv_vcreate_v_u8m1_u8m2(low_index, high_index);
-  const vint8m2_t decoded =
-      __riscv_vrgather_vv_i8m2(table, index, vl32);
-  const vint8m2_t activation = __riscv_vle8_v_i8m2(
-      (const int8_t *)(const void *)activation_bytes, vl32);
-  const vint16m4_t product =
-      __riscv_vwmul_vv_i16m4(decoded, activation, vl32);
-  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-  const int32_t integer_dot = __riscv_vmv_x_s_i32m1_i32(
-      __riscv_vwredsum_vs_i16m4_i32m1(product, zero, vl32));
-  return init + dot_scale * (float)integer_dot;
-}
+bool emitNibbleCodebookLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation) {
+  if (!isNibbleCodebookLocalImplementationMapping(implementation) ||
+      implementation.helperSymbol.empty())
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape packedShape = implementation.valueShapes[1];
+  const RVVVectorShape tableShape = implementation.valueShapes[2];
+  const RVVVectorShape productShape = implementation.valueShapes[3];
+  const bool combined = tableShape == laneShape;
+  const std::string packedUnsignedType =
+      rvvVectorType(RVVElementCategory::UnsignedInteger, packedShape);
+  const std::string packedUnsignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::UnsignedInteger, packedShape);
+  const std::string tableType =
+      rvvVectorType(RVVElementCategory::SignedInteger, tableShape);
+  const std::string tableSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, tableShape);
+  const std::string laneUnsignedType =
+      rvvVectorType(RVVElementCategory::UnsignedInteger, laneShape);
+  const std::string laneUnsignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::UnsignedInteger, laneShape);
+  const std::string laneSignedType =
+      rvvVectorType(RVVElementCategory::SignedInteger, laneShape);
+  const std::string laneSignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, laneShape);
+  const std::string productType =
+      rvvVectorType(RVVElementCategory::SignedInteger, productShape);
+  const std::string productSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, productShape);
+  const std::string packedSetVL = rvvSetVLIntrinsic(packedShape);
+  const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
+  if (packedUnsignedType.empty() || packedUnsignedSuffix.empty() ||
+      tableType.empty() || tableSuffix.empty() || laneUnsignedType.empty() ||
+      laneUnsignedSuffix.empty() || laneSignedType.empty() ||
+      laneSignedSuffix.empty() || productType.empty() ||
+      productSuffix.empty() || packedSetVL.empty() || laneSetVL.empty())
+    return false;
 
-)c";
+  output << "static inline __attribute__((always_inline, unused)) float\n"
+         << implementation.helperSymbol << "(\n"
+         << "    const uint8_t *packed_codes, const uint8_t *table_bytes,\n"
+         << "    const uint8_t *activation_bytes, float dot_scale, float init) {\n"
+         << "  const size_t vl16 = " << packedSetVL << "(16);\n"
+         << "  const " << packedUnsignedType
+         << " packed = __riscv_vle8_v_" << packedUnsignedSuffix
+         << "(packed_codes, vl16);\n"
+         << "  const " << tableType << " table = __riscv_vle8_v_"
+         << tableSuffix
+         << "((const int8_t *)(const void *)table_bytes, vl16);\n"
+         << "  const " << packedUnsignedType
+         << " low_index = __riscv_vand_vx_" << packedUnsignedSuffix
+         << "(packed, UINT8_C(15), vl16);\n"
+         << "  const " << packedUnsignedType
+         << " high_index = __riscv_vsrl_vx_" << packedUnsignedSuffix
+         << "(packed, 4, vl16);\n";
+  if (combined) {
+    output << "  const size_t vl32 = " << laneSetVL << "(32);\n"
+           << "  const " << laneUnsignedType
+           << " index = __riscv_vcreate_v_" << packedUnsignedSuffix << "_"
+           << laneUnsignedSuffix << "(low_index, high_index);\n"
+           << "  const " << laneSignedType
+           << " decoded = __riscv_vrgather_vv_" << laneSignedSuffix
+           << "(table, index, vl32);\n"
+           << "  const " << laneSignedType
+           << " activation = __riscv_vle8_v_" << laneSignedSuffix
+           << "((const int8_t *)(const void *)activation_bytes, vl32);\n"
+           << "  const " << productType
+           << " product = __riscv_vwmul_vv_" << productSuffix
+           << "(decoded, activation, vl32);\n";
+  } else {
+    output << "  const " << tableType
+           << " low = __riscv_vrgather_vv_" << tableSuffix
+           << "(table, low_index, vl16);\n"
+           << "  const " << tableType
+           << " high = __riscv_vrgather_vv_" << tableSuffix
+           << "(table, high_index, vl16);\n"
+           << "  const " << tableType
+           << " activation_low = __riscv_vle8_v_" << tableSuffix
+           << "((const int8_t *)(const void *)activation_bytes, vl16);\n"
+           << "  const " << tableType
+           << " activation_high = __riscv_vle8_v_" << tableSuffix
+           << "((const int8_t *)(const void *)(activation_bytes + 16), vl16);\n"
+           << "  const " << productType
+           << " product = __riscv_vadd_vv_" << productSuffix << "(\n"
+           << "      __riscv_vwmul_vv_" << productSuffix
+           << "(low, activation_low, vl16),\n"
+           << "      __riscv_vwmul_vv_" << productSuffix
+           << "(high, activation_high, vl16), vl16);\n";
   }
-
-  if (registerE8M1) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_nibble_codebook_i8_register_l32_e8m1(
-    const uint8_t *packed_codes, const uint8_t *table_bytes,
-    const uint8_t *activation_bytes, float dot_scale, float init) {
-  const size_t vl16 = __riscv_vsetvl_e8mf2(16);
-  const vuint8mf2_t packed = __riscv_vle8_v_u8mf2(packed_codes, vl16);
-  const vint8mf2_t table = __riscv_vle8_v_i8mf2(
-      (const int8_t *)(const void *)table_bytes, vl16);
-  const vuint8mf2_t low_index =
-      __riscv_vand_vx_u8mf2(packed, UINT8_C(15), vl16);
-  const vuint8mf2_t high_index =
-      __riscv_vsrl_vx_u8mf2(packed, 4, vl16);
-  const vint8mf2_t low =
-      __riscv_vrgather_vv_i8mf2(table, low_index, vl16);
-  const vint8mf2_t high =
-      __riscv_vrgather_vv_i8mf2(table, high_index, vl16);
-  const vint8mf2_t activation_low = __riscv_vle8_v_i8mf2(
-      (const int8_t *)(const void *)activation_bytes, vl16);
-  const vint8mf2_t activation_high = __riscv_vle8_v_i8mf2(
-      (const int8_t *)(const void *)(activation_bytes + 16), vl16);
-  const vint16m1_t product = __riscv_vadd_vv_i16m1(
-      __riscv_vwmul_vv_i16m1(low, activation_low, vl16),
-      __riscv_vwmul_vv_i16m1(high, activation_high, vl16), vl16);
-  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-  const int32_t integer_dot = __riscv_vmv_x_s_i32m1_i32(
-      __riscv_vwredsum_vs_i16m1_i32m1(product, zero, vl16));
-  return init + dot_scale * (float)integer_dot;
-}
-
-)c";
-  }
+  output << "  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n"
+         << "  const int32_t integer_dot = __riscv_vmv_x_s_i32m1_i32(\n"
+         << "      __riscv_vwredsum_vs_" << productSuffix
+         << "_i32m1(product, zero, " << (combined ? "vl32" : "vl16")
+         << "));\n"
+         << "  return init + dot_scale * (float)integer_dot;\n"
+         << "}\n\n";
+  return true;
 }
 
 } // namespace weft::riscv_internal

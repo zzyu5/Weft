@@ -79,6 +79,46 @@ bool isPackedDotLocalImplementationMapping(
   return true;
 }
 
+bool isNibbleCodebookLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 4)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (!reduction || !reduction->extent || *reduction->extent != 32 ||
+      reduction->sequentialFactor != 1 ||
+      reduction->laneFactor * reduction->registerFactor != 32 ||
+      (reduction->laneFactor != 16 && reduction->laneFactor != 32))
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape packedShape = implementation.valueShapes[1];
+  const RVVVectorShape tableShape = implementation.valueShapes[2];
+  const RVVVectorShape productShape = implementation.valueShapes[3];
+  if (laneShape != implementation.mapping.laneShape || laneShape.sew != 8 ||
+      packedShape.sew != 8 || tableShape.sew != 8 || productShape.sew != 16 ||
+      productShape.lmulEighths !=
+          (tableShape == laneShape ? laneShape.lmulEighths
+                                   : packedShape.lmulEighths) *
+              2)
+    return false;
+  const bool combined = tableShape == laneShape;
+  if (combined) {
+    if (reduction->laneFactor != 32 || packedShape.lmulEighths < 8 ||
+        packedShape.lmulEighths * 2 != laneShape.lmulEighths)
+      return false;
+  } else if (tableShape != packedShape) {
+    return false;
+  }
+  return !rvvVectorType(RVVElementCategory::UnsignedInteger, packedShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, tableShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -201,10 +241,11 @@ static bool validateLocalInstructionMapping(
     return isPackedDotLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::Base3TernaryI8:
   case LocalPrimitiveKind::PackedI2TernaryI8:
-  case LocalPrimitiveKind::NibbleCodebookI8:
     return rvvDot && lanes == 32 &&
            (primary == RVVVectorShape{8, 8} ||
             primary == RVVVectorShape{8, 16});
+  case LocalPrimitiveKind::NibbleCodebookI8:
+    return isNibbleCodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedI3GroupedI8:
     return rvvDot && (lanes == 32 || lanes == 64) &&
            primary == RVVVectorShape{8, 16};
@@ -1867,16 +1908,20 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
            CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK, 32, 8, 1,
            target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
-    const bool combined = laneShape == RVVVectorShape{8, 16};
+    const bool combined = candidate.axis.laneFactor == 32 &&
+                          packedShape->lmulEighths >= 8 &&
+                          packedShape->lmulEighths * 2 ==
+                              laneShape.lmulEighths;
     RVVVectorShape tableShape = combined ? laneShape : *packedShape;
     std::optional<RVVVectorShape> productShape =
-        rvvShapeForSemanticLanes(16, combined ? 32 : 16, target);
+        rvvShapeForSameLanes(combined ? laneShape : *packedShape, 16, target);
     if (!productShape)
       continue;
     LocalImplementation implementation;
     implementation.primitive = LocalPrimitiveKind::NibbleCodebookI8;
     implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes = {laneShape, *packedShape};
+    implementation.valueShapes = {laneShape, *packedShape, tableShape,
+                                  *productShape};
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
     AxisMappedResourceFacts resources;

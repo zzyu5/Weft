@@ -53,7 +53,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
-  bool nibbleE8M2 = false, nibbleE8M1 = false;
   bool base3E8M2 = false, base3E8M1 = false;
   bool packedI2E8M2 = false, packedI2E8M1 = false;
   bool signed8E8M2 = false, signed8E8M1 = false;
@@ -122,10 +121,8 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
                         packedU11E8M1);
       break;
     case LocalPrimitiveKind::NibbleCodebookI8:
-      supported = match("__weft_nibble_codebook_i8_register_l32_e8m2",
-                        nibbleE8M2) ||
-                  match("__weft_nibble_codebook_i8_register_l32_e8m1",
-                        nibbleE8M1);
+      supported =
+          emitNibbleCodebookLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::IQ2SI8:
       supported = match("__weft_iq2_s_i8_register_l32_e8m2", iq2Register32) ||
@@ -159,7 +156,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
       !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
-      !nibbleE8M2 && !nibbleE8M1 && !base3E8M2 && !base3E8M1 &&
+      !base3E8M2 && !base3E8M1 &&
       !packedI2E8M2 && !packedI2E8M1 && !signed8E8M2 &&
       !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
       !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
@@ -223,7 +220,6 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
-  emitNibbleCodebookLocalImplementations(output, nibbleE8M2, nibbleE8M1);
   emitTernaryLocalImplementations(output, base3E8M2, base3E8M1,
                                   packedI2E8M2, packedI2E8M1);
   emitSignedCodebookLocalImplementations(

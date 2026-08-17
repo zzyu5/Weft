@@ -496,6 +496,8 @@ struct LocalImplementation {
 
 bool isPackedDotLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isNibbleCodebookLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
