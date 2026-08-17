@@ -19,6 +19,7 @@ bool emitPackedDotLocalImplementation(
       hasHighBits ? LocalLeafKind::PackedI5I8Register
                   : LocalLeafKind::PackedI4I8Register;
   if (implementation.leaf.kind != expectedLeaf ||
+      implementation.leaf.projection == LocalLeafProjection::None ||
       implementation.valueShapes.size() < 2 || !reduction)
     return false;
 
@@ -64,7 +65,12 @@ bool emitPackedDotLocalImplementation(
   output << "    const uint8_t *activation_bytes, int32_t zero_point,\n"
          << "    float dot_scale, float additive_bias, float init) {\n";
 
-  if (reduction->laneFactor == 32) {
+  const bool laneProjection =
+      implementation.leaf.projection ==
+          LocalLeafProjection::PackedDotLaneSlide ||
+      implementation.leaf.projection ==
+          LocalLeafProjection::PackedDotLaneCreate;
+  if (laneProjection) {
     output << "  const size_t vl16 = " << decodeSetVL << "(16);\n"
            << "  const " << decodeUnsignedType
            << " packed = __riscv_vle8_v_" << decodeUnsignedSuffix << "("
@@ -79,7 +85,8 @@ bool emitPackedDotLocalImplementation(
            << decodeSignedSuffix << "(__riscv_vsrl_vx_" << decodeUnsignedSuffix
            << "(packed, 4, vl16));\n"
            << "  const size_t vl32 = " << setVL << "(32);\n";
-    if (decodeShape == shape)
+    if (implementation.leaf.projection ==
+        LocalLeafProjection::PackedDotLaneSlide)
       output << "  " << signedType << " codes = __riscv_vslideup_vx_"
              << signedSuffix << "(low, high, 16, vl32);\n";
     else
@@ -98,7 +105,8 @@ bool emitPackedDotLocalImplementation(
            << "((const int8_t *)(const void *)activation_bytes, vl32);\n"
            << "  const " << widenedType << " products = __riscv_vwmul_vv_"
            << widenedSuffix << "(codes, activation, vl32);\n";
-  } else {
+  } else if (implementation.leaf.projection ==
+             LocalLeafProjection::PackedDotRegisterChunks) {
     for (unsigned chunk = 0; chunk < reduction->registerFactor; ++chunk) {
       const unsigned start = chunk * reduction->laneFactor;
       const unsigned packedOffset = start % 16;
@@ -138,12 +146,14 @@ bool emitPackedDotLocalImplementation(
     for (unsigned chunk = 1; chunk < reduction->registerFactor; ++chunk)
       output << "  products = __riscv_vadd_vv_" << widenedSuffix
              << "(products, products" << chunk << ", vl0);\n";
+  } else {
+    return false;
   }
   output << "  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n"
          << "  const int32_t integer_dot = __riscv_vmv_x_s_i32m1_i32(\n"
          << "      __riscv_vwredsum_vs_" << widenedSuffix
          << "_i32m1(products, zero, "
-         << (reduction->laneFactor == 32 ? "vl32" : "vl0") << "));\n"
+         << (laneProjection ? "vl32" : "vl0") << "));\n"
          << "  return init + dot_scale * (float)integer_dot + additive_bias;\n"
          << "}\n\n";
   return true;

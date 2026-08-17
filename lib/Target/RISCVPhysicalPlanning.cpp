@@ -527,6 +527,18 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
     return LocalLeafDecision{kind, selectedLanes ? selectedLanes : lanes,
                              primary};
   };
+  auto packedDotLeaf = [&](LocalLeafKind kind) {
+    LocalLeafDecision leaf = registerLeaf(kind);
+    const PhysicalAxisDecomposition *reduction =
+        findAxisMapping(implementation.mapping, kCoreAxisK);
+    if (reduction->laneFactor != 32)
+      leaf.projection = LocalLeafProjection::PackedDotRegisterChunks;
+    else if (implementation.valueShapes[1] == implementation.mapping.laneShape)
+      leaf.projection = LocalLeafProjection::PackedDotLaneSlide;
+    else
+      leaf.projection = LocalLeafProjection::PackedDotLaneCreate;
+    return leaf;
+  };
   switch (implementation.primitive) {
   case LocalPrimitiveKind::None:
     return std::nullopt;
@@ -596,11 +608,11 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::PackedI4I8:
     if (!isPackedDotLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedI4I8Register);
+    return packedDotLeaf(LocalLeafKind::PackedI4I8Register);
   case LocalPrimitiveKind::PackedI5I8:
     if (!isPackedDotLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedI5I8Register);
+    return packedDotLeaf(LocalLeafKind::PackedI5I8Register);
   case LocalPrimitiveKind::PackedI3GroupedI8:
     if (!isPackedI3GroupedLocalImplementationMapping(implementation))
       return std::nullopt;

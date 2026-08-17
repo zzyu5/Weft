@@ -497,19 +497,28 @@ enum class LocalLeafKind {
   Q6KI8RVVAssembly,
 };
 
+enum class LocalLeafProjection {
+  None,
+  PackedDotLaneSlide,
+  PackedDotLaneCreate,
+  PackedDotRegisterChunks,
+};
+
 struct LocalLeafDecision {
   LocalLeafKind kind = LocalLeafKind::None;
   unsigned lanes = 0;
   RVVVectorShape primaryShape;
+  LocalLeafProjection projection = LocalLeafProjection::None;
 
   explicit operator bool() const { return kind != LocalLeafKind::None; }
   bool operator==(const LocalLeafDecision &other) const {
     return kind == other.kind && lanes == other.lanes &&
-           primaryShape == other.primaryShape;
+           primaryShape == other.primaryShape && projection == other.projection;
   }
   bool operator<(const LocalLeafDecision &other) const {
-    return std::tie(kind, lanes, primaryShape) <
-           std::tie(other.kind, other.lanes, other.primaryShape);
+    return std::tie(kind, lanes, primaryShape, projection) <
+           std::tie(other.kind, other.lanes, other.primaryShape,
+                    other.projection);
   }
 };
 
