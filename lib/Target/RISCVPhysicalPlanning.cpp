@@ -15,10 +15,9 @@
 namespace weft::riscv_internal {
 
 static unsigned localLaneFactor(const LocalImplementation &implementation) {
-  for (const PhysicalAxisDecomposition &axis : implementation.mapping.axes)
-    if (axis.laneFactor > 1)
-      return axis.laneFactor * axis.registerFactor;
-  return 0;
+  const PhysicalAxisDecomposition *axis = findAxisMapping(
+      implementation.mapping, implementation.mapping.laneAxis);
+  return axis ? axis->laneFactor * axis->registerFactor : 0;
 }
 
 static unsigned localRegisterFactor(const LocalImplementation &implementation,
@@ -2190,13 +2189,11 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
   llvm::SmallVector<Candidate, 32> legal;
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
-    const PhysicalAxisDecomposition *laneAxis = llvm::find_if(
-        mapping.axes, [](const PhysicalAxisDecomposition &axis) {
-          return axis.laneFactor > 1;
-        });
+    const PhysicalAxisDecomposition *laneAxis =
+        findAxisMapping(mapping, mapping.laneAxis);
     const PhysicalAxisDecomposition *reduction =
         findAxisMapping(mapping, kCoreAxisK);
-    if (laneAxis == mapping.axes.end() || !reduction ||
+    if (!laneAxis || !reduction ||
         (reduction->unrollFactor != 1 && reduction->unrollFactor != 2 &&
          reduction->unrollFactor != 4) ||
         (mapping.pipeline.bufferCount != 1 &&
@@ -2349,8 +2346,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     CorePhysicalMapping mapping;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
+    unsigned lanePenalty = 0;
     unsigned rowPenalty = 0;
     unsigned columnPenalty = 0;
+    unsigned memoryPenalty = 0;
     unsigned lmulPenalty = 0;
     unsigned unrollPenalty = 0;
     unsigned bufferPenalty = 0;
@@ -2364,35 +2363,56 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         findAxisMapping(mapping, kCoreAxisN);
     const PhysicalAxisDecomposition *k =
         findAxisMapping(mapping, kCoreAxisK);
+    const PhysicalAxisDecomposition *lane =
+        findAxisMapping(mapping, mapping.laneAxis);
     std::optional<unsigned> inputLMUL = rvvIntegerLMUL(mapping.laneShape);
     std::optional<RVVVectorShape> accumulatorShape =
         rvvShapeForSameLanes(mapping.laneShape, 32, target);
-    if (!m || !n || !k || !inputLMUL || !accumulatorShape ||
+    if (!m || !n || !k || !lane ||
+        (lane->id != kCoreAxisN && lane->id != kCoreAxisK) || !inputLMUL ||
+        !accumulatorShape ||
         (k->unrollFactor != 1 && k->unrollFactor != 2 &&
          k->unrollFactor != 4) ||
         (mapping.pipeline.bufferCount != 1 &&
          mapping.pipeline.bufferCount != 2) ||
-        (mapping.pipeline.bufferCount == 2 && k->unrollFactor < 2))
+        (mapping.pipeline.bufferCount == 2 && k->unrollFactor < 2) ||
+        (lane->id == kCoreAxisN &&
+         (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
       continue;
     const unsigned rows = m->registerFactor;
     const unsigned columns = n->registerFactor;
     const unsigned bufferCount = mapping.pipeline.bufferCount;
+    const bool columnLane = lane->id == kCoreAxisN;
+    const unsigned accumulatorVectors =
+        columnLane ? rows : rows * columns;
+    const unsigned lhsVectors = columnLane ? 0 : (bufferCount == 2 ? rows : 1);
+    const unsigned rhsVectors = columnLane ? 1 : columns;
     std::optional<PhysicalResourceBudget> resources =
         calculateDenseMicrokernelResources(
-            {mapping.laneShape, *accumulatorShape, rows * columns,
-             bufferCount == 2 ? rows : 1, columns, bufferCount},
+            {mapping.laneShape, *accumulatorShape, accumulatorVectors,
+             lhsVectors, rhsVectors, bufferCount},
             target);
     if (!resources)
       continue;
+    const unsigned tailPenalty =
+        columnLane
+            ? static_cast<unsigned>(*reductionExtent % k->unrollFactor != 0) +
+                  static_cast<unsigned>(columnTile % lane->laneFactor != 0)
+            : static_cast<unsigned>(*reductionExtent %
+                                        (k->unrollFactor * k->laneFactor) !=
+                                    0);
+    const unsigned realizedColumns =
+        columnLane ? lane->laneFactor : columns;
+    const unsigned preferredRealizedColumns =
+        columnLane ? std::min(columnTile, lane->laneFactor) : preferredColumns;
     legal.push_back(Candidate{
-        std::move(mapping), *resources,
-        static_cast<unsigned>(*reductionExtent %
-                                  (k->unrollFactor * k->laneFactor) !=
-                              0),
+        std::move(mapping), *resources, tailPenalty,
+        static_cast<unsigned>(!columnLane),
         static_cast<unsigned>(std::abs(static_cast<int>(rows) -
                                        static_cast<int>(preferredRows))),
-        static_cast<unsigned>(std::abs(static_cast<int>(columns) -
-                                       static_cast<int>(preferredColumns))),
+        static_cast<unsigned>(std::abs(static_cast<int>(realizedColumns) -
+                                       static_cast<int>(preferredRealizedColumns))),
+        static_cast<unsigned>(columnLane && facts.nLaneStrided),
         static_cast<unsigned>(std::abs(static_cast<int>(*inputLMUL) -
                                        static_cast<int>(preferredLMUL))),
         static_cast<unsigned>(std::abs(static_cast<int>(k->unrollFactor) -
@@ -2403,12 +2423,12 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.tailPenalty, lhs.rowPenalty, lhs.columnPenalty,
-                    lhs.lmulPenalty,
+    return std::tie(lhs.tailPenalty, lhs.memoryPenalty, lhs.lanePenalty,
+                    lhs.rowPenalty, lhs.columnPenalty, lhs.lmulPenalty,
                     lhs.unrollPenalty, lhs.bufferPenalty,
                     lhs.resources.peakGroups) <
-           std::tie(rhs.tailPenalty, rhs.rowPenalty, rhs.columnPenalty,
-                    rhs.lmulPenalty,
+           std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lanePenalty,
+                    rhs.rowPenalty, rhs.columnPenalty, rhs.lmulPenalty,
                     rhs.unrollPenalty, rhs.bufferPenalty,
                     rhs.resources.peakGroups);
   });

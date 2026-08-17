@@ -573,6 +573,8 @@ struct F16GemmNTileDecision {
   unsigned rowTile = 4;
   unsigned columnTile = 8;
   unsigned reductionTile = 64;
+  VLAMemoryMode rhsColumnMemoryMode = VLAMemoryMode::UnitStride;
+  std::optional<AffineScalarExpression> rhsColumnStride;
   CorePhysicalMapping mapping;
 };
 
@@ -602,8 +604,10 @@ struct LocalDenseProductAnalysis {
   std::optional<uint64_t> reductionExtent;
   LaneRelation lhsReductionRelation = LaneRelation::Independent;
   LaneRelation rhsReductionRelation = LaneRelation::Independent;
+  LaneRelation rhsFreeRelation = LaneRelation::Independent;
   std::optional<AffineScalarExpression> lhsReductionStride;
   std::optional<AffineScalarExpression> rhsReductionStride;
+  std::optional<AffineScalarExpression> rhsFreeStride;
   CoreMappingProblem mapping;
 };
 
@@ -5520,17 +5524,15 @@ private:
           "VLA dot physical value shape is unavailable");
     RVVVectorShape dotShape = initShape->shape;
     std::optional<unsigned> lmul = rvvIntegerLMUL(dotShape);
-    const PhysicalAxisDecomposition *laneAxis = llvm::find_if(
-        decision.mapping.axes, [](const PhysicalAxisDecomposition &axis) {
-          return axis.laneFactor > 1;
-        });
+    const PhysicalAxisDecomposition *laneAxis =
+        findAxisMapping(decision.mapping, decision.mapping.laneAxis);
     const PhysicalAxisDecomposition *mAxis =
         findAxisMapping(decision.mapping, kCoreAxisM);
     const PhysicalAxisDecomposition *reductionAxis =
         findAxisMapping(decision.mapping, kCoreAxisK);
     if (!lmul || dotShape.sew != 32 || !activePhysicalEntity ||
         dotShape != decision.mapping.laneShape ||
-        laneAxis == decision.mapping.axes.end() || !reductionAxis ||
+        !laneAxis || !reductionAxis ||
         reductionAxis->unrollFactor == 0 ||
         (mAxis && mAxis->registerFactor == 0))
       return decision.operation->emitError(
@@ -5795,11 +5797,22 @@ private:
              LaneRelation::Independent))
       return std::nullopt;
     if (analysis.rhsFreeAxis &&
-        (memoryRelation(*rhsAccess, analysis.rhsFreeAxis.getResult()) ==
-             LaneRelation::Independent ||
-         memoryRelation(*lhsAccess, analysis.rhsFreeAxis.getResult()) !=
-             LaneRelation::Independent))
+        memoryRelation(*lhsAccess, analysis.rhsFreeAxis.getResult()) !=
+            LaneRelation::Independent)
       return std::nullopt;
+    if (analysis.rhsFreeAxis) {
+      analysis.rhsFreeRelation =
+          memoryRelation(*rhsAccess, analysis.rhsFreeAxis.getResult());
+      if (analysis.rhsFreeRelation == LaneRelation::Independent)
+        return std::nullopt;
+      if (analysis.rhsFreeRelation == LaneRelation::Strided) {
+        const MemoryAxisFact *axis =
+            memoryAxisFact(*rhsAccess, analysis.rhsFreeAxis.getResult());
+        if (!axis || !axis->laneStride)
+          return std::nullopt;
+        analysis.rhsFreeStride = axis->laneStride;
+      }
+    }
     if (analysis.lhsReductionRelation == LaneRelation::Strided) {
       const MemoryAxisFact *axis =
           memoryAxisFact(*lhsAccess, analysis.reductionAxis.getResult());
@@ -9128,8 +9141,27 @@ private:
     decision.rowTile = analysis->lhsFreeExtent;
     decision.columnTile = analysis->rhsFreeExtent;
     decision.reductionTile = static_cast<unsigned>(*analysis->reductionExtent);
+    decision.rhsColumnMemoryMode =
+        analysis->rhsFreeRelation == LaneRelation::UnitStride
+            ? VLAMemoryMode::UnitStride
+            : VLAMemoryMode::Strided;
+    decision.rhsColumnStride = analysis->rhsFreeStride;
     F16MatmulCandidateFacts candidateFacts;
     candidateFacts.mapping = analysis->mapping;
+    const bool legalColumnLane =
+        analysis->rhsFreeRelation == LaneRelation::UnitStride ||
+        (analysis->rhsFreeRelation == LaneRelation::Strided &&
+         analysis->rhsFreeStride);
+    for (LogicalAxisConstraint &axis : candidateFacts.mapping.axes) {
+      if (axis.id == kCoreAxisK)
+        axis.requireLane = false;
+      if (axis.id == kCoreAxisN) {
+        axis.allowLane = legalColumnLane;
+        axis.requireLane = false;
+      }
+    }
+    candidateFacts.nLaneStrided =
+        analysis->rhsFreeRelation == LaneRelation::Strided;
     std::optional<SelectedF16MatmulPhysical> selected =
         weft::riscv_internal::selectF16MatmulPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -9166,6 +9198,170 @@ private:
     planned.entity.storages.push_back(std::move(*resultStorage));
     planned.entity.resources = selected->resources;
     return planned;
+  }
+
+  mlir::LogicalResult emitF16MatmulColumnLane(
+      MatmulOp op, const F16GemmNTileDecision &decision,
+      const PhysicalStorageDecision &resultStorage, const CValue &accumulator,
+      unsigned inputLMUL, unsigned computeLMUL) {
+    const PhysicalAxisDecomposition *mAxis =
+        findAxisMapping(decision.mapping, kCoreAxisM);
+    const PhysicalAxisDecomposition *nAxis =
+        findAxisMapping(decision.mapping, kCoreAxisN);
+    const PhysicalAxisDecomposition *kAxis =
+        findAxisMapping(decision.mapping, kCoreAxisK);
+    if (decision.mapping.laneAxis != kCoreAxisN || !mAxis || !nAxis ||
+        !kAxis || nAxis->laneFactor == 0 || nAxis->registerFactor != 1 ||
+        kAxis->laneFactor != 1 || kAxis->unrollFactor == 0 ||
+        decision.mapping.pipeline.bufferCount != 1 ||
+        resultStorage.strides.size() != 2 || resultStorage.strides[1] != 1)
+      return op.emitError("F16 matmul column-lane mapping is incomplete");
+    if (decision.rhsColumnMemoryMode == VLAMemoryMode::Strided &&
+        !decision.rhsColumnStride)
+      return op.emitError("F16 matmul column stride was not selected");
+
+    LoadOp lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
+    LoadOp rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
+    auto project = [&](mlir::Value value, llvm::StringRef row,
+                       llvm::StringRef reduction,
+                       llvm::StringRef column) -> std::optional<std::string> {
+      llvm::DenseMap<mlir::Value, std::string> axes;
+      axes[decision.lhsRowAxis] = row.str();
+      axes[decision.lhsReductionAxis] = reduction.str();
+      axes[decision.rhsReductionAxis] = reduction.str();
+      axes[decision.rhsColumnAxis] = column.str();
+      return projectBlockScalar(value, axes);
+    };
+    auto columnStride = [&](llvm::StringRef reduction,
+                            llvm::StringRef column)
+        -> std::optional<std::string> {
+      if (decision.rhsColumnMemoryMode == VLAMemoryMode::UnitStride)
+        return std::string("1");
+      llvm::DenseMap<mlir::Value, std::string> axes;
+      axes[decision.lhsRowAxis] = "0";
+      axes[decision.lhsReductionAxis] = reduction.str();
+      axes[decision.rhsReductionAxis] = reduction.str();
+      axes[decision.rhsColumnAxis] = column.str();
+      return spellAffineScalarExpression(*decision.rhsColumnStride, axes);
+    };
+
+    const unsigned rowMicrotile = mAxis->registerFactor;
+    const unsigned kUnroll = kAxis->unrollFactor;
+    const std::string inputType =
+        "vfloat16m" + std::to_string(inputLMUL) + "_t";
+    const std::string accumulatorType =
+        "vfloat32m" + std::to_string(computeLMUL) + "_t";
+    std::string columnBase = fresh("matmul_n");
+    std::string vl = fresh("matmul_n_vl");
+    line("for (size_t " + columnBase + " = 0; " + columnBase + " < " +
+         std::to_string(decision.columnTile) + ";) {");
+    ++indent;
+    line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
+         std::to_string(inputLMUL) + "(" +
+         std::to_string(decision.columnTile) + " - " + columnBase + ");");
+
+    for (unsigned rowBase = 0; rowBase < decision.rowTile;
+         rowBase += rowMicrotile) {
+      const unsigned rowCount =
+          std::min(rowMicrotile, decision.rowTile - rowBase);
+      llvm::SmallVector<std::string> accumulators;
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string vector = fresh("matmul_acc");
+        std::string storageIndex =
+            std::to_string(rowBase + row) + " * " +
+            std::to_string(resultStorage.strides[0]) + " + " + columnBase;
+        line(accumulatorType + " " + vector + " = __riscv_vle32_v_f32m" +
+             std::to_string(computeLMUL) + "(&" + accumulator.spelling + "[" +
+             storageIndex + "], " + vl + ");");
+        accumulators.push_back(std::move(vector));
+      }
+
+      std::string reduction = fresh("matmul_k");
+      line("for (size_t " + reduction + " = 0; " + reduction + " < " +
+           std::to_string(decision.reductionTile) + "; " + reduction + " += " +
+           std::to_string(kUnroll) + ") {");
+      ++indent;
+      for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
+        std::string coordinate =
+            unroll == 0
+                ? reduction
+                : "(" + reduction + " + " + std::to_string(unroll) + ")";
+        line("if (" + coordinate + " < " +
+             std::to_string(decision.reductionTile) + ") {");
+        ++indent;
+        std::string activeColumns = fresh("matmul_active_n");
+        line("size_t " + activeColumns + " = " + vl + ";");
+        std::string lastColumn =
+            "(" + columnBase + " + " + activeColumns + " - 1)";
+        std::optional<std::string> tailPredicate =
+            project(rhsLoad.getWhere(), "0", coordinate, lastColumn);
+        std::optional<std::string> rhsPointer =
+            project(rhsLoad.getPointer(), "0", coordinate, columnBase);
+        std::optional<std::string> stride =
+            columnStride(coordinate, columnBase);
+        if (!tailPredicate || !rhsPointer || !stride)
+          return op.emitError(
+              "F16 matmul column-lane RHS projection is unavailable");
+        line("while (" + activeColumns + " > 0 && !(" + *tailPredicate +
+             ")) --" + activeColumns + ";");
+        line("if (" + activeColumns + " != 0) {");
+        ++indent;
+        std::string stepVL = fresh("matmul_step_vl");
+        std::string rhsVector = fresh("matmul_rhs");
+        line("const size_t " + stepVL + " = __riscv_vsetvl_e16m" +
+             std::to_string(inputLMUL) + "(" + activeColumns + ");");
+        if (decision.rhsColumnMemoryMode == VLAMemoryMode::UnitStride)
+          line(inputType + " " + rhsVector + " = __riscv_vle16_v_f16m" +
+               std::to_string(inputLMUL) + "(" + *rhsPointer + ", " + stepVL +
+               ");");
+        else
+          line(inputType + " " + rhsVector + " = __riscv_vlse16_v_f16m" +
+               std::to_string(inputLMUL) + "(" + *rhsPointer +
+               ", (ptrdiff_t)(sizeof(_Float16) * (" + *stride + ")), " +
+               stepVL + ");");
+        for (unsigned row = 0; row < rowCount; ++row) {
+          std::string rowIndex = std::to_string(rowBase + row);
+          std::optional<std::string> lhsPointer = project(
+              lhsLoad.getPointer(), rowIndex, coordinate, columnBase);
+          std::optional<std::string> lhsPredicate = project(
+              lhsLoad.getWhere(), rowIndex, coordinate, columnBase);
+          if (!lhsPointer || !lhsPredicate)
+            return op.emitError(
+                "F16 matmul column-lane LHS projection is unavailable");
+          line("if (" + *lhsPredicate + ")");
+          ++indent;
+          line(accumulators[row] + " = __riscv_vfwmacc_vf_f32m" +
+               std::to_string(computeLMUL) + "(" + accumulators[row] + ", *" +
+               *lhsPointer + ", " + rhsVector + ", " + stepVL + ");");
+          --indent;
+        }
+        --indent;
+        line("}");
+        --indent;
+        line("}");
+      }
+      --indent;
+      line("}");
+
+      for (unsigned row = 0; row < rowCount; ++row) {
+        std::string storageIndex =
+            std::to_string(rowBase + row) + " * " +
+            std::to_string(resultStorage.strides[0]) + " + " + columnBase;
+        line("__riscv_vse32_v_f32m" + std::to_string(computeLMUL) + "(&" +
+             accumulator.spelling + "[" + storageIndex + "], " +
+             accumulators[row] + ", " + vl + ");");
+      }
+    }
+    line(columnBase + " += " + vl + ";");
+    --indent;
+    line("}");
+    values[op.getResult()] = accumulator;
+    values[op.getResult()].type = op.getResult().getType();
+    if (mlir::failed(markRematerializedBlockTrees(
+            {op.getLhs(), op.getRhs()}, op.getOperation())))
+      return mlir::failure();
+    loweredBlockOps.insert(op.getOperation());
+    return mlir::success();
   }
 
   mlir::LogicalResult emitF16Matmul(MatmulOp op) {
@@ -9230,6 +9426,11 @@ private:
     if (accumulator.kind != CValueKind::F32BlockStorage ||
         accumulator.spelling.empty())
       return op.emitError("F16 matmul accumulator storage is unavailable");
+    if (decision.mapping.laneAxis == kCoreAxisN)
+      return emitF16MatmulColumnLane(op, decision, *resultStorage, accumulator,
+                                     *inputLMUL, *computeLMUL);
+    if (decision.mapping.laneAxis != kCoreAxisK)
+      return op.emitError("F16 matmul lane axis has no intrinsic-C projection");
     LoadOp lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     LoadOp rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
 

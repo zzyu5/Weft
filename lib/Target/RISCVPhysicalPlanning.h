@@ -744,6 +744,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
 
 struct F16MatmulCandidateFacts {
   CoreMappingProblem mapping;
+  bool nLaneStrided = false;
 };
 
 struct SelectedF16MatmulPhysical {

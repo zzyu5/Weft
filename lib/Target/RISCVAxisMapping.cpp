@@ -146,7 +146,8 @@ bool LocalPipelineMapping::operator<(
 }
 
 bool CorePhysicalMapping::operator==(const CorePhysicalMapping &other) const {
-  return instruction == other.instruction && axes == other.axes &&
+  return instruction == other.instruction && laneAxis == other.laneAxis &&
+         axes == other.axes &&
          laneShape == other.laneShape && pipeline == other.pipeline &&
          fixedFragmentGroups == other.fixedFragmentGroups;
 }
@@ -154,6 +155,8 @@ bool CorePhysicalMapping::operator==(const CorePhysicalMapping &other) const {
 bool CorePhysicalMapping::operator<(const CorePhysicalMapping &other) const {
   if (instruction != other.instruction)
     return instruction < other.instruction;
+  if (laneAxis != other.laneAxis)
+    return laneAxis < other.laneAxis;
   if (axes != other.axes)
     return std::lexicographical_compare(axes.begin(), axes.end(),
                                         other.axes.begin(), other.axes.end());
@@ -267,6 +270,7 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
               continue;
             CorePhysicalMapping mapping;
             mapping.instruction = problem.laneInstruction;
+            mapping.laneAxis = laneAxis;
             mapping.laneShape = laneShape;
             mapping.pipeline.bufferCount = buffers;
             for (size_t index = 0; index < problem.axes.size(); ++index) {
@@ -350,17 +354,15 @@ findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis) {
 }
 
 unsigned mappedLaneSpan(const CorePhysicalMapping &mapping) {
-  for (const PhysicalAxisDecomposition &axis : mapping.axes)
-    if (axis.laneFactor > 1)
-      return axis.laneFactor * axis.registerFactor;
-  return 0;
+  const PhysicalAxisDecomposition *axis =
+      findAxisMapping(mapping, mapping.laneAxis);
+  return axis ? axis->laneFactor * axis->registerFactor : 0;
 }
 
 unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping) {
-  for (const PhysicalAxisDecomposition &axis : mapping.axes)
-    if (axis.laneFactor > 1)
-      return axis.laneFactor;
-  return 0;
+  const PhysicalAxisDecomposition *axis =
+      findAxisMapping(mapping, mapping.laneAxis);
+  return axis ? axis->laneFactor : 0;
 }
 
 unsigned mappedRegisterFactor(const CorePhysicalMapping &mapping,
