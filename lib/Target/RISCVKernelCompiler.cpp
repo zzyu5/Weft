@@ -154,6 +154,11 @@ struct LocalBlockMemoryFact {
   int64_t storageExtent = 0;
 };
 
+enum class I4I8ScaleRealization {
+  Scalar,
+  BlockReload,
+};
+
 struct SymmetricI4I8Decision {
   LocalImplementation implementation;
   RVVVectorShape codeShape;
@@ -166,7 +171,7 @@ struct SymmetricI4I8Decision {
   mlir::Value activation;
   mlir::Value activationScale;
   mlir::Value init;
-  unsigned rowTile = 1;
+  I4I8ScaleRealization scaleRealization = I4I8ScaleRealization::Scalar;
 };
 
 enum class SignBitI8Realization {
@@ -559,7 +564,7 @@ struct AffineI4I8Decision {
   mlir::Value activation;
   mlir::Value activationScale;
   mlir::Value init;
-  unsigned rowTile = 1;
+  I4I8ScaleRealization scaleRealization = I4I8ScaleRealization::Scalar;
 };
 
 struct F16GemmNTileDecision {
@@ -7708,7 +7713,8 @@ private:
                           PhysicalHandoff::LocalPack,
                           planned.realization.codeShape,
                           planned.realization.codeShape);
-    if (planned.realization.rowTile == 4)
+    if (planned.realization.scaleRealization ==
+        I4I8ScaleRealization::BlockReload)
       recordLocalBlockReloads(planned, op.getOperation(),
                               {planned.realization.activationScaleBlock},
                               planned.realization.activationScaleShape);
@@ -7942,7 +7948,9 @@ private:
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
-    decision.rowTile = rowExtent;
+    decision.scaleRealization = activationScale
+                                    ? I4I8ScaleRealization::BlockReload
+                                    : I4I8ScaleRealization::Scalar;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();
@@ -7971,7 +7979,7 @@ private:
             op.getOperation(), selected->second.entity, op.getResult(),
             op.getInit())))
       return mlir::failure();
-    if (decision.rowTile == 4 &&
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload &&
         mlir::failed(requirePhysicalHandoff(
             op.getOperation(), selected->second.entity,
             decision.activationScale, PhysicalHandoff::Reload)))
@@ -7981,7 +7989,7 @@ private:
     CValue packed = require(decision.packedBlockBase);
     std::optional<std::string> scaleBlock;
     CValue scale;
-    if (decision.rowTile == 4)
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload)
       scaleBlock =
           projectLocalBlockMemoryBase(decision.activationScaleBlock);
     else
@@ -7989,11 +7997,14 @@ private:
     CValue accumulator = require(decision.init);
     if (!activation ||
         packed.kind != CValueKind::Pointer ||
-        (decision.rowTile == 1 && scale.kind != CValueKind::Scalar) ||
-        (decision.rowTile == 4 && !scaleBlock) ||
+        (decision.scaleRealization == I4I8ScaleRealization::Scalar &&
+         scale.kind != CValueKind::Scalar) ||
+        (decision.scaleRealization == I4I8ScaleRealization::BlockReload &&
+         !scaleBlock) ||
         accumulator.kind != CValueKind::F32BlockStorage ||
         packed.spelling.empty() ||
-        (decision.rowTile == 1 && scale.spelling.empty()) ||
+        (decision.scaleRealization == I4I8ScaleRealization::Scalar &&
+         scale.spelling.empty()) ||
         accumulator.spelling.empty())
       return op.emitError(
           "selected symmetric i4/i8 fragment operands are unavailable");
@@ -8001,13 +8012,15 @@ private:
     if (helper.empty())
       return op.emitError("symmetric i4/i8 leaf spelling was not selected");
     std::string scaleSpelling =
-        decision.rowTile == 4 ? *scaleBlock : scale.spelling;
+        decision.scaleRealization == I4I8ScaleRealization::BlockReload
+            ? *scaleBlock
+            : scale.spelling;
     line(helper + "(" + scaleSpelling + ", " +
          *activation + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
     llvm::SmallVector<mlir::Value> rematerialized = {decision.activation,
                                                      decision.init};
-    if (decision.rowTile == 4)
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload)
       rematerialized.push_back(decision.activationScale);
     if (mlir::failed(markRematerializedBlockTrees(rematerialized,
                                                   op.getOperation())))
@@ -9083,7 +9096,9 @@ private:
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
-    decision.rowTile = rowExtent;
+    decision.scaleRealization = activationScale
+                                    ? I4I8ScaleRealization::BlockReload
+                                    : I4I8ScaleRealization::Scalar;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();
@@ -9111,7 +9126,7 @@ private:
             op.getOperation(), selected->second.entity, op.getResult(),
             op.getInit())))
       return mlir::failure();
-    if (decision.rowTile == 4 &&
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload &&
         mlir::failed(requirePhysicalHandoff(
             op.getOperation(), selected->second.entity,
             decision.activationScale, PhysicalHandoff::Reload)))
@@ -9121,7 +9136,7 @@ private:
     CValue packed = require(decision.packedBlockBase);
     std::optional<std::string> scaleBlock;
     CValue scale;
-    if (decision.rowTile == 4)
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload)
       scaleBlock =
           projectLocalBlockMemoryBase(decision.activationScaleBlock);
     else
@@ -9129,11 +9144,14 @@ private:
     CValue accumulator = require(decision.init);
     if (!activation ||
         packed.kind != CValueKind::Pointer ||
-        (decision.rowTile == 1 && scale.kind != CValueKind::Scalar) ||
-        (decision.rowTile == 4 && !scaleBlock) ||
+        (decision.scaleRealization == I4I8ScaleRealization::Scalar &&
+         scale.kind != CValueKind::Scalar) ||
+        (decision.scaleRealization == I4I8ScaleRealization::BlockReload &&
+         !scaleBlock) ||
         accumulator.kind != CValueKind::F32BlockStorage ||
         packed.spelling.empty() ||
-        (decision.rowTile == 1 && scale.spelling.empty()) ||
+        (decision.scaleRealization == I4I8ScaleRealization::Scalar &&
+         scale.spelling.empty()) ||
         accumulator.spelling.empty())
       return op.emitError(
           "selected affine i4/i8 fragment operands are unavailable");
@@ -9141,13 +9159,15 @@ private:
     if (helper.empty())
       return op.emitError("affine i4/i8 leaf spelling was not selected");
     std::string scaleSpelling =
-        decision.rowTile == 4 ? *scaleBlock : scale.spelling;
+        decision.scaleRealization == I4I8ScaleRealization::BlockReload
+            ? *scaleBlock
+            : scale.spelling;
     line(helper + "(" + scaleSpelling + ", " +
          *activation + ", " + packed.spelling + ", " +
          accumulator.spelling + ");");
     llvm::SmallVector<mlir::Value> rematerialized = {decision.activation,
                                                      decision.init};
-    if (decision.rowTile == 4)
+    if (decision.scaleRealization == I4I8ScaleRealization::BlockReload)
       rematerialized.push_back(decision.activationScale);
     if (mlir::failed(markRematerializedBlockTrees(rematerialized,
                                                   op.getOperation())))
