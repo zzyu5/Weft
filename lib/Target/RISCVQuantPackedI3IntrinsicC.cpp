@@ -11,12 +11,14 @@ bool emitPackedI3GroupedLocalImplementation(
   if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 3 || !implementation.schedule ||
-      implementation.schedule.decode.chunksPerStep != 3)
+      implementation.valueShapes.size() < 4 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep != 3 ||
+      implementation.schedule.accumulatorCount != 1)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape productShape = implementation.valueShapes[1];
   const RVVVectorShape segmentProductShape = implementation.valueShapes[2];
+  const RVVVectorShape accumulatorShape = implementation.valueShapes[3];
   const std::string laneUnsignedType =
       rvvVectorType(RVVElementCategory::UnsignedInteger, laneShape);
   const std::string laneUnsignedSuffix =
@@ -31,11 +33,20 @@ bool emitPackedI3GroupedLocalImplementation(
       rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, productShape);
   const std::string segmentProductSuffix = rvvIntrinsicTypeSuffix(
       RVVElementCategory::SignedInteger, segmentProductShape);
+  const std::string segmentProductType =
+      rvvVectorType(RVVElementCategory::SignedInteger, segmentProductShape);
+  const std::string accumulatorType =
+      rvvVectorType(RVVElementCategory::SignedInteger, accumulatorShape);
+  const std::string accumulatorSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger,
+                             accumulatorShape);
   const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
   std::optional<unsigned> maskRatio = rvvMaskRatio(laneShape);
   if (laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
       laneSignedType.empty() || laneSignedSuffix.empty() || productType.empty() ||
       productSuffix.empty() || segmentProductSuffix.empty() ||
+      segmentProductType.empty() || accumulatorType.empty() ||
+      accumulatorSuffix.empty() || accumulatorShape.sew != 32 ||
       laneSetVL.empty() || !maskRatio)
     return false;
 
@@ -62,14 +73,16 @@ __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
          << "    float weight_scale, float activation_scale, float init) {\n"
          << "  const size_t vl = " << laneSetVL << "("
          << implementation.schedule.laneFactor << ");\n"
-         << "  int32_t integer_sum = 0;\n"
+         << "  const size_t segment_vl = 16;\n"
+         << "  " << accumulatorType
+         << " integer_acc = __riscv_vmv_v_x_" << accumulatorSuffix
+         << "(0, segment_vl);\n"
          << "#pragma GCC unroll "
          << implementation.schedule.sequentialIterations << "\n"
          << "  for (size_t batch = 0; batch < "
          << implementation.schedule.sequentialIterations << "; ++batch) {\n"
          << "    const size_t first_iteration_group = batch * "
-         << groupsPerIteration << ";\n"
-         << "    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n";
+         << groupsPerIteration << ";\n";
   for (unsigned repeat = 0;
        repeat < implementation.schedule.iterationRegisterFactor; ++repeat) {
     output << "    {\n"
@@ -108,23 +121,29 @@ __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
            << " product = __riscv_vwmul_vv_" << productSuffix
            << "(code, activation, vl);\n";
     for (unsigned group = 0; group < groupsPerVector; ++group) {
-      output << "      const int32_t partial" << group
-             << " = __riscv_vmv_x_s_i32m1_i32(\n"
-             << "          __riscv_vwredsum_vs_" << segmentProductSuffix
-             << "_i32m1(\n              ";
+      output << "      const " << segmentProductType << " segment" << group
+             << " = ";
       if (productShape == segmentProductShape)
         output << "product";
       else
         output << "__riscv_vget_v_" << productSuffix << "_"
                << segmentProductSuffix << "(product, " << group << ")";
-      output << ", zero, 16));\n"
-             << "      integer_sum += __weft_packed_i3_group_scale(\n"
-             << "          scales, first_group + " << group << ") * partial"
-             << group << ";\n";
+      output << ";\n"
+             << "      const " << accumulatorType << " widened" << group
+             << " = __riscv_vwcvt_x_x_v_" << accumulatorSuffix << "(segment"
+             << group << ", segment_vl);\n"
+             << "      integer_acc = __riscv_vmacc_vx_" << accumulatorSuffix
+             << "(\n          integer_acc, __weft_packed_i3_group_scale(\n"
+             << "              scales, first_group + " << group
+             << "), widened" << group << ", segment_vl);\n";
     }
     output << "    }\n";
   }
   output << "  }\n"
+         << "  const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n"
+         << "  const int32_t integer_sum = __riscv_vmv_x_s_i32m1_i32(\n"
+         << "      __riscv_vredsum_vs_" << accumulatorSuffix
+         << "_i32m1(integer_acc, zero, segment_vl));\n"
          << "  return init + weight_scale * activation_scale * "
             "(float)integer_sum;\n"
          << "}\n\n";

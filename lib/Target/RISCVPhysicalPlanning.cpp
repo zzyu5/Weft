@@ -2202,10 +2202,15 @@ derivePackedI3QuantRule(const LocalAxisMappingCandidate &candidate,
       rvvShapeForSameLanes(laneShape, 16, target);
   std::optional<RVVVectorShape> segmentProductShape =
       rvvShapeForSemanticLanes(16, 16, target);
-  if (!productShape || !segmentProductShape)
+  std::optional<RVVVectorShape> accumulatorShape =
+      segmentProductShape
+          ? rvvShapeForSameLanes(*segmentProductShape, 32, target)
+          : std::nullopt;
+  if (!productShape || !segmentProductShape || !accumulatorShape)
     return std::nullopt;
   QuantPrimitivePhysicalRule rule;
-  rule.valueShapes = {laneShape, *productShape, *segmentProductShape};
+  rule.valueShapes = {laneShape, *productShape, *segmentProductShape,
+                      *accumulatorShape};
   rule.operands = {
       {0, PhysicalMemoryMode::UnitStride, 3, 1, true},
       {1, PhysicalMemoryMode::UnitStride, 1, 1, true}};
@@ -2221,7 +2226,9 @@ derivePackedI3QuantRule(const LocalAxisMappingCandidate &candidate,
       {PhysicalLiveClass::Temporary, *segmentProductShape,
        AxisMappedMultiplicity::RegisterFactor, candidate.axis.id,
        candidate.axis.laneFactor / 16},
-      {PhysicalLiveClass::Temporary, kRVVE32M1}};
+      {PhysicalLiveClass::Temporary, kRVVE32M1},
+      {PhysicalLiveClass::Value, *accumulatorShape}};
+  rule.accumulatorCount = 1;
   rule.predicateGroups = 1;
   return rule;
 }
