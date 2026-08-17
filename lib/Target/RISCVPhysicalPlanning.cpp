@@ -2976,35 +2976,48 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
       std::move(legal.front().requirements), legal.front().resources};
 }
 
-std::optional<SelectedF16MatmulPhysical>
-selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
-                              const RISCVTargetProfile &target,
-                              const RISCVBackendConfig &config) {
-  if (!target.hasRVV || !target.hasF || !target.hasVectorF16 ||
-      !target.hasWideningFloat || config.parameters.f16LoadBufferCount < 0 ||
-      config.parameters.f16LoadBufferCount > 4)
+std::optional<SelectedMatmulPhysical>
+selectMatmulPhysicalConfig(const MatmulCandidateFacts &facts,
+                           const RISCVTargetProfile &target,
+                           const RISCVBackendConfig &config) {
+  const bool wideningF16 = facts.inputSEW == 16;
+  const bool nativeF32 = facts.inputSEW == 32;
+  const int64_t configuredLoadBuffers =
+      wideningF16 ? config.parameters.f16LoadBufferCount
+                  : config.parameters.dotLoadBufferCount;
+  if (!target.hasRVV || !target.hasF || (!wideningF16 && !nativeF32) ||
+      (wideningF16 && (!target.hasVectorF16 || !target.hasWideningFloat)) ||
+      configuredLoadBuffers < 0 || configuredLoadBuffers > 4)
     return std::nullopt;
   const unsigned baseInputLanes =
-      rvvLaneCapacity(rvvShape(16, 1), target).value_or(0);
+      rvvLaneCapacity(rvvShape(facts.inputSEW, 1), target).value_or(0);
   if (baseInputLanes == 0)
     return std::nullopt;
   CoreMappingProblem problem = facts.mapping;
-  problem.laneSEW = 16;
-  problem.laneInstruction = CoreInstructionKind::RVVWideningFMA;
-  if (config.parameters.f16InputLMUL != 0)
+  problem.laneSEW = facts.inputSEW;
+  problem.laneInstruction = wideningF16 ? CoreInstructionKind::RVVWideningFMA
+                                        : CoreInstructionKind::RVVFMA;
+  const int64_t configuredInputLMUL =
+      wideningF16 ? config.parameters.f16InputLMUL
+                  : config.parameters.dotLMUL;
+  if (configuredInputLMUL != 0)
     problem.laneLMULCandidates = {
-        static_cast<unsigned>(config.parameters.f16InputLMUL)};
+        static_cast<unsigned>(configuredInputLMUL)};
   else
-    problem.laneLMULCandidates = integerLMULCandidates(target, 16, 4);
+    problem.laneLMULCandidates =
+        integerLMULCandidates(target, facts.inputSEW, 4);
+  const int64_t configuredKUnroll =
+      wideningF16 ? config.parameters.f16KUnroll
+                  : config.parameters.dotKUnroll;
   problem.unrollCandidates =
-      config.parameters.f16KUnroll != 0
+      configuredKUnroll != 0
           ? llvm::SmallVector<unsigned, 4>{
-                static_cast<unsigned>(config.parameters.f16KUnroll)}
+                static_cast<unsigned>(configuredKUnroll)}
           : llvm::SmallVector<unsigned, 4>{1, 2, 4};
   problem.pipelineBufferCandidates =
-      config.parameters.f16LoadBufferCount != 0
+      configuredLoadBuffers != 0
           ? llvm::SmallVector<unsigned, 4>{
-                static_cast<unsigned>(config.parameters.f16LoadBufferCount)}
+                static_cast<unsigned>(configuredLoadBuffers)}
           : localPipelineBufferCandidates(facts.schedule, 4);
   const llvm::SmallVector<unsigned, 4> legalPipelineBuffers =
       localPipelineBufferCandidates(facts.schedule, 4);
@@ -3021,14 +3034,15 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     return std::nullopt;
   const unsigned rowTile = static_cast<unsigned>(*mConstraint->extent);
   const unsigned columnTile = static_cast<unsigned>(*nConstraint->extent);
-  if (config.parameters.f16RowMicrotile != 0)
+  if (wideningF16 && config.parameters.f16RowMicrotile != 0)
     mConstraint->registerFactors = {
         static_cast<unsigned>(config.parameters.f16RowMicrotile)};
-  if (config.parameters.f16ColumnMicrotile != 0)
+  if (wideningF16 && config.parameters.f16ColumnMicrotile != 0)
     nConstraint->registerFactors = {
         static_cast<unsigned>(config.parameters.f16ColumnMicrotile)};
   const unsigned preferredRows =
-      std::min(rowTile, std::max(1u, baseInputLanes / 4));
+      nativeF32 ? std::min(rowTile, 4u)
+                : std::min(rowTile, std::max(1u, baseInputLanes / 4));
   const unsigned preferredLMUL = 1;
   std::optional<uint64_t> reductionExtent;
   for (const LogicalAxisConstraint &axis : problem.axes)
@@ -3076,9 +3090,11 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     if (!m || !n || !k || !lane ||
         (lane->id != facts.rhsFreeAxis &&
          lane->id != facts.reductionAxis) ||
-        (config.parameters.f16LaneAxis == F16MatmulLaneAxis::Column &&
+        (wideningF16 &&
+         config.parameters.f16LaneAxis == F16MatmulLaneAxis::Column &&
          lane->id != facts.rhsFreeAxis) ||
-        (config.parameters.f16LaneAxis == F16MatmulLaneAxis::Reduction &&
+        (wideningF16 &&
+         config.parameters.f16LaneAxis == F16MatmulLaneAxis::Reduction &&
          lane->id != facts.reductionAxis) ||
         !inputLMUL ||
         !accumulatorShape ||
@@ -3161,7 +3177,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.unrollPenalty, rhs.bufferPenalty,
                     rhs.resources.peakGroups);
   });
-  return SelectedF16MatmulPhysical{
+  return SelectedMatmulPhysical{
       std::move(legal.front().mapping), std::move(legal.front().schedule),
       legal.front().accumulatorShape, legal.front().resources};
 }

@@ -1552,9 +1552,11 @@ mlir::LogicalResult MatmulOp::verify() {
   auto rhs = mlir::dyn_cast<BlockType>(unwrapMasked(getRhs().getType()));
   if (!lhs || !rhs || lhs.getShape().size() != 2 || rhs.getShape().size() != 2)
     return emitOpError("matmul requires local rank-two [M,K] x [K,N] blocks");
-  if (!lhs.getElementType().isF16() || !rhs.getElementType().isF16() ||
+  if (lhs.getElementType() != rhs.getElementType() ||
+      (!lhs.getElementType().isF16() && !lhs.getElementType().isF32()) ||
       !getAccDtype().isF32())
-    return emitOpError("matmul supports only f16 x f16 with f32 accumulation");
+    return emitOpError(
+        "matmul supports matching f16 or f32 operands with f32 accumulation");
   llvm::SmallVector<int64_t> outputShape{lhs.getShape()[0], rhs.getShape()[1]};
   llvm::SmallVector<int64_t> outputAxes{lhs.getAxisIds()[0],
                                         rhs.getAxisIds()[1]};

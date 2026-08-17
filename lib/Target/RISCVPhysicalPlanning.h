@@ -1008,8 +1008,9 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config);
 
-struct F16MatmulCandidateFacts {
+struct MatmulCandidateFacts {
   CoreMappingProblem mapping;
+  unsigned inputSEW = 0;
   unsigned lhsFreeAxis = 0;
   unsigned rhsFreeAxis = 0;
   unsigned reductionAxis = 0;
@@ -1017,17 +1018,17 @@ struct F16MatmulCandidateFacts {
   LocalScheduleDependenceFacts schedule;
 };
 
-struct SelectedF16MatmulPhysical {
+struct SelectedMatmulPhysical {
   CorePhysicalMapping mapping;
   LocalMicrokernelSchedule schedule;
   RVVVectorShape accumulatorShape;
   PhysicalResourceBudget resources;
 };
 
-std::optional<SelectedF16MatmulPhysical>
-selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
-                              const RISCVTargetProfile &target,
-                              const RISCVBackendConfig &config);
+std::optional<SelectedMatmulPhysical>
+selectMatmulPhysicalConfig(const MatmulCandidateFacts &facts,
+                           const RISCVTargetProfile &target,
+                           const RISCVBackendConfig &config);
 
 } // namespace weft::riscv_internal
 

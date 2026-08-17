@@ -1940,11 +1940,15 @@ class FrontendCompiler:
                 [] if lhs_region else [lhs_bare.axes[0]]
             )
         elif kind == "matmul":
-            if element_type(lhs.type) != ScalarType(f16) or element_type(
-                rhs.type
-            ) != ScalarType(f16):
+            lhs_element = element_type(lhs.type)
+            rhs_element = element_type(rhs.type)
+            if lhs_element != rhs_element or lhs_element not in {
+                ScalarType(f16),
+                ScalarType(f32),
+            }:
                 raise FrontendError(
-                    "W.matmul requires f16 multiplicands", self._location(call)
+                    "W.matmul requires matching f16 or f32 multiplicands",
+                    self._location(call),
                 )
             if (
                 not isinstance(lhs_bare, BlockType)

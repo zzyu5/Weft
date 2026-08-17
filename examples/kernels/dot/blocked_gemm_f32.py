@@ -14,38 +14,44 @@ def gemm_f32_worker(
     lda: W.index,
     ldb: W.index,
     ldc: W.index,
+    BM: W.constexpr[W.index],
+    BN: W.constexpr[W.index],
+    BK: W.constexpr[W.index],
 ) -> None:
-    for row in W.range(m_begin, m_end, 6):
-        for column in W.range(0, n):
-            row_lane = W.block(6)
-            inner = W.block(k)
-            row_index = row + row_lane[:, None]
-            inner_index = inner[None, :]
-            row_valid = row_index < m_end
-            lhs = W.load(
-                a + row_index * lda + inner_index,
-                where=row_valid,
-                other=W.f32(0.0),
-            )
-            rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
-            value = W.zeros((row_lane,), dtype=W.f32)
-            value = value + W.f32(0.0)
-            if k > W.index(0):
-                value = W.dot(
-                    lhs,
-                    rhs,
-                    init=value,
+    for m0 in W.range(m_begin, m_end, BM):
+        for n0 in W.range(0, n, BN):
+            mi = W.block(BM)
+            ni = W.block(BN)
+            acc = W.zeros((mi, ni), dtype=W.f32)
+
+            k0 = W.index(0)
+            while k0 < k:
+                ki = W.block(BK)
+                m_idx = m0 + mi[:, None]
+                n_idx = n0 + ni[None, :]
+                k_lhs = k0 + ki[None, :]
+                k_rhs = k0 + ki[:, None]
+                a_valid = (m_idx < m_end) & (k_lhs < k)
+                b_valid = (k_rhs < k) & (n_idx < n)
+                a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
+                b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
+                acc = W.matmul(
+                    a_blk,
+                    b_blk,
+                    init=acc,
                     acc_dtype=W.f32,
                     order="relaxed",
                     math="native",
                 )
-            else:
-                value = value + W.f32(0.0)
-            shifted = value + W.f32(0.0)
-            scaled = value * W.f32(1.0)
+                k0 = k0 + BK
+
+            shifted = acc + W.f32(0.0)
+            scaled = acc * W.f32(1.0)
             combined = W.maximum(shifted, scaled)
+            m_idx = m0 + mi[:, None]
+            n_idx = n0 + ni[None, :]
             W.store(
-                c + (row + row_lane) * ldc + column,
+                c + m_idx * ldc + n_idx,
                 combined,
-                where=row + row_lane < m_end,
+                where=(m_idx < m_end) & (n_idx < n),
             )

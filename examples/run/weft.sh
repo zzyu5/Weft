@@ -1192,11 +1192,16 @@ elif [[ ${quant} -eq 1 ]]; then
   cp "${project_root}/examples/repro/weft/quantization/block_dot/common/ggml_quant.h" \
     "${local_root}/common/ggml_quant.h"
 else
-  if [[ ${kernel} == blocked_gemm ]]; then
+  if [[ ${kernel} == blocked_gemm || ${kernel} == blocked_gemm_f32 ]]; then
+    if [[ ${kernel} == blocked_gemm_f32 ]]; then
+      gemm_meta=(--meta=BM=4 --meta=BN=2 --meta=BK=4096)
+    else
+      gemm_meta=(--meta=BM=4 --meta=BN=8 --meta=BK=64)
+    fi
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" |
       "${compiler}" --emit=intrinsic-c --march="${target_march}" --abi=lp64d \
         --vlen-bits="${target_vlen_bits}" --matrix-extension="${matrix_extension}" \
-        --meta=BM=4 --meta=BN=8 --meta=BK=64 "${backend_arguments[@]}" \
+        "${gemm_meta[@]}" "${backend_arguments[@]}" \
         --header="${local_root}/kernel.h" -o "${local_root}/kernel.c"
   elif [[ ${multi} -eq 1 ]]; then
     PYTHONPATH="${project_root}/python" python3 -m weft "${project_root}/${dsl}" \
