@@ -1,101 +1,16 @@
 #include "RISCVQuantIntrinsicC.h"
 
+#include "RISCVRVVSpelling.h"
+
 #include "llvm/Support/raw_ostream.h"
 
 namespace weft::riscv_internal {
+namespace {
 
-void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,
-                            bool registerL64, bool strip) {
-  if (registerL64) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_register_l64_e8m2(
-    const uint8_t *low_bits, const uint8_t *high_bits,
-    const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
-    float weight_scale, float activation_scale, float init) {
-  const int8_t *group_scales =
-      (const int8_t *)(const void *)group_scale_bytes;
-  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
-  const float combined_scale = weight_scale * activation_scale;
-    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-    int32_t integer_sum = 0;
-    for (size_t half = 0; half < 2; ++half) {
-      const uint8_t *q6 = low_bits + half * 64;
-      const uint8_t *qh = high_bits + half * 32;
-      const int8_t *q8v = activation + half * 128;
-      const int8_t *sc = group_scales + half * 8;
-      const size_t vl32 = __riscv_vsetvl_e8m1(32);
-      const vuint8m1_t qh_value = __riscv_vle8_v_u8m1(qh, vl32);
-      const vuint8m1_t q6_0 = __riscv_vle8_v_u8m1(q6, vl32);
-      const vuint8m1_t q6_1 = __riscv_vle8_v_u8m1(q6 + 32, vl32);
-      const vuint8m1_t low_0 = __riscv_vand_vx_u8m1(q6_0, 0x0f, vl32);
-      const vuint8m1_t low_1 = __riscv_vand_vx_u8m1(q6_1, 0x0f, vl32);
-      const vuint8m1_t high_0 = __riscv_vsrl_vx_u8m1(q6_0, 4, vl32);
-      const vuint8m1_t high_1 = __riscv_vsrl_vx_u8m1(q6_1, 4, vl32);
-      const vuint8m1_t qh_0 = __riscv_vand_vx_u8m1(qh_value, 3, vl32);
-      const vuint8m1_t qh_1 = __riscv_vand_vx_u8m1(
-          __riscv_vsrl_vx_u8m1(qh_value, 2, vl32), 3, vl32);
-      const vuint8m1_t qh_2 = __riscv_vand_vx_u8m1(
-          __riscv_vsrl_vx_u8m1(qh_value, 4, vl32), 3, vl32);
-      const vuint8m1_t qh_3 = __riscv_vand_vx_u8m1(
-          __riscv_vsrl_vx_u8m1(qh_value, 6, vl32), 3, vl32);
-      const vint8m1_t value_0 = __riscv_vsub_vx_i8m1(
-          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
-              low_0, __riscv_vsll_vx_u8m1(qh_0, 4, vl32), vl32)),
-          32, vl32);
-      const vint8m1_t value_1 = __riscv_vsub_vx_i8m1(
-          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
-              low_1, __riscv_vsll_vx_u8m1(qh_1, 4, vl32), vl32)),
-          32, vl32);
-      const vint8m1_t value_2 = __riscv_vsub_vx_i8m1(
-          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
-              high_0, __riscv_vsll_vx_u8m1(qh_2, 4, vl32), vl32)),
-          32, vl32);
-      const vint8m1_t value_3 = __riscv_vsub_vx_i8m1(
-          __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vor_vv_u8m1(
-              high_1, __riscv_vsll_vx_u8m1(qh_3, 4, vl32), vl32)),
-          32, vl32);
-      const vint16m2_t product_0 = __riscv_vwmul_vv_i16m2(
-          value_0, __riscv_vle8_v_i8m1(q8v, vl32), vl32);
-      const vint16m2_t product_1 = __riscv_vwmul_vv_i16m2(
-          value_1, __riscv_vle8_v_i8m1(q8v + 32, vl32), vl32);
-      const vint16m2_t product_2 = __riscv_vwmul_vv_i16m2(
-          value_2, __riscv_vle8_v_i8m1(q8v + 64, vl32), vl32);
-      const vint16m2_t product_3 = __riscv_vwmul_vv_i16m2(
-          value_3, __riscv_vle8_v_i8m1(q8v + 96, vl32), vl32);
-      const size_t vl16 = __riscv_vsetvl_e16m1(16);
-      const vint32m2_t scaled_0 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_0, 0), sc[0], vl16);
-      const vint32m2_t scaled_1 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_0, 1), sc[1], vl16);
-      const vint32m2_t scaled_2 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_1, 0), sc[2], vl16);
-      const vint32m2_t scaled_3 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_1, 1), sc[3], vl16);
-      const vint32m2_t scaled_4 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_2, 0), sc[4], vl16);
-      const vint32m2_t scaled_5 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_2, 1), sc[5], vl16);
-      const vint32m2_t scaled_6 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_3, 0), sc[6], vl16);
-      const vint32m2_t scaled_7 = __riscv_vwmul_vx_i32m2(
-          __riscv_vget_v_i16m2_i16m1(product_3, 1), sc[7], vl16);
-      const vint32m1_t sum_0 = __riscv_vredsum_vs_i32m2_i32m1(
-          __riscv_vadd_vv_i32m2(scaled_0, scaled_1, vl16), zero, vl16);
-      const vint32m1_t sum_1 = __riscv_vredsum_vs_i32m2_i32m1(
-          __riscv_vadd_vv_i32m2(scaled_2, scaled_3, vl16), sum_0, vl16);
-      const vint32m1_t sum_2 = __riscv_vredsum_vs_i32m2_i32m1(
-          __riscv_vadd_vv_i32m2(scaled_4, scaled_5, vl16), sum_1, vl16);
-      const vint32m1_t sum_3 = __riscv_vredsum_vs_i32m2_i32m1(
-          __riscv_vadd_vv_i32m2(scaled_6, scaled_7, vl16), sum_2, vl16);
-      integer_sum += __riscv_vmv_x_s_i32m1_i32(sum_3);
-    }
-    return init + combined_scale * (float)integer_sum;
-}
-)c";
-  }
-  if (registerL32) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_register_l32_e8m2(
+void emitQ6KRVVAssembly(llvm::raw_ostream &output,
+                        const LocalImplementation &implementation) {
+  output << "static inline __attribute__((always_inline, unused)) float\n"
+         << implementation.helperSymbol << R"c((
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -204,48 +119,146 @@ __weft_q6_k_i8_register_l32_e8m2(
   }
   return result;
 }
+
 )c";
-  }
-  if (strip) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_q6_k_i8_strip(
-    const uint8_t *low_bits, const uint8_t *high_bits,
-    const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
-    float weight_scale, float activation_scale, float init) {
-  const int8_t *group_scales =
-      (const int8_t *)(const void *)group_scale_bytes;
-  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
-  int8_t decoded[32];
-  int32_t integer_sum = 0;
-  for (size_t half = 0; half < 2; ++half) {
-    for (size_t quarter = 0; quarter < 4; ++quarter) {
-      for (size_t lane = 0; lane < 32; ++lane) {
-        const uint8_t low0 = low_bits[half * 64 + lane];
-        const uint8_t low1 = low_bits[half * 64 + 32 + lane];
-        const uint8_t high = high_bits[half * 32 + lane];
-        uint8_t code;
-        if (quarter == 0)
-          code = (low0 & UINT8_C(15)) | (((high >> 0) & 3) << 4);
-        else if (quarter == 1)
-          code = (low1 & UINT8_C(15)) | (((high >> 2) & 3) << 4);
-        else if (quarter == 2)
-          code = (low0 >> 4) | (((high >> 4) & 3) << 4);
-        else
-          code = (low1 >> 4) | (((high >> 6) & 3) << 4);
-        decoded[lane] = (int8_t)code - 32;
-      }
-      const size_t base = half * 128 + quarter * 32;
-      const int32_t first = __weft_i8_dot(decoded, activation + base, 16);
-      const int32_t second =
-          __weft_i8_dot(decoded + 16, activation + base + 16, 16);
-      integer_sum += first * group_scales[base / 16];
-      integer_sum += second * group_scales[base / 16 + 1];
-    }
-  }
-  return init + (float)integer_sum * weight_scale * activation_scale;
 }
-)c";
+
+} // namespace
+
+bool emitQ6LocalImplementation(llvm::raw_ostream &output,
+                               const LocalImplementation &implementation) {
+  if (!isQ6KLocalImplementationMapping(implementation) ||
+      implementation.helperSymbol.empty())
+    return false;
+  if (implementation.leafSpelling == LocalLeafSpelling::Q6KRVVAssembly) {
+    emitQ6KRVVAssembly(output, implementation);
+    return true;
   }
+  if (implementation.leafSpelling != LocalLeafSpelling::IntrinsicC)
+    return false;
+
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape chunkShape = implementation.valueShapes[1];
+  const RVVVectorShape productShape = implementation.valueShapes[2];
+  const RVVVectorShape segmentProductShape = implementation.valueShapes[3];
+  const std::string laneType =
+      rvvVectorType(RVVElementCategory::SignedInteger, laneShape);
+  const std::string laneSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, laneShape);
+  const std::string chunkUnsignedType =
+      rvvVectorType(RVVElementCategory::UnsignedInteger, chunkShape);
+  const std::string chunkUnsignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::UnsignedInteger, chunkShape);
+  const std::string chunkSignedType =
+      rvvVectorType(RVVElementCategory::SignedInteger, chunkShape);
+  const std::string chunkSignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, chunkShape);
+  const std::string productType =
+      rvvVectorType(RVVElementCategory::SignedInteger, productShape);
+  const std::string productSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, productShape);
+  const std::string segmentProductSuffix = rvvIntrinsicTypeSuffix(
+      RVVElementCategory::SignedInteger, segmentProductShape);
+  const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
+  const std::string chunkSetVL = rvvSetVLIntrinsic(chunkShape);
+  if (!reduction || laneType.empty() || laneSuffix.empty() ||
+      chunkUnsignedType.empty() || chunkUnsignedSuffix.empty() ||
+      chunkSignedType.empty() || chunkSignedSuffix.empty() ||
+      productType.empty() || productSuffix.empty() ||
+      segmentProductSuffix.empty() || laneSetVL.empty() || chunkSetVL.empty())
+    return false;
+
+  const unsigned chunksPerVector = reduction->laneFactor / 32;
+  const unsigned segmentCount = reduction->laneFactor / 16;
+  output << "static inline __attribute__((always_inline, unused)) float\n"
+         << implementation.helperSymbol << "(\n"
+         << "    const uint8_t *low_bits, const uint8_t *high_bits,\n"
+         << "    const uint8_t *group_scale_bytes, const uint8_t "
+            "*activation_bytes,\n"
+         << "    float weight_scale, float activation_scale, float init) {\n"
+         << "  const int8_t *group_scales =\n"
+         << "      (const int8_t *)(const void *)group_scale_bytes;\n"
+         << "  const int8_t *activation =\n"
+         << "      (const int8_t *)(const void *)activation_bytes;\n"
+         << "  const size_t chunk_vl = " << chunkSetVL << "(32);\n"
+         << "  const size_t vl = " << laneSetVL << "("
+         << reduction->laneFactor << ");\n"
+         << "  int32_t integer_sum = 0;\n"
+         << "  for (size_t batch = 0; batch < "
+         << reduction->sequentialFactor << "; ++batch) {\n";
+  for (unsigned chunk = 0; chunk < chunksPerVector; ++chunk) {
+    output << "    const size_t logical_chunk" << chunk << " = batch * "
+           << chunksPerVector << " + " << chunk << ";\n"
+           << "    const size_t half" << chunk << " = logical_chunk" << chunk
+           << " / 4;\n"
+           << "    const size_t quarter" << chunk << " = logical_chunk" << chunk
+           << " % 4;\n"
+           << "    const uint8_t *low" << chunk << " = low_bits + half" << chunk
+           << " * 64 + (quarter" << chunk << " & 1) * 32;\n"
+           << "    const uint8_t *high" << chunk << " = high_bits + half" << chunk
+           << " * 32;\n"
+           << "    const " << chunkUnsignedType << " packed" << chunk
+           << " = __riscv_vle8_v_" << chunkUnsignedSuffix << "(low" << chunk
+           << ", chunk_vl);\n"
+           << "    const " << chunkUnsignedType << " high_bits" << chunk
+           << " = __riscv_vle8_v_" << chunkUnsignedSuffix << "(high" << chunk
+           << ", chunk_vl);\n"
+           << "    const " << chunkUnsignedType << " low_code" << chunk
+           << " = quarter" << chunk << " < 2\n"
+           << "        ? __riscv_vand_vx_" << chunkUnsignedSuffix << "(packed"
+           << chunk << ", UINT8_C(15), chunk_vl)\n"
+           << "        : __riscv_vsrl_vx_" << chunkUnsignedSuffix << "(packed"
+           << chunk << ", 4, chunk_vl);\n"
+           << "    const " << chunkUnsignedType << " high_code" << chunk
+           << " = __riscv_vand_vx_" << chunkUnsignedSuffix << "(\n"
+           << "        __riscv_vsrl_vx_" << chunkUnsignedSuffix << "(high_bits"
+           << chunk << ", 2 * quarter" << chunk
+           << ", chunk_vl), UINT8_C(3), chunk_vl);\n"
+           << "    const " << chunkSignedType << " codes" << chunk
+           << " = __riscv_vsub_vx_" << chunkSignedSuffix << "(\n"
+           << "        __riscv_vreinterpret_v_" << chunkUnsignedSuffix << "_"
+           << chunkSignedSuffix << "(__riscv_vor_vv_" << chunkUnsignedSuffix
+           << "(\n            low_code" << chunk << ", __riscv_vsll_vx_"
+           << chunkUnsignedSuffix << "(high_code" << chunk
+           << ", 4, chunk_vl), chunk_vl)),\n"
+           << "        32, chunk_vl);\n"
+           << "    const " << chunkSignedType << " activation" << chunk
+           << " = __riscv_vle8_v_" << chunkSignedSuffix
+           << "(activation + logical_chunk" << chunk << " * 32, chunk_vl);\n";
+  }
+  if (chunksPerVector == 1) {
+    output << "    const " << laneType << " codes = codes0;\n"
+           << "    const " << laneType << " q8 = activation0;\n";
+  } else {
+    output << "    const " << laneType << " codes = __riscv_vcreate_v_"
+           << chunkSignedSuffix << "_" << laneSuffix
+           << "(codes0, codes1);\n"
+           << "    const " << laneType << " q8 = __riscv_vcreate_v_"
+           << chunkSignedSuffix << "_" << laneSuffix
+           << "(activation0, activation1);\n";
+  }
+  output << "    const " << productType
+         << " product = __riscv_vwmul_vv_" << productSuffix
+         << "(codes, q8, vl);\n"
+         << "    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n";
+  for (unsigned segment = 0; segment < segmentCount; ++segment) {
+    output << "    const int32_t partial" << segment
+           << " = __riscv_vmv_x_s_i32m1_i32(\n"
+           << "        __riscv_vwredsum_vs_" << segmentProductSuffix
+           << "_i32m1(\n            __riscv_vget_v_" << productSuffix << "_"
+           << segmentProductSuffix << "(product, " << segment
+           << "), zero, 16));\n"
+           << "    integer_sum += partial" << segment
+           << " * group_scales[batch * " << segmentCount << " + " << segment
+           << "];\n";
+  }
+  output << "  }\n"
+         << "  return init + (float)integer_sum * weight_scale * "
+            "activation_scale;\n"
+         << "}\n\n";
+  return true;
 }
 
 } // namespace weft::riscv_internal

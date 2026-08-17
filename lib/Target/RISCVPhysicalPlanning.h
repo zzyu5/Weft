@@ -464,8 +464,14 @@ enum class LocalPrimitiveKind {
   Q6KI8,
 };
 
+enum class LocalLeafSpelling {
+  IntrinsicC,
+  Q6KRVVAssembly,
+};
+
 struct LocalImplementation {
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
+  LocalLeafSpelling leafSpelling = LocalLeafSpelling::IntrinsicC;
   CorePhysicalMapping mapping;
   llvm::SmallVector<RVVVectorShape, 4> valueShapes;
   unsigned entryWidth = 0;
@@ -475,13 +481,16 @@ struct LocalImplementation {
     return primitive != LocalPrimitiveKind::None && mapping;
   }
   bool operator==(const LocalImplementation &other) const {
-    return primitive == other.primitive && mapping == other.mapping &&
+    return primitive == other.primitive && leafSpelling == other.leafSpelling &&
+           mapping == other.mapping &&
            valueShapes == other.valueShapes && entryWidth == other.entryWidth &&
            helperSymbol == other.helperSymbol;
   }
   bool operator<(const LocalImplementation &other) const {
     if (primitive != other.primitive)
       return primitive < other.primitive;
+    if (leafSpelling != other.leafSpelling)
+      return leafSpelling < other.leafSpelling;
     if (!(mapping == other.mapping))
       return mapping < other.mapping;
     if (valueShapes != other.valueShapes)
@@ -513,6 +522,8 @@ bool isIQ3SLocalImplementationMapping(
 bool isIQ2SLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isIQ1MLocalImplementationMapping(
+    const LocalImplementation &implementation);
+bool isQ6KLocalImplementationMapping(
     const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>

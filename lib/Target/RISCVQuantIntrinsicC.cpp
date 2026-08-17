@@ -48,11 +48,11 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 bool emitQuantLocalImplementations(llvm::raw_ostream &output,
                                    const SelectedLocalImplementations &selected,
                                    std::string &unsupportedSymbol) {
-  bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
   const LocalImplementation *iq2Implementation = nullptr;
   const LocalImplementation *iq3Implementation = nullptr;
   const LocalImplementation *iq1Implementation = nullptr;
+  const LocalImplementation *q6Implementation = nullptr;
   bool supported = true;
   selected.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
@@ -111,9 +111,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
       iq1Implementation = &implementation;
       break;
     case LocalPrimitiveKind::Q6KI8:
-      supported = match("__weft_q6_k_i8_register_l32_e8m2", q6Register32) ||
-                  match("__weft_q6_k_i8_register_l64_e8m2", q6Register64) ||
-                  match("__weft_q6_k_i8_strip", q6Strip);
+      q6Implementation = &implementation;
       break;
     default:
       return;
@@ -124,30 +122,9 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   });
   if (!supported)
     return false;
-  if (!q6Register32 && !q6Register64 && !q6Strip && !packedI3L32 &&
-      !packedI3L64 && !iq2Implementation && !iq3Implementation &&
-      !iq1Implementation)
+  if (!packedI3L32 && !packedI3L64 && !iq2Implementation &&
+      !iq3Implementation && !iq1Implementation && !q6Implementation)
     return true;
-
-  if (q6Strip) {
-    output << R"c(static inline __attribute__((always_inline, unused)) int32_t
-__weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
-  int32_t result = 0;
-  size_t offset = 0;
-  while (offset < count) {
-    const size_t vl = __riscv_vsetvl_e8m2(count - offset);
-    const vint8m2_t left = __riscv_vle8_v_i8m2(lhs + offset, vl);
-    const vint8m2_t right = __riscv_vle8_v_i8m2(rhs + offset, vl);
-    const vint16m4_t products = __riscv_vwmul_vv_i16m4(left, right, vl);
-    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-    result += __riscv_vmv_x_s_i32m1_i32(
-        __riscv_vwredsum_vs_i16m4_i32m1(products, zero, vl));
-    offset += vl;
-  }
-  return result;
-}
-)c";
-  }
   if (iq1Implementation)
     emitI64Table(output, "__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
   if (iq2Implementation)
@@ -170,7 +147,11 @@ __weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
     unsupportedSymbol = iq1Implementation->helperSymbol;
     return false;
   }
-  emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
+  if (q6Implementation &&
+      !emitQ6LocalImplementation(output, *q6Implementation)) {
+    unsupportedSymbol = q6Implementation->helperSymbol;
+    return false;
+  }
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
   return true;
 }

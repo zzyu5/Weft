@@ -384,6 +384,42 @@ bool isIQ1MLocalImplementationMapping(
                         segmentProductShape).empty();
 }
 
+bool isQ6KLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::Q6KI8 ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 4)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
+      (reduction->laneFactor != 32 && reduction->laneFactor != 64) ||
+      reduction->registerFactor != 1 ||
+      reduction->sequentialFactor != 256 / reduction->laneFactor)
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape chunkShape = implementation.valueShapes[1];
+  const RVVVectorShape productShape = implementation.valueShapes[2];
+  const RVVVectorShape segmentProductShape = implementation.valueShapes[3];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         chunkShape.sew == 8 &&
+         chunkShape.lmulEighths * (reduction->laneFactor / 32) ==
+             laneShape.lmulEighths &&
+         productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         segmentProductShape.sew == 16 &&
+         segmentProductShape.lmulEighths * (reduction->laneFactor / 16) ==
+             productShape.lmulEighths &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, chunkShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, laneShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger,
+                        segmentProductShape).empty();
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -525,10 +561,7 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::IQ1MI8:
     return isIQ1MLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::Q6KI8:
-    return rvvDot &&
-           (((lanes == 32 || lanes == 64) &&
-             primary == RVVVectorShape{8, 16}) ||
-            (strip && lanes == 16 && primary == RVVVectorShape{8, 16}));
+    return isQ6KLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::IQ3SI8:
     return isIQ3SLocalImplementationMapping(implementation);
   }
@@ -606,8 +639,7 @@ selectLocalImplementationSymbol(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::IQ1MI8:
     return "__weft_iq1_m_i8" + registerSuffix;
   case LocalPrimitiveKind::Q6KI8:
-    return sequential ? "__weft_q6_k_i8_strip"
-                      : "__weft_q6_k_i8" + registerSuffix;
+    return "__weft_q6_k_i8" + registerSuffix;
   }
   return {};
 }
@@ -2381,6 +2413,24 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       implementation.valueShapes = {laneShape, *indexShape, tableShape,
                                     tableShape, *productShape,
                                     *segmentProductShape};
+    } else if (primitive == LocalPrimitiveKind::Q6KI8) {
+      if ((candidate.axis.laneFactor != 32 &&
+           candidate.axis.laneFactor != 64) ||
+          candidate.axis.registerFactor != 1)
+        continue;
+      std::optional<RVVVectorShape> chunkShape =
+          rvvShapeForSemanticLanes(8, 32, target);
+      std::optional<RVVVectorShape> productShape =
+          rvvShapeForSameLanes(laneShape, 16, target);
+      std::optional<RVVVectorShape> segmentProductShape =
+          rvvShapeForSemanticLanes(16, 16, target);
+      if (!chunkShape || !productShape || !segmentProductShape)
+        continue;
+      implementation.valueShapes = {laneShape, *chunkShape, *productShape,
+                                    *segmentProductShape};
+      if (candidate.axis.laneFactor == 32 &&
+          laneShape == RVVVectorShape{8, 16})
+        implementation.leafSpelling = LocalLeafSpelling::Q6KRVVAssembly;
     } else {
       implementation.valueShapes = {laneShape};
     }
@@ -2425,6 +2475,37 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
           {PhysicalLiveClass::Temporary, implementation.valueShapes[5],
            AxisMappedMultiplicity::Fixed, kCoreAxisK,
            2 * (candidate.axis.laneFactor / 16)},
+          {PhysicalLiveClass::Temporary, kRVVE32M1}};
+    } else if (primitive == LocalPrimitiveKind::Q6KI8) {
+      if (implementation.leafSpelling == LocalLeafSpelling::Q6KRVVAssembly) {
+        PhysicalResourceRequirements requirements;
+        requirements.reservedGroups = 0;
+        requirements.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
+        std::optional<PhysicalResourceBudget> budget =
+            calculatePhysicalResources(requirements, target);
+        if (!budget)
+          continue;
+        SelectedQuantI8DotPhysical selected;
+        selected.implementation = std::move(implementation);
+        selected.operandShape = laneShape;
+        selected.resources = *budget;
+        legal.push_back(Candidate{std::move(selected),
+                                  candidate.axis.sequentialFactor,
+                                  candidate.axis.registerFactor});
+        continue;
+      }
+      resources.values = {
+          {PhysicalLiveClass::Memory, implementation.valueShapes[1],
+           AxisMappedMultiplicity::Fixed, kCoreAxisK,
+           3 * (candidate.axis.laneFactor / 32)},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[1],
+           AxisMappedMultiplicity::Fixed, kCoreAxisK,
+           2 * (candidate.axis.laneFactor / 32)},
+          {PhysicalLiveClass::Memory, laneShape},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[2]},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[3],
+           AxisMappedMultiplicity::Fixed, kCoreAxisK,
+           candidate.axis.laneFactor / 16},
           {PhysicalLiveClass::Temporary, kRVVE32M1}};
     } else if (candidate.axis.sequentialFactor > 1 && logicalLanes == 16) {
       resources.values = {

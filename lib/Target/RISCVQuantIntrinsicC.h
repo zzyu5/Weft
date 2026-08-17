@@ -15,8 +15,8 @@ bool emitIQ3LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation);
 bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation);
-void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,
-                                bool registerL64, bool strip);
+bool emitQ6LocalImplementation(llvm::raw_ostream &output,
+                               const LocalImplementation &implementation);
 bool emitPackedI4LocalImplementation(llvm::raw_ostream &output,
                                      const LocalImplementation &implementation);
 bool emitPackedI5LocalImplementation(llvm::raw_ostream &output,
