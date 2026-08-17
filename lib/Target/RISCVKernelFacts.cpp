@@ -400,11 +400,17 @@ LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
   if (auto binary = value.getDefiningOp<BinaryOp>()) {
     LaneRelation lhs = classifyLaneRelation(binary.getLhs(), coordinate);
     LaneRelation rhs = classifyLaneRelation(binary.getRhs(), coordinate);
-    if (binary.getKind() == "add" || binary.getKind() == "sub")
-      return combineLaneRelations(lhs, rhs);
+    const bool indexResult =
+        elementType(binary.getResult().getType()).isIndex();
+    if (binary.getKind() == "add" || binary.getKind() == "sub") {
+      LaneRelation combined = combineLaneRelations(lhs, rhs);
+      return indexResult && combined == LaneRelation::NonAffine
+                 ? LaneRelation::Indexed
+                 : combined;
+    }
     if (binary.getKind() == "mul") {
       if (lhs != LaneRelation::Independent && rhs != LaneRelation::Independent)
-        return LaneRelation::NonAffine;
+        return indexResult ? LaneRelation::Indexed : LaneRelation::NonAffine;
       LaneRelation dependent =
           lhs == LaneRelation::Independent ? rhs : lhs;
       mlir::Value scale =
@@ -419,10 +425,12 @@ LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
       }
       if (dependent == LaneRelation::Indexed)
         return LaneRelation::Indexed;
-      return dependent == LaneRelation::NonAffine ? LaneRelation::NonAffine
-                                                   : LaneRelation::Strided;
+      return dependent == LaneRelation::NonAffine
+                 ? (indexResult ? LaneRelation::Indexed
+                                : LaneRelation::NonAffine)
+                 : LaneRelation::Strided;
     }
-    if (elementType(binary.getResult().getType()).isIndex() &&
+    if (indexResult &&
         (lhs != LaneRelation::Independent || rhs != LaneRelation::Independent))
       return LaneRelation::Indexed;
   }
@@ -440,8 +448,9 @@ LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
       return LaneRelation::Indexed;
     return classifyLaneRelation(cast.getInput(), coordinate);
   }
-  return isRegionValue(value.getType()) ? LaneRelation::NonAffine
-                                        : LaneRelation::Independent;
+  return logicalShapeKind(value.getType()) == LogicalShapeKind::Scalar
+             ? LaneRelation::Independent
+             : LaneRelation::NonAffine;
 }
 
 mlir::Value findIndexedOffset(mlir::Value pointer, mlir::Value coordinate) {

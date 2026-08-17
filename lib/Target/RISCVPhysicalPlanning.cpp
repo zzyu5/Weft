@@ -168,14 +168,23 @@ std::string localImplementationSymbol(
            (affine ? "affine" : "symmetric") + "_i4_i8_" +
            (operation.rows == 4 ? "m4_" : "") + "n16_k32";
   }
-  case LocalPrimitiveKind::GroupedAffineI4I8:
+  case LocalPrimitiveKind::GroupedAffineI4I8: {
+    if (operation.kind == LocalHardwareOperationKind::RVVInlineAsm) {
+      const PhysicalAxisDecomposition *reduction = findUniqueAxisMapping(
+          implementation.mapping, LogicalAxisRole::Reduction);
+      return reduction && reduction->sequentialFactor == 1 &&
+                     reduction->laneFactor == 16 &&
+                     reduction->registerFactor == 2
+                 ? "__weft_grouped_affine_i4_i8_register_l16_e8m1"
+                 : std::string{};
+    }
     if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic && sequential)
       return "__weft_grouped_affine_i4_i8_strip";
-    return (operation.kind == LocalHardwareOperationKind::RVVIntrinsic ||
-            operation.kind == LocalHardwareOperationKind::RVVInlineAsm) &&
+    return operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                    !registerSuffix.empty()
                ? "__weft_grouped_affine_i4_i8" + registerSuffix
                : std::string{};
+  }
   case LocalPrimitiveKind::E2M1E8M0I8:
     if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic && sequential)
       return "__weft_e2m1_e8m0_i8_strip";
@@ -310,11 +319,9 @@ std::optional<SelectedBlockDecodePhysical>
 selectBlockDecodePhysical(const BlockDecodeCandidateFacts &facts,
                           const RISCVTargetProfile &target) {
   if (!target.hasRVV || facts.codeExtent != 16 ||
-      facts.tableExtent != 16)
-    return std::nullopt;
-  std::optional<RVVVectorShape> laneShape =
-      rvvShapeForSemanticLanes(8, facts.codeExtent, target);
-  if (!laneShape)
+      facts.tableExtent != 16 || facts.valueShape.sew != 8 ||
+      rvvLaneCapacity(facts.valueShape, target).value_or(0) <
+          facts.codeExtent)
     return std::nullopt;
   CoreMappingProblem problem;
   problem.axes = {
@@ -322,16 +329,16 @@ selectBlockDecodePhysical(const BlockDecodeCandidateFacts &facts,
                             facts.codeExtent, false, true, true, {1}}};
   problem.laneSEW = 8;
   problem.laneInstruction = CoreInstructionKind::RVVIndexedGather;
-  problem.laneShapeCandidates = {*laneShape};
+  problem.laneShapeCandidates = {facts.valueShape};
   llvm::SmallVector<CorePhysicalMapping> mappings =
       enumerateCorePhysicalMappings(problem, target);
   if (mappings.size() != 1)
     return std::nullopt;
   SelectedBlockDecodePhysical selected;
   selected.mapping = std::move(mappings.front());
-  selected.codeShape = *laneShape;
-  selected.tableShape = *laneShape;
-  selected.resultShape = *laneShape;
+  selected.codeShape = facts.valueShape;
+  selected.tableShape = facts.valueShape;
+  selected.resultShape = facts.valueShape;
   selected.tableExtent = facts.tableExtent;
   PhysicalResourceRequirements requirements;
   requirements.live = {

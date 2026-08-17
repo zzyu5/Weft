@@ -38,6 +38,7 @@ selectLoadF16LEPhysical(bool knownAligned,
 struct BlockDecodeCandidateFacts {
   unsigned codeExtent = 0;
   unsigned tableExtent = 0;
+  RVVVectorShape valueShape;
 };
 
 struct SelectedBlockDecodePhysical {

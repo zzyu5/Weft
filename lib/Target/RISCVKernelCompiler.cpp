@@ -24,6 +24,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -95,7 +96,35 @@ struct BlockOperationDecision {
   unsigned maskRatio = 0;
   RVVVectorShape temporaryShape;
   std::optional<SelectedBlockMemoryPhysical> memory;
+  std::shared_ptr<const SelectedBlockDecodePhysical> decode;
 };
+
+bool mergeBlockOperationResources(
+    PhysicalResourceBudget &aggregate,
+    llvm::ArrayRef<BlockOperationDecision> operations) {
+  for (const BlockOperationDecision &operation : operations) {
+    if (!operation.decode)
+      continue;
+    const PhysicalResourceBudget &resources = operation.decode->resources;
+    if (resources.architecturalGroups != aggregate.architecturalGroups)
+      return false;
+    aggregate.valueGroups =
+        std::max(aggregate.valueGroups, resources.valueGroups);
+    aggregate.memoryGroups =
+        std::max(aggregate.memoryGroups, resources.memoryGroups);
+    aggregate.indexGroups =
+        std::max(aggregate.indexGroups, resources.indexGroups);
+    aggregate.predicateGroups =
+        std::max(aggregate.predicateGroups, resources.predicateGroups);
+    aggregate.stateGroups =
+        std::max(aggregate.stateGroups, resources.stateGroups);
+    aggregate.primitiveGroups =
+        std::max(aggregate.primitiveGroups, resources.primitiveGroups);
+    aggregate.peakGroups =
+        std::max(aggregate.peakGroups, resources.peakGroups);
+  }
+  return true;
+}
 
 struct BlockStoreGroupDecision {
   mlir::Operation *operation = nullptr;
@@ -707,9 +736,6 @@ struct RISCVPhysicalPlan {
   llvm::DenseMap<mlir::Operation *,
                  PlannedPhysicalDecision<NibbleCodebookI8Decision>>
       nibbleCodebookI8;
-  llvm::DenseMap<mlir::Operation *,
-                 PlannedPhysicalDecision<SelectedBlockDecodePhysical>>
-      blockDecodes;
   llvm::DenseMap<mlir::Operation *, PlannedPhysicalDecision<LoadF16LEDecision>>
       f16LELoads;
   llvm::DenseMap<mlir::Operation *,
@@ -1337,18 +1363,6 @@ private:
           {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
            op.getActivation()},
           {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](DecodeOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<SelectedBlockDecodePhysical> planned;
-      if (mlir::failed(decideBlockDecode(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeBlockDecodePlan(op, planned);
-      registerDecision(physicalPlan.blockDecodes, op.getOperation(),
-                       std::move(planned), "decode");
     });
     if (!decisionFailure && mlir::failed(prepareMaterializedF32Pointwise()))
       decisionFailure = true;
@@ -8049,23 +8063,6 @@ private:
     planned.entity.resources = planned.realization.physical.resources;
   }
 
-  void finalizeBlockDecodePlan(
-      DecodeOp op,
-      PlannedPhysicalDecision<SelectedBlockDecodePhysical> &planned) const {
-    initializeEntityPlan(planned.entity);
-    recordPhysicalValue(planned.entity, op.getCodes(),
-                        planned.realization.codeShape);
-    recordPhysicalValue(planned.entity, op.getTable(),
-                        planned.realization.tableShape);
-    recordPhysicalValue(planned.entity, op.getResult(),
-                        planned.realization.resultShape);
-    recordPhysicalHandoff(planned.entity, op.getOperation(), op.getCodes(),
-                          PhysicalHandoff::Share,
-                          planned.realization.codeShape,
-                          planned.realization.resultShape);
-    planned.entity.resources = planned.realization.resources;
-  }
-
   mlir::LogicalResult decideSymmetricI4I8Dot(
       SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
     std::optional<LocalBlockMemoryFact> activation =
@@ -10255,6 +10252,21 @@ private:
                                   : found->second.unsignedMaximum;
     };
 
+    if (auto decode = mlir::dyn_cast<DecodeOp>(operation)) {
+      SelectedBlockDecodePhysical selected;
+      if (mlir::failed(decideBlockDecode(decode, byteShape, selected)))
+        return mlir::failure();
+      decision.decode =
+          std::make_shared<const SelectedBlockDecodePhysical>(selected);
+      recordPhysicalValue(entity, decode.getCodes(), selected.codeShape);
+      recordPhysicalValue(entity, decode.getTable(), selected.tableShape);
+      recordPhysicalValue(entity, decode.getResult(), selected.resultShape);
+      recordPhysicalHandoff(entity, decode.getOperation(), decode.getCodes(),
+                            PhysicalHandoff::Share, selected.codeShape,
+                            selected.resultShape);
+      return decision;
+    }
+
     BlockOperationCandidateFacts facts;
     facts.byteShape = byteShape;
     if (mlir::isa<BlockIndexOp>(operation)) {
@@ -10389,7 +10401,7 @@ private:
     llvm::SmallVector<BlockOperationDecision> decisions;
     llvm::DenseMap<mlir::Operation *, BlockOperationDecision> prior;
     for (mlir::Operation *operation : ordered) {
-      if (mlir::isa<PtrAddOp, DecodeOp, TupleOp, TupleGetOp>(operation)) {
+      if (mlir::isa<PtrAddOp, TupleOp, TupleGetOp>(operation)) {
         BlockOperationDecision structural;
         structural.operation = operation;
         decisions.push_back(std::move(structural));
@@ -10697,6 +10709,8 @@ private:
           mlir::failed(materializeI32(rhs, op.getOperation(), vl)))
         return mlir::failure();
     }
+    if (lhs.spelling.empty() || rhs.spelling.empty())
+      return op.emitError("integer block binary operand is unavailable");
 
     std::string suffix;
     std::string cType;
@@ -11134,8 +11148,9 @@ private:
     return mlir::success();
   }
 
-  mlir::LogicalResult decideBlockDecode(DecodeOp op,
-                                        SelectedBlockDecodePhysical &decision) {
+  mlir::LogicalResult decideBlockDecode(
+      DecodeOp op, RVVVectorShape valueShape,
+      SelectedBlockDecodePhysical &decision) const {
     auto codes = mlir::dyn_cast<BlockType>(op.getCodes().getType());
     auto table = mlir::dyn_cast<BlockType>(op.getTable().getType());
     auto result = mlir::dyn_cast<BlockType>(op.getResult().getType());
@@ -11152,7 +11167,7 @@ private:
     std::optional<SelectedBlockDecodePhysical> selected =
         selectBlockDecodePhysical(
             {static_cast<unsigned>(codes.getShape().front()),
-             static_cast<unsigned>(table.getShape().front())},
+             static_cast<unsigned>(table.getShape().front()), valueShape},
             options.target);
     if (!selected)
       return op.emitError(
@@ -11162,9 +11177,14 @@ private:
   }
 
   mlir::LogicalResult emitBlockDecode(
-      DecodeOp op, const SelectedBlockDecodePhysical &decision,
-      llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
+      DecodeOp op, llvm::DenseMap<mlir::Value, BlockValue> &blockValues,
       llvm::StringRef vl) {
+    const BlockOperationDecision *physical =
+        findBlockOperationDecision(op.getOperation());
+    if (!physical || !physical->decode || !activeBlockEntity)
+      return op.emitError(
+          "block decode has no value-chain physical decision");
+    const SelectedBlockDecodePhysical &decision = *physical->decode;
     BlockValue codes = lookupBlockValue(op.getCodes(), blockValues);
     BlockValue table = lookupBlockValue(op.getTable(), blockValues);
     if (decision.mapping.instruction != CoreInstructionKind::RVVIndexedGather ||
@@ -11173,32 +11193,27 @@ private:
         codes.spelling.empty() || table.spelling.empty())
       return op.emitError(
           "RVV block decode operands do not match the selected realization");
-    auto planned = physicalPlan.blockDecodes.find(op.getOperation());
-    if (planned == physicalPlan.blockDecodes.end() ||
-        mlir::failed(requireEntityPlan(op.getOperation(), planned->second)))
-      return mlir::failure();
     const PhysicalHandoffDecision *handoff =
-        findPhysicalHandoff(planned->second.entity, op.getOperation(),
-                            op.getCodes());
+        findPhysicalHandoff(*activeBlockEntity, op.getOperation(), op.getCodes());
     auto codeShape = llvm::find_if(
-        planned->second.entity.values,
+        activeBlockEntity->values,
         [&](const PhysicalValueDecision &value) {
           return value.value == op.getCodes();
         });
     auto tableShape = llvm::find_if(
-        planned->second.entity.values,
+        activeBlockEntity->values,
         [&](const PhysicalValueDecision &value) {
           return value.value == op.getTable();
         });
     auto resultShape = llvm::find_if(
-        planned->second.entity.values,
+        activeBlockEntity->values,
         [&](const PhysicalValueDecision &value) {
           return value.value == op.getResult();
         });
     if (!handoff || handoff->kind != PhysicalHandoff::Share ||
-        codeShape == planned->second.entity.values.end() ||
-        tableShape == planned->second.entity.values.end() ||
-        resultShape == planned->second.entity.values.end() ||
+        codeShape == activeBlockEntity->values.end() ||
+        tableShape == activeBlockEntity->values.end() ||
+        resultShape == activeBlockEntity->values.end() ||
         codeShape->shape != handoff->sourceShape ||
         resultShape->shape != handoff->resultShape ||
         codes.vectorShape != codeShape->shape ||
@@ -11332,10 +11347,7 @@ private:
     if (auto op = mlir::dyn_cast<LoadOp>(operation))
       return emitBlockLoad(op, blockValues, vl);
     if (auto op = mlir::dyn_cast<DecodeOp>(operation)) {
-      auto found = physicalPlan.blockDecodes.find(op.getOperation());
-      if (found == physicalPlan.blockDecodes.end())
-        return op.emitError("block decode has no selected physical decision");
-      return emitBlockDecode(op, found->second.realization, blockValues, vl);
+      return emitBlockDecode(op, blockValues, vl);
     }
     if (auto op = mlir::dyn_cast<StoreOp>(operation))
       return emitBlockStore(op, blockValues, vl);
@@ -11490,6 +11502,11 @@ private:
       operations->push_back(std::move(storeDecision));
     }
     planned.realization.operations = std::move(*operations);
+    planned.entity.resources = selected->resources;
+    if (!mergeBlockOperationResources(planned.entity.resources,
+                                      planned.realization.operations))
+      return op.emitError(
+          "block store operation resources disagree with the target");
     for (StoreOp store : stores) {
       auto storedValue = llvm::find_if(
           planned.entity.values, [&](const PhysicalValueDecision &value) {
@@ -11501,7 +11518,6 @@ private:
                               storedValue->shape, storedValue->shape);
     }
     planned.entity.blockStore = selected->decision;
-    planned.entity.resources = selected->resources;
     if (!physicalPlan.blockStoreGroups
              .try_emplace(op.getOperation(), std::move(planned))
              .second)
@@ -11556,9 +11572,26 @@ private:
             return supportsBlockByteShape(operation, shape);
           }))
         mapping.laneShapeCandidates.push_back(shape);
+    if (mapping.laneShapeCandidates.empty())
+      return op.emitError(
+          "RVV block reduction has no byte shape accepted by its value chain");
+    PhysicalEntityPlan inputProbe;
+    initializeEntityPlan(inputProbe);
+    mlir::FailureOr<llvm::SmallVector<BlockOperationDecision>> probeOperations =
+        decideBlockOperations(valueSlice, mapping.laneShapeCandidates.front(),
+                              axis.getResult(), inputProbe);
+    if (mlir::failed(probeOperations))
+      return mlir::failure();
+    auto probeInput = llvm::find_if(
+        inputProbe.values, [&](const PhysicalValueDecision &value) {
+          return value.value == op.getInput();
+        });
+    if (probeInput == inputProbe.values.end() || !probeInput->shape)
+      return op.emitError(
+          "RVV block reduction input has no physical value shape");
     std::optional<SelectedBlockReducePhysical> selected =
         selectBlockReducePhysical(
-            {std::move(mapping), needsLaneVector, 32},
+            {std::move(mapping), needsLaneVector, probeInput->shape.sew},
             options.target);
     if (!selected)
       return op.emitError(
@@ -11572,6 +11605,11 @@ private:
     if (mlir::failed(operations))
       return mlir::failure();
     planned.realization.operations = std::move(*operations);
+    planned.entity.resources = selected->resources;
+    if (!mergeBlockOperationResources(planned.entity.resources,
+                                      planned.realization.operations))
+      return op.emitError(
+          "block reduction operation resources disagree with the target");
     auto reducedValue = llvm::find_if(
         planned.entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == op.getInput();
@@ -11595,7 +11633,6 @@ private:
                             reductionValue.seedShape);
     planned.realization.values.push_back(reductionValue);
     planned.entity.blockReduce = selected->decision;
-    planned.entity.resources = selected->resources;
     if (!physicalPlan.blockReduceGroups
              .try_emplace(op.getOperation(), std::move(planned))
              .second)
@@ -11673,17 +11710,37 @@ private:
       return op.emitError("block store axis offset is unavailable");
     std::string strip = fresh("block_i");
     std::string vl = fresh("block_vl");
-    std::string lane = fresh("block_lane");
-    auto emitStrip = [&](llvm::StringRef stripOffset,
-                         llvm::StringRef activeVL) -> mlir::LogicalResult {
-      llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+    auto initializeStripValues =
+        [&](llvm::StringRef stripOffset, llvm::StringRef activeVL,
+            llvm::DenseMap<mlir::Value, BlockValue> &blockValues)
+        -> mlir::LogicalResult {
       BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
-                            physical.needsLaneVector ? lane : ""};
-      if (physical.needsLaneVector)
+                            ""};
+      if (physical.needsLaneVector) {
+        std::string laneShape = rvvShapeSuffix(physical.laneShape);
+        if (physical.laneShape.sew != 16 || laneShape.empty())
+          return op.emitError("block lane vector has no selected physical shape");
+        std::string laneSuffix = "u" + laneShape;
+        std::string lane = fresh("block_lane");
+        line("vuint" + laneShape + "_t " + lane + " = __riscv_vid_v_" +
+             laneSuffix + "(" + activeVL.str() + ");");
+        line(lane + " = __riscv_vadd_vx_" + laneSuffix + "(" + lane + ", " +
+             stripOffset.str() + " + " + offset + ", " + activeVL.str() +
+             ");");
+        coordinate.spelling = std::move(lane);
         coordinate.vectorShape = physical.laneShape;
+      }
       coordinate.contiguousIndex =
           "(" + stripOffset.str() + " + " + offset + ")";
       blockValues[axis.getResult()] = std::move(coordinate);
+      return mlir::success();
+    };
+    auto emitStrip = [&](llvm::StringRef stripOffset,
+                         llvm::StringRef activeVL) -> mlir::LogicalResult {
+      llvm::DenseMap<mlir::Value, BlockValue> blockValues;
+      if (mlir::failed(
+              initializeStripValues(stripOffset, activeVL, blockValues)))
+        return mlir::failure();
       const llvm::SmallVector<BlockOperationDecision> *previousOperations =
           activeBlockOperations;
       const PhysicalEntityPlan *previousEntity = activeBlockEntity;
@@ -11718,11 +11775,9 @@ private:
       for (int64_t stripOffset = 0; stripOffset < extent;
            stripOffset += stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
-        BlockValue coordinate{axis.getResult().getType(),
-                              BlockValueKind::Index, ""};
-        coordinate.contiguousIndex =
-            "(" + std::to_string(stripOffset) + " + " + offset + ")";
-        blockValues[axis.getResult()] = std::move(coordinate);
+        if (mlir::failed(initializeStripValues(std::to_string(stripOffset), vl,
+                                              blockValues)))
+          return mlir::failure();
         stripValues.push_back(std::move(blockValues));
       }
       const llvm::SmallVector<BlockOperationDecision> *previousOperations =
@@ -11767,16 +11822,6 @@ private:
            std::to_string(stripVL) + " ? (" +
            std::to_string(extent) + " - " + strip + ") : " +
            std::to_string(stripVL) + ");");
-      if (physical.needsLaneVector) {
-        std::string laneShape = rvvShapeSuffix(physical.laneShape);
-        if (physical.laneShape.sew != 16 || laneShape.empty())
-          return op.emitError("block lane vector has no selected physical shape");
-        std::string laneSuffix = "u" + laneShape;
-        line("vuint" + laneShape + "_t " + lane + " = __riscv_vid_v_" +
-             laneSuffix + "(" + vl + ");");
-        line(lane + " = __riscv_vadd_vx_" + laneSuffix + "(" + lane + ", " + strip +
-             " + " + offset + ", " + vl + ");");
-      }
       if (mlir::failed(emitStrip(strip, vl)))
         return mlir::failure();
       line(strip + " += " + vl + ";");
@@ -11877,6 +11922,21 @@ private:
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
                               ""};
+        if (physical.needsLaneVector) {
+          std::string laneShape = rvvShapeSuffix(physical.laneShape);
+          if (physical.laneShape.sew != 16 || laneShape.empty())
+            return op.emitError(
+                "block reduction lane vector has no selected physical shape");
+          std::string laneSuffix = "u" + laneShape;
+          std::string stripLane = fresh("block_lane");
+          line("vuint" + laneShape + "_t " + stripLane +
+               " = __riscv_vid_v_" + laneSuffix + "(" + vl + ");");
+          line(stripLane + " = __riscv_vadd_vx_" + laneSuffix + "(" +
+               stripLane + ", " + std::to_string(stripOffset) + " + " +
+               offset + ", " + vl + ");");
+          coordinate.spelling = std::move(stripLane);
+          coordinate.vectorShape = physical.laneShape;
+        }
         coordinate.contiguousIndex =
             "(" + std::to_string(stripOffset) + " + " + offset + ")";
         blockValues[axis.getResult()] = std::move(coordinate);

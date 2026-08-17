@@ -299,8 +299,11 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
         supported = false;
     } else if (implementation.primitive ==
                LocalPrimitiveKind::GroupedAffineI4I8) {
+      const PhysicalAxisDecomposition *reduction = findUniqueAxisMapping(
+          implementation.mapping, LogicalAxisRole::Reduction);
       if (operation.kind == LocalHardwareOperationKind::RVVInlineAsm &&
-          lanes == 16)
+          reduction && reduction->sequentialFactor == 1 &&
+          reduction->laneFactor == 16 && reduction->registerFactor == 2)
         usesGroupedI4I8RegisterL16 = true;
       else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic &&
                sequential)
