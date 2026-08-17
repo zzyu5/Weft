@@ -75,16 +75,6 @@ llvm::cl::opt<int64_t> f16LoadBufferCount(
     llvm::cl::desc(
         "Requested F16 matmul register load buffers: zero selects, one to four"),
     llvm::cl::init(0));
-llvm::cl::opt<int64_t> reductionStatePlacement(
-    "reduction-state-placement",
-    llvm::cl::desc(
-        "Requested VLA reduction state placement: 0 selects, 1 scalar, 2 vector"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> i4I8FragmentImplementation(
-    "i4-i8-fragment-implementation",
-    llvm::cl::desc(
-        "Requested i4/i8 fragment implementation: 0 selects, 1 RVV, 2 IME"),
-    llvm::cl::init(0));
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
     llvm::cl::init(0));
@@ -171,9 +161,6 @@ int main(int argc, char **argv) {
     options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;
     options.backend.parameters.f16KUnroll = f16KUnroll;
     options.backend.parameters.f16LoadBufferCount = f16LoadBufferCount;
-    options.backend.structures.reductionStatePlacement = reductionStatePlacement;
-    options.backend.structures.i4I8FragmentImplementation =
-        i4I8FragmentImplementation;
     options.backend.parameters.narrowLMUL = narrowLMUL;
     options.backend.parameters.sortRadixBits = sortRadixBits;
     std::error_code headerError;

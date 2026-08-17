@@ -953,11 +953,9 @@ selectVLAUnaryPhysical(VLAUnarySemantic semantic,
 
 llvm::SmallVector<SelectedVLAStatePhysical, 2>
 enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
-                          const RISCVTargetProfile &target,
-                          const RISCVBackendConfig &config) {
+                          const RISCVTargetProfile &target) {
   llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
-  if (!target.hasRVV || config.structures.reductionStatePlacement < 0 ||
-      config.structures.reductionStatePlacement > 2)
+  if (!target.hasRVV)
     return candidates;
   SelectedVLAStatePhysical scalar;
   switch (facts.semantic) {
@@ -1004,9 +1002,8 @@ enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
     candidates.push_back(scalar);
     return candidates;
   }
-  if (config.structures.reductionStatePlacement != 2)
-    candidates.push_back(scalar);
-  if (facts.relaxedOrder && config.structures.reductionStatePlacement != 1) {
+  candidates.push_back(scalar);
+  if (facts.relaxedOrder) {
     SelectedVLAStatePhysical vector = scalar;
     vector.carry = VLAStateCarryRepresentation::Vector;
     vector.finalize = facts.semantic == VLAStateSemantic::F32AddReduction
@@ -1083,8 +1080,7 @@ selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
 
 std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
-                           const RISCVTargetProfile &target,
-                           const RISCVBackendConfig &config) {
+                           const RISCVTargetProfile &target) {
   auto axis = [&](unsigned id) -> const LogicalAxisConstraint * {
     auto found = llvm::find_if(facts.mapping.axes,
                                [&](const LogicalAxisConstraint &candidate) {
@@ -1100,9 +1096,7 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       rows->role != LogicalAxisRole::Free || !columns->extent ||
       *columns->extent != 16 || columns->role != LogicalAxisRole::Free ||
       !reduction->extent || *reduction->extent != 32 ||
-      reduction->role != LogicalAxisRole::Reduction ||
-      config.structures.i4I8FragmentImplementation < 0 ||
-      config.structures.i4I8FragmentImplementation > 2)
+      reduction->role != LogicalAxisRole::Reduction)
     return std::nullopt;
   const unsigned rowExtent = static_cast<unsigned>(*rows->extent);
   const bool supportsIME =
@@ -1182,16 +1176,6 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
     candidates.push_back(Candidate{
         std::move(selected), fragmentMapping ? 1u : rowExtent * 4u});
   }
-  const int64_t requested = config.structures.i4I8FragmentImplementation;
-  if (requested != 0)
-    llvm::erase_if(candidates, [&](const Candidate &candidate) {
-      const bool fragmentMapping = llvm::any_of(
-          candidate.physical.implementation.mapping.axes,
-          [](const PhysicalAxisDecomposition &axis) {
-            return axis.fragmentFactor > 1;
-          });
-      return requested == 1 ? fragmentMapping : !fragmentMapping;
-    });
   if (candidates.empty())
     return std::nullopt;
   llvm::sort(candidates, [](const Candidate &lhs, const Candidate &rhs) {

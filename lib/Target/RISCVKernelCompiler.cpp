@@ -2730,15 +2730,10 @@ private:
     for (VLAStateDecision &state : decision.states) {
       state.candidates = enumerateVLAStatePhysical(
           VLAStateCandidateFacts{state.semantic, state.relaxedOrder},
-          options.target, options.backend);
+          options.target);
       if (state.candidates.empty()) {
-        if (options.backend.structures.reductionStatePlacement < 0 ||
-            options.backend.structures.reductionStatePlacement > 2)
-          state.operation->emitError(
-              "VLA reduction state placement config must be 0, 1, or 2");
-        else
-          state.operation->emitError(
-              "VLA state has no legal target implementation for its ordering and target facts");
+        state.operation->emitError(
+            "VLA state has no legal target implementation for its ordering and target facts");
         return mlir::failure();
       }
     }
@@ -8041,8 +8036,7 @@ private:
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
         selectI4I8FragmentPhysical(
-            {i4I8BlockProductMapping(rowExtent), false}, options.target,
-            options.backend);
+            {i4I8BlockProductMapping(rowExtent), false}, options.target);
     if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
@@ -9188,8 +9182,7 @@ private:
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
         selectI4I8FragmentPhysical(
-            {i4I8BlockProductMapping(rowExtent), true}, options.target,
-            options.backend);
+            {i4I8BlockProductMapping(rowExtent), true}, options.target);
     if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");

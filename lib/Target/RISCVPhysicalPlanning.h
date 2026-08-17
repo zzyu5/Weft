@@ -512,8 +512,7 @@ struct SelectedI4I8FragmentPhysical {
 
 std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
-                           const RISCVTargetProfile &target,
-                           const RISCVBackendConfig &config);
+                           const RISCVTargetProfile &target);
 
 struct VLAStateCandidateFacts {
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
@@ -532,8 +531,7 @@ struct SelectedVLAStatePhysical {
 
 llvm::SmallVector<SelectedVLAStatePhysical, 2>
 enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
-                          const RISCVTargetProfile &target,
-                          const RISCVBackendConfig &config);
+                          const RISCVTargetProfile &target);
 
 struct VLAIndexedMemoryFact {
   unsigned elementSEW = 0;
