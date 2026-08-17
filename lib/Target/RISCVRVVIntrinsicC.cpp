@@ -5,16 +5,20 @@
 namespace weft::riscv_internal {
 
 void emitRVVLocalImplementations(llvm::raw_ostream &output,
-                             bool usesRVVSymmetricI4I8,
-                             bool usesRVVAffineI4I8,
-                             bool usesRVVSymmetricI4I8M4,
-                             bool usesRVVAffineI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8M4,
                                  bool usesGroupedI4I8RegisterL16,
                                  bool usesGroupedI4I8RegisterL32,
                                  bool usesGroupedI4I8Strip,
                                  bool usesE2M1RegisterE8M1M2,
                                  bool usesE2M1RegisterE8MF2,
                                  bool usesE2M1Strip) {
+  const bool usesRVVSymmetricI4I8 = symmetricI4I8.has_value();
+  const bool usesRVVAffineI4I8 = affineI4I8.has_value();
+  const bool usesRVVSymmetricI4I8M4 = symmetricI4I8M4.has_value();
+  const bool usesRVVAffineI4I8M4 = affineI4I8M4.has_value();
   if (usesRVVSymmetricI4I8) {
     output << R"c(static inline __attribute__((always_inline, unused)) void
 __weft_rvv_symmetric_i4_i8_n16_k32(
@@ -22,10 +26,12 @@ __weft_rvv_symmetric_i4_i8_n16_k32(
     const uint8_t *packed_weight, float *accumulator) {
   const size_t vl = __riscv_vsetvl_e8m1(16);
   vint32m4_t integer_dot = __riscv_vmv_v_x_i32m4(0, vl);
-  for (size_t half = 0; half < 2; ++half) {
+  for (size_t half = 0; half < )c"
+           << symmetricI4I8->decode.chunksPerStep << R"c(; ++half) {
     const uint8_t *codes = packed_weight + 32 + half * 128;
     const int8_t *activation = activation_code + half * 16;
-    for (size_t byte = 0; byte < 8; ++byte) {
+    for (size_t byte = 0; byte < )c"
+           << symmetricI4I8->decode.groupsPerChunk / 2 << R"c(; ++byte) {
       const vuint8m1_t packed =
           __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
       const vuint8m1_t low =
@@ -73,10 +79,12 @@ __weft_rvv_affine_i4_i8_n16_k32(
   const vint16m2_t zero_point =
       __riscv_vreinterpret_v_u16m2_i16m2(zero_unsigned);
   vint32m4_t integer_dot = __riscv_vmv_v_x_i32m4(0, vl);
-  for (size_t half = 0; half < 2; ++half) {
+  for (size_t half = 0; half < )c"
+           << affineI4I8->decode.chunksPerStep << R"c(; ++half) {
     const uint8_t *codes = packed_weight + 48 + half * 128;
     const int8_t *activation = activation_code + half * 16;
-    for (size_t byte = 0; byte < 8; ++byte) {
+    for (size_t byte = 0; byte < )c"
+           << affineI4I8->decode.groupsPerChunk / 2 << R"c(; ++byte) {
       const vuint8m1_t packed =
           __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
       const vuint8m1_t low =
@@ -123,10 +131,12 @@ __weft_rvv_symmetric_i4_i8_m4_n16_k32(
   vint32m4_t dot1 = __riscv_vmv_v_x_i32m4(0, vl);
   vint32m4_t dot2 = __riscv_vmv_v_x_i32m4(0, vl);
   vint32m4_t dot3 = __riscv_vmv_v_x_i32m4(0, vl);
-  for (size_t half = 0; half < 2; ++half) {
+  for (size_t half = 0; half < )c"
+           << symmetricI4I8M4->decode.chunksPerStep << R"c(; ++half) {
     const uint8_t *codes = packed_weight + 32 + half * 128;
     const size_t first_fragment = 2 * half;
-    for (size_t byte = 0; byte < 8; ++byte) {
+    for (size_t byte = 0; byte < )c"
+           << symmetricI4I8M4->decode.groupsPerChunk / 2 << R"c(; ++byte) {
       const vuint8m1_t packed =
           __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
       const vint16m2_t low = __riscv_vsub_vx_i16m2(
@@ -185,10 +195,12 @@ __weft_rvv_affine_i4_i8_m4_n16_k32(
   vint32m4_t dot1 = __riscv_vmv_v_x_i32m4(0, vl);
   vint32m4_t dot2 = __riscv_vmv_v_x_i32m4(0, vl);
   vint32m4_t dot3 = __riscv_vmv_v_x_i32m4(0, vl);
-  for (size_t half = 0; half < 2; ++half) {
+  for (size_t half = 0; half < )c"
+           << affineI4I8M4->decode.chunksPerStep << R"c(; ++half) {
     const uint8_t *codes = packed_weight + 48 + half * 128;
     const size_t first_fragment = 2 * half;
-    for (size_t byte = 0; byte < 8; ++byte) {
+    for (size_t byte = 0; byte < )c"
+           << affineI4I8M4->decode.groupsPerChunk / 2 << R"c(; ++byte) {
       const vuint8m1_t packed =
           __riscv_vlse8_v_u8m1(codes + byte, 8, vl);
       const vint16m2_t low = __riscv_vsub_vv_i16m2(

@@ -11,10 +11,8 @@ bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
   if (implementation.primitive != LocalPrimitiveKind::IQ1MI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 6)
+      implementation.valueShapes.size() < 6 || !implementation.schedule)
     return false;
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape indexShape = implementation.valueShapes[1];
   const RVVVectorShape tableShape = implementation.valueShapes[2];
@@ -46,16 +44,19 @@ bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
   const std::string segmentProductSuffix = rvvIntrinsicTypeSuffix(
       RVVElementCategory::SignedInteger, segmentProductShape);
   const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
-  if (!reduction || laneSignedType.empty() || laneSignedSuffix.empty() ||
+  if (laneSignedType.empty() || laneSignedSuffix.empty() ||
       laneUnsignedSuffix.empty() || indexType.empty() || indexSuffix.empty() ||
       tableType.empty() || tableSuffix.empty() || deltaWordType.empty() ||
       deltaWordSuffix.empty() || productType.empty() || productSuffix.empty() ||
       segmentProductSuffix.empty() || laneSetVL.empty())
     return false;
 
-  const unsigned groupsPerVector = reduction->laneFactor / 32;
-  const unsigned vectorCount = 4 * groupsPerVector;
-  const unsigned segmentCount = 2 * groupsPerVector;
+  const unsigned groupsPerVector =
+      implementation.schedule.decode.groupsPerChunk;
+  const unsigned vectorCount =
+      implementation.schedule.decode.chunksPerStep;
+  const unsigned segmentCount =
+      implementation.schedule.decode.reductionSegments;
   output << "static inline __attribute__((always_inline, unused)) float\n"
          << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *high_delta_bits,\n"
@@ -71,11 +72,11 @@ bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
          << "      (scale_words[0] >> 12) | ((scale_words[1] >> 8) & 0x00f0) |\n"
          << "      ((scale_words[2] >> 4) & 0x0f00) | (scale_words[3] & 0xf000);\n"
          << "  const size_t vl = " << laneSetVL << "("
-         << reduction->laneFactor << ");\n"
+         << implementation.schedule.laneFactor << ");\n"
          << "  int32_t grid_sum = 0;\n"
          << "  int32_t delta_sum = 0;\n"
          << "  for (size_t batch = 0; batch < "
-         << reduction->sequentialFactor << "; ++batch) {\n"
+         << implementation.schedule.sequentialIterations << "; ++batch) {\n"
          << "    const size_t first_group = batch * " << groupsPerVector
          << ";\n"
          << "    uint16_t byte_offsets[" << vectorCount << "];\n"

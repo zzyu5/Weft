@@ -14,14 +14,6 @@
 
 namespace weft::riscv_internal {
 
-static unsigned localLaneFactor(const LocalImplementation &implementation) {
-  if (!implementation.mapping.laneAxis)
-    return 0;
-  const PhysicalAxisDecomposition *axis = findAxisMapping(
-      implementation.mapping, *implementation.mapping.laneAxis);
-  return axis ? axis->laneFactor * axis->registerFactor : 0;
-}
-
 struct LocalAxisMappingCandidate {
   CorePhysicalMapping mapping;
   PhysicalAxisDecomposition axis;
@@ -84,14 +76,76 @@ findUniqueLogicalAxisConstraint(const CoreMappingProblem &problem,
   return result;
 }
 
+static std::optional<LocalMicrokernelSchedule> buildLocalMicrokernelSchedule(
+    const CorePhysicalMapping &mapping, unsigned iterationAxis,
+    unsigned accumulatorCount, llvm::ArrayRef<LocalOperandWindow> operands,
+    LocalDecodeSchedule decode = {}, unsigned prefetchDistance = 0) {
+  const PhysicalAxisDecomposition *iteration =
+      findAxisMapping(mapping, iterationAxis);
+  const PhysicalAxisDecomposition *lane =
+      mapping.laneAxis
+          ? findAxisMapping(mapping, *mapping.laneAxis)
+          : nullptr;
+  if (!iteration || iteration->unrollFactor == 0 || accumulatorCount == 0 ||
+      mapping.pipeline.bufferCount == 0 ||
+      prefetchDistance >= mapping.pipeline.bufferCount)
+    return std::nullopt;
+  LocalMicrokernelSchedule schedule;
+  schedule.iterationAxis = iterationAxis;
+  schedule.sequentialIterations = std::max(1u, iteration->sequentialFactor);
+  schedule.laneFactor =
+      lane ? lane->laneFactor
+           : std::max(1u, iteration->fragmentFactor);
+  schedule.iterationRegisterFactor = iteration->registerFactor;
+  schedule.iterationElements =
+      iteration->laneFactor * iteration->registerFactor *
+      iteration->fragmentFactor;
+  schedule.unrollFactor = iteration->unrollFactor;
+  schedule.accumulatorCount = accumulatorCount;
+  schedule.pipeline.bufferCount = mapping.pipeline.bufferCount;
+  schedule.pipeline.prefetchDistance = prefetchDistance;
+  for (unsigned iteration = 0; iteration < prefetchDistance; ++iteration)
+    schedule.pipeline.actions.push_back(
+        {LocalPipelineActionKind::Load, iteration,
+         iteration % schedule.pipeline.bufferCount});
+  for (unsigned iteration = 0; iteration < schedule.unrollFactor;
+       ++iteration) {
+    const unsigned next = iteration + prefetchDistance;
+    if (next < schedule.unrollFactor)
+      schedule.pipeline.actions.push_back(
+          {LocalPipelineActionKind::Load, next,
+           next % schedule.pipeline.bufferCount});
+    schedule.pipeline.actions.push_back(
+        {LocalPipelineActionKind::Compute, iteration,
+         iteration % schedule.pipeline.bufferCount});
+  }
+  schedule.operands.append(operands.begin(), operands.end());
+  schedule.decode = decode;
+  if (!schedule)
+    return std::nullopt;
+  return schedule;
+}
+
+static bool selectLocalMicrokernelSchedule(
+    LocalImplementation &implementation, unsigned iterationAxis,
+    unsigned accumulatorCount, llvm::ArrayRef<LocalOperandWindow> operands,
+    LocalDecodeSchedule decode = {}, unsigned prefetchDistance = 0) {
+  std::optional<LocalMicrokernelSchedule> schedule =
+      buildLocalMicrokernelSchedule(implementation.mapping, iterationAxis,
+                                    accumulatorCount, operands, decode,
+                                    prefetchDistance);
+  if (!schedule)
+    return false;
+  implementation.schedule = std::move(*schedule);
+  return true;
+}
+
 std::string localImplementationSymbol(
     const LocalImplementation &implementation) {
   const LocalHardwareOperation &operation = implementation.operation;
   const RVVVectorShape laneShape = implementation.mapping.laneShape;
-  const unsigned lanes = localLaneFactor(implementation);
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
-  const bool sequential = reduction && reduction->sequentialFactor > 1;
+  const unsigned lanes = implementation.schedule.iterationElements;
+  const bool sequential = implementation.schedule.sequentialIterations > 1;
   const std::string shape = rvvShapeSuffix(laneShape);
   const std::string registerSuffix =
       lanes && !shape.empty()
@@ -220,7 +274,7 @@ static bool finalizeLocalHardwareOperation(
     return false;
   if (implementation.primitive == LocalPrimitiveKind::F32Math)
     return !implementation.operation;
-  return implementation.operation &&
+  return implementation.operation && implementation.schedule &&
          !localImplementationSymbol(implementation).empty();
 }
 
@@ -855,7 +909,8 @@ selectVLACastPhysical(const VLACastCandidateFacts &facts,
     break;
   case VLACastSemantic::U32ToIndex:
     selected.realization = VLACastRealization::RVVZeroExtendU32ToIndex;
-    sourceSEW = resultSEW = 32;
+    sourceSEW = 32;
+    resultSEW = target.xlen;
     break;
   case VLACastSemantic::IndexToF32:
     selected.realization = VLACastRealization::RVVIndexToF32;
@@ -1127,6 +1182,16 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
         LocalOperationProjection::None,
         fragmentMapping ? mappedRows->fragmentFactor
                         : mappedRows->registerFactor);
+    if (!selectLocalMicrokernelSchedule(
+            selected.implementation, facts.reductionAxis,
+            fragmentMapping ? mappedRows->fragmentFactor
+                            : mappedRows->registerFactor,
+            {{0, PhysicalMemoryMode::UnitStride, 1,
+              std::max(1u, rowExtent), true},
+             {1, PhysicalMemoryMode::UnitStride,
+              std::max(1u, rowExtent), 1, true}},
+            {2, 16, 1}))
+      continue;
     if (!finalizeLocalHardwareOperation(selected.implementation))
       continue;
     const unsigned privateGroups =
@@ -1694,6 +1759,15 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                   laneShape, *byte16, *widened, *halfWidened, highWord};
     selectLocalHardwareOperation(implementation,
                                  LocalHardwareOperationKind::RVVIntrinsic);
+    if (!selectLocalMicrokernelSchedule(
+            implementation, reduction->id, 1,
+            {{0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+             {1, PhysicalMemoryMode::UnitStride,
+              std::max(1u, candidate.axis.registerFactor), 1, true}},
+            {base3 ? 5u : 4u,
+             std::max(1u, candidate.axis.laneFactor / 16),
+             std::max(1u, logicalLanes / 16)}))
+      continue;
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
@@ -1828,6 +1902,14 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     selectLocalHardwareOperation(implementation,
                                  LocalHardwareOperationKind::RVVIntrinsic,
                                  projection);
+    if (!selectLocalMicrokernelSchedule(
+            implementation, reduction->id, 1,
+            {{0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+             {3, PhysicalMemoryMode::Indexed, 1, 1, false},
+             {4, PhysicalMemoryMode::UnitStride,
+              std::max(1u, candidate.axis.registerFactor), 1, true}},
+            {codeCount, 1, 2}))
+      continue;
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
@@ -1918,6 +2000,15 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
         implementation, LocalHardwareOperationKind::RVVIntrinsic,
         combined ? LocalOperationProjection::NibbleCodebookCombined
                  : LocalOperationProjection::NibbleCodebookSplit);
+    if (!selectLocalMicrokernelSchedule(
+            implementation, reduction->id, 1,
+            {{1, PhysicalMemoryMode::UnitStride, 1, 1, true},
+             {2, PhysicalMemoryMode::Indexed, 1, 1, false},
+             {0, PhysicalMemoryMode::UnitStride,
+              std::max(1u, candidate.axis.registerFactor), 1, true}},
+            {2, std::max(1u, candidate.axis.laneFactor / 16),
+             std::max(1u, logicalLanes / 16)}))
+      continue;
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
@@ -1959,6 +2050,9 @@ struct QuantPrimitivePhysicalRule {
   LocalHardwareOperationKind operation =
       LocalHardwareOperationKind::RVVIntrinsic;
   LocalOperationProjection projection = LocalOperationProjection::None;
+  llvm::SmallVector<LocalOperandWindow, 4> operands;
+  LocalDecodeSchedule decode;
+  unsigned accumulatorCount = 1;
   llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
   unsigned predicateGroups = 0;
   std::optional<PhysicalResourceRequirements> directResources;
@@ -1998,6 +2092,13 @@ derivePackedQuantRule(LocalPrimitiveKind primitive,
           : decodeShape == laneShape
                 ? LocalOperationProjection::PackedDotLaneSlide
                 : LocalOperationProjection::PackedDotLaneCreate;
+  rule.operands = {
+      {0, PhysicalMemoryMode::UnitStride,
+       std::max(1u, candidate.axis.registerFactor), 1, true},
+      {1, PhysicalMemoryMode::UnitStride,
+       std::max(1u, candidate.axis.registerFactor), 1, true}};
+  rule.decode = {2, std::max(1u, candidate.axis.laneFactor / 16),
+                 std::max(1u, logicalLanes / 16)};
   rule.liveValues = {
       {PhysicalLiveClass::Memory, laneShape,
        AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 2},
@@ -2027,6 +2128,11 @@ derivePackedI3QuantRule(const LocalAxisMappingCandidate &candidate,
     return std::nullopt;
   QuantPrimitivePhysicalRule rule;
   rule.valueShapes = {laneShape, *productShape, *segmentProductShape};
+  rule.operands = {
+      {0, PhysicalMemoryMode::UnitStride, 3, 1, true},
+      {1, PhysicalMemoryMode::UnitStride, 1, 1, true}};
+  rule.decode = {3, std::max(1u, candidate.axis.laneFactor / 16),
+                 std::max(1u, logicalLanes / 16)};
   rule.liveValues = {
       {PhysicalLiveClass::Memory, laneShape,
        AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 3},
@@ -2070,6 +2176,12 @@ deriveIQ2QuantRule(const LocalAxisMappingCandidate &candidate,
   QuantPrimitivePhysicalRule rule;
   rule.valueShapes = {laneShape, *indexShape, tableShape, *signShape,
                       *productShape, *segmentProductShape};
+  rule.operands = {
+      {0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+      {2, PhysicalMemoryMode::Indexed, 1, 1, false},
+      {3, PhysicalMemoryMode::UnitStride, 1, 1, true}};
+  rule.decode = {4 * groupsPerVector, groupsPerVector,
+                 std::max(1u, candidate.axis.laneFactor / 16)};
   rule.liveValues = {
       {PhysicalLiveClass::Index, *indexShape},
       {PhysicalLiveClass::Memory, tableShape},
@@ -2112,6 +2224,11 @@ deriveIQ3QuantRule(const LocalAxisMappingCandidate &candidate,
   QuantPrimitivePhysicalRule rule;
   rule.valueShapes = {laneShape, *codeShape, *indexShape, tableShape,
                       *signShape, *productShape, *halfProductShape};
+  rule.operands = {
+      {1, PhysicalMemoryMode::UnitStride, 1, 1, true},
+      {3, PhysicalMemoryMode::Indexed, 1, 1, false},
+      {4, PhysicalMemoryMode::UnitStride, 1, 1, true}};
+  rule.decode = {3, 2, 2};
   rule.liveValues = {
       {PhysicalLiveClass::Memory, *codeShape},
       {PhysicalLiveClass::Index, *indexShape},
@@ -2152,6 +2269,12 @@ deriveIQ1QuantRule(const LocalAxisMappingCandidate &candidate,
   QuantPrimitivePhysicalRule rule;
   rule.valueShapes = {laneShape, *indexShape, tableShape, tableShape,
                       *productShape, *segmentProductShape};
+  rule.operands = {
+      {0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+      {2, PhysicalMemoryMode::Indexed, 2, 1, false},
+      {3, PhysicalMemoryMode::UnitStride, 1, 1, true}};
+  rule.decode = {4 * groupsPerVector, groupsPerVector,
+                 std::max(1u, candidate.axis.laneFactor / 16)};
   rule.liveValues = {
       {PhysicalLiveClass::Index, *indexShape},
       {PhysicalLiveClass::Memory, tableShape},
@@ -2186,10 +2309,17 @@ deriveQ6QuantRule(const LocalAxisMappingCandidate &candidate,
   QuantPrimitivePhysicalRule rule;
   rule.valueShapes = {laneShape, *chunkShape, *productShape,
                       *segmentProductShape};
+  rule.operands = {
+      {1, PhysicalMemoryMode::UnitStride,
+       3 * std::max(1u, candidate.axis.laneFactor / 32), 1, true},
+      {0, PhysicalMemoryMode::UnitStride, 1, 1, true}};
+  rule.decode = {std::max(1u, candidate.axis.laneFactor / 32), 3,
+                 std::max(1u, candidate.axis.laneFactor / 16)};
   const unsigned logicalLanes =
       candidate.axis.laneFactor * candidate.axis.registerFactor;
   if (logicalLanes == 32 && laneShape == RVVVectorShape{8, 16}) {
     rule.operation = LocalHardwareOperationKind::RVVInlineAsm;
+    rule.decode = {2, 4, 8};
     PhysicalResourceRequirements resources;
     resources.reservedGroups = 0;
     resources.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
@@ -2272,6 +2402,10 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
                                       rule->valueShapes.end());
     selectLocalHardwareOperation(implementation, rule->operation,
                                  rule->projection);
+    if (!selectLocalMicrokernelSchedule(
+            implementation, reduction->id, rule->accumulatorCount,
+            rule->operands, rule->decode))
+      continue;
     if (!finalizeLocalHardwareOperation(implementation))
       continue;
     std::optional<PhysicalResourceBudget> budget;
@@ -2355,6 +2489,14 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
         continue;
       selectLocalHardwareOperation(implementation,
                                    LocalHardwareOperationKind::RVVIntrinsic);
+      if (!selectLocalMicrokernelSchedule(
+              implementation, reduction->id, 1,
+              {{0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+               {1, PhysicalMemoryMode::UnitStride,
+                activationShape ? 1u : 0u, 1, true}},
+              {1, std::max(1u, logicalLanes / 16),
+               std::max(1u, logicalLanes / 16)}))
+        continue;
       if (!finalizeLocalHardwareOperation(implementation))
         continue;
       RVVVectorShape selectedActivation =
@@ -2484,6 +2626,14 @@ selectGroupedAffineI4I8Physical(
         candidate.implementation,
         registerAsm ? LocalHardwareOperationKind::RVVInlineAsm
                     : LocalHardwareOperationKind::RVVIntrinsic);
+    if (!selectLocalMicrokernelSchedule(
+            candidate.implementation, reduction->id, 1,
+            {{0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+             {1, PhysicalMemoryMode::UnitStride, 1, 1, true},
+             {2, PhysicalMemoryMode::UnitStride, 1, 1, false}},
+            {2, std::max(1u, mappedReduction->laneFactor / 16),
+             std::max(1u, mappedReduction->laneFactor / 16)}))
+      continue;
     if (!finalizeLocalHardwareOperation(candidate.implementation))
       continue;
     if (registerAsm) {
@@ -2530,55 +2680,75 @@ selectGroupedAffineI4I8Physical(
 }
 
 static std::optional<PhysicalResourceRequirements>
-denseMicrokernelRequirements(
-    const DenseMicrokernelResourceFacts &facts,
-    const RISCVTargetProfile &target) {
-  if (!facts.inputShape || !facts.accumulatorShape ||
-      facts.accumulatorVectors == 0 || facts.loadWindow == 0 ||
-      !target.supportsVectorShape(facts.inputShape.sew,
-                                  facts.inputShape.lmulEighths) ||
-      !target.supportsVectorShape(facts.accumulatorShape.sew,
-                                  facts.accumulatorShape.lmulEighths))
+localMicrokernelRequirements(const LocalMicrokernelSchedule &schedule,
+                             RVVVectorShape inputShape,
+                             RVVVectorShape accumulatorShape,
+                             unsigned predicateGroups,
+                             unsigned stateGroups,
+                             unsigned handoffGroups,
+                             const RISCVTargetProfile &target) {
+  if (!schedule || !inputShape || !accumulatorShape ||
+      !target.supportsVectorShape(inputShape.sew,
+                                  inputShape.lmulEighths) ||
+      !target.supportsVectorShape(accumulatorShape.sew,
+                                  accumulatorShape.lmulEighths))
     return std::nullopt;
   PhysicalResourceRequirements requirements;
-  requirements.live = {
-      PhysicalLiveRange{PhysicalLiveClass::Value, facts.accumulatorShape,
-                        facts.accumulatorVectors},
-      PhysicalLiveRange{PhysicalLiveClass::Memory, facts.inputShape,
-                        (facts.lhsVectorsPerWindow +
-                         facts.rhsVectorsPerWindow) *
-                            facts.loadWindow}};
-  if (facts.predicateGroups != 0)
+  requirements.live.push_back(
+      PhysicalLiveRange{PhysicalLiveClass::Value, accumulatorShape,
+                        schedule.accumulatorCount});
+  for (const LocalOperandWindow &operand : schedule.operands) {
+    if (operand.reuseCount == 0)
+      return std::nullopt;
+    if (operand.vectorsPerStep == 0)
+      continue;
+    const unsigned copies =
+        operand.advancesIteration ? schedule.pipeline.bufferCount : 1;
+    requirements.live.push_back(
+        PhysicalLiveRange{PhysicalLiveClass::Memory, inputShape,
+                          operand.vectorsPerStep * copies});
+  }
+  if (predicateGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
-        PhysicalLiveClass::Predicate, {}, 1, facts.predicateGroups});
-  if (facts.stateGroups != 0)
+        PhysicalLiveClass::Predicate, {}, 1, predicateGroups});
+  if (stateGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
-        PhysicalLiveClass::State, {}, 1, facts.stateGroups});
-  if (facts.handoffGroups != 0)
+        PhysicalLiveClass::State, {}, 1, stateGroups});
+  if (handoffGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
-        PhysicalLiveClass::Handoff, {}, 1, facts.handoffGroups});
+        PhysicalLiveClass::Handoff, {}, 1, handoffGroups});
   return requirements;
 }
 
 std::optional<PhysicalResourceBudget>
-calculateDenseMicrokernelResources(
-    const DenseMicrokernelResourceFacts &facts,
-    const RISCVTargetProfile &target) {
+calculateLocalMicrokernelResources(const LocalMicrokernelSchedule &schedule,
+                                   RVVVectorShape inputShape,
+                                   RVVVectorShape accumulatorShape,
+                                   unsigned predicateGroups,
+                                   unsigned stateGroups,
+                                   unsigned handoffGroups,
+                                   const RISCVTargetProfile &target) {
   std::optional<PhysicalResourceRequirements> requirements =
-      denseMicrokernelRequirements(facts, target);
+      localMicrokernelRequirements(schedule, inputShape, accumulatorShape,
+                                   predicateGroups, stateGroups,
+                                   handoffGroups, target);
   if (!requirements)
     return std::nullopt;
   return calculatePhysicalResources(*requirements, target);
 }
 
 static llvm::SmallVector<unsigned, 4> localPipelineBufferCandidates(
-    const LocalPipelineDependenceFacts &facts, unsigned maximumDepth) {
+    const LocalScheduleDependenceFacts &facts, unsigned maximumDepth) {
   llvm::SmallVector<unsigned, 4> candidates{1};
-  if (facts.loadStreams == 0 ||
-      facts.reductionAdvancingLoadStreams != facts.loadStreams ||
-      facts.accumulatorValues == 0 || !facts.allLoadsFeedPrimitive ||
-      facts.addressDependsOnAccumulator ||
-      facts.predicateDependsOnAccumulator)
+  if (facts.operands.empty() || llvm::any_of(
+                                    facts.operands,
+                                    [](const LocalOperandDependenceFacts &operand) {
+                                      return !operand.advancesIteration ||
+                                             !operand.feedsPrimitive ||
+                                             operand.addressDependsOnAccumulator ||
+                                             operand.predicateDependsOnAccumulator ||
+                                             operand.crossesControl;
+                                    }))
     return candidates;
   for (unsigned depth = 2; depth <= maximumDepth; ++depth)
     candidates.push_back(depth);
@@ -2609,7 +2779,9 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
       config.parameters.dotLoadBufferCount != 0
           ? llvm::SmallVector<unsigned, 4>{
                 static_cast<unsigned>(config.parameters.dotLoadBufferCount)}
-          : localPipelineBufferCandidates(facts.pipeline, 4);
+          : localPipelineBufferCandidates(facts.schedule, 4);
+  const llvm::SmallVector<unsigned, 4> legalPipelineBuffers =
+      localPipelineBufferCandidates(facts.schedule, 4);
 
   const unsigned baseF32Lanes =
       rvvLaneCapacity(rvvShape(32, 1), target).value_or(0);
@@ -2625,6 +2797,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
 
   struct Candidate {
     CorePhysicalMapping mapping;
+    LocalMicrokernelSchedule schedule;
     PhysicalResourceRequirements requirements;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
@@ -2648,13 +2821,8 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
         mapping.pipeline.bufferCount == 0 ||
         mapping.pipeline.bufferCount > reduction->unrollFactor ||
         (mapping.pipeline.bufferCount > 1 &&
-         (facts.pipeline.loadStreams == 0 ||
-          facts.pipeline.reductionAdvancingLoadStreams !=
-              facts.pipeline.loadStreams ||
-          facts.pipeline.accumulatorValues == 0 ||
-          !facts.pipeline.allLoadsFeedPrimitive ||
-          facts.pipeline.addressDependsOnAccumulator ||
-          facts.pipeline.predicateDependsOnAccumulator)))
+         !llvm::is_contained(legalPipelineBuffers,
+                             mapping.pipeline.bufferCount)))
       continue;
     unsigned accumulatorVectors = 1;
     for (const PhysicalAxisDecomposition &axis : mapping.axes)
@@ -2677,13 +2845,28 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
         operandVectorsPerWindow(facts.rhsAxes);
     if (lhsVectorsPerWindow == 0 && rhsVectorsPerWindow == 0)
       continue;
-    DenseMicrokernelResourceFacts resourceFacts{
-        mapping.laneShape, mapping.laneShape, accumulatorVectors,
-        lhsVectorsPerWindow, rhsVectorsPerWindow,
-        mapping.pipeline.bufferCount,
-        facts.predicateGroups, facts.stateGroups, facts.handoffGroups};
+    if (facts.schedule.operands.size() != 2)
+      continue;
+    llvm::SmallVector<LocalOperandWindow, 2> operandWindows = {
+        {0, facts.schedule.operands[0].memoryMode, lhsVectorsPerWindow,
+         std::max(1u, accumulatorVectors /
+                          std::max(1u, lhsVectorsPerWindow)),
+         facts.schedule.operands[0].advancesIteration},
+        {1, facts.schedule.operands[1].memoryMode, rhsVectorsPerWindow,
+         std::max(1u, accumulatorVectors /
+                          std::max(1u, rhsVectorsPerWindow)),
+         facts.schedule.operands[1].advancesIteration}};
+    std::optional<LocalMicrokernelSchedule> schedule =
+        buildLocalMicrokernelSchedule(
+            mapping, facts.reductionAxis, accumulatorVectors, operandWindows,
+            {}, mapping.pipeline.bufferCount - 1);
+    if (!schedule)
+      continue;
     std::optional<PhysicalResourceRequirements> requirements =
-        denseMicrokernelRequirements(resourceFacts, target);
+        localMicrokernelRequirements(
+            *schedule, mapping.laneShape, mapping.laneShape,
+            facts.predicateGroups, facts.stateGroups, facts.handoffGroups,
+            target);
     std::optional<PhysicalResourceBudget> resources =
         requirements ? calculatePhysicalResources(*requirements, target)
                      : std::nullopt;
@@ -2701,20 +2884,15 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                         : std::max(8u, 2 * baseF32Lanes));
     const unsigned preferredBuffers =
         reduction->unrollFactor >= 2 &&
-                facts.pipeline.loadStreams != 0 &&
-                facts.pipeline.reductionAdvancingLoadStreams ==
-                    facts.pipeline.loadStreams &&
-                facts.pipeline.accumulatorValues != 0 &&
-                facts.pipeline.allLoadsFeedPrimitive &&
-                !facts.pipeline.addressDependsOnAccumulator &&
-                !facts.pipeline.predicateDependsOnAccumulator
+                llvm::is_contained(legalPipelineBuffers, 2u)
             ? 2
             : 1;
     const unsigned pipelinePenalty = static_cast<unsigned>(std::abs(
         static_cast<int>(mapping.pipeline.bufferCount) -
         static_cast<int>(preferredBuffers)));
     legal.push_back(Candidate{
-        std::move(mapping), std::move(*requirements), *resources,
+        std::move(mapping), std::move(*schedule),
+        std::move(*requirements), *resources,
         static_cast<unsigned>(
             facts.reductionExtent &&
             *facts.reductionExtent %
@@ -2746,9 +2924,9 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                     rhs.lanePenalty, rhs.unrollPenalty, rhs.pipelinePenalty,
                     rhs.peakGroups);
   });
-  return SelectedF32DotPhysical{std::move(legal.front().mapping),
-                                std::move(legal.front().requirements),
-                                legal.front().resources};
+  return SelectedF32DotPhysical{
+      std::move(legal.front().mapping), std::move(legal.front().schedule),
+      std::move(legal.front().requirements), legal.front().resources};
 }
 
 std::optional<SelectedF16MatmulPhysical>
@@ -2780,7 +2958,9 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
       config.parameters.f16LoadBufferCount != 0
           ? llvm::SmallVector<unsigned, 4>{
                 static_cast<unsigned>(config.parameters.f16LoadBufferCount)}
-          : localPipelineBufferCandidates(facts.pipeline, 4);
+          : localPipelineBufferCandidates(facts.schedule, 4);
+  const llvm::SmallVector<unsigned, 4> legalPipelineBuffers =
+      localPipelineBufferCandidates(facts.schedule, 4);
   LogicalAxisConstraint *mConstraint = nullptr;
   LogicalAxisConstraint *nConstraint = nullptr;
   for (LogicalAxisConstraint &axis : problem.axes) {
@@ -2811,13 +2991,17 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     return std::nullopt;
   const unsigned preferredUnroll =
       *reductionExtent < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
-  const unsigned preferredBuffers = *reductionExtent >= 64 ? 2 : 1;
+  const unsigned preferredBuffers =
+      *reductionExtent >= 64 && llvm::is_contained(legalPipelineBuffers, 2u)
+          ? 2
+          : 1;
   const unsigned preferredColumns =
       baseInputLanes <= 8 && columnTile >= 2 && columnTile % 2 == 0
           ? 2
           : 1;
   struct Candidate {
     CorePhysicalMapping mapping;
+    LocalMicrokernelSchedule schedule;
     RVVVectorShape accumulatorShape;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
@@ -2853,13 +3037,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         mapping.pipeline.bufferCount == 0 ||
         mapping.pipeline.bufferCount > k->unrollFactor ||
         (mapping.pipeline.bufferCount > 1 &&
-         (facts.pipeline.loadStreams == 0 ||
-          facts.pipeline.reductionAdvancingLoadStreams !=
-              facts.pipeline.loadStreams ||
-          facts.pipeline.accumulatorValues == 0 ||
-          !facts.pipeline.allLoadsFeedPrimitive ||
-          facts.pipeline.addressDependsOnAccumulator ||
-          facts.pipeline.predicateDependsOnAccumulator)) ||
+         !llvm::is_contained(legalPipelineBuffers,
+                             mapping.pipeline.bufferCount)) ||
         (lane->id == facts.rhsFreeAxis &&
          (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
       continue;
@@ -2871,10 +3050,26 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         columnLane ? rows : rows * columns;
     const unsigned lhsVectors = columnLane ? 0 : (bufferCount > 1 ? rows : 1);
     const unsigned rhsVectors = columnLane ? 1 : columns;
+    if (facts.schedule.operands.size() != 2)
+      continue;
+    llvm::SmallVector<LocalOperandWindow, 2> operandWindows = {
+        {0, facts.schedule.operands[0].memoryMode, lhsVectors,
+         std::max(1u, accumulatorVectors /
+                          std::max(1u, lhsVectors)),
+         facts.schedule.operands[0].advancesIteration},
+        {1, facts.schedule.operands[1].memoryMode, rhsVectors,
+         std::max(1u, accumulatorVectors /
+                          std::max(1u, rhsVectors)),
+         facts.schedule.operands[1].advancesIteration}};
+    std::optional<LocalMicrokernelSchedule> schedule =
+        buildLocalMicrokernelSchedule(
+            mapping, facts.reductionAxis, accumulatorVectors, operandWindows,
+            {}, bufferCount - 1);
+    if (!schedule)
+      continue;
     std::optional<PhysicalResourceBudget> resources =
-        calculateDenseMicrokernelResources(
-            {mapping.laneShape, *accumulatorShape, accumulatorVectors,
-             lhsVectors, rhsVectors, bufferCount},
+        calculateLocalMicrokernelResources(
+            *schedule, mapping.laneShape, *accumulatorShape, 0, 0, 0,
             target);
     if (!resources)
       continue;
@@ -2890,7 +3085,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     const unsigned preferredRealizedColumns =
         columnLane ? std::min(columnTile, lane->laneFactor) : preferredColumns;
     legal.push_back(Candidate{
-        std::move(mapping), *accumulatorShape, *resources, tailPenalty,
+        std::move(mapping), std::move(*schedule), *accumulatorShape,
+        *resources, tailPenalty,
         static_cast<unsigned>(!columnLane),
         static_cast<unsigned>(std::abs(static_cast<int>(rows) -
                                        static_cast<int>(preferredRows))),
@@ -2916,9 +3112,9 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.unrollPenalty, rhs.bufferPenalty,
                     rhs.resources.peakGroups);
   });
-  return SelectedF16MatmulPhysical{std::move(legal.front().mapping),
-                                   legal.front().accumulatorShape,
-                                   legal.front().resources};
+  return SelectedF16MatmulPhysical{
+      std::move(legal.front().mapping), std::move(legal.front().schedule),
+      legal.front().accumulatorShape, legal.front().resources};
 }
 
 } // namespace weft::riscv_internal

@@ -489,6 +489,141 @@ enum class LocalOperationProjection {
   SignSourceExtend,
 };
 
+struct LocalOperandWindow {
+  unsigned valueIndex = 0;
+  PhysicalMemoryMode memoryMode = PhysicalMemoryMode::UnitStride;
+  unsigned vectorsPerStep = 1;
+  unsigned reuseCount = 1;
+  bool advancesIteration = true;
+
+  bool operator==(const LocalOperandWindow &other) const {
+    return std::tie(valueIndex, memoryMode, vectorsPerStep, reuseCount,
+                    advancesIteration) ==
+           std::tie(other.valueIndex, other.memoryMode,
+                    other.vectorsPerStep, other.reuseCount,
+                    other.advancesIteration);
+  }
+  bool operator<(const LocalOperandWindow &other) const {
+    return std::tie(valueIndex, memoryMode, vectorsPerStep, reuseCount,
+                    advancesIteration) <
+           std::tie(other.valueIndex, other.memoryMode,
+                    other.vectorsPerStep, other.reuseCount,
+                    other.advancesIteration);
+  }
+};
+
+enum class LocalPipelineActionKind {
+  Load,
+  Compute,
+};
+
+struct LocalPipelineAction {
+  LocalPipelineActionKind kind = LocalPipelineActionKind::Load;
+  unsigned iteration = 0;
+  unsigned buffer = 0;
+
+  bool operator==(const LocalPipelineAction &other) const {
+    return std::tie(kind, iteration, buffer) ==
+           std::tie(other.kind, other.iteration, other.buffer);
+  }
+  bool operator<(const LocalPipelineAction &other) const {
+    return std::tie(kind, iteration, buffer) <
+           std::tie(other.kind, other.iteration, other.buffer);
+  }
+};
+
+struct LocalPipelineSchedule {
+  unsigned bufferCount = 1;
+  unsigned prefetchDistance = 0;
+  llvm::SmallVector<LocalPipelineAction, 8> actions;
+
+  bool operator==(const LocalPipelineSchedule &other) const {
+    return bufferCount == other.bufferCount &&
+           prefetchDistance == other.prefetchDistance &&
+           actions == other.actions;
+  }
+  bool operator<(const LocalPipelineSchedule &other) const {
+    if (std::tie(bufferCount, prefetchDistance) !=
+        std::tie(other.bufferCount, other.prefetchDistance))
+      return std::tie(bufferCount, prefetchDistance) <
+             std::tie(other.bufferCount, other.prefetchDistance);
+    return std::lexicographical_compare(actions.begin(), actions.end(),
+                                        other.actions.begin(),
+                                        other.actions.end());
+  }
+};
+
+struct LocalDecodeSchedule {
+  unsigned chunksPerStep = 1;
+  unsigned groupsPerChunk = 1;
+  unsigned reductionSegments = 1;
+
+  bool operator==(const LocalDecodeSchedule &other) const {
+    return std::tie(chunksPerStep, groupsPerChunk, reductionSegments) ==
+           std::tie(other.chunksPerStep, other.groupsPerChunk,
+                    other.reductionSegments);
+  }
+  bool operator<(const LocalDecodeSchedule &other) const {
+    return std::tie(chunksPerStep, groupsPerChunk, reductionSegments) <
+           std::tie(other.chunksPerStep, other.groupsPerChunk,
+                    other.reductionSegments);
+  }
+};
+
+struct LocalMicrokernelSchedule {
+  std::optional<unsigned> iterationAxis;
+  unsigned sequentialIterations = 1;
+  unsigned laneFactor = 1;
+  unsigned iterationRegisterFactor = 1;
+  unsigned iterationElements = 1;
+  unsigned unrollFactor = 1;
+  unsigned accumulatorCount = 1;
+  LocalPipelineSchedule pipeline;
+  llvm::SmallVector<LocalOperandWindow, 4> operands;
+  LocalDecodeSchedule decode;
+
+  explicit operator bool() const {
+    return iterationAxis && sequentialIterations != 0 && laneFactor != 0 &&
+           iterationRegisterFactor != 0 && iterationElements != 0 &&
+           unrollFactor != 0 && accumulatorCount != 0 &&
+           pipeline.bufferCount != 0 &&
+           pipeline.prefetchDistance < pipeline.bufferCount &&
+           !pipeline.actions.empty();
+  }
+  bool operator==(const LocalMicrokernelSchedule &other) const {
+    return iterationAxis == other.iterationAxis &&
+           sequentialIterations == other.sequentialIterations &&
+           laneFactor == other.laneFactor &&
+           iterationRegisterFactor == other.iterationRegisterFactor &&
+           iterationElements == other.iterationElements &&
+           unrollFactor == other.unrollFactor &&
+           accumulatorCount == other.accumulatorCount &&
+           pipeline == other.pipeline && operands == other.operands &&
+           decode == other.decode;
+  }
+  bool operator<(const LocalMicrokernelSchedule &other) const {
+    if (std::tie(iterationAxis, sequentialIterations, laneFactor,
+                 iterationRegisterFactor, iterationElements, unrollFactor,
+                 accumulatorCount, pipeline) !=
+        std::tie(other.iterationAxis, other.sequentialIterations,
+                 other.laneFactor, other.iterationRegisterFactor,
+                 other.iterationElements, other.unrollFactor,
+                 other.accumulatorCount, other.pipeline))
+      return std::tie(iterationAxis, sequentialIterations, laneFactor,
+                      iterationRegisterFactor, iterationElements,
+                      unrollFactor, accumulatorCount, pipeline) <
+             std::tie(other.iterationAxis, other.sequentialIterations,
+                      other.laneFactor, other.iterationRegisterFactor,
+                      other.iterationElements, other.unrollFactor,
+                      other.accumulatorCount, other.pipeline);
+    if (operands != other.operands)
+      return std::lexicographical_compare(operands.begin(), operands.end(),
+                                          other.operands.begin(),
+                                          other.operands.end());
+    return decode < other.decode;
+  }
+};
+
 struct LocalHardwareOperation {
   LocalHardwareOperationKind kind = LocalHardwareOperationKind::None;
   unsigned rows = 1;
@@ -511,6 +646,7 @@ struct LocalImplementation {
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
   LocalHardwareOperation operation;
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
   llvm::SmallVector<RVVVectorShape, 4> valueShapes;
   unsigned entryWidth = 0;
 
@@ -519,8 +655,8 @@ struct LocalImplementation {
   }
   bool operator==(const LocalImplementation &other) const {
     return primitive == other.primitive && operation == other.operation &&
-           mapping == other.mapping && valueShapes == other.valueShapes &&
-           entryWidth == other.entryWidth;
+           mapping == other.mapping && schedule == other.schedule &&
+           valueShapes == other.valueShapes && entryWidth == other.entryWidth;
   }
   bool operator<(const LocalImplementation &other) const {
     if (primitive != other.primitive)
@@ -529,6 +665,8 @@ struct LocalImplementation {
       return operation < other.operation;
     if (!(mapping == other.mapping))
       return mapping < other.mapping;
+    if (!(schedule == other.schedule))
+      return schedule < other.schedule;
     if (valueShapes != other.valueShapes)
       return std::lexicographical_compare(valueShapes.begin(), valueShapes.end(),
                                           other.valueShapes.begin(),
@@ -800,31 +938,30 @@ selectGroupedAffineI4I8Physical(
     const GroupedAffineI4I8CandidateFacts &facts,
     const RISCVTargetProfile &target);
 
-struct DenseMicrokernelResourceFacts {
-  RVVVectorShape inputShape;
-  RVVVectorShape accumulatorShape;
-  unsigned accumulatorVectors = 0;
-  unsigned lhsVectorsPerWindow = 0;
-  unsigned rhsVectorsPerWindow = 0;
-  unsigned loadWindow = 1;
-  unsigned predicateGroups = 0;
-  unsigned stateGroups = 0;
-  unsigned handoffGroups = 0;
-};
-
-struct LocalPipelineDependenceFacts {
-  unsigned loadStreams = 0;
-  unsigned reductionAdvancingLoadStreams = 0;
-  unsigned accumulatorValues = 0;
-  bool allLoadsFeedPrimitive = false;
+struct LocalOperandDependenceFacts {
+  PhysicalMemoryMode memoryMode = PhysicalMemoryMode::UnitStride;
+  bool advancesIteration = false;
+  bool feedsPrimitive = false;
   bool addressDependsOnAccumulator = false;
   bool predicateDependsOnAccumulator = false;
+  unsigned consumerCount = 0;
+  bool crossesControl = false;
+};
+
+struct LocalScheduleDependenceFacts {
+  llvm::SmallVector<LocalOperandDependenceFacts, 4> operands;
+  unsigned resultConsumerCount = 0;
+  bool resultCrossesControl = false;
 };
 
 std::optional<PhysicalResourceBudget>
-calculateDenseMicrokernelResources(
-    const DenseMicrokernelResourceFacts &facts,
-    const RISCVTargetProfile &target);
+calculateLocalMicrokernelResources(const LocalMicrokernelSchedule &schedule,
+                                   RVVVectorShape inputShape,
+                                   RVVVectorShape accumulatorShape,
+                                   unsigned predicateGroups,
+                                   unsigned stateGroups,
+                                   unsigned handoffGroups,
+                                   const RISCVTargetProfile &target);
 
 struct F32DotCandidateFacts {
   CoreMappingProblem mapping;
@@ -840,11 +977,12 @@ struct F32DotCandidateFacts {
   unsigned handoffGroups = 0;
   bool reductionPredicate = false;
   bool materializedInit = false;
-  LocalPipelineDependenceFacts pipeline;
+  LocalScheduleDependenceFacts schedule;
 };
 
 struct SelectedF32DotPhysical {
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
   PhysicalResourceRequirements requirements;
   PhysicalResourceBudget resources;
 };
@@ -860,11 +998,12 @@ struct F16MatmulCandidateFacts {
   unsigned rhsFreeAxis = 0;
   unsigned reductionAxis = 0;
   bool nLaneStrided = false;
-  LocalPipelineDependenceFacts pipeline;
+  LocalScheduleDependenceFacts schedule;
 };
 
 struct SelectedF16MatmulPhysical {
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
   RVVVectorShape accumulatorShape;
   PhysicalResourceBudget resources;
 };

@@ -5,10 +5,14 @@
 namespace weft::riscv_internal {
 
 void emitIMELocalImplementations(llvm::raw_ostream &output,
-                             bool usesIME1SymmetricI4I8,
-                             bool usesIME1AffineI4I8,
-                             bool usesIME1SymmetricI4I8M4,
-                             bool usesIME1AffineI4I8M4) {
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8M4) {
+  const bool usesIME1SymmetricI4I8 = symmetricI4I8.has_value();
+  const bool usesIME1AffineI4I8 = affineI4I8.has_value();
+  const bool usesIME1SymmetricI4I8M4 = symmetricI4I8M4.has_value();
+  const bool usesIME1AffineI4I8M4 = affineI4I8M4.has_value();
   if (usesIME1SymmetricI4I8 || usesIME1AffineI4I8) {
     output << R"ime(#define __WEFT_IME1_COMP_I4_I8_M1                                      \
   "vmadot       v16, v14, v0            \n\t"                         \
@@ -117,7 +121,8 @@ __weft_ime1_symmetric_i4_i8_n16_k32(
         "addi         s4, %[B], 128          \n\t"
         "addi         s5, %[A], 0            \n\t"
         "addi         s6, %[A], 8            \n\t"
-        "li           t5, 2                  \n\t"
+        "li           t5, )ime"
+        << symmetricI4I8->decode.chunksPerStep << R"ime(                  \n\t"
         "vsetvli      t0, zero, e8, m1       \n\t"
         "LOOP_INNER%=:                       \n\t"
         __WEFT_IME1_LOAD_I4_I8_M1
@@ -154,7 +159,7 @@ __weft_ime1_symmetric_i4_i8_n16_k32(
 static inline __attribute__((unused)) void __weft_ime1_affine_i4_i8_n16_k32(
     float activation_scale, const int8_t *activation_code,
     const uint8_t *packed_weight, float *accumulator) {
-  const size_t inner = 2;
+  const size_t inner = )ime" << affineI4I8->decode.chunksPerStep << R"ime(;
   const uint8_t *weight = packed_weight;
 
   __asm__ volatile(
@@ -394,7 +399,8 @@ __weft_ime1_symmetric_i4_i8_m4_n16_k32(
       "flw          f4, 12(%[AS])           \n\t"
       "vsetvli      t0, zero, e32, m8       \n\t"
       "vxor.vv      v16, v16, v16           \n\t"
-      "li           t2, 2                   \n\t"
+      "li           t2, )ime"
+      << symmetricI4I8M4->decode.chunksPerStep << R"ime(                   \n\t"
       "LOOP_M4_SYM%=:                       \n\t"
       __WEFT_IME1_LOAD_B_M4
       "vsetvli      t0, zero, e8, m1        \n\t"
@@ -469,7 +475,8 @@ __weft_ime1_affine_i4_i8_m4_n16_k32(
       "vsetvli      t0, zero, e32, m8       \n\t"
       "vxor.vv      v16, v16, v16           \n\t"
       __WEFT_IME1_LOAD_ZP_M4
-      "li           t2, 2                   \n\t"
+      "li           t2, )ime"
+      << affineI4I8M4->decode.chunksPerStep << R"ime(                   \n\t"
       "LOOP_M4_AFFINE%=:                    \n\t"
       __WEFT_IME1_LOAD_B_M4
       "vsetvli      t0, zero, e8, m1        \n\t"

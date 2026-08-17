@@ -11,10 +11,11 @@ bool emitIQ3LocalImplementation(llvm::raw_ostream &output,
   if (implementation.primitive != LocalPrimitiveKind::IQ3SI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 7)
+      implementation.valueShapes.size() < 7 || !implementation.schedule ||
+      implementation.schedule.laneFactor != 64 ||
+      implementation.schedule.decode.chunksPerStep != 3 ||
+      implementation.schedule.decode.reductionSegments != 2)
     return false;
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
   const RVVVectorShape indexShape = implementation.valueShapes[2];
@@ -55,7 +56,7 @@ bool emitIQ3LocalImplementation(llvm::raw_ostream &output,
   const std::string halfProductSuffix = rvvIntrinsicTypeSuffix(
       RVVElementCategory::SignedInteger, halfProductShape);
   std::optional<unsigned> maskRatio = rvvMaskRatio(laneShape);
-  if (!reduction || laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
+  if (laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
       laneSignedType.empty() || laneSignedSuffix.empty() || codeType.empty() ||
       codeSuffix.empty() || indexType.empty() || indexSuffix.empty() ||
       tableType.empty() || tableSuffix.empty() || signType.empty() ||
@@ -93,7 +94,8 @@ bool emitIQ3LocalImplementation(llvm::raw_ostream &output,
          << indexSuffix << "(high_shifts, 16);\n"
          << "  int32_t integer_sum = 0;\n"
          << "  for (size_t group_pair = 0; group_pair < "
-         << reduction->sequentialFactor << "; ++group_pair) {\n"
+         << implementation.schedule.sequentialIterations
+         << "; ++group_pair) {\n"
          << "    const " << codeType << " low8 = __riscv_vle8_v_"
          << codeSuffix << "(codes + group_pair * 16, 16);\n"
          << "    const uint16_t high_word =\n"

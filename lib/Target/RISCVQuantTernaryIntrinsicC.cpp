@@ -11,7 +11,8 @@ bool emitBase3TernaryLocalImplementation(
   if (implementation.primitive != LocalPrimitiveKind::Base3TernaryI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 5)
+      implementation.valueShapes.size() < 5 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep != 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape halfShape = implementation.valueShapes[1];
@@ -100,7 +101,8 @@ bool emitBase3TernaryLocalImplementation(
          << "          __riscv_vsub_vx_" << widenedUnsignedSuffix
          << "(digit0, 1, vl32)),\n      activation0, vl32);\n"
          << "  uint8_t power = 3;\n"
-         << "  for (size_t digit = 1; digit < 5; ++digit) {\n"
+         << "  for (size_t digit = 1; digit < "
+         << implementation.schedule.decode.chunksPerStep << "; ++digit) {\n"
          << "    const " << widenedUnsignedType
          << " decoded = __riscv_vsrl_vx_" << widenedUnsignedSuffix << "(\n"
          << "        __riscv_vwmulu_vx_" << widenedUnsignedSuffix << "(\n"
@@ -138,7 +140,8 @@ bool emitBase3TernaryLocalImplementation(
          << "          __riscv_vsub_vx_" << halfWidenedUnsignedSuffix
          << "(tail0, 1, vl16)),\n      tailActivation0, vl16);\n"
          << "  power = 3;\n"
-         << "  for (size_t digit = 1; digit < 5; ++digit) {\n"
+         << "  for (size_t digit = 1; digit < "
+         << implementation.schedule.decode.chunksPerStep << "; ++digit) {\n"
          << "    const " << halfWidenedUnsignedType
          << " decoded = __riscv_vsrl_vx_" << halfWidenedUnsignedSuffix << "(\n"
          << "        __riscv_vwmulu_vx_" << halfWidenedUnsignedSuffix << "(\n"
@@ -210,10 +213,9 @@ bool emitPackedI2TernaryLocalImplementation(
   if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 2)
+      implementation.valueShapes.size() < 2 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep == 0)
     return false;
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape widenedShape = implementation.valueShapes[1];
   const std::string unsignedType =
@@ -229,14 +231,15 @@ bool emitPackedI2TernaryLocalImplementation(
   const std::string widenedSuffix =
       rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, widenedShape);
   const std::string setVL = rvvSetVLIntrinsic(laneShape);
-  if (!reduction || unsignedType.empty() || unsignedSuffix.empty() ||
+  if (unsignedType.empty() || unsignedSuffix.empty() ||
       signedType.empty() || signedSuffix.empty() || widenedType.empty() ||
       widenedSuffix.empty() || setVL.empty())
     return false;
 
-  const unsigned logicalChunk =
-      reduction->laneFactor * reduction->registerFactor;
-  const unsigned halfCount = reduction->sequentialFactor / 4;
+  const unsigned logicalChunk = implementation.schedule.iterationElements;
+  const unsigned halfCount =
+      implementation.schedule.sequentialIterations /
+      implementation.schedule.decode.chunksPerStep;
   output << "static inline __attribute__((always_inline, unused)) float\n"
          << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *activation_bytes,\n"
@@ -244,17 +247,20 @@ bool emitPackedI2TernaryLocalImplementation(
          << "  const int8_t *activation = "
             "(const int8_t *)(const void *)activation_bytes;\n"
          << "  const size_t vl = " << setVL << "("
-         << reduction->laneFactor << ");\n"
+         << implementation.schedule.laneFactor << ");\n"
          << "  int32_t integer_sum = 0;\n"
          << "  for (size_t half = 0; half < " << halfCount << "; ++half) {\n"
          << "    for (size_t repetition = 0; repetition < "
-         << reduction->registerFactor << "; ++repetition) {\n"
+         << implementation.schedule.iterationRegisterFactor
+         << "; ++repetition) {\n"
          << "      const " << unsignedType << " packed = __riscv_vle8_v_"
          << unsignedSuffix << "(codes + half * " << logicalChunk
-         << " + repetition * " << reduction->laneFactor << ", vl);\n"
+         << " + repetition * " << implementation.schedule.laneFactor
+         << ", vl);\n"
          << "      " << widenedType << " accumulator = __riscv_vmv_v_x_"
          << widenedSuffix << "(0, vl);\n"
-         << "      for (size_t field = 0; field < 4; ++field) {\n"
+         << "      for (size_t field = 0; field < "
+         << implementation.schedule.decode.chunksPerStep << "; ++field) {\n"
          << "        " << unsignedType << " unpacked = __riscv_vsrl_vx_"
          << unsignedSuffix << "(packed, 2 * field, vl);\n"
          << "        if (field != 3)\n"
@@ -267,7 +273,8 @@ bool emitPackedI2TernaryLocalImplementation(
          << "        const " << signedType
          << " values = __riscv_vle8_v_" << signedSuffix
          << "(activation + (half * 4 + field) * " << logicalChunk
-         << " + repetition * " << reduction->laneFactor << ", vl);\n"
+         << " + repetition * " << implementation.schedule.laneFactor
+         << ", vl);\n"
          << "        accumulator = __riscv_vwmacc_vv_" << widenedSuffix
          << "(accumulator, ternary, values, vl);\n"
          << "      }\n"

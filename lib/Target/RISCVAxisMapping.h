@@ -171,7 +171,6 @@ findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis);
 const PhysicalAxisDecomposition *
 findUniqueAxisMapping(const CorePhysicalMapping &mapping,
                       LogicalAxisRole role);
-unsigned mappedLaneSpan(const CorePhysicalMapping &mapping);
 
 enum class PhysicalLiveClass {
   Value,

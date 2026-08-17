@@ -13,8 +13,6 @@ namespace {
 bool emitPackedDotLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation,
     bool hasHighBits) {
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const LocalPrimitiveKind expectedPrimitive =
       hasHighBits ? LocalPrimitiveKind::PackedI5I8
                   : LocalPrimitiveKind::PackedI4I8;
@@ -22,7 +20,8 @@ bool emitPackedDotLocalImplementation(
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
       implementation.operation.projection == LocalOperationProjection::None ||
-      implementation.valueShapes.size() < 3 || !reduction)
+      implementation.valueShapes.size() < 3 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep != 2)
     return false;
 
   const RVVVectorShape shape = implementation.mapping.laneShape;
@@ -109,8 +108,9 @@ bool emitPackedDotLocalImplementation(
            << widenedSuffix << "(codes, activation, vl32);\n";
   } else if (implementation.operation.projection ==
              LocalOperationProjection::PackedDotRegisterChunks) {
-    for (unsigned chunk = 0; chunk < reduction->registerFactor; ++chunk) {
-      const unsigned start = chunk * reduction->laneFactor;
+    for (unsigned chunk = 0;
+         chunk < implementation.schedule.iterationRegisterFactor; ++chunk) {
+      const unsigned start = chunk * implementation.schedule.laneFactor;
       const unsigned packedOffset = start % 16;
       const bool highNibble = start >= 16;
       output << "  const size_t vl" << chunk << " = " << setVL << "(16);\n"
@@ -145,7 +145,8 @@ bool emitPackedDotLocalImplementation(
              << ", activation" << chunk << ", vl" << chunk << ");\n";
     }
     output << "  " << widenedType << " products = products0;\n";
-    for (unsigned chunk = 1; chunk < reduction->registerFactor; ++chunk)
+    for (unsigned chunk = 1;
+         chunk < implementation.schedule.iterationRegisterFactor; ++chunk)
       output << "  products = __riscv_vadd_vv_" << widenedSuffix
              << "(products, products" << chunk << ", vl0);\n";
   } else {
@@ -178,7 +179,8 @@ bool emitNibbleCodebookLocalImplementation(
   if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 4)
+      implementation.valueShapes.size() < 4 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep != 2)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape packedShape = implementation.valueShapes[1];

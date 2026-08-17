@@ -329,6 +329,8 @@ struct VLAAccessDecision {
   RVVVectorShape elementShape;
   RVVVectorShape indexedShape;
   unsigned elementBytes = 0;
+  mlir::Operation *indexedOffsetEmission = nullptr;
+  unsigned indexedOffsetReuseCount = 0;
   mlir::Value bundleAxis;
   unsigned bundleVectors = 0;
   PhysicalInactiveLaneRealization inactiveLane =
@@ -419,6 +421,7 @@ struct VLADotOperandDecision {
 struct VLADotDecision {
   mlir::Operation *operation = nullptr;
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
   VLADotOperandDecision lhs;
   VLADotOperandDecision rhs;
   mlir::Value init;
@@ -574,6 +577,7 @@ struct F16GemmNTileDecision {
   PhysicalMemoryMode rhsColumnMemoryMode = PhysicalMemoryMode::UnitStride;
   std::optional<AffineScalarExpression> rhsColumnStride;
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
 };
 
 struct LocalDotOperandDecision {
@@ -587,6 +591,7 @@ struct LocalDotOperandDecision {
 struct DotDecision {
   mlir::Operation *operation = nullptr;
   CorePhysicalMapping mapping;
+  LocalMicrokernelSchedule schedule;
   LocalDotOperandDecision lhs;
   LocalDotOperandDecision rhs;
   mlir::Value rowAxis;
@@ -1408,6 +1413,7 @@ private:
   llvm::DenseSet<mlir::Operation *> deferredBlockOps;
   llvm::DenseSet<mlir::Operation *> loweredBlockOps;
   llvm::DenseMap<mlir::Operation *, int64_t> materializedBlockElements;
+  llvm::DenseMap<mlir::Operation *, std::string> indexedByteOffsets;
   llvm::DenseMap<mlir::Value, int64_t> controlBlockElements;
   unsigned indent = 0;
   unsigned nextValue = 0;
@@ -1785,9 +1791,21 @@ private:
         entity.values, [&](const PhysicalValueDecision &physical) {
           return physical.value == value;
         });
-    if (!expected || found == entity.values.end() || found->shape != expected)
-      return owner->emitError(
+    if (!expected || found == entity.values.end() || found->shape != expected) {
+      mlir::InFlightDiagnostic error = owner->emitError(
           "value shape is inconsistent with its selected axis mapping");
+      if (expected)
+        error << ": expected e" << expected.sew << " LMUL-eighths "
+              << expected.lmulEighths;
+      else
+        error << ": expected shape unavailable";
+      if (found != entity.values.end())
+        error << ", selected e" << found->shape.sew << " LMUL-eighths "
+              << found->shape.lmulEighths;
+      else
+        error << ", value has no selected shape";
+      return mlir::failure();
+    }
     return mlir::success();
   }
 
@@ -1991,6 +2009,9 @@ private:
     }
 
     F32DotCandidateFacts candidateFacts;
+    candidateFacts.schedule = analyzeLocalScheduleDependences(
+        {dot.getLhs(), dot.getRhs()}, reductionAxis.getResult(), dot.getInit(),
+        dot.getResult());
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
         extent && *extent >= 0)
@@ -2032,6 +2053,7 @@ private:
       return mlir::failure();
     }
     decision.mapping = physical->mapping;
+    decision.schedule = physical->schedule;
     decision.resourceRequirements = physical->requirements;
     decision.resources = physical->resources;
     return decision;
@@ -3145,6 +3167,35 @@ private:
         recordPhysicalHandoff(entity, access.operation,
                               access.indexedOffset, PhysicalHandoff::Share,
                               indexShape, indexShape);
+      }
+    }
+
+    for (size_t firstIndex = 0; firstIndex < decision.accesses.size();
+         ++firstIndex) {
+      VLAAccessDecision &first = decision.accesses[firstIndex];
+      if (first.memoryMode != PhysicalMemoryMode::Indexed ||
+          first.indexedOffsetEmission)
+        continue;
+      llvm::SmallVector<VLAAccessDecision *, 4> group{&first};
+      mlir::Operation *emission = first.operation;
+      for (size_t nextIndex = 0; nextIndex < decision.accesses.size();
+           ++nextIndex) {
+        if (nextIndex == firstIndex)
+          continue;
+        VLAAccessDecision &next = decision.accesses[nextIndex];
+        if (next.memoryMode != PhysicalMemoryMode::Indexed ||
+            next.operation->getBlock() != first.operation->getBlock() ||
+            next.indexedOffset != first.indexedOffset ||
+            next.indexedShape != first.indexedShape ||
+            next.elementBytes != first.elementBytes)
+          continue;
+        group.push_back(&next);
+        if (next.operation->isBeforeInBlock(emission))
+          emission = next.operation;
+      }
+      for (VLAAccessDecision *access : group) {
+        access->indexedOffsetEmission = emission;
+        access->indexedOffsetReuseCount = static_cast<unsigned>(group.size());
       }
     }
 
@@ -4286,6 +4337,8 @@ private:
     std::string previousVL = activeVL;
     const VLARegionDecision *previousDecision = activeVLADecision;
     const PhysicalEntityPlan *previousEntity = activePhysicalEntity;
+    llvm::DenseMap<mlir::Operation *, std::string>
+        previousIndexedByteOffsets = std::move(indexedByteOffsets);
     auto emitStripBody = [&]() -> mlir::LogicalResult {
       inVLA = true;
       activeVL = vl;
@@ -4296,6 +4349,7 @@ private:
         activeVL = previousVL;
         activeVLADecision = previousDecision;
         activePhysicalEntity = previousEntity;
+        indexedByteOffsets = std::move(previousIndexedByteOffsets);
       });
       CValue coordinate{body.getArgument(0).getType(), CValueKind::Coordinate,
                         strip};
@@ -5159,15 +5213,31 @@ private:
           VLACastRealization::RVVZeroExtendU32ToIndex) {
         std::optional<unsigned> sourceLMUL =
             rvvIntegerLMUL(handoff->sourceShape);
-        if (!sourceLMUL)
+        std::optional<unsigned> resultLMUL =
+            rvvIntegerLMUL(handoff->resultShape);
+        if (!sourceLMUL || !resultLMUL)
           return op.emitError("VLA index cast shape has no intrinsic-C spelling");
         if (input.kind != CValueKind::U32Vector || input.spelling.empty())
           return op.emitError(
               "selected u32-to-index VLA cast operand is unavailable");
+        std::string spelling = input.spelling;
+        if (handoff->resultShape.sew != handoff->sourceShape.sew) {
+          std::string type = rvvVectorType(
+              RVVElementCategory::UnsignedInteger, handoff->resultShape);
+          std::string suffix = rvvIntrinsicTypeSuffix(
+              RVVElementCategory::UnsignedInteger, handoff->resultShape);
+          if (handoff->sourceShape.sew != 32 ||
+              handoff->resultShape.sew != 64 || type.empty() || suffix.empty())
+            return op.emitError(
+                "u32-to-index VLA cast has no target-width conversion");
+          spelling = fresh("index_u64");
+          line(type + " " + spelling + " = __riscv_vzext_vf2_" + suffix +
+               "(" + input.spelling + ", " + activeVL + ");");
+        }
         CValue result{op.getResult().getType(), CValueKind::IndexVector,
-                      input.spelling};
-        result.vectorSEW = handoff->sourceShape.sew;
-        result.vectorLMUL = *sourceLMUL;
+                      spelling};
+        result.vectorSEW = handoff->resultShape.sew;
+        result.vectorLMUL = *resultLMUL;
         if (mlir::failed(attachLogicalValidity(
                 op.getOperation(), op.getResult().getType(), result, {input})))
           return mlir::failure();
@@ -5642,9 +5712,14 @@ private:
         findAxisMapping(decision.mapping, decision.reductionMappingAxis);
     if (!lmul || dotShape.sew != 32 || !activePhysicalEntity ||
         dotShape != decision.mapping.laneShape ||
-        !laneAxis || !reductionAxis ||
+        !laneAxis || !reductionAxis || !decision.schedule ||
+        decision.schedule.iterationAxis !=
+            std::optional<unsigned>(decision.reductionMappingAxis) ||
         reductionAxis->unrollFactor == 0 ||
-        decision.mapping.pipeline.bufferCount != 1 ||
+        decision.schedule.unrollFactor != reductionAxis->unrollFactor ||
+        decision.schedule.pipeline.bufferCount !=
+            decision.mapping.pipeline.bufferCount ||
+        decision.schedule.operands.size() != 2 ||
         (mAxis && (mAxis->registerFactor == 0 || !decision.rowAxis)))
       return decision.operation->emitError(
           "VLA dot physical entity is incomplete");
@@ -5659,6 +5734,7 @@ private:
       return decision.operation->emitError(
           "VLA dot physical handoff is inconsistent");
     const unsigned kUnroll = reductionAxis->unrollFactor;
+    const unsigned loadBufferCount = decision.schedule.pipeline.bufferCount;
     auto dot = mlir::cast<DotOp>(decision.operation);
     std::string extent = expression(decision.reductionExtent);
     if (extent.empty() || activeVL.empty())
@@ -5668,24 +5744,26 @@ private:
     std::string vectorSuffix = "f32m" + std::to_string(*lmul);
     std::string vectorType =
         "vfloat32m" + std::to_string(*lmul) + "_t";
-    struct ProjectedDotOperand {
+    struct BufferedDotOperand {
       bool vector = false;
-      std::string spelling;
+      std::string shared;
+      llvm::SmallVector<std::string, 8> rows;
     };
-    auto projectOperand =
+    auto emitProjectedOperand =
         [&](const VLADotOperandDecision &operand,
             const llvm::DenseMap<mlir::Value, std::string> &axes,
-            llvm::StringRef prefix) -> std::optional<ProjectedDotOperand> {
+            llvm::StringRef destination) -> mlir::LogicalResult {
       if (!operand.laneMapped) {
         std::optional<std::string> scalar =
             projectBlockScalar(operand.value, axes);
         if (!scalar)
-          return std::nullopt;
-        return ProjectedDotOperand{false, std::move(*scalar)};
+          return mlir::failure();
+        line(destination.str() + " = " + *scalar + ";");
+        return mlir::success();
       }
       auto load = mlir::dyn_cast_or_null<LoadOp>(operand.load);
       if (!load)
-        return std::nullopt;
+        return mlir::failure();
       std::optional<std::string> pointer =
           projectBlockScalar(load.getPointer(), axes);
       std::optional<std::string> stride =
@@ -5693,19 +5771,18 @@ private:
               ? spellAffineScalarExpression(*operand.laneStride, axes)
               : std::optional<std::string>("1");
       if (!pointer || !stride)
-        return std::nullopt;
-      std::string vector = fresh(prefix);
+        return mlir::failure();
       if (operand.laneMemoryMode == PhysicalMemoryMode::UnitStride)
-        line(vectorType + " " + vector + " = __riscv_vle32_v_" +
+        line(destination.str() + " = __riscv_vle32_v_" +
              vectorSuffix + "(" + *pointer + ", " + activeVL + ");");
       else if (operand.laneMemoryMode == PhysicalMemoryMode::Strided)
-        line(vectorType + " " + vector + " = __riscv_vlse32_v_" +
+        line(destination.str() + " = __riscv_vlse32_v_" +
              vectorSuffix + "(" + *pointer +
              ", (ptrdiff_t)(sizeof(float) * (" + *stride + ")), " + activeVL +
              ");");
       else
-        return std::nullopt;
-      return ProjectedDotOperand{true, std::move(vector)};
+        return mlir::failure();
+      return mlir::success();
     };
 
     const unsigned registerFactor = mAxis ? mAxis->registerFactor : 1;
@@ -5736,55 +5813,95 @@ private:
         accumulators.push_back(std::move(accumulator));
       }
       std::string reduction = fresh("vla_dot_k");
+      struct BufferedDotChunk {
+        BufferedDotOperand lhs;
+        BufferedDotOperand rhs;
+      };
+      llvm::SmallVector<BufferedDotChunk, 4> banks(loadBufferCount);
+      auto allocateOperand = [&](const VLADotOperandDecision &operand,
+                                 BufferedDotOperand &buffered,
+                                 llvm::StringRef prefix) {
+        buffered.vector = operand.laneMapped;
+        const std::string type = buffered.vector ? vectorType : "float";
+        if (!operand.registerMapped) {
+          buffered.shared = fresh(prefix);
+          line(type + " " + buffered.shared + ";");
+          return;
+        }
+        for (unsigned row = 0; row < rowCount; ++row) {
+          buffered.rows.push_back(fresh(prefix));
+          line(type + " " + buffered.rows.back() + ";");
+        }
+      };
+      for (BufferedDotChunk &bank : banks) {
+        allocateOperand(decision.lhs, bank.lhs, "vla_dot_lhs");
+        allocateOperand(decision.rhs, bank.rhs, "vla_dot_rhs");
+      }
+      auto loadOperand = [&](const VLADotOperandDecision &operand,
+                             BufferedDotOperand &buffered,
+                             llvm::StringRef coordinate) -> mlir::LogicalResult {
+        llvm::DenseMap<mlir::Value, std::string> sharedAxes;
+        sharedAxes[decision.reductionAxis] = coordinate.str();
+        if (!operand.registerMapped)
+          return emitProjectedOperand(operand, sharedAxes, buffered.shared);
+        for (unsigned row = 0; row < rowCount; ++row) {
+          llvm::DenseMap<mlir::Value, std::string> axes = sharedAxes;
+          axes[decision.rowAxis] = std::to_string(rowBase + row);
+          if (mlir::failed(
+                  emitProjectedOperand(operand, axes, buffered.rows[row])))
+            return mlir::failure();
+        }
+        return mlir::success();
+      };
+      auto loadBank = [&](unsigned bank, llvm::StringRef coordinate)
+          -> mlir::LogicalResult {
+        return mlir::success(
+            mlir::succeeded(loadOperand(decision.lhs, banks[bank].lhs,
+                                        coordinate)) &&
+            mlir::succeeded(loadOperand(decision.rhs, banks[bank].rhs,
+                                        coordinate)));
+      };
+      auto computeBank = [&](unsigned bank) {
+        for (unsigned row = 0; row < rowCount; ++row) {
+          llvm::StringRef lhs = decision.lhs.registerMapped
+                                    ? banks[bank].lhs.rows[row]
+                                    : banks[bank].lhs.shared;
+          llvm::StringRef rhs = decision.rhs.registerMapped
+                                    ? banks[bank].rhs.rows[row]
+                                    : banks[bank].rhs.shared;
+          if (banks[bank].lhs.vector && banks[bank].rhs.vector)
+            line(accumulators[row] + " = __riscv_vfmacc_vv_" + vectorSuffix +
+                 "_tu(" + accumulators[row] + ", " + lhs.str() + ", " +
+                 rhs.str() + ", " + activeVL + ");");
+          else {
+            llvm::StringRef vector = banks[bank].lhs.vector ? lhs : rhs;
+            llvm::StringRef scalar = banks[bank].lhs.vector ? rhs : lhs;
+            line(accumulators[row] + " = __riscv_vfmacc_vf_" + vectorSuffix +
+                 "(" + accumulators[row] + ", " + scalar.str() + ", " +
+                 vector.str() + ", " + activeVL + ");");
+          }
+        }
+      };
       line("for (size_t " + reduction + " = 0; " + reduction + " < " +
            extent + "; " + reduction + " += " + std::to_string(kUnroll) +
            ") {");
       ++indent;
-      for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
+      for (const LocalPipelineAction &action :
+           decision.schedule.pipeline.actions) {
+        if (action.iteration >= kUnroll || action.buffer >= loadBufferCount)
+          return dot.emitError("VLA dot pipeline action is invalid");
         std::string coordinate =
-            unroll == 0 ? reduction
-                        : "(" + reduction + " + " + std::to_string(unroll) + ")";
+            action.iteration == 0
+                ? reduction
+                : "(" + reduction + " + " +
+                      std::to_string(action.iteration) + ")";
         line("if (" + coordinate + " < " + extent + ") {");
         ++indent;
-        llvm::DenseMap<mlir::Value, std::string> sharedAxes;
-        sharedAxes[decision.reductionAxis] = coordinate;
-        std::optional<ProjectedDotOperand> sharedLHS;
-        std::optional<ProjectedDotOperand> sharedRHS;
-        if (!decision.lhs.registerMapped)
-          sharedLHS = projectOperand(decision.lhs, sharedAxes, "vla_dot_lhs");
-        if (!decision.rhs.registerMapped)
-          sharedRHS = projectOperand(decision.rhs, sharedAxes, "vla_dot_rhs");
-        if ((!decision.lhs.registerMapped && !sharedLHS) ||
-            (!decision.rhs.registerMapped && !sharedRHS))
-          return dot.emitError(
-              "RVV VLA dot shared operand projection is unavailable");
-        for (unsigned row = 0; row < rowCount; ++row) {
-          llvm::DenseMap<mlir::Value, std::string> axes = sharedAxes;
-          if (mAxis)
-            axes[decision.rowAxis] = std::to_string(rowBase + row);
-          std::optional<ProjectedDotOperand> lhs =
-              decision.lhs.registerMapped
-                  ? projectOperand(decision.lhs, axes, "vla_dot_lhs")
-                  : sharedLHS;
-          std::optional<ProjectedDotOperand> rhs =
-              decision.rhs.registerMapped
-                  ? projectOperand(decision.rhs, axes, "vla_dot_rhs")
-                  : sharedRHS;
-          if (!lhs || !rhs || (!lhs->vector && !rhs->vector))
-            return dot.emitError(
-                "RVV VLA dot operand projection is unavailable");
-          if (lhs->vector && rhs->vector)
-            line(accumulators[row] + " = __riscv_vfmacc_vv_" + vectorSuffix +
-                 "_tu(" + accumulators[row] + ", " + lhs->spelling + ", " +
-                 rhs->spelling + ", " + activeVL + ");");
-          else {
-            const ProjectedDotOperand &vector = lhs->vector ? *lhs : *rhs;
-            const ProjectedDotOperand &scalar = lhs->vector ? *rhs : *lhs;
-            line(accumulators[row] + " = __riscv_vfmacc_vf_" + vectorSuffix +
-                 "(" + accumulators[row] + ", " + scalar.spelling + ", " +
-                 vector.spelling + ", " + activeVL + ");");
-          }
-        }
+        if (action.kind == LocalPipelineActionKind::Load) {
+          if (mlir::failed(loadBank(action.buffer, coordinate)))
+            return dot.emitError("VLA dot operand projection is unavailable");
+        } else
+          computeBank(action.buffer);
         --indent;
         line("}");
       }
@@ -5953,28 +6070,50 @@ private:
     return analysis;
   }
 
-  LocalPipelineDependenceFacts analyzeLocalPipelineDependences(
-      llvm::ArrayRef<LoadOp> loads,
+  LocalScheduleDependenceFacts analyzeLocalScheduleDependences(
       llvm::ArrayRef<mlir::Value> primitiveOperands,
-      mlir::Value reductionAxis, mlir::Value accumulator) const {
-    LocalPipelineDependenceFacts facts;
-    if (loads.size() != primitiveOperands.size() || !reductionAxis ||
-        !accumulator)
+      mlir::Value reductionAxis, mlir::Value accumulator,
+      mlir::Value result) const {
+    LocalScheduleDependenceFacts facts;
+    if (primitiveOperands.empty() || !reductionAxis || !accumulator || !result)
       return facts;
-    facts.loadStreams = loads.size();
-    facts.accumulatorValues = 1;
-    facts.allLoadsFeedPrimitive = !loads.empty();
-    for (size_t index = 0; index < loads.size(); ++index) {
-      LoadOp load = loads[index];
-      mlir::Value operand = primitiveOperands[index];
-      facts.reductionAdvancingLoadStreams +=
-          valueDependsOnAxis(load.getPointer(), reductionAxis);
-      facts.allLoadsFeedPrimitive &=
-          valueDependsOn(operand, load.getResult());
-      facts.addressDependsOnAccumulator |=
-          valueDependsOn(load.getPointer(), accumulator);
-      facts.predicateDependsOnAccumulator |=
-          valueDependsOn(load.getWhere(), accumulator);
+    for (mlir::Value operand : primitiveOperands) {
+      LoadOp load = reloadableLoad(operand);
+      LocalOperandDependenceFacts operandFacts;
+      const MemoryAccessFact *access =
+          load ? memoryFact(load.getOperation()) : nullptr;
+      const LaneRelation relation =
+          access ? memoryRelation(*access, reductionAxis)
+                 : LaneRelation::NonAffine;
+      if (relation == LaneRelation::UnitStride)
+        operandFacts.memoryMode = PhysicalMemoryMode::UnitStride;
+      else if (relation == LaneRelation::Strided)
+        operandFacts.memoryMode = PhysicalMemoryMode::Strided;
+      else if (relation == LaneRelation::Indexed)
+        operandFacts.memoryMode = PhysicalMemoryMode::Indexed;
+      operandFacts.advancesIteration =
+          load ? valueDependsOnAxis(load.getPointer(), reductionAxis)
+               : valueDependsOnAxis(operand, reductionAxis);
+      operandFacts.feedsPrimitive =
+          !load || valueDependsOn(operand, load.getResult());
+      operandFacts.addressDependsOnAccumulator =
+          load ? valueDependsOn(load.getPointer(), accumulator)
+               : valueDependsOn(operand, accumulator);
+      operandFacts.predicateDependsOnAccumulator =
+          load && valueDependsOn(load.getWhere(), accumulator);
+      auto value = kernelFacts.values.find(operand);
+      if (value != kernelFacts.values.end()) {
+        operandFacts.consumerCount = value->second.consumers.size();
+        operandFacts.crossesControl =
+            value->second.crossesRegion || value->second.controlCarried;
+      }
+      facts.operands.push_back(operandFacts);
+    }
+    auto resultFacts = kernelFacts.values.find(result);
+    if (resultFacts != kernelFacts.values.end()) {
+      facts.resultConsumerCount = resultFacts->second.consumers.size();
+      facts.resultCrossesControl = resultFacts->second.crossesRegion ||
+                                  resultFacts->second.controlCarried;
     }
     return facts;
   }
@@ -6088,10 +6227,9 @@ private:
       }
     }
     F32DotCandidateFacts candidateFacts;
-    candidateFacts.pipeline = analyzeLocalPipelineDependences(
-        {analysis->lhsLoad, analysis->rhsLoad},
+    candidateFacts.schedule = analyzeLocalScheduleDependences(
         {dot.getLhs(), dot.getRhs()}, reductionCoordinate,
-        dot.getInit());
+        dot.getInit(), dot.getResult());
     candidateFacts.reductionExtent = reduction->staticExtent;
     reductionConstraint->allowLane = true;
     reductionConstraint->requireLane = true;
@@ -6116,6 +6254,7 @@ private:
       return mlir::failure();
     }
     decision.mapping = physical->mapping;
+    decision.schedule = physical->schedule;
     RVVVectorShape computeShape = physical->mapping.laneShape;
     for (mlir::Value value :
          {dot.getLhs(), dot.getRhs(), dot.getInit(), dot.getResult()})
@@ -6178,14 +6317,26 @@ private:
         findAxisMapping(decision.mapping, decision.rowMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
         findAxisMapping(decision.mapping, decision.reductionMappingAxis);
-    if (!lmul || resultShape->shape.sew != 32 ||
+    if (!lmul || !decision.schedule ||
+        decision.schedule.iterationAxis !=
+            std::optional<unsigned>(decision.reductionMappingAxis) ||
+        resultShape->shape.sew != 32 ||
         resultShape->shape != decision.mapping.laneShape || !rowMapping ||
         !kAxis || rowMapping->role != LogicalAxisRole::Free ||
-        rowMapping->registerFactor == 0 || kAxis->unrollFactor == 0)
+        rowMapping->registerFactor == 0 || kAxis->unrollFactor == 0 ||
+        decision.schedule.accumulatorCount != rowMapping->registerFactor ||
+        decision.schedule.unrollFactor != kAxis->unrollFactor ||
+        decision.schedule.pipeline.bufferCount !=
+            decision.mapping.pipeline.bufferCount ||
+        decision.schedule.operands.size() != 2 ||
+        decision.schedule.operands[0].memoryMode !=
+            decision.lhs.reductionMemoryMode ||
+        decision.schedule.operands[1].memoryMode !=
+            decision.rhs.reductionMemoryMode)
       return dot.emitError("local f32 dot value shape is unavailable");
-    const unsigned rowMicrotile = rowMapping->registerFactor;
-    const unsigned kUnroll = kAxis->unrollFactor;
-    const unsigned loadBuffers = decision.mapping.pipeline.bufferCount;
+    const unsigned rowMicrotile = decision.schedule.accumulatorCount;
+    const unsigned kUnroll = decision.schedule.unrollFactor;
+    const unsigned loadBuffers = decision.schedule.pipeline.bufferCount;
     if (loadBuffers == 0 || loadBuffers > kUnroll)
       return dot.emitError("local f32 dot pipeline mapping is unavailable");
     std::string fullVL = fresh("dot_vlmax");
@@ -6335,6 +6486,23 @@ private:
         emitAccumulateChunk(loaded);
         return mlir::success();
       };
+      auto emitScheduledChunks = [&](const auto &coordinateAt)
+          -> mlir::LogicalResult {
+        llvm::SmallVector<LoadedChunk, 4> banks(loadBuffers);
+        for (const LocalPipelineAction &action :
+             decision.schedule.pipeline.actions) {
+          if (action.iteration >= kUnroll || action.buffer >= loadBuffers)
+            return dot.emitError("local f32 dot pipeline action is invalid");
+          if (action.kind == LocalPipelineActionKind::Load) {
+            if (mlir::failed(emitLoadChunk(coordinateAt(action.iteration),
+                                           banks[action.buffer])))
+              return mlir::failure();
+          } else {
+            emitAccumulateChunk(banks[action.buffer]);
+          }
+        }
+        return mlir::success();
+      };
       line("for (size_t " + strip + " = 0; " + strip + " < " + extent +
            ";) {");
       ++indent;
@@ -6342,7 +6510,8 @@ private:
         line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
              std::to_string(*lmul) + "(" + extent + " - " + strip +
              ");");
-        if (mlir::failed(emitChunk(strip)))
+        if (mlir::failed(emitScheduledChunks(
+                [&](unsigned) { return strip; })))
           return mlir::failure();
         line(strip + " += " + vl + ";");
       } else {
@@ -6361,26 +6530,8 @@ private:
                      : "(" + strip + " + " + std::to_string(unroll) +
                            " * " + vl + ")";
         };
-        if (loadBuffers == 1) {
-          for (unsigned unroll = 0; unroll < kUnroll; ++unroll)
-            if (mlir::failed(emitChunk(coordinate(unroll))))
-              return mlir::failure();
-        } else {
-          llvm::SmallVector<LoadedChunk, 4> banks(loadBuffers);
-          const unsigned preload = loadBuffers - 1;
-          for (unsigned stage = 0; stage < preload; ++stage)
-            if (mlir::failed(
-                    emitLoadChunk(coordinate(stage), banks[stage])))
-              return mlir::failure();
-          for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
-            const unsigned next = unroll + preload;
-            if (next < kUnroll &&
-                mlir::failed(emitLoadChunk(
-                    coordinate(next), banks[next % loadBuffers])))
-              return mlir::failure();
-            emitAccumulateChunk(banks[unroll % loadBuffers]);
-          }
-        }
+        if (mlir::failed(emitScheduledChunks(coordinate)))
+          return mlir::failure();
         line(strip + " += " + std::to_string(kUnroll) + " * " + vl +
              ";");
         --indent;
@@ -6490,6 +6641,37 @@ private:
               "indexed VLA load physical handoff is incomplete");
       }
       unsigned elementSEW = decision->elementShape.sew;
+      std::string indexedByteOffsetSpelling;
+      if (decision->memoryMode == PhysicalMemoryMode::Indexed) {
+        std::optional<unsigned> indexLMUL =
+            rvvIntegerLMUL(decision->indexedShape);
+        if (!decision->indexedOffsetEmission ||
+            decision->indexedOffsetReuseCount == 0 ||
+            (decision->indexedShape.sew != 32 &&
+             decision->indexedShape.sew != 64) ||
+            !indexLMUL)
+          return op.emitError("indexed VLA load has no address schedule");
+        auto scheduled =
+            indexedByteOffsets.find(decision->indexedOffsetEmission);
+        if (scheduled == indexedByteOffsets.end()) {
+          if (decision->indexedOffsetEmission != op.getOperation())
+            return op.emitError(
+                "indexed VLA load address schedule has no dominating emission");
+          std::string indexWidth =
+              std::to_string(decision->indexedShape.sew);
+          indexedByteOffsetSpelling = fresh("byte_offsets");
+          line("vuint" + indexWidth + "m" + std::to_string(*indexLMUL) +
+               "_t " + indexedByteOffsetSpelling + " = __riscv_vmul_vx_u" +
+               indexWidth + "m" + std::to_string(*indexLMUL) + "(" +
+               indexedOffset.spelling + ", (uint" + indexWidth + "_t)" +
+               std::to_string(decision->elementBytes) + ", " + activeVL +
+               ");");
+          indexedByteOffsets[decision->indexedOffsetEmission] =
+              indexedByteOffsetSpelling;
+        } else {
+          indexedByteOffsetSpelling = scheduled->second;
+        }
+      }
       if (decision->memoryMode == PhysicalMemoryMode::Segment2) {
         const VLASegment2Decision *segment =
             findSegment2AccessDecision(op.getOperation());
@@ -6560,24 +6742,10 @@ private:
                ", (ptrdiff_t)(sizeof(" + cType +
                ") * (" + *selectedLaneStride + ")), " + activeVL + ");");
         } else if (decision->memoryMode == PhysicalMemoryMode::Indexed) {
-          std::optional<unsigned> indexLMUL =
-              rvvIntegerLMUL(decision->indexedShape);
-          if ((decision->indexedShape.sew != 32 &&
-               decision->indexedShape.sew != 64) ||
-              !indexLMUL)
-            return false;
           std::string indexWidth = std::to_string(decision->indexedShape.sew);
-          std::string offsets = fresh("byte_offsets");
-          std::string indexSuffix =
-              "u" + indexWidth + "m" + std::to_string(*indexLMUL);
-          line("vuint" + indexWidth + "m" +
-               std::to_string(*indexLMUL) + "_t " +
-               offsets + " = __riscv_vmul_vx_" + indexSuffix + "(" +
-               indexedOffset.spelling + ", (uint" + indexWidth + "_t)" +
-               std::to_string(decision->elementBytes) + ", " + activeVL +
-               ");");
           line(name + " = __riscv_vluxei" + indexWidth + "_v_" + suffix + "(" +
-               pointer.spelling + ", " + offsets + ", " + activeVL + ");");
+               pointer.spelling + ", " + indexedByteOffsetSpelling + ", " +
+               activeVL + ");");
         } else {
           return false;
         }
@@ -6623,24 +6791,12 @@ private:
                       pointer.spelling + ", (ptrdiff_t)(sizeof(" + cType +
                       ") * (" + *selectedLaneStride + ")), " + activeVL;
         } else {
-          std::optional<unsigned> indexLMUL =
-              rvvIntegerLMUL(decision->indexedShape);
-          if ((decision->indexedShape.sew != 32 &&
-               decision->indexedShape.sew != 64) ||
-              !indexLMUL)
-            return op.emitError("masked indexed load has no physical index shape");
           std::string indexWidth = std::to_string(decision->indexedShape.sew);
-          std::string offsets = fresh("byte_offsets");
-          line("vuint" + indexWidth + "m" + std::to_string(*indexLMUL) +
-               "_t " + offsets + " = __riscv_vmul_vx_u" + indexWidth + "m" +
-               std::to_string(*indexLMUL) + "(" + indexedOffset.spelling +
-               ", (uint" + indexWidth + "_t)" +
-               std::to_string(decision->elementBytes) + ", " + activeVL +
-               ");");
           intrinsic = "__riscv_vluxei" + indexWidth + "_v_" + suffix +
                       "_tumu";
           arguments = predicate.spelling + ", " + name + ", " +
-                      pointer.spelling + ", " + offsets + ", " + activeVL;
+                      pointer.spelling + ", " + indexedByteOffsetSpelling +
+                      ", " + activeVL;
         }
         line(name + " = " + intrinsic + "(" + arguments + ");");
         if (carriesLogicalValidity)
@@ -9420,10 +9576,9 @@ private:
     candidateFacts.lhsFreeAxis = projectedLHSFree->physicalAxis;
     candidateFacts.rhsFreeAxis = projectedRHSFree->physicalAxis;
     candidateFacts.reductionAxis = projectedReduction->physicalAxis;
-    candidateFacts.pipeline = analyzeLocalPipelineDependences(
-        {analysis->lhsLoad, analysis->rhsLoad},
+    candidateFacts.schedule = analyzeLocalScheduleDependences(
         {matmul.getLhs(), matmul.getRhs()},
-        reductionCoordinate, matmul.getInit());
+        reductionCoordinate, matmul.getInit(), matmul.getResult());
     candidateFacts.nLaneStrided =
         rhsFree->rhsRelation == LaneRelation::Strided;
     std::optional<SelectedF16MatmulPhysical> selected =
@@ -9435,6 +9590,7 @@ private:
     if (!computeShape)
       return std::nullopt;
     decision.mapping = selected->mapping;
+    decision.schedule = selected->schedule;
     std::optional<PhysicalStorageDecision> resultStorage =
         deriveMaterializedBlockStorage(matmul.getResult(), matmul.getInit(), 16);
     llvm::SmallVector<int64_t, 2> expectedResultAxes = {
@@ -9475,10 +9631,15 @@ private:
         findAxisMapping(decision.mapping, decision.reductionMappingAxis);
     if (decision.mapping.laneAxis !=
             std::optional<unsigned>(decision.rhsFreeMappingAxis) ||
+        !decision.schedule ||
+        decision.schedule.iterationAxis !=
+            std::optional<unsigned>(decision.reductionMappingAxis) ||
         !mAxis || !nAxis ||
         !kAxis || nAxis->laneFactor == 0 || nAxis->registerFactor != 1 ||
         kAxis->laneFactor != 1 || kAxis->unrollFactor == 0 ||
-        decision.mapping.pipeline.bufferCount != 1 ||
+        decision.schedule.accumulatorCount != mAxis->registerFactor ||
+        decision.schedule.unrollFactor != kAxis->unrollFactor ||
+        decision.schedule.pipeline.bufferCount != 1 ||
         resultStorage.strides.size() != 2 || resultStorage.strides[1] != 1)
       return op.emitError("F16 matmul column-lane mapping is incomplete");
     if (decision.rhsColumnMemoryMode == PhysicalMemoryMode::Strided &&
@@ -9510,8 +9671,8 @@ private:
       return spellAffineScalarExpression(*decision.rhsColumnStride, axes);
     };
 
-    const unsigned rowMicrotile = mAxis->registerFactor;
-    const unsigned kUnroll = kAxis->unrollFactor;
+    const unsigned rowMicrotile = decision.schedule.accumulatorCount;
+    const unsigned kUnroll = decision.schedule.unrollFactor;
     const std::string inputType =
         "vfloat16m" + std::to_string(inputLMUL) + "_t";
     const std::string accumulatorType =
@@ -9643,14 +9804,23 @@ private:
         findAxisMapping(decision.mapping, decision.rhsFreeMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
         findAxisMapping(decision.mapping, decision.reductionMappingAxis);
-    if (!mAxis || !nAxis || !kAxis || mAxis->registerFactor == 0 ||
+    if (!decision.schedule ||
+        decision.schedule.iterationAxis !=
+            std::optional<unsigned>(decision.reductionMappingAxis) ||
+        !mAxis || !nAxis || !kAxis || mAxis->registerFactor == 0 ||
         nAxis->registerFactor == 0 || kAxis->unrollFactor == 0 ||
-        decision.mapping.pipeline.bufferCount == 0)
+        decision.schedule.accumulatorCount !=
+            mAxis->registerFactor * nAxis->registerFactor ||
+        decision.schedule.unrollFactor != kAxis->unrollFactor ||
+        decision.schedule.pipeline.bufferCount !=
+            decision.mapping.pipeline.bufferCount ||
+        decision.schedule.pipeline.bufferCount == 0 ||
+        decision.schedule.operands.size() != 2)
       return op.emitError("F16 matmul axis mapping is incomplete");
     const unsigned rowMicrotile = mAxis->registerFactor;
     const unsigned columnMicrotile = nAxis->registerFactor;
-    const unsigned kUnroll = kAxis->unrollFactor;
-    const unsigned loadBufferCount = decision.mapping.pipeline.bufferCount;
+    const unsigned kUnroll = decision.schedule.unrollFactor;
+    const unsigned loadBufferCount = decision.schedule.pipeline.bufferCount;
     if (loadBufferCount > kUnroll)
       return op.emitError("F16 matmul pipeline mapping exceeds its K unroll");
     for (auto [value, kind] :
@@ -9842,8 +10012,7 @@ private:
           llvm::SmallVector<std::string> lhs;
           llvm::SmallVector<std::string> rhs;
         };
-        auto emitRegisterBufferedChunks = [&](llvm::StringRef base,
-                                               unsigned count)
+        auto emitRegisterBufferedChunks = [&](llvm::StringRef base)
             -> mlir::LogicalResult {
           llvm::SmallVector<RegisterLoadBank, 4> banks(loadBufferCount);
           const std::string inputType =
@@ -9909,17 +10078,18 @@ private:
               line("}");
             }
           };
-          const unsigned preload = loadBufferCount - 1;
-          for (unsigned stage = 0; stage < preload; ++stage)
-            if (mlir::failed(loadBank(stage, coordinateAt(base, stage))))
-              return mlir::failure();
-          for (unsigned step = 0; step < count; ++step) {
-            const unsigned next = step + preload;
-            if (next < count &&
-                mlir::failed(loadBank(next % loadBufferCount,
-                                      coordinateAt(base, next))))
-              return mlir::failure();
-            computeBank(step % loadBufferCount);
+          for (const LocalPipelineAction &action :
+               decision.schedule.pipeline.actions) {
+            if (action.iteration >= kUnroll ||
+                action.buffer >= loadBufferCount)
+              return op.emitError("F16 matmul pipeline action is invalid");
+            if (action.kind == LocalPipelineActionKind::Load) {
+              if (mlir::failed(loadBank(
+                      action.buffer, coordinateAt(base, action.iteration))))
+                return mlir::failure();
+            } else {
+              computeBank(action.buffer);
+            }
           }
           return mlir::success();
         };
@@ -9931,7 +10101,7 @@ private:
           line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
                std::to_string(*inputLMUL) + "(" + activeK.str() + " - " +
                reduction + ");");
-          if (mlir::failed(emitStreamedChunk(reduction)))
+          if (mlir::failed(emitRegisterBufferedChunks(reduction)))
             return mlir::failure();
           line(reduction + " += " + vl + ";");
         } else {
@@ -9944,16 +10114,8 @@ private:
           line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
                std::to_string(*inputLMUL) + "(" + remaining + " / " +
                std::to_string(kUnroll) + ");");
-          if (loadBufferCount > 1) {
-            if (mlir::failed(
-                    emitRegisterBufferedChunks(reduction, kUnroll)))
-              return mlir::failure();
-          } else {
-            for (unsigned unroll = 0; unroll < kUnroll; ++unroll)
-              if (mlir::failed(
-                      emitStreamedChunk(coordinateAt(reduction, unroll))))
-                return mlir::failure();
-          }
+          if (mlir::failed(emitRegisterBufferedChunks(reduction)))
+            return mlir::failure();
           line(reduction + " += " + std::to_string(kUnroll) +
                " * " + vl + ";");
           --indent;

@@ -6,10 +6,14 @@ namespace weft::riscv_internal {
 
 void emitPrelude(llvm::raw_ostream &output,
                  llvm::ArrayRef<RVVVectorShape> f32MathShapes,
-                 bool usesRVVSymmetricI4I8, bool usesRVVAffineI4I8,
-                 bool usesRVVSymmetricI4I8M4, bool usesRVVAffineI4I8M4,
-                 bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
-                 bool usesIME1SymmetricI4I8M4, bool usesIME1AffineI4I8M4,
+                 const std::optional<LocalMicrokernelSchedule> &rvvSymmetricI4I8,
+                 const std::optional<LocalMicrokernelSchedule> &rvvAffineI4I8,
+                 const std::optional<LocalMicrokernelSchedule> &rvvSymmetricI4I8M4,
+                 const std::optional<LocalMicrokernelSchedule> &rvvAffineI4I8M4,
+                 const std::optional<LocalMicrokernelSchedule> &ime1SymmetricI4I8,
+                 const std::optional<LocalMicrokernelSchedule> &ime1AffineI4I8,
+                 const std::optional<LocalMicrokernelSchedule> &ime1SymmetricI4I8M4,
+                 const std::optional<LocalMicrokernelSchedule> &ime1AffineI4I8M4,
                  bool usesGroupedI4I8RegisterL16,
                  bool usesGroupedI4I8RegisterL32,
                  bool usesGroupedI4I8Strip,
@@ -70,15 +74,13 @@ __weft_load_f16_le_aligned(const uint8_t *bytes) {
 
 )c";
   emitRVVLocalImplementations(
-      output, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
-      usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
+      output, rvvSymmetricI4I8, rvvAffineI4I8,
+      rvvSymmetricI4I8M4, rvvAffineI4I8M4,
       usesGroupedI4I8RegisterL16, usesGroupedI4I8RegisterL32,
       usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
       usesE2M1RegisterE8MF2, usesE2M1Strip);
-  emitIMELocalImplementations(output, usesIME1SymmetricI4I8,
-                              usesIME1AffineI4I8,
-                              usesIME1SymmetricI4I8M4,
-                              usesIME1AffineI4I8M4);
+  emitIMELocalImplementations(output, ime1SymmetricI4I8, ime1AffineI4I8,
+                              ime1SymmetricI4I8M4, ime1AffineI4I8M4);
   for (RVVVectorShape shape : f32MathShapes) {
     const std::string f32Suffix =
         rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, shape);
@@ -218,14 +220,14 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations,
                            std::string &unsupportedSymbol) {
   llvm::SmallVector<RVVVectorShape, 4> f32MathShapes;
-  bool usesRVVSymmetricI4I8 = false;
-  bool usesRVVAffineI4I8 = false;
-  bool usesRVVSymmetricI4I8M4 = false;
-  bool usesRVVAffineI4I8M4 = false;
-  bool usesIME1SymmetricI4I8 = false;
-  bool usesIME1AffineI4I8 = false;
-  bool usesIME1SymmetricI4I8M4 = false;
-  bool usesIME1AffineI4I8M4 = false;
+  std::optional<LocalMicrokernelSchedule> rvvSymmetricI4I8;
+  std::optional<LocalMicrokernelSchedule> rvvAffineI4I8;
+  std::optional<LocalMicrokernelSchedule> rvvSymmetricI4I8M4;
+  std::optional<LocalMicrokernelSchedule> rvvAffineI4I8M4;
+  std::optional<LocalMicrokernelSchedule> ime1SymmetricI4I8;
+  std::optional<LocalMicrokernelSchedule> ime1AffineI4I8;
+  std::optional<LocalMicrokernelSchedule> ime1SymmetricI4I8M4;
+  std::optional<LocalMicrokernelSchedule> ime1AffineI4I8M4;
   bool usesGroupedI4I8RegisterL16 = false;
   bool usesGroupedI4I8RegisterL32 = false;
   bool usesGroupedI4I8Strip = false;
@@ -233,6 +235,18 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
   bool usesE2M1RegisterE8MF2 = false;
   bool usesE2M1Strip = false;
   bool supported = true;
+  auto recordSchedule = [&](std::optional<LocalMicrokernelSchedule> &slot,
+                            const LocalMicrokernelSchedule &schedule) {
+    if (!schedule || schedule.decode.chunksPerStep == 0) {
+      supported = false;
+      return;
+    }
+    if (slot && !(*slot == schedule)) {
+      supported = false;
+      return;
+    }
+    slot = schedule;
+  };
   implementations.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
       return;
@@ -258,27 +272,29 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
       return;
     }
     const LocalHardwareOperation &operation = implementation.operation;
-    const unsigned lanes = mappedLaneSpan(implementation.mapping);
-    const PhysicalAxisDecomposition *reduction =
-        findUniqueAxisMapping(implementation.mapping,
-                              LogicalAxisRole::Reduction);
-    const bool sequential = reduction && reduction->sequentialFactor > 1;
+    const unsigned lanes = implementation.schedule.iterationElements;
+    const bool sequential =
+        implementation.schedule.sequentialIterations > 1;
     if (implementation.primitive == LocalPrimitiveKind::SymmetricI4I8) {
       if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
-        (operation.rows == 4 ? usesIME1SymmetricI4I8M4
-                             : usesIME1SymmetricI4I8) = true;
+        recordSchedule(operation.rows == 4 ? ime1SymmetricI4I8M4
+                                           : ime1SymmetricI4I8,
+                       implementation.schedule);
       else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic)
-        (operation.rows == 4 ? usesRVVSymmetricI4I8M4
-                             : usesRVVSymmetricI4I8) = true;
+        recordSchedule(operation.rows == 4 ? rvvSymmetricI4I8M4
+                                           : rvvSymmetricI4I8,
+                       implementation.schedule);
       else
         supported = false;
     } else if (implementation.primitive == LocalPrimitiveKind::AffineI4I8) {
       if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
-        (operation.rows == 4 ? usesIME1AffineI4I8M4
-                             : usesIME1AffineI4I8) = true;
+        recordSchedule(operation.rows == 4 ? ime1AffineI4I8M4
+                                           : ime1AffineI4I8,
+                       implementation.schedule);
       else if (operation.kind == LocalHardwareOperationKind::RVVIntrinsic)
-        (operation.rows == 4 ? usesRVVAffineI4I8M4
-                             : usesRVVAffineI4I8) = true;
+        recordSchedule(operation.rows == 4 ? rvvAffineI4I8M4
+                                           : rvvAffineI4I8,
+                       implementation.schedule);
       else
         supported = false;
     } else if (implementation.primitive ==
@@ -313,11 +329,10 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
   });
   if (!supported)
     return false;
-  emitPrelude(output, f32MathShapes, usesRVVSymmetricI4I8,
-              usesRVVAffineI4I8,
-              usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
-              usesIME1SymmetricI4I8, usesIME1AffineI4I8,
-              usesIME1SymmetricI4I8M4, usesIME1AffineI4I8M4,
+  emitPrelude(output, f32MathShapes, rvvSymmetricI4I8,
+              rvvAffineI4I8, rvvSymmetricI4I8M4, rvvAffineI4I8M4,
+              ime1SymmetricI4I8, ime1AffineI4I8, ime1SymmetricI4I8M4,
+              ime1AffineI4I8M4,
               usesGroupedI4I8RegisterL16, usesGroupedI4I8RegisterL32,
               usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
               usesE2M1RegisterE8MF2, usesE2M1Strip);

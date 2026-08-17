@@ -367,14 +367,6 @@ findUniqueAxisMapping(const CorePhysicalMapping &mapping,
   return result;
 }
 
-unsigned mappedLaneSpan(const CorePhysicalMapping &mapping) {
-  if (!mapping.laneAxis)
-    return 0;
-  const PhysicalAxisDecomposition *axis =
-      findAxisMapping(mapping, *mapping.laneAxis);
-  return axis ? axis->laneFactor * axis->registerFactor : 0;
-}
-
 std::optional<PhysicalResourceBudget>
 calculatePhysicalResources(const PhysicalResourceRequirements &requirements,
                            const RISCVTargetProfile &target) {

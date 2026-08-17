@@ -11,10 +11,8 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
   if (implementation.primitive != LocalPrimitiveKind::IQ2SI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 6)
+      implementation.valueShapes.size() < 6 || !implementation.schedule)
     return false;
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape indexShape = implementation.valueShapes[1];
   const RVVVectorShape tableShape = implementation.valueShapes[2];
@@ -51,7 +49,7 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
       RVVElementCategory::SignedInteger, segmentProductShape);
   const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
   std::optional<unsigned> maskRatio = rvvMaskRatio(laneShape);
-  if (!reduction || laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
+  if (laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
       laneSignedType.empty() || laneSignedSuffix.empty() || indexType.empty() ||
       indexSuffix.empty() || tableType.empty() || tableSuffix.empty() ||
       signType.empty() || signSuffix.empty() || productType.empty() ||
@@ -59,9 +57,12 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
       segmentProductSuffix.empty() || laneSetVL.empty() || !maskRatio)
     return false;
 
-  const unsigned groupsPerVector = reduction->laneFactor / 32;
-  const unsigned vectorCount = 4 * groupsPerVector;
-  const unsigned segmentCount = 2 * groupsPerVector;
+  const unsigned groupsPerVector =
+      implementation.schedule.decode.groupsPerChunk;
+  const unsigned vectorCount =
+      implementation.schedule.decode.chunksPerStep;
+  const unsigned segmentCount =
+      implementation.schedule.decode.reductionSegments;
   output << "static inline __attribute__((always_inline, unused)) float\n"
          << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *high_bits,\n"
@@ -71,7 +72,7 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
          << "  const int8_t *activation = "
             "(const int8_t *)(const void *)activation_bytes;\n"
          << "  const size_t vl = " << laneSetVL << "("
-         << reduction->laneFactor << ");\n"
+         << implementation.schedule.laneFactor << ");\n"
          << "  const " << laneUnsignedType << " lane = __riscv_vid_v_"
          << laneUnsignedSuffix << "(vl);\n"
          << "  const " << laneUnsignedType
@@ -84,7 +85,7 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
          << "(lane, 7, vl), vl);\n"
          << "  int32_t integer_sum = 0;\n"
          << "  for (size_t batch = 0; batch < "
-         << reduction->sequentialFactor << "; ++batch) {\n"
+         << implementation.schedule.sequentialIterations << "; ++batch) {\n"
          << "    const size_t first_group = batch * " << groupsPerVector
          << ";\n"
          << "    uint16_t byte_offsets[" << vectorCount << "];\n"

@@ -25,7 +25,8 @@ void emitQ6KRVVAssembly(llvm::raw_ostream &output,
   int low_high;
   float temporary;
   float result = init;
-  for (size_t half = 0; half < 2; ++half) {
+  for (size_t half = 0; half < )c"
+         << implementation.schedule.decode.chunksPerStep << R"c(; ++half) {
     __asm__ volatile(
         "addi %[low_high], %[low], 32\n\t"
         "ld t0, 0(%[scale])\n\t"
@@ -132,7 +133,7 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
            LocalHardwareOperationKind::RVVInlineAsm &&
        implementation.operation.kind !=
            LocalHardwareOperationKind::RVVIntrinsic) ||
-      implementation.valueShapes.size() < 4)
+      implementation.valueShapes.size() < 4 || !implementation.schedule)
     return false;
   if (implementation.operation.kind ==
       LocalHardwareOperationKind::RVVInlineAsm) {
@@ -143,8 +144,6 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
       LocalHardwareOperationKind::RVVIntrinsic)
     return false;
 
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape chunkShape = implementation.valueShapes[1];
   const RVVVectorShape productShape = implementation.valueShapes[2];
@@ -169,15 +168,17 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
       RVVElementCategory::SignedInteger, segmentProductShape);
   const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
   const std::string chunkSetVL = rvvSetVLIntrinsic(chunkShape);
-  if (!reduction || laneType.empty() || laneSuffix.empty() ||
+  if (laneType.empty() || laneSuffix.empty() ||
       chunkUnsignedType.empty() || chunkUnsignedSuffix.empty() ||
       chunkSignedType.empty() || chunkSignedSuffix.empty() ||
       productType.empty() || productSuffix.empty() ||
       segmentProductSuffix.empty() || laneSetVL.empty() || chunkSetVL.empty())
     return false;
 
-  const unsigned chunksPerVector = reduction->laneFactor / 32;
-  const unsigned segmentCount = reduction->laneFactor / 16;
+  const unsigned chunksPerVector =
+      implementation.schedule.decode.chunksPerStep;
+  const unsigned segmentCount =
+      implementation.schedule.decode.reductionSegments;
   output << "static inline __attribute__((always_inline, unused)) float\n"
          << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *low_bits, const uint8_t *high_bits,\n"
@@ -190,10 +191,10 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
          << "      (const int8_t *)(const void *)activation_bytes;\n"
          << "  const size_t chunk_vl = " << chunkSetVL << "(32);\n"
          << "  const size_t vl = " << laneSetVL << "("
-         << reduction->laneFactor << ");\n"
+         << implementation.schedule.laneFactor << ");\n"
          << "  int32_t integer_sum = 0;\n"
          << "  for (size_t batch = 0; batch < "
-         << reduction->sequentialFactor << "; ++batch) {\n";
+         << implementation.schedule.sequentialIterations << "; ++batch) {\n";
   for (unsigned chunk = 0; chunk < chunksPerVector; ++chunk) {
     output << "    const size_t logical_chunk" << chunk << " = batch * "
            << chunksPerVector << " + " << chunk << ";\n"

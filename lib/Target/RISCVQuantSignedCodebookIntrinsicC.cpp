@@ -16,7 +16,7 @@ bool emitSignedCodebookLocalImplementation(
            LocalOperationProjection::SignSourceDirect &&
        implementation.operation.projection !=
            LocalOperationProjection::SignSourceExtend) ||
-      implementation.valueShapes.size() < 7)
+      implementation.valueShapes.size() < 7 || !implementation.schedule)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -25,7 +25,7 @@ bool emitSignedCodebookLocalImplementation(
   const RVVVectorShape productShape = implementation.valueShapes[4];
   const RVVVectorShape signSourceShape = implementation.valueShapes[5];
   const RVVVectorShape signWordShape = implementation.valueShapes[6];
-  const unsigned codeCount = 32 / implementation.entryWidth;
+  const unsigned codeCount = implementation.schedule.decode.chunksPerStep;
   const unsigned offsetShift = implementation.entryWidth == 8 ? 3 : 2;
 
   const std::string codeType =
@@ -151,7 +151,7 @@ bool emitPackedU9U7CodebookLocalImplementation(
            LocalOperationProjection::SignSourceDirect &&
        implementation.operation.projection !=
            LocalOperationProjection::SignSourceExtend) ||
-      implementation.valueShapes.size() < 8)
+      implementation.valueShapes.size() < 8 || !implementation.schedule)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape wordShape = implementation.valueShapes[2];
@@ -210,7 +210,8 @@ bool emitPackedU9U7CodebookLocalImplementation(
          << "    const uint8_t *packed_codes, uint8_t scale_byte,\n"
          << "    const uint8_t *activation_bytes, const uint8_t *grid_table,\n"
          << "    const uint8_t *sign_table, float dot_scale, float init) {\n"
-         << "  const size_t code_count = 4;\n"
+         << "  const size_t code_count = "
+         << implementation.schedule.decode.chunksPerStep << ";\n"
          << "  const size_t vl16 = " << halfSetVL << "(16);\n"
          << "  const size_t vl32 = " << laneSetVL << "(32);\n"
          << "  const " << wordType << " words = __riscv_vle16_v_"
@@ -298,7 +299,7 @@ bool emitPackedU11GridDeltaLocalImplementation(
           LocalPrimitiveKind::PackedU11GridDeltaI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 5)
+      implementation.valueShapes.size() < 5 || !implementation.schedule)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -340,7 +341,8 @@ bool emitPackedU11GridDeltaLocalImplementation(
          << "    const uint8_t *codes, uint16_t metadata,\n"
          << "    const uint8_t *activation_bytes, const uint8_t *grid_table,\n"
          << "    int32_t activation_sum, float dot_scale, float init) {\n"
-         << "  const size_t code_count = 4;\n"
+         << "  const size_t code_count = "
+         << implementation.schedule.decode.chunksPerStep << ";\n"
          << "  const size_t vl32 = " << laneSetVL << "(32);\n"
          << "  const " << codeType << " code8 = __riscv_vle8_v_"
          << codeSuffix << "(codes, code_count);\n"

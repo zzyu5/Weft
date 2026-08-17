@@ -31,10 +31,10 @@ private:
 };
 
 void emitRVVLocalImplementations(llvm::raw_ostream &output,
-                                 bool usesRVVSymmetricI4I8,
-                                 bool usesRVVAffineI4I8,
-                                 bool usesRVVSymmetricI4I8M4,
-                                 bool usesRVVAffineI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8M4,
                                  bool usesGroupedI4I8RegisterL16,
                                  bool usesGroupedI4I8RegisterL32,
                                  bool usesGroupedI4I8Strip,
@@ -46,10 +46,10 @@ bool emitQuantLocalImplementations(
     const SelectedLocalImplementations &implementations,
     std::string &unsupportedSymbol);
 void emitIMELocalImplementations(llvm::raw_ostream &output,
-                                 bool usesIME1SymmetricI4I8,
-                                 bool usesIME1AffineI4I8,
-                                 bool usesIME1SymmetricI4I8M4,
-                                 bool usesIME1AffineI4I8M4);
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8,
+    const std::optional<LocalMicrokernelSchedule> &symmetricI4I8M4,
+    const std::optional<LocalMicrokernelSchedule> &affineI4I8M4);
 bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations,
                            std::string &unsupportedSymbol);

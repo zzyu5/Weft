@@ -11,10 +11,9 @@ bool emitPackedI3GroupedLocalImplementation(
   if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
       implementation.operation.kind !=
           LocalHardwareOperationKind::RVVIntrinsic ||
-      implementation.valueShapes.size() < 3)
+      implementation.valueShapes.size() < 3 || !implementation.schedule ||
+      implementation.schedule.decode.chunksPerStep != 3)
     return false;
-  const PhysicalAxisDecomposition *reduction =
-      findUniqueAxisMapping(implementation.mapping, LogicalAxisRole::Reduction);
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape productShape = implementation.valueShapes[1];
   const RVVVectorShape segmentProductShape = implementation.valueShapes[2];
@@ -34,15 +33,16 @@ bool emitPackedI3GroupedLocalImplementation(
       RVVElementCategory::SignedInteger, segmentProductShape);
   const std::string laneSetVL = rvvSetVLIntrinsic(laneShape);
   std::optional<unsigned> maskRatio = rvvMaskRatio(laneShape);
-  if (!reduction || laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
+  if (laneUnsignedType.empty() || laneUnsignedSuffix.empty() ||
       laneSignedType.empty() || laneSignedSuffix.empty() || productType.empty() ||
       productSuffix.empty() || segmentProductSuffix.empty() ||
       laneSetVL.empty() || !maskRatio)
     return false;
 
-  const unsigned groupsPerVector = reduction->laneFactor / 16;
+  const unsigned groupsPerVector =
+      implementation.schedule.decode.groupsPerChunk;
   const unsigned groupsPerIteration =
-      groupsPerVector * reduction->registerFactor;
+      groupsPerVector * implementation.schedule.iterationRegisterFactor;
   output << R"c(static inline __attribute__((always_inline, unused)) int32_t
 __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
   const size_t quarter = group / 4;
@@ -61,15 +61,17 @@ __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
          << "    const uint8_t *scales, const uint8_t *activation_bytes,\n"
          << "    float weight_scale, float activation_scale, float init) {\n"
          << "  const size_t vl = " << laneSetVL << "("
-         << reduction->laneFactor << ");\n"
+         << implementation.schedule.laneFactor << ");\n"
          << "  int32_t integer_sum = 0;\n"
-         << "#pragma GCC unroll " << reduction->sequentialFactor << "\n"
+         << "#pragma GCC unroll "
+         << implementation.schedule.sequentialIterations << "\n"
          << "  for (size_t batch = 0; batch < "
-         << reduction->sequentialFactor << "; ++batch) {\n"
+         << implementation.schedule.sequentialIterations << "; ++batch) {\n"
          << "    const size_t first_iteration_group = batch * "
          << groupsPerIteration << ";\n"
          << "    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n";
-  for (unsigned repeat = 0; repeat < reduction->registerFactor; ++repeat) {
+  for (unsigned repeat = 0;
+       repeat < implementation.schedule.iterationRegisterFactor; ++repeat) {
     output << "    {\n"
            << "      const size_t first_group = first_iteration_group + "
            << repeat * groupsPerVector << ";\n"
