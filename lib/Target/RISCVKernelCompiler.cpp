@@ -598,6 +598,7 @@ struct DotDecision {
   LocalDotOperandDecision lhs;
   LocalDotOperandDecision rhs;
   mlir::Value rowAxis;
+  unsigned rowMappingAxis = kCoreAxisM;
   mlir::Value reductionAxis;
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
@@ -6064,6 +6065,7 @@ private:
             : PhysicalMemoryMode::Strided,
         analysis->rhsReductionStride};
     decision.rowAxis = rowAxis.getResult();
+    decision.rowMappingAxis = freeOnLHS ? kCoreAxisM : kCoreAxisN;
     decision.reductionAxis = analysis->reductionAxis.getResult();
     decision.reductionExtent = analysis->reductionAxis.getExtent();
     decision.rowTile = freeOnLHS ? analysis->lhsFreeExtent
@@ -6086,16 +6088,7 @@ private:
         {analysis->lhsLoad, analysis->rhsLoad},
         {dot.getInit(), dot.getResult()});
     candidateFacts.reductionExtent = analysis->reductionExtent;
-    candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{
-            kCoreAxisM, LogicalAxisRole::Free, decision.rowTile, false, false,
-            false,
-            registerFactorCandidates(decision.rowTile,
-                                     std::min(decision.rowTile, 8u))},
-        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                              analysis->reductionExtent, false, true, true,
-                              {1}}};
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
+    candidateFacts.mapping = analysis->mapping;
     if (freeOnLHS) {
       candidateFacts.lhsAxes = {kCoreAxisM, kCoreAxisK};
       candidateFacts.rhsAxes = {kCoreAxisK};
@@ -6176,15 +6169,16 @@ private:
         resultStorage->reusedStorage)
       return dot.emitError("local f32 dot result storage is incomplete");
     std::optional<unsigned> lmul = rvvIntegerLMUL(resultShape->shape);
-    const PhysicalAxisDecomposition *mAxis =
-        findAxisMapping(decision.mapping, kCoreAxisM);
+    const PhysicalAxisDecomposition *rowMapping =
+        findAxisMapping(decision.mapping, decision.rowMappingAxis);
     const PhysicalAxisDecomposition *kAxis =
         findAxisMapping(decision.mapping, kCoreAxisK);
     if (!lmul || resultShape->shape.sew != 32 ||
-        resultShape->shape != decision.mapping.laneShape || !mAxis || !kAxis ||
-        mAxis->registerFactor == 0 || kAxis->unrollFactor == 0)
+        resultShape->shape != decision.mapping.laneShape || !rowMapping ||
+        !kAxis || rowMapping->role != LogicalAxisRole::Free ||
+        rowMapping->registerFactor == 0 || kAxis->unrollFactor == 0)
       return dot.emitError("local f32 dot value shape is unavailable");
-    const unsigned rowMicrotile = mAxis->registerFactor;
+    const unsigned rowMicrotile = rowMapping->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
     const unsigned loadBuffers = decision.mapping.pipeline.bufferCount;
     if (loadBuffers == 0 || loadBuffers > kUnroll)
