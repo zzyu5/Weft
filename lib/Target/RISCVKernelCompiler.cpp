@@ -2801,7 +2801,9 @@ private:
                  (source.isIndex() && result.isF32());
         });
     VLAEntityCandidateFacts candidateFacts;
-    candidateFacts.hasNarrow = !decision.narrows.empty();
+    for (const VLANarrowDecision &narrow : decision.narrows)
+      candidateFacts.narrowOperationOrdinals.push_back(
+          kernelFacts.operationOrdinals.lookup(narrow.operation));
     candidateFacts.lifetimes = lifetimeSnapshots;
     candidateFacts.hasIndexVector =
         !decision.indexBinaries.empty() || !decision.indexSelects.empty() ||
@@ -2841,16 +2843,23 @@ private:
       candidateFacts.accessElementSEWs.push_back(elementSEW);
       if (access.memoryMode == PhysicalMemoryMode::Indexed) {
         candidateFacts.indexedMemory.push_back(
-            VLAIndexedMemoryFact{elementSEW, access.indexedSEW});
+            VLAIndexedMemoryFact{
+                kernelFacts.operationOrdinals.lookup(access.operation),
+                elementSEW, access.indexedSEW});
       }
     }
     for (const VLASegment2Decision &segment : decision.segment2)
       candidateFacts.segmentMemory.push_back(VLASegmentMemoryFact{
+          kernelFacts.operationOrdinals.lookup(segment.emission),
           segment.kind == VLASegment2AccessKind::Store, segment.fields,
           segment.elementSEW});
-    candidateFacts.lookupCount = decision.lookups.size();
+    for (const VLALookupDecision &lookup : decision.lookups)
+      candidateFacts.lookupOperationOrdinals.push_back(
+          kernelFacts.operationOrdinals.lookup(lookup.operation));
     for (const VLAStateDecision &state : decision.states)
-      candidateFacts.stateCandidates.push_back(state.candidates);
+      candidateFacts.stateCandidates.push_back(VLAStateCandidateSet{
+          kernelFacts.operationOrdinals.lookup(state.operation),
+          state.candidates});
     candidateFacts.dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
     candidateFacts.mapping.axes = {
@@ -2874,7 +2883,9 @@ private:
       if (mlir::failed(requireDataShape(dot.mapping.laneShape, dot.operation)))
         return mlir::failure();
       candidateFacts.localPrimitiveRequirements.push_back(
-          dot.resourceRequirements);
+          VLALocalPrimitiveResourceFact{
+              kernelFacts.operationOrdinals.lookup(dot.operation),
+              dot.resourceRequirements});
     }
     if (options.backend.parameters.vlaLMUL != 0)
       candidateFacts.requiredLMULs.push_back(
@@ -7243,15 +7254,21 @@ private:
   vlaValueLifetimeSnapshots(VLAOp owner) const {
     mlir::Value coordinate = owner.getBody().front().getArgument(0);
     llvm::SmallVector<VLAValueLifetimeSnapshot> snapshots;
-    std::function<void(mlir::Block &)> analyzeBlock =
-        [&](mlir::Block &block) {
+    auto addLiveValues = [](VLAValueLifetimeSnapshot &target,
+                            const VLAValueLifetimeSnapshot &source) {
+      target.f32 += source.f32;
+      target.f16 += source.f16;
+      target.index += source.index;
+      target.byte += source.byte;
+      target.u32 += source.u32;
+      target.mask += source.mask;
+    };
+    std::function<void(mlir::Block &, const VLAValueLifetimeSnapshot &)>
+        analyzeBlock = [&](mlir::Block &block,
+                           const VLAValueLifetimeSnapshot &inherited) {
       llvm::SmallVector<mlir::Operation *> operations;
       for (mlir::Operation &operation : block.without_terminator())
         operations.push_back(&operation);
-      for (mlir::Operation *operation : operations)
-        for (mlir::Region &region : operation->getRegions())
-          for (mlir::Block &nested : region)
-            analyzeBlock(nested);
       if (operations.empty())
         return;
 
@@ -7292,14 +7309,8 @@ private:
                                            : mlir::cast<mlir::BlockArgument>(
                                                  fact.value)
                                                  .getOwner();
-        if (definitionBlock != &block) {
-          mlir::Operation *nestedDefinition =
-              definition ? definition : definitionBlock->getParentOp();
-          while (nestedDefinition && nestedDefinition->getBlock() != &block)
-            nestedDefinition = nestedDefinition->getParentOp();
-          if (nestedDefinition)
-            continue;
-        }
+        if (definitionBlock != &block)
+          continue;
         unsigned begin = 0;
         bool participates = false;
         if (definitionBlock == &block) {
@@ -7352,9 +7363,18 @@ private:
           }
         }
       }
-      snapshots.append(blockSnapshots.begin(), blockSnapshots.end());
+      for (auto [position, operation] : llvm::enumerate(operations)) {
+        VLAValueLifetimeSnapshot snapshot = blockSnapshots[position];
+        addLiveValues(snapshot, inherited);
+        snapshot.operationOrdinal =
+            kernelFacts.operationOrdinals.lookup(operation);
+        snapshots.push_back(snapshot);
+        for (mlir::Region &region : operation->getRegions())
+          for (mlir::Block &nested : region)
+            analyzeBlock(nested, snapshot);
+      }
     };
-    analyzeBlock(owner.getBody().front());
+    analyzeBlock(owner.getBody().front(), {});
     return snapshots;
   }
 

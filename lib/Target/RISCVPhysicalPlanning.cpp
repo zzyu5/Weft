@@ -1265,12 +1265,12 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
   };
   using StateCombination = llvm::SmallVector<SelectedVLAStatePhysical, 4>;
   llvm::SmallVector<StateCombination, 8> stateCombinations(1);
-  for (const auto &stateCandidates : facts.stateCandidates) {
-    if (stateCandidates.empty())
+  for (const VLAStateCandidateSet &stateSet : facts.stateCandidates) {
+    if (stateSet.candidates.empty())
       return std::nullopt;
     llvm::SmallVector<StateCombination, 8> expanded;
     for (const StateCombination &combination : stateCombinations)
-      for (const SelectedVLAStatePhysical &state : stateCandidates) {
+      for (const SelectedVLAStatePhysical &state : stateSet.candidates) {
         StateCombination candidate = combination;
         candidate.push_back(state);
         expanded.push_back(std::move(candidate));
@@ -1425,6 +1425,28 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       }
       return true;
     };
+    auto applyOperationPhase = [&](unsigned operationOrdinal,
+                                   llvm::ArrayRef<PhysicalLiveRange> extra,
+                                   unsigned reservedGroups = 1) {
+      auto snapshot = llvm::find_if(
+          facts.lifetimes, [&](const VLAValueLifetimeSnapshot &candidate) {
+            return candidate.operationOrdinal == operationOrdinal;
+          });
+      if (snapshot == facts.lifetimes.end())
+        return false;
+      PhysicalResourceRequirements requirements;
+      requirements.reservedGroups = reservedGroups;
+      requirements.live.append(persistent.begin(), persistent.end());
+      requirements.live.append(extra.begin(), extra.end());
+      if (!appendSnapshot(requirements, *snapshot))
+        return false;
+      std::optional<PhysicalResourceBudget> budget =
+          calculatePhysicalResources(requirements, target);
+      if (!budget)
+        return false;
+      mergeBudget(*budget);
+      return true;
+    };
     if (!applyPhase({}))
       continue;
 
@@ -1435,10 +1457,10 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       std::optional<RVVVectorShape> offsetShape =
           selectElementShape(memory.offsetSEW);
       if (!elementShape || !offsetShape ||
-          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
-                                        *elementShape, 1, 0},
-                      PhysicalLiveRange{PhysicalLiveClass::Index,
-                                        *offsetShape, 1, 0}})) {
+          !applyOperationPhase(
+              memory.operationOrdinal,
+              {PhysicalLiveRange{PhysicalLiveClass::Memory, *elementShape, 1, 0},
+               PhysicalLiveRange{PhysicalLiveClass::Index, *offsetShape, 1, 0}})) {
         resourceLegal = false;
         break;
       }
@@ -1449,8 +1471,10 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       std::optional<RVVVectorShape> elementShape =
           selectElementShape(memory.elementSEW);
       if (!elementShape ||
-          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Memory,
-                                        *elementShape, memory.fields, 0}})) {
+          !applyOperationPhase(
+              memory.operationOrdinal,
+              {PhysicalLiveRange{PhysicalLiveClass::Memory, *elementShape,
+                                 memory.fields, 0}})) {
         resourceLegal = false;
         break;
       }
@@ -1459,7 +1483,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       continue;
 
     std::optional<VLANarrowPhysical> narrow;
-    if (facts.hasNarrow) {
+    if (!facts.narrowOperationOrdinals.empty()) {
       if (facts.dataSEW != 32)
         continue;
       std::optional<RVVVectorShape> intermediateShape =
@@ -1479,13 +1503,16 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
           {PhysicalLiveClass::Temporary, *resultShape, 1, 0}};
       std::optional<PhysicalResourceBudget> narrowResources =
           calculatePhysicalResources(narrowRequirements, target);
-      if (!narrowResources || !applyPhase(narrowRequirements.live))
+      if (!narrowResources ||
+          !llvm::all_of(facts.narrowOperationOrdinals, [&](unsigned ordinal) {
+            return applyOperationPhase(ordinal, narrowRequirements.live);
+          }))
         continue;
       selected.resources = *narrowResources;
       narrow = selected;
     }
 
-    for (const SelectedVLAStatePhysical &state : states) {
+    for (auto [stateIndex, state] : llvm::enumerate(states)) {
       llvm::SmallVector<PhysicalLiveRange, 6> transient;
       switch (state.stripUpdate) {
       case VLAStateStripUpdate::InclusiveAddScan:
@@ -1525,7 +1552,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
                      {PhysicalLiveClass::Temporary, state.seedShape, 4, 0}};
         break;
       }
-      if (!resourceLegal || !applyPhase(transient)) {
+      if (!resourceLegal ||
+          !applyOperationPhase(
+              facts.stateCandidates[stateIndex].operationOrdinal, transient)) {
         resourceLegal = false;
         break;
       }
@@ -1533,7 +1562,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     if (!resourceLegal)
       continue;
 
-    if (facts.lookupCount != 0) {
+    if (!facts.lookupOperationOrdinals.empty()) {
       std::optional<RVVVectorShape> codeShape =
           selectElementShape(8);
       std::optional<RVVVectorShape> index16Shape =
@@ -1542,20 +1571,26 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
           selectElementShape(32);
       if (!codeShape || !index16Shape || !index32Shape)
         continue;
-      if (!applyPhase({
-              {PhysicalLiveClass::Temporary, *codeShape, 1, 0},
-              {PhysicalLiveClass::Temporary, *index16Shape, 1, 0},
-              {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}}) ||
-          !applyPhase({
-              {PhysicalLiveClass::Index, *index32Shape, 1, 0},
-              {PhysicalLiveClass::Memory, *index32Shape, 1, 0},
-              {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}}))
+      if (!llvm::all_of(facts.lookupOperationOrdinals, [&](unsigned ordinal) {
+            return applyOperationPhase(
+                       ordinal,
+                       {{PhysicalLiveClass::Temporary, *codeShape, 1, 0},
+                        {PhysicalLiveClass::Temporary, *index16Shape, 1, 0},
+                        {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}}) &&
+                   applyOperationPhase(
+                       ordinal,
+                       {{PhysicalLiveClass::Index, *index32Shape, 1, 0},
+                        {PhysicalLiveClass::Memory, *index32Shape, 1, 0},
+                        {PhysicalLiveClass::Temporary, *index32Shape, 1, 0}});
+          }))
         continue;
     }
 
-    for (const PhysicalResourceRequirements &requirements :
+    for (const VLALocalPrimitiveResourceFact &primitive :
          facts.localPrimitiveRequirements) {
-      if (!applyPhase(requirements.live, requirements.reservedGroups)) {
+      if (!applyOperationPhase(primitive.operationOrdinal,
+                               primitive.requirements.live,
+                               primitive.requirements.reservedGroups)) {
         resourceLegal = false;
         break;
       }

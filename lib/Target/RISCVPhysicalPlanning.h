@@ -440,6 +440,7 @@ selectVLALookupPhysical(const VLALookupCandidateFacts &facts,
                         const RISCVTargetProfile &target);
 
 struct VLAValueLifetimeSnapshot {
+  unsigned operationOrdinal = 0;
   unsigned f32 = 0;
   unsigned f16 = 0;
   unsigned index = 0;
@@ -739,14 +740,26 @@ enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
                           const RISCVTargetProfile &target);
 
 struct VLAIndexedMemoryFact {
+  unsigned operationOrdinal = 0;
   unsigned elementSEW = 0;
   unsigned offsetSEW = 0;
 };
 
 struct VLASegmentMemoryFact {
+  unsigned operationOrdinal = 0;
   bool write = false;
   unsigned fields = 0;
   unsigned elementSEW = 0;
+};
+
+struct VLAStateCandidateSet {
+  unsigned operationOrdinal = 0;
+  llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
+};
+
+struct VLALocalPrimitiveResourceFact {
+  unsigned operationOrdinal = 0;
+  PhysicalResourceRequirements requirements;
 };
 
 struct VLANarrowPhysical {
@@ -759,19 +772,18 @@ struct VLANarrowPhysical {
 struct VLAEntityCandidateFacts {
   CoreMappingProblem mapping;
   unsigned dataSEW = 32;
-  unsigned lookupCount = 0;
+  llvm::SmallVector<unsigned, 2> lookupOperationOrdinals;
   bool hasIndexVector = false;
   bool hasAffinePredicate = false;
-  bool hasNarrow = false;
+  llvm::SmallVector<unsigned, 2> narrowOperationOrdinals;
   RVVVectorShape requiredDataShape;
   llvm::SmallVector<unsigned> requiredLMULs;
   llvm::SmallVector<unsigned> accessElementSEWs;
   llvm::SmallVector<VLAIndexedMemoryFact> indexedMemory;
   llvm::SmallVector<VLASegmentMemoryFact> segmentMemory;
   llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimes;
-  llvm::SmallVector<llvm::SmallVector<SelectedVLAStatePhysical, 2>, 4>
-      stateCandidates;
-  llvm::SmallVector<PhysicalResourceRequirements, 2>
+  llvm::SmallVector<VLAStateCandidateSet, 4> stateCandidates;
+  llvm::SmallVector<VLALocalPrimitiveResourceFact, 2>
       localPrimitiveRequirements;
 };
 
