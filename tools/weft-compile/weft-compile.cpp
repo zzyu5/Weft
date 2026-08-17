@@ -52,7 +52,7 @@ llvm::cl::opt<int64_t> dotKUnroll(
 llvm::cl::opt<int64_t> dotLoadBufferCount(
     "dot-load-buffer-count",
     llvm::cl::desc(
-        "Requested local dot register load buffers: zero selects, one or two"),
+        "Requested local dot register load buffers: zero selects, one to four"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> f16InputLMUL(
     "f16-input-lmul",
@@ -73,7 +73,7 @@ llvm::cl::opt<int64_t> f16KUnroll(
 llvm::cl::opt<int64_t> f16LoadBufferCount(
     "f16-load-buffer-count",
     llvm::cl::desc(
-        "Requested F16 matmul register load buffers: zero selects, one or two"),
+        "Requested F16 matmul register load buffers: zero selects, one to four"),
     llvm::cl::init(0));
 llvm::cl::opt<int64_t> reductionStatePlacement(
     "reduction-state-placement",

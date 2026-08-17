@@ -734,6 +734,13 @@ struct DenseMicrokernelResourceFacts {
   unsigned handoffGroups = 0;
 };
 
+struct LocalPipelineDependenceFacts {
+  unsigned independentLoadStreams = 0;
+  unsigned loopCarriedValues = 0;
+  bool addressDependsOnCarriedValue = false;
+  bool predicateDependsOnCarriedValue = false;
+};
+
 std::optional<PhysicalResourceBudget>
 calculateDenseMicrokernelResources(
     const DenseMicrokernelResourceFacts &facts,
@@ -750,7 +757,7 @@ struct F32DotCandidateFacts {
   unsigned handoffGroups = 0;
   bool reductionPredicate = false;
   bool materializedInit = false;
-  bool localPipeline = false;
+  LocalPipelineDependenceFacts pipeline;
 };
 
 struct SelectedF32DotPhysical {
@@ -767,6 +774,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
 struct F16MatmulCandidateFacts {
   CoreMappingProblem mapping;
   bool nLaneStrided = false;
+  LocalPipelineDependenceFacts pipeline;
 };
 
 struct SelectedF16MatmulPhysical {

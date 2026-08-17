@@ -2169,12 +2169,24 @@ calculateDenseMicrokernelResources(
   return calculatePhysicalResources(*requirements, target);
 }
 
+static llvm::SmallVector<unsigned, 4> localPipelineBufferCandidates(
+    const LocalPipelineDependenceFacts &facts, unsigned maximumDepth) {
+  llvm::SmallVector<unsigned, 4> candidates{1};
+  if (facts.independentLoadStreams == 0 || facts.loopCarriedValues == 0 ||
+      facts.addressDependsOnCarriedValue ||
+      facts.predicateDependsOnCarriedValue)
+    return candidates;
+  for (unsigned depth = 2; depth <= maximumDepth; ++depth)
+    candidates.push_back(depth);
+  return candidates;
+}
+
 std::optional<SelectedF32DotPhysical>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config) {
   if (config.parameters.dotLoadBufferCount < 0 ||
-      config.parameters.dotLoadBufferCount > 2)
+      config.parameters.dotLoadBufferCount > 4)
     return std::nullopt;
   CoreMappingProblem problem = facts.mapping;
   problem.laneSEW = 32;
@@ -2190,12 +2202,10 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                 static_cast<unsigned>(config.parameters.dotKUnroll)}
           : llvm::SmallVector<unsigned, 4>{1, 2, 4};
   problem.pipelineBufferCandidates =
-      !facts.localPipeline
-          ? llvm::SmallVector<unsigned, 4>{1}
-          : config.parameters.dotLoadBufferCount != 0
-                ? llvm::SmallVector<unsigned, 4>{static_cast<unsigned>(
-                      config.parameters.dotLoadBufferCount)}
-                : llvm::SmallVector<unsigned, 4>{1, 2};
+      config.parameters.dotLoadBufferCount != 0
+          ? llvm::SmallVector<unsigned, 4>{
+                static_cast<unsigned>(config.parameters.dotLoadBufferCount)}
+          : localPipelineBufferCandidates(facts.pipeline, 4);
 
   const unsigned baseF32Lanes =
       rvvLaneCapacity(rvvShape(32, 1), target).value_or(0);
@@ -2231,10 +2241,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     if (!laneAxis || !reduction ||
         (reduction->unrollFactor != 1 && reduction->unrollFactor != 2 &&
          reduction->unrollFactor != 4) ||
-        (mapping.pipeline.bufferCount != 1 &&
-         mapping.pipeline.bufferCount != 2) ||
-        (mapping.pipeline.bufferCount == 2 &&
-         (!facts.localPipeline || reduction->unrollFactor < 2)))
+        mapping.pipeline.bufferCount == 0 ||
+        mapping.pipeline.bufferCount > reduction->unrollFactor ||
+        (mapping.pipeline.bufferCount > 1 &&
+         (facts.pipeline.independentLoadStreams == 0 ||
+          facts.pipeline.loopCarriedValues == 0 ||
+          facts.pipeline.addressDependsOnCarriedValue ||
+          facts.pipeline.predicateDependsOnCarriedValue)))
       continue;
     unsigned accumulatorVectors = 1;
     for (const PhysicalAxisDecomposition &axis : mapping.axes)
@@ -2273,7 +2286,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                         ? 4
                         : std::max(8u, 2 * baseF32Lanes));
     const unsigned preferredBuffers =
-        facts.localPipeline && reduction->unrollFactor >= 2 ? 2 : 1;
+        reduction->unrollFactor >= 2 &&
+                facts.pipeline.independentLoadStreams != 0 &&
+                facts.pipeline.loopCarriedValues != 0 &&
+                !facts.pipeline.addressDependsOnCarriedValue &&
+                !facts.pipeline.predicateDependsOnCarriedValue
+            ? 2
+            : 1;
     const unsigned pipelinePenalty = static_cast<unsigned>(std::abs(
         static_cast<int>(mapping.pipeline.bufferCount) -
         static_cast<int>(preferredBuffers)));
@@ -2318,7 +2337,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                               const RISCVTargetProfile &target,
                               const RISCVBackendConfig &config) {
   if (!target.hasRVV || !target.hasF || !target.hasVectorF16 ||
-      !target.hasWideningFloat)
+      !target.hasWideningFloat || config.parameters.f16LoadBufferCount < 0 ||
+      config.parameters.f16LoadBufferCount > 4)
     return std::nullopt;
   const unsigned baseInputLanes =
       rvvLaneCapacity(rvvShape(16, 1), target).value_or(0);
@@ -2341,7 +2361,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
       config.parameters.f16LoadBufferCount != 0
           ? llvm::SmallVector<unsigned, 4>{
                 static_cast<unsigned>(config.parameters.f16LoadBufferCount)}
-          : llvm::SmallVector<unsigned, 4>{1, 2};
+          : localPipelineBufferCandidates(facts.pipeline, 4);
   LogicalAxisConstraint *mConstraint = nullptr;
   LogicalAxisConstraint *nConstraint = nullptr;
   for (LogicalAxisConstraint &axis : problem.axes) {
@@ -2408,9 +2428,13 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         !accumulatorShape ||
         (k->unrollFactor != 1 && k->unrollFactor != 2 &&
          k->unrollFactor != 4) ||
-        (mapping.pipeline.bufferCount != 1 &&
-         mapping.pipeline.bufferCount != 2) ||
-        (mapping.pipeline.bufferCount == 2 && k->unrollFactor < 2) ||
+        mapping.pipeline.bufferCount == 0 ||
+        mapping.pipeline.bufferCount > k->unrollFactor ||
+        (mapping.pipeline.bufferCount > 1 &&
+         (facts.pipeline.independentLoadStreams == 0 ||
+          facts.pipeline.loopCarriedValues == 0 ||
+          facts.pipeline.addressDependsOnCarriedValue ||
+          facts.pipeline.predicateDependsOnCarriedValue)) ||
         (lane->id == kCoreAxisN &&
          (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
       continue;
@@ -2420,7 +2444,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     const bool columnLane = lane->id == kCoreAxisN;
     const unsigned accumulatorVectors =
         columnLane ? rows : rows * columns;
-    const unsigned lhsVectors = columnLane ? 0 : (bufferCount == 2 ? rows : 1);
+    const unsigned lhsVectors = columnLane ? 0 : (bufferCount > 1 ? rows : 1);
     const unsigned rhsVectors = columnLane ? 1 : columns;
     std::optional<PhysicalResourceBudget> resources =
         calculateDenseMicrokernelResources(

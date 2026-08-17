@@ -5874,6 +5874,23 @@ private:
     return analysis;
   }
 
+  LocalPipelineDependenceFacts analyzeLocalPipelineDependences(
+      llvm::ArrayRef<LoadOp> loads,
+      llvm::ArrayRef<mlir::Value> loopCarriedValues) const {
+    LocalPipelineDependenceFacts facts;
+    facts.independentLoadStreams = loads.size();
+    facts.loopCarriedValues = loopCarriedValues.size();
+    for (LoadOp load : loads) {
+      for (mlir::Value carried : loopCarriedValues) {
+        facts.addressDependsOnCarriedValue |=
+            valueDependsOn(load.getPointer(), carried);
+        facts.predicateDependsOnCarriedValue |=
+            valueDependsOn(load.getWhere(), carried);
+      }
+    }
+    return facts;
+  }
+
   mlir::FailureOr<PlannedPhysicalDecision<DotDecision>>
   decideLocalF32Dot(DotOp dot) {
     BlockType resultType = mlir::dyn_cast<BlockType>(
@@ -5942,7 +5959,8 @@ private:
     decision.lhsLaneStride = rowStride;
     decision.rhsLaneStride = reductionStride;
     F32DotCandidateFacts candidateFacts;
-    candidateFacts.localPipeline = true;
+    candidateFacts.pipeline = analyzeLocalPipelineDependences(
+        {rowLoad, reductionLoad}, {dot.getInit(), dot.getResult()});
     candidateFacts.reductionExtent = analysis->reductionExtent;
     candidateFacts.mapping = analysis->mapping;
     if (!freeOnLHS)
@@ -6030,8 +6048,7 @@ private:
     const unsigned rowMicrotile = mAxis->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
     const unsigned loadBuffers = decision.mapping.pipeline.bufferCount;
-    if ((loadBuffers != 1 && loadBuffers != 2) ||
-        (loadBuffers == 2 && kUnroll < 2))
+    if (loadBuffers == 0 || loadBuffers > kUnroll)
       return dot.emitError("local f32 dot pipeline mapping is unavailable");
     std::string fullVL = fresh("dot_vlmax");
     std::string vectorSuffix = "f32m" + std::to_string(*lmul);
@@ -6073,6 +6090,7 @@ private:
       };
       auto emitLoadChunk = [&](llvm::StringRef coordinate,
                                LoadedChunk &loaded) -> mlir::LogicalResult {
+        loaded = LoadedChunk{};
         llvm::DenseMap<mlir::Value, std::string> rhsAxes;
         rhsAxes[decision.reductionAxis] = coordinate.str();
         std::optional<std::string> rhs =
@@ -6108,7 +6126,8 @@ private:
                 "local f32 dot LHS projection is unavailable");
           std::string lhsVector = fresh("dot_lhs");
           if (guarded) {
-            line(vectorType + " " + lhsVector + ";");
+            line(vectorType + " " + lhsVector + " = __riscv_vfmv_v_f_" +
+                 vectorSuffix + "(0.0f, " + vl + ");");
             line("if (" + lhsActive[rowBase + row] + ") {");
             ++indent;
           }
@@ -6182,16 +6201,19 @@ private:
             if (mlir::failed(emitChunk(coordinate(unroll))))
               return mlir::failure();
         } else {
-          LoadedChunk current;
-          if (mlir::failed(emitLoadChunk(coordinate(0), current)))
-            return mlir::failure();
-          for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
-            LoadedChunk next;
-            if (unroll + 1 < kUnroll &&
-                mlir::failed(emitLoadChunk(coordinate(unroll + 1), next)))
+          llvm::SmallVector<LoadedChunk, 4> banks(loadBuffers);
+          const unsigned preload = loadBuffers - 1;
+          for (unsigned stage = 0; stage < preload; ++stage)
+            if (mlir::failed(
+                    emitLoadChunk(coordinate(stage), banks[stage])))
               return mlir::failure();
-            emitAccumulateChunk(current);
-            current = std::move(next);
+          for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
+            const unsigned next = unroll + preload;
+            if (next < kUnroll &&
+                mlir::failed(emitLoadChunk(
+                    coordinate(next), banks[next % loadBuffers])))
+              return mlir::failure();
+            emitAccumulateChunk(banks[unroll % loadBuffers]);
           }
         }
         line(strip + " += " + std::to_string(kUnroll) + " * " + vl +
@@ -9204,6 +9226,9 @@ private:
     decision.rhsColumnStride = analysis->rhsFreeStride;
     F16MatmulCandidateFacts candidateFacts;
     candidateFacts.mapping = analysis->mapping;
+    candidateFacts.pipeline = analyzeLocalPipelineDependences(
+        {analysis->lhsLoad, analysis->rhsLoad},
+        {matmul.getInit(), matmul.getResult()});
     const bool legalColumnLane =
         analysis->rhsFreeRelation == LaneRelation::UnitStride ||
         (analysis->rhsFreeRelation == LaneRelation::Strided &&
@@ -9443,6 +9468,8 @@ private:
     const unsigned columnMicrotile = nAxis->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
     const unsigned loadBufferCount = decision.mapping.pipeline.bufferCount;
+    if (loadBufferCount > kUnroll)
+      return op.emitError("F16 matmul pipeline mapping exceeds its K unroll");
     for (auto [value, kind] :
          {std::pair<mlir::Value, PhysicalHandoff>{
               op.getLhs(), PhysicalHandoff::Reload},
@@ -9633,10 +9660,10 @@ private:
         auto emitRegisterBufferedChunks = [&](llvm::StringRef base,
                                                unsigned count)
             -> mlir::LogicalResult {
-          RegisterLoadBank banks[2];
+          llvm::SmallVector<RegisterLoadBank, 4> banks(loadBufferCount);
           const std::string inputType =
               "vfloat16m" + std::to_string(*inputLMUL) + "_t";
-          for (unsigned bank = 0; bank < 2; ++bank) {
+          for (unsigned bank = 0; bank < loadBufferCount; ++bank) {
             for (unsigned row = 0; row < rowCount; ++row) {
               banks[bank].lhs.push_back(fresh("matmul_lhs_bank"));
               line(inputType + " " + banks[bank].lhs.back() + ";");
@@ -9697,14 +9724,17 @@ private:
               line("}");
             }
           };
-          if (mlir::failed(loadBank(0, coordinateAt(base, 0))))
-            return mlir::failure();
-          for (unsigned step = 0; step < count; ++step) {
-            const unsigned next = step + 1;
-            if (next < count &&
-                mlir::failed(loadBank(next % 2, coordinateAt(base, next))))
+          const unsigned preload = loadBufferCount - 1;
+          for (unsigned stage = 0; stage < preload; ++stage)
+            if (mlir::failed(loadBank(stage, coordinateAt(base, stage))))
               return mlir::failure();
-            computeBank(step % 2);
+          for (unsigned step = 0; step < count; ++step) {
+            const unsigned next = step + preload;
+            if (next < count &&
+                mlir::failed(loadBank(next % loadBufferCount,
+                                      coordinateAt(base, next))))
+              return mlir::failure();
+            computeBank(step % loadBufferCount);
           }
           return mlir::success();
         };
@@ -9729,7 +9759,7 @@ private:
           line("const size_t " + vl + " = __riscv_vsetvl_e16m" +
                std::to_string(*inputLMUL) + "(" + remaining + " / " +
                std::to_string(kUnroll) + ");");
-          if (loadBufferCount == 2) {
+          if (loadBufferCount > 1) {
             if (mlir::failed(
                     emitRegisterBufferedChunks(reduction, kUnroll)))
               return mlir::failure();
