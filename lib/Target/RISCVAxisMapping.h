@@ -86,6 +86,7 @@ enum class LogicalAxisRole {
 
 enum class CoreInstructionKind {
   None,
+  Scalar,
   RVVElementwise,
   RVVFMA,
   RVVWideningFMA,
@@ -122,6 +123,7 @@ struct CoreMappingProblem {
   llvm::SmallVector<LogicalAxisConstraint, 4> axes;
   unsigned laneSEW = 0;
   CoreInstructionKind laneInstruction = CoreInstructionKind::None;
+  CoreInstructionKind sequentialInstruction = CoreInstructionKind::None;
   llvm::SmallVector<RVVVectorShape, 4> laneShapeCandidates;
   llvm::SmallVector<unsigned, 4> laneLMULCandidates;
   std::optional<unsigned> unrollAxis;

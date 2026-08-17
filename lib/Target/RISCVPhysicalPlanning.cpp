@@ -613,39 +613,80 @@ std::optional<SelectedMaterializedBlockStorePhysical>
 selectMaterializedBlockStorePhysical(
     const MaterializedBlockStoreCandidateFacts &facts,
     const RISCVTargetProfile &target) {
-  SelectedMaterializedBlockStorePhysical selected;
-  selected.resources.architecturalGroups = target.vectorRegisters;
-  selected.rows = facts.rows;
-  selected.columns = facts.columns;
-  if (facts.rank == 1 && facts.columns == 16 && facts.allActive &&
-      facts.unitStride) {
-    std::optional<RVVVectorShape> shape =
-        rvvShapeForSemanticLanes(32, 16, target);
-    if (!shape)
-      return std::nullopt;
-    selected.realization =
-        MaterializedBlockStoreRealization::RVVContiguousRankOne;
-    selected.vectorShape = *shape;
+  const bool rankOne =
+      facts.mapping.axes.size() == 1 &&
+      facts.mapping.axes.front().id == kCoreAxisN &&
+      facts.mapping.axes.front().role == LogicalAxisRole::Free &&
+      facts.mapping.axes.front().extent;
+  const bool rankTwo =
+      facts.mapping.axes.size() == 2 &&
+      facts.mapping.axes[0].id == kCoreAxisM &&
+      facts.mapping.axes[0].role == LogicalAxisRole::Free &&
+      facts.mapping.axes[0].extent &&
+      facts.mapping.axes[1].id == kCoreAxisN &&
+      facts.mapping.axes[1].role == LogicalAxisRole::Free &&
+      facts.mapping.axes[1].extent;
+  if ((!rankOne && !rankTwo) || !facts.prefixPredicated)
+    return std::nullopt;
+
+  CoreMappingProblem problem = facts.mapping;
+  problem.allowSequentialOnly = true;
+  problem.sequentialInstruction = CoreInstructionKind::Scalar;
+  problem.laneSEW = 32;
+  problem.laneInstruction = CoreInstructionKind::RVVElementwise;
+  if (rankOne && facts.allActive && facts.unitStride) {
+    problem.axes.front().allowLane = true;
+    problem.laneShapeCandidates = rvvShapeCandidates(target, 32);
+  } else {
+    for (LogicalAxisConstraint &axis : problem.axes) {
+      axis.allowLane = false;
+      axis.requireLane = false;
+    }
+    problem.laneShapeCandidates.clear();
+  }
+
+  struct Candidate {
+    SelectedMaterializedBlockStorePhysical physical;
+    unsigned instructionCost = 0;
+    unsigned sequentialFactor = 0;
+    unsigned peakGroups = 0;
+  };
+  llvm::SmallVector<Candidate, 8> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(problem, target)) {
+    const bool vector =
+        mapping.instruction == CoreInstructionKind::RVVElementwise;
+    if (vector && (!rankOne || !facts.allActive || !facts.unitStride ||
+                   !mapping.laneShape))
+      continue;
+    if (!vector && mapping.instruction != CoreInstructionKind::Scalar)
+      continue;
     PhysicalResourceRequirements requirements;
-    requirements.live = {{PhysicalLiveClass::Value, *shape, 1, 0}};
+    if (vector)
+      requirements.live = {
+          {PhysicalLiveClass::Value, mapping.laneShape, 1, 0}};
     std::optional<PhysicalResourceBudget> resources =
         calculatePhysicalResources(requirements, target);
     if (!resources)
-      return std::nullopt;
+      continue;
+    unsigned sequentialFactor = 1;
+    for (const PhysicalAxisDecomposition &axis : mapping.axes)
+      sequentialFactor *= std::max(1u, axis.sequentialFactor);
+    SelectedMaterializedBlockStorePhysical selected;
+    selected.mapping = std::move(mapping);
     selected.resources = *resources;
-  } else if (facts.rank == 1 && facts.columns > 0 &&
-             facts.prefixPredicated) {
-    selected.realization = MaterializedBlockStoreRealization::ScalarRankOne;
-  } else if (facts.rank == 2 && facts.rows > 0 && facts.columns > 0 &&
-             facts.prefixPredicated) {
-    selected.realization = MaterializedBlockStoreRealization::ScalarRankTwo;
-  } else {
-    return std::nullopt;
+    legal.push_back(Candidate{std::move(selected), vector ? 0u : 1u,
+                              sequentialFactor, resources->peakGroups});
   }
-  if (selected.resources.peakGroups >
-      static_cast<unsigned>(target.vectorRegisters))
+  if (legal.empty())
     return std::nullopt;
-  return selected;
+  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+    return std::tie(lhs.instructionCost, lhs.sequentialFactor,
+                    lhs.peakGroups) <
+           std::tie(rhs.instructionCost, rhs.sequentialFactor,
+                    rhs.peakGroups);
+  });
+  return std::move(legal.front().physical);
 }
 
 std::optional<SelectedSortIndicesPhysical>

@@ -294,7 +294,10 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
       for (unsigned unroll : unrollCandidates) {
         for (unsigned buffers : bufferCandidates) {
           CorePhysicalMapping mapping;
-          mapping.instruction = problem.laneInstruction;
+          mapping.instruction =
+              problem.sequentialInstruction == CoreInstructionKind::None
+                  ? problem.laneInstruction
+                  : problem.sequentialInstruction;
           mapping.pipeline.bufferCount = buffers;
           for (size_t index = 0; index < problem.axes.size(); ++index) {
             const LogicalAxisConstraint &axis = problem.axes[index];

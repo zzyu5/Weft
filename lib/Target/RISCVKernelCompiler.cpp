@@ -124,13 +124,11 @@ struct BlockReduceGroupDecision {
 
 struct MaterializedBlockStoreDecision {
   mlir::Operation *operation = nullptr;
-  MaterializedBlockStoreRealization realization =
-      MaterializedBlockStoreRealization::ScalarRankTwo;
+  CorePhysicalMapping mapping;
   mlir::Value rowAxis;
   mlir::Value columnAxis;
   int64_t rows = 0;
   int64_t columns = 0;
-  RVVVectorShape vectorShape;
 };
 
 enum class MaterializedF32PointwiseRealization {
@@ -7184,16 +7182,18 @@ private:
     MaterializedBlockStoreDecision decision;
     decision.operation = op.getOperation();
     MaterializedBlockStoreCandidateFacts facts;
-    facts.rank = block.getShape().size();
+    const unsigned rank = block.getShape().size();
     facts.allActive = isTrue(op.getWhere());
-    if (facts.rank == 1) {
+    if (rank == 1) {
       llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(op.getPointer());
       BlockIndexOp axis = findDimensionAxis(op.getPointer(), 0, axes);
       std::optional<int64_t> elements = materializedF32ElementCount(op.getValue());
       if (!axis || !elements || *elements <= 0)
         return op.emitError(
             "materialized rank-one f32 store requires one bounded typed local axis");
-      facts.columns = *elements;
+      facts.mapping.axes = {LogicalAxisConstraint{
+          kCoreAxisN, LogicalAxisRole::Free,
+          static_cast<uint64_t>(*elements), false, false, false, {1}}};
       facts.prefixPredicated =
           isContiguousPrefixPredicate(op.getWhere(), axis.getResult());
       const MemoryAccessFact *access = memoryFact(op.getOperation());
@@ -7202,7 +7202,9 @@ private:
                         LaneRelation::UnitStride;
       decision.rowAxis = axis.getResult();
       decision.columnAxis = axis.getResult();
-    } else if (facts.rank == 2) {
+      decision.rows = 1;
+      decision.columns = *elements;
+    } else if (rank == 2) {
       llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(op.getPointer());
       BlockIndexOp rowAxis = findDimensionAxis(op.getPointer(), 0, axes);
       BlockIndexOp columnAxis = findDimensionAxis(op.getPointer(), 1, axes);
@@ -7214,13 +7216,20 @@ private:
           *columns <= 0)
         return op.emitError(
             "materialized rank-two f32 store requires bounded typed local axes");
-      facts.rows = *rows;
-      facts.columns = *columns;
+      facts.mapping.axes = {
+          LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free,
+                                static_cast<uint64_t>(*rows), false, false,
+                                false, {1}},
+          LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free,
+                                static_cast<uint64_t>(*columns), false, false,
+                                false, {1}}};
       facts.prefixPredicated =
           isContiguousPrefixPredicate(op.getWhere(), rowAxis.getResult()) &&
           isContiguousPrefixPredicate(op.getWhere(), columnAxis.getResult());
       decision.rowAxis = rowAxis.getResult();
       decision.columnAxis = columnAxis.getResult();
+      decision.rows = *rows;
+      decision.columns = *columns;
     } else {
       return op.emitError(
           "materialized f32 block store requires rank one or rank two");
@@ -7230,17 +7239,14 @@ private:
     if (!selected)
       return op.emitError(
           "materialized f32 block store has no legal target implementation");
-    decision.realization = selected->realization;
-    decision.rows = selected->rows;
-    decision.columns = selected->columns;
-    decision.vectorShape = selected->vectorShape;
+    decision.mapping = selected->mapping;
     PlannedPhysicalDecision<MaterializedBlockStoreDecision> planned(
         std::move(decision));
     initializeEntityPlan(planned.entity);
     planned.entity.resources = selected->resources;
-    if (planned.realization.realization ==
-        MaterializedBlockStoreRealization::RVVContiguousRankOne) {
-      RVVVectorShape vectorShape = planned.realization.vectorShape;
+    if (planned.realization.mapping.instruction ==
+        CoreInstructionKind::RVVElementwise) {
+      RVVVectorShape vectorShape = planned.realization.mapping.laneShape;
       recordPhysicalValue(planned.entity, op.getValue(),
                           vectorShape);
       recordPhysicalHandoff(planned.entity, op.getOperation(), op.getValue(),
@@ -7896,8 +7902,8 @@ private:
         stored->second.kind != CValueKind::F32BlockStorage)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized f32 block storage is unavailable"));
-    if (decision.realization ==
-        MaterializedBlockStoreRealization::ScalarRankOne) {
+    if (decision.mapping.instruction == CoreInstructionKind::Scalar &&
+        decision.mapping.axes.size() == 1) {
       std::string lane = fresh("block_store_lane");
       line("for (size_t " + lane + " = 0; " + lane + " < " +
            std::to_string(decision.columns) + "; ++" + lane + ") {");
@@ -7922,8 +7928,8 @@ private:
       consumed.insert(op.getOperation());
       return std::optional<mlir::LogicalResult>(mlir::success());
     }
-    if (decision.realization ==
-        MaterializedBlockStoreRealization::ScalarRankTwo) {
+    if (decision.mapping.instruction == CoreInstructionKind::Scalar &&
+        decision.mapping.axes.size() == 2) {
       std::string row = fresh("block_store_row");
       std::string column = fresh("block_store_column");
       line("for (size_t " + row + " = 0; " + row + " < " +
@@ -7956,17 +7962,16 @@ private:
       consumed.insert(op.getOperation());
       return std::optional<mlir::LogicalResult>(mlir::success());
     }
-    if (decision.realization !=
-            MaterializedBlockStoreRealization::RVVContiguousRankOne ||
-        decision.columns != 16 || !decision.vectorShape)
+    if (decision.mapping.instruction != CoreInstructionKind::RVVElementwise ||
+        decision.mapping.axes.size() != 1 || !decision.mapping.laneShape)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store decision has no spelling"));
+    const RVVVectorShape vectorShape = decision.mapping.laneShape;
     auto valuePlan = llvm::find_if(
         entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == op.getValue();
         });
-    if (valuePlan == entity.values.end() ||
-        valuePlan->shape != decision.vectorShape)
+    if (valuePlan == entity.values.end() || valuePlan->shape != vectorShape)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store has no physical value shape"));
     llvm::DenseMap<mlir::Value, std::string> axes;
@@ -7979,14 +7984,15 @@ private:
     std::string offset = fresh("block_store_offset");
     std::string vl = fresh("block_store_vl");
     std::string value = fresh("block_store_value");
-    std::string shapeSuffix = rvvShapeSuffix(decision.vectorShape);
+    std::string shapeSuffix = rvvShapeSuffix(vectorShape);
     if (shapeSuffix.empty())
       return std::optional<mlir::LogicalResult>(op.emitError(
           "materialized block store vector shape has no RVV spelling"));
-    line("for (size_t " + offset + " = 0; " + offset + " < 16;) {");
+    line("for (size_t " + offset + " = 0; " + offset + " < " +
+         std::to_string(decision.columns) + ";) {");
     ++indent;
     line("const size_t " + vl + " = __riscv_vsetvl_e" + shapeSuffix +
-         "(16 - " + offset + ");");
+         "(" + std::to_string(decision.columns) + " - " + offset + ");");
     line("vfloat" + shapeSuffix + "_t " + value +
          " = __riscv_vle32_v_f" + shapeSuffix + "(" +
          stored->second.spelling + " + " + offset + ", " + vl + ");");

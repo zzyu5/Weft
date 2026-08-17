@@ -170,27 +170,15 @@ std::optional<SelectedBlockReducePhysical>
 selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
                           const RISCVTargetProfile &target);
 
-enum class MaterializedBlockStoreRealization {
-  ScalarRankOne,
-  ScalarRankTwo,
-  RVVContiguousRankOne,
-};
-
 struct MaterializedBlockStoreCandidateFacts {
-  unsigned rank = 0;
-  int64_t rows = 0;
-  int64_t columns = 0;
+  CoreMappingProblem mapping;
   bool allActive = false;
   bool prefixPredicated = false;
   bool unitStride = false;
 };
 
 struct SelectedMaterializedBlockStorePhysical {
-  MaterializedBlockStoreRealization realization =
-      MaterializedBlockStoreRealization::ScalarRankOne;
-  int64_t rows = 0;
-  int64_t columns = 0;
-  RVVVectorShape vectorShape;
+  CorePhysicalMapping mapping;
   PhysicalResourceBudget resources;
 };
 
