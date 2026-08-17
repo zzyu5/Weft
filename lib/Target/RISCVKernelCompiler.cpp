@@ -8616,15 +8616,7 @@ private:
       OpTy op, TernaryI8DotSemantic semantic,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars, TernaryI8Decision &decision) {
-    std::optional<SelectedTernaryI8DotPhysical> selected =
-        weft::riscv_internal::selectTernaryI8DotPhysical({semantic},
-                                                         options.target);
-    if (!selected)
-      return op.emitError(
-          "ternary/i8 dot has no legal target realization");
-
     decision = TernaryI8Decision{};
-    decision.physical = *selected;
     for (mlir::Value block : blocks) {
       std::optional<LocalBlockMemoryFact> fact =
           resolveLocalBlockMemoryFact(block);
@@ -8633,6 +8625,30 @@ private:
             "ternary/i8 dot requires contiguous all-active local block memory facts");
       decision.blocks.push_back(*fact);
     }
+    TernaryI8DotCandidateFacts facts;
+    facts.semantic = semantic;
+    if (semantic == TernaryI8DotSemantic::Base3Digits) {
+      if (decision.blocks.size() != 3)
+        return op.emitError("base3 ternary/i8 dot requires three block operands");
+      facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
+      facts.secondaryExtent =
+          static_cast<unsigned>(decision.blocks[1].semanticExtent);
+      facts.activationExtent =
+          static_cast<unsigned>(decision.blocks[2].semanticExtent);
+    } else {
+      if (decision.blocks.size() != 2)
+        return op.emitError("packed ternary/i8 dot requires two block operands");
+      facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
+      facts.activationExtent =
+          static_cast<unsigned>(decision.blocks[1].semanticExtent);
+    }
+    std::optional<SelectedTernaryI8DotPhysical> selected =
+        weft::riscv_internal::selectTernaryI8DotPhysical(facts, options.target);
+    if (!selected)
+      return op.emitError(
+          "ternary/i8 dot has no legal target realization");
+
+    decision.physical = *selected;
     decision.scalars.append(scalars.begin(), scalars.end());
     return mlir::success();
   }

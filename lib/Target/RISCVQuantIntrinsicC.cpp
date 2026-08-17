@@ -53,7 +53,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
-  bool base3E8M2 = false, base3E8M1 = false;
   bool signed8E8M2 = false, signed8E8M1 = false;
   bool signed4E8M2 = false, signed4E8M1 = false;
   bool packedU9U7E8M2 = false, packedU9U7E8M1 = false;
@@ -83,10 +82,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
                         packedI3L64);
       break;
     case LocalPrimitiveKind::Base3TernaryI8:
-      supported = match("__weft_base3_ternary_i8_register_l32_e8m2",
-                        base3E8M2) ||
-                  match("__weft_base3_ternary_i8_register_l32_e8m1",
-                        base3E8M1);
+      supported = emitBase3TernaryLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedI2TernaryI8:
       supported =
@@ -153,7 +149,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
       !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
-      !base3E8M2 && !base3E8M1 &&
       !signed8E8M2 && !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
       !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
       !packedU11E8M1)
@@ -216,7 +211,6 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
-  emitBase3TernaryLocalImplementations(output, base3E8M2, base3E8M1);
   emitSignedCodebookLocalImplementations(
       output, signed8E8M2, signed8E8M1, signed4E8M2, signed4E8M1);
   emitPackedU9U7CodebookLocalImplementations(

@@ -500,6 +500,8 @@ bool isNibbleCodebookLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isPackedI2TernaryLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isBase3TernaryLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
@@ -639,6 +641,9 @@ enum class TernaryI8DotSemantic {
 
 struct TernaryI8DotCandidateFacts {
   TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
+  unsigned primaryExtent = 0;
+  unsigned secondaryExtent = 0;
+  unsigned activationExtent = 0;
 };
 
 enum class TernaryDecodeTopology {

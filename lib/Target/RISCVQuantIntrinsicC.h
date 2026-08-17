@@ -26,8 +26,8 @@ void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
                                              bool registerL64);
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
-void emitBase3TernaryLocalImplementations(llvm::raw_ostream &output,
-                                         bool base3E8M2, bool base3E8M1);
+bool emitBase3TernaryLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
 bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
 void emitSignedCodebookLocalImplementations(
