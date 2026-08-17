@@ -571,10 +571,13 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
     if (!rvvDot || (hardwareLanes != 16 && hardwareLanes != 32) ||
         primary != kRVVE8M1 || secondary != kRVVE16M2)
       return std::nullopt;
-    return sequential
-               ? LocalLeafDecision{LocalLeafKind::GroupedAffineI4I8Strip}
-               : registerLeaf(LocalLeafKind::GroupedAffineI4I8Register,
-                              hardwareLanes);
+    if (sequential)
+      return LocalLeafDecision{LocalLeafKind::GroupedAffineI4I8Strip};
+    return registerLeaf(
+        hardwareLanes == 16
+            ? LocalLeafKind::GroupedAffineI4I8RegisterL16
+            : LocalLeafKind::GroupedAffineI4I8RegisterL32,
+        hardwareLanes);
   case LocalPrimitiveKind::E2M1E8M0I8:
     if (!rvvDot ||
         !((lanes == 32 && primary == RVVVectorShape{8, 4} &&
@@ -679,7 +682,8 @@ std::string localImplementationSymbol(
     return "__weft_ime1_symmetric_i4_i8_m4_n16_k32";
   case LocalLeafKind::IMEAffineI4I8M4N16K32:
     return "__weft_ime1_affine_i4_i8_m4_n16_k32";
-  case LocalLeafKind::GroupedAffineI4I8Register:
+  case LocalLeafKind::GroupedAffineI4I8RegisterL16:
+  case LocalLeafKind::GroupedAffineI4I8RegisterL32:
     return registerSuffix.empty()
                ? std::string{}
                : "__weft_grouped_affine_i4_i8" + registerSuffix;

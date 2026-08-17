@@ -285,13 +285,11 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
     case LocalLeafKind::IMEAffineI4I8M4N16K32:
       usesIME1AffineI4I8M4 = true;
       break;
-    case LocalLeafKind::GroupedAffineI4I8Register:
-      if (implementation.leaf.lanes == 16)
-        usesGroupedI4I8RegisterL16 = true;
-      else if (implementation.leaf.lanes == 32)
-        usesGroupedI4I8RegisterL32 = true;
-      else
-        supported = false;
+    case LocalLeafKind::GroupedAffineI4I8RegisterL16:
+      usesGroupedI4I8RegisterL16 = true;
+      break;
+    case LocalLeafKind::GroupedAffineI4I8RegisterL32:
+      usesGroupedI4I8RegisterL32 = true;
       break;
     case LocalLeafKind::GroupedAffineI4I8Strip:
       usesGroupedI4I8Strip = true;
