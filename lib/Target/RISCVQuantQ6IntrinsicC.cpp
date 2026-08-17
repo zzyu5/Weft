@@ -10,7 +10,7 @@ namespace {
 void emitQ6KRVVAssembly(llvm::raw_ostream &output,
                         const LocalImplementation &implementation) {
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << R"c((
+         << localImplementationSymbol(implementation) << R"c((
     const uint8_t *low_bits, const uint8_t *high_bits,
     const uint8_t *group_scale_bytes, const uint8_t *activation_bytes,
     float weight_scale, float activation_scale, float init) {
@@ -128,13 +128,13 @@ void emitQ6KRVVAssembly(llvm::raw_ostream &output,
 bool emitQ6LocalImplementation(llvm::raw_ostream &output,
                                const LocalImplementation &implementation) {
   if (!isQ6KLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
-  if (implementation.leafSpelling == LocalLeafSpelling::Q6KRVVAssembly) {
+  if (implementation.leaf.kind == LocalLeafKind::Q6KI8RVVAssembly) {
     emitQ6KRVVAssembly(output, implementation);
     return true;
   }
-  if (implementation.leafSpelling != LocalLeafSpelling::IntrinsicC)
+  if (implementation.leaf.kind != LocalLeafKind::Q6KI8Register)
     return false;
 
   const PhysicalAxisDecomposition *reduction =
@@ -173,7 +173,7 @@ bool emitQ6LocalImplementation(llvm::raw_ostream &output,
   const unsigned chunksPerVector = reduction->laneFactor / 32;
   const unsigned segmentCount = reduction->laneFactor / 16;
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *low_bits, const uint8_t *high_bits,\n"
          << "    const uint8_t *group_scale_bytes, const uint8_t "
             "*activation_bytes,\n"

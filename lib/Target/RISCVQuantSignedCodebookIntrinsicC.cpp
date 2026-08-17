@@ -9,7 +9,7 @@ namespace weft::riscv_internal {
 bool emitSignedCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isSignedCodebookLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -65,7 +65,7 @@ bool emitSignedCodebookLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, uint32_t sign_metadata,\n"
          << "    const uint8_t *activation_bytes, const uint8_t *grid_table,\n"
          << "    const uint8_t *sign_table, float dot_scale, float init) {\n"
@@ -137,7 +137,7 @@ bool emitSignedCodebookLocalImplementation(
 bool emitPackedU9U7CodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isPackedU9U7CodebookLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape wordShape = implementation.valueShapes[2];
@@ -192,7 +192,7 @@ bool emitPackedU9U7CodebookLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *packed_codes, uint8_t scale_byte,\n"
          << "    const uint8_t *activation_bytes, const uint8_t *grid_table,\n"
          << "    const uint8_t *sign_table, float dot_scale, float init) {\n"
@@ -280,7 +280,7 @@ bool emitPackedU9U7CodebookLocalImplementation(
 bool emitPackedU11GridDeltaLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isPackedU11GridDeltaLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -318,7 +318,7 @@ bool emitPackedU11GridDeltaLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, uint16_t metadata,\n"
          << "    const uint8_t *activation_bytes, const uint8_t *grid_table,\n"
          << "    int32_t activation_sum, float dot_scale, float init) {\n"

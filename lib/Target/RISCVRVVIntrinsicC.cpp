@@ -275,26 +275,31 @@ static inline __attribute__((always_inline, unused)) float
 __weft_e2m1_e8m0_i8_register_e8m1_e8m2(
     const uint8_t *packed_codes, uint8_t exponent,
     const uint8_t *activation_bytes, float activation_scale, float init) {
-  const size_t vl16 = __riscv_vsetvl_e8m1(16);
-  const vint8m2_t table =
-      __riscv_vle8_v_i8m2(__weft_e2m1_doubled, vl16);
+  const size_t vl = __riscv_vsetvl_e8m1(16);
+  const vint8m1_t table =
+      __riscv_vle8_v_i8m1(__weft_e2m1_doubled, vl);
   const vuint8m1_t packed =
-      __riscv_vle8_v_u8m1(packed_codes, vl16);
+      __riscv_vle8_v_u8m1(packed_codes, vl);
   const vuint8m1_t low =
-      __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl16);
-  const vuint8m1_t high = __riscv_vsrl_vx_u8m1(packed, 4, vl16);
-  const vuint8m2_t indices =
-      __riscv_vcreate_v_u8m1_u8m2(low, high);
-  const size_t vl32 = __riscv_vsetvl_e8m2(32);
-  const vint8m2_t activation = __riscv_vle8_v_i8m2(
-      (const int8_t *)(const void *)activation_bytes, vl32);
-  const vint8m2_t decoded =
-      __riscv_vrgather_vv_i8m2(table, indices, vl32);
-  const vint16m4_t products =
-      __riscv_vwmul_vv_i16m4(activation, decoded, vl32);
+      __riscv_vand_vx_u8m1(packed, UINT8_C(15), vl);
+  const vuint8m1_t high = __riscv_vsrl_vx_u8m1(packed, 4, vl);
+  const vint8m1_t decoded_low =
+      __riscv_vrgather_vv_i8m1(table, low, vl);
+  const vint8m1_t decoded_high =
+      __riscv_vrgather_vv_i8m1(table, high, vl);
+  const int8_t *activation =
+      (const int8_t *)(const void *)activation_bytes;
+  const vint8m1_t activation_low =
+      __riscv_vle8_v_i8m1(activation, vl);
+  const vint8m1_t activation_high =
+      __riscv_vle8_v_i8m1(activation + 16, vl);
+  vint16m2_t products =
+      __riscv_vwmul_vv_i16m2(activation_low, decoded_low, vl);
+  products = __riscv_vwmacc_vv_i16m2(
+      products, activation_high, decoded_high, vl);
   const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
   const vint32m1_t reduced =
-      __riscv_vwredsum_vs_i16m4_i32m1(products, zero, vl32);
+      __riscv_vwredsum_vs_i16m2_i32m1(products, zero, vl);
   const int32_t dot = __riscv_vmv_x_s_i32m1_i32(reduced);
   return init + (float)dot * __weft_e8m0_half(exponent) * activation_scale;
 }

@@ -9,7 +9,7 @@ namespace weft::riscv_internal {
 bool emitPackedI3GroupedLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isPackedI3GroupedLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
@@ -54,7 +54,7 @@ __weft_packed_i3_group_scale(const uint8_t *scales, size_t group) {
 
 )c";
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *low_bits, const uint8_t *high_bits,\n"
          << "    const uint8_t *scales, const uint8_t *activation_bytes,\n"
          << "    float weight_scale, float activation_scale, float init) {\n"

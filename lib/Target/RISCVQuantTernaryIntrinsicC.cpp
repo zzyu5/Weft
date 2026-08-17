@@ -9,7 +9,7 @@ namespace weft::riscv_internal {
 bool emitBase3TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isBase3TernaryLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape halfShape = implementation.valueShapes[1];
@@ -70,7 +70,7 @@ bool emitBase3TernaryLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *high_digits,\n"
          << "    const uint8_t *activation_bytes, float weight_scale,\n"
          << "    float activation_scale, float init) {\n"
@@ -206,7 +206,7 @@ bool emitBase3TernaryLocalImplementation(
 bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isPackedI2TernaryLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
@@ -234,7 +234,7 @@ bool emitPackedI2TernaryLocalImplementation(
       reduction->laneFactor * reduction->registerFactor;
   const unsigned halfCount = reduction->sequentialFactor / 4;
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *activation_bytes,\n"
          << "    float weight_scale, float activation_scale, float init) {\n"
          << "  const int8_t *activation = "

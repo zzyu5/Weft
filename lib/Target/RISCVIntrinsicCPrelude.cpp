@@ -236,16 +236,10 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
   implementations.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
       return;
-    const std::string &symbol = implementation.helperSymbol;
-    auto match = [&](const char *expected, bool &flag) {
-      if (symbol != expected)
-        return false;
-      flag = true;
-      return true;
-    };
-    switch (implementation.primitive) {
-    case LocalPrimitiveKind::F32Math:
-      supported = symbol.empty() && implementation.valueShapes.size() == 1 &&
+    const std::string symbol = localImplementationSymbol(implementation);
+    if (implementation.primitive == LocalPrimitiveKind::F32Math) {
+      supported = !implementation.leaf && symbol.empty() &&
+                  implementation.valueShapes.size() == 1 &&
                   implementation.valueShapes.front() ==
                       implementation.mapping.laneShape &&
                   implementation.mapping.laneShape.sew == 32 &&
@@ -254,63 +248,82 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
           !llvm::is_contained(f32MathShapes,
                               implementation.mapping.laneShape))
         f32MathShapes.push_back(implementation.mapping.laneShape);
-      break;
-    case LocalPrimitiveKind::SymmetricI4I8:
-    case LocalPrimitiveKind::AffineI4I8:
-      supported =
-          match("__weft_rvv_symmetric_i4_i8_n16_k32",
-                usesRVVSymmetricI4I8) ||
-          match("__weft_rvv_affine_i4_i8_n16_k32", usesRVVAffineI4I8) ||
-          match("__weft_rvv_symmetric_i4_i8_m4_n16_k32",
-                usesRVVSymmetricI4I8M4) ||
-          match("__weft_rvv_affine_i4_i8_m4_n16_k32",
-                usesRVVAffineI4I8M4) ||
-          match("__weft_ime1_symmetric_i4_i8_n16_k32",
-                usesIME1SymmetricI4I8) ||
-          match("__weft_ime1_affine_i4_i8_n16_k32", usesIME1AffineI4I8) ||
-          match("__weft_ime1_symmetric_i4_i8_m4_n16_k32",
-                usesIME1SymmetricI4I8M4) ||
-          match("__weft_ime1_affine_i4_i8_m4_n16_k32",
-                usesIME1AffineI4I8M4);
-      break;
-    case LocalPrimitiveKind::GroupedAffineI4I8:
-      supported =
-          match("__weft_grouped_affine_i4_i8_register_l16_e8m1",
-                usesGroupedI4I8RegisterL16) ||
-          match("__weft_grouped_affine_i4_i8_register_l32_e8m1",
-                usesGroupedI4I8RegisterL32) ||
-          match("__weft_grouped_affine_i4_i8_strip", usesGroupedI4I8Strip);
-      break;
-    case LocalPrimitiveKind::E2M1E8M0I8:
-      supported =
-          match("__weft_e2m1_e8m0_i8_register_e8m1_e8m2",
-                usesE2M1RegisterE8M1M2) ||
-          match("__weft_e2m1_e8m0_i8_register_e8mf2",
-                usesE2M1RegisterE8MF2) ||
-          match("__weft_e2m1_e8m0_i8_strip", usesE2M1Strip);
-      break;
-    case LocalPrimitiveKind::PackedI4I8:
-    case LocalPrimitiveKind::PackedI5I8:
-    case LocalPrimitiveKind::PackedI3GroupedI8:
-    case LocalPrimitiveKind::Base3TernaryI8:
-    case LocalPrimitiveKind::PackedI2TernaryI8:
-    case LocalPrimitiveKind::SignedCodebook8I8:
-    case LocalPrimitiveKind::SignedCodebook4I8:
-    case LocalPrimitiveKind::PackedU9U7CodebookI8:
-    case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    case LocalPrimitiveKind::NibbleCodebookI8:
-    case LocalPrimitiveKind::IQ2SI8:
-    case LocalPrimitiveKind::IQ3SI8:
-    case LocalPrimitiveKind::IQ1MI8:
-    case LocalPrimitiveKind::Q6KI8:
-      break;
-    case LocalPrimitiveKind::None:
+      if (!supported)
+        unsupportedSymbol = "<f32 math local implementation>";
+      return;
+    }
+    supported = implementation.leaf && !symbol.empty();
+    if (!supported) {
+      unsupportedSymbol = "<unnamed local implementation>";
+      return;
+    }
+    switch (implementation.leaf.kind) {
+    case LocalLeafKind::None:
       supported = false;
+      break;
+    case LocalLeafKind::RVVSymmetricI4I8N16K32:
+      usesRVVSymmetricI4I8 = true;
+      break;
+    case LocalLeafKind::RVVAffineI4I8N16K32:
+      usesRVVAffineI4I8 = true;
+      break;
+    case LocalLeafKind::RVVSymmetricI4I8M4N16K32:
+      usesRVVSymmetricI4I8M4 = true;
+      break;
+    case LocalLeafKind::RVVAffineI4I8M4N16K32:
+      usesRVVAffineI4I8M4 = true;
+      break;
+    case LocalLeafKind::IMESymmetricI4I8N16K32:
+      usesIME1SymmetricI4I8 = true;
+      break;
+    case LocalLeafKind::IMEAffineI4I8N16K32:
+      usesIME1AffineI4I8 = true;
+      break;
+    case LocalLeafKind::IMESymmetricI4I8M4N16K32:
+      usesIME1SymmetricI4I8M4 = true;
+      break;
+    case LocalLeafKind::IMEAffineI4I8M4N16K32:
+      usesIME1AffineI4I8M4 = true;
+      break;
+    case LocalLeafKind::GroupedAffineI4I8Register:
+      if (implementation.leaf.lanes == 16)
+        usesGroupedI4I8RegisterL16 = true;
+      else if (implementation.leaf.lanes == 32)
+        usesGroupedI4I8RegisterL32 = true;
+      else
+        supported = false;
+      break;
+    case LocalLeafKind::GroupedAffineI4I8Strip:
+      usesGroupedI4I8Strip = true;
+      break;
+    case LocalLeafKind::E2M1E8M0I8RegisterE8MF2:
+      usesE2M1RegisterE8MF2 = true;
+      break;
+    case LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2:
+      usesE2M1RegisterE8M1M2 = true;
+      break;
+    case LocalLeafKind::E2M1E8M0I8Strip:
+      usesE2M1Strip = true;
+      break;
+    case LocalLeafKind::PackedI4I8Register:
+    case LocalLeafKind::PackedI5I8Register:
+    case LocalLeafKind::PackedI3GroupedI8Register:
+    case LocalLeafKind::Base3TernaryI8Register:
+    case LocalLeafKind::PackedI2TernaryI8Register:
+    case LocalLeafKind::SignedCodebook8I8Register:
+    case LocalLeafKind::SignedCodebook4I8Register:
+    case LocalLeafKind::PackedU9U7CodebookI8Register:
+    case LocalLeafKind::PackedU11GridDeltaI8Register:
+    case LocalLeafKind::NibbleCodebookI8Register:
+    case LocalLeafKind::IQ2SI8Register:
+    case LocalLeafKind::IQ3SI8Register:
+    case LocalLeafKind::IQ1MI8Register:
+    case LocalLeafKind::Q6KI8Register:
+    case LocalLeafKind::Q6KI8RVVAssembly:
       break;
     }
     if (!supported)
-      unsupportedSymbol = symbol.empty() ? "<unnamed local implementation>"
-                                         : symbol;
+      unsupportedSymbol = symbol;
   });
   if (!supported)
     return false;

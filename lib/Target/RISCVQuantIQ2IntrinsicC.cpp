@@ -9,7 +9,7 @@ namespace weft::riscv_internal {
 bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation) {
   if (!isIQ2SLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
@@ -61,7 +61,7 @@ bool emitIQ2LocalImplementation(llvm::raw_ostream &output,
   const unsigned vectorCount = 4 * groupsPerVector;
   const unsigned segmentCount = 2 * groupsPerVector;
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *codes, const uint8_t *high_bits,\n"
          << "    const uint8_t *sign_bits, const uint8_t *scales,\n"
          << "    const uint8_t *activation_bytes, float weight_scale,\n"

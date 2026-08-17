@@ -464,33 +464,74 @@ enum class LocalPrimitiveKind {
   Q6KI8,
 };
 
-enum class LocalLeafSpelling {
-  IntrinsicC,
-  Q6KRVVAssembly,
+enum class LocalLeafKind {
+  None,
+  RVVSymmetricI4I8N16K32,
+  RVVAffineI4I8N16K32,
+  RVVSymmetricI4I8M4N16K32,
+  RVVAffineI4I8M4N16K32,
+  IMESymmetricI4I8N16K32,
+  IMEAffineI4I8N16K32,
+  IMESymmetricI4I8M4N16K32,
+  IMEAffineI4I8M4N16K32,
+  GroupedAffineI4I8Register,
+  GroupedAffineI4I8Strip,
+  E2M1E8M0I8RegisterE8MF2,
+  E2M1E8M0I8RegisterE8M1E8M2,
+  E2M1E8M0I8Strip,
+  PackedI4I8Register,
+  PackedI5I8Register,
+  PackedI3GroupedI8Register,
+  Base3TernaryI8Register,
+  PackedI2TernaryI8Register,
+  SignedCodebook8I8Register,
+  SignedCodebook4I8Register,
+  PackedU9U7CodebookI8Register,
+  PackedU11GridDeltaI8Register,
+  NibbleCodebookI8Register,
+  IQ2SI8Register,
+  IQ3SI8Register,
+  IQ1MI8Register,
+  Q6KI8Register,
+  Q6KI8RVVAssembly,
+};
+
+struct LocalLeafDecision {
+  LocalLeafKind kind = LocalLeafKind::None;
+  unsigned lanes = 0;
+  RVVVectorShape primaryShape;
+
+  explicit operator bool() const { return kind != LocalLeafKind::None; }
+  bool operator==(const LocalLeafDecision &other) const {
+    return kind == other.kind && lanes == other.lanes &&
+           primaryShape == other.primaryShape;
+  }
+  bool operator<(const LocalLeafDecision &other) const {
+    return std::tie(kind, lanes, primaryShape) <
+           std::tie(other.kind, other.lanes, other.primaryShape);
+  }
 };
 
 struct LocalImplementation {
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
-  LocalLeafSpelling leafSpelling = LocalLeafSpelling::IntrinsicC;
+  LocalLeafDecision leaf;
   CorePhysicalMapping mapping;
   llvm::SmallVector<RVVVectorShape, 4> valueShapes;
   unsigned entryWidth = 0;
-  std::string helperSymbol;
 
   explicit operator bool() const {
     return primitive != LocalPrimitiveKind::None && mapping;
   }
   bool operator==(const LocalImplementation &other) const {
-    return primitive == other.primitive && leafSpelling == other.leafSpelling &&
-           mapping == other.mapping &&
-           valueShapes == other.valueShapes && entryWidth == other.entryWidth &&
-           helperSymbol == other.helperSymbol;
+    return primitive == other.primitive && leaf == other.leaf &&
+           mapping == other.mapping && valueShapes == other.valueShapes &&
+           entryWidth == other.entryWidth;
   }
   bool operator<(const LocalImplementation &other) const {
     if (primitive != other.primitive)
       return primitive < other.primitive;
-    if (leafSpelling != other.leafSpelling)
-      return leafSpelling < other.leafSpelling;
+    if (!(leaf == other.leaf))
+      return leaf < other.leaf;
     if (!(mapping == other.mapping))
       return mapping < other.mapping;
     if (valueShapes != other.valueShapes)
@@ -499,9 +540,12 @@ struct LocalImplementation {
                                           other.valueShapes.end());
     if (entryWidth != other.entryWidth)
       return entryWidth < other.entryWidth;
-    return helperSymbol < other.helperSymbol;
+    return false;
   }
 };
+
+std::string localImplementationSymbol(
+    const LocalImplementation &implementation);
 
 bool isPackedDotLocalImplementationMapping(
     const LocalImplementation &implementation);

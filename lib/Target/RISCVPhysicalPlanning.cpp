@@ -600,8 +600,8 @@ static bool validateLocalInstructionMapping(
   return false;
 }
 
-static std::string
-selectLocalImplementationSymbol(const LocalImplementation &implementation) {
+static std::optional<LocalLeafDecision>
+selectLocalLeafDecision(const LocalImplementation &implementation) {
   const RVVVectorShape primary = implementation.valueShapes.empty()
                                      ? RVVVectorShape{}
                                      : implementation.valueShapes.front();
@@ -614,64 +614,175 @@ selectLocalImplementationSymbol(const LocalImplementation &implementation) {
           : localRegisterFactor(implementation, kCoreAxisM);
   const bool sequential =
       localSequentialFactor(implementation, kCoreAxisK) > 1;
-  const std::string shape = rvvShapeSuffix(primary);
-  const std::string registerSuffix =
-      "_register_l" + std::to_string(lanes) + "_e" + shape;
+  auto registerLeaf = [&](LocalLeafKind kind,
+                          unsigned selectedLanes = 0) {
+    return LocalLeafDecision{kind, selectedLanes ? selectedLanes : lanes,
+                             primary};
+  };
   switch (implementation.primitive) {
   case LocalPrimitiveKind::None:
+    return std::nullopt;
   case LocalPrimitiveKind::F32Math:
-    return {};
-  case LocalPrimitiveKind::SymmetricI4I8:
-  case LocalPrimitiveKind::AffineI4I8: {
-    const bool affine =
-        implementation.primitive == LocalPrimitiveKind::AffineI4I8;
+    return LocalLeafDecision{};
+  case LocalPrimitiveKind::SymmetricI4I8: {
     const bool ime = implementation.mapping.instruction ==
                      CoreInstructionKind::SpacemitIME1MMA;
-    std::string name = "__weft_" + std::string(ime ? "ime1_" : "rvv_") +
-                       (affine ? "affine" : "symmetric") + "_i4_i8_";
-    if (rows == 4)
-      name += "m4_";
-    return name + "n16_k32";
+    if (ime)
+      return LocalLeafDecision{
+          rows == 4 ? LocalLeafKind::IMESymmetricI4I8M4N16K32
+                    : LocalLeafKind::IMESymmetricI4I8N16K32};
+    return LocalLeafDecision{
+        rows == 4 ? LocalLeafKind::RVVSymmetricI4I8M4N16K32
+                  : LocalLeafKind::RVVSymmetricI4I8N16K32};
+  }
+  case LocalPrimitiveKind::AffineI4I8: {
+    const bool ime = implementation.mapping.instruction ==
+                     CoreInstructionKind::SpacemitIME1MMA;
+    if (ime)
+      return LocalLeafDecision{
+          rows == 4 ? LocalLeafKind::IMEAffineI4I8M4N16K32
+                    : LocalLeafKind::IMEAffineI4I8N16K32};
+    return LocalLeafDecision{
+        rows == 4 ? LocalLeafKind::RVVAffineI4I8M4N16K32
+                  : LocalLeafKind::RVVAffineI4I8N16K32};
   }
   case LocalPrimitiveKind::GroupedAffineI4I8:
     return sequential
-               ? "__weft_grouped_affine_i4_i8_strip"
-               : "__weft_grouped_affine_i4_i8_register_l" +
-                     std::to_string(hardwareLanes) + "_e" + shape;
+               ? LocalLeafDecision{LocalLeafKind::GroupedAffineI4I8Strip}
+               : registerLeaf(LocalLeafKind::GroupedAffineI4I8Register,
+                              hardwareLanes);
   case LocalPrimitiveKind::E2M1E8M0I8:
     if (sequential)
-      return "__weft_e2m1_e8m0_i8_strip";
+      return LocalLeafDecision{LocalLeafKind::E2M1E8M0I8Strip};
     return primary == RVVVectorShape{8, 4}
-               ? "__weft_e2m1_e8m0_i8_register_e8mf2"
-               : "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
+               ? LocalLeafDecision{
+                     LocalLeafKind::E2M1E8M0I8RegisterE8MF2}
+               : LocalLeafDecision{
+                     LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2};
   case LocalPrimitiveKind::PackedI4I8:
-    return "__weft_packed_i4_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedI4I8Register);
   case LocalPrimitiveKind::PackedI5I8:
-    return "__weft_packed_i5_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedI5I8Register);
   case LocalPrimitiveKind::PackedI3GroupedI8:
-    return "__weft_packed_i3_grouped_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedI3GroupedI8Register);
   case LocalPrimitiveKind::Base3TernaryI8:
-    return "__weft_base3_ternary_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::Base3TernaryI8Register);
   case LocalPrimitiveKind::PackedI2TernaryI8:
-    return "__weft_packed_i2_ternary_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedI2TernaryI8Register);
   case LocalPrimitiveKind::SignedCodebook8I8:
-    return "__weft_signed_codebook8_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::SignedCodebook8I8Register);
   case LocalPrimitiveKind::SignedCodebook4I8:
-    return "__weft_signed_codebook4_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::SignedCodebook4I8Register);
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
-    return "__weft_packed_u9_u7_codebook_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedU9U7CodebookI8Register);
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    return "__weft_packed_u11_grid_delta_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::PackedU11GridDeltaI8Register);
   case LocalPrimitiveKind::NibbleCodebookI8:
-    return "__weft_nibble_codebook_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::NibbleCodebookI8Register);
   case LocalPrimitiveKind::IQ2SI8:
-    return "__weft_iq2_s_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::IQ2SI8Register);
   case LocalPrimitiveKind::IQ3SI8:
-    return "__weft_iq3_s_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::IQ3SI8Register);
   case LocalPrimitiveKind::IQ1MI8:
-    return "__weft_iq1_m_i8" + registerSuffix;
+    return registerLeaf(LocalLeafKind::IQ1MI8Register);
   case LocalPrimitiveKind::Q6KI8:
-    return "__weft_q6_k_i8" + registerSuffix;
+    return registerLeaf(lanes == 32 && primary == RVVVectorShape{8, 16}
+                            ? LocalLeafKind::Q6KI8RVVAssembly
+                            : LocalLeafKind::Q6KI8Register);
+  }
+  return std::nullopt;
+}
+
+std::string localImplementationSymbol(
+    const LocalImplementation &implementation) {
+  const LocalLeafDecision &leaf = implementation.leaf;
+  const std::string shape = rvvShapeSuffix(leaf.primaryShape);
+  const std::string registerSuffix =
+      leaf.lanes && !shape.empty()
+          ? "_register_l" + std::to_string(leaf.lanes) + "_e" + shape
+          : std::string{};
+  switch (leaf.kind) {
+  case LocalLeafKind::None:
+    return {};
+  case LocalLeafKind::RVVSymmetricI4I8N16K32:
+    return "__weft_rvv_symmetric_i4_i8_n16_k32";
+  case LocalLeafKind::RVVAffineI4I8N16K32:
+    return "__weft_rvv_affine_i4_i8_n16_k32";
+  case LocalLeafKind::RVVSymmetricI4I8M4N16K32:
+    return "__weft_rvv_symmetric_i4_i8_m4_n16_k32";
+  case LocalLeafKind::RVVAffineI4I8M4N16K32:
+    return "__weft_rvv_affine_i4_i8_m4_n16_k32";
+  case LocalLeafKind::IMESymmetricI4I8N16K32:
+    return "__weft_ime1_symmetric_i4_i8_n16_k32";
+  case LocalLeafKind::IMEAffineI4I8N16K32:
+    return "__weft_ime1_affine_i4_i8_n16_k32";
+  case LocalLeafKind::IMESymmetricI4I8M4N16K32:
+    return "__weft_ime1_symmetric_i4_i8_m4_n16_k32";
+  case LocalLeafKind::IMEAffineI4I8M4N16K32:
+    return "__weft_ime1_affine_i4_i8_m4_n16_k32";
+  case LocalLeafKind::GroupedAffineI4I8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_grouped_affine_i4_i8" + registerSuffix;
+  case LocalLeafKind::GroupedAffineI4I8Strip:
+    return "__weft_grouped_affine_i4_i8_strip";
+  case LocalLeafKind::E2M1E8M0I8RegisterE8MF2:
+    return "__weft_e2m1_e8m0_i8_register_e8mf2";
+  case LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2:
+    return "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
+  case LocalLeafKind::E2M1E8M0I8Strip:
+    return "__weft_e2m1_e8m0_i8_strip";
+  case LocalLeafKind::PackedI4I8Register:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_packed_i4_i8" + registerSuffix;
+  case LocalLeafKind::PackedI5I8Register:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_packed_i5_i8" + registerSuffix;
+  case LocalLeafKind::PackedI3GroupedI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_packed_i3_grouped_i8" + registerSuffix;
+  case LocalLeafKind::Base3TernaryI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_base3_ternary_i8" + registerSuffix;
+  case LocalLeafKind::PackedI2TernaryI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_packed_i2_ternary_i8" + registerSuffix;
+  case LocalLeafKind::SignedCodebook8I8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_signed_codebook8_i8" + registerSuffix;
+  case LocalLeafKind::SignedCodebook4I8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_signed_codebook4_i8" + registerSuffix;
+  case LocalLeafKind::PackedU9U7CodebookI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_packed_u9_u7_codebook_i8" + registerSuffix;
+  case LocalLeafKind::PackedU11GridDeltaI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_packed_u11_grid_delta_i8" + registerSuffix;
+  case LocalLeafKind::NibbleCodebookI8Register:
+    return registerSuffix.empty()
+               ? std::string{}
+               : "__weft_nibble_codebook_i8" + registerSuffix;
+  case LocalLeafKind::IQ2SI8Register:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_iq2_s_i8" + registerSuffix;
+  case LocalLeafKind::IQ3SI8Register:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_iq3_s_i8" + registerSuffix;
+  case LocalLeafKind::IQ1MI8Register:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_iq1_m_i8" + registerSuffix;
+  case LocalLeafKind::Q6KI8Register:
+  case LocalLeafKind::Q6KI8RVVAssembly:
+    return registerSuffix.empty() ? std::string{}
+                                  : "__weft_q6_k_i8" + registerSuffix;
   }
   return {};
 }
@@ -679,9 +790,14 @@ selectLocalImplementationSymbol(const LocalImplementation &implementation) {
 static bool finalizeLocalInstructionMapping(LocalImplementation &implementation) {
   if (!validateLocalInstructionMapping(implementation))
     return false;
-  implementation.helperSymbol = selectLocalImplementationSymbol(implementation);
-  return implementation.primitive == LocalPrimitiveKind::F32Math ||
-         !implementation.helperSymbol.empty();
+  std::optional<LocalLeafDecision> leaf =
+      selectLocalLeafDecision(implementation);
+  if (!leaf)
+    return false;
+  implementation.leaf = *leaf;
+  return implementation.primitive == LocalPrimitiveKind::F32Math
+             ? !implementation.leaf
+             : !localImplementationSymbol(implementation).empty();
 }
 
 bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
@@ -2472,9 +2588,6 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
         continue;
       implementation.valueShapes = {laneShape, *chunkShape, *productShape,
                                     *segmentProductShape};
-      if (candidate.axis.laneFactor == 32 &&
-          laneShape == RVVVectorShape{8, 16})
-        implementation.leafSpelling = LocalLeafSpelling::Q6KRVVAssembly;
     } else {
       implementation.valueShapes = {laneShape};
     }
@@ -2534,7 +2647,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
            2 * (candidate.axis.laneFactor / 16)},
           {PhysicalLiveClass::Temporary, kRVVE32M1}};
     } else if (primitive == LocalPrimitiveKind::Q6KI8) {
-      if (implementation.leafSpelling == LocalLeafSpelling::Q6KRVVAssembly) {
+      if (implementation.leaf.kind == LocalLeafKind::Q6KI8RVVAssembly) {
         PhysicalResourceRequirements requirements;
         requirements.reservedGroups = 0;
         requirements.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};

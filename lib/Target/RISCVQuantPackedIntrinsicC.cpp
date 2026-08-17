@@ -16,7 +16,7 @@ bool emitPackedDotLocalImplementation(
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
   if (!isPackedDotLocalImplementationMapping(implementation) || !reduction ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
 
   const RVVVectorShape shape = implementation.mapping.laneShape;
@@ -53,7 +53,7 @@ bool emitPackedDotLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n";
+         << localImplementationSymbol(implementation) << "(\n";
   if (hasHighBits)
     output << "    const uint8_t *low_bits, const uint8_t *high_bits,\n";
   else
@@ -163,7 +163,7 @@ bool emitPackedI5LocalImplementation(
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (!isNibbleCodebookLocalImplementationMapping(implementation) ||
-      implementation.helperSymbol.empty())
+      localImplementationSymbol(implementation).empty())
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape packedShape = implementation.valueShapes[1];
@@ -200,7 +200,7 @@ bool emitNibbleCodebookLocalImplementation(
     return false;
 
   output << "static inline __attribute__((always_inline, unused)) float\n"
-         << implementation.helperSymbol << "(\n"
+         << localImplementationSymbol(implementation) << "(\n"
          << "    const uint8_t *packed_codes, const uint8_t *table_bytes,\n"
          << "    const uint8_t *activation_bytes, float dot_scale, float init) {\n"
          << "  const size_t vl16 = " << packedSetVL << "(16);\n"

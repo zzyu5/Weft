@@ -57,13 +57,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   selected.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
       return;
-    const std::string &symbol = implementation.helperSymbol;
-    auto match = [&](const char *expected, bool &flag) {
-      if (symbol != expected)
-        return false;
-      flag = true;
-      return true;
-    };
+    const std::string symbol = localImplementationSymbol(implementation);
     switch (implementation.primitive) {
     case LocalPrimitiveKind::PackedI4I8:
       supported = emitPackedI4LocalImplementation(output, implementation);
@@ -131,27 +125,27 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
 
   if (iq2Implementation &&
       !emitIQ2LocalImplementation(output, *iq2Implementation)) {
-    unsupportedSymbol = iq2Implementation->helperSymbol;
+    unsupportedSymbol = localImplementationSymbol(*iq2Implementation);
     return false;
   }
   if (iq3Implementation &&
       !emitIQ3LocalImplementation(output, *iq3Implementation)) {
-    unsupportedSymbol = iq3Implementation->helperSymbol;
+    unsupportedSymbol = localImplementationSymbol(*iq3Implementation);
     return false;
   }
   if (iq1Implementation &&
       !emitIQ1LocalImplementation(output, *iq1Implementation)) {
-    unsupportedSymbol = iq1Implementation->helperSymbol;
+    unsupportedSymbol = localImplementationSymbol(*iq1Implementation);
     return false;
   }
   if (q6Implementation &&
       !emitQ6LocalImplementation(output, *q6Implementation)) {
-    unsupportedSymbol = q6Implementation->helperSymbol;
+    unsupportedSymbol = localImplementationSymbol(*q6Implementation);
     return false;
   }
   if (packedI3Implementation && !emitPackedI3GroupedLocalImplementation(
                                     output, *packedI3Implementation)) {
-    unsupportedSymbol = packedI3Implementation->helperSymbol;
+    unsupportedSymbol = localImplementationSymbol(*packedI3Implementation);
     return false;
   }
   return true;
