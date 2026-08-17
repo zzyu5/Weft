@@ -940,11 +940,20 @@ private:
     kernel.walk([&](SortIndicesOp op) {
       if (decisionFailure)
         return;
+      SortIndicesCandidateFacts facts;
+      if (std::optional<int64_t> extent = integerConstantValue(op.getExtent());
+          extent && *extent > 0)
+        facts.mapping.axes = {LogicalAxisConstraint{
+            kCoreAxisBlock, LogicalAxisRole::Free,
+            static_cast<uint64_t>(*extent), true, false, false, {1}}};
+      else
+        facts.mapping.axes = {LogicalAxisConstraint{
+            kCoreAxisBlock, LogicalAxisRole::Free, std::nullopt, true, false,
+            false, {1}}};
+      facts.descending = op.getOrder() == "descending";
+      facts.configuredRadixBits = options.backend.parameters.sortRadixBits;
       std::optional<SelectedSortIndicesPhysical> selected =
-          selectSortIndicesPhysical(
-              {op.getOrder() == "descending",
-               options.backend.parameters.sortRadixBits},
-              options.target);
+          selectSortIndicesPhysical(facts, options.target);
       if (!selected) {
         op.emitError(
             "sort_indices has no legal radix implementation for this target and config");
@@ -3361,7 +3370,12 @@ private:
     if (mlir::failed(requireEntityPlan(op.getOperation(), found->second)))
       return mlir::failure();
     const SelectedSortIndicesPhysical &decision = found->second.realization;
-    if ((decision.radixBits != 8 && decision.radixBits != 11) ||
+    const PhysicalAxisDecomposition *orderedAxis =
+        findAxisMapping(decision.mapping, kCoreAxisBlock);
+    if (decision.mapping.instruction != CoreInstructionKind::Scalar ||
+        !orderedAxis || !orderedAxis->ordered || orderedAxis->laneFactor != 1 ||
+        orderedAxis->registerFactor != 1 ||
+        (decision.radixBits != 8 && decision.radixBits != 11) ||
         decision.passes !=
             (32 + decision.radixBits - 1) / decision.radixBits)
       return op.emitError("sort_indices decision has no intrinsic-C spelling");

@@ -137,6 +137,7 @@ struct PhysicalAxisDecomposition {
   unsigned id = 0;
   LogicalAxisRole role = LogicalAxisRole::Free;
   std::optional<uint64_t> extent;
+  bool ordered = false;
   unsigned sequentialFactor = 0;
   unsigned laneFactor = 1;
   unsigned registerFactor = 1;

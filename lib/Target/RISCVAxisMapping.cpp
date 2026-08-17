@@ -117,19 +117,21 @@ registerFactorCandidates(uint64_t extent, unsigned maximum) {
 
 bool PhysicalAxisDecomposition::operator==(
     const PhysicalAxisDecomposition &other) const {
-  return std::tie(id, role, extent, sequentialFactor, laneFactor,
+  return std::tie(id, role, extent, ordered, sequentialFactor, laneFactor,
                   registerFactor, unrollFactor, fragmentFactor) ==
-         std::tie(other.id, other.role, other.extent, other.sequentialFactor,
-                  other.laneFactor, other.registerFactor, other.unrollFactor,
+         std::tie(other.id, other.role, other.extent, other.ordered,
+                  other.sequentialFactor, other.laneFactor,
+                  other.registerFactor, other.unrollFactor,
                   other.fragmentFactor);
 }
 
 bool PhysicalAxisDecomposition::operator<(
     const PhysicalAxisDecomposition &other) const {
-  return std::tie(id, role, extent, sequentialFactor, laneFactor,
+  return std::tie(id, role, extent, ordered, sequentialFactor, laneFactor,
                   registerFactor, unrollFactor, fragmentFactor) <
-         std::tie(other.id, other.role, other.extent, other.sequentialFactor,
-                  other.laneFactor, other.registerFactor, other.unrollFactor,
+         std::tie(other.id, other.role, other.extent, other.ordered,
+                  other.sequentialFactor, other.laneFactor,
+                  other.registerFactor, other.unrollFactor,
                   other.fragmentFactor);
 }
 
@@ -273,6 +275,7 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
               decomposition.id = axis.id;
               decomposition.role = axis.role;
               decomposition.extent = axis.extent;
+              decomposition.ordered = axis.ordered;
               decomposition.laneFactor = axis.id == laneAxis ? laneFactor : 1;
               decomposition.registerFactor = registers[index];
               decomposition.unrollFactor =
@@ -302,7 +305,8 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
           for (size_t index = 0; index < problem.axes.size(); ++index) {
             const LogicalAxisConstraint &axis = problem.axes[index];
             mapping.axes.push_back(PhysicalAxisDecomposition{
-                axis.id, axis.role, axis.extent, 0, 1, registers[index],
+                axis.id, axis.role, axis.extent, axis.ordered, 0, 1,
+                registers[index],
                 problem.unrollAxis && *problem.unrollAxis == axis.id ? unroll
                                                                     : 1,
                 1});
@@ -327,7 +331,8 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
       if (found != fragment.factors.end())
         fragmentFactor = found->factor;
       mapping.axes.push_back(PhysicalAxisDecomposition{
-          axis.id, axis.role, axis.extent, 0, 1, 1, 1, fragmentFactor});
+          axis.id, axis.role, axis.extent, axis.ordered, 0, 1, 1, 1,
+          fragmentFactor});
     }
     finalizeSequentialFactors(mapping);
     mappings.push_back(std::move(mapping));

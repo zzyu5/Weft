@@ -698,7 +698,24 @@ selectSortIndicesPhysical(const SortIndicesCandidateFacts &facts,
       (facts.configuredRadixBits != 0 && facts.configuredRadixBits != 8 &&
        facts.configuredRadixBits != 11))
     return std::nullopt;
+  if (facts.mapping.axes.size() != 1 ||
+      facts.mapping.axes.front().id != kCoreAxisBlock ||
+      !facts.mapping.axes.front().ordered ||
+      facts.mapping.axes.front().allowLane ||
+      facts.mapping.axes.front().requireLane)
+    return std::nullopt;
+  CoreMappingProblem problem = facts.mapping;
+  problem.allowSequentialOnly = true;
+  problem.sequentialInstruction = CoreInstructionKind::Scalar;
+  llvm::SmallVector<CorePhysicalMapping> mappings =
+      enumerateCorePhysicalMappings(problem, target);
+  if (mappings.size() != 1 || mappings.front().instruction !=
+                                  CoreInstructionKind::Scalar ||
+      mappings.front().axes.size() != 1 ||
+      !mappings.front().axes.front().ordered)
+    return std::nullopt;
   SelectedSortIndicesPhysical selected;
+  selected.mapping = std::move(mappings.front());
   selected.descending = facts.descending;
   selected.radixBits = facts.configuredRadixBits == 0
                            ? 8
@@ -709,7 +726,12 @@ selectSortIndicesPhysical(const SortIndicesCandidateFacts &facts,
   int64_t privateBytes = selected.privateElements * target.xlen / 8;
   if (privateBytes > target.maxPrivateStackBytes)
     return std::nullopt;
-  selected.resources.architecturalGroups = target.vectorRegisters;
+  PhysicalResourceRequirements requirements;
+  std::optional<PhysicalResourceBudget> resources =
+      calculatePhysicalResources(requirements, target);
+  if (!resources)
+    return std::nullopt;
+  selected.resources = *resources;
   return selected;
 }
 

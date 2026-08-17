@@ -188,11 +188,13 @@ selectMaterializedBlockStorePhysical(
     const RISCVTargetProfile &target);
 
 struct SortIndicesCandidateFacts {
+  CoreMappingProblem mapping;
   bool descending = false;
   int64_t configuredRadixBits = 0;
 };
 
 struct SelectedSortIndicesPhysical {
+  CorePhysicalMapping mapping;
   bool descending = false;
   unsigned radixBits = 0;
   unsigned passes = 0;
