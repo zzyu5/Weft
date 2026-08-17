@@ -382,13 +382,11 @@ struct VLAUnaryDecision {
 
 struct VLAStateDecision {
   mlir::Operation *operation = nullptr;
-  VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
+  VLAStateCandidateFacts facts;
   llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
   SelectedVLAStatePhysical physical;
   mlir::Type elementType;
   mlir::Value identity;
-  PhysicalMemoryMode coordinateMode = PhysicalMemoryMode::UnitStride;
-  bool relaxedOrder = false;
   mlir::Value segmentStart;
   mlir::Value segmentVector;
   VLAStateValidityRealization validity =
@@ -2570,8 +2568,9 @@ private:
           reduce.emitError("VLA reduction kind has no physical realization");
           return mlir::failure();
         }
-        state.semantic = *semantic;
-        state.relaxedOrder = reduce.getOrder() == "relaxed";
+        state.facts.semantic = *semantic;
+        state.facts.relaxedOrder = reduce.getOrder() == "relaxed";
+        state.facts.maskedInput = maskedInput;
         decision.states.push_back(std::move(state));
       } else if (auto scan = mlir::dyn_cast<ScanOp>(nested)) {
         bool unsegmented =
@@ -2599,12 +2598,13 @@ private:
         }
         VLAStateDecision state;
         state.operation = scan.getOperation();
-        state.semantic =
+        state.facts.semantic =
             segmented ? VLAStateSemantic::SegmentedInclusiveAddScan
                       : VLAStateSemantic::InclusiveAddScan;
+        state.facts.preservesLanePositions = true;
         state.elementType = elementType(scan.getResult().getType());
         state.identity = scan.getIdentity();
-        state.relaxedOrder = scan.getOrder() == "relaxed";
+        state.facts.relaxedOrder = scan.getOrder() == "relaxed";
         state.segmentStart = scan.getSegmentStart();
         auto segmentCompare = scan.getSegmentStart().getDefiningOp<CompareOp>();
         if (segmentCompare)
@@ -2614,34 +2614,31 @@ private:
                   : segmentCompare.getRhs();
         decision.states.push_back(std::move(state));
       } else if (auto summary = mlir::dyn_cast<ArgMaxOp>(nested)) {
-          LaneRelation coordinate =
-              classifyLaneRelation(summary.getCoordinate(), decision.coordinate);
-          if (coordinate != LaneRelation::UnitStride &&
-              coordinate != LaneRelation::Strided) {
-            summary.emitError("argmax coordinate is not affine in the VLA axis");
-            return mlir::failure();
-          }
-          VLAStateDecision state;
-          state.operation = summary.getOperation();
-          state.semantic = VLAStateSemantic::ArgMaxSummary;
-          state.elementType = summary.getResult().getType();
-          state.relaxedOrder = summary.getOrder() == "relaxed";
-          if (mlir::isa<MaskedType>(summary.getInput().getType()))
-            state.validity = VLAStateValidityRealization::NegativeInfinity;
-          state.coordinateMode = coordinate == LaneRelation::UnitStride
-                                     ? PhysicalMemoryMode::UnitStride
-                                     : PhysicalMemoryMode::Strided;
-          decision.states.push_back(state);
+        VLAStateDecision state;
+        state.operation = summary.getOperation();
+        state.facts.semantic = VLAStateSemantic::ArgMaxSummary;
+        state.facts.relaxedOrder = summary.getOrder() == "relaxed";
+        state.facts.coordinateRelation =
+            classifyLaneRelation(summary.getCoordinate(), decision.coordinate);
+        state.facts.maskedInput =
+            mlir::isa<MaskedType>(summary.getInput().getType());
+        state.elementType = summary.getResult().getType();
+        if (state.facts.maskedInput)
+          state.validity = VLAStateValidityRealization::NegativeInfinity;
+        decision.states.push_back(std::move(state));
       } else if (auto summary =
                      mlir::dyn_cast<OnlineSoftmaxSummaryOp>(nested)) {
-          VLAStateDecision state;
-          state.operation = summary.getOperation();
-          state.semantic = VLAStateSemantic::OnlineSoftmaxSummary;
-          state.elementType = summary.getResult().getType();
-          state.relaxedOrder = summary.getOrder() == "relaxed";
-          if (mlir::isa<MaskedType>(summary.getInput().getType()))
-            state.validity = VLAStateValidityRealization::OnlineSoftmax;
-          decision.states.push_back(std::move(state));
+        VLAStateDecision state;
+        state.operation = summary.getOperation();
+        state.facts.semantic = VLAStateSemantic::OnlineSoftmaxSummary;
+        state.facts.relaxedOrder = summary.getOrder() == "relaxed";
+        state.facts.maskedInput =
+            mlir::isa<MaskedType>(summary.getInput().getType());
+        state.facts.requiresF32Math = true;
+        state.elementType = summary.getResult().getType();
+        if (state.facts.maskedInput)
+          state.validity = VLAStateValidityRealization::OnlineSoftmax;
+        decision.states.push_back(std::move(state));
       }
     }
     for (VLAStateDecision &state : decision.states) {
@@ -2661,9 +2658,22 @@ private:
             "VLA state primitive has no typed value-use facts");
         return mlir::failure();
       }
-      VLAStateCandidateFacts facts;
-      facts.semantic = state.semantic;
-      facts.relaxedOrder = state.relaxedOrder;
+      VLAStateCandidateFacts &facts = state.facts;
+      mlir::Type inputElement = elementType(input.getType());
+      mlir::Type resultElement = elementType(result.getType());
+      if (auto floating = mlir::dyn_cast<mlir::FloatType>(inputElement)) {
+        facts.inputSEW = floating.getWidth();
+        facts.floatingInput = true;
+      } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(inputElement)) {
+        facts.inputSEW = integer.getWidth();
+        facts.signedInput = integer.isSigned();
+      }
+      if (auto floating = mlir::dyn_cast<mlir::FloatType>(resultElement)) {
+        facts.resultSEW = floating.getWidth();
+        facts.floatingResult = true;
+      } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(resultElement)) {
+        facts.resultSEW = integer.getWidth();
+      }
       facts.inputLaneMapped =
           llvm::is_contained(inputFact->second.logicalAxes,
                              decision.coordinate);
@@ -2680,11 +2690,6 @@ private:
         return mlir::failure();
       }
     }
-    const bool needsF32MathImplementation =
-        !decision.unaries.empty() ||
-        llvm::any_of(decision.states, [](const VLAStateDecision &state) {
-          return state.semantic == VLAStateSemantic::OnlineSoftmaxSummary;
-        });
     bool hasF32RegionValue = llvm::any_of(
         physicalOperations, [](mlir::Operation *operation) {
           return llvm::any_of(operation->getResultTypes(), [](mlir::Type type) {
@@ -2805,6 +2810,11 @@ private:
     for (auto &&[state, physical] :
          llvm::zip_equal(decision.states, selected->states))
       state.physical = physical;
+    const bool needsF32MathImplementation =
+        !decision.unaries.empty() ||
+        llvm::any_of(decision.states, [](const VLAStateDecision &state) {
+          return state.physical.requiresF32Math;
+        });
     entity.mapping = selected->mapping;
     entity.vlaIndexShape = selected->indexShape;
     entity.vlaMaskRatio = selected->maskRatio;
@@ -12078,7 +12088,7 @@ private:
          "(" + equal + ", " + activeVL +
          ");");
     std::string laneOffset = first;
-    if (decision.coordinateMode == PhysicalMemoryMode::Strided)
+    if (decision.physical.coordinateMode == PhysicalMemoryMode::Strided)
       laneOffset = "(" + first + " * (" + coordinate.laneStride + "))";
     line("const size_t " + stripIndex + " = (size_t)(" + coordinate.spelling +
          " + " + laneOffset + ");");

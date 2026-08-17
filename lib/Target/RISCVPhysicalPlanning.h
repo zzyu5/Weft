@@ -596,6 +596,15 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
 struct VLAStateCandidateFacts {
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
   bool relaxedOrder = false;
+  unsigned inputSEW = 0;
+  unsigned resultSEW = 0;
+  bool floatingInput = false;
+  bool floatingResult = false;
+  bool signedInput = false;
+  bool preservesLanePositions = false;
+  bool maskedInput = false;
+  bool requiresF32Math = false;
+  LaneRelation coordinateRelation = LaneRelation::Independent;
   bool inputLaneMapped = false;
   bool resultLaneMapped = false;
   bool resultControlCarried = false;
@@ -610,6 +619,8 @@ struct SelectedVLAStatePhysical {
   RVVVectorShape inputShape;
   RVVVectorShape carryShape;
   RVVVectorShape seedShape;
+  PhysicalMemoryMode coordinateMode = PhysicalMemoryMode::UnitStride;
+  bool requiresF32Math = false;
 };
 
 llvm::SmallVector<SelectedVLAStatePhysical, 2>

@@ -1468,53 +1468,63 @@ enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
   llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
   if (!target.hasRVV || !facts.inputLaneMapped)
     return candidates;
-  const bool resultMustCarryLane =
-      facts.semantic == VLAStateSemantic::InclusiveAddScan ||
-      facts.semantic == VLAStateSemantic::SegmentedInclusiveAddScan;
-  if (facts.resultLaneMapped != resultMustCarryLane)
+  if (facts.resultLaneMapped != facts.preservesLanePositions)
     return candidates;
   SelectedVLAStatePhysical scalar;
   scalar.wholeVLALifetime = facts.resultControlCarried ||
                             facts.resultCrossesRegion ||
                             !facts.resultLaneMapped;
+  scalar.requiresF32Math = facts.requiresF32Math;
+  const bool f32Input = facts.floatingInput && facts.inputSEW == 32;
+  const bool f32Result = facts.floatingResult && facts.resultSEW == 32;
   switch (facts.semantic) {
   case VLAStateSemantic::F32AddReduction:
-    if (!target.hasF)
+    if (!target.hasF || !f32Input || !f32Result)
       return candidates;
     scalar.stripUpdate = VLAStateStripUpdate::AddReduction;
     break;
   case VLAStateSemantic::F32MaxReduction:
-    if (!target.hasF)
+    if (!target.hasF || !f32Input || !f32Result)
       return candidates;
     scalar.stripUpdate = VLAStateStripUpdate::MaxReduction;
     break;
   case VLAStateSemantic::I8AddReductionI32:
-    if (!target.hasWideningInteger)
+    if (!target.hasWideningInteger || !facts.signedInput ||
+        facts.inputSEW != 8 || facts.floatingResult || facts.resultSEW != 32)
       return candidates;
     scalar.stripUpdate = VLAStateStripUpdate::WideningAddReduction;
     candidates.push_back(scalar);
     return candidates;
   case VLAStateSemantic::InclusiveAddScan:
-    if (!target.hasF || facts.relaxedOrder)
+    if (!target.hasF || facts.relaxedOrder || facts.maskedInput || !f32Input ||
+        !f32Result)
       return candidates;
     scalar.stripUpdate = VLAStateStripUpdate::InclusiveAddScan;
     candidates.push_back(scalar);
     return candidates;
   case VLAStateSemantic::SegmentedInclusiveAddScan:
-    if (!target.hasF || facts.relaxedOrder)
+    if (!target.hasF || facts.relaxedOrder || facts.maskedInput || !f32Input ||
+        !f32Result)
       return candidates;
     scalar.stripUpdate = VLAStateStripUpdate::SegmentedInclusiveAddScan;
     candidates.push_back(scalar);
     return candidates;
   case VLAStateSemantic::ArgMaxSummary:
-    if (!target.hasF)
+    if (!target.hasF || !f32Input ||
+        (facts.coordinateRelation != LaneRelation::UnitStride &&
+         facts.coordinateRelation != LaneRelation::Strided))
       return candidates;
     scalar.carry = VLAStateCarryRepresentation::ScalarTuple;
     scalar.stripUpdate = VLAStateStripUpdate::ArgMaxSummary;
+    scalar.coordinateMode =
+        facts.coordinateRelation == LaneRelation::UnitStride
+            ? PhysicalMemoryMode::UnitStride
+            : PhysicalMemoryMode::Strided;
     candidates.push_back(scalar);
     return candidates;
   case VLAStateSemantic::OnlineSoftmaxSummary:
-    if (!target.hasF || facts.relaxedOrder)
+    if (!target.hasF || facts.relaxedOrder || !f32Input ||
+        !facts.requiresF32Math)
       return candidates;
     scalar.carry = VLAStateCarryRepresentation::ScalarTuple;
     scalar.stripUpdate = VLAStateStripUpdate::OnlineSoftmaxSummary;
