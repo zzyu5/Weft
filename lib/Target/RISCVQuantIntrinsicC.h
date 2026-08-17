@@ -11,8 +11,8 @@ namespace weft::riscv_internal {
 
 void emitIQ2LocalImplementations(llvm::raw_ostream &output, bool registerL32,
                                  bool registerL64, bool strip);
-void emitIQ3LocalImplementations(llvm::raw_ostream &output, bool registerL64,
-                                 bool strip);
+bool emitIQ3LocalImplementation(llvm::raw_ostream &output,
+                                const LocalImplementation &implementation);
 void emitIQ1LocalImplementations(llvm::raw_ostream &output, bool registerL32,
                                  bool registerL64, bool strip);
 void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,

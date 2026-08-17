@@ -508,6 +508,8 @@ bool isPackedU9U7CodebookLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isPackedU11GridDeltaLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isIQ3SLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
