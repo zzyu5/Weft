@@ -832,12 +832,14 @@ struct AxisMappedLiveValue {
   std::optional<unsigned> axis;
   unsigned factor = 1;
   unsigned chunk = 1;
+  unsigned fixedGroups = 0;
 };
 
 struct AxisMappedResourceFacts {
   const CorePhysicalMapping *mapping = nullptr;
   llvm::SmallVector<AxisMappedLiveValue> values;
   unsigned predicateGroups = 0;
+  unsigned reservedGroups = 1;
 };
 
 std::optional<PhysicalResourceBudget>

@@ -1683,6 +1683,7 @@ calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
   if (!facts.mapping)
     return std::nullopt;
   PhysicalResourceRequirements requirements;
+  requirements.reservedGroups = facts.reservedGroups;
   for (const AxisMappedLiveValue &value : facts.values) {
     const PhysicalAxisDecomposition *axis =
         value.axis ? findAxisMapping(*facts.mapping, *value.axis) : nullptr;
@@ -1713,8 +1714,8 @@ calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
     }
     if (count == 0)
       return std::nullopt;
-    requirements.live.push_back(
-        PhysicalLiveRange{value.liveClass, value.shape, count});
+    requirements.live.push_back(PhysicalLiveRange{
+        value.liveClass, value.shape, count, value.fixedGroups});
   }
   if (facts.predicateGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
@@ -1857,7 +1858,7 @@ struct QuantPrimitivePhysicalRule {
   unsigned entryWidth = 0;
   llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
   unsigned predicateGroups = 0;
-  std::optional<PhysicalResourceRequirements> directResources;
+  unsigned reservedGroups = 1;
 };
 
 struct LocalPrimitivePhysicalCandidate {
@@ -1897,16 +1898,13 @@ enumerateLocalPrimitivePhysicalCandidates(
             rule->operands, rule->decode) ||
         !finalizeLocalHardwareOperation(implementation))
       continue;
-    std::optional<PhysicalResourceBudget> budget;
-    if (rule->directResources) {
-      budget = calculatePhysicalResources(*rule->directResources, target);
-    } else {
-      AxisMappedResourceFacts resources;
-      resources.mapping = &implementation.mapping;
-      resources.values.append(rule->liveValues.begin(), rule->liveValues.end());
-      resources.predicateGroups = rule->predicateGroups;
-      budget = calculateAxisMappedResources(resources, target);
-    }
+    AxisMappedResourceFacts resources;
+    resources.mapping = &implementation.mapping;
+    resources.values.append(rule->liveValues.begin(), rule->liveValues.end());
+    resources.predicateGroups = rule->predicateGroups;
+    resources.reservedGroups = rule->reservedGroups;
+    std::optional<PhysicalResourceBudget> budget =
+        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     legal.push_back(LocalPrimitivePhysicalCandidate{
@@ -2381,10 +2379,14 @@ deriveQ6QuantRule(const LocalAxisMappingCandidate &candidate,
   if (logicalLanes == 32 && laneShape == RVVVectorShape{8, 16}) {
     rule.operation = LocalHardwareOperationKind::RVVInlineAsm;
     rule.decode = {2, 4, 8};
-    PhysicalResourceRequirements resources;
-    resources.reservedGroups = 0;
-    resources.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
-    rule.directResources = std::move(resources);
+    rule.reservedGroups = 0;
+    rule.liveValues = {{PhysicalLiveClass::Temporary,
+                        {},
+                        AxisMappedMultiplicity::Fixed,
+                        std::nullopt,
+                        1,
+                        1,
+                        static_cast<unsigned>(target.vectorRegisters)}};
     return rule;
   }
   rule.liveValues = {
