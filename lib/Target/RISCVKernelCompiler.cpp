@@ -2619,8 +2619,8 @@ private:
       decision.narrows.push_back(VLANarrowDecision{narrow.getOperation()});
     }
 
-    for (mlir::Operation &nested : body.without_terminator()) {
-      if (isDotOwned(&nested))
+    for (mlir::Operation *nested : physicalOperations) {
+      if (isDotOwned(nested))
         continue;
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
         bool f32Reduction =
@@ -2730,9 +2730,35 @@ private:
       }
     }
     for (VLAStateDecision &state : decision.states) {
-      state.candidates = enumerateVLAStatePhysical(
-          VLAStateCandidateFacts{state.semantic, state.relaxedOrder},
-          options.target);
+      if (state.operation->getNumOperands() == 0 ||
+          state.operation->getNumResults() == 0) {
+        state.operation->emitError(
+            "VLA state primitive has no typed input/result value relation");
+        return mlir::failure();
+      }
+      mlir::Value input = state.operation->getOperand(0);
+      mlir::Value result = state.operation->getResult(0);
+      auto inputFact = kernelFacts.values.find(input);
+      auto resultFact = kernelFacts.values.find(result);
+      if (inputFact == kernelFacts.values.end() ||
+          resultFact == kernelFacts.values.end()) {
+        state.operation->emitError(
+            "VLA state primitive has no typed value-use facts");
+        return mlir::failure();
+      }
+      VLAStateCandidateFacts facts;
+      facts.semantic = state.semantic;
+      facts.relaxedOrder = state.relaxedOrder;
+      facts.inputLaneMapped =
+          llvm::is_contained(inputFact->second.logicalAxes,
+                             decision.coordinate);
+      facts.resultLaneMapped =
+          llvm::is_contained(resultFact->second.logicalAxes,
+                             decision.coordinate);
+      facts.resultControlCarried = resultFact->second.controlCarried;
+      facts.resultCrossesRegion = resultFact->second.crossesRegion;
+      state.candidates =
+          enumerateVLAStatePhysical(facts, options.target);
       if (state.candidates.empty()) {
         state.operation->emitError(
             "VLA state has no legal target implementation for its ordering and target facts");

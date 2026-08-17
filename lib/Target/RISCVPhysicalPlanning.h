@@ -518,6 +518,10 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
 struct VLAStateCandidateFacts {
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
   bool relaxedOrder = false;
+  bool inputLaneMapped = false;
+  bool resultLaneMapped = false;
+  bool resultControlCarried = false;
+  bool resultCrossesRegion = false;
 };
 
 struct SelectedVLAStatePhysical {

@@ -954,9 +954,17 @@ llvm::SmallVector<SelectedVLAStatePhysical, 2>
 enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
                           const RISCVTargetProfile &target) {
   llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
-  if (!target.hasRVV)
+  if (!target.hasRVV || !facts.inputLaneMapped)
+    return candidates;
+  const bool resultMustCarryLane =
+      facts.semantic == VLAStateSemantic::InclusiveAddScan ||
+      facts.semantic == VLAStateSemantic::SegmentedInclusiveAddScan;
+  if (facts.resultLaneMapped != resultMustCarryLane)
     return candidates;
   SelectedVLAStatePhysical scalar;
+  scalar.wholeVLALifetime = facts.resultControlCarried ||
+                            facts.resultCrossesRegion ||
+                            !facts.resultLaneMapped;
   switch (facts.semantic) {
   case VLAStateSemantic::F32AddReduction:
     if (!target.hasF)
