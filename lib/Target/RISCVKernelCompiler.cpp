@@ -3875,34 +3875,6 @@ private:
         line(destination.spelling + " = " + next + ";");
       return mlir::success();
     };
-    std::optional<int64_t> constantLower = integerConstant(op.getLower());
-    std::optional<int64_t> constantUpper = integerConstant(op.getUpper());
-    std::optional<int64_t> constantStep = integerConstant(op.getStep());
-    if (constantLower && constantUpper && constantStep && *constantStep > 0 &&
-        *constantUpper >= *constantLower &&
-        (*constantUpper - *constantLower + *constantStep - 1) / *constantStep <=
-            8) {
-      llvm::DenseSet<mlir::Operation *> consumedBefore = consumed;
-      for (int64_t induction = *constantLower; induction < *constantUpper;
-           induction += *constantStep) {
-        consumed = consumedBefore;
-        values[body.getArgument(0)] =
-            CValue{body.getArgument(0).getType(), CValueKind::Scalar,
-                   std::to_string(induction)};
-        for (auto [argument, value] :
-             llvm::zip(body.getArguments().drop_front(), carried))
-          values[argument] = value;
-        for (mlir::Operation &nested : body.without_terminator())
-          if (mlir::failed(emitOperation(&nested)))
-            return mlir::failure();
-        auto yield = mlir::cast<YieldOp>(body.getTerminator());
-        if (mlir::failed(emitCarriedUpdates(
-                yield, "unrolled ordered range yielded an unavailable value")))
-          return mlir::failure();
-      }
-      consumed = consumedBefore;
-      return mlir::success();
-    }
     std::string induction = "__weft_i" + std::to_string(nextLoop++);
     line("for (size_t " + induction + " = " + lower.spelling + "; " +
          induction + " < " + upper.spelling + "; " + induction + " += " +
