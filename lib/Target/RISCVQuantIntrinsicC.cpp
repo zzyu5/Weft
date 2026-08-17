@@ -45,56 +45,124 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 
 } // namespace
 
-void emitQuantLocalImplementations(llvm::raw_ostream &output,
-                                   const SelectedLocalImplementations &selected) {
-  auto has = [&](const char *symbol) { return selected.containsSymbol(symbol); };
-  const bool iq2Register32 = has("__weft_iq2_s_i8_register_l32_e8m2");
-  const bool iq2Register64 = has("__weft_iq2_s_i8_register_l64_e8m2");
-  const bool iq2Strip = has("__weft_iq2_s_i8_strip");
-  const bool iq3Register64 = has("__weft_iq3_s_i8_register_l64_e8m2");
-  const bool iq3Strip = has("__weft_iq3_s_i8_strip");
-  const bool iq1Register32 = has("__weft_iq1_m_i8_register_l32_e8m2");
-  const bool iq1Register64 = has("__weft_iq1_m_i8_register_l64_e8m2");
-  const bool iq1Strip = has("__weft_iq1_m_i8_strip");
-  const bool q6Register32 = has("__weft_q6_k_i8_register_l32_e8m2");
-  const bool q6Register64 = has("__weft_q6_k_i8_register_l64_e8m2");
-  const bool q6Strip = has("__weft_q6_k_i8_strip");
-  const bool packedI4E8M2 = has("__weft_packed_i4_i8_register_l32_e8m2");
-  const bool packedI4E8M1 = has("__weft_packed_i4_i8_register_l32_e8m1");
-  const bool packedI5E8M2 = has("__weft_packed_i5_i8_register_l32_e8m2");
-  const bool packedI5E8M1 = has("__weft_packed_i5_i8_register_l32_e8m1");
-  const bool packedI3L32 =
-      has("__weft_packed_i3_grouped_i8_register_l32_e8m2");
-  const bool packedI3L64 =
-      has("__weft_packed_i3_grouped_i8_register_l64_e8m2");
-  const bool nibbleE8M2 =
-      has("__weft_nibble_codebook_i8_register_l32_e8m2");
-  const bool nibbleE8M1 =
-      has("__weft_nibble_codebook_i8_register_l32_e8m1");
-  const bool base3E8M2 =
-      has("__weft_base3_ternary_i8_register_l32_e8m2");
-  const bool base3E8M1 =
-      has("__weft_base3_ternary_i8_register_l32_e8m1");
-  const bool packedI2E8M2 =
-      has("__weft_packed_i2_ternary_i8_register_l32_e8m2");
-  const bool packedI2E8M1 =
-      has("__weft_packed_i2_ternary_i8_register_l32_e8m1");
-  const bool signed8E8M2 =
-      has("__weft_signed_codebook8_i8_register_l32_e8m2");
-  const bool signed8E8M1 =
-      has("__weft_signed_codebook8_i8_register_l32_e8m1");
-  const bool signed4E8M2 =
-      has("__weft_signed_codebook4_i8_register_l32_e8m2");
-  const bool signed4E8M1 =
-      has("__weft_signed_codebook4_i8_register_l32_e8m1");
-  const bool packedU9U7E8M2 =
-      has("__weft_packed_u9_u7_codebook_i8_register_l32_e8m2");
-  const bool packedU9U7E8M1 =
-      has("__weft_packed_u9_u7_codebook_i8_register_l32_e8m1");
-  const bool packedU11E8M2 =
-      has("__weft_packed_u11_grid_delta_i8_register_l32_e8m2");
-  const bool packedU11E8M1 =
-      has("__weft_packed_u11_grid_delta_i8_register_l32_e8m1");
+bool emitQuantLocalImplementations(llvm::raw_ostream &output,
+                                   const SelectedLocalImplementations &selected,
+                                   std::string &unsupportedSymbol) {
+  bool iq2Register32 = false, iq2Register64 = false, iq2Strip = false;
+  bool iq3Register64 = false, iq3Strip = false;
+  bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
+  bool q6Register32 = false, q6Register64 = false, q6Strip = false;
+  bool packedI4E8M2 = false, packedI4E8M1 = false;
+  bool packedI5E8M2 = false, packedI5E8M1 = false;
+  bool packedI3L32 = false, packedI3L64 = false;
+  bool nibbleE8M2 = false, nibbleE8M1 = false;
+  bool base3E8M2 = false, base3E8M1 = false;
+  bool packedI2E8M2 = false, packedI2E8M1 = false;
+  bool signed8E8M2 = false, signed8E8M1 = false;
+  bool signed4E8M2 = false, signed4E8M1 = false;
+  bool packedU9U7E8M2 = false, packedU9U7E8M1 = false;
+  bool packedU11E8M2 = false, packedU11E8M1 = false;
+  bool supported = true;
+  selected.forEach([&](const LocalImplementation &implementation) {
+    if (!supported)
+      return;
+    const std::string &symbol = implementation.helperSymbol;
+    auto match = [&](const char *expected, bool &flag) {
+      if (symbol != expected)
+        return false;
+      flag = true;
+      return true;
+    };
+    switch (implementation.primitive) {
+    case LocalPrimitiveKind::PackedI4I8:
+      supported = match("__weft_packed_i4_i8_register_l32_e8m2",
+                        packedI4E8M2) ||
+                  match("__weft_packed_i4_i8_register_l32_e8m1",
+                        packedI4E8M1);
+      break;
+    case LocalPrimitiveKind::PackedI5I8:
+      supported = match("__weft_packed_i5_i8_register_l32_e8m2",
+                        packedI5E8M2) ||
+                  match("__weft_packed_i5_i8_register_l32_e8m1",
+                        packedI5E8M1);
+      break;
+    case LocalPrimitiveKind::PackedI3GroupedI8:
+      supported = match("__weft_packed_i3_grouped_i8_register_l32_e8m2",
+                        packedI3L32) ||
+                  match("__weft_packed_i3_grouped_i8_register_l64_e8m2",
+                        packedI3L64);
+      break;
+    case LocalPrimitiveKind::Base3TernaryI8:
+      supported = match("__weft_base3_ternary_i8_register_l32_e8m2",
+                        base3E8M2) ||
+                  match("__weft_base3_ternary_i8_register_l32_e8m1",
+                        base3E8M1);
+      break;
+    case LocalPrimitiveKind::PackedI2TernaryI8:
+      supported = match("__weft_packed_i2_ternary_i8_register_l32_e8m2",
+                        packedI2E8M2) ||
+                  match("__weft_packed_i2_ternary_i8_register_l32_e8m1",
+                        packedI2E8M1);
+      break;
+    case LocalPrimitiveKind::SignedCodebook8I8:
+      supported = match("__weft_signed_codebook8_i8_register_l32_e8m2",
+                        signed8E8M2) ||
+                  match("__weft_signed_codebook8_i8_register_l32_e8m1",
+                        signed8E8M1);
+      break;
+    case LocalPrimitiveKind::SignedCodebook4I8:
+      supported = match("__weft_signed_codebook4_i8_register_l32_e8m2",
+                        signed4E8M2) ||
+                  match("__weft_signed_codebook4_i8_register_l32_e8m1",
+                        signed4E8M1);
+      break;
+    case LocalPrimitiveKind::PackedU9U7CodebookI8:
+      supported = match("__weft_packed_u9_u7_codebook_i8_register_l32_e8m2",
+                        packedU9U7E8M2) ||
+                  match("__weft_packed_u9_u7_codebook_i8_register_l32_e8m1",
+                        packedU9U7E8M1);
+      break;
+    case LocalPrimitiveKind::PackedU11GridDeltaI8:
+      supported = match(
+                      "__weft_packed_u11_grid_delta_i8_register_l32_e8m2",
+                      packedU11E8M2) ||
+                  match("__weft_packed_u11_grid_delta_i8_register_l32_e8m1",
+                        packedU11E8M1);
+      break;
+    case LocalPrimitiveKind::NibbleCodebookI8:
+      supported = match("__weft_nibble_codebook_i8_register_l32_e8m2",
+                        nibbleE8M2) ||
+                  match("__weft_nibble_codebook_i8_register_l32_e8m1",
+                        nibbleE8M1);
+      break;
+    case LocalPrimitiveKind::IQ2SI8:
+      supported = match("__weft_iq2_s_i8_register_l32_e8m2", iq2Register32) ||
+                  match("__weft_iq2_s_i8_register_l64_e8m2", iq2Register64) ||
+                  match("__weft_iq2_s_i8_strip", iq2Strip);
+      break;
+    case LocalPrimitiveKind::IQ3SI8:
+      supported = match("__weft_iq3_s_i8_register_l64_e8m2", iq3Register64) ||
+                  match("__weft_iq3_s_i8_strip", iq3Strip);
+      break;
+    case LocalPrimitiveKind::IQ1MI8:
+      supported = match("__weft_iq1_m_i8_register_l32_e8m2", iq1Register32) ||
+                  match("__weft_iq1_m_i8_register_l64_e8m2", iq1Register64) ||
+                  match("__weft_iq1_m_i8_strip", iq1Strip);
+      break;
+    case LocalPrimitiveKind::Q6KI8:
+      supported = match("__weft_q6_k_i8_register_l32_e8m2", q6Register32) ||
+                  match("__weft_q6_k_i8_register_l64_e8m2", q6Register64) ||
+                  match("__weft_q6_k_i8_strip", q6Strip);
+      break;
+    default:
+      return;
+    }
+    if (!supported)
+      unsupportedSymbol = symbol.empty() ? "<unnamed local implementation>"
+                                         : symbol;
+  });
+  if (!supported)
+    return false;
   if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
@@ -105,7 +173,7 @@ void emitQuantLocalImplementations(llvm::raw_ostream &output,
       !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
       !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
       !packedU11E8M1)
-    return;
+    return true;
 
   if (iq2Strip || iq3Strip || iq1Strip || q6Strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) int32_t
@@ -175,6 +243,7 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
       output, packedU9U7E8M2, packedU9U7E8M1);
   emitPackedU11GridDeltaLocalImplementations(
       output, packedU11E8M2, packedU11E8M1);
+  return true;
 }
 
 } // namespace weft::riscv_internal

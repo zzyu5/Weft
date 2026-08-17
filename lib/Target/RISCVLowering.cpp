@@ -21,7 +21,15 @@ mlir::LogicalResult weft::lowerToRISCVIntrinsicC(
           module, options, bodyOutput, selectedImplementations)))
     return mlir::failure();
   bodyOutput.flush();
-  riscv_internal::emitIntrinsicCPrelude(output, selectedImplementations);
-  output << body;
+  std::string prelude;
+  llvm::raw_string_ostream preludeOutput(prelude);
+  std::string unsupportedSymbol;
+  if (!riscv_internal::emitIntrinsicCPrelude(
+          preludeOutput, selectedImplementations, unsupportedSymbol))
+    return module.emitError()
+           << "RISC-V intrinsic C has no definition for selected local implementation '"
+           << unsupportedSymbol << "'";
+  preludeOutput.flush();
+  output << prelude << body;
   return mlir::success();
 }

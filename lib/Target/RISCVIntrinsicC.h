@@ -20,12 +20,11 @@ public:
     if (implementation)
       implementations.insert(implementation);
   }
-  bool contains(const LocalImplementation &implementation) const {
-    return implementations.find(implementation) != implementations.end();
-  }
-  bool contains(LocalPrimitiveKind primitive) const;
-  bool containsSymbol(const std::string &symbol) const;
   bool empty() const { return implementations.empty(); }
+  template <typename Fn> void forEach(Fn &&fn) const {
+    for (const LocalImplementation &implementation : implementations)
+      fn(implementation);
+  }
 
 private:
   std::set<LocalImplementation> implementations;
@@ -42,16 +41,18 @@ void emitRVVLocalImplementations(llvm::raw_ostream &output,
                                  bool usesE2M1RegisterE8M1M2,
                                  bool usesE2M1RegisterE8MF2,
                                  bool usesE2M1Strip);
-void emitQuantLocalImplementations(
+bool emitQuantLocalImplementations(
     llvm::raw_ostream &output,
-    const SelectedLocalImplementations &implementations);
+    const SelectedLocalImplementations &implementations,
+    std::string &unsupportedSymbol);
 void emitIMELocalImplementations(llvm::raw_ostream &output,
                                  bool usesIME1SymmetricI4I8,
                                  bool usesIME1AffineI4I8,
                                  bool usesIME1SymmetricI4I8M4,
                                  bool usesIME1AffineI4I8M4);
-void emitIntrinsicCPrelude(llvm::raw_ostream &output,
-                           const SelectedLocalImplementations &implementations);
+bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
+                           const SelectedLocalImplementations &implementations,
+                           std::string &unsupportedSymbol);
 
 } // namespace weft::riscv_internal
 

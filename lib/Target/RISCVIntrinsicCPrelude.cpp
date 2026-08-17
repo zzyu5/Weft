@@ -181,38 +181,99 @@ __weft_online_summary_merge_f32(
 )c";
 }
 
-void emitIntrinsicCPrelude(llvm::raw_ostream &output,
-                           const SelectedLocalImplementations &implementations) {
-  bool usesExp =
-      implementations.contains(LocalPrimitiveKind::F32Math);
-  bool usesRVVSymmetricI4I8 = implementations.containsSymbol(
-      "__weft_rvv_symmetric_i4_i8_n16_k32");
-  bool usesRVVAffineI4I8 = implementations.containsSymbol(
-      "__weft_rvv_affine_i4_i8_n16_k32");
-  bool usesRVVSymmetricI4I8M4 = implementations.containsSymbol(
-      "__weft_rvv_symmetric_i4_i8_m4_n16_k32");
-  bool usesRVVAffineI4I8M4 = implementations.containsSymbol(
-      "__weft_rvv_affine_i4_i8_m4_n16_k32");
-  bool usesIME1SymmetricI4I8 = implementations.containsSymbol(
-      "__weft_ime1_symmetric_i4_i8_n16_k32");
-  bool usesIME1AffineI4I8 = implementations.containsSymbol(
-      "__weft_ime1_affine_i4_i8_n16_k32");
-  bool usesIME1SymmetricI4I8M4 = implementations.containsSymbol(
-      "__weft_ime1_symmetric_i4_i8_m4_n16_k32");
-  bool usesIME1AffineI4I8M4 = implementations.containsSymbol(
-      "__weft_ime1_affine_i4_i8_m4_n16_k32");
-  bool usesGroupedI4I8RegisterL16 = implementations.containsSymbol(
-      "__weft_grouped_affine_i4_i8_register_l16_e8m1");
-  bool usesGroupedI4I8RegisterL32 = implementations.containsSymbol(
-      "__weft_grouped_affine_i4_i8_register_l32_e8m1");
-  bool usesGroupedI4I8Strip = implementations.containsSymbol(
-      "__weft_grouped_affine_i4_i8_strip");
-  bool usesE2M1RegisterE8M1M2 = implementations.containsSymbol(
-      "__weft_e2m1_e8m0_i8_register_e8m1_e8m2");
-  bool usesE2M1RegisterE8MF2 = implementations.containsSymbol(
-      "__weft_e2m1_e8m0_i8_register_e8mf2");
-  bool usesE2M1Strip = implementations.containsSymbol(
-      "__weft_e2m1_e8m0_i8_strip");
+bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
+                           const SelectedLocalImplementations &implementations,
+                           std::string &unsupportedSymbol) {
+  bool usesExp = false;
+  bool usesRVVSymmetricI4I8 = false;
+  bool usesRVVAffineI4I8 = false;
+  bool usesRVVSymmetricI4I8M4 = false;
+  bool usesRVVAffineI4I8M4 = false;
+  bool usesIME1SymmetricI4I8 = false;
+  bool usesIME1AffineI4I8 = false;
+  bool usesIME1SymmetricI4I8M4 = false;
+  bool usesIME1AffineI4I8M4 = false;
+  bool usesGroupedI4I8RegisterL16 = false;
+  bool usesGroupedI4I8RegisterL32 = false;
+  bool usesGroupedI4I8Strip = false;
+  bool usesE2M1RegisterE8M1M2 = false;
+  bool usesE2M1RegisterE8MF2 = false;
+  bool usesE2M1Strip = false;
+  bool supported = true;
+  implementations.forEach([&](const LocalImplementation &implementation) {
+    if (!supported)
+      return;
+    const std::string &symbol = implementation.helperSymbol;
+    auto match = [&](const char *expected, bool &flag) {
+      if (symbol != expected)
+        return false;
+      flag = true;
+      return true;
+    };
+    switch (implementation.primitive) {
+    case LocalPrimitiveKind::F32Math:
+      supported = symbol.empty();
+      usesExp = supported;
+      break;
+    case LocalPrimitiveKind::SymmetricI4I8:
+    case LocalPrimitiveKind::AffineI4I8:
+      supported =
+          match("__weft_rvv_symmetric_i4_i8_n16_k32",
+                usesRVVSymmetricI4I8) ||
+          match("__weft_rvv_affine_i4_i8_n16_k32", usesRVVAffineI4I8) ||
+          match("__weft_rvv_symmetric_i4_i8_m4_n16_k32",
+                usesRVVSymmetricI4I8M4) ||
+          match("__weft_rvv_affine_i4_i8_m4_n16_k32",
+                usesRVVAffineI4I8M4) ||
+          match("__weft_ime1_symmetric_i4_i8_n16_k32",
+                usesIME1SymmetricI4I8) ||
+          match("__weft_ime1_affine_i4_i8_n16_k32", usesIME1AffineI4I8) ||
+          match("__weft_ime1_symmetric_i4_i8_m4_n16_k32",
+                usesIME1SymmetricI4I8M4) ||
+          match("__weft_ime1_affine_i4_i8_m4_n16_k32",
+                usesIME1AffineI4I8M4);
+      break;
+    case LocalPrimitiveKind::GroupedAffineI4I8:
+      supported =
+          match("__weft_grouped_affine_i4_i8_register_l16_e8m1",
+                usesGroupedI4I8RegisterL16) ||
+          match("__weft_grouped_affine_i4_i8_register_l32_e8m1",
+                usesGroupedI4I8RegisterL32) ||
+          match("__weft_grouped_affine_i4_i8_strip", usesGroupedI4I8Strip);
+      break;
+    case LocalPrimitiveKind::E2M1E8M0I8:
+      supported =
+          match("__weft_e2m1_e8m0_i8_register_e8m1_e8m2",
+                usesE2M1RegisterE8M1M2) ||
+          match("__weft_e2m1_e8m0_i8_register_e8mf2",
+                usesE2M1RegisterE8MF2) ||
+          match("__weft_e2m1_e8m0_i8_strip", usesE2M1Strip);
+      break;
+    case LocalPrimitiveKind::PackedI4I8:
+    case LocalPrimitiveKind::PackedI5I8:
+    case LocalPrimitiveKind::PackedI3GroupedI8:
+    case LocalPrimitiveKind::Base3TernaryI8:
+    case LocalPrimitiveKind::PackedI2TernaryI8:
+    case LocalPrimitiveKind::SignedCodebook8I8:
+    case LocalPrimitiveKind::SignedCodebook4I8:
+    case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    case LocalPrimitiveKind::PackedU11GridDeltaI8:
+    case LocalPrimitiveKind::NibbleCodebookI8:
+    case LocalPrimitiveKind::IQ2SI8:
+    case LocalPrimitiveKind::IQ3SI8:
+    case LocalPrimitiveKind::IQ1MI8:
+    case LocalPrimitiveKind::Q6KI8:
+      break;
+    case LocalPrimitiveKind::None:
+      supported = false;
+      break;
+    }
+    if (!supported)
+      unsupportedSymbol = symbol.empty() ? "<unnamed local implementation>"
+                                         : symbol;
+  });
+  if (!supported)
+    return false;
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
@@ -220,7 +281,8 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
               usesGroupedI4I8RegisterL16, usesGroupedI4I8RegisterL32,
               usesGroupedI4I8Strip, usesE2M1RegisterE8M1M2,
               usesE2M1RegisterE8MF2, usesE2M1Strip);
-  emitQuantLocalImplementations(output, implementations);
+  return emitQuantLocalImplementations(output, implementations,
+                                       unsupportedSymbol);
 }
 
 } // namespace weft::riscv_internal
