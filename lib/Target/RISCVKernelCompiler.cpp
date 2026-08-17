@@ -612,6 +612,40 @@ struct LocalDenseProductAnalysis {
   }
 };
 
+struct StructuredProductAxisBinding {
+  mlir::Value coordinate;
+  unsigned physicalAxis = 0;
+  LogicalAxisRole role = LogicalAxisRole::Free;
+  std::optional<uint64_t> extent;
+};
+
+struct StructuredProductAxisProjection {
+  CoreMappingProblem mapping;
+  llvm::SmallVector<StructuredProductAxisBinding, 4> bindings;
+  llvm::SmallVector<unsigned, 4> lhsAxes;
+  llvm::SmallVector<unsigned, 4> rhsAxes;
+  llvm::SmallVector<unsigned, 4> resultAxes;
+
+  const StructuredProductAxisBinding *find(mlir::Value coordinate) const {
+    auto found = llvm::find_if(
+        bindings, [&](const StructuredProductAxisBinding &binding) {
+          return binding.coordinate == coordinate;
+        });
+    return found == bindings.end() ? nullptr : &*found;
+  }
+
+  LogicalAxisConstraint *findConstraint(mlir::Value coordinate) {
+    const StructuredProductAxisBinding *binding = find(coordinate);
+    if (!binding)
+      return nullptr;
+    auto found = llvm::find_if(
+        mapping.axes, [&](const LogicalAxisConstraint &constraint) {
+          return constraint.id == binding->physicalAxis;
+        });
+    return found == mapping.axes.end() ? nullptr : &*found;
+  }
+};
+
 template <typename Decision>
 struct PlannedPhysicalDecision {
   Decision realization;
@@ -1755,6 +1789,13 @@ private:
       dot.emitError("RVV VLA dot requires one explicit shared reduction axis");
       return mlir::failure();
     }
+    std::optional<StructuredProductAxisProjection> axisProjection =
+        projectStructuredProductAxes(*product, coordinate);
+    if (!axisProjection) {
+      dot.emitError(
+          "RVV VLA dot axes cannot be projected to a core-local mapping");
+      return mlir::failure();
+    }
     const bool coordinateOnLHS =
         llvm::is_contained(product->lhsAxes, coordinate);
     const bool coordinateOnRHS =
@@ -1780,6 +1821,17 @@ private:
             : registerFreeAxes.front().getDefiningOp<BlockIndexOp>();
     if (!reductionAxis || (!registerFreeAxes.empty() && !registerAxis)) {
       dot.emitError("RVV VLA dot typed axis facts are unavailable");
+      return mlir::failure();
+    }
+    const StructuredProductAxisBinding *projectedReduction =
+        axisProjection->find(reductionAxis.getResult());
+    const StructuredProductAxisBinding *projectedRegister =
+        registerAxis ? axisProjection->find(registerAxis.getResult()) : nullptr;
+    if (!projectedReduction || projectedReduction->physicalAxis != kCoreAxisK ||
+        (registerAxis &&
+         (!projectedRegister ||
+          projectedRegister->physicalAxis != kCoreAxisM))) {
+      dot.emitError("RVV VLA dot axis projection is incomplete");
       return mlir::failure();
     }
     unsigned rowTile = 1;
@@ -1910,31 +1962,11 @@ private:
             integerConstantValue(decision.reductionExtent);
         extent && *extent >= 0)
       candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
-    if (registerAxis)
-      candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-          kCoreAxisM, LogicalAxisRole::Free, decision.rowTile, false, false,
-          false,
-          registerFactorCandidates(decision.rowTile,
-                                   std::min(decision.rowTile, 8u))});
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisN, LogicalAxisRole::Free, std::nullopt, false, true, true,
-        {1}});
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisK, LogicalAxisRole::Reduction,
-        candidateFacts.reductionExtent, false, false, false, {1}});
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
-    auto physicalAxes = [&](llvm::ArrayRef<mlir::Value> axes) {
-      llvm::SmallVector<unsigned, 3> mapped;
-      if (registerAxis && llvm::is_contained(axes, registerAxis.getResult()))
-        mapped.push_back(kCoreAxisM);
-      if (llvm::is_contained(axes, coordinate))
-        mapped.push_back(kCoreAxisN);
-      if (llvm::is_contained(axes, reductionAxis.getResult()))
-        mapped.push_back(kCoreAxisK);
-      return mapped;
-    };
-    candidateFacts.lhsAxes = physicalAxes(product->lhsAxes);
-    candidateFacts.rhsAxes = physicalAxes(product->rhsAxes);
+    candidateFacts.mapping = axisProjection->mapping;
+    candidateFacts.lhsAxes.append(axisProjection->lhsAxes.begin(),
+                                  axisProjection->lhsAxes.end());
+    candidateFacts.rhsAxes.append(axisProjection->rhsAxes.begin(),
+                                  axisProjection->rhsAxes.end());
     auto addOperandFacts = [&](const VLADotOperandDecision &operand) {
       if (!operand.load) {
         ++candidateFacts.handoffGroups;
@@ -5742,6 +5774,149 @@ private:
     return mlir::success();
   }
 
+  std::optional<StructuredProductAxisProjection>
+  projectStructuredProductAxes(const StructuredProductFacts &product,
+                               mlir::Value laneCoordinate = {}) {
+    StructuredProductAxisProjection projection;
+    unsigned nextPhysicalAxis = kCoreAxisBlock + 1;
+    auto physicalAxisAvailable = [&](unsigned physicalAxis) {
+      return llvm::none_of(
+          projection.bindings,
+          [&](const StructuredProductAxisBinding &binding) {
+            return binding.physicalAxis == physicalAxis;
+          });
+    };
+    auto nextAvailablePhysicalAxis = [&]() {
+      while (!physicalAxisAvailable(nextPhysicalAxis))
+        ++nextPhysicalAxis;
+      return nextPhysicalAxis++;
+    };
+    auto addAxis = [&](mlir::Value coordinate, unsigned physicalAxis,
+                       LogicalAxisRole role) -> bool {
+      if (projection.find(coordinate))
+        return true;
+      if (!physicalAxisAvailable(physicalAxis))
+        return false;
+      auto logical = kernelFacts.axes.find(coordinate);
+      if (logical == kernelFacts.axes.end())
+        return false;
+      std::optional<uint64_t> extent;
+      if (logical->second.extent) {
+        std::optional<int64_t> value = physicalExtent(logical->second.extent);
+        if (value && *value <= 0)
+          return false;
+        if (value)
+          extent = static_cast<uint64_t>(*value);
+      }
+      LogicalAxisConstraint constraint;
+      constraint.id = physicalAxis;
+      constraint.role = role;
+      constraint.extent = extent;
+      constraint.registerFactors = {1};
+      if (role == LogicalAxisRole::Free && extent) {
+        const unsigned maximum = static_cast<unsigned>(
+            std::min<uint64_t>(*extent, static_cast<uint64_t>(8)));
+        constraint.registerFactors =
+            registerFactorCandidates(*extent, maximum);
+      }
+      projection.bindings.push_back(
+          StructuredProductAxisBinding{coordinate, physicalAxis, role, extent});
+      projection.mapping.axes.push_back(std::move(constraint));
+      return true;
+    };
+
+    if (laneCoordinate) {
+      if (!llvm::is_contained(product.resultAxes, laneCoordinate) ||
+          (!llvm::is_contained(product.lhsFreeAxes, laneCoordinate) &&
+           !llvm::is_contained(product.rhsFreeAxes, laneCoordinate)) ||
+          !addAxis(laneCoordinate, kCoreAxisN, LogicalAxisRole::Free))
+        return std::nullopt;
+      LogicalAxisConstraint *lane = projection.findConstraint(laneCoordinate);
+      if (!lane)
+        return std::nullopt;
+      lane->allowLane = true;
+      lane->requireLane = true;
+      bool assignedRegisterAxis = false;
+      for (mlir::Value coordinate : product.resultAxes) {
+        if (coordinate == laneCoordinate)
+          continue;
+        const unsigned physicalAxis =
+            !assignedRegisterAxis && physicalAxisAvailable(kCoreAxisM)
+                ? kCoreAxisM
+                : nextAvailablePhysicalAxis();
+        assignedRegisterAxis = true;
+        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
+          return std::nullopt;
+      }
+    } else {
+      bool assignedLHSFreeAxis = false;
+      for (mlir::Value coordinate : product.lhsFreeAxes) {
+        const unsigned physicalAxis =
+            !assignedLHSFreeAxis && physicalAxisAvailable(kCoreAxisM)
+                ? kCoreAxisM
+                : nextAvailablePhysicalAxis();
+        assignedLHSFreeAxis = true;
+        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
+          return std::nullopt;
+      }
+      bool assignedRHSFreeAxis = false;
+      for (mlir::Value coordinate : product.rhsFreeAxes) {
+        const unsigned physicalAxis =
+            !assignedRHSFreeAxis && physicalAxisAvailable(kCoreAxisN)
+                ? kCoreAxisN
+                : nextAvailablePhysicalAxis();
+        assignedRHSFreeAxis = true;
+        if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Free))
+          return std::nullopt;
+      }
+      for (mlir::Value coordinate : product.resultAxes)
+        if (!projection.find(coordinate) &&
+            !addAxis(coordinate, nextAvailablePhysicalAxis(),
+                     LogicalAxisRole::Free))
+          return std::nullopt;
+    }
+
+    bool assignedReductionAxis = false;
+    for (mlir::Value coordinate : product.reductionAxes) {
+      const unsigned physicalAxis =
+          !assignedReductionAxis && physicalAxisAvailable(kCoreAxisK)
+              ? kCoreAxisK
+              : nextAvailablePhysicalAxis();
+      assignedReductionAxis = true;
+      if (!addAxis(coordinate, physicalAxis, LogicalAxisRole::Reduction))
+        return std::nullopt;
+      if (!projection.mapping.unrollAxis)
+        projection.mapping.unrollAxis = physicalAxis;
+    }
+
+    auto projectAxes = [&](llvm::ArrayRef<mlir::Value> logicalAxes,
+                           llvm::SmallVectorImpl<unsigned> &physicalAxes) {
+      for (mlir::Value coordinate : logicalAxes) {
+        const StructuredProductAxisBinding *binding = projection.find(coordinate);
+        if (!binding)
+          return false;
+        physicalAxes.push_back(binding->physicalAxis);
+      }
+      return true;
+    };
+    if (!projectAxes(product.lhsAxes, projection.lhsAxes) ||
+        !projectAxes(product.rhsAxes, projection.rhsAxes) ||
+        !projectAxes(product.resultAxes, projection.resultAxes))
+      return std::nullopt;
+
+    llvm::sort(projection.bindings,
+               [](const StructuredProductAxisBinding &lhs,
+                  const StructuredProductAxisBinding &rhs) {
+                 return lhs.physicalAxis < rhs.physicalAxis;
+               });
+    llvm::sort(projection.mapping.axes,
+               [](const LogicalAxisConstraint &lhs,
+                  const LogicalAxisConstraint &rhs) {
+                 return lhs.id < rhs.id;
+               });
+    return projection;
+  }
+
   std::optional<LocalDenseProductAnalysis>
   analyzeLocalDenseProduct(mlir::Value lhs, mlir::Value rhs,
                            mlir::Value result) {
@@ -5857,6 +6032,15 @@ private:
                   : analysis->product.rhsFreeAxes.front();
     mlir::Value reductionCoordinate =
         analysis->product.reductionAxes.front();
+    std::optional<StructuredProductAxisProjection> axisProjection =
+        projectStructuredProductAxes(analysis->product);
+    const StructuredProductAxisBinding *projectedRow =
+        axisProjection ? axisProjection->find(rowCoordinate) : nullptr;
+    const StructuredProductAxisBinding *projectedReduction =
+        axisProjection ? axisProjection->find(reductionCoordinate) : nullptr;
+    LogicalAxisConstraint *reductionConstraint =
+        axisProjection ? axisProjection->findConstraint(reductionCoordinate)
+                       : nullptr;
     const LocalDenseAxisAnalysis *row = analysis->findAxis(rowCoordinate);
     const LocalDenseAxisAnalysis *reduction =
         analysis->findAxis(reductionCoordinate);
@@ -5872,7 +6056,9 @@ private:
                    LaneRelation::Independent &&
         (freeOnLHS ? row->rhsRelation : row->lhsRelation) ==
             LaneRelation::Independent;
-    if (!row || !reduction || !rowAxis || !reductionAxis ||
+    if (!row || !reduction || !rowAxis || !reductionAxis || !projectedRow ||
+        !projectedReduction || !reductionConstraint ||
+        projectedReduction->physicalAxis != kCoreAxisK ||
         !row->staticExtent ||
         *row->staticExtent > std::numeric_limits<unsigned>::max() ||
         !rowMemoryLegal ||
@@ -5904,7 +6090,7 @@ private:
             : PhysicalMemoryMode::Strided,
         reduction->rhsStride};
     decision.rowAxis = rowAxis.getResult();
-    decision.rowMappingAxis = freeOnLHS ? kCoreAxisM : kCoreAxisN;
+    decision.rowMappingAxis = projectedRow->physicalAxis;
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
     decision.rowTile = rowExtent;
@@ -5927,21 +6113,13 @@ private:
         {dot.getLhs(), dot.getRhs()}, reductionCoordinate,
         dot.getInit());
     candidateFacts.reductionExtent = reduction->staticExtent;
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        decision.rowMappingAxis, LogicalAxisRole::Free, rowExtent, false,
-        false, false,
-        registerFactorCandidates(rowExtent, std::min(rowExtent, 8u))});
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisK, LogicalAxisRole::Reduction, reduction->staticExtent,
-        false, true, true, {1}});
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
-    if (freeOnLHS) {
-      candidateFacts.lhsAxes = {decision.rowMappingAxis, kCoreAxisK};
-      candidateFacts.rhsAxes = {kCoreAxisK};
-    } else {
-      candidateFacts.lhsAxes = {kCoreAxisK};
-      candidateFacts.rhsAxes = {decision.rowMappingAxis, kCoreAxisK};
-    }
+    reductionConstraint->allowLane = true;
+    reductionConstraint->requireLane = true;
+    candidateFacts.mapping = axisProjection->mapping;
+    candidateFacts.lhsAxes.append(axisProjection->lhsAxes.begin(),
+                                  axisProjection->lhsAxes.end());
+    candidateFacts.rhsAxes.append(axisProjection->rhsAxes.begin(),
+                                  axisProjection->rhsAxes.end());
     candidateFacts.unitStrideOperands =
         (reduction->lhsRelation == LaneRelation::UnitStride) +
         (reduction->rhsRelation == LaneRelation::UnitStride);
@@ -9118,6 +9296,20 @@ private:
     mlir::Value rhsFreeCoordinate = analysis->product.rhsFreeAxes.front();
     mlir::Value reductionCoordinate =
         analysis->product.reductionAxes.front();
+    std::optional<StructuredProductAxisProjection> axisProjection =
+        projectStructuredProductAxes(analysis->product);
+    const StructuredProductAxisBinding *projectedLHSFree =
+        axisProjection ? axisProjection->find(lhsFreeCoordinate) : nullptr;
+    const StructuredProductAxisBinding *projectedRHSFree =
+        axisProjection ? axisProjection->find(rhsFreeCoordinate) : nullptr;
+    const StructuredProductAxisBinding *projectedReduction =
+        axisProjection ? axisProjection->find(reductionCoordinate) : nullptr;
+    LogicalAxisConstraint *nConstraint =
+        axisProjection ? axisProjection->findConstraint(rhsFreeCoordinate)
+                       : nullptr;
+    LogicalAxisConstraint *kConstraint =
+        axisProjection ? axisProjection->findConstraint(reductionCoordinate)
+                       : nullptr;
     const LocalDenseAxisAnalysis *lhsFree =
         analysis->findAxis(lhsFreeCoordinate);
     const LocalDenseAxisAnalysis *rhsFree =
@@ -9136,7 +9328,12 @@ private:
          (rhsFree->rhsRelation == LaneRelation::Strided &&
           rhsFree->rhsStride));
     if (!lhsFree || !rhsFree || !reduction || !lhsFreeAxis ||
-        !rhsFreeAxis || !reductionAxis || !lhsFree->staticExtent ||
+        !rhsFreeAxis || !reductionAxis || !projectedLHSFree ||
+        !projectedRHSFree || !projectedReduction || !nConstraint ||
+        !kConstraint || projectedLHSFree->physicalAxis != kCoreAxisM ||
+        projectedRHSFree->physicalAxis != kCoreAxisN ||
+        projectedReduction->physicalAxis != kCoreAxisK ||
+        !lhsFree->staticExtent ||
         !rhsFree->staticExtent || !reduction->staticExtent ||
         *lhsFree->staticExtent > std::numeric_limits<unsigned>::max() ||
         *rhsFree->staticExtent > std::numeric_limits<unsigned>::max() ||
@@ -9182,28 +9379,13 @@ private:
             : PhysicalMemoryMode::Strided;
     decision.rhsColumnStride = rhsFree->rhsStride;
     F16MatmulCandidateFacts candidateFacts;
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisM, LogicalAxisRole::Free, rowTile, false, false, false,
-        registerFactorCandidates(rowTile, std::min(rowTile, 8u))});
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisN, LogicalAxisRole::Free, columnTile, false, false, false,
-        registerFactorCandidates(columnTile, std::min(columnTile, 8u))});
-    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
-        kCoreAxisK, LogicalAxisRole::Reduction, reduction->staticExtent,
-        false, true, true, {1}});
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
+    nConstraint->allowLane = rhsColumnLegal;
+    kConstraint->allowLane = true;
+    candidateFacts.mapping = axisProjection->mapping;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
         {matmul.getLhs(), matmul.getRhs()},
         reductionCoordinate, matmul.getInit());
-    for (LogicalAxisConstraint &axis : candidateFacts.mapping.axes) {
-      if (axis.id == kCoreAxisK)
-        axis.requireLane = false;
-      if (axis.id == kCoreAxisN) {
-        axis.allowLane = rhsColumnLegal;
-        axis.requireLane = false;
-      }
-    }
     candidateFacts.nLaneStrided =
         rhsFree->rhsRelation == LaneRelation::Strided;
     std::optional<SelectedF16MatmulPhysical> selected =
