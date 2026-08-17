@@ -547,31 +547,6 @@ struct LocalImplementation {
 std::string localImplementationSymbol(
     const LocalImplementation &implementation);
 
-bool isPackedDotLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isNibbleCodebookLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isPackedI2TernaryLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isBase3TernaryLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isSignedCodebookLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isPackedU9U7CodebookLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isPackedU11GridDeltaLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isIQ3SLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isIQ2SLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isIQ1MLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isQ6KLocalImplementationMapping(
-    const LocalImplementation &implementation);
-bool isPackedI3GroupedLocalImplementationMapping(
-    const LocalImplementation &implementation);
-
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
                                  const RISCVTargetProfile &target);

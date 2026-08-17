@@ -8,8 +8,8 @@ namespace weft::riscv_internal {
 
 bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation) {
-  if (!isIQ1MLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if (implementation.leaf.kind != LocalLeafKind::IQ1MI8Register ||
+      implementation.valueShapes.size() < 6)
     return false;
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);

@@ -8,8 +8,9 @@ namespace weft::riscv_internal {
 
 bool emitSignedCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (!isSignedCodebookLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if ((implementation.leaf.kind != LocalLeafKind::SignedCodebook8I8Register &&
+       implementation.leaf.kind != LocalLeafKind::SignedCodebook4I8Register) ||
+      implementation.valueShapes.size() < 6)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];
@@ -136,8 +137,9 @@ bool emitSignedCodebookLocalImplementation(
 
 bool emitPackedU9U7CodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (!isPackedU9U7CodebookLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if (implementation.leaf.kind !=
+          LocalLeafKind::PackedU9U7CodebookI8Register ||
+      implementation.valueShapes.size() < 7)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape wordShape = implementation.valueShapes[2];
@@ -279,8 +281,9 @@ bool emitPackedU9U7CodebookLocalImplementation(
 
 bool emitPackedU11GridDeltaLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (!isPackedU11GridDeltaLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if (implementation.leaf.kind !=
+          LocalLeafKind::PackedU11GridDeltaI8Register ||
+      implementation.valueShapes.size() < 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape codeShape = implementation.valueShapes[1];

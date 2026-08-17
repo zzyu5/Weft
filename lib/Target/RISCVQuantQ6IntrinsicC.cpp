@@ -127,8 +127,9 @@ void emitQ6KRVVAssembly(llvm::raw_ostream &output,
 
 bool emitQ6LocalImplementation(llvm::raw_ostream &output,
                                const LocalImplementation &implementation) {
-  if (!isQ6KLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if ((implementation.leaf.kind != LocalLeafKind::Q6KI8RVVAssembly &&
+       implementation.leaf.kind != LocalLeafKind::Q6KI8Register) ||
+      implementation.valueShapes.size() < 4)
     return false;
   if (implementation.leaf.kind == LocalLeafKind::Q6KI8RVVAssembly) {
     emitQ6KRVVAssembly(output, implementation);

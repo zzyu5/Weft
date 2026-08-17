@@ -15,8 +15,11 @@ bool emitPackedDotLocalImplementation(
     bool hasHighBits) {
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!isPackedDotLocalImplementationMapping(implementation) || !reduction ||
-      localImplementationSymbol(implementation).empty())
+  const LocalLeafKind expectedLeaf =
+      hasHighBits ? LocalLeafKind::PackedI5I8Register
+                  : LocalLeafKind::PackedI4I8Register;
+  if (implementation.leaf.kind != expectedLeaf ||
+      implementation.valueShapes.size() < 2 || !reduction)
     return false;
 
   const RVVVectorShape shape = implementation.mapping.laneShape;
@@ -150,20 +153,18 @@ bool emitPackedDotLocalImplementation(
 
 bool emitPackedI4LocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  return implementation.primitive == LocalPrimitiveKind::PackedI4I8 &&
-         emitPackedDotLocalImplementation(output, implementation, false);
+  return emitPackedDotLocalImplementation(output, implementation, false);
 }
 
 bool emitPackedI5LocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  return implementation.primitive == LocalPrimitiveKind::PackedI5I8 &&
-         emitPackedDotLocalImplementation(output, implementation, true);
+  return emitPackedDotLocalImplementation(output, implementation, true);
 }
 
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (!isNibbleCodebookLocalImplementationMapping(implementation) ||
-      localImplementationSymbol(implementation).empty())
+  if (implementation.leaf.kind != LocalLeafKind::NibbleCodebookI8Register ||
+      implementation.valueShapes.size() < 4)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
   const RVVVectorShape packedShape = implementation.valueShapes[1];

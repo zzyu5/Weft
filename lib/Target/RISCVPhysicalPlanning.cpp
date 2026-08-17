@@ -43,7 +43,7 @@ static unsigned localSequentialFactor(const LocalImplementation &implementation,
   return mapping ? mapping->sequentialFactor : 0;
 }
 
-bool isPackedDotLocalImplementationMapping(
+static bool isPackedDotLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedI4I8 &&
       implementation.primitive != LocalPrimitiveKind::PackedI5I8)
@@ -79,7 +79,7 @@ bool isPackedDotLocalImplementationMapping(
   return true;
 }
 
-bool isNibbleCodebookLocalImplementationMapping(
+static bool isNibbleCodebookLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
       implementation.mapping.instruction !=
@@ -119,7 +119,7 @@ bool isNibbleCodebookLocalImplementationMapping(
          !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
 }
 
-bool isPackedI2TernaryLocalImplementationMapping(
+static bool isPackedI2TernaryLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
       implementation.mapping.instruction !=
@@ -143,7 +143,7 @@ bool isPackedI2TernaryLocalImplementationMapping(
          !rvvVectorType(RVVElementCategory::SignedInteger, widenedShape).empty();
 }
 
-bool isBase3TernaryLocalImplementationMapping(
+static bool isBase3TernaryLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::Base3TernaryI8 ||
       implementation.mapping.instruction !=
@@ -179,7 +179,7 @@ bool isBase3TernaryLocalImplementationMapping(
                         highWordShape).empty();
 }
 
-bool isSignedCodebookLocalImplementationMapping(
+static bool isSignedCodebookLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if ((implementation.primitive != LocalPrimitiveKind::SignedCodebook8I8 &&
        implementation.primitive != LocalPrimitiveKind::SignedCodebook4I8) ||
@@ -231,7 +231,7 @@ static bool hasCodebookLaneMapping(const LocalImplementation &implementation,
          reduction->registerFactor == 1;
 }
 
-bool isPackedU9U7CodebookLocalImplementationMapping(
+static bool isPackedU9U7CodebookLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedU9U7CodebookI8 ||
       implementation.entryWidth != 8 ||
@@ -255,7 +255,7 @@ bool isPackedU9U7CodebookLocalImplementationMapping(
          halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
 }
 
-bool isPackedU11GridDeltaLocalImplementationMapping(
+static bool isPackedU11GridDeltaLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive !=
           LocalPrimitiveKind::PackedU11GridDeltaI8 ||
@@ -276,7 +276,7 @@ bool isPackedU11GridDeltaLocalImplementationMapping(
          productShape.lmulEighths == laneShape.lmulEighths * 2;
 }
 
-bool isIQ3SLocalImplementationMapping(
+static bool isIQ3SLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::IQ3SI8 ||
       implementation.mapping.instruction !=
@@ -309,7 +309,7 @@ bool isIQ3SLocalImplementationMapping(
          halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
 }
 
-bool isIQ2SLocalImplementationMapping(
+static bool isIQ2SLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::IQ2SI8 ||
       implementation.mapping.instruction !=
@@ -342,7 +342,7 @@ bool isIQ2SLocalImplementationMapping(
              productShape.lmulEighths;
 }
 
-bool isIQ1MLocalImplementationMapping(
+static bool isIQ1MLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::IQ1MI8 ||
       implementation.mapping.instruction !=
@@ -384,7 +384,7 @@ bool isIQ1MLocalImplementationMapping(
                         segmentProductShape).empty();
 }
 
-bool isQ6KLocalImplementationMapping(
+static bool isQ6KLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::Q6KI8 ||
       implementation.mapping.instruction !=
@@ -420,7 +420,7 @@ bool isQ6KLocalImplementationMapping(
                         segmentProductShape).empty();
 }
 
-bool isPackedI3GroupedLocalImplementationMapping(
+static bool isPackedI3GroupedLocalImplementationMapping(
     const LocalImplementation &implementation) {
   if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
       implementation.mapping.instruction !=
@@ -525,10 +525,10 @@ enumerateRVVLocalAxisMappings(CoreInstructionKind instruction,
   return candidates;
 }
 
-static bool validateLocalInstructionMapping(
-    const LocalImplementation &implementation) {
+static std::optional<LocalLeafDecision>
+selectLocalLeafDecision(const LocalImplementation &implementation) {
   if (!implementation || implementation.valueShapes.empty())
-    return false;
+    return std::nullopt;
   const RVVVectorShape primary = implementation.valueShapes.front();
   const RVVVectorShape secondary = implementation.valueShapes.size() > 1
                                        ? implementation.valueShapes[1]
@@ -544,74 +544,6 @@ static bool validateLocalInstructionMapping(
                       CoreInstructionKind::RVVWideningIntegerDot;
   const bool ime = implementation.mapping.instruction ==
                    CoreInstructionKind::SpacemitIME1MMA;
-  const bool strip = localSequentialFactor(implementation, kCoreAxisK) > 1;
-  switch (implementation.primitive) {
-  case LocalPrimitiveKind::None:
-    return false;
-  case LocalPrimitiveKind::F32Math:
-    return implementation.mapping.instruction ==
-               CoreInstructionKind::RVVElementwise &&
-           primary == implementation.mapping.laneShape && primary.sew == 32 &&
-           rvvIntegerLMUL(primary).has_value();
-  case LocalPrimitiveKind::SymmetricI4I8:
-  case LocalPrimitiveKind::AffineI4I8:
-    return (rvvDot || ime) && rows != 0 && (rows == 1 || rows == 4) &&
-           ((rvvDot && lanes == 16) ||
-            (ime && localFragmentFactor(implementation, kCoreAxisN) == 16 &&
-             localFragmentFactor(implementation, kCoreAxisK) == 32)) &&
-           primary == kRVVE8M1 && secondary == kRVVE32M4;
-  case LocalPrimitiveKind::GroupedAffineI4I8:
-    return rvvDot && (hardwareLanes == 16 || hardwareLanes == 32) &&
-           primary == kRVVE8M1 && secondary == kRVVE16M2;
-  case LocalPrimitiveKind::E2M1E8M0I8:
-    return rvvDot &&
-           ((lanes == 32 && primary == RVVVectorShape{8, 4} &&
-             secondary == RVVVectorShape{8, 4}) ||
-            (lanes == 32 && primary == kRVVE8M1 &&
-             secondary == RVVVectorShape{8, 16}) ||
-            (strip && primary == kRVVE8M1 && !secondary));
-  case LocalPrimitiveKind::PackedI4I8:
-  case LocalPrimitiveKind::PackedI5I8:
-    return isPackedDotLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::Base3TernaryI8:
-    return isBase3TernaryLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::PackedI2TernaryI8:
-    return isPackedI2TernaryLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::NibbleCodebookI8:
-    return isNibbleCodebookLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::PackedI3GroupedI8:
-    return isPackedI3GroupedLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::SignedCodebook8I8:
-  case LocalPrimitiveKind::SignedCodebook4I8:
-    return isSignedCodebookLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::PackedU9U7CodebookI8:
-    return isPackedU9U7CodebookLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    return isPackedU11GridDeltaLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::IQ2SI8:
-    return isIQ2SLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::IQ1MI8:
-    return isIQ1MLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::Q6KI8:
-    return isQ6KLocalImplementationMapping(implementation);
-  case LocalPrimitiveKind::IQ3SI8:
-    return isIQ3SLocalImplementationMapping(implementation);
-  }
-  return false;
-}
-
-static std::optional<LocalLeafDecision>
-selectLocalLeafDecision(const LocalImplementation &implementation) {
-  const RVVVectorShape primary = implementation.valueShapes.empty()
-                                     ? RVVVectorShape{}
-                                     : implementation.valueShapes.front();
-  const unsigned lanes = localLaneFactor(implementation);
-  const unsigned hardwareLanes =
-      mappedHardwareLaneFactor(implementation.mapping);
-  const unsigned rows =
-      implementation.mapping.instruction == CoreInstructionKind::SpacemitIME1MMA
-          ? localFragmentFactor(implementation, kCoreAxisM)
-          : localRegisterFactor(implementation, kCoreAxisM);
   const bool sequential =
       localSequentialFactor(implementation, kCoreAxisK) > 1;
   auto registerLeaf = [&](LocalLeafKind kind,
@@ -623,10 +555,19 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::None:
     return std::nullopt;
   case LocalPrimitiveKind::F32Math:
+    if (implementation.mapping.instruction !=
+            CoreInstructionKind::RVVElementwise ||
+        primary != implementation.mapping.laneShape || primary.sew != 32 ||
+        !rvvIntegerLMUL(primary))
+      return std::nullopt;
     return LocalLeafDecision{};
   case LocalPrimitiveKind::SymmetricI4I8: {
-    const bool ime = implementation.mapping.instruction ==
-                     CoreInstructionKind::SpacemitIME1MMA;
+    if ((!rvvDot && !ime) || (rows != 1 && rows != 4) ||
+        (rvvDot && lanes != 16) ||
+        (ime && (localFragmentFactor(implementation, kCoreAxisN) != 16 ||
+                 localFragmentFactor(implementation, kCoreAxisK) != 32)) ||
+        primary != kRVVE8M1 || secondary != kRVVE32M4)
+      return std::nullopt;
     if (ime)
       return LocalLeafDecision{
           rows == 4 ? LocalLeafKind::IMESymmetricI4I8M4N16K32
@@ -636,8 +577,12 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
                   : LocalLeafKind::RVVSymmetricI4I8N16K32};
   }
   case LocalPrimitiveKind::AffineI4I8: {
-    const bool ime = implementation.mapping.instruction ==
-                     CoreInstructionKind::SpacemitIME1MMA;
+    if ((!rvvDot && !ime) || (rows != 1 && rows != 4) ||
+        (rvvDot && lanes != 16) ||
+        (ime && (localFragmentFactor(implementation, kCoreAxisN) != 16 ||
+                 localFragmentFactor(implementation, kCoreAxisK) != 32)) ||
+        primary != kRVVE8M1 || secondary != kRVVE32M4)
+      return std::nullopt;
     if (ime)
       return LocalLeafDecision{
           rows == 4 ? LocalLeafKind::IMEAffineI4I8M4N16K32
@@ -647,11 +592,21 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
                   : LocalLeafKind::RVVAffineI4I8N16K32};
   }
   case LocalPrimitiveKind::GroupedAffineI4I8:
+    if (!rvvDot || (hardwareLanes != 16 && hardwareLanes != 32) ||
+        primary != kRVVE8M1 || secondary != kRVVE16M2)
+      return std::nullopt;
     return sequential
                ? LocalLeafDecision{LocalLeafKind::GroupedAffineI4I8Strip}
                : registerLeaf(LocalLeafKind::GroupedAffineI4I8Register,
                               hardwareLanes);
   case LocalPrimitiveKind::E2M1E8M0I8:
+    if (!rvvDot ||
+        !((lanes == 32 && primary == RVVVectorShape{8, 4} &&
+           secondary == RVVVectorShape{8, 4}) ||
+          (lanes == 32 && primary == kRVVE8M1 &&
+           secondary == RVVVectorShape{8, 16}) ||
+          (sequential && primary == kRVVE8M1 && !secondary)))
+      return std::nullopt;
     if (sequential)
       return LocalLeafDecision{LocalLeafKind::E2M1E8M0I8Strip};
     return primary == RVVVectorShape{8, 4}
@@ -660,32 +615,60 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
                : LocalLeafDecision{
                      LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2};
   case LocalPrimitiveKind::PackedI4I8:
+    if (!isPackedDotLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedI4I8Register);
   case LocalPrimitiveKind::PackedI5I8:
+    if (!isPackedDotLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedI5I8Register);
   case LocalPrimitiveKind::PackedI3GroupedI8:
+    if (!isPackedI3GroupedLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedI3GroupedI8Register);
   case LocalPrimitiveKind::Base3TernaryI8:
+    if (!isBase3TernaryLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::Base3TernaryI8Register);
   case LocalPrimitiveKind::PackedI2TernaryI8:
+    if (!isPackedI2TernaryLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedI2TernaryI8Register);
   case LocalPrimitiveKind::SignedCodebook8I8:
+    if (!isSignedCodebookLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::SignedCodebook8I8Register);
   case LocalPrimitiveKind::SignedCodebook4I8:
+    if (!isSignedCodebookLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::SignedCodebook4I8Register);
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    if (!isPackedU9U7CodebookLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedU9U7CodebookI8Register);
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
+    if (!isPackedU11GridDeltaLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::PackedU11GridDeltaI8Register);
   case LocalPrimitiveKind::NibbleCodebookI8:
+    if (!isNibbleCodebookLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::NibbleCodebookI8Register);
   case LocalPrimitiveKind::IQ2SI8:
+    if (!isIQ2SLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::IQ2SI8Register);
   case LocalPrimitiveKind::IQ3SI8:
+    if (!isIQ3SLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::IQ3SI8Register);
   case LocalPrimitiveKind::IQ1MI8:
+    if (!isIQ1MLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(LocalLeafKind::IQ1MI8Register);
   case LocalPrimitiveKind::Q6KI8:
+    if (!isQ6KLocalImplementationMapping(implementation))
+      return std::nullopt;
     return registerLeaf(lanes == 32 && primary == RVVVectorShape{8, 16}
                             ? LocalLeafKind::Q6KI8RVVAssembly
                             : LocalLeafKind::Q6KI8Register);
@@ -788,8 +771,6 @@ std::string localImplementationSymbol(
 }
 
 static bool finalizeLocalInstructionMapping(LocalImplementation &implementation) {
-  if (!validateLocalInstructionMapping(implementation))
-    return false;
   std::optional<LocalLeafDecision> leaf =
       selectLocalLeafDecision(implementation);
   if (!leaf)
