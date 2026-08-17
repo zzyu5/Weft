@@ -95,6 +95,16 @@ integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
   return candidates;
 }
 
+llvm::SmallVector<RVVVectorShape, 8>
+rvvShapeCandidates(const RISCVTargetProfile &target, unsigned sew) {
+  llvm::SmallVector<RVVVectorShape, 8> candidates;
+  for (int eighths : target.legalLMULEighths)
+    if (target.supportsVectorShape(sew, eighths))
+      candidates.push_back(RVVVectorShape{sew, eighths});
+  llvm::sort(candidates);
+  return candidates;
+}
+
 llvm::SmallVector<unsigned, 4>
 registerFactorCandidates(uint64_t extent, unsigned maximum) {
   llvm::SmallVector<unsigned, 4> candidates;
@@ -335,6 +345,13 @@ unsigned mappedLaneSpan(const CorePhysicalMapping &mapping) {
   for (const PhysicalAxisDecomposition &axis : mapping.axes)
     if (axis.laneFactor > 1)
       return axis.laneFactor * axis.registerFactor;
+  return 0;
+}
+
+unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping) {
+  for (const PhysicalAxisDecomposition &axis : mapping.axes)
+    if (axis.laneFactor > 1)
+      return axis.laneFactor;
   return 0;
 }
 

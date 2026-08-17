@@ -10326,7 +10326,7 @@ private:
       llvm::StringRef vl) {
     BlockValue codes = lookupBlockValue(op.getCodes(), blockValues);
     BlockValue table = lookupBlockValue(op.getTable(), blockValues);
-    if (decision.realization != BlockDecodeRealization::RVVI8TableGather ||
+    if (decision.mapping.instruction != CoreInstructionKind::RVVIndexedGather ||
         decision.tableExtent != 16 || codes.kind != BlockValueKind::U8 ||
         table.kind != BlockValueKind::I8 ||
         codes.spelling.empty() || table.spelling.empty())

@@ -22,11 +22,14 @@ bool SelectedLocalImplementations::contains(
             : mappedRegisterFactor(implementation.mapping, kCoreAxisM);
     const bool sequential =
         mappedAxisHasSequentialIteration(implementation.mapping, kCoreAxisK);
+    const unsigned queryLanes =
+        implementation.primitive == LocalPrimitiveKind::GroupedAffineI4I8
+            ? mappedHardwareLaneFactor(implementation.mapping)
+            : mappedLaneSpan(implementation.mapping);
     if (implementation.primitive == query.primitive &&
         (query.instruction == CoreInstructionKind::None ||
          implementation.mapping.instruction == query.instruction) &&
-        (query.laneSpan == 0 ||
-         mappedLaneSpan(implementation.mapping) == query.laneSpan) &&
+        (query.laneSpan == 0 || queryLanes == query.laneSpan) &&
         (query.rowFactor == 0 || rows == query.rowFactor) &&
         (!query.primaryShape || primary == query.primaryShape) &&
         (query.sequentialK < 0 || sequential == (query.sequentialK != 0)))
@@ -40,6 +43,8 @@ std::string localImplementationName(const LocalImplementation &implementation) {
                                      ? RVVVectorShape{}
                                      : implementation.valueShapes.front();
   const unsigned lanes = mappedLaneSpan(implementation.mapping);
+  const unsigned hardwareLanes =
+      mappedHardwareLaneFactor(implementation.mapping);
   const unsigned rows = implementation.mapping.instruction ==
                                 CoreInstructionKind::SpacemitIME1MMA
                             ? mappedFragmentFactor(implementation.mapping,
@@ -67,8 +72,10 @@ std::string localImplementationName(const LocalImplementation &implementation) {
     return name + "n16_k32";
   }
   case LocalPrimitiveKind::GroupedAffineI4I8:
-    return sequential ? "__weft_grouped_affine_i4_i8_strip"
-                      : "__weft_grouped_affine_i4_i8" + registerSuffix;
+    return sequential
+               ? "__weft_grouped_affine_i4_i8_strip"
+               : "__weft_grouped_affine_i4_i8_register_l" +
+                     std::to_string(hardwareLanes) + "_e" + shape;
   case LocalPrimitiveKind::E2M1E8M0I8:
     if (sequential)
       return "__weft_e2m1_e8m0_i8_strip";

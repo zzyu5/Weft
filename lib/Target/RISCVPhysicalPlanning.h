@@ -35,18 +35,13 @@ std::optional<LoadF16LEDecision>
 selectLoadF16LEPhysical(bool knownAligned,
                         const RISCVTargetProfile &target);
 
-enum class BlockDecodeRealization {
-  RVVI8TableGather,
-};
-
 struct BlockDecodeCandidateFacts {
   unsigned codeExtent = 0;
   unsigned tableExtent = 0;
 };
 
 struct SelectedBlockDecodePhysical {
-  BlockDecodeRealization realization =
-      BlockDecodeRealization::RVVI8TableGather;
+  CorePhysicalMapping mapping;
   RVVVectorShape codeShape;
   RVVVectorShape tableShape;
   RVVVectorShape resultShape;

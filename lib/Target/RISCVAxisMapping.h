@@ -58,6 +58,8 @@ RVVVectorShape rvvShape(unsigned sew, unsigned lmul);
 llvm::SmallVector<unsigned>
 integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
                       unsigned maximum = 8);
+llvm::SmallVector<RVVVectorShape, 8>
+rvvShapeCandidates(const RISCVTargetProfile &target, unsigned sew);
 llvm::SmallVector<unsigned, 4>
 registerFactorCandidates(uint64_t extent, unsigned maximum);
 
@@ -170,6 +172,7 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
 const PhysicalAxisDecomposition *
 findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis);
 unsigned mappedLaneSpan(const CorePhysicalMapping &mapping);
+unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping);
 unsigned mappedRegisterFactor(const CorePhysicalMapping &mapping,
                               unsigned axis);
 unsigned mappedFragmentFactor(const CorePhysicalMapping &mapping,
