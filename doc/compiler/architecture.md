@@ -77,9 +77,9 @@ fragment轴分解，生成operand window、pipeline actions与统一resource bud
 typed numerical rule与最底层local operation中保留差异。
 
 `RISCVKernelCompiler` 把相连value的selected shape、memory form、state placement、primitive
-realization与handoff组成一次瞬态physical plan。VLA lifetime按真实operation位置计算，nested
-control会继承外层仍存活的值。所有决定准备完成后才生成kernel body，并同时收集实际使用的exact
-intrinsic/asm leaf。
+realization与handoff组成一次瞬态physical plan。VLA lifetime按真实operation位置计算；普通nested
+`for/while/if`会继承外层仍存活的值，nested VLA仍明确unsupported。所有决定准备完成后才生成
+kernel body，并同时收集实际使用的exact intrinsic/asm leaf。
 
 `RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、`RISCVQuant*IntrinsicC`与`RISCVIMEIntrinsicC`
 只按selected local operation拼写helper；它们不读取VLEN、kernel名、格式名或外围IR重新选择实现。

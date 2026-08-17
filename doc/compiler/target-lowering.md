@@ -70,15 +70,21 @@ VLA state直接保存同一个`SelectedVLAStatePhysical`，其中包含carry rep
 finalize与whole-VLA lifetime；entity resource planning与emitter都消费这份结果，不再拆出第二份
 state resource schema。
 
-Resource budget按同一时间活跃的value、memory operand、predicate、loop-carried state、primitive
-temporary、pipeline buffer与extension fragment组成。每个lifetime snapshot绑定真实operation；
-外层跨`for/while/if`存活的值会与nested temporary联合计算，primitive临时资源只叠加在它实际
-执行的位置。多个vector carry会累加占用，互不同时存活的工作才取峰值。资源不足或target没有
-等价实现时立即返回unsupported，不切换到旧emitter、标量实现或外部函数。
+VLA entity的resource budget按同一时间活跃的value、memory operand、predicate、loop-carried
+state与primitive temporary组成。每个lifetime snapshot绑定真实operation；外层跨普通
+`for/while/if`存活的值会与nested temporary联合计算，primitive临时资源只叠加在它实际执行的
+位置。Nested VLA目前明确unsupported，不属于这项能力。
 
-每项决定只有一个 producer。Quant与codebook的typed rule只描述数值差异、value shapes、decode
-和最小硬件operation；轴mapping、microkernel schedule与resource selection由一份共享candidate
-builder完成。生成阶段不能再从target VLEN、格式名或table width推一次helper版本。
+Local dot/matmul与quant实现由最终mapping、accumulator、operand window、pipeline buffer、decode
+temporary和extension fragment计算自己的局部峰值；它们尚未与外围VLA snapshot合并成一份全局
+live interval。资源不足或target没有等价实现时立即返回unsupported，不切换到旧emitter、标量
+实现或外部函数。
+
+每项决定只有一个producer。Packed Q4/Q5/Q6、IQ1/IQ2/IQ3与codebook gather的typed rule只描述
+数值差异、value shapes、decode和最小硬件operation；这些路径的轴mapping、microkernel schedule
+与resource selection由一份共享candidate builder完成。E2M1与grouped affine仍由各自显式typed
+规则构造合法候选，但同样使用共享axis mapping、schedule和resource primitives。生成阶段不能再从
+target VLEN、格式名或table width推一次helper版本。
 
 每个consumer对每个value只能有一条handoff记录。若handoff kind、source shape或result shape
 发生冲突，physical plan直接非法；emitter不从C value当前拼写反推新的转换方式。

@@ -34,6 +34,8 @@ python3 examples/run/tune.py sg2044-rvv128 blocked_gemm \
   -- decode 5
 ```
 
-只有compiler判定合法、system compiler成功且runtime数值检查成功的实例才产生metric并参与选择。
+`tune.py`只组合并转发调用者给出的dimension；option是否属于正式backend config、组合是否合法仍由
+`weft-compile`和target planning唯一判断。只有compiler判定合法、system compiler成功且runtime
+数值检查成功的实例才产生metric并参与选择。
 `--winner-config PATH`可把winner backend config写入当前build使用的文件；该文件不是Kernel IR、
 不进入仓库，也不改变compiler默认值。
