@@ -65,7 +65,9 @@ LMUL、microtile、layout、fragment、table width 或 pipeline。
 `RISCVKernelFacts` 从 Kernel IR 记录 axis identity、ordered parent、普通 consumers、definition/last
 use、control carry，以及每次 memory access 相对各轴的 unit/strided/indexed/non-affine relation。
 它还根据pointer、index SSA、element bytes和effect顺序形成indexed-address与interleaved-memory
-group。这些是后续所有实现共同读取的程序事实，不按example或量化格式分组。
+group。对直接位于VLA body、只依赖VLA外值的纯地址运算，它另外给出coordinate-invariant base与
+可提前执行的operation序列；nested scalar control中的地址不会被越过其控制边界。这些是后续所有
+实现共同读取的程序事实，不按example或量化格式分组。
 
 `RISCVReuseAnalysis` 从同一份facts推导operand是否随reduction推进、是否直接供给primitive、
 address/predicate是否依赖accumulator、consumer数量和control crossing。它是F32 dot、VLA dot和
@@ -74,7 +76,8 @@ F16 matmul共同的reuse/pipeline输入，不产生第二份IR。
 `RISCVAxisMapping` 与 `RISCVPhysicalPlanning` 把显式op约束组合成sequential/lane/register/unroll/
 fragment轴分解，生成operand window、pipeline actions与统一resource budget，再按target profile和
 显式backend config选择合法实例。Dense与quant都使用同一mapping和resource机制；quant格式只在
-typed numerical rule与最底层local operation中保留差异。
+typed numerical rule与最底层local operation中保留差异。占用固定fragment或完整asm register set的
+局部extension实现也通过同一个axis-mapped resource calculator表达，不拥有独立预算旁路。
 
 `RISCVKernelCompiler` 把相连value的selected shape、memory form、state placement、primitive
 realization与handoff组成一次瞬态physical plan。VLA lifetime按真实operation位置计算；普通nested

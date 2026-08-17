@@ -60,7 +60,10 @@ Lowering 联合决定：
 `RISCVKernelFacts` 先按 pointer、index SSA、block scope、effect 顺序和 element bytes 产生 indexed
 address group 与 interleaved memory group。Target planning只对这些事实判断 indexed/segment
 legality；selected segment record保存access kind、field count、element SEW、coordinate scale与
-最终vector shape。Emitter不再扫描相邻access重建分组。
+最终vector shape。对于VLA body中只依赖外层值的纯scalar/ptr-add地址链，facts同时证明可提前执行的
+operation序列；planning形成一次loop-local hoist schedule，emitter在保留空extent语义的guard内先
+机械生成这些operation，再生成strip loop。Nested `for/while/if`中依赖局部iv或state的地址保持原位。
+Emitter不再扫描相邻access或重新判断invariance。
 
 `RISCVReuseAnalysis` 对 dot/matmul 的 operand 统一推导 reduction advancement、memory mode、
 accumulator-dependent address/predicate、consumer count 与 control crossing。Physical planning据此
@@ -80,11 +83,17 @@ temporary和extension fragment计算自己的局部峰值；它们尚未与外�
 live interval。资源不足或target没有等价实现时立即返回unsupported，不切换到旧emitter、标量
 实现或外部函数。
 
+普通f32 block可以在`for/while/if`中carry的当前target前提是其rank-one/rank-two storage能由静态
+extent或已绑定meta value有界化。Runtime-extent二维block的通用materialized load，以及二维到一维
+ordered block reduction，当前没有RISC-V artifact；这类程序明确unsupported，不能把external state
+暗中提升成register state，也不能用未计入资源的动态私有数组代替。
+
 每项决定只有一个producer。Packed Q4/Q5/Q6、IQ1/IQ2/IQ3与codebook gather的typed rule只描述
 数值差异、value shapes、decode和最小硬件operation；这些路径的轴mapping、microkernel schedule
 与resource selection由一份共享candidate builder完成。E2M1与grouped affine仍由各自显式typed
-规则构造合法候选，但同样使用共享axis mapping、schedule和resource primitives。生成阶段不能再从
-target VLEN、格式名或table width推一次helper版本。
+规则构造合法候选，但同样使用共享axis mapping、schedule和axis-mapped resource calculator；RVV
+inline asm与IME fragment的固定register group也在这里形成唯一预算。生成阶段不能再从target VLEN、
+格式名或table width推一次helper版本。
 
 每个consumer对每个value只能有一条handoff记录。若handoff kind、source shape或result shape
 发生冲突，physical plan直接非法；emitter不从C value当前拼写反推新的转换方式。
