@@ -48,11 +48,11 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 bool emitQuantLocalImplementations(llvm::raw_ostream &output,
                                    const SelectedLocalImplementations &selected,
                                    std::string &unsupportedSymbol) {
-  bool packedI3L32 = false, packedI3L64 = false;
   const LocalImplementation *iq2Implementation = nullptr;
   const LocalImplementation *iq3Implementation = nullptr;
   const LocalImplementation *iq1Implementation = nullptr;
   const LocalImplementation *q6Implementation = nullptr;
+  const LocalImplementation *packedI3Implementation = nullptr;
   bool supported = true;
   selected.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
@@ -72,10 +72,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
       supported = emitPackedI5LocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedI3GroupedI8:
-      supported = match("__weft_packed_i3_grouped_i8_register_l32_e8m2",
-                        packedI3L32) ||
-                  match("__weft_packed_i3_grouped_i8_register_l64_e8m2",
-                        packedI3L64);
+      packedI3Implementation = &implementation;
       break;
     case LocalPrimitiveKind::Base3TernaryI8:
       supported = emitBase3TernaryLocalImplementation(output, implementation);
@@ -122,8 +119,8 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   });
   if (!supported)
     return false;
-  if (!packedI3L32 && !packedI3L64 && !iq2Implementation &&
-      !iq3Implementation && !iq1Implementation && !q6Implementation)
+  if (!iq2Implementation && !iq3Implementation && !iq1Implementation &&
+      !q6Implementation && !packedI3Implementation)
     return true;
   if (iq1Implementation)
     emitI64Table(output, "__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
@@ -152,7 +149,11 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
     unsupportedSymbol = q6Implementation->helperSymbol;
     return false;
   }
-  emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
+  if (packedI3Implementation && !emitPackedI3GroupedLocalImplementation(
+                                    output, *packedI3Implementation)) {
+    unsupportedSymbol = packedI3Implementation->helperSymbol;
+    return false;
+  }
   return true;
 }
 

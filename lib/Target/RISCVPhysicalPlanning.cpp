@@ -420,6 +420,39 @@ bool isQ6KLocalImplementationMapping(
                         segmentProductShape).empty();
 }
 
+bool isPackedI3GroupedLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 3)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  const unsigned mappedSpan =
+      reduction ? reduction->laneFactor * reduction->registerFactor : 0;
+  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
+      (reduction->laneFactor != 16 && reduction->laneFactor != 32) ||
+      mappedSpan == 0 || (256 % mappedSpan) != 0 ||
+      reduction->sequentialFactor != 256 / mappedSpan)
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape productShape = implementation.valueShapes[1];
+  const RVVVectorShape segmentProductShape = implementation.valueShapes[2];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         segmentProductShape.sew == 16 &&
+         segmentProductShape.lmulEighths * (reduction->laneFactor / 16) ==
+             productShape.lmulEighths &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, laneShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger,
+                        segmentProductShape).empty();
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -547,8 +580,7 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::NibbleCodebookI8:
     return isNibbleCodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedI3GroupedI8:
-    return rvvDot && (lanes == 32 || lanes == 64) &&
-           primary == RVVVectorShape{8, 16};
+    return isPackedI3GroupedLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::SignedCodebook8I8:
   case LocalPrimitiveKind::SignedCodebook4I8:
     return isSignedCodebookLocalImplementationMapping(implementation);
@@ -2325,6 +2357,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   struct Candidate {
     SelectedQuantI8DotPhysical physical;
     unsigned sequentialFactor = 0;
+    unsigned laneGroups = 0;
     unsigned registerFactor = 0;
   };
   llvm::SmallVector<Candidate, 16> legal;
@@ -2346,6 +2379,17 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
           decodeShape = *halfShape;
       }
       implementation.valueShapes = {laneShape, decodeShape};
+    } else if (primitive == LocalPrimitiveKind::PackedI3GroupedI8) {
+      if (candidate.axis.laneFactor != 16 && candidate.axis.laneFactor != 32)
+        continue;
+      std::optional<RVVVectorShape> productShape =
+          rvvShapeForSameLanes(laneShape, 16, target);
+      std::optional<RVVVectorShape> segmentProductShape =
+          rvvShapeForSemanticLanes(16, 16, target);
+      if (!productShape || !segmentProductShape)
+        continue;
+      implementation.valueShapes = {laneShape, *productShape,
+                                    *segmentProductShape};
     } else if (primitive == LocalPrimitiveKind::IQ2SI8) {
       const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
       if ((candidate.axis.laneFactor != 32 &&
@@ -2452,6 +2496,19 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
            candidate.axis.laneFactor / 16},
           {PhysicalLiveClass::Temporary, kRVVE32M1}};
       resources.predicateGroups = 1;
+    } else if (primitive == LocalPrimitiveKind::PackedI3GroupedI8) {
+      resources.values = {
+          {PhysicalLiveClass::Memory, laneShape,
+           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 3},
+          {PhysicalLiveClass::Temporary, laneShape,
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[1],
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[2],
+           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK,
+           candidate.axis.laneFactor / 16},
+          {PhysicalLiveClass::Temporary, kRVVE32M1}};
+      resources.predicateGroups = 1;
     } else if (primitive == LocalPrimitiveKind::IQ3SI8) {
       resources.values = {
           {PhysicalLiveClass::Memory, implementation.valueShapes[1]},
@@ -2491,6 +2548,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
         selected.resources = *budget;
         legal.push_back(Candidate{std::move(selected),
                                   candidate.axis.sequentialFactor,
+                                  rvvRegisterGroups(laneShape),
                                   candidate.axis.registerFactor});
         continue;
       }
@@ -2532,15 +2590,16 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     selected.resources = *budget;
     legal.push_back(Candidate{std::move(selected),
                               candidate.axis.sequentialFactor,
+                              rvvRegisterGroups(laneShape),
                               candidate.axis.registerFactor});
   }
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.sequentialFactor, lhs.physical.resources.peakGroups,
-                    lhs.registerFactor) <
-           std::tie(rhs.sequentialFactor, rhs.physical.resources.peakGroups,
-                    rhs.registerFactor);
+    return std::tie(lhs.sequentialFactor, lhs.laneGroups,
+                    lhs.physical.resources.peakGroups, lhs.registerFactor) <
+           std::tie(rhs.sequentialFactor, rhs.laneGroups,
+                    rhs.physical.resources.peakGroups, rhs.registerFactor);
   });
   return std::move(legal.front().physical);
 }

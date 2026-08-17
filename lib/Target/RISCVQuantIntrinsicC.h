@@ -21,9 +21,8 @@ bool emitPackedI4LocalImplementation(llvm::raw_ostream &output,
                                      const LocalImplementation &implementation);
 bool emitPackedI5LocalImplementation(llvm::raw_ostream &output,
                                      const LocalImplementation &implementation);
-void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
-                                             bool registerL32,
-                                             bool registerL64);
+bool emitPackedI3GroupedLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
 bool emitBase3TernaryLocalImplementation(

@@ -525,6 +525,8 @@ bool isIQ1MLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isQ6KLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isPackedI3GroupedLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
