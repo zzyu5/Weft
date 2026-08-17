@@ -427,7 +427,6 @@ struct VLADotDecision {
   PhysicalResourceBudget resources;
   VLADotInitRealization initRealization =
       VLADotInitRealization::ZeroVector;
-  llvm::SmallVector<mlir::Operation *> absorbed;
 };
 
 enum class PhysicalHandoff {
@@ -1719,51 +1718,14 @@ private:
     return mlir::success();
   }
 
-  bool isVLADotAbsorbed(mlir::Operation *operation) const {
-    if (!activeVLADecision)
-      return false;
-    return llvm::any_of(
-        activeVLADecision->dots,
-        [&](const VLADotDecision &decision) {
-          return llvm::is_contained(decision.absorbed, operation);
-        });
-  }
-
-  void collectLocalDefinitions(
-      mlir::Value value, mlir::Block &block,
-      llvm::DenseSet<mlir::Operation *> &definitions,
-      llvm::SmallVectorImpl<BlockIndexOp> &axes) const {
-    mlir::Operation *definition = value.getDefiningOp();
-    if (!definition || definition->getBlock() != &block ||
-        !definitions.insert(definition).second)
-      return;
-    if (auto axis = mlir::dyn_cast<BlockIndexOp>(definition))
-      axes.push_back(axis);
-    for (mlir::Value operand : definition->getOperands())
-      collectLocalDefinitions(operand, block, definitions, axes);
-  }
-
-  void retainOnlyPrivateDefinitions(
-      llvm::DenseSet<mlir::Operation *> &definitions,
-      mlir::Operation *consumer) const {
-    llvm::SmallVector<mlir::Operation *> required;
-    for (mlir::Operation *definition : definitions) {
-      if (mlir::isa<BlockIndexOp>(definition))
-        continue;
-      if (llvm::any_of(definition->getUsers(), [&](mlir::Operation *user) {
-            return user != consumer && !definitions.contains(user);
-          }))
-        required.push_back(definition);
-    }
-    while (!required.empty()) {
-      mlir::Operation *operation = required.pop_back_val();
-      if (!definitions.erase(operation))
-        continue;
-      for (mlir::Value operand : operation->getOperands())
-        if (mlir::Operation *producer = operand.getDefiningOp();
-            producer && definitions.contains(producer))
-          required.push_back(producer);
-    }
+  bool projectsSequentialDotAxis(
+      mlir::Operation *operation,
+      llvm::ArrayRef<VLADotDecision> dots) const {
+    return llvm::any_of(operation->getResults(), [&](mlir::Value result) {
+      return llvm::any_of(dots, [&](const VLADotDecision &dot) {
+        return valueDependsOnAxis(result, dot.reductionAxis);
+      });
+    });
   }
 
   mlir::FailureOr<VLADotDecision>
@@ -1937,18 +1899,6 @@ private:
       return mlir::failure();
     }
 
-    llvm::DenseSet<mlir::Operation *> absorbed;
-    llvm::SmallVector<BlockIndexOp> absorbedAxes;
-    for (mlir::Value value : {dot.getLhs(), dot.getRhs()})
-      collectLocalDefinitions(value, block, absorbed, absorbedAxes);
-    if (!registerAxis) {
-      llvm::DenseSet<mlir::Operation *> initDefinitions;
-      llvm::SmallVector<BlockIndexOp> initAxes;
-      collectLocalDefinitions(dot.getInit(), block, initDefinitions, initAxes);
-      for (mlir::Operation *operation : initDefinitions)
-        absorbed.erase(operation);
-    }
-
     F32DotCandidateFacts candidateFacts;
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
@@ -2012,8 +1962,6 @@ private:
     decision.mapping = physical->mapping;
     decision.resourceRequirements = physical->requirements;
     decision.resources = physical->resources;
-    retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
-    decision.absorbed.append(absorbed.begin(), absorbed.end());
     return decision;
   }
 
@@ -2054,15 +2002,8 @@ private:
         return mlir::failure();
       decision.dots.push_back(std::move(*selected));
     }
-    auto isDotOwned = [&](mlir::Operation *operation) {
-      return llvm::any_of(
-          decision.dots, [&](const VLADotDecision &dot) {
-            return llvm::is_contained(dot.absorbed, operation);
-          });
-    };
-
     for (mlir::Operation *nested : physicalOperations) {
-      if (isDotOwned(nested))
+      if (projectsSequentialDotAxis(nested, decision.dots))
         continue;
       if (auto unary = mlir::dyn_cast<UnaryOp>(nested)) {
         if (isRegionValue(unary.getResult().getType()) &&
@@ -2145,7 +2086,7 @@ private:
     }
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isDotOwned(nested))
+      if (projectsSequentialDotAxis(nested, decision.dots))
         continue;
       auto compare = mlir::dyn_cast<CompareOp>(nested);
       if (!compare || !isRegionValue(compare.getResult().getType()))
@@ -2379,7 +2320,7 @@ private:
     };
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isDotOwned(nested))
+      if (projectsSequentialDotAxis(nested, decision.dots))
         continue;
       if (auto load = mlir::dyn_cast<LoadOp>(nested)) {
         if (mlir::failed(addAccess(
@@ -2570,7 +2511,7 @@ private:
       maxEntityF32Vectors = std::max(maxEntityF32Vectors, snapshot.f32);
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isDotOwned(nested))
+      if (projectsSequentialDotAxis(nested, decision.dots))
         continue;
       auto narrow = mlir::dyn_cast<NarrowOp>(nested);
       if (!narrow)
@@ -2586,7 +2527,7 @@ private:
     }
 
     for (mlir::Operation *nested : physicalOperations) {
-      if (isDotOwned(nested))
+      if (projectsSequentialDotAxis(nested, decision.dots))
         continue;
       if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
         bool f32Reduction =
@@ -3336,7 +3277,8 @@ private:
     if (const VLADotDecision *decision =
             findVLADotDecision(operation))
       return emitVLADot(*decision);
-    if (isVLADotAbsorbed(operation))
+    if (activeVLADecision &&
+        projectsSequentialDotAxis(operation, activeVLADecision->dots))
       return mlir::success();
     if (auto op = mlir::dyn_cast<ReduceOp>(operation))
       return emitReduce(op);
@@ -5776,6 +5718,9 @@ private:
       }
     }
     values[dot.getResult()] = std::move(result);
+    if (mlir::failed(markRematerializedBlockTrees(
+            {dot.getLhs(), dot.getRhs()}, dot.getOperation())))
+      return mlir::failure();
     return mlir::success();
   }
 
