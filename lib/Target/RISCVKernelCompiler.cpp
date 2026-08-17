@@ -9659,7 +9659,8 @@ private:
         kAxis->laneFactor != 1 || kAxis->unrollFactor == 0 ||
         decision.schedule.accumulatorCount != mAxis->registerFactor ||
         decision.schedule.unrollFactor != kAxis->unrollFactor ||
-        decision.schedule.pipeline.bufferCount != 1 ||
+        decision.schedule.pipeline.bufferCount == 0 ||
+        decision.schedule.pipeline.bufferCount > kAxis->unrollFactor ||
         resultStorage.strides.size() != 2 || resultStorage.strides[1] != 1)
       return op.emitError("F16 matmul column-lane mapping is incomplete");
     if (decision.rhsColumnMemoryMode == PhysicalMemoryMode::Strided &&
@@ -9693,6 +9694,7 @@ private:
 
     const unsigned rowMicrotile = decision.schedule.accumulatorCount;
     const unsigned kUnroll = decision.schedule.unrollFactor;
+    const unsigned loadBufferCount = decision.schedule.pipeline.bufferCount;
     const std::string inputType =
         "vfloat16m" + std::to_string(inputLMUL) + "_t";
     const std::string accumulatorType =
@@ -9722,19 +9724,20 @@ private:
         accumulators.push_back(std::move(vector));
       }
 
-      std::string reduction = fresh("matmul_k");
-      line("for (size_t " + reduction + " = 0; " + reduction + " < " +
-           std::to_string(decision.reductionTile) + "; " + reduction + " += " +
-           std::to_string(kUnroll) + ") {");
-      ++indent;
-      for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
-        std::string coordinate =
-            unroll == 0
-                ? reduction
-                : "(" + reduction + " + " + std::to_string(unroll) + ")";
-        line("if (" + coordinate + " < " +
-             std::to_string(decision.reductionTile) + ") {");
-        ++indent;
+      llvm::SmallVector<std::string, 4> rhsBanks;
+      llvm::SmallVector<std::string, 4> rhsBankVLs;
+      llvm::SmallVector<std::string, 4> rhsBankValid;
+      for (unsigned bank = 0; bank < loadBufferCount; ++bank) {
+        rhsBanks.push_back(fresh("matmul_rhs_bank"));
+        rhsBankVLs.push_back(fresh("matmul_rhs_vl"));
+        rhsBankValid.push_back(fresh("matmul_rhs_valid"));
+        line(inputType + " " + rhsBanks.back() + ";");
+        line("size_t " + rhsBankVLs.back() + " = 0;");
+        line("int " + rhsBankValid.back() + " = 0;");
+      }
+
+      auto loadBank = [&](unsigned bank, llvm::StringRef coordinate)
+          -> mlir::LogicalResult {
         std::string activeColumns = fresh("matmul_active_n");
         line("size_t " + activeColumns + " = " + vl + ";");
         std::string lastColumn =
@@ -9750,21 +9753,30 @@ private:
               "F16 matmul column-lane RHS projection is unavailable");
         line("while (" + activeColumns + " > 0 && !(" + *tailPredicate +
              ")) --" + activeColumns + ";");
+        line(rhsBankValid[bank] + " = 0;");
         line("if (" + activeColumns + " != 0) {");
         ++indent;
-        std::string stepVL = fresh("matmul_step_vl");
-        std::string rhsVector = fresh("matmul_rhs");
-        line("const size_t " + stepVL + " = __riscv_vsetvl_e16m" +
+        line(rhsBankVLs[bank] + " = __riscv_vsetvl_e16m" +
              std::to_string(inputLMUL) + "(" + activeColumns + ");");
         if (decision.rhsColumnMemoryMode == PhysicalMemoryMode::UnitStride)
-          line(inputType + " " + rhsVector + " = __riscv_vle16_v_f16m" +
-               std::to_string(inputLMUL) + "(" + *rhsPointer + ", " + stepVL +
-               ");");
+          line(rhsBanks[bank] + " = __riscv_vle16_v_f16m" +
+               std::to_string(inputLMUL) + "(" + *rhsPointer + ", " +
+               rhsBankVLs[bank] + ");");
         else
-          line(inputType + " " + rhsVector + " = __riscv_vlse16_v_f16m" +
+          line(rhsBanks[bank] + " = __riscv_vlse16_v_f16m" +
                std::to_string(inputLMUL) + "(" + *rhsPointer +
                ", (ptrdiff_t)(sizeof(_Float16) * (" + *stride + ")), " +
-               stepVL + ");");
+               rhsBankVLs[bank] + ");");
+        line(rhsBankValid[bank] + " = 1;");
+        --indent;
+        line("}");
+        return mlir::success();
+      };
+
+      auto computeBank = [&](unsigned bank, llvm::StringRef coordinate)
+          -> mlir::LogicalResult {
+        line("if (" + rhsBankValid[bank] + ") {");
+        ++indent;
         for (unsigned row = 0; row < rowCount; ++row) {
           std::string rowIndex = std::to_string(rowBase + row);
           std::optional<std::string> lhsPointer = project(
@@ -9778,11 +9790,38 @@ private:
           ++indent;
           line(accumulators[row] + " = __riscv_vfwmacc_vf_f32m" +
                std::to_string(computeLMUL) + "(" + accumulators[row] + ", *" +
-               *lhsPointer + ", " + rhsVector + ", " + stepVL + ");");
+               *lhsPointer + ", " + rhsBanks[bank] + ", " +
+               rhsBankVLs[bank] + ");");
           --indent;
         }
         --indent;
         line("}");
+        return mlir::success();
+      };
+
+      std::string reduction = fresh("matmul_k");
+      line("for (size_t " + reduction + " = 0; " + reduction + " < " +
+           std::to_string(decision.reductionTile) + "; " + reduction + " += " +
+           std::to_string(kUnroll) + ") {");
+      ++indent;
+      for (const LocalPipelineAction &action :
+           decision.schedule.pipeline.actions) {
+        if (action.iteration >= kUnroll || action.buffer >= loadBufferCount)
+          return op.emitError("F16 matmul pipeline action is invalid");
+        std::string coordinate =
+            action.iteration == 0
+                ? reduction
+                : "(" + reduction + " + " +
+                      std::to_string(action.iteration) + ")";
+        line("if (" + coordinate + " < " +
+             std::to_string(decision.reductionTile) + ") {");
+        ++indent;
+        if (action.kind == LocalPipelineActionKind::Load) {
+          if (mlir::failed(loadBank(action.buffer, coordinate)))
+            return mlir::failure();
+        } else if (mlir::failed(computeBank(action.buffer, coordinate))) {
+          return mlir::failure();
+        }
         --indent;
         line("}");
       }

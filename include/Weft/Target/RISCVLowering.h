@@ -13,6 +13,12 @@ class raw_ostream;
 
 namespace weft {
 
+enum class F16MatmulLaneAxis {
+  Auto,
+  Column,
+  Reduction,
+};
+
 struct RISCVCandidateParameters {
   int64_t vlaLMUL = 0;
   int64_t dotLMUL = 0;
@@ -23,6 +29,7 @@ struct RISCVCandidateParameters {
   int64_t f16ColumnMicrotile = 0;
   int64_t f16KUnroll = 0;
   int64_t f16LoadBufferCount = 0;
+  F16MatmulLaneAxis f16LaneAxis = F16MatmulLaneAxis::Auto;
   int64_t narrowLMUL = 0;
   int64_t sortRadixBits = 0;
 };

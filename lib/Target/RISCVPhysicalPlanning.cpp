@@ -3050,6 +3050,10 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     if (!m || !n || !k || !lane ||
         (lane->id != facts.rhsFreeAxis &&
          lane->id != facts.reductionAxis) ||
+        (config.parameters.f16LaneAxis == F16MatmulLaneAxis::Column &&
+         lane->id != facts.rhsFreeAxis) ||
+        (config.parameters.f16LaneAxis == F16MatmulLaneAxis::Reduction &&
+         lane->id != facts.reductionAxis) ||
         !inputLMUL ||
         !accumulatorShape ||
         (k->unrollFactor != 1 && k->unrollFactor != 2 &&
@@ -3059,8 +3063,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         (mapping.pipeline.bufferCount > 1 &&
          !llvm::is_contained(legalPipelineBuffers,
                              mapping.pipeline.bufferCount)) ||
-        (lane->id == facts.rhsFreeAxis &&
-         (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
+        (lane->id == facts.rhsFreeAxis && n->registerFactor != 1))
       continue;
     const unsigned rows = m->registerFactor;
     const unsigned columns = n->registerFactor;

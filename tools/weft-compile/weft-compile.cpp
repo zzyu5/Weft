@@ -75,6 +75,10 @@ llvm::cl::opt<int64_t> f16LoadBufferCount(
     llvm::cl::desc(
         "Requested F16 matmul register load buffers: zero selects, one to four"),
     llvm::cl::init(0));
+llvm::cl::opt<std::string> f16LaneAxis(
+    "f16-lane-axis",
+    llvm::cl::desc("Requested F16 matmul lane axis: auto, column, or reduction"),
+    llvm::cl::init("auto"));
 llvm::cl::opt<int64_t> narrowLMUL(
     "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
     llvm::cl::init(0));
@@ -161,6 +165,18 @@ int main(int argc, char **argv) {
     options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;
     options.backend.parameters.f16KUnroll = f16KUnroll;
     options.backend.parameters.f16LoadBufferCount = f16LoadBufferCount;
+    if (f16LaneAxis == "auto")
+      options.backend.parameters.f16LaneAxis = weft::F16MatmulLaneAxis::Auto;
+    else if (f16LaneAxis == "column")
+      options.backend.parameters.f16LaneAxis = weft::F16MatmulLaneAxis::Column;
+    else if (f16LaneAxis == "reduction")
+      options.backend.parameters.f16LaneAxis =
+          weft::F16MatmulLaneAxis::Reduction;
+    else {
+      llvm::errs() << "unsupported --f16-lane-axis value: " << f16LaneAxis
+                   << "\n";
+      return 1;
+    }
     options.backend.parameters.narrowLMUL = narrowLMUL;
     options.backend.parameters.sortRadixBits = sortRadixBits;
     std::error_code headerError;
