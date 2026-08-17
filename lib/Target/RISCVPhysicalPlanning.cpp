@@ -1140,9 +1140,12 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   llvm::SmallVector<Candidate, 2> candidates;
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
-    const bool ime =
-        mapping.instruction == CoreInstructionKind::SpacemitIME1MMA;
-    if ((ime && !supportsIME) || (!ime && !supportsRVV))
+    const bool fragmentMapping = llvm::any_of(
+        mapping.axes, [](const PhysicalAxisDecomposition &axis) {
+          return axis.fragmentFactor > 1;
+        });
+    if ((fragmentMapping && !supportsIME) ||
+        (!fragmentMapping && !supportsRVV))
       continue;
     SelectedI4I8FragmentPhysical selected;
     selected.codeShape = kRVVE8M1;
@@ -1161,29 +1164,33 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
     if (!mappedRows)
       continue;
     const unsigned privateGroups =
-        ime ? selected.implementation.mapping.fixedFragmentGroups
+        fragmentMapping
+            ? selected.implementation.mapping.fixedFragmentGroups
             : mappedRows->registerFactor *
                       rvvRegisterGroups(selected.accumulatorShape) +
                   8 + static_cast<unsigned>(facts.affine);
     PhysicalResourceRequirements requirements;
     requirements.live.push_back(
-        PhysicalLiveRange{ime ? PhysicalLiveClass::Fragment
-                              : PhysicalLiveClass::Temporary,
+        PhysicalLiveRange{fragmentMapping ? PhysicalLiveClass::Fragment
+                                          : PhysicalLiveClass::Temporary,
                           {}, 1, privateGroups});
     std::optional<PhysicalResourceBudget> resources =
         calculatePhysicalResources(requirements, target);
     if (!resources)
       continue;
     selected.resources = *resources;
-    candidates.push_back(Candidate{std::move(selected),
-                                   ime ? 1u : rowExtent * 4u});
+    candidates.push_back(Candidate{
+        std::move(selected), fragmentMapping ? 1u : rowExtent * 4u});
   }
   const int64_t requested = config.structures.i4I8FragmentImplementation;
   if (requested != 0)
     llvm::erase_if(candidates, [&](const Candidate &candidate) {
-      const bool ime = candidate.physical.implementation.mapping.instruction ==
-                       CoreInstructionKind::SpacemitIME1MMA;
-      return requested == 1 ? ime : !ime;
+      const bool fragmentMapping = llvm::any_of(
+          candidate.physical.implementation.mapping.axes,
+          [](const PhysicalAxisDecomposition &axis) {
+            return axis.fragmentFactor > 1;
+          });
+      return requested == 1 ? fragmentMapping : !fragmentMapping;
     });
   if (candidates.empty())
     return std::nullopt;
