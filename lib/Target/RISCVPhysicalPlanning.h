@@ -725,6 +725,7 @@ struct F32DotCandidateFacts {
   unsigned handoffGroups = 0;
   bool reductionPredicate = false;
   bool materializedInit = false;
+  bool localPipeline = false;
 };
 
 struct SelectedF32DotPhysical {

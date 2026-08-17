@@ -22,6 +22,7 @@ struct RISCVCandidateParameters {
   int64_t vlaLMUL = 0;
   int64_t dotLMUL = 0;
   int64_t dotKUnroll = 0;
+  int64_t dotLoadBufferCount = 0;
   int64_t f16InputLMUL = 0;
   int64_t f16RowMicrotile = 0;
   int64_t f16ColumnMicrotile = 0;

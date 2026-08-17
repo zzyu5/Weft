@@ -49,6 +49,11 @@ llvm::cl::opt<int64_t> dotKUnroll(
     "dot-k-unroll",
     llvm::cl::desc("Requested dot K unroll; zero selects"),
     llvm::cl::init(0));
+llvm::cl::opt<int64_t> dotLoadBufferCount(
+    "dot-load-buffer-count",
+    llvm::cl::desc(
+        "Requested local dot register load buffers: zero selects, one or two"),
+    llvm::cl::init(0));
 llvm::cl::opt<int64_t> f16InputLMUL(
     "f16-input-lmul",
     llvm::cl::desc("Requested F16 matmul input LMUL; zero selects"),
@@ -160,6 +165,7 @@ int main(int argc, char **argv) {
     options.backend.parameters.vlaLMUL = vlaLMUL;
     options.backend.parameters.dotLMUL = dotLMUL;
     options.backend.parameters.dotKUnroll = dotKUnroll;
+    options.backend.parameters.dotLoadBufferCount = dotLoadBufferCount;
     options.backend.parameters.f16InputLMUL = f16InputLMUL;
     options.backend.parameters.f16RowMicrotile = f16RowMicrotile;
     options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;

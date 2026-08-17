@@ -5886,6 +5886,7 @@ private:
     decision.lhsLaneStride = rowStride;
     decision.rhsLaneStride = reductionStride;
     F32DotCandidateFacts candidateFacts;
+    candidateFacts.localPipeline = true;
     candidateFacts.reductionExtent = analysis->reductionExtent;
     candidateFacts.mapping = analysis->mapping;
     if (!freeOnLHS)
@@ -5972,6 +5973,10 @@ private:
       return dot.emitError("local f32 dot value shape is unavailable");
     const unsigned rowMicrotile = mAxis->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
+    const unsigned loadBuffers = decision.mapping.pipeline.bufferCount;
+    if ((loadBuffers != 1 && loadBuffers != 2) ||
+        (loadBuffers == 2 && kUnroll < 2))
+      return dot.emitError("local f32 dot pipeline mapping is unavailable");
     std::string fullVL = fresh("dot_vlmax");
     std::string vectorSuffix = "f32m" + std::to_string(*lmul);
     std::string vectorType = "vfloat32m" + std::to_string(*lmul) + "_t";
@@ -6006,7 +6011,12 @@ private:
       }
       std::string strip = fresh("dot_k");
       std::string vl = fresh("dot_vl");
-      auto emitChunk = [&](llvm::StringRef coordinate) -> mlir::LogicalResult {
+      struct LoadedChunk {
+        std::string rhs;
+        llvm::SmallVector<std::string, 8> lhs;
+      };
+      auto emitLoadChunk = [&](llvm::StringRef coordinate,
+                               LoadedChunk &loaded) -> mlir::LogicalResult {
         llvm::DenseMap<mlir::Value, std::string> rhsAxes;
         rhsAxes[decision.reductionAxis] = coordinate.str();
         std::optional<std::string> rhs =
@@ -6018,12 +6028,12 @@ private:
         if (!rhs || !rhsLaneStride)
           return dot.emitError(
               "local f32 dot RHS projection is unavailable");
-        std::string rhsVector = fresh("dot_rhs");
+        loaded.rhs = fresh("dot_rhs");
         if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride)
-          line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+          line(vectorType + " " + loaded.rhs + " = __riscv_vle32_v_" +
                vectorSuffix + "(" + *rhs + ", " + vl + ");");
         else
-          line(vectorType + " " + rhsVector + " = __riscv_vlse32_v_" +
+          line(vectorType + " " + loaded.rhs + " = __riscv_vlse32_v_" +
                vectorSuffix + "(" + *rhs +
                ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
                vl + ");");
@@ -6040,27 +6050,49 @@ private:
           if (!lhs || !lhsLaneStride)
             return dot.emitError(
                 "local f32 dot LHS projection is unavailable");
+          std::string lhsVector = fresh("dot_lhs");
+          if (guarded) {
+            line(vectorType + " " + lhsVector + ";");
+            line("if (" + lhsActive[rowBase + row] + ") {");
+            ++indent;
+          }
+          if (decision.lhsMemoryMode == VLAMemoryMode::UnitStride)
+            line(std::string(guarded ? "" : vectorType + " ") + lhsVector +
+                 " = __riscv_vle32_v_" + vectorSuffix + "(" + *lhs + ", " +
+                 vl + ");");
+          else
+            line(std::string(guarded ? "" : vectorType + " ") + lhsVector +
+                 " = __riscv_vlse32_v_" + vectorSuffix + "(" + *lhs +
+                 ", (ptrdiff_t)(sizeof(float) * (" + *lhsLaneStride + ")), " +
+                 vl + ");");
+          if (guarded) {
+            --indent;
+            line("}");
+          }
+          loaded.lhs.push_back(std::move(lhsVector));
+        }
+        return mlir::success();
+      };
+      auto emitAccumulateChunk = [&](const LoadedChunk &loaded) {
+        for (unsigned row = 0; row < rowCount; ++row) {
           if (guarded) {
             line("if (" + lhsActive[rowBase + row] + ") {");
             ++indent;
           }
-          std::string lhsVector = fresh("dot_lhs");
-          if (decision.lhsMemoryMode == VLAMemoryMode::UnitStride)
-            line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
-                 vectorSuffix + "(" + *lhs + ", " + vl + ");");
-          else
-            line(vectorType + " " + lhsVector + " = __riscv_vlse32_v_" +
-                 vectorSuffix + "(" + *lhs +
-                 ", (ptrdiff_t)(sizeof(float) * (" + *lhsLaneStride + ")), " +
-                 vl + ");");
           line(accumulators[row] + " = __riscv_vfmacc_vv_" + vectorSuffix +
-               "_tu(" + accumulators[row] + ", " + lhsVector + ", " +
-               rhsVector + ", " + vl + ");");
+               "_tu(" + accumulators[row] + ", " + loaded.lhs[row] + ", " +
+               loaded.rhs + ", " + vl + ");");
           if (guarded) {
             --indent;
             line("}");
           }
         }
+      };
+      auto emitChunk = [&](llvm::StringRef coordinate) -> mlir::LogicalResult {
+        LoadedChunk loaded;
+        if (mlir::failed(emitLoadChunk(coordinate, loaded)))
+          return mlir::failure();
+        emitAccumulateChunk(loaded);
         return mlir::success();
       };
       line("for (size_t " + strip + " = 0; " + strip + " < " + extent +
@@ -6083,14 +6115,28 @@ private:
         line("const size_t " + vl + " = __riscv_vsetvl_e32m" +
              std::to_string(*lmul) + "(" + remaining + " / " +
              std::to_string(kUnroll) + ");");
-        for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
-          std::string coordinate =
-              unroll == 0
-                  ? strip
-                  : "(" + strip + " + " + std::to_string(unroll) + " * " + vl +
-                        ")";
-          if (mlir::failed(emitChunk(coordinate)))
+        auto coordinate = [&](unsigned unroll) {
+          return unroll == 0
+                     ? strip
+                     : "(" + strip + " + " + std::to_string(unroll) +
+                           " * " + vl + ")";
+        };
+        if (loadBuffers == 1) {
+          for (unsigned unroll = 0; unroll < kUnroll; ++unroll)
+            if (mlir::failed(emitChunk(coordinate(unroll))))
+              return mlir::failure();
+        } else {
+          LoadedChunk current;
+          if (mlir::failed(emitLoadChunk(coordinate(0), current)))
             return mlir::failure();
+          for (unsigned unroll = 0; unroll < kUnroll; ++unroll) {
+            LoadedChunk next;
+            if (unroll + 1 < kUnroll &&
+                mlir::failed(emitLoadChunk(coordinate(unroll + 1), next)))
+              return mlir::failure();
+            emitAccumulateChunk(current);
+            current = std::move(next);
+          }
         }
         line(strip + " += " + std::to_string(kUnroll) + " * " + vl +
              ";");

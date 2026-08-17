@@ -2101,6 +2101,9 @@ std::optional<SelectedF32DotPhysical>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config) {
+  if (config.parameters.dotLoadBufferCount < 0 ||
+      config.parameters.dotLoadBufferCount > 2)
+    return std::nullopt;
   CoreMappingProblem problem = facts.mapping;
   problem.laneSEW = 32;
   problem.laneInstruction = CoreInstructionKind::RVVFMA;
@@ -2114,7 +2117,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
           ? llvm::SmallVector<unsigned, 4>{
                 static_cast<unsigned>(config.parameters.dotKUnroll)}
           : llvm::SmallVector<unsigned, 4>{1, 2, 4};
-  problem.pipelineBufferCandidates = {1};
+  problem.pipelineBufferCandidates =
+      !facts.localPipeline
+          ? llvm::SmallVector<unsigned, 4>{1}
+          : config.parameters.dotLoadBufferCount != 0
+                ? llvm::SmallVector<unsigned, 4>{static_cast<unsigned>(
+                      config.parameters.dotLoadBufferCount)}
+                : llvm::SmallVector<unsigned, 4>{1, 2};
 
   const unsigned baseF32Lanes =
       rvvLaneCapacity(rvvShape(32, 1), target).value_or(0);
@@ -2137,6 +2146,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     unsigned memoryPenalty = 0;
     unsigned lanePenalty = 0;
     unsigned unrollPenalty = 0;
+    unsigned pipelinePenalty = 0;
     unsigned peakGroups = 0;
   };
   llvm::SmallVector<Candidate, 32> legal;
@@ -2150,7 +2160,11 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
         findAxisMapping(mapping, kCoreAxisK);
     if (laneAxis == mapping.axes.end() || !reduction ||
         (reduction->unrollFactor != 1 && reduction->unrollFactor != 2 &&
-         reduction->unrollFactor != 4))
+         reduction->unrollFactor != 4) ||
+        (mapping.pipeline.bufferCount != 1 &&
+         mapping.pipeline.bufferCount != 2) ||
+        (mapping.pipeline.bufferCount == 2 &&
+         (!facts.localPipeline || reduction->unrollFactor < 2)))
       continue;
     unsigned accumulatorVectors = 1;
     for (const PhysicalAxisDecomposition &axis : mapping.axes)
@@ -2168,7 +2182,8 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     }
     DenseMicrokernelResourceFacts resourceFacts{
         mapping.laneShape, mapping.laneShape, accumulatorVectors,
-        lhsVectorsPerWindow, rhsVectorsPerWindow, reduction->unrollFactor,
+        lhsVectorsPerWindow, rhsVectorsPerWindow,
+        mapping.pipeline.bufferCount,
         facts.predicateGroups, facts.stateGroups, facts.handoffGroups};
     std::optional<PhysicalResourceRequirements> requirements =
         denseMicrokernelRequirements(resourceFacts, target);
@@ -2187,6 +2202,11 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                  : (accumulatorVectors >= 8
                         ? 4
                         : std::max(8u, 2 * baseF32Lanes));
+    const unsigned preferredBuffers =
+        facts.localPipeline && reduction->unrollFactor >= 2 ? 2 : 1;
+    const unsigned pipelinePenalty = static_cast<unsigned>(std::abs(
+        static_cast<int>(mapping.pipeline.bufferCount) -
+        static_cast<int>(preferredBuffers)));
     legal.push_back(Candidate{
         std::move(mapping), std::move(*requirements), *resources,
         static_cast<unsigned>(
@@ -2205,15 +2225,18 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
         static_cast<unsigned>(std::abs(
             static_cast<int>(reduction->unrollFactor) -
             static_cast<int>(preferredUnroll))),
+        pipelinePenalty,
         resources->peakGroups});
   }
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
     return std::tie(lhs.tailPenalty, lhs.sequentialPenalty, lhs.memoryPenalty,
-                    lhs.lanePenalty, lhs.unrollPenalty, lhs.peakGroups) <
+                    lhs.lanePenalty, lhs.unrollPenalty, lhs.pipelinePenalty,
+                    lhs.peakGroups) <
            std::tie(rhs.tailPenalty, rhs.sequentialPenalty, rhs.memoryPenalty,
-                    rhs.lanePenalty, rhs.unrollPenalty, rhs.peakGroups);
+                    rhs.lanePenalty, rhs.unrollPenalty, rhs.pipelinePenalty,
+                    rhs.peakGroups);
   });
   return SelectedF32DotPhysical{std::move(legal.front().mapping),
                                 std::move(legal.front().requirements),
