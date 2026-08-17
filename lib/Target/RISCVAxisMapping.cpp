@@ -95,6 +95,16 @@ integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
   return candidates;
 }
 
+llvm::SmallVector<unsigned, 4>
+registerFactorCandidates(uint64_t extent, unsigned maximum) {
+  llvm::SmallVector<unsigned, 4> candidates;
+  for (unsigned factor = 1;
+       factor <= maximum && static_cast<uint64_t>(factor) <= extent; ++factor)
+    if (extent % factor == 0)
+      candidates.push_back(factor);
+  return candidates;
+}
+
 bool PhysicalAxisDecomposition::operator==(
     const PhysicalAxisDecomposition &other) const {
   return std::tie(id, role, extent, sequentialFactor, laneFactor,
@@ -115,14 +125,12 @@ bool PhysicalAxisDecomposition::operator<(
 
 bool LocalPipelineMapping::operator==(
     const LocalPipelineMapping &other) const {
-  return bufferCount == other.bufferCount &&
-         prefetchDistance == other.prefetchDistance;
+  return bufferCount == other.bufferCount;
 }
 
 bool LocalPipelineMapping::operator<(
     const LocalPipelineMapping &other) const {
-  return std::tie(bufferCount, prefetchDistance) <
-         std::tie(other.bufferCount, other.prefetchDistance);
+  return bufferCount < other.bufferCount;
 }
 
 bool CorePhysicalMapping::operator==(const CorePhysicalMapping &other) const {
@@ -249,7 +257,6 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
             mapping.instruction = problem.laneInstruction;
             mapping.laneShape = laneShape;
             mapping.pipeline.bufferCount = buffers;
-            mapping.pipeline.prefetchDistance = buffers - 1;
             for (size_t index = 0; index < problem.axes.size(); ++index) {
               const LogicalAxisConstraint &axis = problem.axes[index];
               PhysicalAxisDecomposition decomposition;
@@ -279,7 +286,6 @@ enumerateCorePhysicalMappings(const CoreMappingProblem &problem,
           CorePhysicalMapping mapping;
           mapping.instruction = problem.laneInstruction;
           mapping.pipeline.bufferCount = buffers;
-          mapping.pipeline.prefetchDistance = buffers - 1;
           for (size_t index = 0; index < problem.axes.size(); ++index) {
             const LogicalAxisConstraint &axis = problem.axes[index];
             mapping.axes.push_back(PhysicalAxisDecomposition{

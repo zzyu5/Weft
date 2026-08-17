@@ -1672,21 +1672,28 @@ calculateDenseMicrokernelResources(
       !target.supportsVectorShape(facts.accumulatorShape.sew,
                                   facts.accumulatorShape.lmulEighths))
     return std::nullopt;
-  PhysicalResourceBudget resources;
-  resources.architecturalGroups = target.vectorRegisters;
-  resources.valueGroups =
-      facts.accumulatorVectors * rvvRegisterGroups(facts.accumulatorShape);
-  resources.memoryGroups =
-      (facts.lhsVectorsPerWindow + facts.rhsVectorsPerWindow) *
-      facts.loadWindow * rvvRegisterGroups(facts.inputShape);
-  resources.predicateGroups = facts.predicateGroups;
-  resources.stateGroups = facts.stateGroups;
-  resources.primitiveGroups = resources.valueGroups + resources.memoryGroups;
-  resources.peakGroups = resources.primitiveGroups + resources.predicateGroups +
-                         resources.stateGroups + facts.handoffGroups + 1;
-  if (resources.peakGroups >
-      static_cast<unsigned>(target.vectorRegisters))
+  PhysicalResourceRequirements requirements;
+  requirements.live = {
+      PhysicalLiveRange{PhysicalLiveClass::Value, facts.accumulatorShape,
+                        facts.accumulatorVectors},
+      PhysicalLiveRange{PhysicalLiveClass::Memory, facts.inputShape,
+                        (facts.lhsVectorsPerWindow +
+                         facts.rhsVectorsPerWindow) *
+                            facts.loadWindow}};
+  if (facts.predicateGroups != 0)
+    requirements.live.push_back(PhysicalLiveRange{
+        PhysicalLiveClass::Predicate, {}, 1, facts.predicateGroups});
+  if (facts.stateGroups != 0)
+    requirements.live.push_back(PhysicalLiveRange{
+        PhysicalLiveClass::State, {}, 1, facts.stateGroups});
+  if (facts.handoffGroups != 0)
+    requirements.live.push_back(PhysicalLiveRange{
+        PhysicalLiveClass::Handoff, {}, 1, facts.handoffGroups});
+  std::optional<PhysicalResourceBudget> resources =
+      calculatePhysicalResources(requirements, target);
+  if (!resources)
     return std::nullopt;
+  resources->primitiveGroups = resources->valueGroups + resources->memoryGroups;
   return resources;
 }
 
@@ -1694,108 +1701,119 @@ std::optional<SelectedF32DotPhysical>
 selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config) {
-  auto legalUnroll = [](unsigned value) {
-    return value == 1 || value == 2 || value == 4;
-  };
-  llvm::SmallVector<unsigned> lmulCandidates =
-      integerLMULCandidates(target, 32);
-  llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
+  CoreMappingProblem problem = facts.mapping;
+  problem.laneSEW = 32;
+  problem.laneInstruction = CoreInstructionKind::RVVFMA;
   if (config.parameters.dotLMUL != 0)
-    lmulCandidates = {static_cast<unsigned>(config.parameters.dotLMUL)};
-  if (config.parameters.dotKUnroll != 0)
-    unrollCandidates = {
-        static_cast<unsigned>(config.parameters.dotKUnroll)};
+    problem.laneLMULCandidates = {
+        static_cast<unsigned>(config.parameters.dotLMUL)};
+  else
+    problem.laneLMULCandidates = integerLMULCandidates(target, 32);
+  problem.unrollCandidates =
+      config.parameters.dotKUnroll != 0
+          ? llvm::SmallVector<unsigned, 4>{
+                static_cast<unsigned>(config.parameters.dotKUnroll)}
+          : llvm::SmallVector<unsigned, 4>{1, 2, 4};
+  problem.pipelineBufferCandidates = {1};
 
-  if (facts.lhsVLAFreeAxis && facts.rhsVLAFreeAxis)
-    return std::nullopt;
-  const bool hasVLAFreeAxis = facts.lhsVLAFreeAxis || facts.rhsVLAFreeAxis;
   const unsigned baseF32Lanes =
       rvvLaneCapacity(rvvShape(32, 1), target).value_or(0);
   if (baseF32Lanes == 0)
     return std::nullopt;
-  const unsigned desiredLanes = hasVLAFreeAxis
-                                    ? (facts.rowTile == 1 ? 16 : 8)
-                                    : (facts.rowTile >= 8
-                                           ? 4
-                                           : std::max(8u, 2 * baseF32Lanes));
   unsigned preferredUnroll = 1;
   bool costlyHandoff = facts.materializedInit || facts.reductionPredicate ||
                        facts.indexedOperands != 0;
-  const bool localRowsFillWideVector =
-      !hasVLAFreeAxis && facts.rowTile > 1 && baseF32Lanes >= 8;
-  if (!costlyHandoff && facts.reductionExtent &&
-      !localRowsFillWideVector)
+  if (!costlyHandoff && facts.reductionExtent)
     preferredUnroll = *facts.reductionExtent >= 64
                           ? 4
                           : *facts.reductionExtent >= 32 ? 2 : 1;
 
   struct Candidate {
-    F32DotParameters parameters;
+    CorePhysicalMapping mapping;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
+    unsigned sequentialPenalty = 0;
     unsigned memoryPenalty = 0;
     unsigned lanePenalty = 0;
     unsigned unrollPenalty = 0;
     unsigned peakGroups = 0;
   };
-  llvm::SmallVector<Candidate> legal;
-  for (unsigned lmul : lmulCandidates) {
-    const RVVVectorShape vectorShape = rvvShape(32, lmul);
-    const std::optional<unsigned> laneCapacity =
-        rvvLaneCapacity(vectorShape, target);
-    if (!laneCapacity)
+  llvm::SmallVector<Candidate, 32> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(problem, target)) {
+    const PhysicalAxisDecomposition *laneAxis = llvm::find_if(
+        mapping.axes, [](const PhysicalAxisDecomposition &axis) {
+          return axis.laneFactor > 1;
+        });
+    const PhysicalAxisDecomposition *reduction =
+        findAxisMapping(mapping, kCoreAxisK);
+    if (laneAxis == mapping.axes.end() || !reduction ||
+        (reduction->unrollFactor != 1 && reduction->unrollFactor != 2 &&
+         reduction->unrollFactor != 4))
       continue;
-    for (unsigned unroll : unrollCandidates) {
-      if (!legalUnroll(unroll))
-        continue;
-      unsigned streamedOperands =
-          std::max(1u, facts.unitStrideOperands + facts.stridedOperands +
-                           facts.indexedOperands);
-      std::optional<PhysicalResourceBudget> resources =
-          calculateDenseMicrokernelResources(
-              {vectorShape, vectorShape, facts.rowTile, streamedOperands, 0,
-               unroll, facts.predicateGroups, facts.stateGroups,
-               facts.handoffGroups},
-              target);
-      if (!resources)
-        continue;
-      legal.push_back(Candidate{
-          F32DotParameters{lmul, unroll}, *resources,
-          static_cast<unsigned>(facts.reductionExtent &&
-                                *facts.reductionExtent % unroll != 0),
-          facts.stridedOperands * unroll +
-              2 * facts.indexedOperands * unroll + facts.predicateGroups +
-              facts.handoffGroups,
-          static_cast<unsigned>(std::abs(static_cast<int>(*laneCapacity) -
-                                         static_cast<int>(desiredLanes))),
-          static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
-                                         static_cast<int>(preferredUnroll))),
-          resources->peakGroups});
+    unsigned accumulatorVectors = 1;
+    for (const PhysicalAxisDecomposition &axis : mapping.axes)
+      if (axis.role == LogicalAxisRole::Free)
+        accumulatorVectors *= axis.registerFactor;
+    unsigned lhsVectorsPerWindow = 0;
+    unsigned rhsVectorsPerWindow = 0;
+    if (laneAxis->id == kCoreAxisK) {
+      lhsVectorsPerWindow = accumulatorVectors;
+      rhsVectorsPerWindow = 1;
+    } else if (laneAxis->id == kCoreAxisM) {
+      lhsVectorsPerWindow = 1;
+    } else if (laneAxis->id == kCoreAxisN) {
+      rhsVectorsPerWindow = 1;
     }
+    std::optional<PhysicalResourceBudget> resources =
+        calculateDenseMicrokernelResources(
+            {mapping.laneShape, mapping.laneShape, accumulatorVectors,
+             lhsVectorsPerWindow, rhsVectorsPerWindow,
+             reduction->unrollFactor,
+             facts.predicateGroups, facts.stateGroups, facts.handoffGroups},
+            target);
+    if (!resources)
+      continue;
+    const bool freeLane = laneAxis->role == LogicalAxisRole::Free;
+    unsigned sequentialPenalty = 1;
+    for (const PhysicalAxisDecomposition &axis : mapping.axes)
+      if (axis.role == LogicalAxisRole::Free)
+        sequentialPenalty *= std::max(1u, axis.sequentialFactor);
+    const unsigned desiredLanes =
+        freeLane ? (accumulatorVectors == 1 ? 16 : 8)
+                 : (accumulatorVectors >= 8
+                        ? 4
+                        : std::max(8u, 2 * baseF32Lanes));
+    legal.push_back(Candidate{
+        std::move(mapping), *resources,
+        static_cast<unsigned>(
+            facts.reductionExtent &&
+            *facts.reductionExtent %
+                    (reduction->unrollFactor *
+                     (laneAxis->id == kCoreAxisK ? laneAxis->laneFactor : 1)) !=
+                0),
+        sequentialPenalty,
+        facts.stridedOperands * reduction->unrollFactor +
+            2 * facts.indexedOperands * reduction->unrollFactor +
+            facts.predicateGroups + facts.handoffGroups,
+        static_cast<unsigned>(std::abs(
+            static_cast<int>(laneAxis->laneFactor) -
+            static_cast<int>(desiredLanes))),
+        static_cast<unsigned>(std::abs(
+            static_cast<int>(reduction->unrollFactor) -
+            static_cast<int>(preferredUnroll))),
+        resources->peakGroups});
   }
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.tailPenalty, lhs.memoryPenalty, lhs.lanePenalty,
-                    lhs.unrollPenalty, lhs.peakGroups) <
-           std::tie(rhs.tailPenalty, rhs.memoryPenalty, rhs.lanePenalty,
-                    rhs.unrollPenalty, rhs.peakGroups);
+    return std::tie(lhs.tailPenalty, lhs.sequentialPenalty, lhs.memoryPenalty,
+                    lhs.lanePenalty, lhs.unrollPenalty, lhs.peakGroups) <
+           std::tie(rhs.tailPenalty, rhs.sequentialPenalty, rhs.memoryPenalty,
+                    rhs.lanePenalty, rhs.unrollPenalty, rhs.peakGroups);
   });
-  const F32DotStructure structure = facts.lhsVLAFreeAxis
-                                        ? F32DotStructure::RVVVLAVectorDot
-                                    : facts.rhsVLAFreeAxis
-                                        ? F32DotStructure::RVVVLAMicrotile
-                                        : F32DotStructure::RVVLocalRowMicrokernel;
-  const DenseVectorOrganization vectorOrganization =
-      structure == F32DotStructure::RVVVLAVectorDot
-          ? DenseVectorOrganization::FreeMAxis
-          : structure == F32DotStructure::RVVVLAMicrotile
-                ? DenseVectorOrganization::FreeNAxis
-                : DenseVectorOrganization::ReductionAxis;
-  return SelectedF32DotPhysical{
-      structure, vectorOrganization, DenseLoadSchedule::Streamed,
-      legal.front().parameters,
-      legal.front().resources};
+  return SelectedF32DotPhysical{std::move(legal.front().mapping),
+                                legal.front().resources};
 }
 
 std::optional<SelectedF16MatmulPhysical>
@@ -1809,57 +1827,61 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
       rvvLaneCapacity(rvvShape(16, 1), target).value_or(0);
   if (baseInputLanes == 0)
     return std::nullopt;
-  const unsigned preferredRows =
-      std::min(facts.rowTile, std::max(1u, baseInputLanes / 4));
-  llvm::SmallVector<unsigned> rowCandidates;
-  if (config.parameters.f16RowMicrotile != 0) {
-    rowCandidates.push_back(
-        static_cast<unsigned>(config.parameters.f16RowMicrotile));
-  } else {
-    for (unsigned rows = facts.rowTile; rows > 0; --rows)
-      if (facts.rowTile % rows == 0)
-        rowCandidates.push_back(rows);
-    auto preferred = llvm::find(rowCandidates, preferredRows);
-    if (preferred != rowCandidates.end())
-      std::rotate(rowCandidates.begin(), preferred, std::next(preferred));
-  }
-
-  llvm::SmallVector<unsigned> lmulCandidates =
-      integerLMULCandidates(target, 16, 4);
+  CoreMappingProblem problem = facts.mapping;
+  problem.laneSEW = 16;
+  problem.laneInstruction = CoreInstructionKind::RVVWideningFMA;
   if (config.parameters.f16InputLMUL != 0)
-    lmulCandidates = {
+    problem.laneLMULCandidates = {
         static_cast<unsigned>(config.parameters.f16InputLMUL)};
-  llvm::SmallVector<unsigned> unrollCandidates = {1, 2, 4};
-  if (config.parameters.f16KUnroll != 0)
-    unrollCandidates = {
-        static_cast<unsigned>(config.parameters.f16KUnroll)};
-  llvm::SmallVector<unsigned> bufferCandidates = {1, 2};
-  if (config.parameters.f16LoadBufferCount != 0)
-    bufferCandidates = {
-        static_cast<unsigned>(config.parameters.f16LoadBufferCount)};
-
-  llvm::SmallVector<unsigned> columnCandidates;
-  if (config.parameters.f16ColumnMicrotile != 0) {
-    columnCandidates.push_back(
-        static_cast<unsigned>(config.parameters.f16ColumnMicrotile));
-  } else {
-    columnCandidates.push_back(1);
-    if (facts.columnTile >= 2 && facts.columnTile % 2 == 0)
-      columnCandidates.insert(columnCandidates.begin(), 2);
+  else
+    problem.laneLMULCandidates = integerLMULCandidates(target, 16, 4);
+  problem.unrollCandidates =
+      config.parameters.f16KUnroll != 0
+          ? llvm::SmallVector<unsigned, 4>{
+                static_cast<unsigned>(config.parameters.f16KUnroll)}
+          : llvm::SmallVector<unsigned, 4>{1, 2, 4};
+  problem.pipelineBufferCandidates =
+      config.parameters.f16LoadBufferCount != 0
+          ? llvm::SmallVector<unsigned, 4>{
+                static_cast<unsigned>(config.parameters.f16LoadBufferCount)}
+          : llvm::SmallVector<unsigned, 4>{1, 2};
+  LogicalAxisConstraint *mConstraint = nullptr;
+  LogicalAxisConstraint *nConstraint = nullptr;
+  for (LogicalAxisConstraint &axis : problem.axes) {
+    if (axis.id == kCoreAxisM)
+      mConstraint = &axis;
+    if (axis.id == kCoreAxisN)
+      nConstraint = &axis;
   }
-
+  if (!mConstraint || !nConstraint || !mConstraint->extent ||
+      !nConstraint->extent)
+    return std::nullopt;
+  const unsigned rowTile = static_cast<unsigned>(*mConstraint->extent);
+  const unsigned columnTile = static_cast<unsigned>(*nConstraint->extent);
+  if (config.parameters.f16RowMicrotile != 0)
+    mConstraint->registerFactors = {
+        static_cast<unsigned>(config.parameters.f16RowMicrotile)};
+  if (config.parameters.f16ColumnMicrotile != 0)
+    nConstraint->registerFactors = {
+        static_cast<unsigned>(config.parameters.f16ColumnMicrotile)};
+  const unsigned preferredRows =
+      std::min(rowTile, std::max(1u, baseInputLanes / 4));
   const unsigned preferredLMUL = 1;
+  std::optional<uint64_t> reductionExtent;
+  for (const LogicalAxisConstraint &axis : problem.axes)
+    if (axis.id == kCoreAxisK)
+      reductionExtent = axis.extent;
+  if (!reductionExtent)
+    return std::nullopt;
   const unsigned preferredUnroll =
-      facts.reductionTile < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
-  const unsigned preferredBuffers = facts.reductionTile >= 64 ? 2 : 1;
+      *reductionExtent < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
+  const unsigned preferredBuffers = *reductionExtent >= 64 ? 2 : 1;
   const unsigned preferredColumns =
-      baseInputLanes <= 8 && facts.columnTile >= 2 &&
-              facts.columnTile % 2 == 0
+      baseInputLanes <= 8 && columnTile >= 2 && columnTile % 2 == 0
           ? 2
           : 1;
   struct Candidate {
-    DenseLoadSchedule loadSchedule;
-    F16MatmulParameters parameters;
+    CorePhysicalMapping mapping;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned rowPenalty = 0;
@@ -1868,80 +1890,50 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     unsigned unrollPenalty = 0;
     unsigned bufferPenalty = 0;
   };
-  llvm::SmallVector<Candidate> legal;
-  for (unsigned rows : rowCandidates) {
-    if (rows == 0 || rows > facts.rowTile || facts.rowTile % rows != 0)
+  llvm::SmallVector<Candidate, 64> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(problem, target)) {
+    const PhysicalAxisDecomposition *m =
+        findAxisMapping(mapping, kCoreAxisM);
+    const PhysicalAxisDecomposition *n =
+        findAxisMapping(mapping, kCoreAxisN);
+    const PhysicalAxisDecomposition *k =
+        findAxisMapping(mapping, kCoreAxisK);
+    std::optional<unsigned> inputLMUL = rvvIntegerLMUL(mapping.laneShape);
+    std::optional<RVVVectorShape> accumulatorShape =
+        rvvShapeForSameLanes(mapping.laneShape, 32, target);
+    if (!m || !n || !k || !inputLMUL || !accumulatorShape ||
+        (k->unrollFactor != 1 && k->unrollFactor != 2 &&
+         k->unrollFactor != 4) ||
+        (mapping.pipeline.bufferCount != 1 &&
+         mapping.pipeline.bufferCount != 2) ||
+        (mapping.pipeline.bufferCount == 2 && k->unrollFactor < 2))
       continue;
-    for (unsigned columns : columnCandidates) {
-      if (columns == 0 || columns > facts.columnTile ||
-          facts.columnTile % columns != 0)
-        continue;
-      for (unsigned inputLMUL : lmulCandidates) {
-      if (!target.supportsVectorShape(16, static_cast<int>(inputLMUL * 8)) ||
-          !target.supportsVectorShape(32,
-                                      static_cast<int>(2 * inputLMUL * 8)))
-        continue;
-      unsigned computeLMUL = 2 * inputLMUL;
-      const std::optional<unsigned> laneCapacity =
-          rvvLaneCapacity(rvvShape(16, inputLMUL), target);
-      if (!laneCapacity)
-        continue;
-      const unsigned lanes = *laneCapacity;
-      for (unsigned unroll : unrollCandidates) {
-        if (unroll != 1 && unroll != 2 && unroll != 4)
-          continue;
-        for (unsigned buffers : bufferCandidates) {
-          if ((buffers != 1 && buffers != 2) ||
-              (buffers == 2 && unroll < 2))
-            continue;
-          F16MatmulParameters parameters;
-          parameters.rowMicrotile = rows;
-          parameters.columnMicrotile = columns;
-          parameters.inputLMUL = inputLMUL;
-          parameters.kUnroll = unroll;
-          parameters.loadBufferCount = buffers;
-          DenseLoadSchedule loadSchedule =
-              buffers == 2 ? DenseLoadSchedule::RegisterDoubleBuffered
-                           : DenseLoadSchedule::Streamed;
-          std::optional<PhysicalResourceBudget> resources =
-              calculateDenseMicrokernelResources(
-                  {rvvShape(16, inputLMUL), rvvShape(32, computeLMUL),
-                   rows * columns,
-                   loadSchedule ==
-                           DenseLoadSchedule::RegisterDoubleBuffered
-                       ? rows
-                       : 1,
-                   columns,
-                   loadSchedule ==
-                           DenseLoadSchedule::RegisterDoubleBuffered
-                       ? 2u
-                       : 1u},
-                  target);
-          if (!resources)
-            continue;
-          legal.push_back(Candidate{
-              loadSchedule,
-              parameters,
-              *resources,
-              static_cast<unsigned>(facts.reductionTile % (unroll * lanes) !=
-                                    0),
-              static_cast<unsigned>(std::abs(
-                  static_cast<int>(rows) -
-                  static_cast<int>(preferredRows))),
-              static_cast<unsigned>(std::abs(
-                  static_cast<int>(columns) -
-                  static_cast<int>(preferredColumns))),
-              static_cast<unsigned>(std::abs(static_cast<int>(inputLMUL) -
-                                             static_cast<int>(preferredLMUL))),
-              static_cast<unsigned>(std::abs(static_cast<int>(unroll) -
-                                             static_cast<int>(preferredUnroll))),
-              static_cast<unsigned>(std::abs(
-                  static_cast<int>(buffers) -
-                  static_cast<int>(preferredBuffers)))});
-      }
-    }
-  }
-    }
+    const unsigned rows = m->registerFactor;
+    const unsigned columns = n->registerFactor;
+    const unsigned bufferCount = mapping.pipeline.bufferCount;
+    std::optional<PhysicalResourceBudget> resources =
+        calculateDenseMicrokernelResources(
+            {mapping.laneShape, *accumulatorShape, rows * columns,
+             bufferCount == 2 ? rows : 1, columns, bufferCount},
+            target);
+    if (!resources)
+      continue;
+    legal.push_back(Candidate{
+        std::move(mapping), *resources,
+        static_cast<unsigned>(*reductionExtent %
+                                  (k->unrollFactor * k->laneFactor) !=
+                              0),
+        static_cast<unsigned>(std::abs(static_cast<int>(rows) -
+                                       static_cast<int>(preferredRows))),
+        static_cast<unsigned>(std::abs(static_cast<int>(columns) -
+                                       static_cast<int>(preferredColumns))),
+        static_cast<unsigned>(std::abs(static_cast<int>(*inputLMUL) -
+                                       static_cast<int>(preferredLMUL))),
+        static_cast<unsigned>(std::abs(static_cast<int>(k->unrollFactor) -
+                                       static_cast<int>(preferredUnroll))),
+        static_cast<unsigned>(std::abs(static_cast<int>(bufferCount) -
+                                       static_cast<int>(preferredBuffers)))});
   }
   if (legal.empty())
     return std::nullopt;
@@ -1955,9 +1947,8 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
                     rhs.unrollPenalty, rhs.bufferPenalty,
                     rhs.resources.peakGroups);
   });
-  return SelectedF16MatmulPhysical{
-      DenseVectorOrganization::ReductionAxis, legal.front().loadSchedule,
-      legal.front().parameters, legal.front().resources};
+  return SelectedF16MatmulPhysical{std::move(legal.front().mapping),
+                                   legal.front().resources};
 }
 
 } // namespace weft::riscv_internal

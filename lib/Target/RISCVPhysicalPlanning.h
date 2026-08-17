@@ -733,23 +733,6 @@ selectGroupedAffineI4I8Physical(
     const GroupedAffineI4I8CandidateFacts &facts,
     const RISCVTargetProfile &target);
 
-enum class F32DotStructure {
-  RVVVLAMicrotile,
-  RVVVLAVectorDot,
-  RVVLocalRowMicrokernel,
-};
-
-enum class DenseVectorOrganization {
-  ReductionAxis,
-  FreeMAxis,
-  FreeNAxis,
-};
-
-enum class DenseLoadSchedule {
-  Streamed,
-  RegisterDoubleBuffered,
-};
-
 struct DenseMicrokernelResourceFacts {
   RVVVectorShape inputShape;
   RVVVectorShape accumulatorShape;
@@ -767,15 +750,8 @@ calculateDenseMicrokernelResources(
     const DenseMicrokernelResourceFacts &facts,
     const RISCVTargetProfile &target);
 
-struct F32DotParameters {
-  unsigned lmul = 1;
-  unsigned kUnroll = 1;
-};
-
 struct F32DotCandidateFacts {
-  bool lhsVLAFreeAxis = false;
-  bool rhsVLAFreeAxis = false;
-  unsigned rowTile = 1;
+  CoreMappingProblem mapping;
   std::optional<uint64_t> reductionExtent;
   unsigned unitStrideOperands = 0;
   unsigned stridedOperands = 0;
@@ -788,11 +764,7 @@ struct F32DotCandidateFacts {
 };
 
 struct SelectedF32DotPhysical {
-  F32DotStructure structure = F32DotStructure::RVVLocalRowMicrokernel;
-  DenseVectorOrganization vectorOrganization =
-      DenseVectorOrganization::ReductionAxis;
-  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
-  F32DotParameters parameters;
+  CorePhysicalMapping mapping;
   PhysicalResourceBudget resources;
 };
 
@@ -801,25 +773,12 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config);
 
-struct F16MatmulParameters {
-  unsigned rowMicrotile = 1;
-  unsigned columnMicrotile = 1;
-  unsigned inputLMUL = 1;
-  unsigned kUnroll = 1;
-  unsigned loadBufferCount = 1;
-};
-
 struct F16MatmulCandidateFacts {
-  unsigned rowTile = 1;
-  unsigned columnTile = 1;
-  unsigned reductionTile = 1;
+  CoreMappingProblem mapping;
 };
 
 struct SelectedF16MatmulPhysical {
-  DenseVectorOrganization vectorOrganization =
-      DenseVectorOrganization::ReductionAxis;
-  DenseLoadSchedule loadSchedule = DenseLoadSchedule::Streamed;
-  F16MatmulParameters parameters;
+  CorePhysicalMapping mapping;
   PhysicalResourceBudget resources;
 };
 

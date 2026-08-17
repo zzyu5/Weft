@@ -57,6 +57,8 @@ RVVVectorShape rvvShape(unsigned sew, unsigned lmul);
 llvm::SmallVector<unsigned>
 integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
                       unsigned maximum = 8);
+llvm::SmallVector<unsigned, 4>
+registerFactorCandidates(uint64_t extent, unsigned maximum);
 
 struct PhysicalResourceBudget {
   unsigned architecturalGroups = 0;
@@ -141,7 +143,6 @@ struct PhysicalAxisDecomposition {
 
 struct LocalPipelineMapping {
   unsigned bufferCount = 1;
-  unsigned prefetchDistance = 0;
 
   bool operator==(const LocalPipelineMapping &other) const;
   bool operator<(const LocalPipelineMapping &other) const;
