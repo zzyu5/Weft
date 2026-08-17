@@ -7258,6 +7258,10 @@ private:
       facts.prefixPredicated =
           isContiguousPrefixPredicate(op.getWhere(), rowAxis.getResult()) &&
           isContiguousPrefixPredicate(op.getWhere(), columnAxis.getResult());
+      const MemoryAccessFact *access = memoryFact(op.getOperation());
+      facts.unitStride =
+          access && memoryRelation(*access, columnAxis.getResult()) ==
+                        LaneRelation::UnitStride;
       decision.rowAxis = rowAxis.getResult();
       decision.columnAxis = columnAxis.getResult();
       decision.rows = *rows;
@@ -7994,8 +7998,13 @@ private:
       consumed.insert(op.getOperation());
       return std::optional<mlir::LogicalResult>(mlir::success());
     }
+    const bool rankOneVector = decision.mapping.axes.size() == 1;
+    const bool rankTwoVector = decision.mapping.axes.size() == 2;
+    const PhysicalAxisDecomposition *laneAxis =
+        findAxisMapping(decision.mapping, kCoreAxisN);
     if (decision.mapping.instruction != CoreInstructionKind::RVVElementwise ||
-        decision.mapping.axes.size() != 1 || !decision.mapping.laneShape)
+        (!rankOneVector && !rankTwoVector) || !decision.mapping.laneShape ||
+        !laneAxis || laneAxis->laneFactor == 0)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store decision has no spelling"));
     const RVVVectorShape vectorShape = decision.mapping.laneShape;
@@ -8006,33 +8015,54 @@ private:
     if (valuePlan == entity.values.end() || valuePlan->shape != vectorShape)
       return std::optional<mlir::LogicalResult>(
           op.emitError("materialized block store has no physical value shape"));
-    llvm::DenseMap<mlir::Value, std::string> axes;
-    axes[decision.columnAxis] = "0";
-    std::optional<std::string> destination =
-        projectBlockScalar(op.getPointer(), axes);
-    if (!destination)
-      return std::optional<mlir::LogicalResult>(op.emitError(
-          "materialized f32 block store has no scalar pointer base"));
-    std::string offset = fresh("block_store_offset");
-    std::string vl = fresh("block_store_vl");
-    std::string value = fresh("block_store_value");
     std::string shapeSuffix = rvvShapeSuffix(vectorShape);
     if (shapeSuffix.empty())
       return std::optional<mlir::LogicalResult>(op.emitError(
           "materialized block store vector shape has no RVV spelling"));
-    line("for (size_t " + offset + " = 0; " + offset + " < " +
-         std::to_string(decision.columns) + ";) {");
-    ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e" + shapeSuffix +
-         "(" + std::to_string(decision.columns) + " - " + offset + ");");
-    line("vfloat" + shapeSuffix + "_t " + value +
-         " = __riscv_vle32_v_f" + shapeSuffix + "(" +
-         stored->second.spelling + " + " + offset + ", " + vl + ");");
-    line("__riscv_vse32_v_f" + shapeSuffix + "(" + *destination + " + " +
-         offset + ", " + value + ", " + vl + ");");
-    line(offset + " += " + vl + ";");
-    --indent;
-    line("}");
+    auto emitVectorRow = [&](llvm::StringRef row) -> mlir::LogicalResult {
+      llvm::DenseMap<mlir::Value, std::string> axes;
+      axes[decision.columnAxis] = "0";
+      if (rankTwoVector)
+        axes[decision.rowAxis] = row.str();
+      std::optional<std::string> destination =
+          projectBlockScalar(op.getPointer(), axes);
+      if (!destination)
+        return op.emitError(
+            "materialized f32 block store has no scalar pointer base");
+      std::string offset = fresh("block_store_offset");
+      std::string vl = fresh("block_store_vl");
+      std::string value = fresh("block_store_value");
+      std::string source = stored->second.spelling;
+      if (rankTwoVector)
+        source += " + (" + row.str() + ") * " +
+                  std::to_string(decision.columns);
+      line("for (size_t " + offset + " = 0; " + offset + " < " +
+           std::to_string(decision.columns) + ";) {");
+      ++indent;
+      line("const size_t " + vl + " = __riscv_vsetvl_e" + shapeSuffix +
+           "(" + std::to_string(decision.columns) + " - " + offset + ");");
+      line("vfloat" + shapeSuffix + "_t " + value +
+           " = __riscv_vle32_v_f" + shapeSuffix + "(" + source + " + " +
+           offset + ", " + vl + ");");
+      line("__riscv_vse32_v_f" + shapeSuffix + "(" + *destination + " + " +
+           offset + ", " + value + ", " + vl + ");");
+      line(offset + " += " + vl + ";");
+      --indent;
+      line("}");
+      return mlir::success();
+    };
+    if (rankTwoVector) {
+      std::string row = fresh("block_store_row");
+      line("for (size_t " + row + " = 0; " + row + " < " +
+           std::to_string(decision.rows) + "; ++" + row + ") {");
+      ++indent;
+      if (mlir::failed(emitVectorRow(row)))
+        return mlir::failure();
+      --indent;
+      line("}");
+    } else if (mlir::failed(emitVectorRow("0"))) {
+      return mlir::failure();
+    }
     if (mlir::failed(markRematerializedBlockTrees(
             {op.getPointer()}, op.getOperation())))
       return mlir::failure();

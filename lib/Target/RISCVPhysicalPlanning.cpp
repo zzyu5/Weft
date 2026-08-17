@@ -634,8 +634,11 @@ selectMaterializedBlockStorePhysical(
   problem.sequentialInstruction = CoreInstructionKind::Scalar;
   problem.laneSEW = 32;
   problem.laneInstruction = CoreInstructionKind::RVVElementwise;
-  if (rankOne && facts.allActive && facts.unitStride) {
-    problem.axes.front().allowLane = true;
+  const bool vectorizable = facts.allActive && facts.unitStride;
+  if (vectorizable) {
+    LogicalAxisConstraint &laneAxis =
+        rankOne ? problem.axes.front() : problem.axes[1];
+    laneAxis.allowLane = true;
     problem.laneShapeCandidates = rvvShapeCandidates(target, 32);
   } else {
     for (LogicalAxisConstraint &axis : problem.axes) {
@@ -656,8 +659,7 @@ selectMaterializedBlockStorePhysical(
        enumerateCorePhysicalMappings(problem, target)) {
     const bool vector =
         mapping.instruction == CoreInstructionKind::RVVElementwise;
-    if (vector && (!rankOne || !facts.allActive || !facts.unitStride ||
-                   !mapping.laneShape))
+    if (vector && (!vectorizable || !mapping.laneShape))
       continue;
     if (!vector && mapping.instruction != CoreInstructionKind::Scalar)
       continue;
