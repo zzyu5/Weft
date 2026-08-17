@@ -455,8 +455,10 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
       selected.resultShape = facts.trueShape ? facts.trueShape : facts.falseShape;
     break;
   case BlockOperationSemantic::Other:
-    break;
+    return std::nullopt;
   }
+  if (!selected.resultShape)
+    return std::nullopt;
   return selected;
 }
 

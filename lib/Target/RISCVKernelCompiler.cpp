@@ -9655,6 +9655,8 @@ private:
     llvm::SmallVector<BlockOperationDecision> decisions;
     llvm::DenseMap<mlir::Operation *, BlockOperationDecision> prior;
     for (mlir::Operation *operation : ordered) {
+      if (mlir::isa<PtrAddOp, DecodeOp, TupleOp, TupleGetOp>(operation))
+        continue;
       mlir::FailureOr<BlockOperationDecision> decision =
           decideBlockOperation(operation, byteShape, entity, prior);
       if (mlir::failed(decision))
