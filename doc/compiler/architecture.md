@@ -71,7 +71,7 @@ group。对直接位于VLA body、只依赖VLA外值的纯地址运算，它另�
 
 `RISCVReuseAnalysis` 从同一份facts推导operand是否随reduction推进、是否直接供给primitive、
 address/predicate是否依赖accumulator、consumer数量和control crossing。它是F32 dot、VLA dot和
-F16 matmul共同的reuse/pipeline输入，不产生第二份IR。
+F16/F32 matmul共同的reuse/pipeline输入，不产生第二份IR。
 
 `RISCVAxisMapping` 与 `RISCVPhysicalPlanning` 把显式op约束组合成sequential/lane/register/unroll/
 fragment轴分解，生成operand window、pipeline actions与统一resource budget，再按target profile和

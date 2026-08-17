@@ -113,8 +113,8 @@ W.lookup(table, indices, where=True)
 W.decode(codes, table, where=True, out_dtype=...)
 ```
 
-当前形态为：`dot`使用f32 multiplicand与f32 accumulator；`matmul`使用
-f16 `[M,K] × [K,N]`与f32 accumulator；`lookup`是all-active VLA u8 index查询
+当前形态为：`dot`使用f32 multiplicand与f32 accumulator；`matmul`使用dtype相同的
+f16或f32 `[M,K] × [K,N]` multiplicand与f32 accumulator；`lookup`是all-active VLA u8 index查询
 `block<16xf32>`；`decode`是all-active `block<16xu8>`通过`block<16xi8>`表得到i8 block。
 
 ## Pointwise、special value 与 conversion

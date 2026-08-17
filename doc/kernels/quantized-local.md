@@ -82,9 +82,9 @@ IQ4_NL block是little-endian F16 scale加16个packed bytes，总计18 bytes。DS
 signed-i8 codebook作为显式readonly pointer operand，拆出low/high nibble并调用
 `W.decode(code, table, out_dtype=W.i8)`，随后signed widen到F32、乘scale并写32个logical值。
 
-当前block-local decision只观察decode的table/code/result性质，选择一次16-lane
-`vrgather` realization；emitter从decision取得E8M1/E32M4 physical shape。它不检查kernel名，
-也不从packed byte pattern猜IQ4_NL。
+Decode的typed realization是所在block value-chain operation decision的一部分。同一个entity
+planning从table/code/result性质选择16-lane `vrgather`，统一记录handoff与resource；emitter只从
+该decision取得E8M1/E32M4 physical shape。它不检查kernel名，也不从packed byte pattern猜IQ4_NL。
 
 ## Q1_0 × Q8_0 row dot
 
@@ -229,7 +229,9 @@ packed byte extent和outer pointer relation由外围DSL与`W.storage`负责。Ac
 计入kernel由DSL ABI决定，target不能在两种scope之间自动切换。
 
 Target为这一局部语义选择实际被handoff和emission消费的operand shape、exact leaf与resource
-budget。Decode/reduction的具体局部序列属于该leaf本身，不另存一份未被消费的topology决定。
+budget。Decode、typed vector partial accumulation与最终reduction的具体局部序列属于该leaf本身；
+partial可以跨primitive内部的sequential batch保存在vector state中，但不另存一份未被消费的
+topology决定。
 VLEN128 realization使用固定宽局部RVV/asm序列；VLEN256 realization用32-lane nibble decode、
 signed widening multiply和i32 reduction，metadata只解包当前八组scale/minimum。显式VLEN大于
 128且满足shape/resource条件的其他target使用scalable leaf。选择在physical planning中完成，
@@ -243,8 +245,8 @@ IQ1_S通过`W.packed_u11_grid_delta_i8_dot`显式保留u11 grid index、local sc
 correction关系。
 IQ4_NL与IQ4_XS通过`W.nibble_codebook_i8_dot`共享16-entry nibble table decode、widening dot和
 reduction，格式各自的block stride与scale层次仍在DSL kernel。
-Packed three-bit grouped-scale关系通过`W.packed_i3_grouped_i8_dot`进入既有quant local-dot
-physical family，不由target从普通bitwise/reduce closure中猜测。
+Packed three-bit grouped-scale关系通过`W.packed_i3_grouped_i8_dot`进入共享quant local-dot
+physical mapping与planning，不由target从普通bitwise/reduce closure中猜测。
 每个extension primitive仍保留自身完整的局部数值关系；它们不形成按format分派的whole-kernel
 route。
 

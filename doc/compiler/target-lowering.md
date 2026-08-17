@@ -50,9 +50,9 @@ Lowering 联合决定：
 - VLA strip schedule、SEW/LMUL、mask 与 state placement；
 - unit/strided/indexed/segment memory；
 - value/register shape 与 share/reload/rematerialize/local-pack handoff；
-- F32 dot 与 F16 matmul 的 lane axis、register microtile、multiple accumulators、K-unroll、operand
+- F32 dot 与 F16/F32 matmul 的 lane axis、register microtile、multiple accumulators、K-unroll、operand
   window 和 load/compute schedule；
-- column-lane 与 reduction-lane F16 matmul 都消费相同的 pipeline actions；
+- column-lane 与 reduction-lane matmul 都消费相同的 pipeline actions；
 - quant/codebook 的 packed-axis decomposition、decode、gather、widen、accumulator 与 operand window；
 - RVV 或 IME fragment 与局部 asm leaf；
 - primitive-private temporary 的大小、alignment 与 resource budget。

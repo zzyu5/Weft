@@ -29,7 +29,7 @@ value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
 [M,K] x [K,N] -> [M,N]
 ```
 
-当前 matmul 要求 f16 multiplicand 与 f32 accumulator。
+当前 matmul 要求两侧multiplicand具有相同的f16或f32 element type，accumulator为f32。
 
 VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
 scan或显式typed summary primitive。`init`与`acc_dtype`均为必填 DSL semantics；init必须是scalar或与结果
