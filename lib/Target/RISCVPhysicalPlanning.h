@@ -165,10 +165,17 @@ std::optional<SelectedBlockOperationPhysical>
 selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
                              const RISCVTargetProfile &target);
 
+enum class BlockStoreRealization {
+  RegisterRepetition,
+  SequentialStrip,
+  MultiStripValues,
+};
+
 struct BlockStorePhysicalDecision {
   CorePhysicalMapping mapping;
   bool needsLaneVector = false;
   RVVVectorShape laneShape;
+  BlockStoreRealization realization = BlockStoreRealization::SequentialStrip;
 };
 
 struct BlockStoreCandidateFacts {
@@ -502,6 +509,10 @@ enum class LocalLeafProjection {
   PackedDotLaneSlide,
   PackedDotLaneCreate,
   PackedDotRegisterChunks,
+  NibbleCodebookCombined,
+  NibbleCodebookSplit,
+  SignSourceDirect,
+  SignSourceExtend,
 };
 
 struct LocalLeafDecision {
@@ -807,6 +818,8 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
 
 struct GroupedAffineI4I8CandidateFacts {
   CoreMappingProblem mapping;
+  unsigned scaleMinExtent = 0;
+  unsigned activationSumExtent = 0;
 };
 
 struct SelectedGroupedAffineI4I8Physical {

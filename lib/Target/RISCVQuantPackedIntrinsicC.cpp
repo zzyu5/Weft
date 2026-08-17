@@ -180,7 +180,12 @@ bool emitNibbleCodebookLocalImplementation(
   const RVVVectorShape packedShape = implementation.valueShapes[1];
   const RVVVectorShape tableShape = implementation.valueShapes[2];
   const RVVVectorShape productShape = implementation.valueShapes[3];
-  const bool combined = tableShape == laneShape;
+  const bool combined =
+      implementation.leaf.projection ==
+      LocalLeafProjection::NibbleCodebookCombined;
+  if (!combined && implementation.leaf.projection !=
+                       LocalLeafProjection::NibbleCodebookSplit)
+    return false;
   const std::string packedUnsignedType =
       rvvVectorType(RVVElementCategory::UnsignedInteger, packedShape);
   const std::string packedUnsignedSuffix =

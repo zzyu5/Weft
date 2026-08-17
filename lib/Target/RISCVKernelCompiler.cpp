@@ -835,29 +835,60 @@ bool isFloatConstant(mlir::Value value, double expected) {
   return floating && floating.getValueAsDouble() == expected;
 }
 
-CoreMappingProblem i4I8BlockProductMapping(unsigned rowExtent) {
+std::optional<CoreMappingProblem>
+i4I8BlockProductMapping(BlockType result,
+                        const LocalBlockMemoryFact &activation) {
+  llvm::ArrayRef<int64_t> shape = result.getShape();
+  if ((shape.size() != 1 && shape.size() != 2) ||
+      activation.semanticExtent <= 0)
+    return std::nullopt;
+  const int64_t rowExtent = shape.size() == 2 ? shape[0] : 1;
+  const int64_t columnExtent = shape.back();
+  if (rowExtent <= 0 || columnExtent <= 0 ||
+      static_cast<uint64_t>(rowExtent) >
+          std::numeric_limits<unsigned>::max() ||
+      activation.semanticExtent % rowExtent != 0)
+    return std::nullopt;
+  const int64_t reductionExtent = activation.semanticExtent / rowExtent;
   CoreMappingProblem problem;
   problem.axes = {
       LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, rowExtent,
-                            false, false, false, {rowExtent}},
-      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, 16, false,
-                            false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32, false,
-                            false, false, {1}}};
+                            false, false, false,
+                            {static_cast<unsigned>(rowExtent)}},
+      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, columnExtent,
+                            false, false, false, {1}},
+      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
+                            reductionExtent, false, false, false, {1}}};
   return problem;
 }
 
-CoreMappingProblem groupedAffineI4I8Mapping() {
+std::optional<CoreMappingProblem> groupedAffineI4I8Mapping(
+    const LocalBlockMemoryFact &packedWeight,
+    const LocalBlockMemoryFact &scaleMin,
+    const LocalBlockMemoryFact &activation,
+    const LocalBlockMemoryFact &activationSum) {
+  if (packedWeight.semanticExtent <= 0 || scaleMin.semanticExtent <= 0 ||
+      activation.semanticExtent <= 0 || activationSum.semanticExtent <= 0 ||
+      activation.semanticExtent % packedWeight.semanticExtent != 0 ||
+      activation.semanticExtent % activationSum.semanticExtent != 0)
+    return std::nullopt;
+  const int64_t packedFactor =
+      activation.semanticExtent / packedWeight.semanticExtent;
+  const int64_t groupExtent =
+      activation.semanticExtent / activationSum.semanticExtent;
+  if (groupExtent <= 0 || activation.semanticExtent % groupExtent != 0)
+    return std::nullopt;
+  const int64_t reductionExtent = activation.semanticExtent / groupExtent;
   CoreMappingProblem problem;
   problem.axes = {
       LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, 1, false,
                             false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32, false,
-                            false, false, {1, 2}},
-      LogicalAxisConstraint{kCoreAxisGroup, LogicalAxisRole::Group, 8, false,
-                            false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed, 2, false,
-                            false, false, {1}}};
+      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
+                            reductionExtent, false, false, false, {1, 2}},
+      LogicalAxisConstraint{kCoreAxisGroup, LogicalAxisRole::Group,
+                            groupExtent, false, false, false, {1}},
+      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed,
+                            packedFactor, false, false, false, {1}}};
   return problem;
 }
 
@@ -7995,13 +8026,14 @@ private:
     const unsigned rowExtent = initType.getShape().size() == 2
                                    ? static_cast<unsigned>(initType.getShape()[0])
                                    : 1;
-    const int64_t activationExtent = static_cast<int64_t>(rowExtent) * 32;
-    if (activation->semanticExtent != activationExtent ||
-        activation->storageExtent != activationExtent ||
+    std::optional<CoreMappingProblem> mapping =
+        i4I8BlockProductMapping(initType, *activation);
+    if (!mapping ||
+        activation->storageExtent != activation->semanticExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "symmetric i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
+          "symmetric i4/i8 dot activation cannot be projected to its result axes");
     std::optional<LocalBlockMemoryFact> activationScale;
     if (rowExtent > 1) {
       activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
@@ -8014,8 +8046,7 @@ private:
             "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical(
-            {i4I8BlockProductMapping(rowExtent), false}, options.target);
+        selectI4I8FragmentPhysical({*mapping, false}, options.target);
     if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
@@ -8565,10 +8596,17 @@ private:
     if (!packedWeight || !scaleMin || !activation || !activationSum)
       return op.emitError(
           "grouped affine i4/i8 dot requires contiguous all-active local block memory facts");
+    std::optional<CoreMappingProblem> mapping = groupedAffineI4I8Mapping(
+        *packedWeight, *scaleMin, *activation, *activationSum);
+    if (!mapping)
+      return op.emitError(
+          "grouped affine i4/i8 operands cannot be projected to reduction, group, and packed axes");
 
     std::optional<SelectedGroupedAffineI4I8Physical> selected =
         selectGroupedAffineI4I8Physical(
-            {groupedAffineI4I8Mapping()}, options.target);
+            {*mapping, static_cast<unsigned>(scaleMin->semanticExtent),
+             static_cast<unsigned>(activationSum->semanticExtent)},
+            options.target);
     if (!selected)
       return op.emitError(
           "grouped affine i4/i8 dot has no resource-legal RVV realization for the target");
@@ -9182,13 +9220,14 @@ private:
     const unsigned rowExtent = initType.getShape().size() == 2
                                    ? static_cast<unsigned>(initType.getShape()[0])
                                    : 1;
-    const int64_t activationExtent = static_cast<int64_t>(rowExtent) * 32;
-    if (activation->semanticExtent != activationExtent ||
-        activation->storageExtent != activationExtent ||
+    std::optional<CoreMappingProblem> mapping =
+        i4I8BlockProductMapping(initType, *activation);
+    if (!mapping ||
+        activation->storageExtent != activation->semanticExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
-          "affine i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
+          "affine i4/i8 dot activation cannot be projected to its result axes");
     std::optional<LocalBlockMemoryFact> activationScale;
     if (rowExtent > 1) {
       activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
@@ -9201,8 +9240,7 @@ private:
             "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical(
-            {i4I8BlockProductMapping(rowExtent), true}, options.target);
+        selectI4I8FragmentPhysical({*mapping, true}, options.target);
     if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");
@@ -11558,8 +11596,7 @@ private:
       return mlir::success();
     };
 
-    if (physical.mapping.laneShape == kRVVE8MF4 && sequentialFactor == 1 &&
-        registerFactor > 1) {
+    if (physical.realization == BlockStoreRealization::MultiStripValues) {
       line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "(" +
            std::to_string(stripVL) + ");");
       llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
@@ -11599,7 +11636,8 @@ private:
           }
       activeBlockOperations = previousOperations;
       activeBlockEntity = previousEntity;
-    } else if (sequentialFactor == 1) {
+    } else if (physical.realization ==
+               BlockStoreRealization::RegisterRepetition) {
       line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "(" +
            std::to_string(stripVL) + ");");
       for (unsigned repetition = 0; repetition < registerFactor; ++repetition)

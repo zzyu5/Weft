@@ -539,6 +539,14 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
       leaf.projection = LocalLeafProjection::PackedDotLaneCreate;
     return leaf;
   };
+  auto signSourceLeaf = [&](LocalLeafKind kind, unsigned shapeIndex) {
+    LocalLeafDecision leaf = registerLeaf(kind);
+    leaf.projection =
+        implementation.valueShapes[shapeIndex] == implementation.mapping.laneShape
+            ? LocalLeafProjection::SignSourceDirect
+            : LocalLeafProjection::SignSourceExtend;
+    return leaf;
+  };
   switch (implementation.primitive) {
   case LocalPrimitiveKind::None:
     return std::nullopt;
@@ -628,15 +636,15 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::SignedCodebook8I8:
     if (!isSignedCodebookLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::SignedCodebook8I8Register);
+    return signSourceLeaf(LocalLeafKind::SignedCodebook8I8Register, 5);
   case LocalPrimitiveKind::SignedCodebook4I8:
     if (!isSignedCodebookLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::SignedCodebook4I8Register);
+    return signSourceLeaf(LocalLeafKind::SignedCodebook4I8Register, 5);
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
     if (!isPackedU9U7CodebookLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedU9U7CodebookI8Register);
+    return signSourceLeaf(LocalLeafKind::PackedU9U7CodebookI8Register, 5);
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
     if (!isPackedU11GridDeltaLocalImplementationMapping(implementation))
       return std::nullopt;
@@ -644,7 +652,15 @@ selectLocalLeafDecision(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::NibbleCodebookI8:
     if (!isNibbleCodebookLocalImplementationMapping(implementation))
       return std::nullopt;
-    return registerLeaf(LocalLeafKind::NibbleCodebookI8Register);
+    {
+      LocalLeafDecision leaf =
+          registerLeaf(LocalLeafKind::NibbleCodebookI8Register);
+      leaf.projection =
+          implementation.valueShapes[2] == implementation.mapping.laneShape
+              ? LocalLeafProjection::NibbleCodebookCombined
+              : LocalLeafProjection::NibbleCodebookSplit;
+      return leaf;
+    }
   case LocalPrimitiveKind::IQ2SI8:
     if (!isIQ2SLocalImplementationMapping(implementation))
       return std::nullopt;
@@ -1060,6 +1076,13 @@ selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
     selected.decision.mapping = std::move(mapping);
     selected.decision.needsLaneVector = facts.needsLaneVector;
     selected.decision.laneShape = laneShape;
+    if (selected.decision.mapping.laneShape == kRVVE8MF4 &&
+        sequentialFactor == 1 && registerFactor > 1)
+      selected.decision.realization = BlockStoreRealization::MultiStripValues;
+    else if (sequentialFactor == 1)
+      selected.decision.realization = BlockStoreRealization::RegisterRepetition;
+    else
+      selected.decision.realization = BlockStoreRealization::SequentialStrip;
     selected.resources = *resources;
     legal.push_back(
         Candidate{std::move(selected), sequentialFactor, resources->peakGroups});
@@ -1590,19 +1613,23 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   const LogicalAxisConstraint *columns = axis(kCoreAxisN);
   const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
   if (!target.littleEndian || !rows || !columns || !reduction ||
-      !rows->extent || (*rows->extent != 1 && *rows->extent != 4) ||
+      !rows->extent || *rows->extent == 0 ||
+      *rows->extent > std::numeric_limits<unsigned>::max() ||
       rows->role != LogicalAxisRole::Free || !columns->extent ||
-      *columns->extent != 16 || columns->role != LogicalAxisRole::Free ||
-      !reduction->extent || *reduction->extent != 32 ||
+      *columns->extent == 0 || columns->role != LogicalAxisRole::Free ||
+      !reduction->extent || *reduction->extent == 0 ||
       reduction->role != LogicalAxisRole::Reduction)
     return std::nullopt;
   const unsigned rowExtent = static_cast<unsigned>(*rows->extent);
+  const bool rvvLeafShape =
+      (rowExtent == 1 || rowExtent == 4) && *columns->extent == 16 &&
+      *reduction->extent == 32;
   const bool supportsRVV =
       target.hasF && target.hasVectorF16 && target.hasWideningInteger &&
       target.hasWideningFloat && target.supportsVLENAtLeast(128) &&
       target.supportsVectorShape(8, 8) &&
       target.supportsVectorShape(16, 16) &&
-      target.supportsVectorShape(32, 32);
+      target.supportsVectorShape(32, 32) && rvvLeafShape;
   CoreMappingProblem problem = facts.mapping;
   for (LogicalAxisConstraint &constraint : problem.axes) {
     constraint.allowLane = constraint.id == kCoreAxisN && supportsRVV;
@@ -1621,8 +1648,9 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
             RISCVFragmentInstruction::SpacemitIME1I4I8MMA ||
         capability.lhsElementBits != 4 || capability.rhsElementBits != 8 ||
         capability.accumulatorElementBits != 32 ||
-        capability.mFactor != rowExtent || capability.nFactor != 16 ||
-        capability.kFactor != 32)
+        capability.mFactor != rowExtent ||
+        capability.nFactor != *columns->extent ||
+        capability.kFactor != *reduction->extent)
       continue;
     problem.fragments.push_back(FragmentMappingConstraint{
         CoreInstructionKind::SpacemitIME1MMA,
@@ -2820,20 +2848,21 @@ selectGroupedAffineI4I8Physical(
   const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
   const LogicalAxisConstraint *groups = axis(kCoreAxisGroup);
   const LogicalAxisConstraint *packed = axis(kCoreAxisPacked);
-  if (!rows || !rows->extent || *rows->extent != 1 ||
+  if (!rows || !rows->extent || *rows->extent == 0 ||
       rows->role != LogicalAxisRole::Free || !reduction ||
-      !reduction->extent || *reduction->extent != 32 ||
+      !reduction->extent || *reduction->extent == 0 ||
       reduction->role != LogicalAxisRole::Reduction || !groups ||
-      !groups->extent || *groups->extent != 8 ||
+      !groups->extent || *groups->extent == 0 ||
       groups->role != LogicalAxisRole::Group || !packed ||
-      !packed->extent || *packed->extent != 2 ||
-      packed->role != LogicalAxisRole::Packed)
+      !packed->extent || *packed->extent == 0 ||
+      packed->role != LogicalAxisRole::Packed || facts.scaleMinExtent == 0 ||
+      facts.activationSumExtent == 0)
     return std::nullopt;
 
   std::optional<RVVVectorShape> scaleShape =
-      rvvShapeForSemanticLanes(8, 12, target);
+      rvvShapeForSemanticLanes(8, facts.scaleMinExtent, target);
   std::optional<RVVVectorShape> activationSumShape =
-      rvvShapeForSemanticLanes(8, 32, target);
+      rvvShapeForSemanticLanes(8, facts.activationSumExtent, target);
   if (!scaleShape || !activationSumShape)
     return std::nullopt;
 

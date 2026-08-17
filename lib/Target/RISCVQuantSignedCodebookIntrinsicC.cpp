@@ -10,6 +10,10 @@ bool emitSignedCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if ((implementation.leaf.kind != LocalLeafKind::SignedCodebook8I8Register &&
        implementation.leaf.kind != LocalLeafKind::SignedCodebook4I8Register) ||
+      (implementation.leaf.projection !=
+           LocalLeafProjection::SignSourceDirect &&
+       implementation.leaf.projection !=
+           LocalLeafProjection::SignSourceExtend) ||
       implementation.valueShapes.size() < 6)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -107,7 +111,8 @@ bool emitSignedCodebookLocalImplementation(
          << "(lane, 7, vl32), vl32);\n"
          << "  const " << laneUnsignedType << " signs = __riscv_vrgather_vv_"
          << laneUnsignedSuffix << "(\n      ";
-  if (signSourceShape == laneShape)
+  if (implementation.leaf.projection ==
+      LocalLeafProjection::SignSourceDirect)
     output << "sign_source";
   else
     output << "__riscv_vlmul_ext_v_" << signSourceSuffix << "_"
@@ -139,6 +144,10 @@ bool emitPackedU9U7CodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
   if (implementation.leaf.kind !=
           LocalLeafKind::PackedU9U7CodebookI8Register ||
+      (implementation.leaf.projection !=
+           LocalLeafProjection::SignSourceDirect &&
+       implementation.leaf.projection !=
+           LocalLeafProjection::SignSourceExtend) ||
       implementation.valueShapes.size() < 7)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -243,7 +252,8 @@ bool emitPackedU9U7CodebookLocalImplementation(
          << "(lane, 7, vl32), vl32);\n"
          << "  const " << laneUnsignedType << " signs = __riscv_vrgather_vv_"
          << laneUnsignedSuffix << "(\n      ";
-  if (signSourceShape == laneShape)
+  if (implementation.leaf.projection ==
+      LocalLeafProjection::SignSourceDirect)
     output << "sign_source";
   else
     output << "__riscv_vlmul_ext_v_" << signSourceSuffix << "_"
