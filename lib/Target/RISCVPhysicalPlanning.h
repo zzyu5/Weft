@@ -498,6 +498,8 @@ bool isPackedDotLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isNibbleCodebookLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isPackedI2TernaryLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,

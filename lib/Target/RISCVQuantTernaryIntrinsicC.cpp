@@ -1,13 +1,13 @@
 #include "RISCVQuantIntrinsicC.h"
 
+#include "RISCVRVVSpelling.h"
+
 #include "llvm/Support/raw_ostream.h"
 
 namespace weft::riscv_internal {
 
-void emitTernaryLocalImplementations(llvm::raw_ostream &output,
-                                 bool base3E8M2, bool base3E8M1,
-                                 bool packedI2E8M2,
-                                 bool packedI2E8M1) {
+void emitBase3TernaryLocalImplementations(llvm::raw_ostream &output,
+                                         bool base3E8M2, bool base3E8M1) {
   if (base3E8M2) {
     output << R"c(static inline __attribute__((always_inline, unused)) float
 __weft_base3_ternary_i8_register_l32_e8m2(
@@ -196,71 +196,82 @@ __weft_base3_ternary_i8_register_l32_e8m1(
 )c";
   }
 
-  if (packedI2E8M2) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i2_ternary_i8_register_l32_e8m2(
-    const uint8_t *codes, const uint8_t *activation_bytes,
-    float weight_scale, float activation_scale, float init) {
-  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
-  int32_t integer_sum = 0;
-  for (size_t half = 0; half < 2; ++half) {
-    const size_t vl = __riscv_vsetvl_e8m2(32);
-    const vuint8m2_t packed =
-        __riscv_vle8_v_u8m2(codes + half * 32, vl);
-    vint16m4_t accumulator = __riscv_vmv_v_x_i16m4(0, 32);
-    for (size_t field = 0; field < 4; ++field) {
-      vuint8m2_t unpacked =
-          __riscv_vsrl_vx_u8m2(packed, 2 * field, vl);
-      if (field != 3)
-        unpacked = __riscv_vand_vx_u8m2(unpacked, 3, vl);
-      const vint8m2_t ternary = __riscv_vsub_vx_i8m2(
-          __riscv_vreinterpret_v_u8m2_i8m2(unpacked), 1, vl);
-      const vint8m2_t values = __riscv_vle8_v_i8m2(
-          activation + half * 128 + field * 32, vl);
-      accumulator = __riscv_vwmacc_vv_i16m4(
-          accumulator, ternary, values, vl);
-    }
-    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-    integer_sum += __riscv_vmv_x_s_i32m1_i32(
-        __riscv_vwredsum_vs_i16m4_i32m1(accumulator, zero, 32));
-  }
-  return init + (float)integer_sum * weight_scale * activation_scale;
 }
-)c";
-  }
 
-  if (packedI2E8M1) {
-    output << R"c(static inline __attribute__((always_inline, unused)) float
-__weft_packed_i2_ternary_i8_register_l32_e8m1(
-    const uint8_t *codes, const uint8_t *activation_bytes,
-    float weight_scale, float activation_scale, float init) {
-  const int8_t *activation = (const int8_t *)(const void *)activation_bytes;
-  int32_t integer_sum = 0;
-  for (size_t half = 0; half < 2; ++half) {
-    const size_t vl = __riscv_vsetvl_e8m1(32);
-    const vuint8m1_t packed =
-        __riscv_vle8_v_u8m1(codes + half * 32, vl);
-    vint16m2_t accumulator = __riscv_vmv_v_x_i16m2(0, 32);
-    for (size_t field = 0; field < 4; ++field) {
-      vuint8m1_t unpacked =
-          __riscv_vsrl_vx_u8m1(packed, 2 * field, vl);
-      if (field != 3)
-        unpacked = __riscv_vand_vx_u8m1(unpacked, 3, vl);
-      const vint8m1_t ternary = __riscv_vsub_vx_i8m1(
-          __riscv_vreinterpret_v_u8m1_i8m1(unpacked), 1, vl);
-      const vint8m1_t values = __riscv_vle8_v_i8m1(
-          activation + half * 128 + field * 32, vl);
-      accumulator = __riscv_vwmacc_vv_i16m2(
-          accumulator, ternary, values, vl);
-    }
-    const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);
-    integer_sum += __riscv_vmv_x_s_i32m1_i32(
-        __riscv_vwredsum_vs_i16m2_i32m1(accumulator, zero, 32));
-  }
-  return init + (float)integer_sum * weight_scale * activation_scale;
-}
-)c";
-  }
+bool emitPackedI2TernaryLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation) {
+  if (!isPackedI2TernaryLocalImplementationMapping(implementation) ||
+      implementation.helperSymbol.empty())
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape widenedShape = implementation.valueShapes[1];
+  const std::string unsignedType =
+      rvvVectorType(RVVElementCategory::UnsignedInteger, laneShape);
+  const std::string unsignedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::UnsignedInteger, laneShape);
+  const std::string signedType =
+      rvvVectorType(RVVElementCategory::SignedInteger, laneShape);
+  const std::string signedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, laneShape);
+  const std::string widenedType =
+      rvvVectorType(RVVElementCategory::SignedInteger, widenedShape);
+  const std::string widenedSuffix =
+      rvvIntrinsicTypeSuffix(RVVElementCategory::SignedInteger, widenedShape);
+  const std::string setVL = rvvSetVLIntrinsic(laneShape);
+  if (!reduction || unsignedType.empty() || unsignedSuffix.empty() ||
+      signedType.empty() || signedSuffix.empty() || widenedType.empty() ||
+      widenedSuffix.empty() || setVL.empty())
+    return false;
+
+  const unsigned logicalChunk =
+      reduction->laneFactor * reduction->registerFactor;
+  const unsigned halfCount = reduction->sequentialFactor / 4;
+  output << "static inline __attribute__((always_inline, unused)) float\n"
+         << implementation.helperSymbol << "(\n"
+         << "    const uint8_t *codes, const uint8_t *activation_bytes,\n"
+         << "    float weight_scale, float activation_scale, float init) {\n"
+         << "  const int8_t *activation = "
+            "(const int8_t *)(const void *)activation_bytes;\n"
+         << "  const size_t vl = " << setVL << "("
+         << reduction->laneFactor << ");\n"
+         << "  int32_t integer_sum = 0;\n"
+         << "  for (size_t half = 0; half < " << halfCount << "; ++half) {\n"
+         << "    for (size_t repetition = 0; repetition < "
+         << reduction->registerFactor << "; ++repetition) {\n"
+         << "      const " << unsignedType << " packed = __riscv_vle8_v_"
+         << unsignedSuffix << "(codes + half * " << logicalChunk
+         << " + repetition * " << reduction->laneFactor << ", vl);\n"
+         << "      " << widenedType << " accumulator = __riscv_vmv_v_x_"
+         << widenedSuffix << "(0, vl);\n"
+         << "      for (size_t field = 0; field < 4; ++field) {\n"
+         << "        " << unsignedType << " unpacked = __riscv_vsrl_vx_"
+         << unsignedSuffix << "(packed, 2 * field, vl);\n"
+         << "        if (field != 3)\n"
+         << "          unpacked = __riscv_vand_vx_" << unsignedSuffix
+         << "(unpacked, 3, vl);\n"
+         << "        const " << signedType
+         << " ternary = __riscv_vsub_vx_" << signedSuffix
+         << "(__riscv_vreinterpret_v_" << unsignedSuffix << "_"
+         << signedSuffix << "(unpacked), 1, vl);\n"
+         << "        const " << signedType
+         << " values = __riscv_vle8_v_" << signedSuffix
+         << "(activation + (half * 4 + field) * " << logicalChunk
+         << " + repetition * " << reduction->laneFactor << ", vl);\n"
+         << "        accumulator = __riscv_vwmacc_vv_" << widenedSuffix
+         << "(accumulator, ternary, values, vl);\n"
+         << "      }\n"
+         << "      const vint32m1_t zero = __riscv_vmv_v_x_i32m1(0, 1);\n"
+         << "      integer_sum += __riscv_vmv_x_s_i32m1_i32(\n"
+         << "          __riscv_vwredsum_vs_" << widenedSuffix
+         << "_i32m1(accumulator, zero, vl));\n"
+         << "    }\n"
+         << "  }\n"
+         << "  return init + (float)integer_sum * weight_scale * "
+            "activation_scale;\n"
+         << "}\n\n";
+  return true;
 }
 
 } // namespace weft::riscv_internal

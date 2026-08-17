@@ -119,6 +119,30 @@ bool isNibbleCodebookLocalImplementationMapping(
          !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
 }
 
+bool isPackedI2TernaryLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 2)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
+      reduction->sequentialFactor != 8 ||
+      reduction->laneFactor * reduction->registerFactor != 32 ||
+      (reduction->laneFactor != 16 && reduction->laneFactor != 32))
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape widenedShape = implementation.valueShapes[1];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         widenedShape.sew == 16 &&
+         widenedShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, widenedShape).empty();
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -240,10 +264,11 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::PackedI5I8:
     return isPackedDotLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::Base3TernaryI8:
-  case LocalPrimitiveKind::PackedI2TernaryI8:
     return rvvDot && lanes == 32 &&
            (primary == RVVVectorShape{8, 8} ||
             primary == RVVVectorShape{8, 16});
+  case LocalPrimitiveKind::PackedI2TernaryI8:
+    return isPackedI2TernaryLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::NibbleCodebookI8:
     return isNibbleCodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedI3GroupedI8:
@@ -1738,9 +1763,11 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
     unsigned registerFactor = 0;
   };
   llvm::SmallVector<Candidate, 8> legal;
+  const unsigned semanticExtent =
+      facts.semantic == TernaryI8DotSemantic::PackedI2Fields ? 256 : 32;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK, 32, 8, 1,
-           target)) {
+           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK,
+           semanticExtent, 8, 1, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     std::optional<RVVVectorShape> widened =
         rvvShapeForSameLanes(laneShape, 16, target);
@@ -1749,7 +1776,10 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
     LocalImplementation implementation;
     implementation.primitive = primitive;
     implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes = {laneShape, *byte16};
+    implementation.valueShapes =
+        facts.semantic == TernaryI8DotSemantic::PackedI2Fields
+            ? llvm::SmallVector<RVVVectorShape, 4>{laneShape, *widened}
+            : llvm::SmallVector<RVVVectorShape, 4>{laneShape, *byte16};
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
     AxisMappedResourceFacts resources;

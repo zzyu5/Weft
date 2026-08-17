@@ -26,10 +26,10 @@ void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
                                              bool registerL64);
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
-void emitTernaryLocalImplementations(llvm::raw_ostream &output,
-                                     bool base3E8M2, bool base3E8M1,
-                                     bool packedI2E8M2,
-                                     bool packedI2E8M1);
+void emitBase3TernaryLocalImplementations(llvm::raw_ostream &output,
+                                         bool base3E8M2, bool base3E8M1);
+bool emitPackedI2TernaryLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
 void emitSignedCodebookLocalImplementations(
     llvm::raw_ostream &output, bool entry8E8M2, bool entry8E8M1,
     bool entry4E8M2, bool entry4E8M1);
