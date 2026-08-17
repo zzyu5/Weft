@@ -23,6 +23,22 @@ enum class RISCVMatrixExtension {
   SpacemitIME1,
 };
 
+enum class RISCVFragmentInstruction {
+  SpacemitIME1I4I8MMA,
+};
+
+struct RISCVFragmentCapability {
+  RISCVFragmentInstruction instruction =
+      RISCVFragmentInstruction::SpacemitIME1I4I8MMA;
+  unsigned lhsElementBits = 0;
+  unsigned rhsElementBits = 0;
+  unsigned accumulatorElementBits = 0;
+  unsigned mFactor = 1;
+  unsigned nFactor = 1;
+  unsigned kFactor = 1;
+  unsigned fixedResourceGroups = 0;
+};
+
 struct RISCVTargetProfile {
   std::string triple;
   std::string march;
@@ -45,6 +61,7 @@ struct RISCVTargetProfile {
   std::vector<unsigned> supportedSEW;
   std::vector<int> legalLMULEighths;
   RISCVMatrixExtension matrixExtension = RISCVMatrixExtension::None;
+  std::vector<RISCVFragmentCapability> fragmentCapabilities;
 
   bool supportsSEW(unsigned sew) const;
   bool supportsLMULEighths(int lmulEighths) const;
@@ -58,8 +75,6 @@ struct RISCVTargetProfile {
   bool supportsSegmentVectorMemory(unsigned fields, unsigned sew,
                                    int lmulEighths) const;
   bool hasMatrixExtension(RISCVMatrixExtension extension) const;
-  bool supportsSpacemitIME1I4I8N16K32() const;
-  bool supportsSpacemitIME1I4I8M4N16K32() const;
 };
 
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,

@@ -1272,10 +1272,6 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       reduction->role != LogicalAxisRole::Reduction)
     return std::nullopt;
   const unsigned rowExtent = static_cast<unsigned>(*rows->extent);
-  const bool supportsIME =
-      rowExtent == 4
-          ? target.supportsSpacemitIME1I4I8M4N16K32()
-          : target.supportsSpacemitIME1I4I8N16K32();
   const bool supportsRVV =
       target.hasF && target.hasVectorF16 && target.hasWideningInteger &&
       target.hasWideningFloat && target.supportsVLENAtLeast(128) &&
@@ -1294,11 +1290,22 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   problem.laneSEW = 8;
   problem.laneInstruction = CoreInstructionKind::RVVWideningIntegerDot;
   problem.laneLMULCandidates = {1};
-  if (supportsIME)
+  for (const RISCVFragmentCapability &capability :
+       target.fragmentCapabilities) {
+    if (capability.instruction !=
+            RISCVFragmentInstruction::SpacemitIME1I4I8MMA ||
+        capability.lhsElementBits != 4 || capability.rhsElementBits != 8 ||
+        capability.accumulatorElementBits != 32 ||
+        capability.mFactor != rowExtent || capability.nFactor != 16 ||
+        capability.kFactor != 32)
+      continue;
     problem.fragments.push_back(FragmentMappingConstraint{
         CoreInstructionKind::SpacemitIME1MMA,
-        {{kCoreAxisM, rowExtent}, {kCoreAxisN, 16}, {kCoreAxisK, 32}},
-        28});
+        {{kCoreAxisM, capability.mFactor},
+         {kCoreAxisN, capability.nFactor},
+         {kCoreAxisK, capability.kFactor}},
+        capability.fixedResourceGroups});
+  }
 
   struct Candidate {
     SelectedI4I8FragmentPhysical physical;
@@ -1307,12 +1314,9 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
   llvm::SmallVector<Candidate, 2> candidates;
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
-    const bool fragmentMapping = llvm::any_of(
-        mapping.axes, [](const PhysicalAxisDecomposition &axis) {
-          return axis.fragmentFactor > 1;
-        });
-    if ((fragmentMapping && !supportsIME) ||
-        (!fragmentMapping && !supportsRVV))
+    const bool fragmentMapping =
+        mapping.instruction == CoreInstructionKind::SpacemitIME1MMA;
+    if (!fragmentMapping && !supportsRVV)
       continue;
     SelectedI4I8FragmentPhysical selected;
     selected.codeShape = kRVVE8M1;

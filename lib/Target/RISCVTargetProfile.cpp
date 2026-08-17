@@ -73,21 +73,6 @@ bool weft::RISCVTargetProfile::hasMatrixExtension(
   return matrixExtension == extension;
 }
 
-bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8N16K32() const {
-  return matrixExtension == RISCVMatrixExtension::SpacemitIME1 &&
-         littleEndian && xlen == 64 && hasF && hasVectorF16 &&
-         hasWideningInteger && hasWideningFloat && supportsFixedRVV() &&
-         vlenBits == 256 && supportsVectorShape(8, 2) &&
-         supportsVectorShape(8, 4) && supportsVectorShape(8, 8) &&
-         supportsVectorShape(16, 2) && supportsVectorShape(32, 4) &&
-         supportsVectorShape(32, 8) && supportsVectorShape(32, 32);
-}
-
-bool weft::RISCVTargetProfile::supportsSpacemitIME1I4I8M4N16K32() const {
-  return supportsSpacemitIME1I4I8N16K32() &&
-         supportsVectorShape(16, 4) && supportsVectorShape(32, 64);
-}
-
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                                    int64_t vlenBits,
                                    llvm::StringRef matrixExtension,
@@ -235,6 +220,26 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
   } else {
     error = "unsupported --matrix-extension value: " + matrixExtension.str();
     return false;
+  }
+  if (profile.matrixExtension == RISCVMatrixExtension::SpacemitIME1 &&
+      profile.littleEndian && profile.xlen == 64 && profile.hasF &&
+      profile.hasVectorF16 && profile.hasWideningInteger &&
+      profile.hasWideningFloat && profile.supportsFixedRVV() &&
+      profile.vlenBits == 256 && profile.supportsVectorShape(8, 2) &&
+      profile.supportsVectorShape(8, 4) &&
+      profile.supportsVectorShape(8, 8) &&
+      profile.supportsVectorShape(16, 2) &&
+      profile.supportsVectorShape(32, 4) &&
+      profile.supportsVectorShape(32, 8) &&
+      profile.supportsVectorShape(32, 32)) {
+    profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
+        RISCVFragmentInstruction::SpacemitIME1I4I8MMA, 4, 8, 32, 1, 16,
+        32, 28});
+    if (profile.supportsVectorShape(16, 4) &&
+        profile.supportsVectorShape(32, 64))
+      profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
+          RISCVFragmentInstruction::SpacemitIME1I4I8MMA, 4, 8, 32, 4, 16,
+          32, 28});
   }
   return true;
 }
