@@ -1195,19 +1195,31 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       continue;
     if (!finalizeLocalHardwareOperation(selected.implementation))
       continue;
-    const unsigned privateGroups =
-        fragmentMapping
-            ? selected.implementation.mapping.fixedFragmentGroups
-            : mappedRows->registerFactor *
-                      rvvRegisterGroups(selected.accumulatorShape) +
-                  8 + static_cast<unsigned>(facts.affine);
-    PhysicalResourceRequirements requirements;
-    requirements.live.push_back(
-        PhysicalLiveRange{fragmentMapping ? PhysicalLiveClass::Fragment
-                                          : PhysicalLiveClass::Temporary,
-                          {}, 1, privateGroups});
+    AxisMappedResourceFacts requirements;
+    requirements.mapping = &selected.implementation.mapping;
+    if (fragmentMapping) {
+      requirements.values = {{PhysicalLiveClass::Fragment,
+                              {},
+                              AxisMappedMultiplicity::Fixed,
+                              std::nullopt,
+                              1,
+                              1,
+                              selected.implementation.mapping
+                                  .fixedFragmentGroups}};
+    } else {
+      requirements.values = {
+          {PhysicalLiveClass::Temporary, selected.accumulatorShape,
+           AxisMappedMultiplicity::RegisterFactor, facts.rowsAxis},
+          {PhysicalLiveClass::Temporary,
+           {},
+           AxisMappedMultiplicity::Fixed,
+           std::nullopt,
+           1,
+           1,
+           8 + static_cast<unsigned>(facts.affine)}};
+    }
     std::optional<PhysicalResourceBudget> resources =
-        calculatePhysicalResources(requirements, target);
+        calculateAxisMappedResources(requirements, target);
     if (!resources)
       continue;
     selected.resources = *resources;
@@ -2659,20 +2671,18 @@ selectGroupedAffineI4I8Physical(
       continue;
     if (!finalizeLocalHardwareOperation(candidate.implementation))
       continue;
+    AxisMappedResourceFacts resources;
+    resources.mapping = &candidate.implementation.mapping;
     if (registerAsm) {
-      PhysicalResourceRequirements resources;
       resources.reservedGroups = 0;
-      resources.live = {
-          {PhysicalLiveClass::Temporary, {}, 1,
-           static_cast<unsigned>(target.vectorRegisters)}};
-      std::optional<PhysicalResourceBudget> budget =
-          calculatePhysicalResources(resources, target);
-      if (!budget)
-        continue;
-      candidate.resources = *budget;
+      resources.values = {{PhysicalLiveClass::Temporary,
+                           {},
+                           AxisMappedMultiplicity::Fixed,
+                           std::nullopt,
+                           1,
+                           1,
+                           static_cast<unsigned>(target.vectorRegisters)}};
     } else {
-      AxisMappedResourceFacts resources;
-      resources.mapping = &candidate.implementation.mapping;
       resources.values = {
           {PhysicalLiveClass::Memory, candidate.packedShape,
            AxisMappedMultiplicity::RegisterFactor, mappedReduction->id},
@@ -2684,12 +2694,12 @@ selectGroupedAffineI4I8Physical(
            AxisMappedMultiplicity::RegisterFactor, mappedReduction->id},
           {PhysicalLiveClass::Temporary, candidate.reductionShape,
            AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
-      std::optional<PhysicalResourceBudget> budget =
-          calculateAxisMappedResources(resources, target);
-      if (!budget)
-        continue;
-      candidate.resources = *budget;
     }
+    std::optional<PhysicalResourceBudget> budget =
+        calculateAxisMappedResources(resources, target);
+    if (!budget)
+      continue;
+    candidate.resources = *budget;
     legal.push_back(
         Candidate{std::move(candidate), mappedReduction->sequentialFactor});
   }
