@@ -983,6 +983,36 @@ enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
   return candidates;
 }
 
+static bool resolveVLAStateShapes(SelectedVLAStatePhysical &state,
+                                  RVVVectorShape dataShape,
+                                  const RISCVTargetProfile &target) {
+  state.inputShape = dataShape;
+  switch (state.stripUpdate) {
+  case VLAStateStripUpdate::WideningAddReduction:
+    state.inputShape =
+        rvvShapeForSameLanes(dataShape, 8, target).value_or(RVVVectorShape{});
+    state.seedShape = RVVVectorShape{16, 8};
+    break;
+  case VLAStateStripUpdate::AddReduction:
+  case VLAStateStripUpdate::MaxReduction:
+  case VLAStateStripUpdate::ArgMaxSummary:
+  case VLAStateStripUpdate::OnlineSoftmaxSummary:
+    state.seedShape = kRVVE32M1;
+    break;
+  case VLAStateStripUpdate::InclusiveAddScan:
+  case VLAStateStripUpdate::SegmentedInclusiveAddScan:
+    break;
+  }
+  if (state.carry == VLAStateCarryRepresentation::Vector)
+    state.carryShape = dataShape;
+  auto supported = [&](RVVVectorShape shape) {
+    return !shape ||
+           target.supportsVectorShape(shape.sew, shape.lmulEighths);
+  };
+  return state.inputShape && supported(state.inputShape) &&
+         supported(state.carryShape) && supported(state.seedShape);
+}
+
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasF ||
@@ -1240,14 +1270,19 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     if (!segmentShapesLegal)
       continue;
 
-    for (const StateCombination &states : stateCombinations) {
+    for (const StateCombination &stateChoices : stateCombinations) {
+    StateCombination states = stateChoices;
+    if (!llvm::all_of(states, [&](SelectedVLAStatePhysical &state) {
+          return resolveVLAStateShapes(state, dataShape, target);
+        }))
+      continue;
 
     llvm::SmallVector<PhysicalLiveRange, 8> persistent;
     for (const SelectedVLAStatePhysical &state : states)
       if (state.carry == VLAStateCarryRepresentation::Vector &&
           state.wholeVLALifetime)
         persistent.push_back(
-            {PhysicalLiveClass::State, dataShape, 1, 0});
+            {PhysicalLiveClass::State, state.carryShape, 1, 0});
 
     PhysicalResourceBudget aggregate;
     aggregate.architecturalGroups = target.vectorRegisters;
@@ -1376,31 +1411,25 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       llvm::SmallVector<PhysicalLiveRange, 6> transient;
       switch (state.stripUpdate) {
       case VLAStateStripUpdate::InclusiveAddScan:
-        transient = {{PhysicalLiveClass::Temporary, dataShape, 3, 0},
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 3, 0},
                      {PhysicalLiveClass::Predicate, {}, 1, 1}};
         break;
       case VLAStateStripUpdate::SegmentedInclusiveAddScan:
-        transient = {{PhysicalLiveClass::Temporary, dataShape, 4, 0},
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 4, 0},
                      {PhysicalLiveClass::Predicate, {}, 1, 2}};
         break;
       case VLAStateStripUpdate::AddReduction:
       case VLAStateStripUpdate::MaxReduction:
-        transient = {{PhysicalLiveClass::Temporary, dataShape, 1, 0}};
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 1, 0}};
         if (state.carry != VLAStateCarryRepresentation::Vector ||
-            rvvRegisterGroups(dataShape) < 2)
-          transient.push_back({PhysicalLiveClass::Temporary, {}, 1, 2});
+            rvvRegisterGroups(state.carryShape) < 2)
+          transient.push_back(
+              {PhysicalLiveClass::Temporary, state.seedShape, 2, 0});
         break;
-      case VLAStateStripUpdate::WideningAddReduction: {
-        std::optional<RVVVectorShape> byteShape =
-            rvvShapeForSameLanes(dataShape, 8, target);
-        if (!byteShape) {
-          resourceLegal = false;
-          break;
-        }
-        transient = {{PhysicalLiveClass::Temporary, *byteShape, 1, 0},
-                     {PhysicalLiveClass::Temporary, {}, 1, 1}};
+      case VLAStateStripUpdate::WideningAddReduction:
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 1, 0},
+                     {PhysicalLiveClass::Temporary, state.seedShape, 1, 0}};
         break;
-      }
       case VLAStateStripUpdate::ArgMaxSummary:
         if (!indexShape) {
           indexShape = rvvShapeForSameLanes(
@@ -1410,12 +1439,13 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
           resourceLegal = false;
           break;
         }
-        transient = {{PhysicalLiveClass::Temporary, dataShape, 1, 0},
-                     {PhysicalLiveClass::Index, *indexShape, 1, 0}};
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 1, 0},
+                     {PhysicalLiveClass::Index, *indexShape, 1, 0},
+                     {PhysicalLiveClass::Temporary, state.seedShape, 2, 0}};
         break;
       case VLAStateStripUpdate::OnlineSoftmaxSummary:
-        transient = {{PhysicalLiveClass::Temporary, dataShape, 3, 0},
-                     {PhysicalLiveClass::Temporary, {}, 1, 2}};
+        transient = {{PhysicalLiveClass::Temporary, state.inputShape, 3, 0},
+                     {PhysicalLiveClass::Temporary, state.seedShape, 4, 0}};
         break;
       }
       if (!resourceLegal || !applyPhase(transient)) {

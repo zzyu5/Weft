@@ -503,6 +503,9 @@ struct SelectedVLAStatePhysical {
   VLAStateStripUpdate stripUpdate = VLAStateStripUpdate::AddReduction;
   VLAStateFinalize finalize = VLAStateFinalize::Direct;
   bool wholeVLALifetime = true;
+  RVVVectorShape inputShape;
+  RVVVectorShape carryShape;
+  RVVVectorShape seedShape;
 };
 
 llvm::SmallVector<SelectedVLAStatePhysical, 2>

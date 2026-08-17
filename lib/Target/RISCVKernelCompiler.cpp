@@ -4075,25 +4075,26 @@ private:
     const std::string dataSuffix = rvvIntrinsicTypeSuffix(
         RVVElementCategory::Floating, entity.vlaDataShape);
     const std::string setVL = rvvSetVLIntrinsic(entity.vlaDataShape);
-    const std::string setVLMax = rvvSetVLMaxIntrinsic(entity.vlaDataShape);
-    const std::string scalarF32Type =
-        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
-    const std::string scalarF32Suffix =
-        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
-    if (dataType.empty() || dataSuffix.empty() || setVL.empty() ||
-        setVLMax.empty() || scalarF32Type.empty() || scalarF32Suffix.empty())
+    if (dataType.empty() || dataSuffix.empty() || setVL.empty())
       return op.emitError("VLA entity has no intrinsic-C RVV spelling");
     mlir::Block &body = op.getBody().front();
     llvm::DenseMap<mlir::Operation *, CValue> aggregates;
     for (const VLAStateDecision &state : decision.states) {
       if (state.physical.carry == VLAStateCarryRepresentation::Vector) {
-        if (entity.vlaDataShape.sew != 32)
+        const std::string carryType = rvvVectorType(
+            RVVElementCategory::Floating, state.physical.carryShape);
+        const std::string carrySuffix = rvvIntrinsicTypeSuffix(
+            RVVElementCategory::Floating, state.physical.carryShape);
+        const std::string carrySetVLMax =
+            rvvSetVLMaxIntrinsic(state.physical.carryShape);
+        if (state.physical.carryShape.sew != 32 || carryType.empty() ||
+            carrySuffix.empty() || carrySetVLMax.empty())
           return state.operation->emitError(
               "vector state carry requires the selected f32 VLA shape");
         std::string accumulator = fresh("reduce_acc");
-        line(dataType + " " + accumulator + " = __riscv_vfmv_v_f_" +
-             dataSuffix + "(" + expression(state.identity) + ", " +
-             setVLMax + "());");
+        line(carryType + " " + accumulator + " = __riscv_vfmv_v_f_" +
+             carrySuffix + "(" + expression(state.identity) + ", " +
+             carrySetVLMax + "());");
         CValue aggregate{state.elementType, CValueKind::F32BlockStorage,
                          accumulator};
         aggregates[state.operation] = aggregate;
@@ -4237,20 +4238,33 @@ private:
         continue;
       auto reduce = mlir::cast<ReduceOp>(state.operation);
       CValue aggregate = aggregates[state.operation];
+      const std::string carrySuffix = rvvIntrinsicTypeSuffix(
+          RVVElementCategory::Floating, state.physical.carryShape);
+      const std::string carrySetVLMax =
+          rvvSetVLMaxIntrinsic(state.physical.carryShape);
+      const std::string seedType = rvvVectorType(
+          RVVElementCategory::Floating, state.physical.seedShape);
+      const std::string seedSuffix = rvvIntrinsicTypeSuffix(
+          RVVElementCategory::Floating, state.physical.seedShape);
+      if (carrySuffix.empty() || carrySetVLMax.empty() || seedType.empty() ||
+          seedSuffix.empty())
+        return state.operation->emitError(
+            "vector state finalize has no selected RVV shape");
       std::string seed = fresh("reduce_seed");
       std::string reduced = fresh("reduce_final");
       std::string result = fresh("reduce_result");
-      line(scalarF32Type + " " + seed + " = __riscv_vfmv_v_f_" +
-           scalarF32Suffix + "(" + expression(state.identity) + ", 1);");
+      line(seedType + " " + seed + " = __riscv_vfmv_v_f_" + seedSuffix +
+           "(" + expression(state.identity) + ", 1);");
       std::string intrinsic =
           state.physical.finalize == VLAStateFinalize::HorizontalAdd
               ? "__riscv_vfredusum_vs_"
               : "__riscv_vfredmax_vs_";
-      line(scalarF32Type + " " + reduced + " = " + intrinsic + dataSuffix +
-           "_" + scalarF32Suffix + "(" + aggregate.spelling + ", " + seed +
-           ", " + setVLMax + "());");
+      line(seedType + " " + reduced + " = " + intrinsic + carrySuffix + "_" +
+           seedSuffix + "(" + aggregate.spelling + ", " + seed + ", " +
+           carrySetVLMax + "());");
       line("const float " + result +
-           " = __riscv_vfmv_f_s_f32m1_f32(" + reduced + ");");
+           " = __riscv_vfmv_f_s_" + seedSuffix + "_f32(" + reduced +
+           ");");
       values[reduce.getResult()] =
           CValue{reduce.getResult().getType(), CValueKind::Scalar, result};
     }
@@ -11422,7 +11436,8 @@ private:
     }
     const PhysicalValueDecision *inputShape =
         findVLAValueDecision(semanticInput);
-    if (!inputShape || inputShape->shape.sew != 32) {
+    if (!inputShape || inputShape->shape != decision.physical.inputShape ||
+        decision.physical.inputShape.sew != 32) {
       owner->emitError("VLA state validity has no physical input shape");
       return mlir::failure();
     }
@@ -11438,9 +11453,10 @@ private:
       return mlir::failure();
     }
     std::string suffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::Floating, inputShape->shape);
+        RVVElementCategory::Floating, decision.physical.inputShape);
     std::string vectorType =
-        rvvVectorType(RVVElementCategory::Floating, inputShape->shape);
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.inputShape);
     if (suffix.empty() || vectorType.empty()) {
       owner->emitError("VLA state validity has no RVV intrinsic spelling");
       return mlir::failure();
@@ -11471,14 +11487,17 @@ private:
           findVLAValueDecision(op.getInput());
       std::string inputSuffix =
           inputShape ? rvvIntrinsicTypeSuffix(
-                           RVVElementCategory::SignedInteger, inputShape->shape)
+                           RVVElementCategory::SignedInteger,
+                           decision.physical.inputShape)
                      : std::string{};
-      const RVVVectorShape seedShape{16, 8};
       std::string seedSuffix = rvvIntrinsicTypeSuffix(
-          RVVElementCategory::SignedInteger, seedShape);
+          RVVElementCategory::SignedInteger, decision.physical.seedShape);
       std::string seedType =
-          rvvVectorType(RVVElementCategory::SignedInteger, seedShape);
-      if (!inputShape || inputShape->shape.sew != 8 || inputSuffix.empty() ||
+          rvvVectorType(RVVElementCategory::SignedInteger,
+                        decision.physical.seedShape);
+      if (!inputShape || inputShape->shape != decision.physical.inputShape ||
+          decision.physical.inputShape.sew != 8 ||
+          decision.physical.seedShape.sew != 16 || inputSuffix.empty() ||
           seedSuffix.empty() || seedType.empty())
         return op.emitError("RVV i8 reduction has no physical input shape");
       std::string seed = fresh("i8_reduce_seed");
@@ -11503,18 +11522,24 @@ private:
         findVLAValueDecision(op.getInput());
     std::string inputSuffix =
         inputShape ? rvvIntrinsicTypeSuffix(RVVElementCategory::Floating,
-                                            inputShape->shape)
+                                            decision.physical.inputShape)
                    : std::string{};
     std::string scalarSuffix =
-        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating,
+                               decision.physical.seedShape);
     std::string scalarType =
-        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
-    if (!inputShape || inputShape->shape.sew != 32 || inputSuffix.empty() ||
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.seedShape);
+    if (!inputShape || inputShape->shape != decision.physical.inputShape ||
+        decision.physical.inputShape.sew != 32 ||
+        decision.physical.seedShape.sew != 32 || inputSuffix.empty() ||
         scalarSuffix.empty() || scalarType.empty())
       return op.emitError("RVV reduction has no physical input shape");
     if (decision.physical.carry == VLAStateCarryRepresentation::Vector) {
       if (aggregate.kind != CValueKind::F32BlockStorage)
         return op.emitError("RVV vector reduction carry is unavailable");
+      if (decision.physical.carryShape != decision.physical.inputShape)
+        return op.emitError("RVV vector reduction carry shape is unavailable");
       if (decision.physical.stripUpdate == VLAStateStripUpdate::AddReduction)
         line(aggregate.spelling + " = __riscv_vfadd_vv_" + inputSuffix +
              "_tu(" + aggregate.spelling + ", " + aggregate.spelling + ", " +
@@ -11564,18 +11589,21 @@ private:
         return op.emitError("RVV scan projection is unavailable");
     const PhysicalValueDecision *dataShape =
         findVLAValueDecision(op.getInput());
-    if (!dataShape || dataShape->shape.sew != 32 || !activePhysicalEntity ||
+    if (!dataShape || dataShape->shape != decision.physical.inputShape ||
+        decision.physical.inputShape.sew != 32 || !activePhysicalEntity ||
         activePhysicalEntity->vlaMaskRatio == 0)
       return op.emitError("RVV scan has no physical data/mask shape");
     unsigned maskRatio = activePhysicalEntity->vlaMaskRatio;
     std::string dataSuffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::Floating, dataShape->shape);
+        RVVElementCategory::Floating, decision.physical.inputShape);
     std::string dataType =
-        rvvVectorType(RVVElementCategory::Floating, dataShape->shape);
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.inputShape);
     std::string indexSuffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::UnsignedInteger, dataShape->shape);
+        RVVElementCategory::UnsignedInteger, decision.physical.inputShape);
     std::string indexType =
-        rvvVectorType(RVVElementCategory::UnsignedInteger, dataShape->shape);
+        rvvVectorType(RVVElementCategory::UnsignedInteger,
+                      decision.physical.inputShape);
     std::string maskType = rvvMaskType(maskRatio);
     std::string maskOnlySuffix = rvvMaskSuffix(maskRatio);
     if (dataSuffix.empty() || dataType.empty() || indexSuffix.empty() ||
@@ -11700,16 +11728,20 @@ private:
       return op.emitError("RVV argmax summary projection is unavailable");
     const PhysicalValueDecision *dataShape =
         findVLAValueDecision(op.getInput());
-    if (!dataShape || dataShape->shape.sew != 32 || !activePhysicalEntity ||
+    if (!dataShape || dataShape->shape != decision.physical.inputShape ||
+        decision.physical.inputShape.sew != 32 ||
+        decision.physical.seedShape.sew != 32 || !activePhysicalEntity ||
         activePhysicalEntity->vlaMaskRatio == 0)
       return op.emitError("RVV argmax has no physical data/mask shape");
     unsigned maskRatio = activePhysicalEntity->vlaMaskRatio;
     std::string dataSuffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::Floating, dataShape->shape);
+        RVVElementCategory::Floating, decision.physical.inputShape);
     std::string scalarSuffix =
-        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating,
+                               decision.physical.seedShape);
     std::string scalarType =
-        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.seedShape);
     std::string maskType = rvvMaskType(maskRatio);
     std::string maskSuffix = rvvMaskSuffix(maskRatio);
     if (dataSuffix.empty() || scalarSuffix.empty() || scalarType.empty() ||
@@ -11776,17 +11808,22 @@ private:
     const PhysicalValueDecision *dataShape =
         findVLAValueDecision(op.getInput());
     std::optional<RVVVectorShape> mathShape = activeF32MathShape();
-    if (!dataShape || dataShape->shape.sew != 32 || !mathShape ||
-        dataShape->shape != *mathShape)
+    if (!dataShape || dataShape->shape != decision.physical.inputShape ||
+        decision.physical.inputShape.sew != 32 ||
+        decision.physical.seedShape.sew != 32 || !mathShape ||
+        decision.physical.inputShape != *mathShape)
       return op.emitError("online summary has no physical input shape");
     std::string dataSuffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::Floating, dataShape->shape);
+        RVVElementCategory::Floating, decision.physical.inputShape);
     std::string dataType =
-        rvvVectorType(RVVElementCategory::Floating, dataShape->shape);
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.inputShape);
     std::string scalarSuffix =
-        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, kRVVE32M1);
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating,
+                               decision.physical.seedShape);
     std::string scalarType =
-        rvvVectorType(RVVElementCategory::Floating, kRVVE32M1);
+        rvvVectorType(RVVElementCategory::Floating,
+                      decision.physical.seedShape);
     if (dataSuffix.empty() || dataType.empty() || scalarSuffix.empty() ||
         scalarType.empty())
       return op.emitError("online summary has no intrinsic-C spelling");
