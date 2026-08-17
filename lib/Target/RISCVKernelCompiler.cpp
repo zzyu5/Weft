@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1719,101 +1720,137 @@ private:
   }
 
   mlir::FailureOr<VLADotDecision>
-  decideVLAF32FreeAxisMicrotile(VLAOp vla, DotOp dot) {
-    BlockType lhsType =
-        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getLhs().getType()));
-    RegionType rhsType =
-        mlir::dyn_cast<RegionType>(unwrapLogicalValidity(dot.getRhs().getType()));
-    RegionType resultType = mlir::dyn_cast<RegionType>(
-        unwrapLogicalValidity(dot.getResult().getType()));
-    if (!lhsType || !rhsType || !resultType ||
-        lhsType.getShape().size() != 2 ||
-        rhsType.getShape().size() != 2 || resultType.getShape().size() != 2 ||
-        rhsType.getShape()[0] != -1 || resultType.getShape()[0] != -1 ||
-        lhsType.getShape()[0] != resultType.getShape()[1] ||
-        lhsType.getShape()[1] != rhsType.getShape()[1] ||
-        lhsType.getShape()[0] <= 0 || lhsType.getShape()[0] > 6 ||
-        !lhsType.getElementType().isF32() ||
-        !rhsType.getElementType().isF32() ||
-        !resultType.getElementType().isF32() ||
-        !isFloatConstant(dot.getInit(), 0.0) ||
+  decideVLAF32Dot(VLAOp vla, DotOp dot) {
+    if (!elementType(dot.getLhs().getType()).isF32() ||
+        !elementType(dot.getRhs().getType()).isF32() ||
+        !elementType(dot.getResult().getType()).isF32() ||
         dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
         !dot.getAccDtype().isF32()) {
-      dot.emitError(
-          "RVV VLA dot requires a [BM,K] x [VLA,K] local f32 primitive");
+      dot.emitError("RVV VLA dot requires a relaxed native f32 primitive");
       return mlir::failure();
     }
 
-    LoadOp lhsLoad = reloadableLoad(dot.getLhs());
-    LoadOp rhsLoad = reloadableLoad(dot.getRhs());
-    if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere()) ||
-        (!isTrue(lhsLoad.getWhere()) &&
-         !isFloatConstant(lhsLoad.getOther(), 0.0))) {
+    mlir::Block &block = *dot->getBlock();
+    std::optional<StructuredProductFacts> product =
+        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
+                                      dot.getResult());
+    mlir::Value coordinate = vla.getBody().front().getArgument(0);
+    if (!product || product->reductionAxes.size() != 1 ||
+        !llvm::is_contained(product->resultAxes, coordinate)) {
+      dot.emitError("RVV VLA dot requires one explicit shared reduction axis");
+      return mlir::failure();
+    }
+    const bool coordinateOnLHS =
+        llvm::is_contained(product->lhsFreeAxes, coordinate);
+    const bool coordinateOnRHS =
+        llvm::is_contained(product->rhsFreeAxes, coordinate);
+    if (coordinateOnLHS == coordinateOnRHS) {
+      dot.emitError("exactly one VLA dot operand must own the VLA free axis");
+      return mlir::failure();
+    }
+    llvm::ArrayRef<mlir::Value> laneFreeAxes =
+        coordinateOnLHS ? product->lhsFreeAxes : product->rhsFreeAxes;
+    llvm::ArrayRef<mlir::Value> registerFreeAxes =
+        coordinateOnLHS ? product->rhsFreeAxes : product->lhsFreeAxes;
+    if (laneFreeAxes.size() != 1 || laneFreeAxes.front() != coordinate ||
+        registerFreeAxes.size() > 1 ||
+        product->resultAxes.size() != 1 + registerFreeAxes.size() ||
+        (registerFreeAxes.size() == 1 &&
+         !llvm::is_contained(product->resultAxes,
+                             registerFreeAxes.front()))) {
+      dot.emitError(
+          "RVV VLA dot free axes cannot be represented by one lane axis and one register axis");
+      return mlir::failure();
+    }
+    BlockIndexOp reductionAxis =
+        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
+    BlockIndexOp registerAxis =
+        registerFreeAxes.empty()
+            ? BlockIndexOp{}
+            : registerFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!reductionAxis || (!registerFreeAxes.empty() && !registerAxis)) {
+      dot.emitError("RVV VLA dot typed axis facts are unavailable");
+      return mlir::failure();
+    }
+    unsigned rowTile = 1;
+    if (registerAxis) {
+      std::optional<int64_t> extent = integerConstantValue(registerAxis.getExtent());
+      if (!extent || *extent <= 0 ||
+          static_cast<uint64_t>(*extent) >
+              static_cast<uint64_t>(std::numeric_limits<unsigned>::max())) {
+        dot.emitError("RVV VLA dot register axis requires a positive static extent");
+        return mlir::failure();
+      }
+      rowTile = static_cast<unsigned>(*extent);
+    }
+
+    mlir::Value laneOperand = coordinateOnLHS ? dot.getLhs() : dot.getRhs();
+    mlir::Value registerOperand = coordinateOnLHS ? dot.getRhs() : dot.getLhs();
+    LoadOp laneLoad = reloadableLoad(laneOperand);
+    LoadOp registerLoad = registerAxis ? reloadableLoad(registerOperand) : LoadOp{};
+    if (!laneLoad || !isTrue(laneLoad.getWhere()) ||
+        (registerAxis &&
+         (!registerLoad ||
+          (!isTrue(registerLoad.getWhere()) &&
+           !isFloatConstant(registerLoad.getOther(), 0.0))))) {
       dot.emitError("RVV VLA dot load facts are unavailable");
       return mlir::failure();
     }
 
-    mlir::Block &block = *dot->getBlock();
-    std::optional<StructuredProductFacts> product =
-        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
-                                      dot.getResult());
-    mlir::Value coordinate = vla.getBody().front().getArgument(0);
-    if (!product || product->lhsFreeAxes.size() != 1 ||
-        product->rhsFreeAxes.size() != 1 ||
-        product->rhsFreeAxes.front() != coordinate ||
-        product->reductionAxes.size() != 1 ||
-        product->resultAxes.size() != 2) {
-      dot.emitError(
-          "RVV VLA dot requires explicit row and shared reduction axes");
-      return mlir::failure();
-    }
-    BlockIndexOp reductionAxis =
-        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
-    BlockIndexOp rowAxis =
-        product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!reductionAxis || !rowAxis) {
-      dot.emitError("RVV VLA dot block-axis facts are unavailable");
-      return mlir::failure();
-    }
-    if (integerConstantValue(rowAxis.getExtent()) != lhsType.getShape()[0]) {
-      dot.emitError(
-          "RVV VLA dot result axes do not preserve the local row block");
-      return mlir::failure();
-    }
-
-    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
-    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
-    if (!lhsAccess || !rhsAccess) {
+    const MemoryAccessFact *laneAccess = memoryFact(laneLoad.getOperation());
+    const MemoryAccessFact *registerAccess =
+        registerLoad ? memoryFact(registerLoad.getOperation()) : nullptr;
+    if (!laneAccess || (registerAxis && !registerAccess)) {
       dot.emitError("RVV VLA dot typed memory facts are unavailable");
       return mlir::failure();
     }
-    mlir::Value lhsRoot = lhsAccess->root;
-    mlir::Value rhsRoot = rhsAccess->root;
-    auto lhsPointer =
-        lhsRoot ? mlir::dyn_cast<PtrType>(lhsRoot.getType()) : PtrType{};
-    auto rhsPointer =
-        rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType()) : PtrType{};
-    LaneRelation rhsRelation = memoryRelation(*rhsAccess, coordinate);
-    const MemoryAxisFact *rhsAxis = memoryAxisFact(*rhsAccess, coordinate);
-    if (!lhsPointer || !rhsPointer ||
-        !lhsPointer.getElementType().isF32() ||
-        !rhsPointer.getElementType().isF32() ||
-        (rhsRelation != LaneRelation::UnitStride &&
-         rhsRelation != LaneRelation::Strided) ||
-        memoryRelation(*lhsAccess, rowAxis.getResult()) ==
+    auto pointerType = [](const MemoryAccessFact &access) {
+      return access.root ? mlir::dyn_cast<PtrType>(access.root.getType())
+                         : PtrType{};
+    };
+    PtrType lanePointer = pointerType(*laneAccess);
+    LaneRelation laneRelation = memoryRelation(*laneAccess, coordinate);
+    const MemoryAxisFact *laneAxis = memoryAxisFact(*laneAccess, coordinate);
+    if (!lanePointer || !lanePointer.getElementType().isF32() ||
+        (laneRelation != LaneRelation::UnitStride &&
+         laneRelation != LaneRelation::Strided) ||
+        memoryRelation(*laneAccess, reductionAxis.getResult()) ==
             LaneRelation::Independent ||
-        memoryRelation(*lhsAccess, reductionAxis.getResult()) ==
-            LaneRelation::Independent ||
-        memoryRelation(*lhsAccess, coordinate) != LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, coordinate) == LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, reductionAxis.getResult()) ==
-            LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, rowAxis.getResult()) !=
-            LaneRelation::Independent ||
-        (rhsRelation == LaneRelation::Strided &&
-         (!rhsAxis || !rhsAxis->laneStride))) {
-      dot.emitError(
-          "RVV VLA dot memory relations are unavailable");
+        (registerAxis &&
+         memoryRelation(*laneAccess, registerAxis.getResult()) !=
+             LaneRelation::Independent) ||
+        (laneRelation == LaneRelation::Strided &&
+         (!laneAxis || !laneAxis->laneStride))) {
+      dot.emitError("RVV VLA dot lane-memory relation is unavailable");
+      return mlir::failure();
+    }
+    LaneRelation registerRelation = LaneRelation::Independent;
+    if (registerAxis) {
+      PtrType registerPointer = pointerType(*registerAccess);
+      registerRelation =
+          memoryRelation(*registerAccess, reductionAxis.getResult());
+      if (!registerPointer || !registerPointer.getElementType().isF32() ||
+          memoryRelation(*registerAccess, registerAxis.getResult()) ==
+              LaneRelation::Independent ||
+          memoryRelation(*registerAccess, coordinate) !=
+              LaneRelation::Independent ||
+          (registerRelation != LaneRelation::UnitStride &&
+           registerRelation != LaneRelation::Strided)) {
+        dot.emitError("RVV VLA dot register-memory relation is unavailable");
+        return mlir::failure();
+      }
+    } else if (valueDependsOnAxis(registerOperand, coordinate) ||
+               !valueDependsOnAxis(registerOperand,
+                                   reductionAxis.getResult()) ||
+               !isRegionValue(dot.getInit().getType()) ||
+               !elementType(dot.getInit().getType()).isF32() ||
+               !valueDependsOnAxis(dot.getInit(), coordinate) ||
+               valueDependsOnAxis(dot.getInit(), reductionAxis.getResult())) {
+      dot.emitError("RVV VLA dot scalar operand or carried init axes are unavailable");
+      return mlir::failure();
+    }
+    if (registerAxis && !isFloatConstant(dot.getInit(), 0.0)) {
+      dot.emitError("VLA register-microtile dot requires its explicit zero init");
       return mlir::failure();
     }
 
@@ -1821,193 +1858,77 @@ private:
     llvm::SmallVector<BlockIndexOp> absorbedAxes;
     for (mlir::Value value : {dot.getLhs(), dot.getRhs()})
       collectLocalDefinitions(value, block, absorbed, absorbedAxes);
+    if (!registerAxis) {
+      llvm::DenseSet<mlir::Operation *> initDefinitions;
+      llvm::SmallVector<BlockIndexOp> initAxes;
+      collectLocalDefinitions(dot.getInit(), block, initDefinitions, initAxes);
+      for (mlir::Operation *operation : initDefinitions)
+        absorbed.erase(operation);
+    }
 
     VLADotDecision decision;
     decision.operation = dot.getOperation();
-    decision.lhsLoad = lhsLoad.getOperation();
-    decision.rhsLoad = rhsLoad.getOperation();
-    decision.init = dot.getInit();
-    decision.rowAxis = rowAxis.getResult();
-    decision.reductionAxis = reductionAxis.getResult();
-    decision.reductionExtent = reductionAxis.getExtent();
-    decision.rowTile = static_cast<unsigned>(lhsType.getShape()[0]);
-    F32DotCandidateFacts candidateFacts;
-    if (std::optional<int64_t> extent =
-            integerConstantValue(decision.reductionExtent);
-        extent && *extent >= 0)
-      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
-    candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free,
-                              decision.rowTile, false, false, false,
-                              registerFactorCandidates(decision.rowTile,
-                                                       decision.rowTile)},
-        LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, std::nullopt,
-                              false, true, true, {1}},
-        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                              candidateFacts.reductionExtent, false, false,
-                              false, {1}}};
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
-    candidateFacts.unitStrideOperands =
-        1 + (rhsRelation == LaneRelation::UnitStride ? 1 : 0);
-    candidateFacts.stridedOperands =
-        rhsRelation == LaneRelation::Strided ? 1 : 0;
-    candidateFacts.reductionPredicate =
-        valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
-    candidateFacts.predicateGroups =
-        candidateFacts.reductionPredicate ? 1 : 0;
-    std::optional<SelectedF32DotPhysical> physical =
-        weft::riscv_internal::selectF32DotPhysicalConfig(
-            candidateFacts, options.target, options.backend);
-    if (!physical) {
-      dot.emitError(
-          "RVV VLA dot has no legal register microtile candidate");
-      return mlir::failure();
-    }
-    decision.rhsMemoryMode = rhsRelation == LaneRelation::UnitStride
-                                 ? VLAMemoryMode::UnitStride
-                                 : VLAMemoryMode::Strided;
-    if (rhsAxis)
-      decision.rhsLaneStride = rhsAxis->laneStride;
-    decision.lhsPredicateVariesByReduction =
-        valueDependsOnAxis(lhsLoad.getWhere(), reductionAxis.getResult());
-    decision.mapping = physical->mapping;
-    decision.resources = physical->resources;
-    retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
-    decision.absorbed.append(absorbed.begin(), absorbed.end());
-    return decision;
-  }
-
-  mlir::FailureOr<VLADotDecision>
-  decideVLAF32FreeAxisVectorDot(VLAOp vla, DotOp dot) {
-    RegionType lhsType = mlir::dyn_cast<RegionType>(
-        unwrapLogicalValidity(dot.getLhs().getType()));
-    BlockType rhsType =
-        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getRhs().getType()));
-    RegionType initType = mlir::dyn_cast<RegionType>(
-        unwrapLogicalValidity(dot.getInit().getType()));
-    RegionType resultType = mlir::dyn_cast<RegionType>(
-        unwrapLogicalValidity(dot.getResult().getType()));
-    if (!lhsType || !rhsType || !initType || !resultType ||
-        lhsType.getShape().size() != 2 ||
-        rhsType.getShape().size() != 1 || initType.getShape().size() != 1 ||
-        resultType.getShape().size() != 1 || lhsType.getShape()[0] != -1 ||
-        initType.getShape()[0] != -1 || resultType.getShape()[0] != -1 ||
-        lhsType.getShape()[1] != rhsType.getShape()[0] ||
-        !lhsType.getElementType().isF32() ||
-        !rhsType.getElementType().isF32() ||
-        !initType.getElementType().isF32() ||
-        !resultType.getElementType().isF32() ||
-        dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
-        !dot.getAccDtype().isF32()) {
-      dot.emitError(
-          "RVV VLA vector dot requires a [VLA,K] x [K] local f32 primitive");
-      return mlir::failure();
-    }
-
-    LoadOp freeLoad = reloadableLoad(dot.getLhs());
-    if (!freeLoad || !isTrue(freeLoad.getWhere())) {
-      dot.emitError("RVV VLA vector-dot load facts are unavailable");
-      return mlir::failure();
-    }
-
-    mlir::Block &block = *dot->getBlock();
-    std::optional<StructuredProductFacts> product =
-        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
-                                      dot.getResult());
-    mlir::Value coordinate = vla.getBody().front().getArgument(0);
-    if (!product || product->lhsFreeAxes.size() != 1 ||
-        product->lhsFreeAxes.front() != coordinate ||
-        !product->rhsFreeAxes.empty() ||
-        product->reductionAxes.size() != 1 ||
-        product->resultAxes.size() != 1) {
-      dot.emitError(
-          "RVV VLA vector dot requires one shared explicit reduction axis");
-      return mlir::failure();
-    }
-    BlockIndexOp reductionAxis =
-        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!reductionAxis) {
-      dot.emitError("RVV VLA vector dot block-axis fact is unavailable");
-      return mlir::failure();
-    }
-
-    const MemoryAccessFact *freeAccess = memoryFact(freeLoad.getOperation());
-    if (!freeAccess) {
-      dot.emitError("RVV VLA vector-dot typed memory fact is unavailable");
-      return mlir::failure();
-    }
-    mlir::Value freeRoot = freeAccess->root;
-    auto freePointer =
-        freeRoot ? mlir::dyn_cast<PtrType>(freeRoot.getType()) : PtrType{};
-    LaneRelation freeRelation = memoryRelation(*freeAccess, coordinate);
-    const MemoryAxisFact *freeAxis = memoryAxisFact(*freeAccess, coordinate);
-    if (!freePointer || !freePointer.getElementType().isF32() ||
-        (freeRelation != LaneRelation::UnitStride &&
-         freeRelation != LaneRelation::Strided) ||
-        memoryRelation(*freeAccess, coordinate) == LaneRelation::Independent ||
-        memoryRelation(*freeAccess, reductionAxis.getResult()) ==
-            LaneRelation::Independent ||
-        (freeRelation == LaneRelation::Strided &&
-         (!freeAxis || !freeAxis->laneStride)) ||
-        !valueDependsOnAxis(dot.getInit(), coordinate) ||
-        valueDependsOnAxis(dot.getInit(), reductionAxis.getResult()) ||
-        valueDependsOnAxis(dot.getRhs(), coordinate) ||
-        !valueDependsOnAxis(dot.getRhs(), reductionAxis.getResult())) {
-      dot.emitError("RVV VLA vector-dot memory relations are unavailable");
-      return mlir::failure();
-    }
-
-    llvm::DenseSet<mlir::Operation *> absorbed;
-    llvm::SmallVector<BlockIndexOp> absorbedAxes;
-    for (mlir::Value value : {dot.getLhs(), dot.getRhs()})
-      collectLocalDefinitions(value, block, absorbed, absorbedAxes);
-    llvm::DenseSet<mlir::Operation *> initDefinitions;
-    llvm::SmallVector<BlockIndexOp> initAxes;
-    collectLocalDefinitions(dot.getInit(), block, initDefinitions, initAxes);
-    for (mlir::Operation *operation : initDefinitions)
-      absorbed.erase(operation);
-
-    VLADotDecision decision;
-    decision.operation = dot.getOperation();
-    decision.freeLoad = freeLoad.getOperation();
-    decision.blockedOperand = dot.getRhs();
     decision.init = dot.getInit();
     decision.reductionAxis = reductionAxis.getResult();
     decision.reductionExtent = reductionAxis.getExtent();
-    decision.rowTile = 1;
-    F32DotCandidateFacts candidateFacts;
-    if (std::optional<int64_t> extent =
-            integerConstantValue(decision.reductionExtent);
-        extent && *extent >= 0)
-      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
-    candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, std::nullopt,
-                              false, true, true, {1}},
-        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                              candidateFacts.reductionExtent, false, false,
-                              false, {1}}};
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
-    candidateFacts.unitStrideOperands =
-        freeRelation == LaneRelation::UnitStride ? 1 : 0;
-    candidateFacts.stridedOperands =
-        freeRelation == LaneRelation::Strided ? 1 : 0;
-    candidateFacts.handoffGroups = 1;
-    candidateFacts.materializedInit = true;
-    std::optional<SelectedF32DotPhysical> physical =
-        weft::riscv_internal::selectF32DotPhysicalConfig(
-            candidateFacts, options.target, options.backend);
-    if (!physical) {
-      dot.emitError(
-          "RVV VLA vector dot has no legal register candidate");
-      return mlir::failure();
-    }
-    decision.freeMemoryMode = freeRelation == LaneRelation::UnitStride
+    decision.rowTile = rowTile;
+    decision.freeLoad = laneLoad.getOperation();
+    decision.freeMemoryMode = laneRelation == LaneRelation::UnitStride
                                   ? VLAMemoryMode::UnitStride
                                   : VLAMemoryMode::Strided;
-    if (freeAxis)
-      decision.freeLaneStride = freeAxis->laneStride;
-    decision.initRealization =
-        VLADotInitRealization::MaterializedRegion;
+    if (laneAxis)
+      decision.freeLaneStride = laneAxis->laneStride;
+    if (registerAxis) {
+      decision.lhsLoad = registerLoad.getOperation();
+      decision.rhsLoad = laneLoad.getOperation();
+      decision.rowAxis = registerAxis.getResult();
+      decision.rhsMemoryMode = decision.freeMemoryMode;
+      decision.rhsLaneStride = decision.freeLaneStride;
+      decision.lhsPredicateVariesByReduction =
+          valueDependsOnAxis(registerLoad.getWhere(),
+                             reductionAxis.getResult());
+    } else {
+      decision.blockedOperand = registerOperand;
+      decision.initRealization = VLADotInitRealization::MaterializedRegion;
+    }
+    F32DotCandidateFacts candidateFacts;
+    if (std::optional<int64_t> extent =
+            integerConstantValue(decision.reductionExtent);
+        extent && *extent >= 0)
+      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
+    if (registerAxis)
+      candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+          kCoreAxisM, LogicalAxisRole::Free, decision.rowTile, false, false,
+          false,
+          registerFactorCandidates(decision.rowTile,
+                                   std::min(decision.rowTile, 8u))});
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisN, LogicalAxisRole::Free, std::nullopt, false, true, true,
+        {1}});
+    candidateFacts.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisK, LogicalAxisRole::Reduction,
+        candidateFacts.reductionExtent, false, false, false, {1}});
+    candidateFacts.mapping.unrollAxis = kCoreAxisK;
+    candidateFacts.unitStrideOperands =
+        (laneRelation == LaneRelation::UnitStride) +
+        (registerAxis && registerRelation == LaneRelation::UnitStride);
+    candidateFacts.stridedOperands =
+        (laneRelation == LaneRelation::Strided) +
+        (registerAxis && registerRelation == LaneRelation::Strided);
+    candidateFacts.reductionPredicate = registerAxis &&
+        valueDependsOnAxis(registerLoad.getWhere(), reductionAxis.getResult());
+    candidateFacts.predicateGroups =
+        candidateFacts.reductionPredicate ? 1 : 0;
+    candidateFacts.handoffGroups = registerAxis ? 0 : 1;
+    candidateFacts.materializedInit = !registerAxis;
+    std::optional<SelectedF32DotPhysical> physical =
+        weft::riscv_internal::selectF32DotPhysicalConfig(
+            candidateFacts, options.target, options.backend);
+    if (!physical) {
+      dot.emitError(
+          "RVV VLA dot has no legal axis-mapping candidate");
+      return mlir::failure();
+    }
     decision.mapping = physical->mapping;
     decision.resources = physical->resources;
     retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
@@ -2047,11 +1968,7 @@ private:
       auto dot = mlir::dyn_cast<DotOp>(nested);
       if (!dot || !isRegionValue(dot.getResult().getType()))
         continue;
-      mlir::FailureOr<VLADotDecision> selected =
-          isRegionValue(dot.getLhs().getType()) &&
-                  containsBlockType(dot.getRhs().getType())
-              ? decideVLAF32FreeAxisVectorDot(op, dot)
-              : decideVLAF32FreeAxisMicrotile(op, dot);
+      mlir::FailureOr<VLADotDecision> selected = decideVLAF32Dot(op, dot);
       if (mlir::failed(selected))
         return mlir::failure();
       decision.dots.push_back(std::move(*selected));
@@ -5562,8 +5479,9 @@ private:
         findAxisMapping(decision.mapping, kCoreAxisK);
     if (!lmul || dotShape.sew != 32 || !activePhysicalEntity ||
         dotShape != decision.mapping.laneShape ||
-        laneAxis == decision.mapping.axes.end() || !mAxis || !reductionAxis ||
-        reductionAxis->unrollFactor == 0 || mAxis->registerFactor == 0)
+        laneAxis == decision.mapping.axes.end() || !reductionAxis ||
+        reductionAxis->unrollFactor == 0 ||
+        (mAxis && mAxis->registerFactor == 0))
       return decision.operation->emitError(
           "VLA dot physical entity is incomplete");
     PhysicalHandoff expected =
@@ -5577,7 +5495,7 @@ private:
       return decision.operation->emitError(
           "VLA dot physical handoff is inconsistent");
     const unsigned kUnroll = reductionAxis->unrollFactor;
-    if (laneAxis->id == kCoreAxisM) {
+    if (!mAxis) {
       auto dot = mlir::cast<DotOp>(decision.operation);
       auto freeLoad = mlir::cast<LoadOp>(decision.freeLoad);
       std::string extent = expression(decision.reductionExtent);
