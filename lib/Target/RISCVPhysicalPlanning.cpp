@@ -890,12 +890,28 @@ std::optional<SelectedI4I8FragmentPhysical>
 selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
                            const RISCVTargetProfile &target,
                            const RISCVBackendConfig &config) {
-  if (!target.littleEndian || (facts.rowTile != 1 && facts.rowTile != 4) ||
+  auto axis = [&](unsigned id) -> const LogicalAxisConstraint * {
+    auto found = llvm::find_if(facts.mapping.axes,
+                               [&](const LogicalAxisConstraint &candidate) {
+                                 return candidate.id == id;
+                               });
+    return found == facts.mapping.axes.end() ? nullptr : &*found;
+  };
+  const LogicalAxisConstraint *rows = axis(kCoreAxisM);
+  const LogicalAxisConstraint *columns = axis(kCoreAxisN);
+  const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
+  if (!target.littleEndian || !rows || !columns || !reduction ||
+      !rows->extent || (*rows->extent != 1 && *rows->extent != 4) ||
+      rows->role != LogicalAxisRole::Free || !columns->extent ||
+      *columns->extent != 16 || columns->role != LogicalAxisRole::Free ||
+      !reduction->extent || *reduction->extent != 32 ||
+      reduction->role != LogicalAxisRole::Reduction ||
       config.structures.i4I8FragmentImplementation < 0 ||
       config.structures.i4I8FragmentImplementation > 2)
     return std::nullopt;
+  const unsigned rowExtent = static_cast<unsigned>(*rows->extent);
   const bool supportsIME =
-      facts.rowTile == 4
+      rowExtent == 4
           ? target.supportsSpacemitIME1I4I8M4N16K32()
           : target.supportsSpacemitIME1I4I8N16K32();
   const bool supportsRVV =
@@ -904,21 +920,22 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       target.supportsVectorShape(8, 8) &&
       target.supportsVectorShape(16, 16) &&
       target.supportsVectorShape(32, 32);
-  CoreMappingProblem problem;
-  problem.axes = {
-      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, facts.rowTile,
-                            false, false, false, {facts.rowTile}},
-      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, 16, false,
-                            supportsRVV, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32, false,
-                            false, false, {1}}};
+  CoreMappingProblem problem = facts.mapping;
+  for (LogicalAxisConstraint &constraint : problem.axes) {
+    constraint.allowLane = constraint.id == kCoreAxisN && supportsRVV;
+    constraint.requireLane = constraint.allowLane;
+    constraint.registerFactors =
+        constraint.id == kCoreAxisM
+            ? llvm::SmallVector<unsigned, 4>{rowExtent}
+            : llvm::SmallVector<unsigned, 4>{1};
+  }
   problem.laneSEW = 8;
   problem.laneInstruction = CoreInstructionKind::RVVWideningIntegerDot;
   problem.laneLMULCandidates = {1};
   if (supportsIME)
     problem.fragments.push_back(FragmentMappingConstraint{
         CoreInstructionKind::SpacemitIME1MMA,
-        {{kCoreAxisM, facts.rowTile}, {kCoreAxisN, 16}, {kCoreAxisK, 32}},
+        {{kCoreAxisM, rowExtent}, {kCoreAxisN, 16}, {kCoreAxisK, 32}},
         28});
 
   struct Candidate {
@@ -964,8 +981,7 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
       continue;
     selected.resources = *resources;
     candidates.push_back(Candidate{std::move(selected),
-                                   ime ? 1u
-                                       : facts.rowTile == 4 ? 16u : 4u});
+                                   ime ? 1u : rowExtent * 4u});
   }
   const int64_t requested = config.structures.i4I8FragmentImplementation;
   if (requested != 0)
@@ -1799,8 +1815,25 @@ selectGroupedAffineI4I8Physical(
   if (!target.hasRVV || !target.hasWideningInteger ||
       target.vlenBits < 128 || !target.littleEndian)
     return std::nullopt;
-  if (facts.packedExtent != 128 || facts.scaleExtent != 12 ||
-      facts.activationExtent != 256 || facts.activationSumExtent != 32)
+  auto axis = [&](unsigned id) -> const LogicalAxisConstraint * {
+    auto found = llvm::find_if(facts.mapping.axes,
+                               [&](const LogicalAxisConstraint &candidate) {
+                                 return candidate.id == id;
+                               });
+    return found == facts.mapping.axes.end() ? nullptr : &*found;
+  };
+  const LogicalAxisConstraint *rows = axis(kCoreAxisM);
+  const LogicalAxisConstraint *reduction = axis(kCoreAxisK);
+  const LogicalAxisConstraint *groups = axis(kCoreAxisGroup);
+  const LogicalAxisConstraint *packed = axis(kCoreAxisPacked);
+  if (!rows || !rows->extent || *rows->extent != 1 ||
+      rows->role != LogicalAxisRole::Free || !reduction ||
+      !reduction->extent || *reduction->extent != 32 ||
+      reduction->role != LogicalAxisRole::Reduction || !groups ||
+      !groups->extent || *groups->extent != 8 ||
+      groups->role != LogicalAxisRole::Group || !packed ||
+      !packed->extent || *packed->extent != 2 ||
+      packed->role != LogicalAxisRole::Packed)
     return std::nullopt;
 
   std::optional<RVVVectorShape> scaleShape =
@@ -1822,16 +1855,15 @@ selectGroupedAffineI4I8Physical(
   selected.widenedShape = kRVVE16M2;
   selected.reductionShape = kRVVE32M1;
 
-  CoreMappingProblem problem;
-  problem.axes = {
-      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, 1, false,
-                            false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32,
-                            false, true, true, {1, 2}},
-      LogicalAxisConstraint{kCoreAxisGroup, LogicalAxisRole::Group, 8, false,
-                            false, false, {1}},
-      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed, 2,
-                            false, false, false, {1}}};
+  CoreMappingProblem problem = facts.mapping;
+  for (LogicalAxisConstraint &constraint : problem.axes) {
+    constraint.allowLane = constraint.id == kCoreAxisK;
+    constraint.requireLane = constraint.allowLane;
+    constraint.registerFactors =
+        constraint.id == kCoreAxisK
+            ? llvm::SmallVector<unsigned, 4>{1, 2}
+            : llvm::SmallVector<unsigned, 4>{1};
+  }
   problem.laneSEW = 8;
   problem.laneInstruction = CoreInstructionKind::RVVWideningIntegerDot;
   problem.laneShapeCandidates = {selected.packedShape};

@@ -773,6 +773,32 @@ bool isFloatConstant(mlir::Value value, double expected) {
   return floating && floating.getValueAsDouble() == expected;
 }
 
+CoreMappingProblem i4I8BlockProductMapping(unsigned rowExtent) {
+  CoreMappingProblem problem;
+  problem.axes = {
+      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, rowExtent,
+                            false, false, false, {rowExtent}},
+      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free, 16, false,
+                            false, false, {1}},
+      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32, false,
+                            false, false, {1}}};
+  return problem;
+}
+
+CoreMappingProblem groupedAffineI4I8Mapping() {
+  CoreMappingProblem problem;
+  problem.axes = {
+      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, 1, false,
+                            false, false, {1}},
+      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction, 32, false,
+                            false, false, {1, 2}},
+      LogicalAxisConstraint{kCoreAxisGroup, LogicalAxisRole::Group, 8, false,
+                            false, false, {1}},
+      LogicalAxisConstraint{kCoreAxisPacked, LogicalAxisRole::Packed, 2, false,
+                            false, false, {1}}};
+  return problem;
+}
+
 class KernelCompiler {
 public:
   KernelCompiler(KernelOp kernel, const RISCVLoweringOptions &options,
@@ -3400,8 +3426,7 @@ private:
     if (mlir::failed(requireEntityPlan(op.getOperation(), found->second)))
       return mlir::failure();
     const SelectedSortIndicesPhysical &decision = found->second.realization;
-    if (decision.structure != SortIndicesStructure::StableF32Radix ||
-        (decision.radixBits != 8 && decision.radixBits != 11) ||
+    if ((decision.radixBits != 8 && decision.radixBits != 11) ||
         decision.passes !=
             (32 + decision.radixBits - 1) / decision.radixBits)
       return op.emitError("sort_indices decision has no intrinsic-C spelling");
@@ -7648,41 +7673,40 @@ private:
       SymmetricI4I8DotOp op, SymmetricI4I8Decision &decision) {
     std::optional<LocalBlockMemoryFact> activation =
         resolveLocalBlockMemoryFact(op.getActivation());
-    if (!activation)
+    BlockType initType = mlir::dyn_cast<BlockType>(op.getInit().getType());
+    if (!activation || !initType ||
+        (initType.getShape().size() != 1 && initType.getShape().size() != 2))
       return op.emitError(
-          "symmetric i4/i8 dot requires one typed K32 activation memory fact");
-    unsigned rowTile = activation->semanticExtent == 128 ? 4 : 1;
-    if ((activation->semanticExtent != 32 &&
-         activation->semanticExtent != 128) ||
-        activation->storageExtent != activation->semanticExtent ||
+          "symmetric i4/i8 dot requires typed activation and result block facts");
+    const unsigned rowExtent = initType.getShape().size() == 2
+                                   ? static_cast<unsigned>(initType.getShape()[0])
+                                   : 1;
+    const int64_t activationExtent = static_cast<int64_t>(rowExtent) * 32;
+    if (activation->semanticExtent != activationExtent ||
+        activation->storageExtent != activationExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
           "symmetric i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
     std::optional<LocalBlockMemoryFact> activationScale;
-    if (rowTile == 4) {
+    if (rowExtent > 1) {
       activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
-      if (!activationScale || activationScale->semanticExtent != 4 ||
-          activationScale->storageExtent != 4 ||
+      if (!activationScale ||
+          activationScale->semanticExtent != static_cast<int64_t>(rowExtent) ||
+          activationScale->storageExtent != static_cast<int64_t>(rowExtent) ||
           !activationScale->semanticType.getElementType().isF32() ||
           !activationScale->storageType.getElementType().isF32())
         return op.emitError(
             "symmetric M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({rowTile, false}, options.target,
-                                   options.backend);
+        selectI4I8FragmentPhysical(
+            {i4I8BlockProductMapping(rowExtent), false}, options.target,
+            options.backend);
     if (!physical)
       return op.emitError(
           "symmetric i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
-    mlir::Value packedRoot = pointerRoot(packedBase);
-    auto packedType =
-        packedRoot ? mlir::dyn_cast<PtrType>(packedRoot.getType()) : PtrType{};
-    if (!packedType || packedType.getStorageClass() != "persistent" ||
-        packedType.getStorageFormat() != "q4_0_n16_k32_288b")
-      return op.emitError(
-          "symmetric i4/i8 dot requires persistent format q4_0_n16_k32_288b");
     decision = SymmetricI4I8Decision{};
     decision.implementation = physical->implementation;
     decision.codeShape = physical->codeShape;
@@ -7696,7 +7720,7 @@ private:
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
-    decision.rowTile = rowTile;
+    decision.rowTile = rowExtent;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();
@@ -8178,13 +8202,9 @@ private:
       return op.emitError(
           "grouped affine i4/i8 dot requires contiguous all-active local block memory facts");
 
-    GroupedAffineI4I8CandidateFacts facts{
-        static_cast<unsigned>(packedWeight->semanticExtent),
-        static_cast<unsigned>(scaleMin->semanticExtent),
-        static_cast<unsigned>(activation->semanticExtent),
-        static_cast<unsigned>(activationSum->semanticExtent)};
     std::optional<SelectedGroupedAffineI4I8Physical> selected =
-        selectGroupedAffineI4I8Physical(facts, options.target);
+        selectGroupedAffineI4I8Physical(
+            {groupedAffineI4I8Mapping()}, options.target);
     if (!selected)
       return op.emitError(
           "grouped affine i4/i8 dot has no resource-legal RVV realization for the target");
@@ -8757,41 +8777,40 @@ private:
       AffineI4I8DotOp op, AffineI4I8Decision &decision) {
     std::optional<LocalBlockMemoryFact> activation =
         resolveLocalBlockMemoryFact(op.getActivation());
-    if (!activation)
+    BlockType initType = mlir::dyn_cast<BlockType>(op.getInit().getType());
+    if (!activation || !initType ||
+        (initType.getShape().size() != 1 && initType.getShape().size() != 2))
       return op.emitError(
-          "affine i4/i8 dot requires one typed K32 activation memory fact");
-    unsigned rowTile = activation->semanticExtent == 128 ? 4 : 1;
-    if ((activation->semanticExtent != 32 &&
-         activation->semanticExtent != 128) ||
-        activation->storageExtent != activation->semanticExtent ||
+          "affine i4/i8 dot requires typed activation and result block facts");
+    const unsigned rowExtent = initType.getShape().size() == 2
+                                   ? static_cast<unsigned>(initType.getShape()[0])
+                                   : 1;
+    const int64_t activationExtent = static_cast<int64_t>(rowExtent) * 32;
+    if (activation->semanticExtent != activationExtent ||
+        activation->storageExtent != activationExtent ||
         !activation->semanticType.getElementType().isSignedInteger(8) ||
         !activation->storageType.getElementType().isSignedInteger(8))
       return op.emitError(
           "affine i4/i8 dot requires contiguous signed-i8 K32 or interleaved M4K32 activation memory");
     std::optional<LocalBlockMemoryFact> activationScale;
-    if (rowTile == 4) {
+    if (rowExtent > 1) {
       activationScale = resolveLocalBlockMemoryFact(op.getActivationScale());
-      if (!activationScale || activationScale->semanticExtent != 4 ||
-          activationScale->storageExtent != 4 ||
+      if (!activationScale ||
+          activationScale->semanticExtent != static_cast<int64_t>(rowExtent) ||
+          activationScale->storageExtent != static_cast<int64_t>(rowExtent) ||
           !activationScale->semanticType.getElementType().isF32() ||
           !activationScale->storageType.getElementType().isF32())
         return op.emitError(
             "affine M4 i4/i8 dot requires contiguous f32 block<4> scales");
     }
     std::optional<SelectedI4I8FragmentPhysical> physical =
-        selectI4I8FragmentPhysical({rowTile, true}, options.target,
-                                   options.backend);
+        selectI4I8FragmentPhysical(
+            {i4I8BlockProductMapping(rowExtent), true}, options.target,
+            options.backend);
     if (!physical)
       return op.emitError(
           "affine i4/i8 dot has no legal target fragment for its row tile");
     mlir::Value packedBase = op.getPackedBase();
-    mlir::Value packedRoot = pointerRoot(packedBase);
-    auto packedType =
-        packedRoot ? mlir::dyn_cast<PtrType>(packedRoot.getType()) : PtrType{};
-    if (!packedType || packedType.getStorageClass() != "persistent" ||
-        packedType.getStorageFormat() != "affine_i4_n16_k32_304b")
-      return op.emitError(
-          "affine i4/i8 dot requires persistent format affine_i4_n16_k32_304b");
     decision = AffineI4I8Decision{};
     decision.operation = op.getOperation();
     decision.implementation = physical->implementation;
@@ -8806,7 +8825,7 @@ private:
     decision.activation = op.getActivation();
     decision.activationScale = op.getActivationScale();
     decision.init = op.getInit();
-    decision.rowTile = rowTile;
+    decision.rowTile = rowExtent;
     if (mlir::failed(selectMaterializedBlockStorage(op.getInit(),
                                                    op.getOperation())))
       return mlir::failure();

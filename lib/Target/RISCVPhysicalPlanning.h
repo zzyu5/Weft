@@ -216,17 +216,12 @@ selectMaterializedBlockStorePhysical(
     const MaterializedBlockStoreCandidateFacts &facts,
     const RISCVTargetProfile &target);
 
-enum class SortIndicesStructure {
-  StableF32Radix,
-};
-
 struct SortIndicesCandidateFacts {
   bool descending = false;
   int64_t configuredRadixBits = 0;
 };
 
 struct SelectedSortIndicesPhysical {
-  SortIndicesStructure structure = SortIndicesStructure::StableF32Radix;
   bool descending = false;
   unsigned radixBits = 0;
   unsigned passes = 0;
@@ -508,7 +503,7 @@ std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const RISCVTargetProfile &target);
 
 struct I4I8FragmentCandidateFacts {
-  unsigned rowTile = 1;
+  CoreMappingProblem mapping;
   bool affine = false;
 };
 
@@ -708,10 +703,7 @@ std::optional<SelectedE2M1E8M0I8Physical>
 selectE2M1E8M0I8Physical(const RISCVTargetProfile &target);
 
 struct GroupedAffineI4I8CandidateFacts {
-  unsigned packedExtent = 0;
-  unsigned scaleExtent = 0;
-  unsigned activationExtent = 0;
-  unsigned activationSumExtent = 0;
+  CoreMappingProblem mapping;
 };
 
 struct SelectedGroupedAffineI4I8Physical {
