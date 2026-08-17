@@ -2,6 +2,7 @@
 #define WEFT_LIB_TARGET_RISCVPHYSICALPLANNING_H
 
 #include "RISCVAxisMapping.h"
+#include "RISCVKernelFacts.h"
 #include "Weft/Target/RISCVLowering.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -13,8 +14,6 @@
 #include <tuple>
 
 namespace weft::riscv_internal {
-
-enum class LaneRelation;
 
 bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
                         const RISCVTargetProfile &target);
@@ -91,6 +90,45 @@ enum class BlockBinarySemantic {
   Multiply,
 };
 
+enum class PhysicalMemoryMode {
+  UnitStride,
+  Strided,
+  Indexed,
+  Segment2,
+};
+
+enum class PhysicalActivityMode {
+  AllActive,
+  PredicateMask,
+  ScalarPredicate,
+};
+
+enum class PhysicalInactiveLaneRealization {
+  ExplicitPassthrough,
+  ZeroCarrierWithLogicalValidity,
+};
+
+struct BlockMemoryCandidateFacts {
+  LaneRelation relation = LaneRelation::Independent;
+  bool write = false;
+  bool predicateAllActive = false;
+  bool predicateVector = false;
+  unsigned elementSEW = 0;
+  unsigned indexSEW = 0;
+};
+
+struct SelectedBlockMemoryPhysical {
+  PhysicalMemoryMode memoryMode = PhysicalMemoryMode::UnitStride;
+  PhysicalActivityMode activityMode = PhysicalActivityMode::AllActive;
+  PhysicalInactiveLaneRealization inactiveLane =
+      PhysicalInactiveLaneRealization::ExplicitPassthrough;
+  unsigned indexedSEW = 0;
+};
+
+std::optional<SelectedBlockMemoryPhysical>
+selectBlockMemoryPhysical(const BlockMemoryCandidateFacts &facts,
+                          const RISCVTargetProfile &target);
+
 struct BlockOperationCandidateFacts {
   BlockOperationSemantic operation = BlockOperationSemantic::Other;
   BlockBinarySemantic binary = BlockBinarySemantic::Other;
@@ -111,6 +149,7 @@ struct BlockOperationCandidateFacts {
   std::optional<uint64_t> rhsUnsignedMaximum;
   std::optional<uint64_t> resultUnsignedMaximum;
   std::optional<unsigned> shiftAmount;
+  std::optional<BlockMemoryCandidateFacts> memory;
 };
 
 struct SelectedBlockOperationPhysical {
@@ -119,6 +158,7 @@ struct SelectedBlockOperationPhysical {
   RVVVectorShape temporaryShape;
   std::optional<uint64_t> unsignedMaximum;
   unsigned maskRatio = 0;
+  std::optional<SelectedBlockMemoryPhysical> memory;
 };
 
 std::optional<SelectedBlockOperationPhysical>
@@ -207,24 +247,6 @@ std::optional<SelectedSortIndicesPhysical>
 selectSortIndicesPhysical(const SortIndicesCandidateFacts &facts,
                           const RISCVTargetProfile &target);
 
-enum class VLAMemoryMode {
-  UnitStride,
-  Strided,
-  Indexed,
-  Segment2,
-};
-
-enum class VLAActivityMode {
-  AllActive,
-  PredicateMask,
-  ScalarPredicate,
-};
-
-enum class VLAInactiveLaneRealization {
-  ExplicitPassthrough,
-  ZeroCarrierWithLogicalValidity,
-};
-
 struct VLAAccessCandidateFacts {
   LaneRelation relation;
   bool write = false;
@@ -236,10 +258,10 @@ struct VLAAccessCandidateFacts {
 };
 
 struct SelectedVLAAccessPhysical {
-  VLAMemoryMode memoryMode = VLAMemoryMode::UnitStride;
-  VLAActivityMode activityMode = VLAActivityMode::AllActive;
-  VLAInactiveLaneRealization inactiveLane =
-      VLAInactiveLaneRealization::ExplicitPassthrough;
+  PhysicalMemoryMode memoryMode = PhysicalMemoryMode::UnitStride;
+  PhysicalActivityMode activityMode = PhysicalActivityMode::AllActive;
+  PhysicalInactiveLaneRealization inactiveLane =
+      PhysicalInactiveLaneRealization::ExplicitPassthrough;
   unsigned indexedSEW = 0;
 };
 
@@ -285,7 +307,7 @@ struct VLAPredicateCandidateFacts {
 struct SelectedVLAPredicatePhysical {
   VLAPredicateRealization realization =
       VLAPredicateRealization::RVVAffineIndexScalar;
-  VLAMemoryMode coordinateMode = VLAMemoryMode::UnitStride;
+  PhysicalMemoryMode coordinateMode = PhysicalMemoryMode::UnitStride;
   unsigned vectorSEW = 0;
 };
 

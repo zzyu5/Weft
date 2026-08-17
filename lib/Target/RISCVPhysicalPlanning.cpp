@@ -371,6 +371,11 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
     selected.resultShape = sameLanes(16).value_or(RVVVectorShape{});
     break;
   case BlockOperationSemantic::Load:
+    if (!facts.memory)
+      return std::nullopt;
+    selected.memory = selectBlockMemoryPhysical(*facts.memory, target);
+    if (!selected.memory)
+      return std::nullopt;
     if (facts.resultType == BlockPhysicalType::U8)
       selected.resultShape = facts.byteShape;
     break;
@@ -485,6 +490,34 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
   }
   if (!selected.resultShape)
     return std::nullopt;
+  return selected;
+}
+
+std::optional<SelectedBlockMemoryPhysical>
+selectBlockMemoryPhysical(const BlockMemoryCandidateFacts &facts,
+                          const RISCVTargetProfile &target) {
+  if (!target.hasRVV || (facts.elementSEW != 8 && facts.elementSEW != 32))
+    return std::nullopt;
+
+  SelectedBlockMemoryPhysical selected;
+  if (facts.relation == LaneRelation::UnitStride) {
+    selected.memoryMode = PhysicalMemoryMode::UnitStride;
+  } else if (facts.relation == LaneRelation::Indexed &&
+             target.hasIndexedMemory && facts.indexSEW == 16) {
+    selected.memoryMode = PhysicalMemoryMode::Indexed;
+    selected.indexedSEW = facts.indexSEW;
+  } else {
+    return std::nullopt;
+  }
+
+  if (facts.predicateAllActive) {
+    selected.activityMode = PhysicalActivityMode::AllActive;
+  } else if (!facts.write && facts.predicateVector &&
+             selected.memoryMode == PhysicalMemoryMode::Indexed) {
+    selected.activityMode = PhysicalActivityMode::PredicateMask;
+  } else {
+    return std::nullopt;
+  }
   return selected;
 }
 
@@ -773,15 +806,15 @@ selectVLAAccessPhysical(const VLAAccessCandidateFacts &facts,
   SelectedVLAAccessPhysical selected;
   switch (facts.relation) {
   case LaneRelation::UnitStride:
-    selected.memoryMode = VLAMemoryMode::UnitStride;
+    selected.memoryMode = PhysicalMemoryMode::UnitStride;
     break;
   case LaneRelation::Strided:
-    selected.memoryMode = VLAMemoryMode::Strided;
+    selected.memoryMode = PhysicalMemoryMode::Strided;
     break;
   case LaneRelation::Indexed:
     if (!target.hasIndexedMemory)
       return std::nullopt;
-    selected.memoryMode = VLAMemoryMode::Indexed;
+    selected.memoryMode = PhysicalMemoryMode::Indexed;
     selected.indexedSEW =
         facts.indexedOffsetFromU32 ? 32 : static_cast<unsigned>(target.xlen);
     if (selected.indexedSEW != 32 && selected.indexedSEW != 64)
@@ -792,18 +825,18 @@ selectVLAAccessPhysical(const VLAAccessCandidateFacts &facts,
     return std::nullopt;
   }
   if (facts.predicateAllActive)
-    selected.activityMode = VLAActivityMode::AllActive;
+    selected.activityMode = PhysicalActivityMode::AllActive;
   else if (facts.predicateVector)
-    selected.activityMode = VLAActivityMode::PredicateMask;
+    selected.activityMode = PhysicalActivityMode::PredicateMask;
   else if (facts.predicateScalar)
-    selected.activityMode = VLAActivityMode::ScalarPredicate;
+    selected.activityMode = PhysicalActivityMode::ScalarPredicate;
   else
     return std::nullopt;
   if (facts.carriesLogicalValidity) {
-    if (selected.activityMode == VLAActivityMode::AllActive)
+    if (selected.activityMode == PhysicalActivityMode::AllActive)
       return std::nullopt;
     selected.inactiveLane =
-        VLAInactiveLaneRealization::ZeroCarrierWithLogicalValidity;
+        PhysicalInactiveLaneRealization::ZeroCarrierWithLogicalValidity;
   }
   return selected;
 }
@@ -833,8 +866,8 @@ selectVLAPredicatePhysical(const VLAPredicateCandidateFacts &facts,
     selected.realization = VLAPredicateRealization::RVVAffineIndexScalar;
     selected.coordinateMode =
         facts.coordinateRelation == LaneRelation::UnitStride
-            ? VLAMemoryMode::UnitStride
-            : VLAMemoryMode::Strided;
+            ? PhysicalMemoryMode::UnitStride
+            : PhysicalMemoryMode::Strided;
     return selected;
   }
   if (facts.vectorSEW != 8 && facts.vectorSEW != 32 &&
