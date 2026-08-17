@@ -3030,15 +3030,14 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
   if (!reductionExtent)
     return std::nullopt;
   const unsigned preferredUnroll =
-      *reductionExtent < 32 ? 1 : baseInputLanes >= 16 ? 4 : 2;
+      *reductionExtent < 32 ? 1 : baseInputLanes >= 16 ? 1 : 2;
   const unsigned preferredBuffers =
-      *reductionExtent >= 64 && llvm::is_contained(legalPipelineBuffers, 2u)
+      preferredUnroll >= 2 && *reductionExtent >= 64 &&
+              llvm::is_contained(legalPipelineBuffers, 2u)
           ? 2
           : 1;
   const unsigned preferredColumns =
-      baseInputLanes <= 8 && columnTile >= 2 && columnTile % 2 == 0
-          ? 2
-          : 1;
+      columnTile >= 2 && columnTile % 2 == 0 ? 2 : 1;
   struct Candidate {
     CorePhysicalMapping mapping;
     LocalMicrokernelSchedule schedule;
