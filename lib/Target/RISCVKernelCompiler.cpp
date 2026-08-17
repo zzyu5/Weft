@@ -531,6 +531,7 @@ struct VLARegionDecision {
   CorePhysicalMapping mapping;
   mlir::Value coordinate;
   std::vector<VLAPredicateDecision> predicates;
+  llvm::SmallVector<mlir::Operation *, 8> hoistedAddressOperations;
   std::vector<VLAAccessDecision> accesses;
   std::vector<VLASegment2Decision> segment2;
   std::vector<VLALookupDecision> lookups;
@@ -2381,6 +2382,11 @@ private:
       access.storeValueMode = storeValueMode;
       access.predicate = predicate;
       access.laneStride = axis->laneStride;
+      if (axis->pointerBase)
+        for (mlir::Operation *hoisted :
+             axis->pointerBase->hoistedOperations)
+          if (!llvm::is_contained(decision.hoistedAddressOperations, hoisted))
+            decision.hoistedAddressOperations.push_back(hoisted);
       const bool carriesValidity =
           mlir::isa<LoadOp>(operation) &&
           mlir::isa<MaskedType>(operation->getResult(0).getType());
@@ -4325,6 +4331,8 @@ private:
       coordinate.laneStride = "1";
       values[body.getArgument(0)] = std::move(coordinate);
       for (mlir::Operation &nested : body.without_terminator()) {
+        if (llvm::is_contained(decision.hoistedAddressOperations, &nested))
+          continue;
         if (auto reduce = mlir::dyn_cast<ReduceOp>(nested)) {
           const VLAStateDecision *state =
               findStateDecision(reduce.getOperation());
@@ -4368,6 +4376,14 @@ private:
       return mlir::success();
     };
 
+    const bool guardedHoist = !decision.hoistedAddressOperations.empty();
+    if (guardedHoist) {
+      line("if (" + begin.spelling + " < " + end.spelling + ") {");
+      ++indent;
+      for (mlir::Operation *hoisted : decision.hoistedAddressOperations)
+        if (mlir::failed(emitOperation(hoisted)))
+          return mlir::failure();
+    }
     line("for (size_t " + strip + " = " + begin.spelling + "; " + strip +
          " < " + end.spelling + ";) {");
     ++indent;
@@ -4378,6 +4394,10 @@ private:
     line(strip + " += " + vl + ";");
     --indent;
     line("}");
+    if (guardedHoist) {
+      --indent;
+      line("}");
+    }
 
     for (const VLAStateDecision &state : decision.states) {
       if (state.physical.carry != VLAStateCarryRepresentation::Vector ||

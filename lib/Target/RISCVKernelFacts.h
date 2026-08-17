@@ -37,10 +37,16 @@ struct AffineScalarExpression {
   std::shared_ptr<const AffineScalarExpression> rhs;
 };
 
+struct CoordinateInvariantPointerBaseFact {
+  mlir::Value value;
+  llvm::SmallVector<mlir::Operation *, 4> hoistedOperations;
+};
+
 struct MemoryAxisFact {
   LaneRelation relation = LaneRelation::Independent;
   std::optional<AffineScalarExpression> laneStride;
   mlir::Value indexedOffset;
+  std::optional<CoordinateInvariantPointerBaseFact> pointerBase;
 };
 
 struct InterleavedMemoryFact {

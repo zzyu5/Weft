@@ -98,6 +98,78 @@ bool dependsOn(mlir::Value value, mlir::Value target) {
   return dependsOn(value, target, visited);
 }
 
+mlir::Value pointerRoot(mlir::Value value);
+
+bool isAvailableBeforeVLA(mlir::Value value, VLAOp vla) {
+  if (!value || !vla)
+    return false;
+  if (mlir::Operation *definition = value.getDefiningOp())
+    return definition != vla.getOperation() &&
+           !vla->isAncestor(definition);
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  mlir::Operation *parent =
+      argument ? argument.getOwner()->getParentOp() : nullptr;
+  return parent && parent != vla.getOperation() && !vla->isAncestor(parent);
+}
+
+mlir::Value findCoordinateInvariantPointerBase(mlir::Value pointer,
+                                               mlir::Value coordinate,
+                                               mlir::Value indexedOffset) {
+  auto add = pointer.getDefiningOp<PtrAddOp>();
+  if (!add)
+    return {};
+  LaneRelation base = classifyLaneRelation(add.getBase(), coordinate);
+  LaneRelation offset = classifyLaneRelation(add.getOffset(), coordinate);
+  if (base == LaneRelation::Independent &&
+      (offset != LaneRelation::Independent || add.getOffset() == indexedOffset))
+    return add.getBase();
+  return {};
+}
+
+bool collectHoistedPointerOperations(
+    mlir::Value value, mlir::Value coordinate, VLAOp vla,
+    llvm::DenseSet<mlir::Operation *> &visited,
+    llvm::SmallVectorImpl<mlir::Operation *> &operations) {
+  if (isAvailableBeforeVLA(value, vla))
+    return true;
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getBlock() != &vla.getBody().front() ||
+      dependsOn(value, coordinate) ||
+      !mlir::isa<ConstantOp, BinaryOp, CastOp, ExpandDimsOp, PtrAddOp>(
+          definition))
+    return false;
+  if (!visited.insert(definition).second)
+    return true;
+  for (mlir::Value operand : definition->getOperands())
+    if (!collectHoistedPointerOperations(operand, coordinate, vla, visited,
+                                         operations))
+      return false;
+  operations.push_back(definition);
+  return true;
+}
+
+std::optional<CoordinateInvariantPointerBaseFact>
+deriveCoordinateInvariantPointerBase(mlir::Value pointer,
+                                     mlir::Value coordinate,
+                                     mlir::Value indexedOffset) {
+  auto coordinateArgument = mlir::dyn_cast<mlir::BlockArgument>(coordinate);
+  VLAOp vla = coordinateArgument
+                  ? mlir::dyn_cast_or_null<VLAOp>(
+                        coordinateArgument.getOwner()->getParentOp())
+                  : VLAOp{};
+  mlir::Value base =
+      findCoordinateInvariantPointerBase(pointer, coordinate, indexedOffset);
+  if (!vla || !base || !mlir::isa<PtrType>(base.getType()))
+    return std::nullopt;
+  llvm::DenseSet<mlir::Operation *> visited;
+  llvm::SmallVector<mlir::Operation *, 4> operations;
+  if (!collectHoistedPointerOperations(base, coordinate, vla, visited,
+                                       operations) ||
+      operations.empty())
+    return std::nullopt;
+  return CoordinateInvariantPointerBaseFact{base, std::move(operations)};
+}
+
 std::optional<AffineScalarExpression>
 deriveLaneStride(mlir::Value value, mlir::Value coordinate) {
   if (value == coordinate)
@@ -157,10 +229,10 @@ deriveLaneStride(mlir::Value value, mlir::Value coordinate) {
 }
 
 mlir::Value pointerRoot(mlir::Value value) {
-  if (mlir::isa<PtrType>(value.getType()))
-    return value;
   auto pointer = value.getDefiningOp<PtrAddOp>();
-  return pointer ? pointerRoot(pointer.getBase()) : mlir::Value{};
+  if (pointer)
+    return pointerRoot(pointer.getBase());
+  return mlir::isa<PtrType>(value.getType()) ? value : mlir::Value{};
 }
 
 struct AffineAddressTerms {
@@ -565,6 +637,10 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
         axisFact.laneStride = deriveLaneStride(pointer, axis.first);
       if (axisFact.relation == LaneRelation::Indexed)
         axisFact.indexedOffset = findIndexedOffset(pointer, axis.first);
+      if (axisFact.relation != LaneRelation::Independent &&
+          axisFact.relation != LaneRelation::NonAffine)
+        axisFact.pointerBase = deriveCoordinateInvariantPointerBase(
+            pointer, axis.first, axisFact.indexedOffset);
       fact.axes.try_emplace(axis.first, std::move(axisFact));
       if (std::optional<InterleavedMemoryFact> interleaved =
               deriveInterleavedMemoryFact(pointer, axis.first))
