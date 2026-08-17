@@ -842,12 +842,13 @@ std::optional<SelectedVLASegment2Physical>
 selectVLASegment2Physical(const VLASegment2CandidateFacts &facts,
                           const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasSegmentMemory || facts.fields != 2 ||
+      facts.coordinateScale != static_cast<int64_t>(facts.fields) ||
       facts.elementSEW != 32)
     return std::nullopt;
   return SelectedVLASegment2Physical{
       facts.load ? VLASegment2AccessKind::Load
                  : VLASegment2AccessKind::Store,
-      facts.load, 2, facts.fields, facts.elementSEW};
+      facts.load, facts.coordinateScale, facts.fields, facts.elementSEW};
 }
 
 std::optional<SelectedVLAPredicatePhysical>

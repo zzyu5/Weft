@@ -86,11 +86,30 @@ struct MemoryAccessFact {
   llvm::DenseMap<mlir::Value, InterleavedMemoryFact> interleaved;
 };
 
+struct IndexedMemoryGroupFact {
+  mlir::Value coordinate;
+  mlir::Value indexedOffset;
+  unsigned elementBytes = 0;
+  llvm::SmallVector<mlir::Operation *, 4> accesses;
+};
+
+struct InterleavedMemoryGroupFact {
+  mlir::Value coordinate;
+  mlir::Value base;
+  int64_t coordinateScale = 0;
+  unsigned fields = 0;
+  mlir::Type elementType;
+  bool write = false;
+  llvm::SmallVector<mlir::Operation *, 4> accesses;
+};
+
 struct KernelPhysicalFacts {
   llvm::DenseMap<int64_t, mlir::Value> blockAxes;
   llvm::DenseMap<mlir::Value, LogicalAxisFact> axes;
   llvm::DenseMap<mlir::Value, ValueUseFact> values;
   llvm::DenseMap<mlir::Operation *, MemoryAccessFact> memory;
+  llvm::SmallVector<IndexedMemoryGroupFact, 4> indexedMemoryGroups;
+  llvm::SmallVector<InterleavedMemoryGroupFact, 4> interleavedMemoryGroups;
   llvm::DenseMap<mlir::Operation *, unsigned> operationOrdinals;
 };
 

@@ -2475,88 +2475,50 @@ private:
       }
     }
 
-    struct SegmentFieldCandidate {
-      VLAAccessDecision *access = nullptr;
-      const InterleavedMemoryFact *address = nullptr;
+    auto findAccess = [&](mlir::Operation *operation) -> VLAAccessDecision * {
+      auto found = llvm::find_if(
+          decision.accesses, [&](const VLAAccessDecision &access) {
+            return access.operation == operation;
+          });
+      return found == decision.accesses.end() ? nullptr : &*found;
     };
-    llvm::SmallVector<SegmentFieldCandidate> segmentFields;
-    for (VLAAccessDecision &access : decision.accesses) {
-      const MemoryAccessFact *memory = memoryFact(access.operation);
-      if (!memory || !access.elementType.isF32() ||
-          access.activityMode != PhysicalActivityMode::AllActive ||
-          access.memoryMode != PhysicalMemoryMode::Strided)
+    for (const InterleavedMemoryGroupFact &group :
+         kernelFacts.interleavedMemoryGroups) {
+      if (group.coordinate != decision.coordinate || group.accesses.size() != 2)
         continue;
-      auto interleaved = memory->interleaved.find(decision.coordinate);
-      if (interleaved == memory->interleaved.end())
+      VLAAccessDecision *field0 = findAccess(group.accesses[0]);
+      VLAAccessDecision *field1 = findAccess(group.accesses[1]);
+      if (!field0 || !field1 || !field0->elementType.isF32() ||
+          field0->elementType != field1->elementType ||
+          field0->activityMode != PhysicalActivityMode::AllActive ||
+          field1->activityMode != PhysicalActivityMode::AllActive ||
+          field0->memoryMode != PhysicalMemoryMode::Strided ||
+          field1->memoryMode != PhysicalMemoryMode::Strided)
         continue;
-      segmentFields.push_back(
-          SegmentFieldCandidate{&access, &interleaved->second});
-    }
-    llvm::DenseSet<mlir::Operation *> pairedSegmentAccesses;
-    auto hasInterveningEffect = [](mlir::Operation *lhs,
-                                   mlir::Operation *rhs) {
-      mlir::Operation *first = lhs->isBeforeInBlock(rhs) ? lhs : rhs;
-      mlir::Operation *second = first == lhs ? rhs : lhs;
-      for (mlir::Operation *operation = first->getNextNode();
-           operation && operation != second;
-           operation = operation->getNextNode())
-        if (!mlir::isMemoryEffectFree(operation))
-          return true;
-      return false;
-    };
-    for (SegmentFieldCandidate &first : segmentFields) {
-      if (pairedSegmentAccesses.contains(first.access->operation))
+      std::optional<SelectedVLASegment2Physical> physical =
+          selectVLASegment2Physical(
+              {!group.write, group.coordinateScale, group.fields, 32},
+              options.target);
+      if (!physical)
         continue;
-      for (SegmentFieldCandidate &second : segmentFields) {
-        if (&first == &second ||
-            pairedSegmentAccesses.contains(second.access->operation) ||
-            first.access->operation->getBlock() !=
-                second.access->operation->getBlock() ||
-            !haveSameInterleavedInvariantAddress(*first.address,
-                                                 *second.address) ||
-            first.address->field == second.address->field ||
-            mlir::isa<LoadOp>(first.access->operation) !=
-                mlir::isa<LoadOp>(second.access->operation) ||
-            hasInterveningEffect(first.access->operation,
-                                 second.access->operation))
-          continue;
-        VLAAccessDecision *field0 =
-            first.address->field == 0 ? first.access : second.access;
-        VLAAccessDecision *field1 =
-            first.address->field == 1 ? first.access : second.access;
-        bool loadPair = mlir::isa<LoadOp>(field0->operation);
-        std::optional<SelectedVLASegment2Physical> physical =
-            selectVLASegment2Physical({loadPair, first.address->fields,
-                                       static_cast<unsigned>(32)},
-                                      options.target);
-        if (!physical)
-          continue;
-        mlir::Operation *earlier =
-            field0->operation->isBeforeInBlock(field1->operation)
-                ? field0->operation
-                : field1->operation;
-        mlir::Operation *later =
-            earlier == field0->operation ? field1->operation
-                                         : field0->operation;
-        mlir::Operation *emission =
-            physical->emitAtEarlierAccess ? earlier : later;
-        VLASegment2Decision segment;
-        segment.kind = physical->kind;
-        segment.field0 = field0->operation;
-        segment.field1 = field1->operation;
-        segment.emission = emission;
-        segment.base = first.address->field == 0 ? first.address->pointer
-                                                 : second.address->pointer;
-        segment.coordinateScale = physical->coordinateScale;
-        segment.fields = physical->fields;
-        segment.elementSEW = physical->elementSEW;
-        decision.segment2.push_back(std::move(segment));
-        field0->memoryMode = PhysicalMemoryMode::Segment2;
-        field1->memoryMode = PhysicalMemoryMode::Segment2;
-        pairedSegmentAccesses.insert(field0->operation);
-        pairedSegmentAccesses.insert(field1->operation);
-        break;
-      }
+      mlir::Operation *earlier =
+          field0->operation->isBeforeInBlock(field1->operation)
+              ? field0->operation
+              : field1->operation;
+      mlir::Operation *later = earlier == field0->operation ? field1->operation
+                                                            : field0->operation;
+      VLASegment2Decision segment;
+      segment.kind = physical->kind;
+      segment.field0 = field0->operation;
+      segment.field1 = field1->operation;
+      segment.emission = physical->emitAtEarlierAccess ? earlier : later;
+      segment.base = group.base;
+      segment.coordinateScale = physical->coordinateScale;
+      segment.fields = physical->fields;
+      segment.elementSEW = physical->elementSEW;
+      decision.segment2.push_back(std::move(segment));
+      field0->memoryMode = PhysicalMemoryMode::Segment2;
+      field1->memoryMode = PhysicalMemoryMode::Segment2;
     }
 
     for (mlir::Operation *nested : physicalOperations) {
@@ -3181,32 +3143,28 @@ private:
       }
     }
 
-    for (size_t firstIndex = 0; firstIndex < decision.accesses.size();
-         ++firstIndex) {
-      VLAAccessDecision &first = decision.accesses[firstIndex];
-      if (first.memoryMode != PhysicalMemoryMode::Indexed ||
-          first.indexedOffsetEmission)
+    for (const IndexedMemoryGroupFact &group :
+         kernelFacts.indexedMemoryGroups) {
+      if (group.coordinate != decision.coordinate)
         continue;
-      llvm::SmallVector<VLAAccessDecision *, 4> group{&first};
-      mlir::Operation *emission = first.operation;
-      for (size_t nextIndex = 0; nextIndex < decision.accesses.size();
-           ++nextIndex) {
-        if (nextIndex == firstIndex)
+      llvm::SmallVector<VLAAccessDecision *, 4> selectedAccesses;
+      for (mlir::Operation *operation : group.accesses) {
+        VLAAccessDecision *access = findAccess(operation);
+        if (!access || access->memoryMode != PhysicalMemoryMode::Indexed)
           continue;
-        VLAAccessDecision &next = decision.accesses[nextIndex];
-        if (next.memoryMode != PhysicalMemoryMode::Indexed ||
-            next.operation->getBlock() != first.operation->getBlock() ||
-            next.indexedOffset != first.indexedOffset ||
-            next.indexedShape != first.indexedShape ||
-            next.elementBytes != first.elementBytes)
-          continue;
-        group.push_back(&next);
-        if (next.operation->isBeforeInBlock(emission))
-          emission = next.operation;
+        if (access->indexedOffset != group.indexedOffset ||
+            access->elementBytes != group.elementBytes)
+          return operation->emitError(
+              "indexed memory decision conflicts with its shared address facts");
+        selectedAccesses.push_back(access);
       }
-      for (VLAAccessDecision *access : group) {
+      if (selectedAccesses.empty())
+        continue;
+      mlir::Operation *emission = selectedAccesses.front()->operation;
+      for (VLAAccessDecision *access : selectedAccesses) {
         access->indexedOffsetEmission = emission;
-        access->indexedOffsetReuseCount = static_cast<unsigned>(group.size());
+        access->indexedOffsetReuseCount =
+            static_cast<unsigned>(selectedAccesses.size());
       }
     }
 

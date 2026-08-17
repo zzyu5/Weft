@@ -283,6 +283,7 @@ enum class VLASegment2AccessKind {
 
 struct VLASegment2CandidateFacts {
   bool load = true;
+  int64_t coordinateScale = 2;
   unsigned fields = 2;
   unsigned elementSEW = 0;
 };

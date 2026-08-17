@@ -1,5 +1,7 @@
 #include "RISCVKernelFacts.h"
 
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseSet.h"
 
@@ -287,6 +289,28 @@ bool haveSameInterleavedInvariantAddress(const InterleavedMemoryFact &lhs,
   });
 }
 
+static unsigned elementBytes(mlir::Type type) {
+  type = elementType(type);
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+    return integer.getWidth() % 8 == 0 ? integer.getWidth() / 8 : 0;
+  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type))
+    return floating.getWidth() % 8 == 0 ? floating.getWidth() / 8 : 0;
+  return 0;
+}
+
+static bool hasInterveningMemoryEffect(mlir::Operation *lhs,
+                                       mlir::Operation *rhs) {
+  if (!lhs || !rhs || lhs->getBlock() != rhs->getBlock())
+    return true;
+  mlir::Operation *first = lhs->isBeforeInBlock(rhs) ? lhs : rhs;
+  mlir::Operation *second = first == lhs ? rhs : lhs;
+  for (mlir::Operation *operation = first->getNextNode();
+       operation && operation != second; operation = operation->getNextNode())
+    if (!mlir::isMemoryEffectFree(operation))
+      return true;
+  return false;
+}
+
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
   if (value == coordinate)
     return LaneRelation::UnitStride;
@@ -405,6 +429,8 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
   facts.axes.clear();
   facts.values.clear();
   facts.memory.clear();
+  facts.indexedMemoryGroups.clear();
+  facts.interleavedMemoryGroups.clear();
   facts.operationOrdinals.clear();
   unsigned ordinal = 0;
   kernel.walk([&](mlir::Operation *operation) {
@@ -546,6 +572,88 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
     }
     facts.memory.try_emplace(operation, std::move(fact));
   });
+
+  for (const auto &axisEntry : facts.axes) {
+    mlir::Value coordinate = axisEntry.first;
+    if (!axisEntry.second.vla)
+      continue;
+    llvm::SmallVector<MemoryAccessFact *, 8> accesses;
+    for (auto &memoryEntry : facts.memory)
+      if (memoryEntry.second.axes.contains(coordinate))
+        accesses.push_back(&memoryEntry.second);
+    llvm::sort(accesses, [&](const MemoryAccessFact *lhs,
+                             const MemoryAccessFact *rhs) {
+      return facts.operationOrdinals.lookup(lhs->operation) <
+             facts.operationOrdinals.lookup(rhs->operation);
+    });
+
+    llvm::DenseSet<mlir::Operation *> groupedIndexed;
+    for (MemoryAccessFact *first : accesses) {
+      const MemoryAxisFact &axis = first->axes.find(coordinate)->second;
+      const unsigned bytes = elementBytes(first->elementType);
+      if (axis.relation != LaneRelation::Indexed || !axis.indexedOffset ||
+          bytes == 0 || groupedIndexed.contains(first->operation))
+        continue;
+      IndexedMemoryGroupFact group;
+      group.coordinate = coordinate;
+      group.indexedOffset = axis.indexedOffset;
+      group.elementBytes = bytes;
+      for (MemoryAccessFact *next : accesses) {
+        const MemoryAxisFact &nextAxis = next->axes.find(coordinate)->second;
+        if (next->operation->getBlock() != first->operation->getBlock() ||
+            nextAxis.relation != LaneRelation::Indexed ||
+            nextAxis.indexedOffset != group.indexedOffset ||
+            elementBytes(next->elementType) != group.elementBytes)
+          continue;
+        group.accesses.push_back(next->operation);
+        groupedIndexed.insert(next->operation);
+      }
+      facts.indexedMemoryGroups.push_back(std::move(group));
+    }
+
+    llvm::DenseSet<mlir::Operation *> groupedInterleaved;
+    for (MemoryAccessFact *first : accesses) {
+      auto firstAddress = first->interleaved.find(coordinate);
+      if (firstAddress == first->interleaved.end() ||
+          groupedInterleaved.contains(first->operation))
+        continue;
+      for (MemoryAccessFact *second : accesses) {
+        auto secondAddress = second->interleaved.find(coordinate);
+        if (second == first || secondAddress == second->interleaved.end() ||
+            groupedInterleaved.contains(second->operation) ||
+            first->operation->getBlock() != second->operation->getBlock() ||
+            first->write != second->write ||
+            first->elementType != second->elementType ||
+            firstAddress->second.field == secondAddress->second.field ||
+            !haveSameInterleavedInvariantAddress(firstAddress->second,
+                                                 secondAddress->second) ||
+            hasInterveningMemoryEffect(first->operation, second->operation))
+          continue;
+        InterleavedMemoryGroupFact group;
+        group.coordinate = coordinate;
+        group.coordinateScale = firstAddress->second.coordinateScale;
+        group.fields = firstAddress->second.fields;
+        group.elementType = first->elementType;
+        group.write = first->write;
+        group.accesses.resize(group.fields);
+        if (firstAddress->second.field >= group.accesses.size() ||
+            secondAddress->second.field >= group.accesses.size())
+          continue;
+        group.accesses[firstAddress->second.field] = first->operation;
+        group.accesses[secondAddress->second.field] = second->operation;
+        if (llvm::any_of(group.accesses,
+                         [](mlir::Operation *access) { return !access; }))
+          continue;
+        group.base = firstAddress->second.field == 0
+                         ? firstAddress->second.pointer
+                         : secondAddress->second.pointer;
+        facts.interleavedMemoryGroups.push_back(std::move(group));
+        groupedInterleaved.insert(first->operation);
+        groupedInterleaved.insert(second->operation);
+        break;
+      }
+    }
+  }
   return mlir::success();
 }
 
