@@ -1251,13 +1251,15 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
             {PhysicalLiveClass::Predicate, {}, 1, snapshot.mask});
       return true;
     };
-    auto applyPhase = [&](llvm::ArrayRef<PhysicalLiveRange> extra) {
+    auto applyPhase = [&](llvm::ArrayRef<PhysicalLiveRange> extra,
+                          unsigned reservedGroups = 1) {
       VLAValueLifetimeSnapshot empty;
       llvm::ArrayRef<VLAValueLifetimeSnapshot> snapshots = facts.lifetimes;
       if (snapshots.empty())
         snapshots = llvm::ArrayRef<VLAValueLifetimeSnapshot>(&empty, 1);
       for (const VLAValueLifetimeSnapshot &snapshot : snapshots) {
         PhysicalResourceRequirements requirements;
+        requirements.reservedGroups = reservedGroups;
         requirements.live.append(persistent.begin(), persistent.end());
         requirements.live.append(extra.begin(), extra.end());
         if (!appendSnapshot(requirements, snapshot))
@@ -1404,16 +1406,9 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         continue;
     }
 
-    for (const PhysicalResourceBudget &resource :
-         facts.localPrimitiveResources) {
-      if (resource.peakGroups > static_cast<unsigned>(target.vectorRegisters)) {
-        resourceLegal = false;
-        break;
-      }
-      mergeBudget(resource);
-      if (resource.primitiveGroups != 0 &&
-          !applyPhase({PhysicalLiveRange{PhysicalLiveClass::Temporary, {}, 1,
-                                        resource.primitiveGroups}})) {
+    for (const PhysicalResourceRequirements &requirements :
+         facts.localPrimitiveRequirements) {
+      if (!applyPhase(requirements.live, requirements.reservedGroups)) {
         resourceLegal = false;
         break;
       }
@@ -2036,8 +2031,8 @@ selectGroupedAffineI4I8Physical(
   return std::move(legal.front().physical);
 }
 
-std::optional<PhysicalResourceBudget>
-calculateDenseMicrokernelResources(
+static std::optional<PhysicalResourceRequirements>
+denseMicrokernelRequirements(
     const DenseMicrokernelResourceFacts &facts,
     const RISCVTargetProfile &target) {
   if (!facts.inputShape || !facts.accumulatorShape ||
@@ -2064,12 +2059,18 @@ calculateDenseMicrokernelResources(
   if (facts.handoffGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
         PhysicalLiveClass::Handoff, {}, 1, facts.handoffGroups});
-  std::optional<PhysicalResourceBudget> resources =
-      calculatePhysicalResources(requirements, target);
-  if (!resources)
+  return requirements;
+}
+
+std::optional<PhysicalResourceBudget>
+calculateDenseMicrokernelResources(
+    const DenseMicrokernelResourceFacts &facts,
+    const RISCVTargetProfile &target) {
+  std::optional<PhysicalResourceRequirements> requirements =
+      denseMicrokernelRequirements(facts, target);
+  if (!requirements)
     return std::nullopt;
-  resources->primitiveGroups = resources->valueGroups + resources->memoryGroups;
-  return resources;
+  return calculatePhysicalResources(*requirements, target);
 }
 
 std::optional<SelectedF32DotPhysical>
@@ -2105,6 +2106,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
 
   struct Candidate {
     CorePhysicalMapping mapping;
+    PhysicalResourceRequirements requirements;
     PhysicalResourceBudget resources;
     unsigned tailPenalty = 0;
     unsigned sequentialPenalty = 0;
@@ -2140,14 +2142,16 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
     } else if (laneAxis->id == kCoreAxisN) {
       rhsVectorsPerWindow = 1;
     }
+    DenseMicrokernelResourceFacts resourceFacts{
+        mapping.laneShape, mapping.laneShape, accumulatorVectors,
+        lhsVectorsPerWindow, rhsVectorsPerWindow, reduction->unrollFactor,
+        facts.predicateGroups, facts.stateGroups, facts.handoffGroups};
+    std::optional<PhysicalResourceRequirements> requirements =
+        denseMicrokernelRequirements(resourceFacts, target);
     std::optional<PhysicalResourceBudget> resources =
-        calculateDenseMicrokernelResources(
-            {mapping.laneShape, mapping.laneShape, accumulatorVectors,
-             lhsVectorsPerWindow, rhsVectorsPerWindow,
-             reduction->unrollFactor,
-             facts.predicateGroups, facts.stateGroups, facts.handoffGroups},
-            target);
-    if (!resources)
+        requirements ? calculatePhysicalResources(*requirements, target)
+                     : std::nullopt;
+    if (!requirements || !resources)
       continue;
     const bool freeLane = laneAxis->role == LogicalAxisRole::Free;
     unsigned sequentialPenalty = 1;
@@ -2160,7 +2164,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                         ? 4
                         : std::max(8u, 2 * baseF32Lanes));
     legal.push_back(Candidate{
-        std::move(mapping), *resources,
+        std::move(mapping), std::move(*requirements), *resources,
         static_cast<unsigned>(
             facts.reductionExtent &&
             *facts.reductionExtent %
@@ -2188,6 +2192,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                     rhs.lanePenalty, rhs.unrollPenalty, rhs.peakGroups);
   });
   return SelectedF32DotPhysical{std::move(legal.front().mapping),
+                                std::move(legal.front().requirements),
                                 legal.front().resources};
 }
 

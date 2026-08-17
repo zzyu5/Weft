@@ -430,6 +430,7 @@ struct VLADotDecision {
   std::optional<AffineScalarExpression> rhsLaneStride;
   std::optional<AffineScalarExpression> freeLaneStride;
   bool lhsPredicateVariesByReduction = false;
+  PhysicalResourceRequirements resourceRequirements;
   PhysicalResourceBudget resources;
   VLADotInitRealization initRealization =
       VLADotInitRealization::ZeroVector;
@@ -1959,6 +1960,7 @@ private:
       return mlir::failure();
     }
     decision.mapping = physical->mapping;
+    decision.resourceRequirements = physical->requirements;
     decision.resources = physical->resources;
     retainOnlyPrivateDefinitions(absorbed, dot.getOperation());
     decision.absorbed.append(absorbed.begin(), absorbed.end());
@@ -2774,7 +2776,8 @@ private:
         return mlir::failure();
       }
       candidateFacts.requiredLMULs.push_back(*lmul);
-      candidateFacts.localPrimitiveResources.push_back(dot.resources);
+      candidateFacts.localPrimitiveRequirements.push_back(
+          dot.resourceRequirements);
     }
     if (options.backend.parameters.vlaLMUL != 0)
       candidateFacts.requiredLMULs.push_back(

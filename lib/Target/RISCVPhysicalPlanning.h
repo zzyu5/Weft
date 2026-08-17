@@ -543,7 +543,8 @@ struct VLAEntityCandidateFacts {
   llvm::SmallVector<VLASegmentMemoryFact> segmentMemory;
   llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimes;
   llvm::SmallVector<SelectedVLAStatePhysical> states;
-  llvm::SmallVector<PhysicalResourceBudget> localPrimitiveResources;
+  llvm::SmallVector<PhysicalResourceRequirements, 2>
+      localPrimitiveRequirements;
 };
 
 struct SelectedVLAEntityPhysical {
@@ -727,6 +728,7 @@ struct F32DotCandidateFacts {
 
 struct SelectedF32DotPhysical {
   CorePhysicalMapping mapping;
+  PhysicalResourceRequirements requirements;
   PhysicalResourceBudget resources;
 };
 
