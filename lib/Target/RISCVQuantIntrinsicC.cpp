@@ -53,8 +53,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
-  bool packedU9U7E8M2 = false, packedU9U7E8M1 = false;
-  bool packedU11E8M2 = false, packedU11E8M1 = false;
   bool supported = true;
   selected.forEach([&](const LocalImplementation &implementation) {
     if (!supported)
@@ -92,17 +90,12 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
           emitSignedCodebookLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedU9U7CodebookI8:
-      supported = match("__weft_packed_u9_u7_codebook_i8_register_l32_e8m2",
-                        packedU9U7E8M2) ||
-                  match("__weft_packed_u9_u7_codebook_i8_register_l32_e8m1",
-                        packedU9U7E8M1);
+      supported =
+          emitPackedU9U7CodebookLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedU11GridDeltaI8:
-      supported = match(
-                      "__weft_packed_u11_grid_delta_i8_register_l32_e8m2",
-                      packedU11E8M2) ||
-                  match("__weft_packed_u11_grid_delta_i8_register_l32_e8m1",
-                        packedU11E8M1);
+      supported =
+          emitPackedU11GridDeltaLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::NibbleCodebookI8:
       supported =
@@ -139,9 +132,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
-      !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
-      !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
-      !packedU11E8M1)
+      !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64)
     return true;
 
   if (iq2Strip || iq3Strip || iq1Strip || q6Strip) {
@@ -201,10 +192,6 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
-  emitPackedU9U7CodebookLocalImplementations(
-      output, packedU9U7E8M2, packedU9U7E8M1);
-  emitPackedU11GridDeltaLocalImplementations(
-      output, packedU11E8M2, packedU11E8M1);
   return true;
 }
 

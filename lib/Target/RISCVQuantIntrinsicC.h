@@ -32,12 +32,10 @@ bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
 bool emitSignedCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
-void emitPackedU9U7CodebookLocalImplementations(llvm::raw_ostream &output,
-                                                bool registerE8M2,
-                                                bool registerE8M1);
-void emitPackedU11GridDeltaLocalImplementations(llvm::raw_ostream &output,
-                                                bool registerE8M2,
-                                                bool registerE8M1);
+bool emitPackedU9U7CodebookLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
+bool emitPackedU11GridDeltaLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
 
 } // namespace weft::riscv_internal
 

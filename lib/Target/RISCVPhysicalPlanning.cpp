@@ -216,6 +216,66 @@ bool isSignedCodebookLocalImplementationMapping(
          !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
 }
 
+static bool hasCodebookLaneMapping(const LocalImplementation &implementation,
+                                   size_t shapeCount) {
+  if (implementation.mapping.instruction !=
+          CoreInstructionKind::RVVIndexedGather ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < shapeCount)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  return reduction && reduction->extent && *reduction->extent == 32 &&
+         reduction->sequentialFactor == 1 && reduction->laneFactor == 32 &&
+         reduction->registerFactor == 1;
+}
+
+bool isPackedU9U7CodebookLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::PackedU9U7CodebookI8 ||
+      implementation.entryWidth != 8 ||
+      !hasCodebookLaneMapping(implementation, 7))
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape codeShape = implementation.valueShapes[1];
+  const RVVVectorShape wordShape = implementation.valueShapes[2];
+  const RVVVectorShape tableShape = implementation.valueShapes[3];
+  const RVVVectorShape productShape = implementation.valueShapes[4];
+  const RVVVectorShape signSourceShape = implementation.valueShapes[5];
+  const RVVVectorShape halfProductShape = implementation.valueShapes[6];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         codeShape.sew == 8 && wordShape.sew == 16 &&
+         wordShape.lmulEighths == codeShape.lmulEighths &&
+         tableShape.sew == 64 &&
+         tableShape.lmulEighths == laneShape.lmulEighths &&
+         productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         signSourceShape == kRVVE8M1 && halfProductShape.sew == 16 &&
+         halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
+}
+
+bool isPackedU11GridDeltaLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive !=
+          LocalPrimitiveKind::PackedU11GridDeltaI8 ||
+      implementation.entryWidth != 8 ||
+      !hasCodebookLaneMapping(implementation, 5))
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape codeShape = implementation.valueShapes[1];
+  const RVVVectorShape indexShape = implementation.valueShapes[2];
+  const RVVVectorShape tableShape = implementation.valueShapes[3];
+  const RVVVectorShape productShape = implementation.valueShapes[4];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         codeShape.sew == 8 && indexShape.sew == 16 &&
+         indexShape.lmulEighths == codeShape.lmulEighths * 2 &&
+         tableShape.sew == 64 &&
+         tableShape.lmulEighths == laneShape.lmulEighths &&
+         productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2;
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -349,12 +409,9 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::SignedCodebook4I8:
     return isSignedCodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    return isPackedU9U7CodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    return implementation.mapping.instruction ==
-               CoreInstructionKind::RVVIndexedGather &&
-           lanes == 32 && implementation.entryWidth == 8 &&
-           (primary == RVVVectorShape{8, 8} ||
-            primary == RVVVectorShape{8, 16});
+    return isPackedU11GridDeltaLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::IQ2SI8:
   case LocalPrimitiveKind::IQ1MI8:
   case LocalPrimitiveKind::Q6KI8:
@@ -1965,10 +2022,22 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     LocalImplementation implementation;
     implementation.primitive = facts.primitive;
     implementation.mapping = std::move(candidate.mapping);
+    std::optional<RVVVectorShape> halfProductShape =
+        rvvShapeForSemanticLanes(16, 16, target);
+    if (!halfProductShape)
+      continue;
     if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
         facts.primitive == LocalPrimitiveKind::SignedCodebook4I8)
       implementation.valueShapes = {laneShape, *codeShape, *indexShape,
                                     *tableShape, *productShape, kRVVE8M1};
+    else if (facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
+      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
+                                    *tableShape, *productShape, kRVVE8M1,
+                                    *halfProductShape};
+    else if (facts.primitive ==
+             LocalPrimitiveKind::PackedU11GridDeltaI8)
+      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
+                                    *tableShape, *productShape};
     else
       implementation.valueShapes = {laneShape, *tableShape};
     implementation.entryWidth = facts.entryWidth;
