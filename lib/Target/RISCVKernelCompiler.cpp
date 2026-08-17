@@ -354,20 +354,6 @@ struct VLALookupDecision {
   int64_t tableExtent = 16;
 };
 
-enum class VLABinaryRealization {
-  RVVF16FusedMultiplyAdd,
-};
-
-struct VLABinaryDecision {
-  mlir::Operation *operation = nullptr;
-  VLABinaryRealization realization =
-      VLABinaryRealization::RVVF16FusedMultiplyAdd;
-  mlir::Operation *absorbedProducer = nullptr;
-  mlir::Value accumulator;
-  mlir::Value vector;
-  mlir::Value scalar;
-};
-
 struct VLACastDecision {
   mlir::Operation *operation = nullptr;
   VLACastRealization realization = VLACastRealization::RVVWidenF16ToF32;
@@ -541,7 +527,6 @@ struct VLARegionDecision {
   std::vector<VLAAccessDecision> accesses;
   std::vector<VLASegment2Decision> segment2;
   std::vector<VLALookupDecision> lookups;
-  std::vector<VLABinaryDecision> binaries;
   std::vector<VLAIndexBinaryDecision> indexBinaries;
   std::vector<VLAIndexSelectDecision> indexSelects;
   std::vector<VLAUnaryDecision> unaries;
@@ -1491,17 +1476,6 @@ private:
     return found == activeVLADecision->lookups.end() ? nullptr : &*found;
   }
 
-  const VLABinaryDecision *
-  findBinaryDecision(mlir::Operation *operation) const {
-    if (!activeVLADecision)
-      return nullptr;
-    auto found = llvm::find_if(
-        activeVLADecision->binaries, [&](const VLABinaryDecision &decision) {
-          return decision.operation == operation;
-        });
-    return found == activeVLADecision->binaries.end() ? nullptr : &*found;
-  }
-
   const VLAIndexBinaryDecision *
   findIndexBinaryDecision(mlir::Operation *operation) const {
     if (!activeVLADecision)
@@ -1535,15 +1509,6 @@ private:
           return decision.operation == operation;
         });
     return found == activeVLADecision->unaries.end() ? nullptr : &*found;
-  }
-
-  bool isAbsorbedBinaryProducer(mlir::Operation *operation) const {
-    if (!activeVLADecision)
-      return false;
-    return llvm::any_of(
-        activeVLADecision->binaries, [&](const VLABinaryDecision &decision) {
-          return decision.absorbedProducer == operation;
-        });
   }
 
   const VLACastDecision *
@@ -2926,10 +2891,15 @@ private:
       return mlir::failure();
     }
 
-    auto shapeFromRegionMapping = [&](mlir::Type type) -> RVVVectorShape {
-      if (!isRegionValue(type))
+    auto shapeFromValueMapping = [&](mlir::Value value) -> RVVVectorShape {
+      if (!value || !isRegionValue(value.getType()))
         return {};
-      mlir::Type element = elementType(type);
+      auto valueFacts = kernelFacts.values.find(value);
+      if (valueFacts == kernelFacts.values.end() ||
+          !llvm::is_contained(valueFacts->second.logicalAxes,
+                              decision.coordinate))
+        return {};
+      mlir::Type element = elementType(value.getType());
       if (element.isIndex())
         return entity.vlaIndexShape;
       unsigned sew = element.isF32() ? 32
@@ -2947,22 +2917,20 @@ private:
     };
     for (mlir::Operation *operation : physicalOperations) {
       for (mlir::Value operand : operation->getOperands())
-        recordPhysicalValue(entity, operand,
-                            shapeFromRegionMapping(operand.getType()));
+        recordPhysicalValue(entity, operand, shapeFromValueMapping(operand));
       for (mlir::Value result : operation->getResults())
-        recordPhysicalValue(entity, result,
-                            shapeFromRegionMapping(result.getType()));
+        recordPhysicalValue(entity, result, shapeFromValueMapping(result));
       if (auto loop = mlir::dyn_cast<ForOp>(operation))
         for (mlir::BlockArgument argument :
              loop.getBody().front().getArguments().drop_front())
           recordPhysicalValue(entity, argument,
-                              shapeFromRegionMapping(argument.getType()));
+                              shapeFromValueMapping(argument));
       if (auto loop = mlir::dyn_cast<WhileOp>(operation))
         for (mlir::Region *region :
              {&loop.getConditionRegion(), &loop.getBodyRegion()})
           for (mlir::BlockArgument argument : region->front().getArguments())
             recordPhysicalValue(entity, argument,
-                                shapeFromRegionMapping(argument.getType()));
+                                shapeFromValueMapping(argument));
     }
 
     for (mlir::Operation *operation : physicalOperations) {
@@ -2974,7 +2942,14 @@ private:
       VLACastDecision selectedCast;
       selectedCast.operation = cast.getOperation();
       VLACastCandidateFacts facts;
-      facts.dataShape = entity.mapping.laneShape;
+      auto inputShape = llvm::find_if(
+          entity.values, [&](const PhysicalValueDecision &value) {
+            return value.value == cast.getInput();
+          });
+      if (inputShape == entity.values.end())
+        return cast.emitError(
+            "VLA cast input has no logical-axis physical mapping");
+      facts.dataShape = inputShape->shape;
       if (cast.getInput().getType() == cast.getResult().getType()) {
         facts.semantic = VLACastSemantic::Identity;
         facts.identitySEW = source.isF32() ? 32
@@ -3078,48 +3053,6 @@ private:
       if (unary.realization == VLAUnaryRealization::RVVScalarLibmSin ||
           unary.realization == VLAUnaryRealization::RVVScalarLibmCos)
         recordPhysicalTemporary(entity, unary.operation, shape);
-    }
-
-    for (mlir::Operation *operation : physicalOperations) {
-      auto add = mlir::dyn_cast<BinaryOp>(operation);
-      if (!add || add.getKind() != "add" ||
-          !isF16(elementType(add.getResult().getType())))
-        continue;
-      BinaryOp multiply = add.getLhs().getDefiningOp<BinaryOp>();
-      mlir::Value accumulator = add.getRhs();
-      if (!multiply || multiply.getKind() != "mul") {
-        multiply = add.getRhs().getDefiningOp<BinaryOp>();
-        accumulator = add.getLhs();
-      }
-      if (!multiply || multiply.getKind() != "mul" ||
-          !isF16(elementType(accumulator.getType())))
-        continue;
-      mlir::Value vector = multiply.getLhs();
-      mlir::Value scalar = multiply.getRhs();
-      if (!isRegionValue(vector.getType()))
-        std::swap(vector, scalar);
-      if (!isRegionValue(vector.getType()) || isRegionValue(scalar.getType()) ||
-          !isF16(elementType(vector.getType())) ||
-          !isF16(elementType(scalar.getType())))
-        continue;
-      llvm::DenseSet<mlir::Operation *> absorbed{multiply.getOperation()};
-      retainOnlyPrivateDefinitions(absorbed, add.getOperation());
-      mlir::Operation *absorbedProducer =
-          absorbed.contains(multiply.getOperation()) ? multiply.getOperation()
-                                                     : nullptr;
-      decision.binaries.push_back(VLABinaryDecision{
-          add.getOperation(), VLABinaryRealization::RVVF16FusedMultiplyAdd,
-          absorbedProducer, accumulator, vector, scalar});
-      RVVVectorShape fmaShape =
-          rvvShapeForSameLanes(entity.mapping.laneShape, 16, options.target)
-              .value_or(RVVVectorShape{});
-      if (mlir::failed(requireMappedValueShape(
-              add.getOperation(), entity, accumulator, fmaShape)) ||
-          mlir::failed(requireMappedValueShape(
-              add.getOperation(), entity, vector, fmaShape)) ||
-          mlir::failed(requireMappedValueShape(
-              add.getOperation(), entity, add.getResult(), fmaShape)))
-        return mlir::failure();
     }
 
     for (VLAAccessDecision &access : decision.accesses) {
@@ -4597,8 +4530,6 @@ private:
   }
 
   mlir::LogicalResult emitBinary(BinaryOp op) {
-    if (isAbsorbedBinaryProducer(op.getOperation()))
-      return mlir::success();
     CValue lhs = require(op.getLhs());
     CValue rhs = require(op.getRhs());
     bool lhsBundle = lhs.kind == CValueKind::F32VectorBundle;
@@ -4817,35 +4748,6 @@ private:
     bool f16 = isF16(elementType(op.getResult().getType()));
     CValueKind vectorKind =
         f32 ? CValueKind::F32Vector : CValueKind::F16Vector;
-    if (const VLABinaryDecision *decision =
-            findBinaryDecision(op.getOperation())) {
-      CValue accumulator = require(decision->accumulator);
-      CValue vector = require(decision->vector);
-      CValue scalar = require(decision->scalar);
-      if (decision->realization !=
-              VLABinaryRealization::RVVF16FusedMultiplyAdd ||
-          accumulator.kind != CValueKind::F16Vector ||
-          vector.kind != CValueKind::F16Vector ||
-          scalar.kind != CValueKind::Scalar || accumulator.spelling.empty() ||
-          vector.spelling.empty() || scalar.spelling.empty())
-        return op.emitError("selected f16 fused multiply-add is unavailable");
-      std::optional<unsigned> lmul = physicalValueLMUL(op.getResult());
-      if (!lmul)
-        return op.emitError("f16 fused multiply-add has no physical shape");
-      std::string suffix = "f16m" + std::to_string(*lmul);
-      std::string name = fresh("fma");
-      line("vfloat16m" + std::to_string(*lmul) + "_t " + name +
-           " = __riscv_vfmacc_vf_" + suffix + "(" + accumulator.spelling +
-           ", " + scalar.spelling + ", " + vector.spelling + ", " + activeVL +
-           ");");
-      CValue result{op.getResult().getType(), CValueKind::F16Vector, name};
-      if (mlir::failed(attachLogicalValidity(
-              op.getOperation(), op.getResult().getType(), result,
-              {accumulator, vector, scalar})))
-        return mlir::failure();
-      values[op.getResult()] = std::move(result);
-      return mlir::success();
-    }
     bool lhsVector = lhs.kind == vectorKind;
     bool rhsVector = rhs.kind == vectorKind;
     if (!lhsVector && !rhsVector) {
