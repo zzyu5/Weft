@@ -486,11 +486,11 @@ struct PhysicalEntityPlan {
   llvm::SmallVector<PhysicalTemporaryDecision> temporaries;
   llvm::SmallVector<PhysicalStorageDecision> storages;
   PhysicalResourceBudget resources;
-  RVVVectorShape vlaDataShape;
   RVVVectorShape vlaIndexShape;
   unsigned vlaMaskRatio = 0;
   std::optional<BlockStorePhysicalDecision> blockStore;
   std::optional<BlockReducePhysicalDecision> blockReduce;
+  CorePhysicalMapping mapping;
   bool hasValueShapeConflict = false;
 };
 
@@ -1659,7 +1659,7 @@ private:
 
   std::optional<unsigned> activeVLADataLMUL() const {
     return activePhysicalEntity
-               ? rvvIntegerLMUL(activePhysicalEntity->vlaDataShape)
+               ? rvvIntegerLMUL(activePhysicalEntity->mapping.laneShape)
                : std::nullopt;
   }
 
@@ -1733,6 +1733,19 @@ private:
         found->axisIds.empty() ||
         found->axisIds.size() != found->strides.size())
       return owner->emitError("local primitive physical storage is incomplete");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult requireMappedValueShape(
+      mlir::Operation *owner, const PhysicalEntityPlan &entity,
+      mlir::Value value, RVVVectorShape expected) const {
+    auto found = llvm::find_if(
+        entity.values, [&](const PhysicalValueDecision &physical) {
+          return physical.value == value;
+        });
+    if (!expected || found == entity.values.end() || found->shape != expected)
+      return owner->emitError(
+          "value shape is inconsistent with its selected axis mapping");
     return mlir::success();
   }
 
@@ -2791,16 +2804,25 @@ private:
     candidateFacts.mapping.laneSEW = candidateFacts.dataSEW;
     candidateFacts.mapping.laneInstruction =
         CoreInstructionKind::RVVElementwise;
-    if (decision.f32MathImplementation)
-      candidateFacts.requiredDataShape =
-          decision.f32MathImplementation.valueShapes.front();
+    auto requireDataShape = [&](RVVVectorShape shape,
+                                mlir::Operation *owner) -> mlir::LogicalResult {
+      if (!shape)
+        return owner->emitError("VLA local primitive has no physical lane shape");
+      if (candidateFacts.requiredDataShape &&
+          candidateFacts.requiredDataShape != shape)
+        return owner->emitError(
+            "VLA local primitives require incompatible lane mappings");
+      candidateFacts.requiredDataShape = shape;
+      return mlir::success();
+    };
+    if (decision.f32MathImplementation &&
+        mlir::failed(requireDataShape(
+            decision.f32MathImplementation.valueShapes.front(),
+            op.getOperation())))
+      return mlir::failure();
     for (const VLADotDecision &dot : decision.dots) {
-      std::optional<unsigned> lmul = rvvIntegerLMUL(dot.mapping.laneShape);
-      if (!lmul) {
-        dot.operation->emitError("VLA dot mapping has no integral RVV LMUL");
+      if (mlir::failed(requireDataShape(dot.mapping.laneShape, dot.operation)))
         return mlir::failure();
-      }
-      candidateFacts.requiredLMULs.push_back(*lmul);
       candidateFacts.localPrimitiveRequirements.push_back(
           dot.resourceRequirements);
     }
@@ -2826,15 +2848,15 @@ private:
     for (auto &&[state, physical] :
          llvm::zip_equal(decision.states, selected->states))
       state.physical = physical;
-    entity.vlaDataShape = selected->dataShape;
+    entity.mapping = selected->mapping;
     entity.vlaIndexShape = selected->indexShape;
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
-    decision.mapping = selected->mapping;
+    decision.mapping = entity.mapping;
     narrowPhysical = selected->narrow;
     for (VLASegment2Decision &segment : decision.segment2) {
       segment.vectorShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, segment.elementSEW,
+          rvvShapeForSameLanes(entity.mapping.laneShape, segment.elementSEW,
                                options.target)
               .value_or(RVVVectorShape{});
       if (!segment.vectorShape ||
@@ -2851,10 +2873,12 @@ private:
       return mlir::failure();
     }
 
-    auto regionShape = [&](mlir::Type type) -> RVVVectorShape {
+    auto shapeFromRegionMapping = [&](mlir::Type type) -> RVVVectorShape {
       if (!isRegionValue(type))
         return {};
       mlir::Type element = elementType(type);
+      if (element.isIndex())
+        return entity.vlaIndexShape;
       unsigned sew = element.isF32() ? 32
                      : isF16(element) ? 16
                      : (element.isSignedInteger(8) ||
@@ -2864,25 +2888,28 @@ private:
                                                      : 0;
       return sew == 0
                  ? RVVVectorShape{}
-                 : rvvShapeForSameLanes(entity.vlaDataShape, sew,
+                 : rvvShapeForSameLanes(entity.mapping.laneShape, sew,
                                         options.target)
                        .value_or(RVVVectorShape{});
     };
     for (mlir::Operation *operation : physicalOperations) {
       for (mlir::Value operand : operation->getOperands())
-        recordPhysicalValue(entity, operand, regionShape(operand.getType()));
+        recordPhysicalValue(entity, operand,
+                            shapeFromRegionMapping(operand.getType()));
       for (mlir::Value result : operation->getResults())
-        recordPhysicalValue(entity, result, regionShape(result.getType()));
+        recordPhysicalValue(entity, result,
+                            shapeFromRegionMapping(result.getType()));
       if (auto loop = mlir::dyn_cast<ForOp>(operation))
         for (mlir::BlockArgument argument :
              loop.getBody().front().getArguments().drop_front())
-          recordPhysicalValue(entity, argument, regionShape(argument.getType()));
+          recordPhysicalValue(entity, argument,
+                              shapeFromRegionMapping(argument.getType()));
       if (auto loop = mlir::dyn_cast<WhileOp>(operation))
         for (mlir::Region *region :
              {&loop.getConditionRegion(), &loop.getBodyRegion()})
           for (mlir::BlockArgument argument : region->front().getArguments())
             recordPhysicalValue(entity, argument,
-                                regionShape(argument.getType()));
+                                shapeFromRegionMapping(argument.getType()));
     }
 
     for (mlir::Operation *operation : physicalOperations) {
@@ -2894,7 +2921,7 @@ private:
       VLACastDecision selectedCast;
       selectedCast.operation = cast.getOperation();
       VLACastCandidateFacts facts;
-      facts.dataShape = entity.vlaDataShape;
+      facts.dataShape = entity.mapping.laneShape;
       if (cast.getInput().getType() == cast.getResult().getType()) {
         facts.semantic = VLACastSemantic::Identity;
         facts.identitySEW = source.isF32() ? 32
@@ -2923,8 +2950,13 @@ private:
       selectedCast.realization = selected->realization;
       selectedCast.sourceShape = selected->sourceShape;
       selectedCast.resultShape = selected->resultShape;
-      recordPhysicalValue(entity, cast.getInput(), selected->sourceShape);
-      recordPhysicalValue(entity, cast.getResult(), selected->resultShape);
+      if (mlir::failed(requireMappedValueShape(
+              cast.getOperation(), entity, cast.getInput(),
+              selected->sourceShape)) ||
+          mlir::failed(requireMappedValueShape(
+              cast.getOperation(), entity, cast.getResult(),
+              selected->resultShape)))
+        return mlir::failure();
       recordPhysicalHandoff(entity, cast.getOperation(), cast.getInput(),
                             selected->realization ==
                                     VLACastRealization::RVVIdentity
@@ -2939,11 +2971,13 @@ private:
       op.emitError("VLA index operations have no selected native index shape");
       return mlir::failure();
     }
-    auto recordIndexOperand = [&](mlir::Operation *consumer,
-                                  mlir::Value operand) {
+    auto requireIndexOperand = [&](mlir::Operation *consumer,
+                                   mlir::Value operand) -> mlir::LogicalResult {
       if (!isRegionValue(operand.getType()))
-        return;
-      recordPhysicalValue(entity, operand, entity.vlaIndexShape);
+        return mlir::success();
+      if (mlir::failed(requireMappedValueShape(
+              consumer, entity, operand, entity.vlaIndexShape)))
+        return mlir::failure();
       LaneRelation relation =
           classifyLaneRelation(operand, decision.coordinate);
       recordPhysicalHandoff(
@@ -2953,18 +2987,27 @@ private:
               ? PhysicalHandoff::Rematerialize
               : PhysicalHandoff::Share,
           entity.vlaIndexShape, entity.vlaIndexShape);
+      return mlir::success();
     };
     for (const VLAIndexBinaryDecision &index : decision.indexBinaries) {
       auto binary = mlir::cast<BinaryOp>(index.operation);
-      recordIndexOperand(index.operation, binary.getLhs());
-      recordIndexOperand(index.operation, binary.getRhs());
-      recordPhysicalValue(entity, binary.getResult(), entity.vlaIndexShape);
+      if (mlir::failed(requireIndexOperand(index.operation, binary.getLhs())) ||
+          mlir::failed(requireIndexOperand(index.operation, binary.getRhs())) ||
+          mlir::failed(requireMappedValueShape(
+              index.operation, entity, binary.getResult(),
+              entity.vlaIndexShape)))
+        return mlir::failure();
     }
     for (const VLAIndexSelectDecision &index : decision.indexSelects) {
       auto select = mlir::cast<SelectOp>(index.operation);
-      recordIndexOperand(index.operation, select.getTrueValue());
-      recordIndexOperand(index.operation, select.getFalseValue());
-      recordPhysicalValue(entity, select.getResult(), entity.vlaIndexShape);
+      if (mlir::failed(
+              requireIndexOperand(index.operation, select.getTrueValue())) ||
+          mlir::failed(
+              requireIndexOperand(index.operation, select.getFalseValue())) ||
+          mlir::failed(requireMappedValueShape(
+              index.operation, entity, select.getResult(),
+              entity.vlaIndexShape)))
+        return mlir::failure();
       if (index.trueScalar || index.falseScalar)
         recordPhysicalTemporary(entity, index.operation, entity.vlaIndexShape);
     }
@@ -2972,8 +3015,11 @@ private:
       auto operation = mlir::cast<UnaryOp>(unary.operation);
       RVVVectorShape shape =
           decision.f32MathImplementation.valueShapes.front();
-      recordPhysicalValue(entity, operation.getInput(), shape);
-      recordPhysicalValue(entity, operation.getResult(), shape);
+      if (mlir::failed(requireMappedValueShape(
+              unary.operation, entity, operation.getInput(), shape)) ||
+          mlir::failed(requireMappedValueShape(
+              unary.operation, entity, operation.getResult(), shape)))
+        return mlir::failure();
       recordPhysicalHandoff(entity, unary.operation, operation.getInput(),
                             PhysicalHandoff::Share, shape, shape);
       if (unary.realization == VLAUnaryRealization::RVVScalarLibmSin ||
@@ -3012,11 +3058,15 @@ private:
           add.getOperation(), VLABinaryRealization::RVVF16FusedMultiplyAdd,
           absorbedProducer, accumulator, vector, scalar});
       RVVVectorShape fmaShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, 16, options.target)
+          rvvShapeForSameLanes(entity.mapping.laneShape, 16, options.target)
               .value_or(RVVVectorShape{});
-      recordPhysicalValue(entity, accumulator, fmaShape);
-      recordPhysicalValue(entity, vector, fmaShape);
-      recordPhysicalValue(entity, add.getResult(), fmaShape);
+      if (mlir::failed(requireMappedValueShape(
+              add.getOperation(), entity, accumulator, fmaShape)) ||
+          mlir::failed(requireMappedValueShape(
+              add.getOperation(), entity, vector, fmaShape)) ||
+          mlir::failed(requireMappedValueShape(
+              add.getOperation(), entity, add.getResult(), fmaShape)))
+        return mlir::failure();
     }
 
     for (VLAAccessDecision &access : decision.accesses) {
@@ -3036,7 +3086,7 @@ private:
                                 : 32;
       access.elementBytes = elementSEW / 8;
       RVVVectorShape elementShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, elementSEW, options.target)
+          rvvShapeForSameLanes(entity.mapping.laneShape, elementSEW, options.target)
               .value_or(RVVVectorShape{});
       if (!elementShape) {
         access.operation->emitError(
@@ -3044,12 +3094,17 @@ private:
         return mlir::failure();
       }
       if (auto load = mlir::dyn_cast<LoadOp>(access.operation)) {
-        recordPhysicalValue(entity, load.getResult(), elementShape);
+        if (mlir::failed(requireMappedValueShape(
+                access.operation, entity, load.getResult(), elementShape)))
+          return mlir::failure();
         recordPhysicalHandoff(entity, access.operation, load.getResult(),
                               PhysicalHandoff::Share, elementShape,
                               elementShape);
       } else if (auto store = mlir::dyn_cast<StoreOp>(access.operation)) {
-        recordPhysicalValue(entity, store.getValue(), elementShape);
+        if (isRegionValue(store.getValue().getType()) &&
+            mlir::failed(requireMappedValueShape(
+                access.operation, entity, store.getValue(), elementShape)))
+          return mlir::failure();
         recordPhysicalHandoff(entity, access.operation, store.getValue(),
                               access.storeValueMode ==
                                       VLAStoreValueMode::ScalarBroadcast
@@ -3084,22 +3139,30 @@ private:
     for (VLALookupDecision &lookup : decision.lookups) {
       auto operation = mlir::cast<LookupOp>(lookup.operation);
       RVVVectorShape codeShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, 8, options.target)
+          rvvShapeForSameLanes(entity.mapping.laneShape, 8, options.target)
               .value_or(RVVVectorShape{});
       RVVVectorShape index16Shape =
-          rvvShapeForSameLanes(entity.vlaDataShape, 16, options.target)
+          rvvShapeForSameLanes(entity.mapping.laneShape, 16, options.target)
               .value_or(RVVVectorShape{});
       RVVVectorShape index32Shape =
-          rvvShapeForSameLanes(entity.vlaDataShape, 32, options.target)
+          rvvShapeForSameLanes(entity.mapping.laneShape, 32, options.target)
               .value_or(RVVVectorShape{});
       if (!codeShape || !index16Shape || !index32Shape) {
         lookup.operation->emitError(
             "RVV VLA lookup has no legal typed value shapes");
         return mlir::failure();
       }
-      recordPhysicalValue(entity, operation.getIndices(), codeShape);
-      recordPhysicalValue(entity, operation.getTable(), index32Shape);
-      recordPhysicalValue(entity, operation.getResult(), index32Shape);
+      auto bindLookupValue = [&](mlir::Value value,
+                                 RVVVectorShape shape) -> mlir::LogicalResult {
+        if (isRegionValue(value.getType()))
+          return requireMappedValueShape(lookup.operation, entity, value, shape);
+        recordPhysicalValue(entity, value, shape);
+        return mlir::success();
+      };
+      if (mlir::failed(bindLookupValue(operation.getIndices(), codeShape)) ||
+          mlir::failed(bindLookupValue(operation.getTable(), index32Shape)) ||
+          mlir::failed(bindLookupValue(operation.getResult(), index32Shape)))
+        return mlir::failure();
       recordPhysicalTemporary(entity, lookup.operation, index16Shape);
       recordPhysicalTemporary(entity, lookup.operation, index32Shape);
       recordPhysicalHandoff(entity, lookup.operation, operation.getIndices(),
@@ -3114,7 +3177,7 @@ private:
           VLAPredicateRealization::RVVVectorScalar)
         continue;
       RVVVectorShape predicateShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, predicate.vectorSEW,
+          rvvShapeForSameLanes(entity.mapping.laneShape, predicate.vectorSEW,
                                options.target)
               .value_or(RVVVectorShape{});
       if (!predicateShape) {
@@ -3122,7 +3185,10 @@ private:
             "typed VLA predicate has no legal selected vector shape");
         return mlir::failure();
       }
-      recordPhysicalValue(entity, predicate.coordinate, predicateShape);
+      if (mlir::failed(requireMappedValueShape(
+              predicate.operation, entity, predicate.coordinate,
+              predicateShape)))
+        return mlir::failure();
       recordPhysicalHandoff(entity, predicate.operation, predicate.coordinate,
                             PhysicalHandoff::Share, predicateShape,
                             predicateShape);
@@ -3161,7 +3227,16 @@ private:
               : state.physical.seedShape
                     ? state.physical.seedShape
                     : state.physical.inputShape;
-      recordPhysicalValue(entity, state.operation->getOperand(0), stateShape);
+      if (isRegionValue(state.operation->getOperand(0).getType()) &&
+          mlir::failed(requireMappedValueShape(
+              state.operation, entity, state.operation->getOperand(0),
+              stateShape)))
+        return mlir::failure();
+      for (mlir::Value result : state.operation->getResults())
+        if (isRegionValue(result.getType()) &&
+            mlir::failed(requireMappedValueShape(
+                state.operation, entity, result, stateShape)))
+          return mlir::failure();
       recordPhysicalHandoff(entity, state.operation,
                             state.operation->getOperand(0),
                             PhysicalHandoff::Share, stateShape, stateShape);
@@ -3175,8 +3250,13 @@ private:
     for (const VLANarrowDecision &narrow : decision.narrows) {
       const VLANarrowPhysical &physical = *narrowPhysical;
       auto narrowOp = mlir::cast<NarrowOp>(narrow.operation);
-      recordPhysicalValue(entity, narrowOp.getInput(), physical.sourceShape);
-      recordPhysicalValue(entity, narrowOp.getResult(), physical.resultShape);
+      if (mlir::failed(requireMappedValueShape(
+              narrow.operation, entity, narrowOp.getInput(),
+              physical.sourceShape)) ||
+          mlir::failed(requireMappedValueShape(
+              narrow.operation, entity, narrowOp.getResult(),
+              physical.resultShape)))
+        return mlir::failure();
       recordPhysicalTemporary(entity, narrow.operation,
                               physical.intermediateShape);
       recordPhysicalHandoff(entity, narrow.operation, narrowOp.getInput(),
@@ -3195,12 +3275,26 @@ private:
             dot.blockedOperand && operand == dot.blockedOperand
                 ? PhysicalHandoff::Rematerialize
                 : PhysicalHandoff::Reload;
-        recordPhysicalValue(entity, operand, dotShape);
+        if (isRegionValue(operand.getType())) {
+          if (mlir::failed(requireMappedValueShape(
+                  dot.operation, entity, operand, dotShape)))
+            return mlir::failure();
+        } else {
+          recordPhysicalValue(entity, operand, dotShape);
+        }
         recordPhysicalHandoff(entity, dot.operation, operand, kind, dotShape,
                               dotShape);
       }
-      recordPhysicalValue(entity, dot.init, dotShape);
-      recordPhysicalValue(entity, operation.getResult(), dotShape);
+      if (isRegionValue(dot.init.getType())) {
+        if (mlir::failed(requireMappedValueShape(
+                dot.operation, entity, dot.init, dotShape)))
+          return mlir::failure();
+      } else {
+        recordPhysicalValue(entity, dot.init, dotShape);
+      }
+      if (mlir::failed(requireMappedValueShape(
+              dot.operation, entity, operation.getResult(), dotShape)))
+        return mlir::failure();
       recordPhysicalHandoff(entity, dot.operation, dot.init,
                             dot.initRealization ==
                                     VLADotInitRealization::MaterializedRegion
@@ -4082,14 +4176,18 @@ private:
       return mlir::failure();
     const VLARegionDecision &decision = selected->second.realization;
     const PhysicalEntityPlan &entity = selected->second.entity;
-    std::optional<unsigned> dataLMUL = rvvIntegerLMUL(entity.vlaDataShape);
-    if (!dataLMUL || entity.vlaMaskRatio == 0)
+    const PhysicalAxisDecomposition *vlaAxis =
+        findAxisMapping(entity.mapping, kCoreAxisVLA);
+    std::optional<unsigned> dataLMUL = rvvIntegerLMUL(entity.mapping.laneShape);
+    if (entity.mapping.laneAxis != std::optional<unsigned>(kCoreAxisVLA) ||
+        !vlaAxis || vlaAxis->laneFactor == 0 || !dataLMUL ||
+        entity.vlaMaskRatio == 0)
       return op.emitError("VLA entity has no selected data or mask shape");
     const std::string dataType =
-        rvvVectorType(RVVElementCategory::Floating, entity.vlaDataShape);
+        rvvVectorType(RVVElementCategory::Floating, entity.mapping.laneShape);
     const std::string dataSuffix = rvvIntrinsicTypeSuffix(
-        RVVElementCategory::Floating, entity.vlaDataShape);
-    const std::string setVL = rvvSetVLIntrinsic(entity.vlaDataShape);
+        RVVElementCategory::Floating, entity.mapping.laneShape);
+    const std::string setVL = rvvSetVLIntrinsic(entity.mapping.laneShape);
     if (dataType.empty() || dataSuffix.empty() || setVL.empty())
       return op.emitError("VLA entity has no intrinsic-C RVV spelling");
     mlir::Block &body = op.getBody().front();

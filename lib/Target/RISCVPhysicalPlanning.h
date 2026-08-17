@@ -575,7 +575,6 @@ struct VLAEntityCandidateFacts {
 struct SelectedVLAEntityPhysical {
   CorePhysicalMapping mapping;
   llvm::SmallVector<SelectedVLAStatePhysical, 4> states;
-  RVVVectorShape dataShape;
   RVVVectorShape indexShape;
   unsigned maskRatio = 0;
   std::optional<VLANarrowPhysical> narrow;

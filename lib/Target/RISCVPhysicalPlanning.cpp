@@ -1530,7 +1530,6 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     SelectedVLAEntityPhysical selected;
     selected.mapping = mapping;
     selected.states = states;
-    selected.dataShape = dataShape;
     if (needsIndexShape)
       selected.indexShape = *indexShape;
     selected.maskRatio = rvvMaskRatio(dataShape).value_or(0);
