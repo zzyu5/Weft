@@ -1599,18 +1599,44 @@ selectSignBitI8Physical(const RISCVTargetProfile &target) {
 }
 
 std::optional<PhysicalResourceBudget>
-calculateQuantDecodeResources(const QuantDecodeResourceFacts &facts,
-                              const RISCVTargetProfile &target) {
+calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
+                             const RISCVTargetProfile &target) {
+  if (!facts.mapping)
+    return std::nullopt;
   PhysicalResourceRequirements requirements;
-  for (const RVVShapeMultiplicity &value : facts.loadedValues)
+  for (const AxisMappedLiveValue &value : facts.values) {
+    const PhysicalAxisDecomposition *axis =
+        findAxisMapping(*facts.mapping, value.axis);
+    unsigned count = value.factor;
+    switch (value.multiplicity) {
+    case AxisMappedMultiplicity::Fixed:
+      break;
+    case AxisMappedMultiplicity::RegisterFactor:
+      if (!axis)
+        return std::nullopt;
+      count *= axis->registerFactor;
+      break;
+    case AxisMappedMultiplicity::LaneCapacity: {
+      std::optional<unsigned> capacity = rvvLaneCapacity(value.shape, target);
+      if (!axis || !capacity || *capacity == 0)
+        return std::nullopt;
+      const unsigned logicalLanes = axis->laneFactor * axis->registerFactor;
+      count *= (logicalLanes + *capacity - 1) / *capacity;
+      break;
+    }
+    case AxisMappedMultiplicity::LogicalChunk: {
+      if (!axis || value.chunk == 0)
+        return std::nullopt;
+      const unsigned logicalLanes = axis->laneFactor * axis->registerFactor;
+      count *= (logicalLanes + value.chunk - 1) / value.chunk;
+      break;
+    }
+    }
+    if (count == 0)
+      return std::nullopt;
     requirements.live.push_back(
-        PhysicalLiveRange{PhysicalLiveClass::Memory, value.shape, value.count});
-  for (const RVVShapeMultiplicity &value : facts.indexValues)
-    requirements.live.push_back(
-        PhysicalLiveRange{PhysicalLiveClass::Index, value.shape, value.count});
-  for (const RVVShapeMultiplicity &value : facts.temporaryValues)
-    requirements.live.push_back(PhysicalLiveRange{
-        PhysicalLiveClass::Temporary, value.shape, value.count});
+        PhysicalLiveRange{value.liveClass, value.shape, count});
+  }
   if (facts.predicateGroups != 0)
     requirements.live.push_back(PhysicalLiveRange{
         PhysicalLiveClass::Predicate, {}, 1, facts.predicateGroups});
@@ -1655,23 +1681,30 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
     implementation.valueShapes = {laneShape, *byte16};
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
-    QuantDecodeResourceFacts resources;
-    resources.loadedValues = {
-        {laneShape, candidate.axis.registerFactor}, {*byte16, 1}};
+    AxisMappedResourceFacts resources;
+    resources.mapping = &implementation.mapping;
+    resources.values = {
+        {PhysicalLiveClass::Memory, laneShape,
+         AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 1},
+        {PhysicalLiveClass::Memory, *byte16}};
     switch (facts.semantic) {
     case TernaryI8DotSemantic::Base3Digits:
-      resources.temporaryValues = {
-          {*widened, 3 * candidate.axis.registerFactor}, {kRVVE32M1, 1}};
+      resources.values.append(
+          {{PhysicalLiveClass::Temporary, *widened,
+            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 3},
+           {PhysicalLiveClass::Temporary, kRVVE32M1}});
       break;
     case TernaryI8DotSemantic::PackedI2Fields:
-      resources.temporaryValues = {
-          {laneShape, 2 * candidate.axis.registerFactor},
-          {*widened, candidate.axis.registerFactor},
-          {kRVVE32M1, 1}};
+      resources.values.append(
+          {{PhysicalLiveClass::Temporary, laneShape,
+            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+           {PhysicalLiveClass::Temporary, *widened,
+            AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 1},
+           {PhysicalLiveClass::Temporary, kRVVE32M1}});
       break;
     }
     std::optional<PhysicalResourceBudget> budget =
-        calculateQuantDecodeResources(resources, target);
+        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     SelectedTernaryI8DotPhysical selected;
@@ -1747,19 +1780,24 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     implementation.entryWidth = facts.entryWidth;
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
-    QuantDecodeResourceFacts resources;
-    resources.loadedValues = {
-        {*codeShape, 1}, {*tableShape, 1},
-        {laneShape, candidate.axis.registerFactor}};
-    resources.indexValues = {{*indexShape, 1}};
-    resources.temporaryValues = {
-        {*tableShape, 1},
-        {laneShape, candidate.axis.registerFactor},
-        {*productShape, candidate.axis.registerFactor},
-        {kRVVE32M1, 2}};
+    AxisMappedResourceFacts resources;
+    resources.mapping = &implementation.mapping;
+    resources.values = {
+        {PhysicalLiveClass::Memory, *codeShape},
+        {PhysicalLiveClass::Memory, *tableShape},
+        {PhysicalLiveClass::Memory, laneShape,
+         AxisMappedMultiplicity::RegisterFactor},
+        {PhysicalLiveClass::Index, *indexShape},
+        {PhysicalLiveClass::Temporary, *tableShape},
+        {PhysicalLiveClass::Temporary, laneShape,
+         AxisMappedMultiplicity::RegisterFactor},
+        {PhysicalLiveClass::Temporary, *productShape,
+         AxisMappedMultiplicity::RegisterFactor},
+        {PhysicalLiveClass::Temporary, kRVVE32M1,
+         AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
     resources.predicateGroups = 1;
     std::optional<PhysicalResourceBudget> budget =
-        calculateQuantDecodeResources(resources, target);
+        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     SelectedCodebookGatherI8Physical selected;
@@ -1811,16 +1849,20 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
     implementation.valueShapes = {laneShape, *packedShape};
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
-    QuantDecodeResourceFacts resources;
-    resources.loadedValues = {
-        {*packedShape, 1}, {tableShape, 1},
-        {laneShape, candidate.axis.registerFactor}};
-    resources.temporaryValues = {
-        {*productShape,
-         (combined ? 1u : 2u) * candidate.axis.registerFactor},
-        {kRVVE32M1, 2}};
+    AxisMappedResourceFacts resources;
+    resources.mapping = &implementation.mapping;
+    resources.values = {
+        {PhysicalLiveClass::Memory, *packedShape},
+        {PhysicalLiveClass::Memory, tableShape},
+        {PhysicalLiveClass::Memory, laneShape,
+         AxisMappedMultiplicity::RegisterFactor},
+        {PhysicalLiveClass::Temporary, *productShape,
+         AxisMappedMultiplicity::RegisterFactor, kCoreAxisK,
+         combined ? 1u : 2u},
+        {PhysicalLiveClass::Temporary, kRVVE32M1,
+         AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
     std::optional<PhysicalResourceBudget> budget =
-        calculateQuantDecodeResources(resources, target);
+        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     SelectedNibbleCodebookI8Physical selected;
@@ -1892,21 +1934,27 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     implementation.valueShapes = {laneShape};
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
+    AxisMappedResourceFacts resources;
+    resources.mapping = &implementation.mapping;
     const unsigned logicalLanes =
         candidate.axis.laneFactor * candidate.axis.registerFactor;
-    QuantDecodeResourceFacts resources;
     if (candidate.axis.sequentialFactor > 1 && logicalLanes == 16) {
-      resources.loadedValues = {{laneShape, 2}};
-      resources.temporaryValues = {{kRVVE32M1, 2}};
+      resources.values = {
+          {PhysicalLiveClass::Memory, laneShape,
+           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2},
+          {PhysicalLiveClass::Temporary, kRVVE32M1,
+           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
     } else {
-      resources.loadedValues = {
-          {laneShape, 2 * candidate.axis.registerFactor}};
-      resources.temporaryValues = {
-          {laneShape, 2 * candidate.axis.registerFactor},
-          {kRVVE32M1, 4 * std::max(1u, logicalLanes / 16)}};
+      resources.values = {
+          {PhysicalLiveClass::Memory, laneShape,
+           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+          {PhysicalLiveClass::Temporary, laneShape,
+           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+          {PhysicalLiveClass::Temporary, kRVVE32M1,
+           AxisMappedMultiplicity::LogicalChunk, kCoreAxisK, 4, 16}};
     }
     std::optional<PhysicalResourceBudget> budget =
-        calculateQuantDecodeResources(resources, target);
+        calculateAxisMappedResources(resources, target);
     if (!budget)
       continue;
     SelectedQuantI8DotPhysical selected;
@@ -1957,33 +2005,29 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
         implementation.valueShapes.push_back(activationShape);
       if (!finalizeLocalInstructionMapping(implementation))
         continue;
-      const unsigned logicalLanes =
-          candidate.axis.laneFactor * candidate.axis.registerFactor;
-      const unsigned packedRepetitions = candidate.axis.registerFactor;
-      unsigned activationRepetitions = packedRepetitions;
       RVVVectorShape selectedActivation =
           activationShape ? activationShape : laneShape;
-      if (std::optional<unsigned> capacity =
-              rvvLaneCapacity(selectedActivation, target))
-        activationRepetitions =
-            (logicalLanes + *capacity - 1) / *capacity;
-      else
-        continue;
       std::optional<RVVVectorShape> productShape =
           rvvShapeForSameLanes(selectedActivation, 16, target);
       if (!productShape)
         continue;
-      QuantDecodeResourceFacts resources;
-      resources.loadedValues = {
-          {laneShape, packedRepetitions},
-          {selectedActivation, activationRepetitions}};
-      resources.temporaryValues = {
-          {laneShape, 2 * packedRepetitions},
-          {selectedActivation, 2 * activationRepetitions},
-          {*productShape, activationRepetitions},
-          {kRVVE32M1, 2}};
+      AxisMappedResourceFacts resources;
+      resources.mapping = &implementation.mapping;
+      resources.values = {
+          {PhysicalLiveClass::Memory, laneShape,
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Memory, selectedActivation,
+           AxisMappedMultiplicity::LaneCapacity},
+          {PhysicalLiveClass::Temporary, laneShape,
+           AxisMappedMultiplicity::RegisterFactor, kCoreAxisK, 2},
+          {PhysicalLiveClass::Temporary, selectedActivation,
+           AxisMappedMultiplicity::LaneCapacity, kCoreAxisK, 2},
+          {PhysicalLiveClass::Temporary, *productShape,
+           AxisMappedMultiplicity::LaneCapacity},
+          {PhysicalLiveClass::Temporary, kRVVE32M1,
+           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
       std::optional<PhysicalResourceBudget> budget =
-          calculateQuantDecodeResources(resources, target);
+          calculateAxisMappedResources(resources, target);
       if (!budget)
         continue;
       SelectedE2M1E8M0I8Physical selected;
@@ -2100,17 +2144,21 @@ selectGroupedAffineI4I8Physical(
         continue;
       candidate.resources = *budget;
     } else {
-      QuantDecodeResourceFacts resources;
-      resources.loadedValues =
-          {{candidate.packedShape, reduction->registerFactor},
-           {candidate.scaleShape, 1},
-           {candidate.activationShape, reduction->registerFactor},
-           {candidate.activationSumShape, 1}};
-      resources.temporaryValues =
-          {{candidate.widenedShape, reduction->registerFactor},
-           {candidate.reductionShape, 2}};
+      AxisMappedResourceFacts resources;
+      resources.mapping = &candidate.implementation.mapping;
+      resources.values = {
+          {PhysicalLiveClass::Memory, candidate.packedShape,
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Memory, candidate.scaleShape},
+          {PhysicalLiveClass::Memory, candidate.activationShape,
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Memory, candidate.activationSumShape},
+          {PhysicalLiveClass::Temporary, candidate.widenedShape,
+           AxisMappedMultiplicity::RegisterFactor},
+          {PhysicalLiveClass::Temporary, candidate.reductionShape,
+           AxisMappedMultiplicity::Fixed, kCoreAxisK, 2}};
       std::optional<PhysicalResourceBudget> budget =
-          calculateQuantDecodeResources(resources, target);
+          calculateAxisMappedResources(resources, target);
       if (!budget)
         continue;
       candidate.resources = *budget;

@@ -597,21 +597,31 @@ struct SelectedSignBitI8Physical {
 std::optional<SelectedSignBitI8Physical>
 selectSignBitI8Physical(const RISCVTargetProfile &target);
 
-struct RVVShapeMultiplicity {
-  RVVVectorShape shape;
-  unsigned count = 0;
+enum class AxisMappedMultiplicity {
+  Fixed,
+  RegisterFactor,
+  LaneCapacity,
+  LogicalChunk,
 };
 
-struct QuantDecodeResourceFacts {
-  llvm::SmallVector<RVVShapeMultiplicity> loadedValues;
-  llvm::SmallVector<RVVShapeMultiplicity> indexValues;
-  llvm::SmallVector<RVVShapeMultiplicity> temporaryValues;
+struct AxisMappedLiveValue {
+  PhysicalLiveClass liveClass = PhysicalLiveClass::Value;
+  RVVVectorShape shape;
+  AxisMappedMultiplicity multiplicity = AxisMappedMultiplicity::Fixed;
+  unsigned axis = kCoreAxisK;
+  unsigned factor = 1;
+  unsigned chunk = 1;
+};
+
+struct AxisMappedResourceFacts {
+  const CorePhysicalMapping *mapping = nullptr;
+  llvm::SmallVector<AxisMappedLiveValue> values;
   unsigned predicateGroups = 0;
 };
 
 std::optional<PhysicalResourceBudget>
-calculateQuantDecodeResources(const QuantDecodeResourceFacts &facts,
-                              const RISCVTargetProfile &target);
+calculateAxisMappedResources(const AxisMappedResourceFacts &facts,
+                             const RISCVTargetProfile &target);
 
 enum class TernaryI8DotSemantic {
   Base3Digits,
