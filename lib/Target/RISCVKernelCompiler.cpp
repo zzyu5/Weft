@@ -1611,11 +1611,12 @@ private:
     const LocalImplementation &implementation =
         activeVLADecision->f32MathImplementation;
     if (implementation.primitive != LocalPrimitiveKind::F32Math ||
-        implementation.structure !=
-            LocalImplementationStructure::RVVRegisterMicrokernel ||
-        implementation.parameters.primaryShape.sew != 32)
+        implementation.mapping.instruction !=
+            CoreInstructionKind::RVVElementwise ||
+        implementation.valueShapes.empty() ||
+        implementation.valueShapes.front().sew != 32)
       return std::nullopt;
-    return implementation.parameters.primaryShape;
+    return implementation.valueShapes.front();
   }
 
   std::optional<unsigned> physicalValueLMUL(mlir::Value value) const {
@@ -2805,7 +2806,7 @@ private:
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
     if (decision.f32MathImplementation)
       candidateFacts.requiredDataShape =
-          decision.f32MathImplementation.parameters.primaryShape;
+          decision.f32MathImplementation.valueShapes.front();
     for (const VLADotDecision &dot : decision.dots) {
       candidateFacts.requiredLMULs.push_back(dot.physical.lmul);
       candidateFacts.localPrimitiveResources.push_back(dot.resources);
@@ -2970,7 +2971,7 @@ private:
     for (const VLAUnaryDecision &unary : decision.unaries) {
       auto operation = mlir::cast<UnaryOp>(unary.operation);
       RVVVectorShape shape =
-          decision.f32MathImplementation.parameters.primaryShape;
+          decision.f32MathImplementation.valueShapes.front();
       recordPhysicalValue(entity, operation.getInput(), shape);
       recordPhysicalValue(entity, operation.getResult(), shape);
       recordPhysicalHandoff(entity, unary.operation, operation.getInput(),

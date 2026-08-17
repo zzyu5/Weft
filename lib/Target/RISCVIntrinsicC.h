@@ -14,6 +14,15 @@ class raw_ostream;
 
 namespace weft::riscv_internal {
 
+struct LocalImplementationQuery {
+  LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
+  CoreInstructionKind instruction = CoreInstructionKind::None;
+  unsigned laneSpan = 0;
+  unsigned rowFactor = 0;
+  RVVVectorShape primaryShape;
+  int sequentialK = -1;
+};
+
 class SelectedLocalImplementations {
 public:
   void add(const LocalImplementation &implementation) {
@@ -23,9 +32,8 @@ public:
   bool contains(const LocalImplementation &implementation) const {
     return implementations.find(implementation) != implementations.end();
   }
-  bool contains(LocalImplementationLeaf leaf) const;
-  bool contains(LocalImplementationLeaf leaf, unsigned semanticLanes,
-                RVVVectorShape primaryShape = {}) const;
+  bool contains(LocalPrimitiveKind primitive) const;
+  bool contains(const LocalImplementationQuery &query) const;
   bool empty() const { return implementations.empty(); }
 
 private:

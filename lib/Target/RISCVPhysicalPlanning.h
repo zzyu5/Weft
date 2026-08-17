@@ -1,10 +1,12 @@
 #ifndef WEFT_LIB_TARGET_RISCVPHYSICALPLANNING_H
 #define WEFT_LIB_TARGET_RISCVPHYSICALPLANNING_H
 
+#include "RISCVAxisMapping.h"
 #include "Weft/Target/RISCVLowering.h"
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <tuple>
@@ -13,63 +15,12 @@ namespace weft::riscv_internal {
 
 enum class LaneRelation;
 
-struct RVVVectorShape {
-  unsigned sew = 0;
-  int lmulEighths = 0;
-
-  bool operator==(const RVVVectorShape &other) const {
-    return sew == other.sew && lmulEighths == other.lmulEighths;
-  }
-  bool operator!=(const RVVVectorShape &other) const {
-    return !(*this == other);
-  }
-  bool operator<(const RVVVectorShape &other) const {
-    return sew < other.sew ||
-           (sew == other.sew && lmulEighths < other.lmulEighths);
-  }
-  explicit operator bool() const { return sew != 0 && lmulEighths != 0; }
-};
-
-inline constexpr RVVVectorShape kRVVE8MF4{8, 2};
-inline constexpr RVVVectorShape kRVVE8M1{8, 8};
-inline constexpr RVVVectorShape kRVVE16M2{16, 16};
-inline constexpr RVVVectorShape kRVVE32M1{32, 8};
-inline constexpr RVVVectorShape kRVVE32M2{32, 16};
-inline constexpr RVVVectorShape kRVVE32M4{32, 32};
-
-std::optional<unsigned> rvvIntegerLMUL(const RVVVectorShape &shape);
-unsigned rvvRegisterGroups(const RVVVectorShape &shape);
-std::optional<RVVVectorShape>
-rvvShapeForSemanticLanes(unsigned sew, unsigned semanticLanes,
-                         const RISCVTargetProfile &target);
-std::optional<RVVVectorShape>
-rvvShapeForSameLanes(const RVVVectorShape &source, unsigned resultSEW,
-                     const RISCVTargetProfile &target);
-std::optional<unsigned> rvvMaskRatio(const RVVVectorShape &dataShape);
-std::optional<unsigned>
-rvvLaneCapacity(const RVVVectorShape &shape,
-                const RISCVTargetProfile &target);
-RVVVectorShape rvvShape(unsigned sew, unsigned lmul);
-llvm::SmallVector<unsigned>
-integerLMULCandidates(const RISCVTargetProfile &target, unsigned sew,
-                      unsigned maximum = 8);
 bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
                         const RISCVTargetProfile &target);
 std::optional<int64_t>
 extendPrivateStorageElementCount(int64_t currentElements, int64_t extent,
                                  unsigned elementBytes,
                                  const RISCVTargetProfile &target);
-
-struct PhysicalResourceBudget {
-  unsigned architecturalGroups = 0;
-  unsigned valueGroups = 0;
-  unsigned memoryGroups = 0;
-  unsigned indexGroups = 0;
-  unsigned predicateGroups = 0;
-  unsigned stateGroups = 0;
-  unsigned primitiveGroups = 0;
-  unsigned peakGroups = 0;
-};
 
 enum class LoadF16LERealization {
   ScalarBytes,
@@ -527,92 +478,29 @@ enum class LocalPrimitiveKind {
   Q6KI8,
 };
 
-enum class LocalImplementationStructure {
-  None,
-  RVVRegisterMicrokernel,
-  RVVStripLoop,
-  SpacemitIME1Fragment,
-};
-
-enum class LocalImplementationLeaf {
-  None,
-  RVVF32Math,
-  RVVSymmetricI4I8N16,
-  RVVSymmetricI4I8M4N16,
-  IME1SymmetricI4I8N16,
-  IME1SymmetricI4I8M4N16,
-  RVVAffineI4I8N16,
-  RVVAffineI4I8M4N16,
-  IME1AffineI4I8N16,
-  IME1AffineI4I8M4N16,
-  RVVGroupedAffineI4I8Register,
-  RVVGroupedAffineI4I8Strip,
-  RVVE2M1E8M0I8RegisterMF2,
-  RVVE2M1E8M0I8RegisterM1M2,
-  RVVE2M1E8M0I8Strip,
-  RVVPackedI4I8Register,
-  RVVPackedI5I8Register,
-  RVVPackedI3GroupedI8Register,
-  RVVBase3TernaryI8Register,
-  RVVPackedI2TernaryI8Register,
-  RVVSignedCodebook8I8Register,
-  RVVSignedCodebook4I8Register,
-  RVVPackedU9U7CodebookI8Register,
-  RVVPackedU11GridDeltaI8Register,
-  RVVNibbleCodebookI8Register,
-  RVVIQ2SI8Register,
-  RVVIQ2SI8Strip,
-  RVVIQ3SI8Register,
-  RVVIQ3SI8Strip,
-  RVVIQ1MI8Register,
-  RVVIQ1MI8Strip,
-  RVVQ6KI8Register,
-  RVVQ6KI8Strip,
-};
-
-struct LocalImplementationParameters {
-  unsigned rowMicrotile = 1;
-  unsigned semanticLanes = 0;
-  unsigned entryWidth = 0;
-  RVVVectorShape primaryShape;
-  RVVVectorShape secondaryShape;
-
-  bool operator==(const LocalImplementationParameters &other) const {
-    return rowMicrotile == other.rowMicrotile &&
-           semanticLanes == other.semanticLanes &&
-           entryWidth == other.entryWidth &&
-           primaryShape == other.primaryShape &&
-           secondaryShape == other.secondaryShape;
-  }
-  bool operator<(const LocalImplementationParameters &other) const {
-    return std::tie(rowMicrotile, semanticLanes, entryWidth, primaryShape,
-                    secondaryShape) <
-           std::tie(other.rowMicrotile, other.semanticLanes,
-                    other.entryWidth, other.primaryShape,
-                    other.secondaryShape);
-  }
-};
-
 struct LocalImplementation {
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
-  LocalImplementationStructure structure =
-      LocalImplementationStructure::None;
-  LocalImplementationLeaf leaf = LocalImplementationLeaf::None;
-  LocalImplementationParameters parameters;
+  CorePhysicalMapping mapping;
+  llvm::SmallVector<RVVVectorShape, 4> valueShapes;
+  unsigned entryWidth = 0;
 
   explicit operator bool() const {
-    return primitive != LocalPrimitiveKind::None &&
-           structure != LocalImplementationStructure::None &&
-           leaf != LocalImplementationLeaf::None;
+    return primitive != LocalPrimitiveKind::None && mapping;
   }
   bool operator==(const LocalImplementation &other) const {
-    return primitive == other.primitive && structure == other.structure &&
-           leaf == other.leaf && parameters == other.parameters;
+    return primitive == other.primitive && mapping == other.mapping &&
+           valueShapes == other.valueShapes && entryWidth == other.entryWidth;
   }
   bool operator<(const LocalImplementation &other) const {
-    return std::tie(primitive, structure, leaf, parameters) <
-           std::tie(other.primitive, other.structure, other.leaf,
-                    other.parameters);
+    if (primitive != other.primitive)
+      return primitive < other.primitive;
+    if (!(mapping == other.mapping))
+      return mapping < other.mapping;
+    if (valueShapes != other.valueShapes)
+      return std::lexicographical_compare(valueShapes.begin(), valueShapes.end(),
+                                          other.valueShapes.begin(),
+                                          other.valueShapes.end());
+    return entryWidth < other.entryWidth;
   }
 };
 

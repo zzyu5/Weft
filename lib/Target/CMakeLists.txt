@@ -1,4 +1,5 @@
 add_library(WeftRISCVTarget STATIC
+  RISCVAxisMapping.cpp
   RISCVCABI.cpp
   RISCVTargetProfile.cpp
   RISCVHeader.cpp

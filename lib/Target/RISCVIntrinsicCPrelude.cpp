@@ -184,35 +184,49 @@ __weft_online_summary_merge_f32(
 void emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations) {
   bool usesExp =
-      implementations.contains(LocalImplementationLeaf::RVVF32Math);
+      implementations.contains(LocalPrimitiveKind::F32Math);
   bool usesRVVSymmetricI4I8 = implementations.contains(
-      LocalImplementationLeaf::RVVSymmetricI4I8N16);
+      {LocalPrimitiveKind::SymmetricI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 16, 1});
   bool usesRVVAffineI4I8 = implementations.contains(
-      LocalImplementationLeaf::RVVAffineI4I8N16);
+      {LocalPrimitiveKind::AffineI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 16, 1});
   bool usesRVVSymmetricI4I8M4 = implementations.contains(
-      LocalImplementationLeaf::RVVSymmetricI4I8M4N16);
+      {LocalPrimitiveKind::SymmetricI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 16, 4});
   bool usesRVVAffineI4I8M4 = implementations.contains(
-      LocalImplementationLeaf::RVVAffineI4I8M4N16);
+      {LocalPrimitiveKind::AffineI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 16, 4});
   bool usesIME1SymmetricI4I8 = implementations.contains(
-      LocalImplementationLeaf::IME1SymmetricI4I8N16);
+      {LocalPrimitiveKind::SymmetricI4I8,
+       CoreInstructionKind::SpacemitIME1MMA, 0, 1});
   bool usesIME1AffineI4I8 = implementations.contains(
-      LocalImplementationLeaf::IME1AffineI4I8N16);
+      {LocalPrimitiveKind::AffineI4I8,
+       CoreInstructionKind::SpacemitIME1MMA, 0, 1});
   bool usesIME1SymmetricI4I8M4 = implementations.contains(
-      LocalImplementationLeaf::IME1SymmetricI4I8M4N16);
+      {LocalPrimitiveKind::SymmetricI4I8,
+       CoreInstructionKind::SpacemitIME1MMA, 0, 4});
   bool usesIME1AffineI4I8M4 = implementations.contains(
-      LocalImplementationLeaf::IME1AffineI4I8M4N16);
+      {LocalPrimitiveKind::AffineI4I8,
+       CoreInstructionKind::SpacemitIME1MMA, 0, 4});
   bool usesGroupedI4I8RegisterL16 = implementations.contains(
-      LocalImplementationLeaf::RVVGroupedAffineI4I8Register, 16, kRVVE8M1);
+      {LocalPrimitiveKind::GroupedAffineI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 16, 0, kRVVE8M1, 0});
   bool usesGroupedI4I8RegisterL32 = implementations.contains(
-      LocalImplementationLeaf::RVVGroupedAffineI4I8Register, 32, kRVVE8M1);
+      {LocalPrimitiveKind::GroupedAffineI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 32, 0, kRVVE8M1, 0});
   bool usesGroupedI4I8Strip = implementations.contains(
-      LocalImplementationLeaf::RVVGroupedAffineI4I8Strip);
+      {LocalPrimitiveKind::GroupedAffineI4I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {}, 1});
   bool usesE2M1RegisterE8M1M2 = implementations.contains(
-      LocalImplementationLeaf::RVVE2M1E8M0I8RegisterM1M2);
+      {LocalPrimitiveKind::E2M1E8M0I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, kRVVE8M1, 0});
   bool usesE2M1RegisterE8MF2 = implementations.contains(
-      LocalImplementationLeaf::RVVE2M1E8M0I8RegisterMF2);
+      {LocalPrimitiveKind::E2M1E8M0I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {8, 4}, 0});
   bool usesE2M1Strip = implementations.contains(
-      LocalImplementationLeaf::RVVE2M1E8M0I8Strip);
+      {LocalPrimitiveKind::E2M1E8M0I8,
+       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {}, 1});
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
