@@ -1878,6 +1878,7 @@ struct QuantPrimitivePhysicalRule {
   llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
   unsigned predicateGroups = 0;
   unsigned reservedGroups = 1;
+  unsigned selectionPenalty = 0;
 };
 
 struct LocalPrimitivePhysicalCandidate {
@@ -1885,6 +1886,7 @@ struct LocalPrimitivePhysicalCandidate {
   RVVVectorShape laneShape;
   PhysicalResourceBudget resources;
   unsigned sequentialFactor = 0;
+  unsigned selectionPenalty = 0;
   unsigned laneGroups = 0;
   unsigned registerFactor = 0;
 };
@@ -1928,7 +1930,7 @@ enumerateLocalPrimitivePhysicalCandidates(
       continue;
     legal.push_back(LocalPrimitivePhysicalCandidate{
         std::move(implementation), laneShape, *budget, sequentialFactor,
-        rvvRegisterGroups(laneShape), registerFactor});
+        rule->selectionPenalty, rvvRegisterGroups(laneShape), registerFactor});
   }
   return legal;
 }
@@ -2216,6 +2218,12 @@ derivePackedI3QuantRule(const LocalAxisMappingCandidate &candidate,
       {1, PhysicalMemoryMode::UnitStride, 1, 1, true}};
   rule.decode = {3, std::max(1u, candidate.axis.laneFactor / 16),
                  std::max(1u, logicalLanes / 16)};
+  rule.selectionPenalty =
+      *productShape == *segmentProductShape
+          ? 0
+          : std::max(1u, candidate.axis.laneFactor / 16);
+  if (laneShape.lmulEighths < 8)
+    rule.selectionPenalty += 3;
   rule.liveValues = {
       {PhysicalLiveClass::Memory, laneShape,
        AxisMappedMultiplicity::RegisterFactor, candidate.axis.id, 3},
@@ -2479,10 +2487,12 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     return std::nullopt;
   llvm::sort(legal, [](const LocalPrimitivePhysicalCandidate &lhs,
                        const LocalPrimitivePhysicalCandidate &rhs) {
-    return std::tie(lhs.sequentialFactor, lhs.laneGroups,
-                    lhs.resources.peakGroups, lhs.registerFactor) <
-           std::tie(rhs.sequentialFactor, rhs.laneGroups,
-                    rhs.resources.peakGroups, rhs.registerFactor);
+    return std::tie(lhs.sequentialFactor, lhs.selectionPenalty,
+                    lhs.registerFactor, lhs.laneGroups,
+                    lhs.resources.peakGroups) <
+           std::tie(rhs.sequentialFactor, rhs.selectionPenalty,
+                    rhs.registerFactor, rhs.laneGroups,
+                    rhs.resources.peakGroups);
   });
   LocalPrimitivePhysicalCandidate selected = std::move(legal.front());
   return SelectedQuantI8DotPhysical{std::move(selected.implementation),
