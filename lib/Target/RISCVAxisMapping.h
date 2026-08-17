@@ -157,7 +157,7 @@ struct LocalPipelineMapping {
 
 struct CorePhysicalMapping {
   CoreInstructionKind instruction = CoreInstructionKind::None;
-  unsigned laneAxis = 0;
+  std::optional<unsigned> laneAxis;
   llvm::SmallVector<PhysicalAxisDecomposition, 4> axes;
   RVVVectorShape laneShape;
   LocalPipelineMapping pipeline;

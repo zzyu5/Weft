@@ -354,14 +354,18 @@ findAxisMapping(const CorePhysicalMapping &mapping, unsigned axis) {
 }
 
 unsigned mappedLaneSpan(const CorePhysicalMapping &mapping) {
+  if (!mapping.laneAxis)
+    return 0;
   const PhysicalAxisDecomposition *axis =
-      findAxisMapping(mapping, mapping.laneAxis);
+      findAxisMapping(mapping, *mapping.laneAxis);
   return axis ? axis->laneFactor * axis->registerFactor : 0;
 }
 
 unsigned mappedHardwareLaneFactor(const CorePhysicalMapping &mapping) {
+  if (!mapping.laneAxis)
+    return 0;
   const PhysicalAxisDecomposition *axis =
-      findAxisMapping(mapping, mapping.laneAxis);
+      findAxisMapping(mapping, *mapping.laneAxis);
   return axis ? axis->laneFactor : 0;
 }
 

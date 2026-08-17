@@ -1015,7 +1015,10 @@ private:
         decisionFailure = true;
         return;
       }
-      finalizeAffineI4I8Plan(dot, planned);
+      if (mlir::failed(finalizeAffineI4I8Plan(dot, planned))) {
+        decisionFailure = true;
+        return;
+      }
       registerDecision(physicalPlan.affineI4I8, dot.getOperation(),
                        std::move(planned), "affine_i4_i8_dot");
     });
@@ -1054,7 +1057,10 @@ private:
         decisionFailure = true;
         return;
       }
-      finalizeSymmetricI4I8Plan(op, planned);
+      if (mlir::failed(finalizeSymmetricI4I8Plan(op, planned))) {
+        decisionFailure = true;
+        return;
+      }
       registerDecision(physicalPlan.symmetricI4I8, op.getOperation(),
                        std::move(planned), "symmetric_i4_i8_dot");
     });
@@ -1706,6 +1712,21 @@ private:
     if (!handoff || handoff->kind != kind || !handoff->sourceShape ||
         !handoff->resultShape)
       return owner->emitError("local primitive physical handoff is incomplete");
+    return mlir::success();
+  }
+
+  mlir::LogicalResult requirePhysicalStorage(
+      mlir::Operation *owner, const PhysicalEntityPlan &entity,
+      mlir::Value value, mlir::Value reusedStorage) const {
+    auto found = llvm::find_if(
+        entity.storages, [&](const PhysicalStorageDecision &storage) {
+          return storage.value == value;
+        });
+    if (found == entity.storages.end() ||
+        found->reusedStorage != reusedStorage || found->elements <= 0 ||
+        found->axisIds.empty() ||
+        found->axisIds.size() != found->strides.size())
+      return owner->emitError("local primitive physical storage is incomplete");
     return mlir::success();
   }
 
@@ -5551,7 +5572,9 @@ private:
     }
     std::optional<unsigned> lmul = rvvIntegerLMUL(dotShape);
     const PhysicalAxisDecomposition *laneAxis =
-        findAxisMapping(decision.mapping, decision.mapping.laneAxis);
+        decision.mapping.laneAxis
+            ? findAxisMapping(decision.mapping, *decision.mapping.laneAxis)
+            : nullptr;
     const PhysicalAxisDecomposition *mAxis =
         findAxisMapping(decision.mapping, kCoreAxisM);
     const PhysicalAxisDecomposition *reductionAxis =
@@ -7232,12 +7255,9 @@ private:
     mlir::Operation *definition = value.getDefiningOp();
     if (!definition)
       return std::nullopt;
-    if (auto full = mlir::dyn_cast<FullOp>(definition)) {
-      auto selected = materializedBlockElements.find(full.getOperation());
-      return selected == materializedBlockElements.end()
-                 ? std::nullopt
-                 : std::optional<int64_t>(selected->second);
-    }
+    if (auto selected = materializedBlockElements.find(definition);
+        selected != materializedBlockElements.end())
+      return selected->second;
     if (auto dot = mlir::dyn_cast<DotOp>(definition)) {
       auto selected = physicalPlan.dots.find(dot.getOperation());
       return selected == physicalPlan.dots.end()
@@ -7265,22 +7285,7 @@ private:
         if (auto selected = controlBlockElements.find(value);
             selected != controlBlockElements.end())
           return selected->second;
-    auto block = mlir::dyn_cast<BlockType>(unwrapLogicalValidity(value.getType()));
-    if (!block || !block.getElementType().isF32())
-      return std::nullopt;
-    int64_t elements = 1;
-    for (int64_t dimension : block.getShape()) {
-      std::optional<int64_t> extended = extendPrivateStorageElementCount(
-          elements, dimension, sizeof(float), options.target);
-      if (!extended)
-        return std::nullopt;
-      elements = *extended;
-    }
-    bool structuredPrimitive =
-        physicalPlan.affineI4I8.contains(definition) ||
-        physicalPlan.symmetricI4I8.contains(definition);
-    return structuredPrimitive ? std::optional<int64_t>(elements)
-                               : std::nullopt;
+    return std::nullopt;
   }
 
   std::optional<int64_t> materializedF32ElementCount(mlir::Value value) const {
@@ -7693,8 +7698,8 @@ private:
   }
 
   template <typename OpTy, typename Decision>
-  void finalizeI4I8Plan(
-      OpTy op, PlannedPhysicalDecision<Decision> &planned) const {
+  mlir::LogicalResult
+  finalizeI4I8Plan(OpTy op, PlannedPhysicalDecision<Decision> &planned) {
     initializeEntityPlan(planned.entity);
     recordPhysicalValue(planned.entity, planned.realization.activation,
                         planned.realization.codeShape);
@@ -7715,19 +7720,31 @@ private:
                           PhysicalHandoff::Share,
                           planned.realization.accumulatorShape,
                           planned.realization.accumulatorShape);
+    recordPhysicalHandoff(planned.entity, op.getOperation(), op.getResult(),
+                          PhysicalHandoff::LocalPack,
+                          planned.realization.accumulatorShape,
+                          planned.realization.accumulatorShape);
+    std::optional<PhysicalStorageDecision> storage =
+        deriveMaterializedBlockStorage(op.getResult(), op.getInit(), 16);
+    if (!storage)
+      return op.emitError(
+          "i4/i8 local primitive has no selected result storage layout");
+    materializedBlockElements.try_emplace(op.getOperation(), storage->elements);
+    planned.entity.storages.push_back(std::move(*storage));
     planned.entity.resources = planned.realization.resources;
+    return mlir::success();
   }
 
-  void finalizeSymmetricI4I8Plan(
+  mlir::LogicalResult finalizeSymmetricI4I8Plan(
       SymmetricI4I8DotOp op,
-      PlannedPhysicalDecision<SymmetricI4I8Decision> &planned) const {
-    finalizeI4I8Plan(op, planned);
+      PlannedPhysicalDecision<SymmetricI4I8Decision> &planned) {
+    return finalizeI4I8Plan(op, planned);
   }
 
-  void finalizeAffineI4I8Plan(
+  mlir::LogicalResult finalizeAffineI4I8Plan(
       AffineI4I8DotOp op,
-      PlannedPhysicalDecision<AffineI4I8Decision> &planned) const {
-    finalizeI4I8Plan(op, planned);
+      PlannedPhysicalDecision<AffineI4I8Decision> &planned) {
+    return finalizeI4I8Plan(op, planned);
   }
 
   void finalizeSignBitI8Plan(
@@ -7943,6 +7960,16 @@ private:
     if (mlir::failed(requirePhysicalHandoff(
             op.getOperation(), selected->second.entity, decision.activation,
             PhysicalHandoff::LocalPack)))
+      return mlir::failure();
+    if (mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, op.getInit(),
+            PhysicalHandoff::Share)) ||
+        mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, op.getResult(),
+            PhysicalHandoff::LocalPack)) ||
+        mlir::failed(requirePhysicalStorage(
+            op.getOperation(), selected->second.entity, op.getResult(),
+            op.getInit())))
       return mlir::failure();
     if (decision.rowTile == 4 &&
         mlir::failed(requirePhysicalHandoff(
@@ -9074,6 +9101,16 @@ private:
             op.getOperation(), selected->second.entity, decision.activation,
             PhysicalHandoff::LocalPack)))
       return mlir::failure();
+    if (mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, op.getInit(),
+            PhysicalHandoff::Share)) ||
+        mlir::failed(requirePhysicalHandoff(
+            op.getOperation(), selected->second.entity, op.getResult(),
+            PhysicalHandoff::LocalPack)) ||
+        mlir::failed(requirePhysicalStorage(
+            op.getOperation(), selected->second.entity, op.getResult(),
+            op.getInit())))
+      return mlir::failure();
     if (decision.rowTile == 4 &&
         mlir::failed(requirePhysicalHandoff(
             op.getOperation(), selected->second.entity,
@@ -9236,7 +9273,8 @@ private:
         findAxisMapping(decision.mapping, kCoreAxisN);
     const PhysicalAxisDecomposition *kAxis =
         findAxisMapping(decision.mapping, kCoreAxisK);
-    if (decision.mapping.laneAxis != kCoreAxisN || !mAxis || !nAxis ||
+    if (decision.mapping.laneAxis != std::optional<unsigned>(kCoreAxisN) ||
+        !mAxis || !nAxis ||
         !kAxis || nAxis->laneFactor == 0 || nAxis->registerFactor != 1 ||
         kAxis->laneFactor != 1 || kAxis->unrollFactor == 0 ||
         decision.mapping.pipeline.bufferCount != 1 ||
@@ -9452,10 +9490,10 @@ private:
     if (accumulator.kind != CValueKind::F32BlockStorage ||
         accumulator.spelling.empty())
       return op.emitError("F16 matmul accumulator storage is unavailable");
-    if (decision.mapping.laneAxis == kCoreAxisN)
+    if (decision.mapping.laneAxis == std::optional<unsigned>(kCoreAxisN))
       return emitF16MatmulColumnLane(op, decision, *resultStorage, accumulator,
                                      *inputLMUL, *computeLMUL);
-    if (decision.mapping.laneAxis != kCoreAxisK)
+    if (decision.mapping.laneAxis != std::optional<unsigned>(kCoreAxisK))
       return op.emitError("F16 matmul lane axis has no intrinsic-C projection");
     LoadOp lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
     LoadOp rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);

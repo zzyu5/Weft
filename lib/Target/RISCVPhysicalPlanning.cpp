@@ -15,8 +15,10 @@
 namespace weft::riscv_internal {
 
 static unsigned localLaneFactor(const LocalImplementation &implementation) {
+  if (!implementation.mapping.laneAxis)
+    return 0;
   const PhysicalAxisDecomposition *axis = findAxisMapping(
-      implementation.mapping, implementation.mapping.laneAxis);
+      implementation.mapping, *implementation.mapping.laneAxis);
   return axis ? axis->laneFactor * axis->registerFactor : 0;
 }
 
@@ -2190,7 +2192,7 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
     const PhysicalAxisDecomposition *laneAxis =
-        findAxisMapping(mapping, mapping.laneAxis);
+        mapping.laneAxis ? findAxisMapping(mapping, *mapping.laneAxis) : nullptr;
     const PhysicalAxisDecomposition *reduction =
         findAxisMapping(mapping, kCoreAxisK);
     if (!laneAxis || !reduction ||
@@ -2364,7 +2366,7 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
     const PhysicalAxisDecomposition *k =
         findAxisMapping(mapping, kCoreAxisK);
     const PhysicalAxisDecomposition *lane =
-        findAxisMapping(mapping, mapping.laneAxis);
+        mapping.laneAxis ? findAxisMapping(mapping, *mapping.laneAxis) : nullptr;
     std::optional<unsigned> inputLMUL = rvvIntegerLMUL(mapping.laneShape);
     std::optional<RVVVectorShape> accumulatorShape =
         rvvShapeForSameLanes(mapping.laneShape, 32, target);
