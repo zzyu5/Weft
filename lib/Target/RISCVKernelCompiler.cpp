@@ -584,19 +584,23 @@ struct F16GemmNTileDecision {
   CorePhysicalMapping mapping;
 };
 
+struct LocalDotOperandDecision {
+  mlir::Value value;
+  mlir::Operation *load = nullptr;
+  bool registerMapped = false;
+  PhysicalMemoryMode reductionMemoryMode = PhysicalMemoryMode::UnitStride;
+  std::optional<AffineScalarExpression> reductionStride;
+};
+
 struct DotDecision {
   mlir::Operation *operation = nullptr;
   CorePhysicalMapping mapping;
-  mlir::Operation *lhsLoad = nullptr;
-  mlir::Operation *rhsLoad = nullptr;
+  LocalDotOperandDecision lhs;
+  LocalDotOperandDecision rhs;
   mlir::Value rowAxis;
   mlir::Value reductionAxis;
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
-  PhysicalMemoryMode lhsMemoryMode = PhysicalMemoryMode::UnitStride;
-  PhysicalMemoryMode rhsMemoryMode = PhysicalMemoryMode::UnitStride;
-  std::optional<AffineScalarExpression> lhsLaneStride;
-  std::optional<AffineScalarExpression> rhsLaneStride;
 };
 
 struct LocalDenseProductAnalysis {
@@ -6017,70 +6021,70 @@ private:
       return mlir::failure();
     }
     const bool freeOnLHS = static_cast<bool>(analysis->lhsFreeAxis);
-    LoadOp rowLoad = freeOnLHS ? analysis->lhsLoad : analysis->rhsLoad;
-    LoadOp reductionLoad = freeOnLHS ? analysis->rhsLoad : analysis->lhsLoad;
     BlockIndexOp rowAxis =
         freeOnLHS ? analysis->lhsFreeAxis : analysis->rhsFreeAxis;
-    LaneRelation rowRelation = freeOnLHS
-                                   ? analysis->lhsReductionRelation
-                                   : analysis->rhsReductionRelation;
-    LaneRelation reductionRelation = freeOnLHS
-                                         ? analysis->rhsReductionRelation
-                                         : analysis->lhsReductionRelation;
-    std::optional<AffineScalarExpression> rowStride =
-        freeOnLHS ? analysis->lhsReductionStride
-                  : analysis->rhsReductionStride;
-    std::optional<AffineScalarExpression> reductionStride =
-        freeOnLHS ? analysis->rhsReductionStride
-                  : analysis->lhsReductionStride;
-    if (!isTrue(reductionLoad.getWhere()) ||
-        valueDependsOnAxis(rowLoad.getWhere(),
-                           analysis->reductionAxis.getResult()) ||
-        (!isTrue(rowLoad.getWhere()) &&
-         !isFloatConstant(rowLoad.getOther(), 0.0))) {
-      dot.emitError("local f32 dot predicate facts are unavailable");
-      return mlir::failure();
-    }
 
     PlannedPhysicalDecision<DotDecision> planned;
     DotDecision &decision = planned.realization;
     decision.operation = dot.getOperation();
-    decision.lhsLoad = rowLoad.getOperation();
-    decision.rhsLoad = reductionLoad.getOperation();
+    decision.lhs = LocalDotOperandDecision{
+        dot.getLhs(), analysis->lhsLoad.getOperation(), freeOnLHS,
+        analysis->lhsReductionRelation == LaneRelation::UnitStride
+            ? PhysicalMemoryMode::UnitStride
+            : PhysicalMemoryMode::Strided,
+        analysis->lhsReductionStride};
+    decision.rhs = LocalDotOperandDecision{
+        dot.getRhs(), analysis->rhsLoad.getOperation(), !freeOnLHS,
+        analysis->rhsReductionRelation == LaneRelation::UnitStride
+            ? PhysicalMemoryMode::UnitStride
+            : PhysicalMemoryMode::Strided,
+        analysis->rhsReductionStride};
     decision.rowAxis = rowAxis.getResult();
     decision.reductionAxis = analysis->reductionAxis.getResult();
     decision.reductionExtent = analysis->reductionAxis.getExtent();
     decision.rowTile = freeOnLHS ? analysis->lhsFreeExtent
                                  : analysis->rhsFreeExtent;
-    decision.lhsMemoryMode = rowRelation == LaneRelation::UnitStride
-                                 ? PhysicalMemoryMode::UnitStride
-                                 : PhysicalMemoryMode::Strided;
-    decision.rhsMemoryMode = reductionRelation == LaneRelation::UnitStride
-                                 ? PhysicalMemoryMode::UnitStride
-                                 : PhysicalMemoryMode::Strided;
-    decision.lhsLaneStride = rowStride;
-    decision.rhsLaneStride = reductionStride;
+    for (const LocalDotOperandDecision *operand :
+         {&decision.lhs, &decision.rhs}) {
+      auto load = mlir::cast<LoadOp>(operand->load);
+      if ((operand->registerMapped &&
+           valueDependsOnAxis(load.getWhere(), decision.reductionAxis)) ||
+          (!operand->registerMapped && !isTrue(load.getWhere())) ||
+          (!isTrue(load.getWhere()) &&
+           !isFloatConstant(load.getOther(), 0.0))) {
+        dot.emitError(
+            "local f32 dot predicate facts are incompatible with its axis mapping");
+        return mlir::failure();
+      }
+    }
     F32DotCandidateFacts candidateFacts;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
-        {rowLoad, reductionLoad}, {dot.getInit(), dot.getResult()});
+        {analysis->lhsLoad, analysis->rhsLoad},
+        {dot.getInit(), dot.getResult()});
     candidateFacts.reductionExtent = analysis->reductionExtent;
-    candidateFacts.mapping = analysis->mapping;
+    candidateFacts.mapping.axes = {
+        LogicalAxisConstraint{
+            kCoreAxisM, LogicalAxisRole::Free, decision.rowTile, false, false,
+            false,
+            registerFactorCandidates(decision.rowTile,
+                                     std::min(decision.rowTile, 8u))},
+        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
+                              analysis->reductionExtent, false, true, true,
+                              {1}}};
+    candidateFacts.mapping.unrollAxis = kCoreAxisK;
     if (freeOnLHS) {
       candidateFacts.lhsAxes = {kCoreAxisM, kCoreAxisK};
       candidateFacts.rhsAxes = {kCoreAxisK};
     } else {
       candidateFacts.lhsAxes = {kCoreAxisK};
       candidateFacts.rhsAxes = {kCoreAxisM, kCoreAxisK};
-      for (LogicalAxisConstraint &axis : candidateFacts.mapping.axes)
-        if (axis.id == kCoreAxisN)
-          axis.id = kCoreAxisM;
     }
     candidateFacts.unitStrideOperands =
-        (rowRelation == LaneRelation::UnitStride) +
-        (reductionRelation == LaneRelation::UnitStride);
+        (analysis->lhsReductionRelation == LaneRelation::UnitStride) +
+        (analysis->rhsReductionRelation == LaneRelation::UnitStride);
     candidateFacts.stridedOperands =
-        (rowRelation == LaneRelation::Strided) +
-        (reductionRelation == LaneRelation::Strided);
+        (analysis->lhsReductionRelation == LaneRelation::Strided) +
+        (analysis->rhsReductionRelation == LaneRelation::Strided);
     std::optional<SelectedF32DotPhysical> physical =
         weft::riscv_internal::selectF32DotPhysicalConfig(
             candidateFacts, options.target, options.backend);
@@ -6123,10 +6127,13 @@ private:
     CValue init = require(dot.getInit());
     if (init.kind != CValueKind::F32BlockStorage || init.spelling.empty())
       return dot.emitError("local dot init block storage is unavailable");
-    auto lhsLoad = mlir::cast<LoadOp>(decision.lhsLoad);
-    auto rhsLoad = mlir::cast<LoadOp>(decision.rhsLoad);
+    auto lhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.lhs.load);
+    auto rhsLoad = mlir::dyn_cast_or_null<LoadOp>(decision.rhs.load);
     std::string extent = expression(decision.reductionExtent);
-    if (extent.empty())
+    if (!lhsLoad || !rhsLoad || decision.lhs.value != dot.getLhs() ||
+        decision.rhs.value != dot.getRhs() ||
+        decision.lhs.registerMapped == decision.rhs.registerMapped ||
+        extent.empty())
       return dot.emitError(
           "local f32 dot access projection is unavailable");
 
@@ -6166,19 +6173,22 @@ private:
     line("const size_t " + fullVL + " = __riscv_vsetvlmax_e32m" +
          std::to_string(*lmul) + "();");
 
-    llvm::SmallVector<std::string> lhsActive;
+    const LocalDotOperandDecision &registerOperand =
+        decision.lhs.registerMapped ? decision.lhs : decision.rhs;
+    auto registerLoad = mlir::cast<LoadOp>(registerOperand.load);
+    llvm::SmallVector<std::string> rowActive;
     for (unsigned lane = 0; lane < decision.rowTile; ++lane) {
       llvm::DenseMap<mlir::Value, std::string> axes;
       axes[decision.rowAxis] = std::to_string(lane);
       axes[decision.reductionAxis] = "0";
-      std::optional<std::string> lhsPredicate =
-          projectBlockScalar(lhsLoad.getWhere(), axes);
-      if (!lhsPredicate)
+      std::optional<std::string> predicate =
+          projectBlockScalar(registerLoad.getWhere(), axes);
+      if (!predicate)
         return dot.emitError(
             "local f32 dot row projection is unavailable");
-      std::string lhsCondition = fresh("dot_lhs_active");
-      line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
-      lhsActive.push_back(std::move(lhsCondition));
+      std::string condition = fresh("dot_row_active");
+      line("const bool " + condition + " = " + *predicate + ";");
+      rowActive.push_back(std::move(condition));
     }
 
     auto emitCompute = [&](unsigned rowBase, unsigned rowCount,
@@ -6192,79 +6202,103 @@ private:
       }
       std::string strip = fresh("dot_k");
       std::string vl = fresh("dot_vl");
-      struct LoadedChunk {
-        std::string rhs;
-        llvm::SmallVector<std::string, 8> lhs;
+      struct LoadedOperand {
+        std::string shared;
+        llvm::SmallVector<std::string, 8> rows;
       };
-      auto emitLoadChunk = [&](llvm::StringRef coordinate,
-                               LoadedChunk &loaded) -> mlir::LogicalResult {
-        loaded = LoadedChunk{};
-        llvm::DenseMap<mlir::Value, std::string> rhsAxes;
-        rhsAxes[decision.reductionAxis] = coordinate.str();
-        std::optional<std::string> rhs =
-            projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-        std::optional<std::string> rhsLaneStride =
-            decision.rhsLaneStride
-                ? spellAffineScalarExpression(*decision.rhsLaneStride, rhsAxes)
-                : std::optional<std::string>("1");
-        if (!rhs || !rhsLaneStride)
-          return dot.emitError(
-              "local f32 dot RHS projection is unavailable");
-        loaded.rhs = fresh("dot_rhs");
-        if (decision.rhsMemoryMode == PhysicalMemoryMode::UnitStride)
-          line(vectorType + " " + loaded.rhs + " = __riscv_vle32_v_" +
-               vectorSuffix + "(" + *rhs + ", " + vl + ");");
-        else
-          line(vectorType + " " + loaded.rhs + " = __riscv_vlse32_v_" +
-               vectorSuffix + "(" + *rhs +
-               ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
-               vl + ");");
+      struct LoadedChunk {
+        LoadedOperand lhs;
+        LoadedOperand rhs;
+      };
+      auto emitLoadOperand =
+          [&](const LocalDotOperandDecision &operand,
+              llvm::StringRef coordinate, llvm::StringRef prefix,
+              LoadedOperand &loaded) -> mlir::LogicalResult {
+        auto load = mlir::cast<LoadOp>(operand.load);
+        auto emitOne = [&](llvm::DenseMap<mlir::Value, std::string> axes,
+                           std::optional<unsigned> row)
+            -> mlir::FailureOr<std::string> {
+          std::optional<std::string> pointer =
+              projectBlockScalar(load.getPointer(), axes);
+          std::optional<std::string> stride =
+              operand.reductionStride
+                  ? spellAffineScalarExpression(*operand.reductionStride, axes)
+                  : std::optional<std::string>("1");
+          if (!pointer || !stride)
+            return mlir::failure();
+          std::string vector = fresh(prefix);
+          const bool guardedRow = guarded && row.has_value();
+          if (guardedRow) {
+            line(vectorType + " " + vector + " = __riscv_vfmv_v_f_" +
+                 vectorSuffix + "(0.0f, " + vl + ");");
+            line("if (" + rowActive[rowBase + *row] + ") {");
+            ++indent;
+          }
+          std::string declaration = guardedRow ? "" : vectorType + " ";
+          if (operand.reductionMemoryMode == PhysicalMemoryMode::UnitStride)
+            line(declaration + vector + " = __riscv_vle32_v_" +
+                 vectorSuffix + "(" + *pointer + ", " + vl + ");");
+          else if (operand.reductionMemoryMode ==
+                   PhysicalMemoryMode::Strided)
+            line(declaration + vector + " = __riscv_vlse32_v_" +
+                 vectorSuffix + "(" + *pointer +
+                 ", (ptrdiff_t)(sizeof(float) * (" + *stride + ")), " + vl +
+                 ");");
+          else
+            return mlir::failure();
+          if (guardedRow) {
+            --indent;
+            line("}");
+          }
+          return vector;
+        };
+        if (!operand.registerMapped) {
+          llvm::DenseMap<mlir::Value, std::string> axes;
+          axes[decision.reductionAxis] = coordinate.str();
+          mlir::FailureOr<std::string> vector = emitOne(std::move(axes), {});
+          if (mlir::failed(vector))
+            return dot.emitError(
+                "local f32 dot shared operand projection is unavailable");
+          loaded.shared = std::move(*vector);
+          return mlir::success();
+        }
         for (unsigned row = 0; row < rowCount; ++row) {
           llvm::DenseMap<mlir::Value, std::string> axes;
           axes[decision.rowAxis] = std::to_string(rowBase + row);
           axes[decision.reductionAxis] = coordinate.str();
-          std::optional<std::string> lhs =
-              projectBlockScalar(lhsLoad.getPointer(), axes);
-          std::optional<std::string> lhsLaneStride =
-              decision.lhsLaneStride
-                  ? spellAffineScalarExpression(*decision.lhsLaneStride, axes)
-                  : std::optional<std::string>("1");
-          if (!lhs || !lhsLaneStride)
+          mlir::FailureOr<std::string> vector = emitOne(std::move(axes), row);
+          if (mlir::failed(vector))
             return dot.emitError(
-                "local f32 dot LHS projection is unavailable");
-          std::string lhsVector = fresh("dot_lhs");
-          if (guarded) {
-            line(vectorType + " " + lhsVector + " = __riscv_vfmv_v_f_" +
-                 vectorSuffix + "(0.0f, " + vl + ");");
-            line("if (" + lhsActive[rowBase + row] + ") {");
-            ++indent;
-          }
-          if (decision.lhsMemoryMode == PhysicalMemoryMode::UnitStride)
-            line(std::string(guarded ? "" : vectorType + " ") + lhsVector +
-                 " = __riscv_vle32_v_" + vectorSuffix + "(" + *lhs + ", " +
-                 vl + ");");
-          else
-            line(std::string(guarded ? "" : vectorType + " ") + lhsVector +
-                 " = __riscv_vlse32_v_" + vectorSuffix + "(" + *lhs +
-                 ", (ptrdiff_t)(sizeof(float) * (" + *lhsLaneStride + ")), " +
-                 vl + ");");
-          if (guarded) {
-            --indent;
-            line("}");
-          }
-          loaded.lhs.push_back(std::move(lhsVector));
+                "local f32 dot register operand projection is unavailable");
+          loaded.rows.push_back(std::move(*vector));
         }
+        return mlir::success();
+      };
+      auto emitLoadChunk = [&](llvm::StringRef coordinate,
+                               LoadedChunk &loaded) -> mlir::LogicalResult {
+        loaded = LoadedChunk{};
+        if (mlir::failed(emitLoadOperand(decision.lhs, coordinate, "dot_lhs",
+                                         loaded.lhs)) ||
+            mlir::failed(emitLoadOperand(decision.rhs, coordinate, "dot_rhs",
+                                         loaded.rhs)))
+          return mlir::failure();
         return mlir::success();
       };
       auto emitAccumulateChunk = [&](const LoadedChunk &loaded) {
         for (unsigned row = 0; row < rowCount; ++row) {
           if (guarded) {
-            line("if (" + lhsActive[rowBase + row] + ") {");
+            line("if (" + rowActive[rowBase + row] + ") {");
             ++indent;
           }
+          llvm::StringRef lhs = decision.lhs.registerMapped
+                                    ? loaded.lhs.rows[row]
+                                    : loaded.lhs.shared;
+          llvm::StringRef rhs = decision.rhs.registerMapped
+                                    ? loaded.rhs.rows[row]
+                                    : loaded.rhs.shared;
           line(accumulators[row] + " = __riscv_vfmacc_vv_" + vectorSuffix +
-               "_tu(" + accumulators[row] + ", " + loaded.lhs[row] + ", " +
-               loaded.rhs + ", " + vl + ");");
+               "_tu(" + accumulators[row] + ", " + lhs.str() + ", " +
+               rhs.str() + ", " + vl + ");");
           if (guarded) {
             --indent;
             line("}");
@@ -6356,7 +6390,7 @@ private:
 
     std::string fullTile = fresh("dot_full_tile");
     line("const bool " + fullTile + " = " +
-         llvm::join(lhsActive, " && ") + ";");
+         llvm::join(rowActive, " && ") + ";");
     line("if (" + fullTile + ") {");
     ++indent;
     for (unsigned rowBase = 0; rowBase < decision.rowTile;
