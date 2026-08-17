@@ -125,25 +125,15 @@ std::optional<SelectedBlockOperationPhysical>
 selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
                              const RISCVTargetProfile &target);
 
-enum class BlockStoreRealization {
-  RVVMicroStrips,
-  RVVFixedStrips,
-  RVVDynamicStrips,
-};
-
 struct BlockStorePhysicalDecision {
-  BlockStoreRealization realization = BlockStoreRealization::RVVFixedStrips;
-  RVVVectorShape byteShape;
-  unsigned stripVL = 0;
+  CorePhysicalMapping mapping;
   bool needsLaneVector = false;
   RVVVectorShape laneShape;
 };
 
 struct BlockStoreCandidateFacts {
-  int64_t extent = 0;
+  CoreMappingProblem mapping;
   bool needsLaneVector = false;
-  bool supportsMicroStripOperations = false;
-  bool supportsStandardOperations = false;
 };
 
 struct SelectedBlockStorePhysical {
@@ -155,22 +145,15 @@ std::optional<SelectedBlockStorePhysical>
 selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
                          const RISCVTargetProfile &target);
 
-enum class BlockReduceRealization {
-  RVVFixedStrips,
-  RVVDynamicStrips,
-};
-
 struct BlockReducePhysicalDecision {
-  BlockReduceRealization realization = BlockReduceRealization::RVVFixedStrips;
-  unsigned stripVL = 0;
+  CorePhysicalMapping mapping;
   bool needsLaneVector = false;
   RVVVectorShape laneShape;
 };
 
 struct BlockReduceCandidateFacts {
-  int64_t extent = 0;
+  CoreMappingProblem mapping;
   bool needsLaneVector = false;
-  bool supportsStandardOperations = false;
   RVVVectorShape inputShape;
 };
 

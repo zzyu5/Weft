@@ -463,80 +463,116 @@ selectBlockOperationPhysical(const BlockOperationCandidateFacts &facts,
 std::optional<SelectedBlockStorePhysical>
 selectBlockStorePhysical(const BlockStoreCandidateFacts &facts,
                          const RISCVTargetProfile &target) {
-  llvm::SmallVector<BlockStorePhysicalDecision> candidates;
-  if (facts.supportsMicroStripOperations &&
-      target.supportsVectorShape(kRVVE8MF4.sew,
-                                 kRVVE8MF4.lmulEighths))
-    candidates.push_back(BlockStorePhysicalDecision{
-        BlockStoreRealization::RVVMicroStrips, kRVVE8MF4, 4, false, {}});
-  if (facts.supportsStandardOperations &&
-      target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths)) {
-    candidates.push_back(BlockStorePhysicalDecision{
-        BlockStoreRealization::RVVFixedStrips, kRVVE8M1, 16, false, {}});
-    if (!facts.needsLaneVector ||
-        target.supportsVectorShape(kRVVE16M2.sew,
-                                   kRVVE16M2.lmulEighths))
-      candidates.push_back(BlockStorePhysicalDecision{
-          BlockStoreRealization::RVVDynamicStrips, kRVVE8M1, 16,
-          facts.needsLaneVector,
-          facts.needsLaneVector ? kRVVE16M2 : RVVVectorShape{}});
-  }
-  for (const BlockStorePhysicalDecision &candidate : candidates) {
-    if (candidate.realization == BlockStoreRealization::RVVMicroStrips &&
-        (facts.needsLaneVector || facts.extent != 32))
+  if (facts.mapping.axes.size() != 1 ||
+      facts.mapping.axes.front().id != kCoreAxisBlock ||
+      facts.mapping.axes.front().role != LogicalAxisRole::Free ||
+      !facts.mapping.axes.front().extent ||
+      !facts.mapping.axes.front().requireLane)
+    return std::nullopt;
+  struct Candidate {
+    SelectedBlockStorePhysical physical;
+    unsigned sequentialFactor = 0;
+    unsigned peakGroups = 0;
+  };
+  llvm::SmallVector<Candidate, 8> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(facts.mapping, target)) {
+    const PhysicalAxisDecomposition *axis =
+        findAxisMapping(mapping, kCoreAxisBlock);
+    if (!axis || !mapping.laneShape || mapping.laneShape.sew != 8 ||
+        axis->laneFactor == 0 || axis->registerFactor == 0)
       continue;
-    if (candidate.realization == BlockStoreRealization::RVVFixedStrips &&
-        (facts.needsLaneVector || facts.extent != 32))
+    const unsigned laneFactor = axis->laneFactor;
+    const unsigned registerFactor = axis->registerFactor;
+    const unsigned sequentialFactor = axis->sequentialFactor;
+    const uint64_t realized =
+        static_cast<uint64_t>(laneFactor) * registerFactor;
+    if ((sequentialFactor == 1 && realized != *axis->extent) ||
+        (sequentialFactor > 1 && registerFactor != 1) ||
+        (facts.needsLaneVector && registerFactor != 1))
       continue;
-    unsigned dataGroups = candidate.byteShape == kRVVE8MF4 ? 4 : 8;
+    RVVVectorShape laneShape;
+    if (facts.needsLaneVector) {
+      std::optional<RVVVectorShape> selectedLane =
+          rvvShapeForSameLanes(mapping.laneShape, 16, target);
+      if (!selectedLane)
+        continue;
+      laneShape = *selectedLane;
+    }
     PhysicalResourceRequirements requirements;
-    requirements.live = {{PhysicalLiveClass::Value, {}, 1, dataGroups}};
-    if (candidate.laneShape)
+    requirements.live = {{PhysicalLiveClass::Value, mapping.laneShape,
+                          registerFactor, 0}};
+    if (laneShape)
       requirements.live.push_back(
-          {PhysicalLiveClass::Memory, candidate.laneShape, 1, 0});
+          {PhysicalLiveClass::Index, laneShape, 1, 0});
     std::optional<PhysicalResourceBudget> resources =
         calculatePhysicalResources(requirements, target);
     if (!resources)
       continue;
-    return SelectedBlockStorePhysical{candidate, *resources};
+    SelectedBlockStorePhysical selected;
+    selected.decision.mapping = std::move(mapping);
+    selected.decision.needsLaneVector = facts.needsLaneVector;
+    selected.decision.laneShape = laneShape;
+    selected.resources = *resources;
+    legal.push_back(
+        Candidate{std::move(selected), sequentialFactor, resources->peakGroups});
   }
-  return std::nullopt;
+  if (legal.empty())
+    return std::nullopt;
+  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+    return std::tie(lhs.sequentialFactor, lhs.peakGroups) <
+           std::tie(rhs.sequentialFactor, rhs.peakGroups);
+  });
+  return std::move(legal.front().physical);
 }
 
 std::optional<SelectedBlockReducePhysical>
 selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
                           const RISCVTargetProfile &target) {
-  if (!facts.supportsStandardOperations || !facts.inputShape ||
-      !target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths))
+  if (!facts.inputShape || facts.mapping.axes.size() != 1 ||
+      facts.mapping.axes.front().id != kCoreAxisBlock ||
+      facts.mapping.axes.front().role != LogicalAxisRole::Reduction ||
+      !facts.mapping.axes.front().extent ||
+      !facts.mapping.axes.front().requireLane)
     return std::nullopt;
-  BlockReducePhysicalDecision fixed{
-      BlockReduceRealization::RVVFixedStrips, 16, false, {}};
-  BlockReducePhysicalDecision dynamic{
-      BlockReduceRealization::RVVDynamicStrips, 16, facts.needsLaneVector,
-      facts.needsLaneVector ? kRVVE16M2 : RVVVectorShape{}};
-  llvm::SmallVector<BlockReducePhysicalDecision> candidates;
-  if (facts.extent == 16 && facts.inputShape.sew == 16) {
-    candidates.push_back(dynamic);
-    candidates.push_back(fixed);
-  } else {
-    candidates.push_back(fixed);
-    candidates.push_back(dynamic);
-  }
-  for (const BlockReducePhysicalDecision &candidate : candidates) {
-    if (candidate.needsLaneVector &&
-        !target.supportsVectorShape(candidate.laneShape.sew,
-                                    candidate.laneShape.lmulEighths))
+  struct Candidate {
+    SelectedBlockReducePhysical physical;
+    unsigned sequentialFactor = 0;
+    unsigned peakGroups = 0;
+  };
+  llvm::SmallVector<Candidate, 4> legal;
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(facts.mapping, target)) {
+    const PhysicalAxisDecomposition *axis =
+        findAxisMapping(mapping, kCoreAxisBlock);
+    if (!axis || mapping.laneShape != kRVVE8M1 || axis->laneFactor == 0 ||
+        axis->registerFactor == 0 || axis->registerFactor > 2)
       continue;
-    if (candidate.realization == BlockReduceRealization::RVVFixedStrips &&
-        (facts.needsLaneVector || (facts.extent != 16 && facts.extent != 32)))
+    const unsigned laneFactor = axis->laneFactor;
+    const unsigned registerFactor = axis->registerFactor;
+    const unsigned sequentialFactor = axis->sequentialFactor;
+    const uint64_t realized =
+        static_cast<uint64_t>(laneFactor) * registerFactor;
+    if ((sequentialFactor == 1 && realized != *axis->extent) ||
+        (sequentialFactor > 1 && registerFactor != 1) ||
+        (facts.needsLaneVector && registerFactor != 1))
       continue;
+    RVVVectorShape laneShape;
+    if (facts.needsLaneVector) {
+      std::optional<RVVVectorShape> selectedLane =
+          rvvShapeForSameLanes(mapping.laneShape, 16, target);
+      if (!selectedLane)
+        continue;
+      laneShape = *selectedLane;
+    }
 
     SelectedBlockReducePhysical selected;
-    selected.decision = candidate;
+    selected.decision.mapping = std::move(mapping);
+    selected.decision.needsLaneVector = facts.needsLaneVector;
+    selected.decision.laneShape = laneShape;
     selected.inputShape = facts.inputShape;
     selected.combinedShape = facts.inputShape;
-    if (candidate.realization == BlockReduceRealization::RVVFixedStrips &&
-        facts.inputShape.sew == 16) {
+    if (sequentialFactor == 1 && facts.inputShape.sew == 16) {
       std::optional<RVVVectorShape> combined =
           rvvShapeForSameLanes(facts.inputShape, 32, target);
       if (!combined)
@@ -551,19 +587,26 @@ selectBlockReducePhysical(const BlockReduceCandidateFacts &facts,
 
     PhysicalResourceRequirements requirements;
     requirements.live = {
-        {PhysicalLiveClass::Value, {}, 1, 8},
-        {PhysicalLiveClass::Temporary, {}, 1, 1}};
-    if (candidate.laneShape)
+        {PhysicalLiveClass::Value, facts.inputShape, registerFactor, 0},
+        {PhysicalLiveClass::Temporary, selected.seedShape, 1, 0}};
+    if (laneShape)
       requirements.live.push_back(
-          {PhysicalLiveClass::Memory, candidate.laneShape, 1, 0});
+          {PhysicalLiveClass::Index, laneShape, 1, 0});
     std::optional<PhysicalResourceBudget> resources =
         calculatePhysicalResources(requirements, target);
     if (!resources)
       continue;
     selected.resources = *resources;
-    return selected;
+    legal.push_back(Candidate{std::move(selected), sequentialFactor,
+                              resources->peakGroups});
   }
-  return std::nullopt;
+  if (legal.empty())
+    return std::nullopt;
+  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+    return std::tie(lhs.sequentialFactor, lhs.peakGroups) <
+           std::tie(rhs.sequentialFactor, rhs.peakGroups);
+  });
+  return std::move(legal.front().physical);
 }
 
 std::optional<SelectedMaterializedBlockStorePhysical>

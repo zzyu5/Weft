@@ -17,6 +17,7 @@ inline constexpr unsigned kCoreAxisK = 2;
 inline constexpr unsigned kCoreAxisGroup = 3;
 inline constexpr unsigned kCoreAxisPacked = 4;
 inline constexpr unsigned kCoreAxisVLA = 5;
+inline constexpr unsigned kCoreAxisBlock = 6;
 
 struct RVVVectorShape {
   unsigned sew = 0;

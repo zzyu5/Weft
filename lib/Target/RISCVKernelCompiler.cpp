@@ -10615,11 +10615,20 @@ private:
         llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
           return supportsBlockByteShape(operation, kRVVE8M1);
         });
+    CoreMappingProblem mapping;
+    mapping.axes = {LogicalAxisConstraint{
+        kCoreAxisBlock, LogicalAxisRole::Free,
+        static_cast<uint64_t>(*extent), false, true, true,
+        registerFactorCandidates(static_cast<uint64_t>(*extent), 8)}};
+    mapping.laneSEW = 8;
+    mapping.laneInstruction = CoreInstructionKind::RVVElementwise;
+    if (supportsMicroStripOperations)
+      mapping.laneShapeCandidates.push_back(kRVVE8MF4);
+    if (supportsStandardOperations)
+      mapping.laneShapeCandidates.push_back(kRVVE8M1);
     std::optional<SelectedBlockStorePhysical> selected =
-        selectBlockStorePhysical(
-            {*extent, needsLaneVector, supportsMicroStripOperations,
-             supportsStandardOperations},
-            options.target);
+        selectBlockStorePhysical({std::move(mapping), needsLaneVector},
+                                 options.target);
     if (!selected)
       return op.emitError(
           "RVV block store has no legal physical resource candidate");
@@ -10632,7 +10641,7 @@ private:
         std::move(decision));
     initializeEntityPlan(planned.entity);
     mlir::FailureOr<llvm::SmallVector<BlockOperationDecision>> operations =
-        decideBlockOperations(valueSlice, selected->decision.byteShape,
+        decideBlockOperations(valueSlice, selected->decision.mapping.laneShape,
                               planned.entity);
     if (mlir::failed(operations))
       return mlir::failure();
@@ -10709,10 +10718,18 @@ private:
         llvm::all_of(valueSlice, [&](mlir::Operation *operation) {
           return supportsBlockByteShape(operation, kRVVE8M1);
         });
+    CoreMappingProblem mapping;
+    mapping.axes = {LogicalAxisConstraint{
+        kCoreAxisBlock, LogicalAxisRole::Reduction,
+        static_cast<uint64_t>(extent), true, true, true,
+        registerFactorCandidates(static_cast<uint64_t>(extent), 2)}};
+    mapping.laneSEW = 8;
+    mapping.laneInstruction = CoreInstructionKind::RVVReduction;
+    if (supportsStandardOperations)
+      mapping.laneShapeCandidates = {kRVVE8M1};
     std::optional<SelectedBlockReducePhysical> selected =
         selectBlockReducePhysical(
-            {extent, needsLaneVector, supportsStandardOperations,
-             reducedValue->shape},
+            {std::move(mapping), needsLaneVector, reducedValue->shape},
             options.target);
     if (!selected)
       return op.emitError(
@@ -10790,6 +10807,16 @@ private:
         return store.emitError("block store physical handoff is incomplete");
     }
     const BlockStorePhysicalDecision &physical = *entity.blockStore;
+    const PhysicalAxisDecomposition *axisMapping =
+        findAxisMapping(physical.mapping, kCoreAxisBlock);
+    const std::string byteShape = rvvShapeSuffix(physical.mapping.laneShape);
+    if (!axisMapping || physical.mapping.laneShape.sew != 8 ||
+        byteShape.empty() || axisMapping->laneFactor == 0 ||
+        axisMapping->registerFactor == 0)
+      return op.emitError("block store axis mapping is incomplete");
+    const unsigned stripVL = axisMapping->laneFactor;
+    const unsigned registerFactor = axisMapping->registerFactor;
+    const unsigned sequentialFactor = axisMapping->sequentialFactor;
     int64_t extent = decision.extent;
     BlockIndexOp axis = mlir::cast<BlockIndexOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> valueSlice;
@@ -10837,14 +10864,14 @@ private:
       return mlir::success();
     };
 
-    if (physical.realization ==
-        BlockStoreRealization::RVVMicroStrips) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8mf4(" +
-           std::to_string(physical.stripVL) + ");");
+    if (physical.mapping.laneShape == kRVVE8MF4 && sequentialFactor == 1 &&
+        registerFactor > 1) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "(" +
+           std::to_string(stripVL) + ");");
       llvm::SmallVector<llvm::DenseMap<mlir::Value, BlockValue>, 8>
           stripValues;
       for (int64_t stripOffset = 0; stripOffset < extent;
-           stripOffset += physical.stripVL) {
+           stripOffset += stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(),
                               BlockValueKind::Index, ""};
@@ -10878,23 +10905,22 @@ private:
           }
       activeBlockOperations = previousOperations;
       activeBlockEntity = previousEntity;
-    } else if (physical.realization ==
-               BlockStoreRealization::RVVFixedStrips) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
-           std::to_string(physical.stripVL) + ");");
-      if (mlir::failed(emitStrip("0", vl)) ||
-          mlir::failed(
-              emitStrip(std::to_string(physical.stripVL), vl)))
-        return mlir::failure();
+    } else if (sequentialFactor == 1) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "(" +
+           std::to_string(stripVL) + ");");
+      for (unsigned repetition = 0; repetition < registerFactor; ++repetition)
+        if (mlir::failed(
+                emitStrip(std::to_string(repetition * stripVL), vl)))
+          return mlir::failure();
     } else {
       line("for (size_t " + strip + " = 0; " + strip + " < " +
            std::to_string(extent) + ";) {");
       ++indent;
-      line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
+      line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "((" +
            std::to_string(extent) + " - " + strip + ") < " +
-           std::to_string(physical.stripVL) + " ? (" +
+           std::to_string(stripVL) + " ? (" +
            std::to_string(extent) + " - " + strip + ") : " +
-           std::to_string(physical.stripVL) + ");");
+           std::to_string(stripVL) + ");");
       if (physical.needsLaneVector) {
         std::string laneShape = rvvShapeSuffix(physical.laneShape);
         if (physical.laneShape.sew != 16 || laneShape.empty())
@@ -10949,6 +10975,15 @@ private:
         reduceHandoff->resultShape != selectedReduction->combinedShape)
       return op.emitError("block reduction physical handoff is incomplete");
     const BlockReducePhysicalDecision &physical = *entity.blockReduce;
+    const PhysicalAxisDecomposition *axisMapping =
+        findAxisMapping(physical.mapping, kCoreAxisBlock);
+    const std::string byteShape = rvvShapeSuffix(physical.mapping.laneShape);
+    if (!axisMapping || physical.mapping.laneShape.sew != 8 ||
+        byteShape.empty() || axisMapping->laneFactor == 0 ||
+        axisMapping->registerFactor == 0)
+      return op.emitError("block reduction axis mapping is incomplete");
+    const unsigned stripVL = axisMapping->laneFactor;
+    const unsigned sequentialFactor = axisMapping->sequentialFactor;
     int64_t extent = decision.extent;
     BlockIndexOp axis = mlir::cast<BlockIndexOp>(decision.axis);
     llvm::DenseSet<mlir::Operation *> valueSlice;
@@ -10983,17 +11018,16 @@ private:
           activeBlockEntity = previousEntity;
         });
 
-    if (physical.realization ==
-        BlockReduceRealization::RVVFixedStrips) {
-      line("const size_t " + vl + " = __riscv_vsetvl_e8m1(" +
-           std::to_string(physical.stripVL) + ");");
+    if (sequentialFactor == 1) {
+      line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "(" +
+           std::to_string(stripVL) + ");");
       llvm::SmallVector<llvm::SmallVector<BlockValue, 2>, 2> stripInputs(
           reductions.size());
       llvm::DenseMap<mlir::Operation *, size_t> reductionIndices;
       for (auto [index, reduction] : llvm::enumerate(reductions))
         reductionIndices[reduction.getOperation()] = index;
       for (int64_t stripOffset = 0; stripOffset < extent;
-           stripOffset += physical.stripVL) {
+           stripOffset += stripVL) {
         llvm::DenseMap<mlir::Value, BlockValue> blockValues;
         BlockValue coordinate{axis.getResult().getType(), BlockValueKind::Index,
                               ""};
@@ -11106,11 +11140,11 @@ private:
     line("for (size_t " + strip + " = 0; " + strip + " < " +
          std::to_string(extent) + ";) {");
     ++indent;
-    line("const size_t " + vl + " = __riscv_vsetvl_e8m1((" +
+    line("const size_t " + vl + " = __riscv_vsetvl_e" + byteShape + "((" +
          std::to_string(extent) + " - " + strip + ") < " +
-         std::to_string(physical.stripVL) + " ? (" +
+         std::to_string(stripVL) + " ? (" +
          std::to_string(extent) + " - " + strip + ") : " +
-         std::to_string(physical.stripVL) + ");");
+         std::to_string(stripVL) + ");");
 
     if (physical.needsLaneVector) {
       std::string laneShape = rvvShapeSuffix(physical.laneShape);
