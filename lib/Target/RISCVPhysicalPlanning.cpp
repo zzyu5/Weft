@@ -2848,9 +2848,11 @@ calculateDenseMicrokernelResources(
 static llvm::SmallVector<unsigned, 4> localPipelineBufferCandidates(
     const LocalPipelineDependenceFacts &facts, unsigned maximumDepth) {
   llvm::SmallVector<unsigned, 4> candidates{1};
-  if (facts.independentLoadStreams == 0 || facts.loopCarriedValues == 0 ||
-      facts.addressDependsOnCarriedValue ||
-      facts.predicateDependsOnCarriedValue)
+  if (facts.loadStreams == 0 ||
+      facts.reductionAdvancingLoadStreams != facts.loadStreams ||
+      facts.accumulatorValues == 0 || !facts.allLoadsFeedPrimitive ||
+      facts.addressDependsOnAccumulator ||
+      facts.predicateDependsOnAccumulator)
     return candidates;
   for (unsigned depth = 2; depth <= maximumDepth; ++depth)
     candidates.push_back(depth);
@@ -2920,10 +2922,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
         mapping.pipeline.bufferCount == 0 ||
         mapping.pipeline.bufferCount > reduction->unrollFactor ||
         (mapping.pipeline.bufferCount > 1 &&
-         (facts.pipeline.independentLoadStreams == 0 ||
-          facts.pipeline.loopCarriedValues == 0 ||
-          facts.pipeline.addressDependsOnCarriedValue ||
-          facts.pipeline.predicateDependsOnCarriedValue)))
+         (facts.pipeline.loadStreams == 0 ||
+          facts.pipeline.reductionAdvancingLoadStreams !=
+              facts.pipeline.loadStreams ||
+          facts.pipeline.accumulatorValues == 0 ||
+          !facts.pipeline.allLoadsFeedPrimitive ||
+          facts.pipeline.addressDependsOnAccumulator ||
+          facts.pipeline.predicateDependsOnAccumulator)))
       continue;
     unsigned accumulatorVectors = 1;
     for (const PhysicalAxisDecomposition &axis : mapping.axes)
@@ -2970,10 +2975,13 @@ selectF32DotPhysicalConfig(const F32DotCandidateFacts &facts,
                         : std::max(8u, 2 * baseF32Lanes));
     const unsigned preferredBuffers =
         reduction->unrollFactor >= 2 &&
-                facts.pipeline.independentLoadStreams != 0 &&
-                facts.pipeline.loopCarriedValues != 0 &&
-                !facts.pipeline.addressDependsOnCarriedValue &&
-                !facts.pipeline.predicateDependsOnCarriedValue
+                facts.pipeline.loadStreams != 0 &&
+                facts.pipeline.reductionAdvancingLoadStreams ==
+                    facts.pipeline.loadStreams &&
+                facts.pipeline.accumulatorValues != 0 &&
+                facts.pipeline.allLoadsFeedPrimitive &&
+                !facts.pipeline.addressDependsOnAccumulator &&
+                !facts.pipeline.predicateDependsOnAccumulator
             ? 2
             : 1;
     const unsigned pipelinePenalty = static_cast<unsigned>(std::abs(
@@ -3114,10 +3122,13 @@ selectF16MatmulPhysicalConfig(const F16MatmulCandidateFacts &facts,
         mapping.pipeline.bufferCount == 0 ||
         mapping.pipeline.bufferCount > k->unrollFactor ||
         (mapping.pipeline.bufferCount > 1 &&
-         (facts.pipeline.independentLoadStreams == 0 ||
-          facts.pipeline.loopCarriedValues == 0 ||
-          facts.pipeline.addressDependsOnCarriedValue ||
-          facts.pipeline.predicateDependsOnCarriedValue)) ||
+         (facts.pipeline.loadStreams == 0 ||
+          facts.pipeline.reductionAdvancingLoadStreams !=
+              facts.pipeline.loadStreams ||
+          facts.pipeline.accumulatorValues == 0 ||
+          !facts.pipeline.allLoadsFeedPrimitive ||
+          facts.pipeline.addressDependsOnAccumulator ||
+          facts.pipeline.predicateDependsOnAccumulator)) ||
         (lane->id == kCoreAxisN &&
          (n->registerFactor != 1 || mapping.pipeline.bufferCount != 1)))
       continue;

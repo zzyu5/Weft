@@ -784,10 +784,12 @@ struct DenseMicrokernelResourceFacts {
 };
 
 struct LocalPipelineDependenceFacts {
-  unsigned independentLoadStreams = 0;
-  unsigned loopCarriedValues = 0;
-  bool addressDependsOnCarriedValue = false;
-  bool predicateDependsOnCarriedValue = false;
+  unsigned loadStreams = 0;
+  unsigned reductionAdvancingLoadStreams = 0;
+  unsigned accumulatorValues = 0;
+  bool allLoadsFeedPrimitive = false;
+  bool addressDependsOnAccumulator = false;
+  bool predicateDependsOnAccumulator = false;
 };
 
 std::optional<PhysicalResourceBudget>

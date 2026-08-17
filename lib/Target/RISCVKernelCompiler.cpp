@@ -6007,17 +6007,26 @@ private:
 
   LocalPipelineDependenceFacts analyzeLocalPipelineDependences(
       llvm::ArrayRef<LoadOp> loads,
-      llvm::ArrayRef<mlir::Value> loopCarriedValues) const {
+      llvm::ArrayRef<mlir::Value> primitiveOperands,
+      mlir::Value reductionAxis, mlir::Value accumulator) const {
     LocalPipelineDependenceFacts facts;
-    facts.independentLoadStreams = loads.size();
-    facts.loopCarriedValues = loopCarriedValues.size();
-    for (LoadOp load : loads) {
-      for (mlir::Value carried : loopCarriedValues) {
-        facts.addressDependsOnCarriedValue |=
-            valueDependsOn(load.getPointer(), carried);
-        facts.predicateDependsOnCarriedValue |=
-            valueDependsOn(load.getWhere(), carried);
-      }
+    if (loads.size() != primitiveOperands.size() || !reductionAxis ||
+        !accumulator)
+      return facts;
+    facts.loadStreams = loads.size();
+    facts.accumulatorValues = 1;
+    facts.allLoadsFeedPrimitive = !loads.empty();
+    for (size_t index = 0; index < loads.size(); ++index) {
+      LoadOp load = loads[index];
+      mlir::Value operand = primitiveOperands[index];
+      facts.reductionAdvancingLoadStreams +=
+          valueDependsOnAxis(load.getPointer(), reductionAxis);
+      facts.allLoadsFeedPrimitive &=
+          valueDependsOn(operand, load.getResult());
+      facts.addressDependsOnAccumulator |=
+          valueDependsOn(load.getPointer(), accumulator);
+      facts.predicateDependsOnAccumulator |=
+          valueDependsOn(load.getWhere(), accumulator);
     }
     return facts;
   }
@@ -6086,7 +6095,8 @@ private:
     F32DotCandidateFacts candidateFacts;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
-        {dot.getInit(), dot.getResult()});
+        {dot.getLhs(), dot.getRhs()}, analysis->reductionAxis.getResult(),
+        dot.getInit());
     candidateFacts.reductionExtent = analysis->reductionExtent;
     candidateFacts.mapping = analysis->mapping;
     if (freeOnLHS) {
@@ -9299,7 +9309,8 @@ private:
     candidateFacts.mapping = analysis->mapping;
     candidateFacts.pipeline = analyzeLocalPipelineDependences(
         {analysis->lhsLoad, analysis->rhsLoad},
-        {matmul.getInit(), matmul.getResult()});
+        {matmul.getLhs(), matmul.getRhs()},
+        analysis->reductionAxis.getResult(), matmul.getInit());
     const bool legalColumnLane =
         analysis->rhsFreeRelation == LaneRelation::UnitStride ||
         (analysis->rhsFreeRelation == LaneRelation::Strided &&
