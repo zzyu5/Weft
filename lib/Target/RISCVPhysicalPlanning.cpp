@@ -43,416 +43,6 @@ static unsigned localSequentialFactor(const LocalImplementation &implementation,
   return mapping ? mapping->sequentialFactor : 0;
 }
 
-static bool isPackedDotLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::PackedI4I8 &&
-      implementation.primitive != LocalPrimitiveKind::PackedI5I8)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK || !reduction ||
-      !reduction->extent || *reduction->extent != 32 ||
-      reduction->sequentialFactor != 1 ||
-      reduction->laneFactor * reduction->registerFactor != 32 ||
-      (reduction->laneFactor != 16 && reduction->laneFactor != 32) ||
-      implementation.valueShapes.size() < 2 ||
-      implementation.valueShapes.front() != implementation.mapping.laneShape ||
-      implementation.mapping.laneShape.sew != 8 ||
-      implementation.valueShapes[1].sew != 8)
-    return false;
-  const RVVVectorShape decodeShape = implementation.valueShapes[1];
-  if ((reduction->laneFactor == 16 &&
-       decodeShape != implementation.mapping.laneShape) ||
-      (reduction->laneFactor == 32 &&
-       decodeShape != implementation.mapping.laneShape &&
-       (decodeShape.lmulEighths < 8 ||
-        decodeShape.lmulEighths * 2 !=
-            implementation.mapping.laneShape.lmulEighths)))
-    return false;
-  const RVVVectorShape widened{16,
-                               implementation.mapping.laneShape.lmulEighths * 2};
-  if (rvvVectorType(RVVElementCategory::SignedInteger, widened).empty())
-    return false;
-  return true;
-}
-
-static bool isNibbleCodebookLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 4)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 32 ||
-      reduction->sequentialFactor != 1 ||
-      reduction->laneFactor * reduction->registerFactor != 32 ||
-      (reduction->laneFactor != 16 && reduction->laneFactor != 32))
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape packedShape = implementation.valueShapes[1];
-  const RVVVectorShape tableShape = implementation.valueShapes[2];
-  const RVVVectorShape productShape = implementation.valueShapes[3];
-  if (laneShape != implementation.mapping.laneShape || laneShape.sew != 8 ||
-      packedShape.sew != 8 || tableShape.sew != 8 || productShape.sew != 16 ||
-      productShape.lmulEighths !=
-          (tableShape == laneShape ? laneShape.lmulEighths
-                                   : packedShape.lmulEighths) *
-              2)
-    return false;
-  const bool combined = tableShape == laneShape;
-  if (combined) {
-    if (reduction->laneFactor != 32 || packedShape.lmulEighths < 8 ||
-        packedShape.lmulEighths * 2 != laneShape.lmulEighths)
-      return false;
-  } else if (tableShape != packedShape) {
-    return false;
-  }
-  return !rvvVectorType(RVVElementCategory::UnsignedInteger, packedShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, tableShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
-}
-
-static bool isPackedI2TernaryLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 2)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      reduction->sequentialFactor != 8 ||
-      reduction->laneFactor * reduction->registerFactor != 32 ||
-      (reduction->laneFactor != 16 && reduction->laneFactor != 32))
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape widenedShape = implementation.valueShapes[1];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         widenedShape.sew == 16 &&
-         widenedShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, widenedShape).empty();
-}
-
-static bool isBase3TernaryLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::Base3TernaryI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 5)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      reduction->sequentialFactor != 8 || reduction->laneFactor != 32 ||
-      reduction->registerFactor != 1)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape halfShape = implementation.valueShapes[1];
-  const RVVVectorShape widenedShape = implementation.valueShapes[2];
-  const RVVVectorShape halfWidenedShape = implementation.valueShapes[3];
-  const RVVVectorShape highWordShape = implementation.valueShapes[4];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         halfShape.sew == 8 &&
-         halfShape.lmulEighths * 2 == laneShape.lmulEighths &&
-         widenedShape.sew == 16 &&
-         widenedShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         halfWidenedShape.sew == 16 &&
-         halfWidenedShape.lmulEighths == halfShape.lmulEighths * 2 &&
-         highWordShape.sew == 32 &&
-         highWordShape.lmulEighths == halfShape.lmulEighths &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, widenedShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger,
-                        halfWidenedShape).empty() &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger,
-                        highWordShape).empty();
-}
-
-static bool isSignedCodebookLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if ((implementation.primitive != LocalPrimitiveKind::SignedCodebook8I8 &&
-       implementation.primitive != LocalPrimitiveKind::SignedCodebook4I8) ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVIndexedGather ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 6 ||
-      (implementation.entryWidth != 4 && implementation.entryWidth != 8))
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 32 ||
-      reduction->sequentialFactor != 1 || reduction->laneFactor != 32 ||
-      reduction->registerFactor != 1)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape codeShape = implementation.valueShapes[1];
-  const RVVVectorShape indexShape = implementation.valueShapes[2];
-  const RVVVectorShape tableShape = implementation.valueShapes[3];
-  const RVVVectorShape productShape = implementation.valueShapes[4];
-  const RVVVectorShape signSourceShape = implementation.valueShapes[5];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         codeShape.sew == 8 && indexShape.sew == 16 &&
-         indexShape.lmulEighths == codeShape.lmulEighths * 2 &&
-         tableShape.sew == implementation.entryWidth * 8 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         signSourceShape == kRVVE8M1 &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger, codeShape).empty() &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger, indexShape).empty() &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger, tableShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
-}
-
-static bool hasCodebookLaneMapping(const LocalImplementation &implementation,
-                                   size_t shapeCount) {
-  if (implementation.mapping.instruction !=
-          CoreInstructionKind::RVVIndexedGather ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < shapeCount)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  return reduction && reduction->extent && *reduction->extent == 32 &&
-         reduction->sequentialFactor == 1 && reduction->laneFactor == 32 &&
-         reduction->registerFactor == 1;
-}
-
-static bool isPackedU9U7CodebookLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::PackedU9U7CodebookI8 ||
-      implementation.entryWidth != 8 ||
-      !hasCodebookLaneMapping(implementation, 7))
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape codeShape = implementation.valueShapes[1];
-  const RVVVectorShape wordShape = implementation.valueShapes[2];
-  const RVVVectorShape tableShape = implementation.valueShapes[3];
-  const RVVVectorShape productShape = implementation.valueShapes[4];
-  const RVVVectorShape signSourceShape = implementation.valueShapes[5];
-  const RVVVectorShape halfProductShape = implementation.valueShapes[6];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         codeShape.sew == 8 && wordShape.sew == 16 &&
-         wordShape.lmulEighths == codeShape.lmulEighths &&
-         tableShape.sew == 64 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         signSourceShape == kRVVE8M1 && halfProductShape.sew == 16 &&
-         halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
-}
-
-static bool isPackedU11GridDeltaLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive !=
-          LocalPrimitiveKind::PackedU11GridDeltaI8 ||
-      implementation.entryWidth != 8 ||
-      !hasCodebookLaneMapping(implementation, 5))
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape codeShape = implementation.valueShapes[1];
-  const RVVVectorShape indexShape = implementation.valueShapes[2];
-  const RVVVectorShape tableShape = implementation.valueShapes[3];
-  const RVVVectorShape productShape = implementation.valueShapes[4];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         codeShape.sew == 8 && indexShape.sew == 16 &&
-         indexShape.lmulEighths == codeShape.lmulEighths * 2 &&
-         tableShape.sew == 64 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2;
-}
-
-static bool isIQ3SLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::IQ3SI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 7)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      reduction->sequentialFactor != 4 || reduction->laneFactor != 64 ||
-      reduction->registerFactor != 1)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape codeShape = implementation.valueShapes[1];
-  const RVVVectorShape indexShape = implementation.valueShapes[2];
-  const RVVVectorShape tableShape = implementation.valueShapes[3];
-  const RVVVectorShape signShape = implementation.valueShapes[4];
-  const RVVVectorShape productShape = implementation.valueShapes[5];
-  const RVVVectorShape halfProductShape = implementation.valueShapes[6];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         codeShape.sew == 8 && indexShape.sew == 16 &&
-         indexShape.lmulEighths == codeShape.lmulEighths * 2 &&
-         tableShape.sew == 32 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         signShape.sew == 8 && productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         halfProductShape.sew == 16 &&
-         halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
-}
-
-static bool isIQ2SLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::IQ2SI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 6)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      (reduction->laneFactor != 32 && reduction->laneFactor != 64) ||
-      reduction->registerFactor != 1 ||
-      reduction->sequentialFactor != 256 / reduction->laneFactor)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape indexShape = implementation.valueShapes[1];
-  const RVVVectorShape tableShape = implementation.valueShapes[2];
-  const RVVVectorShape signShape = implementation.valueShapes[3];
-  const RVVVectorShape productShape = implementation.valueShapes[4];
-  const RVVVectorShape segmentProductShape = implementation.valueShapes[5];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         indexShape.sew == 16 && tableShape.sew == 64 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         signShape.sew == 8 && productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         segmentProductShape.sew == 16 &&
-         segmentProductShape.lmulEighths *
-                 (reduction->laneFactor / 16) ==
-             productShape.lmulEighths;
-}
-
-static bool isIQ1MLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::IQ1MI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 6)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      (reduction->laneFactor != 32 && reduction->laneFactor != 64) ||
-      reduction->registerFactor != 1 ||
-      reduction->sequentialFactor != 256 / reduction->laneFactor)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape indexShape = implementation.valueShapes[1];
-  const RVVVectorShape tableShape = implementation.valueShapes[2];
-  const RVVVectorShape deltaWordShape = implementation.valueShapes[3];
-  const RVVVectorShape productShape = implementation.valueShapes[4];
-  const RVVVectorShape segmentProductShape = implementation.valueShapes[5];
-  const unsigned groupsPerVector = reduction->laneFactor / 32;
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         indexShape.sew == 16 &&
-         indexShape.lmulEighths * reduction->laneFactor ==
-             laneShape.lmulEighths * (4 * groupsPerVector) * 2 &&
-         tableShape.sew == 64 &&
-         tableShape.lmulEighths == laneShape.lmulEighths &&
-         deltaWordShape == tableShape && productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         segmentProductShape.sew == 16 &&
-         segmentProductShape.lmulEighths * (reduction->laneFactor / 16) ==
-             productShape.lmulEighths &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger, indexShape).empty() &&
-         !rvvVectorType(RVVElementCategory::UnsignedInteger, tableShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, deltaWordShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger,
-                        segmentProductShape).empty();
-}
-
-static bool isQ6KLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::Q6KI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 4)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      (reduction->laneFactor != 32 && reduction->laneFactor != 64) ||
-      reduction->registerFactor != 1 ||
-      reduction->sequentialFactor != 256 / reduction->laneFactor)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape chunkShape = implementation.valueShapes[1];
-  const RVVVectorShape productShape = implementation.valueShapes[2];
-  const RVVVectorShape segmentProductShape = implementation.valueShapes[3];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         chunkShape.sew == 8 &&
-         chunkShape.lmulEighths * (reduction->laneFactor / 32) ==
-             laneShape.lmulEighths &&
-         productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         segmentProductShape.sew == 16 &&
-         segmentProductShape.lmulEighths * (reduction->laneFactor / 16) ==
-             productShape.lmulEighths &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, chunkShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, laneShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger,
-                        segmentProductShape).empty();
-}
-
-static bool isPackedI3GroupedLocalImplementationMapping(
-    const LocalImplementation &implementation) {
-  if (implementation.primitive != LocalPrimitiveKind::PackedI3GroupedI8 ||
-      implementation.mapping.instruction !=
-          CoreInstructionKind::RVVWideningIntegerDot ||
-      !implementation.mapping.laneAxis ||
-      *implementation.mapping.laneAxis != kCoreAxisK ||
-      implementation.valueShapes.size() < 3)
-    return false;
-  const PhysicalAxisDecomposition *reduction =
-      findAxisMapping(implementation.mapping, kCoreAxisK);
-  const unsigned mappedSpan =
-      reduction ? reduction->laneFactor * reduction->registerFactor : 0;
-  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
-      (reduction->laneFactor != 16 && reduction->laneFactor != 32) ||
-      mappedSpan == 0 || (256 % mappedSpan) != 0 ||
-      reduction->sequentialFactor != 256 / mappedSpan)
-    return false;
-  const RVVVectorShape laneShape = implementation.valueShapes[0];
-  const RVVVectorShape productShape = implementation.valueShapes[1];
-  const RVVVectorShape segmentProductShape = implementation.valueShapes[2];
-  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
-         productShape.sew == 16 &&
-         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
-         segmentProductShape.sew == 16 &&
-         segmentProductShape.lmulEighths * (reduction->laneFactor / 16) ==
-             productShape.lmulEighths &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, laneShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty() &&
-         !rvvVectorType(RVVElementCategory::SignedInteger,
-                        segmentProductShape).empty();
-}
-
 struct LocalAxisMappingCandidate {
   CorePhysicalMapping mapping;
   PhysicalAxisDecomposition axis;
@@ -501,292 +91,142 @@ findLogicalAxisConstraint(const CoreMappingProblem &problem, unsigned axis) {
   return found == problem.axes.end() ? nullptr : &*found;
 }
 
-static std::optional<LocalLeafDecision>
-selectLocalLeafDecision(const LocalImplementation &implementation) {
-  if (!implementation || implementation.valueShapes.empty())
-    return std::nullopt;
-  const RVVVectorShape primary = implementation.valueShapes.front();
-  const RVVVectorShape secondary = implementation.valueShapes.size() > 1
-                                       ? implementation.valueShapes[1]
-                                       : RVVVectorShape{};
-  const unsigned lanes = localLaneFactor(implementation);
-  const unsigned hardwareLanes =
-      mappedHardwareLaneFactor(implementation.mapping);
-  const unsigned rows =
-      implementation.mapping.instruction == CoreInstructionKind::SpacemitIME1MMA
-          ? localFragmentFactor(implementation, kCoreAxisM)
-          : localRegisterFactor(implementation, kCoreAxisM);
-  const bool rvvDot = implementation.mapping.instruction ==
-                      CoreInstructionKind::RVVWideningIntegerDot;
-  const bool ime = implementation.mapping.instruction ==
-                   CoreInstructionKind::SpacemitIME1MMA;
-  const bool sequential =
-      localSequentialFactor(implementation, kCoreAxisK) > 1;
-  auto registerLeaf = [&](LocalLeafKind kind,
-                          unsigned selectedLanes = 0) {
-    return LocalLeafDecision{kind, selectedLanes ? selectedLanes : lanes,
-                             primary};
-  };
-  auto packedDotLeaf = [&](LocalLeafKind kind) {
-    LocalLeafDecision leaf = registerLeaf(kind);
-    const PhysicalAxisDecomposition *reduction =
-        findAxisMapping(implementation.mapping, kCoreAxisK);
-    if (reduction->laneFactor != 32)
-      leaf.projection = LocalLeafProjection::PackedDotRegisterChunks;
-    else if (implementation.valueShapes[1] == implementation.mapping.laneShape)
-      leaf.projection = LocalLeafProjection::PackedDotLaneSlide;
-    else
-      leaf.projection = LocalLeafProjection::PackedDotLaneCreate;
-    return leaf;
-  };
-  auto signSourceLeaf = [&](LocalLeafKind kind, unsigned shapeIndex) {
-    LocalLeafDecision leaf = registerLeaf(kind);
-    leaf.projection =
-        implementation.valueShapes[shapeIndex] == implementation.mapping.laneShape
-            ? LocalLeafProjection::SignSourceDirect
-            : LocalLeafProjection::SignSourceExtend;
-    return leaf;
-  };
-  switch (implementation.primitive) {
-  case LocalPrimitiveKind::None:
-    return std::nullopt;
-  case LocalPrimitiveKind::F32Math:
-    if (implementation.mapping.instruction !=
-            CoreInstructionKind::RVVElementwise ||
-        primary != implementation.mapping.laneShape || primary.sew != 32 ||
-        !rvvIntegerLMUL(primary))
-      return std::nullopt;
-    return LocalLeafDecision{};
-  case LocalPrimitiveKind::SymmetricI4I8: {
-    if ((!rvvDot && !ime) || (rows != 1 && rows != 4) ||
-        (rvvDot && lanes != 16) ||
-        (ime && (localFragmentFactor(implementation, kCoreAxisN) != 16 ||
-                 localFragmentFactor(implementation, kCoreAxisK) != 32)) ||
-        primary != kRVVE8M1 || secondary != kRVVE32M4)
-      return std::nullopt;
-    if (ime)
-      return LocalLeafDecision{
-          rows == 4 ? LocalLeafKind::IMESymmetricI4I8M4N16K32
-                    : LocalLeafKind::IMESymmetricI4I8N16K32};
-    return LocalLeafDecision{
-        rows == 4 ? LocalLeafKind::RVVSymmetricI4I8M4N16K32
-                  : LocalLeafKind::RVVSymmetricI4I8N16K32};
-  }
-  case LocalPrimitiveKind::AffineI4I8: {
-    if ((!rvvDot && !ime) || (rows != 1 && rows != 4) ||
-        (rvvDot && lanes != 16) ||
-        (ime && (localFragmentFactor(implementation, kCoreAxisN) != 16 ||
-                 localFragmentFactor(implementation, kCoreAxisK) != 32)) ||
-        primary != kRVVE8M1 || secondary != kRVVE32M4)
-      return std::nullopt;
-    if (ime)
-      return LocalLeafDecision{
-          rows == 4 ? LocalLeafKind::IMEAffineI4I8M4N16K32
-                    : LocalLeafKind::IMEAffineI4I8N16K32};
-    return LocalLeafDecision{
-        rows == 4 ? LocalLeafKind::RVVAffineI4I8M4N16K32
-                  : LocalLeafKind::RVVAffineI4I8N16K32};
-  }
-  case LocalPrimitiveKind::GroupedAffineI4I8:
-    if (!rvvDot || (hardwareLanes != 16 && hardwareLanes != 32) ||
-        primary != kRVVE8M1 || secondary != kRVVE16M2)
-      return std::nullopt;
-    if (sequential)
-      return LocalLeafDecision{LocalLeafKind::GroupedAffineI4I8Strip};
-    return registerLeaf(
-        hardwareLanes == 16
-            ? LocalLeafKind::GroupedAffineI4I8RegisterL16
-            : LocalLeafKind::GroupedAffineI4I8RegisterL32,
-        hardwareLanes);
-  case LocalPrimitiveKind::E2M1E8M0I8:
-    if (!rvvDot ||
-        !((lanes == 32 && primary == RVVVectorShape{8, 4} &&
-           secondary == RVVVectorShape{8, 4}) ||
-          (lanes == 32 && primary == kRVVE8M1 &&
-           secondary == RVVVectorShape{8, 16}) ||
-          (sequential && primary == kRVVE8M1 && !secondary)))
-      return std::nullopt;
-    if (sequential)
-      return LocalLeafDecision{LocalLeafKind::E2M1E8M0I8Strip};
-    return primary == RVVVectorShape{8, 4}
-               ? LocalLeafDecision{
-                     LocalLeafKind::E2M1E8M0I8RegisterE8MF2}
-               : LocalLeafDecision{
-                     LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2};
-  case LocalPrimitiveKind::PackedI4I8:
-    if (!isPackedDotLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return packedDotLeaf(LocalLeafKind::PackedI4I8Register);
-  case LocalPrimitiveKind::PackedI5I8:
-    if (!isPackedDotLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return packedDotLeaf(LocalLeafKind::PackedI5I8Register);
-  case LocalPrimitiveKind::PackedI3GroupedI8:
-    if (!isPackedI3GroupedLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedI3GroupedI8Register);
-  case LocalPrimitiveKind::Base3TernaryI8:
-    if (!isBase3TernaryLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::Base3TernaryI8Register);
-  case LocalPrimitiveKind::PackedI2TernaryI8:
-    if (!isPackedI2TernaryLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedI2TernaryI8Register);
-  case LocalPrimitiveKind::SignedCodebook8I8:
-    if (!isSignedCodebookLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return signSourceLeaf(LocalLeafKind::SignedCodebook8I8Register, 5);
-  case LocalPrimitiveKind::SignedCodebook4I8:
-    if (!isSignedCodebookLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return signSourceLeaf(LocalLeafKind::SignedCodebook4I8Register, 5);
-  case LocalPrimitiveKind::PackedU9U7CodebookI8:
-    if (!isPackedU9U7CodebookLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return signSourceLeaf(LocalLeafKind::PackedU9U7CodebookI8Register, 5);
-  case LocalPrimitiveKind::PackedU11GridDeltaI8:
-    if (!isPackedU11GridDeltaLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::PackedU11GridDeltaI8Register);
-  case LocalPrimitiveKind::NibbleCodebookI8:
-    if (!isNibbleCodebookLocalImplementationMapping(implementation))
-      return std::nullopt;
-    {
-      LocalLeafDecision leaf =
-          registerLeaf(LocalLeafKind::NibbleCodebookI8Register);
-      leaf.projection =
-          implementation.valueShapes[2] == implementation.mapping.laneShape
-              ? LocalLeafProjection::NibbleCodebookCombined
-              : LocalLeafProjection::NibbleCodebookSplit;
-      return leaf;
-    }
-  case LocalPrimitiveKind::IQ2SI8:
-    if (!isIQ2SLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::IQ2SI8Register);
-  case LocalPrimitiveKind::IQ3SI8:
-    if (!isIQ3SLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::IQ3SI8Register);
-  case LocalPrimitiveKind::IQ1MI8:
-    if (!isIQ1MLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(LocalLeafKind::IQ1MI8Register);
-  case LocalPrimitiveKind::Q6KI8:
-    if (!isQ6KLocalImplementationMapping(implementation))
-      return std::nullopt;
-    return registerLeaf(lanes == 32 && primary == RVVVectorShape{8, 16}
-                            ? LocalLeafKind::Q6KI8RVVAssembly
-                            : LocalLeafKind::Q6KI8Register);
-  }
-  return std::nullopt;
-}
-
 std::string localImplementationSymbol(
     const LocalImplementation &implementation) {
-  const LocalLeafDecision &leaf = implementation.leaf;
-  const std::string shape = rvvShapeSuffix(leaf.primaryShape);
+  const LocalHardwareOperation &operation = implementation.operation;
+  const std::string shape = rvvShapeSuffix(operation.primaryShape);
   const std::string registerSuffix =
-      leaf.lanes && !shape.empty()
-          ? "_register_l" + std::to_string(leaf.lanes) + "_e" + shape
+      operation.lanes && !shape.empty()
+          ? "_register_l" + std::to_string(operation.lanes) + "_e" + shape
           : std::string{};
-  switch (leaf.kind) {
-  case LocalLeafKind::None:
+  switch (implementation.primitive) {
+  case LocalPrimitiveKind::None:
+  case LocalPrimitiveKind::F32Math:
     return {};
-  case LocalLeafKind::RVVSymmetricI4I8N16K32:
-    return "__weft_rvv_symmetric_i4_i8_n16_k32";
-  case LocalLeafKind::RVVAffineI4I8N16K32:
-    return "__weft_rvv_affine_i4_i8_n16_k32";
-  case LocalLeafKind::RVVSymmetricI4I8M4N16K32:
-    return "__weft_rvv_symmetric_i4_i8_m4_n16_k32";
-  case LocalLeafKind::RVVAffineI4I8M4N16K32:
-    return "__weft_rvv_affine_i4_i8_m4_n16_k32";
-  case LocalLeafKind::IMESymmetricI4I8N16K32:
-    return "__weft_ime1_symmetric_i4_i8_n16_k32";
-  case LocalLeafKind::IMEAffineI4I8N16K32:
-    return "__weft_ime1_affine_i4_i8_n16_k32";
-  case LocalLeafKind::IMESymmetricI4I8M4N16K32:
-    return "__weft_ime1_symmetric_i4_i8_m4_n16_k32";
-  case LocalLeafKind::IMEAffineI4I8M4N16K32:
-    return "__weft_ime1_affine_i4_i8_m4_n16_k32";
-  case LocalLeafKind::GroupedAffineI4I8RegisterL16:
-  case LocalLeafKind::GroupedAffineI4I8RegisterL32:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_grouped_affine_i4_i8" + registerSuffix;
-  case LocalLeafKind::GroupedAffineI4I8Strip:
-    return "__weft_grouped_affine_i4_i8_strip";
-  case LocalLeafKind::E2M1E8M0I8RegisterE8MF2:
-    return "__weft_e2m1_e8m0_i8_register_e8mf2";
-  case LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2:
-    return "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
-  case LocalLeafKind::E2M1E8M0I8Strip:
-    return "__weft_e2m1_e8m0_i8_strip";
-  case LocalLeafKind::PackedI4I8Register:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_packed_i4_i8" + registerSuffix;
-  case LocalLeafKind::PackedI5I8Register:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_packed_i5_i8" + registerSuffix;
-  case LocalLeafKind::PackedI3GroupedI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_packed_i3_grouped_i8" + registerSuffix;
-  case LocalLeafKind::Base3TernaryI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_base3_ternary_i8" + registerSuffix;
-  case LocalLeafKind::PackedI2TernaryI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_packed_i2_ternary_i8" + registerSuffix;
-  case LocalLeafKind::SignedCodebook8I8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_signed_codebook8_i8" + registerSuffix;
-  case LocalLeafKind::SignedCodebook4I8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_signed_codebook4_i8" + registerSuffix;
-  case LocalLeafKind::PackedU9U7CodebookI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_packed_u9_u7_codebook_i8" + registerSuffix;
-  case LocalLeafKind::PackedU11GridDeltaI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_packed_u11_grid_delta_i8" + registerSuffix;
-  case LocalLeafKind::NibbleCodebookI8Register:
-    return registerSuffix.empty()
-               ? std::string{}
-               : "__weft_nibble_codebook_i8" + registerSuffix;
-  case LocalLeafKind::IQ2SI8Register:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_iq2_s_i8" + registerSuffix;
-  case LocalLeafKind::IQ3SI8Register:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_iq3_s_i8" + registerSuffix;
-  case LocalLeafKind::IQ1MI8Register:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_iq1_m_i8" + registerSuffix;
-  case LocalLeafKind::Q6KI8Register:
-  case LocalLeafKind::Q6KI8RVVAssembly:
-    return registerSuffix.empty() ? std::string{}
-                                  : "__weft_q6_k_i8" + registerSuffix;
+  case LocalPrimitiveKind::SymmetricI4I8:
+  case LocalPrimitiveKind::AffineI4I8: {
+    const bool affine = implementation.primitive == LocalPrimitiveKind::AffineI4I8;
+    const bool fragment =
+        operation.kind == LocalHardwareOperationKind::MatrixFragment;
+    if ((!fragment && operation.kind != LocalHardwareOperationKind::RVVRegister) ||
+        (operation.rows != 1 && operation.rows != 4))
+      return {};
+    return std::string("__weft_") + (fragment ? "ime1_" : "rvv_") +
+           (affine ? "affine" : "symmetric") + "_i4_i8_" +
+           (operation.rows == 4 ? "m4_" : "") + "n16_k32";
+  }
+  case LocalPrimitiveKind::GroupedAffineI4I8:
+    if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+      return "__weft_grouped_affine_i4_i8_strip";
+    return (operation.kind == LocalHardwareOperationKind::RVVRegister ||
+            operation.kind == LocalHardwareOperationKind::RVVInlineAsm) &&
+                   !registerSuffix.empty()
+               ? "__weft_grouped_affine_i4_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::E2M1E8M0I8:
+    if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+      return "__weft_e2m1_e8m0_i8_strip";
+    if (operation.kind != LocalHardwareOperationKind::RVVRegister)
+      return {};
+    if (operation.primaryShape == RVVVectorShape{8, 4})
+      return "__weft_e2m1_e8m0_i8_register_e8mf2";
+    if (operation.primaryShape == kRVVE8M1)
+      return "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
+    return {};
+  case LocalPrimitiveKind::PackedI4I8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_i4_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::PackedI5I8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_i5_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::PackedI3GroupedI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_i3_grouped_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::Base3TernaryI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_base3_ternary_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::PackedI2TernaryI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_i2_ternary_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::SignedCodebook8I8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_signed_codebook8_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::SignedCodebook4I8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_signed_codebook4_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_u9_u7_codebook_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::PackedU11GridDeltaI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_packed_u11_grid_delta_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::NibbleCodebookI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_nibble_codebook_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::IQ2SI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_iq2_s_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::IQ3SI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_iq3_s_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::IQ1MI8:
+    return operation.kind == LocalHardwareOperationKind::RVVRegister &&
+                   !registerSuffix.empty()
+               ? "__weft_iq1_m_i8" + registerSuffix
+               : std::string{};
+  case LocalPrimitiveKind::Q6KI8:
+    return (operation.kind == LocalHardwareOperationKind::RVVRegister ||
+            operation.kind == LocalHardwareOperationKind::RVVInlineAsm) &&
+                   !registerSuffix.empty()
+               ? "__weft_q6_k_i8" + registerSuffix
+               : std::string{};
   }
   return {};
 }
 
-static bool finalizeLocalInstructionMapping(LocalImplementation &implementation) {
-  std::optional<LocalLeafDecision> leaf =
-      selectLocalLeafDecision(implementation);
-  if (!leaf)
+static void selectLocalHardwareOperation(
+    LocalImplementation &implementation, LocalHardwareOperationKind kind,
+    LocalOperationProjection projection = LocalOperationProjection::None,
+    unsigned rows = 1, unsigned lanes = 0) {
+  implementation.operation = LocalHardwareOperation{
+      kind, lanes ? lanes : localLaneFactor(implementation), rows,
+      implementation.valueShapes.empty() ? RVVVectorShape{}
+                                         : implementation.valueShapes.front(),
+      projection};
+}
+
+static bool finalizeLocalHardwareOperation(
+    const LocalImplementation &implementation) {
+  if (!implementation || implementation.valueShapes.empty())
     return false;
-  implementation.leaf = *leaf;
-  return implementation.primitive == LocalPrimitiveKind::F32Math
-             ? !implementation.leaf
-             : !localImplementationSymbol(implementation).empty();
+  if (implementation.primitive == LocalPrimitiveKind::F32Math)
+    return !implementation.operation;
+  return implementation.operation &&
+         !localImplementationSymbol(implementation).empty();
 }
 
 bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
@@ -1583,7 +1023,7 @@ selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
   implementation.primitive = LocalPrimitiveKind::F32Math;
   implementation.mapping = mapping;
   implementation.valueShapes = {mapping.laneShape};
-  return finalizeLocalInstructionMapping(implementation)
+  return finalizeLocalHardwareOperation(implementation)
              ? std::optional<LocalImplementation>(std::move(implementation))
              : std::nullopt;
 }
@@ -1681,11 +1121,18 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
     selected.implementation.mapping = std::move(mapping);
     selected.implementation.valueShapes = {selected.codeShape,
                                            selected.accumulatorShape};
-    if (!finalizeLocalInstructionMapping(selected.implementation))
-      continue;
     const PhysicalAxisDecomposition *mappedRows =
         findAxisMapping(selected.implementation.mapping, kCoreAxisM);
     if (!mappedRows)
+      continue;
+    selectLocalHardwareOperation(
+        selected.implementation,
+        fragmentMapping ? LocalHardwareOperationKind::MatrixFragment
+                        : LocalHardwareOperationKind::RVVRegister,
+        LocalOperationProjection::None,
+        fragmentMapping ? mappedRows->fragmentFactor
+                        : mappedRows->registerFactor);
+    if (!finalizeLocalHardwareOperation(selected.implementation))
       continue;
     const unsigned privateGroups =
         fragmentMapping
@@ -2209,6 +1656,18 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
            kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
+    const unsigned logicalLanes =
+        candidate.axis.laneFactor * candidate.axis.registerFactor;
+    if (facts.semantic == TernaryI8DotSemantic::Base3Digits) {
+      if (candidate.axis.laneFactor != 32 ||
+          candidate.axis.registerFactor != 1 ||
+          candidate.axis.sequentialFactor != 8)
+        continue;
+    } else if ((candidate.axis.laneFactor != 16 &&
+                candidate.axis.laneFactor != 32) ||
+               logicalLanes != 32 || candidate.axis.sequentialFactor != 8) {
+      continue;
+    }
     std::optional<RVVVectorShape> widened =
         rvvShapeForSameLanes(laneShape, 16, target);
     std::optional<RVVVectorShape> halfWidened =
@@ -2225,7 +1684,9 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
             ? llvm::SmallVector<RVVVectorShape, 4>{laneShape, *widened}
             : llvm::SmallVector<RVVVectorShape, 4>{
                   laneShape, *byte16, *widened, *halfWidened, highWord};
-    if (!finalizeLocalInstructionMapping(implementation))
+    selectLocalHardwareOperation(implementation,
+                                 LocalHardwareOperationKind::RVVRegister);
+    if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
     resources.mapping = &implementation.mapping;
@@ -2321,6 +1782,10 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
            facts.mapping, CoreInstructionKind::RVVIndexedGather, kCoreAxisK, 8,
            target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
+    if (candidate.axis.laneFactor != 32 ||
+        candidate.axis.registerFactor != 1 ||
+        candidate.axis.sequentialFactor != 1)
+      continue;
     std::optional<RVVVectorShape> productShape =
         rvvShapeForSameLanes(laneShape, 16, target);
     if (!productShape)
@@ -2347,7 +1812,17 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     else
       implementation.valueShapes = {laneShape, *tableShape};
     implementation.entryWidth = facts.entryWidth;
-    if (!finalizeLocalInstructionMapping(implementation))
+    LocalOperationProjection projection = LocalOperationProjection::None;
+    if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
+        facts.primitive == LocalPrimitiveKind::SignedCodebook4I8 ||
+        facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
+      projection = implementation.valueShapes[5] == laneShape
+                       ? LocalOperationProjection::SignSourceDirect
+                       : LocalOperationProjection::SignSourceExtend;
+    selectLocalHardwareOperation(implementation,
+                                 LocalHardwareOperationKind::RVVRegister,
+                                 projection);
+    if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
     resources.mapping = &implementation.mapping;
@@ -2413,6 +1888,12 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
            kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
+    const unsigned logicalLanes =
+        candidate.axis.laneFactor * candidate.axis.registerFactor;
+    if ((candidate.axis.laneFactor != 16 &&
+         candidate.axis.laneFactor != 32) ||
+        logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
+      continue;
     const bool combined = candidate.axis.laneFactor == 32 &&
                           packedShape->lmulEighths >= 8 &&
                           packedShape->lmulEighths * 2 ==
@@ -2427,7 +1908,11 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
     implementation.mapping = std::move(candidate.mapping);
     implementation.valueShapes = {laneShape, *packedShape, tableShape,
                                   *productShape};
-    if (!finalizeLocalInstructionMapping(implementation))
+    selectLocalHardwareOperation(
+        implementation, LocalHardwareOperationKind::RVVRegister,
+        combined ? LocalOperationProjection::NibbleCodebookCombined
+                 : LocalOperationProjection::NibbleCodebookSplit);
+    if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
     resources.mapping = &implementation.mapping;
@@ -2512,6 +1997,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
            facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
            kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
+    const unsigned logicalLanes =
+        candidate.axis.laneFactor * candidate.axis.registerFactor;
     LocalImplementation implementation;
     implementation.primitive = primitive;
     implementation.mapping = std::move(candidate.mapping);
@@ -2622,12 +2109,63 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     } else {
       implementation.valueShapes = {laneShape};
     }
-    if (!finalizeLocalInstructionMapping(implementation))
+    LocalOperationProjection projection = LocalOperationProjection::None;
+    LocalHardwareOperationKind operationKind =
+        LocalHardwareOperationKind::RVVRegister;
+    switch (primitive) {
+    case LocalPrimitiveKind::PackedI4I8:
+    case LocalPrimitiveKind::PackedI5I8:
+      if ((candidate.axis.laneFactor != 16 &&
+           candidate.axis.laneFactor != 32) ||
+          logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
+        continue;
+      if (candidate.axis.laneFactor != 32)
+        projection = LocalOperationProjection::PackedDotRegisterChunks;
+      else if (implementation.valueShapes[1] == laneShape)
+        projection = LocalOperationProjection::PackedDotLaneSlide;
+      else
+        projection = LocalOperationProjection::PackedDotLaneCreate;
+      break;
+    case LocalPrimitiveKind::PackedI3GroupedI8:
+      if ((candidate.axis.laneFactor != 16 &&
+           candidate.axis.laneFactor != 32) ||
+          logicalLanes == 0 || (256 % logicalLanes) != 0 ||
+          candidate.axis.sequentialFactor != 256 / logicalLanes)
+        continue;
+      break;
+    case LocalPrimitiveKind::IQ2SI8:
+    case LocalPrimitiveKind::IQ1MI8:
+      if ((candidate.axis.laneFactor != 32 &&
+           candidate.axis.laneFactor != 64) ||
+          candidate.axis.registerFactor != 1 ||
+          candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
+        continue;
+      break;
+    case LocalPrimitiveKind::IQ3SI8:
+      if (candidate.axis.laneFactor != 64 ||
+          candidate.axis.registerFactor != 1 ||
+          candidate.axis.sequentialFactor != 4)
+        continue;
+      break;
+    case LocalPrimitiveKind::Q6KI8:
+      if ((candidate.axis.laneFactor != 32 &&
+           candidate.axis.laneFactor != 64) ||
+          candidate.axis.registerFactor != 1 ||
+          candidate.axis.sequentialFactor != 256 / candidate.axis.laneFactor)
+        continue;
+      operationKind =
+          logicalLanes == 32 && laneShape == RVVVectorShape{8, 16}
+              ? LocalHardwareOperationKind::RVVInlineAsm
+              : LocalHardwareOperationKind::RVVRegister;
+      break;
+    default:
+      break;
+    }
+    selectLocalHardwareOperation(implementation, operationKind, projection);
+    if (!finalizeLocalHardwareOperation(implementation))
       continue;
     AxisMappedResourceFacts resources;
     resources.mapping = &implementation.mapping;
-    const unsigned logicalLanes =
-        candidate.axis.laneFactor * candidate.axis.registerFactor;
     if (primitive == LocalPrimitiveKind::IQ2SI8) {
       resources.values = {
           {PhysicalLiveClass::Index, implementation.valueShapes[1]},
@@ -2678,7 +2216,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
            2 * (candidate.axis.laneFactor / 16)},
           {PhysicalLiveClass::Temporary, kRVVE32M1}};
     } else if (primitive == LocalPrimitiveKind::Q6KI8) {
-      if (implementation.leaf.kind == LocalLeafKind::Q6KI8RVVAssembly) {
+      if (implementation.operation.kind ==
+          LocalHardwareOperationKind::RVVInlineAsm) {
         PhysicalResourceRequirements requirements;
         requirements.reservedGroups = 0;
         requirements.live = {{PhysicalLiveClass::Temporary, {}, 1, 32}};
@@ -2782,7 +2321,23 @@ selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
       implementation.valueShapes = {laneShape};
       if (activationShape)
         implementation.valueShapes.push_back(activationShape);
-      if (!finalizeLocalInstructionMapping(implementation))
+      const unsigned logicalLanes =
+          candidate.axis.laneFactor * candidate.axis.registerFactor;
+      const bool sequential = candidate.axis.sequentialFactor > 1;
+      const bool registerMF2 =
+          logicalLanes == 32 && laneShape == RVVVectorShape{8, 4} &&
+          activationShape == RVVVectorShape{8, 4};
+      const bool registerM1M2 =
+          logicalLanes == 32 && laneShape == kRVVE8M1 &&
+          activationShape == RVVVectorShape{8, 16};
+      const bool strip = sequential && laneShape == kRVVE8M1 &&
+                         !activationShape;
+      if (!registerMF2 && !registerM1M2 && !strip)
+        continue;
+      selectLocalHardwareOperation(
+          implementation, strip ? LocalHardwareOperationKind::RVVStrip
+                                : LocalHardwareOperationKind::RVVRegister);
+      if (!finalizeLocalHardwareOperation(implementation))
         continue;
       RVVVectorShape selectedActivation =
           activationShape ? activationShape : laneShape;
@@ -2908,10 +2463,18 @@ selectGroupedAffineI4I8Physical(
     candidate.implementation.mapping = mapping;
     candidate.implementation.valueShapes = {candidate.packedShape,
                                             candidate.widenedShape};
-    if (!finalizeLocalInstructionMapping(candidate.implementation))
-      continue;
     const bool registerAsm =
         reduction->sequentialFactor == 1 && reduction->laneFactor == 16;
+    selectLocalHardwareOperation(
+        candidate.implementation,
+        reduction->sequentialFactor > 1
+            ? LocalHardwareOperationKind::RVVStrip
+            : registerAsm ? LocalHardwareOperationKind::RVVInlineAsm
+                          : LocalHardwareOperationKind::RVVRegister,
+        LocalOperationProjection::None, 1,
+        mappedHardwareLaneFactor(candidate.implementation.mapping));
+    if (!finalizeLocalHardwareOperation(candidate.implementation))
+      continue;
     if (registerAsm) {
       PhysicalResourceRequirements resources;
       resources.reservedGroups = 0;

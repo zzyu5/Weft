@@ -15,11 +15,13 @@ bool emitPackedDotLocalImplementation(
     bool hasHighBits) {
   const PhysicalAxisDecomposition *reduction =
       findAxisMapping(implementation.mapping, kCoreAxisK);
-  const LocalLeafKind expectedLeaf =
-      hasHighBits ? LocalLeafKind::PackedI5I8Register
-                  : LocalLeafKind::PackedI4I8Register;
-  if (implementation.leaf.kind != expectedLeaf ||
-      implementation.leaf.projection == LocalLeafProjection::None ||
+  const LocalPrimitiveKind expectedPrimitive =
+      hasHighBits ? LocalPrimitiveKind::PackedI5I8
+                  : LocalPrimitiveKind::PackedI4I8;
+  if (implementation.primitive != expectedPrimitive ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
+      implementation.operation.projection == LocalOperationProjection::None ||
       implementation.valueShapes.size() < 2 || !reduction)
     return false;
 
@@ -66,10 +68,10 @@ bool emitPackedDotLocalImplementation(
          << "    float dot_scale, float additive_bias, float init) {\n";
 
   const bool laneProjection =
-      implementation.leaf.projection ==
-          LocalLeafProjection::PackedDotLaneSlide ||
-      implementation.leaf.projection ==
-          LocalLeafProjection::PackedDotLaneCreate;
+      implementation.operation.projection ==
+          LocalOperationProjection::PackedDotLaneSlide ||
+      implementation.operation.projection ==
+          LocalOperationProjection::PackedDotLaneCreate;
   if (laneProjection) {
     output << "  const size_t vl16 = " << decodeSetVL << "(16);\n"
            << "  const " << decodeUnsignedType
@@ -85,8 +87,8 @@ bool emitPackedDotLocalImplementation(
            << decodeSignedSuffix << "(__riscv_vsrl_vx_" << decodeUnsignedSuffix
            << "(packed, 4, vl16));\n"
            << "  const size_t vl32 = " << setVL << "(32);\n";
-    if (implementation.leaf.projection ==
-        LocalLeafProjection::PackedDotLaneSlide)
+    if (implementation.operation.projection ==
+        LocalOperationProjection::PackedDotLaneSlide)
       output << "  " << signedType << " codes = __riscv_vslideup_vx_"
              << signedSuffix << "(low, high, 16, vl32);\n";
     else
@@ -105,8 +107,8 @@ bool emitPackedDotLocalImplementation(
            << "((const int8_t *)(const void *)activation_bytes, vl32);\n"
            << "  const " << widenedType << " products = __riscv_vwmul_vv_"
            << widenedSuffix << "(codes, activation, vl32);\n";
-  } else if (implementation.leaf.projection ==
-             LocalLeafProjection::PackedDotRegisterChunks) {
+  } else if (implementation.operation.projection ==
+             LocalOperationProjection::PackedDotRegisterChunks) {
     for (unsigned chunk = 0; chunk < reduction->registerFactor; ++chunk) {
       const unsigned start = chunk * reduction->laneFactor;
       const unsigned packedOffset = start % 16;
@@ -173,7 +175,9 @@ bool emitPackedI5LocalImplementation(
 
 bool emitNibbleCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (implementation.leaf.kind != LocalLeafKind::NibbleCodebookI8Register ||
+  if (implementation.primitive != LocalPrimitiveKind::NibbleCodebookI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
       implementation.valueShapes.size() < 4)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -181,10 +185,10 @@ bool emitNibbleCodebookLocalImplementation(
   const RVVVectorShape tableShape = implementation.valueShapes[2];
   const RVVVectorShape productShape = implementation.valueShapes[3];
   const bool combined =
-      implementation.leaf.projection ==
-      LocalLeafProjection::NibbleCodebookCombined;
-  if (!combined && implementation.leaf.projection !=
-                       LocalLeafProjection::NibbleCodebookSplit)
+      implementation.operation.projection ==
+      LocalOperationProjection::NibbleCodebookCombined;
+  if (!combined && implementation.operation.projection !=
+                       LocalOperationProjection::NibbleCodebookSplit)
     return false;
   const std::string packedUnsignedType =
       rvvVectorType(RVVElementCategory::UnsignedInteger, packedShape);

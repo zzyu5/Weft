@@ -8,7 +8,9 @@ namespace weft::riscv_internal {
 
 bool emitIQ1LocalImplementation(llvm::raw_ostream &output,
                                 const LocalImplementation &implementation) {
-  if (implementation.leaf.kind != LocalLeafKind::IQ1MI8Register ||
+  if (implementation.primitive != LocalPrimitiveKind::IQ1MI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
       implementation.valueShapes.size() < 6)
     return false;
   const PhysicalAxisDecomposition *reduction =

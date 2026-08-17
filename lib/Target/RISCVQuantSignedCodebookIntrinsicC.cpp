@@ -8,12 +8,14 @@ namespace weft::riscv_internal {
 
 bool emitSignedCodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if ((implementation.leaf.kind != LocalLeafKind::SignedCodebook8I8Register &&
-       implementation.leaf.kind != LocalLeafKind::SignedCodebook4I8Register) ||
-      (implementation.leaf.projection !=
-           LocalLeafProjection::SignSourceDirect &&
-       implementation.leaf.projection !=
-           LocalLeafProjection::SignSourceExtend) ||
+  if ((implementation.primitive != LocalPrimitiveKind::SignedCodebook8I8 &&
+       implementation.primitive != LocalPrimitiveKind::SignedCodebook4I8) ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
+      (implementation.operation.projection !=
+           LocalOperationProjection::SignSourceDirect &&
+       implementation.operation.projection !=
+           LocalOperationProjection::SignSourceExtend) ||
       implementation.valueShapes.size() < 6)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -111,8 +113,8 @@ bool emitSignedCodebookLocalImplementation(
          << "(lane, 7, vl32), vl32);\n"
          << "  const " << laneUnsignedType << " signs = __riscv_vrgather_vv_"
          << laneUnsignedSuffix << "(\n      ";
-  if (implementation.leaf.projection ==
-      LocalLeafProjection::SignSourceDirect)
+  if (implementation.operation.projection ==
+      LocalOperationProjection::SignSourceDirect)
     output << "sign_source";
   else
     output << "__riscv_vlmul_ext_v_" << signSourceSuffix << "_"
@@ -142,12 +144,13 @@ bool emitSignedCodebookLocalImplementation(
 
 bool emitPackedU9U7CodebookLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (implementation.leaf.kind !=
-          LocalLeafKind::PackedU9U7CodebookI8Register ||
-      (implementation.leaf.projection !=
-           LocalLeafProjection::SignSourceDirect &&
-       implementation.leaf.projection !=
-           LocalLeafProjection::SignSourceExtend) ||
+  if (implementation.primitive != LocalPrimitiveKind::PackedU9U7CodebookI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
+      (implementation.operation.projection !=
+           LocalOperationProjection::SignSourceDirect &&
+       implementation.operation.projection !=
+           LocalOperationProjection::SignSourceExtend) ||
       implementation.valueShapes.size() < 7)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -252,8 +255,8 @@ bool emitPackedU9U7CodebookLocalImplementation(
          << "(lane, 7, vl32), vl32);\n"
          << "  const " << laneUnsignedType << " signs = __riscv_vrgather_vv_"
          << laneUnsignedSuffix << "(\n      ";
-  if (implementation.leaf.projection ==
-      LocalLeafProjection::SignSourceDirect)
+  if (implementation.operation.projection ==
+      LocalOperationProjection::SignSourceDirect)
     output << "sign_source";
   else
     output << "__riscv_vlmul_ext_v_" << signSourceSuffix << "_"
@@ -291,8 +294,10 @@ bool emitPackedU9U7CodebookLocalImplementation(
 
 bool emitPackedU11GridDeltaLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (implementation.leaf.kind !=
-          LocalLeafKind::PackedU11GridDeltaI8Register ||
+  if (implementation.primitive !=
+          LocalPrimitiveKind::PackedU11GridDeltaI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
       implementation.valueShapes.size() < 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];

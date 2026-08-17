@@ -127,15 +127,20 @@ void emitQ6KRVVAssembly(llvm::raw_ostream &output,
 
 bool emitQ6LocalImplementation(llvm::raw_ostream &output,
                                const LocalImplementation &implementation) {
-  if ((implementation.leaf.kind != LocalLeafKind::Q6KI8RVVAssembly &&
-       implementation.leaf.kind != LocalLeafKind::Q6KI8Register) ||
+  if (implementation.primitive != LocalPrimitiveKind::Q6KI8 ||
+      (implementation.operation.kind !=
+           LocalHardwareOperationKind::RVVInlineAsm &&
+       implementation.operation.kind !=
+           LocalHardwareOperationKind::RVVRegister) ||
       implementation.valueShapes.size() < 4)
     return false;
-  if (implementation.leaf.kind == LocalLeafKind::Q6KI8RVVAssembly) {
+  if (implementation.operation.kind ==
+      LocalHardwareOperationKind::RVVInlineAsm) {
     emitQ6KRVVAssembly(output, implementation);
     return true;
   }
-  if (implementation.leaf.kind != LocalLeafKind::Q6KI8Register)
+  if (implementation.operation.kind !=
+      LocalHardwareOperationKind::RVVRegister)
     return false;
 
   const PhysicalAxisDecomposition *reduction =

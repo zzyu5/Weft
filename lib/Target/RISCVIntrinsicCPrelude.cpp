@@ -238,7 +238,7 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
       return;
     const std::string symbol = localImplementationSymbol(implementation);
     if (implementation.primitive == LocalPrimitiveKind::F32Math) {
-      supported = !implementation.leaf && symbol.empty() &&
+      supported = !implementation.operation && symbol.empty() &&
                   implementation.valueShapes.size() == 1 &&
                   implementation.valueShapes.front() ==
                       implementation.mapping.laneShape &&
@@ -252,73 +252,54 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
         unsupportedSymbol = "<f32 math local implementation>";
       return;
     }
-    supported = implementation.leaf && !symbol.empty();
+    supported = implementation.operation && !symbol.empty();
     if (!supported) {
       unsupportedSymbol = "<unnamed local implementation>";
       return;
     }
-    switch (implementation.leaf.kind) {
-    case LocalLeafKind::None:
-      supported = false;
-      break;
-    case LocalLeafKind::RVVSymmetricI4I8N16K32:
-      usesRVVSymmetricI4I8 = true;
-      break;
-    case LocalLeafKind::RVVAffineI4I8N16K32:
-      usesRVVAffineI4I8 = true;
-      break;
-    case LocalLeafKind::RVVSymmetricI4I8M4N16K32:
-      usesRVVSymmetricI4I8M4 = true;
-      break;
-    case LocalLeafKind::RVVAffineI4I8M4N16K32:
-      usesRVVAffineI4I8M4 = true;
-      break;
-    case LocalLeafKind::IMESymmetricI4I8N16K32:
-      usesIME1SymmetricI4I8 = true;
-      break;
-    case LocalLeafKind::IMEAffineI4I8N16K32:
-      usesIME1AffineI4I8 = true;
-      break;
-    case LocalLeafKind::IMESymmetricI4I8M4N16K32:
-      usesIME1SymmetricI4I8M4 = true;
-      break;
-    case LocalLeafKind::IMEAffineI4I8M4N16K32:
-      usesIME1AffineI4I8M4 = true;
-      break;
-    case LocalLeafKind::GroupedAffineI4I8RegisterL16:
-      usesGroupedI4I8RegisterL16 = true;
-      break;
-    case LocalLeafKind::GroupedAffineI4I8RegisterL32:
-      usesGroupedI4I8RegisterL32 = true;
-      break;
-    case LocalLeafKind::GroupedAffineI4I8Strip:
-      usesGroupedI4I8Strip = true;
-      break;
-    case LocalLeafKind::E2M1E8M0I8RegisterE8MF2:
-      usesE2M1RegisterE8MF2 = true;
-      break;
-    case LocalLeafKind::E2M1E8M0I8RegisterE8M1E8M2:
-      usesE2M1RegisterE8M1M2 = true;
-      break;
-    case LocalLeafKind::E2M1E8M0I8Strip:
-      usesE2M1Strip = true;
-      break;
-    case LocalLeafKind::PackedI4I8Register:
-    case LocalLeafKind::PackedI5I8Register:
-    case LocalLeafKind::PackedI3GroupedI8Register:
-    case LocalLeafKind::Base3TernaryI8Register:
-    case LocalLeafKind::PackedI2TernaryI8Register:
-    case LocalLeafKind::SignedCodebook8I8Register:
-    case LocalLeafKind::SignedCodebook4I8Register:
-    case LocalLeafKind::PackedU9U7CodebookI8Register:
-    case LocalLeafKind::PackedU11GridDeltaI8Register:
-    case LocalLeafKind::NibbleCodebookI8Register:
-    case LocalLeafKind::IQ2SI8Register:
-    case LocalLeafKind::IQ3SI8Register:
-    case LocalLeafKind::IQ1MI8Register:
-    case LocalLeafKind::Q6KI8Register:
-    case LocalLeafKind::Q6KI8RVVAssembly:
-      break;
+    const LocalHardwareOperation &operation = implementation.operation;
+    if (implementation.primitive == LocalPrimitiveKind::SymmetricI4I8) {
+      if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
+        (operation.rows == 4 ? usesIME1SymmetricI4I8M4
+                             : usesIME1SymmetricI4I8) = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVRegister)
+        (operation.rows == 4 ? usesRVVSymmetricI4I8M4
+                             : usesRVVSymmetricI4I8) = true;
+      else
+        supported = false;
+    } else if (implementation.primitive == LocalPrimitiveKind::AffineI4I8) {
+      if (operation.kind == LocalHardwareOperationKind::MatrixFragment)
+        (operation.rows == 4 ? usesIME1AffineI4I8M4
+                             : usesIME1AffineI4I8) = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVRegister)
+        (operation.rows == 4 ? usesRVVAffineI4I8M4
+                             : usesRVVAffineI4I8) = true;
+      else
+        supported = false;
+    } else if (implementation.primitive ==
+               LocalPrimitiveKind::GroupedAffineI4I8) {
+      if (operation.kind == LocalHardwareOperationKind::RVVInlineAsm &&
+          operation.lanes == 16)
+        usesGroupedI4I8RegisterL16 = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
+               operation.lanes == 32)
+        usesGroupedI4I8RegisterL32 = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+        usesGroupedI4I8Strip = true;
+      else
+        supported = false;
+    } else if (implementation.primitive ==
+               LocalPrimitiveKind::E2M1E8M0I8) {
+      if (operation.kind == LocalHardwareOperationKind::RVVStrip)
+        usesE2M1Strip = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
+               operation.primaryShape == RVVVectorShape{8, 4})
+        usesE2M1RegisterE8MF2 = true;
+      else if (operation.kind == LocalHardwareOperationKind::RVVRegister &&
+               operation.primaryShape == kRVVE8M1)
+        usesE2M1RegisterE8M1M2 = true;
+      else
+        supported = false;
     }
     if (!supported)
       unsupportedSymbol = symbol;

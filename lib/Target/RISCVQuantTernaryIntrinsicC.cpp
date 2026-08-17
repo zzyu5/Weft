@@ -8,7 +8,9 @@ namespace weft::riscv_internal {
 
 bool emitBase3TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (implementation.leaf.kind != LocalLeafKind::Base3TernaryI8Register ||
+  if (implementation.primitive != LocalPrimitiveKind::Base3TernaryI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
       implementation.valueShapes.size() < 5)
     return false;
   const RVVVectorShape laneShape = implementation.valueShapes[0];
@@ -205,7 +207,9 @@ bool emitBase3TernaryLocalImplementation(
 
 bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation) {
-  if (implementation.leaf.kind != LocalLeafKind::PackedI2TernaryI8Register ||
+  if (implementation.primitive != LocalPrimitiveKind::PackedI2TernaryI8 ||
+      implementation.operation.kind !=
+          LocalHardwareOperationKind::RVVRegister ||
       implementation.valueShapes.size() < 2)
     return false;
   const PhysicalAxisDecomposition *reduction =
