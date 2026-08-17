@@ -581,6 +581,26 @@ struct DotDecision {
   mlir::Value reductionAxis;
   mlir::Value reductionExtent;
   unsigned rowTile = 1;
+  VLAMemoryMode lhsMemoryMode = VLAMemoryMode::UnitStride;
+  VLAMemoryMode rhsMemoryMode = VLAMemoryMode::UnitStride;
+  std::optional<AffineScalarExpression> lhsLaneStride;
+  std::optional<AffineScalarExpression> rhsLaneStride;
+};
+
+struct LocalDenseProductAnalysis {
+  LoadOp lhsLoad;
+  LoadOp rhsLoad;
+  BlockIndexOp lhsFreeAxis;
+  BlockIndexOp rhsFreeAxis;
+  BlockIndexOp reductionAxis;
+  unsigned lhsFreeExtent = 1;
+  unsigned rhsFreeExtent = 1;
+  std::optional<uint64_t> reductionExtent;
+  LaneRelation lhsReductionRelation = LaneRelation::Independent;
+  LaneRelation rhsReductionRelation = LaneRelation::Independent;
+  std::optional<AffineScalarExpression> lhsReductionStride;
+  std::optional<AffineScalarExpression> rhsReductionStride;
+  CoreMappingProblem mapping;
 };
 
 template <typename Decision>
@@ -986,7 +1006,7 @@ private:
       if (decisionFailure)
         return;
       std::optional<PlannedPhysicalDecision<F16GemmNTileDecision>> decision =
-          decideF16GemmNTiles(matmul);
+          decideF16Matmul(matmul);
       if (!decision) {
         matmul.emitError(
             "matmul has no legal local microkernel for its typed axes, shape, target, and backend config");
@@ -1000,7 +1020,7 @@ private:
       if (decisionFailure || isRegionValue(dot.getResult().getType()))
         return;
       mlir::FailureOr<PlannedPhysicalDecision<DotDecision>> decision =
-          decideLocalF32RowMicrotile(dot);
+          decideLocalF32Dot(dot);
       if (mlir::failed(decision)) {
         decisionFailure = true;
         return;
@@ -5666,135 +5686,209 @@ private:
     return mlir::success();
   }
 
+  std::optional<LocalDenseProductAnalysis>
+  analyzeLocalDenseProduct(mlir::Value lhs, mlir::Value rhs,
+                           mlir::Value result) {
+    std::optional<StructuredProductFacts> product =
+        analyzeStructuredProductFacts(kernelFacts, lhs, rhs, result);
+    if (!product || product->reductionAxes.size() != 1 ||
+        product->lhsFreeAxes.size() > 1 || product->rhsFreeAxes.size() > 1 ||
+        product->resultAxes.size() !=
+            product->lhsFreeAxes.size() + product->rhsFreeAxes.size())
+      return std::nullopt;
+    for (mlir::Value axis : product->lhsFreeAxes)
+      if (!llvm::is_contained(product->resultAxes, axis))
+        return std::nullopt;
+    for (mlir::Value axis : product->rhsFreeAxes)
+      if (!llvm::is_contained(product->resultAxes, axis))
+        return std::nullopt;
+
+    LocalDenseProductAnalysis analysis;
+    analysis.lhsLoad = reloadableLoad(lhs);
+    analysis.rhsLoad = reloadableLoad(rhs);
+    analysis.reductionAxis =
+        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!product->lhsFreeAxes.empty())
+      analysis.lhsFreeAxis =
+          product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!product->rhsFreeAxes.empty())
+      analysis.rhsFreeAxis =
+          product->rhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
+    if (!analysis.lhsLoad || !analysis.rhsLoad || !analysis.reductionAxis ||
+        (!product->lhsFreeAxes.empty() && !analysis.lhsFreeAxis) ||
+        (!product->rhsFreeAxes.empty() && !analysis.rhsFreeAxis))
+      return std::nullopt;
+
+    auto staticExtent = [&](BlockIndexOp axis) -> std::optional<unsigned> {
+      if (!axis)
+        return 1;
+      std::optional<int64_t> extent = physicalExtent(axis.getExtent());
+      if (!extent || *extent <= 0 ||
+          static_cast<uint64_t>(*extent) >
+              static_cast<uint64_t>(std::numeric_limits<unsigned>::max()))
+        return std::nullopt;
+      return static_cast<unsigned>(*extent);
+    };
+    std::optional<unsigned> lhsFreeExtent = staticExtent(analysis.lhsFreeAxis);
+    std::optional<unsigned> rhsFreeExtent = staticExtent(analysis.rhsFreeAxis);
+    if (!lhsFreeExtent || !rhsFreeExtent)
+      return std::nullopt;
+    analysis.lhsFreeExtent = *lhsFreeExtent;
+    analysis.rhsFreeExtent = *rhsFreeExtent;
+    if (std::optional<int64_t> extent =
+            physicalExtent(analysis.reductionAxis.getExtent());
+        extent && *extent > 0)
+      analysis.reductionExtent = static_cast<uint64_t>(*extent);
+
+    const MemoryAccessFact *lhsAccess =
+        memoryFact(analysis.lhsLoad.getOperation());
+    const MemoryAccessFact *rhsAccess =
+        memoryFact(analysis.rhsLoad.getOperation());
+    if (!lhsAccess || !rhsAccess)
+      return std::nullopt;
+    analysis.lhsReductionRelation =
+        memoryRelation(*lhsAccess, analysis.reductionAxis.getResult());
+    analysis.rhsReductionRelation =
+        memoryRelation(*rhsAccess, analysis.reductionAxis.getResult());
+    auto legalReductionRelation = [](LaneRelation relation) {
+      return relation == LaneRelation::UnitStride ||
+             relation == LaneRelation::Strided;
+    };
+    if (!legalReductionRelation(analysis.lhsReductionRelation) ||
+        !legalReductionRelation(analysis.rhsReductionRelation))
+      return std::nullopt;
+    if (analysis.lhsFreeAxis &&
+        (memoryRelation(*lhsAccess, analysis.lhsFreeAxis.getResult()) ==
+             LaneRelation::Independent ||
+         memoryRelation(*rhsAccess, analysis.lhsFreeAxis.getResult()) !=
+             LaneRelation::Independent))
+      return std::nullopt;
+    if (analysis.rhsFreeAxis &&
+        (memoryRelation(*rhsAccess, analysis.rhsFreeAxis.getResult()) ==
+             LaneRelation::Independent ||
+         memoryRelation(*lhsAccess, analysis.rhsFreeAxis.getResult()) !=
+             LaneRelation::Independent))
+      return std::nullopt;
+    if (analysis.lhsReductionRelation == LaneRelation::Strided) {
+      const MemoryAxisFact *axis =
+          memoryAxisFact(*lhsAccess, analysis.reductionAxis.getResult());
+      if (!axis || !axis->laneStride)
+        return std::nullopt;
+      analysis.lhsReductionStride = axis->laneStride;
+    }
+    if (analysis.rhsReductionRelation == LaneRelation::Strided) {
+      const MemoryAxisFact *axis =
+          memoryAxisFact(*rhsAccess, analysis.reductionAxis.getResult());
+      if (!axis || !axis->laneStride)
+        return std::nullopt;
+      analysis.rhsReductionStride = axis->laneStride;
+    }
+
+    if (analysis.lhsFreeAxis)
+      analysis.mapping.axes.push_back(LogicalAxisConstraint{
+          kCoreAxisM, LogicalAxisRole::Free, analysis.lhsFreeExtent, false,
+          false, false,
+          registerFactorCandidates(analysis.lhsFreeExtent,
+                                   std::min(analysis.lhsFreeExtent, 8u))});
+    if (analysis.rhsFreeAxis)
+      analysis.mapping.axes.push_back(LogicalAxisConstraint{
+          kCoreAxisN, LogicalAxisRole::Free, analysis.rhsFreeExtent, false,
+          false, false,
+          registerFactorCandidates(analysis.rhsFreeExtent,
+                                   std::min(analysis.rhsFreeExtent, 8u))});
+    analysis.mapping.axes.push_back(LogicalAxisConstraint{
+        kCoreAxisK, LogicalAxisRole::Reduction, analysis.reductionExtent,
+        false, true, true, {1}});
+    analysis.mapping.unrollAxis = kCoreAxisK;
+    return analysis;
+  }
+
   mlir::FailureOr<PlannedPhysicalDecision<DotDecision>>
-  decideLocalF32RowMicrotile(DotOp dot) {
-    BlockType lhsType =
-        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getLhs().getType()));
-    BlockType rhsType =
-        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(dot.getRhs().getType()));
+  decideLocalF32Dot(DotOp dot) {
     BlockType resultType = mlir::dyn_cast<BlockType>(
         unwrapLogicalValidity(dot.getResult().getType()));
-    if (!lhsType || !rhsType || !resultType ||
-        lhsType.getShape().size() != 2 ||
-        rhsType.getShape().size() != 1 || resultType.getShape().size() != 1 ||
-        lhsType.getShape()[0] != resultType.getShape()[0] ||
-        lhsType.getShape()[1] != rhsType.getShape()[0] ||
-        resultType.getShape()[0] <= 0 || resultType.getShape()[0] > 8 ||
-        !lhsType.getElementType().isF32() ||
-        !rhsType.getElementType().isF32() || !resultType.getElementType().isF32() ||
-        !mlir::isa<BlockType>(dot.getInit().getType()) ||
-        mlir::cast<BlockType>(dot.getInit().getType()).getShape() !=
-            resultType.getShape() ||
-        mlir::cast<BlockType>(dot.getInit().getType()).getAxisIds() !=
-            resultType.getAxisIds() ||
-        !mlir::cast<BlockType>(dot.getInit().getType())
-             .getElementType()
-             .isF32() ||
+    BlockType initType = mlir::dyn_cast<BlockType>(
+        unwrapLogicalValidity(dot.getInit().getType()));
+    if (!resultType || !initType || resultType != initType ||
+        !elementType(dot.getLhs().getType()).isF32() ||
+        !elementType(dot.getRhs().getType()).isF32() ||
+        !resultType.getElementType().isF32() ||
         dot.getOrder() != "relaxed" || dot.getMath() != "native" ||
         !dot.getAccDtype().isF32()) {
+      dot.emitError("local f32 dot requires matching f32 block init/result");
+      return mlir::failure();
+    }
+    std::optional<LocalDenseProductAnalysis> analysis =
+        analyzeLocalDenseProduct(dot.getLhs(), dot.getRhs(), dot.getResult());
+    if (!analysis || static_cast<bool>(analysis->lhsFreeAxis) ==
+                         static_cast<bool>(analysis->rhsFreeAxis)) {
       dot.emitError(
-          "RVV row microtile requires a [BM,K] x [K] local f32 dot");
+          "local f32 dot requires one free block axis and one reduction axis");
       return mlir::failure();
     }
-
-    LoadOp lhsLoad = reloadableLoad(dot.getLhs());
-    LoadOp rhsLoad = reloadableLoad(dot.getRhs());
-    if (!lhsLoad || !rhsLoad || !isTrue(rhsLoad.getWhere())) {
-      dot.emitError("RVV row microtile load producers are unavailable");
-      return mlir::failure();
-    }
-
-    std::optional<StructuredProductFacts> product =
-        analyzeStructuredProductFacts(kernelFacts, dot.getLhs(), dot.getRhs(),
-                                      dot.getResult());
-    if (!product || product->lhsFreeAxes.size() != 1 ||
-        !product->rhsFreeAxes.empty() || product->reductionAxes.size() != 1 ||
-        product->resultAxes.size() != 1) {
-      dot.emitError(
-          "RVV row microtile requires explicit row and shared K block axes");
-      return mlir::failure();
-    }
-    mlir::Value rowCoordinate = product->lhsFreeAxes.front();
-    mlir::Value reductionCoordinate = product->reductionAxes.front();
-    BlockIndexOp rowAxis = rowCoordinate.getDefiningOp<BlockIndexOp>();
-    BlockIndexOp reductionAxis =
-        reductionCoordinate.getDefiningOp<BlockIndexOp>();
-    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
-    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
-    if (!rowAxis || !reductionAxis || !lhsAccess || !rhsAccess) {
-      dot.emitError("RVV row microtile typed axis/access facts are unavailable");
-      return mlir::failure();
-    }
-    mlir::Value lhsRoot = lhsAccess->root;
-    mlir::Value rhsRoot = rhsAccess->root;
-    auto lhsPointer = lhsRoot ? mlir::dyn_cast<PtrType>(lhsRoot.getType())
-                              : PtrType{};
-    auto rhsPointer = rhsRoot ? mlir::dyn_cast<PtrType>(rhsRoot.getType())
-                              : PtrType{};
-    if (!lhsPointer || !rhsPointer ||
-        !lhsPointer.getElementType().isF32() ||
-        !rhsPointer.getElementType().isF32() ||
-        valueDependsOnAxis(lhsLoad.getWhere(), reductionCoordinate) ||
-        (!isTrue(lhsLoad.getWhere()) &&
-         !isFloatConstant(lhsLoad.getOther(), 0.0))) {
-      dot.emitError("RVV row microtile pointer facts are unavailable");
+    const bool freeOnLHS = static_cast<bool>(analysis->lhsFreeAxis);
+    LoadOp rowLoad = freeOnLHS ? analysis->lhsLoad : analysis->rhsLoad;
+    LoadOp reductionLoad = freeOnLHS ? analysis->rhsLoad : analysis->lhsLoad;
+    BlockIndexOp rowAxis =
+        freeOnLHS ? analysis->lhsFreeAxis : analysis->rhsFreeAxis;
+    LaneRelation rowRelation = freeOnLHS
+                                   ? analysis->lhsReductionRelation
+                                   : analysis->rhsReductionRelation;
+    LaneRelation reductionRelation = freeOnLHS
+                                         ? analysis->rhsReductionRelation
+                                         : analysis->lhsReductionRelation;
+    std::optional<AffineScalarExpression> rowStride =
+        freeOnLHS ? analysis->lhsReductionStride
+                  : analysis->rhsReductionStride;
+    std::optional<AffineScalarExpression> reductionStride =
+        freeOnLHS ? analysis->rhsReductionStride
+                  : analysis->lhsReductionStride;
+    if (!isTrue(reductionLoad.getWhere()) ||
+        valueDependsOnAxis(rowLoad.getWhere(),
+                           analysis->reductionAxis.getResult()) ||
+        (!isTrue(rowLoad.getWhere()) &&
+         !isFloatConstant(rowLoad.getOther(), 0.0))) {
+      dot.emitError("local f32 dot predicate facts are unavailable");
       return mlir::failure();
     }
 
     PlannedPhysicalDecision<DotDecision> planned;
     DotDecision &decision = planned.realization;
     decision.operation = dot.getOperation();
-    decision.lhsLoad = lhsLoad.getOperation();
-    decision.rhsLoad = rhsLoad.getOperation();
+    decision.lhsLoad = rowLoad.getOperation();
+    decision.rhsLoad = reductionLoad.getOperation();
     decision.rowAxis = rowAxis.getResult();
-    decision.reductionAxis = reductionAxis.getResult();
-    decision.reductionExtent = reductionAxis.getExtent();
-    decision.rowTile = static_cast<unsigned>(resultType.getShape()[0]);
-    LaneRelation lhsRelation =
-        memoryRelation(*lhsAccess, reductionCoordinate);
-    LaneRelation rhsRelation =
-        memoryRelation(*rhsAccess, reductionCoordinate);
-    if ((lhsRelation != LaneRelation::UnitStride &&
-         lhsRelation != LaneRelation::Strided) ||
-        (rhsRelation != LaneRelation::UnitStride &&
-         rhsRelation != LaneRelation::Strided) ||
-        memoryRelation(*lhsAccess, rowCoordinate) ==
-            LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, rowCoordinate) !=
-            LaneRelation::Independent) {
-      dot.emitError("RVV row microtile memory relations are unavailable");
-      return mlir::failure();
-    }
+    decision.reductionAxis = analysis->reductionAxis.getResult();
+    decision.reductionExtent = analysis->reductionAxis.getExtent();
+    decision.rowTile = freeOnLHS ? analysis->lhsFreeExtent
+                                 : analysis->rhsFreeExtent;
+    decision.lhsMemoryMode = rowRelation == LaneRelation::UnitStride
+                                 ? VLAMemoryMode::UnitStride
+                                 : VLAMemoryMode::Strided;
+    decision.rhsMemoryMode = reductionRelation == LaneRelation::UnitStride
+                                 ? VLAMemoryMode::UnitStride
+                                 : VLAMemoryMode::Strided;
+    decision.lhsLaneStride = rowStride;
+    decision.rhsLaneStride = reductionStride;
     F32DotCandidateFacts candidateFacts;
-    if (std::optional<int64_t> extent =
-            integerConstantValue(decision.reductionExtent);
-        extent && *extent >= 0)
-      candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
-    candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free,
-                              decision.rowTile, false, false, false,
-                              registerFactorCandidates(decision.rowTile,
-                                                       decision.rowTile)},
-        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                              candidateFacts.reductionExtent, false, true,
-                              true, {1}}};
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
+    candidateFacts.reductionExtent = analysis->reductionExtent;
+    candidateFacts.mapping = analysis->mapping;
+    if (!freeOnLHS)
+      for (LogicalAxisConstraint &axis : candidateFacts.mapping.axes)
+        if (axis.id == kCoreAxisN)
+          axis.id = kCoreAxisM;
     candidateFacts.unitStrideOperands =
-        (lhsRelation == LaneRelation::UnitStride) +
-        (rhsRelation == LaneRelation::UnitStride);
+        (rowRelation == LaneRelation::UnitStride) +
+        (reductionRelation == LaneRelation::UnitStride);
     candidateFacts.stridedOperands =
-        (lhsRelation == LaneRelation::Strided) +
-        (rhsRelation == LaneRelation::Strided);
-    candidateFacts.reductionPredicate =
-        valueDependsOnAxis(lhsLoad.getWhere(), reductionCoordinate);
-    candidateFacts.predicateGroups =
-        candidateFacts.reductionPredicate ? 1 : 0;
+        (rowRelation == LaneRelation::Strided) +
+        (reductionRelation == LaneRelation::Strided);
     std::optional<SelectedF32DotPhysical> physical =
         weft::riscv_internal::selectF32DotPhysicalConfig(
             candidateFacts, options.target, options.backend);
     if (!physical) {
       dot.emitError(
-          "RVV row microtile has no legal register-resource candidate");
+          "local f32 dot has no legal register-resource candidate");
       return mlir::failure();
     }
     decision.mapping = physical->mapping;
@@ -5836,14 +5930,14 @@ private:
     std::string extent = expression(decision.reductionExtent);
     if (extent.empty())
       return dot.emitError(
-          "RVV row microtile access projection is unavailable");
+          "local f32 dot access projection is unavailable");
 
     auto resultShape = llvm::find_if(
         entity.values, [&](const PhysicalValueDecision &value) {
           return value.value == dot.getResult();
         });
     if (resultShape == entity.values.end())
-      return dot.emitError("RVV row microtile physical entity is incomplete");
+      return dot.emitError("local f32 dot physical entity is incomplete");
     auto resultStorage = llvm::find_if(
         entity.storages, [&](const PhysicalStorageDecision &storage) {
           return storage.value == dot.getResult();
@@ -5851,7 +5945,7 @@ private:
     if (resultStorage == entity.storages.end() ||
         resultStorage->elements != static_cast<int64_t>(decision.rowTile) ||
         resultStorage->reusedStorage)
-      return dot.emitError("RVV row microtile result storage is incomplete");
+      return dot.emitError("local f32 dot result storage is incomplete");
     std::optional<unsigned> lmul = rvvIntegerLMUL(resultShape->shape);
     const PhysicalAxisDecomposition *mAxis =
         findAxisMapping(decision.mapping, kCoreAxisM);
@@ -5860,7 +5954,7 @@ private:
     if (!lmul || resultShape->shape.sew != 32 ||
         resultShape->shape != decision.mapping.laneShape || !mAxis || !kAxis ||
         mAxis->registerFactor == 0 || kAxis->unrollFactor == 0)
-      return dot.emitError("RVV row microtile value shape is unavailable");
+      return dot.emitError("local f32 dot value shape is unavailable");
     const unsigned rowMicrotile = mAxis->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
     std::string fullVL = fresh("dot_vlmax");
@@ -5880,7 +5974,7 @@ private:
           projectBlockScalar(lhsLoad.getWhere(), axes);
       if (!lhsPredicate)
         return dot.emitError(
-            "RVV row microtile row projection is unavailable");
+            "local f32 dot row projection is unavailable");
       std::string lhsCondition = fresh("dot_lhs_active");
       line("const bool " + lhsCondition + " = " + *lhsPredicate + ";");
       lhsActive.push_back(std::move(lhsCondition));
@@ -5902,28 +5996,48 @@ private:
         rhsAxes[decision.reductionAxis] = coordinate.str();
         std::optional<std::string> rhs =
             projectBlockScalar(rhsLoad.getPointer(), rhsAxes);
-        if (!rhs)
+        std::optional<std::string> rhsLaneStride =
+            decision.rhsLaneStride
+                ? spellAffineScalarExpression(*decision.rhsLaneStride, rhsAxes)
+                : std::optional<std::string>("1");
+        if (!rhs || !rhsLaneStride)
           return dot.emitError(
-              "RVV row microtile RHS projection is unavailable");
+              "local f32 dot RHS projection is unavailable");
         std::string rhsVector = fresh("dot_rhs");
-        line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
-             vectorSuffix + "(" + *rhs + ", " + vl + ");");
+        if (decision.rhsMemoryMode == VLAMemoryMode::UnitStride)
+          line(vectorType + " " + rhsVector + " = __riscv_vle32_v_" +
+               vectorSuffix + "(" + *rhs + ", " + vl + ");");
+        else
+          line(vectorType + " " + rhsVector + " = __riscv_vlse32_v_" +
+               vectorSuffix + "(" + *rhs +
+               ", (ptrdiff_t)(sizeof(float) * (" + *rhsLaneStride + ")), " +
+               vl + ");");
         for (unsigned row = 0; row < rowCount; ++row) {
           llvm::DenseMap<mlir::Value, std::string> axes;
           axes[decision.rowAxis] = std::to_string(rowBase + row);
           axes[decision.reductionAxis] = coordinate.str();
           std::optional<std::string> lhs =
               projectBlockScalar(lhsLoad.getPointer(), axes);
-          if (!lhs)
+          std::optional<std::string> lhsLaneStride =
+              decision.lhsLaneStride
+                  ? spellAffineScalarExpression(*decision.lhsLaneStride, axes)
+                  : std::optional<std::string>("1");
+          if (!lhs || !lhsLaneStride)
             return dot.emitError(
-                "RVV row microtile LHS projection is unavailable");
+                "local f32 dot LHS projection is unavailable");
           if (guarded) {
             line("if (" + lhsActive[rowBase + row] + ") {");
             ++indent;
           }
           std::string lhsVector = fresh("dot_lhs");
-          line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
-               vectorSuffix + "(" + *lhs + ", " + vl + ");");
+          if (decision.lhsMemoryMode == VLAMemoryMode::UnitStride)
+            line(vectorType + " " + lhsVector + " = __riscv_vle32_v_" +
+                 vectorSuffix + "(" + *lhs + ", " + vl + ");");
+          else
+            line(vectorType + " " + lhsVector + " = __riscv_vlse32_v_" +
+                 vectorSuffix + "(" + *lhs +
+                 ", (ptrdiff_t)(sizeof(float) * (" + *lhsLaneStride + ")), " +
+                 vl + ");");
           line(accumulators[row] + " = __riscv_vfmacc_vv_" + vectorSuffix +
                "_tu(" + accumulators[row] + ", " + lhsVector + ", " +
                rhsVector + ", " + vl + ");");
@@ -8815,106 +8929,53 @@ private:
   }
 
   std::optional<PlannedPhysicalDecision<F16GemmNTileDecision>>
-  decideF16GemmNTiles(MatmulOp matmul) {
-    LoadOp lhsLoad = reloadableLoad(matmul.getLhs());
-    LoadOp rhsLoad = reloadableLoad(matmul.getRhs());
+  decideF16Matmul(MatmulOp matmul) {
     auto blockType = [](mlir::Type type) -> BlockType {
       type = unwrapLogicalValidity(type);
       return mlir::dyn_cast<BlockType>(type);
     };
-    BlockType lhsType = blockType(matmul.getLhs().getType());
-    BlockType rhsType = blockType(matmul.getRhs().getType());
     BlockType initType = blockType(matmul.getInit().getType());
     BlockType resultType = blockType(matmul.getResult().getType());
-    if (!lhsLoad || !rhsLoad || !lhsType || !rhsType || !initType ||
-        !resultType || lhsType.getShape().size() != 2 ||
-        rhsType.getShape().size() != 2 || initType.getShape().size() != 2 ||
-        resultType.getShape().size() != 2 ||
-        !lhsType.getElementType().isF16() ||
-        !rhsType.getElementType().isF16() ||
+    if (!initType || !resultType || initType != resultType ||
+        !elementType(matmul.getLhs().getType()).isF16() ||
+        !elementType(matmul.getRhs().getType()).isF16() ||
         !initType.getElementType().isF32() ||
-        !resultType.getElementType().isF32() ||
         matmul.getOrder() != "relaxed" || matmul.getMath() != "native" ||
         !matmul.getAccDtype().isF32())
       return std::nullopt;
 
-    std::optional<StructuredProductFacts> product =
-        analyzeStructuredProductFacts(kernelFacts, matmul.getLhs(),
-                                      matmul.getRhs(), matmul.getResult());
-    if (!product || product->lhsFreeAxes.size() != 1 ||
-        product->rhsFreeAxes.size() != 1 ||
-        product->reductionAxes.size() != 1 ||
-        product->resultAxes.size() != 2)
+    std::optional<LocalDenseProductAnalysis> analysis =
+        analyzeLocalDenseProduct(matmul.getLhs(), matmul.getRhs(),
+                                 matmul.getResult());
+    if (!analysis || !analysis->lhsFreeAxis || !analysis->rhsFreeAxis ||
+        !analysis->reductionExtent ||
+        analysis->lhsReductionRelation != LaneRelation::UnitStride ||
+        analysis->rhsReductionRelation != LaneRelation::UnitStride)
       return std::nullopt;
-    BlockIndexOp lhsRowAxis =
-        product->lhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
-    BlockIndexOp reductionAxis =
-        product->reductionAxes.front().getDefiningOp<BlockIndexOp>();
-    BlockIndexOp rhsColumnAxis =
-        product->rhsFreeAxes.front().getDefiningOp<BlockIndexOp>();
-    if (!lhsRowAxis || !reductionAxis || !rhsColumnAxis)
-      return std::nullopt;
-    std::optional<int64_t> rowTile =
-        physicalExtent(lhsRowAxis.getExtent());
-    std::optional<int64_t> columnTile =
-        physicalExtent(rhsColumnAxis.getExtent());
-    std::optional<int64_t> reductionTile =
-        physicalExtent(reductionAxis.getExtent());
-    if (!rowTile || *rowTile <= 0 || *rowTile > 8 || !columnTile ||
-        *columnTile <= 0 || !reductionTile || *reductionTile <= 0)
-      return std::nullopt;
-    const MemoryAccessFact *lhsAccess = memoryFact(lhsLoad.getOperation());
-    const MemoryAccessFact *rhsAccess = memoryFact(rhsLoad.getOperation());
-    if (!lhsAccess || !rhsAccess ||
-        memoryRelation(*lhsAccess, reductionAxis.getResult()) !=
-            LaneRelation::UnitStride ||
-        memoryRelation(*rhsAccess, reductionAxis.getResult()) !=
-            LaneRelation::UnitStride ||
-        memoryRelation(*lhsAccess, lhsRowAxis.getResult()) ==
-            LaneRelation::Independent ||
-        memoryRelation(*lhsAccess, rhsColumnAxis.getResult()) !=
-            LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, rhsColumnAxis.getResult()) ==
-            LaneRelation::Independent ||
-        memoryRelation(*rhsAccess, lhsRowAxis.getResult()) !=
-            LaneRelation::Independent)
-      return std::nullopt;
-    if (!isContiguousPrefixPredicate(lhsLoad.getWhere(),
-                                     lhsRowAxis.getResult()) ||
-        !isContiguousPrefixPredicate(lhsLoad.getWhere(),
-                                     reductionAxis.getResult()) ||
-        !isContiguousPrefixPredicate(rhsLoad.getWhere(),
-                                     reductionAxis.getResult()) ||
-        !isContiguousPrefixPredicate(rhsLoad.getWhere(),
-                                     rhsColumnAxis.getResult()))
+    if (!isContiguousPrefixPredicate(analysis->lhsLoad.getWhere(),
+                                     analysis->lhsFreeAxis.getResult()) ||
+        !isContiguousPrefixPredicate(analysis->lhsLoad.getWhere(),
+                                     analysis->reductionAxis.getResult()) ||
+        !isContiguousPrefixPredicate(analysis->rhsLoad.getWhere(),
+                                     analysis->reductionAxis.getResult()) ||
+        !isContiguousPrefixPredicate(analysis->rhsLoad.getWhere(),
+                                     analysis->rhsFreeAxis.getResult()))
       return std::nullopt;
 
     PlannedPhysicalDecision<F16GemmNTileDecision> planned;
     F16GemmNTileDecision &decision = planned.realization;
     decision.operation = matmul.getOperation();
-    decision.lhsLoad = lhsLoad.getOperation();
-    decision.rhsLoad = rhsLoad.getOperation();
-    decision.lhsRowAxis = lhsRowAxis.getResult();
-    decision.lhsReductionAxis = reductionAxis.getResult();
-    decision.rhsReductionAxis = reductionAxis.getResult();
-    decision.rhsColumnAxis = rhsColumnAxis.getResult();
-    decision.rowTile = static_cast<unsigned>(*rowTile);
-    decision.columnTile = static_cast<unsigned>(*columnTile);
-    decision.reductionTile = static_cast<unsigned>(*reductionTile);
+    decision.lhsLoad = analysis->lhsLoad.getOperation();
+    decision.rhsLoad = analysis->rhsLoad.getOperation();
+    decision.lhsRowAxis = analysis->lhsFreeAxis.getResult();
+    decision.lhsReductionAxis = analysis->reductionAxis.getResult();
+    decision.rhsReductionAxis = analysis->reductionAxis.getResult();
+    decision.rhsColumnAxis = analysis->rhsFreeAxis.getResult();
+    decision.rowTile = analysis->lhsFreeExtent;
+    decision.columnTile = analysis->rhsFreeExtent;
+    decision.reductionTile = static_cast<unsigned>(*analysis->reductionExtent);
     F16MatmulCandidateFacts candidateFacts;
-    candidateFacts.mapping.axes = {
-        LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free,
-                              decision.rowTile, false, false, false,
-                              registerFactorCandidates(decision.rowTile,
-                                                       decision.rowTile)},
-        LogicalAxisConstraint{
-            kCoreAxisN, LogicalAxisRole::Free, decision.columnTile, false,
-            false, false,
-            registerFactorCandidates(decision.columnTile,
-                                     std::min(decision.columnTile, 8u))},
-        LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                              decision.reductionTile, false, true, true, {1}}};
-    candidateFacts.mapping.unrollAxis = kCoreAxisK;
+    candidateFacts.mapping = analysis->mapping;
     std::optional<SelectedF16MatmulPhysical> selected =
         weft::riscv_internal::selectF16MatmulPhysicalConfig(
             candidateFacts, options.target, options.backend);
