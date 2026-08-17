@@ -2476,23 +2476,20 @@ private:
 
     struct SegmentFieldCandidate {
       VLAAccessDecision *access = nullptr;
-      InterleavedFieldAddress address;
+      const InterleavedMemoryFact *address = nullptr;
     };
     llvm::SmallVector<SegmentFieldCandidate> segmentFields;
     for (VLAAccessDecision &access : decision.accesses) {
-      mlir::Value pointer;
-      if (auto load = mlir::dyn_cast<LoadOp>(access.operation))
-        pointer = load.getPointer();
-      else if (auto store = mlir::dyn_cast<StoreOp>(access.operation))
-        pointer = store.getPointer();
-      if (!pointer || !access.elementType.isF32() ||
+      const MemoryAccessFact *memory = memoryFact(access.operation);
+      if (!memory || !access.elementType.isF32() ||
           access.activityMode != PhysicalActivityMode::AllActive ||
           access.memoryMode != PhysicalMemoryMode::Strided)
         continue;
-      std::optional<InterleavedFieldAddress> address =
-          matchInterleavedFieldAddress(pointer, decision.coordinate);
-      if (address)
-        segmentFields.push_back(SegmentFieldCandidate{&access, *address});
+      auto interleaved = memory->interleaved.find(decision.coordinate);
+      if (interleaved == memory->interleaved.end())
+        continue;
+      segmentFields.push_back(
+          SegmentFieldCandidate{&access, &interleaved->second});
     }
     llvm::DenseSet<mlir::Operation *> pairedSegmentAccesses;
     auto hasInterveningEffect = [](mlir::Operation *lhs,
@@ -2514,22 +2511,23 @@ private:
             pairedSegmentAccesses.contains(second.access->operation) ||
             first.access->operation->getBlock() !=
                 second.access->operation->getBlock() ||
-            first.address.root != second.address.root ||
-            !haveSameInvariantAddress(first.address, second.address) ||
-            first.address.field == second.address.field ||
+            !haveSameInterleavedInvariantAddress(*first.address,
+                                                 *second.address) ||
+            first.address->field == second.address->field ||
             mlir::isa<LoadOp>(first.access->operation) !=
                 mlir::isa<LoadOp>(second.access->operation) ||
             hasInterveningEffect(first.access->operation,
                                  second.access->operation))
           continue;
         VLAAccessDecision *field0 =
-            first.address.field == 0 ? first.access : second.access;
+            first.address->field == 0 ? first.access : second.access;
         VLAAccessDecision *field1 =
-            first.address.field == 1 ? first.access : second.access;
+            first.address->field == 1 ? first.access : second.access;
         bool loadPair = mlir::isa<LoadOp>(field0->operation);
         std::optional<SelectedVLASegment2Physical> physical =
-            selectVLASegment2Physical(
-                {loadPair, 2, static_cast<unsigned>(32)}, options.target);
+            selectVLASegment2Physical({loadPair, first.address->fields,
+                                       static_cast<unsigned>(32)},
+                                      options.target);
         if (!physical)
           continue;
         mlir::Operation *earlier =
@@ -2546,8 +2544,8 @@ private:
         segment.field0 = field0->operation;
         segment.field1 = field1->operation;
         segment.emission = emission;
-        segment.base = first.address.field == 0 ? first.address.pointer
-                                                : second.address.pointer;
+        segment.base = first.address->field == 0 ? first.address->pointer
+                                                 : second.address->pointer;
         segment.coordinateScale = physical->coordinateScale;
         segment.fields = physical->fields;
         segment.elementSEW = physical->elementSEW;
@@ -7679,80 +7677,6 @@ private:
     return dependsOn(value, target, visited);
   }
 
-  struct InterleavedFieldAddress {
-    mlir::Value root;
-    mlir::Value pointer;
-    llvm::DenseMap<mlir::Value, int64_t> invariantTerms;
-    unsigned field = 0;
-  };
-
-  struct AffineAddressExpression {
-    int64_t coordinateCoefficient = 0;
-    int64_t constant = 0;
-    llvm::DenseMap<mlir::Value, int64_t> invariantTerms;
-  };
-
-  bool collectAffineAddress(mlir::Value value, mlir::Value coordinate,
-                            int64_t coefficient,
-                            AffineAddressExpression &result) const {
-    if (std::optional<int64_t> constant = integerConstantValue(value)) {
-      result.constant += coefficient * *constant;
-      return true;
-    }
-    if (value == coordinate) {
-      result.coordinateCoefficient += coefficient;
-      return true;
-    }
-    if (auto pointer = value.getDefiningOp<PtrAddOp>())
-      return collectAffineAddress(pointer.getBase(), coordinate, coefficient,
-                                  result) &&
-             collectAffineAddress(pointer.getOffset(), coordinate, coefficient,
-                                  result);
-    if (auto binary = value.getDefiningOp<BinaryOp>()) {
-      if (binary.getKind() == "add" || binary.getKind() == "sub")
-        return collectAffineAddress(binary.getLhs(), coordinate, coefficient,
-                                    result) &&
-               collectAffineAddress(
-                   binary.getRhs(), coordinate,
-                   binary.getKind() == "add" ? coefficient : -coefficient,
-                   result);
-      if (binary.getKind() == "mul") {
-        if (std::optional<int64_t> factor =
-                integerConstantValue(binary.getLhs()))
-          return collectAffineAddress(binary.getRhs(), coordinate,
-                                      coefficient * *factor, result);
-        if (std::optional<int64_t> factor =
-                integerConstantValue(binary.getRhs()))
-          return collectAffineAddress(binary.getLhs(), coordinate,
-                                      coefficient * *factor, result);
-      }
-    }
-    if (auto cast = value.getDefiningOp<CastOp>())
-      return collectAffineAddress(cast.getInput(), coordinate, coefficient,
-                                  result);
-    if (auto expand = value.getDefiningOp<ExpandDimsOp>())
-      return collectAffineAddress(expand.getInput(), coordinate, coefficient,
-                                  result);
-    if (dependsOn(value, coordinate))
-      return false;
-    int64_t &term = result.invariantTerms[value];
-    term += coefficient;
-    if (term == 0)
-      result.invariantTerms.erase(value);
-    return true;
-  }
-
-  bool haveSameInvariantAddress(
-      const InterleavedFieldAddress &lhs,
-      const InterleavedFieldAddress &rhs) const {
-    if (lhs.invariantTerms.size() != rhs.invariantTerms.size())
-      return false;
-    return llvm::all_of(lhs.invariantTerms, [&](const auto &term) {
-      auto found = rhs.invariantTerms.find(term.first);
-      return found != rhs.invariantTerms.end() && found->second == term.second;
-    });
-  }
-
   std::optional<LocalBlockMemoryFact>
   resolveLocalBlockMemoryFact(mlir::Value semanticValue) const {
     auto blockType = [](mlir::Type type) -> BlockType {
@@ -7792,35 +7716,6 @@ private:
         semanticType.getShape().front(),
         storageExtent,
     };
-  }
-
-  mlir::Value scalarPointerBase(mlir::Value value) const {
-    while (value && !mlir::isa<PtrType>(value.getType())) {
-      auto pointer = value.getDefiningOp<PtrAddOp>();
-      if (!pointer)
-        return {};
-      value = pointer.getBase();
-    }
-    return value;
-  }
-
-  std::optional<InterleavedFieldAddress>
-  matchInterleavedFieldAddress(mlir::Value pointer,
-                               mlir::Value coordinate) const {
-    mlir::Value root = scalarPointerBase(pointer);
-    AffineAddressExpression expression;
-    if (!root || !mlir::isa<PtrType>(root.getType()) ||
-        !collectAffineAddress(pointer, coordinate, 1, expression) ||
-        expression.coordinateCoefficient != 2 || expression.constant < 0 ||
-        expression.constant > 1)
-      return std::nullopt;
-    auto rootTerm = expression.invariantTerms.find(root);
-    if (rootTerm == expression.invariantTerms.end() || rootTerm->second != 1)
-      return std::nullopt;
-    expression.invariantTerms.erase(rootTerm);
-    return InterleavedFieldAddress{
-        root, pointer, std::move(expression.invariantTerms),
-        static_cast<unsigned>(expression.constant)};
   }
 
   void initializeEntityPlan(PhysicalEntityPlan &entity) const {

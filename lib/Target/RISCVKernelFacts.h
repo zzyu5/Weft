@@ -43,6 +43,15 @@ struct MemoryAxisFact {
   mlir::Value indexedOffset;
 };
 
+struct InterleavedMemoryFact {
+  mlir::Value root;
+  mlir::Value pointer;
+  llvm::DenseMap<mlir::Value, int64_t> invariantTerms;
+  unsigned field = 0;
+  unsigned fields = 0;
+  int64_t coordinateScale = 0;
+};
+
 struct LogicalAxisFact {
   mlir::Value coordinate;
   mlir::Value lowerBound;
@@ -74,6 +83,7 @@ struct MemoryAccessFact {
   mlir::Type elementType;
   bool write = false;
   llvm::DenseMap<mlir::Value, MemoryAxisFact> axes;
+  llvm::DenseMap<mlir::Value, InterleavedMemoryFact> interleaved;
 };
 
 struct KernelPhysicalFacts {
@@ -101,6 +111,8 @@ analyzeStructuredProductFacts(const KernelPhysicalFacts &facts, mlir::Value lhs,
 
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate);
 mlir::Value findIndexedOffset(mlir::Value pointer, mlir::Value coordinate);
+bool haveSameInterleavedInvariantAddress(const InterleavedMemoryFact &lhs,
+                                         const InterleavedMemoryFact &rhs);
 
 mlir::LogicalResult
 analyzeKernelPhysicalFacts(weft::kernel::KernelOp kernel,

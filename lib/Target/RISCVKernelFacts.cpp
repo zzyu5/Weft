@@ -161,6 +161,84 @@ mlir::Value pointerRoot(mlir::Value value) {
   return pointer ? pointerRoot(pointer.getBase()) : mlir::Value{};
 }
 
+struct AffineAddressTerms {
+  int64_t coordinateCoefficient = 0;
+  int64_t constant = 0;
+  llvm::DenseMap<mlir::Value, int64_t> invariantTerms;
+};
+
+bool collectAffineAddressTerms(mlir::Value value, mlir::Value coordinate,
+                               int64_t coefficient,
+                               AffineAddressTerms &result) {
+  if (std::optional<int64_t> constant = integerConstantValue(value)) {
+    result.constant += coefficient * *constant;
+    return true;
+  }
+  if (value == coordinate) {
+    result.coordinateCoefficient += coefficient;
+    return true;
+  }
+  if (auto pointer = value.getDefiningOp<PtrAddOp>())
+    return collectAffineAddressTerms(pointer.getBase(), coordinate, coefficient,
+                                     result) &&
+           collectAffineAddressTerms(pointer.getOffset(), coordinate,
+                                     coefficient, result);
+  if (auto binary = value.getDefiningOp<BinaryOp>()) {
+    if (binary.getKind() == "add" || binary.getKind() == "sub")
+      return collectAffineAddressTerms(binary.getLhs(), coordinate, coefficient,
+                                       result) &&
+             collectAffineAddressTerms(
+                 binary.getRhs(), coordinate,
+                 binary.getKind() == "add" ? coefficient : -coefficient,
+                 result);
+    if (binary.getKind() == "mul") {
+      if (std::optional<int64_t> factor =
+              integerConstantValue(binary.getLhs()))
+        return collectAffineAddressTerms(binary.getRhs(), coordinate,
+                                         coefficient * *factor, result);
+      if (std::optional<int64_t> factor =
+              integerConstantValue(binary.getRhs()))
+        return collectAffineAddressTerms(binary.getLhs(), coordinate,
+                                         coefficient * *factor, result);
+    }
+  }
+  if (auto cast = value.getDefiningOp<CastOp>())
+    return collectAffineAddressTerms(cast.getInput(), coordinate, coefficient,
+                                     result);
+  if (auto expand = value.getDefiningOp<ExpandDimsOp>())
+    return collectAffineAddressTerms(expand.getInput(), coordinate, coefficient,
+                                     result);
+  if (dependsOn(value, coordinate))
+    return false;
+  int64_t &term = result.invariantTerms[value];
+  term += coefficient;
+  if (term == 0)
+    result.invariantTerms.erase(value);
+  return true;
+}
+
+std::optional<InterleavedMemoryFact>
+deriveInterleavedMemoryFact(mlir::Value pointer, mlir::Value coordinate) {
+  mlir::Value root = pointerRoot(pointer);
+  AffineAddressTerms expression;
+  if (!root || !mlir::isa<PtrType>(root.getType()) ||
+      !collectAffineAddressTerms(pointer, coordinate, 1, expression) ||
+      expression.coordinateCoefficient != 2 || expression.constant < 0 ||
+      expression.constant > 1)
+    return std::nullopt;
+  auto rootTerm = expression.invariantTerms.find(root);
+  if (rootTerm == expression.invariantTerms.end() || rootTerm->second != 1)
+    return std::nullopt;
+  expression.invariantTerms.erase(rootTerm);
+  return InterleavedMemoryFact{
+      root,
+      pointer,
+      std::move(expression.invariantTerms),
+      static_cast<unsigned>(expression.constant),
+      2,
+      expression.coordinateCoefficient};
+}
+
 mlir::Value containingVLACoordinate(mlir::Value value) {
   mlir::Operation *anchor = value.getDefiningOp();
   if (!anchor) {
@@ -196,6 +274,18 @@ logicalAxesForValue(mlir::Value value, const KernelPhysicalFacts &facts) {
 }
 
 } // namespace
+
+bool haveSameInterleavedInvariantAddress(const InterleavedMemoryFact &lhs,
+                                         const InterleavedMemoryFact &rhs) {
+  if (lhs.root != rhs.root || lhs.fields != rhs.fields ||
+      lhs.coordinateScale != rhs.coordinateScale ||
+      lhs.invariantTerms.size() != rhs.invariantTerms.size())
+    return false;
+  return llvm::all_of(lhs.invariantTerms, [&](const auto &term) {
+    auto found = rhs.invariantTerms.find(term.first);
+    return found != rhs.invariantTerms.end() && found->second == term.second;
+  });
+}
 
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate) {
   if (value == coordinate)
@@ -450,6 +540,9 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
       if (axisFact.relation == LaneRelation::Indexed)
         axisFact.indexedOffset = findIndexedOffset(pointer, axis.first);
       fact.axes.try_emplace(axis.first, std::move(axisFact));
+      if (std::optional<InterleavedMemoryFact> interleaved =
+              deriveInterleavedMemoryFact(pointer, axis.first))
+        fact.interleaved.try_emplace(axis.first, std::move(*interleaved));
     }
     facts.memory.try_emplace(operation, std::move(fact));
   });
