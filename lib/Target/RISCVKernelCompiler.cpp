@@ -391,6 +391,7 @@ struct VLAUnaryDecision {
 struct VLAStateDecision {
   mlir::Operation *operation = nullptr;
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
+  llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
   SelectedVLAStatePhysical physical;
   mlir::Type elementType;
   mlir::Value identity;
@@ -2647,18 +2648,11 @@ private:
           decision.states.push_back(std::move(state));
       }
     }
-    unsigned reductionStateCount = llvm::count_if(
-        decision.states, [](const VLAStateDecision &state) {
-          return state.semantic == VLAStateSemantic::F32AddReduction ||
-                 state.semantic == VLAStateSemantic::F32MaxReduction;
-        });
     for (VLAStateDecision &state : decision.states) {
-      std::optional<SelectedVLAStatePhysical> selected =
-          selectVLAStatePhysical(
-              VLAStateCandidateFacts{state.semantic, state.relaxedOrder,
-                                     reductionStateCount},
-              options.target, options.backend);
-      if (!selected) {
+      state.candidates = enumerateVLAStatePhysical(
+          VLAStateCandidateFacts{state.semantic, state.relaxedOrder},
+          options.target, options.backend);
+      if (state.candidates.empty()) {
         if (options.backend.structures.reductionStatePlacement < 0 ||
             options.backend.structures.reductionStatePlacement > 2)
           state.operation->emitError(
@@ -2668,13 +2662,11 @@ private:
               "VLA state has no legal target implementation for its ordering and target facts");
         return mlir::failure();
       }
-      state.physical = *selected;
     }
     const bool needsF32MathImplementation =
         !decision.unaries.empty() ||
         llvm::any_of(decision.states, [](const VLAStateDecision &state) {
-          return state.physical.stripUpdate ==
-                 VLAStateStripUpdate::OnlineSoftmaxSummary;
+          return state.semantic == VLAStateSemantic::OnlineSoftmaxSummary;
         });
     if (needsF32MathImplementation) {
       std::optional<LocalImplementation> implementation =
@@ -2757,7 +2749,7 @@ private:
           segment.elementSEW});
     candidateFacts.lookupCount = decision.lookups.size();
     for (const VLAStateDecision &state : decision.states)
-      candidateFacts.states.push_back(state.physical);
+      candidateFacts.stateCandidates.push_back(state.candidates);
     candidateFacts.dataSEW =
         !hasF32RegionValue && onlyF16Accesses && !hasFloatCast ? 16 : 32;
     candidateFacts.mapping.axes = {
@@ -2795,6 +2787,12 @@ private:
                      << " simultaneously live f32 values and its typed memory/state resources";
       return mlir::failure();
     }
+    if (selected->states.size() != decision.states.size())
+      return op.emitError(
+          "VLA state placement selection does not match its semantic states");
+    for (auto &&[state, physical] :
+         llvm::zip_equal(decision.states, selected->states))
+      state.physical = physical;
     entity.vlaDataShape = selected->dataShape;
     entity.vlaIndexShape = selected->indexShape;
     entity.vlaMaskRatio = selected->maskRatio;

@@ -890,74 +890,70 @@ selectVLAUnaryPhysical(VLAUnarySemantic semantic,
   return std::nullopt;
 }
 
-std::optional<SelectedVLAStatePhysical>
-selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
-                       const RISCVTargetProfile &target,
-                       const RISCVBackendConfig &config) {
+llvm::SmallVector<SelectedVLAStatePhysical, 2>
+enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
+                          const RISCVTargetProfile &target,
+                          const RISCVBackendConfig &config) {
+  llvm::SmallVector<SelectedVLAStatePhysical, 2> candidates;
   if (!target.hasRVV || config.structures.reductionStatePlacement < 0 ||
       config.structures.reductionStatePlacement > 2)
-    return std::nullopt;
-  SelectedVLAStatePhysical selected;
+    return candidates;
+  SelectedVLAStatePhysical scalar;
   switch (facts.semantic) {
   case VLAStateSemantic::F32AddReduction:
     if (!target.hasF)
-      return std::nullopt;
-    selected.stripUpdate = VLAStateStripUpdate::AddReduction;
+      return candidates;
+    scalar.stripUpdate = VLAStateStripUpdate::AddReduction;
     break;
   case VLAStateSemantic::F32MaxReduction:
     if (!target.hasF)
-      return std::nullopt;
-    selected.stripUpdate = VLAStateStripUpdate::MaxReduction;
+      return candidates;
+    scalar.stripUpdate = VLAStateStripUpdate::MaxReduction;
     break;
   case VLAStateSemantic::I8AddReductionI32:
     if (!target.hasWideningInteger)
-      return std::nullopt;
-    selected.stripUpdate = VLAStateStripUpdate::WideningAddReduction;
-    break;
+      return candidates;
+    scalar.stripUpdate = VLAStateStripUpdate::WideningAddReduction;
+    candidates.push_back(scalar);
+    return candidates;
   case VLAStateSemantic::InclusiveAddScan:
     if (!target.hasF || facts.relaxedOrder)
-      return std::nullopt;
-    selected.stripUpdate = VLAStateStripUpdate::InclusiveAddScan;
-    break;
+      return candidates;
+    scalar.stripUpdate = VLAStateStripUpdate::InclusiveAddScan;
+    candidates.push_back(scalar);
+    return candidates;
   case VLAStateSemantic::SegmentedInclusiveAddScan:
     if (!target.hasF || facts.relaxedOrder)
-      return std::nullopt;
-    selected.stripUpdate = VLAStateStripUpdate::SegmentedInclusiveAddScan;
-    break;
+      return candidates;
+    scalar.stripUpdate = VLAStateStripUpdate::SegmentedInclusiveAddScan;
+    candidates.push_back(scalar);
+    return candidates;
   case VLAStateSemantic::ArgMaxSummary:
     if (!target.hasF)
-      return std::nullopt;
-    selected.carry = VLAStateCarryRepresentation::ScalarTuple;
-    selected.stripUpdate = VLAStateStripUpdate::ArgMaxSummary;
-    return selected;
+      return candidates;
+    scalar.carry = VLAStateCarryRepresentation::ScalarTuple;
+    scalar.stripUpdate = VLAStateStripUpdate::ArgMaxSummary;
+    candidates.push_back(scalar);
+    return candidates;
   case VLAStateSemantic::OnlineSoftmaxSummary:
     if (!target.hasF || facts.relaxedOrder)
-      return std::nullopt;
-    selected.carry = VLAStateCarryRepresentation::ScalarTuple;
-    selected.stripUpdate = VLAStateStripUpdate::OnlineSoftmaxSummary;
-    return selected;
+      return candidates;
+    scalar.carry = VLAStateCarryRepresentation::ScalarTuple;
+    scalar.stripUpdate = VLAStateStripUpdate::OnlineSoftmaxSummary;
+    candidates.push_back(scalar);
+    return candidates;
   }
-  const bool f32Reduction =
-      facts.semantic == VLAStateSemantic::F32AddReduction ||
-      facts.semantic == VLAStateSemantic::F32MaxReduction;
-  if (f32Reduction) {
-    if (config.structures.reductionStatePlacement == 2 &&
-        !facts.relaxedOrder)
-      return std::nullopt;
-    const bool vectorCarry =
-        config.structures.reductionStatePlacement == 2 ||
-        (config.structures.reductionStatePlacement == 0 &&
-         facts.relaxedOrder &&
-         (target.vlenBits < 256 || facts.reductionStateCount > 1));
-    if (vectorCarry) {
-      selected.carry = VLAStateCarryRepresentation::Vector;
-      selected.finalize =
-          facts.semantic == VLAStateSemantic::F32AddReduction
-              ? VLAStateFinalize::HorizontalAdd
-              : VLAStateFinalize::HorizontalMax;
-    }
+  if (config.structures.reductionStatePlacement != 2)
+    candidates.push_back(scalar);
+  if (facts.relaxedOrder && config.structures.reductionStatePlacement != 1) {
+    SelectedVLAStatePhysical vector = scalar;
+    vector.carry = VLAStateCarryRepresentation::Vector;
+    vector.finalize = facts.semantic == VLAStateSemantic::F32AddReduction
+                          ? VLAStateFinalize::HorizontalAdd
+                          : VLAStateFinalize::HorizontalMax;
+    candidates.push_back(vector);
   }
-  return selected;
+  return candidates;
 }
 
 std::optional<LocalImplementation>
@@ -1145,9 +1141,24 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
   struct Candidate {
     SelectedVLAEntityPhysical physical;
     unsigned lanePenalty = 0;
+    unsigned statePenalty = 0;
     unsigned peakGroups = 0;
     unsigned inverseLanes = 0;
   };
+  using StateCombination = llvm::SmallVector<SelectedVLAStatePhysical, 4>;
+  llvm::SmallVector<StateCombination, 8> stateCombinations(1);
+  for (const auto &stateCandidates : facts.stateCandidates) {
+    if (stateCandidates.empty())
+      return std::nullopt;
+    llvm::SmallVector<StateCombination, 8> expanded;
+    for (const StateCombination &combination : stateCombinations)
+      for (const SelectedVLAStatePhysical &state : stateCandidates) {
+        StateCombination candidate = combination;
+        candidate.push_back(state);
+        expanded.push_back(std::move(candidate));
+      }
+    stateCombinations = std::move(expanded);
+  }
   llvm::SmallVector<Candidate, 8> legal;
   for (CorePhysicalMapping mapping :
        enumerateCorePhysicalMappings(problem, target)) {
@@ -1202,8 +1213,10 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
     if (!segmentShapesLegal)
       continue;
 
+    for (const StateCombination &states : stateCombinations) {
+
     llvm::SmallVector<PhysicalLiveRange, 8> persistent;
-    for (const SelectedVLAStatePhysical &state : facts.states)
+    for (const SelectedVLAStatePhysical &state : states)
       if (state.carry == VLAStateCarryRepresentation::Vector &&
           state.wholeVLALifetime)
         persistent.push_back(
@@ -1332,7 +1345,7 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       narrow = selected;
     }
 
-    for (const SelectedVLAStatePhysical &state : facts.states) {
+    for (const SelectedVLAStatePhysical &state : states) {
       llvm::SmallVector<PhysicalLiveRange, 6> transient;
       switch (state.stripUpdate) {
       case VLAStateStripUpdate::InclusiveAddScan:
@@ -1417,7 +1430,8 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
       continue;
 
     SelectedVLAEntityPhysical selected;
-    selected.mapping = std::move(mapping);
+    selected.mapping = mapping;
+    selected.states = states;
     selected.dataShape = dataShape;
     if (needsIndexShape)
       selected.indexShape = *indexShape;
@@ -1430,18 +1444,28 @@ selectVLAEntityPhysical(const VLAEntityCandidateFacts &facts,
         std::max(1u, std::min(4u, static_cast<unsigned>(target.vectorRegisters) /
                                       8u));
     const unsigned laneGroups = rvvRegisterGroups(dataShape);
+    const unsigned statePenalty = llvm::count_if(
+        states, [](const SelectedVLAStatePhysical &state) {
+          return state.carry == VLAStateCarryRepresentation::Scalar &&
+                 (state.stripUpdate == VLAStateStripUpdate::AddReduction ||
+                  state.stripUpdate == VLAStateStripUpdate::MaxReduction);
+        });
     legal.push_back(Candidate{
         std::move(selected),
         static_cast<unsigned>(std::abs(static_cast<int>(laneGroups) -
                                        static_cast<int>(preferredGroups))),
+        statePenalty,
         aggregate.peakGroups,
         std::numeric_limits<unsigned>::max() - mappedLaneFactor});
+    }
   }
   if (legal.empty())
     return std::nullopt;
   llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.lanePenalty, lhs.peakGroups, lhs.inverseLanes) <
-           std::tie(rhs.lanePenalty, rhs.peakGroups, rhs.inverseLanes);
+    return std::tie(lhs.lanePenalty, lhs.statePenalty, lhs.peakGroups,
+                    lhs.inverseLanes) <
+           std::tie(rhs.lanePenalty, rhs.statePenalty, rhs.peakGroups,
+                    rhs.inverseLanes);
   });
   return std::move(legal.front().physical);
 }

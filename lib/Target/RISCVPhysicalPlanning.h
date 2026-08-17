@@ -496,7 +496,6 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
 struct VLAStateCandidateFacts {
   VLAStateSemantic semantic = VLAStateSemantic::F32AddReduction;
   bool relaxedOrder = false;
-  unsigned reductionStateCount = 0;
 };
 
 struct SelectedVLAStatePhysical {
@@ -506,10 +505,10 @@ struct SelectedVLAStatePhysical {
   bool wholeVLALifetime = true;
 };
 
-std::optional<SelectedVLAStatePhysical>
-selectVLAStatePhysical(const VLAStateCandidateFacts &facts,
-                       const RISCVTargetProfile &target,
-                       const RISCVBackendConfig &config);
+llvm::SmallVector<SelectedVLAStatePhysical, 2>
+enumerateVLAStatePhysical(const VLAStateCandidateFacts &facts,
+                          const RISCVTargetProfile &target,
+                          const RISCVBackendConfig &config);
 
 struct VLAIndexedMemoryFact {
   unsigned elementSEW = 0;
@@ -542,13 +541,15 @@ struct VLAEntityCandidateFacts {
   llvm::SmallVector<VLAIndexedMemoryFact> indexedMemory;
   llvm::SmallVector<VLASegmentMemoryFact> segmentMemory;
   llvm::SmallVector<VLAValueLifetimeSnapshot> lifetimes;
-  llvm::SmallVector<SelectedVLAStatePhysical> states;
+  llvm::SmallVector<llvm::SmallVector<SelectedVLAStatePhysical, 2>, 4>
+      stateCandidates;
   llvm::SmallVector<PhysicalResourceRequirements, 2>
       localPrimitiveRequirements;
 };
 
 struct SelectedVLAEntityPhysical {
   CorePhysicalMapping mapping;
+  llvm::SmallVector<SelectedVLAStatePhysical, 4> states;
   RVVVectorShape dataShape;
   RVVVectorShape indexShape;
   unsigned maskRatio = 0;
