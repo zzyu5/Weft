@@ -52,8 +52,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   bool iq3Register64 = false, iq3Strip = false;
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
-  bool packedI4E8M2 = false, packedI4E8M1 = false;
-  bool packedI5E8M2 = false, packedI5E8M1 = false;
   bool packedI3L32 = false, packedI3L64 = false;
   bool nibbleE8M2 = false, nibbleE8M1 = false;
   bool base3E8M2 = false, base3E8M1 = false;
@@ -75,16 +73,10 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
     };
     switch (implementation.primitive) {
     case LocalPrimitiveKind::PackedI4I8:
-      supported = match("__weft_packed_i4_i8_register_l32_e8m2",
-                        packedI4E8M2) ||
-                  match("__weft_packed_i4_i8_register_l32_e8m1",
-                        packedI4E8M1);
+      supported = emitPackedI4LocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedI5I8:
-      supported = match("__weft_packed_i5_i8_register_l32_e8m2",
-                        packedI5E8M2) ||
-                  match("__weft_packed_i5_i8_register_l32_e8m1",
-                        packedI5E8M1);
+      supported = emitPackedI5LocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedI3GroupedI8:
       supported = match("__weft_packed_i3_grouped_i8_register_l32_e8m2",
@@ -166,8 +158,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
-      !q6Register64 && !q6Strip && !packedI4E8M2 && !packedI4E8M1 &&
-      !packedI5E8M2 && !packedI5E8M1 && !packedI3L32 && !packedI3L64 &&
+      !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
       !nibbleE8M2 && !nibbleE8M1 && !base3E8M2 && !base3E8M1 &&
       !packedI2E8M2 && !packedI2E8M1 && !signed8E8M2 &&
       !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
@@ -231,8 +222,6 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ3LocalImplementations(output, iq3Register64, iq3Strip);
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
-  emitPackedI4LocalImplementations(output, packedI4E8M2, packedI4E8M1);
-  emitPackedI5LocalImplementations(output, packedI5E8M2, packedI5E8M1);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
   emitNibbleCodebookLocalImplementations(output, nibbleE8M2, nibbleE8M1);
   emitTernaryLocalImplementations(output, base3E8M2, base3E8M1,

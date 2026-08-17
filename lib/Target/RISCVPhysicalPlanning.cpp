@@ -43,6 +43,42 @@ static unsigned localSequentialFactor(const LocalImplementation &implementation,
   return mapping ? mapping->sequentialFactor : 0;
 }
 
+bool isPackedDotLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::PackedI4I8 &&
+      implementation.primitive != LocalPrimitiveKind::PackedI5I8)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK || !reduction ||
+      !reduction->extent || *reduction->extent != 32 ||
+      reduction->sequentialFactor != 1 ||
+      reduction->laneFactor * reduction->registerFactor != 32 ||
+      (reduction->laneFactor != 16 && reduction->laneFactor != 32) ||
+      implementation.valueShapes.size() < 2 ||
+      implementation.valueShapes.front() != implementation.mapping.laneShape ||
+      implementation.mapping.laneShape.sew != 8 ||
+      implementation.valueShapes[1].sew != 8)
+    return false;
+  const RVVVectorShape decodeShape = implementation.valueShapes[1];
+  if ((reduction->laneFactor == 16 &&
+       decodeShape != implementation.mapping.laneShape) ||
+      (reduction->laneFactor == 32 &&
+       decodeShape != implementation.mapping.laneShape &&
+       (decodeShape.lmulEighths < 8 ||
+        decodeShape.lmulEighths * 2 !=
+            implementation.mapping.laneShape.lmulEighths)))
+    return false;
+  const RVVVectorShape widened{16,
+                               implementation.mapping.laneShape.lmulEighths * 2};
+  if (rvvVectorType(RVVElementCategory::SignedInteger, widened).empty())
+    return false;
+  return true;
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -162,6 +198,7 @@ static bool validateLocalInstructionMapping(
             (strip && primary == kRVVE8M1 && !secondary));
   case LocalPrimitiveKind::PackedI4I8:
   case LocalPrimitiveKind::PackedI5I8:
+    return isPackedDotLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::Base3TernaryI8:
   case LocalPrimitiveKind::PackedI2TernaryI8:
   case LocalPrimitiveKind::NibbleCodebookI8:
@@ -1924,7 +1961,20 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     LocalImplementation implementation;
     implementation.primitive = primitive;
     implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes = {laneShape};
+    if (primitive == LocalPrimitiveKind::PackedI4I8 ||
+        primitive == LocalPrimitiveKind::PackedI5I8) {
+      RVVVectorShape decodeShape = laneShape;
+      if (candidate.axis.laneFactor == 32) {
+        std::optional<RVVVectorShape> halfShape =
+            rvvShapeForSemanticLanes(8, 16, target);
+        if (halfShape && halfShape->lmulEighths >= 8 &&
+            halfShape->lmulEighths * 2 == laneShape.lmulEighths)
+          decodeShape = *halfShape;
+      }
+      implementation.valueShapes = {laneShape, decodeShape};
+    } else {
+      implementation.valueShapes = {laneShape};
+    }
     if (!finalizeLocalInstructionMapping(implementation))
       continue;
     AxisMappedResourceFacts resources;

@@ -1,6 +1,8 @@
 #ifndef WEFT_LIB_TARGET_RISCVQUANTINTRINSICC_H
 #define WEFT_LIB_TARGET_RISCVQUANTINTRINSICC_H
 
+#include "RISCVPhysicalPlanning.h"
+
 namespace llvm {
 class raw_ostream;
 }
@@ -15,12 +17,10 @@ void emitIQ1LocalImplementations(llvm::raw_ostream &output, bool registerL32,
                                  bool registerL64, bool strip);
 void emitQ6LocalImplementations(llvm::raw_ostream &output, bool registerL32,
                                 bool registerL64, bool strip);
-void emitPackedI4LocalImplementations(llvm::raw_ostream &output,
-                                      bool registerE8M2,
-                                      bool registerE8M1);
-void emitPackedI5LocalImplementations(llvm::raw_ostream &output,
-                                      bool registerE8M2,
-                                      bool registerE8M1);
+bool emitPackedI4LocalImplementation(llvm::raw_ostream &output,
+                                     const LocalImplementation &implementation);
+bool emitPackedI5LocalImplementation(llvm::raw_ostream &output,
+                                     const LocalImplementation &implementation);
 void emitPackedI3GroupedLocalImplementations(llvm::raw_ostream &output,
                                              bool registerL32,
                                              bool registerL64);

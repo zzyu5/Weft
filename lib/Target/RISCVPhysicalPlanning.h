@@ -494,6 +494,9 @@ struct LocalImplementation {
   }
 };
 
+bool isPackedDotLocalImplementationMapping(
+    const LocalImplementation &implementation);
+
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
                                  const RISCVTargetProfile &target);
