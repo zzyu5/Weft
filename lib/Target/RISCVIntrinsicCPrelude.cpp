@@ -4,7 +4,8 @@
 
 namespace weft::riscv_internal {
 
-void emitPrelude(llvm::raw_ostream &output, bool usesExp,
+void emitPrelude(llvm::raw_ostream &output,
+                 llvm::ArrayRef<RVVVectorShape> f32MathShapes,
                  bool usesRVVSymmetricI4I8, bool usesRVVAffineI4I8,
                  bool usesRVVSymmetricI4I8M4, bool usesRVVAffineI4I8M4,
                  bool usesIME1SymmetricI4I8, bool usesIME1AffineI4I8,
@@ -78,9 +79,23 @@ __weft_load_f16_le_aligned(const uint8_t *bytes) {
                               usesIME1AffineI4I8,
                               usesIME1SymmetricI4I8M4,
                               usesIME1AffineI4I8M4);
-  if (!usesExp)
-    return;
-  output << R"c(static inline __attribute__((unused)) vfloat32m2_t __weft_exp_f32m2(
+  for (RVVVectorShape shape : f32MathShapes) {
+    const std::string f32Suffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::Floating, shape);
+    const std::string f32Type =
+        rvvVectorType(RVVElementCategory::Floating, shape);
+    RVVVectorShape u32Shape = shape;
+    const std::string u32Suffix =
+        rvvIntrinsicTypeSuffix(RVVElementCategory::UnsignedInteger, u32Shape);
+    const std::string u32Type =
+        rvvVectorType(RVVElementCategory::UnsignedInteger, u32Shape);
+    std::optional<unsigned> maskRatio = rvvMaskRatio(shape);
+    const std::string maskType =
+        maskRatio ? rvvMaskType(*maskRatio) : std::string{};
+    if (f32Suffix.empty() || f32Type.empty() || u32Suffix.empty() ||
+        u32Type.empty() || maskType.empty() || !maskRatio)
+      continue;
+    std::string implementation = R"c(static inline __attribute__((unused)) vfloat32m2_t __weft_exp_f32m2(
     vfloat32m2_t x, size_t vl) {
   const vfloat32m2_t r = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
   const vfloat32m2_t z =
@@ -162,7 +177,25 @@ __weft_cos_f32m2(vfloat32m2_t x, size_t vl) {
   return __riscv_vle32_v_f32m2(lanes, vl);
 }
 
-static inline __attribute__((always_inline, unused)) void
+)c";
+    auto replaceAll = [&](llvm::StringRef token, llvm::StringRef replacement) {
+      size_t position = 0;
+      while ((position = implementation.find(token.str(), position)) !=
+             std::string::npos) {
+        implementation.replace(position, token.size(), replacement.str());
+        position += replacement.size();
+      }
+    };
+    replaceAll("vfloat32m2_t", f32Type);
+    replaceAll("vuint32m2_t", u32Type);
+    replaceAll("vbool16_t", maskType);
+    replaceAll("f32m2", f32Suffix);
+    replaceAll("u32m2", u32Suffix);
+    replaceAll("b16", "b" + std::to_string(*maskRatio));
+    output << implementation;
+  }
+  if (!f32MathShapes.empty())
+    output << R"c(static inline __attribute__((always_inline, unused)) void
 __weft_online_summary_merge_f32(
     float *maximum, float *sum, float strip_maximum, float strip_sum) {
   if (*maximum == -INFINITY) {
@@ -184,7 +217,7 @@ __weft_online_summary_merge_f32(
 bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations,
                            std::string &unsupportedSymbol) {
-  bool usesExp = false;
+  llvm::SmallVector<RVVVectorShape, 4> f32MathShapes;
   bool usesRVVSymmetricI4I8 = false;
   bool usesRVVAffineI4I8 = false;
   bool usesRVVSymmetricI4I8M4 = false;
@@ -212,8 +245,15 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
     };
     switch (implementation.primitive) {
     case LocalPrimitiveKind::F32Math:
-      supported = symbol.empty();
-      usesExp = supported;
+      supported = symbol.empty() && implementation.valueShapes.size() == 1 &&
+                  implementation.valueShapes.front() ==
+                      implementation.mapping.laneShape &&
+                  implementation.mapping.laneShape.sew == 32 &&
+                  rvvIntegerLMUL(implementation.mapping.laneShape).has_value();
+      if (supported &&
+          !llvm::is_contained(f32MathShapes,
+                              implementation.mapping.laneShape))
+        f32MathShapes.push_back(implementation.mapping.laneShape);
       break;
     case LocalPrimitiveKind::SymmetricI4I8:
     case LocalPrimitiveKind::AffineI4I8:
@@ -274,7 +314,8 @@ bool emitIntrinsicCPrelude(llvm::raw_ostream &output,
   });
   if (!supported)
     return false;
-  emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
+  emitPrelude(output, f32MathShapes, usesRVVSymmetricI4I8,
+              usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,
               usesIME1SymmetricI4I8M4, usesIME1AffineI4I8M4,

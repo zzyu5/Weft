@@ -2742,15 +2742,6 @@ private:
         llvm::any_of(decision.states, [](const VLAStateDecision &state) {
           return state.semantic == VLAStateSemantic::OnlineSoftmaxSummary;
         });
-    if (needsF32MathImplementation) {
-      std::optional<LocalImplementation> implementation =
-          selectF32MathLocalImplementation(options.target);
-      if (!implementation) {
-        op.emitError("VLA f32 math has no legal local implementation");
-        return mlir::failure();
-      }
-      decision.f32MathImplementation = *implementation;
-    }
     bool hasF32RegionValue = llvm::any_of(
         physicalOperations, [](mlir::Operation *operation) {
           return llvm::any_of(operation->getResultTypes(), [](mlir::Type type) {
@@ -2843,11 +2834,6 @@ private:
       candidateFacts.requiredDataShape = shape;
       return mlir::success();
     };
-    if (decision.f32MathImplementation &&
-        mlir::failed(requireDataShape(
-            decision.f32MathImplementation.valueShapes.front(),
-            op.getOperation())))
-      return mlir::failure();
     for (const VLADotDecision &dot : decision.dots) {
       if (mlir::failed(requireDataShape(dot.mapping.laneShape, dot.operation)))
         return mlir::failure();
@@ -2881,6 +2867,16 @@ private:
     entity.vlaMaskRatio = selected->maskRatio;
     entity.resources = selected->resources;
     decision.mapping = entity.mapping;
+    if (needsF32MathImplementation) {
+      std::optional<LocalImplementation> implementation =
+          selectF32MathLocalImplementation(entity.mapping, options.target);
+      if (!implementation) {
+        op.emitError(
+            "VLA f32 math has no implementation for the selected lane mapping");
+        return mlir::failure();
+      }
+      decision.f32MathImplementation = std::move(*implementation);
+    }
     narrowPhysical = selected->narrow;
     for (VLASegment2Decision &segment : decision.segment2) {
       segment.vectorShape =

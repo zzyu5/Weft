@@ -495,7 +495,8 @@ struct LocalImplementation {
 };
 
 std::optional<LocalImplementation>
-selectF32MathLocalImplementation(const RISCVTargetProfile &target);
+selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
+                                 const RISCVTargetProfile &target);
 
 struct I4I8FragmentCandidateFacts {
   CoreMappingProblem mapping;

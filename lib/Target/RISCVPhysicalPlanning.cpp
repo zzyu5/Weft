@@ -141,7 +141,8 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::F32Math:
     return implementation.mapping.instruction ==
                CoreInstructionKind::RVVElementwise &&
-           primary == kRVVE32M2;
+           primary == implementation.mapping.laneShape && primary.sew == 32 &&
+           rvvIntegerLMUL(primary).has_value();
   case LocalPrimitiveKind::SymmetricI4I8:
   case LocalPrimitiveKind::AffineI4I8:
     return (rvvDot || ime) && rows != 0 && (rows == 1 || rows == 4) &&
@@ -934,9 +935,7 @@ selectVLACastPhysical(const VLACastCandidateFacts &facts,
 std::optional<VLAUnaryRealization>
 selectVLAUnaryPhysical(VLAUnarySemantic semantic,
                        const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasF ||
-      !target.supportsVectorShape(kRVVE32M2.sew,
-                                  kRVVE32M2.lmulEighths))
+  if (!target.hasRVV || !target.hasF)
     return std::nullopt;
   switch (semantic) {
   case VLAUnarySemantic::Exp:
@@ -1045,26 +1044,22 @@ static bool resolveVLAStateShapes(SelectedVLAStatePhysical &state,
 }
 
 std::optional<LocalImplementation>
-selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
-  if (!target.hasRVV || !target.hasF ||
-      !target.supportsVectorShape(kRVVE32M2.sew,
-                                  kRVVE32M2.lmulEighths))
+selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
+                                 const RISCVTargetProfile &target) {
+  if (!target.hasRVV || !target.hasF || !mapping || !mapping.laneAxis ||
+      mapping.instruction != CoreInstructionKind::RVVElementwise ||
+      mapping.laneShape.sew != 32 ||
+      !target.supportsVectorShape(mapping.laneShape.sew,
+                                  mapping.laneShape.lmulEighths) ||
+      !rvvIntegerLMUL(mapping.laneShape))
     return std::nullopt;
-  std::optional<unsigned> lanes = rvvLaneCapacity(kRVVE32M2, target);
-  if (!lanes)
-    return std::nullopt;
-  llvm::SmallVector<RVVVectorShape, 1> shapes = {kRVVE32M2};
-  for (CorePhysicalMapping mapping : enumerateRVVLocalMappings(
-           CoreInstructionKind::RVVElementwise, kCoreAxisN, *lanes, 32, 1,
-           shapes, target)) {
-    LocalImplementation implementation;
-    implementation.primitive = LocalPrimitiveKind::F32Math;
-    implementation.mapping = std::move(mapping);
-    implementation.valueShapes = {kRVVE32M2};
-    if (finalizeLocalInstructionMapping(implementation))
-      return implementation;
-  }
-  return std::nullopt;
+  LocalImplementation implementation;
+  implementation.primitive = LocalPrimitiveKind::F32Math;
+  implementation.mapping = mapping;
+  implementation.valueShapes = {mapping.laneShape};
+  return finalizeLocalInstructionMapping(implementation)
+             ? std::optional<LocalImplementation>(std::move(implementation))
+             : std::nullopt;
 }
 
 std::optional<SelectedVLALookupPhysical>
