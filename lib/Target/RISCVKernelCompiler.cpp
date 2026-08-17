@@ -470,6 +470,8 @@ struct PhysicalStorageDecision {
   mlir::Value reusedStorage;
   int64_t elements = 0;
   int64_t alignment = 0;
+  llvm::SmallVector<int64_t> axisIds;
+  llvm::SmallVector<int64_t> strides;
 };
 
 struct PhysicalEntityPlan {
@@ -7036,12 +7038,13 @@ private:
     return axes;
   }
 
-  std::optional<int64_t> physicalBlockElementCount(mlir::Type type) {
+  std::optional<llvm::SmallVector<int64_t>>
+  physicalBlockExtents(mlir::Type type) {
     auto block = mlir::dyn_cast<BlockType>(unwrapLogicalValidity(type));
     if (!block || !block.getElementType().isF32() || block.getShape().empty() ||
         block.getShape().size() > 2)
       return std::nullopt;
-    int64_t elements = 1;
+    llvm::SmallVector<int64_t> extents;
     for (auto [dimension, identity] :
          llvm::zip(block.getShape(), block.getAxisIds())) {
       std::optional<int64_t> extent;
@@ -7054,13 +7057,54 @@ private:
       }
       if (!extent)
         return std::nullopt;
+      extents.push_back(*extent);
+    }
+    return extents;
+  }
+
+  std::optional<int64_t> physicalBlockElementCount(mlir::Type type) {
+    std::optional<llvm::SmallVector<int64_t>> extents =
+        physicalBlockExtents(type);
+    if (!extents)
+      return std::nullopt;
+    int64_t elements = 1;
+    for (int64_t extent : *extents) {
       std::optional<int64_t> extended = extendPrivateStorageElementCount(
-          elements, *extent, sizeof(float), options.target);
+          elements, extent, sizeof(float), options.target);
       if (!extended)
         return std::nullopt;
       elements = *extended;
     }
     return elements;
+  }
+
+  std::optional<PhysicalStorageDecision>
+  deriveMaterializedBlockStorage(mlir::Value value, mlir::Value reusedStorage,
+                                 int64_t alignment) {
+    auto block =
+        mlir::dyn_cast<BlockType>(unwrapLogicalValidity(value.getType()));
+    std::optional<llvm::SmallVector<int64_t>> extents =
+        physicalBlockExtents(value.getType());
+    if (!block || !extents)
+      return std::nullopt;
+    PhysicalStorageDecision storage;
+    storage.value = value;
+    storage.reusedStorage = reusedStorage;
+    storage.alignment = alignment;
+    storage.axisIds.assign(block.getAxisIds().begin(), block.getAxisIds().end());
+    storage.strides.resize(extents->size());
+    int64_t elements = 1;
+    for (size_t reverse = extents->size(); reverse != 0; --reverse) {
+      const size_t dimension = reverse - 1;
+      storage.strides[dimension] = elements;
+      std::optional<int64_t> extended = extendPrivateStorageElementCount(
+          elements, (*extents)[dimension], sizeof(float), options.target);
+      if (!extended)
+        return std::nullopt;
+      elements = *extended;
+    }
+    storage.elements = elements;
+    return storage;
   }
 
   mlir::LogicalResult prepareMaterializedBlockValues() {
@@ -7105,7 +7149,7 @@ private:
 
   mlir::LogicalResult selectMaterializedBlockStorage(mlir::Value value,
                                                      mlir::Operation *owner) {
-    if (!physicalBlockElementCount(value.getType()))
+    if (!deriveMaterializedBlockStorage(value, {}, 16))
       return owner->emitError(
           "selected local primitive has no bounded f32 accumulator domain");
     return mlir::success();
@@ -7149,11 +7193,16 @@ private:
     }
     if (auto matmul = mlir::dyn_cast<MatmulOp>(definition)) {
       auto selected = physicalPlan.f16Matmuls.find(matmul.getOperation());
-      return selected == physicalPlan.f16Matmuls.end()
+      if (selected == physicalPlan.f16Matmuls.end())
+        return std::nullopt;
+      auto storage = llvm::find_if(
+          selected->second.entity.storages,
+          [&](const PhysicalStorageDecision &candidate) {
+            return candidate.value == value;
+          });
+      return storage == selected->second.entity.storages.end()
                  ? std::nullopt
-                 : std::optional<int64_t>(
-                       selected->second.realization.rowTile *
-                       selected->second.realization.columnTile);
+                 : std::optional<int64_t>(storage->elements);
     }
     auto pointwise = physicalPlan.materializedF32Pointwise.find(definition);
     if (pointwise != physicalPlan.materializedF32Pointwise.end())
@@ -9077,8 +9126,13 @@ private:
     if (!computeShape)
       return std::nullopt;
     decision.mapping = selected->mapping;
-    if (mlir::failed(selectMaterializedBlockStorage(matmul.getInit(),
-                                                   matmul.getOperation())))
+    std::optional<PhysicalStorageDecision> resultStorage =
+        deriveMaterializedBlockStorage(matmul.getResult(), matmul.getInit(), 16);
+    llvm::SmallVector<int64_t, 2> expectedResultAxes = {
+        static_cast<int64_t>(analysis->lhsFreeAxis.getAxis()),
+        static_cast<int64_t>(analysis->rhsFreeAxis.getAxis())};
+    if (!resultStorage || resultStorage->axisIds != expectedResultAxes ||
+        resultStorage->strides.size() != 2)
       return std::nullopt;
     RVVVectorShape inputShape = selected->mapping.laneShape;
     recordPhysicalValue(planned.entity, matmul.getLhs(), inputShape);
@@ -9092,6 +9146,10 @@ private:
     recordPhysicalHandoff(planned.entity, matmul.getOperation(), matmul.getInit(),
                           PhysicalHandoff::LocalPack, *computeShape,
                           *computeShape);
+    recordPhysicalHandoff(planned.entity, matmul.getOperation(),
+                          matmul.getResult(), PhysicalHandoff::LocalPack,
+                          *computeShape, *computeShape);
+    planned.entity.storages.push_back(std::move(*resultStorage));
     planned.entity.resources = selected->resources;
     return planned;
   }
@@ -9118,25 +9176,41 @@ private:
     const unsigned columnMicrotile = nAxis->registerFactor;
     const unsigned kUnroll = kAxis->unrollFactor;
     const unsigned loadBufferCount = decision.mapping.pipeline.bufferCount;
-    auto inputShape = llvm::find_if(
-        entity.values, [&](const PhysicalValueDecision &value) {
-          return value.value == op.getLhs();
+    for (auto [value, kind] :
+         {std::pair<mlir::Value, PhysicalHandoff>{
+              op.getLhs(), PhysicalHandoff::Reload},
+          {op.getRhs(), PhysicalHandoff::Reload},
+          {op.getInit(), PhysicalHandoff::LocalPack},
+          {op.getResult(), PhysicalHandoff::LocalPack}})
+      if (mlir::failed(
+              requirePhysicalHandoff(op.getOperation(), entity, value, kind)))
+        return mlir::failure();
+    const PhysicalHandoffDecision *lhsHandoff =
+        findPhysicalHandoff(entity, op.getOperation(), op.getLhs());
+    const PhysicalHandoffDecision *rhsHandoff =
+        findPhysicalHandoff(entity, op.getOperation(), op.getRhs());
+    const PhysicalHandoffDecision *initHandoff =
+        findPhysicalHandoff(entity, op.getOperation(), op.getInit());
+    const PhysicalHandoffDecision *resultHandoff =
+        findPhysicalHandoff(entity, op.getOperation(), op.getResult());
+    auto resultStorage = llvm::find_if(
+        entity.storages, [&](const PhysicalStorageDecision &storage) {
+          return storage.value == op.getResult();
         });
-    auto computeShape = llvm::find_if(
-        entity.values, [&](const PhysicalValueDecision &value) {
-          return value.value == op.getResult();
-        });
-    if (inputShape == entity.values.end() || computeShape == entity.values.end())
-      return op.emitError("F16 matmul has no physical value shape");
-    std::optional<unsigned> inputLMUL = rvvIntegerLMUL(inputShape->shape);
-    std::optional<unsigned> computeLMUL = rvvIntegerLMUL(computeShape->shape);
-    if (!inputLMUL || !computeLMUL || inputShape->shape.sew != 16 ||
-        computeShape->shape.sew != 32 ||
-        inputShape->shape != decision.mapping.laneShape ||
-        computeShape->shape !=
-            rvvShapeForSameLanes(decision.mapping.laneShape, 32,
-                                 options.target)
-                .value_or(RVVVectorShape{}))
+    if (!lhsHandoff || !rhsHandoff || !initHandoff || !resultHandoff ||
+        resultStorage == entity.storages.end() ||
+        resultStorage->reusedStorage != op.getInit() ||
+        resultStorage->axisIds.size() != 2 ||
+        resultStorage->strides.size() != 2)
+      return op.emitError("F16 matmul physical value plan is incomplete");
+    const RVVVectorShape inputShape = lhsHandoff->resultShape;
+    const RVVVectorShape computeShape = initHandoff->resultShape;
+    std::optional<unsigned> inputLMUL = rvvIntegerLMUL(inputShape);
+    std::optional<unsigned> computeLMUL = rvvIntegerLMUL(computeShape);
+    if (!inputLMUL || !computeLMUL || inputShape.sew != 16 ||
+        computeShape.sew != 32 || inputShape != decision.mapping.laneShape ||
+        rhsHandoff->resultShape != inputShape ||
+        resultHandoff->resultShape != computeShape)
       return op.emitError("F16 matmul value shape has no intrinsic-C spelling");
     CValue accumulator = require(op.getInit());
     if (accumulator.kind != CValueKind::F32BlockStorage ||
@@ -9427,8 +9501,10 @@ private:
                  " = __riscv_vfmv_f_s_f32m1_f32(" + partial + ");");
             line(accumulator.spelling + "[" +
                  std::to_string(rowBase + row) + " * " +
-                 std::to_string(decision.columnTile) + " + " +
-                 groupColumns[column] + "] += " + scalar + ";");
+                 std::to_string(resultStorage->strides[0]) + " + (" +
+                 groupColumns[column] + ") * " +
+                 std::to_string(resultStorage->strides[1]) + "] += " + scalar +
+                 ";");
             --indent;
             line("}");
           }
