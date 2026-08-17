@@ -179,6 +179,43 @@ bool isBase3TernaryLocalImplementationMapping(
                         highWordShape).empty();
 }
 
+bool isSignedCodebookLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if ((implementation.primitive != LocalPrimitiveKind::SignedCodebook8I8 &&
+       implementation.primitive != LocalPrimitiveKind::SignedCodebook4I8) ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVIndexedGather ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 6 ||
+      (implementation.entryWidth != 4 && implementation.entryWidth != 8))
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (!reduction || !reduction->extent || *reduction->extent != 32 ||
+      reduction->sequentialFactor != 1 || reduction->laneFactor != 32 ||
+      reduction->registerFactor != 1)
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape codeShape = implementation.valueShapes[1];
+  const RVVVectorShape indexShape = implementation.valueShapes[2];
+  const RVVVectorShape tableShape = implementation.valueShapes[3];
+  const RVVVectorShape productShape = implementation.valueShapes[4];
+  const RVVVectorShape signSourceShape = implementation.valueShapes[5];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         codeShape.sew == 8 && indexShape.sew == 16 &&
+         indexShape.lmulEighths == codeShape.lmulEighths * 2 &&
+         tableShape.sew == implementation.entryWidth * 8 &&
+         tableShape.lmulEighths == laneShape.lmulEighths &&
+         productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         signSourceShape == kRVVE8M1 &&
+         !rvvVectorType(RVVElementCategory::UnsignedInteger, codeShape).empty() &&
+         !rvvVectorType(RVVElementCategory::UnsignedInteger, indexShape).empty() &&
+         !rvvVectorType(RVVElementCategory::UnsignedInteger, tableShape).empty() &&
+         !rvvVectorType(RVVElementCategory::SignedInteger, productShape).empty();
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -309,17 +346,13 @@ static bool validateLocalInstructionMapping(
     return rvvDot && (lanes == 32 || lanes == 64) &&
            primary == RVVVectorShape{8, 16};
   case LocalPrimitiveKind::SignedCodebook8I8:
+  case LocalPrimitiveKind::SignedCodebook4I8:
+    return isSignedCodebookLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::PackedU9U7CodebookI8:
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
     return implementation.mapping.instruction ==
                CoreInstructionKind::RVVIndexedGather &&
            lanes == 32 && implementation.entryWidth == 8 &&
-           (primary == RVVVectorShape{8, 8} ||
-            primary == RVVVectorShape{8, 16});
-  case LocalPrimitiveKind::SignedCodebook4I8:
-    return implementation.mapping.instruction ==
-               CoreInstructionKind::RVVIndexedGather &&
-           lanes == 32 && implementation.entryWidth == 4 &&
            (primary == RVVVectorShape{8, 8} ||
             primary == RVVVectorShape{8, 16});
   case LocalPrimitiveKind::IQ2SI8:
@@ -1889,7 +1922,8 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   if (!target.hasRVV || !target.hasIndexedMemory ||
       !target.hasWideningInteger || !target.littleEndian ||
       target.vlenBits < 128 || !supportedPrimitive ||
-      (facts.entryWidth != 4 && facts.entryWidth != 8))
+      (facts.entryWidth != 4 && facts.entryWidth != 8) ||
+      !target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths))
     return std::nullopt;
 
   unsigned codeCount = 32 / facts.entryWidth;
@@ -1927,7 +1961,12 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     LocalImplementation implementation;
     implementation.primitive = facts.primitive;
     implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes = {laneShape, *tableShape};
+    if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
+        facts.primitive == LocalPrimitiveKind::SignedCodebook4I8)
+      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
+                                    *tableShape, *productShape, kRVVE8M1};
+    else
+      implementation.valueShapes = {laneShape, *tableShape};
     implementation.entryWidth = facts.entryWidth;
     if (!finalizeLocalInstructionMapping(implementation))
       continue;

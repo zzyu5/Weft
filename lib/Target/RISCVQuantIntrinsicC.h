@@ -30,9 +30,8 @@ bool emitBase3TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
 bool emitPackedI2TernaryLocalImplementation(
     llvm::raw_ostream &output, const LocalImplementation &implementation);
-void emitSignedCodebookLocalImplementations(
-    llvm::raw_ostream &output, bool entry8E8M2, bool entry8E8M1,
-    bool entry4E8M2, bool entry4E8M1);
+bool emitSignedCodebookLocalImplementation(
+    llvm::raw_ostream &output, const LocalImplementation &implementation);
 void emitPackedU9U7CodebookLocalImplementations(llvm::raw_ostream &output,
                                                 bool registerE8M2,
                                                 bool registerE8M1);

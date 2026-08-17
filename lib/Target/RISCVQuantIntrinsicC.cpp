@@ -53,8 +53,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
-  bool signed8E8M2 = false, signed8E8M1 = false;
-  bool signed4E8M2 = false, signed4E8M1 = false;
   bool packedU9U7E8M2 = false, packedU9U7E8M1 = false;
   bool packedU11E8M2 = false, packedU11E8M1 = false;
   bool supported = true;
@@ -89,16 +87,9 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
           emitPackedI2TernaryLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::SignedCodebook8I8:
-      supported = match("__weft_signed_codebook8_i8_register_l32_e8m2",
-                        signed8E8M2) ||
-                  match("__weft_signed_codebook8_i8_register_l32_e8m1",
-                        signed8E8M1);
-      break;
     case LocalPrimitiveKind::SignedCodebook4I8:
-      supported = match("__weft_signed_codebook4_i8_register_l32_e8m2",
-                        signed4E8M2) ||
-                  match("__weft_signed_codebook4_i8_register_l32_e8m1",
-                        signed4E8M1);
+      supported =
+          emitSignedCodebookLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::PackedU9U7CodebookI8:
       supported = match("__weft_packed_u9_u7_codebook_i8_register_l32_e8m2",
@@ -149,7 +140,6 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&
       !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
-      !signed8E8M2 && !signed8E8M1 && !signed4E8M2 && !signed4E8M1 &&
       !packedU9U7E8M2 && !packedU9U7E8M1 && !packedU11E8M2 &&
       !packedU11E8M1)
     return true;
@@ -211,8 +201,6 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
-  emitSignedCodebookLocalImplementations(
-      output, signed8E8M2, signed8E8M1, signed4E8M2, signed4E8M1);
   emitPackedU9U7CodebookLocalImplementations(
       output, packedU9U7E8M2, packedU9U7E8M1);
   emitPackedU11GridDeltaLocalImplementations(

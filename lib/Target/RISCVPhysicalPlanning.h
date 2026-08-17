@@ -502,6 +502,8 @@ bool isPackedI2TernaryLocalImplementationMapping(
     const LocalImplementation &implementation);
 bool isBase3TernaryLocalImplementationMapping(
     const LocalImplementation &implementation);
+bool isSignedCodebookLocalImplementationMapping(
+    const LocalImplementation &implementation);
 
 std::optional<LocalImplementation>
 selectF32MathLocalImplementation(const CorePhysicalMapping &mapping,
