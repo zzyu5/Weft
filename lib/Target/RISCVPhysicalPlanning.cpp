@@ -1845,6 +1845,76 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   return std::move(legal.front().physical);
 }
 
+struct QuantPrimitivePhysicalRule {
+  llvm::SmallVector<RVVVectorShape, 8> valueShapes;
+  LocalHardwareOperationKind operation =
+      LocalHardwareOperationKind::RVVIntrinsic;
+  LocalOperationProjection projection = LocalOperationProjection::None;
+  llvm::SmallVector<LocalOperandWindow, 4> operands;
+  LocalDecodeSchedule decode;
+  unsigned accumulatorCount = 1;
+  unsigned entryWidth = 0;
+  llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
+  unsigned predicateGroups = 0;
+  std::optional<PhysicalResourceRequirements> directResources;
+};
+
+struct LocalPrimitivePhysicalCandidate {
+  LocalImplementation implementation;
+  RVVVectorShape laneShape;
+  PhysicalResourceBudget resources;
+  unsigned sequentialFactor = 0;
+  unsigned laneGroups = 0;
+  unsigned registerFactor = 0;
+};
+
+template <typename RuleBuilder>
+static llvm::SmallVector<LocalPrimitivePhysicalCandidate, 16>
+enumerateLocalPrimitivePhysicalCandidates(
+    const CoreMappingProblem &mapping, LocalPrimitiveKind primitive,
+    CoreInstructionKind instruction, unsigned iterationAxis, unsigned laneSEW,
+    const RISCVTargetProfile &target, RuleBuilder &&deriveRule) {
+  llvm::SmallVector<LocalPrimitivePhysicalCandidate, 16> legal;
+  for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
+           mapping, instruction, iterationAxis, laneSEW, target)) {
+    std::optional<QuantPrimitivePhysicalRule> rule = deriveRule(candidate);
+    if (!rule)
+      continue;
+    const RVVVectorShape laneShape = candidate.mapping.laneShape;
+    const unsigned sequentialFactor = candidate.axis.sequentialFactor;
+    const unsigned registerFactor = candidate.axis.registerFactor;
+    LocalImplementation implementation;
+    implementation.primitive = primitive;
+    implementation.mapping = std::move(candidate.mapping);
+    implementation.valueShapes.append(rule->valueShapes.begin(),
+                                      rule->valueShapes.end());
+    implementation.entryWidth = rule->entryWidth;
+    selectLocalHardwareOperation(implementation, rule->operation,
+                                 rule->projection);
+    if (!selectLocalMicrokernelSchedule(
+            implementation, iterationAxis, rule->accumulatorCount,
+            rule->operands, rule->decode) ||
+        !finalizeLocalHardwareOperation(implementation))
+      continue;
+    std::optional<PhysicalResourceBudget> budget;
+    if (rule->directResources) {
+      budget = calculatePhysicalResources(*rule->directResources, target);
+    } else {
+      AxisMappedResourceFacts resources;
+      resources.mapping = &implementation.mapping;
+      resources.values.append(rule->liveValues.begin(), rule->liveValues.end());
+      resources.predicateGroups = rule->predicateGroups;
+      budget = calculateAxisMappedResources(resources, target);
+    }
+    if (!budget)
+      continue;
+    legal.push_back(LocalPrimitivePhysicalCandidate{
+        std::move(implementation), laneShape, *budget, sequentialFactor,
+        rvvRegisterGroups(laneShape), registerFactor});
+  }
+  return legal;
+}
+
 std::optional<SelectedCodebookGatherI8Physical>
 selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
                                const RISCVTargetProfile &target) {
@@ -1884,104 +1954,86 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
           indexShape->lmulEighths))
     return std::nullopt;
 
-  struct Candidate {
-    SelectedCodebookGatherI8Physical physical;
-    unsigned registerFactor = 0;
-  };
-  llvm::SmallVector<Candidate, 8> legal;
-  for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           facts.mapping, CoreInstructionKind::RVVIndexedGather,
-           reduction->id, 8, target)) {
-    const RVVVectorShape laneShape = candidate.mapping.laneShape;
-    if (candidate.axis.laneFactor != 32 ||
-        candidate.axis.registerFactor != 1 ||
-        candidate.axis.sequentialFactor != 1)
-      continue;
-    std::optional<RVVVectorShape> productShape =
-        rvvShapeForSameLanes(laneShape, 16, target);
-    if (!productShape)
-      continue;
-    LocalImplementation implementation;
-    implementation.primitive = facts.primitive;
-    implementation.mapping = std::move(candidate.mapping);
-    std::optional<RVVVectorShape> halfProductShape =
-        rvvShapeForSemanticLanes(16, 16, target);
-    RVVVectorShape signWordShape{32, kRVVE8M1.lmulEighths};
-    if (!halfProductShape ||
-        !target.supportsVectorShape(signWordShape.sew,
-                                    signWordShape.lmulEighths))
-      continue;
-    if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
-        facts.primitive == LocalPrimitiveKind::SignedCodebook4I8)
-      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
-                                    *tableShape, *productShape, kRVVE8M1,
-                                    signWordShape};
-    else if (facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
-      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
-                                    *tableShape, *productShape, kRVVE8M1,
-                                    *halfProductShape, signWordShape};
-    else if (facts.primitive ==
-             LocalPrimitiveKind::PackedU11GridDeltaI8)
-      implementation.valueShapes = {laneShape, *codeShape, *indexShape,
-                                    *tableShape, *productShape};
-    else
-      implementation.valueShapes = {laneShape, *tableShape};
-    implementation.entryWidth = facts.entryWidth;
-    LocalOperationProjection projection = LocalOperationProjection::None;
-    if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
-        facts.primitive == LocalPrimitiveKind::SignedCodebook4I8 ||
-        facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
-      projection = implementation.valueShapes[5] == laneShape
-                       ? LocalOperationProjection::SignSourceDirect
-                       : LocalOperationProjection::SignSourceExtend;
-    selectLocalHardwareOperation(implementation,
-                                 LocalHardwareOperationKind::RVVIntrinsic,
-                                 projection);
-    if (!selectLocalMicrokernelSchedule(
-            implementation, reduction->id, 1,
-            {{0, PhysicalMemoryMode::UnitStride, 1, 1, true},
-             {3, PhysicalMemoryMode::Indexed, 1, 1, false},
-             {4, PhysicalMemoryMode::UnitStride,
-              std::max(1u, candidate.axis.registerFactor), 1, true}},
-            {codeCount, 1, 2}))
-      continue;
-    if (!finalizeLocalHardwareOperation(implementation))
-      continue;
-    AxisMappedResourceFacts resources;
-    resources.mapping = &implementation.mapping;
-    resources.values = {
-        {PhysicalLiveClass::Memory, *codeShape},
-        {PhysicalLiveClass::Memory, *tableShape},
-        {PhysicalLiveClass::Memory, laneShape,
-         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
-        {PhysicalLiveClass::Index, *indexShape},
-        {PhysicalLiveClass::Temporary, *tableShape},
-        {PhysicalLiveClass::Temporary, laneShape,
-         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
-        {PhysicalLiveClass::Temporary, *productShape,
-         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
-        {PhysicalLiveClass::Temporary, kRVVE32M1,
-         AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
-    resources.predicateGroups = 1;
-    std::optional<PhysicalResourceBudget> budget =
-        calculateAxisMappedResources(resources, target);
-    if (!budget)
-      continue;
-    SelectedCodebookGatherI8Physical selected;
-    selected.implementation = std::move(implementation);
-    selected.codeShape = *codeShape;
-    selected.activationShape = laneShape;
-    selected.resources = *budget;
-    legal.push_back(Candidate{std::move(selected),
-                              candidate.axis.registerFactor});
-  }
+  llvm::SmallVector<LocalPrimitivePhysicalCandidate, 16> legal =
+      enumerateLocalPrimitivePhysicalCandidates(
+          facts.mapping, facts.primitive,
+          CoreInstructionKind::RVVIndexedGather, reduction->id, 8, target,
+          [&](const LocalAxisMappingCandidate &candidate)
+              -> std::optional<QuantPrimitivePhysicalRule> {
+            const RVVVectorShape laneShape = candidate.mapping.laneShape;
+            if (candidate.axis.laneFactor != 32 ||
+                candidate.axis.registerFactor != 1 ||
+                candidate.axis.sequentialFactor != 1)
+              return std::nullopt;
+            std::optional<RVVVectorShape> productShape =
+                rvvShapeForSameLanes(laneShape, 16, target);
+            if (!productShape)
+              return std::nullopt;
+            std::optional<RVVVectorShape> halfProductShape =
+                rvvShapeForSemanticLanes(16, 16, target);
+            RVVVectorShape signWordShape{32, kRVVE8M1.lmulEighths};
+            if (!halfProductShape ||
+                !target.supportsVectorShape(signWordShape.sew,
+                                            signWordShape.lmulEighths))
+              return std::nullopt;
+            QuantPrimitivePhysicalRule rule;
+            if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
+                facts.primitive == LocalPrimitiveKind::SignedCodebook4I8)
+              rule.valueShapes = {laneShape, *codeShape, *indexShape,
+                                  *tableShape, *productShape, kRVVE8M1,
+                                  signWordShape};
+            else if (facts.primitive ==
+                     LocalPrimitiveKind::PackedU9U7CodebookI8)
+              rule.valueShapes = {laneShape, *codeShape, *indexShape,
+                                  *tableShape, *productShape, kRVVE8M1,
+                                  *halfProductShape, signWordShape};
+            else if (facts.primitive ==
+                     LocalPrimitiveKind::PackedU11GridDeltaI8)
+              rule.valueShapes = {laneShape, *codeShape, *indexShape,
+                                  *tableShape, *productShape};
+            else
+              return std::nullopt;
+            rule.entryWidth = facts.entryWidth;
+            if (facts.primitive == LocalPrimitiveKind::SignedCodebook8I8 ||
+                facts.primitive == LocalPrimitiveKind::SignedCodebook4I8 ||
+                facts.primitive == LocalPrimitiveKind::PackedU9U7CodebookI8)
+              rule.projection =
+                  rule.valueShapes[5] == laneShape
+                      ? LocalOperationProjection::SignSourceDirect
+                      : LocalOperationProjection::SignSourceExtend;
+            rule.operands = {
+                {0, PhysicalMemoryMode::UnitStride, 1, 1, true},
+                {3, PhysicalMemoryMode::Indexed, 1, 1, false},
+                {4, PhysicalMemoryMode::UnitStride,
+                 std::max(1u, candidate.axis.registerFactor), 1, true}};
+            rule.decode = {codeCount, 1, 2};
+            rule.liveValues = {
+                {PhysicalLiveClass::Memory, *codeShape},
+                {PhysicalLiveClass::Memory, *tableShape},
+                {PhysicalLiveClass::Memory, laneShape,
+                 AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+                {PhysicalLiveClass::Index, *indexShape},
+                {PhysicalLiveClass::Temporary, *tableShape},
+                {PhysicalLiveClass::Temporary, laneShape,
+                 AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+                {PhysicalLiveClass::Temporary, *productShape,
+                 AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+                {PhysicalLiveClass::Temporary, kRVVE32M1,
+                 AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
+            rule.predicateGroups = 1;
+            return rule;
+          });
   if (legal.empty())
     return std::nullopt;
-  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.physical.resources.peakGroups, lhs.registerFactor) <
-           std::tie(rhs.physical.resources.peakGroups, rhs.registerFactor);
+  llvm::sort(legal, [](const LocalPrimitivePhysicalCandidate &lhs,
+                       const LocalPrimitivePhysicalCandidate &rhs) {
+    return std::tie(lhs.resources.peakGroups, lhs.registerFactor) <
+           std::tie(rhs.resources.peakGroups, rhs.registerFactor);
   });
-  return std::move(legal.front().physical);
+  LocalPrimitivePhysicalCandidate selected = std::move(legal.front());
+  return SelectedCodebookGatherI8Physical{
+      std::move(selected.implementation), *codeShape, selected.laneShape,
+      selected.resources};
 }
 
 std::optional<SelectedNibbleCodebookI8Physical>
@@ -2002,96 +2054,69 @@ selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
       !target.supportsVectorShape(kRVVE32M1.sew,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
-  struct Candidate {
-    SelectedNibbleCodebookI8Physical physical;
-    unsigned registerFactor = 0;
-  };
-  llvm::SmallVector<Candidate, 8> legal;
-  for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           reduction->id, 8, target)) {
-    const RVVVectorShape laneShape = candidate.mapping.laneShape;
-    const unsigned logicalLanes =
-        candidate.axis.laneFactor * candidate.axis.registerFactor;
-    if ((candidate.axis.laneFactor != 16 &&
-         candidate.axis.laneFactor != 32) ||
-        logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
-      continue;
-    const bool combined = candidate.axis.laneFactor == 32 &&
-                          packedShape->lmulEighths >= 8 &&
-                          packedShape->lmulEighths * 2 ==
-                              laneShape.lmulEighths;
-    RVVVectorShape tableShape = combined ? laneShape : *packedShape;
-    std::optional<RVVVectorShape> productShape =
-        rvvShapeForSameLanes(combined ? laneShape : *packedShape, 16, target);
-    if (!productShape)
-      continue;
-    LocalImplementation implementation;
-    implementation.primitive = LocalPrimitiveKind::NibbleCodebookI8;
-    implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes = {laneShape, *packedShape, tableShape,
-                                  *productShape};
-    selectLocalHardwareOperation(
-        implementation, LocalHardwareOperationKind::RVVIntrinsic,
-        combined ? LocalOperationProjection::NibbleCodebookCombined
-                 : LocalOperationProjection::NibbleCodebookSplit);
-    if (!selectLocalMicrokernelSchedule(
-            implementation, reduction->id, 1,
-            {{1, PhysicalMemoryMode::UnitStride, 1, 1, true},
-             {2, PhysicalMemoryMode::Indexed, 1, 1, false},
-             {0, PhysicalMemoryMode::UnitStride,
-              std::max(1u, candidate.axis.registerFactor), 1, true}},
-            {2, std::max(1u, candidate.axis.laneFactor / 16),
-             std::max(1u, logicalLanes / 16)}))
-      continue;
-    if (!finalizeLocalHardwareOperation(implementation))
-      continue;
-    AxisMappedResourceFacts resources;
-    resources.mapping = &implementation.mapping;
-    resources.values = {
-        {PhysicalLiveClass::Memory, *packedShape},
-        {PhysicalLiveClass::Memory, tableShape},
-        {PhysicalLiveClass::Memory, laneShape,
-         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
-        {PhysicalLiveClass::Temporary, *productShape,
-         AxisMappedMultiplicity::RegisterFactor, candidate.axis.id,
-         combined ? 1u : 2u},
-        {PhysicalLiveClass::Temporary, kRVVE32M1,
-         AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
-    std::optional<PhysicalResourceBudget> budget =
-        calculateAxisMappedResources(resources, target);
-    if (!budget)
-      continue;
-    SelectedNibbleCodebookI8Physical selected;
-    selected.implementation = std::move(implementation);
-    selected.packedShape = *packedShape;
-    selected.tableShape = tableShape;
-    selected.activationShape = laneShape;
-    selected.resources = *budget;
-    legal.push_back(Candidate{std::move(selected),
-                              candidate.axis.registerFactor});
-  }
+  llvm::SmallVector<LocalPrimitivePhysicalCandidate, 16> legal =
+      enumerateLocalPrimitivePhysicalCandidates(
+          facts.mapping, LocalPrimitiveKind::NibbleCodebookI8,
+          CoreInstructionKind::RVVWideningIntegerDot, reduction->id, 8, target,
+          [&](const LocalAxisMappingCandidate &candidate)
+              -> std::optional<QuantPrimitivePhysicalRule> {
+            const RVVVectorShape laneShape = candidate.mapping.laneShape;
+            const unsigned logicalLanes =
+                candidate.axis.laneFactor * candidate.axis.registerFactor;
+            if ((candidate.axis.laneFactor != 16 &&
+                 candidate.axis.laneFactor != 32) ||
+                logicalLanes != 32 || candidate.axis.sequentialFactor != 1)
+              return std::nullopt;
+            const bool combined = candidate.axis.laneFactor == 32 &&
+                                  packedShape->lmulEighths >= 8 &&
+                                  packedShape->lmulEighths * 2 ==
+                                      laneShape.lmulEighths;
+            RVVVectorShape tableShape = combined ? laneShape : *packedShape;
+            std::optional<RVVVectorShape> productShape =
+                rvvShapeForSameLanes(combined ? laneShape : *packedShape, 16,
+                                     target);
+            if (!productShape)
+              return std::nullopt;
+            QuantPrimitivePhysicalRule rule;
+            rule.valueShapes = {laneShape, *packedShape, tableShape,
+                                *productShape};
+            rule.projection =
+                combined ? LocalOperationProjection::NibbleCodebookCombined
+                         : LocalOperationProjection::NibbleCodebookSplit;
+            rule.operands = {
+                {1, PhysicalMemoryMode::UnitStride, 1, 1, true},
+                {2, PhysicalMemoryMode::Indexed, 1, 1, false},
+                {0, PhysicalMemoryMode::UnitStride,
+                 std::max(1u, candidate.axis.registerFactor), 1, true}};
+            rule.decode = {2,
+                           std::max(1u, candidate.axis.laneFactor / 16),
+                           std::max(1u, logicalLanes / 16)};
+            rule.liveValues = {
+                {PhysicalLiveClass::Memory, *packedShape},
+                {PhysicalLiveClass::Memory, tableShape},
+                {PhysicalLiveClass::Memory, laneShape,
+                 AxisMappedMultiplicity::RegisterFactor, candidate.axis.id},
+                {PhysicalLiveClass::Temporary, *productShape,
+                 AxisMappedMultiplicity::RegisterFactor, candidate.axis.id,
+                 combined ? 1u : 2u},
+                {PhysicalLiveClass::Temporary, kRVVE32M1,
+                 AxisMappedMultiplicity::Fixed, std::nullopt, 2}};
+            return rule;
+          });
   if (legal.empty())
     return std::nullopt;
-  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
-    return std::tie(lhs.physical.resources.peakGroups, lhs.registerFactor) <
-           std::tie(rhs.physical.resources.peakGroups, rhs.registerFactor);
+  llvm::sort(legal, [](const LocalPrimitivePhysicalCandidate &lhs,
+                       const LocalPrimitivePhysicalCandidate &rhs) {
+    return std::tie(lhs.resources.peakGroups, lhs.registerFactor) <
+           std::tie(rhs.resources.peakGroups, rhs.registerFactor);
   });
-  return std::move(legal.front().physical);
+  LocalPrimitivePhysicalCandidate selected = std::move(legal.front());
+  const RVVVectorShape selectedTableShape =
+      selected.implementation.valueShapes[2];
+  return SelectedNibbleCodebookI8Physical{
+      std::move(selected.implementation), *packedShape,
+      selectedTableShape, selected.laneShape, selected.resources};
 }
-
-struct QuantPrimitivePhysicalRule {
-  llvm::SmallVector<RVVVectorShape, 8> valueShapes;
-  LocalHardwareOperationKind operation =
-      LocalHardwareOperationKind::RVVIntrinsic;
-  LocalOperationProjection projection = LocalOperationProjection::None;
-  llvm::SmallVector<LocalOperandWindow, 4> operands;
-  LocalDecodeSchedule decode;
-  unsigned accumulatorCount = 1;
-  llvm::SmallVector<AxisMappedLiveValue, 10> liveValues;
-  unsigned predicateGroups = 0;
-  std::optional<PhysicalResourceRequirements> directResources;
-};
 
 static std::optional<QuantPrimitivePhysicalRule>
 derivePackedQuantRule(LocalPrimitiveKind primitive,
@@ -2414,65 +2439,25 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       !reduction->extent || *reduction->extent == 0)
     return std::nullopt;
   const LocalPrimitiveKind primitive = facts.primitive;
-
-  struct Candidate {
-    SelectedQuantI8DotPhysical physical;
-    unsigned sequentialFactor = 0;
-    unsigned laneGroups = 0;
-    unsigned registerFactor = 0;
-  };
-  llvm::SmallVector<Candidate, 16> legal;
-  for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
-           reduction->id, 8, target)) {
-    const RVVVectorShape laneShape = candidate.mapping.laneShape;
-    std::optional<QuantPrimitivePhysicalRule> rule =
-        deriveQuantPrimitiveRule(primitive, candidate, target);
-    if (!rule)
-      continue;
-    LocalImplementation implementation;
-    implementation.primitive = primitive;
-    implementation.mapping = std::move(candidate.mapping);
-    implementation.valueShapes.append(rule->valueShapes.begin(),
-                                      rule->valueShapes.end());
-    selectLocalHardwareOperation(implementation, rule->operation,
-                                 rule->projection);
-    if (!selectLocalMicrokernelSchedule(
-            implementation, reduction->id, rule->accumulatorCount,
-            rule->operands, rule->decode))
-      continue;
-    if (!finalizeLocalHardwareOperation(implementation))
-      continue;
-    std::optional<PhysicalResourceBudget> budget;
-    if (rule->directResources)
-      budget = calculatePhysicalResources(*rule->directResources, target);
-    else {
-      AxisMappedResourceFacts resources;
-      resources.mapping = &implementation.mapping;
-      resources.values.append(rule->liveValues.begin(), rule->liveValues.end());
-      resources.predicateGroups = rule->predicateGroups;
-      budget = calculateAxisMappedResources(resources, target);
-    }
-    if (!budget)
-      continue;
-    SelectedQuantI8DotPhysical selected;
-    selected.implementation = std::move(implementation);
-    selected.operandShape = laneShape;
-    selected.resources = *budget;
-    legal.push_back(Candidate{std::move(selected),
-                              candidate.axis.sequentialFactor,
-                              rvvRegisterGroups(laneShape),
-                              candidate.axis.registerFactor});
-  }
+  llvm::SmallVector<LocalPrimitivePhysicalCandidate, 16> legal =
+      enumerateLocalPrimitivePhysicalCandidates(
+          facts.mapping, primitive,
+          CoreInstructionKind::RVVWideningIntegerDot, reduction->id, 8, target,
+          [&](const LocalAxisMappingCandidate &candidate) {
+            return deriveQuantPrimitiveRule(primitive, candidate, target);
+          });
   if (legal.empty())
     return std::nullopt;
-  llvm::sort(legal, [](const Candidate &lhs, const Candidate &rhs) {
+  llvm::sort(legal, [](const LocalPrimitivePhysicalCandidate &lhs,
+                       const LocalPrimitivePhysicalCandidate &rhs) {
     return std::tie(lhs.sequentialFactor, lhs.laneGroups,
-                    lhs.physical.resources.peakGroups, lhs.registerFactor) <
+                    lhs.resources.peakGroups, lhs.registerFactor) <
            std::tie(rhs.sequentialFactor, rhs.laneGroups,
-                    rhs.physical.resources.peakGroups, rhs.registerFactor);
+                    rhs.resources.peakGroups, rhs.registerFactor);
   });
-  return std::move(legal.front().physical);
+  LocalPrimitivePhysicalCandidate selected = std::move(legal.front());
+  return SelectedQuantI8DotPhysical{std::move(selected.implementation),
+                                    selected.laneShape, selected.resources};
 }
 
 std::optional<SelectedE2M1E8M0I8Physical>
