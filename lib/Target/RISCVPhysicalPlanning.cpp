@@ -309,6 +309,39 @@ bool isIQ3SLocalImplementationMapping(
          halfProductShape.lmulEighths * 2 == productShape.lmulEighths;
 }
 
+bool isIQ2SLocalImplementationMapping(
+    const LocalImplementation &implementation) {
+  if (implementation.primitive != LocalPrimitiveKind::IQ2SI8 ||
+      implementation.mapping.instruction !=
+          CoreInstructionKind::RVVWideningIntegerDot ||
+      !implementation.mapping.laneAxis ||
+      *implementation.mapping.laneAxis != kCoreAxisK ||
+      implementation.valueShapes.size() < 6)
+    return false;
+  const PhysicalAxisDecomposition *reduction =
+      findAxisMapping(implementation.mapping, kCoreAxisK);
+  if (!reduction || !reduction->extent || *reduction->extent != 256 ||
+      (reduction->laneFactor != 32 && reduction->laneFactor != 64) ||
+      reduction->registerFactor != 1 ||
+      reduction->sequentialFactor != 256 / reduction->laneFactor)
+    return false;
+  const RVVVectorShape laneShape = implementation.valueShapes[0];
+  const RVVVectorShape indexShape = implementation.valueShapes[1];
+  const RVVVectorShape tableShape = implementation.valueShapes[2];
+  const RVVVectorShape signShape = implementation.valueShapes[3];
+  const RVVVectorShape productShape = implementation.valueShapes[4];
+  const RVVVectorShape segmentProductShape = implementation.valueShapes[5];
+  return laneShape == implementation.mapping.laneShape && laneShape.sew == 8 &&
+         indexShape.sew == 16 && tableShape.sew == 64 &&
+         tableShape.lmulEighths == laneShape.lmulEighths &&
+         signShape.sew == 8 && productShape.sew == 16 &&
+         productShape.lmulEighths == laneShape.lmulEighths * 2 &&
+         segmentProductShape.sew == 16 &&
+         segmentProductShape.lmulEighths *
+                 (reduction->laneFactor / 16) ==
+             productShape.lmulEighths;
+}
+
 static llvm::SmallVector<CorePhysicalMapping, 16>
 enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
                           unsigned semanticExtent, unsigned laneSEW,
@@ -446,6 +479,7 @@ static bool validateLocalInstructionMapping(
   case LocalPrimitiveKind::PackedU11GridDeltaI8:
     return isPackedU11GridDeltaLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::IQ2SI8:
+    return isIQ2SLocalImplementationMapping(implementation);
   case LocalPrimitiveKind::IQ1MI8:
   case LocalPrimitiveKind::Q6KI8:
     return rvvDot &&
@@ -523,8 +557,7 @@ selectLocalImplementationSymbol(const LocalImplementation &implementation) {
   case LocalPrimitiveKind::NibbleCodebookI8:
     return "__weft_nibble_codebook_i8" + registerSuffix;
   case LocalPrimitiveKind::IQ2SI8:
-    return sequential ? "__weft_iq2_s_i8_strip"
-                      : "__weft_iq2_s_i8" + registerSuffix;
+    return "__weft_iq2_s_i8" + registerSuffix;
   case LocalPrimitiveKind::IQ3SI8:
     return "__weft_iq3_s_i8" + registerSuffix;
   case LocalPrimitiveKind::IQ1MI8:
@@ -2239,6 +2272,30 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
           decodeShape = *halfShape;
       }
       implementation.valueShapes = {laneShape, decodeShape};
+    } else if (primitive == LocalPrimitiveKind::IQ2SI8) {
+      const unsigned groupsPerVector = candidate.axis.laneFactor / 32;
+      if ((candidate.axis.laneFactor != 32 &&
+           candidate.axis.laneFactor != 64) ||
+          candidate.axis.registerFactor != 1)
+        continue;
+      std::optional<RVVVectorShape> indexShape =
+          rvvShapeForSemanticLanes(16, 4 * groupsPerVector, target);
+      RVVVectorShape tableShape{64, laneShape.lmulEighths};
+      std::optional<RVVVectorShape> signShape =
+          rvvShapeForSemanticLanes(8, 4 * groupsPerVector, target);
+      std::optional<RVVVectorShape> productShape =
+          rvvShapeForSameLanes(laneShape, 16, target);
+      std::optional<RVVVectorShape> segmentProductShape =
+          rvvShapeForSemanticLanes(16, 16, target);
+      if (!target.hasIndexedMemory || !indexShape || !signShape ||
+          !productShape || !segmentProductShape ||
+          !target.supportsIndexedVectorMemory(
+              tableShape.sew, tableShape.lmulEighths, indexShape->sew,
+              indexShape->lmulEighths))
+        continue;
+      implementation.valueShapes = {laneShape, *indexShape, tableShape,
+                                    *signShape, *productShape,
+                                    *segmentProductShape};
     } else if (primitive == LocalPrimitiveKind::IQ3SI8) {
       std::optional<RVVVectorShape> codeShape =
           rvvShapeForSemanticLanes(8, 16, target);
@@ -2269,7 +2326,19 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     resources.mapping = &implementation.mapping;
     const unsigned logicalLanes =
         candidate.axis.laneFactor * candidate.axis.registerFactor;
-    if (primitive == LocalPrimitiveKind::IQ3SI8) {
+    if (primitive == LocalPrimitiveKind::IQ2SI8) {
+      resources.values = {
+          {PhysicalLiveClass::Index, implementation.valueShapes[1]},
+          {PhysicalLiveClass::Memory, implementation.valueShapes[2]},
+          {PhysicalLiveClass::Memory, implementation.valueShapes[3]},
+          {PhysicalLiveClass::Memory, laneShape},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[4]},
+          {PhysicalLiveClass::Temporary, implementation.valueShapes[5],
+           AxisMappedMultiplicity::Fixed, kCoreAxisK,
+           candidate.axis.laneFactor / 16},
+          {PhysicalLiveClass::Temporary, kRVVE32M1}};
+      resources.predicateGroups = 1;
+    } else if (primitive == LocalPrimitiveKind::IQ3SI8) {
       resources.values = {
           {PhysicalLiveClass::Memory, implementation.valueShapes[1]},
           {PhysicalLiveClass::Index, implementation.valueShapes[2]},

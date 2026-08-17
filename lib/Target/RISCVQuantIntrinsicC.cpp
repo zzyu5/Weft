@@ -48,10 +48,10 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 bool emitQuantLocalImplementations(llvm::raw_ostream &output,
                                    const SelectedLocalImplementations &selected,
                                    std::string &unsupportedSymbol) {
-  bool iq2Register32 = false, iq2Register64 = false, iq2Strip = false;
   bool iq1Register32 = false, iq1Register64 = false, iq1Strip = false;
   bool q6Register32 = false, q6Register64 = false, q6Strip = false;
   bool packedI3L32 = false, packedI3L64 = false;
+  const LocalImplementation *iq2Implementation = nullptr;
   const LocalImplementation *iq3Implementation = nullptr;
   bool supported = true;
   selected.forEach([&](const LocalImplementation &implementation) {
@@ -102,9 +102,7 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
           emitNibbleCodebookLocalImplementation(output, implementation);
       break;
     case LocalPrimitiveKind::IQ2SI8:
-      supported = match("__weft_iq2_s_i8_register_l32_e8m2", iq2Register32) ||
-                  match("__weft_iq2_s_i8_register_l64_e8m2", iq2Register64) ||
-                  match("__weft_iq2_s_i8_strip", iq2Strip);
+      iq2Implementation = &implementation;
       break;
     case LocalPrimitiveKind::IQ3SI8:
       iq3Implementation = &implementation;
@@ -128,13 +126,12 @@ bool emitQuantLocalImplementations(llvm::raw_ostream &output,
   });
   if (!supported)
     return false;
-  if (!iq2Register32 && !iq2Register64 && !iq2Strip && !iq1Register32 &&
-      !iq1Register64 && !iq1Strip && !q6Register32 &&
+  if (!iq1Register32 && !iq1Register64 && !iq1Strip && !q6Register32 &&
       !q6Register64 && !q6Strip && !packedI3L32 && !packedI3L64 &&
-      !iq3Implementation)
+      !iq2Implementation && !iq3Implementation)
     return true;
 
-  if (iq2Strip || iq1Strip || q6Strip) {
+  if (iq1Strip || q6Strip) {
     output << R"c(static inline __attribute__((always_inline, unused)) int32_t
 __weft_i8_dot(const int8_t *lhs, const int8_t *rhs, size_t count) {
   int32_t result = 0;
@@ -181,17 +178,21 @@ __weft_get_i8m8_i8m2(vint8m8_t value, size_t segment) {
 
   if (iq1Register32 || iq1Register64 || iq1Strip)
     emitI64Table(output, "__weft_iq1_m_grid", __weft_iq1_m_grid, 2048);
-  if (iq2Register32 || iq2Register64 || iq2Strip)
+  if (iq2Implementation)
     emitI64Table(output, "__weft_iq2_s_grid", __weft_iq2_s_grid, 1024);
   if (iq3Implementation)
     emitI32Table(output, "__weft_iq3_s_grid", __weft_iq3_s_grid, 512);
 
+  if (iq2Implementation &&
+      !emitIQ2LocalImplementation(output, *iq2Implementation)) {
+    unsupportedSymbol = iq2Implementation->helperSymbol;
+    return false;
+  }
   if (iq3Implementation &&
       !emitIQ3LocalImplementation(output, *iq3Implementation)) {
     unsupportedSymbol = iq3Implementation->helperSymbol;
     return false;
   }
-  emitIQ2LocalImplementations(output, iq2Register32, iq2Register64, iq2Strip);
   emitIQ1LocalImplementations(output, iq1Register32, iq1Register64, iq1Strip);
   emitQ6LocalImplementations(output, q6Register32, q6Register64, q6Strip);
   emitPackedI3GroupedLocalImplementations(output, packedI3L32, packedI3L64);
