@@ -3127,14 +3127,13 @@ private:
           return mlir::failure();
         }
       }
-      unsigned stateInputSEW =
-          state.physical.stripUpdate == VLAStateStripUpdate::WideningAddReduction
-              ? 8
-              : 32;
-      RVVVectorShape stateShape =
-          rvvShapeForSameLanes(entity.vlaDataShape, stateInputSEW,
-                               options.target)
-              .value_or(RVVVectorShape{});
+      RVVVectorShape stateShape = state.physical.inputShape;
+      RVVVectorShape identityShape =
+          state.physical.carry == VLAStateCarryRepresentation::Vector
+              ? state.physical.carryShape
+              : state.physical.seedShape
+                    ? state.physical.seedShape
+                    : state.physical.inputShape;
       recordPhysicalValue(entity, state.operation->getOperand(0), stateShape);
       recordPhysicalHandoff(entity, state.operation,
                             state.operation->getOperand(0),
@@ -3144,7 +3143,7 @@ private:
           state.physical.carry == VLAStateCarryRepresentation::Vector
               ? PhysicalHandoff::Share
               : PhysicalHandoff::Rematerialize,
-          stateShape, stateShape);
+          identityShape, identityShape);
     }
     for (const VLANarrowDecision &narrow : decision.narrows) {
       const VLANarrowPhysical &physical = *narrowPhysical;
@@ -3159,9 +3158,22 @@ private:
     }
     for (const VLADotDecision &dot : decision.dots) {
       RVVVectorShape dotShape = dot.mapping.laneShape;
+      auto operation = mlir::dyn_cast<DotOp>(dot.operation);
+      if (!operation) {
+        dot.operation->emitError("VLA dot decision lost its typed primitive");
+        return mlir::failure();
+      }
+      for (mlir::Value operand : {operation.getLhs(), operation.getRhs()}) {
+        const PhysicalHandoff kind =
+            dot.blockedOperand && operand == dot.blockedOperand
+                ? PhysicalHandoff::Rematerialize
+                : PhysicalHandoff::Reload;
+        recordPhysicalValue(entity, operand, dotShape);
+        recordPhysicalHandoff(entity, dot.operation, operand, kind, dotShape,
+                              dotShape);
+      }
       recordPhysicalValue(entity, dot.init, dotShape);
-      if (auto operation = mlir::dyn_cast<DotOp>(dot.operation))
-        recordPhysicalValue(entity, operation.getResult(), dotShape);
+      recordPhysicalValue(entity, operation.getResult(), dotShape);
       recordPhysicalHandoff(entity, dot.operation, dot.init,
                             dot.initRealization ==
                                     VLADotInitRealization::MaterializedRegion
@@ -5515,6 +5527,7 @@ private:
   }
 
   mlir::LogicalResult emitVLADot(const VLADotDecision &decision) {
+    auto operation = mlir::cast<DotOp>(decision.operation);
     const PhysicalHandoffDecision *handoff =
         findVLAHandoff(decision.operation, decision.init);
     const PhysicalValueDecision *initShape =
@@ -5523,6 +5536,19 @@ private:
       return decision.operation->emitError(
           "VLA dot physical value shape is unavailable");
     RVVVectorShape dotShape = initShape->shape;
+    for (mlir::Value operand : {operation.getLhs(), operation.getRhs()}) {
+      const PhysicalHandoffDecision *operandHandoff =
+          findVLAHandoff(decision.operation, operand);
+      const PhysicalHandoff expected =
+          decision.blockedOperand && operand == decision.blockedOperand
+              ? PhysicalHandoff::Rematerialize
+              : PhysicalHandoff::Reload;
+      if (!operandHandoff || operandHandoff->kind != expected ||
+          operandHandoff->sourceShape != dotShape ||
+          operandHandoff->resultShape != dotShape)
+        return decision.operation->emitError(
+            "VLA dot operand handoff is incomplete");
+    }
     std::optional<unsigned> lmul = rvvIntegerLMUL(dotShape);
     const PhysicalAxisDecomposition *laneAxis =
         findAxisMapping(decision.mapping, decision.mapping.laneAxis);
