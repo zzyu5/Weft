@@ -64,20 +64,26 @@ LMUL、microtile、layout、fragment、table width 或 pipeline。
 
 `RISCVKernelFacts` 从 Kernel IR 记录 axis identity、ordered parent、普通 consumers、definition/last
 use、control carry，以及每次 memory access 相对各轴的 unit/strided/indexed/non-affine relation。
-这些是后续所有实现共同读取的程序事实，不按 example 或量化格式分组。
+它还根据pointer、index SSA、element bytes和effect顺序形成indexed-address与interleaved-memory
+group。这些是后续所有实现共同读取的程序事实，不按example或量化格式分组。
 
-`RISCVPhysicalPlanning` 根据上述事实、target profile 和显式 backend config 枚举并过滤当前真正
-存在的候选。F32 dot 先由 lhs/rhs free-axis identity 推导 VLA vector-dot、VLA microtile 或 local-row
-structure，再枚举 LMUL 与 K-unroll；F16 matmul枚举 row/column microtile、input LMUL、K-unroll与
-单/双 register-load buffer。State直接携带选定的carry、strip update、finalize和lifetime；quant与
-RVV/IME local leaf只保存后续handoff/emission实际消费的operand shape、leaf和resource budget。
+`RISCVReuseAnalysis` 从同一份facts推导operand是否随reduction推进、是否直接供给primitive、
+address/predicate是否依赖accumulator、consumer数量和control crossing。它是F32 dot、VLA dot和
+F16 matmul共同的reuse/pipeline输入，不产生第二份IR。
 
-`RISCVKernelCompiler` 把相连 value 的 selected shape、memory form、state placement、primitive
-realization 与 handoff 组成一次瞬态 physical plan。所有决定准备完成后才生成 kernel body，并同时
-收集实际使用的 exact intrinsic/asm leaf。`RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、
-`RISCVQuant*IntrinsicC` 与 `RISCVIMEIntrinsicC` 只按这组 exact leaf 拼写 helper；它们不再读取
-VLEN、kernel 名或外围 IR 来重新选择实现。Segment memory的field count、element SEW、coordinate
-scale与最终vector shape也在plan中确定，emitter不再从pointer pattern重新推导。
+`RISCVAxisMapping` 与 `RISCVPhysicalPlanning` 把显式op约束组合成sequential/lane/register/unroll/
+fragment轴分解，生成operand window、pipeline actions与统一resource budget，再按target profile和
+显式backend config选择合法实例。Dense与quant都使用同一mapping和resource机制；quant格式只在
+typed numerical rule与最底层local operation中保留差异。
+
+`RISCVKernelCompiler` 把相连value的selected shape、memory form、state placement、primitive
+realization与handoff组成一次瞬态physical plan。VLA lifetime按真实operation位置计算，nested
+control会继承外层仍存活的值。所有决定准备完成后才生成kernel body，并同时收集实际使用的exact
+intrinsic/asm leaf。
+
+`RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、`RISCVQuant*IntrinsicC`与`RISCVIMEIntrinsicC`
+只按selected local operation拼写helper；它们不读取VLEN、kernel名、格式名或外围IR重新选择实现。
+`examples/run/weft.sh`中的selector只选择DSL source与相邻runtime，不是production lowering route。
 
 ## 仓库边界
 

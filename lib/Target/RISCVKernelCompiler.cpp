@@ -5,13 +5,13 @@
 #include "RISCVKernelCompiler.h"
 #include "RISCVKernelFacts.h"
 #include "RISCVPhysicalPlanning.h"
+#include "RISCVReuseAnalysis.h"
 
 #include "Weft/Dialect/Extension/IR/ExtensionDialect.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -2010,8 +2010,8 @@ private:
 
     F32DotCandidateFacts candidateFacts;
     candidateFacts.schedule = analyzeLocalScheduleDependences(
-        {dot.getLhs(), dot.getRhs()}, reductionAxis.getResult(), dot.getInit(),
-        dot.getResult());
+        kernelFacts, {dot.getLhs(), dot.getRhs()}, reductionAxis.getResult(),
+        dot.getInit(), dot.getResult());
     if (std::optional<int64_t> extent =
             integerConstantValue(decision.reductionExtent);
         extent && *extent >= 0)
@@ -6039,54 +6039,6 @@ private:
     return analysis;
   }
 
-  LocalScheduleDependenceFacts analyzeLocalScheduleDependences(
-      llvm::ArrayRef<mlir::Value> primitiveOperands,
-      mlir::Value reductionAxis, mlir::Value accumulator,
-      mlir::Value result) const {
-    LocalScheduleDependenceFacts facts;
-    if (primitiveOperands.empty() || !reductionAxis || !accumulator || !result)
-      return facts;
-    for (mlir::Value operand : primitiveOperands) {
-      LoadOp load = reloadableLoad(operand);
-      LocalOperandDependenceFacts operandFacts;
-      const MemoryAccessFact *access =
-          load ? memoryFact(load.getOperation()) : nullptr;
-      const LaneRelation relation =
-          access ? memoryRelation(*access, reductionAxis)
-                 : LaneRelation::NonAffine;
-      if (relation == LaneRelation::UnitStride)
-        operandFacts.memoryMode = PhysicalMemoryMode::UnitStride;
-      else if (relation == LaneRelation::Strided)
-        operandFacts.memoryMode = PhysicalMemoryMode::Strided;
-      else if (relation == LaneRelation::Indexed)
-        operandFacts.memoryMode = PhysicalMemoryMode::Indexed;
-      operandFacts.advancesIteration =
-          load ? valueDependsOnAxis(load.getPointer(), reductionAxis)
-               : valueDependsOnAxis(operand, reductionAxis);
-      operandFacts.feedsPrimitive =
-          !load || valueDependsOn(operand, load.getResult());
-      operandFacts.addressDependsOnAccumulator =
-          load ? valueDependsOn(load.getPointer(), accumulator)
-               : valueDependsOn(operand, accumulator);
-      operandFacts.predicateDependsOnAccumulator =
-          load && valueDependsOn(load.getWhere(), accumulator);
-      auto value = kernelFacts.values.find(operand);
-      if (value != kernelFacts.values.end()) {
-        operandFacts.consumerCount = value->second.consumers.size();
-        operandFacts.crossesControl =
-            value->second.crossesRegion || value->second.controlCarried;
-      }
-      facts.operands.push_back(operandFacts);
-    }
-    auto resultFacts = kernelFacts.values.find(result);
-    if (resultFacts != kernelFacts.values.end()) {
-      facts.resultConsumerCount = resultFacts->second.consumers.size();
-      facts.resultCrossesControl = resultFacts->second.crossesRegion ||
-                                  resultFacts->second.controlCarried;
-    }
-    return facts;
-  }
-
   mlir::FailureOr<PlannedPhysicalDecision<DotDecision>>
   decideLocalF32Dot(DotOp dot) {
     BlockType resultType = mlir::dyn_cast<BlockType>(
@@ -6197,7 +6149,7 @@ private:
     }
     F32DotCandidateFacts candidateFacts;
     candidateFacts.schedule = analyzeLocalScheduleDependences(
-        {dot.getLhs(), dot.getRhs()}, reductionCoordinate,
+        kernelFacts, {dot.getLhs(), dot.getRhs()}, reductionCoordinate,
         dot.getInit(), dot.getResult());
     candidateFacts.reductionExtent = reduction->staticExtent;
     reductionConstraint->allowLane = true;
@@ -9555,8 +9507,8 @@ private:
     candidateFacts.rhsFreeAxis = projectedRHSFree->physicalAxis;
     candidateFacts.reductionAxis = projectedReduction->physicalAxis;
     candidateFacts.schedule = analyzeLocalScheduleDependences(
-        {matmul.getLhs(), matmul.getRhs()},
-        reductionCoordinate, matmul.getInit(), matmul.getResult());
+        kernelFacts, {matmul.getLhs(), matmul.getRhs()}, reductionCoordinate,
+        matmul.getInit(), matmul.getResult());
     candidateFacts.nLaneStrided =
         rhsFree->rhsRelation == LaneRelation::Strided;
     std::optional<SelectedF16MatmulPhysical> selected =
