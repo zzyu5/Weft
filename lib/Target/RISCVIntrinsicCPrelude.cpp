@@ -185,48 +185,34 @@ void emitIntrinsicCPrelude(llvm::raw_ostream &output,
                            const SelectedLocalImplementations &implementations) {
   bool usesExp =
       implementations.contains(LocalPrimitiveKind::F32Math);
-  bool usesRVVSymmetricI4I8 = implementations.contains(
-      {LocalPrimitiveKind::SymmetricI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 16, 1});
-  bool usesRVVAffineI4I8 = implementations.contains(
-      {LocalPrimitiveKind::AffineI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 16, 1});
-  bool usesRVVSymmetricI4I8M4 = implementations.contains(
-      {LocalPrimitiveKind::SymmetricI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 16, 4});
-  bool usesRVVAffineI4I8M4 = implementations.contains(
-      {LocalPrimitiveKind::AffineI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 16, 4});
-  bool usesIME1SymmetricI4I8 = implementations.contains(
-      {LocalPrimitiveKind::SymmetricI4I8,
-       CoreInstructionKind::SpacemitIME1MMA, 0, 1});
-  bool usesIME1AffineI4I8 = implementations.contains(
-      {LocalPrimitiveKind::AffineI4I8,
-       CoreInstructionKind::SpacemitIME1MMA, 0, 1});
-  bool usesIME1SymmetricI4I8M4 = implementations.contains(
-      {LocalPrimitiveKind::SymmetricI4I8,
-       CoreInstructionKind::SpacemitIME1MMA, 0, 4});
-  bool usesIME1AffineI4I8M4 = implementations.contains(
-      {LocalPrimitiveKind::AffineI4I8,
-       CoreInstructionKind::SpacemitIME1MMA, 0, 4});
-  bool usesGroupedI4I8RegisterL16 = implementations.contains(
-      {LocalPrimitiveKind::GroupedAffineI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 16, 0, kRVVE8M1, 0});
-  bool usesGroupedI4I8RegisterL32 = implementations.contains(
-      {LocalPrimitiveKind::GroupedAffineI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 32, 0, kRVVE8M1, 0});
-  bool usesGroupedI4I8Strip = implementations.contains(
-      {LocalPrimitiveKind::GroupedAffineI4I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {}, 1});
-  bool usesE2M1RegisterE8M1M2 = implementations.contains(
-      {LocalPrimitiveKind::E2M1E8M0I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, kRVVE8M1, 0});
-  bool usesE2M1RegisterE8MF2 = implementations.contains(
-      {LocalPrimitiveKind::E2M1E8M0I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {8, 4}, 0});
-  bool usesE2M1Strip = implementations.contains(
-      {LocalPrimitiveKind::E2M1E8M0I8,
-       CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {}, 1});
+  bool usesRVVSymmetricI4I8 = implementations.containsSymbol(
+      "__weft_rvv_symmetric_i4_i8_n16_k32");
+  bool usesRVVAffineI4I8 = implementations.containsSymbol(
+      "__weft_rvv_affine_i4_i8_n16_k32");
+  bool usesRVVSymmetricI4I8M4 = implementations.containsSymbol(
+      "__weft_rvv_symmetric_i4_i8_m4_n16_k32");
+  bool usesRVVAffineI4I8M4 = implementations.containsSymbol(
+      "__weft_rvv_affine_i4_i8_m4_n16_k32");
+  bool usesIME1SymmetricI4I8 = implementations.containsSymbol(
+      "__weft_ime1_symmetric_i4_i8_n16_k32");
+  bool usesIME1AffineI4I8 = implementations.containsSymbol(
+      "__weft_ime1_affine_i4_i8_n16_k32");
+  bool usesIME1SymmetricI4I8M4 = implementations.containsSymbol(
+      "__weft_ime1_symmetric_i4_i8_m4_n16_k32");
+  bool usesIME1AffineI4I8M4 = implementations.containsSymbol(
+      "__weft_ime1_affine_i4_i8_m4_n16_k32");
+  bool usesGroupedI4I8RegisterL16 = implementations.containsSymbol(
+      "__weft_grouped_affine_i4_i8_register_l16_e8m1");
+  bool usesGroupedI4I8RegisterL32 = implementations.containsSymbol(
+      "__weft_grouped_affine_i4_i8_register_l32_e8m1");
+  bool usesGroupedI4I8Strip = implementations.containsSymbol(
+      "__weft_grouped_affine_i4_i8_strip");
+  bool usesE2M1RegisterE8M1M2 = implementations.containsSymbol(
+      "__weft_e2m1_e8m0_i8_register_e8m1_e8m2");
+  bool usesE2M1RegisterE8MF2 = implementations.containsSymbol(
+      "__weft_e2m1_e8m0_i8_register_e8mf2");
+  bool usesE2M1Strip = implementations.containsSymbol(
+      "__weft_e2m1_e8m0_i8_strip");
   emitPrelude(output, usesExp, usesRVVSymmetricI4I8, usesRVVAffineI4I8,
               usesRVVSymmetricI4I8M4, usesRVVAffineI4I8M4,
               usesIME1SymmetricI4I8, usesIME1AffineI4I8,

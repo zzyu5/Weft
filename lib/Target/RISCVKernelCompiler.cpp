@@ -7741,7 +7741,7 @@ private:
         accumulator.spelling.empty())
       return op.emitError(
           "selected symmetric i4/i8 fragment operands are unavailable");
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper = decision.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("symmetric i4/i8 leaf spelling was not selected");
     std::string scaleSpelling =
@@ -8150,7 +8150,7 @@ private:
       return op.emitError(
           "selected E2M1/E8M0 i8 dot operands are unavailable");
 
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper = decision.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("E2M1/E8M0 leaf spelling was not selected");
     std::string result = fresh("e2m1_dot");
@@ -8243,7 +8243,7 @@ private:
           "grouped affine i4/i8 dot operands are not materialized locally");
 
     std::string result = fresh("grouped_dot");
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper = decision.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("grouped affine i4/i8 leaf spelling was not selected");
     line("const float " + result + " = " + helper + "(" +
@@ -8317,7 +8317,7 @@ private:
       operands.push_back(std::move(value.spelling));
     }
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("ternary/i8 leaf spelling was not selected");
     std::string result = fresh("ternary_dot");
@@ -8406,7 +8406,7 @@ private:
           "signed codebook/i8 operands are not materialized locally");
 
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError(
           "signed codebook/i8 leaf spelling was not selected");
@@ -8495,7 +8495,7 @@ private:
           "packed u9/u7 codebook/i8 operands are not materialized locally");
 
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError(
           "packed u9/u7 codebook/i8 leaf spelling was not selected");
@@ -8584,7 +8584,7 @@ private:
           "packed u11 grid-delta/i8 operands are not materialized locally");
 
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError(
           "packed u11 grid-delta/i8 leaf spelling was not selected");
@@ -8663,7 +8663,7 @@ private:
           "nibble codebook/i8 operands are not materialized locally");
 
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError(
           "nibble codebook/i8 leaf spelling was not selected");
@@ -8737,7 +8737,7 @@ private:
     }
     std::string result = fresh("quant_dot");
     std::string helper =
-        localImplementationName(decision.physical.implementation);
+        decision.physical.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("quant/i8 leaf spelling was not selected");
     line("const float " + result + " = " + helper + "(" +
@@ -8850,7 +8850,7 @@ private:
         accumulator.spelling.empty())
       return op.emitError(
           "selected affine i4/i8 fragment operands are unavailable");
-    std::string helper = localImplementationName(decision.implementation);
+    std::string helper = decision.implementation.helperSymbol;
     if (helper.empty())
       return op.emitError("affine i4/i8 leaf spelling was not selected");
     std::string scaleSpelling =

@@ -47,100 +47,54 @@ void emitI32Table(llvm::raw_ostream &output, llvm::StringRef name,
 
 void emitQuantLocalImplementations(llvm::raw_ostream &output,
                                    const SelectedLocalImplementations &selected) {
-  auto reg = [&](LocalPrimitiveKind primitive, CoreInstructionKind instruction,
-                 unsigned lanes, RVVVectorShape shape) {
-    return selected.contains(
-        {primitive, instruction, lanes, 0, shape, 0});
-  };
-  auto strip = [&](LocalPrimitiveKind primitive) {
-    return selected.contains(
-        {primitive, CoreInstructionKind::RVVWideningIntegerDot, 0, 0, {}, 1});
-  };
-  const bool iq2Register32 =
-      reg(LocalPrimitiveKind::IQ2SI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
-  const bool iq2Register64 =
-      reg(LocalPrimitiveKind::IQ2SI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 64, {8, 16});
-  const bool iq2Strip = strip(LocalPrimitiveKind::IQ2SI8);
-  const bool iq3Register64 =
-      reg(LocalPrimitiveKind::IQ3SI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 64, {8, 16});
-  const bool iq3Strip = strip(LocalPrimitiveKind::IQ3SI8);
-  const bool iq1Register32 =
-      reg(LocalPrimitiveKind::IQ1MI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
-  const bool iq1Register64 =
-      reg(LocalPrimitiveKind::IQ1MI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 64, {8, 16});
-  const bool iq1Strip = strip(LocalPrimitiveKind::IQ1MI8);
-  const bool q6Register32 =
-      reg(LocalPrimitiveKind::Q6KI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
-  const bool q6Register64 =
-      reg(LocalPrimitiveKind::Q6KI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 64, {8, 16});
-  const bool q6Strip = strip(LocalPrimitiveKind::Q6KI8);
-  const bool packedI4E8M2 =
-      reg(LocalPrimitiveKind::PackedI4I8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
-  const bool packedI4E8M1 =
-      reg(LocalPrimitiveKind::PackedI4I8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 8});
-  const bool packedI5E8M2 =
-      reg(LocalPrimitiveKind::PackedI5I8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
-  const bool packedI5E8M1 =
-      reg(LocalPrimitiveKind::PackedI5I8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 8});
+  auto has = [&](const char *symbol) { return selected.containsSymbol(symbol); };
+  const bool iq2Register32 = has("__weft_iq2_s_i8_register_l32_e8m2");
+  const bool iq2Register64 = has("__weft_iq2_s_i8_register_l64_e8m2");
+  const bool iq2Strip = has("__weft_iq2_s_i8_strip");
+  const bool iq3Register64 = has("__weft_iq3_s_i8_register_l64_e8m2");
+  const bool iq3Strip = has("__weft_iq3_s_i8_strip");
+  const bool iq1Register32 = has("__weft_iq1_m_i8_register_l32_e8m2");
+  const bool iq1Register64 = has("__weft_iq1_m_i8_register_l64_e8m2");
+  const bool iq1Strip = has("__weft_iq1_m_i8_strip");
+  const bool q6Register32 = has("__weft_q6_k_i8_register_l32_e8m2");
+  const bool q6Register64 = has("__weft_q6_k_i8_register_l64_e8m2");
+  const bool q6Strip = has("__weft_q6_k_i8_strip");
+  const bool packedI4E8M2 = has("__weft_packed_i4_i8_register_l32_e8m2");
+  const bool packedI4E8M1 = has("__weft_packed_i4_i8_register_l32_e8m1");
+  const bool packedI5E8M2 = has("__weft_packed_i5_i8_register_l32_e8m2");
+  const bool packedI5E8M1 = has("__weft_packed_i5_i8_register_l32_e8m1");
   const bool packedI3L32 =
-      reg(LocalPrimitiveKind::PackedI3GroupedI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
+      has("__weft_packed_i3_grouped_i8_register_l32_e8m2");
   const bool packedI3L64 =
-      reg(LocalPrimitiveKind::PackedI3GroupedI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 64, {8, 16});
+      has("__weft_packed_i3_grouped_i8_register_l64_e8m2");
   const bool nibbleE8M2 =
-      reg(LocalPrimitiveKind::NibbleCodebookI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
+      has("__weft_nibble_codebook_i8_register_l32_e8m2");
   const bool nibbleE8M1 =
-      reg(LocalPrimitiveKind::NibbleCodebookI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 8});
+      has("__weft_nibble_codebook_i8_register_l32_e8m1");
   const bool base3E8M2 =
-      reg(LocalPrimitiveKind::Base3TernaryI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
+      has("__weft_base3_ternary_i8_register_l32_e8m2");
   const bool base3E8M1 =
-      reg(LocalPrimitiveKind::Base3TernaryI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 8});
+      has("__weft_base3_ternary_i8_register_l32_e8m1");
   const bool packedI2E8M2 =
-      reg(LocalPrimitiveKind::PackedI2TernaryI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 16});
+      has("__weft_packed_i2_ternary_i8_register_l32_e8m2");
   const bool packedI2E8M1 =
-      reg(LocalPrimitiveKind::PackedI2TernaryI8,
-          CoreInstructionKind::RVVWideningIntegerDot, 32, {8, 8});
+      has("__weft_packed_i2_ternary_i8_register_l32_e8m1");
   const bool signed8E8M2 =
-      reg(LocalPrimitiveKind::SignedCodebook8I8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 16});
+      has("__weft_signed_codebook8_i8_register_l32_e8m2");
   const bool signed8E8M1 =
-      reg(LocalPrimitiveKind::SignedCodebook8I8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 8});
+      has("__weft_signed_codebook8_i8_register_l32_e8m1");
   const bool signed4E8M2 =
-      reg(LocalPrimitiveKind::SignedCodebook4I8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 16});
+      has("__weft_signed_codebook4_i8_register_l32_e8m2");
   const bool signed4E8M1 =
-      reg(LocalPrimitiveKind::SignedCodebook4I8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 8});
+      has("__weft_signed_codebook4_i8_register_l32_e8m1");
   const bool packedU9U7E8M2 =
-      reg(LocalPrimitiveKind::PackedU9U7CodebookI8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 16});
+      has("__weft_packed_u9_u7_codebook_i8_register_l32_e8m2");
   const bool packedU9U7E8M1 =
-      reg(LocalPrimitiveKind::PackedU9U7CodebookI8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 8});
+      has("__weft_packed_u9_u7_codebook_i8_register_l32_e8m1");
   const bool packedU11E8M2 =
-      reg(LocalPrimitiveKind::PackedU11GridDeltaI8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 16});
+      has("__weft_packed_u11_grid_delta_i8_register_l32_e8m2");
   const bool packedU11E8M1 =
-      reg(LocalPrimitiveKind::PackedU11GridDeltaI8,
-          CoreInstructionKind::RVVIndexedGather, 32, {8, 8});
+      has("__weft_packed_u11_grid_delta_i8_register_l32_e8m1");
   if (!iq2Register32 && !iq2Register64 && !iq2Strip &&
       !iq3Register64 && !iq3Strip && !iq1Register32 &&
       !iq1Register64 && !iq1Strip && !q6Register32 &&

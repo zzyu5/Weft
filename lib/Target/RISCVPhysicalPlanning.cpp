@@ -1,6 +1,7 @@
 #include "RISCVPhysicalPlanning.h"
 
 #include "RISCVKernelFacts.h"
+#include "RISCVRVVSpelling.h"
 
 #include "llvm/ADT/STLExtras.h"
 
@@ -170,6 +171,94 @@ static bool validateLocalInstructionMapping(
             (strip && lanes == 16 && primary == RVVVectorShape{8, 16}));
   }
   return false;
+}
+
+static std::string
+selectLocalImplementationSymbol(const LocalImplementation &implementation) {
+  const RVVVectorShape primary = implementation.valueShapes.empty()
+                                     ? RVVVectorShape{}
+                                     : implementation.valueShapes.front();
+  const unsigned lanes = localLaneFactor(implementation);
+  const unsigned hardwareLanes =
+      mappedHardwareLaneFactor(implementation.mapping);
+  const unsigned rows =
+      implementation.mapping.instruction == CoreInstructionKind::SpacemitIME1MMA
+          ? localFragmentFactor(implementation, kCoreAxisM)
+          : localRegisterFactor(implementation, kCoreAxisM);
+  const bool sequential =
+      localSequentialFactor(implementation, kCoreAxisK) > 1;
+  const std::string shape = rvvShapeSuffix(primary);
+  const std::string registerSuffix =
+      "_register_l" + std::to_string(lanes) + "_e" + shape;
+  switch (implementation.primitive) {
+  case LocalPrimitiveKind::None:
+  case LocalPrimitiveKind::F32Math:
+    return {};
+  case LocalPrimitiveKind::SymmetricI4I8:
+  case LocalPrimitiveKind::AffineI4I8: {
+    const bool affine =
+        implementation.primitive == LocalPrimitiveKind::AffineI4I8;
+    const bool ime = implementation.mapping.instruction ==
+                     CoreInstructionKind::SpacemitIME1MMA;
+    std::string name = "__weft_" + std::string(ime ? "ime1_" : "rvv_") +
+                       (affine ? "affine" : "symmetric") + "_i4_i8_";
+    if (rows == 4)
+      name += "m4_";
+    return name + "n16_k32";
+  }
+  case LocalPrimitiveKind::GroupedAffineI4I8:
+    return sequential
+               ? "__weft_grouped_affine_i4_i8_strip"
+               : "__weft_grouped_affine_i4_i8_register_l" +
+                     std::to_string(hardwareLanes) + "_e" + shape;
+  case LocalPrimitiveKind::E2M1E8M0I8:
+    if (sequential)
+      return "__weft_e2m1_e8m0_i8_strip";
+    return primary == RVVVectorShape{8, 4}
+               ? "__weft_e2m1_e8m0_i8_register_e8mf2"
+               : "__weft_e2m1_e8m0_i8_register_e8m1_e8m2";
+  case LocalPrimitiveKind::PackedI4I8:
+    return "__weft_packed_i4_i8" + registerSuffix;
+  case LocalPrimitiveKind::PackedI5I8:
+    return "__weft_packed_i5_i8" + registerSuffix;
+  case LocalPrimitiveKind::PackedI3GroupedI8:
+    return "__weft_packed_i3_grouped_i8" + registerSuffix;
+  case LocalPrimitiveKind::Base3TernaryI8:
+    return "__weft_base3_ternary_i8" + registerSuffix;
+  case LocalPrimitiveKind::PackedI2TernaryI8:
+    return "__weft_packed_i2_ternary_i8" + registerSuffix;
+  case LocalPrimitiveKind::SignedCodebook8I8:
+    return "__weft_signed_codebook8_i8" + registerSuffix;
+  case LocalPrimitiveKind::SignedCodebook4I8:
+    return "__weft_signed_codebook4_i8" + registerSuffix;
+  case LocalPrimitiveKind::PackedU9U7CodebookI8:
+    return "__weft_packed_u9_u7_codebook_i8" + registerSuffix;
+  case LocalPrimitiveKind::PackedU11GridDeltaI8:
+    return "__weft_packed_u11_grid_delta_i8" + registerSuffix;
+  case LocalPrimitiveKind::NibbleCodebookI8:
+    return "__weft_nibble_codebook_i8" + registerSuffix;
+  case LocalPrimitiveKind::IQ2SI8:
+    return sequential ? "__weft_iq2_s_i8_strip"
+                      : "__weft_iq2_s_i8" + registerSuffix;
+  case LocalPrimitiveKind::IQ3SI8:
+    return sequential ? "__weft_iq3_s_i8_strip"
+                      : "__weft_iq3_s_i8" + registerSuffix;
+  case LocalPrimitiveKind::IQ1MI8:
+    return sequential ? "__weft_iq1_m_i8_strip"
+                      : "__weft_iq1_m_i8" + registerSuffix;
+  case LocalPrimitiveKind::Q6KI8:
+    return sequential ? "__weft_q6_k_i8_strip"
+                      : "__weft_q6_k_i8" + registerSuffix;
+  }
+  return {};
+}
+
+static bool finalizeLocalInstructionMapping(LocalImplementation &implementation) {
+  if (!validateLocalInstructionMapping(implementation))
+    return false;
+  implementation.helperSymbol = selectLocalImplementationSymbol(implementation);
+  return implementation.primitive == LocalPrimitiveKind::F32Math ||
+         !implementation.helperSymbol.empty();
 }
 
 bool fitsPrivateStorage(int64_t elements, unsigned elementBytes,
@@ -780,7 +869,7 @@ selectF32MathLocalImplementation(const RISCVTargetProfile &target) {
     implementation.primitive = LocalPrimitiveKind::F32Math;
     implementation.mapping = std::move(mapping);
     implementation.valueShapes = {kRVVE32M2};
-    if (validateLocalInstructionMapping(implementation))
+    if (finalizeLocalInstructionMapping(implementation))
       return implementation;
   }
   return std::nullopt;
@@ -853,7 +942,7 @@ selectI4I8FragmentPhysical(const I4I8FragmentCandidateFacts &facts,
     selected.implementation.mapping = std::move(mapping);
     selected.implementation.valueShapes = {selected.codeShape,
                                            selected.accumulatorShape};
-    if (!validateLocalInstructionMapping(selected.implementation))
+    if (!finalizeLocalInstructionMapping(selected.implementation))
       continue;
     const PhysicalAxisDecomposition *mappedRows =
         findAxisMapping(selected.implementation.mapping, kCoreAxisM);
@@ -1333,7 +1422,7 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
     implementation.primitive = primitive;
     implementation.mapping = mapping;
     implementation.valueShapes = {mapping.laneShape, *byte16};
-    if (!validateLocalInstructionMapping(implementation))
+    if (!finalizeLocalInstructionMapping(implementation))
       continue;
     QuantDecodeResourceFacts resources;
     resources.loadedValues = {
@@ -1428,7 +1517,7 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
     implementation.mapping = mapping;
     implementation.valueShapes = {mapping.laneShape, *tableShape};
     implementation.entryWidth = facts.entryWidth;
-    if (!validateLocalInstructionMapping(implementation))
+    if (!finalizeLocalInstructionMapping(implementation))
       continue;
     QuantDecodeResourceFacts resources;
     resources.loadedValues = {
@@ -1497,7 +1586,7 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
     implementation.primitive = LocalPrimitiveKind::NibbleCodebookI8;
     implementation.mapping = mapping;
     implementation.valueShapes = {mapping.laneShape, *packedShape};
-    if (!validateLocalInstructionMapping(implementation))
+    if (!finalizeLocalInstructionMapping(implementation))
       continue;
     QuantDecodeResourceFacts resources;
     resources.loadedValues = {
@@ -1579,7 +1668,7 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
     implementation.primitive = primitive;
     implementation.mapping = mapping;
     implementation.valueShapes = {mapping.laneShape};
-    if (!validateLocalInstructionMapping(implementation))
+    if (!finalizeLocalInstructionMapping(implementation))
       continue;
     const PhysicalAxisDecomposition *reduction =
         findAxisMapping(mapping, kCoreAxisK);
@@ -1651,7 +1740,7 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
       implementation.valueShapes = {mapping.laneShape};
       if (activationShape)
         implementation.valueShapes.push_back(activationShape);
-      if (!validateLocalInstructionMapping(implementation))
+      if (!finalizeLocalInstructionMapping(implementation))
         continue;
       const unsigned logicalLanes =
           reduction->laneFactor * reduction->registerFactor;
@@ -1764,7 +1853,7 @@ selectGroupedAffineI4I8Physical(
     candidate.implementation.mapping = mapping;
     candidate.implementation.valueShapes = {candidate.packedShape,
                                             candidate.widenedShape};
-    if (!validateLocalInstructionMapping(candidate.implementation))
+    if (!finalizeLocalInstructionMapping(candidate.implementation))
       continue;
     const bool registerAsm =
         reduction->sequentialFactor == 1 && reduction->laneFactor == 16;

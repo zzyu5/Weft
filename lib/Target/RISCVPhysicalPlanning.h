@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <tuple>
 
 namespace weft::riscv_internal {
@@ -478,13 +479,15 @@ struct LocalImplementation {
   CorePhysicalMapping mapping;
   llvm::SmallVector<RVVVectorShape, 4> valueShapes;
   unsigned entryWidth = 0;
+  std::string helperSymbol;
 
   explicit operator bool() const {
     return primitive != LocalPrimitiveKind::None && mapping;
   }
   bool operator==(const LocalImplementation &other) const {
     return primitive == other.primitive && mapping == other.mapping &&
-           valueShapes == other.valueShapes && entryWidth == other.entryWidth;
+           valueShapes == other.valueShapes && entryWidth == other.entryWidth &&
+           helperSymbol == other.helperSymbol;
   }
   bool operator<(const LocalImplementation &other) const {
     if (primitive != other.primitive)
@@ -495,7 +498,9 @@ struct LocalImplementation {
       return std::lexicographical_compare(valueShapes.begin(), valueShapes.end(),
                                           other.valueShapes.begin(),
                                           other.valueShapes.end());
-    return entryWidth < other.entryWidth;
+    if (entryWidth != other.entryWidth)
+      return entryWidth < other.entryWidth;
+    return helperSymbol < other.helperSymbol;
   }
 };
 
