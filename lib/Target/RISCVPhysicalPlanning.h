@@ -695,10 +695,10 @@ enum class TernaryI8DotSemantic {
 };
 
 struct TernaryI8DotCandidateFacts {
+  CoreMappingProblem mapping;
   TernaryI8DotSemantic semantic = TernaryI8DotSemantic::Base3Digits;
   unsigned primaryExtent = 0;
   unsigned secondaryExtent = 0;
-  unsigned activationExtent = 0;
 };
 
 enum class TernaryDecodeTopology {
@@ -719,6 +719,7 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
                            const RISCVTargetProfile &target);
 
 struct CodebookGatherI8CandidateFacts {
+  CoreMappingProblem mapping;
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
   unsigned codeByteExtent = 0;
   unsigned entryWidth = 0;
@@ -743,8 +744,15 @@ struct SelectedNibbleCodebookI8Physical {
   PhysicalResourceBudget resources;
 };
 
+struct NibbleCodebookI8CandidateFacts {
+  CoreMappingProblem mapping;
+  unsigned packedExtent = 0;
+  unsigned tableExtent = 0;
+};
+
 std::optional<SelectedNibbleCodebookI8Physical>
-selectNibbleCodebookI8Physical(const RISCVTargetProfile &target);
+selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
+                               const RISCVTargetProfile &target);
 
 enum class QuantI8DotSemantic {
   PackedI4,
@@ -757,8 +765,8 @@ enum class QuantI8DotSemantic {
 };
 
 struct QuantI8DotCandidateFacts {
+  CoreMappingProblem mapping;
   QuantI8DotSemantic semantic = QuantI8DotSemantic::IQ2S;
-  unsigned semanticExtent = 256;
 };
 
 struct SelectedQuantI8DotPhysical {
@@ -778,8 +786,14 @@ struct SelectedE2M1E8M0I8Physical {
   PhysicalResourceBudget resources;
 };
 
+struct E2M1E8M0I8CandidateFacts {
+  CoreMappingProblem mapping;
+  unsigned packedExtent = 0;
+};
+
 std::optional<SelectedE2M1E8M0I8Physical>
-selectE2M1E8M0I8Physical(const RISCVTargetProfile &target);
+selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
+                         const RISCVTargetProfile &target);
 
 struct GroupedAffineI4I8CandidateFacts {
   CoreMappingProblem mapping;

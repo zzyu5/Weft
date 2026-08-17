@@ -861,6 +861,16 @@ CoreMappingProblem groupedAffineI4I8Mapping() {
   return problem;
 }
 
+CoreMappingProblem localReductionMapping(uint64_t extent) {
+  CoreMappingProblem problem;
+  problem.axes = {LogicalAxisConstraint{
+      kCoreAxisK, LogicalAxisRole::Reduction, extent, false, true, true,
+      registerFactorCandidates(extent,
+                               static_cast<unsigned>(
+                                   std::min<uint64_t>(extent, 8)))}};
+  return problem;
+}
+
 class KernelCompiler {
 public:
   KernelCompiler(KernelOp kernel, const RISCVLoweringOptions &options,
@@ -1253,7 +1263,7 @@ private:
               {op.getPackedCodes(), op.getActivation()},
               {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
                op.getInit()},
-              planned.realization, 32))) {
+              planned.realization))) {
         decisionFailure = true;
         return;
       }
@@ -1270,7 +1280,7 @@ private:
               {op.getLowBits(), op.getHighBits(), op.getActivation()},
               {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
                op.getInit()},
-              planned.realization, 32))) {
+              planned.realization))) {
         decisionFailure = true;
         return;
       }
@@ -8472,9 +8482,17 @@ private:
     if (!packedCodes || !activation)
       return op.emitError(
           "E2M1/E8M0 i8 dot requires contiguous all-active local block memory facts");
+    if (packedCodes->semanticExtent != 16 ||
+        activation->semanticExtent != 32)
+      return op.emitError(
+          "E2M1/E8M0 i8 dot requires sixteen packed codes and thirty-two activations");
 
     std::optional<SelectedE2M1E8M0I8Physical> selected =
-        selectE2M1E8M0I8Physical(options.target);
+        selectE2M1E8M0I8Physical(
+            {localReductionMapping(
+                 static_cast<uint64_t>(activation->semanticExtent)),
+             static_cast<unsigned>(packedCodes->semanticExtent)},
+            options.target);
     if (!selected)
       return op.emitError(
           "E2M1/E8M0 i8 dot has no resource-legal RVV realization for the target");
@@ -8651,14 +8669,14 @@ private:
       facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
       facts.secondaryExtent =
           static_cast<unsigned>(decision.blocks[1].semanticExtent);
-      facts.activationExtent =
-          static_cast<unsigned>(decision.blocks[2].semanticExtent);
+      facts.mapping = localReductionMapping(
+          static_cast<uint64_t>(decision.blocks[2].semanticExtent));
     } else {
       if (decision.blocks.size() != 2)
         return op.emitError("packed ternary/i8 dot requires two block operands");
       facts.primaryExtent = static_cast<unsigned>(decision.blocks[0].semanticExtent);
-      facts.activationExtent =
-          static_cast<unsigned>(decision.blocks[1].semanticExtent);
+      facts.mapping = localReductionMapping(
+          static_cast<uint64_t>(decision.blocks[1].semanticExtent));
     }
     std::optional<SelectedTernaryI8DotPhysical> selected =
         weft::riscv_internal::selectTernaryI8DotPhysical(facts, options.target);
@@ -8734,7 +8752,9 @@ private:
                         : LocalPrimitiveKind::SignedCodebook4I8;
     std::optional<SelectedCodebookGatherI8Physical> selected =
         selectCodebookGatherI8Physical(
-            {primitive, static_cast<unsigned>(codes->semanticExtent),
+            {localReductionMapping(
+                 static_cast<uint64_t>(activation->semanticExtent)),
+             primitive, static_cast<unsigned>(codes->semanticExtent),
              entryWidth},
             options.target);
     if (!selected)
@@ -8822,7 +8842,9 @@ private:
           "packed u9/u7 codebook/i8 dot requires eight packed bytes and thirty-two activations");
     std::optional<SelectedCodebookGatherI8Physical> selected =
         selectCodebookGatherI8Physical(
-            {LocalPrimitiveKind::PackedU9U7CodebookI8, 8, 8},
+            {localReductionMapping(
+                 static_cast<uint64_t>(activation->semanticExtent)),
+             LocalPrimitiveKind::PackedU9U7CodebookI8, 8, 8},
             options.target);
     if (!selected)
       return op.emitError(
@@ -8911,7 +8933,9 @@ private:
           "packed u11 grid-delta/i8 dot requires four code bytes and thirty-two activations");
     std::optional<SelectedCodebookGatherI8Physical> selected =
         selectCodebookGatherI8Physical(
-            {LocalPrimitiveKind::PackedU11GridDeltaI8, 4, 8},
+            {localReductionMapping(
+                 static_cast<uint64_t>(activation->semanticExtent)),
+             LocalPrimitiveKind::PackedU11GridDeltaI8, 4, 8},
             options.target);
     if (!selected)
       return op.emitError(
@@ -9000,7 +9024,12 @@ private:
       return op.emitError(
           "nibble codebook/i8 dot requires sixteen packed codes, sixteen table entries, and thirty-two activations");
     std::optional<SelectedNibbleCodebookI8Physical> selected =
-        selectNibbleCodebookI8Physical(options.target);
+        selectNibbleCodebookI8Physical(
+            {localReductionMapping(
+                 static_cast<uint64_t>(activation->semanticExtent)),
+             static_cast<unsigned>(packedCodes->semanticExtent),
+             static_cast<unsigned>(table->semanticExtent)},
+            options.target);
     if (!selected)
       return op.emitError(
           "nibble codebook/i8 dot has no legal target realization");
@@ -9068,15 +9097,8 @@ private:
       OpTy op, QuantI8DotSemantic semantic,
       llvm::ArrayRef<mlir::Value> blocks,
       llvm::ArrayRef<mlir::Value> scalars,
-      QuantI8DotDecision &decision, unsigned semanticExtent = 256) {
-    std::optional<SelectedQuantI8DotPhysical> selected =
-        weft::riscv_internal::selectQuantI8DotPhysical(
-            QuantI8DotCandidateFacts{semantic, semanticExtent}, options.target);
-    if (!selected)
-      return op.emitError(
-          "quant/i8 dot has no legal target realization");
+      QuantI8DotDecision &decision) {
     decision = QuantI8DotDecision{};
-    decision.physical = *selected;
     for (mlir::Value block : blocks) {
       auto fact = resolveLocalBlockMemoryFact(block);
       if (!fact)
@@ -9084,6 +9106,19 @@ private:
             "quant/i8 dot requires contiguous all-active local block memory facts");
       decision.blocks.push_back(*fact);
     }
+    if (decision.blocks.empty() || decision.blocks.back().semanticExtent <= 0)
+      return op.emitError("quant/i8 dot has no activation reduction domain");
+    std::optional<SelectedQuantI8DotPhysical> selected =
+        weft::riscv_internal::selectQuantI8DotPhysical(
+            QuantI8DotCandidateFacts{
+                localReductionMapping(static_cast<uint64_t>(
+                    decision.blocks.back().semanticExtent)),
+                semantic},
+            options.target);
+    if (!selected)
+      return op.emitError(
+          "quant/i8 dot has no legal target realization");
+    decision.physical = *selected;
     decision.scalars.append(scalars.begin(), scalars.end());
     return mlir::success();
   }

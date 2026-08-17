@@ -453,69 +453,35 @@ static bool isPackedI3GroupedLocalImplementationMapping(
                         segmentProductShape).empty();
 }
 
-static llvm::SmallVector<CorePhysicalMapping, 16>
-enumerateRVVLocalMappings(CoreInstructionKind instruction, unsigned laneAxis,
-                          unsigned semanticExtent, unsigned laneSEW,
-                          unsigned rowExtent,
-                          llvm::ArrayRef<RVVVectorShape> laneShapes,
-                          const RISCVTargetProfile &target) {
-  if ((laneAxis != kCoreAxisN && laneAxis != kCoreAxisK) ||
-      semanticExtent == 0 || rowExtent == 0)
-    return {};
-  llvm::SmallVector<unsigned, 4> repetitions =
-      registerFactorCandidates(semanticExtent,
-                               std::min(semanticExtent, 8u));
-  CoreMappingProblem problem;
-  problem.axes = {
-      LogicalAxisConstraint{kCoreAxisM, LogicalAxisRole::Free, rowExtent,
-                            false, false, false, {rowExtent}},
-      LogicalAxisConstraint{kCoreAxisN, LogicalAxisRole::Free,
-                            laneAxis == kCoreAxisN
-                                ? std::optional<uint64_t>(semanticExtent)
-                                : std::optional<uint64_t>(1),
-                            false, laneAxis == kCoreAxisN,
-                            laneAxis == kCoreAxisN,
-                            laneAxis == kCoreAxisN ? repetitions
-                                                   : llvm::SmallVector<unsigned, 4>{1}},
-      LogicalAxisConstraint{kCoreAxisK, LogicalAxisRole::Reduction,
-                            laneAxis == kCoreAxisK
-                                ? std::optional<uint64_t>(semanticExtent)
-                                : std::optional<uint64_t>(1),
-                            false, laneAxis == kCoreAxisK,
-                            laneAxis == kCoreAxisK,
-                            laneAxis == kCoreAxisK ? repetitions
-                                                   : llvm::SmallVector<unsigned, 4>{1}}};
-  problem.laneSEW = laneSEW;
-  problem.laneInstruction = instruction;
-  problem.laneShapeCandidates.append(laneShapes.begin(), laneShapes.end());
-  llvm::SmallVector<CorePhysicalMapping, 16> mappings;
-  for (CorePhysicalMapping mapping :
-       enumerateCorePhysicalMappings(problem, target)) {
-    const PhysicalAxisDecomposition *axis =
-        findAxisMapping(mapping, laneAxis);
-    if (!axis || axis->laneFactor * axis->registerFactor > semanticExtent)
-      continue;
-    mappings.push_back(std::move(mapping));
-  }
-  return mappings;
-}
-
 struct LocalAxisMappingCandidate {
   CorePhysicalMapping mapping;
   PhysicalAxisDecomposition axis;
 };
 
 static llvm::SmallVector<LocalAxisMappingCandidate, 16>
-enumerateRVVLocalAxisMappings(CoreInstructionKind instruction,
-                              unsigned laneAxis, unsigned semanticExtent,
-                              unsigned laneSEW, unsigned rowExtent,
+enumerateRVVLocalAxisMappings(CoreMappingProblem problem,
+                              CoreInstructionKind instruction,
+                              unsigned laneAxis, unsigned laneSEW,
                               const RISCVTargetProfile &target) {
+  auto laneConstraint = llvm::find_if(
+      problem.axes, [&](const LogicalAxisConstraint &axis) {
+        return axis.id == laneAxis;
+      });
+  if (laneConstraint == problem.axes.end() || !laneConstraint->extent ||
+      *laneConstraint->extent == 0)
+    return {};
+  for (LogicalAxisConstraint &axis : problem.axes) {
+    axis.allowLane = axis.id == laneAxis;
+    axis.requireLane = axis.allowLane;
+  }
+  problem.laneSEW = laneSEW;
+  problem.laneInstruction = instruction;
   llvm::SmallVector<RVVVectorShape, 8> laneShapes =
       rvvShapeCandidates(target, laneSEW);
+  problem.laneShapeCandidates.assign(laneShapes.begin(), laneShapes.end());
   llvm::SmallVector<LocalAxisMappingCandidate, 16> candidates;
-  for (CorePhysicalMapping mapping : enumerateRVVLocalMappings(
-           instruction, laneAxis, semanticExtent, laneSEW, rowExtent,
-           laneShapes, target)) {
+  for (CorePhysicalMapping mapping :
+       enumerateCorePhysicalMappings(problem, target)) {
     const PhysicalAxisDecomposition *axis =
         findAxisMapping(mapping, laneAxis);
     if (!axis)
@@ -523,6 +489,16 @@ enumerateRVVLocalAxisMappings(CoreInstructionKind instruction,
     candidates.push_back({std::move(mapping), *axis});
   }
   return candidates;
+}
+
+static const LogicalAxisConstraint *
+findLogicalAxisConstraint(const CoreMappingProblem &problem, unsigned axis) {
+  auto found = llvm::find_if(
+      problem.axes,
+      [&](const LogicalAxisConstraint &constraint) {
+        return constraint.id == axis;
+      });
+  return found == problem.axes.end() ? nullptr : &*found;
 }
 
 static std::optional<LocalLeafDecision>
@@ -2152,15 +2128,20 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
       target.vlenBits < 128)
     return std::nullopt;
 
+  const LogicalAxisConstraint *reduction =
+      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+  if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
+      !reduction->extent)
+    return std::nullopt;
   switch (facts.semantic) {
   case TernaryI8DotSemantic::Base3Digits:
     if (facts.primaryExtent != 48 || facts.secondaryExtent != 4 ||
-        facts.activationExtent != 256)
+        *reduction->extent != 256)
       return std::nullopt;
     break;
   case TernaryI8DotSemantic::PackedI2Fields:
     if (facts.primaryExtent != 64 || facts.secondaryExtent != 0 ||
-        facts.activationExtent != 256)
+        *reduction->extent != 256)
       return std::nullopt;
     break;
   }
@@ -2181,8 +2162,8 @@ selectTernaryI8DotPhysical(const TernaryI8DotCandidateFacts &facts,
   };
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK,
-           facts.activationExtent, 8, 1, target)) {
+           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
+           kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     std::optional<RVVVectorShape> widened =
         rvvShapeForSameLanes(laneShape, 16, target);
@@ -2263,6 +2244,11 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
       !target.supportsVectorShape(kRVVE8M1.sew, kRVVE8M1.lmulEighths))
     return std::nullopt;
 
+  const LogicalAxisConstraint *reduction =
+      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+  if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
+      reduction->extent != std::optional<uint64_t>(32))
+    return std::nullopt;
   unsigned codeCount = 32 / facts.entryWidth;
   if (facts.codeByteExtent != codeCount &&
       facts.codeByteExtent != 2 * codeCount)
@@ -2288,7 +2274,7 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
   };
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVIndexedGather, kCoreAxisK, 32, 8, 1,
+           facts.mapping, CoreInstructionKind::RVVIndexedGather, kCoreAxisK, 8,
            target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     std::optional<RVVVectorShape> productShape =
@@ -2357,9 +2343,16 @@ selectCodebookGatherI8Physical(const CodebookGatherI8CandidateFacts &facts,
 }
 
 std::optional<SelectedNibbleCodebookI8Physical>
-selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
+selectNibbleCodebookI8Physical(const NibbleCodebookI8CandidateFacts &facts,
+                               const RISCVTargetProfile &target) {
   if (!target.hasRVV || !target.hasWideningInteger || !target.littleEndian ||
-      target.vlenBits < 128)
+      target.vlenBits < 128 || facts.packedExtent != 16 ||
+      facts.tableExtent != 16)
+    return std::nullopt;
+  const LogicalAxisConstraint *reduction =
+      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+  if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
+      reduction->extent != std::optional<uint64_t>(32))
     return std::nullopt;
   std::optional<RVVVectorShape> packedShape =
       rvvShapeForSemanticLanes(8, 16, target);
@@ -2373,8 +2366,8 @@ selectNibbleCodebookI8Physical(const RISCVTargetProfile &target) {
   };
   llvm::SmallVector<Candidate, 8> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK, 32, 8, 1,
-           target)) {
+           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
+           kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     const bool combined = candidate.axis.laneFactor == 32 &&
                           packedShape->lmulEighths >= 8 &&
@@ -2434,7 +2427,10 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
       !target.supportsVectorShape(kRVVE32M1.sew,
                                   kRVVE32M1.lmulEighths))
     return std::nullopt;
-  if (facts.semanticExtent == 0)
+  const LogicalAxisConstraint *reduction =
+      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+  if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
+      !reduction->extent || *reduction->extent == 0)
     return std::nullopt;
   LocalPrimitiveKind primitive = LocalPrimitiveKind::None;
   switch (facts.semantic) {
@@ -2469,8 +2465,8 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
   };
   llvm::SmallVector<Candidate, 16> legal;
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK,
-           facts.semanticExtent, 8, 1, target)) {
+           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
+           kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     LocalImplementation implementation;
     implementation.primitive = primitive;
@@ -2709,8 +2705,15 @@ selectQuantI8DotPhysical(const QuantI8DotCandidateFacts &facts,
 }
 
 std::optional<SelectedE2M1E8M0I8Physical>
-selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
-  if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian)
+selectE2M1E8M0I8Physical(const E2M1E8M0I8CandidateFacts &facts,
+                         const RISCVTargetProfile &target) {
+  if (!target.hasRVV || target.vlenBits < 128 || !target.littleEndian ||
+      facts.packedExtent != 16)
+    return std::nullopt;
+  const LogicalAxisConstraint *reduction =
+      findLogicalAxisConstraint(facts.mapping, kCoreAxisK);
+  if (!reduction || reduction->role != LogicalAxisRole::Reduction ||
+      reduction->extent != std::optional<uint64_t>(32))
     return std::nullopt;
 
   struct Candidate {
@@ -2722,8 +2725,8 @@ selectE2M1E8M0I8Physical(const RISCVTargetProfile &target) {
   llvm::SmallVector<RVVVectorShape, 8> laneShapes =
       rvvShapeCandidates(target, 8);
   for (LocalAxisMappingCandidate candidate : enumerateRVVLocalAxisMappings(
-           CoreInstructionKind::RVVWideningIntegerDot, kCoreAxisK, 32, 8, 1,
-           target)) {
+           facts.mapping, CoreInstructionKind::RVVWideningIntegerDot,
+           kCoreAxisK, 8, target)) {
     const RVVVectorShape laneShape = candidate.mapping.laneShape;
     llvm::SmallVector<RVVVectorShape, 9> activationShapes(
         laneShapes.begin(), laneShapes.end());
