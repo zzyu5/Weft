@@ -1,129 +1,96 @@
-# Dot、Matmul 与 State Algebra
+# 局部计算命令
 
-## Dot 与 matmul 授权点
+局部命令是作者对编译器的语义授权：用户明确说明“这里是 matmul/reduce/quant relation”，
+编译器不用从普通 SSA 图猜；同时命令不取得外围 traversal、storage、state 或 kernel ABI。
 
-Weft不提供任意轴乘加。现有真实kernel只需要两种明确的局部乘加域：
+## 普通 SSA 结果
 
-```python
-value = W.dot(lhs, rhs, init=acc, acc_dtype=W.f32,
-              order="relaxed", math="native")
-
-value = W.matmul(lhs, rhs, init=acc, acc_dtype=W.f32,
-                 order="relaxed", math="native")
-```
-
-`W.dot`固定收缩双方最后一个logical block axis；两侧必须引用同一个`W.block` identity，不能只
-具有相等extent。当前合法shape为：
+所有有结果的 command 都产生普通 scalar/engine SSA value。合法程序包括：
 
 ```text
-[R,K]   x [K]     -> [R]
-[VLA,K] x [K]     -> [VLA]
-[R,K]   x [VLA,K] -> [VLA,R]
+gemm → pointwise → store
+gemm → two consumers
+vdot → state update
+reduce → branch merge
+lookup/decode → quant compute
+structured result → another compatible command
 ```
 
-当前 dot 要求 f32 multiplicand 与 f32 accumulator。
+Direct-store、one-use、source adjacency 或固定 producer closure 都不是语言合同。
 
-`W.matmul`固定表达local block relation；lhs K与rhs K必须是同一个 DSL axis：
+## `W.vdot`
 
-```text
-[M,K] x [K,N] -> [M,N]
-```
+当前 `W.vdot(lhs, rhs, init, acc_dtype, order, math)` 表达显式共享 reduction axis 的局部 vector
+dot 关系，覆盖 canonical 支持的 `[R,K]×[K]`、`[VLA,K]×[K]` 与 `[R,K]×[VLA,K]`。它不创建
+外围 reduction loop，也不决定 RVV lane 或 LMUL。
 
-当前 matmul 要求两侧multiplicand具有相同的f16或f32 element type，accumulator为f32。
+## `W.gemm`
 
-VLA axis始终是free/batch axis，不能被dot或matmul缩并。跨VLA axis的聚合必须使用reduce、
-scan或显式typed summary primitive。`init`与`acc_dtype`均为必填 DSL semantics；init必须是scalar或与结果
-同domain（shape与axis identity均相同）的accumulator value。Operand validity由masked value本身携带，不另设第二套where轴
-描述；masked multiplicand在乘加域中按语义零贡献，`init`与result本身必须是普通unmasked
-accumulator value。结果element type等于accumulator dtype。
-
-普通scalar loop中的multiply/add是作者写下的有序carry，不会被自动识别成dot或matmul。
-只有显式primitive才授权target重组其局部K domain。
-
-`dot`/`matmul`的result是普通SSA value，而不是terminal microkernel result。它可以进入
-pointwise、多个consumer、state update、loop carry、memory store或另一个合法primitive；`init`
-也可以是跨作者循环存活的block accumulator。Target lowering 必须为这些use建立明确physical handoff，
-不能以“必须紧接一个store”等精确closure作为该primitive的语义入口。
+`W.gemm(lhs, rhs, init, acc_dtype, order, math)` 表达局部
+`[M,K] × [K,N] + init → [M,N]`。M/N/K 是 `W.axis` 建立并由 operand 共享的逻辑轴。
 
 作者拥有：
 
-- outer traversal与cache blocking；
-- staging、recomputation和persistent packing；
-- operand block、pointer/index、logical predicate与memory effect；
-- author-visible accumulator及跨block carry；
-- numerical order与math policy。
+- M/N/K 的 outer block traversal；
+- BM/BN/BK 与循环顺序；
+- accumulator 跨 K-loop 的 lifetime；
+- visible staging、workspace 与 persistent packing；
+- epilogue 与 store。
 
-Target只在当前dot/matmul内部决定：
+Target 拥有 command 内的 lane 方向、register microtile、multiple accumulators、K-unroll、load
+reuse、primitive-private packing、local pipeline 与 RVV/IME realization。
 
-- LMUL与register microtile；
-- multiple accumulators与K-unroll；
-- load schedule与local pipeline；
-- RVV或矩阵extension realization；
-- 不越过primitive边界的短生命周期packing/temporary。
+`W.gemm` 不是预编译函数。Canonical `weft_kernel.matmul` 保留 operands、axes、init 与数值
+属性，target 为当前上下文生成实现；同一命令在 GEMM、Conv、MoE、Attention 和 OutProd 的
+外围程序中使用同一编译规则。
 
-Target不得创建 DSL kernel 中不存在的outer loop，改变blocking/staging/persistent format，或从kernel
-名、格式名、完整loop nest与普通SSA graph选择实现。
+## Accumulator
 
-### Blocked GEMM 的授权边界
+`W.accumulator(domain, dtype, init=...)` 创建普通初始 engine value。它不创建特殊寄存器对象；
+是否跨 loop 保存由普通 carry 决定，物理 placement 由 lifetime、consumer 和资源共同决定。
 
-Blocked GEMM 的 M/N/K loop、BM/BN/BK、operand block、accumulator lifetime、staging、packing和
-store都由作者显式写出。同一个worker可以持有accumulator跨K loop，并在外围control中顺序处理
-多个M/N block。`W.matmul`只授权当前local block product的物理重组；它不能替作者创建outer
-K loop、persistent repack或另一种GEMM traversal。这一持续worker-owned lifetime是Weft与典型
-Triton program/CTA-owned result tile 的核心差异。
+## Reduce、scan 与 state
 
-## State algebra
+`W.reduce` 消去指定逻辑轴；`W.scan` 保留顺序前缀关系；argmax、online summary 与 ordered
+state 各自保留完整、不可互猜的可观察语义。Target 只能在语义允许时选择 lane collective、
+sequential update 或局部 extension realization，不能把 ordered state 改成可重结合 reduction。
 
-Weft保留四种不同的state语义，不因底层实现可复用而合并。
+## Lookup 与 decode
 
-### Reduce
+Lookup/decode 明确 packed/codebook 数值关系和 predicate。它们的结果继续携带逻辑轴，可进入
+pointwise、state、dot 或 store。Target 可融合局部 decode 与 compute，但不能改变 persistent
+format 或接管外围 loop。
 
-```python
-result = W.reduce(value, op="add", identity=0.0, where=True,
-                  axis=None, order="relaxed", acc_dtype=W.f32)
-```
+## `W.quant.*`
 
-Reduce只观察最终聚合状态。VLA中`axis=None`消去active VLA axis；block value必须显式选择
-block axis。Masked或`where=false`元素等价于identity。
+量化命令放在一个 namespace 下，表示它们是同一 DSL 的 typed packed-compute commands，而非
+18 个平级语言根构造。每个 command 只保存真正不同的局部数值语义，例如 nibble/high-bit、
+group scale/minimum、codebook index 或 correction。
 
-### Scan
+编译器共享：packed-axis 分解、semantic lane、decode/widen、gather、cross-output reuse、
+accumulator organization、resource 和 pipeline。最低层 leaf 只保留不可进一步分解的 RVV
+intrinsic 或 IME asm。
 
-```python
-prefix = W.scan(value, op="add", identity=0.0, inclusive=True,
-                where=True, segment_start=None,
-                order="ordered", acc_dtype=W.f32)
-```
+当前不提供语义模糊的通用 `qgemm`。只有当多个真实格式能共享一个完整、可观察且不丢信息的
+typed schema 时，才可以增加通用 command；不能为了 API 简短把格式语义藏回后端分支。
 
-Scan为每个logical position产生prefix；output order可观察。`segment_start`是独立语义，不能
-从logical mask猜测。
+## 数值参数
 
-### Typed summary
-
-固定且可观察的summary语义必须使用显式typed primitive：
+`acc_dtype`、`order` 与 `math` 是语义自由度，不是机器调参。默认值使常见调用只需写：
 
 ```python
-value, coordinate = W.argmax(x, i,
-                             tie="lowest_coordinate", order="relaxed")
-
-maximum, scaled_sum = W.online_softmax_summary(
-    x, math="native", order="preserve"
-)
+acc = W.gemm(a_block, b_block, init=acc, acc_dtype=W.f32)
 ```
 
-`argmax`只定义maximum、显式coordinate与最低coordinate tie；`online_softmax_summary`只定义
-稳定的`(maximum, scaled_sum)`合并代数。二者不拥有surrounding traversal、memory、normalize
-consumer或kernel ABI。Target不得从helper closure或普通SSA graph猜出这些primitive。
+只有算法需要不同顺序或数学承诺时才显式传入；LMUL、microtile、fragment、pipeline depth 和
+target 名永远不作为 command 参数。
 
-Weft不提供任意`lift/merge/finalize` summary fold；现有真实kernel没有证明这种泛化是核心
-语言所需。新的summary只有在出现独立、完整且局部的可观察语义时才增加typed primitive。
+## Extension command 的门槛
 
-### Sequential carry
+新增 command 必须同时满足：
 
-```python
-state = init
-for i in W.range(begin, end):
-    state = step(state, i)
-```
-
-普通loop carry按logical iteration order执行。Compiler不得将其替换为reduce、scan、typed summary
-或dot/matmul，也不得根据代码形状猜测结合律。
+1. 有局部、完整、应用可观察的语义；
+2. 不能从现有 command 与普通 SSA 无歧义表达；
+3. 不拥有 outer control、blocking、persistent storage 或 ABI；
+4. 有 canonical op/type、verifier 和真实 target artifact；
+5. 未实现 target 明确 unsupported，不走 fallback。

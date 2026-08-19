@@ -14,14 +14,15 @@ from weft.diagnostics import LanguageUseError
 @dataclass(frozen=True, slots=True)
 class Intrinsic:
     name: str
+    spelling: str | None = None
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise LanguageUseError(
-            f"W.{self.name} is valid only while lowering an @weft.kernel"
+            f"W.{self.spelling or self.name} is valid only while lowering an @weft.kernel"
         )
 
     def __repr__(self) -> str:
-        return f"W.{self.name}"
+        return f"W.{self.spelling or self.name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,27 +79,31 @@ def helper(
     return HelperDefinition(function, effects)
 
 
-def _intrinsic(name: str) -> Intrinsic:
-    return Intrinsic(name)
+def _intrinsic(name: str, spelling: str | None = None) -> Intrinsic:
+    return Intrinsic(name, spelling)
 
 
 range = _intrinsic("range")
+blocks = _intrinsic("blocks")
+pipeline = _intrinsic("pipeline")
 vla = _intrinsic("vla")
 select = _intrinsic("select")
 load = _intrinsic("load")
+transfer = _intrinsic("transfer")
 load_f16_le = _intrinsic("load_f16_le")
 store = _intrinsic("store")
-storage = _intrinsic("storage")
+buffer = _intrinsic("buffer")
 sort_indices = _intrinsic("sort_indices")
-block = _intrinsic("block")
+axis = _intrinsic("axis")
 full = _intrinsic("full")
 zeros = _intrinsic("zeros")
+accumulator = _intrinsic("accumulator")
 reduce = _intrinsic("reduce")
 scan = _intrinsic("scan")
 argmax = _intrinsic("argmax")
 online_softmax_summary = _intrinsic("online_softmax_summary")
-dot = _intrinsic("dot")
-matmul = _intrinsic("matmul")
+vdot = _intrinsic("vdot")
+gemm = _intrinsic("gemm")
 lookup = _intrinsic("lookup")
 decode = _intrinsic("decode")
 narrow = _intrinsic("narrow")
@@ -116,21 +121,51 @@ floor = _intrinsic("floor")
 sqrt = _intrinsic("sqrt")
 rsqrt = _intrinsic("rsqrt")
 neg_inf = _intrinsic("neg_inf")
-affine_i4_i8_dot = _intrinsic("affine_i4_i8_dot")
-symmetric_i4_i8_dot = _intrinsic("symmetric_i4_i8_dot")
-grouped_affine_i4_i8_dot = _intrinsic("grouped_affine_i4_i8_dot")
-sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot")
-e2m1_e8m0_i8_dot = _intrinsic("e2m1_e8m0_i8_dot")
-packed_i4_i8_dot = _intrinsic("packed_i4_i8_dot")
-packed_i5_i8_dot = _intrinsic("packed_i5_i8_dot")
-base3_ternary_i8_dot = _intrinsic("base3_ternary_i8_dot")
-packed_i2_ternary_i8_dot = _intrinsic("packed_i2_ternary_i8_dot")
-signed_codebook_i8_dot = _intrinsic("signed_codebook_i8_dot")
-packed_u9_u7_codebook_i8_dot = _intrinsic("packed_u9_u7_codebook_i8_dot")
-packed_u11_grid_delta_i8_dot = _intrinsic("packed_u11_grid_delta_i8_dot")
-nibble_codebook_i8_dot = _intrinsic("nibble_codebook_i8_dot")
-packed_i3_grouped_i8_dot = _intrinsic("packed_i3_grouped_i8_dot")
-iq2_s_i8_dot = _intrinsic("iq2_s_i8_dot")
-iq3_s_i8_dot = _intrinsic("iq3_s_i8_dot")
-iq1_m_i8_dot = _intrinsic("iq1_m_i8_dot")
-q6_k_i8_dot = _intrinsic("q6_k_i8_dot")
+
+
+class _QuantCommands:
+    """Typed packed-compute commands in the one Weft language."""
+
+    __slots__ = ()
+
+    affine_i4_i8_dot = _intrinsic("affine_i4_i8_dot", "quant.affine_i4_i8_dot")
+    symmetric_i4_i8_dot = _intrinsic(
+        "symmetric_i4_i8_dot", "quant.symmetric_i4_i8_dot"
+    )
+    grouped_affine_i4_i8_dot = _intrinsic(
+        "grouped_affine_i4_i8_dot", "quant.grouped_affine_i4_i8_dot"
+    )
+    sign_bit_i8_dot = _intrinsic("sign_bit_i8_dot", "quant.sign_bit_i8_dot")
+    e2m1_e8m0_i8_dot = _intrinsic(
+        "e2m1_e8m0_i8_dot", "quant.e2m1_e8m0_i8_dot"
+    )
+    packed_i4_i8_dot = _intrinsic("packed_i4_i8_dot", "quant.packed_i4_i8_dot")
+    packed_i5_i8_dot = _intrinsic("packed_i5_i8_dot", "quant.packed_i5_i8_dot")
+    base3_ternary_i8_dot = _intrinsic(
+        "base3_ternary_i8_dot", "quant.base3_ternary_i8_dot"
+    )
+    packed_i2_ternary_i8_dot = _intrinsic(
+        "packed_i2_ternary_i8_dot", "quant.packed_i2_ternary_i8_dot"
+    )
+    signed_codebook_i8_dot = _intrinsic(
+        "signed_codebook_i8_dot", "quant.signed_codebook_i8_dot"
+    )
+    packed_u9_u7_codebook_i8_dot = _intrinsic(
+        "packed_u9_u7_codebook_i8_dot", "quant.packed_u9_u7_codebook_i8_dot"
+    )
+    packed_u11_grid_delta_i8_dot = _intrinsic(
+        "packed_u11_grid_delta_i8_dot", "quant.packed_u11_grid_delta_i8_dot"
+    )
+    nibble_codebook_i8_dot = _intrinsic(
+        "nibble_codebook_i8_dot", "quant.nibble_codebook_i8_dot"
+    )
+    packed_i3_grouped_i8_dot = _intrinsic(
+        "packed_i3_grouped_i8_dot", "quant.packed_i3_grouped_i8_dot"
+    )
+    iq2_s_i8_dot = _intrinsic("iq2_s_i8_dot", "quant.iq2_s_i8_dot")
+    iq3_s_i8_dot = _intrinsic("iq3_s_i8_dot", "quant.iq3_s_i8_dot")
+    iq1_m_i8_dot = _intrinsic("iq1_m_i8_dot", "quant.iq1_m_i8_dot")
+    q6_k_i8_dot = _intrinsic("q6_k_i8_dot", "quant.q6_k_i8_dot")
+
+
+quant = _QuantCommands()

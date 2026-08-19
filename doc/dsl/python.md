@@ -1,164 +1,118 @@
-# Python eDSL 与控制流
+# Python DSL
 
-## Python DSL 的地位
+Python 只用于构造 AOT Weft kernel。`@weft.kernel` 函数不会按普通 Python 执行；frontend 从
+函数 AST 生成 canonical Kernel IR，未知语法或未闭合能力直接报错。
 
-### 参考前端，不是运行时发射器
-
-Weft Python DSL 是规范化参考前端：
-
-```text
-Weft Python DSL kernel
-    → canonical Weft Kernel IR
-    → RISC-V target lowering
-    → intrinsic C / necessary inline asm
-    → system C compiler / archiver
-    → object / static library / generated C header
-```
-
-Python 不参与生成物运行。运行期不得依赖 Python interpreter、LLVM JIT 或 Weft Python package。
-
-其他前端可以直接生成同一个 canonical Weft Kernel IR，不经过 Python。
-
-### Kernel 定义
+## Kernel 与参数
 
 ```python
 import weft
 import weft.language as W
 
 @weft.kernel
-def saxpy(
-    x: W.ptr[W.f32],
-    y: W.ptr[W.f32],
-    a: W.f32,
+def add(
+    x: W.ptr[W.f32, W.readonly, W.noalias],
+    y: W.ptr[W.f32, W.readonly, W.noalias],
+    out: W.ptr[W.f32, W.writeonly, W.noalias],
     begin: W.index,
     end: W.index,
 ) -> None:
     with W.vla(begin, end) as i:
-        xv = W.load(x + i)
-        yv = W.load(y + i)
-        W.store(y + i, a * xv + yv)
+        W.store(out + i, W.load(x + i) + W.load(y + i))
 ```
 
-`@weft.kernel` 定义一个 worker-local entry。它不是 Python callable 的 eager 执行语义。
-Entry 可以返回 `None` 或一个 scalar value；返回类型是 C ABI 的一部分，不能由
-emitter 根据 kernel 名或 use context 改写。
+参数必须使用正式 scalar、pointer 或 `constexpr` annotation。Pointer qualifier 描述 access、
+alignment、alias 与 storage class，不描述 cache 或寄存器层级。
 
-### Kernel 参数类型
+## 有序控制
 
-核心参数类型：
-
-```python
-W.i1
-W.i8, W.i16, W.i32, W.i64
-W.u8, W.u16, W.u32, W.u64
-W.f16, W.bf16, W.f32, W.f64
-W.index
-W.ptr[T]
-W.constexpr[T]
-```
-
-实现可以增加扩展 scalar type，但不得改变核心类型语义。
-
-`W.index` 是地址和逻辑坐标使用的整数类型，不等于 physical lane index。
-
-`W.constexpr[T]` 是 specialization-time meta-parameter。Kernel ABI 与 canonical IR 使用
-`!weft_kernel.constexpr<T>` 与普通 runtime scalar 区分；kernel body 通过
-`weft_kernel.meta_value` 读取其已绑定值。该值在 target lowering 前必须绑定，不会成为
-生成 entry 的 runtime 参数。
-
-### Pointer qualifier
-
-Pointer 参数可以声明：
-
-- storage class：external、persistent(format) 或 workspace；
-- readonly / writeonly；
-- noalias；
-- minimum alignment；
-- restrict-like ownership facts。
-
-这些 qualifier 是作者承诺。编译器可以用其进行 vector memory、hoist 和
-local fusion；运行时违反承诺属于调用方错误。External 是默认 storage class；persistent 与
-workspace 必须在 entry body 使用 `W.storage` 声明 shape，workspace 还必须声明 `W.noalias`。
-
-概念语法：
+普通 `if`、`while` 和以下两种 `for` 都由当前 worker 顺序执行：
 
 ```python
-x: W.ptr[W.f32, W.readonly, W.noalias, W.aligned(64)]
-packed: W.ptr[W.u8, W.readonly, W.persistent("affine_i4_n16_k32_304b")]
-scratch: W.ptr[W.f32, W.workspace, W.noalias]
+for i in W.range(begin, end, step):
+    ...
 
-W.storage(packed, (n_blocks, k_blocks, 304))
-W.storage(scratch, (rows, columns))
-```
-
-`W.storage` 必须直接出现在 kernel entry body；它不是 allocation。所有 author-visible object 都
-由 caller 分配并作为普通 pointer 参数传入。完整 ownership/lifetime 说明见
-[Storage ownership 与 lifetime](storage-and-lifetime.md)。
-
-### Compile-time meta-parameter
-
-```python
-@weft.kernel
-def gemm_worker(..., BM: W.constexpr[W.index], BN: W.constexpr[W.index], BK: W.constexpr[W.index]):
+for block_begin in W.blocks(begin, end, block_size):
     ...
 ```
 
-DSL kernel 声明 meta-parameter 的语义位置与使用位置。候选值集合由外部 build loop 提供，
-不写进 kernel body。基于 meta value 的 loop bound、shape 或 branch 是 specialization-time
-结构；lowering 不得把未绑定 meta value 留成 runtime data-dependent 输入。
+`W.range` 表示一般有序遍历；`W.blocks` 表示作者选择的 algorithmic/cache block traversal。
+二者当前都 lower 为真实 scalar loop，区别保存在 canonical IR，供 target reasoning 使用。
 
-
-## Python 控制流
-
-### Scalar range
+作者可以授权现有循环做局部软件流水：
 
 ```python
-for row in W.range(row_begin, row_end):
-    ...
+for k0 in W.pipeline(W.blocks(0, k, BK)):
+    loaded = W.load(...)
+    acc = W.gemm(..., init=acc, acc_dtype=W.f32)
 ```
 
-`W.range` 是普通有序 scalar loop。作者写出的 carried scalar / block state 必须保持逻辑迭代顺序，除非它被显式改写成 reduce、scan 或typed summary primitive。
+`W.pipeline` 不指定 buffer 数、stage 或 prefetch distance；顺序执行始终是合法 realization。
+它不能包裹 `while`，也不能创建作者没有写出的 staging 或 workspace。
 
-### Scalar condition
-
-Python `if` 条件必须是 scalar `i1`。分支后继续使用的赋值必须在两个分支中都定义，且
-两侧结果类型相同；frontend 将它们显式变成 `weft_kernel.if` 的 region results。
-
-对 VLA / block predicate 必须使用：
+## 显式 VLA 域
 
 ```python
-W.select(predicate, true_value, false_value)
+with W.vla(begin, end) as i:
+    value = W.load(input + i)
+    W.store(output + i, value)
 ```
 
-或 validity-aware memory / structured primitive，不能把 vector predicate 当作 Python 控制流。
+`W.vla` 是作者对一条运行时长度逻辑轴的 SIMD 授权。VLA region 不能嵌套，region value 不能
+逃出词法作用域，普通 scalar loop 不会自动转换为 VLA。
 
-### While 与 early exit
-
-受限 Python `while` 表达有序状态机，并 lowering 为 `weft_kernel.while`。条件必须是 scalar
-`i1`，carried state 默认不可重排、不可跨 iteration 并行；`while ... else` 不属于语言。
-
-### Helper function
-
-纯 helper 使用：
+## 逻辑轴与 engine value
 
 ```python
-@W.pure
-def merge(a, b):
-    ...
-    return value
+mi = W.axis(BM)
+ki = W.axis(BK)
+a_block = W.load(a + (m0 + mi[:, None]) * lda + (k0 + ki[None, :]))
+acc = W.accumulator((mi, ni), W.f32, init=0.0)
 ```
 
-Effectful helper 使用：
+`W.axis(extent, offset=0)` 创建有身份的逻辑轴。轴切片只构造广播关系，不指定 SIMD lane、
+register 或 fragment。`W.full`、`W.zeros` 和 `W.accumulator` 创建普通 engine SSA value；
+`W.accumulator` 只是把“这个输出域将被循环 carry”写得自然，canonical 语义仍是普通初始值。
+
+## 数据移动
 
 ```python
-@W.helper(effects=("read",))
-def load_pair_sum(ptr):
-    return W.load(ptr) + W.load(ptr + W.index(1))
+value = W.load(ptr, where=predicate, other=fill, alignment=16)
+W.store(ptr, value, where=predicate, alignment=16)
+W.transfer(source_ptr, destination_ptr, alignment=16)
 ```
 
-允许声明的 effect 是 `read` 与 `write`。Helper 必须以一个 value return
-结束，并且不接受Python参数/返回annotation；typed schema来自每个调用点。Frontend始终将helper
-inline到caller。Typed summary使用自己的显式canonical primitive，不存在第二条helper-region语义。
-Helper不是第二份IR，也不是运行时Python call。
+`W.transfer` 表示同一逻辑域、同一 element type 的全有效 source-to-destination copy，并直接
+展开为 canonical load/store。它不表示异步 copy，不分配 storage，也不改变 layout。
 
-任意 Python reflection、动态对象、文件 I/O、异常、generator 和运行时 monkey-patching 不属于 kernel language。
+## Buffer 合同
+
+Workspace 或 persistent pointer 必须在入口显式绑定 shape：
+
+```python
+W.buffer(scratch, shape=(rows, columns))
+```
+
+这不是分配。调用者仍提供真实内存；详见
+[Storage 与生命周期](storage-and-lifetime.md)。
+
+## 局部命令
+
+公开命令分为：
+
+- collective：`W.vdot`、`W.gemm`、`W.reduce`、`W.scan`、`W.argmax`、summary、sort；
+- data/transform：load、store、transfer、cast、select、lookup、decode、pointwise；
+- typed packed compute：`W.quant.*`。
+
+命令结果是普通 SSA value，可多 use、参与 pointwise、跨有序控制 carry 或进入另一个合法命令。
+
+## Helper
+
+`@W.pure` 定义纯 helper；`@W.helper(effects=("read", "write"))` 显式列出 effect。Helper 在
+frontend 内联，只减少源码重复，不形成函数 ABI、第二份 IR 或特殊 lowering。Helper 的展开与
+手写等价程序必须产生同类语义事实。
+
+## 禁止的 Python 行为
+
+Frontend 不接受运行时反射、动态对象、异常处理、未知 `weft_kernel.*` op 或任意 Python
+library call。未实现构造直接报告 unsupported；不会执行 Python fallback 或生成假 artifact。

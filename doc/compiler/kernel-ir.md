@@ -1,75 +1,76 @@
-# Canonical Weft Kernel IR
+# Canonical Kernel IR
 
-## 作用
+Canonical Kernel IR 是 DSL 与所有 target 之间唯一持久语义。它不保存候选、选中 layout、LMUL、
+microtile、pipeline buffer、packing 或 fragment。
 
-Kernel IR 是 Python DSL 与 RISC-V target lowering 之间唯一长期保存的表示。它记录作者程序的
-可观察语义，不记录目标机器的一次选择。
+## Kernel 与 ABI
 
-一个 module 包含一个或多个 `weft_kernel.kernel`。每个 kernel 保存 entry name、参数类型、
-返回类型和一个有序 region。未知 `weft_kernel.*` 或 `weft_ext.*` operation 会在解析时失败。
+`weft_kernel.kernel` 保存 symbol、参数名、参数 kind、return type 与 source location。Pointer type
+保存 element type、access、noalias/restrict、alignment、storage class 和 persistent format。
 
-## 类型
+`weft_kernel.storage` 记录 `W.buffer` 的 caller-owned workspace/persistent shape，不执行分配。
 
-核心类型为：
+## 值类型
+
+- scalar：控制、地址与 scalar state；
+- `!weft_kernel.ptr`：typed memory pointer；
+- `!weft_kernel.block`：static/dynamic logical axes 上的 engine value；
+- `!weft_kernel.region`：词法 VLA domain 上的 engine value；
+- masked value：显式 validity；
+- tuple：closed scalar state。
+
+Block/region 的 shape、axis identity 和 element type 是逻辑事实，不是物理 layout。
+
+## 控制
+
+`weft_kernel.for` 保存 lower/upper/step、普通 SSA carry 与两个语义属性：
+
+- `traversal = "ordered" | "blocks"`；
+- `pipeline = false | true`。
+
+`pipeline=true` 只表示作者允许对当前已存在循环做依赖合法的局部流水；不承诺 target 必须采用
+流水，也不保存 stage/depth。`if`、`while`、`vla` 与 yield 保持普通 SSA/control contract。
+
+## 逻辑轴
+
+`weft_kernel.block_index` 是 source `W.axis` 的 canonical 表示，保存 extent、offset 与唯一 axis
+identity。Pointwise、load/store、cast、reduce 和 structured command 必须通过这些 identity
+说明对应、broadcast、free 与 reduction relation。
+
+## Memory 与 effect
+
+Load/store 保留 pointer footprint、predicate、fill/validity 和 alignment。地址计算仍是普通 SSA，
+target 从轴对 pointer 的变化推导 unit/strided/indexed/segment relation。Canonical IR 不保存某个
+target 的 memory instruction choice。
+
+`W.transfer` 当前不增加独立 canonical op：frontend 将它展开为语义等价的一次 load 与 store，
+因此所有 target 复用同一 memory facts。
+
+## Structured command
+
+Source command 使用稳定 canonical op：
 
 ```text
-scalar T
-!weft_kernel.ptr<T, access, noalias, alignment,
-                 restrict, external|workspace|persistent, format>
-!weft_kernel.constexpr<T>
-!weft_kernel.block<[D0, ...], [a0, ...], T>
-!weft_kernel.region<[D0, ...], [a0, ...], T>
-!weft_kernel.masked<T>
-tuple<T0, ...>
+W.vdot   → weft_kernel.dot
+W.gemm   → weft_kernel.matmul
+W.reduce → weft_kernel.reduce
+W.scan   → weft_kernel.scan
 ```
 
-`block` 与 `region` 同时保存 shape 和 axis identity。正 axis ID 必须对应唯一
-`weft_kernel.block_index`；`0` 只表示显式 singleton dimension；VLA 维使用 `-1`。相同 extent
-不等于相同 axis。
+Op 保存 typed operands、axis relation、init 与 numerics。结果是普通 SSA value。Extension/quant
+op 只保存其局部、可观察数值语义，不保存完整 microkernel。
 
-## 控制与 SSA
+## Verification
 
-- `weft_kernel.for` 保存有序 scalar range 与任意 scalar/block carry；
-- `weft_kernel.while` 的 condition/body region 显式传递同一组 carry；
-- `weft_kernel.if` 的两个 region 产生同类型 results；
-- `weft_kernel.vla` 保存逻辑 `[begin,end)` 与跨完整 VLA 域产生的 state results；
-- `weft_kernel.yield`、`condition` 与普通 SSA use-def 完成所有值传递。
+Verifier 检查 source semantics，而不是 target preference：
 
-Block result 可以多 use、进入 pointwise、memory、state、控制 carry 或另一个合法局部运算。
-IR 不编码 one-use、direct-store、相邻 consumer 或某个后端闭包。
+- control carry type、axis 与 dynamic extent identity；
+- pointer access、storage shape、effect 与 validity；
+- pointwise/broadcast domain；
+- dot/matmul free/reduction axis 与 dtype；
+- reduce/scan/state order；
+- quant/extension operand shape、format 和 numerics；
+- canonical dialect 之外的未知 op 不能混入 kernel。
 
-## Storage
-
-`weft_kernel.storage` 只声明 entry 中 workspace/persistent pointer 的 shape。Pointer type 同时保存
-element type、access、alignment、alias、storage class 与 persistent format。普通 input/output
-使用 external pointer，不需要 `storage`。
-
-Primitive-private temporary 不进入 Kernel IR，也不能成为 entry 参数。
-
-## 运算
-
-Kernel dialect 包含：
-
-- scalar constant/meta value、cast/bitcast、unary/binary/compare/select；
-- pointer arithmetic、load/store、block index、singleton-axis view、full；
-- reduce、scan、argmax、online softmax summary、sort indices；
-- dot、matmul、lookup、decode、narrow；
-- for、while、if、VLA 与 entry return。
-
-`weft_ext` 只保存普通 Kernel op 无法无差别表达的局部语义：标量 little-endian f16 load、
-packed quantized dot 与 RISC-V 扩展相关局部运算。Affine/symmetric i4×i8 dot 自身完整定义当前
-N16×K32 packed byte relation；不另设只能在特定 consumer 中生效的 packed block view op。
-
-## Verifier
-
-Verifier 在最早能判断的位置拒绝：
-
-- axis identity、shape/domain、dtype 或 validity 不一致；
-- 非 scalar Python control condition；
-- VLA 中非法 outer-state mutation 或 nested VLA；
-- storage class、shape、workspace alias 或 persistent format 缺失；
-- dot/matmul reduction axis、init/result domain 或 numerical attributes 不完整；
-- extension operand 不足以独立定义其局部语义。
-
-Verifier 不验证 LMUL、register 数、fragment 或 instruction legality；这些由一次 target lowering
-根据 target profile 判断。
+Target 不支持某个合法 canonical program 时返回明确 unsupported；不能把 target 缺口伪装成
+source verifier 规则。

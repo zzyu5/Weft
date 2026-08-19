@@ -20,11 +20,11 @@ def conv_transpose2d_p0_f32(
 ) -> None:
     output_height = (input_height - 1) * stride + kernel_height
     output_width = (input_width - 1) * stride + kernel_width
-    W.storage(
+    W.buffer(
         packed_source,
         shape=(batch, input_height, input_width, input_channels),
     )
-    W.storage(
+    W.buffer(
         packed_weight,
         shape=(output_channels, kernel_height, kernel_width, input_channels),
     )
@@ -89,8 +89,8 @@ def conv_transpose2d_p0_f32(
                         for output_channel_base in W.range(
                             0, output_channels, 6
                         ):
-                            output_channel = W.block(6)
-                            reduction = W.block(input_channels)
+                            output_channel = W.axis(6)
+                            reduction = W.axis(input_channels)
                             input_value = W.load(
                                 packed_source
                                 + reduction
@@ -112,7 +112,7 @@ def conv_transpose2d_p0_f32(
                                 where=weight_channel < output_channels,
                                 other=W.f32(0.0),
                             )
-                            value = W.dot(
+                            value = W.vdot(
                                 weight_value,
                                 input_value,
                                 init=W.zeros((output_channel,), dtype=W.f32),

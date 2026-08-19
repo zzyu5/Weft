@@ -45,8 +45,8 @@ def flash_attn_ext_f32_f16(
     maximum_bias: W.f32,
     logit_softcap: W.f32,
 ) -> None:
-    W.storage(query_scratch, (key_dimension,))
-    W.storage(accumulator_scratch, (value_dimension,))
+    W.buffer(query_scratch, (key_dimension,))
+    W.buffer(accumulator_scratch, (value_dimension,))
 
     head_power_of_two = W.index(1)
     while head_power_of_two * W.index(2) <= query_heads:

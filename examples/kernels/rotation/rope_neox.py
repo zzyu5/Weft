@@ -15,7 +15,7 @@ def rope_neox_f32(
     token_stride: W.index,
     theta_scale: W.f32,
 ) -> None:
-    W.storage(angle_cache, (2, half_dimension))
+    W.buffer(angle_cache, (2, half_dimension))
 
     for token in W.range(0, tokens):
         theta = W.cast(

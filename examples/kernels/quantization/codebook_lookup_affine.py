@@ -11,7 +11,7 @@ def codebook_lookup_affine_f32(
     output: W.ptr[W.f32, W.writeonly, W.noalias],
     elements: W.index,
 ) -> None:
-    table_axis = W.block(16)
+    table_axis = W.axis(16)
     table = W.load(codebook + table_axis)
     with W.vla(0, elements) as index:
         code = W.load(codes + index)
@@ -28,7 +28,7 @@ def codebook_lookup_affine_f32_equivalent(
     output: W.ptr[W.f32, W.writeonly, W.noalias],
     elements: W.index,
 ) -> None:
-    lane = W.block(16)
+    lane = W.axis(16)
     table = W.load(codebook + lane)
     with W.vla(0, elements) as index:
         code_address = codes + index

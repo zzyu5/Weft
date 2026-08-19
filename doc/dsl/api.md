@@ -1,225 +1,121 @@
-# Python DSL API 索引
+# 公开 DSL API
 
-本文件汇总当前 Python DSL。详细语义由同目录其他文档定义；目标不支持某个
-合法 primitive 时必须明确报 unsupported，不能静默换成另一条算法路径。
+本页只列当前 Python frontend、canonical Kernel IR 和 RISC-V lowering 同时存在的入口。未列出的
+名字不是兼容 API；旧 `W.block/W.storage/W.dot/W.matmul` 与顶层量化命令已经删除。
 
-## Kernel、类型与 qualifier
+## 定义
+
+- `@weft.kernel`
+- `@W.pure`
+- `@W.helper(effects=(...))`
+
+## Scalar 与 type
+
+- `W.i1`, `W.i8/i16/i32/i64`, `W.u8/u16/u32/u64`
+- `W.f16`, `W.bf16`, `W.f32`, `W.f64`, `W.index`
+- `W.ptr[dtype, qualifiers...]`
+- `W.constexpr[dtype]`
+- pointer qualifier：`readonly`, `writeonly`, `noalias`, `restrict`, `aligned(n)`,
+  `external`, `workspace`, `persistent(format)`
+
+## Control 与域
 
 ```python
-@weft.kernel
-def kernel(...) -> None | scalar: ...
-
-W.i1
-W.i8, W.i16, W.i32, W.i64
-W.u8, W.u16, W.u32, W.u64
-W.f16, W.bf16, W.f32, W.f64
-W.index
-W.ptr[T, qualifiers...]
-W.constexpr[T]
-
-W.readonly
-W.writeonly
-W.noalias
-W.restrict
-W.aligned(bytes)
-W.external
-W.workspace
-W.persistent(format)
-
-W.storage(pointer, shape)
+W.range(begin, end, step=1)
+W.blocks(begin, end, block)
+W.pipeline(W.range(...))
+W.pipeline(W.blocks(...))
+W.vla(begin, end)
+W.axis(extent, offset=0)
 ```
 
-External 是默认 storage class。Persistent/workspace pointer 必须在 entry body各有一个
-`W.storage`；workspace 同时要求 `W.noalias`。`W.storage` 描述 caller-provided object，不执行
-allocation。
+`range/blocks/pipeline` 仅用于 `for`；`vla` 仅用于 `with`。
 
-## Control 与 helper
+## Storage 与 memory
 
 ```python
-for i in W.range(begin, end, step=1): ...
-if scalar_i1: ...
-while scalar_i1: ...
-W.select(predicate, true_value, false_value)
-
-@W.pure
-def pure_helper(...):
-    return value
-
-@W.helper(effects=("read", "write"))
-def effectful_helper(...):
-    return value
-```
-
-`for ... else` 与 `while ... else` 不属于语言。Integer/index value支持 `&`、`|`、`^`、
-`<<` 与 `>>`。Helper参数和返回值不写Python type annotation；其typed schema来自每个调用点，
-只有kernel entry annotation定义 C ABI。
-
-## VLA、predicate 与 memory
-
-```python
-with W.vla(begin, end) as i:
-    ...
-
+W.buffer(ptr, shape)
 W.load(ptr, where=True, other=W.invalid, alignment=None)
-W.load_f16_le(byte_ptr)
 W.store(ptr, value, where=True, alignment=None)
-W.select(predicate, true_value, false_value)
+W.transfer(source, destination, alignment=None)
+W.load_f16_le(base)
 ```
 
-## Logical block
+## Engine value 构造与 pointwise
 
 ```python
-axis = W.block(extent, offset=0)
-W.full((axis0,), value, dtype=W.f32)
-W.full((axis0, axis1), value, dtype=W.f32)
-W.zeros((axis0,), W.f32)
-W.zeros((axis0, axis1), W.f32)
+W.full(domain, value, dtype=None)
+W.zeros(domain, dtype)
+W.accumulator(domain, dtype, init=0.0)
+W.select(predicate, a, b)
+W.cast(value, dtype)
+W.bitcast(value, dtype)
+W.narrow(value, dtype, saturation=...)
+W.maximum(a, b)
+W.minimum(a, b)
+W.exp/tanh/log/sin/cos/floor/sqrt/rsqrt(value)
+W.neg_inf(dtype)
 ```
 
-每次`W.block`创建唯一 DSL axis identity；constructor的shape entry必须是direct block value，
-不接受裸整数。Python `value[:, None]` / `value[None, :]` 构造identity为0的singleton logical axis。当前 DSL 没有
-任意broadcast、reshape或transpose op；坐标重排必须由作者写成显式pointer/index relation。
-当前`W.full/W.zeros`只创建rank-one或rank-two f32 block。
+Python arithmetic/comparison/bitwise operators在类型和逻辑轴相容时映射为 canonical pointwise op。
+当前 `full/zeros/accumulator` 只构造 rank-one/rank-two f32 engine value；其他 dtype/rank 明确
+unsupported。
 
-## State algebra
+## Collective 与 state
 
 ```python
-W.reduce(value, op=..., identity=..., where=True,
-         axis=None, order="relaxed", acc_dtype=...)
-
-W.scan(value, op=..., identity=..., inclusive=True, where=True,
-       segment_start=None, order="ordered", acc_dtype=...)
-
-W.argmax(value, coordinate, tie="lowest_coordinate", order="relaxed")
-W.online_softmax_summary(value, math="native", order="preserve")
-W.sort_indices(input_ptr, output_ptr, scratch_workspace_ptr, extent,
-               order="ascending", nan="last", tie="index_ascending")
+W.vdot(lhs, rhs, *, init, acc_dtype, order="relaxed", math="native")
+W.gemm(lhs, rhs, *, init, acc_dtype, order="relaxed", math="native")
+W.reduce(value, op="add", identity=..., where=True, axis=None,
+         order="relaxed", acc_dtype=None)
+W.scan(value, op="add", identity=..., inclusive=True, where=True,
+       segment_start=None, order="ordered", acc_dtype=None)
+W.argmax(...)
+W.online_softmax_summary(...)
+W.sort_indices(...)
+W.tuple(...)
 ```
 
-`sort_indices`的scratch必须是rank-one `u32` workspace，其`W.storage` extent与排序extent相同；
-它是caller提供的算法workspace，不是target隐藏的stack ABI。
+具体 reduction/state 参数由对应 kernel 文档与 frontend 诊断约束；这些 command 不能互相猜测。
 
-普通 sequential carry使用 scalar `W.range` / Python `while`，不会被自动提升为 reduce、scan
-或typed summary。
-
-## Structured compute 与 data relation
+## Lookup 与 decode
 
 ```python
-W.dot(lhs, rhs, init=..., acc_dtype=...,
-      order="relaxed", math="native")
-W.matmul(lhs, rhs, init=..., acc_dtype=...,
-         order="relaxed", math="native")
 W.lookup(table, indices, where=True)
 W.decode(codes, table, where=True, out_dtype=...)
 ```
 
-当前形态为：`dot`使用f32 multiplicand与f32 accumulator；`matmul`使用dtype相同的
-f16或f32 `[M,K] × [K,N]` multiplicand与f32 accumulator；`lookup`是all-active VLA u8 index查询
-`block<16xf32>`；`decode`是all-active `block<16xu8>`通过`block<16xi8>`表得到i8 block。
+## Typed quant commands
 
-## Pointwise、special value 与 conversion
+以下名字只存在于 `W.quant` namespace：
 
-```python
-W.maximum(a, b)
-W.minimum(a, b)
-W.exp(x, math="native")
-W.log(x, math="native")
-W.floor(x)
-W.sin(x, math="native")
-W.cos(x, math="native")
-W.sqrt(x, math="native")
-W.rsqrt(x, math="native")
-W.neg_inf(dtype)
-W.tuple(a, b, ...)
-
-W.cast(value, dtype)
-W.narrow(value, W.i8, rounding="rne", saturation=True)
-W.bitcast(value, dtype)
+```text
+affine_i4_i8_dot
+symmetric_i4_i8_dot
+grouped_affine_i4_i8_dot
+sign_bit_i8_dot
+e2m1_e8m0_i8_dot
+packed_i4_i8_dot
+packed_i5_i8_dot
+base3_ternary_i8_dot
+packed_i2_ternary_i8_dot
+signed_codebook_i8_dot
+packed_u9_u7_codebook_i8_dot
+packed_u11_grid_delta_i8_dot
+nibble_codebook_i8_dot
+packed_i3_grouped_i8_dot
+iq2_s_i8_dot
+iq3_s_i8_dot
+iq1_m_i8_dot
+q6_k_i8_dot
 ```
 
-普通 Python arithmetic、comparison 与 integer bitwise operator直接形成 canonical unary/
-binary/compare op。
+调用形式为 `W.quant.<name>(...)`。每个命令的 typed operand domain、persistent format 与数值
+合同见 [量化局部计算](../kernels/quantized-local.md) 和
+[扩展 primitive](../kernels/extensions.md)。
 
-当前`W.narrow`只接受VLA f32→i8，并要求显式RNE与saturation；它不隐含scale或zero point。
+## 不存在的 API
 
-`W.tuple`只接受scalar field；block state直接作为普通SSA value通过`for/while/if` carry。
-
-## 当前 extension 运算
-
-```python
-W.affine_i4_i8_dot(
-    activation, packed_base,
-    activation_scale=..., init=...,
-)
-
-W.symmetric_i4_i8_dot(
-    activation, packed_base,
-    activation_scale=..., init=...,
-)
-
-W.grouped_affine_i4_i8_dot(
-    packed_weight, scale_min, activation, activation_sum_bytes,
-    dot_scale, minimum_scale, init,
-)
-
-W.sign_bit_i8_dot(
-    sign_bits, activation, activation_scale, sign_scale, init,
-)
-
-W.e2m1_e8m0_i8_dot(
-    packed_codes, exponent, activation, activation_scale, init,
-)
-
-W.packed_i4_i8_dot(
-    packed_codes, activation,
-    zero_point, dot_scale, additive_bias, init,
-)
-
-W.packed_i5_i8_dot(
-    low_bits, high_bits, activation,
-    zero_point, dot_scale, additive_bias, init,
-)
-
-W.base3_ternary_i8_dot(
-    codes, high_digits, activation,
-    weight_scale, activation_scale, init,
-)
-
-W.packed_i2_ternary_i8_dot(
-    codes, activation,
-    weight_scale, activation_scale, init,
-)
-
-W.signed_codebook_i8_dot(
-    codes, sign_metadata, activation,
-    grid_table, sign_table, dot_scale, init,
-)
-
-W.packed_u9_u7_codebook_i8_dot(
-    packed_codes, scale_byte, activation,
-    grid_table, sign_table, dot_scale, init,
-)
-
-W.packed_u11_grid_delta_i8_dot(
-    codes, metadata, activation,
-    grid_table, activation_sum, dot_scale, init,
-)
-
-W.nibble_codebook_i8_dot(
-    packed_codes, table, activation, dot_scale, init,
-)
-
-W.packed_i3_grouped_i8_dot(
-    low_bits, high_bits, scales, activation,
-    weight_scale, activation_scale, init,
-)
-
-W.iq2_s_i8_dot(...)
-W.iq3_s_i8_dot(...)
-W.iq1_m_i8_dot(...)
-W.q6_k_i8_dot(...)
-```
-
-它们在 Python DSL 中通过 `W` 暴露，在 Kernel IR 中属于 sibling `weft_ext` dialect。
-Extension 必须保持 local、typed、可组合；完整 kernel、persistent format和outer traversal不能
-进入 extension op。
+当前没有 source-visible engine selector、RVV/IME 名称、LMUL、vector type、fragment、pipeline
+stage、`W.tune`、隐式 allocation、一般化 contraction 或通用 `qgemm`。需要这些名字才能工作
+的代码不属于当前 Weft DSL。

@@ -39,7 +39,7 @@ def get_rows_q4_k(
                 output_group = output_block + group_pair * W.index(64)
                 high_output_group = output_group + W.index(32)
 
-                member = W.block(32)
+                member = W.axis(32)
                 packed = W.load(
                     packed_block
                     + W.index(16)

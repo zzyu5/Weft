@@ -63,7 +63,7 @@ def dequantize_q4_0(
             input_block = input_row + block * W.index(18)
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
-            member = W.block(16)
+            member = W.axis(16)
             codes = W.load(input_block + W.index(2) + member, other=W.u8(0))
             low = W.cast(codes & W.u8(15), W.f32) - W.f32(8.0)
             high = W.cast(codes >> W.u8(4), W.f32) - W.f32(8.0)
@@ -88,7 +88,7 @@ def dequantize_q4_1(
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
             minimum = W.load_f16_le(input_block + W.index(2))
-            member = W.block(16)
+            member = W.axis(16)
             codes = W.load(input_block + W.index(4) + member, other=W.u8(0))
             low = W.cast(codes & W.u8(15), W.f32)
             high = W.cast(codes >> W.u8(4), W.f32)
@@ -112,7 +112,7 @@ def dequantize_q8_0(
             input_block = input_row + block * W.index(34)
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
-            member = W.block(32)
+            member = W.axis(32)
             codes = W.bitcast(
                 W.load(input_block + W.index(2) + member, other=W.u8(0)),
                 W.i8,
@@ -151,7 +151,7 @@ def dequantize_q5_0(
             input_block = input_row + block * W.index(22)
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
-            logical_index = W.block(32)
+            logical_index = W.axis(32)
             code = _load_q5_code(input_block + W.index(2), logical_index)
             value = scale * (W.cast(code, W.f32) - W.f32(16.0))
             W.store(output_block + logical_index, value)
@@ -174,7 +174,7 @@ def dequantize_q5_1(
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
             minimum = W.load_f16_le(input_block + W.index(2))
-            logical_index = W.block(32)
+            logical_index = W.axis(32)
             code = _load_q5_code(input_block + W.index(4), logical_index)
             value = scale * W.cast(code, W.f32) + minimum
             W.store(output_block + logical_index, value)
@@ -197,7 +197,7 @@ def dequantize_q1_0(
             output_block = output_row + block * W.index(128)
             scale = W.load_f16_le(input_block)
             for quarter in W.range(0, 4):
-                logical_index = W.block(32)
+                logical_index = W.axis(32)
                 block_index = quarter * W.index(32) + logical_index
                 sign_byte = W.load(
                     input_block
@@ -230,7 +230,7 @@ def dequantize_tq2_0(
             output_block = output_row + block * W.index(256)
             scale = W.load_f16_le(input_block + W.index(64))
             for half in W.range(0, 2):
-                member = W.block(32)
+                member = W.axis(32)
                 codes = W.load(
                     input_block + half * W.index(32) + member,
                     other=W.u8(0),
@@ -269,7 +269,7 @@ def dequantize_tq1_0(
 
             power = W.u8(1)
             for digit in W.range(0, 5):
-                member = W.block(32)
+                member = W.axis(32)
                 encoded = W.load(input_block + member, other=W.u8(0)) * power
                 ternary = (
                     W.cast(encoded, W.u16) * W.u16(3)
@@ -282,7 +282,7 @@ def dequantize_tq1_0(
 
             power = W.u8(1)
             for digit in W.range(0, 5):
-                member = W.block(16)
+                member = W.axis(16)
                 encoded = W.load(
                     input_block + W.index(32) + member, other=W.u8(0)
                 ) * power
@@ -300,7 +300,7 @@ def dequantize_tq1_0(
 
             power = W.u8(1)
             for digit in W.range(0, 4):
-                member = W.block(4)
+                member = W.axis(4)
                 encoded = W.load(
                     input_block + W.index(48) + member, other=W.u8(0)
                 ) * power
@@ -334,7 +334,7 @@ def dequantize_mxfp4(
             input_block = input_row + block * W.index(17)
             output_block = output_row + block * W.index(32)
             scale = _e8m0_half(W.load(input_block, other=W.u8(0)))
-            member = W.block(16)
+            member = W.axis(16)
             codes = W.load(
                 input_block + W.index(1) + member, other=W.u8(0)
             )
@@ -370,7 +370,7 @@ def dequantize_nvfp4(
                 scale = _ue4m3_half(
                     W.load(input_block + subblock, other=W.u8(0))
                 )
-                member = W.block(16)
+                member = W.axis(16)
                 packed_index = member % W.index(8)
                 shift = W.cast((member // W.index(8)) * W.index(4), W.u8)
                 codes = (
@@ -419,7 +419,7 @@ def dequantize_q4_K(
                 high_scale, high_minimum = load_k4_scale_min(
                     input_block + W.index(4), high_group
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 codes = W.load(
                     input_block
                     + W.index(16)
@@ -479,7 +479,7 @@ def dequantize_q2_K(
                         minimum = block_minimum * W.cast(
                             metadata >> W.u8(4), W.f32
                         )
-                        member = W.block(16)
+                        member = W.axis(16)
                         packed_codes = W.load(
                             input_block
                             + W.index(16)
@@ -552,7 +552,7 @@ def dequantize_q3_K(
                         scale = block_scale * (
                             W.cast(local_scale, W.f32) - W.f32(32.0)
                         )
-                        member = W.block(16)
+                        member = W.axis(16)
                         packed_codes = W.load(
                             input_block
                             + W.index(32)
@@ -609,7 +609,7 @@ def dequantize_q5_K(
                 )
                 low_shift = W.cast(pair * W.index(2), W.u8)
                 high_shift = low_shift + W.u8(1)
-                member = W.block(32)
+                member = W.axis(32)
                 high_bits = W.load(
                     input_block + W.index(16) + member, other=W.u8(0)
                 )
@@ -660,7 +660,7 @@ def dequantize_q6_K(
             output_block = output_row + block * W.index(256)
             block_scale = W.load_f16_le(input_block + W.index(208))
             for half in W.range(0, 2):
-                member = W.block(32)
+                member = W.axis(32)
                 low_a = W.load(
                     input_block + half * W.index(64) + member,
                     other=W.u8(0),
@@ -786,7 +786,7 @@ def dequantize_iq4_xs(
                 high = W.cast((scales_high >> high_shift) & W.u16(3), W.u8)
                 local_scale = W.cast(low | (high << W.u8(4)), W.f32)
                 scale = block_scale * (local_scale - W.f32(32.0))
-                member = W.block(16)
+                member = W.axis(16)
                 codes = W.load(
                     input_block + W.index(8) + group * W.index(16) + member,
                     other=W.u8(0),
@@ -828,7 +828,7 @@ def dequantize_iq4_nl(
             input_block = input_row + block * W.index(18)
             output_block = output_row + block * W.index(32)
             scale = W.load_f16_le(input_block)
-            member = W.block(16)
+            member = W.axis(16)
             packed_codes = W.load(
                 input_block + W.index(2) + member,
                 other=W.u8(0),
@@ -880,7 +880,7 @@ def dequantize_iq2_xxs(
                 scale = block_scale * (
                     W.f32(0.5) + W.cast(metadata >> W.u32(28), W.f32)
                 ) * W.f32(0.25)
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 lane = member % W.index(8)
                 grid_code = W.load(
@@ -958,7 +958,7 @@ def dequantize_iq2_xs(
                 local_scales = W.load(
                     input_block + W.index(66) + group, other=W.u8(0)
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 lane = member % W.index(8)
                 packed_offset = field * W.index(2)
@@ -1027,7 +1027,7 @@ def dequantize_iq2_s(
                 local_scales = W.load(
                     input_block + W.index(74) + group, other=W.u8(0)
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 lane = member % W.index(8)
                 low_index = W.load(
@@ -1118,7 +1118,7 @@ def dequantize_iq3_xxs(
                 scale = block_scale * (
                     W.f32(0.5) + W.cast(metadata >> W.u32(28), W.f32)
                 ) * W.f32(0.5)
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 subrow = (member % W.index(8)) // W.index(4)
                 lane = member % W.index(4)
@@ -1208,7 +1208,7 @@ def dequantize_iq3_s(
                 high_bits = W.load(
                     input_block + W.index(66) + group, other=W.u8(0)
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 subrow = (member % W.index(8)) // W.index(4)
                 lane = member % W.index(4)
@@ -1275,7 +1275,7 @@ def dequantize_iq1_s(
                     W.f32(-0.125),
                     W.f32(0.125),
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 lane = member % W.index(8)
                 low_index = W.load(
@@ -1370,7 +1370,7 @@ def dequantize_iq1_m(
                         W.f32,
                     )
                 )
-                member = W.block(32)
+                member = W.axis(32)
                 field = member // W.index(8)
                 lane = member % W.index(8)
                 low_index = W.load(

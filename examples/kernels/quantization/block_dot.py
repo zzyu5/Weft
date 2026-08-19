@@ -38,9 +38,9 @@ def q4_0_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(18)
         y_block = y + block * W.index(34)
-        packed_axis = W.block(16)
-        activation_axis = W.block(32)
-        result = W.packed_i4_i8_dot(
+        packed_axis = W.axis(16)
+        activation_axis = W.axis(32)
+        result = W.quant.packed_i4_i8_dot(
             W.load(x_block + W.index(2) + packed_axis, other=W.u8(0)),
             W.bitcast(
                 W.load(y_block + W.index(2) + activation_axis, other=W.u8(0)),
@@ -69,9 +69,9 @@ def q4_1_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(20)
         y_block = y + block * W.index(36)
-        packed_axis = W.block(16)
-        activation_axis = W.block(32)
-        result = W.packed_i4_i8_dot(
+        packed_axis = W.axis(16)
+        activation_axis = W.axis(32)
+        result = W.quant.packed_i4_i8_dot(
             W.load(x_block + W.index(4) + packed_axis, other=W.u8(0)),
             W.bitcast(
                 W.load(y_block + W.index(4) + activation_axis, other=W.u8(0)),
@@ -100,16 +100,16 @@ def q5_0_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(22)
         y_block = y + block * W.index(34)
-        packed_axis = W.block(16)
-        high_axis = W.block(4)
-        activation_axis = W.block(32)
+        packed_axis = W.axis(16)
+        high_axis = W.axis(4)
+        activation_axis = W.axis(32)
         low_bits = W.load(x_block + W.index(6) + packed_axis, other=W.u8(0))
         high_bits = W.load(x_block + W.index(2) + high_axis, other=W.u8(0))
         activation = W.bitcast(
             W.load(y_block + W.index(2) + activation_axis, other=W.u8(0)),
             W.i8,
         )
-        result = W.packed_i5_i8_dot(
+        result = W.quant.packed_i5_i8_dot(
             low_bits,
             high_bits,
             activation,
@@ -136,16 +136,16 @@ def q5_1_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(24)
         y_block = y + block * W.index(36)
-        packed_axis = W.block(16)
-        high_axis = W.block(4)
-        activation_axis = W.block(32)
+        packed_axis = W.axis(16)
+        high_axis = W.axis(4)
+        activation_axis = W.axis(32)
         low_bits = W.load(x_block + W.index(8) + packed_axis, other=W.u8(0))
         high_bits = W.load(x_block + W.index(4) + high_axis, other=W.u8(0))
         activation = W.bitcast(
             W.load(y_block + W.index(4) + activation_axis, other=W.u8(0)),
             W.i8,
         )
-        result = W.packed_i5_i8_dot(
+        result = W.quant.packed_i5_i8_dot(
             low_bits,
             high_bits,
             activation,
@@ -173,7 +173,7 @@ def q8_0_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(34)
         y_block = y + block * W.index(34)
-        logical_index = W.block(32)
+        logical_index = W.axis(32)
         x_values = load_q8(x_block + 2, logical_index)
         y_values = load_q8(y_block + 2, logical_index)
         integer_sum = W.reduce(
@@ -203,25 +203,25 @@ def q4_K_row_dot(x, y, blocks):
     for block in W.range(0, blocks):
         x_block = x + block * W.index(144)
         y_block = y + block * W.index(292)
-        scale_index = W.block(12)
+        scale_index = W.axis(12)
         scale_min = W.load(x_block + W.index(4) + scale_index, other=W.u8(0))
-        packed_index = W.block(128)
+        packed_index = W.axis(128)
         packed_weight = W.load(
             x_block + W.index(16) + packed_index, other=W.u8(0)
         )
-        activation_index = W.block(256)
+        activation_index = W.axis(256)
         activation = W.bitcast(
             W.load(y_block + W.index(4) + activation_index, other=W.u8(0)),
             W.i8,
         )
-        sum_byte = W.block(32)
+        sum_byte = W.axis(32)
         activation_sum_bytes = W.load(
             y_block + W.index(260) + sum_byte, other=W.u8(0)
         )
         y_scale = load_f32_le(y_block)
         dot_scale = W.load_f16_le(x_block) * y_scale
         minimum_scale = W.load_f16_le(x_block + 2) * y_scale
-        result = W.grouped_affine_i4_i8_dot(
+        result = W.quant.grouped_affine_i4_i8_dot(
             packed_weight,
             scale_min,
             activation,
@@ -248,9 +248,9 @@ def tq2_0_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(66)
         y = activation + block * W.index(292)
-        code = W.block(64)
-        activation_element = W.block(256)
-        result = W.packed_i2_ternary_i8_dot(
+        code = W.axis(64)
+        activation_element = W.axis(256)
+        result = W.quant.packed_i2_ternary_i8_dot(
             W.load(x + code, other=W.u8(0)),
             W.bitcast(
                 W.load(y + W.index(4) + activation_element, other=W.u8(0)),
@@ -278,10 +278,10 @@ def tq1_0_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(54)
         y = activation + block * W.index(292)
-        code = W.block(48)
-        high_digit = W.block(4)
-        activation_element = W.block(256)
-        result = W.base3_ternary_i8_dot(
+        code = W.axis(48)
+        high_digit = W.axis(4)
+        activation_element = W.axis(256)
+        result = W.quant.base3_ternary_i8_dot(
             W.load(x + code, other=W.u8(0)),
             W.load(x + W.index(48) + high_digit, other=W.u8(0)),
             W.bitcast(
@@ -323,7 +323,7 @@ def q2_K_row_dot(weight, activation, blocks):
                         + lane_group
                     )
                     metadata = W.load(x + group, other=W.u8(0))
-                    member = W.block(16)
+                    member = W.axis(16)
                     packed_codes = W.load(
                         x
                         + W.index(16)
@@ -374,11 +374,11 @@ def q3_K_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(110)
         y = activation + block * W.index(292)
-        low_axis = W.block(64)
-        high_axis = W.block(32)
-        scale_axis = W.block(12)
-        activation_axis = W.block(256)
-        result = W.packed_i3_grouped_i8_dot(
+        low_axis = W.axis(64)
+        high_axis = W.axis(32)
+        scale_axis = W.axis(12)
+        activation_axis = W.axis(256)
+        result = W.quant.packed_i3_grouped_i8_dot(
             W.load(x + W.index(32) + low_axis, other=W.u8(0)),
             W.load(x + high_axis, other=W.u8(0)),
             W.load(x + W.index(96) + scale_axis, other=W.u8(0)),
@@ -422,7 +422,7 @@ def q5_K_row_dot(weight, activation, blocks):
             )
             low_shift = W.cast(pair * W.index(2), W.u8)
             high_shift = low_shift + W.u8(1)
-            member = W.block(32)
+            member = W.axis(32)
             high_bits = W.load(x + W.index(16) + member, other=W.u8(0))
             packed_codes = W.load(
                 x + W.index(48) + pair * W.index(32) + member,

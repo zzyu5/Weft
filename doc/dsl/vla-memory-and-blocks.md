@@ -1,260 +1,97 @@
-# VLA、Predicate、Memory 与 Logical Block
+# 逻辑轴、值与数据移动
 
-## VLA region 规范
+## 逻辑域不是物理 layout
 
-### DSL 语法
+Weft source 描述逻辑元素身份、地址关系和生命周期。Lane、LMUL、vector type、register tuple
+和 extension fragment 只存在于 target lowering。源程序中最重要的两个显式域构造是
+`W.vla` 和 `W.axis`，但它们不是两套 kernel 模型。
+
+## Scalar、memory view 与 engine value
+
+- scalar value：控制、地址、loop counter 和 scalar state；
+- memory view：typed pointer 与地址表达式形成的逻辑 footprint；
+- engine value：带逻辑轴的 block/region SSA value，可被本 core 的 scalar/vector/matrix
+  realization 消费。
+
+Engine value 的名字不承诺常驻寄存器。普通 use-def 和 loop lifetime 决定编译器应共享、
+reload、rematerialize、spill 或 local-pack。
+
+## `W.vla`
+
+`with W.vla(begin, end) as i` 创建一条动态 extent 的 region axis。作者明确授权其元素用 scalable
+SIMD 实现；target 选择 strip 长度、SEW/LMUL、mask/tail 与 memory form。
+
+VLA 的限制：
+
+- region 不可嵌套；
+- region value 不可逃出其词法作用域；
+- VLA body 不可暗中修改 outer scalar state，应使用明确 reduce/scan/summary；
+- VLA 不取得 kernel 的 outer traversal 或 ABI。
+
+## `W.axis`
+
+`W.axis(extent, offset=0)` 创建一条有唯一身份的逻辑轴。把轴组成 tuple 就得到 engine value 的
+逻辑域：
 
 ```python
-with W.vla(begin, end) as i:
-    value = W.load(ptr + i)
-    W.store(out + i, value * 2.0)
+mi = W.axis(BM)
+ni = W.axis(BN)
+tile = W.zeros((mi, ni), dtype=W.f32)
 ```
 
-`i` 是 logical VLA index region value，不是 scalar loop induction variable，也不是 physical lane ID。
+切片 `mi[:, None]` 和 `ni[None, :]` 只表达广播与轴对应。相同 extent 但身份不同的两条轴不会
+自动合并；dot/matmul 的 reduction axis 必须由 operand 显式共享。
 
-### 覆盖语义
+## Pointwise 传播
 
-一个 VLA region 必须覆盖 `[begin, end)` 中每个逻辑位置恰好一次。
+Pointwise operation 保持逻辑元素映射。两个 engine value 只有在轴身份与 broadcast 关系兼容
+时才能组合。一个 consumer 的物理需求不能改写 producer 的逻辑域；若多 consumer 需要不同
+机器形态，target 在共享、转换、reload 或 rematerialize 中选择。
 
-目标 lowering 可以选择：
+## Pointer relation
+
+地址表达式把 pointer 对逻辑轴的变化写进 IR：
 
 ```text
-remaining = end - begin
-base = begin
-while remaining > 0:
-    vl = choose_vl(remaining, SEW, LMUL, backend config)
-    execute logical indices [base, base + vl)
-    base += vl
-    remaining -= vl
+base + i                    unit stride candidate
+base + i * stride           strided candidate
+base + index[i]             indexed/gather candidate
+interleaved field relation  segment candidate
 ```
 
-上述循环只是物理 realization，不是 Kernel IR 结构。
+Memory form 是逻辑轴映射与 pointer relation 的共同结果，不是 source annotation。Alignment、
+access、alias 和 storage class 来自 pointer type。
 
-### Strip 不可观察性
+## Load、store 与 validity
 
-Python DSL 与 Kernel IR 禁止提供：
+`W.load(ptr, where, other)` 产生与 pointer footprint 相同的逻辑值。若 `where` 不是全真且没有
+`other`，结果携带 validity；带 validity 的值必须先由显式 fill/select 闭合，不能直接 store 或
+进入不接受 masked input 的命令。
 
-- `W.vl()`；
-- `W.vlen()`；
-- lane ID；
-- strip number；
-- first/last strip test；
-- exact LMUL；
-- vector register number。
+`W.store(ptr, value, where)` 要求 value 与 pointer domain 相容，并把 effect 保留在 canonical
+IR。Target 可选择 unit/strided/indexed/segment 指令，但不能扩大可见写集合。
 
-需要根据 logical position 判断首尾时，作者使用 `i == begin`、`i + 1 == end` 等逻辑 predicate，而不是物理 strip 状态。
+## `W.transfer`
 
-### VLA region 中的状态限制
+`W.transfer(source, destination, alignment=...)` 是可组合的数据移动命令。当前语义严格限定为：
 
-VLA region body 不得任意修改外层 scalar / block state。
+- source 可读、destination 可写；
+- element type、逻辑 shape 与轴身份相同；
+- 全部逻辑元素有效；
+- 等价于一次 canonical load 后一次 canonical store。
 
-跨整个 VLA domain 的状态必须通过以下一种结构产生：
+它不隐含 async、packing、transpose、cache level 或 storage allocation。需要这些可观察算法结构
+时，作者写出相应 pointer/index、workspace 与 loop；primitive-private local pack 可由 target 在
+命令内部生成。
 
-- `W.reduce`；
-- `W.scan`；
-- 显式typed summary primitive；
-- 满足 lane independence 的 effectful memory operation。
+## 跨控制流的值
 
-任意依赖上一逻辑元素的 recurrence 必须写成有序 scalar loop，或使用显式 `W.scan`。这样可以防止 DSL kernel 行为依赖编译器选择的 strip 边界。
+Engine value 与 scalar state 都能作为 `for`/`while` carry 或 `if` merge value。类型、逻辑轴和
+dynamic extent identity 必须在控制流边界一致。进入控制流前后的 consumer 变化不能决定某个
+structured command 是否可 lowering。
 
-普通有序scalar `for` / `while`可以出现在VLA body中；禁止的是第二个active VLA region，
-不是scalar control。Target可以逐physical strip执行这些scalar loops，但不得把它们重排为
-新的VLA axis，也不得改变loop-carried state或memory effect的逻辑顺序。
+## Canonical 表示
 
-### VLA effect independence
-
-VLA memory effect 必须满足 lane independence：
-
-- 两个 active logical indices 不得写同一地址；
-- 一个 iteration 不得依赖另一个 active iteration 写入的结果；
-- 若存在可能冲突，作者必须使用 scalar ordered loop；当前 DSL 不提供 atomic VLA
-  effect。未来只有在定义完整可观察 ordering/effect 语义后，才能增加相应 local primitive。
-
-该性质一般无法完全静态证明，属于作者义务；编译器可以利用 noalias、affine pointer 和 effect analysis 尽量检查。
-
-### VLA 与 block axis
-
-VLA region内可以构造额外的logical block axis，形成：
-
-```text
-[VLA, D0, D1, ...]
-```
-
-Target lowering 可以把 logical block axes 映射到唯一 RVV lane domain、serial loop、register
-repeat、register microtile、extension fragment或这些机制的合法组合，但不能把一个 block
-axis 暴露成第二个独立、author-observable 的 physical lane domain。
-
-
-## Logical predicate、masked value 与 physical tail
-
-### 三个不同概念
-
-Weft 必须严格区分：
-
-1. **iteration extent**：例如 `i ∈ [0, N)`；
-2. **logical predicate**：causal、padding、ragged validity、bounds 或用户条件；
-3. **physical tail**：最后一个 strip 的 `remaining` 小于最大可用 `vl`。
-
-Physical tail 不进入 canonical logical predicate。Target lowering可以使用缩短 AVL/`vl`、
-内部 physical mask，或二者组合实现尾部；这些 mechanics 不得反向成为 author-observable
-mask。
-
-### Masked load
-
-```python
-x = W.load(ptr, where=valid)
-```
-
-当 `other` 省略且`where`不是静态`True`时，结果是一个带logical validity的masked value。
-`where=True`的无填充值load覆盖整个逻辑domain，因此产生普通all-active value。
-
-```python
-x = W.load(ptr, where=valid, other=0.0)
-```
-
-当提供 `other` 时，结果是普通 filled value；无效位置的值等于 `other`。
-
-### Masked value 传播
-
-Pointwise op 对 masked operand 传播 validity。多个 masked operand 的默认 validity 是其 predicate 的逻辑与，除非 op 显式定义其他规则。
-
-Masked value 只能：
-
-- 由 validity-aware structured primitive 消费；
-- 继续经过会传播相同 logical validity 的 pointwise chain。
-
-禁止将未填充 masked value 作为普通 scalar / block value逃逸到不理解 validity 的 op。普通
-consumer和store需要filled value时，作者必须在原始 `W.load` 提供 `other`。语言不提供从masked
-value事后猜回predicate/fill的第二套API，当前 store 也不接受masked value。
-
-### Consumer-specific invalid semantics
-
-| Consumer | invalid element 的语义 |
-|---|---|
-| store | 不接受masked value；作者使用独立`where`并在producer处给出fill |
-| reduce | 不贡献，等价于该 reduce 的 identity |
-| typed summary | 由该primitive自身定义 |
-| dot / matmul | 不贡献，等价于乘加域的语义零元素 |
-| scan | 默认作为 identity；segment boundary 必须使用独立 `segment_start` |
-| ordinary sequential carry | 作者必须在 producer 处显式提供 filled value，compiler 不猜 |
-
-对于量化/编码operand，局部dot primitive的“语义零”不一定是物理bit pattern `0`。Target lowering必须根据primitive语义处理。
-
-### Predicate 到物理长度的吸收
-
-若compiler证明logical predicate恰好等价于VLA domain的连续bounds restriction，例如：
-
-```text
-i < N
-```
-
-可以通过缩短 AVL / `vl` 实现，而不生成 mask register。
-
-这是 lowering 优化，不能改变 canonical predicate 的语义身份。
-
-
-## Memory 与 effect
-
-### Pointer arithmetic
-
-DSL kernel 显式表达 pointer/index arithmetic：
-
-```python
-ptr = base + row * stride_row + col * stride_col
-```
-
-Target lowering 决定：
-
-- scalar、unit-stride、strided、indexed 或 segment memory；
-- vector grouping；
-- mask realization；
-- local address strength reduction。
-
-若access或predicate位于VLA内的nested scalar control中，target仍按每个实体的pointer、
-lane relation、predicate与effect选择memory realization。该physical scan只为当前strip投影
-地址与mask，不把作者的scalar loop、window或state改写成标准region形状。
-
-### Memory API
-
-核心 API：
-
-```python
-W.load(ptr, *, where=True, other=W.invalid, alignment=None)
-W.store(ptr, value, *, where=True, alignment=None)
-```
-
-`alignment` 是 DSL assertion，不是 physical layout 选择。
-
-### Local rematerialization
-
-Compiler 可以重新计算纯 pointer/index/value producer，也可以在合法 alias/effect 条件下重新 load，而不是强制保存 register value。
-
-若 rematerialization 跨越可能写入同一 memory 的 effect 且无 alias proof，必须拒绝。
-
-### Local fusion
-
-Target lowering 可以吸收 structured primitive 附近的纯 producer / consumer，例如 cast、decode、scale 或 packing，前提是：
-
-- 所有被吸收 value 的 use 都在该局部 envelope 内，或仍能正确 materialize；
-- 不发明新的算法级 loop、state 或 staging；
-- 不改变作者写下的 staging 与 memory effect；
-- 不根据完整 kernel 名匹配；
-- 选择仍绑定到明确 primitive/interface。
-
-这允许实现 fused dequantize + dot/matmul，也允许在 effect、alias 与 numerical legality 成立时
-联合 lower 相邻 primitive、共享 load/register/schedule；每个 primitive 的 observable boundary
-必须保留。它不允许从任意 multiply/add graph 自动发现 GEMM。
-
-
-## Block value API
-
-### Block domain与index
-
-```python
-m = W.block(BM)
-k = W.block(BK)
-```
-
-`W.block(D, offset=0)`同时建立一个唯一logical axis identity并产生shape `[D]` 的index block。
-每次调用都是不同axis；相同extent不代表相同domain。DSL integer literal写成static dimension；
-meta或runtime extent在canonical type中记为`-1`，真实长度由block_index operand保存。Target
-不能从相等shape猜axis identity。
-
-### Broadcasting
-
-Python frontend 支持：
-
-```python
-m[:, None]
-k[None, :]
-```
-
-这两种slicing只插入axis identity为`0`的singleton logical axis；它们不授权任意broadcast或
-shape重写。Pointwise join只能合并同一 DSL axis、显式singleton或scalar；同shape不同axis
-在frontend/canonical边界拒绝。
-
-### Block constructors
-
-```python
-W.full((axis0, axis1, ...), value, dtype=...)
-W.zeros((axis0, axis1, ...), dtype=...)
-```
-
-Shape entry必须是direct `W.block` value，不接受裸整数。同一个block domain因此在constructor、
-operand、result和loop carry中保持同一axis identity。当前 DSL 没有任意reshape/transpose；
-算法需要的坐标变换由作者显式写入pointer/index relation。
-
-### Block load/store
-
-`W.load` 与 `W.store` 对 block-shaped pointer 自动产生 block value/effect，不需要独立 `block_load` 语义。
-
-```python
-m = W.block(BM)
-k = W.block(BK)
-a_blk = W.load(a + (m0 + m[:, None]) * lda + (k0 + k[None, :]), where=...)
-```
-
-Block load、pointwise、state 与 structured primitive 的结果都进入同一普通 SSA value system。
-Block value可以有多个consumer，也可作为`for`/`while` carry跨iteration存活；它不必立即被某个
-primitive消费或store。Target负责合法的register/memory handoff，但不得要求一个固定terminal
-use closure来重新定义 DSL legality。
+Canonical Kernel IR 使用 `!weft_kernel.block` 与 `!weft_kernel.region` 保存 engine value 的
+shape、axis identity 和 element type，使用 `weft_kernel.block_index` 保存 `W.axis`。这些名字是
+内部语义 schema，不是旧 source API，也不赋予任何物理 layout。

@@ -11,14 +11,14 @@ def mxfp4_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         weight_block = weight + block * W.index(17)
         exponent = W.load(weight_block, other=W.u8(0))
-        code_lane = W.block(16)
+        code_lane = W.axis(16)
         packed_codes = W.load(
             weight_block + W.index(1) + code_lane,
             other=W.u8(0),
         )
         activation_block = activation + block * W.index(34)
         activation_scale = W.load_f16_le(activation_block)
-        activation_lane = W.block(32)
+        activation_lane = W.axis(32)
         activation_values = W.bitcast(
             W.load(
                 activation_block + W.index(2) + activation_lane,
@@ -26,7 +26,7 @@ def mxfp4_row_dot(weight, activation, blocks):
             ),
             W.i8,
         )
-        result = W.e2m1_e8m0_i8_dot(
+        result = W.quant.e2m1_e8m0_i8_dot(
             packed_codes,
             exponent,
             activation_values,
@@ -64,7 +64,7 @@ def nvfp4_row_dot(weight, activation, codebook, superblocks):
     for superblock in W.range(0, superblocks):
         weight_block = weight + superblock * W.index(36)
         for subblock in W.range(0, 4):
-            member = W.block(16)
+            member = W.axis(16)
             packed_index = member % W.index(8)
             shift = W.cast((member // W.index(8)) * W.index(4), W.u8)
             packed_codes = W.load(

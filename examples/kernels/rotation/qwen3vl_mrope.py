@@ -22,7 +22,7 @@ def qwen3vl_mrope_f32(
 ) -> None:
     half_dimension = rotary_dimension / W.index(2)
     section_total = section_t + section_h + section_w + section_e
-    W.storage(angle_cache, (2, half_dimension))
+    W.buffer(angle_cache, (2, half_dimension))
 
     for token in W.range(0, tokens):
         theta_t = W.cast(

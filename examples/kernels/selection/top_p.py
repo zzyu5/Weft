@@ -14,9 +14,9 @@ def top_p_nucleus_f32(
     vocabulary: W.index,
     threshold: W.f32,
 ) -> None:
-    W.storage(sorted_indices, (rows, vocabulary))
-    W.storage(sorted_probabilities, (rows, vocabulary))
-    W.storage(sort_scratch, (vocabulary,))
+    W.buffer(sorted_indices, (rows, vocabulary))
+    W.buffer(sorted_probabilities, (rows, vocabulary))
+    W.buffer(sort_scratch, (vocabulary,))
 
     for row in W.range(0, rows):
         row_offset = row * vocabulary

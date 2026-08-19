@@ -23,12 +23,12 @@ def iq2_S_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(82)
         y = activation + block * W.index(292)
-        code_axis = W.block(32)
-        high_axis = W.block(8)
-        sign_axis = W.block(32)
-        scale_axis = W.block(8)
-        activation_axis = W.block(256)
-        result = W.iq2_s_i8_dot(
+        code_axis = W.axis(32)
+        high_axis = W.axis(8)
+        sign_axis = W.axis(32)
+        scale_axis = W.axis(8)
+        activation_axis = W.axis(256)
+        result = W.quant.iq2_s_i8_dot(
             W.load(x + 2 + code_axis, other=W.u8(0)),
             W.load(x + 66 + high_axis, other=W.u8(0)),
             W.load(x + 34 + sign_axis, other=W.u8(0)),
@@ -56,12 +56,12 @@ def iq3_S_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(110)
         y = activation + block * W.index(292)
-        code_axis = W.block(64)
-        high_axis = W.block(8)
-        sign_axis = W.block(32)
-        scale_axis = W.block(4)
-        activation_axis = W.block(256)
-        result = W.iq3_s_i8_dot(
+        code_axis = W.axis(64)
+        high_axis = W.axis(8)
+        sign_axis = W.axis(32)
+        scale_axis = W.axis(4)
+        activation_axis = W.axis(256)
+        result = W.quant.iq3_s_i8_dot(
             W.load(x + 2 + code_axis, other=W.u8(0)),
             W.load(x + 66 + high_axis, other=W.u8(0)),
             W.load(x + 74 + sign_axis, other=W.u8(0)),
@@ -89,11 +89,11 @@ def iq1_M_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(56)
         y = activation + block * W.index(292)
-        code_axis = W.block(32)
-        high_axis = W.block(16)
-        scale_axis = W.block(8)
-        activation_axis = W.block(256)
-        result = W.iq1_m_i8_dot(
+        code_axis = W.axis(32)
+        high_axis = W.axis(16)
+        scale_axis = W.axis(8)
+        activation_axis = W.axis(256)
+        result = W.quant.iq1_m_i8_dot(
             W.load(x + code_axis, other=W.u8(0)),
             W.load(x + 32 + high_axis, other=W.u8(0)),
             W.load(x + 48 + scale_axis, other=W.u8(0)),
@@ -119,11 +119,11 @@ def q6_K_row_dot(weight, activation, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(210)
         y = activation + block * W.index(292)
-        low_axis = W.block(128)
-        high_axis = W.block(64)
-        scale_axis = W.block(16)
-        activation_axis = W.block(256)
-        result = W.q6_k_i8_dot(
+        low_axis = W.axis(128)
+        high_axis = W.axis(64)
+        scale_axis = W.axis(16)
+        activation_axis = W.axis(256)
+        result = W.quant.q6_k_i8_dot(
             W.load(x + low_axis, other=W.u8(0)),
             W.load(x + 128 + high_axis, other=W.u8(0)),
             W.bitcast(W.load(x + 192 + scale_axis, other=W.u8(0)), W.i8),
@@ -150,12 +150,12 @@ def iq4_nl_row_dot(weight, activation, codebook, blocks):
     for block in W.range(0, blocks):
         x = weight + block * W.index(18)
         y = activation + block * W.index(34)
-        member = W.block(16)
-        activation_member = W.block(32)
+        member = W.axis(16)
+        activation_member = W.axis(32)
         packed_codes = W.load(x + W.index(2) + member, other=W.u8(0))
         table = W.bitcast(W.load(codebook + member, other=W.u8(0)), W.i8)
         scale = W.load_f16_le(x) * W.load_f16_le(y)
-        result = W.nibble_codebook_i8_dot(
+        result = W.quant.nibble_codebook_i8_dot(
             packed_codes,
             table,
             W.bitcast(
@@ -219,8 +219,8 @@ def iq4_xs_row_dot(weight, activation, codebook, blocks):
                 local_scale = W.cast(
                     low_scale | (high_scale << W.u8(4)), W.f32
                 ) - W.f32(32.0)
-                member = W.block(16)
-                activation_member = W.block(32)
+                member = W.axis(16)
+                activation_member = W.axis(32)
                 packed_codes = W.load(
                     x + W.index(8) + group * W.index(16) + member,
                     other=W.u8(0),
@@ -228,7 +228,7 @@ def iq4_xs_row_dot(weight, activation, codebook, blocks):
                 table = W.bitcast(
                     W.load(codebook + member, other=W.u8(0)), W.i8
                 )
-                result = W.nibble_codebook_i8_dot(
+                result = W.quant.nibble_codebook_i8_dot(
                     packed_codes,
                     table,
                     W.bitcast(
@@ -314,12 +314,12 @@ def iq2_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
                 )
                 << W.u32(24)
             )
-            code = W.block(4)
-            member = W.block(32)
+            code = W.axis(4)
+            member = W.axis(32)
             local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
                 metadata >> W.u32(28), W.f32
             )
-            result = W.signed_codebook_i8_dot(
+            result = W.quant.signed_codebook_i8_dot(
                 W.load(
                     x + W.index(2) + group * W.index(8) + code,
                     other=W.u8(0),
@@ -360,9 +360,9 @@ def iq2_xs_row_dot(weight, activation, grid_table, sign_table, blocks):
         block_scale = W.load_f16_le(x) * load_f32_le(y) * W.f32(0.125)
         for group in W.range(0, 8):
             scale_byte = W.load(x + W.index(66) + group, other=W.u8(0))
-            code = W.block(8)
-            member = W.block(32)
-            result = W.packed_u9_u7_codebook_i8_dot(
+            code = W.axis(8)
+            member = W.axis(32)
+            result = W.quant.packed_u9_u7_codebook_i8_dot(
                 W.load(
                     x + W.index(2) + group * W.index(8) + code,
                     other=W.u8(0),
@@ -435,12 +435,12 @@ def iq3_xxs_row_dot(weight, activation, grid_table, sign_table, blocks):
                 )
                 << W.u32(24)
             )
-            code = W.block(8)
-            member = W.block(32)
+            code = W.axis(8)
+            member = W.axis(32)
             local_scale = W.f32(1.0) + W.f32(2.0) * W.cast(
                 metadata >> W.u32(28), W.f32
             )
-            result = W.signed_codebook_i8_dot(
+            result = W.quant.signed_codebook_i8_dot(
                 W.load(
                     x + W.index(2) + group * W.index(8) + code,
                     other=W.u8(0),
@@ -489,12 +489,12 @@ def iq1_s_row_dot(weight, activation, grid_table, blocks):
                 W.u16,
             )
             metadata = metadata_low | (metadata_high << W.u16(8))
-            code = W.block(4)
-            member = W.block(32)
+            code = W.axis(4)
+            member = W.axis(32)
             activation_sum = load_i16_le(
                 y + W.index(260) + group * W.index(4)
             ) + load_i16_le(y + W.index(262) + group * W.index(4))
-            result = W.packed_u11_grid_delta_i8_dot(
+            result = W.quant.packed_u11_grid_delta_i8_dot(
                 W.load(
                     x + W.index(2) + group * W.index(4) + code,
                     other=W.u8(0),

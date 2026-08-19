@@ -35,16 +35,16 @@ def q4_k_mul_mat_id(
     packed_block_bytes = W.index(304)
     blocks = inner / block_extent
     items = tokens * slots
-    W.storage(
+    W.buffer(
         packed_weight,
         (experts, rows / column_extent, blocks, packed_block_bytes),
     )
-    W.storage(activation_scale, (tokens, slots, blocks))
-    W.storage(activation_code, (tokens, slots, inner))
-    W.storage(expert_counts, (experts,))
-    W.storage(expert_offsets, (experts + W.index(1),))
-    W.storage(expert_cursors, (experts,))
-    W.storage(expert_items, (tokens, slots))
+    W.buffer(activation_scale, (tokens, slots, blocks))
+    W.buffer(activation_code, (tokens, slots, inner))
+    W.buffer(expert_counts, (experts,))
+    W.buffer(expert_offsets, (experts + W.index(1),))
+    W.buffer(expert_cursors, (experts,))
+    W.buffer(expert_items, (tokens, slots))
 
     for item in W.range(0, items):
         token = item / slots
@@ -137,7 +137,7 @@ def q4_k_mul_mat_id(
             W.index,
         )
         expert_weight = packed_weight + expert * weight_expert_stride
-        for row_begin in W.range(0, rows, column_extent):
+        for row_begin in W.blocks(0, rows, column_extent):
             for position in W.range(begin, end):
                 item = W.cast(
                     W.load(expert_items + position, other=W.u32(0)), W.index
@@ -151,10 +151,10 @@ def q4_k_mul_mat_id(
                     + token * output_token_stride
                     + slot * output_slot_stride
                 )
-                column = W.block(16)
+                column = W.axis(16)
                 accumulator = W.zeros((column,), dtype=W.f32)
                 for block in W.range(0, blocks):
-                    k = W.block(32)
+                    k = W.axis(32)
                     activation_codes = W.load(
                         code_row + block * block_extent + k,
                         other=W.i8(0),
@@ -169,7 +169,7 @@ def q4_k_mul_mat_id(
                         )
                         * packed_block_bytes
                     )
-                    accumulator = W.affine_i4_i8_dot(
+                    accumulator = W.quant.affine_i4_i8_dot(
                         activation_codes,
                         packed_base,
                         activation_scale=activation_block_scale,

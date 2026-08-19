@@ -1,96 +1,83 @@
-# 编译器结构
+# 编译器架构
 
 ## 唯一主链
 
 ```text
-Weft Python DSL kernel
+Python DSL kernel
 → canonical Weft Kernel IR
-→ one RISC-V target lowering
-→ intrinsic C / local inline asm + C header
+→ one target-specific analysis / decision / lowering
+→ intrinsic C or typed local asm
 → system C compiler
-→ object / executable
+→ object, header and executable/library
 ```
 
-Python 前端只把作者程序转换成 Kernel IR。仓库外的前端也可以直接生成相同 Kernel IR；
-Weft 不解析或链接 IntentDSL。
+Persistent representation 只有 canonical Kernel IR 与最终 artifact。Kernel IR 可以保存作者的
+`pipeline` 授权；具体 candidate、layout、LMUL、microtile、packing、pipeline schedule/buffer
+和 fragment 都是一次 target lowering 内的短生命周期 C++ 数据，不形成 Physical IR、
+Selected IR 或第二份 authority。
 
-长期保存的编译器表示只有 Kernel IR。LMUL、memory form、state placement、microtile、packing、
-fragment、resource legality 与候选选择只存在于一次 target lowering 调用中，不形成可输入的
-第二份 IR。
+## 前端职责
 
-## 三方职责
+Python frontend：
 
-作者拥有：
+- 解析一门 Core-local command DSL；
+- 保留作者 control、blocking、storage、effect、axis、value lifetime 与 command semantics；
+- 把高层 source 名映射为稳定 canonical op；
+- 在最早语义边界拒绝不完整或含混程序。
 
-- worker 的 `for / while / if` 与 effect 顺序；
-- outer traversal、blocking、staging 与 persistent layout；
-- block axis、pointer/index、predicate、state 与 accumulator 生命周期；
-- 显式 `W.vla`、`W.dot/W.matmul`、state 和扩展局部运算。
+例如 source `W.axis/W.buffer/W.vdot/W.gemm` 分别进入 canonical
+`block_index/storage/dot/matmul`。Canonical 名称描述稳定语义，不是兼容 source surface。
 
-RISC-V target lowering 拥有：
+## Target lowering 的四个职责
 
-- VLA strip、`vl`、LMUL、mask 与 memory instruction；
-- value/register shape、handoff、reload、rematerialize 与短期 local pack；
-- dot/matmul microtile、multiple accumulators、K-unroll 与已实现的 load/pipeline schedule；
-- RVV、IME 和其他扩展的局部实现；
-- intrinsic C 与 typed inline asm 的生成。
+### 1. 提取程序事实
 
-系统 C 编译器拥有最终寄存器分配、最终机器调度、peephole、常量折叠与机器码生成。
+只读取 Kernel IR 已写明的 axis、loop、use-def、pointer relation、predicate、effect、storage、
+lifetime、dtype 与 explicit command semantics。
 
-## 组合原则
+### 2. 进行唯一推导
 
-Target lowering 逐个读取 VLA、memory、predicate、state、dot/matmul、decode/lookup 与扩展运算
-自身的 typed operands、axis、validity、effect、普通 use relation、backend config 和 target facts。
-它不能先判断完整 kernel 属于哪一类，也不能用 kernel 名、格式 route、外围 loop 数量或精确
-producer/use 形状选择整段实现。
+推导 free/reduction/broadcast axis、memory relation、validity、cast/widen relation、target legality
+和真实 live resource。这些结论错了会导致错误代码，因此只能有一个 producer。
 
-一次 target lowering 内部只有以下信息流，不产生新的持久 IR：
+### 3. 构造和选择物理实现
 
-```text
-typed program/target facts
-→ 唯一合法性与轴关系推导
-→ structural implementation candidates
-→ parameter instances 与 resource filtering
-→ selected physical decisions
-→ intrinsic C / typed local asm
-```
+在 source 授权范围内构造 time/lane/register/unroll/fragment mapping、memory schedule、value
+handoff、microkernel、local packing 与 loop-local pipeline。结构选择与参数实例都读取同一
+facts/target facts；不按 kernel、格式、VLEN 或 source closure 进入完整路径。
 
-一个 value 的 physical shape 只有一个决定来源；每个 `(consumer, value)` 也只有一个 handoff。
-重复记录若在 Share/Convert/Reload/Rematerialize/LocalPack、source shape 或 result shape 上冲突，
-lowering 必须在 emission 前失败。生成 intrinsic C 时只能读取 selected decisions，不能再次推导
-LMUL、microtile、layout、fragment、table width 或 pipeline。
+### 4. 发射
 
-## 当前实现的信息流
+Emitter 只把 selected decision 拼写为普通 C control/address、RVV intrinsic 与 primitive-local
+IME asm。它不重新识别 command，不重新选择 LMUL、memory form、microtile、decode chunk、
+pipeline 或 fragment。
 
-`RISCVKernelFacts` 从 Kernel IR 记录 axis identity、ordered parent、普通 consumers、definition/last
-use、control carry，以及每次 memory access 相对各轴的 unit/strided/indexed/non-affine relation。
-它还根据pointer、index SSA、element bytes和effect顺序形成indexed-address与interleaved-memory
-group。对直接位于VLA body、只依赖VLA外值的纯地址运算，它另外给出coordinate-invariant base与
-可提前执行的operation序列；nested scalar control中的地址不会被越过其控制边界。这些是后续所有
-实现共同读取的程序事实，不按example或量化格式分组。
+## Op-specific rule 与共享 mapping
 
-`RISCVReuseAnalysis` 从同一份facts推导operand是否随reduction推进、是否直接供给primitive、
-address/predicate是否依赖accumulator、consumer数量和control crossing。它是F32 dot、VLA dot和
-F16/F32 matmul共同的reuse/pipeline输入，不产生第二份IR。
+统一的不是所有 op 的语义。每个 explicit command 有自己的 compile rule：pointwise 保持元素
+对应，memory 贡献 pointer relation，reduce/scan 贡献 order/state 约束，gemm 贡献 M/N/K 关系，
+quant command 贡献 packed 数值关系。
 
-`RISCVAxisMapping` 与 `RISCVPhysicalPlanning` 把显式op约束组合成sequential/lane/register/unroll/
-fragment轴分解，生成operand window、pipeline actions与统一resource budget，再按target profile和
-显式backend config选择合法实例。Dense与quant都使用同一mapping和resource机制；quant格式只在
-typed numerical rule与最底层local operation中保留差异。占用固定fragment或完整asm register set的
-局部extension实现也通过同一个axis-mapped resource calculator表达，不拥有独立预算旁路。
+这些 rule 向同一个物理 mapping、resource 与 local scheduler 提供约束。它们不能返回完整
+whole-kernel template。
 
-`RISCVKernelCompiler` 把相连value的selected shape、memory form、state placement、primitive
-realization与handoff组成一次瞬态physical plan。VLA lifetime按真实operation位置计算；普通nested
-`for/while/if`会继承外层仍存活的值，nested VLA仍明确unsupported。所有决定准备完成后才生成
-kernel body，并同时收集实际使用的exact intrinsic/asm leaf。
+## Realization 的位置
 
-`RISCVIntrinsicCPrelude`、`RISCVRVVIntrinsicC`、`RISCVQuant*IntrinsicC`与`RISCVIMEIntrinsicC`
-只按selected local operation拼写helper；它们不读取VLEN、kernel名、格式名或外围IR重新选择实现。
-`examples/run/weft.sh`中的selector只选择DSL source与相邻runtime，不是production lowering route。
+Realization 是 target 内部对一个局部 command 的透明实现候选，例如 RVV outer-product 或 IME
+fragment。它具有明确输入/输出物理形态、资源、mask/tail、dtype 与 instruction requirements，
+但不拥有 outer loop、workspace、persistent layout 或 ABI。用户不编写 realization 程序。
 
-## 仓库边界
+## Product 边界
 
-- `source/` 只保存 GGML baseline 与对应 runtime，不进入 Weft 编译主链。
-- `materials/` 只提供历史实现知识，不进入 CMake、include、import、link 或 runtime。
-- `examples/kernels/` 保存 DSL kernel；`examples/repro/weft/` 保存与其相邻的真实 runtime。
-- `report/` 保存一次性工作记录与当前性能 CSV，不定义语言或编译器。
+普通 DSL kernel 必须在不依赖 examples catalog 的情况下编译为可调用 artifact。`source/` 是
+baseline source，`materials/` 是只读知识供体；二者不进入 include/import/link/runtime，也不
+构成 fallback。
+
+## 明确禁止
+
+- kernel/example/q-format/target-name route；
+- exact op count、one-use、direct-store、source adjacency 或 whole-region matcher；
+- 从普通 scalar/SSA graph 猜 VLA、matmul、online softmax 或算法 variant；
+- legacy/scalar/GGML/materials fallback；
+- analysis 和 emitter 两次决定同一物理事实；
+- system compiler 职责范围内的最终寄存器分配与机器调度。

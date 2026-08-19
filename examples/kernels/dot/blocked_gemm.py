@@ -19,21 +19,20 @@ def gemm_worker(
     BN: W.constexpr[W.index],
     BK: W.constexpr[W.index],
 ) -> None:
-    W.storage(a_f16, shape=(m_end, k))
+    W.buffer(a_f16, shape=(m_end, k))
     for row in W.range(m_begin, m_end):
         with W.vla(0, k) as inner:
             value = W.load(a + row * lda + inner)
             W.store(a_f16 + row * lda + inner, W.cast(value, W.f16))
 
-    for m0 in W.range(m_begin, m_end, BM):
-        for n0 in W.range(0, n, BN):
-            mi = W.block(BM)
-            ni = W.block(BN)
-            acc = W.zeros((mi, ni), dtype=W.f32)
+    for m0 in W.blocks(m_begin, m_end, BM):
+        for n0 in W.blocks(0, n, BN):
+            mi = W.axis(BM)
+            ni = W.axis(BN)
+            acc = W.accumulator((mi, ni), W.f32, init=0.0)
 
-            k0 = W.index(0)
-            while k0 < k:
-                ki = W.block(BK)
+            for k0 in W.pipeline(W.blocks(0, k, BK)):
+                ki = W.axis(BK)
 
                 m_idx = m0 + mi[:, None]
                 n_idx = n0 + ni[None, :]
@@ -46,7 +45,7 @@ def gemm_worker(
                 a_blk = W.load(a_f16 + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
-                acc = W.matmul(
+                acc = W.gemm(
                     a_blk,
                     b_blk,
                     init=acc,
@@ -54,8 +53,6 @@ def gemm_worker(
                     order="relaxed",
                     math="native",
                 )
-                k0 = k0 + BK
-
             acc = acc + W.f32(0.0)
             m_idx = m0 + mi[:, None]
             n_idx = n0 + ni[None, :]

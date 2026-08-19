@@ -19,8 +19,8 @@ def online_flash_attention_f32_f16(
     group_size: W.index,
     scale: W.f32,
 ) -> None:
-    W.storage(query_scratch, shape=(head_dimension,))
-    W.storage(accumulator_scratch, shape=(head_dimension,))
+    W.buffer(query_scratch, shape=(head_dimension,))
+    W.buffer(accumulator_scratch, shape=(head_dimension,))
     for query_head in W.range(head_begin, head_end):
         key_value_head = query_head // group_size
         query_head_offset = query_head * queries * head_dimension

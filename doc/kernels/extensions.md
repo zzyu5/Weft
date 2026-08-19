@@ -6,7 +6,7 @@ DSL 通过 `W.*` 暴露，Kernel IR operation属于 `weft_ext` sibling dialect�
 ## Affine i4×i8 block dot
 
 ```python
-result = W.affine_i4_i8_dot(
+result = W.quant.affine_i4_i8_dot(
     activation,             # block<32, i8> 或 interleaved block<128, i8>
     packed_base,            # scalar ptr<u8>
     activation_scale=...,   # scalar f32 或 block<4, f32>
@@ -28,7 +28,7 @@ Kernel IR中显式存在。IME1或其他matrix fragment只是同一语义的targ
 ## Symmetric i4×i8 block dot
 
 ```python
-result = W.symmetric_i4_i8_dot(
+result = W.quant.symmetric_i4_i8_dot(
     activation,             # block<32, i8> 或 interleaved block<128, i8>
     packed_base,            # scalar ptr<u8>
     activation_scale=...,   # scalar f32 或 block<4, f32>
@@ -49,7 +49,7 @@ realization，不拥有activation quantize、outer loop或kernel ABI。
 ## Grouped affine i4×i8 block dot
 
 ```python
-result = W.grouped_affine_i4_i8_dot(
+result = W.quant.grouped_affine_i4_i8_dot(
     packed_weight,          # block<128, u8>
     scale_min,              # block<12, u8>
     activation,             # block<256, i8>
@@ -67,13 +67,13 @@ encoding，用于affine minimum correction。`dot_scale`、`minimum_scale`和`in
 numerical operand。
 
 External或persistent packed-block storage、pointer field offset和outer reduction loop由作者
-拥有；具体byte extent与storage identity由外围DSL和`W.storage`声明，primitive只验证收到的
+拥有；具体byte extent与storage identity由外围DSL和`W.buffer`声明，primitive只验证收到的
 四个local block operands。VLEN、LMUL、register organization与RVV asm spelling属于target。
 
 ## Sign-bit × signed-i8 local dot
 
 ```python
-result = W.sign_bit_i8_dot(
+result = W.quant.sign_bit_i8_dot(
     sign_bits,        # block<4, u8>
     activation,       # block<32, i8>
     activation_scale, # scalar f32
@@ -94,7 +94,7 @@ numerical semantics。
 ## Packed unsigned-i4/i5 × signed-i8 local dot
 
 ```python
-result = W.packed_i4_i8_dot(
+result = W.quant.packed_i4_i8_dot(
     packed_codes,    # block<16, u8>
     activation,      # block<32, i8>
     zero_point,      # scalar i32
@@ -109,7 +109,7 @@ code减去显式zero point，与32个signed-i8 activation做integer dot；结果
 `additive_bias`，再累加到`init`。Q4_0与Q4_1分别通过zero point 8/0和显式bias表达自身关系。
 
 ```python
-result = W.packed_i5_i8_dot(
+result = W.quant.packed_i5_i8_dot(
     low_bits,       # block<16, u8>
     high_bits,      # block<4, u8>
     activation,     # block<32, i8>
@@ -132,12 +132,12 @@ decode/widen/reduce leaf；VLEN256 byte shape是E8M1，leaf不再自行扩大成
 
 ## Packed ternary × signed-i8 local dot
 
-`W.base3_ternary_i8_dot`接收`block<48,u8>` codes、`block<4,u8>` high digits和
+`W.quant.base3_ternary_i8_dot`接收`block<48,u8>` codes、`block<4,u8>` high digits和
 `block<256,i8>` activation。前32个code byte分别产生五个32-element base-3 digit plane，后16
 个code byte产生五个16-element plane，四个high digit byte产生最后四组4-element plane；每个
 digit都按`((encoded * 3) >> 8) - 1`解释。两个scale与init是显式f32 operand。
 
-`W.packed_i2_ternary_i8_dot`接收`block<64,u8>` codes和`block<256,i8>` activation。每个code
+`W.quant.packed_i2_ternary_i8_dot`接收`block<64,u8>` codes和`block<256,i8>` activation。每个code
 byte的四个2-bit field依次解码为`field - 1`，再与对应activation相乘归约。两种primitive都只
 拥有当前256-element数值关系；54/66-byte enclosing block、Q8_K layout与outer block loop仍由
 DSL kernel拥有。
@@ -149,7 +149,7 @@ kernel名、格式名或外围loop。
 ## E2M1/E8M0 × signed-i8 local dot
 
 ```python
-result = W.e2m1_e8m0_i8_dot(
+result = W.quant.e2m1_e8m0_i8_dot(
     packed_codes,     # block<16, u8>
     exponent,         # scalar u8 E8M0 code
     activation,       # block<32, i8>
@@ -168,36 +168,36 @@ VLEN128 realization选择nibble拼接、table gather、widening multiply与i32 r
 
 ## Codebook / grouped integer local dot
 
-`W.signed_codebook_i8_dot`计算一个32-element signed codebook dot。`codes`是unmasked
+`W.quant.signed_codebook_i8_dot`计算一个32-element signed codebook dot。`codes`是unmasked
 `block<4,u8>`或`block<8,u8>`，分别选择四个8-element entry或八个4-element entry；scalar
 `u32 sign_metadata`的四个7-bit field选择caller-provided sign table中的mask。Grid table、sign
 table、`block<32,i8>` activation、`dot_scale`与`init`都是显式operand。Packed block layout、
 local-scale extraction和outer traversal仍由DSL kernel拥有；target只选择当前局部gather、
 sign、widening dot与reduction的VLEN128/VLEN256 realization。
 
-`W.packed_u9_u7_codebook_i8_dot`接收八个local packed bytes，并把它们解释为四个little-endian
+`W.quant.packed_u9_u7_codebook_i8_dot`接收八个local packed bytes，并把它们解释为四个little-endian
 u16 code word：low 9 bits选择8-element grid entry，high 7 bits选择sign mask。显式
 `scale_byte`的low/high nibble形成两个odd integer scale，分别作用于前后16个activation元素。
 它只拥有这一个32-element lookup、sign与scaled integer dot；74-byte packed block、八组
 traversal和block scale仍由DSL kernel拥有。
 
-`W.packed_u11_grid_delta_i8_dot`接收四个low code bytes和一个u16 metadata。四个3-bit field
+`W.quant.packed_u11_grid_delta_i8_dot`接收四个low code bytes和一个u16 metadata。四个3-bit field
 补成u11 grid index；metadata同时定义odd local scale和作用于显式`activation_sum`的
 `+/-0.125` correction。它返回一个32-element corrected grid dot；50-byte packed block、
 activation sum在Q8 workspace中的地址、八组traversal和block scale仍由DSL kernel拥有。
 
-`W.nibble_codebook_i8_dot`把16个packed bytes的low/high nibble映射到显式
+`W.quant.nibble_codebook_i8_dot`把16个packed bytes的low/high nibble映射到显式
 `block<16,i8>` table，并与`block<32,i8>` activation形成一个local dot。Target为同一语义
 选择VLEN128的32-lane combined gather或VLEN256的e8mf2 half-dot形态，并融合decode、widening
 product与reduction；
 18-byte/136-byte packed block、scale与outer traversal仍由DSL kernel拥有。
 
-`W.packed_i3_grouped_i8_dot`显式接收64-byte two-bit fields、32-byte high-bit plane、12-byte
+`W.quant.packed_i3_grouped_i8_dot`显式接收64-byte two-bit fields、32-byte high-bit plane、12-byte
 packed six-bit scales和256-element i8 activation。Primitive只拥有当前256-element
 decode、subtractive-four correction、group-scale fold与integer dot；110/292-byte block stride、
 block traversal和activation workspace仍由DSL kernel拥有。
 
-`W.iq2_s_i8_dot`、`W.iq3_s_i8_dot`、`W.iq1_m_i8_dot` 与 `W.q6_k_i8_dot` 分别保留各自
+`W.quant.iq2_s_i8_dot`、`W.quant.iq3_s_i8_dot`、`W.quant.iq1_m_i8_dot` 与 `W.quant.q6_k_i8_dot` 分别保留各自
 code/high-bit/sign或delta/group-scale的可观察语义，输入activation、scale与init也都是显式
 operand。它们共同产生一个256-element local integer dot，但persistent block stride、outer
 row/block traversal和activation workspace仍在普通Kernel IR中。
@@ -217,5 +217,5 @@ IQ2_S、Q6_K与IQ1_M可使用对应fixed-lane leaf，IQ3_S在64-lane shape下使
 - C ABI、persistent format、outer loop、staging与cross-primitive state仍在Kernel IR；
 - target可以为同一op提供多个local realization，不需要复制完整operator emitter。
 
-若新硬件只更快实现已有 `W.dot`、`W.matmul`、`W.reduce` 或memory semantics，应只增加target-local
+若新硬件只更快实现已有 `W.vdot`、`W.gemm`、`W.reduce` 或memory semantics，应只增加target-local
 realization，不增加extension op。

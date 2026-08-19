@@ -10,7 +10,7 @@ def copy_f32(
     end: W.index,
 ) -> None:
     with W.vla(begin, end) as i:
-        W.store(output + i, W.load(input + i))
+        W.transfer(input + i, output + i)
 
 
 @weft.kernel

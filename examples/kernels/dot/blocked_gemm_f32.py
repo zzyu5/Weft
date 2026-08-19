@@ -18,15 +18,14 @@ def gemm_f32_worker(
     BN: W.constexpr[W.index],
     BK: W.constexpr[W.index],
 ) -> None:
-    for m0 in W.range(m_begin, m_end, BM):
-        for n0 in W.range(0, n, BN):
-            mi = W.block(BM)
-            ni = W.block(BN)
-            acc = W.zeros((mi, ni), dtype=W.f32)
+    for m0 in W.blocks(m_begin, m_end, BM):
+        for n0 in W.blocks(0, n, BN):
+            mi = W.axis(BM)
+            ni = W.axis(BN)
+            acc = W.accumulator((mi, ni), W.f32, init=0.0)
 
-            k0 = W.index(0)
-            while k0 < k:
-                ki = W.block(BK)
+            for k0 in W.pipeline(W.blocks(0, k, BK)):
+                ki = W.axis(BK)
                 m_idx = m0 + mi[:, None]
                 n_idx = n0 + ni[None, :]
                 k_lhs = k0 + ki[None, :]
@@ -35,7 +34,7 @@ def gemm_f32_worker(
                 b_valid = (k_rhs < k) & (n_idx < n)
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
-                acc = W.matmul(
+                acc = W.gemm(
                     a_blk,
                     b_blk,
                     init=acc,
@@ -43,8 +42,6 @@ def gemm_f32_worker(
                     order="relaxed",
                     math="native",
                 )
-                k0 = k0 + BK
-
             shifted = acc + W.f32(0.0)
             scaled = acc * W.f32(1.0)
             combined = W.maximum(shifted, scaled)

@@ -957,6 +957,8 @@ mlir::LogicalResult IfOp::verify() {
 }
 
 mlir::LogicalResult ForOp::verify() {
+  if (getTraversal() != "ordered" && getTraversal() != "blocks")
+    return emitOpError("traversal must be ordered or blocks");
   auto init = getInitArgs();
   if (init.size() != getNumResults())
     return emitOpError("init count must match result count");
@@ -982,8 +984,12 @@ mlir::LogicalResult ForOp::verify() {
         return emitOpError()
                << "carried dynamic extent changes identity at axis " << axis;
   }
-  if (auto step = constantIndex(getStep()); step && *step == 0)
-    return emitOpError("step must not be zero");
+  if (auto step = constantIndex(getStep()); step) {
+    if (*step == 0)
+      return emitOpError("step must not be zero");
+    if (getTraversal() == "blocks" && *step < 0)
+      return emitOpError("block traversal requires a positive block extent");
+  }
   return mlir::success();
 }
 
@@ -1078,7 +1084,7 @@ mlir::LogicalResult FullOp::verify() {
     if (!axis || axis.getAxis() != axisId ||
         axis.getResult().getType().getShape().front() != dimension)
       return emitOpError(
-          "full result domain must be defined by its explicit W.block axes");
+          "full result domain must be defined by its explicit W.axis values");
   }
   return mlir::success();
 }

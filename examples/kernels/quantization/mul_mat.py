@@ -216,7 +216,7 @@ def mul_mat_q4_0(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(34)
     weight_row_bytes = blocks * W.index(18)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
@@ -251,7 +251,7 @@ def mul_mat_q4_1(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(36)
     weight_row_bytes = blocks * W.index(20)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_1_row(
@@ -288,7 +288,7 @@ def mul_mat_q5_0(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(34)
     weight_row_bytes = blocks * W.index(22)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
@@ -325,7 +325,7 @@ def mul_mat_q5_1(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(36)
     weight_row_bytes = blocks * W.index(24)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_1_row(
@@ -361,7 +361,7 @@ def mul_mat_q8_0(
 ) -> None:
     blocks = inner // W.index(32)
     row_bytes = blocks * W.index(34)
-    W.storage(activation_q8, shape=(row_end, row_bytes))
+    W.buffer(activation_q8, shape=(row_end, row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
@@ -399,7 +399,7 @@ def mul_mat_q1_0(
     weight_blocks = inner // W.index(128)
     activation_row_bytes = activation_blocks * W.index(34)
     weight_row_bytes = weight_blocks * W.index(18)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
 
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
@@ -436,7 +436,7 @@ def mul_mat_q2_K(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(84)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -471,7 +471,7 @@ def mul_mat_q3_K(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(110)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -506,7 +506,7 @@ def mul_mat_q4_K(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(144)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -541,7 +541,7 @@ def mul_mat_q5_K(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(176)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -576,7 +576,7 @@ def mul_mat_q6_K(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(210)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -611,7 +611,7 @@ def mul_mat_tq1_0(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(54)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -646,7 +646,7 @@ def mul_mat_tq2_0(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(66)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -681,7 +681,7 @@ def mul_mat_iq2_s(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(82)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -716,7 +716,7 @@ def mul_mat_iq3_s(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(110)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -751,7 +751,7 @@ def mul_mat_iq1_m(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(56)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -787,7 +787,7 @@ def mul_mat_iq4_xs(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(136)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -825,7 +825,7 @@ def mul_mat_iq2_xxs(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(66)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -864,7 +864,7 @@ def mul_mat_iq2_xs(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(74)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -903,7 +903,7 @@ def mul_mat_iq3_xxs(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(98)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -941,7 +941,7 @@ def mul_mat_iq1_s(
     blocks = inner // W.index(256)
     activation_row_bytes = blocks * W.index(292)
     weight_row_bytes = blocks * W.index(50)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_K_row(
             activation + row * inner,
@@ -978,7 +978,7 @@ def mul_mat_iq4_nl(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(34)
     weight_row_bytes = blocks * W.index(18)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
             activation + row * inner,
@@ -1014,7 +1014,7 @@ def mul_mat_mxfp4(
     blocks = inner // W.index(32)
     activation_row_bytes = blocks * W.index(34)
     weight_row_bytes = blocks * W.index(17)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
             activation + row * inner,
@@ -1051,7 +1051,7 @@ def mul_mat_nvfp4(
     superblocks = inner // W.index(64)
     activation_row_bytes = activation_blocks * W.index(34)
     weight_row_bytes = superblocks * W.index(36)
-    W.storage(activation_q8, shape=(row_end, activation_row_bytes))
+    W.buffer(activation_q8, shape=(row_end, activation_row_bytes))
     for row in W.range(row_begin, row_end):
         quantize_q8_0_row(
             activation + row * inner,

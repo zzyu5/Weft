@@ -149,7 +149,8 @@ def WeftKernel_IfOp : WeftKernel_Op<"if", [RecursiveMemoryEffects]> {
 
 def WeftKernel_ForOp : WeftKernel_Op<"for", [RecursiveMemoryEffects]> {
   let arguments = (ins Index:$lower, Index:$upper, Index:$step,
-                       Variadic<AnyType>:$init_args);
+                       Variadic<AnyType>:$init_args,
+                       StrAttr:$traversal, BoolAttr:$pipeline);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;

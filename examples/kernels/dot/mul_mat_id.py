@@ -25,10 +25,10 @@ def mul_mat_id_f32(
     output_slot_stride: W.index,
     output_token_stride: W.index,
 ) -> None:
-    W.storage(expert_counts, (experts,))
-    W.storage(expert_offsets, (experts + 1,))
-    W.storage(expert_cursors, (experts,))
-    W.storage(expert_items, (tokens, slots))
+    W.buffer(expert_counts, (experts,))
+    W.buffer(expert_offsets, (experts + 1,))
+    W.buffer(expert_cursors, (experts,))
+    W.buffer(expert_items, (tokens, slots))
 
     for expert in W.range(0, experts):
         W.store(expert_counts + expert, W.u32(0))
@@ -78,7 +78,7 @@ def mul_mat_id_f32(
             W.load(expert_offsets + expert + 1, other=W.u32(0)), W.index
         )
         weight_base = weights + expert * weight_expert_stride
-        for row in W.range(0, rows, 6):
+        for row in W.blocks(0, rows, 6):
             for position in W.range(begin, end):
                 item = W.cast(
                     W.load(expert_items + position, other=W.u32(0)), W.index
@@ -95,8 +95,8 @@ def mul_mat_id_f32(
                     + token * output_token_stride
                     + slot * output_slot_stride
                 )
-                row_lane = W.block(6)
-                reduction = W.block(inner)
+                row_lane = W.axis(6)
+                reduction = W.axis(inner)
                 row_index = row + row_lane[:, None]
                 reduction_index = reduction[None, :]
                 row_valid = row_index < rows
@@ -111,7 +111,7 @@ def mul_mat_id_f32(
                     activation_base + reduction,
                     other=W.f32(0.0),
                 )
-                value = W.dot(
+                value = W.vdot(
                     lhs,
                     rhs,
                     init=W.zeros((row_lane,), dtype=W.f32),

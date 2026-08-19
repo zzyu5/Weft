@@ -14,10 +14,10 @@ def out_product_f32(
     rhs_sample_stride: W.index,
     output_row_stride: W.index,
 ) -> None:
-    for row in W.range(0, rows, 6):
+    for row in W.blocks(0, rows, 6):
         with W.vla(0, columns) as column:
-            row_lane = W.block(6)
-            sample_axis = W.block(samples)
+            row_lane = W.axis(6)
+            sample_axis = W.axis(samples)
             row_index = row + row_lane[:, None]
             sample_index = sample_axis[None, :]
             left = W.load(
@@ -30,7 +30,7 @@ def out_product_f32(
                 + sample_axis[None, :] * rhs_sample_stride
                 + column[:, None]
             )
-            value = W.dot(
+            value = W.vdot(
                 left,
                 right,
                 init=W.f32(0.0),

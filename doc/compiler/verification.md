@@ -1,19 +1,33 @@
-# 真实运行复核
+# 真实 Repro
 
-Weft 只保留一类复核：把一个 DSL kernel 生成 intrinsic C/C header，在目标机编译成 executable，
-真实执行并对照数值。
+Weft 唯一允许的验证是可手工执行的一条真实主链：
 
-```bash
-./examples/run/weft.sh sg2044-rvv128 add
-./examples/run/weft.sh k1-rvv256 add
-./examples/run/weft.sh k1-ime256 q4_0_projection_ime prefill 3
+```text
+DSL source
+→ canonical Kernel IR
+→ target lowering
+→ intrinsic C / local asm
+→ system compiler
+→ target execution
+→ compare numerical result with the same algorithm
 ```
 
-每个 examples 分支指定唯一 DSL kernel、runtime、target profile 与真实 workload shape。Runtime
-可以在同一进程调用 GGML baseline 做数值/性能对照，但 Weft 生成代码不得调用 GGML。
+不建立 pytest/lit、单测、边界测试、fixture、case matrix、版本兼容测试或验收状态机。
 
-目标机暂不可用时，只能报告已经生成到 Kernel IR、intrinsic C、object 中的哪一层；不能把未执行
-写成通过。
+## Repro 必须说明
 
-仓库不建立 unit test、boundary test、fixture、lit/pytest、版本兼容检查或验证矩阵。解析器、
-verifier 和 target unsupported error 是编译器本身的一部分，不形成另一套测试系统。
+- DSL kernel symbol 与 constexpr/meta instance；
+- target profile、ISA/ABI 与必要 extension；
+- shape、dtype、storage format 和 input organization；
+- 生成与编译命令；
+- 真机执行命令；
+- 数值 reference 与比较方式。
+
+性能结论还必须保证同硬件、同算法、同 shape、同数据组织、同 preprocessing 归属和相近计时
+范围。跨 target 只用于观察选择差异，不直接给速度优劣结论。
+
+## Artifact 边界
+
+若 target 不可用或 command 没有合法 realization，应准确报告停在：frontend、canonical IR、
+target decision、intrinsic C、system compile 或 target execution 的哪一处。构建成功不能替代数值
+执行，明确 unsupported 也不能写成已支持。

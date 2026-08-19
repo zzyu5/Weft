@@ -13,7 +13,7 @@ def argsort_f32(
     value_row_stride: W.index,
     index_row_stride: W.index,
 ) -> None:
-    W.storage(scratch, (columns,))
+    W.buffer(scratch, (columns,))
     for row in W.range(row_begin, row_end):
         value_base = row * value_row_stride
         index_base = row * index_row_stride

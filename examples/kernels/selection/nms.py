@@ -12,7 +12,7 @@ def greedy_nms_f32(
     maximum_selected: W.index,
     iou_threshold: W.f32,
 ) -> None:
-    W.storage(suppressed, (candidates,))
+    W.buffer(suppressed, (candidates,))
 
     for candidate in W.range(0, candidates):
         W.store(suppressed + candidate, W.u8(0))

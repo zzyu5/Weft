@@ -16,7 +16,7 @@ def csr_sparse_attention_f32(
     head_dimension: W.index,
     scale: W.f32,
 ) -> None:
-    W.storage(accumulator_scratch, shape=(head_dimension,))
+    W.buffer(accumulator_scratch, shape=(head_dimension,))
     for row in W.range(row_begin, row_end):
         query_row = query + row * head_dimension
         output_row = output + row * head_dimension

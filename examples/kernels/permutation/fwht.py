@@ -14,7 +14,7 @@ def fwht_f32(
         half = W.index(1)
         for stage in W.range(0, stages):
             block_extent = half * 2
-            for block in W.range(0, extent, block_extent):
+            for block in W.blocks(0, extent, block_extent):
                 with W.vla(0, half) as lane:
                     left_pointer = batch_base + block + lane
                     right_pointer = batch_base + block + half + lane

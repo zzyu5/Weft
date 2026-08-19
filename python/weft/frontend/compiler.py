@@ -974,19 +974,21 @@ class FrontendCompiler:
                 or coordinate_type.element_type != ScalarType(index)
             ):
                 raise FrontendError(
-                    "block shape entries must be direct W.block values",
+                    "engine-domain entries must be direct W.axis values",
                     self._location(element),
                 )
             if axis[0] in axis_ids:
                 raise FrontendError(
-                    "one logical block axis cannot appear twice in a block shape",
+                    "one logical axis cannot appear twice in an engine domain",
                     self._location(element),
                 )
             dimensions.append(coordinate_type.shape[0])
             axis_ids.append(axis[0])
             coordinates.append(coordinate)
         if not coordinates:
-            raise FrontendError("block shape must contain at least one W.block", self._location(node))
+            raise FrontendError(
+                "engine domain must contain at least one W.axis", self._location(node)
+            )
         return _BlockShapeSpec(
             tuple(dimensions), tuple(axis_ids), tuple(coordinates)
         )
@@ -1124,6 +1126,68 @@ class FrontendCompiler:
         )
         return None
 
+    def _intrinsic_transfer(self, call: ast.Call) -> None:
+        self._require_effect("read", call)
+        self._require_effect("write", call)
+        args = self._positional_and_keywords(
+            call, ("source", "destination"), {"alignment": None}
+        )
+        source = self._value_argument(args["source"], call)
+        destination = self._value_argument(args["destination"], call)
+        if not _is_pointer(source.type) or not _is_pointer(destination.type):
+            raise FrontendError(
+                "W.transfer expects typed source and destination pointers",
+                self._location(call),
+            )
+        source_pointer = element_type(source.type)
+        destination_pointer = element_type(destination.type)
+        assert isinstance(source_pointer, PointerType)
+        assert isinstance(destination_pointer, PointerType)
+        if source_pointer.access == "write" or destination_pointer.access == "read":
+            raise FrontendError(
+                "W.transfer requires a readable source and writable destination",
+                self._location(call),
+            )
+        if source_pointer.element_type != destination_pointer.element_type:
+            raise FrontendError(
+                "W.transfer source and destination element types must match",
+                self._location(call),
+            )
+        if (
+            shape_kind(source.type) != shape_kind(destination.type)
+            or shape_of(source.type) != shape_of(destination.type)
+            or axes_of(source.type) != axes_of(destination.type)
+        ):
+            raise FrontendError(
+                "W.transfer source and destination must have the same logical domain",
+                self._location(call),
+            )
+        alignment = args["alignment"]
+        if isinstance(alignment, ast.expr):
+            alignment = self._eval_static(alignment)
+        alignment = 0 if alignment is None else alignment
+        if isinstance(alignment, bool) or not isinstance(alignment, int) or alignment < 0:
+            raise FrontendError(
+                "W.transfer alignment must be non-negative", self._location(call)
+            )
+        predicate = self._constant(True, i1, call)
+        invalid = self._invalid(call)
+        value_type = with_element_type(source.type, source_pointer.element_type)
+        value = self._emit(
+            "weft_kernel.load",
+            call,
+            operands=(source, predicate, invalid),
+            result_types=(value_type,),
+            attributes={"alignment": str(alignment)},
+        )[0]
+        self._emit(
+            "weft_kernel.store",
+            call,
+            operands=(destination, value, predicate),
+            attributes={"alignment": str(alignment)},
+        )
+        return None
+
     def _intrinsic_sort_indices(self, call: ast.Call) -> None:
         self._require_effect("read", call)
         self._require_effect("write", call)
@@ -1211,35 +1275,35 @@ class FrontendCompiler:
         )
         return None
 
-    def _intrinsic_storage(self, call: ast.Call) -> None:
+    def _intrinsic_buffer(self, call: ast.Call) -> None:
         if self.block is not self.entry_block:
             raise FrontendError(
-                "W.storage must be declared directly in the kernel entry body",
+                "W.buffer must be declared directly in the kernel entry body",
                 self._location(call),
             )
         args = self._positional_and_keywords(call, ("ptr", "shape"), {})
         pointer = self._value_argument(args["ptr"], call)
         if not isinstance(pointer.type, PointerType):
             raise FrontendError(
-                "W.storage requires one entry pointer", self._location(call)
+                "W.buffer requires one entry pointer", self._location(call)
             )
         if self.entry_block is None or pointer not in self.entry_block.arguments:
             raise FrontendError(
-                "W.storage must bind a kernel entry pointer directly",
+                "W.buffer must bind a kernel entry pointer directly",
                 self._location(call),
             )
         if pointer.type.storage_class not in {"persistent", "workspace"}:
             raise FrontendError(
-                "W.storage is required only for persistent or workspace pointers",
+                "W.buffer is required only for persistent or workspace pointers",
                 self._location(call),
             )
         shape_node = args["shape"]
         if not isinstance(shape_node, ast.expr):
-            raise FrontendError("storage shape must be explicit DSL syntax", self._location(call))
+            raise FrontendError("buffer shape must be explicit DSL syntax", self._location(call))
         shape = self._shape_spec(shape_node)
         if pointer in self.storage_shapes:
             raise FrontendError(
-                "one entry pointer cannot have multiple W.storage declarations",
+                "one entry pointer cannot have multiple W.buffer declarations",
                 self._location(call),
             )
         self._emit(
@@ -1251,7 +1315,7 @@ class FrontendCompiler:
         self.storage_shapes[pointer] = shape
         return None
 
-    def _intrinsic_block(self, call: ast.Call) -> Value:
+    def _intrinsic_axis(self, call: ast.Call) -> Value:
         args = self._positional_and_keywords(call, ("extent",), {"offset": 0})
         extent = self._value_argument(args["extent"], call)
         offset = self._value_argument(args["offset"], call)
@@ -1262,7 +1326,7 @@ class FrontendCompiler:
             or not _is_scalar(offset.type)
         ):
             raise FrontendError(
-                "W.block extent/offset must be scalar index", self._location(call)
+                "W.axis extent/offset must be scalar index", self._location(call)
             )
         dimension = -1
         extent_node = args["extent"]
@@ -1273,7 +1337,7 @@ class FrontendCompiler:
         ):
             if extent_node.value <= 0:
                 raise FrontendError(
-                    "W.block extent must be positive", self._location(extent_node)
+                    "W.axis extent must be positive", self._location(extent_node)
                 )
             dimension = extent_node.value
         axis_id = self.next_axis_id
@@ -1337,6 +1401,40 @@ class FrontendCompiler:
         )
         ast.copy_location(synthetic, call)
         return self._intrinsic_full(synthetic)
+
+    def _intrinsic_accumulator(self, call: ast.Call) -> Value:
+        args = self._positional_and_keywords(
+            call, ("domain", "dtype"), {"init": 0.0}
+        )
+        domain = args["domain"]
+        dtype = args["dtype"]
+        if not isinstance(domain, ast.expr) or not isinstance(dtype, ast.expr):
+            raise FrontendError(
+                "W.accumulator domain and dtype must be explicit DSL syntax",
+                self._location(call),
+            )
+        resolved = self._eval_static(dtype)
+        if not isinstance(resolved, DType):
+            raise FrontendError(
+                "W.accumulator dtype must be a Weft scalar type",
+                self._location(call),
+            )
+        shape = self._block_shape_spec(domain)
+        initial = self._value_argument(args["init"], call)
+        if initial.type != ScalarType(resolved):
+            initial = self._cast_value(initial, resolved, call)
+        if initial.type != ScalarType(f32) or len(shape.dimensions) not in {1, 2}:
+            raise FrontendError(
+                "W.accumulator currently creates rank-one or rank-two f32 engine values",
+                self._location(call),
+            )
+        result_type = BlockType(shape.dimensions, shape.axis_ids, initial.type)
+        return self._emit(
+            "weft_kernel.full",
+            call,
+            operands=(initial,) + shape.coordinates,
+            result_types=(result_type,),
+        )[0]
 
     def _expand_dims(self, value: Value, axis: int, node: ast.AST) -> Value:
         shape = shape_of(value.type)
@@ -1866,11 +1964,11 @@ class FrontendCompiler:
         rhs = self._value_argument(args["rhs"], call)
         return args, lhs, rhs
 
-    def _intrinsic_dot(self, call: ast.Call) -> Value:
+    def _intrinsic_vdot(self, call: ast.Call) -> Value:
         args, lhs, rhs = self._product_arguments(call)
         return self._emit_product(call, "dot", args, lhs, rhs)
 
-    def _intrinsic_matmul(self, call: ast.Call) -> Value:
+    def _intrinsic_gemm(self, call: ast.Call) -> Value:
         args, lhs, rhs = self._product_arguments(call)
         return self._emit_product(call, "matmul", args, lhs, rhs)
 
@@ -1882,6 +1980,7 @@ class FrontendCompiler:
         lhs: Value,
         rhs: Value,
     ) -> Value:
+        spelling = "W.vdot" if kind == "dot" else "W.gemm"
         lhs_bare = bare_type(lhs.type)
         rhs_bare = bare_type(rhs.type)
         if not isinstance(lhs_bare, (BlockType, RegionType)) or not isinstance(
@@ -1897,12 +1996,12 @@ class FrontendCompiler:
             static[name] = self._eval_static(item) if isinstance(item, ast.expr) else item
         if static["order"] not in {"ordered", "preserve", "relaxed"}:
             raise FrontendError(
-                f"W.{kind} order must be ordered, preserve, or relaxed",
+                f"{spelling} order must be ordered, preserve, or relaxed",
                 self._location(call),
             )
         if static["math"] not in {"strict", "native", "fast"}:
             raise FrontendError(
-                f"W.{kind} math must be strict, native, or fast",
+                f"{spelling} math must be strict, native, or fast",
                 self._location(call),
             )
         lhs_region = isinstance(lhs_bare, RegionType)
@@ -1912,7 +2011,7 @@ class FrontendCompiler:
                 rhs.type
             ) != ScalarType(f32):
                 raise FrontendError(
-                    "W.dot requires f32 multiplicands", self._location(call)
+                    "W.vdot requires f32 multiplicands", self._location(call)
                 )
             rhs_is_vector = isinstance(rhs_bare, BlockType) and len(rhs_bare.shape) == 1
             rhs_is_vla_rows = rhs_region and len(rhs_bare.shape) == 2
@@ -1923,14 +2022,14 @@ class FrontendCompiler:
                 or (rhs_region and not isinstance(lhs_bare, BlockType))
             ):
                 raise FrontendError(
-                    "W.dot supports [R,K] x [K], [VLA,K] x [K], or [R,K] x [VLA,K]",
+                    "W.vdot supports [R,K] x [K], [VLA,K] x [K], or [R,K] x [VLA,K]",
                     self._location(call),
                 )
             lhs_reduction_axis = lhs_bare.axes[-1]
             rhs_reduction_axis = rhs_bare.axes[-1]
             if lhs_reduction_axis != rhs_reduction_axis:
                 raise FrontendError(
-                    "W.dot operands must share one explicit reduction block",
+                    "W.vdot operands must share one explicit reduction axis",
                     self._location(call),
                 )
             output_shape = ([-1] if lhs_region or rhs_region else []) + (
@@ -1947,7 +2046,7 @@ class FrontendCompiler:
                 ScalarType(f32),
             }:
                 raise FrontendError(
-                    "W.matmul requires matching f16 or f32 multiplicands",
+                    "W.gemm requires matching f16 or f32 multiplicands",
                     self._location(call),
                 )
             if (
@@ -1957,12 +2056,12 @@ class FrontendCompiler:
                 or len(rhs_bare.shape) != 2
             ):
                 raise FrontendError(
-                    "W.matmul requires local [M,K] x [K,N] block operands",
+                    "W.gemm requires local [M,K] x [K,N] engine values",
                     self._location(call),
                 )
             if lhs_bare.axes[1] != rhs_bare.axes[0]:
                 raise FrontendError(
-                    "W.matmul operands must share one explicit K block",
+                    "W.gemm operands must share one explicit K axis",
                     self._location(call),
                 )
             output_shape = [lhs_bare.shape[0], rhs_bare.shape[1]]
@@ -1975,11 +2074,11 @@ class FrontendCompiler:
             acc_type = ScalarType(acc_dtype)
         else:
             raise FrontendError(
-                f"W.{kind} requires an explicit acc_dtype", self._location(call)
+                f"{spelling} requires an explicit acc_dtype", self._location(call)
             )
         if acc_type != ScalarType(f32):
             raise FrontendError(
-                f"W.{kind} requires f32 accumulation", self._location(call)
+                f"{spelling} requires f32 accumulation", self._location(call)
             )
         result_type: ValueType = (
             RegionType(tuple(output_shape), tuple(output_axes), acc_type)
@@ -1991,7 +2090,7 @@ class FrontendCompiler:
         init_arg = args["init"]
         if init_arg is None:
             raise FrontendError(
-                f"W.{kind} requires an explicit accumulator init",
+                f"{spelling} requires an explicit accumulator init",
                 self._location(call),
             )
         if isinstance(init_arg, Value):
@@ -2005,7 +2104,7 @@ class FrontendCompiler:
             )
         if is_masked(init.type):
             raise FrontendError(
-                f"W.{kind} accumulator init cannot carry validity",
+                f"{spelling} accumulator init cannot carry validity",
                 self._location(call),
             )
         return self._emit(
@@ -2769,6 +2868,15 @@ class FrontendCompiler:
     def _intrinsic_range(self, call: ast.Call) -> Value:
         raise FrontendError("W.range is valid only in a for statement", self._location(call))
 
+    def _intrinsic_blocks(self, call: ast.Call) -> Value:
+        raise FrontendError("W.blocks is valid only in a for statement", self._location(call))
+
+    def _intrinsic_pipeline(self, call: ast.Call) -> Value:
+        raise FrontendError(
+            "W.pipeline must wrap W.range or W.blocks in a for statement",
+            self._location(call),
+        )
+
     def _intrinsic_vla(self, call: ast.Call) -> Value:
         raise FrontendError("W.vla is valid only in a with statement", self._location(call))
 
@@ -2776,18 +2884,49 @@ class FrontendCompiler:
         if statement.orelse:
             raise FrontendError("for-else is not part of the Weft DSL", self._location(statement))
         if not isinstance(statement.target, ast.Name) or not isinstance(statement.iter, ast.Call):
-            raise FrontendError("for must use `for name in W.range(...)`", self._location(statement))
-        callee = self._resolve_static(statement.iter.func)
-        if not isinstance(callee, Intrinsic) or callee.name != "range":
-            raise FrontendError("for iteration must be W.range", self._location(statement))
-        args = self._positional_and_keywords(
-            statement.iter, ("begin", "end", "step"), {"step": 1}
-        )
+            raise FrontendError(
+                "for must iterate W.range, W.blocks, or W.pipeline(...)",
+                self._location(statement),
+            )
+        iterator = statement.iter
+        callee = self._resolve_static(iterator.func)
+        pipelined = False
+        if isinstance(callee, Intrinsic) and callee.name == "pipeline":
+            pipeline_args = self._positional_and_keywords(iterator, ("loop",), {})
+            nested = pipeline_args["loop"]
+            if not isinstance(nested, ast.Call):
+                raise FrontendError(
+                    "W.pipeline must wrap W.range or W.blocks",
+                    self._location(iterator),
+                )
+            iterator = nested
+            callee = self._resolve_static(iterator.func)
+            pipelined = True
+        if not isinstance(callee, Intrinsic) or callee.name not in {"range", "blocks"}:
+            raise FrontendError(
+                "for iteration must be W.range, W.blocks, or W.pipeline(...)",
+                self._location(statement),
+            )
+        if callee.name == "range":
+            args = self._positional_and_keywords(
+                iterator, ("begin", "end", "step"), {"step": 1}
+            )
+            step_name = "step"
+            traversal = "ordered"
+        else:
+            args = self._positional_and_keywords(
+                iterator, ("begin", "end", "block"), {}
+            )
+            step_name = "block"
+            traversal = "blocks"
         lower = self._value_argument(args["begin"], statement.iter)
         upper = self._value_argument(args["end"], statement.iter)
-        step = self._value_argument(args["step"], statement.iter)
+        step = self._value_argument(args[step_name], statement.iter)
         if not all(_is_index(value.type) and _is_scalar(value.type) for value in (lower, upper, step)):
-            raise FrontendError("W.range bounds and step must be scalar index", self._location(statement))
+            raise FrontendError(
+                "loop bounds and step/block must be scalar index",
+                self._location(statement),
+            )
         carried_names = sorted(_assigned_names(statement.body) & self.env.keys())
         init_values = tuple(self.env[name] for name in carried_names)
         body = self.builder.region(
@@ -2811,6 +2950,10 @@ class FrontendCompiler:
             result_types=tuple(value.type for value in init_values),
             regions=(body,),
             result_names=tuple(carried_names),
+            attributes={
+                "traversal": _string(traversal),
+                "pipeline": _bool(pipelined),
+            },
         )
         for name, result in zip(carried_names, results):
             self.env[name] = result

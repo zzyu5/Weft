@@ -21,12 +21,12 @@ def gemm_worker(
 ) -> None:
     for m0 in W.range(m_begin, m_end, BM):
         for n0 in W.range(0, n, BN):
-            mi = W.block(BM)
-            ni = W.block(BN)
+            mi = W.axis(BM)
+            ni = W.axis(BN)
             acc = W.zeros((mi, ni), dtype=W.f32)
 
             for k0 in W.range(0, k, BK):
-                ki = W.block(BK)
+                ki = W.axis(BK)
 
                 m_idx = m0 + mi[:, None]
                 n_idx = n0 + ni[None, :]
@@ -39,7 +39,7 @@ def gemm_worker(
                 a_blk = W.load(a + m_idx * lda + k_lhs, where=a_valid)
                 b_blk = W.load(b + n_idx * ldb + k_rhs, where=b_valid)
 
-                acc = W.matmul(
+                acc = W.gemm(
                     a_blk,
                     b_blk,
                     init=acc,
@@ -73,13 +73,13 @@ block表达6个row dot：
 ```python
 for row in W.range(m_begin, m_end, 6):
     for column in W.range(0, n):
-        row_lane = W.block(6)
-        inner = W.block(k)
+        row_lane = W.axis(6)
+        inner = W.axis(k)
         lhs = W.load(a + (row + row_lane[:, None]) * lda + inner[None, :],
                      where=row + row_lane[:, None] < m_end,
                      other=W.f32(0.0))
         rhs = W.load(b + column * ldb + inner, other=W.f32(0.0))
-        value = W.dot(lhs, rhs, init=W.zeros((row_lane,), dtype=W.f32),
+        value = W.vdot(lhs, rhs, init=W.zeros((row_lane,), dtype=W.f32),
                       acc_dtype=W.f32, order="relaxed", math="native")
         shifted = value + W.f32(0.0)
         scaled = value * W.f32(1.0)

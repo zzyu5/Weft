@@ -10,7 +10,7 @@ def q1_0_row_dot(weight, activation, blocks):
         weight_block = weight + block * W.index(18)
         sign_scale = W.load_f16_le(weight_block)
         for sub_block in W.range(0, 4):
-            sign_byte = W.block(4)
+            sign_byte = W.axis(4)
             sign_bits = W.load(
                 weight_block
                 + W.index(2)
@@ -22,7 +22,7 @@ def q1_0_row_dot(weight, activation, blocks):
                 activation + (block * W.index(4) + sub_block) * W.index(34)
             )
             activation_scale = W.load_f16_le(activation_block)
-            activation_lane = W.block(32)
+            activation_lane = W.axis(32)
             activation_values = W.bitcast(
                 W.load(
                     activation_block + W.index(2) + activation_lane,
@@ -30,7 +30,7 @@ def q1_0_row_dot(weight, activation, blocks):
                 ),
                 W.i8,
             )
-            result = W.sign_bit_i8_dot(
+            result = W.quant.sign_bit_i8_dot(
                 sign_bits,
                 activation_values,
                 activation_scale,
