@@ -74,9 +74,14 @@ accumulator、operand load window、K-unroll 和 load/compute order。GEMM、Con
 
 ## Loop-local pipeline
 
-只有 `weft_kernel.for pipeline=true` 才授权 target 调度当前 loop。Scheduler 基于真实 producer、
-effect、alias、state dependence 与 temporary lifetime 构造 prologue/steady/epilogue。顺序实现始终
-合法；target 不能创建跨 loop workspace、persistent buffer 或作者未写的算法 stage。
+`weft_kernel.for pipeline=true` 是 target 将来重排当前 loop 的唯一授权。一个完整
+scheduler 必须基于真实 producer、effect、alias、state dependence 与 temporary lifetime
+构造 prologue/steady/epilogue，且不能创建跨 loop workspace、persistent buffer 或作者
+未写的算法 stage。
+
+当前 RISC-V lowering 尚未消费这个属性生成通用 loop pipeline，所以它只选择合法的
+顺序 loop realization。已实现的 K-unroll/load-buffer schedule 仅位于 explicit dot/matmul
+primitive 内部，不应被记为 `W.pipeline` 的通用实现。
 
 ## Quant 与 packed compute
 

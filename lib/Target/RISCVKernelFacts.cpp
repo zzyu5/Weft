@@ -349,6 +349,14 @@ logicalAxesForValue(mlir::Value value, const KernelPhysicalFacts &facts) {
 
 } // namespace
 
+bool valueDependsOn(mlir::Value value, mlir::Value target) {
+  return dependsOn(value, target);
+}
+
+std::optional<int64_t> getConstantIndexValue(mlir::Value value) {
+  return integerConstantValue(value);
+}
+
 bool haveSameInterleavedInvariantAddress(const InterleavedMemoryFact &lhs,
                                          const InterleavedMemoryFact &rhs) {
   if (lhs.root != rhs.root || lhs.fields != rhs.fields ||
@@ -504,8 +512,8 @@ analyzeStructuredProductFacts(const KernelPhysicalFacts &kernelFacts,
   return facts;
 }
 
-mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
-                                               KernelPhysicalFacts &facts) {
+static mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
+                                                      KernelPhysicalFacts &facts) {
   facts.blockAxes.clear();
   facts.axes.clear();
   facts.values.clear();
@@ -741,5 +749,8 @@ mlir::LogicalResult analyzeKernelPhysicalFacts(KernelOp kernel,
   }
   return mlir::success();
 }
+
+KernelPhysicalFactsAnalysis::KernelPhysicalFactsAnalysis(KernelOp kernel)
+    : valid(mlir::succeeded(analyzeKernelPhysicalFacts(kernel, facts))) {}
 
 } // namespace weft::riscv_internal

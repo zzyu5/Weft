@@ -1,31 +1,9 @@
 #include "RISCVReuseAnalysis.h"
 
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/STLExtras.h"
-
 namespace weft::riscv_internal {
 namespace {
 
 using namespace weft::kernel;
-
-bool dependsOn(mlir::Value value, mlir::Value target,
-               llvm::DenseSet<mlir::Value> &visited) {
-  if (value == target)
-    return true;
-  if (!value || !visited.insert(value).second)
-    return false;
-  mlir::Operation *definition = value.getDefiningOp();
-  if (!definition)
-    return false;
-  return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
-    return dependsOn(operand, target, visited);
-  });
-}
-
-bool dependsOn(mlir::Value value, mlir::Value target) {
-  llvm::DenseSet<mlir::Value> visited;
-  return dependsOn(value, target, visited);
-}
 
 bool dependsOnAxis(const KernelPhysicalFacts &facts, mlir::Value value,
                    mlir::Value axis) {
@@ -80,12 +58,12 @@ LocalScheduleDependenceFacts analyzeLocalScheduleDependences(
         load ? dependsOnAxis(facts, load.getPointer(), reductionAxis)
              : dependsOnAxis(facts, operand, reductionAxis);
     operandFacts.feedsPrimitive =
-        !load || dependsOn(operand, load.getResult());
+        !load || valueDependsOn(operand, load.getResult());
     operandFacts.addressDependsOnAccumulator =
-        load ? dependsOn(load.getPointer(), accumulator)
-             : dependsOn(operand, accumulator);
+        load ? valueDependsOn(load.getPointer(), accumulator)
+             : valueDependsOn(operand, accumulator);
     operandFacts.predicateDependsOnAccumulator =
-        load && dependsOn(load.getWhere(), accumulator);
+        load && valueDependsOn(load.getWhere(), accumulator);
     auto value = facts.values.find(operand);
     if (value != facts.values.end()) {
       operandFacts.consumerCount = value->second.consumers.size();

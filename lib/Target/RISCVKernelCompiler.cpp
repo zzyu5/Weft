@@ -1,4 +1,4 @@
-#include "Weft/Target/RISCVLowering.h"
+#include "Weft/Target/RISCVCompiler.h"
 
 #include "RISCVCABI.h"
 #include "RISCVIntrinsicC.h"
@@ -18,6 +18,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdlib>
@@ -812,21 +813,11 @@ bool isRegionValue(mlir::Type type) {
   return logicalShapeKind(type) == LogicalShapeKind::Region;
 }
 
-std::optional<int64_t> integerConstantValue(mlir::Value value) {
-  auto constant = value.getDefiningOp<ConstantOp>();
-  auto integer = constant
-                     ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
-                     : mlir::IntegerAttr{};
-  if (!integer)
-    return std::nullopt;
-  return integer.getInt();
-}
-
 bool isKnownMultipleOf(mlir::Value value, int64_t divisor,
                        llvm::DenseSet<mlir::Value> &visited) {
   if (!value || divisor <= 0 || !visited.insert(value).second)
     return false;
-  if (std::optional<int64_t> constant = integerConstantValue(value))
+  if (std::optional<int64_t> constant = getConstantIndexValue(value))
     return *constant % divisor == 0;
   if (auto cast = value.getDefiningOp<CastOp>())
     return isKnownMultipleOf(cast.getInput(), divisor, visited);
@@ -947,17 +938,16 @@ CoreMappingProblem localReductionMapping(uint64_t extent) {
   return problem;
 }
 
-class KernelCompiler {
+class KernelLowering {
 public:
-  KernelCompiler(KernelOp kernel, const RISCVLoweringOptions &options,
-                llvm::raw_ostream &output,
-                SelectedLocalImplementations &selectedImplementations)
-      : kernel(kernel), options(options), output(output),
+  KernelLowering(KernelOp kernel, const KernelPhysicalFacts &kernelFacts,
+                 const RISCVCompilerOptions &options, llvm::raw_ostream &output,
+                 SelectedLocalImplementations &selectedImplementations)
+      : kernel(kernel), kernelFacts(kernelFacts), options(options), output(output),
         selectedImplementations(selectedImplementations) {}
 
-  mlir::LogicalResult compile() {
+  mlir::LogicalResult prepare() {
     mlir::Block &body = kernel.getBody().front();
-    llvm::SmallVector<std::string> parameters;
     auto names = kernel.getArgNames();
     auto kinds = kernel.getArgKinds();
     for (auto [index, argument] : llvm::enumerate(body.getArguments())) {
@@ -984,15 +974,20 @@ public:
     }
 
     mlir::Type returnType = kernel.getReturnType();
-    std::string returnTypeSpelling = mlir::isa<mlir::NoneType>(returnType)
-                                         ? "void"
-                                         : cABIScalarType(returnType);
+    returnTypeSpelling = mlir::isa<mlir::NoneType>(returnType)
+                             ? "void"
+                             : cABIScalarType(returnType);
     if (returnTypeSpelling.empty())
       return kernel.emitError(
           "RISC-V intrinsic C ABI has an unsupported return type");
     if (mlir::failed(preparePhysicalDecisions()))
       return mlir::failure();
     collectSelectedLocalImplementations();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult emit() {
+    mlir::Block &body = kernel.getBody().front();
     line(returnTypeSpelling + " " + cABIIdentifier(kernel.getSymName()) +
          "(" + llvm::join(parameters, ", ") + ") {");
     ++indent;
@@ -1061,166 +1056,8 @@ private:
       decisionFailure = true;
       return false;
     };
-    if (mlir::failed(weft::riscv_internal::analyzeKernelPhysicalFacts(
-            kernel, kernelFacts)))
-      return mlir::failure();
     if (mlir::failed(prepareMaterializedBlockValues()))
       return mlir::failure();
-    kernel.walk([&](SortIndicesOp op) {
-      if (decisionFailure)
-        return;
-      SortIndicesCandidateFacts facts;
-      if (std::optional<int64_t> extent = integerConstantValue(op.getExtent());
-          extent && *extent > 0)
-        facts.mapping.axes = {LogicalAxisConstraint{
-            0, LogicalAxisRole::Free,
-            static_cast<uint64_t>(*extent), true, false, false, {1}}};
-      else
-        facts.mapping.axes = {LogicalAxisConstraint{
-            0, LogicalAxisRole::Free, std::nullopt, true, false,
-            false, {1}}};
-      facts.descending = op.getOrder() == "descending";
-      facts.configuredRadixBits = options.backend.parameters.sortRadixBits;
-      std::optional<SelectedSortIndicesPhysical> selected =
-          selectSortIndicesPhysical(facts, options.target);
-      if (!selected) {
-        op.emitError(
-            "sort_indices has no legal radix implementation for this target and config");
-        decisionFailure = true;
-        return;
-      }
-      PlannedPhysicalDecision<SelectedSortIndicesPhysical> planned;
-      planned.realization = *selected;
-      planned.entity.resources = selected->resources;
-      planned.entity.storages.push_back(
-          PhysicalStorageDecision{{}, {}, selected->privateElements,
-                                  selected->privateAlignment});
-      registerDecision(physicalPlan.sortIndices, op.getOperation(),
-                       std::move(planned), "sort_indices");
-    });
-    kernel.walk([&](LoadF16LEOp op) {
-      if (decisionFailure)
-        return;
-      std::optional<LoadF16LEDecision> selected =
-          selectLoadF16LEPhysical(isKnownAlignedF16Pointer(op.getBase()),
-                                  options.target);
-      if (!selected) {
-        op.emitError("load_f16_le has no legal target implementation");
-        decisionFailure = true;
-        return;
-      }
-      PlannedPhysicalDecision<LoadF16LEDecision> planned;
-      initializeEntityPlan(planned.entity);
-      planned.realization = *selected;
-      registerDecision(physicalPlan.f16LELoads, op.getOperation(),
-                       std::move(planned), "load_f16_le");
-    });
-    kernel.walk([&](VLAOp vla) {
-      if (decisionFailure)
-        return;
-      mlir::FailureOr<PlannedPhysicalDecision<VLARegionDecision>> decision =
-          decideVLARegion(vla);
-      if (mlir::failed(decision)) {
-        decisionFailure = true;
-        return;
-      }
-      registerDecision(physicalPlan.vlaRegions, vla.getOperation(),
-                       std::move(*decision), "VLA region");
-    });
-    kernel.walk([&](AffineI4I8DotOp dot) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<AffineI4I8Decision> planned;
-      if (mlir::failed(
-              decideAffineI4I8Dot(dot, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      if (mlir::failed(finalizeAffineI4I8Plan(dot, planned))) {
-        decisionFailure = true;
-        return;
-      }
-      registerDecision(physicalPlan.affineI4I8, dot.getOperation(),
-                       std::move(planned), "affine_i4_i8_dot");
-    });
-    kernel.walk([&](MatmulOp matmul) {
-      if (decisionFailure)
-        return;
-      std::optional<PlannedPhysicalDecision<MatmulDecision>> decision =
-          decideMatmul(matmul);
-      if (!decision) {
-        matmul.emitError(
-            "matmul has no legal local microkernel for its typed axes, shape, target, and backend config");
-        decisionFailure = true;
-        return;
-      }
-      registerDecision(physicalPlan.matmuls, matmul.getOperation(),
-                       std::move(*decision), "matmul");
-    });
-    kernel.walk([&](DotOp dot) {
-      if (decisionFailure || isRegionValue(dot.getResult().getType()))
-        return;
-      mlir::FailureOr<PlannedPhysicalDecision<DotDecision>> decision =
-          decideLocalF32Dot(dot);
-      if (mlir::failed(decision)) {
-        decisionFailure = true;
-        return;
-      }
-      registerDecision(physicalPlan.dots, dot.getOperation(),
-                       std::move(*decision), "dot");
-    });
-    kernel.walk([&](SymmetricI4I8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<SymmetricI4I8Decision> planned;
-      if (mlir::failed(
-              decideSymmetricI4I8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      if (mlir::failed(finalizeSymmetricI4I8Plan(op, planned))) {
-        decisionFailure = true;
-        return;
-      }
-      registerDecision(physicalPlan.symmetricI4I8, op.getOperation(),
-                       std::move(planned), "symmetric_i4_i8_dot");
-    });
-    kernel.walk([&](SignBitI8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<SignBitI8Decision> planned;
-      if (mlir::failed(decideSignBitI8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeSignBitI8Plan(op, planned);
-      registerDecision(physicalPlan.signBitI8, op.getOperation(),
-                       std::move(planned), "sign_bit_i8_dot");
-    });
-    kernel.walk([&](E2M1E8M0I8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<E2M1E8M0I8Decision> planned;
-      if (mlir::failed(decideE2M1E8M0I8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeE2M1E8M0I8Plan(op, planned);
-      registerDecision(physicalPlan.e2m1E8M0I8, op.getOperation(),
-                       std::move(planned), "e2m1_e8m0_i8_dot");
-    });
-    kernel.walk([&](GroupedAffineI4I8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<GroupedAffineI4I8Decision> planned;
-      if (mlir::failed(decideGroupedAffineI4I8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeGroupedAffineI4I8Plan(op, planned);
-      registerDecision(physicalPlan.groupedAffineI4I8, op.getOperation(),
-                       std::move(planned), "grouped_affine_i4_i8_dot");
-    });
     auto prepareTernaryDot = [&](auto op, LocalPrimitiveKind primitive,
                                  llvm::ArrayRef<mlir::Value> blocks,
                                  llvm::ArrayRef<mlir::Value> scalars) {
@@ -1236,73 +1073,9 @@ private:
       registerDecision(physicalPlan.ternaryI8, op.getOperation(),
                        std::move(planned), "ternary_i8_dot");
     };
-    kernel.walk([&](Base3TernaryI8DotOp op) {
-      prepareTernaryDot(
-          op, LocalPrimitiveKind::Base3TernaryI8,
-          {op.getCodes(), op.getHighDigits(), op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](PackedI2TernaryI8DotOp op) {
-      prepareTernaryDot(
-          op, LocalPrimitiveKind::PackedI2TernaryI8,
-          {op.getCodes(), op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](SignedCodebookI8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<SignedCodebookI8Decision> planned;
-      if (mlir::failed(
-              decideSignedCodebookI8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeSignedCodebookI8Plan(op, planned);
-      registerDecision(physicalPlan.signedCodebookI8, op.getOperation(),
-                       std::move(planned), "signed_codebook_i8_dot");
-    });
-    kernel.walk([&](PackedU9U7CodebookI8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<PackedU9U7CodebookI8Decision> planned;
-      if (mlir::failed(
-              decidePackedU9U7CodebookI8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizePackedU9U7CodebookI8Plan(op, planned);
-      registerDecision(physicalPlan.packedU9U7CodebookI8, op.getOperation(),
-                       std::move(planned), "packed_u9_u7_codebook_i8_dot");
-    });
-    kernel.walk([&](PackedU11GridDeltaI8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<PackedU11GridDeltaI8Decision> planned;
-      if (mlir::failed(
-              decidePackedU11GridDeltaI8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizePackedU11GridDeltaI8Plan(op, planned);
-      registerDecision(physicalPlan.packedU11GridDeltaI8, op.getOperation(),
-                       std::move(planned), "packed_u11_grid_delta_i8_dot");
-    });
-    kernel.walk([&](NibbleCodebookI8DotOp op) {
-      if (decisionFailure)
-        return;
-      PlannedPhysicalDecision<NibbleCodebookI8Decision> planned;
-      if (mlir::failed(decideNibbleCodebookI8Dot(op, planned.realization))) {
-        decisionFailure = true;
-        return;
-      }
-      finalizeNibbleCodebookI8Plan(op, planned);
-      registerDecision(physicalPlan.nibbleCodebookI8, op.getOperation(),
-                       std::move(planned), "nibble_codebook_i8_dot");
-    });
-    auto prepareQuantI8Dot = [&](auto op,
-                                       LocalPrimitiveKind primitive,
-                                       llvm::ArrayRef<mlir::Value> blocks,
-                                       llvm::ArrayRef<mlir::Value> scalars) {
+    auto prepareQuantI8Dot = [&](auto op, LocalPrimitiveKind primitive,
+                                 llvm::ArrayRef<mlir::Value> blocks,
+                                 llvm::ArrayRef<mlir::Value> scalars) {
       if (decisionFailure)
         return;
       PlannedPhysicalDecision<QuantI8DotDecision> planned;
@@ -1316,54 +1089,252 @@ private:
       registerDecision(physicalPlan.quantI8Dots, op.getOperation(),
                        std::move(planned), "quant_i8_dot");
     };
-    kernel.walk([&](IQ2SI8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::IQ2SI8,
-          {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
-           op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](PackedI3GroupedI8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::PackedI3GroupedI8,
-          {op.getLowBits(), op.getHighBits(), op.getScales(),
-           op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](PackedI4I8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::PackedI4I8,
-          {op.getPackedCodes(), op.getActivation()},
-          {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
-           op.getInit()});
-    });
-    kernel.walk([&](PackedI5I8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::PackedI5I8,
-          {op.getLowBits(), op.getHighBits(), op.getActivation()},
-          {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
-           op.getInit()});
-    });
-    kernel.walk([&](IQ3SI8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::IQ3SI8,
-          {op.getCodes(), op.getHighBits(), op.getSignBits(), op.getScales(),
-           op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](IQ1MI8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::IQ1MI8,
-          {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
-           op.getActivation()},
-          {op.getActivationScale(), op.getInit()});
-    });
-    kernel.walk([&](Q6KI8DotOp op) {
-      prepareQuantI8Dot(
-          op, LocalPrimitiveKind::Q6KI8,
-          {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
-           op.getActivation()},
-          {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+
+    kernel.walk([&](mlir::Operation *operation) {
+      if (decisionFailure)
+        return;
+      llvm::TypeSwitch<mlir::Operation *, void>(operation)
+          .Case<SortIndicesOp>([&](auto op) {
+            SortIndicesCandidateFacts facts;
+            if (std::optional<int64_t> extent =
+                    getConstantIndexValue(op.getExtent());
+                extent && *extent > 0)
+              facts.mapping.axes = {LogicalAxisConstraint{
+                  0, LogicalAxisRole::Free, static_cast<uint64_t>(*extent),
+                  true, false, false, {1}}};
+            else
+              facts.mapping.axes = {LogicalAxisConstraint{
+                  0, LogicalAxisRole::Free, std::nullopt, true, false, false,
+                  {1}}};
+            facts.descending = op.getOrder() == "descending";
+            facts.configuredRadixBits =
+                options.backend.parameters.sortRadixBits;
+            std::optional<SelectedSortIndicesPhysical> selected =
+                selectSortIndicesPhysical(facts, options.target);
+            if (!selected) {
+              op.emitError(
+                  "sort_indices has no legal radix implementation for this target and config");
+              decisionFailure = true;
+              return;
+            }
+            PlannedPhysicalDecision<SelectedSortIndicesPhysical> planned;
+            planned.realization = *selected;
+            planned.entity.resources = selected->resources;
+            planned.entity.storages.push_back(PhysicalStorageDecision{
+                {}, {}, selected->privateElements, selected->privateAlignment});
+            registerDecision(physicalPlan.sortIndices, op.getOperation(),
+                             std::move(planned), "sort_indices");
+          })
+          .Case<LoadF16LEOp>([&](auto op) {
+            std::optional<LoadF16LEDecision> selected =
+                selectLoadF16LEPhysical(isKnownAlignedF16Pointer(op.getBase()),
+                                        options.target);
+            if (!selected) {
+              op.emitError("load_f16_le has no legal target implementation");
+              decisionFailure = true;
+              return;
+            }
+            PlannedPhysicalDecision<LoadF16LEDecision> planned;
+            initializeEntityPlan(planned.entity);
+            planned.realization = *selected;
+            registerDecision(physicalPlan.f16LELoads, op.getOperation(),
+                             std::move(planned), "load_f16_le");
+          })
+          .Case<VLAOp>([&](auto op) {
+            mlir::FailureOr<PlannedPhysicalDecision<VLARegionDecision>> decision =
+                decideVLARegion(op);
+            if (mlir::failed(decision)) {
+              decisionFailure = true;
+              return;
+            }
+            registerDecision(physicalPlan.vlaRegions, op.getOperation(),
+                             std::move(*decision), "VLA region");
+          })
+          .Case<AffineI4I8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<AffineI4I8Decision> planned;
+            if (mlir::failed(decideAffineI4I8Dot(op, planned.realization)) ||
+                mlir::failed(finalizeAffineI4I8Plan(op, planned))) {
+              decisionFailure = true;
+              return;
+            }
+            registerDecision(physicalPlan.affineI4I8, op.getOperation(),
+                             std::move(planned), "affine_i4_i8_dot");
+          })
+          .Case<MatmulOp>([&](auto op) {
+            std::optional<PlannedPhysicalDecision<MatmulDecision>> decision =
+                decideMatmul(op);
+            if (!decision) {
+              op.emitError(
+                  "matmul has no legal local microkernel for its typed axes, shape, target, and backend config");
+              decisionFailure = true;
+              return;
+            }
+            registerDecision(physicalPlan.matmuls, op.getOperation(),
+                             std::move(*decision), "matmul");
+          })
+          .Case<DotOp>([&](auto op) {
+            if (isRegionValue(op.getResult().getType()))
+              return;
+            mlir::FailureOr<PlannedPhysicalDecision<DotDecision>> decision =
+                decideLocalF32Dot(op);
+            if (mlir::failed(decision)) {
+              decisionFailure = true;
+              return;
+            }
+            registerDecision(physicalPlan.dots, op.getOperation(),
+                             std::move(*decision), "dot");
+          })
+          .Case<SymmetricI4I8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<SymmetricI4I8Decision> planned;
+            if (mlir::failed(decideSymmetricI4I8Dot(op, planned.realization)) ||
+                mlir::failed(finalizeSymmetricI4I8Plan(op, planned))) {
+              decisionFailure = true;
+              return;
+            }
+            registerDecision(physicalPlan.symmetricI4I8, op.getOperation(),
+                             std::move(planned), "symmetric_i4_i8_dot");
+          })
+          .Case<SignBitI8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<SignBitI8Decision> planned;
+            if (mlir::failed(decideSignBitI8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizeSignBitI8Plan(op, planned);
+            registerDecision(physicalPlan.signBitI8, op.getOperation(),
+                             std::move(planned), "sign_bit_i8_dot");
+          })
+          .Case<E2M1E8M0I8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<E2M1E8M0I8Decision> planned;
+            if (mlir::failed(decideE2M1E8M0I8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizeE2M1E8M0I8Plan(op, planned);
+            registerDecision(physicalPlan.e2m1E8M0I8, op.getOperation(),
+                             std::move(planned), "e2m1_e8m0_i8_dot");
+          })
+          .Case<GroupedAffineI4I8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<GroupedAffineI4I8Decision> planned;
+            if (mlir::failed(
+                    decideGroupedAffineI4I8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizeGroupedAffineI4I8Plan(op, planned);
+            registerDecision(physicalPlan.groupedAffineI4I8,
+                             op.getOperation(), std::move(planned),
+                             "grouped_affine_i4_i8_dot");
+          })
+          .Case<Base3TernaryI8DotOp>([&](auto op) {
+            prepareTernaryDot(
+                op, LocalPrimitiveKind::Base3TernaryI8,
+                {op.getCodes(), op.getHighDigits(), op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          })
+          .Case<PackedI2TernaryI8DotOp>([&](auto op) {
+            prepareTernaryDot(
+                op, LocalPrimitiveKind::PackedI2TernaryI8,
+                {op.getCodes(), op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          })
+          .Case<SignedCodebookI8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<SignedCodebookI8Decision> planned;
+            if (mlir::failed(
+                    decideSignedCodebookI8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizeSignedCodebookI8Plan(op, planned);
+            registerDecision(physicalPlan.signedCodebookI8,
+                             op.getOperation(), std::move(planned),
+                             "signed_codebook_i8_dot");
+          })
+          .Case<PackedU9U7CodebookI8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<PackedU9U7CodebookI8Decision> planned;
+            if (mlir::failed(
+                    decidePackedU9U7CodebookI8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizePackedU9U7CodebookI8Plan(op, planned);
+            registerDecision(physicalPlan.packedU9U7CodebookI8,
+                             op.getOperation(), std::move(planned),
+                             "packed_u9_u7_codebook_i8_dot");
+          })
+          .Case<PackedU11GridDeltaI8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<PackedU11GridDeltaI8Decision> planned;
+            if (mlir::failed(decidePackedU11GridDeltaI8Dot(
+                    op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizePackedU11GridDeltaI8Plan(op, planned);
+            registerDecision(physicalPlan.packedU11GridDeltaI8,
+                             op.getOperation(), std::move(planned),
+                             "packed_u11_grid_delta_i8_dot");
+          })
+          .Case<NibbleCodebookI8DotOp>([&](auto op) {
+            PlannedPhysicalDecision<NibbleCodebookI8Decision> planned;
+            if (mlir::failed(
+                    decideNibbleCodebookI8Dot(op, planned.realization))) {
+              decisionFailure = true;
+              return;
+            }
+            finalizeNibbleCodebookI8Plan(op, planned);
+            registerDecision(physicalPlan.nibbleCodebookI8,
+                             op.getOperation(), std::move(planned),
+                             "nibble_codebook_i8_dot");
+          })
+          .Case<IQ2SI8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::IQ2SI8,
+                {op.getCodes(), op.getHighBits(), op.getSignBits(),
+                 op.getScales(), op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          })
+          .Case<PackedI3GroupedI8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::PackedI3GroupedI8,
+                {op.getLowBits(), op.getHighBits(), op.getScales(),
+                 op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          })
+          .Case<PackedI4I8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::PackedI4I8,
+                {op.getPackedCodes(), op.getActivation()},
+                {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+                 op.getInit()});
+          })
+          .Case<PackedI5I8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::PackedI5I8,
+                {op.getLowBits(), op.getHighBits(), op.getActivation()},
+                {op.getZeroPoint(), op.getDotScale(), op.getAdditiveBias(),
+                 op.getInit()});
+          })
+          .Case<IQ3SI8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::IQ3SI8,
+                {op.getCodes(), op.getHighBits(), op.getSignBits(),
+                 op.getScales(), op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          })
+          .Case<IQ1MI8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::IQ1MI8,
+                {op.getCodes(), op.getHighDeltaBits(), op.getScales(),
+                 op.getActivation()},
+                {op.getActivationScale(), op.getInit()});
+          })
+          .Case<Q6KI8DotOp>([&](auto op) {
+            prepareQuantI8Dot(
+                op, LocalPrimitiveKind::Q6KI8,
+                {op.getLowBits(), op.getHighBits(), op.getGroupScales(),
+                 op.getActivation()},
+                {op.getWeightScale(), op.getActivationScale(), op.getInit()});
+          });
     });
     if (!decisionFailure && mlir::failed(prepareMaterializedF32Pointwise()))
       decisionFailure = true;
@@ -1416,11 +1387,13 @@ private:
   }
 
   KernelOp kernel;
-  const RISCVLoweringOptions &options;
+  const KernelPhysicalFacts &kernelFacts;
+  const RISCVCompilerOptions &options;
   llvm::raw_ostream &output;
   SelectedLocalImplementations &selectedImplementations;
+  llvm::SmallVector<std::string> parameters;
+  std::string returnTypeSpelling;
   llvm::DenseMap<mlir::Value, CValue> values;
-  KernelPhysicalFacts kernelFacts;
   RISCVPhysicalPlan physicalPlan;
   const llvm::SmallVector<BlockOperationDecision> *activeBlockOperations =
       nullptr;
@@ -1900,7 +1873,7 @@ private:
     }
     unsigned rowTile = 1;
     if (registerAxis) {
-      std::optional<int64_t> extent = integerConstantValue(registerAxis.getExtent());
+      std::optional<int64_t> extent = getConstantIndexValue(registerAxis.getExtent());
       if (!extent || *extent <= 0 ||
           static_cast<uint64_t>(*extent) >
               static_cast<uint64_t>(std::numeric_limits<unsigned>::max())) {
@@ -2029,7 +2002,7 @@ private:
         kernelFacts, {dot.getLhs(), dot.getRhs()}, reductionAxis.getResult(),
         dot.getInit(), dot.getResult());
     if (std::optional<int64_t> extent =
-            integerConstantValue(decision.reductionExtent);
+            getConstantIndexValue(decision.reductionExtent);
         extent && *extent >= 0)
       candidateFacts.reductionExtent = static_cast<uint64_t>(*extent);
     candidateFacts.mapping = axisProjection->mapping;
@@ -4523,25 +4496,6 @@ private:
         materialized.spelling.empty())
       return std::nullopt;
     return materialized.spelling;
-  }
-
-  bool valueDependsOn(mlir::Value value, mlir::Value target,
-                      llvm::DenseSet<mlir::Value> &visited) const {
-    if (value == target)
-      return true;
-    if (!value || !visited.insert(value).second)
-      return false;
-    mlir::Operation *definition = value.getDefiningOp();
-    if (!definition)
-      return false;
-    return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
-      return valueDependsOn(operand, target, visited);
-    });
-  }
-
-  bool valueDependsOn(mlir::Value value, mlir::Value target) const {
-    llvm::DenseSet<mlir::Value> visited;
-    return valueDependsOn(value, target, visited);
   }
 
   std::string scalarBinary(llvm::StringRef kind, llvm::StringRef lhs,
@@ -7323,17 +7277,8 @@ private:
     return snapshots;
   }
 
-  mlir::Value pointerRoot(mlir::Value value) const {
-    if (mlir::isa<PtrType>(value.getType()))
-      return value;
-    auto pointer = value.getDefiningOp<PtrAddOp>();
-    if (!pointer)
-      return {};
-    return pointerRoot(pointer.getBase());
-  }
-
   std::optional<int64_t> physicalExtent(mlir::Value value) {
-    if (std::optional<int64_t> constant = integerConstantValue(value))
+    if (std::optional<int64_t> constant = getConstantIndexValue(value))
       return constant;
     auto meta = value.getDefiningOp<MetaValueOp>();
     auto argument = meta
@@ -7853,7 +7798,7 @@ private:
     llvm::SmallVector<BlockIndexOp> axes = collectBlockAxes(load.getPointer());
     BlockIndexOp storageAxis = findDimensionAxis(load.getPointer(), 0, axes);
     if (!access || !storageAxis ||
-        integerConstantValue(storageAxis.getExtent()) != storageExtent ||
+        getConstantIndexValue(storageAxis.getExtent()) != storageExtent ||
         memoryRelation(*access, storageAxis.getResult()) !=
             LaneRelation::UnitStride)
       return std::nullopt;
@@ -12648,8 +12593,8 @@ private:
 } // namespace
 
 mlir::LogicalResult weft::riscv_internal::compileRISCVKernelsToIntrinsicC(
-    mlir::ModuleOp module, const RISCVLoweringOptions &options,
-    llvm::raw_ostream &output,
+    mlir::ModuleOp module, const RISCVCompilerOptions &options,
+    mlir::AnalysisManager &analysisManager, llvm::raw_ostream &output,
     SelectedLocalImplementations &selectedImplementations) {
   llvm::SmallVector<weft::kernel::KernelOp> kernels;
   for (weft::kernel::KernelOp kernel :
@@ -12658,8 +12603,14 @@ mlir::LogicalResult weft::riscv_internal::compileRISCVKernelsToIntrinsicC(
   if (kernels.empty())
     return module.emitError("RISC-V lowering requires a Weft kernel");
   for (weft::kernel::KernelOp kernel : kernels) {
-    KernelCompiler compiler(kernel, options, output, selectedImplementations);
-    if (mlir::failed(compiler.compile()))
+    KernelPhysicalFactsAnalysis &analysis =
+        analysisManager.getChildAnalysis<KernelPhysicalFactsAnalysis,
+                                         weft::kernel::KernelOp>(kernel);
+    if (!analysis.succeeded())
+      return mlir::failure();
+    KernelLowering lowering(kernel, analysis.getFacts(), options, output,
+                            selectedImplementations);
+    if (mlir::failed(lowering.prepare()) || mlir::failed(lowering.emit()))
       return mlir::failure();
   }
   return mlir::success();

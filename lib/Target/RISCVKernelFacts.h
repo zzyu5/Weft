@@ -119,6 +119,21 @@ struct KernelPhysicalFacts {
   llvm::DenseMap<mlir::Operation *, unsigned> operationOrdinals;
 };
 
+/// MLIR analysis owned by one canonical KernelOp. Construction is the only
+/// producer of target-independent axis, use, and memory facts for a RISC-V
+/// compilation invocation.
+class KernelPhysicalFactsAnalysis {
+public:
+  explicit KernelPhysicalFactsAnalysis(weft::kernel::KernelOp kernel);
+
+  bool succeeded() const { return valid; }
+  const KernelPhysicalFacts &getFacts() const { return facts; }
+
+private:
+  KernelPhysicalFacts facts;
+  bool valid = false;
+};
+
 struct StructuredProductFacts {
   llvm::SmallVector<mlir::Value> lhsAxes;
   llvm::SmallVector<mlir::Value> rhsAxes;
@@ -136,12 +151,10 @@ analyzeStructuredProductFacts(const KernelPhysicalFacts &facts, mlir::Value lhs,
 
 LaneRelation classifyLaneRelation(mlir::Value value, mlir::Value coordinate);
 mlir::Value findIndexedOffset(mlir::Value pointer, mlir::Value coordinate);
+bool valueDependsOn(mlir::Value value, mlir::Value target);
+std::optional<int64_t> getConstantIndexValue(mlir::Value value);
 bool haveSameInterleavedInvariantAddress(const InterleavedMemoryFact &lhs,
                                          const InterleavedMemoryFact &rhs);
-
-mlir::LogicalResult
-analyzeKernelPhysicalFacts(weft::kernel::KernelOp kernel,
-                           KernelPhysicalFacts &facts);
 
 } // namespace weft::riscv_internal
 

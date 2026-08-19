@@ -1,6 +1,5 @@
-#include "Weft/Target/RISCVLowering.h"
-
 #include "RISCVCABI.h"
+#include "RISCVHeader.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -124,7 +123,7 @@ struct HeaderExpression {
 
 mlir::FailureOr<HeaderExpression>
 storageExpression(KernelOp kernel, mlir::Value value,
-                  const weft::RISCVLoweringOptions &options,
+                  const weft::RISCVCompilerOptions &options,
                   llvm::DenseSet<mlir::Value> &visiting) {
   if (!visiting.insert(value).second) {
     kernel.emitError("storage extent expression contains a cycle");
@@ -250,7 +249,7 @@ std::string queryParameters(KernelOp kernel,
 
 mlir::LogicalResult emitStorageMetadata(
     KernelOp kernel, StorageOp storage,
-    const weft::RISCVLoweringOptions &options, llvm::raw_ostream &output) {
+    const weft::RISCVCompilerOptions &options, llvm::raw_ostream &output) {
   std::optional<unsigned> pointerIndex =
       entryArgumentIndex(kernel, storage.getPointer());
   if (!pointerIndex)
@@ -329,8 +328,8 @@ void emitPointerMetadata(KernelOp kernel, unsigned index, PtrType pointer,
 
 } // namespace
 
-mlir::LogicalResult weft::emitRISCVHeader(
-    mlir::ModuleOp module, const RISCVLoweringOptions &options,
+mlir::LogicalResult weft::riscv_internal::emitRISCVArtifactHeader(
+    mlir::ModuleOp module, const RISCVCompilerOptions &options,
     llvm::raw_ostream &output) {
   llvm::SmallVector<KernelOp> kernels;
   module.walk([&](KernelOp kernel) { kernels.push_back(kernel); });

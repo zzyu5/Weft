@@ -2,9 +2,10 @@
 #define WEFT_LIB_TARGET_RISCVKERNELCOMPILER_H
 
 #include "RISCVIntrinsicC.h"
-#include "Weft/Target/RISCVLowering.h"
+#include "Weft/Target/RISCVCompiler.h"
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/AnalysisManager.h"
 #include "mlir/Support/LogicalResult.h"
 
 namespace llvm {
@@ -15,7 +16,8 @@ namespace weft::riscv_internal {
 
 mlir::LogicalResult
 compileRISCVKernelsToIntrinsicC(mlir::ModuleOp module,
-                                const RISCVLoweringOptions &options,
+                                const RISCVCompilerOptions &options,
+                                mlir::AnalysisManager &analysisManager,
                                 llvm::raw_ostream &output,
                                 SelectedLocalImplementations &selectedImplementations);
 

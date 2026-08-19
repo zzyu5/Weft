@@ -20,11 +20,12 @@ add_library(WeftRISCVTarget STATIC
   RISCVQuantTernaryIntrinsicC.cpp
   RISCVQuantSignedCodebookIntrinsicC.cpp
   RISCVIMEIntrinsicC.cpp
-  RISCVLowering.cpp
+  RISCVCompiler.cpp
 )
 
 target_link_libraries(WeftRISCVTarget PUBLIC
   WeftExtensionDialect
   WeftKernelDialect
   MLIRIR
+  MLIRPass
 )

@@ -5,16 +5,23 @@
 ```text
 Python DSL kernel
 → canonical Weft Kernel IR
-→ one target-specific analysis / decision / lowering
-→ intrinsic C or typed local asm
+→ one MLIR RISC-V artifact pass
+→ typed analysis / physical decision / lowering
+→ intrinsic C with typed local asm + public header
 → system C compiler
-→ object, header and executable/library
+→ object and executable/library
 ```
 
 Persistent representation 只有 canonical Kernel IR 与最终 artifact。Kernel IR 可以保存作者的
 `pipeline` 授权；具体 candidate、layout、LMUL、microtile、packing、pipeline schedule/buffer
 和 fragment 都是一次 target lowering 内的短生命周期 C++ 数据，不形成 Physical IR、
 Selected IR 或第二份 authority。
+
+当前实现中，`compileRISCVModule` 创建 MLIR `PassManager`，对 `ModuleOp` 运行唯一的
+RISC-V artifact pass。该 pass 通过 `AnalysisManager` 为每个 canonical `KernelOp` 构造一次
+axis/use/memory facts，然后在同一次 invocation 中完成物理决定、intrinsic-C/asm 与
+header 生成。Pass 不把 target decision 写回 Kernel IR，也不产生 target dialect 或可序列化
+Physical IR。
 
 ## 前端职责
 
@@ -48,9 +55,10 @@ facts/target facts；不按 kernel、格式、VLEN 或 source closure 进入完�
 
 ### 4. 发射
 
-Emitter 只把 selected decision 拼写为普通 C control/address、RVV intrinsic 与 primitive-local
-IME asm。它不重新识别 command，不重新选择 LMUL、memory form、microtile、decode chunk、
-pipeline 或 fragment。
+Emitter 把 canonical scalar control/address 直接投影为普通 C，并把 selected local decision
+拼写为 RVV intrinsic 与 primitive-local IME asm。它可读取 op 的源语义以发射控制流、
+地址和标量运算，但不得由此重新识别 command，也不得重新选择 LMUL、memory form、
+microtile、decode chunk、pipeline 或 fragment。
 
 ## Op-specific rule 与共享 mapping
 
@@ -72,6 +80,10 @@ fragment。它具有明确输入/输出物理形态、资源、mask/tail、dtype
 普通 DSL kernel 必须在不依赖 examples catalog 的情况下编译为可调用 artifact。`source/` 是
 baseline source，`materials/` 是只读知识供体；二者不进入 include/import/link/runtime，也不
 构成 fallback。
+
+当前 Weft compiler API 的 artifact 边界是 intrinsic C（其中可含局部 asm）与 public
+header。Object、library 和 executable 由后续 system C compiler/runtime 生成，不是
+`compileRISCVModule` 的返回字段。
 
 ## 明确禁止
 

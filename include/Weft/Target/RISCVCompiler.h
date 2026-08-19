@@ -1,5 +1,5 @@
-#ifndef WEFT_TARGET_RISCVLOWERING_H
-#define WEFT_TARGET_RISCVLOWERING_H
+#ifndef WEFT_TARGET_RISCVCOMPILER_H
+#define WEFT_TARGET_RISCVCOMPILER_H
 
 #include "Weft/Target/RISCVTargetProfile.h"
 
@@ -7,9 +7,8 @@
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/StringMap.h"
 
-namespace llvm {
-class raw_ostream;
-}
+#include <cstdint>
+#include <string>
 
 namespace weft {
 
@@ -38,20 +37,23 @@ struct RISCVBackendConfig {
   RISCVCandidateParameters parameters;
 };
 
-struct RISCVLoweringOptions {
+struct RISCVCompilerOptions {
   RISCVTargetProfile target;
   llvm::StringMap<int64_t> metaBindings;
   RISCVBackendConfig backend;
 };
 
-mlir::LogicalResult lowerToRISCVIntrinsicC(
-    mlir::ModuleOp module, const RISCVLoweringOptions &options,
-    llvm::raw_ostream &output);
+struct RISCVArtifact {
+  std::string intrinsicC;
+  std::string header;
+};
 
-mlir::LogicalResult emitRISCVHeader(
-    mlir::ModuleOp module, const RISCVLoweringOptions &options,
-    llvm::raw_ostream &output);
+/// Run the unique MLIR RISC-V compilation pass and return both public
+/// artifacts. Physical facts, candidates, and selected decisions remain
+/// transient state owned by this invocation.
+mlir::FailureOr<RISCVArtifact>
+compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
 } // namespace weft
 
-#endif // WEFT_TARGET_RISCVLOWERING_H
+#endif // WEFT_TARGET_RISCVCOMPILER_H

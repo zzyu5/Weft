@@ -20,8 +20,12 @@ Kernel IR
 ## 普通控制与地址
 
 作者的 scalar `for/while/if`、pointer arithmetic、workspace access 与 effect 原样投影为普通 C。
-`W.blocks` 仍是作者的 block traversal；target 不替换其 loop order。`W.pipeline` 授权的 loop 可在
-保持依赖与 effect 的前提下生成局部 prologue/steady/epilogue。
+`W.blocks` 仍是作者的 block traversal；target 不替换其 loop order。`W.pipeline` 仅把
+当前已存在 loop 标记为允许局部重排；当前 RISC-V lowering 尚未实现通用 loop
+prologue/steady/epilogue scheduler，因而对该构造采用合法的顺序 realization。
+
+Dot/matmul leaf 已有的 K-unroll 和 register load buffering 属于 explicit primitive 内部的
+realization，由 primitive 本身授权；它不等于对作者 `for` loop 实现了通用流水。
 
 ## Selected local operation
 
@@ -53,5 +57,7 @@ materials fallback。
 
 ## Artifact
 
-成功结果包括可编译 intrinsic C/局部 asm、system compiler 生成的 object/library，以及调用所需
-header 和 workspace/persistent metadata。Artifact 不链接 `source/` 或 `materials/`。
+`compileRISCVModule` 的成功结果是可编译 intrinsic C/局部 asm 与调用所需 header，
+header 包含已能从 canonical storage contract 投影的 workspace/persistent metadata。System C
+compiler 再生成 object/library/executable；这些不是当前 compiler API 返回的 artifact 字段。
+Artifact 不链接 `source/` 或 `materials/`。

@@ -1,6 +1,6 @@
 #include "Weft/Dialect/Extension/IR/ExtensionDialect.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
-#include "Weft/Target/RISCVLowering.h"
+#include "Weft/Target/RISCVCompiler.h"
 #include "Weft/Target/RISCVTargetProfile.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -13,6 +13,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
+
+#include <utility>
 
 namespace {
 
@@ -149,7 +151,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (emitKind == "intrinsic-c") {
-    weft::RISCVLoweringOptions options;
+    weft::RISCVCompilerOptions options;
     std::string error;
     if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, matrixExtension,
                                        options.target, error)) {
@@ -187,12 +189,14 @@ int main(int argc, char **argv) {
                    << "\n";
       return 1;
     }
-    if (!parseMetaBindings(options.metaBindings) ||
-        mlir::failed(
-            weft::lowerToRISCVIntrinsicC(*module, options, output.os())) ||
-        mlir::failed(
-            weft::emitRISCVHeader(*module, options, header.os())))
+    if (!parseMetaBindings(options.metaBindings))
       return 1;
+    mlir::FailureOr<weft::RISCVArtifact> artifact =
+        weft::compileRISCVModule(*module, std::move(options));
+    if (mlir::failed(artifact))
+      return 1;
+    output.os() << artifact->intrinsicC;
+    header.os() << artifact->header;
     header.keep();
   } else {
     module->print(output.os());

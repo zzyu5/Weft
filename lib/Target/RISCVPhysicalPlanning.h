@@ -3,7 +3,7 @@
 
 #include "RISCVAxisMapping.h"
 #include "RISCVKernelFacts.h"
-#include "Weft/Target/RISCVLowering.h"
+#include "Weft/Target/RISCVCompiler.h"
 
 #include "llvm/ADT/SmallVector.h"
 
