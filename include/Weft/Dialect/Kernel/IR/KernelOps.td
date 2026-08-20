@@ -9,13 +9,12 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 def WEFT_Kernel_Dialect : Dialect {
   let name = "weft_kernel";
   let cppNamespace = "::weft::kernel";
-  let summary = "Canonical worker-local Weft kernel semantics";
+  let summary = "Canonical Weft level, value, encoding, and operation semantics";
   let description = [{
-    The dialect is the sole algorithm representation consumed by Weft.  It
-    records worker-local scalar control, one-dimensional VLA regions, logical
-    blocks, predicates, state algebra and structured compute.  It deliberately
-    contains no launch grid, hardware lanes, vector length, LMUL, physical layout,
-    register tile, provider identity or instruction spelling.
+    This dialect is the sole persistent Weft program representation. It records
+    logical encodings, views, values, level ownership, ordinary ordered control,
+    and explicit basic operations. It contains no hardware layout, vector width,
+    register tile, fragment, instruction spelling, or built-in operator kernel.
   }];
   let useDefaultTypePrinterParser = 1;
 }
@@ -28,114 +27,177 @@ class WeftKernel_Type<string name, string typeMnemonic, list<Trait> traits = []>
 class WeftKernel_Op<string mnemonic, list<Trait> traits = []>
     : Op<WEFT_Kernel_Dialect, mnemonic, traits>;
 
-def WeftKernel_PtrType : WeftKernel_Type<"Ptr", "ptr"> {
-  let summary = "Typed pointer and author-declared alias/access facts";
+def WeftKernel_EncodingType : WeftKernel_Type<"Encoding", "encoding"> {
+  let parameters = (ins
+    StringRefParameter<"encoding family">:$family,
+    StringRefParameter<"base, dense, derived_family, derived_instance, or ephemeral">:$kind,
+    StringRefParameter<"fixed physical layout identity, otherwise empty">:$layoutIdentity
+  );
+  let assemblyFormat =
+      "`<` $family `,` $kind `,` $layoutIdentity `>`";
+  let genVerifyDecl = 1;
+}
+
+def WeftKernel_ViewType : WeftKernel_Type<"View", "view"> {
+  let parameters = (ins
+    "::mlir::Type":$encoding,
+    "::mlir::DenseI64ArrayAttr":$shape,
+    "::mlir::DenseI64ArrayAttr":$axisIds
+  );
+  let assemblyFormat =
+      "`<` $encoding `,` $shape `,` $axisIds `>`";
+  let genVerifyDecl = 1;
+}
+
+def WeftKernel_ValueType : WeftKernel_Type<"Value", "value"> {
   let parameters = (ins
     "::mlir::Type":$elementType,
-    StringRefParameter<"read, write, or readwrite">:$access,
-    "bool":$noAlias,
-    "int64_t":$alignment,
-    "bool":$restrictLike,
-    StringRefParameter<"external, persistent, or workspace">:$storageClass,
-    StringRefParameter<"persistent storage format identity, otherwise empty">:$storageFormat
+    "::mlir::DenseI64ArrayAttr":$shape,
+    "::mlir::DenseI64ArrayAttr":$axisIds
   );
-  let assemblyFormat = "`<` $elementType `,` $access `,` $noAlias `,` $alignment `,` $restrictLike `,` $storageClass `,` $storageFormat `>`";
+  let assemblyFormat =
+      "`<` $elementType `,` $shape `,` $axisIds `>`";
   let genVerifyDecl = 1;
 }
 
-def WeftKernel_ConstexprType : WeftKernel_Type<"Constexpr", "constexpr"> {
-  let summary = "Specialization-time scalar meta-parameter";
-  let parameters = (ins "::mlir::Type":$valueType);
-  let assemblyFormat = "`<` $valueType `>`";
-  let genVerifyDecl = 1;
-}
-
-def WeftKernel_BlockType : WeftKernel_Type<"Block", "block"> {
-  let summary = "Logical block domain with explicit author axis identity";
+def WeftKernel_SliceType : WeftKernel_Type<"Slice", "slice"> {
   let parameters = (ins
-    ArrayRefParameter<"int64_t">:$shape,
-    ArrayRefParameter<"int64_t">:$axisIds,
-    "::mlir::Type":$elementType
+    "::mlir::Type":$encoding,
+    "::mlir::DenseI64ArrayAttr":$shape,
+    "::mlir::DenseI64ArrayAttr":$axisIds
   );
-  let assemblyFormat = "`<` `[` $shape `]` `,` `[` $axisIds `]` `,` $elementType `>`";
+  let assemblyFormat =
+      "`<` $encoding `,` $shape `,` $axisIds `>`";
   let genVerifyDecl = 1;
 }
 
-def WeftKernel_RegionType : WeftKernel_Type<"Region", "region"> {
-  let summary = "Value over the active VLA axis plus zero or more block axes";
+def WeftKernel_DomainType : WeftKernel_Type<"Domain", "domain"> {
   let parameters = (ins
-    ArrayRefParameter<"int64_t">:$shape,
-    ArrayRefParameter<"int64_t">:$axisIds,
-    "::mlir::Type":$elementType
+    StringRefParameter<"axis name">:$axisName,
+    "int64_t":$axisId,
+    StringRefParameter<"root, rows, cols, tiles, blocks, or subs">:$relation,
+    StringRefParameter<"logical extent expression">:$extent,
+    StringRefParameter<"partition expression">:$partition,
+    StringRefParameter<"multiplicity expression">:$multiplicity,
+    StringRefParameter<"exact or tail">:$tail
   );
-  let assemblyFormat = "`<` `[` $shape `]` `,` `[` $axisIds `]` `,` $elementType `>`";
+  let assemblyFormat =
+      "`<` $axisName `,` $axisId `,` $relation `,` $extent `,` $partition `,` $multiplicity `,` $tail `>`";
   let genVerifyDecl = 1;
 }
 
-def WeftKernel_MaskedType : WeftKernel_Type<"Masked", "masked"> {
-  let summary = "A value carrying first-class logical validity";
-  let parameters = (ins "::mlir::Type":$valueType);
-  let assemblyFormat = "`<` $valueType `>`";
+def WeftKernel_PointType : WeftKernel_Type<"Point", "point"> {
+  let parameters = (ins WeftKernel_DomainType:$domain);
+  let assemblyFormat = "`<` $domain `>`";
   let genVerifyDecl = 1;
 }
 
-def WeftKernel_TupleType : WeftKernel_Type<"Tuple", "tuple"> {
-  let summary = "Closed heterogeneous state tuple";
-  let parameters = (ins ArrayRefParameter<"::mlir::Type">:$types);
-  let assemblyFormat = "`<` `[` $types `]` `>`";
-  let genVerifyDecl = 1;
-}
-
-def WeftKernel_ReturnOp : WeftKernel_Op<"return", [Terminator]> {
-  let arguments = (ins Variadic<AnyType>:$values);
-  let results = (outs);
+def WeftKernel_EncodingDeclOp
+    : WeftKernel_Op<"encoding_decl", [Symbol, Pure]> {
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    StrAttr:$kind,
+    StrAttr:$layout_identity,
+    StrAttr:$bit_order,
+    StrAttr:$byte_order,
+    I64Attr:$alignment,
+    I64Attr:$storage_bits,
+    ArrayAttr:$field_names,
+    ArrayAttr:$field_types,
+    ArrayAttr:$field_shapes,
+    ArrayAttr:$field_packing,
+    DenseI64ArrayAttr:$field_bit_offsets,
+    DenseI64ArrayAttr:$field_storage_bits,
+    DenseI64ArrayAttr:$padding
+  );
   let hasVerifier = 1;
 }
 
-def WeftKernel_YieldOp : WeftKernel_Op<"yield", [Terminator]> {
-  let arguments = (ins Variadic<AnyType>:$values);
-  let results = (outs);
+def WeftKernel_DeriveOp
+    : WeftKernel_Op<"derive", [Symbol, IsolatedFromAbove, SingleBlock, Pure]> {
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       StrAttr:$source_family,
+                       StrAttr:$result_family,
+                       ArrayAttr:$parameters);
+  let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
 }
 
-def WeftKernel_ConditionOp : WeftKernel_Op<"condition", [Terminator]> {
-  let arguments = (ins I1:$condition, Variadic<AnyType>:$values);
-  let results = (outs);
+def WeftKernel_DeriveYieldOp : WeftKernel_Op<"derive_yield", [Terminator]> {
+  let arguments = (ins WeftKernel_ViewType:$value);
   let hasVerifier = 1;
 }
 
 def WeftKernel_KernelOp
     : WeftKernel_Op<"kernel", [Symbol, IsolatedFromAbove, SingleBlock]> {
-  let summary = "One worker-local AOT kernel entry";
-  let arguments = (ins
-    SymbolNameAttr:$sym_name,
-    ArrayAttr:$arg_names,
-    ArrayAttr:$arg_kinds,
-    TypeAttr:$return_type,
-    StrAttr:$source
-  );
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       ArrayAttr:$arg_names,
+                       ArrayAttr:$shape_symbols,
+                       StrAttr:$source);
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
 }
 
-def WeftKernel_ConstantOp : WeftKernel_Op<"constant", [Pure]> {
-  let arguments = (ins AnyAttr:$value);
-  let results = (outs AnyType:$result);
+def WeftKernel_ReturnOp : WeftKernel_Op<"return", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values);
   let hasVerifier = 1;
 }
 
-def WeftKernel_MetaValueOp : WeftKernel_Op<"meta_value", [Pure]> {
-  let arguments = (ins WeftKernel_ConstexprType:$input);
-  let results = (outs AnyType:$result);
+def WeftKernel_RootDomainOp : WeftKernel_Op<"root_domain", [Pure]> {
+  let results = (outs WeftKernel_DomainType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_StorageOp : WeftKernel_Op<"storage"> {
-  let summary = "Source-visible persistent or worker-local storage shape";
-  let arguments = (ins WeftKernel_PtrType:$pointer,
-                       Variadic<Index>:$extents,
-                       DenseI64ArrayAttr:$shape);
-  let results = (outs);
+def WeftKernel_SymbolOp : WeftKernel_Op<"symbol", [Pure]> {
+  let arguments = (ins StrAttr:$name, StrAttr:$kind);
+  let results = (outs Index:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_DomainOp : WeftKernel_Op<"domain", [Pure]> {
+  let arguments = (ins WeftKernel_DomainType:$parent);
+  let results = (outs WeftKernel_DomainType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_LevelOp
+    : WeftKernel_Op<"level", [RecursiveMemoryEffects]> {
+  let arguments = (ins WeftKernel_DomainType:$domain,
+                       Variadic<AnyType>:$carried,
+                       ArrayAttr:$state_names,
+                       ArrayAttr:$staged_names);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$state_births,
+                         SizedRegion<1>:$staged_births,
+                         SizedRegion<1>:$body);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_BirthsYieldOp : WeftKernel_Op<"births_yield", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_HandoffOp : WeftKernel_Op<"handoff", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values, ArrayAttr:$names);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_YieldOp : WeftKernel_Op<"yield", [Terminator]> {
+  let arguments = (ins Variadic<AnyType>:$values);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_ConditionOp : WeftKernel_Op<"condition", [Terminator]> {
+  let arguments = (ins I1:$condition, Variadic<AnyType>:$values);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_ForOp : WeftKernel_Op<"for", [RecursiveMemoryEffects]> {
+  let arguments = (ins Index:$lower, Index:$upper, Index:$step,
+                       Variadic<AnyType>:$init_args);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
 }
 
@@ -147,15 +209,6 @@ def WeftKernel_IfOp : WeftKernel_Op<"if", [RecursiveMemoryEffects]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_ForOp : WeftKernel_Op<"for", [RecursiveMemoryEffects]> {
-  let arguments = (ins Index:$lower, Index:$upper, Index:$step,
-                       Variadic<AnyType>:$init_args,
-                       StrAttr:$traversal, BoolAttr:$pipeline);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region SizedRegion<1>:$body);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_WhileOp : WeftKernel_Op<"while", [RecursiveMemoryEffects]> {
   let arguments = (ins Variadic<AnyType>:$init_args);
   let results = (outs Variadic<AnyType>:$results);
@@ -164,195 +217,159 @@ def WeftKernel_WhileOp : WeftKernel_Op<"while", [RecursiveMemoryEffects]> {
   let hasVerifier = 1;
 }
 
-def WeftKernel_VLAOp : WeftKernel_Op<"vla", [RecursiveMemoryEffects]> {
-  let arguments = (ins Index:$begin, Index:$end);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region SizedRegion<1>:$body);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_BlockIndexOp : WeftKernel_Op<"block_index", [Pure]> {
-  let summary = "One source-owned logical block axis and its coordinates";
-  let arguments = (ins Index:$extent, Index:$offset, I64Attr:$axis);
-  let results = (outs WeftKernel_BlockType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_FullOp : WeftKernel_Op<"full", [Pure]> {
-  let arguments = (ins AnyType:$value,
-                       Variadic<WeftKernel_BlockType>:$axes);
-  let results = (outs WeftKernel_BlockType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_ExpandDimsOp : WeftKernel_Op<"expand_dims", [Pure]> {
-  let arguments = (ins AnyType:$input, I64Attr:$axis);
+def WeftKernel_ConstantOp : WeftKernel_Op<"constant", [Pure]> {
+  let arguments = (ins AnyAttr:$value);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_PtrAddOp : WeftKernel_Op<"ptr_add", [Pure]> {
-  let arguments = (ins AnyType:$base, AnyType:$offset);
+def WeftKernel_NewOp : WeftKernel_Op<"new", [Pure]> {
+  let arguments = (ins Optional<AnyType>:$initial, BoolAttr:$initialized);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_MaterializeOp : WeftKernel_Op<"materialize", [Pure]> {
+  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_AdmitOp : WeftKernel_Op<"admit", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins AnyType:$region, OptionalAttr<StrAttr>:$engine);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_CommitOp : WeftKernel_Op<"commit", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins AnyType:$value, AnyType:$region,
+                       OptionalAttr<StrAttr>:$engine);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_StageHandoffOp : WeftKernel_Op<"stage_handoff", [Pure]> {
+  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_SliceOp : WeftKernel_Op<"slice", [Pure]> {
+  let arguments = (ins AnyType:$base, Variadic<AnyType>:$indices,
+                       ArrayAttr:$selectors);
+  let results = (outs WeftKernel_SliceType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_FieldOp : WeftKernel_Op<"field", [Pure]> {
+  let arguments = (ins AnyType:$owner, StrAttr:$name);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_ExtractOp : WeftKernel_Op<"extract", [Pure]> {
+  let arguments = (ins AnyType:$input, Variadic<AnyType>:$indices,
+                       ArrayAttr:$selectors);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_UpdateOp : WeftKernel_Op<"update", [Pure]> {
+  let arguments = (ins AnyType:$input, AnyType:$value,
+                       Variadic<AnyType>:$indices, ArrayAttr:$selectors);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_UnaryOp : WeftKernel_Op<"unary", [Pure]> {
-  let arguments = (ins AnyType:$input, StrAttr:$kind, StrAttr:$math);
+  let arguments = (ins AnyType:$input, StrAttr:$kind,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_BinaryOp : WeftKernel_Op<"binary", [Pure]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$kind);
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$kind,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$predicate);
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$predicate,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
-  let arguments = (ins AnyType:$input);
+  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_BitcastOp : WeftKernel_Op<"bitcast", [Pure]> {
-  let arguments = (ins AnyType:$input);
+class WeftKernel_GroupedMacOp<string mnemonic>
+    : WeftKernel_Op<mnemonic, [Pure]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, I64Attr:$group,
+                       StrAttr:$overflow, OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_SelectOp : WeftKernel_Op<"select", [Pure]> {
-  let arguments = (ins AnyType:$predicate, AnyType:$true_value,
-                       AnyType:$false_value);
+def WeftKernel_MacPairsOp : WeftKernel_GroupedMacOp<"mac_pairs">;
+def WeftKernel_MacGroupsOp : WeftKernel_GroupedMacOp<"mac_groups">;
+
+def WeftKernel_WidenOp : WeftKernel_Op<"widen", [Pure]> {
+  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_TupleOp : WeftKernel_Op<"tuple", [Pure]> {
-  let arguments = (ins Variadic<AnyType>:$values);
-  let results = (outs WeftKernel_TupleType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_TupleGetOp : WeftKernel_Op<"tuple_get", [Pure]> {
-  let arguments = (ins WeftKernel_TupleType:$input, I64Attr:$index);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_SpecialValueOp : WeftKernel_Op<"special_value", [Pure]> {
-  let arguments = (ins StrAttr:$kind);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_InvalidOp : WeftKernel_Op<"invalid", [Pure]> {
-  let summary = "Explicit absence of a filled value or optional predicate";
-  let arguments = (ins);
-  let results = (outs NoneType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_LoadOp : WeftKernel_Op<"load", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$pointer, AnyType:$where, AnyType:$other,
-                       I64Attr:$alignment);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_StoreOp : WeftKernel_Op<"store", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins AnyType:$pointer, AnyType:$value, AnyType:$where,
-                       I64Attr:$alignment);
-  let results = (outs);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_SortIndicesOp
-    : WeftKernel_Op<"sort_indices", [MemoryEffects<[MemRead, MemWrite]>]> {
-  let summary = "Stable local ordering of an f32 pointer slice into u32 indices";
-  let arguments = (ins WeftKernel_PtrType:$input,
-                       WeftKernel_PtrType:$output,
-                       WeftKernel_PtrType:$scratch,
-                       Index:$extent,
-                       StrAttr:$order,
-                       StrAttr:$nan,
-                       StrAttr:$tie);
-  let results = (outs);
   let hasVerifier = 1;
 }
 
 def WeftKernel_ReduceOp : WeftKernel_Op<"reduce", [Pure]> {
-  let arguments = (ins AnyType:$input, AnyType:$identity, AnyType:$where,
-                       StrAttr:$kind, I64Attr:$axis, StrAttr:$order,
-                       TypeAttr:$acc_dtype);
+  let arguments = (ins AnyType:$input, StrAttr:$kind, I64Attr:$axis,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_ScanOp : WeftKernel_Op<"scan", [Pure]> {
-  let arguments = (ins AnyType:$input, AnyType:$identity, AnyType:$where,
-                       AnyType:$segment_start, StrAttr:$kind,
-                       BoolAttr:$inclusive, StrAttr:$order,
-                       TypeAttr:$acc_dtype);
+def WeftKernel_Fold2Op : WeftKernel_Op<"fold2", [Pure]> {
+  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_ArgMaxOp : WeftKernel_Op<"argmax", [Pure]> {
-  let summary = "Maximum f32 value with explicit logical coordinate tie-breaking";
-  let arguments = (ins AnyType:$input, AnyType:$coordinate,
-                       StrAttr:$tie, StrAttr:$order);
-  let results = (outs WeftKernel_TupleType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_OnlineSoftmaxSummaryOp
-    : WeftKernel_Op<"online_softmax_summary", [Pure]> {
-  let summary = "Stable f32 maximum and exponentially rescaled sum";
-  let arguments = (ins AnyType:$input, StrAttr:$math, StrAttr:$order);
-  let results = (outs WeftKernel_TupleType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_DotOp : WeftKernel_Op<"dot", [Pure]> {
-  let summary = "Dot over the final logical block axis of both operands";
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$init,
-                       TypeAttr:$acc_dtype, StrAttr:$order, StrAttr:$math);
+class WeftKernel_ContractLikeOp<string mnemonic>
+    : WeftKernel_Op<mnemonic, [Pure]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs,
+                       DenseI64ArrayAttr:$over,
+                       OptionalAttr<TypeAttr>:$acc_type,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_MatmulOp : WeftKernel_Op<"matmul", [Pure]> {
-  let summary = "Local rank-two [M,K] x [K,N] matrix multiplication";
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$init,
-                       TypeAttr:$acc_dtype, StrAttr:$order, StrAttr:$math);
-  let results = (outs AnyType:$result);
-  let hasVerifier = 1;
-}
+def WeftKernel_DotOp : WeftKernel_ContractLikeOp<"dot">;
+def WeftKernel_ContractOp : WeftKernel_ContractLikeOp<"contract">;
+def WeftKernel_OuterContractOp
+    : WeftKernel_ContractLikeOp<"outer_contract">;
 
 def WeftKernel_LookupOp : WeftKernel_Op<"lookup", [Pure]> {
-  let arguments = (ins AnyType:$table, AnyType:$indices, AnyType:$where);
+  let arguments = (ins AnyType:$table, AnyType:$indices,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_DecodeOp : WeftKernel_Op<"decode", [Pure]> {
-  let arguments = (ins AnyType:$codes, AnyType:$table, AnyType:$where,
-                       TypeAttr:$out_dtype);
-  let results = (outs AnyType:$result);
+def WeftKernel_PackOp : WeftKernel_Op<"pack", [Pure]> {
+  let arguments = (ins AnyType:$view, StrAttr:$along,
+                       OptionalAttr<StrAttr>:$engine);
+  let results = (outs WeftKernel_ViewType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_NarrowOp : WeftKernel_Op<"narrow", [Pure]> {
-  let arguments = (ins AnyType:$input, StrAttr:$rounding,
-                       BoolAttr:$saturation);
-  let results = (outs AnyType:$result);
+def WeftKernel_InterleaveOp : WeftKernel_Op<"interleave", [Pure]> {
+  let arguments = (ins WeftKernel_ViewType:$view, I64Attr:$rows,
+                       OptionalAttr<StrAttr>:$engine);
+  let results = (outs WeftKernel_ViewType:$result);
   let hasVerifier = 1;
 }
 

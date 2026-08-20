@@ -3,8 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from weft.language import DType
-from weft.language import DTypeCategory
+from weft.language.dtypes import DType, DTypeCategory
 
 
 class ValueType:
@@ -17,51 +16,47 @@ class ScalarType(ValueType):
 
 
 @dataclass(frozen=True, slots=True)
-class PointerType(ValueType):
-    element_type: ScalarType
-    access: str
-    noalias: bool
-    alignment: int
-    restrict_like: bool
-    storage_class: str
-    storage_format: str
+class EncodingType(ValueType):
+    family: str
+    kind: str
+    layout_identity: str
 
 
 @dataclass(frozen=True, slots=True)
-class ConstexprType(ValueType):
-    value_type: ScalarType
-
-
-@dataclass(frozen=True, slots=True)
-class BlockType(ValueType):
+class ViewType(ValueType):
+    encoding: EncodingType
     shape: tuple[int, ...]
     axes: tuple[int, ...]
-    element_type: ValueType
 
 
 @dataclass(frozen=True, slots=True)
-class RegionType(ValueType):
+class LocalValueType(ValueType):
+    element_type: ValueType
     shape: tuple[int, ...]
     axes: tuple[int, ...]
-    element_type: ValueType
 
 
 @dataclass(frozen=True, slots=True)
-class MaskedType(ValueType):
-    value_type: ValueType
+class SliceType(ValueType):
+    encoding: EncodingType
+    shape: tuple[int, ...]
+    axes: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class TupleType(ValueType):
-    fields: tuple[ValueType, ...]
+class DomainType(ValueType):
+    axis_name: str
+    axis_id: int
+    relation: str
+    extent: str
+    partition: str
+    multiplicity: str
+    tail: str
 
 
 @dataclass(frozen=True, slots=True)
-class NoneType(ValueType):
-    pass
-
-
-NONE_TYPE = NoneType()
+class DomainPointType(ValueType):
+    domain: DomainType
 
 
 def emit_type(value_type: ValueType) -> str:
@@ -72,104 +67,77 @@ def emit_type(value_type: ValueType) -> str:
         if dtype.category is DTypeCategory.INDEX:
             return "index"
         if dtype.category is DTypeCategory.INTEGER:
-            prefix = "s" if dtype.signedness == "signed" else "u"
-            return f"{prefix}i{dtype.bits}"
+            prefix = "si" if dtype.signedness == "signed" else "ui"
+            return f"{prefix}{dtype.bits}"
         return dtype.name
-    if isinstance(value_type, PointerType):
+    if isinstance(value_type, EncodingType):
         return (
-            f"!weft_kernel.ptr<{emit_type(value_type.element_type)}, "
-            f"{json.dumps(value_type.access)}, "
-            f"{str(value_type.noalias).lower()}, {value_type.alignment}, "
-            f"{str(value_type.restrict_like).lower()}, "
-            f"{json.dumps(value_type.storage_class)}, "
-            f"{json.dumps(value_type.storage_format)}>"
+            "!weft_kernel.encoding<"
+            f"{json.dumps(value_type.family)}, {json.dumps(value_type.kind)}, "
+            f"{json.dumps(value_type.layout_identity)}>"
         )
-    if isinstance(value_type, ConstexprType):
-        return f"!weft_kernel.constexpr<{emit_type(value_type.value_type)}>"
-    if isinstance(value_type, BlockType):
-        shape = ", ".join(str(dimension) for dimension in value_type.shape)
-        axes = ", ".join(str(axis) for axis in value_type.axes)
+    if isinstance(value_type, ViewType):
+        return _emit_shaped("view", value_type.encoding, value_type.shape, value_type.axes)
+    if isinstance(value_type, LocalValueType):
+        return _emit_shaped("value", value_type.element_type, value_type.shape, value_type.axes)
+    if isinstance(value_type, SliceType):
+        return _emit_shaped("slice", value_type.encoding, value_type.shape, value_type.axes)
+    if isinstance(value_type, DomainType):
         return (
-            f"!weft_kernel.block<[{shape}], [{axes}], "
-            f"{emit_type(value_type.element_type)}>"
+            "!weft_kernel.domain<"
+            f"{json.dumps(value_type.axis_name)}, {value_type.axis_id}, "
+            f"{json.dumps(value_type.relation)}, {json.dumps(value_type.extent)}, "
+            f"{json.dumps(value_type.partition)}, {json.dumps(value_type.multiplicity)}, "
+            f"{json.dumps(value_type.tail)}>"
         )
-    if isinstance(value_type, RegionType):
-        shape = ", ".join(str(dimension) for dimension in value_type.shape)
-        axes = ", ".join(str(axis) for axis in value_type.axes)
-        return (
-            f"!weft_kernel.region<[{shape}], [{axes}], "
-            f"{emit_type(value_type.element_type)}>"
-        )
-    if isinstance(value_type, MaskedType):
-        return f"!weft_kernel.masked<{emit_type(value_type.value_type)}>"
-    if isinstance(value_type, TupleType):
-        fields = ", ".join(emit_type(field) for field in value_type.fields)
-        return f"!weft_kernel.tuple<[{fields}]>"
-    if isinstance(value_type, NoneType):
-        return "none"
+    if isinstance(value_type, DomainPointType):
+        return f"!weft_kernel.point<{emit_type(value_type.domain)}>"
     raise TypeError(f"cannot emit unknown Weft type {value_type!r}")
 
 
-def bare_type(value_type: ValueType) -> ValueType:
-    return value_type.value_type if isinstance(value_type, MaskedType) else value_type
+def _emit_shaped(
+    mnemonic: str,
+    element: ValueType,
+    shape: tuple[int, ...],
+    axes: tuple[int, ...],
+) -> str:
+    dimensions = "[" + ", ".join(str(dimension) for dimension in shape) + "]"
+    identities = "[" + ", ".join(str(axis) for axis in axes) + "]"
+    return (
+        f"!weft_kernel.{mnemonic}<"
+        f"{emit_type(element)}, {dimensions}, {identities}>"
+    )
 
 
-def is_masked(value_type: ValueType) -> bool:
-    return isinstance(value_type, MaskedType)
+def shape_of(value_type: ValueType) -> tuple[int, ...]:
+    if isinstance(value_type, (ViewType, LocalValueType, SliceType)):
+        return value_type.shape
+    return ()
+
+
+def axes_of(value_type: ValueType) -> tuple[int, ...]:
+    if isinstance(value_type, (ViewType, LocalValueType, SliceType)):
+        return value_type.axes
+    return ()
 
 
 def element_type(value_type: ValueType) -> ValueType:
-    value_type = bare_type(value_type)
-    if isinstance(value_type, (BlockType, RegionType)):
+    if isinstance(value_type, (ViewType, SliceType)):
+        return value_type.encoding
+    if isinstance(value_type, LocalValueType):
         return value_type.element_type
     return value_type
 
 
-def shape_of(value_type: ValueType) -> tuple[int, ...] | None:
-    value_type = bare_type(value_type)
-    if isinstance(value_type, (BlockType, RegionType)):
-        return value_type.shape
-    return None
-
-
-def axes_of(value_type: ValueType) -> tuple[int, ...] | None:
-    value_type = bare_type(value_type)
-    if isinstance(value_type, (BlockType, RegionType)):
-        return value_type.axes
-    return None
-
-
-def shape_kind(value_type: ValueType) -> str:
-    value_type = bare_type(value_type)
-    if isinstance(value_type, RegionType):
-        return "region"
-    if isinstance(value_type, BlockType):
-        return "block"
-    return "scalar"
-
-
-def shaped_type(
-    kind: str,
-    shape: tuple[int, ...],
-    axes: tuple[int, ...],
-    element: ValueType,
+def value_type(
+    element: ValueType, shape: tuple[int, ...], axes: tuple[int, ...]
 ) -> ValueType:
-    if kind == "region":
-        return RegionType(shape, axes, element)
-    if kind == "block":
-        return BlockType(shape, axes, element)
-    if shape or axes:
-        raise ValueError("scalar type cannot carry a logical domain")
+    if not shape:
+        return element
+    return LocalValueType(element, shape, axes)
+
+
+def with_element(value: ValueType, element: ValueType) -> ValueType:
+    if isinstance(value, LocalValueType):
+        return LocalValueType(element, value.shape, value.axes)
     return element
-
-
-def with_element_type(value_type: ValueType, new_element: ValueType) -> ValueType:
-    masked = is_masked(value_type)
-    bare = bare_type(value_type)
-    if isinstance(bare, BlockType):
-        result: ValueType = BlockType(bare.shape, bare.axes, new_element)
-    elif isinstance(bare, RegionType):
-        result = RegionType(bare.shape, bare.axes, new_element)
-    else:
-        result = new_element
-    return MaskedType(result) if masked else result

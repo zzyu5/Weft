@@ -5,14 +5,9 @@ import inspect
 import textwrap
 from dataclasses import dataclass
 from types import FunctionType
-from typing import Any
-from typing import Callable
-from typing import Generic
-from typing import ParamSpec
-from typing import TypeVar
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
-from weft.diagnostics import DefinitionError
-from weft.diagnostics import LanguageUseError
+from weft.diagnostics import DefinitionError, LanguageUseError
 
 
 P = ParamSpec("P")
@@ -23,33 +18,37 @@ R = TypeVar("R")
 class DefinitionSource:
     filename: str
     first_line: int
+    text: str
+
+
+def _function_source(function: FunctionType, noun: str) -> DefinitionSource:
+    try:
+        lines, first_line = inspect.getsourcelines(function)
+    except (OSError, TypeError) as error:
+        raise DefinitionError(f"Weft must be able to inspect the {noun}") from error
+    return DefinitionSource(
+        inspect.getsourcefile(function) or function.__code__.co_filename,
+        first_line,
+        textwrap.dedent("".join(lines)),
+    )
 
 
 class KernelDefinition(Generic[P, R]):
-    """Captured Python text for one worker-local Weft DSL kernel."""
+    """Captured source for one AOT Weft kernel."""
 
     def __init__(self, function: Callable[P, R]) -> None:
         if not isinstance(function, FunctionType):
             raise DefinitionError("Weft kernels must decorate a Python function")
         self.python_function = function
-        try:
-            _, source_start = inspect.getsourcelines(function)
-        except (OSError, TypeError) as error:
-            raise DefinitionError(
-                "Weft must be able to inspect the decorated DSL kernel"
-            ) from error
-        self.source = DefinitionSource(
-            filename=inspect.getsourcefile(function) or function.__code__.co_filename,
-            first_line=source_start,
-        )
+        self.source = _function_source(function, "decorated DSL kernel")
         functools.update_wrapper(self, function)
 
     @property
     def signature(self) -> inspect.Signature:
-        return inspect.signature(self.python_function, eval_str=True)
+        return inspect.signature(self.python_function, eval_str=False)
 
     def source_text(self) -> str:
-        return textwrap.dedent(inspect.getsource(self.python_function))
+        return self.source.text
 
     def lower(self) -> str:
         from weft.frontend import lower_to_mlir
@@ -65,7 +64,103 @@ class KernelDefinition(Generic[P, R]):
         return f"<weft kernel {self.__module__}.{self.__qualname__}>"
 
 
+class EncodingDefinition:
+    """Captured pure-layout encoding declaration."""
+
+    def __init__(self, declaration: type[object], bindings: dict[str, object]) -> None:
+        if not isinstance(declaration, type):
+            raise DefinitionError("@weft.encoding decorates one class declaration")
+        try:
+            lines, first_line = inspect.getsourcelines(declaration)
+        except (OSError, TypeError) as error:
+            raise DefinitionError("Weft must be able to inspect the encoding class") from error
+        self.python_class = declaration
+        self.bindings = bindings
+        self.source = DefinitionSource(
+            inspect.getsourcefile(declaration) or inspect.getfile(declaration),
+            first_line,
+            textwrap.dedent("".join(lines)),
+        )
+        self.__name__ = declaration.__name__
+        self.__qualname__ = declaration.__qualname__
+        self.__module__ = declaration.__module__
+
+    def __repr__(self) -> str:
+        return f"<weft encoding {self.__module__}.{self.__qualname__}>"
+
+
+class DerivedEncodingDefinition:
+    """Captured build-phase encoding-family generator."""
+
+    def __init__(self, function: Callable[..., object]) -> None:
+        if not isinstance(function, FunctionType):
+            raise DefinitionError("@weft.derive decorates one Python function")
+        self.python_function = function
+        self.source = _function_source(function, "derived encoding definition")
+        functools.update_wrapper(self, function)
+
+    @property
+    def signature(self) -> inspect.Signature:
+        return inspect.signature(self.python_function, eval_str=False)
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise LanguageUseError(
+            f"derived encoding {self.__name__} is generated at build time"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InlineDefinition:
+    python_function: FunctionType
+    source: DefinitionSource
+
+    @classmethod
+    def capture(cls, function: Callable[..., object]) -> InlineDefinition:
+        if not isinstance(function, FunctionType):
+            raise DefinitionError("Weft inline functions must be ordinary Python functions")
+        return cls(function, _function_source(function, "inline function"))
+
+    @property
+    def signature(self) -> inspect.Signature:
+        return inspect.signature(self.python_function, eval_str=False)
+
+    @property
+    def name(self) -> str:
+        return self.python_function.__name__
+
+
+@dataclass(frozen=True, slots=True)
+class OverloadSet:
+    name: str
+    definitions: tuple[InlineDefinition, ...]
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        raise LanguageUseError(
+            f"overload set {self.name} is resolved only while lowering a Weft kernel"
+        )
+
+
 def kernel(function: Callable[P, R] | None = None) -> Any:
     if function is None:
         return KernelDefinition
     return KernelDefinition(function)
+
+
+def encoding(declaration: type[object]) -> EncodingDefinition:
+    frame = inspect.currentframe()
+    try:
+        if frame is None or frame.f_back is None:
+            raise DefinitionError("@weft.encoding cannot capture its definition scope")
+        return EncodingDefinition(declaration, dict(frame.f_back.f_globals))
+    finally:
+        del frame
+
+
+def derive(function: Callable[..., object]) -> DerivedEncodingDefinition:
+    return DerivedEncodingDefinition(function)
+
+
+def overloads(name: str, *functions: Callable[..., object]) -> OverloadSet:
+    if not name or not functions:
+        raise DefinitionError("weft.overloads expects a name and at least one function")
+    return OverloadSet(name, tuple(InlineDefinition.capture(function) for function in functions))

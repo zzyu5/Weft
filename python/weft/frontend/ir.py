@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 
 from weft.diagnostics import SourceLocation
 
-from .types import ValueType
-from .types import emit_type
+from .types import ValueType, emit_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,21 +30,24 @@ class Region:
             "weft_kernel.return",
             "weft_kernel.yield",
             "weft_kernel.condition",
+            "weft_kernel.births_yield",
+            "weft_kernel.handoff",
+            "weft_kernel.derive_yield",
         }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class Operation:
     name: str
     operands: tuple[Value, ...]
     results: tuple[Value, ...]
-    attributes: tuple[tuple[str, str], ...]
+    attributes: dict[str, str]
     regions: tuple[Region, ...]
     location: SourceLocation
 
 
 class IRBuilder:
-    """A one-way generic MLIR assembly builder, not an op schema."""
+    """One-way canonical MLIR assembly builder."""
 
     def __init__(self) -> None:
         self._next_value_id = 0
@@ -89,14 +90,15 @@ class IRBuilder:
             self.value(value_type, hint)
             for value_type, hint in zip(result_types, names)
         )
-        return Operation(
+        operation = Operation(
             name,
             tuple(operands),
             results,
-            tuple((attributes or {}).items()),
+            dict(attributes or {}),
             tuple(regions),
             location,
         )
+        return operation
 
     def emit(
         self,
@@ -111,11 +113,12 @@ class IRBuilder:
         block.operations.append(operation)
         return operation.results
 
-    def module(self, module_name: str, kernel: Operation) -> str:
+    def module(self, module_name: str, items: tuple[Operation, ...]) -> str:
         lines = [
             f"module attributes {{weft.source_module = {json.dumps(module_name)}}} {{"
         ]
-        lines.extend(_render_operation(kernel, 1))
+        for item in items:
+            lines.extend(_render_operation(item, 1))
         lines.append("}")
         return "\n".join(lines) + "\n"
 
@@ -136,7 +139,7 @@ def _render_operation(operation: Operation, indent: int) -> list[str]:
         lines.append(f"{prefix})")
     if operation.attributes:
         attributes = ", ".join(
-            f"{name} = {value}" for name, value in operation.attributes
+            f"{name} = {value}" for name, value in operation.attributes.items()
         )
         lines[-1] += f" {{{attributes}}}"
     operand_types = ", ".join(emit_type(value.type) for value in operation.operands)

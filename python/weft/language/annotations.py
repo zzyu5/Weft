@@ -6,101 +6,96 @@ from .dtypes import DType
 
 
 @dataclass(frozen=True, slots=True)
-class PointerQualifier:
+class LayoutAtom:
+    category: str
+    value: str
+
+
+class _BitOrder:
+    lsb_first = LayoutAtom("bit_order", "lsb_first")
+    msb_first = LayoutAtom("bit_order", "msb_first")
+
+
+class _ByteOrder:
+    little = LayoutAtom("byte_order", "little")
+    big = LayoutAtom("byte_order", "big")
+
+
+bitorder = _BitOrder()
+byteorder = _ByteOrder()
+lo_first = "lo_first"
+hi_first = "hi_first"
+
+
+@dataclass(frozen=True, slots=True)
+class PackingSpec:
     kind: str
-    value: object = True
+    argument: str
 
 
-readonly = PointerQualifier("access", "read")
-writeonly = PointerQualifier("access", "write")
-noalias = PointerQualifier("noalias")
-restrict = PointerQualifier("restrict")
-external = PointerQualifier("storage", ("external", ""))
-workspace = PointerQualifier("storage", ("workspace", ""))
+def packed(storage_bytes: int) -> PackingSpec:
+    if isinstance(storage_bytes, bool) or not isinstance(storage_bytes, int) or storage_bytes <= 0:
+        raise TypeError("packed expects a positive byte count")
+    return PackingSpec("packed", str(storage_bytes))
 
 
-def persistent(storage_format: str) -> PointerQualifier:
-    if not isinstance(storage_format, str) or not storage_format:
-        raise TypeError("W.persistent expects a non-empty storage format identity")
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
-    if any(character not in allowed for character in storage_format):
-        raise TypeError(
-            "W.persistent storage format identity uses only letters, digits, '_', '-', or '.'"
-        )
-    return PointerQualifier("storage", ("persistent", storage_format))
-
-
-def aligned(minimum: int) -> PointerQualifier:
-    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum <= 0:
-        raise TypeError("W.aligned expects a positive integer")
-    if minimum & (minimum - 1):
-        raise TypeError("W.aligned expects a power of two")
-    return PointerQualifier("alignment", minimum)
+def nibble(order: str) -> PackingSpec:
+    if order not in {lo_first, hi_first}:
+        raise TypeError("nibble order must be lo_first or hi_first")
+    return PackingSpec("nibble", order)
 
 
 @dataclass(frozen=True, slots=True)
-class PtrSpec:
-    dtype: DType
-    access: str = "readwrite"
-    noalias: bool = False
-    alignment: int = 0
-    restrict_like: bool = False
-    storage_class: str = "external"
-    storage_format: str = ""
+class PaddingSpec:
+    bytes: int
+    value: int = 0
 
 
-class ptr:
-    @classmethod
-    def __class_getitem__(cls, parameters: object) -> PtrSpec:
-        items = parameters if isinstance(parameters, tuple) else (parameters,)
-        if not items or not isinstance(items[0], DType):
-            raise TypeError("W.ptr expects a Weft dtype as its first parameter")
-        access = "readwrite"
-        alias = False
-        alignment = 0
-        restrict_like = False
-        storage_class = "external"
-        storage_format = ""
-        seen: set[str] = set()
-        for qualifier in items[1:]:
-            if not isinstance(qualifier, PointerQualifier):
-                raise TypeError("W.ptr qualifiers must be Weft qualifier objects")
-            if qualifier.kind in seen and qualifier.kind != "noalias":
-                raise TypeError(f"duplicate pointer qualifier {qualifier.kind!r}")
-            seen.add(qualifier.kind)
-            if qualifier.kind == "access":
-                access = str(qualifier.value)
-            elif qualifier.kind == "noalias":
-                alias = True
-            elif qualifier.kind == "alignment":
-                alignment = int(qualifier.value)
-            elif qualifier.kind == "restrict":
-                restrict_like = True
-            elif qualifier.kind == "storage":
-                storage_class, storage_format = qualifier.value
-            else:
-                raise TypeError(f"unknown pointer qualifier {qualifier.kind!r}")
-        if storage_class == "workspace" and not alias:
-            raise TypeError("W.workspace pointers must also declare W.noalias")
-        return PtrSpec(
-            dtype=items[0],
-            access=access,
-            noalias=alias,
-            alignment=alignment,
-            restrict_like=restrict_like,
-            storage_class=storage_class,
-            storage_format=storage_format,
-        )
+def padding(bytes: int, value: int = 0) -> PaddingSpec:
+    if isinstance(bytes, bool) or not isinstance(bytes, int) or bytes <= 0:
+        raise TypeError("padding expects a positive byte count")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 255:
+        raise TypeError("padding fill must be a byte")
+    return PaddingSpec(bytes, value)
 
 
 @dataclass(frozen=True, slots=True)
-class ConstexprSpec:
+class ArraySpec:
     dtype: DType
+    shape: tuple[object, ...]
+    packing: PackingSpec | None = None
+
+    def __matmul__(self, packing: object) -> ArraySpec:
+        if not isinstance(packing, PackingSpec):
+            raise TypeError("encoding field @ annotation must be packed(...) or nibble(...)")
+        return ArraySpec(self.dtype, self.shape, packing)
 
 
-class constexpr:
+@dataclass(frozen=True, slots=True)
+class ViewSpec:
+    encoding: object
+    shape: tuple[object, ...]
+
+
+class View:
     @classmethod
-    def __class_getitem__(cls, dtype: object) -> ConstexprSpec:
-        if not isinstance(dtype, DType):
-            raise TypeError("W.constexpr expects a Weft dtype")
-        return ConstexprSpec(dtype)
+    def __class_getitem__(cls, parameters: object) -> ViewSpec:
+        if not isinstance(parameters, tuple) or len(parameters) != 2:
+            raise TypeError("View expects View[Encoding, shape]")
+        encoding, shape = parameters
+        return ViewSpec(encoding, shape if isinstance(shape, tuple) else (shape,))
+
+
+@dataclass(frozen=True, slots=True)
+class AutoSpec:
+    choices: tuple[object, ...]
+
+    @property
+    def spelling(self) -> str:
+        return "|".join(str(choice) for choice in self.choices)
+
+
+def auto(*choices: object) -> AutoSpec:
+    if not choices:
+        raise TypeError("auto expects at least one candidate or one symbolic parameter")
+    return AutoSpec(tuple(choices))

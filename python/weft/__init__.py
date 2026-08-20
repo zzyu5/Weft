@@ -1,9 +1,13 @@
-from .api import KernelDefinition
-from .api import kernel
-from .diagnostics import DefinitionError
-from .diagnostics import FrontendError
-from .diagnostics import LanguageUseError
-from .diagnostics import WeftError
+from .api import (
+    DerivedEncodingDefinition,
+    EncodingDefinition,
+    KernelDefinition,
+    derive,
+    encoding,
+    kernel,
+    overloads,
+)
+from .diagnostics import DefinitionError, FrontendError, LanguageUseError, WeftError
 
 
 def lower_to_mlir(definition: KernelDefinition[object, object]) -> str:
@@ -14,10 +18,15 @@ def lower_to_mlir(definition: KernelDefinition[object, object]) -> str:
 
 __all__ = [
     "DefinitionError",
+    "DerivedEncodingDefinition",
+    "EncodingDefinition",
     "FrontendError",
     "KernelDefinition",
     "LanguageUseError",
     "WeftError",
+    "derive",
+    "encoding",
     "kernel",
     "lower_to_mlir",
+    "overloads",
 ]

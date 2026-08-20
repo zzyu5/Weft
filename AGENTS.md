@@ -7,10 +7,11 @@
 
 ## 设计边界
 
-- [`doc/index.md`](doc/index.md) 及其链接的模块是唯一规范；源码是当前实现事实。
-- Weft kernel 是 worker/hart-local 程序。core 中禁止 grid、task identity、隐式 hart identity
-  和 GPU SIMT 根模型。
-- 持久表示只有 canonical Kernel IR 和最终 artifacts。LMUL、microtile、packing、fragment、
+- [`report/weft-spec.md`](report/weft-spec.md) 是唯一规范；[`doc/index.md`](doc/index.md)
+  及其链接只说明当前实现如何落实规范，源码是当前实现事实。
+- Weft kernel 最终在 CPU 调用上下文中执行，但 worker/hart 不是语言根对象。core 中禁止 grid、
+  task identity、隐式 hart identity 和 GPU SIMT 根模型。
+- 持久表示只有 canonical Kernel IR 和最终 artifacts。LMUL、microtile、primitive-local packing、fragment、
   capability、legality 与候选选择都是单次 target lowering 内的瞬态实现。
 - Target lowering 只根据 primitive、typed operands、局部 use relation、显式 backend config
   与 target facts 生成代码，禁止按 kernel、算子或量化格式接管 whole-kernel lowering。

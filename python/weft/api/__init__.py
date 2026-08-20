@@ -1,4 +1,23 @@
-from .definitions import KernelDefinition
-from .definitions import kernel
+from .definitions import (
+    DerivedEncodingDefinition,
+    EncodingDefinition,
+    InlineDefinition,
+    KernelDefinition,
+    OverloadSet,
+    derive,
+    encoding,
+    kernel,
+    overloads,
+)
 
-__all__ = ["KernelDefinition", "kernel"]
+__all__ = [
+    "DerivedEncodingDefinition",
+    "EncodingDefinition",
+    "InlineDefinition",
+    "KernelDefinition",
+    "OverloadSet",
+    "derive",
+    "encoding",
+    "kernel",
+    "overloads",
+]

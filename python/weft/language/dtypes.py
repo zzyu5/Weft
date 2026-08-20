@@ -23,8 +23,18 @@ class DType:
 
     def __call__(self, value: object) -> object:
         raise LanguageUseError(
-            f"W.{self.name}(...) is valid only while lowering an @weft.kernel"
+            f"W.{self.name}(...) is valid only while lowering a Weft definition"
         )
+
+    def __getitem__(self, shape: object) -> object:
+        from .annotations import ArraySpec
+
+        return ArraySpec(self, shape if isinstance(shape, tuple) else (shape,))
+
+    def __matmul__(self, packing: object) -> object:
+        from .annotations import ArraySpec
+
+        return ArraySpec(self, ()) @ packing
 
     def __repr__(self) -> str:
         return f"W.{self.name}"
@@ -32,10 +42,13 @@ class DType:
 
 i1 = DType("i1", DTypeCategory.BOOL, 1)
 index = DType("index", DTypeCategory.INDEX, None)
+i4 = DType("i4", DTypeCategory.INTEGER, 4, "signed")
 i8 = DType("i8", DTypeCategory.INTEGER, 8, "signed")
 i16 = DType("i16", DTypeCategory.INTEGER, 16, "signed")
 i32 = DType("i32", DTypeCategory.INTEGER, 32, "signed")
 i64 = DType("i64", DTypeCategory.INTEGER, 64, "signed")
+u4 = DType("u4", DTypeCategory.INTEGER, 4, "unsigned")
+u6 = DType("u6", DTypeCategory.INTEGER, 6, "unsigned")
 u8 = DType("u8", DTypeCategory.INTEGER, 8, "unsigned")
 u16 = DType("u16", DTypeCategory.INTEGER, 16, "unsigned")
 u32 = DType("u32", DTypeCategory.INTEGER, 32, "unsigned")
