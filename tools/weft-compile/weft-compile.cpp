@@ -1,5 +1,5 @@
-#include "Weft/Dialect/Extension/IR/ExtensionDialect.h"
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
+#include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
 #include "Weft/Target/RISCVCompiler.h"
 #include "Weft/Target/RISCVTargetProfile.h"
 
@@ -23,78 +23,28 @@ llvm::cl::opt<std::string> inputFilename(
     llvm::cl::init("-"));
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
-llvm::cl::opt<std::string> headerFilename(
-    "header", llvm::cl::desc("Generated public C header path"));
 llvm::cl::opt<std::string> emitKind(
-    "emit", llvm::cl::desc("kernel-ir or intrinsic-c"),
-    llvm::cl::init("intrinsic-c"));
+    "emit", llvm::cl::desc("kernel-ir or physical-assignment"),
+    llvm::cl::init("physical-assignment"));
 llvm::cl::opt<std::string> march("march", llvm::cl::desc("RISC-V ISA string"));
 llvm::cl::opt<std::string> abi("abi", llvm::cl::desc("RISC-V ABI"));
 llvm::cl::opt<int64_t> vlenBits(
-    "vlen-bits",
-    llvm::cl::desc("Explicit fixed VLEN in bits"),
+    "vlen-bits", llvm::cl::desc("Explicit fixed VLEN in bits"),
     llvm::cl::init(0));
 llvm::cl::opt<std::string> matrixExtension(
     "matrix-extension",
     llvm::cl::desc("Target matrix extension: none or spacemit-ime1"),
     llvm::cl::init("none"));
 llvm::cl::list<std::string> metaBindings(
-    "meta", llvm::cl::desc("Specialization binding NAME=INTEGER"),
+    "meta", llvm::cl::desc("Auto specialization binding NAME=INTEGER"),
     llvm::cl::ZeroOrMore);
-llvm::cl::opt<int64_t> vlaLMUL(
-    "vla-lmul", llvm::cl::desc("Requested VLA data LMUL; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> dotLMUL(
-    "dot-lmul", llvm::cl::desc("Requested dot LMUL; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> dotKUnroll(
-    "dot-k-unroll",
-    llvm::cl::desc("Requested dot K unroll; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> dotLoadBufferCount(
-    "dot-load-buffer-count",
-    llvm::cl::desc(
-        "Requested local dot register load buffers: zero selects, one to four"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16InputLMUL(
-    "f16-input-lmul",
-    llvm::cl::desc("Requested F16 matmul input LMUL; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16RowMicrotile(
-    "f16-row-microtile",
-    llvm::cl::desc("Requested F16 matmul row microtile; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16ColumnMicrotile(
-    "f16-column-microtile",
-    llvm::cl::desc("Requested F16 matmul column microtile; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16KUnroll(
-    "f16-k-unroll",
-    llvm::cl::desc("Requested F16 matmul K unroll; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> f16LoadBufferCount(
-    "f16-load-buffer-count",
-    llvm::cl::desc(
-        "Requested F16 matmul register load buffers: zero selects, one to four"),
-    llvm::cl::init(0));
-llvm::cl::opt<std::string> f16LaneAxis(
-    "f16-lane-axis",
-    llvm::cl::desc("Requested F16 matmul lane axis: auto, column, or reduction"),
-    llvm::cl::init("auto"));
-llvm::cl::opt<int64_t> narrowLMUL(
-    "narrow-lmul", llvm::cl::desc("Requested f32 narrow LMUL; zero selects"),
-    llvm::cl::init(0));
-llvm::cl::opt<int64_t> sortRadixBits(
-    "sort-radix-bits",
-    llvm::cl::desc("Requested stable f32 radix width; zero selects"),
-    llvm::cl::init(0));
 
 bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
   for (llvm::StringRef spelling : metaBindings) {
     auto [name, valueSpelling] = spelling.split('=');
     int64_t value = 0;
     if (name.empty() || valueSpelling.empty() ||
-        valueSpelling.getAsInteger(0, value)) {
+        valueSpelling.getAsInteger(0, value) || value <= 0) {
       llvm::errs() << "invalid --meta binding: " << spelling << "\n";
       return false;
     }
@@ -109,23 +59,12 @@ bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
 } // namespace
 
 int main(int argc, char **argv) {
-  llvm::cl::ParseCommandLineOptions(argc, argv, "Weft RISC-V kernel compiler\n");
-  if (emitKind != "kernel-ir" && emitKind != "intrinsic-c") {
+  llvm::cl::ParseCommandLineOptions(argc, argv,
+                                    "Weft RISC-V representation compiler\n");
+  if (emitKind != "kernel-ir" && emitKind != "physical-assignment") {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
   }
-  if (emitKind == "intrinsic-c" &&
-      (headerFilename.empty() || headerFilename == "-" ||
-       headerFilename == outputFilename)) {
-    llvm::errs()
-        << "--emit=intrinsic-c requires a distinct file path in --header\n";
-    return 1;
-  }
-  if (emitKind == "kernel-ir" && !headerFilename.empty()) {
-    llvm::errs() << "--header is valid only with --emit=intrinsic-c\n";
-    return 1;
-  }
-
   auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(inputFilename);
   if (!buffer) {
     llvm::errs() << "cannot read " << inputFilename << ": "
@@ -134,11 +73,11 @@ int main(int argc, char **argv) {
   }
   llvm::SourceMgr sourceManager;
   sourceManager.AddNewSourceBuffer(std::move(*buffer), llvm::SMLoc());
-
   mlir::DialectRegistry registry;
   registry.insert<weft::kernel::WEFTKernelDialect,
-                  weft::extension::WEFTExtensionDialect>();
+                  weft::riscv::WEFTRISCVDialect>();
   mlir::MLIRContext context(registry);
+  context.getOrLoadDialect<weft::riscv::WEFTRISCVDialect>();
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sourceManager, &context);
   if (!module || mlir::failed(mlir::verify(*module)))
     return 1;
@@ -150,57 +89,33 @@ int main(int argc, char **argv) {
     llvm::errs() << "cannot open output: " << errorCode.message() << "\n";
     return 1;
   }
-  if (emitKind == "intrinsic-c") {
+  if (emitKind == "kernel-ir") {
+    bool hasTransientPlanning = false;
+    module->walk([&](mlir::Operation *operation) {
+      if (mlir::isa<weft::riscv::ProblemOp, weft::riscv::AssignmentOp>(operation))
+        hasTransientPlanning = true;
+    });
+    if (hasTransientPlanning) {
+      llvm::errs() << "kernel-ir input cannot contain compiler-owned weft_riscv operations\n";
+      return 1;
+    }
+    module->print(output.os());
+    output.os() << '\n';
+  } else {
     weft::RISCVCompilerOptions options;
     std::string error;
     if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, matrixExtension,
                                        options.target, error)) {
-      llvm::errs() << error << "\n";
-      return 1;
-    }
-    options.backend.parameters.vlaLMUL = vlaLMUL;
-    options.backend.parameters.dotLMUL = dotLMUL;
-    options.backend.parameters.dotKUnroll = dotKUnroll;
-    options.backend.parameters.dotLoadBufferCount = dotLoadBufferCount;
-    options.backend.parameters.f16InputLMUL = f16InputLMUL;
-    options.backend.parameters.f16RowMicrotile = f16RowMicrotile;
-    options.backend.parameters.f16ColumnMicrotile = f16ColumnMicrotile;
-    options.backend.parameters.f16KUnroll = f16KUnroll;
-    options.backend.parameters.f16LoadBufferCount = f16LoadBufferCount;
-    if (f16LaneAxis == "auto")
-      options.backend.parameters.f16LaneAxis = weft::F16MatmulLaneAxis::Auto;
-    else if (f16LaneAxis == "column")
-      options.backend.parameters.f16LaneAxis = weft::F16MatmulLaneAxis::Column;
-    else if (f16LaneAxis == "reduction")
-      options.backend.parameters.f16LaneAxis =
-          weft::F16MatmulLaneAxis::Reduction;
-    else {
-      llvm::errs() << "unsupported --f16-lane-axis value: " << f16LaneAxis
-                   << "\n";
-      return 1;
-    }
-    options.backend.parameters.narrowLMUL = narrowLMUL;
-    options.backend.parameters.sortRadixBits = sortRadixBits;
-    std::error_code headerError;
-    llvm::ToolOutputFile header(headerFilename, headerError,
-                                llvm::sys::fs::OF_Text);
-    if (headerError) {
-      llvm::errs() << "cannot open header output: " << headerError.message()
-                   << "\n";
+      llvm::errs() << error << '\n';
       return 1;
     }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
-    mlir::FailureOr<weft::RISCVArtifact> artifact =
-        weft::compileRISCVModule(*module, std::move(options));
-    if (mlir::failed(artifact))
+    mlir::FailureOr<weft::RISCVPlanningResult> result =
+        weft::planRISCVModule(*module, std::move(options));
+    if (mlir::failed(result))
       return 1;
-    output.os() << artifact->intrinsicC;
-    header.os() << artifact->header;
-    header.keep();
-  } else {
-    module->print(output.os());
-    output.os() << '\n';
+    output.os() << result->assignment;
   }
   output.keep();
   return 0;

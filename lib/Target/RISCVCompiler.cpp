@@ -1,114 +1,102 @@
 #include "Weft/Target/RISCVCompiler.h"
 
-#include "RISCVHeader.h"
-#include "RISCVIntrinsicC.h"
-#include "RISCVKernelCompiler.h"
+#include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
+#include "Weft/Target/RISCVPasses.h"
 
-#include "mlir/Pass/Pass.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <memory>
 #include <string>
-#include <utility>
 
 namespace {
 
-struct RISCVArtifactState {
-  weft::RISCVArtifact artifact;
-  bool complete = false;
-};
-
-class CompileRISCVArtifactPass final
-    : public mlir::PassWrapper<CompileRISCVArtifactPass,
-                               mlir::OperationPass<mlir::ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CompileRISCVArtifactPass)
-
-  CompileRISCVArtifactPass(
-      std::shared_ptr<const weft::RISCVCompilerOptions> options,
-      std::shared_ptr<RISCVArtifactState> state)
-      : options(std::move(options)), state(std::move(state)) {}
-
-  CompileRISCVArtifactPass(const CompileRISCVArtifactPass &other)
-      : mlir::PassWrapper<CompileRISCVArtifactPass,
-                          mlir::OperationPass<mlir::ModuleOp>>(other),
-        options(other.options), state(other.state) {}
-
-  llvm::StringRef getArgument() const final {
-    return "weft-compile-riscv-artifact";
+void printDictionary(llvm::raw_ostream &output, mlir::DictionaryAttr dictionary,
+                     llvm::StringRef indent) {
+  for (mlir::NamedAttribute named : dictionary) {
+    output << indent << named.getName() << " = ";
+    named.getValue().print(output);
+    output << '\n';
   }
+}
 
-  llvm::StringRef getDescription() const final {
-    return "analyze canonical Weft IR and emit one RISC-V artifact";
+void printAssignment(llvm::raw_ostream &output,
+                     weft::riscv::AssignmentOp assignment) {
+  output << "kernel = @" << assignment.getKernel() << '\n';
+  output << "status = " << assignment.getStatus() << '\n';
+  output << "\ntarget\n";
+  printDictionary(output, assignment.getTarget(), "  ");
+  output << "\ncandidate\n";
+  printDictionary(output, assignment.getCandidate(), "  ");
+  output << "\nC: vector representation decisions\n";
+  printDictionary(output, assignment.getCDecisions(), "  ");
+  output << "\nD: instruction and memory decisions\n";
+  printDictionary(output, assignment.getDDecisions(), "  ");
+  output << "\nresources\n";
+  printDictionary(output, assignment.getResources(), "  ");
+  output << "\nvalues\n";
+  for (mlir::Attribute attribute : assignment.getValues()) {
+    auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+    output << "  " << mlir::cast<mlir::StringAttr>(value.get("id")).getValue()
+           << "  "
+           << mlir::cast<mlir::StringAttr>(value.get("logical_type")).getValue()
+           << '\n';
+    for (llvm::StringRef key :
+         {"physical_kind", "physical_encoding_kind", "physical_sew",
+          "lane_axis", "lmul", "vl", "register_groups", "storage",
+          "encoding_family", "layout_identity"})
+      if (mlir::Attribute field = value.get(key)) {
+        output << "    " << key << " = ";
+        field.print(output);
+        output << '\n';
+      }
   }
-
-  void runOnOperation() final {
-    mlir::ModuleOp module = getOperation();
-    if (!options->target.supportsFixedRVV()) {
-      module.emitError(
-          "the intrinsic C target requires RVV with an explicit fixed VLEN; no fallback backend is installed");
-      signalPassFailure();
-      return;
-    }
-
-    weft::riscv_internal::SelectedLocalImplementations implementations;
-    std::string body;
-    llvm::raw_string_ostream bodyOutput(body);
-    mlir::AnalysisManager analysisManager = getAnalysisManager();
-    if (mlir::failed(
-            weft::riscv_internal::compileRISCVKernelsToIntrinsicC(
-                module, *options, analysisManager, bodyOutput,
-                implementations))) {
-      signalPassFailure();
-      return;
-    }
-    bodyOutput.flush();
-
-    std::string prelude;
-    llvm::raw_string_ostream preludeOutput(prelude);
-    std::string unsupportedSymbol;
-    if (!weft::riscv_internal::emitIntrinsicCPrelude(
-            preludeOutput, implementations, unsupportedSymbol)) {
-      module.emitError()
-          << "RISC-V intrinsic C has no definition for selected local implementation '"
-          << unsupportedSymbol << "'";
-      signalPassFailure();
-      return;
-    }
-    preludeOutput.flush();
-
-    std::string header;
-    llvm::raw_string_ostream headerOutput(header);
-    if (mlir::failed(weft::riscv_internal::emitRISCVArtifactHeader(
-            module, *options, headerOutput))) {
-      signalPassFailure();
-      return;
-    }
-    headerOutput.flush();
-
-    state->artifact.intrinsicC = std::move(prelude) + std::move(body);
-    state->artifact.header = std::move(header);
-    state->complete = true;
-    markAllAnalysesPreserved();
+  output << "\noperations\n";
+  for (mlir::Attribute attribute : assignment.getOperations()) {
+    auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+    output << "  "
+           << mlir::cast<mlir::StringAttr>(operation.get("id")).getValue()
+           << "  "
+           << mlir::cast<mlir::StringAttr>(operation.get("source_op")).getValue()
+           << " -> "
+           << mlir::cast<mlir::StringAttr>(operation.get("realization")).getValue()
+           << '\n';
+    for (llvm::StringRef key : {"validity", "level_mapping"})
+      if (mlir::Attribute field = operation.get(key)) {
+        output << "    " << key << " = ";
+        field.print(output);
+        output << '\n';
+      }
   }
-
-private:
-  std::shared_ptr<const weft::RISCVCompilerOptions> options;
-  std::shared_ptr<RISCVArtifactState> state;
-};
+}
 
 } // namespace
 
-mlir::FailureOr<weft::RISCVArtifact>
-weft::compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
-  auto sharedOptions =
-      std::make_shared<const RISCVCompilerOptions>(std::move(options));
-  auto state = std::make_shared<RISCVArtifactState>();
+mlir::FailureOr<weft::RISCVPlanningResult>
+weft::planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
   mlir::PassManager manager(module.getContext());
-  manager.addPass(
-      std::make_unique<CompileRISCVArtifactPass>(sharedOptions, state));
-  if (mlir::failed(manager.run(module)) || !state->complete)
+  manager.enableVerifier(true);
+  manager.addPass(createConstructRISCVProblemsPass(options));
+  manager.addPass(createConstrainRISCVRepresentationsPass());
+  manager.addPass(createConstrainRISCVInstructionsPass());
+  manager.addPass(createConstrainRISCVResourcesPass());
+  manager.addPass(createSolveRISCVProblemsPass());
+  if (mlir::failed(manager.run(module)))
     return mlir::failure();
-  return std::move(state->artifact);
+
+  RISCVPlanningResult result;
+  llvm::raw_string_ostream output(result.assignment);
+  bool found = false;
+  for (riscv::AssignmentOp assignment : module.getOps<riscv::AssignmentOp>()) {
+    if (found)
+      output << "\n---\n\n";
+    printAssignment(output, assignment);
+    found = true;
+  }
+  if (!found) {
+    module.emitError("RISC-V planning pipeline produced no assignment");
+    return mlir::failure();
+  }
+  output.flush();
+  return result;
 }

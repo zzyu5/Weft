@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS RISCVOps.td)
+mlir_tablegen(RISCVOpsDialect.h.inc -gen-dialect-decls -dialect=weft_riscv)
+mlir_tablegen(RISCVOpsDialect.cpp.inc -gen-dialect-defs -dialect=weft_riscv)
+mlir_tablegen(RISCVOps.h.inc -gen-op-decls)
+mlir_tablegen(RISCVOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(WeftRISCVIncGen)

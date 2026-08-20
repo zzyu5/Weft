@@ -1,6 +1,6 @@
 # Canonical Kernel IR
 
-Canonical Kernel IR 是本轮唯一持久前端表示。Python AST、inline 展开环境和 axis 分配表都是构造期对象；物理 layout、LMUL、microtile、packing candidate、fragment 和指令选择不进入该 IR。
+Canonical Kernel IR 是唯一持久程序表示。Python AST、inline 展开环境和 axis 分配表都是构造期对象；物理 layout、LMUL、packing candidate、fragment 和指令选择不进入该 IR。RISC-V lowering 使用的 problem 与 assignment 只在一次编译调用中存在，不构成第二份程序语义。
 
 ## 类型
 
@@ -17,7 +17,7 @@ Canonical Kernel IR 是本轮唯一持久前端表示。Python AST、inline 展�
 
 `encoding.kind` 当前区分 `base`、`dense`、`derived_family`、`derived_instance` 与 primitive-private `ephemeral`。base、dense 与 derived instance 必须带固定 layout identity；derived family 必须不带，避免把抽象生成族伪装成已实例化 ABI。
 
-前端 `kernel` 可以引用源码中声明的 `derived_family`，因为此时 artifact candidate 尚未选择；它不是最终函数 ABI。artifact 构造必须先执行对应 builder，把该类型实例化为带固定 identity 的 `derived_instance`，再交给 target lowering。前端不得凭空伪造 identity，target lowering 也不得直接消费抽象 family。
+前端 `kernel` 可以引用源码中声明的 `derived_family`，因为此时物理候选尚未选择；它不是最终函数 ABI。RISC-V 物理求解必须联合选择该 family 的 builder 结果、字节顺序和固定 layout identity；assignment 中只有已经实例化的 identity，最终调用方必须按同一 builder metadata 提供持久数据。前端不得凭空伪造 identity，发射也不得直接消费未实例化的 family。
 
 ## 结构 operation
 
@@ -38,4 +38,4 @@ Canonical Kernel IR 是本轮唯一持久前端表示。Python AST、inline 展�
 
 verifier 检查布局字段合法、domain/partition 结构、Level 三个 region 的签名与 terminator、普通控制 carry、Value/View domain、基本 op 的 shape/type 关系，以及 engine role 兼容。
 
-verifier 不证明数学等价、不证明有限位宽不溢出、不替作者选择另一棵树，也不验证性能。当前 frontend-only 工具 `weft-opt` 可解析并验证 canonical IR；RISC-V target 对新 schema 的消费属于下一轮，不能通过保留旧 op 来伪装已完成。
+verifier 不证明数学等价、不证明有限位宽不溢出、不替作者选择另一棵树，也不验证性能。`weft-opt` 可解析并验证 canonical IR；`weft-compile --emit=physical-assignment` 由当前唯一 RISC-V planning 主干消费它。普通 `for`、`if`、`while` 在该主干中固定为有序标量控制，不存在自动向量化入口。
