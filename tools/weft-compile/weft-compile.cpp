@@ -47,9 +47,6 @@ llvm::cl::list<int64_t> autoUnroll(
 llvm::cl::list<int64_t> autoPipelineDepth(
     "auto-pipeline-depth", llvm::cl::desc("Level-local pipeline depth choices"),
     llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
-llvm::cl::list<int64_t> autoPrefetchDistance(
-    "auto-prefetch-distance", llvm::cl::desc("Level-local prefetch distance choices"),
-    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
 
 bool parseMetaBindings(
     llvm::StringMap<llvm::SmallVector<int64_t, 4>> &result) {
@@ -86,13 +83,13 @@ bool parseMetaBindings(
 
 bool assignChoices(llvm::cl::list<int64_t> &source,
                    llvm::SmallVectorImpl<int64_t> &destination,
-                   llvm::StringRef option, bool allowZero) {
+                   llvm::StringRef option) {
   if (source.empty())
     return true;
   llvm::SmallSet<int64_t, 8> seen;
   destination.clear();
   for (int64_t value : source) {
-    if (value < 0 || (!allowZero && value == 0)) {
+    if (value <= 0) {
       llvm::errs() << "--" << option << " contains an invalid value: " << value
                    << "\n";
       return false;
@@ -159,11 +156,9 @@ int main(int argc, char **argv) {
     }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
-    if (!assignChoices(autoUnroll, options.unrollChoices, "auto-unroll", false) ||
+    if (!assignChoices(autoUnroll, options.unrollChoices, "auto-unroll") ||
         !assignChoices(autoPipelineDepth, options.pipelineDepthChoices,
-                       "auto-pipeline-depth", false) ||
-        !assignChoices(autoPrefetchDistance, options.prefetchDistanceChoices,
-                       "auto-prefetch-distance", true))
+                       "auto-pipeline-depth"))
       return 1;
     if (llvm::any_of(options.pipelineDepthChoices,
                      [](int64_t value) { return value > 2; })) {

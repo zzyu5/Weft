@@ -2583,8 +2583,25 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   auto partialSEWAttr =
       local ? local.getAs<mlir::IntegerAttr>("partial_sew")
             : mlir::IntegerAttr();
+  auto lhsAccess =
+      local ? local.getAs<mlir::StringAttr>("lhs_access") : mlir::StringAttr();
+  auto lhsGroupAttr =
+      local ? local.getAs<mlir::IntegerAttr>("lhs_group_size")
+            : mlir::IntegerAttr();
+  auto lhsLayerAttr =
+      local ? local.getAs<mlir::IntegerAttr>("lhs_layer_size")
+            : mlir::IntegerAttr();
+  auto lhsLayerOrder =
+      local ? local.getAs<mlir::StringAttr>("lhs_layer_order")
+            : mlir::StringAttr();
+  auto lhsBitOffset =
+      local ? local.getAs<mlir::IntegerAttr>("lhs_bit_offset")
+            : mlir::IntegerAttr();
   auto rhsAccess =
       local ? local.getAs<mlir::StringAttr>("rhs_access") : mlir::StringAttr();
+  auto rhsBitOffset =
+      local ? local.getAs<mlir::IntegerAttr>("rhs_bit_offset")
+            : mlir::IntegerAttr();
   auto schedule = selected.getAs<mlir::DictionaryAttr>("schedule");
   int64_t unroll =
       schedule ? riscv_internal::integer(schedule, "unroll").value_or(0) : 0;
@@ -2592,15 +2609,17 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
       schedule
           ? riscv_internal::integer(schedule, "pipeline_depth").value_or(0)
           : 0;
-  int64_t prefetchDistance =
-      schedule
-          ? riscv_internal::integer(schedule, "prefetch_distance").value_or(-1)
-          : -1;
+  auto loopStructure =
+      schedule ? schedule.getAs<mlir::StringAttr>("loop_structure")
+               : mlir::StringAttr();
   if (!instruction || instruction.getValue() != "rvv.vwmaccsu" ||
       !lhsLMULAttr || !partialLMULAttr || !partialSEWAttr ||
       partialSEWAttr.getInt() != 16 || unroll <= 0 || pipelineDepth <= 0 ||
-      prefetchDistance < 0 || !rhsAccess ||
-      rhsAccess.getValue() != "natural-scalar-field")
+      !lhsAccess ||
+      lhsAccess.getValue() != "grouped-layered-constant-stride-window" ||
+      !lhsGroupAttr || !lhsLayerAttr || !lhsLayerOrder || !lhsBitOffset ||
+      !rhsAccess || rhsAccess.getValue() != "natural-unit-stride-window" ||
+      !rhsBitOffset || !loopStructure)
     return mac.sourceOperation->emitError(
                "grouped MAC has no complete selected local operation"),
            mlir::failure();
@@ -2622,21 +2641,41 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
     return mac.sourceOperation->emitError(
                "rvv.vwmaccsu grouped MAC requires an unsigned sub-byte lhs"),
            mlir::failure();
+  const int64_t storageGroup = lhsGroupAttr.getInt();
+  const int64_t storageLayer = lhsLayerAttr.getInt();
+  if (storageGroup <= 0 || storageLayer <= 0 ||
+      storageGroup % storageLayer != 0)
+    return mac.sourceOperation->emitError(
+               "selected grouped MAC has an invalid storage grouping"),
+           mlir::failure();
+  const int64_t storageLayers = storageGroup / storageLayer;
+  const bool lowFirst = lhsLayerOrder.getValue() == "lo_first";
+  if ((lhsLayerOrder.getValue() != "lo_first" &&
+       lhsLayerOrder.getValue() != "hi_first") ||
+      storageLayers * lhsInteger.getWidth() > 8 ||
+      lhsBitOffset.getInt() != lhsField->bitOffset ||
+      rhsBitOffset.getInt() != rhsField->bitOffset ||
+      lhsOwner.interleaveRows <= 0 || point.point.physicalExtent <= 0 ||
+      point.point.physicalExtent > storageLayer ||
+      storageLayer % point.point.physicalExtent != 0)
+    return mac.sourceOperation->emitError(
+               "selected grouped MAC window is incompatible with its field mapping"),
+           mlir::failure();
+  const bool doubleBuffered =
+      loopStructure.getValue() == "cross-iteration-double-buffer";
+  if ((pipelineDepth == 1 &&
+       loopStructure.getValue() != "sequential-stream") ||
+      (pipelineDepth == 2 && !doubleBuffered) || pipelineDepth > 2)
+    return mac.sourceOperation->emitError(
+               "selected grouped MAC schedule has no generated loop structure"),
+           mlir::failure();
+
   const int64_t elements = encoding->second.logicalElements;
-  const std::string base = "(" + point.point.base + " % " +
-                           std::to_string(elements) + ")";
-  const std::string groups = "((" + point.point.active + " + " +
-                             std::to_string(mac.group - 1) + ") / " +
-                             std::to_string(mac.group) + ")";
   const std::string outSuffix = vectorSuffix(result);
   const std::string outType = vectorType(result);
   const std::string outName = fresh("mac_reduce");
   line(outType + " " + outName + " = __riscv_vmv_v_x_" + outSuffix +
        "(0, " + laneVL() + ");");
-  const std::string groupIndex = fresh("mac_group");
-  line("for (size_t " + groupIndex + " = 0; " + groupIndex + " < " + groups +
-       "; " + groupIndex + " += " + std::to_string(unroll) + ") {");
-  ++indent;
   const int64_t partialLMUL = partialLMULAttr.getInt();
   const int64_t rawLMUL = lhsLMULAttr.getInt();
   auto lmul = [](int64_t eighths) {
@@ -2648,144 +2687,235 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   const std::string partialType = "vint16" + lmul(partialLMUL) + "_t";
   const std::string rawSuffix = "u8" + lmul(rawLMUL);
   const std::string rawType = "vuint8" + lmul(rawLMUL) + "_t";
-  if (prefetchDistance > 0) {
-    const std::string futureGroup =
-        "(" + groupIndex + " + " +
-        std::to_string(unroll * prefetchDistance) + ")";
-    line("if (" + futureGroup + " < " + groups + ") {");
-    ++indent;
-    for (int64_t term = 0; term < mac.group; ++term) {
-      const std::string logical =
-          "(" + base + " + " + futureGroup + " * " +
-          std::to_string(mac.group) + " + " + std::to_string(term) + ")";
-      auto fragment =
-          singleStorageFragment(*lhsField, logical, lhsInteger.getWidth());
-      if (!fragment)
-        return mac.sourceOperation->emitError(
-                   "selected grouped MAC prefetch has no field mapping"),
-               mlir::failure();
-      line("__builtin_prefetch(" + lhsOwner.recordPointer + " + (" +
-           fragment->byte + ") * " + std::to_string(lhsOwner.interleaveRows) +
-           ", 0, 1);");
-      line("__builtin_prefetch(" + rhsOwner.recordPointer + " + " +
-           std::to_string(rhsField->bitOffset / 8) + " + " + logical +
-           ", 0, 1);");
-    }
-    --indent;
-    line("}");
-  }
+  const std::string logicalBase = fresh("mac_logical_base");
+  const std::string active = fresh("mac_active");
+  const std::string fullGroups = fresh("mac_full_groups");
+  const std::string tail = fresh("mac_tail");
+  const std::string layerWithin = fresh("mac_layer_within");
+  const std::string physicalLayer = fresh("mac_physical_layer");
+  const std::string storageByte = fresh("mac_storage_byte");
+  const std::string shift = fresh("mac_shift");
+  const std::string qWindow = fresh("mac_q_window");
+  const std::string xWindow = fresh("mac_x_window");
+  line("const size_t " + logicalBase + " = " + point.point.base + " % " +
+       std::to_string(elements) + ";");
+  line("const size_t " + active + " = " + point.point.active + ";");
+  line("const size_t " + fullGroups + " = " + active + " / " +
+       std::to_string(mac.group) + ";");
+  line("const size_t " + tail + " = " + active + " % " +
+       std::to_string(mac.group) + ";");
+  line("const size_t " + layerWithin + " = " + logicalBase + " % " +
+       std::to_string(storageGroup) + ";");
+  if (lowFirst)
+    line("const size_t " + physicalLayer + " = " + layerWithin + " / " +
+         std::to_string(storageLayer) + ";");
+  else
+    line("const size_t " + physicalLayer + " = " +
+         std::to_string(storageLayers - 1) + " - " + layerWithin + " / " +
+         std::to_string(storageLayer) + ";");
+  line("const size_t " + storageByte + " = " +
+       std::to_string(lhsBitOffset.getInt() / 8) + " + (" + logicalBase + " / " +
+       std::to_string(storageGroup) + ") * " + std::to_string(storageLayer) +
+       " + " + layerWithin + " % " + std::to_string(storageLayer) + ";");
+  line("const size_t " + shift + " = " + physicalLayer + " * " +
+       std::to_string(lhsInteger.getWidth()) + ";");
+  line("const uint8_t *" + qWindow + " = " + lhsOwner.recordPointer + " + " +
+       storageByte + " * " + std::to_string(lhsOwner.interleaveRows) + ";");
+  line("const int8_t *" + xWindow + " = (const int8_t *)(" +
+       rhsOwner.recordPointer + " + " +
+       std::to_string(rhsBitOffset.getInt() / 8) + " + " + logicalBase + ");");
 
-  llvm::SmallVector<std::string> partials;
-  llvm::SmallVector<llvm::SmallVector<std::string>> bufferedQ(unroll);
-  llvm::SmallVector<llvm::SmallVector<std::string>> bufferedX(unroll);
-  llvm::SmallVector<llvm::SmallVector<std::string>> valid(unroll);
-  for (int64_t slot = 0; slot < unroll; ++slot) {
-    std::string partial = fresh("pair_partial");
-    line(partialType + " " + partial + " = __riscv_vmv_v_x_" + partialSuffix +
-         "(0, " + laneVL() + ");");
-    partials.push_back(std::move(partial));
-  }
-
-  auto logicalFor = [&](int64_t slot, int64_t term) {
-    return "(" + base + " + (" + groupIndex + " + " +
-           std::to_string(slot) + ") * " + std::to_string(mac.group) + " + " +
-           std::to_string(term) + ")";
-  };
-  auto conditionFor = [&](int64_t slot, int64_t term) {
-    return "(" + groupIndex + " + " + std::to_string(slot) + " < " + groups +
-           " && (" + groupIndex + " + " + std::to_string(slot) + ") * " +
-           std::to_string(mac.group) + " + " + std::to_string(term) + " < " +
-           point.point.active + ")";
-  };
-  auto fragmentFor = [&](int64_t slot, int64_t term)
-      -> std::optional<StorageFragment> {
-    return singleStorageFragment(*lhsField, logicalFor(slot, term),
-                                 lhsInteger.getWidth());
-  };
-
-  if (pipelineDepth > 1) {
+  using Bank = llvm::SmallVector<llvm::SmallVector<std::string>>;
+  auto declareBank = [&](Bank &q, Bank &x, llvm::StringRef prefix) {
+    q.resize(unroll);
+    x.resize(unroll);
     for (int64_t slot = 0; slot < unroll; ++slot)
       for (int64_t term = 0; term < mac.group; ++term) {
-        auto fragment = fragmentFor(slot, term);
-        if (!fragment)
-          return mac.sourceOperation->emitError(
-                     "selected buffered grouped MAC has no field mapping"),
-                 mlir::failure();
-        std::string q = fresh("q_buffer");
-        std::string x = fresh("x_buffer");
-        std::string isValid = fresh("buffer_valid");
-        line(rawType + " " + q + " = __riscv_vmv_v_x_" + rawSuffix +
-             "(0, " + laneVL() + ");");
-        line("int8_t " + x + " = 0;");
-        line("const int " + isValid + " = " + conditionFor(slot, term) + ";");
-        line("if (" + isValid + ") {");
-        ++indent;
-        std::string packed = fresh("q_packed");
-        line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
-             lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
-             std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
-        line(q + " = __riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" +
-             rawSuffix + "(" + packed + ", " + fragment->shift + ", " +
-             laneVL() + "), " +
-             std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " +
-             laneVL() + ");");
-        line(x + " = *(const int8_t *)(" + rhsOwner.recordPointer + " + " +
-             std::to_string(rhsField->bitOffset / 8) + " + " +
-             logicalFor(slot, term) + ");");
-        --indent;
-        line("}");
-        bufferedQ[slot].push_back(std::move(q));
-        bufferedX[slot].push_back(std::move(x));
-        valid[slot].push_back(std::move(isValid));
+        std::string qName = fresh((prefix + "_q").str());
+        std::string xName = fresh((prefix + "_x").str());
+        line(rawType + " " + qName + ";");
+        line("int8_t " + xName + ";");
+        q[slot].push_back(std::move(qName));
+        x[slot].push_back(std::move(xName));
       }
-  }
-
-  for (int64_t slot = 0; slot < unroll; ++slot) {
-    for (int64_t term = 0; term < mac.group; ++term) {
-      if (pipelineDepth > 1) {
-        line("if (" + valid[slot][term] + ") " + partials[slot] +
-             " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" + partials[slot] +
-             ", " + bufferedX[slot][term] + ", " + bufferedQ[slot][term] +
-             ", " + laneVL() + ");");
-        continue;
-      }
-      auto fragment = fragmentFor(slot, term);
-      if (!fragment)
-        return mac.sourceOperation->emitError(
-                   "selected grouped MAC field layout has no single-byte mapping"),
-               mlir::failure();
-      line("if (" + conditionFor(slot, term) + ") {");
-      ++indent;
-      std::string packed = fresh("q_packed");
-      line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
-           lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
-           std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
-      std::string q = fresh("q_value");
-      line(rawType + " " + q + " = __riscv_vand_vx_" + rawSuffix + "(" +
-           "__riscv_vsrl_vx_" + rawSuffix + "(" + packed + ", " +
-           fragment->shift + ", " + laneVL() + "), " +
+  };
+  auto decodedLoad = [&](llvm::StringRef qPointer, int64_t linearTerm) {
+    return "__riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" + rawSuffix +
+           "(__riscv_vle8_v_" + rawSuffix + "(" + qPointer.str() + " + " +
+           std::to_string(linearTerm * lhsOwner.interleaveRows) + ", " + laneVL() +
+           "), " + shift + ", " + laneVL() + "), " +
            std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " + laneVL() +
-           ");");
-      const std::string x =
-          "*(const int8_t *)(" + rhsOwner.recordPointer + " + " +
-          std::to_string(rhsField->bitOffset / 8) + " + " +
-          logicalFor(slot, term) + ")";
-      line(partials[slot] + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
-           partials[slot] + ", " + x + ", " + q + ", " + laneVL() + ");");
-      --indent;
-      line("}");
+           ")";
+  };
+  auto loadBank = [&](Bank &q, Bank &x, llvm::StringRef qPointer,
+                      llvm::StringRef xPointer) {
+    for (int64_t slot = 0; slot < unroll; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term) {
+        int64_t linearTerm = slot * mac.group + term;
+        line(q[slot][term] + " = " + decodedLoad(qPointer, linearTerm) + ";");
+        line(x[slot][term] + " = *(" + xPointer.str() + " + " +
+             std::to_string(linearTerm) + ");");
+      }
+  };
+  auto beginPartials = [&](int64_t count) {
+    llvm::SmallVector<std::string> partials;
+    for (int64_t slot = 0; slot < count; ++slot) {
+      std::string partial = fresh("group_partial");
+      line(partialType + " " + partial + " = __riscv_vmv_v_x_" +
+           partialSuffix + "(0, " + laneVL() + ");");
+      partials.push_back(std::move(partial));
     }
-    line("if (" + groupIndex + " + " + std::to_string(slot) + " < " + groups +
-         ") {");
+    return partials;
+  };
+  auto accumulate = [&](llvm::ArrayRef<std::string> partials, const Bank &q,
+                        const Bank &x, int64_t slots) {
+    for (int64_t slot = 0; slot < slots; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term)
+        line(partials[slot] + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+             partials[slot] + ", " + x[slot][term] + ", " + q[slot][term] +
+             ", " + laneVL() + ");");
+  };
+  auto mergePartials = [&](llvm::ArrayRef<std::string> partials) {
+    for (llvm::StringRef partial : partials) {
+      std::string widened = fresh("partial_wide");
+      line(outType + " " + widened + " = __riscv_vwcvt_x_x_v_" + outSuffix +
+           "(" + partial.str() + ", " + laneVL() + ");");
+      line(outName + " = __riscv_vadd_vv_" + outSuffix + "(" + outName + ", " +
+           widened + ", " + laneVL() + ");");
+    }
+  };
+  auto emitImmediate = [&](llvm::StringRef qPointer, llvm::StringRef xPointer,
+                           int64_t slots) {
+    llvm::SmallVector<std::string> partials = beginPartials(slots);
+    for (int64_t slot = 0; slot < slots; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term) {
+        int64_t linearTerm = slot * mac.group + term;
+        std::string q = fresh("q_value");
+        line(rawType + " " + q + " = " + decodedLoad(qPointer, linearTerm) +
+             ";");
+        const std::string x = "*(" + xPointer.str() + " + " +
+                              std::to_string(linearTerm) + ")";
+        line(partials[slot] + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+             partials[slot] + ", " + x + ", " + q + ", " + laneVL() + ");");
+      }
+    mergePartials(partials);
+  };
+
+  const int64_t chunkTerms = unroll * mac.group;
+  const int64_t chunkQBytes = chunkTerms * lhsOwner.interleaveRows;
+  const std::string fullChunks = fresh("mac_full_chunks");
+  line("const size_t " + fullChunks + " = " + fullGroups + " / " +
+       std::to_string(unroll) + ";");
+
+  if (doubleBuffered) {
+    line("if (" + fullChunks + " != 0) {");
     ++indent;
-    std::string widened = fresh("partial_wide");
-    line(outType + " " + widened + " = __riscv_vwcvt_x_x_v_" + outSuffix +
-         "(" + partials[slot] + ", " + laneVL() + ");");
-    line(outName + " = __riscv_vadd_vv_" + outSuffix + "(" + outName + ", " +
-         widened + ", " + laneVL() + ");");
+    Bank currentQ;
+    Bank currentX;
+    Bank nextQ;
+    Bank nextX;
+    declareBank(currentQ, currentX, "current");
+    declareBank(nextQ, nextX, "next");
+    loadBank(currentQ, currentX, qWindow, xWindow);
+    const std::string nextQPointer = fresh("mac_next_q");
+    const std::string nextXPointer = fresh("mac_next_x");
+    line("const uint8_t *" + nextQPointer + " = " + qWindow + " + " +
+         std::to_string(chunkQBytes) + ";");
+    line("const int8_t *" + nextXPointer + " = " + xWindow + " + " +
+         std::to_string(chunkTerms) + ";");
+    const std::string chunk = fresh("mac_chunk");
+    line("#pragma GCC unroll 1");
+    line("for (size_t " + chunk + " = 1; " + chunk + " < " + fullChunks +
+         "; ++" + chunk + ") {");
+    ++indent;
+    llvm::SmallVector<std::string> partials = beginPartials(unroll);
+    for (int64_t slot = 0; slot < unroll; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term) {
+        int64_t linearTerm = slot * mac.group + term;
+        line(nextQ[slot][term] + " = " +
+             decodedLoad(nextQPointer, linearTerm) + ";");
+        line(nextX[slot][term] + " = *(" + nextXPointer + " + " +
+             std::to_string(linearTerm) + ");");
+        line(partials[slot] + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+             partials[slot] + ", " + currentX[slot][term] + ", " +
+             currentQ[slot][term] + ", " + laneVL() + ");");
+      }
+    mergePartials(partials);
+    for (int64_t slot = 0; slot < unroll; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term) {
+        line(currentQ[slot][term] + " = " + nextQ[slot][term] + ";");
+        line(currentX[slot][term] + " = " + nextX[slot][term] + ";");
+      }
+    line(nextQPointer + " += " + std::to_string(chunkQBytes) + ";");
+    line(nextXPointer + " += " + std::to_string(chunkTerms) + ";");
+    --indent;
+    line("}");
+    llvm::SmallVector<std::string> epilogue = beginPartials(unroll);
+    accumulate(epilogue, currentQ, currentX, unroll);
+    mergePartials(epilogue);
+    --indent;
+    line("}");
+  } else {
+    const std::string chunkQPointer = fresh("mac_chunk_q");
+    const std::string chunkXPointer = fresh("mac_chunk_x");
+    line("const uint8_t *" + chunkQPointer + " = " + qWindow + ";");
+    line("const int8_t *" + chunkXPointer + " = " + xWindow + ";");
+    const std::string chunk = fresh("mac_chunk");
+    line("#pragma GCC unroll 1");
+    line("for (size_t " + chunk + " = 0; " + chunk + " < " + fullChunks +
+         "; ++" + chunk + ") {");
+    ++indent;
+    emitImmediate(chunkQPointer, chunkXPointer, unroll);
+    line(chunkQPointer + " += " + std::to_string(chunkQBytes) + ";");
+    line(chunkXPointer + " += " + std::to_string(chunkTerms) + ";");
     --indent;
     line("}");
   }
+
+  const std::string processedGroups = fresh("mac_processed_groups");
+  const std::string remainingGroups = fresh("mac_remaining_groups");
+  const std::string remainderQ = fresh("mac_remainder_q");
+  const std::string remainderX = fresh("mac_remainder_x");
+  line("const size_t " + processedGroups + " = " + fullChunks + " * " +
+       std::to_string(unroll) + ";");
+  line("size_t " + remainingGroups + " = " + fullGroups + " - " +
+       processedGroups + ";");
+  line("const uint8_t *" + remainderQ + " = " + qWindow + " + " +
+       processedGroups + " * " +
+       std::to_string(mac.group * lhsOwner.interleaveRows) + ";");
+  line("const int8_t *" + remainderX + " = " + xWindow + " + " +
+       processedGroups + " * " + std::to_string(mac.group) + ";");
+  line("while (" + remainingGroups + " != 0) {");
+  ++indent;
+  emitImmediate(remainderQ, remainderX, 1);
+  line(remainderQ + " += " +
+       std::to_string(mac.group * lhsOwner.interleaveRows) + ";");
+  line(remainderX + " += " + std::to_string(mac.group) + ";");
+  line("--" + remainingGroups + ";");
+  --indent;
+  line("}");
+
+  line("if (" + tail + " != 0) {");
+  ++indent;
+  llvm::SmallVector<std::string> tailPartial = beginPartials(1);
+  const std::string tailQ = fresh("mac_tail_q");
+  const std::string tailX = fresh("mac_tail_x");
+  line("const uint8_t *" + tailQ + " = " + qWindow + " + " + fullGroups +
+       " * " + std::to_string(mac.group * lhsOwner.interleaveRows) + ";");
+  line("const int8_t *" + tailX + " = " + xWindow + " + " + fullGroups +
+       " * " + std::to_string(mac.group) + ";");
+  for (int64_t term = 0; term < mac.group; ++term) {
+    line("if (" + std::to_string(term) + " < " + tail + ") {");
+    ++indent;
+    std::string q = fresh("q_tail_value");
+    line(rawType + " " + q + " = " + decodedLoad(tailQ, term) + ";");
+    line(tailPartial.front() + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+         tailPartial.front() + ", *(" + tailX + " + " + std::to_string(term) +
+         "), " + q + ", " + laneVL() + ");");
+    --indent;
+    line("}");
+  }
+  mergePartials(tailPartial);
   --indent;
   line("}");
   Binding resultBinding;

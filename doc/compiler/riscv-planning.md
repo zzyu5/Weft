@@ -39,9 +39,9 @@ SelectRISCVLocalOperations
     fragment 与 operand/result handoff。
 
 ScheduleRISCVLevels
-    为每个 Level 写入 iteration/tail 归属。当前可执行候选固定为
-    unroll=1、pipeline_depth=1、prefetch_distance=0；这些字段不代表已经
-    存在多种流水实现。
+    为每个 Level 写入 iteration/tail、unroll 与 loop-local pipeline 归属。
+    pipeline_depth=1 产生 sequential stream，depth=2 产生跨 iteration 的
+    current/next 双银行；逐 term software prefetch 不属于候选空间。
 
 CheckRISCVResources
     根据 SSA 首末使用、value register groups、matrix fragment 与保留组

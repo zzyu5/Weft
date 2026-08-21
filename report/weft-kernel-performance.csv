@@ -4,8 +4,8 @@ normalization,rms_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hid
 summary_state,softmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,attention[heads=32;Q=128;K=128],full-attention-score-softmax,10,0,64,full,no,,,4.89512e-08,4.02709696e-07,4.520210,115.987532,MElements/s
 dense_dot,gemm_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,12.058155,2.782717,GOP/s
 dense_dot,gemm_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,770.720239,5.572667,GOP/s
-quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-use-def-physicalized-real-ggml-layout,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,19.461960,6.034362,GOP/s
-quantized_dot,q4_K_q8_K_groups4,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-use-def-physicalized-real-ggml-layout,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,17.390340,6.753204,GOP/s
+quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-hoisted-window-cross-group-pipeline,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,13.716003,8.562299,GOP/s
+quantized_dot,q4_K_q8_K_groups4,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-hoisted-window-sequential-stream,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,12.745688,9.214137,GOP/s
 dense_dot,gemv_f32,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-solved-strided-row-cohort,M=1;N=14336;K=4096,full-dense-projection,10,1,64,full,no,,,0,0,790.707095,0.148526,GOP/s
 irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,embedding[vocab=128256;hidden=4096];tokens=128,full-embedding-row-decode,10,0,64,full,no,,,0,0,0.906954,,
 memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,4.127589,1.016163,GB/s

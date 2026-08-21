@@ -391,8 +391,6 @@ mlir::ArrayAttr instantiateCandidates(
     expandScheduleDimension(bindings, level, "unroll", options.unrollChoices);
     expandScheduleDimension(bindings, level, "pipeline_depth",
                             options.pipelineDepthChoices);
-    expandScheduleDimension(bindings, level, "prefetch_distance",
-                            options.prefetchDistanceChoices);
   }
   llvm::SmallVector<mlir::Attribute> candidates;
   for (auto [index, binding] : llvm::enumerate(bindings)) {
@@ -403,8 +401,7 @@ mlir::ArrayAttr instantiateCandidates(
     llvm::SmallVector<mlir::NamedAttribute> schedule;
     for (llvm::StringRef level : scheduleLevels) {
       llvm::SmallVector<mlir::NamedAttribute> parameters;
-      for (llvm::StringRef parameter :
-           {"unroll", "pipeline_depth", "prefetch_distance"}) {
+      for (llvm::StringRef parameter : {"unroll", "pipeline_depth"}) {
         const std::string key = (level + "." + parameter).str();
         parameters.push_back(builder.getNamedAttr(
             parameter, builder.getI64IntegerAttr(binding.schedule.lookup(key))));

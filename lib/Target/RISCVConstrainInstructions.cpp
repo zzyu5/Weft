@@ -349,11 +349,42 @@ public:
                   mlir::cast<mlir::StringAttr>(operands[0]).getValue());
               auto result = values.find(
                   mlir::cast<mlir::StringAttr>(results[0]).getValue());
+              const EncodingFieldFacts *lhsField = fieldFactsForValue(
+                  mlir::cast<mlir::StringAttr>(operands[0]).getValue(),
+                  producers, values, encodings);
               const EncodingFieldFacts *rhsField = fieldFactsForValue(
                   mlir::cast<mlir::StringAttr>(operands[1]).getValue(),
                   producers, values, encodings);
-              if (lhs == values.end() || result == values.end() || !rhsField ||
-                  firstLayoutKind(rhsField->layouts) != "natural") {
+              auto grouped =
+                  lhsField && lhsField->layouts.size() == 2
+                      ? mlir::dyn_cast<mlir::DictionaryAttr>(lhsField->layouts[0])
+                      : mlir::DictionaryAttr();
+              auto layered =
+                  lhsField && lhsField->layouts.size() == 2
+                      ? mlir::dyn_cast<mlir::DictionaryAttr>(lhsField->layouts[1])
+                      : mlir::DictionaryAttr();
+              auto groupKind =
+                  grouped ? grouped.getAs<mlir::StringAttr>("kind")
+                          : mlir::StringAttr();
+              auto layerKind =
+                  layered ? layered.getAs<mlir::StringAttr>("kind")
+                          : mlir::StringAttr();
+              auto groupSize =
+                  grouped ? grouped.getAs<mlir::IntegerAttr>("size")
+                          : mlir::IntegerAttr();
+              auto layerSize =
+                  layered ? layered.getAs<mlir::IntegerAttr>("size")
+                          : mlir::IntegerAttr();
+              auto layerOrder =
+                  layered ? layered.getAs<mlir::StringAttr>("order")
+                          : mlir::StringAttr();
+              if (lhs == values.end() || result == values.end() || !lhsField ||
+                  !rhsField || firstLayoutKind(rhsField->layouts) != "natural" ||
+                  !groupKind || groupKind.getValue() != "grouped" || !layerKind ||
+                  layerKind.getValue() != "layered" || !groupSize || !layerSize ||
+                  !layerOrder || lhsField->bitOffset % 8 ||
+                  groupSize.getInt() <= 0 || layerSize.getInt() <= 0 ||
+                  groupSize.getInt() % layerSize.getInt() != 0) {
                 legal = false;
               } else {
                 localOperation = riscv_internal::dictionary(
@@ -366,8 +397,18 @@ public:
                      {"partial_sew", builder.getI64IntegerAttr(16)},
                      {"partial_layout",
                       builder.getStringAttr("group-major")},
+                     {"lhs_access",
+                      builder.getStringAttr(
+                          "grouped-layered-constant-stride-window")},
+                     {"lhs_group_size", groupSize},
+                     {"lhs_layer_size", layerSize},
+                     {"lhs_layer_order", layerOrder},
+                     {"lhs_bit_offset",
+                      builder.getI64IntegerAttr(lhsField->bitOffset)},
                      {"rhs_access",
-                      builder.getStringAttr("natural-scalar-field")},
+                      builder.getStringAttr("natural-unit-stride-window")},
+                     {"rhs_bit_offset",
+                      builder.getI64IntegerAttr(rhsField->bitOffset)},
                      {"decision_owner", builder.getStringAttr("operation")}});
               }
             }

@@ -28,7 +28,7 @@ mlir::DictionaryAttr scheduleForLevel(mlir::Builder &builder,
         builder,
         {{"unroll", builder.getI64IntegerAttr(1)},
          {"pipeline_depth", builder.getI64IntegerAttr(1)},
-         {"prefetch_distance", builder.getI64IntegerAttr(0)},
+         {"loop_structure", builder.getStringAttr("sequential-stream")},
          {"derived_from",
           builder.getStringAttr("no schedulable local cluster in this Level")},
          {"decision_owner", builder.getStringAttr("Level")}});
@@ -36,7 +36,11 @@ mlir::DictionaryAttr scheduleForLevel(mlir::Builder &builder,
       builder,
       {{"unroll", selected.get("unroll")},
        {"pipeline_depth", selected.get("pipeline_depth")},
-       {"prefetch_distance", selected.get("prefetch_distance")},
+       {"loop_structure",
+        builder.getStringAttr(
+            riscv_internal::integer(selected, "pipeline_depth").value_or(0) == 2
+                ? "cross-iteration-double-buffer"
+                : "sequential-stream")},
        {"derived_from",
         builder.getStringAttr("concrete outer auto candidate for " +
                               levelId.str())},
@@ -68,14 +72,14 @@ mlir::DictionaryAttr addLocalTemporaryBudget(mlir::Builder &builder,
   int64_t partialGroups = (partialLMUL + 7) / 8;
   int64_t temporaryGroups = (unroll - 1) * partialGroups;
   if (pipeline > 1)
-    temporaryGroups += unroll * group * rawGroups;
+    temporaryGroups += 2 * unroll * group * rawGroups;
   local = riscv_internal::set(
       local, "temporary_vector_groups",
       builder.getI64IntegerAttr(temporaryGroups));
   local = riscv_internal::set(
       local, "temporary_groups_derived_from",
       builder.getStringAttr(
-          "additional unroll partials + explicitly buffered decoded operands"));
+          "additional unroll partials + current/next decoded operand banks"));
   return riscv_internal::set(operation, "local_operation", local);
 }
 

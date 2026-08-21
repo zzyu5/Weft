@@ -18,7 +18,6 @@ struct RISCVCompilerOptions {
   llvm::StringMap<llvm::SmallVector<int64_t, 4>> metaBindings;
   llvm::SmallVector<int64_t, 4> unrollChoices{1};
   llvm::SmallVector<int64_t, 4> pipelineDepthChoices{1};
-  llvm::SmallVector<int64_t, 4> prefetchDistanceChoices{0};
 };
 
 struct RISCVPlanningResult {

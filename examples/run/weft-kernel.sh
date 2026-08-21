@@ -48,10 +48,6 @@ fi
 if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
   physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
 fi
-if [[ -n ${WEFT_AUTO_PREFETCH_DISTANCE:-} ]]; then
-  physical_auto+=(--auto-prefetch-distance "${WEFT_AUTO_PREFETCH_DISTANCE}")
-fi
-
 meta=()
 matrix_extension=none
 runtime_kernel_define=
