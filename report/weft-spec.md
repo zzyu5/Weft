@@ -10,7 +10,7 @@ Weft 是一门层级化、encoding-aware、有限位宽的**数值 realization �
 
 作者写下一份具体的数值实现：哪些中间值存在、每个值在哪一层诞生、以什么类型的关系交回外层、哪些代数支路被拆出去、同时保留多少个输出、哪些重排发生在调用之外。
 
-编译器不发明代数结构。它为这份实现求解物理表示：SEW/LMUL 沿链传播、vl 与尾循环、寄存器分组与压力、packed 字节的交错顺序、指令选择、引擎绑定、unroll 与流水、`auto` 参数取值。
+编译器不发明代数结构。它用一串前向 physicalization pass 落实这份实现：SEW/LMUL 沿值链传播、vl 与尾循环、寄存器分组、packed value 的读取形态、指令选择、引擎绑定、unroll 与流水。`std` 特化和 `auto` 参数在最外层形成候选；每个候选独立走完整 pass 序列，资源不合法就被删除。
 
 一句话：
 
@@ -153,7 +153,7 @@ SIMT 硬件**强制** ownership：一个值必须被一组线程共同拥有，l
 
 # 第三部分 · 语言规范
 
-## 3.1 Encoding —— 纯布局声明
+## 3.1 Encoding —— 逻辑字段到 storage 的纯布局映射
 
 ```python
 @weft.encoding
@@ -161,9 +161,9 @@ class Q4_K:                          # 144 B / 256 elems
     layout = bitorder.lsb_first, byteorder.little
     d:     f16
     dmin:  f16
-    sc:    u6[8]   @packed(12)       # per 32 elems, 6 bit × 8 → 12 B（与 m 共用）
-    m:     u6[8]   @packed(12)
-    q:     u4[256] @nibble(lo_first) # 128 B
+    sc:     u6[8] @ joined(4, 2, 4, lo_first)
+    m:      u6[8] @ joined(4, 2, 4, lo_first)
+    q:     u4[256] @ grouped(64) @ layered(32, lo_first)
 
 @weft.encoding
 class Q8_K:                          # 292 B / 256 elems
@@ -173,13 +173,60 @@ class Q8_K:                          # 292 B / 256 elems
     bsum:  i16[16]                   # per 16 elems
 ```
 
-**这就是 C 的 struct 声明，但比 C 严格**：C 的 bit-field 没有稳定跨编译器 ABI，Weft 必须显式规定：
+Encoding 不是“字段起始 offset + 元素宽度”的 C struct 字段表。它定义：
+
+> **一个逻辑字段坐标怎样映射到 storage unit 与其中的 bit range。**
+
+字段仍按源码顺序占据互不重叠的 storage span；字段内部的逻辑元素不要求按 `offset + i × width` 连续排列。作者只组合少量布局关系，不写逐元素 bit-slice 表，也不写地址公式。
+
+从 GGML 的 Q4/Q5/Q2_K..Q6_K/IQ 系列归纳出的关系只有五类：
+
+```text
+natural
+    logical element 按顺序占据自然 storage unit；Q8_0/Q8_1 属于此类。
+
+grouped(N)
+    每 N 个逻辑元素形成一个独立重复的 storage group。
+
+layered(P, lo_first | hi_first)
+    group 内按 P 个元素一层；同一层内位置相同的元素共享一个
+    storage unit 的不同 bit range。Q4_0 是 grouped(32)+layered(16)，
+    Q4_K.q 是 grouped(64)+layered(32)。
+
+bit_planes(w0, w1, ...)
+    一个逻辑值的不同 bit width 位于独立重复平面；Q5/Q6/Q3 的
+    qh/hmask 属于此类。
+
+join
+    把多个 plane 中的片段重组成一个逻辑字段值；K-scale 与 IQ
+    metadata 使用它。join 只重组 bits，不执行 scale、zero-point、
+    codebook 或 dequant 数学。
+```
+
+`natural/grouped/layered/joined` 构成本轮公开且可 lowering 的基础布局表面。`bit_planes` 是全格式调查得到、但尚无本轮 consumer 的下一类纯布局关系；在它闭合前，相关 metadata 必须作为真实 storage 字段出现，不能伪装成连续逻辑字段，也不能让 emitter 按格式名恢复。
+
+`joined(group=4, fields=2, low_bits=4, order=lo_first)` 表示一组连续逻辑字段共享规则化 storage：每个字段的前 `group` 项以完整宽度占据独立 byte；后 `group` 项的低 `low_bits` 在尾部 bytes 按 field 顺序分层，剩余高 bits 填入前半 bytes 的空余高位。Q4_K 的 `sc/m` 因而共享 12 bytes，作者不写任何 bit slice。
+
+以 Q4_K.q 为例，`grouped(64) @ layered(32, lo_first)` 唯一表示：
+
+```text
+g = i // 64
+r = i % 64
+storage byte = 32*g + (r % 32)
+storage bits = low nibble  if r < 32
+               high nibble otherwise
+```
+
+这是布局关系的解释，不是作者写入源程序的索引公式。
+
+Encoding 必须同时显式规定：
 
 ```
 bit order        位在字节内的方向
 byte order       字节序
-sub-byte packing 亚字节字段的排布（nibble 高低位顺序、6-bit 的跨字节方式）
-array packing    数组元素之间是否跨字节边界
+grouping         logical array 到重复 storage group 的划分
+layering         group 内逻辑层与 storage bit range 的对应
+bit planes/join  一个逻辑值跨多个 storage plane 时的纯 bit 重组
 alignment        对齐
 padding          填充位置与内容
 ```
@@ -188,9 +235,9 @@ padding          填充位置与内容
 - 不变量。编译器不知道 `bsum[j] == Σ q[16j:16j+16]`，也不需要知道。
 - 解码语义作为推理基础。`dequant()` 如果存在，它是**可以被调用的函数**，不是给编译器推理用的关系。
 
-**唯一作用：** 让作者按字段名访问 packed struct，而不是自己算字节偏移。
+**唯一作用：** 让作者按逻辑字段访问 packed storage，而不是自己计算 byte/nibble 地址。布局 pass 可以把组合关系展开为 canonical index mapping；那是编译产物，不是源程序表面。
 
-**推论：** 编译器不能自行从 `q` 重建或替换 `bsum`。若某个派生编码需要生成字段，那是它的 builder 的责任。
+**推论：** 编译器不能自行从 `q` 重建或替换 `bsum`。若某个派生编码需要生成字段，那是它的 builder 的责任。D 组可以选择 and/shift、gather 或专用 unpack 来实现同一 mapping，但不能改变 mapping。
 
 > **注意 Q4_K 的 sc/m 粒度是 32、Q8_K 的 bsum 粒度是 16。这个错配是真实的，程序必须显式处理（见 4.1 的 `fold2`）。**
 
@@ -373,7 +420,7 @@ for i in range(N):
 
 **(1) 没有黑盒。** 标准库是同语言可读的源码，不是 C++ selector、不是模板特化、不是 emitter 分支。
 
-**(2) 调用是 inline 的。** 不是运行时 call。调用点展开成被调用者的那棵树，与外围代码一起进入同一个表示求解器 —— 所以跨越调用点的 layout 是联合求解的，不会出现"库里选了一种排布、外面又转一次"。（与 C 的 `static inline` 同类，但更强：C 只 inline 代码，我们 inline 的是树，表示还没定。）
+**(2) 调用是 inline 的。** 不是运行时 call。调用点展开成被调用者的那棵树，与外围代码一起进入同一串 physicalization pass；值的表示沿普通 use-def 继续传播，冲突处显式插入局部 convert，而不是让库和调用者各自隐藏选择。（与 C 的 `static inline` 同类，但更强：C 只 inline 代码，我们 inline 时物理表示尚未决定。）
 
 **(3) 一个名字下可以有多个实现，靠签名选。**
 
@@ -626,7 +673,7 @@ def topk(X: View[f32,(N,)], out: View[i32,(K_,)]):
 
 # 第五部分 · 编译器
 
-## 5.1 决策清单：作者 10 项，编译器 16 项
+## 5.1 决策清单与实体归属
 
 手写一份 q4_K RVV intrinsic，人要定的全部决策：
 
@@ -648,89 +695,91 @@ def topk(X: View[f32,(N,)], out: View[i32,(K_,)]):
 
 ### C 组 · 向量形态（9 项，**编译器**）
 
-11. 每个中间值的 SEW
-12. 每个中间值的 LMUL（widen 会翻倍并沿链传染）
-13. vl 怎么算，每层循环各一次
-14. 尾循环
-15. 16 个累加器怎么分组进寄存器
-16. 寄存器总量够不够 32，不够谁 spill
-17. i16 partial 是 lane-major 还是 group-major
-18. 横向 reduce 在哪一步做
-19. VLEN 128 / 256 是否要不同代码
+11. 某个 **value** 的 SEW
+12. 某个 **value** 的 LMUL（widen 会沿 use-def 传播）
+13. 某个 **Level/value** 的 vl
+14. 某个 **Level** 的尾循环
+15. 某组 **state/result values** 怎样分组进寄存器
+16. 整个候选的寄存器预算是否合法；spill 归属于具体 **value**
+17. 某个分组乘加 **result value** 的 partial layout
+18. 某个 **reduce op** 的横向归约位置
+19. 当前 **target/entry** 的 VLEN specialization
 
 ### D 组 · 指令与内存形态（7 项，**编译器**）
 
-20. nibble 拆法：and+shift / 专用 unpack / `vluxei` 查表
-21. mac 用哪条：`vwmaccsu` / `vqmaccsu` / IME
-22. scale 怎么广播对齐到 lane
-23. 交错的字节级顺序
-24. load 的步长与对齐
-25. prefetch 距离
-26. 软流水深度 / unroll 因子
+20. 某个 packed **value-use edge** 的拆法：and+shift / 专用 unpack / gather
+21. 某个 **mac/contract op** 的指令：`vwmaccsu` / `vqmaccsu` / IME
+22. 某个 scale **value-use edge** 怎样广播到 consumer mapping
+23. 某个 **memory object / derived encoding instance** 的字节级顺序
+24. 某个 **memory edge** 的 load form、步长与对齐
+25. 某个 **Level + memory edge** 的 prefetch 距离
+26. 某个 **Level / local op cluster** 的软流水深度与 unroll
 
 ```
 写 intrinsic：26 项
 写 Weft：    10 项（A + B）
-编译器解：   16 项（C + D）
+编译器 passes 决定：16 类实体级属性（C + D）
 ```
 
-## 5.2 这 16 项是一个带回边的环
+这些不是 16 个 kernel-global 开关。一个 kernel 可以同时有多个 packed value、多个 reduce、多个 memory edge 和多个 Level；每个实体都可以得到不同决定。只有 target facts 与总寄存器预算是全局输入/检查。
 
-它们不是 16 个独立的空格。看其中几项的耦合：
+## 5.2 前向 pass 序列，不是全局求解器
 
-```
-选 vqmaccsu（21）
-  → 要求 weight 展开成 i8，一次吃 4 个（20 必须是展开式拆法）
-    → 决定 Q4K_I16 的字节交错顺序（23）
-      → 决定 load 出来是 u8m1 还是 u8m2（11、12）
-        → 决定 i16 partial 的排布（17）
-          → 决定 widen 之后 LMUL 是 m2 还是 m4（12）
-            → 决定 16 个累加器占多少寄存器（15）
-              → 可能超过 32 个，倒逼回去改 LMUL（12）
-                → 又倒逼回去改 mac 形态（21）
-```
+编译器采用和常规 MLIR compiler 一致的形态：每个 pass 读取 canonical IR 与前序 pass 已写下的瞬态 attribute，决定一类实体事实，再交给后续 pass。
 
-**这是一个带回边的约束系统。**
-
-手写时人怎么处理：在环上任选一点猜死，一路推下去，推到寄存器不够就回头调，调不动就降 cohort。这个过程要两天，结果是局部的 —— 你永远不知道从另一个点出发会不会更好。
-
-> llama.cpp 里同一格式的多份实现，每一份就是从一个不同的猜死点长出来的，彼此之间没有关系。**没有人试过第二个点，因为试一次要重写一遍。**
-
-**解这个环是编译器唯一要做的事，也是它真正难的事。**
-
-## 5.3 表示解空间
-
-对每个逻辑值求一个物理表示：
-
-```
-Memory representation      canonical encoding / 派生 encoding / packed panel / dense
-Vector representation      scalar / RVV lane value / register bundle / vector partial
-Matrix representation      IME fragment
-Local storage              stack / 目标私有 workspace
+```text
+std specialization × auto bindings
+        ↓ 最外层枚举完整 source candidate
+InferEncodingMappings
+        为每个 encoded field/value-use 展开 grouped/layered mapping
+PropagateValueRepresentations
+        为每个 value 决定 SEW、LMUL、vl 与必要 convert
+SelectLocalOperations
+        为每个 op / memory edge 选择 local RVV/IME operation
+ScheduleLevels
+        为每个 Level 决定 unroll、local pipeline 与 prefetch
+CheckResources
+        汇总 live values；合法则保留，不够则使用已明确决定的 spill，
+        否则把当前完整 candidate 标为非法
+EmitIntrinsicC
+        只读所有决定，机械拼写 intrinsic C / local asm
+        ↓
+rank 或真机实测所有合法 candidate，选择 winner
 ```
 
-链的两端被钉死：一端是内存编码，一端是指令操作数格式。中间自由，且相邻两环必须匹配。
+**pass 内前向，pass 之间靠 entity-local attribute 传递。没有回边。**
+
+- layout 冲突不回头重选：在冲突的 value-use edge 插入明确 convert，后续 pass 可以消除冗余 convert；
+- 资源不足不回头修改 LMUL、instruction 或作者树：当前 candidate spill 或非法；
+- 要探索另一 LMUL、mac realization、unroll 或 std 数值特化，就形成另一个外层 candidate，重新走完整流水；
+- 一个 pass 不读取 emitter 状态，也不修改更早 pass 已冻结的实体决定。
+
+这不意味着各项彼此独立。instruction 会读取 operand representation，schedule 会读取 instruction latency，resource check 会汇总所有 live values；依赖通过前向数据流体现，而不是通过全局 dictionary 上的 arc propagation 与 DFS 回溯体现。
+
+## 5.3 瞬态决定的归属
+
+一次 target lowering 内，决定直接挂在它描述的实体上：
+
+```
+value attr         physical kind / SEW / LMUL / vl / register bundle / spill
+op attr            selected local realization / operand-result handoff
+memory-edge attr   encoding mapping / load form / stride / alignment / unpack
+Level attr         tail / unroll / pipeline / prefetch schedule
+target facts       ISA / ABI / VLEN / extensions / global resource budget
+```
+
+链的两端仍被钉死：一端是内存 encoding mapping，一端是 selected instruction operand form。中间的 value-use 冲突由显式 convert 表示。
 
 **pin 只出现在跨调用边界**：kernel 参数、持久 buffer、调用方可见 workspace。**pin 处不许插 coercion**；内部的 coercion 是编译器自己的成本。
 
-## 5.4 联合候选选择（不是串行三阶段）
-
-一个自然的想法是：
-
-```
-阶段1 选定 auto 与树 → 阶段2 求物理表示
-```
-
-**这个是错的。** 因为 `group=16` 合不合法**取决于**寄存器够不够，而寄存器够不够要等物理求解才知道。串行会死锁。
-
-正确模型：
+## 5.4 候选在 pass 流水之外枚举
 
 ```
 程序 schema
   × 库函数的多个特化（不同的树）
   × auto 参数实例
         ↓
-  对每个完整候选，各自做表示与资源求解
+  对每个完整候选，运行一遍完整前向 pass 序列
         ↓
   删除不可行候选（寄存器不足、无合法表示链、引擎不匹配）
         ↓
@@ -739,12 +788,12 @@ Local storage              stack / 目标私有 workspace
   选出完整 winner
 ```
 
-因此"树不可改"的准确含义是：
+候选之间可以具有不同 std 特化、`auto` 参数和 target-local physical config；候选内部不回退重选。因而“树不可改”的准确含义仍是：
 
 > **对每一个已实例化的候选而言，树不可改。**
-> 不是"物理求解之前必须先永久选定一棵树"。
+> 资源检查只能接受或拒绝这个候选，不能把它改成另一棵树。
 
-**编译器仍然不发明树** —— 候选集来自库中人写好的特化和 `auto` 的取值范围，不来自结构搜索。
+**编译器仍然不发明树** —— source candidate 来自库中人写好的特化和 `auto` 的取值范围，不来自结构搜索。
 
 ## 5.5 可改与不可改
 
@@ -771,7 +820,17 @@ Local storage              stack / 目标私有 workspace
 
 例：把与 sub index 无关的地址加法提出去 —— 可以（数值树没变）。把 `w.d * i32_acc` 下沉到 sub 层 —— 不可以（转换、舍入位置、中间类型全变）。
 
-## 5.6 Verifier
+## 5.6 Pass 契约、Verifier 与 emitter
+
+每个 physicalization pass 必须声明：
+
+```text
+读哪些 canonical facts / 前序 attributes
+写到哪类具体实体
+缺失或冲突时插入什么 convert，或返回什么 unsupported
+```
+
+同一决定只有一个 producer。后面的 pass 只消费，不重新推导。
 
 **需要**（结构与类型）：
 
@@ -796,6 +855,8 @@ engine role 是否与 op 兼容
 
 > **检查它是不是一份合法的 Weft 程序，不证明它是不是作者想写的那个数学公式。**
 
+Emitter 是最后一个 pass。它只读 selected value/op/memory-edge/Level attributes，负责普通 C、RVV intrinsic、ABI 和 typed local asm 拼写。Emitter 缺信息必须回报前序 pass 契约缺口；不得扫描 source closure、根据 dtype/shape/VLEN/格式名补选结构，也不得写回任何 physical attribute。
+
 ## 5.7 编译器绝不做的四件事
 
 ```
@@ -811,7 +872,7 @@ engine role 是否与 op 兼容
 
 ## 5.8 输出
 
-生成 intrinsic C（`__riscv_v*` / IME intrinsic），不生成 IR 交给 LLVM 做向量化。理由：向量形态是我们求解的结果，不能再交给另一个求解器猜。
+生成 intrinsic C（`__riscv_v*` / IME intrinsic），不生成 IR 交给 LLVM 做向量化。理由：向量形态已经由 Weft passes 明确决定，不能再交给系统编译器重新猜。
 
 ---
 
@@ -853,15 +914,15 @@ i32_acc += reduce(widen(p16, i32)) * w.sc[s]
 Weft 里：
 
 - **展开式拆 nibble 用 and/shift 还是 gather** —— 逻辑值集合没变，**同一份源程序的两个表示解**，编译器解。
-- **成对 mac 换成四路 mac** —— 逻辑值集合变了（i16 partial 的数量和覆盖范围变了），**是另一棵树，但作者只改一行**：`mac_pairs(...)` → `mac_groups(..., n=4)`，下面 16 项全部重新求解。
+- **成对 mac 换成四路 mac** —— 逻辑值集合变了（i16 partial 的数量和覆盖范围变了），**是另一棵树，但作者只改一行**：`mac_pairs(...)` → `mac_groups(..., n=4)`，该候选重新走完整 physicalization pass 序列。
 
 > **收益不是编译器替你找到最好的结构，而是让"换一个结构"的代价从两天降到一行。**
 
-这个主张不需要编译器有任何超人能力，只需要表示求解这一件事做对。
+这个主张不需要编译器有任何超人能力，只需要实体级 physicalization pass 与候选枚举做对。
 
 ## 6.4 VLEN 无关与双引擎
 
-- **VLEN** 是求解时的一个约束参数。同一份分解，VLEN 128 与 256 出不同的 LMUL、cohort 物理分组、unroll。**不写两份。**
+- **VLEN** 是 target fact。同一份分解在 VLEN 128 与 256 的候选流水中产生不同的 LMUL、cohort 物理分组与 unroll。**不写两份。**
 - **IME** 不是"另一个后端"，是同一台机器上的另一个引擎。同一份数值分解，在 `@wide` 树和 `@matrix` 树之间选 —— 两棵树共享 A 组的全部 6 项，只在 B 组和 engine 标注上不同。
 
 ## 6.5 抽象是否正确的纸面检验
@@ -951,7 +1012,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 语言贡献：   层级化、encoding-aware 的有限位宽数值实现
              —— 对 GPU 也成立，不是非 SIMT 专属
 
-编译器贡献： 面向单控制器 vector/matrix 机器的联合表示求解
+编译器贡献： 面向单控制器 vector/matrix 机器的实体级物理化 pass
              —— 这才是非 SIMT 的部分
 ```
 
@@ -982,7 +1043,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **3.** 源程序里没有"许可"，编译器里没有"证明"。想加标志位时，先问谁读它。
 
-**4.** Encoding 是纯布局声明，必须明确 bit/byte order 与 packing；不携带不变量。
+**4.** Encoding 是逻辑字段到 storage unit/bit range 的纯布局映射，由 grouped/layered/bit-plane/join 等关系组合；不携带不变量或解码数学。
 
 **5.** Level 与 `for` 的区别是"值在哪一层诞生、以什么关系交回外层"。语法上是普通 SSA，IR 必须保留层归属。
 
@@ -994,7 +1055,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **9.** **只有一个层级、一门语言。** 标准库是用同一门语言写的普通函数，inline 展开，无黑盒，无特权原语，无第二类用户。
 
-**10.** "树不可改"是对每个已实例化的候选而言；候选选择是联合的，不是串行三阶段。
+**10.** "树不可改"是对每个已实例化的候选而言；候选在最外层枚举，每个候选独立走完整前向 pass 序列，资源检查只接受或拒绝。
 
 **11.** 语言贡献与编译器贡献分开主张。
 
@@ -1004,7 +1065,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 1. **多引擎流水的表达。** `materialize` + `handoff` 够不够表达双缓冲式的跨引擎 overlap，还是需要第三个动词。
 2. **tail 语义。** level 的 partition 在非整除域上如何定义，尤其是 cohort 宽度除不尽时。
-3. **表示求解的可解性。** 那个带回边的约束系统的规模与求解策略（约束传播 + 代价模型 + 候选枚举）。
+3. **bit_planes 的公开表面。** 全格式调查已证明它是重复出现的纯布局关系；在没有真实 lowering 消费者前不暴露半成品接口。
 4. **代价模型。** 静态排序候选需要什么粒度的机器模型；什么时候必须落到真机实测。
 5. **Intent → Weft 的生成路径。** 当前设计不依赖它；Weft 独立成立。
 
@@ -1023,5 +1084,5 @@ Kernel Program + Local Realization Program 两份用户程序
 数学等价证明器与溢出证明器
 Level 上的 ordered 属性
 闭合原语作为特权层（"普通用户 vs 库作者"两个层级）
-串行三阶段编译（先定树、后求表示）
+全局 C/D dictionary、arc propagation 与 DFS 回溯求解器
 ```

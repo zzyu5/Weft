@@ -367,7 +367,7 @@ public:
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
     if (!options->target.supportsFixedRVV()) {
-      module.emitError("RISC-V representation solving requires RVV and a fixed VLEN");
+      module.emitError("RISC-V physicalization requires RVV and a fixed VLEN");
       signalPassFailure();
       return;
     }
@@ -396,30 +396,26 @@ public:
         signalPassFailure();
         return;
       }
-      mlir::OperationState state(kernel.getLoc(), riscv::ProblemOp::getOperationName());
-      state.addAttribute("sym_name", builder.getStringAttr(
-                                         "__weft_problem_" +
-                                         std::to_string(problemIndex++)));
-      state.addAttribute("kernel",
-                         mlir::FlatSymbolRefAttr::get(module.getContext(),
-                                                      kernel.getSymName()));
-      state.addAttribute("target",
-                         riscv_internal::targetFacts(builder, options->target));
-      state.addAttribute("candidates",
-                         instantiateCandidates(builder, kernel, *dimensions));
-      state.addAttribute("values", collector.valueAttributes());
-      state.addAttribute("operations", collector.operationAttributes());
-      state.addAttribute(
-          "constraints",
-          riscv_internal::strings(
-              builder,
-              {"program-tree=frozen", "ordinary-control=scalar-ordered",
-               "pins=kernel-abi,persistent-encoding",
-               "candidate-space=std-specialization-x-auto"}));
-      state.addAttribute("decision_domains", builder.getDictionaryAttr({}));
-      state.addAttribute("resource_model", builder.getDictionaryAttr({}));
-      state.addAttribute("stage", builder.getStringAttr("facts"));
-      builder.create(state);
+      mlir::ArrayAttr candidates = instantiateCandidates(builder, kernel, *dimensions);
+      for (mlir::Attribute attribute : candidates) {
+        auto candidate = mlir::cast<mlir::DictionaryAttr>(attribute);
+        mlir::OperationState state(kernel.getLoc(),
+                                   riscv::ProblemOp::getOperationName());
+        state.addAttribute("sym_name", builder.getStringAttr(
+                                           "__weft_candidate_" +
+                                           std::to_string(problemIndex++)));
+        state.addAttribute("kernel",
+                           mlir::FlatSymbolRefAttr::get(module.getContext(),
+                                                        kernel.getSymName()));
+        state.addAttribute("target",
+                           riscv_internal::targetFacts(builder, options->target));
+        state.addAttribute("candidate", candidate);
+        state.addAttribute("values", collector.valueAttributes());
+        state.addAttribute("operations", collector.operationAttributes());
+        state.addAttribute("resources", builder.getDictionaryAttr({}));
+        state.addAttribute("stage", builder.getStringAttr("facts"));
+        builder.create(state);
+      }
     }
     if (problemIndex == 0) {
       module.emitError("RISC-V planning requires at least one Weft kernel");

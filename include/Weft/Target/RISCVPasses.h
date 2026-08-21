@@ -11,10 +11,11 @@ namespace weft {
 
 std::unique_ptr<mlir::Pass>
 createConstructRISCVProblemsPass(RISCVCompilerOptions options);
-std::unique_ptr<mlir::Pass> createConstrainRISCVRepresentationsPass();
-std::unique_ptr<mlir::Pass> createConstrainRISCVInstructionsPass();
-std::unique_ptr<mlir::Pass> createConstrainRISCVResourcesPass();
-std::unique_ptr<mlir::Pass> createSolveRISCVProblemsPass();
+std::unique_ptr<mlir::Pass> createAssignRISCVRepresentationsPass();
+std::unique_ptr<mlir::Pass> createSelectRISCVLocalOperationsPass();
+std::unique_ptr<mlir::Pass> createScheduleRISCVLevelsPass();
+std::unique_ptr<mlir::Pass> createCheckRISCVResourcesPass();
+std::unique_ptr<mlir::Pass> createSelectRISCVWinnerPass();
 
 } // namespace weft
 

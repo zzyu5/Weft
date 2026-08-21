@@ -4,7 +4,8 @@ normalization,rms_norm_worker,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,hid
 summary_state,softmax_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,attention[heads=32;Q=128;K=128],full-attention-score-softmax,10,0,64,full,no,,,4.89512e-08,4.02709696e-07,4.520210,115.987532,MElements/s
 dense_dot,gemm_worker,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=1;N=4096;K=4096,full-dense-projection,10,0,64,sampled,no,,,0,0,12.058155,2.782717,GOP/s
 dense_dot,gemm_worker,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;N=4096;K=4096,full-dense-projection,3,0,64,sampled,no,,,0,0,770.720239,5.572667,GOP/s
-quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-solved-representation,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,18.272175,6.427287,GOP/s
+quantized_dot,q4_K_q8_K,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-forward-physicalized-real-ggml-layout,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,20.369742,5.765439,GOP/s
+quantized_dot,q4_K_q8_K_groups4,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-forward-physicalized-real-ggml-layout,M=1;N=14336;K=4096,single-thread-full-projection-block-dot,10,1,64,full,no,,,0,0,17.378719,6.757720,GOP/s
 dense_dot,gemv_f32,decode,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-solved-strided-row-cohort,M=1;N=14336;K=4096,full-dense-projection,10,1,64,full,no,,,0,0,790.707095,0.148526,GOP/s
 irregular_decode,get_rows_q4_k,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,embedding[vocab=128256;hidden=4096];tokens=128,full-embedding-row-decode,10,0,64,full,no,,,0,0,0.906954,,
 memory_permutation,transpose_f32,forward,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,rows=128;columns=4096,full-contiguous-transpose,10,0,64,full,no,,,0,,4.127589,1.016163,GB/s
@@ -308,9 +309,9 @@ source_vec_dot,q5_1_q8_1,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-pri
 source_vec_dot,q8_0_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,10,0,64,full_rows,no,,,0,0,66.178246,1.774609,GOP/s
 source_vec_dot,mxfp4_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,64.103831,1.832036,GOP/s
 source_vec_dot,nvfp4_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-primitive,M=1;N=14336;K=4096,full-direct-generated-row-dot,3,0,64,full_rows,no,,,0,0,245.680274,0.478022,GOP/s
-source_quantization,quantize_q8_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,2.776641,660.873336,MElements/s
-source_quantization,quantize_q8_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,4.980090,368.468880,MElements/s
-source_quantization,quantize_q8_K,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.247671,349.680458,MElements/s
+source_quantization,quantize_q8_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-forward-physicalized,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,4.965072,369.583324,MElements/s
+source_quantization,quantize_q8_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-forward-physicalized,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.385064,340.758810,MElements/s
+source_quantization,quantize_q8_K,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-forward-co-reduction,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.614015,326.861970,MElements/s
 source_quantization,quantize_q8_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.878013,312.181685,MElements/s
 source_quantization,quantize_q8_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,6.922016,265.097317,MElements/s
 source_quantization,quantize_q8_K,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,6.596924,278.161155,MElements/s

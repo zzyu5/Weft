@@ -73,6 +73,27 @@ def _type_array(values: Sequence[ValueType]) -> str:
     return "[" + ", ".join(emit_type(value) for value in values) + "]"
 
 
+def _layout_array(fields: Sequence[_FieldInfo]) -> str:
+    rendered: list[str] = []
+    for field in fields:
+        atoms: list[str] = []
+        for layout in field.layouts:
+            values = [f"kind = {_string(layout.kind)}"]
+            if layout.size:
+                values.append(f"size = {layout.size} : i64")
+            if layout.order:
+                values.append(f"order = {_string(layout.order)}")
+            if layout.fields:
+                values.append(f"fields = {layout.fields} : i64")
+            if layout.low_bits:
+                values.append(f"low_bits = {layout.low_bits} : i64")
+            if layout.role >= 0:
+                values.append(f"role = {layout.role} : i64")
+            atoms.append("{" + ", ".join(values) + "}")
+        rendered.append("[" + ", ".join(atoms) + "]")
+    return "[" + ", ".join(rendered) + "]"
+
+
 class _AssignedNames(ast.NodeVisitor):
     def __init__(self) -> None:
         self.names: set[str] = set()
@@ -162,11 +183,21 @@ def _names_needed_before_definition(statements: Sequence[ast.stmt]) -> set[str]:
 
 
 @dataclass(frozen=True, slots=True)
+class _LayoutInfo:
+    kind: str
+    size: int = 0
+    order: str = ""
+    fields: int = 0
+    low_bits: int = 0
+    role: int = -1
+
+
+@dataclass(frozen=True, slots=True)
 class _FieldInfo:
     name: str
     dtype: DType
     shape: tuple[int, ...]
-    packing: str
+    layouts: tuple[_LayoutInfo, ...]
     bit_offset: int
     storage_bits: int
 
@@ -516,10 +547,10 @@ class FrontendCompiler:
                     raise FrontendError("padding requires positive bytes and one-byte fill")
                 layout_items.append(("padding", (byte_count, fill)))
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                dtype, shape, packing = self._parse_encoding_field(
+                dtype, shape, layouts = self._parse_encoding_field(
                     statement.annotation, module_bindings, definition
                 )
-                layout_items.append(("field", (statement.target.id, dtype, shape, packing)))
+                layout_items.append(("field", (statement.target.id, dtype, shape, layouts)))
         if not bit_order or not byte_order:
             raise FrontendError(
                 "encoding layout must declare bit order and byte order",
@@ -528,7 +559,9 @@ class FrontendCompiler:
         offset = 0
         fields: list[_FieldInfo] = []
         paddings: list[_PaddingInfo] = []
-        for kind, item in layout_items:
+        item_index = 0
+        while item_index < len(layout_items):
+            kind, item = layout_items[item_index]
             if kind == "padding":
                 byte_count, fill = item
                 if offset % 8:
@@ -536,37 +569,57 @@ class FrontendCompiler:
                 storage_bits = int(byte_count) * 8
                 paddings.append(_PaddingInfo(offset, storage_bits, int(fill)))
                 offset += storage_bits
+                item_index += 1
                 continue
-            name, dtype, shape, packing = item
+            name, dtype, shape, layouts = item
             count = math.prod(shape) if shape else 1
             if dtype.bits is None:
                 raise FrontendError("encoding fields require fixed-width dtypes")
-            storage_bits = dtype.bits * count
-            if packing.startswith("nibble:") and dtype.bits != 4:
-                raise FrontendError("nibble packing requires a 4-bit field")
-            if packing.startswith("packed:"):
-                container_bits = int(packing.split(":", 1)[1]) * 8
-                if storage_bits > container_bits:
-                    raise FrontendError("packed field exceeds its declared byte container")
-            fields.append(_FieldInfo(name, dtype, shape, packing, offset, storage_bits))
-            offset += storage_bits
-        field_index = 0
-        while field_index < len(fields):
-            packing = fields[field_index].packing
-            if not packing.startswith("packed:"):
-                field_index += 1
+            self._verify_field_layout(dtype, shape, layouts, definition)
+            if layouts[0].kind == "joined":
+                joined = layouts[0]
+                members: list[tuple[str, DType, tuple[int, ...], tuple[_LayoutInfo, ...]]] = []
+                for member_index in range(joined.fields):
+                    cursor = item_index + member_index
+                    if cursor >= len(layout_items) or layout_items[cursor][0] != "field":
+                        raise FrontendError("joined layout requires consecutive logical fields")
+                    member = layout_items[cursor][1]
+                    member_name, member_dtype, member_shape, member_layouts = member
+                    if (
+                        member_dtype != dtype
+                        or member_shape != shape
+                        or len(member_layouts) != 1
+                        or member_layouts[0] != joined
+                    ):
+                        raise FrontendError("joined fields must have one identical layout declaration")
+                    members.append(member)
+                storage_bits = joined.size * (joined.fields + 1) * 8
+                for role, (member_name, member_dtype, member_shape, _) in enumerate(members):
+                    concrete = _LayoutInfo(
+                        joined.kind,
+                        joined.size,
+                        joined.order,
+                        joined.fields,
+                        joined.low_bits,
+                        role,
+                    )
+                    fields.append(
+                        _FieldInfo(
+                            member_name,
+                            member_dtype,
+                            member_shape,
+                            (concrete,),
+                            offset,
+                            storage_bits,
+                        )
+                    )
+                offset += storage_bits
+                item_index += joined.fields
                 continue
-            end = field_index
-            packed_bits = 0
-            while end < len(fields) and fields[end].packing == packing:
-                packed_bits += fields[end].storage_bits
-                end += 1
-            container_bits = int(packing.split(":", 1)[1]) * 8
-            if packed_bits != container_bits:
-                raise FrontendError(
-                    "consecutive fields sharing packed(n) must exactly fill n bytes"
-                )
-            field_index = end
+            storage_bits = dtype.bits * count
+            fields.append(_FieldInfo(name, dtype, shape, layouts, offset, storage_bits))
+            offset += storage_bits
+            item_index += 1
         encoding_type = EncodingType(definition.__name__, "base", definition.__name__)
         logical_extent = max(
             (field.shape[-1] for field in fields if field.shape), default=None
@@ -601,7 +654,7 @@ class FrontendCompiler:
                     "field_shapes": "["
                     + ", ".join(_i64_array(field.shape) for field in fields)
                     + "]",
-                    "field_packing": _strings([field.packing for field in fields]),
+                    "field_layouts": _layout_array(fields),
                     "field_bit_offsets": _i64_array([field.bit_offset for field in fields]),
                     "field_storage_bits": _i64_array([field.storage_bits for field in fields]),
                     "padding": _i64_array(
@@ -625,22 +678,40 @@ class FrontendCompiler:
         annotation: ast.expr,
         bindings: dict[str, object],
         definition: EncodingDefinition,
-    ) -> tuple[DType, tuple[int, ...], str]:
-        packing = "natural"
+    ) -> tuple[DType, tuple[int, ...], tuple[_LayoutInfo, ...]]:
+        layouts: list[_LayoutInfo] = []
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
             annotation = ast.parse(annotation.value, mode="eval").body
-        if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.MatMult):
-            packing_node = annotation.right
+        while isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.MatMult):
+            layout_node = annotation.right
             annotation = annotation.left
-            if not isinstance(packing_node, ast.Call) or not isinstance(packing_node.func, ast.Name):
-                raise FrontendError("encoding packing must be an explicit layout constructor")
+            if not isinstance(layout_node, ast.Call) or not isinstance(layout_node.func, ast.Name):
+                raise FrontendError("encoding field layout must use an explicit constructor")
             values = [
                 bindings.get(argument.id)
                 if isinstance(argument, ast.Name) and argument.id in bindings
                 else ast.literal_eval(argument)
-                for argument in packing_node.args
+                for argument in layout_node.args
             ]
-            packing = packing_node.func.id + ":" + ":".join(str(value) for value in values)
+            if layout_node.keywords:
+                raise FrontendError("encoding field layout constructors use positional arguments")
+            if layout_node.func.id == "grouped" and len(values) == 1:
+                layout = _LayoutInfo("grouped", int(values[0]))
+            elif layout_node.func.id == "layered" and len(values) == 2:
+                layout = _LayoutInfo("layered", int(values[0]), str(values[1]))
+            elif layout_node.func.id == "joined" and len(values) == 4:
+                layout = _LayoutInfo(
+                    "joined",
+                    int(values[0]),
+                    str(values[3]),
+                    int(values[1]),
+                    int(values[2]),
+                )
+            else:
+                raise FrontendError(
+                    "encoding field layout must be grouped, layered, or joined"
+                )
+            layouts.insert(0, layout)
         shape: tuple[int, ...] = ()
         if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
             dtype = bindings.get(annotation.value.id)
@@ -657,7 +728,52 @@ class FrontendCompiler:
             raise FrontendError(
                 f"encoding {definition.__name__} fields require fixed Weft dtypes"
             )
-        return dtype, shape, packing
+        if not layouts:
+            layouts.append(_LayoutInfo("natural"))
+        return dtype, shape, tuple(layouts)
+
+    def _verify_field_layout(
+        self,
+        dtype: DType,
+        shape: tuple[int, ...],
+        layouts: tuple[_LayoutInfo, ...],
+        definition: EncodingDefinition,
+    ) -> None:
+        if layouts == (_LayoutInfo("natural"),):
+            return
+        if len(layouts) == 1 and layouts[0].kind == "joined":
+            joined = layouts[0]
+            if (
+                len(shape) != 1
+                or joined.size <= 0
+                or joined.fields < 2
+                or shape[0] != 2 * joined.size
+                or joined.low_bits <= 0
+                or dtype.bits is None
+                or joined.low_bits >= dtype.bits
+                or joined.low_bits * joined.fields != 8
+                or dtype.bits + (dtype.bits - joined.low_bits) != 8
+                or dtype.bits * shape[0] * joined.fields
+                != joined.size * (joined.fields + 1) * 8
+                or joined.order not in {"lo_first", "hi_first"}
+            ):
+                raise FrontendError("joined layout parameters do not form one dense byte container")
+            return
+        if len(shape) != 1:
+            raise FrontendError(
+                f"encoding {definition.__name__} grouped/layered fields must be rank one"
+            )
+        if len(layouts) != 2 or layouts[0].kind != "grouped" or layouts[1].kind != "layered":
+            raise FrontendError("encoding field layout requires grouped(n) followed by layered(n, order)")
+        group, layer = layouts
+        if group.size <= 0 or shape[0] % group.size:
+            raise FrontendError("grouped extent must divide the logical field extent")
+        if layer.size <= 0 or group.size % layer.size:
+            raise FrontendError("layered extent must divide its enclosing group")
+        if layer.order not in {"lo_first", "hi_first"}:
+            raise FrontendError("layered order must be lo_first or hi_first")
+        if dtype.bits is None or dtype.bits * (group.size // layer.size) != 8:
+            raise FrontendError("current layered layout requires one byte per layer position")
 
     def _declare_derived(self, definition: DerivedEncodingDefinition) -> None:
         name = definition.__name__
@@ -725,8 +841,8 @@ class FrontendCompiler:
                             field.name,
                             field.dtype,
                             field.shape,
-                            "derived",
-                            -1,
+                            field.layouts,
+                            field.bit_offset,
                             field.storage_bits,
                         )
                         for field in source_info.fields

@@ -17,10 +17,11 @@ mlir::LogicalResult runPlanning(mlir::ModuleOp module,
   mlir::PassManager manager(module.getContext());
   manager.enableVerifier(true);
   manager.addPass(weft::createConstructRISCVProblemsPass(std::move(options)));
-  manager.addPass(weft::createConstrainRISCVRepresentationsPass());
-  manager.addPass(weft::createConstrainRISCVInstructionsPass());
-  manager.addPass(weft::createConstrainRISCVResourcesPass());
-  manager.addPass(weft::createSolveRISCVProblemsPass());
+  manager.addPass(weft::createAssignRISCVRepresentationsPass());
+  manager.addPass(weft::createSelectRISCVLocalOperationsPass());
+  manager.addPass(weft::createScheduleRISCVLevelsPass());
+  manager.addPass(weft::createCheckRISCVResourcesPass());
+  manager.addPass(weft::createSelectRISCVWinnerPass());
   return manager.run(module);
 }
 
@@ -41,10 +42,6 @@ void printAssignment(llvm::raw_ostream &output,
   printDictionary(output, assignment.getTarget(), "  ");
   output << "\ncandidate\n";
   printDictionary(output, assignment.getCandidate(), "  ");
-  output << "\nC: vector representation decisions\n";
-  printDictionary(output, assignment.getCDecisions(), "  ");
-  output << "\nD: instruction and memory decisions\n";
-  printDictionary(output, assignment.getDDecisions(), "  ");
   output << "\nresources\n";
   printDictionary(output, assignment.getResources(), "  ");
   output << "\nvalues\n";
@@ -52,12 +49,14 @@ void printAssignment(llvm::raw_ostream &output,
     auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
     output << "  " << mlir::cast<mlir::StringAttr>(value.get("id")).getValue()
            << "  "
-           << mlir::cast<mlir::StringAttr>(value.get("logical_type")).getValue()
+           << mlir::cast<mlir::StringAttr>(value.get("type_spelling")).getValue()
            << '\n';
     for (llvm::StringRef key :
          {"physical_kind", "physical_encoding_kind", "physical_sew",
-          "lane_axis", "lmul", "vl", "register_groups", "storage",
-          "encoding_family", "layout_identity"})
+          "lane_axis", "physical_lanes", "stream_parts", "lmul", "vl",
+          "register_groups", "storage", "materialization",
+          "encoding_family", "base_encoding_family", "layout_identity",
+          "interleave_rows"})
       if (mlir::Attribute field = value.get(key)) {
         output << "    " << key << " = ";
         field.print(output);
@@ -74,7 +73,8 @@ void printAssignment(llvm::raw_ostream &output,
            << " -> "
            << mlir::cast<mlir::StringAttr>(operation.get("realization")).getValue()
            << '\n';
-    for (llvm::StringRef key : {"validity", "level_mapping"})
+    for (llvm::StringRef key : {"validity", "memory_edge", "local_operation",
+                                "co_reduce_partner", "level_mapping", "schedule"})
       if (mlir::Attribute field = operation.get(key)) {
         output << "    " << key << " = ";
         field.print(output);

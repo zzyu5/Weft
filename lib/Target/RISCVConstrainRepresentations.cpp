@@ -7,44 +7,113 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <algorithm>
+#include <optional>
 #include <string>
 
 using namespace weft;
 
 namespace {
 
-std::optional<int64_t> fixedPartition(kernel::DomainType domain) {
-  int64_t value = 0;
-  if (!domain.getPartition().getAsInteger(10, value) && value > 0)
-    return value;
+std::optional<int64_t> resolvePartition(llvm::StringRef partition,
+                                        mlir::DictionaryAttr candidate) {
+  int64_t fixed = 0;
+  if (!partition.getAsInteger(10, fixed) && fixed > 0)
+    return fixed;
+  if (!partition.consume_front("auto:"))
+    return std::nullopt;
+  auto bindings = candidate.getAs<mlir::DictionaryAttr>("auto_bindings");
+  if (!bindings)
+    return std::nullopt;
+  auto value = bindings.getAs<mlir::IntegerAttr>(partition);
+  return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+}
+
+bool containsAxis(mlir::DictionaryAttr value, int64_t axis) {
+  auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+  return axes && llvm::is_contained(axes.asArrayRef(), axis);
+}
+
+int64_t laneExtent(mlir::DictionaryAttr value, int64_t axis) {
+  auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+  auto shape = value.getAs<mlir::DenseI64ArrayAttr>("shape");
+  if (!axes || !shape)
+    return 1;
+  for (auto [valueAxis, extent] : llvm::zip(axes.asArrayRef(), shape.asArrayRef()))
+    if (valueAxis == axis)
+      return std::max<int64_t>(1, extent);
+  return 1;
+}
+
+std::string lmulSpelling(int64_t eighths) {
+  return eighths < 8 ? "mf" + std::to_string(8 / eighths)
+                     : "m" + std::to_string(eighths / 8);
+}
+
+std::optional<int64_t> chooseLMUL(int64_t lanes, int64_t sew,
+                                  int64_t vlenBits,
+                                  mlir::DenseI64ArrayAttr legal) {
+  if (lanes <= 0 || sew <= 0 || vlenBits <= 0 || !legal)
+    return std::nullopt;
+  int64_t required = (lanes * sew * 8 + vlenBits - 1) / vlenBits;
+  for (int64_t candidate : legal.asArrayRef())
+    if (candidate >= required)
+      return candidate;
   return std::nullopt;
 }
 
-class ConstrainRISCVRepresentationsPass final
-    : public mlir::PassWrapper<ConstrainRISCVRepresentationsPass,
+std::string physicalKind(mlir::DictionaryAttr value, int64_t laneAxis,
+                         int64_t physicalLanes) {
+  llvm::StringRef kind = *riscv_internal::string(value, "kind");
+  if (kind == "view" || kind == "slice")
+    return "memory";
+  if (kind == "encoded_value")
+    return "encoded-record";
+  if (kind == "control")
+    return "control";
+  if (kind == "scalar")
+    return "scalar";
+  if (riscv_internal::integer(value, "logical_sew").value_or(0) == 0)
+    return "encoded-record";
+  if (!containsAxis(value, laneAxis))
+    return "sequential";
+  auto shape = value.getAs<mlir::DenseI64ArrayAttr>("shape");
+  return (shape && shape.size() > 1) || laneExtent(value, laneAxis) > physicalLanes
+             ? "rvv-stream"
+             : "rvv-lane";
+}
+
+void invalidate(riscv::ProblemOp problem, mlir::Builder &builder,
+                llvm::StringRef reason) {
+  problem.setResourcesAttr(riscv_internal::dictionary(
+      builder, {{"invalid_reason", builder.getStringAttr(reason)}}));
+  problem.setStageAttr(builder.getStringAttr("invalid"));
+}
+
+class AssignRISCVRepresentationsPass final
+    : public mlir::PassWrapper<AssignRISCVRepresentationsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      ConstrainRISCVRepresentationsPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AssignRISCVRepresentationsPass)
 
   llvm::StringRef getArgument() const final {
-    return "weft-riscv-constrain-representations";
+    return "weft-riscv-assign-representations";
   }
   llvm::StringRef getDescription() const final {
-    return "propagate SEW, LMUL, lane and ordered-control domains along SSA chains";
+    return "assign entity-local SEW, LMUL, vl and materialization forward";
   }
 
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
     mlir::Builder builder(module.getContext());
-    for (riscv::ProblemOp problem :
-         llvm::make_early_inc_range(module.getOps<riscv::ProblemOp>())) {
+    for (riscv::ProblemOp problem : module.getOps<riscv::ProblemOp>()) {
+      if (problem.getStage() == "invalid")
+        continue;
       if (problem.getStage() != "facts") {
-        problem.emitError("representation constraints require a facts-stage problem");
+        problem.emitError("representation pass requires a facts-stage candidate");
         signalPassFailure();
         return;
       }
@@ -56,171 +125,177 @@ public:
         return;
       }
 
-      llvm::SmallSet<int64_t, 4> laneAxes;
-      llvm::SmallSet<int64_t, 8> cohorts;
-      llvm::DenseMap<int64_t, llvm::SmallVector<kernel::DomainType, 2>>
-          domainsByAxis;
       llvm::StringMap<mlir::DictionaryAttr> valuesById;
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
         valuesById[*riscv_internal::string(value, "id")] = value;
       }
-      auto addPartition = [&](kernel::DomainType domain) {
-        if (auto partition = fixedPartition(domain)) {
-          if (*partition > 1)
-            cohorts.insert(*partition);
-          return;
-        }
-        if (!domain.getPartition().starts_with("auto:"))
-          return;
-        llvm::StringRef name = domain.getPartition().drop_front(5);
-        for (mlir::Attribute candidateAttribute : problem.getCandidates()) {
-          auto candidate = mlir::cast<mlir::DictionaryAttr>(candidateAttribute);
-          auto bindings = candidate.getAs<mlir::DictionaryAttr>("auto_bindings");
-          if (bindings)
-            if (auto value = bindings.getAs<mlir::IntegerAttr>(name);
-                value && value.getInt() > 1)
-              cohorts.insert(value.getInt());
-        }
-      };
-      kernel.walk([&](kernel::DomainOp domainOperation) {
-        kernel::DomainType domain = domainOperation.getResult().getType();
-        domainsByAxis[domain.getAxisId()].push_back(domain);
-        if (domain.getRelation() != "rows" && domain.getRelation() != "cols")
-          return;
-        auto partition = fixedPartition(domain);
-        if ((partition && *partition > 1) ||
-            domain.getPartition().starts_with("auto:")) {
-          laneAxes.insert(domain.getAxisId());
-          addPartition(domain);
-        }
-      });
+      llvm::SmallSet<int64_t, 8> wideAxes;
+      llvm::StringMap<int64_t> useCounts;
+      llvm::StringMap<std::string> producers;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef name = *riscv_internal::string(operation, "name");
+        if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+          for (mlir::Attribute operand : operands)
+            ++useCounts[mlir::cast<mlir::StringAttr>(operand).getValue()];
+        if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+          for (mlir::Attribute result : results)
+            producers[mlir::cast<mlir::StringAttr>(result).getValue()] = name.str();
         if (riscv_internal::string(operation, "engine").value_or("") != "wide")
           continue;
-        for (llvm::StringRef key : {"operands", "results"}) {
-          auto ids = operation.getAs<mlir::ArrayAttr>(key);
-          if (!ids)
-            continue;
-          for (mlir::Attribute idAttribute : ids) {
-            auto found = valuesById.find(
-                mlir::cast<mlir::StringAttr>(idAttribute).getValue());
-            if (found == valuesById.end())
-              continue;
-            auto axes = found->second.getAs<mlir::DenseI64ArrayAttr>("axes");
-            if (!axes)
-              continue;
-            for (int64_t axis : axes.asArrayRef()) {
-              auto domains = domainsByAxis.find(axis);
-              if (domains == domainsByAxis.end())
+        for (llvm::StringRef key : {"operands", "results"})
+          if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+            for (mlir::Attribute id : ids) {
+              auto found = valuesById.find(
+                  mlir::cast<mlir::StringAttr>(id).getValue());
+              if (found == valuesById.end())
                 continue;
-              for (kernel::DomainType domain : domains->second) {
-                auto partition = fixedPartition(domain);
-                if (partition && *partition <= 1)
-                  continue;
-                laneAxes.insert(axis);
-                addPartition(domain);
-              }
+              if (auto axes = found->second.getAs<mlir::DenseI64ArrayAttr>("axes"))
+                for (int64_t axis : axes.asArrayRef())
+                  wideAxes.insert(axis);
             }
-          }
-        }
-      }
-      if (laneAxes.empty()) {
-        laneAxes.insert(-1);
-        cohorts.insert(1);
       }
 
-      auto targetLMUL = problem.getTarget().getAs<mlir::DenseI64ArrayAttr>(
+      struct AxisChoice {
+        int priority = 2;
+        int64_t axis = -1;
+        int64_t cohort = 1;
+      } selected;
+      kernel.walk([&](kernel::DomainOp domainOp) {
+        kernel::DomainType domain = domainOp.getResult().getType();
+        if (!wideAxes.contains(domain.getAxisId()))
+          return;
+        auto partition = resolvePartition(domain.getPartition(), problem.getCandidate());
+        if (!partition || *partition <= 1)
+          return;
+        int priority =
+            (domain.getRelation() == "rows" || domain.getRelation() == "cols") ? 0 : 1;
+        if (selected.axis < 0 || priority < selected.priority) {
+          selected = {priority, domain.getAxisId(), *partition};
+        } else if (domain.getAxisId() == selected.axis) {
+          selected.cohort = std::max(selected.cohort, *partition);
+        }
+      });
+
+      int64_t physicalLanes = 1;
+      int64_t vlenBits =
+          *riscv_internal::integer(problem.getTarget(), "vlen_bits");
+      auto legalLMUL = problem.getTarget().getAs<mlir::DenseI64ArrayAttr>(
           "legal_lmul_eighths");
-      llvm::SmallVector<mlir::Attribute> plannedValues;
+      if (selected.axis >= 0) {
+        int64_t maximumSEW = 0;
+        for (mlir::Attribute attribute : problem.getValues()) {
+          auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+          if (containsAxis(value, selected.axis))
+            maximumSEW = std::max<int64_t>(
+                maximumSEW,
+                std::max<int64_t>(8, riscv_internal::integer(value, "logical_sew")
+                                         .value_or(0)));
+        }
+        if (!maximumSEW || !legalLMUL || legalLMUL.empty()) {
+          invalidate(problem, builder, "lane axis has no legal target representation");
+          continue;
+        }
+        int64_t maximumLMUL = *llvm::max_element(legalLMUL.asArrayRef());
+        physicalLanes = std::min(
+            selected.cohort, vlenBits * maximumLMUL / (maximumSEW * 8));
+        if (physicalLanes <= 0) {
+          invalidate(problem, builder, "target has no lanes for selected value widths");
+          continue;
+        }
+      }
+
+      llvm::SmallVector<mlir::Attribute> assignedValues;
+      bool legal = true;
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-        auto type = mlir::cast<mlir::TypeAttr>(value.get("type")).getValue();
-        llvm::StringRef kind =
-            mlir::cast<mlir::StringAttr>(value.get("kind")).getValue();
-        llvm::SmallVector<std::string> representations;
-        llvm::SmallVector<int64_t> sew;
-        llvm::SmallVector<int64_t> lmul;
-        if (kind == "view" || kind == "slice" || kind == "encoded_value") {
-          representations.push_back("memory");
-        } else if (kind == "control") {
-          representations.push_back("control");
-        } else if (kind == "scalar") {
-          representations.push_back("scalar");
-          unsigned bits = riscv_internal::logicalBitWidth(type);
-          if (bits)
-            sew.push_back(bits);
-        } else if (kind == "local_value") {
-          bool hasLaneAxis = llvm::any_of(
-              riscv_internal::logicalAxes(type),
-              [&](int64_t axis) { return laneAxes.contains(axis); });
-          representations.push_back(hasLaneAxis ? "rvv-lane" : "sequential");
-          if (hasLaneAxis && riscv_internal::logicalShape(type).size() > 1)
-            representations.push_back("rvv-stream");
-          unsigned bits = riscv_internal::logicalBitWidth(type);
-          if (bits)
-            sew.push_back(std::max(8u, bits));
-          if (hasLaneAxis && targetLMUL)
-            lmul.append(targetLMUL.asArrayRef().begin(),
-                        targetLMUL.asArrayRef().end());
-        } else {
-          problem.emitError("unknown canonical value kind in representation pass");
-          signalPassFailure();
-          return;
+        std::string id = riscv_internal::string(value, "id")->str();
+        int64_t logicalSEW =
+            riscv_internal::integer(value, "logical_sew").value_or(0);
+        std::string kind = physicalKind(value, selected.axis, physicalLanes);
+        bool lane = selected.axis >= 0 && containsAxis(value, selected.axis) &&
+                    logicalSEW > 0;
+        int64_t valueLanes = lane ? std::min(laneExtent(value, selected.axis),
+                                             physicalLanes)
+                                  : 1;
+        int64_t physicalSEW = logicalSEW ? std::max<int64_t>(8, logicalSEW) : 0;
+        int64_t lmul = 0;
+        if (lane) {
+          auto selectedLMUL =
+              chooseLMUL(valueLanes, physicalSEW, vlenBits, legalLMUL);
+          if (!selectedLMUL) {
+            legal = false;
+            break;
+          }
+          lmul = *selectedLMUL;
         }
+        int64_t streamParts =
+            lane ? std::max<int64_t>(
+                       1, (laneExtent(value, selected.axis) + valueLanes - 1) /
+                              valueLanes)
+                 : 1;
+        int64_t registerGroups = lmul ? (lmul + 7) / 8 : 0;
+        bool shareAdmitted = producers.lookup(id) == "weft_kernel.admit" &&
+                             useCounts.lookup(id) > 1 &&
+                             registerGroups * streamParts <= 8;
+        value = riscv_internal::set(value, "physical_kind",
+                                    builder.getStringAttr(kind));
         value = riscv_internal::set(
-            value, "representation_domain",
-            riscv_internal::strings(builder, representations));
-        value = riscv_internal::set(value, "sew_domain",
-                                    riscv_internal::integers(builder, sew));
-        value = riscv_internal::set(value, "lmul_domain_eighths",
-                                    riscv_internal::integers(builder, lmul));
-        plannedValues.push_back(value);
+            value, "physical_encoding_kind",
+            builder.getStringAttr(
+                riscv_internal::string(value, "encoding_kind").value_or("") ==
+                        "derived_family"
+                    ? "derived_instance"
+                    : riscv_internal::string(value, "encoding_kind")
+                          .value_or("not-applicable")));
+        value = riscv_internal::set(
+            value, "physical_sew", builder.getI64IntegerAttr(physicalSEW));
+        value = riscv_internal::set(
+            value, "lane_axis",
+            builder.getI64IntegerAttr(lane ? selected.axis : 0));
+        value = riscv_internal::set(
+            value, "physical_lanes", builder.getI64IntegerAttr(valueLanes));
+        value = riscv_internal::set(
+            value, "stream_parts", builder.getI64IntegerAttr(streamParts));
+        value = riscv_internal::set(
+            value, "lmul_eighths", builder.getI64IntegerAttr(lmul));
+        value = riscv_internal::set(
+            value, "lmul",
+            builder.getStringAttr(lmul ? lmulSpelling(lmul) : "none"));
+        value = riscv_internal::set(
+            value, "vl",
+            builder.getStringAttr(lane ? "min(" + std::to_string(valueLanes) +
+                                             ",remaining-axis" +
+                                             std::to_string(selected.axis) + ")"
+                                       : "1"));
+        value = riscv_internal::set(
+            value, "register_groups",
+            builder.getI64IntegerAttr(registerGroups));
+        value = riscv_internal::set(
+            value, "storage",
+            builder.getStringAttr(
+                kind == "memory"          ? "pinned-memory"
+                : kind == "control"       ? "control"
+                : kind == "scalar"        ? "scalar-register"
+                : kind == "encoded-record" ? "local-record"
+                : kind == "sequential"    ? "scalar-or-rematerialized"
+                                           : "vector-register"));
+        value = riscv_internal::set(
+            value, "materialization",
+            builder.getStringAttr(producers.lookup(id) == "weft_kernel.admit"
+                                      ? (shareAdmitted ? "shared-register"
+                                                       : "reload-per-use")
+                                      : "not-applicable"));
+        value = riscv_internal::set(
+            value, "decision_owner", builder.getStringAttr("value"));
+        assignedValues.push_back(value);
       }
-
-      llvm::SmallVector<std::string> constraints;
-      for (mlir::Attribute attribute : problem.getConstraints())
-        constraints.push_back(
-            mlir::cast<mlir::StringAttr>(attribute).getValue().str());
-      for (mlir::Attribute attribute : problem.getOperations()) {
-        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef name =
-            mlir::cast<mlir::StringAttr>(operation.get("name")).getValue();
-        llvm::StringRef id =
-            mlir::cast<mlir::StringAttr>(operation.get("id")).getValue();
-        if (name == "weft_kernel.widen")
-          constraints.push_back(id.str() +
-                                ": preserve-lanes; result-sew widens; lmul propagates");
-        else if (name == "weft_kernel.binary" ||
-                 name == "weft_kernel.unary" ||
-                 name == "weft_kernel.cast")
-          constraints.push_back(id.str() +
-                                ": pointwise values share one lane mapping");
-        else if (name == "weft_kernel.reduce" ||
-                 name == "weft_kernel.fold2")
-          constraints.push_back(id.str() +
-                                ": closed reduction preserves remaining axes");
-        else if (name == "weft_kernel.for" || name == "weft_kernel.if" ||
-                 name == "weft_kernel.while")
-          constraints.push_back(id.str() +
-                                ": ordered-scalar; no automatic lane mapping");
+      if (!legal) {
+        invalidate(problem, builder, "one value has no legal SEW/LMUL representation");
+        continue;
       }
-
-      llvm::SmallVector<int64_t> laneAxisValues(laneAxes.begin(), laneAxes.end());
-      llvm::SmallVector<int64_t> cohortValues(cohorts.begin(), cohorts.end());
-      llvm::sort(laneAxisValues);
-      llvm::sort(cohortValues);
-      mlir::DictionaryAttr domains = problem.getDecisionDomains();
-      domains = riscv_internal::set(
-          domains, "lane_axis", riscv_internal::integers(builder, laneAxisValues));
-      domains = riscv_internal::set(
-          domains, "cohort", riscv_internal::integers(builder, cohortValues));
-      domains = riscv_internal::set(
-          domains, "lmul_multiplier", riscv_internal::integers(builder, {1, 2}));
-      problem.setValuesAttr(builder.getArrayAttr(plannedValues));
-      problem.setConstraintsAttr(riscv_internal::strings(builder, constraints));
-      problem.setDecisionDomainsAttr(domains);
+      problem.setValuesAttr(builder.getArrayAttr(assignedValues));
       problem.setStageAttr(builder.getStringAttr("representations"));
     }
   }
@@ -228,7 +303,6 @@ public:
 
 } // namespace
 
-std::unique_ptr<mlir::Pass>
-weft::createConstrainRISCVRepresentationsPass() {
-  return std::make_unique<ConstrainRISCVRepresentationsPass>();
+std::unique_ptr<mlir::Pass> weft::createAssignRISCVRepresentationsPass() {
+  return std::make_unique<AssignRISCVRepresentationsPass>();
 }

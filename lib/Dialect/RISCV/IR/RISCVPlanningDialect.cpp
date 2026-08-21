@@ -27,11 +27,16 @@ mlir::LogicalResult requireDictionaryKeys(mlir::Operation *operation,
 } // namespace
 
 mlir::LogicalResult ProblemOp::verify() {
-  if (getKernel().empty() || getCandidates().empty())
-    return emitOpError("planning problem requires a kernel and candidates");
+  if (getKernel().empty())
+    return emitOpError("physicalization candidate requires a kernel");
   if (getStage() != "facts" && getStage() != "representations" &&
-      getStage() != "instructions" && getStage() != "resources")
-    return emitOpError("unknown planning problem stage");
+      getStage() != "operations" && getStage() != "schedule" &&
+      getStage() != "resources" && getStage() != "invalid")
+    return emitOpError("unknown physicalization candidate stage");
+  if (failed(requireDictionaryKeys(
+          *this, getCandidate(), {"id", "specialization", "auto_bindings"},
+          "candidate")))
+    return mlir::failure();
   return requireDictionaryKeys(*this, getTarget(),
                                {"march", "abi", "vlen_bits",
                                 "vector_registers", "supported_sew",
@@ -51,23 +56,9 @@ mlir::LogicalResult AssignmentOp::verify() {
           *this, getCandidate(), {"id", "specialization", "auto_bindings"},
           "candidate")))
     return mlir::failure();
-  if (failed(requireDictionaryKeys(
-          *this, getCDecisions(),
-          {"sew", "lmul", "vl", "tail", "accumulator_grouping",
-           "register_budget", "partial_layout", "horizontal_reduce",
-           "vlen_specialization"},
-          "C decisions")))
-    return mlir::failure();
-  if (failed(requireDictionaryKeys(
-          *this, getDDecisions(),
-          {"nibble_unpack", "mac_instruction", "scale_broadcast",
-           "byte_interleave", "load_stride_alignment",
-           "prefetch_distance", "pipeline_unroll"},
-          "D decisions")))
-    return mlir::failure();
   return requireDictionaryKeys(*this, getResources(),
                                {"vector_register_budget", "peak_vector_groups",
-                                "spill", "stack_bytes"},
+                                "spill", "stack_bytes", "cost"},
                                "resources");
 }
 

@@ -7,11 +7,11 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringSet.h"
 
+#include <algorithm>
+#include <optional>
 #include <string>
 
 using namespace weft;
@@ -19,58 +19,76 @@ using namespace weft;
 namespace {
 
 bool targetFlag(mlir::DictionaryAttr target, llvm::StringRef name) {
-  if (auto value = target.getAs<mlir::BoolAttr>(name))
-    return value.getValue();
-  return false;
+  auto value = target.getAs<mlir::BoolAttr>(name);
+  return value && value.getValue();
 }
-
-struct EncodingFacts {
-  struct BaseLayout {
-    std::string bitOrder;
-    std::string byteOrder;
-    int64_t alignment = 0;
-    int64_t storageBits = 0;
-  };
-  llvm::StringMap<std::string> sourceByDerivedFamily;
-  llvm::StringMap<std::string> packingByField;
-  llvm::StringMap<BaseLayout> baseLayouts;
-};
 
 std::string fieldKey(llvm::StringRef family, llvm::StringRef field) {
   return (family + "::" + field).str();
 }
 
+struct EncodingFieldFacts {
+  mlir::TypeAttr type;
+  mlir::DenseI64ArrayAttr shape;
+  mlir::ArrayAttr layouts;
+  int64_t bitOffset = 0;
+  int64_t storageBits = 0;
+};
+
+struct EncodingFacts {
+  struct Base {
+    int64_t storageBits = 0;
+    int64_t alignment = 1;
+    std::string bitOrder;
+    std::string byteOrder;
+  };
+  llvm::StringMap<EncodingFieldFacts> fields;
+  llvm::StringMap<Base> bases;
+  llvm::StringMap<std::string> sourceByDerived;
+  llvm::StringMap<int64_t> rowsByDerived;
+};
+
 EncodingFacts collectEncodingFacts(mlir::ModuleOp module) {
-  EncodingFacts facts;
-  module.walk([&](kernel::DeriveOp derive) {
-    facts.sourceByDerivedFamily[derive.getResultFamily()] =
-        derive.getSourceFamily().str();
-  });
-  module.walk([&](kernel::EncodingDeclOp declaration) {
-    facts.baseLayouts[declaration.getSymName()] =
-        {declaration.getBitOrder().str(), declaration.getByteOrder().str(),
-         static_cast<int64_t>(declaration.getAlignment()),
-         static_cast<int64_t>(declaration.getStorageBits())};
-    for (auto [nameAttribute, packingAttribute] :
-         llvm::zip_equal(declaration.getFieldNames(),
-                         declaration.getFieldPacking())) {
+  EncodingFacts result;
+  for (kernel::EncodingDeclOp declaration :
+       module.getOps<kernel::EncodingDeclOp>()) {
+    result.bases[declaration.getSymName()] = {
+        static_cast<int64_t>(declaration.getStorageBits()),
+        static_cast<int64_t>(declaration.getAlignment()),
+        declaration.getBitOrder().str(), declaration.getByteOrder().str()};
+    for (size_t index = 0; index < declaration.getFieldNames().size(); ++index) {
       llvm::StringRef name =
-          mlir::cast<mlir::StringAttr>(nameAttribute).getValue();
-      llvm::StringRef packing =
-          mlir::cast<mlir::StringAttr>(packingAttribute).getValue();
-      facts.packingByField[fieldKey(declaration.getSymName(), name)] =
-          packing.str();
+          mlir::cast<mlir::StringAttr>(declaration.getFieldNames()[index])
+              .getValue();
+      result.fields[fieldKey(declaration.getSymName(), name)] = {
+          mlir::cast<mlir::TypeAttr>(declaration.getFieldTypes()[index]),
+          mlir::cast<mlir::DenseI64ArrayAttr>(declaration.getFieldShapes()[index]),
+          mlir::cast<mlir::ArrayAttr>(declaration.getFieldLayouts()[index]),
+          declaration.getFieldBitOffsets()[index],
+          declaration.getFieldStorageBits()[index]};
     }
-  });
-  return facts;
+  }
+  for (kernel::DeriveOp derive : module.getOps<kernel::DeriveOp>()) {
+    result.sourceByDerived[derive.getResultFamily()] =
+        derive.getSourceFamily().str();
+    int64_t rows = 0;
+    for (mlir::Attribute attribute : derive.getParameters()) {
+      llvm::StringRef spelling =
+          mlir::cast<mlir::StringAttr>(attribute).getValue();
+      if (spelling.consume_front("rows="))
+        spelling.getAsInteger(10, rows);
+    }
+    if (rows > 0)
+      result.rowsByDerived[derive.getResultFamily()] = rows;
+  }
+  return result;
 }
 
-llvm::StringRef resolveBaseFamily(const EncodingFacts &facts,
-                                  llvm::StringRef family) {
+llvm::StringRef baseFamily(const EncodingFacts &facts, llvm::StringRef family) {
   llvm::SmallSet<std::string, 4> visited;
   while (true) {
-    auto found = facts.sourceByDerivedFamily.find(family);
-    if (found == facts.sourceByDerivedFamily.end())
+    auto found = facts.sourceByDerived.find(family);
+    if (found == facts.sourceByDerived.end())
       break;
     if (!visited.insert(family.str()).second)
       break;
@@ -79,381 +97,519 @@ llvm::StringRef resolveBaseFamily(const EncodingFacts &facts,
   return family;
 }
 
-struct DerivedInterleave {
-  std::string family;
-  int64_t rows = 0;
-};
-
-llvm::SmallVector<DerivedInterleave>
-collectDerivedInterleaves(mlir::ModuleOp module) {
-  llvm::SmallVector<DerivedInterleave> result;
-  module.walk([&](kernel::DeriveOp derive) {
-    int64_t rows = 0;
-    for (mlir::Attribute attribute : derive.getParameters()) {
-      llvm::StringRef parameter =
-          mlir::cast<mlir::StringAttr>(attribute).getValue();
-      if (parameter.consume_front("rows="))
-        parameter.getAsInteger(10, rows);
-    }
-    if (rows > 0)
-      result.push_back({derive.getResultFamily().str(), rows});
-  });
-  return result;
+llvm::StringRef firstLayoutKind(mlir::ArrayAttr layouts) {
+  if (!layouts || layouts.empty())
+    return {};
+  auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(layouts[0]);
+  auto kind = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
+                         : mlir::StringAttr();
+  return kind ? kind.getValue() : llvm::StringRef();
 }
 
-llvm::SmallVector<std::string> matrixRealizations(
-    mlir::DictionaryAttr target, mlir::DictionaryAttr operation,
-    const llvm::StringMap<mlir::DictionaryAttr> &values) {
+const EncodingFieldFacts *fieldFactsFor(
+    mlir::DictionaryAttr fieldOperation,
+    const llvm::StringMap<mlir::DictionaryAttr> &values,
+    const EncodingFacts &encodings) {
+  if (riscv_internal::string(fieldOperation, "name").value_or("") !=
+      "weft_kernel.field")
+    return nullptr;
+  auto source =
+      fieldOperation.getAs<mlir::DictionaryAttr>("source_attributes");
+  auto fieldName = source ? source.getAs<mlir::StringAttr>("name")
+                          : mlir::StringAttr();
+  auto operands = fieldOperation.getAs<mlir::ArrayAttr>("operands");
+  if (!fieldName || !operands || operands.empty())
+    return nullptr;
+  auto owner = values.find(
+      mlir::cast<mlir::StringAttr>(operands[0]).getValue());
+  auto family = owner == values.end()
+                    ? mlir::StringAttr()
+                    : owner->second.getAs<mlir::StringAttr>("encoding_family");
+  if (!family)
+    return nullptr;
+  llvm::StringRef base = baseFamily(encodings, family.getValue());
+  auto field = encodings.fields.find(fieldKey(base, fieldName.getValue()));
+  return field == encodings.fields.end() ? nullptr : &field->second;
+}
+
+std::string validityFor(mlir::DictionaryAttr operation) {
+  auto path = operation.getAs<mlir::ArrayAttr>("level_path");
+  if (!path || path.empty())
+    return "always";
+  std::string result = "intersection(";
+  for (auto [index, level] : llvm::enumerate(path)) {
+    if (index)
+      result += ",";
+    result += mlir::cast<mlir::StringAttr>(level).getValue().str() + ".active";
+  }
+  return result + ")";
+}
+
+std::optional<mlir::DictionaryAttr>
+selectMatrix(mlir::DictionaryAttr target, mlir::DictionaryAttr operation,
+             const llvm::StringMap<mlir::DictionaryAttr> &values) {
   auto operands = operation.getAs<mlir::ArrayAttr>("operands");
   auto results = operation.getAs<mlir::ArrayAttr>("results");
   if (!operands || operands.size() < 2 || !results || results.empty())
-    return {};
-  auto lookupSEW = [&](mlir::Attribute id) -> std::optional<int64_t> {
+    return std::nullopt;
+  auto sew = [&](mlir::Attribute id) -> int64_t {
     auto found = values.find(mlir::cast<mlir::StringAttr>(id).getValue());
-    if (found == values.end())
-      return std::nullopt;
-    return riscv_internal::integer(found->second, "logical_sew");
+    return found == values.end()
+               ? 0
+               : riscv_internal::integer(found->second, "logical_sew").value_or(0);
   };
-  auto lhsSEW = lookupSEW(operands[0]);
-  auto rhsSEW = lookupSEW(operands[1]);
-  auto accumulatorSEW = lookupSEW(results[0]);
-  if (!lhsSEW || !rhsSEW || !accumulatorSEW)
-    return {};
-  llvm::SmallVector<std::string> realizations;
-  auto fragments = target.getAs<mlir::ArrayAttr>("matrix_fragments");
-  for (mlir::Attribute attribute : fragments) {
-    auto fragment = mlir::cast<mlir::DictionaryAttr>(attribute);
-    if (*riscv_internal::integer(fragment, "lhs_sew") != *lhsSEW ||
-        *riscv_internal::integer(fragment, "rhs_sew") != *rhsSEW ||
-        *riscv_internal::integer(fragment, "accumulator_sew") !=
-            *accumulatorSEW)
-      continue;
-    realizations.push_back(
-        "matrix." + riscv_internal::string(fragment, "identity")->str());
-  }
-  return realizations;
+  int64_t lhs = sew(operands[0]);
+  int64_t rhs = sew(operands[1]);
+  int64_t result = sew(results[0]);
+  if (auto fragments = target.getAs<mlir::ArrayAttr>("matrix_fragments"))
+    for (mlir::Attribute attribute : fragments) {
+      auto fragment = mlir::cast<mlir::DictionaryAttr>(attribute);
+      if (riscv_internal::integer(fragment, "lhs_sew").value_or(0) == lhs &&
+          riscv_internal::integer(fragment, "rhs_sew").value_or(0) == rhs &&
+          riscv_internal::integer(fragment, "accumulator_sew").value_or(0) ==
+              result)
+        return fragment;
+    }
+  return std::nullopt;
 }
 
-class ConstrainRISCVInstructionsPass final
-    : public mlir::PassWrapper<ConstrainRISCVInstructionsPass,
+void invalidate(riscv::ProblemOp problem, mlir::Builder &builder,
+                llvm::StringRef reason) {
+  problem.setResourcesAttr(riscv_internal::dictionary(
+      builder, {{"invalid_reason", builder.getStringAttr(reason)}}));
+  problem.setStageAttr(builder.getStringAttr("invalid"));
+}
+
+class SelectRISCVLocalOperationsPass final
+    : public mlir::PassWrapper<SelectRISCVLocalOperationsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConstrainRISCVInstructionsPass)
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SelectRISCVLocalOperationsPass)
 
   llvm::StringRef getArgument() const final {
-    return "weft-riscv-constrain-instructions";
+    return "weft-riscv-select-local-operations";
   }
   llvm::StringRef getDescription() const final {
-    return "couple decode, instruction, memory, broadcast and derived layout domains";
+    return "select operation and memory-edge realizations from typed facts";
   }
 
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
     mlir::Builder builder(module.getContext());
-    EncodingFacts encodingFacts = collectEncodingFacts(module);
-    llvm::SmallVector<DerivedInterleave> interleaves =
-        collectDerivedInterleaves(module);
+    EncodingFacts encodings = collectEncodingFacts(module);
     for (riscv::ProblemOp problem : module.getOps<riscv::ProblemOp>()) {
+      if (problem.getStage() == "invalid")
+        continue;
+
       if (problem.getStage() != "representations") {
-        problem.emitError(
-            "instruction constraints require a representations-stage problem");
+        problem.emitError("operation selection requires assigned representations");
         signalPassFailure();
         return;
       }
-      bool hasProduct = false;
-      bool hasNibbleField = false;
-      llvm::StringMap<unsigned> reductionKindsByInput;
-      llvm::SmallVector<
-          std::pair<std::string, llvm::SmallVector<std::string>>>
-          instructionDomains;
-      llvm::StringSet<> usedEncodingFamilies;
+
+      llvm::SmallVector<mlir::Attribute> updatedValues;
       llvm::StringMap<mlir::DictionaryAttr> values;
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+        auto family = value.getAs<mlir::StringAttr>("encoding_family");
+        if (family) {
+          auto source = encodings.sourceByDerived.find(family.getValue());
+          if (source != encodings.sourceByDerived.end()) {
+            auto base = encodings.bases.find(source->second);
+            auto rows = encodings.rowsByDerived.find(family.getValue());
+            if (base == encodings.bases.end() || rows == encodings.rowsByDerived.end()) {
+              invalidate(problem, builder,
+                         "derived encoding has no concrete builder layout facts");
+              break;
+            }
+            int64_t vlen =
+                *riscv_internal::integer(problem.getTarget(), "vlen_bits");
+            value = riscv_internal::set(
+                value, "base_encoding_family",
+                builder.getStringAttr(source->second));
+            value = riscv_internal::set(
+                value, "interleave_rows",
+                builder.getI64IntegerAttr(rows->second));
+            value = riscv_internal::set(
+                value, "base_record_storage_bits",
+                builder.getI64IntegerAttr(base->second.storageBits));
+            value = riscv_internal::set(
+                value, "layout_identity",
+                builder.getStringAttr(family.getValue().str() + ".rows" +
+                                      std::to_string(rows->second) +
+                                      ".byte-major.vlen" +
+                                      std::to_string(vlen)));
+          }
+        }
         values[*riscv_internal::string(value, "id")] = value;
-        if (auto family = value.getAs<mlir::StringAttr>("encoding_family"))
-          usedEncodingFamilies.insert(family.getValue());
+        updatedValues.push_back(value);
       }
-      llvm::SmallVector<mlir::Attribute> plannedOperations;
+      if (problem.getStage() == "invalid")
+        continue;
+
+      llvm::SmallSet<int64_t, 4> candidateLaneAxes;
+      for (const auto &entry : values) {
+        int64_t axis =
+            riscv_internal::integer(entry.getValue(), "lane_axis").value_or(0);
+        if (axis > 0)
+          candidateLaneAxes.insert(axis);
+      }
+
+      llvm::StringMap<mlir::DictionaryAttr> producers;
+      llvm::StringMap<int64_t> useCounts;
+      struct ReductionPair {
+        std::string maximum;
+        std::string minimum;
+      };
+      llvm::StringMap<ReductionPair> reductionsByInput;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef name =
-            mlir::cast<mlir::StringAttr>(operation.get("name")).getValue();
-        llvm::StringRef engine =
-            mlir::cast<mlir::StringAttr>(operation.get("engine")).getValue();
-        llvm::StringRef operationId =
-            mlir::cast<mlir::StringAttr>(operation.get("id")).getValue();
-        bool isProduct = false;
-        bool hasInstructionChoice = false;
-        llvm::SmallVector<std::string> realizations;
-        llvm::SmallVector<std::string> memoryForms;
-        if (name == "weft_kernel.mac_pairs" ||
-            name == "weft_kernel.mac_groups") {
-          isProduct = true;
-          hasInstructionChoice = true;
-          hasProduct = true;
-          if (engine == "wide" || engine.empty()) {
-            if (targetFlag(problem.getTarget(), "has_widening_integer"))
-              realizations.push_back("rvv.vwmaccsu");
+        if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+          for (mlir::Attribute result : results)
+            producers[mlir::cast<mlir::StringAttr>(result).getValue()] = operation;
+        if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+          for (mlir::Attribute operand : operands)
+            ++useCounts[mlir::cast<mlir::StringAttr>(operand).getValue()];
+        if (riscv_internal::string(operation, "name").value_or("") ==
+            "weft_kernel.reduce") {
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto source =
+              operation.getAs<mlir::DictionaryAttr>("source_attributes");
+          llvm::StringRef kind =
+              riscv_internal::string(source, "kind").value_or("");
+          if (operands && operands.size() == 1 &&
+              (kind == "max" || kind == "min")) {
+            llvm::StringRef input =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            std::string id = riscv_internal::string(operation, "id")->str();
+            if (kind == "max")
+              reductionsByInput[input].maximum = std::move(id);
+            else
+              reductionsByInput[input].minimum = std::move(id);
           }
-        } else if (name == "weft_kernel.dot" ||
-                   name == "weft_kernel.contract" ||
+        }
+      }
+
+      llvm::StringMap<std::string> coReducePartners;
+      llvm::StringMap<std::string> coReduceRoles;
+      for (const auto &entry : reductionsByInput) {
+        const ReductionPair &pair = entry.getValue();
+        if (pair.maximum.empty() || pair.minimum.empty())
+          continue;
+        coReducePartners[pair.maximum] = pair.minimum;
+        coReducePartners[pair.minimum] = pair.maximum;
+        coReduceRoles[pair.maximum] = "leader";
+        coReduceRoles[pair.minimum] = "follower";
+      }
+
+      llvm::SmallVector<mlir::Attribute> operations;
+      bool legal = true;
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef name = *riscv_internal::string(operation, "name");
+        llvm::StringRef engine =
+            riscv_internal::string(operation, "engine").value_or("");
+        std::string realization = "structural";
+        mlir::DictionaryAttr memoryEdge;
+        mlir::DictionaryAttr localOperation;
+
+        if (name == "weft_kernel.mac_pairs" || name == "weft_kernel.mac_groups") {
+          if ((engine.empty() || engine == "wide") &&
+              targetFlag(problem.getTarget(), "has_widening_integer")) {
+            realization = "rvv.vwmaccsu.typed";
+            auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+            auto results = operation.getAs<mlir::ArrayAttr>("results");
+            if (!operands || operands.size() < 2 || !results || results.empty()) {
+              legal = false;
+            } else {
+              auto lhs = values.find(
+                  mlir::cast<mlir::StringAttr>(operands[0]).getValue());
+              auto result = values.find(
+                  mlir::cast<mlir::StringAttr>(results[0]).getValue());
+              if (lhs == values.end() || result == values.end()) {
+                legal = false;
+              } else {
+                localOperation = riscv_internal::dictionary(
+                    builder,
+                    {{"instruction", builder.getStringAttr("rvv.vwmaccsu")},
+                     {"lhs_lmul_eighths",
+                      lhs->second.get("lmul_eighths")},
+                     {"partial_lmul_eighths",
+                      result->second.get("lmul_eighths")},
+                     {"partial_sew", builder.getI64IntegerAttr(16)},
+                     {"partial_layout",
+                      builder.getStringAttr("group-major")},
+                     {"decision_owner", builder.getStringAttr("operation")}});
+              }
+            }
+          } else
+            legal = false;
+        } else if (name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
                    name == "weft_kernel.outer_contract") {
-          isProduct = true;
-          hasInstructionChoice = true;
-          hasProduct = true;
-          if (engine == "wide" || engine.empty())
-            realizations.push_back("rvv.reduction-product");
-          if (engine == "matrix" || engine.empty()) {
-            llvm::SmallVector<std::string> matrix = matrixRealizations(
-                problem.getTarget(), operation, values);
-            realizations.append(matrix.begin(), matrix.end());
+          if (engine == "matrix") {
+            auto selected = selectMatrix(problem.getTarget(), operation, values);
+            if (selected) {
+              llvm::StringRef identity =
+                  riscv_internal::string(*selected, "identity").value_or("");
+              realization = "matrix." + identity.str();
+              auto results = operation.getAs<mlir::ArrayAttr>("results");
+              auto result =
+                  results && !results.empty()
+                      ? values.find(mlir::cast<mlir::StringAttr>(results[0])
+                                        .getValue())
+                      : values.end();
+              if (result == values.end()) {
+                legal = false;
+              } else {
+                localOperation = *selected;
+                localOperation = riscv_internal::set(
+                    localOperation, "result_vector_suffix",
+                    builder.getStringAttr(
+                        "i" +
+                        std::to_string(riscv_internal::integer(
+                                           result->second, "physical_sew")
+                                           .value_or(0)) +
+                        riscv_internal::string(result->second, "lmul")
+                            .value_or("")
+                            .str()));
+                localOperation = riscv_internal::set(
+                    localOperation, "interleave_rows",
+                    localOperation.get("n_factor"));
+                localOperation = riscv_internal::set(
+                    localOperation, "decision_owner",
+                    builder.getStringAttr("operation"));
+              }
+            } else
+              legal = false;
+          } else if (engine.empty() || engine == "wide") {
+            realization = "rvv.reduction-product";
+            if (name == "weft_kernel.dot") {
+              auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+              if (operands && operands.size() == 2) {
+                auto lhs = producers.find(
+                    mlir::cast<mlir::StringAttr>(operands[0]).getValue());
+                auto rhs = producers.find(
+                    mlir::cast<mlir::StringAttr>(operands[1]).getValue());
+                if (lhs != producers.end() && rhs != producers.end() &&
+                    riscv_internal::string(lhs->second, "name").value_or("") ==
+                        "weft_kernel.field" &&
+                    riscv_internal::string(rhs->second, "name").value_or("") ==
+                        "weft_kernel.fold2") {
+                  realization = "rvv.dot.encoded-field-folded-i16";
+                  const EncodingFieldFacts *lhsField =
+                      fieldFactsFor(lhs->second, values, encodings);
+                  auto results = operation.getAs<mlir::ArrayAttr>("results");
+                  auto result =
+                      results && !results.empty()
+                          ? values.find(mlir::cast<mlir::StringAttr>(
+                                            results[0])
+                                            .getValue())
+                          : values.end();
+                  if (!lhsField || !lhsField->shape ||
+                      lhsField->shape.empty() || result == values.end()) {
+                    legal = false;
+                  } else {
+                    localOperation = riscv_internal::dictionary(
+                        builder,
+                        {{"instruction", builder.getStringAttr("rvv.vmacc")},
+                         {"accumulator_sew",
+                          builder.getI64IntegerAttr(32)},
+                         {"accumulator_lmul_eighths",
+                          result->second.get("lmul_eighths")},
+                         {"group_count",
+                          builder.getI64IntegerAttr(
+                              lhsField->shape.asArrayRef().back())},
+                         {"rhs_pairs_per_group",
+                          builder.getI64IntegerAttr(2)},
+                         {"decision_owner",
+                          builder.getStringAttr("operation")}});
+                  }
+                }
+              }
+            }
+          } else {
+            legal = false;
           }
         } else if (name == "weft_kernel.lookup") {
-          hasInstructionChoice = true;
-          if (engine == "scalar" || engine.empty())
-            realizations.push_back("scalar.lookup");
-          if ((engine == "wide" || engine.empty()) &&
-              targetFlag(problem.getTarget(), "has_indexed_memory"))
-            realizations.push_back("rvv.indexed-lookup");
-        } else if (name == "weft_kernel.admit" ||
-                   name == "weft_kernel.commit") {
-          realizations.push_back("transfer.rvv");
-          memoryForms.push_back("unit-stride");
-          memoryForms.push_back("strided");
+          if (engine == "scalar")
+            realization = "scalar.lookup";
+          else if ((engine.empty() || engine == "wide") &&
+                   targetFlag(problem.getTarget(), "has_indexed_memory"))
+            realization = "rvv.indexed-lookup";
+          else
+            legal = false;
+        } else if (name == "weft_kernel.admit" || name == "weft_kernel.commit") {
+          realization = name == "weft_kernel.admit" ? "transfer.rvv.load"
+                                                     : "transfer.rvv.store";
+          memoryEdge = riscv_internal::dictionary(
+              builder,
+              {{"form", builder.getStringAttr("unit-stride")},
+               {"decision_owner", builder.getStringAttr("memory-edge")}});
         } else if (name == "weft_kernel.field") {
-          realizations.push_back("encoded-field-view");
-          auto sourceAttributes =
-              operation.getAs<mlir::DictionaryAttr>("source_attributes");
+          auto source = operation.getAs<mlir::DictionaryAttr>("source_attributes");
           auto operands = operation.getAs<mlir::ArrayAttr>("operands");
-          auto fieldName = sourceAttributes
-                               ? sourceAttributes.getAs<mlir::StringAttr>("name")
-                               : mlir::StringAttr();
-          auto ownerId = operands && !operands.empty()
-                             ? mlir::dyn_cast<mlir::StringAttr>(operands[0])
-                             : mlir::StringAttr();
-          auto owner = ownerId ? values.find(ownerId.getValue()) : values.end();
+          auto fieldName = source ? source.getAs<mlir::StringAttr>("name")
+                                  : mlir::StringAttr();
+          auto owner = operands && !operands.empty()
+                           ? values.find(mlir::cast<mlir::StringAttr>(operands[0])
+                                             .getValue())
+                           : values.end();
           auto family = owner != values.end()
                             ? owner->second.getAs<mlir::StringAttr>(
                                   "encoding_family")
                             : mlir::StringAttr();
           if (!fieldName || !family) {
-            problem.emitError(
-                "encoded field lacks an owner encoding family or field name");
-            signalPassFailure();
-            return;
-          }
-          llvm::StringRef baseFamily =
-              resolveBaseFamily(encodingFacts, family.getValue());
-          auto packing = encodingFacts.packingByField.find(
-              fieldKey(baseFamily, fieldName.getValue()));
-          if (packing == encodingFacts.packingByField.end()) {
-            problem.emitError()
-                << "field '" << fieldName.getValue()
-                << "' has no packing fact in encoding '" << baseFamily << "'";
-            signalPassFailure();
-            return;
-          }
-          operation = riscv_internal::set(
-              operation, "field_packing",
-              builder.getStringAttr(packing->second));
-          llvm::StringRef packingSpelling = packing->second;
-          if (packingSpelling.starts_with("nibble:"))
-            hasNibbleField = true;
-        } else if (name == "weft_kernel.widen") {
-          realizations.push_back("rvv.widen");
-        } else if (name == "weft_kernel.reduce") {
-          realizations.push_back("rvv.reduce");
-          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
-          auto sourceAttributes =
-              operation.getAs<mlir::DictionaryAttr>("source_attributes");
-          llvm::StringRef kind =
-              riscv_internal::string(sourceAttributes, "kind").value_or("");
-          if (operands && operands.size() == 1 &&
-              (kind == "max" || kind == "min")) {
-            llvm::StringRef input =
-                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
-            reductionKindsByInput[input] |= kind == "max" ? 1u : 2u;
-          }
-        } else if (name == "weft_kernel.fold2") {
-          realizations.push_back("ordered-pair-fold");
-        } else if (name == "weft_kernel.binary" ||
-                   name == "weft_kernel.unary" ||
-                   name == "weft_kernel.cast") {
-          realizations.push_back("mapped-pointwise");
-        } else if (name == "weft_kernel.for" || name == "weft_kernel.if" ||
-                   name == "weft_kernel.while") {
-          realizations.push_back("ordered-scalar-control");
-        } else if (name == "weft_kernel.level") {
-          realizations.push_back("logical-level");
-        } else {
-          realizations.push_back("structural");
-        }
-        if (hasInstructionChoice && realizations.empty()) {
-          problem.emitError()
-              << "operation " << operationId << " with engine role '" << engine
-              << "' has no legal target instruction";
-          signalPassFailure();
-          return;
-        }
-        if (hasInstructionChoice) {
-          bool requiresSubbyteUnpack = false;
-          if (isProduct && (name == "weft_kernel.mac_pairs" ||
-                            name == "weft_kernel.mac_groups")) {
-            auto operands = operation.getAs<mlir::ArrayAttr>("operands");
-            for (mlir::Attribute operandAttribute : operands) {
-              auto operandId = mlir::cast<mlir::StringAttr>(operandAttribute);
-              auto operand = values.find(operandId.getValue());
-              if (operand != values.end() &&
-                  riscv_internal::integer(operand->second, "logical_sew")
-                          .value_or(8) < 8)
-                requiresSubbyteUnpack = true;
+            legal = false;
+          } else {
+            llvm::StringRef base = baseFamily(encodings, family.getValue());
+            auto field = encodings.fields.find(fieldKey(base, fieldName.getValue()));
+            if (field == encodings.fields.end()) {
+              legal = false;
+            } else {
+              llvm::StringRef kind = firstLayoutKind(field->second.layouts);
+              if (kind == "natural")
+                realization = "encoded-field.natural";
+              else if (kind == "grouped")
+                realization = "encoded-field.layered.and-shift";
+              else if (kind == "joined")
+                realization = "encoded-field.joined.and-shift";
+              else
+                legal = false;
+              int64_t resultSEW = 0;
+              int64_t resultLMUL = 0;
+              if (auto results = operation.getAs<mlir::ArrayAttr>("results");
+                  results && results.size() == 1) {
+                auto result = values.find(
+                    mlir::cast<mlir::StringAttr>(results[0]).getValue());
+                if (result != values.end()) {
+                  resultSEW = riscv_internal::integer(
+                                  result->second, "physical_sew")
+                                  .value_or(0);
+                  resultLMUL = riscv_internal::integer(
+                                   result->second, "lmul_eighths")
+                                   .value_or(0);
+                }
+              }
+              int64_t rawLMUL =
+                  resultSEW > 0
+                      ? std::max<int64_t>(1, resultLMUL * 8 / resultSEW)
+                      : 0;
+              memoryEdge = riscv_internal::dictionary(
+                  builder,
+                  {{"base_family", builder.getStringAttr(base)},
+                   {"field", fieldName},
+                   {"field_type", field->second.type},
+                   {"field_shape", field->second.shape},
+                   {"layout", field->second.layouts},
+                   {"bit_offset",
+                    builder.getI64IntegerAttr(field->second.bitOffset)},
+                   {"storage_bits",
+                    builder.getI64IntegerAttr(field->second.storageBits)},
+                   {"unpack", builder.getStringAttr(
+                                  kind == "natural" ? "none" : "and-shift")},
+                   {"raw_sew", builder.getI64IntegerAttr(8)},
+                   {"raw_lmul_eighths",
+                    builder.getI64IntegerAttr(rawLMUL)},
+                   {"decision_owner", builder.getStringAttr("memory-edge")}});
             }
           }
-          std::string instructionKey =
-              (requiresSubbyteUnpack ? "instruction_subbyte."
-                                     : "instruction.") +
-              operationId.str();
-          operation = riscv_internal::set(
-              operation, "instruction_domain_key",
-              builder.getStringAttr(instructionKey));
-          instructionDomains.push_back({instructionKey, realizations});
+        } else if (name == "weft_kernel.widen") {
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          realization = results && results.size() == 1 &&
+                                useCounts.lookup(
+                                    mlir::cast<mlir::StringAttr>(results[0])
+                                        .getValue()) == 1
+                            ? "rvv.widen-preserve-or-defer"
+                            : "rvv.widen-preserve-lanes";
+        } else if (name == "weft_kernel.reduce") {
+          realization = "rvv.reduce.streamed";
+          llvm::StringRef id = *riscv_internal::string(operation, "id");
+          auto partner = coReducePartners.find(id);
+          if (partner != coReducePartners.end()) {
+            realization = "rvv.co-reduce.max-min." + coReduceRoles.lookup(id);
+            operation = riscv_internal::set(
+                operation, "co_reduce_partner",
+                builder.getStringAttr(partner->second));
+            localOperation = riscv_internal::dictionary(
+                builder,
+                {{"instructions",
+                  builder.getStringAttr("rvv.vfredmax+rvv.vfredmin")},
+                 {"input_materialization",
+                  builder.getStringAttr("shared-per-stream-part")},
+                 {"decision_owner", builder.getStringAttr("operation-cluster")}});
+          }
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          if (partner == coReducePartners.end() && operands &&
+              operands.size() == 1) {
+            auto producer = producers.find(
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue());
+            if (producer != producers.end() &&
+                riscv_internal::string(producer->second, "name").value_or("") ==
+                    "weft_kernel.widen") {
+              llvm::StringRef kind = riscv_internal::string(
+                                         operation.getAs<mlir::DictionaryAttr>(
+                                             "source_attributes"),
+                                         "kind")
+                                         .value_or("unknown");
+              realization = "rvv.widen-reduce." + kind.str();
+            }
+          }
+        } else if (name == "weft_kernel.fold2") {
+          realization = "ordered-pair-fold";
+        } else if (name == "weft_kernel.binary" || name == "weft_kernel.unary" ||
+                   name == "weft_kernel.cast" || name == "weft_kernel.compare") {
+          realization = "mapped-pointwise";
+        } else if (name == "weft_kernel.for" || name == "weft_kernel.if" ||
+                   name == "weft_kernel.while") {
+          realization = "ordered-scalar-control";
+        } else if (name == "weft_kernel.level") {
+          realization = "logical-level";
+        } else if (name == "weft_kernel.materialize") {
+          realization = "stage-once";
+          if (candidateLaneAxes.size() != 1) {
+            legal = false;
+          } else {
+            localOperation = riscv_internal::dictionary(
+                builder,
+                {{"lane_axis",
+                  builder.getI64IntegerAttr(*candidateLaneAxes.begin())},
+                 {"decision_owner", builder.getStringAttr("operation")}});
+          }
+        } else if (name == "weft_kernel.pack") {
+          realization = "primitive-local-pack";
         }
-        operation = riscv_internal::set(
-            operation, "realization_domain",
-            riscv_internal::strings(builder, realizations));
-        operation = riscv_internal::set(
-            operation, "memory_form_domain",
-            riscv_internal::strings(builder, memoryForms));
-        plannedOperations.push_back(operation);
-      }
-      mlir::DictionaryAttr domains = problem.getDecisionDomains();
-      auto laneAxes = domains.getAs<mlir::DenseI64ArrayAttr>("lane_axis");
-      bool hasVectorLane = laneAxes && llvm::any_of(
-                                            laneAxes.asArrayRef(),
-                                            [](int64_t axis) { return axis > 0; });
-      llvm::SmallVector<std::string> nibbleMethods{"none"};
-      if (hasNibbleField) {
-        nibbleMethods = {"and-shift"};
-        if (targetFlag(problem.getTarget(), "has_indexed_memory"))
-          nibbleMethods.push_back("indexed-gather");
-      }
-      llvm::SmallVector<std::string> interleaveOrders;
-      llvm::StringSet<> usedInterleaves;
-      for (const DerivedInterleave &interleave : interleaves) {
-        if (!usedEncodingFamilies.contains(interleave.family))
-          continue;
-        usedInterleaves.insert(interleave.family);
-        interleaveOrders.push_back(interleave.family + ".rows" +
-                                   std::to_string(interleave.rows) +
-                                   ".pair-major");
-        interleaveOrders.push_back(interleave.family + ".rows" +
-                                   std::to_string(interleave.rows) +
-                                   ".row-major");
-      }
-      if (usedInterleaves.size() > 1) {
-        problem.emitError(
-            "one physical assignment currently supports one derived interleave family; multiple families are explicitly unsupported");
-        signalPassFailure();
-        return;
-      }
-      if (interleaveOrders.empty())
-        interleaveOrders.push_back("not-applicable");
-      domains = riscv_internal::set(
-          domains, "nibble_unpack",
-          riscv_internal::strings(builder, nibbleMethods));
-      for (const auto &entry : instructionDomains)
-        domains = riscv_internal::set(
-            domains, entry.first,
-            riscv_internal::strings(builder, entry.second));
-      domains = riscv_internal::set(
-          domains, "scale_broadcast",
-          riscv_internal::strings(
-              builder, hasProduct && hasVectorLane
-                           ? llvm::SmallVector<std::string>{"lane-aligned",
-                                                            "scalar-splat"}
-                           : llvm::SmallVector<std::string>{"not-applicable"}));
-      domains = riscv_internal::set(
-          domains, "byte_interleave",
-          riscv_internal::strings(builder, interleaveOrders));
-      domains = riscv_internal::set(
-          domains, "load_stride_alignment",
-          riscv_internal::strings(builder,
-                                  {"unit-stride", "strided"}));
-      domains = riscv_internal::set(
-          domains, "partial_layout",
-          riscv_internal::strings(
-              builder, hasProduct && hasVectorLane
-                           ? llvm::SmallVector<std::string>{"group-major",
-                                                            "lane-major"}
-                           : llvm::SmallVector<std::string>{"not-applicable"}));
-      domains = riscv_internal::set(
-          domains, "horizontal_reduce",
-          riscv_internal::strings(
-              builder, hasProduct && hasVectorLane
-                           ? llvm::SmallVector<std::string>{"streamed",
-                                                            "end-of-sub"}
-                           : llvm::SmallVector<std::string>{"not-applicable"}));
-      const bool hasCoReduction = llvm::any_of(
-          reductionKindsByInput,
-          [](const auto &entry) { return entry.getValue() == 3u; });
-      domains = riscv_internal::set(
-          domains, "co_reduce_schedule",
-          riscv_internal::strings(
-              builder, hasCoReduction
-                           ? llvm::SmallVector<std::string>{"separate", "shared"}
-                           : llvm::SmallVector<std::string>{"separate"}));
 
-      llvm::SmallVector<std::string> constraints;
-      for (mlir::Attribute attribute : problem.getConstraints())
-        constraints.push_back(
-            mlir::cast<mlir::StringAttr>(attribute).getValue().str());
-      constraints.push_back(
-          "mac-instruction <-> nibble-unpack <-> derived-byte-interleave");
-      constraints.push_back(
-          "partial-layout <-> horizontal-reduce <-> value-lmul");
-      constraints.push_back(
-          "load-form is derived from selected layout and logical axis relation");
-      constraints.push_back(
-          "explicit engine role is a hard domain restriction, never a hint");
-      llvm::SmallVector<mlir::Attribute> layoutSources;
-      for (const DerivedInterleave &interleave : interleaves) {
-        if (!usedEncodingFamilies.contains(interleave.family))
-          continue;
-        llvm::StringRef baseFamily =
-            resolveBaseFamily(encodingFacts, interleave.family);
-        auto base = encodingFacts.baseLayouts.find(baseFamily);
-        if (base == encodingFacts.baseLayouts.end()) {
-          problem.emitError() << "derived encoding '" << interleave.family
-                              << "' has no base layout facts";
-          signalPassFailure();
-          return;
-        }
-        layoutSources.push_back(riscv_internal::dictionary(
-            builder,
-            {{"family", builder.getStringAttr(interleave.family)},
-             {"source_family", builder.getStringAttr(baseFamily)},
-             {"rows", builder.getI64IntegerAttr(interleave.rows)},
-             {"bit_order", builder.getStringAttr(base->second.bitOrder)},
-             {"byte_order", builder.getStringAttr(base->second.byteOrder)},
-             {"alignment", builder.getI64IntegerAttr(base->second.alignment)},
-             {"base_record_storage_bits",
-              builder.getI64IntegerAttr(base->second.storageBits)}}));
+        if (!legal)
+          break;
+        operation = riscv_internal::set(
+            operation, "source_op", operation.get("name"));
+        operation = riscv_internal::set(
+            operation, "realization", builder.getStringAttr(realization));
+        operation = riscv_internal::set(
+            operation, "validity", builder.getStringAttr(validityFor(operation)));
+        operation = riscv_internal::set(
+            operation, "decision_owner", builder.getStringAttr("operation"));
+        if (memoryEdge)
+          operation = riscv_internal::set(operation, "memory_edge", memoryEdge);
+        if (localOperation)
+          operation = riscv_internal::set(operation, "local_operation",
+                                          localOperation);
+        operations.push_back(operation);
       }
-      mlir::DictionaryAttr resourceModel = riscv_internal::set(
-          problem.getResourceModel(), "derived_layout_sources",
-          builder.getArrayAttr(layoutSources));
-      problem.setOperationsAttr(builder.getArrayAttr(plannedOperations));
-      problem.setDecisionDomainsAttr(domains);
-      problem.setConstraintsAttr(riscv_internal::strings(builder, constraints));
-      problem.setResourceModelAttr(resourceModel);
-      problem.setStageAttr(builder.getStringAttr("instructions"));
+      if (!legal) {
+        invalidate(problem, builder,
+                   "one operation has no legal target-local realization");
+        continue;
+      }
+      problem.setValuesAttr(builder.getArrayAttr(updatedValues));
+      problem.setOperationsAttr(builder.getArrayAttr(operations));
+      problem.setStageAttr(builder.getStringAttr("operations"));
     }
   }
 };
 
 } // namespace
 
-std::unique_ptr<mlir::Pass> weft::createConstrainRISCVInstructionsPass() {
-  return std::make_unique<ConstrainRISCVInstructionsPass>();
+std::unique_ptr<mlir::Pass> weft::createSelectRISCVLocalOperationsPass() {
+  return std::make_unique<SelectRISCVLocalOperationsPass>();
 }

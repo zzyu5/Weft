@@ -8,12 +8,13 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 def WEFT_RISCV_Dialect : Dialect {
   let name = "weft_riscv";
   let cppNamespace = "::weft::riscv";
-  let summary = "Transient RISC-V representation planning";
+  let summary = "Transient RISC-V forward physicalization";
   let description = [{
     This dialect exists only inside one target-lowering invocation. A problem
-    records finite physical domains and constraints derived from canonical Weft
-    IR; an assignment records one complete solution. Neither operation is an
-    accepted source program or a persistent algorithm authority.
+    records one concrete source/auto candidate while forward passes attach
+    entity-local value, operation, memory-edge, and Level decisions. An
+    assignment records the selected candidate. Neither operation is an accepted
+    source program or a persistent algorithm authority.
   }];
 }
 
@@ -26,12 +27,10 @@ def WeftRISCV_ProblemOp
     SymbolNameAttr:$sym_name,
     FlatSymbolRefAttr:$kernel,
     DictionaryAttr:$target,
-    ArrayAttr:$candidates,
+    DictionaryAttr:$candidate,
     ArrayAttr:$values,
     ArrayAttr:$operations,
-    ArrayAttr:$constraints,
-    DictionaryAttr:$decision_domains,
-    DictionaryAttr:$resource_model,
+    DictionaryAttr:$resources,
     StrAttr:$stage
   );
   let hasVerifier = 1;
@@ -46,8 +45,6 @@ def WeftRISCV_AssignmentOp
     DictionaryAttr:$candidate,
     ArrayAttr:$values,
     ArrayAttr:$operations,
-    DictionaryAttr:$c_decisions,
-    DictionaryAttr:$d_decisions,
     DictionaryAttr:$resources,
     StrAttr:$status
   );

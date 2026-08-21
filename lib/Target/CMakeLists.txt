@@ -4,6 +4,7 @@ add_library(WeftRISCVTarget STATIC
   RISCVConstructProblems.cpp
   RISCVConstrainRepresentations.cpp
   RISCVConstrainInstructions.cpp
+  RISCVScheduleLevels.cpp
   RISCVConstrainResources.cpp
   RISCVSolve.cpp
   RISCVIntrinsicC.cpp

@@ -105,7 +105,7 @@ def WeftKernel_EncodingDeclOp
     ArrayAttr:$field_names,
     ArrayAttr:$field_types,
     ArrayAttr:$field_shapes,
-    ArrayAttr:$field_packing,
+    ArrayAttr:$field_layouts,
     DenseI64ArrayAttr:$field_bit_offsets,
     DenseI64ArrayAttr:$field_storage_bits,
     DenseI64ArrayAttr:$padding

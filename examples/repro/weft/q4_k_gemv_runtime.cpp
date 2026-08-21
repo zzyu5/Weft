@@ -67,29 +67,40 @@ constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 
 volatile std::uint64_t flush_sink = 0;
 
-void put_bits(std::uint8_t *record, std::size_t bit_offset, unsigned width,
-              std::uint32_t value) {
-  for (unsigned bit = 0; bit < width; ++bit) {
-    const std::size_t position = bit_offset + bit;
-    const std::uint8_t mask = static_cast<std::uint8_t>(1U << (position & 7U));
-    if ((value >> bit) & 1U) {
-      record[position >> 3U] |= mask;
-    } else {
-      record[position >> 3U] &= static_cast<std::uint8_t>(~mask);
-    }
-  }
+std::uint32_t random_word(std::uint32_t &state) {
+  state ^= state << 13U;
+  state ^= state >> 17U;
+  state ^= state << 5U;
+  return state;
 }
 
-std::uint32_t get_bits(const std::uint8_t *record, std::size_t bit_offset,
-                       unsigned width) {
-  std::uint32_t value = 0;
-  for (unsigned bit = 0; bit < width; ++bit) {
-    const std::size_t position = bit_offset + bit;
-    value |= static_cast<std::uint32_t>(
-                 (record[position >> 3U] >> (position & 7U)) & 1U)
-             << bit;
-  }
-  return value;
+void random_bytes(std::uint8_t *target, std::size_t bytes,
+                  std::uint32_t &state) {
+  for (std::size_t index = 0; index < bytes; ++index)
+    target[index] = static_cast<std::uint8_t>(random_word(state));
+}
+
+std::uint8_t q4k_scale(const std::uint8_t *record, std::size_t group) {
+  const std::uint8_t *scales = record + 4;
+  if (group < 4)
+    return static_cast<std::uint8_t>(scales[group] & 0x3FU);
+  return static_cast<std::uint8_t>((scales[group + 4] & 0x0FU) |
+                                   ((scales[group - 4] >> 6U) << 4U));
+}
+
+std::uint8_t q4k_minimum(const std::uint8_t *record, std::size_t group) {
+  const std::uint8_t *scales = record + 4;
+  if (group < 4)
+    return static_cast<std::uint8_t>(scales[group + 4] & 0x3FU);
+  return static_cast<std::uint8_t>((scales[group + 4] >> 4U) |
+                                   ((scales[group] >> 6U) << 4U));
+}
+
+std::uint8_t q4k_value(const std::uint8_t *record, std::size_t element) {
+  const std::size_t group64 = element / 64;
+  const std::size_t within = element % 64;
+  const std::uint8_t packed = record[16 + group64 * 32 + within % 32];
+  return static_cast<std::uint8_t>((packed >> (4U * (within / 32))) & 0x0FU);
 }
 
 void store_f16(std::uint8_t *target, _Float16 value) {
@@ -124,43 +135,34 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
 
 void initialize_q4(std::vector<std::uint8_t> &weights) {
   const std::size_t blocks = kK / kBlock;
+  std::uint32_t random_state = 0x4b1d2a73U;
   for (std::size_t row = 0; row < kM; ++row) {
     for (std::size_t block = 0; block < blocks; ++block) {
       std::uint8_t *record =
           weights.data() + (row * blocks + block) * kQ4RecordBytes;
-      store_f16(record, static_cast<_Float16>(0.5F));
-      store_f16(record + 2, static_cast<_Float16>(0.25F));
-      for (std::size_t group = 0; group < 8; ++group) {
-        put_bits(record, 32 + group * 6, 6,
-                 static_cast<std::uint32_t>(1 + group % 4));
-        put_bits(record, 80 + group * 6, 6,
-                 static_cast<std::uint32_t>(1 + group % 3));
-      }
-      for (std::size_t element = 0; element < kBlock; ++element) {
-        put_bits(record, 128 + element * 4, 4,
-                 static_cast<std::uint32_t>((row + block + element) & 15U));
-      }
+      random_bytes(record, kQ4RecordBytes, random_state);
+      const float d = 0.125F +
+                      static_cast<float>(random_word(random_state) & 31U) /
+                          128.0F;
+      const float dmin = 0.0625F +
+                         static_cast<float>(random_word(random_state) & 15U) /
+                             256.0F;
+      store_f16(record, static_cast<_Float16>(d));
+      store_f16(record + 2, static_cast<_Float16>(dmin));
     }
   }
 }
 
 void initialize_q8(std::vector<std::uint8_t> &activation) {
   const std::size_t blocks = kK / kBlock;
+  std::uint32_t random_state = 0x8ac6f251U;
   for (std::size_t block = 0; block < blocks; ++block) {
     std::uint8_t *record = activation.data() + block * kQ8RecordBytes;
-    store_f32(record, 0.5F);
-    auto *values = reinterpret_cast<std::int8_t *>(record + 4);
-    for (std::size_t element = 0; element < kBlock; ++element) {
-      values[element] = static_cast<std::int8_t>(
-          static_cast<int>((block + element) % 15U) - 7);
-    }
-    for (std::size_t group = 0; group < 16; ++group) {
-      std::int16_t sum = 0;
-      for (std::size_t element = 0; element < 16; ++element) {
-        sum = static_cast<std::int16_t>(sum + values[group * 16 + element]);
-      }
-      std::memcpy(record + 260 + group * 2, &sum, sizeof(sum));
-    }
+    random_bytes(record, kQ8RecordBytes, random_state);
+    const float d = 0.125F +
+                    static_cast<float>(random_word(random_state) & 31U) /
+                        128.0F;
+    store_f32(record, d);
   }
 }
 
@@ -182,13 +184,12 @@ float reference_row(const std::uint8_t *weights, const std::uint8_t *activation,
     for (std::size_t group = 0; group < 8; ++group) {
       std::int32_t partial = 0;
       for (std::size_t element = 0; element < 32; ++element) {
-        const std::int32_t q = static_cast<std::int32_t>(
-            get_bits(w, 128 + (group * 32 + element) * 4, 4));
+        const std::int32_t q =
+            static_cast<std::int32_t>(q4k_value(w, group * 32 + element));
         const std::int32_t v = static_cast<std::int8_t>(x[4 + group * 32 + element]);
         partial += q * v;
       }
-      scaled += partial * static_cast<std::int32_t>(
-                              get_bits(w, 32 + group * 6, 6));
+      scaled += partial * static_cast<std::int32_t>(q4k_scale(w, group));
     }
     std::int32_t minimum = 0;
     for (std::size_t group = 0; group < 8; ++group) {
@@ -196,7 +197,7 @@ float reference_row(const std::uint8_t *weights, const std::uint8_t *activation,
       std::int16_t second;
       std::memcpy(&first, x + 260 + 4 * group, sizeof(first));
       std::memcpy(&second, x + 262 + 4 * group, sizeof(second));
-      minimum += static_cast<std::int32_t>(get_bits(w, 80 + group * 6, 6)) *
+      minimum += static_cast<std::int32_t>(q4k_minimum(w, group)) *
                  static_cast<std::int32_t>(first + second);
     }
     const float scale_term = static_cast<float>(d16) * static_cast<float>(scaled);

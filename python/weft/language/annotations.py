@@ -28,21 +28,35 @@ hi_first = "hi_first"
 
 
 @dataclass(frozen=True, slots=True)
-class PackingSpec:
+class FieldLayoutSpec:
     kind: str
-    argument: str
+    size: int
+    order: str = ""
+    fields: int = 0
+    low_bits: int = 0
 
 
-def packed(storage_bytes: int) -> PackingSpec:
-    if isinstance(storage_bytes, bool) or not isinstance(storage_bytes, int) or storage_bytes <= 0:
-        raise TypeError("packed expects a positive byte count")
-    return PackingSpec("packed", str(storage_bytes))
+def grouped(elements: int) -> FieldLayoutSpec:
+    if isinstance(elements, bool) or not isinstance(elements, int) or elements <= 0:
+        raise TypeError("grouped expects a positive logical element count")
+    return FieldLayoutSpec("grouped", elements)
 
 
-def nibble(order: str) -> PackingSpec:
+def layered(elements: int, order: str) -> FieldLayoutSpec:
+    if isinstance(elements, bool) or not isinstance(elements, int) or elements <= 0:
+        raise TypeError("layered expects a positive logical layer extent")
     if order not in {lo_first, hi_first}:
-        raise TypeError("nibble order must be lo_first or hi_first")
-    return PackingSpec("nibble", order)
+        raise TypeError("layered order must be lo_first or hi_first")
+    return FieldLayoutSpec("layered", elements, order)
+
+
+def joined(group: int, fields: int, low_bits: int, order: str) -> FieldLayoutSpec:
+    for name, value in {"group": group, "fields": fields, "low_bits": low_bits}.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise TypeError(f"joined {name} must be a positive integer")
+    if order not in {lo_first, hi_first}:
+        raise TypeError("joined order must be lo_first or hi_first")
+    return FieldLayoutSpec("joined", group, order, fields, low_bits)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,12 +77,12 @@ def padding(bytes: int, value: int = 0) -> PaddingSpec:
 class ArraySpec:
     dtype: DType
     shape: tuple[object, ...]
-    packing: PackingSpec | None = None
+    layouts: tuple[FieldLayoutSpec, ...] = ()
 
-    def __matmul__(self, packing: object) -> ArraySpec:
-        if not isinstance(packing, PackingSpec):
-            raise TypeError("encoding field @ annotation must be packed(...) or nibble(...)")
-        return ArraySpec(self.dtype, self.shape, packing)
+    def __matmul__(self, layout: object) -> ArraySpec:
+        if not isinstance(layout, FieldLayoutSpec):
+            raise TypeError("encoding field @ annotation must be a field layout")
+        return ArraySpec(self.dtype, self.shape, self.layouts + (layout,))
 
 
 @dataclass(frozen=True, slots=True)

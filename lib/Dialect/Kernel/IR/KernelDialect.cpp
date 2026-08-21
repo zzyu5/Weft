@@ -290,49 +290,115 @@ mlir::LogicalResult EncodingDeclOp::verify() {
     return emitOpError("byte_order must be little or big");
   if (getAlignment() <= 0 || getStorageBits() <= 0)
     return emitOpError("alignment and storage_bits must be positive");
-  if (failed(verifyStringArray(*this, getFieldNames(), "field_names")) ||
-      failed(verifyStringArray(*this, getFieldPacking(), "field_packing")))
+  if (failed(verifyStringArray(*this, getFieldNames(), "field_names")))
     return mlir::failure();
   const size_t count = getFieldNames().size();
   if (getFieldTypes().size() != count || getFieldShapes().size() != count ||
-      getFieldPacking().size() != count ||
+      getFieldLayouts().size() != count ||
       getFieldBitOffsets().size() != count ||
       getFieldStorageBits().size() != count)
     return emitOpError("all encoding field arrays must have the same length");
   int64_t previousEnd = 0;
+  int64_t joinedOffset = -1;
+  int64_t joinedWidth = 0;
+  int64_t joinedFields = 0;
+  int64_t joinedNextRole = 0;
   llvm::SmallVector<std::pair<int64_t, int64_t>> spans;
   for (size_t index = 0; index < count; ++index) {
-    if (!mlir::isa<mlir::TypeAttr>(getFieldTypes()[index]) ||
-        !mlir::isa<mlir::DenseI64ArrayAttr>(getFieldShapes()[index]))
+    auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(getFieldTypes()[index]);
+    auto shapeAttr =
+        mlir::dyn_cast<mlir::DenseI64ArrayAttr>(getFieldShapes()[index]);
+    auto layouts = mlir::dyn_cast<mlir::ArrayAttr>(getFieldLayouts()[index]);
+    if (!typeAttr || !shapeAttr || !layouts || layouts.empty())
       return emitOpError("field_types and field_shapes have invalid elements");
+    auto kind = [](mlir::Attribute attribute) -> llvm::StringRef {
+      auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+      auto value = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
+                              : mlir::StringAttr();
+      return value ? value.getValue() : llvm::StringRef();
+    };
+    bool sharedJoined = false;
+    int64_t joinedRole = -1;
+    if (kind(layouts[0]) == "natural") {
+      if (layouts.size() != 1)
+        return emitOpError("natural field layout cannot be combined");
+    } else if (kind(layouts[0]) == "joined") {
+      if (layouts.size() != 1)
+        return emitOpError("joined field layout cannot be combined");
+      auto joined = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
+      auto group = joined.getAs<mlir::IntegerAttr>("size");
+      auto fields = joined.getAs<mlir::IntegerAttr>("fields");
+      auto lowBits = joined.getAs<mlir::IntegerAttr>("low_bits");
+      auto role = joined.getAs<mlir::IntegerAttr>("role");
+      auto order = joined.getAs<mlir::StringAttr>("order");
+      auto integer = mlir::dyn_cast<mlir::IntegerType>(typeAttr.getValue());
+      if (!group || !fields || !lowBits || !role || !order || !integer ||
+          shapeAttr.size() != 1 || group.getInt() <= 0 || fields.getInt() < 2 ||
+          role.getInt() < 0 || role.getInt() >= fields.getInt() ||
+          shapeAttr[0] != 2 * group.getInt() || lowBits.getInt() <= 0 ||
+          lowBits.getInt() >= integer.getWidth() ||
+          lowBits.getInt() * fields.getInt() != 8 ||
+          integer.getWidth() + integer.getWidth() - lowBits.getInt() != 8 ||
+          (order.getValue() != "lo_first" && order.getValue() != "hi_first"))
+        return emitOpError("invalid joined field layout");
+      joinedRole = role.getInt();
+      sharedJoined = true;
+    } else {
+      if (layouts.size() != 2 || kind(layouts[0]) != "grouped" ||
+          kind(layouts[1]) != "layered")
+        return emitOpError(
+            "field layout must be natural or grouped followed by layered");
+      auto grouped = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
+      auto layered = mlir::cast<mlir::DictionaryAttr>(layouts[1]);
+      auto group = grouped.getAs<mlir::IntegerAttr>("size");
+      auto layer = layered.getAs<mlir::IntegerAttr>("size");
+      auto order = layered.getAs<mlir::StringAttr>("order");
+      if (!group || !layer || !order || group.getInt() <= 0 ||
+          layer.getInt() <= 0 || group.getInt() % layer.getInt() ||
+          (order.getValue() != "lo_first" &&
+           order.getValue() != "hi_first"))
+        return emitOpError("invalid grouped/layered field layout");
+      auto integer = mlir::dyn_cast<mlir::IntegerType>(typeAttr.getValue());
+      if (!integer || shapeAttr.size() != 1 ||
+          shapeAttr[0] % group.getInt() ||
+          integer.getWidth() * (group.getInt() / layer.getInt()) != 8)
+        return emitOpError(
+            "grouped/layered field must form one byte per layer position");
+    }
     int64_t offset = getFieldBitOffsets()[index];
     int64_t width = getFieldStorageBits()[index];
-    if (offset < previousEnd || width <= 0 || offset + width > getStorageBits())
+    if (width <= 0 || offset + width > getStorageBits())
       return emitOpError("encoding fields overlap or exceed storage_bits");
-    previousEnd = offset + width;
-    spans.emplace_back(offset, offset + width);
-  }
-  for (size_t index = 0; index < count;) {
-    llvm::StringRef packing =
-        mlir::cast<mlir::StringAttr>(getFieldPacking()[index]).getValue();
-    if (!packing.starts_with("packed:")) {
-      ++index;
-      continue;
+    if (sharedJoined) {
+      auto joined = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
+      int64_t fields = joined.getAs<mlir::IntegerAttr>("fields").getInt();
+      if (joinedRole == 0) {
+        if (offset < previousEnd)
+          return emitOpError("joined storage overlaps a previous field");
+        joinedOffset = offset;
+        joinedWidth = width;
+        joinedFields = fields;
+        joinedNextRole = 1;
+        previousEnd = offset + width;
+        spans.emplace_back(offset, offset + width);
+      } else if (offset != joinedOffset || width != joinedWidth ||
+                 fields != joinedFields || joinedRole != joinedNextRole++) {
+        return emitOpError(
+            "joined logical fields must be consecutive roles over one storage span");
+      }
+    } else {
+      if (joinedOffset >= 0 && joinedNextRole != joinedFields)
+        return emitOpError("joined storage is missing one or more logical fields");
+      joinedOffset = -1;
+      joinedNextRole = 0;
+      if (offset < previousEnd)
+        return emitOpError("encoding fields overlap");
+      previousEnd = offset + width;
+      spans.emplace_back(offset, offset + width);
     }
-    int64_t bytes = 0;
-    if (packing.drop_front(7).getAsInteger(10, bytes) || bytes <= 0)
-      return emitOpError("packed field spelling must be packed:<positive bytes>");
-    int64_t packedBits = 0;
-    size_t end = index;
-    while (end < count &&
-           mlir::cast<mlir::StringAttr>(getFieldPacking()[end]).getValue() ==
-               packing)
-      packedBits += getFieldStorageBits()[end++];
-    if (packedBits != bytes * 8)
-      return emitOpError(
-          "consecutive fields sharing packed(n) must exactly fill n bytes");
-    index = end;
   }
+  if (joinedOffset >= 0 && joinedNextRole != joinedFields)
+    return emitOpError("joined storage is missing one or more logical fields");
   if (getPadding().size() % 3)
     return emitOpError("padding is a sequence of offset, width, fill triples");
   for (size_t index = 0; index < getPadding().size(); index += 3) {

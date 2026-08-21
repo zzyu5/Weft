@@ -55,7 +55,7 @@ struct EncodingField {
   std::string name;
   mlir::Type type;
   llvm::SmallVector<int64_t> shape;
-  std::string packing;
+  mlir::ArrayAttr layouts;
   int64_t bitOffset = 0;
   int64_t storageBits = 0;
 };
@@ -69,6 +69,54 @@ struct EncodingInfo {
   int64_t logicalElements = 1;
   llvm::SmallVector<EncodingField> fields;
 };
+
+llvm::StringRef layoutKind(mlir::ArrayAttr layouts) {
+  if (!layouts || layouts.empty())
+    return {};
+  auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(layouts[0]);
+  auto kind = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
+                         : mlir::StringAttr();
+  return kind ? kind.getValue() : llvm::StringRef();
+}
+
+struct StorageFragment {
+  std::string byte;
+  std::string shift;
+  unsigned width = 0;
+};
+
+std::optional<StorageFragment>
+singleStorageFragment(const EncodingField &field, llvm::StringRef logicalIndex,
+                      unsigned logicalWidth) {
+  llvm::StringRef kind = layoutKind(field.layouts);
+  if (kind == "natural") {
+    std::string bit = "(" + std::to_string(field.bitOffset) + " + (" +
+                      logicalIndex.str() + ") * " +
+                      std::to_string(logicalWidth) + ")";
+    return StorageFragment{"(" + bit + " / 8)", "(" + bit + " % 8)",
+                           logicalWidth};
+  }
+  if (kind != "grouped" || field.layouts.size() != 2)
+    return std::nullopt;
+  auto grouped = mlir::cast<mlir::DictionaryAttr>(field.layouts[0]);
+  auto layered = mlir::cast<mlir::DictionaryAttr>(field.layouts[1]);
+  int64_t group = grouped.getAs<mlir::IntegerAttr>("size").getInt();
+  int64_t layer = layered.getAs<mlir::IntegerAttr>("size").getInt();
+  llvm::StringRef order = layered.getAs<mlir::StringAttr>("order").getValue();
+  int64_t layers = group / layer;
+  std::string within = "((" + logicalIndex.str() + ") % " +
+                       std::to_string(group) + ")";
+  std::string layerIndex = "(" + within + " / " + std::to_string(layer) + ")";
+  if (order == "hi_first")
+    layerIndex = "(" + std::to_string(layers - 1) + " - " + layerIndex + ")";
+  std::string byte = "(" + std::to_string(field.bitOffset / 8) + " + ((" +
+                     logicalIndex.str() + ") / " + std::to_string(group) + ") * " +
+                     std::to_string(layer) + " + " + within + " % " +
+                     std::to_string(layer) + ")";
+  std::string shift = "(" + layerIndex + " * " +
+                      std::to_string(logicalWidth) + ")";
+  return StorageFragment{byte, shift, logicalWidth};
+}
 
 struct PointInfo {
   int64_t axis = 0;
@@ -100,6 +148,7 @@ struct FieldInfo {
   std::string name;
   std::optional<mlir::Value> index;
   std::string selector;
+  mlir::DictionaryAttr memoryEdge;
 };
 
 struct Binding {
@@ -154,25 +203,6 @@ public:
       for (mlir::NamedAttribute binding : bindings)
         autoBindings[binding.getName()] =
             mlir::cast<mlir::IntegerAttr>(binding.getValue()).getInt();
-    for (mlir::Attribute attribute : assignment.getValues()) {
-      auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-      llvm::StringRef kind =
-          riscv_internal::string(value, "physical_kind").value_or("");
-      int64_t axis = riscv_internal::integer(value, "lane_axis").value_or(0);
-      if (kind.starts_with("rvv") && axis > 0) {
-        laneAxis = axis;
-        break;
-      }
-    }
-    auto byteInterleave = assignment.getDDecisions().getAs<mlir::DictionaryAttr>(
-        "byte_interleave");
-    if (byteInterleave) {
-      interleaveRows = riscv_internal::integer(byteInterleave, "rows").value_or(0);
-      interleaveIdentity =
-          riscv_internal::string(byteInterleave, "layout_identity")
-              .value_or("")
-              .str();
-    }
   }
 
   mlir::LogicalResult emit() {
@@ -212,7 +242,10 @@ public:
       auto info = source == derivedSources.end()
                       ? encodings.end()
                       : encodings.find(source->second);
-      if (info == encodings.end() || interleaveRows <= 0)
+      mlir::DictionaryAttr physical = assigned(argument);
+      int64_t rows =
+          riscv_internal::integer(physical, "interleave_rows").value_or(0);
+      if (info == encodings.end() || rows <= 0)
         continue;
       const std::string prefix = identifier(kernel.getSymName()) + "_" +
                                  identifier(mlir::cast<mlir::StringAttr>(names[index])
@@ -222,26 +255,26 @@ public:
       output << "size_t " << prefix
              << "_packed_size(size_t M, size_t K) {\n"
              << "  if (K == 0 || K % " << elements << " != 0) return 0;\n"
-             << "  return ((M + " << interleaveRows << " - 1) / "
-             << interleaveRows << ") * (K / " << elements << ") * "
-             << recordBytes * interleaveRows << ";\n"
+             << "  return ((M + " << rows << " - 1) / "
+             << rows << ") * (K / " << elements << ") * "
+             << recordBytes * rows << ";\n"
              << "}\n\n";
       output << "void " << prefix
              << "_pack(const uint8_t *restrict source, uint8_t *restrict target, "
                 "size_t M, size_t K) {\n"
              << "  const size_t blocks = K / " << elements << ";\n"
-             << "  const size_t row_groups = (M + " << interleaveRows
-             << " - 1) / " << interleaveRows << ";\n"
+             << "  const size_t row_groups = (M + " << rows
+             << " - 1) / " << rows << ";\n"
              << "  for (size_t rg = 0; rg < row_groups; ++rg)\n"
              << "    for (size_t kb = 0; kb < blocks; ++kb)\n"
              << "      for (size_t byte = 0; byte < " << recordBytes
              << "; ++byte)\n"
-             << "        for (size_t lane = 0; lane < " << interleaveRows
+             << "        for (size_t lane = 0; lane < " << rows
              << "; ++lane) {\n"
-             << "          const size_t row = rg * " << interleaveRows
+             << "          const size_t row = rg * " << rows
              << " + lane;\n"
              << "          const size_t dst = ((rg * blocks + kb) * "
-             << recordBytes << " + byte) * " << interleaveRows
+             << recordBytes << " + byte) * " << rows
              << " + lane;\n"
              << "          target[dst] = row < M ? source[(row * blocks + kb) * "
              << recordBytes << " + byte] : 0;\n"
@@ -351,7 +384,7 @@ private:
       auto names = declaration.getFieldNames();
       auto types = declaration.getFieldTypes();
       auto shapes = declaration.getFieldShapes();
-      auto packing = declaration.getFieldPacking();
+      auto layouts = declaration.getFieldLayouts();
       auto offsets = declaration.getFieldBitOffsets();
       auto storage = declaration.getFieldStorageBits();
       for (size_t index = 0; index < names.size(); ++index) {
@@ -360,8 +393,7 @@ private:
         field.type = mlir::cast<mlir::TypeAttr>(types[index]).getValue();
         auto shape = mlir::cast<mlir::DenseI64ArrayAttr>(shapes[index]);
         field.shape.assign(shape.asArrayRef().begin(), shape.asArrayRef().end());
-        field.packing =
-            mlir::cast<mlir::StringAttr>(packing[index]).getValue().str();
+        field.layouts = mlir::cast<mlir::ArrayAttr>(layouts[index]);
         field.bitOffset = offsets[index];
         field.storageBits = storage[index];
         if (!field.shape.empty())
@@ -614,6 +646,7 @@ private:
   int64_t vectorPartCount(mlir::Value value) const;
   int64_t streamPartCount(mlir::Value value) const;
   int64_t physicalLanes(mlir::Value value) const;
+  int64_t laneAxisFor(mlir::Value value) const;
   std::string partOffset(mlir::Value value, size_t part) const;
   std::string partVL(mlir::Value value, size_t part) const;
   mlir::FailureOr<Binding>
@@ -632,9 +665,9 @@ private:
                                llvm::StringRef logicalIndex);
   mlir::FailureOr<Binding> emitGroupedMacReduction(mlir::Value result,
                                                     const Binding &mac);
-  Binding emitQuantDot(mlir::Value result, mlir::Value lhsValue,
-                       const Binding &lhs,
-                       const Binding &rhs);
+  mlir::FailureOr<Binding> emitQuantDot(kernel::DotOp operation,
+                                        const Binding &lhs,
+                                        const Binding &rhs);
   std::string laneVL() const {
     return laneVLStack.empty() ? "1" : laneVLStack.back();
   }
@@ -645,9 +678,6 @@ private:
   llvm::raw_ostream &output;
   unsigned indent = 0;
   unsigned nextName = 0;
-  int64_t laneAxis = -1;
-  int64_t interleaveRows = 0;
-  std::string interleaveIdentity;
   llvm::DenseMap<mlir::Value, mlir::DictionaryAttr> valueAssignments;
   llvm::DenseMap<mlir::Operation *, mlir::DictionaryAttr> operationAssignments;
   llvm::StringMap<mlir::DictionaryAttr> assignmentOperationsById;
@@ -697,6 +727,10 @@ int64_t Emitter::physicalLanes(mlir::Value value) const {
   return 1;
 }
 
+int64_t Emitter::laneAxisFor(mlir::Value value) const {
+  return riscv_internal::integer(assigned(value), "lane_axis").value_or(0);
+}
+
 std::string Emitter::partOffset(mlir::Value value, size_t part) const {
   const int64_t streams = streamPartCount(value);
   const int64_t stream = static_cast<int64_t>(part % streams);
@@ -705,8 +739,7 @@ std::string Emitter::partOffset(mlir::Value value, size_t part) const {
 
 std::string Emitter::partVL(mlir::Value value, size_t part) const {
   const int64_t streams = streamPartCount(value);
-  if (streams == 1)
-    return laneVL();
+  const int64_t laneAxis = laneAxisFor(value);
   auto scope = axisScopes.find(laneAxis);
   if (scope == axisScopes.end() || scope->second.empty())
     return laneVL();
@@ -723,6 +756,7 @@ int64_t Emitter::vectorPartCount(mlir::Value value) const {
   if (!type)
     return 1;
   int64_t count = 1;
+  const int64_t laneAxis = laneAxisFor(value);
   for (auto [extent, axis] :
        llvm::zip(type.getShape().asArrayRef(), type.getAxisIds().asArrayRef())) {
     if (axis == laneAxis)
@@ -841,6 +875,7 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
     return mlir::failure();
   int64_t nonLaneAxis = -1;
   int64_t count = 1;
+  const int64_t laneAxis = laneAxisFor(result);
   for (auto [extent, axis] : llvm::zip(resultType.getShape().asArrayRef(),
                                        resultType.getAxisIds().asArrayRef()))
     if (axis != laneAxis) {
@@ -1327,8 +1362,12 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
   }
   std::string family = encoding.getFamily().str();
   std::string sourceFamily = family;
-  auto derived = derivedSources.find(family);
-  if (derived != derivedSources.end())
+  mlir::DictionaryAttr physical = assigned(value);
+  if (auto selectedBase = physical.getAs<mlir::StringAttr>(
+          "base_encoding_family"))
+    sourceFamily = selectedBase.getValue().str();
+  else if (auto derived = derivedSources.find(family);
+           derived != derivedSources.end())
     sourceFamily = derived->second;
   auto info = encodings.find(sourceFamily);
   if (info == encodings.end())
@@ -1368,7 +1407,9 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
   const int64_t recordBytes = info->second.storageBits / 8;
   const int64_t elements = info->second.logicalElements;
   if (encoding.getKind() == "derived_family") {
-    if (interleaveRows <= 0 || base.memory.axes.size() != 2)
+    int64_t rows =
+        riscv_internal::integer(physical, "interleave_rows").value_or(0);
+    if (rows <= 0 || base.memory.axes.size() != 2)
       return value.getDefiningOp()->emitError(
                  "derived interleave requires a two-axis view and selected rows"),
              mlir::failure();
@@ -1376,12 +1417,12 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
     const PointInfo block = points.lookup(base.memory.axes[1]);
     const std::string blocks = "(" + base.memory.extents[1] + " / " +
                                std::to_string(elements) + ")";
-    result.interleaveRows = interleaveRows;
+    result.interleaveRows = rows;
     result.recordPointer = base.memory.name + " + (((" + row.base + " / " +
-                           std::to_string(interleaveRows) + ") * " + blocks +
+                           std::to_string(rows) + ") * " + blocks +
                            " + (" + block.base + " / " +
                            std::to_string(elements) + ")) * " +
-                           std::to_string(recordBytes * interleaveRows) + ")";
+                           std::to_string(recordBytes * rows) + ")";
   } else {
     if (base.memory.axes.empty())
       return value.getDefiningOp()->emitError(
@@ -1460,10 +1501,18 @@ mlir::LogicalResult Emitter::compileNew(kernel::NewOp operation) {
 }
 
 mlir::LogicalResult Emitter::compileField(kernel::FieldOp operation) {
+  mlir::DictionaryAttr selected = assigned(operation.getOperation());
+  auto memoryEdge = selected.getAs<mlir::DictionaryAttr>("memory_edge");
+  llvm::StringRef realization =
+      riscv_internal::string(selected, "realization").value_or("");
+  if (!memoryEdge || !realization.starts_with("encoded-field."))
+    return fail(operation,
+                "field emission requires one selected memory-edge mapping");
   Binding binding;
   binding.kind = Binding::Kind::Field;
   binding.field.owner = operation.getOwner();
   binding.field.name = operation.getName().str();
+  binding.field.memoryEdge = memoryEdge;
   bindings[operation.getResult()] = std::move(binding);
   return mlir::success();
 }
@@ -1517,6 +1566,7 @@ mlir::LogicalResult Emitter::compileExtract(kernel::ExtractOp operation) {
   if (!pointValue)
     return fail(operation, "local vector extract has no domain point");
   const Binding &point = bindings.lookup(*pointValue);
+  const int64_t laneAxis = laneAxisFor(operation.getInput());
   if (point.kind != Binding::Kind::Point || point.point.axis != laneAxis)
     return fail(operation,
                 "local vector extract point does not own the selected lane axis");
@@ -1749,7 +1799,7 @@ mlir::LogicalResult Emitter::compileMac(mlir::Operation &operation,
                                         int64_t group) {
   llvm::StringRef realization =
       riscv_internal::string(assigned(&operation), "realization").value_or("");
-  if (!realization.starts_with("rvv.vwmaccsu("))
+  if (realization != "rvv.vwmaccsu.typed")
     return fail(&operation,
                 "intrinsic-C emitter only implements the selected rvv.vwmaccsu MAC");
   Binding binding;
@@ -2033,9 +2083,14 @@ mlir::LogicalResult Emitter::compileFold2(kernel::Fold2Op operation) {
 mlir::LogicalResult Emitter::compileDot(kernel::DotOp operation) {
   Binding lhs = bindings.lookup(operation.getLhs());
   Binding rhs = bindings.lookup(operation.getRhs());
-  if (lhs.kind == Binding::Kind::Field && rhs.kind == Binding::Kind::DeferredFold) {
-    bindings[operation.getResult()] =
-        emitQuantDot(operation.getResult(), operation.getLhs(), lhs, rhs);
+  llvm::StringRef realization =
+      riscv_internal::string(assigned(operation.getOperation()), "realization")
+          .value_or("");
+  if (realization == "rvv.dot.encoded-field-folded-i16") {
+    mlir::FailureOr<Binding> result = emitQuantDot(operation, lhs, rhs);
+    if (mlir::failed(result))
+      return mlir::failure();
+    bindings[operation.getResult()] = std::move(*result);
     return mlir::success();
   }
   return compileContract(*operation, operation.getLhs(), operation.getRhs(),
@@ -2235,33 +2290,25 @@ std::optional<EncodingField>
 Emitter::fieldFor(const Binding &fieldBinding) const {
   if (fieldBinding.kind != Binding::Kind::Field)
     return std::nullopt;
-  const Binding &owner = bindings.lookup(fieldBinding.field.owner);
-  std::string family;
-  if (owner.kind == Binding::Kind::Record) {
-    family = owner.encodingFamily;
-  } else if (owner.kind == Binding::Kind::Slice) {
-    auto sliceType =
-        mlir::dyn_cast<kernel::SliceType>(fieldBinding.field.owner.getType());
-    auto ownerEncoding = sliceType
-                             ? mlir::dyn_cast<kernel::EncodingType>(
-                                   sliceType.getEncoding())
-                             : kernel::EncodingType();
-    if (!ownerEncoding)
-      return std::nullopt;
-    family = ownerEncoding.getFamily().str();
-    auto derived = derivedSources.find(family);
-    if (derived != derivedSources.end())
-      family = derived->second;
-  } else {
+  mlir::DictionaryAttr mapping = fieldBinding.field.memoryEdge;
+  if (!mapping)
     return std::nullopt;
-  }
-  auto encoding = encodings.find(family);
-  if (encoding == encodings.end())
+  auto name = mapping.getAs<mlir::StringAttr>("field");
+  auto type = mapping.getAs<mlir::TypeAttr>("field_type");
+  auto shape = mapping.getAs<mlir::DenseI64ArrayAttr>("field_shape");
+  auto layouts = mapping.getAs<mlir::ArrayAttr>("layout");
+  auto offset = mapping.getAs<mlir::IntegerAttr>("bit_offset");
+  auto storage = mapping.getAs<mlir::IntegerAttr>("storage_bits");
+  if (!name || !type || !shape || !layouts || !offset || !storage)
     return std::nullopt;
-  for (const EncodingField &field : encoding->second.fields)
-    if (field.name == fieldBinding.field.name)
-      return field;
-  return std::nullopt;
+  EncodingField result;
+  result.name = name.getValue().str();
+  result.type = type.getValue();
+  result.shape.assign(shape.asArrayRef().begin(), shape.asArrayRef().end());
+  result.layouts = layouts;
+  result.bitOffset = offset.getInt();
+  result.storageBits = storage.getInt();
+  return result;
 }
 
 Binding Emitter::emitInterleavedField(mlir::Value result,
@@ -2306,7 +2353,7 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     llvm::StringRef physicalKind =
         riscv_internal::string(assigned(result), "physical_kind").value_or("");
     if (physicalKind.starts_with("rvv") && !field->shape.empty()) {
-      if (field->bitOffset % 8 || field->packing != "natural" ||
+      if (field->bitOffset % 8 || layoutKind(field->layouts) != "natural" ||
           (logicalWidth != 8 && logicalWidth != 16 && logicalWidth != 32))
         return {};
       Binding vectorResult;
@@ -2355,12 +2402,11 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     return scalarResult;
   }
 
-  mlir::DictionaryAttr physical = assigned(result);
-  int64_t resultSEW =
-      physical.getAs<mlir::IntegerAttr>("physical_sew").getInt();
-  int64_t resultLMUL =
-      physical.getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
-  int64_t rawLMUL = std::max<int64_t>(1, resultLMUL * 8 / resultSEW);
+  mlir::DictionaryAttr edge = fieldBinding.field.memoryEdge;
+  int64_t rawLMUL =
+      riscv_internal::integer(edge, "raw_lmul_eighths").value_or(0);
+  if (rawLMUL <= 0)
+    return {};
   auto lmul = [](int64_t eighths) {
     if (eighths < 8)
       return std::string("mf") + std::to_string(8 / eighths);
@@ -2368,37 +2414,75 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
   };
   const std::string rawSuffix = "u8" + lmul(rawLMUL);
   const std::string rawType = "vuint8" + lmul(rawLMUL) + "_t";
-  const std::string bit = "(" + std::to_string(field->bitOffset) + " + (" +
-                          logicalIndex + ") * " +
-                          std::to_string(logicalWidth) + ")";
-  const std::string byte = "(" + bit + " / 8)";
-  const std::string shift = "(" + bit + " % 8)";
-  std::string low = fresh("packed_low");
-  line(rawType + " " + low + " = __riscv_vle8_v_" + rawSuffix + "(" +
-       owner.recordPointer + " + " + byte + " * " +
-       std::to_string(owner.interleaveRows) + ", " + laneVL() + ");");
-  std::string raw = fresh("packed_value");
-  line(rawType + " " + raw + " = __riscv_vsrl_vx_" + rawSuffix + "(" + low +
-       ", " + shift + ", " + laneVL() + ");");
-  if (logicalWidth < 8) {
-    line("if (" + shift + " + " + std::to_string(logicalWidth) + " > 8) {");
-    ++indent;
-    std::string high = fresh("packed_high");
-    line(rawType + " " + high + " = __riscv_vle8_v_" + rawSuffix + "(" +
-         owner.recordPointer + " + (" + byte + " + 1) * " +
+  auto loadByte = [&](llvm::StringRef byte, llvm::StringRef prefix) {
+    std::string loaded = fresh(prefix);
+    line(rawType + " " + loaded + " = __riscv_vle8_v_" + rawSuffix + "(" +
+         owner.recordPointer + " + (" + byte.str() + ") * " +
          std::to_string(owner.interleaveRows) + ", " + laneVL() + ");");
-    std::string highShift = fresh("packed_join");
-    line(rawType + " " + highShift + " = __riscv_vsll_vx_" + rawSuffix + "(" +
-         high + ", 8 - " + shift + ", " + laneVL() + ");");
-    line(raw + " = __riscv_vor_vv_" + rawSuffix + "(" + raw + ", " + highShift +
-         ", " + laneVL() + ");");
+    return loaded;
+  };
+
+  std::string raw;
+  llvm::StringRef kind = layoutKind(field->layouts);
+  if (kind == "joined") {
+    auto joined = mlir::cast<mlir::DictionaryAttr>(field->layouts[0]);
+    int64_t group = joined.getAs<mlir::IntegerAttr>("size").getInt();
+    int64_t fields = joined.getAs<mlir::IntegerAttr>("fields").getInt();
+    int64_t lowBits = joined.getAs<mlir::IntegerAttr>("low_bits").getInt();
+    int64_t role = joined.getAs<mlir::IntegerAttr>("role").getInt();
+    llvm::StringRef order =
+        joined.getAs<mlir::StringAttr>("order").getValue();
+    int64_t physicalRole = order == "lo_first" ? role : fields - 1 - role;
+    raw = fresh("joined_value");
+    line(rawType + " " + raw + ";");
+    line("if ((" + logicalIndex + ") < " + std::to_string(group) + ") {");
+    ++indent;
+    std::string headByte = "(" + std::to_string(field->bitOffset / 8) + " + " +
+                           std::to_string(role * group) + " + (" +
+                           logicalIndex + "))";
+    std::string head = loadByte(headByte, "joined_head");
+    line(raw + " = __riscv_vand_vx_" + rawSuffix + "(" + head + ", " +
+         std::to_string((1u << logicalWidth) - 1) + ", " + laneVL() + ");");
+    --indent;
+    line("} else {");
+    ++indent;
+    std::string tail = "((" + logicalIndex + ") - " + std::to_string(group) + ")";
+    std::string lowByte = "(" + std::to_string(field->bitOffset / 8) + " + " +
+                          std::to_string(fields * group) + " + " + tail + ")";
+    std::string highByte = "(" + std::to_string(field->bitOffset / 8) + " + " +
+                           std::to_string(role * group) + " + " + tail + ")";
+    std::string low = loadByte(lowByte, "joined_low");
+    std::string high = loadByte(highByte, "joined_high");
+    std::string lowPart = fresh("joined_low_bits");
+    line(rawType + " " + lowPart + " = __riscv_vand_vx_" + rawSuffix +
+         "(__riscv_vsrl_vx_" + rawSuffix + "(" + low + ", " +
+         std::to_string(physicalRole * lowBits) + ", " + laneVL() + "), " +
+         std::to_string((1u << lowBits) - 1) + ", " + laneVL() + ");");
+    std::string highPart = fresh("joined_high_bits");
+    line(rawType + " " + highPart + " = __riscv_vsll_vx_" + rawSuffix +
+         "(__riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" + rawSuffix +
+         "(" + high + ", " + std::to_string(logicalWidth) + ", " + laneVL() +
+         "), " + std::to_string((1u << (logicalWidth - lowBits)) - 1) + ", " +
+         laneVL() + "), " + std::to_string(lowBits) + ", " + laneVL() + ");");
+    line(raw + " = __riscv_vor_vv_" + rawSuffix + "(" + lowPart + ", " +
+         highPart + ", " + laneVL() + ");");
     --indent;
     line("}");
-    std::string masked = fresh("packed_masked");
-    line(rawType + " " + masked + " = __riscv_vand_vx_" + rawSuffix + "(" +
-         raw + ", " + std::to_string((1u << logicalWidth) - 1) + ", " +
-         laneVL() + ");");
-    raw = std::move(masked);
+  } else {
+    auto fragment =
+        singleStorageFragment(*field, logicalIndex, logicalWidth);
+    if (!fragment)
+      return {};
+    std::string loaded = loadByte(fragment->byte, "packed_byte");
+    if (logicalWidth <= 8) {
+      raw = fresh("packed_value");
+      line(rawType + " " + raw + " = __riscv_vand_vx_" + rawSuffix +
+           "(__riscv_vsrl_vx_" + rawSuffix + "(" + loaded + ", " +
+           fragment->shift + ", " + laneVL() + "), " +
+           std::to_string((1u << logicalWidth) - 1) + ", " + laneVL() + ");");
+    } else {
+      raw = std::move(loaded);
+    }
   }
   Binding resultBinding;
   resultBinding.kind = Binding::Kind::Vector;
@@ -2406,12 +2490,16 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     resultBinding.parts.push_back(raw);
     return resultBinding;
   }
-  if (logicalWidth == 16) {
+  if (logicalWidth == 16 && kind == "natural") {
+    auto fragment =
+        singleStorageFragment(*field, logicalIndex, logicalWidth);
+    if (!fragment)
+      return {};
     const std::string u16Suffix = "u16" + lmul(rawLMUL * 2);
     const std::string u16Type = "vuint16" + lmul(rawLMUL * 2) + "_t";
     std::string high = fresh("word_high");
     line(rawType + " " + high + " = __riscv_vle8_v_" + rawSuffix + "(" +
-         owner.recordPointer + " + (" + byte + " + 1) * " +
+         owner.recordPointer + " + (" + fragment->byte + " + 1) * " +
          std::to_string(owner.interleaveRows) + ", " + laneVL() + ");");
     std::string low16 = fresh("word_low16");
     std::string high16 = fresh("word_high16");
@@ -2456,10 +2544,24 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   if (mac.group <= 0)
     return mac.sourceOperation->emitError("selected grouped MAC has an invalid group"),
            mlir::failure();
-  auto nibble = assignment.getDDecisions().getAs<mlir::StringAttr>("nibble_unpack");
-  if (!nibble || nibble.getValue() != "and-shift")
+  mlir::DictionaryAttr selected = assigned(mac.sourceOperation);
+  auto local = selected.getAs<mlir::DictionaryAttr>("local_operation");
+  auto instruction = local ? local.getAs<mlir::StringAttr>("instruction")
+                           : mlir::StringAttr();
+  auto lhsLMULAttr =
+      local ? local.getAs<mlir::IntegerAttr>("lhs_lmul_eighths")
+            : mlir::IntegerAttr();
+  auto partialLMULAttr =
+      local ? local.getAs<mlir::IntegerAttr>("partial_lmul_eighths")
+            : mlir::IntegerAttr();
+  auto partialSEWAttr =
+      local ? local.getAs<mlir::IntegerAttr>("partial_sew")
+            : mlir::IntegerAttr();
+  if (!instruction || instruction.getValue() != "rvv.vwmaccsu" ||
+      !lhsLMULAttr || !partialLMULAttr || !partialSEWAttr ||
+      partialSEWAttr.getInt() != 16)
     return mac.sourceOperation->emitError(
-               "intrinsic-C emitter only implements selected nibble_unpack=and-shift"),
+               "grouped MAC has no complete selected local operation"),
            mlir::failure();
   const Binding &point = bindings.lookup(*lhs.field.index);
   const Binding &rhsPoint = bindings.lookup(*rhs.field.index);
@@ -2494,10 +2596,8 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   line("for (size_t " + groupIndex + " = 0; " + groupIndex + " < " + groups +
        "; ++" + groupIndex + ") {");
   ++indent;
-  mlir::DictionaryAttr macPhysical = assigned(mac.lhs);
-  (void)macPhysical;
-  int64_t outLMUL = assigned(result).getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
-  int64_t partialLMUL = std::max<int64_t>(1, outLMUL / 2);
+  const int64_t partialLMUL = partialLMULAttr.getInt();
+  const int64_t rawLMUL = lhsLMULAttr.getInt();
   auto lmul = [](int64_t eighths) {
     if (eighths < 8)
       return std::string("mf") + std::to_string(8 / eighths);
@@ -2505,9 +2605,8 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   };
   const std::string partialSuffix = "i16" + lmul(partialLMUL);
   const std::string partialType = "vint16" + lmul(partialLMUL) + "_t";
-  const std::string rawSuffix = "u8" + lmul(std::max<int64_t>(1, partialLMUL / 2));
-  const std::string rawType =
-      "vuint8" + lmul(std::max<int64_t>(1, partialLMUL / 2)) + "_t";
+  const std::string rawSuffix = "u8" + lmul(rawLMUL);
+  const std::string rawType = "vuint8" + lmul(rawLMUL) + "_t";
   std::string partial = fresh("pair_partial");
   line(partialType + " " + partial + " = __riscv_vmv_v_x_" + partialSuffix +
        "(0, " + laneVL() + ");");
@@ -2515,21 +2614,23 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
     const std::string logical = "(" + base + " + " + groupIndex + " * " +
                                 std::to_string(mac.group) + " + " +
                                 std::to_string(term) + ")";
-    const std::string bit = "(" + std::to_string(lhsField->bitOffset) + " + " +
-                            logical + " * " +
-                            std::to_string(lhsInteger.getWidth()) +
-                            ")";
+    auto fragment =
+        singleStorageFragment(*lhsField, logical, lhsInteger.getWidth());
+    if (!fragment)
+      return mac.sourceOperation->emitError(
+                 "selected grouped MAC field layout has no single-byte mapping"),
+             mlir::failure();
     line("if (" + groupIndex + " * " + std::to_string(mac.group) + " + " +
          std::to_string(term) + " < " + point.point.active + ") {");
     ++indent;
     std::string packed = fresh("q_packed");
     line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
-         lhsOwner.recordPointer + " + (" + bit + " / 8) * " +
+         lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
          std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
     std::string q = fresh("q_value");
     line(rawType + " " + q + " = __riscv_vand_vx_" + rawSuffix + "(" +
-         "__riscv_vsrl_vx_" + rawSuffix + "(" + packed + ", " + bit +
-         " % 8, " + laneVL() + "), " +
+         "__riscv_vsrl_vx_" + rawSuffix + "(" + packed + ", " +
+         fragment->shift + ", " + laneVL() + "), " +
          std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " + laneVL() +
          ");");
     const std::string x = "*(const int8_t *)(" + rhsOwner.recordPointer + " + " +
@@ -2553,36 +2654,71 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   return resultBinding;
 }
 
-Binding Emitter::emitQuantDot(mlir::Value result, mlir::Value lhsValue,
-                              const Binding &lhs,
-                              const Binding &rhs) {
+mlir::FailureOr<Binding>
+Emitter::emitQuantDot(kernel::DotOp operation, const Binding &lhs,
+                      const Binding &rhs) {
   Binding resultBinding;
+  if (lhs.kind != Binding::Kind::Field ||
+      rhs.kind != Binding::Kind::DeferredFold)
+    return operation.emitError(
+               "selected encoded dot requires one field and one ordered pair fold"),
+           mlir::failure();
+  mlir::DictionaryAttr selected = assigned(operation.getOperation());
+  auto local = selected.getAs<mlir::DictionaryAttr>("local_operation");
+  auto instruction = local ? local.getAs<mlir::StringAttr>("instruction")
+                           : mlir::StringAttr();
+  auto accumulatorSEW =
+      local ? local.getAs<mlir::IntegerAttr>("accumulator_sew")
+            : mlir::IntegerAttr();
+  auto accumulatorLMUL =
+      local ? local.getAs<mlir::IntegerAttr>("accumulator_lmul_eighths")
+            : mlir::IntegerAttr();
+  auto groupCount = local ? local.getAs<mlir::IntegerAttr>("group_count")
+                          : mlir::IntegerAttr();
+  auto rhsPairs =
+      local ? local.getAs<mlir::IntegerAttr>("rhs_pairs_per_group")
+            : mlir::IntegerAttr();
+  if (!instruction || instruction.getValue() != "rvv.vmacc" ||
+      !accumulatorSEW || accumulatorSEW.getInt() != 32 || !accumulatorLMUL ||
+      !groupCount || !rhsPairs)
+    return operation.emitError(
+               "selected encoded dot has no complete local operation"),
+           mlir::failure();
   const Binding &lhsOwner = bindings.lookup(lhs.field.owner);
   const Binding &foldInput = bindings.lookup(rhs.input);
+  if (foldInput.kind != Binding::Kind::Field)
+    return operation.emitError("selected ordered pair fold lost its encoded field"),
+           mlir::failure();
   const Binding &rhsOwner = bindings.lookup(foldInput.field.owner);
   auto lhsField = fieldFor(lhs);
   auto rhsField = fieldFor(foldInput);
   if (!lhsField || !rhsField)
-    return resultBinding;
-  const std::string i32Suffix = "i32" +
-      vectorSuffix(result).substr(vectorSuffix(result).find('m'));
-  const std::string i32Type = "vint32" +
-      vectorSuffix(result).substr(vectorSuffix(result).find('m')) + "_t";
+    return operation.emitError("selected encoded dot has incomplete memory edges"),
+           mlir::failure();
+  auto lmul = [](int64_t eighths) {
+    if (eighths < 8)
+      return std::string("mf") + std::to_string(8 / eighths);
+    return std::string("m") + std::to_string(eighths / 8);
+  };
+  const std::string i32Suffix = "i32" + lmul(accumulatorLMUL.getInt());
+  const std::string i32Type =
+      "vint32" + lmul(accumulatorLMUL.getInt()) + "_t";
   std::string acc = fresh("min_acc");
   line(i32Type + " " + acc + " = __riscv_vmv_v_x_" + i32Suffix + "(0, " +
        laneVL() + ");");
   std::string index = fresh("min_group");
-  const int64_t count = lhsField->shape.empty() ? 1 : lhsField->shape.back();
   line("for (size_t " + index + " = 0; " + index + " < " +
-       std::to_string(count) + "; ++" + index + ") {");
+       std::to_string(groupCount.getInt()) + "; ++" + index + ") {");
   ++indent;
   Binding indexed = lhs;
   indexed.field.index.reset();
-    Binding m8 = emitInterleavedField(lhsValue, indexed, index);
+  Binding m8 = emitInterleavedField(operation.getLhs(), indexed, index);
   if (m8.kind != Binding::Kind::Vector) {
     --indent;
     line("}");
-    return {};
+    return operation.emitError(
+               "selected encoded dot could not materialize its lhs field mapping"),
+           mlir::failure();
   }
   std::string m32 = fresh("min_scale");
   std::string u32Suffix = i32Suffix;
@@ -2590,19 +2726,21 @@ Binding Emitter::emitQuantDot(mlir::Value result, mlir::Value lhsValue,
   line(i32Type + " " + m32 + " = __riscv_vreinterpret_v_" + u32Suffix + "_" +
        i32Suffix + "(__riscv_vzext_vf4_" + u32Suffix + "(" + m8.parts.front() +
        ", " + laneVL() + "));" );
-  const std::string bsum = "((int32_t)weft_load_i16_le(" + rhsOwner.recordPointer +
-                           " + " + std::to_string(rhsField->bitOffset / 8) +
-                           " + 2 * (2 * " + index + ")) + (int32_t)weft_load_i16_le(" +
-                           rhsOwner.recordPointer + " + " +
-                           std::to_string(rhsField->bitOffset / 8) +
-                           " + 2 * (2 * " + index + " + 1)))";
+  const std::string pairCount = std::to_string(rhsPairs.getInt());
+  const std::string bsum =
+      "((int32_t)weft_load_i16_le(" + rhsOwner.recordPointer + " + " +
+      std::to_string(rhsField->bitOffset / 8) + " + 2 * (" + pairCount + " * " +
+      index + ")) + (int32_t)weft_load_i16_le(" + rhsOwner.recordPointer + " + " +
+      std::to_string(rhsField->bitOffset / 8) + " + 2 * (" + pairCount + " * " +
+      index + " + 1)))";
   line(acc + " = __riscv_vmacc_vx_" + i32Suffix + "(" + acc + ", " + bsum +
        ", " + m32 + ", " + laneVL() + ");");
   --indent;
   line("}");
   std::string converted = fresh("min_term");
-  line(vectorType(result) + " " + converted + " = __riscv_vfcvt_f_x_v_" +
-       vectorSuffix(result) + "(" + acc + ", " + laneVL() + ");");
+  line(vectorType(operation.getResult()) + " " + converted +
+       " = __riscv_vfcvt_f_x_v_" + vectorSuffix(operation.getResult()) + "(" +
+       acc + ", " + laneVL() + ");");
   resultBinding.kind = Binding::Kind::Vector;
   resultBinding.parts.push_back(std::move(converted));
   return resultBinding;
@@ -2664,6 +2802,14 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
       denseAddress(sourceBinding.slice, {{axes[0], i}, {axes[1], j}});
   if (!source)
     return fail(materialize, "local pack source has no address relation");
+  mlir::DictionaryAttr local =
+      assigned(materialize.getOperation()).getAs<mlir::DictionaryAttr>(
+          "local_operation");
+  int64_t laneAxis =
+      riscv_internal::integer(local, "lane_axis").value_or(0);
+  if (laneAxis <= 0)
+    return fail(materialize,
+                "selected local pack has no operation-owned lane axis");
   const bool laneFirst = axes[0] == laneAxis;
   const bool laneSecond = axes[1] == laneAxis;
   std::string destination;
@@ -2707,7 +2853,18 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
   llvm::StringRef realization =
       riscv_internal::string(selected, "realization").value_or("");
   if (realization.starts_with("matrix.")) {
-    if (!realization.starts_with("matrix.spacemit-ime1-i4i8-mma.m1n16k32"))
+    auto local = selected.getAs<mlir::DictionaryAttr>("local_operation");
+    llvm::StringRef instruction =
+        riscv_internal::string(local, "instruction").value_or("");
+    int64_t mFactor = riscv_internal::integer(local, "m_factor").value_or(0);
+    int64_t nFactor = riscv_internal::integer(local, "n_factor").value_or(0);
+    int64_t kFactor = riscv_internal::integer(local, "k_factor").value_or(0);
+    int64_t interleaveRows =
+        riscv_internal::integer(local, "interleave_rows").value_or(0);
+    llvm::StringRef resultSuffix =
+        riscv_internal::string(local, "result_vector_suffix").value_or("");
+    if (instruction != "spacemit-ime1-i4i8-mma" || mFactor != 1 ||
+        nFactor != 16 || kFactor != 32)
       return fail(&operation,
                   "intrinsic-C emitter has no leaf for the selected matrix realization");
     if (lhs.kind != Binding::Kind::Field || rhs.kind != Binding::Kind::Field ||
@@ -2719,7 +2876,8 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
     auto lhsField = fieldFor(lhs);
     auto rhsField = fieldFor(rhs);
     if (!lhsField || !rhsField || lhsOwner.kind != Binding::Kind::Record ||
-        rhsOwner.kind != Binding::Kind::Record || lhsOwner.interleaveRows != 16)
+        rhsOwner.kind != Binding::Kind::Record ||
+        lhsOwner.interleaveRows != interleaveRows)
       return fail(&operation,
                   "selected IME fragment requires a rows=16 derived encoding");
     const Binding &point = bindings.lookup(*lhs.field.index);
@@ -2729,11 +2887,9 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
         point.point.active != rhsPoint.point.active)
       return fail(&operation,
                   "selected IME fragment operands do not share one reduction point");
-    if (riscv_internal::integer(assignment.getTarget(), "vlen_bits").value_or(0) !=
-            256 ||
-        vectorSuffix(resultValue) != "i32m2")
+    if (vectorSuffix(resultValue) != resultSuffix)
       return fail(&operation,
-                  "selected IME m1n16k32 leaf requires VLEN256 and an i32m2 result");
+                  "selected IME leaf result does not match its assigned value representation");
     auto encoding = encodings.find(lhsOwner.encodingFamily);
     if (encoding == encodings.end())
       return fail(&operation, "selected IME fragment encoding family is unavailable");
@@ -2759,6 +2915,7 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
   if (lhs.kind != Binding::Kind::Slice || rhs.kind != Binding::Kind::Slice)
     return fail(&operation, "dense contraction requires admitted memory slices");
   auto resultType = mlir::cast<kernel::ValueType>(resultValue.getType());
+  const int64_t laneAxis = laneAxisFor(resultValue);
   int64_t reductionAxis = -1;
   llvm::ArrayRef<int64_t> over;
   if (auto contract = mlir::dyn_cast<kernel::ContractOp>(operation))
@@ -2846,7 +3003,8 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
   Binding region = bindings.lookup(operation.getRegion());
   if (region.kind == Binding::Kind::Field) {
     auto field = fieldFor(region);
-    if (!field || field->bitOffset % 8 || field->packing != "natural")
+    if (!field || field->bitOffset % 8 ||
+        layoutKind(field->layouts) != "natural")
       return fail(operation,
                   "encoded field commit currently requires a byte-aligned natural field");
     Binding record = bindings.lookup(region.field.owner);
@@ -2933,10 +3091,12 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
   if (value.kind != Binding::Kind::Vector)
     return fail(operation, "dense commit has no selected numeric handoff");
   size_t laneDimension =
-      llvm::find(memory.memory.axes, laneAxis) - memory.memory.axes.begin();
+      llvm::find(memory.memory.axes, laneAxisFor(operation.getValue())) -
+      memory.memory.axes.begin();
   if (laneDimension >= memory.memory.axes.size())
     return fail(operation, "commit destination has no selected lane axis");
   int64_t nonLaneAxis = -1;
+  const int64_t laneAxis = laneAxisFor(operation.getValue());
   for (int64_t axis : memory.memory.axes)
     if (axis != laneAxis)
       nonLaneAxis = axis;

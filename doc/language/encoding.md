@@ -1,6 +1,6 @@
 # Encoding 与 View
 
-Encoding 只描述内存位布局。它不携带字段不变量，不提供解码等价关系，也不授权编译器重建、删除或替换字段。
+Encoding 只描述逻辑字段坐标到 storage unit/bit range 的映射。它不携带字段不变量，不提供解码等价关系，也不授权编译器重建、删除或替换字段。
 
 ## 基础编码
 
@@ -11,19 +11,29 @@ class Example:
     alignment = 16
     header: u16
     reserved = padding(2, value=0)
-    lo: u4[16] @ nibble(lo_first)
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
 ```
 
-字段按源码顺序布局。canonical declaration 明确保留：
+字段按源码顺序占据 storage span；只有显式属于同一个 `joined` 组合的字段可以共享 span。字段内部不再默认使用 `bit_offset + i * width`。作者组合：
+
+- `natural`：连续自然元素；
+- `grouped(N)`：每 N 个逻辑元素重复一次布局；
+- `layered(P, order)`：组内每 P 个元素一层，同一位置共享一个 storage unit 的不同 bit range；
+- `joined(group, fields, low_bits, order)`：多个同形逻辑字段共享规则化 storage，后半字段 bits 分层回填；
+- 后续由真实消费者闭合的 `bit_planes`：独立 storage plane 的纯 bit 重组。
+
+canonical declaration 明确保留：
 
 - 字节内 bit order；
 - byte order；
-- 每个字段的 dtype、shape、packing、bit offset 与 storage bits；
+- 每个字段的 dtype、shape、storage span 与结构化 layout expression；
 - encoding alignment；
 - padding 的 bit offset、宽度和填充值；
 - 整个对象的 storage bits 与 layout identity。
 
-`nibble(lo_first/hi_first)` 只适用于四位字段。相邻字段若使用相同的 `packed(n)`，它们必须合计恰好填满 `n` 字节；因此 Q4_K 的 `sc` 与 `m` 共同占据连续的 12 字节，而不是依赖 C bit-field ABI。
+Q4_0 的 q 使用 `grouped(32) @ layered(16, lo_first)`；Q4_K 的 q 使用 `grouped(64) @ layered(32, lo_first)`。二者 storage 大小相同于线性 nibble array，但逻辑索引映射不同。Q8 字段保持 `natural`。
+
+Q4_K 的 `sc/m` 使用相同的 `joined(4, 2, 4, lo_first)` 并共享 12 bytes。该词只规定 bit 的规则化重组，不包含 scale/min 数学；禁止把它退化成两个连续 `u6[8]` bit streams。
 
 `View[Encoding, shape]` 是使用该编码的内存对象；`View[f32, (M, N)]` 由前端生成固定 identity 的 dense encoding 特例。
 

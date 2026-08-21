@@ -8,7 +8,7 @@ Weft 作者编写一棵有层归属的有限位宽计算树。树的叶子是带
 
 ```text
 @weft.kernel                 一个前端可降为 canonical Kernel IR 的入口函数
-@weft.encoding               一个纯内存布局声明
+@weft.encoding               逻辑字段坐标到 storage bits 的纯布局映射
 @weft.derive                 一个 build/load 阶段的编码类型生成器
 View[Encoding, shape]        带编码的内存对象
 L.rows/cols/tiles/blocks/subs

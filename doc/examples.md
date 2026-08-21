@@ -4,7 +4,7 @@
 
 | 入口 | 同语言源码 | 主要约束 |
 |---|---|---|
-| `quantization/q4_k_gemv.py` | `std/encodings.py`、`std/quant.py` | pure encoding、derive、三层位宽、min 支路、`ds` 的 block 层位置、嵌套 handoff |
+| `quantization/q4_k_gemv.py` | `std/encodings.py`、`std/quant.py` | grouped/layered q layout、joined K-scale layout、derive、三层位宽、min 支路、`ds` 的 block 层位置、嵌套 handoff |
 | `dense/gemm.py` | `std/dense.py::gemm` | NC/KC/MC/MR/NR/KB 层、staged panel、KC-scope accumulator |
 | `dense/gemv.py` | `std/dense.py::gemv` | GEMM 的一维退化，使用普通 `contract` 而非新原语 |
 | `attention/flash_attention.py` | `std/attention.py` | staged query、三个 state、非归约 handoff、顺序性来自 use-def |

@@ -7,12 +7,13 @@ from weft.language import (
     byteorder,
     f16,
     f32,
+    grouped,
     i8,
     i16,
     interleave,
+    joined,
+    layered,
     lo_first,
-    nibble,
-    packed,
     u4,
     u6,
 )
@@ -23,9 +24,16 @@ class Q4_K:
     layout = bitorder.lsb_first, byteorder.little
     d: f16
     dmin: f16
-    sc: u6[8] @ packed(12)
-    m: u6[8] @ packed(12)
-    q: u4[256] @ nibble(lo_first)
+    sc: u6[8] @ joined(4, 2, 4, lo_first)
+    m: u6[8] @ joined(4, 2, 4, lo_first)
+    q: u4[256] @ grouped(64) @ layered(32, lo_first)
+
+
+@weft.encoding
+class Q4_0:
+    layout = bitorder.lsb_first, byteorder.little
+    d: f16
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
 
 
 @weft.encoding
