@@ -118,8 +118,6 @@ public:
       bool hasVectorLane = laneAxes && llvm::any_of(
                                             laneAxes.asArrayRef(),
                                             [](int64_t axis) { return axis > 0; });
-      bool hasPipelineLoop = pipelineLevel != "not-applicable";
-      bool hasPrefetchSource = !prefetchSources.empty();
       llvm::SmallVector<int64_t> groups;
       if (auto cohorts = domains.getAs<mlir::DenseI64ArrayAttr>("cohort")) {
         for (int64_t cohort : cohorts.asArrayRef())
@@ -136,23 +134,13 @@ public:
           riscv_internal::integers(builder, groups));
       domains = riscv_internal::set(
           domains, "prefetch_distance",
-          riscv_internal::integers(builder,
-                                   hasVectorLane && hasPipelineLoop &&
-                                           hasPrefetchSource
-                                       ? llvm::SmallVector<int64_t>{0, 1, 2}
-                                       : llvm::SmallVector<int64_t>{0}));
+          riscv_internal::integers(builder, llvm::SmallVector<int64_t>{0}));
       domains = riscv_internal::set(
           domains, "pipeline_depth",
-          riscv_internal::integers(builder,
-                                   hasVectorLane && hasPipelineLoop
-                                       ? llvm::SmallVector<int64_t>{1, 2}
-                                       : llvm::SmallVector<int64_t>{1}));
+          riscv_internal::integers(builder, llvm::SmallVector<int64_t>{1}));
       domains = riscv_internal::set(
           domains, "unroll",
-          riscv_internal::integers(builder,
-                                   hasVectorLane && hasPipelineLoop
-                                       ? llvm::SmallVector<int64_t>{1, 2, 4}
-                                       : llvm::SmallVector<int64_t>{1}));
+          riscv_internal::integers(builder, llvm::SmallVector<int64_t>{1}));
       domains = riscv_internal::set(
           domains, "spill",
           riscv_internal::strings(
@@ -189,7 +177,7 @@ public:
       constraints.push_back(
           "lmul x live register-bundles + buffers <= architectural groups");
       constraints.push_back(
-          "pipeline-depth and unroll feed back into operand-buffer pressure");
+          "current intrinsic-C schedule fixes pipeline-depth=1, unroll=1, prefetch=0");
       constraints.push_back(
           "spill is a selected local representation, never an emitter surprise");
       problem.setValuesAttr(builder.getArrayAttr(liveValues));

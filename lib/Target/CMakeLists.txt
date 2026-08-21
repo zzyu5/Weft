@@ -6,6 +6,7 @@ add_library(WeftRISCVTarget STATIC
   RISCVConstrainInstructions.cpp
   RISCVConstrainResources.cpp
   RISCVSolve.cpp
+  RISCVIntrinsicC.cpp
   RISCVCompiler.cpp
 )
 

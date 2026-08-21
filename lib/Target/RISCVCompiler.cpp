@@ -2,6 +2,7 @@
 
 #include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
 #include "Weft/Target/RISCVPasses.h"
+#include "RISCVIntrinsicC.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/PassManager.h"
@@ -10,6 +11,18 @@
 #include <string>
 
 namespace {
+
+mlir::LogicalResult runPlanning(mlir::ModuleOp module,
+                                weft::RISCVCompilerOptions options) {
+  mlir::PassManager manager(module.getContext());
+  manager.enableVerifier(true);
+  manager.addPass(weft::createConstructRISCVProblemsPass(std::move(options)));
+  manager.addPass(weft::createConstrainRISCVRepresentationsPass());
+  manager.addPass(weft::createConstrainRISCVInstructionsPass());
+  manager.addPass(weft::createConstrainRISCVResourcesPass());
+  manager.addPass(weft::createSolveRISCVProblemsPass());
+  return manager.run(module);
+}
 
 void printDictionary(llvm::raw_ostream &output, mlir::DictionaryAttr dictionary,
                      llvm::StringRef indent) {
@@ -70,24 +83,12 @@ void printAssignment(llvm::raw_ostream &output,
   }
 }
 
-} // namespace
-
-mlir::FailureOr<weft::RISCVPlanningResult>
-weft::planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
-  mlir::PassManager manager(module.getContext());
-  manager.enableVerifier(true);
-  manager.addPass(createConstructRISCVProblemsPass(options));
-  manager.addPass(createConstrainRISCVRepresentationsPass());
-  manager.addPass(createConstrainRISCVInstructionsPass());
-  manager.addPass(createConstrainRISCVResourcesPass());
-  manager.addPass(createSolveRISCVProblemsPass());
-  if (mlir::failed(manager.run(module)))
-    return mlir::failure();
-
-  RISCVPlanningResult result;
-  llvm::raw_string_ostream output(result.assignment);
+mlir::FailureOr<std::string> assignmentText(mlir::ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream output(text);
   bool found = false;
-  for (riscv::AssignmentOp assignment : module.getOps<riscv::AssignmentOp>()) {
+  for (weft::riscv::AssignmentOp assignment :
+       module.getOps<weft::riscv::AssignmentOp>()) {
     if (found)
       output << "\n---\n\n";
     printAssignment(output, assignment);
@@ -98,5 +99,35 @@ weft::planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
     return mlir::failure();
   }
   output.flush();
+  return text;
+}
+
+} // namespace
+
+mlir::FailureOr<weft::RISCVPlanningResult>
+weft::planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
+  mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
+  if (mlir::failed(runPlanning(*working, std::move(options))))
+    return mlir::failure();
+  mlir::FailureOr<std::string> text = assignmentText(*working);
+  if (mlir::failed(text))
+    return mlir::failure();
+  RISCVPlanningResult result;
+  result.assignment = std::move(*text);
+  return result;
+}
+
+mlir::FailureOr<weft::RISCVCompilationResult>
+weft::compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
+  mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
+  if (mlir::failed(runPlanning(*working, std::move(options))))
+    return mlir::failure();
+  mlir::FailureOr<std::string> text = assignmentText(*working);
+  if (mlir::failed(text))
+    return mlir::failure();
+  RISCVCompilationResult result;
+  result.assignment = std::move(*text);
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+    return mlir::failure();
   return result;
 }

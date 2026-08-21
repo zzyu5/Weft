@@ -21,11 +21,22 @@ struct RISCVPlanningResult {
   std::string assignment;
 };
 
+struct RISCVCompilationResult {
+  std::string assignment;
+  std::string intrinsicC;
+};
+
 /// Build and solve the transient RISC-V representation problem. The input is
 /// canonical Kernel IR. Physical problem/assignment operations exist only for
 /// this invocation and are not accepted as source authority.
 mlir::FailureOr<RISCVPlanningResult>
 planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
+
+/// Solve the transient physical problem and mechanically emit the selected
+/// intrinsic-C program. Canonical Kernel IR remains the semantic source;
+/// AssignmentOp is the sole source of target choices.
+mlir::FailureOr<RISCVCompilationResult>
+compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
 } // namespace weft
 

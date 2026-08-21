@@ -739,7 +739,10 @@ mlir::DictionaryAttr levelMapping(
       riscv_internal::string(domain->second, "domain_multiplicity").value_or("");
   llvm::StringRef tail =
       riscv_internal::string(domain->second, "domain_tail").value_or("");
-  bool lane = axis == solution.laneAxis;
+  auto physicalPartition = resolvePartition(partition, solution.candidate);
+  bool lane = axis == solution.laneAxis &&
+              (relation == "rows" || relation == "cols") &&
+              physicalPartition && *physicalPartition == solution.lanesPerGroup;
   return riscv_internal::dictionary(
       builder,
       {{"axis", builder.getI64IntegerAttr(axis)},
@@ -776,6 +779,7 @@ mlir::ArrayAttr assignedOperations(mlir::Builder &builder,
     llvm::SmallVector<std::pair<llvm::StringRef, mlir::Attribute>> fields{
         {"id", operation.get("id")},
         {"source_op", operation.get("name")},
+        {"source_attributes", operation.get("source_attributes")},
         {"realization",
          builder.getStringAttr(realizationFor(
              operation, values, problem.getResourceModel(), solution))},

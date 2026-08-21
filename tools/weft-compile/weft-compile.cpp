@@ -24,7 +24,7 @@ llvm::cl::opt<std::string> inputFilename(
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
 llvm::cl::opt<std::string> emitKind(
-    "emit", llvm::cl::desc("kernel-ir or physical-assignment"),
+    "emit", llvm::cl::desc("kernel-ir, physical-assignment, or intrinsic-c"),
     llvm::cl::init("physical-assignment"));
 llvm::cl::opt<std::string> march("march", llvm::cl::desc("RISC-V ISA string"));
 llvm::cl::opt<std::string> abi("abi", llvm::cl::desc("RISC-V ABI"));
@@ -61,7 +61,8 @@ bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Weft RISC-V representation compiler\n");
-  if (emitKind != "kernel-ir" && emitKind != "physical-assignment") {
+  if (emitKind != "kernel-ir" && emitKind != "physical-assignment" &&
+      emitKind != "intrinsic-c") {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
   }
@@ -111,11 +112,19 @@ int main(int argc, char **argv) {
     }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
-    mlir::FailureOr<weft::RISCVPlanningResult> result =
-        weft::planRISCVModule(*module, std::move(options));
-    if (mlir::failed(result))
-      return 1;
-    output.os() << result->assignment;
+    if (emitKind == "physical-assignment") {
+      mlir::FailureOr<weft::RISCVPlanningResult> result =
+          weft::planRISCVModule(*module, std::move(options));
+      if (mlir::failed(result))
+        return 1;
+      output.os() << result->assignment;
+    } else {
+      mlir::FailureOr<weft::RISCVCompilationResult> result =
+          weft::compileRISCVModule(*module, std::move(options));
+      if (mlir::failed(result))
+        return 1;
+      output.os() << result->intrinsicC;
+    }
   }
   output.keep();
   return 0;

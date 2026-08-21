@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <sg2044|k1> <q4_k_gemv|q4_k_gemv_groups4|q4_k_gemv_ime|gemv_f32|gemm_f32> <repetitions>" >&2
+  exit 2
+fi
+
+target=$1
+kernel=$2
+repetitions=$3
+project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+compiler="${project_root}/build/tools/weft-compile/weft-compile"
+
+case "${target}" in
+  sg2044)
+    remote_host=rvv
+    remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
+    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_cpu=48
+    march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
+    vlen=128
+    extra_cflags=
+    link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
+    runtime_target_define=
+    ;;
+  k1)
+    remote_host=k1
+    remote_cc=/usr/bin/clang-18
+    remote_cxx=/usr/bin/clang++-18
+    remote_cpu=3
+    march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
+    vlen=256
+    extra_cflags=-fno-integrated-as
+    link_path=/usr/lib/riscv64-linux-gnu
+    runtime_target_define=-DWEFT_TARGET_K1=1
+    ;;
+  *)
+    echo "unsupported Weft target: ${target}" >&2
+    exit 2
+    ;;
+esac
+
+meta=()
+matrix_extension=none
+runtime_kernel_define=
+case "${kernel}" in
+  q4_k_gemv)
+    dsl=examples/kernels/quantization/q4_k_gemv.py
+    runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
+    ;;
+  q4_k_gemv_groups4)
+    dsl=examples/kernels/quantization/q4_k_gemv_groups4.py
+    runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
+    runtime_kernel_define=-DWEFT_Q4_GROUPS4=1
+    ;;
+  q4_k_gemv_ime)
+    if [[ ${target} != k1 ]]; then
+      echo "q4_k_gemv_ime requires target k1" >&2
+      exit 2
+    fi
+    dsl=examples/kernels/quantization/q4_k_gemv_ime.py
+    runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
+    matrix_extension=spacemit-ime1
+    runtime_kernel_define=-DWEFT_Q4_IME=1
+    ;;
+  gemv_f32)
+    dsl=examples/kernels/dense/gemv.py
+    runtime=examples/repro/weft/gemv_runtime.cpp
+    meta=(--meta MR=4 --meta KB=64)
+    ;;
+  gemm_f32)
+    dsl=examples/kernels/dense/gemm.py
+    runtime=examples/repro/weft/gemm_runtime.cpp
+    meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+    ;;
+  *)
+    echo "unsupported Weft kernel: ${kernel}" >&2
+    exit 2
+    ;;
+esac
+
+local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
+cleanup_local() {
+  status=$?
+  trap - EXIT
+  find "${local_root}" -depth -delete
+  exit "${status}"
+}
+trap cleanup_local EXIT
+
+PYTHONPATH="${project_root}/python" python -m weft "${project_root}/${dsl}" \
+  > "${local_root}/kernel.mlir"
+"${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
+  --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
+  --matrix-extension="${matrix_extension}" \
+  -o "${local_root}/kernel.c"
+cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
+
+printf -v repetitions_argument '%q' "${repetitions}"
+printf -v cc_argument '%q' "${remote_cc}"
+printf -v cxx_argument '%q' "${remote_cxx}"
+printf -v cpu_argument '%q' "${remote_cpu}"
+printf -v march_argument '%q' "${march}"
+printf -v extra_cflags_argument '%q' "${extra_cflags}"
+printf -v link_path_argument '%q' "${link_path}"
+printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
+printf -v runtime_kernel_define_argument '%q' "${runtime_kernel_define}"
+
+tar -C "${local_root}" -cf - kernel.c runtime.cpp |
+  ssh "${remote_host}" "
+    set -eu
+    remote_root=\$(mktemp -d /tmp/weft-kernel.XXXXXX)
+    cleanup() {
+      exit_status=\$?
+      trap - EXIT
+      find \"\${remote_root}\" -depth -delete
+      exit \"\${exit_status}\"
+    }
+    trap cleanup EXIT
+    tar -C \"\${remote_root}\" -xf -
+    cd \"\${remote_root}\"
+    cc=${cc_argument}
+    cxx=${cxx_argument}
+    cpu=${cpu_argument}
+    march=${march_argument}
+    extra_cflags=${extra_cflags_argument}
+    link_path=${link_path_argument}
+    runtime_target_define=${runtime_target_define_argument}
+    runtime_kernel_define=${runtime_kernel_define_argument}
+    \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \${extra_cflags} \
+      -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
+    \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+      \${extra_cflags} \${runtime_target_define} \${runtime_kernel_define} \
+      -march=\"\${march}\" -mabi=lp64d \
+      runtime.cpp kernel.o \
+      -L\"\${link_path}\" -Wl,-rpath,\"\${link_path}\" -o runtime
+    exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
+  "

@@ -1,0 +1,260 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern "C" {
+#if defined(WEFT_Q4_IME)
+std::size_t q4_k_q8_k_gemv_ime_W_packed_size(std::size_t M, std::size_t K);
+void q4_k_q8_k_gemv_ime_W_pack(const std::uint8_t *source,
+                                std::uint8_t *target, std::size_t M,
+                                std::size_t K);
+void q4_k_q8_k_gemv_ime(const std::uint8_t *W, const std::uint8_t *X, float *Y,
+                        std::size_t M, std::size_t K);
+#elif defined(WEFT_Q4_GROUPS4)
+std::size_t q4_k_q8_k_gemv_groups4_W_packed_size(std::size_t M,
+                                                 std::size_t K);
+void q4_k_q8_k_gemv_groups4_W_pack(const std::uint8_t *source,
+                                    std::uint8_t *target, std::size_t M,
+                                    std::size_t K);
+void q4_k_q8_k_gemv_groups4(const std::uint8_t *W, const std::uint8_t *X,
+                            float *Y, std::size_t M, std::size_t K);
+#else
+std::size_t q4_k_q8_k_gemv_W_packed_size(std::size_t M, std::size_t K);
+void q4_k_q8_k_gemv_W_pack(const std::uint8_t *source, std::uint8_t *target,
+                            std::size_t M, std::size_t K);
+void q4_k_q8_k_gemv(const std::uint8_t *W, const std::uint8_t *X, float *Y,
+                    std::size_t M, std::size_t K);
+#endif
+}
+
+#if defined(WEFT_Q4_IME)
+#define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_ime_W_packed_size
+#define WEFT_Q4_PACK q4_k_q8_k_gemv_ime_W_pack
+#define WEFT_Q4_KERNEL q4_k_q8_k_gemv_ime
+#define WEFT_Q4_KERNEL_NAME "q4_k_q8_k_gemv_ime"
+#elif defined(WEFT_Q4_GROUPS4)
+#define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_groups4_W_packed_size
+#define WEFT_Q4_PACK q4_k_q8_k_gemv_groups4_W_pack
+#define WEFT_Q4_KERNEL q4_k_q8_k_gemv_groups4
+#define WEFT_Q4_KERNEL_NAME "q4_k_q8_k_gemv_groups4"
+#else
+#define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_W_packed_size
+#define WEFT_Q4_PACK q4_k_q8_k_gemv_W_pack
+#define WEFT_Q4_KERNEL q4_k_q8_k_gemv
+#define WEFT_Q4_KERNEL_NAME "q4_k_q8_k_gemv"
+#endif
+
+#if defined(WEFT_TARGET_K1)
+#define WEFT_TARGET_NAME "K1/X60"
+#else
+#define WEFT_TARGET_NAME "SG2044"
+#endif
+
+namespace {
+
+constexpr std::size_t kM = 14336;
+constexpr std::size_t kK = 4096;
+constexpr std::size_t kQ4RecordBytes = 144;
+constexpr std::size_t kQ8RecordBytes = 292;
+constexpr std::size_t kBlock = 256;
+constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
+
+volatile std::uint64_t flush_sink = 0;
+
+void put_bits(std::uint8_t *record, std::size_t bit_offset, unsigned width,
+              std::uint32_t value) {
+  for (unsigned bit = 0; bit < width; ++bit) {
+    const std::size_t position = bit_offset + bit;
+    const std::uint8_t mask = static_cast<std::uint8_t>(1U << (position & 7U));
+    if ((value >> bit) & 1U) {
+      record[position >> 3U] |= mask;
+    } else {
+      record[position >> 3U] &= static_cast<std::uint8_t>(~mask);
+    }
+  }
+}
+
+std::uint32_t get_bits(const std::uint8_t *record, std::size_t bit_offset,
+                       unsigned width) {
+  std::uint32_t value = 0;
+  for (unsigned bit = 0; bit < width; ++bit) {
+    const std::size_t position = bit_offset + bit;
+    value |= static_cast<std::uint32_t>(
+                 (record[position >> 3U] >> (position & 7U)) & 1U)
+             << bit;
+  }
+  return value;
+}
+
+void store_f16(std::uint8_t *target, _Float16 value) {
+  std::memcpy(target, &value, sizeof(value));
+}
+
+void store_f32(std::uint8_t *target, float value) {
+  std::memcpy(target, &value, sizeof(value));
+}
+
+std::size_t parse_repetitions(const char *text) {
+  char *end = nullptr;
+  const unsigned long value = std::strtoul(text, &end, 10);
+  return *text != '\0' && *end == '\0' && value != 0
+             ? static_cast<std::size_t>(value)
+             : 0;
+}
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const std::size_t middle = values.size() / 2;
+  return values.size() & 1U ? values[middle]
+                            : 0.5 * (values[middle - 1] + values[middle]);
+}
+
+void evict_cache(std::vector<std::uint8_t> &buffer) {
+  for (std::size_t offset = 0; offset < buffer.size(); offset += 64) {
+    buffer[offset] = static_cast<std::uint8_t>(buffer[offset] + 1U);
+    flush_sink += buffer[offset];
+  }
+}
+
+void initialize_q4(std::vector<std::uint8_t> &weights) {
+  const std::size_t blocks = kK / kBlock;
+  for (std::size_t row = 0; row < kM; ++row) {
+    for (std::size_t block = 0; block < blocks; ++block) {
+      std::uint8_t *record =
+          weights.data() + (row * blocks + block) * kQ4RecordBytes;
+      store_f16(record, static_cast<_Float16>(0.5F));
+      store_f16(record + 2, static_cast<_Float16>(0.25F));
+      for (std::size_t group = 0; group < 8; ++group) {
+        put_bits(record, 32 + group * 6, 6,
+                 static_cast<std::uint32_t>(1 + group % 4));
+        put_bits(record, 80 + group * 6, 6,
+                 static_cast<std::uint32_t>(1 + group % 3));
+      }
+      for (std::size_t element = 0; element < kBlock; ++element) {
+        put_bits(record, 128 + element * 4, 4,
+                 static_cast<std::uint32_t>((row + block + element) & 15U));
+      }
+    }
+  }
+}
+
+void initialize_q8(std::vector<std::uint8_t> &activation) {
+  const std::size_t blocks = kK / kBlock;
+  for (std::size_t block = 0; block < blocks; ++block) {
+    std::uint8_t *record = activation.data() + block * kQ8RecordBytes;
+    store_f32(record, 0.5F);
+    auto *values = reinterpret_cast<std::int8_t *>(record + 4);
+    for (std::size_t element = 0; element < kBlock; ++element) {
+      values[element] = static_cast<std::int8_t>(
+          static_cast<int>((block + element) % 15U) - 7);
+    }
+    for (std::size_t group = 0; group < 16; ++group) {
+      std::int16_t sum = 0;
+      for (std::size_t element = 0; element < 16; ++element) {
+        sum = static_cast<std::int16_t>(sum + values[group * 16 + element]);
+      }
+      std::memcpy(record + 260 + group * 2, &sum, sizeof(sum));
+    }
+  }
+}
+
+float reference_row(const std::uint8_t *weights, const std::uint8_t *activation,
+                    std::size_t row) {
+  const std::size_t blocks = kK / kBlock;
+  float result = 0.0F;
+  for (std::size_t block = 0; block < blocks; ++block) {
+    const std::uint8_t *w =
+        weights + (row * blocks + block) * kQ4RecordBytes;
+    const std::uint8_t *x = activation + block * kQ8RecordBytes;
+    _Float16 d16;
+    _Float16 dmin16;
+    float ds;
+    std::memcpy(&d16, w, sizeof(d16));
+    std::memcpy(&dmin16, w + 2, sizeof(dmin16));
+    std::memcpy(&ds, x, sizeof(ds));
+    std::int32_t scaled = 0;
+    for (std::size_t group = 0; group < 8; ++group) {
+      std::int32_t partial = 0;
+      for (std::size_t element = 0; element < 32; ++element) {
+        const std::int32_t q = static_cast<std::int32_t>(
+            get_bits(w, 128 + (group * 32 + element) * 4, 4));
+        const std::int32_t v = static_cast<std::int8_t>(x[4 + group * 32 + element]);
+        partial += q * v;
+      }
+      scaled += partial * static_cast<std::int32_t>(
+                              get_bits(w, 32 + group * 6, 6));
+    }
+    std::int32_t minimum = 0;
+    for (std::size_t group = 0; group < 8; ++group) {
+      std::int16_t first;
+      std::int16_t second;
+      std::memcpy(&first, x + 260 + 4 * group, sizeof(first));
+      std::memcpy(&second, x + 262 + 4 * group, sizeof(second));
+      minimum += static_cast<std::int32_t>(get_bits(w, 80 + group * 6, 6)) *
+                 static_cast<std::int32_t>(first + second);
+    }
+    const float scale_term = static_cast<float>(d16) * static_cast<float>(scaled);
+    const float min_term = static_cast<float>(dmin16) * static_cast<float>(minimum);
+    result += ds * (scale_term - min_term);
+  }
+  return result;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: %s <repetitions>\n", argv[0]);
+    return 2;
+  }
+  const std::size_t repetitions = parse_repetitions(argv[1]);
+  if (repetitions == 0) {
+    std::fprintf(stderr, "repetitions must be positive\n");
+    return 2;
+  }
+  const std::size_t blocks = kK / kBlock;
+  std::vector<std::uint8_t> source_weights(kM * blocks * kQ4RecordBytes, 0);
+  std::vector<std::uint8_t> activation(blocks * kQ8RecordBytes, 0);
+  initialize_q4(source_weights);
+  initialize_q8(activation);
+  std::vector<std::uint8_t> packed(
+      WEFT_Q4_PACKED_SIZE(kM, kK));
+  WEFT_Q4_PACK(source_weights.data(), packed.data(), kM, kK);
+  std::vector<float> output(kM, 0.0F);
+  WEFT_Q4_KERNEL(packed.data(), activation.data(), output.data(), kM, kK);
+  for (std::size_t row = 0; row < kM; ++row) {
+    const float expected = reference_row(source_weights.data(), activation.data(), row);
+    if (std::memcmp(&expected, &output[row], sizeof(float)) != 0) {
+      std::fprintf(stderr,
+                   "numeric mismatch row=%zu expected=%.9g actual=%.9g\n", row,
+                   expected, output[row]);
+      return 1;
+    }
+  }
+  std::vector<std::uint8_t> flush(kFlushBytes, 1);
+  std::vector<double> samples;
+  samples.reserve(repetitions);
+  for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
+    evict_cache(flush);
+    const auto begin = std::chrono::steady_clock::now();
+    WEFT_Q4_KERNEL(packed.data(), activation.data(), output.data(), kM, kK);
+    const auto end = std::chrono::steady_clock::now();
+    samples.push_back(
+        std::chrono::duration<double, std::micro>(end - begin).count());
+  }
+  const double median_us = median(samples);
+  const double operations = 2.0 * static_cast<double>(kM) * kK;
+  std::printf("kernel=%s\n", WEFT_Q4_KERNEL_NAME);
+  std::printf("target=%s\nM=%zu\nK=%zu\n", WEFT_TARGET_NAME, kM, kK);
+  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("cold_median_us=%.3f\n", median_us);
+  std::printf("cold_gop_s=%.6f\n", operations / median_us / 1.0e3);
+  std::printf("output_sample=%.9g\n", output.front());
+  return 0;
+}
