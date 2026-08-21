@@ -8,6 +8,9 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -36,22 +39,66 @@ llvm::cl::opt<std::string> matrixExtension(
     llvm::cl::desc("Target matrix extension: none or spacemit-ime1"),
     llvm::cl::init("none"));
 llvm::cl::list<std::string> metaBindings(
-    "meta", llvm::cl::desc("Auto specialization binding NAME=INTEGER"),
+    "meta", llvm::cl::desc("Auto specialization choices NAME=INTEGER[,INTEGER...]"),
     llvm::cl::ZeroOrMore);
+llvm::cl::list<int64_t> autoUnroll(
+    "auto-unroll", llvm::cl::desc("Level-local unroll choices"),
+    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
+llvm::cl::list<int64_t> autoPipelineDepth(
+    "auto-pipeline-depth", llvm::cl::desc("Level-local pipeline depth choices"),
+    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
+llvm::cl::list<int64_t> autoPrefetchDistance(
+    "auto-prefetch-distance", llvm::cl::desc("Level-local prefetch distance choices"),
+    llvm::cl::CommaSeparated, llvm::cl::ZeroOrMore);
 
-bool parseMetaBindings(llvm::StringMap<int64_t> &result) {
+bool parseMetaBindings(
+    llvm::StringMap<llvm::SmallVector<int64_t, 4>> &result) {
   for (llvm::StringRef spelling : metaBindings) {
     auto [name, valueSpelling] = spelling.split('=');
-    int64_t value = 0;
-    if (name.empty() || valueSpelling.empty() ||
-        valueSpelling.getAsInteger(0, value) || value <= 0) {
+    if (name.empty() || valueSpelling.empty()) {
       llvm::errs() << "invalid --meta binding: " << spelling << "\n";
       return false;
     }
-    if (!result.try_emplace(name, value).second) {
+    llvm::SmallVector<int64_t, 4> values;
+    llvm::SmallSet<int64_t, 8> seen;
+    llvm::SmallVector<llvm::StringRef, 4> spellings;
+    valueSpelling.split(spellings, ',', -1, true);
+    for (llvm::StringRef valueText : spellings) {
+      int64_t value = 0;
+      if (valueText.getAsInteger(0, value) || value <= 0) {
+        llvm::errs() << "invalid --meta binding: " << spelling << "\n";
+        return false;
+      }
+      if (seen.insert(value).second)
+        values.push_back(value);
+    }
+    if (values.empty()) {
+      llvm::errs() << "invalid --meta binding: " << spelling << "\n";
+      return false;
+    }
+    if (!result.try_emplace(name, std::move(values)).second) {
       llvm::errs() << "duplicate --meta binding: " << name << "\n";
       return false;
     }
+  }
+  return true;
+}
+
+bool assignChoices(llvm::cl::list<int64_t> &source,
+                   llvm::SmallVectorImpl<int64_t> &destination,
+                   llvm::StringRef option, bool allowZero) {
+  if (source.empty())
+    return true;
+  llvm::SmallSet<int64_t, 8> seen;
+  destination.clear();
+  for (int64_t value : source) {
+    if (value < 0 || (!allowZero && value == 0)) {
+      llvm::errs() << "--" << option << " contains an invalid value: " << value
+                   << "\n";
+      return false;
+    }
+    if (seen.insert(value).second)
+      destination.push_back(value);
   }
   return true;
 }
@@ -112,6 +159,17 @@ int main(int argc, char **argv) {
     }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
+    if (!assignChoices(autoUnroll, options.unrollChoices, "auto-unroll", false) ||
+        !assignChoices(autoPipelineDepth, options.pipelineDepthChoices,
+                       "auto-pipeline-depth", false) ||
+        !assignChoices(autoPrefetchDistance, options.prefetchDistanceChoices,
+                       "auto-prefetch-distance", true))
+      return 1;
+    if (llvm::any_of(options.pipelineDepthChoices,
+                     [](int64_t value) { return value > 2; })) {
+      llvm::errs() << "--auto-pipeline-depth currently supports only 1 or 2\n";
+      return 1;
+    }
     if (emitKind == "physical-assignment") {
       mlir::FailureOr<weft::RISCVPlanningResult> result =
           weft::planRISCVModule(*module, std::move(options));

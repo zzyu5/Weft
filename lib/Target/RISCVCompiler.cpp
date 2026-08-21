@@ -55,6 +55,9 @@ void printAssignment(llvm::raw_ostream &output,
          {"source", "physical_kind", "physical_encoding_kind", "physical_sew",
           "lane_axis", "physical_lanes", "stream_parts", "lmul", "vl",
           "register_groups", "storage", "materialization",
+          "representation_chain", "sew_derived_from", "lanes_derived_from",
+          "lmul_derived_from", "vl_derived_from", "representation_users",
+          "materialization_derived_from",
           "handoff_class", "live_start", "live_end",
           "encoding_family", "base_encoding_family", "layout_identity",
           "interleave_rows"})
@@ -74,8 +77,9 @@ void printAssignment(llvm::raw_ostream &output,
            << " -> "
            << mlir::cast<mlir::StringAttr>(operation.get("realization")).getValue()
            << '\n';
-    for (llvm::StringRef key : {"validity", "memory_edge", "local_operation",
-                                "co_reduce_partner", "level_mapping", "schedule"})
+    for (llvm::StringRef key : {"validity", "representation_transfer", "memory_edge",
+                                "local_operation", "co_reduce_partner",
+                                "level_mapping", "schedule_level", "schedule"})
       if (mlir::Attribute field = operation.get(key)) {
         output << "    " << key << " = ";
         field.print(output);

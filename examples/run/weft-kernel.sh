@@ -41,6 +41,17 @@ case "${target}" in
     ;;
 esac
 
+physical_auto=()
+if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
+  physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
+fi
+if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
+  physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
+if [[ -n ${WEFT_AUTO_PREFETCH_DISTANCE:-} ]]; then
+  physical_auto+=(--auto-prefetch-distance "${WEFT_AUTO_PREFETCH_DISTANCE}")
+fi
+
 meta=()
 matrix_extension=none
 runtime_kernel_define=
@@ -95,6 +106,14 @@ case "${kernel}" in
     ;;
 esac
 
+if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
+  meta=()
+  IFS=';' read -r -a requested_meta <<< "${WEFT_META_BINDINGS}"
+  for binding in "${requested_meta[@]}"; do
+    [[ -n ${binding} ]] && meta+=(--meta "${binding}")
+  done
+fi
+
 local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
 cleanup_local() {
   status=$?
@@ -108,6 +127,7 @@ PYTHONPATH="${project_root}/python" python -m weft "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
+  "${physical_auto[@]}" \
   --matrix-extension="${matrix_extension}" \
   -o "${local_root}/kernel.c"
 cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"

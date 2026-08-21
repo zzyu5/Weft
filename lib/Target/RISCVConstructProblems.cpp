@@ -298,13 +298,13 @@ collectAutoDimensions(kernel::KernelOp kernel,
         continue;
       }
       auto binding = options.metaBindings.find(choice);
-      if (binding == options.metaBindings.end() || binding->second <= 0) {
+      if (binding == options.metaBindings.end() || binding->second.empty()) {
         operation.emitError()
             << "auto parameter '" << choice
-            << "' requires one positive --meta binding in this invocation";
+            << "' requires positive --meta choices in this invocation";
         return mlir::WalkResult::interrupt();
       }
-      dimension.choices.push_back(binding->second);
+      dimension.choices.append(binding->second.begin(), binding->second.end());
     }
     dimensions.push_back(std::move(dimension));
     return mlir::WalkResult::advance();
@@ -314,31 +314,110 @@ collectAutoDimensions(kernel::KernelOp kernel,
   return dimensions;
 }
 
+bool isSchedulableLocalOperation(mlir::DictionaryAttr operation) {
+  llvm::StringRef engine =
+      riscv_internal::string(operation, "engine").value_or("");
+  if (engine != "wide" && engine != "matrix")
+    return false;
+  llvm::StringRef name =
+      riscv_internal::string(operation, "name").value_or("");
+  return name != "weft_kernel.admit" && name != "weft_kernel.commit" &&
+         name != "weft_kernel.materialize" &&
+         name != "weft_kernel.stage_handoff";
+}
+
+llvm::SmallVector<std::string>
+collectLeafScheduleLevels(mlir::ArrayAttr operations) {
+  llvm::SmallSet<std::string, 8> localLevels;
+  llvm::SmallSet<std::string, 8> enclosingLevels;
+  for (mlir::Attribute attribute : operations) {
+    auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+    if (!isSchedulableLocalOperation(operation))
+      continue;
+    auto path = operation.getAs<mlir::ArrayAttr>("level_path");
+    if (!path || path.empty())
+      continue;
+    for (size_t index = 0; index + 1 < path.size(); ++index)
+      enclosingLevels.insert(
+          mlir::cast<mlir::StringAttr>(path[index]).getValue().str());
+    localLevels.insert(
+        mlir::cast<mlir::StringAttr>(path[path.size() - 1]).getValue().str());
+  }
+  llvm::SmallVector<std::string> result;
+  for (const std::string &level : localLevels)
+    if (!enclosingLevels.contains(level))
+      result.push_back(level);
+  llvm::sort(result);
+  return result;
+}
+
+struct CandidateBindings {
+  llvm::StringMap<int64_t> source;
+  llvm::StringMap<int64_t> schedule;
+};
+
+void expandScheduleDimension(
+    llvm::SmallVectorImpl<CandidateBindings> &bindings, llvm::StringRef level,
+    llvm::StringRef parameter, llvm::ArrayRef<int64_t> choices) {
+  llvm::SmallVector<CandidateBindings> expanded;
+  const std::string key = (level + "." + parameter).str();
+  for (const CandidateBindings &binding : bindings)
+    for (int64_t choice : choices) {
+      CandidateBindings next = binding;
+      next.schedule[key] = choice;
+      expanded.push_back(std::move(next));
+    }
+  bindings.assign(std::make_move_iterator(expanded.begin()),
+                  std::make_move_iterator(expanded.end()));
+}
+
 mlir::ArrayAttr instantiateCandidates(
     mlir::Builder &builder, kernel::KernelOp kernel,
-    llvm::ArrayRef<AutoDimension> dimensions) {
-  llvm::SmallVector<llvm::StringMap<int64_t>> bindings(1);
+    llvm::ArrayRef<AutoDimension> dimensions,
+    llvm::ArrayRef<std::string> scheduleLevels,
+    const RISCVCompilerOptions &options) {
+  llvm::SmallVector<CandidateBindings> bindings(1);
   for (const AutoDimension &dimension : dimensions) {
-    llvm::SmallVector<llvm::StringMap<int64_t>> expanded;
-    for (const llvm::StringMap<int64_t> &binding : bindings)
+    llvm::SmallVector<CandidateBindings> expanded;
+    for (const CandidateBindings &binding : bindings)
       for (int64_t choice : dimension.choices) {
-        llvm::StringMap<int64_t> next = binding;
-        next[dimension.name] = choice;
+        CandidateBindings next = binding;
+        next.source[dimension.name] = choice;
         expanded.push_back(std::move(next));
       }
     bindings = std::move(expanded);
   }
+  for (llvm::StringRef level : scheduleLevels) {
+    expandScheduleDimension(bindings, level, "unroll", options.unrollChoices);
+    expandScheduleDimension(bindings, level, "pipeline_depth",
+                            options.pipelineDepthChoices);
+    expandScheduleDimension(bindings, level, "prefetch_distance",
+                            options.prefetchDistanceChoices);
+  }
   llvm::SmallVector<mlir::Attribute> candidates;
   for (auto [index, binding] : llvm::enumerate(bindings)) {
     llvm::SmallVector<mlir::NamedAttribute> concrete;
-    for (const auto &entry : binding)
+    for (const auto &entry : binding.source)
       concrete.push_back(builder.getNamedAttr(
           entry.getKey(), builder.getI64IntegerAttr(entry.getValue())));
+    llvm::SmallVector<mlir::NamedAttribute> schedule;
+    for (llvm::StringRef level : scheduleLevels) {
+      llvm::SmallVector<mlir::NamedAttribute> parameters;
+      for (llvm::StringRef parameter :
+           {"unroll", "pipeline_depth", "prefetch_distance"}) {
+        const std::string key = (level + "." + parameter).str();
+        parameters.push_back(builder.getNamedAttr(
+            parameter, builder.getI64IntegerAttr(binding.schedule.lookup(key))));
+      }
+      schedule.push_back(builder.getNamedAttr(
+          level, builder.getDictionaryAttr(parameters)));
+    }
     candidates.push_back(riscv_internal::dictionary(
         builder,
         {{"id", builder.getStringAttr("candidate" + std::to_string(index))},
          {"specialization", builder.getStringAttr(kernel.getSymName())},
-         {"auto_bindings", builder.getDictionaryAttr(concrete)}}));
+         {"auto_bindings", builder.getDictionaryAttr(concrete)},
+         {"schedule_bindings", builder.getDictionaryAttr(schedule)}}));
   }
   return builder.getArrayAttr(candidates);
 }
@@ -396,7 +475,10 @@ public:
         signalPassFailure();
         return;
       }
-      mlir::ArrayAttr candidates = instantiateCandidates(builder, kernel, *dimensions);
+      llvm::SmallVector<std::string> scheduleLevels =
+          collectLeafScheduleLevels(collector.operationAttributes());
+      mlir::ArrayAttr candidates = instantiateCandidates(
+          builder, kernel, *dimensions, scheduleLevels, *options);
       for (mlir::Attribute attribute : candidates) {
         auto candidate = mlir::cast<mlir::DictionaryAttr>(attribute);
         mlir::OperationState state(kernel.getLoc(),

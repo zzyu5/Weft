@@ -5,6 +5,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
@@ -14,7 +15,10 @@ namespace weft {
 
 struct RISCVCompilerOptions {
   RISCVTargetProfile target;
-  llvm::StringMap<int64_t> metaBindings;
+  llvm::StringMap<llvm::SmallVector<int64_t, 4>> metaBindings;
+  llvm::SmallVector<int64_t, 4> unrollChoices{1};
+  llvm::SmallVector<int64_t, 4> pipelineDepthChoices{1};
+  llvm::SmallVector<int64_t, 4> prefetchDistanceChoices{0};
 };
 
 struct RISCVPlanningResult {

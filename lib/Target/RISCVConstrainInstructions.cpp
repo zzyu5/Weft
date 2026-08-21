@@ -325,6 +325,7 @@ public:
       }
 
       llvm::SmallVector<mlir::Attribute> operations;
+      llvm::StringMap<mlir::DictionaryAttr> memoryEdgesByValue;
       bool legal = true;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
@@ -348,7 +349,11 @@ public:
                   mlir::cast<mlir::StringAttr>(operands[0]).getValue());
               auto result = values.find(
                   mlir::cast<mlir::StringAttr>(results[0]).getValue());
-              if (lhs == values.end() || result == values.end()) {
+              const EncodingFieldFacts *rhsField = fieldFactsForValue(
+                  mlir::cast<mlir::StringAttr>(operands[1]).getValue(),
+                  producers, values, encodings);
+              if (lhs == values.end() || result == values.end() || !rhsField ||
+                  firstLayoutKind(rhsField->layouts) != "natural") {
                 legal = false;
               } else {
                 localOperation = riscv_internal::dictionary(
@@ -361,6 +366,8 @@ public:
                      {"partial_sew", builder.getI64IntegerAttr(16)},
                      {"partial_layout",
                       builder.getStringAttr("group-major")},
+                     {"rhs_access",
+                      builder.getStringAttr("natural-scalar-field")},
                      {"decision_owner", builder.getStringAttr("operation")}});
               }
             }
@@ -503,9 +510,33 @@ public:
         } else if (name == "weft_kernel.admit" || name == "weft_kernel.commit") {
           realization = name == "weft_kernel.admit" ? "transfer.rvv.load"
                                                      : "transfer.rvv.store";
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          llvm::StringRef transferredId;
+          if (name == "weft_kernel.admit" && results && !results.empty())
+            transferredId = mlir::cast<mlir::StringAttr>(results[0]).getValue();
+          else if (name == "weft_kernel.commit" && operands && !operands.empty())
+            transferredId = mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+          auto transferred = values.find(transferredId);
+          llvm::StringRef physical =
+              transferred == values.end()
+                  ? llvm::StringRef()
+                  : riscv_internal::string(transferred->second, "physical_kind")
+                        .value_or("");
+          llvm::StringRef form =
+              physical == "encoded-record" ? "record-address"
+              : physical.starts_with("rvv") ? "runtime-strided"
+                                             : "scalar-address";
           memoryEdge = riscv_internal::dictionary(
               builder,
-              {{"form", builder.getStringAttr("unit-stride")},
+              {{"form", builder.getStringAttr(form)},
+               {"stride_source",
+                builder.getStringAttr(physical.starts_with("rvv")
+                                          ? "runtime View stride on selected lane axis"
+                                          : "not-applicable")},
+               {"derived_from",
+                builder.getStringAttr(
+                    "typed transfer value; concrete View stride is a runtime edge fact")},
                {"decision_owner", builder.getStringAttr("memory-edge")}});
         } else if (name == "weft_kernel.field") {
           auto source = operation.getAs<mlir::DictionaryAttr>("source_attributes");
@@ -572,7 +603,79 @@ public:
                    {"raw_sew", builder.getI64IntegerAttr(8)},
                    {"raw_lmul_eighths",
                     builder.getI64IntegerAttr(rawLMUL)},
+                   {"form", builder.getStringAttr("field-layout-definition")},
+                   {"interleave_rows",
+                    builder.getI64IntegerAttr(
+                        owner == values.end()
+                            ? 0
+                            : riscv_internal::integer(owner->second,
+                                                      "interleave_rows")
+                                  .value_or(0))},
+                   {"derived_from",
+                    builder.getStringAttr(
+                        "encoding declaration; concrete access belongs to each extract")},
                    {"decision_owner", builder.getStringAttr("memory-edge")}});
+            }
+          }
+        } else if (name == "weft_kernel.extract") {
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          if (!operands || operands.empty() || !results || results.size() != 1) {
+            legal = false;
+          } else {
+            llvm::StringRef input =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            auto inherited = memoryEdgesByValue.find(input);
+            if (inherited != memoryEdgesByValue.end()) {
+              memoryEdge = inherited->second;
+              auto result = values.find(
+                  mlir::cast<mlir::StringAttr>(results[0]).getValue());
+              int64_t laneAxis =
+                  result == values.end()
+                      ? 0
+                      : riscv_internal::integer(result->second, "lane_axis")
+                            .value_or(0);
+              int64_t resultSEW =
+                  result == values.end()
+                      ? 0
+                      : riscv_internal::integer(result->second, "physical_sew")
+                            .value_or(0);
+              int64_t resultLMUL =
+                  result == values.end()
+                      ? 0
+                      : riscv_internal::integer(result->second, "lmul_eighths")
+                            .value_or(0);
+              int64_t rows =
+                  riscv_internal::integer(memoryEdge, "interleave_rows")
+                      .value_or(0);
+              auto layout = memoryEdge.getAs<mlir::ArrayAttr>("layout");
+              llvm::StringRef layoutKind = firstLayoutKind(layout);
+              llvm::StringRef form =
+                  laneAxis > 0 && rows > 0 && layoutKind == "grouped"
+                      ? "unit-stride-layered-unpack"
+                  : laneAxis > 0 && rows > 0 && layoutKind == "joined"
+                      ? "unit-stride-multi-load-join"
+                  : laneAxis > 0 && rows > 0
+                      ? "unit-stride-interleaved"
+                  : layoutKind == "joined" ? "scalar-multi-load-join"
+                                            : "scalar-indexed";
+              memoryEdge = riscv_internal::set(
+                  memoryEdge, "form", builder.getStringAttr(form));
+              if (laneAxis > 0 && resultSEW > 0 && resultLMUL > 0)
+                memoryEdge = riscv_internal::set(
+                    memoryEdge, "raw_lmul_eighths",
+                    builder.getI64IntegerAttr(
+                        std::max<int64_t>(1, resultLMUL * 8 / resultSEW)));
+              memoryEdge = riscv_internal::set(
+                  memoryEdge, "access_value",
+                  mlir::cast<mlir::StringAttr>(results[0]));
+              memoryEdge = riscv_internal::set(
+                  memoryEdge, "derived_from",
+                  builder.getStringAttr(
+                      "this extract selector + encoding mapping + selected lane axis"));
+              realization = "encoded-access." + form.str();
+            } else {
+              realization = "mapped-local-extract";
             }
           }
         } else if (name == "weft_kernel.widen") {
@@ -657,6 +760,11 @@ public:
           operation = riscv_internal::set(operation, "local_operation",
                                           localOperation);
         operations.push_back(operation);
+        if (memoryEdge)
+          if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+            for (mlir::Attribute result : results)
+              memoryEdgesByValue[mlir::cast<mlir::StringAttr>(result).getValue()] =
+                  memoryEdge;
       }
       if (!legal) {
         invalidate(problem, builder,

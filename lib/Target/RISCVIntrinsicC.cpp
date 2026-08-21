@@ -215,9 +215,12 @@ public:
       return mlir::failure();
     line("void " + identifier(kernel.getSymName()) + "(" + *arguments + ") {");
     ++indent;
-    for (mlir::Attribute symbol : kernel.getShapeSymbols())
-      line("(void)" + identifier(mlir::cast<mlir::StringAttr>(symbol).getValue()) +
-           ";");
+    for (mlir::Attribute symbol : kernel.getShapeSymbols()) {
+      llvm::StringRef name =
+          mlir::cast<mlir::StringAttr>(symbol).getValue();
+      if (!autoBindings.contains(name))
+        line("(void)" + identifier(name) + ";");
+    }
     if (mlir::failed(initializeKernelArguments()))
       return mlir::failure();
     if (mlir::failed(compileBlock(kernel.getBody().front(), {})))
@@ -892,6 +895,22 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
   }
   const std::string suffix = vectorSuffix(result);
   const std::string type = vectorType(result);
+  mlir::Operation *transfer = result.getDefiningOp();
+  if (auto fresh = mlir::dyn_cast_or_null<kernel::NewOp>(transfer);
+      fresh && fresh.getInitialized())
+    transfer = fresh.getInitial().getDefiningOp();
+  mlir::DictionaryAttr selected = assigned(transfer);
+  auto edge = selected
+                  ? selected.getAs<mlir::DictionaryAttr>("memory_edge")
+                  : mlir::DictionaryAttr();
+  llvm::StringRef memoryForm =
+      edge ? riscv_internal::string(edge, "form").value_or("")
+           : llvm::StringRef();
+  if (memoryForm != "unit-stride" && memoryForm != "runtime-strided") {
+    result.getDefiningOp()->emitError(
+        "dense load has no pass-selected unit or runtime-strided memory form");
+    return mlir::failure();
+  }
   const int64_t streams = streamPartCount(result);
   const int64_t totalParts = count * streams;
   for (int64_t part = 0; part < totalParts; ++part) {
@@ -907,8 +926,7 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
       return mlir::failure();
     }
     std::string expression;
-    if (laneDimension < memory.strides.size() &&
-        memory.strides[laneDimension] == "1")
+    if (memoryForm == "unit-stride")
       expression = "__riscv_vle" + std::to_string(sew) + "_v_" + suffix +
                    "(" + *address + ", " + partVL(result, part) + ")";
     else
@@ -1520,6 +1538,14 @@ mlir::LogicalResult Emitter::compileField(kernel::FieldOp operation) {
 mlir::LogicalResult Emitter::compileExtract(kernel::ExtractOp operation) {
   Binding binding = bindings.lookup(operation.getInput());
   if (binding.kind == Binding::Kind::Field) {
+    mlir::DictionaryAttr selected = assigned(operation.getOperation());
+    auto memoryEdge = selected
+                          ? selected.getAs<mlir::DictionaryAttr>("memory_edge")
+                          : mlir::DictionaryAttr();
+    if (!memoryEdge)
+      return fail(operation,
+                  "encoded extract has no pass-selected per-use memory edge");
+    binding.field.memoryEdge = memoryEdge;
     size_t cursor = 0;
     for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
       llvm::StringRef selector =
@@ -2557,9 +2583,24 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   auto partialSEWAttr =
       local ? local.getAs<mlir::IntegerAttr>("partial_sew")
             : mlir::IntegerAttr();
+  auto rhsAccess =
+      local ? local.getAs<mlir::StringAttr>("rhs_access") : mlir::StringAttr();
+  auto schedule = selected.getAs<mlir::DictionaryAttr>("schedule");
+  int64_t unroll =
+      schedule ? riscv_internal::integer(schedule, "unroll").value_or(0) : 0;
+  int64_t pipelineDepth =
+      schedule
+          ? riscv_internal::integer(schedule, "pipeline_depth").value_or(0)
+          : 0;
+  int64_t prefetchDistance =
+      schedule
+          ? riscv_internal::integer(schedule, "prefetch_distance").value_or(-1)
+          : -1;
   if (!instruction || instruction.getValue() != "rvv.vwmaccsu" ||
       !lhsLMULAttr || !partialLMULAttr || !partialSEWAttr ||
-      partialSEWAttr.getInt() != 16)
+      partialSEWAttr.getInt() != 16 || unroll <= 0 || pipelineDepth <= 0 ||
+      prefetchDistance < 0 || !rhsAccess ||
+      rhsAccess.getValue() != "natural-scalar-field")
     return mac.sourceOperation->emitError(
                "grouped MAC has no complete selected local operation"),
            mlir::failure();
@@ -2594,7 +2635,7 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
        "(0, " + laneVL() + ");");
   const std::string groupIndex = fresh("mac_group");
   line("for (size_t " + groupIndex + " = 0; " + groupIndex + " < " + groups +
-       "; ++" + groupIndex + ") {");
+       "; " + groupIndex + " += " + std::to_string(unroll) + ") {");
   ++indent;
   const int64_t partialLMUL = partialLMULAttr.getInt();
   const int64_t rawLMUL = lhsLMULAttr.getInt();
@@ -2607,45 +2648,144 @@ Emitter::emitGroupedMacReduction(mlir::Value result, const Binding &mac) {
   const std::string partialType = "vint16" + lmul(partialLMUL) + "_t";
   const std::string rawSuffix = "u8" + lmul(rawLMUL);
   const std::string rawType = "vuint8" + lmul(rawLMUL) + "_t";
-  std::string partial = fresh("pair_partial");
-  line(partialType + " " + partial + " = __riscv_vmv_v_x_" + partialSuffix +
-       "(0, " + laneVL() + ");");
-  for (int64_t term = 0; term < mac.group; ++term) {
-    const std::string logical = "(" + base + " + " + groupIndex + " * " +
-                                std::to_string(mac.group) + " + " +
-                                std::to_string(term) + ")";
-    auto fragment =
-        singleStorageFragment(*lhsField, logical, lhsInteger.getWidth());
-    if (!fragment)
-      return mac.sourceOperation->emitError(
-                 "selected grouped MAC field layout has no single-byte mapping"),
-             mlir::failure();
-    line("if (" + groupIndex + " * " + std::to_string(mac.group) + " + " +
-         std::to_string(term) + " < " + point.point.active + ") {");
+  if (prefetchDistance > 0) {
+    const std::string futureGroup =
+        "(" + groupIndex + " + " +
+        std::to_string(unroll * prefetchDistance) + ")";
+    line("if (" + futureGroup + " < " + groups + ") {");
     ++indent;
-    std::string packed = fresh("q_packed");
-    line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
-         lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
-         std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
-    std::string q = fresh("q_value");
-    line(rawType + " " + q + " = __riscv_vand_vx_" + rawSuffix + "(" +
-         "__riscv_vsrl_vx_" + rawSuffix + "(" + packed + ", " +
-         fragment->shift + ", " + laneVL() + "), " +
-         std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " + laneVL() +
-         ");");
-    const std::string x = "*(const int8_t *)(" + rhsOwner.recordPointer + " + " +
-                          std::to_string(rhsField->bitOffset / 8) + " + " + logical +
-                          ")";
-    line(partial + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" + partial +
-         ", " + x + ", " + q + ", " + laneVL() + ");");
+    for (int64_t term = 0; term < mac.group; ++term) {
+      const std::string logical =
+          "(" + base + " + " + futureGroup + " * " +
+          std::to_string(mac.group) + " + " + std::to_string(term) + ")";
+      auto fragment =
+          singleStorageFragment(*lhsField, logical, lhsInteger.getWidth());
+      if (!fragment)
+        return mac.sourceOperation->emitError(
+                   "selected grouped MAC prefetch has no field mapping"),
+               mlir::failure();
+      line("__builtin_prefetch(" + lhsOwner.recordPointer + " + (" +
+           fragment->byte + ") * " + std::to_string(lhsOwner.interleaveRows) +
+           ", 0, 1);");
+      line("__builtin_prefetch(" + rhsOwner.recordPointer + " + " +
+           std::to_string(rhsField->bitOffset / 8) + " + " + logical +
+           ", 0, 1);");
+    }
     --indent;
     line("}");
   }
-  std::string widened = fresh("partial_wide");
-  line(outType + " " + widened + " = __riscv_vwcvt_x_x_v_" + outSuffix + "(" +
-       partial + ", " + laneVL() + ");");
-  line(outName + " = __riscv_vadd_vv_" + outSuffix + "(" + outName + ", " +
-       widened + ", " + laneVL() + ");");
+
+  llvm::SmallVector<std::string> partials;
+  llvm::SmallVector<llvm::SmallVector<std::string>> bufferedQ(unroll);
+  llvm::SmallVector<llvm::SmallVector<std::string>> bufferedX(unroll);
+  llvm::SmallVector<llvm::SmallVector<std::string>> valid(unroll);
+  for (int64_t slot = 0; slot < unroll; ++slot) {
+    std::string partial = fresh("pair_partial");
+    line(partialType + " " + partial + " = __riscv_vmv_v_x_" + partialSuffix +
+         "(0, " + laneVL() + ");");
+    partials.push_back(std::move(partial));
+  }
+
+  auto logicalFor = [&](int64_t slot, int64_t term) {
+    return "(" + base + " + (" + groupIndex + " + " +
+           std::to_string(slot) + ") * " + std::to_string(mac.group) + " + " +
+           std::to_string(term) + ")";
+  };
+  auto conditionFor = [&](int64_t slot, int64_t term) {
+    return "(" + groupIndex + " + " + std::to_string(slot) + " < " + groups +
+           " && (" + groupIndex + " + " + std::to_string(slot) + ") * " +
+           std::to_string(mac.group) + " + " + std::to_string(term) + " < " +
+           point.point.active + ")";
+  };
+  auto fragmentFor = [&](int64_t slot, int64_t term)
+      -> std::optional<StorageFragment> {
+    return singleStorageFragment(*lhsField, logicalFor(slot, term),
+                                 lhsInteger.getWidth());
+  };
+
+  if (pipelineDepth > 1) {
+    for (int64_t slot = 0; slot < unroll; ++slot)
+      for (int64_t term = 0; term < mac.group; ++term) {
+        auto fragment = fragmentFor(slot, term);
+        if (!fragment)
+          return mac.sourceOperation->emitError(
+                     "selected buffered grouped MAC has no field mapping"),
+                 mlir::failure();
+        std::string q = fresh("q_buffer");
+        std::string x = fresh("x_buffer");
+        std::string isValid = fresh("buffer_valid");
+        line(rawType + " " + q + " = __riscv_vmv_v_x_" + rawSuffix +
+             "(0, " + laneVL() + ");");
+        line("int8_t " + x + " = 0;");
+        line("const int " + isValid + " = " + conditionFor(slot, term) + ";");
+        line("if (" + isValid + ") {");
+        ++indent;
+        std::string packed = fresh("q_packed");
+        line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
+             lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
+             std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
+        line(q + " = __riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" +
+             rawSuffix + "(" + packed + ", " + fragment->shift + ", " +
+             laneVL() + "), " +
+             std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " +
+             laneVL() + ");");
+        line(x + " = *(const int8_t *)(" + rhsOwner.recordPointer + " + " +
+             std::to_string(rhsField->bitOffset / 8) + " + " +
+             logicalFor(slot, term) + ");");
+        --indent;
+        line("}");
+        bufferedQ[slot].push_back(std::move(q));
+        bufferedX[slot].push_back(std::move(x));
+        valid[slot].push_back(std::move(isValid));
+      }
+  }
+
+  for (int64_t slot = 0; slot < unroll; ++slot) {
+    for (int64_t term = 0; term < mac.group; ++term) {
+      if (pipelineDepth > 1) {
+        line("if (" + valid[slot][term] + ") " + partials[slot] +
+             " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" + partials[slot] +
+             ", " + bufferedX[slot][term] + ", " + bufferedQ[slot][term] +
+             ", " + laneVL() + ");");
+        continue;
+      }
+      auto fragment = fragmentFor(slot, term);
+      if (!fragment)
+        return mac.sourceOperation->emitError(
+                   "selected grouped MAC field layout has no single-byte mapping"),
+               mlir::failure();
+      line("if (" + conditionFor(slot, term) + ") {");
+      ++indent;
+      std::string packed = fresh("q_packed");
+      line(rawType + " " + packed + " = __riscv_vle8_v_" + rawSuffix + "(" +
+           lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
+           std::to_string(lhsOwner.interleaveRows) + ", " + laneVL() + ");");
+      std::string q = fresh("q_value");
+      line(rawType + " " + q + " = __riscv_vand_vx_" + rawSuffix + "(" +
+           "__riscv_vsrl_vx_" + rawSuffix + "(" + packed + ", " +
+           fragment->shift + ", " + laneVL() + "), " +
+           std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " + laneVL() +
+           ");");
+      const std::string x =
+          "*(const int8_t *)(" + rhsOwner.recordPointer + " + " +
+          std::to_string(rhsField->bitOffset / 8) + " + " +
+          logicalFor(slot, term) + ")";
+      line(partials[slot] + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+           partials[slot] + ", " + x + ", " + q + ", " + laneVL() + ");");
+      --indent;
+      line("}");
+    }
+    line("if (" + groupIndex + " + " + std::to_string(slot) + " < " + groups +
+         ") {");
+    ++indent;
+    std::string widened = fresh("partial_wide");
+    line(outType + " " + widened + " = __riscv_vwcvt_x_x_v_" + outSuffix +
+         "(" + partials[slot] + ", " + laneVL() + ");");
+    line(outName + " = __riscv_vadd_vv_" + outSuffix + "(" + outName + ", " +
+         widened + ", " + laneVL() + ");");
+    --indent;
+    line("}");
+  }
   --indent;
   line("}");
   Binding resultBinding;
@@ -3015,6 +3155,10 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
 mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
   Binding value = bindings.lookup(operation.getValue());
   Binding region = bindings.lookup(operation.getRegion());
+  mlir::DictionaryAttr selected = assigned(operation.getOperation());
+  auto selectedEdge = selected
+                          ? selected.getAs<mlir::DictionaryAttr>("memory_edge")
+                          : mlir::DictionaryAttr();
   if (region.kind == Binding::Kind::Field) {
     auto field = fieldFor(region);
     if (!field || field->bitOffset % 8 ||
@@ -3115,6 +3259,12 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
     if (axis != laneAxis)
       nonLaneAxis = axis;
   const int64_t streams = streamPartCount(operation.getValue());
+  llvm::StringRef memoryForm =
+      selectedEdge ? riscv_internal::string(selectedEdge, "form").value_or("")
+                   : llvm::StringRef();
+  if (memoryForm != "unit-stride" && memoryForm != "runtime-strided")
+    return fail(operation,
+                "dense commit has no pass-selected unit or runtime-strided form");
   for (size_t part = 0; part < value.parts.size(); ++part) {
     const int64_t nonLanePart = static_cast<int64_t>(part) / streams;
     llvm::SmallVector<std::pair<int64_t, std::string>> offsets;
@@ -3132,7 +3282,7 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
     if (!width || !elementType)
       return fail(operation, "vector commit element has no fixed C representation");
     std::string statement;
-    if (memory.memory.strides[laneDimension] == "1")
+    if (memoryForm == "unit-stride")
       statement = "__riscv_vse" + std::to_string(width) + "_v_" + suffix +
                   "(" + *address + ", " +
                   value.parts[part] + ", " +

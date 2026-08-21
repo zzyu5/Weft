@@ -35,11 +35,14 @@ public:
     llvm::StringMap<riscv::ProblemOp> winners;
     llvm::StringMap<int64_t> costs;
     llvm::StringMap<bool> seen;
+    llvm::StringMap<int64_t> evaluatedCounts;
+    llvm::StringMap<int64_t> legalCounts;
     llvm::StringMap<llvm::SmallVector<std::string>> invalidReasons;
 
     for (riscv::ProblemOp problem : module.getOps<riscv::ProblemOp>()) {
       std::string kernel = problem.getKernel().str();
       seen[kernel] = true;
+      ++evaluatedCounts[kernel];
       if (problem.getStage() == "invalid") {
         invalidReasons[kernel].push_back(
             riscv_internal::string(problem.getResources(), "invalid_reason")
@@ -52,6 +55,7 @@ public:
         signalPassFailure();
         return;
       }
+      ++legalCounts[kernel];
       int64_t cost =
           riscv_internal::integer(problem.getResources(), "cost")
               .value_or(std::numeric_limits<int64_t>::max());
@@ -86,7 +90,18 @@ public:
       state.addAttribute("candidate", winner.getCandidate());
       state.addAttribute("values", winner.getValues());
       state.addAttribute("operations", winner.getOperations());
-      state.addAttribute("resources", winner.getResources());
+      mlir::DictionaryAttr resources = winner.getResources();
+      resources = riscv_internal::set(
+          resources, "evaluated_candidate_count",
+          builder.getI64IntegerAttr(evaluatedCounts.lookup(entry.getKey())));
+      resources = riscv_internal::set(
+          resources, "legal_candidate_count",
+          builder.getI64IntegerAttr(legalCounts.lookup(entry.getKey())));
+      resources = riscv_internal::set(
+          resources, "selection_basis",
+          builder.getStringAttr(
+              "static resource cost; build-time tuner measures concrete bindings"));
+      state.addAttribute("resources", resources);
       state.addAttribute("status", builder.getStringAttr("complete"));
       builder.create(state);
     }
