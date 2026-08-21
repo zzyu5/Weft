@@ -638,11 +638,23 @@ mlir::LogicalResult SliceOp::verify() {
 }
 
 mlir::LogicalResult FieldOp::verify() {
-  if (!isLocalValue(getOwner().getType()) ||
-      !isEncoding(logicalElement(getOwner().getType())) || getName().empty())
-    return emitOpError("field access requires a named field of an encoded Value");
-  if (!isLocalValue(getResult().getType()))
-    return emitOpError("field access produces a local Value");
+  mlir::Type owner = getOwner().getType();
+  mlir::Type result = getResult().getType();
+  if ((!isLocalValue(owner) && !isViewLike(owner)) ||
+      !isEncoding(logicalElement(owner)) || getName().empty())
+    return emitOpError(
+        "field access requires a named field of an encoded Value or View region");
+  if (isLocalValue(owner)) {
+    if (!isLocalValue(result) || !isNumeric(result))
+      return emitOpError("encoded Value field access produces a numeric local Value");
+    return mlir::success();
+  }
+  auto resultSlice = mlir::dyn_cast<SliceType>(result);
+  auto resultEncoding = resultSlice
+                            ? mlir::dyn_cast<EncodingType>(resultSlice.getEncoding())
+                            : EncodingType();
+  if (!resultEncoding || resultEncoding.getKind() != "dense")
+    return emitOpError("encoded View field access produces a dense numeric slice");
   return mlir::success();
 }
 
@@ -666,8 +678,11 @@ mlir::LogicalResult UpdateOp::verify() {
 }
 
 mlir::LogicalResult UnaryOp::verify() {
-  if (getInput().getType() != getResult().getType())
+  if (getInput().getType() != getResult().getType() ||
+      !isNumeric(getInput().getType()))
     return emitOpError("unary operation preserves its logical type");
+  if (getKind() != "neg" && getKind() != "abs" && getKind() != "exp")
+    return emitOpError("unknown unary numeric operation");
   return verifyEngine(*this, getEngine(), {"scalar", "wide"});
 }
 
@@ -714,6 +729,18 @@ mlir::LogicalResult CastOp::verify() {
   if (!isNumeric(getInput().getType()) || !isNumeric(getResult().getType()) ||
       !sameDomain(getInput().getType(), getResult().getType()))
     return emitOpError("cast converts numeric elements and preserves the logical domain");
+  auto rounding = (*this)->getAttrOfType<mlir::StringAttr>("rounding");
+  auto saturate = (*this)->getAttrOfType<mlir::BoolAttr>("saturate");
+  if (static_cast<bool>(rounding) != static_cast<bool>(saturate))
+    return emitOpError("rounded narrowing requires both rounding and saturate attributes");
+  if (rounding) {
+    if (rounding.getValue() != "rne" && rounding.getValue() != "rtz" &&
+        rounding.getValue() != "rdn" && rounding.getValue() != "rup")
+      return emitOpError("unknown numeric narrowing rounding mode");
+    if (!mlir::isa<mlir::FloatType>(logicalElement(getInput().getType())) ||
+        !mlir::isa<mlir::IntegerType>(logicalElement(getResult().getType())))
+      return emitOpError("rounded narrowing converts floating values to integers");
+  }
   return verifyEngine(*this, getEngine(), {"scalar", "wide"});
 }
 
@@ -807,10 +834,14 @@ mlir::LogicalResult OuterContractOp::verify() {
 
 mlir::LogicalResult LookupOp::verify() {
   auto index = mlir::dyn_cast<mlir::IntegerType>(logicalElement(getIndices().getType()));
-  if (!isLocalValue(getTable().getType()) || !index)
-    return emitOpError("lookup requires a local table and integer indices");
+  if (!isLocalValue(getTable().getType()) || !isNumeric(getTable().getType()) ||
+      !index || index.isSigned())
+    return emitOpError(
+        "lookup requires a numeric local table and unsigned integer indices");
   if (!sameDomain(getIndices().getType(), getResult().getType()))
     return emitOpError("lookup result must follow the index domain");
+  if (logicalElement(getTable().getType()) != logicalElement(getResult().getType()))
+    return emitOpError("lookup result element type must match the table element type");
   return verifyEngine(*this, getEngine(), {"scalar", "wide"});
 }
 

@@ -11,6 +11,7 @@ from .annotations import (
 )
 from .builtins import (
     L,
+    abs,
     admit,
     commit,
     contract,
@@ -26,6 +27,7 @@ from .builtins import (
     matrix,
     maximum,
     minimum,
+    narrow,
     new,
     outer_contract,
     pack,
@@ -58,6 +60,7 @@ from .dtypes import (
 __all__ = [
     "L",
     "View",
+    "abs",
     "admit",
     "auto",
     "bf16",
@@ -89,6 +92,7 @@ __all__ = [
     "matrix",
     "maximum",
     "minimum",
+    "narrow",
     "new",
     "nibble",
     "outer_contract",

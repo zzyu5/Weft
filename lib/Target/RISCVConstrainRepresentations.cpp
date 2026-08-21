@@ -7,7 +7,9 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringMap.h"
 
 #include <string>
 
@@ -56,26 +58,74 @@ public:
 
       llvm::SmallSet<int64_t, 4> laneAxes;
       llvm::SmallSet<int64_t, 8> cohorts;
+      llvm::DenseMap<int64_t, llvm::SmallVector<kernel::DomainType, 2>>
+          domainsByAxis;
+      llvm::StringMap<mlir::DictionaryAttr> valuesById;
+      for (mlir::Attribute attribute : problem.getValues()) {
+        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+        valuesById[*riscv_internal::string(value, "id")] = value;
+      }
+      auto addPartition = [&](kernel::DomainType domain) {
+        if (auto partition = fixedPartition(domain)) {
+          if (*partition > 1)
+            cohorts.insert(*partition);
+          return;
+        }
+        if (!domain.getPartition().starts_with("auto:"))
+          return;
+        llvm::StringRef name = domain.getPartition().drop_front(5);
+        for (mlir::Attribute candidateAttribute : problem.getCandidates()) {
+          auto candidate = mlir::cast<mlir::DictionaryAttr>(candidateAttribute);
+          auto bindings = candidate.getAs<mlir::DictionaryAttr>("auto_bindings");
+          if (bindings)
+            if (auto value = bindings.getAs<mlir::IntegerAttr>(name);
+                value && value.getInt() > 1)
+              cohorts.insert(value.getInt());
+        }
+      };
       kernel.walk([&](kernel::DomainOp domainOperation) {
         kernel::DomainType domain = domainOperation.getResult().getType();
+        domainsByAxis[domain.getAxisId()].push_back(domain);
         if (domain.getRelation() != "rows" && domain.getRelation() != "cols")
           return;
-        laneAxes.insert(domain.getAxisId());
-        if (auto partition = fixedPartition(domain))
-          cohorts.insert(*partition);
-        else if (domain.getPartition().starts_with("auto:")) {
-          llvm::StringRef name = domain.getPartition().drop_front(5);
-          for (mlir::Attribute candidateAttribute : problem.getCandidates()) {
-            auto candidate =
-                mlir::cast<mlir::DictionaryAttr>(candidateAttribute);
-            auto bindings =
-                candidate.getAs<mlir::DictionaryAttr>("auto_bindings");
-            if (bindings)
-              if (auto value = bindings.getAs<mlir::IntegerAttr>(name))
-              cohorts.insert(value.getInt());
-          }
+        auto partition = fixedPartition(domain);
+        if ((partition && *partition > 1) ||
+            domain.getPartition().starts_with("auto:")) {
+          laneAxes.insert(domain.getAxisId());
+          addPartition(domain);
         }
       });
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        if (riscv_internal::string(operation, "engine").value_or("") != "wide")
+          continue;
+        for (llvm::StringRef key : {"operands", "results"}) {
+          auto ids = operation.getAs<mlir::ArrayAttr>(key);
+          if (!ids)
+            continue;
+          for (mlir::Attribute idAttribute : ids) {
+            auto found = valuesById.find(
+                mlir::cast<mlir::StringAttr>(idAttribute).getValue());
+            if (found == valuesById.end())
+              continue;
+            auto axes = found->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+            if (!axes)
+              continue;
+            for (int64_t axis : axes.asArrayRef()) {
+              auto domains = domainsByAxis.find(axis);
+              if (domains == domainsByAxis.end())
+                continue;
+              for (kernel::DomainType domain : domains->second) {
+                auto partition = fixedPartition(domain);
+                if (partition && *partition <= 1)
+                  continue;
+                laneAxes.insert(axis);
+                addPartition(domain);
+              }
+            }
+          }
+        }
+      }
       if (laneAxes.empty()) {
         laneAxes.insert(-1);
         cohorts.insert(1);
@@ -166,6 +216,8 @@ public:
           domains, "lane_axis", riscv_internal::integers(builder, laneAxisValues));
       domains = riscv_internal::set(
           domains, "cohort", riscv_internal::integers(builder, cohortValues));
+      domains = riscv_internal::set(
+          domains, "lmul_multiplier", riscv_internal::integers(builder, {1, 2}));
       problem.setValuesAttr(builder.getArrayAttr(plannedValues));
       problem.setConstraintsAttr(riscv_internal::strings(builder, constraints));
       problem.setDecisionDomainsAttr(domains);

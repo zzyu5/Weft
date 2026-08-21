@@ -265,6 +265,7 @@ class FrontendCompiler:
         self._declaring_derives: set[str] = set()
         self._slice_info: dict[Value, _SliceInfo] = {}
         self._encoded_axis: dict[Value, int] = {}
+        self._field_record_extent: dict[Value, int] = {}
         self._derive_result: ViewType | None = None
 
     def compile(self) -> str:
@@ -810,7 +811,9 @@ class FrontendCompiler:
             if name not in self.env:
                 raise FrontendError("indexed assignment requires an existing state value", self._location(target))
             current = self.env[name]
-            indices, kinds, _, _ = self._compile_selectors(target.slice, current.type)
+            indices, kinds, _, _ = self._compile_selectors(
+                target.slice, current.type, current
+            )
             updated = self._emit(
                 "weft_kernel.update",
                 target,
@@ -1058,7 +1061,7 @@ class FrontendCompiler:
         owner = self._expect_value(self._compile_expr(expression.value), expression.value)
         owner_element = element_type(owner.type)
         if not isinstance(owner_element, EncodingType):
-            raise FrontendError("field access requires an admitted encoded value", self._location(expression))
+            raise FrontendError("field access requires an encoded Value or View region", self._location(expression))
         info = self._declared_encodings.get(owner_element.family)
         if info is None:
             raise FrontendError(f"encoding {owner_element.family!r} is not declared", self._location(expression))
@@ -1068,15 +1071,44 @@ class FrontendCompiler:
                 f"encoding {owner_element.family!r} has no field {expression.attr!r}",
                 self._location(expression),
             )
-        shape = shape_of(owner.type) + field.shape
+        shape = list(shape_of(owner.type))
         axes = list(axes_of(owner.type))
         record_axis = self._encoded_axis.get(owner)
-        for _ in field.shape:
+        if isinstance(owner.type, (ViewType, SliceType)):
+            slice_info = self._slice_info.get(owner)
+            if info.logical_extent is None or slice_info is None:
+                raise FrontendError(
+                    "encoded View field access requires one explicit record region",
+                    self._location(expression),
+                )
+            for selector in reversed(slice_info.selectors):
+                if isinstance(selector.type, DomainPointType):
+                    if selector.type.domain.partition == str(info.logical_extent) and shape:
+                        record_axis = axes.pop()
+                        shape.pop()
+                        break
             if record_axis is None:
-                record_axis = self._next_axis_id
+                raise FrontendError(
+                    "encoded View field access must select its complete record extent",
+                    self._location(expression),
+                )
+        for field_index, dimension in enumerate(field.shape):
+            field_axis = record_axis if field_index + 1 == len(field.shape) else None
+            if field_axis is None:
+                field_axis = self._next_axis_id
                 self._next_axis_id += 1
-            axes.append(record_axis)
-        result_type = value_type(ScalarType(field.dtype), shape, tuple(axes))
+            if record_axis is None and field_index + 1 == len(field.shape):
+                record_axis = field_axis
+            shape.append(dimension)
+            axes.append(field_axis)
+        if isinstance(owner.type, (ViewType, SliceType)):
+            result_type = SliceType(
+                EncodingType(field.dtype.name, "dense", f"dense.{field.dtype.name}"),
+                tuple(shape),
+                tuple(axes),
+            )
+        else:
+            result_type = value_type(ScalarType(field.dtype), tuple(shape), tuple(axes))
         result = self._emit(
             "weft_kernel.field",
             expression,
@@ -1086,11 +1118,15 @@ class FrontendCompiler:
         )[0]
         if record_axis is not None:
             self._encoded_axis[result] = record_axis
+        if info.logical_extent is not None:
+            self._field_record_extent[result] = info.logical_extent
         return result
 
     def _compile_subscript(self, expression: ast.Subscript) -> Value:
         base = self._expect_value(self._compile_expr(expression.value), expression.value)
-        selectors, kinds, result_shape, result_axes = self._compile_selectors(expression.slice, base.type)
+        selectors, kinds, result_shape, result_axes = self._compile_selectors(
+            expression.slice, base.type, base
+        )
         if isinstance(base.type, (ViewType, SliceType)):
             result_type: ValueType = SliceType(
                 base.type.encoding, result_shape, result_axes
@@ -1116,7 +1152,10 @@ class FrontendCompiler:
         raise FrontendError("only View, slice, or local Value supports indexing", self._location(expression))
 
     def _compile_selectors(
-        self, selector: ast.expr, base_type: ValueType
+        self,
+        selector: ast.expr,
+        base_type: ValueType,
+        base_value: Value | None = None,
     ) -> tuple[list[Value], list[str], tuple[int, ...], tuple[int, ...]]:
         items = list(selector.elts) if isinstance(selector, ast.Tuple) else [selector]
         base_shape = list(shape_of(base_type))
@@ -1160,7 +1199,20 @@ class FrontendCompiler:
                         local_dimension = int(partition)
                     except ValueError:
                         local_dimension = dimension
-                if dimension > 0 and local_dimension > 0 and dimension < local_dimension:
+                record_extent = (
+                    self._field_record_extent.get(base_value)
+                    if base_value is not None
+                    else None
+                )
+                if (
+                    dimension > 0
+                    and record_extent is not None
+                    and dimension < record_extent
+                ) or (
+                    dimension > 0
+                    and local_dimension > 0
+                    and dimension < local_dimension
+                ):
                     kinds.append("group_index")
                 else:
                     kinds.append("domain")
@@ -1361,7 +1413,9 @@ class FrontendCompiler:
     def _intrinsic_commit(self, call: ast.Call) -> None:
         args = self._arguments(call, ("value", "region"), {})
         value = self._expect_value(self._compile_expr(args["value"]), args["value"])
-        region = self._expect_value(self._compile_expr(args["region"]), args["region"])
+        region = self._compile_expr(args["region"])
+        if not isinstance(region, Value):
+            raise FrontendError("commit destination is a View region", self._location(call))
         if not isinstance(region.type, (SliceType, ViewType)):
             raise FrontendError("commit destination is a View region", self._location(call))
         self._emit("weft_kernel.commit", call, operands=(value, region))
@@ -1386,6 +1440,42 @@ class FrontendCompiler:
         result_type = with_element(value.type, ScalarType(dtype))
         return self._emit(
             "weft_kernel.widen", call, operands=(value,), result_types=(result_type,)
+        )[0]
+
+    def _intrinsic_narrow(self, call: ast.Call) -> Value:
+        args = self._arguments(
+            call,
+            ("value", "dtype"),
+            {"rounding": "rne", "saturation": True},
+        )
+        value = self._expect_value(self._compile_expr(args["value"]), args["value"])
+        dtype = self._eval_static(args["dtype"]) if isinstance(args["dtype"], ast.expr) else args["dtype"]
+        rounding = (
+            self._eval_static(args["rounding"])
+            if isinstance(args["rounding"], ast.expr)
+            else args["rounding"]
+        )
+        saturation = (
+            self._eval_static(args["saturation"])
+            if isinstance(args["saturation"], ast.expr)
+            else args["saturation"]
+        )
+        if not isinstance(dtype, DType):
+            raise FrontendError("narrow dtype must be a Weft dtype", self._location(call))
+        if rounding not in {"rne", "rtz", "rdn", "rup"}:
+            raise FrontendError("narrow rounding must be rne, rtz, rdn, or rup", self._location(call))
+        if not isinstance(saturation, bool):
+            raise FrontendError("narrow saturation must be a boolean", self._location(call))
+        result_type = with_element(value.type, ScalarType(dtype))
+        return self._emit(
+            "weft_kernel.cast",
+            call,
+            operands=(value,),
+            result_types=(result_type,),
+            attributes={
+                "rounding": _string(rounding),
+                "saturate": "true" if saturation else "false",
+            },
         )[0]
 
     def _intrinsic_mac_pairs(self, call: ast.Call) -> Value:
@@ -1553,6 +1643,8 @@ class FrontendCompiler:
     def _intrinsic_lookup(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("table", "idx"), {})
         table = self._expect_value(self._compile_expr(args["table"]), args["table"])
+        if isinstance(table.type, (SliceType, ViewType)):
+            table = self._admit_value(table, args["table"])
         indices = self._expect_value(self._compile_expr(args["idx"]), args["idx"])
         result_type = value_type(element_type(table.type), shape_of(indices.type), axes_of(indices.type))
         return self._emit(
@@ -1614,6 +1706,17 @@ class FrontendCompiler:
             operands=(value,),
             result_types=(value.type,),
             attributes={"kind": _string("exp")},
+        )[0]
+
+    def _intrinsic_abs(self, call: ast.Call) -> Value:
+        args = self._arguments(call, ("value",), {})
+        value = self._expect_value(self._compile_expr(args["value"]), args["value"])
+        return self._emit(
+            "weft_kernel.unary",
+            call,
+            operands=(value,),
+            result_types=(value.type,),
+            attributes={"kind": _string("abs")},
         )[0]
 
     def _birth_kind(self, statement: ast.stmt) -> str | None:

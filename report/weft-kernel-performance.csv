@@ -311,9 +311,9 @@ source_vec_dot,nvfp4_q8_0,decode,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C-local-pr
 source_quantization,quantize_q8_0,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,2.776641,660.873336,MElements/s
 source_quantization,quantize_q8_1,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,4.980090,368.468880,MElements/s
 source_quantization,quantize_q8_K,prefill,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.247671,349.680458,MElements/s
-source_quantization,quantize_q8_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.017607,365.713776,MElements/s
-source_quantization,quantize_q8_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.726751,320.427384,MElements/s
-source_quantization,quantize_q8_K,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,6.849957,267.886081,MElements/s
+source_quantization,quantize_q8_0,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,5.878013,312.181685,MElements/s
+source_quantization,quantize_q8_1,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,6.922016,265.097317,MElements/s
+source_quantization,quantize_q8_K,prefill,K1/X60,RV64GCV-VLEN256,RVV-intrinsic-C,M=128;K=14336,full-direct-generated-activation-quantization,10,0,64,full,no,,,0,0,6.596924,278.161155,MElements/s
 source_dequantization,dequantize_q1_0,tensor,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-direct-generated-row-dequantization,10,0,64,full,no,,,0,0,7.142739,587.212314,MElements/s
 source_dequantization,dequantize_q4_0,tensor,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-direct-generated-row-dequantization,10,0,64,full,no,,,0,0,5.726543,732.432115,MElements/s
 source_dequantization,dequantize_q4_1,tensor,SG2044,RV64GCV-VLEN128,RVV-intrinsic-C-local-decode,N=1024;K=4096,full-direct-generated-row-dequantization,10,0,64,full,no,,,0,0,5.739303,730.803723,MElements/s

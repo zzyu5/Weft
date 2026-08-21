@@ -302,7 +302,10 @@ def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
 }
 
 def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
-  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input,
+                       OptionalAttr<StrAttr>:$rounding,
+                       OptionalAttr<BoolAttr>:$saturate,
+                       OptionalAttr<StrAttr>:$engine);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

@@ -29,6 +29,21 @@ class Q4_K:
 
 
 @weft.encoding
+class Q8_0:
+    layout = bitorder.lsb_first, byteorder.little
+    d: f16
+    q: i8[32]
+
+
+@weft.encoding
+class Q8_1:
+    layout = bitorder.lsb_first, byteorder.little
+    d: f16
+    s: f16
+    q: i8[32]
+
+
+@weft.encoding
 class Q8_K:
     layout = bitorder.lsb_first, byteorder.little
     ds: f32

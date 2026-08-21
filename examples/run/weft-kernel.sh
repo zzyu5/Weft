@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <sg2044|k1> <q4_k_gemv|q4_k_gemv_groups4|q4_k_gemv_ime|gemv_f32|gemm_f32> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <q4_k_gemv|q4_k_gemv_groups4|q4_k_gemv_ime|q8_0_quantize|q8_1_quantize|q8_K_quantize|gemv_f32|gemm_f32> <repetitions>" >&2
   exit 2
 fi
 
@@ -63,6 +63,21 @@ case "${kernel}" in
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     matrix_extension=spacemit-ime1
     runtime_kernel_define=-DWEFT_Q4_IME=1
+    ;;
+  q8_0_quantize|q8_1_quantize|q8_K_quantize)
+    dsl=examples/kernels/quantization/${kernel}.py
+    runtime=examples/repro/weft/q8_quantize_runtime.cpp
+    case "${kernel}" in
+      q8_0_quantize)
+        runtime_kernel_define=-DWEFT_Q8_KIND=0
+        ;;
+      q8_1_quantize)
+        runtime_kernel_define=-DWEFT_Q8_KIND=1
+        ;;
+      q8_K_quantize)
+        runtime_kernel_define=-DWEFT_Q8_KIND=2
+        ;;
+    esac
     ;;
   gemv_f32)
     dsl=examples/kernels/dense/gemv.py

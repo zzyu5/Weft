@@ -162,6 +162,7 @@ public:
       }
       bool hasProduct = false;
       bool hasNibbleField = false;
+      llvm::StringMap<unsigned> reductionKindsByInput;
       llvm::SmallVector<
           std::pair<std::string, llvm::SmallVector<std::string>>>
           instructionDomains;
@@ -183,11 +184,13 @@ public:
         llvm::StringRef operationId =
             mlir::cast<mlir::StringAttr>(operation.get("id")).getValue();
         bool isProduct = false;
+        bool hasInstructionChoice = false;
         llvm::SmallVector<std::string> realizations;
         llvm::SmallVector<std::string> memoryForms;
         if (name == "weft_kernel.mac_pairs" ||
             name == "weft_kernel.mac_groups") {
           isProduct = true;
+          hasInstructionChoice = true;
           hasProduct = true;
           if (engine == "wide" || engine.empty()) {
             if (targetFlag(problem.getTarget(), "has_widening_integer"))
@@ -197,6 +200,7 @@ public:
                    name == "weft_kernel.contract" ||
                    name == "weft_kernel.outer_contract") {
           isProduct = true;
+          hasInstructionChoice = true;
           hasProduct = true;
           if (engine == "wide" || engine.empty())
             realizations.push_back("rvv.reduction-product");
@@ -205,6 +209,13 @@ public:
                 problem.getTarget(), operation, values);
             realizations.append(matrix.begin(), matrix.end());
           }
+        } else if (name == "weft_kernel.lookup") {
+          hasInstructionChoice = true;
+          if (engine == "scalar" || engine.empty())
+            realizations.push_back("scalar.lookup");
+          if ((engine == "wide" || engine.empty()) &&
+              targetFlag(problem.getTarget(), "has_indexed_memory"))
+            realizations.push_back("rvv.indexed-lookup");
         } else if (name == "weft_kernel.admit" ||
                    name == "weft_kernel.commit") {
           realizations.push_back("transfer.rvv");
@@ -253,6 +264,17 @@ public:
           realizations.push_back("rvv.widen");
         } else if (name == "weft_kernel.reduce") {
           realizations.push_back("rvv.reduce");
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto sourceAttributes =
+              operation.getAs<mlir::DictionaryAttr>("source_attributes");
+          llvm::StringRef kind =
+              riscv_internal::string(sourceAttributes, "kind").value_or("");
+          if (operands && operands.size() == 1 &&
+              (kind == "max" || kind == "min")) {
+            llvm::StringRef input =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            reductionKindsByInput[input] |= kind == "max" ? 1u : 2u;
+          }
         } else if (name == "weft_kernel.fold2") {
           realizations.push_back("ordered-pair-fold");
         } else if (name == "weft_kernel.binary" ||
@@ -267,17 +289,17 @@ public:
         } else {
           realizations.push_back("structural");
         }
-        if (isProduct && realizations.empty()) {
+        if (hasInstructionChoice && realizations.empty()) {
           problem.emitError()
               << "operation " << operationId << " with engine role '" << engine
               << "' has no legal target instruction";
           signalPassFailure();
           return;
         }
-        if (isProduct) {
+        if (hasInstructionChoice) {
           bool requiresSubbyteUnpack = false;
-          if (name == "weft_kernel.mac_pairs" ||
-              name == "weft_kernel.mac_groups") {
+          if (isProduct && (name == "weft_kernel.mac_pairs" ||
+                            name == "weft_kernel.mac_groups")) {
             auto operands = operation.getAs<mlir::ArrayAttr>("operands");
             for (mlir::Attribute operandAttribute : operands) {
               auto operandId = mlir::cast<mlir::StringAttr>(operandAttribute);
@@ -372,6 +394,15 @@ public:
                            ? llvm::SmallVector<std::string>{"streamed",
                                                             "end-of-sub"}
                            : llvm::SmallVector<std::string>{"not-applicable"}));
+      const bool hasCoReduction = llvm::any_of(
+          reductionKindsByInput,
+          [](const auto &entry) { return entry.getValue() == 3u; });
+      domains = riscv_internal::set(
+          domains, "co_reduce_schedule",
+          riscv_internal::strings(
+              builder, hasCoReduction
+                           ? llvm::SmallVector<std::string>{"separate", "shared"}
+                           : llvm::SmallVector<std::string>{"separate"}));
 
       llvm::SmallVector<std::string> constraints;
       for (mlir::Attribute attribute : problem.getConstraints())
