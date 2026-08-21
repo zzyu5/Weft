@@ -221,14 +221,12 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
       profile.supportsVectorShape(32, 4) &&
       profile.supportsVectorShape(32, 8) &&
       profile.supportsVectorShape(32, 32)) {
+    // The emitted M1N16K32 local leaf clobbers v0, v14, and v16.  Its i32m2
+    // result is a normal value and is accounted for separately by liveness.
+    constexpr unsigned imeM1N16K32VectorClobbers = 3;
     profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
         RISCVFragmentInstruction::SpacemitIME1I4I8MMA, 4, 8, 32, 1, 16,
-        32, 28});
-    if (profile.supportsVectorShape(16, 4) &&
-        profile.supportsVectorShape(32, 64))
-      profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
-          RISCVFragmentInstruction::SpacemitIME1I4I8MMA, 4, 8, 32, 4, 16,
-          32, 28});
+        32, imeM1N16K32VectorClobbers});
   }
   return true;
 }

@@ -132,6 +132,28 @@ const EncodingFieldFacts *fieldFactsFor(
   return field == encodings.fields.end() ? nullptr : &field->second;
 }
 
+const EncodingFieldFacts *fieldFactsForValue(
+    llvm::StringRef valueId,
+    const llvm::StringMap<mlir::DictionaryAttr> &producers,
+    const llvm::StringMap<mlir::DictionaryAttr> &values,
+    const EncodingFacts &encodings) {
+  while (true) {
+    auto producer = producers.find(valueId);
+    if (producer == producers.end())
+      return nullptr;
+    llvm::StringRef name =
+        riscv_internal::string(producer->second, "name").value_or("");
+    if (name == "weft_kernel.field")
+      return fieldFactsFor(producer->second, values, encodings);
+    if (name != "weft_kernel.extract")
+      return nullptr;
+    auto operands = producer->second.getAs<mlir::ArrayAttr>("operands");
+    if (!operands || operands.empty())
+      return nullptr;
+    valueId = mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+  }
+}
+
 std::string validityFor(mlir::DictionaryAttr operation) {
   auto path = operation.getAs<mlir::ArrayAttr>("level_path");
   if (!path || path.empty())
@@ -352,32 +374,72 @@ public:
               llvm::StringRef identity =
                   riscv_internal::string(*selected, "identity").value_or("");
               realization = "matrix." + identity.str();
+              auto operands = operation.getAs<mlir::ArrayAttr>("operands");
               auto results = operation.getAs<mlir::ArrayAttr>("results");
               auto result =
                   results && !results.empty()
                       ? values.find(mlir::cast<mlir::StringAttr>(results[0])
                                         .getValue())
                       : values.end();
-              if (result == values.end()) {
+              const EncodingFieldFacts *lhsField =
+                  operands && !operands.empty()
+                      ? fieldFactsForValue(
+                            mlir::cast<mlir::StringAttr>(operands[0]).getValue(),
+                            producers, values, encodings)
+                      : nullptr;
+              if (result == values.end() || !lhsField ||
+                  lhsField->layouts.size() != 2) {
                 legal = false;
               } else {
-                localOperation = *selected;
-                localOperation = riscv_internal::set(
-                    localOperation, "result_vector_suffix",
-                    builder.getStringAttr(
-                        "i" +
-                        std::to_string(riscv_internal::integer(
-                                           result->second, "physical_sew")
-                                           .value_or(0)) +
-                        riscv_internal::string(result->second, "lmul")
-                            .value_or("")
-                            .str()));
-                localOperation = riscv_internal::set(
-                    localOperation, "interleave_rows",
-                    localOperation.get("n_factor"));
-                localOperation = riscv_internal::set(
-                    localOperation, "decision_owner",
-                    builder.getStringAttr("operation"));
+                auto grouped = mlir::dyn_cast<mlir::DictionaryAttr>(
+                    lhsField->layouts[0]);
+                auto layered = mlir::dyn_cast<mlir::DictionaryAttr>(
+                    lhsField->layouts[1]);
+                auto groupKind =
+                    grouped ? grouped.getAs<mlir::StringAttr>("kind")
+                            : mlir::StringAttr();
+                auto layerKind =
+                    layered ? layered.getAs<mlir::StringAttr>("kind")
+                            : mlir::StringAttr();
+                auto groupSize =
+                    grouped ? grouped.getAs<mlir::IntegerAttr>("size")
+                            : mlir::IntegerAttr();
+                auto layerSize =
+                    layered ? layered.getAs<mlir::IntegerAttr>("size")
+                            : mlir::IntegerAttr();
+                auto layerOrder =
+                    layered ? layered.getAs<mlir::StringAttr>("order")
+                            : mlir::StringAttr();
+                if (!groupKind || groupKind.getValue() != "grouped" ||
+                    !layerKind || layerKind.getValue() != "layered" ||
+                    !groupSize || !layerSize || !layerOrder ||
+                    groupSize.getInt() != 2 * layerSize.getInt()) {
+                  legal = false;
+                } else {
+                  localOperation = *selected;
+                  localOperation = riscv_internal::set(
+                      localOperation, "lhs_group_size", groupSize);
+                  localOperation = riscv_internal::set(
+                      localOperation, "lhs_layer_size", layerSize);
+                  localOperation = riscv_internal::set(
+                      localOperation, "lhs_layer_order", layerOrder);
+                  localOperation = riscv_internal::set(
+                      localOperation, "result_vector_suffix",
+                      builder.getStringAttr(
+                          "i" +
+                          std::to_string(riscv_internal::integer(
+                                             result->second, "physical_sew")
+                                             .value_or(0)) +
+                          riscv_internal::string(result->second, "lmul")
+                              .value_or("")
+                              .str()));
+                  localOperation = riscv_internal::set(
+                      localOperation, "interleave_rows",
+                      localOperation.get("n_factor"));
+                  localOperation = riscv_internal::set(
+                      localOperation, "decision_owner",
+                      builder.getStringAttr("operation"));
+                }
               }
             } else
               legal = false;

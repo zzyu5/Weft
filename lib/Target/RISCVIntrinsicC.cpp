@@ -2861,6 +2861,12 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
     int64_t kFactor = riscv_internal::integer(local, "k_factor").value_or(0);
     int64_t interleaveRows =
         riscv_internal::integer(local, "interleave_rows").value_or(0);
+    int64_t lhsGroupSize =
+        riscv_internal::integer(local, "lhs_group_size").value_or(0);
+    int64_t lhsLayerSize =
+        riscv_internal::integer(local, "lhs_layer_size").value_or(0);
+    llvm::StringRef lhsLayerOrder =
+        riscv_internal::string(local, "lhs_layer_order").value_or("");
     llvm::StringRef resultSuffix =
         riscv_internal::string(local, "result_vector_suffix").value_or("");
     if (instruction != "spacemit-ime1-i4i8-mma" || mFactor != 1 ||
@@ -2880,6 +2886,11 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
         lhsOwner.interleaveRows != interleaveRows)
       return fail(&operation,
                   "selected IME fragment requires a rows=16 derived encoding");
+    if (lhsField->bitOffset % 8 || lhsGroupSize <= 0 || lhsLayerSize <= 0 ||
+        lhsGroupSize != 2 * lhsLayerSize ||
+        (lhsLayerOrder != "lo_first" && lhsLayerOrder != "hi_first"))
+      return fail(&operation,
+                  "selected IME fragment has an incomplete packed-field mapping");
     const Binding &point = bindings.lookup(*lhs.field.index);
     const Binding &rhsPoint = bindings.lookup(*rhs.field.index);
     if (point.kind != Binding::Kind::Point || rhsPoint.kind != Binding::Kind::Point ||
@@ -2901,7 +2912,10 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
     std::string name = fresh("ime_fragment");
     line(vectorType(resultValue) + " " + name +
          " = weft_ime_i4_i8_m1n16k32(" + lhsOwner.recordPointer + ", " +
-         std::to_string(lhsField->bitOffset) + ", (const int8_t *)(" +
+         std::to_string(lhsField->bitOffset) + ", " +
+         std::to_string(lhsGroupSize) + ", " +
+         std::to_string(lhsLayerSize) + ", " +
+         (lhsLayerOrder == "lo_first" ? "1" : "0") + ", (const int8_t *)(" +
          rhsOwner.recordPointer + " + " +
          std::to_string(rhsField->bitOffset / 8) + " + " + logicalBase + "), " +
          logicalBase + ", " + point.point.active + ", " + laneVL() + ");");
@@ -3178,7 +3192,8 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
     }
   if (needsIME)
     output << "static inline vint32m2_t weft_ime_i4_i8_m1n16k32(\n"
-           << "    const uint8_t *panel, size_t q_bit_offset, const int8_t *x,\n"
+           << "    const uint8_t *panel, size_t q_bit_offset, size_t q_group,\n"
+           << "    size_t q_layer, int q_low_first, const int8_t *x,\n"
            << "    size_t logical_base, size_t extent, size_t vl) {\n"
            << "  _Alignas(32) int32_t output[16];\n"
            << "  _Alignas(16) int8_t activation[8];\n"
@@ -3190,10 +3205,17 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
            << "      for (size_t row = 0; row < 4; ++row)\n"
            << "        for (size_t k = 0; k < 8; ++k) {\n"
            << "          if (chunk * 8 + k < extent) {\n"
-           << "            const size_t bit = q_bit_offset +\n"
-           << "                (logical_base + chunk * 8 + k) * 4;\n"
-           << "            const uint8_t packed = panel[(bit / 8) * 16 + group * 4 + row];\n"
-           << "            weights[row * 8 + k] = (packed >> (bit % 8)) & 15;\n"
+           << "            const size_t logical = logical_base + chunk * 8 + k;\n"
+           << "            const size_t within = logical % q_group;\n"
+           << "            const size_t layer_index = within / q_layer;\n"
+           << "            const size_t storage_byte = q_bit_offset / 8 +\n"
+           << "                (logical / q_group) * q_layer + within % q_layer;\n"
+           << "            const size_t bit_layer = q_low_first ? layer_index :\n"
+           << "                (q_group / q_layer - 1 - layer_index);\n"
+           << "            const uint8_t packed =\n"
+           << "                panel[storage_byte * 16 + group * 4 + row];\n"
+           << "            weights[row * 8 + k] =\n"
+           << "                (packed >> (4 * bit_layer)) & 15;\n"
            << "          } else {\n"
            << "            weights[row * 8 + k] = 0;\n"
            << "          }\n"

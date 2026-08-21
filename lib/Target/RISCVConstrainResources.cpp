@@ -66,7 +66,12 @@ public:
         values.push_back(value);
       }
 
-      int64_t peak = 0;
+      auto targetFragments =
+          problem.getTarget().getAs<mlir::ArrayAttr>("matrix_fragments");
+      constexpr int64_t reserved = 2;
+      int64_t peak = reserved;
+      int64_t peakOrdinal = -1;
+      int64_t peakFragmentGroups = 0;
       llvm::SmallVector<std::string> peakClasses;
       for (int64_t ordinal = 0; ordinal <
                                 static_cast<int64_t>(problem.getOperations().size());
@@ -90,8 +95,26 @@ public:
         int64_t total = 0;
         for (const auto &entry : live)
           total += entry.getValue();
+        int64_t fragmentGroups = 0;
+        auto operation = mlir::cast<mlir::DictionaryAttr>(
+            problem.getOperations()[ordinal]);
+        llvm::StringRef realization =
+            riscv_internal::string(operation, "realization").value_or("");
+        if (realization.consume_front("matrix.") && targetFragments)
+          for (mlir::Attribute fragmentAttribute : targetFragments) {
+            auto fragment =
+                mlir::cast<mlir::DictionaryAttr>(fragmentAttribute);
+            if (riscv_internal::string(fragment, "identity").value_or("") ==
+                realization)
+              fragmentGroups +=
+                  riscv_internal::integer(fragment, "fixed_resource_groups")
+                      .value_or(0);
+          }
+        total += fragmentGroups + reserved;
         if (total > peak) {
           peak = total;
+          peakOrdinal = ordinal;
+          peakFragmentGroups = fragmentGroups;
           peakClasses.clear();
           for (const auto &entry : live)
             peakClasses.push_back(entry.getKey().str() + ":" +
@@ -99,26 +122,6 @@ public:
           llvm::sort(peakClasses);
         }
       }
-      int64_t fragments = 0;
-      auto targetFragments =
-          problem.getTarget().getAs<mlir::ArrayAttr>("matrix_fragments");
-      for (mlir::Attribute attribute : problem.getOperations()) {
-        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef realization =
-            riscv_internal::string(operation, "realization").value_or("");
-        if (!realization.consume_front("matrix.") || !targetFragments)
-          continue;
-        for (mlir::Attribute fragmentAttribute : targetFragments) {
-          auto fragment = mlir::cast<mlir::DictionaryAttr>(fragmentAttribute);
-          if (riscv_internal::string(fragment, "identity").value_or("") ==
-              realization)
-            fragments += riscv_internal::integer(
-                             fragment, "fixed_resource_groups")
-                             .value_or(0);
-        }
-      }
-      constexpr int64_t reserved = 2;
-      peak += fragments + reserved;
       int64_t budget =
           *riscv_internal::integer(problem.getTarget(), "vector_registers");
       auto resources = riscv_internal::dictionary(
@@ -126,6 +129,10 @@ public:
           {{"vector_register_budget", builder.getI64IntegerAttr(budget)},
            {"peak_vector_groups", builder.getI64IntegerAttr(peak)},
            {"peak_live_classes", riscv_internal::strings(builder, peakClasses)},
+           {"peak_operation_ordinal", builder.getI64IntegerAttr(peakOrdinal)},
+           {"peak_fragment_groups",
+            builder.getI64IntegerAttr(peakFragmentGroups)},
+           {"reserved_vector_groups", builder.getI64IntegerAttr(reserved)},
            {"spill", builder.getStringAttr("none")},
            {"stack_bytes", builder.getI64IntegerAttr(0)},
            {"cost", builder.getI64IntegerAttr(peak)},

@@ -52,9 +52,10 @@ void printAssignment(llvm::raw_ostream &output,
            << mlir::cast<mlir::StringAttr>(value.get("type_spelling")).getValue()
            << '\n';
     for (llvm::StringRef key :
-         {"physical_kind", "physical_encoding_kind", "physical_sew",
+         {"source", "physical_kind", "physical_encoding_kind", "physical_sew",
           "lane_axis", "physical_lanes", "stream_parts", "lmul", "vl",
           "register_groups", "storage", "materialization",
+          "handoff_class", "live_start", "live_end",
           "encoding_family", "base_encoding_family", "layout_identity",
           "interleave_rows"})
       if (mlir::Attribute field = value.get(key)) {
