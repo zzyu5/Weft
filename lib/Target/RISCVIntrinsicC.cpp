@@ -971,6 +971,33 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
   if (binding.kind == Binding::Kind::Slice) {
     llvm::StringRef kind =
         riscv_internal::string(assigned(value), "physical_kind").value_or("");
+    if (kind == "sequential" || kind == "scalar") {
+      auto valueType = mlir::cast<kernel::ValueType>(value.getType());
+      int64_t elements = 1;
+      for (int64_t extent : valueType.getShape().asArrayRef())
+        elements *= extent;
+      if (elements != 1) {
+        value.getDefiningOp()->emitError(
+            "sequential dense load requires one logical element");
+        return mlir::failure();
+      }
+      const Binding &base = bindings.lookup(binding.slice.base);
+      mlir::Type element = riscv_internal::logicalElement(value.getType());
+      if (base.kind != Binding::Kind::Memory || !base.memory.elementType ||
+          base.memory.elementType != element) {
+        value.getDefiningOp()->emitError(
+            "sequential dense load has no matching memory element");
+        return mlir::failure();
+      }
+      auto address = denseAddress(binding.slice, {});
+      auto type = scalarCType(element);
+      if (!address || !type) {
+        value.getDefiningOp()->emitError(
+            "sequential dense load has no address or C type");
+        return mlir::failure();
+      }
+      return scalar("*(const " + *type + " *)(" + *address + ")");
+    }
     if (!kind.starts_with("rvv")) {
       value.getDefiningOp()->emitError(
           "dense slice has no selected scalar or vector load realization");
@@ -1139,7 +1166,8 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
        " < (size_t)(" + partition + ") ? (size_t)(" + total + ") - " +
        iterator + " : (size_t)(" + partition + ");");
   line("(void)" + active + ";");
-  line("const size_t " + base + " = (size_t)(" + origin + ") + " + iterator +
+  line("const size_t " + base +
+       " __attribute__((unused)) = (size_t)(" + origin + ") + " + iterator +
        ";");
   PointInfo point{axis, base, active, physicalExtent};
   axisScopes[axis].push_back(point);
@@ -1450,6 +1478,33 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
              mlir::failure();
     }
   }
+  for (auto [axis, offsetValue] : region.slice.localOffsets) {
+    auto dimension = llvm::find(base.memory.axes, axis);
+    if (dimension == base.memory.axes.end())
+      return value.getDefiningOp()->emitError(
+                 "encoded record local offset has no matching memory axis"),
+             mlir::failure();
+    const size_t position =
+        static_cast<size_t>(std::distance(base.memory.axes.begin(), dimension));
+    const Binding &offset = bindings.lookup(offsetValue);
+    std::string expression;
+    if (offset.kind == Binding::Kind::Scalar) {
+      expression = offset.scalar;
+    } else if (offset.kind == Binding::Kind::Point) {
+      expression = offset.point.base;
+      PointInfo point = offset.point;
+      point.base = "(" + coordinates[position] + " + " + expression + ")";
+      points[axis] = std::move(point);
+    } else {
+      return value.getDefiningOp()->emitError(
+                 "encoded record local offset is neither scalar nor domain point"),
+             mlir::failure();
+    }
+    coordinates[position] =
+        "(" + coordinates[position] + " + " + expression + ")";
+    if (auto point = points.find(axis); point != points.end())
+      point->second.base = coordinates[position];
+  }
   Binding result;
   result.kind = Binding::Kind::Record;
   result.encodingFamily = sourceFamily;
@@ -1603,6 +1658,23 @@ mlir::LogicalResult Emitter::compileExtract(kernel::ExtractOp operation) {
     }
     bindings[operation.getResult()] = std::move(binding);
     return mlir::success();
+  }
+
+  if (binding.kind == Binding::Kind::Slice) {
+    mlir::FailureOr<Binding> materialized =
+        materializeNumeric(operation.getInput(), std::move(binding));
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    auto inputType = mlir::cast<kernel::ValueType>(operation.getInput().getType());
+    int64_t elements = 1;
+    for (int64_t extent : inputType.getShape().asArrayRef())
+      elements *= extent;
+    if (materialized->kind == Binding::Kind::Scalar && elements == 1 &&
+        !mlir::isa<kernel::ValueType>(operation.getResult().getType())) {
+      bindings[operation.getResult()] = std::move(*materialized);
+      return mlir::success();
+    }
+    binding = std::move(*materialized);
   }
 
   if (binding.kind != Binding::Kind::Vector)
@@ -1810,6 +1882,34 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
   }
   if (input->kind != Binding::Kind::Vector)
     return fail(operation, "cast has no selected numeric handoff");
+  if (!rounding && ((source.isF32() && target.isF16()) ||
+                    (source.isF16() && target.isF32()))) {
+    int64_t sourceLMUL = assigned(operation.getInput())
+                             .getAs<mlir::IntegerAttr>("lmul_eighths")
+                             .getInt();
+    int64_t targetLMUL = assigned(operation.getResult())
+                             .getAs<mlir::IntegerAttr>("lmul_eighths")
+                             .getInt();
+    if ((source.isF32() && sourceLMUL != targetLMUL * 2) ||
+        (source.isF16() && targetLMUL != sourceLMUL * 2))
+      return fail(operation,
+                  "selected f16/f32 cast LMUL relation cannot be emitted mechanically");
+    const std::string targetSuffix = vectorSuffix(operation.getResult());
+    const std::string targetType = vectorType(operation.getResult());
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (auto [index, part] : llvm::enumerate(input->parts)) {
+      const std::string vl = partVL(operation.getResult(), index);
+      std::string value = fresh(source.isF32() ? "narrow_f16" : "widen_f32");
+      std::string intrinsic = source.isF32() ? "__riscv_vfncvt_f_f_w_"
+                                             : "__riscv_vfwcvt_f_f_v_";
+      line(targetType + " " + value + " = " + intrinsic + targetSuffix +
+           "(" + part + ", " + vl + ");");
+      result.parts.push_back(std::move(value));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (!rounding || !saturate || !saturate.getValue() || !source.isF32())
     return fail(operation,
                 "current vector cast implements explicit saturated f32 narrowing only");
@@ -3493,7 +3593,8 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
     return fail(operation, "commit destination has no selected lane axis");
   int64_t nonLaneAxis = -1;
   const int64_t laneAxis = laneAxisFor(operation.getValue());
-  for (int64_t axis : memory.memory.axes)
+  auto valueType = mlir::cast<kernel::ValueType>(operation.getValue().getType());
+  for (int64_t axis : valueType.getAxisIds().asArrayRef())
     if (axis != laneAxis)
       nonLaneAxis = axis;
   const int64_t streams = streamPartCount(operation.getValue());

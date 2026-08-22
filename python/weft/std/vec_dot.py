@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weft.language import L, View, admit, commit, f32, i32, index, transfer, u32
+from weft.language import L, View, admit, f32, i32, index, transfer, u32
 
 from .encodings import (
     IQ1_M,
@@ -89,7 +89,6 @@ def _grid8(grid, grid_index, x, base):
 def vec_dot_q1_0_q8_0(
     W: View[Q1_0, (K,)],
     X: View[Q8_0, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=128) as wb:
@@ -109,13 +108,12 @@ def vec_dot_q1_0_q8_0(
             subtotal += f32(x.d) * f32(integer)
             quarter += index(1)
         result += f32(w.d) * subtotal
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q4_0_q8_0(
     W: View[Q4_0, (K,)],
     X: View[Q8_0, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -123,13 +121,12 @@ def vec_dot_q4_0_q8_0(
         x = admit(X[kb]) @ transfer
         integer = _dot_q4_values(w.q, x.q, zero=8)
         result += f32(integer) * f32(w.d) * f32(x.d)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q4_1_q8_1(
     W: View[Q4_1, (K,)],
     X: View[Q8_1, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -137,13 +134,12 @@ def vec_dot_q4_1_q8_1(
         x = admit(X[kb]) @ transfer
         integer = _dot_q4_values(w.q, x.q)
         result += (f32(w.d) * f32(x.d)) * f32(integer) + f32(w.m) * f32(x.s)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q5_0_q8_0(
     W: View[Q5_0, (K,)],
     X: View[Q8_0, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -157,13 +153,12 @@ def vec_dot_q5_0_q8_0(
             low += q0 * i32(x.q[j])
             high += q1 * i32(x.q[j + 16])
         result += (f32(w.d) * f32(x.d)) * f32(low + high)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q5_1_q8_1(
     W: View[Q5_1, (K,)],
     X: View[Q8_1, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -177,13 +172,12 @@ def vec_dot_q5_1_q8_1(
             low += q0 * i32(x.q[j])
             high += q1 * i32(x.q[j + 16])
         result += (f32(w.d) * f32(x.d)) * f32(low + high) + f32(w.m) * f32(x.s)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q8_0_q8_0(
     W: View[Q8_0, (K,)],
     X: View[Q8_0, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -193,13 +187,12 @@ def vec_dot_q8_0_q8_0(
         for j in range(32):
             integer += i32(w.q[j]) * i32(x.q[j])
         result += f32(integer) * (f32(w.d) * f32(x.d))
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q2_k_q8_k(
     W: View[Q2_K, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -219,13 +212,12 @@ def vec_dot_q2_k_q8_k(
                 partial += i32(x.q[j]) * i32(q)
             scaled += i32(metadata & u32(15)) * partial
         result += f32(x.ds) * f32(w.d) * f32(scaled) - f32(x.ds) * f32(w.dmin) * f32(minimum)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q3_k_q8_k(
     W: View[Q3_K, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     lane0 = f32(0.0)
     lane1 = f32(0.0)
@@ -291,13 +283,12 @@ def vec_dot_q3_k_q8_k(
     result += lane5
     result += lane6
     result += lane7
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q4_k_q8_k(
     W: View[Q4_K, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     lane0 = f32(0.0)
     lane1 = f32(0.0)
@@ -361,13 +352,12 @@ def vec_dot_q4_k_q8_k(
     result += lane5
     result += lane6
     result += lane7
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q5_k_q8_k(
     W: View[Q5_K, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     lane0 = f32(0.0)
     lane1 = f32(0.0)
@@ -432,13 +422,12 @@ def vec_dot_q5_k_q8_k(
     result += lane5
     result += lane6
     result += lane7
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_q6_k_q8_k(
     W: View[Q6_K, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     lane0 = f32(0.0)
     lane1 = f32(0.0)
@@ -505,14 +494,13 @@ def vec_dot_q6_k_q8_k(
     result += lane5
     result += lane6
     result += lane7
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_iq1_s_q8_k(
     W: View[IQ1_S, (K,)],
     X: View[Q8_K, (K,)],
     grid: View[f32, (16384,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -536,7 +524,7 @@ def vec_dot_iq1_s_q8_k(
             correction += scale * delta * (i32(x.bsum[group * 2]) + i32(x.bsum[group * 2 + 1]))
         combined = f32(main) + f32(0.125) * f32(correction)
         result += f32(w.d) * f32(x.ds) * combined
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_iq1_m_q8_k(
@@ -544,7 +532,6 @@ def vec_dot_iq1_m_q8_k(
     X: View[Q8_K, (K,)],
     grid: View[f32, (16384,)],
     f16_bits: View[f32, (65536,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -598,7 +585,7 @@ def vec_dot_iq1_m_q8_k(
             correction += sum20 * ls1 + sum21 * ls2
         combined = f32(main) + f32(0.125) * f32(correction)
         result += f32(block_scale) * f32(x.ds) * combined
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_iq2_xxs_q8_k(
@@ -606,7 +593,6 @@ def vec_dot_iq2_xxs_q8_k(
     X: View[Q8_K, (K,)],
     grid: View[f32, (2048,)],
     signs: View[f32, (1024,)],
-    Y: View[f32, (1,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -626,7 +612,7 @@ def vec_dot_iq2_xxs_q8_k(
             scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
             block_sum += local * scale
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
-    commit(f32(0.125) * sumf, Y[0])
+    return f32(0.125) * sumf
 
 
 def vec_dot_iq2_xs_q8_k(
@@ -634,7 +620,6 @@ def vec_dot_iq2_xs_q8_k(
     X: View[Q8_K, (K,)],
     grid: View[f32, (4096,)],
     signs: View[f32, (1024,)],
-    Y: View[f32, (1,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -663,14 +648,13 @@ def vec_dot_iq2_xs_q8_k(
             ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
             block_sum += first * ls1 + second * ls2
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
-    commit(f32(0.125) * sumf, Y[0])
+    return f32(0.125) * sumf
 
 
 def vec_dot_iq2_s_q8_k(
     W: View[IQ2_S, (K,)],
     X: View[Q8_K, (K,)],
     grid: View[f32, (8192,)],
-    Y: View[f32, (1,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -703,7 +687,7 @@ def vec_dot_iq2_s_q8_k(
             ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
             block_sum += ls1 * first + ls2 * second
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
-    commit(f32(0.125) * sumf, Y[0])
+    return f32(0.125) * sumf
 
 
 def vec_dot_iq3_xxs_q8_k(
@@ -711,7 +695,6 @@ def vec_dot_iq3_xxs_q8_k(
     X: View[Q8_K, (K,)],
     grid: View[f32, (1024,)],
     signs: View[f32, (1024,)],
-    Y: View[f32, (1,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -751,14 +734,13 @@ def vec_dot_iq3_xxs_q8_k(
             scale = i32((metadata >> u32(28)) * u32(2) + u32(1))
             block_sum += local * scale
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
-    commit(f32(0.25) * sumf, Y[0])
+    return f32(0.25) * sumf
 
 
 def vec_dot_iq3_s_q8_k(
     W: View[IQ3_S, (K,)],
     X: View[Q8_K, (K,)],
     grid: View[f32, (2048,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -793,14 +775,13 @@ def vec_dot_iq3_s_q8_k(
             scale = i32(((metadata >> u32(shift)) & u32(15)) * u32(2) + u32(1))
             block_sum += local * scale
         result += f32(w.d) * f32(x.ds) * f32(block_sum)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_iq4_nl_q8_0(
     W: View[IQ4_NL, (K,)],
     X: View[Q8_0, (K,)],
     codebook: View[f32, (16,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -808,14 +789,13 @@ def vec_dot_iq4_nl_q8_0(
         x = admit(X[kb]) @ transfer
         integer = _dot_codebook32(w.q, x.q, codebook)
         result += (f32(x.d) * f32(w.d)) * f32(integer)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_iq4_xs_q8_k(
     W: View[IQ4_XS, (K,)],
     X: View[Q8_K, (K,)],
     codebook: View[f32, (16,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -833,14 +813,13 @@ def vec_dot_iq4_xs_q8_k(
                 integer += q * i32(x.q[sub * 32 + j])
             block_scale = f32(w.d) * f32(x.ds) * f32(scale)
             result += block_scale * f32(integer)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_tq1_0_q8_k(
     W: View[TQ1_0, (K,)],
     X: View[Q8_K, (K,)],
     powers: View[u32, (5,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -860,13 +839,12 @@ def vec_dot_tq1_0_q8_k(
                 q = radix3_digit(powers, w.qh[j], digit)
                 integer += q * i32(x.q[240 + digit * 4 + j])
         result += f32(integer) * (f32(w.d) * f32(x.ds))
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_tq2_0_q8_k(
     W: View[TQ2_0, (K,)],
     X: View[Q8_K, (K,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -881,7 +859,7 @@ def vec_dot_tq2_0_q8_k(
                     integer += i32(x.q[chunk * 128 + digit * 32 + lane]) * q
         scale = f32(x.ds) * f32(w.d)
         result += f32(integer) * scale
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_mxfp4_q8_0(
@@ -889,7 +867,6 @@ def vec_dot_mxfp4_q8_0(
     X: View[Q8_0, (K,)],
     codebook: View[f32, (16,)],
     e8m0_scale: View[f32, (256,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
@@ -898,7 +875,7 @@ def vec_dot_mxfp4_q8_0(
         integer = _dot_codebook32(w.q, x.q, codebook)
         scale = f32(x.d) * exponent_scale(e8m0_scale, w.e)
         result += scale * f32(integer)
-    commit(result, Y[0])
+    return result
 
 
 def vec_dot_nvfp4_q8_0(
@@ -906,7 +883,6 @@ def vec_dot_nvfp4_q8_0(
     X: View[Q8_0, (K,)],
     codebook: View[f32, (16,)],
     ue4m3_scale: View[f32, (256,)],
-    Y: View[f32, (1,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=64) as wb:
@@ -923,4 +899,4 @@ def vec_dot_nvfp4_q8_0(
                 scale = f32(x.d) * exponent_scale(ue4m3_scale, w.d[sub])
                 result += scale * f32(integer)
             x_block += index(1)
-    commit(result, Y[0])
+    return result

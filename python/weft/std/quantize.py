@@ -74,11 +74,14 @@ def quantize_q8_K(
     for row in range(M):
         with L.blocks(K, extent=256) as kb:
             block = admit(X[row, kb]) @ transfer
-            maximum = reduce(block, op="max") @ wide
-            minimum = reduce(block, op="min") @ wide
-            extreme = maximum
-            if absolute(minimum) > absolute(maximum):
-                extreme = minimum
+            extreme = f32(0.0)
+            magnitude = f32(0.0)
+            with L.subs(kb, extent=1) as element:
+                sample = reduce(admit(X[row, element]) @ transfer, op="add") @ wide
+                sample_magnitude = absolute(sample)
+                if sample_magnitude > magnitude:
+                    magnitude = sample_magnitude
+                    extreme = sample
 
             inverse = f32(0.0)
             d = f32(0.0)

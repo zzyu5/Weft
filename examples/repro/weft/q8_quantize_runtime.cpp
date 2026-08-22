@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <vector>
 
 #ifndef WEFT_Q8_KIND
@@ -92,14 +91,15 @@ void reference(const std::vector<float> &input,
       std::uint8_t *target =
           output.data() + (row * blocks + block) * kRecordBytes;
 #if WEFT_Q8_KIND == 2
-      float maximum = -std::numeric_limits<float>::infinity();
-      float minimum = std::numeric_limits<float>::infinity();
+      float extreme = 0.0F;
+      float magnitude = 0.0F;
       for (std::size_t element = 0; element < kBlock; ++element) {
-        maximum = std::max(maximum, source[element]);
-        minimum = std::min(minimum, source[element]);
+        const float candidate = std::fabs(source[element]);
+        if (candidate > magnitude) {
+          magnitude = candidate;
+          extreme = source[element];
+        }
       }
-      const float extreme =
-          std::fabs(minimum) > std::fabs(maximum) ? minimum : maximum;
       const float inverse = extreme == 0.0F ? 0.0F : -127.0F / extreme;
       const float scale = inverse == 0.0F ? 0.0F : 1.0F / inverse;
       std::memcpy(target, &scale, sizeof(scale));
