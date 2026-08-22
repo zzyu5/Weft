@@ -150,6 +150,7 @@ public:
       llvm::StringMap<int64_t> useCounts;
       llvm::StringMap<std::string> producers;
       llvm::StringMap<std::string> producerIds;
+      llvm::StringMap<bool> singletonScalarExtractInputs;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef name = *riscv_internal::string(operation, "name");
@@ -163,6 +164,29 @@ public:
             producers[id] = name.str();
             producerIds[id] = riscv_internal::string(operation, "id")->str();
           }
+        if (name == "weft_kernel.extract") {
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          if (operands && !operands.empty() && results && results.size() == 1) {
+            llvm::StringRef inputId =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            llvm::StringRef resultId =
+                mlir::cast<mlir::StringAttr>(results[0]).getValue();
+            auto input = valuesById.find(inputId);
+            auto result = valuesById.find(resultId);
+            auto shape = input == valuesById.end()
+                             ? mlir::DenseI64ArrayAttr()
+                             : input->second.getAs<mlir::DenseI64ArrayAttr>("shape");
+            bool singleton = shape && !shape.empty();
+            if (singleton)
+              for (int64_t extent : shape.asArrayRef())
+                singleton &= extent == 1;
+            if (singleton && result != valuesById.end() &&
+                riscv_internal::string(result->second, "kind").value_or("") ==
+                    "scalar")
+              singletonScalarExtractInputs[inputId] = true;
+          }
+        }
         if (riscv_internal::string(operation, "engine").value_or("") != "wide")
           continue;
         for (llvm::StringRef key : {"operands", "results"})
@@ -343,9 +367,14 @@ public:
         unsigned chainRoot = find(index);
         auto chainIt = chains.find(chainRoot);
         int64_t chainLanes = chainIt == chains.end() ? 1 : chainIt->second.lanes;
-        std::string kind = physicalKind(value, selected.axis, chainLanes);
         bool lane = selected.axis >= 0 && containsAxis(value, selected.axis) &&
                     logicalSEW > 0;
+        const bool scalarExtract = singletonScalarExtractInputs.lookup(id) &&
+                                   useCounts.lookup(id) == 1;
+        if (scalarExtract)
+          lane = false;
+        std::string kind =
+            physicalKind(value, lane ? selected.axis : 0, chainLanes);
         int64_t logicalLaneExtent =
             lane ? laneExtent(value, selected.axis) : 0;
         int64_t valueLanes =
@@ -441,7 +470,9 @@ public:
                 lane ? "axis" + std::to_string(selected.axis) +
                            " use-def chain r" + std::to_string(chainRoot) +
                            " extent/cohort/VLEN resource bound"
-                     : "value does not carry the selected lane axis"));
+                : scalarExtract
+                    ? "singleton local value has one scalar extract consumer"
+                    : "value does not carry the selected lane axis"));
         value = riscv_internal::set(
             value, "lmul_derived_from",
             builder.getStringAttr(

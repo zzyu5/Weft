@@ -77,7 +77,7 @@ def quantize_q8_K(
             extreme = f32(0.0)
             magnitude = f32(0.0)
             with L.subs(kb, extent=1) as element:
-                sample = reduce(admit(X[row, element]) @ transfer, op="add") @ wide
+                sample = f32((admit(X[row, element]) @ transfer)[0])
                 sample_magnitude = absolute(sample)
                 if sample_magnitude > magnitude:
                     magnitude = sample_magnitude
