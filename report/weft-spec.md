@@ -159,6 +159,7 @@ SIMT 硬件**强制** ownership：一个值必须被一组线程共同拥有，l
 @weft.encoding
 class Q4_K:                          # 144 B / 256 elems
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
     d:     f16
     dmin:  f16
     sc:     u6[8] @ joined(4, 2, 4, lo_first)
@@ -168,6 +169,7 @@ class Q4_K:                          # 144 B / 256 elems
 @weft.encoding
 class Q8_K:                          # 292 B / 256 elems
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
     ds:    f32
     q:     i8[256]
     bsum:  i16[16]                   # per 16 elems
@@ -176,6 +178,10 @@ class Q8_K:                          # 292 B / 256 elems
 Encoding 不是“字段起始 offset + 元素宽度”的 C struct 字段表。它定义：
 
 > **一个逻辑字段坐标怎样映射到 storage unit 与其中的 bit range。**
+
+`elements` 是每条 storage record 对应的逻辑元素数。它是必填布局事实，不能从
+字段 shape 猜测：TQ1 的 48 个 radix storage bytes、IQ 的 grid/index 字段都只覆盖
+record 的一种存储分解，而一条 record 仍对应 256 个逻辑元素。
 
 字段仍按源码顺序占据互不重叠的 storage span；字段内部的逻辑元素不要求按 `offset + i × width` 连续排列。作者只组合少量布局关系，不写逐元素 bit-slice 表，也不写地址公式。
 
@@ -224,6 +230,7 @@ Encoding 必须同时显式规定：
 ```
 bit order        位在字节内的方向
 byte order       字节序
+elements         一条 storage record 对应的逻辑元素数
 grouping         logical array 到重复 storage group 的划分
 layering         group 内逻辑层与 storage bit range 的对应
 bit planes/join  一个逻辑值跨多个 storage plane 时的纯 bit 重组

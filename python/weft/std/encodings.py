@@ -16,12 +16,87 @@ from weft.language import (
     lo_first,
     u4,
     u6,
+    u8,
+    u16,
 )
+
+
+@weft.encoding
+class Q1_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 128
+    d: f16
+    q: u8[16]
+
+
+@weft.encoding
+class Q4_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    d: f16
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class Q4_1:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    d: f16
+    m: f16
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class Q5_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    d: f16
+    qh: u8[4]
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class Q5_1:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    d: f16
+    m: f16
+    qh: u8[4]
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class Q8_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    d: f16
+    q: i8[32]
+
+
+@weft.encoding
+class Q2_K:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    scales: u8[16]
+    q: u8[64]
+    d: f16
+    dmin: f16
+
+
+@weft.encoding
+class Q3_K:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    hmask: u8[32]
+    q: u8[64]
+    scales: u8[12]
+    d: f16
 
 
 @weft.encoding
 class Q4_K:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
     d: f16
     dmin: f16
     sc: u6[8] @ joined(4, 2, 4, lo_first)
@@ -30,22 +105,146 @@ class Q4_K:
 
 
 @weft.encoding
-class Q4_0:
+class Q5_K:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    dmin: f16
+    sc: u6[8] @ joined(4, 2, 4, lo_first)
+    m: u6[8] @ joined(4, 2, 4, lo_first)
+    qh: u8[32]
+    q: u4[256] @ grouped(64) @ layered(32, lo_first)
+
+
+@weft.encoding
+class Q6_K:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    ql: u8[128]
+    qh: u8[64]
+    scales: i8[16]
+    d: f16
+
+
+@weft.encoding
+class IQ1_S:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u8[32]
+    qh: u16[8]
+
+
+@weft.encoding
+class IQ1_M:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    q: u8[32]
+    qh: u8[16]
+    scales: u8[8]
+
+
+@weft.encoding
+class IQ2_S:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u8[64]
+    qh: u8[8]
+    scales: u8[8]
+
+
+@weft.encoding
+class IQ2_XS:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u16[32]
+    scales: u8[8]
+
+
+@weft.encoding
+class IQ2_XXS:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u16[32]
+
+
+@weft.encoding
+class IQ3_S:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u8[64]
+    qh: u8[8]
+    signs: u8[32]
+    scales: u8[4]
+
+
+@weft.encoding
+class IQ3_XXS:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    d: f16
+    q: u8[96]
+
+
+@weft.encoding
+class IQ4_NL:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
     d: f16
     q: u4[32] @ grouped(32) @ layered(16, lo_first)
 
 
 @weft.encoding
-class Q8_0:
+class IQ4_XS:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
     d: f16
-    q: i8[32]
+    scales_h: u16
+    scales_l: u8[4]
+    q: u4[256] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class TQ1_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    q: u8[48]
+    qh: u8[4]
+    d: f16
+
+
+@weft.encoding
+class TQ2_0:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    q: u8[64]
+    d: f16
+
+
+@weft.encoding
+class MXFP4:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 32
+    e: u8
+    q: u4[32] @ grouped(32) @ layered(16, lo_first)
+
+
+@weft.encoding
+class NVFP4:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 64
+    d: u8[4]
+    q: u4[64] @ grouped(16) @ layered(8, lo_first)
 
 
 @weft.encoding
 class Q8_1:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 32
     d: f16
     s: f16
     q: i8[32]
@@ -54,6 +253,7 @@ class Q8_1:
 @weft.encoding
 class Q8_K:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 256
     ds: f32
     q: i8[256]
     bsum: i16[16]

@@ -101,6 +101,7 @@ def WeftKernel_EncodingDeclOp
     StrAttr:$bit_order,
     StrAttr:$byte_order,
     I64Attr:$alignment,
+    I64Attr:$elements,
     I64Attr:$storage_bits,
     ArrayAttr:$field_names,
     ArrayAttr:$field_types,

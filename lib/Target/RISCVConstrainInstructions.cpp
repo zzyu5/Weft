@@ -39,6 +39,7 @@ struct EncodingFacts {
   struct Base {
     int64_t storageBits = 0;
     int64_t alignment = 1;
+    int64_t elements = 0;
     std::string bitOrder;
     std::string byteOrder;
   };
@@ -55,6 +56,7 @@ EncodingFacts collectEncodingFacts(mlir::ModuleOp module) {
     result.bases[declaration.getSymName()] = {
         static_cast<int64_t>(declaration.getStorageBits()),
         static_cast<int64_t>(declaration.getAlignment()),
+        static_cast<int64_t>(declaration.getElements()),
         declaration.getBitOrder().str(), declaration.getByteOrder().str()};
     for (size_t index = 0; index < declaration.getFieldNames().size(); ++index) {
       llvm::StringRef name =

@@ -499,6 +499,7 @@ class FrontendCompiler:
         bit_order = ""
         byte_order = ""
         alignment = 1
+        elements: int | None = None
         layout_items: list[tuple[str, object]] = []
         for statement in declaration.body:
             if isinstance(statement, ast.Assign) and any(
@@ -512,6 +513,23 @@ class FrontendCompiler:
                             bit_order = value.attr
                         elif value.attr in {"little", "big"}:
                             byte_order = value.attr
+            elif (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == "elements"
+            ):
+                if elements is not None:
+                    raise FrontendError("encoding elements may be declared only once")
+                try:
+                    literal = ast.literal_eval(statement.value)
+                except (ValueError, TypeError) as error:
+                    raise FrontendError(
+                        "encoding elements must be a positive integer"
+                    ) from error
+                if isinstance(literal, bool) or not isinstance(literal, int) or literal <= 0:
+                    raise FrontendError("encoding elements must be a positive integer")
+                elements = literal
             elif (
                 isinstance(statement, ast.Assign)
                 and len(statement.targets) == 1
@@ -554,6 +572,11 @@ class FrontendCompiler:
         if not bit_order or not byte_order:
             raise FrontendError(
                 "encoding layout must declare bit order and byte order",
+                SourceLocation(definition.source.filename, definition.source.first_line, 0),
+            )
+        if elements is None:
+            raise FrontendError(
+                "encoding must declare a positive elements count",
                 SourceLocation(definition.source.filename, definition.source.first_line, 0),
             )
         offset = 0
@@ -621,9 +644,6 @@ class FrontendCompiler:
             offset += storage_bits
             item_index += 1
         encoding_type = EncodingType(definition.__name__, "base", definition.__name__)
-        logical_extent = max(
-            (field.shape[-1] for field in fields if field.shape), default=None
-        )
         info = _EncodingInfo(
             definition,
             encoding_type,
@@ -633,7 +653,7 @@ class FrontendCompiler:
             tuple(fields),
             tuple(paddings),
             offset,
-            logical_extent,
+            elements,
         )
         self._declared_encodings[definition.__name__] = info
         location = SourceLocation(definition.source.filename, definition.source.first_line, 0)
@@ -648,6 +668,7 @@ class FrontendCompiler:
                     "bit_order": _string(bit_order),
                     "byte_order": _string(byte_order),
                     "alignment": str(alignment),
+                    "elements": str(elements),
                     "storage_bits": str(offset),
                     "field_names": _strings([field.name for field in fields]),
                     "field_types": _type_array([ScalarType(field.dtype) for field in fields]),

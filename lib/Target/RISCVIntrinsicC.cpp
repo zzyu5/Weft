@@ -66,7 +66,7 @@ struct EncodingInfo {
   std::string layoutIdentity;
   int64_t storageBits = 0;
   int64_t alignment = 1;
-  int64_t logicalElements = 1;
+  int64_t logicalElements = 0;
   llvm::SmallVector<EncodingField> fields;
 };
 
@@ -141,6 +141,7 @@ struct SliceInfo {
   mlir::Value base;
   llvm::SmallVector<mlir::Value> indices;
   llvm::SmallVector<std::string> selectors;
+  llvm::SmallVector<std::pair<int64_t, mlir::Value>> localOffsets;
 };
 
 struct FieldInfo {
@@ -384,6 +385,7 @@ private:
       info.layoutIdentity = declaration.getLayoutIdentity().str();
       info.storageBits = declaration.getStorageBits();
       info.alignment = declaration.getAlignment();
+      info.logicalElements = declaration.getElements();
       auto names = declaration.getFieldNames();
       auto types = declaration.getFieldTypes();
       auto shapes = declaration.getFieldShapes();
@@ -399,8 +401,6 @@ private:
         field.layouts = mlir::cast<mlir::ArrayAttr>(layouts[index]);
         field.bitOffset = offsets[index];
         field.storageBits = storage[index];
-        if (!field.shape.empty())
-          info.logicalElements = std::max(info.logicalElements, field.shape.back());
         info.fields.push_back(std::move(field));
       }
       encodings[info.family] = std::move(info);
@@ -843,6 +843,19 @@ std::optional<std::string> Emitter::denseAddress(
       else
         return std::nullopt;
     }
+    for (auto [axis, value] : slice.localOffsets) {
+      if (axis != memory.axes[dimension])
+        continue;
+      const Binding &offset = bindings.lookup(value);
+      std::string expression;
+      if (offset.kind == Binding::Kind::Scalar)
+        expression = offset.scalar;
+      else if (offset.kind == Binding::Kind::Point)
+        expression = offset.point.base;
+      else
+        return std::nullopt;
+      coordinate = "(" + coordinate + " + " + expression + ")";
+    }
     auto extra = offsetByAxis.find(std::to_string(memory.axes[dimension]));
     if (extra != offsetByAxis.end())
       coordinate = "(" + coordinate + " + " + extra->second + ")";
@@ -1125,6 +1138,7 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   line("const size_t " + active + " = (size_t)(" + total + ") - " + iterator +
        " < (size_t)(" + partition + ") ? (size_t)(" + total + ") - " +
        iterator + " : (size_t)(" + partition + ");");
+  line("(void)" + active + ";");
   line("const size_t " + base + " = (size_t)(" + origin + ") + " + iterator +
        ";");
   PointInfo point{axis, base, active, physicalExtent};
@@ -1349,11 +1363,28 @@ mlir::LogicalResult Emitter::compileSlice(kernel::SliceOp slice) {
   }
   Binding binding;
   binding.kind = Binding::Kind::Slice;
-  binding.slice.base = slice.getBase();
-  binding.slice.indices.assign(slice.getIndices().begin(), slice.getIndices().end());
-  for (mlir::Attribute selector : slice.getSelectors())
-    binding.slice.selectors.push_back(
-        mlir::cast<mlir::StringAttr>(selector).getValue().str());
+  if (base.kind == Binding::Kind::Slice) {
+    binding.slice = base.slice;
+    auto baseType = mlir::cast<kernel::SliceType>(slice.getBase().getType());
+    size_t cursor = 0;
+    for (auto [position, selectorAttribute] : llvm::enumerate(slice.getSelectors())) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (cursor >= slice.getIndices().size() ||
+          position >= baseType.getAxisIds().size())
+        return fail(slice, "nested slice selector has no logical axis or index");
+      binding.slice.localOffsets.emplace_back(
+          baseType.getAxisIds()[position], slice.getIndices()[cursor++]);
+    }
+  } else {
+    binding.slice.base = slice.getBase();
+    binding.slice.indices.assign(slice.getIndices().begin(), slice.getIndices().end());
+    for (mlir::Attribute selector : slice.getSelectors())
+      binding.slice.selectors.push_back(
+          mlir::cast<mlir::StringAttr>(selector).getValue().str());
+  }
   bindings[slice.getResult()] = std::move(binding);
   return mlir::success();
 }
@@ -1470,6 +1501,19 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
 
 mlir::LogicalResult Emitter::compileAdmit(kernel::AdmitOp admit) {
   Binding region = bindings.lookup(admit.getRegion());
+  if (region.kind == Binding::Kind::Memory) {
+    auto view = mlir::dyn_cast<kernel::ViewType>(admit.getRegion().getType());
+    auto encoding = view ? mlir::dyn_cast<kernel::EncodingType>(view.getEncoding())
+                         : kernel::EncodingType();
+    if (!encoding || encoding.getKind() != "dense")
+      return fail(admit,
+                  "whole-view admit is only defined for a dense read-only value");
+    Binding slice;
+    slice.kind = Binding::Kind::Slice;
+    slice.slice.base = admit.getRegion();
+    bindings[admit.getResult()] = std::move(slice);
+    return mlir::success();
+  }
   if (region.kind != Binding::Kind::Slice)
     return fail(admit, "admit currently requires a canonical slice region");
   auto encoding = mlir::dyn_cast<kernel::EncodingType>(
@@ -2354,18 +2398,24 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     return {};
   std::string logicalIndex = requestedIndex.str();
   if (fieldBinding.field.index) {
-    const Binding &point = bindings.lookup(*fieldBinding.field.index);
+    const Binding &index = bindings.lookup(*fieldBinding.field.index);
     auto encoding = encodings.find(owner.encodingFamily);
-    if (encoding == encodings.end() || point.kind != Binding::Kind::Point)
+    if (encoding == encodings.end())
       return {};
-    const int64_t elements = encoding->second.logicalElements;
-    if (fieldBinding.field.selector == "group_index")
-      logicalIndex = "((" + point.point.base + " % " +
-                     std::to_string(elements) + ") / " +
-                     std::to_string(point.point.physicalExtent) + ")";
-    else
-      logicalIndex = "(" + point.point.base + " % " +
-                     std::to_string(elements) + ")";
+    if (index.kind == Binding::Kind::Scalar) {
+      logicalIndex = index.scalar;
+    } else if (index.kind == Binding::Kind::Point) {
+      const int64_t elements = encoding->second.logicalElements;
+      if (fieldBinding.field.selector == "group_index")
+        logicalIndex = "((" + index.point.base + " % " +
+                       std::to_string(elements) + ") / " +
+                       std::to_string(index.point.physicalExtent) + ")";
+      else
+        logicalIndex = "(" + index.point.base + " % " +
+                       std::to_string(elements) + ")";
+    } else {
+      return {};
+    }
   }
   unsigned logicalWidth = 0;
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type))
@@ -2405,23 +2455,81 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     }
     Binding scalarResult;
     scalarResult.kind = Binding::Kind::Scalar;
-    const std::string byte = std::to_string(field->bitOffset / 8);
-    if (field->type.isF32())
+    llvm::StringRef kind = layoutKind(field->layouts);
+    if (kind == "joined") {
+      auto joined = mlir::cast<mlir::DictionaryAttr>(field->layouts[0]);
+      int64_t group = joined.getAs<mlir::IntegerAttr>("size").getInt();
+      int64_t fields = joined.getAs<mlir::IntegerAttr>("fields").getInt();
+      int64_t lowBits = joined.getAs<mlir::IntegerAttr>("low_bits").getInt();
+      int64_t role = joined.getAs<mlir::IntegerAttr>("role").getInt();
+      llvm::StringRef order =
+          joined.getAs<mlir::StringAttr>("order").getValue();
+      int64_t physicalRole = order == "lo_first" ? role : fields - 1 - role;
+      const std::string headByte =
+          "(" + std::to_string(field->bitOffset / 8 + role * group) +
+          " + (" + logicalIndex + "))";
+      const std::string tail = "((" + logicalIndex + ") - " +
+                               std::to_string(group) + ")";
+      const std::string lowByte =
+          "(" + std::to_string(field->bitOffset / 8 + fields * group) +
+          " + " + tail + ")";
+      const std::string highByte =
+          "(" + std::to_string(field->bitOffset / 8 + role * group) +
+          " + " + tail + ")";
+      const uint64_t logicalMask = (uint64_t(1) << logicalWidth) - 1;
+      const uint64_t lowMask = (uint64_t(1) << lowBits) - 1;
+      const uint64_t highMask =
+          (uint64_t(1) << (logicalWidth - lowBits)) - 1;
+      const std::string head =
+          "((uint8_t)((" + owner.recordPointer + ")[" + headByte + "] & " +
+          std::to_string(logicalMask) + "))";
+      const std::string low =
+          "((uint8_t)(((" + owner.recordPointer + ")[" + lowByte + "] >> " +
+          std::to_string(physicalRole * lowBits) + ") & " +
+          std::to_string(lowMask) + "))";
+      const std::string high =
+          "((uint8_t)(((" + owner.recordPointer + ")[" + highByte + "] >> " +
+          std::to_string(logicalWidth) + ") & " +
+          std::to_string(highMask) + "))";
+      scalarResult.scalar = "((" + logicalIndex + ") < " +
+                            std::to_string(group) + " ? " + head + " : (" +
+                            low + " | (" + high + " << " +
+                            std::to_string(lowBits) + ")))";
+      return scalarResult;
+    }
+    auto fragment = singleStorageFragment(*field, logicalIndex, logicalWidth);
+    if (!fragment)
+      return {};
+    const std::string address = owner.recordPointer + " + (" + fragment->byte + ")";
+    const bool naturallyByteAligned =
+        kind == "natural" && field->bitOffset % 8 == 0 && logicalWidth % 8 == 0;
+    if (field->type.isF32() && logicalWidth == 32 && naturallyByteAligned)
       scalarResult.scalar = "weft_load_f32_le(" + owner.recordPointer + " + " +
-                            byte + ")";
-    else if (field->type.isF16())
+                            fragment->byte + ")";
+    else if (field->type.isF16() && logicalWidth == 16 && naturallyByteAligned)
       scalarResult.scalar = "weft_load_f16_le(" + owner.recordPointer + " + " +
-                            byte + ")";
+                            fragment->byte + ")";
     else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
-             integer && integer.getWidth() == 8) {
-      auto type = scalarCType(field->type);
-      if (!type)
-        return {};
-      scalarResult.scalar = "*(const " + *type + " *)(" + owner.recordPointer +
-                            " + " + byte + ")";
-    } else if (field->type.isSignedInteger(16)) {
-      scalarResult.scalar = "weft_load_i16_le(" + owner.recordPointer + " + " +
-                            byte + ")";
+             integer && integer.getWidth() <= 8) {
+      const uint64_t mask = (uint64_t(1) << integer.getWidth()) - 1;
+      std::string value = "((" + address + ")[0] >> (" + fragment->shift + ")) & " +
+                          std::to_string(mask);
+      if (integer.isSigned() && integer.getWidth() < 8) {
+        const uint64_t sign = uint64_t(1) << (integer.getWidth() - 1);
+        value = "((int8_t)((((" + value + ") ^ " + std::to_string(sign) +
+                ") - " + std::to_string(sign) + ")))";
+      } else if (integer.isSigned()) {
+        value = "((int8_t)(" + value + "))";
+      } else {
+        value = "((uint8_t)(" + value + "))";
+      }
+      scalarResult.scalar = std::move(value);
+    } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
+               integer && integer.getWidth() == 16 && naturallyByteAligned) {
+      scalarResult.scalar =
+          std::string(integer.isUnsigned() ? "weft_load_u16_le(" :
+                                             "weft_load_i16_le(") +
+          owner.recordPointer + " + " + fragment->byte + ")";
     } else {
       return {};
     }
@@ -3446,6 +3554,9 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
          << "#include <riscv_vector.h>\n\n"
          << "static inline __attribute__((unused)) int16_t weft_load_i16_le(const uint8_t *p) {\n"
          << "  uint16_t bits; memcpy(&bits, p, sizeof(bits)); return (int16_t)bits;\n"
+         << "}\n"
+         << "static inline __attribute__((unused)) uint16_t weft_load_u16_le(const uint8_t *p) {\n"
+         << "  uint16_t bits; memcpy(&bits, p, sizeof(bits)); return bits;\n"
          << "}\n"
          << "static inline __attribute__((unused)) _Float16 weft_load_f16_le(const uint8_t *p) {\n"
          << "  _Float16 value; memcpy(&value, p, sizeof(value)); return value;\n"

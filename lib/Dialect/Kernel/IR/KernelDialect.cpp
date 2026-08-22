@@ -288,8 +288,8 @@ mlir::LogicalResult EncodingDeclOp::verify() {
     return emitOpError("bit_order must be lsb_first or msb_first");
   if (getByteOrder() != "little" && getByteOrder() != "big")
     return emitOpError("byte_order must be little or big");
-  if (getAlignment() <= 0 || getStorageBits() <= 0)
-    return emitOpError("alignment and storage_bits must be positive");
+  if (getAlignment() <= 0 || getElements() <= 0 || getStorageBits() <= 0)
+    return emitOpError("alignment, elements, and storage_bits must be positive");
   if (failed(verifyStringArray(*this, getFieldNames(), "field_names")))
     return mlir::failure();
   const size_t count = getFieldNames().size();

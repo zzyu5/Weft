@@ -8,13 +8,14 @@ Encoding 只描述逻辑字段坐标到 storage unit/bit range 的映射。它�
 @weft.encoding
 class Example:
     layout = bitorder.lsb_first, byteorder.little
+    elements = 32
     alignment = 16
     header: u16
     reserved = padding(2, value=0)
     q: u4[32] @ grouped(32) @ layered(16, lo_first)
 ```
 
-字段按源码顺序占据 storage span；只有显式属于同一个 `joined` 组合的字段可以共享 span。字段内部不再默认使用 `bit_offset + i * width`。作者组合：
+`elements` 必须显式给出一条 storage record 对应的逻辑元素数；它不从字段长度推断。字段按源码顺序占据 storage span；只有显式属于同一个 `joined` 组合的字段可以共享 span。字段内部不再默认使用 `bit_offset + i * width`。作者组合：
 
 - `natural`：连续自然元素；
 - `grouped(N)`：每 N 个逻辑元素重复一次布局；
@@ -28,6 +29,7 @@ canonical declaration 明确保留：
 - byte order；
 - 每个字段的 dtype、shape、storage span 与结构化 layout expression；
 - encoding alignment；
+- 每条 record 的逻辑元素数；
 - padding 的 bit offset、宽度和填充值；
 - 整个对象的 storage bits 与 layout identity。
 
