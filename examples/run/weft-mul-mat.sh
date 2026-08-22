@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <sg2044|k1> <f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4>" >&2
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
   exit 2
 fi
 
 target=$1
 format=$2
+phase=$3
+repetitions=$4
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compiler="${project_root}/build/tools/weft-compile/weft-compile"
 formats=(f16 q1_0 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq1_m iq2_s iq2_xs iq2_xxs iq3_s iq3_xxs iq4_nl iq4_xs tq1_0 tq2_0 mxfp4 nvfp4)
 format_id=-1
-for index in "${!formats[@]}"; do
-  if [[ ${formats[index]} == "${format}" ]]; then
-    format_id=${index}
-    break
-  fi
-done
-if [[ ${format_id} -lt 0 ]]; then
+if [[ ${format} != f32 ]]; then
+  for index in "${!formats[@]}"; do
+    if [[ ${formats[index]} == "${format}" ]]; then
+      format_id=${index}
+      break
+    fi
+  done
+fi
+if [[ ${format} != f32 && ${format_id} -lt 0 ]]; then
   echo "unsupported MUL_MAT format: ${format}" >&2
   exit 2
 fi
@@ -34,6 +38,8 @@ case "${target}" in
     march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     vlen=128
     extra_flags=
+    link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
+    runtime_target_define=
     ;;
   k1)
     remote_host=k1
@@ -45,6 +51,8 @@ case "${target}" in
     march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
     vlen=256
     extra_flags=-fno-integrated-as
+    link_path=/usr/lib/riscv64-linux-gnu
+    runtime_target_define=-DWEFT_TARGET_K1=1
     ;;
   *)
     echo "unsupported Weft target: ${target}" >&2
@@ -61,13 +69,23 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
+meta=()
+if [[ ${format} == f32 ]]; then
+  dsl=examples/kernels/dense/gemm.py
+  kernel=gemm_f32
+  runtime=examples/repro/weft/gemm_runtime.cpp
+  meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+else
+  dsl=examples/kernels/quantization/mul_mat.py
+  kernel=production_mul_mat_${format}
+  runtime=examples/repro/weft/mul_mat_runtime.cpp
+fi
 PYTHONPATH="${project_root}/python" python -m weft \
-  "${project_root}/examples/kernels/quantization/mul_mat.py" \
-  --kernel "production_mul_mat_${format}" > "${local_root}/kernel.mlir"
+  "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
-  --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
+  --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
   -o "${local_root}/kernel.c"
-cp "${project_root}/examples/repro/weft/mul_mat_runtime.cpp" "${local_root}/runtime.cpp"
+cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 
 printf -v source_argument '%q' "${remote_source}"
 printf -v build_argument '%q' "${remote_build}"
@@ -77,6 +95,10 @@ printf -v cpu_argument '%q' "${remote_cpu}"
 printf -v march_argument '%q' "${march}"
 printf -v extra_flags_argument '%q' "${extra_flags}"
 printf -v format_argument '%q' "${format_id}"
+printf -v link_path_argument '%q' "${link_path}"
+printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
+printf -v phase_argument '%q' "${phase}"
+printf -v repetitions_argument '%q' "${repetitions}"
 
 tar -C "${local_root}" -cf - kernel.c runtime.cpp |
   ssh "${remote_host}" "
@@ -99,17 +121,20 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
     march=${march_argument}
     extra_flags=${extra_flags_argument}
     format_id=${format_argument}
+    link_path=${link_path_argument}
+    runtime_target_define=${runtime_target_define_argument}
     \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
       \${extra_flags} -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
-      -Wno-unused-const-variable -ffp-contract=off \${extra_flags} \
+      -Wno-unused-const-variable -ffp-contract=fast \${extra_flags} \
+      \${runtime_target_define} \
       -DWEFT_MUL_MAT_FORMAT=\"\${format_id}\" \
       -march=\"\${march}\" -mabi=lp64d \
       -I\"\${source_root}/ggml/include\" -I\"\${source_root}/ggml/src\" \
       -I\"\${source_root}/ggml/src/ggml-cpu\" runtime.cpp kernel.o \
-      -L\"\${build_root}/bin\" -L/opt/tcrv-toolchains/gcc-15.2.0/lib \
-      -Wl,-rpath,\"\${build_root}/bin:/opt/tcrv-toolchains/gcc-15.2.0/lib\" \
+      -L\"\${build_root}/bin\" -L\"\${link_path}\" \
+      -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o runtime
-    exec taskset -c \"\${cpu}\" ./runtime
+    exec taskset -c \"\${cpu}\" ./runtime ${phase_argument} ${repetitions_argument}
   "

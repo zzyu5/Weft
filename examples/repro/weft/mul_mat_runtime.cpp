@@ -5,6 +5,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,8 +20,38 @@
 
 namespace {
 
-constexpr std::size_t kM = 2;
-constexpr std::size_t kN = 2;
+#if defined(WEFT_TARGET_K1)
+constexpr const char *kTarget = "K1/X60";
+#else
+constexpr const char *kTarget = "SG2044";
+#endif
+constexpr std::size_t kN = 4096;
+constexpr std::size_t kK = 4096;
+constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
+std::size_t runtimeM = 0;
+volatile std::uint64_t flushSink = 0;
+
+std::size_t parse_repetitions(const char *text) {
+  char *end = nullptr;
+  const unsigned long value = std::strtoul(text, &end, 10);
+  return *text != '\0' && *end == '\0' && value != 0
+             ? static_cast<std::size_t>(value)
+             : 0;
+}
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const std::size_t middle = values.size() / 2;
+  return values.size() & 1U ? values[middle]
+                            : 0.5 * (values[middle - 1] + values[middle]);
+}
+
+void evict_cache(std::vector<std::uint8_t> &buffer) {
+  for (std::size_t offset = 0; offset < buffer.size(); offset += 64) {
+    buffer[offset] = static_cast<std::uint8_t>(buffer[offset] + 1U);
+    flushSink += buffer[offset];
+  }
+}
 
 [[maybe_unused]] std::vector<float> grid64(const std::uint64_t *table, std::size_t entries) {
   std::vector<float> result(entries * 8);
@@ -111,7 +142,7 @@ constexpr int kElements = 128;
 #define selected_reference ggml_vec_dot_q1_0_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_q1_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q1_0(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q1_0(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 2
 using selected_weight = block_q4_0;
 using selected_activation = block_q8_0;
@@ -121,7 +152,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_q4_0_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_q4_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q4_0(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q4_0(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 3
 using selected_weight = block_q4_1;
 using selected_activation = block_q8_1;
@@ -131,7 +162,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_q4_1_q8_1_generic
 #define selected_quantize quantize_row_q8_1_ref
 extern "C" void production_mul_mat_q4_1(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q4_1(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q4_1(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 4
 using selected_weight = block_q5_0;
 using selected_activation = block_q8_0;
@@ -141,7 +172,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_q5_0_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_q5_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q5_0(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q5_0(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 5
 using selected_weight = block_q5_1;
 using selected_activation = block_q8_1;
@@ -151,7 +182,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_q5_1_q8_1_generic
 #define selected_quantize quantize_row_q8_1_ref
 extern "C" void production_mul_mat_q5_1(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q5_1(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q5_1(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 6
 using selected_weight = block_q8_0;
 using selected_activation = block_q8_0;
@@ -161,7 +192,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_q8_0_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_q8_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q8_0(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q8_0(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 7
 using selected_weight = block_q2_K;
 using selected_activation = block_q8_K;
@@ -171,7 +202,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q2_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_q2_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q2_k(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q2_k(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 8
 using selected_weight = block_q3_K;
 using selected_activation = block_q8_K;
@@ -181,7 +212,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q3_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_q3_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q3_k(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q3_k(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 9
 using selected_weight = block_q4_K;
 using selected_activation = block_q8_K;
@@ -191,7 +222,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q4_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_q4_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q4_k(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q4_k(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 10
 using selected_weight = block_q5_K;
 using selected_activation = block_q8_K;
@@ -201,7 +232,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q5_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_q5_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q5_k(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q5_k(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 11
 using selected_weight = block_q6_K;
 using selected_activation = block_q8_K;
@@ -211,7 +242,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q6_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_q6_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_q6_k(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_q6_k(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 12
 using selected_weight = block_iq1_s;
 using selected_activation = block_q8_K;
@@ -221,7 +252,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq1_s_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq1_s(const std::uint8_t *, const float *, std::uint8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq1_s(w, x, xq, iq1.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq1_s(w, x, xq, iq1.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 13
 using selected_weight = block_iq1_m;
 using selected_activation = block_q8_K;
@@ -231,7 +262,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq1_m_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq1_m(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq1_m(w, x, xq, iq1.data(), fp16.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq1_m(w, x, xq, iq1.data(), fp16.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 14
 using selected_weight = block_iq2_s;
 using selected_activation = block_q8_K;
@@ -241,7 +272,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq2_s_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq2_s(const std::uint8_t *, const float *, std::uint8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq2_s(w, x, xq, iq2s.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_s(w, x, xq, iq2s.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 15
 using selected_weight = block_iq2_xs;
 using selected_activation = block_q8_K;
@@ -251,7 +282,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq2_xs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq2_xs(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs(w, x, xq, iq2xs.data(), signs.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 16
 using selected_weight = block_iq2_xxs;
 using selected_activation = block_q8_K;
@@ -261,7 +292,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq2_xxs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq2_xxs(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq2_xxs(w, x, xq, iq2xxs.data(), signs.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_xxs(w, x, xq, iq2xxs.data(), signs.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 17
 using selected_weight = block_iq3_s;
 using selected_activation = block_q8_K;
@@ -271,7 +302,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq3_s_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq3_s(const std::uint8_t *, const float *, std::uint8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq3_s(w, x, xq, iq3s.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq3_s(w, x, xq, iq3s.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 18
 using selected_weight = block_iq3_xxs;
 using selected_activation = block_q8_K;
@@ -281,7 +312,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq3_xxs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq3_xxs(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq3_xxs(w, x, xq, iq3xxs.data(), signs.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq3_xxs(w, x, xq, iq3xxs.data(), signs.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 19
 using selected_weight = block_iq4_nl;
 using selected_activation = block_q8_0;
@@ -291,7 +322,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_iq4_nl_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_iq4_nl(const std::uint8_t *, const float *, std::uint8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq4_nl(w, x, xq, iq4.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq4_nl(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 20
 using selected_weight = block_iq4_xs;
 using selected_activation = block_q8_K;
@@ -301,7 +332,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_iq4_xs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_iq4_xs(const std::uint8_t *, const float *, std::uint8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq4_xs(w, x, xq, iq4.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_iq4_xs(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 21
 using selected_weight = block_tq1_0;
 using selected_activation = block_q8_K;
@@ -311,7 +342,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_tq1_0_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_tq1_0(const std::uint8_t *, const float *, std::uint8_t *, const std::uint32_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_tq1_0(w, x, xq, powers, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_tq1_0(w, x, xq, powers, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 22
 using selected_weight = block_tq2_0;
 using selected_activation = block_q8_K;
@@ -321,7 +352,7 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_tq2_0_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 extern "C" void production_mul_mat_tq2_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_tq2_0(w, x, xq, y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_tq2_0(w, x, xq, y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 23
 using selected_weight = block_mxfp4;
 using selected_activation = block_q8_0;
@@ -331,7 +362,7 @@ constexpr int kElements = 32;
 #define selected_reference ggml_vec_dot_mxfp4_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_mxfp4(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_mxfp4(w, x, xq, fp4.data(), e8m0.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_mxfp4(w, x, xq, fp4.data(), e8m0.data(), y, kN, kK, runtimeM)
 #elif WEFT_MUL_MAT_FORMAT == 24
 using selected_weight = block_nvfp4;
 using selected_activation = block_q8_0;
@@ -341,44 +372,73 @@ constexpr int kElements = 64;
 #define selected_reference ggml_vec_dot_nvfp4_q8_0
 #define selected_quantize quantize_row_q8_0_ref
 extern "C" void production_mul_mat_nvfp4(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_nvfp4(w, x, xq, fp4.data(), ue4m3.data(), y, kN, kElements, kM)
+#define selected_call(w, x, xq, y) production_mul_mat_nvfp4(w, x, xq, fp4.data(), ue4m3.data(), y, kN, kK, runtimeM)
 #else
 #error "unknown WEFT_MUL_MAT_FORMAT"
 #endif
 
-int main() {
-  const std::vector<float> activation = activation_values(kM * kElements);
-  std::vector<float> expected(kM * kN, 0.0f);
-  std::vector<float> actual(kM * kN, 0.0f);
+int main(int argc, char **argv) {
+  if (argc != 3) {
+    std::fprintf(stderr, "usage: %s <decode|prefill> <repetitions>\n", argv[0]);
+    return 2;
+  }
+  const char *phase = argv[1];
+  if (std::strcmp(phase, "decode") == 0)
+    runtimeM = 1;
+  else if (std::strcmp(phase, "prefill") == 0)
+    runtimeM = 128;
+  else {
+    std::fprintf(stderr, "unsupported phase: %s\n", phase);
+    return 2;
+  }
+  const std::size_t repetitions = parse_repetitions(argv[2]);
+  if (repetitions == 0) {
+    std::fprintf(stderr, "repetitions must be positive\n");
+    return 2;
+  }
+  const std::vector<float> activation = activation_values(runtimeM * kK);
+  std::vector<float> expected(runtimeM * kN, 0.0f);
+  std::vector<float> actual(runtimeM * kN, 0.0f);
 
 #if WEFT_MUL_MAT_FORMAT == 0
-  std::vector<_Float16> weights(kN * kElements);
-  std::vector<_Float16> expected_workspace(kM * kElements);
-  std::vector<_Float16> actual_workspace(kM * kElements);
-  for (std::size_t index = 0; index < weights.size(); ++index)
-    weights[index] = static_cast<_Float16>(
+  std::vector<_Float16> weightRow(kK);
+  for (std::size_t index = 0; index < weightRow.size(); ++index)
+    weightRow[index] = static_cast<_Float16>(
         static_cast<float>(static_cast<int>((index * 19U) % 127U) - 63) / 13.0f);
+  std::vector<_Float16> weights(kN * kK);
+  for (std::size_t column = 0; column < kN; ++column)
+    std::memcpy(weights.data() + column * kK, weightRow.data(),
+                kK * sizeof(_Float16));
+  std::vector<_Float16> expected_workspace(runtimeM * kK);
+  std::vector<_Float16> actual_workspace(runtimeM * kK);
   for (std::size_t index = 0; index < expected_workspace.size(); ++index)
     expected_workspace[index] = static_cast<_Float16>(activation[index]);
-  for (std::size_t row = 0; row < kM; ++row)
-    for (std::size_t column = 0; column < kN; ++column)
-      for (int k = 0; k < kElements; ++k)
-        expected[row * kN + column] +=
-            static_cast<float>(weights[column * kElements + k]) *
-            static_cast<float>(expected_workspace[row * kElements + k]);
-  production_mul_mat_f16(weights.data(), activation.data(), actual_workspace.data(),
-                          actual.data(), kN, kElements, kM);
+  for (std::size_t row = 0; row < runtimeM; ++row) {
+    float sum = 0.0f;
+    for (std::size_t k = 0; k < kK; ++k)
+      sum += static_cast<float>(weightRow[k]) *
+             static_cast<float>(expected_workspace[row * kK + k]);
+    std::fill_n(expected.data() + row * kN, kN, sum);
+  }
+  auto run = [&] {
+    production_mul_mat_f16(weights.data(), activation.data(),
+                            actual_workspace.data(), actual.data(), kN, kK,
+                            runtimeM);
+  };
+  run();
   if (actual_workspace != expected_workspace) {
     std::fprintf(stderr, "f16 staging mismatch\n");
     return 1;
   }
 #else
-  std::vector<selected_activation> expected_workspace(kM * kElements / selected_xqk);
-  std::vector<selected_activation> actual_workspace(kM * kElements / selected_xqk);
-  for (std::size_t row = 0; row < kM; ++row)
-    selected_quantize(activation.data() + row * kElements,
-                      expected_workspace.data() + row * kElements / selected_xqk,
-                      kElements);
+  std::vector<selected_activation> expected_workspace(runtimeM * kK /
+                                                       selected_xqk);
+  std::vector<selected_activation> actual_workspace(runtimeM * kK /
+                                                     selected_xqk);
+  for (std::size_t row = 0; row < runtimeM; ++row)
+    selected_quantize(activation.data() + row * kK,
+                      expected_workspace.data() + row * kK / selected_xqk,
+                      kK);
 
   const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
   const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
@@ -413,21 +473,21 @@ int main() {
 
   std::mt19937 generator(0x4d554c4dU + WEFT_MUL_MAT_FORMAT);
   std::uniform_int_distribution<unsigned> bytes(0, 255);
-  std::vector<selected_weight> weights(kN * kElements / selected_wqk);
+  selected_weight weightRecord{};
+  std::vector<selected_weight> weightRow(kK / selected_wqk);
+  std::vector<float> expectedRows(runtimeM, 0.0f);
   bool found = false;
   for (int attempt = 0; attempt < 4096; ++attempt) {
-    auto *raw = reinterpret_cast<std::uint8_t *>(weights.data());
-    for (std::size_t index = 0; index < weights.size() * sizeof(selected_weight); ++index)
+    auto *raw = reinterpret_cast<std::uint8_t *>(&weightRecord);
+    for (std::size_t index = 0; index < sizeof(selected_weight); ++index)
       raw[index] = static_cast<std::uint8_t>(bytes(generator));
+    std::fill(weightRow.begin(), weightRow.end(), weightRecord);
     found = true;
-    for (std::size_t row = 0; row < kM; ++row) {
-      for (std::size_t column = 0; column < kN; ++column) {
-        selected_reference(
-            kElements, &expected[row * kN + column], 0,
-            weights.data() + column * kElements / selected_wqk, 0,
-            expected_workspace.data() + row * kElements / selected_xqk, 0, 1);
-        found = found && __builtin_isfinite(expected[row * kN + column]);
-      }
+    for (std::size_t row = 0; row < runtimeM; ++row) {
+      selected_reference(kK, &expectedRows[row], 0, weightRow.data(), 0,
+                         expected_workspace.data() + row * kK / selected_xqk,
+                         0, 1);
+      found = found && __builtin_isfinite(expectedRows[row]);
     }
     if (found)
       break;
@@ -436,10 +496,19 @@ int main() {
     std::fprintf(stderr, "failed to generate finite random encoded weights\n");
     return 2;
   }
-  selected_call(reinterpret_cast<const std::uint8_t *>(weights.data()),
-                activation.data(),
-                reinterpret_cast<std::uint8_t *>(actual_workspace.data()),
-                actual.data());
+  std::vector<selected_weight> weights(kN * weightRow.size());
+  for (std::size_t column = 0; column < kN; ++column)
+    std::memcpy(weights.data() + column * weightRow.size(), weightRow.data(),
+                weightRow.size() * sizeof(selected_weight));
+  for (std::size_t row = 0; row < runtimeM; ++row)
+    std::fill_n(expected.data() + row * kN, kN, expectedRows[row]);
+  auto run = [&] {
+    selected_call(reinterpret_cast<const std::uint8_t *>(weights.data()),
+                  activation.data(),
+                  reinterpret_cast<std::uint8_t *>(actual_workspace.data()),
+                  actual.data());
+  };
+  run();
   if (std::memcmp(actual_workspace.data(), expected_workspace.data(),
                   actual_workspace.size() * sizeof(selected_activation)) != 0) {
     std::fprintf(stderr, "activation workspace mismatch\n");
@@ -454,6 +523,23 @@ int main() {
       return 1;
     }
   }
-  std::printf("bit_exact=yes M=%zu N=%zu K=%d\n", kM, kN, kElements);
+  std::vector<std::uint8_t> flush(kFlushBytes, 1);
+  std::vector<double> samples;
+  samples.reserve(repetitions);
+  for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
+    evict_cache(flush);
+    const auto begin = std::chrono::steady_clock::now();
+    run();
+    const auto end = std::chrono::steady_clock::now();
+    samples.push_back(
+        std::chrono::duration<double, std::micro>(end - begin).count());
+  }
+  const double medianUs = median(samples);
+  const double operations = 2.0 * static_cast<double>(runtimeM) * kN * kK;
+  std::printf("target=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n", kTarget,
+              phase, runtimeM, kN, kK);
+  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", medianUs,
+              operations / medianUs / 1.0e3);
   return 0;
 }

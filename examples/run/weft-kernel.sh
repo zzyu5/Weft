@@ -159,9 +159,10 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
     link_path=${link_path_argument}
     runtime_target_define=${runtime_target_define_argument}
     runtime_kernel_define=${runtime_kernel_define_argument}
-    \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror \${extra_cflags} \
+    \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
+      \${extra_cflags} \
       -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
-    \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror -ffp-contract=off \
+    \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror -ffp-contract=fast \
       \${extra_cflags} \${runtime_target_define} \${runtime_kernel_define} \
       -march=\"\${march}\" -mabi=lp64d \
       runtime.cpp kernel.o \

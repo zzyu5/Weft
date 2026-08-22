@@ -4,6 +4,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,7 +19,37 @@
 
 namespace {
 
-constexpr std::size_t kElements = 256;
+#if defined(WEFT_TARGET_K1)
+constexpr const char *kTarget = "K1/X60";
+#else
+constexpr const char *kTarget = "SG2044";
+#endif
+constexpr std::size_t kRows = 1024;
+constexpr std::size_t kElements = 4096;
+constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
+volatile std::uint64_t flushSink = 0;
+
+std::size_t parse_repetitions(const char *text) {
+  char *end = nullptr;
+  const unsigned long value = std::strtoul(text, &end, 10);
+  return *text != '\0' && *end == '\0' && value != 0
+             ? static_cast<std::size_t>(value)
+             : 0;
+}
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const std::size_t middle = values.size() / 2;
+  return values.size() & 1U ? values[middle]
+                            : 0.5 * (values[middle - 1] + values[middle]);
+}
+
+void evict_cache(std::vector<std::uint8_t> &buffer) {
+  for (std::size_t offset = 0; offset < buffer.size(); offset += 64) {
+    buffer[offset] = static_cast<std::uint8_t>(buffer[offset] + 1U);
+    flushSink += buffer[offset];
+  }
+}
 
 std::vector<float> grid64(const std::uint64_t *table, std::size_t entries) {
   std::vector<float> result(entries * 8);
@@ -93,21 +124,20 @@ std::vector<float> ue4m3_table() {
 }
 
 template <typename Block, typename Reference>
-std::vector<Block> finite_random_records(Reference reference,
-                                         std::size_t block_elements) {
+Block finite_random_record(Reference reference, std::size_t block_elements) {
   std::mt19937 generator(0x57454654U + WEFT_ROW_FORMAT);
   std::uniform_int_distribution<unsigned> bytes(0, 255);
-  std::vector<Block> records(kElements / block_elements);
-  std::vector<float> probe(kElements);
+  Block record{};
+  std::vector<float> probe(block_elements);
   for (int attempt = 0; attempt < 4096; ++attempt) {
-    auto *raw = reinterpret_cast<std::uint8_t *>(records.data());
-    for (std::size_t index = 0; index < records.size() * sizeof(Block); ++index)
+    auto *raw = reinterpret_cast<std::uint8_t *>(&record);
+    for (std::size_t index = 0; index < sizeof(Block); ++index)
       raw[index] = static_cast<std::uint8_t>(bytes(generator));
-    reference(records.data(), probe.data(), kElements);
+    reference(&record, probe.data(), block_elements);
     if (std::all_of(probe.begin(), probe.end(), [](float value) {
           return __builtin_isfinite(value);
         })) {
-      return records;
+      return record;
     }
   }
   std::fprintf(stderr, "failed to generate finite random encoded data\n");
@@ -240,12 +270,26 @@ extern "C" void row_dequantize_nvfp4(const std::uint8_t *, const float *, const 
 #error "unknown WEFT_ROW_FORMAT"
 #endif
 
-int main() {
-  auto records =
-      finite_random_records<selected_block>(selected_reference, selected_qk);
-  std::vector<float> expected(kElements);
-  std::vector<float> actual(kElements);
-  selected_reference(records.data(), expected.data(), kElements);
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: %s <repetitions>\n", argv[0]);
+    return 2;
+  }
+  const std::size_t repetitions = parse_repetitions(argv[1]);
+  if (repetitions == 0) {
+    std::fprintf(stderr, "repetitions must be positive\n");
+    return 2;
+  }
+  const selected_block record =
+      finite_random_record<selected_block>(selected_reference, selected_qk);
+  std::vector<selected_block> inputRow(kElements / selected_qk, record);
+  std::vector<float> expectedRow(kElements);
+  selected_reference(inputRow.data(), expectedRow.data(), kElements);
+  std::vector<selected_block> input(kRows * inputRow.size());
+  for (std::size_t row = 0; row < kRows; ++row)
+    std::memcpy(input.data() + row * inputRow.size(), inputRow.data(),
+                inputRow.size() * sizeof(selected_block));
+  std::vector<float> actual(kRows * kElements);
 
   const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
   const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
@@ -267,62 +311,140 @@ int main() {
   (void)powers;
 
 #if WEFT_ROW_FORMAT == 0
-  row_dequantize_q1_0(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q1_0(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 1
-  row_dequantize_q4_0(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q4_0(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 2
-  row_dequantize_q4_1(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q4_1(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 3
-  row_dequantize_q5_0(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q5_0(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 4
-  row_dequantize_q5_1(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q5_1(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 5
-  row_dequantize_q8_0(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q8_0(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 6
-  row_dequantize_q2_k(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q2_k(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 7
-  row_dequantize_q3_k(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q3_k(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 8
-  row_dequantize_q4_k(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q4_k(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 9
-  row_dequantize_q5_k(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q5_k(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 10
-  row_dequantize_q6_k(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_q6_k(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 11
-  row_dequantize_iq1_s(reinterpret_cast<const std::uint8_t *>(records.data()), iq1.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq1_s(source, iq1.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 12
-  row_dequantize_iq1_m(reinterpret_cast<const std::uint8_t *>(records.data()), iq1.data(), fp16.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq1_m(source, iq1.data(), fp16.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 13
-  row_dequantize_iq2_s(reinterpret_cast<const std::uint8_t *>(records.data()), iq2s.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq2_s(source, iq2s.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 14
-  row_dequantize_iq2_xs(reinterpret_cast<const std::uint8_t *>(records.data()), iq2xs.data(), signs.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq2_xs(source, iq2xs.data(), signs.data(), target,
+                          kElements);
+  };
 #elif WEFT_ROW_FORMAT == 15
-  row_dequantize_iq2_xxs(reinterpret_cast<const std::uint8_t *>(records.data()), iq2xxs.data(), signs.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq2_xxs(source, iq2xxs.data(), signs.data(), target,
+                           kElements);
+  };
 #elif WEFT_ROW_FORMAT == 16
-  row_dequantize_iq3_s(reinterpret_cast<const std::uint8_t *>(records.data()), iq3s.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq3_s(source, iq3s.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 17
-  row_dequantize_iq3_xxs(reinterpret_cast<const std::uint8_t *>(records.data()), iq3xxs.data(), signs.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq3_xxs(source, iq3xxs.data(), signs.data(), target,
+                           kElements);
+  };
 #elif WEFT_ROW_FORMAT == 18
-  row_dequantize_iq4_nl(reinterpret_cast<const std::uint8_t *>(records.data()), iq4.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq4_nl(source, iq4.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 19
-  row_dequantize_iq4_xs(reinterpret_cast<const std::uint8_t *>(records.data()), iq4.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_iq4_xs(source, iq4.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 20
-  row_dequantize_tq1_0(reinterpret_cast<const std::uint8_t *>(records.data()), powers, actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_tq1_0(source, powers, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 21
-  row_dequantize_tq2_0(reinterpret_cast<const std::uint8_t *>(records.data()), actual.data(), kElements);
+  auto runRow = [](const std::uint8_t *source, float *target) {
+    row_dequantize_tq2_0(source, target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 22
-  row_dequantize_mxfp4(reinterpret_cast<const std::uint8_t *>(records.data()), fp4.data(), e8m0.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_mxfp4(source, fp4.data(), e8m0.data(), target, kElements);
+  };
 #elif WEFT_ROW_FORMAT == 23
-  row_dequantize_nvfp4(reinterpret_cast<const std::uint8_t *>(records.data()), fp4.data(), ue4m3.data(), actual.data(), kElements);
+  auto runRow = [&](const std::uint8_t *source, float *target) {
+    row_dequantize_nvfp4(source, fp4.data(), ue4m3.data(), target, kElements);
+  };
 #endif
 
-  for (std::size_t index = 0; index < kElements; ++index) {
-    if (std::memcmp(&actual[index], &expected[index], sizeof(float)) != 0) {
-      std::fprintf(stderr, "mismatch at %zu: actual=%a expected=%a\n", index,
-                   actual[index], expected[index]);
-      return 1;
+  auto run = [&] {
+    for (std::size_t row = 0; row < kRows; ++row)
+      runRow(reinterpret_cast<const std::uint8_t *>(
+                 input.data() + row * inputRow.size()),
+             actual.data() + row * kElements);
+  };
+  run();
+  for (std::size_t row = 0; row < kRows; ++row) {
+    for (std::size_t index = 0; index < kElements; ++index) {
+      const float value = actual[row * kElements + index];
+      if (std::memcmp(&value, &expectedRow[index], sizeof(float)) != 0) {
+        std::fprintf(stderr,
+                     "mismatch at row=%zu element=%zu: actual=%a expected=%a\n",
+                     row, index, value, expectedRow[index]);
+        return 1;
+      }
     }
   }
-  std::printf("bit_exact=yes elements=%zu\n", kElements);
+  std::vector<std::uint8_t> flush(kFlushBytes, 1);
+  std::vector<double> samples;
+  samples.reserve(repetitions);
+  for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
+    evict_cache(flush);
+    const auto begin = std::chrono::steady_clock::now();
+    run();
+    const auto end = std::chrono::steady_clock::now();
+    samples.push_back(
+        std::chrono::duration<double, std::micro>(end - begin).count());
+  }
+  const double medianUs = median(samples);
+  const double elements = static_cast<double>(kRows) * kElements;
+  std::printf("target=%s\nN=%zu\nK=%zu\n", kTarget, kRows, kElements);
+  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("cold_median_us=%.3f\ncold_melements_s=%.6f\n", medianUs,
+              elements / medianUs);
   return 0;
 }

@@ -131,7 +131,8 @@ tar -C "${local_root}" -cf - runtime.cpp |
     extra_cxx_flags=${extra_cxx_flags_argument}
     extra_define=${extra_define_argument}
 
-    \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \${extra_cxx_flags} \${extra_define} \
+    \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror -ffp-contract=fast \
+      \${extra_cxx_flags} \${extra_define} \
       -march=\"\${march}\" -mabi=lp64d \
       -I\"\${source_root}/ggml/include\" \
       -I\"\${source_root}/ggml/src\" \

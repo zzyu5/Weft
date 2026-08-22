@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: $0 <sg2044|k1> <q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4>" >&2
+if [[ $# -ne 3 ]]; then
+  echo "usage: $0 <sg2044|k1> <q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <repetitions>" >&2
   exit 2
 fi
 
 target=$1
 format=$2
+repetitions=$3
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compiler="${project_root}/build/tools/weft-compile/weft-compile"
 
@@ -35,6 +36,8 @@ case "${target}" in
     march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     vlen=128
     extra_flags=
+    link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
+    runtime_target_define=
     ;;
   k1)
     remote_host=k1
@@ -46,6 +49,8 @@ case "${target}" in
     march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
     vlen=256
     extra_flags=-fno-integrated-as
+    link_path=/usr/lib/riscv64-linux-gnu
+    runtime_target_define=-DWEFT_TARGET_K1=1
     ;;
   *)
     echo "unsupported Weft target: ${target}" >&2
@@ -79,6 +84,9 @@ printf -v cpu_argument '%q' "${remote_cpu}"
 printf -v march_argument '%q' "${march}"
 printf -v extra_flags_argument '%q' "${extra_flags}"
 printf -v format_argument '%q' "${format_id}"
+printf -v link_path_argument '%q' "${link_path}"
+printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
+printf -v repetitions_argument '%q' "${repetitions}"
 
 tar -C "${local_root}" -cf - kernel.c runtime.cpp |
   ssh "${remote_host}" "
@@ -101,21 +109,24 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
     march=${march_argument}
     extra_flags=${extra_flags_argument}
     format_id=${format_argument}
+    link_path=${link_path_argument}
+    runtime_target_define=${runtime_target_define_argument}
 
-    \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=off \
+    \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
       \${extra_flags} -march=\"\${march}\" -mabi=lp64d \
       -c kernel.c -o kernel.o
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
-      -Wno-unused-const-variable -ffp-contract=off \${extra_flags} \
+      -Wno-unused-const-variable -ffp-contract=fast \${extra_flags} \
+      \${runtime_target_define} \
       -DWEFT_ROW_FORMAT=\"\${format_id}\" \
       -march=\"\${march}\" -mabi=lp64d \
       -I\"\${source_root}/ggml/include\" \
       -I\"\${source_root}/ggml/src\" \
       -I\"\${source_root}/ggml/src/ggml-cpu\" \
       runtime.cpp kernel.o -L\"\${build_root}/bin\" \
-      -L/opt/tcrv-toolchains/gcc-15.2.0/lib \
-      -Wl,-rpath,\"\${build_root}/bin:/opt/tcrv-toolchains/gcc-15.2.0/lib\" \
+      -L\"\${link_path}\" \
+      -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o runtime
-    exec taskset -c \"\${cpu}\" ./runtime
+    exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
   "

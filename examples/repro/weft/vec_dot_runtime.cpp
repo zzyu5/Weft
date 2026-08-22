@@ -4,6 +4,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,16 +19,37 @@
 
 namespace {
 
-#if WEFT_VEC_DOT_FORMAT == 0
-constexpr int kElements = 128;
-#elif WEFT_VEC_DOT_FORMAT == 23
-constexpr int kElements = 64;
-#elif (WEFT_VEC_DOT_FORMAT >= 6 && WEFT_VEC_DOT_FORMAT <= 17) || \
-    (WEFT_VEC_DOT_FORMAT >= 19 && WEFT_VEC_DOT_FORMAT <= 21)
-constexpr int kElements = 256;
+#if defined(WEFT_TARGET_K1)
+constexpr const char *kTarget = "K1/X60";
 #else
-constexpr int kElements = 32;
+constexpr const char *kTarget = "SG2044";
 #endif
+constexpr int kElements = 4096;
+constexpr std::size_t kRows = 14336;
+constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
+volatile std::uint64_t flushSink = 0;
+
+std::size_t parse_repetitions(const char *text) {
+  char *end = nullptr;
+  const unsigned long value = std::strtoul(text, &end, 10);
+  return *text != '\0' && *end == '\0' && value != 0
+             ? static_cast<std::size_t>(value)
+             : 0;
+}
+
+double median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  const std::size_t middle = values.size() / 2;
+  return values.size() & 1U ? values[middle]
+                            : 0.5 * (values[middle - 1] + values[middle]);
+}
+
+void evict_cache(std::vector<std::uint8_t> &buffer) {
+  for (std::size_t offset = 0; offset < buffer.size(); offset += 64) {
+    buffer[offset] = static_cast<std::uint8_t>(buffer[offset] + 1U);
+    flushSink += buffer[offset];
+  }
+}
 
 std::vector<float> grid64(const std::uint64_t *table, std::size_t entries) {
   std::vector<float> result(entries * 8);
@@ -299,23 +321,36 @@ extern "C" void quantized_vec_dot_nvfp4_q8_0(const std::uint8_t *, const std::ui
 #error "unknown WEFT_VEC_DOT_FORMAT"
 #endif
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: %s <repetitions>\n", argv[0]);
+    return 2;
+  }
+  const std::size_t repetitions = parse_repetitions(argv[1]);
+  if (repetitions == 0) {
+    std::fprintf(stderr, "repetitions must be positive\n");
+    return 2;
+  }
+
   std::mt19937 generator(0x56444f54U + WEFT_VEC_DOT_FORMAT);
   std::uniform_int_distribution<unsigned> bytes(0, 255);
-  std::vector<selected_weight> weights(kElements / selected_wqk);
-  std::vector<selected_activation> activation(kElements / selected_xqk);
-  float expected = 0.0f;
+  selected_weight weightRecord{};
+  std::vector<selected_activation> activationRecord(selected_wqk /
+                                                       selected_xqk);
+  float recordExpected = 0.0f;
   bool found = false;
   for (int attempt = 0; attempt < 4096; ++attempt) {
-    auto *weight_bytes = reinterpret_cast<std::uint8_t *>(weights.data());
-    auto *activation_bytes = reinterpret_cast<std::uint8_t *>(activation.data());
-    for (std::size_t i = 0; i < weights.size() * sizeof(selected_weight); ++i)
+    auto *weight_bytes = reinterpret_cast<std::uint8_t *>(&weightRecord);
+    auto *activation_bytes =
+        reinterpret_cast<std::uint8_t *>(activationRecord.data());
+    for (std::size_t i = 0; i < sizeof(selected_weight); ++i)
       weight_bytes[i] = static_cast<std::uint8_t>(bytes(generator));
-    for (std::size_t i = 0; i < activation.size() * sizeof(selected_activation); ++i)
+    for (std::size_t i = 0;
+         i < activationRecord.size() * sizeof(selected_activation); ++i)
       activation_bytes[i] = static_cast<std::uint8_t>(bytes(generator));
-    selected_reference(kElements, &expected, 0, weights.data(), 0,
-                       activation.data(), 0, 1);
-    if (__builtin_isfinite(expected)) {
+    selected_reference(selected_wqk, &recordExpected, 0, &weightRecord, 0,
+                       activationRecord.data(), 0, 1);
+    if (__builtin_isfinite(recordExpected)) {
       found = true;
       break;
     }
@@ -324,6 +359,23 @@ int main() {
     std::fprintf(stderr, "failed to generate finite random encoded data\n");
     return 2;
   }
+
+  std::vector<selected_weight> weightRow(kElements / selected_wqk,
+                                         weightRecord);
+  std::vector<selected_activation> activation(kElements / selected_xqk);
+  for (std::size_t index = 0; index < activation.size(); ++index)
+    activation[index] = activationRecord[index % activationRecord.size()];
+  float expected = 0.0f;
+  selected_reference(kElements, &expected, 0, weightRow.data(), 0,
+                     activation.data(), 0, 1);
+  if (!__builtin_isfinite(expected)) {
+    std::fprintf(stderr, "non-finite full-row reference\n");
+    return 2;
+  }
+  std::vector<selected_weight> weights(kRows * weightRow.size());
+  for (std::size_t row = 0; row < kRows; ++row)
+    std::memcpy(weights.data() + row * weightRow.size(), weightRow.data(),
+                weightRow.size() * sizeof(selected_weight));
 
   const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
   const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
@@ -356,14 +408,41 @@ int main() {
   (void)fp4;
   (void)powers;
 
-  float actual = 0.0f;
-  selected_call(reinterpret_cast<const std::uint8_t *>(weights.data()),
-                reinterpret_cast<const std::uint8_t *>(activation.data()),
-                &actual);
-  if (std::memcmp(&actual, &expected, sizeof(float)) != 0) {
-    std::fprintf(stderr, "mismatch: actual=%a expected=%a\n", actual, expected);
-    return 1;
+  std::vector<float> output(kRows, 0.0f);
+  auto run = [&] {
+    for (std::size_t row = 0; row < kRows; ++row)
+      selected_call(
+          reinterpret_cast<const std::uint8_t *>(weights.data() +
+                                                 row * weightRow.size()),
+          reinterpret_cast<const std::uint8_t *>(activation.data()),
+          &output[row]);
+  };
+  run();
+  for (std::size_t row = 0; row < kRows; ++row) {
+    if (std::memcmp(&output[row], &expected, sizeof(float)) != 0) {
+      std::fprintf(stderr,
+                   "mismatch at row %zu: actual=%a expected=%a\n", row,
+                   output[row], expected);
+      return 1;
+    }
   }
-  std::printf("bit_exact=yes elements=%d\n", kElements);
+  std::vector<std::uint8_t> flush(kFlushBytes, 1);
+  std::vector<double> samples;
+  samples.reserve(repetitions);
+  for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
+    evict_cache(flush);
+    const auto begin = std::chrono::steady_clock::now();
+    run();
+    const auto end = std::chrono::steady_clock::now();
+    samples.push_back(
+        std::chrono::duration<double, std::micro>(end - begin).count());
+  }
+  const double medianUs = median(samples);
+  const double operations = 2.0 * static_cast<double>(kRows) * kElements;
+  std::printf("target=%s\nM=1\nN=%zu\nK=%d\n", kTarget, kRows,
+              kElements);
+  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", medianUs,
+              operations / medianUs / 1.0e3);
   return 0;
 }

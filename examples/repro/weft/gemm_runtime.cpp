@@ -17,7 +17,6 @@ extern "C" void gemm_f32(const float *A, const float *B, float *C,
 #endif
 
 namespace {
-constexpr std::size_t kM = 128;
 constexpr std::size_t kK = 4096;
 constexpr std::size_t kN = 4096;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
@@ -47,17 +46,25 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: %s <repetitions>\n", argv[0]);
+  if (argc != 3) {
+    std::fprintf(stderr, "usage: %s <decode|prefill> <repetitions>\n", argv[0]);
     return 2;
   }
-  const std::size_t repetitions = parse_repetitions(argv[1]);
+  const char *phase = argv[1];
+  const std::size_t m = std::strcmp(phase, "decode") == 0
+                            ? 1
+                            : std::strcmp(phase, "prefill") == 0 ? 128 : 0;
+  if (m == 0) {
+    std::fprintf(stderr, "unsupported phase: %s\n", phase);
+    return 2;
+  }
+  const std::size_t repetitions = parse_repetitions(argv[2]);
   if (repetitions == 0)
     return 2;
-  std::vector<float> lhs(kM * kK, 1.0F / 4096.0F);
+  std::vector<float> lhs(m * kK, 1.0F / 4096.0F);
   std::vector<float> rhs(kK * kN, 1.0F);
-  std::vector<float> output(kM * kN, 0.0F);
-  gemm_f32(lhs.data(), rhs.data(), output.data(), kM, kK, kN);
+  std::vector<float> output(m * kN, 0.0F);
+  gemm_f32(lhs.data(), rhs.data(), output.data(), m, kK, kN);
   const float expected = 1.0F;
   for (std::size_t index = 0; index < output.size(); ++index) {
     if (std::memcmp(&expected, &output[index], sizeof(float)) != 0) {
@@ -73,16 +80,16 @@ int main(int argc, char **argv) {
     std::fill(output.begin(), output.end(), 0.0F);
     evict_cache(flush);
     const auto begin = std::chrono::steady_clock::now();
-    gemm_f32(lhs.data(), rhs.data(), output.data(), kM, kK, kN);
+    gemm_f32(lhs.data(), rhs.data(), output.data(), m, kK, kN);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::micro>(end - begin).count());
   }
   const double median_us = median(samples);
   const double operations =
-      2.0 * static_cast<double>(kM) * kK * static_cast<double>(kN);
-  std::printf("kernel=gemm_f32\ntarget=%s\nM=%zu\nN=%zu\nK=%zu\n",
-              WEFT_TARGET_NAME, kM, kN, kK);
+      2.0 * static_cast<double>(m) * kK * static_cast<double>(kN);
+  std::printf("kernel=gemm_f32\ntarget=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n",
+              WEFT_TARGET_NAME, phase, m, kN, kK);
   std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", median_us,
               operations / median_us / 1.0e3);
