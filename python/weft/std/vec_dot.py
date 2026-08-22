@@ -1,0 +1,926 @@
+from __future__ import annotations
+
+from weft.language import L, View, admit, commit, f32, i32, index, transfer, u32
+
+from .encodings import (
+    IQ1_M,
+    IQ1_S,
+    IQ2_S,
+    IQ2_XS,
+    IQ2_XXS,
+    IQ3_S,
+    IQ3_XXS,
+    IQ4_NL,
+    IQ4_XS,
+    MXFP4,
+    NVFP4,
+    Q1_0,
+    Q2_K,
+    Q3_K,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q4_K,
+    Q5_K,
+    Q6_K,
+    Q8_0,
+    Q8_1,
+    Q8_K,
+    TQ1_0,
+    TQ2_0,
+)
+from .quant_fragments import exponent_scale, high_bit_plane, nonlinear_lookup, radix3_digit
+
+
+def _dot_q4_values(q, x, zero: int = 0):
+    low = i32(0)
+    high = i32(0)
+    for j in range(16):
+        low += (i32(q[j]) - i32(zero)) * i32(x[j])
+        high += (i32(q[j + 16]) - i32(zero)) * i32(x[j + 16])
+    return low + high
+
+
+def _dot_codebook32(q, x, codebook):
+    low = i32(0)
+    high = i32(0)
+    for j in range(16):
+        low += i32(nonlinear_lookup(codebook, q[j])) * i32(x[j])
+        high += i32(nonlinear_lookup(codebook, q[j + 16])) * i32(x[j + 16])
+    return low + high
+
+
+def _q3_scale(scales, sub):
+    quarter = sub // 4
+    position = sub % 4
+    source = u32(scales[position])
+    if quarter == 1:
+        source = u32(scales[4 + position])
+    if quarter == 2:
+        source = u32(scales[position])
+    if quarter == 3:
+        source = u32(scales[4 + position])
+    shift = i32(0)
+    if quarter >= 2:
+        shift = i32(4)
+    low = (source >> u32(shift)) & u32(15)
+    high = (u32(scales[8 + position]) >> u32(quarter * 2)) & u32(3)
+    return i32(low | (high << u32(4))) - i32(32)
+
+
+def _signed_grid8(grid, signs, grid_index, sign_index, x, base):
+    result = i32(0)
+    for lane in range(8):
+        value = i32(nonlinear_lookup(grid, u32(grid_index) * u32(8) + u32(lane)))
+        sign = i32(nonlinear_lookup(signs, u32(sign_index) * u32(8) + u32(lane)))
+        result += value * sign * i32(x[base + lane])
+    return result
+
+
+def _grid8(grid, grid_index, x, base):
+    result = i32(0)
+    for lane in range(8):
+        value = i32(nonlinear_lookup(grid, u32(grid_index) * u32(8) + u32(lane)))
+        result += value * i32(x[base + lane])
+    return result
+
+
+def vec_dot_q1_0_q8_0(
+    W: View[Q1_0, (K,)],
+    X: View[Q8_0, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=128) as wb:
+        w = admit(W[wb]) @ transfer
+        subtotal = f32(0.0)
+        quarter = index(0)
+        with L.subs(wb, extent=32) as xb:
+            x = admit(X[xb]) @ transfer
+            integer = i32(0)
+            for byte in range(4):
+                bits = w.q[quarter * 4 + byte]
+                for lane in range(8):
+                    value = -i32(x.q[byte * 8 + lane])
+                    if ((u32(bits) >> u32(lane)) & u32(1)) != u32(0):
+                        value = i32(x.q[byte * 8 + lane])
+                    integer += value
+            subtotal += f32(x.d) * f32(integer)
+            quarter += index(1)
+        result += f32(w.d) * subtotal
+    commit(result, Y[0])
+
+
+def vec_dot_q4_0_q8_0(
+    W: View[Q4_0, (K,)],
+    X: View[Q8_0, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = _dot_q4_values(w.q, x.q, zero=8)
+        result += f32(integer) * f32(w.d) * f32(x.d)
+    commit(result, Y[0])
+
+
+def vec_dot_q4_1_q8_1(
+    W: View[Q4_1, (K,)],
+    X: View[Q8_1, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = _dot_q4_values(w.q, x.q)
+        result += (f32(w.d) * f32(x.d)) * f32(integer) + f32(w.m) * f32(x.s)
+    commit(result, Y[0])
+
+
+def vec_dot_q5_0_q8_0(
+    W: View[Q5_0, (K,)],
+    X: View[Q8_0, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        low = i32(0)
+        high = i32(0)
+        for j in range(16):
+            q0 = high_bit_plane(w.q[j], w.qh[j // 8], j % 8) - i32(16)
+            q1 = high_bit_plane(w.q[j + 16], w.qh[(j + 16) // 8], (j + 16) % 8) - i32(16)
+            low += q0 * i32(x.q[j])
+            high += q1 * i32(x.q[j + 16])
+        result += (f32(w.d) * f32(x.d)) * f32(low + high)
+    commit(result, Y[0])
+
+
+def vec_dot_q5_1_q8_1(
+    W: View[Q5_1, (K,)],
+    X: View[Q8_1, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        low = i32(0)
+        high = i32(0)
+        for j in range(16):
+            q0 = high_bit_plane(w.q[j], w.qh[j // 8], j % 8)
+            q1 = high_bit_plane(w.q[j + 16], w.qh[(j + 16) // 8], (j + 16) % 8)
+            low += q0 * i32(x.q[j])
+            high += q1 * i32(x.q[j + 16])
+        result += (f32(w.d) * f32(x.d)) * f32(low + high) + f32(w.m) * f32(x.s)
+    commit(result, Y[0])
+
+
+def vec_dot_q8_0_q8_0(
+    W: View[Q8_0, (K,)],
+    X: View[Q8_0, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = i32(0)
+        for j in range(32):
+            integer += i32(w.q[j]) * i32(x.q[j])
+        result += f32(integer) * (f32(w.d) * f32(x.d))
+    commit(result, Y[0])
+
+
+def vec_dot_q2_k_q8_k(
+    W: View[Q2_K, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        scaled = i32(0)
+        minimum = i32(0)
+        for sub in range(16):
+            metadata = u32(w.scales[sub])
+            minimum += i32(x.bsum[sub]) * i32(metadata >> u32(4))
+            partial = i32(0)
+            for lane in range(16):
+                j = sub * 16 + lane
+                within = j % 128
+                packed = w.q[(j // 128) * 32 + within % 32]
+                q = (u32(packed) >> u32((within // 32) * 2)) & u32(3)
+                partial += i32(x.q[j]) * i32(q)
+            scaled += i32(metadata & u32(15)) * partial
+        result += f32(x.ds) * f32(w.d) * f32(scaled) - f32(x.ds) * f32(w.dmin) * f32(minimum)
+    commit(result, Y[0])
+
+
+def vec_dot_q3_k_q8_k(
+    W: View[Q3_K, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    lane0 = f32(0.0)
+    lane1 = f32(0.0)
+    lane2 = f32(0.0)
+    lane3 = f32(0.0)
+    lane4 = f32(0.0)
+    lane5 = f32(0.0)
+    lane6 = f32(0.0)
+    lane7 = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        acc0 = i32(0)
+        acc1 = i32(0)
+        acc2 = i32(0)
+        acc3 = i32(0)
+        acc4 = i32(0)
+        acc5 = i32(0)
+        acc6 = i32(0)
+        acc7 = i32(0)
+        for sub in range(16):
+            scale = _q3_scale(w.scales, sub)
+            for lane in range(16):
+                j = sub * 16 + lane
+                within = j % 128
+                packed = w.q[(j // 128) * 32 + within % 32]
+                low = (u32(packed) >> u32((within // 32) * 2)) & u32(3)
+                high = (u32(w.hmask[j % 32]) >> u32(j // 32)) & u32(1)
+                q = i32(low) + i32(high) * i32(4) - i32(4)
+                product = scale * q * i32(x.q[j])
+                which = lane % 8
+                if which == 0:
+                    acc0 += product
+                if which == 1:
+                    acc1 += product
+                if which == 2:
+                    acc2 += product
+                if which == 3:
+                    acc3 += product
+                if which == 4:
+                    acc4 += product
+                if which == 5:
+                    acc5 += product
+                if which == 6:
+                    acc6 += product
+                if which == 7:
+                    acc7 += product
+        scale = f32(w.d) * f32(x.ds)
+        lane0 += scale * f32(acc0)
+        lane1 += scale * f32(acc1)
+        lane2 += scale * f32(acc2)
+        lane3 += scale * f32(acc3)
+        lane4 += scale * f32(acc4)
+        lane5 += scale * f32(acc5)
+        lane6 += scale * f32(acc6)
+        lane7 += scale * f32(acc7)
+    result = f32(0.0)
+    result += lane0
+    result += lane1
+    result += lane2
+    result += lane3
+    result += lane4
+    result += lane5
+    result += lane6
+    result += lane7
+    commit(result, Y[0])
+
+
+def vec_dot_q4_k_q8_k(
+    W: View[Q4_K, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    lane0 = f32(0.0)
+    lane1 = f32(0.0)
+    lane2 = f32(0.0)
+    lane3 = f32(0.0)
+    lane4 = f32(0.0)
+    lane5 = f32(0.0)
+    lane6 = f32(0.0)
+    lane7 = f32(0.0)
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        minimum = i32(0)
+        acc0 = i32(0)
+        acc1 = i32(0)
+        acc2 = i32(0)
+        acc3 = i32(0)
+        acc4 = i32(0)
+        acc5 = i32(0)
+        acc6 = i32(0)
+        acc7 = i32(0)
+        for sub in range(8):
+            minimum += (i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])) * i32(w.m[sub])
+            scale = i32(w.sc[sub])
+            for lane in range(32):
+                j = sub * 32 + lane
+                product = scale * i32(w.q[j]) * i32(x.q[j])
+                which = lane % 8
+                if which == 0:
+                    acc0 += product
+                if which == 1:
+                    acc1 += product
+                if which == 2:
+                    acc2 += product
+                if which == 3:
+                    acc3 += product
+                if which == 4:
+                    acc4 += product
+                if which == 5:
+                    acc5 += product
+                if which == 6:
+                    acc6 += product
+                if which == 7:
+                    acc7 += product
+        scale = f32(w.d) * f32(x.ds)
+        lane0 += scale * f32(acc0)
+        lane1 += scale * f32(acc1)
+        lane2 += scale * f32(acc2)
+        lane3 += scale * f32(acc3)
+        lane4 += scale * f32(acc4)
+        lane5 += scale * f32(acc5)
+        lane6 += scale * f32(acc6)
+        lane7 += scale * f32(acc7)
+        result -= (f32(w.dmin) * f32(x.ds)) * f32(minimum)
+    result += lane0
+    result += lane1
+    result += lane2
+    result += lane3
+    result += lane4
+    result += lane5
+    result += lane6
+    result += lane7
+    commit(result, Y[0])
+
+
+def vec_dot_q5_k_q8_k(
+    W: View[Q5_K, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    lane0 = f32(0.0)
+    lane1 = f32(0.0)
+    lane2 = f32(0.0)
+    lane3 = f32(0.0)
+    lane4 = f32(0.0)
+    lane5 = f32(0.0)
+    lane6 = f32(0.0)
+    lane7 = f32(0.0)
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        minimum = i32(0)
+        acc0 = i32(0)
+        acc1 = i32(0)
+        acc2 = i32(0)
+        acc3 = i32(0)
+        acc4 = i32(0)
+        acc5 = i32(0)
+        acc6 = i32(0)
+        acc7 = i32(0)
+        for sub in range(8):
+            minimum += (i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])) * i32(w.m[sub])
+            scale = i32(w.sc[sub])
+            for lane in range(32):
+                j = sub * 32 + lane
+                q = high_bit_plane(w.q[j], w.qh[j % 32], j // 32)
+                product = scale * q * i32(x.q[j])
+                which = lane % 8
+                if which == 0:
+                    acc0 += product
+                if which == 1:
+                    acc1 += product
+                if which == 2:
+                    acc2 += product
+                if which == 3:
+                    acc3 += product
+                if which == 4:
+                    acc4 += product
+                if which == 5:
+                    acc5 += product
+                if which == 6:
+                    acc6 += product
+                if which == 7:
+                    acc7 += product
+        scale = f32(w.d) * f32(x.ds)
+        lane0 += scale * f32(acc0)
+        lane1 += scale * f32(acc1)
+        lane2 += scale * f32(acc2)
+        lane3 += scale * f32(acc3)
+        lane4 += scale * f32(acc4)
+        lane5 += scale * f32(acc5)
+        lane6 += scale * f32(acc6)
+        lane7 += scale * f32(acc7)
+        result -= (f32(w.dmin) * f32(x.ds)) * f32(minimum)
+    result += lane0
+    result += lane1
+    result += lane2
+    result += lane3
+    result += lane4
+    result += lane5
+    result += lane6
+    result += lane7
+    commit(result, Y[0])
+
+
+def vec_dot_q6_k_q8_k(
+    W: View[Q6_K, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    lane0 = f32(0.0)
+    lane1 = f32(0.0)
+    lane2 = f32(0.0)
+    lane3 = f32(0.0)
+    lane4 = f32(0.0)
+    lane5 = f32(0.0)
+    lane6 = f32(0.0)
+    lane7 = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        acc0 = i32(0)
+        acc1 = i32(0)
+        acc2 = i32(0)
+        acc3 = i32(0)
+        acc4 = i32(0)
+        acc5 = i32(0)
+        acc6 = i32(0)
+        acc7 = i32(0)
+        for sub in range(16):
+            scale = i32(w.scales[sub])
+            for lane in range(16):
+                j = sub * 16 + lane
+                within = j % 128
+                ql = w.ql[(j // 128) * 64 + within % 64]
+                low = (u32(ql) >> u32((within // 64) * 4)) & u32(15)
+                qh = w.qh[(j // 128) * 32 + within % 32]
+                high = (u32(qh) >> u32((within // 32) * 2)) & u32(3)
+                q = i32(low | (high << u32(4))) - i32(32)
+                product = scale * q * i32(x.q[j])
+                which = lane % 8
+                if which == 0:
+                    acc0 += product
+                if which == 1:
+                    acc1 += product
+                if which == 2:
+                    acc2 += product
+                if which == 3:
+                    acc3 += product
+                if which == 4:
+                    acc4 += product
+                if which == 5:
+                    acc5 += product
+                if which == 6:
+                    acc6 += product
+                if which == 7:
+                    acc7 += product
+        scale = f32(w.d) * f32(x.ds)
+        lane0 += scale * f32(acc0)
+        lane1 += scale * f32(acc1)
+        lane2 += scale * f32(acc2)
+        lane3 += scale * f32(acc3)
+        lane4 += scale * f32(acc4)
+        lane5 += scale * f32(acc5)
+        lane6 += scale * f32(acc6)
+        lane7 += scale * f32(acc7)
+    result = f32(0.0)
+    result += lane0
+    result += lane1
+    result += lane2
+    result += lane3
+    result += lane4
+    result += lane5
+    result += lane6
+    result += lane7
+    commit(result, Y[0])
+
+
+def vec_dot_iq1_s_q8_k(
+    W: View[IQ1_S, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (16384,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        main = i32(0)
+        correction = i32(0)
+        for group in range(8):
+            metadata = u32(w.qh[group])
+            scale = i32(((metadata >> u32(12)) & u32(7)) * u32(2) + u32(1))
+            group_sum = i32(0)
+            for entry in range(4):
+                grid_index = u32(w.q[group * 4 + entry]) | (
+                    ((metadata >> u32(entry * 3)) & u32(7)) << u32(8)
+                )
+                group_sum += _grid8(grid, grid_index, x.q, group * 32 + entry * 8)
+            delta = i32(1)
+            if ((metadata >> u32(15)) & u32(1)) != u32(0):
+                delta = i32(-1)
+            main += scale * group_sum
+            correction += scale * delta * (i32(x.bsum[group * 2]) + i32(x.bsum[group * 2 + 1]))
+        combined = f32(main) + f32(0.125) * f32(correction)
+        result += f32(w.d) * f32(x.ds) * combined
+    commit(result, Y[0])
+
+
+def vec_dot_iq1_m_q8_k(
+    W: View[IQ1_M, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (16384,)],
+    f16_bits: View[f32, (65536,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        sc0 = u32(w.scales[0]) | (u32(w.scales[1]) << u32(8))
+        sc1 = u32(w.scales[2]) | (u32(w.scales[3]) << u32(8))
+        sc2 = u32(w.scales[4]) | (u32(w.scales[5]) << u32(8))
+        sc3 = u32(w.scales[6]) | (u32(w.scales[7]) << u32(8))
+        scale_bits = (sc0 >> u32(12)) | ((sc1 >> u32(8)) & u32(0x00F0))
+        scale_bits = scale_bits | ((sc2 >> u32(4)) & u32(0x0F00))
+        scale_bits = scale_bits | (sc3 & u32(0xF000))
+        block_scale = nonlinear_lookup(f16_bits, scale_bits)
+        main = i32(0)
+        correction = i32(0)
+        for group in range(8):
+            sum10 = i32(0)
+            sum11 = i32(0)
+            sum20 = i32(0)
+            sum21 = i32(0)
+            for entry in range(4):
+                qh = u32(w.qh[group * 2 + entry // 2])
+                high_shift = i32(0)
+                delta_shift = i32(3)
+                if entry % 2 == 1:
+                    high_shift = i32(4)
+                    delta_shift = i32(7)
+                grid_index = u32(w.q[group * 4 + entry]) | (
+                    ((qh >> u32(high_shift)) & u32(7)) << u32(8)
+                )
+                dot = _grid8(grid, grid_index, x.q, group * 32 + entry * 8)
+                qsum = i32(0)
+                for lane in range(8):
+                    qsum += i32(x.q[group * 32 + entry * 8 + lane])
+                delta = i32(1)
+                if ((qh >> u32(delta_shift)) & u32(1)) != u32(0):
+                    delta = i32(-1)
+                if entry < 2:
+                    sum10 += dot
+                    sum20 += qsum * delta
+                if entry >= 2:
+                    sum11 += dot
+                    sum21 += qsum * delta
+            word = u32(w.scales[2 * (group // 2)]) | (
+                u32(w.scales[2 * (group // 2) + 1]) << u32(8)
+            )
+            shift = (group % 2) * 6
+            ls1 = i32(((word >> u32(shift)) & u32(7)) * u32(2) + u32(1))
+            ls2 = i32(((word >> u32(shift + 3)) & u32(7)) * u32(2) + u32(1))
+            main += sum10 * ls1 + sum11 * ls2
+            correction += sum20 * ls1 + sum21 * ls2
+        combined = f32(main) + f32(0.125) * f32(correction)
+        result += f32(block_scale) * f32(x.ds) * combined
+    commit(result, Y[0])
+
+
+def vec_dot_iq2_xxs_q8_k(
+    W: View[IQ2_XXS, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (2048,)],
+    signs: View[f32, (1024,)],
+    Y: View[f32, (1,)],
+):
+    sumf = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        block_sum = i32(0)
+        for group in range(8):
+            word0 = u32(w.q[group * 4]) | (u32(w.q[group * 4 + 1]) << u32(16))
+            word1 = u32(w.q[group * 4 + 2]) | (u32(w.q[group * 4 + 3]) << u32(16))
+            local = i32(0)
+            for entry in range(4):
+                grid_index = (word0 >> u32(entry * 8)) & u32(255)
+                sign_index = (word1 >> u32(entry * 7)) & u32(127)
+                local += _signed_grid8(
+                    grid, signs, grid_index, sign_index, x.q, group * 32 + entry * 8
+                )
+            scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
+            block_sum += local * scale
+        sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
+    commit(f32(0.125) * sumf, Y[0])
+
+
+def vec_dot_iq2_xs_q8_k(
+    W: View[IQ2_XS, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (4096,)],
+    signs: View[f32, (1024,)],
+    Y: View[f32, (1,)],
+):
+    sumf = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        block_sum = i32(0)
+        for group in range(8):
+            first = i32(0)
+            second = i32(0)
+            for entry in range(4):
+                code = u32(w.q[group * 4 + entry])
+                dot = _signed_grid8(
+                    grid,
+                    signs,
+                    code & u32(511),
+                    code >> u32(9),
+                    x.q,
+                    group * 32 + entry * 8,
+                )
+                if entry < 2:
+                    first += dot
+                if entry >= 2:
+                    second += dot
+            metadata = u32(w.scales[group])
+            ls1 = i32((metadata & u32(15)) * u32(2) + u32(1))
+            ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
+            block_sum += first * ls1 + second * ls2
+        sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
+    commit(f32(0.125) * sumf, Y[0])
+
+
+def vec_dot_iq2_s_q8_k(
+    W: View[IQ2_S, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (8192,)],
+    Y: View[f32, (1,)],
+):
+    sumf = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        block_sum = i32(0)
+        for group in range(8):
+            first = i32(0)
+            second = i32(0)
+            for entry in range(4):
+                grid_index = u32(w.q[group * 4 + entry]) | (
+                    ((u32(w.qh[group]) >> u32(entry * 2)) & u32(3)) << u32(8)
+                )
+                local = i32(0)
+                sign_byte = u32(w.q[32 + group * 4 + entry])
+                for lane in range(8):
+                    sign = i32(1)
+                    if ((sign_byte >> u32(lane)) & u32(1)) != u32(0):
+                        sign = i32(-1)
+                    value = i32(
+                        nonlinear_lookup(grid, grid_index * u32(8) + u32(lane))
+                    )
+                    local += i32(x.q[group * 32 + entry * 8 + lane]) * value * sign
+                if entry < 2:
+                    first += local
+                if entry >= 2:
+                    second += local
+            metadata = u32(w.scales[group])
+            ls1 = i32((metadata & u32(15)) * u32(2) + u32(1))
+            ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
+            block_sum += ls1 * first + ls2 * second
+        sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
+    commit(f32(0.125) * sumf, Y[0])
+
+
+def vec_dot_iq3_xxs_q8_k(
+    W: View[IQ3_XXS, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (1024,)],
+    signs: View[f32, (1024,)],
+    Y: View[f32, (1,)],
+):
+    sumf = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        block_sum = i32(0)
+        for group in range(8):
+            metadata_base = 64 + group * 4
+            metadata = u32(w.q[metadata_base]) | (u32(w.q[metadata_base + 1]) << u32(8))
+            metadata = metadata | (u32(w.q[metadata_base + 2]) << u32(16))
+            metadata = metadata | (u32(w.q[metadata_base + 3]) << u32(24))
+            local = i32(0)
+            for entry in range(4):
+                sign_index = (metadata >> u32(entry * 7)) & u32(127)
+                for lane in range(4):
+                    q0 = i32(
+                        nonlinear_lookup(
+                            grid,
+                            u32(w.q[group * 8 + entry * 2]) * u32(4) + u32(lane),
+                        )
+                    )
+                    q1 = i32(
+                        nonlinear_lookup(
+                            grid,
+                            u32(w.q[group * 8 + entry * 2 + 1]) * u32(4) + u32(lane),
+                        )
+                    )
+                    s0 = i32(
+                        nonlinear_lookup(signs, sign_index * u32(8) + u32(lane))
+                    )
+                    s1 = i32(
+                        nonlinear_lookup(signs, sign_index * u32(8) + u32(lane + 4))
+                    )
+                    base = group * 32 + entry * 8
+                    local += q0 * i32(x.q[base + lane]) * s0
+                    local += q1 * i32(x.q[base + lane + 4]) * s1
+            scale = i32((metadata >> u32(28)) * u32(2) + u32(1))
+            block_sum += local * scale
+        sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
+    commit(f32(0.25) * sumf, Y[0])
+
+
+def vec_dot_iq3_s_q8_k(
+    W: View[IQ3_S, (K,)],
+    X: View[Q8_K, (K,)],
+    grid: View[f32, (2048,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        block_sum = i32(0)
+        for group in range(8):
+            local = i32(0)
+            for entry in range(4):
+                qh = u32(w.qh[group])
+                grid0 = u32(w.q[group * 8 + entry * 2]) | (
+                    ((qh >> u32(entry * 2)) & u32(1)) << u32(8)
+                )
+                grid1 = u32(w.q[group * 8 + entry * 2 + 1]) | (
+                    ((qh >> u32(entry * 2 + 1)) & u32(1)) << u32(8)
+                )
+                sign_byte = u32(w.signs[group * 4 + entry])
+                for lane in range(4):
+                    sign0 = i32(1)
+                    sign1 = i32(1)
+                    if ((sign_byte >> u32(lane)) & u32(1)) != u32(0):
+                        sign0 = i32(-1)
+                    if ((sign_byte >> u32(lane + 4)) & u32(1)) != u32(0):
+                        sign1 = i32(-1)
+                    q0 = i32(nonlinear_lookup(grid, grid0 * u32(4) + u32(lane)))
+                    q1 = i32(nonlinear_lookup(grid, grid1 * u32(4) + u32(lane)))
+                    base = group * 32 + entry * 8
+                    local += q0 * i32(x.q[base + lane]) * sign0
+                    local += q1 * i32(x.q[base + lane + 4]) * sign1
+            metadata = u32(w.scales[group // 2])
+            shift = (group % 2) * 4
+            scale = i32(((metadata >> u32(shift)) & u32(15)) * u32(2) + u32(1))
+            block_sum += local * scale
+        result += f32(w.d) * f32(x.ds) * f32(block_sum)
+    commit(result, Y[0])
+
+
+def vec_dot_iq4_nl_q8_0(
+    W: View[IQ4_NL, (K,)],
+    X: View[Q8_0, (K,)],
+    codebook: View[f32, (16,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = _dot_codebook32(w.q, x.q, codebook)
+        result += (f32(x.d) * f32(w.d)) * f32(integer)
+    commit(result, Y[0])
+
+
+def vec_dot_iq4_xs_q8_k(
+    W: View[IQ4_XS, (K,)],
+    X: View[Q8_K, (K,)],
+    codebook: View[f32, (16,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        for sub in range(8):
+            low = u32(w.scales_l[sub // 2])
+            shift = (sub % 2) * 4
+            scale_low = (low >> u32(shift)) & u32(15)
+            scale_high = (u32(w.scales_h) >> u32(sub * 2)) & u32(3)
+            scale = i32(scale_low | (scale_high << u32(4))) - i32(32)
+            integer = i32(0)
+            for j in range(32):
+                q = i32(nonlinear_lookup(codebook, w.q[sub * 32 + j]))
+                integer += q * i32(x.q[sub * 32 + j])
+            block_scale = f32(w.d) * f32(x.ds) * f32(scale)
+            result += block_scale * f32(integer)
+    commit(result, Y[0])
+
+
+def vec_dot_tq1_0_q8_k(
+    W: View[TQ1_0, (K,)],
+    X: View[Q8_K, (K,)],
+    powers: View[u32, (5,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = i32(0)
+        for j in range(32):
+            for digit in range(5):
+                q = radix3_digit(powers, w.q[j], digit)
+                integer += q * i32(x.q[digit * 32 + j])
+        for j in range(16):
+            for digit in range(5):
+                q = radix3_digit(powers, w.q[32 + j], digit)
+                integer += q * i32(x.q[160 + digit * 16 + j])
+        for digit in range(4):
+            for j in range(4):
+                q = radix3_digit(powers, w.qh[j], digit)
+                integer += q * i32(x.q[240 + digit * 4 + j])
+        result += f32(integer) * (f32(w.d) * f32(x.ds))
+    commit(result, Y[0])
+
+
+def vec_dot_tq2_0_q8_k(
+    W: View[TQ2_0, (K,)],
+    X: View[Q8_K, (K,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = i32(0)
+        for chunk in range(2):
+            for digit in range(4):
+                for lane in range(32):
+                    packed = w.q[chunk * 32 + lane]
+                    q = i32((u32(packed) >> u32(digit * 2)) & u32(3)) - i32(1)
+                    integer += i32(x.q[chunk * 128 + digit * 32 + lane]) * q
+        scale = f32(x.ds) * f32(w.d)
+        result += f32(integer) * scale
+    commit(result, Y[0])
+
+
+def vec_dot_mxfp4_q8_0(
+    W: View[MXFP4, (K,)],
+    X: View[Q8_0, (K,)],
+    codebook: View[f32, (16,)],
+    e8m0_scale: View[f32, (256,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=32) as kb:
+        w = admit(W[kb]) @ transfer
+        x = admit(X[kb]) @ transfer
+        integer = _dot_codebook32(w.q, x.q, codebook)
+        scale = f32(x.d) * exponent_scale(e8m0_scale, w.e)
+        result += scale * f32(integer)
+    commit(result, Y[0])
+
+
+def vec_dot_nvfp4_q8_0(
+    W: View[NVFP4, (K,)],
+    X: View[Q8_0, (K,)],
+    codebook: View[f32, (16,)],
+    ue4m3_scale: View[f32, (256,)],
+    Y: View[f32, (1,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=64) as wb:
+        w = admit(W[wb]) @ transfer
+        x_block = index(0)
+        with L.subs(wb, extent=32) as xb:
+            x = admit(X[xb]) @ transfer
+            for half in range(2):
+                sub = x_block * 2 + half
+                integer = i32(0)
+                for lane in range(16):
+                    q = i32(nonlinear_lookup(codebook, w.q[sub * 16 + lane]))
+                    integer += i32(x.q[half * 16 + lane]) * q
+                scale = f32(x.d) * exponent_scale(ue4m3_scale, w.d[sub])
+                result += scale * f32(integer)
+            x_block += index(1)
+    commit(result, Y[0])
