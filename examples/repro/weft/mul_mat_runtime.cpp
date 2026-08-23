@@ -221,8 +221,42 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_q4_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_Q4_DERIVED)
+#if defined(WEFT_Q4_DERIVED_DECODE)
+extern "C" std::size_t production_mul_mat_q4_k_i16_decode_W_packed_size(
+    std::size_t, std::size_t);
+extern "C" void production_mul_mat_q4_k_i16_decode_W_pack(
+    const std::uint8_t *, std::uint8_t *, std::size_t, std::size_t);
+extern "C" void production_mul_mat_q4_k_i16_decode(
+    const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
+    std::size_t, std::size_t);
+#define selected_packed_size production_mul_mat_q4_k_i16_decode_W_packed_size
+#define selected_pack production_mul_mat_q4_k_i16_decode_W_pack
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_q4_k_i16_decode(w, x, xq, y, runtimeM, kK, kN)
+#else
+extern "C" std::size_t production_mul_mat_q4_k_i16_W_packed_size(
+    std::size_t, std::size_t);
+extern "C" void production_mul_mat_q4_k_i16_W_pack(
+    const std::uint8_t *, std::uint8_t *, std::size_t, std::size_t);
+extern "C" void production_mul_mat_q4_k_i16(
+    const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
+    std::size_t, std::size_t);
+#define selected_packed_size production_mul_mat_q4_k_i16_W_packed_size
+#define selected_pack production_mul_mat_q4_k_i16_W_pack
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_q4_k_i16(w, x, xq, y, runtimeM, kK, kN)
+#endif
+#elif defined(WEFT_Q4_LOCAL_PACK)
+extern "C" void production_mul_mat_q4_k_local_pack(
+    const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
+    std::size_t, std::size_t);
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_q4_k_local_pack(w, x, xq, y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_q4_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q4_k(w, x, xq, y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 10
 using selected_weight = block_q5_K;
 using selected_activation = block_q8_K;
@@ -377,6 +411,80 @@ extern "C" void production_mul_mat_nvfp4(const std::uint8_t *, const float *, st
 #error "unknown WEFT_MUL_MAT_FORMAT"
 #endif
 
+#if WEFT_MUL_MAT_FORMAT == 9 &&                                                \
+    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_LOCAL_PACK))
+float reference_f32_mul(float lhs, float rhs) {
+  volatile float result = lhs * rhs;
+  return result;
+}
+
+float reference_f32_sub(float lhs, float rhs) {
+  volatile float result = lhs - rhs;
+  return result;
+}
+
+float reference_f32_add(float lhs, float rhs) {
+  volatile float result = lhs + rhs;
+  return result;
+}
+
+std::uint8_t q4k_scale(const block_q4_K &record, std::size_t group) {
+  if (group < 4)
+    return static_cast<std::uint8_t>(record.scales[group] & 0x3fU);
+  return static_cast<std::uint8_t>(
+      (record.scales[group + 4] & 0x0fU) |
+      ((record.scales[group - 4] >> 6U) << 4U));
+}
+
+std::uint8_t q4k_minimum(const block_q4_K &record, std::size_t group) {
+  if (group < 4)
+    return static_cast<std::uint8_t>(record.scales[group + 4] & 0x3fU);
+  return static_cast<std::uint8_t>(
+      (record.scales[group + 4] >> 4U) |
+      ((record.scales[group] >> 6U) << 4U));
+}
+
+std::uint8_t q4k_value(const block_q4_K &record, std::size_t element) {
+  const std::size_t group = element / 64;
+  const std::size_t within = element % 64;
+  const std::uint8_t packed = record.qs[group * 32 + within % 32];
+  return static_cast<std::uint8_t>(
+      (packed >> (4U * static_cast<unsigned>(within / 32))) & 0x0fU);
+}
+
+float q4k_blocked_reference(const block_q4_K *weights,
+                            const block_q8_K *activation) {
+  float result = 0.0f;
+  for (std::size_t block = 0; block < kK / QK_K; ++block) {
+    std::int32_t scaled = 0;
+    std::int32_t minimum = 0;
+    for (std::size_t group = 0; group < 8; ++group) {
+      std::int32_t partial = 0;
+      for (std::size_t element = 0; element < 32; ++element) {
+        const std::size_t logical = group * 32 + element;
+        partial += static_cast<std::int32_t>(
+                       q4k_value(weights[block], logical)) *
+                   static_cast<std::int32_t>(activation[block].qs[logical]);
+      }
+      scaled += partial *
+                static_cast<std::int32_t>(q4k_scale(weights[block], group));
+      minimum +=
+          static_cast<std::int32_t>(q4k_minimum(weights[block], group)) *
+          static_cast<std::int32_t>(activation[block].bsums[2 * group] +
+                                    activation[block].bsums[2 * group + 1]);
+    }
+    const float scaleTerm = reference_f32_mul(
+        ggml_fp16_to_fp32(weights[block].d), static_cast<float>(scaled));
+    const float minimumTerm = reference_f32_mul(
+        ggml_fp16_to_fp32(weights[block].dmin), static_cast<float>(minimum));
+    const float blockTerm = reference_f32_mul(
+        activation[block].d, reference_f32_sub(scaleTerm, minimumTerm));
+    result = reference_f32_add(result, blockTerm);
+  }
+  return result;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc != 3) {
     std::fprintf(stderr, "usage: %s <decode|prefill> <repetitions>\n", argv[0]);
@@ -484,9 +592,15 @@ int main(int argc, char **argv) {
     std::fill(weightRow.begin(), weightRow.end(), weightRecord);
     found = true;
     for (std::size_t row = 0; row < runtimeM; ++row) {
+#if WEFT_MUL_MAT_FORMAT == 9 &&                                                \
+    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_LOCAL_PACK))
+      expectedRows[row] = q4k_blocked_reference(
+          weightRow.data(), expected_workspace.data() + row * kK / selected_xqk);
+#else
       selected_reference(kK, &expectedRows[row], 0, weightRow.data(), 0,
                          expected_workspace.data() + row * kK / selected_xqk,
                          0, 1);
+#endif
       found = found && __builtin_isfinite(expectedRows[row]);
     }
     if (found)
@@ -500,11 +614,18 @@ int main(int argc, char **argv) {
   for (std::size_t column = 0; column < kN; ++column)
     std::memcpy(weights.data() + column * weightRow.size(), weightRow.data(),
                 weightRow.size() * sizeof(selected_weight));
+  const std::uint8_t *kernelWeights =
+      reinterpret_cast<const std::uint8_t *>(weights.data());
+#if WEFT_MUL_MAT_FORMAT == 9 && defined(WEFT_Q4_DERIVED)
+  std::vector<std::uint8_t> packedWeights(
+      selected_packed_size(kN, kK));
+  selected_pack(kernelWeights, packedWeights.data(), kN, kK);
+  kernelWeights = packedWeights.data();
+#endif
   for (std::size_t row = 0; row < runtimeM; ++row)
     std::fill_n(expected.data() + row * kN, kN, expectedRows[row]);
   auto run = [&] {
-    selected_call(reinterpret_cast<const std::uint8_t *>(weights.data()),
-                  activation.data(),
+    selected_call(kernelWeights, activation.data(),
                   reinterpret_cast<std::uint8_t *>(actual_workspace.data()),
                   actual.data());
   };

@@ -53,7 +53,9 @@ void printAssignment(llvm::raw_ostream &output,
            << '\n';
     for (llvm::StringRef key :
          {"source", "physical_kind", "physical_encoding_kind", "physical_sew",
-          "lane_axis", "physical_lanes", "stream_parts", "lmul", "vl",
+          "lane_axis", "physical_lanes", "stream_parts", "register_parts",
+          "vector_parts", "register_axis", "lmul", "vl",
+          "register_groups_per_part",
           "register_groups", "storage", "materialization",
           "representation_chain", "sew_derived_from", "lanes_derived_from",
           "lmul_derived_from", "vl_derived_from", "representation_users",

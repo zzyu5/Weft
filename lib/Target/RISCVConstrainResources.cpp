@@ -236,10 +236,22 @@ public:
       problem.setValuesAttr(builder.getArrayAttr(valueAttributes));
       problem.setResourcesAttr(resources);
       if (peak.groups > budget) {
+        std::string reason =
+            "selected entity decisions require " +
+            std::to_string(peak.groups) + " vector groups at operation " +
+            std::to_string(peak.ordinal) + " but the target budget is " +
+            std::to_string(budget);
+        if (!peak.classes.empty()) {
+          reason += ": ";
+          for (auto [index, value] : llvm::enumerate(peak.classes)) {
+            if (index)
+              reason += ", ";
+            reason += value;
+          }
+        }
         resources = riscv_internal::set(
             resources, "invalid_reason",
-            builder.getStringAttr(
-                "selected entity decisions exceed the vector-register budget"));
+            builder.getStringAttr(reason));
         problem.setResourcesAttr(resources);
         problem.setStageAttr(builder.getStringAttr("invalid"));
       } else {

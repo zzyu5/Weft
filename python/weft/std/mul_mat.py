@@ -1,6 +1,28 @@
 from __future__ import annotations
 
-from weft.language import L, View, admit, commit, f16, f32, transfer, u32
+from weft.language import (
+    L,
+    View,
+    admit,
+    auto,
+    commit,
+    dot,
+    f16,
+    f32,
+    fold2,
+    i16,
+    i32,
+    mac_groups,
+    materialize,
+    new,
+    outer_contract,
+    pack,
+    reduce,
+    transfer,
+    u32,
+    wide,
+    widen,
+)
 
 from .encodings import (
     IQ1_M,
@@ -20,6 +42,7 @@ from .encodings import (
     Q4_0,
     Q4_1,
     Q4_K,
+    Q4K_I16,
     Q5_0,
     Q5_1,
     Q5_K,
@@ -166,6 +189,97 @@ def mul_mat_q4_k(
     for row in range(M):
         for column in range(N):
             commit(vec_dot_q4_k_q8_k(W[column], Xq[row]), Y[row, column])
+
+
+def mul_mat_q4_k_i16(
+    W: View[Q4K_I16, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(M, extent=auto("MC")) as mc:
+            with L.rows(mc, group=auto("MR")) as mb:
+                with L.cols(nc, group=16) as nb:
+                    f32_acc = new(f32, [MR, 16], init=0)
+                    with L.tiles(K, extent=auto("KC")) as kc:
+                        with L.blocks(kc, extent=256) as kb:
+                            w = admit(W[nb, kb]) @ transfer
+                            x = admit(Xq[mb, kb]) @ transfer
+                            i32_acc = new(i32, [MR, 16], init=0)
+                            with L.subs(extent=32) as s:
+                                p32 = outer_contract(
+                                    x.q[s], w.q[s], over="k", acc=i32
+                                ) @ wide
+                                i32_acc += p32 * w.sc[s] @ wide
+                            mins = fold2(x.bsum)
+                            min_term = outer_contract(
+                                mins, w.m, over="k", acc=i32
+                            ) @ wide
+                            f32_acc += x.ds * (
+                                w.d * i32_acc - w.dmin * min_term
+                            ) @ wide
+                    commit(f32_acc, Y[mb, nb])
+
+
+def mul_mat_q4_k_i16_decode(
+    W: View[Q4K_I16, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        with L.rows(N, group=16) as nb:
+            f32_acc = new(f32, [16], init=0)
+            with L.blocks(K, extent=256) as kb:
+                w = admit(W[nb, kb]) @ transfer
+                x = admit(Xq[row, kb]) @ transfer
+                i32_acc = new(i32, [16], init=0)
+                with L.subs(extent=32) as s:
+                    p16 = mac_groups(w.q[s], x.q[s], n=4, into=i16) @ wide
+                    i32_acc += reduce(widen(p16, i32)) * w.sc[s] @ wide
+                mins = fold2(x.bsum)
+                min_term = dot(w.m, mins) @ wide
+                f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term) @ wide
+            commit(f32_acc, Y[row, nb])
+
+
+def mul_mat_q4_k_local_pack(
+    W: View[Q4_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            with L.tiles(M, extent=auto("MC")) as mc:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=16) as nb:
+                        f32_acc = new(f32, [MR, 16], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=256) as kb:
+                            w = admit(wp[nb, kb]) @ transfer
+                            x = admit(Xq[mb, kb]) @ transfer
+                            i32_acc = new(i32, [MR, 16], init=0)
+                            with L.subs(extent=32) as s:
+                                p32 = outer_contract(
+                                    x.q[s], w.q[s], over="k", acc=i32
+                                ) @ wide
+                                i32_acc += p32 * w.sc[s] @ wide
+                            mins = fold2(x.bsum)
+                            min_term = outer_contract(
+                                mins, w.m, over="k", acc=i32
+                            ) @ wide
+                            f32_acc += x.ds * (
+                                w.d * i32_acc - w.dmin * min_term
+                            ) @ wide
+                        commit(f32_acc, Y[mb, nb])
 
 
 def mul_mat_q5_k(

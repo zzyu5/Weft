@@ -20,6 +20,7 @@ from weft.std.encodings import (
     Q4_0,
     Q4_1,
     Q4_K,
+    Q4K_I16,
     Q5_0,
     Q5_1,
     Q5_K,
@@ -49,6 +50,9 @@ from weft.std.mul_mat import (
     mul_mat_q4_0,
     mul_mat_q4_1,
     mul_mat_q4_k,
+    mul_mat_q4_k_i16,
+    mul_mat_q4_k_i16_decode,
+    mul_mat_q4_k_local_pack,
     mul_mat_q5_0,
     mul_mat_q5_1,
     mul_mat_q5_k,
@@ -148,6 +152,36 @@ def production_mul_mat_q4_k(
     W: View[Q4_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
 ):
     mul_mat_q4_k(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q4_k_i16(
+    W: View[Q4K_I16, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_q4_k_i16(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q4_k_i16_decode(
+    W: View[Q4K_I16, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_q4_k_i16_decode(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q4_k_local_pack(
+    W: View[Q4_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_q4_k_local_pack(W, X, Xq, Y)
 
 
 @weft.kernel

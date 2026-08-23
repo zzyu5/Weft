@@ -1516,12 +1516,14 @@ class FrontendCompiler:
         axes = list(region.type.axes)
         element: ValueType
         record_axis: int | None = None
-        if encoding.kind in {"dense", "ephemeral"}:
-            scalar_family = (
-                encoding.family
-                if encoding.kind == "dense"
-                else encoding.family.split(".", 2)[1]
-            )
+        ephemeral_encoded = (
+            encoding.kind == "ephemeral"
+            and encoding.family in self._declared_encodings
+        )
+        if encoding.kind == "dense" or (
+            encoding.kind == "ephemeral" and not ephemeral_encoded
+        ):
+            scalar_family = encoding.family
             static = getattr(sys.modules["weft.language"], scalar_family)
             element = ScalarType(static)
         else:
@@ -1798,7 +1800,9 @@ class FrontendCompiler:
             raise FrontendError("pack expects a View region", self._location(call))
         along = self._eval_static(args["along"]) if isinstance(args["along"], ast.expr) else args["along"]
         encoding = EncodingType(
-            f"packed.{value.type.encoding.family}.{along}", "ephemeral", ""
+            value.type.encoding.family,
+            "ephemeral",
+            f"packed.along.{along}",
         )
         result_type = ViewType(encoding, value.type.shape, value.type.axes)
         return self._emit(

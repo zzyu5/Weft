@@ -7,8 +7,10 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
 #include <optional>
@@ -106,6 +108,33 @@ llvm::StringRef firstLayoutKind(mlir::ArrayAttr layouts) {
   auto kind = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
                          : mlir::StringAttr();
   return kind ? kind.getValue() : llvm::StringRef();
+}
+
+bool containsAxis(mlir::DictionaryAttr value, int64_t axis) {
+  auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+  return axes && llvm::is_contained(axes.asArrayRef(), axis);
+}
+
+mlir::Type logicalElement(mlir::DictionaryAttr value) {
+  auto type = value.getAs<mlir::TypeAttr>("type");
+  return type ? riscv_internal::logicalElement(type.getValue()) : mlir::Type();
+}
+
+int64_t vectorParts(mlir::DictionaryAttr value) {
+  return riscv_internal::integer(value, "vector_parts").value_or(1);
+}
+
+int64_t wideningPartialTerms(unsigned unsignedWidth) {
+  if (unsignedWidth == 0 || unsignedWidth >= 8)
+    return 0;
+  const int64_t unsignedMaximum = (int64_t{1} << unsignedWidth) - 1;
+  const int64_t positiveLimit = 32767 / (unsignedMaximum * 127);
+  const int64_t negativeLimit = 32768 / (unsignedMaximum * 128);
+  int64_t legalLimit = std::min(positiveLimit, negativeLimit);
+  int64_t powerOfTwo = 1;
+  while (powerOfTwo <= legalLimit / 2)
+    powerOfTwo *= 2;
+  return powerOfTwo;
 }
 
 const EncodingFieldFacts *fieldFactsFor(
@@ -271,15 +300,17 @@ public:
       if (problem.getStage() == "invalid")
         continue;
 
-      llvm::SmallSet<int64_t, 4> candidateLaneAxes;
+      llvm::StringMap<llvm::SmallVector<std::string, 2>> valuesByHandoff;
       for (const auto &entry : values) {
-        int64_t axis =
-            riscv_internal::integer(entry.getValue(), "lane_axis").value_or(0);
-        if (axis > 0)
-          candidateLaneAxes.insert(axis);
+        llvm::StringRef handoff =
+            riscv_internal::string(entry.getValue(), "handoff_class")
+                .value_or("");
+        if (!handoff.empty())
+          valuesByHandoff[handoff].push_back(entry.getKey().str());
       }
 
       llvm::StringMap<mlir::DictionaryAttr> producers;
+      llvm::StringMap<llvm::SmallVector<mlir::DictionaryAttr, 2>> users;
       llvm::StringMap<int64_t> useCounts;
       struct ReductionPair {
         std::string maximum;
@@ -292,8 +323,12 @@ public:
           for (mlir::Attribute result : results)
             producers[mlir::cast<mlir::StringAttr>(result).getValue()] = operation;
         if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
-          for (mlir::Attribute operand : operands)
-            ++useCounts[mlir::cast<mlir::StringAttr>(operand).getValue()];
+          for (mlir::Attribute operand : operands) {
+            llvm::StringRef id =
+                mlir::cast<mlir::StringAttr>(operand).getValue();
+            ++useCounts[id];
+            users[id].push_back(operation);
+          }
         if (riscv_internal::string(operation, "name").value_or("") ==
             "weft_kernel.reduce") {
           auto operands = operation.getAs<mlir::ArrayAttr>("operands");
@@ -314,6 +349,44 @@ public:
         }
       }
 
+      auto collectReachableLanes =
+          [&](llvm::StringRef root, llvm::SmallSet<int64_t, 4> &axes,
+              llvm::DenseMap<int64_t, int64_t> &widths) {
+            llvm::SmallVector<std::string> pending{root.str()};
+            llvm::StringSet<> visited;
+            while (!pending.empty()) {
+              std::string id = std::move(pending.pop_back_val());
+              if (!visited.insert(id).second)
+                continue;
+              if (auto value = values.find(id); value != values.end()) {
+                int64_t axis =
+                    riscv_internal::integer(value->second, "lane_axis")
+                        .value_or(0);
+                int64_t lanes =
+                    riscv_internal::integer(value->second, "physical_lanes")
+                        .value_or(1);
+                if (axis > 0 && lanes > 1) {
+                  axes.insert(axis);
+                  widths[axis] = std::max(widths.lookup(axis), lanes);
+                }
+                llvm::StringRef handoff =
+                    riscv_internal::string(value->second, "handoff_class")
+                        .value_or("");
+                auto members = valuesByHandoff.find(handoff);
+                if (!handoff.empty() && members != valuesByHandoff.end())
+                  pending.append(members->second.begin(), members->second.end());
+              }
+              auto reachableUsers = users.find(id);
+              if (reachableUsers == users.end())
+                continue;
+              for (mlir::DictionaryAttr user : reachableUsers->second)
+                if (auto results = user.getAs<mlir::ArrayAttr>("results"))
+                  for (mlir::Attribute result : results)
+                    pending.push_back(
+                        mlir::cast<mlir::StringAttr>(result).getValue().str());
+            }
+          };
+
       llvm::StringMap<std::string> coReducePartners;
       llvm::StringMap<std::string> coReduceRoles;
       for (const auto &entry : reductionsByInput) {
@@ -329,6 +402,8 @@ public:
       llvm::SmallVector<mlir::Attribute> operations;
       llvm::StringMap<mlir::DictionaryAttr> memoryEdgesByValue;
       bool legal = true;
+      std::string illegalOperation;
+      std::string illegalDetail;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef name = *riscv_internal::string(operation, "name");
@@ -494,7 +569,229 @@ public:
             } else
               legal = false;
           } else if (engine.empty() || engine == "wide") {
-            realization = "rvv.reduction-product";
+            bool selectedOuter = false;
+            if (name == "weft_kernel.outer_contract") {
+              auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+              auto results = operation.getAs<mlir::ArrayAttr>("results");
+              auto source =
+                  operation.getAs<mlir::DictionaryAttr>("source_attributes");
+              auto over = source
+                              ? source.getAs<mlir::DenseI64ArrayAttr>("over")
+                              : mlir::DenseI64ArrayAttr();
+              int64_t laneAxis =
+                  riscv_internal::integer(operation, "lane_axis").value_or(0);
+              int64_t accumulatorAxis =
+                  riscv_internal::integer(operation, "accumulator_axis")
+                      .value_or(0);
+              if (operands && operands.size() == 2 && results &&
+                  results.size() == 1 && over && over.size() == 1 &&
+                  laneAxis > 0 && accumulatorAxis > 0) {
+                llvm::StringRef lhsId =
+                    mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+                llvm::StringRef rhsId =
+                    mlir::cast<mlir::StringAttr>(operands[1]).getValue();
+                llvm::StringRef resultId =
+                    mlir::cast<mlir::StringAttr>(results[0]).getValue();
+                auto lhs = values.find(lhsId);
+                auto rhs = values.find(rhsId);
+                auto result = values.find(resultId);
+                const bool lhsLane =
+                    lhs != values.end() && containsAxis(lhs->second, laneAxis);
+                const bool rhsLane =
+                    rhs != values.end() && containsAxis(rhs->second, laneAxis);
+                llvm::StringRef laneId = lhsLane && !rhsLane ? lhsId : rhsId;
+                llvm::StringRef repeatedId = lhsLane && !rhsLane ? rhsId : lhsId;
+                auto lane = values.find(laneId);
+                auto repeated = values.find(repeatedId);
+                const EncodingFieldFacts *laneField = fieldFactsForValue(
+                    laneId, producers, values, encodings);
+                const EncodingFieldFacts *repeatedField = fieldFactsForValue(
+                    repeatedId, producers, values, encodings);
+                auto laneInteger =
+                    lane == values.end()
+                        ? mlir::IntegerType()
+                        : mlir::dyn_cast<mlir::IntegerType>(
+                              logicalElement(lane->second));
+                auto repeatedInteger =
+                    repeated == values.end()
+                        ? mlir::IntegerType()
+                        : mlir::dyn_cast<mlir::IntegerType>(
+                              logicalElement(repeated->second));
+                auto resultInteger =
+                    result == values.end()
+                        ? mlir::IntegerType()
+                        : mlir::dyn_cast<mlir::IntegerType>(
+                              logicalElement(result->second));
+                const int64_t laneLMUL =
+                    lane == values.end()
+                        ? 0
+                        : riscv_internal::integer(lane->second,
+                                                  "lmul_eighths")
+                              .value_or(0);
+                const int64_t resultLMUL =
+                    result == values.end()
+                        ? 0
+                        : riscv_internal::integer(result->second,
+                                                  "lmul_eighths")
+                              .value_or(0);
+                const int64_t parts =
+                    result == values.end() ? 0 : vectorParts(result->second);
+                if (lhsLane != rhsLane && laneField && repeatedField &&
+                    laneInteger && repeatedInteger && resultInteger &&
+                    laneInteger.isUnsigned() && laneInteger.getWidth() < 8 &&
+                    repeatedInteger.isSigned() &&
+                    repeatedInteger.getWidth() == 8 &&
+                    resultInteger.isSigned() &&
+                    resultInteger.getWidth() == 32 &&
+                    firstLayoutKind(repeatedField->layouts) == "natural" &&
+                    laneLMUL > 0 && resultLMUL > 0 && parts > 0) {
+                  const int64_t partialLMUL = laneLMUL * 2;
+                  const int64_t partialTerms =
+                      wideningPartialTerms(laneInteger.getWidth());
+                  if (partialTerms <= 0) {
+                    legal = false;
+                    continue;
+                  }
+                  const int64_t temporaryGroups =
+                      parts * ((partialLMUL + 7) / 8);
+                  realization = "rvv.outer.encoded-widening-mac";
+                  localOperation = riscv_internal::dictionary(
+                      builder,
+                      {{"instruction", builder.getStringAttr("rvv.vwmaccsu")},
+                       {"lane_operand",
+                        builder.getStringAttr(lhsLane ? "lhs" : "rhs")},
+                       {"lane_axis", builder.getI64IntegerAttr(laneAxis)},
+                       {"accumulator_axis",
+                        builder.getI64IntegerAttr(accumulatorAxis)},
+                       {"reduction_axis",
+                        builder.getI64IntegerAttr(over.asArrayRef().front())},
+                       {"lane_lmul_eighths",
+                        builder.getI64IntegerAttr(laneLMUL)},
+                       {"partial_lmul_eighths",
+                        builder.getI64IntegerAttr(partialLMUL)},
+                       {"accumulator_lmul_eighths",
+                        builder.getI64IntegerAttr(resultLMUL)},
+                       {"partial_sew", builder.getI64IntegerAttr(16)},
+                       {"accumulator_sew", builder.getI64IntegerAttr(32)},
+                       {"partial_terms_max",
+                        builder.getI64IntegerAttr(partialTerms)},
+                       {"accumulator_parts", builder.getI64IntegerAttr(parts)},
+                       {"temporary_vector_groups",
+                        builder.getI64IntegerAttr(temporaryGroups)},
+                       {"decision_owner", builder.getStringAttr("operation")}});
+                  llvm::StringRef laneAccess = "mapped-field-per-term";
+                  if (laneField->layouts && laneField->layouts.size() >= 2) {
+                    auto grouped = mlir::dyn_cast<mlir::DictionaryAttr>(
+                        laneField->layouts[0]);
+                    auto layered = mlir::dyn_cast<mlir::DictionaryAttr>(
+                        laneField->layouts[1]);
+                    auto groupedKind =
+                        grouped ? grouped.getAs<mlir::StringAttr>("kind")
+                                : mlir::StringAttr();
+                    auto layeredKind =
+                        layered ? layered.getAs<mlir::StringAttr>("kind")
+                                : mlir::StringAttr();
+                    auto groupSize =
+                        grouped ? grouped.getAs<mlir::IntegerAttr>("size")
+                                : mlir::IntegerAttr();
+                    auto layerSize =
+                        layered ? layered.getAs<mlir::IntegerAttr>("size")
+                                : mlir::IntegerAttr();
+                    auto layerOrder =
+                        layered ? layered.getAs<mlir::StringAttr>("order")
+                                : mlir::StringAttr();
+                    if (groupedKind && groupedKind.getValue() == "grouped" &&
+                        layeredKind && layeredKind.getValue() == "layered" &&
+                        groupSize && layerSize && layerOrder) {
+                      laneAccess =
+                          "grouped-layered-constant-stride-window";
+                      localOperation = riscv_internal::set(
+                          localOperation, "lane_group_size", groupSize);
+                      localOperation = riscv_internal::set(
+                          localOperation, "lane_layer_size", layerSize);
+                      localOperation = riscv_internal::set(
+                          localOperation, "lane_layer_order", layerOrder);
+                    }
+                  }
+                  localOperation = riscv_internal::set(
+                      localOperation, "lane_access",
+                      builder.getStringAttr(laneAccess));
+                  localOperation = riscv_internal::set(
+                      localOperation, "lane_bit_offset",
+                      builder.getI64IntegerAttr(laneField->bitOffset));
+                  localOperation = riscv_internal::set(
+                      localOperation, "repeated_bit_offset",
+                      builder.getI64IntegerAttr(repeatedField->bitOffset));
+                  selectedOuter = true;
+                } else if (lhsLane != rhsLane && laneField && laneInteger &&
+                           laneInteger.isUnsigned() &&
+                           laneInteger.getWidth() <= 8 && resultInteger &&
+                           resultInteger.isSigned() &&
+                           resultInteger.getWidth() == 32 && laneLMUL > 0 &&
+                           resultLMUL > 0 && parts > 0) {
+                  auto repeatedProducer = producers.find(repeatedId);
+                  auto foldOperands =
+                      repeatedProducer == producers.end()
+                          ? mlir::ArrayAttr()
+                          : repeatedProducer->second.getAs<mlir::ArrayAttr>(
+                                "operands");
+                  const bool folded =
+                      repeatedProducer != producers.end() &&
+                      riscv_internal::string(repeatedProducer->second, "name")
+                              .value_or("") == "weft_kernel.fold2" &&
+                      foldOperands && foldOperands.size() == 1;
+                  llvm::StringRef foldInputId =
+                      folded
+                          ? mlir::cast<mlir::StringAttr>(foldOperands[0])
+                                .getValue()
+                          : llvm::StringRef();
+                  const EncodingFieldFacts *foldInputField =
+                      folded ? fieldFactsForValue(foldInputId, producers, values,
+                                                  encodings)
+                             : nullptr;
+                  auto foldInput = values.find(foldInputId);
+                  auto foldInputInteger =
+                      foldInput == values.end()
+                          ? mlir::IntegerType()
+                          : mlir::dyn_cast<mlir::IntegerType>(
+                                logicalElement(foldInput->second));
+                  if (folded && foldInputField && foldInputInteger &&
+                      foldInputInteger.isSigned() &&
+                      foldInputInteger.getWidth() == 16 &&
+                      firstLayoutKind(foldInputField->layouts) == "natural" &&
+                      laneField->shape && !laneField->shape.empty()) {
+                    realization = "rvv.outer.encoded-fold-product";
+                    localOperation = riscv_internal::dictionary(
+                        builder,
+                        {{"instruction", builder.getStringAttr("rvv.vmacc")},
+                         {"lane_operand",
+                          builder.getStringAttr(lhsLane ? "lhs" : "rhs")},
+                         {"lane_axis", builder.getI64IntegerAttr(laneAxis)},
+                         {"accumulator_axis",
+                          builder.getI64IntegerAttr(accumulatorAxis)},
+                         {"reduction_axis",
+                          builder.getI64IntegerAttr(over.asArrayRef().front())},
+                         {"accumulator_lmul_eighths",
+                          builder.getI64IntegerAttr(resultLMUL)},
+                         {"accumulator_sew", builder.getI64IntegerAttr(32)},
+                         {"accumulator_parts",
+                          builder.getI64IntegerAttr(parts)},
+                         {"group_count",
+                          builder.getI64IntegerAttr(
+                              laneField->shape.asArrayRef().back())},
+                         {"rhs_pairs_per_group",
+                          builder.getI64IntegerAttr(2)},
+                         {"temporary_vector_groups",
+                          builder.getI64IntegerAttr((resultLMUL + 7) / 8)},
+                         {"decision_owner",
+                          builder.getStringAttr("operation")}});
+                    selectedOuter = true;
+                  }
+                }
+              }
+            }
+            if (!selectedOuter)
+              realization = "rvv.reduction-product";
             if (name == "weft_kernel.dot") {
               auto operands = operation.getAs<mlir::ArrayAttr>("operands");
               if (operands && operands.size() == 2) {
@@ -774,21 +1071,113 @@ public:
           realization = "logical-level";
         } else if (name == "weft_kernel.materialize") {
           realization = "stage-once";
-          if (candidateLaneAxes.size() != 1) {
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          llvm::SmallSet<int64_t, 4> reachableLaneAxes;
+          llvm::DenseMap<int64_t, int64_t> reachableLaneWidths;
+          if (results && results.size() == 1)
+            collectReachableLanes(
+                mlir::cast<mlir::StringAttr>(results[0]).getValue(),
+                reachableLaneAxes, reachableLaneWidths);
+          if (!operands || operands.size() != 1 || !results ||
+              results.size() != 1 || reachableLaneAxes.size() != 1) {
+            illegalDetail = "reachable lane axis count=" +
+                            std::to_string(reachableLaneAxes.size());
             legal = false;
           } else {
+            const int64_t laneAxis = *reachableLaneAxes.begin();
             localOperation = riscv_internal::dictionary(
                 builder,
                 {{"lane_axis",
-                  builder.getI64IntegerAttr(*candidateLaneAxes.begin())},
+                  builder.getI64IntegerAttr(laneAxis)},
                  {"decision_owner", builder.getStringAttr("operation")}});
+            llvm::StringRef packId =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            auto packProducer = producers.find(packId);
+            auto packOperands =
+                packProducer == producers.end()
+                    ? mlir::ArrayAttr()
+                    : packProducer->second.getAs<mlir::ArrayAttr>("operands");
+            if (packProducer == producers.end() || !packOperands ||
+                packOperands.size() != 1 ||
+                riscv_internal::string(packProducer->second, "name")
+                        .value_or("") != "weft_kernel.pack") {
+              illegalDetail = "materialize input is not one explicit pack request";
+              legal = false;
+            } else {
+              llvm::StringRef sourceId =
+                  mlir::cast<mlir::StringAttr>(packOperands[0]).getValue();
+              auto source = values.find(sourceId);
+              auto sourceAxes =
+                  source == values.end()
+                      ? mlir::DenseI64ArrayAttr()
+                      : source->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+              if (!sourceAxes || sourceAxes.size() != 2 ||
+                  !llvm::is_contained(sourceAxes.asArrayRef(), laneAxis)) {
+                illegalDetail =
+                    "local pack source is not a rank-two value carrying its lane axis";
+                legal = false;
+              } else {
+                const int64_t recordAxis =
+                    sourceAxes.asArrayRef().front() == laneAxis
+                        ? sourceAxes.asArrayRef().back()
+                        : sourceAxes.asArrayRef().front();
+                localOperation = riscv_internal::set(
+                    localOperation, "source_rank", builder.getI64IntegerAttr(2));
+                localOperation = riscv_internal::set(
+                    localOperation, "row_axis",
+                    builder.getI64IntegerAttr(laneAxis));
+                localOperation = riscv_internal::set(
+                    localOperation, "record_axis",
+                    builder.getI64IntegerAttr(recordAxis));
+                auto family =
+                    source == values.end()
+                        ? mlir::StringAttr()
+                        : source->second.getAs<mlir::StringAttr>(
+                              "encoding_family");
+                llvm::StringRef base =
+                    family ? baseFamily(encodings, family.getValue())
+                           : llvm::StringRef();
+                auto encoding = encodings.bases.find(base);
+                if (encoding != encodings.bases.end()) {
+                  const int64_t rows = reachableLaneWidths.lookup(laneAxis);
+                  if (rows <= 1) {
+                    illegalDetail =
+                        "encoded local pack has no multi-row lane cohort";
+                    legal = false;
+                  } else {
+                    localOperation = riscv_internal::set(
+                        localOperation, "packing",
+                        builder.getStringAttr("encoded-record-interleave"));
+                    localOperation = riscv_internal::set(
+                        localOperation, "source_encoding_family",
+                        builder.getStringAttr(base));
+                    localOperation = riscv_internal::set(
+                        localOperation, "interleave_rows",
+                        builder.getI64IntegerAttr(rows));
+                    localOperation = riscv_internal::set(
+                        localOperation, "record_storage_bits",
+                        builder.getI64IntegerAttr(encoding->second.storageBits));
+                    localOperation = riscv_internal::set(
+                        localOperation, "logical_elements",
+                        builder.getI64IntegerAttr(encoding->second.elements));
+                  }
+                }
+              }
+            }
           }
         } else if (name == "weft_kernel.pack") {
           realization = "primitive-local-pack";
         }
 
-        if (!legal)
+        if (!legal) {
+          illegalOperation =
+              riscv_internal::string(operation, "id").value_or("unknown").str() +
+              ":" + name.str();
+          if (!illegalDetail.empty())
+            illegalOperation += " (" + illegalDetail + ")";
           break;
+        }
         operation = riscv_internal::set(
             operation, "source_op", operation.get("name"));
         operation = riscv_internal::set(
@@ -811,7 +1200,8 @@ public:
       }
       if (!legal) {
         invalidate(problem, builder,
-                   "one operation has no legal target-local realization");
+                   "operation has no legal target-local realization: " +
+                       illegalOperation);
         continue;
       }
       problem.setValuesAttr(builder.getArrayAttr(updatedValues));

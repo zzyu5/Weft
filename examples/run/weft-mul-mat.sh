@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q4_k_i16|q4_k_local|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
   exit 2
 fi
 
@@ -14,7 +14,9 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 compiler="${project_root}/build/tools/weft-compile/weft-compile"
 formats=(f16 q1_0 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq1_m iq2_s iq2_xs iq2_xxs iq3_s iq3_xxs iq4_nl iq4_xs tq1_0 tq2_0 mxfp4 nvfp4)
 format_id=-1
-if [[ ${format} != f32 ]]; then
+if [[ ${format} == q4_k_i16 || ${format} == q4_k_local ]]; then
+  format_id=9
+elif [[ ${format} != f32 ]]; then
   for index in "${!formats[@]}"; do
     if [[ ${formats[index]} == "${format}" ]]; then
       format_id=${index}
@@ -70,6 +72,8 @@ cleanup_local() {
 trap cleanup_local EXIT
 
 meta=()
+physical=()
+runtime_kernel_define=
 if [[ ${format} == f32 ]]; then
   dsl=examples/kernels/dense/gemm.py
   kernel=gemm_f32
@@ -77,13 +81,32 @@ if [[ ${format} == f32 ]]; then
   meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
 else
   dsl=examples/kernels/quantization/mul_mat.py
-  kernel=production_mul_mat_${format}
+  if [[ ${format} == q4_k_i16 ]]; then
+    runtime_kernel_define=-DWEFT_Q4_DERIVED=1
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_q4_k_i16_decode
+      runtime_kernel_define="${runtime_kernel_define} -DWEFT_Q4_DERIVED_DECODE=1"
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      kernel=production_mul_mat_q4_k_i16
+      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
+      physical=(--auto-unroll=4 --auto-pipeline-depth=2)
+    fi
+  elif [[ ${format} == q4_k_local ]]; then
+    runtime_kernel_define=-DWEFT_Q4_LOCAL_PACK=1
+    kernel=production_mul_mat_q4_k_local_pack
+    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
+    physical=(--auto-unroll=4 --auto-pipeline-depth=2)
+  else
+    kernel=production_mul_mat_${format}
+  fi
   runtime=examples/repro/weft/mul_mat_runtime.cpp
 fi
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
+  "${physical[@]}" \
   -o "${local_root}/kernel.c"
 cp "${project_root}/${runtime}" "${local_root}/runtime.cpp"
 
@@ -127,7 +150,7 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       \${extra_flags} -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
       -Wno-unused-const-variable -ffp-contract=fast \${extra_flags} \
-      \${runtime_target_define} \
+      \${runtime_target_define} ${runtime_kernel_define} \
       -DWEFT_MUL_MAT_FORMAT=\"\${format_id}\" \
       -march=\"\${march}\" -mabi=lp64d \
       -I\"\${source_root}/ggml/include\" -I\"\${source_root}/ggml/src\" \

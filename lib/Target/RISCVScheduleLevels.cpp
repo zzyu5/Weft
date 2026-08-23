@@ -52,9 +52,47 @@ mlir::DictionaryAttr addLocalTemporaryBudget(mlir::Builder &builder,
                                              mlir::DictionaryAttr schedule) {
   llvm::StringRef name =
       riscv_internal::string(operation, "name").value_or("");
+  auto local = operation.getAs<mlir::DictionaryAttr>("local_operation");
+  llvm::StringRef realization =
+      riscv_internal::string(operation, "realization").value_or("");
+  if (name == "weft_kernel.outer_contract" &&
+      realization == "rvv.outer.encoded-widening-mac" && local) {
+    int64_t maximumTerms =
+        riscv_internal::integer(local, "partial_terms_max").value_or(0);
+    int64_t unroll = riscv_internal::integer(schedule, "unroll").value_or(1);
+    int64_t pipeline =
+        riscv_internal::integer(schedule, "pipeline_depth").value_or(1);
+    int64_t laneLMUL =
+        riscv_internal::integer(local, "lane_lmul_eighths").value_or(0);
+    int64_t partialLMUL =
+        riscv_internal::integer(local, "partial_lmul_eighths").value_or(0);
+    int64_t parts =
+        riscv_internal::integer(local, "accumulator_parts").value_or(0);
+    if (maximumTerms <= 0 || unroll <= 0 || pipeline <= 0 || laneLMUL <= 0 ||
+        partialLMUL <= 0 || parts <= 0)
+      return operation;
+    int64_t partialTerms = std::min(maximumTerms, unroll);
+    int64_t laneGroups = (laneLMUL + 7) / 8;
+    int64_t partialGroups = (partialLMUL + 7) / 8;
+    int64_t temporaryGroups = parts * partialGroups;
+    if (pipeline > 1)
+      temporaryGroups += 2 * partialTerms * laneGroups;
+    local = riscv_internal::set(
+        local, "partial_terms", builder.getI64IntegerAttr(partialTerms));
+    local = riscv_internal::set(
+        local, "operand_buffer_count",
+        builder.getI64IntegerAttr(pipeline > 1 ? 2 : 1));
+    local = riscv_internal::set(
+        local, "temporary_vector_groups",
+        builder.getI64IntegerAttr(temporaryGroups));
+    local = riscv_internal::set(
+        local, "temporary_groups_derived_from",
+        builder.getStringAttr(
+            "selected accumulator partials + scheduled encoded operand banks"));
+    return riscv_internal::set(operation, "local_operation", local);
+  }
   if (name != "weft_kernel.mac_pairs" && name != "weft_kernel.mac_groups")
     return operation;
-  auto local = operation.getAs<mlir::DictionaryAttr>("local_operation");
   auto source = operation.getAs<mlir::DictionaryAttr>("source_attributes");
   if (!local || !source)
     return operation;
@@ -124,6 +162,39 @@ public:
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
         values[*riscv_internal::string(value, "id")] = value;
+      }
+      llvm::StringMap<int64_t> levelLaneWidths;
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        auto path = operation.getAs<mlir::ArrayAttr>("level_path");
+        if (!path || path.empty())
+          continue;
+        auto recordValue = [&](mlir::Attribute valueAttribute) {
+          auto valueId = mlir::dyn_cast<mlir::StringAttr>(valueAttribute);
+          auto value = valueId ? values.find(valueId.getValue()) : values.end();
+          if (value == values.end())
+            return;
+          int64_t laneAxis =
+              riscv_internal::integer(value->second, "lane_axis").value_or(0);
+          int64_t physicalLanes =
+              riscv_internal::integer(value->second, "physical_lanes")
+                  .value_or(1);
+          if (laneAxis <= 0 || physicalLanes <= 1)
+            return;
+          for (mlir::Attribute levelAttribute : path) {
+            auto level = mlir::cast<mlir::StringAttr>(levelAttribute);
+            const std::string key = level.getValue().str() + "#" +
+                                    std::to_string(laneAxis);
+            levelLaneWidths[key] =
+                std::max(levelLaneWidths.lookup(key), physicalLanes);
+          }
+        };
+        if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+          for (mlir::Attribute operand : operands)
+            recordValue(operand);
+        if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+          for (mlir::Attribute result : results)
+            recordValue(result);
       }
       llvm::StringMap<mlir::DictionaryAttr> schedulesByLevel;
       bool schedulesLegal = true;
@@ -213,14 +284,10 @@ public:
           signalPassFailure();
           return;
         }
-        int64_t physicalLanes = 1;
-        for (const auto &entry : values)
-          if (riscv_internal::integer(entry.getValue(), "lane_axis").value_or(0) ==
-              axis)
-            physicalLanes = std::max(
-                physicalLanes,
-                riscv_internal::integer(entry.getValue(), "physical_lanes")
-                    .value_or(1));
+        llvm::StringRef levelId = *riscv_internal::string(operation, "id");
+        int64_t physicalLanes = levelLaneWidths.lookup(
+            levelId.str() + "#" + std::to_string(axis));
+        physicalLanes = std::max<int64_t>(1, physicalLanes);
         bool lane = physicalLanes > 1 && *physicalPartition > 1;
         physicalLanes = lane ? std::min(physicalLanes, *physicalPartition) : 1;
         auto mapping = riscv_internal::dictionary(
@@ -248,7 +315,6 @@ public:
                   lane ? "strip-at-physical-lanes-and-set-vl"
                        : "explicit-multiplicity-with-parent-validity")},
              {"decision_owner", builder.getStringAttr("Level")}});
-        llvm::StringRef levelId = *riscv_internal::string(operation, "id");
         mlir::DictionaryAttr schedule = schedulesByLevel.lookup(levelId);
         operation = riscv_internal::set(operation, "level_mapping", mapping);
         operation = riscv_internal::set(operation, "schedule", schedule);
