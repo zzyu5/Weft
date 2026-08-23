@@ -44,6 +44,7 @@ public:
       llvm::StringMap<int64_t> first;
       llvm::StringMap<int64_t> last;
       llvm::StringMap<std::string> producers;
+      llvm::StringMap<bool> deferredLocalResults;
       llvm::StringMap<llvm::SmallVector<int64_t, 4>> useOrdinals;
       for (auto [ordinal, attribute] : llvm::enumerate(problem.getOperations())) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
@@ -56,6 +57,9 @@ public:
             first.try_emplace(id, ordinal);
             last[id] = ordinal;
             producers[id] = name.str();
+            if (riscv_internal::string(operation, "realization").value_or("") ==
+                "rvv.outer.deferred-reduction-product")
+              deferredLocalResults[id] = true;
           }
         if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
           for (mlir::Attribute idAttribute : operands) {
@@ -70,15 +74,35 @@ public:
       }
 
       llvm::SmallVector<mlir::DictionaryAttr> values;
+      llvm::StringMap<std::string> valueClasses;
+      llvm::StringMap<std::string> resourceClassParents;
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef id = *riscv_internal::string(value, "id");
+        llvm::StringRef handoff =
+            riscv_internal::string(value, "handoff_class").value_or(id);
+        valueClasses[id] = handoff.str();
+        resourceClassParents.try_emplace(handoff, handoff.str());
         int64_t begin = first.contains(id) ? first.lookup(id) : 0;
         int64_t end = last.contains(id) ? last.lookup(id) : begin;
         value = riscv_internal::set(
             value, "live_start", builder.getI64IntegerAttr(begin));
         value = riscv_internal::set(
             value, "live_end", builder.getI64IntegerAttr(end));
+        if (deferredLocalResults.lookup(id)) {
+          value = riscv_internal::set(
+              value, "register_groups", builder.getI64IntegerAttr(0));
+          value = riscv_internal::set(
+              value, "storage",
+              builder.getStringAttr("deferred-operation-cluster"));
+          value = riscv_internal::set(
+              value, "materialization",
+              builder.getStringAttr("deferred-to-single-consumer"));
+          value = riscv_internal::set(
+              value, "materialization_derived_from",
+              builder.getStringAttr(
+                  "selected outer-contract plus accumulator-add local cluster"));
+        }
         if (riscv_internal::string(value, "materialization").value_or("") ==
             "pending-liveness") {
           bool multipleUses = useOrdinals.lookup(id).size() > 1;
@@ -94,6 +118,49 @@ public:
                       : "single memory consumer does not require a persistent register"));
         }
         values.push_back(value);
+      }
+
+      auto findResourceClass = [&](llvm::StringRef value) {
+        std::string root = value.str();
+        while (resourceClassParents.lookup(root) != root)
+          root = resourceClassParents.lookup(root);
+        return root;
+      };
+      auto uniteResourceClasses = [&](llvm::StringRef lhs, llvm::StringRef rhs) {
+        std::string lhsRoot = findResourceClass(lhs);
+        std::string rhsRoot = findResourceClass(rhs);
+        if (lhsRoot != rhsRoot)
+          resourceClassParents[rhsRoot] = lhsRoot;
+      };
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        auto local = operation.getAs<mlir::DictionaryAttr>("local_operation");
+        auto tiedOperand =
+            local ? local.getAs<mlir::IntegerAttr>("tied_operand")
+                  : mlir::IntegerAttr();
+        auto tiedResult =
+            local ? local.getAs<mlir::IntegerAttr>("tied_result")
+                  : mlir::IntegerAttr();
+        auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+        auto results = operation.getAs<mlir::ArrayAttr>("results");
+        if (!tiedOperand || !tiedResult || !operands || !results ||
+            tiedOperand.getInt() < 0 || tiedResult.getInt() < 0 ||
+            tiedOperand.getInt() >= static_cast<int64_t>(operands.size()) ||
+            tiedResult.getInt() >= static_cast<int64_t>(results.size()))
+          continue;
+        llvm::StringRef operandId =
+            mlir::cast<mlir::StringAttr>(operands[tiedOperand.getInt()])
+                .getValue();
+        llvm::StringRef resultId =
+            mlir::cast<mlir::StringAttr>(results[tiedResult.getInt()]).getValue();
+        uniteResourceClasses(valueClasses.lookup(operandId),
+                             valueClasses.lookup(resultId));
+      }
+      for (mlir::DictionaryAttr &value : values) {
+        llvm::StringRef id = *riscv_internal::string(value, "id");
+        value = riscv_internal::set(
+            value, "resource_class",
+            builder.getStringAttr(findResourceClass(valueClasses.lookup(id))));
       }
 
       auto targetFragments =
@@ -130,9 +197,9 @@ public:
               liveNow = llvm::is_contained(useOrdinals.lookup(id), ordinal);
             if (!liveNow)
               continue;
-            llvm::StringRef handoff =
-                riscv_internal::string(value, "handoff_class").value_or(id);
-            live[handoff] = std::max(live.lookup(handoff), groups);
+            llvm::StringRef resourceClass =
+                riscv_internal::string(value, "resource_class").value_or(id);
+            live[resourceClass] = std::max(live.lookup(resourceClass), groups);
           }
           int64_t total = reserved;
           for (const auto &entry : live)

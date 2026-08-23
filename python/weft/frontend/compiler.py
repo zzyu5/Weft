@@ -1152,8 +1152,23 @@ class FrontendCompiler:
         current = element_type(value.type)
         if current == ScalarType(dtype):
             return value
+        if not isinstance(current, ScalarType):
+            raise FrontendError("numeric conversion requires scalar elements", self._location(node))
+        source = current.dtype
+        integer_to_float = (
+            source.category is DTypeCategory.INTEGER
+            and dtype.category in {DTypeCategory.FLOAT, DTypeCategory.BFLOAT}
+        )
+        widens = (
+            source.bits is not None
+            and dtype.bits is not None
+            and (
+                dtype.bits > source.bits
+                or (integer_to_float and dtype.bits >= source.bits)
+            )
+        )
         return self._emit(
-            "weft_kernel.widen",
+            "weft_kernel.widen" if widens else "weft_kernel.cast",
             node,
             operands=(value,),
             result_types=(with_element(value.type, ScalarType(dtype)),),

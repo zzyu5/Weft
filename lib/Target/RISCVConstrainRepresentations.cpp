@@ -168,17 +168,64 @@ public:
         facts.cohort = std::max(facts.cohort, *partition);
       });
 
+      llvm::StringMap<AxisFacts> levelAxisFacts;
+      llvm::StringMap<int64_t> levelAxes;
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        if (riscv_internal::string(operation, "name").value_or("") !=
+            "weft_kernel.level")
+          continue;
+        auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+        if (!operands || operands.empty())
+          continue;
+        llvm::StringRef domainId =
+            mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+        auto domainValue = valuesById.find(domainId);
+        if (domainValue == valuesById.end())
+          continue;
+        auto axis = riscv_internal::integer(domainValue->second, "domain_axis");
+        auto relation =
+            riscv_internal::string(domainValue->second, "domain_relation");
+        auto partition =
+            riscv_internal::string(domainValue->second, "domain_partition");
+        auto resolved = partition
+                            ? resolvePartition(*partition, problem.getCandidate())
+                            : std::optional<int64_t>();
+        if (!axis || !relation || !resolved || *resolved <= 0)
+          continue;
+        llvm::StringRef levelId =
+            riscv_internal::string(operation, "id").value_or("");
+        levelAxes[levelId] = *axis;
+        levelAxisFacts[levelId] = {
+            (*relation == "rows" || *relation == "cols") ? 0 : 1,
+            *resolved};
+      }
+      auto factsFor = [&](mlir::DictionaryAttr operation, int64_t axis) {
+        if (auto path = operation.getAs<mlir::ArrayAttr>("level_path"))
+          for (mlir::Attribute levelAttribute : llvm::reverse(path)) {
+            llvm::StringRef level =
+                mlir::cast<mlir::StringAttr>(levelAttribute).getValue();
+            if (levelAxes.lookup(level) == axis)
+              return levelAxisFacts.lookup(level);
+          }
+        return axisFacts.lookup(axis);
+      };
+
       llvm::StringMap<int64_t> useCounts;
-      llvm::StringMap<llvm::SmallVector<std::string, 4>> consumerOperationIds;
       llvm::StringMap<std::string> producers;
       llvm::StringMap<std::string> producerIds;
       llvm::StringMap<mlir::DictionaryAttr> producerOperations;
       llvm::StringMap<bool> singletonScalarExtractInputs;
       llvm::StringMap<int64_t> valueLaneAxes;
       llvm::StringMap<int> valueLanePriorities;
-      llvm::StringMap<int64_t> valueRegisterAxes;
+      llvm::StringMap<int64_t> valueLaneCohorts;
+      llvm::StringMap<llvm::SmallVector<int64_t, 4>> valueRegisterAxes;
       llvm::StringMap<int64_t> operationLaneAxes;
+      llvm::StringMap<int64_t> operationLaneCohorts;
+      llvm::StringMap<int64_t> operationMemoryAffinities;
+      llvm::StringMap<std::string> operationLaneReasons;
       llvm::StringMap<int64_t> operationAccumulatorAxes;
+      llvm::StringMap<int64_t> operationEliminatedAxes;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef name = *riscv_internal::string(operation, "name");
@@ -189,7 +236,6 @@ public:
             llvm::StringRef id =
                 mlir::cast<mlir::StringAttr>(operand).getValue();
             ++useCounts[id];
-            consumerOperationIds[id].push_back(operationId.str());
           }
         if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
           for (mlir::Attribute result : results) {
@@ -222,11 +268,134 @@ public:
               singletonScalarExtractInputs[inputId] = true;
           }
         }
+      }
+
+      llvm::StringMap<llvm::SmallVector<std::string, 8>> useDefNeighbors;
+      auto connect = [&](llvm::ArrayRef<std::string> ids) {
+        for (size_t lhs = 0; lhs < ids.size(); ++lhs)
+          for (size_t rhs = lhs + 1; rhs < ids.size(); ++rhs) {
+            useDefNeighbors[ids[lhs]].push_back(ids[rhs]);
+            useDefNeighbors[ids[rhs]].push_back(ids[lhs]);
+          }
+      };
+      llvm::StringMap<llvm::SmallVector<std::string, 8>> handoffValues;
+      for (mlir::Attribute attribute : problem.getValues()) {
+        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef handoff =
+            riscv_internal::string(value, "handoff_class").value_or("");
+        if (!handoff.empty())
+          handoffValues[handoff].push_back(
+              riscv_internal::string(value, "id")->str());
+      }
+      for (const auto &entry : handoffValues)
+        connect(entry.getValue());
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        if (!propagatesLaneIdentity(
+                riscv_internal::string(operation, "name").value_or("")))
+          continue;
+        llvm::SmallVector<std::string, 8> ids;
+        for (llvm::StringRef key : {"operands", "results"})
+          if (auto values = operation.getAs<mlir::ArrayAttr>(key))
+            for (mlir::Attribute value : values)
+              ids.push_back(
+                  mlir::cast<mlir::StringAttr>(value).getValue().str());
+        connect(ids);
+      }
+      auto contiguousAxisForMemory = [&](mlir::DictionaryAttr value) {
+        auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+        if (!axes || axes.empty())
+          return int64_t{0};
+        llvm::StringRef layout =
+            riscv_internal::string(value, "layout_identity").value_or("");
+        if (layout.consume_front("packed.along."))
+          for (auto [ordinal, symbol] :
+               llvm::enumerate(kernel.getShapeSymbols()))
+            if (mlir::cast<mlir::StringAttr>(symbol)
+                    .getValue()
+                    .equals_insensitive(layout))
+              return static_cast<int64_t>(ordinal) + 1;
+        if (riscv_internal::string(value, "encoding_kind").value_or("") ==
+            "dense")
+          return axes.asArrayRef().back();
+        return int64_t{0};
+      };
+      auto memoryAffinityFor = [&](mlir::DictionaryAttr operation,
+                                   int64_t candidateAxis) {
+        llvm::SmallSet<std::string, 32> visited;
+        llvm::SmallVector<std::string, 16> pending;
+        for (llvm::StringRef key : {"operands", "results"})
+          if (auto values = operation.getAs<mlir::ArrayAttr>(key))
+            for (mlir::Attribute value : values)
+              pending.push_back(
+                  mlir::cast<mlir::StringAttr>(value).getValue().str());
+        int64_t score = 0;
+        while (!pending.empty()) {
+          std::string current = std::move(pending.back());
+          pending.pop_back();
+          if (!visited.insert(current).second)
+            continue;
+          auto value = valuesById.find(current);
+          if (value == valuesById.end() ||
+              !containsAxis(value->second, candidateAxis))
+            continue;
+          llvm::StringRef kind =
+              riscv_internal::string(value->second, "kind").value_or("");
+          if ((kind == "view" || kind == "slice") &&
+              contiguousAxisForMemory(value->second) == candidateAxis)
+            ++score;
+          auto neighbors = useDefNeighbors.find(current);
+          if (neighbors != useDefNeighbors.end())
+            pending.append(neighbors->second.begin(), neighbors->second.end());
+        }
+        return score;
+      };
+
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef name = *riscv_internal::string(operation, "name");
+        llvm::StringRef operationId =
+            *riscv_internal::string(operation, "id");
         if (riscv_internal::string(operation, "engine").value_or("") != "wide")
           continue;
         int64_t operationAxis = -1;
         int operationPriority = 3;
-        if (name == "weft_kernel.outer_contract") {
+        int64_t operationCohort = 1;
+        int64_t operationMemoryAffinity = -1;
+        if (name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
+            name == "weft_kernel.outer_contract") {
+          auto source =
+              operation.getAs<mlir::DictionaryAttr>("source_attributes");
+          auto over = source
+                          ? source.getAs<mlir::DenseI64ArrayAttr>("over")
+                          : mlir::DenseI64ArrayAttr();
+          if (over && over.size() == 1)
+            operationEliminatedAxes[operationId] =
+                over.asArrayRef().front();
+        }
+        if (name == "weft_kernel.reduce") {
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto source =
+              operation.getAs<mlir::DictionaryAttr>("source_attributes");
+          auto position = source ? source.getAs<mlir::IntegerAttr>("axis")
+                                 : mlir::IntegerAttr();
+          if (operands && operands.size() == 1 && position) {
+            llvm::StringRef inputId =
+                mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+            auto input = valuesById.find(inputId);
+            auto axes = input == valuesById.end()
+                            ? mlir::DenseI64ArrayAttr()
+                            : input->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+            if (axes && position.getInt() >= 0 &&
+                position.getInt() < static_cast<int64_t>(axes.size())) {
+              operationAxis = axes.asArrayRef()[position.getInt()];
+              operationPriority = -2;
+              operationCohort =
+                  std::max<int64_t>(1, factsFor(operation, operationAxis).cohort);
+              operationEliminatedAxes[operationId] = operationAxis;
+            }
+          }
+        } else if (name == "weft_kernel.outer_contract") {
           auto source =
               operation.getAs<mlir::DictionaryAttr>("source_attributes");
           auto over = source
@@ -297,6 +466,7 @@ public:
                   llvm::is_contained(axes.asArrayRef(), packedLaneAxis)) {
                 operationAxis = packedLaneAxis;
                 operationPriority = -1;
+                operationCohort = factsFor(operation, packedLaneAxis).cohort;
               }
               if (operationAxis > 0)
                 break;
@@ -306,6 +476,7 @@ public:
                   continue;
                 operationAxis = axis;
                 operationPriority = -1;
+                operationCohort = factsFor(operation, axis).cohort;
                 break;
               }
               if (operationAxis > 0)
@@ -326,13 +497,20 @@ public:
             if (!axes)
               continue;
             for (int64_t axis : axes.asArrayRef()) {
-              auto facts = axisFacts.find(axis);
-              if (facts == axisFacts.end())
+              AxisFacts facts = factsFor(operation, axis);
+              if (facts.cohort <= 1)
                 continue;
+              int64_t memoryAffinity = memoryAffinityFor(operation, axis);
               if (operationAxis < 0 ||
-                  facts->second.priority < operationPriority) {
+                  facts.priority < operationPriority ||
+                  (facts.priority == operationPriority &&
+                   (memoryAffinity > operationMemoryAffinity ||
+                    (memoryAffinity == operationMemoryAffinity &&
+                     facts.cohort > operationCohort)))) {
                 operationAxis = axis;
-                operationPriority = facts->second.priority;
+                operationPriority = facts.priority;
+                operationCohort = facts.cohort;
+                operationMemoryAffinity = memoryAffinity;
               }
             }
           }
@@ -347,9 +525,12 @@ public:
             if (axis <= 0)
               continue;
             int priority = valueLanePriorities.lookup(id);
-            if (operationAxis < 0 || priority < operationPriority) {
+            int64_t cohort = valueLaneCohorts.lookup(id);
+            if (operationAxis < 0 || priority < operationPriority ||
+                (priority == operationPriority && cohort > operationCohort)) {
               operationAxis = axis;
               operationPriority = priority;
+              operationCohort = cohort;
             }
           }
         };
@@ -382,15 +563,20 @@ public:
                   llvm::StringRef operationId =
                       *riscv_internal::string(operation, "id");
                   operationAccumulatorAxes[operationId] = axis;
-                  valueRegisterAxes[
-                      mlir::cast<mlir::StringAttr>(results[0]).getValue()] =
-                      axis;
                   break;
                 }
           }
         }
         operationLaneAxes[*riscv_internal::string(operation, "id")] =
             operationAxis;
+        operationLaneCohorts[operationId] = operationCohort;
+        operationMemoryAffinities[operationId] = operationMemoryAffinity;
+        operationLaneReasons[operationId] =
+            operationEliminatedAxes.lookup(operationId) == operationAxis
+                ? "explicit reduction axis eliminated by this operation"
+            : operationPriority < 0
+                ? "explicit packed/derived operand layout"
+                : "use-def-connected memory affinity followed by innermost Level cohort";
         for (llvm::StringRef key : {"operands", "results"})
           if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
             for (mlir::Attribute idAttribute : ids) {
@@ -404,10 +590,14 @@ public:
                           .value_or(0) <= 0)
                 continue;
               auto previous = valueLanePriorities.find(id);
+              const int64_t previousCohort = valueLaneCohorts.lookup(id);
               if (previous == valueLanePriorities.end() ||
-                  operationPriority < previous->second) {
+                  operationPriority < previous->second ||
+                  (operationPriority == previous->second &&
+                   operationCohort > previousCohort)) {
                 valueLaneAxes[id] = operationAxis;
                 valueLanePriorities[id] = operationPriority;
+                valueLaneCohorts[id] = operationCohort;
               }
             }
       }
@@ -425,7 +615,10 @@ public:
             llvm::StringRef operationId =
                 riscv_internal::string(operation, "id").value_or("");
             int64_t axis = operationLaneAxes.lookup(operationId);
-            int priority = axis > 0 ? axisFacts.lookup(axis).priority : 3;
+            AxisFacts operationFacts =
+                axis > 0 ? factsFor(operation, axis) : AxisFacts{};
+            int priority = axis > 0 ? operationFacts.priority : 3;
+            int64_t cohort = axis > 0 ? operationFacts.cohort : 1;
             for (llvm::StringRef key : {"results", "operands"})
               if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
                 for (mlir::Attribute idAttribute : ids) {
@@ -433,10 +626,14 @@ public:
                       mlir::cast<mlir::StringAttr>(idAttribute).getValue();
                   int64_t candidate = valueLaneAxes.lookup(id);
                   int candidatePriority = valueLanePriorities.lookup(id);
+                  int64_t candidateCohort = valueLaneCohorts.lookup(id);
                   if (candidate > 0 &&
-                      (axis <= 0 || candidatePriority < priority)) {
+                      (axis <= 0 || candidatePriority < priority ||
+                       (candidatePriority == priority &&
+                        candidateCohort > cohort))) {
                     axis = candidate;
                     priority = candidatePriority;
+                    cohort = candidateCohort;
                   }
                 }
             if (axis <= 0)
@@ -454,10 +651,13 @@ public:
                               .value_or(0) <= 0)
                     continue;
                   auto previous = valueLanePriorities.find(id);
+                  const int64_t previousCohort = valueLaneCohorts.lookup(id);
                   if (previous == valueLanePriorities.end() ||
-                      priority < previous->second) {
+                      priority < previous->second ||
+                      (priority == previous->second && cohort > previousCohort)) {
                     valueLaneAxes[id] = axis;
                     valueLanePriorities[id] = priority;
+                    valueLaneCohorts[id] = cohort;
                     changed = true;
                   }
                 }
@@ -466,71 +666,10 @@ public:
       };
       propagateLaneIdentities();
 
-      bool changed = true;
-      while (changed) {
-        changed = false;
-        for (mlir::Attribute attribute : problem.getOperations()) {
-          auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
-          llvm::StringRef name =
-              riscv_internal::string(operation, "name").value_or("");
-          if (!propagatesLaneIdentity(name))
-            continue;
-          int64_t registerAxis = 0;
-          for (llvm::StringRef key : {"results", "operands"})
-            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
-              for (mlir::Attribute idAttribute : ids) {
-                llvm::StringRef id =
-                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
-                int64_t candidate = valueRegisterAxes.lookup(id);
-                if (candidate > 0) {
-                  registerAxis = candidate;
-                  break;
-                }
-              }
-          if (registerAxis <= 0)
-            continue;
-          for (llvm::StringRef key : {"operands", "results"})
-            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
-              for (mlir::Attribute idAttribute : ids) {
-                llvm::StringRef id =
-                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
-                auto found = valuesById.find(id);
-                if (found == valuesById.end() ||
-                    !containsAxis(found->second, registerAxis) ||
-                    riscv_internal::integer(found->second, "logical_sew")
-                            .value_or(0) <= 0 ||
-                    valueRegisterAxes.lookup(id) == registerAxis)
-                  continue;
-                valueRegisterAxes[id] = registerAxis;
-                changed = true;
-              }
-        }
-      }
-
-      llvm::StringMap<int64_t> handoffRegisterAxes;
-      for (mlir::Attribute attribute : problem.getValues()) {
-        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef handoff =
-            riscv_internal::string(value, "handoff_class").value_or("");
-        llvm::StringRef id = *riscv_internal::string(value, "id");
-        int64_t axis = valueRegisterAxes.lookup(id);
-        if (!handoff.empty() && axis > 0)
-          handoffRegisterAxes[handoff] = axis;
-      }
-      for (mlir::Attribute attribute : problem.getValues()) {
-        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef handoff =
-            riscv_internal::string(value, "handoff_class").value_or("");
-        int64_t axis = handoffRegisterAxes.lookup(handoff);
-        if (handoff.empty() || axis <= 0 || !containsAxis(value, axis) ||
-            riscv_internal::integer(value, "logical_sew").value_or(0) <= 0)
-          continue;
-        valueRegisterAxes[*riscv_internal::string(value, "id")] = axis;
-      }
-
       struct HandoffChoice {
         int64_t axis = 0;
         int priority = 3;
+        int64_t cohort = 1;
       };
       llvm::StringMap<HandoffChoice> handoffChoices;
       for (mlir::Attribute attribute : problem.getValues()) {
@@ -542,9 +681,11 @@ public:
         if (handoff.empty() || axis <= 0)
           continue;
         int priority = valueLanePriorities.lookup(id);
+        int64_t cohort = valueLaneCohorts.lookup(id);
         HandoffChoice &choice = handoffChoices[handoff];
-        if (choice.axis <= 0 || priority < choice.priority)
-          choice = {axis, priority};
+        if (choice.axis <= 0 || priority < choice.priority ||
+            (priority == choice.priority && cohort > choice.cohort))
+          choice = {axis, priority, cohort};
       }
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
@@ -557,33 +698,43 @@ public:
           continue;
         llvm::StringRef id = *riscv_internal::string(value, "id");
         auto previous = valueLanePriorities.find(id);
+        const int64_t previousCohort = valueLaneCohorts.lookup(id);
         if (previous == valueLanePriorities.end() ||
-            choice->second.priority < previous->second) {
+            choice->second.priority < previous->second ||
+            (choice->second.priority == previous->second &&
+             choice->second.cohort > previousCohort)) {
           valueLaneAxes[id] = choice->second.axis;
           valueLanePriorities[id] = choice->second.priority;
+          valueLaneCohorts[id] = choice->second.cohort;
         }
       }
       propagateLaneIdentities();
 
+      // A value keeps every source-visible cohort axis that is not its SIMD
+      // lane as an ordered register tuple.  This is the projection of the
+      // logical value shape onto core-local register repetitions; it is not a
+      // second source-level value decomposition.  In particular a reduce
+      // result keeps all free axes even though its lane/reduction axis has
+      // disappeared from the canonical result type.
       for (mlir::Attribute attribute : problem.getValues()) {
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef id = *riscv_internal::string(value, "id");
-        int64_t laneAxis = valueLaneAxes.lookup(id);
-        int64_t registerAxis = valueRegisterAxes.lookup(id);
-        if (laneAxis <= 0 || laneAxis != registerAxis)
+        if (riscv_internal::integer(value, "logical_sew").value_or(0) <= 0)
           continue;
-        auto consumers = consumerOperationIds.find(id);
-        if (consumers == consumerOperationIds.end() || consumers->second.empty())
+        const int64_t laneAxis = valueLaneAxes.lookup(id);
+        auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+        if (!axes)
           continue;
-        bool registerBroadcastOnly = true;
-        for (const std::string &consumerId : consumers->second) {
-          int64_t consumerLane = operationLaneAxes.lookup(consumerId);
-          registerBroadcastOnly &= consumerLane > 0 && consumerLane != laneAxis;
+        llvm::SmallVector<int64_t, 4> registerAxes;
+        for (int64_t axis : axes.asArrayRef()) {
+          auto facts = axisFacts.find(axis);
+          if (axis == laneAxis || facts == axisFacts.end() ||
+              facts->second.priority != 0 || facts->second.cohort <= 1)
+            continue;
+          registerAxes.push_back(axis);
         }
-        if (registerBroadcastOnly) {
-          valueLaneAxes.erase(id);
-          valueLanePriorities.erase(id);
-        }
+        if (!registerAxes.empty())
+          valueRegisterAxes[id] = std::move(registerAxes);
       }
 
       int64_t vlenBits =
@@ -696,7 +847,8 @@ public:
           continue;
         ChainFacts &chain = chains[find(index)];
         chain.axis = axis;
-        chain.cohort = axisFacts.lookup(axis).cohort;
+        chain.cohort = std::max<int64_t>(chain.cohort,
+                                         valueLaneCohorts.lookup(id));
         chain.maximumSEW =
             std::max<int64_t>(chain.maximumSEW, std::max<int64_t>(8, logicalSEW));
         chain.maximumExtent = std::max(chain.maximumExtent, laneExtent(value, axis));
@@ -762,7 +914,8 @@ public:
         auto chainIt = chains.find(chainRoot);
         int64_t chainLanes = chainIt == chains.end() ? 1 : chainIt->second.lanes;
         int64_t valueLaneAxis = valueLaneAxes.lookup(id);
-        int64_t valueRegisterAxis = valueRegisterAxes.lookup(id);
+        llvm::SmallVector<int64_t, 4> valueRegisterAxisList =
+            valueRegisterAxes.lookup(id);
         bool lane = valueLaneAxis > 0 && containsAxis(value, valueLaneAxis) &&
                     logicalSEW > 0 && chainIt != chains.end();
         const bool scalarExtract = singletonScalarExtractInputs.lookup(id) &&
@@ -796,22 +949,30 @@ public:
                         : 1)
                  : 1;
         int64_t registerParts = 1;
-        if (valueRegisterAxis > 0 && valueRegisterAxis != valueLaneAxis) {
-          auto shape = value.getAs<mlir::DenseI64ArrayAttr>("shape");
-          auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+        llvm::SmallVector<int64_t, 4> registerExtents;
+        auto shape = value.getAs<mlir::DenseI64ArrayAttr>("shape");
+        auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
+        for (int64_t registerAxis : valueRegisterAxisList) {
+          int64_t physicalExtent = 0;
           if (shape && axes && shape.size() == axes.size())
             for (auto [extent, axis] :
-                 llvm::zip(shape.asArrayRef(), axes.asArrayRef())) {
-              if (axis != valueRegisterAxis)
-                continue;
-              int64_t physicalExtent = resolveValueExtent(extent);
-              auto facts = axisFacts.find(axis);
-              if (physicalExtent <= 0 && facts != axisFacts.end())
-                physicalExtent = facts->second.cohort;
-              if (physicalExtent > 0)
-                registerParts *= physicalExtent;
-            }
+                 llvm::zip(shape.asArrayRef(), axes.asArrayRef()))
+              if (axis == registerAxis) {
+                physicalExtent = resolveValueExtent(extent);
+                break;
+              }
+          auto facts = axisFacts.find(registerAxis);
+          if (physicalExtent <= 0 && facts != axisFacts.end())
+            physicalExtent = facts->second.cohort;
+          if (physicalExtent <= 0) {
+            legal = false;
+            break;
+          }
+          registerExtents.push_back(physicalExtent);
+          registerParts *= physicalExtent;
         }
+        if (!legal)
+          break;
         if (!lane && registerParts > 1 && logicalSEW > 0)
           kind = "register-scalar-tuple";
         int64_t vectorParts = streamParts * registerParts;
@@ -841,8 +1002,16 @@ public:
         value = riscv_internal::set(
             value, "register_parts", builder.getI64IntegerAttr(registerParts));
         value = riscv_internal::set(
+            value, "register_axes",
+            builder.getDenseI64ArrayAttr(valueRegisterAxisList));
+        value = riscv_internal::set(
+            value, "register_extents",
+            builder.getDenseI64ArrayAttr(registerExtents));
+        value = riscv_internal::set(
             value, "register_axis",
-            builder.getI64IntegerAttr(valueRegisterAxis));
+            builder.getI64IntegerAttr(valueRegisterAxisList.empty()
+                                          ? 0
+                                          : valueRegisterAxisList.front()));
         value = riscv_internal::set(
             value, "lmul_eighths", builder.getI64IntegerAttr(lmul));
         value = riscv_internal::set(
@@ -948,11 +1117,27 @@ public:
           operation = riscv_internal::set(
               operation, "lane_axis",
               builder.getI64IntegerAttr(operationLaneAxis));
+        if (operationLaneAxis > 0) {
+          operation = riscv_internal::set(
+              operation, "lane_axis_derived_from",
+              builder.getStringAttr(operationLaneReasons.lookup(id)));
+          operation = riscv_internal::set(
+              operation, "lane_axis_memory_affinity",
+              builder.getI64IntegerAttr(operationMemoryAffinities.lookup(id)));
+          operation = riscv_internal::set(
+              operation, "lane_axis_cohort",
+              builder.getI64IntegerAttr(operationLaneCohorts.lookup(id)));
+        }
         int64_t accumulatorAxis = operationAccumulatorAxes.lookup(id);
         if (accumulatorAxis > 0)
           operation = riscv_internal::set(
               operation, "accumulator_axis",
               builder.getI64IntegerAttr(accumulatorAxis));
+        int64_t eliminatedAxis = operationEliminatedAxes.lookup(id);
+        if (eliminatedAxis > 0)
+          operation = riscv_internal::set(
+              operation, "eliminated_axis",
+              builder.getI64IntegerAttr(eliminatedAxis));
         auto transfer = transferDescriptions.find(id);
         if (transfer != transferDescriptions.end())
           operation = riscv_internal::set(

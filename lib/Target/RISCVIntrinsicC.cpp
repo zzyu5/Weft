@@ -167,6 +167,8 @@ struct Binding {
     Record,
     Field,
     DeferredMac,
+    DeferredProduct,
+    DeferredContract,
     DeferredWiden,
     DeferredFold,
     PackRequest,
@@ -638,7 +640,9 @@ private:
   mlir::LogicalResult compileLookup(kernel::LookupOp operation);
   mlir::LogicalResult compileContract(mlir::Operation &operation,
                                       mlir::Value lhs, mlir::Value rhs,
-                                      mlir::Value result, bool outer);
+                                      mlir::Value result, bool outer,
+                                      std::optional<Binding> initial = std::nullopt,
+                                      mlir::Value initialValue = {});
   mlir::LogicalResult compileBinary(kernel::BinaryOp operation);
   mlir::LogicalResult compileCommit(kernel::CommitOp operation);
   mlir::LogicalResult compilePack(kernel::PackOp operation);
@@ -654,13 +658,32 @@ private:
   std::string vectorSuffix(mlir::Value value) const;
   int64_t vectorPartCount(mlir::Value value) const;
   int64_t streamPartCount(mlir::Value value) const;
+  int64_t registerPartCount(mlir::Value value) const;
   int64_t physicalLanes(mlir::Value value) const;
   int64_t laneAxisFor(mlir::Value value) const;
+  llvm::SmallVector<int64_t, 4> registerAxesFor(mlir::Value value) const;
+  llvm::SmallVector<int64_t, 4> registerExtentsFor(mlir::Value value) const;
+  std::optional<llvm::SmallVector<int64_t, 4>>
+  registerCoordinates(mlir::Value value, size_t registerPart) const;
+  std::optional<size_t> projectPart(mlir::Value source, mlir::Value result,
+                                    size_t resultPart) const;
+  std::optional<size_t> projectRegisterPart(mlir::Value source,
+                                            mlir::Value result,
+                                            size_t resultRegisterPart) const;
+  mlir::FailureOr<Binding> projectBinding(mlir::Value source,
+                                          mlir::Value result,
+                                          const Binding &binding);
+  mlir::LogicalResult assignBinding(mlir::Operation *operation,
+                                    mlir::Value targetValue, Binding &target,
+                                    mlir::Value sourceValue,
+                                    const Binding &source,
+                                    llvm::StringRef mismatch);
   std::string partOffset(mlir::Value value, size_t part) const;
   std::string partVL(mlir::Value value, size_t part) const;
   mlir::FailureOr<Binding>
   makeVector(mlir::Value value, llvm::StringRef prefix,
-             std::optional<Binding> initial = std::nullopt);
+             std::optional<Binding> initial = std::nullopt,
+             mlir::Value initialValue = {});
   mlir::FailureOr<Binding> loadDenseBlock(mlir::Value result,
                                           const Binding &memoryBlock);
   mlir::FailureOr<Binding> materializeNumeric(mlir::Value value,
@@ -738,6 +761,192 @@ int64_t Emitter::streamPartCount(mlir::Value value) const {
   return 1;
 }
 
+int64_t Emitter::registerPartCount(mlir::Value value) const {
+  if (auto count = assigned(value).getAs<mlir::IntegerAttr>("register_parts"))
+    return std::max<int64_t>(1, count.getInt());
+  return 1;
+}
+
+llvm::SmallVector<int64_t, 4>
+Emitter::registerAxesFor(mlir::Value value) const {
+  llvm::SmallVector<int64_t, 4> result;
+  if (auto axes =
+          assigned(value).getAs<mlir::DenseI64ArrayAttr>("register_axes"))
+    result.append(axes.asArrayRef().begin(), axes.asArrayRef().end());
+  else if (auto axis = assigned(value).getAs<mlir::IntegerAttr>("register_axis");
+           axis && axis.getInt() > 0)
+    result.push_back(axis.getInt());
+  return result;
+}
+
+llvm::SmallVector<int64_t, 4>
+Emitter::registerExtentsFor(mlir::Value value) const {
+  llvm::SmallVector<int64_t, 4> result;
+  if (auto extents =
+          assigned(value).getAs<mlir::DenseI64ArrayAttr>("register_extents"))
+    result.append(extents.asArrayRef().begin(), extents.asArrayRef().end());
+  if (!result.empty())
+    return result;
+  result.assign(registerAxesFor(value).size(), 1);
+  if (result.size() == 1)
+    result.front() = registerPartCount(value);
+  return result;
+}
+
+std::optional<llvm::SmallVector<int64_t, 4>>
+Emitter::registerCoordinates(mlir::Value value, size_t registerPart) const {
+  llvm::SmallVector<int64_t, 4> axes = registerAxesFor(value);
+  llvm::SmallVector<int64_t, 4> extents = registerExtentsFor(value);
+  if (axes.size() != extents.size())
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 4> coordinates(axes.size(), 0);
+  int64_t remaining = static_cast<int64_t>(registerPart);
+  for (int64_t index = static_cast<int64_t>(axes.size()) - 1; index >= 0;
+       --index) {
+    if (extents[index] <= 0)
+      return std::nullopt;
+    coordinates[index] = remaining % extents[index];
+    remaining /= extents[index];
+  }
+  if (remaining != 0)
+    return std::nullopt;
+  return coordinates;
+}
+
+std::optional<size_t> Emitter::projectPart(mlir::Value source,
+                                           mlir::Value result,
+                                           size_t resultPart) const {
+  const int64_t resultStreams = streamPartCount(result);
+  const int64_t sourceStreams = streamPartCount(source);
+  if (resultStreams <= 0 || sourceStreams <= 0)
+    return std::nullopt;
+  const int64_t resultStream = resultPart % resultStreams;
+  int64_t resultRegister = resultPart / resultStreams;
+  llvm::SmallVector<int64_t, 4> resultAxes = registerAxesFor(result);
+  llvm::SmallVector<int64_t, 4> resultExtents = registerExtentsFor(result);
+  if (resultAxes.size() != resultExtents.size())
+    return std::nullopt;
+  llvm::SmallVector<int64_t, 4> resultCoordinates(resultAxes.size(), 0);
+  for (int64_t index = static_cast<int64_t>(resultAxes.size()) - 1; index >= 0;
+       --index) {
+    if (resultExtents[index] <= 0)
+      return std::nullopt;
+    resultCoordinates[index] = resultRegister % resultExtents[index];
+    resultRegister /= resultExtents[index];
+  }
+  if (resultRegister != 0)
+    return std::nullopt;
+
+  llvm::SmallVector<int64_t, 4> sourceAxes = registerAxesFor(source);
+  llvm::SmallVector<int64_t, 4> sourceExtents = registerExtentsFor(source);
+  if (sourceAxes.size() != sourceExtents.size())
+    return std::nullopt;
+  int64_t sourceRegister = 0;
+  for (auto [axis, extent] : llvm::zip(sourceAxes, sourceExtents)) {
+    auto found = llvm::find(resultAxes, axis);
+    if (found == resultAxes.end() || extent <= 0)
+      return std::nullopt;
+    const size_t position = found - resultAxes.begin();
+    if (resultCoordinates[position] >= extent)
+      return std::nullopt;
+    sourceRegister = sourceRegister * extent + resultCoordinates[position];
+  }
+
+  const int64_t sourceLane = laneAxisFor(source);
+  const int64_t resultLane = laneAxisFor(result);
+  int64_t sourceStream = 0;
+  if (sourceLane > 0) {
+    if (sourceLane != resultLane || resultStream >= sourceStreams)
+      return std::nullopt;
+    sourceStream = sourceStreams == 1 ? 0 : resultStream;
+  }
+  const int64_t projected = sourceRegister * sourceStreams + sourceStream;
+  if (projected < 0 || projected >= vectorPartCount(source))
+    return std::nullopt;
+  return static_cast<size_t>(projected);
+}
+
+std::optional<size_t>
+Emitter::projectRegisterPart(mlir::Value source, mlir::Value result,
+                             size_t resultRegisterPart) const {
+  auto resultCoordinates = registerCoordinates(result, resultRegisterPart);
+  llvm::SmallVector<int64_t, 4> resultAxes = registerAxesFor(result);
+  llvm::SmallVector<int64_t, 4> sourceAxes = registerAxesFor(source);
+  llvm::SmallVector<int64_t, 4> sourceExtents = registerExtentsFor(source);
+  if (!resultCoordinates || resultCoordinates->size() != resultAxes.size() ||
+      sourceAxes.size() != sourceExtents.size())
+    return std::nullopt;
+  int64_t sourceRegister = 0;
+  for (auto [axis, extent] : llvm::zip(sourceAxes, sourceExtents)) {
+    auto found = llvm::find(resultAxes, axis);
+    if (found == resultAxes.end() || extent <= 0)
+      return std::nullopt;
+    size_t position = static_cast<size_t>(found - resultAxes.begin());
+    if ((*resultCoordinates)[position] >= extent)
+      return std::nullopt;
+    sourceRegister = sourceRegister * extent + (*resultCoordinates)[position];
+  }
+  if (sourceRegister < 0 || sourceRegister >= registerPartCount(source))
+    return std::nullopt;
+  return static_cast<size_t>(sourceRegister);
+}
+
+mlir::FailureOr<Binding>
+Emitter::projectBinding(mlir::Value source, mlir::Value result,
+                        const Binding &binding) {
+  if (binding.kind == Binding::Kind::Scalar)
+    return binding;
+  if (binding.kind != Binding::Kind::ScalarTuple &&
+      binding.kind != Binding::Kind::Vector)
+    return binding;
+  const int64_t parts = binding.kind == Binding::Kind::Vector
+                            ? vectorPartCount(result)
+                            : registerPartCount(result);
+  if (parts <= 0)
+    return mlir::failure();
+  Binding projected;
+  projected.kind = binding.kind;
+  for (int64_t part = 0; part < parts; ++part) {
+    auto sourcePart = projectPart(source, result, part);
+    if (!sourcePart || *sourcePart >= binding.parts.size())
+      return mlir::failure();
+    projected.parts.push_back(binding.parts[*sourcePart]);
+  }
+  if (projected.kind == Binding::Kind::ScalarTuple && parts == 1) {
+    projected.kind = Binding::Kind::Scalar;
+    projected.scalar = projected.parts.front();
+    projected.parts.clear();
+  }
+  return projected;
+}
+
+mlir::LogicalResult
+Emitter::assignBinding(mlir::Operation *operation, mlir::Value targetValue,
+                       Binding &target, mlir::Value sourceValue,
+                       const Binding &source, llvm::StringRef mismatch) {
+  if (target.kind == Binding::Kind::Scalar &&
+      source.kind == Binding::Kind::Scalar) {
+    line(target.scalar + " = " + source.scalar + ";");
+    return mlir::success();
+  }
+  if ((target.kind != Binding::Kind::Vector &&
+       target.kind != Binding::Kind::ScalarTuple) ||
+      target.kind != source.kind)
+    return fail(operation, mismatch);
+  const int64_t parts = target.kind == Binding::Kind::Vector
+                            ? vectorPartCount(targetValue)
+                            : registerPartCount(targetValue);
+  if (parts != static_cast<int64_t>(target.parts.size()))
+    return fail(operation, mismatch);
+  for (int64_t part = 0; part < parts; ++part) {
+    auto sourcePart = projectPart(sourceValue, targetValue, part);
+    if (!sourcePart || *sourcePart >= source.parts.size())
+      return fail(operation, mismatch);
+    line(target.parts[part] + " = " + source.parts[*sourcePart] + ";");
+  }
+  return mlir::success();
+}
+
 int64_t Emitter::physicalLanes(mlir::Value value) const {
   if (auto lanes = assigned(value).getAs<mlir::IntegerAttr>("physical_lanes"))
     return std::max<int64_t>(1, lanes.getInt());
@@ -769,27 +978,15 @@ std::string Emitter::partVL(mlir::Value value, size_t part) const {
 }
 
 int64_t Emitter::vectorPartCount(mlir::Value value) const {
-  auto type = mlir::dyn_cast<kernel::ValueType>(value.getType());
-  if (!type)
-    return 1;
-  int64_t count = 1;
-  const int64_t laneAxis = laneAxisFor(value);
-  for (auto [extent, axis] :
-       llvm::zip(type.getShape().asArrayRef(), type.getAxisIds().asArrayRef())) {
-    if (axis == laneAxis)
-      continue;
-    auto scope = axisScopes.find(axis);
-    if (scope != axisScopes.end() && !scope->second.empty())
-      count *= scope->second.back().physicalExtent;
-    else if (extent > 0)
-      count *= extent;
-  }
-  return std::max<int64_t>(1, count) * streamPartCount(value);
+  if (auto count = assigned(value).getAs<mlir::IntegerAttr>("vector_parts"))
+    return std::max<int64_t>(1, count.getInt());
+  return registerPartCount(value) * streamPartCount(value);
 }
 
 mlir::FailureOr<Binding>
 Emitter::makeVector(mlir::Value value, llvm::StringRef prefix,
-                    std::optional<Binding> initial) {
+                    std::optional<Binding> initial,
+                    mlir::Value initialValue) {
   Binding result;
   result.kind = Binding::Kind::Vector;
   const int64_t count = vectorPartCount(value);
@@ -814,9 +1011,29 @@ Emitter::makeVector(mlir::Value value, llvm::StringRef prefix,
           expression = "__riscv_vmv_v_x_" + suffix + "((" +
                        *elementType + ")(" + initial->scalar + "), " +
                        partVL(value, index) + ")";
-      } else if (initial->kind == Binding::Kind::Vector &&
-                 index < static_cast<int64_t>(initial->parts.size())) {
-        expression = initial->parts[index];
+      } else if (initial->kind == Binding::Kind::Vector ||
+                 initial->kind == Binding::Kind::ScalarTuple) {
+        if (!initialValue) {
+          kernel.emitError(
+              "vector initialization from a structured value requires its physical source");
+          return mlir::failure();
+        }
+        auto sourcePart = projectPart(initialValue, value, index);
+        if (!sourcePart || *sourcePart >= initial->parts.size()) {
+          kernel.emitError(
+              "vector initializer cannot be projected to the selected result mapping");
+          return mlir::failure();
+        }
+        if (initial->kind == Binding::Kind::Vector)
+          expression = initial->parts[*sourcePart];
+        else if (mlir::isa<mlir::FloatType>(element))
+          expression = "__riscv_vfmv_v_f_" + suffix + "((" +
+                       *elementType + ")(" + initial->parts[*sourcePart] +
+                       "), " + partVL(value, index) + ")";
+        else
+          expression = "__riscv_vmv_v_x_" + suffix + "((" +
+                       *elementType + ")(" + initial->parts[*sourcePart] +
+                       "), " + partVL(value, index) + ")";
       }
     }
     if (expression.empty())
@@ -885,7 +1102,6 @@ mlir::FailureOr<Binding>
 Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
   Binding loaded;
   loaded.kind = Binding::Kind::Vector;
-  auto resultType = mlir::cast<kernel::ValueType>(result.getType());
   auto slice = memoryBlock.slice;
   const Binding &base = bindings.lookup(slice.base);
   if (base.kind != Binding::Kind::Memory) {
@@ -903,18 +1119,8 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
   unsigned sew = riscv_internal::logicalBitWidth(result.getType());
   if (!elementType || !sew)
     return mlir::failure();
-  int64_t nonLaneAxis = -1;
-  int64_t count = 1;
   const int64_t laneAxis = laneAxisFor(result);
-  for (auto [extent, axis] : llvm::zip(resultType.getShape().asArrayRef(),
-                                       resultType.getAxisIds().asArrayRef()))
-    if (axis != laneAxis) {
-      nonLaneAxis = axis;
-      auto scope = axisScopes.find(axis);
-      count = scope != axisScopes.end() && !scope->second.empty()
-                  ? scope->second.back().physicalExtent
-                  : std::max<int64_t>(1, extent);
-    }
+  llvm::SmallVector<int64_t, 4> registerAxes = registerAxesFor(result);
   size_t laneDimension = llvm::find(memory.axes, laneAxis) - memory.axes.begin();
   if (laneDimension >= memory.strides.size()) {
     result.getDefiningOp()->emitError("selected dense load has no physical lane axis");
@@ -939,12 +1145,23 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
     return mlir::failure();
   }
   const int64_t streams = streamPartCount(result);
-  const int64_t totalParts = count * streams;
+  const int64_t totalParts = vectorPartCount(result);
   for (int64_t part = 0; part < totalParts; ++part) {
-    const int64_t nonLanePart = part / streams;
+    auto coordinates = registerCoordinates(result, part / streams);
+    if (!coordinates || coordinates->size() != registerAxes.size()) {
+      result.getDefiningOp()->emitError(
+          "selected dense load has no register-coordinate mapping");
+      return mlir::failure();
+    }
     llvm::SmallVector<std::pair<int64_t, std::string>> offsets;
-    if (nonLaneAxis >= 0)
-      offsets.push_back({nonLaneAxis, std::to_string(nonLanePart)});
+    std::string active = "1";
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      offsets.push_back({axis, std::to_string(coordinate)});
+      auto scope = axisScopes.find(axis);
+      if (scope != axisScopes.end() && !scope->second.empty())
+        active += " && " + std::to_string(coordinate) + " < " +
+                  scope->second.back().active;
+    }
     if (streams > 1)
       offsets.push_back({laneAxis, partOffset(result, part)});
     auto address = denseAddress(slice, offsets);
@@ -961,17 +1178,19 @@ Emitter::loadDenseBlock(mlir::Value result, const Binding &memoryBlock) {
                    "(" + *address + ", " + memory.strides[laneDimension] +
                    " * (ptrdiff_t)sizeof(" + *elementType + "), " +
                    partVL(result, part) + ")";
-    if (streams > 1 && nonLaneAxis < 0) {
+    if (registerAxes.empty() && streams > 1) {
       loaded.parts.push_back(std::move(expression));
       continue;
     }
     std::string name = fresh("load");
-    if (nonLaneAxis >= 0) {
-      const std::string active = axisScopes.lookup(nonLaneAxis).back().active;
-      line(type + " " + name + " = __riscv_vfmv_v_f_" + suffix + "(0.0f, " +
-           partVL(result, part) + ");");
-      line("if (" + std::to_string(nonLanePart) + " < " + active + ") " + name +
-           " = " + expression + ";");
+    if (!registerAxes.empty()) {
+      std::string zero = mlir::isa<mlir::FloatType>(resultElement)
+                             ? "__riscv_vfmv_v_f_" + suffix + "(0.0, " +
+                                   partVL(result, part) + ")"
+                             : "__riscv_vmv_v_x_" + suffix + "(0, " +
+                                   partVL(result, part) + ")";
+      line(type + " " + name + " = " + zero + ";");
+      line("if (" + active + ") " + name + " = " + expression + ";");
     } else {
       line(type + " " + name + " = " + expression + ";");
     }
@@ -1037,20 +1256,53 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
         owner = std::move(*record);
       }
       auto field = fieldFor(binding);
-      const int64_t registerAxis =
-          riscv_internal::integer(assigned(value), "register_axis").value_or(0);
+      llvm::SmallVector<int64_t, 4> registerAxes = registerAxesFor(value);
       const int64_t registerParts =
           riscv_internal::integer(assigned(value), "register_parts").value_or(0);
-      std::string stride;
-      for (const auto &[axis, byteStride] : owner.recordByteStrides)
-        if (axis == registerAxis)
-          stride = byteStride;
+      llvm::SmallVector<std::string, 4> registerStrides;
+      for (int64_t registerAxis : registerAxes) {
+        std::string stride;
+        for (const auto &[axis, byteStride] : owner.recordByteStrides)
+          if (axis == registerAxis) {
+            stride = byteStride;
+            break;
+          }
+        if (stride.empty())
+          return value.getDefiningOp()->emitError(
+                     "selected scalar tuple axis has no record-byte stride"),
+                 mlir::failure();
+        registerStrides.push_back(std::move(stride));
+      }
+      std::string logicalIndex = "0";
+      if (binding.field.index) {
+        const Binding &index = bindings.lookup(*binding.field.index);
+        auto encoding = encodings.find(owner.encodingFamily);
+        if (index.kind == Binding::Kind::Scalar) {
+          logicalIndex = index.scalar;
+        } else if (index.kind == Binding::Kind::Point &&
+                   encoding != encodings.end()) {
+          const int64_t elements = encoding->second.logicalElements;
+          logicalIndex =
+              binding.field.selector == "group_index"
+                  ? "((" + index.point.base + " % " +
+                        std::to_string(elements) + ") / " +
+                        std::to_string(index.point.physicalExtent) + ")"
+                  : "(" + index.point.base + " % " +
+                        std::to_string(elements) + ")";
+        } else {
+          return value.getDefiningOp()->emitError(
+                     "selected scalar tuple field has no usable logical index"),
+                 mlir::failure();
+        }
+      }
       unsigned logicalWidth =
           field ? riscv_internal::logicalBitWidth(field->type) : 0;
-      auto fragment = field ? singleStorageFragment(*field, "0", logicalWidth)
+      auto fragment = field
+                          ? singleStorageFragment(*field, logicalIndex, logicalWidth)
                             : std::optional<StorageFragment>();
-      if (owner.kind != Binding::Kind::Record || !field || registerAxis <= 0 ||
-          registerParts <= 0 || stride.empty() || !fragment ||
+      if (owner.kind != Binding::Kind::Record || !field || registerAxes.empty() ||
+          registerParts <= 0 || registerAxes.size() != registerStrides.size() ||
+          !fragment ||
           layoutKind(field->layouts) != "natural" || field->bitOffset % 8 ||
           logicalWidth % 8)
         return value.getDefiningOp()->emitError(
@@ -1059,9 +1311,16 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
       Binding tuple;
       tuple.kind = Binding::Kind::ScalarTuple;
       for (int64_t part = 0; part < registerParts; ++part) {
-        const std::string record =
-            "(" + owner.recordPointer + " + " + std::to_string(part) +
-            " * " + stride + ")";
+        auto coordinates = registerCoordinates(value, part);
+        if (!coordinates || coordinates->size() != registerAxes.size())
+          return value.getDefiningOp()->emitError(
+                     "selected scalar tuple has no register-coordinate mapping"),
+                 mlir::failure();
+        std::string record = "(" + owner.recordPointer;
+        for (auto [coordinate, stride] :
+             llvm::zip(*coordinates, registerStrides))
+          record += " + " + std::to_string(coordinate) + " * " + stride;
+        record += ")";
         if (field->type.isF32())
           tuple.parts.push_back("weft_load_f32_le(" + record + " + " +
                                 fragment->byte + ")");
@@ -1187,7 +1446,13 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileCommit(commit);
   if (mlir::isa<kernel::StageHandoffOp>(operation)) {
     auto handoff = mlir::cast<kernel::StageHandoffOp>(operation);
-    bindings[handoff.getResult()] = bindings.lookup(handoff.getInput());
+    mlir::FailureOr<Binding> projected =
+        projectBinding(handoff.getInput(), handoff.getResult(),
+                       bindings.lookup(handoff.getInput()));
+    if (mlir::failed(projected))
+      return fail(handoff,
+                  "stage handoff requires an explicit physical layout conversion");
+    bindings[handoff.getResult()] = std::move(*projected);
     return mlir::success();
   }
   return fail(&operation, "intrinsic-C emission has no rule for canonical operation");
@@ -1214,7 +1479,7 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   for (mlir::Value value : level.getCarried()) {
     Binding source = bindings.lookup(value);
     if (source.kind == Binding::Kind::Vector) {
-      mlir::FailureOr<Binding> copy = makeVector(value, "carry", source);
+      mlir::FailureOr<Binding> copy = makeVector(value, "carry", source, value);
       if (mlir::failed(copy))
         return mlir::failure();
       carried.push_back(std::move(*copy));
@@ -1225,6 +1490,19 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
       if (!type)
         return fail(level, "intrinsic-C emission does not support a carried scalar type");
       line(*type + " " + copy.scalar + " = " + source.scalar + ";");
+      carried.push_back(std::move(copy));
+    } else if (source.kind == Binding::Kind::ScalarTuple) {
+      auto type = scalarCType(riscv_internal::logicalElement(value.getType()));
+      if (!type)
+        return fail(level,
+                    "intrinsic-C emission does not support a carried tuple type");
+      Binding copy;
+      copy.kind = Binding::Kind::ScalarTuple;
+      for (llvm::StringRef expression : source.parts) {
+        std::string name = fresh("carry");
+        line(*type + " " + name + " = " + expression.str() + ";");
+        copy.parts.push_back(std::move(name));
+      }
       carried.push_back(std::move(copy));
     } else {
       carried.push_back(std::move(source));
@@ -1267,45 +1545,71 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   pointBinding.point = point;
 
   auto compileBirths = [&](mlir::Region &region,
-                           llvm::SmallVectorImpl<Binding> &yielded) {
+                           llvm::SmallVectorImpl<Binding> &yielded,
+                           llvm::SmallVectorImpl<mlir::Value> &yieldedValues) {
     mlir::Block &block = region.front();
     if (mlir::failed(compileBlock(block, {pointBinding})))
       return mlir::failure();
     auto terminator = mlir::cast<kernel::BirthsYieldOp>(block.getTerminator());
-    for (mlir::Value value : terminator.getValues())
+    for (mlir::Value value : terminator.getValues()) {
       yielded.push_back(bindings.lookup(value));
+      yieldedValues.push_back(value);
+    }
     return mlir::success();
   };
 
   llvm::SmallVector<Binding, 0> stateBirths;
   llvm::SmallVector<Binding, 0> stagedBirths;
-  if (mlir::failed(compileBirths(level.getStateBirths(), stateBirths)) ||
-      mlir::failed(compileBirths(level.getStagedBirths(), stagedBirths)))
+  llvm::SmallVector<mlir::Value, 0> stateBirthValues;
+  llvm::SmallVector<mlir::Value, 0> stagedBirthValues;
+  if (mlir::failed(compileBirths(level.getStateBirths(), stateBirths,
+                                stateBirthValues)) ||
+      mlir::failed(compileBirths(level.getStagedBirths(), stagedBirths,
+                                stagedBirthValues)))
     return mlir::failure();
 
   llvm::SmallVector<Binding, 0> bodyArguments{pointBinding};
-  bodyArguments.append(carried.begin(), carried.end());
-  bodyArguments.append(stateBirths.begin(), stateBirths.end());
-  bodyArguments.append(stagedBirths.begin(), stagedBirths.end());
-  if (mlir::failed(compileBlock(level.getBody().front(), bodyArguments)))
+  mlir::Block &body = level.getBody().front();
+  size_t argumentIndex = 1;
+  for (auto [index, binding] : llvm::enumerate(carried)) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        level.getCarried()[index], body.getArgument(argumentIndex++), binding);
+    if (mlir::failed(projected))
+      return fail(level,
+                  "level carried argument requires an explicit physical layout conversion");
+    bodyArguments.push_back(std::move(*projected));
+  }
+  for (auto [value, binding] : llvm::zip(stateBirthValues, stateBirths)) {
+    mlir::FailureOr<Binding> projected =
+        projectBinding(value, body.getArgument(argumentIndex++), binding);
+    if (mlir::failed(projected))
+      return fail(level,
+                  "level state birth requires an explicit physical layout conversion");
+    bodyArguments.push_back(std::move(*projected));
+  }
+  for (auto [value, binding] : llvm::zip(stagedBirthValues, stagedBirths)) {
+    mlir::FailureOr<Binding> projected =
+        projectBinding(value, body.getArgument(argumentIndex++), binding);
+    if (mlir::failed(projected))
+      return fail(level,
+                  "level staged birth requires an explicit physical layout conversion");
+    bodyArguments.push_back(std::move(*projected));
+  }
+  if (mlir::failed(compileBlock(body, bodyArguments)))
     return mlir::failure();
-  auto handoff = mlir::cast<kernel::HandoffOp>(level.getBody().front().getTerminator());
+  auto handoff = mlir::cast<kernel::HandoffOp>(body.getTerminator());
+  if (handoff.getValues().size() != carried.size())
+    return fail(level,
+                "level handoff value count does not match its carried state");
   for (auto [index, value] : llvm::enumerate(handoff.getValues())) {
     Binding next = bindings.lookup(value);
     if (index >= carried.size())
       return fail(level, "handoff produced more carried values than the level owns");
     Binding &state = carried[index];
-    if (state.kind == Binding::Kind::Vector && next.kind == Binding::Kind::Vector) {
-      if (state.parts.size() != next.parts.size())
-        return fail(level, "vector handoff shape changed inside a frozen level");
-      for (auto [target, source] : llvm::zip(state.parts, next.parts))
-        line(target + " = " + source + ";");
-    } else if (state.kind == Binding::Kind::Scalar &&
-               next.kind == Binding::Kind::Scalar) {
-      line(state.scalar + " = " + next.scalar + ";");
-    } else {
-      state = std::move(next);
-    }
+    if (mlir::failed(assignBinding(
+            level, level.getCarried()[index], state, value, next,
+            "level handoff requires an explicit physical layout conversion")))
+      return mlir::failure();
   }
 
   if (laneLevel)
@@ -1313,8 +1617,14 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   axisScopes[axis].pop_back();
   --indent;
   line("}");
-  for (auto [result, binding] : llvm::zip(level.getResults(), carried))
-    bindings[result] = binding;
+  for (auto [index, result] : llvm::enumerate(level.getResults())) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        level.getCarried()[index], result, carried[index]);
+    if (mlir::failed(projected))
+      return fail(level,
+                  "level result requires an explicit physical layout conversion");
+    bindings[result] = std::move(*projected);
+  }
   return mlir::success();
 }
 
@@ -1337,13 +1647,27 @@ mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
       line(*type + " " + copy.scalar + " = " + source.scalar + ";");
       carried.push_back(std::move(copy));
     } else if (source.kind == Binding::Kind::Vector) {
-      mlir::FailureOr<Binding> copy = makeVector(value, "for_carry", source);
+      mlir::FailureOr<Binding> copy =
+          makeVector(value, "for_carry", source, value);
       if (mlir::failed(copy))
         return mlir::failure();
       carried.push_back(std::move(*copy));
+    } else if (source.kind == Binding::Kind::ScalarTuple) {
+      auto type = scalarCType(riscv_internal::logicalElement(value.getType()));
+      if (!type)
+        return fail(operation,
+                    "ordered for tuple carry has no scalar C type");
+      Binding copy;
+      copy.kind = Binding::Kind::ScalarTuple;
+      for (llvm::StringRef expression : source.parts) {
+        std::string name = fresh("for_carry");
+        line(*type + " " + name + " = " + expression.str() + ";");
+        copy.parts.push_back(std::move(name));
+      }
+      carried.push_back(std::move(copy));
     } else {
       return fail(operation,
-                  "ordered for carry has no selected scalar/vector handoff");
+                  "ordered for carry has no selected scalar/vector/tuple handoff");
     }
   }
   std::string iterator = fresh("for_index");
@@ -1352,28 +1676,39 @@ mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
        step.scalar + ") {");
   ++indent;
   llvm::SmallVector<Binding, 0> arguments{scalar(iterator)};
-  arguments.append(carried.begin(), carried.end());
   mlir::Block &body = operation.getBody().front();
+  for (auto [index, binding] : llvm::enumerate(carried)) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        operation.getInitArgs()[index], body.getArgument(index + 1), binding);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "ordered for argument requires an explicit physical layout conversion");
+    arguments.push_back(std::move(*projected));
+  }
   if (mlir::failed(compileBlock(body, arguments)))
     return mlir::failure();
   auto yield = mlir::cast<kernel::YieldOp>(body.getTerminator());
-  for (auto [state, nextValue] : llvm::zip(carried, yield.getValues())) {
+  if (yield.getValues().size() != carried.size())
+    return fail(operation,
+                "ordered for yield count does not match its carried state");
+  for (auto [index, nextValue] : llvm::enumerate(yield.getValues())) {
+    Binding &state = carried[index];
     Binding next = bindings.lookup(nextValue);
-    if (state.kind == Binding::Kind::Scalar && next.kind == Binding::Kind::Scalar)
-      line(state.scalar + " = " + next.scalar + ";");
-    else if (state.kind == Binding::Kind::Vector &&
-             next.kind == Binding::Kind::Vector &&
-             state.parts.size() == next.parts.size())
-      for (auto [destination, expression] : llvm::zip(state.parts, next.parts))
-        line(destination + " = " + expression + ";");
-    else
-      return fail(operation,
-                  "ordered for body changed a carried physical handoff");
+    if (mlir::failed(assignBinding(
+            operation, operation.getInitArgs()[index], state, nextValue, next,
+            "ordered for body requires an explicit physical layout conversion")))
+      return mlir::failure();
   }
   --indent;
   line("}");
-  for (auto [result, binding] : llvm::zip(operation.getResults(), carried))
-    bindings[result] = std::move(binding);
+  for (auto [index, result] : llvm::enumerate(operation.getResults())) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        operation.getInitArgs()[index], result, carried[index]);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "ordered for result requires an explicit physical layout conversion");
+    bindings[result] = std::move(*projected);
+  }
   return mlir::success();
 }
 
@@ -1398,9 +1733,18 @@ mlir::LogicalResult Emitter::compileIf(kernel::IfOp operation) {
     if (!type)
       return fail(operation, "ordered if result has no intrinsic-C scalar type");
     Binding result;
-    result.kind = Binding::Kind::Scalar;
-    result.scalar = fresh("if_result");
-    line(*type + " " + result.scalar + ";");
+    if (kind == "register-scalar-tuple") {
+      result.kind = Binding::Kind::ScalarTuple;
+      for (int64_t part = 0; part < registerPartCount(resultValue); ++part) {
+        std::string name = fresh("if_result");
+        line(*type + " " + name + ";");
+        result.parts.push_back(std::move(name));
+      }
+    } else {
+      result.kind = Binding::Kind::Scalar;
+      result.scalar = fresh("if_result");
+      line(*type + " " + result.scalar + ";");
+    }
     results.push_back(std::move(result));
   }
 
@@ -1409,21 +1753,16 @@ mlir::LogicalResult Emitter::compileIf(kernel::IfOp operation) {
     if (mlir::failed(compileBlock(block, {})))
       return mlir::failure();
     auto yield = mlir::cast<kernel::YieldOp>(block.getTerminator());
-    for (auto [target, value] : llvm::zip(results, yield.getValues())) {
+    if (yield.getValues().size() != results.size())
+      return fail(operation,
+                  "ordered if yield count does not match its results");
+    for (auto [index, value] : llvm::enumerate(yield.getValues())) {
+      Binding &target = results[index];
       Binding source = bindings.lookup(value);
-      if (target.kind == Binding::Kind::Scalar &&
-          source.kind == Binding::Kind::Scalar) {
-        line(target.scalar + " = " + source.scalar + ";");
-      } else if (target.kind == Binding::Kind::Vector &&
-                 source.kind == Binding::Kind::Vector &&
-                 target.parts.size() == source.parts.size()) {
-        for (auto [destination, expression] :
-             llvm::zip(target.parts, source.parts))
-          line(destination + " = " + expression + ";");
-      } else {
-        return fail(operation,
-                    "ordered if branches disagree on selected physical handoff");
-      }
+      if (mlir::failed(assignBinding(
+              operation, operation.getResult(index), target, value, source,
+              "ordered if branch requires an explicit physical layout conversion")))
+        return mlir::failure();
     }
     return mlir::success();
   };
@@ -1708,10 +2047,63 @@ mlir::LogicalResult Emitter::compileNew(kernel::NewOp operation) {
     mlir::FailureOr<Binding> result =
         initial.kind == Binding::Kind::Slice
             ? loadDenseBlock(operation.getResult(), initial)
-            : makeVector(operation.getResult(), "state", initial);
+            : makeVector(operation.getResult(), "state", initial,
+                         operation.getInitialized() ? operation.getInitial()
+                                                    : mlir::Value());
     if (mlir::failed(result))
       return mlir::failure();
     bindings[operation.getResult()] = std::move(*result);
+    return mlir::success();
+  }
+  if (kind == "register-scalar-tuple") {
+    auto type =
+        scalarCType(riscv_internal::logicalElement(operation.getResult().getType()));
+    const int64_t parts = registerPartCount(operation.getResult());
+    if (!type || parts <= 0)
+      return fail(operation,
+                  "selected register tuple state has no scalar C representation");
+    Binding result;
+    result.kind = Binding::Kind::ScalarTuple;
+    llvm::SmallVector<int64_t, 4> axes = registerAxesFor(operation.getResult());
+    for (int64_t part = 0; part < parts; ++part) {
+      std::string expression;
+      if (initial.kind == Binding::Kind::Scalar) {
+        expression = initial.scalar;
+      } else if (initial.kind == Binding::Kind::ScalarTuple) {
+        auto projected = projectPart(operation.getInitial(), operation.getResult(), part);
+        if (!projected || *projected >= initial.parts.size())
+          return fail(operation,
+                      "register tuple initializer mapping is not projectable");
+        expression = initial.parts[*projected];
+      } else if (initial.kind == Binding::Kind::Slice) {
+        auto coordinates = registerCoordinates(operation.getResult(), part);
+        if (!coordinates || coordinates->size() != axes.size())
+          return fail(operation,
+                      "register tuple initializer has no coordinate projection");
+        llvm::SmallVector<std::pair<int64_t, std::string>> offsets;
+        std::string active = "1";
+        for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+          offsets.push_back({axis, std::to_string(coordinate)});
+          auto scope = axisScopes.find(axis);
+          if (scope != axisScopes.end() && !scope->second.empty())
+            active += " && " + std::to_string(coordinate) + " < " +
+                      scope->second.back().active;
+        }
+        auto address = denseAddress(initial.slice, offsets);
+        if (!address)
+          return fail(operation,
+                      "register tuple initializer has no dense address relation");
+        expression = "((" + active + ") ? *(const " + *type + " *)(" +
+                     *address + ") : (" + *type + ")0)";
+      } else {
+        return fail(operation,
+                    "register tuple new requires scalar, tuple, or dense initializer");
+      }
+      std::string name = fresh("state");
+      line(*type + " " + name + " = " + expression + ";");
+      result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
   if (kind != "scalar")
@@ -1966,13 +2358,16 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
     return fail(operation, "cast target has no intrinsic-C type");
   auto rounding = operation->getAttrOfType<mlir::StringAttr>("rounding");
   auto saturate = operation->getAttrOfType<mlir::BoolAttr>("saturate");
-  if (input->kind == Binding::Kind::Scalar) {
-    std::string expression = input->scalar;
+  auto scalarExpression = [&](llvm::StringRef inputExpression)
+      -> mlir::FailureOr<std::string> {
+    std::string expression = inputExpression.str();
     if (rounding) {
       auto integer = mlir::dyn_cast<mlir::IntegerType>(target);
       if (!integer)
-        return fail(operation, "rounded scalar narrowing requires an integer target");
+        return mlir::failure();
       const unsigned width = integer.getWidth();
+      if (width == 0 || width >= 64)
+        return mlir::failure();
       const bool isUnsigned = integer.isUnsigned();
       const double minimum = isUnsigned ? 0.0 : -static_cast<double>(uint64_t{1} << (width - 1));
       const double maximum = isUnsigned
@@ -1987,12 +2382,76 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
                                                                         : "ceil";
       expression = roundFunction.str() + "(" + expression + ")";
     }
-    bindings[operation.getResult()] =
-        scalar("((" + *targetCType + ")(" + expression + "))");
+    return "((" + *targetCType + ")(" + expression + "))";
+  };
+  if (input->kind == Binding::Kind::Scalar) {
+    mlir::FailureOr<std::string> expression = scalarExpression(input->scalar);
+    if (mlir::failed(expression))
+      return fail(operation,
+                  "rounded scalar narrowing requires an integer target");
+    bindings[operation.getResult()] = scalar(std::move(*expression));
+    return mlir::success();
+  }
+  if (input->kind == Binding::Kind::ScalarTuple) {
+    Binding result;
+    result.kind = Binding::Kind::ScalarTuple;
+    const int64_t parts = registerPartCount(operation.getResult());
+    for (int64_t part = 0; part < parts; ++part) {
+      auto sourcePart =
+          projectPart(operation.getInput(), operation.getResult(), part);
+      if (!sourcePart || *sourcePart >= input->parts.size())
+        return fail(operation,
+                    "scalar-tuple cast requires an explicit physical layout conversion");
+      mlir::FailureOr<std::string> expression =
+          scalarExpression(input->parts[*sourcePart]);
+      if (mlir::failed(expression))
+        return fail(operation,
+                    "rounded scalar-tuple narrowing requires an integer target");
+      result.parts.push_back(std::move(*expression));
+    }
+    if (registerPartCount(operation.getResult()) == 1 && result.parts.size() == 1)
+      bindings[operation.getResult()] = scalar(result.parts.front());
+    else
+      bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
   if (input->kind != Binding::Kind::Vector)
     return fail(operation, "cast has no selected numeric handoff");
+  mlir::DictionaryAttr local =
+      assigned(operation.getOperation()).getAs<mlir::DictionaryAttr>(
+          "local_operation");
+  llvm::StringRef conversion =
+      riscv_internal::string(local, "conversion").value_or("");
+  if (!rounding && conversion == "identity") {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        operation.getInput(), operation.getResult(), *input);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "identity cast requires an explicit physical layout conversion");
+    bindings[operation.getResult()] = std::move(*projected);
+    return mlir::success();
+  }
+  if (!rounding && conversion == "integer-reinterpret") {
+    const std::string sourceSuffix = vectorSuffix(operation.getInput());
+    const std::string targetSuffix = vectorSuffix(operation.getResult());
+    const std::string targetType = vectorType(operation.getResult());
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+      auto sourcePart =
+          projectPart(operation.getInput(), operation.getResult(), part);
+      if (!sourcePart || *sourcePart >= input->parts.size())
+        return fail(operation,
+                    "integer reinterpret requires an explicit physical layout conversion");
+      std::string value = fresh("reinterpret");
+      line(targetType + " " + value + " = __riscv_vreinterpret_v_" +
+           sourceSuffix + "_" + targetSuffix + "(" +
+           input->parts[*sourcePart] + ");");
+      result.parts.push_back(std::move(value));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (!rounding && ((source.isF32() && target.isF16()) ||
                     (source.isF16() && target.isF32()))) {
     int64_t sourceLMUL = assigned(operation.getInput())
@@ -2009,13 +2468,18 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
     const std::string targetType = vectorType(operation.getResult());
     Binding result;
     result.kind = Binding::Kind::Vector;
-    for (auto [index, part] : llvm::enumerate(input->parts)) {
-      const std::string vl = partVL(operation.getResult(), index);
+    for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+      auto sourcePart =
+          projectPart(operation.getInput(), operation.getResult(), part);
+      if (!sourcePart || *sourcePart >= input->parts.size())
+        return fail(operation,
+                    "float cast requires an explicit physical layout conversion");
+      const std::string vl = partVL(operation.getResult(), part);
       std::string value = fresh(source.isF32() ? "narrow_f16" : "widen_f32");
       std::string intrinsic = source.isF32() ? "__riscv_vfncvt_f_f_w_"
                                              : "__riscv_vfwcvt_f_f_v_";
       line(targetType + " " + value + " = " + intrinsic + targetSuffix +
-           "(" + part + ", " + vl + ");");
+           "(" + input->parts[*sourcePart] + ", " + vl + ");");
       result.parts.push_back(std::move(value));
     }
     bindings[operation.getResult()] = std::move(result);
@@ -2052,12 +2516,18 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
                                                        : "__RISCV_FRM_RUP";
   Binding result;
   result.kind = Binding::Kind::Vector;
-  for (auto [index, part] : llvm::enumerate(input->parts)) {
-    const std::string vl = partVL(operation.getResult(), index);
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto sourcePart =
+        projectPart(operation.getInput(), operation.getResult(), part);
+    if (!sourcePart || *sourcePart >= input->parts.size())
+      return fail(operation,
+                  "rounded narrowing requires an explicit physical layout conversion");
+    const std::string vl = partVL(operation.getResult(), part);
     std::string i32Value = fresh("rounded_i32");
     line(i32Type + " " + i32Value + " = __riscv_vfcvt_" +
          std::string(targetInteger.isUnsigned() ? "xu" : "x") + "_f_v_" +
-         i32Suffix + "_rm(" + part + ", " + frm.str() + ", " + vl +
+         i32Suffix + "_rm(" + input->parts[*sourcePart] + ", " + frm.str() +
+         ", " + vl +
          ");");
     std::string i16Value = fresh("narrow_i16");
     line(i16Type + " " + i16Value + " = __riscv_" +
@@ -2119,27 +2589,41 @@ mlir::LogicalResult Emitter::compileWiden(kernel::WidenOp operation) {
   mlir::Type target = riscv_internal::logicalElement(operation.getResult().getType());
   const std::string targetType = vectorType(operation.getResult());
   const std::string targetSuffix = vectorSuffix(operation.getResult());
-  for (auto [index, part] : llvm::enumerate(input.parts)) {
-    const std::string vl = partVL(operation.getResult(), index);
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto sourcePart =
+        projectPart(operation.getInput(), operation.getResult(), part);
+    if (!sourcePart || *sourcePart >= input.parts.size())
+      return fail(operation,
+                  "widen requires an explicit physical layout conversion");
+    const std::string &sourceExpression = input.parts[*sourcePart];
+    const std::string vl = partVL(operation.getResult(), part);
     std::string expression;
     if (source.isF16() && target.isF32())
-      expression = "__riscv_vfwcvt_f_f_v_" + targetSuffix + "(" + part +
-                   ", " + vl + ")";
+      expression = "__riscv_vfwcvt_f_f_v_" + targetSuffix + "(" +
+                   sourceExpression + ", " + vl + ")";
     else if (source.isInteger(32) && target.isF32())
-      expression = "__riscv_vfcvt_f_x_v_" + targetSuffix + "(" + part +
-                   ", " + vl + ")";
+      expression = "__riscv_vfcvt_f_x_v_" + targetSuffix + "(" +
+                   sourceExpression + ", " + vl + ")";
     else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(source)) {
-      unsigned factor = mlir::cast<mlir::IntegerType>(target).getWidth() /
-                        std::max(8u, integer.getWidth());
+      auto targetInteger = mlir::dyn_cast<mlir::IntegerType>(target);
+      unsigned sourceWidth = std::max(8u, integer.getWidth());
+      unsigned targetWidth = targetInteger ? targetInteger.getWidth() : 0;
+      if (!targetInteger || targetWidth <= sourceWidth ||
+          targetWidth % sourceWidth)
+        return fail(operation, "unsupported integer widening width relation");
+      unsigned factor = targetWidth / sourceWidth;
+      if (factor != 2 && factor != 4 && factor != 8)
+        return fail(operation, "unsupported RVV integer widening factor");
       std::string unsignedSuffix = targetSuffix;
       unsignedSuffix[0] = 'u';
       if (integer.isSigned()) {
         expression = "__riscv_vsext_vf" + std::to_string(factor) + "_" +
-                     targetSuffix + "(" + part + ", " + vl + ")";
+                     targetSuffix + "(" + sourceExpression + ", " + vl +
+                     ")";
       } else {
         std::string widened =
             "__riscv_vzext_vf" + std::to_string(factor) + "_" + unsignedSuffix +
-            "(" + part + ", " + vl + ")";
+            "(" + sourceExpression + ", " + vl + ")";
         expression = targetSuffix[0] == 'i'
                          ? "__riscv_vreinterpret_v_" + unsignedSuffix + "_" +
                                targetSuffix + "(" + widened + ")"
@@ -2273,22 +2757,46 @@ mlir::LogicalResult Emitter::compileReduce(kernel::ReduceOp operation) {
     const std::string targetType =
         std::string(targetInteger.isUnsigned() ? "vuint" : "vint") +
         std::to_string(targetInteger.getWidth()) + "m1_t";
-    std::string accumulator = fresh("widen_reduce_scalar");
-    line(*scalarType + " " + accumulator + " = 0;");
-    for (auto [index, part] : llvm::enumerate(materialized->parts)) {
-      std::string seed = fresh("widen_reduce_seed");
-      line(targetType + " " + seed + " = __riscv_vmv_v_x_" + targetSuffix +
-           "(" + accumulator + ", 1);");
-      std::string reduced = fresh("widen_reduce_vector");
-      line(targetType + " " + reduced + " = __riscv_" +
-           std::string(targetInteger.isUnsigned() ? "vwredsumu" : "vwredsum") +
-           "_vs_" + sourceSuffix + "_" + targetSuffix + "(" + part + ", " +
-           seed + ", " + partVL(input.input, index) + ");");
-      line(accumulator + " = __riscv_vmv_x_s_" + targetSuffix + "_" +
-           std::string(targetInteger.isUnsigned() ? "u" : "i") +
-           std::to_string(targetInteger.getWidth()) + "(" + reduced + ");");
+    const int64_t resultParts = registerPartCount(operation.getResult());
+    const int64_t streams = streamPartCount(input.input);
+    if (resultParts <= 0 || streams <= 0)
+      return fail(operation,
+                  "widening reduction input/result mappings do not form a slice");
+    Binding result;
+    result.kind = resultParts == 1 ? Binding::Kind::Scalar
+                                   : Binding::Kind::ScalarTuple;
+    for (int64_t resultPart = 0; resultPart < resultParts; ++resultPart) {
+      auto sourceRegister =
+          projectRegisterPart(input.input, operation.getResult(), resultPart);
+      if (!sourceRegister)
+        return fail(operation,
+                    "widening reduction free-axis mapping is not projectable");
+      std::string accumulator = fresh("widen_reduce_scalar");
+      line(*scalarType + " " + accumulator + " = 0;");
+      for (int64_t stream = 0; stream < streams; ++stream) {
+        const size_t index = *sourceRegister * streams + stream;
+        if (index >= materialized->parts.size())
+          return fail(operation,
+                      "widening reduction source mapping is incomplete");
+        std::string seed = fresh("widen_reduce_seed");
+        line(targetType + " " + seed + " = __riscv_vmv_v_x_" + targetSuffix +
+             "(" + accumulator + ", 1);");
+        std::string reduced = fresh("widen_reduce_vector");
+        line(targetType + " " + reduced + " = __riscv_" +
+             std::string(targetInteger.isUnsigned() ? "vwredsumu" : "vwredsum") +
+             "_vs_" + sourceSuffix + "_" + targetSuffix + "(" +
+             materialized->parts[index] + ", " + seed + ", " +
+             partVL(input.input, index) + ");");
+        line(accumulator + " = __riscv_vmv_x_s_" + targetSuffix + "_" +
+             std::string(targetInteger.isUnsigned() ? "u" : "i") +
+             std::to_string(targetInteger.getWidth()) + "(" + reduced + ");");
+      }
+      if (resultParts == 1)
+        result.scalar = accumulator;
+      else
+        result.parts.push_back(std::move(accumulator));
     }
-    bindings[operation.getResult()] = scalar(accumulator);
+    bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
   mlir::FailureOr<Binding> materialized =
@@ -2324,32 +2832,57 @@ mlir::LogicalResult Emitter::compileReduce(kernel::ReduceOp operation) {
   else
     return fail(operation,
                 "current wide reduce implements add and floating max/min");
-  std::string accumulator = fresh("reduce_scalar");
-  line(*scalarType + " " + accumulator + " = (" + *scalarType + ")(" + initial +
-       ");");
-  for (auto [index, part] : llvm::enumerate(materialized->parts)) {
-    const std::string seed = fresh("reduce_seed");
-    line(baseType + " " + seed + " = __riscv_" +
-         std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") + baseSuffix + "(" +
-         accumulator + ", 1);");
-    std::string stem;
-    if (floating)
-      stem = kind == "add" ? "vfredusum" : kind == "max" ? "vfredmax" : "vfredmin";
+  const int64_t resultParts = registerPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getInput());
+  if (resultParts <= 0 || streams <= 0)
+    return fail(operation,
+                "reduce input/result mappings do not form an eliminated-axis slice");
+  Binding result;
+  result.kind = resultParts == 1 ? Binding::Kind::Scalar
+                                 : Binding::Kind::ScalarTuple;
+  for (int64_t resultPart = 0; resultPart < resultParts; ++resultPart) {
+    auto sourceRegister = projectRegisterPart(
+        operation.getInput(), operation.getResult(), resultPart);
+    if (!sourceRegister)
+      return fail(operation,
+                  "reduce free-axis mapping is not projectable");
+    std::string accumulator = fresh("reduce_scalar");
+    line(*scalarType + " " + accumulator + " = (" + *scalarType + ")(" +
+         initial + ");");
+    for (int64_t stream = 0; stream < streams; ++stream) {
+      const size_t index = *sourceRegister * streams + stream;
+      if (index >= materialized->parts.size())
+        return fail(operation, "reduce source mapping is incomplete");
+      const std::string seed = fresh("reduce_seed");
+      line(baseType + " " + seed + " = __riscv_" +
+           std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") + baseSuffix +
+           "(" + accumulator + ", 1);");
+      std::string stem;
+      if (floating)
+        stem = kind == "add"   ? "vfredusum"
+               : kind == "max" ? "vfredmax"
+                                 : "vfredmin";
+      else
+        stem = "vredsum";
+      const std::string reduced = fresh("reduce_vector");
+      line(baseType + " " + reduced + " = __riscv_" + stem + "_vs_" +
+           sourceSuffix + "_" + baseSuffix + "(" +
+           materialized->parts[index] + ", " + seed + ", " +
+           partVL(operation.getInput(), index) + ");");
+      if (floating)
+        line(accumulator + " = __riscv_vfmv_f_s_" + baseSuffix + "_f" +
+             std::to_string(sew) + "(" + reduced + ");");
+      else
+        line(accumulator + " = __riscv_vmv_x_s_" + baseSuffix + "_" +
+             std::string(unsignedInteger ? "u" : "i") +
+             std::to_string(sew) + "(" + reduced + ");");
+    }
+    if (resultParts == 1)
+      result.scalar = accumulator;
     else
-      stem = "vredsum";
-    const std::string reduced = fresh("reduce_vector");
-    line(baseType + " " + reduced + " = __riscv_" + stem + "_vs_" +
-         sourceSuffix + "_" + baseSuffix + "(" + part + ", " + seed +
-         ", " + partVL(operation.getInput(), index) + ");");
-    if (floating)
-      line(accumulator + " = __riscv_vfmv_f_s_" + baseSuffix + "_f" +
-           std::to_string(sew) + "(" + reduced + ");");
-    else
-      line(accumulator + " = __riscv_vmv_x_s_" + baseSuffix + "_" +
-           std::string(unsignedInteger ? "u" : "i") + std::to_string(sew) +
-           "(" + reduced + ");");
+      result.parts.push_back(std::move(accumulator));
   }
-  bindings[operation.getResult()] = scalar(accumulator);
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 
@@ -2422,9 +2955,6 @@ mlir::LogicalResult Emitter::compileLookup(kernel::LookupOp operation) {
                 "RVV indexed lookup requires vector unsigned indices");
 
   const int64_t parts = vectorPartCount(operation.getResult());
-  if (parts != static_cast<int64_t>(indices.parts.size()))
-    return fail(operation,
-                "lookup index and result physical mappings do not agree");
   mlir::DictionaryAttr indexPhysical = assigned(operation.getIndices());
   auto indexSEW = indexPhysical.getAs<mlir::IntegerAttr>("physical_sew");
   auto indexLMUL = indexPhysical.getAs<mlir::StringAttr>("lmul");
@@ -2442,8 +2972,13 @@ mlir::LogicalResult Emitter::compileLookup(kernel::LookupOp operation) {
   Binding result;
   result.kind = Binding::Kind::Vector;
   for (int64_t part = 0; part < parts; ++part) {
+    auto indexPart =
+        projectPart(operation.getIndices(), operation.getResult(), part);
+    if (!indexPart || *indexPart >= indices.parts.size())
+      return fail(operation,
+                  "lookup index mapping requires an explicit layout conversion");
     const std::string vl = partVL(operation.getResult(), part);
-    std::string byteOffsets = indices.parts[part];
+    std::string byteOffsets = indices.parts[*indexPart];
     if (tableBytes != 1)
       byteOffsets = "__riscv_vmul_vx_" + indexSuffix + "(" + byteOffsets +
                     ", " + std::to_string(tableBytes) + ", " + vl + ")";
@@ -2463,6 +2998,104 @@ mlir::LogicalResult Emitter::compileLookup(kernel::LookupOp operation) {
 }
 
 mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
+  llvm::StringRef realization =
+      riscv_internal::string(assigned(operation.getOperation()), "realization")
+          .value_or("");
+  if (realization == "rvv.outer.accumulate") {
+    Binding lhs = bindings.lookup(operation.getLhs());
+    Binding rhs = bindings.lookup(operation.getRhs());
+    const Binding *contract = lhs.kind == Binding::Kind::DeferredContract
+                                  ? &lhs
+                              : rhs.kind == Binding::Kind::DeferredContract
+                                  ? &rhs
+                                  : nullptr;
+    mlir::Value accumulatorValue = lhs.kind == Binding::Kind::DeferredContract
+                                       ? operation.getRhs()
+                                       : operation.getLhs();
+    if (!contract || !contract->sourceOperation)
+      return fail(operation,
+                  "selected outer accumulation has no deferred contract");
+    mlir::FailureOr<Binding> accumulator = materializeNumeric(
+        accumulatorValue, bindings.lookup(accumulatorValue));
+    if (mlir::failed(accumulator) ||
+        accumulator->kind != Binding::Kind::Vector)
+      return fail(operation,
+                  "selected outer accumulation requires a vector accumulator");
+    return compileContract(*contract->sourceOperation, contract->lhs,
+                           contract->rhs, operation.getResult(), true,
+                           std::move(*accumulator), accumulatorValue);
+  }
+  if (realization == "rvv.fma.product") {
+    Binding product;
+    product.kind = Binding::Kind::DeferredProduct;
+    product.lhs = operation.getLhs();
+    product.rhs = operation.getRhs();
+    product.sourceOperation = operation.getOperation();
+    bindings[operation.getResult()] = std::move(product);
+    return mlir::success();
+  }
+  if (realization == "rvv.fma.accumulate") {
+    Binding lhs = bindings.lookup(operation.getLhs());
+    Binding rhs = bindings.lookup(operation.getRhs());
+    const Binding *product = lhs.kind == Binding::Kind::DeferredProduct ? &lhs
+                              : rhs.kind == Binding::Kind::DeferredProduct
+                                  ? &rhs
+                                  : nullptr;
+    mlir::Value accumulatorValue = lhs.kind == Binding::Kind::DeferredProduct
+                                       ? operation.getRhs()
+                                       : operation.getLhs();
+    if (!product)
+      return fail(operation,
+                  "selected fused accumulation has no deferred product");
+    mlir::FailureOr<Binding> accumulator = materializeNumeric(
+        accumulatorValue, bindings.lookup(accumulatorValue));
+    mlir::FailureOr<Binding> productLhs = materializeNumeric(
+        product->lhs, bindings.lookup(product->lhs));
+    mlir::FailureOr<Binding> productRhs = materializeNumeric(
+        product->rhs, bindings.lookup(product->rhs));
+    if (mlir::failed(accumulator) || mlir::failed(productLhs) ||
+        mlir::failed(productRhs))
+      return mlir::failure();
+    const int64_t resultParts = vectorPartCount(operation.getResult());
+    auto vectorCompatible = [&](mlir::Value value, const Binding &binding) {
+      if (binding.kind != Binding::Kind::Vector)
+        return false;
+      for (int64_t part = 0; part < resultParts; ++part) {
+        auto projected = projectPart(value, operation.getResult(), part);
+        if (!projected || *projected >= binding.parts.size())
+          return false;
+      }
+      return true;
+    };
+    if (resultParts <= 0 ||
+        !vectorCompatible(accumulatorValue, *accumulator) ||
+        !vectorCompatible(product->lhs, *productLhs) ||
+        !vectorCompatible(product->rhs, *productRhs))
+      return fail(operation,
+                  "selected fused accumulation mappings do not agree");
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    const std::string type = vectorType(operation.getResult());
+    const std::string suffix = vectorSuffix(operation.getResult());
+    for (int64_t part = 0; part < resultParts; ++part) {
+      const size_t accPart = *projectPart(accumulatorValue,
+                                          operation.getResult(), part);
+      const size_t lhsPart =
+          *projectPart(product->lhs, operation.getResult(), part);
+      const size_t rhsPart =
+          *projectPart(product->rhs, operation.getResult(), part);
+      const std::string &acc = accumulator->parts[accPart];
+      const std::string &mulLhs = productLhs->parts[lhsPart];
+      const std::string &mulRhs = productRhs->parts[rhsPart];
+      std::string value = fresh("fma");
+      line(type + " " + value + " = __riscv_vfmacc_vv_" + suffix + "(" +
+           acc + ", " + mulLhs + ", " + mulRhs + ", " +
+           partVL(operation.getResult(), part) + ");");
+      result.parts.push_back(std::move(value));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   mlir::FailureOr<Binding> lhsOr =
       materializeNumeric(operation.getLhs(), bindings.lookup(operation.getLhs()));
   mlir::FailureOr<Binding> rhsOr =
@@ -2497,6 +3130,61 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
     }
     return fail(operation, "unsupported selected scalar pointwise binary kind");
   }
+  if ((lhs.kind == Binding::Kind::Scalar ||
+       lhs.kind == Binding::Kind::ScalarTuple) &&
+      (rhs.kind == Binding::Kind::Scalar ||
+       rhs.kind == Binding::Kind::ScalarTuple)) {
+    llvm::StringRef kind = operation.getKind();
+    llvm::StringRef spelling = kind == "add" ? "+"
+                              : kind == "sub" ? "-"
+                              : kind == "mul" ? "*"
+                              : kind == "div" ? "/"
+                              : kind == "mod" ? "%"
+                              : kind == "and" ? "&"
+                              : kind == "or"  ? "|"
+                              : kind == "xor" ? "^"
+                              : kind == "shl" ? "<<"
+                              : kind == "shr" ? ">>"
+                                                : "";
+    if (spelling.empty() && kind != "max" && kind != "min")
+      return fail(operation,
+                  "unsupported selected scalar-tuple pointwise binary kind");
+    const int64_t parts = registerPartCount(operation.getResult());
+    Binding result;
+    result.kind = parts == 1 ? Binding::Kind::Scalar
+                             : Binding::Kind::ScalarTuple;
+    for (int64_t part = 0; part < parts; ++part) {
+      auto expressionFor = [&](mlir::Value value,
+                               const Binding &binding) -> std::optional<std::string> {
+        if (binding.kind == Binding::Kind::Scalar)
+          return binding.scalar;
+        auto projected = projectPart(value, operation.getResult(), part);
+        if (!projected || *projected >= binding.parts.size())
+          return std::nullopt;
+        return binding.parts[*projected];
+      };
+      auto lhsExpression = expressionFor(operation.getLhs(), lhs);
+      auto rhsExpression = expressionFor(operation.getRhs(), rhs);
+      if (!lhsExpression || !rhsExpression)
+        return fail(operation,
+                    "scalar-tuple operand projection is not representable");
+      std::string expression;
+      if (!spelling.empty())
+        expression = "(" + *lhsExpression + " " + spelling.str() + " " +
+                     *rhsExpression + ")";
+      else
+        expression = "((" + *lhsExpression + ") " +
+                     std::string(kind == "max" ? ">" : "<") + " (" +
+                     *rhsExpression + ") ? (" + *lhsExpression + ") : (" +
+                     *rhsExpression + "))";
+      if (parts == 1)
+        result.scalar = std::move(expression);
+      else
+        result.parts.push_back(std::move(expression));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   const Binding &vector = lhs.kind == Binding::Kind::Vector ? lhs : rhs;
   const Binding &other = lhs.kind == Binding::Kind::Vector ? rhs : lhs;
   if (vector.kind != Binding::Kind::Vector ||
@@ -2530,25 +3218,45 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
   if (stem == "unsupported")
     return fail(operation, "unsupported selected pointwise binary kind");
   const int64_t resultParts = vectorPartCount(operation.getResult());
-  auto compatibleParts = [&](const Binding &binding) {
-    return (binding.kind != Binding::Kind::Vector &&
-            binding.kind != Binding::Kind::ScalarTuple) ||
-           binding.parts.size() == 1 ||
-           static_cast<int64_t>(binding.parts.size()) == resultParts;
+  auto compatibleParts = [&](mlir::Value value, const Binding &binding) {
+    if (binding.kind == Binding::Kind::Scalar)
+      return true;
+    if (binding.kind != Binding::Kind::Vector &&
+        binding.kind != Binding::Kind::ScalarTuple)
+      return false;
+    for (int64_t part = 0; part < resultParts; ++part) {
+      auto projected = projectPart(value, operation.getResult(), part);
+      if (!projected || *projected >= binding.parts.size())
+        return false;
+    }
+    return true;
   };
-  if (resultParts <= 0 || !compatibleParts(lhs) || !compatibleParts(rhs))
+  if (resultParts <= 0 || !compatibleParts(operation.getLhs(), lhs) ||
+      !compatibleParts(operation.getRhs(), rhs))
     return fail(operation,
                 "pointwise operand mappings cannot broadcast to the selected result mapping");
   for (int64_t index = 0; index < resultParts; ++index) {
     std::string expression;
     if (other.kind == Binding::Kind::Scalar ||
         other.kind == Binding::Kind::ScalarTuple) {
-      std::string vectorPart =
-          vector.parts[vector.parts.size() == 1 ? 0 : index];
+      mlir::Value vectorValue = lhs.kind == Binding::Kind::Vector
+                                    ? operation.getLhs()
+                                    : operation.getRhs();
+      mlir::Value scalarValue = lhs.kind == Binding::Kind::Vector
+                                    ? operation.getRhs()
+                                    : operation.getLhs();
+      auto vectorPartIndex = projectPart(vectorValue, operation.getResult(), index);
+      auto scalarPartIndex = other.kind == Binding::Kind::Scalar
+                                 ? std::optional<size_t>(0)
+                                 : projectPart(scalarValue, operation.getResult(), index);
+      if (!vectorPartIndex || !scalarPartIndex)
+        return fail(operation,
+                    "pointwise operand projection is not representable");
+      std::string vectorPart = vector.parts[*vectorPartIndex];
       const std::string scalarPart =
           other.kind == Binding::Kind::Scalar
               ? other.scalar
-              : other.parts[other.parts.size() == 1 ? 0 : index];
+              : other.parts[*scalarPartIndex];
       bool scalarOnLeft = lhs.kind == Binding::Kind::Scalar ||
                           lhs.kind == Binding::Kind::ScalarTuple;
       bool commutative = kind == "add" || kind == "mul" || kind == "and" ||
@@ -2568,8 +3276,15 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
                      partVL(operation.getResult(), index) + ")";
       }
     } else {
-      const std::string &lhsPart = lhs.parts[lhs.parts.size() == 1 ? 0 : index];
-      const std::string &rhsPart = rhs.parts[rhs.parts.size() == 1 ? 0 : index];
+      auto lhsPartIndex =
+          projectPart(operation.getLhs(), operation.getResult(), index);
+      auto rhsPartIndex =
+          projectPart(operation.getRhs(), operation.getResult(), index);
+      if (!lhsPartIndex || !rhsPartIndex)
+        return fail(operation,
+                    "pointwise vector operand projection is not representable");
+      const std::string &lhsPart = lhs.parts[*lhsPartIndex];
+      const std::string &rhsPart = rhs.parts[*rhsPartIndex];
       expression = "__riscv_" + stem + "_vv_" + suffix + "(" + lhsPart +
                    ", " + rhsPart + ", " +
                    partVL(operation.getResult(), index) + ")";
@@ -2876,6 +3591,10 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     line(u16Type + " " + word + " = __riscv_vor_vv_" + u16Suffix + "(" +
          low16 + ", " + high16 + ", " + laneVL() + ");");
     const std::string resultSuffix = vectorSuffix(result);
+    if (resultSuffix == u16Suffix) {
+      resultBinding.parts.push_back(std::move(word));
+      return resultBinding;
+    }
     std::string converted = fresh("field");
     line(vectorType(result) + " " + converted + " = __riscv_vreinterpret_v_" +
          u16Suffix + "_" + resultSuffix + "(" + word + ");");
@@ -3451,6 +4170,13 @@ mlir::FailureOr<Binding> Emitter::emitEncodedOuterMac(
     return operation.emitError(
                "selected encoded outer MAC accumulator part count disagrees with its value representation"),
            mlir::failure();
+  llvm::SmallVector<int64_t, 4> accumulatorAxes =
+      registerAxesFor(resultValue);
+  if (accumulatorAxes.size() != 1 ||
+      accumulatorAxes.front() != accumulatorAxis)
+    return operation.emitError(
+               "selected encoded outer MAC requires one explicit accumulator axis"),
+           mlir::failure();
 
   std::string repeatedStride;
   for (const auto &[axis, stride] : repeatedOwner.recordByteStrides)
@@ -3803,6 +4529,13 @@ mlir::FailureOr<Binding> Emitter::emitEncodedOuterFold(
     return operation.emitError(
                "selected encoded outer fold product accumulator part count disagrees with its value representation"),
            mlir::failure();
+  llvm::SmallVector<int64_t, 4> accumulatorAxes =
+      registerAxesFor(resultValue);
+  if (accumulatorAxes.size() != 1 ||
+      accumulatorAxes.front() != accumulatorAxis)
+    return operation.emitError(
+               "selected encoded outer fold product requires one explicit accumulator axis"),
+           mlir::failure();
   std::string foldStride;
   for (const auto &[axis, stride] : foldOwner.recordByteStrides)
     if (axis == accumulatorAxis)
@@ -3891,8 +4624,8 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
   mlir::DictionaryAttr local =
       assigned(materialize.getOperation()).getAs<mlir::DictionaryAttr>(
           "local_operation");
-  int64_t laneAxis =
-      riscv_internal::integer(local, "lane_axis").value_or(0);
+  int64_t packAxis =
+      riscv_internal::integer(local, "pack_axis").value_or(0);
   llvm::StringRef packing =
       riscv_internal::string(local, "packing").value_or("");
   int64_t interleaveRows =
@@ -3903,20 +4636,22 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
       riscv_internal::integer(local, "logical_elements").value_or(0);
   int64_t sourceRank =
       riscv_internal::integer(local, "source_rank").value_or(0);
+  int64_t otherAxis =
+      riscv_internal::integer(local, "other_axis").value_or(0);
   int64_t rowAxis = riscv_internal::integer(local, "row_axis").value_or(0);
   int64_t recordAxis =
       riscv_internal::integer(local, "record_axis").value_or(0);
   llvm::StringRef sourceEncodingFamily =
       riscv_internal::string(local, "source_encoding_family").value_or("");
-  if (laneAxis <= 0 || sourceRank != 2 || rowAxis != laneAxis ||
-      recordAxis <= 0 || recordAxis == rowAxis)
+  if (packAxis <= 0 || otherAxis <= 0 || otherAxis == packAxis ||
+      sourceRank != 2)
     return fail(materialize,
                 "selected local pack has incomplete operation-owned axes");
   llvm::SmallVector<int64_t> axes(resultType.getAxisIds().asArrayRef().begin(),
                                   resultType.getAxisIds().asArrayRef().end());
   if (axes.size() != static_cast<size_t>(sourceRank) ||
-      !llvm::is_contained(axes, rowAxis) ||
-      !llvm::is_contained(axes, recordAxis))
+      !llvm::is_contained(axes, packAxis) ||
+      !llvm::is_contained(axes, otherAxis))
     return fail(materialize,
                 "local pack result disagrees with its selected source axes");
   llvm::SmallVector<PointInfo> scopes;
@@ -3926,8 +4661,8 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
       return fail(materialize, "pack axis has no enclosing level ownership");
     scopes.push_back(found->second.back());
   }
-  const size_t rowPosition = llvm::find(axes, rowAxis) - axes.begin();
-  const size_t recordPosition = llvm::find(axes, recordAxis) - axes.begin();
+  const size_t rowPosition = llvm::find(axes, packAxis) - axes.begin();
+  const size_t recordPosition = llvm::find(axes, otherAxis) - axes.begin();
   const PointInfo &rowScope = scopes[rowPosition];
   const PointInfo &recordScope = scopes[recordPosition];
   const int64_t rowExtent = rowScope.physicalExtent;
@@ -3938,6 +4673,7 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
     if (sourceMemory.memory.elementType || sourceEncodingFamily.empty() ||
         interleaveRows <= 1 || recordStorageBits <= 0 ||
         recordStorageBits % 8 || logicalElements <= 0 ||
+        rowAxis != packAxis || recordAxis <= 0 || recordAxis == rowAxis ||
         rowExtent % interleaveRows || recordExtent % logicalElements)
       return fail(materialize,
                   "selected encoded local pack has incompatible record facts");
@@ -4013,7 +4749,7 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
                 "selected local pack has no dense or encoded implementation");
   std::string buffer = fresh("packed");
   line("_Alignas(64) float " + buffer + "[" +
-       std::to_string(rowExtent * recordExtent) +
+       std::to_string(extent0 * extent1) +
        "];" );
   std::string i = fresh("pack_i");
   std::string j = fresh("pack_j");
@@ -4027,8 +4763,8 @@ Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
       denseAddress(sourceBinding.slice, {{axes[0], i}, {axes[1], j}});
   if (!source)
     return fail(materialize, "local pack source has no address relation");
-  const bool laneFirst = rowPosition == 0;
-  const bool laneSecond = axes[1] == laneAxis;
+  const bool laneFirst = axes[0] == packAxis;
+  const bool laneSecond = axes[1] == packAxis;
   std::string destination;
   if (laneFirst)
     destination = j + " * " + std::to_string(extent0) + " + " + i;
@@ -4063,12 +4799,23 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
                                               mlir::Value lhsValue,
                                               mlir::Value rhsValue,
                                               mlir::Value resultValue,
-                                              bool outer) {
+                                              bool outer,
+                                              std::optional<Binding> initial,
+                                              mlir::Value initialValue) {
   Binding lhs = bindings.lookup(lhsValue);
   Binding rhs = bindings.lookup(rhsValue);
   mlir::DictionaryAttr selected = assigned(&operation);
   llvm::StringRef realization =
       riscv_internal::string(selected, "realization").value_or("");
+  if (realization == "rvv.outer.deferred-reduction-product" && !initial) {
+    Binding deferred;
+    deferred.kind = Binding::Kind::DeferredContract;
+    deferred.lhs = lhsValue;
+    deferred.rhs = rhsValue;
+    deferred.sourceOperation = &operation;
+    bindings[resultValue] = std::move(deferred);
+    return mlir::success();
+  }
   if (realization == "rvv.outer.encoded-widening-mac") {
     mlir::FailureOr<Binding> result =
         emitEncodedOuterMac(operation, lhsValue, rhsValue, resultValue, lhs, rhs);
@@ -4161,7 +4908,14 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
                 "intrinsic-C emitter has no leaf for the selected contraction realization");
   if (lhs.kind != Binding::Kind::Slice || rhs.kind != Binding::Kind::Slice)
     return fail(&operation, "dense contraction requires admitted memory slices");
-  auto resultType = mlir::cast<kernel::ValueType>(resultValue.getType());
+  auto local = selected.getAs<mlir::DictionaryAttr>("local_operation");
+  llvm::StringRef laneOperand =
+      riscv_internal::string(local, "lane_operand").value_or("");
+  if (outer && laneOperand != "lhs" && laneOperand != "rhs")
+    return fail(&operation,
+                "selected dense outer contraction has no lane operand");
+  const Binding &laneSlice = laneOperand == "rhs" ? rhs : lhs;
+  const Binding &repeatedSlice = laneOperand == "rhs" ? lhs : rhs;
   const int64_t laneAxis = laneAxisFor(resultValue);
   int64_t reductionAxis = -1;
   llvm::ArrayRef<int64_t> over;
@@ -4179,63 +4933,97 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
   const PointInfo &reduction = reductionScope->second.back();
   if (!riscv_internal::logicalElement(resultValue.getType()).isF32())
     return fail(&operation, "current dense contraction emission supports only f32 results");
-  mlir::FailureOr<Binding> resultOr =
-      makeVector(resultValue, "contract", scalar("0"));
+  mlir::FailureOr<Binding> resultOr = makeVector(
+      resultValue, "contract", initial ? *initial : scalar("0"), initialValue);
   if (mlir::failed(resultOr))
     return mlir::failure();
   Binding result = std::move(*resultOr);
-  int64_t outputAxis = -1;
-  for (int64_t axis : resultType.getAxisIds().asArrayRef())
-    if (axis != laneAxis)
-      outputAxis = axis;
+  llvm::SmallVector<int64_t, 4> registerAxes = registerAxesFor(resultValue);
+  const int64_t streams = streamPartCount(resultValue);
+  llvm::StringRef laneMemoryForm =
+      riscv_internal::string(local, "lane_memory_form").value_or("");
+  if (laneMemoryForm != "unit-stride" &&
+      laneMemoryForm != "runtime-strided")
+    return fail(&operation,
+                "dense contraction has no pass-selected lane memory form");
   std::string k = fresh("reduce_k");
   line("for (size_t " + k + " = 0; " + k + " < " + reduction.active + "; ++" +
        k + ") {");
   ++indent;
-  const Binding &lhsMemory = bindings.lookup(lhs.slice.base);
-  const Binding &rhsMemory = bindings.lookup(rhs.slice.base);
-  if (lhsMemory.kind != Binding::Kind::Memory ||
-      rhsMemory.kind != Binding::Kind::Memory ||
-      !lhsMemory.memory.elementType || !rhsMemory.memory.elementType ||
-      !lhsMemory.memory.elementType.isF32() ||
-      !rhsMemory.memory.elementType.isF32())
+  const Binding &laneMemory = bindings.lookup(laneSlice.slice.base);
+  const Binding &repeatedMemory = bindings.lookup(repeatedSlice.slice.base);
+  if (laneMemory.kind != Binding::Kind::Memory ||
+      repeatedMemory.kind != Binding::Kind::Memory ||
+      !laneMemory.memory.elementType || !repeatedMemory.memory.elementType ||
+      !laneMemory.memory.elementType.isF32() ||
+      !repeatedMemory.memory.elementType.isF32())
     return fail(&operation,
                 "current dense contraction emission requires f32 memory operands");
-  size_t lhsLaneDimension =
-      llvm::find(lhsMemory.memory.axes, laneAxis) - lhsMemory.memory.axes.begin();
-  if (lhsLaneDimension >= lhsMemory.memory.axes.size())
-    return fail(&operation, "contraction lhs has no selected lane axis");
-  llvm::SmallVector<std::pair<int64_t, std::string>> lhsOffsets{{reductionAxis, k}};
-  auto lhsAddress = denseAddress(lhs.slice, lhsOffsets);
-  if (!lhsAddress)
-    return fail(&operation, "contraction lhs has no address relation");
+  size_t laneDimension = llvm::find(laneMemory.memory.axes, laneAxis) -
+                         laneMemory.memory.axes.begin();
+  if (laneDimension >= laneMemory.memory.axes.size())
+    return fail(&operation,
+                "contraction lane operand has no selected lane axis");
   const std::string suffix = vectorSuffix(resultValue);
-  std::string loaded = fresh("operand");
-  if (lhsMemory.memory.strides[lhsLaneDimension] == "1")
-    line(vectorType(resultValue) + " " + loaded + " = __riscv_vle32_v_" +
-         suffix + "(" + *lhsAddress + ", " + laneVL() + ");");
-  else
-    line(vectorType(resultValue) + " " + loaded + " = __riscv_vlse32_v_" +
-         suffix + "(" + *lhsAddress + ", " +
-         lhsMemory.memory.strides[lhsLaneDimension] +
-         " * (ptrdiff_t)sizeof(float), " + laneVL() + ");");
-  std::string outputActive;
-  if (outputAxis >= 0)
-    outputActive = axisScopes.lookup(outputAxis).back().active;
+  llvm::StringMap<std::string> loadedLaneValues;
   for (size_t part = 0; part < result.parts.size(); ++part) {
-    llvm::SmallVector<std::pair<int64_t, std::string>> rhsOffsets{{reductionAxis, k}};
-    if (outer && outputAxis >= 0)
-      rhsOffsets.push_back({outputAxis, std::to_string(part)});
-    auto rhsAddress = denseAddress(rhs.slice, rhsOffsets);
-    if (!rhsAddress)
-      return fail(&operation, "contraction rhs has no address relation");
+    auto coordinates = registerCoordinates(resultValue, part / streams);
+    if (!coordinates || coordinates->size() != registerAxes.size())
+      return fail(&operation,
+                  "dense contraction result has no register-coordinate mapping");
+    llvm::SmallVector<std::pair<int64_t, std::string>> laneOffsets{
+        {reductionAxis, k}};
+    llvm::SmallVector<std::pair<int64_t, std::string>> repeatedOffsets{
+        {reductionAxis, k}};
+    std::string active = "1";
+    std::string laneKey = std::to_string(part % streams);
+    if (streams > 1)
+      laneOffsets.push_back({laneAxis, partOffset(resultValue, part)});
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      auto scope = axisScopes.find(axis);
+      if (scope != axisScopes.end() && !scope->second.empty())
+        active += " && " + std::to_string(coordinate) + " < " +
+                  scope->second.back().active;
+      if (llvm::is_contained(laneMemory.memory.axes, axis)) {
+        laneOffsets.push_back({axis, std::to_string(coordinate)});
+        laneKey += ":" + std::to_string(axis) + "=" +
+                   std::to_string(coordinate);
+      }
+      if (llvm::is_contained(repeatedMemory.memory.axes, axis))
+        repeatedOffsets.push_back({axis, std::to_string(coordinate)});
+    }
+    std::string loaded;
+    auto existingLoad = loadedLaneValues.find(laneKey);
+    if (existingLoad != loadedLaneValues.end()) {
+      loaded = existingLoad->second;
+    } else {
+      auto laneAddress = denseAddress(laneSlice.slice, laneOffsets);
+      if (!laneAddress)
+        return fail(&operation,
+                    "contraction lane operand has no address relation");
+      loaded = fresh("operand");
+      if (laneMemoryForm == "unit-stride")
+        line(vectorType(resultValue) + " " + loaded + " = __riscv_vle32_v_" +
+             suffix + "(" + *laneAddress + ", " +
+             partVL(resultValue, part) + ");");
+      else
+        line(vectorType(resultValue) + " " + loaded + " = __riscv_vlse32_v_" +
+             suffix + "(" + *laneAddress + ", " +
+             laneMemory.memory.strides[laneDimension] +
+             " * (ptrdiff_t)sizeof(float), " + partVL(resultValue, part) +
+             ");");
+      loadedLaneValues[laneKey] = loaded;
+    }
+    auto repeatedAddress = denseAddress(repeatedSlice.slice, repeatedOffsets);
+    if (!repeatedAddress)
+      return fail(&operation,
+                  "contraction repeated operand has no address relation");
     std::string statement = result.parts[part] + " = __riscv_vfmacc_vf_" +
                             suffix + "(" + result.parts[part] + ", *(" +
-                            *rhsAddress + "), " + loaded + ", " + laneVL() +
-                            ");";
-    if (!outputActive.empty())
-      line("if (" + std::to_string(part) + " < " + outputActive + ") " +
-           statement);
+                            *repeatedAddress + "), " + loaded + ", " +
+                            partVL(resultValue, part) + ");";
+    if (!registerAxes.empty())
+      line("if (" + active + ") " + statement);
     else
       line(statement);
   }
@@ -4339,6 +5127,37 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
     line("*(" + *type + " *)(" + *address + ") = " + value.scalar + ";");
     return mlir::success();
   }
+  if (value.kind == Binding::Kind::ScalarTuple) {
+    auto type = scalarCType(element);
+    llvm::SmallVector<int64_t, 4> axes =
+        registerAxesFor(operation.getValue());
+    if (!type || value.parts.size() !=
+                     static_cast<size_t>(registerPartCount(operation.getValue())))
+      return fail(operation,
+                  "dense scalar tuple commit has no complete physical mapping");
+    for (size_t part = 0; part < value.parts.size(); ++part) {
+      auto coordinates = registerCoordinates(operation.getValue(), part);
+      if (!coordinates || coordinates->size() != axes.size())
+        return fail(operation,
+                    "dense scalar tuple commit has no coordinate projection");
+      llvm::SmallVector<std::pair<int64_t, std::string>> offsets;
+      std::string active = "1";
+      for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+        offsets.push_back({axis, std::to_string(coordinate)});
+        auto scope = axisScopes.find(axis);
+        if (scope != axisScopes.end() && !scope->second.empty())
+          active += " && " + std::to_string(coordinate) + " < " +
+                    scope->second.back().active;
+      }
+      auto address = denseAddress(region.slice, offsets);
+      if (!address)
+        return fail(operation,
+                    "dense scalar tuple commit has no address relation");
+      line("if (" + active + ") *(" + *type + " *)(" + *address + ") = " +
+           value.parts[part] + ";");
+    }
+    return mlir::success();
+  }
   if (value.kind != Binding::Kind::Vector)
     return fail(operation, "dense commit has no selected numeric handoff");
   size_t laneDimension =
@@ -4346,12 +5165,9 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
       memory.memory.axes.begin();
   if (laneDimension >= memory.memory.axes.size())
     return fail(operation, "commit destination has no selected lane axis");
-  int64_t nonLaneAxis = -1;
   const int64_t laneAxis = laneAxisFor(operation.getValue());
-  auto valueType = mlir::cast<kernel::ValueType>(operation.getValue().getType());
-  for (int64_t axis : valueType.getAxisIds().asArrayRef())
-    if (axis != laneAxis)
-      nonLaneAxis = axis;
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getValue());
   const int64_t streams = streamPartCount(operation.getValue());
   llvm::StringRef memoryForm =
       selectedEdge ? riscv_internal::string(selectedEdge, "form").value_or("")
@@ -4360,10 +5176,20 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
     return fail(operation,
                 "dense commit has no pass-selected unit or runtime-strided form");
   for (size_t part = 0; part < value.parts.size(); ++part) {
-    const int64_t nonLanePart = static_cast<int64_t>(part) / streams;
+    auto coordinates =
+        registerCoordinates(operation.getValue(), part / streams);
+    if (!coordinates || coordinates->size() != registerAxes.size())
+      return fail(operation,
+                  "dense vector commit has no register-coordinate mapping");
     llvm::SmallVector<std::pair<int64_t, std::string>> offsets;
-    if (nonLaneAxis >= 0)
-      offsets.push_back({nonLaneAxis, std::to_string(nonLanePart)});
+    std::string active = "1";
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      offsets.push_back({axis, std::to_string(coordinate)});
+      auto scope = axisScopes.find(axis);
+      if (scope != axisScopes.end() && !scope->second.empty())
+        active += " && " + std::to_string(coordinate) + " < " +
+                  scope->second.back().active;
+    }
     if (streams > 1)
       offsets.push_back({laneAxis, partOffset(operation.getValue(), part)});
     auto address = denseAddress(region.slice, offsets);
@@ -4388,9 +5214,8 @@ mlir::LogicalResult Emitter::compileCommit(kernel::CommitOp operation) {
                   " * (ptrdiff_t)sizeof(" + *elementType + "), " +
                   value.parts[part] + ", " +
                   partVL(operation.getValue(), part) + ");";
-    if (nonLaneAxis >= 0)
-      line("if (" + std::to_string(nonLanePart) + " < " +
-           axisScopes.lookup(nonLaneAxis).back().active + ") " + statement);
+    if (!registerAxes.empty())
+      line("if (" + active + ") " + statement);
     else
       line(statement);
   }

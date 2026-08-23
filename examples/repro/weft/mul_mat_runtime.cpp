@@ -62,6 +62,16 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
   return result;
 }
 
+[[maybe_unused]] std::vector<std::int8_t> grid64_i8(
+    const std::uint64_t *table, std::size_t entries) {
+  std::vector<std::int8_t> result(entries * 8);
+  for (std::size_t entry = 0; entry < entries; ++entry)
+    for (std::size_t lane = 0; lane < 8; ++lane)
+      result[entry * 8 + lane] = static_cast<std::int8_t>(
+          (table[entry] >> (8 * lane)) & 0xffU);
+  return result;
+}
+
 [[maybe_unused]] std::vector<float> grid32(const std::uint32_t *table, std::size_t entries) {
   std::vector<float> result(entries * 4);
   for (std::size_t entry = 0; entry < entries; ++entry)
@@ -77,6 +87,15 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
     for (std::size_t lane = 0; lane < 8; ++lane)
       result[sign * 8 + lane] =
           (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1.0f : 1.0f;
+  return result;
+}
+
+[[maybe_unused]] std::vector<std::int8_t> sign_table_i8() {
+  std::vector<std::int8_t> result(128 * 8);
+  for (std::size_t sign = 0; sign < 128; ++sign)
+    for (std::size_t lane = 0; lane < 8; ++lane)
+      result[sign * 8 + lane] =
+          (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1 : 1;
   return result;
 }
 
@@ -325,8 +344,17 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xxs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_IQ2_XXS_LOCAL_PACK)
+extern "C" void production_mul_mat_iq2_xxs_local_pack(
+    const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *,
+    const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_iq2_xxs_local_pack(w, x, xq, iq2xxs_i8.data(),          \
+                                         signs_i8.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq2_xxs(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq2_xxs(w, x, xq, iq2xxs.data(), signs.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 17
 using selected_weight = block_iq3_s;
 using selected_activation = block_q8_K;
@@ -550,11 +578,13 @@ int main(int argc, char **argv) {
 
   const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
   const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
+  const std::vector<std::int8_t> iq2xxs_i8 = grid64_i8(iq2xxs_grid, 256);
   const std::vector<float> iq2xs = grid64(iq2xs_grid, 512);
   const std::vector<float> iq2s = grid64(iq2s_grid, 1024);
   const std::vector<float> iq3xxs = grid32(iq3xxs_grid, 256);
   const std::vector<float> iq3s = grid32(iq3s_grid, 512);
   const std::vector<float> signs = sign_table();
+  const std::vector<std::int8_t> signs_i8 = sign_table_i8();
   const std::vector<float> fp16 = f16_table();
   const std::vector<float> e8m0 = e8m0_table();
   const std::vector<float> ue4m3 = ue4m3_table();
@@ -567,11 +597,13 @@ int main(int argc, char **argv) {
   const std::uint32_t powers[5] = {1, 3, 9, 27, 81};
   (void)iq1;
   (void)iq2xxs;
+  (void)iq2xxs_i8;
   (void)iq2xs;
   (void)iq2s;
   (void)iq3xxs;
   (void)iq3s;
   (void)signs;
+  (void)signs_i8;
   (void)fp16;
   (void)e8m0;
   (void)ue4m3;

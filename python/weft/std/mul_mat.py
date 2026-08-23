@@ -10,8 +10,10 @@ from weft.language import (
     f16,
     f32,
     fold2,
+    i8,
     i16,
     i32,
+    lookup,
     mac_groups,
     materialize,
     new,
@@ -375,6 +377,83 @@ def mul_mat_iq2_xxs(
         for column in range(N):
             value = vec_dot_iq2_xxs_q8_k(W[column], Xq[row], grid, signs)
             commit(value, Y[row, column])
+
+
+def mul_mat_iq2_xxs_local_pack(
+    W: View[IQ2_XXS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            with L.tiles(M, extent=auto("MC")) as mc:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=16) as nb:
+                        f32_acc = new(f32, [MR, 16], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=256) as kb:
+                            w = admit(wp[nb, kb]) @ transfer
+                            x = admit(Xq[mb, kb]) @ transfer
+                            block_sum = new(i32, [MR, 16], init=0)
+                            for group in range(8):
+                                word0 = widen(w.q[:, group * 4], u32) | (
+                                    widen(w.q[:, group * 4 + 1], u32) << u32(16)
+                                )
+                                word1 = widen(w.q[:, group * 4 + 2], u32) | (
+                                    widen(w.q[:, group * 4 + 3], u32) << u32(16)
+                                )
+                                local = new(i32, [MR, 16], init=0)
+                                for entry in range(4):
+                                    grid_index = (
+                                        word0 >> u32(entry * 8)
+                                    ) & u32(255)
+                                    sign_index = (
+                                        word1 >> u32(entry * 7)
+                                    ) & u32(127)
+                                    for lane in range(8):
+                                        weight = widen(
+                                            lookup(
+                                                grid,
+                                                grid_index * u32(8) + u32(lane),
+                                            )
+                                            @ wide,
+                                            i32,
+                                        )
+                                        sign = widen(
+                                            lookup(
+                                                signs,
+                                                sign_index * u32(8) + u32(lane),
+                                            )
+                                            @ wide,
+                                            i32,
+                                        )
+                                        activation = i32(
+                                            x.q[:, group * 32 + entry * 8 + lane]
+                                        )
+                                        local += weight * sign * activation @ wide
+                                scale = i32(
+                                    (word1 >> u32(28)) * u32(2) + u32(1)
+                                )
+                                block_sum += local * scale @ wide
+                            f32_acc += (
+                                f32(w.d)
+                                * f32(x.ds)
+                                * widen(block_sum, f32)
+                            ) @ wide
+                        commit(f32_acc, Y[mb, nb])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(M, extent=auto("MC")) as mc:
+            with L.rows(mc, group=auto("MR")) as mb:
+                with L.cols(nc, group=16) as nb:
+                    value = admit(Y[mb, nb]) @ transfer
+                    commit(f32(0.125) * value @ wide, Y[mb, nb])
 
 
 def mul_mat_iq3_s(

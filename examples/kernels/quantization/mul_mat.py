@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import weft
-from weft.language import View, f16, f32, u32
+from weft.language import View, f16, f32, i8, u32
 from weft.std.encodings import (
     IQ1_M,
     IQ1_S,
@@ -38,6 +38,7 @@ from weft.std.mul_mat import (
     mul_mat_iq2_s,
     mul_mat_iq2_xs,
     mul_mat_iq2_xxs,
+    mul_mat_iq2_xxs_local_pack,
     mul_mat_iq3_s,
     mul_mat_iq3_xxs,
     mul_mat_iq4_nl,
@@ -236,6 +237,18 @@ def production_mul_mat_iq2_xxs(
     grid: View[f32, (2048,)], signs: View[f32, (1024,)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq2_xxs(W, X, Xq, grid, signs, Y)
+
+
+@weft.kernel
+def production_mul_mat_iq2_xxs_local_pack(
+    W: View[IQ2_XXS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_iq2_xxs_local_pack(W, X, Xq, grid, signs, Y)
 
 
 @weft.kernel

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q4_k_i16|q4_k_local|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q4_k_i16|q4_k_local|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq2_xxs_local|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
   exit 2
 fi
 
@@ -16,6 +16,8 @@ formats=(f16 q1_0 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq1_m 
 format_id=-1
 if [[ ${format} == q4_k_i16 || ${format} == q4_k_local ]]; then
   format_id=9
+elif [[ ${format} == iq2_xxs_local ]]; then
+  format_id=16
 elif [[ ${format} != f32 ]]; then
   for index in "${!formats[@]}"; do
     if [[ ${formats[index]} == "${format}" ]]; then
@@ -97,10 +99,22 @@ else
     kernel=production_mul_mat_q4_k_local_pack
     meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
     physical=(--auto-unroll=4 --auto-pipeline-depth=2)
+  elif [[ ${format} == iq2_xxs_local ]]; then
+    runtime_kernel_define=-DWEFT_IQ2_XXS_LOCAL_PACK=1
+    kernel=production_mul_mat_iq2_xxs_local_pack
+    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
   else
     kernel=production_mul_mat_${format}
   fi
   runtime=examples/repro/weft/mul_mat_runtime.cpp
+fi
+if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
+  meta=()
+  IFS=';' read -r -a requested_meta <<< "${WEFT_META_BINDINGS}"
+  for binding in "${requested_meta[@]}"; do
+    [[ -n ${binding} ]] && meta+=(--meta "${binding}")
+  done
 fi
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
