@@ -3025,7 +3025,8 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
                            contract->rhs, operation.getResult(), true,
                            std::move(*accumulator), accumulatorValue);
   }
-  if (realization == "rvv.fma.product") {
+  if (realization == "rvv.fma.product" ||
+      realization == "rvv.fmsac.product") {
     Binding product;
     product.kind = Binding::Kind::DeferredProduct;
     product.lhs = operation.getLhs();
@@ -3034,7 +3035,21 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
     bindings[operation.getResult()] = std::move(product);
     return mlir::success();
   }
-  if (realization == "rvv.fma.accumulate") {
+  if (realization == "rvv.fma.accumulate" ||
+      realization == "rvv.fmsac.accumulate") {
+    mlir::DictionaryAttr selected = assigned(operation.getOperation());
+    auto local = selected
+                     ? selected.getAs<mlir::DictionaryAttr>("local_operation")
+                     : mlir::DictionaryAttr();
+    llvm::StringRef instruction =
+        riscv_internal::string(local, "instruction").value_or("");
+    llvm::StringRef operandForm =
+        riscv_internal::string(local, "operand_form").value_or("");
+    if ((instruction != "rvv.vfmacc" && instruction != "rvv.vfmsac") ||
+        (operandForm != "vv" && operandForm != "vf-lhs-scalar" &&
+         operandForm != "vf-rhs-scalar"))
+      return fail(operation,
+                  "selected fused accumulation has no complete local operation");
     Binding lhs = bindings.lookup(operation.getLhs());
     Binding rhs = bindings.lookup(operation.getRhs());
     const Binding *product = lhs.kind == Binding::Kind::DeferredProduct ? &lhs
@@ -3067,30 +3082,52 @@ mlir::LogicalResult Emitter::compileBinary(kernel::BinaryOp operation) {
       }
       return true;
     };
+    const bool lhsScalar = operandForm == "vf-lhs-scalar";
+    const bool rhsScalar = operandForm == "vf-rhs-scalar";
+    const bool productCompatible =
+        operandForm == "vv"
+            ? vectorCompatible(product->lhs, *productLhs) &&
+                  vectorCompatible(product->rhs, *productRhs)
+            : lhsScalar ? productLhs->kind == Binding::Kind::Scalar &&
+                              vectorCompatible(product->rhs, *productRhs)
+                        : productRhs->kind == Binding::Kind::Scalar &&
+                              vectorCompatible(product->lhs, *productLhs);
     if (resultParts <= 0 ||
         !vectorCompatible(accumulatorValue, *accumulator) ||
-        !vectorCompatible(product->lhs, *productLhs) ||
-        !vectorCompatible(product->rhs, *productRhs))
+        !productCompatible)
       return fail(operation,
                   "selected fused accumulation mappings do not agree");
     Binding result;
     result.kind = Binding::Kind::Vector;
     const std::string type = vectorType(operation.getResult());
     const std::string suffix = vectorSuffix(operation.getResult());
+    const std::string intrinsic =
+        instruction == "rvv.vfmacc" ? "vfmacc" : "vfmsac";
     for (int64_t part = 0; part < resultParts; ++part) {
       const size_t accPart = *projectPart(accumulatorValue,
                                           operation.getResult(), part);
-      const size_t lhsPart =
-          *projectPart(product->lhs, operation.getResult(), part);
-      const size_t rhsPart =
-          *projectPart(product->rhs, operation.getResult(), part);
       const std::string &acc = accumulator->parts[accPart];
-      const std::string &mulLhs = productLhs->parts[lhsPart];
-      const std::string &mulRhs = productRhs->parts[rhsPart];
       std::string value = fresh("fma");
-      line(type + " " + value + " = __riscv_vfmacc_vv_" + suffix + "(" +
-           acc + ", " + mulLhs + ", " + mulRhs + ", " +
-           partVL(operation.getResult(), part) + ");");
+      if (operandForm == "vv") {
+        const size_t lhsPart =
+            *projectPart(product->lhs, operation.getResult(), part);
+        const size_t rhsPart =
+            *projectPart(product->rhs, operation.getResult(), part);
+        line(type + " " + value + " = __riscv_" + intrinsic + "_vv_" + suffix + "(" +
+             acc + ", " + productLhs->parts[lhsPart] + ", " +
+             productRhs->parts[rhsPart] + ", " +
+             partVL(operation.getResult(), part) + ");");
+      } else {
+        const Binding &scalarOperand = lhsScalar ? *productLhs : *productRhs;
+        const Binding &vectorOperand = lhsScalar ? *productRhs : *productLhs;
+        mlir::Value vectorValue = lhsScalar ? product->rhs : product->lhs;
+        const size_t vectorPart =
+            *projectPart(vectorValue, operation.getResult(), part);
+        line(type + " " + value + " = __riscv_" + intrinsic + "_vf_" + suffix + "(" +
+             acc + ", " + scalarOperand.scalar + ", " +
+             vectorOperand.parts[vectorPart] + ", " +
+             partVL(operation.getResult(), part) + ");");
+      }
       result.parts.push_back(std::move(value));
     }
     bindings[operation.getResult()] = std::move(result);
@@ -4805,6 +4842,9 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
   Binding lhs = bindings.lookup(lhsValue);
   Binding rhs = bindings.lookup(rhsValue);
   mlir::DictionaryAttr selected = assigned(&operation);
+  if (!selected)
+    return fail(&operation,
+                "intrinsic-C emission has no selected operation assignment");
   llvm::StringRef realization =
       riscv_internal::string(selected, "realization").value_or("");
   if (realization == "rvv.outer.deferred-reduction-product" && !initial) {
@@ -4909,6 +4949,9 @@ mlir::LogicalResult Emitter::compileContract(mlir::Operation &operation,
   if (lhs.kind != Binding::Kind::Slice || rhs.kind != Binding::Kind::Slice)
     return fail(&operation, "dense contraction requires admitted memory slices");
   auto local = selected.getAs<mlir::DictionaryAttr>("local_operation");
+  if (!local)
+    return fail(&operation,
+                "selected dense contraction has no local operation decision");
   llvm::StringRef laneOperand =
       riscv_internal::string(local, "lane_operand").value_or("");
   if (outer && laneOperand != "lhs" && laneOperand != "rhs")

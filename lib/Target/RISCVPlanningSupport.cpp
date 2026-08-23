@@ -154,6 +154,8 @@ unsigned riscv_internal::logicalBitWidth(mlir::Type type) {
 std::optional<int64_t>
 riscv_internal::integer(mlir::DictionaryAttr dictionary,
                         llvm::StringRef name) {
+  if (!dictionary)
+    return std::nullopt;
   if (auto value = dictionary.getAs<mlir::IntegerAttr>(name))
     return value.getInt();
   return std::nullopt;
@@ -162,6 +164,8 @@ riscv_internal::integer(mlir::DictionaryAttr dictionary,
 std::optional<llvm::StringRef>
 riscv_internal::string(mlir::DictionaryAttr dictionary,
                        llvm::StringRef name) {
+  if (!dictionary)
+    return std::nullopt;
   if (auto value = dictionary.getAs<mlir::StringAttr>(name))
     return value.getValue();
   return std::nullopt;
@@ -169,6 +173,8 @@ riscv_internal::string(mlir::DictionaryAttr dictionary,
 
 mlir::ArrayAttr riscv_internal::array(mlir::DictionaryAttr dictionary,
                                       llvm::StringRef name) {
+  if (!dictionary)
+    return {};
   return dictionary.getAs<mlir::ArrayAttr>(name);
 }
 

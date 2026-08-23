@@ -140,6 +140,31 @@ int64_t contiguousAxisForMemory(kernel::KernelOp kernel,
   return 0;
 }
 
+int64_t contiguousAxisForValueUse(
+    kernel::KernelOp kernel, llvm::StringRef valueId,
+    const llvm::StringMap<mlir::DictionaryAttr> &producers,
+    const llvm::StringMap<mlir::DictionaryAttr> &values) {
+  llvm::SmallSet<std::string, 4> visited;
+  while (visited.insert(valueId.str()).second) {
+    auto value = values.find(valueId);
+    if (value != values.end())
+      if (int64_t axis = contiguousAxisForMemory(kernel, value->second))
+        return axis;
+    auto producer = producers.find(valueId);
+    if (producer == producers.end())
+      break;
+    llvm::StringRef name =
+        riscv_internal::string(producer->second, "name").value_or("");
+    if (name != "weft_kernel.admit" && name != "weft_kernel.slice")
+      break;
+    auto operands = producer->second.getAs<mlir::ArrayAttr>("operands");
+    if (!operands || operands.empty())
+      break;
+    valueId = mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+  }
+  return 0;
+}
+
 mlir::Type logicalElement(mlir::DictionaryAttr value) {
   auto type = value.getAs<mlir::TypeAttr>("type");
   return type ? riscv_internal::logicalElement(type.getValue()) : mlir::Type();
@@ -433,6 +458,10 @@ public:
 
       llvm::StringMap<std::string> fusedProductByAdd;
       llvm::StringMap<std::string> fusedAddByProduct;
+      llvm::StringMap<std::string> fusedOperandFormByAdd;
+      llvm::StringMap<std::string> fusedOperandFormByProduct;
+      llvm::StringMap<std::string> fusedInstructionByAdd;
+      llvm::StringMap<std::string> fusedInstructionByProduct;
       llvm::StringMap<std::string> fusedOuterByAdd;
       llvm::StringMap<std::string> fusedAddByOuter;
       auto samePhysicalMapping = [&](mlir::DictionaryAttr lhs,
@@ -458,8 +487,10 @@ public:
             operation.getAs<mlir::DictionaryAttr>("source_attributes");
         auto operands = operation.getAs<mlir::ArrayAttr>("operands");
         auto results = operation.getAs<mlir::ArrayAttr>("results");
-        if (riscv_internal::string(source, "kind").value_or("") != "add" ||
-            !operands || operands.size() != 2 || !results || results.size() != 1)
+        llvm::StringRef binaryKind =
+            riscv_internal::string(source, "kind").value_or("");
+        if ((binaryKind != "add" && binaryKind != "sub") || !operands ||
+            operands.size() != 2 || !results || results.size() != 1)
           continue;
         auto result = values.find(
             mlir::cast<mlir::StringAttr>(results[0]).getValue());
@@ -468,7 +499,9 @@ public:
                  .value_or("")
                  .starts_with("rvv"))
           continue;
-        for (mlir::Attribute operand : operands) {
+        for (auto [operandIndex, operand] : llvm::enumerate(operands)) {
+          if (binaryKind == "sub" && operandIndex != 0)
+            continue;
           llvm::StringRef productValue =
               mlir::cast<mlir::StringAttr>(operand).getValue();
           auto producer = producers.find(productValue);
@@ -487,7 +520,8 @@ public:
                   : mlir::cast<mlir::StringAttr>(operands[0]).getValue();
           auto product = values.find(productValue);
           auto accumulator = values.find(accumulatorValue);
-          if (producerName == "weft_kernel.outer_contract" &&
+          if (binaryKind == "add" &&
+              producerName == "weft_kernel.outer_contract" &&
               product != values.end() && accumulator != values.end() &&
               samePhysicalMapping(product->second, result->second) &&
               samePhysicalMapping(accumulator->second, result->second)) {
@@ -506,32 +540,53 @@ public:
           auto productOperands =
               producer->second.getAs<mlir::ArrayAttr>("operands");
           bool compatible = resultParts > 0 && productOperands &&
-                            productOperands.size() == 2;
-          llvm::SmallVector<llvm::StringRef, 3> fusedInputs{accumulatorValue};
+                            productOperands.size() == 2 &&
+                            accumulator != values.end() &&
+                            samePhysicalMapping(accumulator->second,
+                                                result->second);
+          unsigned scalarOperands = 0;
+          int scalarOperand = -1;
           if (productOperands)
-            for (mlir::Attribute productOperand : productOperands)
-              fusedInputs.push_back(
-                  mlir::cast<mlir::StringAttr>(productOperand).getValue());
-          for (llvm::StringRef inputId : fusedInputs) {
-            auto input = values.find(inputId);
-            const int64_t parts =
-                input == values.end()
-                    ? 0
-                    : riscv_internal::integer(input->second, "vector_parts")
-                          .value_or(0);
-            compatible &=
-                input != values.end() &&
-                riscv_internal::string(input->second, "physical_kind")
-                    .value_or("")
-                    .starts_with("rvv") &&
-                (parts == 1 || parts == resultParts);
-          }
+            for (auto [index, productOperand] : llvm::enumerate(productOperands)) {
+              llvm::StringRef inputId =
+                  mlir::cast<mlir::StringAttr>(productOperand).getValue();
+              auto input = values.find(inputId);
+              llvm::StringRef physical =
+                  input == values.end()
+                      ? llvm::StringRef()
+                      : riscv_internal::string(input->second, "physical_kind")
+                            .value_or("");
+              if (physical == "scalar" && input != values.end() &&
+                  logicalElement(input->second).isF32()) {
+                ++scalarOperands;
+                scalarOperand = index;
+                continue;
+              }
+              const int64_t parts =
+                  input == values.end()
+                      ? 0
+                      : riscv_internal::integer(input->second, "vector_parts")
+                            .value_or(0);
+              compatible &= input != values.end() && physical.starts_with("rvv") &&
+                            (parts == 1 || parts == resultParts);
+            }
+          compatible &= scalarOperands <= 1;
           if (!compatible)
             continue;
+          llvm::StringRef operandForm =
+              scalarOperands == 0 ? "vv"
+              : scalarOperand == 0 ? "vf-lhs-scalar"
+                                   : "vf-rhs-scalar";
           llvm::StringRef addId =
               riscv_internal::string(operation, "id").value_or("");
           fusedProductByAdd[addId] = productValue.str();
           fusedAddByProduct[productValue] = addId.str();
+          fusedOperandFormByAdd[addId] = operandForm.str();
+          fusedOperandFormByProduct[productValue] = operandForm.str();
+          llvm::StringRef instruction =
+              binaryKind == "add" ? "rvv.vfmacc" : "rvv.vfmsac";
+          fusedInstructionByAdd[addId] = instruction.str();
+          fusedInstructionByProduct[productValue] = instruction.str();
           break;
         }
       }
@@ -952,11 +1007,20 @@ public:
             }
             if (!selectedOuter) {
               realization = "rvv.reduction-product";
-              if (name == "weft_kernel.outer_contract") {
+              if (name == "weft_kernel.contract" ||
+                  name == "weft_kernel.outer_contract") {
                 auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+                auto results = operation.getAs<mlir::ArrayAttr>("results");
+                auto source = operation.getAs<mlir::DictionaryAttr>(
+                    "source_attributes");
+                auto over = source
+                                ? source.getAs<mlir::DenseI64ArrayAttr>("over")
+                                : mlir::DenseI64ArrayAttr();
                 int64_t laneAxis =
                     riscv_internal::integer(operation, "lane_axis").value_or(0);
-                if (operands && operands.size() == 2 && laneAxis > 0) {
+                if (operands && operands.size() == 2 && results &&
+                    results.size() == 1 && over && over.size() == 1 &&
+                    laneAxis > 0) {
                   llvm::StringRef lhsId =
                       mlir::cast<mlir::StringAttr>(operands[0]).getValue();
                   llvm::StringRef rhsId =
@@ -967,13 +1031,17 @@ public:
                       lhs != values.end() && containsAxis(lhs->second, laneAxis);
                   const bool rhsLane =
                       rhs != values.end() && containsAxis(rhs->second, laneAxis);
-                  if (lhsLane != rhsLane)
+                  if (lhsLane != rhsLane) {
                     localOperation = riscv_internal::dictionary(
                         builder,
-                        {{"lane_operand",
+                        {{"instruction", builder.getStringAttr("rvv.vfmacc")},
+                         {"lane_operand",
                           builder.getStringAttr(lhsLane ? "lhs" : "rhs")},
                          {"lane_axis", builder.getI64IntegerAttr(laneAxis)},
+                         {"reduction_axis",
+                          builder.getI64IntegerAttr(over.asArrayRef().front())},
                          {"decision_owner", builder.getStringAttr("operation")}});
+                  }
                 }
               }
             }
@@ -1322,16 +1390,28 @@ public:
                 {{"contract_value", builder.getStringAttr(outer->second)},
                  {"decision_owner", builder.getStringAttr("operation-cluster")}});
           } else if (product != fusedProductByAdd.end()) {
-            realization = "rvv.fma.accumulate";
+            llvm::StringRef instruction =
+                fusedInstructionByAdd.lookup(operationId);
+            realization = instruction == "rvv.vfmacc" ? "rvv.fma.accumulate"
+                                                       : "rvv.fmsac.accumulate";
             localOperation = riscv_internal::dictionary(
                 builder,
-                {{"product_value", builder.getStringAttr(product->second)},
+                {{"instruction", builder.getStringAttr(instruction)},
+                 {"operand_form",
+                  builder.getStringAttr(fusedOperandFormByAdd.lookup(operationId))},
+                 {"product_value", builder.getStringAttr(product->second)},
                  {"decision_owner", builder.getStringAttr("operation-cluster")}});
           } else if (add != fusedAddByProduct.end()) {
-            realization = "rvv.fma.product";
+            llvm::StringRef instruction =
+                fusedInstructionByProduct.lookup(resultId);
+            realization = instruction == "rvv.vfmacc" ? "rvv.fma.product"
+                                                       : "rvv.fmsac.product";
             localOperation = riscv_internal::dictionary(
                 builder,
-                {{"consumer", builder.getStringAttr(add->second)},
+                {{"instruction", builder.getStringAttr(instruction)},
+                 {"operand_form",
+                  builder.getStringAttr(fusedOperandFormByProduct.lookup(resultId))},
+                 {"consumer", builder.getStringAttr(add->second)},
                  {"decision_owner", builder.getStringAttr("operation-cluster")}});
           } else {
             realization = "mapped-pointwise";
@@ -1461,7 +1541,8 @@ public:
           }
         }
 
-        if (name == "weft_kernel.outer_contract" &&
+        if ((name == "weft_kernel.contract" ||
+             name == "weft_kernel.outer_contract") &&
             (realization == "rvv.reduction-product" ||
              realization == "rvv.outer.deferred-reduction-product")) {
           auto operands = operation.getAs<mlir::ArrayAttr>("operands");
@@ -1480,10 +1561,8 @@ public:
             llvm::StringRef laneValueId =
                 mlir::cast<mlir::StringAttr>(operands[operandIndex]).getValue();
             auto laneValue = values.find(laneValueId);
-            int64_t contiguousAxis =
-                laneValue == values.end()
-                    ? 0
-                    : contiguousAxisForMemory(kernel, laneValue->second);
+            int64_t contiguousAxis = contiguousAxisForValueUse(
+                kernel, laneValueId, producers, values);
             llvm::StringRef memoryForm =
                 contiguousAxis == laneAxis ? "unit-stride"
                                            : "runtime-strided";
