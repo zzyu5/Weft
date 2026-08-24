@@ -23,6 +23,7 @@ Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下�
 
 ## 编译主干
 
-- [两层 MLIR 编译主干](compiler.md)：`weft_kernel → weft_riscv → intrinsic C`，RISC-V physical IR 的 typed entities、pass contracts 与 terminal translation 边界。
+- [两层 MLIR 编译主干](compiler.md)：`weft_kernel → weft_riscv → intrinsic C`，RISC-V physical IR、local leaf、pass contracts 与 terminal translation 边界。
+- [实验定义](experiments.md)：baseline 怎样决定作者侧 DSL 实现、正确性与性能协议、两台目标机器和结果记录边界。
 
 这些文件只描述设计，不记录实现进度、性能结果或迁移过程。

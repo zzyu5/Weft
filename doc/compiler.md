@@ -195,7 +195,62 @@ final verifier 至少要求：
 - 不存在未展开的 composite/schedule op；
 - build requirements在完整 RISC-V program 上成立。
 
-## 6. Terminal translation
+## 6. Local leaf 与指令落点
+
+### 6.1 Leaf 是 physical operation，不是完整 kernel
+
+local leaf 是 RISC-V IR 中已经选定、合同闭合的 target operation。它可以是：
+
+- 一个 RVV primitive，对应一个 intrinsic；
+- 一个由少量固定 RVV instructions 实现的 closed primitive；
+- 一个 IME fragment operation，对应 intrinsic 或 typed inline asm；
+- 一个 ISA 规定的固定局部指令序列。
+
+leaf 可以隐藏 ISA spelling 和 primitive-private temporaries，但不能隐藏：
+
+- canonical Level 或 ordinary outer loop；
+- source blocking、staging、state recurrence 或 persistent packing；
+- invocation-local pack loop、pipeline、spill 或跨 primitive workspace；
+- kernel ABI 与完整 operator traversal。
+
+固定 fragment 内部的有限指令序列可以是 opaque leaf；其循环次数、operand window、effects、resources 和结果必须由 leaf contract 完全封闭。trip count 来自 source Level、dynamic shape 或 physical pipeline 的循环必须在 RISC-V IR 中显式存在。
+
+### 6.2 Leaf contract
+
+每个 primitive target op 必须由类型和 verifier 明确给出：
+
+```text
+实现的 local numerical/transfer semantics
+typed physical operands 与 results
+logical axes、layout、dtype、shape、mask 与 tail
+memory descriptors、alias、effects 与 ordering
+fragment family、register/local temporaries 与 resources
+允许的 input/output conversions
+rounding、overflow、saturation 与 exceptional-value policy
+intrinsic/asm spelling key、required headers 与 toolchain capability
+inline-asm operands、constraints、clobbers、volatile/memory semantics
+```
+
+opaque IME leaf 还必须声明完整局部 ABI 和 fragment handoff。没有这些字段的 helper 函数，即使能生成 asm，也不是合法 leaf。
+
+### 6.3 Leaf selection 的位置
+
+RVV、IME 或其它 extension 之间的选择会改变 layout、fragment、conversion 和 resources，因此属于 RISC-V passes，不属于 terminal translator：
+
+1. `SelectRISCVOperations` 根据 canonical op、typed operands、axes、Encoding、target profile、build requirement 和固定优先级选择 target-op family；
+2. layout、memory、schedule 和 resource passes 将它具体化并验证；
+3. `LowerRISCVComposites` 产生最终 primitive RVV/IME leaf ops；
+4. `VerifyFinalRISCV` 确认每个 leaf 都有唯一完整合同和可用 spelling。
+
+候选由 target operation definitions 与 target profile capability 组成，不按 kernel、operator family 或量化格式注册。无合法 leaf 时当前 physical module 明确 unsupported；不能回到 emitter 选择另一条路径。
+
+若两个实现具有不同 operand representation、fragment、resources、effects 或 instruction sequence，它们是不同 physical leaves，选择必须在 pass 中完成。若它们只有 Clang intrinsic API 或 asm 语法不同而机器语义与合同完全相同，差异属于 toolchain spelling adapter，不是新的 physical 选择。
+
+### 6.4 Materials 的使用边界
+
+`materials/` 中的 intrinsic、asm、constraint 和 clobber 可以帮助实现 leaf spelling；其中的 microtile、operand reuse、fragment handoff 和 pipeline 必须先进入 RISC-V IR 的 target op、layout 或 schedule。完整旧 kernel、outer traversal 和 runtime 函数不能包装成 leaf。
+
+## 7. Terminal translation
 
 terminal translator 只接收通过 `VerifyFinalRISCV` 的 module。它负责：
 
@@ -206,7 +261,7 @@ terminal translator 只接收通过 `VerifyFinalRISCV` 的 module。它负责：
 
 它不能推导 layout、选择 memory form/engine/fragment、生成 Level loop/pack loop/pipeline，不能同时读取 canonical module与一张 assignment table合成机器程序。缺失信息是 final verifier错误。
 
-## 7. 与 Triton 的准确对应
+## 8. 与 Triton 的准确对应
 
 Triton 的结构不是“每个 pass 一层 IR”：
 
@@ -252,7 +307,7 @@ intrinsic C
 
 TileLang也没有把每个规划步骤变成一层IR。layout inference把结果附着到真实block/loop，`LowerTileOp`再重写buffer与index（`ref/tilelang/src/transform/layout_inference/layout_inference.cc:1196`、`ref/tilelang/src/transform/lower_tile_op.cc:1080`）；software-pipeline injection会真实生成buffer version、barrier和重写后的body（`ref/tilelang/src/transform/inject_pipeline.cc:3608`）。Weft采用的是同一条机械原则：跨pass结果必须落在真实程序实体上，而不是要求复制TileLang的SIMT storage/thread模型。
 
-## 8. 明确排除的结构
+## 9. 明确排除的结构
 
 Weft 不采用：
 

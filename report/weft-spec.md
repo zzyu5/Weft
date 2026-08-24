@@ -894,6 +894,27 @@ VerifyFinalRISCV
 
 这些是pass，不是IR层。pass-local analysis map可以存在，但跨pass结果必须写回physical type、operation、region或附着于真实实体的typed attribute。每个pass后dump同一份RISC-V module，必须能直接看见type变化、conversion插入/删除、memory/target op替换、pipeline展开与spill/reload。
 
+### 5.8.1 Local leaf
+
+local leaf是final RISC-V IR中的target operation，不是完整kernel。它可以是一条RVV intrinsic、一个固定closed RVV sequence，或一个合同闭合的IME/extension fragment operation。leaf只允许隐藏ISA spelling和primitive-private temporaries，不能隐藏source Level、outer traversal、blocking、state、local-pack loop、pipeline、workspace、persistent artifact或kernel ABI。
+
+每个leaf必须由typed IR和verifier明确声明：
+
+```text
+local numerical/transfer semantics
+typed operands/results、logical axes与physical layouts
+dtype、shape、mask/tail、rounding与overflow
+memory descriptor、alias、effect与order
+fragment、register/local temporaries与resources
+allowed conversions与result handoff
+intrinsic/asm spelling key、headers与toolchain requirement
+asm operands、constraints、clobbers与memory semantics
+```
+
+RVV与IME之间的选择会改变representation、conversion和resources，由`SelectRISCVOperations`与后续physical passes完成；`LowerRISCVComposites`产生最终primitive leaf ops。Terminal translator只按已选leaf的spelling key输出Clang intrinsic或typed asm。仅有API/asm语法差异而机器合同相同的情况属于toolchain adapter；合同不同就是不同physical leaf，不能留给emitter选择。
+
+leaf候选来自target operation definitions与target profile capability，不按kernel、算子family或量化格式注册。无合法leaf时当前physical module明确unsupported，不得调用旧helper、恢复fallback或在emitter中重选。
+
 ## 5.9 瞬态实体归属
 
 一次 target lowering 内，物理事实归属于具体实体：
@@ -993,6 +1014,14 @@ Terminal translator只接收通过final verifier的RISC-V module。它把`func/s
 ## 5.13 输出
 
 RISC-V IR terminal translation生成 intrinsic C（`__riscv_v*` / IME intrinsic），不增加LLVM dialect层，也不把未决定的向量形态交给LLVM自动向量化。系统C compiler继续负责最终寄存器分配、机器调度、peephole和机器码生成。
+
+## 5.14 实验的地位
+
+实验是编译器的外部检验，不是编译器架构。`source/` baseline同时承担算法实现参照和性能参照：作者必须根据baseline真实表达相同的algorithm variant、blocking、staging、state、persistent layout、preprocessing与timing boundary；这些内容不同就不是同一比较case。
+
+作者树固定后，baseline不参与layout、LMUL、RVV/IME leaf、pipeline或physical-parameter选择，也不能成为backend route。若baseline具有DSL未表达的作者侧结构，修改DSL/std；若树已经一致，再把差距归因到physical pass、leaf、terminal spelling或system compiler。
+
+浮点kernel不要求bit-exact；bit-exact只用于Encoding/storage bytes与离散字段。严格性能比要求同target、算法、shape、phase、layout、preprocessing、timed region、thread count、Clang版本、target flags和测量协议。完整实验定义见`doc/experiments.md`。
 
 ---
 
@@ -1187,6 +1216,12 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **12.** 语言贡献与编译器贡献分开主张。
 
+**13.** 程序 IR 只有 Canonical Kernel IR 与 target-aware physical IR 两层；非SIMT抽象机器、target profile、tuner和pass不构成额外IR层。RISC-V最终直接translation到intrinsic C。
+
+**14.** local leaf是final physical IR中合同闭合的target operation。RVV/IME选择在physical passes中完成；terminal translator只拼写intrinsic或typed asm。leaf不得隐藏Level、outer traversal、pack/pipeline或kernel ABI。
+
+**15.** baseline既决定作者比较的算法实现树，也评价最终artifact；它不参与physical/leaf选择。实验按同target、算法、shape、toolchain和timing protocol检验编译器，不能反向形成backend特例。
+
 ---
 
 # 附录 A · 未闭合问题
@@ -1218,4 +1253,7 @@ Level 上的 ordered 属性
 全局 C/D dictionary、arc propagation 与 DFS 回溯求解器
 静态 cost model 作为结构选择权威
 生成多个合法物理结构后静态排序或真机竞赛
+whole-kernel intrinsic/asm leaf
+用浮点bit-exact替代数值容差合同
+由baseline名称或性能行触发backend route
 ```

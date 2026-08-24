@@ -180,6 +180,14 @@ instruction/intrinsic/asm realization
 
 ISA 通常只给出合法区域，不给出唯一实现。target profile 因此还要为多个合法 structural realization 提供固定规则与优先级。同一个 canonical `contract` 可以拥有 RVV register-microkernel 和 IME fragment contracts；target 根据 operand axes、Encoding、representation、resources 与 build requirements 选择合法 engine 和 fragment family。
 
+### 6.1 Local leaf
+
+local leaf 是上述 target operation contract 的最终 ISA 落点，不是独立算法层。RVV intrinsic leaf、IME asm leaf 或其它 opaque extension leaf 都必须具有 typed operands/results、layout、mask/tail、memory/effect/order、resource、clobber 与局部 ABI 合同。
+
+leaf 只可封闭一个固定 local primitive 及其 primitive-private temporaries。source Level、outer traversal、blocking、state、local-pack loop、pipeline、workspace、persistent Encoding 和 kernel ABI 必须在 leaf 外的 RISC-V physical program 或 canonical program 中显式存在。
+
+选择 RVV 还是 IME 会改变 representation 与 resource，必须在 physical passes 中完成。terminal spelling 只把已选 leaf 写成当前 toolchain 的 intrinsic 或 typed asm；spelling 不能根据 shape、格式名或 source closure 重新选择 leaf。
+
 ## 7. Physical conversion
 
 conversion 在不改变 canonical Value、logical axes 和 Level 归属的前提下，把一种表示变成另一种。它可以落成：
