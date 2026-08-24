@@ -1,16 +1,12 @@
 # Weft 规范
 
-**版本 0.2 · 面向 RVV / IME**
-
----
-
 ## 摘要
 
 Weft 是一门层级化、encoding-aware、有限位宽的**数值 realization 语言**。
 
 作者写下一份具体的数值实现：哪些中间值存在、每个值在哪一层诞生、以什么类型的关系交回外层、哪些代数支路被拆出去、同时保留多少个输出、哪些重排发生在调用之外。
 
-编译器不发明代数结构。它用一串前向 physicalization pass 落实这份实现：SEW/LMUL 沿值链传播、vl 与尾循环、寄存器分组、packed value 的读取形态、指令选择、引擎绑定、unroll 与流水。`std` 特化和 `auto` 参数在最外层形成候选；每个候选独立走完整 pass 序列，资源不合法就被删除。
+编译器不发明代数结构。它在非 SIMT 物理抽象机器上落实这份实现，并严格区分三类工作：唯一合法推导、由 target 固定规则完成的结构性选择、由构建期实测完成的参数性选择。`std` 特化和 source `auto` 仍由作者提供；target 不生成新的程序树。
 
 一句话：
 
@@ -63,11 +59,11 @@ min 支路里 `q` 消失了，剩下的是对 activation 的求和；而 Q8_K �
 |---|---|---|
 | Intent / 计算图 | 逻辑域 + 原子 contract | contract 内部不可见，"i16 partial"、"min 支路走 bsum" 无处安放 |
 | Halide / TVM / Exo | 算法 + schedule，**前提是 schedule 不改数值** | 上面的改写改变了数值结构，在 Halide 里那是另一个 algorithm，而 Halide 对新 algorithm 一无所知 |
-| Triton | 带 ownership 的静态 tile | layout 系统围绕 SIMT ownership 建模；layout 维度里没有"编码"，表达不了 nibble→i8→i16 pair 这条链 |
-| TileLang | 存储层级 + copy/gemm | shared/local/fragment 是源语言词汇，换机器要改语言 |
+| Triton | program grid + block tensor | distributed layout 围绕 thread/warp/CTA ownership；packed bit mapping 与层级有限位宽 realization 不是其根模型的一等结构 |
+| TileLang | launch/thread binding + storage scope + tile op | shared/local/fragment、copy、pipeline 与 tensorization 是 source contract；Encoding 与 Level lifetime 不是其根模型的一等结构 |
 | intrinsic | 全部手写 | 能写，但分解与表示写死在同一份代码里 |
 
-**注意措辞：** 不是"别人写不出来"。Triton/TileLang 里当然可以手写 decode、乘法、归约和 correction 支路。真正的区别是：**这些结构不是它们根模型的一等对象，无法在其中自然保存、组合并重新物理化。**
+**注意措辞：** 不是"别人写不出来"。Triton/TileLang 里当然可以手写 decode、乘法、归约和 correction 支路。真正的区别是 source contract 保存什么：Triton 保存 program/block 与 SIMT distributed layout，TileLang 保存 thread/storage/copy/tile structure，Weft 保存 Encoding、有限位宽数值树与 Level lifetime。具体机制见 7.2 与第八部分。
 
 ## 1.3 与 Intent 的边界
 
@@ -87,11 +83,9 @@ intrinsic   把这个实现绑定到一台具体机器
 
 ## 2.1 为什么根不是一个"对象"
 
-SIMT 硬件**强制** ownership：一个值必须被一组线程共同拥有，layout 就是"逻辑坐标 → owner"这个函数，`tile` 是它的名字。tile 一写下来，编译空间就被结构性划定 —— 这不是审美，是硬件逼出的特权对象。
+Triton 一类 SIMT 语言把 logical coordinate 到 thread/warp/CTA owner 的分布作为物理 layout 的核心关系。单控制器 vector/matrix 目标不需要先建立这类虚拟 owner 才能调度整个逻辑值。
 
-单控制器机器没有这个强制。控制器看得见整个值，没有谁拥有谁。
-
-这解释了为什么一系列候选全部失败：worker、VLA region、space-time block、reduction stream + resident state —— 它们都在找特权对象。
+这不表示单控制器目标没有强物理对象；它只说明 Weft 不把某一种 owner、tile、VLA region、space-time block 或 resident-state pattern 选作所有程序的源语言根类型。
 
 **准确的表述（不上升为硬件定理）：**
 
@@ -114,6 +108,8 @@ SIMT 硬件**强制** ownership：一个值必须被一组线程共同拥有，l
 
 > **改变了逻辑值集合，或改变了逻辑值的层归属 → 属于源程序（树），作者写。**
 > **不改变这两者 → 属于编译器（表示）。**
+
+这里的“逻辑值”不是只有 dtype/shape 的匿名元素集合。canonical logical Value 由具体 producing operation contract 定义，包括 typed operands、axes、effects 与硬 engine role；改变 producing op 的 role 或数值/effect contract，就是换了 canonical value definition。因而 engine role 仍由 2.2 覆盖，不是额外权限位或例外。
 
 它的用法：
 
@@ -376,7 +372,7 @@ Q4K_I16<rows=16>              抽象派生编码族
 Q4K_I16_R16_LayoutA           已实例化物理编码（含具体字节交错顺序）
 ```
 
-build-time 可以在 LayoutA / LayoutB 之间选择，**但一旦 artifact 建好，kernel entry 接收的就是固定的 layout identity，lowering 不能再选另一种交错顺序。** builder 必须产出：
+作者可以用不同 derived builder 或显式 build config 选择 LayoutA / LayoutB，**但一旦 artifact 建好，kernel entry 接收的就是固定的 layout identity，lowering 不能再选另一种交错顺序。** builder 必须产出：
 
 ```
 builder / size / alignment / endianness / layout identity / target compatibility
@@ -393,9 +389,11 @@ group=auto(1, 4, 8, 16)
 extent=auto("KB")
 ```
 
-`auto` 是**搜索空间的声明**，不是许可位。它说"这个数由候选选择定"，而"这个宽度存在"是作者写的。与 Triton 的 `BLOCK_M`、TileLang 的 `num_stages` 同类。
+`auto` 是作者声明的有限 source 参数域，不是许可位。它说"这个数由构建过程绑定"，而"这个宽度存在"是作者写的。与 Triton 的 `BLOCK_M` 同类；它可能实例化不同 logical cohort 或 Level extent，因此仍属于作者程序空间。
 
-要删除的只是没有明确含义、只说"编译器随便找"的 permission bit —— 前者把语义责任推给编译器，后者只是留一个数不填。
+target 还可以为同一 source tree 声明 LMUL、已固定 schema 内的 physical microtile extent、unroll、pipeline depth 与 buffer count 等有限物理参数。这些参数不进入 DSL 或 canonical IR，由构建期实测选择。source `auto` 与 target physical parameter 可以由同一工具测量，但前者实例化作者程序，后者只实例化机器表示。
+
+要删除的只是没有明确含义、只说"编译器随便找"的 permission bit。
 
 ## 3.9 普通控制流
 
@@ -442,7 +440,7 @@ gemv(Q4K_I16, Q8_K)               → 另一棵树
 gemv(Q4K_I16, Q8_K, engine=matrix) → 又一棵
 ```
 
-这是普通重载/特化，不是编译器搜索结构。**编译器仍不发明树，它只在几棵人写好的树里挑。**
+这是普通重载/特化，不是编译器搜索结构。前端根据参数类型、derived Encoding 与显式 config 唯一解析到一棵树；匹配歧义是前端错误。构建过程只枚举该树声明的有限 source `auto` 绑定，target compiler 不在多棵 std tree 之间竞赛。
 
 **(4) 参数化的是数值决策，不是机器参数。**
 
@@ -478,9 +476,11 @@ dot(a, b)               逐元素乘后归约
 contract(a, b, over=)   指定轴上的缩并
 outer_contract(a,b,over=) 外积式缩并，产出二维结果
 lookup(table, idx)      查表
-pack(view, along=)      重排为便于连续访问的形态
+pack(view, along=)      授权 invocation-local pack 并指定连续供应的逻辑轴
 interleave(view, rows=) 跨行交错（派生编码专用）
 ```
+
+`pack` 的存在、`along`、所在 Level 与 engine role 是作者意图；physical pack schema 由 target compiler 根据 producer、所有 consumer、widening、pipeline、资源与 handoff 按固定规则选择，schema 内数值 extent 可以作为 physical parameter。它不等同于跨调用的 derived Encoding，后者的 bytes 与 ABI 必须由作者固定。
 
 **注意：** `reduce` 内部可以产生多个物理 partial 与树归约 —— 因为源程序里它只有一个逻辑结果值，逻辑值集合没变。而 `i32_acc += ...` 拆成 4 路是从 1 个逻辑值变成 4 个，属于改树，作者写。这不是给 `reduce` 的豁免权，是判据的直接应用。
 
@@ -686,129 +686,152 @@ def topk(X: View[f32,(N,)], out: View[i32,(K_,)]):
 
 # 第五部分 · 编译器
 
-## 5.1 决策清单与实体归属
+## 5.1 作者程序与编译器表示
 
-手写一份 q4_K RVV intrinsic，人要定的全部决策：
+手写一份 q4_K intrinsic 时，人同时承担两组不同性质的工作。
 
-### A 组 · 数值分解（6 项，**作者**）
+### 作者写入 canonical tree
 
-1. 分配律怎么拆 —— 拆不拆出 min 支路
-2. min 支路落到哪个字段 —— 用 bsum 还是重新求和
-3. bsum 粒度 16 vs sc 粒度 32 怎么折叠
-4. 中间位宽的层次 —— i16 → i32 → f32
-5. `d` / `sc` / `ds` 各自乘在哪一层
-6. mac 一次吃几个元素（2 / 4 / 8）—— 决定 i16 能装多少
+1. 代数支路：是否拆 min 支路、使用 bsum 还是重新求和；
+2. 逻辑粒度：bsum/sc 怎样折叠，mac 一次覆盖几个元素；
+3. 有限位宽：i16、i32、f32 的转换与舍入位置；
+4. 频率层次：`d/sc/ds` 分别在哪个 Level 参与；
+5. logical values/state/partial 的数量；
+6. cohort、Level extent、accumulator lifetime 与 handoff；
+7. `admit`、`materialize` 与 invocation-local `pack` 位于哪层；
+8. `pack` 的 `along` 与 engine role；
+9. persistent derived Encoding 是否存在、bytes 与 ABI 是什么；
+10. ordinary scalar control 与显式 shaped axis 的选择。
 
-### B 组 · 数据供应结构（4 项，**作者**）
+### 编译器形成 physical program
 
-7. 同时保留几个输出（cohort 宽度）
-8. 几路 partial 累加器
-9. activation 在哪一层被读一次
-10. weight 要不要跨调用重排、重排成什么形状
+- logical axes 到 time、lane、register replica、fragment 与 local storage 的表示；
+- value 的 SEW、LMUL、`vl`、tail、register group 与 physical partial；
+- memory edge 的 load form、unpack、broadcast、conversion 与 reuse；
+- local operation 的 RVV/IME realization；
+- invocation-local pack 的 physical schema 与 parameterized extents；
+- local cluster、pipeline、unroll、prefetch、buffer、spill/reload/rematerialize；
+- resource legality、intrinsic 与 local asm。
 
-### C 组 · 向量形态（9 项，**编译器**）
+第二组不是一个统一的“前向推导”，而是三种性质不同的决定。
 
-11. 某个 **value** 的 SEW
-12. 某个 **value** 的 LMUL（widen 会沿 use-def 传播）
-13. 某个 **Level/value** 的 vl
-14. 某个 **Level** 的尾循环
-15. 某组 **state/result values** 怎样分组进寄存器
-16. 整个候选的寄存器预算是否合法；spill 归属于具体 **value**
-17. 某个分组乘加 **result value** 的 partial layout
-18. 某个 **reduce op** 的横向归约位置
-19. 当前 **target/entry** 的 VLEN specialization
+## 5.2 非 SIMT 物理抽象机器
 
-### D 组 · 指令与内存形态（7 项，**编译器**）
-
-20. 某个 packed **value-use edge** 的拆法：and+shift / 专用 unpack / gather
-21. 某个 **mac/contract op** 的指令：`vwmaccsu` / `vqmaccsu` / IME
-22. 某个 scale **value-use edge** 怎样广播到 consumer mapping
-23. 某个 **memory object / derived encoding instance** 的字节级顺序
-24. 某个 **memory edge** 的 load form、步长与对齐
-25. 某个 **Level + memory edge** 的 prefetch 距离
-26. 某个 **Level / local op cluster** 的软流水深度与 unroll
-
-```
-写 intrinsic：26 项
-写 Weft：    10 项（A + B）
-编译器 passes 决定：16 类实体级属性（C + D）
-```
-
-这些不是 16 个 kernel-global 开关。一个 kernel 可以同时有多个 packed value、多个 reduce、多个 memory edge 和多个 Level；每个实体都可以得到不同决定。只有 target facts 与总寄存器预算是全局输入/检查。
-
-## 5.2 前向 pass 序列，不是全局求解器
-
-编译器采用和常规 MLIR compiler 一致的形态：每个 pass 读取 canonical IR 与前序 pass 已写下的瞬态 attribute，决定一类实体事实，再交给后续 pass。
+目标 lowering 把每个 source Value 的 logical coordinates 关联到下列物理分量：
 
 ```text
-std specialization × auto bindings
-        ↓ 最外层枚举完整 source candidate
-InferEncodingMappings
-        为每个 encoded field/value-use 展开 grouped/layered mapping
-PropagateValueRepresentations
-        为每个 value 决定 SEW、LMUL、vl 与必要 convert
-SelectLocalOperations
-        为每个 op / memory edge 选择 local RVV/IME operation
-ScheduleLevels
-        为每个 Level 决定 unroll、local pipeline 与 prefetch
-CheckResources
-        汇总 live values；合法则保留，不够则使用已明确决定的 spill，
-        否则把当前完整 candidate 标为非法
-EmitIntrinsicC
-        只读所有决定，机械拼写 intrinsic C / local asm
-        ↓
-rank 或真机实测所有合法 candidate，选择 winner
+logical coordinates
+    → issue/time
+    × SIMD lane
+    × register replica
+    × extension fragment
+    × local storage
 ```
 
-**pass 内前向，pass 之间靠 entity-local attribute 传递。没有回边。**
+这是一条可组合、可部分定义、允许 broadcast/replication 的表示关系，不是所有 Value 都必须拥有的五维笛卡尔积。scalar、RVV、IME、staged local object 可以只使用其中一部分。
 
-- layout 冲突不回头重选：在冲突的 value-use edge 插入明确 convert，后续 pass 可以消除冗余 convert；
-- 资源不足不回头修改 LMUL、instruction 或作者树：当前 candidate spill 或非法；
-- 要探索另一 LMUL、mac realization、unroll 或 std 数值特化，就形成另一个外层 candidate，重新走完整流水；
-- 一个 pass 不读取 emitter 状态，也不修改更早 pass 已冻结的实体决定。
+每个物理实体必须保留 canonical Value、logical axes、Level instance、ordinary control、producer/consumer、effect、validity 与 engine role 的 identity。物理化可以分片、复制、暂存或重算同一 Value，不能改变 logical value 集合、Level 归属、handoff、pinned Encoding 或 operation 数值语义。
 
-这不意味着各项彼此独立。instruction 会读取 operand representation，schedule 会读取 instruction latency，resource check 会汇总所有 live values；依赖通过前向数据流体现，而不是通过全局 dictionary 上的 arc propagation 与 DFS 回溯体现。
+完整机器合同见 `doc/machine/physical-machine.md`。
 
-## 5.3 瞬态决定的归属
+## 5.3 唯一合法推导
 
-一次 target lowering 内，决定直接挂在它描述的实体上：
+这类事实由语言与 target legality 唯一决定，不能使用启发式：
 
-```
-value attr         physical kind / SEW / LMUL / vl / register bundle / spill
-op attr            selected local realization / operand-result handoff
-memory-edge attr   encoding mapping / load form / stride / alignment / unpack
-Level attr         tail / unroll / pipeline / prefetch schedule
-target facts       ISA / ABI / VLEN / extensions / global resource budget
+```text
+op/value          free、reduction、broadcast axes；result 保留/消去哪些 axes
+encoded use       logical coordinate → storage bits
+typed chain       cast/widen/narrow 的 element-width 与数值关系
+memory/effect     alias、order、validity、mask 与可移动性
+target op         dtype、shape、显式 role compatibility、mask/tail、fragment/resource 是否合法
 ```
 
-链的两端仍被钉死：一端是内存 encoding mapping，一端是 selected instruction operand form。中间的 value-use 冲突由显式 convert 表示。
+例如 `[M,K]` 沿 K reduce 的结果必须保留 M axis；把它变成 scalar 再广播不是较差实现，而是错误表示。一个 codebook axis 只有在 source shaped Value 中存在时才能映射到 lane，编译器不能从八个独立 scalar lookup 重新发明轴。
 
-**pin 只出现在跨调用边界**：kernel 参数、持久 buffer、调用方可见 workspace。**pin 处不许插 coercion**；内部的 coercion 是编译器自己的成本。
+同一事实只有一个 producer。上下游 representation 不一致时插入保持 logical identity 的 physical conversion；后续 pass 可以消除或重物化 conversion，但不能用默认字段静默替代。
 
-## 5.4 候选在 pass 流水之外枚举
+## 5.4 结构性选择
 
+这类决定不改变 canonical tree，但存在多个合法 physical realization：
+
+```text
+axes               time / lane / register replica / fragment 的分配
+engine             未绑定且 op 允许多个 role 时的 wide / matrix realization
+memory             unit / strided / indexed / segment
+pack               invocation-local schema：axis orientation、carrier与handoff关系
+materialization    share / reload / rematerialize / spill / local pack
+quant              decode materialize / decode-compute fusion
+schedule           sequential / local software pipeline
+extension          fragment family 与 handoff structure
 ```
-程序 schema
-  × 库函数的多个特化（不同的树）
-  × auto 参数实例
-        ↓
-  对每个完整候选，运行一遍完整前向 pass 序列
-        ↓
-  删除不可行候选（寄存器不足、无合法表示链、引擎不匹配）
-        ↓
-  静态代价排序 或 真机实测
-        ↓
-  选出完整 winner
+
+显式 `@wide/@matrix/@transfer` 是硬约束，不参与 engine 选择。persistent derived Encoding 的 byte layout 也不是结构选择；它已经由作者和 ABI 固定。
+
+结构性选择使用 target 提供的确定规则和固定优先级。规则可以读取 typed use-def、producer/consumers、Encoding mapping、target legality、live values 与资源上限，并选取第一个合法结构。
+
+Weft 不建立静态 cost model，不生成多个合法结构后用估计或真机运行比较性能。较低优先级结构只在较高优先级结构不合法时使用，不能因为“可能更快”成为隐式备用路径。结构一旦产生，后续 pass 与 emitter 只消费它。
+
+## 5.5 参数性选择
+
+结构固定后，下面参数可以拥有多个有限合法绑定：
+
+```text
+value/op            LMUL、physical lane factor、schema内physical microtile extent
+Level/cluster       unroll、pipeline depth、buffer count
+memory edge         prefetch distance
 ```
 
-候选之间可以具有不同 std 特化、`auto` 参数和 target-local physical config；候选内部不回退重选。因而“树不可改”的准确含义仍是：
+target profile 声明有限参数域；构建期 tuner 为当前 target/shape 编译并实测这些绑定。每个绑定完整经过 legality、resource check 与 emission；非法绑定在运行前拒绝。tuner 不生成新结构，不改变结构优先级，也不让一个非法实现变合法。
 
-> **对每一个已实例化的候选而言，树不可改。**
-> 资源检查只能接受或拒绝这个候选，不能把它改成另一棵树。
+source `auto` 与此不同。它由作者/std 声明，可能实例化不同 cohort、Level extent 或其它 source tree；target 不发明其值域。构建工具可以同时测 source `auto` 与 physical parameter，但必须保存二者的不同 authority。
 
-**编译器仍然不发明树** —— source candidate 来自库中人写好的特化和 `auto` 的取值范围，不来自结构搜索。
+## 5.6 编译流程
 
-## 5.5 可改与不可改
+```text
+按类型与显式 config 选定 std overload
+        ↓
+绑定一组作者声明的 source auto 参数
+        ↓
+Canonical Verify
+        ↓
+唯一合法推导：axes / Encoding / typed/effect facts
+        ↓
+确定结构选择：representation / memory / pack / local op / cluster
+        ↓
+实例化有限 physical parameters
+        ↓
+对每组参数建立完整 physical program并做resource check
+        ↓
+真机实测合法参数绑定，选择 winner
+        ↓
+机械 emission：intrinsic C / local asm
+```
+
+没有全局带回边求解器，也没有结构 tournament：
+
+- 唯一事实在它所属的实体上产生一次；
+- 结构 pass 按固定规则选择一次，不在 emitter 中重选；
+- layout conflict 形成显式 conversion；
+- physical parameter binding 资源不足则 spill（若结构明确允许）或判非法；
+- 所有绑定都非法时，当前 source candidate unsupported；
+- target lowering 不修改作者 tree，也不转去另一个 std overload。
+
+## 5.7 瞬态实体归属
+
+一次 target lowering 内，物理事实归属于具体实体：
+
+```text
+value              representation / axes mapping / SEW / LMUL / vl / spill
+value-use edge     conversion / broadcast / handoff / rematerialization
+op                 selected local realization / physical partial / fragment
+memory edge        Encoding mapping / load form / stride / alignment / unpack
+Level/cluster      time mapping / tail / unroll / pipeline / buffers / prefetch
+target profile     ISA / ABI / VLEN / engines / resources / priorities / parameter domains
+```
+
+链的一端是 pinned memory Encoding，另一端是 selected target operation operand/result contract。内部 conversion、local pack、spill 和 pipeline temporary 不成为 canonical values 或跨调用 artifact。
+
+## 5.8 可改与不可改
 
 ```
 可以改：
@@ -833,7 +856,7 @@ target facts       ISA / ABI / VLEN / extensions / global resource budget
 
 例：把与 sub index 无关的地址加法提出去 —— 可以（数值树没变）。把 `w.d * i32_acc` 下沉到 sub 层 —— 不可以（转换、舍入位置、中间类型全变）。
 
-## 5.6 Pass 契约、Verifier 与 emitter
+## 5.9 Verifier 与 emitter
 
 每个 physicalization pass 必须声明：
 
@@ -843,7 +866,7 @@ target facts       ISA / ABI / VLEN / extensions / global resource budget
 缺失或冲突时插入什么 convert，或返回什么 unsupported
 ```
 
-同一决定只有一个 producer。后面的 pass 只消费，不重新推导。
+同一决定只有一个 producer。后面的 pass 只消费，不重新推导或重新选择。
 
 **需要**（结构与类型）：
 
@@ -873,9 +896,9 @@ storage bytes 或从中解出的离散字段，允许逐字节一致；浮点 ke
 检查与明确的绝对/相对误差容差，不要求 bit-exact。不同合法的乘加结合与 contraction
 可以产生末位差异，不能为了复刻 reference 的舍入位置而改作者数值树或阻断合法指令融合。
 
-Emitter 是最后一个 pass。它只读 selected value/op/memory-edge/Level attributes，负责普通 C、RVV intrinsic、ABI 和 typed local asm 拼写。Emitter 缺信息必须回报前序 pass 契约缺口；不得扫描 source closure、根据 dtype/shape/VLEN/格式名补选结构，也不得写回任何 physical attribute。
+Emitter 是最后一个 pass。它只读 selected physical values、conversions、operations、memory edges、local storage、clusters 与 parameters，负责普通 C、RVV intrinsic、ABI 和 typed local asm 拼写。Emitter 缺信息必须回报前序 pass 契约缺口；不得扫描 source closure、根据 dtype/shape/VLEN/格式名补选结构，也不得写回任何 physical fact。
 
-## 5.7 编译器绝不做的四件事
+## 5.10 编译器绝不做的四件事
 
 ```
 发现 q4_K 的分配律
@@ -888,7 +911,7 @@ Emitter 是最后一个 pass。它只读 selected value/op/memory-edge/Level att
 
 > **Weft 不替你想出算法改写；它让你把想出来的那个写下来一次，并把"换一个写法"的代价从两天降到一行。**
 
-## 5.8 输出
+## 5.11 输出
 
 生成 intrinsic C（`__riscv_v*` / IME intrinsic），不生成 IR 交给 LLVM 做向量化。理由：向量形态已经由 Weft passes 明确决定，不能再交给系统编译器重新猜。
 
@@ -931,31 +954,31 @@ i32_acc += reduce(widen(p16, i32)) * w.sc[s]
 
 Weft 里：
 
-- **展开式拆 nibble 用 and/shift 还是 gather** —— 逻辑值集合没变，**同一份源程序的两个表示解**，编译器解。
+- **展开式拆 nibble 用 and/shift 还是 gather** —— 逻辑值集合没变，是 target 的结构性选择；编译器按固定 legality 规则与优先级决定，作者不写，也不把两种结构交给 tuner 竞赛。
 - **成对 mac 换成四路 mac** —— 逻辑值集合变了（i16 partial 的数量和覆盖范围变了），**是另一棵树，但作者只改一行**：`mac_pairs(...)` → `mac_groups(..., n=4)`，该候选重新走完整 physicalization pass 序列。
 
 > **收益不是编译器替你找到最好的结构，而是让"换一个结构"的代价从两天降到一行。**
 
-这个主张不需要编译器有任何超人能力，只需要实体级 physicalization pass 与候选枚举做对。
+同时，作者不再手写同一棵树内部的 layout、pack shape、register/fragment mapping、memory form 和 pipeline。这个主张要求编译器拥有真实的物理抽象机器、typed physical program 与编译算法，不能只把固定 emitter 分支包装成 pass。
 
 ## 6.4 VLEN 无关与双引擎
 
-- **VLEN** 是 target fact。同一份分解在 VLEN 128 与 256 的候选流水中产生不同的 LMUL、cohort 物理分组与 unroll。**不写两份。**
-- **IME** 不是"另一个后端"，是同一台机器上的另一个引擎。同一份数值分解，在 `@wide` 树和 `@matrix` 树之间选 —— 两棵树共享 A 组的全部 6 项，只在 B 组和 engine 标注上不同。
+- **VLEN** 是 target fact。同一份分解在 VLEN 128 与 256 上经 target rules 与 physical parameter tuning 产生不同的 LMUL、cohort 物理分组与 unroll。**不写两份。**
+- **IME** 不是"另一个后端"，是同一台机器上的另一个引擎。库/调用配置可以选择 `@wide` 树或 `@matrix` 树；两棵作者程序可以共享数值分解，只在数据供应与 engine 标注上不同。target 不把显式 `@wide` 偷换成 IME。
 
-## 6.5 抽象是否正确的纸面检验
+## 6.5 抽象的外部检验
 
-不需要机器就能判：
+不能靠职责表或 pass 名称自证。要用结构不同的 source、consumer 与 target 实际检验：
 
-> **改 A/B 组的任意一项，C/D 组是否需要人重新介入？**
+> **改作者树的任意一项，target 物理表示是否仍能在不手写 LMUL、pack shape、layout、memory form 或 pipeline 的前提下重新形成？**
 
-| 改动 | C/D 组 | 人要管吗 |
+| 改动 | target physical program | 人要管吗 |
 |---|---|---|
 | cohort 16 → 8 | LMUL、寄存器分组、交错全变 | 不用 |
-| mac 2 元素 → 4 元素 | 20/21/23/17/11/12 全变 | 不用 |
+| mac 2 元素 → 4 元素 | unpack、instruction、partial、SEW/LMUL 与 memory mapping 全变 | 不用 |
 | 加一条新支路 | 多一组值要排 | 不用 |
 
-**三条都成立 → 抽象对。任何一条里人还得回去调 LMUL → A/B 与 C/D 没真分开 → 抽象假。**
+这不是纸面自证。必须用结构不同的 source、consumer 与 target 实际编译：若作者仍要回去手调 LMUL、物理 pack 或 fragment，说明 source tree 与 physical machine 没有真正分开。
 
 ---
 
@@ -969,10 +992,10 @@ Weft 里：
 根抽象（层级数值 realization）                   不变
 语言词汇（level / new / materialize / admit /
           commit / encoding / engine role）      不变
-数值分解的主体（A 组 6 项）                       基本不变
-数据供应结构（B 组）                              大部分不变
+数值分解的主体                                    基本不变
+数据供应结构                                      大部分不变
 引擎边界与物化位置                                变
-物理表示、指令、资源、流水                         全变（编译器解）
+target profile、物理表示、指令、资源、流水          全变
 ```
 
 **"接新硬件源程序一个字不改"是错的。** 正确的说法：
@@ -981,11 +1004,18 @@ Weft 里：
 
 一台把 decode 和 matmul 放在两个物理单元上的机器，本来就该有不同的树。要求树跨机器不变，等于要求性能跨机器不变。
 
-## 7.2 与 TileLang-Ascend 的对照
+## 7.2 与 TileLang 的机制对照
 
-TileLang 为支持 Ascend，往**源语言**里加了：Cube/Vector 执行域、UB/L1/L0 存储关键字、跨引擎 handoff、隐藏 workspace、同步原语、重定义 `T.Parallel`。**GPU 的 TileLang 程序和 Ascend 的 TileLang 程序不是同一门语言的两个程序。**
+TileLang source 明确暴露 launch/thread binding、shared/local/fragment allocation、copy instruction preference、pipeline stage/order 和 layout。具体位置包括：
 
-Weft 的做法：
+- `ref/tilelang/tilelang/language/kernel.py:149`：block/thread indices 与 launch frame；
+- `ref/tilelang/tilelang/language/allocate.py:1`：shared/local/fragment/global scope；
+- `ref/tilelang/tilelang/language/copy_op.py:54`：copy/TMA/cp.async preference；
+- `ref/tilelang/tilelang/language/loop.py:13`：parallel layout 与 software-pipeline metadata。
+
+TileLang compiler 仍通过 `ref/tilelang/src/transform/layout_inference/layout_inference.cc:92`、`ref/tilelang/src/transform/pipeline_planning.cc:36` 与 `ref/tilelang/src/transform/lower_tile_op.cc:43` 推导 layout、分析 pipeline 并 lower tile operation。在所参考版本中，CPU pipeline 将 thread binding 串行化，CPU GEMM lowering 选择 `cpu.scalar`；见 `ref/tilelang/tilelang/cpu/pipeline.py:15` 与 `ref/tilelang/src/cpu/op/gemm.cc:21`。
+
+Weft 不复用这些 source-level storage/thread constructs，而用同一门语言写目标相关的程序树：
 
 ```python
 # RVV：decode 与 contract 交错
@@ -999,20 +1029,23 @@ with L.blocks(...) as kb:
     acc  += contract(handoff(panel), x) @ matrix
 ```
 
-同一门语言、同一套 level 规则、四个抽象角色 + 两个动词。存储层级不在源语言里 —— 它是目标贡献的表示格点。
-
-> **它们改语言，我们改程序。**
+同一门语言、同一套 Level 规则、四个抽象角色与 Encoding。存储层级、fragment 和 physical pipeline 不进入源程序；它们属于 target profile 与物理抽象机器。目标若需要不同 engine boundary、materialization 或 persistent artifact，作者写同一语言中的另一棵程序，而不是让 backend 偷改现有树。
 
 ## 7.3 目标贡献什么
 
-```
-representation      可用的表示格点与合法转换
-engine binding      哪些 op 能落到哪个角色
-handoff / transfer  跨引擎交接的代价与同步要求
-schedule 约束       流水深度、issue 限制、资源方程
+```text
+ISA / ABI / VLEN
+engine roles、可实现的 canonical ops 与 operand/result contracts
+time / lane / register-replica / fragment / local-storage representations
+合法 conversions、memory forms、mask/tail 与 alignment
+register、fragment、temporary、buffer 与 local-storage resources
+transfer、wait、barrier、issue 与 ordering constraints
+固定 structural rules 与 priorities
+有限 physical parameter domains
+intrinsic / local asm availability
 ```
 
-不只是"加几个存储类型"。
+target profile 不只是“加几个存储类型”，也不能按 kernel 或格式名提供 whole-kernel route。它改变物理表示和规则，不改变 canonical tree、engine-role 硬约束或 pinned bytes。
 
 ## 7.4 关于 TPU 一类的诚实评估
 
@@ -1030,11 +1063,12 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 语言贡献：   层级化、encoding-aware 的有限位宽数值实现
              —— 对 GPU 也成立，不是非 SIMT 专属
 
-编译器贡献： 面向单控制器 vector/matrix 机器的实体级物理化 pass
+编译器贡献： 面向单控制器 vector/matrix 机器的物理抽象机器、
+             typed physical program 与实体级编译算法
              —— 这才是非 SIMT 的部分
 ```
 
-**语言不必"原生非 SIMT"，它只需要不携带 SIMT 包袱。** Triton 的问题不是它能表达 tile，是 layout 系统围绕 ownership 建模，搬到单控制器机器上必须先拆掉再重新恢复。Weft 的层不携带 ownership，所以不需要被拆 —— 这就够了。
+**语言不必"原生非 SIMT"，它只需要不携带 SIMT ownership。** 非 SIMT 的正面定义是：logical Value 不属于虚拟 thread；编译器把完整值沿 issue/time、lane、register replica、extension fragment 与 local storage 作物理分解。只说“没有线程”不够，完整合同见 `doc/machine/physical-machine.md`。
 
 ---
 
@@ -1044,10 +1078,10 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 |---|---|---|---|
 | Intent | 逻辑域 + 原子 contract | 否 | — |
 | Halide / TVM / Exo | 算法 + 保数值的 schedule | 否（改数值即换 algorithm） | schedule |
-| Triton | 带 ownership 的静态 tile | 否（layout 无编码维度） | 后端重新恢复被抹掉的结构 |
-| TileLang | 存储层级 + copy/gemm | 否（一等结构是 buffer/copy） | **改抽象机器** |
+| Triton | program grid + block tensor；TTGIR distributed encoding | 可以手写，但 Encoding/Level 数值树不是根模型的一等结构 | source/meta 改 program/block；compiler 改 layout/MMA/pipeline |
+| TileLang | thread binding + storage scope + copy/tile op | 可以手写，但 Encoding/Level 数值树不是根模型的一等结构 | source 改 storage/thread/copy structure；compiler 做 layout/tile lowering |
 | intrinsic | 全部手写 | — | **全部重写** |
-| **Weft** | **层级数值 realization** | **是** | **程序的引擎边界；语言不变** |
+| **Weft** | **层级数值 realization + 非 SIMT 物理机器** | **是** | **作者改数值/Level/ABI；target 改表示、结构规则与参数** |
 
 **论证方式：** 不依赖"别人写不出来"，而依赖 —— **别人能写，但无法在其根模型中自然保存、组合并重新物理化这些信息。**
 
@@ -1073,19 +1107,22 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **9.** **只有一个层级、一门语言。** 标准库是用同一门语言写的普通函数，inline 展开，无黑盒，无特权原语，无第二类用户。
 
-**10.** "树不可改"是对每个已实例化的候选而言；候选在最外层枚举，每个候选独立走完整前向 pass 序列，资源检查只接受或拒绝。
+**10.** 编译器决定分三类：唯一合法推导、固定规则与优先级完成的结构性选择、构建期实测完成的参数性选择。Weft 不使用静态 cost model，也不生成多个物理结构后竞赛。
 
-**11.** 语言贡献与编译器贡献分开主张。
+**11.** 非 SIMT 的正面机器模型是 logical Value 到 issue/time、lane、register replica、extension fragment 与 local storage 的可组合表示关系；不是“没有线程”这一句否定定义。
+
+**12.** 语言贡献与编译器贡献分开主张。
 
 ---
 
 # 附录 A · 未闭合问题
 
-1. **多引擎流水的表达。** `materialize` + `handoff` 够不够表达双缓冲式的跨引擎 overlap，还是需要第三个动词。
-2. **tail 语义。** level 的 partition 在非整除域上如何定义，尤其是 cohort 宽度除不尽时。
-3. **bit_planes 的公开表面。** 全格式调查已证明它是重复出现的纯布局关系；在没有真实 lowering 消费者前不暴露半成品接口。
-4. **代价模型。** 静态排序候选需要什么粒度的机器模型；什么时候必须落到真机实测。
-5. **Intent → Weft 的生成路径。** 当前设计不依赖它；Weft 独立成立。
+1. **跨 engine 异步流水。** `materialize + handoff` 是否足以表达 source-visible synchronization 与双缓冲 overlap；若同步改变可观察程序，可能需要新的 source语义。
+2. **fragment 的部分 spill 与 handoff。** opaque fragment 能否局部拆分、怎样保持 source Value identity、哪些 reduction 必须在 fragment 内闭合。
+3. **local storage 的跨 engine ordering。** 不同 engine 共享 local object 时的 alias、coherence、wait/barrier合同。
+4. **动态 loop 与 tail 的 physical time identity。** pipeline version、dynamic trip count、tail mask 与 source Level instance 的完整对应规则。
+5. **bit_planes 的公开表面。** 全格式调查已证明它是重复出现的纯布局关系；在没有真实 lowering 消费者前不暴露半成品接口。
+6. **Intent → Weft 的生成路径。** 当前设计不依赖它；Weft 独立成立。
 
 # 附录 B · 已排除的候选（防重走）
 
@@ -1103,4 +1140,6 @@ Kernel Program + Local Realization Program 两份用户程序
 Level 上的 ordered 属性
 闭合原语作为特权层（"普通用户 vs 库作者"两个层级）
 全局 C/D dictionary、arc propagation 与 DFS 回溯求解器
+静态 cost model 作为结构选择权威
+生成多个合法物理结构后静态排序或真机竞赛
 ```

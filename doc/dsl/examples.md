@@ -1,6 +1,6 @@
 # DSL 示例
 
-这些示例展示作者树的语义边界。它们不规定目标 LMUL、register tile、fragment、load form或pipeline。为突出关系，片段省略 import、decorator 与函数签名中可由上下文确定的静态符号声明；未定义的大写符号均为静态 shape/参数，不是运行时隐式变量。
+这些示例展示作者树的语义边界。它们不规定目标 LMUL、physical microtile、pack schema/extent、fragment、load form或pipeline。为突出关系，片段省略 import、decorator 与函数签名中可由上下文确定的静态符号声明；未定义的大写符号均为静态 shape/参数，不是运行时隐式变量。
 
 ## 1. Q4_K × Q8_K multi-output vec-dot
 
@@ -139,6 +139,8 @@ def mul_mat(
 ### 2.1 KC 不能省略
 
 `Bp` 在 KC 层诞生，作用域是 `KC × NC`，被该 KC 下所有 MC 复用。没有 KC 层时，无法仅靠注释表达 panel size、物化频率和C的分段累加。
+
+`along="k"` 规定 K 是 local pack 的连续供应方向；它不固定 vector window、register tuple、fragment operand 或 local-storage tile 的具体形状。后者由 target compiler 根据 A、B operands 的 producer mapping、所有 consumer、资源与 engine role 选择。
 
 ### 2.2 Accumulator 作用域是数值决策
 

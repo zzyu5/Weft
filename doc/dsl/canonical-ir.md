@@ -20,7 +20,8 @@ Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它�
 - field storage span；
 - grouped/layered/bit-plane/joined mapping；
 - View/Slice 的 logical shape 和 axis identities；
-- derive builder、pack/interleave和pinned artifact layout identity。
+- derive builder、persistent interleave 与 pinned artifact layout identity；
+- invocation-local `pack` 的 source presence、`along`、logical result、Level 和 engine role。
 
 ### 1.3 Logical Value
 
@@ -65,6 +66,7 @@ Canonical Kernel IR 不包含：
 - selected RVV/IME instruction；
 - unit/strided/indexed/segment memory form；
 - primitive-private unpack/packing实现；
+- invocation-local `pack` 的 physical schema 与 parameterized extents；
 - physical layout conversion；
 - unroll、prefetch、local pipeline和buffer version；
 - live interval、spill、reload、rematerialization；
@@ -127,6 +129,6 @@ engine role
 effects
 ```
 
-并为每个已实例化std/auto candidate形成一份target physical program。若物理实现需要改变canonical values、Level归属、artifact ABI或numerical operation，它不能在target lowering中完成；必须返回到作者tree或另一个stdoverload。
+并为每个已实例化std/auto candidate形成一份target physical program。唯一合法事实必须从这些输入唯一推导；存在多个合法物理结构时，target按固定规则和优先级选择；结构固定后的有限物理参数可以由构建期实测选择。若物理实现需要改变canonical values、Level归属、artifact ABI或numerical operation，它不能在target lowering中完成；必须返回到作者tree或另一个stdoverload。
 
 canonical IR本身不承担目标物理candidate的持久authority。一个candidate被拒绝或替换，不得修改源程序语义。

@@ -39,7 +39,7 @@ acc = new(f32, [MR, NR], init=0)
 Bp = materialize(pack(B[kc, nc], along="k")) @ transfer
 ```
 
-`materialize` 在当前逻辑作用域形成一次 staged value，后代只读复用；位于 Level 中时，它是该 Level 的 `births.staged`。它不表示某个具体 cache、栈、vector register 或 shared memory；它规定的是逻辑物化次数和生命周期。
+`materialize` 在当前逻辑作用域形成一次 staged Value，后代只读复用；位于 Level 中时，它是该 Level 的 `births.staged`。staged Value 的 element type、logical shape、axes 与 Level 归属进入 canonical IR；它不表示某个具体 cache、栈、vector register、fragment 或 shared memory。若表达式是 `pack`，作者给出 pack 的存在、`along`、Level 和 role，target compiler 决定不改变这些 canonical facts 的物理目标形状。
 
 ### 2.3 `admit`
 

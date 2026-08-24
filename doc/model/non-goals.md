@@ -101,6 +101,18 @@ GEMM/GEMV/quantized MUL_MAT不是opaque language op。它们由同语言std函�
 
 SEW/LMUL属于value，instruction属于op，memory form属于memory edge，pipeline属于Level/local cluster。它们不是kernel-global C/D字典。
 
-pass根据实体的typed use推导；冲突用显式physical conversion表示；资源不足时spill或拒绝当前candidate。编译器不通过带回边的全局solver修改作者tree。
+唯一事实由实体的typed use推导；存在多个合法物理实现时，target按固定规则与优先级作结构选择；物理参数由有限实测调优选择。冲突用显式physical conversion表示；资源不足时spill或拒绝当前candidate。编译器不通过带回边的全局solver修改作者tree。
 
 这条属于语言与target compiler的职责边界；具体physical IR和pass结构不在本部分定义。
+
+## 14. 静态 cost model
+
+Weft 不为结构性选择建立预测执行时间、带宽、cache 命中或综合得分的静态 cost model。当前目标的机器行为、编译器和 runtime 还不足以让这类模型成为可靠的规范组成部分；把未经验证的估计写成公共选择权威只会隐藏硬编码。
+
+结构性选择由 target 的确定规则和固定优先级完成。规则可以读取 typed use-def、Encoding mapping、target legality 和资源上限，但不能用一个预测分数比较两个都合法的结构。
+
+## 15. 编译器生成结构后竞赛
+
+目标编译器不为同一个 source candidate 生成多种 lane/register/fragment、memory、pack 或 pipeline 结构，再通过静态排序或真机运行挑 winner。这样做会把编译时间、实现复杂度和结果可解释性绑定到无限增长的结构空间。
+
+允许实测的只有有限参数绑定：作者显式声明的 source `auto`，以及 target 为已经固定的物理结构声明的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth 和 buffer count 等参数。tuner 不生成新的结构，也不改变结构优先级。

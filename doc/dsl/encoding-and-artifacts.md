@@ -204,7 +204,7 @@ invocation phase
 - 跨调用生命周期；
 - 可与哪些 target artifact 兼容。
 
-一旦调用方传入某个 derived instance，kernel lowering 不得改选另一 byte interleave。kernel 内部也可以 `materialize(pack(...))` 建立短生命周期 local pack；那是另一份作者程序，成本计入每次 invocation。
+一旦调用方传入某个 derived instance，kernel lowering 不得改选另一 byte interleave。kernel 内部也可以 `materialize(pack(...))` 建立短生命周期 local pack；pack 的存在、`along`、Level 与物化次数属于作者程序，成本计入每次 invocation，但它的物理目标形状由 target compiler 决定。local pack 不形成跨调用可见的 Encoding identity。
 
 ## 7. Storage ownership 与 lifetime
 

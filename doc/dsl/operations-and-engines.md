@@ -20,7 +20,7 @@ gemv(Q4K_I[16], Q8_K)                  # packed wide tree
 gemv(Q4K_I[16], Q8_K, engine=matrix)   # matrix-role tree
 ```
 
-这些候选都由人写。前端根据类型、显式 config 和 overload 规则选中或枚举；编译器不会从普通 multiply/add 图发明另一棵 std tree。
+这些实现都由人写。前端根据类型、显式 config 和 overload 规则选中；若实现公开了 source `auto` 参数，构建过程只枚举作者声明的有限参数绑定。编译器不会从普通 multiply/add 图发明另一棵 std tree，也不会生成多棵结构后竞赛。
 
 ## 2. 没有内置 GEMM
 
@@ -54,7 +54,7 @@ with L.tiles(N, extent=auto("NC")) as nc:
 with L.rows(mc, group=auto("MR")) as mb:
 ```
 
-`auto` 声明一个由构建/调优过程实例化的源参数。它不是“允许后端随便修改”的 permission bit。
+`auto` 声明一个由构建/调优过程实例化的源参数。它不是“允许后端随便修改”的 permission bit，也不是 target 结构搜索入口。
 
 `auto("MR")` 在包含它的 std/kernel 函数中引入同名静态符号 `MR`；同一作用域内重复出现的同名 `auto` 必须绑定同一个值。每个名字都必须由 std overload 或显式 build config 给出非空、有限的合法值域；缺少值域或跨作用域重名歧义是前端错误。
 
@@ -71,7 +71,9 @@ NC=64, KC=256, MR=4, NR=16
 - 资源不足时 spill 或拒绝；
 - 不回头修改 `MR/NR/KC`。
 
-调优器可以枚举作者为 `auto` 声明的有限取值并实测完整 candidate。合法取值域由 std overload 或显式 build config 提供，不由 target pass 根据 kernel shape 发明。它不搜索未声明的 Level topology。
+调优器可以枚举作者为 `auto` 声明的有限取值并实测完整 candidate。合法取值域由 std overload 或显式 build config 提供，不由 target pass 根据 kernel shape 发明。它不搜索未声明的 Level topology，也不与 target compiler 自己生成的其它结构比较。
+
+target lowering 还可以为已经确定的物理结构公开另一组 finite physical parameters，例如 LMUL、schema 内 physical microtile extent、unroll、pipeline depth 和 buffer count。它们不进入 DSL 或 canonical IR；构建期 tuner 可以实测这些参数绑定。source `auto` 与 physical parameters 可以由同一工具测量，但前者实例化作者程序，后者只实例化同一 source tree 的机器表示。
 
 ## 4. 基本 op 的要求
 
@@ -182,9 +184,11 @@ indices = iota(8, dtype=u32)
 values = lookup(codebook, base + indices)
 ```
 
-`lookup` 接收只读 table/View 与 unsigned logical indices，结果继承 index Value 的 shape和axes。
+`lookup` 接收只读 table/View 与 unsigned logical indices。对每个 index logical coordinate，operation 读取对应 table entry；结果的 shape 和 axes 必须与 indices 完全相同，table entry axis 被索引消去，不会凭字段名进入 result。越界 policy、mask 与 fill 必须由 operation 调用显式给出，不能由 target 猜测。
 
 八个独立 scalar lookup 不等于一个 `[8]` lookup。目标编译器只能为显式 shaped index选择 unit/indexed/gather或专用 table realization。
+
+例如 indices 是 `[M,G]`，则 lookup result 也是 `[M,G]`；后续沿 G reduce 得到 `[M]`。target可以把 G 映射到 lane、把 M 映射到 register replica，但不能消掉 M，也不能把八个独立 scalar lookup 恢复成 G axis。
 
 ## 9. Pack 与 interleave
 
@@ -192,7 +196,16 @@ values = lookup(codebook, base + indices)
 pack(view, along="k")
 ```
 
-在 invocation 内建立 ephemeral Encoding 的逻辑重排请求；result domain 与源 View对应。其可观察生命周期由外层 `materialize` 和 Level 归属决定，可以供该 Level 的多个后代 operation 复用，但不能越过 pin boundary。具体 register/cache/stack representation 不进入 DSL。
+在 invocation 内建立 ephemeral pack 请求；result 的 logical values、shape 与 axes 和源 View 对应。作者决定：
+
+- 是否建立 pack；
+- `along` 指定哪条 logical axis 应成为局部连续供应方向；
+- pack 所在的 Level、物化次数和可见 lifetime；
+- 包围该 operation 的 engine role。
+
+作者不规定 physical pack schema 或 schema 内 extents。target compiler 根据 `along`、producer storage mapping、所有 consumer representation、widening、decode/compute fusion、pipeline buffer、资源和跨 engine handoff，按 target 的固定规则与优先级选择 schema；tuner只实例化 schema 内有限数值参数。该表示可以形成 vector window、register tuple、fragment operand 或 invocation-local storage，但不能改变 logical shape、Level 归属或 pin ABI。
+
+`materialize(pack(...))` 可以供声明 Level 的多个后代 operation 复用，不能越过 pin boundary。具体 register/cache/stack representation 不进入 DSL。
 
 ```python
 interleave(view, rows=16)
@@ -245,7 +258,7 @@ role 不是 hint：
 acc += contract(panel, activation, over="k", acc=i32) @ matrix
 ```
 
-调用者通过参数类型、derived encoding和显式engine config选择这棵tree。目标编译器为 `matrix` role选择IME fragment、local pack、指令与handoff；若operand/layout不满足，candidate失败。
+调用者通过参数类型、derived encoding和显式engine config选择这棵tree。目标编译器在 `matrix` role 内选择IME fragment、local pack、指令与handoff；若operand/layout不满足，candidate失败。只有未绑定 role 且 operation 本身同时允许多个 role 时，target 才可以按固定结构优先级在 wide 与 matrix realization 之间选择。
 
 同名的 `@wide` tree与`@matrix` tree是两个作者程序，不是后端把一个role自动换成另一个。
 

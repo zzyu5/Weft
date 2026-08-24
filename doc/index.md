@@ -1,8 +1,8 @@
-# Weft 编程模型与 DSL 规范
+# Weft 编程模型、DSL 与物理机器规范
 
-Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下一个确定的、层级化的有限位宽数值程序；目标编译器为这份程序决定物理表示、局部指令和执行形态。本目录是编程模型与 DSL 的规范性定义；目标 physical IR 与 pass 结构不在本部分定义。
+Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下一个确定的、层级化的有限位宽数值程序；目标编译器在非 SIMT 物理抽象机器上为这份程序决定表示、局部指令和执行形态。本目录定义编程模型、DSL 与目标物理机器；physical IR 的 dialect、op、type 和 pass 结构不在本部分定义。
 
-目录只有两个层次：
+目录只有三个层次：
 
 ## `model/`
 
@@ -16,5 +16,9 @@ Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下�
 - [Operation 与 Engine Role](dsl/operations-and-engines.md)：标准库、`auto`、基本 operation、显式逻辑轴和 engine 约束。
 - [DSL 示例](dsl/examples.md)：Q4_K vec-dot、blocked MUL_MAT、GEMV、online attention 和 Top-K。
 - [Canonical Kernel IR](dsl/canonical-ir.md)：语言事实必须保存什么，以及不得包含什么物理信息。
+
+## `machine/`
+
+- [非 SIMT 物理抽象机器](machine/physical-machine.md)：逻辑值怎样沿时间、lane、寄存器副本、extension fragment 与局部存储形成物理表示，以及 target profile 必须提供什么。
 
 本文档不规定某个目标后端怎样组织 physical IR，也不记录实现进度、性能结果或迁移过程。
