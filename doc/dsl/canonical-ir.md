@@ -2,7 +2,7 @@
 
 Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它保存作者写下的树，供任何目标后端读取；它不保存某次 target lowering 的机器表示。
 
-本文只规定 canonical 边界。两层 lowering 与 target-aware physical IR 见[编译主干](../compiler.md)。
+本文只规定 canonical 边界。两层 lowering 见[编译器总览](../compiler/index.md)，target-aware 表示见[RISC-V Physical IR](../compiler/riscv-ir.md)。
 
 ## 1. 必须承载的内容
 

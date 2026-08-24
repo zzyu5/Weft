@@ -1,0 +1,96 @@
+# 实验与 Baseline
+
+## 1. 实验服务于编译器
+
+Weft 的目标是建立语言和编译器：
+
+```text
+作者写出确定的数值与实现树
+    ↓
+编译器生成 target-aware RISC-V program
+    ↓
+intrinsic C / local asm
+```
+
+实验用于检验：程序是否生成数值正确的真实target artifact；编译器是否形成高质量机器实现；相同语言事实换format、shape、consumer、VLEN或extension后是否仍成立。
+
+实验可以否定语言或编译器假设，但不能成为隐藏语言。不能因为某行CSV慢，就增加kernel/format route、whole-kernel leaf、emitter matcher或fallback。
+
+## 2. Baseline 的双重作用
+
+### 2.1 决定作者比较哪一种实现
+
+`source/`中的GGML/llama.cpp baseline既是性能参照，也是作者编写对应DSL/std函数时的真实算法实现参照。为了比较同一种实现，作者必须先确认并自然表达：
+
+- algorithm variant与数值分解；
+- outer traversal、loop order与blocking；
+- staging、workspace与跨loop reuse；
+- accumulator/state的诞生层和更新方式；
+- persistent repack、derived Encoding与ABI；
+- activation quantize、decode、prefill等phase；
+- preprocessing与timed region边界。
+
+若baseline的高性能依赖这些结构，而DSL没有写出，修改DSL/std tree；不能让target compiler从普通SSA猜回blocking、staging或persistent packing。若DSL无法表达，这是语言缺口，不能换更容易的baseline或缩小workload。
+
+### 2.2 不决定 target physical realization
+
+作者树冻结后，baseline不能指定LMUL、`vl`、lane/register/fragment mapping、memory form、invocation-local pack schema、RVV/IME leaf、pipeline、spill或intrinsic spelling。这些由RISC-V passes与[leaf contracts](../compiler/leaves.md)决定。
+
+可以阅读baseline或`materials/`理解microkernel、reuse和指令组织，但知识必须分别进入DSL tree、physical compiler或local leaf；baseline函数本身不得调用、链接、包装或成为fallback。
+
+### 2.3 不参与编译选择
+
+GGML吞吐不参与leaf selection或physical-parameter tuner。tuner只在编译器自己生成并验证合法的有限参数绑定之间实测；baseline在winner生成以后评价最终artifact。
+
+## 3. 可比较 Case
+
+只有下列内容全部一致时才可计算Weft/baseline比值：
+
+```text
+target machine
+algorithm variant与数值语义
+operator/helper boundary
+shape、dtype、quant format与layout
+decode/prefill phase
+thread count
+input bytes/data generation policy
+persistent preprocessing与repack归属
+timed region
+system compiler与flags
+correctness policy
+measurement protocol
+```
+
+production `MUL_MAT`、standalone vec-dot、activation quantize和row dequantize是不同case。不能用vec-dot数字代替完整MUL_MAT，也不能把persistent repack排除在一边、计入另一边。
+
+当前production矩阵参照为`N=4096, K=4096`，decode为`M=1`、prefill为`M=128`。vec-dot helper是独立case，参照shape为`M=1, N=14336, K=4096`。改变shape形成新case，不能覆盖旧结果。
+
+具体correctness、toolchain、machines、timing与CSV合同见[测量协议](protocol.md)。
+
+## 4. 性能差距的所有权
+
+按顺序判断：
+
+1. **DSL/std tree：** baseline是否具有当前树未表达的variant、blocking、staging、state或persistent layout；
+2. **Canonical IR：** axes、Encoding、Level、effects与numerical semantics是否保存；
+3. **RISC-V passes：** layout、conversion、memory、reuse、pipeline与resources是否产生；
+4. **Leaf selection：** 是否选择符合typed facts与target capability的RVV/IME op；
+5. **Terminal spelling：** intrinsic/asm是否忠实，Clang是否保留已选physical形态；
+6. **Measurement：** workload、timing、flags与cache状态是否匹配。
+
+第1项不一致时，修改DSL/std并作为新的作者程序重新比较。若tree、Encoding、std与physical passes已经闭合，但达到baseline仍必须改变canonical logical Value集合或Level归属，应停止并报告spec 2.2可能被证伪，不能让compiler暗中改tree。
+
+性能比、分档和聚类只是定位共享能力缺口的工具，不是编译器架构。单条高性能不能证明泛化，平均数也不能代替逐case事实。
+
+## 5. 禁止实验驱动出隐藏语言
+
+不允许：
+
+- 为追一行数字增加kernel名、format名、exact closure或whole-kernel leaf；
+- 通过GGML/materials调用、legacy path或silent scalar fallback通过测试；
+- 数值失败仍记录性能；
+- 为float bit-exact修改作者tree或禁用合法融合；
+- 用更小shape、不同phase、timing scope或helper替换失败case；
+- 将tuner结果、generated-C inspection或compile success冒充真实target性能。
+
+实验回答“当前编译器在明确合同下做得怎样”，不回答“下一条后端特例写在哪里”。

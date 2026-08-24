@@ -896,24 +896,9 @@ VerifyFinalRISCV
 
 ### 5.8.1 Local leaf
 
-local leaf是final RISC-V IR中的target operation，不是完整kernel。它可以是一条RVV intrinsic、一个固定closed RVV sequence，或一个合同闭合的IME/extension fragment operation。leaf只允许隐藏ISA spelling和primitive-private temporaries，不能隐藏source Level、outer traversal、blocking、state、local-pack loop、pipeline、workspace、persistent artifact或kernel ABI。
+local leaf是final RISC-V IR中的合同闭合target operation，不是完整kernel。它只允许隐藏ISA spelling和primitive-private temporaries，不能隐藏Level、outer traversal、blocking、state、pack/pipeline、workspace、persistent artifact或kernel ABI。
 
-每个leaf必须由typed IR和verifier明确声明：
-
-```text
-local numerical/transfer semantics
-typed operands/results、logical axes与physical layouts
-dtype、shape、mask/tail、rounding与overflow
-memory descriptor、alias、effect与order
-fragment、register/local temporaries与resources
-allowed conversions与result handoff
-intrinsic/asm spelling key、headers与toolchain requirement
-asm operands、constraints、clobbers与memory semantics
-```
-
-RVV与IME之间的选择会改变representation、conversion和resources，由`SelectRISCVOperations`与后续physical passes完成；`LowerRISCVComposites`产生最终primitive leaf ops。Terminal translator只按已选leaf的spelling key输出Clang intrinsic或typed asm。仅有API/asm语法差异而机器合同相同的情况属于toolchain adapter；合同不同就是不同physical leaf，不能留给emitter选择。
-
-leaf候选来自target operation definitions与target profile capability，不按kernel、算子family或量化格式注册。无合法leaf时当前physical module明确unsupported，不得调用旧helper、恢复fallback或在emitter中重选。
+RVV与IME选择由physical passes根据typed facts、target profile与固定优先级完成；terminal translator只拼写已选leaf。候选不按kernel、算子family或量化格式注册，无合法leaf时明确unsupported。完整typed合同、RVV/IME边界与toolchain规则见`doc/compiler/leaves.md`。
 
 ## 5.9 瞬态实体归属
 
@@ -1013,7 +998,7 @@ Terminal translator只接收通过final verifier的RISC-V module。它把`func/s
 
 ## 5.13 输出
 
-RISC-V IR terminal translation生成 intrinsic C（`__riscv_v*` / IME intrinsic），不增加LLVM dialect层，也不把未决定的向量形态交给LLVM自动向量化。系统C compiler继续负责最终寄存器分配、机器调度、peephole和机器码生成。
+RISC-V IR terminal translation生成 intrinsic C（`__riscv_v*` / IME intrinsic），不增加LLVM dialect层，也不把未决定的向量形态交给LLVM自动向量化。系统C compiler继续负责最终寄存器分配、机器调度、peephole和机器码生成；完整边界见`doc/compiler/emission.md`。
 
 ## 5.14 实验的地位
 
@@ -1021,7 +1006,7 @@ RISC-V IR terminal translation生成 intrinsic C（`__riscv_v*` / IME intrinsic�
 
 作者树固定后，baseline不参与layout、LMUL、RVV/IME leaf、pipeline或physical-parameter选择，也不能成为backend route。若baseline具有DSL未表达的作者侧结构，修改DSL/std；若树已经一致，再把差距归因到physical pass、leaf、terminal spelling或system compiler。
 
-浮点kernel不要求bit-exact；bit-exact只用于Encoding/storage bytes与离散字段。严格性能比要求同target、算法、shape、phase、layout、preprocessing、timed region、thread count、Clang版本、target flags和测量协议。完整实验定义见`doc/experiments.md`。
+浮点kernel不要求bit-exact；bit-exact只用于Encoding/storage bytes与离散字段。严格性能比要求同target、算法、shape、phase、layout、preprocessing、timed region、thread count、Clang版本、target flags和测量协议。完整实验定义见`doc/experiments/index.md`与`doc/experiments/protocol.md`。
 
 ---
 

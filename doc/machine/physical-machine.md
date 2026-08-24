@@ -4,7 +4,7 @@
 
 Weft 源程序规定 logical values、axes、Level、数值 operation、Encoding、lifetime、handoff 和 effects。目标编译器必须把这些事实实现为一份单控制器机器程序。
 
-本文件定义 lowering 面向的物理抽象机器。它不把物理对象加入 DSL；该机器由唯一的 target-aware RISC-V IR 承载，具体 IR 与 pass 见[编译主干](../compiler.md)。
+本文件定义 lowering 面向的物理抽象机器。它不把物理对象加入 DSL；该机器由唯一的 target-aware [RISC-V IR](../compiler/riscv-ir.md)承载，编译算法见[RISC-V Pass](../compiler/passes.md)。
 
 非 SIMT 的准确含义是：
 
@@ -182,11 +182,7 @@ ISA 通常只给出合法区域，不给出唯一实现。target profile 因此�
 
 ### 6.1 Local leaf
 
-local leaf 是上述 target operation contract 的最终 ISA 落点，不是独立算法层。RVV intrinsic leaf、IME asm leaf 或其它 opaque extension leaf 都必须具有 typed operands/results、layout、mask/tail、memory/effect/order、resource、clobber 与局部 ABI 合同。
-
-leaf 只可封闭一个固定 local primitive 及其 primitive-private temporaries。source Level、outer traversal、blocking、state、local-pack loop、pipeline、workspace、persistent Encoding 和 kernel ABI 必须在 leaf 外的 RISC-V physical program 或 canonical program 中显式存在。
-
-选择 RVV 还是 IME 会改变 representation 与 resource，必须在 physical passes 中完成。terminal spelling 只把已选 leaf 写成当前 toolchain 的 intrinsic 或 typed asm；spelling 不能根据 shape、格式名或 source closure 重新选择 leaf。
+local leaf 是上述 target operation contract 的最终 ISA 落点，不是独立算法层。RVV/IME leaf 的typed合同、选择、opaque边界与失败规则统一定义在[RISC-V Local Leaf](../compiler/leaves.md)；terminal spelling见[Emission](../compiler/emission.md)。
 
 ## 7. Physical conversion
 

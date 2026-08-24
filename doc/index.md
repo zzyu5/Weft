@@ -21,9 +21,17 @@ Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下�
 
 - [非 SIMT 物理抽象机器](machine/physical-machine.md)：逻辑值怎样沿时间、lane、寄存器副本、extension fragment 与局部存储形成物理表示，以及 target profile 必须提供什么。
 
-## 编译主干
+## `compiler/`
 
-- [两层 MLIR 编译主干](compiler.md)：`weft_kernel → weft_riscv → intrinsic C`，RISC-V physical IR、local leaf、pass contracts 与 terminal translation 边界。
-- [实验定义](experiments.md)：baseline 怎样决定作者侧 DSL 实现、正确性与性能协议、两台目标机器和结果记录边界。
+- [编译器总览](compiler/index.md)：两层 MLIR、candidate authority 与完整文档入口。
+- [RISC-V Physical IR](compiler/riscv-ir.md)：physical value、memory、conversion、Level/control 与 final invariants。
+- [编译 Pass](compiler/passes.md)：layout、memory、schedule、resource 与 target-op rewrite。
+- [RISC-V Local Leaf](compiler/leaves.md)：RVV intrinsic、IME/opaque asm 的合同与选择。
+- [Intrinsic C / ASM Emission](compiler/emission.md)：terminal translator 与 system compiler 边界。
+
+## `experiments/`
+
+- [实验与 Baseline](experiments/index.md)：baseline怎样决定作者侧DSL实现、case identity与性能归因。
+- [测量协议](experiments/protocol.md)：correctness、Clang、目标机、timing与CSV合同。
 
 这些文件只描述设计，不记录实现进度、性能结果或迁移过程。
