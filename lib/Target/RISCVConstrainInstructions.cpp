@@ -586,8 +586,6 @@ public:
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef name = *riscv_internal::string(operation, "name");
-        llvm::StringRef engine =
-            riscv_internal::string(operation, "engine").value_or("");
         std::string realization = "structural";
         mlir::DictionaryAttr memoryEdge;
         mlir::DictionaryAttr localOperation;
@@ -636,8 +634,7 @@ public:
           }
         } else if (name == "weft_kernel.mac_pairs" ||
                    name == "weft_kernel.mac_groups") {
-          if ((engine.empty() || engine == "wide") &&
-              targetFlag(problem.getTarget(), "has_widening_integer")) {
+          if (targetFlag(problem.getTarget(), "has_widening_integer")) {
             realization = "rvv.vwmaccsu.typed";
             auto operands = operation.getAs<mlir::ArrayAttr>("operands");
             auto results = operation.getAs<mlir::ArrayAttr>("results");
@@ -715,8 +712,9 @@ public:
             legal = false;
         } else if (name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
                    name == "weft_kernel.outer_contract") {
-          if (engine == "matrix") {
-            auto selected = selectMatrix(problem.getTarget(), operation, values);
+          if (auto selectedMatrix =
+                  selectMatrix(problem.getTarget(), operation, values)) {
+            auto selected = selectedMatrix;
             if (selected) {
               llvm::StringRef identity =
                   riscv_internal::string(*selected, "identity").value_or("");
@@ -790,7 +788,7 @@ public:
               }
             } else
               legal = false;
-          } else if (engine.empty() || engine == "wide") {
+          } else {
             bool selectedOuter = false;
             if (name == "weft_kernel.outer_contract") {
               auto operands = operation.getAs<mlir::ArrayAttr>("operands");
@@ -1115,24 +1113,27 @@ public:
                 }
               }
             }
-          } else {
-            legal = false;
           }
         } else if (name == "weft_kernel.lookup") {
-          if (engine == "scalar")
+          auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          llvm::StringRef indexId =
+              operands && operands.size() == 2
+                  ? mlir::cast<mlir::StringAttr>(operands[1]).getValue()
+                  : llvm::StringRef();
+          auto result =
+              results && results.size() == 1
+                  ? values.find(
+                        mlir::cast<mlir::StringAttr>(results[0]).getValue())
+                  : values.end();
+          llvm::StringRef physical =
+              result == values.end()
+                  ? llvm::StringRef()
+                  : riscv_internal::string(result->second, "physical_kind")
+                        .value_or("");
+          if (!physical.starts_with("rvv")) {
             realization = "scalar.lookup";
-          else if (engine.empty() || engine == "wide") {
-            auto operands = operation.getAs<mlir::ArrayAttr>("operands");
-            auto results = operation.getAs<mlir::ArrayAttr>("results");
-            llvm::StringRef indexId =
-                operands && operands.size() == 2
-                    ? mlir::cast<mlir::StringAttr>(operands[1]).getValue()
-                    : llvm::StringRef();
-            auto result =
-                results && results.size() == 1
-                    ? values.find(
-                          mlir::cast<mlir::StringAttr>(results[0]).getValue())
-                    : values.end();
+          } else {
             int64_t laneAxis =
                 result == values.end()
                     ? 0
@@ -1161,8 +1162,7 @@ public:
             } else {
               legal = false;
             }
-          } else
-            legal = false;
+          }
         } else if (name == "weft_kernel.admit" || name == "weft_kernel.commit") {
           realization = name == "weft_kernel.admit" ? "transfer.rvv.load"
                                                      : "transfer.rvv.store";
@@ -1551,16 +1551,17 @@ public:
         } else if (name == "weft_kernel.level") {
           realization = "logical-level";
         } else if (name == "weft_kernel.materialize") {
-          realization = "stage-once";
           localOperation =
               operation.getAs<mlir::DictionaryAttr>("storage_mapping");
-          if (!localOperation) {
-            illegalDetail =
-                "materialize has no pass-derived storage mapping";
-            legal = false;
+          if (localOperation)
+            realization = "stage-local-storage";
+          else {
+            realization = "retain-local-value";
+            localOperation = riscv_internal::dictionary(
+                builder,
+                {{"storage", builder.getStringAttr("register-or-rematerialized")},
+                 {"decision_owner", builder.getStringAttr("operation")}});
           }
-        } else if (name == "weft_kernel.pack") {
-          realization = "primitive-local-pack";
         }
 
         if (name == "weft_kernel.outer_contract" &&

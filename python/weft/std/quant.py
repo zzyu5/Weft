@@ -13,72 +13,69 @@ from weft.language import (
     i32,
     mac_groups,
     mac_pairs,
-    matrix,
     new,
     reduce,
-    transfer,
-    wide,
     widen,
 )
 
-from .encodings import Q4K_I16, Q8_K
+from .encodings import Q4K_I, Q8_K
 
 
 def q4k_gemv(
-    W: View[Q4K_I16, (M, K)],
+    W: View[Q4K_I[16], (M, K)],
     X: View[Q8_K, (K,)],
     Y: View[f32, (M,)],
 ):
     with L.rows(M, group=16) as mb:
         f32_acc = new(f32, [16], init=0)
         with L.blocks(K, extent=256) as kb:
-            w = admit(W[mb, kb]) @ transfer
-            x = admit(X[kb]) @ transfer
+            w = admit(W[mb, kb])
+            x = admit(X[kb])
             i32_acc = new(i32, [16], init=0)
             with L.subs(extent=32) as s:
-                p16 = mac_pairs(w.q[s], x.q[s], into=i16) @ wide
-                i32_acc += reduce(widen(p16, i32)) * w.sc[s] @ wide
+                p16 = mac_pairs(w.q[s], x.q[s], into=i16)
+                i32_acc += reduce(widen(p16, i32)) * w.sc[s]
             mins = fold2(x.bsum)
-            min_term = dot(w.m, mins) @ wide
-            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term) @ wide
+            min_term = dot(w.m, mins)
+            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
         commit(f32_acc, Y[mb])
 
 
 def q4k_gemv_groups4(
-    W: View[Q4K_I16, (M, K)],
+    W: View[Q4K_I[16], (M, K)],
     X: View[Q8_K, (K,)],
     Y: View[f32, (M,)],
 ):
     with L.rows(M, group=16) as mb:
         f32_acc = new(f32, [16], init=0)
         with L.blocks(K, extent=256) as kb:
-            w = admit(W[mb, kb]) @ transfer
-            x = admit(X[kb]) @ transfer
+            w = admit(W[mb, kb])
+            x = admit(X[kb])
             i32_acc = new(i32, [16], init=0)
             with L.subs(extent=32) as s:
-                p16 = mac_groups(w.q[s], x.q[s], n=4, into=i16) @ wide
-                i32_acc += reduce(widen(p16, i32)) * w.sc[s] @ wide
+                p16 = mac_groups(w.q[s], x.q[s], n=4, into=i16)
+                i32_acc += reduce(widen(p16, i32)) * w.sc[s]
             mins = fold2(x.bsum)
-            min_term = dot(w.m, mins) @ wide
-            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term) @ wide
+            min_term = dot(w.m, mins)
+            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
         commit(f32_acc, Y[mb])
 
 
-def q4k_gemv_ime(
-    W: View[Q4K_I16, (M, K)],
+def q4k_gemv_contract(
+    W: View[Q4K_I[16], (M, K)],
     X: View[Q8_K, (K,)],
     Y: View[f32, (M,)],
 ):
     with L.rows(M, group=16) as mb:
         f32_acc = new(f32, [16], init=0)
         with L.blocks(K, extent=256) as kb:
-            w = admit(W[mb, kb]) @ transfer
-            x = admit(X[kb]) @ transfer
+            w = admit(W[mb, kb])
+            x = admit(X[kb])
             i32_acc = new(i32, [16], init=0)
             with L.subs(extent=32) as s:
-                p32 = contract(w.q[s], x.q[s], over="k", acc=i32) @ matrix
-                i32_acc += p32 * w.sc[s] @ wide
+                p32 = contract(w.q[s], x.q[s], over="k", acc=i32)
+                i32_acc += p32 * w.sc[s]
             mins = fold2(x.bsum)
-            min_term = dot(w.m, mins) @ wide
-            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term) @ wide
+            min_term = dot(w.m, mins)
+            f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
         commit(f32_acc, Y[mb])

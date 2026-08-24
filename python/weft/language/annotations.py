@@ -100,6 +100,14 @@ class View:
         return ViewSpec(encoding, shape if isinstance(shape, tuple) else (shape,))
 
 
+class static:
+    """Marker for a build-time parameter in a derived Encoding definition."""
+
+    @classmethod
+    def __class_getitem__(cls, parameter: object) -> object:
+        return parameter
+
+
 @dataclass(frozen=True, slots=True)
 class AutoSpec:
     choices: tuple[object, ...]

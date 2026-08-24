@@ -18,7 +18,7 @@ from .encodings import (
     Q4_0,
     Q4_1,
     Q4_K,
-    Q4K_I16,
+    Q4K_I,
     Q5_0,
     Q5_1,
     Q5_K,
@@ -56,7 +56,7 @@ from .mul_mat import (
     mul_mat_tq1_0,
     mul_mat_tq2_0,
 )
-from .quant import q4k_gemv, q4k_gemv_groups4, q4k_gemv_ime
+from .quant import q4k_gemv, q4k_gemv_contract, q4k_gemv_groups4
 from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
 from .row_dequant import (
     dequantize_iq1_m,
@@ -136,7 +136,7 @@ __all__ = [
     "MXFP4",
     "NVFP4",
     "Q4_0",
-    "Q4K_I16",
+    "Q4K_I",
     "Q8_K",
     "Q8_0",
     "Q8_1",
@@ -194,7 +194,7 @@ __all__ = [
     "mul_mat_nvfp4",
     "q4k_gemv",
     "q4k_gemv_groups4",
-    "q4k_gemv_ime",
+    "q4k_gemv_contract",
     "quantize_q8_0",
     "quantize_q8_1",
     "quantize_q8_K",

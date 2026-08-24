@@ -434,8 +434,7 @@ public:
                                name == "weft_kernel.lookup" ||
                                name == "weft_kernel.admit";
           if (name == "weft_kernel.commit" ||
-              name == "weft_kernel.materialize" ||
-              name == "weft_kernel.pack") {
+              name == "weft_kernel.materialize") {
             producerOps.clear();
             break;
           }

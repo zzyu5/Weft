@@ -30,7 +30,7 @@ class WeftKernel_Op<string mnemonic, list<Trait> traits = []>
 def WeftKernel_EncodingType : WeftKernel_Type<"Encoding", "encoding"> {
   let parameters = (ins
     StringRefParameter<"encoding family">:$family,
-    StringRefParameter<"base, dense, derived_family, derived_instance, or ephemeral">:$kind,
+    StringRefParameter<"base, dense, derived_family, or derived_instance">:$kind,
     StringRefParameter<"fixed physical layout identity, otherwise empty">:$layoutIdentity
   );
   let assemblyFormat =
@@ -237,26 +237,19 @@ def WeftKernel_NewOp : WeftKernel_Op<"new", [Pure]> {
 }
 
 def WeftKernel_MaterializeOp : WeftKernel_Op<"materialize", [Pure]> {
-  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_AdmitOp : WeftKernel_Op<"admit", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$region, OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$region);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_CommitOp : WeftKernel_Op<"commit", [MemoryEffects<[MemWrite]>]> {
-  let arguments = (ins AnyType:$value, AnyType:$region,
-                       OptionalAttr<StrAttr>:$engine);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_StageHandoffOp : WeftKernel_Op<"stage_handoff", [Pure]> {
-  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
-  let results = (outs AnyType:$result);
+  let arguments = (ins AnyType:$value, AnyType:$region);
   let hasVerifier = 1;
 }
 
@@ -288,22 +281,19 @@ def WeftKernel_UpdateOp : WeftKernel_Op<"update", [Pure]> {
 }
 
 def WeftKernel_UnaryOp : WeftKernel_Op<"unary", [Pure]> {
-  let arguments = (ins AnyType:$input, StrAttr:$kind,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input, StrAttr:$kind);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_BinaryOp : WeftKernel_Op<"binary", [Pure]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$kind,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$kind);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$predicate,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$predicate);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -311,8 +301,7 @@ def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
 def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
   let arguments = (ins AnyType:$input,
                        OptionalAttr<StrAttr>:$rounding,
-                       OptionalAttr<BoolAttr>:$saturate,
-                       OptionalAttr<StrAttr>:$engine);
+                       OptionalAttr<BoolAttr>:$saturate);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -320,7 +309,7 @@ def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
 class WeftKernel_GroupedMacOp<string mnemonic>
     : WeftKernel_Op<mnemonic, [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, I64Attr:$group,
-                       StrAttr:$overflow, OptionalAttr<StrAttr>:$engine);
+                       StrAttr:$overflow);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -329,20 +318,19 @@ def WeftKernel_MacPairsOp : WeftKernel_GroupedMacOp<"mac_pairs">;
 def WeftKernel_MacGroupsOp : WeftKernel_GroupedMacOp<"mac_groups">;
 
 def WeftKernel_WidenOp : WeftKernel_Op<"widen", [Pure]> {
-  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_ReduceOp : WeftKernel_Op<"reduce", [Pure]> {
-  let arguments = (ins AnyType:$input, StrAttr:$kind, I64Attr:$axis,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input, StrAttr:$kind, I64Attr:$axis);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_Fold2Op : WeftKernel_Op<"fold2", [Pure]> {
-  let arguments = (ins AnyType:$input, OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -351,8 +339,7 @@ class WeftKernel_ContractLikeOp<string mnemonic>
     : WeftKernel_Op<mnemonic, [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                        DenseI64ArrayAttr:$over,
-                       OptionalAttr<TypeAttr>:$acc_type,
-                       OptionalAttr<StrAttr>:$engine);
+                       OptionalAttr<TypeAttr>:$acc_type);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -363,22 +350,13 @@ def WeftKernel_OuterContractOp
     : WeftKernel_ContractLikeOp<"outer_contract">;
 
 def WeftKernel_LookupOp : WeftKernel_Op<"lookup", [Pure]> {
-  let arguments = (ins AnyType:$table, AnyType:$indices,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins AnyType:$table, AnyType:$indices);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftKernel_PackOp : WeftKernel_Op<"pack", [Pure]> {
-  let arguments = (ins AnyType:$view, StrAttr:$along,
-                       OptionalAttr<StrAttr>:$engine);
-  let results = (outs WeftKernel_ViewType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftKernel_InterleaveOp : WeftKernel_Op<"interleave", [Pure]> {
-  let arguments = (ins WeftKernel_ViewType:$view, I64Attr:$rows,
-                       OptionalAttr<StrAttr>:$engine);
+  let arguments = (ins WeftKernel_ViewType:$view, I64Attr:$rows);
   let results = (outs WeftKernel_ViewType:$result);
   let hasVerifier = 1;
 }

@@ -100,8 +100,7 @@ std::string physicalKind(mlir::DictionaryAttr value, int64_t laneAxis,
 bool propagatesLaneIdentity(llvm::StringRef name) {
   return name == "weft_kernel.iota" || name == "weft_kernel.admit" ||
          name == "weft_kernel.commit" ||
-         name == "weft_kernel.materialize" || name == "weft_kernel.pack" ||
-         name == "weft_kernel.stage_handoff" ||
+         name == "weft_kernel.materialize" ||
          name == "weft_kernel.field" || name == "weft_kernel.extract" ||
          name == "weft_kernel.new" || name == "weft_kernel.unary" ||
          name == "weft_kernel.binary" || name == "weft_kernel.compare" ||
@@ -345,15 +344,6 @@ public:
         auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
         if (!axes || axes.empty())
           return int64_t{0};
-        llvm::StringRef layout =
-            riscv_internal::string(value, "layout_identity").value_or("");
-        if (layout.consume_front("packed.along."))
-          for (auto [ordinal, symbol] :
-               llvm::enumerate(kernel.getShapeSymbols()))
-            if (mlir::cast<mlir::StringAttr>(symbol)
-                    .getValue()
-                    .equals_insensitive(layout))
-              return static_cast<int64_t>(ordinal) + 1;
         if (riscv_internal::string(value, "encoding_kind").value_or("") ==
             "dense")
           return axes.asArrayRef().back();
@@ -395,8 +385,6 @@ public:
         llvm::StringRef name = *riscv_internal::string(operation, "name");
         llvm::StringRef operationId =
             *riscv_internal::string(operation, "id");
-        if (riscv_internal::string(operation, "engine").value_or("") != "wide")
-          continue;
         int64_t operationAxis = -1;
         int operationPriority = 3;
         int64_t operationCohort = 1;
@@ -510,22 +498,9 @@ public:
                                              riscv_internal::logicalElement(
                                                  ownerType.getValue()))
                                        : kernel::EncodingType();
-              int64_t packedLaneAxis = 0;
-              if (ownerEncoding && ownerEncoding.getKind() == "ephemeral") {
-                llvm::StringRef packedAlong = ownerEncoding.getLayoutIdentity();
-                if (packedAlong.consume_front("packed.along."))
-                  for (auto [ordinal, symbol] :
-                       llvm::enumerate(kernel.getShapeSymbols()))
-                    if (mlir::cast<mlir::StringAttr>(symbol)
-                            .getValue()
-                            .equals_insensitive(packedAlong)) {
-                      packedLaneAxis = static_cast<int64_t>(ordinal) + 1;
-                      break;
-                    }
-              }
               const bool derivedInterleave =
-                  ownerEncoding && ownerEncoding.getKind() == "derived_family";
-              if (!derivedInterleave && packedLaneAxis <= 0)
+                  ownerEncoding && ownerEncoding.getKind() == "derived_instance";
+              if (!derivedInterleave)
                 continue;
               auto operand = valuesById.find(valueId);
               auto axes = operand == valuesById.end()
@@ -534,15 +509,6 @@ public:
                                     "axes");
               if (!axes)
                 continue;
-              if (packedLaneAxis > 0 &&
-                  packedLaneAxis != over.asArrayRef().front() &&
-                  llvm::is_contained(axes.asArrayRef(), packedLaneAxis)) {
-                operationAxis = packedLaneAxis;
-                operationPriority = -1;
-                operationCohort = factsFor(operation, packedLaneAxis).cohort;
-              }
-              if (operationAxis > 0)
-                break;
               for (int64_t axis : axes.asArrayRef()) {
                 if (axis == over.asArrayRef().front() ||
                     axisFacts.find(axis) == axisFacts.end())
@@ -1094,7 +1060,6 @@ public:
         return name == "weft_kernel.admit" ||
                name == "weft_kernel.commit" ||
                name == "weft_kernel.materialize" ||
-               name == "weft_kernel.pack" ||
                name == "weft_kernel.extract" ||
                name == "weft_kernel.lookup" ||
                name == "weft_kernel.reduce" ||
@@ -1416,11 +1381,8 @@ public:
         value = riscv_internal::set(
             value, "physical_encoding_kind",
             builder.getStringAttr(
-                riscv_internal::string(value, "encoding_kind").value_or("") ==
-                        "derived_family"
-                    ? "derived_instance"
-                    : riscv_internal::string(value, "encoding_kind")
-                          .value_or("not-applicable")));
+                riscv_internal::string(value, "encoding_kind")
+                    .value_or("not-applicable")));
         value = riscv_internal::set(
             value, "physical_sew", builder.getI64IntegerAttr(physicalSEW));
         value = riscv_internal::set(

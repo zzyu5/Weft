@@ -172,7 +172,6 @@ struct Binding {
     DeferredContract,
     DeferredWiden,
     DeferredFold,
-    PackRequest,
     Point,
     Domain,
   } kind = Kind::None;
@@ -249,7 +248,7 @@ public:
       if (!view)
         continue;
       auto encoding = mlir::dyn_cast<kernel::EncodingType>(view.getEncoding());
-      if (!encoding || encoding.getKind() != "derived_family")
+      if (!encoding || encoding.getKind() != "derived_instance")
         continue;
       auto source = derivedSources.find(encoding.getFamily());
       auto info = source == derivedSources.end()
@@ -661,7 +660,6 @@ private:
                                       mlir::Value initialValue = {});
   mlir::LogicalResult compileBinary(kernel::BinaryOp operation);
   mlir::LogicalResult compileCommit(kernel::CommitOp operation);
-  mlir::LogicalResult compilePack(kernel::PackOp operation);
 
   Binding scalar(llvm::StringRef expression) const {
     Binding binding;
@@ -1579,8 +1577,6 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileSlice(slice);
   if (auto admit = mlir::dyn_cast<kernel::AdmitOp>(operation))
     return compileAdmit(admit);
-  if (auto pack = mlir::dyn_cast<kernel::PackOp>(operation))
-    return compilePack(pack);
   if (auto materialize = mlir::dyn_cast<kernel::MaterializeOp>(operation))
     return compileMaterialize(materialize);
   if (auto iota = mlir::dyn_cast<kernel::IotaOp>(operation))
@@ -1621,17 +1617,6 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileBinary(binary);
   if (auto commit = mlir::dyn_cast<kernel::CommitOp>(operation))
     return compileCommit(commit);
-  if (mlir::isa<kernel::StageHandoffOp>(operation)) {
-    auto handoff = mlir::cast<kernel::StageHandoffOp>(operation);
-    mlir::FailureOr<Binding> projected =
-        projectBinding(handoff.getInput(), handoff.getResult(),
-                       bindings.lookup(handoff.getInput()));
-    if (mlir::failed(projected))
-      return fail(handoff,
-                  "stage handoff requires an explicit physical layout conversion");
-    bindings[handoff.getResult()] = std::move(*projected);
-    return mlir::success();
-  }
   return fail(&operation, "intrinsic-C emission has no rule for canonical operation");
 }
 
@@ -2204,10 +2189,7 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
   auto encoding = sliceType
                       ? mlir::dyn_cast<kernel::EncodingType>(sliceType.getEncoding())
                       : kernel::EncodingType();
-  if (!encoding || encoding.getKind() == "dense" ||
-      (encoding.getKind() == "ephemeral" &&
-       (!base.memory.packed || base.memory.recordBytes <= 0 ||
-        base.memory.interleaveRows <= 0))) {
+  if (!encoding || encoding.getKind() == "dense") {
     value.getDefiningOp()->emitError("record slice must carry a concrete encoding");
     return mlir::failure();
   }
@@ -2290,7 +2272,7 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
   result.encodingFamily = sourceFamily;
   const int64_t recordBytes = info->second.storageBits / 8;
   const int64_t elements = info->second.logicalElements;
-  if (encoding.getKind() == "derived_family" ||
+  if (encoding.getKind() == "derived_instance" ||
       base.memory.interleaveRows > 0) {
     int64_t rows = base.memory.interleaveRows > 0
                        ? base.memory.interleaveRows
@@ -2382,14 +2364,6 @@ mlir::LogicalResult Emitter::compileAdmit(kernel::AdmitOp admit) {
   if (encoding.getKind() == "dense") {
     bindings[admit.getResult()] = std::move(region);
     return mlir::success();
-  }
-  if (encoding.getKind() == "ephemeral") {
-    const Binding &base = bindings.lookup(region.slice.base);
-    if (base.kind != Binding::Kind::Memory || !base.memory.packed ||
-        base.memory.recordBytes <= 0) {
-      bindings[admit.getResult()] = std::move(region);
-      return mlir::success();
-    }
   }
   mlir::FailureOr<Binding> result = recordForSlice(admit.getRegion());
   if (mlir::failed(result))
@@ -5451,201 +5425,12 @@ mlir::FailureOr<Binding> Emitter::emitEncodedOuterFold(
   return result;
 }
 
-mlir::LogicalResult Emitter::compilePack(kernel::PackOp operation) {
-  Binding input = bindings.lookup(operation.getView());
-  if (input.kind != Binding::Kind::Slice)
-    return fail(operation, "pack requires an explicit source slice");
-  Binding result;
-  result.kind = Binding::Kind::PackRequest;
-  result.input = operation.getView();
-  result.scalar = operation.getAlong().str();
-  bindings[operation.getResult()] = std::move(result);
-  return mlir::success();
-}
-
 mlir::LogicalResult
 Emitter::compileMaterialize(kernel::MaterializeOp materialize) {
-  Binding request = bindings.lookup(materialize.getInput());
-  if (request.kind != Binding::Kind::PackRequest)
-    return fail(materialize, "materialize currently requires a pack value");
-  Binding sourceBinding = bindings.lookup(request.input);
-  if (sourceBinding.kind != Binding::Kind::Slice)
-    return fail(materialize, "packed materialize lost its source slice");
-  const Binding &sourceMemory = bindings.lookup(sourceBinding.slice.base);
-  if (sourceMemory.kind != Binding::Kind::Memory)
-    return fail(materialize, "pack source is not memory-backed");
-  auto resultType = mlir::cast<kernel::ViewType>(materialize.getResult().getType());
-  mlir::DictionaryAttr local =
-      assigned(materialize.getOperation()).getAs<mlir::DictionaryAttr>(
-          "local_operation");
-  int64_t packAxis =
-      riscv_internal::integer(local, "pack_axis").value_or(0);
-  llvm::StringRef packing =
-      riscv_internal::string(local, "packing").value_or("");
-  int64_t interleaveRows =
-      riscv_internal::integer(local, "interleave_rows").value_or(0);
-  int64_t recordStorageBits =
-      riscv_internal::integer(local, "record_storage_bits").value_or(0);
-  int64_t logicalElements =
-      riscv_internal::integer(local, "logical_elements").value_or(0);
-  int64_t sourceRank =
-      riscv_internal::integer(local, "source_rank").value_or(0);
-  int64_t otherAxis =
-      riscv_internal::integer(local, "other_axis").value_or(0);
-  int64_t rowAxis = riscv_internal::integer(local, "row_axis").value_or(0);
-  int64_t recordAxis =
-      riscv_internal::integer(local, "record_axis").value_or(0);
-  llvm::StringRef sourceEncodingFamily =
-      riscv_internal::string(local, "source_encoding_family").value_or("");
-  if (packAxis <= 0 || otherAxis <= 0 || otherAxis == packAxis ||
-      sourceRank != 2)
-    return fail(materialize,
-                "selected local pack has incomplete operation-owned axes");
-  llvm::SmallVector<int64_t> axes(resultType.getAxisIds().asArrayRef().begin(),
-                                  resultType.getAxisIds().asArrayRef().end());
-  if (axes.size() != static_cast<size_t>(sourceRank) ||
-      !llvm::is_contained(axes, packAxis) ||
-      !llvm::is_contained(axes, otherAxis))
-    return fail(materialize,
-                "local pack result disagrees with its selected source axes");
-  llvm::SmallVector<PointInfo> scopes;
-  for (int64_t axis : axes) {
-    auto found = axisScopes.find(axis);
-    if (found == axisScopes.end() || found->second.empty())
-      return fail(materialize, "pack axis has no enclosing level ownership");
-    scopes.push_back(found->second.back());
-  }
-  const size_t rowPosition = llvm::find(axes, packAxis) - axes.begin();
-  const size_t recordPosition = llvm::find(axes, otherAxis) - axes.begin();
-  const PointInfo &rowScope = scopes[rowPosition];
-  const PointInfo &recordScope = scopes[recordPosition];
-  const int64_t rowExtent = rowScope.physicalExtent;
-  const int64_t recordExtent = recordScope.physicalExtent;
-  const int64_t extent0 = scopes[0].physicalExtent;
-  const int64_t extent1 = scopes[1].physicalExtent;
-  if (packing == "encoded-record-interleave") {
-    if (sourceMemory.memory.elementType || sourceEncodingFamily.empty() ||
-        interleaveRows <= 1 || recordStorageBits <= 0 ||
-        recordStorageBits % 8 || logicalElements <= 0 ||
-        rowAxis != packAxis || recordAxis <= 0 || recordAxis == rowAxis ||
-        rowExtent % interleaveRows || recordExtent % logicalElements)
-      return fail(materialize,
-                  "selected encoded local pack has incompatible record facts");
-    const int64_t recordBytes = recordStorageBits / 8;
-    const int64_t rowGroups = rowExtent / interleaveRows;
-    const int64_t blocks = recordExtent / logicalElements;
-    std::string buffer = fresh("packed_encoded");
-    line("_Alignas(64) uint8_t " + buffer + "[" +
-         std::to_string(rowGroups * blocks * recordBytes * interleaveRows) +
-         "];" );
-    std::string rowGroup = fresh("pack_row_group");
-    std::string block = fresh("pack_block");
-    std::string byte = fresh("pack_byte");
-    std::string lane = fresh("pack_lane");
-    line("for (size_t " + rowGroup + " = 0; " + rowGroup + " < " +
-         std::to_string(rowGroups) + "; ++" + rowGroup + ")");
-    ++indent;
-    line("for (size_t " + block + " = 0; " + block + " < " +
-         std::to_string(blocks) + "; ++" + block + ")");
-    ++indent;
-    line("for (size_t " + byte + " = 0; " + byte + " < " +
-         std::to_string(recordBytes) + "; ++" + byte + ")");
-    ++indent;
-    line("for (size_t " + lane + " = 0; " + lane + " < " +
-         std::to_string(interleaveRows) + "; ++" + lane + ") {");
-    ++indent;
-    const std::string localRow =
-        "(" + rowGroup + " * " + std::to_string(interleaveRows) + " + " +
-        lane + ")";
-    const std::string destination =
-        "(((" + rowGroup + " * " + std::to_string(blocks) + " + " + block +
-        ") * " + std::to_string(recordBytes) + " + " + byte + ") * " +
-        std::to_string(interleaveRows) + " + " + lane + ")";
-    const std::string sourceBlocks =
-        "(" + sourceMemory.memory.extents[recordPosition] + " / " +
-        std::to_string(logicalElements) + ")";
-    const std::string source =
-        "((" + rowScope.base + " + " + localRow + ") * " + sourceBlocks +
-        " + ((" + recordScope.base + " / " +
-        std::to_string(logicalElements) + ") + " + block + ")) * " +
-        std::to_string(recordBytes) + " + " + byte;
-    line(buffer + "[" + destination + "] = (" + localRow + " < " +
-         rowScope.active + " && " + block + " * " +
-         std::to_string(logicalElements) + " < " + recordScope.active +
-         ") ? " + sourceMemory.memory.name + "[" + source + "] : 0;");
-    --indent;
-    line("}");
-    --indent;
-    --indent;
-    --indent;
-
-    Binding result;
-    result.kind = Binding::Kind::Memory;
-    result.memory.name = buffer;
-    result.memory.encoding = resultType.getEncoding();
-    result.memory.axes = axes;
-    for (const PointInfo &scope : scopes) {
-      result.memory.extents.push_back(std::to_string(scope.physicalExtent));
-      result.memory.origins.push_back(scope.base);
-    }
-    result.memory.isConst = true;
-    result.memory.packed = true;
-    result.memory.sourceEncodingFamily = sourceEncodingFamily.str();
-    result.memory.interleaveRows = interleaveRows;
-    result.memory.recordBytes = recordBytes;
-    result.memory.logicalElements = logicalElements;
-    bindings[materialize.getResult()] = std::move(result);
-    return mlir::success();
-  }
-  if (!sourceMemory.memory.elementType ||
-      !sourceMemory.memory.elementType.isF32())
-    return fail(materialize,
-                "selected local pack has no dense or encoded implementation");
-  std::string buffer = fresh("packed");
-  line("_Alignas(64) float " + buffer + "[" +
-       std::to_string(extent0 * extent1) +
-       "];" );
-  std::string i = fresh("pack_i");
-  std::string j = fresh("pack_j");
-  line("for (size_t " + i + " = 0; " + i + " < " + scopes[0].active + "; ++" +
-       i + ")");
-  ++indent;
-  line("for (size_t " + j + " = 0; " + j + " < " + scopes[1].active + "; ++" +
-       j + ") {");
-  ++indent;
-  auto source =
-      denseAddress(sourceBinding.slice, {{axes[0], i}, {axes[1], j}});
-  if (!source)
-    return fail(materialize, "local pack source has no address relation");
-  const bool laneFirst = axes[0] == packAxis;
-  const bool laneSecond = axes[1] == packAxis;
-  std::string destination;
-  if (laneFirst)
-    destination = j + " * " + std::to_string(extent0) + " + " + i;
-  else if (laneSecond)
-    destination = i + " * " + std::to_string(extent1) + " + " + j;
-  else
-    destination = i + " * " + std::to_string(extent1) + " + " + j;
-  line(buffer + "[" + destination + "] = *(" + *source + ");");
-  --indent;
-  line("}");
-  --indent;
-
-  Binding result;
-  result.kind = Binding::Kind::Memory;
-  result.memory.name = buffer;
-  result.memory.encoding = resultType.getEncoding();
-  result.memory.elementType = sourceMemory.memory.elementType;
-  result.memory.axes = axes;
-  result.memory.extents = {std::to_string(extent0), std::to_string(extent1)};
-  result.memory.origins = {scopes[0].base, scopes[1].base};
-  result.memory.isConst = true;
-  result.memory.packed = true;
-  if (laneFirst)
-    result.memory.strides = {"1", std::to_string(extent0)};
-  else
-    result.memory.strides = {std::to_string(extent1), "1"};
-  bindings[materialize.getResult()] = std::move(result);
+  Binding input = bindings.lookup(materialize.getInput());
+  if (input.kind == Binding::Kind::None)
+    return fail(materialize, "materialize input has no emitted value");
+  bindings[materialize.getResult()] = std::move(input);
   return mlir::success();
 }
 

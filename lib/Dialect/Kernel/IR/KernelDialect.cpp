@@ -116,18 +116,6 @@ mlir::LogicalResult verifyStringArray(mlir::Operation *operation,
   return mlir::success();
 }
 
-mlir::LogicalResult verifyEngine(mlir::Operation *operation,
-                                 std::optional<llvm::StringRef> engine,
-                                 llvm::ArrayRef<llvm::StringRef> allowed) {
-  if (!engine)
-    return mlir::success();
-  if (!llvm::is_contained(allowed, *engine))
-    return operation->emitOpError()
-           << "engine role '" << *engine << "' is incompatible with "
-           << operation->getName();
-  return mlir::success();
-}
-
 mlir::LogicalResult verifyPointwise(mlir::Operation *operation,
                                     mlir::Type lhs, mlir::Type rhs,
                                     mlir::Type result) {
@@ -177,8 +165,7 @@ mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
                                        mlir::Value lhs, mlir::Value rhs,
                                        llvm::ArrayRef<int64_t> over,
                                        std::optional<mlir::Type> accType,
-                                       mlir::Type result,
-                                       std::optional<llvm::StringRef> engine) {
+                                       mlir::Type result) {
   if (!isLocalValue(lhs.getType()) || !isLocalValue(rhs.getType()) ||
       !isLocalValue(result))
     return operation->emitOpError("contraction operands must be local Values");
@@ -206,7 +193,7 @@ mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
       return operation->emitOpError("contraction result contains an unrelated axis");
   if (accType && logicalElement(result) != *accType)
     return operation->emitOpError("acc_type must equal the result element type");
-  return verifyEngine(operation, engine, {"wide", "matrix"});
+  return mlir::success();
 }
 
 } // namespace
@@ -218,7 +205,7 @@ mlir::LogicalResult EncodingType::verify(
   if (family.empty())
     return emitError() << "encoding family must not be empty";
   if (kind != "base" && kind != "dense" && kind != "derived_family" &&
-      kind != "derived_instance" && kind != "ephemeral")
+      kind != "derived_instance")
     return emitError() << "unknown encoding kind";
   if ((kind == "base" || kind == "dense" || kind == "derived_instance") &&
       layoutIdentity.empty())
@@ -440,9 +427,10 @@ mlir::LogicalResult DeriveOp::verify() {
     return emitOpError("derive body must end in derive_yield");
   auto resultEncoding = yield.getValue().getType().getEncoding();
   auto result = mlir::cast<EncodingType>(resultEncoding);
-  if (result.getKind() != "derived_family" ||
-      result.getFamily() != getResultFamily())
-    return emitOpError("derive result must be its abstract derived encoding family");
+  if (result.getKind() != "derived_instance" ||
+      result.getFamily() != getResultFamily() || result.getLayoutIdentity().empty())
+    return emitOpError(
+        "derive result must be one concrete instance of its derived encoding family");
   return mlir::success();
 }
 
@@ -655,7 +643,7 @@ mlir::LogicalResult NewOp::verify() {
 mlir::LogicalResult MaterializeOp::verify() {
   if (getInput().getType() != getResult().getType())
     return emitOpError("materialize preserves its logical value type");
-  return verifyEngine(*this, getEngine(), {"transfer"});
+  return mlir::success();
 }
 
 mlir::LogicalResult AdmitOp::verify() {
@@ -675,7 +663,7 @@ mlir::LogicalResult AdmitOp::verify() {
   } else if (!sameDomain(getRegion().getType(), getResult().getType())) {
     return emitOpError("dense admit must preserve the logical domain");
   }
-  return verifyEngine(*this, getEngine(), {"transfer"});
+  return mlir::success();
 }
 
 mlir::LogicalResult CommitOp::verify() {
@@ -686,13 +674,7 @@ mlir::LogicalResult CommitOp::verify() {
   if (!isNumeric(getValue().getType()) &&
       logicalElement(getValue().getType()) != logicalElement(getRegion().getType()))
     return emitOpError("encoded commit requires identical encoding");
-  return verifyEngine(*this, getEngine(), {"transfer"});
-}
-
-mlir::LogicalResult StageHandoffOp::verify() {
-  if (getInput().getType() != getResult().getType())
-    return emitOpError("stage handoff preserves its logical type");
-  return verifyEngine(*this, getEngine(), {"transfer"});
+  return mlir::success();
 }
 
 mlir::LogicalResult SliceOp::verify() {
@@ -780,14 +762,14 @@ mlir::LogicalResult UnaryOp::verify() {
     return emitOpError("unary operation preserves its logical type");
   if (getKind() != "neg" && getKind() != "abs" && getKind() != "exp")
     return emitOpError("unknown unary numeric operation");
-  return verifyEngine(*this, getEngine(), {"scalar", "wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult BinaryOp::verify() {
   if (failed(verifyPointwise(*this, getLhs().getType(), getRhs().getType(),
                              getResult().getType())))
     return mlir::failure();
-  return verifyEngine(*this, getEngine(), {"scalar", "wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult CompareOp::verify() {
@@ -819,7 +801,7 @@ mlir::LogicalResult CompareOp::verify() {
             "compare operands disagree on a shared logical axis extent");
     }
   }
-  return verifyEngine(*this, getEngine(), {"scalar", "wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult CastOp::verify() {
@@ -838,19 +820,19 @@ mlir::LogicalResult CastOp::verify() {
         !mlir::isa<mlir::IntegerType>(logicalElement(getResult().getType())))
       return emitOpError("rounded narrowing converts floating values to integers");
   }
-  return verifyEngine(*this, getEngine(), {"scalar", "wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult MacPairsOp::verify() {
   if (getGroup() != 2 || getOverflow() != "wrap")
     return emitOpError("mac_pairs is a wrapping group of exactly two elements");
-  return verifyEngine(*this, getEngine(), {"wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult MacGroupsOp::verify() {
   if (getGroup() <= 0 || getOverflow() != "wrap")
     return emitOpError("mac_groups requires positive group and wrap overflow");
-  return verifyEngine(*this, getEngine(), {"wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult WidenOp::verify() {
@@ -867,7 +849,7 @@ mlir::LogicalResult WidenOp::verify() {
                       : *resultWidth <= *inputWidth))
     return emitOpError(
         "widen must increase width or convert an integer to no-narrower float");
-  return verifyEngine(*this, getEngine(), {"wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult ReduceOp::verify() {
@@ -892,7 +874,7 @@ mlir::LogicalResult ReduceOp::verify() {
       return emitOpError("reduce must preserve every non-reduced logical axis");
     ++resultIndex;
   }
-  return verifyEngine(*this, getEngine(), {"wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult Fold2Op::verify() {
@@ -911,22 +893,22 @@ mlir::LogicalResult Fold2Op::verify() {
       input.getAxisIds() != result.getAxisIds() ||
       !llvm::equal(inputShape.drop_back(), resultShape.drop_back()))
     return emitOpError("fold2 halves an even final logical extent");
-  return verifyEngine(*this, getEngine(), {"wide"});
+  return mlir::success();
 }
 
 mlir::LogicalResult DotOp::verify() {
   return verifyContractLike(*this, getLhs(), getRhs(), getOver(), getAccType(),
-                            getResult().getType(), getEngine());
+                            getResult().getType());
 }
 
 mlir::LogicalResult ContractOp::verify() {
   return verifyContractLike(*this, getLhs(), getRhs(), getOver(), getAccType(),
-                            getResult().getType(), getEngine());
+                            getResult().getType());
 }
 
 mlir::LogicalResult OuterContractOp::verify() {
   return verifyContractLike(*this, getLhs(), getRhs(), getOver(), getAccType(),
-                            getResult().getType(), getEngine());
+                            getResult().getType());
 }
 
 mlir::LogicalResult LookupOp::verify() {
@@ -939,27 +921,18 @@ mlir::LogicalResult LookupOp::verify() {
     return emitOpError("lookup result must follow the index domain");
   if (logicalElement(getTable().getType()) != logicalElement(getResult().getType()))
     return emitOpError("lookup result element type must match the table element type");
-  return verifyEngine(*this, getEngine(), {"scalar", "wide"});
-}
-
-mlir::LogicalResult PackOp::verify() {
-  if (!isViewLike(getView().getType()) || !sameDomain(getView().getType(), getResult().getType()))
-    return emitOpError("pack preserves the logical View domain");
-  if (mlir::cast<EncodingType>(getResult().getType().getEncoding()).getKind() !=
-      "ephemeral")
-    return emitOpError("pack produces a primitive-local ephemeral encoding");
-  return verifyEngine(*this, getEngine(), {"transfer"});
+  return mlir::success();
 }
 
 mlir::LogicalResult InterleaveOp::verify() {
   if (getRows() <= 0 || !sameDomain(getView().getType(), getResult().getType()))
     return emitOpError("interleave requires positive rows and preserves the View domain");
   if (mlir::cast<EncodingType>(getResult().getType().getEncoding()).getKind() !=
-      "derived_family")
-    return emitOpError("interleave in derive produces an abstract derived family");
+      "derived_instance")
+    return emitOpError("interleave in derive produces a concrete derived instance");
   if (!mlir::isa_and_nonnull<DeriveOp>(getOperation()->getParentOp()))
     return emitOpError("interleave is valid only inside a derive body");
-  return verifyEngine(*this, getEngine(), {"transfer"});
+  return mlir::success();
 }
 
 void WEFTKernelDialect::initialize() {

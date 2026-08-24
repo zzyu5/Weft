@@ -13,8 +13,6 @@ from weft.language import (
     i32,
     narrow,
     reduce,
-    transfer,
-    wide,
     widen,
 )
 
@@ -27,8 +25,8 @@ def quantize_q8_0(
 ):
     for row in range(M):
         with L.blocks(K, extent=32) as kb:
-            x = admit(X[row, kb]) @ transfer
-            amax = reduce(absolute(x) @ wide, op="max") @ wide
+            x = admit(X[row, kb])
+            amax = reduce(absolute(x), op="max")
             d = amax / f32(127.0)
             inverse = f32(0.0)
             if amax != f32(0.0):
@@ -38,9 +36,9 @@ def quantize_q8_0(
                 i8,
                 rounding="rne",
                 saturation=True,
-            ) @ wide
-            commit(f16(d), Y[row, kb].d) @ transfer
-            commit(q, Y[row, kb].q) @ transfer
+            )
+            commit(f16(d), Y[row, kb].d)
+            commit(q, Y[row, kb].q)
 
 
 def quantize_q8_1(
@@ -49,8 +47,8 @@ def quantize_q8_1(
 ):
     for row in range(M):
         with L.blocks(K, extent=32) as kb:
-            x = admit(X[row, kb]) @ transfer
-            amax = reduce(absolute(x) @ wide, op="max") @ wide
+            x = admit(X[row, kb])
+            amax = reduce(absolute(x), op="max")
             d = amax / f32(127.0)
             inverse = f32(0.0)
             if amax != f32(0.0):
@@ -60,11 +58,11 @@ def quantize_q8_1(
                 i8,
                 rounding="rne",
                 saturation=True,
-            ) @ wide
-            qsum = reduce(widen(q, i16), op="add") @ wide
-            commit(f16(d), Y[row, kb].d) @ transfer
-            commit(f16(f32(qsum) * d), Y[row, kb].s) @ transfer
-            commit(q, Y[row, kb].q) @ transfer
+            )
+            qsum = reduce(widen(q, i16), op="add")
+            commit(f16(d), Y[row, kb].d)
+            commit(f16(f32(qsum) * d), Y[row, kb].s)
+            commit(q, Y[row, kb].q)
 
 
 def quantize_q8_K(
@@ -73,11 +71,11 @@ def quantize_q8_K(
 ):
     for row in range(M):
         with L.blocks(K, extent=256) as kb:
-            block = admit(X[row, kb]) @ transfer
+            block = admit(X[row, kb])
             extreme = f32(0.0)
             magnitude = f32(0.0)
             with L.subs(kb, extent=1) as element:
-                sample = f32((admit(X[row, element]) @ transfer)[0])
+                sample = f32((admit(X[row, element]))[0])
                 sample_magnitude = absolute(sample)
                 if sample_magnitude > magnitude:
                     magnitude = sample_magnitude
@@ -94,12 +92,12 @@ def quantize_q8_K(
                 i8,
                 rounding="rne",
                 saturation=True,
-            ) @ wide
-            commit(q, Y[row, kb].q) @ transfer
+            )
+            commit(q, Y[row, kb].q)
 
             with L.subs(kb, extent=16) as group:
                 q_group = q[group]
-                bsum = reduce(widen(q_group, i16), op="add") @ wide
-                commit(i16(bsum), Y[row, kb].bsum[group]) @ transfer
+                bsum = reduce(widen(q_group, i16), op="add")
+                commit(i16(bsum), Y[row, kb].bsum[group])
 
-            commit(d, Y[row, kb].ds) @ transfer
+            commit(d, Y[row, kb].ds)

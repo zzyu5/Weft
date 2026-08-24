@@ -20,7 +20,7 @@ from weft.std.encodings import (
     Q4_0,
     Q4_1,
     Q4_K,
-    Q4K_I16,
+    Q4K_I,
     Q5_0,
     Q5_1,
     Q5_K,
@@ -38,7 +38,7 @@ from weft.std.mul_mat import (
     mul_mat_iq2_s,
     mul_mat_iq2_xs,
     mul_mat_iq2_xxs,
-    mul_mat_iq2_xxs_local_pack,
+    mul_mat_iq2_xxs_staged,
     mul_mat_iq3_s,
     mul_mat_iq3_xxs,
     mul_mat_iq4_nl,
@@ -51,9 +51,9 @@ from weft.std.mul_mat import (
     mul_mat_q4_0,
     mul_mat_q4_1,
     mul_mat_q4_k,
-    mul_mat_q4_k_i16,
-    mul_mat_q4_k_i16_decode,
-    mul_mat_q4_k_local_pack,
+    mul_mat_q4_k_persistent,
+    mul_mat_q4_k_persistent_decode,
+    mul_mat_q4_k_staged,
     mul_mat_q5_0,
     mul_mat_q5_1,
     mul_mat_q5_k,
@@ -156,33 +156,33 @@ def production_mul_mat_q4_k(
 
 
 @weft.kernel
-def production_mul_mat_q4_k_i16(
-    W: View[Q4K_I16, (N, K)],
+def production_mul_mat_q4_k_persistent(
+    W: View[Q4K_I[16], (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
 ):
-    mul_mat_q4_k_i16(W, X, Xq, Y)
+    mul_mat_q4_k_persistent(W, X, Xq, Y)
 
 
 @weft.kernel
-def production_mul_mat_q4_k_i16_decode(
-    W: View[Q4K_I16, (N, K)],
+def production_mul_mat_q4_k_persistent_decode(
+    W: View[Q4K_I[16], (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
 ):
-    mul_mat_q4_k_i16_decode(W, X, Xq, Y)
+    mul_mat_q4_k_persistent_decode(W, X, Xq, Y)
 
 
 @weft.kernel
-def production_mul_mat_q4_k_local_pack(
+def production_mul_mat_q4_k_staged(
     W: View[Q4_K, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
 ):
-    mul_mat_q4_k_local_pack(W, X, Xq, Y)
+    mul_mat_q4_k_staged(W, X, Xq, Y)
 
 
 @weft.kernel
@@ -240,7 +240,7 @@ def production_mul_mat_iq2_xxs(
 
 
 @weft.kernel
-def production_mul_mat_iq2_xxs_local_pack(
+def production_mul_mat_iq2_xxs_staged(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -248,7 +248,7 @@ def production_mul_mat_iq2_xxs_local_pack(
     signs: View[i8, (1024,)],
     Y: View[f32, (M, N)],
 ):
-    mul_mat_iq2_xxs_local_pack(W, X, Xq, grid, signs, Y)
+    mul_mat_iq2_xxs_staged(W, X, Xq, grid, signs, Y)
 
 
 @weft.kernel

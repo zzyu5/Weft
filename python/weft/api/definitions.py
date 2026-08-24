@@ -108,6 +108,18 @@ class DerivedEncodingDefinition:
             f"derived encoding {self.__name__} is generated at build time"
         )
 
+    def __getitem__(self, parameters: object) -> DerivedEncodingInstance:
+        values = parameters if isinstance(parameters, tuple) else (parameters,)
+        if not values or any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise TypeError("derived Encoding parameters must be static integers")
+        return DerivedEncodingInstance(self, values)
+
+
+@dataclass(frozen=True, slots=True)
+class DerivedEncodingInstance:
+    family: DerivedEncodingDefinition
+    parameters: tuple[int, ...]
+
 
 @dataclass(frozen=True, slots=True)
 class InlineDefinition:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weft.language import L, View, admit, commit, f32, i32, transfer, u32
+from weft.language import L, View, admit, commit, f32, i32, u32
 
 from .encodings import (
     IQ1_M,
@@ -50,7 +50,7 @@ from .quant_fragments import (
 
 def dequantize_q1_0(W: View[Q1_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=128) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(128):
             bit = extract_bits(w.q[j // 8], j % 8)
             q = i32(bit) * i32(2) - i32(1)
@@ -59,21 +59,21 @@ def dequantize_q1_0(W: View[Q1_0, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q4_0(W: View[Q4_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             commit(symmetric_integer(w.q[j], w.d, zero=8), Y[kb][j])
 
 
 def dequantize_q4_1(W: View[Q4_1, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             commit(min_affine(w.q[j], w.d, w.m), Y[kb][j])
 
 
 def dequantize_q5_0(W: View[Q5_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             q = high_bit_plane(w.q[j], w.qh[j // 8], j % 8) - i32(16)
             commit(symmetric_integer(q, w.d), Y[kb][j])
@@ -81,7 +81,7 @@ def dequantize_q5_0(W: View[Q5_0, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q5_1(W: View[Q5_1, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             q = high_bit_plane(w.q[j], w.qh[j // 8], j % 8)
             commit(min_affine(q, w.d, w.m), Y[kb][j])
@@ -89,14 +89,14 @@ def dequantize_q5_1(W: View[Q5_1, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q8_0(W: View[Q8_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             commit(symmetric_integer(w.q[j], w.d), Y[kb][j])
 
 
 def dequantize_q2_k(W: View[Q2_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             within = j % 128
             packed = w.q[(j // 128) * 32 + (within % 32)]
@@ -109,7 +109,7 @@ def dequantize_q2_k(W: View[Q2_K, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q3_k(W: View[Q3_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             within = j % 128
             packed = w.q[(j // 128) * 32 + (within % 32)]
@@ -139,7 +139,7 @@ def dequantize_q3_k(W: View[Q3_K, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q4_k(W: View[Q4_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             sub = j // 32
             commit(k_superblock(w.q[j], w.sc[sub], w.d, w.m[sub], w.dmin), Y[kb][j])
@@ -147,7 +147,7 @@ def dequantize_q4_k(W: View[Q4_K, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q5_k(W: View[Q5_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             q = high_bit_plane(w.q[j], w.qh[j % 32], j // 32)
             sub = j // 32
@@ -156,7 +156,7 @@ def dequantize_q5_k(W: View[Q5_K, (K,)], Y: View[f32, (K,)]):
 
 def dequantize_q6_k(W: View[Q6_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             within = j % 128
             ql = w.ql[(j // 128) * 64 + (within % 64)]
@@ -174,7 +174,7 @@ def dequantize_iq1_s(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -197,7 +197,7 @@ def dequantize_iq1_m(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         sc0 = u32(w.scales[0]) | (u32(w.scales[1]) << u32(8))
         sc1 = u32(w.scales[2]) | (u32(w.scales[3]) << u32(8))
         sc2 = u32(w.scales[4]) | (u32(w.scales[5]) << u32(8))
@@ -239,7 +239,7 @@ def dequantize_iq2_xxs(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -260,7 +260,7 @@ def dequantize_iq2_xs(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -279,7 +279,7 @@ def dequantize_iq2_s(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -302,7 +302,7 @@ def dequantize_iq3_xxs(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -326,7 +326,7 @@ def dequantize_iq3_s(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             group = j // 32
             entry = (j % 32) // 8
@@ -348,7 +348,7 @@ def dequantize_iq4_xs(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             sub = j // 32
             low = extract_bits(w.scales_l[sub // 2], (sub % 2) * 4, 4)
@@ -364,7 +364,7 @@ def dequantize_tq1_0(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             packed = u32(w.q[0])
             digit = j // 32
@@ -386,7 +386,7 @@ def dequantize_iq4_nl(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(32):
             q = nonlinear_lookup(codebook, w.q[j])
             commit(fp4_codebook(q, w.d), Y[kb][j])
@@ -394,7 +394,7 @@ def dequantize_iq4_nl(
 
 def dequantize_tq2_0(W: View[TQ2_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(256):
             within = j % 128
             packed = w.q[(j // 128) * 32 + within % 32]
@@ -409,7 +409,7 @@ def dequantize_mxfp4(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         scale = exponent_scale(e8m0_scale, w.e)
         for j in range(32):
             q = nonlinear_lookup(codebook, w.q[j])
@@ -423,7 +423,7 @@ def dequantize_nvfp4(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=64) as kb:
-        w = admit(W[kb]) @ transfer
+        w = admit(W[kb])
         for j in range(64):
             scale = exponent_scale(ue4m3_scale, w.d[j // 16])
             q = nonlinear_lookup(codebook, w.q[j])

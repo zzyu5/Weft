@@ -19,11 +19,8 @@ from weft.language import (
     materialize,
     new,
     outer_contract,
-    pack,
     reduce,
-    transfer,
     u32,
-    wide,
     widen,
 )
 
@@ -45,7 +42,7 @@ from .encodings import (
     Q4_0,
     Q4_1,
     Q4_K,
-    Q4K_I16,
+    Q4K_I,
     Q5_0,
     Q5_1,
     Q5_K,
@@ -97,11 +94,11 @@ def _iq2_xxs_entry_products(
 ):
     grid_index = (word0 >> u32(entry * 8)) & u32(255)
     sign_index = (word1 >> u32(entry * 7)) & u32(127)
-    weight = lookup(grid, grid_index * u32(8) + codebook_lane) @ wide
-    sign = lookup(signs, sign_index * u32(8) + codebook_lane) @ wide
-    signed_weight = weight * sign @ wide
+    weight = lookup(grid, grid_index * u32(8) + codebook_lane)
+    sign = lookup(signs, sign_index * u32(8) + codebook_lane)
+    signed_weight = weight * sign
     activation = x.q[:, group * 32 + entry * 8 + codebook_lane]
-    return widen(activation, i16) * widen(signed_weight, i16) @ wide
+    return widen(activation, i16) * widen(signed_weight, i16)
 
 
 def _iq2_xxs_group_products(
@@ -130,7 +127,7 @@ def _iq2_xxs_group_products(
         entry_lane,
     )
     scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
-    return widen(local, i32) * scale @ wide
+    return widen(local, i32) * scale
 
 
 def mul_mat_q1_0(
@@ -157,24 +154,24 @@ def mul_mat_q4_0(
             commit(f32(0.0), Y[row, column])
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(K, extent=auto("KC")) as kc:
-            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            wp = materialize(admit(W[nc, kc]))
             with L.tiles(M, extent=auto("MC")) as mc:
                 with L.rows(mc, group=auto("MR")) as mb:
                     with L.cols(nc, group=auto("NR")) as nb:
                         acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
                         with L.blocks(kc, extent=32) as kb:
-                            w = admit(wp[nb, kb]) @ transfer
-                            x = admit(Xq[mb, kb]) @ transfer
+                            w = wp[nb, kb]
+                            x = admit(Xq[mb, kb])
                             raw = outer_contract(
                                 x.q, w.q, over="k", acc=i32
-                            ) @ wide
+                            )
                             activation_sum = reduce(
                                 widen(x.q, i32), axis="k"
-                            ) @ wide
-                            centered = raw - i32(8) * activation_sum @ wide
+                            )
+                            centered = raw - i32(8) * activation_sum
                             acc += (
                                 widen(centered, f32) * f32(w.d) * f32(x.d)
-                            ) @ wide
+                            )
                         commit(acc, Y[mb, nb])
 
 
@@ -262,8 +259,8 @@ def mul_mat_q4_k(
             commit(vec_dot_q4_k_q8_k(W[column], Xq[row]), Y[row, column])
 
 
-def mul_mat_q4_k_i16(
-    W: View[Q4K_I16, (N, K)],
+def mul_mat_q4_k_persistent(
+    W: View[Q4K_I[16], (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
@@ -276,26 +273,26 @@ def mul_mat_q4_k_i16(
                     f32_acc = new(f32, [MR, 16], init=0)
                     with L.tiles(K, extent=auto("KC")) as kc:
                         with L.blocks(kc, extent=256) as kb:
-                            w = admit(W[nb, kb]) @ transfer
-                            x = admit(Xq[mb, kb]) @ transfer
+                            w = admit(W[nb, kb])
+                            x = admit(Xq[mb, kb])
                             i32_acc = new(i32, [MR, 16], init=0)
                             with L.subs(extent=32) as s:
                                 p32 = outer_contract(
                                     x.q[s], w.q[s], over="k", acc=i32
-                                ) @ wide
-                                i32_acc += p32 * w.sc[s] @ wide
+                                )
+                                i32_acc += p32 * w.sc[s]
                             mins = fold2(x.bsum)
                             min_term = outer_contract(
                                 mins, w.m, over="k", acc=i32
-                            ) @ wide
+                            )
                             f32_acc += x.ds * (
                                 w.d * i32_acc - w.dmin * min_term
-                            ) @ wide
+                            )
                     commit(f32_acc, Y[mb, nb])
 
 
-def mul_mat_q4_k_i16_decode(
-    W: View[Q4K_I16, (N, K)],
+def mul_mat_q4_k_persistent_decode(
+    W: View[Q4K_I[16], (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
@@ -305,19 +302,19 @@ def mul_mat_q4_k_i16_decode(
         with L.rows(N, group=16) as nb:
             f32_acc = new(f32, [16], init=0)
             with L.blocks(K, extent=256) as kb:
-                w = admit(W[nb, kb]) @ transfer
-                x = admit(Xq[row, kb]) @ transfer
+                w = admit(W[nb, kb])
+                x = admit(Xq[row, kb])
                 i32_acc = new(i32, [16], init=0)
                 with L.subs(extent=32) as s:
-                    p16 = mac_groups(w.q[s], x.q[s], n=4, into=i16) @ wide
-                    i32_acc += reduce(widen(p16, i32)) * w.sc[s] @ wide
+                    p16 = mac_groups(w.q[s], x.q[s], n=4, into=i16)
+                    i32_acc += reduce(widen(p16, i32)) * w.sc[s]
                 mins = fold2(x.bsum)
-                min_term = dot(w.m, mins) @ wide
-                f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term) @ wide
+                min_term = dot(w.m, mins)
+                f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
             commit(f32_acc, Y[row, nb])
 
 
-def mul_mat_q4_k_local_pack(
+def mul_mat_q4_k_staged(
     W: View[Q4_K, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -329,27 +326,27 @@ def mul_mat_q4_k_local_pack(
             commit(f32(0.0), Y[row, column])
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(K, extent=auto("KC")) as kc:
-            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            wp = materialize(admit(W[nc, kc]))
             with L.tiles(M, extent=auto("MC")) as mc:
                 with L.rows(mc, group=auto("MR")) as mb:
                     with L.cols(nc, group=16) as nb:
                         f32_acc = new(f32, [MR, 16], init=admit(Y[mb, nb]))
                         with L.blocks(kc, extent=256) as kb:
-                            w = admit(wp[nb, kb]) @ transfer
-                            x = admit(Xq[mb, kb]) @ transfer
+                            w = wp[nb, kb]
+                            x = admit(Xq[mb, kb])
                             i32_acc = new(i32, [MR, 16], init=0)
                             with L.subs(extent=32) as s:
                                 p32 = outer_contract(
                                     x.q[s], w.q[s], over="k", acc=i32
-                                ) @ wide
-                                i32_acc += p32 * w.sc[s] @ wide
+                                )
+                                i32_acc += p32 * w.sc[s]
                             mins = fold2(x.bsum)
                             min_term = outer_contract(
                                 mins, w.m, over="k", acc=i32
-                            ) @ wide
+                            )
                             f32_acc += x.ds * (
                                 w.d * i32_acc - w.dmin * min_term
-                            ) @ wide
+                            )
                         commit(f32_acc, Y[mb, nb])
 
 
@@ -448,7 +445,7 @@ def mul_mat_iq2_xxs(
             commit(value, Y[row, column])
 
 
-def mul_mat_iq2_xxs_local_pack(
+def mul_mat_iq2_xxs_staged(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -462,14 +459,14 @@ def mul_mat_iq2_xxs_local_pack(
             commit(f32(0.0), Y[row, column])
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(K, extent=auto("KC")) as kc:
-            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            wp = materialize(admit(W[nc, kc]))
             with L.tiles(M, extent=auto("MC")) as mc:
                 with L.rows(mc, group=auto("MR")) as mb:
                     with L.cols(nc, group=auto("NR")) as nb:
                         f32_acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
                         with L.blocks(kc, extent=256) as kb:
-                            w = admit(wp[nb, kb]) @ transfer
-                            x = admit(Xq[mb, kb]) @ transfer
+                            w = wp[nb, kb]
+                            x = admit(Xq[mb, kb])
                             entry_lane = iota(4)
                             codebook_lane = iota(8)
                             block_partial = _iq2_xxs_group_products(
@@ -493,21 +490,21 @@ def mul_mat_iq2_xxs_local_pack(
                                 )
                                 block_partial = (
                                     block_partial + group_partial
-                                ) @ wide
-                            entry_sum = reduce(block_partial, axis=1) @ wide
-                            block_sum = reduce(entry_sum, axis=1) @ wide
+                                )
+                            entry_sum = reduce(block_partial, axis=1)
+                            block_sum = reduce(entry_sum, axis=1)
                             f32_acc += (
                                 f32(w.d)
                                 * f32(x.ds)
                                 * widen(block_sum, f32)
-                            ) @ wide
+                            )
                         commit(f32_acc, Y[mb, nb])
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(M, extent=auto("MC")) as mc:
             with L.rows(mc, group=auto("MR")) as mb:
                 with L.cols(nc, group=auto("NR")) as nb:
-                    value = admit(Y[mb, nb]) @ transfer
-                    commit(f32(0.125) * value @ wide, Y[mb, nb])
+                    value = admit(Y[mb, nb])
+                    commit(f32(0.125) * value, Y[mb, nb])
 
 
 def mul_mat_iq3_s(
@@ -629,13 +626,23 @@ def mul_mat_f16(
 ):
     for row in range(M):
         with L.blocks(K, extent=1) as kb:
-            value = admit(X[row, kb]) @ transfer
-            commit(f16(value), Xh[row, kb]) @ transfer
+            value = admit(X[row, kb])
+            commit(f16(value), Xh[row, kb])
     for row in range(M):
         for column in range(N):
-            accumulator = f32(0.0)
-            with L.blocks(K, extent=1) as kb:
-                weight = f32((admit(W[column, kb]) @ transfer)[0])
-                activation = f32((admit(Xh[row, kb]) @ transfer)[0])
-                accumulator += weight * activation
-            commit(accumulator, Y[row, column])
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(admit(W[nc, kc]))
+            with L.tiles(M, extent=auto("MC")) as mc:
+                xp = materialize(admit(Xh[mc, kc]))
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=auto("NR")) as nb:
+                        acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=auto("KB")) as kb:
+                            weights = wp[nb, kb]
+                            activations = xp[mb, kb]
+                            acc += outer_contract(
+                                activations, weights, over="k", acc=f32
+                            )
+                        commit(acc, Y[mb, nb])

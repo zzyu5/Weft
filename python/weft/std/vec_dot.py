@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weft.language import L, View, admit, f32, i32, index, transfer, u32
+from weft.language import L, View, admit, f32, i32, index, u32
 
 from .encodings import (
     IQ1_M,
@@ -92,11 +92,11 @@ def vec_dot_q1_0_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=128) as wb:
-        w = admit(W[wb]) @ transfer
+        w = admit(W[wb])
         subtotal = f32(0.0)
         quarter = index(0)
         with L.subs(wb, extent=32) as xb:
-            x = admit(X[xb]) @ transfer
+            x = admit(X[xb])
             integer = i32(0)
             for byte in range(4):
                 bits = w.q[quarter * 4 + byte]
@@ -117,8 +117,8 @@ def vec_dot_q4_0_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = _dot_q4_values(w.q, x.q, zero=8)
         result += f32(integer) * f32(w.d) * f32(x.d)
     return result
@@ -130,8 +130,8 @@ def vec_dot_q4_1_q8_1(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = _dot_q4_values(w.q, x.q)
         result += (f32(w.d) * f32(x.d)) * f32(integer) + f32(w.m) * f32(x.s)
     return result
@@ -143,8 +143,8 @@ def vec_dot_q5_0_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         low = i32(0)
         high = i32(0)
         for j in range(16):
@@ -162,8 +162,8 @@ def vec_dot_q5_1_q8_1(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         low = i32(0)
         high = i32(0)
         for j in range(16):
@@ -181,8 +181,8 @@ def vec_dot_q8_0_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = i32(0)
         for j in range(32):
             integer += i32(w.q[j]) * i32(x.q[j])
@@ -196,8 +196,8 @@ def vec_dot_q2_k_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         scaled = i32(0)
         minimum = i32(0)
         for sub in range(16):
@@ -228,8 +228,8 @@ def vec_dot_q3_k_q8_k(
     lane6 = f32(0.0)
     lane7 = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         acc0 = i32(0)
         acc1 = i32(0)
         acc2 = i32(0)
@@ -300,8 +300,8 @@ def vec_dot_q4_k_q8_k(
     lane7 = f32(0.0)
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         minimum = i32(0)
         acc0 = i32(0)
         acc1 = i32(0)
@@ -369,8 +369,8 @@ def vec_dot_q5_k_q8_k(
     lane7 = f32(0.0)
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         minimum = i32(0)
         acc0 = i32(0)
         acc1 = i32(0)
@@ -438,8 +438,8 @@ def vec_dot_q6_k_q8_k(
     lane6 = f32(0.0)
     lane7 = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         acc0 = i32(0)
         acc1 = i32(0)
         acc2 = i32(0)
@@ -504,8 +504,8 @@ def vec_dot_iq1_s_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         main = i32(0)
         correction = i32(0)
         for group in range(8):
@@ -535,8 +535,8 @@ def vec_dot_iq1_m_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         sc0 = u32(w.scales[0]) | (u32(w.scales[1]) << u32(8))
         sc1 = u32(w.scales[2]) | (u32(w.scales[3]) << u32(8))
         sc2 = u32(w.scales[4]) | (u32(w.scales[5]) << u32(8))
@@ -596,8 +596,8 @@ def vec_dot_iq2_xxs_q8_k(
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         block_sum = i32(0)
         for group in range(8):
             word0 = u32(w.q[group * 4]) | (u32(w.q[group * 4 + 1]) << u32(16))
@@ -623,8 +623,8 @@ def vec_dot_iq2_xs_q8_k(
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         block_sum = i32(0)
         for group in range(8):
             first = i32(0)
@@ -658,8 +658,8 @@ def vec_dot_iq2_s_q8_k(
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         block_sum = i32(0)
         for group in range(8):
             first = i32(0)
@@ -698,8 +698,8 @@ def vec_dot_iq3_xxs_q8_k(
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         block_sum = i32(0)
         for group in range(8):
             metadata_base = 64 + group * 4
@@ -744,8 +744,8 @@ def vec_dot_iq3_s_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         block_sum = i32(0)
         for group in range(8):
             local = i32(0)
@@ -785,8 +785,8 @@ def vec_dot_iq4_nl_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = _dot_codebook32(w.q, x.q, codebook)
         result += (f32(x.d) * f32(w.d)) * f32(integer)
     return result
@@ -799,8 +799,8 @@ def vec_dot_iq4_xs_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         for sub in range(8):
             low = u32(w.scales_l[sub // 2])
             shift = (sub % 2) * 4
@@ -823,8 +823,8 @@ def vec_dot_tq1_0_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = i32(0)
         for j in range(32):
             for digit in range(5):
@@ -848,8 +848,8 @@ def vec_dot_tq2_0_q8_k(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = i32(0)
         for chunk in range(2):
             for digit in range(4):
@@ -870,8 +870,8 @@ def vec_dot_mxfp4_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
-        w = admit(W[kb]) @ transfer
-        x = admit(X[kb]) @ transfer
+        w = admit(W[kb])
+        x = admit(X[kb])
         integer = _dot_codebook32(w.q, x.q, codebook)
         scale = f32(x.d) * exponent_scale(e8m0_scale, w.e)
         result += scale * f32(integer)
@@ -886,10 +886,10 @@ def vec_dot_nvfp4_q8_0(
 ):
     result = f32(0.0)
     with L.blocks(K, extent=64) as wb:
-        w = admit(W[wb]) @ transfer
+        w = admit(W[wb])
         x_block = index(0)
         with L.subs(wb, extent=32) as xb:
-            x = admit(X[xb]) @ transfer
+            x = admit(X[xb])
             for half in range(2):
                 sub = x_block * 2 + half
                 integer = i32(0)

@@ -162,10 +162,6 @@ private:
         {"control_path", riscv_internal::strings(builder, controlPath)},
         {"location",
          builder.getStringAttr(riscv_internal::printAttribute(operation.getLoc()))}};
-    if (auto engine = operation.getAttrOfType<mlir::StringAttr>("engine"))
-      fields.push_back({"engine", engine});
-    else
-      fields.push_back({"engine", builder.getStringAttr("")});
     const bool opensLevel = mlir::isa<kernel::LevelOp>(operation);
     const bool opensControl = mlir::isa<kernel::ForOp, kernel::WhileOp,
                                         kernel::IfOp>(operation);

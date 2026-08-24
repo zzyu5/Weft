@@ -11,11 +11,11 @@
 
 extern "C" {
 #if defined(WEFT_Q4_IME)
-std::size_t q4_k_q8_k_gemv_ime_W_packed_size(std::size_t M, std::size_t K);
-void q4_k_q8_k_gemv_ime_W_pack(const std::uint8_t *source,
+std::size_t q4_k_q8_k_gemv_contract_W_packed_size(std::size_t M, std::size_t K);
+void q4_k_q8_k_gemv_contract_W_pack(const std::uint8_t *source,
                                 std::uint8_t *target, std::size_t M,
                                 std::size_t K);
-void q4_k_q8_k_gemv_ime(const std::uint8_t *W, const std::uint8_t *X, float *Y,
+void q4_k_q8_k_gemv_contract(const std::uint8_t *W, const std::uint8_t *X, float *Y,
                         std::size_t M, std::size_t K);
 #elif defined(WEFT_Q4_GROUPS4)
 std::size_t q4_k_q8_k_gemv_groups4_W_packed_size(std::size_t M,
@@ -35,10 +35,10 @@ void q4_k_q8_k_gemv(const std::uint8_t *W, const std::uint8_t *X, float *Y,
 }
 
 #if defined(WEFT_Q4_IME)
-#define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_ime_W_packed_size
-#define WEFT_Q4_PACK q4_k_q8_k_gemv_ime_W_pack
-#define WEFT_Q4_KERNEL q4_k_q8_k_gemv_ime
-#define WEFT_Q4_KERNEL_NAME "q4_k_q8_k_gemv_ime"
+#define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_contract_W_packed_size
+#define WEFT_Q4_PACK q4_k_q8_k_gemv_contract_W_pack
+#define WEFT_Q4_KERNEL q4_k_q8_k_gemv_contract
+#define WEFT_Q4_KERNEL_NAME "q4_k_q8_k_gemv_contract"
 #elif defined(WEFT_Q4_GROUPS4)
 #define WEFT_Q4_PACKED_SIZE q4_k_q8_k_gemv_groups4_W_packed_size
 #define WEFT_Q4_PACK q4_k_q8_k_gemv_groups4_W_pack

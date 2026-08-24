@@ -16,20 +16,6 @@ class Intrinsic:
 
 
 @dataclass(frozen=True, slots=True)
-class EngineRole:
-    name: str
-
-    def __rmatmul__(self, value: object) -> object:
-        raise LanguageUseError("engine-role binding is compile-time Weft syntax")
-
-
-scalar = EngineRole("scalar")
-wide = EngineRole("wide")
-matrix = EngineRole("matrix")
-transfer = EngineRole("transfer")
-
-
-@dataclass(frozen=True, slots=True)
 class LevelConstructor:
     relation: str
 
@@ -57,7 +43,6 @@ iota = _intrinsic("iota")
 materialize = _intrinsic("materialize")
 admit = _intrinsic("admit")
 commit = _intrinsic("commit")
-handoff = _intrinsic("handoff")
 
 mac_pairs = _intrinsic("mac_pairs")
 mac_groups = _intrinsic("mac_groups")
@@ -69,7 +54,6 @@ dot = _intrinsic("dot")
 contract = _intrinsic("contract")
 outer_contract = _intrinsic("outer_contract")
 lookup = _intrinsic("lookup")
-pack = _intrinsic("pack")
 interleave = _intrinsic("interleave")
 
 maximum = _intrinsic("maximum")

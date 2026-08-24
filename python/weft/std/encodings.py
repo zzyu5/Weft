@@ -14,6 +14,7 @@ from weft.language import (
     joined,
     layered,
     lo_first,
+    static,
     u4,
     u6,
     u8,
@@ -260,5 +261,7 @@ class Q8_K:
 
 
 @weft.derive
-def Q4K_I16(W: View[Q4_K, (M, K)]) -> View[Q4K_I16, (M, K)]:
-    return interleave(W, rows=16)
+def Q4K_I(
+    W: View[Q4_K, (M, K)], *, rows: static[int]
+) -> View[Q4K_I[rows], (M, K)]:
+    return interleave(W, rows=rows)

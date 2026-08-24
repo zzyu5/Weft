@@ -16,8 +16,6 @@ from weft.language import (
     maximum,
     new,
     reduce,
-    transfer,
-    wide,
 )
 
 
@@ -36,18 +34,18 @@ def flash_attention(
     O: View[f16, (Tq, D)],
 ):
     with L.rows(Tq, group=auto("BQ")) as qb:
-        q = materialize(admit(Q[qb, :])) @ transfer
+        q = materialize(admit(Q[qb, :]))
         m = new(f32, [BQ], init=-inf)
         l = new(f32, [BQ], init=0)
         o = new(f32, [BQ, D], init=0)
         with L.blocks(Tk, extent=auto("BK")) as kb:
-            k = admit(K[kb, :]) @ transfer
-            v = admit(V[kb, :]) @ transfer
-            s = contract(q, k, over="d", acc=f32) @ wide
-            m_new = maximum(m, _rowmax(s)) @ wide
-            p = exp(s - m_new) @ wide
-            alpha = exp(m - m_new) @ wide
-            l = l * alpha + _rowsum(p) @ wide
-            o = o * alpha + contract(p, v, over="tk") @ wide
+            k = admit(K[kb, :])
+            v = admit(V[kb, :])
+            s = contract(q, k, over="d", acc=f32)
+            m_new = maximum(m, _rowmax(s))
+            p = exp(s - m_new)
+            alpha = exp(m - m_new)
+            l = l * alpha + _rowsum(p)
+            o = o * alpha + contract(p, v, over="tk")
             m = m_new
         commit(o / l, O[qb, :])

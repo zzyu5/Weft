@@ -259,36 +259,36 @@ constexpr int kElements = 256;
 #define selected_quantize quantize_row_q8_K_ref
 #if defined(WEFT_Q4_DERIVED)
 #if defined(WEFT_Q4_DERIVED_DECODE)
-extern "C" std::size_t production_mul_mat_q4_k_i16_decode_W_packed_size(
+extern "C" std::size_t production_mul_mat_q4_k_persistent_decode_W_packed_size(
     std::size_t, std::size_t);
-extern "C" void production_mul_mat_q4_k_i16_decode_W_pack(
+extern "C" void production_mul_mat_q4_k_persistent_decode_W_pack(
     const std::uint8_t *, std::uint8_t *, std::size_t, std::size_t);
-extern "C" void production_mul_mat_q4_k_i16_decode(
+extern "C" void production_mul_mat_q4_k_persistent_decode(
     const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
     std::size_t, std::size_t);
-#define selected_packed_size production_mul_mat_q4_k_i16_decode_W_packed_size
-#define selected_pack production_mul_mat_q4_k_i16_decode_W_pack
+#define selected_packed_size production_mul_mat_q4_k_persistent_decode_W_packed_size
+#define selected_pack production_mul_mat_q4_k_persistent_decode_W_pack
 #define selected_call(w, x, xq, y)                                            \
-  production_mul_mat_q4_k_i16_decode(w, x, xq, y, runtimeM, kK, kN)
+  production_mul_mat_q4_k_persistent_decode(w, x, xq, y, runtimeM, kK, kN)
 #else
-extern "C" std::size_t production_mul_mat_q4_k_i16_W_packed_size(
+extern "C" std::size_t production_mul_mat_q4_k_persistent_W_packed_size(
     std::size_t, std::size_t);
-extern "C" void production_mul_mat_q4_k_i16_W_pack(
+extern "C" void production_mul_mat_q4_k_persistent_W_pack(
     const std::uint8_t *, std::uint8_t *, std::size_t, std::size_t);
-extern "C" void production_mul_mat_q4_k_i16(
+extern "C" void production_mul_mat_q4_k_persistent(
     const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
     std::size_t, std::size_t);
-#define selected_packed_size production_mul_mat_q4_k_i16_W_packed_size
-#define selected_pack production_mul_mat_q4_k_i16_W_pack
+#define selected_packed_size production_mul_mat_q4_k_persistent_W_packed_size
+#define selected_pack production_mul_mat_q4_k_persistent_W_pack
 #define selected_call(w, x, xq, y)                                            \
-  production_mul_mat_q4_k_i16(w, x, xq, y, runtimeM, kK, kN)
+  production_mul_mat_q4_k_persistent(w, x, xq, y, runtimeM, kK, kN)
 #endif
-#elif defined(WEFT_Q4_LOCAL_PACK)
-extern "C" void production_mul_mat_q4_k_local_pack(
+#elif defined(WEFT_Q4_STAGED)
+extern "C" void production_mul_mat_q4_k_staged(
     const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
     std::size_t, std::size_t);
 #define selected_call(w, x, xq, y)                                            \
-  production_mul_mat_q4_k_local_pack(w, x, xq, y, kN, kK, runtimeM)
+  production_mul_mat_q4_k_staged(w, x, xq, y, kN, kK, runtimeM)
 #else
 extern "C" void production_mul_mat_q4_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q4_k(w, x, xq, y, kN, kK, runtimeM)
@@ -361,12 +361,12 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xxs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
-#if defined(WEFT_IQ2_XXS_LOCAL_PACK)
-extern "C" void production_mul_mat_iq2_xxs_local_pack(
+#if defined(WEFT_IQ2_XXS_STAGED)
+extern "C" void production_mul_mat_iq2_xxs_staged(
     const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *,
     const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y)                                            \
-  production_mul_mat_iq2_xxs_local_pack(w, x, xq, iq2xxs_i8.data(),          \
+  production_mul_mat_iq2_xxs_staged(w, x, xq, iq2xxs_i8.data(),          \
                                          signs_i8.data(), y, kN, kK, runtimeM)
 #else
 extern "C" void production_mul_mat_iq2_xxs(const std::uint8_t *, const float *, std::uint8_t *, const float *, const float *, float *, std::size_t, std::size_t, std::size_t);
@@ -457,7 +457,7 @@ extern "C" void production_mul_mat_nvfp4(const std::uint8_t *, const float *, st
 #endif
 
 #if WEFT_MUL_MAT_FORMAT == 9 &&                                                \
-    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_LOCAL_PACK))
+    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_STAGED))
 float reference_f32_mul(float lhs, float rhs) {
   volatile float result = lhs * rhs;
   return result;
@@ -642,7 +642,7 @@ int main(int argc, char **argv) {
     found = true;
     for (std::size_t row = 0; row < runtimeM; ++row) {
 #if WEFT_MUL_MAT_FORMAT == 9 &&                                                \
-    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_LOCAL_PACK))
+    (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_STAGED))
       expectedRows[row] = q4k_blocked_reference(
           weightRow.data(), expected_workspace.data() + row * kK / selected_xqk);
 #else

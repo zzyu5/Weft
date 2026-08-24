@@ -18,7 +18,7 @@ from weft.api import (
 )
 from weft.diagnostics import FrontendError, SourceLocation
 from weft.language.annotations import AutoSpec, View, auto
-from weft.language.builtins import EngineRole, Intrinsic, LevelConstructor
+from weft.language.builtins import Intrinsic, LevelConstructor
 from weft.language.dtypes import (
     DType,
     DTypeCategory,
@@ -230,48 +230,6 @@ class _SliceInfo:
 
 
 class FrontendCompiler:
-    _ENGINE_OPS = {
-        "weft_kernel.admit",
-        "weft_kernel.commit",
-        "weft_kernel.materialize",
-        "weft_kernel.stage_handoff",
-        "weft_kernel.unary",
-        "weft_kernel.binary",
-        "weft_kernel.mac_pairs",
-        "weft_kernel.mac_groups",
-        "weft_kernel.widen",
-        "weft_kernel.reduce",
-        "weft_kernel.fold2",
-        "weft_kernel.dot",
-        "weft_kernel.contract",
-        "weft_kernel.outer_contract",
-        "weft_kernel.lookup",
-        "weft_kernel.pack",
-        "weft_kernel.interleave",
-        "weft_kernel.compare",
-        "weft_kernel.cast",
-    }
-
-    _ENGINE_COMPATIBILITY = {
-        "scalar": {
-            "weft_kernel.unary", "weft_kernel.binary", "weft_kernel.compare",
-            "weft_kernel.cast", "weft_kernel.lookup",
-        },
-        "wide": {
-            "weft_kernel.unary", "weft_kernel.binary", "weft_kernel.compare", "weft_kernel.cast",
-            "weft_kernel.mac_pairs", "weft_kernel.mac_groups", "weft_kernel.widen",
-            "weft_kernel.reduce", "weft_kernel.fold2", "weft_kernel.dot",
-            "weft_kernel.contract", "weft_kernel.outer_contract", "weft_kernel.lookup",
-        },
-        "matrix": {
-            "weft_kernel.dot", "weft_kernel.contract", "weft_kernel.outer_contract",
-        },
-        "transfer": {
-            "weft_kernel.admit", "weft_kernel.commit", "weft_kernel.materialize",
-            "weft_kernel.stage_handoff", "weft_kernel.pack", "weft_kernel.interleave",
-        },
-    }
-
     def __init__(self, definition: KernelDefinition[object, object]) -> None:
         self.definition = definition
         self.source = FunctionSource.from_definition(definition)
@@ -281,9 +239,6 @@ class FrontendCompiler:
         self.static_env: dict[str, object] = {}
         self.immutable_names: set[str] = set()
         self.active_domain: Value | None = None
-        self.active_engine: str | None = None
-        self.engine_target: ast.AST | None = None
-        self.engine_consumed = False
         self._shape_ids: dict[str, int] = {}
         self._axis_ids: dict[str, int] = {}
         self._shape_symbols: dict[str, Value] = {}
@@ -292,7 +247,7 @@ class FrontendCompiler:
         self._next_domain_serial = 1
         self._declarations: list[Operation] = []
         self._declared_encodings: dict[str, _EncodingInfo] = {}
-        self._declared_derives: set[str] = set()
+        self._declared_derives: set[tuple[str, tuple[int, ...]]] = set()
         self._declaring_derives: set[str] = set()
         self._slice_info: dict[Value, _SliceInfo] = {}
         self._encoded_axis: dict[Value, int] = {}
@@ -371,18 +326,6 @@ class FrontendCompiler:
         if self.block is None:
             raise AssertionError("compiler has no insertion block")
         attrs = dict(attributes or {})
-        if self.active_engine is not None and node is self.engine_target:
-            if name not in self._ENGINE_OPS:
-                raise FrontendError(
-                    f"{name} does not accept an engine binding", self._location(node)
-                )
-            if name not in self._ENGINE_COMPATIBILITY[self.active_engine]:
-                raise FrontendError(
-                    f"engine role {self.active_engine!r} cannot realize {name}",
-                    self._location(node),
-                )
-            attrs["engine"] = _string(self.active_engine)
-            self.engine_consumed = True
         return self.builder.emit(
             self.block,
             name,
@@ -429,10 +372,30 @@ class FrontendCompiler:
             if isinstance(static, EncodingDefinition):
                 return self._declare_encoding(static).value_type
             if isinstance(static, DerivedEncodingDefinition):
-                self._declare_derived(static)
-                return EncodingType(static.__name__, "derived_family", "")
+                raise FrontendError(
+                    "kernel ABI requires a concrete derived Encoding instance",
+                    self._location(annotation),
+                )
         if isinstance(annotation, ast.Subscript):
             owner = self._resolve_static(annotation.value)
+            if isinstance(owner, DerivedEncodingDefinition):
+                arguments = (
+                    list(annotation.slice.elts)
+                    if isinstance(annotation.slice, ast.Tuple)
+                    else [annotation.slice]
+                )
+                values = tuple(self._eval_static(argument) for argument in arguments)
+                if not values or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in values
+                ):
+                    raise FrontendError(
+                        "derived Encoding parameters are positive static integers",
+                        self._location(annotation),
+                    )
+                self._declare_derived(owner, values)
+                identity = owner.__name__ + "[" + ",".join(str(value) for value in values) + "]"
+                return EncodingType(owner.__name__, "derived_instance", identity)
             if owner is View:
                 items = (
                     list(annotation.slice.elts)
@@ -796,9 +759,12 @@ class FrontendCompiler:
         if dtype.bits is None or dtype.bits * (group.size // layer.size) != 8:
             raise FrontendError("current layered layout requires one byte per layer position")
 
-    def _declare_derived(self, definition: DerivedEncodingDefinition) -> None:
+    def _declare_derived(
+        self, definition: DerivedEncodingDefinition, arguments: tuple[int, ...]
+    ) -> None:
         name = definition.__name__
-        if name in self._declared_derives:
+        instance = (name, arguments)
+        if instance in self._declared_derives:
             return
         if name in self._declaring_derives:
             raise FrontendError(f"recursive derived encoding {name!r}")
@@ -806,13 +772,26 @@ class FrontendCompiler:
         source = FunctionSource.from_definition(definition)
         if len(source.function.args.args) != 1 or source.function.args.args[0].annotation is None:
             raise FrontendError("derived encoding takes one annotated View", source.location(source.function))
+        static_parameters = source.function.args.kwonlyargs
+        if len(static_parameters) != len(arguments):
+            raise FrontendError(
+                "derived Encoding instance does not bind every static parameter",
+                source.location(source.function),
+            )
         previous_source = self.source
+        previous_static = self.static_env
         self.source = source
+        self.static_env = dict(previous_static)
+        self.static_env.update(
+            {parameter.arg: value for parameter, value in zip(static_parameters, arguments)}
+        )
         try:
             source_type = self._parse_annotation(source.function.args.args[0].annotation)
             if not isinstance(source_type, ViewType):
                 raise FrontendError("derived encoding input must be a View", source.location(source.function))
-            result_encoding = EncodingType(name, "derived_family", "")
+            identity = name + "[" + ",".join(str(value) for value in arguments) + "]"
+            symbol = name + "$" + "$".join(str(value) for value in arguments)
+            result_encoding = EncodingType(name, "derived_instance", identity)
             result_type = ViewType(result_encoding, source_type.shape, source_type.axes)
             region = self.builder.region((source_type,), (source.function.args.args[0].arg,))
             saved = (self.block, self.env, self._derive_result, self.active_domain)
@@ -841,7 +820,7 @@ class FrontendCompiler:
                     "weft_kernel.derive",
                     source.location(source.function),
                     attributes={
-                        "sym_name": _string(name),
+                        "sym_name": _string(symbol),
                         "source_family": _string(source_type.encoding.family),
                         "result_family": _string(name),
                         "parameters": _strings(parameters),
@@ -872,9 +851,10 @@ class FrontendCompiler:
                     source_info.storage_bits,
                     source_info.logical_extent,
                 )
-            self._declared_derives.add(name)
+            self._declared_derives.add(instance)
         finally:
             self.source = previous_source
+            self.static_env = previous_static
             self._declaring_derives.discard(name)
 
     def _compile_statements(self, statements: Sequence[ast.stmt]) -> None:
@@ -987,24 +967,6 @@ class FrontendCompiler:
         if isinstance(expression, ast.Subscript):
             return self._compile_subscript(expression)
         if isinstance(expression, ast.BinOp):
-            if isinstance(expression.op, ast.MatMult):
-                role = self._resolve_static(expression.right)
-                if not isinstance(role, EngineRole):
-                    raise FrontendError("right side of @ must be an engine role", self._location(expression.right))
-                previous = (self.active_engine, self.engine_target, self.engine_consumed)
-                self.active_engine = role.name
-                self.engine_target = expression.left
-                self.engine_consumed = False
-                try:
-                    result = self._compile_expr(expression.left)
-                    if not self.engine_consumed:
-                        raise FrontendError(
-                            "engine role must bind one explicit basic operation",
-                            self._location(expression.left),
-                        )
-                    return result
-                finally:
-                    self.active_engine, self.engine_target, self.engine_consumed = previous
             lhs, rhs = self._compile_binary_operands(expression.left, expression.right)
             operations = {
                 ast.Add: "add",
@@ -1590,13 +1552,7 @@ class FrontendCompiler:
         axes = list(region.type.axes)
         element: ValueType
         record_axis: int | None = None
-        ephemeral_encoded = (
-            encoding.kind == "ephemeral"
-            and encoding.family in self._declared_encodings
-        )
-        if encoding.kind == "dense" or (
-            encoding.kind == "ephemeral" and not ephemeral_encoded
-        ):
+        if encoding.kind == "dense":
             scalar_family = encoding.family
             static = getattr(sys.modules["weft.language"], scalar_family)
             element = ScalarType(static)
@@ -1633,16 +1589,6 @@ class FrontendCompiler:
             raise FrontendError("commit destination is a View region", self._location(call))
         self._emit("weft_kernel.commit", call, operands=(value, region))
         return None
-
-    def _intrinsic_handoff(self, call: ast.Call) -> Value:
-        args = self._arguments(call, ("value",), {})
-        value = self._expect_value(self._compile_expr(args["value"]), args["value"])
-        return self._emit(
-            "weft_kernel.stage_handoff",
-            call,
-            operands=(value,),
-            result_types=(value.type,),
-        )[0]
 
     def _intrinsic_widen(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("value", "dtype"), {})
@@ -1873,26 +1819,6 @@ class FrontendCompiler:
             result_types=(result_type,),
         )[0]
 
-    def _intrinsic_pack(self, call: ast.Call) -> Value:
-        args = self._arguments(call, ("view",), {"along": None})
-        value = self._expect_value(self._compile_expr(args["view"]), args["view"])
-        if not isinstance(value.type, (ViewType, SliceType)):
-            raise FrontendError("pack expects a View region", self._location(call))
-        along = self._eval_static(args["along"]) if isinstance(args["along"], ast.expr) else args["along"]
-        encoding = EncodingType(
-            value.type.encoding.family,
-            "ephemeral",
-            f"packed.along.{along}",
-        )
-        result_type = ViewType(encoding, value.type.shape, value.type.axes)
-        return self._emit(
-            "weft_kernel.pack",
-            call,
-            operands=(value,),
-            result_types=(result_type,),
-            attributes={"along": _string(str(along))},
-        )[0]
-
     def _intrinsic_interleave(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("view",), {"rows": None})
         value = self._expect_value(self._compile_expr(args["view"]), args["view"])
@@ -1946,8 +1872,6 @@ class FrontendCompiler:
             value = statement.value
         elif isinstance(statement, ast.AnnAssign):
             value = statement.value
-        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.MatMult):
-            value = value.left
         if not isinstance(value, ast.Call):
             return None
         callee = self._resolve_static(value.func)
@@ -2276,8 +2200,6 @@ class FrontendCompiler:
                 static = self._resolve_static(expression)
             except FrontendError:
                 return None
-            if isinstance(static, EngineRole):
-                return ("engine", static.name)
         return None
 
     def _annotation_signature(
@@ -2295,7 +2217,11 @@ class FrontendCompiler:
             items = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
             if len(items) != 2:
                 return None
-            encoding = source.resolve(items[0])
+            encoding_node = items[0]
+            if isinstance(encoding_node, ast.Subscript):
+                encoding = source.resolve(encoding_node.value)
+            else:
+                encoding = source.resolve(encoding_node)
             if isinstance(encoding, DType):
                 family = encoding.name
             elif isinstance(encoding, (EncodingDefinition, DerivedEncodingDefinition)):
@@ -2338,13 +2264,6 @@ class FrontendCompiler:
             if expected is not None and actual != expected:
                 return False
             parameter = definition.signature.parameters[name]
-            if name == "engine":
-                actual_engine = self._expression_signature(node)
-                if not actual_engine or actual_engine[0] != "engine":
-                    return False
-                default = parameter.default
-                if isinstance(default, EngineRole) and actual_engine != ("engine", default.name):
-                    return False
         return True
 
     def _select_overload(self, overloads: OverloadSet, call: ast.Call) -> InlineDefinition:
@@ -2366,14 +2285,14 @@ class FrontendCompiler:
         parameter: inspect.Parameter,
     ) -> Value | object:
         static_default = parameter.default
-        if isinstance(static_default, (AutoSpec, EngineRole, DType, str, int)):
+        if isinstance(static_default, (AutoSpec, DType, str, int)):
             return self._eval_static(expression)
         if isinstance(expression, (ast.Name, ast.Attribute, ast.Call)):
             try:
                 static = self._eval_static(expression)
             except FrontendError:
                 static = None
-            if isinstance(static, (AutoSpec, EngineRole, DType)):
+            if isinstance(static, (AutoSpec, DType)):
                 return static
         return self._expect_value(self._compile_expr(expression), expression)
 
@@ -2396,8 +2315,6 @@ class FrontendCompiler:
             else:
                 static_bound[parameter_ast.arg] = value
         saved = (self.source, self.env, self.static_env, self.immutable_names)
-        engine_target = self.engine_target
-        bind_return_engine = engine_target is call
         self.source = source
         self.env = dict(self._shape_symbols)
         self.env.update(bound)
@@ -2410,8 +2327,6 @@ class FrontendCompiler:
                 self._compile_statements(body[:-1])
                 return_node = body[-1]
                 assert isinstance(return_node, ast.Return)
-                if bind_return_engine and return_node.value is not None:
-                    self.engine_target = return_node.value
                 return (
                     self._expect_value(self._compile_expr(return_node.value), return_node.value)
                     if return_node.value is not None
@@ -2421,7 +2336,6 @@ class FrontendCompiler:
             return None
         finally:
             self.source, self.env, self.static_env, self.immutable_names = saved
-            self.engine_target = engine_target
 
 
 def lower_to_mlir(definition: KernelDefinition[object, object]) -> str:
