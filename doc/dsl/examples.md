@@ -51,26 +51,26 @@ def q4k_gemv(
         f32_acc = new(f32, [16], init=0)
 
         with L.blocks(K, extent=256) as kb:
-            w = admit(W[nb, kb]) @ transfer
-            x = admit(X[kb]) @ transfer
+            w = admit(W[nb, kb])
+            x = admit(X[kb])
             i32_acc = new(i32, [16], init=0)
 
             with L.subs(extent=32) as s:
                 # [16,32] × [32] -> [16,16] i16 partials
-                p16 = mac_pairs(w.q[s], x.q[s], into=i16) @ wide
+                p16 = mac_pairs(w.q[s], x.q[s], into=i16)
                 # 消去 element-pair 轴，保留 16-output free axis
-                sub_sum = reduce(widen(p16, i32), op="add", axis="k") @ wide
-                i32_acc += sub_sum * i32(w.sc[s]) @ wide
+                sub_sum = reduce(widen(p16, i32), op="add", axis="k")
+                i32_acc += sub_sum * i32(w.sc[s])
 
             # bsum 粒度 16，m 粒度 32
             mins = fold2(x.bsum)
-            min_term = dot(widen(w.m, i32), mins) @ wide
+            min_term = dot(widen(w.m, i32), mins)
 
             # ds 属于当前 Q8_K block，必须在 block handoff 处参与
             f32_acc += f32(x.ds) * (
                 f32(w.d) * f32(i32_acc)
                 - f32(w.dmin) * f32(min_term)
-            ) @ wide
+            )
 
         commit(f32_acc, Y[nb])
 ```
@@ -100,8 +100,8 @@ single vec-dot
 persistent blocked MUL_MAT/GEMV
     View[Q4K_I[16], (N,K)]，跨调用已重排，多输出cohort在kernel内
 
-canonical local-pack MUL_MAT
-    Q4_K[N,K]，每次invocation内materialize(pack(...))
+canonical staged MUL_MAT
+    Q4_K[N,K]，每次 invocation 内 materialize canonical region；target 可选择 local pack
 ```
 
 它们的ABI、物化次数和Level树不同，必须分别由作者函数表达。
@@ -116,12 +116,12 @@ def mul_mat(
 ):
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(K, extent=auto("KC")) as kc:
-            # 每个(NC,KC) panel一次，被所有MC复用
-            Bp = materialize(pack(B[kc, nc], along="k")) @ transfer
+            # 每个(NC,KC) staged region一次，被所有MC复用
+            Bp = materialize(admit(B[kc, nc]))
 
             with L.tiles(M, extent=auto("MC")) as mc:
-                # 每个(MC,KC) panel一次
-                Ap = materialize(pack(A[mc, kc], along="k")) @ transfer
+                # 每个(MC,KC) staged region一次
+                Ap = materialize(admit(A[mc, kc]))
 
                 with L.rows(mc, group=auto("MR")) as mb:
                     with L.cols(nc, group=auto("NR")) as nb:
@@ -129,18 +129,20 @@ def mul_mat(
                         acc = new(f32, [MR, NR], init=admit(C[mb, nb]))
 
                         with L.blocks(kc, extent=auto("KB")) as kb:
-                            a = admit(Ap[mb, kb]) @ transfer
-                            b = admit(Bp[kb, nb]) @ transfer
-                            acc += outer_contract(a, b, over="k") @ wide
+                            a = Ap[mb, kb]
+                            b = Bp[kb, nb]
+                            acc += outer_contract(a, b, over="k")
 
                         commit(acc, C[mb, nb])
 ```
 
 ### 2.1 KC 不能省略
 
-`Bp` 在 KC 层诞生，作用域是 `KC × NC`，被该 KC 下所有 MC 复用。没有 KC 层时，无法仅靠注释表达 panel size、物化频率和C的分段累加。
+`Bp` 在 KC 层诞生，作用域是 `KC × NC`，被该 KC 下所有 MC 复用。没有 KC 层时，无法仅靠注释表达 staged region 的逻辑范围、物化频率和 C 的分段累加。
 
-`along="k"` 规定 K 是 local pack 的连续供应方向；它不固定 vector window、register tuple、fragment operand 或 local-storage tile 的具体形状。后者由 target compiler 根据 A、B operands 的 producer mapping、所有 consumer、资源与 engine role 选择。
+source 不规定 local pack 的连续方向。target compiler 根据 A/B 的 logical axes、Encoding/address relation、所有 consumers、widening、reuse、resources 与 chosen engine，决定是否建立 local pack 以及 axis orientation。若作者确实要改变 logical axes，必须写显式 transpose/reshape/index；若要改变跨调用 bytes，必须写 derived Encoding。
+
+同一份 `outer_contract` 可以由 RVV register microkernel 或 IME fragment 实现。若 build 必须实际使用 IME，调用侧在 build config 中声明 `require=uses_extension(IME)`；该 requirement 不改变这里的 source tree。不满足时 build 失败，不退回另一 engine。若 IME 需要不同的 source-visible materialization 或 Level，作者另写一份 std 函数。
 
 ### 2.2 Accumulator 作用域是数值决策
 
@@ -158,7 +160,7 @@ read/init once → accumulate entire K → write once
 
 两者的 C traffic、state lifetime 和浮点累加顺序不同，是两棵作者程序。编译器不能根据cache或寄存器压力在两者之间切换。
 
-量化 MUL_MAT 可以复用 NC/KC/MC/MR/NR 外层骨架，但内层量化树、activation quantize、workspace和persistent/local packing必须由对应std函数显式写出；它们不是dense `outer_contract` 的隐式后端模式。
+量化 MUL_MAT 可以复用 NC/KC/MC/MR/NR 外层骨架，但内层量化树、activation quantize、workspace 和 persistent Encoding 必须由对应 std 函数显式写出；它们不是 dense `outer_contract` 的隐式后端模式。invocation-local pack 属于同一树的 target physical representation。
 
 ## 3. GEMV 是 blocked MUL_MAT 的退化
 
@@ -172,8 +174,8 @@ def gemv(
         acc = new(f32, [MR], init=0)
         with L.blocks(K, extent=auto("KB")) as kb:
             # X block被当前MR行共同使用
-            x = admit(X[kb]) @ transfer
-            acc += contract(admit(W[mb, kb]), x, over="k") @ wide
+            x = admit(X[kb])
+            acc += contract(admit(W[mb, kb]), x, over="k")
         commit(acc, Y[mb])
 ```
 
@@ -202,25 +204,25 @@ def flash_attention(
     O: View[f16, (Tq, D)],
 ):
     with L.rows(Tq, group=auto("BQ")) as qb:
-        q = materialize(admit(Q[qb, :])) @ transfer
+        q = materialize(admit(Q[qb, :]))
         m = new(f32, [BQ], init=-inf)
         l = new(f32, [BQ], init=0)
         o = new(f32, [BQ, D], init=0)
 
         with L.blocks(Tk, extent=auto("BK")) as kb:
-            k = admit(K[kb, :]) @ transfer
-            v = admit(V[kb, :]) @ transfer
+            k = admit(K[kb, :])
+            v = admit(V[kb, :])
 
-            s = contract(q, k, over="d", acc=f32) @ wide
-            m_new = maximum(m, rowmax(s)) @ wide
-            p = exp(s - m_new) @ wide
-            alpha = exp(m - m_new) @ wide
+            s = contract(q, k, over="d", acc=f32)
+            m_new = maximum(m, rowmax(s))
+            p = exp(s - m_new)
+            alpha = exp(m - m_new)
 
-            l = l * alpha + rowsum(p) @ wide
-            o = o * alpha + contract(p, v, over="tk", acc=f32) @ wide
+            l = l * alpha + rowsum(p)
+            o = o * alpha + contract(p, v, over="tk", acc=f32)
             m = m_new
 
-        out = narrow(o / l, f16) @ wide
+        out = narrow(o / l, f16)
         commit(out, O[qb, :])
 ```
 

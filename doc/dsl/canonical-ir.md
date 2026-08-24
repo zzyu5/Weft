@@ -20,8 +20,7 @@ Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它�
 - field storage span；
 - grouped/layered/bit-plane/joined mapping；
 - View/Slice 的 logical shape 和 axis identities；
-- derive builder、persistent interleave 与 pinned artifact layout identity；
-- invocation-local `pack` 的 source presence、`along`、logical result、Level 和 engine role。
+- derive builder、persistent interleave 与 pinned artifact layout identity。
 
 ### 1.3 Logical Value
 
@@ -52,8 +51,7 @@ Level 不能在canonical化时退化成“一个loop加几个可丢弃attribute�
 - lookup/index relation；
 - state update与effect；
 - operation精度、顺序、overflow/wrap/saturate语义；
-- reduce identity、空域政策、NaN/signed-zero与允许的结合自由度；
-- engine role硬约束。
+- reduce identity、空域政策、NaN/signed-zero与允许的结合自由度。
 
 ## 2. 按设计不承载的内容
 
@@ -64,9 +62,9 @@ Canonical Kernel IR 不包含：
 - physical lane、register tuple或fragment layout；
 - machine register编号；
 - selected RVV/IME instruction；
+- selected scalar/wide/matrix/transfer engine；
 - unit/strided/indexed/segment memory form；
-- primitive-private unpack/packing实现；
-- invocation-local `pack` 的 physical schema 与 parameterized extents；
+- invocation-local unpack/packing、schema、axis orientation 与 parameterized extents；
 - physical layout conversion；
 - unroll、prefetch、local pipeline和buffer version；
 - live interval、spill、reload、rematerialization；
@@ -86,7 +84,6 @@ canonical verifier必须检查程序是不是一份合法Weft程序：
 - 普通控制carry与branch result类型一致；
 - admit/materialize/new/commit的domain与value关系一致；
 - primitive operand/result shape和axis relation合法；
-- engine role与operation类别兼容；
 - derive builder result与declared family一致；
 - pinned layout identity在ABI边界明确。
 
@@ -125,10 +122,11 @@ logical axes
 Level/domain/lifetime
 memory/encoding relation
 operation semantics
-engine role
 effects
 ```
 
-并为每个已实例化std/auto candidate形成一份target physical program。唯一合法事实必须从这些输入唯一推导；存在多个合法物理结构时，target按固定规则和优先级选择；结构固定后的有限物理参数可以由构建期实测选择。若物理实现需要改变canonical values、Level归属、artifact ABI或numerical operation，它不能在target lowering中完成；必须返回到作者tree或另一个stdoverload。
+并与独立的 target profile/build config 一起，为每个已实例化 std/auto candidate 形成一份 target physical program。target profile 提供 engines、representations、legality 与结构规则；build config 提供 target requirement，例如最终 physical program 必须使用 IME。requirement 在结构性选择时参与 legality 过滤，并在 selected program 上验证；二者都不进入 canonical Value identity。
+
+唯一合法事实必须从这些输入唯一推导；存在多个合法物理结构时，target 按固定规则和优先级选择；结构固定后的有限物理参数可以由构建期实测选择。若物理实现需要改变 canonical values、Level 归属、artifact ABI 或 numerical operation，它不能在 target lowering 中完成；必须返回到作者 tree 或另一个 std overload。
 
 canonical IR本身不承担目标物理candidate的持久authority。一个candidate被拒绝或替换，不得修改源程序语义。

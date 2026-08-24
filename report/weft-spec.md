@@ -106,10 +106,10 @@ Triton 一类 SIMT 语言把 logical coordinate 到 thread/warp/CTA owner 的分
 
 整份规范只有一条分界线：
 
-> **改变了逻辑值集合，或改变了逻辑值的层归属 → 属于源程序（树），作者写。**
-> **不改变这两者 → 属于编译器（表示）。**
+> **改变 canonical operation/value/effect graph，或改变 Value 的 Level / artifact 归属 → 属于源程序（树），作者写。**
+> **只改变同一程序的物理表示 → 属于编译器。**
 
-这里的“逻辑值”不是只有 dtype/shape 的匿名元素集合。canonical logical Value 由具体 producing operation contract 定义，包括 typed operands、axes、effects 与硬 engine role；改变 producing op 的 role 或数值/effect contract，就是换了 canonical value definition。因而 engine role 仍由 2.2 覆盖，不是额外权限位或例外。
+canonical logical Value 由 producing operation 的 typed operands、result type、logical axes、数值语义与 effects 定义。目标 engine、invocation-local pack、memory form、lane/register/fragment layout 和 pipeline 都不进入 Value identity；它们是在同一 canonical graph 上形成的物理程序。
 
 它的用法：
 
@@ -122,24 +122,46 @@ Triton 一类 SIMT 语言把 logical coordinate 到 thread/warp/CTA owner 的分
 | `group=16` 拆成 4 次 `group=4` | 变了（4 套 admit + 4 套状态） | **禁止** |
 | 把循环不变的地址计算提出去 | 没变（本来就不随内层变） | 编译器 |
 | 把 `w.d * i32_acc` 下沉到 sub 层 | 变了（中间类型、转换与舍入位置全变） | **禁止** |
+| 为一个 staged Value 选择 local pack 及连续方向 | 没变 | 编译器 |
+| `contract` 用 RVV 还是 IME | 没变 | 编译器；硬目标要求写在 build config |
 | LMUL / vl / 寄存器分组 | 没变 | 编译器 |
 | strip-mining、spill/reload、rematerialize | 没变 | 编译器 |
 
 **这条判据同时定义了作者写什么和编译器做什么，它比任何一个"根抽象的名字"更根本。**
 
-## 2.3 三条被否决的诱惑
+## 2.3 语义、配置与 hint 必须分层
 
-设计过程中反复出现、必须拒绝的三类构造：
+成熟 kernel DSL 并不排斥 hint 或编译 meta。Triton 的 `tl.assume`、`tl.multiple_of`、`tl.max_contiguous`、`tl.range(num_stages=...)` 与 load/store cache modifier，TileLang 的 `T.Parallel`、`T.Pipelined` 和 `T.copy` annotation，都把事实承诺、schedule 参数或 target preference 附着在明确的 IR 实体上；它们不被伪装成数值 Value 的 identity。
 
-**(1) 权限位** —— `allow_reassociation` / `allow_repack` / `allow_low_precision`。
+Weft 采用以下分层：
 
-编译器里没有"权限"。真实编译器只有语义和类型。`-ffast-math` 看似权限，实则换了一门语言（float 加法定义为可结合的语言）。权限的正确归宿是变成 op 的定义或类型的一部分 —— Triton 把结合性写进 `tl.sum` 的定义、把精度写成 `tl.dot` 的参数，而不是给全局开关。
+```text
+core DSL
+    numerical operations / logical axes / effects / Level / pinned Encoding
+
+build config
+    source auto bindings / target profile / hard target requirements
+
+target physical machine
+    engine / layout / local pack / memory form / register-fragment mapping /
+    pipeline / spill / reload / rematerialize / intrinsic-asm
+```
+
+core DSL 不提供 soft-hint 语法。target preference 或“必须使用某扩展，否则失败”属于 build config，不进入 canonical Kernel IR，也不改变 Value identity。
+
+## 2.4 三条被否决的诱惑
+
+下面三类构造不属于 Weft 的语言或编译器合同：
+
+**(1) 用权限位代替语义或配置分层** —— `allow_reassociation` / `allow_repack` / `allow_low_precision`。
+
+若一个开关改变数值、effect 或 artifact 语义，它必须进入相应 operation、type 或 Encoding；若只限制目标实现，它属于 build config；若两者都不改变，它没有独立语义。`-ffast-math` 看似权限，实则改变浮点语言；Triton 也把精度写进 `tl.dot` 的参数，而不是塞进一个通用 engine permission。
 
 **(2) 数学等价证明** —— 编译器不需要证明 min 支路等价于原式，因为**编译器根本不知道原式存在**。Weft 程序里没有那个数学定义。作者写 `dot(w.m, mins)` 就是要算这个式子，和 C 里写 `a*b+c` 一样。分配律是作者做的，做错了就是算错。
 
 **(3) 溢出证明** —— `into=i16` 是作者的选择，不是断言。溢出是作者的责任，和 C 里写 `int16_t sum` 一样。最多在可选调试模式插检查。
 
-**通用规则（三次教训的共同形式）：**
+**通用规则：**
 
 > **每当想加一个标志位，先问：谁读它？如果读它的那个优化被"不改树"禁止了，这个标志就不存在。**
 
@@ -272,7 +294,7 @@ commit(value, view[region])      # 写回
 | | 语义 | 例 |
 |---|---|---|
 | `new` | 在本层诞生、被内层更新、有跨迭代状态 | accumulator |
-| `materialize` | 在本层物化一次、被后代只读复用 | packed panel |
+| `materialize` | 在本层形成一个 staged Value、被后代只读复用 | staged panel |
 
 `admit` 的层归属就是它的全部信息量：**"这个数据在哪一层被供应一次" = "它被复用几次"。** 普通 load 表达不了这件事。
 
@@ -324,29 +346,28 @@ register / fragment / issue    它的物理分解
 
 **不要说"16 个必须同时物理 live"。**
 
-## 3.6 Engine role
+## 3.6 Core DSL、build config 与目标物理机器
 
-四个抽象角色，**不是 ISA 名字**：
-
-```
-scalar     标量控制与地址
-wide       宽向量计算
-matrix     矩阵引擎
-transfer   数据搬运能力
-```
-
-**硬绑定：** `op @ wide` 表示这个 realization 明确要求宽向量引擎，编译器**不会**把它落到矩阵引擎。要用 IME，就写另一棵标注 `@matrix` 的树（可以是同一个函数名的另一个特化）。
-
-含糊的第三种状态（"写了 wide 但编译器可能用 matrix"）不存在 —— 那等于把 engine role 变成 hint，即变相的权限位。
-
-**`transfer` 是能力不是硬件。** RVV 的普通 load/store 可以实现 transfer role；有独立搬运单元的目标映射到它自己的机制。不要求目标存在独立 DMA 单元。
-
-两个动词：
+`scalar`、`wide`、`matrix` 与 `transfer` 是目标物理机器中的 engine 类别，不是 core DSL annotation。源程序写：
 
 ```python
-materialize(expr)     # 在这里形成一次真实的跨阶段值
-handoff(value)        # 一个阶段的值交给另一个阶段
+acc += contract(a, b, over="k", acc=i32)
 ```
+
+该 operation 的 typed operands、logical axes、Encoding、use-def 和数值语义进入 canonical IR。target profile 再判断有哪些 scalar/RVV/IME realization 合法，并按结构规则选择一种。选择哪类 engine 不改变 canonical result。
+
+若作者要求产物必须使用 IME，否则失败，要求写入 build config：
+
+```text
+target = K1
+require = uses_extension(IME)
+```
+
+requirement 是对 target physical program 的硬谓词。它在结构性选择前过滤不能满足要求的 physical structures，并在 selected program 上再次验证；不满足就拒绝当前 build，不静默退回 RVV。它不进入 canonical Value identity，也不允许编译器修改作者树。
+
+如果 IME 高性能实现需要不同的数据供应树，例如额外的 `materialize`、不同 Level 或 persistent Encoding，作者选择另一份 std 函数。那两份程序的区别来自真实的 logical birth、lifetime 或 artifact，而不是 `@matrix` 权限位。
+
+跨 physical engine 的 register/fragment/local-storage 交接是 target physical conversion。core DSL 不提供 `stage_handoff`；普通 SSA use-def 与 `materialize` 已经给出值边界和生命周期。若某种多引擎执行需要 source-visible 的同步或 effect，必须定义具有该可观察语义的 operation，不能用 engine annotation 暗示。
 
 ## 3.7 派生编码与阶段
 
@@ -393,7 +414,7 @@ extent=auto("KB")
 
 target 还可以为同一 source tree 声明 LMUL、已固定 schema 内的 physical microtile extent、unroll、pipeline depth 与 buffer count 等有限物理参数。这些参数不进入 DSL 或 canonical IR，由构建期实测选择。source `auto` 与 target physical parameter 可以由同一工具测量，但前者实例化作者程序，后者只实例化机器表示。
 
-要删除的只是没有明确含义、只说"编译器随便找"的 permission bit。
+没有明确语义、只说“编译器随便找”的 permission bit 不属于语言。
 
 ## 3.9 普通控制流
 
@@ -437,10 +458,10 @@ for i in range(N):
 ```python
 gemv(f32, f32)                    → 一棵树
 gemv(Q4K_I16, Q8_K)               → 另一棵树
-gemv(Q4K_I16, Q8_K, engine=matrix) → 又一棵
+gemv_panelized(Q4K_I16, Q8_K)      → 带不同 materialize / Level 的另一棵
 ```
 
-这是普通重载/特化，不是编译器搜索结构。前端根据参数类型、derived Encoding 与显式 config 唯一解析到一棵树；匹配歧义是前端错误。构建过程只枚举该树声明的有限 source `auto` 绑定，target compiler 不在多棵 std tree 之间竞赛。
+这是普通重载/特化，不是编译器搜索结构。前端根据调用的函数、参数类型与 derived Encoding 唯一解析到一棵树；匹配歧义是前端错误。build config 可以约束 target capability 或最终 physical program，但不能替作者在多棵 std tree 之间选算法结构。构建过程只枚举该树声明的有限 source `auto` 绑定，target compiler 不在多棵 std tree 之间竞赛。
 
 **(4) 参数化的是数值决策，不是机器参数。**
 
@@ -476,11 +497,11 @@ dot(a, b)               逐元素乘后归约
 contract(a, b, over=)   指定轴上的缩并
 outer_contract(a,b,over=) 外积式缩并，产出二维结果
 lookup(table, idx)      查表
-pack(view, along=)      授权 invocation-local pack 并指定连续供应的逻辑轴
+reshape/transpose/index 显式改变 logical axes 或坐标关系
 interleave(view, rows=) 跨行交错（派生编码专用）
 ```
 
-`pack` 的存在、`along`、所在 Level 与 engine role 是作者意图；physical pack schema 由 target compiler 根据 producer、所有 consumer、widening、pipeline、资源与 handoff 按固定规则选择，schema 内数值 extent 可以作为 physical parameter。它不等同于跨调用的 derived Encoding，后者的 bytes 与 ABI 必须由作者固定。
+`reshape/transpose/index` 必须完整规定输入输出 logical axes 和坐标映射。它们是 canonical operation，不是 local layout hint。invocation-local pack 不进入 core DSL；target compiler 可以在不改变 logical axes、Level 或 effects 的前提下，为任意合法 Value/use edge 选择 local pack。跨调用的重排仍必须使用 derived Encoding 固定 bytes 与 ABI。
 
 **注意：** `reduce` 内部可以产生多个物理 partial 与树归约 —— 因为源程序里它只有一个逻辑结果值，逻辑值集合没变。而 `i32_acc += ...` 拆成 4 路是从 1 个逻辑值变成 4 个，属于改树，作者写。这不是给 `reduce` 的豁免权，是判据的直接应用。
 
@@ -508,25 +529,25 @@ def q4k_gemv(W: View[Q4K_I16, (M,K)], X: View[Q8_K, (K,)], Y: View[f32, (M,)]):
     f32_acc = new(f32, [16], init=0)                     # births.state
 
     with L.blocks(K, extent=256) as kb:
-      w = admit(W[mb, kb]) @ transfer
-      x = admit(X[kb])     @ transfer
+      w = admit(W[mb, kb])
+      x = admit(X[kb])
 
       i32_acc = new(i32, [16], init=0)                   # births.state
 
       with L.subs(extent=32) as s:                       # 8 次 / block
           # 元素层：成对乘积落 i16。2 × 15 × 127 = 3810，安全。
           # 整 32 项压 i16 会溢出（60960），故不这么写。
-          p16 = mac_pairs(w.q[s], x.q[s], into=i16)             @ wide
+          p16 = mac_pairs(w.q[s], x.q[s], into=i16)
           # handoff: element → sub，关系是 widen-reduce 后乘 scale
-          i32_acc += reduce(widen(p16, i32)) * w.sc[s]          @ wide
+          i32_acc += reduce(widen(p16, i32)) * w.sc[s]
 
       # min 支路：完全不碰 w.q
       # bsum 粒度 16、sc/m 粒度 32，故 2:1 折叠
       mins = fold2(x.bsum)                               # i16[16] → i32[8]
-      min_term = dot(w.m, mins)                          @ wide
+      min_term = dot(w.m, mins)
 
       # handoff: block → row。ds 属于当前 Q8_K block，必须在本层乘。
-      f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)     @ wide
+      f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
 
     commit(f32_acc, Y[mb])
 ```
@@ -565,10 +586,10 @@ def gemm(A: View[f32,(M,K)], B: View[f32,(K,N)], C: View[f32,(M,N)]):
   with L.tiles(N, extent=auto("NC")) as nc:
     with L.tiles(K, extent=auto("KC")) as kc:                    # ← KC 层
 
-      Bp = materialize(pack(B[kc, nc], along="k")) @ transfer    # staged，被所有 MC 复用
+      Bp = materialize(admit(B[kc, nc]))                          # staged，被所有 MC 复用
 
       with L.tiles(M, extent=auto("MC")) as mc:
-        Ap = materialize(pack(A[mc, kc], along="k")) @ transfer  # staged，每 MC 一次
+        Ap = materialize(admit(A[mc, kc]))                        # staged，每 MC 一次
 
         with L.rows(mc, group=auto("MR")) as mb:
           with L.cols(nc, group=auto("NR")) as nb:
@@ -578,9 +599,9 @@ def gemm(A: View[f32,(M,K)], B: View[f32,(K,N)], C: View[f32,(M,N)]):
             acc = new(f32, [MR, NR], init=admit(C[mb, nb]))
 
             with L.blocks(kc, extent=auto("KB")) as kb:
-              a = admit(Ap[mb, kb]) @ transfer
-              b = admit(Bp[kb, nb]) @ transfer
-              acc += outer_contract(a, b, over="k") @ wide
+              a = Ap[mb, kb]
+              b = Bp[kb, nb]
+              acc += outer_contract(a, b, over="k")
 
             commit(acc, C[mb, nb])
 ```
@@ -594,18 +615,18 @@ def gemm(A: View[f32,(M,K)], B: View[f32,(K,N)], C: View[f32,(M,N)]):
 | accumulator 只跨 KC（上面这份） | 每个 KC 读一次写一次 | 分段累加，段间在 f32 上合并 |
 | accumulator 跨整个 K（KC 层退化） | 只写一次 | 一路累到底 |
 
-**这正是这门语言要表达的东西。** 前者是经典 BLIS：把 `Bp` 限制在 KC×NC 使 panel 装得进 cache，代价是 C 的 read-modify-write。后者省了 C 的往返，代价是 panel 可能过大。作者选，不是编译器选。
+**这正是这门语言要表达的东西。** 前者是经典 BLIS：把 `Bp` 的 staged logical domain 限制在 KC×NC，使该工作集有机会装入 cache，代价是 C 的 read-modify-write。后者省了 C 的往返，代价是 staged working set 可能过大。作者选 logical domain 与 lifetime，target 选择具体 local representation。
 
 ### 层级位置就是复用倍数
 
 | 分派 | 含义 |
 |---|---|
-| `pack(B)` 在 KC 层 | 每个 (NC, KC) panel 打包一次，被所有 MC 复用 |
-| `pack(A)` 在 MC 层 | 每个 (MC, KC) panel 打包一次，被所有 NR 复用 |
+| `materialize(B)` 在 KC 层 | 每个 (NC, KC) region 形成一个 staged Value，被所有 MC 复用 |
+| `materialize(A)` 在 MC 层 | 每个 (MC, KC) region 形成一个 staged Value，被所有 NR 复用 |
 | `acc` 在 MR/NR 层 | 跨当前 KC 驻留 |
 | `admit` 在 KB 层 | 每 K 块供应一次 |
 
-把 `pack(B)` 挪进 MC 层，程序仍然正确，但那是另一个程序 —— B 被重复打包 MC 次。
+把 `materialize(B)` 挪进 MC 层，程序仍然正确，但那是另一个程序 —— B 的 staged birth 与供应次数被复制 MC 次。staged Value 最终是原样引用、register window、local-storage panel、RVV tuple 还是 IME operand，由 target physical machine 决定。
 
 ## 4.3 GEMV
 
@@ -617,12 +638,12 @@ def gemv(W: View[f32,(M,K)], X: View[f32,(K,)], Y: View[f32,(M,)]):
   with L.rows(M, group=auto("MR")) as mb:
     acc = new(f32, [MR], init=0)
     with L.blocks(K, extent=auto("KB")) as kb:
-      x = admit(X[kb]) @ transfer            # 被 MR 行共用
-      acc += contract(admit(W[mb, kb]), x, over="k") @ wide
+      x = admit(X[kb])                       # 被 MR 行共用
+      acc += contract(admit(W[mb, kb]), x, over="k")
     commit(acc, Y[mb])
 ```
 
-相对 GEMM：去掉 `L.cols` 层、accumulator 降为一维、X 太小不 pack。
+相对 GEMM：去掉 `L.cols` 层、accumulator 降为一维，并且 source tree 没有额外的 staged panel birth。target 仍可在同一 Value lifetime 内选择 register window 或 local pack。
 
 **"小 N 走 row-dot、大 N 走 panel GEMM"这个 regime 判断不进语言** —— 作者写的就是他要的那棵树。
 
@@ -636,22 +657,22 @@ def flash_attn(Q: View[f16,(Tq,D)], K: View[f16,(Tk,D)], V: View[f16,(Tk,D)],
                O: View[f16,(Tq,D)]):
 
   with L.rows(Tq, group=auto("BQ")) as qb:
-    q = materialize(admit(Q[qb, :])) @ transfer      # staged
+    q = materialize(admit(Q[qb, :]))                 # staged
     m = new(f32, [BQ],   init=-inf)                  # state
     l = new(f32, [BQ],   init=0)                     # state
     o = new(f32, [BQ,D], init=0)                     # state
 
     with L.blocks(Tk, extent=auto("BK")) as kb:
-      k = admit(K[kb, :]) @ transfer
-      v = admit(V[kb, :]) @ transfer
+      k = admit(K[kb, :])
+      v = admit(V[kb, :])
 
-      s     = contract(q, k, over="d", acc=f32)  @ wide
-      m_new = max(m, rowmax(s))                  @ wide
-      p     = exp(s - m_new)                     @ wide
-      alpha = exp(m - m_new)                     @ wide
+      s     = contract(q, k, over="d", acc=f32)
+      m_new = max(m, rowmax(s))
+      p     = exp(s - m_new)
+      alpha = exp(m - m_new)
 
-      l = l * alpha + rowsum(p)                  @ wide
-      o = o * alpha + contract(p, v, over="tk")  @ wide
+      l = l * alpha + rowsum(p)
+      o = o * alpha + contract(p, v, over="tk")
       m = m_new
 
     commit(o / l, O[qb, :])
@@ -698,18 +719,17 @@ def topk(X: View[f32,(N,)], out: View[i32,(K_,)]):
 4. 频率层次：`d/sc/ds` 分别在哪个 Level 参与；
 5. logical values/state/partial 的数量；
 6. cohort、Level extent、accumulator lifetime 与 handoff；
-7. `admit`、`materialize` 与 invocation-local `pack` 位于哪层；
-8. `pack` 的 `along` 与 engine role；
-9. persistent derived Encoding 是否存在、bytes 与 ABI 是什么；
-10. ordinary scalar control 与显式 shaped axis 的选择。
+7. `admit` 与 `materialize` 位于哪层；
+8. persistent derived Encoding 是否存在、bytes 与 ABI 是什么；
+9. ordinary scalar control 与显式 shaped axis 的选择。
 
 ### 编译器形成 physical program
 
 - logical axes 到 time、lane、register replica、fragment 与 local storage 的表示；
 - value 的 SEW、LMUL、`vl`、tail、register group 与 physical partial；
 - memory edge 的 load form、unpack、broadcast、conversion 与 reuse；
-- local operation 的 RVV/IME realization；
-- invocation-local pack 的 physical schema 与 parameterized extents；
+- local operation 使用 scalar、RVV、IME 或 transfer engine 的 realization；
+- invocation-local pack 的存在、axis orientation、physical schema 与 parameterized extents；
 - local cluster、pipeline、unroll、prefetch、buffer、spill/reload/rematerialize；
 - resource legality、intrinsic 与 local asm。
 
@@ -730,7 +750,7 @@ logical coordinates
 
 这是一条可组合、可部分定义、允许 broadcast/replication 的表示关系，不是所有 Value 都必须拥有的五维笛卡尔积。scalar、RVV、IME、staged local object 可以只使用其中一部分。
 
-每个物理实体必须保留 canonical Value、logical axes、Level instance、ordinary control、producer/consumer、effect、validity 与 engine role 的 identity。物理化可以分片、复制、暂存或重算同一 Value，不能改变 logical value 集合、Level 归属、handoff、pinned Encoding 或 operation 数值语义。
+每个物理实体必须保留 canonical Value、logical axes、Level instance、ordinary control、producer/consumer、effect 与 validity 的 identity。物理化可以分片、复制、暂存或重算同一 Value，不能改变 logical value 集合、Level 归属、handoff、pinned Encoding 或 operation 数值语义。
 
 完整机器合同见 `doc/machine/physical-machine.md`。
 
@@ -743,7 +763,7 @@ op/value          free、reduction、broadcast axes；result 保留/消去哪些
 encoded use       logical coordinate → storage bits
 typed chain       cast/widen/narrow 的 element-width 与数值关系
 memory/effect     alias、order、validity、mask 与可移动性
-target op         dtype、shape、显式 role compatibility、mask/tail、fragment/resource 是否合法
+target op         dtype、shape、mask/tail、engine/fragment/resource 是否合法
 ```
 
 例如 `[M,K]` 沿 K reduce 的结果必须保留 M axis；把它变成 scalar 再广播不是较差实现，而是错误表示。一个 codebook axis 只有在 source shaped Value 中存在时才能映射到 lane，编译器不能从八个独立 scalar lookup 重新发明轴。
@@ -756,16 +776,16 @@ target op         dtype、shape、显式 role compatibility、mask/tail、fragme
 
 ```text
 axes               time / lane / register replica / fragment 的分配
-engine             未绑定且 op 允许多个 role 时的 wide / matrix realization
+engine             scalar / wide / matrix / transfer realization
 memory             unit / strided / indexed / segment
-pack               invocation-local schema：axis orientation、carrier与handoff关系
+pack               是否建立 invocation-local pack，以及 axis orientation、carrier与handoff关系
 materialization    share / reload / rematerialize / spill / local pack
 quant              decode materialize / decode-compute fusion
 schedule           sequential / local software pipeline
 extension          fragment family 与 handoff structure
 ```
 
-显式 `@wide/@matrix/@transfer` 是硬约束，不参与 engine 选择。persistent derived Encoding 的 byte layout 也不是结构选择；它已经由作者和 ABI 固定。
+build config 可以对最终 physical program施加硬 target requirement，例如必须使用 IME；它只过滤结构选择结果，不进入 canonical tree。persistent derived Encoding 的 byte layout 也不是结构选择；它已经由作者和 ABI 固定。
 
 结构性选择使用 target 提供的确定规则和固定优先级。规则可以读取 typed use-def、producer/consumers、Encoding mapping、target legality、live values 与资源上限，并选取第一个合法结构。
 
@@ -788,7 +808,7 @@ source `auto` 与此不同。它由作者/std 声明，可能实例化不同 coh
 ## 5.6 编译流程
 
 ```text
-按类型与显式 config 选定 std overload
+按函数调用、类型与静态 source 参数选定 std overload
         ↓
 绑定一组作者声明的 source auto 参数
         ↓
@@ -796,7 +816,7 @@ Canonical Verify
         ↓
 唯一合法推导：axes / Encoding / typed/effect facts
         ↓
-确定结构选择：representation / memory / pack / local op / cluster
+按 build requirements 过滤并确定结构选择：representation / memory / pack / local op / cluster
         ↓
 实例化有限 physical parameters
         ↓
@@ -827,6 +847,7 @@ op                 selected local realization / physical partial / fragment
 memory edge        Encoding mapping / load form / stride / alignment / unpack
 Level/cluster      time mapping / tail / unroll / pipeline / buffers / prefetch
 target profile     ISA / ABI / VLEN / engines / resources / priorities / parameter domains
+build config       source-auto bindings / target requirements
 ```
 
 链的一端是 pinned memory Encoding，另一端是 selected target operation operand/result contract。内部 conversion、local pack、spill 和 pipeline temporary 不成为 canonical values 或跨调用 artifact。
@@ -876,7 +897,6 @@ admit / new / materialize / commit 的域是否对应
 operand 类型与 shape 是否匹配
 encoding 字段宽度、偏移、bit/byte order 是否合法
 scope 是否越界
-engine role 是否与 op 兼容
 派生 encoding 的 builder 与消费端 layout identity 是否一致
 ```
 
@@ -931,11 +951,11 @@ Emitter 是最后一个 pass。它只读 selected physical values、conversions�
 
 **(4) VLEN 分裂。** VLEN 128 和 256 上同一份代码性能差很多。llama.cpp 的 RVV 文件里 Q2_K 按 VLEN128/VLEN256 分了两个实现 —— 这是被迫的。
 
-**(5) 交错顺序 ↔ 指令选择绑死。** 决定用 `vwmaccsu`，nibble 拆出来的顺序就被钉死，`Q4K_I16` 的字节排法就被钉死。想试 `vluxei` gather？整个 kernel 从 load 到 store 全部重写。
+**(5) kernel-local layout ↔ 指令选择绑死。** 决定用 `vwmaccsu`，nibble 的 local unpack 顺序、register window 与 consumer shape 都随之钉死。想试 `vluxei` gather，往往要重写从 load 到 accumulator 的整段 intrinsic。跨调用的 `Q4K_I16` bytes 仍是作者固定的 derived Encoding，不在这项自由里。
 
 ## 6.2 Weft 里他不写的
 
-上面五条，一条都不写。他写的是：
+上面五类 target-internal 细节都不写；跨调用可见的 derived Encoding 仍由作者写。他写的是：
 
 ```python
 p16 = mac_pairs(w.q[s], x.q[s], into=i16)
@@ -961,10 +981,10 @@ Weft 里：
 
 同时，作者不再手写同一棵树内部的 layout、pack shape、register/fragment mapping、memory form 和 pipeline。这个主张要求编译器拥有真实的物理抽象机器、typed physical program 与编译算法，不能只把固定 emitter 分支包装成 pass。
 
-## 6.4 VLEN 无关与双引擎
+## 6.4 VLEN 无关与多引擎
 
 - **VLEN** 是 target fact。同一份分解在 VLEN 128 与 256 上经 target rules 与 physical parameter tuning 产生不同的 LMUL、cohort 物理分组与 unroll。**不写两份。**
-- **IME** 不是"另一个后端"，是同一台机器上的另一个引擎。库/调用配置可以选择 `@wide` 树或 `@matrix` 树；两棵作者程序可以共享数值分解，只在数据供应与 engine 标注上不同。target 不把显式 `@wide` 偷换成 IME。
+- **IME** 不是"另一个后端"，是同一台物理机器上的另一个引擎。若同一 source tree 的 axes、materialization 与 operands 同时允许 RVV 和 IME，target 按结构规则选择；若 IME 需要不同的 logical materialization 或 Level，作者写另一份 std tree。`require=uses_extension(IME)` 可以要求 build 结果必须实际使用 IME，否则失败；它不进入 DSL。
 
 ## 6.5 抽象的外部检验
 
@@ -991,18 +1011,13 @@ Weft 里：
 ```
 根抽象（层级数值 realization）                   不变
 语言词汇（level / new / materialize / admit /
-          commit / encoding / engine role）      不变
+          commit / encoding / operation）        不变
 数值分解的主体                                    基本不变
-数据供应结构                                      大部分不变
-引擎边界与物化位置                                变
+数据供应结构                                      仅在作者选择另一 source tree 时变
 target profile、物理表示、指令、资源、流水          全变
 ```
 
-**"接新硬件源程序一个字不改"是错的。** 正确的说法：
-
-> **同一门语言的两个不同程序，而不是两门语言。**
-
-一台把 decode 和 matmul 放在两个物理单元上的机器，本来就该有不同的树。要求树跨机器不变，等于要求性能跨机器不变。
+同一 source tree 在不同 target 上可以选择不同 engine、layout、local pack、conversion 和 pipeline。只有当高性能实现确实需要改变 logical materialization、Level、effect 或 persistent artifact 时，作者才写同一门语言中的另一棵程序。把 decode 与 contract 分配到不同物理 engine 本身不要求改树；它们之间若需要 source-visible staged birth 或同步语义，才需要新的 source operation/Level 结构。
 
 ## 7.2 与 TileLang 的机制对照
 
@@ -1018,24 +1033,24 @@ TileLang compiler 仍通过 `ref/tilelang/src/transform/layout_inference/layout_
 Weft 不复用这些 source-level storage/thread constructs，而用同一门语言写目标相关的程序树：
 
 ```python
-# RVV：decode 与 contract 交错
+# 一份直接消费 decode value 的 source tree
 with L.subs(...) as s:
-    p16 = mac_pairs(w.q[s], x.q[s], into=i16)      @ wide
-    i32_acc += reduce(widen(p16,i32)) * w.sc[s]    @ wide
+    p16 = mac_pairs(w.q[s], x.q[s], into=i16)
+    i32_acc += reduce(widen(p16,i32)) * w.sc[s]
 
-# 分离引擎的机器：整块 decode → 物化 → 交给 matrix engine
+# 若另一实现确实需要不同 logical materialization，作者写另一份 std tree
 with L.blocks(...) as kb:
-    panel = materialize(decode_all(w) @ wide)
-    acc  += contract(handoff(panel), x) @ matrix
+    panel = materialize(decode_all(w))
+    acc  += contract(panel, x)
 ```
 
-同一门语言、同一套 Level 规则、四个抽象角色与 Encoding。存储层级、fragment 和 physical pipeline 不进入源程序；它们属于 target profile 与物理抽象机器。目标若需要不同 engine boundary、materialization 或 persistent artifact，作者写同一语言中的另一棵程序，而不是让 backend 偷改现有树。
+同一门语言、同一套 Level 规则与 Encoding。若上面两棵树的 logical births 不同，它们就是两个作者程序；若 logical tree 相同，RVV/IME engine、register↔fragment conversion、local pack 与 physical pipeline 都由 target profile 和物理抽象机器决定。跨调用 persistent artifact 仍由作者固定。
 
 ## 7.3 目标贡献什么
 
 ```text
 ISA / ABI / VLEN
-engine roles、可实现的 canonical ops 与 operand/result contracts
+physical engine classes、可实现的 canonical ops 与 operand/result contracts
 time / lane / register-replica / fragment / local-storage representations
 合法 conversions、memory forms、mask/tail 与 alignment
 register、fragment、temporary、buffer 与 local-storage resources
@@ -1045,7 +1060,7 @@ transfer、wait、barrier、issue 与 ordering constraints
 intrinsic / local asm availability
 ```
 
-target profile 不只是“加几个存储类型”，也不能按 kernel 或格式名提供 whole-kernel route。它改变物理表示和规则，不改变 canonical tree、engine-role 硬约束或 pinned bytes。
+target profile 不只是“加几个存储类型”，也不能按 kernel 或格式名提供 whole-kernel route。它改变物理表示和规则，不改变 canonical tree 或 pinned bytes。build requirement 只过滤不满足目标约束的 physical program，不能反向改树。
 
 ## 7.4 关于 TPU 一类的诚实评估
 
@@ -1091,9 +1106,9 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **1.** Weft 的源语言不选择任何一种目标物理对象作为统一根类型。这是设计选择，不是硬件定理。
 
-**2.** 唯一判据：改变了逻辑值集合或它们的层归属 → 树，作者写；没变 → 表示，编译器解。
+**2.** 唯一判据：改变 canonical operation/value/effect graph，或改变 Value 的 Level / artifact 归属 → 树，作者写；只改变同一程序的物理表示 → 编译器。
 
-**3.** 源程序里没有"许可"，编译器里没有"证明"。想加标志位时，先问谁读它。
+**3.** Core DSL 不用权限位混淆语义、build config 与物理实现。目标要求属于 config，engine/local pack 属于物理机器。
 
 **4.** Encoding 是逻辑字段到 storage unit/bit range 的纯布局映射，由 grouped/layered/bit-plane/join 等关系组合；不携带不变量或解码数学。
 
@@ -1101,7 +1116,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 **6.** 层是可选结构。普通 `for/if/while` 默认有序标量，编译器不自动向量化。
 
-**7.** Engine role 硬绑定。`transfer` 是能力不是硬件。
+**7.** `scalar/wide/matrix/transfer` 是物理 engine 类别，不进入 canonical operation 或 Value identity；硬 target requirement 写在 build config。
 
 **8.** 跨调用可见的表示必须写在源程序里；派生编码是类型生成，字节布局在 build 时固定。
 
@@ -1117,7 +1132,7 @@ TPU TensorCore 也是单控制器，前提成立，层级分派有意义。但 M
 
 # 附录 A · 未闭合问题
 
-1. **跨 engine 异步流水。** `materialize + handoff` 是否足以表达 source-visible synchronization 与双缓冲 overlap；若同步改变可观察程序，可能需要新的 source语义。
+1. **跨 engine 异步流水。** register/fragment/local-storage conversion 与 wait/barrier 怎样保持 source use-def/effect；若同步本身对源程序可观察，需要定义真实 effect operation，不能恢复通用 `stage_handoff`。
 2. **fragment 的部分 spill 与 handoff。** opaque fragment 能否局部拆分、怎样保持 source Value identity、哪些 reduction 必须在 fragment 内闭合。
 3. **local storage 的跨 engine ordering。** 不同 engine 共享 local object 时的 alias、coherence、wait/barrier合同。
 4. **动态 loop 与 tail 的 physical time identity。** pipeline version、dynamic trip count、tail mask 与 source Level instance 的完整对应规则。
@@ -1136,6 +1151,8 @@ reduction stream + resident state
 Kernel Program + Local Realization Program 两份用户程序
 "CPU = vdot，GPU = gemm"
 权限位（allow_reassociation / allow_repack / ...）
+invocation-local `pack(along=...)` 作为 core DSL operation
+source-level `@wide/@matrix/@transfer` 与 `stage_handoff`
 数学等价证明器与溢出证明器
 Level 上的 ordered 属性
 闭合原语作为特权层（"普通用户 vs 库作者"两个层级）

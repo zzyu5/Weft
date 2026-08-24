@@ -2,7 +2,7 @@
 
 ## 1. 定位
 
-Weft 源程序规定 logical values、axes、Level、数值 operation、Encoding、lifetime、handoff 和 engine role。目标编译器必须把这些事实实现为一份单控制器机器程序。
+Weft 源程序规定 logical values、axes、Level、数值 operation、Encoding、lifetime、handoff 和 effects。目标编译器必须把这些事实实现为一份单控制器机器程序。
 
 本文件定义 lowering 面向的物理抽象机器。它不定义 physical dialect、IR op/type 名称或 pass 顺序，也不把物理对象加入 DSL。
 
@@ -23,7 +23,6 @@ logical axes 与 coordinates
 ordinary control iteration / branch
 producer、consumers 与 use edge
 effect、alias、validity 与 order
-engine role
 ```
 
 物理化可以复制、分片、暂存或重算同一 Value，但不能改变：
@@ -118,7 +117,7 @@ fragment 可以是不可逐元素寻址的 opaque carrier，但不能暗中拥�
 local storage 是 invocation 内、target 管理的可寻址临时载体。它可以承载：
 
 - spill slot；
-- source 已授权的 invocation-local pack；
+- target 选择的 invocation-local pack；
 - pipeline buffer；
 - engine handoff 的局部物化；
 - primitive-private temporary。
@@ -170,7 +169,7 @@ lookup result 必须继承 shaped indices 的全部 logical axes。table entry a
 
 ```text
 实现哪个 canonical op
-允许的 engine role
+使用哪个 physical engine class
 operand/result representation constraints
 dtype、shape、axis 与 mask/tail legality
 memory、alias 与 ordering requirements
@@ -179,7 +178,7 @@ register、fragment、local-storage 与 buffer resources
 instruction/intrinsic/asm realization
 ```
 
-ISA 通常只给出合法区域，不给出唯一实现。target profile 因此还要为多个合法 structural realization 提供固定规则与优先级。例如 `@matrix` 已固定 engine role，但同一 target 仍可能有多个合法 fragment family；未绑定 role 的 op 只有在自身语义同时允许 wide/matrix 时才可由规则选择 engine。
+ISA 通常只给出合法区域，不给出唯一实现。target profile 因此还要为多个合法 structural realization 提供固定规则与优先级。同一个 canonical `contract` 可以拥有 RVV register-microkernel 和 IME fragment contracts；target 根据 operand axes、Encoding、representation、resources 与 build requirements 选择合法 engine 和 fragment family。
 
 ## 7. Physical conversion
 
@@ -190,32 +189,32 @@ conversion 在不改变 canonical Value、logical axes 和 Level 归属的前提
 - widen/narrow 对应的 physical type change；
 - register/fragment handoff；
 - local store/load；
-- source-authorized pack 的局部物化。
+- target-selected local pack 的物化与读取。
 
 conversion 必须是 physical program 中可观察、可验证、可消除的 operation，不能只是 emitter 旁边的字符串或缺失字段默认值。多个 consumer 可以共享一个支配它们的 representation；若 consumer 要求冲突，conversion 归属于具体 use edge。
 
 pin boundary 不允许隐式 conversion。kernel 参数、caller workspace 与 persistent derived encoding 的 bytes 必须与声明的 Encoding identity 一致。
 
-## 8. Pack 的物理含义
+## 8. Local pack 的物理含义
 
-source `pack(view, along=A)` 授权 invocation 内建立一种新的局部表示，并规定：
+local pack 是 target 为同一个 canonical Value 或 value-use edge选择的一种 invocation-local representation。源程序不包含 `pack(along=...)`；它只通过 Value/Level/use-def 给出：
 
-- logical values、shape 与 axes 不变；
-- A 是连续供应的优先 logical axis；
-- `materialize` 所在 Level 决定一次逻辑物化和复用域；
-- engine role 限制允许的 consumer/transfer 类别。
+- logical values、shape 与 axes；
+- producer Encoding、address relation 与 validity；
+- `materialize` 建立的 logical birth、lifetime 与 reuse domain；
+- all consumers 及其 typed operation requirements。
 
-target compiler选择 physical pack schema，并由 physical parameters 实例化 schema 内的数值 extents。选择同时读取：
+target compiler 据此决定是否需要 local pack、哪条 logical axis 对当前 consumer 连续、pack 的 carrier 与 schema，以及它在 register、fragment 或 local storage 中的表示。选择同时读取：
 
-- producer Encoding 与地址连续性；
+- producer storage mapping 与地址连续性；
 - 全部 consumers 的 lane/register/fragment requirements；
 - widening、decode 与 compute fusion；
-- live interval、pipeline buffer 和资源；
-- engine handoff 与 local-storage 能力。
+- live interval、pipeline buffers 与 resources；
+- physical engine handoff 与 local-storage 能力。
 
-target 使用确定规则与优先级选取第一个合法 pack schema，包括 axis orientation、carrier kind、consumer handoff 与 local-storage/register/fragment 关系；不用 cost model 比较多个合法 schema，也不实测不同 schema。schema 固定后的 lane factor、LMUL、microtile extent 和 buffer count 可以作为有限物理参数实测。
+target 使用确定规则与优先级选取第一个合法 pack 结构；schema 固定后的 lane factor、LMUL、microtile extent 和 buffer count 可以作为有限 physical parameters 实测。local pack 不得改变 canonical axes、Level birth、effects 或 source materialization 次数，也不得越过 pin boundary。
 
-persistent interleave 不属于这里。它改变 bytes、artifact 与 ABI，必须由 derived Encoding builder 固定。
+若作者要改变 logical axes，使用 canonical reshape/transpose/index operation；若要改变跨调用 bytes、artifact 与 ABI，使用 derived Encoding builder。两者都不是 local pack。
 
 ## 9. 跨 Level、loop 与 consumer
 
@@ -283,11 +282,11 @@ local cluster 是从作者已有 Level/ordinary loop 中抽取的一组物理 pr
 
 ### 13.1 唯一合法推导
 
-axis relation、Encoding mapping、typed conversion关系、effect/alias/order、显式 role compatibility、instruction/fragment legality。选定 base LMUL/lane parameter 后，cast/widen/narrow 链上的派生 element width 与 representation relation也属于唯一推导。结果错了会改变数值或生成非法程序，不能启发式。
+axis relation、Encoding mapping、typed conversion关系、effect/alias/order、engine/instruction/fragment legality。选定 base LMUL/lane parameter 后，cast/widen/narrow 链上的派生 element width 与 representation relation也属于唯一推导。结果错了会改变数值或生成非法程序，不能启发式。
 
 ### 13.2 结构性选择
 
-同一 source tree 下的 lane/register/fragment mapping、memory form、pack schema、materialization/reload/rematerialize、local pipeline structure、fragment family。target 使用确定规则与固定优先级，不使用 cost model，不生成多个结构进行性能比较。
+同一 source tree 下的 engine、lane/register/fragment mapping、memory form、local pack、materialization/reload/rematerialize、local pipeline structure、fragment family。target 使用确定规则与固定优先级，不使用 cost model，不生成多个结构进行性能比较。
 
 ### 13.3 参数性选择
 
@@ -300,7 +299,7 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 ```text
 ISA 与 ABI
 vector length / scalable-vector facts
-engine roles 与可实现的 canonical ops
+physical engine classes 与可实现的 canonical ops
 representation constructors 与合法 conversions
 scalar/vector register resources
 fragment families、operand/result constraints 与 resources
@@ -317,12 +316,22 @@ intrinsic / local asm availability
 换目标时可以改变这些 profile facts、规则、参数域和最终指令；不能改变：
 
 - source Value/axis/Level/operation语义；
-- `@wide/@matrix/@transfer` 的硬约束；
 - ordinary control的有序性；
 - pin boundary 的 Encoding/layout identity；
 - 本文件对 time/lane/replica/fragment/local-storage 表示关系的定义。
 
 新 extension 通过增加 representation、target operation、conversion、resource rule与spelling接入；不能增加按 kernel/格式名接管 whole-kernel lowering的路径。
+
+### 14.1 Build config
+
+build config 是 canonical IR 之外、target lowering 的独立输入。它可以指定 target profile、source `auto` 绑定与对最终 physical program 的硬 requirement，例如：
+
+```text
+target = K1
+require = uses_extension(IME)
+```
+
+requirement 是 physical legality 的额外约束：结构性选择前，不能满足它的 structures 被排除；选择后、emission 前还要对完整 physical program 验证。不满足就拒绝当前 build，不能静默改用 RVV，也不能修改 source tree。它约束的是 target artifact，不定义 canonical operation 或 Value identity。若高性能 IME 路径需要不同的 Level/materialize/persistent Encoding，作者必须在进入 lowering 前选择另一份 std source tree。
 
 ## 15. 与 Triton/TileLang 可复用的机制边界
 
@@ -357,7 +366,7 @@ typed physical IR 是承载这台机器的必要条件：每个 representation�
 
 下列问题不能由 backend convention 私下补齐：
 
-1. **跨 engine 异步流水。** `materialize + handoff` 是否足以表达 source-visible synchronization 与双缓冲 overlap；若同步改变可观察程序，可能需要新的 source语义。
+1. **跨 engine 异步流水。** register/fragment/local-storage conversion、wait/barrier 与 source use-def/effect 的完整对应；若同步本身 source-visible，需要定义真实 effect operation，不能恢复通用 `stage_handoff`。
 2. **fragment 的部分 spill 与 handoff。** opaque fragment 能否局部拆分、怎样保持 source Value identity、哪些 reduction 必须在fragment内闭合。
 3. **local storage 的跨 engine ordering。** 不同 engine 共享 local object 时的 alias、coherence、wait/barrier合同。
 4. **动态 loop 与 tail 的 physical time identity。** pipeline version、dynamic trip count、tail mask与source Level instance的完整对应规则。

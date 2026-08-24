@@ -36,15 +36,15 @@ acc = new(f32, [MR, NR], init=0)
 ### 2.2 `materialize`
 
 ```python
-Bp = materialize(pack(B[kc, nc], along="k")) @ transfer
+Bp = materialize(admit(B[kc, nc]))
 ```
 
-`materialize` 在当前逻辑作用域形成一次 staged Value，后代只读复用；位于 Level 中时，它是该 Level 的 `births.staged`。staged Value 的 element type、logical shape、axes 与 Level 归属进入 canonical IR；它不表示某个具体 cache、栈、vector register、fragment 或 shared memory。若表达式是 `pack`，作者给出 pack 的存在、`along`、Level 和 role，target compiler 决定不改变这些 canonical facts 的物理目标形状。
+`materialize` 在当前逻辑作用域形成一次 staged Value，后代只读复用；位于 Level 中时，它是该 Level 的 `births.staged`。staged Value 的 element type、logical shape、axes 与 Level 归属进入 canonical IR；它不表示某个具体 cache、栈、vector register、fragment、shared memory 或 packed panel。target 可以在保持这些 canonical facts 的前提下，为该 Value 选择原样引用、register window、local-storage panel、RVV tuple、IME operand 或其它 physical representation。
 
 ### 2.3 `admit`
 
 ```python
-x = admit(X[kb]) @ transfer
+x = admit(X[kb])
 ```
 
 `admit` 把一个 View region 在当前 kernel/Level 作用域供应一次。把同一 `admit` 移到更内层会增加逻辑供应次数；移到更外层会扩大 Value 生命周期。两者是不同作者程序。
@@ -143,23 +143,21 @@ o = o * alpha + contribution
 
 先重标定旧 state，再加入当前 block，是一个可观察的非归约 handoff。
 
-### 6.2 跨 engine handoff
+### 6.2 跨 physical engine 的 value use
 
 ```python
 def local_decode(
     packed: Value[u4, (K,), ("k",)]
 ) -> Value[i8, (K,), ("k",)]:
-    return (i8(packed) - i8(8)) @ wide
+    return i8(packed) - i8(8)
 
-panel = materialize(local_decode(packed)) @ transfer
-acc += contract(handoff(panel), x, over="k") @ matrix
+panel = materialize(local_decode(packed))
+acc += contract(panel, x, over="k")
 ```
 
-`local_decode` 在这里是同一门语言编写、保持 K axis 的普通 helper，不是隐藏 primitive；真实格式可以用 lookup、bit operation 和 cast 组成其数值树。显式 `handoff(value)` 表示一个 materialized Value 进入另一 engine role 的局部 operation；前端把它记为 canonical `stage_handoff`。它与 Level body 终结处的 carried/state handoff 是两个不同结构。它不规定同步指令或 fragment layout；目标必须为该 role 边界提供合法 realization，否则编译失败。
+`local_decode` 是保持 K axis 的普通 helper。`panel` 的 materialized birth 和普通 SSA use-def 已完整表达 source-visible value boundary；core DSL 不再增加 `stage_handoff` 或 source engine annotation。
 
-`@transfer` 的 `admit`/`materialize` 结果进入普通 SSA，不因 transfer role 自动获得物理 owner，因此直接供 `@wide` operation 使用不需要 `handoff`。`handoff` 用于作者显式建立的 compute-engine stage boundary，例如一个 `@wide` 结果先 materialize，再进入 `@matrix`；它不是每条跨 role use-def edge 都必须插入的语法噪声。
-
-本规范没有定义任意异步多引擎协议。`materialize + handoff` 只表达可观察的 value boundary；需要新的 source-visible同步、并发或 workspace 语义时，不能用未说明的 backend convention 补出。
+若 target 让 producer 与 consumer 使用不同 physical engine，它在具体 use edge 上插入 register/fragment/local-storage conversion，并承担相应 ordering 与 resources。若同步、并发或 workspace 会改变 source-visible effects，则必须定义真实的 effect operation 或另一棵作者程序，不能由 engine convention 暗中补出。
 
 ## 7. 普通控制流
 

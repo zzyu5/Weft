@@ -204,7 +204,7 @@ invocation phase
 - 跨调用生命周期；
 - 可与哪些 target artifact 兼容。
 
-一旦调用方传入某个 derived instance，kernel lowering 不得改选另一 byte interleave。kernel 内部也可以 `materialize(pack(...))` 建立短生命周期 local pack；pack 的存在、`along`、Level 与物化次数属于作者程序，成本计入每次 invocation，但它的物理目标形状由 target compiler 决定。local pack 不形成跨调用可见的 Encoding identity。
+一旦调用方传入某个 derived instance，kernel lowering 不得改选另一 byte interleave。invocation 内部的 `materialize` 只建立 staged Value 的 birth、Level 与复用范围；target compiler 可以为这个 Value 选择短生命周期 local pack，但 pack 的存在、方向和 physical schema 都不进入 canonical DSL，也不形成跨调用可见的 Encoding identity。
 
 ## 7. Storage ownership 与 lifetime
 
@@ -215,7 +215,7 @@ Weft 不用硬件 storage scope 区分对象，而用调用边界、Encoding 和
 | 普通输入/输出 | kernel 参数中的 `View` | caller 持有；在 invocation 边界可见 |
 | caller-visible workspace | kernel 参数中的可写 `View` 与 effect/alias 约束 | caller 分配；kernel 在一次调用内按作者树使用 |
 | persistent packed object | derived-instance `View` | artifact phase 生成；跨调用保留 |
-| invocation-local staged pack | `materialize(pack(...))` | 在声明它的逻辑作用域诞生，供后代复用，调用结束前消亡 |
+| invocation-local staged Value | `materialize(expr)` | 在声明它的逻辑作用域诞生，供后代复用，调用结束前消亡；可被 target 表示为 local pack |
 | primitive-private temporary | 不进入 DSL | target realization 内部产生和销毁 |
 
 workspace 不是靠参数名识别的特殊 pointer。它的 Encoding、shape、alignment、读写 effect，以及与其它 View 的 alias 约束都是 kernel 签名的一部分；函数不能私下要求一块签名中不存在的 scratch memory。
@@ -229,7 +229,7 @@ workspace 不是靠参数名识别的特殊 pointer。它的 Encoding、shape、
 - persistent packed object；
 - returned builder metadata。
 
-pin 的 Encoding/layout identity 必须由两侧共同知道。编译器不得在 pin 处静默插入 coercion；若需要转换，作者必须把 builder、workspace 或 invocation 内 materialization 写入程序。
+pin 的 Encoding/layout identity 必须由两侧共同知道。编译器不得在 pin 处静默插入 coercion；若需要跨调用转换，作者必须把 builder 或 workspace 写入程序。invocation 内的 physical conversion 只能作用于已经进入 kernel 的 Value，不改变 pin bytes。
 
 primitive-private temporary、register pack 和 fragment 不跨调用边界，不进入 DSL 或 artifact metadata。
 

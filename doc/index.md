@@ -13,7 +13,7 @@ Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下�
 
 - [Encoding、View 与 Artifact](dsl/encoding-and-artifacts.md)：packed storage、内存对象、派生布局和调用边界。
 - [Value、Level 与有序控制](dsl/values-and-levels.md)：逻辑值、生命周期、domain、cohort、handoff 和普通控制。
-- [Operation 与 Engine Role](dsl/operations-and-engines.md)：标准库、`auto`、基本 operation、显式逻辑轴和 engine 约束。
+- [函数、Operation 与编译配置](dsl/functions-and-operations.md)：标准库、`auto`、基本 operation、显式逻辑轴，以及 core DSL 与 target requirement 的边界。
 - [DSL 示例](dsl/examples.md)：Q4_K vec-dot、blocked MUL_MAT、GEMV、online attention 和 Top-K。
 - [Canonical Kernel IR](dsl/canonical-ir.md)：语言事实必须保存什么，以及不得包含什么物理信息。
 

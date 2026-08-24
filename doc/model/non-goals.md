@@ -58,6 +58,8 @@ allow_matrix
 
 permission没有独立语义。若一种变化会改变logical tree，它必须成为另一个operation、type或stdtree；若不改变，它本来就在编译器表示权限内。精度和结合性必须写进具体operation语义，不使用全局许可。
 
+这不等于成熟 DSL 不能有 assumption、schedule metadata 或 target hint。Weft 的选择是把 target requirement 放进 build config，把 physical organization 放进 target machine；core DSL 不用一个 `allow_*` 位混淆这些层次。
+
 ## 8. 通用 `ordered` 属性
 
 ordinary control本身有序；state/attention等顺序由SSA use-def和effect明确；closed primitive需要的结合/顺序由primitive定义。
@@ -79,25 +81,37 @@ max + exp + sum
 
 这避免kernel-name、exact-op-count、source-closure matcher成为隐藏语言。
 
-## 10. Built-in whole-kernel matmul或quant op
+## 10. Invocation-local `pack(along=...)`
 
-GEMM/GEMV/quantized MUL_MAT不是opaque language op。它们由同语言std函数组织outer traversal、Level、packing、state和local contract。
+core DSL 不提供只保持数值、shape、axes 与 Level 不变的 local-pack operation。`materialize(expr)` 已经表达 staged Value 的诞生层、物化次数、lifetime 和复用域；local pack 的存在、连续方向、carrier 和 schema 属于 target physical representation。
+
+若重排改变 logical axes，作者写真实的 reshape/transpose/index operation；若改变跨调用 bytes 与 ABI，作者写 derived Encoding。两者都不需要模糊的 pack 授权点。
+
+## 11. Source engine role 与 `stage_handoff`
+
+core DSL 不提供 `@wide`、`@matrix`、`@transfer` 或通用 `stage_handoff`。它们不改变 canonical operation/value/effect graph 或 Level 归属，只限制 target realization，因此属于 build config 和 physical machine。
+
+`scalar/wide/matrix/transfer` 仍是 target engine 类别。若 build 必须使用 IME，写 `require=uses_extension(IME)`，不满足则失败。若 IME 需要另一棵 materialization/Level tree，作者选择另一份 std 函数；跨 engine 的 register/fragment/local-storage 交接是 physical conversion。
+
+## 12. Built-in whole-kernel matmul或quant op
+
+GEMM/GEMV/quantized MUL_MAT不是opaque language op。它们由同语言std函数组织outer traversal、Level、staged lifetime、state和local contract。persistent packing 通过 derived Encoding 表达；invocation-local packing 由 target 物理化。
 
 允许的closed primitive只拥有局部operand/result numerical relation，不能拥有kernel ABI、outer traversal、persistent layout或workspace。
 
-## 11. 两套用户DSL
+## 13. 两套用户DSL
 
 不区分“普通用户语言”和“专家kernel语言”。std作者、应用作者和新格式作者使用相同Encoding、Value、Level、control和basic ops。
 
 库可以提供更高层普通函数和重载，但它们没有隐藏IR、特殊verifier或后端捷径。
 
-## 12. 自动规范化作者tree
+## 14. 自动规范化作者tree
 
 编译器不把作者的blocking、staging、accumulator lifetime、persistent packing、普通control或algorithm variant重写成标准模板。
 
 等价source spelling可以通过相同typed facts得到相同物理类别；实现这一点依赖SSA/axis/use-def分析，不依赖把source tree改成统一形状。
 
-## 13. 全局物理开关或全局约束求解器
+## 15. 全局物理开关或全局约束求解器
 
 SEW/LMUL属于value，instruction属于op，memory form属于memory edge，pipeline属于Level/local cluster。它们不是kernel-global C/D字典。
 
@@ -105,13 +119,13 @@ SEW/LMUL属于value，instruction属于op，memory form属于memory edge，pipel
 
 这条属于语言与target compiler的职责边界；具体physical IR和pass结构不在本部分定义。
 
-## 14. 静态 cost model
+## 16. 静态 cost model
 
 Weft 不为结构性选择建立预测执行时间、带宽、cache 命中或综合得分的静态 cost model。当前目标的机器行为、编译器和 runtime 还不足以让这类模型成为可靠的规范组成部分；把未经验证的估计写成公共选择权威只会隐藏硬编码。
 
 结构性选择由 target 的确定规则和固定优先级完成。规则可以读取 typed use-def、Encoding mapping、target legality 和资源上限，但不能用一个预测分数比较两个都合法的结构。
 
-## 15. 编译器生成结构后竞赛
+## 17. 编译器生成结构后竞赛
 
 目标编译器不为同一个 source candidate 生成多种 lane/register/fragment、memory、pack 或 pipeline 结构，再通过静态排序或真机运行挑 winner。这样做会把编译时间、实现复杂度和结果可解释性绑定到无限增长的结构空间。
 
