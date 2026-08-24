@@ -1,0 +1,247 @@
+# Encoding、View 与 artifact
+
+## 1. Encoding 是纯布局
+
+Encoding 定义：
+
+> 一个 logical field coordinate 怎样映射到 storage unit 和其中的 bit range。
+
+它不定义 dequant 公式、scale 语义、zero point、不变量或某条 ISA 指令。
+
+```python
+@weft.encoding
+class Q4_K:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    alignment = 1
+    d:    f16
+    dmin: f16
+    sc:   u6[8]   @ joined(4, 2, 4, lo_first)
+    m:    u6[8]   @ joined(4, 2, 4, lo_first)
+    q:    u4[256] @ grouped(64) @ layered(32, lo_first)
+
+@weft.encoding
+class Q8_K:
+    layout = bitorder.lsb_first, byteorder.little
+    elements = 256
+    alignment = 1
+    ds:   f32
+    q:    i8[256]
+    bsum: i16[16]
+```
+
+一份完整 Encoding 必须给出：
+
+- bit order；
+- byte order；
+- `elements`：一条 storage record 对应多少个逻辑元素；
+- field 的逻辑 shape 和 element bit width；
+- field storage span；
+- grouping、layering、bit plane 或 join 关系；
+- alignment；省略时语义等于 `alignment = 1`；
+- 非空 padding 的位置与内容要求；省略时语义等于没有 padding。
+
+`elements` 不能从最大字段长度猜测。radix bytes、grid indices 或 metadata field 可以只覆盖 record 的一种存储分解，但整条 record 仍对应另一数量的逻辑元素。
+
+字段声明顺序与完整的 `natural/grouped/layered/bit_planes/joined` 组合必须能唯一计算每个 field 的 storage span；示例因此不重复书写 byte offset。若这些关系不能唯一确定 span，Encoding 非法，作者必须补足布局关系。未声明 padding只表示没有 padding，不允许用它解释未覆盖的空洞。
+
+`alignment` 是一条 serialized storage record 起始地址必须满足的最小对齐，不是某个 host C struct 的自然对齐，也不是外层 tensor allocator 的对齐。目标代码若要把地址转换成具有更强 C ABI 对齐要求的对象，必须在该使用点另行证明要求成立。
+
+## 2. 基础布局关系
+
+### 2.1 `natural`
+
+逻辑元素按顺序占据自然 storage unit。Q8 字节数组和普通 dense scalar field 属于这一类。
+
+### 2.2 `grouped(N)`
+
+每 N 个逻辑元素形成一个独立重复 storage group。后续布局关系在每个 group 内重新开始。
+
+### 2.3 `layered(P, order)`
+
+group 内每 P 个逻辑元素形成一层；不同层中位置相同的元素共享 storage unit 的不同 bit range。
+
+例如：
+
+```text
+Q4_K.q = grouped(64) @ layered(32, lo_first)
+```
+
+唯一表示：
+
+```text
+group = i // 64
+within = i % 64
+storage byte = 32*group + (within % 32)
+storage bits = low nibble  if within < 32
+               high nibble otherwise
+```
+
+这个公式是布局关系的规范解释，不是要求作者在 kernel 中手写 byte/nibble 地址。
+
+### 2.4 record-local field axis 与 Level point
+
+Encoding field 的 shape 建立 record-local logical axes。一个覆盖该 record element axis 的 Level point 可以用来选择 field：
+
+```python
+with L.subs(extent=32) as sub:
+    q32 = block.q[sub]   # 选择当前 32-element logical region
+    sc1 = block.sc[sub]  # 选择与该 region 对应的一个 record-local field item
+```
+
+后一种投影只有在 `elements / field_extent == Level partition` 时唯一成立；其 field coordinate 是当前 point 在 record 内的 ordinal。选择会消去这个 record-local field axis，并保留其它 free axes：对单条 record，`block.sc[sub]` 是 scalar；对 16-row cohort，它是 `[16]`。若比例关系不唯一，作者必须显式给出 index/reshape relation，前端不能根据字段名或使用位置猜测。这个规则只定义 logical indexing，不声称 `sc` 是 scale，也不赋予 field 数值不变量。
+
+### 2.5 `bit_planes(w0, w1, ...)`
+
+一个逻辑值的不同 bit 片段位于独立的重复 storage plane。它只描述 plane 位置、宽度和组合次序，不执行数值解码。
+
+Q5/Q6 类格式可以让 low bits 和 high bits 分处不同 field/plane；kernel 读取的仍是合成后的逻辑 field value。
+
+### 2.6 `joined(group, fields, low_bits, order)`
+
+多个逻辑 field 共享一段规则化 storage：每个 field 的一部分 bits 位于主 bytes，剩余 bits 位于共同尾部或另一 plane，按照 `order` 重组。`joined(..., fields=F, ...)` 绑定连续的 F 个、带同一 joined annotation 的 field declaration；字段数量或参数不一致时 Encoding 非法。Q4_K 中连续的 `sc` 与 `m` 因而组成同一个 joined group，而不是两段独立 storage。
+
+Q4_K 的 `sc/m` 使用：
+
+```text
+joined(4, 2, 4, lo_first)
+```
+
+它说明两组 6-bit logical values 如何共用 12 bytes；不说明 scale/min 在数学公式中如何使用。
+
+### 2.7 `padding`
+
+padding 明确声明无逻辑 field 对应的 storage range。未声明的空洞不是隐式 padding；Encoding 必须完整覆盖 record storage。
+
+## 3. Encoding 不包含的知识
+
+下面关系都不属于布局：
+
+```text
+bsum[j] == Σ x[16j:16j+16]
+sc 是 scale
+m 是 minimum correction
+q 应先减 zero point
+某个 field 应由 gather 读取
+某个格式应使用 IME
+```
+
+如果 kernel 要使用 `bsum`，作者显式读取它。如果派生 artifact 要生成 `bsum`，builder 显式计算并写入。编译器不能从 `q` 推断或替换这些字段。
+
+同一 Encoding mapping 可以由 shift/mask、gather、segment 或专用 unpack 实现；这些是目标物理 realization，不改变 Encoding。
+
+## 4. View
+
+```python
+View[Encoding, shape]
+```
+
+View 是带 Encoding 的内存对象。它规定：
+
+- 逻辑 shape；
+- 逻辑 axis identity；
+- 每个逻辑元素所属的 storage record；
+- 可观察的 encoding/layout identity；
+- kernel 参数或外部 artifact 的内存边界；
+- 参数级 access effect 与 alias relation。
+
+`View[f32, (M, N)]` 是 dense Encoding 的简写。dense 仍然有明确的 element type、shape、axis 和 ABI，不代表“没有布局”。
+
+对 record Encoding，View 的 shape仍按 logical elements 计数；storage size 由 record span 与 `elements` 推出。若逻辑 extent 不能被 `elements` 整除，Encoding/derived builder 必须定义 tail record 与 padding，或前端拒绝该 View；不能假定越界 bytes 可读。
+
+View 不等于一个已加载的 tile。对 View 做 slice 得到逻辑 region；`admit` 才把 region 供应给当前 Level。
+
+## 5. Base、derived family 与 derived instance
+
+三种身份必须分开：
+
+```text
+base encoding
+    Q4_K：调用方已有的 canonical packed record
+
+derived family
+    Q4K_I[rows]：由 build/load phase 生成的一类跨行交错表示
+
+derived instance
+    Q4K_I[16]：静态参数和具体 byte layout 已固定的 artifact layout identity
+```
+
+派生 family 由同一语言中的 builder 定义：
+
+```python
+@weft.derive
+def Q4K_I(
+    W: View[Q4_K, (N, K)], *, rows: static[int]
+) -> View[Q4K_I[rows], (N, K)]:
+    return interleave(W, rows=rows)
+```
+
+`Q4K_I` 是抽象 family；`Q4K_I[16]` 是 builder 静态实例化后具有确定 byte layout 的类型。方括号是派生 Encoding 的类型生成语法，不是 ordinary value indexing。`derive` 是类型与 artifact 生成，不是 kernel 最外层循环。
+
+`@weft.derive` 将被装饰函数的名称同时引入 Encoding 类型命名空间，因此函数的 result annotation 可以引用正在定义的 family constructor。它不是运行时递归调用。
+
+`interleave(W, rows=R)` 保留每一行的 base Encoding，并把每个 R-row cohort 写成 byte-major 顺序：对 record-local byte coordinate `b`，依次存放 cohort 中各行的第 `b` 个 byte，再进入 `b+1`。上面的 builder 要求行 extent 能被 `rows` 整除；需要 tail cohort 时，builder 必须另行显式声明 padding/layout，不能由 artifact runtime 默默补齐。
+
+std 函数可以对 family 的静态参数进行重载或生成函数；导出 kernel 或 artifact 之前，参数必须实例化为固定的 layout identity。调用方 ABI 看到的是 derived instance，不是仍可变化的 family 参数。目标 profile 不必成为 identity 的一部分；多个目标可以接受同一实例，但不能各自私改它的 bytes。
+
+## 6. Artifact phase 与 invocation phase
+
+```text
+artifact phase
+    build、load 或模型初始化期间执行
+    生成持久 packed object、size、alignment、endianness、layout identity
+
+invocation phase
+    kernel 每次调用时执行
+    消费固定 View/layout identity
+```
+
+持久重排必须由作者程序显式声明，因为它改变：
+
+- kernel ABI；
+- 内存容量和 alignment；
+- 初始化成本；
+- 跨调用生命周期；
+- 可与哪些 target artifact 兼容。
+
+一旦调用方传入某个 derived instance，kernel lowering 不得改选另一 byte interleave。kernel 内部也可以 `materialize(pack(...))` 建立短生命周期 local pack；那是另一份作者程序，成本计入每次 invocation。
+
+## 7. Storage ownership 与 lifetime
+
+Weft 不用硬件 storage scope 区分对象，而用调用边界、Encoding 和逻辑生命周期区分：
+
+| 对象 | 源程序表示 | 所有权与生命周期 |
+|---|---|---|
+| 普通输入/输出 | kernel 参数中的 `View` | caller 持有；在 invocation 边界可见 |
+| caller-visible workspace | kernel 参数中的可写 `View` 与 effect/alias 约束 | caller 分配；kernel 在一次调用内按作者树使用 |
+| persistent packed object | derived-instance `View` | artifact phase 生成；跨调用保留 |
+| invocation-local staged pack | `materialize(pack(...))` | 在声明它的逻辑作用域诞生，供后代复用，调用结束前消亡 |
+| primitive-private temporary | 不进入 DSL | target realization 内部产生和销毁 |
+
+workspace 不是靠参数名识别的特殊 pointer。它的 Encoding、shape、alignment、读写 effect，以及与其它 View 的 alias 约束都是 kernel 签名的一部分；函数不能私下要求一块签名中不存在的 scratch memory。
+
+## 8. Pin boundary
+
+下列表示跨越调用边界，因此是 pin：
+
+- kernel 参数；
+- caller-visible workspace；
+- persistent packed object；
+- returned builder metadata。
+
+pin 的 Encoding/layout identity 必须由两侧共同知道。编译器不得在 pin 处静默插入 coercion；若需要转换，作者必须把 builder、workspace 或 invocation 内 materialization 写入程序。
+
+primitive-private temporary、register pack 和 fragment 不跨调用边界，不进入 DSL 或 artifact metadata。
+
+## 9. 布局正确性
+
+Encoding 验证针对离散 storage 事实：
+
+- 字段 storage span 不重叠；
+- bit/byte order 完整；
+- grouped/layered/planes/join 映射在声明域内；
+- padding 完整覆盖空洞；
+- derived builder 的 result family 与声明一致；
+- consumer 的 pinned layout identity 与 artifact 一致。
+
+这类验证可以要求逐 byte 或逐 field 一致。它与浮点 kernel 的容差判据是两件事。
