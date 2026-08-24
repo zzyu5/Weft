@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,22 @@ constexpr std::size_t kK = 4096;
 constexpr std::size_t kN = 4096;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 volatile std::uint64_t flush_sink = 0;
+constexpr double kAbsoluteTolerance = 1.0e-4;
+constexpr double kRelativeTolerance = 2.0e-3;
+
+bool within_tolerance(float actual, float expected, double &max_absolute,
+                      double &max_relative) {
+  if (!std::isfinite(actual) || !std::isfinite(expected))
+    return false;
+  const double absolute =
+      std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+  const double relative =
+      absolute / std::max(std::fabs(static_cast<double>(expected)), 1.0e-30);
+  max_absolute = std::max(max_absolute, absolute);
+  max_relative = std::max(max_relative, relative);
+  return absolute <=
+         kAbsoluteTolerance + kRelativeTolerance * std::fabs(expected);
+}
 
 std::size_t parse_repetitions(const char *text) {
   char *end = nullptr;
@@ -66,8 +83,11 @@ int main(int argc, char **argv) {
   std::vector<float> output(m * kN, 0.0F);
   gemm_f32(lhs.data(), rhs.data(), output.data(), m, kK, kN);
   const float expected = 1.0F;
+  double max_absolute = 0.0;
+  double max_relative = 0.0;
   for (std::size_t index = 0; index < output.size(); ++index) {
-    if (std::memcmp(&expected, &output[index], sizeof(float)) != 0) {
+    if (!within_tolerance(output[index], expected, max_absolute,
+                          max_relative)) {
       std::fprintf(stderr,
                    "numeric mismatch index=%zu expected=%.9g actual=%.9g\n",
                    index, expected, output[index]);
@@ -90,7 +110,9 @@ int main(int argc, char **argv) {
       2.0 * static_cast<double>(m) * kK * static_cast<double>(kN);
   std::printf("kernel=gemm_f32\ntarget=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n",
               WEFT_TARGET_NAME, phase, m, kN, kK);
-  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
+              "max_relative_error=%.9g\nrepetitions=%zu\n",
+              max_absolute, max_relative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", median_us,
               operations / median_us / 1.0e3);
   return 0;

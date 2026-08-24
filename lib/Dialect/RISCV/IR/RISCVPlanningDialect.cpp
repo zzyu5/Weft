@@ -30,7 +30,9 @@ mlir::LogicalResult ProblemOp::verify() {
   if (getKernel().empty())
     return emitOpError("physicalization candidate requires a kernel");
   if (getStage() != "facts" && getStage() != "representations" &&
-      getStage() != "operations" && getStage() != "schedule" &&
+      getStage() != "conversions" && getStage() != "storage-mappings" &&
+      getStage() != "operations" &&
+      getStage() != "schedule" &&
       getStage() != "resources" && getStage() != "invalid")
     return emitOpError("unknown physicalization candidate stage");
   if (failed(requireDictionaryKeys(

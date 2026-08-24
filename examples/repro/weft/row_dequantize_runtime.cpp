@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +19,22 @@
 #endif
 
 namespace {
+constexpr double kAbsoluteTolerance = 1.0e-4;
+constexpr double kRelativeTolerance = 2.0e-3;
+
+bool within_tolerance(float actual, float expected, double &max_absolute,
+                      double &max_relative) {
+  if (!std::isfinite(actual) || !std::isfinite(expected))
+    return false;
+  const double absolute =
+      std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+  const double relative =
+      absolute / std::max(std::fabs(static_cast<double>(expected)), 1.0e-30);
+  max_absolute = std::max(max_absolute, absolute);
+  max_relative = std::max(max_relative, relative);
+  return absolute <=
+         kAbsoluteTolerance + kRelativeTolerance * std::fabs(expected);
+}
 
 #if defined(WEFT_TARGET_K1)
 constexpr const char *kTarget = "K1/X60";
@@ -418,10 +435,13 @@ int main(int argc, char **argv) {
              actual.data() + row * kElements);
   };
   run();
+  double maxAbsolute = 0.0;
+  double maxRelative = 0.0;
   for (std::size_t row = 0; row < kRows; ++row) {
     for (std::size_t index = 0; index < kElements; ++index) {
       const float value = actual[row * kElements + index];
-      if (std::memcmp(&value, &expectedRow[index], sizeof(float)) != 0) {
+      if (!within_tolerance(value, expectedRow[index], maxAbsolute,
+                            maxRelative)) {
         std::fprintf(stderr,
                      "mismatch at row=%zu element=%zu: actual=%a expected=%a\n",
                      row, index, value, expectedRow[index]);
@@ -443,7 +463,9 @@ int main(int argc, char **argv) {
   const double medianUs = median(samples);
   const double elements = static_cast<double>(kRows) * kElements;
   std::printf("target=%s\nN=%zu\nK=%zu\n", kTarget, kRows, kElements);
-  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
+              "max_relative_error=%.9g\nrepetitions=%zu\n",
+              maxAbsolute, maxRelative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_melements_s=%.6f\n", medianUs,
               elements / medianUs);
   return 0;

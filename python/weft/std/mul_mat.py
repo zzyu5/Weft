@@ -13,6 +13,7 @@ from weft.language import (
     i8,
     i16,
     i32,
+    iota,
     lookup,
     mac_groups,
     materialize,
@@ -84,6 +85,54 @@ from .vec_dot import (
 )
 
 
+def _iq2_xxs_entry_products(
+    word0,
+    word1,
+    x,
+    grid,
+    signs,
+    codebook_lane,
+    group,
+    entry,
+):
+    grid_index = (word0 >> u32(entry * 8)) & u32(255)
+    sign_index = (word1 >> u32(entry * 7)) & u32(127)
+    weight = lookup(grid, grid_index * u32(8) + codebook_lane) @ wide
+    sign = lookup(signs, sign_index * u32(8) + codebook_lane) @ wide
+    signed_weight = weight * sign @ wide
+    activation = x.q[:, group * 32 + entry * 8 + codebook_lane]
+    return widen(activation, i16) * widen(signed_weight, i16) @ wide
+
+
+def _iq2_xxs_group_products(
+    w,
+    x,
+    grid,
+    signs,
+    entry_lane,
+    codebook_lane,
+    group,
+):
+    word0 = widen(w.q[:, group * 4], u32) | (
+        widen(w.q[:, group * 4 + 1], u32) << u32(16)
+    )
+    word1 = widen(w.q[:, group * 4 + 2], u32) | (
+        widen(w.q[:, group * 4 + 3], u32) << u32(16)
+    )
+    local = _iq2_xxs_entry_products(
+        word0,
+        word1,
+        x,
+        grid,
+        signs,
+        codebook_lane,
+        group,
+        entry_lane,
+    )
+    scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
+    return widen(local, i32) * scale @ wide
+
+
 def mul_mat_q1_0(
     W: View[Q1_0, (N, K)],
     X: View[f32, (M, K)],
@@ -105,8 +154,28 @@ def mul_mat_q4_0(
     quantize_q8_0(X, Xq)
     for row in range(M):
         for column in range(N):
-            value = vec_dot_q4_0_q8_0(W[column], Xq[row])
-            commit(value, Y[row, column])
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(pack(W[nc, kc], along="n")) @ transfer
+            with L.tiles(M, extent=auto("MC")) as mc:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=auto("NR")) as nb:
+                        acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=32) as kb:
+                            w = admit(wp[nb, kb]) @ transfer
+                            x = admit(Xq[mb, kb]) @ transfer
+                            raw = outer_contract(
+                                x.q, w.q, over="k", acc=i32
+                            ) @ wide
+                            activation_sum = reduce(
+                                widen(x.q, i32), axis="k"
+                            ) @ wide
+                            centered = raw - i32(8) * activation_sum @ wide
+                            acc += (
+                                widen(centered, f32) * f32(w.d) * f32(x.d)
+                            ) @ wide
+                        commit(acc, Y[mb, nb])
 
 
 def mul_mat_q4_1(
@@ -396,52 +465,37 @@ def mul_mat_iq2_xxs_local_pack(
             wp = materialize(pack(W[nc, kc], along="n")) @ transfer
             with L.tiles(M, extent=auto("MC")) as mc:
                 with L.rows(mc, group=auto("MR")) as mb:
-                    with L.cols(nc, group=16) as nb:
-                        f32_acc = new(f32, [MR, 16], init=admit(Y[mb, nb]))
+                    with L.cols(nc, group=auto("NR")) as nb:
+                        f32_acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
                         with L.blocks(kc, extent=256) as kb:
                             w = admit(wp[nb, kb]) @ transfer
                             x = admit(Xq[mb, kb]) @ transfer
-                            block_sum = new(i32, [MR, 16], init=0)
-                            for group in range(8):
-                                word0 = widen(w.q[:, group * 4], u32) | (
-                                    widen(w.q[:, group * 4 + 1], u32) << u32(16)
+                            entry_lane = iota(4)
+                            codebook_lane = iota(8)
+                            block_partial = _iq2_xxs_group_products(
+                                w,
+                                x,
+                                grid,
+                                signs,
+                                entry_lane,
+                                codebook_lane,
+                                0,
+                            )
+                            for group in range(1, 8):
+                                group_partial = _iq2_xxs_group_products(
+                                    w,
+                                    x,
+                                    grid,
+                                    signs,
+                                    entry_lane,
+                                    codebook_lane,
+                                    group,
                                 )
-                                word1 = widen(w.q[:, group * 4 + 2], u32) | (
-                                    widen(w.q[:, group * 4 + 3], u32) << u32(16)
-                                )
-                                local = new(i32, [MR, 16], init=0)
-                                for entry in range(4):
-                                    grid_index = (
-                                        word0 >> u32(entry * 8)
-                                    ) & u32(255)
-                                    sign_index = (
-                                        word1 >> u32(entry * 7)
-                                    ) & u32(127)
-                                    for lane in range(8):
-                                        weight = widen(
-                                            lookup(
-                                                grid,
-                                                grid_index * u32(8) + u32(lane),
-                                            )
-                                            @ wide,
-                                            i32,
-                                        )
-                                        sign = widen(
-                                            lookup(
-                                                signs,
-                                                sign_index * u32(8) + u32(lane),
-                                            )
-                                            @ wide,
-                                            i32,
-                                        )
-                                        activation = i32(
-                                            x.q[:, group * 32 + entry * 8 + lane]
-                                        )
-                                        local += weight * sign * activation @ wide
-                                scale = i32(
-                                    (word1 >> u32(28)) * u32(2) + u32(1)
-                                )
-                                block_sum += local * scale @ wide
+                                block_partial = (
+                                    block_partial + group_partial
+                                ) @ wide
+                            entry_sum = reduce(block_partial, axis=1) @ wide
+                            block_sum = reduce(entry_sum, axis=1) @ wide
                             f32_acc += (
                                 f32(w.d)
                                 * f32(x.ds)
@@ -451,7 +505,7 @@ def mul_mat_iq2_xxs_local_pack(
     with L.tiles(N, extent=auto("NC")) as nc:
         with L.tiles(M, extent=auto("MC")) as mc:
             with L.rows(mc, group=auto("MR")) as mb:
-                with L.cols(nc, group=16) as nb:
+                with L.cols(nc, group=auto("NR")) as nb:
                     value = admit(Y[mb, nb]) @ transfer
                     commit(f32(0.125) * value @ wide, Y[mb, nb])
 

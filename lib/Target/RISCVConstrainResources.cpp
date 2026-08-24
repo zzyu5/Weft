@@ -7,6 +7,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -46,6 +47,7 @@ public:
       llvm::StringMap<std::string> producers;
       llvm::StringMap<bool> deferredLocalResults;
       llvm::StringMap<llvm::SmallVector<int64_t, 4>> useOrdinals;
+      llvm::StringSet<> pipelineFrontiers;
       for (auto [ordinal, attribute] : llvm::enumerate(problem.getOperations())) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         llvm::StringRef name =
@@ -71,6 +73,17 @@ public:
             if (uses.empty() || uses.back() != static_cast<int64_t>(ordinal))
               uses.push_back(ordinal);
           }
+        if (auto cluster =
+                operation.getAs<mlir::DictionaryAttr>("local_cluster")) {
+          int64_t depth =
+              riscv_internal::integer(cluster, "pipeline_depth").value_or(1);
+          if (depth > 1)
+            if (auto frontier =
+                    cluster.getAs<mlir::ArrayAttr>("frontier_values"))
+              for (mlir::Attribute value : frontier)
+                pipelineFrontiers.insert(
+                    mlir::cast<mlir::StringAttr>(value).getValue());
+        }
       }
 
       llvm::SmallVector<mlir::DictionaryAttr> values;
@@ -193,7 +206,8 @@ public:
             llvm::StringRef materialization =
                 riscv_internal::string(value, "materialization").value_or("");
             bool liveNow = ordinal >= begin && ordinal <= end;
-            if (materialization == "reload-per-use")
+            if (materialization == "reload-per-use" ||
+                materialization == "rematerialize-per-register-part")
               liveNow = llvm::is_contained(useOrdinals.lookup(id), ordinal);
             if (!liveNow)
               continue;
@@ -246,36 +260,81 @@ public:
 
       Peak peak = measurePeak();
       llvm::SmallVector<std::string> reloaded;
+      llvm::SmallVector<std::string> rematerialized;
+      auto isPureRematerializable = [](llvm::StringRef producer) {
+        return producer == "weft_kernel.iota" ||
+               producer == "weft_kernel.extract" ||
+               producer == "weft_kernel.lookup" ||
+               producer == "weft_kernel.unary" ||
+               producer == "weft_kernel.binary" ||
+               producer == "weft_kernel.cast" ||
+               producer == "weft_kernel.widen" ||
+               producer == "weft_kernel.narrow";
+      };
       while (peak.groups > budget) {
         int64_t bestScore = -1;
         size_t bestIndex = values.size();
+        bool rematerialize = false;
         for (auto [index, value] : llvm::enumerate(values)) {
           llvm::StringRef id = *riscv_internal::string(value, "id");
-          if (producers.lookup(id) != "weft_kernel.admit" ||
-              riscv_internal::string(value, "materialization").value_or("") !=
-                  "shared-register")
-            continue;
-          int64_t groups =
+          llvm::StringRef materialization =
+              riscv_internal::string(value, "materialization").value_or("");
+          std::string producer = producers.lookup(id);
+          const bool reload = producer == "weft_kernel.admit" &&
+                              materialization == "shared-register" &&
+                              !pipelineFrontiers.contains(id);
+          const int64_t perPart =
+              riscv_internal::integer(value, "register_groups_per_part")
+                  .value_or(0);
+          const int64_t groups =
               riscv_internal::integer(value, "register_groups").value_or(0);
+          const bool recompute = isPureRematerializable(producer) &&
+                                 !pipelineFrontiers.contains(id) &&
+                                 materialization !=
+                                     "rematerialize-per-register-part" &&
+                                 groups > perPart && perPart > 0 &&
+                                 !useOrdinals.lookup(id).empty();
+          if (!reload && !recompute)
+            continue;
           int64_t span = *riscv_internal::integer(value, "live_end") -
                          *riscv_internal::integer(value, "live_start") + 1;
-          int64_t score = groups * span;
+          int64_t score = (groups - (recompute ? perPart : 0)) * span;
           if (score > bestScore) {
             bestScore = score;
             bestIndex = index;
+            rematerialize = recompute;
           }
         }
         if (bestIndex == values.size())
           break;
         mlir::DictionaryAttr value = values[bestIndex];
-        reloaded.push_back(riscv_internal::string(value, "id")->str());
-        value = riscv_internal::set(
-            value, "materialization",
-            builder.getStringAttr("reload-per-use"));
-        value = riscv_internal::set(
-            value, "materialization_derived_from",
-            builder.getStringAttr(
-                "live-range peak exceeded target registers; reload source at uses"));
+        llvm::StringRef id = *riscv_internal::string(value, "id");
+        if (rematerialize) {
+          rematerialized.push_back(id.str());
+          value = riscv_internal::set(
+              value, "materialization",
+              builder.getStringAttr("rematerialize-per-register-part"));
+          value = riscv_internal::set(
+              value, "register_groups",
+              builder.getI64IntegerAttr(
+                  riscv_internal::integer(value, "register_groups_per_part")
+                      .value_or(0)));
+          value = riscv_internal::set(
+              value, "storage", builder.getStringAttr("deferred-expression"));
+          value = riscv_internal::set(
+              value, "materialization_derived_from",
+              builder.getStringAttr(
+                  "pure computed aggregate exceeds the live register budget; emit one register coordinate at each use"));
+        } else {
+          reloaded.push_back(id.str());
+          value = riscv_internal::set(
+              value, "materialization",
+              builder.getStringAttr("reload-per-use"));
+          value = riscv_internal::set(
+              value, "materialization_derived_from",
+              builder.getStringAttr(
+                  "live-range peak exceeded target registers; reload source at uses"));
+        }
         values[bestIndex] = value;
         peak = measurePeak();
       }
@@ -292,9 +351,15 @@ public:
             builder.getI64IntegerAttr(peak.temporaryGroups)},
            {"reserved_vector_groups", builder.getI64IntegerAttr(reserved)},
            {"spill", builder.getStringAttr(reloaded.empty()
-                                               ? "none"
-                                               : "reload-admitted-values")},
+                                               ? (rematerialized.empty()
+                                                      ? "none"
+                                                      : "rematerialize-computed-values")
+                                               : (rematerialized.empty()
+                                                      ? "reload-admitted-values"
+                                                      : "reload-and-rematerialize"))},
            {"reloaded_values", riscv_internal::strings(builder, reloaded)},
+           {"rematerialized_values",
+            riscv_internal::strings(builder, rematerialized)},
            {"stack_bytes", builder.getI64IntegerAttr(0)},
            {"cost", builder.getI64IntegerAttr(peak.groups)},
            {"decision_owner", builder.getStringAttr("global-resource-check")}});
@@ -315,6 +380,40 @@ public:
               reason += ", ";
             reason += value;
           }
+        }
+        if (!rematerialized.empty()) {
+          reason += "; rematerialized computed values: ";
+          for (auto [index, value] : llvm::enumerate(rematerialized)) {
+            if (index)
+              reason += ", ";
+            reason += value;
+          }
+        }
+        reason += "; live values: ";
+        bool firstValue = true;
+        for (mlir::DictionaryAttr value : values) {
+          int64_t begin = *riscv_internal::integer(value, "live_start");
+          int64_t end = *riscv_internal::integer(value, "live_end");
+          if (peak.ordinal < begin || peak.ordinal > end)
+            continue;
+          llvm::StringRef id = *riscv_internal::string(value, "id");
+          int64_t groups =
+              riscv_internal::integer(value, "register_groups").value_or(0);
+          if (!groups)
+            continue;
+          if (!firstValue)
+            reason += ", ";
+          firstValue = false;
+          reason += id.str() + "=" + producers.lookup(id) + "/" +
+                    riscv_internal::string(value, "materialization")
+                        .value_or("")
+                        .str() +
+                    "/" + std::to_string(groups) + "g/" +
+                    std::to_string(riscv_internal::integer(
+                                       value, "register_groups_per_part")
+                                       .value_or(0)) +
+                    "gpp/" + std::to_string(useOrdinals.lookup(id).size()) +
+                    "uses";
         }
         resources = riscv_internal::set(
             resources, "invalid_reason",

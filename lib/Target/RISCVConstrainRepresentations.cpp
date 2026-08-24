@@ -38,6 +38,15 @@ bool containsAxis(mlir::DictionaryAttr value, int64_t axis) {
   return axes && llvm::is_contained(axes.asArrayRef(), axis);
 }
 
+bool sameAxisSet(mlir::DenseI64ArrayAttr lhs, mlir::DenseI64ArrayAttr rhs) {
+  if (!lhs || !rhs || lhs.size() != rhs.size())
+    return false;
+  for (int64_t axis : lhs.asArrayRef())
+    if (!llvm::is_contained(rhs.asArrayRef(), axis))
+      return false;
+  return true;
+}
+
 int64_t laneExtent(mlir::DictionaryAttr value, int64_t axis) {
   auto axes = value.getAs<mlir::DenseI64ArrayAttr>("axes");
   auto shape = value.getAs<mlir::DenseI64ArrayAttr>("shape");
@@ -89,7 +98,8 @@ std::string physicalKind(mlir::DictionaryAttr value, int64_t laneAxis,
 }
 
 bool propagatesLaneIdentity(llvm::StringRef name) {
-  return name == "weft_kernel.admit" || name == "weft_kernel.commit" ||
+  return name == "weft_kernel.iota" || name == "weft_kernel.admit" ||
+         name == "weft_kernel.commit" ||
          name == "weft_kernel.materialize" || name == "weft_kernel.pack" ||
          name == "weft_kernel.stage_handoff" ||
          name == "weft_kernel.field" || name == "weft_kernel.extract" ||
@@ -98,7 +108,7 @@ bool propagatesLaneIdentity(llvm::StringRef name) {
          name == "weft_kernel.cast" || name == "weft_kernel.widen" ||
          name == "weft_kernel.narrow" || name == "weft_kernel.fold2" ||
          name == "weft_kernel.mac_pairs" ||
-         name == "weft_kernel.mac_groups" || name == "weft_kernel.reduce" ||
+         name == "weft_kernel.mac_groups" ||
          name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
          name == "weft_kernel.outer_contract" ||
          name == "weft_kernel.lookup";
@@ -220,10 +230,15 @@ public:
       llvm::StringMap<int> valueLanePriorities;
       llvm::StringMap<int64_t> valueLaneCohorts;
       llvm::StringMap<llvm::SmallVector<int64_t, 4>> valueRegisterAxes;
+      llvm::DenseMap<int64_t, int64_t> explicitLocalAxisExtents;
+      llvm::StringMap<bool> valueNoLaneAnchors;
+      llvm::StringMap<bool> valueStrongLaneAnchors;
       llvm::StringMap<int64_t> operationLaneAxes;
       llvm::StringMap<int64_t> operationLaneCohorts;
       llvm::StringMap<int64_t> operationMemoryAffinities;
       llvm::StringMap<std::string> operationLaneReasons;
+      llvm::StringMap<bool> operationNoLaneMappings;
+      llvm::StringMap<std::string> operationSliceConflicts;
       llvm::StringMap<int64_t> operationAccumulatorAxes;
       llvm::StringMap<int64_t> operationEliminatedAxes;
       for (mlir::Attribute attribute : problem.getOperations()) {
@@ -245,6 +260,30 @@ public:
             producerIds[id] = riscv_internal::string(operation, "id")->str();
             producerOperations[id] = operation;
           }
+        if (name == "weft_kernel.iota" || name == "weft_kernel.dot" ||
+            name == "weft_kernel.contract" ||
+            name == "weft_kernel.outer_contract")
+          if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+            for (mlir::Attribute result : results) {
+              llvm::StringRef resultId =
+                  mlir::cast<mlir::StringAttr>(result).getValue();
+              if (name != "weft_kernel.iota") {
+                valueStrongLaneAnchors[resultId] = true;
+                continue;
+              }
+              auto found = valuesById.find(resultId);
+              auto axes = found == valuesById.end()
+                              ? mlir::DenseI64ArrayAttr()
+                              : found->second.getAs<mlir::DenseI64ArrayAttr>(
+                                    "axes");
+              auto shape = found == valuesById.end()
+                               ? mlir::DenseI64ArrayAttr()
+                               : found->second.getAs<mlir::DenseI64ArrayAttr>(
+                                     "shape");
+              if (axes && axes.size() == 1 && shape && shape.size() == 1 &&
+                  shape[0] > 1)
+                explicitLocalAxisExtents[axes[0]] = shape[0];
+            }
         if (name == "weft_kernel.extract") {
           auto operands = operation.getAs<mlir::ArrayAttr>("operands");
           auto results = operation.getAs<mlir::ArrayAttr>("results");
@@ -362,6 +401,25 @@ public:
         int operationPriority = 3;
         int64_t operationCohort = 1;
         int64_t operationMemoryAffinity = -1;
+        if (name == "weft_kernel.iota") {
+          auto results = operation.getAs<mlir::ArrayAttr>("results");
+          if (results && results.size() == 1) {
+            auto result = valuesById.find(
+                mlir::cast<mlir::StringAttr>(results[0]).getValue());
+            auto axes = result == valuesById.end()
+                            ? mlir::DenseI64ArrayAttr()
+                            : result->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+            auto shape = result == valuesById.end()
+                             ? mlir::DenseI64ArrayAttr()
+                             : result->second.getAs<mlir::DenseI64ArrayAttr>("shape");
+            if (axes && axes.size() == 1 && shape && shape.size() == 1) {
+              operationAxis = axes[0];
+              operationPriority = -4;
+              operationCohort = shape[0];
+              operationMemoryAffinity = 1;
+            }
+          }
+        }
         if (name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
             name == "weft_kernel.outer_contract") {
           auto source =
@@ -388,11 +446,26 @@ public:
                             : input->second.getAs<mlir::DenseI64ArrayAttr>("axes");
             if (axes && position.getInt() >= 0 &&
                 position.getInt() < static_cast<int64_t>(axes.size())) {
-              operationAxis = axes.asArrayRef()[position.getInt()];
-              operationPriority = -2;
-              operationCohort =
-                  std::max<int64_t>(1, factsFor(operation, operationAxis).cohort);
-              operationEliminatedAxes[operationId] = operationAxis;
+              const int64_t eliminatedAxis =
+                  axes.asArrayRef()[position.getInt()];
+              operationEliminatedAxes[operationId] = eliminatedAxis;
+              const int64_t inputLane = valueLaneAxes.lookup(inputId);
+              if (inputLane > 0) {
+                operationAxis = inputLane;
+                operationPriority = valueLanePriorities.lookup(inputId);
+                operationCohort = valueLaneCohorts.lookup(inputId);
+              } else {
+                operationAxis = eliminatedAxis;
+                operationPriority = -2;
+                operationCohort = std::max<int64_t>(
+                    1, factsFor(operation, operationAxis).cohort);
+              }
+              if (operationAxis == eliminatedAxis)
+                if (auto results =
+                        operation.getAs<mlir::ArrayAttr>("results"))
+                  for (mlir::Attribute result : results)
+                    valueNoLaneAnchors[mlir::cast<mlir::StringAttr>(result)
+                                           .getValue()] = true;
             }
           }
         } else if (name == "weft_kernel.outer_contract") {
@@ -537,6 +610,68 @@ public:
         if (operationAxis < 0)
           considerMappedOperands(
               operation.getAs<mlir::ArrayAttr>("operands"));
+        auto anchoredNoLaneAxes = [&]() {
+          llvm::SmallVector<mlir::DenseI64ArrayAttr, 2> anchors;
+          for (llvm::StringRef key : {"operands", "results"})
+            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+              for (mlir::Attribute idAttribute : ids) {
+                llvm::StringRef id =
+                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                if (!valueNoLaneAnchors.lookup(id))
+                  continue;
+                auto found = valuesById.find(id);
+                if (found != valuesById.end())
+                  if (auto axes = found->second.getAs<mlir::DenseI64ArrayAttr>(
+                          "axes"))
+                    anchors.push_back(axes);
+              }
+          return anchors;
+        }();
+        bool hasStrongLaneAnchor = false;
+        for (llvm::StringRef key : {"operands", "results"})
+          if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+            for (mlir::Attribute idAttribute : ids) {
+              llvm::StringRef id =
+                  mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+              hasStrongLaneAnchor |= valueStrongLaneAnchors.lookup(id) &&
+                                     valueLaneAxes.lookup(id) > 0;
+            }
+        if (!anchoredNoLaneAxes.empty())
+          operationSliceConflicts[operationId] =
+              hasStrongLaneAnchor ? "explicit-lane-anchor-wins"
+                                  : "sliced-no-lane-anchor-wins";
+        // A reduce result is the parent representation with the reduction axis
+        // sliced away.  It therefore acts as an explicit no-lane mapping anchor.
+        // Generic pointwise propagation may adopt that sliced mapping, but it may
+        // not invent a new lane merely because a surviving free axis has a local
+        // cohort.  An explicit primitive/memory anchor (negative priority) still
+        // wins and receives a later mechanical broadcast/conversion.
+        if (name != "weft_kernel.reduce" && !anchoredNoLaneAxes.empty() &&
+            !hasStrongLaneAnchor) {
+          operationNoLaneMappings[operationId] = true;
+          for (llvm::StringRef key : {"operands", "results"})
+            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+              for (mlir::Attribute idAttribute : ids) {
+                llvm::StringRef id =
+                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                auto found = valuesById.find(id);
+                if (found == valuesById.end() ||
+                    riscv_internal::integer(found->second, "logical_sew")
+                            .value_or(0) <= 0)
+                  continue;
+                auto axes =
+                    found->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+                if (!axes || !llvm::any_of(anchoredNoLaneAxes, [&](auto anchor) {
+                      return sameAxisSet(anchor, axes);
+                    }))
+                  continue;
+                valueNoLaneAnchors[id] = true;
+                valueLaneAxes.erase(id);
+                valueLanePriorities.erase(id);
+                valueLaneCohorts.erase(id);
+              }
+          continue;
+        }
         if (operationAxis < 0)
           consider(operation.getAs<mlir::ArrayAttr>("results"));
         if (operationAxis < 0)
@@ -572,7 +707,9 @@ public:
         operationLaneCohorts[operationId] = operationCohort;
         operationMemoryAffinities[operationId] = operationMemoryAffinity;
         operationLaneReasons[operationId] =
-            operationEliminatedAxes.lookup(operationId) == operationAxis
+            name == "weft_kernel.iota"
+                ? "explicit logical iota axis"
+            : operationEliminatedAxes.lookup(operationId) == operationAxis
                 ? "explicit reduction axis eliminated by this operation"
             : operationPriority < 0
                 ? "explicit packed/derived operand layout"
@@ -614,6 +751,53 @@ public:
               continue;
             llvm::StringRef operationId =
                 riscv_internal::string(operation, "id").value_or("");
+            llvm::SmallVector<mlir::DenseI64ArrayAttr, 2> slicedAnchors;
+            bool strongLane = false;
+            for (llvm::StringRef key : {"operands", "results"})
+              if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+                for (mlir::Attribute idAttribute : ids) {
+                  llvm::StringRef id =
+                      mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                  auto found = valuesById.find(id);
+                  if (valueNoLaneAnchors.lookup(id) &&
+                      found != valuesById.end())
+                    if (auto axes = found->second.getAs<
+                            mlir::DenseI64ArrayAttr>("axes"))
+                      slicedAnchors.push_back(axes);
+                  strongLane |= valueStrongLaneAnchors.lookup(id) &&
+                                valueLaneAxes.lookup(id) > 0;
+                }
+            if (!slicedAnchors.empty() && !strongLane) {
+              bool newlySliced = !operationNoLaneMappings.lookup(operationId);
+              operationNoLaneMappings[operationId] = true;
+              operationLaneAxes.erase(operationId);
+              operationSliceConflicts[operationId] =
+                  "sliced-no-lane-anchor-wins";
+              for (llvm::StringRef key : {"operands", "results"})
+                if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+                  for (mlir::Attribute idAttribute : ids) {
+                    llvm::StringRef id =
+                        mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                    auto found = valuesById.find(id);
+                    auto axes =
+                        found == valuesById.end()
+                            ? mlir::DenseI64ArrayAttr()
+                            : found->second.getAs<mlir::DenseI64ArrayAttr>(
+                                  "axes");
+                    if (!axes || !llvm::any_of(slicedAnchors, [&](auto anchor) {
+                          return sameAxisSet(anchor, axes);
+                        }))
+                      continue;
+                    newlySliced |= !valueNoLaneAnchors.lookup(id) ||
+                                   valueLaneAxes.lookup(id) > 0;
+                    valueNoLaneAnchors[id] = true;
+                    valueLaneAxes.erase(id);
+                    valueLanePriorities.erase(id);
+                    valueLaneCohorts.erase(id);
+                  }
+              changed |= newlySliced;
+              continue;
+            }
             int64_t axis = operationLaneAxes.lookup(operationId);
             AxisFacts operationFacts =
                 axis > 0 ? factsFor(operation, axis) : AxisFacts{};
@@ -646,6 +830,7 @@ public:
                       mlir::cast<mlir::StringAttr>(idAttribute).getValue();
                   auto found = valuesById.find(id);
                   if (found == valuesById.end() ||
+                      valueNoLaneAnchors.lookup(id) ||
                       !containsAxis(found->second, axis) ||
                       riscv_internal::integer(found->second, "logical_sew")
                               .value_or(0) <= 0)
@@ -666,49 +851,292 @@ public:
       };
       propagateLaneIdentities();
 
+      // A reduction slices exactly one logical axis from its input mapping.
+      // The initial operation walk may see the reduction before the complete
+      // iota/use-def mapping has reached its input, so refresh the slice after
+      // lane propagation has stabilized.  If the eliminated axis is not the
+      // input lane, the lane and all surviving free axes remain part of the
+      // result representation.  Only eliminating the actual lane produces a
+      // no-lane result.
+      auto refreshReductionMappings = [&]() {
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        if (riscv_internal::string(operation, "name").value_or("") !=
+            "weft_kernel.reduce")
+          continue;
+        auto operands = operation.getAs<mlir::ArrayAttr>("operands");
+        auto results = operation.getAs<mlir::ArrayAttr>("results");
+        llvm::StringRef operationId =
+            riscv_internal::string(operation, "id").value_or("");
+        const int64_t eliminatedAxis =
+            operationEliminatedAxes.lookup(operationId);
+        if (!operands || operands.size() != 1 || !results ||
+            results.size() != 1 || eliminatedAxis <= 0)
+          continue;
+        llvm::StringRef inputId =
+            mlir::cast<mlir::StringAttr>(operands[0]).getValue();
+        llvm::StringRef resultId =
+            mlir::cast<mlir::StringAttr>(results[0]).getValue();
+        const int64_t inputLane = valueLaneAxes.lookup(inputId);
+        auto resultValue = valuesById.find(resultId);
+        if (inputLane <= 0 || resultValue == valuesById.end())
+          continue;
+        operationLaneAxes[operationId] = inputLane;
+        operationLaneCohorts[operationId] = valueLaneCohorts.lookup(inputId);
+        operationLaneReasons[operationId] =
+            inputLane == eliminatedAxis
+                ? "explicit reduction eliminates the input lane axis"
+                : "reduce result slices one non-lane axis and preserves the input lane";
+        if (inputLane == eliminatedAxis ||
+            !containsAxis(resultValue->second, inputLane)) {
+          valueNoLaneAnchors[resultId] = true;
+          valueLaneAxes.erase(resultId);
+          valueLanePriorities.erase(resultId);
+          valueLaneCohorts.erase(resultId);
+          continue;
+        }
+        operationNoLaneMappings.erase(operationId);
+        operationSliceConflicts.erase(operationId);
+        valueNoLaneAnchors.erase(resultId);
+        valueLaneAxes[resultId] = inputLane;
+        valueLanePriorities[resultId] = valueLanePriorities.lookup(inputId);
+        valueLaneCohorts[resultId] = valueLaneCohorts.lookup(inputId);
+      }
+      };
+      refreshReductionMappings();
+      propagateLaneIdentities();
+
       struct HandoffChoice {
         int64_t axis = 0;
         int priority = 3;
         int64_t cohort = 1;
       };
-      llvm::StringMap<HandoffChoice> handoffChoices;
-      for (mlir::Attribute attribute : problem.getValues()) {
-        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef handoff =
-            riscv_internal::string(value, "handoff_class").value_or("");
-        llvm::StringRef id = *riscv_internal::string(value, "id");
-        int64_t axis = valueLaneAxes.lookup(id);
-        if (handoff.empty() || axis <= 0)
-          continue;
-        int priority = valueLanePriorities.lookup(id);
-        int64_t cohort = valueLaneCohorts.lookup(id);
-        HandoffChoice &choice = handoffChoices[handoff];
-        if (choice.axis <= 0 || priority < choice.priority ||
-            (priority == choice.priority && cohort > choice.cohort))
-          choice = {axis, priority, cohort};
-      }
-      for (mlir::Attribute attribute : problem.getValues()) {
-        auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-        llvm::StringRef handoff =
-            riscv_internal::string(value, "handoff_class").value_or("");
-        auto choice = handoffChoices.find(handoff);
-        if (handoff.empty() || choice == handoffChoices.end() ||
-            !containsAxis(value, choice->second.axis) ||
-            riscv_internal::integer(value, "logical_sew").value_or(0) <= 0)
-          continue;
-        llvm::StringRef id = *riscv_internal::string(value, "id");
-        auto previous = valueLanePriorities.find(id);
-        const int64_t previousCohort = valueLaneCohorts.lookup(id);
-        if (previous == valueLanePriorities.end() ||
-            choice->second.priority < previous->second ||
-            (choice->second.priority == previous->second &&
-             choice->second.cohort > previousCohort)) {
-          valueLaneAxes[id] = choice->second.axis;
-          valueLanePriorities[id] = choice->second.priority;
-          valueLaneCohorts[id] = choice->second.cohort;
+      auto propagateHandoffIdentities = [&]() {
+        llvm::StringMap<HandoffChoice> choices;
+        for (mlir::Attribute attribute : problem.getValues()) {
+          auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+          llvm::StringRef handoff =
+              riscv_internal::string(value, "handoff_class").value_or("");
+          llvm::StringRef id = *riscv_internal::string(value, "id");
+          int64_t axis = valueLaneAxes.lookup(id);
+          if (handoff.empty() || axis <= 0 || valueNoLaneAnchors.lookup(id))
+            continue;
+          int priority = valueLanePriorities.lookup(id);
+          int64_t cohort = valueLaneCohorts.lookup(id);
+          HandoffChoice &choice = choices[handoff];
+          if (choice.axis <= 0 || priority < choice.priority ||
+              (priority == choice.priority && cohort > choice.cohort))
+            choice = {axis, priority, cohort};
         }
+        bool changed = false;
+        for (mlir::Attribute attribute : problem.getValues()) {
+          auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+          llvm::StringRef handoff =
+              riscv_internal::string(value, "handoff_class").value_or("");
+          llvm::StringRef id = *riscv_internal::string(value, "id");
+          auto choice = choices.find(handoff);
+          if (handoff.empty() || choice == choices.end() ||
+              valueNoLaneAnchors.lookup(id) ||
+              !containsAxis(value, choice->second.axis) ||
+              riscv_internal::integer(value, "logical_sew").value_or(0) <= 0)
+            continue;
+          auto previous = valueLanePriorities.find(id);
+          const int64_t previousCohort = valueLaneCohorts.lookup(id);
+          if (previous == valueLanePriorities.end() ||
+              choice->second.priority < previous->second ||
+              (choice->second.priority == previous->second &&
+               choice->second.cohort > previousCohort)) {
+            valueLaneAxes[id] = choice->second.axis;
+            valueLanePriorities[id] = choice->second.priority;
+            valueLaneCohorts[id] = choice->second.cohort;
+            changed = true;
+          }
+        }
+        return changed;
+      };
+      propagateHandoffIdentities();
+      // Explicit iota defines the complete logical cohort.  Generic propagation
+      // may copy that mapping but may never shrink it to the default cohort of
+      // an axis that does not come from a Level domain.
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        if (riscv_internal::string(operation, "name").value_or("") !=
+            "weft_kernel.iota")
+          continue;
+        auto results = operation.getAs<mlir::ArrayAttr>("results");
+        if (!results || results.size() != 1)
+          continue;
+        llvm::StringRef id =
+            mlir::cast<mlir::StringAttr>(results[0]).getValue();
+        auto value = valuesById.find(id);
+        auto axes = value == valuesById.end()
+                        ? mlir::DenseI64ArrayAttr()
+                        : value->second.getAs<mlir::DenseI64ArrayAttr>("axes");
+        auto shape = value == valuesById.end()
+                         ? mlir::DenseI64ArrayAttr()
+                         : value->second.getAs<mlir::DenseI64ArrayAttr>("shape");
+        if (!axes || axes.size() != 1 || !shape || shape.size() != 1)
+          continue;
+        valueLaneAxes[id] = axes[0];
+        valueLanePriorities[id] = -4;
+        valueLaneCohorts[id] = shape[0];
       }
       propagateLaneIdentities();
+      while (propagateHandoffIdentities())
+        propagateLaneIdentities();
+      auto propagateSlicedHandoffs = [&]() {
+        bool changed = false;
+        for (const auto &entry : handoffValues) {
+          llvm::SmallVector<mlir::DenseI64ArrayAttr, 2> slicedAxes;
+          for (const std::string &id : entry.getValue()) {
+            if (!valueNoLaneAnchors.lookup(id))
+              continue;
+            auto found = valuesById.find(id);
+            if (found != valuesById.end())
+              if (auto axes =
+                      found->second.getAs<mlir::DenseI64ArrayAttr>("axes"))
+                slicedAxes.push_back(axes);
+          }
+          if (slicedAxes.empty())
+            continue;
+          for (const std::string &id : entry.getValue()) {
+            auto found = valuesById.find(id);
+            auto axes = found == valuesById.end()
+                            ? mlir::DenseI64ArrayAttr()
+                            : found->second.getAs<mlir::DenseI64ArrayAttr>(
+                                  "axes");
+            if (!axes || valueStrongLaneAnchors.lookup(id) ||
+              !llvm::any_of(slicedAxes, [&](auto anchor) {
+                return sameAxisSet(anchor, axes);
+              }))
+              continue;
+            changed |= !valueNoLaneAnchors.lookup(id) ||
+                       valueLaneAxes.lookup(id) > 0;
+            valueNoLaneAnchors[id] = true;
+            valueLaneAxes.erase(id);
+            valueLanePriorities.erase(id);
+            valueLaneCohorts.erase(id);
+          }
+        }
+        return changed;
+      };
+      while (propagateSlicedHandoffs())
+        propagateLaneIdentities();
+      bool slicedChanged = true;
+      while (slicedChanged) {
+        slicedChanged = false;
+        for (mlir::Attribute attribute : problem.getOperations()) {
+          auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+          llvm::StringRef name =
+              riscv_internal::string(operation, "name").value_or("");
+          if (!propagatesLaneIdentity(name))
+            continue;
+          llvm::SmallVector<mlir::DenseI64ArrayAttr, 2> anchors;
+          bool strongLane = false;
+          for (llvm::StringRef key : {"operands", "results"})
+            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+              for (mlir::Attribute idAttribute : ids) {
+                llvm::StringRef id =
+                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                auto found = valuesById.find(id);
+                if (valueNoLaneAnchors.lookup(id) &&
+                    found != valuesById.end())
+                  if (auto axes = found->second.getAs<
+                          mlir::DenseI64ArrayAttr>("axes"))
+                    anchors.push_back(axes);
+                strongLane |= valueStrongLaneAnchors.lookup(id) &&
+                              valueLaneAxes.lookup(id) > 0;
+              }
+          if (anchors.empty() || strongLane)
+            continue;
+          llvm::StringRef operationId =
+              riscv_internal::string(operation, "id").value_or("");
+          operationNoLaneMappings[operationId] = true;
+          operationLaneAxes.erase(operationId);
+          operationSliceConflicts[operationId] =
+              "sliced-no-lane-anchor-wins";
+          for (llvm::StringRef key : {"operands", "results"})
+            if (auto ids = operation.getAs<mlir::ArrayAttr>(key))
+              for (mlir::Attribute idAttribute : ids) {
+                llvm::StringRef id =
+                    mlir::cast<mlir::StringAttr>(idAttribute).getValue();
+                auto found = valuesById.find(id);
+                auto axes = found == valuesById.end()
+                                ? mlir::DenseI64ArrayAttr()
+                                : found->second.getAs<
+                                      mlir::DenseI64ArrayAttr>("axes");
+                if (!axes ||
+                    !llvm::any_of(anchors, [&](auto anchor) {
+                      return sameAxisSet(anchor, axes);
+                    }))
+                  continue;
+                slicedChanged |= !valueNoLaneAnchors.lookup(id) ||
+                                 valueLaneAxes.lookup(id) > 0;
+                valueNoLaneAnchors[id] = true;
+                valueLaneAxes.erase(id);
+                valueLanePriorities.erase(id);
+                valueLaneCohorts.erase(id);
+              }
+        }
+        slicedChanged |= propagateSlicedHandoffs();
+      }
+      refreshReductionMappings();
+      propagateLaneIdentities();
+
+      // iota establishes a logical axis, not a physical SIMD mandate.  Keep a
+      // local axis in lanes only when a non-pointwise entity actually consumes
+      // it as a memory, collective, contraction, or packed-compute lane.  An
+      // otherwise shaped iota becomes an ordered register tuple, which avoids
+      // manufacturing a vector only to immediately extract every lane again at
+      // a downstream layout conflict.
+      llvm::SmallSet<int64_t, 8> requiredLocalLaneAxes;
+      auto anchorsLaneMapping = [](llvm::StringRef name) {
+        return name == "weft_kernel.admit" ||
+               name == "weft_kernel.commit" ||
+               name == "weft_kernel.materialize" ||
+               name == "weft_kernel.pack" ||
+               name == "weft_kernel.extract" ||
+               name == "weft_kernel.lookup" ||
+               name == "weft_kernel.reduce" ||
+               name == "weft_kernel.scan" ||
+               name == "weft_kernel.fold2" ||
+               name == "weft_kernel.mac_pairs" ||
+               name == "weft_kernel.mac_groups" ||
+               name == "weft_kernel.dot" ||
+               name == "weft_kernel.contract" ||
+               name == "weft_kernel.outer_contract";
+      };
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef id = *riscv_internal::string(operation, "id");
+        llvm::StringRef name = *riscv_internal::string(operation, "name");
+        int64_t axis = operationLaneAxes.lookup(id);
+        if (axis > 0 && anchorsLaneMapping(name))
+          requiredLocalLaneAxes.insert(axis);
+      }
+      for (const auto &entry : explicitLocalAxisExtents) {
+        const int64_t axis = entry.first;
+        if (requiredLocalLaneAxes.contains(axis))
+          continue;
+        for (mlir::Attribute attribute : problem.getValues()) {
+          auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
+          llvm::StringRef id = *riscv_internal::string(value, "id");
+          if (valueLaneAxes.lookup(id) != axis ||
+              valueStrongLaneAnchors.lookup(id))
+            continue;
+          valueLaneAxes.erase(id);
+          valueLanePriorities.erase(id);
+          valueLaneCohorts.erase(id);
+        }
+        for (mlir::Attribute attribute : problem.getOperations()) {
+          auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+          llvm::StringRef id = *riscv_internal::string(operation, "id");
+          llvm::StringRef name = *riscv_internal::string(operation, "name");
+          if (operationLaneAxes.lookup(id) == axis &&
+              !anchorsLaneMapping(name))
+            operationLaneAxes.erase(id);
+        }
+      }
 
       // A value keeps every source-visible cohort axis that is not its SIMD
       // lane as an ordered register tuple.  This is the projection of the
@@ -728,8 +1156,13 @@ public:
         llvm::SmallVector<int64_t, 4> registerAxes;
         for (int64_t axis : axes.asArrayRef()) {
           auto facts = axisFacts.find(axis);
-          if (axis == laneAxis || facts == axisFacts.end() ||
-              facts->second.priority != 0 || facts->second.cohort <= 1)
+          const bool levelRegisterAxis =
+              facts != axisFacts.end() && facts->second.priority == 0 &&
+              facts->second.cohort > 1;
+          const bool explicitLocalRegisterAxis =
+              explicitLocalAxisExtents.lookup(axis) > 1;
+          if (axis == laneAxis ||
+              (!levelRegisterAxis && !explicitLocalRegisterAxis))
             continue;
           registerAxes.push_back(axis);
         }
@@ -1065,9 +1498,16 @@ public:
             builder.getStringAttr(
                 lane ? "axis" + std::to_string(valueLaneAxis) +
                            " use-def chain r" + std::to_string(chainRoot) +
-                           " extent/cohort/VLEN resource bound"
+                           " extent=" +
+                           std::to_string(chainIt->second.maximumExtent) +
+                           " cohort=" + std::to_string(chainIt->second.cohort) +
+                           " max-sew=" +
+                           std::to_string(chainIt->second.maximumSEW) +
+                           " VLEN resource bound"
                 : scalarExtract
                     ? "singleton local value has one scalar extract consumer"
+                : valueNoLaneAnchors.lookup(id)
+                    ? "operation-local sliced mapping carries no SIMD lane"
                     : "value does not carry the selected lane axis"));
         value = riscv_internal::set(
             value, "lmul_derived_from",
@@ -1088,6 +1528,17 @@ public:
           value = riscv_internal::set(
               value, "representation_users",
               riscv_internal::strings(builder, chainIt->second.operations));
+        if (lane && chainIt != chains.end()) {
+          value = riscv_internal::set(
+              value, "representation_chain_cohort",
+              builder.getI64IntegerAttr(chainIt->second.cohort));
+          value = riscv_internal::set(
+              value, "representation_chain_maximum_sew",
+              builder.getI64IntegerAttr(chainIt->second.maximumSEW));
+          value = riscv_internal::set(
+              value, "representation_chain_maximum_extent",
+              builder.getI64IntegerAttr(chainIt->second.maximumExtent));
+        }
         value = riscv_internal::set(
             value, "materialization_derived_from",
             builder.getStringAttr(producers.lookup(id) == "weft_kernel.admit"
@@ -1127,6 +1578,13 @@ public:
           operation = riscv_internal::set(
               operation, "lane_axis_cohort",
               builder.getI64IntegerAttr(operationLaneCohorts.lookup(id)));
+        } else if (operationNoLaneMappings.lookup(id)) {
+          operation = riscv_internal::set(
+              operation, "lane_axis", builder.getI64IntegerAttr(0));
+          operation = riscv_internal::set(
+              operation, "lane_axis_derived_from",
+              builder.getStringAttr(
+                  "pointwise result preserves a sliced reduction mapping"));
         }
         int64_t accumulatorAxis = operationAccumulatorAxes.lookup(id);
         if (accumulatorAxis > 0)
@@ -1138,6 +1596,11 @@ public:
           operation = riscv_internal::set(
               operation, "eliminated_axis",
               builder.getI64IntegerAttr(eliminatedAxis));
+        if (auto conflict = operationSliceConflicts.find(id);
+            conflict != operationSliceConflicts.end())
+          operation = riscv_internal::set(
+              operation, "layout_conflict_resolution",
+              builder.getStringAttr(conflict->second));
         auto transfer = transferDescriptions.find(id);
         if (transfer != transferDescriptions.end())
           operation = riscv_internal::set(

@@ -16,11 +16,11 @@ case "${target}" in
   sg2044)
     remote_host=rvv
     remote_source=/home/ubuntu/llama.cpp-upstream-native
-    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv
-    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-clang18-rv64gcv
+    remote_cxx=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang++
     remote_cpu=48
     remote_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
-    remote_extra_cxx_flags=
+    remote_extra_cxx_flags='--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0 -B/opt/tcrv-toolchains/binutils-2.46.1/bin -fno-integrated-as'
     remote_extra_define=
     ;;
   k1)

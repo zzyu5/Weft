@@ -53,6 +53,7 @@ def _intrinsic(name: str) -> Intrinsic:
 
 
 new = _intrinsic("new")
+iota = _intrinsic("iota")
 materialize = _intrinsic("materialize")
 admit = _intrinsic("admit")
 commit = _intrinsic("commit")

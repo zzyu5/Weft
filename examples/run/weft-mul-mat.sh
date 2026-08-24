@@ -35,13 +35,13 @@ case "${target}" in
   sg2044)
     remote_host=rvv
     remote_source=/home/ubuntu/llama.cpp-upstream-native
-    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv
-    remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
-    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-clang18-rv64gcv
+    remote_cc=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang
+    remote_cxx=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang++
     remote_cpu=48
     march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     vlen=128
-    extra_flags=
+    extra_flags='--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0 -B/opt/tcrv-toolchains/binutils-2.46.1/bin -fno-integrated-as'
     link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
     runtime_target_define=
     ;;
@@ -102,7 +102,11 @@ else
   elif [[ ${format} == iq2_xxs_local ]]; then
     runtime_kernel_define=-DWEFT_IQ2_XXS_LOCAL_PACK=1
     kernel=production_mul_mat_iq2_xxs_local_pack
-    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
+    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+  elif [[ ${format} == q4_0 ]]; then
+    kernel=production_mul_mat_q4_0
+    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2 --meta NR=8)
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
   else
     kernel=production_mul_mat_${format}
@@ -115,6 +119,13 @@ if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
   for binding in "${requested_meta[@]}"; do
     [[ -n ${binding} ]] && meta+=(--meta "${binding}")
   done
+fi
+if [[ -n ${WEFT_AUTO_UNROLL:-} || -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
+  physical=()
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] &&
+    physical+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] &&
+    physical+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
 fi
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"

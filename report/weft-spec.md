@@ -406,6 +406,11 @@ for i in range(N):
 
 **默认语义：有序标量。编译器不把循环迭代自动变成并行或宽执行。**
 
+逻辑轴必须由作者显式表达。把 `for i in range(8)` 展开成八份独立 SSA，
+与写下一个 shape 为 `[8]` 的值，是两份不同的程序：前者只有八次有序标量执行，
+后者才存在一个可被表示 pass 映射的 8 元素逻辑轴。编译器不得从同构 SSA、
+固定 op 数量或 source closure 中把前者重新识别成后者，也不得自动向量化前者。
+
 宽执行只来自三处：
 1. 调用了库中已写好的 realization（`matmul` / `reduce` / `sort` ...）
 2. 打开的层级数值 realization（level + cohort）
@@ -465,6 +470,7 @@ mac_groups(a, b, n=4, into=i16)
     每 n 个相邻元素的乘积累加为一个 i16
 
 widen(v, dtype)         位宽提升，逻辑值数量不变
+iota(n, dtype=u32)      显式建立 shape 为 [n] 的逻辑索引值
 reduce(v)               整个逻辑向量归约为一个值
                         （内部可用树归约/多物理 partial——不改变逻辑值集合）
 fold2(v)                相邻两项相加，[n] → [n/2]
@@ -861,6 +867,11 @@ engine role 是否与 op 兼容
 ```
 
 > **检查它是不是一份合法的 Weft 程序，不证明它是不是作者想写的那个数学公式。**
+
+数值 repro 的正确性判据与 encoding repro 分开：encoding 布局验证比较同一段
+storage bytes 或从中解出的离散字段，允许逐字节一致；浮点 kernel 输出使用有限性
+检查与明确的绝对/相对误差容差，不要求 bit-exact。不同合法的乘加结合与 contraction
+可以产生末位差异，不能为了复刻 reference 的舍入位置而改作者数值树或阻断合法指令融合。
 
 Emitter 是最后一个 pass。它只读 selected value/op/memory-edge/Level attributes，负责普通 C、RVV intrinsic、ABI 和 typed local asm 拼写。Emitter 缺信息必须回报前序 pass 契约缺口；不得扫描 source closure、根据 dtype/shape/VLEN/格式名补选结构，也不得写回任何 physical attribute。
 

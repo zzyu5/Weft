@@ -15,12 +15,12 @@ compiler="${project_root}/build/tools/weft-compile/weft-compile"
 case "${target}" in
   sg2044)
     remote_host=rvv
-    remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
-    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_cc=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang
+    remote_cxx=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang++
     remote_cpu=48
     march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     vlen=128
-    extra_cflags=
+    extra_cflags='--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0 -B/opt/tcrv-toolchains/binutils-2.46.1/bin -fno-integrated-as'
     link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
     runtime_target_define=
     ;;
@@ -51,6 +51,7 @@ fi
 meta=()
 matrix_extension=none
 runtime_kernel_define=
+runtime_phase=
 case "${kernel}" in
   q4_k_gemv)
     dsl=examples/kernels/quantization/q4_k_gemv.py
@@ -95,6 +96,7 @@ case "${kernel}" in
     dsl=examples/kernels/dense/gemm.py
     runtime=examples/repro/weft/gemm_runtime.cpp
     meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+    runtime_phase=prefill
     ;;
   *)
     echo "unsupported Weft kernel: ${kernel}" >&2
@@ -137,6 +139,7 @@ printf -v extra_cflags_argument '%q' "${extra_cflags}"
 printf -v link_path_argument '%q' "${link_path}"
 printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
 printf -v runtime_kernel_define_argument '%q' "${runtime_kernel_define}"
+printf -v runtime_phase_argument '%q' "${runtime_phase}"
 
 tar -C "${local_root}" -cf - kernel.c runtime.cpp |
   ssh "${remote_host}" "
@@ -167,5 +170,9 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -march=\"\${march}\" -mabi=lp64d \
       runtime.cpp kernel.o \
       -L\"\${link_path}\" -Wl,-rpath,\"\${link_path}\" -o runtime
+    runtime_phase=${runtime_phase_argument}
+    if [ -n \"\${runtime_phase}\" ]; then
+      exec taskset -c \"\${cpu}\" ./runtime \"\${runtime_phase}\" ${repetitions_argument}
+    fi
     exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
   "

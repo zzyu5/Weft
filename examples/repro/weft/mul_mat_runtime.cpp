@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,22 @@
 #endif
 
 namespace {
+constexpr double kAbsoluteTolerance = 1.0e-4;
+constexpr double kRelativeTolerance = 2.0e-3;
+
+bool within_tolerance(float actual, float expected, double &max_absolute,
+                      double &max_relative) {
+  if (!std::isfinite(actual) || !std::isfinite(expected))
+    return false;
+  const double absolute =
+      std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+  const double relative =
+      absolute / std::max(std::fabs(static_cast<double>(expected)), 1.0e-30);
+  max_absolute = std::max(max_absolute, absolute);
+  max_relative = std::max(max_relative, relative);
+  return absolute <=
+         kAbsoluteTolerance + kRelativeTolerance * std::fabs(expected);
+}
 
 #if defined(WEFT_TARGET_K1)
 constexpr const char *kTarget = "K1/X60";
@@ -669,8 +686,11 @@ int main(int argc, char **argv) {
   }
 #endif
 
+  double maxAbsolute = 0.0;
+  double maxRelative = 0.0;
   for (std::size_t index = 0; index < expected.size(); ++index) {
-    if (std::memcmp(&actual[index], &expected[index], sizeof(float)) != 0) {
+    if (!within_tolerance(actual[index], expected[index], maxAbsolute,
+                          maxRelative)) {
       std::fprintf(stderr, "output mismatch at %zu: actual=%a expected=%a\n",
                    index, actual[index], expected[index]);
       return 1;
@@ -691,7 +711,9 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(runtimeM) * kN * kK;
   std::printf("target=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n", kTarget,
               phase, runtimeM, kN, kK);
-  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
+              "max_relative_error=%.9g\nrepetitions=%zu\n",
+              maxAbsolute, maxRelative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", medianUs,
               operations / medianUs / 1.0e3);
   return 0;

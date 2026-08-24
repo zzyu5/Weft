@@ -24,18 +24,25 @@ if [[ ${format_id} -lt 0 ]]; then
   echo "unsupported row-dequantization format: ${format}" >&2
   exit 2
 fi
+physical_auto=()
+if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
+  physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
+fi
+if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
+  physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
 
 case "${target}" in
   sg2044)
     remote_host=rvv
     remote_source=/home/ubuntu/llama.cpp-upstream-native
-    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-gcc15-rv64gcv
-    remote_cc=/opt/tcrv-toolchains/gcc-15.2.0/bin/gcc
-    remote_cxx=/opt/tcrv-toolchains/gcc-15.2.0/bin/g++
+    remote_build=/home/ubuntu/llama.cpp-upstream-native/build-clang18-rv64gcv
+    remote_cc=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang
+    remote_cxx=/opt/tcrv-toolchains/llvm-18.1.8/bin/clang++
     remote_cpu=48
     march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     vlen=128
-    extra_flags=
+    extra_flags='--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0 -B/opt/tcrv-toolchains/binutils-2.46.1/bin -fno-integrated-as'
     link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
     runtime_target_define=
     ;;
@@ -72,6 +79,7 @@ PYTHONPATH="${project_root}/python" python -m weft \
   --kernel "row_dequantize_${format}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
+  "${physical_auto[@]}" \
   -o "${local_root}/kernel.c"
 cp "${project_root}/examples/repro/weft/row_dequantize_runtime.cpp" \
   "${local_root}/runtime.cpp"

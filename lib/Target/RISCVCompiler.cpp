@@ -18,6 +18,8 @@ mlir::LogicalResult runPlanning(mlir::ModuleOp module,
   manager.enableVerifier(true);
   manager.addPass(weft::createConstructRISCVProblemsPass(std::move(options)));
   manager.addPass(weft::createAssignRISCVRepresentationsPass());
+  manager.addPass(weft::createResolveRISCVLayoutConversionsPass());
+  manager.addPass(weft::createPropagateRISCVStorageMappingsPass());
   manager.addPass(weft::createSelectRISCVLocalOperationsPass());
   manager.addPass(weft::createScheduleRISCVLevelsPass());
   manager.addPass(weft::createCheckRISCVResourcesPass());
@@ -79,9 +81,10 @@ void printAssignment(llvm::raw_ostream &output,
            << " -> "
            << mlir::cast<mlir::StringAttr>(operation.get("realization")).getValue()
            << '\n';
-    for (llvm::StringRef key : {"validity", "representation_transfer", "memory_edge",
+    for (llvm::StringRef key : {"validity", "control_path", "representation_transfer", "use_conversions", "storage_mapping", "memory_edge",
                                 "local_operation", "co_reduce_partner",
-                                "level_mapping", "schedule_level", "schedule"})
+                                "level_mapping", "local_cluster", "schedule_loop",
+                                "schedule_level", "schedule"})
       if (mlir::Attribute field = operation.get(key)) {
         output << "    " << key << " = ";
         field.print(output);

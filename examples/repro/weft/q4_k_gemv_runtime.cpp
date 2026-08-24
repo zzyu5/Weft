@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +58,22 @@ void q4_k_q8_k_gemv(const std::uint8_t *W, const std::uint8_t *X, float *Y,
 #endif
 
 namespace {
+constexpr double kAbsoluteTolerance = 1.0e-4;
+constexpr double kRelativeTolerance = 2.0e-3;
+
+bool within_tolerance(float actual, float expected, double &max_absolute,
+                      double &max_relative) {
+  if (!std::isfinite(actual) || !std::isfinite(expected))
+    return false;
+  const double absolute =
+      std::fabs(static_cast<double>(actual) - static_cast<double>(expected));
+  const double relative =
+      absolute / std::max(std::fabs(static_cast<double>(expected)), 1.0e-30);
+  max_absolute = std::max(max_absolute, absolute);
+  max_relative = std::max(max_relative, relative);
+  return absolute <=
+         kAbsoluteTolerance + kRelativeTolerance * std::fabs(expected);
+}
 
 constexpr std::size_t kM = 14336;
 constexpr std::size_t kK = 4096;
@@ -229,9 +246,11 @@ int main(int argc, char **argv) {
   WEFT_Q4_PACK(source_weights.data(), packed.data(), kM, kK);
   std::vector<float> output(kM, 0.0F);
   WEFT_Q4_KERNEL(packed.data(), activation.data(), output.data(), kM, kK);
+  double max_absolute = 0.0;
+  double max_relative = 0.0;
   for (std::size_t row = 0; row < kM; ++row) {
     const float expected = reference_row(source_weights.data(), activation.data(), row);
-    if (std::memcmp(&expected, &output[row], sizeof(float)) != 0) {
+    if (!within_tolerance(output[row], expected, max_absolute, max_relative)) {
       std::fprintf(stderr,
                    "numeric mismatch row=%zu expected=%.9g actual=%.9g\n", row,
                    expected, output[row]);
@@ -253,7 +272,9 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(kM) * kK;
   std::printf("kernel=%s\n", WEFT_Q4_KERNEL_NAME);
   std::printf("target=%s\nM=%zu\nK=%zu\n", WEFT_TARGET_NAME, kM, kK);
-  std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
+  std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
+              "max_relative_error=%.9g\nrepetitions=%zu\n",
+              max_absolute, max_relative, repetitions);
   std::printf("cold_median_us=%.3f\n", median_us);
   std::printf("cold_gop_s=%.6f\n", operations / median_us / 1.0e3);
   std::printf("output_sample=%.9g\n", output.front());

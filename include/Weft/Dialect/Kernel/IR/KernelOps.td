@@ -224,6 +224,12 @@ def WeftKernel_ConstantOp : WeftKernel_Op<"constant", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftKernel_IotaOp : WeftKernel_Op<"iota", [Pure]> {
+  let arguments = (ins I64Attr:$start, I64Attr:$end);
+  let results = (outs WeftKernel_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftKernel_NewOp : WeftKernel_Op<"new", [Pure]> {
   let arguments = (ins Optional<AnyType>:$initial, BoolAttr:$initialized);
   let results = (outs AnyType:$result);

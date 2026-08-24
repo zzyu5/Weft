@@ -1371,9 +1371,41 @@ class FrontendCompiler:
                     result_shape.append(local_dimension)
                     result_axes.append(axis)
             else:
-                if value.type != ScalarType(index):
-                    raise FrontendError("scalar index must have index type", self._location(item))
-                kinds.append("index")
+                if value.type == ScalarType(index):
+                    kinds.append("index")
+                    continue
+                if isinstance(value.type, LocalValueType):
+                    selector_element = element_type(value.type)
+                    if not isinstance(selector_element, ScalarType) or (
+                        selector_element.dtype.category
+                        not in {DTypeCategory.INTEGER, DTypeCategory.INDEX}
+                        or selector_element.dtype.signedness == "signed"
+                    ):
+                        raise FrontendError(
+                            "shaped gather indices must be unsigned integer or index Values",
+                            self._location(item),
+                        )
+                    if not isinstance(base_type, LocalValueType):
+                        raise FrontendError(
+                            "shaped gather currently indexes a local Value",
+                            self._location(item),
+                        )
+                    kinds.append("gather")
+                    for gather_extent, gather_axis in zip(
+                        shape_of(value.type), axes_of(value.type)
+                    ):
+                        if gather_axis in result_axes:
+                            existing = result_shape[result_axes.index(gather_axis)]
+                            if existing != gather_extent:
+                                raise FrontendError(
+                                    "gather index disagrees with an existing logical axis",
+                                    self._location(item),
+                                )
+                            continue
+                        result_shape.append(gather_extent)
+                        result_axes.append(gather_axis)
+                    continue
+                raise FrontendError("scalar index must have index type", self._location(item))
         return values, kinds, tuple(result_shape), tuple(result_axes)
 
     def _compile_call(self, call: ast.Call) -> Value | None:
@@ -1472,6 +1504,33 @@ class FrontendCompiler:
             operands=operands,
             result_types=(result_type,),
             attributes={"initialized": "true" if operands else "false"},
+        )[0]
+
+    def _intrinsic_iota(self, call: ast.Call) -> Value:
+        args = self._arguments(call, ("extent",), {"start": 0, "dtype": u32})
+        extent = self._eval_static(args["extent"]) if isinstance(args["extent"], ast.expr) else args["extent"]
+        start = self._eval_static(args["start"]) if isinstance(args["start"], ast.expr) else args["start"]
+        dtype = self._eval_static(args["dtype"]) if isinstance(args["dtype"], ast.expr) else args["dtype"]
+        if not isinstance(extent, int) or extent <= 0:
+            raise FrontendError("iota extent must be a positive integer", self._location(call))
+        if not isinstance(start, int):
+            raise FrontendError("iota start must be an integer", self._location(call))
+        if (
+            not isinstance(dtype, DType)
+            or dtype.category != DTypeCategory.INTEGER
+            or dtype.signedness == "signed"
+        ):
+            raise FrontendError(
+                "iota dtype must be an unsigned integer", self._location(call)
+            )
+        axis = self._next_axis_id
+        self._next_axis_id += 1
+        result_type = value_type(ScalarType(dtype), (extent,), (axis,))
+        return self._emit(
+            "weft_kernel.iota",
+            call,
+            result_types=(result_type,),
+            attributes={"start": str(start), "end": str(start + extent)},
         )[0]
 
     def _parse_local_shape(self, node: ast.expr) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -1692,6 +1751,12 @@ class FrontendCompiler:
             if axis_id not in axes:
                 raise FrontendError("reduce axis is not present", self._location(call))
             position = axes.index(axis_id)
+        elif isinstance(axis, int):
+            if axis < 0 or axis >= len(shape):
+                raise FrontendError("reduce axis position is out of range", self._location(call))
+            position = axis
+        elif axis is not None:
+            raise FrontendError("reduce axis is a logical name or position", self._location(call))
         shape.pop(position)
         axes.pop(position)
         result_type = value_type(element_type(value.type), tuple(shape), tuple(axes))

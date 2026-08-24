@@ -625,6 +625,17 @@ mlir::LogicalResult ConstantOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult IotaOp::verify() {
+  auto result = getResult().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  if (!element || element.isSigned() || result.getShape().size() != 1 ||
+      result.getAxisIds().size() != 1)
+    return emitOpError("iota produces one unsigned integer logical axis");
+  if (getEnd() <= getStart() || result.getShape()[0] != getEnd() - getStart())
+    return emitOpError("iota shape must equal its positive [start, end) extent");
+  return mlir::success();
+}
+
 mlir::LogicalResult NewOp::verify() {
   if (!isLocalValue(getResult().getType()))
     return emitOpError("new produces a local Value");
@@ -693,7 +704,8 @@ mlir::LogicalResult SliceOp::verify() {
   for (mlir::Attribute attribute : getSelectors()) {
     llvm::StringRef selector = mlir::cast<mlir::StringAttr>(attribute).getValue();
     if (selector != "all" && selector != "domain" &&
-        selector != "group_index" && selector != "index")
+        selector != "group_index" && selector != "index" &&
+        selector != "gather")
       return emitOpError("unknown slice selector");
     if (selector != "all")
       ++indexed;
@@ -728,6 +740,25 @@ mlir::LogicalResult ExtractOp::verify() {
   if (!mlir::isa<ValueType>(getInput().getType()) ||
       failed(verifyStringArray(*this, getSelectors(), "selectors")))
     return emitOpError("extract requires a shaped local Value and selectors");
+  size_t cursor = 0;
+  for (mlir::Attribute attribute : getSelectors()) {
+    llvm::StringRef selector = mlir::cast<mlir::StringAttr>(attribute).getValue();
+    if (selector == "all")
+      continue;
+    if (cursor >= getIndices().size())
+      return emitOpError("extract selector has no corresponding index");
+    mlir::Type indexType = getIndices()[cursor++].getType();
+    if (selector != "gather")
+      continue;
+    auto value = mlir::dyn_cast<ValueType>(indexType);
+    auto integer = value
+                       ? mlir::dyn_cast<mlir::IntegerType>(value.getElementType())
+                       : mlir::IntegerType();
+    if (!integer || integer.isSigned())
+      return emitOpError("gather selector requires shaped unsigned indices");
+  }
+  if (cursor != getIndices().size())
+    return emitOpError("extract selectors and index operands disagree");
   return mlir::success();
 }
 

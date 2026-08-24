@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <sg2044|k1> <kernel> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <kernel|format:phase> <repetitions>" >&2
   exit 2
 fi
 
@@ -10,6 +10,51 @@ target=$1
 kernel=$2
 repetitions=$3
 run_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+runner=${WEFT_TUNE_RUNNER:-kernel}
+
+run_candidate() {
+  local meta=$1
+  local unroll=$2
+  local pipeline=$3
+  case "${runner}" in
+    kernel)
+      WEFT_META_BINDINGS="${meta}" \
+      WEFT_AUTO_UNROLL="${unroll}" \
+      WEFT_AUTO_PIPELINE_DEPTH="${pipeline}" \
+        "${run_dir}/weft-kernel.sh" "${target}" "${kernel}" "${repetitions}"
+      ;;
+    mul-mat)
+      local format=${kernel%%:*}
+      local phase=${kernel#*:}
+      if [[ -z ${format} || ${phase} == "${kernel}" ||
+            ( ${phase} != decode && ${phase} != prefill ) ]]; then
+        echo "mul-mat tuning expects <format>:<decode|prefill>" >&2
+        return 2
+      fi
+      WEFT_META_BINDINGS="${meta}" \
+      WEFT_AUTO_UNROLL="${unroll}" \
+      WEFT_AUTO_PIPELINE_DEPTH="${pipeline}" \
+        "${run_dir}/weft-mul-mat.sh" "${target}" "${format}" "${phase}" \
+        "${repetitions}"
+      ;;
+    vec-dot)
+      WEFT_AUTO_UNROLL="${unroll}" \
+      WEFT_AUTO_PIPELINE_DEPTH="${pipeline}" \
+        "${run_dir}/weft-quantized-vec-dot.sh" "${target}" "${kernel}" \
+        "${repetitions}"
+      ;;
+    row-dequantize)
+      WEFT_AUTO_UNROLL="${unroll}" \
+      WEFT_AUTO_PIPELINE_DEPTH="${pipeline}" \
+        "${run_dir}/weft-row-dequantize.sh" "${target}" "${kernel}" \
+        "${repetitions}"
+      ;;
+    *)
+      echo "unsupported WEFT_TUNE_RUNNER: ${runner}" >&2
+      return 2
+      ;;
+  esac
+}
 
 IFS=',' read -r -a unrolls <<< "${WEFT_TUNE_UNROLLS:-1,2,4}"
 IFS=',' read -r -a pipelines <<< "${WEFT_TUNE_PIPELINE_DEPTHS:-1,2}"
@@ -55,12 +100,11 @@ trap cleanup EXIT
 for meta in "${meta_configs[@]}"; do
   for unroll in "${unrolls[@]}"; do
     for pipeline in "${pipelines[@]}"; do
-      output=$(
-        WEFT_META_BINDINGS="${meta}" \
-        WEFT_AUTO_UNROLL="${unroll}" \
-        WEFT_AUTO_PIPELINE_DEPTH="${pipeline}" \
-          "${run_dir}/weft-kernel.sh" "${target}" "${kernel}" "${repetitions}"
-      )
+      if ! output=$(run_candidate "${meta}" "${unroll}" "${pipeline}" 2>&1); then
+        printf 'rejected unroll=%s pipeline_depth=%s meta=%s\n' \
+          "${unroll}" "${pipeline}" "${meta:-none}" >&2
+        continue
+      fi
       numeric=$(sed -n 's/^numeric=//p' <<< "${output}")
       metric_name=cold_gop_s
       metric=$(sed -n 's/^cold_gop_s=//p' <<< "${output}")
@@ -68,8 +112,9 @@ for meta in "${meta_configs[@]}"; do
         metric_name=melements_s
         metric=$(sed -n 's/^melements_s=//p' <<< "${output}")
       fi
-      if [[ ${numeric} != bit-exact || -z ${metric} ]]; then
-        echo "candidate produced no bit-exact measurable result" >&2
+      if [[ ${numeric} != bit-exact && ${numeric} != within-tolerance ]] ||
+         [[ -z ${metric} ]]; then
+        echo "candidate produced no numerically valid measurable result" >&2
         exit 1
       fi
       printf 'unroll=%s pipeline_depth=%s meta=%s %s=%s\n' \
@@ -82,6 +127,15 @@ for meta in "${meta_configs[@]}"; do
 done
 
 winner=$(sort -t $'\t' -k1,1gr "${results}" | head -n 1)
+if [[ -z ${winner} ]]; then
+  echo "no numerically valid measurable candidate" >&2
+  exit 1
+fi
 IFS=$'\t' read -r metric unroll pipeline meta metric_name <<< "${winner}"
 printf 'winner unroll=%s pipeline_depth=%s meta=%s %s=%s\n' \
   "${unroll}" "${pipeline}" "${meta}" "${metric_name}" "${metric}"
+if [[ ${WEFT_TUNE_APPLY_WINNER:-1} == 1 ]]; then
+  [[ ${meta} == none ]] && meta=
+  printf 'selected_run\n'
+  run_candidate "${meta}" "${unroll}" "${pipeline}"
+fi

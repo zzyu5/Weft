@@ -6,9 +6,12 @@
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -134,6 +137,60 @@ std::optional<int64_t> resolvePartition(llvm::StringRef partition,
   return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
 }
 
+int64_t operationOrdinal(llvm::StringRef id) {
+  if (!id.consume_front("op"))
+    return -1;
+  int64_t ordinal = -1;
+  return id.getAsInteger(10, ordinal) ? -1 : ordinal;
+}
+
+using RootSet = llvm::SmallSet<std::string, 8>;
+
+struct LocalCluster {
+  llvm::SmallVector<std::string> producers;
+  llvm::SmallVector<std::string> consumers;
+  llvm::SmallVector<std::string> frontier;
+  int64_t bufferGroups = 0;
+};
+
+mlir::DictionaryAttr localClusterAttribute(mlir::Builder &builder,
+                                           const LocalCluster &cluster,
+                                           int64_t pipelineDepth) {
+  return riscv_internal::dictionary(
+      builder,
+      {{"producer_ops", riscv_internal::strings(builder, cluster.producers)},
+       {"consumer_ops", riscv_internal::strings(builder, cluster.consumers)},
+       {"frontier_values", riscv_internal::strings(builder, cluster.frontier)},
+       {"pipeline_depth", builder.getI64IntegerAttr(pipelineDepth)},
+       {"buffer_groups",
+        builder.getI64IntegerAttr(pipelineDepth > 1 ? cluster.bufferGroups : 0)},
+       {"derived_from",
+        builder.getStringAttr(
+            "loop induction/carry dependencies + memory roots + selected local operations")},
+       {"decision_owner", builder.getStringAttr("loop-local-use-def-cluster")}});
+}
+
+mlir::DictionaryAttr addClusterTemporaryBudget(
+    mlir::Builder &builder, mlir::DictionaryAttr operation,
+    int64_t bufferGroups) {
+  if (bufferGroups <= 0)
+    return operation;
+  mlir::DictionaryAttr local =
+      operation.getAs<mlir::DictionaryAttr>("local_operation");
+  if (!local)
+    local = builder.getDictionaryAttr({});
+  const int64_t existing =
+      riscv_internal::integer(local, "temporary_vector_groups").value_or(0);
+  local = riscv_internal::set(
+      local, "temporary_vector_groups",
+      builder.getI64IntegerAttr(existing + bufferGroups));
+  local = riscv_internal::set(
+      local, "temporary_groups_derived_from",
+      builder.getStringAttr(
+          "selected local-operation temporaries + next-iteration frontier"));
+  return riscv_internal::set(operation, "local_operation", local);
+}
+
 class ScheduleRISCVLevelsPass final
     : public mlir::PassWrapper<ScheduleRISCVLevelsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -163,6 +220,256 @@ public:
         auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
         values[*riscv_internal::string(value, "id")] = value;
       }
+
+      llvm::StringMap<mlir::DictionaryAttr> operationsById;
+      llvm::StringMap<mlir::DictionaryAttr> producersByValue;
+      llvm::StringMap<llvm::SmallVector<mlir::DictionaryAttr, 2>> usersByValue;
+      for (mlir::Attribute attribute : problem.getOperations()) {
+        auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
+        llvm::StringRef id = *riscv_internal::string(operation, "id");
+        operationsById[id] = operation;
+        if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+          for (mlir::Attribute result : results)
+            producersByValue[mlir::cast<mlir::StringAttr>(result).getValue()] =
+                operation;
+        if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+          for (mlir::Attribute operand : operands)
+            usersByValue[mlir::cast<mlir::StringAttr>(operand).getValue()]
+                .push_back(operation);
+      }
+
+      llvm::StringMap<LocalCluster> clustersByLoop;
+      for (const auto &loopEntry : operationsById) {
+        mlir::DictionaryAttr loop = loopEntry.getValue();
+        if (riscv_internal::string(loop, "name").value_or("") !=
+            "weft_kernel.for")
+          continue;
+        const std::string loopId = loopEntry.getKey().str();
+        llvm::SmallVector<std::string> expectedControl;
+        if (auto outer = loop.getAs<mlir::ArrayAttr>("control_path"))
+          for (mlir::Attribute attribute : outer)
+            expectedControl.push_back(
+                mlir::cast<mlir::StringAttr>(attribute).getValue().str());
+        expectedControl.push_back(loopId);
+
+        llvm::SmallVector<mlir::DictionaryAttr> bodyOperations;
+        bool nestedControl = false;
+        for (const auto &entry : operationsById) {
+          mlir::DictionaryAttr operation = entry.getValue();
+          auto path = operation.getAs<mlir::ArrayAttr>("control_path");
+          if (!path || path.size() != expectedControl.size() ||
+              operation.get("level_path") != loop.get("level_path"))
+            continue;
+          bool samePath = true;
+          for (auto [index, attribute] : llvm::enumerate(path))
+            samePath &= mlir::cast<mlir::StringAttr>(attribute).getValue() ==
+                        expectedControl[index];
+          if (!samePath)
+            continue;
+          llvm::StringRef name =
+              riscv_internal::string(operation, "name").value_or("");
+          nestedControl |= name == "weft_kernel.for" ||
+                           name == "weft_kernel.while" ||
+                           name == "weft_kernel.if" ||
+                           name == "weft_kernel.level";
+          bodyOperations.push_back(operation);
+        }
+        if (nestedControl || bodyOperations.empty())
+          continue;
+        llvm::sort(bodyOperations, [](mlir::DictionaryAttr lhs,
+                                      mlir::DictionaryAttr rhs) {
+          return operationOrdinal(*riscv_internal::string(lhs, "id")) <
+                 operationOrdinal(*riscv_internal::string(rhs, "id"));
+        });
+
+        llvm::StringSet<> bodyIds;
+        for (mlir::DictionaryAttr operation : bodyOperations)
+          bodyIds.insert(*riscv_internal::string(operation, "id"));
+
+        llvm::StringSet<> carryValues;
+        const std::string argumentPrefix = loopId + ".region0.block0.arg";
+        for (const auto &entry : values) {
+          llvm::StringRef source =
+              riscv_internal::string(entry.getValue(), "source").value_or("");
+          if (!source.consume_front(argumentPrefix))
+            continue;
+          int64_t argument = -1;
+          if (!source.getAsInteger(10, argument) && argument > 0)
+            carryValues.insert(entry.getKey());
+        }
+        if (carryValues.empty())
+          continue;
+
+        llvm::StringMap<RootSet> rootCache;
+        llvm::StringSet<> rootVisiting;
+        std::function<RootSet(llvm::StringRef)> rootsForValue =
+            [&](llvm::StringRef valueId) -> RootSet {
+          if (auto cached = rootCache.find(valueId); cached != rootCache.end())
+            return cached->second;
+          RootSet roots;
+          if (carryValues.contains(valueId)) {
+            roots.insert("carry:" + valueId.str());
+            rootCache[valueId] = roots;
+            return roots;
+          }
+          if (!rootVisiting.insert(valueId).second)
+            return roots;
+          auto producer = producersByValue.find(valueId);
+          if (producer == producersByValue.end()) {
+            auto value = values.find(valueId);
+            llvm::StringRef kind =
+                value == values.end()
+                    ? llvm::StringRef()
+                    : riscv_internal::string(value->second, "kind").value_or("");
+            if (kind == "view" || kind == "slice" ||
+                kind == "encoded_value")
+              roots.insert("memory:" + valueId.str());
+          } else {
+            llvm::StringRef name =
+                riscv_internal::string(producer->second, "name").value_or("");
+            if (name != "weft_kernel.constant" &&
+                name != "weft_kernel.iota" && name != "weft_kernel.symbol" &&
+                name != "weft_kernel.domain" &&
+                name != "weft_kernel.root_domain")
+              if (auto operands =
+                      producer->second.getAs<mlir::ArrayAttr>("operands"))
+                for (mlir::Attribute operand : operands) {
+                  RootSet operandRoots = rootsForValue(
+                      mlir::cast<mlir::StringAttr>(operand).getValue());
+                  roots.insert(operandRoots.begin(), operandRoots.end());
+                }
+          }
+          rootVisiting.erase(valueId);
+          rootCache[valueId] = roots;
+          return roots;
+        };
+
+        llvm::StringSet<> consumerValues;
+        for (const auto &carry : carryValues)
+          consumerValues.insert(carry.getKey());
+        llvm::StringSet<> consumerOps;
+        bool hasCompute = false;
+        for (mlir::DictionaryAttr operation : bodyOperations) {
+          llvm::StringRef id = *riscv_internal::string(operation, "id");
+          llvm::StringRef name =
+              riscv_internal::string(operation, "name").value_or("");
+          bool consumer = false;
+          RootSet roots;
+          if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+            for (mlir::Attribute operand : operands) {
+              llvm::StringRef value =
+                  mlir::cast<mlir::StringAttr>(operand).getValue();
+              consumer |= consumerValues.contains(value);
+              RootSet operandRoots = rootsForValue(value);
+              roots.insert(operandRoots.begin(), operandRoots.end());
+            }
+          bool explicitCompute =
+              name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
+              name == "weft_kernel.outer_contract" ||
+              name == "weft_kernel.mac_pairs" ||
+              name == "weft_kernel.mac_groups" ||
+              name == "weft_kernel.reduce" || name == "weft_kernel.scan";
+          if (name == "weft_kernel.binary") {
+            auto source =
+                operation.getAs<mlir::DictionaryAttr>("source_attributes");
+            if (riscv_internal::string(source, "kind").value_or("") == "mul") {
+              int64_t memoryRoots = 0;
+              for (const std::string &root : roots)
+                memoryRoots += llvm::StringRef(root).starts_with("memory:");
+              explicitCompute |= memoryRoots >= 2;
+            }
+          }
+          consumer |= explicitCompute;
+          hasCompute |= explicitCompute;
+          if (!consumer)
+            continue;
+          consumerOps.insert(id);
+          if (auto results = operation.getAs<mlir::ArrayAttr>("results"))
+            for (mlir::Attribute result : results)
+              consumerValues.insert(
+                  mlir::cast<mlir::StringAttr>(result).getValue());
+        }
+        if (!hasCompute)
+          continue;
+
+        llvm::StringSet<> frontierValues;
+        for (mlir::DictionaryAttr operation : bodyOperations) {
+          llvm::StringRef id = *riscv_internal::string(operation, "id");
+          if (!consumerOps.contains(id))
+            continue;
+          if (auto operands = operation.getAs<mlir::ArrayAttr>("operands"))
+            for (mlir::Attribute operand : operands) {
+              llvm::StringRef value =
+                  mlir::cast<mlir::StringAttr>(operand).getValue();
+              auto producer = producersByValue.find(value);
+              if (producer == producersByValue.end())
+                continue;
+              llvm::StringRef producerId =
+                  *riscv_internal::string(producer->second, "id");
+              if (bodyIds.contains(producerId) &&
+                  !consumerOps.contains(producerId))
+                frontierValues.insert(value);
+            }
+        }
+        if (frontierValues.empty())
+          continue;
+
+        llvm::StringSet<> producerOps;
+        llvm::SmallVector<std::string> pending;
+        for (const auto &frontier : frontierValues)
+          pending.push_back(frontier.getKey().str());
+        bool hasMemoryProducer = false;
+        while (!pending.empty()) {
+          std::string value = std::move(pending.pop_back_val());
+          auto producer = producersByValue.find(value);
+          if (producer == producersByValue.end())
+            continue;
+          llvm::StringRef id = *riscv_internal::string(producer->second, "id");
+          if (!bodyIds.contains(id) || consumerOps.contains(id) ||
+              !producerOps.insert(id).second)
+            continue;
+          llvm::StringRef name =
+              riscv_internal::string(producer->second, "name").value_or("");
+          hasMemoryProducer |= name == "weft_kernel.extract" ||
+                               name == "weft_kernel.lookup" ||
+                               name == "weft_kernel.admit";
+          if (name == "weft_kernel.commit" ||
+              name == "weft_kernel.materialize" ||
+              name == "weft_kernel.pack") {
+            producerOps.clear();
+            break;
+          }
+          if (auto operands = producer->second.getAs<mlir::ArrayAttr>("operands"))
+            for (mlir::Attribute operand : operands)
+              pending.push_back(
+                  mlir::cast<mlir::StringAttr>(operand).getValue().str());
+        }
+        if (!hasMemoryProducer || producerOps.empty())
+          continue;
+
+        LocalCluster cluster;
+        for (mlir::DictionaryAttr operation : bodyOperations) {
+          llvm::StringRef id = *riscv_internal::string(operation, "id");
+          if (producerOps.contains(id))
+            cluster.producers.push_back(id.str());
+          else if (consumerOps.contains(id) &&
+                   riscv_internal::string(operation, "name").value_or("") !=
+                       "weft_kernel.yield")
+            cluster.consumers.push_back(id.str());
+        }
+        for (const auto &frontier : frontierValues) {
+          cluster.frontier.push_back(frontier.getKey().str());
+          auto value = values.find(frontier.getKey());
+          if (value != values.end())
+            cluster.bufferGroups +=
+                riscv_internal::integer(value->second, "register_groups")
+                    .value_or(0);
+        }
+        llvm::sort(cluster.frontier);
+        if (!cluster.producers.empty() && !cluster.consumers.empty())
+          clustersByLoop[loopId] = std::move(cluster);
+      }
+
       llvm::StringMap<int64_t> levelLaneWidths;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
@@ -224,11 +531,115 @@ public:
         continue;
       }
 
+      auto enclosingSchedule = [&](mlir::DictionaryAttr operation) {
+        mlir::DictionaryAttr schedule;
+        if (auto path = operation.getAs<mlir::ArrayAttr>("level_path"))
+          for (mlir::Attribute level : llvm::reverse(path)) {
+            llvm::StringRef id =
+                mlir::cast<mlir::StringAttr>(level).getValue();
+            auto found = schedulesByLevel.find(id);
+            if (found == schedulesByLevel.end())
+              continue;
+            schedule = found->second;
+            break;
+          }
+        return schedule;
+      };
+      llvm::StringMap<int64_t> clusterPipelineDepths;
+      for (const auto &entry : clustersByLoop) {
+        mlir::DictionaryAttr loop = operationsById.lookup(entry.getKey());
+        mlir::DictionaryAttr schedule = enclosingSchedule(loop);
+        clusterPipelineDepths[entry.getKey()] =
+            riscv_internal::integer(schedule, "pipeline_depth").value_or(1);
+      }
+
       llvm::SmallVector<mlir::Attribute> operations;
       for (mlir::Attribute attribute : problem.getOperations()) {
         auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
         if (riscv_internal::string(operation, "name").value_or("") !=
             "weft_kernel.level") {
+          llvm::StringRef operationId =
+              riscv_internal::string(operation, "id").value_or("");
+          auto ownCluster = clustersByLoop.find(operationId);
+          if (ownCluster != clustersByLoop.end()) {
+            const int64_t depth = clusterPipelineDepths.lookup(operationId);
+            llvm::StringRef structure =
+                depth > 1 ? "cross-iteration-prologue-steady-epilogue"
+                          : "sequential-local-cluster";
+            mlir::DictionaryAttr cluster =
+                localClusterAttribute(builder, ownCluster->second, depth);
+            operation =
+                riscv_internal::set(operation, "local_cluster", cluster);
+            operation = riscv_internal::set(
+                operation, "schedule",
+                riscv_internal::dictionary(
+                    builder,
+                    {{"pipeline_depth", builder.getI64IntegerAttr(depth)},
+                     {"loop_structure",
+                      builder.getStringAttr(structure)},
+                     {"decision_owner",
+                      builder.getStringAttr("loop-local-use-def-cluster")}}));
+            operations.push_back(operation);
+            continue;
+          }
+
+          const LocalCluster *enclosingCluster = nullptr;
+          std::string enclosingLoop;
+          if (auto controlPath =
+                  operation.getAs<mlir::ArrayAttr>("control_path"))
+            for (mlir::Attribute control : llvm::reverse(controlPath)) {
+              llvm::StringRef id =
+                  mlir::cast<mlir::StringAttr>(control).getValue();
+              auto found = clustersByLoop.find(id);
+              if (found == clustersByLoop.end())
+                continue;
+              enclosingCluster = &found->second;
+              enclosingLoop = id.str();
+              break;
+            }
+          if (enclosingCluster) {
+            const int64_t depth = clusterPipelineDepths.lookup(enclosingLoop);
+            llvm::StringRef structure =
+                depth > 1 ? "cross-iteration-prologue-steady-epilogue"
+                          : "sequential-local-cluster";
+            auto producer = llvm::find(enclosingCluster->producers,
+                                       operationId.str());
+            auto consumer = llvm::find(enclosingCluster->consumers,
+                                       operationId.str());
+            llvm::StringRef stage =
+                producer != enclosingCluster->producers.end()
+                    ? "producer"
+                : consumer != enclosingCluster->consumers.end()
+                    ? "consumer"
+                    : "outside-cluster";
+            int64_t order =
+                stage == "producer"
+                    ? std::distance(enclosingCluster->producers.begin(), producer)
+                : stage == "consumer"
+                    ? std::distance(enclosingCluster->consumers.begin(), consumer)
+                    : -1;
+            operation = riscv_internal::set(
+                operation, "schedule_loop",
+                builder.getStringAttr(enclosingLoop));
+            operation = riscv_internal::set(
+                operation, "schedule",
+                riscv_internal::dictionary(
+                    builder,
+                    {{"cluster_stage", builder.getStringAttr(stage)},
+                     {"cluster_order", builder.getI64IntegerAttr(order)},
+                     {"pipeline_depth", builder.getI64IntegerAttr(depth)},
+                     {"loop_structure",
+                      builder.getStringAttr(structure)},
+                     {"decision_owner",
+                      builder.getStringAttr("loop-local-use-def-cluster")}}));
+            if (depth > 1 && !enclosingCluster->consumers.empty() &&
+                enclosingCluster->consumers.front() == operationId)
+              operation = addClusterTemporaryBudget(
+                  builder, operation, enclosingCluster->bufferGroups);
+            operations.push_back(operation);
+            continue;
+          }
+
           auto path = operation.getAs<mlir::ArrayAttr>("level_path");
           mlir::DictionaryAttr inherited;
           std::string inheritedLevel;
