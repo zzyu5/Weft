@@ -1,4 +1,4 @@
-# Encoding、View 与 artifact
+# Encoding、View 与 Artifact
 
 ## 1. Encoding 是纯布局
 

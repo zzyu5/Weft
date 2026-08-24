@@ -1,4 +1,4 @@
-# 编程模型
+# Weft 编程模型
 
 ## 1. Weft 承载哪一段程序
 
@@ -92,7 +92,7 @@ i8/u4 element products
 
 调用方可以在多个 hart 上调用同一 kernel，但 hart 数量、任务划分和线程运行时不属于 kernel 语义。并行调用的 buffer alias、同步和任务分配由调用方负责。
 
-kernel 内部可以使用 [Level](language/values-levels-and-control.md) 表达层级数值合成，也可以完全使用普通有序控制。Level 是可选构造，不是每个 kernel 必须套用的根对象。
+kernel 内部可以使用 [Level](../dsl/values-and-levels.md) 表达层级数值合成，也可以完全使用普通有序控制。Level 是可选构造，不是每个 kernel 必须套用的根对象。
 
 ## 4. 根抽象
 

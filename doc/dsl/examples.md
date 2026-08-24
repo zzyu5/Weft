@@ -1,4 +1,4 @@
-# 语言示例
+# DSL 示例
 
 这些示例展示作者树的语义边界。它们不规定目标 LMUL、register tile、fragment、load form或pipeline。为突出关系，片段省略 import、decorator 与函数签名中可由上下文确定的静态符号声明；未定义的大写符号均为静态 shape/参数，不是运行时隐式变量。
 

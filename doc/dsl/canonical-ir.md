@@ -1,4 +1,4 @@
-# Canonical Kernel IR 边界
+# Canonical Kernel IR
 
 Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它保存作者写下的树，供任何目标后端读取；它不保存某次 target lowering 的机器表示。
 
