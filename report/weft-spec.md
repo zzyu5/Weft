@@ -814,29 +814,87 @@ source `auto` 与此不同。它由作者/std 声明，可能实例化不同 coh
         ↓
 Canonical Verify
         ↓
-唯一合法推导：axes / Encoding / typed/effect facts
+ConvertWeftToRISCV
         ↓
-按 build requirements 过滤并确定结构选择：representation / memory / pack / local op / cluster
+target-aware RISC-V Physical IR
         ↓
-实例化有限 physical parameters
+layout / memory / operation / pipeline / resource passes
         ↓
-对每组参数建立完整 physical program并做resource check
+VerifyFinalRISCV
         ↓
-真机实测合法参数绑定，选择 winner
-        ↓
-机械 emission：intrinsic C / local asm
+terminal translation：intrinsic C / local asm
 ```
 
-没有全局带回边求解器，也没有结构 tournament：
+Weft 只有两层 MLIR 程序表示：
 
-- 唯一事实在它所属的实体上产生一次；
-- 结构 pass 按固定规则选择一次，不在 emitter 中重选；
-- layout conflict 形成显式 conversion；
-- physical parameter binding 资源不足则 spill（若结构明确允许）或判非法；
-- 所有绑定都非法时，当前 source candidate unsupported；
-- target lowering 不修改作者 tree，也不转去另一个 std overload。
+```text
+Canonical Kernel IR             类似 TTIR
+RISC-V Physical IR              类似 TTGIR
+```
 
-## 5.7 瞬态实体归属
+intrinsic C 是第二层的 terminal translation，不是第三层 MLIR。非SIMT物理抽象机器是 RISC-V IR 的语义，不单独形成一层通用 Physical IR。`func/scf/arith` 与 `weft_riscv` 可以同时出现在同一 RISC-V module 中；dialect namespace、target profile、build config、tuner 和 pass 数量都不增加 IR 层次。
+
+构建 driver 在进入 lowering 前绑定 source candidate。结构固定后，有限 physical parameter 的每组绑定各自从 canonical module 建立一份独立 RISC-V module并完整编译；tuner比较的是这些module产生的可执行artifact，不是一张全局assignment表。
+
+没有全局带回边求解器，也没有结构 tournament：唯一事实在所属实体上产生一次；结构 pass 按固定规则选择；layout conflict形成显式conversion；资源不足则插入结构合同允许的spill或判当前module非法；target lowering不修改作者tree，也不转去另一个std overload。
+
+## 5.7 RISC-V Physical IR
+
+RISC-V IR 是一份瞬态、target-aware、typed SSA physical program，不是 canonical program 旁边的 decision record。它至少必须直接表达：
+
+```text
+physical value type     logical axes → time/lane/register-replica/fragment mapping
+memory descriptor       Encoding、storage mapping、extent/stride/origin/alignment
+convert_layout          保持logical identity的真实SSA conversion
+memory operations       load/store/encoded access与selected memory form
+local objects           local pack、pipeline buffer、spill slot及其lifetime
+target operations       selected scalar/RVV/IME/transfer operation
+schedule structure      physical loop、cluster、buffer version、prologue/steady/epilogue
+resource operations     spill/reload或pure-producer rematerialization
+```
+
+layout属于physical value type；representation conflict在具体use edge形成typed `weft_riscv.convert_layout`。conversion elimination必须重写或删除真实operation。local pack、pipeline和spill必须形成真实local object、region与SSA use-def。不能用`realization="..."`、`pipeline_depth=2`或缺字段默认值代替尚未生成的程序结构。
+
+每个physical entity携带source origin，但真实use-def、control、memory和schedule必须存在于RISC-V IR本身；emitter不得借origin回查canonical closure再补程序。
+
+设计不采用第三层`weft_phys` dialect，不采用`weft_riscv.problem` / `weft_riscv.assignment`字典，也不保留兼容路径。未来target实现同一非SIMT机器合同时，替换第二层target-aware physical IR，不插入新的source或physical层。
+
+## 5.8 RISC-V Pass
+
+所有pass改写同一份RISC-V IR：
+
+```text
+ConvertWeftToRISCV
+    建立target-aware types、ABI descriptor、source origin与一一对应的Level/control
+
+SelectRISCVOperations
+    按typed facts、target profile、requirements与固定优先级选择scalar/RVV/IME anchors
+
+PropagateRISCVLayouts
+    沿use-def传播完整layout，在不兼容use edge插入typed conversion
+
+PlanRISCVMemory
+    物化unit/strided/indexed/segment、encoded access与invocation-local pack
+
+CanonicalizeRISCVLayouts
+    conversion propagation/elimination、rematerialization、CSE/DCE与reuse
+
+PipelineRISCVLevels
+    在已有Level/loop内生成cluster、physical loop、buffer version与真实pipeline结构
+
+MaterializeRISCVResources
+    计算live resources，插入合法spill/reload/rematerialized producer或拒绝module
+
+LowerRISCVComposites
+    把composite conversion/memory/contract/schedule降为scf与primitive RVV/IME ops
+
+VerifyFinalRISCV
+    确认layout、conversion、memory、schedule、resource与requirements全部闭合
+```
+
+这些是pass，不是IR层。pass-local analysis map可以存在，但跨pass结果必须写回physical type、operation、region或附着于真实实体的typed attribute。每个pass后dump同一份RISC-V module，必须能直接看见type变化、conversion插入/删除、memory/target op替换、pipeline展开与spill/reload。
+
+## 5.9 瞬态实体归属
 
 一次 target lowering 内，物理事实归属于具体实体：
 
@@ -852,7 +910,7 @@ build config       source-auto bindings / target requirements
 
 链的一端是 pinned memory Encoding，另一端是 selected target operation operand/result contract。内部 conversion、local pack、spill 和 pipeline temporary 不成为 canonical values 或跨调用 artifact。
 
-## 5.8 可改与不可改
+## 5.10 可改与不可改
 
 ```
 可以改：
@@ -877,17 +935,18 @@ build config       source-auto bindings / target requirements
 
 例：把与 sub index 无关的地址加法提出去 —— 可以（数值树没变）。把 `w.d * i32_acc` 下沉到 sub 层 —— 不可以（转换、舍入位置、中间类型全变）。
 
-## 5.9 Verifier 与 emitter
+## 5.11 Verifier 与 emitter
 
-每个 physicalization pass 必须声明：
+每个 RISC-V pass 必须声明：
 
 ```text
-读哪些 canonical facts / 前序 attributes
-写到哪类具体实体
-缺失或冲突时插入什么 convert，或返回什么 unsupported
+允许出现哪些op/type
+读哪些program facts
+产生、替换或消除哪些program entities
+pass后必须满足哪些结构不变量
 ```
 
-同一决定只有一个 producer。后面的 pass 只消费，不重新推导或重新选择。
+同一决定只有一个 producer。后面的pass只消费，不重新推导或重新选择。pass顺序由MLIR legality、type verifier、operation interface与pass failure约束，不由`stage="representations"`字符串约束。
 
 **需要**（结构与类型）：
 
@@ -916,9 +975,9 @@ storage bytes 或从中解出的离散字段，允许逐字节一致；浮点 ke
 检查与明确的绝对/相对误差容差，不要求 bit-exact。不同合法的乘加结合与 contraction
 可以产生末位差异，不能为了复刻 reference 的舍入位置而改作者数值树或阻断合法指令融合。
 
-Emitter 是最后一个 pass。它只读 selected physical values、conversions、operations、memory edges、local storage、clusters 与 parameters，负责普通 C、RVV intrinsic、ABI 和 typed local asm 拼写。Emitter 缺信息必须回报前序 pass 契约缺口；不得扫描 source closure、根据 dtype/shape/VLEN/格式名补选结构，也不得写回任何 physical fact。
+Terminal translator只接收通过final verifier的RISC-V module。它把`func/scf/cf/arith`写成普通C，把已选RVV/IME operations写成确定intrinsic或typed local asm，并打印已经物化的ABI和pointer arithmetic。它不能生成Level/pack/pipeline/microkernel结构，不能推导layout、memory form、engine、fragment或spill，也不能同时读取canonical module与side record合成physical program。缺失信息必须回报final-RISC-V verifier错误。
 
-## 5.10 编译器绝不做的四件事
+## 5.12 编译器绝不做的四件事
 
 ```
 发现 q4_K 的分配律
@@ -931,9 +990,9 @@ Emitter 是最后一个 pass。它只读 selected physical values、conversions�
 
 > **Weft 不替你想出算法改写；它让你把想出来的那个写下来一次，并把"换一个写法"的代价从两天降到一行。**
 
-## 5.11 输出
+## 5.13 输出
 
-生成 intrinsic C（`__riscv_v*` / IME intrinsic），不生成 IR 交给 LLVM 做向量化。理由：向量形态已经由 Weft passes 明确决定，不能再交给系统编译器重新猜。
+RISC-V IR terminal translation生成 intrinsic C（`__riscv_v*` / IME intrinsic），不增加LLVM dialect层，也不把未决定的向量形态交给LLVM自动向量化。系统C compiler继续负责最终寄存器分配、机器调度、peephole和机器码生成。
 
 ---
 

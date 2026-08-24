@@ -2,7 +2,7 @@
 
 Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它保存作者写下的树，供任何目标后端读取；它不保存某次 target lowering 的机器表示。
 
-本文只规定 canonical 边界，不规定 physical IR 的 dialect、pass 或 lowering 结构。
+本文只规定 canonical 边界。两层 lowering 与 target-aware physical IR 见[编译主干](../compiler.md)。
 
 ## 1. 必须承载的内容
 
@@ -125,8 +125,18 @@ operation semantics
 effects
 ```
 
-并与独立的 target profile/build config 一起，为每个已实例化 std/auto candidate 形成一份 target physical program。target profile 提供 engines、representations、legality 与结构规则；build config 提供 target requirement，例如最终 physical program 必须使用 IME。requirement 在结构性选择时参与 legality 过滤，并在 selected program 上验证；二者都不进入 canonical Value identity。
+并与独立的 target profile/build config 一起，为每个已实例化 std/auto candidate 形成一份 target-aware RISC-V IR module。target profile 提供 engines、representations、legality 与结构规则；build config 提供 target requirement，例如最终 physical program 必须使用 IME。requirement 在结构性选择时参与 legality 过滤，并在 selected program 上验证；二者都不进入 canonical Value identity。
+
+```text
+Canonical Kernel IR
+    ↓ ConvertWeftToRISCV
+RISC-V Physical IR
+    ↓ terminal translation
+intrinsic C / local asm
+```
+
+这是两层 MLIR。target profile、build config、tuner和各个physical pass都是转换输入或对第二层程序的改写，不构成额外IR层。canonical module保持不变；每个candidate从它独立建立一份瞬态RISC-V module。
 
 唯一合法事实必须从这些输入唯一推导；存在多个合法物理结构时，target 按固定规则和优先级选择；结构固定后的有限物理参数可以由构建期实测选择。若物理实现需要改变 canonical values、Level 归属、artifact ABI 或 numerical operation，它不能在 target lowering 中完成；必须返回到作者 tree 或另一个 std overload。
 
-canonical IR本身不承担目标物理candidate的持久authority。一个candidate被拒绝或替换，不得修改源程序语义。
+canonical IR本身不承担目标物理candidate的持久authority。一个candidate被拒绝或替换，不得修改源程序语义；选定layout、conversion、memory、schedule和target operations必须存在于RISC-V IR本身，不能只保存在side record中。

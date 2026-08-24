@@ -4,7 +4,7 @@
 
 Weft 源程序规定 logical values、axes、Level、数值 operation、Encoding、lifetime、handoff 和 effects。目标编译器必须把这些事实实现为一份单控制器机器程序。
 
-本文件定义 lowering 面向的物理抽象机器。它不定义 physical dialect、IR op/type 名称或 pass 顺序，也不把物理对象加入 DSL。
+本文件定义 lowering 面向的物理抽象机器。它不把物理对象加入 DSL；该机器由唯一的 target-aware RISC-V IR 承载，具体 IR 与 pass 见[编译主干](../compiler.md)。
 
 非 SIMT 的准确含义是：
 
@@ -347,9 +347,19 @@ TileLang 在 source 中显式提供 shared/local/fragment allocation、thread bi
 
 ## 16. 与 physical IR 的边界
 
-typed physical IR 是承载这台机器的必要条件：每个 representation、conversion、local storage、cluster、buffer version 和 target operation 必须能成为可验证、可改写的程序实体。
+这台抽象机器不是 Kernel IR 与 RISC-V IR 之间的第三层。它是第二层 target-aware RISC-V IR 的语义：每个 representation、conversion、local storage、cluster、buffer version 和 target operation 都必须成为该程序中可验证、可改写的实体。
 
-它不是充分条件。有了 dialect、type 和 op，不会自动产生：
+```text
+Canonical Kernel IR
+    ↓
+RISC-V IR：本文件定义的物理机器
+    ↓
+intrinsic C / local asm
+```
+
+RISC-V IR可以混用`func/scf/arith`与`weft_riscv` operations；dialect namespace和pass数量不增加IR层次。设计不采用`weft_phys → weft_riscv`两级physical lowering，也不采用canonical program旁边的`problem/assignment`字典。
+
+typed RISC-V IR只是必要载体，不是充分能力。有了dialect、type和op，不会自动产生：
 
 - axis/layout propagation；
 - coalescing 与 memory scheduling；
@@ -360,7 +370,7 @@ typed physical IR 是承载这台机器的必要条件：每个 representation�
 - target structural rules；
 - physical parameter tuning。
 
-这些是真实编译算法，必须分别实现并用改变输入、target与consumer后的结果检验。
+这些是真实编译算法；它们作为pass改写同一份RISC-V IR，并用改变输入、target与consumer后的结果检验。
 
 ## 17. 尚未闭合的机器问题
 

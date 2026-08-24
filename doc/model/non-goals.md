@@ -130,3 +130,9 @@ Weft 不为结构性选择建立预测执行时间、带宽、cache 命中或综
 目标编译器不为同一个 source candidate 生成多种 lane/register/fragment、memory、pack 或 pipeline 结构，再通过静态排序或真机运行挑 winner。这样做会把编译时间、实现复杂度和结果可解释性绑定到无限增长的结构空间。
 
 允许实测的只有有限参数绑定：作者显式声明的 source `auto`，以及 target 为已经固定的物理结构声明的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth 和 buffer count 等参数。tuner 不生成新的结构，也不改变结构优先级。
+
+## 18. 第三层 Physical IR 与 side-record planning
+
+Weft 的程序 IR 只有 Canonical Kernel IR 和 target-aware physical IR 两层。非SIMT物理机器是第二层的语义，不单独形成`weft_phys → weft_riscv`两级lowering；target profile、build config、tuner和pass stage也不是IR层。
+
+物理决定不能只保存在`problem/assignment`字典或其它并行side record中，再让emitter同时读取canonical program与记录首次合成physical program。layout必须进入physical value type，conversion/memory/local object/pipeline/spill必须成为真实operation或region结构，pass结果必须能从改写后的RISC-V IR直接观察和验证。
