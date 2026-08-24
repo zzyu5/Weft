@@ -3,6 +3,8 @@
 #include "Weft/Target/RISCVCompiler.h"
 #include "Weft/Target/RISCVTargetProfile.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
@@ -120,7 +122,8 @@ int main(int argc, char **argv) {
   sourceManager.AddNewSourceBuffer(std::move(*buffer), llvm::SMLoc());
   mlir::DialectRegistry registry;
   registry.insert<weft::kernel::WEFTKernelDialect,
-                  weft::riscv::WEFTRISCVDialect>();
+                  weft::riscv::WEFTRISCVDialect,
+                  mlir::arith::ArithDialect, mlir::scf::SCFDialect>();
   mlir::MLIRContext context(registry);
   context.getOrLoadDialect<weft::riscv::WEFTRISCVDialect>();
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sourceManager, &context);

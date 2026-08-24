@@ -31,10 +31,11 @@ def WeftKernel_EncodingType : WeftKernel_Type<"Encoding", "encoding"> {
   let parameters = (ins
     StringRefParameter<"encoding family">:$family,
     StringRefParameter<"base, dense, derived_family, or derived_instance">:$kind,
-    StringRefParameter<"fixed physical layout identity, otherwise empty">:$layoutIdentity
+    StringRefParameter<"fixed artifact layout identity, otherwise empty">:$layoutIdentity,
+    "::mlir::DenseI64ArrayAttr":$parameters
   );
   let assemblyFormat =
-      "`<` $family `,` $kind `,` $layoutIdentity `>`";
+      "`<` $family `,` $kind `,` $layoutIdentity `,` $parameters `>`";
   let genVerifyDecl = 1;
 }
 
@@ -74,15 +75,14 @@ def WeftKernel_SliceType : WeftKernel_Type<"Slice", "slice"> {
 def WeftKernel_DomainType : WeftKernel_Type<"Domain", "domain"> {
   let parameters = (ins
     StringRefParameter<"axis name">:$axisName,
+    "int64_t":$domainId,
+    "int64_t":$parentDomainId,
     "int64_t":$axisId,
     StringRefParameter<"root, rows, cols, tiles, blocks, or subs">:$relation,
-    StringRefParameter<"logical extent expression">:$extent,
-    StringRefParameter<"partition expression">:$partition,
-    StringRefParameter<"multiplicity expression">:$multiplicity,
     StringRefParameter<"exact or tail">:$tail
   );
   let assemblyFormat =
-      "`<` $axisName `,` $axisId `,` $relation `,` $extent `,` $partition `,` $multiplicity `,` $tail `>`";
+      "`<` $axisName `,` $domainId `,` $parentDomainId `,` $axisId `,` $relation `,` $tail `>`";
   let genVerifyDecl = 1;
 }
 
@@ -119,7 +119,9 @@ def WeftKernel_DeriveOp
   let arguments = (ins SymbolNameAttr:$sym_name,
                        StrAttr:$source_family,
                        StrAttr:$result_family,
-                       ArrayAttr:$parameters);
+                       StrAttr:$layout_identity,
+                       ArrayAttr:$parameter_names,
+                       DenseI64ArrayAttr:$parameter_values);
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
 }
@@ -133,6 +135,8 @@ def WeftKernel_KernelOp
     : WeftKernel_Op<"kernel", [Symbol, IsolatedFromAbove, SingleBlock]> {
   let arguments = (ins SymbolNameAttr:$sym_name,
                        ArrayAttr:$arg_names,
+                       ArrayAttr:$arg_access,
+                       DenseI64ArrayAttr:$arg_alias_sets,
                        ArrayAttr:$shape_symbols,
                        StrAttr:$source);
   let regions = (region SizedRegion<1>:$body);
@@ -150,13 +154,16 @@ def WeftKernel_RootDomainOp : WeftKernel_Op<"root_domain", [Pure]> {
 }
 
 def WeftKernel_SymbolOp : WeftKernel_Op<"symbol", [Pure]> {
-  let arguments = (ins StrAttr:$name, StrAttr:$kind);
+  let arguments = (ins StrAttr:$name, StrAttr:$kind,
+                       DenseI64ArrayAttr:$choices);
   let results = (outs Index:$result);
   let hasVerifier = 1;
 }
 
 def WeftKernel_DomainOp : WeftKernel_Op<"domain", [Pure]> {
-  let arguments = (ins WeftKernel_DomainType:$parent);
+  let arguments = (ins WeftKernel_DomainType:$parent,
+                       Index:$extent, Index:$partition,
+                       Index:$multiplicity);
   let results = (outs WeftKernel_DomainType:$result);
   let hasVerifier = 1;
 }
@@ -164,9 +171,7 @@ def WeftKernel_DomainOp : WeftKernel_Op<"domain", [Pure]> {
 def WeftKernel_LevelOp
     : WeftKernel_Op<"level", [RecursiveMemoryEffects]> {
   let arguments = (ins WeftKernel_DomainType:$domain,
-                       Variadic<AnyType>:$carried,
-                       ArrayAttr:$state_names,
-                       ArrayAttr:$staged_names);
+                       Variadic<AnyType>:$carried);
   let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$state_births,
                          SizedRegion<1>:$staged_births,
@@ -180,44 +185,13 @@ def WeftKernel_BirthsYieldOp : WeftKernel_Op<"births_yield", [Terminator]> {
 }
 
 def WeftKernel_HandoffOp : WeftKernel_Op<"handoff", [Terminator]> {
-  let arguments = (ins Variadic<AnyType>:$values, ArrayAttr:$names);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_YieldOp : WeftKernel_Op<"yield", [Terminator]> {
   let arguments = (ins Variadic<AnyType>:$values);
   let hasVerifier = 1;
 }
 
-def WeftKernel_ConditionOp : WeftKernel_Op<"condition", [Terminator]> {
-  let arguments = (ins I1:$condition, Variadic<AnyType>:$values);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_ForOp : WeftKernel_Op<"for", [RecursiveMemoryEffects]> {
-  let arguments = (ins Index:$lower, Index:$upper, Index:$step,
-                       Variadic<AnyType>:$init_args);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region SizedRegion<1>:$body);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_IfOp : WeftKernel_Op<"if", [RecursiveMemoryEffects]> {
-  let arguments = (ins I1:$condition);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region SizedRegion<1>:$then_region,
-                         SizedRegion<1>:$else_region);
-  let hasVerifier = 1;
-}
-
-def WeftKernel_WhileOp : WeftKernel_Op<"while", [RecursiveMemoryEffects]> {
-  let arguments = (ins Variadic<AnyType>:$init_args);
-  let results = (outs Variadic<AnyType>:$results);
-  let regions = (region SizedRegion<1>:$condition_region,
-                         SizedRegion<1>:$body_region);
-  let hasVerifier = 1;
-}
-
+// MLIR arith.constant accepts only signless integers.  Weft integer types carry
+// source signedness, so signed/unsigned scalar literals require a canonical op
+// whose result type preserves that semantic fact.
 def WeftKernel_ConstantOp : WeftKernel_Op<"constant", [Pure]> {
   let arguments = (ins AnyAttr:$value);
   let results = (outs AnyType:$result);
@@ -299,9 +273,14 @@ def WeftKernel_CompareOp : WeftKernel_Op<"compare", [Pure]> {
 }
 
 def WeftKernel_CastOp : WeftKernel_Op<"cast", [Pure]> {
-  let arguments = (ins AnyType:$input,
-                       OptionalAttr<StrAttr>:$rounding,
-                       OptionalAttr<BoolAttr>:$saturate);
+  let arguments = (ins AnyType:$input);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_NarrowOp : WeftKernel_Op<"narrow", [Pure]> {
+  let arguments = (ins AnyType:$input, StrAttr:$rounding,
+                       BoolAttr:$saturate);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
@@ -314,7 +293,6 @@ class WeftKernel_GroupedMacOp<string mnemonic>
   let hasVerifier = 1;
 }
 
-def WeftKernel_MacPairsOp : WeftKernel_GroupedMacOp<"mac_pairs">;
 def WeftKernel_MacGroupsOp : WeftKernel_GroupedMacOp<"mac_groups">;
 
 def WeftKernel_WidenOp : WeftKernel_Op<"widen", [Pure]> {
@@ -350,7 +328,7 @@ def WeftKernel_OuterContractOp
     : WeftKernel_ContractLikeOp<"outer_contract">;
 
 def WeftKernel_LookupOp : WeftKernel_Op<"lookup", [Pure]> {
-  let arguments = (ins AnyType:$table, AnyType:$indices);
+  let arguments = (ins AnyType:$table, AnyType:$indices, StrAttr:$bounds);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

@@ -28,8 +28,8 @@ class Region:
     def terminated(self) -> bool:
         return bool(self.operations) and self.operations[-1].name in {
             "weft_kernel.return",
-            "weft_kernel.yield",
-            "weft_kernel.condition",
+            "scf.yield",
+            "scf.condition",
             "weft_kernel.births_yield",
             "weft_kernel.handoff",
             "weft_kernel.derive_yield",

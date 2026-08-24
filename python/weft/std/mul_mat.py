@@ -94,8 +94,12 @@ def _iq2_xxs_entry_products(
 ):
     grid_index = (word0 >> u32(entry * 8)) & u32(255)
     sign_index = (word1 >> u32(entry * 7)) & u32(127)
-    weight = lookup(grid, grid_index * u32(8) + codebook_lane)
-    sign = lookup(signs, sign_index * u32(8) + codebook_lane)
+    weight = lookup(
+        grid, grid_index * u32(8) + codebook_lane, bounds="in_bounds"
+    )
+    sign = lookup(
+        signs, sign_index * u32(8) + codebook_lane, bounds="in_bounds"
+    )
     signed_weight = weight * sign
     activation = x.q[:, group * 32 + entry * 8 + codebook_lane]
     return widen(activation, i16) * widen(signed_weight, i16)

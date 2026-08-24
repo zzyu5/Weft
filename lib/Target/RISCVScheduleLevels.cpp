@@ -94,7 +94,7 @@ mlir::DictionaryAttr addLocalTemporaryBudget(mlir::Builder &builder,
             "selected accumulator partials + scheduled encoded operand banks"));
     return riscv_internal::set(operation, "local_operation", local);
   }
-  if (name != "weft_kernel.mac_pairs" && name != "weft_kernel.mac_groups")
+  if (name != "weft_kernel.mac_groups")
     return operation;
   auto source = operation.getAs<mlir::DictionaryAttr>("source_attributes");
   if (!local || !source)
@@ -242,7 +242,7 @@ public:
       for (const auto &loopEntry : operationsById) {
         mlir::DictionaryAttr loop = loopEntry.getValue();
         if (riscv_internal::string(loop, "name").value_or("") !=
-            "weft_kernel.for")
+            "scf.for")
           continue;
         const std::string loopId = loopEntry.getKey().str();
         llvm::SmallVector<std::string> expectedControl;
@@ -268,9 +268,9 @@ public:
             continue;
           llvm::StringRef name =
               riscv_internal::string(operation, "name").value_or("");
-          nestedControl |= name == "weft_kernel.for" ||
-                           name == "weft_kernel.while" ||
-                           name == "weft_kernel.if" ||
+          nestedControl |= name == "scf.for" ||
+                           name == "scf.while" ||
+                           name == "scf.if" ||
                            name == "weft_kernel.level";
           bodyOperations.push_back(operation);
         }
@@ -327,7 +327,7 @@ public:
           } else {
             llvm::StringRef name =
                 riscv_internal::string(producer->second, "name").value_or("");
-            if (name != "weft_kernel.constant" &&
+            if (name != "arith.constant" && name != "weft_kernel.constant" &&
                 name != "weft_kernel.iota" && name != "weft_kernel.symbol" &&
                 name != "weft_kernel.domain" &&
                 name != "weft_kernel.root_domain")
@@ -366,9 +366,8 @@ public:
           bool explicitCompute =
               name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
               name == "weft_kernel.outer_contract" ||
-              name == "weft_kernel.mac_pairs" ||
               name == "weft_kernel.mac_groups" ||
-              name == "weft_kernel.reduce" || name == "weft_kernel.scan";
+              name == "weft_kernel.reduce";
           if (name == "weft_kernel.binary") {
             auto source =
                 operation.getAs<mlir::DictionaryAttr>("source_attributes");
@@ -453,7 +452,7 @@ public:
             cluster.producers.push_back(id.str());
           else if (consumerOps.contains(id) &&
                    riscv_internal::string(operation, "name").value_or("") !=
-                       "weft_kernel.yield")
+                       "scf.yield")
             cluster.consumers.push_back(id.str());
         }
         for (const auto &frontier : frontierValues) {

@@ -5,6 +5,8 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
@@ -22,6 +24,50 @@
 using namespace weft;
 
 namespace {
+
+bool isCanonicalKernelOperation(llvm::StringRef name) {
+  return name == "weft_kernel.root_domain" ||
+         name == "weft_kernel.symbol" || name == "weft_kernel.domain" ||
+         name == "weft_kernel.level" ||
+         name == "weft_kernel.births_yield" ||
+         name == "weft_kernel.handoff" || name == "weft_kernel.return" ||
+         name == "weft_kernel.constant" || name == "weft_kernel.iota" ||
+         name == "weft_kernel.new" ||
+         name == "weft_kernel.materialize" ||
+         name == "weft_kernel.admit" || name == "weft_kernel.commit" ||
+         name == "weft_kernel.slice" || name == "weft_kernel.field" ||
+         name == "weft_kernel.extract" || name == "weft_kernel.update" ||
+         name == "weft_kernel.unary" || name == "weft_kernel.binary" ||
+         name == "weft_kernel.compare" || name == "weft_kernel.cast" ||
+         name == "weft_kernel.narrow" ||
+         name == "weft_kernel.mac_groups" || name == "weft_kernel.widen" ||
+         name == "weft_kernel.reduce" || name == "weft_kernel.fold2" ||
+         name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
+         name == "weft_kernel.outer_contract" ||
+         name == "weft_kernel.lookup" || name == "arith.constant" ||
+         name == "arith.ceildivui" || name == "scf.for" ||
+         name == "scf.if" || name == "scf.while" ||
+         name == "scf.yield" || name == "scf.condition";
+}
+
+std::optional<std::string> indexExpression(mlir::Value value) {
+  if (auto symbol = value.getDefiningOp<kernel::SymbolOp>()) {
+    if (symbol.getKind() == "source_auto")
+      return "auto:" + symbol.getName().str();
+    return symbol.getName().str();
+  }
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+      return std::to_string(integer.getInt());
+  }
+  if (auto ceil = value.getDefiningOp<mlir::arith::CeilDivUIOp>()) {
+    auto lhs = indexExpression(ceil.getLhs());
+    auto rhs = indexExpression(ceil.getRhs());
+    if (lhs && rhs)
+      return "ceildiv(" + *lhs + "," + *rhs + ")";
+  }
+  return std::nullopt;
+}
 
 std::string valueKind(mlir::Type type) {
   if (mlir::isa<kernel::ViewType>(type))
@@ -57,6 +103,9 @@ public:
       : builder(builder), kernel(kernel) {}
 
   mlir::LogicalResult collect() {
+    kernel.walk([&](kernel::DomainOp domain) {
+      domains.try_emplace(domain.getResult().getType().getDomainId(), domain);
+    });
     llvm::SmallVector<std::string> levelPath;
     llvm::SmallVector<std::string> controlPath;
     visitBlock(kernel.getBody().front(), "kernel", levelPath, controlPath);
@@ -112,12 +161,35 @@ private:
           {"domain_axis", builder.getI64IntegerAttr(domain.getAxisId())});
       fields.push_back(
           {"domain_relation", builder.getStringAttr(domain.getRelation())});
+      auto domainOperation = domains.find(domain.getDomainId());
+      std::string extent = "1";
+      std::string partition = "1";
+      std::string multiplicity = "1";
+      if (domainOperation == domains.end() && domain.getDomainId() != 0) {
+        kernel.emitError()
+            << "non-root domain identity " << domain.getDomainId()
+            << " has no canonical domain operation";
+        failed = true;
+      } else if (domainOperation != domains.end()) {
+        auto extentValue = indexExpression(domainOperation->second.getExtent());
+        auto partitionValue =
+            indexExpression(domainOperation->second.getPartition());
+        auto multiplicityValue =
+            indexExpression(domainOperation->second.getMultiplicity());
+        if (!extentValue || !partitionValue || !multiplicityValue) {
+          domainOperation->second.emitError(
+              "domain index expressions must be canonical shape/auto/constant/ceildiv values");
+          failed = true;
+        } else {
+          extent = std::move(*extentValue);
+          partition = std::move(*partitionValue);
+          multiplicity = std::move(*multiplicityValue);
+        }
+      }
+      fields.push_back({"domain_extent", builder.getStringAttr(extent)});
+      fields.push_back({"domain_partition", builder.getStringAttr(partition)});
       fields.push_back(
-          {"domain_extent", builder.getStringAttr(domain.getExtent())});
-      fields.push_back(
-          {"domain_partition", builder.getStringAttr(domain.getPartition())});
-      fields.push_back({"domain_multiplicity",
-                        builder.getStringAttr(domain.getMultiplicity())});
+          {"domain_multiplicity", builder.getStringAttr(multiplicity)});
       fields.push_back({"domain_tail", builder.getStringAttr(domain.getTail())});
     }
     values.push_back(riscv_internal::dictionary(builder, fields));
@@ -136,6 +208,11 @@ private:
   void visitOperation(mlir::Operation &operation,
                       llvm::SmallVectorImpl<std::string> &levelPath,
                       llvm::SmallVectorImpl<std::string> &controlPath) {
+    if (!isCanonicalKernelOperation(operation.getName().getStringRef())) {
+      operation.emitError(
+          "operation is outside the canonical Kernel IR to RISC-V contract");
+      failed = true;
+    }
     std::string operationId = "op" + std::to_string(nextOperation++);
     llvm::SmallVector<std::string> resultIds;
     for (auto [index, result] : llvm::enumerate(operation.getResults()))
@@ -163,8 +240,8 @@ private:
         {"location",
          builder.getStringAttr(riscv_internal::printAttribute(operation.getLoc()))}};
     const bool opensLevel = mlir::isa<kernel::LevelOp>(operation);
-    const bool opensControl = mlir::isa<kernel::ForOp, kernel::WhileOp,
-                                        kernel::IfOp>(operation);
+    const bool opensControl = mlir::isa<mlir::scf::ForOp, mlir::scf::WhileOp,
+                                        mlir::scf::IfOp>(operation);
     if (opensLevel)
       levelPath.push_back(operationId);
     if (opensControl)
@@ -219,39 +296,39 @@ private:
       for (mlir::Value birth : stagedYield.getValues())
         uniteHandoff(birth, body.getArgument(cursor++));
     });
-    kernel.walk([&](kernel::ForOp loop) {
-      mlir::Block &body = loop.getBody().front();
-      auto yield = mlir::cast<kernel::YieldOp>(body.getTerminator());
+    kernel.walk([&](mlir::scf::ForOp loop) {
+      mlir::Block &body = *loop.getBody();
+      auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
       for (auto [index, initial] : llvm::enumerate(loop.getInitArgs())) {
         uniteHandoff(initial, body.getArgument(index + 1));
-        uniteHandoff(body.getArgument(index + 1), yield.getValues()[index]);
-        uniteHandoff(yield.getValues()[index], loop.getResult(index));
+        uniteHandoff(body.getArgument(index + 1), yield.getResults()[index]);
+        uniteHandoff(yield.getResults()[index], loop.getResult(index));
       }
     });
-    kernel.walk([&](kernel::IfOp branch) {
-      auto thenYield = mlir::cast<kernel::YieldOp>(
+    kernel.walk([&](mlir::scf::IfOp branch) {
+      auto thenYield = mlir::cast<mlir::scf::YieldOp>(
           branch.getThenRegion().front().getTerminator());
-      auto elseYield = mlir::cast<kernel::YieldOp>(
+      auto elseYield = mlir::cast<mlir::scf::YieldOp>(
           branch.getElseRegion().front().getTerminator());
       for (auto [index, result] : llvm::enumerate(branch.getResults())) {
-        uniteHandoff(thenYield.getValues()[index], result);
-        uniteHandoff(elseYield.getValues()[index], result);
+        uniteHandoff(thenYield.getResults()[index], result);
+        uniteHandoff(elseYield.getResults()[index], result);
       }
     });
-    kernel.walk([&](kernel::WhileOp loop) {
-      mlir::Block &condition = loop.getConditionRegion().front();
-      mlir::Block &body = loop.getBodyRegion().front();
+    kernel.walk([&](mlir::scf::WhileOp loop) {
+      mlir::Block &condition = loop.getBefore().front();
+      mlir::Block &body = loop.getAfter().front();
       auto conditionTerminator =
-          mlir::cast<kernel::ConditionOp>(condition.getTerminator());
-      auto yield = mlir::cast<kernel::YieldOp>(body.getTerminator());
-      for (auto [index, initial] : llvm::enumerate(loop.getInitArgs())) {
+          mlir::cast<mlir::scf::ConditionOp>(condition.getTerminator());
+      auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
+      for (auto [index, initial] : llvm::enumerate(loop.getInits())) {
         uniteHandoff(initial, condition.getArgument(index));
         uniteHandoff(condition.getArgument(index),
-                     conditionTerminator.getValues()[index]);
-        uniteHandoff(conditionTerminator.getValues()[index],
+                     conditionTerminator.getArgs()[index]);
+        uniteHandoff(conditionTerminator.getArgs()[index],
                      body.getArgument(index));
-        uniteHandoff(body.getArgument(index), yield.getValues()[index]);
-        uniteHandoff(yield.getValues()[index], loop.getResult(index));
+        uniteHandoff(body.getArgument(index), yield.getResults()[index]);
+        uniteHandoff(yield.getResults()[index], loop.getResult(index));
       }
     });
 
@@ -266,6 +343,7 @@ private:
   mlir::Builder &builder;
   kernel::KernelOp kernel;
   llvm::DenseMap<mlir::Value, std::string> ids;
+  llvm::DenseMap<int64_t, kernel::DomainOp> domains;
   llvm::DenseMap<mlir::Value, unsigned> valueOrdinals;
   llvm::SmallVector<unsigned> handoffParent;
   llvm::SmallVector<mlir::Attribute> values;
@@ -285,28 +363,21 @@ collectAutoDimensions(kernel::KernelOp kernel,
                       const RISCVCompilerOptions &options) {
   llvm::SmallVector<AutoDimension> dimensions;
   llvm::SmallSet<std::string, 8> seen;
-  mlir::WalkResult result = kernel.walk([&](kernel::DomainOp operation) {
-    kernel::DomainType domain = operation.getResult().getType();
-    llvm::StringRef partition = domain.getPartition();
-    if (!partition.starts_with("auto:"))
+  mlir::WalkResult result = kernel.walk([&](kernel::SymbolOp operation) {
+    if (operation.getKind() != "source_auto")
       return mlir::WalkResult::advance();
-    llvm::StringRef spelling = partition.drop_front(5);
-    if (!seen.insert(spelling.str()).second)
+    llvm::StringRef name = operation.getName();
+    if (!seen.insert(name.str()).second)
       return mlir::WalkResult::advance();
     AutoDimension dimension;
-    dimension.name = spelling.str();
-    llvm::SmallVector<llvm::StringRef> choices;
-    spelling.split(choices, '|', -1, false);
-    for (llvm::StringRef choice : choices) {
-      int64_t value = 0;
-      if (!choice.getAsInteger(10, value) && value > 0) {
-        dimension.choices.push_back(value);
-        continue;
-      }
-      auto binding = options.metaBindings.find(choice);
+    dimension.name = name.str();
+    auto declaredChoices = operation.getChoices();
+    dimension.choices.append(declaredChoices.begin(), declaredChoices.end());
+    if (dimension.choices.empty()) {
+      auto binding = options.metaBindings.find(name);
       if (binding == options.metaBindings.end() || binding->second.empty()) {
         operation.emitError()
-            << "auto parameter '" << choice
+            << "auto parameter '" << name
             << "' requires positive --meta choices in this invocation";
         return mlir::WalkResult::interrupt();
       }
@@ -330,9 +401,9 @@ std::pair<bool, bool>
 scheduleCapabilities(mlir::DictionaryAttr operation) {
   llvm::StringRef name =
       riscv_internal::string(operation, "name").value_or("");
-  if (name == "weft_kernel.for")
+  if (name == "scf.for")
     return {false, true};
-  if (name == "weft_kernel.mac_pairs" || name == "weft_kernel.mac_groups" ||
+  if (name == "weft_kernel.mac_groups" ||
       name == "weft_kernel.outer_contract")
     return {true, true};
   return {false, false};

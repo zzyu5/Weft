@@ -5,6 +5,8 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
@@ -189,6 +191,9 @@ struct Binding {
   PointInfo point;
   mlir::Value parentDomain;
   kernel::DomainType domainType;
+  std::string domainExtent;
+  std::string domainPartition;
+  std::string domainMultiplicity;
   std::string recordPointer;
   std::string encodingFamily;
   int64_t interleaveRows = 0;
@@ -203,7 +208,6 @@ public:
     indexAssignment();
     collectEncodings();
     collectDerivedFamilies();
-    collectWritableArguments();
     for (auto [index, symbol] : llvm::enumerate(kernel.getShapeSymbols()))
       axisSymbolIds[mlir::cast<mlir::StringAttr>(symbol).getValue()] = index + 1;
     auto bindings = assignment.getCandidate().getAs<mlir::DictionaryAttr>(
@@ -426,29 +430,6 @@ private:
       derivedSources[derive.getResultFamily()] = derive.getSourceFamily().str();
   }
 
-  mlir::Value rootView(mlir::Value value) const {
-    while (true) {
-      if (auto field = value.getDefiningOp<kernel::FieldOp>()) {
-        value = field.getOwner();
-        continue;
-      }
-      if (auto slice = value.getDefiningOp<kernel::SliceOp>()) {
-        value = slice.getBase();
-        continue;
-      }
-      return value;
-    }
-  }
-
-  void collectWritableArguments() {
-    kernel.walk([&](kernel::CommitOp commit) {
-      mlir::Value root = rootView(commit.getRegion());
-      if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(root))
-        if (argument.getOwner() == &kernel.getBody().front())
-          writableArguments.insert(argument.getArgNumber());
-    });
-  }
-
   std::optional<std::string> scalarCType(mlir::Type type) const {
     if (type.isIndex())
       return "size_t";
@@ -496,10 +477,14 @@ private:
     return std::nullopt;
   }
 
-  std::optional<std::string> argumentCType(mlir::BlockArgument argument) const {
+  std::optional<std::string> argumentCType(mlir::BlockArgument argument) {
     auto view = mlir::cast<kernel::ViewType>(argument.getType());
     auto encoding = mlir::cast<kernel::EncodingType>(view.getEncoding());
-    bool writable = writableArguments.contains(argument.getArgNumber());
+    llvm::StringRef access =
+        mlir::cast<mlir::StringAttr>(
+            kernel.getArgAccess()[argument.getArgNumber()])
+            .getValue();
+    bool writable = access == "write" || access == "readwrite";
     std::string element = "uint8_t";
     if (encoding.getKind() == "dense") {
       auto denseType = denseElementType(encoding);
@@ -510,7 +495,12 @@ private:
         return std::nullopt;
       element = *fieldType;
     }
-    return (writable ? "" : "const ") + element + " *restrict";
+    int64_t aliasSet = kernel.getArgAliasSets()[argument.getArgNumber()];
+    size_t aliases = 0;
+    for (int64_t candidate : kernel.getArgAliasSets())
+      aliases += candidate == aliasSet;
+    std::string qualifier = aliasSet >= 0 && aliases == 1 ? " *restrict" : " *";
+    return (writable ? "" : "const ") + element + qualifier;
   }
 
   mlir::FailureOr<std::string> functionArguments() {
@@ -592,7 +582,10 @@ private:
         memory.strides[dimension] = "(" + memory.strides[dimension + 1] + " * " +
                                     memory.extents[dimension + 1] + ")";
       memory.origins.assign(memory.axes.size(), "0");
-      memory.isConst = !writableArguments.contains(index);
+      llvm::StringRef access = mlir::cast<mlir::StringAttr>(
+                                   kernel.getArgAccess()[index])
+                                   .getValue();
+      memory.isConst = access != "write" && access != "readwrite";
       Binding binding;
       binding.kind = Binding::Kind::Memory;
       binding.memory = std::move(memory);
@@ -616,8 +609,8 @@ private:
     }
     for (mlir::Operation &operation : block) {
       if (mlir::isa<kernel::ReturnOp, kernel::BirthsYieldOp,
-                    kernel::HandoffOp, kernel::YieldOp,
-                    kernel::ConditionOp>(operation))
+                    kernel::HandoffOp, mlir::scf::YieldOp,
+                    mlir::scf::ConditionOp>(operation))
         continue;
       if (mlir::failed(compileOperation(operation))) {
         conversionCaches.pop_back();
@@ -630,12 +623,13 @@ private:
 
   mlir::LogicalResult compileOperation(mlir::Operation &operation);
   mlir::LogicalResult compileLevel(kernel::LevelOp level);
-  mlir::LogicalResult compileFor(kernel::ForOp operation);
+  mlir::LogicalResult compileFor(mlir::scf::ForOp operation);
   mlir::LogicalResult compilePipelinedFor(
-      kernel::ForOp operation, mlir::DictionaryAttr cluster,
+      mlir::scf::ForOp operation, mlir::DictionaryAttr cluster,
       const Binding &lower, const Binding &upper, const Binding &step,
       llvm::SmallVectorImpl<Binding> &carried);
-  mlir::LogicalResult compileIf(kernel::IfOp operation);
+  mlir::LogicalResult compileIf(mlir::scf::IfOp operation);
+  mlir::LogicalResult compileWhile(mlir::scf::WhileOp operation);
   mlir::LogicalResult compileSlice(kernel::SliceOp slice);
   mlir::LogicalResult compileAdmit(kernel::AdmitOp admit);
   mlir::LogicalResult compileMaterialize(kernel::MaterializeOp materialize);
@@ -645,7 +639,10 @@ private:
   mlir::LogicalResult compileExtract(kernel::ExtractOp operation);
   mlir::LogicalResult compileUnary(kernel::UnaryOp operation);
   mlir::LogicalResult compileCompare(kernel::CompareOp operation);
+  template <typename ConversionOp>
+  mlir::LogicalResult compileCastImpl(ConversionOp operation);
   mlir::LogicalResult compileCast(kernel::CastOp operation);
+  mlir::LogicalResult compileNarrow(kernel::NarrowOp operation);
   mlir::LogicalResult compileWiden(kernel::WidenOp operation);
   mlir::LogicalResult compileReduce(kernel::ReduceOp operation);
   mlir::LogicalResult compileFold2(kernel::Fold2Op operation);
@@ -753,7 +750,6 @@ private:
   llvm::StringMap<std::string> derivedSources;
   llvm::StringMap<int64_t> autoBindings;
   llvm::StringMap<int64_t> axisSymbolIds;
-  llvm::SmallSet<unsigned, 8> writableArguments;
   llvm::DenseMap<int64_t, llvm::SmallVector<PointInfo>> axisScopes;
   llvm::SmallVector<std::string> laneVLStack;
   llvm::SmallVector<llvm::StringMap<std::string>> conversionCaches;
@@ -1531,8 +1527,32 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
 }
 
 mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
+  auto bindConstant = [&](mlir::Attribute value,
+                          mlir::Value result) -> mlir::LogicalResult {
+    std::string expression;
+    llvm::raw_string_ostream stream(expression);
+    value.print(stream);
+    stream.flush();
+    size_t typeMarker = expression.find(" : ");
+    if (typeMarker != std::string::npos)
+      expression.resize(typeMarker);
+    mlir::Type element = riscv_internal::logicalElement(result.getType());
+    if (element.isF32())
+      expression += "f";
+    else if (element.isF16())
+      expression = "((_Float16)(" + expression + "f))";
+    bindings[result] = scalar(expression);
+    return mlir::success();
+  };
   if (auto symbol = mlir::dyn_cast<kernel::SymbolOp>(operation)) {
-    bindings[symbol.getResult()] = scalar(identifier(symbol.getName()));
+    if (symbol.getKind() == "source_auto") {
+      auto binding = autoBindings.find(symbol.getName());
+      if (binding == autoBindings.end())
+        return fail(symbol, "source-auto symbol has no selected binding");
+      bindings[symbol.getResult()] = scalar(std::to_string(binding->second));
+    } else {
+      bindings[symbol.getResult()] = scalar(identifier(symbol.getName()));
+    }
     return mlir::success();
   }
   if (auto root = mlir::dyn_cast<kernel::RootDomainOp>(operation)) {
@@ -1543,36 +1563,45 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return mlir::success();
   }
   if (auto domain = mlir::dyn_cast<kernel::DomainOp>(operation)) {
+    Binding extent = bindings.lookup(domain.getExtent());
+    Binding partition = bindings.lookup(domain.getPartition());
+    Binding multiplicity = bindings.lookup(domain.getMultiplicity());
+    if (extent.kind != Binding::Kind::Scalar ||
+        partition.kind != Binding::Kind::Scalar ||
+        multiplicity.kind != Binding::Kind::Scalar)
+      return fail(domain,
+                  "domain extent, partition, and multiplicity require scalar index values");
     Binding binding;
     binding.kind = Binding::Kind::Domain;
     binding.parentDomain = domain.getParent();
     binding.domainType = domain.getResult().getType();
+    binding.domainExtent = std::move(extent.scalar);
+    binding.domainPartition = std::move(partition.scalar);
+    binding.domainMultiplicity = std::move(multiplicity.scalar);
     bindings[domain.getResult()] = std::move(binding);
     return mlir::success();
   }
-  if (auto constant = mlir::dyn_cast<kernel::ConstantOp>(operation)) {
-    std::string expression;
-    llvm::raw_string_ostream stream(expression);
-    constant.getValue().print(stream);
-    stream.flush();
-    size_t typeMarker = expression.find(" : ");
-    if (typeMarker != std::string::npos)
-      expression.resize(typeMarker);
-    mlir::Type element =
-        riscv_internal::logicalElement(constant.getResult().getType());
-    if (element.isF32())
-      expression += "f";
-    else if (element.isF16())
-      expression = "((_Float16)(" + expression + "f))";
-    bindings[constant.getResult()] = scalar(expression);
+  if (auto constant = mlir::dyn_cast<kernel::ConstantOp>(operation))
+    return bindConstant(constant.getValue(), constant.getResult());
+  if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(operation))
+    return bindConstant(constant.getValue(), constant.getResult());
+  if (auto ceil = mlir::dyn_cast<mlir::arith::CeilDivUIOp>(operation)) {
+    Binding lhs = bindings.lookup(ceil.getLhs());
+    Binding rhs = bindings.lookup(ceil.getRhs());
+    if (lhs.kind != Binding::Kind::Scalar || rhs.kind != Binding::Kind::Scalar)
+      return fail(ceil, "ceildiv operands require scalar index values");
+    bindings[ceil.getResult()] = scalar(
+        "((" + lhs.scalar + " + " + rhs.scalar + " - 1) / " + rhs.scalar + ")");
     return mlir::success();
   }
   if (auto level = mlir::dyn_cast<kernel::LevelOp>(operation))
     return compileLevel(level);
-  if (auto loop = mlir::dyn_cast<kernel::ForOp>(operation))
+  if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(operation))
     return compileFor(loop);
-  if (auto branch = mlir::dyn_cast<kernel::IfOp>(operation))
+  if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(operation))
     return compileIf(branch);
+  if (auto loop = mlir::dyn_cast<mlir::scf::WhileOp>(operation))
+    return compileWhile(loop);
   if (auto slice = mlir::dyn_cast<kernel::SliceOp>(operation))
     return compileSlice(slice);
   if (auto admit = mlir::dyn_cast<kernel::AdmitOp>(operation))
@@ -1593,8 +1622,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileCompare(compare);
   if (auto cast = mlir::dyn_cast<kernel::CastOp>(operation))
     return compileCast(cast);
-  if (auto mac = mlir::dyn_cast<kernel::MacPairsOp>(operation))
-    return compileMac(operation, mac.getLhs(), mac.getRhs(), mac.getGroup());
+  if (auto narrow = mlir::dyn_cast<kernel::NarrowOp>(operation))
+    return compileNarrow(narrow);
   if (auto mac = mlir::dyn_cast<kernel::MacGroupsOp>(operation))
     return compileMac(operation, mac.getLhs(), mac.getRhs(), mac.getGroup());
   if (auto widen = mlir::dyn_cast<kernel::WidenOp>(operation))
@@ -1624,13 +1653,13 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   const Binding &domainBinding = bindings.lookup(level.getDomain());
   kernel::DomainType domain = domainBinding.domainType;
   const int64_t axis = domain.getAxisId();
-  const std::string partition = resolve(domain.getPartition());
+  const std::string partition = domainBinding.domainPartition;
   int64_t physicalExtent = 0;
   if (llvm::StringRef(partition).getAsInteger(10, physicalExtent) ||
       physicalExtent <= 0)
     return fail(level, "selected Level partition is not a positive compile-time integer");
   std::string origin = "0";
-  std::string total = resolve(domain.getExtent());
+  std::string total = domainBinding.domainExtent;
   auto parentScope = axisScopes.find(axis);
   if (parentScope != axisScopes.end() && !parentScope->second.empty()) {
     origin = parentScope->second.back().base;
@@ -1790,9 +1819,9 @@ mlir::LogicalResult Emitter::compileLevel(kernel::LevelOp level) {
   return mlir::success();
 }
 
-mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
-  Binding lower = bindings.lookup(operation.getLower());
-  Binding upper = bindings.lookup(operation.getUpper());
+mlir::LogicalResult Emitter::compileFor(mlir::scf::ForOp operation) {
+  Binding lower = bindings.lookup(operation.getLowerBound());
+  Binding upper = bindings.lookup(operation.getUpperBound());
   Binding step = bindings.lookup(operation.getStep());
   if (lower.kind != Binding::Kind::Scalar ||
       upper.kind != Binding::Kind::Scalar || step.kind != Binding::Kind::Scalar)
@@ -1844,7 +1873,7 @@ mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
        step.scalar + ") {");
   ++indent;
   llvm::SmallVector<Binding, 0> arguments{scalar(iterator)};
-  mlir::Block &body = operation.getBody().front();
+  mlir::Block &body = *operation.getBody();
   for (auto [index, binding] : llvm::enumerate(carried)) {
     mlir::FailureOr<Binding> projected = projectBinding(
         operation.getInitArgs()[index], body.getArgument(index + 1), binding);
@@ -1855,11 +1884,11 @@ mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
   }
   if (mlir::failed(compileBlock(body, arguments)))
     return mlir::failure();
-  auto yield = mlir::cast<kernel::YieldOp>(body.getTerminator());
-  if (yield.getValues().size() != carried.size())
+  auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
+  if (yield.getResults().size() != carried.size())
     return fail(operation,
                 "ordered for yield count does not match its carried state");
-  for (auto [index, nextValue] : llvm::enumerate(yield.getValues())) {
+  for (auto [index, nextValue] : llvm::enumerate(yield.getResults())) {
     Binding &state = carried[index];
     Binding next = bindings.lookup(nextValue);
     if (mlir::failed(assignBinding(
@@ -1881,7 +1910,7 @@ mlir::LogicalResult Emitter::compileFor(kernel::ForOp operation) {
 }
 
 mlir::LogicalResult Emitter::compilePipelinedFor(
-    kernel::ForOp operation, mlir::DictionaryAttr cluster,
+    mlir::scf::ForOp operation, mlir::DictionaryAttr cluster,
     const Binding &lower, const Binding &upper, const Binding &step,
     llvm::SmallVectorImpl<Binding> &carried) {
   auto producerIds = cluster.getAs<mlir::ArrayAttr>("producer_ops");
@@ -1892,7 +1921,7 @@ mlir::LogicalResult Emitter::compilePipelinedFor(
     return fail(operation,
                 "selected local pipeline has no producer/consumer frontier");
 
-  mlir::Block &body = operation.getBody().front();
+  mlir::Block &body = *operation.getBody();
   llvm::SmallPtrSet<mlir::Operation *, 32> producers;
   llvm::SmallPtrSet<mlir::Operation *, 32> consumers;
   auto collectOperations = [&](mlir::ArrayAttr ids,
@@ -1977,11 +2006,11 @@ mlir::LogicalResult Emitter::compilePipelinedFor(
   };
 
   auto updateCarry = [&]() -> mlir::LogicalResult {
-    auto yield = mlir::cast<kernel::YieldOp>(body.getTerminator());
-    if (yield.getValues().size() != carried.size())
+    auto yield = mlir::cast<mlir::scf::YieldOp>(body.getTerminator());
+    if (yield.getResults().size() != carried.size())
       return fail(operation,
                   "pipelined for yield count does not match its carried state");
-    for (auto [index, nextValue] : llvm::enumerate(yield.getValues())) {
+    for (auto [index, nextValue] : llvm::enumerate(yield.getResults())) {
       auto found = bindings.find(nextValue);
       if (found == bindings.end())
         return fail(operation,
@@ -2059,7 +2088,7 @@ mlir::LogicalResult Emitter::compilePipelinedFor(
   return mlir::success();
 }
 
-mlir::LogicalResult Emitter::compileIf(kernel::IfOp operation) {
+mlir::LogicalResult Emitter::compileIf(mlir::scf::IfOp operation) {
   Binding condition = bindings.lookup(operation.getCondition());
   if (condition.kind != Binding::Kind::Scalar)
     return fail(operation, "ordered if requires a selected scalar condition");
@@ -2099,11 +2128,11 @@ mlir::LogicalResult Emitter::compileIf(kernel::IfOp operation) {
     mlir::Block &block = region.front();
     if (mlir::failed(compileBlock(block, {})))
       return mlir::failure();
-    auto yield = mlir::cast<kernel::YieldOp>(block.getTerminator());
-    if (yield.getValues().size() != results.size())
+    auto yield = mlir::cast<mlir::scf::YieldOp>(block.getTerminator());
+    if (yield.getResults().size() != results.size())
       return fail(operation,
                   "ordered if yield count does not match its results");
-    for (auto [index, value] : llvm::enumerate(yield.getValues())) {
+    for (auto [index, value] : llvm::enumerate(yield.getResults())) {
       Binding &target = results[index];
       Binding source = bindings.lookup(value);
       if (mlir::failed(assignBinding(
@@ -2127,6 +2156,78 @@ mlir::LogicalResult Emitter::compileIf(kernel::IfOp operation) {
   line("}");
   for (auto [resultValue, binding] : llvm::zip(operation.getResults(), results))
     bindings[resultValue] = std::move(binding);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileWhile(mlir::scf::WhileOp operation) {
+  llvm::SmallVector<Binding, 0> carried;
+  for (mlir::Value value : operation.getInits()) {
+    mlir::FailureOr<Binding> storage = declareMutableBinding(value, "while_carry");
+    if (mlir::failed(storage))
+      return fail(operation,
+                  "ordered while carry has no mutable scalar/vector representation");
+    Binding source = bindings.lookup(value);
+    if (mlir::failed(assignBinding(
+            operation, value, *storage, value, source,
+            "ordered while initial carry requires an explicit physical conversion")))
+      return mlir::failure();
+    carried.push_back(std::move(*storage));
+  }
+
+  mlir::Block &before = operation.getBefore().front();
+  mlir::Block &after = operation.getAfter().front();
+  line("while (1) {");
+  ++indent;
+  llvm::SmallVector<Binding, 0> beforeArguments;
+  for (auto [index, binding] : llvm::enumerate(carried)) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        operation.getInits()[index], before.getArgument(index), binding);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "ordered while condition carry requires an explicit physical conversion");
+    beforeArguments.push_back(std::move(*projected));
+  }
+  if (mlir::failed(compileBlock(before, beforeArguments)))
+    return mlir::failure();
+  auto condition = mlir::cast<mlir::scf::ConditionOp>(before.getTerminator());
+  Binding predicate = bindings.lookup(condition.getCondition());
+  if (predicate.kind != Binding::Kind::Scalar)
+    return fail(operation, "ordered while condition requires a scalar predicate");
+  line("if (!(" + predicate.scalar + ")) break;");
+
+  llvm::SmallVector<Binding, 0> afterArguments;
+  for (auto [index, value] : llvm::enumerate(condition.getArgs())) {
+    Binding source = bindings.lookup(value);
+    mlir::FailureOr<Binding> projected =
+        projectBinding(value, after.getArgument(index), source);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "ordered while body carry requires an explicit physical conversion");
+    afterArguments.push_back(std::move(*projected));
+  }
+  if (mlir::failed(compileBlock(after, afterArguments)))
+    return mlir::failure();
+  auto yield = mlir::cast<mlir::scf::YieldOp>(after.getTerminator());
+  if (yield.getResults().size() != carried.size())
+    return fail(operation,
+                "ordered while yield count does not match its carried state");
+  for (auto [index, value] : llvm::enumerate(yield.getResults())) {
+    Binding next = bindings.lookup(value);
+    if (mlir::failed(assignBinding(
+            operation, operation.getInits()[index], carried[index], value, next,
+            "ordered while body requires an explicit physical conversion")))
+      return mlir::failure();
+  }
+  --indent;
+  line("}");
+  for (auto [index, result] : llvm::enumerate(operation.getResults())) {
+    mlir::FailureOr<Binding> projected = projectBinding(
+        operation.getInits()[index], result, carried[index]);
+    if (mlir::failed(projected))
+      return fail(operation,
+                  "ordered while result requires an explicit physical conversion");
+    bindings[result] = std::move(*projected);
+  }
   return mlir::success();
 }
 
@@ -2781,27 +2882,35 @@ mlir::LogicalResult Emitter::compileCompare(kernel::CompareOp operation) {
   return mlir::success();
 }
 
-mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
+template <typename ConversionOp>
+mlir::LogicalResult Emitter::compileCastImpl(ConversionOp operation) {
+  mlir::Operation *rawOperation = operation.getOperation();
+  mlir::Value inputValue = operation.getInput();
+  mlir::Value resultValue = operation.getResult();
   mlir::FailureOr<Binding> input = materializeNumeric(
-      operation.getInput(), bindings.lookup(operation.getInput()));
+      inputValue, bindings.lookup(inputValue));
   if (mlir::failed(input))
     return mlir::failure();
   mlir::Type source =
-      riscv_internal::logicalElement(operation.getInput().getType());
+      riscv_internal::logicalElement(inputValue.getType());
   mlir::Type target =
-      riscv_internal::logicalElement(operation.getResult().getType());
+      riscv_internal::logicalElement(resultValue.getType());
   auto targetCType = scalarCType(target);
   if (!targetCType)
     return fail(operation, "cast target has no intrinsic-C type");
-  auto rounding = operation->getAttrOfType<mlir::StringAttr>("rounding");
-  auto saturate = operation->getAttrOfType<mlir::BoolAttr>("saturate");
+  auto rounding = rawOperation->getAttrOfType<mlir::StringAttr>("rounding");
+  auto saturate = rawOperation->getAttrOfType<mlir::BoolAttr>("saturate");
   auto scalarExpression = [&](llvm::StringRef inputExpression)
       -> mlir::FailureOr<std::string> {
     std::string expression = inputExpression.str();
     if (rounding) {
       auto integer = mlir::dyn_cast<mlir::IntegerType>(target);
-      if (!integer)
-        return mlir::failure();
+      if (!integer) {
+        if (!mlir::isa<mlir::FloatType>(target) ||
+            (saturate && saturate.getValue()))
+          return mlir::failure();
+        return "((" + *targetCType + ")(" + expression + "))";
+      }
       const unsigned width = integer.getWidth();
       if (width == 0 || width >= 64)
         return mlir::failure();
@@ -2866,9 +2975,9 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
   }
   if (input->kind != Binding::Kind::Vector)
     return fail(operation, "cast has no selected numeric handoff");
+  mlir::DictionaryAttr operationAssignment = assigned(rawOperation);
   mlir::DictionaryAttr local =
-      assigned(operation.getOperation()).getAs<mlir::DictionaryAttr>(
-          "local_operation");
+      operationAssignment.getAs<mlir::DictionaryAttr>("local_operation");
   llvm::StringRef conversion =
       riscv_internal::string(local, "conversion").value_or("");
   if (!rounding && conversion == "identity") {
@@ -2904,14 +3013,15 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
-  if (!rounding && ((source.isF32() && target.isF16()) ||
-                    (source.isF16() && target.isF32()))) {
-    int64_t sourceLMUL = assigned(operation.getInput())
-                             .getAs<mlir::IntegerAttr>("lmul_eighths")
-                             .getInt();
-    int64_t targetLMUL = assigned(operation.getResult())
-                             .getAs<mlir::IntegerAttr>("lmul_eighths")
-                             .getInt();
+  if ((!rounding || (saturate && !saturate.getValue())) &&
+      ((source.isF32() && target.isF16()) ||
+       (source.isF16() && target.isF32()))) {
+    mlir::DictionaryAttr inputAssignment = assigned(inputValue);
+    mlir::DictionaryAttr resultAssignment = assigned(resultValue);
+    int64_t sourceLMUL =
+        inputAssignment.getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
+    int64_t targetLMUL =
+        resultAssignment.getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
     if ((source.isF32() && sourceLMUL != targetLMUL * 2) ||
         (source.isF16() && targetLMUL != sourceLMUL * 2))
       return fail(operation,
@@ -2943,10 +3053,12 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
   if (!targetInteger || targetInteger.getWidth() != 8)
     return fail(operation,
                 "current vector narrowing implements an eight-bit integer target");
+  mlir::DictionaryAttr inputAssignment = assigned(inputValue);
+  mlir::DictionaryAttr resultAssignment = assigned(resultValue);
   int64_t sourceLMUL =
-      assigned(operation.getInput()).getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
+      inputAssignment.getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
   int64_t targetLMUL =
-      assigned(operation.getResult()).getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
+      resultAssignment.getAs<mlir::IntegerAttr>("lmul_eighths").getInt();
   auto lmul = [](int64_t eighths) {
     if (eighths < 8)
       return std::string("mf") + std::to_string(8 / eighths);
@@ -2993,6 +3105,14 @@ mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileCast(kernel::CastOp operation) {
+  return compileCastImpl(operation);
+}
+
+mlir::LogicalResult Emitter::compileNarrow(kernel::NarrowOp operation) {
+  return compileCastImpl(operation);
 }
 
 mlir::LogicalResult Emitter::compileMac(mlir::Operation &operation,
@@ -4858,12 +4978,8 @@ Emitter::emitQuantDot(kernel::DotOp operation, const Binding &lhs,
        ", " + m32 + ", " + laneVL() + ");");
   --indent;
   line("}");
-  std::string converted = fresh("min_term");
-  line(vectorType(operation.getResult()) + " " + converted +
-       " = __riscv_vfcvt_f_x_v_" + vectorSuffix(operation.getResult()) + "(" +
-       acc + ", " + laneVL() + ");");
   resultBinding.kind = Binding::Kind::Vector;
-  resultBinding.parts.push_back(std::move(converted));
+  resultBinding.parts.push_back(std::move(acc));
   return resultBinding;
 }
 

@@ -76,13 +76,9 @@ EncodingFacts collectEncodingFacts(mlir::ModuleOp module) {
   for (kernel::DeriveOp derive : module.getOps<kernel::DeriveOp>()) {
     result.sourceByDerived[derive.getResultFamily()] =
         derive.getSourceFamily().str();
-    int64_t rows = 0;
-    for (mlir::Attribute attribute : derive.getParameters()) {
-      llvm::StringRef spelling =
-          mlir::cast<mlir::StringAttr>(attribute).getValue();
-      if (spelling.consume_front("rows="))
-        spelling.getAsInteger(10, rows);
-    }
+    int64_t rows = derive.getParameterValues().size() == 1
+                       ? derive.getParameterValues()[0]
+                       : 0;
     if (rows > 0)
       result.rowsByDerived[derive.getResultFamily()] = rows;
   }
@@ -632,8 +628,7 @@ public:
             illegalDetail =
                 "iota has no derived lane or register-tuple representation";
           }
-        } else if (name == "weft_kernel.mac_pairs" ||
-                   name == "weft_kernel.mac_groups") {
+        } else if (name == "weft_kernel.mac_groups") {
           if (targetFlag(problem.getTarget(), "has_widening_integer")) {
             realization = "rvv.vwmaccsu.typed";
             auto operands = operation.getAs<mlir::ArrayAttr>("operands");
@@ -1462,13 +1457,15 @@ public:
           }
         } else if (name == "weft_kernel.fold2") {
           realization = "ordered-pair-fold";
-        } else if (name == "weft_kernel.cast") {
+        } else if (name == "weft_kernel.cast" ||
+                   name == "weft_kernel.narrow") {
           auto operands = operation.getAs<mlir::ArrayAttr>("operands");
           auto results = operation.getAs<mlir::ArrayAttr>("results");
           if (!operands || operands.size() != 1 || !results ||
               results.size() != 1) {
             legal = false;
-            illegalDetail = "numeric cast does not have one input and one result";
+            illegalDetail =
+                "numeric conversion does not have one input and one result";
           } else {
             auto input = values.find(
                 mlir::cast<mlir::StringAttr>(operands[0]).getValue());
@@ -1493,11 +1490,37 @@ public:
                     : source.isF32() && target.isF16()
                           ? "float-narrow"
                           : "numeric-convert";
-            realization = "mapped-cast." + conversion.str();
-            localOperation = riscv_internal::dictionary(
-                builder,
-                {{"conversion", builder.getStringAttr(conversion)},
-                 {"decision_owner", builder.getStringAttr("operation")}});
+            if (name == "weft_kernel.narrow") {
+              auto sourceAttributes =
+                  operation.getAs<mlir::DictionaryAttr>("source_attributes");
+              auto rounding = sourceAttributes
+                                  ? sourceAttributes.getAs<mlir::StringAttr>(
+                                        "rounding")
+                                  : mlir::StringAttr();
+              auto saturate = sourceAttributes
+                                  ? sourceAttributes.getAs<mlir::BoolAttr>(
+                                        "saturate")
+                                  : mlir::BoolAttr();
+              if (!rounding || !saturate) {
+                legal = false;
+                illegalDetail =
+                    "narrow has no explicit rounding and saturation semantics";
+              } else {
+                realization = "mapped-narrow." + conversion.str();
+                localOperation = riscv_internal::dictionary(
+                    builder,
+                    {{"conversion", builder.getStringAttr(conversion)},
+                     {"rounding", rounding},
+                     {"saturate", saturate},
+                     {"decision_owner", builder.getStringAttr("operation")}});
+              }
+            } else {
+              realization = "mapped-cast." + conversion.str();
+              localOperation = riscv_internal::dictionary(
+                  builder,
+                  {{"conversion", builder.getStringAttr(conversion)},
+                   {"decision_owner", builder.getStringAttr("operation")}});
+            }
           }
         } else if (name == "weft_kernel.binary") {
           llvm::StringRef operationId =
@@ -1545,8 +1568,8 @@ public:
           }
         } else if (name == "weft_kernel.unary" || name == "weft_kernel.compare") {
           realization = "mapped-pointwise";
-        } else if (name == "weft_kernel.for" || name == "weft_kernel.if" ||
-                   name == "weft_kernel.while") {
+        } else if (name == "scf.for" || name == "scf.if" ||
+                   name == "scf.while") {
           realization = "ordered-scalar-control";
         } else if (name == "weft_kernel.level") {
           realization = "logical-level";
@@ -1562,6 +1585,20 @@ public:
                 {{"storage", builder.getStringAttr("register-or-rematerialized")},
                  {"decision_owner", builder.getStringAttr("operation")}});
           }
+        } else if (name == "weft_kernel.root_domain" ||
+                   name == "weft_kernel.symbol" ||
+                   name == "weft_kernel.domain" ||
+                   name == "weft_kernel.births_yield" ||
+                   name == "weft_kernel.handoff" ||
+                   name == "weft_kernel.return" ||
+                   name == "weft_kernel.constant" ||
+                   name == "weft_kernel.slice" ||
+                   name == "arith.constant" || name == "arith.ceildivui" ||
+                   name == "scf.yield" || name == "scf.condition") {
+          realization = "canonical-structural";
+        } else {
+          legal = false;
+          illegalDetail = "operation is not part of the canonical-to-RISC-V contract";
         }
 
         if (name == "weft_kernel.outer_contract" &&

@@ -16,6 +16,8 @@ add_library(WeftRISCVTarget STATIC
 target_link_libraries(WeftRISCVTarget PUBLIC
   WeftKernelDialect
   WeftRISCVDialect
+  MLIRArithDialect
   MLIRIR
   MLIRPass
+  MLIRSCFDialect
 )

@@ -1,15 +1,21 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include <limits>
+#include <functional>
 
 using namespace weft::kernel;
 
@@ -35,6 +41,21 @@ bool isViewLike(mlir::Type type) {
 
 bool isLocalValue(mlir::Type type) {
   return isScalar(type) || isEncoding(type) || mlir::isa<ValueType>(type);
+}
+
+bool isCanonicalNumericElement(mlir::Type type) {
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+    return integer.getWidth() == 1 || !integer.isSignless();
+  return type.isIndex() || mlir::isa<mlir::FloatType>(type);
+}
+
+bool isCanonicalProgramType(mlir::Type type) {
+  if (isCanonicalNumericElement(type))
+    return true;
+  if (auto value = mlir::dyn_cast<ValueType>(type))
+    return isEncoding(value.getElementType()) ||
+           isCanonicalNumericElement(value.getElementType());
+  return mlir::isa<EncodingType, ViewType, SliceType, DomainType, PointType>(type);
 }
 
 mlir::Type logicalElement(mlir::Type type) {
@@ -86,6 +107,118 @@ std::optional<unsigned> bitWidth(mlir::Type type) {
   return std::nullopt;
 }
 
+std::string denseFamilyFor(mlir::Type type) {
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type)) {
+    llvm::StringRef prefix = integer.isUnsigned() ? "u" : "i";
+    return (prefix + llvm::Twine(integer.getWidth())).str();
+  }
+  if (type.isBF16())
+    return "bf16";
+  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type))
+    return ("f" + llvm::Twine(floating.getWidth())).str();
+  return {};
+}
+
+EncodingDeclOp findEncodingDeclaration(mlir::Operation *operation,
+                                       llvm::StringRef family) {
+  EncodingDeclOp result;
+  if (auto module = operation->getParentOfType<mlir::ModuleOp>())
+    module.walk([&](EncodingDeclOp declaration) {
+      if (!result && declaration.getSymName() == family)
+        result = declaration;
+    });
+  return result;
+}
+
+mlir::LogicalResult verifyEncodingReference(mlir::Operation *operation,
+                                            EncodingType encoding) {
+  if (encoding.getKind() == "dense") {
+    if (encoding.getLayoutIdentity() !=
+        ("dense." + encoding.getFamily()).str()) {
+      operation->emitOpError()
+          << "dense Encoding layout identity must be dense.<family>";
+      return mlir::failure();
+    }
+    return mlir::success();
+  }
+
+  auto module = operation->getParentOfType<mlir::ModuleOp>();
+  if (!module) {
+    operation->emitOpError("Encoding reference must belong to one module");
+    return mlir::failure();
+  }
+  if (encoding.getKind() == "base") {
+    unsigned matches = 0;
+    module.walk([&](EncodingDeclOp declaration) {
+      if (declaration.getSymName() == encoding.getFamily() &&
+          declaration.getLayoutIdentity() == encoding.getLayoutIdentity())
+        ++matches;
+    });
+    if (matches != 1) {
+      operation->emitOpError()
+          << "base Encoding must resolve to exactly one declaration with the "
+             "same family and pinned layout identity";
+      return mlir::failure();
+    }
+    return mlir::success();
+  }
+  if (encoding.getKind() == "derived_instance") {
+    unsigned matches = 0;
+    module.walk([&](DeriveOp derive) {
+      if (derive.getResultFamily() == encoding.getFamily() &&
+          derive.getLayoutIdentity() == encoding.getLayoutIdentity() &&
+          derive.getParameterValues() == encoding.getParameters().asArrayRef())
+        ++matches;
+    });
+    if (matches != 1) {
+      operation->emitOpError()
+          << "derived Encoding instance must resolve to exactly one derive "
+             "builder with the same family, parameters, and pinned identity";
+      return mlir::failure();
+    }
+    return mlir::success();
+  }
+  operation->emitOpError(
+      "abstract derived Encoding family cannot appear in a runtime program type");
+  return mlir::failure();
+}
+
+mlir::LogicalResult verifyEncodingInType(mlir::Operation *operation,
+                                         mlir::Type type) {
+  if (auto view = mlir::dyn_cast<ViewType>(type))
+    return verifyEncodingReference(
+        operation, mlir::cast<EncodingType>(view.getEncoding()));
+  if (auto slice = mlir::dyn_cast<SliceType>(type))
+    return verifyEncodingReference(
+        operation, mlir::cast<EncodingType>(slice.getEncoding()));
+  if (auto value = mlir::dyn_cast<ValueType>(type)) {
+    if (auto encoding = mlir::dyn_cast<EncodingType>(value.getElementType()))
+      return verifyEncodingReference(operation, encoding);
+    return mlir::success();
+  }
+  if (auto encoding = mlir::dyn_cast<EncodingType>(type))
+    return verifyEncodingReference(operation, encoding);
+  return mlir::success();
+}
+
+llvm::StringRef baseFamilyFor(mlir::Operation *operation,
+                              EncodingType encoding) {
+  if (encoding.getKind() == "base")
+    return encoding.getFamily();
+  if (encoding.getKind() != "derived_instance")
+    return {};
+  llvm::StringRef source;
+  if (auto module = operation->getParentOfType<mlir::ModuleOp>())
+    module.walk([&](DeriveOp derive) {
+      if (source.empty() && derive.getResultFamily() == encoding.getFamily() &&
+          derive.getLayoutIdentity() == encoding.getLayoutIdentity() &&
+          derive.getParameterValues() ==
+              encoding.getParameters().asArrayRef())
+        source = derive.getSourceFamily();
+    });
+  return source;
+}
+
 mlir::LogicalResult verifyShape(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::ArrayRef<int64_t> shape, llvm::ArrayRef<int64_t> axes,
@@ -121,44 +254,143 @@ mlir::LogicalResult verifyPointwise(mlir::Operation *operation,
                                     mlir::Type result) {
   if (!isLocalValue(lhs) || !isLocalValue(rhs) || !isLocalValue(result))
     return operation->emitOpError("pointwise operands must be local Values");
+  if (!isNumeric(lhs) || !isNumeric(rhs) || !isNumeric(result))
+    return operation->emitOpError("pointwise operands and result must be numeric");
   if (logicalElement(lhs) != logicalElement(rhs))
     return operation->emitOpError("pointwise element types must match");
   if (logicalElement(result) != logicalElement(lhs))
     return operation->emitOpError("pointwise result element type must match");
-  llvm::DenseSet<int64_t> axes;
-  for (int64_t axis : logicalAxes(lhs))
-    axes.insert(axis);
+  llvm::SmallVector<int64_t> expectedAxes(logicalAxes(lhs));
   for (int64_t axis : logicalAxes(rhs))
-    axes.insert(axis);
-  if (axes.size() != logicalAxes(result).size())
-    return operation->emitOpError("pointwise result must preserve the union of axes");
-  for (int64_t axis : logicalAxes(result))
-    if (!axes.contains(axis))
-      return operation->emitOpError("pointwise result contains an unrelated axis");
+    if (!llvm::is_contained(expectedAxes, axis))
+      expectedAxes.push_back(axis);
+  if (!llvm::equal(expectedAxes, logicalAxes(result)))
+    return operation->emitOpError(
+        "pointwise result axes must follow lhs order then rhs-only axes");
   for (auto [axis, extent] : llvm::zip(logicalAxes(result), logicalShape(result))) {
+    std::optional<int64_t> expectedExtent;
     for (mlir::Type operand : {lhs, rhs}) {
       auto operandAxes = logicalAxes(operand);
       auto found = llvm::find(operandAxes, axis);
       if (found == operandAxes.end())
         continue;
       size_t position = static_cast<size_t>(found - operandAxes.begin());
-      if (logicalShape(operand)[position] != extent)
+      int64_t operandExtent = logicalShape(operand)[position];
+      if (!expectedExtent || *expectedExtent == 1)
+        expectedExtent = operandExtent;
+      else if (operandExtent != 1 && operandExtent != *expectedExtent)
         return operation->emitOpError(
             "pointwise operands disagree on a shared logical axis extent");
     }
+    if (!expectedExtent || extent != *expectedExtent)
+      return operation->emitOpError(
+          "pointwise result extent must equal its broadcast operand extent");
   }
   return mlir::success();
 }
 
-mlir::LogicalResult verifyControlYield(mlir::Operation *owner,
-                                       mlir::Block &block,
-                                       mlir::TypeRange expected) {
-  auto yield = mlir::dyn_cast<YieldOp>(block.getTerminator());
-  if (!yield)
-    return owner->emitOpError("control region must end in weft_kernel.yield");
-  if (yield.getValues().getTypes() != expected)
-    return owner->emitOpError("control yield types must match operation results");
+mlir::LogicalResult verifyProjection(mlir::Operation *operation,
+                                     mlir::Type base,
+                                     mlir::ValueRange indices,
+                                     mlir::ArrayAttr selectors,
+                                     mlir::Type projected,
+                                     bool allowGather) {
+  if (selectors.size() > logicalAxes(base).size())
+    return operation->emitOpError("projection has more selectors than input axes");
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  size_t indexCursor = 0;
+  constexpr int64_t dynamicProjection = std::numeric_limits<int64_t>::min();
+  for (size_t position = 0; position < logicalAxes(base).size(); ++position) {
+    llvm::StringRef selector =
+        position < selectors.size()
+            ? mlir::dyn_cast<mlir::StringAttr>(selectors[position]).getValue()
+            : llvm::StringRef("all");
+    if (selector == "all") {
+      expectedAxes.push_back(logicalAxes(base)[position]);
+      expectedShape.push_back(logicalShape(base)[position]);
+      continue;
+    }
+    if (indexCursor >= indices.size())
+      return operation->emitOpError(
+          "projection selector has no corresponding index operand");
+    mlir::Value index = indices[indexCursor++];
+    if (selector == "domain" || selector == "group_index") {
+      auto point = mlir::dyn_cast<PointType>(index.getType());
+      if (!point || point.getDomain().getAxisId() != logicalAxes(base)[position])
+        return operation->emitOpError(
+            "level projection point must select the corresponding logical axis");
+      if (selector == "domain") {
+        expectedAxes.push_back(logicalAxes(base)[position]);
+        expectedShape.push_back(dynamicProjection);
+      }
+      continue;
+    }
+    if (selector == "index") {
+      if (!index.getType().isIndex())
+        return operation->emitOpError("scalar projection index must have index type");
+      continue;
+    }
+    if (selector != "gather" || !allowGather)
+      return operation->emitOpError("unknown or disallowed projection selector");
+    auto gather = mlir::dyn_cast<ValueType>(index.getType());
+    auto integer = gather
+                       ? mlir::dyn_cast<mlir::IntegerType>(gather.getElementType())
+                       : mlir::IntegerType();
+    if (!integer || integer.isSigned())
+      return operation->emitOpError(
+          "gather projection requires shaped unsigned indices");
+    for (auto [axis, extent] : llvm::zip(gather.getAxisIds().asArrayRef(),
+                                        gather.getShape().asArrayRef())) {
+      auto found = llvm::find(expectedAxes, axis);
+      if (found == expectedAxes.end()) {
+        expectedAxes.push_back(axis);
+        expectedShape.push_back(extent);
+      } else if (expectedShape[static_cast<size_t>(found - expectedAxes.begin())] !=
+                 extent) {
+        return operation->emitOpError(
+            "gather projection disagrees on a shared logical axis extent");
+      }
+    }
+  }
+  if (indexCursor != indices.size() ||
+      !llvm::equal(expectedAxes, logicalAxes(projected)) ||
+      expectedShape.size() != logicalShape(projected).size())
+    return operation->emitOpError(
+        "projection operands and result logical axes do not match");
+  for (auto [expected, actual] : llvm::zip(expectedShape, logicalShape(projected)))
+    if (expected != dynamicProjection && expected != actual)
+      return operation->emitOpError(
+          "projection result has an incorrect logical extent");
   return mlir::success();
+}
+
+mlir::Type promotedElement(mlir::Type lhs, mlir::Type rhs) {
+  lhs = logicalElement(lhs);
+  rhs = logicalElement(rhs);
+  auto lhsFloat = mlir::dyn_cast<mlir::FloatType>(lhs);
+  auto rhsFloat = mlir::dyn_cast<mlir::FloatType>(rhs);
+  if (lhsFloat || rhsFloat) {
+    unsigned width = std::max(lhsFloat ? lhsFloat.getWidth() : 0u,
+                              rhsFloat ? rhsFloat.getWidth() : 0u);
+    if (width > 32)
+      return mlir::Float64Type::get(lhs.getContext());
+    return mlir::Float32Type::get(lhs.getContext());
+  }
+  auto lhsInteger = mlir::dyn_cast<mlir::IntegerType>(lhs);
+  auto rhsInteger = mlir::dyn_cast<mlir::IntegerType>(rhs);
+  if (!lhsInteger || !rhsInteger || lhsInteger.isSignless() ||
+      rhsInteger.isSignless())
+    return {};
+  unsigned width = std::max(lhsInteger.getWidth(), rhsInteger.getWidth());
+  for (unsigned candidate : {8u, 16u, 32u, 64u})
+    if (width <= candidate) {
+      auto signedness = lhsInteger.isSigned() || rhsInteger.isSigned()
+                            ? mlir::IntegerType::Signed
+                            : mlir::IntegerType::Unsigned;
+      return mlir::IntegerType::get(lhs.getContext(), candidate, signedness);
+    }
+  return {};
 }
 
 mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
@@ -169,6 +401,8 @@ mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
   if (!isLocalValue(lhs.getType()) || !isLocalValue(rhs.getType()) ||
       !isLocalValue(result))
     return operation->emitOpError("contraction operands must be local Values");
+  if (!isNumeric(lhs.getType()) || !isNumeric(rhs.getType()) || !isNumeric(result))
+    return operation->emitOpError("contraction operands and result must be numeric");
   if (over.empty())
     return operation->emitOpError("contraction requires at least one reduction axis");
   llvm::DenseSet<int64_t> reduction;
@@ -179,20 +413,49 @@ mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
       return operation->emitOpError(
           "each contraction axis must occur once in both operands");
   }
-  llvm::DenseSet<int64_t> expected;
+  for (int64_t axis : logicalAxes(lhs.getType())) {
+    auto rhsAxes = logicalAxes(rhs.getType());
+    auto found = llvm::find(rhsAxes, axis);
+    if (found == rhsAxes.end())
+      continue;
+    size_t lhsPosition = static_cast<size_t>(
+        llvm::find(logicalAxes(lhs.getType()), axis) - logicalAxes(lhs.getType()).begin());
+    size_t rhsPosition = static_cast<size_t>(found - rhsAxes.begin());
+    if (logicalShape(lhs.getType())[lhsPosition] !=
+        logicalShape(rhs.getType())[rhsPosition])
+      return operation->emitOpError(
+          "contraction operands disagree on a shared logical axis extent");
+  }
+  llvm::SmallVector<int64_t> expected;
   for (int64_t axis : logicalAxes(lhs.getType()))
     if (!reduction.contains(axis))
-      expected.insert(axis);
+      expected.push_back(axis);
   for (int64_t axis : logicalAxes(rhs.getType()))
-    if (!reduction.contains(axis))
-      expected.insert(axis);
-  if (expected.size() != logicalAxes(result).size())
-    return operation->emitOpError("contraction result has the wrong free axes");
-  for (int64_t axis : logicalAxes(result))
-    if (!expected.contains(axis))
-      return operation->emitOpError("contraction result contains an unrelated axis");
-  if (accType && logicalElement(result) != *accType)
-    return operation->emitOpError("acc_type must equal the result element type");
+    if (!reduction.contains(axis) && !llvm::is_contained(expected, axis))
+      expected.push_back(axis);
+  if (!llvm::equal(expected, logicalAxes(result)))
+    return operation->emitOpError(
+        "contraction result axes must follow lhs free axes then rhs-only free axes");
+  for (auto [axis, extent] : llvm::zip(logicalAxes(result), logicalShape(result))) {
+    auto lhsAxes = logicalAxes(lhs.getType());
+    auto lhsPosition = llvm::find(lhsAxes, axis);
+    auto rhsAxes = logicalAxes(rhs.getType());
+    auto rhsPosition = llvm::find(rhsAxes, axis);
+    int64_t expectedExtent =
+        lhsPosition != lhsAxes.end()
+            ? logicalShape(lhs.getType())[static_cast<size_t>(lhsPosition -
+                                                             lhsAxes.begin())]
+            : logicalShape(rhs.getType())[static_cast<size_t>(rhsPosition -
+                                                             rhsAxes.begin())];
+    if (extent != expectedExtent)
+      return operation->emitOpError(
+          "contraction result extent must follow its free operand axis");
+  }
+  mlir::Type expectedElement =
+      accType ? *accType : promotedElement(lhs.getType(), rhs.getType());
+  if (!expectedElement || logicalElement(result) != expectedElement)
+    return operation->emitOpError(
+        "contraction result element must match acc_type or canonical promotion");
   return mlir::success();
 }
 
@@ -201,7 +464,7 @@ mlir::LogicalResult verifyContractLike(mlir::Operation *operation,
 mlir::LogicalResult EncodingType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::StringRef family, llvm::StringRef kind,
-    llvm::StringRef layoutIdentity) {
+    llvm::StringRef layoutIdentity, mlir::DenseI64ArrayAttr parameters) {
   if (family.empty())
     return emitError() << "encoding family must not be empty";
   if (kind != "base" && kind != "dense" && kind != "derived_family" &&
@@ -212,6 +475,16 @@ mlir::LogicalResult EncodingType::verify(
     return emitError() << "concrete encoding requires a layout identity";
   if (kind == "derived_family" && !layoutIdentity.empty())
     return emitError() << "abstract derived encoding cannot carry a layout identity";
+  if ((kind == "base" || kind == "dense" || kind == "derived_family") &&
+      !parameters.empty())
+    return emitError() << "only a concrete derived encoding carries static parameters";
+  if (kind == "derived_instance") {
+    if (parameters.empty())
+      return emitError() << "derived instance requires static parameters";
+    if (llvm::any_of(parameters.asArrayRef(),
+                     [](int64_t value) { return value <= 0; }))
+      return emitError() << "derived encoding parameters must be positive";
+  }
   return mlir::success();
 }
 
@@ -228,7 +501,7 @@ mlir::LogicalResult ValueType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     mlir::Type elementType, mlir::DenseI64ArrayAttr shape,
     mlir::DenseI64ArrayAttr axisIds) {
-  if (!isScalar(elementType) && !isEncoding(elementType))
+  if (!isCanonicalNumericElement(elementType) && !isEncoding(elementType))
     return emitError() << "Value element must be numeric or encoded";
   return verifyShape(emitError, shape.asArrayRef(), axisIds.asArrayRef(), false);
 }
@@ -244,17 +517,21 @@ mlir::LogicalResult SliceType::verify(
 
 mlir::LogicalResult DomainType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-    llvm::StringRef axisName, int64_t axisId, llvm::StringRef relation,
-    llvm::StringRef extent, llvm::StringRef partition,
-    llvm::StringRef multiplicity, llvm::StringRef tail) {
-  if (axisName.empty() || extent.empty() || partition.empty() ||
-      multiplicity.empty())
-    return emitError() << "domain fields must not be empty";
+    llvm::StringRef axisName, int64_t domainId, int64_t parentDomainId,
+    int64_t axisId, llvm::StringRef relation, llvm::StringRef tail) {
+  if (axisName.empty())
+    return emitError() << "domain axis name must not be empty";
   if (relation != "root" && relation != "rows" && relation != "cols" &&
       relation != "tiles" && relation != "blocks" && relation != "subs")
     return emitError() << "unknown level relation";
-  if ((relation == "root") != (axisId == 0))
-    return emitError() << "only the root domain has axis identity zero";
+  if (relation == "root") {
+    if (domainId != 0 || parentDomainId != -1 || axisId != 0)
+      return emitError()
+             << "root domain has id zero, no parent, and axis identity zero";
+  } else if (domainId <= 0 || parentDomainId < 0 || axisId <= 0) {
+    return emitError()
+           << "child domain has positive domain/axis identities and a parent";
+  }
   if (tail != "exact" && tail != "tail")
     return emitError() << "domain tail must be exact or tail";
   return mlir::success();
@@ -271,6 +548,9 @@ mlir::LogicalResult PointType::verify(
 mlir::LogicalResult EncodingDeclOp::verify() {
   if (getKind() != "base")
     return emitOpError("encoding declaration must define a base layout");
+  if (getLayoutIdentity() != getSymName())
+    return emitOpError(
+        "base Encoding layout identity must equal its declared family symbol");
   if (getBitOrder() != "lsb_first" && getBitOrder() != "msb_first")
     return emitOpError("bit_order must be lsb_first or msb_first");
   if (getByteOrder() != "little" && getByteOrder() != "big")
@@ -280,6 +560,8 @@ mlir::LogicalResult EncodingDeclOp::verify() {
   if (failed(verifyStringArray(*this, getFieldNames(), "field_names")))
     return mlir::failure();
   const size_t count = getFieldNames().size();
+  if (count == 0)
+    return emitOpError("encoding declaration requires at least one field");
   if (getFieldTypes().size() != count || getFieldShapes().size() != count ||
       getFieldLayouts().size() != count ||
       getFieldBitOffsets().size() != count ||
@@ -290,14 +572,28 @@ mlir::LogicalResult EncodingDeclOp::verify() {
   int64_t joinedWidth = 0;
   int64_t joinedFields = 0;
   int64_t joinedNextRole = 0;
+  int64_t joinedSize = 0;
+  int64_t joinedLowBits = 0;
+  std::string joinedOrder;
   llvm::SmallVector<std::pair<int64_t, int64_t>> spans;
+  llvm::DenseSet<llvm::StringRef> fieldNames;
   for (size_t index = 0; index < count; ++index) {
+    llvm::StringRef fieldName =
+        mlir::cast<mlir::StringAttr>(getFieldNames()[index]).getValue();
+    if (fieldName.empty() || !fieldNames.insert(fieldName).second)
+      return emitOpError("encoding field names must be non-empty and unique");
     auto typeAttr = mlir::dyn_cast<mlir::TypeAttr>(getFieldTypes()[index]);
     auto shapeAttr =
         mlir::dyn_cast<mlir::DenseI64ArrayAttr>(getFieldShapes()[index]);
     auto layouts = mlir::dyn_cast<mlir::ArrayAttr>(getFieldLayouts()[index]);
-    if (!typeAttr || !shapeAttr || !layouts || layouts.empty())
+    if (!typeAttr || !shapeAttr || !layouts || layouts.empty() ||
+        llvm::any_of(shapeAttr.asArrayRef(),
+                     [](int64_t extent) { return extent <= 0; }))
       return emitOpError("field_types and field_shapes have invalid elements");
+    if (!isCanonicalNumericElement(typeAttr.getValue()) ||
+        typeAttr.getValue().isIndex())
+      return emitOpError(
+          "encoding fields require fixed-width signed, unsigned, or floating elements");
     auto kind = [](mlir::Attribute attribute) -> llvm::StringRef {
       auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
       auto value = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
@@ -309,6 +605,14 @@ mlir::LogicalResult EncodingDeclOp::verify() {
     if (kind(layouts[0]) == "natural") {
       if (layouts.size() != 1)
         return emitOpError("natural field layout cannot be combined");
+      auto width = bitWidth(typeAttr.getValue());
+      int64_t elements = 1;
+      for (int64_t extent : shapeAttr.asArrayRef())
+        elements *= extent;
+      if (!width || getFieldStorageBits()[index] !=
+                        static_cast<int64_t>(*width) * elements)
+        return emitOpError(
+            "natural field storage width must match its typed logical shape");
     } else if (kind(layouts[0]) == "joined") {
       if (layouts.size() != 1)
         return emitOpError("joined field layout cannot be combined");
@@ -330,6 +634,11 @@ mlir::LogicalResult EncodingDeclOp::verify() {
         return emitOpError("invalid joined field layout");
       joinedRole = role.getInt();
       sharedJoined = true;
+      const int64_t expectedStorage =
+          group.getInt() * (fields.getInt() + 1) * 8;
+      if (getFieldStorageBits()[index] != expectedStorage)
+        return emitOpError(
+            "joined field storage span must be uniquely implied by its layout");
     } else {
       if (layouts.size() != 2 || kind(layouts[0]) != "grouped" ||
           kind(layouts[1]) != "layered")
@@ -351,10 +660,14 @@ mlir::LogicalResult EncodingDeclOp::verify() {
           integer.getWidth() * (group.getInt() / layer.getInt()) != 8)
         return emitOpError(
             "grouped/layered field must form one byte per layer position");
+      if (getFieldStorageBits()[index] !=
+          integer.getWidth() * shapeAttr[0])
+        return emitOpError(
+            "grouped/layered field storage span must match its complete logical field");
     }
     int64_t offset = getFieldBitOffsets()[index];
     int64_t width = getFieldStorageBits()[index];
-    if (width <= 0 || offset + width > getStorageBits())
+    if (offset < 0 || width <= 0 || offset + width > getStorageBits())
       return emitOpError("encoding fields overlap or exceed storage_bits");
     if (sharedJoined) {
       auto joined = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
@@ -366,10 +679,18 @@ mlir::LogicalResult EncodingDeclOp::verify() {
         joinedWidth = width;
         joinedFields = fields;
         joinedNextRole = 1;
+        joinedSize = joined.getAs<mlir::IntegerAttr>("size").getInt();
+        joinedLowBits = joined.getAs<mlir::IntegerAttr>("low_bits").getInt();
+        joinedOrder = joined.getAs<mlir::StringAttr>("order").getValue().str();
         previousEnd = offset + width;
         spans.emplace_back(offset, offset + width);
       } else if (offset != joinedOffset || width != joinedWidth ||
-                 fields != joinedFields || joinedRole != joinedNextRole++) {
+                 fields != joinedFields || joinedRole != joinedNextRole++ ||
+                 joined.getAs<mlir::IntegerAttr>("size").getInt() != joinedSize ||
+                 joined.getAs<mlir::IntegerAttr>("low_bits").getInt() !=
+                     joinedLowBits ||
+                 joined.getAs<mlir::StringAttr>("order").getValue() !=
+                     joinedOrder) {
         return emitOpError(
             "joined logical fields must be consecutive roles over one storage span");
       }
@@ -414,23 +735,44 @@ mlir::LogicalResult DeriveOp::verify() {
   if (getSourceFamily().empty() || getResultFamily().empty() ||
       getSourceFamily() == getResultFamily())
     return emitOpError("derive requires distinct source and result families");
-  if (failed(verifyStringArray(*this, getParameters(), "parameters")))
+  if (getLayoutIdentity().empty() ||
+      failed(verifyStringArray(*this, getParameterNames(), "parameter_names")))
     return mlir::failure();
+  if (getParameterNames().size() != getParameterValues().size() ||
+      getParameterNames().empty())
+    return emitOpError(
+        "derive requires one typed value for every static parameter name");
+  llvm::DenseSet<llvm::StringRef> parameterNames;
+  for (auto [nameAttr, value] :
+       llvm::zip(getParameterNames(), getParameterValues())) {
+    llvm::StringRef name = mlir::cast<mlir::StringAttr>(nameAttr).getValue();
+    if (name.empty() || !parameterNames.insert(name).second || value <= 0)
+      return emitOpError(
+          "derive parameter names are unique and values are positive");
+  }
   mlir::Block &body = getBody().front();
   if (body.getNumArguments() != 1 || !mlir::isa<ViewType>(body.getArgument(0).getType()))
     return emitOpError("derive body takes one source View");
   auto source = mlir::cast<ViewType>(body.getArgument(0).getType()).getEncoding();
-  if (mlir::cast<EncodingType>(source).getFamily() != getSourceFamily())
+  auto sourceEncoding = mlir::cast<EncodingType>(source);
+  if (sourceEncoding.getKind() != "base" ||
+      sourceEncoding.getFamily() != getSourceFamily())
     return emitOpError("derive source View family does not match source_family");
+  if (failed(verifyEncodingReference(*this, sourceEncoding)))
+    return mlir::failure();
   auto yield = mlir::dyn_cast<DeriveYieldOp>(body.getTerminator());
   if (!yield)
     return emitOpError("derive body must end in derive_yield");
   auto resultEncoding = yield.getValue().getType().getEncoding();
   auto result = mlir::cast<EncodingType>(resultEncoding);
   if (result.getKind() != "derived_instance" ||
-      result.getFamily() != getResultFamily() || result.getLayoutIdentity().empty())
+      result.getFamily() != getResultFamily() ||
+      result.getLayoutIdentity() != getLayoutIdentity() ||
+      result.getParameters().asArrayRef() != getParameterValues())
     return emitOpError(
         "derive result must be one concrete instance of its derived encoding family");
+  if (failed(verifyEncodingReference(*this, result)))
+    return mlir::failure();
   return mlir::success();
 }
 
@@ -442,13 +784,153 @@ mlir::LogicalResult DeriveYieldOp::verify() {
 
 mlir::LogicalResult KernelOp::verify() {
   mlir::Block &body = getBody().front();
-  if (getArgNames().size() != body.getNumArguments())
-    return emitOpError("arg_names must match kernel entry arguments");
+  if (getArgNames().size() != body.getNumArguments() ||
+      getArgAccess().size() != body.getNumArguments() ||
+      getArgAliasSets().size() != body.getNumArguments())
+    return emitOpError(
+        "argument names, access, and alias sets must match kernel entry arguments");
   if (failed(verifyStringArray(*this, getArgNames(), "arg_names")) ||
+      failed(verifyStringArray(*this, getArgAccess(), "arg_access")) ||
       failed(verifyStringArray(*this, getShapeSymbols(), "shape_symbols")))
     return mlir::failure();
+  llvm::DenseSet<llvm::StringRef> names;
+  for (auto [index, nameAttr] : llvm::enumerate(getArgNames())) {
+    llvm::StringRef name = mlir::cast<mlir::StringAttr>(nameAttr).getValue();
+    if (name.empty() || !names.insert(name).second)
+      return emitOpError("kernel argument names must be non-empty and unique");
+    llvm::StringRef access =
+        mlir::cast<mlir::StringAttr>(getArgAccess()[index]).getValue();
+    mlir::Type type = body.getArgument(index).getType();
+    if (access != "none" && access != "read" && access != "write" &&
+        access != "readwrite")
+      return emitOpError("unknown kernel argument access mode");
+    if (mlir::isa<ViewType>(type)) {
+      if (getArgAliasSets()[index] < 0)
+        return emitOpError("View argument requires a non-negative alias set");
+    } else if (access != "none" || getArgAliasSets()[index] != -1) {
+      return emitOpError(
+          "scalar argument has no View access effect or alias set");
+    }
+  }
   if (!mlir::isa<ReturnOp>(body.getTerminator()))
     return emitOpError("kernel body must end in weft_kernel.return");
+
+  bool typeFailure = false;
+  auto verifyTypes = [&](mlir::Operation *owner, mlir::Block &block) {
+    for (mlir::BlockArgument argument : block.getArguments()) {
+      if (!isCanonicalProgramType(argument.getType())) {
+        owner->emitOpError(
+            "region argument type is outside the canonical Weft type set");
+        typeFailure = true;
+      } else if (failed(verifyEncodingInType(owner, argument.getType()))) {
+        typeFailure = true;
+      }
+    }
+  };
+  verifyTypes(*this, body);
+  getBody().walk([&](mlir::Operation *operation) {
+    llvm::StringRef name = operation->getName().getStringRef();
+    const bool standardCanonical =
+        name == "arith.constant" || name == "arith.ceildivui" ||
+        name == "scf.for" || name == "scf.if" || name == "scf.while" ||
+        name == "scf.yield" || name == "scf.condition";
+    if (operation->getDialect() != getOperation()->getDialect() &&
+        !standardCanonical) {
+      operation->emitOpError(
+          "operation is outside the canonical Weft/arith/SCF contract");
+      typeFailure = true;
+    }
+    for (mlir::Value operand : operation->getOperands())
+      if (!isCanonicalProgramType(operand.getType())) {
+        operation->emitOpError("operand type is outside the canonical Weft type set");
+        typeFailure = true;
+      }
+    for (mlir::Value result : operation->getResults())
+      if (!isCanonicalProgramType(result.getType())) {
+        operation->emitOpError("result type is outside the canonical Weft type set");
+        typeFailure = true;
+      } else if (failed(verifyEncodingInType(operation, result.getType())))
+        typeFailure = true;
+    for (mlir::Region &region : operation->getRegions())
+      for (mlir::Block &nested : region)
+        verifyTypes(operation, nested);
+  });
+  if (typeFailure)
+    return mlir::failure();
+
+  llvm::DenseSet<int64_t> domainIds;
+  unsigned roots = 0;
+  getBody().walk([&](mlir::Operation *operation) {
+    if (auto root = mlir::dyn_cast<RootDomainOp>(operation)) {
+      ++roots;
+      domainIds.insert(root.getResult().getType().getDomainId());
+      return;
+    }
+    if (auto domain = mlir::dyn_cast<DomainOp>(operation)) {
+      if (!domainIds.insert(domain.getResult().getType().getDomainId()).second) {
+        domain.emitOpError("domain identity must be unique within one kernel");
+        typeFailure = true;
+      }
+      return;
+    }
+    if (auto level = mlir::dyn_cast<LevelOp>(operation))
+      if (!level.getDomain().getDefiningOp<DomainOp>()) {
+        level.emitOpError("Level domain must be produced by a canonical domain op");
+        typeFailure = true;
+      }
+  });
+  if (roots != 1) {
+    emitOpError("kernel must contain exactly one canonical root domain");
+    return mlir::failure();
+  }
+  if (typeFailure)
+    return mlir::failure();
+
+  auto rootArgument = [&](mlir::Value value) -> std::optional<unsigned> {
+    while (mlir::Operation *producer = value.getDefiningOp()) {
+      if (auto slice = mlir::dyn_cast<SliceOp>(producer)) {
+        value = slice.getBase();
+        continue;
+      }
+      if (auto field = mlir::dyn_cast<FieldOp>(producer)) {
+        value = field.getOwner();
+        continue;
+      }
+      return std::nullopt;
+    }
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+    if (!argument || argument.getOwner() != &body)
+      return std::nullopt;
+    return argument.getArgNumber();
+  };
+  getBody().walk([&](mlir::Operation *operation) {
+    mlir::Value region;
+    llvm::StringRef required;
+    if (auto admit = mlir::dyn_cast<AdmitOp>(operation)) {
+      region = admit.getRegion();
+      required = "read";
+    } else if (auto commit = mlir::dyn_cast<CommitOp>(operation)) {
+      region = commit.getRegion();
+      required = "write";
+    } else {
+      return;
+    }
+    auto index = rootArgument(region);
+    if (!index)
+      return;
+    llvm::StringRef access =
+        mlir::cast<mlir::StringAttr>(getArgAccess()[*index]).getValue();
+    const bool allowed = required == "read"
+                             ? access == "read" || access == "readwrite"
+                             : access == "write" || access == "readwrite";
+    if (!allowed) {
+      operation->emitOpError()
+          << required << " effect contradicts the kernel argument access mode";
+      typeFailure = true;
+    }
+  });
+  if (typeFailure)
+    return mlir::failure();
   return mlir::success();
 }
 
@@ -462,21 +944,54 @@ mlir::LogicalResult ReturnOp::verify() {
 
 mlir::LogicalResult RootDomainOp::verify() {
   DomainType type = getResult().getType();
-  if (type.getRelation() != "root" || type.getAxisId() != 0)
+  if (type.getRelation() != "root" || type.getDomainId() != 0 ||
+      type.getParentDomainId() != -1 || type.getAxisId() != 0)
     return emitOpError("root_domain must produce the canonical root domain");
   return mlir::success();
 }
 
 mlir::LogicalResult SymbolOp::verify() {
-  if (getName().empty() || getKind() != "shape")
-    return emitOpError("symbol currently represents one named shape value");
+  if (getName().empty() || (getKind() != "shape" && getKind() != "source_auto"))
+    return emitOpError("symbol is a named shape or source auto value");
+  if (getKind() == "shape" && !getChoices().empty())
+    return emitOpError("shape symbol cannot carry source-auto choices");
+  if (llvm::any_of(getChoices(),
+                   [](int64_t value) { return value <= 0; }))
+    return emitOpError("source-auto choices must be positive");
   return mlir::success();
 }
 
 mlir::LogicalResult DomainOp::verify() {
+  DomainType parent = getParent().getType();
   DomainType child = getResult().getType();
   if (child.getRelation() == "root")
     return emitOpError("child domain cannot be another root");
+  if (child.getParentDomainId() != parent.getDomainId())
+    return emitOpError("child domain must name its parent domain identity");
+  if (child.getAxisId() == parent.getAxisId() &&
+      child.getAxisName().split('.').first !=
+          parent.getAxisName().split('.').first)
+    return emitOpError("a refined logical axis must preserve its axis name");
+  auto [axisBase, axisSerial] = child.getAxisName().rsplit('.');
+  if (axisBase.empty() || axisSerial != std::to_string(child.getDomainId()))
+    return emitOpError(
+        "child domain axis name must carry its unique domain identity suffix");
+  auto parentProducer = getParent().getDefiningOp();
+  if (!mlir::isa_and_nonnull<RootDomainOp, DomainOp>(parentProducer))
+    return emitOpError("domain parent must be a canonical root or child domain");
+  auto multiplicity = getMultiplicity().getDefiningOp<mlir::arith::CeilDivUIOp>();
+  if (!multiplicity || multiplicity.getLhs() != getExtent() ||
+      multiplicity.getRhs() != getPartition())
+    return emitOpError(
+        "domain multiplicity must be ceildiv(extent, partition)");
+  for (auto [value, name] :
+       {std::pair(getExtent(), llvm::StringRef("extent")),
+        std::pair(getPartition(), llvm::StringRef("partition"))}) {
+    if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+      if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+          integer && integer.getInt() <= 0)
+        return emitOpError() << "domain " << name << " must be positive";
+  }
   return mlir::success();
 }
 
@@ -486,10 +1001,6 @@ mlir::LogicalResult LevelOp::verify() {
   for (auto [operand, result] : llvm::zip(getCarried(), getResults()))
     if (operand.getType() != result.getType())
       return emitOpError("level carried operand/result types must match");
-  if (failed(verifyStringArray(*this, getStateNames(), "state_names")) ||
-      failed(verifyStringArray(*this, getStagedNames(), "staged_names")))
-    return mlir::failure();
-
   DomainType domain = getDomain().getType();
   PointType point = PointType::get(getContext(), domain);
   mlir::Block &state = getStateBirths().front();
@@ -502,9 +1013,15 @@ mlir::LogicalResult LevelOp::verify() {
   auto stagedYield = mlir::dyn_cast<BirthsYieldOp>(staged.getTerminator());
   if (!stateYield || !stagedYield)
     return emitOpError("births regions must end in births_yield");
-  if (stateYield.getValues().size() != getStateNames().size() ||
-      stagedYield.getValues().size() != getStagedNames().size())
-    return emitOpError("birth names must match births_yield values");
+  for (mlir::Value value : stateYield.getValues())
+    if (!value.getDefiningOp<NewOp>() ||
+        value.getParentRegion() != &getStateBirths())
+      return emitOpError("state_births may yield only values defined by new");
+  for (mlir::Value value : stagedYield.getValues())
+    if (!value.getDefiningOp<MaterializeOp>() ||
+        value.getParentRegion() != &getStagedBirths())
+      return emitOpError(
+          "staged_births may yield only values defined by materialize");
 
   const size_t expectedArguments = 1 + getCarried().size() +
                                    stateYield.getValues().size() +
@@ -525,9 +1042,6 @@ mlir::LogicalResult LevelOp::verify() {
   auto handoff = mlir::dyn_cast<HandoffOp>(body.getTerminator());
   if (!handoff || handoff.getValues().getTypes() != getResults().getTypes())
     return emitOpError("level body handoff must match level results");
-  if (handoff.getNames().size() != getResults().size() ||
-      failed(verifyStringArray(handoff, handoff.getNames(), "names")))
-    return emitOpError("handoff names must match level results");
   return mlir::success();
 }
 
@@ -543,82 +1057,26 @@ mlir::LogicalResult HandoffOp::verify() {
   auto level = mlir::dyn_cast_or_null<LevelOp>(getOperation()->getParentOp());
   if (!level || getOperation()->getParentRegion() != &level.getBody())
     return emitOpError("handoff terminates a level body");
-  if (getNames().size() != getValues().size())
-    return emitOpError("handoff names and values must match");
-  return verifyStringArray(*this, getNames(), "names");
-}
-
-mlir::LogicalResult YieldOp::verify() {
-  mlir::Operation *parent = getOperation()->getParentOp();
-  if (!mlir::isa_and_nonnull<ForOp, IfOp, WhileOp>(parent))
-    return emitOpError("yield terminates ordinary for, if, or while control");
   return mlir::success();
-}
-
-mlir::LogicalResult ConditionOp::verify() {
-  auto loop = mlir::dyn_cast_or_null<WhileOp>(getOperation()->getParentOp());
-  if (!loop || getOperation()->getParentRegion() != &loop.getConditionRegion())
-    return emitOpError("condition terminates a while condition region");
-  if (getValues().getTypes() != loop.getResults().getTypes())
-    return emitOpError("while condition carry must match while results");
-  return mlir::success();
-}
-
-mlir::LogicalResult ForOp::verify() {
-  if (getInitArgs().getTypes() != getResults().getTypes())
-    return emitOpError("for init and result types must match");
-  mlir::Block &body = getBody().front();
-  if (body.getNumArguments() != 1 + getInitArgs().size() ||
-      !body.getArgument(0).getType().isIndex())
-    return emitOpError("for body takes index followed by carried values");
-  for (auto [argument, initial] :
-       llvm::zip(body.getArguments().drop_front(), getInitArgs()))
-    if (argument.getType() != initial.getType())
-      return emitOpError("for carried argument type mismatch");
-  return verifyControlYield(*this, body, getResults().getTypes());
-}
-
-mlir::LogicalResult IfOp::verify() {
-  mlir::Block &thenBlock = getThenRegion().front();
-  mlir::Block &elseBlock = getElseRegion().front();
-  if (thenBlock.getNumArguments() || elseBlock.getNumArguments())
-    return emitOpError("ordinary if regions do not take implicit arguments");
-  if (failed(verifyControlYield(*this, thenBlock, getResults().getTypes())))
-    return mlir::failure();
-  return verifyControlYield(*this, elseBlock, getResults().getTypes());
-}
-
-mlir::LogicalResult WhileOp::verify() {
-  if (getInitArgs().getTypes() != getResults().getTypes())
-    return emitOpError("while init and result types must match");
-  mlir::Block &condition = getConditionRegion().front();
-  mlir::Block &body = getBodyRegion().front();
-  if (condition.getArgumentTypes() != getResults().getTypes() ||
-      body.getArgumentTypes() != getResults().getTypes())
-    return emitOpError("while regions take the carried values");
-  auto conditionTerminator = mlir::dyn_cast<ConditionOp>(condition.getTerminator());
-  if (!conditionTerminator)
-    return emitOpError("while condition region must end in condition");
-  if (conditionTerminator.getValues().getTypes() != getResults().getTypes())
-    return emitOpError("while condition carry must match while results");
-  return verifyControlYield(*this, body, getResults().getTypes());
 }
 
 mlir::LogicalResult ConstantOp::verify() {
-  if (!isScalar(getResult().getType()))
-    return emitOpError("constant result must be a scalar or index");
-  if (auto typed = mlir::dyn_cast<mlir::TypedAttr>(getValue());
-      typed && typed.getType() != getResult().getType())
-    return emitOpError("constant attribute and result types must match");
+  if (!isScalar(getResult().getType()) || getResult().getType().isIndex())
+    return emitOpError(
+        "constant represents a signed or unsigned scalar numeric literal");
+  auto typed = mlir::dyn_cast<mlir::TypedAttr>(getValue());
+  if (!typed || typed.getType() != getResult().getType())
+    return emitOpError("constant attribute and result type must match");
   return mlir::success();
 }
 
 mlir::LogicalResult IotaOp::verify() {
   auto result = getResult().getType();
   auto element = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
-  if (!element || element.isSigned() || result.getShape().size() != 1 ||
+  if ((!element && !result.getElementType().isIndex()) ||
+      (element && element.isSigned()) || result.getShape().size() != 1 ||
       result.getAxisIds().size() != 1)
-    return emitOpError("iota produces one unsigned integer logical axis");
+    return emitOpError("iota produces one unsigned integer or index logical axis");
   if (getEnd() <= getStart() || result.getShape()[0] != getEnd() - getStart())
     return emitOpError("iota shape must equal its positive [start, end) extent");
   return mlir::success();
@@ -653,13 +1111,10 @@ mlir::LogicalResult AdmitOp::verify() {
   if (auto encoded = mlir::dyn_cast<EncodingType>(resultElement)) {
     auto regionEncoding =
         mlir::cast<EncodingType>(logicalElement(getRegion().getType()));
-    if (encoded.getFamily() != regionEncoding.getFamily() ||
-        logicalShape(getResult().getType()).size() >
-            logicalShape(getRegion().getType()).size() ||
-        !llvm::equal(logicalAxes(getResult().getType()),
-                     logicalAxes(getRegion().getType()).take_front(
-                         logicalAxes(getResult().getType()).size())))
-      return emitOpError("encoded admit may remove only its record axis");
+    if (encoded != regionEncoding ||
+        !sameDomain(getRegion().getType(), getResult().getType()))
+      return emitOpError(
+          "encoded admit preserves the selected logical record domain");
   } else if (!sameDomain(getRegion().getType(), getResult().getType())) {
     return emitOpError("dense admit must preserve the logical domain");
   }
@@ -671,9 +1126,16 @@ mlir::LogicalResult CommitOp::verify() {
     return emitOpError("commit maps a local Value to a View region");
   if (!sameDomain(getValue().getType(), getRegion().getType()))
     return emitOpError("commit value and destination must have the same domain");
-  if (!isNumeric(getValue().getType()) &&
-      logicalElement(getValue().getType()) != logicalElement(getRegion().getType()))
+  auto destination =
+      mlir::cast<EncodingType>(logicalElement(getRegion().getType()));
+  if (destination.getKind() == "dense") {
+    if (!isNumeric(getValue().getType()) ||
+        destination.getFamily() != denseFamilyFor(logicalElement(getValue().getType())))
+      return emitOpError(
+          "dense commit requires an explicitly converted matching element type");
+  } else if (logicalElement(getValue().getType()) != destination) {
     return emitOpError("encoded commit requires identical encoding");
+  }
   return mlir::success();
 }
 
@@ -682,19 +1144,10 @@ mlir::LogicalResult SliceOp::verify() {
     return emitOpError("slice base must be a View or slice");
   if (failed(verifyStringArray(*this, getSelectors(), "selectors")))
     return mlir::failure();
-  size_t indexed = 0;
-  for (mlir::Attribute attribute : getSelectors()) {
-    llvm::StringRef selector = mlir::cast<mlir::StringAttr>(attribute).getValue();
-    if (selector != "all" && selector != "domain" &&
-        selector != "group_index" && selector != "index" &&
-        selector != "gather")
-      return emitOpError("unknown slice selector");
-    if (selector != "all")
-      ++indexed;
-  }
-  if (indexed != getIndices().size())
-    return emitOpError("slice selectors and index operands disagree");
-  return mlir::success();
+  if (logicalElement(getBase().getType()) != logicalElement(getResult().getType()))
+    return emitOpError("slice preserves its View encoding");
+  return verifyProjection(*this, getBase().getType(), getIndices(),
+                          getSelectors(), getResult().getType(), false);
 }
 
 mlir::LogicalResult FieldOp::verify() {
@@ -704,9 +1157,46 @@ mlir::LogicalResult FieldOp::verify() {
       !isEncoding(logicalElement(owner)) || getName().empty())
     return emitOpError(
         "field access requires a named field of an encoded Value or View region");
+  auto ownerEncoding = mlir::cast<EncodingType>(logicalElement(owner));
+  llvm::StringRef baseFamily = baseFamilyFor(*this, ownerEncoding);
+  EncodingDeclOp declaration = findEncodingDeclaration(*this, baseFamily);
+  if (!declaration)
+    return emitOpError("encoded field owner has no matching base declaration");
+  size_t fieldIndex = declaration.getFieldNames().size();
+  for (auto [index, attribute] : llvm::enumerate(declaration.getFieldNames()))
+    if (mlir::cast<mlir::StringAttr>(attribute).getValue() == getName()) {
+      fieldIndex = index;
+      break;
+    }
+  if (fieldIndex == declaration.getFieldNames().size())
+    return emitOpError("field name is absent from the owner Encoding declaration");
+  mlir::Type fieldType =
+      mlir::cast<mlir::TypeAttr>(declaration.getFieldTypes()[fieldIndex]).getValue();
+  auto fieldShape =
+      mlir::cast<mlir::DenseI64ArrayAttr>(declaration.getFieldShapes()[fieldIndex])
+          .asArrayRef();
+  auto ownerShape = logicalShape(owner);
+  auto ownerAxes = logicalAxes(owner);
+  auto resultShape = logicalShape(result);
+  auto resultAxes = logicalAxes(result);
+  if (ownerShape.empty() || ownerShape.back() != declaration.getElements())
+    return emitOpError(
+        "encoded field owner must expose exactly one complete record axis");
+  llvm::SmallVector<int64_t> expectedShape(ownerShape.drop_back());
+  expectedShape.append(fieldShape.begin(), fieldShape.end());
+  if (resultAxes.size() < ownerAxes.size() - 1 ||
+      (!fieldShape.empty() && resultAxes.empty()) ||
+      !llvm::equal(resultShape, expectedShape) ||
+      !llvm::equal(resultAxes.take_front(ownerAxes.size() - 1),
+                   ownerAxes.drop_back()) ||
+      (!fieldShape.empty() && resultAxes.back() != ownerAxes.back()))
+    return emitOpError(
+        "field result must replace the record axis with its declared field shape");
   if (isLocalValue(owner)) {
     if (!isLocalValue(result) || !isNumeric(result))
       return emitOpError("encoded Value field access produces a numeric local Value");
+    if (logicalElement(result) != fieldType)
+      return emitOpError("field result element must match the declared field type");
     return mlir::success();
   }
   auto resultSlice = mlir::dyn_cast<SliceType>(result);
@@ -715,6 +1205,8 @@ mlir::LogicalResult FieldOp::verify() {
                             : EncodingType();
   if (!resultEncoding || resultEncoding.getKind() != "dense")
     return emitOpError("encoded View field access produces a dense numeric slice");
+  if (resultEncoding.getFamily() != denseFamilyFor(fieldType))
+    return emitOpError("field slice encoding must match the declared field type");
   return mlir::success();
 }
 
@@ -722,26 +1214,10 @@ mlir::LogicalResult ExtractOp::verify() {
   if (!mlir::isa<ValueType>(getInput().getType()) ||
       failed(verifyStringArray(*this, getSelectors(), "selectors")))
     return emitOpError("extract requires a shaped local Value and selectors");
-  size_t cursor = 0;
-  for (mlir::Attribute attribute : getSelectors()) {
-    llvm::StringRef selector = mlir::cast<mlir::StringAttr>(attribute).getValue();
-    if (selector == "all")
-      continue;
-    if (cursor >= getIndices().size())
-      return emitOpError("extract selector has no corresponding index");
-    mlir::Type indexType = getIndices()[cursor++].getType();
-    if (selector != "gather")
-      continue;
-    auto value = mlir::dyn_cast<ValueType>(indexType);
-    auto integer = value
-                       ? mlir::dyn_cast<mlir::IntegerType>(value.getElementType())
-                       : mlir::IntegerType();
-    if (!integer || integer.isSigned())
-      return emitOpError("gather selector requires shaped unsigned indices");
-  }
-  if (cursor != getIndices().size())
-    return emitOpError("extract selectors and index operands disagree");
-  return mlir::success();
+  if (logicalElement(getInput().getType()) != logicalElement(getResult().getType()))
+    return emitOpError("extract preserves its local element type");
+  return verifyProjection(*this, getInput().getType(), getIndices(),
+                          getSelectors(), getResult().getType(), true);
 }
 
 mlir::LogicalResult UpdateOp::verify() {
@@ -753,7 +1229,8 @@ mlir::LogicalResult UpdateOp::verify() {
   if (logicalElement(getValue().getType()) !=
       mlir::cast<ValueType>(getInput().getType()).getElementType())
     return emitOpError("updated element type must match the state Value");
-  return mlir::success();
+  return verifyProjection(*this, getInput().getType(), getIndices(),
+                          getSelectors(), getValue().getType(), true);
 }
 
 mlir::LogicalResult UnaryOp::verify() {
@@ -762,44 +1239,69 @@ mlir::LogicalResult UnaryOp::verify() {
     return emitOpError("unary operation preserves its logical type");
   if (getKind() != "neg" && getKind() != "abs" && getKind() != "exp")
     return emitOpError("unknown unary numeric operation");
+  if (getKind() == "exp" &&
+      !mlir::isa<mlir::FloatType>(logicalElement(getInput().getType())))
+    return emitOpError("exp requires floating-point elements");
   return mlir::success();
 }
 
 mlir::LogicalResult BinaryOp::verify() {
+  constexpr llvm::StringLiteral allowed[] = {
+      "add", "sub", "mul", "div", "mod", "and", "or",
+      "xor", "shl", "shr", "max", "min"};
+  if (!llvm::is_contained(allowed, getKind()))
+    return emitOpError("unknown binary numeric operation");
   if (failed(verifyPointwise(*this, getLhs().getType(), getRhs().getType(),
                              getResult().getType())))
     return mlir::failure();
+  if (getKind() == "mod" || getKind() == "and" || getKind() == "or" ||
+      getKind() == "xor" || getKind() == "shl" || getKind() == "shr") {
+    mlir::Type element = logicalElement(getResult().getType());
+    if (!element.isIndex() && !mlir::isa<mlir::IntegerType>(element))
+      return emitOpError("integer-only binary operation has non-integer elements");
+  }
   return mlir::success();
 }
 
 mlir::LogicalResult CompareOp::verify() {
+  constexpr llvm::StringLiteral predicates[] = {"eq", "ne", "lt",
+                                                 "le", "gt", "ge"};
+  if (!llvm::is_contained(predicates, getPredicate()))
+    return emitOpError("unknown comparison predicate");
   if (!isLocalValue(getLhs().getType()) || !isLocalValue(getRhs().getType()) ||
+      !isNumeric(getLhs().getType()) || !isNumeric(getRhs().getType()) ||
       logicalElement(getLhs().getType()) != logicalElement(getRhs().getType()))
     return emitOpError("compare operands must have matching element types");
   auto predicate = mlir::dyn_cast<mlir::IntegerType>(logicalElement(getResult().getType()));
   if (!predicate || predicate.getWidth() != 1)
     return emitOpError("compare result must have i1 elements");
-  llvm::DenseSet<int64_t> expected;
-  for (int64_t axis : logicalAxes(getLhs().getType()))
-    expected.insert(axis);
+  llvm::SmallVector<int64_t> expected(logicalAxes(getLhs().getType()));
   for (int64_t axis : logicalAxes(getRhs().getType()))
-    expected.insert(axis);
-  if (expected.size() != logicalAxes(getResult().getType()).size())
-    return emitOpError("compare result must preserve the union of operand axes");
+    if (!llvm::is_contained(expected, axis))
+      expected.push_back(axis);
+  if (!llvm::equal(expected, logicalAxes(getResult().getType())))
+    return emitOpError(
+        "compare result axes must follow lhs order then rhs-only axes");
   for (auto [axis, extent] :
        llvm::zip(logicalAxes(getResult().getType()),
                  logicalShape(getResult().getType()))) {
-    if (!expected.contains(axis))
-      return emitOpError("compare result contains an unrelated axis");
+    std::optional<int64_t> expectedExtent;
     for (mlir::Type operand : {getLhs().getType(), getRhs().getType()}) {
       auto operandAxes = logicalAxes(operand);
       auto found = llvm::find(operandAxes, axis);
-      if (found != operandAxes.end() &&
-          logicalShape(operand)[static_cast<size_t>(found - operandAxes.begin())] !=
-              extent)
+      if (found == operandAxes.end())
+        continue;
+      int64_t operandExtent =
+          logicalShape(operand)[static_cast<size_t>(found - operandAxes.begin())];
+      if (!expectedExtent || *expectedExtent == 1)
+        expectedExtent = operandExtent;
+      else if (operandExtent != 1 && operandExtent != *expectedExtent)
         return emitOpError(
             "compare operands disagree on a shared logical axis extent");
     }
+    if (!expectedExtent || extent != *expectedExtent)
+      return emitOpError(
+          "compare result extent must equal its broadcast operand extent");
   }
   return mlir::success();
 }
@@ -808,30 +1310,80 @@ mlir::LogicalResult CastOp::verify() {
   if (!isNumeric(getInput().getType()) || !isNumeric(getResult().getType()) ||
       !sameDomain(getInput().getType(), getResult().getType()))
     return emitOpError("cast converts numeric elements and preserves the logical domain");
-  auto rounding = (*this)->getAttrOfType<mlir::StringAttr>("rounding");
-  auto saturate = (*this)->getAttrOfType<mlir::BoolAttr>("saturate");
-  if (static_cast<bool>(rounding) != static_cast<bool>(saturate))
-    return emitOpError("rounded narrowing requires both rounding and saturate attributes");
-  if (rounding) {
-    if (rounding.getValue() != "rne" && rounding.getValue() != "rtz" &&
-        rounding.getValue() != "rdn" && rounding.getValue() != "rup")
-      return emitOpError("unknown numeric narrowing rounding mode");
-    if (!mlir::isa<mlir::FloatType>(logicalElement(getInput().getType())) ||
-        !mlir::isa<mlir::IntegerType>(logicalElement(getResult().getType())))
-      return emitOpError("rounded narrowing converts floating values to integers");
-  }
+  if (logicalElement(getInput().getType()) ==
+      logicalElement(getResult().getType()))
+    return emitOpError("identity conversion is not a canonical cast");
   return mlir::success();
 }
 
-mlir::LogicalResult MacPairsOp::verify() {
-  if (getGroup() != 2 || getOverflow() != "wrap")
-    return emitOpError("mac_pairs is a wrapping group of exactly two elements");
+mlir::LogicalResult NarrowOp::verify() {
+  if (!isNumeric(getInput().getType()) || !isNumeric(getResult().getType()) ||
+      !sameDomain(getInput().getType(), getResult().getType()))
+    return emitOpError(
+        "narrow converts numeric elements and preserves the logical domain");
+  if (getRounding() != "rne" && getRounding() != "rtz" &&
+      getRounding() != "rdn" && getRounding() != "rup")
+    return emitOpError("unknown numeric narrowing rounding mode");
+  auto inputWidth = bitWidth(getInput().getType());
+  auto resultWidth = bitWidth(getResult().getType());
+  if (!inputWidth || !resultWidth || *resultWidth >= *inputWidth)
+    return emitOpError("narrow must reduce the element bit width");
+  if (getSaturate() &&
+      !mlir::isa<mlir::IntegerType>(logicalElement(getResult().getType())))
+    return emitOpError("saturation is defined only for an integer result");
   return mlir::success();
 }
 
 mlir::LogicalResult MacGroupsOp::verify() {
   if (getGroup() <= 0 || getOverflow() != "wrap")
     return emitOpError("mac_groups requires positive group and wrap overflow");
+  if (!mlir::isa<ValueType>(getLhs().getType()) ||
+      !mlir::isa<ValueType>(getRhs().getType()) ||
+      !mlir::isa<ValueType>(getResult().getType()) ||
+      !isNumeric(getLhs().getType()) || !isNumeric(getRhs().getType()) ||
+      !isNumeric(getResult().getType()))
+    return emitOpError("mac_groups consumes and produces shaped numeric Values");
+  auto lhs = mlir::cast<ValueType>(getLhs().getType());
+  auto rhs = mlir::cast<ValueType>(getRhs().getType());
+  auto result = mlir::cast<ValueType>(getResult().getType());
+  auto lhsAxes = lhs.getAxisIds().asArrayRef();
+  auto rhsAxes = rhs.getAxisIds().asArrayRef();
+  if (lhsAxes.empty() || rhsAxes.empty() || lhsAxes.back() != rhsAxes.back())
+    return emitOpError("mac_groups requires one final common grouped axis");
+  int64_t groupedAxis = lhsAxes.back();
+  llvm::SmallVector<int64_t> inputAxes(lhsAxes.drop_back());
+  llvm::SmallVector<int64_t> inputShape(
+      lhs.getShape().asArrayRef().drop_back());
+  for (auto [axis, extent] : llvm::zip(rhsAxes.drop_back(),
+                                      rhs.getShape().asArrayRef().drop_back())) {
+    auto found = llvm::find(inputAxes, axis);
+    if (found == inputAxes.end()) {
+      inputAxes.push_back(axis);
+      inputShape.push_back(extent);
+      continue;
+    }
+    size_t position = static_cast<size_t>(found - inputAxes.begin());
+    if (inputShape[position] != extent)
+      return emitOpError(
+          "mac_groups operands disagree on a shared logical axis extent");
+  }
+  inputAxes.push_back(groupedAxis);
+  inputShape.push_back(lhs.getShape()[lhs.getShape().size() - 1]);
+  if (inputShape.back() != rhs.getShape()[rhs.getShape().size() - 1])
+    return emitOpError(
+        "mac_groups operands disagree on the grouped axis extent");
+  if (inputAxes.empty() ||
+      !llvm::equal(result.getAxisIds().asArrayRef(), inputAxes) ||
+      result.getShape().size() != inputShape.size())
+    return emitOpError(
+        "mac_groups result axes must follow lhs order then rhs-only axes");
+  for (size_t index = 0; index + 1 < inputShape.size(); ++index)
+    if (result.getShape()[index] != inputShape[index])
+      return emitOpError("mac_groups preserves non-grouped extents");
+  if (inputShape.back() <= 0 || inputShape.back() % getGroup() ||
+      result.getShape()[result.getShape().size() - 1] !=
+          inputShape.back() / getGroup())
+    return emitOpError("mac_groups divides its final logical extent by group");
   return mlir::success();
 }
 
@@ -853,9 +1405,12 @@ mlir::LogicalResult WidenOp::verify() {
 }
 
 mlir::LogicalResult ReduceOp::verify() {
+  if (getKind() != "add" && getKind() != "max" && getKind() != "min")
+    return emitOpError("reduce kind must be add, max, or min");
   if (!mlir::isa<ValueType>(getInput().getType()) ||
-      !isLocalValue(getResult().getType()))
-    return emitOpError("reduce consumes a shaped Value");
+      !isLocalValue(getResult().getType()) || !isNumeric(getInput().getType()) ||
+      !isNumeric(getResult().getType()))
+    return emitOpError("reduce consumes and produces numeric Values");
   auto input = mlir::cast<ValueType>(getInput().getType());
   auto inputShape = input.getShape().asArrayRef();
   auto inputAxes = input.getAxisIds().asArrayRef();
@@ -883,13 +1438,15 @@ mlir::LogicalResult Fold2Op::verify() {
     return emitOpError("fold2 consumes and produces shaped Values");
   auto input = mlir::cast<ValueType>(getInput().getType());
   auto result = mlir::cast<ValueType>(getResult().getType());
+  auto inputElement = mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
   auto resultElement = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
   llvm::ArrayRef<int64_t> inputShape = input.getShape().asArrayRef();
   llvm::ArrayRef<int64_t> resultShape = result.getShape().asArrayRef();
   if (inputShape.empty() || inputShape.size() != resultShape.size() ||
       inputShape.back() <= 0 || inputShape.back() % 2 ||
       resultShape.back() != inputShape.back() / 2 ||
-      !resultElement || resultElement.getWidth() != 32 ||
+      !inputElement || !resultElement || !resultElement.isSigned() ||
+      resultElement.getWidth() != 32 ||
       input.getAxisIds() != result.getAxisIds() ||
       !llvm::equal(inputShape.drop_back(), resultShape.drop_back()))
     return emitOpError("fold2 halves an even final logical extent");
@@ -897,6 +1454,11 @@ mlir::LogicalResult Fold2Op::verify() {
 }
 
 mlir::LogicalResult DotOp::verify() {
+  if (getOver().size() != 1 || logicalAxes(getLhs().getType()).empty() ||
+      logicalAxes(getRhs().getType()).empty() ||
+      getOver()[0] != logicalAxes(getLhs().getType()).back() ||
+      getOver()[0] != logicalAxes(getRhs().getType()).back())
+    return emitOpError("dot reduces the final common logical axis");
   return verifyContractLike(*this, getLhs(), getRhs(), getOver(), getAccType(),
                             getResult().getType());
 }
@@ -907,14 +1469,26 @@ mlir::LogicalResult ContractOp::verify() {
 }
 
 mlir::LogicalResult OuterContractOp::verify() {
+  llvm::DenseSet<int64_t> reduction;
+  for (int64_t axis : getOver())
+    reduction.insert(axis);
+  for (int64_t axis : logicalAxes(getLhs().getType()))
+    if (!reduction.contains(axis) &&
+        llvm::is_contained(logicalAxes(getRhs().getType()), axis))
+      return emitOpError(
+          "outer_contract requires disjoint lhs and rhs free axes");
   return verifyContractLike(*this, getLhs(), getRhs(), getOver(), getAccType(),
                             getResult().getType());
 }
 
 mlir::LogicalResult LookupOp::verify() {
-  auto index = mlir::dyn_cast<mlir::IntegerType>(logicalElement(getIndices().getType()));
-  if (!isLocalValue(getTable().getType()) || !isNumeric(getTable().getType()) ||
-      !index || index.isSigned())
+  if (getBounds() != "in_bounds")
+    return emitOpError("current canonical lookup requires bounds = in_bounds");
+  mlir::Type indexElement = logicalElement(getIndices().getType());
+  auto index = mlir::dyn_cast<mlir::IntegerType>(indexElement);
+  if (!mlir::isa<ValueType>(getTable().getType()) ||
+      !isNumeric(getTable().getType()) ||
+      (!indexElement.isIndex() && (!index || index.isSigned())))
     return emitOpError(
         "lookup requires a numeric local table and unsigned integer indices");
   if (!sameDomain(getIndices().getType(), getResult().getType()))
@@ -930,8 +1504,18 @@ mlir::LogicalResult InterleaveOp::verify() {
   if (mlir::cast<EncodingType>(getResult().getType().getEncoding()).getKind() !=
       "derived_instance")
     return emitOpError("interleave in derive produces a concrete derived instance");
-  if (!mlir::isa_and_nonnull<DeriveOp>(getOperation()->getParentOp()))
+  auto derive = mlir::dyn_cast_or_null<DeriveOp>(getOperation()->getParentOp());
+  if (!derive)
     return emitOpError("interleave is valid only inside a derive body");
+  auto resultEncoding =
+      mlir::cast<EncodingType>(getResult().getType().getEncoding());
+  if (derive.getParameterValues().size() != 1 ||
+      derive.getParameterValues()[0] != getRows() ||
+      resultEncoding.getParameters().asArrayRef() !=
+          derive.getParameterValues() ||
+      resultEncoding.getLayoutIdentity() != derive.getLayoutIdentity())
+    return emitOpError(
+        "interleave rows and result identity must match its derive instance");
   return mlir::success();
 }
 

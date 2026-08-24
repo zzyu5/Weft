@@ -14,6 +14,7 @@ from weft.language import (
     f32,
     materialize,
     maximum,
+    narrow,
     new,
     reduce,
 )
@@ -48,4 +49,6 @@ def flash_attention(
             l = l * alpha + _rowsum(p)
             o = o * alpha + contract(p, v, over="tk")
             m = m_new
-        commit(o / l, O[qb, :])
+        commit(
+            narrow(o / l, f16, rounding="rne", saturation=False), O[qb, :]
+        )

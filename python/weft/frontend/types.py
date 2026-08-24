@@ -20,6 +20,7 @@ class EncodingType(ValueType):
     family: str
     kind: str
     layout_identity: str
+    parameters: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,11 +47,10 @@ class SliceType(ValueType):
 @dataclass(frozen=True, slots=True)
 class DomainType(ValueType):
     axis_name: str
+    domain_id: int
+    parent_domain_id: int
     axis_id: int
     relation: str
-    extent: str
-    partition: str
-    multiplicity: str
     tail: str
 
 
@@ -74,7 +74,8 @@ def emit_type(value_type: ValueType) -> str:
         return (
             "!weft_kernel.encoding<"
             f"{json.dumps(value_type.family)}, {json.dumps(value_type.kind)}, "
-            f"{json.dumps(value_type.layout_identity)}>"
+            f"{json.dumps(value_type.layout_identity)}, "
+            f"{_emit_i64_list(value_type.parameters)}>"
         )
     if isinstance(value_type, ViewType):
         return _emit_shaped("view", value_type.encoding, value_type.shape, value_type.axes)
@@ -85,14 +86,18 @@ def emit_type(value_type: ValueType) -> str:
     if isinstance(value_type, DomainType):
         return (
             "!weft_kernel.domain<"
-            f"{json.dumps(value_type.axis_name)}, {value_type.axis_id}, "
-            f"{json.dumps(value_type.relation)}, {json.dumps(value_type.extent)}, "
-            f"{json.dumps(value_type.partition)}, {json.dumps(value_type.multiplicity)}, "
+            f"{json.dumps(value_type.axis_name)}, {value_type.domain_id}, "
+            f"{value_type.parent_domain_id}, {value_type.axis_id}, "
+            f"{json.dumps(value_type.relation)}, "
             f"{json.dumps(value_type.tail)}>"
         )
     if isinstance(value_type, DomainPointType):
         return f"!weft_kernel.point<{emit_type(value_type.domain)}>"
     raise TypeError(f"cannot emit unknown Weft type {value_type!r}")
+
+
+def _emit_i64_list(values: tuple[int, ...]) -> str:
+    return "[" + ", ".join(str(value) for value in values) + "]"
 
 
 def _emit_shaped(

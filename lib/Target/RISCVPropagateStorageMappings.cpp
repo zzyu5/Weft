@@ -58,13 +58,9 @@ EncodingMappings collectEncodingMappings(mlir::ModuleOp module) {
         yield.getValue().getType().getEncoding());
     llvm::StringRef identity = encoding.getLayoutIdentity();
     result.sourceByInstance[identity] = derive.getSourceFamily().str();
-    int64_t rows = 0;
-    for (mlir::Attribute attribute : derive.getParameters()) {
-      llvm::StringRef spelling =
-          mlir::cast<mlir::StringAttr>(attribute).getValue();
-      if (spelling.consume_front("rows="))
-        spelling.getAsInteger(10, rows);
-    }
+    int64_t rows = derive.getParameterValues().size() == 1
+                       ? derive.getParameterValues()[0]
+                       : 0;
     if (rows > 0)
       result.rowsByInstance[identity] = rows;
   }

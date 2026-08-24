@@ -23,6 +23,7 @@ from weft.language.dtypes import (
     DType,
     DTypeCategory,
     f32,
+    f64,
     i1,
     i8,
     i16,
@@ -235,6 +236,7 @@ class FrontendCompiler:
         self.source = FunctionSource.from_definition(definition)
         self.builder = IRBuilder()
         self.block: Region | None = None
+        self._kernel_body: Region | None = None
         self.env: dict[str, Value] = {}
         self.static_env: dict[str, object] = {}
         self.immutable_names: set[str] = set()
@@ -242,6 +244,8 @@ class FrontendCompiler:
         self._shape_ids: dict[str, int] = {}
         self._axis_ids: dict[str, int] = {}
         self._shape_symbols: dict[str, Value] = {}
+        self._auto_symbols: dict[str, Value] = {}
+        self._auto_choices: dict[str, tuple[int, ...]] = {}
         self._next_shape_id = -1
         self._next_axis_id = 1
         self._next_domain_serial = 1
@@ -250,9 +254,12 @@ class FrontendCompiler:
         self._declared_derives: set[tuple[str, tuple[int, ...]]] = set()
         self._declaring_derives: set[str] = set()
         self._slice_info: dict[Value, _SliceInfo] = {}
-        self._encoded_axis: dict[Value, int] = {}
         self._field_record_extent: dict[Value, int] = {}
         self._derive_result: ViewType | None = None
+        self._domain_partition_values: dict[int, Value] = {}
+        self._domain_partition_spelling: dict[int, str | int] = {}
+        self._view_roots: dict[Value, int] = {}
+        self._argument_access: list[set[str]] = []
 
     def compile(self) -> str:
         function = self.source.function
@@ -280,13 +287,18 @@ class FrontendCompiler:
         body = self.builder.region(
             tuple(argument_types), tuple(parameter.arg for parameter in parameters)
         )
+        self._kernel_body = body
         self.block = body
         self.env = {
             parameter.arg: argument
             for parameter, argument in zip(parameters, body.arguments)
         }
+        self._argument_access = [set() for _ in body.arguments]
+        for index, argument in enumerate(body.arguments):
+            if isinstance(argument.type, ViewType):
+                self._view_roots[argument] = index
         self._materialize_shape_symbols(function)
-        root_type = DomainType("root", 0, "root", "1", "1", "1", "exact")
+        root_type = DomainType("root", 0, -1, 0, "root", "exact")
         self.active_domain = self._emit(
             "weft_kernel.root_domain", function, result_types=(root_type,)
         )[0]
@@ -300,6 +312,21 @@ class FrontendCompiler:
             attributes={
                 "sym_name": _string(self.definition.__name__),
                 "arg_names": _strings([parameter.arg for parameter in parameters]),
+                "arg_access": _strings(
+                    [
+                        "readwrite"
+                        if access == {"read", "write"}
+                        else "read"
+                        if access == {"read"}
+                        else "write"
+                        if access == {"write"}
+                        else "none"
+                        for access in self._argument_access
+                    ]
+                ),
+                "arg_alias_sets": _i64_array(
+                    [0 if isinstance(value_type_, ViewType) else -1 for value_type_ in argument_types]
+                ),
                 "shape_symbols": _strings(list(self._shape_ids)),
                 "source": _string(f"{self.source.filename}:{self.source.first_line}"),
             },
@@ -357,7 +384,11 @@ class FrontendCompiler:
                 "weft_kernel.symbol",
                 node,
                 result_types=(ScalarType(index),),
-                attributes={"name": _string(name), "kind": _string("shape")},
+                attributes={
+                    "name": _string(name),
+                    "kind": _string("shape"),
+                    "choices": _i64_array(()),
+                },
                 result_names=(name,),
             )[0]
             self._shape_symbols[name] = value
@@ -395,7 +426,9 @@ class FrontendCompiler:
                     )
                 self._declare_derived(owner, values)
                 identity = owner.__name__ + "[" + ",".join(str(value) for value in values) + "]"
-                return EncodingType(owner.__name__, "derived_instance", identity)
+                return EncodingType(
+                    owner.__name__, "derived_instance", identity, values
+                )
             if owner is View:
                 items = (
                     list(annotation.slice.elts)
@@ -414,6 +447,7 @@ class FrontendCompiler:
                             encoding.dtype.name,
                             "dense",
                             f"dense.{encoding.dtype.name}",
+                            (),
                         )
                     else:
                         raise FrontendError("invalid View encoding", self._location(items[0]))
@@ -606,7 +640,9 @@ class FrontendCompiler:
             fields.append(_FieldInfo(name, dtype, shape, layouts, offset, storage_bits))
             offset += storage_bits
             item_index += 1
-        encoding_type = EncodingType(definition.__name__, "base", definition.__name__)
+        encoding_type = EncodingType(
+            definition.__name__, "base", definition.__name__, ()
+        )
         info = _EncodingInfo(
             definition,
             encoding_type,
@@ -791,7 +827,9 @@ class FrontendCompiler:
                 raise FrontendError("derived encoding input must be a View", source.location(source.function))
             identity = name + "[" + ",".join(str(value) for value in arguments) + "]"
             symbol = name + "$" + "$".join(str(value) for value in arguments)
-            result_encoding = EncodingType(name, "derived_instance", identity)
+            result_encoding = EncodingType(
+                name, "derived_instance", identity, arguments
+            )
             result_type = ViewType(result_encoding, source_type.shape, source_type.axes)
             region = self.builder.region((source_type,), (source.function.args.args[0].arg,))
             saved = (self.block, self.env, self._derive_result, self.active_domain)
@@ -804,12 +842,6 @@ class FrontendCompiler:
             return_node = source.function.body[0]
             if return_node.value is None:
                 raise FrontendError("derived encoding must return a View", source.location(return_node))
-            parameters: list[str] = []
-            if isinstance(return_node.value, ast.Call):
-                for keyword in return_node.value.keywords:
-                    if keyword.arg is None:
-                        raise FrontendError("derived encoding parameters cannot use **kwargs")
-                    parameters.append(f"{keyword.arg}={self._eval_static(keyword.value)}")
             result = self._expect_value(self._compile_expr(return_node.value), return_node.value)
             if result.type != result_type:
                 raise FrontendError("derived encoding result does not match its generated family", source.location(return_node))
@@ -823,7 +855,11 @@ class FrontendCompiler:
                         "sym_name": _string(symbol),
                         "source_family": _string(source_type.encoding.family),
                         "result_family": _string(name),
-                        "parameters": _strings(parameters),
+                        "layout_identity": _string(identity),
+                        "parameter_names": _strings(
+                            [parameter.arg for parameter in static_parameters]
+                        ),
+                        "parameter_values": _i64_array(arguments),
                     },
                     regions=(region,),
                 )
@@ -919,6 +955,16 @@ class FrontendCompiler:
             )
         self.env[name] = value
 
+    def _propagate_view_root(self, result: Value, source: Value) -> None:
+        root = self._view_roots.get(source)
+        if root is not None:
+            self._view_roots[result] = root
+
+    def _mark_view_access(self, value: Value, effect: str) -> None:
+        root = self._view_roots.get(value)
+        if root is not None:
+            self._argument_access[root].add(effect)
+
     def _bind_target(self, target: ast.expr, value: Value) -> None:
         if isinstance(target, ast.Name):
             self._bind_name(target.id, value, target)
@@ -990,6 +1036,11 @@ class FrontendCompiler:
                 return self._constant(-expression.operand.value, None, expression)
             operand = self._expect_value(self._compile_expr(expression.operand), expression.operand)
             if isinstance(expression.op, ast.USub):
+                if not isinstance(element_type(operand.type), ScalarType):
+                    raise FrontendError(
+                        "numeric negation requires scalar elements",
+                        self._location(expression),
+                    )
                 return self._emit(
                     "weft_kernel.unary",
                     expression,
@@ -1002,6 +1053,11 @@ class FrontendCompiler:
             if len(expression.ops) != 1 or len(expression.comparators) != 1:
                 raise FrontendError("chained comparison is not supported", self._location(expression))
             lhs, rhs = self._compile_binary_operands(expression.left, expression.comparators[0])
+            if not isinstance(element_type(lhs.type), ScalarType):
+                raise FrontendError(
+                    "comparison requires numeric scalar elements",
+                    self._location(expression),
+                )
             predicates = {
                 ast.Eq: "eq",
                 ast.NotEq: "ne",
@@ -1066,8 +1122,13 @@ class FrontendCompiler:
                 if "." not in number and "e" not in number.lower():
                     number += ".0"
             spelling = f"{number} : {emit_type(value_type_)}"
+        operation = (
+            "weft_kernel.constant"
+            if dtype.category is DTypeCategory.INTEGER
+            else "arith.constant"
+        )
         return self._emit(
-            "weft_kernel.constant",
+            operation,
             node,
             result_types=(value_type_,),
             attributes={"value": spelling},
@@ -1094,7 +1155,7 @@ class FrontendCompiler:
     def _promote_dtype(self, lhs: DType, rhs: DType) -> DType:
         floating = {DTypeCategory.FLOAT, DTypeCategory.BFLOAT}
         if lhs.category in floating or rhs.category in floating:
-            return f32
+            return f64 if lhs == f64 or rhs == f64 else f32
         bits = max(lhs.bits or 64, rhs.bits or 64)
         signed = lhs.signedness == "signed" or rhs.signedness == "signed"
         table = {
@@ -1161,6 +1222,10 @@ class FrontendCompiler:
     def _binary_values(self, kind: str, lhs: Value, rhs: Value, node: ast.AST) -> Value:
         if element_type(lhs.type) != element_type(rhs.type):
             raise FrontendError("binary element types must match", self._location(node))
+        if not isinstance(element_type(lhs.type), ScalarType):
+            raise FrontendError(
+                "binary operations require numeric scalar elements", self._location(node)
+            )
         shape, axes = self._broadcast_domain(lhs.type, rhs.type, node)
         result_type = value_type(element_type(lhs.type), shape, axes)
         return self._emit(
@@ -1187,25 +1252,18 @@ class FrontendCompiler:
             )
         shape = list(shape_of(owner.type))
         axes = list(axes_of(owner.type))
-        record_axis = self._encoded_axis.get(owner)
-        if isinstance(owner.type, (ViewType, SliceType)):
-            slice_info = self._slice_info.get(owner)
-            if info.logical_extent is None or slice_info is None:
-                raise FrontendError(
-                    "encoded View field access requires one explicit record region",
-                    self._location(expression),
-                )
-            for selector in reversed(slice_info.selectors):
-                if isinstance(selector.type, DomainPointType):
-                    if selector.type.domain.partition == str(info.logical_extent) and shape:
-                        record_axis = axes.pop()
-                        shape.pop()
-                        break
-            if record_axis is None:
-                raise FrontendError(
-                    "encoded View field access must select its complete record extent",
-                    self._location(expression),
-                )
+        if info.logical_extent is None or not shape:
+            raise FrontendError(
+                "encoded field access requires an explicit complete record axis",
+                self._location(expression),
+            )
+        record_extent = shape.pop()
+        record_axis = axes.pop()
+        if record_extent > 0 and record_extent != info.logical_extent:
+            raise FrontendError(
+                "encoded field access must select exactly one storage record",
+                self._location(expression),
+            )
         for field_index, dimension in enumerate(field.shape):
             field_axis = record_axis if field_index + 1 == len(field.shape) else None
             if field_axis is None:
@@ -1217,7 +1275,9 @@ class FrontendCompiler:
             axes.append(field_axis)
         if isinstance(owner.type, (ViewType, SliceType)):
             result_type = SliceType(
-                EncodingType(field.dtype.name, "dense", f"dense.{field.dtype.name}"),
+                EncodingType(
+                    field.dtype.name, "dense", f"dense.{field.dtype.name}", ()
+                ),
                 tuple(shape),
                 tuple(axes),
             )
@@ -1230,8 +1290,8 @@ class FrontendCompiler:
             result_types=(result_type,),
             attributes={"name": _string(expression.attr)},
         )[0]
-        if record_axis is not None:
-            self._encoded_axis[result] = record_axis
+        if isinstance(owner.type, (ViewType, SliceType)):
+            self._propagate_view_root(result, owner)
         if info.logical_extent is not None:
             self._field_record_extent[result] = info.logical_extent
         return result
@@ -1253,6 +1313,7 @@ class FrontendCompiler:
                 attributes={"selectors": _strings(kinds)},
             )[0]
             self._slice_info[result] = _SliceInfo(base, tuple(selectors), tuple(kinds))
+            self._propagate_view_root(result, base)
             return result
         if isinstance(base.type, LocalValueType):
             result_type = value_type(base.type.element_type, result_shape, result_axes)
@@ -1305,14 +1366,13 @@ class FrontendCompiler:
                 domain = value.type.domain
                 if domain.axis_id != axis:
                     raise FrontendError("level point indexes a different logical axis", self._location(item))
-                partition = domain.partition
-                if partition.startswith("auto:"):
-                    local_dimension = self._shape_id(partition.removeprefix("auto:"))
+                partition = self._domain_partition_spelling.get(domain.domain_id)
+                if isinstance(partition, str):
+                    local_dimension = self._shape_id(partition)
+                elif isinstance(partition, int):
+                    local_dimension = partition
                 else:
-                    try:
-                        local_dimension = int(partition)
-                    except ValueError:
-                        local_dimension = dimension
+                    local_dimension = dimension
                 record_extent = (
                     self._field_record_extent.get(base_value)
                     if base_value is not None
@@ -1381,12 +1441,7 @@ class FrontendCompiler:
             value = self._expect_value(self._compile_expr(argument), argument)
             if not isinstance(element_type(value.type), ScalarType):
                 raise FrontendError("dtype constructor converts numeric Values", self._location(call))
-            return self._emit(
-                "weft_kernel.cast",
-                call,
-                operands=(value,),
-                result_types=(with_element(value.type, ScalarType(callee)),),
-            )[0]
+            return self._convert_value(value, callee, call)
         if isinstance(callee, Intrinsic):
             method = getattr(self, f"_intrinsic_{callee.name}", None)
             if method is None:
@@ -1473,13 +1528,13 @@ class FrontendCompiler:
         extent = self._eval_static(args["extent"]) if isinstance(args["extent"], ast.expr) else args["extent"]
         start = self._eval_static(args["start"]) if isinstance(args["start"], ast.expr) else args["start"]
         dtype = self._eval_static(args["dtype"]) if isinstance(args["dtype"], ast.expr) else args["dtype"]
-        if not isinstance(extent, int) or extent <= 0:
+        if isinstance(extent, bool) or not isinstance(extent, int) or extent <= 0:
             raise FrontendError("iota extent must be a positive integer", self._location(call))
-        if not isinstance(start, int):
+        if isinstance(start, bool) or not isinstance(start, int):
             raise FrontendError("iota start must be an integer", self._location(call))
         if (
             not isinstance(dtype, DType)
-            or dtype.category != DTypeCategory.INTEGER
+            or dtype.category not in {DTypeCategory.INTEGER, DTypeCategory.INDEX}
             or dtype.signedness == "signed"
         ):
             raise FrontendError(
@@ -1506,11 +1561,17 @@ class FrontendCompiler:
         ]
         for item in items:
             if isinstance(item, ast.Constant) and isinstance(item.value, int):
+                if item.value <= 0:
+                    raise FrontendError(
+                        "local shape extents must be positive",
+                        self._location(item),
+                    )
                 shape.append(item.value)
                 matching = [
                     domain.axis_id
                     for domain in active_points
-                    if domain.partition == str(item.value)
+                    if self._domain_partition_spelling.get(domain.domain_id)
+                    == item.value
                 ]
                 if matching:
                     axes.append(matching[-1])
@@ -1522,7 +1583,8 @@ class FrontendCompiler:
                 matching = [
                     domain.axis_id
                     for domain in active_points
-                    if domain.partition == f"auto:{item.id}"
+                    if self._domain_partition_spelling.get(domain.domain_id)
+                    == item.id
                 ]
                 axes.append(matching[-1] if matching else self._axis_id(item.id))
             else:
@@ -1551,23 +1613,12 @@ class FrontendCompiler:
         shape = list(region.type.shape)
         axes = list(region.type.axes)
         element: ValueType
-        record_axis: int | None = None
         if encoding.kind == "dense":
             scalar_family = encoding.family
             static = getattr(sys.modules["weft.language"], scalar_family)
             element = ScalarType(static)
         else:
             element = encoding
-            info = self._declared_encodings.get(encoding.family)
-            slice_info = self._slice_info.get(region)
-            if info and info.logical_extent and slice_info:
-                for selector in reversed(slice_info.selectors):
-                    if isinstance(selector.type, DomainPointType):
-                        partition = selector.type.domain.partition
-                        if partition == str(info.logical_extent) and shape:
-                            record_axis = axes.pop()
-                            shape.pop()
-                            break
         result_type = value_type(element, tuple(shape), tuple(axes))
         result = self._emit(
             "weft_kernel.admit",
@@ -1575,8 +1626,7 @@ class FrontendCompiler:
             operands=(region,),
             result_types=(result_type,),
         )[0]
-        if record_axis is not None:
-            self._encoded_axis[result] = record_axis
+        self._mark_view_access(region, "read")
         return result
 
     def _intrinsic_commit(self, call: ast.Call) -> None:
@@ -1587,6 +1637,7 @@ class FrontendCompiler:
             raise FrontendError("commit destination is a View region", self._location(call))
         if not isinstance(region.type, (SliceType, ViewType)):
             raise FrontendError("commit destination is a View region", self._location(call))
+        self._mark_view_access(region, "write")
         self._emit("weft_kernel.commit", call, operands=(value, region))
         return None
 
@@ -1596,6 +1647,12 @@ class FrontendCompiler:
         dtype = self._eval_static(args["dtype"]) if isinstance(args["dtype"], ast.expr) else args["dtype"]
         if not isinstance(dtype, DType):
             raise FrontendError("widen dtype must be a Weft dtype", self._location(call))
+        if not isinstance(value.type, (ScalarType, LocalValueType)) or not isinstance(
+            element_type(value.type), ScalarType
+        ):
+            raise FrontendError(
+                "widen requires a numeric scalar or local Value", self._location(call)
+            )
         result_type = with_element(value.type, ScalarType(dtype))
         return self._emit(
             "weft_kernel.widen", call, operands=(value,), result_types=(result_type,)
@@ -1621,13 +1678,19 @@ class FrontendCompiler:
         )
         if not isinstance(dtype, DType):
             raise FrontendError("narrow dtype must be a Weft dtype", self._location(call))
+        if not isinstance(value.type, (ScalarType, LocalValueType)) or not isinstance(
+            element_type(value.type), ScalarType
+        ):
+            raise FrontendError(
+                "narrow requires a numeric scalar or local Value", self._location(call)
+            )
         if rounding not in {"rne", "rtz", "rdn", "rup"}:
             raise FrontendError("narrow rounding must be rne, rtz, rdn, or rup", self._location(call))
         if not isinstance(saturation, bool):
             raise FrontendError("narrow saturation must be a boolean", self._location(call))
         result_type = with_element(value.type, ScalarType(dtype))
         return self._emit(
-            "weft_kernel.cast",
+            "weft_kernel.narrow",
             call,
             operands=(value,),
             result_types=(result_type,),
@@ -1638,12 +1701,12 @@ class FrontendCompiler:
         )[0]
 
     def _intrinsic_mac_pairs(self, call: ast.Call) -> Value:
-        return self._mac_groups(call, 2, "mac_pairs")
+        return self._mac_groups(call, 2, "mac_groups")
 
     def _intrinsic_mac_groups(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("a", "b"), {"n": None, "into": None})
         n = self._eval_static(args["n"]) if isinstance(args["n"], ast.expr) else args["n"]
-        if not isinstance(n, int):
+        if isinstance(n, bool) or not isinstance(n, int):
             raise FrontendError("mac_groups requires integer n", self._location(call))
         return self._mac_groups(call, n, "mac_groups", args)
 
@@ -1660,10 +1723,35 @@ class FrontendCompiler:
         into = self._eval_static(args["into"]) if isinstance(args["into"], ast.expr) else args["into"]
         if not isinstance(into, DType):
             raise FrontendError(f"{operation} requires an explicit into dtype", self._location(call))
-        broadcast_shape, broadcast_axes = self._broadcast_domain(lhs.type, rhs.type, call)
-        shape = list(broadcast_shape)
-        if not shape:
-            raise FrontendError(f"{operation} requires a logical vector", self._location(call))
+        if not isinstance(element_type(lhs.type), ScalarType) or not isinstance(
+            element_type(rhs.type), ScalarType
+        ):
+            raise FrontendError(
+                f"{operation} requires numeric scalar elements", self._location(call)
+            )
+        lhs_shape, rhs_shape = shape_of(lhs.type), shape_of(rhs.type)
+        lhs_axes, rhs_axes = axes_of(lhs.type), axes_of(rhs.type)
+        if not lhs_axes or not rhs_axes or lhs_axes[-1] != rhs_axes[-1]:
+            raise FrontendError(
+                f"{operation} requires one final common grouped axis",
+                self._location(call),
+            )
+        grouped_axis = lhs_axes[-1]
+        broadcast_axes = tuple(
+            [axis for axis in lhs_axes if axis != grouped_axis]
+            + [axis for axis in rhs_axes if axis != grouped_axis and axis not in lhs_axes]
+            + [grouped_axis]
+        )
+        extents: dict[int, int] = {}
+        for axes, shape_ in ((lhs_axes, lhs_shape), (rhs_axes, rhs_shape)):
+            for axis, extent in zip(axes, shape_):
+                if axis in extents and extents[axis] != extent:
+                    raise FrontendError(
+                        f"{operation} operands disagree on a shared axis extent",
+                        self._location(call),
+                    )
+                extents[axis] = extent
+        shape = [extents[axis] for axis in broadcast_axes]
         if group <= 0:
             raise FrontendError(f"{operation} group must be positive", self._location(call))
         if shape[-1] > 0 and shape[-1] % group:
@@ -1691,18 +1779,26 @@ class FrontendCompiler:
         axes = list(axes_of(value.type))
         if not shape:
             raise FrontendError("reduce requires a shaped Value", self._location(call))
+        if not isinstance(element_type(value.type), ScalarType):
+            raise FrontendError(
+                "reduce requires numeric scalar elements", self._location(call)
+            )
         position = len(shape) - 1
         if isinstance(axis, str):
             axis_id = self._axis_ids.get(axis.lower())
             if axis_id not in axes:
                 raise FrontendError("reduce axis is not present", self._location(call))
             position = axes.index(axis_id)
-        elif isinstance(axis, int):
+        elif isinstance(axis, int) and not isinstance(axis, bool):
             if axis < 0 or axis >= len(shape):
                 raise FrontendError("reduce axis position is out of range", self._location(call))
             position = axis
         elif axis is not None:
             raise FrontendError("reduce axis is a logical name or position", self._location(call))
+        if op not in {"add", "max", "min"}:
+            raise FrontendError(
+                "reduce op must be add, max, or min", self._location(call)
+            )
         shape.pop(position)
         axes.pop(position)
         result_type = value_type(element_type(value.type), tuple(shape), tuple(axes))
@@ -1720,6 +1816,14 @@ class FrontendCompiler:
         shape = list(shape_of(value.type))
         if not shape:
             raise FrontendError("fold2 requires a shaped Value", self._location(call))
+        fold_element = element_type(value.type)
+        if (
+            not isinstance(fold_element, ScalarType)
+            or fold_element.dtype.category is not DTypeCategory.INTEGER
+        ):
+            raise FrontendError(
+                "fold2 requires fixed-width integer elements", self._location(call)
+            )
         if shape[-1] > 0 and shape[-1] % 2:
             raise FrontendError("fold2 input extent must be even", self._location(call))
         shape[-1] = shape[-1] // 2 if shape[-1] > 0 else shape[-1]
@@ -1752,6 +1856,11 @@ class FrontendCompiler:
         if acc is not None and not isinstance(acc, DType):
             raise FrontendError("contract acc must be a Weft dtype", self._location(call))
         names = (over,) if isinstance(over, str) else tuple(over or ())
+        if not names:
+            raise FrontendError(
+                f"{operation} requires one or more explicit reduction axes",
+                self._location(call),
+            )
         reduction_axes: list[int] = []
         for name in names:
             axis = self._axis_ids.get(str(name).lower())
@@ -1770,6 +1879,15 @@ class FrontendCompiler:
         accumulator_dtype: DType | None,
     ) -> Value:
         lhs_axes, rhs_axes = axes_of(lhs.type), axes_of(rhs.type)
+        lhs_element = element_type(lhs.type)
+        rhs_element = element_type(rhs.type)
+        if not isinstance(lhs_element, ScalarType) or not isinstance(
+            rhs_element, ScalarType
+        ):
+            raise FrontendError(
+                "contraction operands must have numeric scalar elements",
+                self._location(call),
+            )
         for axis in reduction_axes:
             if axis not in lhs_axes or axis not in rhs_axes:
                 raise FrontendError("contraction axis must occur in both operands", self._location(call))
@@ -1781,18 +1899,19 @@ class FrontendCompiler:
                     continue
                 output_shape.append(dimension)
                 output_axes.append(axis)
-        result_element = (
-            ScalarType(accumulator_dtype)
-            if accumulator_dtype is not None
-            else element_type(lhs.type)
-        )
-        if (
-            accumulator_dtype is None
-            and isinstance(result_element, ScalarType)
-            and result_element.dtype.bits
-            and result_element.dtype.bits < 32
+        if accumulator_dtype is not None:
+            result_element = ScalarType(accumulator_dtype)
+        elif isinstance(lhs_element, ScalarType) and isinstance(
+            rhs_element, ScalarType
         ):
-            result_element = ScalarType(f32)
+            result_element = ScalarType(
+                self._promote_dtype(lhs_element.dtype, rhs_element.dtype)
+            )
+        else:
+            raise FrontendError(
+                "contraction requires numeric operands and an explicit accumulator when promotion is ambiguous",
+                self._location(call),
+            )
         result_type = value_type(result_element, tuple(output_shape), tuple(output_axes))
         attributes = {"over": _i64_array(reduction_axes)}
         if accumulator_dtype is not None:
@@ -1806,17 +1925,47 @@ class FrontendCompiler:
         )[0]
 
     def _intrinsic_lookup(self, call: ast.Call) -> Value:
-        args = self._arguments(call, ("table", "idx"), {})
+        args = self._arguments(call, ("table", "idx"), {"bounds": None})
         table = self._expect_value(self._compile_expr(args["table"]), args["table"])
         if isinstance(table.type, (SliceType, ViewType)):
             table = self._admit_value(table, args["table"])
+        if not isinstance(table.type, LocalValueType) or not isinstance(
+            element_type(table.type), ScalarType
+        ):
+            raise FrontendError(
+                "lookup table must be a shaped numeric local Value",
+                self._location(call),
+            )
         indices = self._expect_value(self._compile_expr(args["idx"]), args["idx"])
+        index_element = element_type(indices.type)
+        if (
+            not isinstance(indices.type, (ScalarType, LocalValueType))
+            or not isinstance(index_element, ScalarType)
+            or index_element.dtype.category
+            not in {DTypeCategory.INTEGER, DTypeCategory.INDEX}
+            or index_element.dtype.signedness == "signed"
+        ):
+            raise FrontendError(
+                "lookup indices must be unsigned integer or index Values",
+                self._location(call),
+            )
+        bounds = (
+            self._eval_static(args["bounds"])
+            if isinstance(args["bounds"], ast.expr)
+            else args["bounds"]
+        )
+        if bounds != "in_bounds":
+            raise FrontendError(
+                "lookup currently requires explicit bounds='in_bounds'",
+                self._location(call),
+            )
         result_type = value_type(element_type(table.type), shape_of(indices.type), axes_of(indices.type))
         return self._emit(
             "weft_kernel.lookup",
             call,
             operands=(table, indices),
             result_types=(result_type,),
+            attributes={"bounds": _string(bounds)},
         )[0]
 
     def _intrinsic_interleave(self, call: ast.Call) -> Value:
@@ -1825,6 +1974,16 @@ class FrontendCompiler:
         if not isinstance(value.type, ViewType) or self._derive_result is None:
             raise FrontendError("interleave is used by a derived encoding builder", self._location(call))
         rows = self._eval_static(args["rows"]) if isinstance(args["rows"], ast.expr) else args["rows"]
+        if (
+            isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows <= 0
+            or self._derive_result.encoding.parameters != (rows,)
+        ):
+            raise FrontendError(
+                "interleave rows must equal the concrete derived Encoding parameter",
+                self._location(call),
+            )
         return self._emit(
             "weft_kernel.interleave",
             call,
@@ -1847,6 +2006,13 @@ class FrontendCompiler:
     def _intrinsic_exp(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("value",), {})
         value = self._expect_value(self._compile_expr(args["value"]), args["value"])
+        exp_element = element_type(value.type)
+        if (
+            not isinstance(exp_element, ScalarType)
+            or exp_element.dtype.category
+            not in {DTypeCategory.FLOAT, DTypeCategory.BFLOAT}
+        ):
+            raise FrontendError("exp requires floating-point elements", self._location(call))
         return self._emit(
             "weft_kernel.unary",
             call,
@@ -1858,6 +2024,8 @@ class FrontendCompiler:
     def _intrinsic_abs(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("value",), {})
         value = self._expect_value(self._compile_expr(args["value"]), args["value"])
+        if not isinstance(element_type(value.type), ScalarType):
+            raise FrontendError("abs requires numeric scalar elements", self._location(call))
         return self._emit(
             "weft_kernel.unary",
             call,
@@ -1890,13 +2058,16 @@ class FrontendCompiler:
             raise FrontendError("with is reserved for a Weft Level", self._location(statement))
         if self.active_domain is None:
             raise FrontendError("Level requires an enclosing domain", self._location(statement))
-        domain_type = self._level_domain(constructor.relation, item.context_expr)
+        domain_type, extent, partition, multiplicity = self._level_domain(
+            constructor.relation, item.context_expr
+        )
         domain = self._emit(
             "weft_kernel.domain",
             item.context_expr,
-            operands=(self.active_domain,),
+            operands=(self.active_domain, extent, partition, multiplicity),
             result_types=(domain_type,),
         )[0]
+        self._domain_partition_values[domain_type.domain_id] = partition
         point_type = DomainPointType(domain_type)
 
         state_statements = [s for s in statement.body if self._birth_kind(s) == "state"]
@@ -1945,7 +2116,6 @@ class FrontendCompiler:
             "weft_kernel.handoff",
             statement,
             operands=handed,
-            attributes={"names": _strings(carried_names)},
         )
         self.block, self.env, self.immutable_names, self.active_domain = saved
         results = self._emit(
@@ -1955,10 +2125,6 @@ class FrontendCompiler:
             result_types=tuple(value.type for value in carried_values),
             regions=(state_region, staged_region, body),
             result_names=tuple(carried_names),
-            attributes={
-                "state_names": _strings(state_names),
-                "staged_names": _strings(staged_names),
-            },
         )
         for name, result in zip(carried_names, results):
             self.env[name] = result
@@ -1989,7 +2155,57 @@ class FrontendCompiler:
         self.block, self.env, self.immutable_names = saved
         return region, names, tuple(values)
 
-    def _level_domain(self, relation: str, call: ast.Call) -> DomainType:
+    def _source_auto_value(self, specification: AutoSpec, node: ast.AST) -> tuple[Value, str | int]:
+        if len(specification.choices) == 1 and isinstance(
+            specification.choices[0], str
+        ):
+            name = specification.choices[0]
+            choices: tuple[int, ...] = ()
+            spelling: str | int = name
+        elif specification.choices and all(
+            isinstance(choice, int)
+            and not isinstance(choice, bool)
+            and choice > 0
+            for choice in specification.choices
+        ):
+            choices = tuple(int(choice) for choice in specification.choices)
+            name = "auto$" + "$".join(str(choice) for choice in choices)
+            spelling = name
+        else:
+            raise FrontendError(
+                "auto is one symbolic parameter or a finite list of positive integers",
+                self._location(node),
+            )
+        existing = self._auto_symbols.get(name)
+        if existing is not None:
+            if self._auto_choices[name] != choices:
+                raise FrontendError(
+                    f"auto parameter {name!r} has inconsistent choices",
+                    self._location(node),
+                )
+            return existing, spelling
+        if self._kernel_body is None:
+            raise AssertionError("source auto parameter requires a kernel body")
+        operation = self.builder.operation(
+            "weft_kernel.symbol",
+            self._location(node),
+            result_types=(ScalarType(index),),
+            attributes={
+                "name": _string(name),
+                "kind": _string("source_auto"),
+                "choices": _i64_array(choices),
+            },
+            result_names=(name,),
+        )
+        self._kernel_body.operations.insert(0, operation)
+        value = operation.results[0]
+        self._auto_symbols[name] = value
+        self._auto_choices[name] = choices
+        return value, spelling
+
+    def _level_domain(
+        self, relation: str, call: ast.Call
+    ) -> tuple[DomainType, Value, Value, Value]:
         arguments = list(call.args)
         keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
         parent = self.active_domain.type
@@ -2002,37 +2218,55 @@ class FrontendCompiler:
                 source_domain = self.env[source.id].type.domain
                 axis_name = source_domain.axis_name.split(".")[0]
                 axis_id = source_domain.axis_id
-                extent = source_domain.partition
+                extent_value = self._domain_partition_values[source_domain.domain_id]
             elif isinstance(source, ast.Name):
                 axis_name = source.id.lower()
                 axis_id = self._axis_id(source.id)
-                extent = source.id
+                extent_value = self._shape_symbols[source.id]
             else:
                 raise FrontendError("Level domain is a shape symbol or parent point", self._location(source))
         else:
             axis_name = parent.axis_name.split(".")[0]
             axis_id = parent.axis_id
-            extent = parent.partition
+            extent_value = self._domain_partition_values[parent.domain_id]
         parameter_name = "group" if relation in {"rows", "cols"} else "extent"
         if parameter_name not in keywords:
             raise FrontendError(f"L.{relation} requires {parameter_name}=", self._location(call))
         parameter = self._eval_static(keywords[parameter_name])
         if isinstance(parameter, AutoSpec):
-            partition = "auto:" + (
-                str(parameter.choices[0])
-                if len(parameter.choices) == 1
-                else "|".join(str(choice) for choice in parameter.choices)
+            partition_value, partition_spelling = self._source_auto_value(
+                parameter, keywords[parameter_name]
             )
         elif isinstance(parameter, int) and parameter > 0:
-            partition = str(parameter)
+            partition_value = self._constant(
+                parameter, index, keywords[parameter_name]
+            )
+            partition_spelling = parameter
         else:
             raise FrontendError("Level partition is a positive integer or auto declaration", self._location(call))
-        multiplicity = f"ceildiv({extent},{partition.removeprefix('auto:')})"
+        multiplicity = self._emit(
+            "arith.ceildivui",
+            call,
+            operands=(extent_value, partition_value),
+            result_types=(ScalarType(index),),
+        )[0]
         serial = self._next_domain_serial
         self._next_domain_serial += 1
-        return DomainType(
-            f"{axis_name}.{serial}", axis_id, relation, extent, partition, multiplicity, "tail"
+        tail = "tail"
+        if isinstance(partition_spelling, int):
+            extent_spelling = self._domain_partition_spelling.get(parent.domain_id)
+            if isinstance(extent_spelling, int) and extent_spelling % partition_spelling == 0:
+                tail = "exact"
+        domain = DomainType(
+            f"{axis_name}.{serial}",
+            serial,
+            parent.domain_id,
+            axis_id,
+            relation,
+            tail,
         )
+        self._domain_partition_spelling[serial] = partition_spelling
+        return domain, extent_value, partition_value, multiplicity
 
     def _compile_for(self, statement: ast.For) -> None:
         if statement.orelse or not isinstance(statement.target, ast.Name) or not isinstance(statement.iter, ast.Call):
@@ -2065,13 +2299,13 @@ class FrontendCompiler:
             self.env[name] = argument
         self._compile_statements(statement.body)
         self._emit(
-            "weft_kernel.yield",
+            "scf.yield",
             statement,
             operands=tuple(self.env[name] for name in carried_names),
         )
         self.block, self.env = saved
         results = self._emit(
-            "weft_kernel.for",
+            "scf.for",
             statement,
             operands=(lower, upper, step) + init_values,
             result_types=tuple(value.type for value in init_values),
@@ -2085,8 +2319,21 @@ class FrontendCompiler:
         condition = self._expect_value(self._compile_expr(statement.test), statement.test)
         if condition.type != ScalarType(i1):
             raise FrontendError("if condition is scalar i1", self._location(statement.test))
+        then_assigned = _assigned_names(statement.body)
+        else_assigned = _assigned_names(statement.orelse)
+        branch_defined = then_assigned | else_assigned
+        missing = sorted(
+            (branch_defined & live_after)
+            - set(self.env)
+            - (then_assigned & else_assigned)
+        )
+        if missing:
+            raise FrontendError(
+                f"if value {missing[0]!r} is live after the branch but is not defined on both paths",
+                self._location(statement),
+            )
         merged_names = sorted(
-            (_assigned_names(statement.body) | _assigned_names(statement.orelse))
+            branch_defined
             & (set(self.env) | live_after)
         )
         outer_env = self.env
@@ -2097,7 +2344,7 @@ class FrontendCompiler:
             self.block, self.env = region, dict(outer_env)
             self._compile_statements(statements)
             values = tuple(self.env[name] for name in merged_names)
-            self._emit("weft_kernel.yield", statement, operands=values)
+            self._emit("scf.yield", statement, operands=values)
             self.block, self.env = saved
             return region, values
 
@@ -2106,7 +2353,7 @@ class FrontendCompiler:
         if tuple(value.type for value in then_values) != tuple(value.type for value in else_values):
             raise FrontendError("if branch result types must match", self._location(statement))
         results = self._emit(
-            "weft_kernel.if",
+            "scf.if",
             statement,
             operands=(condition,),
             result_types=tuple(value.type for value in then_values),
@@ -2135,7 +2382,7 @@ class FrontendCompiler:
         if condition.type != ScalarType(i1):
             raise FrontendError("while condition is scalar i1", self._location(statement.test))
         self._emit(
-            "weft_kernel.condition",
+            "scf.condition",
             statement,
             operands=(condition,) + condition_region.arguments,
         )
@@ -2144,13 +2391,13 @@ class FrontendCompiler:
             self.env[name] = argument
         self._compile_statements(statement.body)
         self._emit(
-            "weft_kernel.yield",
+            "scf.yield",
             statement,
             operands=tuple(self.env[name] for name in carried_names),
         )
         self.block, self.env = saved
         results = self._emit(
-            "weft_kernel.while",
+            "scf.while",
             statement,
             operands=init_values,
             result_types=tuple(value.type for value in init_values),
@@ -2162,11 +2409,21 @@ class FrontendCompiler:
 
     def _type_signature(self, value_type_: ValueType) -> tuple[object, ...]:
         if isinstance(value_type_, (ViewType, SliceType)):
-            return ("view", value_type_.encoding.family, len(value_type_.shape))
+            return (
+                "view",
+                self._type_signature(value_type_.encoding),
+                len(value_type_.shape),
+            )
         if isinstance(value_type_, ScalarType):
             return ("scalar", value_type_.dtype.name)
         if isinstance(value_type_, EncodingType):
-            return ("encoding", value_type_.family)
+            return (
+                "encoding",
+                value_type_.family,
+                value_type_.kind,
+                value_type_.layout_identity,
+                value_type_.parameters,
+            )
         if isinstance(value_type_, LocalValueType):
             element = self._type_signature(value_type_.element_type)
             return ("value", element, len(value_type_.shape))
@@ -2220,16 +2477,49 @@ class FrontendCompiler:
             encoding_node = items[0]
             if isinstance(encoding_node, ast.Subscript):
                 encoding = source.resolve(encoding_node.value)
+                parameters = (
+                    list(encoding_node.slice.elts)
+                    if isinstance(encoding_node.slice, ast.Tuple)
+                    else [encoding_node.slice]
+                )
             else:
                 encoding = source.resolve(encoding_node)
+                parameters = []
             if isinstance(encoding, DType):
-                family = encoding.name
-            elif isinstance(encoding, (EncodingDefinition, DerivedEncodingDefinition)):
-                family = encoding.__name__
+                encoding_signature: tuple[object, ...] = (
+                    "encoding",
+                    encoding.name,
+                    "dense",
+                    f"dense.{encoding.name}",
+                    (),
+                )
+            elif isinstance(encoding, EncodingDefinition):
+                encoding_signature = (
+                    "encoding",
+                    encoding.__name__,
+                    "base",
+                    encoding.__name__,
+                    (),
+                )
+            elif isinstance(encoding, DerivedEncodingDefinition):
+                try:
+                    values = tuple(int(ast.literal_eval(value)) for value in parameters)
+                except (ValueError, TypeError):
+                    return None
+                identity = encoding.__name__ + "[" + ",".join(
+                    str(value) for value in values
+                ) + "]"
+                encoding_signature = (
+                    "encoding",
+                    encoding.__name__,
+                    "derived_instance",
+                    identity,
+                    values,
+                )
             else:
                 return None
             shape = items[1].elts if isinstance(items[1], (ast.Tuple, ast.List)) else [items[1]]
-            return ("view", family, len(shape))
+            return ("view", encoding_signature, len(shape))
         return None
 
     def _call_nodes_for_definition(

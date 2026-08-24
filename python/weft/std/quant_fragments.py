@@ -17,24 +17,33 @@ def signed_scale(raw, zero: int = 0):
 
 
 def grid_sign(grid, signs, grid_index, sign_index, lane, lanes: int = 8):
-    grid_value = lookup(grid, u32(grid_index) * u32(lanes) + u32(lane))
-    sign_value = lookup(signs, u32(sign_index) * u32(lanes) + u32(lane))
+    grid_value = lookup(
+        grid, u32(grid_index) * u32(lanes) + u32(lane), bounds="in_bounds"
+    )
+    sign_value = lookup(
+        signs, u32(sign_index) * u32(lanes) + u32(lane), bounds="in_bounds"
+    )
     return grid_value * sign_value
 
 
 def grid_delta(grid, grid_index, lane, delta):
-    return lookup(grid, u32(grid_index) * u32(8) + u32(lane)) + f32(delta)
+    return (
+        lookup(
+            grid, u32(grid_index) * u32(8) + u32(lane), bounds="in_bounds"
+        )
+        + f32(delta)
+    )
 
 
 def nonlinear_lookup(codebook, code):
-    return lookup(codebook, u32(code))
+    return lookup(codebook, u32(code), bounds="in_bounds")
 
 
 def exponent_scale(table, raw):
-    return lookup(table, u32(raw))
+    return lookup(table, u32(raw), bounds="in_bounds")
 
 
 def radix3_digit(powers, packed, digit):
-    power = lookup(powers, u32(digit))
+    power = lookup(powers, u32(digit), bounds="in_bounds")
     wrapped = (u32(packed) * u32(power)) & u32(255)
     return i32((wrapped * u32(3)) >> u32(8)) - i32(1)

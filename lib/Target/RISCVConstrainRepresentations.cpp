@@ -5,6 +5,7 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
@@ -31,6 +32,25 @@ std::optional<int64_t> resolvePartition(llvm::StringRef partition,
     return std::nullopt;
   auto value = bindings.getAs<mlir::IntegerAttr>(partition);
   return value ? std::optional<int64_t>(value.getInt()) : std::nullopt;
+}
+
+std::optional<int64_t> resolvePartition(kernel::DomainOp domain,
+                                        mlir::DictionaryAttr candidate) {
+  mlir::Value partition = domain.getPartition();
+  if (auto constant = partition.getDefiningOp<mlir::arith::ConstantOp>()) {
+    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+        integer && integer.getInt() > 0)
+      return integer.getInt();
+  }
+  if (auto symbol = partition.getDefiningOp<kernel::SymbolOp>();
+      symbol && symbol.getKind() == "source_auto") {
+    auto bindings = candidate.getAs<mlir::DictionaryAttr>("auto_bindings");
+    auto value = bindings ? bindings.getAs<mlir::IntegerAttr>(symbol.getName())
+                          : mlir::IntegerAttr();
+    if (value && value.getInt() > 0)
+      return value.getInt();
+  }
+  return std::nullopt;
 }
 
 bool containsAxis(mlir::DictionaryAttr value, int64_t axis) {
@@ -106,7 +126,6 @@ bool propagatesLaneIdentity(llvm::StringRef name) {
          name == "weft_kernel.binary" || name == "weft_kernel.compare" ||
          name == "weft_kernel.cast" || name == "weft_kernel.widen" ||
          name == "weft_kernel.narrow" || name == "weft_kernel.fold2" ||
-         name == "weft_kernel.mac_pairs" ||
          name == "weft_kernel.mac_groups" ||
          name == "weft_kernel.dot" || name == "weft_kernel.contract" ||
          name == "weft_kernel.outer_contract" ||
@@ -164,8 +183,7 @@ public:
       llvm::DenseMap<int64_t, AxisFacts> axisFacts;
       kernel.walk([&](kernel::DomainOp domainOp) {
         kernel::DomainType domain = domainOp.getResult().getType();
-        auto partition =
-            resolvePartition(domain.getPartition(), problem.getCandidate());
+        auto partition = resolvePartition(domainOp, problem.getCandidate());
         if (!partition || *partition <= 1)
           return;
         int priority =
@@ -1063,9 +1081,7 @@ public:
                name == "weft_kernel.extract" ||
                name == "weft_kernel.lookup" ||
                name == "weft_kernel.reduce" ||
-               name == "weft_kernel.scan" ||
                name == "weft_kernel.fold2" ||
-               name == "weft_kernel.mac_pairs" ||
                name == "weft_kernel.mac_groups" ||
                name == "weft_kernel.dot" ||
                name == "weft_kernel.contract" ||
