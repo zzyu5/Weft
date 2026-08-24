@@ -34,6 +34,12 @@ lane / register tuple / fragment / memory operation / intrinsic / local asm
 - 局部软件流水、spill、reload 和 rematerialization；
 - intrinsic 名称与 inline asm spelling。
 
+### 1.1 与上游算子合同的边界
+
+Weft 不依赖某个上游前端才能成立。kernel 可以直接用 DSL 编写，也可以由仓库外的前端生成 Canonical Kernel IR。
+
+若上游系统只给出原子的数学 contract，它定义的是一个语义等价类；Weft 作者从中选择一份确定的、有限位宽且带 Level/lifetime 的 realization。i16 partial、min correction 支路和 staged birth 无法保存在仍然原子的 contract 内。Weft 不打开 contract 自动发现这些结构，也不证明所选 realization 与某个上游 contract 数学等价。
+
 ## 2. Q4_K 说明的缺口
 
 设一条 Q4_K weight block 与一条 Q8_K activation block 的数学关系为：
@@ -284,7 +290,23 @@ Weft 选择暴露另一组事实：
 
 这不是“TileLang 写不出来、Weft 写得出来”的区别；它是源语言保存的结构不同。TileLang 保存硬件感知的 buffer/copy/thread structure，Weft 保存 encoding-aware 数值树与 logical lifetime structure。
 
-## 9. 正确性边界
+## 9. 语言贡献、编译器贡献与目标边界
+
+Weft 的两项贡献必须分开表述：
+
+```text
+语言：    encoding-aware、层级化、有限位宽的数值 realization
+编译器：  把完整 logical Value 沿 time、lane、register replica、fragment 与
+          local storage 物理化的非 SIMT target machine、typed IR 与 passes
+```
+
+第一项并非非 SIMT 专属：同一棵数值树也可以映射到 GPU。非 SIMT 的部分来自第二项——logical Value 不预先归属于虚拟 thread，target compiler 对完整值进行物理分解。因此不能仅凭“语言里没有线程”主张机器贡献，也不能仅凭一条手工优化路径主张编译器已经完成这种分解。
+
+以 algorithm/schedule 分层的系统可以把这类数值分解写成另一份 algorithm，但保持数值不变的 schedule 无法承载 partial 数量、有限位宽或 Level birth 的变化。手写 intrinsic 可以表达全部内容，却把数值树和 LMUL、寄存器组织、指令及流水固定在同一份程序里。Weft 固定前者，重新物理化后者。
+
+固定形状矩阵引擎仍可成为 target profile，但它提供的合法 fragment 往往使结构自由度远小于 RVV/IME。若高性能需要改变外部 batch、融合边界、padding、logical materialization 或 Level，调用方或作者必须提供另一棵程序；target compiler 不能为了迁就固定引擎暗中改变 canonical tree。TPU 类固定 MXU 因而是可表达但收益较窄的边缘目标，不是调整根模型的理由。
+
+## 10. 正确性边界
 
 Encoding 与浮点数值使用不同判据：
 

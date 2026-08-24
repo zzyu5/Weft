@@ -78,11 +78,24 @@ production `MUL_MAT`、standalone vec-dot、activation quantize和row dequantize
 5. **Terminal spelling：** intrinsic/asm是否忠实，Clang是否保留已选physical形态；
 6. **Measurement：** workload、timing、flags与cache状态是否匹配。
 
-第1项不一致时，修改DSL/std并作为新的作者程序重新比较。若tree、Encoding、std与physical passes已经闭合，但达到baseline仍必须改变canonical logical Value集合或Level归属，应停止并报告spec 2.2可能被证伪，不能让compiler暗中改tree。
+第1项不一致时，修改DSL/std并作为新的作者程序重新比较。若tree、Encoding、std与physical passes已经闭合，但达到baseline仍必须改变canonical logical Value集合或Level归属，应停止并报告[唯一职责判据](../model/programming-model.md#6-唯一职责判据)可能被证伪，不能让compiler暗中改tree。
 
 性能比、分档和聚类只是定位共享能力缺口的工具，不是编译器架构。单条高性能不能证明泛化，平均数也不能代替逐case事实。
 
-## 5. 禁止实验驱动出隐藏语言
+## 5. 外部反证，而不是内部自评
+
+“有 pass”“emitter 只拼写”或一条深度优化路径达到 baseline，都不能证明抽象成立。至少要改变会迫使物理表示重新形成的外部条件：
+
+- 同一 source tree 在 VLEN128、VLEN256 与合法 RVV/IME profile 上编译；
+- 改变 cohort、source `auto` 绑定、shape、stride、predicate 或普通 consumer；
+- 让相同 operation/Encoding 出现在不同 Level、use-def 与 memory context；
+- 使用没有针对性后端改动的新格式或 std 函数。
+
+这些变化后，作者不应手工补 LMUL、local-pack schema、lane/register mapping、fragment 或 pipeline。若必须补这些信息，说明 physical machine 或 passes 没有真正承载该决定。若必须改变 canonical Value 集合、Level 或 artifact 才能获得所需实现，则把它记录为作者程序差异或职责判据的设计信号，不能由后端静默完成。
+
+跨机器只检验目标事实是否产生各自合法的 physical program；速度只与同一机器、同一 case 的 baseline 比较。K1 的 intrinsic C 能生成不能代替 K1 真机执行，SG2044 的结果也不能外推为 VLEN256/IME 结论。
+
+## 6. 禁止实验驱动出隐藏语言
 
 不允许：
 

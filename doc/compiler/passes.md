@@ -54,7 +54,13 @@ pass 后必须满足哪些不变量
 
 pass-local analysis map 可以存在；跨 pass 结果必须写回 type、operation、region 或真实 entity 的 typed attribute。stage 字符串和 value/op dictionaries 不能成为跨 pass authority。
 
-## 3. 与 Triton/TileLang 的机制关系
+## 3. 可观察性
+
+每个 pass 后必须能够 dump 同一份 RISC-V module。dump 中应直接看见该 pass 实际造成的 type/layout 变化、`convert_layout` 插入或删除、memory/target-op 替换、physical loop 与 pipeline 展开，以及 spill/reload/rematerialization。只打印 analysis table、assignment dictionary 或 pass 名称不能证明程序已经被改写。
+
+若某项跨 pass 决定只能从 side record 观察，说明它尚未进入 physical IR；若 final emitter 需要回查 Canonical Kernel IR 或补默认字段才能输出，说明前序 pass contract 未闭合。
+
+## 4. 与 Triton/TileLang 的机制关系
 
 Triton 的 Coalesce、AccelerateMatmul、RemoveLayoutConversions 和 Pipeline 都在 TTGIR 上重写同一份程序，不是四层 IR：
 

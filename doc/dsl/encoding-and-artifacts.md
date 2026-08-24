@@ -37,13 +37,13 @@ class Q8_K:
 - `elements`：一条 storage record 对应多少个逻辑元素；
 - field 的逻辑 shape 和 element bit width；
 - field storage span；
-- grouping、layering、bit plane 或 join 关系；
+- grouping、layering 或 join 关系；
 - alignment；省略时语义等于 `alignment = 1`；
 - 非空 padding 的位置与内容要求；省略时语义等于没有 padding。
 
 `elements` 不能从最大字段长度猜测。radix bytes、grid indices 或 metadata field 可以只覆盖 record 的一种存储分解，但整条 record 仍对应另一数量的逻辑元素。
 
-字段声明顺序与完整的 `natural/grouped/layered/bit_planes/joined` 组合必须能唯一计算每个 field 的 storage span；示例因此不重复书写 byte offset。若这些关系不能唯一确定 span，Encoding 非法，作者必须补足布局关系。未声明 padding只表示没有 padding，不允许用它解释未覆盖的空洞。
+字段声明顺序与完整的 `natural/grouped/layered/joined` 组合必须能唯一计算每个 field 的 storage span；示例因此不重复书写 byte offset。若这些关系不能唯一确定 span，Encoding 非法，作者必须补足布局关系。未声明 padding只表示没有 padding，不允许用它解释未覆盖的空洞。
 
 `alignment` 是一条 serialized storage record 起始地址必须满足的最小对齐，不是某个 host C struct 的自然对齐，也不是外层 tensor allocator 的对齐。目标代码若要把地址转换成具有更强 C ABI 对齐要求的对象，必须在该使用点另行证明要求成立。
 
@@ -91,11 +91,11 @@ with L.subs(extent=32) as sub:
 
 后一种投影只有在 `elements / field_extent == Level partition` 时唯一成立；其 field coordinate 是当前 point 在 record 内的 ordinal。选择会消去这个 record-local field axis，并保留其它 free axes：对单条 record，`block.sc[sub]` 是 scalar；对 16-row cohort，它是 `[16]`。若比例关系不唯一，作者必须显式给出 index/reshape relation，前端不能根据字段名或使用位置猜测。这个规则只定义 logical indexing，不声称 `sc` 是 scale，也不赋予 field 数值不变量。
 
-### 2.5 `bit_planes(w0, w1, ...)`
+### 2.5 保留但不公开的 `bit_planes`
 
-一个逻辑值的不同 bit 片段位于独立的重复 storage plane。它只描述 plane 位置、宽度和组合次序，不执行数值解码。
+全格式布局中确实存在“一个逻辑值的不同 bit 片段位于独立重复 storage plane”的关系，但 `bit_planes` 尚未形成唯一的 source type、verifier 与 lowering 合同，因此不是公开 DSL 构造。
 
-Q5/Q6 类格式可以让 low bits 和 high bits 分处不同 field/plane；kernel 读取的仍是合成后的逻辑 field value。
+在合同闭合前，Q5/Q6 等格式把 low/high bits 声明为真实、独立的 storage fields，由普通数值函数显式组合。前端不能接受半成品 `bit_planes` annotation，emitter 也不能根据格式名恢复 plane 关系。公开它的条件不是格式数量，而是同一声明能唯一决定 storage mapping，并有不依赖格式名的真实 lowering consumer。
 
 ### 2.6 `joined(group, fields, low_bits, order)`
 
@@ -239,7 +239,7 @@ Encoding 验证针对离散 storage 事实：
 
 - 字段 storage span 不重叠；
 - bit/byte order 完整；
-- grouped/layered/planes/join 映射在声明域内；
+- grouped/layered/join 映射在声明域内；
 - padding 完整覆盖空洞；
 - derived builder 的 result family 与声明一致；
 - consumer 的 pinned layout identity 与 artifact 一致。

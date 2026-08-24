@@ -2,6 +2,8 @@
 
 Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下一个确定的、层级化的有限位宽数值程序；目标编译器在非 SIMT 物理抽象机器上为这份程序决定表示、局部指令和执行形态。本目录定义编程模型、DSL、目标物理机器和两层 MLIR 编译主干。
 
+本文件及其链接是项目当前唯一设计规范。源码说明当前实现事实；`report/` 只保存一次性工作结果、baseline 来源和性能数据，不能反向定义语言或编译器合同。
+
 文件分工不等于 IR 层次。Weft 的程序 IR 始终只有 Canonical Kernel IR 与 target-aware physical IR 两层。
 
 ## `model/`
