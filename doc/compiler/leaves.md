@@ -1,62 +1,74 @@
 # RISC-V Local Leaf
 
-## 1. Leaf 的边界
+## 1. 边界
 
-local leaf 是 final RISC-V IR 中已经选定、合同闭合的 target operation。它可以是：
+local leaf 是 final RISC-V IR 中已经选定、合同闭合的 target-local operation。它可以是一条
+RVV intrinsic、一个固定短指令序列、一个 IME fragment operation，或 ISA规定的固定 opaque
+asm sequence。
 
-- 一条 RVV intrinsic；
-- 少量固定 RVV instructions 实现的 closed primitive；
-- 一个 IME fragment operation；
-- 一个 ISA 规定的固定 opaque instruction sequence。
-
-leaf 可以隐藏 ISA spelling 与 primitive-private temporaries，不能隐藏 canonical Level、outer loop、blocking、staging、state、local-pack loop、pipeline、spill、workspace、persistent Encoding、kernel ABI 或完整 operator traversal。
-
-固定 fragment 内的有限指令序列可以 opaque；其 trip count、operand window、effects、resources 和 result 必须由合同完全封闭。trip count 来自 source Level、dynamic shape 或 physical pipeline 时，循环必须在 [RISC-V IR](riscv-ir.md) 中显式存在。
-
-## 2. Typed Leaf Contract
-
-每个 leaf op 必须由类型和 verifier 声明：
+leaf的完整合同不是一个 instruction字符串，而是：
 
 ```text
-local numerical/transfer semantics
-typed operands/results、logical axes与physical layouts
-dtype、shape、mask/tail、rounding与overflow
-memory descriptor、alias、effect与order
-fragment、register/local temporaries与resources
-allowed conversions与result handoff
-intrinsic/asm spelling key、headers与toolchain requirement
-asm operands、constraints、clobbers与memory semantics
+physical op kind
++ operand/result physical types
++ layout/access/conversion/window/fragment attributes
++ LeafAttr exact instruction、spelling、mask/tail与resources
 ```
 
-opaque IME leaf 还必须声明完整 local ABI、fragment handoff、volatile 与 synchronization contract。缺少这些字段的 helper，即使能生成 asm，也不是合法 leaf。
+translator可以根据这些 typed facts展开一个有限、唯一的指令序列。它不能在多个layout、
+memory form、microtile、fragment、engine或pipeline之间再选一次。
 
-## 3. Leaf Selection
+leaf不能隐藏 canonical Level、outer traversal、blocking、state、source materialization、
+caller workspace、persistent Encoding、dynamic pack loop、pipeline或完整operator ABI。固定序列的
+slots、terms、trip count、effects和resources若不能由op合同静态闭合，就必须继续拆为真实IR。
+primitive-private C array或fragment scratch也必须写入leaf的`local_bytes`，并由resource pass计入
+kernel local-storage上界；不能只在terminal translator中出现。
 
-RVV、IME或其它extension之间的选择会改变layout、fragment、conversion与resources，必须在physical passes中完成：
+## 2. RVV leaf
 
-1. `SelectRISCVOperations`按canonical op、typed operands、axes、Encoding、profile、requirement和固定优先级选择target-op family；
-2. layout、memory、schedule、resource passes将它具体化并验证；
-3. `LowerRISCVComposites`产生最终primitive leaf ops；
-4. `VerifyFinalRISCV`确认每个leaf只有一个完整合同和可用spelling。
+一对一RVV operation由leaf固定 intrinsic family，value type固定SEW/LMUL/`vl`/register parts，
+access或conversion固定operand form。terminal lowering只把这些事实投影为Clang RVV spelling。
 
-leaf definitions和target profile capability构成可用集合；不按kernel、operator family或量化格式注册。没有合法leaf时当前module明确unsupported，不能回到emitter重选或调用旧helper。
+grouped MAC、encoded dot和contract step允许作为closed sequence：reduction loop已经在IR中，
+window type固定slots/terms/result parts，access固定storage geometry，step leaf固定widen/MAC
+sequence。改变group、unroll、lane operand或memory form会产生另一份physical op，而不是
+emitter分支选择。
 
-若两个实现的operand representation、fragment、resources、effects或instruction sequence不同，它们是不同physical leaves。若只有Clang intrinsic API或asm语法不同，而机器语义和合同相同，则属于toolchain spelling adapter，不是physical选择。
+`convert_layout`同样是terminal physical op。source/result type和`ConversionAttr`唯一决定
+split/merge/slide/splat/extract；translator实现该映射不等于重新推导layout。
 
-## 4. RVV Leaf
+spill/reload必须具有exact transfer leaf、typed local slot和完整value layout；translator不能仅凭
+binding kind自行选择一条隐藏路径。
 
-RVV leaf必须把SEW、LMUL、`vl`、mask/tail、operand/result layout和intrinsic semantics写入op contract。动态strip、source Level loop、pack loop与pipeline必须已经在IR中展开；leaf不能通过C helper重新生成这些结构。
+## 3. IME / opaque asm leaf
 
-一对一intrinsic可直接保留到terminal。固定closed sequence只有在所有temporary、资源、effects和局部顺序都可验证时才可作为opaque leaf；否则必须继续拆成primitive RVV ops。
+IME capability和operations共同固定：
 
-## 5. IME / Opaque ASM Leaf
+- fragment family、logical shape、dtype与axis relation；
+- lhs/rhs/accumulator fragment role及其tiled packing schema、tile rows/columns、tile与
+  element order、storage width与alignment；
+- MMA group/chunk数和fragment resources；
+- fragment→RVV handoff；
+- exact asm spelling key、constraints、clobbers与memory effect。
 
-IME leaf必须描述fragment family/shape、operand packing requirement、accumulator/result representation、RVV↔fragment handoff、register/fragment resources、asm constraints与clobbers。
+当前SpaceMIT IME1 leaf是一个固定的 signed-i8 `M4×K8` 与 signed-i8 `K8×N4`
+fragment product，产生 i32 `M4×N4` accumulator。lhs按`[M,K]`排列，rhs按
+`[N,K]`的物理次序装入同一个`[K,N]`逻辑值，result按`[M,N]`排列。packing tile geometry、
+axis order和各role的resource groups都是typed attribute，不能只靠`role=lhs`在emitter中复原；
+固定的pack、`vmadot`和unpack序列可以opaque，因为shape、trip count、signedness、storage width
+和clobber集合已由唯一capability/spelling合同封闭。i4 operand、其它fragment shape以及非
+VLEN256的IME1 target当前均是明确unsupported，不会由terminal translator改走另一条实现。
 
-完整GEMM/GEMV函数、按M/N/K dispatch的helper、persistent repack和带outer traversal的长asm都不是leaf。IME需要另一棵Level/materialization/persistent Encoding时，作者在lowering前选择另一份std tree；不能由leaf改树。
+完整GEMM/GEMV、persistent repack、M/N/K dispatch和outer loop不属于IME leaf。若extension需要
+不同Level/materialization或persistent Encoding，作者在lowering前选择另一份std tree。
 
-## 6. Materials 与失败边界
+## 4. 选择与失败
 
-`materials/`中的intrinsic/asm name、constraint、clobber和局部ABI可用于spelling；其中的microtile、operand reuse、fragment handoff和pipeline必须先进入target op、layout或schedule。完整旧kernel、runtime和format route不能包装成leaf。
+1. `SelectRISCVOperations`只选择局部structural family；
+2. layout、memory与composite passes把representation和真实control闭合；
+3. `FinalizeRISCVLeaves`为尚未终结的普通op写唯一exact instruction；
+4. resource pass补全leaf resource counts，final verifier核对整个合同。
 
-无合法leaf、合同字段不全、toolchain不支持spelling、resource/ABI/effect不闭合，都必须在final verifier前失败。不得fallback、静默scalar化或让terminal emitter补决定。
+leaf/capability集合不按kernel、operator或量化格式注册。无合法leaf、packing/access不完整、
+toolchain不支持spelling、resource/effect不闭合时当前module失败；不能回到emitter重选、静默
+scalar化或调用materials/GGML helper。

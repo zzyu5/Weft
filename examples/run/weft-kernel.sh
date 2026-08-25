@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <sg2044|k1> <q4_k_gemv|q4_k_gemv_groups4|q4_k_gemv_contract|q8_0_quantize|q8_1_quantize|q8_K_quantize|gemv_f32|gemm_f32> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <q4_k_gemv|q4_k_gemv_groups4|q8_0_quantize|q8_1_quantize|q8_K_quantize|gemv_f32|gemm_f32|ime_i8_contract> <repetitions>" >&2
   exit 2
 fi
 
@@ -62,15 +62,15 @@ case "${kernel}" in
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     runtime_kernel_define=-DWEFT_Q4_GROUPS4=1
     ;;
-  q4_k_gemv_contract)
+  ime_i8_contract)
     if [[ ${target} != k1 ]]; then
-      echo "q4_k_gemv_contract requires target k1 with IME" >&2
+      echo "ime_i8_contract requires target k1 with IME" >&2
       exit 2
     fi
-    dsl=examples/kernels/quantization/q4_k_gemv_contract.py
-    runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
+    dsl=examples/kernels/dense/ime_i8_contract.py
+    runtime=examples/repro/weft/ime_i8_contract_runtime.cpp
+    meta=(--meta MR=4 --meta NR=4 --meta KB=8)
     matrix_extension=spacemit-ime1
-    runtime_kernel_define=-DWEFT_Q4_IME=1
     ;;
   q8_0_quantize|q8_1_quantize|q8_K_quantize)
     dsl=examples/kernels/quantization/${kernel}.py

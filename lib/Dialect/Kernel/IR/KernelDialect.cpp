@@ -1088,7 +1088,8 @@ mlir::LogicalResult NewOp::verify() {
   if (getInitialized() != static_cast<bool>(getInitial()))
     return emitOpError("initialized must agree with the optional initial value");
   if (!getInitial())
-    return mlir::success();
+    return emitOpError(
+        "new requires an explicit initial value; uninitialized state has no canonical semantics");
   mlir::Type initial = getInitial().getType();
   mlir::Type result = getResult().getType();
   if (initial == result)

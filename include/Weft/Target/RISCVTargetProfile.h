@@ -19,19 +19,28 @@ enum class RISCVABI {
 };
 
 enum class RISCVFragmentInstruction {
-  SpacemitIME1I4I8MMA,
+  SpacemitIME1I8MMA,
+};
+
+enum class RISCVFragmentSignedness {
+  Signed,
+  Unsigned,
 };
 
 struct RISCVFragmentCapability {
   RISCVFragmentInstruction instruction =
-      RISCVFragmentInstruction::SpacemitIME1I4I8MMA;
+      RISCVFragmentInstruction::SpacemitIME1I8MMA;
+  RISCVFragmentSignedness lhsSignedness = RISCVFragmentSignedness::Signed;
+  RISCVFragmentSignedness rhsSignedness = RISCVFragmentSignedness::Signed;
   unsigned lhsElementBits = 0;
   unsigned rhsElementBits = 0;
   unsigned accumulatorElementBits = 0;
   unsigned mFactor = 1;
   unsigned nFactor = 1;
   unsigned kFactor = 1;
-  unsigned fixedResourceGroups = 0;
+  unsigned lhsResourceGroups = 0;
+  unsigned rhsResourceGroups = 0;
+  unsigned accumulatorResourceGroups = 0;
 };
 
 struct RISCVTargetProfile {

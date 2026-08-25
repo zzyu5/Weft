@@ -10,14 +10,16 @@
 namespace weft {
 
 std::unique_ptr<mlir::Pass>
-createConstructRISCVProblemsPass(RISCVCompilerOptions options);
-std::unique_ptr<mlir::Pass> createAssignRISCVRepresentationsPass();
-std::unique_ptr<mlir::Pass> createResolveRISCVLayoutConversionsPass();
-std::unique_ptr<mlir::Pass> createPropagateRISCVStorageMappingsPass();
-std::unique_ptr<mlir::Pass> createSelectRISCVLocalOperationsPass();
-std::unique_ptr<mlir::Pass> createScheduleRISCVLevelsPass();
-std::unique_ptr<mlir::Pass> createCheckRISCVResourcesPass();
-std::unique_ptr<mlir::Pass> createSelectRISCVWinnerPass();
+createConvertWeftToRISCVPass(RISCVCompilerOptions options);
+std::unique_ptr<mlir::Pass> createSelectRISCVOperationsPass();
+std::unique_ptr<mlir::Pass> createPropagateRISCVLayoutsPass();
+std::unique_ptr<mlir::Pass> createPlanRISCVMemoryPass();
+std::unique_ptr<mlir::Pass> createCanonicalizeRISCVLayoutsPass();
+std::unique_ptr<mlir::Pass> createLowerRISCVCompositesPass();
+std::unique_ptr<mlir::Pass> createPipelineRISCVLevelsPass();
+std::unique_ptr<mlir::Pass> createFinalizeRISCVLeavesPass();
+std::unique_ptr<mlir::Pass> createMaterializeRISCVResourcesPass();
+std::unique_ptr<mlir::Pass> createVerifyFinalRISCVPass();
 
 } // namespace weft
 

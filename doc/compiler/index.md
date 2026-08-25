@@ -18,6 +18,8 @@ system C compiler
 
 第一层对应 Triton TTIR，第二层对应 TTGIR。非 SIMT 物理机器是第二层的语义，不是第三层 IR；target profile、build config、tuner 和各个 pass 也不是 IR 层。RISC-V module 可以混用 `func`、`scf`、`arith` 与 `weft_riscv` operations，dialect namespace 不增加层次。
 
+当前 RISC-V physical compiler 的正式目标范围是带完整 `V` 扩展且构建时显式给出正 `VLEN` 的 RV32/RV64 profile；`Zve` 子集、纯标量 target 和未知 VLEN 会在创建 RISC-V IR 前明确拒绝。scalar physical value/leaf 是同一 RVV kernel 内的表示与操作，不构成另一条 scalar backend。
+
 ## 2. 两层的 authority
 
 [Canonical Kernel IR](../dsl/canonical-ir.md) 是唯一持久作者程序，保存 logical tree、Level/lifetime、Encoding/ABI、ordinary control 与数值语义。target pass 不能增加 canonical Value、Level、effect、persistent artifact 或算法阶段。
@@ -35,9 +37,9 @@ system C compiler
 × 一个按固定优先级选定的 structural realization
 ```
 
-source `auto` 在进入 lowering 前绑定。结构固定后的 LMUL、microtile extent、unroll、pipeline depth、buffer count 等有限参数，每组绑定各自建立并编译一份 RISC-V module。tuner 比较可执行 artifacts，不共享 `assignment` 字典，也不生成新的物理结构。
+source `auto` 在进入 lowering 前绑定。结构固定后的 LMUL、microtile extent、unroll、pipeline depth 等有限参数，每组绑定各自建立并编译一份 RISC-V module。depth=1表示顺序执行；当前两阶段pipeline只接受depth=2/buffer=2的window cluster，buffer count不是独立binding。当前 compiler API 每次只接受一组单值 binding；外部 tuner 可以枚举这些 module 并比较可执行 artifacts，但不共享 `assignment` 字典，也不生成新的物理结构。
 
-结构性选择按 target 固定规则和优先级进行。较高优先级结构被完整 legality/resource pipeline 证明非法时，driver 才从原 canonical candidate 建立下一优先级 module；一个 module 内不保存备用路线。
+结构性选择按 target 固定规则和优先级进行；一个 module 内不保存备用路线。选定结构在后续 legality/resource pass 中失败时该 module 直接失败，不在 pass 或 emitter 中回退。需要另一 target/configuration 时，调用者从同一 canonical candidate 重新建立一份 module。
 
 ## 4. 编译器文档
 

@@ -1,76 +1,154 @@
 # RISC-V 编译 Pass
 
-所有 pass 改写同一份 [RISC-V IR](riscv-ir.md)，不是各自产生新的 IR 层。
+所有 pass 都改写同一份 [RISC-V IR](riscv-ir.md)。`implementation`、`schedule`、
+`lane_operand` 等中间属性附着在具体 operation 上，并在其消费者 pass 中删除；它们不是
+module 外的 assignment 表，也不构成新的 IR 层。
 
-## 1. Pass Pipeline
+## 1. 固定顺序
+
+```text
+ConvertWeftToRISCV
+→ SelectRISCVOperations
+→ PropagateRISCVLayouts
+→ PlanRISCVMemory
+→ CanonicalizeRISCVLayouts
+→ LowerRISCVComposites
+→ PipelineRISCVLevels
+→ FinalizeRISCVLeaves
+→ MaterializeRISCVResources
+→ VerifyFinalRISCV
+```
+
+该顺序是依赖关系，不是阶段标签。`LowerRISCVComposites` 必须先产生 window/step、
+fragment 和显式 reduction loop，pipeline 才有真实 cluster 可改写；exact leaf 完成后，
+resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
+
+## 2. 各 pass 合同
 
 ### `ConvertWeftToRISCV`
 
-建立 target-aware types、完整 ABI descriptor、source origin 及一一对应的 Level/control。保留 canonical numerical op 边界，不创建 source 没有的 logical Value、Level、effect 或 artifact。
+输入是一个已经实例化的 Canonical Kernel IR candidate、一份 target profile 和一组单值
+physical parameter binding。它建立 target-aware `ValueType`、`MemDescType`、Level/control、
+完整 runtime `memory_view`、artifact builder 与 numerical operations，然后删除 canonical
+operations。初始 layout、access 和 leaf 可以是 `unassigned`，但 source axis、Value、Level、
+birth、handoff、effect、Encoding 与 ABI identity 必须一一保留。
+
+一个 physical module 只含一组 meta/unroll/pipeline binding。候选枚举和实测发生在 driver
+之外；pass pipeline 不接收列表，也不在 module 内保存备用值。
 
 ### `SelectRISCVOperations`
 
-根据 operation semantics、typed operands、axes、Encoding、target profile、build requirements 和固定优先级，选择 scalar/RVV/IME target-op family。selected op 是 layout constraint anchor，不是 whole-kernel implementation selector。
+读取 operation semantics、typed operands、axes 和 target capability，按 target 固定优先级
+写入一个 `ImplementationAttr`：scalar、RVV 或 IME 的局部结构 family。它不选择 memory
+form，也不写 exact intrinsic。没有合法局部结构时当前 module 失败。
 
 ### `PropagateRISCVLayouts`
 
-从 pinned memory 和 target-op anchors 沿 use-def 传播完整 layout，在不兼容 use edge 插入 `convert_layout`。缺失 layout 使当前 module 失败，不能默认 scalar、`part=1` 或第一种能装下的 LMUL。
+从 selected operation anchors、logical axes、producer/consumer、control carry 和 target VLEN
+推导每个 shaped SSA value 的 time/lane/register-replica/local factors、SEW、LMUL、`vl`、
+validity 与 register groups。普通无特殊 anchor 的 shaped value使用 target 的固定规则：
+最内逻辑轴进入 lane；一元素表示保持 scalar。LMUL 是实现该 lane extent 的最小合法值，
+不是 emitter 默认值。
+
+pointwise、state 与 control handoff 的要求不一致时，pass 插入真实 `convert_layout`；
+`for/if/while` 的 carried/result types 同时被改写。无法保持 logical axes 或无合法 LMUL 时
+失败，不通过静默 scalarization 继续。
 
 ### `PlanRISCVMemory`
 
-根据 descriptor、Encoding mapping、layout、all consumers、reuse 和 target capability，物化 unit/strided/indexed/segment、encoded access 与 invocation-local pack。
+读取 `MemDescType`、Encoding field mapping 和 value layout，为每条 memory edge写入
+`AccessAttr` 与 transfer leaf。dense access 得到 unit/strided/indexed；encoded field 得到
+natural/grouped-layered/joined 的完整 storage geometry。lookup table被保留为 descriptor edge，
+不是先整表 load。contract 的 lane operand 与 lane memory form也在这里唯一确定，并在
+composite lowering 中消费。
 
 ### `CanonicalizeRISCVLayouts`
 
-执行 conversion propagation、backward rematerialization、hoist/sink、CSE/DCE 和冗余 conversion 消除。效果通过 value type 和真实 operations 的变化观察。
-
-### `PipelineRISCVLevels`
-
-在作者已有 Level/loop 内，根据 SSA use-def、alias、effect、state carry 与 validity 形成 local cluster，并把固定 unroll/pipeline/buffer/prefetch 参数物化成真实 loop 与 buffer structure。
-
-### `MaterializeRISCVResources`
-
-基于 physical SSA live intervals 计算 register、fragment、temporary 与 local-storage 使用；插入合同允许的 spill/reload 或 pure-producer rematerialization，否则拒绝 module。
+该 pass 只做已经实现的真实 rewrite：相邻逆 conversion 消除、单 use 纯 pointwise producer
+的 backward rematerialization，以及同一 block 内相同 conversion 的 SSA CSE。它不声称已经
+实现跨 block hoist/sink、全局 conversion algebra 或任意 producer rematerialization。
 
 ### `LowerRISCVComposites`
 
-把 encoded access、local pack、composite reduce/contract、conversion 与 schedule helper 降为明确 control、memory 和 primitive [RVV/IME leaf ops](leaves.md)。
+把 source-level physical composites 改写为终端前的真实程序结构：
+
+- Level loop变成带 Level identity 的 `scf.for`；
+- state/local materialization变成 local alloc/bind/load/store 或 register/staged SSA；
+- grouped/encoded reduction变成显式 reduction loop与 typed window load/step；
+- ordinary contract变成显式 reduction loop与 RVV step；
+- IME contract变成 typed fragment pack/MMA/unpack；
+- layout conversion获得唯一 terminal conversion leaf。
+
+未知 conversion kind、缺失 reduction extent、缺失 access 或不闭合 fragment capability均明确
+失败。该 pass 不创建 source outer traversal、Level、workspace 或 persistent Encoding。
+
+### `PipelineRISCVLevels`
+
+读取 `scf.for` 上的`weft.riscv.schedule` typed attribute并消费它。depth 1 删除已消费的
+schedule；当前可执行的
+depth 2 结构要求一个显式 load-window/compute-window cluster、两个window SSA版本和一个
+carried accumulator，pass 将其改写为真实的空迭代 guard、prologue、steady-state loop 和
+epilogue。当前cluster body必须恰好由一个window load和紧随其后的一个window step构成；
+它没有虚构两个`LocalType` buffer。
+
+普通register-resident contract没有上述window cluster，因此depth > 1直接unsupported，不能
+静默改回depth 1。其它 cluster、multi-carry 或 depth > 2 尚没有实现时同样unsupported。仅有
+`pipeline_depth=2` attribute 而没有上述 rewrite 不算 pipeline。
+
+### `FinalizeRISCVLeaves`
+
+读取 `ImplementationAttr` 与已经确定的 value carrier/SEW/operand form，为 pointwise、cast、
+reduce、state transfer等仍未闭合的 operation写入 exact instruction/spelling leaf，并删除
+`ImplementationAttr`。结构 family只在 `SelectRISCVOperations` 产生。由
+`LowerRISCVComposites`新建的window step、RVV contract step、fragment和layout-conversion op在
+创建时已有自己的exact leaf；本pass只终结仍保留generic operation的那一组。两者作用于互斥的
+physical op集合，不为同一个operation重复选择instruction。
+
+### `MaterializeRISCVResources`
+
+用 region-aware SSA live interval和 leaf temporary计算 vector/fragment peak，并把每个 leaf 的
+operand/result resource groups写实。资源超限时，只对同一 block 内可合法保存的普通
+`ValueType` 插入显式 local slot、`spill` 和各 use-site `reload`；fragment spill、跨 block spill
+和任意 pure-producer rematerialization尚未实现时判当前 module非法。
+
+动态 local object必须紧邻一个 typed `local_capacity_guard`。guard给出 target-bounded byte
+上界，kernel resource summary按上界计算；缺少闭合上界时拒绝生成 C VLA。
 
 ### `VerifyFinalRISCV`
 
-验证 [final RISC-V IR 不变量](riscv-ir.md#6-final-ir-不变量)和 build requirements；成功后才允许 [terminal emission](emission.md)。
+最终 verifier 拒绝：残留 canonical op、非 terminal RISC-V op、`unassigned` layout/access、
+`implementation`、未展开 schedule、未选 leaf、丢失 Level birth/handoff、绕过 runtime
+`memory_view` 的 ABI edge，以及超出 target 的 register/fragment/local-storage 使用。
 
-## 2. Pass Contract
-
-每个 pass 必须声明：
-
-```text
-允许出现哪些 op/type
-读取哪些 program facts
-产生、替换或消除哪些 entities
-pass 后必须满足哪些不变量
-失败返回 invalid 还是 unsupported
-```
-
-pass-local analysis map 可以存在；跨 pass 结果必须写回 type、operation、region 或真实 entity 的 typed attribute。stage 字符串和 value/op dictionaries 不能成为跨 pass authority。
+operation/type verifier继续检查 logical domain、axis projection、Encoding field、conversion、
+window、fragment role/packing和 exact leaf之间的局部合同；final verifier还把descriptor
+storage facts与Encoding declaration、leaf widening/memory要求与target capability逐项核对。
+成功只说明这份 RISC-V module满足
+当前已实现的 terminal op 集合；没有实现的 spill、pipeline或extension结构必须在前序 pass
+明确失败。
 
 ## 3. 可观察性
 
-每个 pass 后必须能够 dump 同一份 RISC-V module。dump 中应直接看见该 pass 实际造成的 type/layout 变化、`convert_layout` 插入或删除、memory/target-op 替换、physical loop 与 pipeline 展开，以及 spill/reload/rematerialization。只打印 analysis table、assignment dictionary 或 pass 名称不能证明程序已经被改写。
-
-若某项跨 pass 决定只能从 side record 观察，说明它尚未进入 physical IR；若 final emitter 需要回查 Canonical Kernel IR 或补默认字段才能输出，说明前序 pass contract 未闭合。
+每个 pass 的输入和输出都是 program。用 MLIR pass instrumentation dump 同一 module时，应
+直接看到 type/layout变化、`convert_layout` 插入或删除、memory attributes、loop/window/
+fragment rewrite、pipeline expansion与spill/reload。只打印 analysis table或 assignment
+dictionary不能证明程序已经物理化。
 
 ## 4. 与 Triton/TileLang 的机制关系
 
-Triton 的 Coalesce、AccelerateMatmul、RemoveLayoutConversions 和 Pipeline 都在 TTGIR 上重写同一份程序，不是四层 IR：
+下列路径相对于仓库根目录位于同级reference checkout `../ref/`。Triton 的 layout encoding、`ttg.convert_layout`、Coalesce、AccelerateMatmul、
+RemoveLayoutConversions 与 Pipeline同样在 TTGIR 上改写真实程序：
 
-- `ref/triton/lib/Conversion/TritonToTritonGPU/TritonGPUConversion.cpp:19`：layout进入tensor type encoding；
-- `ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:27`：typed `ttg.convert_layout`；
-- `ref/triton/lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:71`：memory op与conversion rewrite；
-- `ref/triton/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:441`：MMA layout/op rewrite；
-- `ref/triton/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:42`：propagation/rematerialization；
-- `ref/triton/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:51`：loop-carried SSA与pipeline expansion。
+- `../ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:32`
+- `../ref/triton/lib/Dialect/TritonGPU/Transforms/Coalesce.cpp:71`
+- `../ref/triton/lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:441`
+- `../ref/triton/lib/Dialect/TritonGPU/Transforms/RemoveLayoutConversions.cpp:42`
+- `../ref/triton/lib/Dialect/TritonGPU/Transforms/Pipeliner/PipelineExpander.cpp:51`
 
-TileLang也把layout结果附着到真实block/loop，再由LowerTileOp和InjectSoftwarePipeline重写buffer、index、barrier与body；见`ref/tilelang/src/transform/layout_inference/layout_inference.cc:1196`、`lower_tile_op.cc:1080`、`inject_pipeline.cc:3608`。
+TileLang也把layout、buffer与pipeline结果落到真实block/loop，再由LowerTileOp和
+InjectSoftwarePipeline重写body：
+`../ref/tilelang/src/transform/layout_inference/layout_inference.cc:1196`、
+`lower_tile_op.cc:1080`、`inject_pipeline.cc:3608`。
 
-Weft复用的是typed representation、explicit conversion和real rewrite，不复用SIMT thread/storage ownership。
+Weft复用的是 typed representation、explicit conversion 与 real rewrite；逻辑值不因此获得
+thread/warp/CTA ownership。

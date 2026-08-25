@@ -187,19 +187,22 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
     error = "--abi floating-point register convention is not present in --march";
     return false;
   }
-  profile.vlenBits = vlenBits;
-  if (profile.hasRVV) {
-    profile.vectorRegisters = 32;
-    profile.supportedSEW = {8, 16, 32, 64};
-    profile.legalLMULEighths = {1, 2, 4, 8, 16, 32, 64};
-    profile.hasIndexedMemory = true;
-    profile.hasSegmentMemory = true;
-    profile.hasWideningInteger = true;
-    profile.hasWideningFloat = profile.hasF;
-  } else if (vlenBits != 0) {
-    error = "--vlen-bits requires an ISA string with the vector extension";
+  if (!profile.hasRVV) {
+    error = "the current Weft RISC-V physical compiler requires the full V extension";
     return false;
   }
+  if (vlenBits <= 0) {
+    error = "the current Weft RISC-V physical compiler requires an explicit positive --vlen-bits";
+    return false;
+  }
+  profile.vlenBits = vlenBits;
+  profile.vectorRegisters = 32;
+  profile.supportedSEW = {8, 16, 32, 64};
+  profile.legalLMULEighths = {1, 2, 4, 8, 16, 32, 64};
+  profile.hasIndexedMemory = true;
+  profile.hasSegmentMemory = true;
+  profile.hasWideningInteger = true;
+  profile.hasWideningFloat = profile.hasF;
   const bool spacemitIME1 = matrixExtension == "spacemit-ime1";
   if (matrixExtension != "none" && !spacemitIME1) {
     error = "unsupported --matrix-extension value: " + matrixExtension.str();
@@ -211,22 +214,16 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
       return false;
     }
   }
-  if (spacemitIME1 && profile.littleEndian && profile.xlen == 64 && profile.hasF &&
-      profile.hasVectorF16 && profile.hasWideningInteger &&
-      profile.hasWideningFloat && profile.supportsFixedRVV() &&
-      profile.vlenBits == 256 && profile.supportsVectorShape(8, 2) &&
-      profile.supportsVectorShape(8, 4) &&
+  if (spacemitIME1 && profile.littleEndian && profile.xlen == 64 &&
+      profile.supportsFixedRVV() && profile.vlenBits == 256 &&
       profile.supportsVectorShape(8, 8) &&
-      profile.supportsVectorShape(16, 2) &&
-      profile.supportsVectorShape(32, 4) &&
-      profile.supportsVectorShape(32, 8) &&
-      profile.supportsVectorShape(32, 32)) {
-    // The emitted M1N16K32 local leaf clobbers v0, v14, and v16.  Its i32m2
-    // result is a normal value and is accounted for separately by liveness.
-    constexpr unsigned imeM1N16K32VectorClobbers = 3;
+      profile.supportsVectorShape(32, 8)) {
+    // The board-validated leaf consumes v0/v1 as two 4x8 signed-i8 fragments
+    // and produces one 4x4 i32 fragment in v2/v3.
     profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
-        RISCVFragmentInstruction::SpacemitIME1I4I8MMA, 4, 8, 32, 1, 16,
-        32, imeM1N16K32VectorClobbers});
+        RISCVFragmentInstruction::SpacemitIME1I8MMA,
+        RISCVFragmentSignedness::Signed, RISCVFragmentSignedness::Signed,
+        8, 8, 32, 4, 4, 8, 1, 1, 2});
   }
   return true;
 }

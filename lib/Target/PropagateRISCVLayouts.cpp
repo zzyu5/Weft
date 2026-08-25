@@ -1,0 +1,861 @@
+#include "Weft/Target/RISCVPasses.h"
+
+#include "RISCVPhysicalSupport.h"
+
+#include "Weft/Dialect/Kernel/IR/KernelDialect.h"
+#include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
+
+#include <algorithm>
+#include <memory>
+
+using namespace weft;
+
+namespace {
+
+struct Roles {
+  int64_t laneAxis = 0;
+  llvm::SmallSet<int64_t, 4> replicaAxes;
+  bool ime = false;
+  bool local = false;
+  bool anchored = false;
+  bool fullLaneExtent = false;
+  llvm::SmallVector<int64_t, 4> fragmentParameters;
+};
+
+bool containsAxis(mlir::Type type, int64_t axis) {
+  return llvm::is_contained(riscv_internal::logicalAxes(type), axis);
+}
+
+void addSmallReplicas(mlir::Value value, Roles &roles, int64_t except = 0) {
+  for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
+    if (int64_t extent = riscv_internal::physicalExtent(value, axis);
+        axis != except && extent > 0 && extent <= 16)
+      roles.replicaAxes.insert(axis);
+}
+
+int64_t freeAxisSharedByOneOperand(mlir::Value lhs, mlir::Value rhs) {
+  auto lhsAxes = riscv_internal::logicalAxes(lhs.getType());
+  auto rhsAxes = riscv_internal::logicalAxes(rhs.getType());
+  for (int64_t axis : lhsAxes)
+    if (!llvm::is_contained(rhsAxes, axis))
+      return axis;
+  for (int64_t axis : rhsAxes)
+    if (!llvm::is_contained(lhsAxes, axis))
+      return axis;
+  return 0;
+}
+
+void constrainGroupedMac(riscv::MacGroupsOp operation, mlir::Value value,
+                         Roles &roles) {
+  roles.anchored = true;
+  roles.fullLaneExtent = true;
+  // A grouped MAC consumes one shared reduction coordinate.  If one operand
+  // also carries an output/cohort axis, that free axis is the reusable vector
+  // direction.  Falling back to the final reduction axis is only valid for a
+  // scalar-output vec-dot.  This is an axis relation, not a source-shape
+  // matcher: canonical and derived encodings use the same rule.
+  int64_t lane =
+      freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs());
+  if (!lane) {
+    auto lhsAxes = riscv_internal::logicalAxes(operation.getLhs().getType());
+    auto rhsAxes = riscv_internal::logicalAxes(operation.getRhs().getType());
+    if (!lhsAxes.empty() && !rhsAxes.empty() && lhsAxes.back() == rhsAxes.back())
+      lane = lhsAxes.back();
+  }
+  if (lane && containsAxis(value.getType(), lane))
+    roles.laneAxis = lane;
+  addSmallReplicas(value, roles, roles.laneAxis);
+}
+
+int64_t rhsFreeLane(mlir::Value lhs, mlir::Value rhs,
+                    llvm::ArrayRef<int64_t> reduction) {
+  for (auto it = riscv_internal::logicalAxes(rhs.getType()).rbegin();
+       it != riscv_internal::logicalAxes(rhs.getType()).rend(); ++it)
+    if (!llvm::is_contained(reduction, *it) &&
+        !llvm::is_contained(riscv_internal::logicalAxes(lhs.getType()), *it))
+      return *it;
+  for (auto it = riscv_internal::logicalAxes(lhs.getType()).rbegin();
+       it != riscv_internal::logicalAxes(lhs.getType()).rend(); ++it)
+    if (!llvm::is_contained(reduction, *it) &&
+        !llvm::is_contained(riscv_internal::logicalAxes(rhs.getType()), *it))
+      return *it;
+  return 0;
+}
+
+template <typename Contract>
+void constrainContractOperand(Contract operation, mlir::Value value, Roles &roles) {
+  roles.anchored = true;
+  auto reduction = operation.getOver();
+  int64_t lane = rhsFreeLane(operation.getLhs(), operation.getRhs(), reduction);
+  auto implementation = operation->template getAttrOfType<
+      riscv::ImplementationAttr>("implementation");
+  if (implementation && implementation.getEngine() == "ime") {
+    auto parameters = implementation.getParameters().asArrayRef();
+    roles.fragmentParameters.assign(parameters.begin(), parameters.end());
+    // Canonical values remain ordinary physical values.  IME fragments are
+    // separate typed temporaries introduced by LowerRISCVComposites, followed
+    // by an explicit fragment-to-RVV handoff.
+  }
+  if (lane && containsAxis(value.getType(), lane))
+    roles.laneAxis = lane;
+  else
+    for (int64_t axis : reduction)
+      if (containsAxis(value.getType(), axis)) {
+        roles.laneAxis = axis;
+        break;
+      }
+  for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
+    if (!llvm::is_contained(reduction, axis) && axis != roles.laneAxis &&
+        riscv_internal::physicalExtent(value, axis) > 0 && riscv_internal::physicalExtent(value, axis) <= 16)
+      roles.replicaAxes.insert(axis);
+}
+
+Roles rolesFor(mlir::Value value) {
+  Roles roles;
+  auto element = riscv_internal::logicalElement(value.getType());
+  if (mlir::isa<kernel::EncodingType>(element))
+    return roles;
+
+  if (value.getDefiningOp<riscv::FieldOp>()) {
+    roles.local = true;
+    return roles;
+  }
+
+  if (auto state = value.getDefiningOp<riscv::NewOp>();
+      state && state.getOwnerDomainId() == 0 &&
+      llvm::any_of(riscv_internal::logicalShape(value.getType()),
+                   [](int64_t extent) { return extent < 0; })) {
+    roles.local = true;
+    return roles;
+  }
+
+  if (auto materialize = value.getDefiningOp<riscv::MaterializeOp>();
+      materialize && materialize.getPlacement() == "local") {
+    roles.local = true;
+    return roles;
+  }
+  if (value.getDefiningOp<riscv::ReduceOp>()) {
+    // A reduction result preserves every free logical axis.  Small free axes
+    // are register replicas; the eliminated axis is anchored on the producer,
+    // not manufactured on the result.
+    roles.anchored = true;
+    addSmallReplicas(value, roles);
+    return roles;
+  }
+  if (auto operation = value.getDefiningOp<riscv::MacGroupsOp>()) {
+    constrainGroupedMac(operation, value, roles);
+  } else if (auto operation = value.getDefiningOp<riscv::LookupOp>()) {
+    auto axes = riscv_internal::logicalAxes(value.getType());
+    if (!axes.empty())
+      roles.laneAxis = axes.back();
+    addSmallReplicas(value, roles, roles.laneAxis);
+  } else if (auto operation = value.getDefiningOp<riscv::DotOp>()) {
+    constrainContractOperand(operation, value, roles);
+  } else if (auto operation = value.getDefiningOp<riscv::ContractOp>()) {
+    constrainContractOperand(operation, value, roles);
+  } else if (auto operation = value.getDefiningOp<riscv::OuterContractOp>()) {
+    constrainContractOperand(operation, value, roles);
+  }
+
+  for (mlir::OpOperand &use : value.getUses()) {
+    mlir::Operation *owner = use.getOwner();
+    if (auto reduce = mlir::dyn_cast<riscv::ReduceOp>(owner)) {
+      auto axes = riscv_internal::logicalAxes(value.getType());
+      if (reduce.getAxis() >= 0 &&
+          reduce.getAxis() < static_cast<int64_t>(axes.size())) {
+        // The eliminated axis is only the fallback lane anchor.  A producer or
+        // loop-carried value may already have a surviving lane axis, in which
+        // case this is a register-axis reduction.  Defer that choice until the
+        // strong producer/control constraints have propagated.
+        roles.anchored = true;
+      }
+    } else if (auto mac = mlir::dyn_cast<riscv::MacGroupsOp>(owner)) {
+      constrainGroupedMac(mac, value, roles);
+    } else if (auto contract = mlir::dyn_cast<riscv::DotOp>(owner)) {
+      constrainContractOperand(contract, value, roles);
+    } else if (auto contract = mlir::dyn_cast<riscv::ContractOp>(owner)) {
+      constrainContractOperand(contract, value, roles);
+    } else if (auto contract = mlir::dyn_cast<riscv::OuterContractOp>(owner)) {
+      constrainContractOperand(contract, value, roles);
+    } else if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(owner)) {
+      auto axes = riscv_internal::logicalAxes(lookup.getIndices().getType());
+      if (!axes.empty() && containsAxis(value.getType(), axes.back()))
+        roles.laneAxis = axes.back();
+      addSmallReplicas(value, roles, roles.laneAxis);
+    }
+  }
+
+  return roles;
+}
+
+bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
+                bool preserveCarrier = false) {
+  bool changed = false;
+  auto axes = riscv_internal::logicalAxes(target.getType());
+  if (preserveCarrier && source.local && !destination.local) {
+    destination.local = true;
+    changed = true;
+  }
+  if (preserveCarrier && source.ime && !destination.ime) {
+    destination.ime = true;
+    destination.fragmentParameters = source.fragmentParameters;
+    changed = true;
+  }
+  if (source.laneAxis && llvm::is_contained(axes, source.laneAxis) &&
+      destination.laneAxis == 0) {
+    destination.laneAxis = source.laneAxis;
+    destination.replicaAxes.erase(source.laneAxis);
+    changed = true;
+  }
+  for (int64_t axis : source.replicaAxes)
+    if (axis != destination.laneAxis && llvm::is_contained(axes, axis) &&
+        destination.replicaAxes.insert(axis).second)
+      changed = true;
+  if (source.anchored && !destination.anchored) {
+    destination.anchored = true;
+    changed = true;
+  }
+  if (source.fullLaneExtent && !destination.fullLaneExtent) {
+    destination.fullLaneExtent = true;
+    changed = true;
+  }
+  return changed;
+}
+
+void completeRoles(mlir::Value value, Roles &roles) {
+  if (roles.local || roles.ime)
+    return;
+  auto axes = riscv_internal::logicalAxes(value.getType());
+  if (!roles.anchored && roles.laneAxis == 0 && !axes.empty()) {
+    // A shaped Value already carries an explicit logical domain.  Unlike an
+    // ordinary scalar for/while iteration, that domain is legal input to the
+    // target mapping.  The target's base structural rule maps the innermost
+    // logical axis to RVV; memory and consumer anchors above may replace this
+    // with a more constrained axis.  Root dynamic state is handled earlier and
+    // deliberately remains local (Top-K is the canonical example).
+    roles.laneAxis = axes.back();
+    roles.anchored = true;
+  }
+  addSmallReplicas(value, roles, roles.laneAxis);
+  if (roles.laneAxis)
+    roles.replicaAxes.erase(roles.laneAxis);
+}
+
+int64_t roundLegalLMUL(riscv::TargetAttr target, int64_t requested) {
+  for (int64_t legal : target.getLegalLMULEighths().asArrayRef())
+    if (legal >= requested)
+      return legal;
+  return 0;
+}
+
+riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
+                              Roles roles, int64_t dynamicLaneSpan) {
+  auto type = mlir::cast<riscv::ValueType>(value.getType());
+  auto axes = type.getAxisIds().asArrayRef();
+  auto element = type.getElementType();
+  auto kernel = value.getParentRegion()->getParentOfType<riscv::KernelOp>();
+  riscv::TargetAttr target = kernel.getTarget();
+  const int64_t sew = std::max<int64_t>(8, riscv_internal::logicalBitWidth(type));
+
+  llvm::SmallVector<int64_t> time;
+  llvm::SmallVector<int64_t> lane(axes.size(), 1);
+  llvm::SmallVector<int64_t> replica(axes.size(), 1);
+  llvm::SmallVector<int64_t> fragment(axes.size(), 1);
+  llvm::SmallVector<int64_t> local(axes.size(), 1);
+
+  if (mlir::isa<kernel::EncodingType>(element)) {
+    for (int64_t axis : axes)
+      time.push_back(std::max<int64_t>(1, riscv_internal::physicalExtent(value, axis)));
+    return riscv::LayoutAttr::get(
+        builder.getContext(), "local", type.getAxisIds(),
+        riscv_internal::integers(builder, time),
+        riscv_internal::integers(builder, lane),
+        riscv_internal::integers(builder, replica),
+        riscv_internal::integers(builder, fragment),
+        riscv_internal::integers(builder, local), 8, 0, 1, 0, "full");
+  }
+
+  if (roles.local) {
+    for (size_t index = 0; index < axes.size(); ++index) {
+      int64_t extent =
+          std::max<int64_t>(1, riscv_internal::physicalExtent(value, axes[index]));
+      time.push_back(1);
+      local[index] = extent;
+    }
+    return riscv::LayoutAttr::get(
+        builder.getContext(), "local", type.getAxisIds(),
+        riscv_internal::integers(builder, time),
+        riscv_internal::integers(builder, lane),
+        riscv_internal::integers(builder, replica),
+        riscv_internal::integers(builder, fragment),
+        riscv_internal::integers(builder, local), sew, 0, 1, 0, "full");
+  }
+
+  if (roles.ime) {
+    auto parameters = roles.fragmentParameters;
+    llvm::SmallVector<int64_t> freeAxes;
+    for (int64_t axis : axes)
+      freeAxes.push_back(axis);
+    for (size_t index = 0; index < axes.size(); ++index) {
+      int64_t extent = std::max<int64_t>(1, riscv_internal::physicalExtent(value, axes[index]));
+      int64_t factor = 1;
+      if (!parameters.empty()) {
+        if (index == 0)
+          factor = std::min(extent, parameters[0]);
+        else if (index == 1 && parameters.size() > 1)
+          factor = std::min(extent, parameters[1]);
+        else if (parameters.size() > 2)
+          factor = std::min(extent, parameters[2]);
+      }
+      fragment[index] = std::max<int64_t>(1, factor);
+      time.push_back((extent + fragment[index] - 1) / fragment[index]);
+    }
+    return riscv::LayoutAttr::get(
+        builder.getContext(), "ime", type.getAxisIds(),
+        riscv_internal::integers(builder, time),
+        riscv_internal::integers(builder, lane),
+        riscv_internal::integers(builder, replica),
+        riscv_internal::integers(builder, fragment),
+        riscv_internal::integers(builder, local), sew, 0, 1, 0, "full");
+  }
+
+  int64_t desiredLanes = 1;
+  if (roles.laneAxis) {
+    int64_t logicalExtent = riscv_internal::physicalExtent(value, roles.laneAxis);
+    int64_t representationExtent =
+        logicalExtent > 0 ? logicalExtent : std::max<int64_t>(1, dynamicLaneSpan);
+    // One logical block may span several issue-time strips.  Do not consume
+    // every legal register group merely to cover the whole logical extent in
+    // one value: that destroys the register replicas needed by neighbouring
+    // free axes.  The base scalable vector is the representation anchor;
+    // larger extents remain explicit time factors.
+    int64_t baseLanes = target.getVlenBits() / sew;
+    desiredLanes = representationExtent;
+    if (!roles.fullLaneExtent)
+      desiredLanes =
+          std::min(desiredLanes, std::max<int64_t>(1, baseLanes));
+  }
+  int64_t requestedLMUL =
+      roles.laneAxis
+          ? std::max<int64_t>(1, (desiredLanes * sew * 8 +
+                                  target.getVlenBits() - 1) /
+                                     target.getVlenBits())
+          : 0;
+  int64_t lmul = roles.laneAxis ? roundLegalLMUL(target, requestedLMUL) : 0;
+  if (roles.laneAxis && lmul == 0)
+    return {};
+  int64_t actualLanes = roles.laneAxis
+                            ? target.getVlenBits() * lmul / (8 * sew)
+                            : 1;
+  actualLanes = std::max<int64_t>(1, std::min(actualLanes, desiredLanes));
+
+  int64_t replicas = 1;
+  for (size_t index = 0; index < axes.size(); ++index) {
+    int64_t logicalExtent = riscv_internal::physicalExtent(value, axes[index]);
+    int64_t extent = logicalExtent > 0 ? logicalExtent
+                     : axes[index] == roles.laneAxis
+                         ? std::max<int64_t>(1, dynamicLaneSpan)
+                         : 1;
+    if (axes[index] == roles.laneAxis)
+      lane[index] = std::min(extent, actualLanes);
+    if (roles.replicaAxes.contains(axes[index])) {
+      replica[index] = extent;
+      replicas *= extent;
+    }
+    int64_t mapped = lane[index] * replica[index];
+    time.push_back((extent + mapped - 1) / mapped);
+  }
+  // A logical axis of extent one does not constitute an RVV representation.
+  // Keep the axis identity in the type, but use the scalar carrier so later
+  // memory and operation passes do not invent a one-lane vector operation.
+  const bool usesRVV = roles.laneAxis && actualLanes > 1;
+  llvm::StringRef carrier = usesRVV ? "rvv" : "scalar";
+  if (!usesRVV)
+    lmul = 0;
+  int64_t groups = usesRVV ? ((lmul + 7) / 8) * replicas : 0;
+  llvm::StringRef validity = "full";
+  if (roles.laneAxis && riscv_internal::physicalExtent(value, roles.laneAxis) <= 0)
+    validity = "tail";
+  for (mlir::Operation *parent = value.getParentRegion()->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (auto loop = mlir::dyn_cast<riscv::LoopOp>(parent))
+      if (loop.getDomain().getType().getTail() == "tail")
+        validity = "tail";
+  return riscv::LayoutAttr::get(
+      builder.getContext(), carrier, type.getAxisIds(),
+      riscv_internal::integers(builder, time),
+      riscv_internal::integers(builder, lane),
+      riscv_internal::integers(builder, replica),
+      riscv_internal::integers(builder, fragment),
+      riscv_internal::integers(builder, local), sew, lmul,
+      usesRVV ? actualLanes : 1, groups, validity);
+}
+
+bool pointwiseLike(mlir::Operation *operation) {
+  return mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+                   riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
+                   riscv::UpdateOp, riscv::MaterializeOp>(operation);
+}
+
+void setValueLayout(mlir::Value value, riscv::LayoutAttr layout) {
+  if (mlir::isa<riscv::ValueType>(value.getType()))
+    value.setType(riscv_internal::withLayout(value.getType(), layout));
+}
+
+class PropagateRISCVLayoutsPass
+    : public mlir::PassWrapper<PropagateRISCVLayoutsPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  llvm::StringRef getArgument() const override {
+    return "weft-riscv-propagate-layouts";
+  }
+  llvm::StringRef getDescription() const override {
+    return "Propagate logical-axis preserving physical layouts and insert conversions";
+  }
+
+  void runOnOperation() override {
+    mlir::OpBuilder builder(&getContext());
+    bool failed = false;
+    llvm::SmallVector<mlir::Value> values;
+    getOperation().walk([&](mlir::Operation *operation) {
+      for (mlir::Value result : operation->getResults())
+        if (mlir::isa<riscv::ValueType>(result.getType()))
+          values.push_back(result);
+      for (mlir::Region &region : operation->getRegions())
+        for (mlir::Block &block : region)
+          for (mlir::BlockArgument argument : block.getArguments())
+            if (mlir::isa<riscv::ValueType>(argument.getType()))
+              values.push_back(argument);
+    });
+
+    llvm::DenseMap<mlir::Value, Roles> roles;
+    for (mlir::Value value : values)
+      roles.try_emplace(value, rolesFor(value));
+
+    // Pointwise values and loop-carried state share one logical distribution.
+    // Anchors come from selected target operations; propagation never creates a
+    // new logical axis and never crosses a local-storage boundary.
+    auto propagateRoles = [&]() {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+      getOperation().walk([&](mlir::Operation *operation) {
+        if (!pointwiseLike(operation) || operation->getNumResults() != 1)
+          return;
+        mlir::Value result = operation->getResult(0);
+        if (!mlir::isa<riscv::ValueType>(result.getType()))
+          return;
+        for (mlir::Value operand : operation->getOperands()) {
+          if (!mlir::isa<riscv::ValueType>(operand.getType()))
+            continue;
+          if (mlir::isa<riscv::UpdateOp>(operation) &&
+              (roles[result].local || roles[operand].local)) {
+            Roles local;
+            local.local = true;
+            changed |= mergeRoles(local, result, roles[result]);
+            changed |= mergeRoles(local, operand, roles[operand]);
+            continue;
+          }
+          // A local-storage value used by ordinary pointwise code requires a
+          // typed local_load conversion; it does not force the consumer's
+          // entire value chain into local storage.  Conversely, a vector
+          // consumer does not rewrite the source object's placement.
+          if (roles[result].local || roles[operand].local)
+            continue;
+          changed |= mergeRoles(roles[operand], result, roles[result]);
+          changed |= mergeRoles(roles[result], operand, roles[operand]);
+        }
+      });
+      getOperation().walk([&](riscv::LoopOp loop) {
+        auto yield = mlir::cast<riscv::YieldOp>(loop.getBody().front().getTerminator());
+        for (auto [index, initial] : llvm::enumerate(loop.getCarried())) {
+          mlir::Value argument = loop.getBody().front().getArgument(index + 1);
+          mlir::Value next = yield.getValues()[index];
+          mlir::Value result = loop.getResult(index);
+          mlir::Value valuesToMerge[] = {initial, argument, next, result};
+          for (mlir::Value source : valuesToMerge)
+            for (mlir::Value target : valuesToMerge)
+              if (mlir::isa<riscv::ValueType>(source.getType()) &&
+                  mlir::isa<riscv::ValueType>(target.getType()) &&
+                  !roles[source].local && !roles[target].local)
+                changed |=
+                    mergeRoles(roles[source], target, roles[target], true);
+        }
+      });
+      getOperation().walk([&](mlir::Operation *operation) {
+        if (!mlir::isa<mlir::scf::ForOp, mlir::scf::IfOp,
+                       mlir::scf::WhileOp>(operation))
+          return;
+        llvm::SmallVector<mlir::Value> related;
+        for (mlir::Value operand : operation->getOperands())
+          if (mlir::isa<riscv::ValueType>(operand.getType()))
+            related.push_back(operand);
+        for (mlir::Value result : operation->getResults())
+          if (mlir::isa<riscv::ValueType>(result.getType()))
+            related.push_back(result);
+        for (mlir::Region &region : operation->getRegions())
+          for (mlir::Block &block : region) {
+            for (mlir::BlockArgument argument : block.getArguments())
+              if (mlir::isa<riscv::ValueType>(argument.getType()))
+                related.push_back(argument);
+            if (mlir::Operation *terminator = block.getTerminator())
+              for (mlir::Value operand : terminator->getOperands())
+                if (mlir::isa<riscv::ValueType>(operand.getType()))
+                  related.push_back(operand);
+          }
+        for (mlir::Value source : related)
+          for (mlir::Value target : related) {
+            auto sourceType = mlir::cast<riscv::ValueType>(source.getType());
+            auto targetType = mlir::cast<riscv::ValueType>(target.getType());
+            if (sourceType.getElementType() == targetType.getElementType() &&
+                sourceType.getShape() == targetType.getShape() &&
+                sourceType.getAxisIds() == targetType.getAxisIds())
+              changed |=
+                  mergeRoles(roles[source], target, roles[target], true);
+          }
+      });
+      getOperation().walk([&](riscv::ReduceOp reduce) {
+        mlir::Value input = reduce.getInput();
+        mlir::Value result = reduce.getResult();
+        if (!mlir::isa<riscv::ValueType>(input.getType()) ||
+            !mlir::isa<riscv::ValueType>(result.getType()))
+          return;
+        changed |= mergeRoles(roles[input], result, roles[result]);
+        changed |= mergeRoles(roles[result], input, roles[input]);
+      });
+      getOperation().walk([&](riscv::Fold2Op fold) {
+        mlir::Value input = fold.getInput();
+        mlir::Value result = fold.getResult();
+        if (!mlir::isa<riscv::ValueType>(input.getType()) ||
+            !mlir::isa<riscv::ValueType>(result.getType()))
+          return;
+        changed |= mergeRoles(roles[input], result, roles[result]);
+        changed |= mergeRoles(roles[result], input, roles[input]);
+      });
+      getOperation().walk([&](riscv::ExtractOp extract) {
+        mlir::Value input = extract.getInput();
+        mlir::Value result = extract.getResult();
+        if (!mlir::isa<riscv::ValueType>(input.getType()) ||
+            !mlir::isa<riscv::ValueType>(result.getType()) ||
+            roles[input].local || roles[result].local)
+          return;
+        // Extract removes axes selected by a point/index and preserves every
+        // remaining logical axis.  Representation roles on those surviving
+        // axes therefore propagate in both directions; consumed axes are
+        // filtered by mergeRoles rather than rediscovered from source shape.
+        changed |= mergeRoles(roles[input], result, roles[result]);
+        changed |= mergeRoles(roles[result], input, roles[input]);
+      });
+      }
+    };
+    // First propagate operation and consumer anchors.  Only values that remain
+    // unanchored then receive the target's base innermost-lane mapping.  That
+    // default is itself a physical fact needed by downstream reductions and
+    // control-flow handoffs, so run the same propagation to a second fixed
+    // point instead of leaving it stranded on the defining value.
+    propagateRoles();
+    getOperation().walk([&](riscv::ReduceOp reduce) {
+      mlir::Value input = reduce.getInput();
+      auto axes = riscv_internal::logicalAxes(input.getType());
+      if (!mlir::isa<riscv::ValueType>(input.getType()) ||
+          reduce.getAxis() < 0 ||
+          reduce.getAxis() >= static_cast<int64_t>(axes.size()))
+        return;
+      const int64_t eliminated = axes[reduce.getAxis()];
+      Roles &inputRoles = roles[input];
+      if (!inputRoles.laneAxis)
+        inputRoles.laneAxis = eliminated;
+      inputRoles.anchored = true;
+      inputRoles.replicaAxes.erase(inputRoles.laneAxis);
+      addSmallReplicas(input, inputRoles, inputRoles.laneAxis);
+      inputRoles.replicaAxes.erase(eliminated);
+    });
+    propagateRoles();
+    for (mlir::Value value : values)
+      completeRoles(value, roles[value]);
+    propagateRoles();
+
+    // A symbolic logical axis must keep one common semantic cohort across a
+    // connected physical program even when casts change SEW/VLMAX.  Otherwise
+    // f32 and f16 values of the same axis each claim one unrelated strip and a
+    // conversion has neither enough source streams nor a well-defined merge.
+    // Axis identity is canonical; the target-dependent cohort is physical and
+    // remains local to this pass.
+    llvm::DenseMap<mlir::Operation *, llvm::DenseMap<int64_t, int64_t>>
+        dynamicLaneSpans;
+    for (mlir::Value value : values) {
+      int64_t axis = roles[value].laneAxis;
+      if (!axis || riscv_internal::physicalExtent(value, axis) != 0)
+        continue;
+      auto kernel = value.getParentRegion()->getParentOfType<riscv::KernelOp>();
+      if (!kernel)
+        continue;
+      int64_t sew = std::max<int64_t>(
+          8, riscv_internal::logicalBitWidth(value.getType()));
+      int64_t baseLanes = std::max<int64_t>(1, kernel.getTarget().getVlenBits() / sew);
+      dynamicLaneSpans[kernel.getOperation()][axis] =
+          std::max(dynamicLaneSpans[kernel.getOperation()][axis], baseLanes);
+    }
+
+    for (mlir::Value value : values) {
+      int64_t dynamicLaneSpan = 1;
+      if (int64_t axis = roles[value].laneAxis; axis) {
+        auto kernel = value.getParentRegion()->getParentOfType<riscv::KernelOp>();
+        if (kernel)
+          dynamicLaneSpan = std::max<int64_t>(
+              1, dynamicLaneSpans[kernel.getOperation()].lookup(axis));
+      }
+      riscv::LayoutAttr layout =
+          buildLayout(builder, value, roles[value], dynamicLaneSpan);
+      if (!layout) {
+        value.getParentRegion()->getParentOp()->emitError(
+            "no legal LMUL can preserve the inferred logical lane mapping");
+        failed = true;
+        continue;
+      }
+      setValueLayout(value, layout);
+    }
+    getOperation().walk([&](riscv::NewOp state) {
+      if (auto value = mlir::dyn_cast<riscv::ValueType>(state.getResult().getType()))
+        state.setPlacementAttr(builder.getStringAttr(
+            value.getLayout().getCarrier() == "local" ? "local" :
+            value.getLayout().getCarrier() == "scalar" ? "scalar" : "register"));
+    });
+    if (failed) {
+      signalPassFailure();
+      return;
+    }
+
+    insertUseConversions(builder);
+  }
+
+private:
+  static mlir::LogicalResult convertYieldOperand(mlir::OpBuilder &builder,
+                                                 mlir::Operation *terminator,
+                                                 unsigned index,
+                                                 mlir::Type required) {
+    mlir::Value value = terminator->getOperand(index);
+    if (value.getType() == required)
+      return mlir::success();
+    auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
+    auto target = mlir::dyn_cast<riscv::ValueType>(required);
+    if (!source || !target || source.getElementType() != target.getElementType() ||
+        source.getShape() != target.getShape() ||
+        source.getAxisIds() != target.getAxisIds())
+      return terminator->emitError(
+          "control-flow handoff changes the logical value domain");
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(terminator);
+    auto conversion = builder.create<riscv::ConvertLayoutOp>(
+        terminator->getLoc(), target, value,
+        riscv_internal::layoutConversion(builder, source.getLayout(),
+                                         target.getLayout()),
+        riscv_internal::unselectedLeaf(builder));
+    terminator->setOperand(index, conversion.getResult());
+    return mlir::success();
+  }
+
+  bool reconcileControlCarries(mlir::OpBuilder &builder) {
+    bool failed = false;
+    getOperation().walk([&](riscv::LoopOp loop) {
+      mlir::Block &body = loop.getBody().front();
+      auto yield = mlir::cast<riscv::YieldOp>(body.getTerminator());
+      for (auto [index, carried] : llvm::enumerate(loop.getCarried())) {
+        mlir::Type type = carried.getType();
+        body.getArgument(index + 1).setType(type);
+        loop.getResult(index).setType(type);
+        failed |= mlir::failed(convertYieldOperand(builder, yield, index, type));
+      }
+    });
+    getOperation().walk([&](mlir::scf::ForOp loop) {
+      for (auto [index, initial] : llvm::enumerate(loop.getInitArgs())) {
+        mlir::Type type = initial.getType();
+        loop.getRegionIterArg(index).setType(type);
+        loop.getResult(index).setType(type);
+        failed |= mlir::failed(convertYieldOperand(
+            builder, loop.getBody()->getTerminator(), index, type));
+      }
+    });
+    getOperation().walk([&](mlir::scf::IfOp branch) {
+      for (auto [index, result] : llvm::enumerate(branch.getResults())) {
+        failed |= mlir::failed(convertYieldOperand(
+            builder, branch.thenYield(), index, result.getType()));
+        failed |= mlir::failed(convertYieldOperand(
+            builder, branch.elseYield(), index, result.getType()));
+      }
+    });
+    getOperation().walk([&](mlir::scf::WhileOp loop) {
+      auto condition = mlir::cast<mlir::scf::ConditionOp>(
+          loop.getBefore().front().getTerminator());
+      auto yield = mlir::cast<mlir::scf::YieldOp>(
+          loop.getAfter().front().getTerminator());
+      for (auto [index, initial] : llvm::enumerate(loop.getInits())) {
+        mlir::Type type = initial.getType();
+        loop.getBefore().front().getArgument(index).setType(type);
+        loop.getAfter().front().getArgument(index).setType(type);
+        loop.getResult(index).setType(type);
+        failed |= mlir::failed(
+            convertYieldOperand(builder, condition, index + 1, type));
+        failed |= mlir::failed(convertYieldOperand(builder, yield, index, type));
+      }
+    });
+    return failed;
+  }
+
+  bool reconcileStateInitializers(mlir::OpBuilder &builder) {
+    bool failed = false;
+    llvm::SmallVector<riscv::NewOp> states;
+    getOperation().walk([&](riscv::NewOp state) {
+      if (state.getInitialized())
+        states.push_back(state);
+    });
+    for (riscv::NewOp state : states) {
+      mlir::Value initial = state.getInitial();
+      auto source = mlir::dyn_cast<riscv::ValueType>(initial.getType());
+      auto target = mlir::dyn_cast<riscv::ValueType>(state.getResult().getType());
+      // Canonical `new` permits a scalar initializer to broadcast to a shaped
+      // state.  That is a numerical rule and does not require a layout edge.
+      if (!source || !target || initial.getType() == state.getResult().getType())
+        continue;
+      if (source.getElementType() != target.getElementType() ||
+          source.getShape() != target.getShape() ||
+          source.getAxisIds() != target.getAxisIds()) {
+        state.emitError(
+            "physical state initializer changes the canonical logical domain");
+        failed = true;
+        continue;
+      }
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(state);
+      auto conversion = builder.create<riscv::ConvertLayoutOp>(
+          state.getLoc(), target, initial,
+          riscv_internal::layoutConversion(builder, source.getLayout(),
+                                           target.getLayout()),
+          riscv_internal::unselectedLeaf(builder));
+      state.getInitialMutable().assign(conversion.getResult());
+    }
+    return failed;
+  }
+
+  void insertUseConversions(mlir::OpBuilder &builder) {
+    if (reconcileControlCarries(builder) ||
+        reconcileStateInitializers(builder)) {
+      signalPassFailure();
+      return;
+    }
+    llvm::SmallVector<mlir::Operation *> operations;
+    getOperation().walk([&](mlir::Operation *operation) {
+      // Pointwise operations require one shared element mapping.  Structured
+      // products do not: free and reduction operands deliberately retain
+      // different lane/register decompositions and are reconciled by their
+      // typed RVV step or IME pack operations during composite lowering.
+      if (pointwiseLike(operation) || mlir::isa<riscv::LookupOp>(operation))
+        operations.push_back(operation);
+    });
+    for (mlir::Operation *operation : operations) {
+      if (operation->getNumResults() != 1 ||
+          !mlir::isa<riscv::ValueType>(operation->getResult(0).getType()))
+        continue;
+      auto result = mlir::cast<riscv::ValueType>(operation->getResult(0).getType());
+      for (mlir::OpOperand &operand : operation->getOpOperands()) {
+        if (!mlir::isa<riscv::ValueType>(operand.get().getType()))
+          continue;
+        if (mlir::isa<riscv::LookupOp>(operation) &&
+            operand.getOperandNumber() == 0)
+          continue;
+        auto kernel = operation->getParentOfType<riscv::KernelOp>();
+        riscv::LayoutAttr required = riscv_internal::projectLayout(
+            builder, mlir::cast<riscv::ValueType>(operand.get().getType()),
+            result.getLayout(), kernel.getTarget());
+        if (!required) {
+          operation->emitError(
+              "no legal target layout projects the pointwise result mapping to its operand");
+          signalPassFailure();
+          continue;
+        }
+        mlir::Type requiredType =
+            riscv_internal::withLayout(operand.get().getType(), required);
+        if (operand.get().getType() == requiredType)
+          continue;
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(operation);
+        auto conversion = builder.create<riscv::ConvertLayoutOp>(
+            operation->getLoc(), requiredType, operand.get(),
+            riscv_internal::layoutConversion(
+                builder,
+                mlir::cast<riscv::ValueType>(operand.get().getType())
+                    .getLayout(),
+                required),
+            riscv_internal::unselectedLeaf(builder));
+        operand.set(conversion.getResult());
+      }
+    }
+
+    llvm::SmallVector<riscv::ExtractOp> gathers;
+    getOperation().walk([&](riscv::ExtractOp extract) {
+      if (llvm::any_of(extract.getSelectors(), [](mlir::Attribute selector) {
+            return mlir::cast<mlir::StringAttr>(selector).getValue() ==
+                   "gather";
+          }))
+        gathers.push_back(extract);
+    });
+    for (riscv::ExtractOp extract : gathers) {
+      auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+      if (!result)
+        continue;
+      size_t indexCursor = 0;
+      for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (indexCursor >= extract.getIndices().size()) {
+          extract.emitError("gather selector has no physical index operand");
+          signalPassFailure();
+          break;
+        }
+        mlir::OpOperand &operand =
+            extract->getOpOperand(1 + indexCursor++);
+        if (selector != "gather" ||
+            !mlir::isa<riscv::ValueType>(operand.get().getType()))
+          continue;
+        auto kernel = extract->getParentOfType<riscv::KernelOp>();
+        riscv::LayoutAttr required = riscv_internal::projectLayout(
+            builder, mlir::cast<riscv::ValueType>(operand.get().getType()),
+            result.getLayout(), kernel.getTarget());
+        if (!required) {
+          extract.emitError(
+              "no legal target layout projects the gather result mapping to its index");
+          signalPassFailure();
+          continue;
+        }
+        mlir::Type requiredType =
+            riscv_internal::withLayout(operand.get().getType(), required);
+        if (operand.get().getType() == requiredType)
+          continue;
+        auto source =
+            mlir::cast<riscv::ValueType>(operand.get().getType()).getLayout();
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(extract);
+        auto conversion = builder.create<riscv::ConvertLayoutOp>(
+            extract.getLoc(), requiredType, operand.get(),
+            riscv_internal::layoutConversion(builder, source, required),
+            riscv_internal::unselectedLeaf(builder));
+        operand.set(conversion.getResult());
+      }
+    }
+  }
+};
+
+} // namespace
+
+std::unique_ptr<mlir::Pass> weft::createPropagateRISCVLayoutsPass() {
+  return std::make_unique<PropagateRISCVLayoutsPass>();
+}

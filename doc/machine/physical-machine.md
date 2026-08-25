@@ -265,6 +265,8 @@ local cluster 是从作者已有 Level/ordinary loop 中抽取的一组物理 pr
 
 这些结构只改变同一 source instances 的 issue time和temporary lifetime；不能创建新的算法 pass、跨 Level workspace、persistent buffer或另一种state recurrence。pipeline depth、buffer count、unroll和prefetch distance是有限物理参数，可由构建期实测选择。
 
+当前RISC-V实现的可执行子集更窄：depth=1是顺序执行；depth=2只接受一个window load紧接一个window step、单一accumulator carry和两个window SSA版本，并生成真实prologue/steady-state/epilogue。async transfer、wait、多于两个buffer、普通register contract的多阶段pipeline和非零prefetch尚未形成合法physical program，不能仅通过设置参数声称支持。
+
 ## 12. Resource model
 
 每份完整物理参数绑定都必须计算同时 live 的：
@@ -294,11 +296,11 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 
 ### 13.3 参数性选择
 
-结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count 和 prefetch distance。target 提供有限合法域，tuner 通过实测选择；非法绑定在 emission 前拒绝。
+结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count 和 prefetch distance。target 提供有限合法域，tuner 通过实测选择；非法绑定在 emission 前拒绝。当前RISC-V compiler API只暴露unroll和pipeline depth；depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
 
 ## 14. Target profile
 
-每个 target profile 必须提供：
+一个完整 target implementation 必须为其实际支持的机器能力提供下列 facts；未提供的能力就是 unsupported，不能由 pass 或 emitter 假定默认存在：
 
 ```text
 ISA 与 ABI
@@ -316,6 +318,8 @@ spill/rematerialize legality
 有限 physical parameter domains
 intrinsic / local asm availability
 ```
+
+当前 RISC-V `TargetAttr` 只物化已经有真实 consumer 的子集：ISA/ABI、显式 VLEN、32 个 vector registers、合法 SEW/LMUL、完整 `V` 的 indexed/segment/widening 能力、local-storage 上界，以及 typed IME fragment capability。当前 backend 要求完整 `V` 和显式正 VLEN；`Zve`、纯标量 target、未知 VLEN、异步 transfer/wait/barrier、独立 prefetch 域及通用 latency model 均明确不在当前实现范围。它们没有占位字段，也不能通过默认值假装可用。
 
 换目标时可以改变这些 profile facts、规则、参数域和最终指令；不能改变：
 
@@ -339,15 +343,15 @@ requirement 是 physical legality 的额外约束：结构性选择前，不能�
 
 ## 15. 与 Triton/TileLang 可复用的机制边界
 
-TritonGPU把 distributed layout 放在 tensor type encoding 上，`convert_layout` 是真实 typed op；coalescing、matmul acceleration、layout-conversion elimination、loop scheduling和pipeline都改写IR。对应源码位于：
+以下路径相对于本仓库根目录位于同级reference checkout `../ref/`。TritonGPU把 distributed layout 放在 tensor type encoding 上，`convert_layout` 是真实 typed op；coalescing、matmul acceleration、layout-conversion elimination、loop scheduling和pipeline都改写IR。对应源码位于：
 
-- `ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:738`；
-- `ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:32`；
-- `ref/triton/third_party/nvidia/backend/compiler.py:297`。
+- `../ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUAttrDefs.td:738`；
+- `../ref/triton/include/triton/Dialect/TritonGPU/IR/TritonGPUOps.td:32`；
+- `../ref/triton/third_party/nvidia/backend/compiler.py:297`。
 
 Weft 应复用“typed representation + explicit conversion + real program rewrite”的机制，不复用 logical coordinate→thread/warp/CTA ownership 作为 source 根布局。
 
-TileLang 在 source 中显式提供 shared/local/fragment allocation、thread binding、copy/pipeline metadata和layout；对应源码位于 `ref/tilelang/tilelang/language/allocate.py:1`、`kernel.py:149`、`loop.py:13`。Weft 不把这些 target storage/thread objects加入 DSL，但物理机器必须具有同等明确的 local storage、fragment、transfer 与 pipeline语义，不能只靠 emitter 私约定。
+TileLang 在 source 中显式提供 shared/local/fragment allocation、thread binding、copy/pipeline metadata和layout；对应源码位于 `../ref/tilelang/tilelang/language/allocate.py:1`、`kernel.py:149`、`loop.py:13`。Weft 不把这些 target storage/thread objects加入 DSL，但物理机器必须具有同等明确的 local storage、fragment、transfer 与 pipeline语义，不能只靠 emitter 私约定。
 
 ## 16. 与 physical IR 的边界
 

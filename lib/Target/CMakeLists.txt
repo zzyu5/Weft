@@ -1,14 +1,16 @@
 add_library(WeftRISCVTarget STATIC
   RISCVTargetProfile.cpp
-  RISCVPlanningSupport.cpp
-  RISCVConstructProblems.cpp
-  RISCVConstrainRepresentations.cpp
-  RISCVResolveLayoutConversions.cpp
-  RISCVPropagateStorageMappings.cpp
-  RISCVConstrainInstructions.cpp
-  RISCVScheduleLevels.cpp
-  RISCVConstrainResources.cpp
-  RISCVSolve.cpp
+  RISCVPhysicalSupport.cpp
+  ConvertWeftToRISCV.cpp
+  SelectRISCVOperations.cpp
+  PropagateRISCVLayouts.cpp
+  PlanRISCVMemory.cpp
+  CanonicalizeRISCVLayouts.cpp
+  LowerRISCVComposites.cpp
+  PipelineRISCVLevels.cpp
+  FinalizeRISCVLeaves.cpp
+  MaterializeRISCVResources.cpp
+  VerifyFinalRISCV.cpp
   RISCVIntrinsicC.cpp
   RISCVCompiler.cpp
 )

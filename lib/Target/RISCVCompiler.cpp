@@ -1,10 +1,11 @@
 #include "Weft/Target/RISCVCompiler.h"
 
-#include "Weft/Dialect/RISCV/IR/RISCVPlanningDialect.h"
+#include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 #include "Weft/Target/RISCVPasses.h"
 #include "RISCVIntrinsicC.h"
 
-#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -12,131 +13,55 @@
 
 namespace {
 
-mlir::LogicalResult runPlanning(mlir::ModuleOp module,
-                                weft::RISCVCompilerOptions options) {
+mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
+                                       weft::RISCVCompilerOptions options) {
+  module.getContext()->getOrLoadDialect<mlir::arith::ArithDialect>();
+  module.getContext()->getOrLoadDialect<mlir::scf::SCFDialect>();
+  module.getContext()->getOrLoadDialect<weft::riscv::WEFTRISCVDialect>();
   mlir::PassManager manager(module.getContext());
   manager.enableVerifier(true);
-  manager.addPass(weft::createConstructRISCVProblemsPass(std::move(options)));
-  manager.addPass(weft::createAssignRISCVRepresentationsPass());
-  manager.addPass(weft::createResolveRISCVLayoutConversionsPass());
-  manager.addPass(weft::createPropagateRISCVStorageMappingsPass());
-  manager.addPass(weft::createSelectRISCVLocalOperationsPass());
-  manager.addPass(weft::createScheduleRISCVLevelsPass());
-  manager.addPass(weft::createCheckRISCVResourcesPass());
-  manager.addPass(weft::createSelectRISCVWinnerPass());
+  manager.addPass(weft::createConvertWeftToRISCVPass(std::move(options)));
+  manager.addPass(weft::createSelectRISCVOperationsPass());
+  manager.addPass(weft::createPropagateRISCVLayoutsPass());
+  manager.addPass(weft::createPlanRISCVMemoryPass());
+  manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
+  manager.addPass(weft::createLowerRISCVCompositesPass());
+  manager.addPass(weft::createPipelineRISCVLevelsPass());
+  manager.addPass(weft::createFinalizeRISCVLeavesPass());
+  manager.addPass(weft::createMaterializeRISCVResourcesPass());
+  manager.addPass(weft::createVerifyFinalRISCVPass());
   return manager.run(module);
 }
 
-void printDictionary(llvm::raw_ostream &output, mlir::DictionaryAttr dictionary,
-                     llvm::StringRef indent) {
-  for (mlir::NamedAttribute named : dictionary) {
-    output << indent << named.getName() << " = ";
-    named.getValue().print(output);
-    output << '\n';
-  }
-}
-
-void printAssignment(llvm::raw_ostream &output,
-                     weft::riscv::AssignmentOp assignment) {
-  output << "kernel = @" << assignment.getKernel() << '\n';
-  output << "status = " << assignment.getStatus() << '\n';
-  output << "\ntarget\n";
-  printDictionary(output, assignment.getTarget(), "  ");
-  output << "\ncandidate\n";
-  printDictionary(output, assignment.getCandidate(), "  ");
-  output << "\nresources\n";
-  printDictionary(output, assignment.getResources(), "  ");
-  output << "\nvalues\n";
-  for (mlir::Attribute attribute : assignment.getValues()) {
-    auto value = mlir::cast<mlir::DictionaryAttr>(attribute);
-    output << "  " << mlir::cast<mlir::StringAttr>(value.get("id")).getValue()
-           << "  "
-           << mlir::cast<mlir::StringAttr>(value.get("type_spelling")).getValue()
-           << '\n';
-    for (llvm::StringRef key :
-         {"source", "physical_kind", "physical_encoding_kind", "physical_sew",
-          "lane_axis", "physical_lanes", "stream_parts", "register_parts",
-          "vector_parts", "register_axis", "lmul", "vl",
-          "register_groups_per_part",
-          "register_groups", "storage", "materialization",
-          "representation_chain", "sew_derived_from", "lanes_derived_from",
-          "lmul_derived_from", "vl_derived_from", "representation_users",
-          "materialization_derived_from",
-          "handoff_class", "live_start", "live_end",
-          "encoding_family", "base_encoding_family", "layout_identity",
-          "interleave_rows"})
-      if (mlir::Attribute field = value.get(key)) {
-        output << "    " << key << " = ";
-        field.print(output);
-        output << '\n';
-      }
-  }
-  output << "\noperations\n";
-  for (mlir::Attribute attribute : assignment.getOperations()) {
-    auto operation = mlir::cast<mlir::DictionaryAttr>(attribute);
-    output << "  "
-           << mlir::cast<mlir::StringAttr>(operation.get("id")).getValue()
-           << "  "
-           << mlir::cast<mlir::StringAttr>(operation.get("source_op")).getValue()
-           << " -> "
-           << mlir::cast<mlir::StringAttr>(operation.get("realization")).getValue()
-           << '\n';
-    for (llvm::StringRef key : {"validity", "control_path", "representation_transfer", "use_conversions", "storage_mapping", "memory_edge",
-                                "local_operation", "co_reduce_partner",
-                                "level_mapping", "local_cluster", "schedule_loop",
-                                "schedule_level", "schedule"})
-      if (mlir::Attribute field = operation.get(key)) {
-        output << "    " << key << " = ";
-        field.print(output);
-        output << '\n';
-      }
-  }
-}
-
-mlir::FailureOr<std::string> assignmentText(mlir::ModuleOp module) {
+std::string printModule(mlir::ModuleOp module) {
   std::string text;
   llvm::raw_string_ostream output(text);
-  bool found = false;
-  for (weft::riscv::AssignmentOp assignment :
-       module.getOps<weft::riscv::AssignmentOp>()) {
-    if (found)
-      output << "\n---\n\n";
-    printAssignment(output, assignment);
-    found = true;
-  }
-  if (!found) {
-    module.emitError("RISC-V planning pipeline produced no assignment");
-    return mlir::failure();
-  }
+  module.print(output);
+  output << '\n';
   output.flush();
   return text;
 }
 
 } // namespace
 
-mlir::FailureOr<weft::RISCVPlanningResult>
-weft::planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
+mlir::FailureOr<weft::RISCVPhysicalizationResult>
+weft::physicalizeRISCVModule(mlir::ModuleOp module,
+                            RISCVCompilerOptions options) {
   mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
-  if (mlir::failed(runPlanning(*working, std::move(options))))
+  if (mlir::failed(runPhysicalization(*working, std::move(options))))
     return mlir::failure();
-  mlir::FailureOr<std::string> text = assignmentText(*working);
-  if (mlir::failed(text))
-    return mlir::failure();
-  RISCVPlanningResult result;
-  result.assignment = std::move(*text);
+  RISCVPhysicalizationResult result;
+  result.riscvIR = printModule(*working);
   return result;
 }
 
 mlir::FailureOr<weft::RISCVCompilationResult>
 weft::compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
   mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
-  if (mlir::failed(runPlanning(*working, std::move(options))))
-    return mlir::failure();
-  mlir::FailureOr<std::string> text = assignmentText(*working);
-  if (mlir::failed(text))
+  if (mlir::failed(runPhysicalization(*working, std::move(options))))
     return mlir::failure();
   RISCVCompilationResult result;
-  result.assignment = std::move(*text);
+  result.riscvIR = printModule(*working);
   if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
     return mlir::failure();
   return result;

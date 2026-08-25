@@ -5,7 +5,6 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
@@ -15,27 +14,26 @@ namespace weft {
 
 struct RISCVCompilerOptions {
   RISCVTargetProfile target;
-  llvm::StringMap<llvm::SmallVector<int64_t, 4>> metaBindings;
-  llvm::SmallVector<int64_t, 4> unrollChoices{1};
-  llvm::SmallVector<int64_t, 4> pipelineDepthChoices{1};
+  llvm::StringMap<int64_t> metaBindings;
+  int64_t unroll = 1;
+  int64_t pipelineDepth = 1;
 };
 
-struct RISCVPlanningResult {
-  std::string assignment;
+struct RISCVPhysicalizationResult {
+  std::string riscvIR;
 };
 
 struct RISCVCompilationResult {
-  std::string assignment;
+  std::string riscvIR;
   std::string intrinsicC;
 };
 
-/// Run transient forward RISC-V physicalization over canonical Kernel IR.
-/// Candidate/assignment operations exist only for this invocation.
-mlir::FailureOr<RISCVPlanningResult>
-planRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
+/// Convert one instantiated Canonical Kernel IR candidate into a complete,
+/// target-aware RISC-V Physical IR program.
+mlir::FailureOr<RISCVPhysicalizationResult>
+physicalizeRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
-/// Select one resource-legal forward candidate and mechanically emit its
-/// intrinsic-C program. AssignmentOp is the sole source of target choices.
+/// Translate a verified RISC-V Physical IR program mechanically to intrinsic C.
 mlir::FailureOr<RISCVCompilationResult>
 compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
