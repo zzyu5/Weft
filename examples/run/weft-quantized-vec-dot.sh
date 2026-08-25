@@ -27,11 +27,21 @@ if [[ ${format_id} -lt 0 ]]; then
 fi
 kernel="quantized_vec_dot_${format}_${partners[format_id]}"
 physical_auto=()
+if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
+fi
 if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
   physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
 fi
 if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
   physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
+if [[ ${target} == sg2044 && ${format} == q8_0 ]]; then
+  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+    physical_auto+=(--auto-lmul-eighths 8)
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+    physical_auto+=(--auto-pipeline-depth 1)
 fi
 
 case "${target}" in

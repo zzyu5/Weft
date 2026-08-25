@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from weft.language import L, View, admit, f32, i32, index, u32
+from weft.language import (
+    L,
+    View,
+    admit,
+    contract,
+    f32,
+    i8,
+    i16,
+    i32,
+    index,
+    mac_groups,
+    reduce,
+    u32,
+    widen,
+)
 
 from .encodings import (
     IQ1_M,
@@ -119,8 +133,9 @@ def vec_dot_q4_0_q8_0(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        integer = _dot_q4_values(w.q, x.q, zero=8)
-        result += f32(integer) * f32(w.d) * f32(x.d)
+        centered = i8(w.q) - i8(8)
+        integer = contract(x.q, centered, over="k", acc=i32)
+        result += (f32(w.d) * f32(x.d)) * f32(integer)
     return result
 
 
@@ -183,9 +198,7 @@ def vec_dot_q8_0_q8_0(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        integer = i32(0)
-        for j in range(32):
-            integer += i32(w.q[j]) * i32(x.q[j])
+        integer = contract(w.q, x.q, over="k", acc=i32)
         result += f32(integer) * (f32(w.d) * f32(x.d))
     return result
 
@@ -290,68 +303,22 @@ def vec_dot_q4_k_q8_k(
     W: View[Q4_K, (K,)],
     X: View[Q8_K, (K,)],
 ):
-    lane0 = f32(0.0)
-    lane1 = f32(0.0)
-    lane2 = f32(0.0)
-    lane3 = f32(0.0)
-    lane4 = f32(0.0)
-    lane5 = f32(0.0)
-    lane6 = f32(0.0)
-    lane7 = f32(0.0)
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        i32_acc = i32(0)
+        with L.subs(extent=32) as sub:
+            partial = contract(w.q[sub], x.q[sub], over="k", acc=i32)
+            i32_acc += partial * i32(w.sc[sub])
         minimum = i32(0)
-        acc0 = i32(0)
-        acc1 = i32(0)
-        acc2 = i32(0)
-        acc3 = i32(0)
-        acc4 = i32(0)
-        acc5 = i32(0)
-        acc6 = i32(0)
-        acc7 = i32(0)
         for sub in range(8):
-            minimum += (i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])) * i32(w.m[sub])
-            scale = i32(w.sc[sub])
-            for lane in range(32):
-                j = sub * 32 + lane
-                product = scale * i32(w.q[j]) * i32(x.q[j])
-                which = lane % 8
-                if which == 0:
-                    acc0 += product
-                if which == 1:
-                    acc1 += product
-                if which == 2:
-                    acc2 += product
-                if which == 3:
-                    acc3 += product
-                if which == 4:
-                    acc4 += product
-                if which == 5:
-                    acc5 += product
-                if which == 6:
-                    acc6 += product
-                if which == 7:
-                    acc7 += product
-        scale = f32(w.d) * f32(x.ds)
-        lane0 += scale * f32(acc0)
-        lane1 += scale * f32(acc1)
-        lane2 += scale * f32(acc2)
-        lane3 += scale * f32(acc3)
-        lane4 += scale * f32(acc4)
-        lane5 += scale * f32(acc5)
-        lane6 += scale * f32(acc6)
-        lane7 += scale * f32(acc7)
-        result -= (f32(w.dmin) * f32(x.ds)) * f32(minimum)
-    result += lane0
-    result += lane1
-    result += lane2
-    result += lane3
-    result += lane4
-    result += lane5
-    result += lane6
-    result += lane7
+            minimum += i32(w.m[sub]) * (
+                i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])
+            )
+        result += f32(x.ds) * (
+            f32(w.d) * f32(i32_acc) - f32(w.dmin) * f32(minimum)
+        )
     return result
 
 

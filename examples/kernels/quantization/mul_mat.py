@@ -49,10 +49,10 @@ from weft.std.mul_mat import (
     mul_mat_q2_k,
     mul_mat_q3_k,
     mul_mat_q4_0,
+    mul_mat_q4_0_decode,
     mul_mat_q4_1,
     mul_mat_q4_k,
     mul_mat_q4_k_persistent,
-    mul_mat_q4_k_persistent_decode,
     mul_mat_q4_k_staged,
     mul_mat_q5_0,
     mul_mat_q5_1,
@@ -82,6 +82,16 @@ def production_mul_mat_q4_0(
     Y: View[f32, (M, N)],
 ):
     mul_mat_q4_0(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q4_0_decode(
+    W: View[Q4_0, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_q4_0_decode(W, X, Xq, Y)
 
 
 @weft.kernel
@@ -163,16 +173,6 @@ def production_mul_mat_q4_k_persistent(
     Y: View[f32, (M, N)],
 ):
     mul_mat_q4_k_persistent(W, X, Xq, Y)
-
-
-@weft.kernel
-def production_mul_mat_q4_k_persistent_decode(
-    W: View[Q4K_I[16], (N, K)],
-    X: View[f32, (M, K)],
-    Xq: View[Q8_K, (M, K)],
-    Y: View[f32, (M, N)],
-):
-    mul_mat_q4_k_persistent_decode(W, X, Xq, Y)
 
 
 @weft.kernel

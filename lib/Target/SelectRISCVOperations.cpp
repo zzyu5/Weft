@@ -10,6 +10,7 @@
 #include "llvm/ADT/StringSwitch.h"
 
 #include <memory>
+#include <limits>
 
 using namespace weft;
 
@@ -56,6 +57,12 @@ bool supportsRVVType(riscv::TargetAttr target, mlir::Type type) {
   if (!target.getHasRVV() || target.getVlenBits() <= 0 ||
       target.getVectorRegisters() <= 0 ||
       !llvm::is_contained(target.getSupportedSEW().asArrayRef(), sew))
+    return false;
+  auto layout = value.getLayout();
+  if (layout.getCarrier() == "rvv" &&
+      (layout.getSew() != sew ||
+       !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                           layout.getLmulEighths())))
     return false;
   return !element.isF16() || target.getHasVectorF16();
 }
@@ -164,12 +171,16 @@ public:
       // PlanRISCVMemory, after layouts are known.  Selection establishes only
       // numerical/structured operation anchors.
       if (mlir::isa<riscv::LoadOp, riscv::StoreOp, riscv::FieldOp,
-                    riscv::ExtractOp, riscv::LookupOp>(operation))
+                    riscv::ExtractOp, riscv::LookupOp,
+                    riscv::ConvertLayoutOp>(operation))
         return;
       riscv::ImplementationAttr selected = select(operation, builder);
       if (!selected) {
-        operation->emitError(
-            "SelectRISCVOperations has no legal target-local operation for the typed primitive");
+        auto diagnostic = operation->emitError()
+                          << "SelectRISCVOperations has no legal target-local operation for '"
+                          << operation->getName() << "'";
+        if (operation->getNumResults() == 1)
+          diagnostic << " with result " << operation->getResult(0).getType();
         failed = true;
         return;
       }
@@ -186,16 +197,25 @@ private:
                                  llvm::StringRef scalarInstruction,
                                  llvm::StringRef vectorInstruction,
                                  mlir::Type result) {
-      if (!isShaped(result) || isTrivialShaped(result))
+      auto value = mlir::dyn_cast<riscv::ValueType>(result);
+      if (!value || isTrivialShaped(result) ||
+          value.getLayout().getCarrier() == "scalar")
         return scalarImplementation(builder, family, scalarInstruction);
+      if (value.getLayout().getCarrier() != "unassigned" &&
+          value.getLayout().getCarrier() != "rvv")
+        return riscv::ImplementationAttr();
       return supportsRVVOperation(operation)
                  ? rvvImplementation(builder, family, vectorInstruction)
                  : riscv::ImplementationAttr();
     };
 
     if (auto op = mlir::dyn_cast<riscv::IotaOp>(operation)) {
-      if (isTrivialShaped(op.getResult().getType()))
+      auto result = mlir::cast<riscv::ValueType>(op.getResult().getType());
+      if (isTrivialShaped(result) || result.getLayout().getCarrier() == "scalar")
         return scalarImplementation(builder, "iota", "register.iota");
+      if (result.getLayout().getCarrier() != "unassigned" &&
+          result.getLayout().getCarrier() != "rvv")
+        return {};
       return supportsRVVOperation(operation)
                  ? rvvImplementation(builder, "iota", "rvv.vid")
                  : riscv::ImplementationAttr();
@@ -206,7 +226,9 @@ private:
     if (auto op = mlir::dyn_cast<riscv::UnaryOp>(operation)) {
       std::string scalar = ("scalar." + op.getKind()).str();
       std::string vector = ("rvv.v" + op.getKind()).str();
-      if (op.getKind() == "exp" && isShaped(op.getResult().getType()) &&
+      auto result = mlir::dyn_cast<riscv::ValueType>(op.getResult().getType());
+      if (op.getKind() == "exp" && result &&
+          result.getLayout().getCarrier() != "scalar" &&
           riscv_internal::logicalElement(op.getResult().getType()).isF32())
         return rvvImplementation(builder, "exp-approx",
                                  "rvv.exp-approx-f32");
@@ -276,6 +298,27 @@ private:
           riscv_internal::logicalElement(lhs.getType()));
       auto rhsInteger = mlir::dyn_cast<mlir::IntegerType>(
           riscv_internal::logicalElement(rhs.getType()));
+      auto resultInteger = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(result));
+      auto lhsPhysical = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
+      auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
+      const bool canDoubleLMUL =
+          lhsPhysical && lhsPhysical.getLayout().getLmulEighths() > 0 &&
+          lhsPhysical.getLayout().getLmulEighths() <=
+              std::numeric_limits<int64_t>::max() / 2;
+      const int64_t partialLMUL =
+          canDoubleLMUL ? lhsPhysical.getLayout().getLmulEighths() * 2 : 0;
+      if (canDoubleLMUL && lhsInteger && rhsInteger && resultInteger &&
+          lhsInteger.getWidth() <= 16 && rhsInteger.getWidth() <= 16 &&
+          std::max<unsigned>(8, lhsInteger.getWidth()) ==
+              std::max<unsigned>(8, rhsInteger.getWidth()) &&
+          (lhsInteger.isSigned() || rhsInteger.isSigned()) &&
+          resultInteger.isSigned() && resultInteger.getWidth() == 32 &&
+          over.size() == 1 && target.getHasWideningInteger() &&
+          llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                             partialLMUL))
+        return rvvImplementation(builder, "widen-dot",
+                                 "rvv.vwmul-vwredsum", over);
       if (lhsInteger && rhsInteger && lhsInteger.getWidth() <= 8 &&
           rhsInteger.getWidth() <= 8 &&
           ((lhsInteger.isUnsigned() && rhsInteger.isSigned()) ||

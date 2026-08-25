@@ -12,11 +12,14 @@ namespace weft {
 std::unique_ptr<mlir::Pass>
 createConvertWeftToRISCVPass(RISCVCompilerOptions options);
 std::unique_ptr<mlir::Pass> createSelectRISCVOperationsPass();
-std::unique_ptr<mlir::Pass> createPropagateRISCVLayoutsPass();
+std::unique_ptr<mlir::Pass>
+createPropagateRISCVLayoutsPass(int64_t lmulEighths);
 std::unique_ptr<mlir::Pass> createPlanRISCVMemoryPass();
 std::unique_ptr<mlir::Pass> createCanonicalizeRISCVLayoutsPass();
 std::unique_ptr<mlir::Pass> createLowerRISCVCompositesPass();
 std::unique_ptr<mlir::Pass> createPipelineRISCVLevelsPass();
+std::unique_ptr<mlir::Pass> createUnrollRISCVLevelsPass();
+std::unique_ptr<mlir::Pass> createShareRISCVLayeredWindowsPass();
 std::unique_ptr<mlir::Pass> createFinalizeRISCVLeavesPass();
 std::unique_ptr<mlir::Pass> createMaterializeRISCVResourcesPass();
 std::unique_ptr<mlir::Pass> createVerifyFinalRISCVPass();

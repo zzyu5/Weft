@@ -42,6 +42,9 @@ case "${target}" in
 esac
 
 physical_auto=()
+if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
+fi
 if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
   physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
 fi
@@ -61,6 +64,13 @@ case "${kernel}" in
     dsl=examples/kernels/quantization/q4_k_gemv_groups4.py
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     runtime_kernel_define=-DWEFT_Q4_GROUPS4=1
+    if [[ ${target} == sg2044 ]]; then
+      [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+        physical_auto+=(--auto-lmul-eighths 32)
+      [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 2)
+      [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+        physical_auto+=(--auto-pipeline-depth 1)
+    fi
     ;;
   ime_i8_contract)
     if [[ ${target} != k1 ]]; then
@@ -78,12 +88,26 @@ case "${kernel}" in
     case "${kernel}" in
       q8_0_quantize)
         runtime_kernel_define=-DWEFT_Q8_KIND=0
+        if [[ ${target} == sg2044 ]]; then
+          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+            physical_auto+=(--auto-lmul-eighths 16)
+          [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
+          [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+            physical_auto+=(--auto-pipeline-depth 1)
+        fi
         ;;
       q8_1_quantize)
         runtime_kernel_define=-DWEFT_Q8_KIND=1
         ;;
       q8_K_quantize)
         runtime_kernel_define=-DWEFT_Q8_KIND=2
+        if [[ ${target} == sg2044 ]]; then
+          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+            physical_auto+=(--auto-lmul-eighths 64)
+          [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
+          [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+            physical_auto+=(--auto-pipeline-depth 1)
+        fi
         ;;
     esac
     ;;
@@ -95,7 +119,10 @@ case "${kernel}" in
   gemm_f32)
     dsl=examples/kernels/dense/gemm.py
     runtime=examples/repro/weft/gemm_runtime.cpp
-    meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+    meta=(--meta MC=64 --meta NC=16 --meta MR=2 --meta NR=2)
+    if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+      physical_auto+=(--auto-lmul-eighths 16)
+    fi
     runtime_phase=prefill
     ;;
   *)

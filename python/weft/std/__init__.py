@@ -46,6 +46,7 @@ from .mul_mat import (
     mul_mat_q2_k,
     mul_mat_q3_k,
     mul_mat_q4_0,
+    mul_mat_q4_0_decode,
     mul_mat_q4_1,
     mul_mat_q4_k,
     mul_mat_q5_0,
@@ -57,7 +58,14 @@ from .mul_mat import (
     mul_mat_tq2_0,
 )
 from .quant import q4k_gemv, q4k_gemv_contract, q4k_gemv_groups4
-from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
+from .quantize import (
+    quantize_q8_0,
+    quantize_q8_1,
+    quantize_q8_K,
+    quantize_row_q8_0,
+    quantize_row_q8_1,
+    quantize_row_q8_K,
+)
 from .row_dequant import (
     dequantize_iq1_m,
     dequantize_iq1_s,
@@ -170,6 +178,7 @@ __all__ = [
     "mul_mat_f16",
     "mul_mat_q1_0",
     "mul_mat_q4_0",
+    "mul_mat_q4_0_decode",
     "mul_mat_q4_1",
     "mul_mat_q5_0",
     "mul_mat_q5_1",
@@ -198,6 +207,9 @@ __all__ = [
     "quantize_q8_0",
     "quantize_q8_1",
     "quantize_q8_K",
+    "quantize_row_q8_0",
+    "quantize_row_q8_1",
+    "quantize_row_q8_K",
     "topk",
     "vec_dot_q1_0_q8_0",
     "vec_dot_q4_0_q8_0",

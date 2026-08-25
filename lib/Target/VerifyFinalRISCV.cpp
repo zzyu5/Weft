@@ -36,9 +36,15 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::LocalBindOp, riscv::LocalLoadOp,
       riscv::LocalStoreOp, riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RegisterMaterializeOp, riscv::RVVGroupedMacLoadOp,
+      riscv::RegisterMaterializeOp, riscv::RVVGroupedMacReduceOp,
+      riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
-      riscv::RVVEncodedDotStepOp, riscv::RVVSplatOp,
+      riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
+      riscv::RVVWidenReduceOp,
+      riscv::RVVPartitionedWidenReduceStoreOp,
+      riscv::RVVLayeredWindowOp,
+      riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
+      riscv::RVVStreamContractOp, riscv::RVVSplatOp,
       riscv::ProjectReductionOperandOp, riscv::RVVContractStepOp,
       riscv::RVVEncodedContractStepOp>(operation);
 }
@@ -53,9 +59,15 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::LocalCapacityGuardOp, riscv::LocalLoadOp, riscv::LocalStoreOp,
       riscv::SpillOp, riscv::ReloadOp, riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RVVGroupedMacLoadOp, riscv::RVVGroupedMacStepOp,
+      riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
+      riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
-      riscv::RVVSplatOp, riscv::ProjectReductionOperandOp,
+      riscv::RVVWidenDotOp, riscv::RVVWidenReduceOp,
+      riscv::RVVPartitionedWidenReduceStoreOp,
+      riscv::RVVLayeredWindowOp,
+      riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
+      riscv::RVVStreamContractOp, riscv::RVVSplatOp,
+      riscv::ProjectReductionOperandOp,
       riscv::RVVContractStepOp, riscv::RVVEncodedContractStepOp>(operation);
 }
 
@@ -160,8 +172,12 @@ mlir::LogicalResult verifyDescriptorFacts(mlir::Operation *owner,
 }
 
 bool requiresIntegerWidening(mlir::Operation *operation) {
-  if (mlir::isa<riscv::RVVGroupedMacStepOp,
+  if (mlir::isa<riscv::RVVGroupedMacReduceOp,
+                riscv::RVVGroupedMacStepOp,
                 riscv::RVVEncodedDotStepOp,
+                riscv::RVVWidenDotOp,
+                riscv::RVVWidenReduceOp,
+                riscv::RVVPartitionedWidenReduceStoreOp,
                 riscv::RVVEncodedContractStepOp>(operation))
     return true;
   auto widen = mlir::dyn_cast<riscv::WidenOp>(operation);
@@ -312,7 +328,8 @@ public:
         const bool scalarValue =
             !value || value.getLayout().getCarrier() == "scalar";
         const bool scalarStore =
-            access && scalarValue && access.getForm() == "unit" &&
+            access && scalarValue &&
+            (access.getForm() == "unit" || access.getForm() == "strided") &&
             access.getMapping() == "dense" && leaf.getEngine() == "transfer" &&
             leaf.getFamily() == "store" &&
             leaf.getInstruction() == "scalar.store" &&
@@ -627,8 +644,10 @@ public:
         const bool arithmeticResult = mlir::isa<
             riscv::IotaOp, riscv::UpdateOp, riscv::UnaryOp, riscv::BinaryOp,
             riscv::CompareOp, riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
-            riscv::RVVSplatOp, riscv::RVVGroupedMacStepOp,
-            riscv::RVVEncodedDotStepOp, riscv::RVVContractStepOp,
+            riscv::RVVSplatOp, riscv::RVVGroupedMacReduceOp,
+            riscv::RVVGroupedMacStepOp,
+            riscv::RVVEncodedDotStepOp, riscv::RVVLayeredWindowOp,
+            riscv::RVVContractStepOp,
             riscv::RVVEncodedContractStepOp>(operation);
         for (mlir::Value result : operation->getResults()) {
           if (auto value = mlir::dyn_cast<riscv::ValueType>(result.getType())) {

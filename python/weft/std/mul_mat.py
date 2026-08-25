@@ -6,6 +6,7 @@ from weft.language import (
     admit,
     auto,
     commit,
+    contract,
     dot,
     f16,
     f32,
@@ -153,30 +154,29 @@ def mul_mat_q4_0(
     Y: View[f32, (M, N)],
 ):
     quantize_q8_0(X, Xq)
+    for column in range(N):
+        with L.tiles(M, extent=auto("MC")) as mc:
+            with L.rows(mc, group=auto("MR")) as mb:
+                acc = new(f32, [MR], init=f32(0.0))
+                with L.blocks(K, extent=32) as kb:
+                    w = admit(W[column, kb])
+                    x = admit(Xq[mb, kb])
+                    centered = i8(w.q) - i8(8)
+                    integer = contract(x.q, centered, over="k", acc=i32)
+                    acc += (f32(w.d) * f32(x.d)) * widen(integer, f32)
+                commit(acc, Y[mb, column])
+
+
+def mul_mat_q4_0_decode(
+    W: View[Q4_0, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_0(X, Xq)
     for row in range(M):
         for column in range(N):
-            commit(f32(0.0), Y[row, column])
-    with L.tiles(N, extent=auto("NC")) as nc:
-        with L.tiles(K, extent=auto("KC")) as kc:
-            wp = materialize(admit(W[nc, kc]))
-            with L.tiles(M, extent=auto("MC")) as mc:
-                with L.rows(mc, group=auto("MR")) as mb:
-                    with L.cols(nc, group=auto("NR")) as nb:
-                        acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
-                        with L.blocks(kc, extent=32) as kb:
-                            w = wp[nb, kb]
-                            x = admit(Xq[mb, kb])
-                            raw = outer_contract(
-                                x.q, w.q, over="k", acc=i32
-                            )
-                            activation_sum = reduce(
-                                widen(x.q, i32), axis="k"
-                            )
-                            centered = raw - i32(8) * activation_sum
-                            acc += (
-                                widen(centered, f32) * f32(w.d) * f32(x.d)
-                            )
-                        commit(acc, Y[mb, nb])
+            commit(vec_dot_q4_0_q8_0(W[column], Xq[row]), Y[row, column])
 
 
 def mul_mat_q4_1(
@@ -264,38 +264,6 @@ def mul_mat_q4_k(
 
 
 def mul_mat_q4_k_persistent(
-    W: View[Q4K_I[16], (N, K)],
-    X: View[f32, (M, K)],
-    Xq: View[Q8_K, (M, K)],
-    Y: View[f32, (M, N)],
-):
-    quantize_q8_K(X, Xq)
-    with L.tiles(N, extent=auto("NC")) as nc:
-        with L.tiles(M, extent=auto("MC")) as mc:
-            with L.rows(mc, group=auto("MR")) as mb:
-                with L.cols(nc, group=16) as nb:
-                    f32_acc = new(f32, [MR, 16], init=0)
-                    with L.tiles(K, extent=auto("KC")) as kc:
-                        with L.blocks(kc, extent=256) as kb:
-                            w = admit(W[nb, kb])
-                            x = admit(Xq[mb, kb])
-                            i32_acc = new(i32, [MR, 16], init=0)
-                            with L.subs(extent=32) as s:
-                                p32 = outer_contract(
-                                    x.q[s], w.q[s], over="k", acc=i32
-                                )
-                                i32_acc += p32 * w.sc[s]
-                            mins = fold2(x.bsum)
-                            min_term = outer_contract(
-                                mins, w.m, over="k", acc=i32
-                            )
-                            f32_acc += x.ds * (
-                                w.d * i32_acc - w.dmin * min_term
-                            )
-                    commit(f32_acc, Y[mb, nb])
-
-
-def mul_mat_q4_k_persistent_decode(
     W: View[Q4K_I[16], (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],

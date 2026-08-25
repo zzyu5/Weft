@@ -14,6 +14,7 @@
 #include <memory>
 #include <initializer_list>
 #include <limits>
+#include <optional>
 
 using namespace weft;
 
@@ -37,6 +38,15 @@ int64_t sum(int64_t lhs, int64_t rhs) {
 int64_t resultParts(riscv::LayoutAttr layout) {
   return product(
       {product(layout.getTimeFactors()), product(layout.getReplicaFactors())});
+}
+
+bool supportsRVVLayout(riscv::TargetAttr target, riscv::LayoutAttr layout) {
+  return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
+         target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
+         llvm::is_contained(target.getSupportedSEW().asArrayRef(),
+                            layout.getSew()) &&
+         llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                            layout.getLmulEighths());
 }
 
 riscv::AccessAttr accessOf(mlir::Value value) {
@@ -64,6 +74,72 @@ riscv::AccessAttr accessOf(mlir::Value value) {
     break;
   }
   return {};
+}
+
+struct IntegerRange {
+  int64_t minimum;
+  int64_t maximum;
+};
+
+std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) {
+  if (depth > 8)
+    return std::nullopt;
+  auto type = mlir::dyn_cast<mlir::IntegerType>(
+      riscv_internal::logicalElement(value.getType()));
+  if (!type || type.getWidth() == 0 || type.getWidth() >= 63)
+    return std::nullopt;
+
+  auto constantRange = [](mlir::Attribute attribute)
+      -> std::optional<IntegerRange> {
+    auto integer = mlir::dyn_cast_or_null<mlir::IntegerAttr>(attribute);
+    if (!integer)
+      return std::nullopt;
+    const int64_t value = integer.getInt();
+    return IntegerRange{value, value};
+  };
+  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
+    if (auto range = constantRange(constant.getValue()))
+      return range;
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto range = constantRange(constant.getValue()))
+      return range;
+
+  if (auto widen = value.getDefiningOp<riscv::WidenOp>())
+    if (auto range = integerRange(widen.getInput(), depth + 1))
+      return range;
+  if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    if (auto range = integerRange(cast.getInput(), depth + 1))
+      return range;
+
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>();
+      binary && binary.getKind() == "sub") {
+    auto lhs = integerRange(binary.getLhs(), depth + 1);
+    auto rhs = integerRange(binary.getRhs(), depth + 1);
+    if (lhs && rhs) {
+      const __int128 minimum = static_cast<__int128>(lhs->minimum) -
+                               static_cast<__int128>(rhs->maximum);
+      const __int128 maximum = static_cast<__int128>(lhs->maximum) -
+                               static_cast<__int128>(rhs->minimum);
+      if (minimum >= std::numeric_limits<int64_t>::min() &&
+          maximum <= std::numeric_limits<int64_t>::max())
+        return IntegerRange{static_cast<int64_t>(minimum),
+                            static_cast<int64_t>(maximum)};
+    }
+  }
+
+  if (type.isSigned()) {
+    const int64_t bound = int64_t{1} << (type.getWidth() - 1);
+    return IntegerRange{-bound, bound - 1};
+  }
+  return IntegerRange{0, (int64_t{1} << type.getWidth()) - 1};
+}
+
+std::optional<int64_t> maximumMagnitude(mlir::Value value) {
+  auto range = integerRange(value);
+  if (!range)
+    return std::nullopt;
+  return std::max(range->maximum,
+                  range->minimum < 0 ? -range->minimum : range->minimum);
 }
 
 void copyIdentity(mlir::Operation *source, mlir::Operation *target) {
@@ -109,6 +185,10 @@ public:
     lowerLocalCommits(rewriter, failed);
     lowerLoops(rewriter, failed);
     closeOrderedLoops(failed);
+    lowerPartitionedWidenReduceStores(rewriter, failed);
+    lowerWidenReductions(rewriter, failed);
+    lowerStreamDots(rewriter);
+    lowerStreamReductions(rewriter, failed);
     lowerGroupedReductions(rewriter, failed);
     lowerEncodedDots(rewriter, failed);
     lowerContracts(rewriter, failed);
@@ -119,6 +199,164 @@ public:
   }
 
 private:
+  void lowerPartitionedWidenReduceStores(mlir::IRRewriter &rewriter,
+                                         bool &failed) {
+    llvm::SmallVector<mlir::scf::ForOp> loops;
+    getOperation().walk([&](mlir::scf::ForOp loop) {
+      if (loop->hasAttr("weft.riscv.level"))
+        loops.push_back(loop);
+    });
+    for (mlir::scf::ForOp loop : loops) {
+      if (!loop.getInitArgs().empty() || loop.getNumResults() != 0)
+        continue;
+      llvm::SmallVector<riscv::StoreOp> stores;
+      loop.getBody()->walk([&](riscv::StoreOp store) { stores.push_back(store); });
+      if (stores.size() != 1)
+        continue;
+      riscv::StoreOp store = stores.front();
+      auto reduce = store.getValue().getDefiningOp<riscv::ReduceOp>();
+      auto widen = reduce ? reduce.getInput().getDefiningOp<riscv::WidenOp>()
+                          : riscv::WidenOp();
+      auto extract = widen ? widen.getInput().getDefiningOp<riscv::ExtractOp>()
+                           : riscv::ExtractOp();
+      auto point = extract && extract.getIndices().size() == 1
+                       ? extract.getIndices().front().getDefiningOp<
+                             riscv::PhysicalPointOp>()
+                       : riscv::PhysicalPointOp();
+      auto destinationSlice = store.getRegion().getDefiningOp<riscv::SliceOp>();
+      auto destinationField = destinationSlice
+                                  ? destinationSlice.getBase().getDefiningOp<
+                                        riscv::FieldOp>()
+                                  : riscv::FieldOp();
+      auto destinationOwner = destinationField
+                                  ? destinationField.getOwner().getDefiningOp<
+                                        riscv::SliceOp>()
+                                  : riscv::SliceOp();
+      auto outerPoint = point
+                            ? point.getParent().getDefiningOp<
+                                  riscv::PhysicalPointOp>()
+                            : riscv::PhysicalPointOp();
+      auto partitionConstant =
+          point ? point.getPartition().getDefiningOp<
+                      mlir::arith::ConstantIndexOp>()
+                : mlir::arith::ConstantIndexOp();
+      auto input = extract
+                       ? mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType())
+                       : riscv::ValueType();
+      auto destination = destinationField
+                             ? mlir::dyn_cast<riscv::MemDescType>(
+                                   destinationField.getResult().getType())
+                             : riscv::MemDescType();
+      auto owner = destinationField
+                       ? mlir::dyn_cast<riscv::MemDescType>(
+                             destinationField.getOwner().getType())
+                       : riscv::MemDescType();
+      const int64_t partitionValue =
+          partitionConstant ? partitionConstant.value() : 0;
+      const int64_t count =
+          input && partitionValue > 0 && input.getShape().size() == 1
+              ? input.getShape()[0] / partitionValue
+              : -1;
+      const int64_t inputParts = input ? resultParts(input.getLayout()) : -1;
+      auto target = loop->getParentOfType<riscv::KernelOp>().getTarget();
+      if (!reduce || !widen || !extract || !point || !outerPoint ||
+          !destinationSlice || !destinationField || !destinationOwner ||
+          !partitionConstant || !input || !destination || !owner ||
+          reduce.getKind() != "add" ||
+          extract.getSelectors().size() != 1 ||
+          mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() !=
+              "domain" ||
+          input.getShape().size() != 1 || partitionConstant.value() <= 0 ||
+          input.getShape()[0] % partitionConstant.value() ||
+          count <= 1 || inputParts <= 0 || count % inputParts ||
+          destination.getAxisIds().size() != 1 || owner.getElements() <= 0 ||
+          !target.getHasRVV() || !target.getHasWideningInteger() ||
+          !supportsRVVLayout(target, input.getLayout()) ||
+          !loop->isProperAncestor(point) ||
+          loop->isProperAncestor(extract.getInput().getDefiningOp()))
+        continue;
+
+      bool extraEffects = false;
+      loop.getBody()->walk([&](mlir::Operation *nested) {
+        if (nested == store.getOperation())
+          return;
+        if (auto effects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(nested))
+          if (!effects.hasNoEffect())
+            extraEffects = true;
+      });
+      if (extraEffects)
+        continue;
+
+      rewriter.setInsertionPoint(loop);
+      destinationOwner->moveBefore(loop);
+      destinationField->moveBefore(loop);
+      mlir::Value elements = rewriter.create<mlir::arith::ConstantIndexOp>(
+          loop.getLoc(), owner.getElements());
+      mlir::Value partition = rewriter.create<mlir::arith::ConstantIndexOp>(
+          loop.getLoc(), partitionConstant.value());
+      mlir::Value within = rewriter.create<mlir::arith::RemUIOp>(
+          loop.getLoc(), outerPoint.getBase(), elements);
+      mlir::Value baseIndex = rewriter.create<mlir::arith::DivUIOp>(
+          loop.getLoc(), within, partition);
+      auto cluster =
+          rewriter.create<riscv::RVVPartitionedWidenReduceStoreOp>(
+              loop.getLoc(), extract.getInput(), destinationField.getResult(),
+              baseIndex, partitionConstant.value(), count,
+              destination.getAxisIds()[0], store.getAccess(),
+              riscv_internal::leaf(
+                  rewriter, "rvv", "partitioned-widen-reduce-store",
+                  "rvv.partitioned-vwredsum-store",
+                  "rvv.partitioned-vwredsum-store",
+                  input.getLayout().getRegisterGroups(), 0, 1));
+      copyIdentity(reduce, cluster);
+      if (auto parentLoop = loop->getParentOfType<mlir::scf::ForOp>())
+        parentLoop->setAttr("weft.riscv.system_unroll",
+                            rewriter.getStringAttr("disable"));
+      rewriter.eraseOp(loop);
+    }
+  }
+
+  void lowerWidenReductions(mlir::IRRewriter &rewriter, bool &failed) {
+    llvm::SmallVector<riscv::ReduceOp> reductions;
+    getOperation().walk(
+        [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
+    for (riscv::ReduceOp reduce : reductions) {
+      auto widen = reduce.getInput().getDefiningOp<riscv::WidenOp>();
+      auto input = widen
+                       ? mlir::dyn_cast<riscv::ValueType>(widen.getInput().getType())
+                       : riscv::ValueType();
+      auto inputElement = input
+                              ? mlir::dyn_cast<mlir::IntegerType>(
+                                    input.getElementType())
+                              : mlir::IntegerType();
+      auto resultElement =
+          mlir::dyn_cast<mlir::IntegerType>(reduce.getResult().getType());
+      auto target = reduce->getParentOfType<riscv::KernelOp>().getTarget();
+      if (!widen || !input || !inputElement || inputElement.isSignless() ||
+          !resultElement || resultElement.isSignless() ||
+          reduce.getKind() != "add" ||
+          resultElement.getWidth() != inputElement.getWidth() * 2 ||
+          mlir::isa<riscv::ValueType>(reduce.getResult().getType()) ||
+          input.getLayout().getCarrier() != "rvv" ||
+          resultParts(input.getLayout()) != 1 || !target.getHasRVV() ||
+          !target.getHasWideningInteger() ||
+          !supportsRVVLayout(target, input.getLayout()))
+        continue;
+      rewriter.setInsertionPoint(reduce);
+      auto folded = rewriter.create<riscv::RVVWidenReduceOp>(
+          reduce.getLoc(), reduce.getResult().getType(), widen.getInput(),
+          reduce.getKindAttr(), reduce.getAxisAttr(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "widen-reduce", "rvv.vwredsum",
+              "rvv.vwredsum", input.getLayout().getRegisterGroups(), 0, 1));
+      copyIdentity(reduce, folded);
+      reduce.getResult().replaceAllUsesWith(folded.getResult());
+      rewriter.eraseOp(reduce);
+      if (widen.getResult().use_empty())
+        rewriter.eraseOp(widen);
+    }
+  }
+
   mlir::FailureOr<std::pair<mlir::Value, int64_t>>
   elementCount(mlir::IRRewriter &rewriter, mlir::Operation *anchor,
                riscv::ValueType value) const {
@@ -147,6 +385,129 @@ private:
                                                   dimension);
     }
     return std::make_pair(count, staticCount);
+  }
+
+  void lowerStreamReductions(mlir::IRRewriter &rewriter, bool &failed) {
+    llvm::DenseMap<mlir::Value, llvm::SmallVector<riscv::ReduceOp, 2>> groups;
+    getOperation().walk([&](riscv::ReduceOp reduce) {
+      auto input = mlir::dyn_cast<riscv::ValueType>(reduce.getInput().getType());
+      auto implementation =
+          reduce->getAttrOfType<riscv::ImplementationAttr>("implementation");
+      if (!input || mlir::isa<riscv::ValueType>(reduce.getResult().getType()) ||
+          !implementation || implementation.getEngine() != "rvv" ||
+          implementation.getFamily() != "reduce" ||
+          input.getLayout().getCarrier() != "rvv" ||
+          input.getLayout().getValidity() != "full" ||
+          product(input.getLayout().getTimeFactors()) <= 1)
+        return;
+      groups[reduce.getInput()].push_back(reduce);
+    });
+    for (auto &[inputValue, reductions] : groups) {
+      if (reductions.empty())
+        continue;
+      const int64_t axis = reductions.front().getAxis();
+      if (llvm::any_of(reductions, [&](riscv::ReduceOp reduce) {
+            return reduce.getAxis() != axis ||
+                   reduce.getResult().getType() !=
+                       reductions.front().getResult().getType();
+          }))
+        continue;
+      auto load = inputValue.getDefiningOp<riscv::LoadOp>();
+      if (!load || static_cast<size_t>(std::distance(inputValue.use_begin(),
+                                                     inputValue.use_end())) !=
+                       reductions.size())
+        continue;
+      riscv::AccessAttr access = accessOf(inputValue);
+      if (!access || (access.getForm() != "unit" &&
+                      access.getForm() != "strided"))
+        continue;
+      llvm::SmallVector<mlir::Type> resultTypes;
+      llvm::SmallVector<mlir::Attribute> kinds;
+      for (riscv::ReduceOp reduce : reductions) {
+        resultTypes.push_back(reduce.getResult().getType());
+        kinds.push_back(rewriter.getStringAttr(reduce.getKind()));
+      }
+      auto input = mlir::cast<riscv::ValueType>(inputValue.getType());
+      const int64_t groupsPerVector = input.getLayout().getRegisterGroups();
+      rewriter.setInsertionPoint(reductions.front());
+      auto stream = rewriter.create<riscv::RVVStreamReduceOp>(
+          reductions.front().getLoc(), resultTypes, load.getRegion(),
+          input.getLayout(), rewriter.getArrayAttr(kinds), axis, access,
+          riscv_internal::leaf(
+              rewriter, "rvv", "stream-reduce", "rvv.stream-reduce",
+              "rvv.stream-reduce", 0, 0,
+              groupsPerVector * static_cast<int64_t>(reductions.size()) + 1));
+      copyIdentity(reductions.front(), stream);
+      for (auto [index, reduce] : llvm::enumerate(reductions))
+        reduce.getResult().replaceAllUsesWith(stream.getResult(index));
+      for (riscv::ReduceOp reduce : reductions)
+        rewriter.eraseOp(reduce);
+      if (load.getResult().use_empty())
+        rewriter.eraseOp(load);
+    }
+  }
+
+  void lowerStreamDots(mlir::IRRewriter &rewriter) {
+    llvm::SmallVector<riscv::ReduceOp> reductions;
+    getOperation().walk(
+        [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
+    for (riscv::ReduceOp reduce : reductions) {
+      if (reduce.getKind() != "add" || !reduce.getResult().getType().isF32() ||
+          mlir::isa<riscv::ValueType>(reduce.getResult().getType()))
+        continue;
+      auto productOp = reduce.getInput().getDefiningOp<riscv::BinaryOp>();
+      if (!productOp || productOp.getKind() != "mul" ||
+          !productOp.getResult().hasOneUse())
+        continue;
+      auto lhsLoad = productOp.getLhs().getDefiningOp<riscv::LoadOp>();
+      auto rhsLoad = productOp.getRhs().getDefiningOp<riscv::LoadOp>();
+      auto lhs = lhsLoad ? mlir::dyn_cast<riscv::ValueType>(
+                               lhsLoad.getResult().getType())
+                         : riscv::ValueType();
+      auto rhs = rhsLoad ? mlir::dyn_cast<riscv::ValueType>(
+                               rhsLoad.getResult().getType())
+                         : riscv::ValueType();
+      if (!lhsLoad || !rhsLoad || !lhs || !rhs ||
+          !lhsLoad.getResult().hasOneUse() || !rhsLoad.getResult().hasOneUse() ||
+          !lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
+          lhs.getShape() != rhs.getShape() || lhs.getAxisIds() != rhs.getAxisIds() ||
+          lhs.getLayout() != rhs.getLayout() || lhs.getShape().size() != 1 ||
+          lhs.getLayout().getCarrier() != "rvv" ||
+          reduce.getAxis() != 0)
+        continue;
+      riscv::AccessAttr lhsAccess = accessOf(lhsLoad.getResult());
+      riscv::AccessAttr rhsAccess = accessOf(rhsLoad.getResult());
+      if (!lhsAccess || !rhsAccess ||
+          (lhsAccess.getForm() != "unit" && lhsAccess.getForm() != "strided") ||
+          (rhsAccess.getForm() != "unit" && rhsAccess.getForm() != "strided") ||
+          lhsAccess.getMapping() != "dense" ||
+          rhsAccess.getMapping() != "dense")
+        continue;
+
+      mlir::Value extent =
+          fullAxisExtent(reduce.getOperation(), lhs.getAxisIds()[0]);
+      if (!extent)
+        continue;
+
+      rewriter.setInsertionPoint(reduce);
+      const int64_t groups = lhs.getLayout().getRegisterGroups();
+      auto stream = rewriter.create<riscv::RVVStreamDotOp>(
+          reduce.getLoc(), reduce.getResult().getType(), lhsLoad.getRegion(),
+          rhsLoad.getRegion(), extent, lhs.getLayout(), reduce.getAxis(), lhsAccess,
+          rhsAccess,
+          riscv_internal::leaf(rewriter, "rvv", "stream-dot",
+                               "rvv.stream-dot", "rvv.stream-dot", 0, 0,
+                               groups * 3));
+      copyIdentity(reduce, stream);
+      reduce.getResult().replaceAllUsesWith(stream.getResult());
+      rewriter.eraseOp(reduce);
+      if (productOp.getResult().use_empty())
+        rewriter.eraseOp(productOp);
+      if (lhsLoad.getResult().use_empty())
+        rewriter.eraseOp(lhsLoad);
+      if (rhsLoad.getResult().use_empty())
+        rewriter.eraseOp(rhsLoad);
+    }
   }
 
   void lowerLocalStates(mlir::IRRewriter &rewriter, bool &failed) {
@@ -412,6 +773,28 @@ private:
     return {};
   }
 
+  riscv::FieldOp sourceField(mlir::Value value) const {
+    while (mlir::Operation *definition = value.getDefiningOp()) {
+      if (auto field = mlir::dyn_cast<riscv::FieldOp>(definition))
+        return field;
+      if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
+        value = extract.getInput();
+        continue;
+      }
+      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(definition)) {
+        value = conversion.getInput();
+        continue;
+      }
+      if (auto materialize =
+              mlir::dyn_cast<riscv::RegisterMaterializeOp>(definition)) {
+        value = materialize.getInput();
+        continue;
+      }
+      break;
+    }
+    return {};
+  }
+
   mlir::FailureOr<mlir::Value>
   projectLoadedOperand(mlir::IRRewriter &rewriter, mlir::Value value,
                        riscv::ValueType projectedType, mlir::Value index,
@@ -501,20 +884,28 @@ private:
       mlir::Value total = domain.getExtent();
       rewriter.setInsertionPoint(loop);
       origin = rewriter.create<mlir::arith::ConstantIndexOp>(loop.getLoc(), 0);
-      auto parentType =
-          mlir::cast<riscv::PointType>(parentPoint.getType()).getDomain();
-      if (parentType.getRelation() != "root" &&
-          parentType.getAxisId() == domainType.getAxisId()) {
-        auto point = parentPoint.getDefiningOp<riscv::PhysicalPointOp>();
+      mlir::Value ancestor = parentPoint;
+      while (true) {
+        auto ancestorType =
+            mlir::cast<riscv::PointType>(ancestor.getType()).getDomain();
+        if (ancestorType.getRelation() == "root")
+          break;
+        auto point = ancestor.getDefiningOp<riscv::PhysicalPointOp>();
         if (!point) {
           loop.emitError(
-              "same-axis physical Level lost its parent point entity");
+              "physical Level ancestry lost an explicit point entity");
           failed = true;
-          continue;
+          break;
         }
-        origin = point.getBase();
-        total = point.getActive();
+        if (ancestorType.getAxisId() == domainType.getAxisId()) {
+          origin = point.getBase();
+          total = point.getActive();
+          break;
+        }
+        ancestor = point.getParent();
       }
+      if (failed)
+        continue;
       mlir::Value lower =
           rewriter.create<mlir::arith::ConstantIndexOp>(loop.getLoc(), 0);
       auto physical = rewriter.create<mlir::scf::ForOp>(
@@ -528,6 +919,10 @@ private:
               domainType.getAxisId(), domainType.getRelation(),
               loop.getStateBirthCount(), loop.getStagedBirthCount(),
               loop.getHandoffCount(), "ascending"));
+      if (loop.getSchedule().getUnroll() > 1)
+        physical->setAttr(
+            "weft.riscv.unroll_factor",
+            rewriter.getI64IntegerAttr(loop.getSchedule().getUnroll()));
 
       mlir::Block &sourceBody = loop.getBody().front();
       mlir::Block *targetBody = physical.getBody();
@@ -536,8 +931,10 @@ private:
           loop.getLoc(), origin, physical.getInductionVar());
       mlir::Value remaining = rewriter.create<mlir::arith::SubIOp>(
           loop.getLoc(), total, physical.getInductionVar());
-      mlir::Value active = rewriter.create<mlir::arith::MinUIOp>(
-          loop.getLoc(), remaining, domain.getPartition());
+      mlir::Value active = domain.getPartition();
+      if (domainType.getTail() != "exact")
+        active = rewriter.create<mlir::arith::MinUIOp>(
+            loop.getLoc(), remaining, domain.getPartition());
       auto point = rewriter.create<riscv::PhysicalPointOp>(
           loop.getLoc(), sourceBody.getArgument(0).getType(), parentPoint, base,
           active, domain.getPartition());
@@ -748,15 +1145,25 @@ private:
       }
       mlir::Value lhs = mac.getLhs();
       mlir::Value rhs = mac.getRhs();
-      while (auto conversion = lhs.getDefiningOp<riscv::ConvertLayoutOp>())
-        lhs = conversion.getInput();
-      while (auto conversion = rhs.getDefiningOp<riscv::ConvertLayoutOp>())
-        rhs = conversion.getInput();
       riscv::AccessAttr lhsAccess = accessOf(lhs);
       riscv::AccessAttr rhsAccess = accessOf(rhs);
       auto resultType =
           mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
-      if (!lhsAccess || !rhsAccess || !resultType) {
+      auto widenedType =
+          mlir::dyn_cast<riscv::ValueType>(widen.getResult().getType());
+      riscv::ValueType accumulatorType = resultType ? resultType : widenedType;
+      auto lhsType = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
+      auto rhsType = mlir::dyn_cast<riscv::ValueType>(rhs.getType());
+      auto lhsInteger = lhsType
+                            ? mlir::dyn_cast<mlir::IntegerType>(
+                                  lhsType.getElementType())
+                            : mlir::IntegerType();
+      auto rhsInteger = rhsType
+                            ? mlir::dyn_cast<mlir::IntegerType>(
+                                  rhsType.getElementType())
+                            : mlir::IntegerType();
+      if (!lhsAccess || !rhsAccess || !accumulatorType || !lhsType ||
+          !rhsType || !lhsInteger || !rhsInteger) {
         reduce.emitError(
             "grouped MAC reduction has no typed operand access/result contract");
         failed = true;
@@ -768,21 +1175,85 @@ private:
       riscv::ScheduleAttr schedule = mac.getSchedule();
       auto lhsLayout =
           mlir::cast<riscv::ValueType>(mac.getLhs().getType()).getLayout();
+      const int64_t partialLMUL =
+          product({lhsLayout.getLmulEighths(), int64_t{2}});
+      const int64_t partialRegisterGroups = product(
+          {std::max<int64_t>(1, lhsLayout.getRegisterGroups()), int64_t{2}});
+      if (partialLMUL <= 0 || partialRegisterGroups <= 0) {
+        reduce.emitError(
+            "grouped MAC partial LMUL or register groups overflow their physical domain");
+        failed = true;
+        continue;
+      }
       auto partialLayout = riscv::LayoutAttr::get(
           rewriter.getContext(), lhsLayout.getCarrier(), lhsLayout.getAxisIds(),
           lhsLayout.getTimeFactors(), lhsLayout.getLaneFactors(),
           lhsLayout.getReplicaFactors(), lhsLayout.getFragmentFactors(),
           lhsLayout.getLocalFactors(), 16,
-          std::min<int64_t>(64, lhsLayout.getLmulEighths() * 2),
+          partialLMUL,
           lhsLayout.getVl(),
-          std::max<int64_t>(1, lhsLayout.getRegisterGroups() * 2),
+          partialRegisterGroups,
           lhsLayout.getValidity());
-      mlir::Value point = findOperandPoint(lhs, reductionAxis);
-      if (!point)
-        point = findOperandPoint(rhs, reductionAxis);
+      riscv::FieldOp lhsField = sourceField(lhs);
+      riscv::FieldOp rhsField = sourceField(rhs);
+      riscv::LoadOp lhsLoad = lhsField ? sourceLoad(lhsField.getOwner())
+                                      : riscv::LoadOp();
+      riscv::LoadOp rhsLoad = rhsField ? sourceLoad(rhsField.getOwner())
+                                      : riscv::LoadOp();
+      auto lhsMemory = lhsLoad ? lhsLoad.getRegion().getType()
+                               : riscv::MemDescType();
+      mlir::Value lhsPoint = findOperandPoint(lhs, reductionAxis);
+      mlir::Value rhsPoint = findOperandPoint(rhs, reductionAxis);
+      mlir::Value point = lhsPoint ? lhsPoint : rhsPoint;
+      auto target = reduce->getParentOfType<riscv::KernelOp>().getTarget();
+      int64_t laneAxis = 0;
+      for (auto [axis, factor] :
+           llvm::zip(lhsType.getAxisIds().asArrayRef(),
+                     lhsLayout.getLaneFactors().asArrayRef()))
+        if (axis != reductionAxis && factor > 1) {
+          laneAxis = axis;
+          break;
+        }
+      bool hasCohortStride = false;
+      if (lhsMemory && laneAxis > 0)
+        for (auto [axis, stride] :
+             llvm::zip(lhsMemory.getAxisIds().asArrayRef(),
+                       lhsMemory.getStrides().asArrayRef()))
+          if (axis == laneAxis && stride != 0)
+            hasCohortStride = true;
+      const int64_t storageGroup = lhsAccess.getGroupSize();
+      const int64_t storageLayer = lhsAccess.getLayerSize();
+      const bool exactGeometry =
+          lhsInteger.isUnsigned() && lhsInteger.getWidth() < 8 &&
+          rhsInteger.isSigned() && rhsInteger.getWidth() == 8 && lhsField &&
+          rhsField && lhsLoad && rhsLoad && lhsPoint && rhsPoint &&
+          lhsPoint == rhsPoint && lhsAccess.getMapping() == "grouped_layered" &&
+          rhsAccess.getMapping() == "natural" && storageGroup > 0 &&
+          storageLayer > 0 && storageGroup % storageLayer == 0 &&
+          storageLayer % mac.getGroup() == 0 &&
+          (lhsAccess.getOrder() == "lo_first" ||
+           lhsAccess.getOrder() == "hi_first") &&
+          lhsAccess.getBitOffset() % 8 == 0 &&
+          rhsAccess.getBitOffset() % 8 == 0 &&
+          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
+          resultParts(accumulatorType.getLayout()) == 1 &&
+          supportsRVVLayout(target, lhsLayout) &&
+          supportsRVVLayout(target, partialLayout) &&
+          supportsRVVLayout(target, accumulatorType.getLayout()) &&
+          target.getHasWideningInteger();
+      if (!exactGeometry) {
+        reduce.emitError(
+            "selected grouped MAC has no complete typed field, cohort-storage, "
+            "RVV-layout, or shared reduction-point realization");
+        failed = true;
+        continue;
+      }
       auto physicalPoint =
           point ? point.getDefiningOp<riscv::PhysicalPointOp>()
                 : riscv::PhysicalPointOp();
+      const bool exactWindow =
+          physicalPoint &&
+          physicalPoint.getResult().getType().getDomain().getTail() == "exact";
       mlir::Value active = physicalPoint ? physicalPoint.getActive()
                                          : fullAxisExtent(reduce, reductionAxis);
       if (!active) {
@@ -792,7 +1263,47 @@ private:
         continue;
       }
       rewriter.setInsertionPoint(reduce);
-      mlir::Type element = resultType.getElementType();
+      if (schedule.getPipelineDepth() == 1 &&
+          schedule.getBufferCount() == 1) {
+        const int64_t operandGroups = lhsLayout.getRegisterGroups();
+        const int64_t temporaryGroups =
+            product({partialLayout.getRegisterGroups(), schedule.getUnroll()});
+        if (operandGroups <= 0 || temporaryGroups <= 0) {
+          reduce.emitError(
+              "grouped MAC leaf resources overflow their physical domain");
+          failed = true;
+          continue;
+        }
+        auto grouped = rewriter.create<riscv::RVVGroupedMacReduceOp>(
+            reduce.getLoc(), accumulatorType, lhs, rhs, active, mac.getGroup(),
+            schedule.getUnroll(), reductionAxis, partialLayout, lhsAccess,
+            rhsAccess,
+            riscv_internal::leaf(
+                rewriter, "rvv", "grouped-mac-reduce",
+                "rvv.grouped-mac-reduce.u8-s8",
+                "rvv.grouped-mac-reduce.u8-s8",
+                operandGroups,
+                accumulatorType.getLayout().getRegisterGroups(),
+                temporaryGroups, 0,
+                "none", exactWindow ? "exact" : "agnostic",
+                {static_cast<int64_t>(mac.getGroup()), schedule.getUnroll(),
+                 reductionAxis}));
+        copyIdentity(reduce, grouped);
+        if (resultType) {
+          reduce.getResult().replaceAllUsesWith(grouped.getResult());
+          rewriter.eraseOp(reduce);
+        } else {
+          reduce.getInputMutable().assign(grouped.getResult());
+        }
+        if (widen.getResult().use_empty())
+          rewriter.eraseOp(widen);
+        if (bridge && bridge.getResult().use_empty())
+          rewriter.eraseOp(bridge);
+        if (mac.getResult().use_empty())
+          rewriter.eraseOp(mac);
+        continue;
+      }
+      mlir::Type element = accumulatorType.getElementType();
       mlir::TypedAttr zero = mlir::isa<mlir::FloatType>(element)
                                  ? mlir::cast<mlir::TypedAttr>(
                                        rewriter.getFloatAttr(element, 0.0))
@@ -801,10 +1312,10 @@ private:
       auto scalarZero =
           rewriter.create<riscv::ConstantOp>(reduce.getLoc(), element, zero);
       auto accumulator = rewriter.create<riscv::RVVSplatOp>(
-          reduce.getLoc(), resultType, scalarZero,
+          reduce.getLoc(), accumulatorType, scalarZero,
           riscv_internal::leaf(rewriter, "rvv", "splat", "rvv.splat",
                                "rvv.splat", 0,
-                               resultType.getLayout().getRegisterGroups()));
+                               accumulatorType.getLayout().getRegisterGroups()));
       mlir::Value groupSize = rewriter.create<mlir::arith::ConstantIndexOp>(
           reduce.getLoc(), mac.getGroup());
       mlir::Value groupCount = rewriter.create<mlir::arith::CeilDivUIOp>(
@@ -821,40 +1332,51 @@ private:
       loop->setAttr("weft.riscv.schedule", schedule);
       auto windowType = riscv::WindowType::get(
           rewriter.getContext(), "grouped-mac", lhs.getType(), rhs.getType(),
-          resultType, reductionAxis, schedule.getUnroll(), mac.getGroup(),
-          resultParts(resultType.getLayout()), partialLayout, resultType.getLayout(),
+          accumulatorType, reductionAxis, schedule.getUnroll(), mac.getGroup(),
+          resultParts(accumulatorType.getLayout()), partialLayout,
+          accumulatorType.getLayout(),
           product({std::max<int64_t>(1, lhsLayout.getRegisterGroups()),
                    schedule.getUnroll(), static_cast<int64_t>(mac.getGroup())}));
+      const int64_t termsPerWindow =
+          product({static_cast<int64_t>(mac.getGroup()), schedule.getUnroll()});
+      const bool compactWindow =
+          termsPerWindow > 0 && storageLayer % termsPerWindow == 0;
       rewriter.setInsertionPointToStart(loop.getBody());
       auto load = rewriter.create<riscv::RVVGroupedMacLoadOp>(
           reduce.getLoc(), windowType, lhs, rhs, loop.getInductionVar(), active,
-          mac.getGroup(), schedule.getUnroll(), reductionAxis, partialLayout,
-          lhsAccess, rhsAccess,
+          mac.getGroup(), schedule.getUnroll(), reductionAxis,
+          compactWindow ? "compact" : "fragmented", partialLayout, lhsAccess,
+          rhsAccess,
           riscv_internal::leaf(
               rewriter, "rvv", "grouped-mac-load",
               "rvv.grouped-mac-load.u8-s8",
               "rvv.grouped-mac-load.u8-s8", 0,
               windowType.getResourceGroups(),
-              0, 0, "none", "agnostic",
+              0, 0, "none", exactWindow ? "exact" : "agnostic",
               {static_cast<int64_t>(mac.getGroup()), schedule.getUnroll(),
                reductionAxis}));
       auto stepOp = rewriter.create<riscv::RVVGroupedMacStepOp>(
-          reduce.getLoc(), resultType, load.getResult(),
+          reduce.getLoc(), accumulatorType, load.getResult(),
           loop.getRegionIterArg(0),
           riscv_internal::leaf(
               rewriter, "rvv", "grouped-mac-step",
               "rvv.vwmaccsu.vx.grouped", "rvv.vwmaccsu.vx.grouped",
               windowType.getResourceGroups(),
-              resultType.getLayout().getRegisterGroups(),
-              partialLayout.getRegisterGroups(), 0, "none", "agnostic",
+              accumulatorType.getLayout().getRegisterGroups(),
+              partialLayout.getRegisterGroups(), 0, "none",
+              exactWindow ? "exact" : "agnostic",
               {static_cast<int64_t>(mac.getGroup()), schedule.getUnroll(),
                reductionAxis}));
       rewriter.setInsertionPointToEnd(loop.getBody());
       rewriter.create<mlir::scf::YieldOp>(reduce.getLoc(), stepOp.getResult());
       copyIdentity(reduce, load);
       copyIdentity(reduce, stepOp);
-      reduce.getResult().replaceAllUsesWith(loop.getResult(0));
-      rewriter.eraseOp(reduce);
+      if (resultType) {
+        reduce.getResult().replaceAllUsesWith(loop.getResult(0));
+        rewriter.eraseOp(reduce);
+      } else {
+        reduce.getInputMutable().assign(loop.getResult(0));
+      }
       if (widen.getResult().use_empty())
         rewriter.eraseOp(widen);
       if (bridge && bridge.getResult().use_empty())
@@ -1030,9 +1552,219 @@ private:
       auto laneMemory =
           operation->getAttrOfType<mlir::StringAttr>("lane_memory_form");
       auto schedule = operation->getAttrOfType<riscv::ScheduleAttr>("schedule");
-      if (!implementation || !resultType || !over || !laneOperand || !laneMemory ||
-          !schedule) {
+      if (!implementation || !over || !laneOperand || !laneMemory || !schedule) {
         operation->emitError("contract has no complete typed physical contract");
+        failed = true;
+        continue;
+      }
+      if (mlir::isa<riscv::ContractOp>(operation) && resultType &&
+          resultType.getLayout().getCarrier() == "scalar" &&
+          implementation.getEngine() == "rvv" &&
+          implementation.getOperation() == "rvv.vfmacc" && over.size() == 1) {
+        auto lhsType =
+            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
+        auto rhsType =
+            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(1).getType());
+        riscv::LoadOp lhsLoad = sourceLoad(operation->getOperand(0));
+        riscv::LoadOp rhsLoad = sourceLoad(operation->getOperand(1));
+        riscv::AccessAttr lhsAccess = accessOf(operation->getOperand(0));
+        riscv::AccessAttr rhsAccess = accessOf(operation->getOperand(1));
+        const int64_t reductionAxis = over.asArrayRef().front();
+        auto laneFactor = [&](riscv::ValueType value) {
+          auto found = llvm::find(value.getAxisIds().asArrayRef(), reductionAxis);
+          if (found == value.getAxisIds().asArrayRef().end())
+            return int64_t{0};
+          return value.getLayout().getLaneFactors()[
+              static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin())];
+        };
+        const bool lhsMemory = lhsAccess &&
+                               (lhsAccess.getForm() == "unit" ||
+                                lhsAccess.getForm() == "strided") &&
+                               lhsAccess.getMapping() == "dense";
+        const bool rhsMemory = rhsAccess &&
+                               (rhsAccess.getForm() == "unit" ||
+                                rhsAccess.getForm() == "strided") &&
+                               rhsAccess.getMapping() == "dense";
+        if (!lhsType || !rhsType || !lhsLoad || !rhsLoad || !lhsMemory ||
+            !rhsMemory || lhsType.getElementType() != resultType.getElementType() ||
+            rhsType.getElementType() != resultType.getElementType() ||
+            !resultType.getElementType().isF32() ||
+            lhsType.getLayout().getCarrier() != "rvv" ||
+            rhsType.getLayout().getCarrier() != "rvv" ||
+            lhsType.getLayout().getLmulEighths() !=
+                rhsType.getLayout().getLmulEighths() ||
+            lhsType.getLayout().getVl() != rhsType.getLayout().getVl() ||
+            laneFactor(lhsType) != lhsType.getLayout().getVl() ||
+            laneFactor(rhsType) != rhsType.getLayout().getVl() ||
+            schedule.getUnroll() <= 0 || schedule.getPipelineDepth() != 1 ||
+            schedule.getBufferCount() != 1) {
+          operation->emitError(
+              "f32 stream contract has no closed reduction-lane memory realization");
+          failed = true;
+          continue;
+        }
+        mlir::Value extent = fullAxisExtent(operation, reductionAxis);
+        if (!extent) {
+          operation->emitError("f32 stream contract has no reduction extent");
+          failed = true;
+          continue;
+        }
+
+        llvm::SmallVector<int64_t> axes(
+            resultType.getAxisIds().asArrayRef().begin(),
+            resultType.getAxisIds().asArrayRef().end());
+        axes.push_back(reductionAxis);
+        llvm::SmallVector<int64_t> time(axes.size(), 1);
+        llvm::SmallVector<int64_t> lane(axes.size(), 1);
+        llvm::SmallVector<int64_t> replica(
+            resultType.getLayout().getReplicaFactors().asArrayRef().begin(),
+            resultType.getLayout().getReplicaFactors().asArrayRef().end());
+        replica.push_back(1);
+        llvm::SmallVector<int64_t> one(axes.size(), 1);
+        lane.back() = lhsType.getLayout().getVl();
+        const int64_t replicas = product(resultType.getLayout().getReplicaFactors());
+        const int64_t groupsPerVector =
+            (lhsType.getLayout().getLmulEighths() + 7) / 8;
+        const int64_t accumulatorGroups =
+            product({groupsPerVector, replicas});
+        auto accumulatorLayout = riscv::LayoutAttr::get(
+            rewriter.getContext(), "rvv", riscv_internal::integers(rewriter, axes),
+            riscv_internal::integers(rewriter, time),
+            riscv_internal::integers(rewriter, lane),
+            riscv_internal::integers(rewriter, replica),
+            riscv_internal::integers(rewriter, one),
+            riscv_internal::integers(rewriter, one), 32,
+            lhsType.getLayout().getLmulEighths(), lhsType.getLayout().getVl(),
+            accumulatorGroups, lhsType.getLayout().getValidity());
+        const int64_t lhsReplicas =
+            product(lhsType.getLayout().getReplicaFactors());
+        const int64_t rhsReplicas =
+            product(rhsType.getLayout().getReplicaFactors());
+        const int64_t stationaryReplicas = rhsReplicas;
+        const int64_t temporaryGroups =
+            sum(accumulatorGroups,
+                product({groupsPerVector, stationaryReplicas + 1}));
+        if (!accumulatorLayout || replicas <= 0 || groupsPerVector <= 0 ||
+            lhsReplicas <= 0 || rhsReplicas <= 0 || temporaryGroups <= 0) {
+          operation->emitError(
+              "f32 stream contract has invalid replica or resource geometry");
+          failed = true;
+          continue;
+        }
+        rewriter.setInsertionPoint(operation);
+        auto stream = rewriter.create<riscv::RVVStreamContractOp>(
+            operation->getLoc(), resultType, lhsLoad.getRegion(),
+            rhsLoad.getRegion(), extent, accumulatorLayout, reductionAxis,
+            "rhs", schedule.getUnroll(), lhsAccess, rhsAccess,
+            riscv_internal::leaf(rewriter, "rvv", "stream-contract",
+                                 "rvv.stream-contract", "rvv.stream-contract",
+                                 0, 0, temporaryGroups, 0));
+        copyIdentity(operation, stream);
+        operation->getResult(0).replaceAllUsesWith(stream.getResult());
+        rewriter.eraseOp(operation);
+        continue;
+      }
+      if (implementation.getFamily() == "widen-dot" &&
+          implementation.getOperation() == "rvv.vwmul-vwredsum") {
+        auto lhsType =
+            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
+        auto rhsType =
+            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(1).getType());
+        auto lhsElement = lhsType
+                              ? mlir::dyn_cast<mlir::IntegerType>(
+                                    lhsType.getElementType())
+                              : mlir::IntegerType();
+        auto rhsElement = rhsType
+                              ? mlir::dyn_cast<mlir::IntegerType>(
+                                    rhsType.getElementType())
+                              : mlir::IntegerType();
+        auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
+            riscv_internal::logicalElement(operation->getResult(0).getType()));
+        auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
+        const int64_t partialLMUL =
+            lhsType
+                ? product({lhsType.getLayout().getLmulEighths(), int64_t{2}})
+                : -1;
+        if (!lhsType || !rhsType || !lhsElement || !rhsElement ||
+            !resultElement || lhsElement.isSignless() ||
+            rhsElement.isSignless() || resultElement.isSignless() ||
+            lhsElement.getWidth() > 16 || rhsElement.getWidth() > 16 ||
+            std::max<unsigned>(8, lhsElement.getWidth()) !=
+                std::max<unsigned>(8, rhsElement.getWidth()) ||
+            (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+            !resultElement.isSigned() || resultElement.getWidth() != 32 ||
+            over.size() != 1 || !target.getHasWideningInteger() ||
+            !supportsRVVLayout(target, lhsType.getLayout()) ||
+            !supportsRVVLayout(target, rhsType.getLayout()) ||
+            lhsType.getLayout().getSew() != rhsType.getLayout().getSew() ||
+            lhsType.getLayout().getLmulEighths() !=
+                rhsType.getLayout().getLmulEighths() ||
+            lhsType.getLayout().getVl() != rhsType.getLayout().getVl() ||
+            !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                                partialLMUL) ||
+            (resultType && resultType.getLayout().getCarrier() != "scalar")) {
+          operation->emitError(
+              "selected RVV widening dot has no legal typed operands, scalar "
+              "free-axis result, or target widening shape");
+          failed = true;
+          continue;
+        }
+        const int64_t streams = product(lhsType.getLayout().getTimeFactors());
+        const unsigned partialWidth =
+            std::max<unsigned>(8, lhsElement.getWidth()) * 2;
+        const int64_t partialMaximum =
+            (int64_t{1} << (partialWidth - 1)) - 1;
+        auto lhsMagnitude = maximumMagnitude(operation->getOperand(0));
+        auto rhsMagnitude = maximumMagnitude(operation->getOperand(1));
+        auto hasFullReductionMapping = [&](riscv::ValueType value) {
+          auto found = llvm::find(value.getAxisIds().asArrayRef(), over[0]);
+          if (found == value.getAxisIds().asArrayRef().end())
+            return false;
+          const size_t position = static_cast<size_t>(
+              found - value.getAxisIds().asArrayRef().begin());
+          const int64_t extent = value.getShape()[position];
+          return extent > 0 &&
+                 value.getLayout().getLaneFactors()[position] *
+                         value.getLayout().getTimeFactors()[position] ==
+                     extent;
+        };
+        const bool fusedStreamsAreExact =
+            hasFullReductionMapping(lhsType) &&
+            hasFullReductionMapping(rhsType) && streams > 1 &&
+            lhsMagnitude && rhsMagnitude && *rhsMagnitude > 0 &&
+            *lhsMagnitude <= partialMaximum / *rhsMagnitude / streams;
+        llvm::StringRef streamReduction =
+            fusedStreamsAreExact ? "fused" : "per_stream";
+        const int64_t partialGroups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
+        const int64_t outputParts =
+            resultType ? product(resultType.getLayout().getReplicaFactors()) : 1;
+        const int64_t temporaryGroups =
+            sum(product({outputParts, partialGroups}), 1);
+        if (outputParts <= 0 || temporaryGroups <= 0) {
+          operation->emitError(
+              "selected RVV widening dot has invalid result/resource geometry");
+          failed = true;
+          continue;
+        }
+        rewriter.setInsertionPoint(operation);
+        auto widenedDot = rewriter.create<riscv::RVVWidenDotOp>(
+            operation->getLoc(), operation->getResult(0).getType(),
+            operation->getOperand(0), operation->getOperand(1), over,
+            rewriter.getStringAttr(streamReduction),
+            riscv_internal::leaf(
+                rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",
+                "rvv.vwmul-vwredsum",
+                lhsType.getLayout().getRegisterGroups() +
+                    rhsType.getLayout().getRegisterGroups(),
+                0, temporaryGroups));
+        copyIdentity(operation, widenedDot);
+        operation->getResult(0).replaceAllUsesWith(widenedDot.getResult());
+        rewriter.eraseOp(operation);
+        continue;
+      }
+      if (!resultType) {
+        operation->emitError(
+            "selected contract implementation requires a shaped physical result");
         failed = true;
         continue;
       }
@@ -1172,39 +1904,96 @@ private:
       auto physicalPoint =
           point ? point.getDefiningOp<riscv::PhysicalPointOp>()
                 : riscv::PhysicalPointOp();
-      mlir::Value reductionUpper =
-          physicalPoint ? physicalPoint.getActive()
-                        : fullAxisExtent(operation, reductionAxis);
+      std::optional<int64_t> typedReductionExtent;
+      for (mlir::Value operand : operation->getOperands().take_front(2)) {
+        auto value = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+        if (!value)
+          continue;
+        auto found = llvm::find(value.getAxisIds().asArrayRef(), reductionAxis);
+        if (found == value.getAxisIds().asArrayRef().end())
+          continue;
+        int64_t extent = value.getShape()[static_cast<size_t>(
+            found - value.getAxisIds().asArrayRef().begin())];
+        if (extent <= 0)
+          continue;
+        if (typedReductionExtent && *typedReductionExtent != extent) {
+          operation->emitError(
+              "contract operands disagree on their typed reduction extent");
+          failed = true;
+          break;
+        }
+        typedReductionExtent = extent;
+      }
+      if (failed)
+        continue;
+      mlir::Value reductionUpper;
+      if (typedReductionExtent) {
+        auto partition = physicalPoint
+                             ? physicalPoint.getPartition()
+                                   .getDefiningOp<mlir::arith::ConstantIndexOp>()
+                             : mlir::arith::ConstantIndexOp();
+        if (!physicalPoint ||
+            (partition && partition.value() > *typedReductionExtent))
+          reductionUpper = rewriter.create<mlir::arith::ConstantIndexOp>(
+              operation->getLoc(), *typedReductionExtent);
+      }
+      if (!reductionUpper)
+        reductionUpper = physicalPoint ? physicalPoint.getActive()
+                                       : fullAxisExtent(operation, reductionAxis);
       if (!reductionUpper) {
         operation->emitError("contract reduction axis has no physical extent");
         failed = true;
         continue;
       }
+      const bool exactReductionLevel =
+          physicalPoint &&
+          physicalPoint.getResult().getType().getDomain().getTail() == "exact";
       mlir::Type element = resultType.getElementType();
-      mlir::TypedAttr zero;
-      if (auto floating = mlir::dyn_cast<mlir::FloatType>(element))
-        zero = rewriter.getFloatAttr(floating, 0.0);
-      else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element))
-        zero = rewriter.getIntegerAttr(integer, 0);
-      else {
-        operation->emitError("contract accumulator element is not numeric");
-        failed = true;
-        continue;
+      riscv::BinaryOp fusedAccumulatorAdd;
+      mlir::Value initialAccumulator;
+      mlir::Value contractResult = operation->getResult(0);
+      if (contractResult.hasOneUse()) {
+        mlir::OpOperand &use = *contractResult.getUses().begin();
+        if (auto add = mlir::dyn_cast<riscv::BinaryOp>(use.getOwner());
+            add && add.getKind() == "add" &&
+            add.getResult().getType() == resultType) {
+          mlir::Value other = use.getOperandNumber() == 0 ? add.getRhs()
+                                                          : add.getLhs();
+          if (other.getType() == resultType) {
+            fusedAccumulatorAdd = add;
+            initialAccumulator = other;
+          }
+        }
       }
-      auto scalarZero = rewriter.create<riscv::ConstantOp>(
-          operation->getLoc(), element, zero);
-      auto zeroLeaf = riscv_internal::leaf(
-          rewriter, "rvv", "splat", "rvv.splat", "rvv.splat",
-          0, resultType.getLayout().getRegisterGroups());
-      auto accumulator = rewriter.create<riscv::RVVSplatOp>(
-          operation->getLoc(), resultType, scalarZero, zeroLeaf);
+      riscv::ConstantOp scalarZero;
+      riscv::RVVSplatOp zeroAccumulator;
+      if (!initialAccumulator) {
+        mlir::TypedAttr zero;
+        if (auto floating = mlir::dyn_cast<mlir::FloatType>(element))
+          zero = rewriter.getFloatAttr(floating, 0.0);
+        else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element))
+          zero = rewriter.getIntegerAttr(integer, 0);
+        else {
+          operation->emitError("contract accumulator element is not numeric");
+          failed = true;
+          continue;
+        }
+        scalarZero = rewriter.create<riscv::ConstantOp>(operation->getLoc(),
+                                                        element, zero);
+        auto zeroLeaf = riscv_internal::leaf(
+            rewriter, "rvv", "splat", "rvv.splat", "rvv.splat", 0,
+            resultType.getLayout().getRegisterGroups());
+        zeroAccumulator = rewriter.create<riscv::RVVSplatOp>(
+            operation->getLoc(), resultType, scalarZero, zeroLeaf);
+        initialAccumulator = zeroAccumulator.getResult();
+      }
       mlir::Value lower = rewriter.create<mlir::arith::ConstantIndexOp>(
           operation->getLoc(), 0);
       mlir::Value step = rewriter.create<mlir::arith::ConstantIndexOp>(
           operation->getLoc(), schedule.getUnroll());
       auto reductionLoop = rewriter.create<mlir::scf::ForOp>(
           operation->getLoc(), lower, reductionUpper, step,
-          mlir::ValueRange{accumulator.getResult()});
+          mlir::ValueRange{initialAccumulator});
       reductionLoop->setAttr("weft.riscv.direction",
                              rewriter.getStringAttr("ascending"));
       rewriter.setInsertionPointToStart(reductionLoop.getBody());
@@ -1222,8 +2011,10 @@ private:
             "RVV contract implementation has no exact terminal step instruction");
         failed = true;
         rewriter.eraseOp(reductionLoop);
-        rewriter.eraseOp(accumulator);
-        rewriter.eraseOp(scalarZero);
+        if (zeroAccumulator)
+          rewriter.eraseOp(zeroAccumulator);
+        if (scalarZero)
+          rewriter.eraseOp(scalarZero);
         continue;
       }
       auto stepLeaf = riscv_internal::leaf(
@@ -1237,22 +2028,40 @@ private:
       riscv::LayoutAttr resultLayout = resultType.getLayout();
       auto kernel = operation->getParentOfType<riscv::KernelOp>();
       auto laneType = mlir::dyn_cast<riscv::ValueType>(laneValue.getType());
-      auto laneLoadLayout =
-          laneType ? riscv_internal::projectLayout(
-                         rewriter, laneType, resultLayout, kernel.getTarget())
-                   : riscv::LayoutAttr();
+      auto encodedLaneField = laneValue.getDefiningOp<riscv::FieldOp>();
+      auto encodedLaneAccess = accessOf(laneValue);
+      const bool projectEncodedLane =
+          encodedLaneField && laneType && encodedLaneAccess &&
+          encodedLaneAccess.getMapping() != "dense" &&
+          mlir::isa<mlir::IntegerType>(laneType.getElementType()) &&
+          mlir::isa<mlir::IntegerType>(element);
+      riscv::ValueType projectedLaneSeed;
+      if (projectEncodedLane)
+        projectedLaneSeed = riscv::ValueType::get(
+            rewriter.getContext(), laneType.getElementType(),
+            resultType.getShape(), resultType.getAxisIds(), resultLayout);
+      auto laneLoadLayout = laneType
+                                ? riscv_internal::projectLayout(
+                                      rewriter,
+                                      projectEncodedLane ? projectedLaneSeed
+                                                         : laneType,
+                                      resultLayout, kernel.getTarget())
+                                : riscv::LayoutAttr();
       if (!laneLoadLayout || laneLoadLayout.getCarrier() != "rvv") {
         operation->emitError(
             "contract lane operand has no legal projected RVV representation");
         failed = true;
         rewriter.eraseOp(reductionLoop);
-        rewriter.eraseOp(accumulator);
-        rewriter.eraseOp(scalarZero);
+        if (zeroAccumulator)
+          rewriter.eraseOp(zeroAccumulator);
+        if (scalarZero)
+          rewriter.eraseOp(scalarZero);
         continue;
       }
       mlir::Value lhs = operation->getOperand(0);
       mlir::Value rhs = operation->getOperand(1);
-      if (implementation.getFamily() != "encoded-contract" &&
+      if (!projectEncodedLane &&
+          implementation.getFamily() != "encoded-contract" &&
           laneType.getLayout() != laneLoadLayout) {
         auto convertedType = mlir::cast<riscv::ValueType>(
             riscv_internal::withLayout(laneType, laneLoadLayout));
@@ -1262,6 +2071,7 @@ private:
                                              laneLoadLayout),
             riscv_internal::unselectedLeaf(rewriter));
         copyIdentity(operation, conversion);
+        conversion->moveBefore(reductionLoop);
         laneValue = conversion.getResult();
         if (laneOperand.getValue() == "rhs")
           rhs = laneValue;
@@ -1275,7 +2085,8 @@ private:
                                      currentLaneType.getElementType())
                                : mlir::IntegerType();
       auto resultInteger = mlir::dyn_cast<mlir::IntegerType>(element);
-      if (implementation.getFamily() != "encoded-contract" && sourceInteger &&
+      if (!projectEncodedLane &&
+          implementation.getFamily() != "encoded-contract" && sourceInteger &&
           resultInteger &&
           std::max<unsigned>(8, sourceInteger.getWidth()) <
               resultInteger.getWidth()) {
@@ -1293,8 +2104,10 @@ private:
               "integer contract lane operand has no legal widening representation");
           failed = true;
           rewriter.eraseOp(reductionLoop);
-          rewriter.eraseOp(accumulator);
-          rewriter.eraseOp(scalarZero);
+          if (zeroAccumulator)
+            rewriter.eraseOp(zeroAccumulator);
+          if (scalarZero)
+            rewriter.eraseOp(scalarZero);
           continue;
         }
         auto widenedType = riscv::ValueType::get(
@@ -1311,6 +2124,7 @@ private:
                 currentLaneType.getLayout().getRegisterGroups(),
                 widenedLayout.getRegisterGroups()));
         copyIdentity(operation, widen);
+        widen->moveBefore(reductionLoop);
         laneValue = widen.getResult();
         if (laneOperand.getValue() == "rhs")
           rhs = laneValue;
@@ -1325,8 +2139,10 @@ private:
             "encoded contraction operands have no typed storage mappings");
         failed = true;
         rewriter.eraseOp(reductionLoop);
-        rewriter.eraseOp(accumulator);
-        rewriter.eraseOp(scalarZero);
+        if (zeroAccumulator)
+          rewriter.eraseOp(zeroAccumulator);
+        if (scalarZero)
+          rewriter.eraseOp(scalarZero);
         continue;
       }
 
@@ -1340,12 +2156,15 @@ private:
           index = rewriter.create<mlir::arith::AddIOp>(operation->getLoc(), index,
                                                        delta);
         }
-        mlir::Value inBounds = rewriter.create<mlir::arith::CmpIOp>(
-            operation->getLoc(), mlir::arith::CmpIPredicate::ult, index,
-            reductionUpper);
-        auto guarded = rewriter.create<mlir::scf::IfOp>(
-            operation->getLoc(), mlir::TypeRange{resultType}, inBounds, true);
-        rewriter.setInsertionPointToStart(&guarded.getThenRegion().front());
+        mlir::scf::IfOp guarded;
+        if (offset && !exactReductionLevel) {
+          mlir::Value inBounds = rewriter.create<mlir::arith::CmpIOp>(
+              operation->getLoc(), mlir::arith::CmpIPredicate::ult, index,
+              reductionUpper);
+          guarded = rewriter.create<mlir::scf::IfOp>(
+              operation->getLoc(), mlir::TypeRange{resultType}, inBounds, true);
+          rewriter.setInsertionPointToStart(&guarded.getThenRegion().front());
+        }
 
         mlir::Value next;
         if (implementation.getFamily() == "encoded-contract") {
@@ -1364,6 +2183,42 @@ private:
         } else {
           mlir::Value stepLhs = lhs;
           mlir::Value stepRhs = rhs;
+          if (projectEncodedLane) {
+            llvm::SmallVector<mlir::Attribute> selectors;
+            for (int64_t axis : laneType.getAxisIds().asArrayRef())
+              selectors.push_back(rewriter.getStringAttr(
+                  axis == reductionAxis ? "index" : "all"));
+            auto projectedType = mlir::cast<riscv::ValueType>(
+                riscv_internal::withLayout(projectedLaneSeed, laneLoadLayout));
+            auto extract = rewriter.create<riscv::ExtractOp>(
+                operation->getLoc(), projectedType, laneValue,
+                mlir::ValueRange{index}, rewriter.getArrayAttr(selectors),
+                encodedLaneAccess,
+                riscv_internal::leaf(
+                    rewriter, "transfer", "extract", "rvv.extract.indexed",
+                    "rvv.extract.indexed", 0,
+                    projectedType.getLayout().getRegisterGroups()));
+            copyIdentity(operation, extract);
+            mlir::Value projected = extract.getResult();
+            unsigned sourceWidth =
+                std::max<unsigned>(8, sourceInteger.getWidth());
+            unsigned factor = resultInteger.getWidth() / sourceWidth;
+            std::string instruction =
+                std::string(sourceInteger.isSigned() ? "rvv.sext.vf"
+                                                     : "rvv.zext.vf") +
+                std::to_string(factor);
+            auto widened = rewriter.create<riscv::WidenOp>(
+                operation->getLoc(), resultType, projected,
+                riscv_internal::leaf(
+                    rewriter, "rvv", "widen", instruction, instruction,
+                    projectedType.getLayout().getRegisterGroups(),
+                    resultType.getLayout().getRegisterGroups()));
+            copyIdentity(operation, widened);
+            if (laneOperand.getValue() == "rhs")
+              stepRhs = widened.getResult();
+            else
+              stepLhs = widened.getResult();
+          }
           mlir::Value stepLane = laneOperand.getValue() == "rhs" ? stepRhs
                                                                   : stepLhs;
           auto stepLaneType =
@@ -1452,21 +2307,33 @@ private:
           copyIdentity(operation, contractStep);
           next = contractStep.getResult();
         }
-        rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), next);
-        rewriter.setInsertionPointToStart(&guarded.getElseRegion().front());
-        rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), carried);
-        rewriter.setInsertionPointAfter(guarded);
-        carried = guarded.getResult(0);
+        if (guarded) {
+          rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), next);
+          rewriter.setInsertionPointToStart(&guarded.getElseRegion().front());
+          rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), carried);
+          rewriter.setInsertionPointAfter(guarded);
+          carried = guarded.getResult(0);
+        } else {
+          carried = next;
+        }
       }
       if (contractFailed) {
         rewriter.eraseOp(reductionLoop);
-        rewriter.eraseOp(accumulator);
-        rewriter.eraseOp(scalarZero);
+        if (zeroAccumulator)
+          rewriter.eraseOp(zeroAccumulator);
+        if (scalarZero)
+          rewriter.eraseOp(scalarZero);
         continue;
       }
       rewriter.setInsertionPointToEnd(reductionLoop.getBody());
       rewriter.create<mlir::scf::YieldOp>(operation->getLoc(), carried);
-      operation->getResult(0).replaceAllUsesWith(reductionLoop.getResult(0));
+      if (fusedAccumulatorAdd) {
+        fusedAccumulatorAdd.getResult().replaceAllUsesWith(
+            reductionLoop.getResult(0));
+        rewriter.eraseOp(fusedAccumulatorAdd);
+      } else {
+        operation->getResult(0).replaceAllUsesWith(reductionLoop.getResult(0));
+      }
       rewriter.eraseOp(operation);
     }
   }

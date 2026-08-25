@@ -43,6 +43,10 @@ llvm::cl::list<std::string> metaBindings(
 llvm::cl::opt<int64_t> autoUnroll(
     "auto-unroll", llvm::cl::desc("Instantiated Level-local unroll binding"),
     llvm::cl::init(1));
+llvm::cl::opt<int64_t> autoLMULEighths(
+    "auto-lmul-eighths",
+    llvm::cl::desc("Instantiated maximum RVV LMUL binding in eighths"),
+    llvm::cl::init(8));
 llvm::cl::opt<int64_t> autoPipelineDepth(
     "auto-pipeline-depth",
     llvm::cl::desc("Instantiated Level-local pipeline-depth binding"),
@@ -125,13 +129,20 @@ int main(int argc, char **argv) {
       llvm::errs() << error << '\n';
       return 1;
     }
+    if (!options.target.supportsLMULEighths(autoLMULEighths)) {
+      llvm::errs() << "--auto-lmul-eighths is not legal for this target: "
+                   << autoLMULEighths << '\n';
+      return 1;
+    }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
     if (autoUnroll <= 0 || autoPipelineDepth <= 0 || autoPipelineDepth > 2) {
       llvm::errs()
-          << "--auto-unroll must be positive and --auto-pipeline-depth must be 1 or 2\n";
+          << "--auto-unroll must be positive and --auto-pipeline-depth must "
+             "be 1 or 2\n";
       return 1;
     }
+    options.lmulEighths = autoLMULEighths;
     options.unroll = autoUnroll;
     options.pipelineDepth = autoPipelineDepth;
     if (emitKind == "riscv-ir") {

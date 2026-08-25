@@ -7,8 +7,8 @@ from weft.std import gemm
 
 @weft.kernel
 def gemm_f32(
-    A: View[f32, (M, K)],
-    B: View[f32, (K, N)],
-    C: View[f32, (M, N)],
+    X: View[f32, (M, K)],
+    W: View[f32, (N, K)],
+    Y: View[f32, (M, N)],
 ):
-    gemm(A, B, C)
+    gemm(X, W, Y)

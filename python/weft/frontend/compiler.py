@@ -244,6 +244,7 @@ class FrontendCompiler:
         self._shape_ids: dict[str, int] = {}
         self._axis_ids: dict[str, int] = {}
         self._shape_symbols: dict[str, Value] = {}
+        self._shape_multiples: dict[str, int] = {}
         self._auto_symbols: dict[str, Value] = {}
         self._auto_choices: dict[str, tuple[int, ...]] = {}
         self._next_shape_id = -1
@@ -283,6 +284,18 @@ class FrontendCompiler:
                     self.source.location(parameter),
                 )
             argument_types.append(annotation)
+
+        shape_names = {shape_id: name for name, shape_id in self._shape_ids.items()}
+        for argument_type in argument_types:
+            if not isinstance(argument_type, ViewType) or not argument_type.shape:
+                continue
+            info = self._declared_encodings.get(argument_type.encoding.family)
+            shape_name = shape_names.get(argument_type.shape[-1])
+            if info is None or info.logical_extent is None or shape_name is None:
+                continue
+            self._shape_multiples[shape_name] = math.lcm(
+                self._shape_multiples.get(shape_name, 1), info.logical_extent
+            )
 
         body = self.builder.region(
             tuple(argument_types), tuple(parameter.arg for parameter in parameters)
@@ -1684,8 +1697,11 @@ class FrontendCompiler:
             raise FrontendError(
                 "narrow requires a numeric scalar or local Value", self._location(call)
             )
-        if rounding not in {"rne", "rtz", "rdn", "rup"}:
-            raise FrontendError("narrow rounding must be rne, rtz, rdn, or rup", self._location(call))
+        if rounding not in {"rne", "rtz", "rdn", "rup", "dynamic"}:
+            raise FrontendError(
+                "narrow rounding must be rne, rtz, rdn, rup, or dynamic",
+                self._location(call),
+            )
         if not isinstance(saturation, bool):
             raise FrontendError("narrow saturation must be a boolean", self._location(call))
         result_type = with_element(value.type, ScalarType(dtype))
@@ -2210,6 +2226,7 @@ class FrontendCompiler:
         keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
         parent = self.active_domain.type
         assert isinstance(parent, DomainType)
+        extent_symbol: str | None = None
         if arguments:
             source = arguments[0]
             if isinstance(source, ast.Name) and source.id in self.env and isinstance(
@@ -2223,6 +2240,7 @@ class FrontendCompiler:
                 axis_name = source.id.lower()
                 axis_id = self._axis_id(source.id)
                 extent_value = self._shape_symbols[source.id]
+                extent_symbol = source.id
             else:
                 raise FrontendError("Level domain is a shape symbol or parent point", self._location(source))
         else:
@@ -2256,6 +2274,12 @@ class FrontendCompiler:
         if isinstance(partition_spelling, int):
             extent_spelling = self._domain_partition_spelling.get(parent.domain_id)
             if isinstance(extent_spelling, int) and extent_spelling % partition_spelling == 0:
+                tail = "exact"
+            elif (
+                extent_symbol is not None
+                and extent_symbol in self._shape_multiples
+                and self._shape_multiples[extent_symbol] % partition_spelling == 0
+            ):
                 tail = "exact"
         domain = DomainType(
             f"{axis_name}.{serial}",

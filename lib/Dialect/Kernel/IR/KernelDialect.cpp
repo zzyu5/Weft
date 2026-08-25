@@ -1323,7 +1323,8 @@ mlir::LogicalResult NarrowOp::verify() {
     return emitOpError(
         "narrow converts numeric elements and preserves the logical domain");
   if (getRounding() != "rne" && getRounding() != "rtz" &&
-      getRounding() != "rdn" && getRounding() != "rup")
+      getRounding() != "rdn" && getRounding() != "rup" &&
+      getRounding() != "dynamic")
     return emitOpError("unknown numeric narrowing rounding mode");
   auto inputWidth = bitWidth(getInput().getType());
   auto resultWidth = bitWidth(getResult().getType());

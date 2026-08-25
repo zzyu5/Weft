@@ -15,6 +15,7 @@ namespace {
 
 mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
                                        weft::RISCVCompilerOptions options) {
+  const int64_t lmulEighths = options.lmulEighths;
   module.getContext()->getOrLoadDialect<mlir::arith::ArithDialect>();
   module.getContext()->getOrLoadDialect<mlir::scf::SCFDialect>();
   module.getContext()->getOrLoadDialect<weft::riscv::WEFTRISCVDialect>();
@@ -22,11 +23,14 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.enableVerifier(true);
   manager.addPass(weft::createConvertWeftToRISCVPass(std::move(options)));
   manager.addPass(weft::createSelectRISCVOperationsPass());
-  manager.addPass(weft::createPropagateRISCVLayoutsPass());
+  manager.addPass(weft::createPropagateRISCVLayoutsPass(lmulEighths));
+  manager.addPass(weft::createSelectRISCVOperationsPass());
   manager.addPass(weft::createPlanRISCVMemoryPass());
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createLowerRISCVCompositesPass());
   manager.addPass(weft::createPipelineRISCVLevelsPass());
+  manager.addPass(weft::createUnrollRISCVLevelsPass());
+  manager.addPass(weft::createShareRISCVLayeredWindowsPass());
   manager.addPass(weft::createFinalizeRISCVLeavesPass());
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
   manager.addPass(weft::createVerifyFinalRISCVPass());

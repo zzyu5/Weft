@@ -23,7 +23,7 @@
 #endif
 
 extern "C" void WEFT_Q8_ENTRY(const float *input, std::uint8_t *output,
-                              std::size_t rows, std::size_t columns);
+                              std::size_t columns);
 
 #if defined(WEFT_TARGET_K1)
 #define WEFT_TARGET_NAME "K1/X60"
@@ -91,15 +91,14 @@ void reference(const std::vector<float> &input,
       std::uint8_t *target =
           output.data() + (row * blocks + block) * kRecordBytes;
 #if WEFT_Q8_KIND == 2
-      float extreme = 0.0F;
-      float magnitude = 0.0F;
+      float maximum = -INFINITY;
+      float minimum = INFINITY;
       for (std::size_t element = 0; element < kBlock; ++element) {
-        const float candidate = std::fabs(source[element]);
-        if (candidate > magnitude) {
-          magnitude = candidate;
-          extreme = source[element];
-        }
+        maximum = std::max(maximum, source[element]);
+        minimum = std::min(minimum, source[element]);
       }
+      const float extreme =
+          std::fabs(maximum) > std::fabs(minimum) ? maximum : minimum;
       const float inverse = extreme == 0.0F ? 0.0F : -127.0F / extreme;
       const float scale = inverse == 0.0F ? 0.0F : 1.0F / inverse;
       std::memcpy(target, &scale, sizeof(scale));
@@ -141,6 +140,14 @@ void reference(const std::vector<float> &input,
   }
 }
 
+void run_weft(const std::vector<float> &input,
+              std::vector<std::uint8_t> &output) {
+  const std::size_t rowBytes = (kColumns / kBlock) * kRecordBytes;
+  for (std::size_t row = 0; row < kRows; ++row)
+    WEFT_Q8_ENTRY(input.data() + row * kColumns,
+                  output.data() + row * rowBytes, kColumns);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -162,7 +169,7 @@ int main(int argc, char **argv) {
   std::vector<std::uint8_t> expected(outputBytes, 0);
   std::vector<std::uint8_t> actual(outputBytes, 0);
   reference(input, expected);
-  WEFT_Q8_ENTRY(input.data(), actual.data(), kRows, kColumns);
+  run_weft(input, actual);
   if (actual != expected) {
     const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
     std::fprintf(stderr,
@@ -178,7 +185,7 @@ int main(int argc, char **argv) {
   for (std::size_t repetition = 0; repetition < repetitions; ++repetition) {
     evict_cache(flush);
     const auto begin = std::chrono::steady_clock::now();
-    WEFT_Q8_ENTRY(input.data(), actual.data(), kRows, kColumns);
+    run_weft(input, actual);
     const auto end = std::chrono::steady_clock::now();
     samples.push_back(
         std::chrono::duration<double, std::milli>(end - begin).count());

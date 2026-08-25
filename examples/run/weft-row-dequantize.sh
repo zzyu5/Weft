@@ -25,11 +25,21 @@ if [[ ${format_id} -lt 0 ]]; then
   exit 2
 fi
 physical_auto=()
+if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
+fi
 if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
   physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
 fi
 if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
   physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
+if [[ ${target} == sg2044 && ${format} == q4_k ]]; then
+  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+    physical_auto+=(--auto-lmul-eighths 32)
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 2)
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+    physical_auto+=(--auto-pipeline-depth 1)
 fi
 
 case "${target}" in

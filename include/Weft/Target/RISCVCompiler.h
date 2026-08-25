@@ -15,6 +15,7 @@ namespace weft {
 struct RISCVCompilerOptions {
   RISCVTargetProfile target;
   llvm::StringMap<int64_t> metaBindings;
+  int64_t lmulEighths = 8;
   int64_t unroll = 1;
   int64_t pipelineDepth = 1;
 };

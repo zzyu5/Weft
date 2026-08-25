@@ -140,9 +140,11 @@ def dequantize_q3_k(W: View[Q3_K, (K,)], Y: View[f32, (K,)]):
 def dequantize_q4_k(W: View[Q4_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            sub = j // 32
-            commit(k_superblock(w.q[j], w.sc[sub], w.d, w.m[sub], w.dmin), Y[kb][j])
+        with L.subs(kb, extent=32) as sub:
+            commit(
+                k_superblock(w.q[sub], w.sc[sub], w.d, w.m[sub], w.dmin),
+                Y[kb][sub],
+            )
 
 
 def dequantize_q5_k(W: View[Q5_K, (K,)], Y: View[f32, (K,)]):

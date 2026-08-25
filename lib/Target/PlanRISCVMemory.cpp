@@ -9,6 +9,7 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <memory>
+#include <numeric>
 
 using namespace weft;
 
@@ -33,6 +34,7 @@ struct FieldFacts {
   int64_t joinRole = 0;
   int64_t bitOffset = 0;
   int64_t storageBits = 0;
+  int64_t alignment = 1;
   llvm::StringRef order = "none";
 };
 
@@ -60,6 +62,9 @@ FieldFacts fieldFacts(riscv::FieldOp operation) {
   result.scalarPerRecord = fieldShape.empty();
   result.bitOffset = declaration.getFieldBitOffsets()[index];
   result.storageBits = declaration.getFieldStorageBits()[index];
+  if (result.bitOffset % 8 == 0)
+    result.alignment = std::gcd<int64_t>(declaration.getAlignment(),
+                                         result.bitOffset / 8);
   auto layouts = mlir::cast<mlir::ArrayAttr>(declaration.getFieldLayouts()[index]);
   llvm::StringRef kind = layoutKind(layouts);
   if (kind == "natural") {
@@ -167,8 +172,12 @@ public:
       }
       llvm::StringRef form = access.getForm();
       operation.setAccessAttr(access);
-      operation.setLeafAttr(
-          transferLeaf(builder, "store", ("rvv.store." + form).str()));
+      auto value =
+          mlir::dyn_cast<riscv::ValueType>(operation.getValue().getType());
+      const bool scalar = !value || value.getLayout().getCarrier() == "scalar";
+      operation.setLeafAttr(transferLeaf(
+          builder, "store",
+          scalar ? "scalar.store" : ("rvv.store." + form).str()));
     });
     getOperation().walk([&](riscv::FieldOp operation) {
       FieldFacts facts = fieldFacts(operation);
@@ -191,7 +200,7 @@ public:
         return;
       }
       operation.setAccessAttr(makeAccess(
-          builder, form, facts.mapping, 1, facts.group, facts.layer,
+          builder, form, facts.mapping, facts.alignment, facts.group, facts.layer,
           facts.joinFields, facts.joinLowBits, facts.joinRole, facts.bitOffset,
           facts.storageBits, facts.order));
       operation.setLeafAttr(transferLeaf(
@@ -311,20 +320,24 @@ public:
         return;
       auto result =
           mlir::dyn_cast<riscv::ValueType>(operation->getResult(0).getType());
-      if (!result) {
+      int64_t laneAxis = 0;
+      if (result) {
+        for (auto [axis, factor] :
+             llvm::zip(result.getAxisIds().asArrayRef(),
+                       result.getLayout().getLaneFactors().asArrayRef()))
+          if (factor > 1) {
+            laneAxis = axis;
+            break;
+          }
+      } else if (auto over = operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over");
+                 over && !over.empty()) {
+        laneAxis = over.asArrayRef().front();
+      } else {
         operation->emitError(
-            "contraction result has no physical value for lane-memory planning");
+            "scalar contraction has no reduction axis for lane-memory planning");
         failed = true;
         return;
       }
-      int64_t laneAxis = 0;
-      for (auto [axis, factor] :
-           llvm::zip(result.getAxisIds().asArrayRef(),
-                     result.getLayout().getLaneFactors().asArrayRef()))
-        if (factor > 1) {
-          laneAxis = axis;
-          break;
-        }
       auto hasAxis = [&](mlir::Value value, int64_t axis) {
         return axis && llvm::is_contained(
                            riscv_internal::logicalAxes(value.getType()), axis);

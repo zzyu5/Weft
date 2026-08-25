@@ -5,7 +5,7 @@ matrix_multiplication,mul_mat_f16,decode,SG2044,RVV F16 vec-dot,M=1;N=4096;K=409
 matrix_multiplication,mul_mat_f16,decode,K1/X60,RVV F16 vec-dot,M=1;N=4096;K=4096,9.785,3.429088,GOP/s
 matrix_multiplication,mul_mat_q1_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,14.379,2.333519,GOP/s
 matrix_multiplication,mul_mat_q1_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,9.078,3.696397,GOP/s
-matrix_multiplication,mul_mat_q4_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,13.661,2.456199,GOP/s
+matrix_multiplication,mul_mat_q4_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,4.525,7.415338,GOP/s
 matrix_multiplication,mul_mat_q4_0,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,2.941,11.409209,GOP/s
 matrix_multiplication,mul_mat_q4_1,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,13.336,2.516081,GOP/s
 matrix_multiplication,mul_mat_q4_1,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,3.519,9.535097,GOP/s
@@ -19,7 +19,7 @@ matrix_multiplication,mul_mat_q2_K,decode,SG2044,RVV quantized vec-dot,M=1;N=409
 matrix_multiplication,mul_mat_q2_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,13.958,2.403987,GOP/s
 matrix_multiplication,mul_mat_q3_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,4.665,7.192864,GOP/s
 matrix_multiplication,mul_mat_q3_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,14.014,2.394356,GOP/s
-matrix_multiplication,mul_mat_q4_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,3.760,8.923346,GOP/s
+matrix_multiplication,mul_mat_q4_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,3.425,9.797607,GOP/s
 matrix_multiplication,mul_mat_q4_K,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,3.436,9.766010,GOP/s
 matrix_multiplication,mul_mat_q5_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,25.712,1.305015,GOP/s
 matrix_multiplication,mul_mat_q5_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,27.260,1.230904,GOP/s
@@ -51,13 +51,13 @@ matrix_multiplication,mul_mat_mxfp4,decode,SG2044,RVV quantized vec-dot,M=1;N=40
 matrix_multiplication,mul_mat_mxfp4,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,13.191,2.543730,GOP/s
 matrix_multiplication,mul_mat_nvfp4,decode,SG2044,scalar vec-dot,M=1;N=4096;K=4096,88.900,0.377442,GOP/s
 matrix_multiplication,mul_mat_nvfp4,decode,K1/X60,scalar vec-dot,M=1;N=4096;K=4096,214.137,0.156696,GOP/s
-matrix_multiplication,mul_mat_f32,prefill,SG2044,RVV F32 vec-dot,M=128;N=4096;K=4096,574.193,7.480011,GOP/s
+matrix_multiplication,mul_mat_f32,prefill,SG2044,RVV F32 vec-dot,M=128;N=4096;K=4096,599.441,7.164959,GOP/s
 matrix_multiplication,mul_mat_f32,prefill,K1/X60,RVV F32 vec-dot,M=128;N=4096;K=4096,1606.776,2.673035,GOP/s
 matrix_multiplication,mul_mat_f16,prefill,SG2044,RVV F16 vec-dot,M=128;N=4096;K=4096,299.138,14.357800,GOP/s
 matrix_multiplication,mul_mat_f16,prefill,K1/X60,RVV F16 vec-dot,M=128;N=4096;K=4096,782.657,5.487675,GOP/s
 matrix_multiplication,mul_mat_q1_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1010.623,4.249822,GOP/s
 matrix_multiplication,mul_mat_q1_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1132.405,3.792784,GOP/s
-matrix_multiplication,mul_mat_q4_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1734.067,2.476818,GOP/s
+matrix_multiplication,mul_mat_q4_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,566.585,7.580451,GOP/s
 matrix_multiplication,mul_mat_q4_0,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,151.069,28.430585,GOP/s
 matrix_multiplication,mul_mat_q4_1,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1694.128,2.535208,GOP/s
 matrix_multiplication,mul_mat_q4_1,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,174.724,24.581428,GOP/s
@@ -71,7 +71,7 @@ matrix_multiplication,mul_mat_q2_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=
 matrix_multiplication,mul_mat_q2_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1781.885,2.410350,GOP/s
 matrix_multiplication,mul_mat_q3_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,594.975,7.218739,GOP/s
 matrix_multiplication,mul_mat_q3_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1753.587,2.449247,GOP/s
-matrix_multiplication,mul_mat_q4_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,444.056,9.672122,GOP/s
+matrix_multiplication,mul_mat_q4_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,442.818,9.699175,GOP/s
 matrix_multiplication,mul_mat_q4_K,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,174.758,24.576693,GOP/s
 matrix_multiplication,mul_mat_q5_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1589.374,2.702302,GOP/s
 matrix_multiplication,mul_mat_q5_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,3434.231,1.250635,GOP/s
@@ -113,13 +113,13 @@ vec_dot_microkernel,q5_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,18.
 vec_dot_microkernel,q5_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,64.756,1.813580,GOP/s
 vec_dot_microkernel,q5_1_q8_1,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,20.121,5.836734,GOP/s
 vec_dot_microkernel,q5_1_q8_1,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,68.025,1.726429,GOP/s
-vec_dot_microkernel,q8_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,212.232,0.553360,GOP/s
+vec_dot_microkernel,q8_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,177.175,0.662852,GOP/s
 vec_dot_microkernel,q8_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,55.091,2.131744,GOP/s
 vec_dot_microkernel,q2_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,12.617,9.307765,GOP/s
 vec_dot_microkernel,q2_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,48.013,2.445995,GOP/s
 vec_dot_microkernel,q3_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,15.894,7.388895,GOP/s
 vec_dot_microkernel,q3_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,48.107,2.441261,GOP/s
-vec_dot_microkernel,q4_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,13.009,9.027928,GOP/s
+vec_dot_microkernel,q4_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,11.816,9.938788,GOP/s
 vec_dot_microkernel,q4_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,45.462,2.583276,GOP/s
 vec_dot_microkernel,q5_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,90.167,1.302480,GOP/s
 vec_dot_microkernel,q5_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,94.593,1.241532,GOP/s
@@ -151,11 +151,11 @@ vec_dot_microkernel,mxfp4_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,17
 vec_dot_microkernel,mxfp4_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,45.392,2.587276,GOP/s
 vec_dot_microkernel,nvfp4_q8_0,decode,SG2044,scalar,M=1;N=14336;K=4096,310.850,0.377805,GOP/s
 vec_dot_microkernel,nvfp4_q8_0,decode,K1/X60,scalar,M=1;N=14336;K=4096,748.241,0.156956,GOP/s
-quantization,quantize_row_q8_0,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.292,557.450745,MElements/s
+quantization,quantize_row_q8_0,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.380,542.905469,MElements/s
 quantization,quantize_row_q8_0,prefill,K1/X60,RVV intrinsic,M=128;K=14336,5.560,330.016487,MElements/s
 quantization,quantize_row_q8_1,prefill,SG2044,RVV intrinsic,M=128;K=14336,4.503,407.500644,MElements/s
 quantization,quantize_row_q8_1,prefill,K1/X60,RVV intrinsic,M=128;K=14336,6.395,286.933900,MElements/s
-quantization,quantize_row_q8_K,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.975,461.631658,MElements/s
+quantization,quantize_row_q8_K,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.615,507.651815,MElements/s
 quantization,quantize_row_q8_K,prefill,K1/X60,RVV intrinsic,M=128;K=14336,5.112,358.931036,MElements/s
 dequantization,dequantize_row_q1_0,tensor,SG2044,scalar,N=1024;K=4096,9.309,450.552687,MElements/s
 dequantization,dequantize_row_q1_0,tensor,K1/X60,scalar,N=1024;K=4096,28.287,148.275975,MElements/s
@@ -177,7 +177,7 @@ dequantization,dequantize_row_q2_K,tensor,SG2044,scalar,N=1024;K=4096,19.897,210
 dequantization,dequantize_row_q2_K,tensor,K1/X60,scalar,N=1024;K=4096,31.204,134.413723,MElements/s
 dequantization,dequantize_row_q3_K,tensor,SG2044,scalar,N=1024;K=4096,15.998,262.184458,MElements/s
 dequantization,dequantize_row_q3_K,tensor,K1/X60,scalar,N=1024;K=4096,36.797,113.984709,MElements/s
-dequantization,dequantize_row_q4_K,tensor,SG2044,scalar,N=1024;K=4096,5.837,718.605602,MElements/s
+dequantization,dequantize_row_q4_K,tensor,SG2044,scalar,N=1024;K=4096,6.174,679.321803,MElements/s
 dequantization,dequantize_row_q4_K,tensor,K1/X60,scalar,N=1024;K=4096,25.133,166.886487,MElements/s
 dequantization,dequantize_row_q5_K,tensor,SG2044,scalar,N=1024;K=4096,9.509,441.094630,MElements/s
 dequantization,dequantize_row_q5_K,tensor,K1/X60,scalar,N=1024;K=4096,37.372,112.231314,MElements/s

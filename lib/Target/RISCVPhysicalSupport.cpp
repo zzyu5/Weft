@@ -237,9 +237,15 @@ riscv::AccessAttr riscv_internal::denseAccess(mlir::Builder &builder,
   if (mappedAxis) {
     auto axes = memory.getAxisIds().asArrayRef();
     auto found = llvm::find(axes, mappedAxis);
-    form = found == axes.end() ? "indexed"
-           : found + 1 == axes.end() ? "unit"
-                                     : "strided";
+    if (found == axes.end()) {
+      form = "indexed";
+    } else {
+      const size_t dimension = static_cast<size_t>(found - axes.begin());
+      form = dimension < memory.getStrides().size() &&
+                     memory.getStrides()[dimension] == 1
+                 ? "unit"
+                 : "strided";
+    }
   }
   return riscv::AccessAttr::get(
       builder.getContext(), form, "dense",
@@ -571,6 +577,11 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
     if (sourceInteger && targetInteger &&
         sourceInteger.getWidth() == targetInteger.getWidth())
       return "rvv.reinterpret";
+    if (sourceInteger && targetInteger && sourceInteger.isUnsigned() &&
+        sourceInteger.getWidth() < targetInteger.getWidth() &&
+        std::max<unsigned>(8, sourceInteger.getWidth()) ==
+            std::max<unsigned>(8, targetInteger.getWidth()))
+      return targetInteger.isSigned() ? "rvv.reinterpret" : "rvv.identity";
     if (source.isF16() && target.isF32())
       return "rvv.fwiden.f16-f32";
     if (source.isF32() && target.isF16())
@@ -592,8 +603,11 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
     }
     if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(operation);
         narrow && source.isF32() && targetInteger &&
-        targetInteger.getWidth() == 8 && narrow.getSaturate())
-      return ("rvv.f32-i8-saturate." + narrow.getRounding()).str();
+        targetInteger.getWidth() == 8)
+      return ("rvv.f32-i8-" +
+              llvm::StringRef(narrow.getSaturate() ? "saturate." : "nonsaturating.") +
+              narrow.getRounding())
+          .str();
     return {};
   }
   if (auto reduce = mlir::dyn_cast<riscv::ReduceOp>(operation)) {

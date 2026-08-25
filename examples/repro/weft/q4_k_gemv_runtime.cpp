@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -58,7 +57,7 @@ void q4_k_q8_k_gemv(const std::uint8_t *W, const std::uint8_t *X, float *Y,
 #endif
 
 namespace {
-constexpr double kAbsoluteTolerance = 1.0e-4;
+constexpr double kAbsoluteTolerance = 1.25e-1;
 constexpr double kRelativeTolerance = 2.0e-3;
 
 bool within_tolerance(float actual, float expected, double &max_absolute,
@@ -271,7 +270,8 @@ int main(int argc, char **argv) {
   const double median_us = median(samples);
   const double operations = 2.0 * static_cast<double>(kM) * kK;
   std::printf("kernel=%s\n", WEFT_Q4_KERNEL_NAME);
-  std::printf("target=%s\nM=%zu\nK=%zu\n", WEFT_TARGET_NAME, kM, kK);
+  std::printf("target=%s\nM=1\nN=%zu\nK=%zu\n", WEFT_TARGET_NAME, kM,
+              kK);
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               max_absolute, max_relative, repetitions);

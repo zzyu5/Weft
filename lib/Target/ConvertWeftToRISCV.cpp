@@ -604,8 +604,33 @@ private:
                                                  stagedYield.getValues().size()));
     state.addAttribute("handoff_count",
                        builder.getI64IntegerAttr(resultTypes.size()));
+    bool innermost = true;
+    for (mlir::Operation &nested : source.getBody().front())
+      nested.walk([&](kernel::LevelOp) { innermost = false; });
+    const int64_t levelAxis =
+        mlir::cast<kernel::DomainType>(source.getDomain().getType()).getAxisId();
+    bool shapedReductionConsumesLevelAxis = false;
+    source.getBody().walk([&](mlir::Operation *operation) {
+      auto consumes = [&](mlir::DenseI64ArrayAttr over, mlir::Type resultType) {
+        // A shaped contraction owns an explicit element-wise reduction loop in
+        // LowerRISCVComposites and consumes the selected unroll there.  A
+        // scalar dot instead closes one logical block with an RVV reduction;
+        // its surrounding Level remains the owner of iteration unrolling.
+        if (over && mlir::isa<kernel::ValueType>(resultType) &&
+            llvm::is_contained(over.asArrayRef(), levelAxis))
+          shapedReductionConsumesLevelAxis = true;
+      };
+      if (auto dot = mlir::dyn_cast<kernel::DotOp>(operation))
+        consumes(dot.getOverAttr(), dot.getResult().getType());
+      else if (auto contract = mlir::dyn_cast<kernel::ContractOp>(operation))
+        consumes(contract.getOverAttr(), contract.getResult().getType());
+      else if (auto outer = mlir::dyn_cast<kernel::OuterContractOp>(operation))
+        consumes(outer.getOverAttr(), outer.getResult().getType());
+    });
+    const int64_t levelUnroll =
+        innermost && !shapedReductionConsumesLevelAxis ? options.unroll : 1;
     state.addAttribute("schedule",
-                       riscv_internal::schedule(builder, 1, 1));
+                       riscv_internal::schedule(builder, levelUnroll, 1));
     state.addRegion();
     mlir::Operation *rawLoop = builder.create(state);
     rawLoop->setAttr("canonical_op", builder.getStringAttr("weft_kernel.level"));
@@ -795,6 +820,17 @@ private:
       addLeaf(attrs);
       targetName = riscv::StoreOp::getOperationName();
     } else if (mlir::isa<kernel::FieldOp>(source)) {
+      auto owner =
+          mlir::dyn_cast<riscv::MemDescType>(operands.front().getType());
+      auto result = mlir::dyn_cast<riscv::MemDescType>(results.front());
+      if (owner && result)
+        results.front() = riscv::MemDescType::get(
+            builder.getContext(), result.getEncoding(), result.getShape(),
+            result.getAxisIds(), result.getStrides(), result.getOrigins(),
+            result.getAlignment(), result.getAddressClass(), owner.getAccess(),
+            owner.getAliasSet(), result.getLayoutIdentity(),
+            result.getStorageBits(), result.getElements(),
+            result.getInterleaveRows());
       addAccess(attrs);
       addLeaf(attrs);
       targetName = riscv::FieldOp::getOperationName();

@@ -10,6 +10,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -167,6 +168,132 @@ bool isNumericPhysical(mlir::Type type) {
   mlir::Type element = elementOf(type);
   return element.isIndex() ||
          mlir::isa<mlir::IntegerType, mlir::FloatType>(element);
+}
+
+FieldOp sourceField(mlir::Value value) {
+  while (mlir::Operation *definition = value.getDefiningOp()) {
+    if (auto field = mlir::dyn_cast<FieldOp>(definition))
+      return field;
+    if (auto extract = mlir::dyn_cast<ExtractOp>(definition)) {
+      value = extract.getInput();
+      continue;
+    }
+    if (auto conversion = mlir::dyn_cast<ConvertLayoutOp>(definition)) {
+      value = conversion.getInput();
+      continue;
+    }
+    if (auto materialize = mlir::dyn_cast<RegisterMaterializeOp>(definition)) {
+      value = materialize.getInput();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+LoadOp sourceLoad(mlir::Value value) {
+  while (mlir::Operation *definition = value.getDefiningOp()) {
+    if (auto load = mlir::dyn_cast<LoadOp>(definition))
+      return load;
+    if (auto conversion = mlir::dyn_cast<ConvertLayoutOp>(definition)) {
+      value = conversion.getInput();
+      continue;
+    }
+    if (auto materialize = mlir::dyn_cast<RegisterMaterializeOp>(definition)) {
+      value = materialize.getInput();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+mlir::Value sourcePoint(mlir::Value value, int64_t axis) {
+  llvm::SmallVector<mlir::Value> worklist{value};
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (auto point = mlir::dyn_cast<PointType>(current.getType());
+        point && point.getDomain().getAxisId() == axis)
+      return current;
+    mlir::Operation *definition = current.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      continue;
+    llvm::append_range(worklist, definition->getOperands());
+  }
+  return {};
+}
+
+bool supportsLayout(TargetAttr target, LayoutAttr layout) {
+  return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
+         target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
+         llvm::is_contained(target.getSupportedSEW().asArrayRef(),
+                            layout.getSew()) &&
+         llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                            layout.getLmulEighths());
+}
+
+std::optional<int64_t> doubledPositive(int64_t value) {
+  if (value <= 0 || value > std::numeric_limits<int64_t>::max() / 2)
+    return std::nullopt;
+  return value * 2;
+}
+
+bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
+                                  mlir::Value rhs, int64_t reductionAxis,
+                                  AccessAttr lhsAccess, AccessAttr rhsAccess,
+                                  int64_t group, LayoutAttr partialLayout) {
+  auto lhsType = mlir::dyn_cast<ValueType>(lhs.getType());
+  auto rhsType = mlir::dyn_cast<ValueType>(rhs.getType());
+  auto lhsInteger = lhsType
+                        ? mlir::dyn_cast<mlir::IntegerType>(
+                              lhsType.getElementType())
+                        : mlir::IntegerType();
+  auto rhsInteger = rhsType
+                        ? mlir::dyn_cast<mlir::IntegerType>(
+                              rhsType.getElementType())
+                        : mlir::IntegerType();
+  FieldOp lhsField = sourceField(lhs);
+  FieldOp rhsField = sourceField(rhs);
+  LoadOp lhsLoad = lhsField ? sourceLoad(lhsField.getOwner()) : LoadOp();
+  LoadOp rhsLoad = rhsField ? sourceLoad(rhsField.getOwner()) : LoadOp();
+  auto lhsMemory = lhsLoad ? lhsLoad.getRegion().getType() : MemDescType();
+  mlir::Value lhsPoint = sourcePoint(lhs, reductionAxis);
+  mlir::Value rhsPoint = sourcePoint(rhs, reductionAxis);
+  auto kernel = operation->getParentOfType<KernelOp>();
+  if (!kernel || !lhsType || !rhsType || !lhsInteger || !rhsInteger ||
+      !lhsInteger.isUnsigned() || lhsInteger.getWidth() >= 8 ||
+      !rhsInteger.isSigned() || rhsInteger.getWidth() != 8 || !lhsField ||
+      !rhsField || !lhsLoad || !rhsLoad || !lhsPoint || !rhsPoint ||
+      lhsPoint != rhsPoint || lhsAccess.getMapping() != "grouped_layered" ||
+      rhsAccess.getMapping() != "natural" || group <= 0 ||
+      lhsAccess.getGroupSize() <= 0 || lhsAccess.getLayerSize() <= 0 ||
+      lhsAccess.getGroupSize() % lhsAccess.getLayerSize() ||
+      lhsAccess.getLayerSize() % group || lhsAccess.getBitOffset() % 8 ||
+      rhsAccess.getBitOffset() % 8 ||
+      (lhsAccess.getOrder() != "lo_first" &&
+       lhsAccess.getOrder() != "hi_first") ||
+      !supportsLayout(kernel.getTarget(), lhsType.getLayout()) ||
+      !supportsLayout(kernel.getTarget(), partialLayout) ||
+      !kernel.getTarget().getHasWideningInteger())
+    return false;
+  int64_t laneAxis = 0;
+  for (auto [axis, factor] :
+       llvm::zip(lhsType.getAxisIds().asArrayRef(),
+                 lhsType.getLayout().getLaneFactors().asArrayRef()))
+    if (axis != reductionAxis && factor > 1) {
+      laneAxis = axis;
+      break;
+    }
+  bool hasCohortStride = false;
+  if (lhsMemory && laneAxis > 0)
+    for (auto [axis, stride] :
+         llvm::zip(lhsMemory.getAxisIds().asArrayRef(),
+                   lhsMemory.getStrides().asArrayRef()))
+      if (axis == laneAxis && stride != 0)
+        hasCohortStride = true;
+  return lhsMemory && lhsMemory.getElements() > 0 &&
+         (lhsMemory.getInterleaveRows() > 0 || hasCohortStride);
 }
 
 mlir::LogicalResult verifyBroadcastDomain(mlir::Operation *operation,
@@ -1305,8 +1432,9 @@ mlir::LogicalResult LoadOp::verify() {
 }
 
 mlir::LogicalResult StoreOp::verify() {
-  if (!canWrite(getRegion().getType().getAccess()) ||
-      !isPhysicalValue(getValue().getType()) ||
+  if (!canWrite(getRegion().getType().getAccess()))
+    return emitOpError("physical store descriptor is not writable");
+  if (!isPhysicalValue(getValue().getType()) ||
       !sameLogicalDomain(getValue().getType(), getRegion().getType()))
     return emitOpError("physical store value and descriptor domains must match");
   return verifyLeafOperation(*this);
@@ -1535,9 +1663,9 @@ static mlir::LogicalResult verifyContractOp(mlir::Operation *operation) {
   auto rhs = mlir::dyn_cast<ValueType>(operation->getOperand(1).getType());
   auto result = mlir::dyn_cast<ValueType>(operation->getResult(0).getType());
   auto over = operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over");
-  if (!lhs || !rhs || !result || !over || over.empty())
+  if (!lhs || !rhs || !over || over.empty())
     return operation->emitOpError(
-        "physical contract requires shaped operands/result and reduction axes");
+        "physical contract requires shaped operands and reduction axes");
   llvm::DenseSet<int64_t> reduction;
   for (int64_t axis : over.asArrayRef())
     if (axis <= 0 || !reduction.insert(axis).second ||
@@ -1577,12 +1705,19 @@ static mlir::LogicalResult verifyContractOp(mlir::Operation *operation) {
       return operation->emitOpError(
           "physical contract reduction-axis extents disagree");
   }
-  if (!llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
-      !llvm::equal(expectedShape, result.getShape().asArrayRef()))
+  if (expectedAxes.empty()) {
+    if (result || !isNumericPhysical(operation->getResult(0).getType()))
+      return operation->emitOpError(
+          "physical scalar contract must eliminate every logical axis");
+  } else if (!result ||
+             !llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
+             !llvm::equal(expectedShape, result.getShape().asArrayRef())) {
     return operation->emitOpError(
         "physical contract result must preserve ordered free axes and extents");
+  }
   if (auto accumulator = operation->getAttrOfType<mlir::TypeAttr>("acc_type");
-      accumulator && accumulator.getValue() != result.getElementType())
+      accumulator && accumulator.getValue() !=
+                         elementOf(operation->getResult(0).getType()))
     return operation->emitOpError(
         "physical contract accumulator type must equal its result element type");
   auto laneOperand = operation->getAttrOfType<mlir::StringAttr>("lane_operand");
@@ -1998,30 +2133,95 @@ mlir::LogicalResult RegisterMaterializeOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
+  auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
+  auto resultParts = physicalPartCount(getResult().getType());
+  if (!lhs || lhs.getLayout().getCarrier() != "rvv")
+    return emitOpError("grouped MAC reduction lhs must use an RVV representation");
+  if (!resultParts || *resultParts != 1 ||
+      getResult().getType().getLayout().getCarrier() != "rvv")
+    return emitOpError("grouped MAC reduction result must be one RVV part");
+  if (getGroup() <= 0 || getUnroll() <= 0 || getReductionAxis() <= 0)
+    return emitOpError("grouped MAC reduction has invalid structural parameters");
+  if (getPartialLayout().getCarrier() != "rvv" ||
+      getPartialLayout().getSew() != 16)
+    return emitOpError("grouped MAC reduction requires a 16-bit RVV partial layout");
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return emitOpError(
+        "grouped MAC reduction must be nested in one target kernel");
+  auto target = kernel.getTarget();
+  if (!hasGroupedMacOperandGeometry(
+          getOperation(), getLhs(), getRhs(), getReductionAxis(),
+          getLhsAccess(), getRhsAccess(), getGroup(), getPartialLayout()) ||
+      !supportsLayout(target, getResult().getType().getLayout()))
+    return emitOpError(
+        "grouped MAC reduction has no complete typed field, cohort-storage, "
+        "RVV-layout, or shared reduction-point realization");
+  if (getLhsAccess().getForm() == "unassigned" ||
+      getRhsAccess().getForm() == "unassigned")
+    return emitOpError("grouped MAC reduction operands require selected access forms");
+  if (!exactLeaf(getLeaf(), "rvv", "grouped-mac-reduce",
+                 "rvv.grouped-mac-reduce.u8-s8", "none", "agnostic") &&
+      !exactLeaf(getLeaf(), "rvv", "grouped-mac-reduce",
+                 "rvv.grouped-mac-reduce.u8-s8", "none", "exact"))
+    return emitOpError("grouped MAC reduction leaf is not the selected RVV operation");
+  if (getLeaf().getParameters().asArrayRef() !=
+      llvm::ArrayRef<int64_t>({static_cast<int64_t>(getGroup()),
+                               static_cast<int64_t>(getUnroll()),
+                               static_cast<int64_t>(getReductionAxis())}))
+    return emitOpError("grouped MAC reduction leaf parameters disagree with its schedule");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
   auto window = getResult().getType();
   auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
-  auto lhsParts = lhs ? physicalPartCount(lhs) : std::nullopt;
-  if (!lhs || lhs.getLayout().getCarrier() != "rvv" || !lhsParts ||
-      *lhsParts != 1 ||
-      window.getFamily() != "grouped-mac" || getGroup() <= 0 ||
-      getUnroll() <= 0 || getReductionAxis() <= 0 ||
-      window.getReductionAxis() != getReductionAxis() ||
+  if (!lhs || lhs.getLayout().getCarrier() != "rvv")
+    return emitOpError("grouped MAC lhs must use an RVV representation");
+  if (window.getFamily() != "grouped-mac" || getGroup() <= 0 ||
+      getUnroll() <= 0 || getReductionAxis() <= 0)
+    return emitOpError("grouped MAC window has invalid structural parameters");
+  if (window.getReductionAxis() != getReductionAxis() ||
       window.getSlots() != getUnroll() ||
-      window.getTermsPerSlot() != getGroup() ||
-      window.getLhsType() != getLhs().getType() ||
+      window.getTermsPerSlot() != getGroup())
+    return emitOpError("grouped MAC window shape disagrees with its operation");
+  if (window.getLhsType() != getLhs().getType() ||
       window.getRhsType() != getRhs().getType() ||
-      window.getPartialLayout() != getPartialLayout() ||
-      getLhsAccess().getForm() == "unassigned" ||
-      getRhsAccess().getForm() == "unassigned" ||
-      !exactLeaf(getLeaf(), "rvv", "grouped-mac-load",
-                 "rvv.grouped-mac-load.u8-s8", "none", "agnostic") ||
+      window.getPartialLayout() != getPartialLayout())
+    return emitOpError("grouped MAC window type disagrees with its operands");
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return emitOpError("grouped MAC load must be nested in one target kernel");
+  auto target = kernel.getTarget();
+  auto termsPerWindow = checkedPositiveProduct(
+      {static_cast<int64_t>(getGroup()), static_cast<int64_t>(getUnroll())});
+  if ((getWindowForm() != "compact" && getWindowForm() != "fragmented") ||
+      !termsPerWindow ||
+      (getWindowForm() == "compact" &&
+       getLhsAccess().getLayerSize() % *termsPerWindow != 0))
+    return emitOpError(
+        "grouped MAC load has no closed compact/fragmented window form");
+  if (!hasGroupedMacOperandGeometry(
+          getOperation(), getLhs(), getRhs(), getReductionAxis(),
+          getLhsAccess(), getRhsAccess(), getGroup(), getPartialLayout()) ||
+      !supportsLayout(target, window.getResultLayout()))
+    return emitOpError(
+        "grouped MAC load has no complete typed field, cohort-storage, "
+        "RVV-layout, or shared reduction-point realization");
+  if (getLhsAccess().getForm() == "unassigned" ||
+      getRhsAccess().getForm() == "unassigned")
+    return emitOpError("grouped MAC operands require selected access forms");
+  if ((!exactLeaf(getLeaf(), "rvv", "grouped-mac-load",
+                  "rvv.grouped-mac-load.u8-s8", "none", "agnostic") &&
+       !exactLeaf(getLeaf(), "rvv", "grouped-mac-load",
+                  "rvv.grouped-mac-load.u8-s8", "none", "exact")) ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>(
               {static_cast<int64_t>(getGroup()),
                static_cast<int64_t>(getUnroll()),
                static_cast<int64_t>(getReductionAxis())}))
-    return emitOpError("grouped MAC load window contract is incomplete");
+    return emitOpError("grouped MAC load leaf disagrees with its window");
   return mlir::success();
 }
 
@@ -2032,8 +2232,10 @@ mlir::LogicalResult RVVGroupedMacStepOp::verify() {
       window.getResultType() != getResult().getType() ||
       window.getResultLayout() != getResult().getType().getLayout() ||
       window.getResultLayout().getCarrier() != "rvv" ||
-      !exactLeaf(getLeaf(), "rvv", "grouped-mac-step",
-                 "rvv.vwmaccsu.vx.grouped", "none", "agnostic") ||
+      (!exactLeaf(getLeaf(), "rvv", "grouped-mac-step",
+                  "rvv.vwmaccsu.vx.grouped", "none", "agnostic") &&
+       !exactLeaf(getLeaf(), "rvv", "grouped-mac-step",
+                  "rvv.vwmaccsu.vx.grouped", "none", "exact")) ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>({window.getTermsPerSlot(), window.getSlots(),
                                    window.getReductionAxis()}))
@@ -2079,6 +2281,356 @@ mlir::LogicalResult RVVEncodedDotStepOp::verify() {
           llvm::ArrayRef<int64_t>({window.getReductionAxis(), window.getSlots(),
                                    window.getTermsPerSlot()}))
     return emitOpError("encoded dot compute step contract is incomplete");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVWidenDotOp::verify() {
+  ValueType lhs = getLhs().getType();
+  ValueType rhs = getRhs().getType();
+  auto lhsElement = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+  auto rhsElement = mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType());
+  auto shapedResult = mlir::dyn_cast<ValueType>(getResult().getType());
+  auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
+      shapedResult ? shapedResult.getElementType() : getResult().getType());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return emitOpError("RVV widening dot must be nested in one target kernel");
+  auto target = kernel.getTarget();
+  auto partialLMULValue = doubledPositive(lhs.getLayout().getLmulEighths());
+  const int64_t partialLMUL = partialLMULValue.value_or(-1);
+  llvm::SmallVector<int64_t> freeAxes;
+  for (int64_t axis : lhs.getAxisIds().asArrayRef())
+    if (!llvm::is_contained(getOver(), axis))
+      freeAxes.push_back(axis);
+  for (int64_t axis : rhs.getAxisIds().asArrayRef())
+    if (!llvm::is_contained(getOver(), axis) &&
+        !llvm::is_contained(freeAxes, axis))
+      freeAxes.push_back(axis);
+  const bool legalResult =
+      (!shapedResult && isScalar(getResult().getType()) && freeAxes.empty()) ||
+      (shapedResult && shapedResult.getLayout().getCarrier() == "scalar" &&
+       shapedResult.getAxisIds().asArrayRef() ==
+           llvm::ArrayRef<int64_t>(freeAxes));
+  auto factorFor = [](LayoutAttr layout, mlir::DenseI64ArrayAttr factors,
+                      int64_t axis) {
+    auto found = llvm::find(layout.getAxisIds().asArrayRef(), axis);
+    if (found == layout.getAxisIds().asArrayRef().end())
+      return int64_t{0};
+    return factors[static_cast<size_t>(
+        found - layout.getAxisIds().asArrayRef().begin())];
+  };
+  const int64_t reductionAxis = getOver().empty() ? 0 : getOver()[0];
+  const bool compatibleReductionMapping =
+      reductionAxis && lhs.getLayout().getCarrier() == "rvv" &&
+      rhs.getLayout().getCarrier() == "rvv" &&
+      lhs.getLayout().getSew() == rhs.getLayout().getSew() &&
+      lhs.getLayout().getLmulEighths() ==
+          rhs.getLayout().getLmulEighths() &&
+      lhs.getLayout().getVl() == rhs.getLayout().getVl() &&
+      factorFor(lhs.getLayout(), lhs.getLayout().getLaneFactors(),
+                reductionAxis) ==
+          factorFor(rhs.getLayout(), rhs.getLayout().getLaneFactors(),
+                    reductionAxis) &&
+      factorFor(lhs.getLayout(), lhs.getLayout().getTimeFactors(),
+                reductionAxis) ==
+          factorFor(rhs.getLayout(), rhs.getLayout().getTimeFactors(),
+                    reductionAxis);
+  if ((getStreamReduction() != "fused" &&
+       getStreamReduction() != "per_stream") ||
+      !lhsElement || !rhsElement || !resultElement ||
+      lhsElement.getWidth() > 16 || rhsElement.getWidth() > 16 ||
+      std::max<unsigned>(8, lhsElement.getWidth()) !=
+          std::max<unsigned>(8, rhsElement.getWidth()) ||
+      (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+      resultElement.getWidth() != 32 || !legalResult ||
+      getOver().size() != 1 ||
+      !llvm::is_contained(lhs.getAxisIds().asArrayRef(), getOver()[0]) ||
+      !llvm::is_contained(rhs.getAxisIds().asArrayRef(), getOver()[0]) ||
+      !compatibleReductionMapping ||
+      !target.getHasWideningInteger() ||
+      !supportsLayout(target, lhs.getLayout()) ||
+      !supportsLayout(target, rhs.getLayout()) ||
+      !partialLMULValue ||
+      !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), partialLMUL) ||
+      !exactLeaf(getLeaf(), "rvv", "widen-dot",
+                 "rvv.vwmul-vwredsum", "none", "exact"))
+    return emitOpError()
+           << "RVV widening dot requires matching <=16-bit integer vectors with "
+              "at least one signed operand, an explicit fused/per-stream "
+              "reduction policy, one shared "
+              "reduction axis, a signed-i32 scalar result, and a legal doubled "
+              "LMUL; lhs="
+           << lhs << ", rhs=" << rhs << ", result=" << getResult().getType()
+           << ", over=" << getOver() << ", partial_lmul=" << partialLMUL
+           << ", leaf=" << getLeaf();
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVWidenReduceOp::verify() {
+  auto input = getInput().getType();
+  auto inputElement =
+      mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
+  auto resultElement =
+      mlir::dyn_cast<mlir::IntegerType>(getResult().getType());
+  auto parts = physicalPartCount(input);
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return emitOpError(
+        "RVV widening reduction must be nested in one target kernel");
+  auto target = kernel.getTarget();
+  if (!inputElement || inputElement.isSignless() || !resultElement ||
+      resultElement.isSignless() || getKind() != "add" ||
+      resultElement.getWidth() != inputElement.getWidth() * 2 ||
+      inputElement.getWidth() < 8 || inputElement.getWidth() > 16 ||
+      !isScalar(getResult().getType()) || getAxis() < 0 ||
+      static_cast<size_t>(getAxis()) >= input.getShape().size() ||
+      input.getLayout().getCarrier() != "rvv" ||
+      checkedPositiveProduct(input.getLayout().getTimeFactors().asArrayRef()) !=
+          std::optional<int64_t>(1) || !parts || *parts != 1 ||
+      !target.getHasRVV() || !target.getHasWideningInteger() ||
+      !llvm::is_contained(target.getSupportedSEW().asArrayRef(),
+                          input.getLayout().getSew()) ||
+      !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                          input.getLayout().getLmulEighths()) ||
+      !exactLeaf(getLeaf(), "rvv", "widen-reduce", "rvv.vwredsum", "none",
+                 "exact"))
+    return emitOpError(
+        "RVV widening reduction requires one signedness-qualified integer "
+        "vector, an add reduction axis, and a double-width scalar result");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartitionedWidenReduceStoreOp::verify() {
+  auto input = getInput().getType();
+  auto inputElement =
+      mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
+  auto destination = getDestination().getType();
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(destination.getEncoding());
+  auto destinationField = getDestination().getDefiningOp<FieldOp>();
+  auto parts = physicalPartCount(input);
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel)
+    return emitOpError(
+        "partitioned widening reduction store must be nested in one target kernel");
+  auto target = kernel.getTarget();
+  std::string destinationFamily;
+  if (inputElement)
+    destinationFamily =
+        std::string(inputElement.isUnsigned() ? "u" : "i") +
+        std::to_string(inputElement.getWidth() * 2);
+  auto axis = llvm::find(destination.getAxisIds().asArrayRef(),
+                         getDestinationAxis());
+  if (!inputElement || !inputElement.isSigned() || inputElement.getWidth() != 8 ||
+      input.getShape().size() != 1 || getPartition() != 16 || getCount() <= 1 ||
+      input.getShape()[0] != getPartition() * getCount() ||
+      input.getLayout().getCarrier() != "rvv" ||
+      input.getLayout().getValidity() != "full" || !parts ||
+      getCount() % *parts || !encoding || !destinationField ||
+      destinationField.getAccess().getMapping() != "natural" ||
+      destinationField.getAccess().getBitOffset() % 8 ||
+      encoding.getKind() != "dense" ||
+      encoding.getFamily() != destinationFamily ||
+      axis == destination.getAxisIds().asArrayRef().end() ||
+      getAccess().getForm() != "unit" || getAccess().getMapping() != "dense" ||
+      !target.getHasRVV() || !target.getHasWideningInteger() ||
+      !llvm::is_contained(target.getSupportedSEW().asArrayRef(),
+                          input.getLayout().getSew()) ||
+      !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                          input.getLayout().getLmulEighths()) ||
+      !exactLeaf(getLeaf(), "rvv", "partitioned-widen-reduce-store",
+                 "rvv.partitioned-vwredsum-store", "none", "exact"))
+    return emitOpError()
+           << "partitioned widening reduction store requires one full signed-i8 "
+              "RVV axis split into 16-element partitions, an aligned natural "
+              "i16 field, and a closed unit destination edge on a "
+              "widening-capable target; input="
+           << input << ", physical_parts=" << (parts ? *parts : -1)
+           << ", partition=" << getPartition() << ", count=" << getCount()
+           << ", destination=" << destination << ", field_access="
+           << (destinationField ? destinationField.getAccess() : AccessAttr())
+           << ", store_access=" << getAccess() << ", target=" << target;
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVLayeredWindowOp::verify() {
+  auto field = getField().getType();
+  auto first = getFirst().getType();
+  auto second = getSecond().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  const int64_t group = getAccess().getGroupSize();
+  const int64_t layer = getAccess().getLayerSize();
+  const int64_t axis = getPoint().getType().getDomain().getAxisId();
+  auto physicalPoint = getPoint().getDefiningOp<PhysicalPointOp>();
+  auto partition = physicalPoint
+                       ? physicalPoint.getPartition().getDefiningOp<
+                             mlir::arith::ConstantIndexOp>()
+                       : mlir::arith::ConstantIndexOp();
+  if (!element || element.isSigned() || field.getShape().size() != 1 ||
+      first != second || first.getElementType() != field.getElementType() ||
+      first.getShape().size() != 1 || first.getShape()[0] != layer ||
+      first.getAxisIds().size() != 1 || first.getAxisIds()[0] != axis ||
+      first.getLayout().getCarrier() != "rvv" ||
+      first.getLayout().getValidity() != "full" ||
+      getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "grouped_layered" || group <= 0 ||
+      layer <= 0 || group != layer * 2 || element.getWidth() * 2 > 8 ||
+      (getAccess().getOrder() != "lo_first" &&
+       getAccess().getOrder() != "hi_first") ||
+      !partition || partition.value() != layer ||
+      !exactLeaf(getLeaf(), "rvv", "layered-window", "rvv.layered-window",
+                 "none", "exact"))
+    return emitOpError(
+        "RVV layered window requires two equal full-vector layer results, one "
+        "two-layer packed field, and an exact layer-sized point");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVStreamReduceOp::verify() {
+  auto source = mlir::dyn_cast<MemDescType>(getSource().getType());
+  auto encoding = source
+                      ? mlir::dyn_cast<kernel::EncodingType>(source.getEncoding())
+                      : kernel::EncodingType();
+  auto layout = getInputLayout();
+  auto streams = checkedPositiveProduct(
+      layout.getTimeFactors().asArrayRef());
+  if (!source || !encoding || encoding.getKind() != "dense" ||
+      encoding.getFamily() != "f32" || layout.getSew() != 32 || !streams ||
+      *streams <= 1 || layout.getCarrier() != "rvv" ||
+      layout.getValidity() != "full" || layout.getAxisIds().size() != 1 ||
+      layout.getReplicaFactors()[0] != 1 || layout.getLaneFactors()[0] <= 1 ||
+      layout.getLaneFactors()[0] != layout.getVl() || getAxis() != 0 ||
+      getKinds().size() != getNumResults() || getNumResults() == 0 ||
+      (getAccess().getForm() != "unit" && getAccess().getForm() != "strided") ||
+      getAccess().getMapping() != "dense" ||
+      !exactLeaf(getLeaf(), "rvv", "stream-reduce",
+                 "rvv.stream-reduce", "none", "exact"))
+    return emitOpError(
+        "RVV stream reduction requires a full multi-stream f32 value, one "
+        "valid axis, matching scalar results, and a selected memory edge");
+  for (auto [kind, result] : llvm::zip(getKinds(), getResults())) {
+    auto name = mlir::dyn_cast<mlir::StringAttr>(kind);
+    if (!name || (name.getValue() != "add" && name.getValue() != "max" &&
+                  name.getValue() != "min") ||
+        !result.getType().isF32())
+      return emitOpError(
+          "RVV stream reduction kinds and scalar result types disagree");
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVStreamDotOp::verify() {
+  auto lhs = getLhs().getType();
+  auto rhs = getRhs().getType();
+  auto lhsEncoding =
+      mlir::dyn_cast<kernel::EncodingType>(lhs.getEncoding());
+  auto rhsEncoding =
+      mlir::dyn_cast<kernel::EncodingType>(rhs.getEncoding());
+  auto layout = getInputLayout();
+  const bool lhsMemory = getLhsAccess().getForm() == "unit" ||
+                         getLhsAccess().getForm() == "strided";
+  const bool rhsMemory = getRhsAccess().getForm() == "unit" ||
+                         getRhsAccess().getForm() == "strided";
+  if (!lhsEncoding || !rhsEncoding || lhsEncoding.getKind() != "dense" ||
+      rhsEncoding.getKind() != "dense" || lhsEncoding.getFamily() != "f32" ||
+      rhsEncoding.getFamily() != "f32" || lhs.getShape() != rhs.getShape() ||
+      lhs.getAxisIds() != rhs.getAxisIds() || layout.getSew() != 32 ||
+      layout.getCarrier() != "rvv" ||
+      (layout.getValidity() != "full" && layout.getValidity() != "tail") ||
+      layout.getAxisIds().size() != 1 ||
+      layout.getReplicaFactors()[0] != 1 || layout.getLaneFactors()[0] <= 1 ||
+      layout.getLaneFactors()[0] != layout.getVl() || getAxis() != 0 ||
+      !lhsMemory || !rhsMemory || getLhsAccess().getMapping() != "dense" ||
+      getRhsAccess().getMapping() != "dense" || !getResult().getType().isF32() ||
+      !exactLeaf(getLeaf(), "rvv", "stream-dot", "rvv.stream-dot", "none",
+                 "exact"))
+    return emitOpError(
+        "RVV stream dot requires matching dense f32 slices, one full "
+        "multi-stream RVV reduction axis, two selected memory edges, and a "
+        "scalar f32 result");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVStreamContractOp::verify() {
+  auto lhs = getLhs().getType();
+  auto rhs = getRhs().getType();
+  auto result = getResult().getType();
+  auto lhsEncoding =
+      mlir::dyn_cast<kernel::EncodingType>(lhs.getEncoding());
+  auto rhsEncoding =
+      mlir::dyn_cast<kernel::EncodingType>(rhs.getEncoding());
+  auto accumulator = getAccumulatorLayout();
+  const bool lhsMemory = getLhsAccess().getForm() == "unit" ||
+                         getLhsAccess().getForm() == "strided";
+  const bool rhsMemory = getRhsAccess().getForm() == "unit" ||
+                         getRhsAccess().getForm() == "strided";
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  auto appendFreeAxes = [&](MemDescType operand) -> mlir::LogicalResult {
+    bool foundReduction = false;
+    for (auto [shape, axis] : llvm::zip(operand.getShape().asArrayRef(),
+                                        operand.getAxisIds().asArrayRef())) {
+      if (axis == getReductionAxis()) {
+        foundReduction = true;
+        continue;
+      }
+      auto found = llvm::find(expectedAxes, axis);
+      if (found == expectedAxes.end()) {
+        expectedAxes.push_back(axis);
+        expectedShape.push_back(shape);
+      } else if (expectedShape[found - expectedAxes.begin()] != shape) {
+        return emitOpError(
+            "stream contract operands disagree on a free-axis shape");
+      }
+    }
+    return mlir::success(foundReduction);
+  };
+  if (mlir::failed(appendFreeAxes(lhs)) || mlir::failed(appendFreeAxes(rhs)))
+    return mlir::failure();
+  llvm::SmallVector<int64_t> expectedAccumulatorAxes(expectedAxes.begin(),
+                                                     expectedAxes.end());
+  expectedAccumulatorAxes.push_back(getReductionAxis());
+  auto resultLanes = checkedPositiveProduct(
+      result.getLayout().getLaneFactors().asArrayRef());
+  if (!lhsEncoding || !rhsEncoding || lhsEncoding.getKind() != "dense" ||
+      rhsEncoding.getKind() != "dense" || lhsEncoding.getFamily() != "f32" ||
+      rhsEncoding.getFamily() != "f32" || getReductionAxis() <= 0 ||
+      result.getElementType() != mlir::Float32Type::get(getContext()) ||
+      result.getAxisIds().asArrayRef() != llvm::ArrayRef(expectedAxes) ||
+      result.getShape().asArrayRef() != llvm::ArrayRef(expectedShape) ||
+      result.getLayout().getCarrier() != "scalar" ||
+      !resultLanes || *resultLanes != 1 ||
+      accumulator.getCarrier() != "rvv" || accumulator.getSew() != 32 ||
+      accumulator.getAxisIds().asArrayRef() !=
+          llvm::ArrayRef(expectedAccumulatorAxes) ||
+      accumulator.getLaneFactors().asArrayRef().back() != accumulator.getVl() ||
+      accumulator.getVl() <= 1 || accumulator.getLmulEighths() <= 0 ||
+      getStationaryOperand() != "lhs" && getStationaryOperand() != "rhs" ||
+      getUnroll() <= 0 ||
+      !lhsMemory || !rhsMemory || getLhsAccess().getMapping() != "dense" ||
+      getRhsAccess().getMapping() != "dense" ||
+      !exactLeaf(getLeaf(), "rvv", "stream-contract",
+                 "rvv.stream-contract", "none", "exact"))
+    return emitOpError(
+        "RVV stream contract requires two dense f32 slices, one shared "
+        "reduction lane, scalar free-axis replicas, selected memory edges, "
+        "and a closed local schedule");
+  for (size_t index = 0; index < expectedAxes.size(); ++index) {
+    if (accumulator.getTimeFactors()[index] != 1 ||
+        accumulator.getLaneFactors()[index] != 1 ||
+        accumulator.getReplicaFactors()[index] !=
+            result.getLayout().getReplicaFactors()[index] ||
+        accumulator.getFragmentFactors()[index] != 1 ||
+        accumulator.getLocalFactors()[index] != 1)
+      return emitOpError(
+          "stream contract accumulator does not preserve its free-axis replicas");
+  }
+  const size_t reductionPosition = expectedAxes.size();
+  if (accumulator.getTimeFactors()[reductionPosition] != 1 ||
+      accumulator.getReplicaFactors()[reductionPosition] != 1 ||
+      accumulator.getFragmentFactors()[reductionPosition] != 1 ||
+      accumulator.getLocalFactors()[reductionPosition] != 1)
+    return emitOpError(
+        "stream contract reduction axis has a non-lane physical factor");
   return mlir::success();
 }
 
@@ -2249,7 +2801,7 @@ mlir::LogicalResult RVVEncodedContractStepOp::verify() {
       getRhsAccess().getForm() == "unassigned" ||
       getLhsAccess().getMapping() == "opaque" ||
       getRhsAccess().getMapping() == "opaque" ||
-      !laneType || laneType.getLayout() != getLaneLoadLayout() ||
+      !laneType || laneType.getAxisIds() != getLaneLoadLayout().getAxisIds() ||
       getLaneLoadLayout().getCarrier() != "rvv" ||
       getLaneLoadLayout().getSew() != 8 ||
       !exactLeaf(getLeaf(), "rvv", "encoded-contract-step",
@@ -2257,9 +2809,49 @@ mlir::LogicalResult RVVEncodedContractStepOp::verify() {
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>(
               {static_cast<int64_t>(getReductionAxis())}))
-    return emitOpError(
-        "encoded contract step requires mixed narrow integers, typed accesses, "
-        "an i32 RVV accumulator, and one closed decode-MAC leaf");
+    return emitOpError()
+           << "encoded contract step requires mixed narrow integers, typed "
+              "accesses, an i32 RVV accumulator, and one closed decode-MAC "
+              "leaf; lhs="
+           << getLhs().getType() << ", rhs=" << getRhs().getType()
+           << ", accumulator=" << getAccumulator().getType()
+           << ", result=" << getResult().getType()
+           << ", lane_operand=" << getLaneOperand()
+           << ", lane_load_layout=" << getLaneLoadLayout()
+           << ", lhs_access=" << getLhsAccess()
+           << ", rhs_access=" << getRhsAccess() << ", leaf=" << getLeaf()
+           << ", mixed=" << mixedNarrow
+           << ", same_accumulator="
+           << (getAccumulator().getType() == getResult().getType())
+           << ", result_has_reduction_axis="
+           << llvm::is_contained(
+                  getResult().getType().getAxisIds().asArrayRef(),
+                  getReductionAxis())
+           << ", lane_name_valid="
+           << (getLaneOperand() == "lhs" || getLaneOperand() == "rhs")
+           << ", accesses_valid="
+           << (getLhsAccess().getForm() != "unassigned" &&
+               getRhsAccess().getForm() != "unassigned" &&
+               getLhsAccess().getMapping() != "opaque" &&
+               getRhsAccess().getMapping() != "opaque")
+           << ", axes_match="
+           << llvm::equal(expectedAxes,
+                          getResult().getType().getAxisIds().asArrayRef())
+           << ", shape_match="
+           << llvm::equal(expectedShape,
+                          getResult().getType().getShape().asArrayRef())
+           << ", lane_axes_match="
+           << (laneType &&
+               laneType.getAxisIds() == getLaneLoadLayout().getAxisIds())
+           << ", lane_carrier=" << getLaneLoadLayout().getCarrier()
+           << ", lane_sew=" << getLaneLoadLayout().getSew()
+           << ", leaf_match="
+           << exactLeaf(getLeaf(), "rvv", "encoded-contract-step",
+                        "rvv.vmacc.decoded-u8-s8", "none", "agnostic")
+           << ", parameters_match="
+           << (getLeaf().getParameters().asArrayRef() ==
+               llvm::ArrayRef<int64_t>(
+                   {static_cast<int64_t>(getReductionAxis())}));
   auto accumulatorElement = getResult().getType().getElementType();
   auto accumulatorInteger =
       mlir::dyn_cast<mlir::IntegerType>(accumulatorElement);

@@ -80,7 +80,8 @@ if [[ ${format} == f32 ]]; then
   dsl=examples/kernels/dense/gemm.py
   kernel=gemm_f32
   runtime=examples/repro/weft/gemm_runtime.cpp
-  meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+  meta=(--meta NC=16 --meta MC=64 --meta NR=2 --meta MR=2)
+  physical=(--auto-lmul-eighths=16)
 else
   dsl=examples/kernels/quantization/mul_mat.py
   if [[ ${format} == f16 ]]; then
@@ -88,15 +89,8 @@ else
     meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
   elif [[ ${format} == q4_k_persistent ]]; then
     runtime_kernel_define=-DWEFT_Q4_DERIVED=1
-    if [[ ${phase} == decode ]]; then
-      kernel=production_mul_mat_q4_k_persistent_decode
-      runtime_kernel_define="${runtime_kernel_define} -DWEFT_Q4_DERIVED_DECODE=1"
-      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
-    else
-      kernel=production_mul_mat_q4_k_persistent
-      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
-      physical=(--auto-unroll=4 --auto-pipeline-depth=2)
-    fi
+    kernel=production_mul_mat_q4_k_persistent
+    physical=(--auto-lmul-eighths=32 --auto-unroll=2 --auto-pipeline-depth=1)
   elif [[ ${format} == q4_k_staged ]]; then
     runtime_kernel_define=-DWEFT_Q4_STAGED=1
     kernel=production_mul_mat_q4_k_staged
@@ -108,9 +102,14 @@ else
     meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
   elif [[ ${format} == q4_0 ]]; then
-    kernel=production_mul_mat_q4_0
-    meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2 --meta NR=8)
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_q4_0_decode
+      runtime_kernel_define=-DWEFT_Q40_DECODE=1
+    else
+      kernel=production_mul_mat_q4_0
+      meta=(--meta MC=16 --meta MR=2)
+    fi
   else
     kernel=production_mul_mat_${format}
   fi
@@ -129,6 +128,9 @@ if [[ -n ${WEFT_AUTO_UNROLL:-} || -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
     physical+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] &&
     physical+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
+if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  physical+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
 fi
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
