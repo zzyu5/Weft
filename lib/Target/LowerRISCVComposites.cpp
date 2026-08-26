@@ -2037,6 +2037,23 @@ private:
           encodedLaneAccess.getMapping() != "dense" &&
           mlir::isa<mlir::IntegerType>(laneType.getElementType()) &&
           mlir::isa<mlir::IntegerType>(element);
+      bool splitResultLane = false;
+      for (auto [lane, time] :
+           llvm::zip(resultLayout.getLaneFactors().asArrayRef(),
+                     resultLayout.getTimeFactors().asArrayRef()))
+        splitResultLane |= lane > 1 && time > 1;
+      if (mlir::isa<riscv::OuterContractOp>(operation) && splitResultLane &&
+          !projectEncodedLane && !encodedLaneAccess) {
+        operation->emitError(
+            "computed outer-contract lane operand has no proven multi-strip handoff");
+        failed = true;
+        rewriter.eraseOp(reductionLoop);
+        if (zeroAccumulator)
+          rewriter.eraseOp(zeroAccumulator);
+        if (scalarZero)
+          rewriter.eraseOp(scalarZero);
+        continue;
+      }
       riscv::ValueType projectedLaneSeed;
       if (projectEncodedLane)
         projectedLaneSeed =
@@ -2462,6 +2479,8 @@ private:
         instruction = "rvv.tuple-convert";
       else if (kind == "register_to_lane")
         instruction = "rvv.register-to-lane";
+      else if (kind == "time_to_lane")
+        instruction = "rvv.time-to-lane";
       else if (kind == "lane_to_register")
         instruction = "rvv.lane-to-register";
       else if (kind == "reshape")

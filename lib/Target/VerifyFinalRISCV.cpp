@@ -291,6 +291,21 @@ public:
             "structural implementation anchor survived terminal leaf lowering");
         failed = true;
       }
+      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
+          conversion &&
+          conversion.getConversion().getKind() == "time_to_lane") {
+        mlir::Operation *definition = conversion.getInput().getDefiningOp();
+        bool rematerializable =
+            mlir::isa_and_nonnull<riscv::FieldOp, riscv::SliceOp>(definition);
+        if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition))
+          rematerializable =
+              static_cast<bool>(riscv_internal::sourceField(extract.getInput()));
+        if (!rematerializable) {
+          conversion.emitError(
+              "final time-to-lane conversion was not rematerialized to an encoded field edge");
+          failed = true;
+        }
+      }
       if (auto access = operation->getAttrOfType<riscv::AccessAttr>("access"))
         if (access.getForm() == "unassigned") {
           operation->emitError("final memory edge has no selected form");

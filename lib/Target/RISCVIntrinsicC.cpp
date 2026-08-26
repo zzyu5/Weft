@@ -6205,6 +6205,93 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     return mlir::success();
   }
   if (kind == "register_to_lane" &&
+      input.kind == Binding::Kind::ScalarTuple) {
+    auto sourceLayout = layoutOf(conversion.getInput());
+    auto resultLayout = layoutOf(conversion.getResult());
+    const int64_t laneAxis = laneAxisFor(conversion.getResult());
+    const int64_t lanes = physicalLanes(conversion.getResult());
+    const int64_t streams = streamPartCount(conversion.getResult());
+    const int64_t resultRegisters =
+        registerPartCount(conversion.getResult());
+    auto sourceAxes = registerAxesFor(conversion.getInput());
+    auto sourceExtents = registerExtentsFor(conversion.getInput());
+    auto resultAxes = registerAxesFor(conversion.getResult());
+    if (!sourceLayout || !resultLayout || laneAxis <= 0 || lanes <= 1 ||
+        streams <= 0 || resultRegisters <= 0 ||
+        streamPartCount(conversion.getInput()) != 1 ||
+        sourceAxes.size() != sourceExtents.size() ||
+        !llvm::is_contained(sourceAxes, laneAxis))
+      return fail(conversion,
+                  "register-to-lane conversion has incomplete typed factors");
+
+    mlir::Type element =
+        riscv_internal::logicalElement(conversion.getResult().getType());
+    auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
+    const bool floating = mlir::isa<mlir::FloatType>(element);
+    if (!floating && !integer)
+      return fail(conversion,
+                  "register-to-lane conversion has no scalar element type");
+    const std::string suffix = vectorSuffix(conversion.getResult());
+    const std::string vectorCType = vectorType(conversion.getResult());
+    const std::string broadcast =
+        floating ? "__riscv_vfmv_v_f_" : "__riscv_vmv_v_x_";
+    const std::string slide =
+        floating ? "__riscv_vfslide1up_vf_" : "__riscv_vslide1up_vx_";
+
+    Binding packed;
+    packed.kind = Binding::Kind::Vector;
+    for (int64_t resultRegister = 0; resultRegister < resultRegisters;
+         ++resultRegister) {
+      auto resultCoordinates =
+          registerCoordinates(conversion.getResult(), resultRegister);
+      if (!resultCoordinates || resultCoordinates->size() != resultAxes.size())
+        return fail(conversion,
+                    "register-to-lane result has no register coordinates");
+      for (int64_t stream = 0; stream < streams; ++stream) {
+        llvm::SmallVector<size_t, 16> sourceParts;
+        for (int64_t lane = 0; lane < lanes; ++lane) {
+          const int64_t laneCoordinate = stream * lanes + lane;
+          int64_t sourcePart = 0;
+          for (auto [axis, extent] : llvm::zip(sourceAxes, sourceExtents)) {
+            int64_t coordinate = laneCoordinate;
+            if (axis != laneAxis) {
+              auto found = llvm::find(resultAxes, axis);
+              if (found == resultAxes.end())
+                return fail(
+                    conversion,
+                    "register-to-lane source axis is absent from result registers");
+              coordinate = (*resultCoordinates)[static_cast<size_t>(
+                  found - resultAxes.begin())];
+            }
+            if (extent <= 0 || coordinate < 0 || coordinate >= extent)
+              return fail(conversion,
+                          "register-to-lane coordinate exceeds source tuple");
+            sourcePart = sourcePart * extent + coordinate;
+          }
+          if (sourcePart < 0 ||
+              sourcePart >= static_cast<int64_t>(input.parts.size()))
+            return fail(conversion,
+                        "register-to-lane source part is outside its tuple");
+          sourceParts.push_back(static_cast<size_t>(sourcePart));
+        }
+        const int64_t resultPart = resultRegister * streams + stream;
+        const std::string vl = partVL(conversion.getResult(), resultPart);
+        std::string expression = broadcast + suffix + "(" +
+                                 input.parts[sourceParts.back()] + ", " + vl +
+                                 ")";
+        for (int64_t lane = lanes - 2; lane >= 0; --lane)
+          expression = slide + suffix + "(" + expression + ", " +
+                       input.parts[sourceParts[static_cast<size_t>(lane)]] +
+                       ", " + vl + ")";
+        std::string name = fresh("layout_pack");
+        line(vectorCType + " " + name + " = " + expression + ";");
+        packed.parts.push_back(std::move(name));
+      }
+    }
+    bindings[conversion.getResult()] = std::move(packed);
+    return mlir::success();
+  }
+  if ((kind == "register_to_lane" || kind == "time_to_lane") &&
       (input.kind == Binding::Kind::Slice || input.kind == Binding::Kind::Field)) {
     mlir::FailureOr<Binding> materialized =
         materializeNumeric(conversion.getResult(), std::move(input));

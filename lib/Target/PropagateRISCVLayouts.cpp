@@ -29,6 +29,7 @@ struct Roles {
   bool local = false;
   bool anchored = false;
   bool fullLaneExtent = false;
+  bool registerTuple = false;
   llvm::SmallVector<int64_t, 4> fragmentParameters;
 };
 
@@ -109,6 +110,8 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
         roles.laneAxis = axis;
         break;
       }
+    if (!roles.laneAxis)
+      roles.registerTuple = true;
     addSmallReplicas(value, roles, roles.laneAxis);
     return;
   }
@@ -273,8 +276,15 @@ bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
     destination.fragmentParameters = source.fragmentParameters;
     changed = true;
   }
+  if (source.registerTuple && !destination.registerTuple &&
+      !(destination.anchored && destination.laneAxis)) {
+    destination.registerTuple = true;
+    destination.laneAxis = 0;
+    addSmallReplicas(target, destination);
+    changed = true;
+  }
   if (source.laneAxis && llvm::is_contained(axes, source.laneAxis) &&
-      destination.laneAxis == 0) {
+      destination.laneAxis == 0 && !destination.registerTuple) {
     destination.laneAxis = source.laneAxis;
     destination.replicaAxes.erase(source.laneAxis);
     changed = true;
@@ -824,9 +834,12 @@ public:
           8, riscv_internal::logicalBitWidth(value.getType()));
       int64_t capacity = std::max<int64_t>(
           1, kernel.getTarget().getVlenBits() * lmulEighths / (8 * sew));
-      if (!kernel.getTarget().getHasIndexedMemory())
-        if (auto storageLimit = encodedLaneLimit(value, axis))
-          capacity = std::min(capacity, *storageLimit);
+      // Indexed memory makes a storage relation executable; it does not erase
+      // the number of logical elements represented by one encoded layer.
+      // Preserve that per-use storage width on every target, then express any
+      // wider VLEN as additional issue-time strips.
+      if (auto storageLimit = encodedLaneLimit(value, axis))
+        capacity = std::min(capacity, *storageLimit);
       int64_t extent = riscv_internal::physicalExtent(value, axis);
       connectedLaneSpans[value] =
           extent > 0 ? std::min(extent, capacity) : capacity;

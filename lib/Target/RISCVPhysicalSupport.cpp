@@ -294,7 +294,30 @@ riscv_internal::layoutConversion(mlir::Builder &builder,
                             : "tuple";
   } else if (source.getCarrier() == "scalar" &&
              target.getCarrier() == "rvv") {
-    kind = "splat";
+    bool registerToLane = false;
+    bool timeToLane = false;
+    auto sourceAxes = source.getAxisIds().asArrayRef();
+    auto targetAxes = target.getAxisIds().asArrayRef();
+    for (auto [index, axis] : llvm::enumerate(sourceAxes)) {
+      auto found = llvm::find(targetAxes, axis);
+      if (found == targetAxes.end())
+        continue;
+      size_t targetIndex = static_cast<size_t>(found - targetAxes.begin());
+      if (target.getLaneFactors()[targetIndex] <= 1)
+        continue;
+      registerToLane |= source.getReplicaFactors()[index] >
+                        target.getReplicaFactors()[targetIndex];
+      timeToLane |= source.getTimeFactors()[index] >
+                    target.getTimeFactors()[targetIndex];
+    }
+    // Moving both issue-time and register factors into one lane axis needs a
+    // distinct typed conversion.  Keep it illegal instead of assigning either
+    // existing kind and relying on the emitter to reinterpret the layout.
+    kind = registerToLane && timeToLane
+               ? "reshape"
+           : registerToLane ? "register_to_lane"
+           : timeToLane     ? "time_to_lane"
+                            : "splat";
   } else if (source.getCarrier() == "rvv" &&
              target.getCarrier() == "scalar") {
     kind = "extract";

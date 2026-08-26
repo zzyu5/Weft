@@ -796,7 +796,8 @@ mlir::LogicalResult ConversionAttr::verify(
     llvm::StringRef kind, llvm::StringRef effect, int64_t temporaryGroups) {
   if (kind != "splat" && kind != "extract" && kind != "reshape" &&
       kind != "tuple" && kind != "register_to_lane" &&
-      kind != "lane_to_register" && kind != "rvv_to_fragment" &&
+      kind != "time_to_lane" && kind != "lane_to_register" &&
+      kind != "rvv_to_fragment" &&
       kind != "fragment_to_rvv" && kind != "local_load" &&
       kind != "local_store")
     return emitError() << "unknown physical conversion kind";
@@ -1881,7 +1882,8 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
   llvm::StringRef target = result.getLayout().getCarrier();
   llvm::StringRef kind = getConversion().getKind();
   llvm::StringRef effect = getConversion().getEffect();
-  if ((source == "scalar" && target == "rvv" && kind != "splat") ||
+  if ((source == "scalar" && target == "rvv" && kind != "splat" &&
+       kind != "register_to_lane" && kind != "time_to_lane") ||
       (source == "rvv" && target == "scalar" && kind != "extract") ||
       (source == "local" && target != "local" && kind != "local_load") ||
       (source != "local" && target == "local" && kind != "local_store") ||
@@ -1893,6 +1895,101 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
       kind == "rvv_to_fragment" || kind == "fragment_to_rvv")
     return emitOpError() << "convert_layout kind '" << kind
                          << "' does not match " << source << " -> " << target;
+  if (source == "scalar" && target == "rvv" &&
+      kind == "register_to_lane") {
+    auto sourceLayout = input.getLayout();
+    auto targetLayout = result.getLayout();
+    auto sourceTime = sourceLayout.getTimeFactors().asArrayRef();
+    auto sourceLane = sourceLayout.getLaneFactors().asArrayRef();
+    auto sourceReplica = sourceLayout.getReplicaFactors().asArrayRef();
+    auto sourceFragment = sourceLayout.getFragmentFactors().asArrayRef();
+    auto sourceLocal = sourceLayout.getLocalFactors().asArrayRef();
+    auto targetTime = targetLayout.getTimeFactors().asArrayRef();
+    auto targetLane = targetLayout.getLaneFactors().asArrayRef();
+    auto targetReplica = targetLayout.getReplicaFactors().asArrayRef();
+    auto targetFragment = targetLayout.getFragmentFactors().asArrayRef();
+    auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
+    std::optional<size_t> laneDimension;
+    for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
+      if (targetLane[dimension] > 1) {
+        if (laneDimension)
+          return emitOpError(
+              "scalar register-to-lane conversion requires exactly one lane axis");
+        laneDimension = dimension;
+      }
+      if (sourceTime[dimension] != 1 || sourceLane[dimension] != 1 ||
+          sourceFragment[dimension] != 1 || sourceLocal[dimension] != 1 ||
+          targetFragment[dimension] != 1 || targetLocal[dimension] != 1)
+        return emitOpError(
+            "scalar register-to-lane conversion only moves register replicas into RVV lanes");
+    }
+    if (!laneDimension)
+      return emitOpError(
+          "scalar register-to-lane conversion requires one non-unit target lane axis");
+    for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
+      if (dimension == *laneDimension) {
+        auto represented = checkedPositiveProduct(
+            {targetTime[dimension], targetLane[dimension]});
+        if (!represented || sourceReplica[dimension] != *represented ||
+            targetReplica[dimension] != 1)
+          return emitOpError(
+              "scalar register-to-lane conversion must preserve the complete moved axis");
+        continue;
+      }
+      if (targetTime[dimension] != 1 || targetLane[dimension] != 1 ||
+          sourceReplica[dimension] != targetReplica[dimension])
+        return emitOpError(
+            "scalar register-to-lane conversion cannot remap another logical axis");
+    }
+  }
+  if (source == "scalar" && target == "rvv" && kind == "time_to_lane") {
+    auto sourceLayout = input.getLayout();
+    auto targetLayout = result.getLayout();
+    auto sourceTime = sourceLayout.getTimeFactors().asArrayRef();
+    auto sourceLane = sourceLayout.getLaneFactors().asArrayRef();
+    auto sourceReplica = sourceLayout.getReplicaFactors().asArrayRef();
+    auto sourceFragment = sourceLayout.getFragmentFactors().asArrayRef();
+    auto sourceLocal = sourceLayout.getLocalFactors().asArrayRef();
+    auto targetTime = targetLayout.getTimeFactors().asArrayRef();
+    auto targetLane = targetLayout.getLaneFactors().asArrayRef();
+    auto targetReplica = targetLayout.getReplicaFactors().asArrayRef();
+    auto targetFragment = targetLayout.getFragmentFactors().asArrayRef();
+    auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
+    std::optional<size_t> laneDimension;
+    for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
+      if (targetLane[dimension] > 1) {
+        if (laneDimension)
+          return emitOpError(
+              "scalar time-to-lane conversion requires exactly one lane axis");
+        laneDimension = dimension;
+      }
+      if (sourceLane[dimension] != 1 ||
+          sourceFragment[dimension] != 1 || sourceLocal[dimension] != 1 ||
+          targetFragment[dimension] != 1 || targetLocal[dimension] != 1)
+        return emitOpError(
+            "scalar time-to-lane conversion only moves issue-time parts into RVV lanes");
+    }
+    if (!laneDimension)
+      return emitOpError(
+          "scalar time-to-lane conversion requires one non-unit target lane axis");
+    for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
+      if (dimension == *laneDimension) {
+        auto represented = checkedPositiveProduct(
+            {targetTime[dimension], targetLane[dimension]});
+        if (!represented || sourceTime[dimension] != *represented ||
+            sourceReplica[dimension] != targetReplica[dimension] ||
+            sourceTime[dimension] <= targetTime[dimension])
+          return emitOpError(
+              "scalar time-to-lane conversion must preserve the complete moved axis");
+        continue;
+      }
+      if (targetLane[dimension] != 1 ||
+          sourceTime[dimension] != targetTime[dimension] ||
+          sourceReplica[dimension] != targetReplica[dimension])
+        return emitOpError(
+            "scalar time-to-lane conversion cannot remap another logical axis");
+    }
+  }
   if (auto access = (*this)->getAttrOfType<AccessAttr>("source_access")) {
     if (effect != "pure" && effect != "read")
       return emitOpError(
@@ -1910,6 +2007,7 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
         : kind == "local_store"  ? "rvv.local-store"
         : kind == "tuple"        ? "rvv.tuple-convert"
         : kind == "register_to_lane" ? "rvv.register-to-lane"
+        : kind == "time_to_lane" ? "rvv.time-to-lane"
         : kind == "lane_to_register" ? "rvv.lane-to-register"
                                       : "rvv.layout-reshape";
     if (getLeaf().getEngine() != "rvv" ||

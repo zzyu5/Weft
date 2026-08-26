@@ -306,6 +306,28 @@ private:
       auto resultFloat = mlir::dyn_cast<mlir::FloatType>(
           riscv_internal::logicalElement(result));
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
+      auto wideningDotFitsRegisterMicrotile = [&]() {
+        if (!mlir::isa<riscv::OuterContractOp>(operation))
+          return true;
+        auto value = mlir::dyn_cast<riscv::ValueType>(result);
+        if (!value)
+          return false;
+        int64_t replicas = 1;
+        for (int64_t axis : value.getAxisIds().asArrayRef()) {
+          int64_t extent = riscv_internal::physicalExtent(
+              operation->getResult(0), axis);
+          if (extent <= 0 ||
+              replicas > target.getVectorRegisters() / extent)
+            return false;
+          replicas *= extent;
+        }
+        // An 8/16-bit widening product needs at least two register groups per
+        // accumulator at LMUL=m1, plus one group for each operand.  This is the
+        // minimum resource proof available before layout propagation; the
+        // exact selected LMUL is checked again by LowerRISCVComposites.
+        return replicas > 0 &&
+               replicas * 2 + 2 <= target.getVectorRegisters();
+      };
       // The widening-dot family follows from the typed numerical relation and
       // target capability.  It must be selected before layout propagation so
       // its reduction axis can anchor the operand layouts.  The concrete
@@ -317,7 +339,8 @@ private:
               std::max<unsigned>(8, rhsInteger.getWidth()) &&
           (lhsInteger.isSigned() || rhsInteger.isSigned()) &&
           resultInteger.isSigned() && resultInteger.getWidth() == 32 &&
-          over.size() == 1 && target.getHasWideningInteger())
+          over.size() == 1 && target.getHasWideningInteger() &&
+          wideningDotFitsRegisterMicrotile())
         return rvvImplementation(builder, "widen-dot",
                                  "rvv.vwmul-vwredsum", over);
       if (lhsInteger && rhsInteger && lhsInteger.getWidth() <= 8 &&
@@ -345,7 +368,7 @@ private:
                             true, true, op.getOver());
     if (auto op = mlir::dyn_cast<riscv::OuterContractOp>(operation))
       return selectContract(op.getLhs(), op.getRhs(), op.getResult().getType(),
-                            true, false, op.getOver());
+                            true, true, op.getOver());
     return {};
   }
 };
