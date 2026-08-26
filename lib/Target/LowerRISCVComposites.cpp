@@ -1557,10 +1557,16 @@ private:
         failed = true;
         continue;
       }
-      if (mlir::isa<riscv::ContractOp>(operation) && resultType &&
+      const bool wideningFloatStream =
+          implementation.getFamily() == "widen-float-contract" &&
+          implementation.getOperation() == "rvv.vfwmacc";
+      const bool ordinaryFloatStream =
+          implementation.getFamily() == "contract" &&
+          implementation.getOperation() == "rvv.vfmacc";
+      if (mlir::isa<riscv::ContractOp, riscv::OuterContractOp>(operation) &&
+          (ordinaryFloatStream || wideningFloatStream) && resultType &&
           resultType.getLayout().getCarrier() == "scalar" &&
-          implementation.getEngine() == "rvv" &&
-          implementation.getOperation() == "rvv.vfmacc" && over.size() == 1) {
+          implementation.getEngine() == "rvv" && over.size() == 1) {
         auto lhsType =
             mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
         auto rhsType =
@@ -1585,10 +1591,16 @@ private:
                                (rhsAccess.getForm() == "unit" ||
                                 rhsAccess.getForm() == "strided") &&
                                rhsAccess.getMapping() == "dense";
+        const bool ordinaryTypes = lhsType && rhsType &&
+                                   lhsType.getElementType().isF32() &&
+                                   rhsType.getElementType().isF32();
+        const bool wideningTypes = lhsType && rhsType &&
+                                   lhsType.getElementType().isF16() &&
+                                   rhsType.getElementType().isF16();
         if (!lhsType || !rhsType || !lhsLoad || !rhsLoad || !lhsMemory ||
-            !rhsMemory || lhsType.getElementType() != resultType.getElementType() ||
-            rhsType.getElementType() != resultType.getElementType() ||
-            !resultType.getElementType().isF32() ||
+            !rhsMemory || !resultType.getElementType().isF32() ||
+            (ordinaryFloatStream && !ordinaryTypes) ||
+            (wideningFloatStream && !wideningTypes) ||
             lhsType.getLayout().getCarrier() != "rvv" ||
             rhsType.getLayout().getCarrier() != "rvv" ||
             lhsType.getLayout().getLmulEighths() !=
@@ -1599,13 +1611,22 @@ private:
             schedule.getUnroll() <= 0 || schedule.getPipelineDepth() != 1 ||
             schedule.getBufferCount() != 1) {
           operation->emitError(
-              "f32 stream contract has no closed reduction-lane memory realization");
+              "floating stream contract has no closed reduction-lane memory realization");
           failed = true;
           continue;
         }
-        mlir::Value extent = fullAxisExtent(operation, reductionAxis);
+        mlir::Value point =
+            findOperandPoint(operation->getOperand(0), reductionAxis);
+        if (!point)
+          point = findOperandPoint(operation->getOperand(1), reductionAxis);
+        auto physicalPoint =
+            point ? point.getDefiningOp<riscv::PhysicalPointOp>()
+                  : riscv::PhysicalPointOp();
+        mlir::Value extent = physicalPoint
+                                 ? physicalPoint.getActive()
+                                 : fullAxisExtent(operation, reductionAxis);
         if (!extent) {
-          operation->emitError("f32 stream contract has no reduction extent");
+          operation->emitError("floating stream contract has no reduction extent");
           failed = true;
           continue;
         }
@@ -1623,8 +1644,18 @@ private:
         llvm::SmallVector<int64_t> one(axes.size(), 1);
         lane.back() = lhsType.getLayout().getVl();
         const int64_t replicas = product(resultType.getLayout().getReplicaFactors());
-        const int64_t groupsPerVector =
-            (lhsType.getLayout().getLmulEighths() + 7) / 8;
+        const int64_t operandLMUL = lhsType.getLayout().getLmulEighths();
+        const int64_t accumulatorLMUL =
+            wideningFloatStream ? operandLMUL * 2 : operandLMUL;
+        auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
+        if (!llvm::is_contained(
+                target.getLegalLMULEighths().asArrayRef(), accumulatorLMUL)) {
+          operation->emitError(
+              "floating stream contract accumulator LMUL exceeds the target");
+          failed = true;
+          continue;
+        }
+        const int64_t groupsPerVector = (accumulatorLMUL + 7) / 8;
         const int64_t accumulatorGroups =
             product({groupsPerVector, replicas});
         auto accumulatorLayout = riscv::LayoutAttr::get(
@@ -1633,31 +1664,53 @@ private:
             riscv_internal::integers(rewriter, lane),
             riscv_internal::integers(rewriter, replica),
             riscv_internal::integers(rewriter, one),
-            riscv_internal::integers(rewriter, one), 32,
-            lhsType.getLayout().getLmulEighths(), lhsType.getLayout().getVl(),
+            riscv_internal::integers(rewriter, one), 32, accumulatorLMUL,
+            lhsType.getLayout().getVl(),
             accumulatorGroups, lhsType.getLayout().getValidity());
+        auto operandLayout = riscv::LayoutAttr::get(
+            rewriter.getContext(), "rvv",
+            riscv_internal::integers(rewriter, {reductionAxis}),
+            riscv_internal::integers(rewriter, {1}),
+            riscv_internal::integers(rewriter,
+                                     {lhsType.getLayout().getVl()}),
+            riscv_internal::integers(rewriter, {1}),
+            riscv_internal::integers(rewriter, {1}),
+            riscv_internal::integers(rewriter, {1}),
+            riscv_internal::logicalBitWidth(lhsType.getElementType()),
+            operandLMUL, lhsType.getLayout().getVl(),
+            (operandLMUL + 7) / 8, lhsType.getLayout().getValidity());
         const int64_t lhsReplicas =
             product(lhsType.getLayout().getReplicaFactors());
         const int64_t rhsReplicas =
             product(rhsType.getLayout().getReplicaFactors());
-        const int64_t stationaryReplicas = rhsReplicas;
+        const bool stationaryRhs = rhsReplicas <= lhsReplicas;
+        const int64_t stationaryReplicas =
+            stationaryRhs ? rhsReplicas : lhsReplicas;
+        const int64_t operandGroups = (operandLMUL + 7) / 8;
         const int64_t temporaryGroups =
             sum(accumulatorGroups,
-                product({groupsPerVector, stationaryReplicas + 1}));
-        if (!accumulatorLayout || replicas <= 0 || groupsPerVector <= 0 ||
+                product({operandGroups, stationaryReplicas + 1}));
+        if (!operandLayout || !accumulatorLayout || replicas <= 0 ||
+            groupsPerVector <= 0 ||
             lhsReplicas <= 0 || rhsReplicas <= 0 || temporaryGroups <= 0) {
           operation->emitError(
-              "f32 stream contract has invalid replica or resource geometry");
+              "floating stream contract has invalid replica or resource geometry");
           failed = true;
           continue;
         }
         rewriter.setInsertionPoint(operation);
         auto stream = rewriter.create<riscv::RVVStreamContractOp>(
             operation->getLoc(), resultType, lhsLoad.getRegion(),
-            rhsLoad.getRegion(), extent, accumulatorLayout, reductionAxis,
-            "rhs", schedule.getUnroll(), lhsAccess, rhsAccess,
+            rhsLoad.getRegion(), extent, operandLayout, accumulatorLayout,
+            reductionAxis, stationaryRhs ? "rhs" : "lhs",
+            schedule.getUnroll(), lhsAccess, rhsAccess,
             riscv_internal::leaf(rewriter, "rvv", "stream-contract",
-                                 "rvv.stream-contract", "rvv.stream-contract",
+                                 wideningFloatStream
+                                     ? "rvv.stream-widen-contract"
+                                     : "rvv.stream-contract",
+                                 wideningFloatStream
+                                     ? "rvv.stream-widen-contract"
+                                     : "rvv.stream-contract",
                                  0, 0, temporaryGroups, 0));
         copyIdentity(operation, stream);
         operation->getResult(0).replaceAllUsesWith(stream.getResult());
@@ -2000,6 +2053,9 @@ private:
       llvm::StringRef stepInstruction;
       if (implementation.getOperation() == "rvv.vfmacc")
         stepInstruction = "rvv.vfmacc.vf";
+      else if (implementation.getFamily() == "widen-float-contract" &&
+               implementation.getOperation() == "rvv.vfwmacc")
+        stepInstruction = "rvv.vfwmacc.vf";
       else if (implementation.getOperation() == "rvv.vmacc")
         stepInstruction = "rvv.vmacc.vx";
       else if (implementation.getFamily() == "encoded-contract" &&

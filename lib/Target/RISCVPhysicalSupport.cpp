@@ -182,9 +182,15 @@ riscv::LayoutAttr riscv_internal::projectLayout(
   int64_t sew = std::max<int64_t>(8, logicalBitWidth(source));
   int64_t lmul = 0;
   if (carrier == "rvv") {
+    int64_t elen = 0;
+    for (int64_t supported : target.getSupportedSEW().asArrayRef())
+      elen = std::max(elen, supported);
+    if (elen <= 0)
+      return {};
     int64_t requested = std::max<int64_t>(
         1, (laneCount * sew * 8 + target.getVlenBits() - 1) /
                target.getVlenBits());
+    requested = std::max(requested, (8 * sew + elen - 1) / elen);
     for (int64_t legal : target.getLegalLMULEighths().asArrayRef())
       if (legal >= requested) {
         lmul = legal;

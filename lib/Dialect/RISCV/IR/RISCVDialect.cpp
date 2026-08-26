@@ -225,12 +225,19 @@ mlir::Value sourcePoint(mlir::Value value, int64_t axis) {
 }
 
 bool supportsLayout(TargetAttr target, LayoutAttr layout) {
+  int64_t elen = 0;
+  for (int64_t supported : target.getSupportedSEW().asArrayRef())
+    elen = std::max(elen, supported);
+  const bool legalFractionalLMUL =
+      layout && elen > 0 && layout.getLmulEighths() * elen >=
+                                8 * layout.getSew();
   return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
          target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
          llvm::is_contained(target.getSupportedSEW().asArrayRef(),
                             layout.getSew()) &&
          llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
-                            layout.getLmulEighths());
+                            layout.getLmulEighths()) &&
+         legalFractionalLMUL;
 }
 
 std::optional<int64_t> doubledPositive(int64_t value) {
@@ -2692,6 +2699,7 @@ mlir::LogicalResult RVVStreamContractOp::verify() {
       mlir::dyn_cast<kernel::EncodingType>(lhs.getEncoding());
   auto rhsEncoding =
       mlir::dyn_cast<kernel::EncodingType>(rhs.getEncoding());
+  auto operand = getOperandLayout();
   auto accumulator = getAccumulatorLayout();
   const bool lhsMemory = getLhsAccess().getForm() == "unit" ||
                          getLhsAccess().getForm() == "strided";
@@ -2725,14 +2733,33 @@ mlir::LogicalResult RVVStreamContractOp::verify() {
   expectedAccumulatorAxes.push_back(getReductionAxis());
   auto resultLanes = checkedPositiveProduct(
       result.getLayout().getLaneFactors().asArrayRef());
+  const bool ordinaryF32 = lhsEncoding && rhsEncoding &&
+                           lhsEncoding.getFamily() == "f32" &&
+                           rhsEncoding.getFamily() == "f32";
+  const bool wideningF16 = lhsEncoding && rhsEncoding &&
+                           lhsEncoding.getFamily() == "f16" &&
+                           rhsEncoding.getFamily() == "f16";
+  const bool exactInstruction =
+      ordinaryF32
+          ? exactLeaf(getLeaf(), "rvv", "stream-contract",
+                      "rvv.stream-contract", "none", "exact")
+          : wideningF16 &&
+                exactLeaf(getLeaf(), "rvv", "stream-contract",
+                          "rvv.stream-widen-contract", "none", "exact");
   if (!lhsEncoding || !rhsEncoding || lhsEncoding.getKind() != "dense" ||
-      rhsEncoding.getKind() != "dense" || lhsEncoding.getFamily() != "f32" ||
-      rhsEncoding.getFamily() != "f32" || getReductionAxis() <= 0 ||
+      rhsEncoding.getKind() != "dense" ||
+      (!ordinaryF32 && !wideningF16) || getReductionAxis() <= 0 ||
       result.getElementType() != mlir::Float32Type::get(getContext()) ||
       result.getAxisIds().asArrayRef() != llvm::ArrayRef(expectedAxes) ||
       result.getShape().asArrayRef() != llvm::ArrayRef(expectedShape) ||
       result.getLayout().getCarrier() != "scalar" ||
       !resultLanes || *resultLanes != 1 ||
+      operand.getCarrier() != "rvv" ||
+      operand.getAxisIds().size() != 1 ||
+      operand.getAxisIds()[0] != static_cast<int64_t>(getReductionAxis()) ||
+      operand.getLaneFactors().size() != 1 ||
+      operand.getLaneFactors()[0] != operand.getVl() || operand.getVl() <= 1 ||
+      operand.getSew() != (wideningF16 ? 16 : 32) ||
       accumulator.getCarrier() != "rvv" || accumulator.getSew() != 32 ||
       accumulator.getAxisIds().asArrayRef() !=
           llvm::ArrayRef(expectedAccumulatorAxes) ||
@@ -2740,12 +2767,14 @@ mlir::LogicalResult RVVStreamContractOp::verify() {
       accumulator.getVl() <= 1 || accumulator.getLmulEighths() <= 0 ||
       getStationaryOperand() != "lhs" && getStationaryOperand() != "rhs" ||
       getUnroll() <= 0 ||
-      !lhsMemory || !rhsMemory || getLhsAccess().getMapping() != "dense" ||
-      getRhsAccess().getMapping() != "dense" ||
-      !exactLeaf(getLeaf(), "rvv", "stream-contract",
-                 "rvv.stream-contract", "none", "exact"))
+      (wideningF16
+           ? accumulator.getLmulEighths() != operand.getLmulEighths() * 2
+           : accumulator.getLmulEighths() != operand.getLmulEighths()) ||
+      accumulator.getVl() != operand.getVl() || !lhsMemory || !rhsMemory ||
+      getLhsAccess().getMapping() != "dense" ||
+      getRhsAccess().getMapping() != "dense" || !exactInstruction)
     return emitOpError(
-        "RVV stream contract requires two dense f32 slices, one shared "
+        "RVV stream contract requires two matching dense floating slices, one shared "
         "reduction lane, scalar free-axis replicas, selected memory edges, "
         "and a closed local schedule");
   for (size_t index = 0; index < expectedAxes.size(); ++index) {
@@ -2872,6 +2901,7 @@ mlir::LogicalResult RVVContractStepOp::verify() {
       getLeaf().getEngine() != "rvv" ||
       getLeaf().getFamily() != "contract-step" ||
       (getLeaf().getInstruction() != "rvv.vfmacc.vf" &&
+       getLeaf().getInstruction() != "rvv.vfwmacc.vf" &&
        getLeaf().getInstruction() != "rvv.vmacc.vx") ||
       getLeaf().getSpelling() != getLeaf().getInstruction() ||
       getLeaf().getMask() != "none" || getLeaf().getTail() != "agnostic" ||
@@ -2881,7 +2911,11 @@ mlir::LogicalResult RVVContractStepOp::verify() {
       (getLeaf().getInstruction() == "rvv.vfmacc.vf" &&
        (elementOf(getLhs().getType()) != getResult().getType().getElementType() ||
         elementOf(getRhs().getType()) !=
-            getResult().getType().getElementType())))
+            getResult().getType().getElementType())) ||
+      (getLeaf().getInstruction() == "rvv.vfwmacc.vf" &&
+       (!elementOf(getLhs().getType()).isF16() ||
+        !elementOf(getRhs().getType()).isF16() ||
+        !getResult().getType().getElementType().isF32())))
     return emitOpError()
            << "RVV contract step has an incomplete typed contract; accumulator="
            << getAccumulator().getType() << ", result=" << getResult().getType()

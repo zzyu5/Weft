@@ -309,10 +309,13 @@ public:
             laneAxis = axis;
             break;
           }
-      } else if (auto over = operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over");
-                 over && !over.empty()) {
-        laneAxis = over.asArrayRef().front();
-      } else {
+      }
+      if (!laneAxis)
+        if (auto over =
+                operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over");
+            over && !over.empty())
+          laneAxis = over.asArrayRef().front();
+      if (!laneAxis) {
         operation->emitError(
             "scalar contraction has no reduction axis for lane-memory planning");
         failed = true;

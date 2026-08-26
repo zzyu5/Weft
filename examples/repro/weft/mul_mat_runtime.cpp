@@ -222,8 +222,13 @@ constexpr int kElements = 32;
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_q5_0_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
+#if defined(WEFT_Q50_DECODE)
+extern "C" void production_mul_mat_q5_0_decode(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_q5_0_decode(w, x, xq, y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_q5_0(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q5_0(w, x, xq, y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 5
 using selected_weight = block_q5_1;
 using selected_activation = block_q8_1;

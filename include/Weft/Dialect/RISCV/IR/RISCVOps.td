@@ -913,6 +913,7 @@ def WeftRISCV_RVVStreamContractOp
   let arguments = (ins WeftRISCV_MemDescType:$lhs,
                        WeftRISCV_MemDescType:$rhs,
                        Index:$extent,
+                       WeftRISCV_LayoutAttr:$operand_layout,
                        WeftRISCV_LayoutAttr:$accumulator_layout,
                        I64Attr:$reduction_axis,
                        StrAttr:$stationary_operand,

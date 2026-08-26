@@ -10,6 +10,7 @@
 #include "mlir/Pass/Pass.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -27,6 +28,12 @@ std::optional<int64_t> integerConstant(mlir::Value value) {
     if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
       return integer.getInt();
   return std::nullopt;
+}
+
+mlir::Value stripLayoutConversions(mlir::Value value) {
+  while (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    value = conversion.getInput();
+  return value;
 }
 
 bool isBinaryWithConstant(riscv::BinaryOp operation, llvm::StringRef kind,
@@ -72,11 +79,19 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
     return std::nullopt;
   auto extract = variableShift.getLhs().getDefiningOp<riscv::ExtractOp>();
   auto position = variableShift.getRhs().getDefiningOp<riscv::BinaryOp>();
+  size_t gatherSelectors = 0;
+  if (extract)
+    for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "gather")
+        ++gatherSelectors;
+      else if (selector != "all")
+        return std::nullopt;
+    }
   if (!extract || !position || position.getKind() != "mod" ||
       integerConstant(position.getRhs()) != 8 ||
-      extract.getSelectors().size() != 1 || extract.getIndices().size() != 1 ||
-      mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() !=
-          "gather")
+      gatherSelectors != 1 || extract.getIndices().size() != 1)
     return std::nullopt;
 
   auto byteIndex = extract.getIndices().front().getDefiningOp<riscv::BinaryOp>();
@@ -84,12 +99,14 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
       integerConstant(byteIndex.getRhs()) != 8 ||
       byteIndex.getLhs() != position.getLhs())
     return std::nullopt;
-  auto coordinates = byteIndex.getLhs().getDefiningOp<riscv::IotaOp>();
+  auto coordinates =
+      stripLayoutConversions(byteIndex.getLhs()).getDefiningOp<riscv::IotaOp>();
   if (!coordinates || coordinates.getStart() != 0)
     return std::nullopt;
 
   mlir::Value planeInput = extract.getInput();
-  if (auto conversion = planeInput.getDefiningOp<riscv::ConvertLayoutOp>())
+  while (auto conversion =
+             planeInput.getDefiningOp<riscv::ConvertLayoutOp>())
     planeInput = conversion.getInput();
   auto plane = planeInput.getDefiningOp<riscv::FieldOp>();
   auto lowType = mlir::dyn_cast<riscv::ValueType>(low.getType());
@@ -97,11 +114,21 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
   auto planeType = plane
                        ? mlir::dyn_cast<riscv::ValueType>(plane.getResult().getType())
                        : riscv::ValueType();
+  auto coordinateType =
+      mlir::dyn_cast<riscv::ValueType>(coordinates.getResult().getType());
   if (!plane || !lowType || !resultType || !planeType ||
+      !coordinateType || coordinateType.getAxisIds().size() != 1 ||
       lowType != resultType || lowType.getLayout().getCarrier() != "rvv" ||
       planeType.getLayout().getCarrier() != "local" ||
-      coordinates.getEnd() !=
-          riscv_internal::staticProduct(resultType.getShape()).value_or(-1))
+      coordinates.getEnd() - coordinates.getStart() !=
+          riscv_internal::staticProduct(coordinateType.getShape()).value_or(-1))
+    return std::nullopt;
+  auto coordinateAxis = llvm::find(resultType.getAxisIds().asArrayRef(),
+                                   coordinateType.getAxisIds()[0]);
+  if (coordinateAxis == resultType.getAxisIds().asArrayRef().end() ||
+      resultType.getShape()[static_cast<size_t>(
+          coordinateAxis - resultType.getAxisIds().asArrayRef().begin())] !=
+          coordinateType.getShape()[0])
     return std::nullopt;
 
   auto lowInteger =
@@ -114,11 +141,23 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
       plane.getAccess().getBitOffset() % 8)
     return std::nullopt;
 
-  auto lowElements = riscv_internal::staticProduct(resultType.getShape());
-  auto planeElements = riscv_internal::staticProduct(planeType.getShape());
-  if (!lowElements || !planeElements || *planeElements * 8 != *lowElements ||
-      resultType.getAxisIds() != planeType.getAxisIds())
+  if (resultType.getAxisIds() != planeType.getAxisIds() ||
+      resultType.getShape().size() != planeType.getShape().size())
     return std::nullopt;
+  const size_t packedAxis = static_cast<size_t>(
+      coordinateAxis - resultType.getAxisIds().asArrayRef().begin());
+  for (size_t index = 0; index < resultType.getShape().size(); ++index) {
+    const int64_t lowExtent = resultType.getShape()[index];
+    const int64_t planeExtent = planeType.getShape()[index];
+    if (index == packedAxis) {
+      if (lowExtent <= 0 || planeExtent <= 0 ||
+          planeExtent > std::numeric_limits<int64_t>::max() / 8 ||
+          planeExtent * 8 != lowExtent)
+        return std::nullopt;
+    } else if (lowExtent != planeExtent) {
+      return std::nullopt;
+    }
+  }
   auto owner = mlir::dyn_cast<riscv::ValueType>(plane.getOwner().getType());
   auto encoding = owner ? mlir::dyn_cast<kernel::EncodingType>(
                               riscv_internal::logicalElement(owner))
@@ -131,7 +170,13 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
 
 void eraseDeadTree(mlir::Value value, mlir::IRRewriter &rewriter) {
   mlir::Operation *operation = value.getDefiningOp();
-  if (!operation || !mlir::isMemoryEffectFree(operation) ||
+  const bool pureLayoutConversion =
+      operation && mlir::isa<riscv::ConvertLayoutOp>(operation) &&
+      mlir::cast<riscv::ConvertLayoutOp>(operation)
+              .getConversion()
+              .getEffect() == "pure";
+  if (!operation ||
+      (!mlir::isMemoryEffectFree(operation) && !pureLayoutConversion) ||
       llvm::any_of(operation->getResults(),
                    [](mlir::Value result) { return !result.use_empty(); }))
     return;

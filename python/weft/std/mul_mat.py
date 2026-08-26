@@ -21,6 +21,7 @@ from weft.language import (
     new,
     outer_contract,
     reduce,
+    u8,
     u32,
     widen,
 )
@@ -55,6 +56,7 @@ from .encodings import (
     TQ2_0,
 )
 from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
+from .quant_fragments import high_bit_plane_u8
 from .vec_dot import (
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
@@ -154,17 +156,22 @@ def mul_mat_q4_0(
     Y: View[f32, (M, N)],
 ):
     quantize_q8_0(X, Xq)
-    for column in range(N):
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
         with L.tiles(M, extent=auto("MC")) as mc:
-            with L.rows(mc, group=auto("MR")) as mb:
-                acc = new(f32, [MR], init=f32(0.0))
-                with L.blocks(K, extent=32) as kb:
-                    w = admit(W[column, kb])
-                    x = admit(Xq[mb, kb])
-                    centered = i8(w.q) - i8(8)
-                    integer = contract(x.q, centered, over="k", acc=i32)
-                    acc += (f32(w.d) * f32(x.d)) * widen(integer, f32)
-                commit(acc, Y[mb, column])
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=32) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        centered = i8(w.q) - i8(8)
+                        integer = outer_contract(
+                            x.q, centered, over="k", acc=i32
+                        )
+                        acc += (f32(w.d) * f32(x.d)) * widen(integer, f32)
+                    commit(acc, Y[mb, nb])
 
 
 def mul_mat_q4_0_decode(
@@ -192,6 +199,35 @@ def mul_mat_q4_1(
 
 
 def mul_mat_q5_0(
+    W: View[Q5_0, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_0(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=32) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        lane = iota(32, dtype=u8, axis="k")
+                        q = high_bit_plane_u8(
+                            w.q, w.qh[:, lane // u8(8)], lane % u8(8)
+                        )
+                        centered = i8(q) - i8(16)
+                        integer = outer_contract(
+                            x.q, centered, over="k", acc=i32
+                        )
+                        acc += (f32(w.d) * f32(x.d)) * widen(integer, f32)
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_q5_0_decode(
     W: View[Q5_0, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],

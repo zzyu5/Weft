@@ -68,7 +68,11 @@ local_root=$(mktemp -d /tmp/weft-mul-mat.XXXXXX)
 cleanup_local() {
   status=$?
   trap - EXIT
-  find "${local_root}" -depth -delete
+  if [[ ${WEFT_KEEP_ARTIFACTS:-0} == 1 ]]; then
+    echo "WEFT_LOCAL_ARTIFACTS=${local_root}" >&2
+  else
+    find "${local_root}" -depth -delete
+  fi
   exit "${status}"
 }
 trap cleanup_local EXIT
@@ -86,7 +90,13 @@ else
   dsl=examples/kernels/quantization/mul_mat.py
   if [[ ${format} == f16 ]]; then
     kernel=production_mul_mat_f16
-    meta=(--meta NC=32 --meta KC=128 --meta MC=16 --meta MR=4 --meta NR=4 --meta KB=32)
+    if [[ ${target} == sg2044 ]]; then
+      meta=(--meta NC=32 --meta KC=4096 --meta MC=16 --meta MR=4 --meta NR=2 --meta KB=4096)
+      physical=(--auto-lmul-eighths=8)
+    else
+      meta=(--meta NC=32 --meta KC=4096 --meta MC=16 --meta MR=2 --meta NR=2 --meta KB=4096)
+      physical=(--auto-lmul-eighths=16)
+    fi
   elif [[ ${format} == q4_k_persistent ]]; then
     runtime_kernel_define=-DWEFT_Q4_DERIVED=1
     kernel=production_mul_mat_q4_k_persistent
@@ -108,7 +118,16 @@ else
       runtime_kernel_define=-DWEFT_Q40_DECODE=1
     else
       kernel=production_mul_mat_q4_0
-      meta=(--meta MC=16 --meta MR=2)
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == q5_0 ]]; then
+    physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_q5_0_decode
+      runtime_kernel_define=-DWEFT_Q50_DECODE=1
+    else
+      kernel=production_mul_mat_q5_0
+      meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
     fi
   else
     kernel=production_mul_mat_${format}
@@ -152,15 +171,21 @@ printf -v link_path_argument '%q' "${link_path}"
 printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
 printf -v phase_argument '%q' "${phase}"
 printf -v repetitions_argument '%q' "${repetitions}"
+printf -v keep_artifacts_argument '%q' "${WEFT_KEEP_ARTIFACTS:-0}"
 
 tar -C "${local_root}" -cf - kernel.c runtime.cpp |
   ssh "${remote_host}" "
     set -eu
     remote_root=\$(mktemp -d /tmp/weft-mul-mat.XXXXXX)
+    keep_artifacts=${keep_artifacts_argument}
     cleanup() {
       exit_status=\$?
       trap - EXIT
-      find \"\${remote_root}\" -depth -delete
+      if [ \"\${keep_artifacts}\" = 1 ]; then
+        echo \"WEFT_REMOTE_ARTIFACTS=${remote_host}:\${remote_root}\" >&2
+      else
+        find \"\${remote_root}\" -depth -delete
+      fi
       exit \"\${exit_status}\"
     }
     trap cleanup EXIT
@@ -176,6 +201,10 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
     format_id=${format_argument}
     link_path=${link_path_argument}
     runtime_target_define=${runtime_target_define_argument}
+    if [ \"\${keep_artifacts}\" = 1 ]; then
+      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
+        \${extra_flags} -march=\"\${march}\" -mabi=lp64d -S kernel.c -o kernel.s
+    fi
     \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
       \${extra_flags} -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
@@ -189,5 +218,5 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o runtime
-    exec taskset -c \"\${cpu}\" ./runtime ${phase_argument} ${repetitions_argument}
+    taskset -c \"\${cpu}\" ./runtime ${phase_argument} ${repetitions_argument}
   "

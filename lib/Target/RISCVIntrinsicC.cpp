@@ -190,6 +190,7 @@ struct Binding {
   int64_t recordElements = 0;
   int64_t recordStrideBytes = 0;
   llvm::SmallVector<std::pair<int64_t, std::string>> recordByteStrides;
+  llvm::SmallVector<std::pair<int64_t, std::string>> recordOrigins;
 };
 
 class Emitter {
@@ -1015,8 +1016,13 @@ std::optional<std::string> Emitter::extractLaneForRegisterBroadcast(
   if (laneCoordinate == axes.end())
     return std::nullopt;
   laneOffset = (*coordinates)[laneCoordinate - axes.begin()];
-  const int64_t sourcePart = laneOffset / physicalLanes(source);
+  auto sourceRegister = projectRegisterPart(source, result, resultPart);
+  if (!sourceRegister)
+    return std::nullopt;
+  const int64_t laneStream = laneOffset / physicalLanes(source);
   laneOffset %= physicalLanes(source);
+  const int64_t sourcePart =
+      *sourceRegister * streamPartCount(source) + laneStream;
   if (sourcePart < 0 ||
       sourcePart >= static_cast<int64_t>(binding.parts.size()))
     return std::nullopt;
@@ -2437,11 +2443,13 @@ mlir::LogicalResult Emitter::compileSlice(riscv::SliceOp slice) {
         return fail(slice, "nested slice selector has no logical axis or index");
       int64_t axis = baseType.getAxisIds()[position];
       mlir::Value index = slice.getIndices()[cursor++];
-      if (selector != "domain") {
-        // Scalar/group indices are relative to the already selected block.
+      if (selector == "index") {
+        // Plain scalar indices are offsets relative to the selected block.
         binding.slice.localOffsets.emplace_back(axis, index);
         continue;
       }
+      if (selector != "domain" && selector != "group_index")
+        return fail(slice, "nested slice has an unknown selector");
       auto found = llvm::find(root.memory.axes, axis);
       if (found == root.memory.axes.end())
         return fail(slice, "nested slice logical axis is absent from root memory");
@@ -2458,8 +2466,9 @@ mlir::LogicalResult Emitter::compileSlice(riscv::SliceOp slice) {
       else
         return fail(slice, "nested slice root selector has no matching index");
       // Physical points carry absolute coordinates in their canonical domain.
-      // A nested selector therefore replaces the root selector for that axis;
-      // adding the child point to its parent would count the parent base twice.
+      // Domain and group-index projections therefore replace the root selector
+      // for that axis; adding the child point to its parent would count the
+      // parent base twice.
       binding.slice.selectors[rootDimension] = selector.str();
     }
   } else {
@@ -2501,7 +2510,8 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
            mlir::failure();
 
   llvm::DenseMap<int64_t, PointInfo> points;
-  llvm::SmallVector<std::string> coordinates(base.memory.axes.size(), "0");
+  llvm::SmallVector<std::string> coordinates(base.memory.origins.begin(),
+                                             base.memory.origins.end());
   size_t cursor = 0;
   for (auto [dimension, selector] : llvm::enumerate(region.slice.selectors)) {
     if (selector == "all")
@@ -2560,6 +2570,9 @@ mlir::FailureOr<Binding> Emitter::recordForSlice(mlir::Value value) {
   result.recordAxis = base.memory.axes.empty() ? 0 : base.memory.axes.back();
   result.recordElements = elements;
   result.recordStrideBytes = recordBytes;
+  for (auto [dimension, axis] : llvm::enumerate(base.memory.axes))
+    if (llvm::is_contained(sliceType.getAxisIds().asArrayRef(), axis))
+      result.recordOrigins.emplace_back(axis, coordinates[dimension]);
   if (encoding.getKind() == "derived_instance" ||
       base.memory.interleaveRows > 0) {
     int64_t rows = base.memory.interleaveRows > 0
@@ -2899,6 +2912,7 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
                   "encoded record extract selector rank does not match its logical axes");
     size_t cursor = 0;
     llvm::SmallVector<std::pair<int64_t, std::string>> remainingStrides;
+    llvm::SmallVector<std::pair<int64_t, std::string>> remainingOrigins;
     std::string pointer = binding.recordPointer;
     for (auto [dimension, selectorAttribute] :
          llvm::enumerate(operation.getSelectors())) {
@@ -2921,34 +2935,37 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
         else if (axis != binding.recordAxis)
           return fail(operation,
                       "encoded record extract has no typed byte stride for one axis");
+        if (auto origin = llvm::find_if(
+                binding.recordOrigins,
+                [&](const auto &entry) { return entry.first == axis; });
+            origin != binding.recordOrigins.end())
+          remainingOrigins.push_back(*origin);
         continue;
       }
       if (cursor >= operation.getIndices().size())
         return fail(operation,
                     "encoded record extract selector has no coordinate value");
       Binding coordinate = bindings.lookup(operation.getIndices()[cursor++]);
-      std::string expression;
+      std::string absoluteExpression;
       if (selector == "domain" && coordinate.kind == Binding::Kind::Point)
-        expression = coordinate.point.base;
+        absoluteExpression = coordinate.point.base;
       else if (selector == "group_index" &&
                coordinate.kind == Binding::Kind::Point)
-        expression = "(" + coordinate.point.base + " / " +
-                     std::to_string(coordinate.point.physicalExtent) + ")";
+        absoluteExpression = "(" + coordinate.point.base + " / " +
+                             std::to_string(coordinate.point.physicalExtent) + ")";
       else if (selector == "index" && coordinate.kind == Binding::Kind::Scalar)
-        expression = coordinate.scalar;
+        absoluteExpression = coordinate.scalar;
       else
         return fail(operation,
                     "encoded record extract coordinate does not match its selector");
-      if (retainsAxis && coordinate.kind == Binding::Kind::Point) {
-        auto extent = extentForShape(inputType.getShape()[dimension], axis);
-        if (!extent)
-          return fail(operation,
-                      "encoded record subdomain has no enclosing logical extent");
-        expression = "((" + coordinate.point.base + ") % (" + *extent + "))";
-        if (selector == "group_index")
-          expression = "(" + expression + " / " +
-                       std::to_string(coordinate.point.physicalExtent) + ")";
-      }
+      std::string expression = absoluteExpression;
+      if (coordinate.kind == Binding::Kind::Point)
+        if (auto origin = llvm::find_if(
+                binding.recordOrigins,
+                [&](const auto &entry) { return entry.first == axis; });
+            origin != binding.recordOrigins.end())
+          expression = "((" + absoluteExpression + ") - (" +
+                       origin->second + "))";
       if (stride != binding.recordByteStrides.end()) {
         pointer = "(" + pointer + " + (" + expression + ") * (" +
                   stride->second + "))";
@@ -2965,12 +2982,15 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
         return fail(operation,
                     "encoded record extract has no typed record coordinate relation");
       }
+      if (retainsAxis && coordinate.kind == Binding::Kind::Point)
+        remainingOrigins.emplace_back(axis, absoluteExpression);
     }
     if (cursor != operation.getIndices().size())
       return fail(operation,
                   "encoded record extract has unused coordinate operands");
     binding.recordPointer = std::move(pointer);
     binding.recordByteStrides = std::move(remainingStrides);
+    binding.recordOrigins = std::move(remainingOrigins);
     bindings[operation.getResult()] = std::move(binding);
     return mlir::success();
   }
@@ -6020,32 +6040,26 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     auto scalarType = scalarCType(element);
     if (!scalarType)
       return fail(conversion, "RVV extract result has no scalar C type");
-    const std::string suffix = vectorSuffix(conversion.getInput());
-    auto extractOne = [&](int64_t lane) {
-      const std::string shifted =
-          lane == 0
-              ? input.parts.front()
-              : "__riscv_vslidedown_vx_" + suffix + "(" +
-                    input.parts.front() + ", " + std::to_string(lane) + ", " +
-                    partVL(conversion.getInput(), 0) + ")";
-      if (mlir::isa<mlir::FloatType>(element))
-        return "__riscv_vfmv_f_s_" + suffix + "_f" +
-               std::to_string(riscv_internal::logicalBitWidth(element)) + "(" +
-               shifted + ")";
-      auto integer = mlir::cast<mlir::IntegerType>(element);
-      return "__riscv_vmv_x_s_" + suffix + "_" +
-             std::string(integer.isUnsigned() ? "u" : "i") +
-             std::to_string(integer.getWidth()) + "(" + shifted + ")";
-    };
     int64_t parts = registerPartCount(conversion.getResult());
     if (parts == 1) {
-      bindings[conversion.getResult()] = scalar(extractOne(0));
+      auto extracted = extractLaneForRegisterBroadcast(
+          conversion.getInput(), conversion.getResult(), 0, input);
+      if (!extracted)
+        return fail(conversion,
+                    "RVV extract cannot preserve its typed register coordinates");
+      bindings[conversion.getResult()] = scalar(*extracted);
       return mlir::success();
     }
     Binding tuple;
     tuple.kind = Binding::Kind::ScalarTuple;
-    for (int64_t part = 0; part < parts; ++part)
-      tuple.parts.push_back(extractOne(part));
+    for (int64_t part = 0; part < parts; ++part) {
+      auto extracted = extractLaneForRegisterBroadcast(
+          conversion.getInput(), conversion.getResult(), part, input);
+      if (!extracted)
+        return fail(conversion,
+                    "RVV extract cannot preserve its typed register coordinates");
+      tuple.parts.push_back(*extracted);
+    }
     bindings[conversion.getResult()] = std::move(tuple);
     return mlir::success();
   }
@@ -7244,7 +7258,9 @@ Emitter::compileRVVStreamDot(riscv::RVVStreamDotOp operation) {
 
 mlir::LogicalResult Emitter::compileRVVStreamContract(
     riscv::RVVStreamContractOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.stream-contract")
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool widening = instruction == "rvv.stream-widen-contract";
+  if (instruction != "rvv.stream-contract" && !widening)
     return fail(operation, "RVV stream contract has no exact selected leaf");
   Binding lhs = bindings.lookup(operation.getLhs());
   Binding rhs = bindings.lookup(operation.getRhs());
@@ -7257,11 +7273,15 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
   const Binding &rhsBase = bindings.lookup(rhs.slice.base);
   if (lhsBase.kind != Binding::Kind::Memory ||
       rhsBase.kind != Binding::Kind::Memory || !lhsBase.memory.elementType ||
-      !rhsBase.memory.elementType || !lhsBase.memory.elementType.isF32() ||
-      !rhsBase.memory.elementType.isF32())
+      !rhsBase.memory.elementType ||
+      (widening ? (!lhsBase.memory.elementType.isF16() ||
+                   !rhsBase.memory.elementType.isF16())
+                : (!lhsBase.memory.elementType.isF32() ||
+                   !rhsBase.memory.elementType.isF32())))
     return fail(operation,
-                "RVV stream contract inputs are not dense f32 memory slices");
+                "RVV stream contract inputs do not match its selected floating leaf");
 
+  riscv::LayoutAttr operandLayout = operation.getOperandLayout();
   riscv::LayoutAttr accumulatorLayout = operation.getAccumulatorLayout();
   const int64_t reductionAxis = operation.getReductionAxis();
   auto lhsReduction = llvm::find(lhsBase.memory.axes, reductionAxis);
@@ -7274,11 +7294,20 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
       lhsReduction - lhsBase.memory.axes.begin());
   const size_t rhsReductionDimension = static_cast<size_t>(
       rhsReduction - rhsBase.memory.axes.begin());
-  const std::string lmul = lmulSpelling(accumulatorLayout.getLmulEighths());
-  if (lmul.empty())
+  const std::string operandLMUL =
+      lmulSpelling(operandLayout.getLmulEighths());
+  const std::string accumulatorLMUL =
+      lmulSpelling(accumulatorLayout.getLmulEighths());
+  if (operandLMUL.empty() || accumulatorLMUL.empty())
     return fail(operation, "RVV stream contract has an invalid LMUL");
-  const std::string suffix = "f32" + lmul;
-  const std::string type = "vfloat32" + lmul + "_t";
+  const std::string operandSuffix =
+      std::string(widening ? "f16" : "f32") + operandLMUL;
+  const std::string accumulatorSuffix = "f32" + accumulatorLMUL;
+  const std::string operandType =
+      std::string(widening ? "vfloat16" : "vfloat32") + operandLMUL + "_t";
+  const std::string accumulatorType = "vfloat32" + accumulatorLMUL + "_t";
+  const std::string scalarType = widening ? "_Float16" : "float";
+  const unsigned operandBits = widening ? 16 : 32;
   const std::string fullVL = std::to_string(accumulatorLayout.getVl());
   const int64_t parts = registerPartCount(operation.getResult());
   if (parts <= 0)
@@ -7288,7 +7317,8 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
   llvm::SmallVector<std::string> accumulators;
   for (int64_t part = 0; part < parts; ++part) {
     std::string accumulator = fresh("stream_contract");
-    line(type + " " + accumulator + " = __riscv_vfmv_v_f_" + suffix +
+    line(accumulatorType + " " + accumulator + " = __riscv_vfmv_v_f_" +
+         accumulatorSuffix +
          "(0.0f, " + fullVL + ");");
     accumulators.push_back(std::move(accumulator));
   }
@@ -7308,7 +7338,8 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
     std::string streamVL = fullVL;
     if (!exactStrips) {
       streamVL = fresh("stream_vl");
-      line("size_t " + streamVL + " = __riscv_vsetvl_e32" + lmul +
+      line("size_t " + streamVL + " = __riscv_vsetvl_e" +
+           std::to_string(operandBits) + operandLMUL +
            "((size_t)(" + extent.scalar + ") - " + streamIndex + ");");
     }
     const int64_t stripCount = exactStrips ? operation.getUnroll() : 1;
@@ -7320,7 +7351,7 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
                     std::to_string(unrolled * accumulatorLayout.getVl()) + ")";
       llvm::StringMap<std::string> lhsLoads;
       llvm::StringMap<std::string> rhsLoads;
-    auto loadOperand = [&](const Binding &slice, const Binding &base,
+      auto loadOperand = [&](const Binding &slice, const Binding &base,
                            riscv::AccessAttr access, size_t reductionDimension,
                            llvm::ArrayRef<int64_t> coordinates,
                            llvm::StringRef prefix,
@@ -7349,18 +7380,20 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
       std::string loaded = fresh(prefix);
       std::string expression;
       if (access.getForm() == "unit")
-        expression = "__riscv_vle32_v_" + suffix + "(" + *address + ", " +
-                     streamVL + ")";
+        expression = "__riscv_vle" + std::to_string(operandBits) + "_v_" +
+                     operandSuffix + "(" + *address + ", " + streamVL + ")";
       else
-        expression = "__riscv_vlse32_v_" + suffix + "(" + *address +
+        expression = "__riscv_vlse" + std::to_string(operandBits) + "_v_" +
+                     operandSuffix + "(" + *address +
                      ", (ptrdiff_t)(" + base.memory.strides[reductionDimension] +
-                     " * (ptrdiff_t)sizeof(float)), " + streamVL + ")";
+                     " * (ptrdiff_t)sizeof(" + scalarType + ")), " + streamVL +
+                     ")";
       if (guarded) {
-        line(type + " " + loaded + " = __riscv_vfmv_v_f_" + suffix +
-             "(0.0f, " + streamVL + ");");
+        line(operandType + " " + loaded + " = __riscv_vfmv_v_f_" +
+             operandSuffix + "(0.0f, " + streamVL + ");");
         line("if (" + active + ") " + loaded + " = " + expression + ";");
       } else {
-        line(type + " " + loaded + " = " + expression + ";");
+        line(operandType + " " + loaded + " = " + expression + ";");
       }
       cache[key] = loaded;
       return loaded;
@@ -7418,7 +7451,9 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
       if (!lhsValue || !rhsValue)
         return fail(operation,
                     "RVV stream contract has no selected dense address relation");
-      line(accumulators[part] + " = __riscv_vfmacc_vv_" + suffix + "(" +
+      line(accumulators[part] + " = __riscv_" +
+           std::string(widening ? "vfwmacc_vv_" : "vfmacc_vv_") +
+           accumulatorSuffix + "(" +
            accumulators[part] + ", " + *lhsValue + ", " + *rhsValue + ", " +
            streamVL + ");");
     }
@@ -7474,7 +7509,8 @@ mlir::LogicalResult Emitter::compileRVVStreamContract(
     line("vfloat32m1_t " + seed +
          " = __riscv_vfmv_v_f_f32m1(0.0f, 1);");
     std::string reduced = fresh("stream_scalar");
-    line("vfloat32m1_t " + reduced + " = __riscv_vfredusum_vs_" + suffix +
+    line("vfloat32m1_t " + reduced + " = __riscv_vfredusum_vs_" +
+         accumulatorSuffix +
          "_f32m1(" + accumulators[part] + ", " + seed + ", " + fullVL +
          ");");
     std::string scalarName = fresh("stream_value");
@@ -7673,8 +7709,9 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
     riscv::RVVContractStepOp operation) {
   llvm::StringRef instruction = operation.getLeaf().getInstruction();
   const bool floating = instruction == "rvv.vfmacc.vf";
+  const bool wideningFloat = instruction == "rvv.vfwmacc.vf";
   const bool integer = instruction == "rvv.vmacc.vx";
-  if (!floating && !integer)
+  if (!floating && !wideningFloat && !integer)
     return fail(operation,
                 "RVV contract step has no exact selected FMA operand form");
   Binding lhs = bindings.lookup(operation.getLhs());
@@ -7718,7 +7755,9 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
       }
       std::string name = fresh("contract_step");
       line(vectorType(resultValue) + " " + name + " = __riscv_" +
-           std::string(floating ? "vfmacc_vf_" : "vmacc_vx_") +
+           std::string(wideningFloat ? "vfwmacc_vf_"
+                                     : (floating ? "vfmacc_vf_" :
+                                                   "vmacc_vx_")) +
            vectorSuffix(resultValue) + "(" + accumulator.parts[part] + ", " +
            repeatedExpression + ", " + laneSlice.parts[*lanePart] + ", " +
            partVL(resultValue, part) + ");");
@@ -7832,7 +7871,7 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
              *scalarCType(laneMemory.memory.elementType) + "), " +
              partVL(resultValue, part) +
              ");");
-      if (laneMemory.memory.elementType.isF16()) {
+      if (laneMemory.memory.elementType.isF16() && !wideningFloat) {
         std::string widened = fresh("operand_wide");
         line(vectorType(resultValue) + " " + widened +
              " = __riscv_vfwcvt_f_f_v_" + suffix + "(" + loaded + ", " +
@@ -7851,7 +7890,7 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
         return fail(operation,
                     "RVV contract step repeated operand has no address relation");
       repeatedExpression = "*(" + *repeatedAddress + ")";
-      if (repeatedMemory->memory.elementType.isF16())
+      if (repeatedMemory->memory.elementType.isF16() && !wideningFloat)
         repeatedExpression = "((float)(" + repeatedExpression + "))";
     } else if (repeated.kind == Binding::Kind::Scalar) {
       repeatedExpression = repeated.scalar;
@@ -7864,7 +7903,9 @@ mlir::LogicalResult Emitter::compileRVVContractStep(
       repeatedExpression = repeated.parts[*repeatedPart];
     }
     std::string statement =
-        name + " = __riscv_vfmacc_vf_" + suffix + "(" + name + ", " +
+        name + " = __riscv_" +
+        std::string(wideningFloat ? "vfwmacc_vf_" : "vfmacc_vf_") +
+        suffix + "(" + name + ", " +
         repeatedExpression + ", " + loaded + ", " +
         partVL(resultValue, part) + ");";
     if (!registerAxes.empty())

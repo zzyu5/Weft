@@ -100,6 +100,18 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
   int64_t lane = rhsFreeLane(operation.getLhs(), operation.getRhs(), reduction);
   auto implementation = operation->template getAttrOfType<
       riscv::ImplementationAttr>("implementation");
+  if (implementation &&
+      (implementation.getFamily() == "widen-float-contract" ||
+       implementation.getFamily() == "widen-dot")) {
+    roles.fullLaneExtent = true;
+    for (int64_t axis : reduction)
+      if (containsAxis(value.getType(), axis)) {
+        roles.laneAxis = axis;
+        break;
+      }
+    addSmallReplicas(value, roles, roles.laneAxis);
+    return;
+  }
   if (implementation && implementation.getEngine() == "ime") {
     auto parameters = implementation.getParameters().asArrayRef();
     roles.fragmentParameters.assign(parameters.begin(), parameters.end());
@@ -285,7 +297,14 @@ void completeRoles(mlir::Value value, Roles &roles) {
     roles.replicaAxes.erase(roles.laneAxis);
 }
 
-int64_t roundLegalLMUL(riscv::TargetAttr target, int64_t requested) {
+int64_t roundLegalLMUL(riscv::TargetAttr target, int64_t requested,
+                       int64_t sew) {
+  int64_t elen = 0;
+  for (int64_t supported : target.getSupportedSEW().asArrayRef())
+    elen = std::max(elen, supported);
+  if (elen <= 0)
+    return 0;
+  requested = std::max(requested, (8 * sew + elen - 1) / elen);
   for (int64_t legal : target.getLegalLMULEighths().asArrayRef())
     if (legal >= requested)
       return legal;
@@ -385,7 +404,8 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
                                   target.getVlenBits() - 1) /
                                      target.getVlenBits())
           : 0;
-  int64_t lmul = roles.laneAxis ? roundLegalLMUL(target, requestedLMUL) : 0;
+  int64_t lmul =
+      roles.laneAxis ? roundLegalLMUL(target, requestedLMUL, sew) : 0;
   if (roles.laneAxis && lmul == 0)
     return {};
   int64_t actualLanes = roles.laneAxis

@@ -298,6 +298,12 @@ private:
           riscv_internal::logicalElement(rhs.getType()));
       auto resultInteger = mlir::dyn_cast<mlir::IntegerType>(
           riscv_internal::logicalElement(result));
+      auto lhsFloat = mlir::dyn_cast<mlir::FloatType>(
+          riscv_internal::logicalElement(lhs.getType()));
+      auto rhsFloat = mlir::dyn_cast<mlir::FloatType>(
+          riscv_internal::logicalElement(rhs.getType()));
+      auto resultFloat = mlir::dyn_cast<mlir::FloatType>(
+          riscv_internal::logicalElement(result));
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
       // The widening-dot family follows from the typed numerical relation and
       // target capability.  It must be selected before layout propagation so
@@ -321,6 +327,11 @@ private:
           hasEncodedFieldOrigin(rhs))
         return rvvImplementation(builder, "encoded-contract",
                                  "rvv.vmacc.decoded-u8-s8", over);
+      if (lhsFloat && rhsFloat && resultFloat && lhsFloat.isF16() &&
+          rhsFloat.isF16() && resultFloat.isF32() &&
+          target.getHasVectorF16())
+        return rvvImplementation(builder, "widen-float-contract",
+                                 "rvv.vfwmacc", over);
       llvm::StringRef instruction = isFloat(result) ? "rvv.vfmacc"
                                                     : "rvv.vmacc";
       return rvvImplementation(builder, "contract", instruction, over);
