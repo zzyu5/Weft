@@ -93,6 +93,7 @@ public:
               conversion.getLoc(), requiredType, operand,
               riscv_internal::layoutConversion(rewriter,
                                                operandType.getLayout(), required),
+              riscv::AccessAttr(),
               riscv_internal::unselectedLeaf(rewriter));
           operands.push_back(edge.getResult());
         }

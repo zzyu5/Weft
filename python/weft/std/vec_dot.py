@@ -49,8 +49,6 @@ from .encodings import (
 )
 from .quant_fragments import (
     exponent_scale,
-    high_bit_plane,
-    high_bit_plane_u8,
     nonlinear_lookup,
     radix3_digit,
     small_nonlinear_lookup,
@@ -84,20 +82,18 @@ def _q3_scale(scales, sub):
 
 
 def _signed_grid8(grid, signs, grid_index, sign_index, x, base):
-    result = i32(0)
-    for lane in range(8):
-        value = i32(nonlinear_lookup(grid, u32(grid_index) * u32(8) + u32(lane)))
-        sign = i32(nonlinear_lookup(signs, u32(sign_index) * u32(8) + u32(lane)))
-        result += value * sign * i32(x[base + lane])
-    return result
+    lane = iota(8, dtype=u32, axis="k")
+    value = nonlinear_lookup(grid, u32(grid_index) * u32(8) + lane)
+    sign = nonlinear_lookup(signs, u32(sign_index) * u32(8) + lane)
+    product = widen(value, i32) * widen(sign, i32) * widen(x[base + lane], i32)
+    return reduce(product, axis=0)
 
 
 def _grid8(grid, grid_index, x, base):
-    result = i32(0)
-    for lane in range(8):
-        value = i32(nonlinear_lookup(grid, u32(grid_index) * u32(8) + u32(lane)))
-        result += value * i32(x[base + lane])
-    return result
+    lane = iota(8, dtype=u32, axis="k")
+    value = nonlinear_lookup(grid, u32(grid_index) * u32(8) + lane)
+    product = widen(value, i32) * widen(x[base + lane], i32)
+    return reduce(product, axis=0)
 
 
 def vec_dot_q1_0_q8_0(
@@ -108,19 +104,11 @@ def vec_dot_q1_0_q8_0(
     with L.blocks(K, extent=128) as wb:
         w = admit(W[wb])
         subtotal = f32(0.0)
-        quarter = index(0)
         with L.subs(wb, extent=32) as xb:
             x = admit(X[xb])
-            integer = i32(0)
-            for byte in range(4):
-                bits = w.q[quarter * 4 + byte]
-                for lane in range(8):
-                    value = -i32(x.q[byte * 8 + lane])
-                    if ((u32(bits) >> u32(lane)) & u32(1)) != u32(0):
-                        value = i32(x.q[byte * 8 + lane])
-                    integer += value
+            centered = i8(w.q[xb]) * i8(2) - i8(1)
+            integer = contract(x.q, centered, over="k", acc=i32)
             subtotal += f32(x.d) * f32(integer)
-            quarter += index(1)
         result += f32(w.d) * subtotal
     return result
 
@@ -160,8 +148,7 @@ def vec_dot_q5_0_q8_0(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        lane = iota(32, dtype=u8, axis="k")
-        q = high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8))
+        q = u8(w.q) | (u8(w.qh) << u8(4))
         centered = i8(q) - i8(16)
         integer = contract(centered, x.q, over="k", acc=i32)
         result += (f32(w.d) * f32(x.d)) * f32(integer)
@@ -176,8 +163,7 @@ def vec_dot_q5_1_q8_1(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        lane = iota(32, dtype=u8, axis="k")
-        q = high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8))
+        q = u8(w.q) | (u8(w.qh) << u8(4))
         integer = contract(q, x.q, over="k", acc=i32)
         result += (f32(w.d) * f32(x.d)) * f32(integer) + f32(w.m) * f32(x.s)
     return result
@@ -206,16 +192,10 @@ def vec_dot_q2_k_q8_k(
         x = admit(X[kb])
         scaled = i32(0)
         minimum = i32(0)
-        for sub in range(16):
+        with L.subs(kb, extent=16) as sub:
             metadata = u32(w.scales[sub])
             minimum += i32(x.bsum[sub]) * i32(metadata >> u32(4))
-            partial = i32(0)
-            for lane in range(16):
-                j = sub * 16 + lane
-                within = j % 128
-                packed = w.q[(j // 128) * 32 + within % 32]
-                q = (u32(packed) >> u32((within // 32) * 2)) & u32(3)
-                partial += i32(x.q[j]) * i32(q)
+            partial = contract(x.q[sub], w.q[sub], over="k", acc=i32)
             scaled += i32(metadata & u32(15)) * partial
         result += f32(x.ds) * f32(w.d) * f32(scaled) - f32(x.ds) * f32(w.dmin) * f32(minimum)
     return result
@@ -319,69 +299,22 @@ def vec_dot_q5_k_q8_k(
     W: View[Q5_K, (K,)],
     X: View[Q8_K, (K,)],
 ):
-    lane0 = f32(0.0)
-    lane1 = f32(0.0)
-    lane2 = f32(0.0)
-    lane3 = f32(0.0)
-    lane4 = f32(0.0)
-    lane5 = f32(0.0)
-    lane6 = f32(0.0)
-    lane7 = f32(0.0)
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        integer = i32(0)
+        with L.subs(extent=32) as sub:
+            q = u8(w.q[sub]) | (u8(w.qh[sub]) << u8(4))
+            integer += contract(q, x.q[sub], over="k", acc=i32) * i32(w.sc[sub])
         minimum = i32(0)
-        acc0 = i32(0)
-        acc1 = i32(0)
-        acc2 = i32(0)
-        acc3 = i32(0)
-        acc4 = i32(0)
-        acc5 = i32(0)
-        acc6 = i32(0)
-        acc7 = i32(0)
         for sub in range(8):
-            minimum += (i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])) * i32(w.m[sub])
-            scale = i32(w.sc[sub])
-            for lane in range(32):
-                j = sub * 32 + lane
-                q = high_bit_plane(w.q[j], w.qh[j % 32], j // 32)
-                product = scale * q * i32(x.q[j])
-                which = lane % 8
-                if which == 0:
-                    acc0 += product
-                if which == 1:
-                    acc1 += product
-                if which == 2:
-                    acc2 += product
-                if which == 3:
-                    acc3 += product
-                if which == 4:
-                    acc4 += product
-                if which == 5:
-                    acc5 += product
-                if which == 6:
-                    acc6 += product
-                if which == 7:
-                    acc7 += product
-        scale = f32(w.d) * f32(x.ds)
-        lane0 += scale * f32(acc0)
-        lane1 += scale * f32(acc1)
-        lane2 += scale * f32(acc2)
-        lane3 += scale * f32(acc3)
-        lane4 += scale * f32(acc4)
-        lane5 += scale * f32(acc5)
-        lane6 += scale * f32(acc6)
-        lane7 += scale * f32(acc7)
-        result -= (f32(w.dmin) * f32(x.ds)) * f32(minimum)
-    result += lane0
-    result += lane1
-    result += lane2
-    result += lane3
-    result += lane4
-    result += lane5
-    result += lane6
-    result += lane7
+            minimum += i32(w.m[sub]) * (
+                i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])
+            )
+        result += f32(x.ds) * (
+            f32(w.d) * f32(integer) - f32(w.dmin) * f32(minimum)
+        )
     return result
 
 
@@ -811,15 +744,10 @@ def vec_dot_tq2_0_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        integer = i32(0)
-        for chunk in range(2):
-            for digit in range(4):
-                for lane in range(32):
-                    packed = w.q[chunk * 32 + lane]
-                    q = i32((u32(packed) >> u32(digit * 2)) & u32(3)) - i32(1)
-                    integer += i32(x.q[chunk * 128 + digit * 32 + lane]) * q
+        q = i8(w.q) - i8(1)
+        integer = contract(x.q, q, over="k", acc=i32)
         scale = f32(x.ds) * f32(w.d)
-        result += f32(integer) * scale
+        result += widen(integer, f32) * scale
     return result
 
 

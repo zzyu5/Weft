@@ -676,6 +676,7 @@ def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [Pure]> {
 def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout"> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_ConversionAttr:$conversion,
+                       OptionalAttr<WeftRISCV_AccessAttr>:$source_access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;

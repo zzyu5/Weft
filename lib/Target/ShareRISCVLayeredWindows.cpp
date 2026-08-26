@@ -27,11 +27,7 @@ struct LinearIndex {
 };
 
 std::optional<int64_t> constantIndex(mlir::Value value) {
-  llvm::APInt constant;
-  if (mlir::matchPattern(value, mlir::m_ConstantInt(&constant)) &&
-      constant.isSignedIntN(64))
-    return constant.getSExtValue();
-  return std::nullopt;
+  return riscv_internal::constantInt(value);
 }
 
 void decomposeIndex(mlir::Value value, int64_t coefficient,
@@ -84,24 +80,6 @@ bool sameTerms(const LinearIndex &lhs, const LinearIndex &rhs) {
       return false;
   }
   return true;
-}
-
-mlir::Value stripRepresentationConversions(
-    mlir::Value value,
-    llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions = nullptr) {
-  while (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
-    auto input = mlir::dyn_cast<riscv::ValueType>(conversion.getInput().getType());
-    auto result = mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
-    llvm::StringRef effect = conversion.getConversion().getEffect();
-    if (!input || !result || input.getShape() != result.getShape() ||
-        input.getAxisIds() != result.getAxisIds() ||
-        (effect != "pure" && effect != "read"))
-      break;
-    if (conversions)
-      conversions->push_back(conversion);
-    value = conversion.getInput();
-  }
-  return value;
 }
 
 bool isReadOnlyOrPure(mlir::Operation *operation) {
@@ -162,11 +140,13 @@ bool isLayerExtract(
     riscv::ExtractOp extract, riscv::FieldOp &field,
     riscv::PhysicalPointOp &point,
     llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions = nullptr) {
-  field = stripRepresentationConversions(extract.getInput(), conversions)
-              .getDefiningOp<riscv::FieldOp>();
+  mlir::Value source = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), conversions);
+  field = riscv_internal::sourceField(source);
   point = extract.getIndices().size() == 1
-              ? extract.getIndices().front().getDefiningOp<
-                    riscv::PhysicalPointOp>()
+              ? riscv_internal::stripRepresentationConversions(
+                    extract.getIndices().front())
+                    .getDefiningOp<riscv::PhysicalPointOp>()
               : riscv::PhysicalPointOp();
   auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
   auto input = field
@@ -185,6 +165,7 @@ bool isLayerExtract(
       result.getShape()[static_cast<size_t>(
           axis - result.getAxisIds().asArrayRef().begin())] ==
           extract.getAccess().getLayerSize();
+  llvm::StringRef validity = result.getLayout().getValidity();
   return domainSelectors == 1 &&
          extract.getAccess().getForm() == "indexed" &&
          extract.getAccess().getMapping() == "grouped_layered" &&
@@ -192,7 +173,25 @@ bool isLayerExtract(
              extract.getAccess().getLayerSize() * 2 &&
          result.getShape().size() == input.getShape().size() && hasLayerAxis &&
          result.getLayout().getCarrier() == "rvv" &&
-         result.getLayout().getValidity() == "full";
+         (validity == "full" || validity == "tail");
+}
+
+bool sameFieldEdge(riscv::FieldOp lhs, riscv::FieldOp rhs) {
+  if (!lhs || !rhs || lhs.getOwner() != rhs.getOwner() ||
+      lhs.getResult().getType() != rhs.getResult().getType() ||
+      lhs.getAccess() != rhs.getAccess())
+    return false;
+  riscv_internal::FieldFacts left = riscv_internal::fieldFacts(lhs);
+  riscv_internal::FieldFacts right = riscv_internal::fieldFacts(rhs);
+  return left.mapping == right.mapping &&
+         left.scalarPerRecord == right.scalarPerRecord &&
+         left.logicalRank == right.logicalRank &&
+         left.group == right.group && left.layer == right.layer &&
+         left.joinFields == right.joinFields &&
+         left.joinLowBits == right.joinLowBits &&
+         left.joinRole == right.joinRole && left.bitOffset == right.bitOffset &&
+         left.storageBits == right.storageBits &&
+         left.alignment == right.alignment && left.order == right.order;
 }
 
 class ShareRISCVLayeredWindowsPass
@@ -243,9 +242,12 @@ public:
                             &candidateConversions) ||
             candidate.getResult().getType() != first.getResult().getType() ||
             candidate.getAccess() != first.getAccess() ||
-            candidateField.getName() != firstField.getName() ||
-            candidateField.getOwner() != firstField.getOwner() ||
-            candidatePoint.getParent() != firstPoint.getParent())
+            !sameFieldEdge(candidateField, firstField) ||
+            candidatePoint.getParent() != firstPoint.getParent() ||
+            candidatePoint.getActive() != firstPoint.getActive() ||
+            candidatePoint.getPartition() != firstPoint.getPartition() ||
+            candidatePoint.getResult().getType() !=
+                firstPoint.getResult().getType())
           continue;
         LinearIndex candidateIndex;
         decomposeIndex(candidatePoint.getBase(), 1, candidateIndex);
@@ -265,6 +267,7 @@ public:
 
       auto firstType = mlir::cast<riscv::ValueType>(first.getResult().getType());
       const int64_t groups = firstType.getLayout().getRegisterGroups();
+      const bool tail = firstType.getLayout().getValidity() == "tail";
       rewriter.setInsertionPoint(first);
       auto shared = rewriter.create<riscv::RVVLayeredWindowOp>(
           first.getLoc(),
@@ -272,7 +275,8 @@ public:
           firstField.getResult(), firstPoint.getResult(), first.getAccess(),
           riscv_internal::leaf(rewriter, "rvv", "layered-window",
                                "rvv.layered-window", "rvv.layered-window", 0,
-                               groups * 2, groups));
+                               groups * 2, groups, 0, "none",
+                               tail ? "agnostic" : "exact"));
       if (auto origin = first->getAttr("source_origin"))
         shared->setAttr("source_origin", origin);
       shared->setAttr("canonical_op",

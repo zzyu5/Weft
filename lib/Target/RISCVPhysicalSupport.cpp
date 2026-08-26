@@ -720,6 +720,7 @@ riscv_internal::fieldFacts(riscv::FieldOp operation) {
   auto fieldShape =
       mlir::cast<mlir::DenseI64ArrayAttr>(declaration.getFieldShapes()[index]);
   result.scalarPerRecord = fieldShape.empty();
+  result.logicalRank = fieldShape.size();
   result.bitOffset = declaration.getFieldBitOffsets()[index];
   result.storageBits = declaration.getFieldStorageBits()[index];
   if (result.bitOffset % 8 == 0)
@@ -755,6 +756,104 @@ riscv_internal::fieldFacts(riscv::FieldOp operation) {
     result.order = layered.getAs<mlir::StringAttr>("order").getValue();
   }
   return result;
+}
+
+std::optional<int64_t> riscv_internal::constantInt(mlir::Value value) {
+  while (true) {
+    if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+      value = cast.getInput();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<mlir::arith::IndexCastOp>()) {
+      value = cast.getIn();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<mlir::arith::IndexCastUIOp>()) {
+      value = cast.getIn();
+      continue;
+    }
+    break;
+  }
+  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
+    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+      return integer.getInt();
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+      return integer.getInt();
+  return std::nullopt;
+}
+
+mlir::Value riscv_internal::stripRepresentationConversions(
+    mlir::Value value,
+    llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions) {
+  while (true) {
+    if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
+      auto input = mlir::dyn_cast<riscv::ValueType>(conversion.getInput().getType());
+      auto result = mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
+      llvm::StringRef effect = conversion.getConversion().getEffect();
+      if (!input || !result || input.getShape() != result.getShape() ||
+          input.getAxisIds() != result.getAxisIds() ||
+          (effect != "pure" && effect != "read"))
+        break;
+      if (conversions)
+        conversions->push_back(conversion);
+      value = conversion.getInput();
+      continue;
+    }
+    if (auto materialize =
+            value.getDefiningOp<riscv::RegisterMaterializeOp>()) {
+      value = materialize.getInput();
+      continue;
+    }
+    break;
+  }
+  return value;
+}
+
+riscv::FieldOp riscv_internal::sourceField(mlir::Value value) {
+  while (mlir::Operation *definition = value.getDefiningOp()) {
+    value = stripRepresentationConversions(value);
+    definition = value.getDefiningOp();
+    if (auto field = mlir::dyn_cast_or_null<riscv::FieldOp>(definition))
+      return field;
+    if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition)) {
+      value = extract.getInput();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+riscv::LoadOp riscv_internal::sourceLoad(mlir::Value value) {
+  while (mlir::Operation *definition = value.getDefiningOp()) {
+    value = stripRepresentationConversions(value);
+    definition = value.getDefiningOp();
+    if (auto load = mlir::dyn_cast_or_null<riscv::LoadOp>(definition))
+      return load;
+    if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition)) {
+      value = extract.getInput();
+      continue;
+    }
+    break;
+  }
+  return {};
+}
+
+riscv::AccessAttr riscv_internal::accessOf(mlir::Value value) {
+  while (mlir::Operation *definition = value.getDefiningOp()) {
+    if (auto access = definition->getAttrOfType<riscv::AccessAttr>("access"))
+      if (!(access.getForm() == "local" && access.getMapping() == "dense"))
+        return access;
+    value = stripRepresentationConversions(value);
+    definition = value.getDefiningOp();
+    if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition)) {
+      value = extract.getInput();
+      continue;
+    }
+    break;
+  }
+  return {};
 }
 
 void riscv_internal::copyOrigin(mlir::Operation *source,

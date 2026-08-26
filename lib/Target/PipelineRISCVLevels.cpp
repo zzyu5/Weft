@@ -34,6 +34,21 @@ std::optional<int64_t> orderOf(mlir::Operation *operation) {
   return order.getInt();
 }
 
+bool recursivelyUses(mlir::Operation *operation, mlir::Value value) {
+  bool found = false;
+  operation->walk([&](mlir::Operation *nested) {
+    if (!found && llvm::is_contained(nested->getOperands(), value))
+      found = true;
+  });
+  return found;
+}
+
+mlir::Operation *bodyOwner(mlir::Operation *operation, mlir::Block *body) {
+  while (operation && operation->getBlock() != body)
+    operation = operation->getParentOp();
+  return operation;
+}
+
 mlir::Operation *cloneScheduled(mlir::IRRewriter &rewriter,
                                 mlir::Operation *source,
                                 mlir::IRMapping &mapping) {
@@ -139,16 +154,15 @@ public:
                                                     stageOne.end());
       bool needsBufferedIV = false;
       for (mlir::Operation *operation : stageOne)
-        needsBufferedIV |= llvm::is_contained(operation->getOperands(),
-                                              loop.getInductionVar());
+        needsBufferedIV |= recursivelyUses(operation, loop.getInductionVar());
       llvm::SmallVector<mlir::Value> crossStageValues;
       llvm::DenseSet<mlir::Value> seenCrossStage;
       for (mlir::Operation *operation : stageZero)
         for (mlir::Value result : operation->getResults()) {
           bool crosses = false;
           for (mlir::OpOperand &use : result.getUses())
-            if (use.getOwner() == yield.getOperation() ||
-                stageOneSet.contains(use.getOwner())) {
+            if (mlir::Operation *owner = bodyOwner(use.getOwner(), body);
+                owner == yield.getOperation() || stageOneSet.contains(owner)) {
               crosses = true;
               break;
             }

@@ -8,15 +8,6 @@ def extract_bits(value, shift, width: int = 1):
     return (u32(value) >> u32(shift)) & u32(mask)
 
 
-def high_bit_plane(low, plane, position, bit: int = 4):
-    return i32(low) | i32(extract_bits(plane, position, 1) << u32(bit))
-
-
-def high_bit_plane_u8(low, plane, position, bit: int = 4):
-    high = (u8(plane) >> u8(position)) & u8(1)
-    return u8(low) | (high << u8(bit))
-
-
 def signed_scale(raw, zero: int = 0):
     return i32(raw) - i32(zero)
 

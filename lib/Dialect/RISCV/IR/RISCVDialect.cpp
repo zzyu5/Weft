@@ -1702,8 +1702,13 @@ mlir::LogicalResult Fold2Op::verify() {
       (getAccess().getForm() != "unassigned" &&
        (getAccess().getMapping() != "natural" ||
         getAccess().getBitOffset() % 8)))
-    return emitOpError(
-        "physical fold2 requires a closed natural-field to RVV realization");
+    return emitOpError()
+           << "physical fold2 requires a closed natural-field to RVV realization"
+           << " (input=" << input.getLayout().getCarrier()
+           << ", result=" << result.getLayout().getCarrier()
+           << ", access=" << getAccess().getForm() << "/"
+           << getAccess().getMapping() << ", bit_offset="
+           << getAccess().getBitOffset() << ")";
   return verifyLeafOperation(*this);
 }
 
@@ -1888,6 +1893,15 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
       kind == "rvv_to_fragment" || kind == "fragment_to_rvv")
     return emitOpError() << "convert_layout kind '" << kind
                          << "' does not match " << source << " -> " << target;
+  if (auto access = (*this)->getAttrOfType<AccessAttr>("source_access")) {
+    if (effect != "pure" && effect != "read")
+      return emitOpError(
+          "source_access is only legal on a read-only representation conversion");
+    if (access.getForm() != "unit" && access.getForm() != "strided" &&
+        access.getForm() != "indexed" && access.getForm() != "segment")
+      return emitOpError(
+          "source_access must name one exact target memory form");
+  }
   if (getLeaf().getEngine() != "unselected") {
     llvm::StringRef expected =
         kind == "splat"          ? "rvv.splat"
@@ -2224,49 +2238,94 @@ mlir::LogicalResult RVVBitplaneMergeOp::verify() {
   auto lowElement = mlir::dyn_cast<mlir::IntegerType>(low.getElementType());
   auto planeElement =
       mlir::dyn_cast<mlir::IntegerType>(plane.getElementType());
-  if (!lowElement || !planeElement || lowElement.isSigned() ||
-      planeElement.isSigned() || lowElement.getWidth() != 8 ||
-      planeElement.getWidth() != 8 || low != result ||
-      low.getLayout().getCarrier() != "rvv" ||
-      plane.getLayout().getCarrier() != "local" || getInsertBit() <= 0 ||
+  auto field = getPlane().getDefiningOp<FieldOp>();
+  const bool logicalPlane =
+      planeElement && !planeElement.isSigned() && planeElement.getWidth() == 1 &&
+      plane.getShape() == low.getShape() && plane.getAxisIds() == low.getAxisIds() &&
+      field && field.getAccess().getForm() == "indexed" &&
+      field.getAccess().getMapping() == "grouped_layered" &&
+      field.getAccess().getGroupSize() == 8 &&
+      field.getAccess().getLayerSize() == 1;
+  const bool bytePlane =
+      planeElement && !planeElement.isSigned() && planeElement.getWidth() == 8 &&
+      plane.getLayout().getCarrier() == "local";
+  if (!lowElement || lowElement.isSigned() || lowElement.getWidth() != 8 ||
+      (!logicalPlane && !bytePlane) || low != result ||
+      low.getLayout().getCarrier() != "rvv" || getInsertBit() <= 0 ||
       getInsertBit() >= 8)
     return emitOpError(
-        "RVV bitplane merge requires one unsigned-eight-bit RVV value and one local byte plane");
+        "RVV bitplane merge requires one unsigned-eight-bit RVV value and one typed logical-bit or local-byte plane");
   if (low.getShape().size() != plane.getShape().size() ||
       low.getAxisIds() != plane.getAxisIds())
     return emitOpError(
         "RVV bitplane merge requires matching logical axes for values and storage plane");
   int64_t bitplaneAxes = 0;
   int64_t bitplaneAxis = 0;
-  for (auto [axis, lowExtent, planeExtent] :
-       llvm::zip(low.getAxisIds().asArrayRef(), low.getShape().asArrayRef(),
-                 plane.getShape().asArrayRef())) {
-    if (lowExtent == planeExtent)
-      continue;
-    if (planeExtent <= 0 || lowExtent != planeExtent * 8)
-      return emitOpError(
-          "RVV bitplane merge plane must pack exactly eight logical values per byte");
-    ++bitplaneAxes;
-    bitplaneAxis = axis;
+  if (bytePlane) {
+    for (auto [axis, lowExtent, planeExtent] :
+         llvm::zip(low.getAxisIds().asArrayRef(), low.getShape().asArrayRef(),
+                   plane.getShape().asArrayRef())) {
+      if (lowExtent == planeExtent)
+        continue;
+      if (planeExtent <= 0 || lowExtent != planeExtent * 8)
+        return emitOpError(
+            "RVV bitplane merge plane must pack exactly eight logical values per byte");
+      ++bitplaneAxes;
+      bitplaneAxis = axis;
+    }
+    if (bitplaneAxes != 1)
+      return emitOpError("RVV bitplane merge requires one byte-packed logical axis");
   }
-  if (bitplaneAxes != 1 || low.getLayout().getVl() <= 0 ||
-      low.getLayout().getVl() % 8)
-    return emitOpError(
-        "RVV bitplane merge requires one byte-packed lane axis and byte-aligned RVV parts");
+  int64_t laneAxis = 0;
+  int64_t laneAxes = 0;
   for (auto [axis, lane] :
        llvm::zip(low.getLayout().getAxisIds().asArrayRef(),
                  low.getLayout().getLaneFactors().asArrayRef()))
-    if ((axis == bitplaneAxis && lane <= 1) ||
-        (axis != bitplaneAxis && lane != 1))
+    if (lane > 1) {
+      laneAxis = axis;
+      ++laneAxes;
+    }
+  if (logicalPlane) {
+    if (laneAxes != 1)
       return emitOpError(
-          "RVV bitplane merge SIMD lanes must belong to the packed bit axis");
-  auto field = getPlane().getDefiningOp<FieldOp>();
-  if (!field || field.getAccess().getMapping() != "natural" ||
+          "RVV logical bitplane merge must map one encoded logical axis to lanes");
+    bitplaneAxis = laneAxis;
+  }
+  auto packed = llvm::find(low.getAxisIds().asArrayRef(), bitplaneAxis);
+  const size_t packedPosition = static_cast<size_t>(
+      packed - low.getAxisIds().asArrayRef().begin());
+  const bool laneMask =
+      getLeaf().getInstruction() == "rvv.bitplane-merge.mask" &&
+      laneAxes == 1 && laneAxis == bitplaneAxis &&
+      low.getLayout().getVl() > 0 && low.getLayout().getVl() % 8 == 0;
+  const bool stridedByte =
+      getLeaf().getInstruction() == "rvv.bitplane-merge.strided" &&
+      laneAxes == 1 && laneAxis != bitplaneAxis &&
+      packed != low.getAxisIds().asArrayRef().end() &&
+      low.getLayout().getLaneFactors()[packedPosition] == 1 &&
+      low.getLayout().getReplicaFactors()[packedPosition] == 1 &&
+      low.getLayout().getFragmentFactors()[packedPosition] == 1 &&
+      low.getLayout().getLocalFactors()[packedPosition] == 1 &&
+      low.getLayout().getTimeFactors()[packedPosition] ==
+          low.getShape()[packedPosition];
+  bool otherTime = false;
+  for (auto [axis, time] :
+       llvm::zip(low.getAxisIds().asArrayRef(),
+                 low.getLayout().getTimeFactors().asArrayRef()))
+    otherTime |= axis != bitplaneAxis && time != 1;
+  if (!laneMask && !(stridedByte && !otherTime))
+    return emitOpError(
+        "RVV bitplane merge layout does not match its selected lane-mask or strided-byte realization");
+  if (!field ||
+      ((!logicalPlane && field.getAccess().getMapping() != "natural") ||
+       (logicalPlane && field.getAccess().getMapping() != "grouped_layered")) ||
       field.getAccess().getBitOffset() % 8)
     return emitOpError(
-        "RVV bitplane merge requires one byte-aligned natural encoded field");
-  if (!exactLeaf(getLeaf(), "rvv", "bitplane-merge",
-                 "rvv.bitplane-merge", "none", "agnostic") ||
+        "RVV bitplane merge requires one byte-aligned encoded bitplane field");
+  if ((!exactLeaf(getLeaf(), "rvv", "bitplane-merge",
+                  "rvv.bitplane-merge.mask", "none", "agnostic") &&
+       !exactLeaf(getLeaf(), "rvv", "bitplane-merge",
+                  "rvv.bitplane-merge.strided", "none", "agnostic")) ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>({static_cast<int64_t>(getInsertBit())}) ||
       getLeaf().getLocalBytes() != 0)
@@ -2611,11 +2670,13 @@ mlir::LogicalResult RVVLayeredWindowOp::verify() {
                        ? physicalPoint.getPartition().getDefiningOp<
                              mlir::arith::ConstantIndexOp>()
                        : mlir::arith::ConstantIndexOp();
+  llvm::StringRef validity = first.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
   if (!element || element.isSigned() || field.getShape().size() != first.getShape().size() ||
       first != second || first.getElementType() != field.getElementType() ||
       first.getAxisIds() != field.getAxisIds() || !hasLayerAxis ||
       first.getLayout().getCarrier() != "rvv" ||
-      first.getLayout().getValidity() != "full" ||
+      (validity != "full" && validity != "tail") ||
       getAccess().getForm() != "indexed" ||
       getAccess().getMapping() != "grouped_layered" || group <= 0 ||
       layer <= 0 || group != layer * 2 || element.getWidth() * 2 > 8 ||
@@ -2623,10 +2684,10 @@ mlir::LogicalResult RVVLayeredWindowOp::verify() {
        getAccess().getOrder() != "hi_first") ||
       !partition || partition.value() != layer ||
       !exactLeaf(getLeaf(), "rvv", "layered-window", "rvv.layered-window",
-                 "none", "exact"))
+                 "none", tail))
     return emitOpError(
-        "RVV layered window requires two equal full-vector layer results, one "
-        "two-layer packed field, and an exact layer-sized point");
+        "RVV layered window requires two equal full/tail layer results, one "
+        "two-layer packed field, and an identical exact layer-sized point");
   return mlir::success();
 }
 

@@ -105,12 +105,21 @@ else
     runtime_kernel_define=-DWEFT_Q4_STAGED=1
     kernel=production_mul_mat_q4_k_staged
     meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
-    physical=(--auto-unroll=4 --auto-pipeline-depth=2)
+    physical=(--auto-unroll=4 --auto-pipeline-depth=1)
   elif [[ ${format} == iq2_xxs_staged ]]; then
     runtime_kernel_define=-DWEFT_IQ2_XXS_STAGED=1
     kernel=production_mul_mat_iq2_xxs_staged
     meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+  elif [[ ${format} == q1_0 ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_q1_0_decode
+      runtime_kernel_define=-DWEFT_Q10_DECODE=1
+    else
+      kernel=production_mul_mat_q1_0
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
   elif [[ ${format} == q4_0 ]]; then
     if [[ ${phase} == decode ]]; then
       physical=(--auto-unroll=1 --auto-pipeline-depth=1)
@@ -129,6 +138,55 @@ else
     else
       kernel=production_mul_mat_q5_0
       meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
+    fi
+  elif [[ ${format} == q5_1 ]]; then
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q5_1_decode
+      runtime_kernel_define=-DWEFT_Q51_DECODE=1
+    else
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q5_1
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == q8_0 ]]; then
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q8_0_decode
+      runtime_kernel_define=-DWEFT_Q80_DECODE=1
+    else
+      physical=(--auto-unroll=1 --auto-pipeline-depth=2)
+      kernel=production_mul_mat_q8_0
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == tq2_0 ]]; then
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_tq2_0_decode
+      runtime_kernel_define=-DWEFT_TQ20_DECODE=1
+    else
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_tq2_0
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == q2_k ]]; then
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q2_k_decode
+      runtime_kernel_define=-DWEFT_Q2K_DECODE=1
+    else
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q2_k
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == q5_k ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_q5_k_decode
+      runtime_kernel_define=-DWEFT_Q5K_DECODE=1
+    else
+      kernel=production_mul_mat_q5_k
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
     fi
   elif [[ ${format} == q4_1 ]]; then
     if [[ ${phase} == decode ]]; then

@@ -15,6 +15,8 @@ from weft.language import (
     layered,
     lo_first,
     static,
+    u1,
+    u2,
     u4,
     u6,
     u8,
@@ -27,7 +29,7 @@ class Q1_0:
     layout = bitorder.lsb_first, byteorder.little
     elements = 128
     d: f16
-    q: u8[16]
+    q: u1[128] @ grouped(8) @ layered(1, lo_first)
 
 
 @weft.encoding
@@ -53,7 +55,7 @@ class Q5_0:
     layout = bitorder.lsb_first, byteorder.little
     elements = 32
     d: f16
-    qh: u8[4]
+    qh: u1[32] @ grouped(8) @ layered(1, lo_first)
     q: u4[32] @ grouped(32) @ layered(16, lo_first)
 
 
@@ -63,7 +65,7 @@ class Q5_1:
     elements = 32
     d: f16
     m: f16
-    qh: u8[4]
+    qh: u1[32] @ grouped(8) @ layered(1, lo_first)
     q: u4[32] @ grouped(32) @ layered(16, lo_first)
 
 
@@ -81,7 +83,7 @@ class Q2_K:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
     scales: u8[16]
-    q: u8[64]
+    q: u2[256] @ grouped(128) @ layered(32, lo_first)
     d: f16
     dmin: f16
 
@@ -116,7 +118,7 @@ class Q5_K:
     dmin: f16
     sc: u6[8] @ joined(4, 2, 4, lo_first)
     m: u6[8] @ joined(4, 2, 4, lo_first)
-    qh: u8[32]
+    qh: u1[256] @ grouped(256) @ layered(32, lo_first)
     q: u4[256] @ grouped(64) @ layered(32, lo_first)
 
 
@@ -225,7 +227,7 @@ class TQ1_0:
 class TQ2_0:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
-    q: u8[64]
+    q: u2[256] @ grouped(128) @ layered(32, lo_first)
     d: f16
 
 

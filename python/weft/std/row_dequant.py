@@ -53,8 +53,6 @@ from .quant_fragments import (
     extract_bits,
     grid_delta,
     grid_sign,
-    high_bit_plane,
-    high_bit_plane_u8,
     nonlinear_lookup,
     radix3_digit,
     signed_scale,
@@ -65,9 +63,7 @@ from .quant_fragments import (
 def dequantize_q1_0(W: View[Q1_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=128) as kb:
         w = admit(W[kb])
-        lane = iota(128, dtype=u8, axis="k")
-        bit = extract_bits(w.q[lane // u8(8)], lane % u8(8))
-        q = i32(bit) * i32(2) - i32(1)
+        q = i32(i8(w.q) * i8(2) - i8(1))
         commit(ternary_radix(q, w.d), Y[kb])
 
 
@@ -86,16 +82,14 @@ def dequantize_q4_1(W: View[Q4_1, (K,)], Y: View[f32, (K,)]):
 def dequantize_q5_0(W: View[Q5_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
-        lane = iota(32, dtype=u8, axis="k")
-        q = i32(high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8))) - i32(16)
+        q = i32(u8(w.q) | (u8(w.qh) << u8(4))) - i32(16)
         commit(symmetric_integer(q, w.d), Y[kb])
 
 
 def dequantize_q5_1(W: View[Q5_1, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
-        lane = iota(32, dtype=u8, axis="k")
-        q = i32(high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8)))
+        q = i32(u8(w.q) | (u8(w.qh) << u8(4)))
         commit(min_affine(q, w.d, w.m), Y[kb])
 
 
@@ -108,14 +102,14 @@ def dequantize_q8_0(W: View[Q8_0, (K,)], Y: View[f32, (K,)]):
 def dequantize_q2_k(W: View[Q2_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            within = j % 128
-            packed = w.q[(j // 128) * 32 + (within % 32)]
-            q = extract_bits(packed, (within // 32) * 2, 2)
-            metadata = w.scales[j // 16]
+        with L.subs(kb, extent=16) as sub:
+            metadata = w.scales[sub]
             scale = extract_bits(metadata, 0, 4)
             minimum = extract_bits(metadata, 4, 4)
-            commit(k_superblock(q, scale, w.d, minimum, w.dmin), Y[kb][j])
+            commit(
+                k_superblock(w.q[sub], scale, w.d, minimum, w.dmin),
+                Y[kb][sub],
+            )
 
 
 def dequantize_q3_k(W: View[Q3_K, (K,)], Y: View[f32, (K,)]):
@@ -161,10 +155,12 @@ def dequantize_q4_k(W: View[Q4_K, (K,)], Y: View[f32, (K,)]):
 def dequantize_q5_k(W: View[Q5_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            q = high_bit_plane(w.q[j], w.qh[j % 32], j // 32)
-            sub = j // 32
-            commit(k_superblock(q, w.sc[sub], w.d, w.m[sub], w.dmin), Y[kb][j])
+        with L.subs(kb, extent=32) as sub:
+            q = i32(w.q[sub]) | (i32(w.qh[sub]) << u32(4))
+            commit(
+                k_superblock(q, w.sc[sub], w.d, w.m[sub], w.dmin),
+                Y[kb][sub],
+            )
 
 
 def dequantize_q6_k(W: View[Q6_K, (K,)], Y: View[f32, (K,)]):
@@ -408,11 +404,8 @@ def dequantize_iq4_nl(
 def dequantize_tq2_0(W: View[TQ2_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            within = j % 128
-            packed = w.q[(j // 128) * 32 + within % 32]
-            q = i32(extract_bits(packed, (within // 32) * 2, 2)) - i32(1)
-            commit(ternary_radix(q, w.d), Y[kb][j])
+        q = i32(i8(w.q) - i8(1))
+        commit(ternary_radix(q, w.d), Y[kb])
 
 
 def dequantize_mxfp4(

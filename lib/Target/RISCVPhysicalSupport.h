@@ -8,6 +8,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <optional>
 #include <string>
@@ -17,6 +18,7 @@ namespace weft::riscv_internal {
 struct FieldFacts {
   llvm::StringRef mapping = "opaque";
   bool scalarPerRecord = false;
+  int64_t logicalRank = 0;
   int64_t group = 0;
   int64_t layer = 0;
   int64_t joinFields = 0;
@@ -99,6 +101,14 @@ llvm::StringRef baseEncodingFamily(mlir::Operation *operation,
 int64_t interleaveRows(mlir::Operation *operation,
                        kernel::EncodingType encoding);
 FieldFacts fieldFacts(riscv::FieldOp operation);
+
+std::optional<int64_t> constantInt(mlir::Value value);
+mlir::Value stripRepresentationConversions(
+    mlir::Value value,
+    llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions = nullptr);
+riscv::FieldOp sourceField(mlir::Value value);
+riscv::LoadOp sourceLoad(mlir::Value value);
+riscv::AccessAttr accessOf(mlir::Value value);
 
 void copyOrigin(mlir::Operation *source, mlir::Operation *target);
 

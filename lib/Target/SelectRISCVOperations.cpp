@@ -282,6 +282,7 @@ private:
                  : riscv::ImplementationAttr();
     auto selectContract = [&](mlir::Value lhs, mlir::Value rhs,
                               mlir::Type result, bool permitIME,
+                              bool permitWidenDot,
                               llvm::ArrayRef<int64_t> over)
         -> riscv::ImplementationAttr {
       if (permitIME)
@@ -310,7 +311,7 @@ private:
       // its reduction axis can anchor the operand layouts.  The concrete
       // doubled-LMUL legality is checked after those layouts exist, when the
       // composite is lowered.
-      if (lhsInteger && rhsInteger && resultInteger &&
+      if (permitWidenDot && lhsInteger && rhsInteger && resultInteger &&
           lhsInteger.getWidth() <= 16 && rhsInteger.getWidth() <= 16 &&
           std::max<unsigned>(8, lhsInteger.getWidth()) ==
               std::max<unsigned>(8, rhsInteger.getWidth()) &&
@@ -338,13 +339,13 @@ private:
     };
     if (auto op = mlir::dyn_cast<riscv::DotOp>(operation))
       return selectContract(op.getLhs(), op.getRhs(), op.getResult().getType(),
-                            false, op.getOver());
+                            false, true, op.getOver());
     if (auto op = mlir::dyn_cast<riscv::ContractOp>(operation))
       return selectContract(op.getLhs(), op.getRhs(), op.getResult().getType(),
-                            true, op.getOver());
+                            true, true, op.getOver());
     if (auto op = mlir::dyn_cast<riscv::OuterContractOp>(operation))
       return selectContract(op.getLhs(), op.getRhs(), op.getResult().getType(),
-                            true, op.getOver());
+                            true, false, op.getOver());
     return {};
   }
 };

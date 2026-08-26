@@ -38,10 +38,49 @@ bool hasNestedRegion(mlir::Operation *operation) {
   return operation->getNumRegions() != 0;
 }
 
+bool isDefinedInside(mlir::Operation *container, mlir::Value value) {
+  if (mlir::Operation *definition = value.getDefiningOp())
+    return definition == container || container->isProperAncestor(definition);
+  auto argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+  mlir::Operation *parent = argument
+                                ? argument.getOwner()->getParentOp()
+                                : nullptr;
+  return parent &&
+         (parent == container || container->isProperAncestor(parent));
+}
+
+void collectExternalOperands(mlir::Operation *operation,
+                             llvm::DenseSet<mlir::Value> &operands) {
+  operation->walk([&](mlir::Operation *nested) {
+    for (mlir::Value operand : nested->getOperands())
+      if (!isDefinedInside(operation, operand))
+        operands.insert(operand);
+  });
+}
+
+bool isClosedReadOnlyRegion(mlir::Operation *operation) {
+  if (!mlir::isa<mlir::scf::ForOp>(operation))
+    return false;
+  bool valid = true;
+  operation->walk([&](mlir::Operation *nested) {
+    if (!valid || nested == operation || mlir::isa<mlir::scf::YieldOp>(nested))
+      return;
+    if (hasNestedRegion(nested) && !mlir::isa<mlir::scf::ForOp>(nested)) {
+      valid = false;
+      return;
+    }
+    if (!hasNestedRegion(nested) && hasWriteOrUnknownEffect(nested))
+      valid = false;
+  });
+  return valid;
+}
+
 bool dependsOnStageOne(mlir::Operation *operation,
                        llvm::DenseSet<mlir::Operation *> &stageOne,
                        mlir::Block *body) {
-  for (mlir::Value operand : operation->getOperands()) {
+  llvm::DenseSet<mlir::Value> operands;
+  collectExternalOperands(operation, operands);
+  for (mlir::Value operand : operands) {
     if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(operand)) {
       if (argument.getOwner() == body && argument.getArgNumber() > 0)
         return true;
@@ -110,9 +149,10 @@ public:
       mlir::Block *body = loop.getBody();
       llvm::SmallVector<mlir::Operation *> operations;
       for (mlir::Operation &operation : body->without_terminator()) {
-        if (hasNestedRegion(&operation)) {
+        if (hasNestedRegion(&operation) &&
+            !isClosedReadOnlyRegion(&operation)) {
           operation.emitError(
-              "nested-region operation has no physical pipeline predication contract");
+              "nested-region operation is not a closed read-only physical pipeline stage unit");
           failed = true;
           operations.clear();
           break;

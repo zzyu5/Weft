@@ -20,6 +20,10 @@ using namespace weft;
 
 namespace {
 
+using riscv_internal::accessOf;
+using riscv_internal::sourceField;
+using riscv_internal::sourceLoad;
+
 int64_t product(mlir::DenseI64ArrayAttr values) {
   return riscv_internal::staticProduct(values.asArrayRef()).value_or(-1);
 }
@@ -49,33 +53,6 @@ bool supportsRVVLayout(riscv::TargetAttr target, riscv::LayoutAttr layout) {
                             layout.getLmulEighths());
 }
 
-riscv::AccessAttr accessOf(mlir::Value value) {
-  for (mlir::Operation *operation = value.getDefiningOp(); operation;) {
-    if (auto access = operation->getAttrOfType<riscv::AccessAttr>("access")) {
-      if (!(access.getForm() == "local" && access.getMapping() == "dense"))
-        return access;
-    }
-    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(operation)) {
-      value = extract.getInput();
-      operation = value.getDefiningOp();
-      continue;
-    }
-    if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation)) {
-      value = conversion.getInput();
-      operation = value.getDefiningOp();
-      continue;
-    }
-    if (auto materialize =
-            mlir::dyn_cast<riscv::RegisterMaterializeOp>(operation)) {
-      value = materialize.getInput();
-      operation = value.getDefiningOp();
-      continue;
-    }
-    break;
-  }
-  return {};
-}
-
 struct IntegerRange {
   int64_t minimum;
   int64_t maximum;
@@ -84,6 +61,9 @@ struct IntegerRange {
 std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) {
   if (depth > 8)
     return std::nullopt;
+  mlir::Value source = riscv_internal::stripRepresentationConversions(value);
+  if (source != value)
+    return integerRange(source, depth + 1);
   auto type = mlir::dyn_cast<mlir::IntegerType>(
       riscv_internal::logicalElement(value.getType()));
   if (!type || type.getWidth() == 0 || type.getWidth() >= 63)
@@ -214,14 +194,20 @@ private:
       if (stores.size() != 1)
         continue;
       riscv::StoreOp store = stores.front();
-      auto reduce = store.getValue().getDefiningOp<riscv::ReduceOp>();
-      auto widen = reduce ? reduce.getInput().getDefiningOp<riscv::WidenOp>()
-                          : riscv::WidenOp();
-      auto extract = widen ? widen.getInput().getDefiningOp<riscv::ExtractOp>()
-                           : riscv::ExtractOp();
+      auto reduce = riscv_internal::stripRepresentationConversions(store.getValue())
+                        .getDefiningOp<riscv::ReduceOp>();
+      auto widen =
+          reduce ? riscv_internal::stripRepresentationConversions(reduce.getInput())
+                       .getDefiningOp<riscv::WidenOp>()
+                 : riscv::WidenOp();
+      auto extract =
+          widen ? riscv_internal::stripRepresentationConversions(widen.getInput())
+                      .getDefiningOp<riscv::ExtractOp>()
+                : riscv::ExtractOp();
       auto point = extract && extract.getIndices().size() == 1
-                       ? extract.getIndices().front().getDefiningOp<
-                             riscv::PhysicalPointOp>()
+                       ? riscv_internal::stripRepresentationConversions(
+                             extract.getIndices().front())
+                             .getDefiningOp<riscv::PhysicalPointOp>()
                        : riscv::PhysicalPointOp();
       auto destinationSlice = store.getRegion().getDefiningOp<riscv::SliceOp>();
       auto destinationField = destinationSlice
@@ -321,7 +307,10 @@ private:
     getOperation().walk(
         [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
     for (riscv::ReduceOp reduce : reductions) {
-      auto widen = reduce.getInput().getDefiningOp<riscv::WidenOp>();
+      llvm::SmallVector<riscv::ConvertLayoutOp> bridges;
+      mlir::Value reduced = riscv_internal::stripRepresentationConversions(
+          reduce.getInput(), &bridges);
+      auto widen = reduced.getDefiningOp<riscv::WidenOp>();
       auto input = widen
                        ? mlir::dyn_cast<riscv::ValueType>(widen.getInput().getType())
                        : riscv::ValueType();
@@ -352,6 +341,9 @@ private:
       copyIdentity(reduce, folded);
       reduce.getResult().replaceAllUsesWith(folded.getResult());
       rewriter.eraseOp(reduce);
+      for (riscv::ConvertLayoutOp bridge : llvm::reverse(bridges))
+        if (bridge.getResult().use_empty())
+          rewriter.eraseOp(bridge);
       if (widen.getResult().use_empty())
         rewriter.eraseOp(widen);
     }
@@ -412,10 +404,8 @@ private:
                        reductions.front().getResult().getType();
           }))
         continue;
-      auto load = inputValue.getDefiningOp<riscv::LoadOp>();
-      if (!load || static_cast<size_t>(std::distance(inputValue.use_begin(),
-                                                     inputValue.use_end())) !=
-                       reductions.size())
+      auto load = sourceLoad(inputValue);
+      if (!load)
         continue;
       riscv::AccessAttr access = accessOf(inputValue);
       if (!access || (access.getForm() != "unit" &&
@@ -455,28 +445,24 @@ private:
       if (reduce.getKind() != "add" || !reduce.getResult().getType().isF32() ||
           mlir::isa<riscv::ValueType>(reduce.getResult().getType()))
         continue;
-      auto productOp = reduce.getInput().getDefiningOp<riscv::BinaryOp>();
-      if (!productOp || productOp.getKind() != "mul" ||
-          !productOp.getResult().hasOneUse())
+      auto productOp =
+          riscv_internal::stripRepresentationConversions(reduce.getInput())
+              .getDefiningOp<riscv::BinaryOp>();
+      if (!productOp || productOp.getKind() != "mul")
         continue;
-      auto lhsLoad = productOp.getLhs().getDefiningOp<riscv::LoadOp>();
-      auto rhsLoad = productOp.getRhs().getDefiningOp<riscv::LoadOp>();
-      auto lhs = lhsLoad ? mlir::dyn_cast<riscv::ValueType>(
-                               lhsLoad.getResult().getType())
-                         : riscv::ValueType();
-      auto rhs = rhsLoad ? mlir::dyn_cast<riscv::ValueType>(
-                               rhsLoad.getResult().getType())
-                         : riscv::ValueType();
+      auto lhsLoad = sourceLoad(productOp.getLhs());
+      auto rhsLoad = sourceLoad(productOp.getRhs());
+      auto lhs = mlir::dyn_cast<riscv::ValueType>(productOp.getLhs().getType());
+      auto rhs = mlir::dyn_cast<riscv::ValueType>(productOp.getRhs().getType());
       if (!lhsLoad || !rhsLoad || !lhs || !rhs ||
-          !lhsLoad.getResult().hasOneUse() || !rhsLoad.getResult().hasOneUse() ||
           !lhs.getElementType().isF32() || !rhs.getElementType().isF32() ||
           lhs.getShape() != rhs.getShape() || lhs.getAxisIds() != rhs.getAxisIds() ||
           lhs.getLayout() != rhs.getLayout() || lhs.getShape().size() != 1 ||
           lhs.getLayout().getCarrier() != "rvv" ||
           reduce.getAxis() != 0)
         continue;
-      riscv::AccessAttr lhsAccess = accessOf(lhsLoad.getResult());
-      riscv::AccessAttr rhsAccess = accessOf(rhsLoad.getResult());
+      riscv::AccessAttr lhsAccess = accessOf(productOp.getLhs());
+      riscv::AccessAttr rhsAccess = accessOf(productOp.getRhs());
       if (!lhsAccess || !rhsAccess ||
           (lhsAccess.getForm() != "unit" && lhsAccess.getForm() != "strided") ||
           (rhsAccess.getForm() != "unit" && rhsAccess.getForm() != "strided") ||
@@ -755,46 +741,6 @@ private:
                                  axisAttr, layout);
   }
 
-  riscv::LoadOp sourceLoad(mlir::Value value) const {
-    while (mlir::Operation *definition = value.getDefiningOp()) {
-      if (auto load = mlir::dyn_cast<riscv::LoadOp>(definition))
-        return load;
-      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(definition)) {
-        value = conversion.getInput();
-        continue;
-      }
-      if (auto materialize =
-              mlir::dyn_cast<riscv::RegisterMaterializeOp>(definition)) {
-        value = materialize.getInput();
-        continue;
-      }
-      break;
-    }
-    return {};
-  }
-
-  riscv::FieldOp sourceField(mlir::Value value) const {
-    while (mlir::Operation *definition = value.getDefiningOp()) {
-      if (auto field = mlir::dyn_cast<riscv::FieldOp>(definition))
-        return field;
-      if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
-        value = extract.getInput();
-        continue;
-      }
-      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(definition)) {
-        value = conversion.getInput();
-        continue;
-      }
-      if (auto materialize =
-              mlir::dyn_cast<riscv::RegisterMaterializeOp>(definition)) {
-        value = materialize.getInput();
-        continue;
-      }
-      break;
-    }
-    return {};
-  }
-
   mlir::FailureOr<mlir::Value>
   projectLoadedOperand(mlir::IRRewriter &rewriter, mlir::Value value,
                        riscv::ValueType projectedType, mlir::Value index,
@@ -1001,7 +947,7 @@ private:
         continue;
       }
       if (operation.getPlacement() == "reload") {
-        if (auto load = operation.getInput().getDefiningOp<riscv::LoadOp>()) {
+        if (auto load = sourceLoad(operation.getInput())) {
           rewriter.setInsertionPoint(operation);
           auto staged = rewriter.create<riscv::StagedViewOp>(
               operation.getLoc(), load.getRegion().getType(), load.getRegion(),
@@ -1103,6 +1049,7 @@ private:
             operation.getLoc(), target, input,
             riscv_internal::layoutConversion(rewriter, source.getLayout(),
                                              target.getLayout()),
+            riscv::AccessAttr(),
             riscv_internal::unselectedLeaf(rewriter));
         copyIdentity(operation, conversion);
         input = conversion.getResult();
@@ -1122,13 +1069,14 @@ private:
     getOperation().walk(
         [&](riscv::ReduceOp operation) { reductions.push_back(operation); });
     for (riscv::ReduceOp reduce : reductions) {
-      auto widen = reduce.getInput().getDefiningOp<riscv::WidenOp>();
-      riscv::ConvertLayoutOp bridge;
+      auto widen =
+          riscv_internal::stripRepresentationConversions(reduce.getInput())
+              .getDefiningOp<riscv::WidenOp>();
+      llvm::SmallVector<riscv::ConvertLayoutOp> bridges;
       mlir::Value macValue = widen ? widen.getInput() : mlir::Value();
       if (macValue)
-        bridge = macValue.getDefiningOp<riscv::ConvertLayoutOp>();
-      if (bridge)
-        macValue = bridge.getInput();
+        macValue = riscv_internal::stripRepresentationConversions(macValue,
+                                                                  &bridges);
       auto mac = macValue ? macValue.getDefiningOp<riscv::MacGroupsOp>()
                           : riscv::MacGroupsOp();
       if (!widen || !mac)
@@ -1299,8 +1247,9 @@ private:
         }
         if (widen.getResult().use_empty())
           rewriter.eraseOp(widen);
-        if (bridge && bridge.getResult().use_empty())
-          rewriter.eraseOp(bridge);
+        for (riscv::ConvertLayoutOp conversion : llvm::reverse(bridges))
+          if (conversion.getResult().use_empty())
+            rewriter.eraseOp(conversion);
         if (mac.getResult().use_empty())
           rewriter.eraseOp(mac);
         continue;
@@ -1381,8 +1330,9 @@ private:
       }
       if (widen.getResult().use_empty())
         rewriter.eraseOp(widen);
-      if (bridge && bridge.getResult().use_empty())
-        rewriter.eraseOp(bridge);
+      for (riscv::ConvertLayoutOp conversion : llvm::reverse(bridges))
+        if (conversion.getResult().use_empty())
+          rewriter.eraseOp(conversion);
       if (mac.getResult().use_empty())
         rewriter.eraseOp(mac);
     }
@@ -1400,25 +1350,14 @@ private:
           implementation.getFamily() != "encoded-contract" ||
           implementation.getOperation() != "rvv.vmacc.decoded-u8-s8")
         continue;
-      mlir::Value lhsSource = dot.getLhs();
-      if (auto conversion = lhsSource.getDefiningOp<riscv::ConvertLayoutOp>())
-        lhsSource = conversion.getInput();
-      auto lhsField = lhsSource.getDefiningOp<riscv::FieldOp>();
-      mlir::Value rhsSource = dot.getRhs();
+      auto lhsField = sourceField(dot.getLhs());
       llvm::SmallVector<riscv::ConvertLayoutOp> rhsConversions;
-      while (auto conversion =
-                 rhsSource.getDefiningOp<riscv::ConvertLayoutOp>()) {
-        rhsConversions.push_back(conversion);
-        rhsSource = conversion.getInput();
-      }
+      mlir::Value rhsSource = riscv_internal::stripRepresentationConversions(
+          dot.getRhs(), &rhsConversions);
       auto rhsFold = rhsSource.getDefiningOp<riscv::Fold2Op>();
       mlir::Value rhsFieldValue = rhsFold ? rhsFold.getInput() : mlir::Value();
-      while (auto conversion =
-                 rhsFieldValue.getDefiningOp<riscv::ConvertLayoutOp>())
-        rhsFieldValue = conversion.getInput();
-      auto rhsField = rhsFieldValue
-                          ? rhsFieldValue.getDefiningOp<riscv::FieldOp>()
-                          : riscv::FieldOp();
+      auto rhsField = rhsFieldValue ? sourceField(rhsFieldValue)
+                                    : riscv::FieldOp();
       if (!lhsField || !rhsFold || !rhsField)
         continue;
       auto lhsType = mlir::cast<riscv::ValueType>(dot.getLhs().getType());
@@ -1460,6 +1399,7 @@ private:
                 riscv_internal::withLayout(lhs.getType(), desiredLhsLayout)),
             lhs, riscv_internal::layoutConversion(
                      rewriter, lhsType.getLayout(), desiredLhsLayout),
+            riscv::AccessAttr(),
             riscv_internal::unselectedLeaf(rewriter));
         lhs = conversion.getResult();
       }
@@ -1760,7 +1700,11 @@ private:
             (resultType && resultType.getLayout().getCarrier() != "scalar")) {
           operation->emitError(
               "selected RVV widening dot has no legal typed operands, scalar "
-              "free-axis result, or target widening shape");
+              "free-axis result, or target widening shape; lhs=")
+              << operation->getOperand(0).getType() << ", rhs="
+              << operation->getOperand(1).getType() << ", result="
+              << operation->getResult(0).getType() << ", over=" << over
+              << ", partial_lmul=" << partialLMUL << ", target=" << target;
           failed = true;
           continue;
         }
@@ -2086,7 +2030,7 @@ private:
       riscv::LayoutAttr resultLayout = resultType.getLayout();
       auto kernel = operation->getParentOfType<riscv::KernelOp>();
       auto laneType = mlir::dyn_cast<riscv::ValueType>(laneValue.getType());
-      auto encodedLaneField = laneValue.getDefiningOp<riscv::FieldOp>();
+      auto encodedLaneField = sourceField(laneValue);
       auto encodedLaneAccess = accessOf(laneValue);
       const bool projectEncodedLane =
           encodedLaneField && laneType && encodedLaneAccess &&
@@ -2095,9 +2039,8 @@ private:
           mlir::isa<mlir::IntegerType>(element);
       riscv::ValueType projectedLaneSeed;
       if (projectEncodedLane)
-        projectedLaneSeed = riscv::ValueType::get(
-            rewriter.getContext(), laneType.getElementType(),
-            resultType.getShape(), resultType.getAxisIds(), resultLayout);
+        projectedLaneSeed =
+            projectedReductionType(rewriter, laneType, reductionAxis);
       auto laneLoadLayout = laneType
                                 ? riscv_internal::projectLayout(
                                       rewriter,
@@ -2116,6 +2059,38 @@ private:
           rewriter.eraseOp(scalarZero);
         continue;
       }
+      riscv::AccessAttr projectedLaneAccess = encodedLaneAccess;
+      if (projectEncodedLane) {
+        riscv::LoadOp ownerLoad = sourceLoad(encodedLaneField.getOwner());
+        int64_t laneAxis = 0;
+        for (auto [axis, factor] :
+             llvm::zip(projectedLaneSeed.getAxisIds().asArrayRef(),
+                       laneLoadLayout.getLaneFactors().asArrayRef()))
+          if (factor > 1) {
+            laneAxis = axis;
+            break;
+          }
+        if (!ownerLoad || !laneAxis || laneAxis == reductionAxis) {
+          operation->emitError(
+              "encoded contract lane projection has no typed record-stride relation");
+          failed = true;
+          rewriter.eraseOp(reductionLoop);
+          if (zeroAccumulator)
+            rewriter.eraseOp(zeroAccumulator);
+          if (scalarZero)
+            rewriter.eraseOp(scalarZero);
+          continue;
+        }
+        auto memory = ownerLoad.getRegion().getType();
+        llvm::StringRef form = memory.getInterleaveRows() > 0 ? "unit" : "strided";
+        projectedLaneAccess = riscv::AccessAttr::get(
+            rewriter.getContext(), form, encodedLaneAccess.getMapping(),
+            encodedLaneAccess.getAlignment(), 0, 0,
+            encodedLaneAccess.getGroupSize(), encodedLaneAccess.getLayerSize(),
+            encodedLaneAccess.getJoinFields(), encodedLaneAccess.getJoinLowBits(),
+            encodedLaneAccess.getJoinRole(), encodedLaneAccess.getBitOffset(),
+            encodedLaneAccess.getStorageBits(), encodedLaneAccess.getOrder());
+      }
       mlir::Value lhs = operation->getOperand(0);
       mlir::Value rhs = operation->getOperand(1);
       if (!projectEncodedLane &&
@@ -2127,6 +2102,7 @@ private:
             operation->getLoc(), convertedType, laneValue,
             riscv_internal::layoutConversion(rewriter, laneType.getLayout(),
                                              laneLoadLayout),
+            riscv::AccessAttr(),
             riscv_internal::unselectedLeaf(rewriter));
         copyIdentity(operation, conversion);
         conversion->moveBefore(reductionLoop);
@@ -2251,26 +2227,44 @@ private:
             auto extract = rewriter.create<riscv::ExtractOp>(
                 operation->getLoc(), projectedType, laneValue,
                 mlir::ValueRange{index}, rewriter.getArrayAttr(selectors),
-                encodedLaneAccess,
+                projectedLaneAccess,
                 riscv_internal::leaf(
-                    rewriter, "transfer", "extract", "rvv.extract.indexed",
-                    "rvv.extract.indexed", 0,
+                    rewriter, "transfer", "extract",
+                    ("rvv.extract." + projectedLaneAccess.getForm()).str(),
+                    ("rvv.extract." + projectedLaneAccess.getForm()).str(), 0,
                     projectedType.getLayout().getRegisterGroups()));
             copyIdentity(operation, extract);
             mlir::Value projected = extract.getResult();
             unsigned sourceWidth =
                 std::max<unsigned>(8, sourceInteger.getWidth());
             unsigned factor = resultInteger.getWidth() / sourceWidth;
+            auto widenedSeed = riscv::ValueType::get(
+                rewriter.getContext(), resultInteger, projectedType.getShape(),
+                projectedType.getAxisIds(), projectedType.getLayout());
+            auto widenedLayout = riscv_internal::projectLayout(
+                rewriter, widenedSeed, resultLayout, kernel.getTarget());
+            if (!widenedLayout || widenedLayout.getCarrier() != "rvv" ||
+                resultInteger.getWidth() % sourceWidth ||
+                (factor != 2 && factor != 4 && factor != 8)) {
+              operation->emitError(
+                  "encoded contract lane projection has no legal widening representation");
+              failed = true;
+              contractFailed = true;
+              break;
+            }
             std::string instruction =
                 std::string(sourceInteger.isSigned() ? "rvv.sext.vf"
                                                      : "rvv.zext.vf") +
                 std::to_string(factor);
+            auto widenedType = riscv::ValueType::get(
+                rewriter.getContext(), resultInteger, projectedType.getShape(),
+                projectedType.getAxisIds(), widenedLayout);
             auto widened = rewriter.create<riscv::WidenOp>(
-                operation->getLoc(), resultType, projected,
+                operation->getLoc(), widenedType, projected,
                 riscv_internal::leaf(
                     rewriter, "rvv", "widen", instruction, instruction,
                     projectedType.getLayout().getRegisterGroups(),
-                    resultType.getLayout().getRegisterGroups()));
+                    widenedLayout.getRegisterGroups()));
             copyIdentity(operation, widened);
             if (laneOperand.getValue() == "rhs")
               stepRhs = widened.getResult();

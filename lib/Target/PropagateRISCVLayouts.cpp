@@ -173,8 +173,15 @@ Roles rolesFor(mlir::Value value) {
       if (roles.anchored)
         return roles;
     }
-    roles.local = true;
-    return roles;
+    const bool addressableField =
+        !value.use_empty() && llvm::all_of(value.getUsers(), [](mlir::Operation *user) {
+          return mlir::isa<riscv::ExtractOp, riscv::SliceOp,
+                           riscv::Fold2Op>(user);
+        });
+    if (addressableField) {
+      roles.local = true;
+      return roles;
+    }
   }
 
   if (auto state = value.getDefiningOp<riscv::NewOp>();
@@ -196,6 +203,15 @@ Roles rolesFor(mlir::Value value) {
     // not manufactured on the result.
     roles.anchored = true;
     addSmallReplicas(value, roles);
+    return roles;
+  }
+  if (value.getDefiningOp<riscv::Fold2Op>()) {
+    roles.anchored = true;
+    roles.fullLaneExtent = true;
+    auto axes = riscv_internal::logicalAxes(value.getType());
+    if (!axes.empty())
+      roles.laneAxis = axes.back();
+    addSmallReplicas(value, roles, roles.laneAxis);
     return roles;
   }
   if (auto operation = value.getDefiningOp<riscv::MacGroupsOp>()) {
@@ -463,7 +479,7 @@ bool pointwiseLike(mlir::Operation *operation) {
                    riscv::UpdateOp, riscv::MaterializeOp>(operation);
 }
 
-std::optional<int64_t> encodedLaneLimit(mlir::Value value) {
+std::optional<int64_t> encodedLaneLimit(mlir::Value value, int64_t laneAxis) {
   llvm::SmallPtrSet<mlir::Operation *, 8> visited;
   std::function<std::optional<int64_t>(mlir::Value)> visit =
       [&](mlir::Value current) -> std::optional<int64_t> {
@@ -472,7 +488,14 @@ std::optional<int64_t> encodedLaneLimit(mlir::Value value) {
       return std::nullopt;
     if (auto field = mlir::dyn_cast<riscv::FieldOp>(definition)) {
       riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
-      if (facts.mapping == "grouped_layered" && facts.layer > 0)
+      auto type = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+      if (!type || facts.logicalRank <= 0 ||
+          facts.logicalRank > static_cast<int64_t>(type.getAxisIds().size()))
+        return std::nullopt;
+      auto logicalFieldAxes = type.getAxisIds().asArrayRef().take_back(
+          static_cast<size_t>(facts.logicalRank));
+      if (facts.mapping == "grouped_layered" && facts.layer > 0 &&
+          llvm::is_contained(logicalFieldAxes, laneAxis))
         return facts.layer;
       return std::nullopt;
     }
@@ -489,6 +512,10 @@ std::optional<int64_t> encodedLaneLimit(mlir::Value value) {
         return std::nullopt;
       return visit(conversion.getInput());
     }
+    if (auto materialize = mlir::dyn_cast<riscv::MaterializeOp>(definition))
+      return visit(materialize.getInput());
+    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition))
+      return visit(extract.getInput());
     if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(definition))
       return visit(lookup.getIndices());
     // Storage-layer width constrains the raw field and representation-only
@@ -555,7 +582,7 @@ riscv::LayoutAttr registerGatherSourceLayout(mlir::Builder &builder,
 }
 
 bool isDenseLoadBacked(riscv::MaterializeOp materialize) {
-  auto load = materialize.getInput().getDefiningOp<riscv::LoadOp>();
+  auto load = riscv_internal::sourceLoad(materialize.getInput());
   if (!load)
     return false;
   auto encoding =
@@ -665,6 +692,21 @@ public:
           changed |= mergeRoles(roles[result], operand, roles[operand]);
         }
       });
+      getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
+        mlir::Value input = conversion.getInput();
+        mlir::Value result = conversion.getResult();
+        auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+        auto resultType = mlir::dyn_cast<riscv::ValueType>(result.getType());
+        llvm::StringRef effect = conversion.getConversion().getEffect();
+        if (!inputType || !resultType ||
+            inputType.getElementType() != resultType.getElementType() ||
+            inputType.getShape() != resultType.getShape() ||
+            inputType.getAxisIds() != resultType.getAxisIds() ||
+            (effect != "pure" && effect != "read"))
+          return;
+        changed |= mergeRoles(roles[input], result, roles[result]);
+        changed |= mergeRoles(roles[result], input, roles[input]);
+      });
       getOperation().walk([&](riscv::LoopOp loop) {
         auto yield = mlir::cast<riscv::YieldOp>(loop.getBody().front().getTerminator());
         for (auto [index, initial] : llvm::enumerate(loop.getCarried())) {
@@ -716,15 +758,6 @@ public:
       getOperation().walk([&](riscv::ReduceOp reduce) {
         mlir::Value input = reduce.getInput();
         mlir::Value result = reduce.getResult();
-        if (!mlir::isa<riscv::ValueType>(input.getType()) ||
-            !mlir::isa<riscv::ValueType>(result.getType()))
-          return;
-        changed |= mergeRoles(roles[input], result, roles[result]);
-        changed |= mergeRoles(roles[result], input, roles[input]);
-      });
-      getOperation().walk([&](riscv::Fold2Op fold) {
-        mlir::Value input = fold.getInput();
-        mlir::Value result = fold.getResult();
         if (!mlir::isa<riscv::ValueType>(input.getType()) ||
             !mlir::isa<riscv::ValueType>(result.getType()))
           return;
@@ -791,8 +824,9 @@ public:
           8, riscv_internal::logicalBitWidth(value.getType()));
       int64_t capacity = std::max<int64_t>(
           1, kernel.getTarget().getVlenBits() * lmulEighths / (8 * sew));
-      if (auto storageLimit = encodedLaneLimit(value))
-        capacity = std::min(capacity, *storageLimit);
+      if (!kernel.getTarget().getHasIndexedMemory())
+        if (auto storageLimit = encodedLaneLimit(value, axis))
+          capacity = std::min(capacity, *storageLimit);
       int64_t extent = riscv_internal::physicalExtent(value, axis);
       connectedLaneSpans[value] =
           extent > 0 ? std::min(extent, capacity) : capacity;
@@ -864,8 +898,9 @@ public:
     // width through the explicit materialize edge; do not manufacture or merge
     // either logical axis.
     getOperation().walk([&](riscv::LookupOp lookup) {
-      auto materialize =
-          lookup.getTable().getDefiningOp<riscv::MaterializeOp>();
+      auto materialize = riscv_internal::stripRepresentationConversions(
+                             lookup.getTable())
+                             .getDefiningOp<riscv::MaterializeOp>();
       auto table = mlir::dyn_cast<riscv::ValueType>(lookup.getTable().getType());
       auto indices =
           mlir::dyn_cast<riscv::ValueType>(lookup.getIndices().getType());
@@ -955,6 +990,7 @@ private:
         terminator->getLoc(), target, value,
         riscv_internal::layoutConversion(builder, source.getLayout(),
                                          target.getLayout()),
+        riscv::AccessAttr(),
         riscv_internal::unselectedLeaf(builder));
     terminator->setOperand(index, conversion.getResult());
     return mlir::success();
@@ -1036,6 +1072,7 @@ private:
           state.getLoc(), target, initial,
           riscv_internal::layoutConversion(builder, source.getLayout(),
                                            target.getLayout()),
+          riscv::AccessAttr(),
           riscv_internal::unselectedLeaf(builder));
       state.getInitialMutable().assign(conversion.getResult());
     }
@@ -1102,6 +1139,7 @@ private:
                 mlir::cast<riscv::ValueType>(operand.get().getType())
                     .getLayout(),
                 required),
+            riscv::AccessAttr(),
             riscv_internal::unselectedLeaf(builder));
         operand.set(conversion.getResult());
       }
@@ -1134,6 +1172,7 @@ private:
               riscv_internal::withLayout(input, required), extract.getInput(),
               riscv_internal::layoutConversion(builder, input.getLayout(),
                                                required),
+              riscv::AccessAttr(),
               riscv_internal::unselectedLeaf(builder));
           extract.getInputMutable().assign(conversion.getResult());
         }
@@ -1175,6 +1214,7 @@ private:
         auto conversion = builder.create<riscv::ConvertLayoutOp>(
             extract.getLoc(), requiredType, operand.get(),
             riscv_internal::layoutConversion(builder, source, required),
+            riscv::AccessAttr(),
             riscv_internal::unselectedLeaf(builder));
         operand.set(conversion.getResult());
       }

@@ -50,6 +50,45 @@ mlir::LogicalResult verifyAccessCapability(mlir::Operation *operation,
   return mlir::success();
 }
 
+bool laneTraversesRecords(riscv::FieldOp operation, mlir::Type physicalType) {
+  auto field = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+  auto physical = mlir::dyn_cast<riscv::ValueType>(physicalType);
+  riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(operation);
+  if (!field || !physical || physical.getLayout().getCarrier() != "rvv" ||
+      facts.logicalRank < 0 ||
+      facts.logicalRank > static_cast<int64_t>(field.getShape().size()))
+    return false;
+  int64_t laneAxis = 0;
+  for (auto [axis, factor] :
+       llvm::zip(physical.getAxisIds().asArrayRef(),
+                 physical.getLayout().getLaneFactors().asArrayRef()))
+    if (factor > 1) {
+      if (laneAxis)
+        return false;
+      laneAxis = axis;
+    }
+  if (!laneAxis)
+    return false;
+  const int64_t outerRank =
+      static_cast<int64_t>(field.getShape().size()) - facts.logicalRank;
+  return llvm::is_contained(
+      field.getAxisIds().asArrayRef().take_front(outerRank), laneAxis);
+}
+
+riscv::AccessAttr fieldAccess(mlir::Builder &builder,
+                              riscv::FieldOp operation,
+                              mlir::Type physicalType) {
+  riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(operation);
+  llvm::StringRef form = facts.mapping == "natural" ? "unit" : "indexed";
+  if ((facts.mapping == "natural" && facts.scalarPerRecord) ||
+      laneTraversesRecords(operation, physicalType))
+    form = "strided";
+  return makeAccess(builder, form, facts.mapping, facts.alignment, facts.group,
+                    facts.layer, facts.joinFields, facts.joinLowBits,
+                    facts.joinRole, facts.bitOffset, facts.storageBits,
+                    facts.order);
+}
+
 class PlanRISCVMemoryPass
     : public mlir::PassWrapper<PlanRISCVMemoryPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -113,29 +152,22 @@ public:
         failed = true;
         return;
       }
-      llvm::StringRef form = facts.mapping == "natural" ? "unit" : "indexed";
-      // A scalar field repeated once per encoded record is contiguous only
-      // within a record.  Vectorizing an outer logical axis therefore requires
-      // the record-byte stride selected from the owner descriptor.
-      if (facts.mapping == "natural" && facts.scalarPerRecord)
-        form = "strided";
+      auto access =
+          fieldAccess(builder, operation, operation.getResult().getType());
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
-      if (form == "indexed" && !target.getHasIndexedMemory()) {
+      if (access.getForm() == "indexed" && !target.getHasIndexedMemory()) {
         operation.emitError(
             "encoded field requires indexed memory unsupported by the target profile");
         failed = true;
         return;
       }
-      operation.setAccessAttr(makeAccess(
-          builder, form, facts.mapping, facts.alignment, facts.group, facts.layer,
-          facts.joinFields, facts.joinLowBits, facts.joinRole, facts.bitOffset,
-          facts.storageBits, facts.order));
+      operation.setAccessAttr(access);
       operation.setLeafAttr(transferLeaf(
           builder, "encoded-field", ("rvv.encoded." + facts.mapping).str()));
     });
     getOperation().walk([&](riscv::ExtractOp operation) {
       riscv::AccessAttr access;
-      auto field = operation.getInput().getDefiningOp<riscv::FieldOp>();
+      auto field = riscv_internal::sourceField(operation.getInput());
       auto inputLayout = riscv_internal::layoutOf(operation.getInput().getType());
       const bool gather = llvm::any_of(
           operation.getSelectors(), [](mlir::Attribute selector) {
@@ -185,6 +217,8 @@ public:
             return mlir::cast<mlir::StringAttr>(selector).getValue() == "gather";
           }))
         form = "indexed";
+      if (field && laneTraversesRecords(field, operation.getResult().getType()))
+        form = "strided";
       access = makeAccess(builder, form, access.getMapping(),
                           access.getAlignment(), access.getGroupSize(),
                           access.getLayerSize(), access.getJoinFields(),
@@ -199,8 +233,34 @@ public:
       operation.setLeafAttr(transferLeaf(
           builder, "extract", ("rvv.extract." + form).str()));
     });
+    getOperation().walk([&](riscv::ConvertLayoutOp operation) {
+      auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+      if (!result || result.getLayout().getCarrier() != "rvv")
+        return;
+
+      riscv::AccessAttr access;
+      mlir::Value source = riscv_internal::stripRepresentationConversions(
+          operation.getInput());
+      if (auto extract = source.getDefiningOp<riscv::ExtractOp>()) {
+        if (!riscv_internal::sourceField(extract.getInput()))
+          return;
+        access = extract.getAccess();
+      } else if (auto field = source.getDefiningOp<riscv::FieldOp>()) {
+        access = fieldAccess(builder, field, operation.getResult().getType());
+      } else {
+        return;
+      }
+      if (access.getForm() != "unit" && access.getForm() != "strided" &&
+          access.getForm() != "indexed" && access.getForm() != "segment")
+        return;
+      if (mlir::failed(verifyAccessCapability(operation, access))) {
+        failed = true;
+        return;
+      }
+      operation->setAttr("source_access", access);
+    });
     getOperation().walk([&](riscv::Fold2Op operation) {
-      auto field = operation.getInput().getDefiningOp<riscv::FieldOp>();
+      auto field = riscv_internal::sourceField(operation.getInput());
       if (!field || field.getAccess().getMapping() != "natural" ||
           field.getAccess().getBitOffset() % 8 ||
           riscv_internal::logicalBitWidth(operation.getInput().getType()) != 16) {
