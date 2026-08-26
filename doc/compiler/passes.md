@@ -10,17 +10,24 @@ module 外的 assignment 表，也不构成新的 IR 层。
 ConvertWeftToRISCV
 → SelectRISCVOperations
 → PropagateRISCVLayouts
+→ SelectRISCVOperations
 → PlanRISCVMemory
 → CanonicalizeRISCVLayouts
+→ FuseRISCVBitplanes
 → LowerRISCVComposites
+→ HoistRISCVLoopInvariants
+→ ScheduleRISCVLevels
 → PipelineRISCVLevels
+→ UnrollRISCVLevels
+→ ShareRISCVLayeredWindows
 → FinalizeRISCVLeaves
 → MaterializeRISCVResources
 → VerifyFinalRISCV
 ```
 
-该顺序是依赖关系，不是阶段标签。`LowerRISCVComposites` 必须先产生 window/step、
-fragment 和显式 reduction loop，pipeline 才有真实 cluster 可改写；exact leaf 完成后，
+该顺序是依赖关系，不是阶段标签。`LowerRISCVComposites` 必须先产生带 typed
+operation/effect 的显式 physical loop，`schedule` 才能从真实 use-def 分配 stage/order，
+`pipeline` 再只负责版本化 SSA 值并生成 prologue/steady-state/epilogue。exact leaf 完成后，
 resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
 
 ## 2. 各 pass 合同
@@ -49,6 +56,9 @@ form，也不写 exact intrinsic。没有合法局部结构时当前 module 失�
 validity 与 register groups。普通无特殊 anchor 的 shaped value使用 target 的固定规则：
 最内逻辑轴进入 lane；一元素表示保持 scalar。LMUL 是实现该 lane extent 的最小合法值，
 不是 emitter 默认值。
+当 encoded field 经过保持 shape/axis 的 conversion 或作为 lookup index 流向下游时，
+storage layer 宽度同样沿这条 use-def 链传播；target 不能因此把超过真实
+grouped/layered 宽度的逻辑 lane 伪装成一次 indexed load。
 
 pointwise、state 与 control handoff 的要求不一致时，pass 插入真实 `convert_layout`；
 `for/if/while` 的 carried/result types 同时被改写。无法保持 logical axes 或无合法 LMUL 时
@@ -64,7 +74,7 @@ composite lowering 中消费。
 
 ### `CanonicalizeRISCVLayouts`
 
-该 pass 只做已经实现的真实 rewrite：相邻逆 conversion 消除、单 use 纯 pointwise producer
+该 pass 只做已经实现的真实 rewrite：相邻 pure 逆 conversion 消除、单 use 纯 pointwise producer
 的 backward rematerialization，以及同一 block 内相同 conversion 的 SSA CSE。它不声称已经
 实现跨 block hoist/sink、全局 conversion algebra 或任意 producer rematerialization。
 
@@ -82,18 +92,28 @@ composite lowering 中消费。
 未知 conversion kind、缺失 reduction extent、缺失 access 或不闭合 fragment capability均明确
 失败。该 pass 不创建 source outer traversal、Level、workspace 或 persistent Encoding。
 
-### `PipelineRISCVLevels`
+### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 
-读取 `scf.for` 上的`weft.riscv.schedule` typed attribute并消费它。depth 1 删除已消费的
-schedule；当前可执行的
-depth 2 结构要求一个显式 load-window/compute-window cluster、两个window SSA版本和一个
-carried accumulator，pass 将其改写为真实的空迭代 guard、prologue、steady-state loop 和
-epilogue。当前cluster body必须恰好由一个window load和紧随其后的一个window step构成；
-它没有虚构两个`LocalType` buffer。
+`ScheduleRISCVLevels` 是 scheduler。它读取已 lowering 的 physical `scf.for`、SSA use-def、
+loop carry 和 operation effect，把与下一迭代无关的 pure/read producer 放在 stage 0，
+把依赖 carry 并生成 yield 的 consumer 放在 stage 1，并在具体 operation 上写入
+stage/order。它不通过 op 数量、相邻关系或 window family 命名 cluster。嵌套 region、write/
+unknown effect 目前没有 predication/ordering 合同，因此明确拒绝，不得重排。
 
-普通register-resident contract没有上述window cluster，因此depth > 1直接unsupported，不能
-静默改回depth 1。其它 cluster、multi-carry 或 depth > 2 尚没有实现时同样unsupported。仅有
-`pipeline_depth=2` attribute 而没有上述 rewrite 不算 pipeline。
+`PipelineRISCVLevels` 是 expander。depth 1 只消费 schedule；depth 2 消费 scheduler 写入的
+stage/order，为所有跨 stage SSA value 增加 loop-carried 版本，支持多个 source carries，
+并生成空迭代 guard、prologue、steady-state loop 和 epilogue。当前只实现距离一迭代、
+depth=2/buffer=2；嵌套 region predication、write effect、depth>2 和显式 local-storage ping-pong
+尚无合法 physical program 时直接 unsupported。仅设置 `pipeline_depth=2` 而没有
+dependency-derived producer/consumer cluster 仍会失败，不算 pipeline。
+
+### `ShareRISCVLayeredWindows`
+
+该 pass 读取 typed `grouped_layered` access geometry，并在 pure conversion、无中间
+write/unknown effect 的 `local_load` 与 integer index cast 之后，仍用 field owner、logical point
+与线性 byte-coordinate 关系证明两个
+layer 共享一个 RVV storage window。成功时它以真实 `rvv_layered_window` op 替换两个
+extract。当前仅对 full-validity layer 改写；tail cohort 没有证明安全时保持原程序。
 
 ### `FinalizeRISCVLeaves`
 

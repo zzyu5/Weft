@@ -65,10 +65,10 @@ from .quant_fragments import (
 def dequantize_q1_0(W: View[Q1_0, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=128) as kb:
         w = admit(W[kb])
-        for j in range(128):
-            bit = extract_bits(w.q[j // 8], j % 8)
-            q = i32(bit) * i32(2) - i32(1)
-            commit(ternary_radix(q, w.d), Y[kb][j])
+        lane = iota(128, dtype=u8, axis="k")
+        bit = extract_bits(w.q[lane // u8(8)], lane % u8(8))
+        q = i32(bit) * i32(2) - i32(1)
+        commit(ternary_radix(q, w.d), Y[kb])
 
 
 def dequantize_q4_0(W: View[Q4_0, (K,)], Y: View[f32, (K,)]):

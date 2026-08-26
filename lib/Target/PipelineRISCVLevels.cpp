@@ -7,44 +7,55 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <memory>
+#include <optional>
+#include <algorithm>
 
 using namespace weft;
 
 namespace {
 
-bool isWindowLoad(mlir::Operation *operation) {
-  return mlir::isa<riscv::RVVGroupedMacLoadOp,
-                   riscv::RVVEncodedDotLoadOp>(operation);
+constexpr llvm::StringLiteral kStageAttr = "weft.riscv.pipeline_stage";
+constexpr llvm::StringLiteral kOrderAttr = "weft.riscv.pipeline_order";
+
+std::optional<int64_t> stageOf(mlir::Operation *operation) {
+  auto stage = operation->getAttrOfType<mlir::IntegerAttr>(kStageAttr);
+  if (!stage)
+    return std::nullopt;
+  return stage.getInt();
 }
 
-bool isWindowStep(mlir::Operation *operation) {
-  return mlir::isa<riscv::RVVGroupedMacStepOp,
-                   riscv::RVVEncodedDotStepOp>(operation);
+std::optional<int64_t> orderOf(mlir::Operation *operation) {
+  auto order = operation->getAttrOfType<mlir::IntegerAttr>(kOrderAttr);
+  if (!order || order.getInt() < 0)
+    return std::nullopt;
+  return order.getInt();
 }
 
-mlir::Value windowIndex(mlir::Operation *operation) {
-  if (auto load = mlir::dyn_cast<riscv::RVVGroupedMacLoadOp>(operation))
-    return load.getGroupIndex();
-  if (auto load = mlir::dyn_cast<riscv::RVVEncodedDotLoadOp>(operation))
-    return load.getGroupIndex();
-  return {};
+mlir::Operation *cloneScheduled(mlir::IRRewriter &rewriter,
+                                mlir::Operation *source,
+                                mlir::IRMapping &mapping) {
+  mlir::Operation *clone = rewriter.clone(*source, mapping);
+  clone->removeAttr(kStageAttr);
+  clone->removeAttr(kOrderAttr);
+  return clone;
 }
 
-mlir::Value cloneLoad(mlir::IRRewriter &rewriter, mlir::Operation *source,
-                      mlir::Value index) {
-  mlir::IRMapping mapping;
-  mapping.map(windowIndex(source), index);
-  return rewriter.clone(*source, mapping)->getResult(0);
-}
-
-mlir::Value cloneStep(mlir::IRRewriter &rewriter, mlir::Operation *source,
-                      mlir::Value window, mlir::Value accumulator) {
-  mlir::IRMapping mapping;
-  mapping.map(source->getOperand(0), window);
-  mapping.map(source->getOperand(1), accumulator);
-  return rewriter.clone(*source, mapping)->getResult(0);
+void copyLoopAttrs(mlir::Operation *source, mlir::Operation *target,
+                   bool preserveLevelIdentity) {
+  for (mlir::NamedAttribute attribute : source->getAttrs())
+    if (attribute.getName() != "weft.riscv.schedule" &&
+        (preserveLevelIdentity || attribute.getName() != "weft.riscv.level"))
+      target->setAttr(attribute.getName(), attribute.getValue());
+  if (!preserveLevelIdentity &&
+      !target->hasAttr("weft.riscv.direction"))
+    if (auto level =
+            source->getAttrOfType<riscv::LevelAttr>("weft.riscv.level"))
+      target->setAttr("weft.riscv.direction",
+                      mlir::StringAttr::get(target->getContext(),
+                                            level.getDirection()));
 }
 
 class PipelineRISCVLevelsPass
@@ -55,17 +66,18 @@ public:
     return "weft-riscv-pipeline-levels";
   }
   llvm::StringRef getDescription() const override {
-    return "Materialize explicit prologue/steady/epilogue physical window pipelines";
+    return "Expand scheduled physical Levels into SSA-versioned prologue, steady state, and epilogue";
   }
 
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
     bool failed = false;
     llvm::SmallVector<mlir::scf::ForOp> loops;
-    getOperation().walk([&](mlir::scf::ForOp loop) {
-      if (loop->hasAttr("weft.riscv.schedule"))
-        loops.push_back(loop);
-    });
+    getOperation().walk<mlir::WalkOrder::PostOrder>(
+        [&](mlir::scf::ForOp loop) {
+          if (loop->hasAttr("weft.riscv.schedule"))
+            loops.push_back(loop);
+        });
 
     for (mlir::scf::ForOp loop : loops) {
       auto schedule = loop->getAttrOfType<riscv::ScheduleAttr>(
@@ -80,68 +92,178 @@ public:
         continue;
       }
       if (schedule.getPipelineDepth() != 2 ||
-          schedule.getBufferCount() != 2 || loop.getInitArgs().size() != 1) {
+          schedule.getBufferCount() != 2) {
         loop.emitError(
-            "physical scheduler currently supports a two-stage, two-buffer, single-carry pipeline");
-        failed = true;
-        continue;
-      }
-      mlir::Block *body = loop.getBody();
-      llvm::SmallVector<mlir::Operation *> operations;
-      for (mlir::Operation &operation : body->without_terminator())
-        operations.push_back(&operation);
-      if (operations.size() != 2 || !isWindowLoad(operations[0]) ||
-          !isWindowStep(operations[1]) ||
-          operations[1]->getOperand(0) != operations[0]->getResult(0) ||
-          operations[1]->getOperand(1) != loop.getRegionIterArg(0)) {
-        loop.emitError(
-            "pipeline schedule has no explicit load-window/compute-window local cluster");
+            "physical expander currently implements one-iteration-distance, two-stage pipelines");
         failed = true;
         continue;
       }
 
-      mlir::Operation *load = operations[0];
-      mlir::Operation *step = operations[1];
+      mlir::Block *body = loop.getBody();
+      llvm::SmallVector<mlir::Operation *> stageZero;
+      llvm::SmallVector<mlir::Operation *> stageOne;
+      llvm::DenseSet<int64_t> stageZeroOrders;
+      llvm::DenseSet<int64_t> stageOneOrders;
+      bool missingStage = false;
+      for (mlir::Operation &operation : body->without_terminator()) {
+        std::optional<int64_t> stage = stageOf(&operation);
+        std::optional<int64_t> order = orderOf(&operation);
+        if (!stage || (*stage != 0 && *stage != 1) || !order) {
+          operation.emitError(
+              "pipeline expander received an operation without a valid scheduled stage/order");
+          missingStage = true;
+          break;
+        }
+        llvm::DenseSet<int64_t> &orders =
+            *stage == 0 ? stageZeroOrders : stageOneOrders;
+        if (!orders.insert(*order).second) {
+          operation.emitError(
+              "pipeline expander received duplicate order within one stage");
+          missingStage = true;
+          break;
+        }
+        (*stage == 0 ? stageZero : stageOne).push_back(&operation);
+      }
+      if (missingStage || stageZero.empty() || stageOne.empty()) {
+        failed = true;
+        continue;
+      }
+      auto byScheduledOrder = [](mlir::Operation *lhs, mlir::Operation *rhs) {
+        return *orderOf(lhs) < *orderOf(rhs);
+      };
+      std::stable_sort(stageZero.begin(), stageZero.end(), byScheduledOrder);
+      std::stable_sort(stageOne.begin(), stageOne.end(), byScheduledOrder);
+
+      auto yield = mlir::cast<mlir::scf::YieldOp>(body->getTerminator());
+      llvm::DenseSet<mlir::Operation *> stageOneSet(stageOne.begin(),
+                                                    stageOne.end());
+      bool needsBufferedIV = false;
+      for (mlir::Operation *operation : stageOne)
+        needsBufferedIV |= llvm::is_contained(operation->getOperands(),
+                                              loop.getInductionVar());
+      llvm::SmallVector<mlir::Value> crossStageValues;
+      llvm::DenseSet<mlir::Value> seenCrossStage;
+      for (mlir::Operation *operation : stageZero)
+        for (mlir::Value result : operation->getResults()) {
+          bool crosses = false;
+          for (mlir::OpOperand &use : result.getUses())
+            if (use.getOwner() == yield.getOperation() ||
+                stageOneSet.contains(use.getOwner())) {
+              crosses = true;
+              break;
+            }
+          if (crosses && seenCrossStage.insert(result).second)
+            crossStageValues.push_back(result);
+        }
+      if (crossStageValues.empty()) {
+        loop.emitError(
+            "pipeline schedule has no SSA value crossing from producer to consumer stage");
+        failed = true;
+        continue;
+      }
+
       rewriter.setInsertionPoint(loop);
       mlir::Value nonEmpty = rewriter.create<mlir::arith::CmpIOp>(
           loop.getLoc(), mlir::arith::CmpIPredicate::ult,
           loop.getLowerBound(), loop.getUpperBound());
       auto pipeline = rewriter.create<mlir::scf::IfOp>(
-          loop.getLoc(), mlir::TypeRange{loop.getResult(0).getType()}, nonEmpty,
-          true);
+          loop.getLoc(), loop.getResultTypes(), nonEmpty, true);
+      copyLoopAttrs(loop, pipeline, true);
+
       rewriter.setInsertionPointToStart(&pipeline.getThenRegion().front());
-      mlir::Value firstWindow = cloneLoad(rewriter, load, loop.getLowerBound());
+      mlir::IRMapping prologue;
+      prologue.map(loop.getInductionVar(), loop.getLowerBound());
+      for (auto [argument, initial] :
+           llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs()))
+        prologue.map(argument, initial);
+      for (mlir::Operation *operation : stageZero)
+        cloneScheduled(rewriter, operation, prologue);
+
+      llvm::SmallVector<mlir::Value> steadyInitial(loop.getInitArgs());
+      if (needsBufferedIV)
+        steadyInitial.push_back(loop.getLowerBound());
+      for (mlir::Value value : crossStageValues)
+        steadyInitial.push_back(prologue.lookup(value));
+
       mlir::Value steadyLower = rewriter.create<mlir::arith::AddIOp>(
           loop.getLoc(), loop.getLowerBound(), loop.getStep());
       auto steady = rewriter.create<mlir::scf::ForOp>(
           loop.getLoc(), steadyLower, loop.getUpperBound(), loop.getStep(),
-          mlir::ValueRange{loop.getInitArgs().front(), firstWindow});
-      steady->setAttr("weft.riscv.direction",
-                      rewriter.getStringAttr("ascending"));
+          steadyInitial);
+      copyLoopAttrs(loop, steady, false);
+      if (!steady.getBody()->empty())
+        if (auto oldYield =
+                mlir::dyn_cast<mlir::scf::YieldOp>(steady.getBody()->back()))
+          rewriter.eraseOp(oldYield);
       rewriter.setInsertionPointToStart(steady.getBody());
-      mlir::Value nextWindow =
-          cloneLoad(rewriter, load, steady.getInductionVar());
-      mlir::Value nextAccumulator = cloneStep(
-          rewriter, step, steady.getRegionIterArg(1),
-          steady.getRegionIterArg(0));
+
+      const unsigned carryCount = loop.getInitArgs().size();
+      mlir::IRMapping currentProducer;
+      currentProducer.map(loop.getInductionVar(), steady.getInductionVar());
+      for (auto [argument, carried] :
+           llvm::zip(loop.getRegionIterArgs(),
+                     steady.getRegionIterArgs().take_front(carryCount)))
+        currentProducer.map(argument, carried);
+      for (mlir::Operation *operation : stageZero)
+        cloneScheduled(rewriter, operation, currentProducer);
+
+      mlir::IRMapping previousConsumer;
+      if (needsBufferedIV)
+        previousConsumer.map(loop.getInductionVar(),
+                             steady.getRegionIterArg(carryCount));
+      for (auto [argument, carried] :
+           llvm::zip(loop.getRegionIterArgs(),
+                     steady.getRegionIterArgs().take_front(carryCount)))
+        previousConsumer.map(argument, carried);
+      for (auto [index, value] : llvm::enumerate(crossStageValues))
+        previousConsumer.map(value,
+                             steady.getRegionIterArg(
+                                 carryCount + (needsBufferedIV ? 1 : 0) + index));
+      for (mlir::Operation *operation : stageOne)
+        cloneScheduled(rewriter, operation, previousConsumer);
+
+      llvm::SmallVector<mlir::Value> steadyYield;
+      for (mlir::Value value : yield.getResults())
+        steadyYield.push_back(previousConsumer.lookupOrDefault(value));
+      if (needsBufferedIV)
+        steadyYield.push_back(steady.getInductionVar());
+      for (mlir::Value value : crossStageValues)
+        steadyYield.push_back(currentProducer.lookup(value));
       rewriter.setInsertionPointToEnd(steady.getBody());
-      rewriter.create<mlir::scf::YieldOp>(
-          loop.getLoc(), mlir::ValueRange{nextAccumulator, nextWindow});
+      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), steadyYield);
 
       rewriter.setInsertionPointAfter(steady);
-      mlir::Value finalAccumulator =
-          cloneStep(rewriter, step, steady.getResult(1), steady.getResult(0));
-      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), finalAccumulator);
+      mlir::IRMapping epilogue;
+      if (needsBufferedIV)
+        epilogue.map(loop.getInductionVar(), steady.getResult(carryCount));
+      for (auto [argument, carried] :
+           llvm::zip(loop.getRegionIterArgs(),
+                     steady.getResults().take_front(carryCount)))
+        epilogue.map(argument, carried);
+      for (auto [index, value] : llvm::enumerate(crossStageValues))
+        epilogue.map(value,
+                     steady.getResult(carryCount +
+                                      (needsBufferedIV ? 1 : 0) + index));
+      for (mlir::Operation *operation : stageOne)
+        cloneScheduled(rewriter, operation, epilogue);
+      llvm::SmallVector<mlir::Value> finalValues;
+      for (mlir::Value value : yield.getResults())
+        finalValues.push_back(epilogue.lookupOrDefault(value));
+      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), finalValues);
+
       rewriter.setInsertionPointToStart(&pipeline.getElseRegion().front());
-      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), loop.getInitArgs().front());
-      loop.getResult(0).replaceAllUsesWith(pipeline.getResult(0));
+      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), loop.getInitArgs());
+      loop.getResults().replaceAllUsesWith(pipeline.getResults());
       rewriter.eraseOp(loop);
     }
 
-    // Schedule attributes are inputs to structural rewriting, not terminal
-    // authority. Operations without a physical loop have no local pipeline
-    // dimension; consuming their attribute is exact rather than a downgrade.
     getOperation().walk([&](mlir::Operation *operation) {
+      if (operation->hasAttr("weft.riscv.schedule") ||
+          operation->hasAttr(kStageAttr) || operation->hasAttr(kOrderAttr)) {
+        operation->emitError(
+            "physical schedule survived without structural pipeline expansion");
+        failed = true;
+      }
       if (operation->hasAttr("schedule")) {
         operation->emitError(
             "operation-local schedule survived without an explicit physical loop");

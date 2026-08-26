@@ -21,6 +21,10 @@ bool rematerializable(mlir::Operation *operation) {
          operation->getNumResults() == 1;
 }
 
+bool isPureRepresentationConversion(riscv::ConvertLayoutOp conversion) {
+  return conversion.getConversion().getEffect() == "pure";
+}
+
 class CanonicalizeRISCVLayoutsPass
     : public mlir::PassWrapper<CanonicalizeRISCVLayoutsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -45,7 +49,9 @@ public:
           continue;
         if (auto previous =
                 conversion.getInput().getDefiningOp<riscv::ConvertLayoutOp>()) {
-          if (previous.getInput().getType() == conversion.getResult().getType()) {
+          if (isPureRepresentationConversion(previous) &&
+              isPureRepresentationConversion(conversion) &&
+              previous.getInput().getType() == conversion.getResult().getType()) {
             conversion.getResult().replaceAllUsesWith(previous.getInput());
             rewriter.eraseOp(conversion);
             if (previous.getResult().use_empty())
@@ -54,6 +60,8 @@ public:
             continue;
           }
         }
+        if (!isPureRepresentationConversion(conversion))
+          continue;
         mlir::Operation *producer = conversion.getInput().getDefiningOp();
         if (!producer || !rematerializable(producer) ||
             !conversion.getInput().hasOneUse())
@@ -107,7 +115,7 @@ public:
           available;
       for (mlir::Operation &operation : llvm::make_early_inc_range(*block)) {
         auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
-        if (!conversion)
+        if (!conversion || !isPureRepresentationConversion(conversion))
           continue;
         auto key = std::make_pair(conversion.getInput(),
                                   conversion.getResult().getType());

@@ -19,6 +19,7 @@ std::unique_ptr<mlir::Pass> createCanonicalizeRISCVLayoutsPass();
 std::unique_ptr<mlir::Pass> createFuseRISCVBitplanesPass();
 std::unique_ptr<mlir::Pass> createLowerRISCVCompositesPass();
 std::unique_ptr<mlir::Pass> createHoistRISCVLoopInvariantsPass();
+std::unique_ptr<mlir::Pass> createScheduleRISCVLevelsPass();
 std::unique_ptr<mlir::Pass> createPipelineRISCVLevelsPass();
 std::unique_ptr<mlir::Pass> createUnrollRISCVLevelsPass();
 std::unique_ptr<mlir::Pass> createShareRISCVLayeredWindowsPass();

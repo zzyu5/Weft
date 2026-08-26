@@ -265,7 +265,13 @@ local cluster 是从作者已有 Level/ordinary loop 中抽取的一组物理 pr
 
 这些结构只改变同一 source instances 的 issue time和temporary lifetime；不能创建新的算法 pass、跨 Level workspace、persistent buffer或另一种state recurrence。pipeline depth、buffer count、unroll和prefetch distance是有限物理参数，可由构建期实测选择。
 
-当前RISC-V实现的可执行子集更窄：depth=1是顺序执行；depth=2只接受一个window load紧接一个window step、单一accumulator carry和两个window SSA版本，并生成真实prologue/steady-state/epilogue。async transfer、wait、多于两个buffer、普通register contract的多阶段pipeline和非零prefetch尚未形成合法physical program，不能仅通过设置参数声称支持。
+当前 RISC-V 实现已将 scheduler 与 expander 分开。depth=1 是顺序执行；depth=2
+先从一个带 carry 的 physical Level 的 use-def/effect 推导 pure/read producer 和 carry-dependent
+consumer，再为任意数量的跨 stage SSA value 与多个 source carries 生成真实 prologue/
+steady-state/epilogue。当前只实现距离一迭代、depth=2/buffer=2；嵌套 region 与
+write/unknown effect 还没有 predication/ordering 合同，会明确拒绝。async transfer、wait、
+多于两个 buffer、显式 local-storage ping-pong 和非零 prefetch 尚未形成合法 physical
+program，不能仅通过设置参数声称支持。
 
 ## 12. Resource model
 

@@ -484,6 +484,33 @@ public:
           }
         }
       }
+      if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(operation)) {
+        auto level =
+            branch->getAttrOfType<riscv::LevelAttr>("weft.riscv.level");
+        if (!level)
+          return;
+        if (level.getHandoffCount() !=
+            static_cast<int64_t>(branch.getNumResults())) {
+          branch.emitError()
+              << "pipelined physical Level lost its handoff identity; expected "
+              << level.getHandoffCount() << ", observed "
+              << branch.getNumResults();
+          failed = true;
+        }
+        bool foundPoint = false;
+        branch.getThenRegion().walk([&](riscv::PhysicalPointOp point) {
+          auto domain = point.getResult().getType().getDomain();
+          if (domain.getDomainId() == level.getDomainId() &&
+              domain.getAxisId() == level.getAxisId() &&
+              domain.getRelation() == level.getRelation())
+            foundPoint = true;
+        });
+        if (!foundPoint) {
+          branch.emitError(
+              "pipelined physical Level has no point for its logical domain");
+          failed = true;
+        }
+      }
     });
     for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>()) {
       for (mlir::BlockArgument argument : kernel.getBody().front().getArguments()) {

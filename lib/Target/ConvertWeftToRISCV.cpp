@@ -527,11 +527,12 @@ private:
                        riscv_internal::unassignedAccess(builder));
   }
 
-  void addSchedule(llvm::SmallVectorImpl<mlir::NamedAttribute> &attrs) {
+  void addSchedule(llvm::SmallVectorImpl<mlir::NamedAttribute> &attrs,
+                   bool localPipeline) {
     attrs.emplace_back(
         builder.getStringAttr("schedule"),
         riscv_internal::schedule(builder, options.unroll,
-                                 options.pipelineDepth));
+                                 localPipeline ? options.pipelineDepth : 1));
   }
 
   mlir::LogicalResult cloneStandard(mlir::Operation *source) {
@@ -629,8 +630,11 @@ private:
     });
     const int64_t levelUnroll =
         innermost && !shapedReductionConsumesLevelAxis ? options.unroll : 1;
-    state.addAttribute("schedule",
-                       riscv_internal::schedule(builder, levelUnroll, 1));
+    const int64_t levelPipelineDepth =
+        innermost && !carried.empty() ? options.pipelineDepth : 1;
+    state.addAttribute(
+        "schedule",
+        riscv_internal::schedule(builder, levelUnroll, levelPipelineDepth));
     state.addRegion();
     mlir::Operation *rawLoop = builder.create(state);
     rawLoop->setAttr("canonical_op", builder.getStringAttr("weft_kernel.level"));
@@ -860,7 +864,7 @@ private:
       addLeaf(attrs);
       targetName = riscv::WidenOp::getOperationName();
     } else if (mlir::isa<kernel::MacGroupsOp>(source)) {
-      addSchedule(attrs);
+      addSchedule(attrs, true);
       addLeaf(attrs);
       targetName = riscv::MacGroupsOp::getOperationName();
     } else if (mlir::isa<kernel::ReduceOp>(source)) {
@@ -875,7 +879,7 @@ private:
                          builder.getStringAttr("unassigned"));
       attrs.emplace_back(builder.getStringAttr("lane_memory_form"),
                          builder.getStringAttr("unassigned"));
-      addSchedule(attrs);
+      addSchedule(attrs, false);
       addLeaf(attrs);
       targetName = riscv::DotOp::getOperationName();
     } else if (mlir::isa<kernel::ContractOp>(source)) {
@@ -883,7 +887,7 @@ private:
                          builder.getStringAttr("unassigned"));
       attrs.emplace_back(builder.getStringAttr("lane_memory_form"),
                          builder.getStringAttr("unassigned"));
-      addSchedule(attrs);
+      addSchedule(attrs, false);
       addLeaf(attrs);
       targetName = riscv::ContractOp::getOperationName();
     } else if (mlir::isa<kernel::OuterContractOp>(source)) {
@@ -891,7 +895,7 @@ private:
                          builder.getStringAttr("unassigned"));
       attrs.emplace_back(builder.getStringAttr("lane_memory_form"),
                          builder.getStringAttr("unassigned"));
-      addSchedule(attrs);
+      addSchedule(attrs, false);
       addLeaf(attrs);
       targetName = riscv::OuterContractOp::getOperationName();
     } else if (mlir::isa<kernel::LookupOp>(source)) {

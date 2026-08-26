@@ -476,6 +476,21 @@ std::optional<int64_t> encodedLaneLimit(mlir::Value value) {
         return facts.layer;
       return std::nullopt;
     }
+    if (auto conversion =
+            mlir::dyn_cast<riscv::ConvertLayoutOp>(definition)) {
+      auto input =
+          mlir::dyn_cast<riscv::ValueType>(conversion.getInput().getType());
+      auto result =
+          mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
+      llvm::StringRef effect = conversion.getConversion().getEffect();
+      if (!input || !result || input.getShape() != result.getShape() ||
+          input.getAxisIds() != result.getAxisIds() ||
+          (effect != "pure" && effect != "read"))
+        return std::nullopt;
+      return visit(conversion.getInput());
+    }
+    if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(definition))
+      return visit(lookup.getIndices());
     // Storage-layer width constrains the raw field and representation-only
     // casts, not a newly computed logical value.  In particular, combining
     // low/high bit layers creates a full logical vector that may be

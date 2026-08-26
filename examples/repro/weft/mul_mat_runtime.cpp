@@ -212,8 +212,13 @@ constexpr int kElements = 32;
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_q4_1_q8_1_generic
 #define selected_quantize quantize_row_q8_1_ref
+#if defined(WEFT_Q41_DECODE)
+extern "C" void production_mul_mat_q4_1_decode(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_q4_1_decode(w, x, xq, y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_q4_1(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q4_1(w, x, xq, y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 4
 using selected_weight = block_q5_0;
 using selected_activation = block_q8_0;
@@ -406,8 +411,13 @@ constexpr int kElements = 32;
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_iq4_nl_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
+#if defined(WEFT_IQ4_NL_DECODE)
+extern "C" void production_mul_mat_iq4_nl_decode(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq4_nl_decode(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq4_nl(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq4_nl(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 20
 using selected_weight = block_iq4_xs;
 using selected_activation = block_q8_K;

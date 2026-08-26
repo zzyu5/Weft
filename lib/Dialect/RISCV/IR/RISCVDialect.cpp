@@ -2601,15 +2601,19 @@ mlir::LogicalResult RVVLayeredWindowOp::verify() {
   const int64_t group = getAccess().getGroupSize();
   const int64_t layer = getAccess().getLayerSize();
   const int64_t axis = getPoint().getType().getDomain().getAxisId();
+  auto resultAxis = llvm::find(first.getAxisIds().asArrayRef(), axis);
+  const bool hasLayerAxis =
+      resultAxis != first.getAxisIds().asArrayRef().end() &&
+      first.getShape()[static_cast<size_t>(
+          resultAxis - first.getAxisIds().asArrayRef().begin())] == layer;
   auto physicalPoint = getPoint().getDefiningOp<PhysicalPointOp>();
   auto partition = physicalPoint
                        ? physicalPoint.getPartition().getDefiningOp<
                              mlir::arith::ConstantIndexOp>()
                        : mlir::arith::ConstantIndexOp();
-  if (!element || element.isSigned() || field.getShape().size() != 1 ||
+  if (!element || element.isSigned() || field.getShape().size() != first.getShape().size() ||
       first != second || first.getElementType() != field.getElementType() ||
-      first.getShape().size() != 1 || first.getShape()[0] != layer ||
-      first.getAxisIds().size() != 1 || first.getAxisIds()[0] != axis ||
+      first.getAxisIds() != field.getAxisIds() || !hasLayerAxis ||
       first.getLayout().getCarrier() != "rvv" ||
       first.getLayout().getValidity() != "full" ||
       getAccess().getForm() != "indexed" ||

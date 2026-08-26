@@ -923,6 +923,8 @@ private:
         physical->setAttr(
             "weft.riscv.unroll_factor",
             rewriter.getI64IntegerAttr(loop.getSchedule().getUnroll()));
+      if (loop.getSchedule().getPipelineDepth() > 1)
+        physical->setAttr("weft.riscv.schedule", loop.getSchedule());
 
       mlir::Block &sourceBody = loop.getBody().front();
       mlir::Block *targetBody = physical.getBody();

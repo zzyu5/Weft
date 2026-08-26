@@ -193,6 +193,32 @@ def mul_mat_q4_1(
     Y: View[f32, (M, N)],
 ):
     quantize_q8_1(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=32) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        integer = outer_contract(
+                            x.q, i8(w.q), over="k", acc=i32
+                        )
+                        acc += (f32(w.d) * f32(x.d)) * widen(
+                            integer, f32
+                        ) + f32(w.m) * f32(x.s)
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_q4_1_decode(
+    W: View[Q4_1, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_1, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_1(X, Xq)
     for row in range(M):
         for column in range(N):
             commit(vec_dot_q4_1_q8_1(W[column], Xq[row]), Y[row, column])
@@ -544,6 +570,33 @@ def mul_mat_iq3_xxs(
 
 
 def mul_mat_iq4_nl(
+    W: View[IQ4_NL, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    codebook: View[i8, (16,)],
+    Y: View[f32, (M, N)],
+):
+    table = materialize(admit(codebook))
+    quantize_q8_0(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=32) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        q = lookup(table, w.q, bounds="in_bounds")
+                        integer = outer_contract(
+                            x.q, q, over="k", acc=i32
+                        )
+                        acc += (f32(w.d) * f32(x.d)) * widen(integer, f32)
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_iq4_nl_decode(
     W: View[IQ4_NL, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],

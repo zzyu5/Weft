@@ -37,7 +37,7 @@ system C compiler
 × 一个按固定优先级选定的 structural realization
 ```
 
-source `auto` 在进入 lowering 前绑定。结构固定后的 LMUL、microtile extent、unroll、pipeline depth 等有限参数，每组绑定各自建立并编译一份 RISC-V module。depth=1表示顺序执行；当前两阶段pipeline只接受depth=2/buffer=2的window cluster，buffer count不是独立binding。当前 compiler API 每次只接受一组单值 binding；外部 tuner 可以枚举这些 module 并比较可执行 artifacts，但不共享 `assignment` 字典，也不生成新的物理结构。
+source `auto` 在进入 lowering 前绑定。结构固定后的 LMUL、microtile extent、unroll、pipeline depth 等有限参数，每组绑定各自建立并编译一份 RISC-V module。depth=1表示顺序执行；当前两阶段 pipeline 只接受 depth=2/buffer=2，并且必须能从一个带 carry 的 physical Level 中推导出 pure/read producer 与 carry-dependent consumer cluster，buffer count不是独立 binding。当前 compiler API 每次只接受一组单值 binding；外部 tuner 可以枚举这些 module 并比较可执行 artifacts，但不共享 `assignment` 字典，也不生成新的物理结构。
 
 结构性选择按 target 固定规则和优先级进行；一个 module 内不保存备用路线。选定结构在后续 legality/resource pass 中失败时该 module 直接失败，不在 pass 或 emitter 中回退。需要另一 target/configuration 时，调用者从同一 canonical candidate 重新建立一份 module。
 
