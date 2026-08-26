@@ -10,85 +10,11 @@
 
 #include <memory>
 #include <numeric>
+#include <optional>
 
 using namespace weft;
 
 namespace {
-
-llvm::StringRef layoutKind(mlir::ArrayAttr layouts) {
-  if (!layouts || layouts.empty())
-    return {};
-  auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(layouts[0]);
-  auto kind = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
-                         : mlir::StringAttr();
-  return kind ? kind.getValue() : llvm::StringRef();
-}
-
-struct FieldFacts {
-  llvm::StringRef mapping = "opaque";
-  bool scalarPerRecord = false;
-  int64_t group = 0;
-  int64_t layer = 0;
-  int64_t joinFields = 0;
-  int64_t joinLowBits = 0;
-  int64_t joinRole = 0;
-  int64_t bitOffset = 0;
-  int64_t storageBits = 0;
-  int64_t alignment = 1;
-  llvm::StringRef order = "none";
-};
-
-FieldFacts fieldFacts(riscv::FieldOp operation) {
-  auto ownerElement = riscv_internal::logicalElement(operation.getOwner().getType());
-  auto encoding = mlir::dyn_cast<kernel::EncodingType>(ownerElement);
-  if (!encoding)
-    return {};
-  llvm::StringRef base = riscv_internal::baseEncodingFamily(operation, encoding);
-  riscv::EncodingDeclOp declaration =
-      riscv_internal::findEncoding(operation, base);
-  if (!declaration)
-    return {};
-  size_t index = declaration.getFieldNames().size();
-  for (auto [position, name] : llvm::enumerate(declaration.getFieldNames()))
-    if (mlir::cast<mlir::StringAttr>(name).getValue() == operation.getName()) {
-      index = position;
-      break;
-    }
-  if (index == declaration.getFieldNames().size())
-    return {};
-  FieldFacts result;
-  auto fieldShape =
-      mlir::cast<mlir::DenseI64ArrayAttr>(declaration.getFieldShapes()[index]);
-  result.scalarPerRecord = fieldShape.empty();
-  result.bitOffset = declaration.getFieldBitOffsets()[index];
-  result.storageBits = declaration.getFieldStorageBits()[index];
-  if (result.bitOffset % 8 == 0)
-    result.alignment = std::gcd<int64_t>(declaration.getAlignment(),
-                                         result.bitOffset / 8);
-  auto layouts = mlir::cast<mlir::ArrayAttr>(declaration.getFieldLayouts()[index]);
-  llvm::StringRef kind = layoutKind(layouts);
-  if (kind == "natural") {
-    result.mapping = "natural";
-  } else if (kind == "joined") {
-    result.mapping = "joined";
-    auto joined = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
-    result.group = joined.getAs<mlir::IntegerAttr>("size").getInt();
-    result.joinFields = joined.getAs<mlir::IntegerAttr>("fields").getInt();
-    result.joinLowBits = joined.getAs<mlir::IntegerAttr>("low_bits").getInt();
-    result.joinRole = joined.getAs<mlir::IntegerAttr>("role").getInt();
-    result.order = joined.getAs<mlir::StringAttr>("order").getValue();
-  } else if (kind == "grouped" && layouts.size() == 2 &&
-             layoutKind(mlir::ArrayAttr::get(operation.getContext(),
-                                             {layouts[1]})) == "layered") {
-    result.mapping = "grouped_layered";
-    auto grouped = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
-    auto layered = mlir::cast<mlir::DictionaryAttr>(layouts[1]);
-    result.group = grouped.getAs<mlir::IntegerAttr>("size").getInt();
-    result.layer = layered.getAs<mlir::IntegerAttr>("size").getInt();
-    result.order = layered.getAs<mlir::StringAttr>("order").getValue();
-  }
-  return result;
-}
 
 riscv::AccessAttr makeAccess(mlir::Builder &builder, llvm::StringRef form,
                              llvm::StringRef mapping, int64_t alignment,
@@ -139,6 +65,7 @@ public:
     mlir::Builder builder(&getContext());
     bool failed = false;
     llvm::SmallVector<riscv::LoadOp> deadTableLoads;
+    llvm::SmallVector<riscv::MaterializeOp> deadTableMaterializations;
     getOperation().walk([&](riscv::LoadOp operation) {
       auto memory = operation.getRegion().getType();
       auto encoding = mlir::cast<kernel::EncodingType>(memory.getEncoding());
@@ -180,7 +107,7 @@ public:
           scalar ? "scalar.store" : ("rvv.store." + form).str()));
     });
     getOperation().walk([&](riscv::FieldOp operation) {
-      FieldFacts facts = fieldFacts(operation);
+      riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(operation);
       if (facts.mapping == "opaque") {
         operation.emitError("encoded field has no complete storage mapping");
         failed = true;
@@ -210,16 +137,23 @@ public:
       riscv::AccessAttr access;
       auto field = operation.getInput().getDefiningOp<riscv::FieldOp>();
       auto inputLayout = riscv_internal::layoutOf(operation.getInput().getType());
+      const bool gather = llvm::any_of(
+          operation.getSelectors(), [](mlir::Attribute selector) {
+            return mlir::cast<mlir::StringAttr>(selector).getValue() ==
+                   "gather";
+          });
+      if (gather && inputLayout && inputLayout.getCarrier() == "rvv") {
+        operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
+        operation.setLeafAttr(riscv_internal::leaf(
+            builder, "rvv", "extract", "rvv.extract.vrgather",
+            "rvv.extract.vrgather", 0, 0));
+        return;
+      }
       // Encoded fields use the local carrier because their bytes are not yet a
       // numerical register value.  They nevertheless retain an encoded memory
       // edge selected on FieldOp; do not misclassify that representation as a
       // compiler-created local array.
       if (!field && inputLayout && inputLayout.getCarrier() == "local") {
-        const bool gather = llvm::any_of(
-            operation.getSelectors(), [](mlir::Attribute selector) {
-              return mlir::cast<mlir::StringAttr>(selector).getValue() ==
-                     "gather";
-            });
         if (gather) {
           auto target =
               operation->getParentOfType<riscv::KernelOp>().getTarget();
@@ -285,16 +219,59 @@ public:
           transferLeaf(builder, "local-update", "local.update"));
     });
     getOperation().walk([&](riscv::LookupOp operation) {
-      // A lookup table is an addressable memory value, not an RVV value that
-      // must first be loaded in full.  Preserve the explicit descriptor edge
-      // and let the lookup leaf load exactly the selected entries/window.
-      if (auto tableLoad = operation.getTable().getDefiningOp<riscv::LoadOp>()) {
+      // An unmaterialized admitted table remains an addressable memory edge.
+      // Explicit materialize carries cross-use lifetime, so its selected RVV
+      // value is consumed by a register gather instead of being reconstructed
+      // as an indexed memory access at every use.
+      auto tableLoad = operation.getTable().getDefiningOp<riscv::LoadOp>();
+      auto tableMaterialize =
+          operation.getTable().getDefiningOp<riscv::MaterializeOp>();
+      if (!tableLoad && tableMaterialize)
+        tableLoad =
+            tableMaterialize.getInput().getDefiningOp<riscv::LoadOp>();
+      auto indexLayout = riscv_internal::layoutOf(operation.getIndices().getType());
+      bool indexed = indexLayout && indexLayout.getCarrier() == "rvv";
+      auto tableLayout = riscv_internal::layoutOf(operation.getTable().getType());
+      auto resultLayout = riscv_internal::layoutOf(operation.getResult().getType());
+      auto tableParts = tableLayout
+                            ? riscv_internal::staticProduct(
+                                  tableLayout.getTimeFactors().asArrayRef())
+                            : std::optional<int64_t>();
+      auto tableReplicas = tableLayout
+                               ? riscv_internal::staticProduct(
+                                     tableLayout.getReplicaFactors().asArrayRef())
+                               : std::optional<int64_t>();
+      bool registerTable =
+          indexed && tableLayout && resultLayout &&
+          tableLayout.getCarrier() == "rvv" &&
+          tableLayout.getSew() == resultLayout.getSew() &&
+          tableLayout.getLmulEighths() == resultLayout.getLmulEighths() &&
+          indexLayout.getSew() == resultLayout.getSew() &&
+          indexLayout.getLmulEighths() == resultLayout.getLmulEighths() &&
+          tableParts && *tableParts == 1 && tableReplicas &&
+          *tableReplicas == 1;
+      if (!registerTable && tableLoad) {
         operation->setOperand(0, tableLoad.getRegion());
         if (!llvm::is_contained(deadTableLoads, tableLoad))
           deadTableLoads.push_back(tableLoad);
+        if (tableMaterialize &&
+            !llvm::is_contained(deadTableMaterializations,
+                                tableMaterialize))
+          deadTableMaterializations.push_back(tableMaterialize);
       }
-      auto indexLayout = riscv_internal::layoutOf(operation.getIndices().getType());
-      bool indexed = indexLayout && indexLayout.getCarrier() == "rvv";
+      if (registerTable) {
+        operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
+        operation.setLeafAttr(riscv_internal::leaf(
+            builder, "rvv", "lookup", "rvv.vrgather", "rvv.vrgather", 0,
+            0));
+        return;
+      }
+      if (mlir::isa<riscv::ValueType>(operation.getTable().getType())) {
+        operation.emitError(
+            "materialized lookup table has no complete register or memory realization");
+        failed = true;
+        return;
+      }
       llvm::StringRef form = indexed ? "indexed" : "unit";
       if (indexed &&
           !operation->getParentOfType<riscv::KernelOp>()
@@ -311,6 +288,9 @@ public:
           indexed ? "rvv.vluxei" : "scalar.lookup",
           indexed ? "rvv.vluxei" : "scalar.lookup", 0, 0));
     });
+    for (riscv::MaterializeOp materialize : deadTableMaterializations)
+      if (materialize && materialize.getResult().use_empty())
+        materialize.erase();
     for (riscv::LoadOp load : deadTableLoads)
       if (load && load.getResult().use_empty())
         load.erase();

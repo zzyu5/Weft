@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weft.language import f32, i32, lookup, u32
+from weft.language import f32, i32, lookup, u8, u32
 
 
 def extract_bits(value, shift, width: int = 1):
@@ -10,6 +10,11 @@ def extract_bits(value, shift, width: int = 1):
 
 def high_bit_plane(low, plane, position, bit: int = 4):
     return i32(low) | i32(extract_bits(plane, position, 1) << u32(bit))
+
+
+def high_bit_plane_u8(low, plane, position, bit: int = 4):
+    high = (u8(plane) >> u8(position)) & u8(1)
+    return u8(low) | (high << u8(bit))
 
 
 def signed_scale(raw, zero: int = 0):
@@ -23,7 +28,7 @@ def grid_sign(grid, signs, grid_index, sign_index, lane, lanes: int = 8):
     sign_value = lookup(
         signs, u32(sign_index) * u32(lanes) + u32(lane), bounds="in_bounds"
     )
-    return grid_value * sign_value
+    return i32(grid_value) * i32(sign_value)
 
 
 def grid_delta(grid, grid_index, lane, delta):
@@ -37,6 +42,10 @@ def grid_delta(grid, grid_index, lane, delta):
 
 def nonlinear_lookup(codebook, code):
     return lookup(codebook, u32(code), bounds="in_bounds")
+
+
+def small_nonlinear_lookup(codebook, code):
+    return lookup(codebook, u8(code), bounds="in_bounds")
 
 
 def exponent_scale(table, raw):

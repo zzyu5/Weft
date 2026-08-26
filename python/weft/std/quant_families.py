@@ -26,4 +26,4 @@ def iq_codebook(q, scale):
 
 
 def fp4_codebook(q, scale):
-    return f32(q) * f32(scale)
+    return f32(i32(q)) * f32(scale)

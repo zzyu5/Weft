@@ -6,6 +6,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <limits>
+#include <numeric>
 
 using namespace weft;
 
@@ -687,6 +688,66 @@ int64_t riscv_internal::interleaveRows(mlir::Operation *operation,
           derived.getParameterValues() == encoding.getParameters().asArrayRef())
         result = derived.getInterleaveRows();
     });
+  return result;
+}
+
+riscv_internal::FieldFacts
+riscv_internal::fieldFacts(riscv::FieldOp operation) {
+  auto ownerElement = logicalElement(operation.getOwner().getType());
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(ownerElement);
+  if (!encoding)
+    return {};
+  llvm::StringRef base = baseEncodingFamily(operation, encoding);
+  riscv::EncodingDeclOp declaration = findEncoding(operation, base);
+  if (!declaration)
+    return {};
+  size_t index = declaration.getFieldNames().size();
+  for (auto [position, name] : llvm::enumerate(declaration.getFieldNames()))
+    if (mlir::cast<mlir::StringAttr>(name).getValue() == operation.getName()) {
+      index = position;
+      break;
+    }
+  if (index == declaration.getFieldNames().size())
+    return {};
+
+  FieldFacts result;
+  auto fieldShape =
+      mlir::cast<mlir::DenseI64ArrayAttr>(declaration.getFieldShapes()[index]);
+  result.scalarPerRecord = fieldShape.empty();
+  result.bitOffset = declaration.getFieldBitOffsets()[index];
+  result.storageBits = declaration.getFieldStorageBits()[index];
+  if (result.bitOffset % 8 == 0)
+    result.alignment = std::gcd<int64_t>(declaration.getAlignment(),
+                                         result.bitOffset / 8);
+  auto layouts =
+      mlir::cast<mlir::ArrayAttr>(declaration.getFieldLayouts()[index]);
+  auto layoutKind = [](mlir::Attribute attribute) -> llvm::StringRef {
+    auto dictionary = mlir::dyn_cast<mlir::DictionaryAttr>(attribute);
+    auto kind = dictionary ? dictionary.getAs<mlir::StringAttr>("kind")
+                           : mlir::StringAttr();
+    return kind ? kind.getValue() : llvm::StringRef();
+  };
+  llvm::StringRef kind =
+      layouts.empty() ? llvm::StringRef() : layoutKind(layouts[0]);
+  if (kind == "natural") {
+    result.mapping = "natural";
+  } else if (kind == "joined") {
+    result.mapping = "joined";
+    auto joined = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
+    result.group = joined.getAs<mlir::IntegerAttr>("size").getInt();
+    result.joinFields = joined.getAs<mlir::IntegerAttr>("fields").getInt();
+    result.joinLowBits = joined.getAs<mlir::IntegerAttr>("low_bits").getInt();
+    result.joinRole = joined.getAs<mlir::IntegerAttr>("role").getInt();
+    result.order = joined.getAs<mlir::StringAttr>("order").getValue();
+  } else if (kind == "grouped" && layouts.size() == 2 &&
+             layoutKind(layouts[1]) == "layered") {
+    result.mapping = "grouped_layered";
+    auto grouped = mlir::cast<mlir::DictionaryAttr>(layouts[0]);
+    auto layered = mlir::cast<mlir::DictionaryAttr>(layouts[1]);
+    result.group = grouped.getAs<mlir::IntegerAttr>("size").getInt();
+    result.layer = layered.getAs<mlir::IntegerAttr>("size").getInt();
+    result.order = layered.getAs<mlir::StringAttr>("order").getValue();
+  }
   return result;
 }
 

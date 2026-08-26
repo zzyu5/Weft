@@ -68,34 +68,36 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
   }
 }
 
-std::vector<float> grid64(const std::uint64_t *table, std::size_t entries) {
-  std::vector<float> result(entries * 8);
+std::vector<std::int8_t> grid64(const std::uint64_t *table,
+                                std::size_t entries) {
+  std::vector<std::int8_t> result(entries * 8);
   for (std::size_t entry = 0; entry < entries; ++entry) {
     for (std::size_t lane = 0; lane < 8; ++lane) {
-      result[entry * 8 + lane] = static_cast<float>(
-          static_cast<std::int8_t>((table[entry] >> (8 * lane)) & 0xffU));
+      result[entry * 8 + lane] = static_cast<std::int8_t>(
+          (table[entry] >> (8 * lane)) & 0xffU);
     }
   }
   return result;
 }
 
-std::vector<float> grid32(const std::uint32_t *table, std::size_t entries) {
-  std::vector<float> result(entries * 4);
+std::vector<std::int8_t> grid32(const std::uint32_t *table,
+                                std::size_t entries) {
+  std::vector<std::int8_t> result(entries * 4);
   for (std::size_t entry = 0; entry < entries; ++entry) {
     for (std::size_t lane = 0; lane < 4; ++lane) {
-      result[entry * 4 + lane] = static_cast<float>(
-          static_cast<std::int8_t>((table[entry] >> (8 * lane)) & 0xffU));
+      result[entry * 4 + lane] = static_cast<std::int8_t>(
+          (table[entry] >> (8 * lane)) & 0xffU);
     }
   }
   return result;
 }
 
-std::vector<float> sign_table() {
-  std::vector<float> result(128 * 8);
+std::vector<std::int8_t> sign_table() {
+  std::vector<std::int8_t> result(128 * 8);
   for (std::size_t sign = 0; sign < 128; ++sign) {
     for (std::size_t lane = 0; lane < 8; ++lane) {
       result[sign * 8 + lane] =
-          (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1.0f : 1.0f;
+          (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1 : 1;
     }
   }
   return result;
@@ -222,47 +224,47 @@ extern "C" void row_dequantize_q6_k(const std::uint8_t *, float *, std::size_t);
 using selected_block = block_iq1_s;
 #define selected_reference dequantize_row_iq1_s
 #define selected_qk 256
-extern "C" void row_dequantize_iq1_s(const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq1_s(const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 12
 using selected_block = block_iq1_m;
 #define selected_reference dequantize_row_iq1_m
 #define selected_qk 256
-extern "C" void row_dequantize_iq1_m(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq1_m(const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 13
 using selected_block = block_iq2_s;
 #define selected_reference dequantize_row_iq2_s
 #define selected_qk 256
-extern "C" void row_dequantize_iq2_s(const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq2_s(const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 14
 using selected_block = block_iq2_xs;
 #define selected_reference dequantize_row_iq2_xs
 #define selected_qk 256
-extern "C" void row_dequantize_iq2_xs(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq2_xs(const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 15
 using selected_block = block_iq2_xxs;
 #define selected_reference dequantize_row_iq2_xxs
 #define selected_qk 256
-extern "C" void row_dequantize_iq2_xxs(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq2_xxs(const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 16
 using selected_block = block_iq3_s;
 #define selected_reference dequantize_row_iq3_s
 #define selected_qk 256
-extern "C" void row_dequantize_iq3_s(const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq3_s(const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 17
 using selected_block = block_iq3_xxs;
 #define selected_reference dequantize_row_iq3_xxs
 #define selected_qk 256
-extern "C" void row_dequantize_iq3_xxs(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq3_xxs(const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 18
 using selected_block = block_iq4_nl;
 #define selected_reference dequantize_row_iq4_nl
 #define selected_qk 32
-extern "C" void row_dequantize_iq4_nl(const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq4_nl(const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 19
 using selected_block = block_iq4_xs;
 #define selected_reference dequantize_row_iq4_xs
 #define selected_qk 256
-extern "C" void row_dequantize_iq4_xs(const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_iq4_xs(const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 20
 using selected_block = block_tq1_0;
 #define selected_reference dequantize_row_tq1_0
@@ -277,12 +279,12 @@ extern "C" void row_dequantize_tq2_0(const std::uint8_t *, float *, std::size_t)
 using selected_block = block_mxfp4;
 #define selected_reference dequantize_row_mxfp4
 #define selected_qk 32
-extern "C" void row_dequantize_mxfp4(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_mxfp4(const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #elif WEFT_ROW_FORMAT == 23
 using selected_block = block_nvfp4;
 #define selected_reference dequantize_row_nvfp4
 #define selected_qk 64
-extern "C" void row_dequantize_nvfp4(const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void row_dequantize_nvfp4(const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #else
 #error "unknown WEFT_ROW_FORMAT"
 #endif
@@ -308,21 +310,21 @@ int main(int argc, char **argv) {
                 inputRow.size() * sizeof(selected_block));
   std::vector<float> actual(kRows * kElements);
 
-  const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
-  const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
-  const std::vector<float> iq2xs = grid64(iq2xs_grid, 512);
-  const std::vector<float> iq2s = grid64(iq2s_grid, 1024);
-  const std::vector<float> iq3xxs = grid32(iq3xxs_grid, 256);
-  const std::vector<float> iq3s = grid32(iq3s_grid, 512);
-  const std::vector<float> signs = sign_table();
+  const std::vector<std::int8_t> iq1 = grid64(iq1s_grid, 2048);
+  const std::vector<std::int8_t> iq2xxs = grid64(iq2xxs_grid, 256);
+  const std::vector<std::int8_t> iq2xs = grid64(iq2xs_grid, 512);
+  const std::vector<std::int8_t> iq2s = grid64(iq2s_grid, 1024);
+  const std::vector<std::int8_t> iq3xxs = grid32(iq3xxs_grid, 256);
+  const std::vector<std::int8_t> iq3s = grid32(iq3s_grid, 512);
+  const std::vector<std::int8_t> signs = sign_table();
   const std::vector<float> fp16 = f16_table();
   const std::vector<float> e8m0 = e8m0_table();
   const std::vector<float> ue4m3 = ue4m3_table();
-  std::vector<float> iq4(16);
-  std::vector<float> fp4(16);
+  std::vector<std::int8_t> iq4(16);
+  std::vector<std::int8_t> fp4(16);
   for (std::size_t index = 0; index < 16; ++index) {
-    iq4[index] = static_cast<float>(kvalues_iq4nl[index]);
-    fp4[index] = static_cast<float>(kvalues_mxfp4[index]);
+    iq4[index] = kvalues_iq4nl[index];
+    fp4[index] = kvalues_mxfp4[index];
   }
   const std::uint32_t powers[5] = {1, 3, 9, 27, 81};
   (void)powers;

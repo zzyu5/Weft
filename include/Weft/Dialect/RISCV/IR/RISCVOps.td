@@ -142,7 +142,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
 
 def WeftRISCV_AccessAttr : WeftRISCV_Attr<"Access", "access"> {
   let parameters = (ins
-    StringRefParameter<"unassigned, unit, strided, indexed, segment, or local">:$form,
+    StringRefParameter<"unassigned, unit, strided, indexed, segment, register, or local">:$form,
     StringRefParameter<"dense, natural, grouped_layered, joined, or opaque">:$mapping,
     "int64_t":$alignment,
     "int64_t":$indexSEW,
@@ -766,6 +766,16 @@ def WeftRISCV_RegisterMaterializeOp
                        I64Attr:$birth_id, I64Attr:$lifetime_end_domain_id,
                        StrAttr:$realization);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVBitplaneMergeOp
+    : WeftRISCV_Op<"rvv_bitplane_merge", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$low,
+                       WeftRISCV_ValueType:$plane,
+                       I64Attr:$insert_bit,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 

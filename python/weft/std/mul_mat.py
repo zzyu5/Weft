@@ -350,7 +350,7 @@ def mul_mat_iq1_s(
     W: View[IQ1_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -363,7 +363,7 @@ def mul_mat_iq1_m(
     W: View[IQ1_M, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
     f16_bits: View[f32, (65536,)],
     Y: View[f32, (M, N)],
 ):
@@ -378,7 +378,7 @@ def mul_mat_iq2_s(
     W: View[IQ2_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (8192,)],
+    grid: View[i8, (8192,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -391,8 +391,8 @@ def mul_mat_iq2_xs(
     W: View[IQ2_XS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (4096,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (4096,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -406,8 +406,8 @@ def mul_mat_iq2_xxs(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (2048,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -483,7 +483,7 @@ def mul_mat_iq3_s(
     W: View[IQ3_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (2048,)],
+    grid: View[i8, (2048,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -496,8 +496,8 @@ def mul_mat_iq3_xxs(
     W: View[IQ3_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[f32, (1024,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (1024,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -511,7 +511,7 @@ def mul_mat_iq4_nl(
     W: View[IQ4_NL, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_0(X, Xq)
@@ -525,7 +525,7 @@ def mul_mat_iq4_xs(
     W: View[IQ4_XS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -564,7 +564,7 @@ def mul_mat_mxfp4(
     W: View[MXFP4, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     scale: View[f32, (256,)],
     Y: View[f32, (M, N)],
 ):
@@ -579,7 +579,7 @@ def mul_mat_nvfp4(
     W: View[NVFP4, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     scale: View[f32, (256,)],
     Y: View[f32, (M, N)],
 ):

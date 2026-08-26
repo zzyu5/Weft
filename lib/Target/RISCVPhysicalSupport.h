@@ -14,6 +14,20 @@
 
 namespace weft::riscv_internal {
 
+struct FieldFacts {
+  llvm::StringRef mapping = "opaque";
+  bool scalarPerRecord = false;
+  int64_t group = 0;
+  int64_t layer = 0;
+  int64_t joinFields = 0;
+  int64_t joinLowBits = 0;
+  int64_t joinRole = 0;
+  int64_t bitOffset = 0;
+  int64_t storageBits = 0;
+  int64_t alignment = 1;
+  llvm::StringRef order = "none";
+};
+
 mlir::DenseI64ArrayAttr integers(mlir::Builder &builder,
                                  llvm::ArrayRef<int64_t> values);
 mlir::ArrayAttr strings(mlir::Builder &builder,
@@ -84,6 +98,7 @@ llvm::StringRef baseEncodingFamily(mlir::Operation *operation,
                                    kernel::EncodingType encoding);
 int64_t interleaveRows(mlir::Operation *operation,
                        kernel::EncodingType encoding);
+FieldFacts fieldFacts(riscv::FieldOp operation);
 
 void copyOrigin(mlir::Operation *source, mlir::Operation *target);
 

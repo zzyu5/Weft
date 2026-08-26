@@ -2298,6 +2298,62 @@ private:
             else
               stepRhs = projectedValue;
           }
+          if (implementation.getOperation() == "rvv.vfmacc") {
+            auto normalizeFloatOperand =
+                [&](mlir::Value input) -> mlir::FailureOr<mlir::Value> {
+              mlir::Type sourceElement =
+                  riscv_internal::logicalElement(input.getType());
+              if (sourceElement == element)
+                return input;
+              if (!sourceElement.isF16() || !element.isF32())
+                return mlir::failure();
+
+              mlir::Type targetType = element;
+              llvm::StringRef engine = "scalar";
+              int64_t operandGroups = 0;
+              int64_t resultGroups = 0;
+              if (auto sourceType =
+                      mlir::dyn_cast<riscv::ValueType>(input.getType())) {
+                auto targetSeed = riscv::ValueType::get(
+                    rewriter.getContext(), element, sourceType.getShape(),
+                    sourceType.getAxisIds(), sourceType.getLayout());
+                riscv::LayoutAttr targetLayout = riscv_internal::projectLayout(
+                    rewriter, targetSeed, sourceType.getLayout(),
+                    kernel.getTarget());
+                if (!targetLayout ||
+                    (targetLayout.getCarrier() != "scalar" &&
+                     targetLayout.getCarrier() != "rvv"))
+                  return mlir::failure();
+                targetType = riscv::ValueType::get(
+                    rewriter.getContext(), element, sourceType.getShape(),
+                    sourceType.getAxisIds(), targetLayout);
+                engine = targetLayout.getCarrier();
+                operandGroups = sourceType.getLayout().getRegisterGroups();
+                resultGroups = targetLayout.getRegisterGroups();
+              }
+              llvm::StringRef instruction =
+                  engine == "rvv" ? "rvv.fwiden.f16-f32" : "scalar.widen";
+              auto widened = rewriter.create<riscv::WidenOp>(
+                  operation->getLoc(), targetType, input,
+                  riscv_internal::leaf(rewriter, engine, "widen", instruction,
+                                       instruction, operandGroups,
+                                       resultGroups));
+              copyIdentity(operation, widened);
+              return widened.getResult();
+            };
+            auto normalizedLhs = normalizeFloatOperand(stepLhs);
+            auto normalizedRhs = normalizeFloatOperand(stepRhs);
+            if (mlir::failed(normalizedLhs) || mlir::failed(normalizedRhs)) {
+              operation->emitError(
+                  "floating contract operands have no legal typed f32 handoff");
+              failed = true;
+              contractFailed = true;
+              break;
+            }
+            stepLhs = *normalizedLhs;
+            stepRhs = *normalizedRhs;
+            stepLane = laneOperand.getValue() == "rhs" ? stepRhs : stepLhs;
+          }
           auto contractStep = rewriter.create<riscv::RVVContractStepOp>(
               operation->getLoc(), resultType, stepLhs, stepRhs, carried, index,
               reductionAxis, laneOperand.getValue(),

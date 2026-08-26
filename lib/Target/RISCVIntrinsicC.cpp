@@ -607,6 +607,8 @@ private:
   mlir::LogicalResult compileRVVEncodedContractStep(
       riscv::RVVEncodedContractStepOp operation);
   mlir::LogicalResult
+  compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation);
+  mlir::LogicalResult
   compileGroupedMacReduce(riscv::RVVGroupedMacReduceOp operation);
   mlir::LogicalResult
   compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation);
@@ -1988,6 +1990,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileReduce(reduce);
   if (auto fold = mlir::dyn_cast<riscv::Fold2Op>(operation))
     return compileFold2(fold);
+  if (auto merge = mlir::dyn_cast<riscv::RVVBitplaneMergeOp>(operation))
+    return compileRVVBitplaneMerge(merge);
   if (auto reduce = mlir::dyn_cast<riscv::RVVGroupedMacReduceOp>(operation))
     return compileGroupedMacReduce(reduce);
   if (auto load = mlir::dyn_cast<riscv::RVVGroupedMacLoadOp>(operation))
@@ -2825,6 +2829,54 @@ mlir::LogicalResult Emitter::compileField(riscv::FieldOp operation) {
 
 mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
   Binding binding = bindings.lookup(operation.getInput());
+  if (instructionOf(operation.getOperation()) == "rvv.extract.vrgather") {
+    mlir::FailureOr<Binding> source =
+        materializeNumeric(operation.getInput(), std::move(binding));
+    if (mlir::failed(source))
+      return mlir::failure();
+    mlir::Value gatherIndex;
+    size_t cursor = 0;
+    for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (cursor >= operation.getIndices().size())
+        return fail(operation, "register extract selector has no index");
+      if (selector == "gather") {
+        if (gatherIndex)
+          return fail(operation,
+                      "register extract supports one shaped gather selector");
+        gatherIndex = operation.getIndices()[cursor];
+      }
+      ++cursor;
+    }
+    if (!gatherIndex || source->kind != Binding::Kind::Vector ||
+        source->parts.size() != 1)
+      return fail(operation,
+                  "register extract requires one complete source vector");
+    mlir::FailureOr<Binding> indices = materializeNumeric(
+        gatherIndex, bindings.lookup(gatherIndex));
+    if (mlir::failed(indices) || indices->kind != Binding::Kind::Vector)
+      return fail(operation, "register extract requires vector indices");
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    const std::string suffix = vectorSuffix(operation.getResult());
+    const std::string type = vectorType(operation.getResult());
+    for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+      auto indexPart = projectPart(gatherIndex, operation.getResult(), part);
+      if (!indexPart || *indexPart >= indices->parts.size())
+        return fail(operation,
+                    "register extract index mapping requires an explicit layout conversion");
+      std::string name = fresh("register_gather");
+      line(type + " " + name + " = __riscv_vrgather_vv_" + suffix + "(" +
+           source->parts.front() + ", " + indices->parts[*indexPart] + ", " +
+           partVL(operation.getResult(), part) + ");");
+      result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (binding.kind == Binding::Kind::Scalar &&
       !mlir::isa<riscv::ValueType>(operation.getResult().getType())) {
     auto input = mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
@@ -3125,16 +3177,14 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
   if (binding.kind != Binding::Kind::Vector)
     return fail(operation,
                 "extract has no selected local vector or encoded-field input");
-  if (!mlir::isa<mlir::IntegerType>(
-          riscv_internal::logicalElement(operation.getInput().getType())) ||
-      riscv_internal::logicalElement(operation.getInput().getType()) !=
+  mlir::Type extractElement =
+      riscv_internal::logicalElement(operation.getInput().getType());
+  if ((!mlir::isa<mlir::IntegerType>(extractElement) &&
+       !mlir::isa<mlir::FloatType>(extractElement)) ||
+      extractElement !=
           riscv_internal::logicalElement(operation.getResult().getType()))
     return fail(operation,
-                "current local vector extract requires one unchanged integer element type");
-  if (streamPartCount(operation.getResult()) != 1)
-    return fail(operation,
-                "current local vector extract result must fit one RVV value");
-
+                "current local vector extract requires one unchanged numeric element type");
   std::optional<mlir::Value> pointValue;
   size_t cursor = 0;
   for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
@@ -3166,38 +3216,41 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
       logicalExtent = extent;
   const int64_t inputLanes = physicalLanes(operation.getInput());
   const int64_t resultLanes = physicalLanes(operation.getResult());
+  const int64_t inputStreams = streamPartCount(operation.getInput());
+  const int64_t resultStreams = streamPartCount(operation.getResult());
   if (logicalExtent <= 0 || inputLanes <= 0 || resultLanes <= 0 ||
-      inputLanes % resultLanes ||
-      point.point.physicalExtent > resultLanes ||
+      inputLanes != resultLanes || inputStreams <= 0 || resultStreams <= 0 ||
+      point.point.physicalExtent <= 0 ||
+      point.point.physicalExtent % resultLanes ||
+      registerPartCount(operation.getInput()) != 1 ||
+      registerPartCount(operation.getResult()) != 1 ||
       static_cast<int64_t>(binding.parts.size()) !=
-          streamPartCount(operation.getInput()))
+          inputStreams)
     return fail(operation,
                 "selected local vector subview has incompatible strip geometry");
 
-  const std::string inputSuffix = vectorSuffix(operation.getInput());
   const std::string resultSuffix = vectorSuffix(operation.getResult());
   const std::string resultType = vectorType(operation.getResult());
-  const std::string resultName = fresh("extract");
-  line(resultType + " " + resultName + " = __riscv_vmv_v_x_" + resultSuffix +
-       "(0, " + laneVL() + ");");
   const std::string relative = "(" + point.point.base + " % " +
                                std::to_string(logicalExtent) + ")";
-  for (auto [part, source] : llvm::enumerate(binding.parts)) {
-    const std::string shifted =
-        "__riscv_vslidedown_vx_" + inputSuffix + "(" + source + ", " +
-        relative + " % " + std::to_string(inputLanes) + ", " +
-        std::to_string(inputLanes) + ")";
-    const std::string extracted =
-        inputSuffix == resultSuffix
-            ? shifted
-            : "__riscv_vlmul_trunc_v_" + inputSuffix + "_" + resultSuffix +
-                  "(" + shifted + ")";
-    line("if ((" + relative + " / " + std::to_string(inputLanes) + ") == " +
-         std::to_string(part) + ") " + resultName + " = " + extracted + ";");
-  }
   Binding result;
   result.kind = Binding::Kind::Vector;
-  result.parts.push_back(std::move(resultName));
+  for (int64_t resultPart = 0; resultPart < resultStreams; ++resultPart) {
+    const std::string resultName = fresh("extract");
+    const std::string splat =
+        mlir::isa<mlir::FloatType>(extractElement) ? "__riscv_vfmv_v_f_"
+                                                   : "__riscv_vmv_v_x_";
+    line(resultType + " " + resultName + " = " + splat + resultSuffix +
+         "(" + (mlir::isa<mlir::FloatType>(extractElement) ? "0.0" : "0") +
+         ", " + partVL(operation.getResult(), resultPart) + ");");
+    const std::string selectedPart =
+        "(" + relative + " / " + std::to_string(inputLanes) + " + " +
+        std::to_string(resultPart) + ")";
+    for (auto [sourcePart, source] : llvm::enumerate(binding.parts))
+      line("if (" + selectedPart + " == " + std::to_string(sourcePart) +
+           ") " + resultName + " = " + source + ";");
+    result.parts.push_back(resultName);
+  }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
@@ -4299,6 +4352,51 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
 
 mlir::LogicalResult Emitter::compileLookup(riscv::LookupOp operation) {
   llvm::StringRef realization = instructionOf(operation.getOperation());
+  Binding indices = bindings.lookup(operation.getIndices());
+  mlir::FailureOr<Binding> materializedIndices =
+      materializeNumeric(operation.getIndices(), indices);
+  if (mlir::failed(materializedIndices))
+    return mlir::failure();
+  indices = std::move(*materializedIndices);
+
+  if (realization == "rvv.vrgather") {
+    Binding table = bindings.lookup(operation.getTable());
+    mlir::FailureOr<Binding> materializedTable =
+        materializeNumeric(operation.getTable(), table);
+    if (mlir::failed(materializedTable))
+      return mlir::failure();
+    table = std::move(*materializedTable);
+    if (table.kind != Binding::Kind::Vector || table.parts.size() != 1 ||
+        indices.kind != Binding::Kind::Vector)
+      return fail(operation,
+                  "RVV register lookup requires one complete table vector and vector indices");
+    const int64_t parts = vectorPartCount(operation.getResult());
+    const std::string resultSuffix = vectorSuffix(operation.getResult());
+    const std::string resultType = vectorType(operation.getResult());
+    const bool share = isSharedMaterialization(operation.getResult());
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < parts; ++part) {
+      auto indexPart = mappedPart(operation.getOperation(), 1, part);
+      if (!indexPart || *indexPart >= indices.parts.size())
+        return fail(operation,
+                    "register lookup index mapping requires an explicit layout conversion");
+      const std::string vl = partVL(operation.getResult(), part);
+      std::string expression = "__riscv_vrgather_vv_" + resultSuffix + "(" +
+                               table.parts.front() + ", " +
+                               indices.parts[*indexPart] + ", " + vl + ")";
+      if (!share) {
+        result.parts.push_back(std::move(expression));
+        continue;
+      }
+      std::string name = fresh("lookup");
+      line(resultType + " " + name + " = " + expression + ";");
+      result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
+
   Binding table = bindings.lookup(operation.getTable());
   if (table.kind != Binding::Kind::Slice && table.kind != Binding::Kind::Memory)
     return fail(operation,
@@ -4323,13 +4421,6 @@ mlir::LogicalResult Emitter::compileLookup(riscv::LookupOp operation) {
                 "selected lookup requires a byte-addressable numeric table");
   const unsigned tableBytes = tableBits / 8;
   const std::string base = "((const " + *tableCType + " *)(" + *address + "))";
-
-  Binding indices = bindings.lookup(operation.getIndices());
-  mlir::FailureOr<Binding> materialized =
-      materializeNumeric(operation.getIndices(), indices);
-  if (mlir::failed(materialized))
-    return mlir::failure();
-  indices = std::move(*materialized);
 
   if (realization == "scalar.lookup") {
     if (indices.kind != Binding::Kind::Scalar)
@@ -4622,13 +4713,13 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
                    ", " + rhsPart + ", " +
                    partVL(operation.getResult(), index) + ")";
     }
-    if (streamPartCount(operation.getResult()) > 1) {
-      result.parts.push_back(std::move(expression));
-    } else {
-      std::string name = fresh("pointwise");
-      line(type + " " + name + " = " + expression + ";");
-      result.parts.push_back(std::move(name));
-    }
+    // Preserve the physical SSA operation as one C value.  Inlining the
+    // expression into each downstream use would duplicate loop-invariant
+    // coordinate work after LICM and would no longer spell the selected
+    // physical program mechanically.
+    std::string name = fresh("pointwise");
+    line(type + " " + name + " = " + expression + ";");
+    result.parts.push_back(std::move(name));
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
@@ -4679,21 +4770,117 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
       llvm::StringRef form = fieldBinding.field.useAccess
                                  ? fieldBinding.field.useAccess.getForm()
                                  : llvm::StringRef();
-      if (form != "indexed" ||
-          owner.interleaveRows != 0 ||
-          field->bitOffset % 8 || field->access.getMapping() != "natural" ||
-          (logicalWidth != 8 && logicalWidth != 16 && logicalWidth != 32))
+      if (form != "indexed" || owner.interleaveRows != 0 ||
+          field->bitOffset % 8)
         return {};
       mlir::Value indexValue = *fieldBinding.field.index;
       auto indexLayout = layoutOf(indexValue);
       auto elementType = scalarCType(field->type);
-      if (!indexLayout || !elementType)
+      if (!indexLayout)
         return {};
       const std::string indexSuffix =
           "u" + std::to_string(indexLayout.getSew()) +
           lmulSpelling(indexLayout.getLmulEighths());
       const std::string resultSuffix = vectorSuffix(result);
       const std::string resultType = vectorType(result);
+      llvm::StringRef mapping = field->access.getMapping();
+      if (mapping == "grouped_layered") {
+        auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
+        auto resultLayout = layoutOf(result);
+        const int64_t group = field->access.getGroupSize();
+        const int64_t layer = field->access.getLayerSize();
+        const int64_t layers = layer > 0 ? group / layer : 0;
+        llvm::StringRef order = field->access.getOrder();
+        if (!integer || integer.isSigned() || !resultLayout ||
+            indexLayout.getSew() != 32 || resultLayout.getSew() != 8 ||
+            logicalWidth == 0 || logicalWidth > 8 || group <= 0 ||
+            layer <= 0 || group % layer || layers * logicalWidth > 8 ||
+            physicalLanes(indexValue) != physicalLanes(result))
+          return {};
+
+        const int64_t indexLMUL = indexLayout.getLmulEighths();
+        if (indexLMUL % 4)
+          return {};
+        const int64_t shift16LMUL = indexLMUL / 2;
+        const int64_t shift8LMUL = indexLMUL / 4;
+        if (shift8LMUL != resultLayout.getLmulEighths())
+          return {};
+        const std::string shift16Suffix =
+            "u16" + lmulSpelling(shift16LMUL);
+        const std::string shift16Type =
+            "vuint16" + lmulSpelling(shift16LMUL) + "_t";
+        const std::string shift8Suffix =
+            "u8" + lmulSpelling(shift8LMUL);
+        const std::string shift8Type =
+            "vuint8" + lmulSpelling(shift8LMUL) + "_t";
+        const uint64_t mask = (uint64_t(1) << logicalWidth) - 1;
+        Binding gathered;
+        gathered.kind = Binding::Kind::Vector;
+        const int64_t resultStreams = streamPartCount(result);
+        for (int64_t part = 0; part < vectorPartCount(result); ++part) {
+          auto indexPart = projectPart(indexValue, result, part);
+          auto coordinates =
+              registerCoordinates(result, part / resultStreams);
+          llvm::SmallVector<int64_t, 4> axes = registerAxesFor(result);
+          if (!indexPart || *indexPart >= index.parts.size() || !coordinates ||
+              coordinates->size() != axes.size())
+            return {};
+          std::string record = "(" + owner.recordPointer;
+          for (auto [axis, coordinate] : llvm::zip(axes, *coordinates))
+            for (const auto &[recordAxis, stride] : owner.recordByteStrides)
+              if (recordAxis == axis)
+                record += " + " + std::to_string(coordinate) + " * " + stride;
+          record += " + " + std::to_string(field->bitOffset / 8) + ")";
+          const std::string vl = partVL(result, part);
+          const std::string &indices = index.parts[*indexPart];
+          std::string within = fresh("encoded_within");
+          line("vuint32" + lmulSpelling(indexLMUL) + "_t " + within +
+               " = __riscv_vremu_vx_" + indexSuffix + "(" + indices + ", " +
+               std::to_string(group) + ", " + vl + ");");
+          std::string groups = fresh("encoded_group");
+          line("vuint32" + lmulSpelling(indexLMUL) + "_t " + groups +
+               " = __riscv_vdivu_vx_" + indexSuffix + "(" + indices + ", " +
+               std::to_string(group) + ", " + vl + ");");
+          std::string bytes = fresh("encoded_bytes");
+          line("vuint32" + lmulSpelling(indexLMUL) + "_t " + bytes +
+               " = __riscv_vadd_vv_" + indexSuffix +
+               "(__riscv_vmul_vx_" + indexSuffix + "(" + groups + ", " +
+               std::to_string(layer) + ", " + vl + "), " +
+               "__riscv_vremu_vx_" + indexSuffix + "(" + within + ", " +
+               std::to_string(layer) + ", " + vl + "), " + vl + ");");
+          std::string loaded = fresh("encoded_gather");
+          line(resultType + " " + loaded + " = __riscv_vluxei32_v_" +
+               resultSuffix + "((const uint8_t *)(" + record + "), " + bytes +
+               ", " + vl + ");");
+          std::string layer32 = fresh("encoded_layer");
+          std::string layerExpression =
+              "__riscv_vdivu_vx_" + indexSuffix + "(" + within + ", " +
+              std::to_string(layer) + ", " + vl + ")";
+          if (order == "hi_first")
+            layerExpression = "__riscv_vrsub_vx_" + indexSuffix + "(" +
+                              layerExpression + ", " +
+                              std::to_string(layers - 1) + ", " + vl + ")";
+          line("vuint32" + lmulSpelling(indexLMUL) + "_t " + layer32 +
+               " = __riscv_vmul_vx_" + indexSuffix + "(" + layerExpression +
+               ", " + std::to_string(logicalWidth) + ", " + vl + ");");
+          std::string layer16 = fresh("encoded_shift16");
+          line(shift16Type + " " + layer16 + " = __riscv_vnsrl_wx_" +
+               shift16Suffix + "(" + layer32 + ", 0, " + vl + ");");
+          std::string layer8 = fresh("encoded_shift8");
+          line(shift8Type + " " + layer8 + " = __riscv_vnsrl_wx_" +
+               shift8Suffix + "(" + layer16 + ", 0, " + vl + ");");
+          std::string decoded = fresh("encoded_value");
+          line(resultType + " " + decoded + " = __riscv_vand_vx_" +
+               resultSuffix + "(__riscv_vsrl_vv_" + resultSuffix + "(" +
+               loaded + ", " + layer8 + ", " + vl + "), " +
+               std::to_string(mask) + ", " + vl + ");");
+          gathered.parts.push_back(std::move(decoded));
+        }
+        return gathered;
+      }
+      if (mapping != "natural" || !elementType ||
+          (logicalWidth != 8 && logicalWidth != 16 && logicalWidth != 32))
+        return {};
       Binding gathered;
       gathered.kind = Binding::Kind::Vector;
       const int64_t resultStreams = streamPartCount(result);
@@ -5754,6 +5941,30 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
             if (resultLanes % sourceLanes != 0)
               return fail(conversion,
                           "RVV merge repartition requires integral lane groups");
+            const int64_t pieces = resultLanes / sourceLanes;
+            auto sourceLayout = layoutOf(conversion.getInput());
+            auto resultLayout = layoutOf(conversion.getResult());
+            if (pieces == 2 && sourceLayout && resultLayout &&
+                sourceLayout.getSew() == resultLayout.getSew() &&
+                sourceLayout.getLmulEighths() >= 8 &&
+                sourceLayout.getLmulEighths() * 2 ==
+                    resultLayout.getLmulEighths()) {
+              const int64_t firstStream = resultStream * pieces;
+              const size_t firstPart =
+                  *sourceRegister * sourceStreams + firstStream;
+              const size_t secondPart = firstPart + 1;
+              if (firstStream + 1 >= sourceStreams ||
+                  secondPart >= input.parts.size())
+                return fail(conversion,
+                            "RVV create repartition exceeds its source streams");
+              expression = "__riscv_vcreate_v_" + sourceSuffix + "_" +
+                           resultSuffix + "(" + input.parts[firstPart] + ", " +
+                           input.parts[secondPart] + ")";
+              std::string name = fresh("layout_repartition");
+              line(resultCType + " " + name + " = " + expression + ";");
+              repartitioned.parts.push_back(std::move(name));
+              continue;
+            }
             mlir::Type element = resultType.getElementType();
             std::string merged =
                 std::string(mlir::isa<mlir::FloatType>(element)
@@ -5764,7 +5975,6 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
                 partVL(conversion.getResult(),
                        resultRegister * resultStreams + resultStream) +
                 ")";
-            const int64_t pieces = resultLanes / sourceLanes;
             for (int64_t piece = 0; piece < pieces; ++piece) {
               const int64_t sourceStream =
                   resultStream * pieces + piece;
@@ -5841,6 +6051,82 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
   }
   return fail(conversion,
               "layout conversion kind is not a terminal RVV representation operation");
+}
+
+mlir::LogicalResult
+Emitter::compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.bitplane-merge")
+    return fail(operation, "RVV bitplane merge has no exact selected leaf");
+  mlir::FailureOr<Binding> low = materializeNumeric(
+      operation.getLow(), bindings.lookup(operation.getLow()));
+  Binding plane = bindings.lookup(operation.getPlane());
+  if (mlir::failed(low) || low->kind != Binding::Kind::Vector ||
+      plane.kind != Binding::Kind::Field)
+    return fail(operation,
+                "RVV bitplane merge requires one vector value and one encoded field edge");
+  Binding owner = bindings.lookup(plane.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    mlir::FailureOr<Binding> record = recordForSlice(plane.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(plane);
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      !field || field->access.getMapping() != "natural" ||
+      field->bitOffset % 8)
+    return fail(operation,
+                "RVV bitplane merge field has no direct byte-plane address");
+
+  auto layout = operation.getResult().getType().getLayout();
+  const int64_t maskBits = layout.getSew() * 8 / layout.getLmulEighths();
+  if ((maskBits != 1 && maskBits != 2 && maskBits != 4 && maskBits != 8 &&
+       maskBits != 16 && maskBits != 32 && maskBits != 64) ||
+      layout.getVl() % 8)
+    return fail(operation,
+                "RVV bitplane merge selected an illegal mask ratio or byte boundary");
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  const std::string maskType =
+      "vbool" + std::to_string(maskBits) + "_t";
+  const int64_t parts = vectorPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    auto lowPart = mappedPart(operation.getOperation(), 0, part);
+    auto coordinates = registerCoordinates(operation.getResult(), part / streams);
+    auto axes = registerAxesFor(operation.getResult());
+    if (!lowPart || *lowPart >= low->parts.size() || !coordinates ||
+        coordinates->size() != axes.size())
+      return fail(operation,
+                  "RVV bitplane merge lacks one typed value-use or register mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      auto stride = llvm::find_if(owner.recordByteStrides, [&](const auto &entry) {
+        return entry.first == axis;
+      });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "RVV bitplane merge register axis has no record-byte stride");
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += " + " + std::to_string(field->bitOffset / 8) + " + (" +
+              partOffset(operation.getResult(), part) + " / 8))";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string mask = fresh("bitplane_mask");
+    line(maskType + " " + mask + " = __riscv_vlm_v_b" +
+         std::to_string(maskBits) + "((const uint8_t *)(" + record + "), " +
+         vl + ");");
+    std::string merged = fresh("bitplane_merge");
+    line(type + " " + merged + " = __riscv_vor_vx_" + suffix + "_mu(" +
+         mask + ", " + low->parts[*lowPart] + ", " + low->parts[*lowPart] +
+         ", " + std::to_string(int64_t(1) << operation.getInsertBit()) + ", " +
+         vl + ");");
+    result.parts.push_back(std::move(merged));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
 }
 
 mlir::LogicalResult Emitter::compileGroupedMacReduce(

@@ -184,9 +184,10 @@ Top-K、heap update、依赖前一迭代的搜索和 CSR traversal 可以只用�
 
 ```python
 lane = iota(8, dtype=u32)
+within_k = iota(32, dtype=u32, axis="k")
 ```
 
-`iota` 建立 shape `[8]` 的 logical index Value 和一个明确 axis identity。后续 gather、lookup、pointwise 与 reduce 在这个轴上组合。
+未指定 `axis` 时，`iota` 建立一条新的 logical axis。`axis="k"` 则让坐标值沿已经存在的 K axis 排列；它用于显式描述一个 K block 内的 field gather、bit-plane 组合或 lookup，不创建第二条同 extent 轴。两种形式都产生 shaped logical index Value，后续 gather、lookup、pointwise 与 reduce 按其 axis identity 组合。
 
 它与下面程序不同：
 

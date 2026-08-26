@@ -772,9 +772,9 @@ private:
       targetName = riscv::NewOp::getOperationName();
     } else if (mlir::isa<kernel::MaterializeOp>(source)) {
       attrs.emplace_back(builder.getStringAttr("placement"),
-                         builder.getStringAttr("reload"));
+                         builder.getStringAttr("shared"));
       attrs.emplace_back(builder.getStringAttr("schema"),
-                         builder.getStringAttr("pinned-reload"));
+                         builder.getStringAttr("value-share"));
       attrs.emplace_back(builder.getStringAttr("owner_domain_id"),
                          builder.getI64IntegerAttr(currentOwnerDomainId));
       attrs.emplace_back(builder.getStringAttr("birth_id"),

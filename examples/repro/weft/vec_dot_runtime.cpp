@@ -68,34 +68,36 @@ void evict_cache(std::vector<std::uint8_t> &buffer) {
   }
 }
 
-std::vector<float> grid64(const std::uint64_t *table, std::size_t entries) {
-  std::vector<float> result(entries * 8);
+std::vector<std::int8_t> grid64(const std::uint64_t *table,
+                                std::size_t entries) {
+  std::vector<std::int8_t> result(entries * 8);
   for (std::size_t entry = 0; entry < entries; ++entry) {
     for (std::size_t lane = 0; lane < 8; ++lane) {
-      result[entry * 8 + lane] = static_cast<float>(
-          static_cast<std::int8_t>((table[entry] >> (8 * lane)) & 0xffU));
+      result[entry * 8 + lane] = static_cast<std::int8_t>(
+          (table[entry] >> (8 * lane)) & 0xffU);
     }
   }
   return result;
 }
 
-std::vector<float> grid32(const std::uint32_t *table, std::size_t entries) {
-  std::vector<float> result(entries * 4);
+std::vector<std::int8_t> grid32(const std::uint32_t *table,
+                                std::size_t entries) {
+  std::vector<std::int8_t> result(entries * 4);
   for (std::size_t entry = 0; entry < entries; ++entry) {
     for (std::size_t lane = 0; lane < 4; ++lane) {
-      result[entry * 4 + lane] = static_cast<float>(
-          static_cast<std::int8_t>((table[entry] >> (8 * lane)) & 0xffU));
+      result[entry * 4 + lane] = static_cast<std::int8_t>(
+          (table[entry] >> (8 * lane)) & 0xffU);
     }
   }
   return result;
 }
 
-std::vector<float> sign_table() {
-  std::vector<float> result(128 * 8);
+std::vector<std::int8_t> sign_table() {
+  std::vector<std::int8_t> result(128 * 8);
   for (std::size_t sign = 0; sign < 128; ++sign) {
     for (std::size_t lane = 0; lane < 8; ++lane) {
       result[sign * 8 + lane] =
-          (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1.0f : 1.0f;
+          (ksigns_iq2xs[sign] & kmask_iq2xs[lane]) ? -1 : 1;
     }
   }
   return result;
@@ -236,7 +238,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq1_s_q8_K_generic
-extern "C" void quantized_vec_dot_iq1_s_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq1_s_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq1_s_q8_k(w, x, iq1.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 12
 using selected_weight = block_iq1_m;
@@ -244,7 +246,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq1_m_q8_K_generic
-extern "C" void quantized_vec_dot_iq1_m_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq1_m_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq1_m_q8_k(w, x, iq1.data(), fp16.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 13
 using selected_weight = block_iq2_s;
@@ -252,7 +254,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_s_q8_K_generic
-extern "C" void quantized_vec_dot_iq2_s_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq2_s_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq2_s_q8_k(w, x, iq2s.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 14
 using selected_weight = block_iq2_xs;
@@ -260,7 +262,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xs_q8_K_generic
-extern "C" void quantized_vec_dot_iq2_xs_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq2_xs_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq2_xs_q8_k(w, x, iq2xs.data(), signs.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 15
 using selected_weight = block_iq2_xxs;
@@ -268,7 +270,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xxs_q8_K_generic
-extern "C" void quantized_vec_dot_iq2_xxs_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq2_xxs_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq2_xxs_q8_k(w, x, iq2xxs.data(), signs.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 16
 using selected_weight = block_iq3_s;
@@ -276,7 +278,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq3_s_q8_K_generic
-extern "C" void quantized_vec_dot_iq3_s_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq3_s_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq3_s_q8_k(w, x, iq3s.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 17
 using selected_weight = block_iq3_xxs;
@@ -284,7 +286,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq3_xxs_q8_K_generic
-extern "C" void quantized_vec_dot_iq3_xxs_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq3_xxs_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq3_xxs_q8_k(w, x, iq3xxs.data(), signs.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 18
 using selected_weight = block_iq4_nl;
@@ -292,7 +294,7 @@ using selected_activation = block_q8_0;
 #define selected_wqk 32
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_iq4_nl_q8_0_generic
-extern "C" void quantized_vec_dot_iq4_nl_q8_0(const std::uint8_t *, const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq4_nl_q8_0(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq4_nl_q8_0(w, x, iq4.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 19
 using selected_weight = block_iq4_xs;
@@ -300,7 +302,7 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq4_xs_q8_K_generic
-extern "C" void quantized_vec_dot_iq4_xs_q8_k(const std::uint8_t *, const std::uint8_t *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_iq4_xs_q8_k(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_iq4_xs_q8_k(w, x, iq4.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 20
 using selected_weight = block_tq1_0;
@@ -324,7 +326,7 @@ using selected_activation = block_q8_0;
 #define selected_wqk 32
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_mxfp4_q8_0_generic
-extern "C" void quantized_vec_dot_mxfp4_q8_0(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_mxfp4_q8_0(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_mxfp4_q8_0(w, x, fp4.data(), e8m0.data(), y, kElements)
 #elif WEFT_VEC_DOT_FORMAT == 23
 using selected_weight = block_nvfp4;
@@ -332,7 +334,7 @@ using selected_activation = block_q8_0;
 #define selected_wqk 64
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_nvfp4_q8_0
-extern "C" void quantized_vec_dot_nvfp4_q8_0(const std::uint8_t *, const std::uint8_t *, const float *, const float *, float *, std::size_t);
+extern "C" void quantized_vec_dot_nvfp4_q8_0(const std::uint8_t *, const std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_nvfp4_q8_0(w, x, fp4.data(), ue4m3.data(), y, kElements)
 #else
 #error "unknown WEFT_VEC_DOT_FORMAT"
@@ -394,21 +396,21 @@ int main(int argc, char **argv) {
     std::memcpy(weights.data() + row * weightRow.size(), weightRow.data(),
                 weightRow.size() * sizeof(selected_weight));
 
-  const std::vector<float> iq1 = grid64(iq1s_grid, 2048);
-  const std::vector<float> iq2xxs = grid64(iq2xxs_grid, 256);
-  const std::vector<float> iq2xs = grid64(iq2xs_grid, 512);
-  const std::vector<float> iq2s = grid64(iq2s_grid, 1024);
-  const std::vector<float> iq3xxs = grid32(iq3xxs_grid, 256);
-  const std::vector<float> iq3s = grid32(iq3s_grid, 512);
-  const std::vector<float> signs = sign_table();
+  const std::vector<std::int8_t> iq1 = grid64(iq1s_grid, 2048);
+  const std::vector<std::int8_t> iq2xxs = grid64(iq2xxs_grid, 256);
+  const std::vector<std::int8_t> iq2xs = grid64(iq2xs_grid, 512);
+  const std::vector<std::int8_t> iq2s = grid64(iq2s_grid, 1024);
+  const std::vector<std::int8_t> iq3xxs = grid32(iq3xxs_grid, 256);
+  const std::vector<std::int8_t> iq3s = grid32(iq3s_grid, 512);
+  const std::vector<std::int8_t> signs = sign_table();
   const std::vector<float> fp16 = f16_table();
   const std::vector<float> e8m0 = e8m0_table();
   const std::vector<float> ue4m3 = ue4m3_table();
-  std::vector<float> iq4(16);
-  std::vector<float> fp4(16);
+  std::vector<std::int8_t> iq4(16);
+  std::vector<std::int8_t> fp4(16);
   for (std::size_t index = 0; index < 16; ++index) {
-    iq4[index] = static_cast<float>(kvalues_iq4nl[index]);
-    fp4[index] = static_cast<float>(kvalues_mxfp4[index]);
+    iq4[index] = kvalues_iq4nl[index];
+    fp4[index] = kvalues_mxfp4[index];
   }
   const std::uint32_t powers[5] = {1, 3, 9, 27, 81};
   (void)iq1;

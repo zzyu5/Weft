@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import weft
-from weft.language import View, commit, f32, u32
+from weft.language import View, commit, f32, i8, u32
 from weft.std.encodings import (
     IQ1_M,
     IQ1_S,
@@ -141,7 +141,7 @@ def quantized_vec_dot_q6_k_q8_k(
 def quantized_vec_dot_iq4_nl_q8_0(
     W: View[IQ4_NL, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq4_nl_q8_0(W, X, codebook), Y[0])
@@ -151,7 +151,7 @@ def quantized_vec_dot_iq4_nl_q8_0(
 def quantized_vec_dot_iq1_s_q8_k(
     W: View[IQ1_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq1_s_q8_k(W, X, grid), Y[0])
@@ -161,7 +161,7 @@ def quantized_vec_dot_iq1_s_q8_k(
 def quantized_vec_dot_iq1_m_q8_k(
     W: View[IQ1_M, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
     f16_bits: View[f32, (65536,)],
     Y: View[f32, (1,)],
 ):
@@ -172,7 +172,7 @@ def quantized_vec_dot_iq1_m_q8_k(
 def quantized_vec_dot_iq2_s_q8_k(
     W: View[IQ2_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (8192,)],
+    grid: View[i8, (8192,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq2_s_q8_k(W, X, grid), Y[0])
@@ -182,8 +182,8 @@ def quantized_vec_dot_iq2_s_q8_k(
 def quantized_vec_dot_iq2_xs_q8_k(
     W: View[IQ2_XS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (4096,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (4096,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq2_xs_q8_k(W, X, grid, signs), Y[0])
@@ -193,8 +193,8 @@ def quantized_vec_dot_iq2_xs_q8_k(
 def quantized_vec_dot_iq2_xxs_q8_k(
     W: View[IQ2_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (2048,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq2_xxs_q8_k(W, X, grid, signs), Y[0])
@@ -204,7 +204,7 @@ def quantized_vec_dot_iq2_xxs_q8_k(
 def quantized_vec_dot_iq3_s_q8_k(
     W: View[IQ3_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (2048,)],
+    grid: View[i8, (2048,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq3_s_q8_k(W, X, grid), Y[0])
@@ -214,8 +214,8 @@ def quantized_vec_dot_iq3_s_q8_k(
 def quantized_vec_dot_iq3_xxs_q8_k(
     W: View[IQ3_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (1024,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (1024,)],
+    signs: View[i8, (1024,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq3_xxs_q8_k(W, X, grid, signs), Y[0])
@@ -225,7 +225,7 @@ def quantized_vec_dot_iq3_xxs_q8_k(
 def quantized_vec_dot_iq4_xs_q8_k(
     W: View[IQ4_XS, (K,)],
     X: View[Q8_K, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq4_xs_q8_k(W, X, codebook), Y[0])
@@ -252,7 +252,7 @@ def quantized_vec_dot_tq2_0_q8_k(
 def quantized_vec_dot_mxfp4_q8_0(
     W: View[MXFP4, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     scale: View[f32, (256,)],
     Y: View[f32, (1,)],
 ):
@@ -263,7 +263,7 @@ def quantized_vec_dot_mxfp4_q8_0(
 def quantized_vec_dot_nvfp4_q8_0(
     W: View[NVFP4, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     scale: View[f32, (256,)],
     Y: View[f32, (1,)],
 ):

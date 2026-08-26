@@ -9,9 +9,12 @@ from weft.language import (
     i8,
     i16,
     i32,
+    iota,
     index,
     mac_groups,
+    materialize,
     reduce,
+    u8,
     u32,
     widen,
 )
@@ -44,25 +47,22 @@ from .encodings import (
     TQ1_0,
     TQ2_0,
 )
-from .quant_fragments import exponent_scale, high_bit_plane, nonlinear_lookup, radix3_digit
+from .quant_fragments import (
+    exponent_scale,
+    high_bit_plane,
+    high_bit_plane_u8,
+    nonlinear_lookup,
+    radix3_digit,
+    small_nonlinear_lookup,
+)
 
 
-def _dot_q4_values(q, x, zero: int = 0):
-    low = i32(0)
-    high = i32(0)
-    for j in range(16):
-        low += (i32(q[j]) - i32(zero)) * i32(x[j])
-        high += (i32(q[j + 16]) - i32(zero)) * i32(x[j + 16])
-    return low + high
+def _dot_q4_values(q, x):
+    return contract(q, x, over="k", acc=i32)
 
 
 def _dot_codebook32(q, x, codebook):
-    low = i32(0)
-    high = i32(0)
-    for j in range(16):
-        low += i32(nonlinear_lookup(codebook, q[j])) * i32(x[j])
-        high += i32(nonlinear_lookup(codebook, q[j + 16])) * i32(x[j + 16])
-    return low + high
+    return contract(small_nonlinear_lookup(codebook, q), x, over="k", acc=i32)
 
 
 def _q3_scale(scales, sub):
@@ -160,14 +160,11 @@ def vec_dot_q5_0_q8_0(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        low = i32(0)
-        high = i32(0)
-        for j in range(16):
-            q0 = high_bit_plane(w.q[j], w.qh[j // 8], j % 8) - i32(16)
-            q1 = high_bit_plane(w.q[j + 16], w.qh[(j + 16) // 8], (j + 16) % 8) - i32(16)
-            low += q0 * i32(x.q[j])
-            high += q1 * i32(x.q[j + 16])
-        result += (f32(w.d) * f32(x.d)) * f32(low + high)
+        lane = iota(32, dtype=u8, axis="k")
+        q = high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8))
+        centered = i8(q) - i8(16)
+        integer = contract(centered, x.q, over="k", acc=i32)
+        result += (f32(w.d) * f32(x.d)) * f32(integer)
     return result
 
 
@@ -179,14 +176,10 @@ def vec_dot_q5_1_q8_1(
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        low = i32(0)
-        high = i32(0)
-        for j in range(16):
-            q0 = high_bit_plane(w.q[j], w.qh[j // 8], j % 8)
-            q1 = high_bit_plane(w.q[j + 16], w.qh[(j + 16) // 8], (j + 16) % 8)
-            low += q0 * i32(x.q[j])
-            high += q1 * i32(x.q[j + 16])
-        result += (f32(w.d) * f32(x.d)) * f32(low + high) + f32(w.m) * f32(x.s)
+        lane = iota(32, dtype=u8, axis="k")
+        q = high_bit_plane_u8(w.q, w.qh[lane // u8(8)], lane % u8(8))
+        integer = contract(q, x.q, over="k", acc=i32)
+        result += (f32(w.d) * f32(x.d)) * f32(integer) + f32(w.m) * f32(x.s)
     return result
 
 
@@ -467,7 +460,7 @@ def vec_dot_q6_k_q8_k(
 def vec_dot_iq1_s_q8_k(
     W: View[IQ1_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -497,7 +490,7 @@ def vec_dot_iq1_s_q8_k(
 def vec_dot_iq1_m_q8_k(
     W: View[IQ1_M, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (16384,)],
+    grid: View[i8, (16384,)],
     f16_bits: View[f32, (65536,)],
 ):
     result = f32(0.0)
@@ -558,8 +551,8 @@ def vec_dot_iq1_m_q8_k(
 def vec_dot_iq2_xxs_q8_k(
     W: View[IQ2_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (2048,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -585,8 +578,8 @@ def vec_dot_iq2_xxs_q8_k(
 def vec_dot_iq2_xs_q8_k(
     W: View[IQ2_XS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (4096,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (4096,)],
+    signs: View[i8, (1024,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -621,7 +614,7 @@ def vec_dot_iq2_xs_q8_k(
 def vec_dot_iq2_s_q8_k(
     W: View[IQ2_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (8192,)],
+    grid: View[i8, (8192,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -660,8 +653,8 @@ def vec_dot_iq2_s_q8_k(
 def vec_dot_iq3_xxs_q8_k(
     W: View[IQ3_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (1024,)],
-    signs: View[f32, (1024,)],
+    grid: View[i8, (1024,)],
+    signs: View[i8, (1024,)],
 ):
     sumf = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -707,7 +700,7 @@ def vec_dot_iq3_xxs_q8_k(
 def vec_dot_iq3_s_q8_k(
     W: View[IQ3_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[f32, (2048,)],
+    grid: View[i8, (2048,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -748,13 +741,14 @@ def vec_dot_iq3_s_q8_k(
 def vec_dot_iq4_nl_q8_0(
     W: View[IQ4_NL, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
 ):
+    table = materialize(admit(codebook))
     result = f32(0.0)
     with L.blocks(K, extent=32) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        integer = _dot_codebook32(w.q, x.q, codebook)
+        integer = _dot_codebook32(w.q, x.q, table)
         result += (f32(x.d) * f32(w.d)) * f32(integer)
     return result
 
@@ -762,7 +756,7 @@ def vec_dot_iq4_nl_q8_0(
 def vec_dot_iq4_xs_q8_k(
     W: View[IQ4_XS, (K,)],
     X: View[Q8_K, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
 ):
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
@@ -832,7 +826,7 @@ def vec_dot_tq2_0_q8_k(
 def vec_dot_mxfp4_q8_0(
     W: View[MXFP4, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     e8m0_scale: View[f32, (256,)],
 ):
     result = f32(0.0)
@@ -848,7 +842,7 @@ def vec_dot_mxfp4_q8_0(
 def vec_dot_nvfp4_q8_0(
     W: View[NVFP4, (K,)],
     X: View[Q8_0, (K,)],
-    codebook: View[f32, (16,)],
+    codebook: View[i8, (16,)],
     ue4m3_scale: View[f32, (256,)],
 ):
     result = f32(0.0)

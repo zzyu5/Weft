@@ -90,7 +90,7 @@ case "${kernel}" in
         runtime_kernel_define=-DWEFT_Q8_KIND=0
         if [[ ${target} == sg2044 ]]; then
           [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 16)
+            physical_auto+=(--auto-lmul-eighths 32)
           [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
           [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
             physical_auto+=(--auto-pipeline-depth 1)
@@ -98,15 +98,22 @@ case "${kernel}" in
         ;;
       q8_1_quantize)
         runtime_kernel_define=-DWEFT_Q8_KIND=1
+        if [[ ${target} == sg2044 ]]; then
+          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+            physical_auto+=(--auto-lmul-eighths 64)
+        fi
         ;;
       q8_K_quantize)
         runtime_kernel_define=-DWEFT_Q8_KIND=2
         if [[ ${target} == sg2044 ]]; then
           [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 64)
+            physical_auto+=(--auto-lmul-eighths 16)
           [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
           [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
             physical_auto+=(--auto-pipeline-depth 1)
+        elif [[ ${target} == k1 ]]; then
+          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
+            physical_auto+=(--auto-lmul-eighths 16)
         fi
         ;;
     esac

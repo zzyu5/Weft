@@ -11,9 +11,12 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <functional>
 #include <memory>
+#include <optional>
 
 using namespace weft;
 
@@ -440,9 +443,125 @@ bool pointwiseLike(mlir::Operation *operation) {
                    riscv::UpdateOp, riscv::MaterializeOp>(operation);
 }
 
+std::optional<int64_t> encodedLaneLimit(mlir::Value value) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  std::function<std::optional<int64_t>(mlir::Value)> visit =
+      [&](mlir::Value current) -> std::optional<int64_t> {
+    mlir::Operation *definition = current.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      return std::nullopt;
+    if (auto field = mlir::dyn_cast<riscv::FieldOp>(definition)) {
+      riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+      if (facts.mapping == "grouped_layered" && facts.layer > 0)
+        return facts.layer;
+      return std::nullopt;
+    }
+    // Storage-layer width constrains the raw field and representation-only
+    // casts, not a newly computed logical value.  In particular, combining
+    // low/high bit layers creates a full logical vector that may be
+    // re-partitioned through an explicit convert_layout.
+    if (!mlir::isa<riscv::UnaryOp, riscv::CastOp, riscv::NarrowOp,
+                   riscv::WidenOp>(definition))
+      return std::nullopt;
+    std::optional<int64_t> limit;
+    for (mlir::Value operand : definition->getOperands())
+      if (auto operandLimit = visit(operand))
+        limit = limit ? std::min(*limit, *operandLimit) : operandLimit;
+    return limit;
+  };
+  return visit(value);
+}
+
 void setValueLayout(mlir::Value value, riscv::LayoutAttr layout) {
   if (mlir::isa<riscv::ValueType>(value.getType()))
     value.setType(riscv_internal::withLayout(value.getType(), layout));
+}
+
+riscv::LayoutAttr withRegisterWidth(mlir::Builder &builder,
+                                    riscv::LayoutAttr layout,
+                                    int64_t lmulEighths) {
+  int64_t replicas = 1;
+  for (int64_t factor : layout.getReplicaFactors().asArrayRef())
+    replicas *= factor;
+  return riscv::LayoutAttr::get(
+      builder.getContext(), layout.getCarrier(), layout.getAxisIds(),
+      layout.getTimeFactors(), layout.getLaneFactors(),
+      layout.getReplicaFactors(), layout.getFragmentFactors(),
+      layout.getLocalFactors(), layout.getSew(), lmulEighths, layout.getVl(),
+      ((lmulEighths + 7) / 8) * replicas, layout.getValidity());
+}
+
+riscv::LayoutAttr registerGatherSourceLayout(mlir::Builder &builder,
+                                             riscv::ValueType source,
+                                             riscv::LayoutAttr resultLayout,
+                                             riscv::TargetAttr target) {
+  auto shape = source.getShape().asArrayRef();
+  if (shape.size() != 1 || shape.front() <= 0 ||
+      resultLayout.getCarrier() != "rvv" ||
+      resultLayout.getSew() !=
+          std::max<int64_t>(8, riscv_internal::logicalBitWidth(source)))
+    return {};
+  const int64_t capacity = target.getVlenBits() *
+                           resultLayout.getLmulEighths() /
+                           (8 * resultLayout.getSew());
+  if (shape.front() > capacity)
+    return {};
+  llvm::SmallVector<int64_t> one{1};
+  llvm::SmallVector<int64_t> lane{shape.front()};
+  return riscv::LayoutAttr::get(
+      builder.getContext(), "rvv", source.getAxisIds(),
+      riscv_internal::integers(builder, one),
+      riscv_internal::integers(builder, lane),
+      riscv_internal::integers(builder, one),
+      riscv_internal::integers(builder, one),
+      riscv_internal::integers(builder, one), resultLayout.getSew(),
+      resultLayout.getLmulEighths(), shape.front(),
+      (resultLayout.getLmulEighths() + 7) / 8, "full");
+}
+
+bool isDenseLoadBacked(riscv::MaterializeOp materialize) {
+  auto load = materialize.getInput().getDefiningOp<riscv::LoadOp>();
+  if (!load)
+    return false;
+  auto encoding =
+      mlir::dyn_cast<kernel::EncodingType>(load.getRegion().getType().getEncoding());
+  return encoding && encoding.getKind() == "dense";
+}
+
+bool requiresAddressableReload(riscv::MaterializeOp materialize,
+                               riscv::TargetAttr target) {
+  auto value = mlir::dyn_cast<riscv::ValueType>(materialize.getResult().getType());
+  if (!value || value.getLayout().getCarrier() != "rvv" ||
+      !isDenseLoadBacked(materialize))
+    return false;
+
+  bool hasExtract = false;
+  bool allExtracts = true;
+  bool registerProjectionUnsupported = false;
+  for (mlir::Operation *user : materialize.getResult().getUsers()) {
+    auto extract = mlir::dyn_cast<riscv::ExtractOp>(user);
+    if (!extract || extract.getInput() != materialize.getResult()) {
+      allExtracts = false;
+      continue;
+    }
+    hasExtract = true;
+    int64_t selectedAxes = 0;
+    for (mlir::Attribute selector : extract.getSelectors())
+      if (mlir::cast<mlir::StringAttr>(selector).getValue() != "all")
+        ++selectedAxes;
+    registerProjectionUnsupported |= selectedAxes != 1;
+  }
+  if (!hasExtract || !allExtracts)
+    return false;
+
+  auto timeParts = riscv_internal::staticProduct(
+      value.getLayout().getTimeFactors().asArrayRef());
+  if (!timeParts)
+    return true;
+  const int64_t residentGroups =
+      *timeParts * value.getLayout().getRegisterGroups();
+  return registerProjectionUnsupported ||
+         residentGroups > target.getVectorRegisters();
 }
 
 class PropagateRISCVLayoutsPass
@@ -620,12 +739,11 @@ public:
       completeRoles(value, roles[value]);
     propagateRoles();
 
-    // One pointwise-connected value chain keeps one logical lane cohort across
-    // SEW changes.  Each value first contributes the largest lane span legal
-    // for its own type and the instantiated LMUL bound; the chain then takes
-    // the minimum.  Extract/reduce boundaries are deliberately not unioned:
-    // they change the surviving logical domain and receive explicit
-    // conversions when their consumer requires another representation.
+    // Each physical value receives the largest lane span legal for its own
+    // type and the instantiated LMUL bound.  Structured-product operands and
+    // a same-axis extract remain coupled where the target instruction requires
+    // it; ordinary pointwise mismatches become explicit convert_layout edges
+    // instead of conservatively shrinking the whole use-def chain.
     llvm::DenseMap<mlir::Value, int64_t> connectedLaneSpans;
     for (mlir::Value value : values) {
       int64_t axis = roles[value].laneAxis;
@@ -638,6 +756,8 @@ public:
           8, riscv_internal::logicalBitWidth(value.getType()));
       int64_t capacity = std::max<int64_t>(
           1, kernel.getTarget().getVlenBits() * lmulEighths / (8 * sew));
+      if (auto storageLimit = encodedLaneLimit(value))
+        capacity = std::min(capacity, *storageLimit);
       int64_t extent = riscv_internal::physicalExtent(value, axis);
       connectedLaneSpans[value] =
           extent > 0 ? std::min(extent, capacity) : capacity;
@@ -646,20 +766,41 @@ public:
     while (laneSpanChanged) {
       laneSpanChanged = false;
       getOperation().walk([&](mlir::Operation *operation) {
-        if (!pointwiseLike(operation) || operation->getNumResults() != 1)
-          return;
-        mlir::Value result = operation->getResult(0);
-        if (!connectedLaneSpans.count(result))
-          return;
-        int64_t axis = roles[result].laneAxis;
-        int64_t span = connectedLaneSpans[result];
-        llvm::SmallVector<mlir::Value> connected{result};
-        for (mlir::Value operand : operation->getOperands())
-          if (connectedLaneSpans.count(operand) && roles[operand].laneAxis == axis) {
-            connected.push_back(operand);
-            span = std::min(span, connectedLaneSpans[operand]);
+        if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
+                       riscv::OuterContractOp>(operation)) {
+          if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(operation)) {
+            mlir::Value input = extract.getInput();
+            mlir::Value result = extract.getResult();
+            if (!connectedLaneSpans.count(input) ||
+                !connectedLaneSpans.count(result) ||
+                roles[input].laneAxis == 0 ||
+                roles[input].laneAxis != roles[result].laneAxis)
+              return;
+            int64_t span =
+                std::min(connectedLaneSpans[input], connectedLaneSpans[result]);
+            for (mlir::Value value : {input, result})
+              if (connectedLaneSpans[value] != span) {
+                connectedLaneSpans[value] = span;
+                laneSpanChanged = true;
+              }
+            return;
+          } else {
+            return;
           }
-        for (mlir::Value value : connected)
+        }
+        auto implementation = operation->getAttrOfType<riscv::ImplementationAttr>(
+            "implementation");
+        if (!implementation || implementation.getFamily() != "widen-dot")
+          return;
+        mlir::Value lhs = operation->getOperand(0);
+        mlir::Value rhs = operation->getOperand(1);
+        if (!connectedLaneSpans.count(lhs) || !connectedLaneSpans.count(rhs) ||
+            roles[lhs].laneAxis == 0 ||
+            roles[lhs].laneAxis != roles[rhs].laneAxis)
+          return;
+        int64_t span =
+            std::min(connectedLaneSpans[lhs], connectedLaneSpans[rhs]);
+        for (mlir::Value value : {lhs, rhs})
           if (connectedLaneSpans[value] != span) {
             connectedLaneSpans[value] = span;
             laneSpanChanged = true;
@@ -681,6 +822,69 @@ public:
       }
       setValueLayout(value, layout);
     }
+    // A register lookup uses the result's RVV register group as a table source.
+    // The table may contain fewer active lanes than the result (for example a
+    // 16-entry codebook feeding a 32-lane result on VLEN256), but vrgather.vv
+    // still requires the same SEW/LMUL register type.  Propagate that physical
+    // width through the explicit materialize edge; do not manufacture or merge
+    // either logical axis.
+    getOperation().walk([&](riscv::LookupOp lookup) {
+      auto materialize =
+          lookup.getTable().getDefiningOp<riscv::MaterializeOp>();
+      auto table = mlir::dyn_cast<riscv::ValueType>(lookup.getTable().getType());
+      auto indices =
+          mlir::dyn_cast<riscv::ValueType>(lookup.getIndices().getType());
+      auto result = mlir::dyn_cast<riscv::ValueType>(lookup.getResult().getType());
+      if (!materialize || materialize.getPlacement() != "shared" || !table ||
+          !indices || !result || table.getLayout().getCarrier() != "rvv" ||
+          indices.getLayout().getCarrier() != "rvv" ||
+          result.getLayout().getCarrier() != "rvv")
+        return;
+      if (table.getLayout().getSew() != result.getLayout().getSew() ||
+          indices.getLayout().getSew() != result.getLayout().getSew()) {
+        lookup.emitError(
+            "register lookup operands have no common RVV SEW representation");
+        failed = true;
+        return;
+      }
+      const int64_t requiredLMUL = result.getLayout().getLmulEighths();
+      auto tableElements =
+          riscv_internal::staticProduct(table.getShape().asArrayRef());
+      const int64_t tableCapacity =
+          lookup->getParentOfType<riscv::KernelOp>().getTarget().getVlenBits() *
+          requiredLMUL / (8 * result.getLayout().getSew());
+      // A table larger than the selected result register group remains an
+      // addressable table.  PlanRISCVMemory will choose an indexed-memory leaf
+      // for this physical instance instead of inventing a partial register
+      // table or changing the logical lookup.
+      if (!tableElements || *tableElements > tableCapacity)
+        return;
+      if (table.getLayout().getLmulEighths() == requiredLMUL)
+        return;
+      auto update = [&](mlir::Value value) {
+        auto type = mlir::dyn_cast<riscv::ValueType>(value.getType());
+        if (!type || type.getLayout().getCarrier() != "rvv" ||
+            type.getLayout().getSew() != result.getLayout().getSew())
+          return;
+        setValueLayout(value,
+                       withRegisterWidth(builder, type.getLayout(), requiredLMUL));
+      };
+      update(materialize.getInput());
+      update(materialize.getResult());
+    });
+    // Canonical materialize fixes the value's birth, lifetime, and sharing
+    // scope.  It does not require the complete logical panel to reside in
+    // registers.  A dense load-backed panel whose direct consumers are
+    // projections remains addressable when the selected RVV representation
+    // cannot exist as one legal register-resident value.  Composite lowering
+    // will turn those projections into loads from the staged view.
+    getOperation().walk([&](riscv::MaterializeOp materialize) {
+      if (materialize.getPlacement() != "shared")
+        return;
+      auto kernel = materialize->getParentOfType<riscv::KernelOp>();
+      if (kernel && requiresAddressableReload(materialize, kernel.getTarget()))
+        materialize.setPlacementAttr(builder.getStringAttr("reload"));
+    });
     getOperation().walk([&](riscv::NewOp state) {
       if (auto value = mlir::dyn_cast<riscv::ValueType>(state.getResult().getType()))
         state.setPlacementAttr(builder.getStringAttr(
@@ -815,6 +1019,9 @@ private:
       // products do not: free and reduction operands deliberately retain
       // different lane/register decompositions and are reconciled by their
       // typed RVV step or IME pack operations during composite lowering.
+      if (auto materialize = mlir::dyn_cast<riscv::MaterializeOp>(operation);
+          materialize && materialize.getPlacement() == "reload")
+        return;
       if (pointwiseLike(operation) || mlir::isa<riscv::LookupOp>(operation))
         operations.push_back(operation);
     });
@@ -830,9 +1037,17 @@ private:
             operand.getOperandNumber() == 0)
           continue;
         auto kernel = operation->getParentOfType<riscv::KernelOp>();
-        riscv::LayoutAttr required = riscv_internal::projectLayout(
-            builder, mlir::cast<riscv::ValueType>(operand.get().getType()),
-            result.getLayout(), kernel.getTarget());
+        auto operandType =
+            mlir::cast<riscv::ValueType>(operand.get().getType());
+        riscv::LayoutAttr required =
+            mlir::isa<riscv::MaterializeOp>(operation) &&
+                    operandType.getElementType() == result.getElementType() &&
+                    operandType.getShape() == result.getShape() &&
+                    operandType.getAxisIds() == result.getAxisIds()
+                ? result.getLayout()
+                : riscv_internal::projectLayout(builder, operandType,
+                                                result.getLayout(),
+                                                kernel.getTarget());
         if (!required) {
           operation->emitError(
               "no legal target layout projects the pointwise result mapping to its operand");
@@ -869,6 +1084,25 @@ private:
       auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
       if (!result)
         continue;
+      auto input = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
+      if (input && input.getLayout().getCarrier() == "local" &&
+          result.getLayout().getCarrier() == "rvv" &&
+          input.getElementType() == result.getElementType()) {
+        auto kernel = extract->getParentOfType<riscv::KernelOp>();
+        auto required = registerGatherSourceLayout(
+            builder, input, result.getLayout(), kernel.getTarget());
+        if (required) {
+          mlir::OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(extract);
+          auto conversion = builder.create<riscv::ConvertLayoutOp>(
+              extract.getLoc(),
+              riscv_internal::withLayout(input, required), extract.getInput(),
+              riscv_internal::layoutConversion(builder, input.getLayout(),
+                                               required),
+              riscv_internal::unselectedLeaf(builder));
+          extract.getInputMutable().assign(conversion.getResult());
+        }
+      }
       size_t indexCursor = 0;
       for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
         llvm::StringRef selector =

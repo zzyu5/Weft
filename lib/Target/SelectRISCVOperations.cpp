@@ -10,8 +10,6 @@
 #include "llvm/ADT/StringSwitch.h"
 
 #include <memory>
-#include <limits>
-
 using namespace weft;
 
 namespace {
@@ -300,23 +298,19 @@ private:
           riscv_internal::logicalElement(rhs.getType()));
       auto resultInteger = mlir::dyn_cast<mlir::IntegerType>(
           riscv_internal::logicalElement(result));
-      auto lhsPhysical = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
-      const bool canDoubleLMUL =
-          lhsPhysical && lhsPhysical.getLayout().getLmulEighths() > 0 &&
-          lhsPhysical.getLayout().getLmulEighths() <=
-              std::numeric_limits<int64_t>::max() / 2;
-      const int64_t partialLMUL =
-          canDoubleLMUL ? lhsPhysical.getLayout().getLmulEighths() * 2 : 0;
-      if (canDoubleLMUL && lhsInteger && rhsInteger && resultInteger &&
+      // The widening-dot family follows from the typed numerical relation and
+      // target capability.  It must be selected before layout propagation so
+      // its reduction axis can anchor the operand layouts.  The concrete
+      // doubled-LMUL legality is checked after those layouts exist, when the
+      // composite is lowered.
+      if (lhsInteger && rhsInteger && resultInteger &&
           lhsInteger.getWidth() <= 16 && rhsInteger.getWidth() <= 16 &&
           std::max<unsigned>(8, lhsInteger.getWidth()) ==
               std::max<unsigned>(8, rhsInteger.getWidth()) &&
           (lhsInteger.isSigned() || rhsInteger.isSigned()) &&
           resultInteger.isSigned() && resultInteger.getWidth() == 32 &&
-          over.size() == 1 && target.getHasWideningInteger() &&
-          llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
-                             partialLMUL))
+          over.size() == 1 && target.getHasWideningInteger())
         return rvvImplementation(builder, "widen-dot",
                                  "rvv.vwmul-vwredsum", over);
       if (lhsInteger && rhsInteger && lhsInteger.getWidth() <= 8 &&

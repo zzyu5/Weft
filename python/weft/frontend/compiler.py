@@ -1537,10 +1537,17 @@ class FrontendCompiler:
         )[0]
 
     def _intrinsic_iota(self, call: ast.Call) -> Value:
-        args = self._arguments(call, ("extent",), {"start": 0, "dtype": u32})
+        args = self._arguments(
+            call, ("extent",), {"start": 0, "dtype": u32, "axis": None}
+        )
         extent = self._eval_static(args["extent"]) if isinstance(args["extent"], ast.expr) else args["extent"]
         start = self._eval_static(args["start"]) if isinstance(args["start"], ast.expr) else args["start"]
         dtype = self._eval_static(args["dtype"]) if isinstance(args["dtype"], ast.expr) else args["dtype"]
+        axis_name = (
+            self._eval_static(args["axis"])
+            if isinstance(args["axis"], ast.expr)
+            else args["axis"]
+        )
         if isinstance(extent, bool) or not isinstance(extent, int) or extent <= 0:
             raise FrontendError("iota extent must be a positive integer", self._location(call))
         if isinstance(start, bool) or not isinstance(start, int):
@@ -1553,8 +1560,20 @@ class FrontendCompiler:
             raise FrontendError(
                 "iota dtype must be an unsigned integer", self._location(call)
             )
-        axis = self._next_axis_id
-        self._next_axis_id += 1
+        if axis_name is None:
+            axis = self._next_axis_id
+            self._next_axis_id += 1
+        else:
+            if not isinstance(axis_name, str):
+                raise FrontendError(
+                    "iota axis must name an existing logical axis",
+                    self._location(call),
+                )
+            axis = self._axis_ids.get(axis_name.lower())
+            if axis is None:
+                raise FrontendError(
+                    f"unknown iota axis {axis_name!r}", self._location(call)
+                )
         result_type = value_type(ScalarType(dtype), (extent,), (axis,))
         return self._emit(
             "weft_kernel.iota",

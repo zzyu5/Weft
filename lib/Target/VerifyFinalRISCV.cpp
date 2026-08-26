@@ -36,7 +36,8 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::LocalBindOp, riscv::LocalLoadOp,
       riscv::LocalStoreOp, riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RegisterMaterializeOp, riscv::RVVGroupedMacReduceOp,
+      riscv::RegisterMaterializeOp, riscv::RVVBitplaneMergeOp,
+      riscv::RVVGroupedMacReduceOp,
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
       riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
@@ -59,6 +60,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::LocalCapacityGuardOp, riscv::LocalLoadOp, riscv::LocalStoreOp,
       riscv::SpillOp, riscv::ReloadOp, riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
+      riscv::RVVBitplaneMergeOp,
       riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
@@ -361,12 +363,17 @@ public:
             local && leaf.getEngine() == "transfer" &&
             leaf.getFamily() == "local-extract" &&
             leaf.getInstruction() == "local.extract";
+        const bool registerExtract =
+            access && access.getForm() == "register" &&
+            leaf.getEngine() == "rvv" && leaf.getFamily() == "extract" &&
+            leaf.getInstruction() == "rvv.extract.vrgather";
         const bool ordinaryExtract =
-            access && !local && !localGather &&
+            access && !local && !localGather && !registerExtract &&
             leaf.getEngine() == "transfer" && leaf.getFamily() == "extract" &&
             leaf.getInstruction() ==
                 ("rvv.extract." + access.getForm()).str();
-        if (!access || (!localExtract && !localGather && !ordinaryExtract)) {
+        if (!access || (!localExtract && !localGather && !registerExtract &&
+                        !ordinaryExtract)) {
           extract.emitError(
               "final extract has no closed physical access and transfer leaf");
           failed = true;
@@ -568,7 +575,10 @@ public:
           if (!lanes || layout.getVl() > vlmax || *lanes > layout.getVl() ||
               layout.getRegisterGroups() != expectedGroups) {
             operation->emitError(
-                "RVV layout lane/vl/register assignment disagrees with the target vector shape");
+                "RVV layout lane/vl/register assignment disagrees with the target vector shape: layout=")
+                << layout << ", vlmax=" << vlmax << ", lanes="
+                << (lanes ? *lanes : -1) << ", expected-groups="
+                << expectedGroups;
             failed = true;
           }
         };

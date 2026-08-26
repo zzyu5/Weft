@@ -6,7 +6,9 @@ add_library(WeftRISCVTarget STATIC
   PropagateRISCVLayouts.cpp
   PlanRISCVMemory.cpp
   CanonicalizeRISCVLayouts.cpp
+  FuseRISCVBitplanes.cpp
   LowerRISCVComposites.cpp
+  HoistRISCVLoopInvariants.cpp
   PipelineRISCVLevels.cpp
   UnrollRISCVLevels.cpp
   ShareRISCVLayeredWindows.cpp
@@ -25,4 +27,5 @@ target_link_libraries(WeftRISCVTarget PUBLIC
   MLIRPass
   MLIRSCFDialect
   MLIRSCFTransforms
+  MLIRTransforms
 )

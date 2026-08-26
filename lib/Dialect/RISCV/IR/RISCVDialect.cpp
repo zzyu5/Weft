@@ -680,7 +680,8 @@ mlir::LogicalResult AccessAttr::verify(
     int64_t joinRole, int64_t bitOffset, int64_t storageBits,
     llvm::StringRef order) {
   if (form != "unassigned" && form != "unit" && form != "strided" &&
-      form != "indexed" && form != "segment" && form != "local")
+      form != "indexed" && form != "segment" && form != "register" &&
+      form != "local")
     return emitError() << "unknown physical memory form";
   if (mapping != "dense" && mapping != "natural" &&
       mapping != "grouped_layered" && mapping != "joined" &&
@@ -1513,6 +1514,47 @@ mlir::LogicalResult ExtractOp::verify() {
   if (failed(verifyProjection(*this, getInput().getType(), getIndices(),
                               getSelectors(), getResult().getType(), true)))
     return mlir::failure();
+  if (getAccess().getForm() == "register") {
+    auto result = mlir::dyn_cast<ValueType>(getResult().getType());
+    auto input = getInput().getType();
+    unsigned gatherCount = 0;
+    mlir::Value gatherIndex;
+    size_t cursor = 0;
+    for (mlir::Attribute selectorAttribute : getSelectors()) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (cursor >= getIndices().size())
+        return emitOpError("register gather selector has no index operand");
+      if (selector == "gather") {
+        ++gatherCount;
+        gatherIndex = getIndices()[cursor];
+      }
+      ++cursor;
+    }
+    auto indices = gatherIndex
+                       ? mlir::dyn_cast<ValueType>(gatherIndex.getType())
+                       : ValueType();
+    auto time = checkedPositiveProduct(input.getLayout().getTimeFactors().asArrayRef());
+    auto replicas =
+        checkedPositiveProduct(input.getLayout().getReplicaFactors().asArrayRef());
+    if (!result || !indices || gatherCount != 1 ||
+        input.getLayout().getCarrier() != "rvv" ||
+        result.getLayout().getCarrier() != "rvv" ||
+        indices.getLayout().getCarrier() != "rvv" || !time || *time != 1 ||
+        !replicas || *replicas != 1 ||
+        input.getLayout().getSew() != result.getLayout().getSew() ||
+        input.getLayout().getLmulEighths() !=
+            result.getLayout().getLmulEighths() ||
+        indices.getLayout().getSew() != result.getLayout().getSew() ||
+        indices.getLayout().getLmulEighths() !=
+            result.getLayout().getLmulEighths() ||
+        !exactLeaf(getLeaf(), "rvv", "extract", "rvv.extract.vrgather",
+                   "none", "exact"))
+      return emitOpError(
+          "register extract requires one complete RVV source, index, result, and exact gather leaf");
+  }
   return verifyLeafOperation(*this);
 }
 
@@ -1767,6 +1809,41 @@ mlir::LogicalResult LookupOp::verify() {
   llvm::StringRef carrier = "scalar";
   if (auto indices = mlir::dyn_cast<ValueType>(getIndices().getType()))
     carrier = indices.getLayout().getCarrier();
+  auto tableValue = mlir::dyn_cast<ValueType>(getTable().getType());
+  auto resultValue = mlir::dyn_cast<ValueType>(getResult().getType());
+  // ConvertWeftToRISCV creates a typed lookup before layout propagation and
+  // memory planning have assigned its access form and terminal leaf.  Keep
+  // that transient state verifiable only while both decisions are explicitly
+  // unassigned; PlanRISCVMemory must close them together before final
+  // verification.
+  if (getAccess().getForm() == "unassigned" &&
+      getLeaf().getEngine() == "unselected")
+    return verifyLeafOperation(*this);
+  if (tableValue) {
+    auto tableLayout = tableValue.getLayout();
+    auto indexValue = mlir::dyn_cast<ValueType>(getIndices().getType());
+    if (!indexValue || !resultValue || carrier != "rvv" ||
+        tableLayout.getCarrier() != "rvv" ||
+        resultValue.getLayout().getCarrier() != "rvv" ||
+        tableLayout.getSew() != resultValue.getLayout().getSew() ||
+        tableLayout.getLmulEighths() != resultValue.getLayout().getLmulEighths() ||
+        indexValue.getLayout().getSew() != resultValue.getLayout().getSew() ||
+        indexValue.getLayout().getLmulEighths() !=
+            resultValue.getLayout().getLmulEighths() ||
+        getAccess().getForm() != "register" ||
+        !exactLeaf(getLeaf(), "rvv", "lookup", "rvv.vrgather", "none",
+                   "exact"))
+      return emitOpError(
+          "register lookup requires one layout-compatible RVV table, index, result, and exact gather leaf");
+    auto tableParts = checkedPositiveProduct(tableLayout.getTimeFactors().asArrayRef());
+    auto tableReplicas =
+        checkedPositiveProduct(tableLayout.getReplicaFactors().asArrayRef());
+    if (!tableParts || !tableReplicas || *tableParts != 1 ||
+        *tableReplicas != 1)
+      return emitOpError(
+          "register lookup table must fit one complete RVV register value");
+    return verifyLeafOperation(*this);
+  }
   if ((carrier == "scalar" &&
        (getAccess().getForm() != "unit" ||
         !exactLeaf(getLeaf(), "scalar", "lookup", "scalar.lookup", "none",
@@ -2130,6 +2207,63 @@ mlir::LogicalResult RegisterMaterializeOp::verify() {
       (getRealization() != "share" && getRealization() != "reload" &&
        getRealization() != "rematerialize"))
     return emitOpError("register materialize requires stable value identity and lifetime");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVBitplaneMergeOp::verify() {
+  ValueType low = getLow().getType();
+  ValueType plane = getPlane().getType();
+  ValueType result = getResult().getType();
+  auto lowElement = mlir::dyn_cast<mlir::IntegerType>(low.getElementType());
+  auto planeElement =
+      mlir::dyn_cast<mlir::IntegerType>(plane.getElementType());
+  if (!lowElement || !planeElement || lowElement.isSigned() ||
+      planeElement.isSigned() || lowElement.getWidth() != 8 ||
+      planeElement.getWidth() != 8 || low != result ||
+      low.getLayout().getCarrier() != "rvv" ||
+      plane.getLayout().getCarrier() != "local" || getInsertBit() <= 0 ||
+      getInsertBit() >= 8)
+    return emitOpError(
+        "RVV bitplane merge requires one unsigned-eight-bit RVV value and one local byte plane");
+  if (low.getShape().size() != plane.getShape().size() ||
+      low.getAxisIds() != plane.getAxisIds())
+    return emitOpError(
+        "RVV bitplane merge requires matching logical axes for values and storage plane");
+  int64_t bitplaneAxes = 0;
+  int64_t bitplaneAxis = 0;
+  for (auto [axis, lowExtent, planeExtent] :
+       llvm::zip(low.getAxisIds().asArrayRef(), low.getShape().asArrayRef(),
+                 plane.getShape().asArrayRef())) {
+    if (lowExtent == planeExtent)
+      continue;
+    if (planeExtent <= 0 || lowExtent != planeExtent * 8)
+      return emitOpError(
+          "RVV bitplane merge plane must pack exactly eight logical values per byte");
+    ++bitplaneAxes;
+    bitplaneAxis = axis;
+  }
+  if (bitplaneAxes != 1 || low.getLayout().getVl() <= 0 ||
+      low.getLayout().getVl() % 8)
+    return emitOpError(
+        "RVV bitplane merge requires one byte-packed lane axis and byte-aligned RVV parts");
+  for (auto [axis, lane] :
+       llvm::zip(low.getLayout().getAxisIds().asArrayRef(),
+                 low.getLayout().getLaneFactors().asArrayRef()))
+    if ((axis == bitplaneAxis && lane <= 1) ||
+        (axis != bitplaneAxis && lane != 1))
+      return emitOpError(
+          "RVV bitplane merge SIMD lanes must belong to the packed bit axis");
+  auto field = getPlane().getDefiningOp<FieldOp>();
+  if (!field || field.getAccess().getMapping() != "natural" ||
+      field.getAccess().getBitOffset() % 8)
+    return emitOpError(
+        "RVV bitplane merge requires one byte-aligned natural encoded field");
+  if (!exactLeaf(getLeaf(), "rvv", "bitplane-merge",
+                 "rvv.bitplane-merge", "none", "agnostic") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({static_cast<int64_t>(getInsertBit())}) ||
+      getLeaf().getLocalBytes() != 0)
+    return emitOpError("RVV bitplane merge has no exact selected leaf");
   return mlir::success();
 }
 
@@ -2743,7 +2877,11 @@ mlir::LogicalResult RVVContractStepOp::verify() {
       getLeaf().getMask() != "none" || getLeaf().getTail() != "agnostic" ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>(
-              {static_cast<int64_t>(getReductionAxis())}))
+              {static_cast<int64_t>(getReductionAxis())}) ||
+      (getLeaf().getInstruction() == "rvv.vfmacc.vf" &&
+       (elementOf(getLhs().getType()) != getResult().getType().getElementType() ||
+        elementOf(getRhs().getType()) !=
+            getResult().getType().getElementType())))
     return emitOpError()
            << "RVV contract step has an incomplete typed contract; accumulator="
            << getAccumulator().getType() << ", result=" << getResult().getType()
