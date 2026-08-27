@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <iterator>
+#include <limits>
 
 using namespace weft;
 
@@ -25,6 +26,8 @@ int64_t groups(mlir::Type type) {
     return window.getResourceGroups();
   if (auto window = mlir::dyn_cast<riscv::LayeredWindowType>(type))
     return window.getResourceGroups();
+  if (auto partials = mlir::dyn_cast<riscv::PartialSetType>(type))
+    return partials.getResourceGroups();
   if (auto layout = riscv_internal::layoutOf(type))
     return layout.getRegisterGroups();
   return 0;
@@ -448,8 +451,31 @@ public:
         mlir::Location location =
             definition ? definition->getLoc()
                        : peak.block->getParentOp()->getLoc();
-        const int64_t sizeBytes =
-            victim->groups * kernel.getTarget().getVlenBits() / 8;
+        int64_t streamParts = 1;
+        bool spillSizeOverflow = false;
+        for (int64_t factor :
+             valueType.getLayout().getTimeFactors().asArrayRef()) {
+          if (factor <= 0 ||
+              streamParts > std::numeric_limits<int64_t>::max() / factor) {
+            spillSizeOverflow = true;
+            break;
+          }
+          streamParts *= factor;
+        }
+        const int64_t vlenBytes = kernel.getTarget().getVlenBits() / 8;
+        if (spillSizeOverflow || vlenBytes <= 0 ||
+            victim->groups > std::numeric_limits<int64_t>::max() / streamParts ||
+            victim->groups * streamParts >
+                std::numeric_limits<int64_t>::max() / vlenBytes) {
+          kernel.emitError("physical spill storage size is not representable");
+          failed = true;
+          break;
+        }
+        // Register groups count simultaneously-live replicas.  A value with a
+        // time decomposition also owns one sequential RVV part per time
+        // coordinate; an explicit spill must preserve every part even though
+        // those parts do not contribute simultaneously to the register peak.
+        const int64_t sizeBytes = victim->groups * streamParts * vlenBytes;
         const int64_t alignment =
             std::max<int64_t>(16, kernel.getTarget().getVlenBits() / 8);
         int64_t ownerDomain = 0;

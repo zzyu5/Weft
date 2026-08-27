@@ -1203,12 +1203,25 @@ class FrontendCompiler:
                 or (integer_to_float and dtype.bits >= source.bits)
             )
         )
-        return self._emit(
+        result = self._emit(
             "weft_kernel.widen" if widens else "weft_kernel.cast",
             node,
             operands=(value,),
             result_types=(with_element(value.type, ScalarType(dtype)),),
         )[0]
+        return self._propagate_field_record_extent(result, value)
+
+    def _propagate_field_record_extent(
+        self, result: Value, *sources: Value
+    ) -> Value:
+        extents = {
+            self._field_record_extent[source]
+            for source in sources
+            if source in self._field_record_extent
+        }
+        if len(extents) == 1:
+            self._field_record_extent[result] = extents.pop()
+        return result
 
     def _broadcast_domain(
         self, lhs: ValueType, rhs: ValueType, node: ast.AST
@@ -1241,13 +1254,14 @@ class FrontendCompiler:
             )
         shape, axes = self._broadcast_domain(lhs.type, rhs.type, node)
         result_type = value_type(element_type(lhs.type), shape, axes)
-        return self._emit(
+        result = self._emit(
             "weft_kernel.binary",
             node,
             operands=(lhs, rhs),
             result_types=(result_type,),
             attributes={"kind": _string(kind)},
         )[0]
+        return self._propagate_field_record_extent(result, lhs, rhs)
 
     def _compile_field(self, expression: ast.Attribute) -> Value:
         owner = self._expect_value(self._compile_expr(expression.value), expression.value)
@@ -1626,12 +1640,13 @@ class FrontendCompiler:
     def _intrinsic_materialize(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("expr",), {})
         value = self._expect_value(self._compile_expr(args["expr"]), args["expr"])
-        return self._emit(
+        result = self._emit(
             "weft_kernel.materialize",
             call,
             operands=(value,),
             result_types=(value.type,),
         )[0]
+        return self._propagate_field_record_extent(result, value)
 
     def _intrinsic_admit(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("region",), {})
@@ -1686,9 +1701,10 @@ class FrontendCompiler:
                 "widen requires a numeric scalar or local Value", self._location(call)
             )
         result_type = with_element(value.type, ScalarType(dtype))
-        return self._emit(
+        result = self._emit(
             "weft_kernel.widen", call, operands=(value,), result_types=(result_type,)
         )[0]
+        return self._propagate_field_record_extent(result, value)
 
     def _intrinsic_narrow(self, call: ast.Call) -> Value:
         args = self._arguments(
@@ -2140,8 +2156,10 @@ class FrontendCompiler:
             self.env[name] = body.arguments[cursor]
             cursor += 1
         self.immutable_names = set(saved[2])
-        for name in staged_names:
-            self.env[name] = body.arguments[cursor]
+        for name, staged_value in zip(staged_names, staged_values):
+            argument = body.arguments[cursor]
+            self.env[name] = argument
+            self._propagate_field_record_extent(argument, staged_value)
             self.immutable_names.add(name)
             cursor += 1
         self.active_domain = domain

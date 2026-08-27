@@ -164,6 +164,7 @@ public:
     lowerLocalStates(rewriter, failed);
     lowerLocalCommits(rewriter, failed);
     lowerLoops(rewriter, failed);
+    lowerLocalGroupExtracts(rewriter, failed);
     closeOrderedLoops(failed);
     lowerPartitionedWidenReduceStores(rewriter, failed);
     lowerWidenReductions(rewriter, failed);
@@ -854,8 +855,16 @@ private:
         continue;
       mlir::Value lower =
           rewriter.create<mlir::arith::ConstantIndexOp>(loop.getLoc(), 0);
+      mlir::Value upper = total;
+      mlir::Value step = domain.getPartition();
+      const bool ordinalIteration = domainType.getTail() == "exact";
+      if (ordinalIteration) {
+        upper = rewriter.create<mlir::arith::DivUIOp>(
+            loop.getLoc(), total, domain.getPartition());
+        step = rewriter.create<mlir::arith::ConstantIndexOp>(loop.getLoc(), 1);
+      }
       auto physical = rewriter.create<mlir::scf::ForOp>(
-          loop.getLoc(), lower, total, domain.getPartition(), loop.getCarried());
+          loop.getLoc(), lower, upper, step, loop.getCarried());
       if (auto source = loop->getAttr("source_origin"))
         physical->setAttr("source_origin", source);
       physical->setAttr(
@@ -875,10 +884,14 @@ private:
       mlir::Block &sourceBody = loop.getBody().front();
       mlir::Block *targetBody = physical.getBody();
       rewriter.setInsertionPointToStart(targetBody);
+      mlir::Value logicalOffset = physical.getInductionVar();
+      if (ordinalIteration)
+        logicalOffset = rewriter.create<mlir::arith::MulIOp>(
+            loop.getLoc(), physical.getInductionVar(), domain.getPartition());
       mlir::Value base = rewriter.create<mlir::arith::AddIOp>(
-          loop.getLoc(), origin, physical.getInductionVar());
+          loop.getLoc(), origin, logicalOffset);
       mlir::Value remaining = rewriter.create<mlir::arith::SubIOp>(
-          loop.getLoc(), total, physical.getInductionVar());
+          loop.getLoc(), total, logicalOffset);
       mlir::Value active = domain.getPartition();
       if (domainType.getTail() != "exact")
         active = rewriter.create<mlir::arith::MinUIOp>(
@@ -941,9 +954,54 @@ private:
         [&](riscv::MaterializeOp operation) { operations.push_back(operation); });
     for (riscv::MaterializeOp operation : operations) {
       if (operation.getPlacement() == "local") {
-        operation.emitError(
-            "local materialize reached composite lowering without an explicit local object");
-        failed = true;
+        auto input =
+            mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
+        auto result =
+            mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+        const int64_t elements =
+            result ? product(result.getLayout().getLocalFactors()) : -1;
+        const int64_t elementBytes =
+            result ? std::max<int64_t>(
+                         1, (riscv_internal::logicalBitWidth(result) + 7) / 8)
+                   : -1;
+        if (!input || !result || input.getLayout().getCarrier() != "rvv" ||
+            result.getLayout().getCarrier() != "local" || elements <= 0 ||
+            elementBytes <= 0) {
+          operation.emitError(
+              "local materialize requires one closed RVV-to-local value mapping");
+          failed = true;
+          continue;
+        }
+        const int64_t bytes = elements * elementBytes;
+        rewriter.setInsertionPoint(operation);
+        mlir::Value allocationBytes =
+            rewriter.create<mlir::arith::ConstantIndexOp>(operation.getLoc(),
+                                                          bytes);
+        auto storageType = riscv::LocalType::get(
+            rewriter.getContext(), result.getElementType(), result.getShape(),
+            result.getAxisIds(), -1, std::max<int64_t>(8, elementBytes),
+            operation.getBirthId(), "pack", operation.getOwnerDomainId(),
+            operation.getBirthId(), operation.getLifetimeEndDomainId(),
+            "rvv-local-materialize");
+        auto allocation = rewriter.create<riscv::LocalAllocOp>(
+            operation.getLoc(), storageType, allocationBytes);
+        mlir::Value logicalElements =
+            rewriter.create<mlir::arith::ConstantIndexOp>(operation.getLoc(),
+                                                          elements);
+        auto binding = rewriter.create<riscv::LocalBindOp>(
+            operation.getLoc(), result, allocation.getResult(), logicalElements);
+        auto stored = rewriter.create<riscv::RVVLocalMaterializeOp>(
+            operation.getLoc(), operation.getInput(), binding.getResult(),
+            riscv_internal::leaf(
+                rewriter, "transfer", "local-materialize",
+                "rvv.local-materialize", "rvv.local-materialize",
+                input.getLayout().getRegisterGroups(), 0, 0, 0, "none",
+                "exact", {}, bytes));
+        copyIdentity(operation, allocation);
+        copyIdentity(operation, binding);
+        copyIdentity(operation, stored);
+        operation.getResult().replaceAllUsesWith(binding.getResult());
+        rewriter.eraseOp(operation);
         continue;
       }
       if (operation.getPlacement() == "reload") {
@@ -1061,6 +1119,126 @@ private:
       copyIdentity(operation, materialized);
       operation.getResult().replaceAllUsesWith(materialized.getResult());
       rewriter.eraseOp(operation);
+    }
+  }
+
+  void lowerLocalGroupExtracts(mlir::IRRewriter &rewriter, bool &failed) {
+    llvm::SmallVector<riscv::ExtractOp> extracts;
+    getOperation().walk([&](riscv::ExtractOp extract) {
+      auto input =
+          mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
+      if (input && input.getLayout().getCarrier() == "local")
+        extracts.push_back(extract);
+    });
+    for (riscv::ExtractOp extract : extracts) {
+      auto input = mlir::cast<riscv::ValueType>(extract.getInput().getType());
+      auto result =
+          mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+      auto binding = extract.getInput().getDefiningOp<riscv::LocalBindOp>();
+      if (!result || result.getLayout().getCarrier() != "scalar" || !binding ||
+          extract.getSelectors().size() != input.getShape().size())
+        continue;
+
+      size_t cursor = 0;
+      int64_t groupDimension = -1;
+      riscv::PhysicalPointOp groupPoint;
+      bool supported = true;
+      for (auto [dimension, selectorAttribute] :
+           llvm::enumerate(extract.getSelectors())) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (cursor >= extract.getIndices().size() ||
+            selector != "group_index" || groupDimension >= 0) {
+          supported = false;
+          break;
+        }
+        groupPoint = extract.getIndices()[cursor++]
+                         .getDefiningOp<riscv::PhysicalPointOp>();
+        groupDimension = static_cast<int64_t>(dimension);
+      }
+      auto resultParts = riscv_internal::staticProduct(
+          result.getLayout().getReplicaFactors().asArrayRef());
+      if (!supported || cursor != extract.getIndices().size() || !groupPoint ||
+          groupDimension < 0 || !resultParts || *resultParts <= 0 ||
+          llvm::any_of(result.getLayout().getTimeFactors().asArrayRef(),
+                       [](int64_t factor) { return factor != 1; }) ||
+          llvm::any_of(result.getLayout().getLaneFactors().asArrayRef(),
+                       [](int64_t factor) { return factor != 1; }))
+        continue;
+
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(extract);
+      mlir::Value groupCount = rewriter.create<mlir::arith::ConstantIndexOp>(
+          extract.getLoc(),
+          input.getLayout().getLocalFactors()[groupDimension]);
+      mlir::Value recordExtent = rewriter.create<mlir::arith::MulIOp>(
+          extract.getLoc(), groupPoint.getPartition(), groupCount);
+      mlir::Value relative = rewriter.create<mlir::arith::RemUIOp>(
+          extract.getLoc(), groupPoint.getBase(), recordExtent);
+      mlir::Value group = rewriter.create<mlir::arith::DivUIOp>(
+          extract.getLoc(), relative, groupPoint.getPartition());
+
+      llvm::SmallVector<mlir::Value> loaded;
+      for (int64_t part = 0; part < *resultParts; ++part) {
+        llvm::DenseMap<int64_t, int64_t> coordinates;
+        int64_t remaining = part;
+        for (int64_t dimension =
+                 static_cast<int64_t>(result.getAxisIds().size()) - 1;
+             dimension >= 0; --dimension) {
+          const int64_t factor =
+              result.getLayout().getReplicaFactors()[dimension];
+          coordinates[result.getAxisIds()[dimension]] = remaining % factor;
+          remaining /= factor;
+        }
+        mlir::Value linear = rewriter.create<mlir::arith::ConstantIndexOp>(
+            extract.getLoc(), 0);
+        for (size_t dimension = 0; dimension < input.getShape().size();
+             ++dimension) {
+          mlir::Value extent = rewriter.create<mlir::arith::ConstantIndexOp>(
+              extract.getLoc(), input.getLayout().getLocalFactors()[dimension]);
+          linear = rewriter.create<mlir::arith::MulIOp>(extract.getLoc(), linear,
+                                                        extent);
+          mlir::Value coordinate;
+          if (static_cast<int64_t>(dimension) == groupDimension) {
+            coordinate = group;
+          } else {
+            auto found = coordinates.find(input.getAxisIds()[dimension]);
+            if (found == coordinates.end()) {
+              supported = false;
+              break;
+            }
+            coordinate = rewriter.create<mlir::arith::ConstantIndexOp>(
+                extract.getLoc(), found->second);
+          }
+          linear = rewriter.create<mlir::arith::AddIOp>(extract.getLoc(), linear,
+                                                        coordinate);
+        }
+        if (!supported)
+          break;
+        auto load = rewriter.create<riscv::LocalLoadOp>(
+            extract.getLoc(), result.getElementType(), binding.getResult(), linear,
+            riscv_internal::leaf(rewriter, "transfer", "local-load",
+                                 "local.load.element", "local.load.element", 0,
+                                 0, 0, 0));
+        copyIdentity(extract, load);
+        loaded.push_back(load.getResult());
+      }
+      if (!supported) {
+        extract.emitError(
+            "local grouped projection has no complete scalar replica mapping");
+        failed = true;
+        continue;
+      }
+      auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
+          extract.getLoc(), result, loaded,
+          riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
+                               "scalar.assemble-replicas",
+                               "scalar.assemble-replicas", 0, 0));
+      copyIdentity(extract, assembled);
+      extract.getResult().replaceAllUsesWith(assembled.getResult());
+      rewriter.eraseOp(extract);
     }
   }
 
@@ -1752,10 +1930,17 @@ private:
           continue;
         }
         rewriter.setInsertionPoint(operation);
+        auto schedule = operation->getAttrOfType<riscv::ScheduleAttr>("schedule");
+        if (!schedule) {
+          operation->emitError(
+              "selected RVV widening dot lost its typed physical schedule");
+          failed = true;
+          continue;
+        }
         auto widenedDot = rewriter.create<riscv::RVVWidenDotOp>(
             operation->getLoc(), operation->getResult(0).getType(),
             operation->getOperand(0), operation->getOperand(1), over,
-            rewriter.getStringAttr(streamReduction),
+            rewriter.getStringAttr(streamReduction), schedule.getUnroll(),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",
                 "rvv.vwmul-vwredsum",
@@ -1763,6 +1948,23 @@ private:
                     rhsType.getLayout().getRegisterGroups(),
                 0, temporaryGroups));
         copyIdentity(operation, widenedDot);
+        if (schedule.getUnroll() > 1 && streamReduction == "per_stream") {
+          if (auto parentLoop =
+                  operation->getParentOfType<mlir::scf::ForOp>()) {
+            auto existing = parentLoop->getAttrOfType<mlir::IntegerAttr>(
+                "weft.riscv.unroll_factor");
+            if (existing && existing.getInt() != schedule.getUnroll()) {
+              operation->emitError(
+                  "one physical Level received incompatible contraction unroll bindings");
+              failed = true;
+              rewriter.eraseOp(widenedDot);
+              continue;
+            }
+            parentLoop->setAttr(
+                "weft.riscv.unroll_factor",
+                rewriter.getI64IntegerAttr(schedule.getUnroll()));
+          }
+        }
         operation->getResult(0).replaceAllUsesWith(widenedDot.getResult());
         rewriter.eraseOp(operation);
         continue;

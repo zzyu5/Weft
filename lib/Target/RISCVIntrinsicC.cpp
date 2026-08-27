@@ -169,6 +169,7 @@ struct Binding {
     LocalArray,
     Fragment,
     Window,
+    PartialSet,
     Point,
     Domain,
   } kind = Kind::None;
@@ -582,6 +583,8 @@ private:
   mlir::LogicalResult compileLocalBind(riscv::LocalBindOp operation);
   mlir::LogicalResult compileLocalLoad(riscv::LocalLoadOp operation);
   mlir::LogicalResult compileLocalStore(riscv::LocalStoreOp operation);
+  mlir::LogicalResult
+  compileRVVLocalMaterialize(riscv::RVVLocalMaterializeOp operation);
   mlir::LogicalResult compileSpill(riscv::SpillOp operation);
   mlir::LogicalResult compileReload(riscv::ReloadOp operation);
   mlir::LogicalResult compileIMEPack(riscv::IMEPackOp operation);
@@ -629,6 +632,12 @@ private:
   compileEncodedDotStep(riscv::RVVEncodedDotStepOp operation);
   mlir::LogicalResult compileRVVWidenDot(riscv::RVVWidenDotOp operation);
   mlir::LogicalResult
+  compileRVVWidenMultiply(riscv::RVVWidenMultiplyOp operation);
+  mlir::LogicalResult compileRVVRegularRepeatIndex(
+      riscv::RVVRegularRepeatIndexOp operation);
+  mlir::LogicalResult compileRVVRegularRepeatGather(
+      riscv::RVVRegularRepeatGatherOp operation);
+  mlir::LogicalResult
   compileRVVStorageWindow(riscv::RVVStorageWindowOp operation);
   mlir::LogicalResult
   compileRVVLayeredStorageLoad(riscv::RVVLayeredStorageLoadOp operation);
@@ -638,6 +647,17 @@ private:
   compileRVVWidenAccumulate(riscv::RVVWidenAccumulateOp operation);
   mlir::LogicalResult
   compileRVVFinalizeWidenDot(riscv::RVVFinalizeWidenDotOp operation);
+  mlir::LogicalResult compileRVVPartialSet(riscv::RVVPartialSetOp operation);
+  mlir::LogicalResult
+  compileRVVPartialReduce(riscv::RVVPartialReduceOp operation);
+  mlir::LogicalResult compileRVVPartialScaleCombine(
+      riscv::RVVPartialScaleCombineOp operation);
+  mlir::LogicalResult
+  compileRVVPartialCombine(riscv::RVVPartialCombineOp operation);
+  mlir::LogicalResult
+  compileRVVPartialFinalize(riscv::RVVPartialFinalizeOp operation);
+  mlir::LogicalResult
+  compileRVVAssembleReplicas(riscv::RVVAssembleReplicasOp operation);
   mlir::LogicalResult
   compileRVVWidenReduce(riscv::RVVWidenReduceOp operation);
   mlir::LogicalResult compileRVVPartitionedWidenReduceStore(
@@ -752,6 +772,33 @@ std::string lmulSpelling(int64_t eighths) {
   default:
     return {};
   }
+}
+
+std::string vectorSuffixFor(riscv::ValueType value) {
+  char category = 'i';
+  if (mlir::isa<mlir::FloatType>(value.getElementType()))
+    category = 'f';
+  else if (auto integer =
+               mlir::dyn_cast<mlir::IntegerType>(value.getElementType()))
+    category = integer.isUnsigned() ? 'u' : 'i';
+  return std::string(1, category) +
+         std::to_string(value.getLayout().getSew()) +
+         lmulSpelling(value.getLayout().getLmulEighths());
+}
+
+std::string vectorTypeFor(riscv::ValueType value) {
+  std::string suffix = vectorSuffixFor(value);
+  const std::string prefix = suffix.front() == 'f'
+                                 ? "vfloat"
+                                 : suffix.front() == 'u' ? "vuint" : "vint";
+  return prefix + suffix.substr(1) + "_t";
+}
+
+int64_t physicalLanesFor(riscv::ValueType value) {
+  int64_t lanes = 1;
+  for (int64_t factor : value.getLayout().getLaneFactors().asArrayRef())
+    lanes *= factor;
+  return std::max<int64_t>(1, lanes);
 }
 
 int64_t product(mlir::DenseI64ArrayAttr values) {
@@ -1604,8 +1651,10 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
     mlir::FailureOr<Binding> loaded = loadDenseBlock(value, binding);
     if (mlir::failed(loaded))
       return mlir::failure();
-    if (isSharedMaterialization(value))
-      bindings[value] = *loaded;
+    // A selected physical SSA load is evaluated once.  Any reload or
+    // rematerialization must already be an explicit physical operation; the
+    // terminal emitter must not silently duplicate the producer per consumer.
+    bindings[value] = *loaded;
     return loaded;
   }
   if (binding.kind == Binding::Kind::Field) {
@@ -1754,6 +1803,7 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                      "selected scalar tuple field type has no intrinsic-C load"),
                  mlir::failure();
       }
+      bindings[value] = tuple;
       return tuple;
     }
     auto expected = selectedBindingKind(value);
@@ -1788,6 +1838,7 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
         }
         streamed.parts.push_back(std::move(part.parts.front()));
       }
+      bindings[value] = streamed;
       return streamed;
     }
     Binding loaded = emitInterleavedField(value, binding, "0");
@@ -1819,6 +1870,7 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
           "encoded field load does not materialize every selected physical part");
       return mlir::failure();
     }
+    bindings[value] = loaded;
     return loaded;
   }
   return binding;
@@ -2020,6 +2072,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileLocalLoad(load);
   if (auto store = mlir::dyn_cast<riscv::LocalStoreOp>(operation))
     return compileLocalStore(store);
+  if (auto materialize =
+          mlir::dyn_cast<riscv::RVVLocalMaterializeOp>(operation))
+    return compileRVVLocalMaterialize(materialize);
   if (auto spill = mlir::dyn_cast<riscv::SpillOp>(operation))
     return compileSpill(spill);
   if (auto reload = mlir::dyn_cast<riscv::ReloadOp>(operation))
@@ -2072,6 +2127,14 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileEncodedDotStep(step);
   if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation))
     return compileRVVWidenDot(dot);
+  if (auto multiply = mlir::dyn_cast<riscv::RVVWidenMultiplyOp>(operation))
+    return compileRVVWidenMultiply(multiply);
+  if (auto index =
+          mlir::dyn_cast<riscv::RVVRegularRepeatIndexOp>(operation))
+    return compileRVVRegularRepeatIndex(index);
+  if (auto gather =
+          mlir::dyn_cast<riscv::RVVRegularRepeatGatherOp>(operation))
+    return compileRVVRegularRepeatGather(gather);
   if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(operation))
     return compileRVVStorageWindow(window);
   if (auto load = mlir::dyn_cast<riscv::RVVLayeredStorageLoadOp>(operation))
@@ -2085,6 +2148,20 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto finalize =
           mlir::dyn_cast<riscv::RVVFinalizeWidenDotOp>(operation))
     return compileRVVFinalizeWidenDot(finalize);
+  if (auto partial = mlir::dyn_cast<riscv::RVVPartialSetOp>(operation))
+    return compileRVVPartialSet(partial);
+  if (auto reduce = mlir::dyn_cast<riscv::RVVPartialReduceOp>(operation))
+    return compileRVVPartialReduce(reduce);
+  if (auto combine =
+          mlir::dyn_cast<riscv::RVVPartialScaleCombineOp>(operation))
+    return compileRVVPartialScaleCombine(combine);
+  if (auto combine = mlir::dyn_cast<riscv::RVVPartialCombineOp>(operation))
+    return compileRVVPartialCombine(combine);
+  if (auto finalize = mlir::dyn_cast<riscv::RVVPartialFinalizeOp>(operation))
+    return compileRVVPartialFinalize(finalize);
+  if (auto assemble =
+          mlir::dyn_cast<riscv::RVVAssembleReplicasOp>(operation))
+    return compileRVVAssembleReplicas(assemble);
   if (auto reduce = mlir::dyn_cast<riscv::RVVWidenReduceOp>(operation))
     return compileRVVWidenReduce(reduce);
   if (auto reduce =
@@ -5523,9 +5600,10 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
         }
         if (layers > 1 && layerIndex != "0") {
           std::string shifted = fresh("grouped_layered_shift");
-          line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-               loaded + ", " + layerIndex + " * " +
-               std::to_string(logicalWidth) + ", " + vl + ");");
+          line(type + " " + shifted + " = ((" + layerIndex + ") == 0) ? " +
+               loaded + " : __riscv_vsrl_vx_" + suffix + "(" + loaded + ", " +
+               layerIndex + " * " + std::to_string(logicalWidth) + ", " + vl +
+               ");");
           loaded = std::move(shifted);
         }
         const bool shiftExposesOnlyLogicalBits =
@@ -5969,6 +6047,33 @@ mlir::LogicalResult Emitter::compileLocalStore(riscv::LocalStoreOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVLocalMaterialize(
+    riscv::RVVLocalMaterializeOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.local-materialize")
+    return fail(operation,
+                "RVV local materialize has no exact selected leaf");
+  mlir::FailureOr<Binding> input = materializeNumeric(
+      operation.getInput(), bindings.lookup(operation.getInput()));
+  Binding destination = bindings.lookup(operation.getDestination());
+  auto element = scalarCType(operation.getInput().getType().getElementType());
+  const int64_t parts = vectorPartCount(operation.getInput());
+  const int64_t lanes = physicalLanes(operation.getInput());
+  const unsigned bits = operation.getInput().getType().getLayout().getSew();
+  if (mlir::failed(input) || input->kind != Binding::Kind::Vector ||
+      destination.kind != Binding::Kind::LocalArray ||
+      destination.scalar.empty() || !element || parts <= 0 || lanes <= 0 ||
+      input->parts.size() != static_cast<size_t>(parts))
+    return fail(operation,
+                "RVV local materialize has no complete vector/local binding");
+  const std::string suffix = vectorSuffix(operation.getInput());
+  for (int64_t part = 0; part < parts; ++part)
+    line("__riscv_vse" + std::to_string(bits) + "_v_" + suffix + "((" +
+         *element + " *)" + destination.scalar + " + " +
+         std::to_string(part * lanes) + ", " + input->parts[part] + ", " +
+         partVL(operation.getInput(), part) + ");");
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileSpill(riscv::SpillOp operation) {
   Binding input = bindings.lookup(operation.getInput());
   Binding slot = bindings.lookup(operation.getSlot());
@@ -5982,13 +6087,23 @@ mlir::LogicalResult Emitter::compileSpill(riscv::SpillOp operation) {
   auto scalarType = scalarCType(element);
   if (!scalarType)
     return fail(operation, "spill value has no C element type");
+  if (input.kind == Binding::Kind::Slice || input.kind == Binding::Kind::Field) {
+    mlir::FailureOr<Binding> materialized =
+        materializeNumeric(operation.getInput(), std::move(input));
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    input = std::move(*materialized);
+  }
   if (input.kind == Binding::Kind::Vector) {
+    auto inputType =
+        mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
     const int64_t parts = vectorPartCount(operation.getInput());
-    if (parts <= 0 || input.parts.size() != static_cast<size_t>(parts) ||
+    if (!inputType || parts <= 0 ||
+        input.parts.size() != static_cast<size_t>(parts) ||
         slotType.getSizeBytes() % parts)
       return fail(operation, "vector spill byte partition is incomplete");
     const int64_t bytes = slotType.getSizeBytes() / parts;
-    const unsigned bits = riscv_internal::logicalBitWidth(element);
+    const unsigned bits = inputType.getLayout().getSew();
     const std::string suffix = vectorSuffix(operation.getInput());
     for (int64_t part = 0; part < parts; ++part)
       line("__riscv_vse" + std::to_string(bits) + "_v_" + suffix +
@@ -6034,10 +6149,35 @@ mlir::LogicalResult Emitter::compileReload(riscv::ReloadOp operation) {
     if (parts <= 0 || slotType.getSizeBytes() % parts)
       return fail(operation, "vector reload byte partition is incomplete");
     const int64_t bytes = slotType.getSizeBytes() / parts;
-    const unsigned bits = riscv_internal::logicalBitWidth(resultType.getElementType());
+    const unsigned bits = resultType.getLayout().getSew();
     const std::string suffix = vectorSuffix(operation.getResult());
     const std::string type = vectorType(operation.getResult());
+    const int64_t streams = streamPartCount(operation.getResult());
+    auto partIsUsed = [&](int64_t part) {
+      for (mlir::OpOperand &use : operation.getResult().getUses()) {
+        auto set = mlir::dyn_cast<riscv::RVVPartialSetOp>(use.getOwner());
+        if (!set)
+          return true;
+        const size_t operand = use.getOperandNumber();
+        const size_t lhsCount = set.getLhs().size();
+        int64_t replica = -1;
+        if (operand < lhsCount)
+          replica = set.getLhsReplicas()[operand];
+        else if (operand < lhsCount + set.getRhs().size())
+          replica = set.getRhsReplicas()[operand - lhsCount];
+        else
+          return true;
+        if (streams <= 0 ||
+            (part >= replica * streams && part < (replica + 1) * streams))
+          return true;
+      }
+      return false;
+    };
     for (int64_t part = 0; part < parts; ++part) {
+      if (!partIsUsed(part)) {
+        result.parts.emplace_back();
+        continue;
+      }
       std::string loaded = fresh("reload");
       line(type + " " + loaded + " = __riscv_vle" + std::to_string(bits) +
            "_v_" + suffix + "((const " + *scalarType + " *)(" + slot.scalar +
@@ -7584,6 +7724,250 @@ Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVWidenMultiply(
+    riscv::RVVWidenMultiplyOp operation) {
+  auto lhs = materializeNumeric(operation.getLhs(),
+                                bindings.lookup(operation.getLhs()));
+  auto rhs = materializeNumeric(operation.getRhs(),
+                                bindings.lookup(operation.getRhs()));
+  if (mlir::failed(lhs) || mlir::failed(rhs) ||
+      lhs->kind != Binding::Kind::Vector ||
+      rhs->kind != Binding::Kind::Vector)
+    return fail(operation,
+                "RVV widening multiply requires two selected vector operands");
+  const std::string instruction = instructionOf(operation.getOperation()).str();
+  if (instruction != "rvv.vwmulu.vv" && instruction != "rvv.vwmul.vv" &&
+      instruction != "rvv.vwmulsu.vv" &&
+      instruction != "rvv.vwmulsu.vv.swap")
+    return fail(operation,
+                "RVV widening multiply has no exact selected instruction");
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  std::string suffix = vectorSuffix(operation.getResult());
+  std::string unsignedSuffix = suffix;
+  unsignedSuffix[0] = 'u';
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto lhsPart = mappedPart(operation.getOperation(), 0, part);
+    auto rhsPart = mappedPart(operation.getOperation(), 1, part);
+    if (!lhsPart || !rhsPart || *lhsPart >= lhs->parts.size() ||
+        *rhsPart >= rhs->parts.size())
+      return fail(operation,
+                  "RVV widening multiply has no closed operand-part mapping");
+    std::string intrinsic;
+    std::string left = lhs->parts[*lhsPart];
+    std::string right = rhs->parts[*rhsPart];
+    if (instruction == "rvv.vwmulu.vv")
+      intrinsic = "__riscv_vwmulu_vv_" + unsignedSuffix;
+    else {
+      intrinsic = "__riscv_" +
+                  std::string(instruction == "rvv.vwmul.vv"
+                                  ? "vwmul_vv_"
+                                  : "vwmulsu_vv_") +
+                  suffix;
+      if (instruction == "rvv.vwmulsu.vv.swap")
+        std::swap(left, right);
+    }
+    std::string expression = intrinsic + "(" + left + ", " + right + ", " +
+                             partVL(operation.getResult(), part) + ")";
+    if (instruction == "rvv.vwmulu.vv" && suffix[0] == 'i')
+      expression = "__riscv_vreinterpret_v_" + unsignedSuffix + "_" + suffix +
+                   "(" + expression + ")";
+    std::string name = fresh("widen_multiply");
+    line(vectorType(operation.getResult()) + " " + name + " = " + expression +
+         ";");
+    result.parts.push_back(std::move(name));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVRegularRepeatIndex(
+    riscv::RVVRegularRepeatIndexOp operation) {
+  const int64_t repeat = operation.getRepeat();
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool powerOfTwo = instruction == "rvv.regular-repeat-index.pow2";
+  if ((!powerOfTwo && instruction != "rvv.regular-repeat-index.div") ||
+      operation.getResults().size() != operation.getPartBases().size())
+    return fail(operation,
+                "regular-repeat index has no exact selected physical spelling");
+  mlir::Value firstResult = operation.getResults().front();
+  const std::string indexSuffix = vectorSuffix(firstResult);
+  const int64_t lanes = physicalLanes(firstResult);
+  std::string baseExpression = "__riscv_vid_v_" + indexSuffix + "(" +
+                               std::to_string(lanes) + ")";
+  if (powerOfTwo) {
+    int64_t shift = 0;
+    for (int64_t value = repeat; value > 1; value >>= 1)
+      ++shift;
+    baseExpression = "__riscv_vsrl_vx_" + indexSuffix + "(" +
+                     baseExpression + ", " + std::to_string(shift) + ", " +
+                     std::to_string(lanes) + ")";
+  } else {
+    baseExpression = "__riscv_vdivu_vx_" + indexSuffix + "(" +
+                     baseExpression + ", " + std::to_string(repeat) + ", " +
+                     std::to_string(lanes) + ")";
+  }
+  std::string baseIndex = fresh("repeat_index_base");
+  line(vectorType(firstResult) + " " + baseIndex + " = " + baseExpression +
+       ";");
+  for (auto [resultValue, basesAttribute] :
+       llvm::zip(operation.getResults(), operation.getPartBases())) {
+    auto bases = mlir::cast<mlir::DenseI64ArrayAttr>(basesAttribute);
+    const int64_t streams = streamPartCount(resultValue);
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < vectorPartCount(resultValue); ++part) {
+      const int64_t stream = part % streams;
+      if (stream < 0 || stream >= static_cast<int64_t>(bases.size()))
+        return fail(operation,
+                    "regular-repeat index result part exceeds its typed bases");
+      const std::string suffix = vectorSuffix(resultValue);
+      std::string expression = baseIndex;
+      if (bases[stream] != 0)
+        expression = "__riscv_vadd_vx_" + suffix + "(" + expression + ", " +
+                     std::to_string(bases[stream]) + ", " +
+                     partVL(resultValue, part) + ")";
+      std::string name = fresh("repeat_index");
+      line(vectorType(resultValue) + " " + name + " = " + expression + ";");
+      result.parts.push_back(std::move(name));
+    }
+    bindings[resultValue] = std::move(result);
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
+    riscv::RVVRegularRepeatGatherOp operation) {
+  mlir::Value firstValue = operation.getResults().front();
+  const int64_t lanes = physicalLanes(firstValue);
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool broadcastOnly = instruction == "rvv.regular-repeat-broadcast";
+  const bool powerOfTwo = instruction == "rvv.regular-repeat-gather.pow2";
+  if (!broadcastOnly && !powerOfTwo &&
+      instruction != "rvv.regular-repeat-gather.div")
+    return fail(operation,
+                "regular-repeat gather has no exact selected index spelling");
+  Binding field = bindings.lookup(operation.getField());
+  if (field.kind != Binding::Kind::Field || field.field.index ||
+      operation.getResults().empty())
+    return fail(operation,
+                "regular-repeat gather requires one unprojected encoded field");
+  Binding owner = bindings.lookup(field.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(field.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto storage = fieldFor(field);
+  auto elementType = storage ? scalarCType(storage->type) : std::nullopt;
+  auto integer = storage
+                     ? mlir::dyn_cast<mlir::IntegerType>(storage->type)
+                     : mlir::IntegerType();
+  if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
+      !storage || !elementType || !integer || storage->bitOffset % 8)
+    return fail(operation,
+                "regular-repeat gather has incomplete record storage geometry");
+  const std::string suffix = vectorSuffix(firstValue);
+  const std::string type = vectorType(firstValue);
+  auto layout = layoutOf(firstValue);
+  if (!layout)
+    return fail(operation, "regular-repeat gather result has no RVV layout");
+  if (lanes <= 1)
+    return fail(operation, "regular-repeat gather has no lane extent");
+
+  const int64_t registerParts = registerPartCount(firstValue);
+  llvm::SmallVector<std::string> sourceWindows;
+  llvm::SmallVector<std::string> sourceRecords;
+  llvm::SmallVector<int64_t, 4> axes = registerAxesFor(firstValue);
+  for (int64_t replica = 0; replica < registerParts; ++replica) {
+    auto coordinates = registerCoordinates(firstValue, replica);
+    if (!coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "regular-repeat gather has no free-axis register coordinates");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      auto byteStride = llvm::find_if(owner.recordByteStrides,
+                                      [&](const auto &entry) {
+                                        return entry.first == axis;
+                                      });
+      if (byteStride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "regular-repeat gather free axis has no record stride");
+      record += " + " + std::to_string(coordinate) + " * " +
+                byteStride->second;
+    }
+    record += ")";
+    sourceRecords.push_back(record);
+    if (broadcastOnly)
+      continue;
+    const std::string pointer =
+        "((const " + *elementType + " *)((const uint8_t *)(" + record +
+        ") + " + std::to_string(storage->bitOffset / 8) + ") + " +
+        std::to_string(operation.getSourceBase()) + ")";
+    std::string loaded = fresh("repeat_source");
+    line(type + " " + loaded + " = __riscv_vle" +
+         std::to_string(integer.getWidth()) + "_v_" + suffix + "(" + pointer +
+         ", " + std::to_string(operation.getSourceCount()) + ");");
+    sourceWindows.push_back(std::move(loaded));
+  }
+
+  for (auto [resultNumber, values] : llvm::enumerate(
+           llvm::zip(operation.getResults(), operation.getPartBases()))) {
+    auto [resultValue, basesAttribute] = values;
+    auto bases = mlir::cast<mlir::DenseI64ArrayAttr>(basesAttribute);
+    const int64_t streams = streamPartCount(resultValue);
+    Binding indexBinding;
+    if (!broadcastOnly) {
+      if (resultNumber >= operation.getIndices().size())
+        return fail(operation,
+                    "regular-repeat gather lost its typed index operand");
+      indexBinding = bindings.lookup(operation.getIndices()[resultNumber]);
+      if (indexBinding.kind != Binding::Kind::Vector ||
+          indexBinding.parts.size() !=
+              static_cast<size_t>(vectorPartCount(resultValue)))
+        return fail(operation,
+                    "regular-repeat gather typed index is not materialized");
+    }
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < vectorPartCount(resultValue); ++part) {
+      const int64_t replica = part / streams;
+      const int64_t stream = part % streams;
+      const int64_t availableSources = static_cast<int64_t>(
+          broadcastOnly ? sourceRecords.size() : sourceWindows.size());
+      if (replica < 0 || replica >= availableSources ||
+          stream < 0 || stream >= static_cast<int64_t>(bases.size()))
+        return fail(operation,
+                    "regular-repeat gather result parts exceed its selected window");
+      if (broadcastOnly) {
+        const int64_t sourceIndex = operation.getSourceBase() + bases[stream];
+        const std::string scalarValue =
+            "((const " + *elementType + " *)((const uint8_t *)(" +
+            sourceRecords[replica] + ") + " +
+            std::to_string(storage->bitOffset / 8) + "))[" +
+            std::to_string(sourceIndex) + "]";
+        std::string gathered = fresh("regular_broadcast");
+        const bool floating = mlir::isa<mlir::FloatType>(storage->type);
+        line(vectorType(resultValue) + " " + gathered + " = __riscv_" +
+             std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") +
+             vectorSuffix(resultValue) + "(" + scalarValue + ", " +
+             partVL(resultValue, part) + ");");
+        result.parts.push_back(std::move(gathered));
+        continue;
+      }
+      std::string gathered = fresh("regular_gather");
+      line(vectorType(resultValue) + " " + gathered +
+           " = __riscv_vrgather_vv_" + vectorSuffix(resultValue) + "(" +
+           sourceWindows[replica] + ", " + indexBinding.parts[part] + ", " +
+           partVL(resultValue, part) + ");");
+      result.parts.push_back(std::move(gathered));
+    }
+    bindings[resultValue] = std::move(result);
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult
 Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
   if (instructionOf(operation.getOperation()) != "rvv.storage-window")
@@ -7773,19 +8157,40 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
       "u8" + lmulSpelling(layout.getLmulEighths());
   const std::string type =
       "vuint8" + lmulSpelling(layout.getLmulEighths()) + "_t";
-  llvm::SmallVector<int64_t, 4> axes =
-      registerAxesFor(operation.getField());
+  llvm::SmallVector<int64_t, 4> axes;
+  for (auto [axis, factor] :
+       llvm::zip(valueType.getAxisIds().asArrayRef(),
+                 layout.getReplicaFactors().asArrayRef()))
+    if (factor > 1)
+      axes.push_back(axis);
   const int64_t sourceStreams = streamPartCount(operation.getField());
   Binding result;
   result.kind = Binding::Kind::Window;
   result.windowFamily = "layered-storage";
   for (int64_t replica = 0; replica < replicas; ++replica) {
-    auto coordinates = registerCoordinates(operation.getField(), replica);
-    if (sourceStreams <= 0 || !coordinates || coordinates->size() != axes.size())
+    llvm::SmallVector<int64_t, 4> allCoordinates(
+        layout.getReplicaFactors().size(), 0);
+    int64_t remaining = replica;
+    for (int64_t position =
+             static_cast<int64_t>(layout.getReplicaFactors().size()) - 1;
+         position >= 0; --position) {
+      const int64_t factor = layout.getReplicaFactors()[position];
+      if (factor <= 0)
+        return fail(operation,
+                    "RVV layered storage load has an invalid replica factor");
+      allCoordinates[static_cast<size_t>(position)] = remaining % factor;
+      remaining /= factor;
+    }
+    llvm::SmallVector<int64_t, 4> coordinates;
+    for (auto [coordinate, factor] :
+         llvm::zip(allCoordinates, layout.getReplicaFactors().asArrayRef()))
+      if (factor > 1)
+        coordinates.push_back(coordinate);
+    if (sourceStreams <= 0 || coordinates.size() != axes.size())
       return fail(operation,
                   "RVV layered storage load has no register-coordinate mapping");
     std::string record = "(" + owner.recordPointer;
-    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+    for (auto [axis, coordinate] : llvm::zip(axes, coordinates)) {
       auto stride = llvm::find_if(owner.recordByteStrides,
                                   [&](const auto &entry) {
                                     return entry.first == axis;
@@ -7971,6 +8376,292 @@ mlir::LogicalResult Emitter::compileRVVFinalizeWidenDot(
       result.parts.push_back(std::move(scalarName));
     else
       result.scalar = std::move(scalarName);
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVPartialSet(riscv::RVVPartialSetOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.partial-set")
+    return fail(operation, "RVV partial set has no exact selected leaf");
+  auto setType = operation.getResult().getType();
+  auto partialType = setType.getPartialType();
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  const llvm::StringRef instruction = operation.getMultiplyInstruction();
+  for (size_t pair = 0; pair < operation.getLhs().size(); ++pair) {
+    mlir::Value lhsValue = operation.getLhs()[pair];
+    mlir::Value rhsValue = operation.getRhs()[pair];
+    auto lhs = materializeNumeric(lhsValue, bindings.lookup(lhsValue));
+    auto rhs = materializeNumeric(rhsValue, bindings.lookup(rhsValue));
+    if (mlir::failed(lhs) || mlir::failed(rhs) ||
+        lhs->kind != Binding::Kind::Vector ||
+        rhs->kind != Binding::Kind::Vector)
+      return fail(operation,
+                  "RVV partial set requires materialized vector operands");
+    const int64_t lhsStreams = streamPartCount(lhsValue);
+    const int64_t rhsStreams = streamPartCount(rhsValue);
+    if (lhsStreams <= 0 || lhsStreams != rhsStreams)
+      return fail(operation,
+                  "RVV partial set operand pair has incompatible streams");
+    auto lhsElement =
+        mlir::cast<riscv::ValueType>(lhsValue.getType()).getElementType();
+    auto rhsElement =
+        mlir::cast<riscv::ValueType>(rhsValue.getType()).getElementType();
+    for (int64_t stream = 0; stream < lhsStreams; ++stream) {
+      const size_t lhsPart = static_cast<size_t>(
+          operation.getLhsReplicas()[pair] * lhsStreams + stream);
+      const size_t rhsPart = static_cast<size_t>(
+          operation.getRhsReplicas()[pair] * rhsStreams + stream);
+      if (lhsPart >= lhs->parts.size() || rhsPart >= rhs->parts.size() ||
+          lhs->parts[lhsPart].empty() || rhs->parts[rhsPart].empty())
+        return fail(operation,
+                    "RVV partial set replica does not project to every stream");
+      std::string left = lhs->parts[lhsPart];
+      std::string right = rhs->parts[rhsPart];
+      std::string mnemonic;
+      if (instruction == "rvv.vwmul.vv") {
+        mnemonic = "vwmul";
+      } else if (instruction == "rvv.vwmul.vv.reinterpret-rhs" ||
+                 instruction == "rvv.vwmul.vv.reinterpret-lhs") {
+        mnemonic = "vwmul";
+        mlir::Value reinterpretValue =
+            instruction == "rvv.vwmul.vv.reinterpret-rhs" ? rhsValue : lhsValue;
+        std::string sourceSuffix = vectorSuffix(reinterpretValue);
+        std::string targetSuffix = sourceSuffix;
+        if (sourceSuffix.empty() || sourceSuffix.front() != 'u')
+          return fail(operation,
+                      "narrow unsigned partial operand has no unsigned RVV spelling");
+        targetSuffix.front() = 'i';
+        std::string &operand =
+            instruction == "rvv.vwmul.vv.reinterpret-rhs" ? right : left;
+        operand = "__riscv_vreinterpret_v_" + sourceSuffix + "_" +
+                  targetSuffix + "(" + operand + ")";
+      } else if (instruction == "rvv.vwmulsu.vv") {
+        mnemonic = "vwmulsu";
+      } else if (instruction == "rvv.vwmulsu.vv.swap") {
+        mnemonic = "vwmulsu";
+        std::swap(left, right);
+      } else {
+        return fail(operation,
+                    "RVV partial set has no exact widening multiply instruction");
+      }
+      std::string product = fresh("partial_slot");
+      line(vectorTypeFor(partialType) + " " + product + " = __riscv_" +
+           mnemonic + "_vv_" + vectorSuffixFor(partialType) + "(" + left +
+           ", " + right + ", " +
+           partVL(lhsValue, lhsPart) + ");");
+      result.parts.push_back(std::move(product));
+    }
+  }
+  if (result.parts.size() != static_cast<size_t>(setType.getSlots()))
+    return fail(operation,
+                "RVV partial set did not materialize every declared slot");
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVPartialReduce(riscv::RVVPartialReduceOp operation) {
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.partial-reduce.widen" &&
+      instruction != "rvv.partial-reduce")
+    return fail(operation, "RVV partial reduction has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  auto inputType = operation.getInput().getType();
+  auto resultType = operation.getResult().getType();
+  auto inputPartial = inputType.getPartialType();
+  if (input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(inputType.getSlots()) ||
+      resultType.getSlots() != inputType.getSlots())
+    return fail(operation,
+                "RVV partial reduction has no complete typed input set");
+  std::string seed = fresh("partial_reduce_seed");
+  line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+  const std::string reduction = instruction == "rvv.partial-reduce.widen"
+                                    ? "vwredsum"
+                                    : "vredsum";
+  const std::string suffix = vectorSuffixFor(inputPartial);
+  const std::string vl = std::to_string(physicalLanesFor(inputPartial));
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  for (llvm::StringRef partial : input.parts) {
+    std::string reduced = fresh("partial_reduced");
+    line("vint32m1_t " + reduced + " = __riscv_" + reduction + "_vs_" +
+         suffix + "_i32m1(" + partial.str() + ", " + seed + ", " + vl +
+         ");");
+    result.parts.push_back(std::move(reduced));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVPartialScaleCombine(
+    riscv::RVVPartialScaleCombineOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "rvv.partial-scale-combine")
+    return fail(operation,
+                "RVV scaled partial combine has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  auto inputType = operation.getInput().getType();
+  auto resultType = operation.getResult().getType();
+  if (input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(inputType.getSlots()) ||
+      operation.getScales().size() != input.parts.size() ||
+      operation.getScaleReplicas().size() != input.parts.size() ||
+      operation.getSlotOrder().size() != input.parts.size() ||
+      resultType.getSlots() <= 0 || inputType.getSlots() % resultType.getSlots())
+    return fail(operation,
+                "RVV scaled partial combine has no complete typed slot set");
+  llvm::SmallVector<std::string> scales;
+  for (auto [scaleValue, replica] : llvm::zip(
+           operation.getScales(), operation.getScaleReplicas())) {
+    Binding scale = bindings.lookup(scaleValue);
+    if (scale.kind == Binding::Kind::Scalar && replica == 0) {
+      scales.push_back(scale.scalar);
+      continue;
+    }
+    if (scale.kind == Binding::Kind::ScalarTuple && replica >= 0 &&
+        static_cast<size_t>(replica) < scale.parts.size()) {
+      scales.push_back(scale.parts[replica]);
+      continue;
+    }
+    if (scale.kind != Binding::Kind::Scalar)
+      return fail(operation,
+                  "RVV scaled partial combine scale replica has no scalar binding");
+    return fail(operation,
+                "RVV scaled partial combine scalar scale selected a nonzero replica");
+  }
+  const int64_t fanout = inputType.getSlots() / resultType.getSlots();
+  const std::string suffix = vectorSuffixFor(inputType.getPartialType());
+  const std::string type = vectorTypeFor(inputType.getPartialType());
+  const std::string vl =
+      std::to_string(physicalLanesFor(inputType.getPartialType()));
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  for (int64_t resultSlot = 0; resultSlot < resultType.getSlots(); ++resultSlot) {
+    const int64_t first = operation.getSlotOrder()[resultSlot * fanout];
+    std::string combined = fresh("scaled_partial");
+    line(type + " " + combined + " = __riscv_vmul_vx_" + suffix + "(" +
+         input.parts[first] + ", " + scales[first] + ", " + vl + ");");
+    for (int64_t term = 1; term < fanout; ++term) {
+      const int64_t slot =
+          operation.getSlotOrder()[resultSlot * fanout + term];
+      std::string next = fresh("scaled_partial_chain");
+      line(type + " " + next + " = __riscv_vmacc_vx_" + suffix + "(" +
+           combined + ", " + scales[slot] + ", " + input.parts[slot] + ", " +
+           vl + ");");
+      combined = std::move(next);
+    }
+    result.parts.push_back(std::move(combined));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVPartialCombine(riscv::RVVPartialCombineOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.partial-combine")
+    return fail(operation, "RVV partial combine has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  auto inputType = operation.getInput().getType();
+  auto resultType = operation.getResult().getType();
+  if (input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(inputType.getSlots()) ||
+      resultType.getSlots() * operation.getArity() != inputType.getSlots())
+    return fail(operation,
+                "RVV partial combine has no complete input slot set");
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  const std::string type = vectorTypeFor(resultType.getPartialType());
+  const std::string suffix = vectorSuffixFor(resultType.getPartialType());
+  const std::string vl = std::to_string(
+      physicalLanesFor(resultType.getPartialType()));
+  for (int64_t slot = 0; slot < resultType.getSlots(); ++slot) {
+    std::string combined = input.parts[slot * operation.getArity()];
+    for (int64_t term = 1; term < operation.getArity(); ++term) {
+      std::string next = fresh("partial_tree");
+      line(type + " " + next + " = __riscv_vadd_vv_" + suffix + "(" +
+           combined + ", " +
+           input.parts[slot * operation.getArity() + term] + ", " + vl +
+           ");");
+      combined = std::move(next);
+    }
+    result.parts.push_back(std::move(combined));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVPartialFinalize(riscv::RVVPartialFinalizeOp operation) {
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.partial-finalize.reduce" &&
+      instruction != "rvv.partial-finalize.extract")
+    return fail(operation, "RVV partial finalize has no exact selected leaf");
+  auto setType = operation.getInput().getType();
+  auto partialType = setType.getPartialType();
+  auto partialElement =
+      mlir::dyn_cast<mlir::IntegerType>(partialType.getElementType());
+  Binding input = bindings.lookup(operation.getInput());
+  if (!partialElement || input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(setType.getSlots()) ||
+      input.parts.empty())
+    return fail(operation,
+                "RVV partial finalize has no complete typed partial set");
+  llvm::SmallVector<std::string> scalars;
+  if (instruction == "rvv.partial-finalize.extract") {
+    const std::string suffix = vectorSuffixFor(partialType);
+    const std::string scalarSuffix =
+        partialElement.getWidth() == 16 ? "i16" : "i32";
+    for (llvm::StringRef part : input.parts) {
+      std::string extracted = fresh("partial_scalar_part");
+      line("int32_t " + extracted + " = (int32_t)__riscv_vmv_x_s_" +
+           suffix + "_" + scalarSuffix + "(" + part.str() + ");");
+      scalars.push_back(std::move(extracted));
+    }
+  } else {
+    std::string seed = fresh("partial_seed");
+    line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+    const std::string reduction =
+        partialElement.getWidth() == 16 ? "vwredsum" : "vredsum";
+    const std::string suffix = vectorSuffixFor(partialType);
+    const std::string vl = std::to_string(physicalLanesFor(partialType));
+    for (llvm::StringRef part : input.parts) {
+      std::string reduced = fresh("partial_reduction");
+      line("vint32m1_t " + reduced + " = __riscv_" + reduction + "_vs_" +
+           suffix + "_i32m1(" + part.str() + ", " + seed + ", " + vl +
+           ");");
+      seed = std::move(reduced);
+    }
+    std::string extracted = fresh("partial_scalar_part");
+    line("int32_t " + extracted + " = __riscv_vmv_x_s_i32m1_i32(" + seed +
+         ");");
+    scalars.push_back(std::move(extracted));
+  }
+  std::string scalarName = fresh("partial_scalar");
+  std::string expression = scalars.front();
+  for (size_t index = 1; index < scalars.size(); ++index)
+    expression = "(" + expression + " + " + scalars[index] + ")";
+  line("int32_t " + scalarName + " = " + expression + ";");
+  bindings[operation.getResult()] = scalar(std::move(scalarName));
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVAssembleReplicas(
+    riscv::RVVAssembleReplicasOp operation) {
+  if (instructionOf(operation.getOperation()) != "scalar.assemble-replicas")
+    return fail(operation,
+                "scalar replica assembly has no exact selected leaf");
+  Binding result;
+  result.kind = Binding::Kind::ScalarTuple;
+  for (mlir::Value value : operation.getValues()) {
+    Binding part = bindings.lookup(value);
+    if (part.kind != Binding::Kind::Scalar)
+      return fail(operation,
+                  "scalar replica assembly operand has no scalar binding");
+    result.parts.push_back(part.scalar);
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();

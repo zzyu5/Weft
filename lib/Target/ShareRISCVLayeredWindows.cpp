@@ -180,6 +180,7 @@ bool isLayerExtract(
 
 bool sameFieldEdge(riscv::FieldOp lhs, riscv::FieldOp rhs) {
   if (!lhs || !rhs || lhs.getOwner() != rhs.getOwner() ||
+      lhs.getName() != rhs.getName() ||
       lhs.getResult().getType() != rhs.getResult().getType() ||
       lhs.getAccess() != rhs.getAccess())
     return false;
@@ -307,6 +308,114 @@ bool isProjectedLayeredExtract(
   return true;
 }
 
+struct CompleteLayeredExtract {
+  riscv::ExtractOp extract;
+  riscv::FieldOp field;
+  riscv::PhysicalPointOp point;
+  riscv::PhysicalPointOp parent;
+  riscv::ValueType resultType;
+  LinearIndex relative;
+  llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
+};
+
+std::optional<CompleteLayeredExtract>
+completeLayeredExtract(riscv::ExtractOp extract) {
+  CompleteLayeredExtract result;
+  mlir::Value source = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), &result.conversions);
+  result.field = source.getDefiningOp<riscv::FieldOp>();
+  result.point =
+      extract.getIndices().size() == 1
+          ? riscv_internal::stripRepresentationConversions(
+                extract.getIndices().front())
+                .getDefiningOp<riscv::PhysicalPointOp>()
+          : riscv::PhysicalPointOp();
+  result.parent = result.point
+                      ? result.point.getParent().getDefiningOp<
+                            riscv::PhysicalPointOp>()
+                      : riscv::PhysicalPointOp();
+  result.resultType =
+      mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  auto fieldType = result.field
+                       ? mlir::dyn_cast<riscv::ValueType>(
+                             result.field.getResult().getType())
+                       : riscv::ValueType();
+  auto element = fieldType
+                     ? mlir::dyn_cast<mlir::IntegerType>(
+                           fieldType.getElementType())
+                     : mlir::IntegerType();
+  if (!result.field || !result.point || !result.parent || !result.resultType ||
+      !fieldType || !element || element.isSigned() ||
+      extract.getAccess().getForm() != "indexed" ||
+      extract.getAccess().getMapping() != "grouped_layered" ||
+      extract.getIndices().size() != 1 ||
+      fieldType.getShape().size() != result.resultType.getShape().size())
+    return std::nullopt;
+
+  int64_t domainSelectors = 0;
+  for (mlir::Attribute selector : extract.getSelectors()) {
+    llvm::StringRef name = mlir::cast<mlir::StringAttr>(selector).getValue();
+    if (name == "domain")
+      ++domainSelectors;
+    else if (name != "all")
+      return std::nullopt;
+  }
+  const int64_t axis =
+      result.point.getResult().getType().getDomain().getAxisId();
+  auto position = llvm::find(result.resultType.getAxisIds().asArrayRef(), axis);
+  if (domainSelectors != 1 ||
+      position == result.resultType.getAxisIds().asArrayRef().end())
+    return std::nullopt;
+  const size_t axisPosition = static_cast<size_t>(
+      position - result.resultType.getAxisIds().asArrayRef().begin());
+  const int64_t group = extract.getAccess().getGroupSize();
+  const int64_t layer = extract.getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  const int64_t lanes =
+      result.resultType.getLayout().getLaneFactors()[axisPosition];
+  auto parentPartition = result.parent.getPartition()
+                             .getDefiningOp<mlir::arith::ConstantIndexOp>();
+  if (group <= 0 || layer <= 0 || group % layer || layers <= 1 || lanes <= 1 ||
+      layer % lanes || element.getWidth() * layers != 8 ||
+      extract.getAccess().getBitOffset() % 8 ||
+      (extract.getAccess().getOrder() != "lo_first" &&
+       extract.getAccess().getOrder() != "hi_first") ||
+      result.resultType.getShape()[axisPosition] != lanes ||
+      result.resultType.getLayout().getTimeFactors()[axisPosition] != 1 ||
+      result.resultType.getLayout().getCarrier() != "rvv" || !parentPartition ||
+      parentPartition.value() % group ||
+      result.parent.getResult().getType().getDomain().getAxisId() != axis ||
+      result.parent.getResult().getType().getDomain().getTail() != "exact")
+    return std::nullopt;
+  for (size_t index = 0; index < result.resultType.getShape().size(); ++index) {
+    if (index == axisPosition)
+      continue;
+    if (fieldType.getShape()[index] != result.resultType.getShape()[index] ||
+        result.resultType.getLayout().getTimeFactors()[index] != 1 ||
+        result.resultType.getLayout().getLaneFactors()[index] != 1)
+      return std::nullopt;
+  }
+
+  decomposeIndex(result.point.getBase(), 1, result.relative);
+  decomposeIndex(result.parent.getBase(), -1, result.relative);
+  if (!result.relative.valid || result.relative.constant < 0)
+    return std::nullopt;
+  result.extract = extract;
+  return result;
+}
+
+bool sameCompleteLayeredGroup(CompleteLayeredExtract &lhs,
+                              CompleteLayeredExtract &rhs) {
+  return lhs.extract->getBlock() == rhs.extract->getBlock() &&
+         sameFieldEdge(lhs.field, rhs.field) && lhs.parent == rhs.parent &&
+         lhs.point.getActive() == rhs.point.getActive() &&
+         lhs.point.getPartition() == rhs.point.getPartition() &&
+         lhs.point.getResult().getType() == rhs.point.getResult().getType() &&
+         lhs.resultType == rhs.resultType &&
+         lhs.extract.getAccess() == rhs.extract.getAccess() &&
+         sameTerms(lhs.relative, rhs.relative);
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -393,6 +502,168 @@ public:
     getOperation().walk(
         [&](riscv::ExtractOp extract) { extracts.push_back(extract); });
     llvm::DenseSet<mlir::Operation *> consumed;
+
+    // A complete grouped/layered logical group is represented by one raw byte
+    // window per lane-width position and one typed decode per storage layer.
+    // The relation is derived from Field storage geometry and the child point's
+    // affine coordinate relative to its typed parent point.  Equivalent
+    // consumers therefore share the same physical load without relying on
+    // source operation adjacency or a kernel-specific closure.
+    for (riscv::ExtractOp first : extracts) {
+      if (consumed.contains(first))
+        continue;
+      auto firstInfo = completeLayeredExtract(first);
+      if (!firstInfo)
+        continue;
+      const int64_t group = first.getAccess().getGroupSize();
+      const int64_t layer = first.getAccess().getLayerSize();
+      auto axisIt = llvm::find(
+          firstInfo->resultType.getAxisIds().asArrayRef(),
+          firstInfo->point.getResult().getType().getDomain().getAxisId());
+      if (axisIt == firstInfo->resultType.getAxisIds().asArrayRef().end())
+        continue;
+      const size_t axisPosition = static_cast<size_t>(
+          axisIt - firstInfo->resultType.getAxisIds().asArrayRef().begin());
+      const int64_t lanes =
+          firstInfo->resultType.getLayout().getLaneFactors()[axisPosition];
+      const int64_t layers = group / layer;
+      const int64_t windowsPerLayer = layer / lanes;
+      const int64_t slots = layers * windowsPerLayer;
+      const int64_t groupBase =
+          (firstInfo->relative.constant / group) * group;
+
+      llvm::SmallVector<llvm::SmallVector<CompleteLayeredExtract, 1>, 8>
+          bySlot(static_cast<size_t>(slots));
+      for (riscv::ExtractOp candidate : extracts) {
+        if (consumed.contains(candidate))
+          continue;
+        auto info = completeLayeredExtract(candidate);
+        if (!info || !sameCompleteLayeredGroup(*firstInfo, *info))
+          continue;
+        const int64_t delta = info->relative.constant - groupBase;
+        if (delta < 0 || delta >= group || delta % lanes)
+          continue;
+        bySlot[static_cast<size_t>(delta / lanes)].push_back(std::move(*info));
+      }
+      if (llvm::any_of(bySlot, [](const auto &slot) { return slot.empty(); }))
+        continue;
+
+      mlir::Operation *insertion = bySlot.front().front().extract;
+      bool foldable = true;
+      for (auto &slot : bySlot) {
+        for (CompleteLayeredExtract &info : slot) {
+          if (info.extract->isBeforeInBlock(insertion))
+            insertion = info.extract;
+          foldable &= canFoldReadConversions(
+              bySlot.front().front().extract, info.extract,
+              bySlot.front().front().conversions, info.conversions);
+        }
+      }
+      if (!foldable)
+        continue;
+
+      CompleteLayeredExtract &leader = bySlot.front().front();
+      rewriter.setInsertionPoint(insertion);
+      auto groupValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+          first.getLoc(), group);
+      auto relativeBase = rewriter.create<mlir::arith::SubIOp>(
+          first.getLoc(), leader.point.getBase(), leader.parent.getBase());
+      auto groupIndex = rewriter.create<mlir::arith::DivUIOp>(
+          first.getLoc(), relativeBase, groupValue);
+      mlir::Value windowGroup = groupIndex;
+      if (windowsPerLayer != 1) {
+        auto windowsValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+            first.getLoc(), windowsPerLayer);
+        windowGroup = rewriter.create<mlir::arith::MulIOp>(
+            first.getLoc(), groupIndex, windowsValue);
+      }
+
+      auto fieldType = mlir::cast<riscv::ValueType>(
+          leader.field.getResult().getType());
+      auto fieldAxis = llvm::find(fieldType.getAxisIds().asArrayRef(),
+                                  leader.point.getResult()
+                                      .getType()
+                                      .getDomain()
+                                      .getAxisId());
+      if (fieldAxis == fieldType.getAxisIds().asArrayRef().end())
+        continue;
+      const int64_t projectionExtent =
+          fieldType.getShape()[static_cast<size_t>(
+              fieldAxis - fieldType.getAxisIds().asArrayRef().begin())];
+      const int64_t rawGroups =
+          firstInfo->resultType.getLayout().getRegisterGroups();
+      auto storageType = riscv::LayeredWindowType::get(
+          rewriter.getContext(), fieldType, leader.resultType,
+          leader.point.getResult().getType().getDomain().getAxisId(), layers,
+          windowsPerLayer, rawGroups);
+      llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> decoded(
+          static_cast<size_t>(windowsPerLayer));
+      for (int64_t window = 0; window < windowsPerLayer; ++window) {
+        mlir::Value windowIndex = windowGroup;
+        if (window) {
+          auto offset = rewriter.create<mlir::arith::ConstantIndexOp>(
+              first.getLoc(), window);
+          windowIndex = rewriter.create<mlir::arith::AddIOp>(
+              first.getLoc(), windowGroup, offset);
+        }
+        auto storage = rewriter.create<riscv::RVVLayeredStorageLoadOp>(
+            first.getLoc(), storageType, leader.field.getResult(),
+            leader.parent.getResult(), windowIndex,
+            leader.point.getResult().getType().getDomain().getAxisId(), 0,
+            projectionExtent, first.getAccess(),
+            riscv_internal::leaf(
+                rewriter, "rvv", "layered-storage-load",
+                "rvv.layered-storage-load", "rvv.layered-storage-load",
+                fieldType.getLayout().getRegisterGroups(), rawGroups, rawGroups,
+                0, "none",
+                leader.resultType.getLayout().getValidity() == "tail"
+                    ? "agnostic"
+                    : "exact"));
+        riscv_internal::copyOrigin(first, storage);
+        for (int64_t storageLayer = 0; storageLayer < layers; ++storageLayer) {
+          auto value = rewriter.create<riscv::RVVLayeredStorageDecodeOp>(
+              first.getLoc(), leader.resultType, storage.getResult(),
+              storageLayer,
+              riscv_internal::leaf(
+                  rewriter, "rvv", "layered-storage-decode",
+                  "rvv.layered-storage-decode", "rvv.layered-storage-decode",
+                  rawGroups,
+                  leader.resultType.getLayout().getRegisterGroups(), 1, 0,
+                  "none",
+                  leader.resultType.getLayout().getValidity() == "tail"
+                      ? "agnostic"
+                      : "exact"));
+          riscv_internal::copyOrigin(first, value);
+          decoded[static_cast<size_t>(window)].push_back(value.getResult());
+        }
+      }
+
+      for (int64_t storageLayer = 0; storageLayer < layers; ++storageLayer) {
+        for (int64_t window = 0; window < windowsPerLayer; ++window) {
+          const int64_t slot =
+              (storageLayer * layer + window * lanes) / lanes;
+          for (CompleteLayeredExtract &info :
+               bySlot[static_cast<size_t>(slot)]) {
+            info.extract.getResult().replaceAllUsesWith(
+                decoded[static_cast<size_t>(window)]
+                       [static_cast<size_t>(storageLayer)]);
+            consumed.insert(info.extract);
+          }
+        }
+      }
+      for (auto &slot : bySlot) {
+        for (CompleteLayeredExtract &info : slot) {
+          rewriter.eraseOp(info.extract);
+          for (riscv::ConvertLayoutOp conversion :
+               llvm::reverse(info.conversions))
+            if (conversion.getResult().use_empty())
+              rewriter.eraseOp(conversion);
+          if (info.field != leader.field &&
+              info.field.getResult().use_empty())
+            rewriter.eraseOp(info.field);
+        }
+      }
+    }
 
     for (riscv::ExtractOp first : extracts) {
       if (consumed.contains(first))

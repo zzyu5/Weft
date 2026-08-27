@@ -7,6 +7,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <memory>
 #include <limits>
@@ -34,7 +35,8 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::ConvertLayoutOp,
       riscv::LocalAllocOp, riscv::LocalCapacityGuardOp,
       riscv::LocalBindOp, riscv::LocalLoadOp,
-      riscv::LocalStoreOp, riscv::SpillOp, riscv::ReloadOp,
+      riscv::LocalStoreOp, riscv::RVVLocalMaterializeOp,
+      riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RegisterMaterializeOp, riscv::RVVBitplaneMergeOp,
       riscv::RVVBitmaskDecodeOp,
@@ -42,9 +44,14 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
       riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
+      riscv::RVVWidenMultiplyOp, riscv::RVVRegularRepeatIndexOp,
+      riscv::RVVRegularRepeatGatherOp,
       riscv::RVVStorageWindowOp, riscv::RVVLayeredStorageLoadOp,
       riscv::RVVLayeredStorageDecodeOp, riscv::RVVWidenAccumulateOp,
       riscv::RVVFinalizeWidenDotOp,
+      riscv::RVVPartialSetOp, riscv::RVVPartialReduceOp,
+      riscv::RVVPartialScaleCombineOp, riscv::RVVPartialCombineOp,
+      riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
       riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
@@ -63,15 +70,21 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::CastOp, riscv::NarrowOp, riscv::WidenOp, riscv::ReduceOp,
       riscv::Fold2Op, riscv::LookupOp, riscv::ConvertLayoutOp,
       riscv::LocalCapacityGuardOp, riscv::LocalLoadOp, riscv::LocalStoreOp,
-      riscv::SpillOp, riscv::ReloadOp, riscv::IMEPackOp,
+      riscv::RVVLocalMaterializeOp, riscv::SpillOp, riscv::ReloadOp,
+      riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RVVBitplaneMergeOp, riscv::RVVBitmaskDecodeOp,
       riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
-      riscv::RVVWidenDotOp, riscv::RVVStorageWindowOp,
+      riscv::RVVWidenDotOp, riscv::RVVWidenMultiplyOp,
+      riscv::RVVRegularRepeatIndexOp, riscv::RVVRegularRepeatGatherOp,
+      riscv::RVVStorageWindowOp,
       riscv::RVVLayeredStorageLoadOp, riscv::RVVLayeredStorageDecodeOp,
       riscv::RVVWidenAccumulateOp, riscv::RVVFinalizeWidenDotOp,
+      riscv::RVVPartialSetOp, riscv::RVVPartialReduceOp,
+      riscv::RVVPartialScaleCombineOp, riscv::RVVPartialCombineOp,
+      riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
       riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
@@ -89,6 +102,8 @@ int64_t resourceGroups(mlir::Type type) {
     return window.getResourceGroups();
   if (auto window = mlir::dyn_cast<riscv::LayeredWindowType>(type))
     return window.getResourceGroups();
+  if (auto partials = mlir::dyn_cast<riscv::PartialSetType>(type))
+    return partials.getResourceGroups();
   if (auto layout = riscv_internal::layoutOf(type))
     return layout.getRegisterGroups();
   return 0;
@@ -189,6 +204,11 @@ bool requiresIntegerWidening(mlir::Operation *operation) {
                 riscv::RVVGroupedMacStepOp,
                 riscv::RVVEncodedDotStepOp,
                 riscv::RVVWidenDotOp,
+                riscv::RVVPartialSetOp,
+                riscv::RVVPartialReduceOp,
+                riscv::RVVPartialScaleCombineOp,
+                riscv::RVVPartialCombineOp,
+                riscv::RVVPartialFinalizeOp,
                 riscv::RVVWidenAccumulateOp,
                 riscv::RVVFinalizeWidenDotOp,
                 riscv::RVVWidenReduceOp,
@@ -477,25 +497,41 @@ public:
               failed = true;
             }
           }
-          int64_t actualState = 0;
-          int64_t actualStaged = 0;
+          llvm::DenseSet<int64_t> stateBirths;
+          llvm::DenseSet<int64_t> stagedBirths;
           for (mlir::Operation &nested : loop.getBody()->without_terminator()) {
             if (auto state = mlir::dyn_cast<riscv::NewOp>(nested);
                 state && state.getOwnerDomainId() == level.getDomainId())
-              ++actualState;
+              stateBirths.insert(state.getBirthId());
             if (auto state = mlir::dyn_cast<riscv::LocalBindOp>(nested);
                 state && state.getStorage().getType().getPurpose() == "handoff" &&
                 state.getStorage().getType().getOwnerDomainId() ==
                     level.getDomainId())
-              ++actualState;
+              stateBirths.insert(state.getStorage().getType().getBirthId());
             if (auto staged =
                     mlir::dyn_cast<riscv::RegisterMaterializeOp>(nested);
                 staged && staged.getOwnerDomainId() == level.getDomainId())
-              ++actualStaged;
+              stagedBirths.insert(staged.getBirthId());
             if (auto staged = mlir::dyn_cast<riscv::StagedViewOp>(nested);
                 staged && staged.getOwnerDomainId() == level.getDomainId())
-              ++actualStaged;
+              stagedBirths.insert(staged.getBirthId());
+            if (auto staged =
+                    mlir::dyn_cast<riscv::RVVLocalMaterializeOp>(nested);
+                staged &&
+                staged.getDestination()
+                        .getDefiningOp<riscv::LocalBindOp>()
+                        .getStorage()
+                        .getType()
+                        .getOwnerDomainId() == level.getDomainId())
+              stagedBirths.insert(
+                  staged.getDestination()
+                      .getDefiningOp<riscv::LocalBindOp>()
+                      .getStorage()
+                      .getType()
+                      .getBirthId());
           }
+          const int64_t actualState = stateBirths.size();
+          const int64_t actualStaged = stagedBirths.size();
           if (level.getStateBirthCount() != actualState ||
               level.getStagedBirthCount() != actualStaged ||
               level.getHandoffCount() !=

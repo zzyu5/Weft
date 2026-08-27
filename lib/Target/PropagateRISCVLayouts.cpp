@@ -233,10 +233,23 @@ Roles rolesFor(mlir::Value value) {
     return roles;
   }
 
-  if (auto materialize = value.getDefiningOp<riscv::MaterializeOp>();
-      materialize && materialize.getPlacement() == "local") {
-    roles.local = true;
-    return roles;
+  if (auto materialize = value.getDefiningOp<riscv::MaterializeOp>()) {
+    bool groupedProjection = !value.use_empty();
+    for (mlir::Operation *user : value.getUsers()) {
+      auto extract = mlir::dyn_cast<riscv::ExtractOp>(user);
+      bool hasGroupIndex = false;
+      if (extract && extract.getInput() == value)
+        hasGroupIndex = llvm::any_of(
+            extract.getSelectors(), [](mlir::Attribute selector) {
+              return mlir::cast<mlir::StringAttr>(selector).getValue() ==
+                     "group_index";
+            });
+      groupedProjection &= static_cast<bool>(extract) && hasGroupIndex;
+    }
+    if (materialize.getPlacement() == "local" || groupedProjection) {
+      roles.local = true;
+      return roles;
+    }
   }
   if (value.getDefiningOp<riscv::ReduceOp>()) {
     // A reduction result preserves every free logical axis.  Small free axes
@@ -831,7 +844,18 @@ public:
         // axes therefore propagate in both directions; consumed axes are
         // filtered by mergeRoles rather than rediscovered from source shape.
         changed |= mergeRoles(roles[input], result, roles[result]);
-        changed |= mergeRoles(roles[result], input, roles[input]);
+        Roles projectedResult = roles[result];
+        if (projectedResult.registerTuple) {
+          auto inputAxes = riscv_internal::logicalAxes(input.getType());
+          auto resultAxes = riscv_internal::logicalAxes(result.getType());
+          if (llvm::any_of(inputAxes, [&](int64_t axis) {
+                return !llvm::is_contained(resultAxes, axis);
+              })) {
+            projectedResult.registerTuple = false;
+            projectedResult.anchored = false;
+          }
+        }
+        changed |= mergeRoles(projectedResult, input, roles[input]);
       });
       }
     };
@@ -1009,6 +1033,13 @@ public:
     getOperation().walk([&](riscv::MaterializeOp materialize) {
       if (materialize.getPlacement() != "shared")
         return;
+      if (auto value =
+              mlir::dyn_cast<riscv::ValueType>(materialize.getResult().getType());
+          value && value.getLayout().getCarrier() == "local" &&
+          !mlir::isa<kernel::EncodingType>(value.getElementType())) {
+        materialize.setPlacementAttr(builder.getStringAttr("local"));
+        return;
+      }
       auto kernel = materialize->getParentOfType<riscv::KernelOp>();
       if (kernel && requiresAddressableReload(materialize, kernel.getTarget()))
         materialize.setPlacementAttr(builder.getStringAttr("reload"));
@@ -1150,7 +1181,8 @@ private:
       // different lane/register decompositions and are reconciled by their
       // typed RVV step or IME pack operations during composite lowering.
       if (auto materialize = mlir::dyn_cast<riscv::MaterializeOp>(operation);
-          materialize && materialize.getPlacement() == "reload")
+          materialize && (materialize.getPlacement() == "reload" ||
+                          materialize.getPlacement() == "local"))
         return;
       if (pointwiseLike(operation) || mlir::isa<riscv::LookupOp>(operation))
         operations.push_back(operation);

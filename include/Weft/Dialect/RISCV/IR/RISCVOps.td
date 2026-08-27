@@ -357,6 +357,22 @@ def WeftRISCV_LayeredWindowType
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_PartialSetType
+    : WeftRISCV_Type<"PartialSet", "partial_set"> {
+  let parameters = (ins
+    "::weft::riscv::ValueType":$partialType,
+    "int64_t":$reductionAxis,
+    "int64_t":$slots,
+    "int64_t":$termsPerSlot,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $partialType `,` $reductionAxis `,` $slots `,` $termsPerSlot `,`
+        $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_DomainType : WeftRISCV_Type<"Domain", "domain"> {
   let parameters = (ins
     StringRefParameter<"axis name">:$axisName,
@@ -734,6 +750,14 @@ def WeftRISCV_LocalStoreOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVLocalMaterializeOp
+    : WeftRISCV_Op<"rvv_local_materialize", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       WeftRISCV_ValueType:$destination,
+                       WeftRISCV_LeafAttr:$leaf);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_SpillOp
     : WeftRISCV_Op<"spill", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$input, WeftRISCV_LocalType:$slot,
@@ -871,8 +895,43 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        WeftRISCV_ValueType:$rhs,
                        DenseI64ArrayAttr:$over,
                        StrAttr:$stream_reduction,
+                       I64Attr:$partial_unroll,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVWidenMultiplyOp
+    : WeftRISCV_Op<"rvv_widen_multiply", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$lhs,
+                       WeftRISCV_ValueType:$rhs,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRegularRepeatIndexOp
+    : WeftRISCV_Op<"rvv_regular_repeat_index", [Pure]> {
+  let arguments = (ins I64Attr:$reduction_axis,
+                       I64Attr:$repeat,
+                       ArrayAttr:$part_bases,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs Variadic<WeftRISCV_ValueType>:$results);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRegularRepeatGatherOp
+    : WeftRISCV_Op<"rvv_regular_repeat_gather", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       Variadic<WeftRISCV_ValueType>:$indices,
+                       I64Attr:$reduction_axis,
+                       I64Attr:$source_base,
+                       I64Attr:$source_count,
+                       I64Attr:$repeat,
+                       ArrayAttr:$part_bases,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs Variadic<WeftRISCV_ValueType>:$results);
   let hasVerifier = 1;
 }
 
@@ -933,6 +992,64 @@ def WeftRISCV_RVVFinalizeWidenDotOp
                        I64Attr:$reduction_axis,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialSetOp
+    : WeftRISCV_Op<"rvv_partial_set", [Pure, AttrSizedOperandSegments]> {
+  let arguments = (ins Variadic<WeftRISCV_ValueType>:$lhs,
+                       Variadic<WeftRISCV_ValueType>:$rhs,
+                       DenseI64ArrayAttr:$lhs_replicas,
+                       DenseI64ArrayAttr:$rhs_replicas,
+                       I64Attr:$reduction_axis,
+                       StrAttr:$multiply_instruction,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialReduceOp
+    : WeftRISCV_Op<"rvv_partial_reduce", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialScaleCombineOp
+    : WeftRISCV_Op<"rvv_partial_scale_combine", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       Variadic<WeftRISCV_ValueType>:$scales,
+                       DenseI64ArrayAttr:$scale_replicas,
+                       DenseI64ArrayAttr:$slot_order,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialCombineOp
+    : WeftRISCV_Op<"rvv_partial_combine", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       I64Attr:$arity,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialFinalizeOp
+    : WeftRISCV_Op<"rvv_partial_finalize", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       I64Attr:$reduction_axis,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs AnyInteger:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVAssembleReplicasOp
+    : WeftRISCV_Op<"rvv_assemble_replicas", [Pure]> {
+  let arguments = (ins Variadic<AnyInteger>:$values,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 

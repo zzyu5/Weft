@@ -456,6 +456,9 @@ def mul_mat_q2_k_group_reduced(
                     with L.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
+                        low_scales = materialize(
+                            u8(wp[nb, kb].scales) & u8(15)
+                        )
                         integer = new(i32, [MR, NR], init=i32(0))
                         with L.subs(kb, extent=16) as sub:
                             partial = outer_contract(
@@ -464,7 +467,7 @@ def mul_mat_q2_k_group_reduced(
                                 over="k",
                                 acc=i32,
                             )
-                            scale = i32(u8(w.scales[:, sub]) & u8(15))
+                            scale = i32(low_scales[:, sub])
                             integer += partial * scale
                         mins = widen(u8(w.scales) >> u8(4), i16)
                         correction = outer_contract(

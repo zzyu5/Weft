@@ -81,6 +81,7 @@ class Q8_0:
 @weft.encoding
 class Q2_K:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     scales: u8[16]
     q: u2[256] @ grouped(128) @ layered(32, lo_first)
