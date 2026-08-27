@@ -302,7 +302,13 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_q4_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
-#if defined(WEFT_Q4_DERIVED)
+#if defined(WEFT_Q4K_DECODE)
+extern "C" void production_mul_mat_q4_k_decode(
+    const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t,
+    std::size_t, std::size_t);
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_q4_k_decode(w, x, xq, y, kN, kK, runtimeM)
+#elif defined(WEFT_Q4_DERIVED)
 extern "C" std::size_t production_mul_mat_q4_k_persistent_W_packed_size(
     std::size_t, std::size_t);
 extern "C" void production_mul_mat_q4_k_persistent_W_pack(
@@ -397,7 +403,14 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xxs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
-#if defined(WEFT_IQ2_XXS_STAGED)
+#if defined(WEFT_IQ2_XXS_DECODE)
+extern "C" void production_mul_mat_iq2_xxs_decode(
+    const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *,
+    const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y)                                            \
+  production_mul_mat_iq2_xxs_decode(w, x, xq, iq2xxs.data(), signs.data(), y, \
+                                    kN, kK, runtimeM)
+#elif defined(WEFT_IQ2_XXS_STAGED)
 extern "C" void production_mul_mat_iq2_xxs_staged(
     const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *,
     const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
@@ -451,8 +464,13 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq4_xs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_IQ4_XS_DECODE)
+extern "C" void production_mul_mat_iq4_xs_decode(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq4_xs_decode(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq4_xs(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq4_xs(w, x, xq, iq4.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 21
 using selected_weight = block_tq1_0;
 using selected_activation = block_q8_K;
@@ -486,8 +504,13 @@ constexpr int kElements = 32;
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_mxfp4_q8_0_generic
 #define selected_quantize quantize_row_q8_0_ref
+#if defined(WEFT_MXFP4_DECODE)
+extern "C" void production_mul_mat_mxfp4_decode(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_mxfp4_decode(w, x, xq, fp4.data(), e8m0.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_mxfp4(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_mxfp4(w, x, xq, fp4.data(), e8m0.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 24
 using selected_weight = block_nvfp4;
 using selected_activation = block_q8_0;
@@ -496,8 +519,13 @@ constexpr int kElements = 64;
 #define selected_xqk 32
 #define selected_reference ggml_vec_dot_nvfp4_q8_0
 #define selected_quantize quantize_row_q8_0_ref
+#if defined(WEFT_NVFP4_DECODE)
+extern "C" void production_mul_mat_nvfp4_decode(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_nvfp4_decode(w, x, xq, fp4.data(), ue4m3.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_nvfp4(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_nvfp4(w, x, xq, fp4.data(), ue4m3.data(), y, kN, kK, runtimeM)
+#endif
 #else
 #error "unknown WEFT_MUL_MAT_FORMAT"
 #endif

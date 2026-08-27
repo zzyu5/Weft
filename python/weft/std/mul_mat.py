@@ -15,6 +15,7 @@ from weft.language import (
     i16,
     i32,
     iota,
+    index,
     lookup,
     mac_groups,
     materialize,
@@ -56,6 +57,7 @@ from .encodings import (
     TQ2_0,
 )
 from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
+from .quant_fragments import exponent_scale
 from .vec_dot import (
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
@@ -379,18 +381,48 @@ def mul_mat_q2_k(
                     with L.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
-                        with L.subs(kb, extent=16) as sub:
-                            metadata = u32(w.scales[:, sub])
-                            scale = i32(metadata & u32(15))
-                            minimum = i32(metadata >> u32(4))
-                            integer = outer_contract(
-                                x.q[:, sub], w.q[:, sub], over="k", acc=i32
+                        coordinates = iota(128, dtype=u32, axis="k")
+                        first_scale = widen(
+                            u8(w.scales[:, coordinates / u32(16)]) & u8(15),
+                            i16,
+                        )
+                        first_weight = (
+                            widen(w.q[:, coordinates], i16) * first_scale
+                        )
+                        first = outer_contract(
+                            widen(x.q[:, coordinates], i16),
+                            first_weight,
+                            over="k",
+                            acc=i32,
+                        )
+
+                        second_coordinates = coordinates + u32(128)
+                        second_scale = widen(
+                            u8(
+                                w.scales[:, coordinates / u32(16) + u32(8)]
                             )
-                            correction = x.bsum[:, sub] * minimum
-                            acc += f32(x.ds) * (
-                                f32(w.d) * widen(scale * integer, f32)
-                                - f32(w.dmin) * widen(correction, f32)
-                            )
+                            & u8(15),
+                            i16,
+                        )
+                        second_weight = (
+                            widen(w.q[:, second_coordinates], i16) * second_scale
+                        )
+                        second = outer_contract(
+                            widen(x.q[:, second_coordinates], i16),
+                            second_weight,
+                            over="k",
+                            acc=i32,
+                        )
+
+                        mins = widen(u8(w.scales) >> u8(4), i16)
+                        correction = outer_contract(
+                            x.bsum, mins, over="k", acc=i32
+                        )
+                        integer = first + second
+                        acc += f32(x.ds) * (
+                            f32(w.d) * widen(integer, f32)
+                            - f32(w.dmin) * widen(correction, f32)
+                        )
                     commit(acc, Y[mb, nb])
 
 
@@ -419,6 +451,15 @@ def mul_mat_q3_k(
 
 
 def mul_mat_q4_k(
+    W: View[Q4_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_q4_k_staged(W, X, Xq, Y)
+
+
+def mul_mat_q4_k_decode(
     W: View[Q4_K, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -618,6 +659,21 @@ def mul_mat_iq2_xxs(
             commit(value, Y[row, column])
 
 
+def mul_mat_iq2_xxs_decode(
+    W: View[IQ2_XXS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (2048,)],
+    signs: View[i8, (1024,)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            value = vec_dot_iq2_xxs_q8_k(W[column], Xq[row], grid, signs)
+            commit(value, Y[row, column])
+
+
 def mul_mat_iq2_xxs_staged(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
@@ -756,6 +812,52 @@ def mul_mat_iq4_xs(
     codebook: View[i8, (16,)],
     Y: View[f32, (M, N)],
 ):
+    table = materialize(admit(codebook))
+    quantize_q8_K(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        sub_index = index(0)
+                        with L.subs(kb, extent=32) as sub:
+                            low = u32(
+                                w.scales_l[:, sub_index // index(2)]
+                            )
+                            shift = (sub_index % index(2)) * index(4)
+                            scale_low = (low >> u32(shift)) & u32(15)
+                            scale_high = (
+                                u32(w.scales_h) >> u32(sub_index * index(2))
+                            ) & u32(3)
+                            scale = i32(
+                                scale_low | (scale_high << u32(4))
+                            ) - i32(32)
+                            q = lookup(table, u8(w.q[:, sub]), bounds="in_bounds")
+                            integer = outer_contract(
+                                x.q[:, sub], q, over="k", acc=i32
+                            )
+                            acc += (
+                                f32(w.d)
+                                * f32(x.ds)
+                                * widen(scale, f32)
+                                * widen(integer, f32)
+                            )
+                            sub_index += index(1)
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_iq4_xs_decode(
+    W: View[IQ4_XS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    codebook: View[i8, (16,)],
+    Y: View[f32, (M, N)],
+):
     quantize_q8_K(X, Xq)
     for row in range(M):
         for column in range(N):
@@ -821,6 +923,37 @@ def mul_mat_mxfp4(
     scale: View[f32, (256,)],
     Y: View[f32, (M, N)],
 ):
+    table = materialize(admit(codebook))
+    quantize_q8_0(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=32) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        q = lookup(table, u8(w.q), bounds="in_bounds")
+                        integer = outer_contract(x.q, q, over="k", acc=i32)
+                        block_scale = exponent_scale(scale, w.e)
+                        acc += (
+                            f32(x.d)
+                            * block_scale
+                            * widen(integer, f32)
+                        )
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_mxfp4_decode(
+    W: View[MXFP4, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    codebook: View[i8, (16,)],
+    scale: View[f32, (256,)],
+    Y: View[f32, (M, N)],
+):
     quantize_q8_0(X, Xq)
     for row in range(M):
         for column in range(N):
@@ -829,6 +962,45 @@ def mul_mat_mxfp4(
 
 
 def mul_mat_nvfp4(
+    W: View[NVFP4, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_0, (M, K)],
+    codebook: View[i8, (16,)],
+    scale: View[f32, (256,)],
+    Y: View[f32, (M, N)],
+):
+    table = materialize(admit(codebook))
+    quantize_q8_0(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=64) as wb:
+                        w = wp[nb, wb]
+                        with L.subs(wb, extent=32) as xb:
+                            x = xp[mb, xb]
+                            with L.subs(xb, extent=16) as sub:
+                                q = lookup(
+                                    table, u8(w.q[:, sub]), bounds="in_bounds"
+                                )
+                                integer = outer_contract(
+                                    x.q[:, sub], q, over="k", acc=i32
+                                )
+                                block_scale = exponent_scale(
+                                    scale, w.d[:, sub]
+                                )
+                                acc += (
+                                    f32(x.d)
+                                    * block_scale
+                                    * widen(integer, f32)
+                                )
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_nvfp4_decode(
     W: View[NVFP4, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_0, (M, K)],

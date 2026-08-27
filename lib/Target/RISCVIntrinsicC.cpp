@@ -151,6 +151,9 @@ struct FieldInfo {
   mlir::Type elementType;
   llvm::SmallVector<int64_t> shape;
   int64_t logicalRank = 0;
+  int64_t regularBase = 0;
+  int64_t regularStride = 0;
+  int64_t regularRepeat = 0;
 };
 
 struct Binding {
@@ -3239,6 +3242,18 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
           mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
       if (selector == "all")
         continue;
+      if (selector == "regular") {
+        auto pattern = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+            "index_pattern");
+        if (!pattern || pattern.size() != 3 || binding.field.regularRepeat)
+          return fail(operation,
+                      "regular encoded extract has no unique index pattern");
+        binding.field.regularBase = pattern[0];
+        binding.field.regularStride = pattern[1];
+        binding.field.regularRepeat = pattern[2];
+        binding.field.selector = "regular";
+        continue;
+      }
       if (cursor >= operation.getIndices().size())
         return fail(operation, "extract selector has no corresponding index");
       mlir::Value index = operation.getIndices()[cursor++];
@@ -4560,11 +4575,21 @@ mlir::LogicalResult Emitter::compileLookup(riscv::LookupOp operation) {
   const std::string base = "((const " + *tableCType + " *)(" + *address + "))";
 
   if (realization == "scalar.lookup") {
-    if (indices.kind != Binding::Kind::Scalar)
+    if (indices.kind == Binding::Kind::Scalar) {
+      bindings[operation.getResult()] =
+          scalar(base + "[(size_t)(" + indices.scalar + ")]");
+      return mlir::success();
+    }
+    const int64_t resultParts = registerPartCount(operation.getResult());
+    if (indices.kind != Binding::Kind::ScalarTuple || resultParts <= 1 ||
+        static_cast<int64_t>(indices.parts.size()) != resultParts)
       return fail(operation,
-                  "scalar lookup requires a scalar unsigned index");
-    bindings[operation.getResult()] =
-        scalar(base + "[(size_t)(" + indices.scalar + ")]");
+                  "scalar lookup requires scalar or replica-tuple unsigned indices");
+    Binding result;
+    result.kind = Binding::Kind::ScalarTuple;
+    for (llvm::StringRef part : indices.parts)
+      result.parts.push_back(base + "[(size_t)(" + part.str() + ")]");
+    bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
   if (realization != "rvv.vluxei")
@@ -4902,7 +4927,11 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     return {};
   std::string logicalIndex = requestedIndex.str();
   int64_t logicalPartition = 0;
-  if (fieldBinding.field.index) {
+  if (fieldBinding.field.regularRepeat > 0) {
+    logicalIndex = std::to_string(fieldBinding.field.regularBase);
+    if (fieldBinding.field.regularRepeat == 1)
+      logicalPartition = physicalLanes(result);
+  } else if (fieldBinding.field.index) {
     const Binding &index = bindings.lookup(*fieldBinding.field.index);
     if (index.kind == Binding::Kind::Vector) {
       llvm::StringRef form = fieldBinding.field.useAccess
@@ -5125,6 +5154,70 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
       }
       return "((" + logicalIndex + ") + " + std::to_string(linear) + ")";
     };
+    if (vectorResult && fieldBinding.field.regularRepeat > 1 &&
+        selectedForm == "indexed" &&
+        field->access.getMapping() == "natural") {
+      auto elementType = scalarCType(field->type);
+      const int64_t repeat = fieldBinding.field.regularRepeat;
+      const int64_t stride = fieldBinding.field.regularStride;
+      const int64_t lanes = physicalLanes(result);
+      if (!elementType || field->bitOffset % 8 ||
+          (logicalWidth != 8 && logicalWidth != 16 && logicalWidth != 32) ||
+          repeat <= 1 || stride <= 0 || lanes <= 0 ||
+          (repeat % lanes && lanes % repeat))
+        return {};
+      Binding repeated;
+      repeated.kind = Binding::Kind::Vector;
+      const std::string suffix = vectorSuffix(result);
+      const std::string type = vectorType(result);
+      const int64_t streams = streamPartCount(result);
+      llvm::SmallVector<int64_t, 4> axes = registerAxesFor(result);
+      for (int64_t part = 0; part < vectorPartCount(result); ++part) {
+        auto coordinates = registerCoordinates(result, part / streams);
+        int64_t offset = 0;
+        if (streams <= 0 || !coordinates || coordinates->size() != axes.size() ||
+            llvm::StringRef(partOffset(result, part)).getAsInteger(10, offset) ||
+            offset % lanes ||
+            (repeat >= lanes ? offset % repeat + lanes > repeat
+                             : offset % repeat))
+          return {};
+        std::string record = "(" + owner.recordPointer;
+        for (auto [axis, coordinate] : llvm::zip(axes, *coordinates))
+          for (const auto &[recordAxis, byteStride] : owner.recordByteStrides)
+            if (recordAxis == axis)
+              record += " + " + std::to_string(coordinate) + " * " +
+                        byteStride;
+        record += ")";
+        auto address = [&](int64_t logicalOffset) {
+          const int64_t sourceIndex =
+              fieldBinding.field.regularBase +
+              (logicalOffset / repeat) * stride;
+          return "((const " + *elementType + " *)((const uint8_t *)(" +
+                 record + ") + " + std::to_string(field->bitOffset / 8) +
+                 "))[" + std::to_string(sourceIndex) + "]";
+        };
+        std::string name = fresh("field_repeat");
+        const bool floating = mlir::isa<mlir::FloatType>(field->type);
+        const std::string broadcast =
+            "__riscv_" +
+            std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") + suffix;
+        const std::string vl = partVL(result, part);
+        std::string expression = broadcast + "(" + address(offset) + ", " +
+                                 vl + ")";
+        if (lanes > repeat)
+          for (int64_t piece = 1; piece < lanes / repeat; ++piece) {
+            const std::string next =
+                broadcast + "(" + address(offset + piece * repeat) + ", " +
+                vl + ")";
+            expression = "__riscv_vslideup_vx_" + suffix + "(" + expression +
+                         ", " + next + ", " + std::to_string(piece * repeat) +
+                         ", " + vl + ")";
+          }
+        line(type + " " + name + " = " + expression + ";");
+        repeated.parts.push_back(std::move(name));
+      }
+      return repeated;
+    }
     if (vectorResult && field->access.getMapping() == "joined" &&
         !field->shape.empty()) {
       const int64_t laneAxis = laneAxisFor(result);
@@ -6466,6 +6559,13 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     return mlir::success();
   }
   if (kind == "extract" || kind == "lane_to_register") {
+    if (input.kind == Binding::Kind::Slice || input.kind == Binding::Kind::Field) {
+      mlir::FailureOr<Binding> materialized =
+          materializeNumeric(conversion.getInput(), std::move(input));
+      if (mlir::failed(materialized))
+        return mlir::failure();
+      input = std::move(*materialized);
+    }
     if (input.kind != Binding::Kind::Vector || input.parts.empty())
       return fail(conversion, "RVV extract requires one vector input");
     mlir::Type element =

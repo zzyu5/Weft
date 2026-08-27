@@ -63,6 +63,24 @@ public:
         if (!isPureRepresentationConversion(conversion))
           continue;
         mlir::Operation *producer = conversion.getInput().getDefiningOp();
+        if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(producer)) {
+          if (!conversion.getInput().hasOneUse() ||
+              !extract->hasAttr("index_pattern"))
+            continue;
+          rewriter.setInsertionPoint(conversion);
+          auto rematerialized = rewriter.create<riscv::ExtractOp>(
+              extract.getLoc(), conversion.getResult().getType(),
+              extract.getInput(), extract.getIndices(), extract.getSelectors(),
+              extract.getAccess(), extract.getLeaf());
+          for (auto attribute : extract->getAttrs())
+            if (attribute.getName() != "operandSegmentSizes")
+              rematerialized->setAttr(attribute.getName(), attribute.getValue());
+          conversion.getResult().replaceAllUsesWith(rematerialized.getResult());
+          rewriter.eraseOp(conversion);
+          rewriter.eraseOp(extract);
+          changed = true;
+          continue;
+        }
         if (!producer || !rematerializable(producer) ||
             !conversion.getInput().hasOneUse())
           continue;

@@ -186,7 +186,21 @@ else
     else
       physical=(--auto-unroll=1 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q2_k
-      meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
+      if [[ ${target} == sg2044 ]]; then
+        meta=(--meta NC=32 --meta MC=16 --meta MR=1 --meta NR=1)
+      else
+        meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=1)
+      fi
+    fi
+  elif [[ ${format} == q4_k ]]; then
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q4_k_decode
+      runtime_kernel_define=-DWEFT_Q4K_DECODE=1
+    else
+      physical=(--auto-unroll=4 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_q4_k
+      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
     fi
   elif [[ ${format} == q5_k ]]; then
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
@@ -219,6 +233,41 @@ else
     else
       kernel=production_mul_mat_iq4_nl
       meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
+    fi
+  elif [[ ${format} == iq2_xxs ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_iq2_xxs_decode
+      runtime_kernel_define=-DWEFT_IQ2_XXS_DECODE=1
+    else
+      kernel=production_mul_mat_iq2_xxs
+    fi
+  elif [[ ${format} == iq4_xs ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_iq4_xs_decode
+      runtime_kernel_define=-DWEFT_IQ4_XS_DECODE=1
+    else
+      kernel=production_mul_mat_iq4_xs
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == mxfp4 ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_mxfp4_decode
+      runtime_kernel_define=-DWEFT_MXFP4_DECODE=1
+    else
+      kernel=production_mul_mat_mxfp4
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
+    fi
+  elif [[ ${format} == nvfp4 ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_nvfp4_decode
+      runtime_kernel_define=-DWEFT_NVFP4_DECODE=1
+    else
+      kernel=production_mul_mat_nvfp4
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
     fi
   else
     kernel=production_mul_mat_${format}

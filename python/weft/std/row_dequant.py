@@ -9,6 +9,7 @@ from weft.language import (
     i8,
     i32,
     iota,
+    index,
     materialize,
     u8,
     u32,
@@ -356,15 +357,21 @@ def dequantize_iq4_xs(
     codebook: View[i8, (16,)],
     Y: View[f32, (K,)],
 ):
+    table = materialize(admit(codebook))
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            sub = j // 32
-            low = extract_bits(w.scales_l[sub // 2], (sub % 2) * 4, 4)
-            high = extract_bits(w.scales_h, sub * 2, 2)
+        sub_index = index(0)
+        with L.subs(kb, extent=32) as sub:
+            low = extract_bits(
+                w.scales_l[sub_index // index(2)],
+                (sub_index % index(2)) * index(4),
+                4,
+            )
+            high = extract_bits(w.scales_h, sub_index * index(2), 2)
             scale = signed_scale(low | (high << u32(4)), zero=32)
-            q = nonlinear_lookup(codebook, w.q[j])
-            commit(iq_codebook(i32(q), f32(w.d) * f32(scale)), Y[kb][j])
+            q = small_nonlinear_lookup(table, w.q[sub])
+            commit(iq_codebook(i32(q), f32(w.d) * f32(scale)), Y[kb][sub])
+            sub_index += index(1)
 
 
 def dequantize_tq1_0(
@@ -427,9 +434,12 @@ def dequantize_nvfp4(
     ue4m3_scale: View[f32, (256,)],
     Y: View[f32, (K,)],
 ):
+    table = materialize(admit(codebook))
     with L.blocks(K, extent=64) as kb:
         w = admit(W[kb])
-        for j in range(64):
-            scale = exponent_scale(ue4m3_scale, w.d[j // 16])
-            q = nonlinear_lookup(codebook, w.q[j])
-            commit(fp4_codebook(q, scale), Y[kb][j])
+        sub_index = index(0)
+        with L.subs(kb, extent=16) as sub:
+            scale = exponent_scale(ue4m3_scale, w.d[sub_index])
+            q = small_nonlinear_lookup(table, w.q[sub])
+            commit(fp4_codebook(q, scale), Y[kb][sub])
+            sub_index += index(1)

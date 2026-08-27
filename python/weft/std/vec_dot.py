@@ -190,14 +190,33 @@ def vec_dot_q2_k_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        scaled = i32(0)
-        minimum = i32(0)
-        with L.subs(kb, extent=16) as sub:
-            metadata = u32(w.scales[sub])
-            minimum += i32(x.bsum[sub]) * i32(metadata >> u32(4))
-            partial = contract(x.q[sub], w.q[sub], over="k", acc=i32)
-            scaled += i32(metadata & u32(15)) * partial
-        result += f32(x.ds) * f32(w.d) * f32(scaled) - f32(x.ds) * f32(w.dmin) * f32(minimum)
+        coordinates = iota(128, dtype=u32, axis="k")
+        first_scale = widen(
+            u8(w.scales[coordinates / u32(16)]) & u8(15), i16
+        )
+        first_weight = widen(w.q[coordinates], i16) * first_scale
+        first = contract(
+            widen(x.q[coordinates], i16), first_weight, over="k", acc=i32
+        )
+
+        second_coordinates = coordinates + u32(128)
+        second_scale = widen(
+            u8(w.scales[coordinates / u32(16) + u32(8)]) & u8(15), i16
+        )
+        second_weight = widen(w.q[second_coordinates], i16) * second_scale
+        second = contract(
+            widen(x.q[second_coordinates], i16),
+            second_weight,
+            over="k",
+            acc=i32,
+        )
+
+        mins = widen(u8(w.scales) >> u8(4), i16)
+        minimum = contract(x.bsum, mins, over="k", acc=i32)
+        scaled = first + second
+        result += f32(x.ds) * (
+            f32(w.d) * f32(scaled) - f32(w.dmin) * f32(minimum)
+        )
     return result
 
 
@@ -691,22 +710,23 @@ def vec_dot_iq4_xs_q8_k(
     X: View[Q8_K, (K,)],
     codebook: View[i8, (16,)],
 ):
+    table = materialize(admit(codebook))
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        for sub in range(8):
-            low = u32(w.scales_l[sub // 2])
-            shift = (sub % 2) * 4
+        sub_index = index(0)
+        with L.subs(kb, extent=32) as sub:
+            low = u32(w.scales_l[sub_index // index(2)])
+            shift = (sub_index % index(2)) * index(4)
             scale_low = (low >> u32(shift)) & u32(15)
-            scale_high = (u32(w.scales_h) >> u32(sub * 2)) & u32(3)
+            scale_high = (u32(w.scales_h) >> u32(sub_index * index(2))) & u32(3)
             scale = i32(scale_low | (scale_high << u32(4))) - i32(32)
-            integer = i32(0)
-            for j in range(32):
-                q = i32(nonlinear_lookup(codebook, w.q[sub * 32 + j]))
-                integer += q * i32(x.q[sub * 32 + j])
+            q = small_nonlinear_lookup(table, w.q[sub])
+            integer = contract(q, x.q[sub], over="k", acc=i32)
             block_scale = f32(w.d) * f32(x.ds) * f32(scale)
             result += block_scale * f32(integer)
+            sub_index += index(1)
     return result
 
 
@@ -773,19 +793,15 @@ def vec_dot_nvfp4_q8_0(
     codebook: View[i8, (16,)],
     ue4m3_scale: View[f32, (256,)],
 ):
+    table = materialize(admit(codebook))
     result = f32(0.0)
     with L.blocks(K, extent=64) as wb:
         w = admit(W[wb])
-        x_block = index(0)
         with L.subs(wb, extent=32) as xb:
             x = admit(X[xb])
-            for half in range(2):
-                sub = x_block * 2 + half
-                integer = i32(0)
-                for lane in range(16):
-                    q = i32(nonlinear_lookup(codebook, w.q[sub * 16 + lane]))
-                    integer += i32(x.q[half * 16 + lane]) * q
+            with L.subs(xb, extent=16) as sub:
+                q = small_nonlinear_lookup(table, w.q[sub])
+                integer = contract(q, x.q[sub], over="k", acc=i32)
                 scale = f32(x.d) * exponent_scale(ue4m3_scale, w.d[sub])
                 result += scale * f32(integer)
-            x_block += index(1)
     return result

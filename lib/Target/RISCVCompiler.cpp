@@ -29,6 +29,7 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createSelectRISCVOperationsPass());
   manager.addPass(weft::createLowerRISCVCompositesPass());
+  manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createFuseRISCVBitplanesPass());
   manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
   manager.addPass(weft::createScheduleRISCVLevelsPass());

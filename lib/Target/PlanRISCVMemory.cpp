@@ -5,9 +5,12 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -15,6 +18,119 @@
 using namespace weft;
 
 namespace {
+
+struct RegularIndex {
+  int64_t base = 0;
+  int64_t stride = 1;
+  int64_t repeat = 1;
+};
+
+bool checkedAdd(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+      (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+    return false;
+  result = lhs + rhs;
+  return true;
+}
+
+bool checkedSubtract(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() + rhs) ||
+      (rhs < 0 && lhs > std::numeric_limits<int64_t>::max() + rhs))
+    return false;
+  result = lhs - rhs;
+  return true;
+}
+
+bool checkedScale(int64_t value, int64_t factor, int64_t &result) {
+  if (factor <= 0 || value > std::numeric_limits<int64_t>::max() / factor ||
+      value < std::numeric_limits<int64_t>::min() / factor)
+    return false;
+  result = value * factor;
+  return true;
+}
+
+std::optional<int64_t> constantInteger(mlir::Value value) {
+  auto constant = value.getDefiningOp<riscv::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+}
+
+std::optional<RegularIndex> analyzeRegularIndex(mlir::Value value,
+                                                unsigned depth = 0) {
+  if (depth > 16)
+    return std::nullopt;
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    return analyzeRegularIndex(conversion.getInput(), depth + 1);
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    if (iota.getStart() >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return std::nullopt;
+    return RegularIndex{static_cast<int64_t>(iota.getStart()), 1, 1};
+  }
+  auto binary = value.getDefiningOp<riscv::BinaryOp>();
+  if (!binary)
+    return std::nullopt;
+
+  auto lhs = analyzeRegularIndex(binary.getLhs(), depth + 1);
+  auto rhs = analyzeRegularIndex(binary.getRhs(), depth + 1);
+  auto lhsConstant = constantInteger(binary.getLhs());
+  auto rhsConstant = constantInteger(binary.getRhs());
+  if (binary.getKind() == "add") {
+    if (lhs && rhsConstant) {
+      return checkedAdd(lhs->base, *rhsConstant, lhs->base) ? lhs
+                                                            : std::nullopt;
+    }
+    if (rhs && lhsConstant) {
+      return checkedAdd(rhs->base, *lhsConstant, rhs->base) ? rhs
+                                                            : std::nullopt;
+    }
+  }
+  if (binary.getKind() == "sub" && lhs && rhsConstant) {
+    return checkedSubtract(lhs->base, *rhsConstant, lhs->base) ? lhs
+                                                               : std::nullopt;
+  }
+  if (binary.getKind() == "mul") {
+    auto scale = [&](RegularIndex pattern, int64_t factor)
+        -> std::optional<RegularIndex> {
+      if (!checkedScale(pattern.base, factor, pattern.base) ||
+          !checkedScale(pattern.stride, factor, pattern.stride))
+        return std::nullopt;
+      return pattern;
+    };
+    if (lhs && rhsConstant)
+      return scale(*lhs, *rhsConstant);
+    if (rhs && lhsConstant)
+      return scale(*rhs, *lhsConstant);
+  }
+  if (binary.getKind() == "div" && lhs && rhsConstant && *rhsConstant > 0 &&
+      lhs->base % *rhsConstant == 0 && lhs->stride == 1 &&
+      lhs->repeat <= std::numeric_limits<int64_t>::max() / *rhsConstant) {
+    lhs->base /= *rhsConstant;
+    lhs->repeat *= *rhsConstant;
+    return lhs;
+  }
+  return std::nullopt;
+}
+
+void eraseDeadRegularIndexChain(mlir::Value value,
+                                llvm::DenseSet<mlir::Operation *> &visited,
+                                mlir::IRRewriter &rewriter) {
+  mlir::Operation *definition = value.getDefiningOp();
+  const bool hasUses =
+      definition && llvm::any_of(definition->getResults(), [](mlir::Value result) {
+        return !result.use_empty();
+      });
+  if (!definition || !visited.insert(definition).second || hasUses ||
+      !mlir::isa<riscv::IotaOp, riscv::BinaryOp, riscv::ConvertLayoutOp>(
+          definition))
+    return;
+  llvm::SmallVector<mlir::Value> operands(definition->getOperands());
+  rewriter.eraseOp(definition);
+  for (mlir::Value operand : operands)
+    eraseDeadRegularIndexChain(operand, visited, rewriter);
+}
 
 riscv::AccessAttr makeAccess(mlir::Builder &builder, llvm::StringRef form,
                              llvm::StringRef mapping, int64_t alignment,
@@ -102,6 +218,7 @@ public:
 
   void runOnOperation() override {
     mlir::Builder builder(&getContext());
+    mlir::IRRewriter rewriter(&getContext());
     bool failed = false;
     llvm::SmallVector<riscv::LoadOp> deadTableLoads;
     llvm::SmallVector<riscv::MaterializeOp> deadTableMaterializations;
@@ -174,7 +291,50 @@ public:
             return mlir::cast<mlir::StringAttr>(selector).getValue() ==
                    "gather";
           });
-      if (gather && inputLayout && inputLayout.getCarrier() == "rvv") {
+      mlir::Value gatherIndex;
+      size_t gatherCursor = 0;
+      for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (gatherCursor >= operation.getIndices().size())
+          break;
+        if (selector == "gather")
+          gatherIndex = operation.getIndices()[gatherCursor];
+        ++gatherCursor;
+      }
+      auto inputValue =
+          mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
+      auto resultValue =
+          mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+      auto indexValue =
+          gatherIndex ? mlir::dyn_cast<riscv::ValueType>(gatherIndex.getType())
+                      : riscv::ValueType();
+      auto inputTime = inputLayout
+                           ? riscv_internal::staticProduct(
+                                 inputLayout.getTimeFactors().asArrayRef())
+                           : std::optional<int64_t>();
+      auto inputReplicas =
+          inputLayout
+              ? riscv_internal::staticProduct(
+                    inputLayout.getReplicaFactors().asArrayRef())
+              : std::optional<int64_t>();
+      const bool completeRegisterSource =
+          inputValue && resultValue && indexValue && inputLayout &&
+          inputLayout.getCarrier() == "rvv" &&
+          resultValue.getLayout().getCarrier() == "rvv" &&
+          indexValue.getLayout().getCarrier() == "rvv" &&
+          inputTime && *inputTime == 1 && inputReplicas && *inputReplicas == 1;
+      const bool compatibleRegisterGather =
+          completeRegisterSource &&
+          inputLayout.getSew() == resultValue.getLayout().getSew() &&
+          inputLayout.getLmulEighths() ==
+              resultValue.getLayout().getLmulEighths() &&
+          indexValue.getLayout().getSew() == resultValue.getLayout().getSew() &&
+          indexValue.getLayout().getLmulEighths() ==
+              resultValue.getLayout().getLmulEighths();
+      if (gather && compatibleRegisterGather) {
         operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
         operation.setLeafAttr(riscv_internal::leaf(
             builder, "rvv", "extract", "rvv.extract.vrgather",
@@ -233,6 +393,119 @@ public:
       operation.setLeafAttr(transferLeaf(
           builder, "extract", ("rvv.extract." + form).str()));
     });
+
+    llvm::SmallVector<riscv::ExtractOp> extracts;
+    getOperation().walk(
+        [&](riscv::ExtractOp extract) { extracts.push_back(extract); });
+    for (riscv::ExtractOp extract : extracts) {
+      llvm::SmallVector<riscv::ConvertLayoutOp> inputConversions;
+      mlir::Value source = riscv_internal::stripRepresentationConversions(
+          extract.getInput(), &inputConversions);
+      auto field = source.getDefiningOp<riscv::FieldOp>();
+      riscv::ConvertLayoutOp conversion;
+      if (extract.getResult().hasOneUse())
+        conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(
+            *extract.getResult().getUsers().begin());
+      mlir::Type selectedResultType =
+          conversion ? conversion.getResult().getType()
+                     : extract.getResult().getType();
+      auto result = mlir::dyn_cast<riscv::ValueType>(selectedResultType);
+      if (!field || !result || extract.getAccess().getForm() != "indexed")
+        continue;
+      size_t indexCursor = 0;
+      size_t gatherCursor = 0;
+      size_t gatherDimension = extract.getSelectors().size();
+      unsigned gatherCount = 0;
+      mlir::Value gatherIndex;
+      llvm::SmallVector<mlir::Attribute> selectors;
+      llvm::SmallVector<mlir::Value> retainedIndices;
+      for (auto [dimension, selectorAttribute] :
+           llvm::enumerate(extract.getSelectors())) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all") {
+          selectors.push_back(selectorAttribute);
+          continue;
+        }
+        if (indexCursor >= extract.getIndices().size()) {
+          gatherCount = 0;
+          break;
+        }
+        mlir::Value index = extract.getIndices()[indexCursor++];
+        if (selector == "gather") {
+          ++gatherCount;
+          gatherCursor = indexCursor - 1;
+          gatherDimension = dimension;
+          gatherIndex = index;
+          selectors.push_back(builder.getStringAttr("regular"));
+        } else {
+          retainedIndices.push_back(index);
+          selectors.push_back(selectorAttribute);
+        }
+      }
+      auto pattern = gatherCount == 1 && indexCursor == extract.getIndices().size()
+                         ? analyzeRegularIndex(gatherIndex)
+                         : std::optional<RegularIndex>();
+      if (!pattern || pattern->base < 0 || pattern->stride <= 0 ||
+          pattern->repeat <= 0 || gatherDimension >= result.getShape().size())
+        continue;
+      if (gatherDimension >= result.getLayout().getLaneFactors().size())
+        continue;
+      auto access = field.getAccess();
+      const int64_t lanes =
+          result.getLayout().getLaneFactors()[gatherDimension];
+      const int64_t extent = result.getShape()[gatherDimension];
+      if (lanes <= 1 || extent <= 0 || pattern->stride != 1)
+        continue;
+      bool legal = true;
+      if (access.getMapping() == "natural" && pattern->repeat > 1)
+        legal &= pattern->repeat % lanes == 0 || lanes % pattern->repeat == 0;
+      else if (access.getMapping() == "grouped_layered" &&
+               pattern->repeat == 1)
+        legal &= access.getLayerSize() > 0 &&
+                 access.getLayerSize() % lanes == 0 &&
+                 pattern->base % lanes == 0;
+      else
+        legal &= access.getMapping() == "natural" && pattern->repeat == 1;
+      int64_t scaledLast = 0;
+      int64_t last = 0;
+      auto input = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
+      if (!input || gatherDimension >= input.getShape().size())
+        continue;
+      legal &= checkedScale((extent - 1) / pattern->repeat, pattern->stride,
+                            scaledLast) &&
+               checkedAdd(pattern->base, scaledLast, last) &&
+               last >= pattern->base && last < input.getShape()[gatherDimension];
+      if (!legal)
+        continue;
+
+      rewriter.setInsertionPoint(extract);
+      auto replacement = rewriter.create<riscv::ExtractOp>(
+          extract.getLoc(), selectedResultType, field.getResult(),
+          retainedIndices, rewriter.getArrayAttr(selectors), extract.getAccess(),
+          extract.getLeaf());
+      replacement->setAttr(
+          "index_pattern",
+          rewriter.getDenseI64ArrayAttr(
+              {pattern->base, pattern->stride, pattern->repeat}));
+      riscv_internal::copyOrigin(extract, replacement);
+      if (auto canonical = extract->getAttr("canonical_op"))
+        replacement->setAttr("canonical_op", canonical);
+      if (conversion) {
+        conversion.getResult().replaceAllUsesWith(replacement.getResult());
+        rewriter.eraseOp(conversion);
+      } else {
+        extract.getResult().replaceAllUsesWith(replacement.getResult());
+      }
+      rewriter.eraseOp(extract);
+      for (riscv::ConvertLayoutOp inputConversion :
+           llvm::reverse(inputConversions))
+        if (inputConversion.getResult().use_empty())
+          rewriter.eraseOp(inputConversion);
+      llvm::DenseSet<mlir::Operation *> visited;
+      eraseDeadRegularIndexChain(gatherIndex, visited, rewriter);
+      (void)gatherCursor;
+    }
     getOperation().walk([&](riscv::ConvertLayoutOp operation) {
       auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
       if (!result || result.getLayout().getCarrier() != "rvv")

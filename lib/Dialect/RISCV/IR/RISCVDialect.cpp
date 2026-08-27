@@ -1570,9 +1570,53 @@ mlir::LogicalResult ExtractOp::verify() {
       !isPhysicalValue(getResult().getType()) ||
       elementOf(getInput().getType()) != elementOf(getResult().getType()))
     return emitOpError("physical extract requires typed selectors and result");
-  if (failed(verifyProjection(*this, getInput().getType(), getIndices(),
-                              getSelectors(), getResult().getType(), true)))
+  auto pattern = getOperation()->getAttrOfType<mlir::DenseI64ArrayAttr>(
+      "index_pattern");
+  if (pattern) {
+    auto input = getInput().getType();
+    auto result = mlir::dyn_cast<ValueType>(getResult().getType());
+    size_t regularDimension = getSelectors().size();
+    unsigned regularCount = 0;
+    for (auto [dimension, selectorAttribute] :
+         llvm::enumerate(getSelectors())) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "regular") {
+        ++regularCount;
+        regularDimension = dimension;
+      } else if (selector != "all") {
+        return emitOpError(
+            "regular physical extract currently permits only all/regular selectors");
+      }
+    }
+    if (!result || pattern.size() != 3 || regularCount != 1 ||
+        !getIndices().empty() || getAccess().getForm() != "indexed" ||
+        input.getShape().size() != result.getShape().size() ||
+        input.getAxisIds() != result.getAxisIds() ||
+        regularDimension >= input.getShape().size() || pattern[0] < 0 ||
+        pattern[1] <= 0 || pattern[2] <= 0 ||
+        result.getShape()[regularDimension] <= 0)
+      return emitOpError(
+          "regular physical extract requires one closed base/stride/repeat mapping");
+    for (size_t dimension = 0; dimension < input.getShape().size(); ++dimension)
+      if (dimension != regularDimension &&
+          input.getShape()[dimension] != result.getShape()[dimension])
+        return emitOpError(
+            "regular physical extract must preserve every non-indexed axis");
+    const int64_t steps =
+        (result.getShape()[regularDimension] - 1) / pattern[2];
+    if (steps > (std::numeric_limits<int64_t>::max() - pattern[0]) /
+                    pattern[1])
+      return emitOpError("regular physical extract index mapping overflows");
+    const int64_t last = pattern[0] + steps * pattern[1];
+    if (last < pattern[0] || last >= input.getShape()[regularDimension])
+      return emitOpError(
+          "regular physical extract index mapping exceeds its source axis");
+  } else if (failed(verifyProjection(*this, getInput().getType(), getIndices(),
+                                     getSelectors(), getResult().getType(),
+                                     true))) {
     return mlir::failure();
+  }
   if (getAccess().getForm() == "register") {
     auto result = mlir::dyn_cast<ValueType>(getResult().getType());
     auto input = getInput().getType();
@@ -1612,7 +1656,10 @@ mlir::LogicalResult ExtractOp::verify() {
         !exactLeaf(getLeaf(), "rvv", "extract", "rvv.extract.vrgather",
                    "none", "exact"))
       return emitOpError(
-          "register extract requires one complete RVV source, index, result, and exact gather leaf");
+                 "register extract requires one complete RVV source, index, result, and exact gather leaf; input=")
+             << input << ", index="
+             << (gatherIndex ? gatherIndex.getType() : mlir::Type())
+             << ", result=" << getResult().getType();
   }
   return verifyLeafOperation(*this);
 }
