@@ -2880,19 +2880,44 @@ mlir::LogicalResult RVVStorageWindowOp::verify() {
       (validity != "full" && validity != "tail") ||
       !exactLeaf(getLeaf(), "rvv", "storage-window", "rvv.storage-window",
                  "none", tail))
-    return emitOpError(
-        "RVV storage window requires one typed field/point/offset edge and one complete lane result");
+    return emitOpError()
+           << "RVV storage window requires one typed field/point/offset edge and "
+              "one complete lane result; field="
+           << field << ", result=" << result << ", axis=" << axis
+           << ", point-axis=" << pointAxis << ", access=" << getAccess()
+           << ", projection=<" << getProjectionBase() << ","
+           << getProjectionStride() << "," << getProjectionRepeat() << ","
+           << getProjectionExtent() << ">";
   const size_t fieldPosition = static_cast<size_t>(
       fieldAxis - field.getAxisIds().asArrayRef().begin());
   const size_t resultPosition = static_cast<size_t>(
       resultAxis - result.getAxisIds().asArrayRef().begin());
-  if (result.getShape()[resultPosition] <= 0 ||
-      field.getShape()[fieldPosition] < result.getShape()[resultPosition] ||
+  const int64_t lanes = result.getShape()[resultPosition];
+  const int64_t projectionBase = getProjectionBase();
+  const int64_t projectionStride = getProjectionStride();
+  const int64_t projectionRepeat = getProjectionRepeat();
+  const int64_t projectionExtent = getProjectionExtent();
+  const int64_t offsetAlignment = getOffsetAlignment();
+  const bool projectionBounds =
+      projectionBase >= 0 && projectionStride > 0 && projectionRepeat > 0 &&
+      projectionExtent > 0 && field.getShape()[fieldPosition] > 0 &&
+      projectionBase <= field.getShape()[fieldPosition] - 1 &&
+      (projectionExtent - 1) / projectionRepeat <=
+          (field.getShape()[fieldPosition] - 1 - projectionBase) /
+              projectionStride;
+  if (lanes <= 0 || !projectionBounds || projectionExtent < lanes ||
+      offsetAlignment != lanes ||
+      (projectionRepeat % lanes != 0 && lanes % projectionRepeat != 0) ||
       result.getShape()[resultPosition] !=
           result.getLayout().getLaneFactors()[resultPosition] ||
       result.getLayout().getVl() < result.getShape()[resultPosition])
-    return emitOpError(
-        "RVV storage window result must cover one legal lane-sized subrange");
+    return emitOpError()
+           << "RVV storage window result must cover one bounded, lane-aligned "
+              "projected subrange; field="
+           << field << ", result=" << result << ", lanes=" << lanes
+           << ", projection=<" << projectionBase << "," << projectionStride
+           << "," << projectionRepeat << "," << projectionExtent
+           << ">, offset-alignment=" << offsetAlignment;
   for (size_t position = 0; position < result.getShape().size(); ++position) {
     if (position == resultPosition)
       continue;
@@ -2920,6 +2945,11 @@ mlir::LogicalResult RVVLayeredStorageLoadOp::verify() {
   const int64_t group = getAccess().getGroupSize();
   const int64_t layer = getAccess().getLayerSize();
   const int64_t layers = layer > 0 ? group / layer : 0;
+  auto physicalPoint = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto pointPartition =
+      physicalPoint
+          ? physicalPoint.getPartition().getDefiningOp<mlir::arith::ConstantIndexOp>()
+          : mlir::arith::ConstantIndexOp();
   auto resultAxis = llvm::find(result.getAxisIds().asArrayRef(),
                                getReductionAxis());
   const int64_t lanes =
@@ -2927,6 +2957,13 @@ mlir::LogicalResult RVVLayeredStorageLoadOp::verify() {
           ? 0
           : result.getLayout().getLaneFactors()[static_cast<size_t>(
                 resultAxis - result.getAxisIds().asArrayRef().begin())];
+  auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(),
+                              getReductionAxis());
+  const int64_t fieldExtent =
+      fieldAxis == field.getAxisIds().asArrayRef().end()
+          ? 0
+          : field.getShape()[static_cast<size_t>(
+                fieldAxis - field.getAxisIds().asArrayRef().begin())];
   llvm::StringRef validity = result.getLayout().getValidity();
   llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
   if (!sourceField || getAccess() != sourceField.getAccess() || !integer ||
@@ -2937,7 +2974,12 @@ mlir::LogicalResult RVVLayeredStorageLoadOp::verify() {
       getAccess().getForm() != "indexed" ||
       getAccess().getMapping() != "grouped_layered" || group <= 0 ||
       layer <= 0 || group % layer || layers <= 1 || lanes <= 1 ||
+      !pointPartition || pointPartition.value() % group ||
       layer % lanes || integer.getWidth() * layers != 8 ||
+      getProjectionBase() < 0 || getProjectionExtent() <= 0 ||
+      getProjectionBase() % group || getProjectionExtent() % group ||
+      fieldExtent <= 0 || getProjectionBase() > fieldExtent ||
+      getProjectionExtent() > fieldExtent - getProjectionBase() ||
       getAccess().getBitOffset() % 8 ||
       (getAccess().getOrder() != "lo_first" &&
        getAccess().getOrder() != "hi_first") ||
@@ -3175,13 +3217,18 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
           resultValue.getLayout().getFragmentFactors()[position] == 1 &&
           resultValue.getLayout().getLocalFactors()[position] == 1;
   auto kernel = getOperation()->getParentOfType<KernelOp>();
+  llvm::StringRef instruction =
+      partialElement && partialElement.getWidth() == 16
+          ? llvm::StringRef("rvv.vwredsum.partial")
+          : llvm::StringRef("rvv.vredsum.partial");
   if (!partialElement || !partialElement.isSigned() ||
-      partialElement.getWidth() != 16 || !resultElement ||
+      (partialElement.getWidth() != 16 && partialElement.getWidth() != 32) ||
+      !resultElement ||
       !resultElement.isSigned() || resultElement.getWidth() != 32 ||
       !completeMapping || !legalResult || !kernel ||
       !supportsLayout(kernel.getTarget(), partial.getLayout()) ||
       !exactLeaf(getLeaf(), "rvv", "finalize-widen-dot",
-                 "rvv.vwredsum.partial", "none", "exact"))
+                 instruction, "none", "exact"))
     return emitOpError(
         "final widened dot reduction must remove one lane axis and preserve every free replica");
   return mlir::success();
@@ -3355,6 +3402,92 @@ mlir::LogicalResult RVVLayeredStreamOp::verify() {
     return emitOpError(
         "RVV layered stream requires one byte-aligned packed field whose "
         "grouped/layered geometry is represented by one complete time/lane axis");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVProjectedLayeredStreamOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  const int64_t axis = getReductionAxis();
+  auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), axis);
+  auto resultAxis = llvm::find(result.getAxisIds().asArrayRef(), axis);
+  const int64_t group = getAccess().getGroupSize();
+  const int64_t layer = getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  auto physicalPoint = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto pointPartition =
+      physicalPoint
+          ? physicalPoint.getPartition().getDefiningOp<mlir::arith::ConstantIndexOp>()
+          : mlir::arith::ConstantIndexOp();
+  const int64_t fieldExtent =
+      fieldAxis == field.getAxisIds().asArrayRef().end()
+          ? 0
+          : field.getShape()[static_cast<size_t>(
+                fieldAxis - field.getAxisIds().asArrayRef().begin())];
+  const int64_t resultExtent =
+      resultAxis == result.getAxisIds().asArrayRef().end()
+          ? 0
+          : result.getShape()[static_cast<size_t>(
+                resultAxis - result.getAxisIds().asArrayRef().begin())];
+  const int64_t lanes =
+      resultAxis == result.getAxisIds().asArrayRef().end()
+          ? 0
+          : result.getLayout().getLaneFactors()[static_cast<size_t>(
+                resultAxis - result.getAxisIds().asArrayRef().begin())];
+  const int64_t time =
+      resultAxis == result.getAxisIds().asArrayRef().end()
+          ? 0
+          : result.getLayout().getTimeFactors()[static_cast<size_t>(
+                resultAxis - result.getAxisIds().asArrayRef().begin())];
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  bool preservesFreeAxes = field.getAxisIds() == result.getAxisIds() &&
+                          field.getShape().size() == result.getShape().size();
+  if (preservesFreeAxes)
+    for (size_t position = 0; position < result.getShape().size(); ++position) {
+      if (result.getAxisIds()[position] == axis)
+        continue;
+      preservesFreeAxes &=
+          field.getShape()[position] == result.getShape()[position] &&
+          result.getLayout().getTimeFactors()[position] == 1 &&
+          result.getLayout().getLaneFactors()[position] == 1 &&
+          (result.getShape()[position] > 0
+               ? result.getLayout().getReplicaFactors()[position] ==
+                     result.getShape()[position]
+               : result.getLayout().getReplicaFactors()[position] > 0) &&
+          result.getLayout().getFragmentFactors()[position] == 1 &&
+          result.getLayout().getLocalFactors()[position] == 1;
+    }
+  if (!element || element.isSigned() || !sourceField ||
+      getAccess() != sourceField.getAccess() || axis <= 0 ||
+      getOrigin().getType().getDomain().getAxisId() != axis ||
+      getOrigin().getType().getDomain().getTail() != "exact" ||
+      fieldAxis == field.getAxisIds().asArrayRef().end() ||
+      resultAxis == result.getAxisIds().asArrayRef().end() ||
+      field.getElementType() != result.getElementType() || !preservesFreeAxes ||
+      getProjectionBase() < 0 || getProjectionStride() != 1 ||
+      getProjectionRepeat() != 1 || getProjectionExtent() != resultExtent ||
+      resultExtent <= 0 || fieldExtent <= 0 ||
+      getProjectionBase() > fieldExtent ||
+      resultExtent > fieldExtent - getProjectionBase() ||
+      group <= 0 || layer <= 0 || group % layer || layers <= 1 ||
+      getProjectionBase() % group || resultExtent % group ||
+      !pointPartition || pointPartition.value() % group ||
+      result.getLayout().getCarrier() != "rvv" || lanes <= 1 || time <= 1 ||
+      time > std::numeric_limits<int64_t>::max() / lanes ||
+      time * lanes != resultExtent || layer % lanes ||
+      element.getWidth() * layers > 8 || getAccess().getBitOffset() % 8 ||
+      getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "grouped_layered" ||
+      (getAccess().getOrder() != "lo_first" &&
+       getAccess().getOrder() != "hi_first") ||
+      (validity != "full" && validity != "tail") ||
+      !exactLeaf(getLeaf(), "rvv", "projected-layered-stream",
+                 "rvv.projected-layered-stream", "none", tail))
+    return emitOpError(
+        "projected layered stream requires one typed field/point projection and one closed grouped/layered time-lane mapping");
   return mlir::success();
 }
 

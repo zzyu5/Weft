@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -875,6 +876,38 @@ riscv::AccessAttr riscv_internal::accessOf(mlir::Value value) {
       continue;
     }
     break;
+  }
+  return {};
+}
+
+riscv::PhysicalPointOp riscv_internal::originPoint(mlir::Value value,
+                                                   int64_t axis) {
+  llvm::SmallVector<mlir::Value> worklist{value};
+  llvm::DenseSet<mlir::Value> visited;
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    current = stripRepresentationConversions(current);
+    if (auto point = current.getDefiningOp<riscv::PhysicalPointOp>();
+        point && point.getResult().getType().getDomain().getAxisId() == axis)
+      return point;
+    mlir::Operation *definition = current.getDefiningOp();
+    if (!definition)
+      continue;
+    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
+      for (mlir::Value index : extract.getIndices())
+        worklist.push_back(index);
+      worklist.push_back(extract.getInput());
+      continue;
+    }
+    if (auto field = mlir::dyn_cast<riscv::FieldOp>(definition)) {
+      worklist.push_back(field.getOwner());
+      continue;
+    }
+    if (auto materialize =
+            mlir::dyn_cast<riscv::RegisterMaterializeOp>(definition))
+      worklist.push_back(materialize.getInput());
   }
   return {};
 }

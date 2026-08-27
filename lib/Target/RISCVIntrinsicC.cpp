@@ -646,6 +646,8 @@ private:
   compileRVVLayeredWindow(riscv::RVVLayeredWindowOp operation);
   mlir::LogicalResult
   compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation);
+  mlir::LogicalResult compileRVVProjectedLayeredStream(
+      riscv::RVVProjectedLayeredStreamOp operation);
   mlir::LogicalResult
   compileRVVStreamReduce(riscv::RVVStreamReduceOp operation);
   mlir::LogicalResult compileRVVStreamDot(riscv::RVVStreamDotOp operation);
@@ -2092,6 +2094,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVLayeredWindow(window);
   if (auto stream = mlir::dyn_cast<riscv::RVVLayeredStreamOp>(operation))
     return compileRVVLayeredStream(stream);
+  if (auto stream =
+          mlir::dyn_cast<riscv::RVVProjectedLayeredStreamOp>(operation))
+    return compileRVVProjectedLayeredStream(stream);
   if (auto reduce = mlir::dyn_cast<riscv::RVVStreamReduceOp>(operation))
     return compileRVVStreamReduce(reduce);
   if (auto dot = mlir::dyn_cast<riscv::RVVStreamDotOp>(operation))
@@ -7592,6 +7597,120 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
     return fail(operation,
                 "RVV storage window requires one unprojected field, point, and scalar offset");
   field.field.useAccess = operation.getAccess();
+  if (operation.getAccess().getMapping() == "natural") {
+    Binding owner = bindings.lookup(field.field.owner);
+    if (owner.kind == Binding::Kind::Slice) {
+      auto record = recordForSlice(field.field.owner);
+      if (mlir::failed(record))
+        return mlir::failure();
+      owner = std::move(*record);
+    }
+    auto storage = fieldFor(field);
+    auto resultType = operation.getResult().getType();
+    auto elementType = storage ? scalarCType(storage->type) : std::nullopt;
+    auto axis = llvm::find(resultType.getAxisIds().asArrayRef(),
+                           operation.getReductionAxis());
+    const int64_t lanes =
+        axis == resultType.getAxisIds().asArrayRef().end()
+            ? 0
+            : resultType.getLayout().getLaneFactors()[static_cast<size_t>(
+                  axis - resultType.getAxisIds().asArrayRef().begin())];
+    unsigned width = 0;
+    if (storage)
+      if (auto integer = mlir::dyn_cast<mlir::IntegerType>(storage->type))
+        width = integer.getWidth();
+      else if (auto floating = mlir::dyn_cast<mlir::FloatType>(storage->type))
+        width = floating.getWidth();
+    const int64_t bytes = width / 8;
+    const int64_t repeat = operation.getProjectionRepeat();
+    const int64_t stride = operation.getProjectionStride();
+    if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
+        !storage || !elementType ||
+        storage->bitOffset % 8 || (width != 8 && width != 16 && width != 32) ||
+        bytes <= 0 || lanes <= 0 || repeat <= 0 || stride <= 0 ||
+        (repeat % lanes && lanes % repeat))
+      return fail(operation,
+                  "RVV projected storage window has incomplete natural-field geometry");
+    const std::string suffix = vectorSuffix(operation.getResult());
+    const std::string type = vectorType(operation.getResult());
+    const bool floating = mlir::isa<mlir::FloatType>(storage->type);
+    const std::string broadcast =
+        "__riscv_" + std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") + suffix;
+    const int64_t streams = streamPartCount(operation.getResult());
+    llvm::SmallVector<int64_t, 4> axes =
+        registerAxesFor(operation.getResult());
+    Binding loaded;
+    loaded.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+      auto coordinates =
+          registerCoordinates(operation.getResult(), part / streams);
+      if (streams != 1 || !coordinates || coordinates->size() != axes.size())
+        return fail(operation,
+                    "RVV projected storage window has no register-coordinate mapping");
+      std::string record = "(" + owner.recordPointer;
+      for (auto [freeAxis, coordinate] : llvm::zip(axes, *coordinates)) {
+        auto byteStride = llvm::find_if(owner.recordByteStrides,
+                                        [&](const auto &entry) {
+                                          return entry.first == freeAxis;
+                                        });
+        if (byteStride == owner.recordByteStrides.end())
+          return fail(operation,
+                      "RVV projected storage window free axis has no record stride");
+        record += " + " + std::to_string(coordinate) + " * " + byteStride->second;
+      }
+      record += ")";
+      const std::string logical =
+          "((" + point.point.base + ") % " +
+          std::to_string(owner.recordElements) + " + (" + offset.scalar + "))";
+      auto address = [&](llvm::StringRef sourceIndex) {
+        return "((const " + *elementType + " *)((const uint8_t *)(" + record +
+               ") + " + std::to_string(storage->bitOffset / 8) + "))[(" +
+               sourceIndex.str() + ")]";
+      };
+      const std::string vl = partVL(operation.getResult(), part);
+      std::string value;
+      if (repeat == 1) {
+        const std::string sourceIndex =
+            std::to_string(operation.getProjectionBase()) + " + (" + logical +
+            ") * " + std::to_string(stride);
+        std::string name = fresh("projected_window");
+        const std::string pointer = "&(" + address(sourceIndex) + ")";
+        const std::string expression =
+            stride == 1
+                ? "__riscv_vle" + std::to_string(width) + "_v_" + suffix +
+                      "(" + pointer + ", " + vl + ")"
+                : "__riscv_vlse" + std::to_string(width) + "_v_" + suffix +
+                      "(" + pointer + ", (ptrdiff_t)" +
+                      std::to_string(stride * bytes) + ", " + vl + ")";
+        line(type + " " + name + " = " + expression + ";");
+        value = std::move(name);
+      } else {
+        const int64_t pieceWidth = std::min<int64_t>(repeat, lanes);
+        const int64_t pieces = lanes / pieceWidth;
+        for (int64_t piece = 0; piece < pieces; ++piece) {
+          const std::string sourceIndex =
+              std::to_string(operation.getProjectionBase()) + " + ((" + logical +
+              " + " + std::to_string(piece * pieceWidth) + ") / " +
+              std::to_string(repeat) + ") * " + std::to_string(stride);
+          const std::string next =
+              broadcast + "(" + address(sourceIndex) + ", " + vl + ")";
+          if (piece == 0) {
+            value = next;
+          } else {
+            value = "__riscv_vslideup_vx_" + suffix + "(" + value + ", " +
+                    next + ", " + std::to_string(piece * pieceWidth) + ", " + vl +
+                    ")";
+          }
+        }
+        std::string name = fresh("projected_repeat");
+        line(type + " " + name + " = " + value + ";");
+        value = std::move(name);
+      }
+      loaded.parts.push_back(std::move(value));
+    }
+    bindings[operation.getResult()] = std::move(loaded);
+    return mlir::success();
+  }
   field.field.index = operation.getOrigin();
   field.field.selector = "domain";
   field.field.relativeIndices.push_back(operation.getLogicalOffset());
@@ -7678,8 +7797,9 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
     }
     record += ")";
     const std::string logicalBase =
-        "((" + point.point.base + ") % " +
-        std::to_string(owner.recordElements) + ")";
+        "(((" + point.point.base + ") % " +
+        std::to_string(owner.recordElements) + ") + " +
+        std::to_string(operation.getProjectionBase()) + ")";
     const std::string groupIndex =
         "((" + logicalBase + " / " + std::to_string(group) + ") + (" +
         windowIndex.scalar + " / " + std::to_string(windowsPerLayer) + "))";
@@ -7809,7 +7929,9 @@ mlir::LogicalResult Emitter::compileRVVWidenAccumulate(
 
 mlir::LogicalResult Emitter::compileRVVFinalizeWidenDot(
     riscv::RVVFinalizeWidenDotOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.vwredsum.partial")
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.vwredsum.partial" &&
+      instruction != "rvv.vredsum.partial")
     return fail(operation,
                 "RVV final widened dot has no exact selected leaf");
   auto partial = materializeNumeric(operation.getPartial(),
@@ -7829,9 +7951,17 @@ mlir::LogicalResult Emitter::compileRVVFinalizeWidenDot(
   Binding result;
   result.kind = resultValue ? Binding::Kind::ScalarTuple : Binding::Kind::Scalar;
   const std::string partialSuffix = vectorSuffix(operation.getPartial());
+  auto partialElement = mlir::dyn_cast<mlir::IntegerType>(
+      operation.getPartial().getType().getElementType());
+  if (!partialElement ||
+      (partialElement.getWidth() != 16 && partialElement.getWidth() != 32))
+    return fail(operation,
+                "RVV final widened dot has no supported partial element width");
   for (int64_t part = 0; part < resultParts; ++part) {
     std::string reduced = fresh("widen_partial_sum");
-    line("vint32m1_t " + reduced + " = __riscv_vwredsum_vs_" +
+    line("vint32m1_t " + reduced + " = __riscv_" +
+         std::string(partialElement.getWidth() == 16 ? "vwredsum" : "vredsum") +
+         "_vs_" +
          partialSuffix + "_i32m1(" + partial->parts[part] + ", " + seed + ", " +
          partVL(operation.getPartial(), part) + ");");
     std::string scalarName = fresh("widen_partial_scalar");
@@ -8098,6 +8228,148 @@ Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
       static_cast<size_t>(vectorPartCount(operation.getResult())))
     return fail(operation,
                 "RVV layered stream did not produce every selected physical part");
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVProjectedLayeredStream(
+    riscv::RVVProjectedLayeredStreamOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "rvv.projected-layered-stream")
+    return fail(operation,
+                "projected RVV layered stream has no exact selected leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  Binding point = bindings.lookup(operation.getOrigin());
+  if (fieldBinding.kind != Binding::Kind::Field ||
+      point.kind != Binding::Kind::Point)
+    return fail(operation,
+                "projected RVV layered stream requires one encoded field and typed point");
+  fieldBinding.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  auto resultType = operation.getResult().getType();
+  auto reduction = llvm::find(resultType.getAxisIds().asArrayRef(),
+                              operation.getReductionAxis());
+  const int64_t reductionPosition =
+      reduction == resultType.getAxisIds().asArrayRef().end()
+          ? -1
+          : reduction - resultType.getAxisIds().asArrayRef().begin();
+  const int64_t group = operation.getAccess().getGroupSize();
+  const int64_t layer = operation.getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  const int64_t lanes = reductionPosition < 0
+                            ? 0
+                            : resultType.getLayout().getLaneFactors()[
+                                  static_cast<size_t>(reductionPosition)];
+  const int64_t streams = streamPartCount(operation.getResult());
+  const int64_t replicas = registerPartCount(operation.getResult());
+  if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
+      !field || !integer || integer.isSigned() || field->bitOffset % 8 ||
+      reductionPosition < 0 || group <= 0 || layer <= 0 || group % layer ||
+      layers <= 1 || lanes <= 1 || streams <= 1 || replicas <= 0 ||
+      operation.getProjectionStride() != 1 ||
+      operation.getProjectionRepeat() != 1)
+    return fail(operation,
+                "projected RVV layered stream has incomplete field or projection geometry");
+
+  const unsigned width = integer.getWidth();
+  const uint64_t mask = (uint64_t(1) << width) - 1;
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  llvm::SmallVector<int64_t, 4> axes =
+      registerAxesFor(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t replica = 0; replica < replicas; ++replica) {
+    auto coordinates = registerCoordinates(operation.getResult(), replica);
+    if (!coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "projected RVV layered stream has no register-coordinate mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "projected RVV layered stream free axis has no record stride");
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += ")";
+    const std::string recordGroup =
+        "(((" + point.point.base + ") % " +
+        std::to_string(owner.recordElements) + ") / " +
+        std::to_string(group) + ")";
+    llvm::StringMap<std::string> loadedWindows;
+    for (int64_t stream = 0; stream < streams; ++stream) {
+      const int64_t part = replica * streams + stream;
+      auto coordinate = timeCoordinate(operation.getResult(), part,
+                                       operation.getReductionAxis());
+      if (!coordinate)
+        return fail(operation,
+                    "projected RVV layered stream has no complete time coordinate");
+      const int64_t logicalOffset =
+          operation.getProjectionBase() + *coordinate * lanes;
+      const int64_t groupIndex = logicalOffset / group;
+      const int64_t withinGroup = logicalOffset % group;
+      const int64_t logicalLayer = withinGroup / layer;
+      const int64_t withinLayer = withinGroup % layer;
+      if (logicalLayer < 0 || logicalLayer >= layers || withinLayer < 0 ||
+          withinLayer + lanes > layer)
+        return fail(operation,
+                    "projected RVV layered stream crosses one storage layer");
+      const int64_t physicalLayer =
+          operation.getAccess().getOrder() == "lo_first"
+              ? logicalLayer
+              : layers - 1 - logicalLayer;
+      const std::string cacheKey =
+          std::to_string(groupIndex) + ":" + std::to_string(withinLayer);
+      auto cached = loadedWindows.find(cacheKey);
+      std::string raw;
+      const std::string vl = partVL(operation.getResult(), part);
+      if (cached != loadedWindows.end()) {
+        raw = cached->second;
+      } else {
+        const std::string byte =
+            "(" + std::to_string(field->bitOffset / 8) + " + (" +
+            recordGroup + " + " + std::to_string(groupIndex) + ") * " +
+            std::to_string(layer) + " + " + std::to_string(withinLayer) + ")";
+        raw = fresh("projected_layered_raw");
+        line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+             "((const uint8_t *)(" + record + " + " + byte + "), " + vl +
+             ");");
+        loadedWindows[cacheKey] = raw;
+      }
+      std::string value = raw;
+      if (physicalLayer != 0) {
+        std::string shifted = fresh("projected_layered_shift");
+        line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
+             value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+             ");");
+        value = std::move(shifted);
+      }
+      if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+        std::string masked = fresh("projected_layered_value");
+        line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
+             value + ", " + std::to_string(mask) + ", " + vl + ");");
+        value = std::move(masked);
+      }
+      result.parts.push_back(std::move(value));
+    }
+  }
+  if (result.parts.size() !=
+      static_cast<size_t>(vectorPartCount(operation.getResult())))
+    return fail(operation,
+                "projected RVV layered stream did not produce every physical part");
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }

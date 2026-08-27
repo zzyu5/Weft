@@ -48,6 +48,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
+      riscv::RVVProjectedLayeredStreamOp,
       riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
       riscv::RVVStreamContractOp, riscv::RVVSplatOp,
       riscv::ProjectReductionOperandOp, riscv::RVVContractStepOp,
@@ -74,6 +75,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
+      riscv::RVVProjectedLayeredStreamOp,
       riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
       riscv::RVVStreamContractOp, riscv::RVVSplatOp,
       riscv::ProjectReductionOperandOp,
@@ -711,7 +713,7 @@ public:
             riscv::RVVGroupedMacReduceOp,
             riscv::RVVGroupedMacStepOp,
             riscv::RVVEncodedDotStepOp, riscv::RVVLayeredWindowOp,
-            riscv::RVVLayeredStreamOp,
+            riscv::RVVLayeredStreamOp, riscv::RVVProjectedLayeredStreamOp,
             riscv::RVVContractStepOp,
             riscv::RVVEncodedContractStepOp>(operation);
         for (mlir::Value result : operation->getResults()) {

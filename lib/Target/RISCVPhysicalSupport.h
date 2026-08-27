@@ -109,6 +109,7 @@ mlir::Value stripRepresentationConversions(
 riscv::FieldOp sourceField(mlir::Value value);
 riscv::LoadOp sourceLoad(mlir::Value value);
 riscv::AccessAttr accessOf(mlir::Value value);
+riscv::PhysicalPointOp originPoint(mlir::Value value, int64_t axis);
 
 void copyOrigin(mlir::Operation *source, mlir::Operation *target);
 

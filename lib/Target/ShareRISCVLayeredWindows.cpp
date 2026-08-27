@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -230,6 +231,82 @@ bool isLayeredStreamField(riscv::FieldOp field) {
   return hasStreamAxis;
 }
 
+bool isProjectedLayeredExtract(
+    riscv::ExtractOp extract, riscv::FieldOp &field,
+    riscv::PhysicalPointOp &origin, int64_t &axis, int64_t &base,
+    int64_t &stride, int64_t &repeat, int64_t &extent,
+    llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions = nullptr) {
+  mlir::Value source = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), conversions);
+  field = source.getDefiningOp<riscv::FieldOp>();
+  auto input = field
+                   ? mlir::dyn_cast<riscv::ValueType>(field.getResult().getType())
+                   : riscv::ValueType();
+  auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  auto pattern = extract->getAttrOfType<mlir::DenseI64ArrayAttr>("index_pattern");
+  if (!field || !input || !result || !pattern || pattern.size() != 3 ||
+      input.getShape().size() != result.getShape().size() ||
+      extract.getAccess().getForm() != "indexed" ||
+      extract.getAccess().getMapping() != "grouped_layered")
+    return false;
+
+  size_t projection = extract.getSelectors().size();
+  bool hasRegular = false;
+  for (auto [position, selector] : llvm::enumerate(extract.getSelectors())) {
+    llvm::StringRef name = mlir::cast<mlir::StringAttr>(selector).getValue();
+    if (name == "regular") {
+      if (projection != extract.getSelectors().size())
+        return false;
+      projection = position;
+      hasRegular = true;
+    } else if (name != "all") {
+      return false;
+    }
+  }
+  if (!hasRegular || projection >= result.getShape().size() ||
+      projection >= result.getAxisIds().size() ||
+      !extract.getIndices().empty())
+    return false;
+
+  axis = result.getAxisIds()[projection];
+  base = pattern[0];
+  stride = pattern[1];
+  repeat = pattern[2];
+  extent = result.getShape()[projection];
+  origin = riscv_internal::originPoint(field.getOwner(), axis);
+  const int64_t sourceExtent = input.getShape()[projection];
+  const int64_t group = extract.getAccess().getGroupSize();
+  const int64_t layer = extract.getAccess().getLayerSize();
+  const int64_t lanes = result.getLayout().getLaneFactors()[projection];
+  const int64_t time = result.getLayout().getTimeFactors()[projection];
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
+  if (!origin || base < 0 || stride != 1 || repeat != 1 || extent <= 0 ||
+      sourceExtent <= 0 || group <= 0 || layer <= 0 || group % layer ||
+      layers <= 1 || base % group || extent % group || lanes <= 1 ||
+      layer % lanes || time <= 1 || time > std::numeric_limits<int64_t>::max() / lanes ||
+      time * lanes != extent || !element || element.isSigned() ||
+      element.getWidth() * layers > 8 ||
+      base > sourceExtent - extent ||
+      origin.getResult().getType().getDomain().getTail() != "exact" ||
+      result.getLayout().getCarrier() != "rvv")
+    return false;
+  if (conversions &&
+      !canFoldReadConversions(
+          extract, extract, *conversions,
+          llvm::ArrayRef<riscv::ConvertLayoutOp>{}))
+    return false;
+  for (size_t position = 0; position < result.getShape().size(); ++position) {
+    if (position == projection)
+      continue;
+    if (input.getShape()[position] != result.getShape()[position] ||
+        result.getLayout().getTimeFactors()[position] != 1 ||
+        result.getLayout().getLaneFactors()[position] != 1)
+      return false;
+  }
+  return true;
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -268,6 +345,48 @@ public:
                       rewriter.getStringAttr("weft_kernel.field"));
       field.getResult().replaceAllUsesExcept(stream.getResult(),
                                              stream.getOperation());
+    }
+
+    llvm::SmallVector<riscv::ExtractOp> projectedExtracts;
+    getOperation().walk(
+        [&](riscv::ExtractOp extract) { projectedExtracts.push_back(extract); });
+    for (riscv::ExtractOp extract : projectedExtracts) {
+      riscv::FieldOp field;
+      riscv::PhysicalPointOp origin;
+      llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
+      int64_t axis = 0;
+      int64_t base = 0;
+      int64_t stride = 0;
+      int64_t repeat = 0;
+      int64_t extent = 0;
+      if (!isProjectedLayeredExtract(extract, field, origin, axis, base, stride,
+                                     repeat, extent, &conversions))
+        continue;
+      auto type = mlir::cast<riscv::ValueType>(extract.getResult().getType());
+      const int64_t resultGroups = type.getLayout().getRegisterGroups();
+      const int64_t temporaryGroups =
+          std::max<int64_t>(1, (type.getLayout().getLmulEighths() + 7) / 8);
+      const bool tail = type.getLayout().getValidity() == "tail";
+      rewriter.setInsertionPoint(extract);
+      auto stream = rewriter.create<riscv::RVVProjectedLayeredStreamOp>(
+          extract.getLoc(), type, field.getResult(), origin.getResult(), axis,
+          base, stride, repeat, extent, extract.getAccess(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "projected-layered-stream",
+              "rvv.projected-layered-stream", "rvv.projected-layered-stream",
+              mlir::cast<riscv::ValueType>(field.getResult().getType())
+                  .getLayout()
+                  .getRegisterGroups(),
+              resultGroups, temporaryGroups, 0, "none",
+              tail ? "agnostic" : "exact"));
+      riscv_internal::copyOrigin(extract, stream);
+      if (auto canonical = extract->getAttr("canonical_op"))
+        stream->setAttr("canonical_op", canonical);
+      extract.getResult().replaceAllUsesWith(stream.getResult());
+      rewriter.eraseOp(extract);
+      for (riscv::ConvertLayoutOp conversion : llvm::reverse(conversions))
+        if (conversion.getResult().use_empty())
+          rewriter.eraseOp(conversion);
     }
 
     llvm::SmallVector<riscv::ExtractOp> extracts;

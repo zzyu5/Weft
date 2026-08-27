@@ -198,9 +198,7 @@ else
       kernel=production_mul_mat_q4_k_decode
       runtime_kernel_define=-DWEFT_Q4K_DECODE=1
     else
-      physical=(--auto-unroll=4 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q4_k
-      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=2)
     fi
   elif [[ ${format} == q5_k ]]; then
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)

@@ -882,6 +882,11 @@ def WeftRISCV_RVVStorageWindowOp
                        WeftRISCV_PointType:$origin,
                        Index:$logical_offset,
                        I64Attr:$reduction_axis,
+                       I64Attr:$projection_base,
+                       I64Attr:$projection_stride,
+                       I64Attr:$projection_repeat,
+                       I64Attr:$projection_extent,
+                       I64Attr:$offset_alignment,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
@@ -894,6 +899,8 @@ def WeftRISCV_RVVLayeredStorageLoadOp
                        WeftRISCV_PointType:$origin,
                        Index:$window_index,
                        I64Attr:$reduction_axis,
+                       I64Attr:$projection_base,
+                       I64Attr:$projection_extent,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_LayeredWindowType:$result);
@@ -967,6 +974,22 @@ def WeftRISCV_RVVLayeredWindowOp
 def WeftRISCV_RVVLayeredStreamOp
     : WeftRISCV_Op<"rvv_layered_stream", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVProjectedLayeredStreamOp
+    : WeftRISCV_Op<"rvv_projected_layered_stream",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       I64Attr:$reduction_axis,
+                       I64Attr:$projection_base,
+                       I64Attr:$projection_stride,
+                       I64Attr:$projection_repeat,
+                       I64Attr:$projection_extent,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);

@@ -456,7 +456,10 @@ def mul_mat_q4_k(
     Xq: View[Q8_K, (M, K)],
     Y: View[f32, (M, N)],
 ):
-    mul_mat_q4_k_staged(W, X, Xq, Y)
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(vec_dot_q4_k_q8_k(W[column], Xq[row]), Y[row, column])
 
 
 def mul_mat_q4_k_decode(
