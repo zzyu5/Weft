@@ -904,6 +904,11 @@ public:
       independentDots.push_back(dot);
     });
     for (riscv::RVVWidenDotOp dot : independentDots) {
+      // A fused stream owns its storage-window and reduction topology.  Leave
+      // it for the typed layered-stream materialization below instead of
+      // reinterpreting its sequential stream slots as independent partials.
+      if (dot.getStreamReduction() == "fused")
+        continue;
       if (dot.getOver().size() != 1)
         continue;
       const int64_t reductionAxis = dot.getOver()[0];
