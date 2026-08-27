@@ -780,6 +780,17 @@ def WeftRISCV_RVVBitplaneMergeOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVBitmaskDecodeOp
+    : WeftRISCV_Op<"rvv_bitmask_decode", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       WeftRISCV_PointType:$point,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVGroupedMacReduceOp
     : WeftRISCV_Op<"rvv_grouped_mac_reduce", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
@@ -880,6 +891,15 @@ def WeftRISCV_RVVLayeredWindowOp
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$first,
                       WeftRISCV_ValueType:$second);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVLayeredStreamOp
+    : WeftRISCV_Op<"rvv_layered_stream", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 

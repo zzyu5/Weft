@@ -1737,9 +1737,15 @@ private:
         const int64_t partialGroups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
         const int64_t outputParts =
             resultType ? product(resultType.getLayout().getReplicaFactors()) : 1;
+        // RVVWidenDot emits output replicas sequentially.  Only the partials
+        // for one output, the reduction seed, and the reduction result are
+        // simultaneously live.  Per-stream reduction retains one partial per
+        // time part; fused reduction retains only one accumulated partial.
+        const int64_t livePartials =
+            streamReduction == "fused" ? 1 : streams;
         const int64_t temporaryGroups =
-            sum(product({outputParts, partialGroups}), 1);
-        if (outputParts <= 0 || temporaryGroups <= 0) {
+            sum(product({livePartials, partialGroups}), 2);
+        if (outputParts <= 0 || livePartials <= 0 || temporaryGroups <= 0) {
           operation->emitError(
               "selected RVV widening dot has invalid result/resource geometry");
           failed = true;

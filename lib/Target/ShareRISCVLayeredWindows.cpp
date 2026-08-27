@@ -12,6 +12,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -194,6 +195,41 @@ bool sameFieldEdge(riscv::FieldOp lhs, riscv::FieldOp rhs) {
          left.alignment == right.alignment && left.order == right.order;
 }
 
+bool isLayeredStreamField(riscv::FieldOp field) {
+  auto value = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+  auto element = value
+                     ? mlir::dyn_cast<mlir::IntegerType>(value.getElementType())
+                     : mlir::IntegerType();
+  riscv::AccessAttr access = field.getAccess();
+  const int64_t group = access ? access.getGroupSize() : 0;
+  const int64_t layer = access ? access.getLayerSize() : 0;
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  if (!value || !element || element.isSigned() || !access ||
+      value.getLayout().getCarrier() != "rvv" ||
+      access.getForm() != "indexed" ||
+      access.getMapping() != "grouped_layered" ||
+      group <= 0 || layer <= 0 || group % layer || layers <= 1 ||
+      element.getWidth() * layers > 8 || access.getBitOffset() % 8)
+    return false;
+  bool hasStreamAxis = false;
+  for (size_t index = 0; index < value.getShape().size(); ++index) {
+    const int64_t extent = value.getShape()[index];
+    const int64_t time = value.getLayout().getTimeFactors()[index];
+    const int64_t lanes = value.getLayout().getLaneFactors()[index];
+    const bool streamAxis = extent > 0 && extent % group == 0 && lanes > 1 &&
+                            layer % lanes == 0 && time > 1 &&
+                            time * lanes == extent;
+    if (streamAxis) {
+      if (hasStreamAxis)
+        return false;
+      hasStreamAxis = true;
+    } else if (time != 1 || lanes != 1) {
+      return false;
+    }
+  }
+  return hasStreamAxis;
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -206,11 +242,38 @@ public:
   }
 
   void runOnOperation() override {
+    mlir::IRRewriter rewriter(&getContext());
+    llvm::SmallVector<riscv::FieldOp> fields;
+    getOperation().walk(
+        [&](riscv::FieldOp field) { fields.push_back(field); });
+    for (riscv::FieldOp field : fields) {
+      if (!isLayeredStreamField(field))
+        continue;
+      auto type = mlir::cast<riscv::ValueType>(field.getResult().getType());
+      const int64_t resultGroups = type.getLayout().getRegisterGroups();
+      const int64_t temporaryGroups =
+          std::max<int64_t>(1,
+                            (type.getLayout().getLmulEighths() + 7) / 8);
+      const bool tail = type.getLayout().getValidity() == "tail";
+      rewriter.setInsertionPointAfter(field);
+      auto stream = rewriter.create<riscv::RVVLayeredStreamOp>(
+          field.getLoc(), type, field.getResult(), field.getAccess(),
+          riscv_internal::leaf(rewriter, "rvv", "layered-stream",
+                               "rvv.layered-stream", "rvv.layered-stream", 0,
+                               resultGroups, temporaryGroups, 0, "none",
+                               tail ? "agnostic" : "exact"));
+      if (auto origin = field->getAttr("source_origin"))
+        stream->setAttr("source_origin", origin);
+      stream->setAttr("canonical_op",
+                      rewriter.getStringAttr("weft_kernel.field"));
+      field.getResult().replaceAllUsesExcept(stream.getResult(),
+                                             stream.getOperation());
+    }
+
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(
         [&](riscv::ExtractOp extract) { extracts.push_back(extract); });
     llvm::DenseSet<mlir::Operation *> consumed;
-    mlir::IRRewriter rewriter(&getContext());
 
     for (riscv::ExtractOp first : extracts) {
       if (consumed.contains(first))

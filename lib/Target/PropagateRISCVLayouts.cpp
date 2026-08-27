@@ -25,6 +25,7 @@ namespace {
 struct Roles {
   int64_t laneAxis = 0;
   llvm::SmallSet<int64_t, 4> replicaAxes;
+  llvm::SmallSet<int64_t, 4> sequentialAxes;
   bool ime = false;
   bool local = false;
   bool anchored = false;
@@ -40,7 +41,8 @@ bool containsAxis(mlir::Type type, int64_t axis) {
 void addSmallReplicas(mlir::Value value, Roles &roles, int64_t except = 0) {
   for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
     if (int64_t extent = riscv_internal::physicalExtent(value, axis);
-        axis != except && extent > 0 && extent <= 16)
+        axis != except && !roles.sequentialAxes.contains(axis) && extent > 0 &&
+        extent <= 16)
       roles.replicaAxes.insert(axis);
 }
 
@@ -142,6 +144,42 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
   roles.anchored = true;
   roles.fullLaneExtent = true;
   auto reduction = operation.getOver();
+  int64_t reductionElements = 1;
+  bool completeReduction = !reduction.empty();
+  for (int64_t axis : reduction) {
+    if (!containsAxis(value.getType(), axis)) {
+      completeReduction = false;
+      break;
+    }
+    const int64_t extent = riscv_internal::physicalExtent(value, axis);
+    if (extent <= 0) {
+      completeReduction = false;
+      break;
+    }
+    reductionElements *= extent;
+  }
+  auto kernel = value.getParentRegion()->getParentOfType<riscv::KernelOp>();
+  const int64_t sew =
+      std::max<int64_t>(8, riscv_internal::logicalBitWidth(value.getType()));
+  const int64_t baseLanes =
+      kernel && sew > 0 ? kernel.getTarget().getVlenBits() / sew : 0;
+  // A contraction shorter than one base RVV vector whose operand already
+  // carries one vector-sized free axis is an outer-product issue: keep that
+  // free axis in lanes and advance the reduction in time.  Materializing the
+  // short reduction axis instead would create one vector replica per output
+  // only to extract those replicas again in the contract-step lowering.
+  if (completeReduction && baseLanes > 1 && reductionElements < baseLanes)
+    for (int64_t axis : riscv_internal::logicalAxes(value.getType())) {
+      const int64_t extent = riscv_internal::physicalExtent(value, axis);
+      if (!llvm::is_contained(reduction, axis) && extent > 1 &&
+          extent <= baseLanes) {
+        roles.laneAxis = axis;
+        for (int64_t reductionAxis : reduction)
+          if (containsAxis(value.getType(), reductionAxis))
+            roles.sequentialAxes.insert(reductionAxis);
+        return;
+      }
+    }
   for (int64_t axis : reduction)
     if (containsAxis(value.getType(), axis)) {
       roles.laneAxis = axis;
@@ -291,8 +329,15 @@ bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
   }
   for (int64_t axis : source.replicaAxes)
     if (axis != destination.laneAxis && llvm::is_contained(axes, axis) &&
+        !destination.sequentialAxes.contains(axis) &&
         destination.replicaAxes.insert(axis).second)
       changed = true;
+  for (int64_t axis : source.sequentialAxes)
+    if (llvm::is_contained(axes, axis) &&
+        destination.sequentialAxes.insert(axis).second) {
+      destination.replicaAxes.erase(axis);
+      changed = true;
+    }
   if (source.anchored && !destination.anchored) {
     destination.anchored = true;
     changed = true;

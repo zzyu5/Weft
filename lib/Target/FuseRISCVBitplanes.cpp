@@ -9,6 +9,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -41,6 +42,53 @@ struct BitplaneRelation {
   int64_t insertBit = 0;
   llvm::StringRef instruction;
 };
+
+struct BitmaskRelation {
+  riscv::FieldOp field;
+  riscv::PhysicalPointOp origin;
+  riscv::PhysicalPointOp point;
+};
+
+std::optional<BitmaskRelation>
+matchBitmaskDecode(riscv::ConvertLayoutOp conversion) {
+  if (!conversion || conversion.getConversion().getEffect() != "pure" ||
+      conversion.getConversion().getKind() != "time_to_lane")
+    return std::nullopt;
+  auto extract = conversion.getInput().getDefiningOp<riscv::ExtractOp>();
+  auto field = extract ? extract.getInput().getDefiningOp<riscv::FieldOp>()
+                       : riscv::FieldOp();
+  auto result = mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
+  auto element = result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+                        : mlir::IntegerType();
+  if (!extract || !field || !result || !element || element.isSigned() ||
+      element.getWidth() != 1 || result.getLayout().getCarrier() != "rvv" ||
+      extract.getIndices().size() != 1)
+    return std::nullopt;
+
+  riscv::PhysicalPointOp point;
+  size_t cursor = 0;
+  for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
+    llvm::StringRef selector =
+        mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+    if (selector == "all")
+      continue;
+    if (cursor >= extract.getIndices().size() || selector != "domain" || point)
+      return std::nullopt;
+    point = extract.getIndices()[cursor++].getDefiningOp<riscv::PhysicalPointOp>();
+  }
+  auto origin = point
+                    ? point.getParent().getDefiningOp<riscv::PhysicalPointOp>()
+                    : riscv::PhysicalPointOp();
+  if (!point || !origin || cursor != extract.getIndices().size())
+    return std::nullopt;
+
+  riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+  if (facts.mapping != "grouped_layered" || facts.group <= 0 ||
+      facts.layer <= 0 || facts.group != facts.layer * 8 ||
+      facts.bitOffset % 8 || facts.order != "lo_first")
+    return std::nullopt;
+  return BitmaskRelation{field, origin, point};
+}
 
 std::optional<BitplaneRelation>
 matchLogicalBitplane(riscv::BinaryOp merge, mlir::Value low,
@@ -294,12 +342,42 @@ public:
   }
 
   void runOnOperation() override {
+    llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
+    getOperation().walk([&](riscv::ConvertLayoutOp operation) {
+      conversions.push_back(operation);
+    });
+    mlir::IRRewriter rewriter(&getContext());
+    for (riscv::ConvertLayoutOp conversion : conversions) {
+      auto relation = matchBitmaskDecode(conversion);
+      if (!relation)
+        continue;
+      auto result = conversion.getResult().getType();
+      const int64_t resultGroups = result.getLayout().getRegisterGroups();
+      const int64_t temporaryGroups = std::max<int64_t>(
+          1, (result.getLayout().getLmulEighths() + 7) / 8);
+      const bool tail = result.getLayout().getValidity() == "tail";
+      rewriter.setInsertionPoint(conversion);
+      auto decoded = rewriter.create<riscv::RVVBitmaskDecodeOp>(
+          conversion.getLoc(), result, relation->field.getResult(),
+          relation->origin.getResult(), relation->point.getResult(),
+          relation->field.getAccess(),
+          riscv_internal::leaf(rewriter, "rvv", "bitmask-decode",
+                               "rvv.bitmask-decode", "rvv.bitmask-decode", 0,
+                               resultGroups, temporaryGroups, 0, "none",
+                               tail ? "agnostic" : "exact"));
+      riscv_internal::copyOrigin(conversion, decoded);
+      decoded->setAttr("canonical_op",
+                       rewriter.getStringAttr("weft_kernel.extract"));
+      mlir::Value oldInput = conversion.getInput();
+      rewriter.replaceOp(conversion, decoded.getResult());
+      eraseDeadTree(oldInput, rewriter);
+    }
+
     llvm::SmallVector<riscv::BinaryOp> merges;
     getOperation().walk([&](riscv::BinaryOp operation) {
       if (operation.getKind() == "or")
         merges.push_back(operation);
     });
-    mlir::IRRewriter rewriter(&getContext());
     for (riscv::BinaryOp merge : merges) {
       auto relation = matchBitplane(merge, merge.getLhs(), merge.getRhs());
       if (!relation)

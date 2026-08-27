@@ -613,6 +613,8 @@ private:
   mlir::LogicalResult
   compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation);
   mlir::LogicalResult
+  compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation);
+  mlir::LogicalResult
   compileGroupedMacReduce(riscv::RVVGroupedMacReduceOp operation);
   mlir::LogicalResult
   compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation);
@@ -629,6 +631,8 @@ private:
       riscv::RVVPartitionedWidenReduceStoreOp operation);
   mlir::LogicalResult
   compileRVVLayeredWindow(riscv::RVVLayeredWindowOp operation);
+  mlir::LogicalResult
+  compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation);
   mlir::LogicalResult
   compileRVVStreamReduce(riscv::RVVStreamReduceOp operation);
   mlir::LogicalResult compileRVVStreamDot(riscv::RVVStreamDotOp operation);
@@ -2039,6 +2043,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileFold2(fold);
   if (auto merge = mlir::dyn_cast<riscv::RVVBitplaneMergeOp>(operation))
     return compileRVVBitplaneMerge(merge);
+  if (auto decode = mlir::dyn_cast<riscv::RVVBitmaskDecodeOp>(operation))
+    return compileRVVBitmaskDecode(decode);
   if (auto reduce = mlir::dyn_cast<riscv::RVVGroupedMacReduceOp>(operation))
     return compileGroupedMacReduce(reduce);
   if (auto load = mlir::dyn_cast<riscv::RVVGroupedMacLoadOp>(operation))
@@ -2058,6 +2064,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVPartitionedWidenReduceStore(reduce);
   if (auto window = mlir::dyn_cast<riscv::RVVLayeredWindowOp>(operation))
     return compileRVVLayeredWindow(window);
+  if (auto stream = mlir::dyn_cast<riscv::RVVLayeredStreamOp>(operation))
+    return compileRVVLayeredStream(stream);
   if (auto reduce = mlir::dyn_cast<riscv::RVVStreamReduceOp>(operation))
     return compileRVVStreamReduce(reduce);
   if (auto dot = mlir::dyn_cast<riscv::RVVStreamDotOp>(operation))
@@ -6651,6 +6659,90 @@ Emitter::compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult
+Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.bitmask-decode")
+    return fail(operation, "RVV bitmask decode has no exact selected leaf");
+  Binding packed = bindings.lookup(operation.getField());
+  Binding origin = bindings.lookup(operation.getOrigin());
+  Binding point = bindings.lookup(operation.getPoint());
+  if (packed.kind != Binding::Kind::Field ||
+      origin.kind != Binding::Kind::Point || point.kind != Binding::Kind::Point)
+    return fail(operation,
+                "RVV bitmask decode requires one encoded field and two typed points");
+  Binding owner = bindings.lookup(packed.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    mlir::FailureOr<Binding> record = recordForSlice(packed.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(packed);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      !field || !integer || !integer.isUnsigned() || integer.getWidth() != 1 ||
+      field->access.getMapping() != "grouped_layered" ||
+      field->access.getOrder() != "lo_first" || field->bitOffset % 8 ||
+      field->access.getGroupSize() != field->access.getLayerSize() * 8)
+    return fail(operation,
+                "RVV bitmask decode field has no direct contiguous mask address");
+
+  auto layout = operation.getResult().getType().getLayout();
+  const int64_t maskBits = layout.getSew() * 8 / layout.getLmulEighths();
+  if (maskBits != 1 && maskBits != 2 && maskBits != 4 && maskBits != 8 &&
+      maskBits != 16 && maskBits != 32 && maskBits != 64)
+    return fail(operation, "RVV bitmask decode selected an illegal mask ratio");
+  const int64_t group = field->access.getGroupSize();
+  const int64_t layer = field->access.getLayerSize();
+  const int64_t parts = vectorPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  const std::string maskType =
+      "vbool" + std::to_string(maskBits) + "_t";
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / streams);
+    if (!coordinates || coordinates->size() != registerAxes.size())
+      return fail(operation,
+                  "RVV bitmask decode lacks a typed register mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "RVV bitmask decode register axis has no record-byte stride");
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    const std::string relative =
+        "((" + point.point.base + ") - (" + origin.point.base + ") + " +
+        partOffset(operation.getResult(), part) + ")";
+    record += " + " + std::to_string(field->bitOffset / 8) + " + ((" +
+              relative + ") / " + std::to_string(group) + ") * " +
+              std::to_string(layer) + ")";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string mask = fresh("bitmask");
+    line(maskType + " " + mask + " = __riscv_vlm_v_b" +
+         std::to_string(maskBits) + "((const uint8_t *)(" + record + "), " +
+         vl + ");");
+    std::string decoded = fresh("bitmask_decode");
+    line(type + " " + decoded + " = __riscv_vmerge_vxm_" + suffix +
+         "(__riscv_vmv_v_x_" + suffix + "(0, " + vl + "), 1, " + mask +
+         ", " + vl + ");");
+    result.parts.push_back(std::move(decoded));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileGroupedMacReduce(
     riscv::RVVGroupedMacReduceOp operation) {
   if (operation.getLeaf().getInstruction() !=
@@ -7487,6 +7579,136 @@ mlir::LogicalResult Emitter::compileRVVPartitionedWidenReduceStore(
              ? "*(int16_t *)(" + address + ") = " + scalarName + ";"
              : "weft_store_i16_le(" + address + ", " + scalarName + ");");
   }
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.layered-stream")
+    return fail(operation, "RVV layered stream has no exact selected leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  if (fieldBinding.kind != Binding::Kind::Field)
+    return fail(operation, "RVV layered stream requires one encoded field edge");
+  fieldBinding.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    mlir::FailureOr<Binding> record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  auto resultType = operation.getResult().getType();
+  const int64_t group = operation.getAccess().getGroupSize();
+  const int64_t layer = operation.getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  const int64_t streams = streamPartCount(operation.getResult());
+  const int64_t replicas = registerPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> axes =
+      registerAxesFor(operation.getResult());
+  int64_t streamAxis = 0;
+  int64_t streamAxes = 0;
+  for (size_t index = 0; index < resultType.getShape().size(); ++index)
+    if (resultType.getLayout().getTimeFactors()[index] > 1 &&
+        resultType.getLayout().getLaneFactors()[index] > 1) {
+      streamAxis = resultType.getAxisIds()[index];
+      ++streamAxes;
+    }
+  if (owner.kind != Binding::Kind::Record || !field || !integer ||
+      integer.isSigned() || field->bitOffset % 8 || layer <= 0 ||
+      group <= 0 || group % layer || layers <= 1 ||
+      integer.getWidth() * layers > 8 || streamAxes != 1 || streams <= 1 ||
+      replicas <= 0)
+    return fail(operation,
+                "RVV layered stream has incomplete field, record, or layout geometry");
+
+  const unsigned width = integer.getWidth();
+  const uint64_t mask = (uint64_t(1) << width) - 1;
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t replica = 0; replica < replicas; ++replica) {
+    auto coordinates = registerCoordinates(operation.getResult(), replica);
+    if (!coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "RVV layered stream has no register-coordinate mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      bool foundStride = false;
+      for (const auto &[recordAxis, stride] : owner.recordByteStrides)
+        if (recordAxis == axis) {
+          record += " + " + std::to_string(coordinate) + " * " + stride;
+          foundStride = true;
+        }
+      if (!foundStride)
+        return fail(operation,
+                    "RVV layered stream register axis has no record-byte stride");
+    }
+    record += ")";
+    llvm::StringMap<std::string> loadedWindows;
+    for (int64_t stream = 0; stream < streams; ++stream) {
+      const int64_t part = replica * streams + stream;
+      auto coordinate = timeCoordinate(operation.getResult(), part, streamAxis);
+      if (!coordinate)
+        return fail(operation,
+                    "RVV layered stream has no complete time coordinate");
+      const int64_t logicalOffset = *coordinate * physicalLanes(operation.getResult());
+      const int64_t groupIndex = logicalOffset / group;
+      const int64_t withinGroup = logicalOffset % group;
+      const int64_t logicalLayer = withinGroup / layer;
+      const int64_t withinLayer = withinGroup % layer;
+      if (logicalLayer < 0 || logicalLayer >= layers || withinLayer < 0 ||
+          withinLayer + physicalLanes(operation.getResult()) > layer)
+        return fail(operation,
+                    "RVV layered stream time/lane decomposition crosses a storage layer");
+      const int64_t physicalLayer =
+          operation.getAccess().getOrder() == "lo_first"
+              ? logicalLayer
+              : layers - 1 - logicalLayer;
+      const int64_t byteOffset = field->bitOffset / 8 + groupIndex * layer +
+                                 withinLayer;
+      const std::string vl = partVL(operation.getResult(), part);
+      // Time coordinates visit logical layers in order.  For one storage
+      // byte window the first visit therefore has at least as many active
+      // lanes as every later layer that shares it, so the raw load can be
+      // reused while each decode still uses its own selected VL.
+      const std::string cacheKey = std::to_string(byteOffset);
+      auto cached = loadedWindows.find(cacheKey);
+      std::string raw;
+      if (cached != loadedWindows.end()) {
+        raw = cached->second;
+      } else {
+        raw = fresh("layered_stream_raw");
+        line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+             "((const uint8_t *)(" + record + " + " +
+             std::to_string(byteOffset) + "), " + vl + ");");
+        loadedWindows[cacheKey] = raw;
+      }
+      std::string value = raw;
+      if (physicalLayer != 0) {
+        std::string shifted = fresh("layered_stream_shift");
+        line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
+             value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+             ");");
+        value = std::move(shifted);
+      }
+      if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+        std::string masked = fresh("layered_stream_value");
+        line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
+             value + ", " + std::to_string(mask) + ", " + vl + ");");
+        value = std::move(masked);
+      }
+      result.parts.push_back(std::move(value));
+    }
+  }
+  if (result.parts.size() !=
+      static_cast<size_t>(vectorPartCount(operation.getResult())))
+    return fail(operation,
+                "RVV layered stream did not produce every selected physical part");
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

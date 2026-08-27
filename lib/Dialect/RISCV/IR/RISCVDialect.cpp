@@ -2431,6 +2431,98 @@ mlir::LogicalResult RVVBitplaneMergeOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto resultElement = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto origin = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto point = getPoint().getDefiningOp<PhysicalPointOp>();
+  const int64_t axis = getPoint().getType().getDomain().getAxisId();
+  auto position = llvm::find(result.getAxisIds().asArrayRef(), axis);
+  const bool hasAxis = position != result.getAxisIds().asArrayRef().end();
+  const size_t axisPosition = hasAxis
+                                  ? static_cast<size_t>(
+                                        position -
+                                        result.getAxisIds().asArrayRef().begin())
+                                  : 0;
+  const int64_t extent = hasAxis ? result.getShape()[axisPosition] : 0;
+  auto partition = point
+                       ? point.getPartition().getDefiningOp<
+                             mlir::arith::ConstantIndexOp>()
+                       : mlir::arith::ConstantIndexOp();
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  bool compatibleShape = field.getAxisIds() == result.getAxisIds() &&
+                         field.getShape().size() == result.getShape().size();
+  if (compatibleShape)
+    for (size_t index = 0; index < field.getShape().size(); ++index) {
+      if (index == axisPosition)
+        compatibleShape &= field.getShape()[index] >= extent;
+      else
+        compatibleShape &= field.getShape()[index] == result.getShape()[index];
+    }
+  bool onlyPointAxisIsStreamed = hasAxis;
+  if (onlyPointAxisIsStreamed)
+    for (size_t index = 0; index < result.getShape().size(); ++index)
+      if (index != axisPosition)
+        onlyPointAxisIsStreamed &=
+            result.getLayout().getTimeFactors()[index] == 1 &&
+            result.getLayout().getLaneFactors()[index] == 1;
+
+  bool ownerAnchoredAtOrigin = false;
+  if (sourceField && origin) {
+    if (auto owner = sourceField.getOwner().getDefiningOp<ExtractOp>()) {
+      auto ownerInput = mlir::dyn_cast<ValueType>(owner.getInput().getType());
+      size_t cursor = 0;
+      for (auto [position, selectorAttribute] :
+           llvm::enumerate(owner.getSelectors())) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (cursor >= owner.getIndices().size())
+          break;
+        mlir::Value index = owner.getIndices()[cursor++];
+        if (ownerInput && position < ownerInput.getAxisIds().size() &&
+            ownerInput.getAxisIds()[position] == axis && selector == "domain" &&
+            index == getOrigin())
+          ownerAnchoredAtOrigin = true;
+      }
+    }
+  }
+  if (!fieldElement || fieldElement.isSigned() || fieldElement.getWidth() != 1 ||
+      !resultElement || resultElement.isSigned() ||
+      resultElement.getWidth() != 1 || !sourceField || !origin || !point ||
+      !partition || !hasAxis || extent <= 0 || partition.value() != extent ||
+      point.getParent() != getOrigin() ||
+      point.getResult().getType().getDomain().getAxisId() !=
+          origin.getResult().getType().getDomain().getAxisId() ||
+      !ownerAnchoredAtOrigin || !compatibleShape || !onlyPointAxisIsStreamed ||
+      getAccess() != sourceField.getAccess() ||
+      getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "grouped_layered" ||
+      getAccess().getGroupSize() <= 0 || getAccess().getLayerSize() <= 0 ||
+      getAccess().getGroupSize() != getAccess().getLayerSize() * 8 ||
+      getAccess().getOrder() != "lo_first" ||
+      getAccess().getBitOffset() % 8 ||
+      extent % getAccess().getGroupSize() ||
+      result.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getLaneFactors()[axisPosition] %
+          getAccess().getGroupSize() ||
+      result.getLayout().getTimeFactors()[axisPosition] *
+              result.getLayout().getLaneFactors()[axisPosition] !=
+          extent ||
+      (validity != "full" && validity != "tail") ||
+      !exactLeaf(getLeaf(), "rvv", "bitmask-decode", "rvv.bitmask-decode",
+                 "none", tail))
+    return emitOpError(
+        "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
+        "an explicitly anchored sub-Level point, and a complete time/lane result");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
   auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
   auto resultParts = physicalPartCount(getResult().getType());
@@ -2786,6 +2878,52 @@ mlir::LogicalResult RVVLayeredWindowOp::verify() {
     return emitOpError(
         "RVV layered window requires two equal full/tail layer results, one "
         "two-layer packed field, and an identical exact layer-sized point");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVLayeredStreamOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  const int64_t group = getAccess().getGroupSize();
+  const int64_t layer = getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  bool hasStreamAxis = false;
+  bool onlyOneStreamAxis = true;
+  for (size_t index = 0; index < field.getShape().size(); ++index) {
+    const int64_t extent = field.getShape()[index];
+    const int64_t time = field.getLayout().getTimeFactors()[index];
+    const int64_t lanes = field.getLayout().getLaneFactors()[index];
+    const bool streamAxis =
+        group > 0 && layer > 0 && extent > 0 && extent % group == 0 &&
+        lanes > 1 && layer % lanes == 0 && time > 1 &&
+        time * lanes == extent;
+    if (streamAxis) {
+      onlyOneStreamAxis &= !hasStreamAxis;
+      hasStreamAxis = true;
+    } else {
+      onlyOneStreamAxis &= time == 1 && lanes == 1;
+    }
+  }
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  if (!element || element.isSigned() || !sourceField ||
+      getAccess() != sourceField.getAccess() || field != result ||
+      field.getLayout().getCarrier() != "rvv" || !hasStreamAxis ||
+      !onlyOneStreamAxis ||
+      (validity != "full" && validity != "tail") ||
+      getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "grouped_layered" || group <= 0 ||
+      layer <= 0 || group % layer || layers <= 1 ||
+      element.getWidth() * layers > 8 || getAccess().getBitOffset() % 8 ||
+      (getAccess().getOrder() != "lo_first" &&
+       getAccess().getOrder() != "hi_first") ||
+      !exactLeaf(getLeaf(), "rvv", "layered-stream", "rvv.layered-stream",
+                 "none", tail))
+    return emitOpError(
+        "RVV layered stream requires one byte-aligned packed field whose "
+        "grouped/layered geometry is represented by one complete time/lane axis");
   return mlir::success();
 }
 
