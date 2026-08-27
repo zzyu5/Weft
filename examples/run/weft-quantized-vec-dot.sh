@@ -26,6 +26,11 @@ if [[ ${format_id} -lt 0 ]]; then
   exit 2
 fi
 kernel="quantized_vec_dot_${format}_${partners[format_id]}"
+runtime_kernel_define=
+if [[ ${target} == sg2044 && ${format} == q2_k ]]; then
+  kernel=quantized_vec_dot_q2_k_q8_k_group_reduced
+  runtime_kernel_define=-DWEFT_Q2K_GROUP_REDUCED=1
+fi
 physical_auto=()
 if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
   physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
@@ -137,7 +142,7 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -c kernel.c -o kernel.o
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror \
       -Wno-unused-const-variable -ffp-contract=fast \${extra_flags} \
-      \${runtime_target_define} \
+      \${runtime_target_define} ${runtime_kernel_define} \
       -DWEFT_VEC_DOT_FORMAT=\"\${format_id}\" \
       -march=\"\${march}\" -mabi=lp64d \
       -I\"\${source_root}/ggml/include\" \

@@ -278,11 +278,21 @@ constexpr int kElements = 256;
 #define selected_reference ggml_vec_dot_q2_K_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
 #if defined(WEFT_Q2K_DECODE)
+#if defined(WEFT_Q2K_GROUP_REDUCED)
+extern "C" void production_mul_mat_q2_k_group_reduced_decode(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_q2_k_group_reduced_decode(w, x, xq, y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_q2_k_decode(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q2_k_decode(w, x, xq, y, kN, kK, runtimeM)
+#endif
+#else
+#if defined(WEFT_Q2K_GROUP_REDUCED)
+extern "C" void production_mul_mat_q2_k_group_reduced(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_q2_k_group_reduced(w, x, xq, y, kN, kK, runtimeM)
 #else
 extern "C" void production_mul_mat_q2_k(const std::uint8_t *, const float *, std::uint8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_q2_k(w, x, xq, y, kN, kK, runtimeM)
+#endif
 #endif
 #elif WEFT_MUL_MAT_FORMAT == 8
 using selected_weight = block_q3_K;

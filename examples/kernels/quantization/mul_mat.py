@@ -54,6 +54,8 @@ from weft.std.mul_mat import (
     mul_mat_q1_0_decode,
     mul_mat_q2_k,
     mul_mat_q2_k_decode,
+    mul_mat_q2_k_group_reduced,
+    mul_mat_q2_k_group_reduced_decode,
     mul_mat_q3_k,
     mul_mat_q4_0,
     mul_mat_q4_0_decode,
@@ -220,6 +222,20 @@ def production_mul_mat_q2_k_decode(
     W: View[Q2_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
 ):
     mul_mat_q2_k_decode(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q2_k_group_reduced(
+    W: View[Q2_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
+):
+    mul_mat_q2_k_group_reduced(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q2_k_group_reduced_decode(
+    W: View[Q2_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
+):
+    mul_mat_q2_k_group_reduced_decode(W, X, Xq, Y)
 
 
 @weft.kernel

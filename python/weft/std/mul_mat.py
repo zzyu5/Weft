@@ -72,6 +72,7 @@ from .vec_dot import (
     vec_dot_nvfp4_q8_0,
     vec_dot_q1_0_q8_0,
     vec_dot_q2_k_q8_k,
+    vec_dot_q2_k_q8_k_group_reduced,
     vec_dot_q3_k_q8_k,
     vec_dot_q4_0_q8_0,
     vec_dot_q4_1_q8_1,
@@ -436,6 +437,59 @@ def mul_mat_q2_k_decode(
     for row in range(M):
         for column in range(N):
             commit(vec_dot_q2_k_q8_k(W[column], Xq[row]), Y[row, column])
+
+
+def mul_mat_q2_k_group_reduced(
+    W: View[Q2_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        integer = new(i32, [MR, NR], init=i32(0))
+                        with L.subs(kb, extent=16) as sub:
+                            partial = outer_contract(
+                                x.q[:, sub],
+                                w.q[:, sub],
+                                over="k",
+                                acc=i32,
+                            )
+                            scale = i32(u8(w.scales[:, sub]) & u8(15))
+                            integer += partial * scale
+                        mins = widen(u8(w.scales) >> u8(4), i16)
+                        correction = outer_contract(
+                            x.bsum, mins, over="k", acc=i32
+                        )
+                        acc += f32(x.ds) * (
+                            f32(w.d) * widen(integer, f32)
+                            - f32(w.dmin) * widen(correction, f32)
+                        )
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_q2_k_group_reduced_decode(
+    W: View[Q2_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(
+                vec_dot_q2_k_q8_k_group_reduced(W[column], Xq[row]),
+                Y[row, column],
+            )
 
 
 def mul_mat_q3_k(

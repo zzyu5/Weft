@@ -220,6 +220,32 @@ def vec_dot_q2_k_q8_k(
     return result
 
 
+def vec_dot_q2_k_q8_k_group_reduced(
+    W: View[Q2_K, (K,)],
+    X: View[Q8_K, (K,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb])
+        x = admit(X[kb])
+        integer = i32(0)
+        with L.subs(kb, extent=16) as sub:
+            partial = contract(
+                w.q[sub],
+                x.q[sub],
+                over="k",
+                acc=i32,
+            )
+            scale = i32(u8(w.scales[sub]) & u8(15))
+            integer += partial * scale
+        mins = widen(u8(w.scales) >> u8(4), i16)
+        minimum = contract(x.bsum, mins, over="k", acc=i32)
+        result += f32(x.ds) * (
+            f32(w.d) * f32(integer) - f32(w.dmin) * f32(minimum)
+        )
+    return result
+
+
 def vec_dot_q3_k_q8_k(
     W: View[Q3_K, (K,)],
     X: View[Q8_K, (K,)],

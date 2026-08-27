@@ -44,6 +44,7 @@ from weft.std.vec_dot import (
     vec_dot_nvfp4_q8_0,
     vec_dot_q1_0_q8_0,
     vec_dot_q2_k_q8_k,
+    vec_dot_q2_k_q8_k_group_reduced,
     vec_dot_q3_k_q8_k,
     vec_dot_q4_0_q8_0,
     vec_dot_q4_1_q8_1,
@@ -107,6 +108,13 @@ def quantized_vec_dot_q2_k_q8_k(
     W: View[Q2_K, (K,)], X: View[Q8_K, (K,)], Y: View[f32, (1,)]
 ):
     commit(vec_dot_q2_k_q8_k(W, X), Y[0])
+
+
+@weft.kernel
+def quantized_vec_dot_q2_k_q8_k_group_reduced(
+    W: View[Q2_K, (K,)], X: View[Q8_K, (K,)], Y: View[f32, (1,)]
+):
+    commit(vec_dot_q2_k_q8_k_group_reduced(W, X), Y[0])
 
 
 @weft.kernel
