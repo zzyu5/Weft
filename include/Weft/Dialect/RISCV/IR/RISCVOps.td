@@ -340,6 +340,23 @@ def WeftRISCV_WindowType : WeftRISCV_Type<"Window", "window"> {
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_LayeredWindowType
+    : WeftRISCV_Type<"LayeredWindow", "layered_window"> {
+  let parameters = (ins
+    "::weft::riscv::ValueType":$fieldType,
+    "::weft::riscv::ValueType":$resultType,
+    "int64_t":$reductionAxis,
+    "int64_t":$layers,
+    "int64_t":$windowsPerLayer,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $fieldType `,` $resultType `,` $reductionAxis `,` $layers `,`
+        $windowsPerLayer `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_DomainType : WeftRISCV_Type<"Domain", "domain"> {
   let parameters = (ins
     StringRefParameter<"axis name">:$axisName,
@@ -854,6 +871,59 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        WeftRISCV_ValueType:$rhs,
                        DenseI64ArrayAttr:$over,
                        StrAttr:$stream_reduction,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStorageWindowOp
+    : WeftRISCV_Op<"rvv_storage_window", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       Index:$logical_offset,
+                       I64Attr:$reduction_axis,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVLayeredStorageLoadOp
+    : WeftRISCV_Op<"rvv_layered_storage_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       Index:$window_index,
+                       I64Attr:$reduction_axis,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_LayeredWindowType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVLayeredStorageDecodeOp
+    : WeftRISCV_Op<"rvv_layered_storage_decode", [Pure]> {
+  let arguments = (ins WeftRISCV_LayeredWindowType:$window,
+                       I64Attr:$layer,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVWidenAccumulateOp
+    : WeftRISCV_Op<"rvv_widen_accumulate", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$lhs,
+                       WeftRISCV_ValueType:$rhs,
+                       WeftRISCV_ValueType:$accumulator,
+                       I64Attr:$reduction_axis,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVFinalizeWidenDotOp
+    : WeftRISCV_Op<"rvv_finalize_widen_dot", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$partial,
+                       I64Attr:$reduction_axis,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;

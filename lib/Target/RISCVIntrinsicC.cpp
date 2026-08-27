@@ -626,6 +626,16 @@ private:
   compileEncodedDotStep(riscv::RVVEncodedDotStepOp operation);
   mlir::LogicalResult compileRVVWidenDot(riscv::RVVWidenDotOp operation);
   mlir::LogicalResult
+  compileRVVStorageWindow(riscv::RVVStorageWindowOp operation);
+  mlir::LogicalResult
+  compileRVVLayeredStorageLoad(riscv::RVVLayeredStorageLoadOp operation);
+  mlir::LogicalResult
+  compileRVVLayeredStorageDecode(riscv::RVVLayeredStorageDecodeOp operation);
+  mlir::LogicalResult
+  compileRVVWidenAccumulate(riscv::RVVWidenAccumulateOp operation);
+  mlir::LogicalResult
+  compileRVVFinalizeWidenDot(riscv::RVVFinalizeWidenDotOp operation);
+  mlir::LogicalResult
   compileRVVWidenReduce(riscv::RVVWidenReduceOp operation);
   mlir::LogicalResult compileRVVPartitionedWidenReduceStore(
       riscv::RVVPartitionedWidenReduceStoreOp operation);
@@ -2057,6 +2067,19 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileEncodedDotStep(step);
   if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation))
     return compileRVVWidenDot(dot);
+  if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(operation))
+    return compileRVVStorageWindow(window);
+  if (auto load = mlir::dyn_cast<riscv::RVVLayeredStorageLoadOp>(operation))
+    return compileRVVLayeredStorageLoad(load);
+  if (auto decode =
+          mlir::dyn_cast<riscv::RVVLayeredStorageDecodeOp>(operation))
+    return compileRVVLayeredStorageDecode(decode);
+  if (auto accumulate =
+          mlir::dyn_cast<riscv::RVVWidenAccumulateOp>(operation))
+    return compileRVVWidenAccumulate(accumulate);
+  if (auto finalize =
+          mlir::dyn_cast<riscv::RVVFinalizeWidenDotOp>(operation))
+    return compileRVVFinalizeWidenDot(finalize);
   if (auto reduce = mlir::dyn_cast<riscv::RVVWidenReduceOp>(operation))
     return compileRVVWidenReduce(reduce);
   if (auto reduce =
@@ -7453,6 +7476,273 @@ Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
       output.scalar = std::move(total);
   }
   bindings[operation.getResult()] = std::move(output);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.storage-window")
+    return fail(operation, "RVV storage window has no exact selected leaf");
+  Binding field = bindings.lookup(operation.getField());
+  Binding point = bindings.lookup(operation.getOrigin());
+  Binding offset = bindings.lookup(operation.getLogicalOffset());
+  if (field.kind != Binding::Kind::Field ||
+      point.kind != Binding::Kind::Point ||
+      offset.kind != Binding::Kind::Scalar || field.field.index)
+    return fail(operation,
+                "RVV storage window requires one unprojected field, point, and scalar offset");
+  field.field.useAccess = operation.getAccess();
+  field.field.index = operation.getOrigin();
+  field.field.selector = "domain";
+  field.field.relativeIndices.push_back(operation.getLogicalOffset());
+  Binding loaded = emitInterleavedField(operation.getResult(), field, "0");
+  if (loaded.kind != Binding::Kind::Vector ||
+      loaded.parts.size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())))
+    return fail(operation,
+                "RVV storage window did not materialize every selected vector part");
+  bindings[operation.getResult()] = std::move(loaded);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
+    riscv::RVVLayeredStorageLoadOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.layered-storage-load")
+    return fail(operation,
+                "RVV layered storage load has no exact selected leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  Binding point = bindings.lookup(operation.getOrigin());
+  Binding windowIndex = bindings.lookup(operation.getWindowIndex());
+  if (fieldBinding.kind != Binding::Kind::Field ||
+      point.kind != Binding::Kind::Point ||
+      windowIndex.kind != Binding::Kind::Scalar)
+    return fail(operation,
+                "RVV layered storage load requires a field, point, and scalar window index");
+  fieldBinding.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  auto windowType = operation.getResult().getType();
+  auto valueType = windowType.getResultType();
+  auto layout = valueType.getLayout();
+  const int64_t group = operation.getAccess().getGroupSize();
+  const int64_t layer = operation.getAccess().getLayerSize();
+  auto reduction = llvm::find(valueType.getAxisIds().asArrayRef(),
+                              operation.getReductionAxis());
+  const int64_t lanes =
+      reduction == valueType.getAxisIds().asArrayRef().end()
+          ? 0
+          : layout.getLaneFactors()[static_cast<size_t>(
+                reduction - valueType.getAxisIds().asArrayRef().begin())];
+  const int64_t windowsPerLayer = windowType.getWindowsPerLayer();
+  const int64_t replicas = product(layout.getReplicaFactors());
+  if (owner.kind != Binding::Kind::Record || !field || !integer ||
+      integer.isSigned() || field->bitOffset % 8 || owner.recordElements <= 0 ||
+      group <= 0 || layer <= 0 || lanes <= 0 || windowsPerLayer <= 0 ||
+      replicas <= 0 || layout.getSew() != 8)
+    return fail(operation,
+                "RVV layered storage load has incomplete record or vector geometry");
+
+  const std::string suffix =
+      "u8" + lmulSpelling(layout.getLmulEighths());
+  const std::string type =
+      "vuint8" + lmulSpelling(layout.getLmulEighths()) + "_t";
+  llvm::SmallVector<int64_t, 4> axes =
+      registerAxesFor(operation.getField());
+  const int64_t sourceStreams = streamPartCount(operation.getField());
+  Binding result;
+  result.kind = Binding::Kind::Window;
+  result.windowFamily = "layered-storage";
+  for (int64_t replica = 0; replica < replicas; ++replica) {
+    auto coordinates = registerCoordinates(operation.getField(), replica);
+    if (sourceStreams <= 0 || !coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "RVV layered storage load has no register-coordinate mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "RVV layered storage load register axis has no byte stride");
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += ")";
+    const std::string logicalBase =
+        "((" + point.point.base + ") % " +
+        std::to_string(owner.recordElements) + ")";
+    const std::string groupIndex =
+        "((" + logicalBase + " / " + std::to_string(group) + ") + (" +
+        windowIndex.scalar + " / " + std::to_string(windowsPerLayer) + "))";
+    const std::string within =
+        "((" + logicalBase + " % " + std::to_string(layer) + ") + (" +
+        windowIndex.scalar + " % " + std::to_string(windowsPerLayer) + ") * " +
+        std::to_string(lanes) + ")";
+    const std::string byte =
+        "(" + std::to_string(field->bitOffset / 8) + " + " + groupIndex +
+        " * " + std::to_string(layer) + " + " + within + ")";
+    std::string raw = fresh("layered_window_raw");
+    line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+         "((const uint8_t *)(" + record + " + " + byte + "), " +
+         std::to_string(lanes) + ");");
+    result.windowLhs.push_back(std::move(raw));
+    result.windowValidity.push_back(std::to_string(lanes));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVLayeredStorageDecode(
+    riscv::RVVLayeredStorageDecodeOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.layered-storage-decode")
+    return fail(operation,
+                "RVV layered storage decode has no exact selected leaf");
+  Binding window = bindings.lookup(operation.getWindow());
+  auto load =
+      operation.getWindow().getDefiningOp<riscv::RVVLayeredStorageLoadOp>();
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(
+      operation.getResult().getType().getElementType());
+  if (window.kind != Binding::Kind::Window ||
+      window.windowFamily != "layered-storage" || !load || !integer ||
+      integer.isSigned() || window.windowLhs.empty())
+    return fail(operation,
+                "RVV layered storage decode has no typed raw storage window");
+  const int64_t layers = load.getResult().getType().getLayers();
+  int64_t physicalLayer = operation.getLayer();
+  if (load.getAccess().getOrder() == "hi_first")
+    physicalLayer = layers - 1 - physicalLayer;
+  const unsigned width = integer.getWidth();
+  const uint64_t mask = (uint64_t(1) << width) - 1;
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (auto [part, raw] : llvm::enumerate(window.windowLhs)) {
+    std::string value = raw;
+    const std::string vl = part < window.windowValidity.size()
+                               ? window.windowValidity[part]
+                               : std::to_string(physicalLanes(operation.getResult()));
+    if (physicalLayer != 0) {
+      std::string shifted = fresh("layered_window_shift");
+      line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
+           value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+           ");");
+      value = std::move(shifted);
+    }
+    if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+      std::string masked = fresh("layered_window_value");
+      line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
+           value + ", " + std::to_string(mask) + ", " + vl + ");");
+      value = std::move(masked);
+    }
+    result.parts.push_back(std::move(value));
+  }
+  if (result.parts.size() !=
+      static_cast<size_t>(vectorPartCount(operation.getResult())))
+    return fail(operation,
+                "RVV layered storage decode did not produce every register replica");
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVWidenAccumulate(
+    riscv::RVVWidenAccumulateOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.vwmacc.partial")
+    return fail(operation,
+                "RVV widened partial accumulation has no exact selected leaf");
+  auto lhs = materializeNumeric(operation.getLhs(),
+                                bindings.lookup(operation.getLhs()));
+  auto rhs = materializeNumeric(operation.getRhs(),
+                                bindings.lookup(operation.getRhs()));
+  auto accumulator = materializeNumeric(
+      operation.getAccumulator(), bindings.lookup(operation.getAccumulator()));
+  if (mlir::failed(lhs) || mlir::failed(rhs) || mlir::failed(accumulator) ||
+      lhs->kind != Binding::Kind::Vector ||
+      rhs->kind != Binding::Kind::Vector ||
+      accumulator->kind != Binding::Kind::Vector)
+    return fail(operation,
+                "RVV widened partial accumulation requires materialized vectors");
+  auto lhsElement = operation.getLhs().getType().getElementType();
+  auto rhsElement = operation.getRhs().getType().getElementType();
+  const bool mixed = lhsElement.isSignedInteger() != rhsElement.isSignedInteger();
+  const std::string suffix = vectorSuffix(operation.getAccumulator());
+  const std::string type = vectorType(operation.getAccumulator());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  const int64_t parts = vectorPartCount(operation.getResult());
+  if (accumulator->parts.size() != static_cast<size_t>(parts))
+    return fail(operation,
+                "RVV widened partial accumulator part count is incomplete");
+  for (int64_t part = 0; part < parts; ++part) {
+    auto lhsPart = projectRegisterPart(operation.getLhs(), operation.getResult(), part);
+    auto rhsPart = projectRegisterPart(operation.getRhs(), operation.getResult(), part);
+    if (!lhsPart || !rhsPart || *lhsPart >= lhs->parts.size() ||
+        *rhsPart >= rhs->parts.size())
+      return fail(operation,
+                  "RVV widened partial operands do not project to accumulator replicas");
+    const std::string &signedOperand =
+        lhsElement.isSignedInteger() ? lhs->parts[*lhsPart] : rhs->parts[*rhsPart];
+    const std::string &unsignedOperand =
+        lhsElement.isSignedInteger() ? rhs->parts[*rhsPart] : lhs->parts[*lhsPart];
+    const std::string operands =
+        mixed ? signedOperand + ", " + unsignedOperand
+              : lhs->parts[*lhsPart] + ", " + rhs->parts[*rhsPart];
+    std::string name = fresh("widen_partial");
+    line(type + " " + name + " = __riscv_" +
+         std::string(mixed ? "vwmaccsu" : "vwmacc") + "_vv_" + suffix + "(" +
+         accumulator->parts[part] + ", " + operands + ", " +
+         partVL(operation.getLhs(), *lhsPart) + ");");
+    result.parts.push_back(std::move(name));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVFinalizeWidenDot(
+    riscv::RVVFinalizeWidenDotOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.vwredsum.partial")
+    return fail(operation,
+                "RVV final widened dot has no exact selected leaf");
+  auto partial = materializeNumeric(operation.getPartial(),
+                                    bindings.lookup(operation.getPartial()));
+  if (mlir::failed(partial) || partial->kind != Binding::Kind::Vector ||
+      partial->parts.empty())
+    return fail(operation,
+                "RVV final widened dot requires a materialized partial tuple");
+  auto resultValue = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+  const int64_t resultParts =
+      resultValue ? registerPartCount(operation.getResult()) : 1;
+  if (partial->parts.size() != static_cast<size_t>(resultParts))
+    return fail(operation,
+                "RVV final widened dot cannot project partials to result replicas");
+  std::string seed = fresh("widen_partial_seed");
+  line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+  Binding result;
+  result.kind = resultValue ? Binding::Kind::ScalarTuple : Binding::Kind::Scalar;
+  const std::string partialSuffix = vectorSuffix(operation.getPartial());
+  for (int64_t part = 0; part < resultParts; ++part) {
+    std::string reduced = fresh("widen_partial_sum");
+    line("vint32m1_t " + reduced + " = __riscv_vwredsum_vs_" +
+         partialSuffix + "_i32m1(" + partial->parts[part] + ", " + seed + ", " +
+         partVL(operation.getPartial(), part) + ");");
+    std::string scalarName = fresh("widen_partial_scalar");
+    line("int32_t " + scalarName + " = __riscv_vmv_x_s_i32m1_i32(" +
+         reduced + ");");
+    if (resultValue)
+      result.parts.push_back(std::move(scalarName));
+    else
+      result.scalar = std::move(scalarName);
+  }
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

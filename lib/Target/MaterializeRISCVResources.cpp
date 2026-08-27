@@ -23,6 +23,8 @@ int64_t groups(mlir::Type type) {
     return fragment.getResourceGroups();
   if (auto window = mlir::dyn_cast<riscv::WindowType>(type))
     return window.getResourceGroups();
+  if (auto window = mlir::dyn_cast<riscv::LayeredWindowType>(type))
+    return window.getResourceGroups();
   if (auto layout = riscv_internal::layoutOf(type))
     return layout.getRegisterGroups();
   return 0;

@@ -13,6 +13,7 @@ add_library(WeftRISCVTarget STATIC
   PipelineRISCVLevels.cpp
   UnrollRISCVLevels.cpp
   ShareRISCVLayeredWindows.cpp
+  MaterializeRISCVPartialAccumulators.cpp
   FinalizeRISCVLeaves.cpp
   MaterializeRISCVResources.cpp
   VerifyFinalRISCV.cpp

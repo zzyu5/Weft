@@ -42,6 +42,9 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
       riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
+      riscv::RVVStorageWindowOp, riscv::RVVLayeredStorageLoadOp,
+      riscv::RVVLayeredStorageDecodeOp, riscv::RVVWidenAccumulateOp,
+      riscv::RVVFinalizeWidenDotOp,
       riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
@@ -65,7 +68,10 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
-      riscv::RVVWidenDotOp, riscv::RVVWidenReduceOp,
+      riscv::RVVWidenDotOp, riscv::RVVStorageWindowOp,
+      riscv::RVVLayeredStorageLoadOp, riscv::RVVLayeredStorageDecodeOp,
+      riscv::RVVWidenAccumulateOp, riscv::RVVFinalizeWidenDotOp,
+      riscv::RVVWidenReduceOp,
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
       riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
@@ -78,6 +84,8 @@ int64_t resourceGroups(mlir::Type type) {
   if (auto fragment = mlir::dyn_cast<riscv::FragmentType>(type))
     return fragment.getResourceGroups();
   if (auto window = mlir::dyn_cast<riscv::WindowType>(type))
+    return window.getResourceGroups();
+  if (auto window = mlir::dyn_cast<riscv::LayeredWindowType>(type))
     return window.getResourceGroups();
   if (auto layout = riscv_internal::layoutOf(type))
     return layout.getRegisterGroups();
@@ -179,6 +187,8 @@ bool requiresIntegerWidening(mlir::Operation *operation) {
                 riscv::RVVGroupedMacStepOp,
                 riscv::RVVEncodedDotStepOp,
                 riscv::RVVWidenDotOp,
+                riscv::RVVWidenAccumulateOp,
+                riscv::RVVFinalizeWidenDotOp,
                 riscv::RVVWidenReduceOp,
                 riscv::RVVPartitionedWidenReduceStoreOp,
                 riscv::RVVEncodedContractStepOp>(operation))
