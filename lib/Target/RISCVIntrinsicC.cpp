@@ -664,6 +664,8 @@ private:
   compileRVVPartialReduce(riscv::RVVPartialReduceOp operation);
   mlir::LogicalResult compileRVVPartialScaleCombine(
       riscv::RVVPartialScaleCombineOp operation);
+  mlir::LogicalResult compileRVVPartialWidenScale(
+      riscv::RVVPartialWidenScaleOp operation);
   mlir::LogicalResult
   compileRVVPartialCombine(riscv::RVVPartialCombineOp operation);
   mlir::LogicalResult
@@ -2284,6 +2286,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto combine =
           mlir::dyn_cast<riscv::RVVPartialScaleCombineOp>(operation))
     return compileRVVPartialScaleCombine(combine);
+  if (auto scale =
+          mlir::dyn_cast<riscv::RVVPartialWidenScaleOp>(operation))
+    return compileRVVPartialWidenScale(scale);
   if (auto combine = mlir::dyn_cast<riscv::RVVPartialCombineOp>(operation))
     return compileRVVPartialCombine(combine);
   if (auto finalize = mlir::dyn_cast<riscv::RVVPartialFinalizeOp>(operation))
@@ -8389,7 +8394,7 @@ Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
                 "RVV widening dot requires materialized vector operands");
   const int64_t lhsStreams = streamPartCount(operation.getLhs());
   const int64_t rhsStreams = streamPartCount(operation.getRhs());
-  if (lhsStreams <= 0 || lhsStreams != rhsStreams ||
+  if (lhsStreams <= 0 || rhsStreams <= 0 ||
       lhs->parts.size() !=
           static_cast<size_t>(lhsStreams * registerPartCount(operation.getLhs())) ||
       rhs->parts.size() !=
@@ -9247,21 +9252,35 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       const int64_t group = operation.getAccess().getGroupSize();
       const int64_t layer = operation.getAccess().getLayerSize();
       const int64_t layers = group / layer;
-      std::string physicalLayer =
-          "(((" + logicalBase.scalar + ") % " + std::to_string(group) + ") / " +
-          std::to_string(layer) + " + " +
-          std::to_string(operation.getLayerForPart()[part]) + ")";
-      if (operation.getAccess().getOrder() == "hi_first")
-        physicalLayer = "(" + std::to_string(layers - 1) + " - " +
-                        physicalLayer + ")";
-      std::string shifted = fresh("replica_layered_shift");
-      line(vectorTypeValue + " " + shifted + " = __riscv_vsrl_vx_" +
-           vectorSuffixValue + "(" + value + ", (size_t)(" + physicalLayer +
-           " * " + std::to_string(fieldInteger.getWidth()) + "), " + vl +
-           ");");
+      std::optional<int64_t> constantLayer;
+      if (operation.getLogicalBaseMultiple() % group == 0) {
+        constantLayer = operation.getLayerForPart()[part];
+        if (operation.getAccess().getOrder() == "hi_first")
+          constantLayer = layers - 1 - *constantLayer;
+      }
+      if (!constantLayer || *constantLayer != 0) {
+        std::string physicalLayer;
+        if (constantLayer) {
+          physicalLayer = std::to_string(*constantLayer);
+        } else {
+          physicalLayer =
+              "(((" + logicalBase.scalar + ") % " + std::to_string(group) +
+              ") / " + std::to_string(layer) + " + " +
+              std::to_string(operation.getLayerForPart()[part]) + ")";
+          if (operation.getAccess().getOrder() == "hi_first")
+            physicalLayer = "(" + std::to_string(layers - 1) + " - " +
+                            physicalLayer + ")";
+        }
+        std::string shifted = fresh("replica_layered_shift");
+        line(vectorTypeValue + " " + shifted + " = __riscv_vsrl_vx_" +
+             vectorSuffixValue + "(" + value + ", (size_t)(" +
+             physicalLayer + " * " +
+             std::to_string(fieldInteger.getWidth()) + "), " + vl + ");");
+        value = std::move(shifted);
+      }
       std::string decoded = fresh("replica_layered_value");
       line(vectorTypeValue + " " + decoded + " = __riscv_vand_vx_" +
-           vectorSuffixValue + "(" + shifted + ", " +
+           vectorSuffixValue + "(" + value + ", " +
            std::to_string(mask) + ", " + vl + ");");
       value = std::move(decoded);
     }
@@ -9603,14 +9622,17 @@ mlir::LogicalResult Emitter::compileRVVPartialScaleCombine(
   llvm::SmallVector<std::string> scales;
   for (auto [scaleValue, replica] :
        llvm::zip(operation.getScales(), operation.getScaleReplicas())) {
-    Binding scale = bindings.lookup(scaleValue);
-    if (scale.kind == Binding::Kind::Scalar && replica == 0) {
-      scales.push_back(scale.scalar);
+    auto scale =
+        materializeNumeric(scaleValue, bindings.lookup(scaleValue));
+    if (mlir::failed(scale))
+      return mlir::failure();
+    if (scale->kind == Binding::Kind::Scalar && replica == 0) {
+      scales.push_back(scale->scalar);
       continue;
     }
-    if (scale.kind == Binding::Kind::ScalarTuple && replica >= 0 &&
-        static_cast<size_t>(replica) < scale.parts.size()) {
-      scales.push_back(scale.parts[replica]);
+    if (scale->kind == Binding::Kind::ScalarTuple && replica >= 0 &&
+        static_cast<size_t>(replica) < scale->parts.size()) {
+      scales.push_back(scale->parts[replica]);
       continue;
     }
     return fail(operation,
@@ -9638,6 +9660,57 @@ mlir::LogicalResult Emitter::compileRVVPartialScaleCombine(
       combined = std::move(next);
     }
     result.parts.push_back(std::move(combined));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
+    riscv::RVVPartialWidenScaleOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.partial-widen-scale")
+    return fail(operation,
+                "RVV partial widen-scale has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  auto inputType = operation.getInput().getType();
+  auto resultType = operation.getResult().getType();
+  if (input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(inputType.getSlots()) ||
+      resultType.getSlots() != inputType.getSlots() ||
+      operation.getScales().size() != input.parts.size() ||
+      operation.getScaleReplicas().size() != input.parts.size())
+    return fail(operation,
+                "RVV partial widen-scale has no complete typed slot set");
+  llvm::SmallVector<std::string> scales;
+  for (auto [scaleValue, replica] :
+       llvm::zip(operation.getScales(), operation.getScaleReplicas())) {
+    auto scale =
+        materializeNumeric(scaleValue, bindings.lookup(scaleValue));
+    if (mlir::failed(scale))
+      return mlir::failure();
+    if (scale->kind == Binding::Kind::Scalar && replica == 0) {
+      scales.push_back(scale->scalar);
+      continue;
+    }
+    if (scale->kind == Binding::Kind::ScalarTuple && replica >= 0 &&
+        static_cast<size_t>(replica) < scale->parts.size()) {
+      scales.push_back(scale->parts[replica]);
+      continue;
+    }
+    return fail(
+        operation,
+        "RVV partial widen-scale scale replica has no scalar binding");
+  }
+  const std::string type = vectorTypeFor(resultType.getPartialType());
+  const std::string suffix = vectorSuffixFor(resultType.getPartialType());
+  const std::string vl =
+      std::to_string(physicalLanesFor(inputType.getPartialType()));
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  for (size_t slot = 0; slot < input.parts.size(); ++slot) {
+    std::string scaled = fresh("partial_widen_scale");
+    line(type + " " + scaled + " = __riscv_vwmul_vx_" + suffix + "(" +
+         input.parts[slot] + ", " + scales[slot] + ", " + vl + ");");
+    result.parts.push_back(std::move(scaled));
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();

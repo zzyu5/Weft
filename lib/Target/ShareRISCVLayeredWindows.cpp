@@ -654,10 +654,12 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
         targetType.getElementType() == resultType.getElementType() &&
         targetType.getShape() == resultType.getShape() &&
         targetType.getAxisIds() == resultType.getAxisIds()) {
-      if (extract.getAccess().getMapping() == "natural") {
-        consumerConversion = conversion;
-        selectedType = targetType;
-      }
+      // The typed geometry checks below are sufficient for both natural and
+      // grouped/layered storage.  Refusing the latter here forces a narrow raw
+      // window followed by register-to-lane packing even when the target lane
+      // layout divides the declared group and layer exactly.
+      consumerConversion = conversion;
+      selectedType = targetType;
     }
   }
   const bool scalarReplicas = resultType.getLayout().getCarrier() == "scalar";
@@ -689,7 +691,7 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
         represented != selectedType.getShape()[position])
       return false;
     if (lane > 1) {
-      if ((layered && laneAxis) || replica != 1)
+      if (replica != 1)
         return false;
       lanePositions.push_back(position);
       laneAxis = selectedType.getAxisIds()[position];
@@ -720,12 +722,12 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       return false;
   }
 
-  // A natural byte-addressable field may map several logical axes into one
-  // RVV register.  Accept that representation only when the affine storage
-  // coordinates prove that the lane axes flatten to one contiguous interval
-  // in row-major axis order.  Packed/layered storage keeps its single-lane-axis
-  // semantic result; its raw byte windows may still be coalesced below.
-  if (!layered && lanePositions.size() > 1) {
+  // Several logical axes may map into one RVV register only when the typed
+  // affine storage coordinates prove a contiguous row-major interval.  For a
+  // layered field the subsequent group/layer divisibility checks additionally
+  // prove that this wider logical interval can be decoded from whole raw
+  // windows without crossing an encoded layer boundary.
+  if (lanePositions.size() > 1) {
     int64_t expectedStride = 1;
     for (int64_t position =
              static_cast<int64_t>(selectedType.getShape().size()) - 1;
@@ -848,6 +850,12 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   if (!scalarBase)
     scalarBase = rewriter.create<mlir::arith::ConstantIndexOp>(extract.getLoc(),
                                                                affine.constant);
+  const int64_t logicalBaseMultiple =
+      affine.scalarBase
+          ? std::max<int64_t>(1, knownMultiple(affine.scalarBase))
+          : (affine.constant == 0
+                 ? logicalSpan
+                 : std::max<int64_t>(1, std::abs(affine.constant)));
   const int64_t resultGroups = selectedType.getLayout().getRegisterGroups();
   const int64_t temporaryGroups =
       std::max<int64_t>(1,
@@ -857,8 +865,8 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       layered ? "rvv.replica-storage-load.layered"
               : "rvv.replica-storage-load.natural";
   auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
-      extract.getLoc(), selectedType, field.getResult(), scalarBase, laneAxis,
-      logicalSpan,
+      extract.getLoc(), selectedType, field.getResult(), scalarBase,
+      logicalBaseMultiple, laneAxis, logicalSpan,
       rewriter.getDenseI64ArrayAttr(windowOffsets),
       rewriter.getDenseI64ArrayAttr(windowForPart),
       rewriter.getDenseI64ArrayAttr(layerForPart), extract.getAccess(),

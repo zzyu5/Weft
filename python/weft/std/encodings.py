@@ -128,9 +128,9 @@ class Q5_K:
 class Q6_K:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
-    ql: u8[128]
-    qh: u8[64]
-    scales: i8[16]
+    ql: u4[256] @ grouped(128) @ layered(64, lo_first)
+    qh: u2[256] @ grouped(128) @ layered(32, lo_first)
+    scales: i8[16] @ grouped(16) @ layered(16, lo_first)
     d: f16
 
 

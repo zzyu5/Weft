@@ -321,71 +321,35 @@ def vec_dot_q6_k_q8_k(
     W: View[Q6_K, (K,)],
     X: View[Q8_K, (K,)],
 ):
-    lane0 = f32(0.0)
-    lane1 = f32(0.0)
-    lane2 = f32(0.0)
-    lane3 = f32(0.0)
-    lane4 = f32(0.0)
-    lane5 = f32(0.0)
-    lane6 = f32(0.0)
-    lane7 = f32(0.0)
+    result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        acc0 = i32(0)
-        acc1 = i32(0)
-        acc2 = i32(0)
-        acc3 = i32(0)
-        acc4 = i32(0)
-        acc5 = i32(0)
-        acc6 = i32(0)
-        acc7 = i32(0)
-        for sub in range(16):
-            scale = i32(w.scales[sub])
-            for lane in range(16):
-                j = sub * 16 + lane
-                within = j % 128
-                ql = w.ql[(j // 128) * 64 + within % 64]
-                low = (u32(ql) >> u32((within // 64) * 4)) & u32(15)
-                qh = w.qh[(j // 128) * 32 + within % 32]
-                high = (u32(qh) >> u32((within // 32) * 2)) & u32(3)
-                q = i32(low | (high << u32(4))) - i32(32)
-                product = scale * q * i32(x.q[j])
-                which = lane % 8
-                if which == 0:
-                    acc0 += product
-                if which == 1:
-                    acc1 += product
-                if which == 2:
-                    acc2 += product
-                if which == 3:
-                    acc3 += product
-                if which == 4:
-                    acc4 += product
-                if which == 5:
-                    acc5 += product
-                if which == 6:
-                    acc6 += product
-                if which == 7:
-                    acc7 += product
-        scale = f32(w.d) * f32(x.ds)
-        lane0 += scale * f32(acc0)
-        lane1 += scale * f32(acc1)
-        lane2 += scale * f32(acc2)
-        lane3 += scale * f32(acc3)
-        lane4 += scale * f32(acc4)
-        lane5 += scale * f32(acc5)
-        lane6 += scale * f32(acc6)
-        lane7 += scale * f32(acc7)
-    result = f32(0.0)
-    result += lane0
-    result += lane1
-    result += lane2
-    result += lane3
-    result += lane4
-    result += lane5
-    result += lane6
-    result += lane7
+        integer_acc = i32(0)
+        half_index = index(0)
+        with L.subs(kb, extent=128) as half:
+            plane = iota(4, dtype=u8)
+            scale_part = iota(2, dtype=u8)
+            lane = iota(16, dtype=u8, axis="k")
+            coordinate = (
+                u8(half_index) * u8(128)
+                + plane * u8(32)
+                + scale_part * u8(16)
+                + lane
+            )
+            q = i8(w.ql[coordinate]) | (i8(w.qh[coordinate]) << u8(4))
+            q -= i8(32)
+            products = contract(x.q[coordinate], q, over="k", acc=i32)
+            scale_coordinate = (
+                u8(half_index) * u8(8)
+                + plane * u8(2)
+                + scale_part
+            )
+            integer_acc += reduce(
+                reduce(products * i32(w.scales[scale_coordinate]), axis=1), axis=0
+            )
+            half_index += index(1)
+        result += f32(w.d) * f32(x.ds) * f32(integer_acc)
     return result
 
 

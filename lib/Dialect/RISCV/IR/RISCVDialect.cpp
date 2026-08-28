@@ -3552,7 +3552,8 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       resultAxis == result.getAxisIds().asArrayRef().end() ||
       field.getElementType() != result.getElementType() ||
       result.getLayout().getCarrier() != "rvv" || !parts || *parts <= 0 ||
-      getLogicalSpan() <= 0 || getWindowOffsets().empty() ||
+      getLogicalBaseMultiple() <= 0 || getLogicalSpan() <= 0 ||
+      getWindowOffsets().empty() ||
       getWindowForPart().size() != static_cast<size_t>(*parts) ||
       getLayerForPart().size() != static_cast<size_t>(*parts) ||
       (!natural && !layered) ||
@@ -3563,6 +3564,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
            << "replica storage load requires one scalar base and a closed field-to-register window map; field="
            << field << ", result=" << result << ", source_field="
            << static_cast<bool>(sourceField) << ", access=" << getAccess()
+           << ", logical_base_multiple=" << getLogicalBaseMultiple()
            << ", lane_axis=" << getLaneAxis()
            << ", logical_span=" << getLogicalSpan()
            << ", window_offsets=" << getWindowOffsets()
@@ -3591,14 +3593,13 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
     const int64_t replica = result.getLayout().getReplicaFactors()[position];
     int64_t factors[] = {time, lane, replica};
     auto represented = checkedPositiveProduct(factors);
-    if ((layered && position != lanePosition && lane != 1) ||
-        (lane > 1 && replica != 1) ||
+    if ((lane > 1 && replica != 1) ||
         (time > 1 && replica > 1) || !represented ||
         *represented != result.getShape()[position] ||
         result.getLayout().getFragmentFactors()[position] != 1 ||
         result.getLayout().getLocalFactors()[position] != 1)
       return emitOpError(
-          "replica storage load must preserve every non-lane axis as issue time or register replicas");
+          "replica storage load must preserve every logical axis as lane, issue time, or register replicas");
   }
 
   if (natural) {
@@ -4242,6 +4243,83 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
                       [](int64_t factor) { return factor == 1; }))
       return emitOpError(
           "RVV scaled partial combine scales require in-bounds signed-i32 scalar replicas");
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
+  PartialSetType input = getInput().getType();
+  PartialSetType result = getResult().getType();
+  ValueType inputPartial = input.getPartialType();
+  ValueType resultPartial = result.getPartialType();
+  auto inputElement =
+      mlir::dyn_cast<mlir::IntegerType>(inputPartial.getElementType());
+  auto resultElement =
+      mlir::dyn_cast<mlir::IntegerType>(resultPartial.getElementType());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  const bool sameCoordinates =
+      inputPartial.getAxisIds() == resultPartial.getAxisIds() &&
+      inputPartial.getShape() == resultPartial.getShape() &&
+      inputPartial.getLayout().getAxisIds() ==
+          resultPartial.getLayout().getAxisIds() &&
+      inputPartial.getLayout().getTimeFactors() ==
+          resultPartial.getLayout().getTimeFactors() &&
+      inputPartial.getLayout().getLaneFactors() ==
+          resultPartial.getLayout().getLaneFactors() &&
+      inputPartial.getLayout().getReplicaFactors() ==
+          resultPartial.getLayout().getReplicaFactors() &&
+      inputPartial.getLayout().getFragmentFactors() ==
+          resultPartial.getLayout().getFragmentFactors() &&
+      inputPartial.getLayout().getLocalFactors() ==
+          resultPartial.getLayout().getLocalFactors();
+  if (!inputElement || !inputElement.isSigned() ||
+      inputElement.getWidth() != 16 || !resultElement ||
+      !resultElement.isSigned() || resultElement.getWidth() != 32 ||
+      inputPartial.getLayout().getCarrier() != "rvv" ||
+      resultPartial.getLayout().getCarrier() != "rvv" || !sameCoordinates ||
+      result.getReductionAxis() != input.getReductionAxis() ||
+      result.getSlots() != input.getSlots() ||
+      result.getTermsPerSlot() != input.getTermsPerSlot() ||
+      resultPartial.getLayout().getSew() !=
+          2 * inputPartial.getLayout().getSew() ||
+      resultPartial.getLayout().getLmulEighths() !=
+          2 * inputPartial.getLayout().getLmulEighths() ||
+      resultPartial.getLayout().getVl() != inputPartial.getLayout().getVl() ||
+      resultPartial.getLayout().getRegisterGroups() !=
+          std::max<int64_t>(
+              1, (resultPartial.getLayout().getLmulEighths() + 7) / 8) ||
+      result.getResourceGroups() !=
+          result.getSlots() *
+              resultPartial.getLayout().getRegisterGroups() ||
+      getScales().size() != static_cast<size_t>(input.getSlots()) ||
+      getScaleReplicas().size() != static_cast<size_t>(input.getSlots()) ||
+      !kernel || !kernel.getTarget().getHasWideningInteger() ||
+      !supportsRVVLayout(kernel.getTarget(), inputPartial.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), resultPartial.getLayout()) ||
+      !exactLeaf(getLeaf(), "rvv", "partial-widen-scale",
+                 "rvv.partial-widen-scale", "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>(
+              {input.getReductionAxis(), input.getSlots()}))
+    return emitOpError(
+        "RVV partial widen-scale requires one signed narrow scalar per i16 slot and an exact i32 topology");
+  for (auto [scale, replica] :
+       llvm::zip(getScales(), getScaleReplicas())) {
+    ValueType type = mlir::cast<ValueType>(scale.getType());
+    auto scaleElement =
+        mlir::dyn_cast<mlir::IntegerType>(type.getElementType());
+    auto replicas = checkedPositiveProduct(
+        type.getLayout().getReplicaFactors().asArrayRef());
+    if (!scaleElement || !scaleElement.isSigned() ||
+        scaleElement.getWidth() <= 0 || scaleElement.getWidth() > 16 ||
+        type.getLayout().getCarrier() != "scalar" || !replicas ||
+        replica < 0 || replica >= *replicas ||
+        !llvm::all_of(type.getLayout().getTimeFactors().asArrayRef(),
+                      [](int64_t factor) { return factor == 1; }) ||
+        !llvm::all_of(type.getLayout().getLaneFactors().asArrayRef(),
+                      [](int64_t factor) { return factor == 1; }))
+      return emitOpError(
+          "RVV partial widen-scale operands require in-bounds signed narrow scalar replicas");
   }
   return mlir::success();
 }

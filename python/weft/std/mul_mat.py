@@ -701,6 +701,39 @@ def mul_mat_q6_k(
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        integer_acc = new(i32, [MR, NR], init=i32(0))
+                        with L.subs(kb, extent=16) as sub:
+                            q = i8(w.ql[:, sub]) | (i8(w.qh[:, sub]) << u8(4))
+                            q -= i8(32)
+                            integer = outer_contract(
+                                x.q[:, sub], q, over="k", acc=i32
+                            )
+                            integer_acc += integer * i32(w.scales[:, sub])
+                        acc += (
+                            f32(x.ds)
+                            * f32(w.d)
+                            * widen(integer_acc, f32)
+                        )
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_q6_k_decode(
+    W: View[Q6_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
     for row in range(M):
         for column in range(N):
             commit(vec_dot_q6_k_q8_k(W[column], Xq[row]), Y[row, column])

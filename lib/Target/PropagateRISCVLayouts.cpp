@@ -290,14 +290,14 @@ bool layoutPreservingPointwise(mlir::Operation *operation) {
                    riscv::ConvertLayoutOp, riscv::MaterializeOp>(operation);
 }
 
-llvm::SmallVector<int64_t>
-downstreamReducedFreeAxes(mlir::Operation *contraction,
-                          llvm::ArrayRef<int64_t> reductionAxes) {
-  llvm::SmallVector<int64_t> reducedAxes;
+std::optional<int64_t>
+downstreamImmediateReducedFreeAxis(mlir::Operation *contraction,
+                                   llvm::ArrayRef<int64_t> reductionAxes) {
   if (!contraction || contraction->getNumResults() != 1)
-    return reducedAxes;
+    return std::nullopt;
   llvm::SmallVector<mlir::Value> worklist{contraction->getResult(0)};
   llvm::SmallPtrSet<mlir::Operation *, 16> visited;
+  std::optional<int64_t> reducedAxis;
   while (!worklist.empty()) {
     mlir::Value value = worklist.pop_back_val();
     auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
@@ -311,10 +311,14 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
             reduce.getAxis() >= static_cast<int64_t>(source.getAxisIds().size()))
           continue;
         const int64_t axis = source.getAxisIds()[reduce.getAxis()];
-        if (!llvm::is_contained(reductionAxes, axis) &&
-            !llvm::is_contained(reducedAxes, axis))
-          reducedAxes.push_back(axis);
-        worklist.push_back(reduce.getResult());
+        if (llvm::is_contained(reductionAxes, axis))
+          continue;
+        if (reducedAxis && *reducedAxis != axis)
+          return std::nullopt;
+        reducedAxis = axis;
+        // Preserve the explicit nested reduction tree.  Only the first
+        // reduction outside the contraction may join its lane coordinate;
+        // outer reductions remain independent partial/register coordinates.
         continue;
       }
       if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
@@ -326,7 +330,7 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
       worklist.push_back(user->getResult(0));
     }
   }
-  return reducedAxes;
+  return reducedAxis;
 }
 
 int64_t freeAxisSharedByOneOperand(mlir::Value lhs, mlir::Value rhs) {
@@ -479,20 +483,19 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
       roles.laneAxis = axis;
       break;
     }
-  // A free axis that is consumed by a downstream reduction is not an output
-  // microtile that must remain as register replicas.  It is a segmented lane
-  // coordinate of the same local contraction.  Coalesce as much of it as the
-  // instantiated LMUL permits; any remainder stays as explicit issue time.
-  // This is derived from the typed contraction/use relation and applies to
-  // dense, bit-plane, and codebook inputs alike.
+  // The first free axis eliminated immediately after a contraction belongs to
+  // the same lane-local partial.  Later nested reductions describe a distinct
+  // partial-combine hierarchy and therefore remain register replicas.  Folding
+  // every downstream reduction axis into one large LMUL value destroys that
+  // author-visible hierarchy and forces avoidable register-to-lane packing.
   if (roles.laneAxis)
-    for (int64_t freeAxis :
-         downstreamReducedFreeAxes(operation.getOperation(), reduction))
-      if (freeAxis != roles.laneAxis &&
-          containsAxis(value.getType(), freeAxis)) {
-        roles.coalescedLaneAxes.insert(freeAxis);
-        roles.replicaAxes.erase(freeAxis);
-      }
+    if (auto freeAxis = downstreamImmediateReducedFreeAxis(
+            operation.getOperation(), reduction);
+        freeAxis && *freeAxis != roles.laneAxis &&
+        containsAxis(value.getType(), *freeAxis)) {
+      roles.coalescedLaneAxes.insert(*freeAxis);
+      roles.replicaAxes.erase(*freeAxis);
+    }
   // A shaped contraction result no longer contains the eliminated reduction
   // axis.  Its surviving free axes form a register/time tuple; a downstream
   // pointwise scale or reduction must not re-anchor one of those free axes as
@@ -1757,7 +1760,34 @@ private:
       if (!lhsLanes || !rhsLanes || *lhsLanes <= 0 || *rhsLanes <= 0 ||
           *lhsLanes == *rhsLanes)
         continue;
-      const unsigned sourceIndex = *lhsLanes < *rhsLanes ? 0 : 1;
+      llvm::SmallVector<int64_t> contractionReductionAxes;
+      if (auto over =
+              operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over"))
+        contractionReductionAxes.assign(over.asArrayRef().begin(),
+                                        over.asArrayRef().end());
+      auto immediate = downstreamImmediateReducedFreeAxis(
+          operation, contractionReductionAxes);
+      auto extraLaneAxes = [&](riscv::ValueType type) {
+        int64_t extras = 0;
+        for (auto [position, axis] :
+             llvm::enumerate(type.getAxisIds().asArrayRef()))
+          if (type.getLayout().getLaneFactors()[position] > 1 &&
+              !llvm::is_contained(contractionReductionAxes, axis) &&
+              (!immediate || axis != *immediate))
+            ++extras;
+        return extras;
+      };
+      const int64_t lhsExtras = extraLaneAxes(lhs);
+      const int64_t rhsExtras = extraLaneAxes(rhs);
+      // The explicit nested reduction tree fixes which free coordinate joins
+      // the contraction lanes.  When one operand's memory mapping has flattened
+      // additional outer partial axes into lanes, convert that operand back to
+      // the contraction topology instead of forcing every other operand into
+      // the larger flattened register group.  If both already preserve the
+      // same hierarchy, retain the wider common issue shape.
+      const unsigned sourceIndex =
+          lhsExtras != rhsExtras ? (lhsExtras > rhsExtras ? 0 : 1)
+                                 : (*lhsLanes < *rhsLanes ? 0 : 1);
       auto source = sourceIndex ? rhs : lhs;
       auto target = sourceIndex ? lhs : rhs;
       if (source.getLayout().getCarrier() != "rvv" ||

@@ -995,6 +995,7 @@ def WeftRISCV_RVVReplicaStorageLoadOp
     : WeftRISCV_Op<"rvv_replica_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        AnyType:$logical_base,
+                       I64Attr:$logical_base_multiple,
                        I64Attr:$lane_axis,
                        I64Attr:$logical_span,
                        DenseI64ArrayAttr:$window_offsets,
@@ -1081,6 +1082,16 @@ def WeftRISCV_RVVPartialScaleCombineOp
                        Variadic<WeftRISCV_ValueType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
                        DenseI64ArrayAttr:$slot_order,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialWidenScaleOp
+    : WeftRISCV_Op<"rvv_partial_widen_scale", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       Variadic<WeftRISCV_ValueType>:$scales,
+                       DenseI64ArrayAttr:$scale_replicas,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;

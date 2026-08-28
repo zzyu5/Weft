@@ -149,15 +149,10 @@ def dequantize_q5_k(W: View[Q5_K, (K,)], Y: View[f32, (K,)]):
 def dequantize_q6_k(W: View[Q6_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            within = j % 128
-            ql = w.ql[(j // 128) * 64 + (within % 64)]
-            low = extract_bits(ql, (within // 64) * 4, 4)
-            qh = w.qh[(j // 128) * 32 + (within % 32)]
-            high = extract_bits(qh, (within // 32) * 2, 2)
-            q = i32(low | (high << u32(4))) - i32(32)
-            scale = w.scales[(j // 128) * 8 + within // 16]
-            commit(f32(w.d) * f32(scale) * f32(q), Y[kb][j])
+        with L.subs(kb, extent=16) as sub:
+            q = i32(w.ql[sub]) | (i32(w.qh[sub]) << u32(4))
+            q -= i32(32)
+            commit(f32(w.d) * f32(w.scales[sub]) * f32(q), Y[kb][sub])
 
 
 def dequantize_iq1_s(

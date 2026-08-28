@@ -465,6 +465,27 @@ riscv::ValueType splitPartialSlotType(mlir::Builder &builder,
                                lane, axisIds, layout);
 }
 
+riscv::ValueType widenPartialSlotType(mlir::Builder &builder,
+                                      riscv::ValueType source) {
+  auto element = mlir::dyn_cast<mlir::IntegerType>(source.getElementType());
+  if (!element || !element.isSigned() || element.getWidth() != 16 ||
+      source.getLayout().getCarrier() != "rvv")
+    return {};
+  const int64_t lmul = source.getLayout().getLmulEighths() * 2;
+  const int64_t groups = std::max<int64_t>(1, (lmul + 7) / 8);
+  auto layout = riscv::LayoutAttr::get(
+      builder.getContext(), "rvv", source.getLayout().getAxisIds(),
+      source.getLayout().getTimeFactors(), source.getLayout().getLaneFactors(),
+      source.getLayout().getReplicaFactors(),
+      source.getLayout().getFragmentFactors(),
+      source.getLayout().getLocalFactors(), 32, lmul,
+      source.getLayout().getVl(), groups, source.getLayout().getValidity());
+  auto widened = mlir::IntegerType::get(builder.getContext(), 32,
+                                        mlir::IntegerType::Signed);
+  return riscv::ValueType::get(builder.getContext(), widened, source.getShape(),
+                               source.getAxisIds(), layout);
+}
+
 riscv::ValueType vectorPartialSlotType(
     mlir::Builder &builder, riscv::ValueType operand,
     riscv::ValueType result, int64_t reductionAxis) {
@@ -885,6 +906,42 @@ mlir::FailureOr<mlir::Value> rematerializeScalarReplicas(
   mlir::Value result = clone->getResult(0);
   memo.try_emplace(value, result);
   return result;
+}
+
+std::optional<mlir::Value> narrowScaleSource(mlir::Value value) {
+  mlir::Value cursor = value;
+  while (auto conversion = cursor.getDefiningOp<riscv::ConvertLayoutOp>()) {
+    if (conversion.getConversion().getEffect() != "pure")
+      return std::nullopt;
+    cursor = conversion.getInput();
+  }
+  auto widen = cursor.getDefiningOp<riscv::WidenOp>();
+  if (!widen)
+    return std::nullopt;
+  auto source = mlir::dyn_cast<riscv::ValueType>(widen.getInput().getType());
+  auto result = mlir::dyn_cast<riscv::ValueType>(widen.getResult().getType());
+  auto sourceElement =
+      source ? mlir::dyn_cast<mlir::IntegerType>(source.getElementType())
+             : mlir::IntegerType();
+  auto resultElement =
+      result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+             : mlir::IntegerType();
+  if (!source || !result || !sourceElement || !sourceElement.isSigned() ||
+      sourceElement.getWidth() <= 0 || sourceElement.getWidth() > 16 ||
+      !resultElement || !resultElement.isSigned() ||
+      resultElement.getWidth() != 32 ||
+      source.getLayout().getCarrier() != "scalar" ||
+      result.getLayout().getCarrier() != "scalar" ||
+      source.getShape() != result.getShape() ||
+      source.getAxisIds() != result.getAxisIds() ||
+      source.getLayout().getTimeFactors() !=
+          result.getLayout().getTimeFactors() ||
+      source.getLayout().getLaneFactors() !=
+          result.getLayout().getLaneFactors() ||
+      source.getLayout().getReplicaFactors() !=
+          result.getLayout().getReplicaFactors())
+    return std::nullopt;
+  return widen.getInput();
 }
 
 struct ScaledPartialContribution {
@@ -1516,6 +1573,41 @@ public:
       for (int64_t slot = 0; slot < *slots; ++slot)
         scaleReplicas.push_back(slot);
 
+      auto narrowScale = narrowScaleSource(*scalarScale);
+      auto narrowScaleType =
+          narrowScale
+              ? mlir::dyn_cast<riscv::ValueType>((*narrowScale).getType())
+              : riscv::ValueType();
+      auto narrowScaleParts =
+          narrowScaleType
+              ? riscv_internal::staticProduct(
+                    narrowScaleType.getLayout()
+                        .getReplicaFactors()
+                        .asArrayRef())
+              : std::optional<int64_t>();
+      auto widenedSlot = widenPartialSlotType(rewriter, slotType);
+      auto finalInteger =
+          mlir::dyn_cast<mlir::IntegerType>(reduce.getResult().getType());
+      const int64_t widenedGroups =
+          widenedSlot ? *slots * widenedSlot.getLayout().getRegisterGroups() : 0;
+      const int64_t narrowScaleGroups =
+          narrowScaleType
+              ? *slots * narrowScaleType.getLayout().getRegisterGroups()
+              : 0;
+      const bool useWidenScaleTopology =
+          narrowScale && narrowScaleType && narrowScaleParts &&
+          *narrowScaleParts == *slots && widenedSlot && *slots >= 2 &&
+          *slots % 2 == 0 && finalInteger && finalInteger.isSigned() &&
+          finalInteger.getWidth() == 32 &&
+          llvm::is_contained(
+              kernel.getTarget().getSupportedSEW().asArrayRef(),
+              widenedSlot.getLayout().getSew()) &&
+          llvm::is_contained(
+              kernel.getTarget().getLegalLMULEighths().asArrayRef(),
+              widenedSlot.getLayout().getLmulEighths()) &&
+          repackedType.getResourceGroups() + narrowScaleGroups + widenedGroups <=
+              kernel.getTarget().getVectorRegisters();
+
       auto set = rewriter.create<riscv::RVVPartialSetOp>(
           reduce.getLoc(), setType, mlir::ValueRange{dot.getLhs()},
           mlir::ValueRange{dot.getRhs()},
@@ -1541,43 +1633,80 @@ public:
         riscv_internal::copyOrigin(dot, repacked);
         partials = repacked.getResult();
       }
-      auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
-          reduce.getLoc(), reducedType, partials,
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-reduce",
-              mlir::cast<mlir::IntegerType>(slotType.getElementType())
-                          .getWidth() == 16
-                  ? "rvv.partial-reduce.widen"
-                  : "rvv.partial-reduce",
-              mlir::cast<mlir::IntegerType>(slotType.getElementType())
-                          .getWidth() == 16
-                  ? "rvv.partial-reduce.widen"
-                  : "rvv.partial-reduce",
-              repackedType.getResourceGroups(),
-              reducedType.getResourceGroups(), 1, 0,
-              "none", "exact", {reductionAxis, *slots}));
-      riscv_internal::copyOrigin(dot, reduced);
-      auto combined = rewriter.create<riscv::RVVPartialScaleCombineOp>(
-          reduce.getLoc(), combinedType, reduced.getResult(), scales,
-          rewriter.getDenseI64ArrayAttr(scaleReplicas),
-          rewriter.getDenseI64ArrayAttr(slotOrder),
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-scale-combine",
-              "rvv.partial-scale-combine", "rvv.partial-scale-combine",
-              reducedType.getResourceGroups(), combinedType.getResourceGroups(), 1,
-              0, "none", "exact",
-              {reductionAxis, *slots, chains, fanout}));
-      riscv_internal::copyOrigin(dot, combined);
-      auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
-          reduce.getLoc(), reduce.getResult().getType(), combined.getResult(),
-          reductionAxis,
-          riscv_internal::leaf(rewriter, "rvv", "partial-finalize",
-                               *partialFinalizeInstruction(combinedType,
-                                                           reductionAxis),
-                               *partialFinalizeInstruction(combinedType,
-                                                           reductionAxis),
-                               combinedType.getResourceGroups(), 0, 0, 0,
-                               "none", "exact", {reductionAxis, chains}));
+      riscv::RVVPartialFinalizeOp finalized;
+      if (useWidenScaleTopology) {
+        auto widenedType = riscv::PartialSetType::get(
+            rewriter.getContext(), widenedSlot, reductionAxis, *slots,
+            repackedType.getTermsPerSlot(), widenedGroups);
+        auto pairType = riscv::PartialSetType::get(
+            rewriter.getContext(), widenedSlot, reductionAxis, *slots / 2,
+            widenedType.getTermsPerSlot() * 2,
+            (*slots / 2) * widenedSlot.getLayout().getRegisterGroups());
+        llvm::SmallVector<mlir::Value> narrowScales(*slots, *narrowScale);
+        auto scaled = rewriter.create<riscv::RVVPartialWidenScaleOp>(
+            reduce.getLoc(), widenedType, partials, narrowScales,
+            rewriter.getDenseI64ArrayAttr(scaleReplicas),
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-widen-scale",
+                "rvv.partial-widen-scale", "rvv.partial-widen-scale",
+                repackedType.getResourceGroups() + narrowScaleGroups,
+                widenedType.getResourceGroups(), 0, 0, "none", "exact",
+                {reductionAxis, *slots}));
+        riscv_internal::copyOrigin(dot, scaled);
+        auto paired = rewriter.create<riscv::RVVPartialCombineOp>(
+            reduce.getLoc(), pairType, scaled.getResult(), 2, "pairwise",
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-combine", "rvv.partial-combine",
+                "rvv.partial-combine", widenedType.getResourceGroups(),
+                pairType.getResourceGroups(), 0, 0, "none", "exact",
+                {reductionAxis, 2, *slots / 2}));
+        riscv_internal::copyOrigin(dot, paired);
+        finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
+            reduce.getLoc(), reduce.getResult().getType(), paired.getResult(),
+            reductionAxis,
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-finalize",
+                *partialFinalizeInstruction(pairType, reductionAxis),
+                *partialFinalizeInstruction(pairType, reductionAxis),
+                pairType.getResourceGroups(), 0, 0, 0, "none", "exact",
+                {reductionAxis, *slots / 2}));
+      } else {
+        auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
+            reduce.getLoc(), reducedType, partials,
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-reduce",
+                mlir::cast<mlir::IntegerType>(slotType.getElementType())
+                            .getWidth() == 16
+                    ? "rvv.partial-reduce.widen"
+                    : "rvv.partial-reduce",
+                mlir::cast<mlir::IntegerType>(slotType.getElementType())
+                            .getWidth() == 16
+                    ? "rvv.partial-reduce.widen"
+                    : "rvv.partial-reduce",
+                repackedType.getResourceGroups(), reducedType.getResourceGroups(),
+                1, 0, "none", "exact", {reductionAxis, *slots}));
+        riscv_internal::copyOrigin(dot, reduced);
+        auto combined = rewriter.create<riscv::RVVPartialScaleCombineOp>(
+            reduce.getLoc(), combinedType, reduced.getResult(), scales,
+            rewriter.getDenseI64ArrayAttr(scaleReplicas),
+            rewriter.getDenseI64ArrayAttr(slotOrder),
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-scale-combine",
+                "rvv.partial-scale-combine", "rvv.partial-scale-combine",
+                reducedType.getResourceGroups(), combinedType.getResourceGroups(),
+                1, 0, "none", "exact",
+                {reductionAxis, *slots, chains, fanout}));
+        riscv_internal::copyOrigin(dot, combined);
+        finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
+            reduce.getLoc(), reduce.getResult().getType(), combined.getResult(),
+            reductionAxis,
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-finalize",
+                *partialFinalizeInstruction(combinedType, reductionAxis),
+                *partialFinalizeInstruction(combinedType, reductionAxis),
+                combinedType.getResourceGroups(), 0, 0, 0, "none", "exact",
+                {reductionAxis, chains}));
+      }
       riscv_internal::copyOrigin(dot, finalized);
       reduce.getResult().replaceAllUsesWith(finalized.getResult());
 
