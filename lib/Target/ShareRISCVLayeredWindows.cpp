@@ -440,37 +440,55 @@ bool isProjectedLayeredExtract(
                    ? mlir::dyn_cast<riscv::ValueType>(field.getResult().getType())
                    : riscv::ValueType();
   auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
-  auto pattern = extract->getAttrOfType<mlir::DenseI64ArrayAttr>("index_pattern");
-  if (!field || !input || !result || !pattern || pattern.size() != 3 ||
+  if (!field || !input || !result ||
       input.getShape().size() != result.getShape().size() ||
       extract.getAccess().getForm() != "indexed" ||
       extract.getAccess().getMapping() != "grouped_layered")
     return false;
 
   size_t projection = extract.getSelectors().size();
-  bool hasRegular = false;
+  bool domainProjection = false;
+  int64_t domainSelectors = 0;
   for (auto [position, selector] : llvm::enumerate(extract.getSelectors())) {
     llvm::StringRef name = mlir::cast<mlir::StringAttr>(selector).getValue();
-    if (name == "regular") {
+    if (name == "regular" || name == "domain") {
       if (projection != extract.getSelectors().size())
         return false;
       projection = position;
-      hasRegular = true;
+      domainProjection = name == "domain";
+      domainSelectors += domainProjection;
     } else if (name != "all") {
       return false;
     }
   }
-  if (!hasRegular || projection >= result.getShape().size() ||
-      projection >= result.getAxisIds().size() ||
-      !extract.getIndices().empty())
+  if (projection >= result.getShape().size() ||
+      projection >= result.getAxisIds().size())
     return false;
 
   axis = result.getAxisIds()[projection];
-  base = pattern[0];
-  stride = pattern[1];
-  repeat = pattern[2];
   extent = result.getShape()[projection];
-  origin = riscv_internal::originPoint(field.getOwner(), axis);
+  if (domainProjection) {
+    origin = extract.getIndices().size() == 1
+                 ? riscv_internal::stripRepresentationConversions(
+                       extract.getIndices().front())
+                       .getDefiningOp<riscv::PhysicalPointOp>()
+                 : riscv::PhysicalPointOp();
+    if (domainSelectors != 1 || !origin ||
+        origin.getResult().getType().getDomain().getAxisId() != axis)
+      return false;
+    base = 0;
+    stride = 1;
+    repeat = 1;
+  } else {
+    auto pattern =
+        extract->getAttrOfType<mlir::DenseI64ArrayAttr>("index_pattern");
+    if (!pattern || pattern.size() != 3 || !extract.getIndices().empty())
+      return false;
+    base = pattern[0];
+    stride = pattern[1];
+    repeat = pattern[2];
+    origin = riscv_internal::originPoint(field.getOwner(), axis);
+  }
   const int64_t sourceExtent = input.getShape()[projection];
   const int64_t group = extract.getAccess().getGroupSize();
   const int64_t layer = extract.getAccess().getLayerSize();
@@ -626,18 +644,52 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   auto kernel = extract->getParentOfType<riscv::KernelOp>();
   if (!field || !fieldType || !resultType || extract.getIndices().size() != 1 ||
       !kernel ||
-      extract.getSelectors().size() != 1 ||
-      mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() !=
-          "gather" ||
       extract.getAccess().getForm() != "indexed" ||
       (extract.getAccess().getMapping() != "natural" &&
        extract.getAccess().getMapping() != "grouped_layered"))
+    return false;
+  int64_t gatherSelectors = 0;
+  for (mlir::Attribute selector : extract.getSelectors()) {
+    llvm::StringRef name = mlir::cast<mlir::StringAttr>(selector).getValue();
+    if (name == "gather")
+      ++gatherSelectors;
+    else if (name != "all")
+      return false;
+  }
+  if (gatherSelectors != 1)
     return false;
 
   ShapedAffineIndex affine;
   decomposeShapedIndex(extract.getIndices().front(), 1, affine);
   if (!affine.valid)
     return false;
+
+  auto isPreservedFieldAxis = [&](size_t resultPosition) {
+    const int64_t axis = resultType.getAxisIds()[resultPosition];
+    auto fieldAxis = llvm::find(fieldType.getAxisIds().asArrayRef(), axis);
+    if (fieldAxis == fieldType.getAxisIds().asArrayRef().end())
+      return false;
+    const size_t fieldPosition = static_cast<size_t>(
+        fieldAxis - fieldType.getAxisIds().asArrayRef().begin());
+    return fieldType.getShape()[fieldPosition] ==
+           resultType.getShape()[resultPosition];
+  };
+
+  auto hasContiguousLaneGeometry = [&](riscv::ValueType type) {
+    int64_t expectedStride = 1;
+    for (int64_t position = static_cast<int64_t>(type.getShape().size()) - 1;
+         position >= 0; --position) {
+      const int64_t lane =
+          type.getLayout().getLaneFactors()[static_cast<size_t>(position)];
+      if (lane <= 1)
+        continue;
+      const int64_t axis = type.getAxisIds()[static_cast<size_t>(position)];
+      if (affine.axisCoefficients.lookup(axis) != expectedStride ||
+          !checkedMultiply(expectedStride, lane, expectedStride))
+        return false;
+    }
+    return true;
+  };
 
   riscv::ConvertLayoutOp consumerConversion;
   riscv::ValueType selectedType = resultType;
@@ -648,12 +700,24 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
         conversion
             ? mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType())
             : riscv::ValueType();
+    auto targetLanes =
+        targetType
+            ? riscv_internal::staticProduct(
+                  targetType.getLayout().getLaneFactors().asArrayRef())
+            : std::optional<int64_t>();
+    const bool targetFitsOneLayer =
+        extract.getAccess().getMapping() != "grouped_layered" ||
+        (targetLanes && *targetLanes > 0 &&
+         extract.getAccess().getLayerSize() % *targetLanes == 0);
     if (conversion && conversion.getConversion().getEffect() == "pure" &&
         targetType &&
         targetType.getLayout().getCarrier() == "rvv" &&
         targetType.getElementType() == resultType.getElementType() &&
         targetType.getShape() == resultType.getShape() &&
-        targetType.getAxisIds() == resultType.getAxisIds()) {
+        targetType.getAxisIds() == resultType.getAxisIds() &&
+        targetFitsOneLayer &&
+        (extract.getAccess().getMapping() != "grouped_layered" ||
+         hasContiguousLaneGeometry(targetType))) {
       // The typed geometry checks below are sufficient for both natural and
       // grouped/layered storage.  Refusing the latter here forces a narrow raw
       // window followed by register-to-lane packing even when the target lane
@@ -685,10 +749,16 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
         selectedType.getLayout().getFragmentFactors()[position];
     const int64_t local = selectedType.getLayout().getLocalFactors()[position];
     int64_t represented = 0;
+    const bool preservedFieldAxis =
+        !affine.axisCoefficients.contains(selectedType.getAxisIds()[position]) &&
+        isPreservedFieldAxis(position);
     if (time <= 0 || lane <= 0 || replica <= 0 || fragment != 1 || local != 1 ||
         !checkedMultiply(time, lane, represented) ||
         !checkedMultiply(represented, replica, represented) ||
-        represented != selectedType.getShape()[position])
+        (selectedType.getShape()[position] > 0 &&
+         represented != selectedType.getShape()[position]) ||
+        (selectedType.getShape()[position] <= 0 && represented != 1 &&
+         !preservedFieldAxis))
       return false;
     if (lane > 1) {
       if (replica != 1)
@@ -699,7 +769,8 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     } else {
       if ((time > 1 && replica > 1) ||
           (selectedType.getShape()[position] > 1 &&
-           !affine.axisCoefficients.contains(selectedType.getAxisIds()[position])))
+           !affine.axisCoefficients.contains(selectedType.getAxisIds()[position]) &&
+           !preservedFieldAxis))
         return false;
     }
     if (!checkedMultiply(streams, time, streams) ||
@@ -831,14 +902,16 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   if (affine.scalarBase && affine.constant != 0)
     return false;
 
-  llvm::DenseMap<int64_t, int64_t> windowIds;
+  llvm::DenseMap<std::pair<int64_t, int64_t>, int64_t> windowIds;
   llvm::SmallVector<int64_t> windowOffsets;
   llvm::SmallVector<int64_t> windowForPart;
   llvm::SmallVector<int64_t> layerForPart;
-  for (int64_t offset : partOffsets) {
+  for (auto [part, offset] : llvm::enumerate(partOffsets)) {
     const int64_t windowOffset = layered ? offset % layer : offset;
+    const int64_t recordReplica = static_cast<int64_t>(part) / streams;
     auto [found, inserted] = windowIds.try_emplace(
-        windowOffset, static_cast<int64_t>(windowOffsets.size()));
+        std::make_pair(recordReplica, windowOffset),
+        static_cast<int64_t>(windowOffsets.size()));
     if (inserted)
       windowOffsets.push_back(windowOffset);
     windowForPart.push_back(found->second);

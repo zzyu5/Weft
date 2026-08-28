@@ -1247,6 +1247,88 @@ public:
     propagateRoles();
     for (mlir::Value value : values)
       completeRoles(value, roles[value]);
+
+    // A widening contraction has one physical issue topology over the axes
+    // shared by both operands.  Storage propagation may otherwise leave one
+    // operand with a shared partial axis in registers while the other operand
+    // carries the same axis in time/lanes.  Prefer the already-derived mapping
+    // with fewer shared register replicas and propagate that mapping to the
+    // other operand before layouts are built.  Unique output axes remain owned
+    // by their respective operand.
+    getOperation().walk([&](mlir::Operation *operation) {
+      // Only an outer contraction has two independently surviving free-axis
+      // domains whose shared partial coordinates require one issue mapping.
+      // Dot/contract and grouped-MAC reductions already anchor their single
+      // surviving domain through the reduction result and must retain it.
+      if (!mlir::isa<riscv::OuterContractOp>(operation))
+        return;
+      auto implementation =
+          operation->getAttrOfType<riscv::ImplementationAttr>("implementation");
+      if (!implementation || implementation.getFamily() != "widen-dot")
+        return;
+      mlir::Value lhs = operation->getOperand(0);
+      mlir::Value rhs = operation->getOperand(1);
+      auto lhsType = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
+      auto rhsType = mlir::dyn_cast<riscv::ValueType>(rhs.getType());
+      if (!lhsType || !rhsType)
+        return;
+      llvm::SmallVector<int64_t> sharedAxes;
+      for (auto [lhsPosition, axis] :
+           llvm::enumerate(lhsType.getAxisIds().asArrayRef())) {
+        auto rhsAxis = llvm::find(rhsType.getAxisIds().asArrayRef(), axis);
+        if (rhsAxis == rhsType.getAxisIds().asArrayRef().end())
+          continue;
+        const size_t rhsPosition = static_cast<size_t>(
+            rhsAxis - rhsType.getAxisIds().asArrayRef().begin());
+        if (lhsType.getShape()[lhsPosition] != rhsType.getShape()[rhsPosition])
+          return;
+        sharedAxes.push_back(axis);
+      }
+      const bool lhsHasUniqueFreeAxis = llvm::any_of(
+          lhsType.getAxisIds().asArrayRef(),
+          [&](int64_t axis) { return !llvm::is_contained(sharedAxes, axis); });
+      const bool rhsHasUniqueFreeAxis = llvm::any_of(
+          rhsType.getAxisIds().asArrayRef(),
+          [&](int64_t axis) { return !llvm::is_contained(sharedAxes, axis); });
+      if (sharedAxes.empty() || !lhsHasUniqueFreeAxis ||
+          !rhsHasUniqueFreeAxis || roles[lhs].laneAxis == 0 ||
+          roles[lhs].laneAxis != roles[rhs].laneAxis ||
+          !llvm::is_contained(sharedAxes, roles[lhs].laneAxis))
+        return;
+      auto sharedReplicaProduct = [&](mlir::Value value) {
+        int64_t result = 1;
+        for (int64_t axis : sharedAxes)
+          if (roles[value].replicaAxes.contains(axis)) {
+            const int64_t extent = riscv_internal::physicalExtent(value, axis);
+            if (extent <= 0 || !checkedMultiply(result, extent, result))
+              return int64_t{-1};
+          }
+        return result;
+      };
+      const int64_t lhsReplicas = sharedReplicaProduct(lhs);
+      const int64_t rhsReplicas = sharedReplicaProduct(rhs);
+      if (lhsReplicas <= 0 || rhsReplicas <= 0 || lhsReplicas == rhsReplicas)
+        return;
+      mlir::Value anchor = lhsReplicas < rhsReplicas ? lhs : rhs;
+      mlir::Value target = lhsReplicas < rhsReplicas ? rhs : lhs;
+      Roles &anchorRoles = roles[anchor];
+      Roles &targetRoles = roles[target];
+      for (int64_t axis : sharedAxes) {
+        targetRoles.replicaAxes.erase(axis);
+        targetRoles.coalescedLaneAxes.erase(axis);
+        targetRoles.sequentialAxes.erase(axis);
+        if (anchorRoles.replicaAxes.contains(axis))
+          targetRoles.replicaAxes.insert(axis);
+        if (anchorRoles.coalescedLaneAxes.contains(axis))
+          targetRoles.coalescedLaneAxes.insert(axis);
+        if (anchorRoles.sequentialAxes.contains(axis))
+          targetRoles.sequentialAxes.insert(axis);
+      }
+      targetRoles.laneAxis = anchorRoles.laneAxis;
+      targetRoles.registerTuple = false;
+      targetRoles.anchored = true;
+      targetRoles.fullLaneExtent = anchorRoles.fullLaneExtent;
+    });
     propagateRoles();
 
     // Each physical value receives the largest lane span legal for its own
@@ -1578,8 +1660,11 @@ private:
       if (ordinal < lane.size() && lane[ordinal] > 1)
         continue;
       if (inputType.getLayout().getCarrier() != "scalar") {
-        reduce.emitError(
+        auto diagnostic = reduce.emitError(
             "reduction layout conflict requires an unsupported non-scalar lane remap");
+        if (mlir::Operation *definition = input.getDefiningOp())
+          diagnostic << "; producer=" << definition->getName();
+        diagnostic << "; layout=" << inputType.getLayout();
         signalPassFailure();
         continue;
       }

@@ -17,6 +17,11 @@ constexpr llvm::StringLiteral kStageAttr = "weft.riscv.pipeline_stage";
 constexpr llvm::StringLiteral kOrderAttr = "weft.riscv.pipeline_order";
 
 bool hasWriteOrUnknownEffect(mlir::Operation *operation) {
+  // Physical points carry Level identity and therefore are deliberately not
+  // globally Pure/CSE-able, but reading that identity does not create a memory
+  // dependence inside a software-pipelined Level.
+  if (mlir::isa<riscv::RootPointOp, riscv::PhysicalPointOp>(operation))
+    return false;
   if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation)) {
     llvm::StringRef effect = conversion.getConversion().getEffect();
     return effect != "pure" && effect != "read";
@@ -159,7 +164,9 @@ public:
         }
         if (hasWriteOrUnknownEffect(&operation)) {
           operation.emitError(
-              "effectful operation has no physical pipeline ordering or predication contract");
+              "effectful operation ")
+              << operation.getName()
+              << " has no physical pipeline ordering or predication contract";
           failed = true;
           operations.clear();
           break;

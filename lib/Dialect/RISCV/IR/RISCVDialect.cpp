@@ -753,6 +753,68 @@ mlir::LogicalResult ScheduleAttr::verify(
   return mlir::success();
 }
 
+mlir::LogicalResult PartialTopologyAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    llvm::StringRef kind, int64_t rootOperand,
+    mlir::DenseI64ArrayAttr partialAxes, mlir::DenseI64ArrayAttr outputAxes,
+    int64_t sourceSlots, int64_t partialSlots, int64_t outputReplicas,
+    int64_t laneSplit, int64_t combineArity,
+    mlir::DenseI64ArrayAttr slotOrder, int64_t resourceGroups) {
+  if (kind != "unassigned" && kind != "sequential_fused" &&
+      kind != "sequential_per_stream" && kind != "independent" &&
+      kind != "scaled" && kind != "level_scaled" && kind != "merged" &&
+      kind != "layered")
+    return emitError() << "unknown partial topology kind";
+  if (kind == "unassigned") {
+    if (rootOperand != -1 || !partialAxes.empty() || !outputAxes.empty() ||
+        sourceSlots != 0 || partialSlots != 0 || outputReplicas != 0 ||
+        laneSplit != 0 || combineArity != 0 || !slotOrder.empty() ||
+        resourceGroups != 0)
+      return emitError()
+             << "unassigned partial topology cannot carry physical decisions";
+    return mlir::success();
+  }
+  if (rootOperand < -1 || sourceSlots <= 0 || partialSlots <= 0 ||
+      outputReplicas <= 0 || laneSplit <= 0 || combineArity <= 0 ||
+      resourceGroups <= 0 ||
+      slotOrder.size() != static_cast<size_t>(partialSlots))
+    return emitError() << "selected partial topology has incomplete geometry";
+  llvm::SmallVector<int64_t> ordered(slotOrder.asArrayRef());
+  llvm::sort(ordered);
+  for (auto [index, slot] : llvm::enumerate(ordered))
+    if (slot != static_cast<int64_t>(index))
+      return emitError() << "partial topology slot order is not a permutation";
+  llvm::SmallVector<int64_t> uniquePartialAxes(partialAxes.asArrayRef());
+  llvm::SmallVector<int64_t> uniqueOutputAxes(outputAxes.asArrayRef());
+  llvm::sort(uniquePartialAxes);
+  llvm::sort(uniqueOutputAxes);
+  if (std::adjacent_find(uniquePartialAxes.begin(), uniquePartialAxes.end()) !=
+          uniquePartialAxes.end() ||
+      std::adjacent_find(uniqueOutputAxes.begin(), uniqueOutputAxes.end()) !=
+          uniqueOutputAxes.end())
+    return emitError() << "partial topology axes must be unique";
+  if (llvm::any_of(partialAxes.asArrayRef(), [&](int64_t axis) {
+        return axis == 0 || llvm::is_contained(outputAxes.asArrayRef(), axis);
+      }) ||
+      llvm::any_of(outputAxes.asArrayRef(),
+                   [](int64_t axis) { return axis == 0; }))
+    return emitError()
+           << "partial and output axes must be nonzero and disjoint";
+  if (laneSplit > 1 &&
+      (kind != "scaled" || sourceSlots * laneSplit != partialSlots))
+    return emitError()
+           << "lane-split topology must close scaled source and partial slots";
+  if ((kind == "independent" || kind == "scaled" ||
+       kind == "level_scaled" || kind == "layered") &&
+      (combineArity > partialSlots || partialSlots % combineArity))
+    return emitError()
+           << "partial topology combine arity must divide its partial slots";
+  if ((kind == "layered") != (rootOperand >= 0))
+    return emitError()
+           << "only a layered topology may own one layered root operand";
+  return mlir::success();
+}
+
 mlir::LogicalResult LevelAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     int64_t domainId, int64_t axisId, llvm::StringRef relation,
@@ -3049,9 +3111,14 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
     compatibleStreamedReductions &= completeTimeAxis(lhs) &&
                                     completeTimeAxis(rhs);
   }
-  if ((getStreamReduction() != "fused" &&
-       getStreamReduction() != "per_stream") ||
-      getPartialUnroll() <= 0 ||
+  llvm::StringRef topologyKind = getPartialTopology().getKind();
+  const bool validTopology =
+      topologyKind == "unassigned" || topologyKind == "sequential_fused" ||
+      topologyKind == "sequential_per_stream" ||
+      topologyKind == "independent" || topologyKind == "scaled" ||
+      topologyKind == "level_scaled" || topologyKind == "merged" ||
+      topologyKind == "layered";
+  if (!validTopology || getPartialUnroll() <= 0 ||
       getSliceLmulEighths() <= 0 || !closedLaneSlices ||
       !lhsElement || !rhsElement || !resultElement ||
       lhsElement.getWidth() > 16 || rhsElement.getWidth() > 16 ||
@@ -3074,8 +3141,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
                  "rvv.vwmul-vwredsum", "none", "exact"))
     return emitOpError()
            << "RVV widening dot requires matching <=16-bit integer vectors with "
-              "at least one signed operand, an explicit fused/per-stream "
-              "reduction policy, one shared lane reduction axis, optional "
+              "at least one signed operand, one selected partial topology, "
+              "one shared lane reduction axis, optional "
               "issue-time reduction axes, a signed-i32 scalar result, and a legal doubled "
               "LMUL; lhs="
            << lhs << ", rhs=" << rhs << ", result=" << getResult().getType()
@@ -3591,15 +3658,43 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
     const int64_t time = result.getLayout().getTimeFactors()[position];
     const int64_t lane = result.getLayout().getLaneFactors()[position];
     const int64_t replica = result.getLayout().getReplicaFactors()[position];
+    const int64_t axis = result.getAxisIds()[position];
+    auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), axis);
+    const bool preservedFieldAxis =
+        fieldAxis != field.getAxisIds().asArrayRef().end() &&
+        field.getShape()[static_cast<size_t>(
+            fieldAxis - field.getAxisIds().asArrayRef().begin())] ==
+            result.getShape()[position];
     int64_t factors[] = {time, lane, replica};
     auto represented = checkedPositiveProduct(factors);
     if ((lane > 1 && replica != 1) ||
         (time > 1 && replica > 1) || !represented ||
-        *represented != result.getShape()[position] ||
+        (result.getShape()[position] > 0 &&
+         *represented != result.getShape()[position]) ||
+        (result.getShape()[position] <= 0 &&
+         (validity != "tail" ||
+          (*represented != 1 && !preservedFieldAxis))) ||
         result.getLayout().getFragmentFactors()[position] != 1 ||
         result.getLayout().getLocalFactors()[position] != 1)
       return emitOpError(
           "replica storage load must preserve every logical axis as lane, issue time, or register replicas");
+  }
+  auto streams = checkedPositiveProduct(
+      result.getLayout().getTimeFactors().asArrayRef());
+  llvm::SmallVector<int64_t> windowReplicas(getWindowOffsets().size(), -1);
+  if (!streams || *streams <= 0)
+    return emitOpError(
+        "replica storage load must define a positive issue-time decomposition");
+  for (auto [part, window] : llvm::enumerate(getWindowForPart())) {
+    if (window < 0 || window >= static_cast<int64_t>(windowReplicas.size()))
+      return emitOpError(
+          "replica storage load part references an invalid source window");
+    const int64_t replica = static_cast<int64_t>(part) / *streams;
+    int64_t &known = windowReplicas[static_cast<size_t>(window)];
+    if (known >= 0 && known != replica)
+      return emitOpError(
+          "replica storage load source window cannot cross register replicas");
+    known = replica;
   }
 
   if (natural) {
@@ -3927,6 +4022,8 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
       getRhsOperands().size() != static_cast<size_t>(result.getSlots()) ||
       getLhsParts().size() != static_cast<size_t>(result.getSlots()) ||
       getRhsParts().size() != static_cast<size_t>(result.getSlots()) ||
+      getLhsLaneOffsets().size() != static_cast<size_t>(result.getSlots()) ||
+      getRhsLaneOffsets().size() != static_cast<size_t>(result.getSlots()) ||
       getReductionAxis() != result.getReductionAxis() ||
       !exactLeaf(getLeaf(), "rvv", "partial-set", "rvv.partial-set",
                  "none", "exact"))
@@ -3978,6 +4075,31 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
     auto rhsAxis = positionOf(rhs);
     auto lhsParts = physicalPartCount(lhs);
     auto rhsParts = physicalPartCount(rhs);
+    auto lhsLanes = checkedPositiveProduct(
+        lhs.getLayout().getLaneFactors().asArrayRef());
+    auto rhsLanes = checkedPositiveProduct(
+        rhs.getLayout().getLaneFactors().asArrayRef());
+    const int64_t sliceLanes =
+        partial.getLayout().getLaneFactors()[*partialAxis];
+    int64_t lhsSliceLMUL =
+        lhsLanes && *lhsLanes > 0 &&
+                (lhs.getLayout().getLmulEighths() * sliceLanes) % *lhsLanes == 0
+            ? lhs.getLayout().getLmulEighths() * sliceLanes / *lhsLanes
+            : -1;
+    int64_t rhsSliceLMUL =
+        rhsLanes && *rhsLanes > 0 &&
+                (rhs.getLayout().getLmulEighths() * sliceLanes) % *rhsLanes == 0
+            ? rhs.getLayout().getLmulEighths() * sliceLanes / *rhsLanes
+            : -1;
+    // RVV group extraction cannot name a fractional destination register.
+    // A sub-register slice therefore uses an m1 carrier and records its true
+    // lane offset; this is the same typed contract used by RVVWidenDotOp.
+    if (lhsSliceLMUL > 0 && lhsSliceLMUL < 8 &&
+        lhs.getLayout().getLmulEighths() > lhsSliceLMUL)
+      lhsSliceLMUL = 8;
+    if (rhsSliceLMUL > 0 && rhsSliceLMUL < 8 &&
+        rhs.getLayout().getLmulEighths() > rhsSliceLMUL)
+      rhsSliceLMUL = 8;
     const llvm::StringRef instruction = getMultiplyInstruction();
     const bool exactMultiply =
         (instruction == "rvv.vwmul.vv" && lhsElement && rhsElement &&
@@ -4010,15 +4132,16 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
         lhs.getLayout().getTimeFactors()[*lhsAxis] <= 0 ||
         lhs.getLayout().getTimeFactors()[*lhsAxis] !=
             rhs.getLayout().getTimeFactors()[*rhsAxis] ||
-        partial.getLayout().getLaneFactors()[*partialAxis] !=
-            (partial.getAxisIds().size() == 1
-                 ? checkedPositiveProduct(
-                       lhs.getLayout().getLaneFactors().asArrayRef())
-                       .value_or(-1)
-                 : lhs.getLayout().getLaneFactors()[*lhsAxis]) ||
+        sliceLanes <= 0 || !lhsLanes || !rhsLanes ||
+        sliceLanes > *lhsLanes || sliceLanes > *rhsLanes ||
+        getLhsLaneOffsets()[slot] < 0 || getRhsLaneOffsets()[slot] < 0 ||
+        getLhsLaneOffsets()[slot] % sliceLanes ||
+        getRhsLaneOffsets()[slot] % sliceLanes ||
+        getLhsLaneOffsets()[slot] > *lhsLanes - sliceLanes ||
+        getRhsLaneOffsets()[slot] > *rhsLanes - sliceLanes ||
         partial.getLayout().getSew() != 2 * lhs.getLayout().getSew() ||
-        partial.getLayout().getLmulEighths() !=
-            2 * lhs.getLayout().getLmulEighths() ||
+        lhsSliceLMUL <= 0 || lhsSliceLMUL != rhsSliceLMUL ||
+        partial.getLayout().getLmulEighths() != 2 * lhsSliceLMUL ||
         result.getTermsPerSlot() !=
             partial.getLayout().getLaneFactors()[*partialAxis] ||
         !preservesPartialAxes(lhs) || !preservesPartialAxes(rhs) ||
@@ -4277,9 +4400,11 @@ mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
       !resultElement.isSigned() || resultElement.getWidth() != 32 ||
       inputPartial.getLayout().getCarrier() != "rvv" ||
       resultPartial.getLayout().getCarrier() != "rvv" || !sameCoordinates ||
+      getCombineArity() <= 0 || input.getSlots() % getCombineArity() ||
       result.getReductionAxis() != input.getReductionAxis() ||
-      result.getSlots() != input.getSlots() ||
-      result.getTermsPerSlot() != input.getTermsPerSlot() ||
+      result.getSlots() != input.getSlots() / getCombineArity() ||
+      result.getTermsPerSlot() !=
+          input.getTermsPerSlot() * getCombineArity() ||
       resultPartial.getLayout().getSew() !=
           2 * inputPartial.getLayout().getSew() ||
       resultPartial.getLayout().getLmulEighths() !=
@@ -4300,7 +4425,8 @@ mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
                  "rvv.partial-widen-scale", "none", "exact") ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>(
-              {input.getReductionAxis(), input.getSlots()}))
+              {input.getReductionAxis(), input.getSlots(),
+               static_cast<int64_t>(getCombineArity())}))
     return emitOpError(
         "RVV partial widen-scale requires one signed narrow scalar per i16 slot and an exact i32 topology");
   for (auto [scale, replica] :

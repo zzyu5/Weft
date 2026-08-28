@@ -1777,13 +1777,26 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                         std::to_string(index.point.physicalExtent) + ")"
                   : "(" + index.point.base + " % " +
                         std::to_string(elements) + ")";
-        } else if (index.kind == Binding::Kind::ScalarTuple &&
-                   static_cast<int64_t>(index.parts.size()) == registerParts) {
-          tupleLogicalIndices.assign(index.parts.begin(), index.parts.end());
-          if (auto indexType =
-                  mlir::dyn_cast<riscv::ValueType>(binding.field.index->getType()))
-            indexAxes.assign(indexType.getAxisIds().asArrayRef().begin(),
-                             indexType.getAxisIds().asArrayRef().end());
+        } else if (index.kind == Binding::Kind::ScalarTuple) {
+          auto indexType = mlir::dyn_cast<riscv::ValueType>(
+              binding.field.index->getType());
+          if (!indexType ||
+              static_cast<int64_t>(index.parts.size()) !=
+                  registerPartCount(*binding.field.index))
+            return value.getDefiningOp()->emitError(
+                       "selected scalar tuple field index has no closed register mapping"),
+                   mlir::failure();
+          indexAxes.assign(indexType.getAxisIds().asArrayRef().begin(),
+                           indexType.getAxisIds().asArrayRef().end());
+          tupleLogicalIndices.reserve(registerParts);
+          for (int64_t part = 0; part < registerParts; ++part) {
+            auto projected = projectRegisterPart(*binding.field.index, value, part);
+            if (!projected || *projected >= index.parts.size())
+              return value.getDefiningOp()->emitError(
+                         "selected scalar tuple field index cannot project across result register axes"),
+                     mlir::failure();
+            tupleLogicalIndices.push_back(index.parts[*projected]);
+          }
         } else {
           return value.getDefiningOp()->emitError(
                      "selected scalar tuple field has no usable logical index"),
@@ -8440,7 +8453,7 @@ Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
     llvm::SmallVector<std::string> productVLs;
     const bool combineStreams =
         operation.getReductionStreams() > 1 &&
-        operation.getStreamReduction() == "fused";
+        operation.getPartialTopology().getKind() == "sequential_fused";
     for (int64_t stream = 0; stream < operation.getReductionStreams(); ++stream) {
       const size_t planned = static_cast<size_t>(
           outputPart * operation.getReductionStreams() + stream);
@@ -8464,6 +8477,8 @@ Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
             laneOffset % operation.getReductionLanes())
           return std::nullopt;
         const std::string sourceSuffix = vectorSuffix(value);
+        if (sourceSuffix.empty())
+          return std::nullopt;
         const char category = sourceSuffix.front();
         const std::string sliceSuffix =
             std::string(1, category) + std::to_string(inputSEW) +
@@ -9192,6 +9207,53 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   const std::string vectorSuffixValue = vectorSuffix(operation.getResult());
   const std::string vectorTypeValue = vectorType(operation.getResult());
   const std::string vl = std::to_string(lanes);
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  llvm::SmallVector<int64_t> windowReplicas(operation.getWindowOffsets().size(),
+                                            -1);
+  if (streams <= 0)
+    return fail(operation,
+                "RVV replica storage load has no issue-time part mapping");
+  for (auto [part, window] :
+       llvm::enumerate(operation.getWindowForPart())) {
+    if (window < 0 ||
+        window >= static_cast<int64_t>(windowReplicas.size()))
+      return fail(operation,
+                  "RVV replica storage load part references an absent source window");
+    const int64_t replica = static_cast<int64_t>(part) / streams;
+    int64_t &known = windowReplicas[static_cast<size_t>(window)];
+    if (known >= 0 && known != replica)
+      return fail(operation,
+                  "RVV replica storage window crosses register replicas");
+    known = replica;
+  }
+  auto recordForWindow = [&](size_t window) -> std::optional<std::string> {
+    if (window >= windowReplicas.size() || windowReplicas[window] < 0)
+      return std::nullopt;
+    auto coordinates =
+        registerCoordinates(operation.getResult(), windowReplicas[window]);
+    if (!coordinates || coordinates->size() != registerAxes.size())
+      return std::nullopt;
+    std::string record = "(" + owner.recordPointer;
+    auto fieldType = operation.getField().getType();
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      if (!llvm::is_contained(fieldType.getAxisIds().asArrayRef(), axis))
+        continue;
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end()) {
+        if (coordinate != 0)
+          return std::nullopt;
+        continue;
+      }
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += ")";
+    return record;
+  };
   llvm::SmallVector<std::string> windows;
   windows.reserve(operation.getWindowOffsets().size());
   if (!layered) {
@@ -9201,12 +9263,17 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       return fail(operation,
                   "natural replica storage load requires a byte-addressable integer field");
     const int64_t bytes = width / 8;
-    for (int64_t offset : operation.getWindowOffsets()) {
+    for (auto [window, offset] :
+         llvm::enumerate(operation.getWindowOffsets())) {
+      auto record = recordForWindow(window);
+      if (!record)
+        return fail(operation,
+                    "natural replica storage window has no register-coordinate record");
       const std::string index = "((" + logicalBase.scalar + ") + " +
                                 std::to_string(offset) + ")";
       const std::string pointer =
           "((const " + *scalarType + " *)((const uint8_t *)(" +
-          owner.recordPointer + ") + " + std::to_string(field->bitOffset / 8) +
+          *record + ") + " + std::to_string(field->bitOffset / 8) +
           ")) + " + index;
       std::string raw = fresh("replica_window");
       line(vectorTypeValue + " " + raw + " = __riscv_vle" +
@@ -9226,14 +9293,19 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
                                    std::to_string(group) + ")";
     const std::string withinLayer = "((" + logicalBase.scalar + ") % " +
                                     std::to_string(layer) + ")";
-    for (int64_t offset : operation.getWindowOffsets()) {
+    for (auto [window, offset] :
+         llvm::enumerate(operation.getWindowOffsets())) {
+      auto record = recordForWindow(window);
+      if (!record)
+        return fail(operation,
+                    "layered replica storage window has no register-coordinate record");
       const std::string byte =
           "(" + std::to_string(field->bitOffset / 8) + " + " + groupIndex +
           " * " + std::to_string(layer) + " + " + withinLayer + " + " +
           std::to_string(offset) + ")";
       std::string raw = fresh("replica_layered_raw");
       line(vectorTypeValue + " " + raw + " = __riscv_vle8_v_" +
-           vectorSuffixValue + "((const uint8_t *)(" + owner.recordPointer +
+           vectorSuffixValue + "((const uint8_t *)(" + *record +
            " + " + byte + "), " + vl + ");");
       windows.push_back(std::move(raw));
     }
@@ -9398,6 +9470,22 @@ Emitter::compileRVVPartialSet(riscv::RVVPartialSetOp operation) {
     return fail(operation, "RVV partial set has no exact selected leaf");
   auto setType = operation.getResult().getType();
   auto partialType = setType.getPartialType();
+  auto partialAxis = llvm::find(partialType.getAxisIds().asArrayRef(),
+                                operation.getReductionAxis());
+  auto kernel = operation->getParentOfType<riscv::KernelOp>();
+  const int64_t sliceLMUL = partialType.getLayout().getLmulEighths() / 2;
+  const int64_t sliceLanes =
+      partialAxis == partialType.getAxisIds().asArrayRef().end()
+          ? 0
+          : partialType.getLayout().getLaneFactors()[static_cast<size_t>(
+                partialAxis - partialType.getAxisIds().asArrayRef().begin())];
+  if (!kernel || sliceLMUL <= 0 || sliceLanes <= 0 ||
+      operation.getLhsLaneOffsets().size() !=
+          static_cast<size_t>(setType.getSlots()) ||
+      operation.getRhsLaneOffsets().size() !=
+          static_cast<size_t>(setType.getSlots()))
+    return fail(operation,
+                "RVV partial set is missing its typed lane-slice plan");
   Binding result;
   result.kind = Binding::Kind::PartialSet;
   const llvm::StringRef instruction = operation.getMultiplyInstruction();
@@ -9431,17 +9519,71 @@ Emitter::compileRVVPartialSet(riscv::RVVPartialSetOp operation) {
         lhs->parts[lhsPart].empty() || rhs->parts[rhsPart].empty())
       return fail(operation,
                   "RVV partial set slot has no selected physical operand part");
-    std::string left = lhs->parts[lhsPart];
-    std::string right = rhs->parts[rhsPart];
+    struct OperandSlice {
+      std::string value;
+      std::string suffix;
+    };
+    auto sliceOperand = [&](mlir::Value value, llvm::StringRef source,
+                            int64_t laneOffset)
+        -> std::optional<OperandSlice> {
+      auto valueType = mlir::cast<riscv::ValueType>(value.getType());
+      const int64_t sourceLMUL = valueType.getLayout().getLmulEighths();
+      const int64_t inputSEW = valueType.getLayout().getSew();
+      if (sourceLMUL < sliceLMUL || sourceLMUL % sliceLMUL || inputSEW <= 0 ||
+          laneOffset < 0 || laneOffset % sliceLanes)
+        return std::nullopt;
+      const std::string sourceSuffix = vectorSuffix(value);
+      if (sourceSuffix.empty())
+        return std::nullopt;
+      const char category = sourceSuffix.front();
+      const std::string sliceSuffix =
+          std::string(1, category) + std::to_string(inputSEW) +
+          lmulSpelling(sliceLMUL);
+      const std::string sliceType =
+          std::string(category == 'u' ? "vuint" : "vint") +
+          sliceSuffix.substr(1) + "_t";
+      const int64_t sliceSpan =
+          kernel.getTarget().getVlenBits() * sliceLMUL / (8 * inputSEW);
+      if (sliceSpan <= 0)
+        return std::nullopt;
+      const int64_t group = laneOffset / sliceSpan;
+      const int64_t intra = laneOffset % sliceSpan;
+      std::string sliced = source.str();
+      if (sourceLMUL != sliceLMUL) {
+        sliced = fresh("partial_operand_slice");
+        line(sliceType + " " + sliced + " = __riscv_vget_v_" +
+             sourceSuffix + "_" + sliceSuffix + "(" + source.str() + ", " +
+             std::to_string(group) + ");");
+      } else if (group != 0) {
+        return std::nullopt;
+      }
+      if (intra != 0) {
+        std::string shifted = fresh("partial_operand_slide");
+        line(sliceType + " " + shifted + " = __riscv_vslidedown_vx_" +
+             sliceSuffix + "(" + sliced + ", " + std::to_string(intra) +
+             ", " + std::to_string(sliceLanes) + ");");
+        sliced = std::move(shifted);
+      }
+      return OperandSlice{std::move(sliced), sliceSuffix};
+    };
+    auto lhsSlice = sliceOperand(lhsValue, lhs->parts[lhsPart],
+                                 operation.getLhsLaneOffsets()[slot]);
+    auto rhsSlice = sliceOperand(rhsValue, rhs->parts[rhsPart],
+                                 operation.getRhsLaneOffsets()[slot]);
+    if (!lhsSlice || !rhsSlice)
+      return fail(operation,
+                  "RVV partial set cannot materialize its selected lane slice");
+    std::string left = lhsSlice->value;
+    std::string right = rhsSlice->value;
     std::string mnemonic;
     if (instruction == "rvv.vwmul.vv") {
       mnemonic = "vwmul";
     } else if (instruction == "rvv.vwmul.vv.reinterpret-rhs" ||
                instruction == "rvv.vwmul.vv.reinterpret-lhs") {
       mnemonic = "vwmul";
-      mlir::Value reinterpretValue =
-          instruction == "rvv.vwmul.vv.reinterpret-rhs" ? rhsValue : lhsValue;
-      std::string sourceSuffix = vectorSuffix(reinterpretValue);
+      std::string sourceSuffix =
+          instruction == "rvv.vwmul.vv.reinterpret-rhs" ? rhsSlice->suffix
+                                                          : lhsSlice->suffix;
       std::string targetSuffix = sourceSuffix;
       if (sourceSuffix.empty() || sourceSuffix.front() != 'u')
         return fail(operation,
@@ -9463,7 +9605,7 @@ Emitter::compileRVVPartialSet(riscv::RVVPartialSetOp operation) {
     std::string product = fresh("partial_slot");
     line(vectorTypeFor(partialType) + " " + product + " = __riscv_" +
          mnemonic + "_vv_" + vectorSuffixFor(partialType) + "(" + left +
-         ", " + right + ", " + partVL(lhsValue, lhsPart) + ");");
+         ", " + right + ", " + std::to_string(sliceLanes) + ");");
     result.parts.push_back(std::move(product));
   }
   if (result.parts.size() != static_cast<size_t>(setType.getSlots()))
@@ -9675,7 +9817,9 @@ mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
   auto resultType = operation.getResult().getType();
   if (input.kind != Binding::Kind::PartialSet ||
       input.parts.size() != static_cast<size_t>(inputType.getSlots()) ||
-      resultType.getSlots() != inputType.getSlots() ||
+      operation.getCombineArity() <= 0 ||
+      resultType.getSlots() * operation.getCombineArity() !=
+          inputType.getSlots() ||
       operation.getScales().size() != input.parts.size() ||
       operation.getScaleReplicas().size() != input.parts.size())
     return fail(operation,
@@ -9706,11 +9850,32 @@ mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
       std::to_string(physicalLanesFor(inputType.getPartialType()));
   Binding result;
   result.kind = Binding::Kind::PartialSet;
-  for (size_t slot = 0; slot < input.parts.size(); ++slot) {
-    std::string scaled = fresh("partial_widen_scale");
-    line(type + " " + scaled + " = __riscv_vwmul_vx_" + suffix + "(" +
-         input.parts[slot] + ", " + scales[slot] + ", " + vl + ");");
-    result.parts.push_back(std::move(scaled));
+  for (int64_t resultSlot = 0; resultSlot < resultType.getSlots();
+       ++resultSlot) {
+    llvm::SmallVector<std::string> level;
+    for (int64_t term = 0; term < operation.getCombineArity(); ++term) {
+      const size_t slot = static_cast<size_t>(
+          resultSlot * operation.getCombineArity() + term);
+      std::string scaled = fresh("partial_widen_scale");
+      line(type + " " + scaled + " = __riscv_vwmul_vx_" + suffix + "(" +
+           input.parts[slot] + ", " + scales[slot] + ", " + vl + ");");
+      level.push_back(std::move(scaled));
+    }
+    while (level.size() > 1) {
+      llvm::SmallVector<std::string> next;
+      for (size_t term = 0; term < level.size(); term += 2) {
+        if (term + 1 == level.size()) {
+          next.push_back(std::move(level[term]));
+          continue;
+        }
+        std::string combined = fresh("partial_widen_scale_add");
+        line(type + " " + combined + " = __riscv_vadd_vv_" + suffix + "(" +
+             level[term] + ", " + level[term + 1] + ", " + vl + ");");
+        next.push_back(std::move(combined));
+      }
+      level = std::move(next);
+    }
+    result.parts.push_back(std::move(level.front()));
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();

@@ -30,6 +30,11 @@ struct FieldFacts {
   llvm::StringRef order = "none";
 };
 
+struct IntegerRange {
+  int64_t minimum;
+  int64_t maximum;
+};
+
 mlir::DenseI64ArrayAttr integers(mlir::Builder &builder,
                                  llvm::ArrayRef<int64_t> values);
 mlir::ArrayAttr strings(mlir::Builder &builder,
@@ -103,6 +108,9 @@ int64_t interleaveRows(mlir::Operation *operation,
 FieldFacts fieldFacts(riscv::FieldOp operation);
 
 std::optional<int64_t> constantInt(mlir::Value value);
+std::optional<IntegerRange> integerRange(mlir::Value value,
+                                         unsigned depth = 0);
+std::optional<int64_t> maximumMagnitude(mlir::Value value);
 mlir::Value stripRepresentationConversions(
     mlir::Value value,
     llvm::SmallVectorImpl<riscv::ConvertLayoutOp> *conversions = nullptr);

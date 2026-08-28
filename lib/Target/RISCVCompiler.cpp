@@ -37,6 +37,7 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createPipelineRISCVLevelsPass());
   manager.addPass(weft::createUnrollRISCVLevelsPass());
   manager.addPass(weft::createShareRISCVLayeredWindowsPass());
+  manager.addPass(weft::createPlanRISCVPartialTopologiesPass());
   manager.addPass(weft::createMaterializeRISCVPartialAccumulatorsPass());
   // Partial materialization can introduce fresh lane-to-register edges around
   // shaped iotas and other pure producers.  Canonicalize those new edges

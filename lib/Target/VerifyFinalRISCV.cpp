@@ -343,6 +343,16 @@ public:
             "structural implementation anchor survived terminal leaf lowering");
         failed = true;
       }
+      if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation)) {
+        llvm::StringRef kind = dot.getPartialTopology().getKind();
+        if (kind != "sequential_fused" &&
+            kind != "sequential_per_stream") {
+          dot.emitError()
+              << "selected partial topology was not materialized; topology="
+              << dot.getPartialTopology();
+          failed = true;
+        }
+      }
       if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
           conversion &&
           conversion.getConversion().getKind() == "time_to_lane") {

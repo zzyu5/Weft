@@ -129,7 +129,7 @@ else
       physical=(--auto-unroll=1 --auto-pipeline-depth=2)
       kernel=production_mul_mat_q4_0
       if [[ ${target} == sg2044 ]]; then
-        meta=(--meta NC=32 --meta MC=16 --meta MR=8 --meta NR=1)
+        meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=1)
       else
         meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
       fi
@@ -151,8 +151,8 @@ else
     else
       kernel=production_mul_mat_q5_1
       if [[ ${target} == sg2044 ]]; then
-        physical=(--auto-unroll=1 --auto-pipeline-depth=2)
-        meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=2)
+        physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+        meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=1)
       else
         physical=(--auto-unroll=1 --auto-pipeline-depth=1)
         meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
@@ -210,13 +210,9 @@ else
       kernel=production_mul_mat_q3_k_decode
       runtime_kernel_define=-DWEFT_Q3K_DECODE=1
     else
-      if [[ ${target} == sg2044 ]]; then
-        physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
-      else
-        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
-      fi
+      physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q3_k
-      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=1)
+      meta=(--meta NC=32 --meta MC=16 --meta MR=1 --meta NR=1)
     fi
   elif [[ ${format} == q4_k ]]; then
     if [[ ${phase} == decode ]]; then
@@ -254,7 +250,7 @@ else
       physical=(--auto-unroll=1 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q4_1
       if [[ ${target} == sg2044 ]]; then
-        meta=(--meta NC=32 --meta MC=16 --meta MR=8 --meta NR=1)
+        meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=1)
       else
         meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
       fi

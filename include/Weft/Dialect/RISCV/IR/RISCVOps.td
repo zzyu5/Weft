@@ -180,6 +180,29 @@ def WeftRISCV_ScheduleAttr : WeftRISCV_Attr<"Schedule", "schedule"> {
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_PartialTopologyAttr
+    : WeftRISCV_Attr<"PartialTopology", "partial_topology"> {
+  let parameters = (ins
+    StringRefParameter<"unassigned, sequential_fused, sequential_per_stream, independent, scaled, level_scaled, merged, or layered">:$kind,
+    "int64_t":$rootOperand,
+    "::mlir::DenseI64ArrayAttr":$partialAxes,
+    "::mlir::DenseI64ArrayAttr":$outputAxes,
+    "int64_t":$sourceSlots,
+    "int64_t":$partialSlots,
+    "int64_t":$outputReplicas,
+    "int64_t":$laneSplit,
+    "int64_t":$combineArity,
+    "::mlir::DenseI64ArrayAttr":$slotOrder,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $kind `,` $rootOperand `,` $partialAxes `,` $outputAxes `,`
+        $sourceSlots `,` $partialSlots `,` $outputReplicas `,` $laneSplit `,`
+        $combineArity `,` $slotOrder `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_LevelAttr : WeftRISCV_Attr<"Level", "level"> {
   let parameters = (ins
     "int64_t":$domainId,
@@ -894,7 +917,8 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        DenseI64ArrayAttr:$over,
-                       StrAttr:$stream_reduction,
+                       WeftRISCV_PartialTopologyAttr:$partial_topology,
+                       BoolAttr:$fused_streams_legal,
                        I64Attr:$partial_unroll,
                        I64Attr:$reduction_lanes,
                        I64Attr:$reduction_streams,
@@ -1035,6 +1059,8 @@ def WeftRISCV_RVVPartialSetOp
                        DenseI64ArrayAttr:$rhs_operands,
                        DenseI64ArrayAttr:$lhs_parts,
                        DenseI64ArrayAttr:$rhs_parts,
+                       DenseI64ArrayAttr:$lhs_lane_offsets,
+                       DenseI64ArrayAttr:$rhs_lane_offsets,
                        I64Attr:$reduction_axis,
                        StrAttr:$multiply_instruction,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1092,6 +1118,7 @@ def WeftRISCV_RVVPartialWidenScaleOp
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        Variadic<WeftRISCV_ValueType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
+                       I64Attr:$combine_arity,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;

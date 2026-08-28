@@ -7,6 +7,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <limits>
+#include <algorithm>
+#include <cstdint>
 #include <numeric>
 
 using namespace weft;
@@ -837,6 +839,138 @@ mlir::Value riscv_internal::stripRepresentationConversions(
     break;
   }
   return value;
+}
+
+std::optional<riscv_internal::IntegerRange>
+riscv_internal::integerRange(mlir::Value value, unsigned depth) {
+  if (depth > 16)
+    return std::nullopt;
+  mlir::Value source = stripRepresentationConversions(value);
+  if (source != value)
+    return integerRange(source, depth + 1);
+  auto type = mlir::dyn_cast<mlir::IntegerType>(logicalElement(value.getType()));
+  if (!type || type.getWidth() == 0 || type.getWidth() >= 63)
+    return std::nullopt;
+  const __int128 typeMinimum =
+      type.isSigned() ? -(__int128{1} << (type.getWidth() - 1)) : 0;
+  const __int128 typeMaximum =
+      type.isSigned() ? (__int128{1} << (type.getWidth() - 1)) - 1
+                      : (__int128{1} << type.getWidth()) - 1;
+  auto checkedRange = [&](const __int128 minimum,
+                          const __int128 maximum)
+      -> std::optional<IntegerRange> {
+    if (minimum < typeMinimum || maximum > typeMaximum || minimum > maximum)
+      return std::nullopt;
+    return IntegerRange{static_cast<int64_t>(minimum),
+                        static_cast<int64_t>(maximum)};
+  };
+  auto constantRange = [](mlir::Attribute attribute)
+      -> std::optional<IntegerRange> {
+    auto integer = mlir::dyn_cast_or_null<mlir::IntegerAttr>(attribute);
+    if (!integer)
+      return std::nullopt;
+    const int64_t constant = integer.getInt();
+    return IntegerRange{constant, constant};
+  };
+  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
+    if (auto range = constantRange(constant.getValue()))
+      return range;
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+    if (auto range = constantRange(constant.getValue()))
+      return range;
+  if (auto widen = value.getDefiningOp<riscv::WidenOp>())
+    if (auto range = integerRange(widen.getInput(), depth + 1))
+      return range;
+  if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    if (auto range = integerRange(cast.getInput(), depth + 1))
+      if (auto checked = checkedRange(range->minimum, range->maximum))
+        return checked;
+  if (auto narrow = value.getDefiningOp<riscv::NarrowOp>())
+    if (!narrow.getSaturate())
+      if (auto range = integerRange(narrow.getInput(), depth + 1))
+        if (auto checked = checkedRange(range->minimum, range->maximum))
+          return checked;
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    auto lhs = integerRange(binary.getLhs(), depth + 1);
+    auto rhs = integerRange(binary.getRhs(), depth + 1);
+    if (lhs && rhs) {
+      if (binary.getKind() == "add")
+        if (auto range = checkedRange(
+                static_cast<__int128>(lhs->minimum) + rhs->minimum,
+                static_cast<__int128>(lhs->maximum) + rhs->maximum))
+          return range;
+      if (binary.getKind() == "sub")
+        if (auto range = checkedRange(
+                static_cast<__int128>(lhs->minimum) - rhs->maximum,
+                static_cast<__int128>(lhs->maximum) - rhs->minimum))
+          return range;
+      if (binary.getKind() == "mul") {
+        const __int128 candidates[] = {
+            static_cast<__int128>(lhs->minimum) * rhs->minimum,
+            static_cast<__int128>(lhs->minimum) * rhs->maximum,
+            static_cast<__int128>(lhs->maximum) * rhs->minimum,
+            static_cast<__int128>(lhs->maximum) * rhs->maximum};
+        if (auto range = checkedRange(
+                *std::min_element(std::begin(candidates), std::end(candidates)),
+                *std::max_element(std::begin(candidates), std::end(candidates))))
+          return range;
+      }
+      if (binary.getKind() == "and") {
+        const IntegerRange *mask =
+            rhs->minimum == rhs->maximum && rhs->minimum >= 0 ? &*rhs
+            : lhs->minimum == lhs->maximum && lhs->minimum >= 0 ? &*lhs
+                                                                  : nullptr;
+        if (mask)
+          if (auto range = checkedRange(0, mask->maximum))
+            return range;
+      }
+      if (binary.getKind() == "or" && lhs->minimum >= 0 &&
+          rhs->minimum >= 0) {
+        auto coveringMask = [](int64_t maximum) {
+          uint64_t value = static_cast<uint64_t>(maximum);
+          value |= value >> 1;
+          value |= value >> 2;
+          value |= value >> 4;
+          value |= value >> 8;
+          value |= value >> 16;
+          value |= value >> 32;
+          return value;
+        };
+        const __int128 maximum =
+            static_cast<__int128>(coveringMask(lhs->maximum) |
+                                  coveringMask(rhs->maximum));
+        if (auto range = checkedRange(0, maximum))
+          return range;
+      }
+      if (binary.getKind() == "shl" && lhs->minimum >= 0 &&
+          rhs->minimum == rhs->maximum && rhs->minimum >= 0 &&
+          rhs->minimum < static_cast<int64_t>(type.getWidth()))
+        if (auto range = checkedRange(
+                static_cast<__int128>(lhs->minimum) << rhs->minimum,
+                static_cast<__int128>(lhs->maximum) << rhs->minimum))
+          return range;
+      if (binary.getKind() == "shr" && lhs->minimum >= 0 &&
+          rhs->minimum == rhs->maximum && rhs->minimum >= 0 &&
+          rhs->minimum < static_cast<int64_t>(type.getWidth()))
+        if (auto range = checkedRange(lhs->minimum >> rhs->minimum,
+                                      lhs->maximum >> rhs->minimum))
+          return range;
+    }
+  }
+  if (type.isSigned()) {
+    const int64_t bound = int64_t{1} << (type.getWidth() - 1);
+    return IntegerRange{-bound, bound - 1};
+  }
+  return IntegerRange{0, (int64_t{1} << type.getWidth()) - 1};
+}
+
+std::optional<int64_t>
+riscv_internal::maximumMagnitude(mlir::Value value) {
+  auto range = integerRange(value);
+  if (!range)
+    return std::nullopt;
+  return std::max(range->maximum,
+                  range->minimum < 0 ? -range->minimum : range->minimum);
 }
 
 riscv::FieldOp riscv_internal::sourceField(mlir::Value value) {

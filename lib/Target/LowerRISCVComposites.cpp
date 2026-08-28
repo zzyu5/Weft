@@ -259,120 +259,6 @@ std::optional<int64_t> constantInteger(mlir::Value value) {
   return integer.getInt();
 }
 
-struct IntegerRange {
-  int64_t minimum;
-  int64_t maximum;
-};
-
-std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) {
-  if (depth > 16)
-    return std::nullopt;
-  mlir::Value source = riscv_internal::stripRepresentationConversions(value);
-  if (source != value)
-    return integerRange(source, depth + 1);
-  auto type = mlir::dyn_cast<mlir::IntegerType>(
-      riscv_internal::logicalElement(value.getType()));
-  if (!type || type.getWidth() == 0 || type.getWidth() >= 63)
-    return std::nullopt;
-  const __int128 typeMinimum =
-      type.isSigned() ? -(__int128{1} << (type.getWidth() - 1)) : 0;
-  const __int128 typeMaximum =
-      type.isSigned() ? (__int128{1} << (type.getWidth() - 1)) - 1
-                      : (__int128{1} << type.getWidth()) - 1;
-  auto checkedRange = [&](const __int128 minimum,
-                          const __int128 maximum)
-      -> std::optional<IntegerRange> {
-    if (minimum < typeMinimum || maximum > typeMaximum || minimum > maximum)
-      return std::nullopt;
-    return IntegerRange{static_cast<int64_t>(minimum),
-                        static_cast<int64_t>(maximum)};
-  };
-
-  auto constantRange = [](mlir::Attribute attribute)
-      -> std::optional<IntegerRange> {
-    auto integer = mlir::dyn_cast_or_null<mlir::IntegerAttr>(attribute);
-    if (!integer)
-      return std::nullopt;
-    const int64_t value = integer.getInt();
-    return IntegerRange{value, value};
-  };
-  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
-    if (auto range = constantRange(constant.getValue()))
-      return range;
-  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
-    if (auto range = constantRange(constant.getValue()))
-      return range;
-
-  if (auto widen = value.getDefiningOp<riscv::WidenOp>())
-    if (auto range = integerRange(widen.getInput(), depth + 1))
-      return range;
-  if (auto cast = value.getDefiningOp<riscv::CastOp>())
-    if (auto range = integerRange(cast.getInput(), depth + 1))
-      if (auto checked = checkedRange(range->minimum, range->maximum))
-        return checked;
-  if (auto narrow = value.getDefiningOp<riscv::NarrowOp>())
-    if (!narrow.getSaturate())
-      if (auto range = integerRange(narrow.getInput(), depth + 1))
-        if (auto checked = checkedRange(range->minimum, range->maximum))
-          return checked;
-  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
-    auto lhs = integerRange(binary.getLhs(), depth + 1);
-    auto rhs = integerRange(binary.getRhs(), depth + 1);
-    if (lhs && rhs) {
-      if (binary.getKind() == "add")
-        if (auto range = checkedRange(
-                static_cast<__int128>(lhs->minimum) + rhs->minimum,
-                static_cast<__int128>(lhs->maximum) + rhs->maximum))
-          return range;
-      if (binary.getKind() == "sub")
-        if (auto range = checkedRange(
-                static_cast<__int128>(lhs->minimum) - rhs->maximum,
-                static_cast<__int128>(lhs->maximum) - rhs->minimum))
-          return range;
-      if (binary.getKind() == "mul") {
-        const __int128 candidates[] = {
-            static_cast<__int128>(lhs->minimum) * rhs->minimum,
-            static_cast<__int128>(lhs->minimum) * rhs->maximum,
-            static_cast<__int128>(lhs->maximum) * rhs->minimum,
-            static_cast<__int128>(lhs->maximum) * rhs->maximum};
-        if (auto range = checkedRange(
-                *std::min_element(std::begin(candidates), std::end(candidates)),
-                *std::max_element(std::begin(candidates), std::end(candidates))))
-          return range;
-      }
-      if (binary.getKind() == "and") {
-        const IntegerRange *mask =
-            rhs->minimum == rhs->maximum && rhs->minimum >= 0 ? &*rhs
-            : lhs->minimum == lhs->maximum && lhs->minimum >= 0 ? &*lhs
-                                                                  : nullptr;
-        if (mask)
-          if (auto range = checkedRange(0, mask->maximum))
-            return range;
-      }
-      if (binary.getKind() == "shr" && lhs->minimum >= 0 &&
-          rhs->minimum == rhs->maximum && rhs->minimum >= 0 &&
-          rhs->minimum < static_cast<int64_t>(type.getWidth()))
-        if (auto range = checkedRange(
-                lhs->minimum >> rhs->minimum, lhs->maximum >> rhs->minimum))
-          return range;
-    }
-  }
-
-  if (type.isSigned()) {
-    const int64_t bound = int64_t{1} << (type.getWidth() - 1);
-    return IntegerRange{-bound, bound - 1};
-  }
-  return IntegerRange{0, (int64_t{1} << type.getWidth()) - 1};
-}
-
-std::optional<int64_t> maximumMagnitude(mlir::Value value) {
-  auto range = integerRange(value);
-  if (!range)
-    return std::nullopt;
-  return std::max(range->maximum,
-                  range->minimum < 0 ? -range->minimum : range->minimum);
-}
-
 void copyIdentity(mlir::Operation *source, mlir::Operation *target) {
   if (auto origin = source->getAttr("source_origin"))
     target->setAttr("source_origin", origin);
@@ -1946,7 +1832,7 @@ private:
         continue;
       auto carryType =
           mlir::dyn_cast<mlir::IntegerType>(loop.getRegionIterArg(0).getType());
-      auto initRange = integerRange(loop.getInitArgs().front());
+      auto initRange = riscv_internal::integerRange(loop.getInitArgs().front());
       if (!carryType || !carryType.isSigned() || carryType.getWidth() != 16 ||
           !initRange || initRange->minimum != 0 || initRange->maximum != 0 ||
           !loop.getRegionIterArg(0).hasOneUse() ||
@@ -2024,8 +1910,8 @@ private:
           (*upper - *lower) % *step)
         continue;
       const int64_t iterations = (*upper - *lower) / *step;
-      auto lhsMagnitude = maximumMagnitude(contract.getLhs());
-      auto rhsMagnitude = maximumMagnitude(contract.getRhs());
+      auto lhsMagnitude = riscv_internal::maximumMagnitude(contract.getLhs());
+      auto rhsMagnitude = riscv_internal::maximumMagnitude(contract.getRhs());
       const int64_t lanes = lhs.getLayout().getLaneFactors()[*lhsPosition];
       const __int128 bound =
           lhsMagnitude && rhsMagnitude
@@ -2479,8 +2365,8 @@ private:
             std::max<unsigned>(8, lhsElement.getWidth()) * 2;
         const int64_t partialMaximum =
             (int64_t{1} << (partialWidth - 1)) - 1;
-        auto lhsMagnitude = maximumMagnitude(lhsValue);
-        auto rhsMagnitude = maximumMagnitude(rhsValue);
+        auto lhsMagnitude = riscv_internal::maximumMagnitude(lhsValue);
+        auto rhsMagnitude = riscv_internal::maximumMagnitude(rhsValue);
         auto hasFullReductionMapping = [&](riscv::ValueType value) {
           auto found = llvm::find(value.getAxisIds().asArrayRef(), over[0]);
           if (found == value.getAxisIds().asArrayRef().end())
@@ -2493,23 +2379,19 @@ private:
                          value.getLayout().getTimeFactors()[position] ==
                      extent;
         };
-        const bool fusedStreamsAreExact =
+        const bool fusedStreamsLegal =
             hasFullReductionMapping(lhsType) &&
             hasFullReductionMapping(rhsType) && streams > 1 &&
             lhsMagnitude && rhsMagnitude && *rhsMagnitude > 0 &&
             *lhsMagnitude <= partialMaximum / *rhsMagnitude / streams;
-        llvm::StringRef streamReduction =
-            fusedStreamsAreExact ? "fused" : "per_stream";
         const int64_t partialGroups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
         const int64_t outputParts =
             lhsLaneSlices ? static_cast<int64_t>(lhsLaneSlices->offsets.size())
                            : -1;
-        // RVVWidenDot emits output replicas sequentially.  Only the partials
-        // for one output, the reduction seed, and the reduction result are
-        // simultaneously live.  Per-stream reduction retains one partial per
-        // time part; fused reduction retains only one accumulated partial.
-        const int64_t livePartials =
-            streamReduction == "fused" ? 1 : streams;
+        // Topology is selected after all typed storage windows and downstream
+        // reductions exist.  Until then reserve the conservative per-stream
+        // footprint rather than making a second topology decision here.
+        const int64_t livePartials = streams;
         const int64_t temporaryGroups =
             sum(product({livePartials, partialGroups}), 2);
         if (outputParts <= 0 || livePartials <= 0 || temporaryGroups <= 0) {
@@ -2526,10 +2408,15 @@ private:
           failed = true;
           continue;
         }
+        auto partialTopology = riscv::PartialTopologyAttr::get(
+            rewriter.getContext(), "unassigned", -1,
+            rewriter.getDenseI64ArrayAttr({}),
+            rewriter.getDenseI64ArrayAttr({}), 0, 0, 0, 0, 0,
+            rewriter.getDenseI64ArrayAttr({}), 0);
         auto widenedDot = rewriter.create<riscv::RVVWidenDotOp>(
             operation->getLoc(), physicalResultType, lhsValue, rhsValue,
             rewriter.getDenseI64ArrayAttr(physicalReductionAxes),
-            rewriter.getStringAttr(streamReduction), schedule.getUnroll(),
+            partialTopology, fusedStreamsLegal, schedule.getUnroll(),
             lhsLaneSlices->reductionLanes,
             lhsLaneSlices->reductionStreams,
             lhsLaneSlices->sliceLmulEighths,
@@ -2544,10 +2431,21 @@ private:
                     rhsType.getLayout().getRegisterGroups(),
                 0, temporaryGroups));
         copyIdentity(operation, widenedDot);
-        if (schedule.getUnroll() > 1 && streamReduction == "per_stream") {
-          if (auto parentLoop =
+        // A dot whose complete reduction-time decomposition can be fused has
+        // no local per-stream issue loop to unroll.  Its enclosing loop may be
+        // the storage-block traversal, so attaching the contraction unroll to
+        // that loop would duplicate whole blocks.  The topology planner still
+        // owns the final fused/independent choice; this legality fact only
+        // determines whether a local issue-loop binding exists.
+        if (schedule.getUnroll() > 1 && !fusedStreamsLegal) {
+          // The schedule belongs to the physical issue loop that directly
+          // contains this contraction.  A more distant Level may carry the
+          // same logical reduction axis while iterating whole storage blocks;
+          // binding the local unroll there duplicates the complete block
+          // program instead of its partial contributions.
+          if (auto issueLoop =
                   operation->getParentOfType<mlir::scf::ForOp>()) {
-            auto existing = parentLoop->getAttrOfType<mlir::IntegerAttr>(
+            auto existing = issueLoop->getAttrOfType<mlir::IntegerAttr>(
                 "weft.riscv.unroll_factor");
             if (existing && existing.getInt() != schedule.getUnroll()) {
               operation->emitError(
@@ -2556,7 +2454,7 @@ private:
               rewriter.eraseOp(widenedDot);
               continue;
             }
-            parentLoop->setAttr(
+            issueLoop->setAttr(
                 "weft.riscv.unroll_factor",
                 rewriter.getI64IntegerAttr(schedule.getUnroll()));
           }
