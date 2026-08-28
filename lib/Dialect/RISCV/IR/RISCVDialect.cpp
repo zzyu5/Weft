@@ -33,6 +33,22 @@ using namespace weft::riscv;
 #define GET_OP_CLASSES
 #include "Weft/Dialect/RISCV/IR/RISCVOps.cpp.inc"
 
+bool weft::riscv::supportsRVVLayout(TargetAttr target, LayoutAttr layout) {
+  int64_t elen = 0;
+  for (int64_t supported : target.getSupportedSEW().asArrayRef())
+    elen = std::max(elen, supported);
+  const bool legalFractionalLMUL =
+      layout && elen > 0 &&
+      layout.getLmulEighths() * elen >= 8 * layout.getSew();
+  return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
+         target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
+         llvm::is_contained(target.getSupportedSEW().asArrayRef(),
+                            layout.getSew()) &&
+         llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                            layout.getLmulEighths()) &&
+         legalFractionalLMUL;
+}
+
 namespace {
 
 mlir::LogicalResult verifyShape(
@@ -215,6 +231,10 @@ LoadOp sourceLoad(mlir::Value value) {
       value = materialize.getInput();
       continue;
     }
+    if (auto extract = mlir::dyn_cast<ExtractOp>(definition)) {
+      value = extract.getInput();
+      continue;
+    }
     break;
   }
   return {};
@@ -234,22 +254,6 @@ mlir::Value sourcePoint(mlir::Value value, int64_t axis) {
     llvm::append_range(worklist, definition->getOperands());
   }
   return {};
-}
-
-bool supportsLayout(TargetAttr target, LayoutAttr layout) {
-  int64_t elen = 0;
-  for (int64_t supported : target.getSupportedSEW().asArrayRef())
-    elen = std::max(elen, supported);
-  const bool legalFractionalLMUL =
-      layout && elen > 0 && layout.getLmulEighths() * elen >=
-                                8 * layout.getSew();
-  return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
-         target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
-         llvm::is_contained(target.getSupportedSEW().asArrayRef(),
-                            layout.getSew()) &&
-         llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
-                            layout.getLmulEighths()) &&
-         legalFractionalLMUL;
 }
 
 std::optional<int64_t> doubledPositive(int64_t value) {
@@ -292,18 +296,22 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
       rhsAccess.getBitOffset() % 8 ||
       (lhsAccess.getOrder() != "lo_first" &&
        lhsAccess.getOrder() != "hi_first") ||
-      !supportsLayout(kernel.getTarget(), lhsType.getLayout()) ||
-      !supportsLayout(kernel.getTarget(), partialLayout) ||
+      !supportsRVVLayout(kernel.getTarget(), lhsType.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), partialLayout) ||
       !kernel.getTarget().getHasWideningInteger())
     return false;
   int64_t laneAxis = 0;
+  bool reductionLane = false;
   for (auto [axis, factor] :
        llvm::zip(lhsType.getAxisIds().asArrayRef(),
-                 lhsType.getLayout().getLaneFactors().asArrayRef()))
+                 lhsType.getLayout().getLaneFactors().asArrayRef())) {
+    if (axis == reductionAxis && factor > 1)
+      reductionLane = true;
     if (axis != reductionAxis && factor > 1) {
       laneAxis = axis;
       break;
     }
+  }
   bool hasCohortStride = false;
   if (lhsMemory && laneAxis > 0)
     for (auto [axis, stride] :
@@ -311,8 +319,10 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
                    lhsMemory.getStrides().asArrayRef()))
       if (axis == laneAxis && stride != 0)
         hasCohortStride = true;
-  return lhsMemory && lhsMemory.getElements() > 0 &&
-         (lhsMemory.getInterleaveRows() > 0 || hasCohortStride);
+  const bool result =
+      lhsMemory &&
+      (lhsMemory.getInterleaveRows() > 0 || hasCohortStride || reductionLane);
+  return result;
 }
 
 mlir::LogicalResult verifyBroadcastDomain(mlir::Operation *operation,
@@ -1092,10 +1102,21 @@ mlir::LogicalResult PartialSetType::verify(
       partialType.getLayout().getLocalFactors()[position] != 1)
     return emitError()
            << "partial set reduction axis must be one complete lane partial";
-  for (size_t other = 0; other < partialType.getShape().size(); ++other)
-    if (other != position)
+  for (size_t other = 0; other < partialType.getShape().size(); ++other) {
+    if (other == position)
+      continue;
+    const int64_t lanes = partialType.getLayout().getLaneFactors()[other];
+    const int64_t replicas =
+        partialType.getLayout().getReplicaFactors()[other];
+    if (partialType.getLayout().getTimeFactors()[other] != 1 || lanes <= 0 ||
+        replicas <= 0 ||
+        (partialType.getShape()[other] > 0 &&
+         lanes * replicas != partialType.getShape()[other]) ||
+        partialType.getLayout().getFragmentFactors()[other] != 1 ||
+        partialType.getLayout().getLocalFactors()[other] != 1)
       return emitError()
-             << "one partial-set SSA value represents one output replica only";
+             << "partial-set free axes must remain exact lane/register coordinates";
+  }
   if (partialType.getLayout().getRegisterGroups() <= 0 ||
       slots > std::numeric_limits<int64_t>::max() /
                   partialType.getLayout().getRegisterGroups() ||
@@ -1816,8 +1837,10 @@ mlir::LogicalResult ReduceOp::verify() {
                            static_cast<size_t>(
                                found - input.getAxisIds().asArrayRef().begin()),
                            result, resultPosition))
-        return emitOpError(
-            "physical reduce must preserve every free-axis representation");
+        return emitOpError()
+               << "physical reduce must preserve every free-axis representation; input="
+               << input << ", result=" << result
+               << ", free_axis=" << axis;
     }
   return verifyLeafOperation(*this);
 }
@@ -2061,11 +2084,11 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
               "scalar register-to-lane conversion requires exactly one lane axis");
         laneDimension = dimension;
       }
-      if (sourceTime[dimension] != 1 || sourceLane[dimension] != 1 ||
+      if (sourceLane[dimension] != 1 ||
           sourceFragment[dimension] != 1 || sourceLocal[dimension] != 1 ||
           targetFragment[dimension] != 1 || targetLocal[dimension] != 1)
         return emitOpError(
-            "scalar register-to-lane conversion only moves register replicas into RVV lanes");
+            "scalar register-to-lane conversion only uses scalar time/replica coordinates and RVV lanes");
     }
     if (!laneDimension)
       return emitOpError(
@@ -2074,16 +2097,21 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
       if (dimension == *laneDimension) {
         auto represented = checkedPositiveProduct(
             {targetTime[dimension], targetLane[dimension]});
-        if (!represented || sourceReplica[dimension] != *represented ||
+        if (!represented || sourceTime[dimension] != 1 ||
+            sourceReplica[dimension] != *represented ||
             targetReplica[dimension] != 1)
           return emitOpError(
               "scalar register-to-lane conversion must preserve the complete moved axis");
         continue;
       }
-      if (targetTime[dimension] != 1 || targetLane[dimension] != 1 ||
-          sourceReplica[dimension] != targetReplica[dimension])
+      auto sourceRepresented = checkedPositiveProduct(
+          {sourceTime[dimension], sourceReplica[dimension]});
+      auto targetRepresented = checkedPositiveProduct(
+          {targetTime[dimension], targetReplica[dimension]});
+      if (targetLane[dimension] != 1 || !sourceRepresented ||
+          !targetRepresented || *sourceRepresented != *targetRepresented)
         return emitOpError(
-            "scalar register-to-lane conversion cannot remap another logical axis");
+            "scalar register-to-lane conversion must preserve every non-lane logical axis");
     }
   }
   if (source == "scalar" && target == "rvv" && kind == "time_to_lane") {
@@ -2127,11 +2155,14 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
               "scalar time-to-lane conversion must preserve the complete moved axis");
         continue;
       }
-      if (targetLane[dimension] != 1 ||
-          sourceTime[dimension] != targetTime[dimension] ||
-          sourceReplica[dimension] != targetReplica[dimension])
+      auto sourceRepresented = checkedPositiveProduct(
+          {sourceTime[dimension], sourceReplica[dimension]});
+      auto targetRepresented = checkedPositiveProduct(
+          {targetTime[dimension], targetReplica[dimension]});
+      if (targetLane[dimension] != 1 || !sourceRepresented ||
+          !targetRepresented || *sourceRepresented != *targetRepresented)
         return emitOpError(
-            "scalar time-to-lane conversion cannot remap another logical axis");
+            "scalar time-to-lane conversion must preserve every non-lane logical axis");
     }
   }
   if (auto access = (*this)->getAttrOfType<AccessAttr>("source_access")) {
@@ -2731,9 +2762,10 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
   auto resultParts = physicalPartCount(getResult().getType());
   if (!lhs || lhs.getLayout().getCarrier() != "rvv")
     return emitOpError("grouped MAC reduction lhs must use an RVV representation");
-  if (!resultParts || *resultParts != 1 ||
+  if (!resultParts || *resultParts <= 0 ||
       getResult().getType().getLayout().getCarrier() != "rvv")
-    return emitOpError("grouped MAC reduction result must be one RVV part");
+    return emitOpError(
+        "grouped MAC reduction result must have one or more RVV output parts");
   if (getGroup() <= 0 || getUnroll() <= 0 || getReductionAxis() <= 0)
     return emitOpError("grouped MAC reduction has invalid structural parameters");
   if (getPartialLayout().getCarrier() != "rvv" ||
@@ -2744,13 +2776,21 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
     return emitOpError(
         "grouped MAC reduction must be nested in one target kernel");
   auto target = kernel.getTarget();
-  if (!hasGroupedMacOperandGeometry(
-          getOperation(), getLhs(), getRhs(), getReductionAxis(),
-          getLhsAccess(), getRhsAccess(), getGroup(), getPartialLayout()) ||
-      !supportsLayout(target, getResult().getType().getLayout()))
-    return emitOpError(
-        "grouped MAC reduction has no complete typed field, cohort-storage, "
-        "RVV-layout, or shared reduction-point realization");
+  const bool operandGeometry = hasGroupedMacOperandGeometry(
+      getOperation(), getLhs(), getRhs(), getReductionAxis(), getLhsAccess(),
+      getRhsAccess(), getGroup(), getPartialLayout());
+  const bool resultLayout =
+      supportsRVVLayout(target, getResult().getType().getLayout());
+  if (!operandGeometry || !resultLayout)
+    return emitOpError()
+           << "grouped MAC reduction has no complete typed field, cohort-storage, "
+              "RVV-layout, or shared reduction-point realization; operand_geometry="
+           << operandGeometry << ", result_layout=" << resultLayout
+           << ", lhs=" << getLhs().getType() << ", rhs=" << getRhs().getType()
+           << ", result=" << getResult().getType()
+           << ", lhs_access=" << getLhsAccess()
+           << ", rhs_access=" << getRhsAccess()
+           << ", partial_layout=" << getPartialLayout();
   if (getLhsAccess().getForm() == "unassigned" ||
       getRhsAccess().getForm() == "unassigned")
     return emitOpError("grouped MAC reduction operands require selected access forms");
@@ -2798,7 +2838,7 @@ mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
   if (!hasGroupedMacOperandGeometry(
           getOperation(), getLhs(), getRhs(), getReductionAxis(),
           getLhsAccess(), getRhsAccess(), getGroup(), getPartialLayout()) ||
-      !supportsLayout(target, window.getResultLayout()))
+      !supportsRVVLayout(target, window.getResultLayout()))
     return emitOpError(
         "grouped MAC load has no complete typed field, cohort-storage, "
         "RVV-layout, or shared reduction-point realization");
@@ -2889,7 +2929,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   if (!kernel)
     return emitOpError("RVV widening dot must be nested in one target kernel");
   auto target = kernel.getTarget();
-  auto partialLMULValue = doubledPositive(lhs.getLayout().getLmulEighths());
+  auto partialLMULValue = doubledPositive(getSliceLmulEighths());
   const int64_t partialLMUL = partialLMULValue.value_or(-1);
   llvm::SmallVector<int64_t> freeAxes;
   for (int64_t axis : lhs.getAxisIds().asArrayRef())
@@ -2904,6 +2944,68 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       (shapedResult && shapedResult.getLayout().getCarrier() == "scalar" &&
        shapedResult.getAxisIds().asArrayRef() ==
            llvm::ArrayRef<int64_t>(freeAxes));
+  const int64_t outputParts =
+      shapedResult ? physicalPartCount(shapedResult).value_or(-1) : 1;
+  auto laneProduct = [](ValueType value,
+                        llvm::ArrayRef<int64_t> selectedAxes) {
+    int64_t result = 1;
+    for (auto [axis, factor] :
+         llvm::zip(value.getAxisIds().asArrayRef(),
+                   value.getLayout().getLaneFactors().asArrayRef())) {
+      if (!llvm::is_contained(selectedAxes, axis))
+        continue;
+      if (factor <= 0 || result > std::numeric_limits<int64_t>::max() / factor)
+        return int64_t{-1};
+      result *= factor;
+    }
+    return result;
+  };
+  auto allLanes = [](ValueType value) {
+    return checkedPositiveProduct(
+               value.getLayout().getLaneFactors().asArrayRef())
+        .value_or(-1);
+  };
+  const int64_t lhsReductionLanes = laneProduct(lhs, getOver());
+  const int64_t rhsReductionLanes = laneProduct(rhs, getOver());
+  const int64_t lhsLanes = allLanes(lhs);
+  const int64_t rhsLanes = allLanes(rhs);
+  auto validOffsets = [&](llvm::ArrayRef<int64_t> offsets, int64_t lanes) {
+    if (offsets.size() != static_cast<size_t>(outputParts) || lanes <= 0 ||
+        getReductionLanes() <= 0)
+      return false;
+    return llvm::all_of(offsets, [&](int64_t offset) {
+      return offset >= 0 && offset % getReductionLanes() == 0 &&
+             offset <= lanes - getReductionLanes();
+    });
+  };
+  auto lhsParts = physicalPartCount(lhs);
+  auto rhsParts = physicalPartCount(rhs);
+  auto validParts = [&](llvm::ArrayRef<int64_t> parts,
+                        std::optional<int64_t> available) {
+    if (!available || getReductionStreams() <= 0 ||
+        outputParts > std::numeric_limits<int64_t>::max() /
+                          getReductionStreams() ||
+        parts.size() != static_cast<size_t>(outputParts * getReductionStreams()))
+      return false;
+    return llvm::all_of(parts, [&](int64_t part) {
+      return part >= 0 && part < *available;
+    });
+  };
+  const bool closedLaneSlices =
+      outputParts > 0 && getReductionStreams() > 0 &&
+      getReductionLanes() == lhsReductionLanes &&
+      getReductionLanes() == rhsReductionLanes && lhsLanes > 0 &&
+      rhsLanes > 0 &&
+      getSliceLmulEighths() <= lhs.getLayout().getLmulEighths() &&
+      getSliceLmulEighths() <= rhs.getLayout().getLmulEighths() &&
+      lhs.getLayout().getLmulEighths() * getReductionLanes() <=
+          getSliceLmulEighths() * lhsLanes &&
+      rhs.getLayout().getLmulEighths() * getReductionLanes() <=
+          getSliceLmulEighths() * rhsLanes &&
+      validOffsets(getLhsLaneOffsets(), lhsLanes) &&
+      validOffsets(getRhsLaneOffsets(), rhsLanes) &&
+      validParts(getLhsParts(), lhsParts) &&
+      validParts(getRhsParts(), rhsParts);
   auto factorFor = [](LayoutAttr layout, mlir::DenseI64ArrayAttr factors,
                       int64_t axis) {
     auto found = llvm::find(layout.getAxisIds().asArrayRef(), axis);
@@ -2928,22 +3030,44 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
                 reductionAxis) ==
           factorFor(rhs.getLayout(), rhs.getLayout().getTimeFactors(),
                     reductionAxis);
+  bool compatibleStreamedReductions = true;
+  for (int64_t axis : getOver().drop_front()) {
+    auto completeTimeAxis = [&](ValueType value) {
+      auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
+      if (found == value.getAxisIds().asArrayRef().end())
+        return false;
+      const size_t position = static_cast<size_t>(
+          found - value.getAxisIds().asArrayRef().begin());
+      const int64_t extent = value.getShape()[position];
+      auto layout = value.getLayout();
+      return extent > 0 && layout.getTimeFactors()[position] == extent &&
+             layout.getLaneFactors()[position] == 1 &&
+             layout.getReplicaFactors()[position] == 1 &&
+             layout.getFragmentFactors()[position] == 1 &&
+             layout.getLocalFactors()[position] == 1;
+    };
+    compatibleStreamedReductions &= completeTimeAxis(lhs) &&
+                                    completeTimeAxis(rhs);
+  }
   if ((getStreamReduction() != "fused" &&
        getStreamReduction() != "per_stream") ||
       getPartialUnroll() <= 0 ||
+      getSliceLmulEighths() <= 0 || !closedLaneSlices ||
       !lhsElement || !rhsElement || !resultElement ||
       lhsElement.getWidth() > 16 || rhsElement.getWidth() > 16 ||
       std::max<unsigned>(8, lhsElement.getWidth()) !=
           std::max<unsigned>(8, rhsElement.getWidth()) ||
       (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
       resultElement.getWidth() != 32 || !legalResult ||
-      getOver().size() != 1 ||
+      getOver().empty() || !compatibleStreamedReductions ||
       !llvm::is_contained(lhs.getAxisIds().asArrayRef(), getOver()[0]) ||
       !llvm::is_contained(rhs.getAxisIds().asArrayRef(), getOver()[0]) ||
       !compatibleReductionMapping ||
       !target.getHasWideningInteger() ||
-      !supportsLayout(target, lhs.getLayout()) ||
-      !supportsLayout(target, rhs.getLayout()) ||
+      !supportsRVVLayout(target, lhs.getLayout()) ||
+      !supportsRVVLayout(target, rhs.getLayout()) ||
+      !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                          getSliceLmulEighths()) ||
       !partialLMULValue ||
       !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), partialLMUL) ||
       !exactLeaf(getLeaf(), "rvv", "widen-dot",
@@ -2951,8 +3075,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
     return emitOpError()
            << "RVV widening dot requires matching <=16-bit integer vectors with "
               "at least one signed operand, an explicit fused/per-stream "
-              "reduction policy, one shared "
-              "reduction axis, a signed-i32 scalar result, and a legal doubled "
+              "reduction policy, one shared lane reduction axis, optional "
+              "issue-time reduction axes, a signed-i32 scalar result, and a legal doubled "
               "LMUL; lhs="
            << lhs << ", rhs=" << rhs << ", result=" << getResult().getType()
            << ", over=" << getOver() << ", partial_lmul=" << partialLMUL
@@ -3021,13 +3145,67 @@ mlir::LogicalResult RVVWidenMultiplyOp::verify() {
       lhs.getLayout().getVl() != rhs.getLayout().getVl() ||
       lhs.getLayout().getVl() != result.getLayout().getVl() ||
       !kernel.getTarget().getHasWideningInteger() ||
-      !supportsLayout(kernel.getTarget(), lhs.getLayout()) ||
-      !supportsLayout(kernel.getTarget(), rhs.getLayout()) ||
-      !supportsLayout(kernel.getTarget(), result.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), lhs.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), rhs.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), result.getLayout()) ||
       !exactLeaf(getLeaf(), "rvv", "widen-multiply", instruction, "none",
                  "exact"))
     return emitOpError(
         "RVV widening multiply requires coordinate-identical integer operands and one exact doubled-width result layout");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVWidenScalarMultiplyOp::verify() {
+  ValueType lhs = getLhs().getType();
+  ValueType result = getResult().getType();
+  auto lhsElement = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+  auto rhsElement = mlir::dyn_cast<mlir::IntegerType>(getRhs().getType());
+  auto resultElement =
+      mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  llvm::StringRef instruction;
+  if (lhsElement && rhsElement) {
+    if (lhsElement.isUnsigned() && rhsElement.isUnsigned())
+      instruction = "rvv.vwmulu.vx";
+    else if (lhsElement.isSigned() && rhsElement.isSigned())
+      instruction = "rvv.vwmul.vx";
+    else if (lhsElement.isSigned())
+      instruction = "rvv.vwmulsu.vx";
+  }
+  const bool sameCoordinates =
+      lhs.getShape() == result.getShape() &&
+      lhs.getAxisIds() == result.getAxisIds() &&
+      lhs.getLayout().getCarrier() == "rvv" &&
+      result.getLayout().getCarrier() == "rvv" &&
+      lhs.getLayout().getAxisIds() == result.getLayout().getAxisIds() &&
+      lhs.getLayout().getTimeFactors() ==
+          result.getLayout().getTimeFactors() &&
+      lhs.getLayout().getLaneFactors() ==
+          result.getLayout().getLaneFactors() &&
+      lhs.getLayout().getReplicaFactors() ==
+          result.getLayout().getReplicaFactors() &&
+      lhs.getLayout().getFragmentFactors() ==
+          result.getLayout().getFragmentFactors() &&
+      lhs.getLayout().getLocalFactors() ==
+          result.getLayout().getLocalFactors();
+  if (!kernel || !lhsElement || !rhsElement || !resultElement ||
+      lhsElement.isSignless() || rhsElement.isSignless() ||
+      resultElement.isSignless() || !isScalar(getRhs().getType()) ||
+      lhsElement != rhsElement || lhsElement.getWidth() > 16 ||
+      lhsElement.getWidth() != lhs.getLayout().getSew() ||
+      resultElement.getWidth() != 2 * lhsElement.getWidth() ||
+      result.getLayout().getSew() !=
+          static_cast<int64_t>(resultElement.getWidth()) ||
+      result.getLayout().getLmulEighths() !=
+          2 * lhs.getLayout().getLmulEighths() ||
+      lhs.getLayout().getVl() != result.getLayout().getVl() ||
+      !sameCoordinates || !kernel.getTarget().getHasWideningInteger() ||
+      !supportsRVVLayout(kernel.getTarget(), lhs.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), result.getLayout()) ||
+      !exactLeaf(getLeaf(), "rvv", "widen-scalar-multiply", instruction,
+                 "none", "exact"))
+    return emitOpError(
+        "RVV widening scalar multiply requires one narrow scalar and one exact doubled-width result layout");
   return mlir::success();
 }
 
@@ -3337,6 +3515,130 @@ mlir::LogicalResult RVVLayeredStorageDecodeOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  mlir::Type baseType = getLogicalBase().getType();
+  const bool scalarBase = baseType.isIndex() || mlir::isa<mlir::IntegerType>(baseType);
+  auto resultAxis = llvm::find(result.getAxisIds().asArrayRef(), getLaneAxis());
+  auto parts = physicalPartCount(result);
+  llvm::StringRef mapping = getAccess().getMapping();
+  const bool natural = mapping == "natural";
+  const bool layered = mapping == "grouped_layered";
+  const int64_t group = getAccess().getGroupSize();
+  const int64_t layer = getAccess().getLayerSize();
+  const int64_t layers = layered && layer > 0 ? group / layer : 1;
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  llvm::StringRef instruction =
+      natural ? "rvv.replica-storage-load.natural"
+              : "rvv.replica-storage-load.layered";
+  auto sameStorageGeometry = [&](AccessAttr lhs, AccessAttr rhs) {
+    return lhs && rhs && lhs.getMapping() == rhs.getMapping() &&
+           lhs.getGroupSize() == rhs.getGroupSize() &&
+           lhs.getLayerSize() == rhs.getLayerSize() &&
+           lhs.getJoinFields() == rhs.getJoinFields() &&
+           lhs.getJoinLowBits() == rhs.getJoinLowBits() &&
+           lhs.getJoinRole() == rhs.getJoinRole() &&
+           lhs.getBitOffset() == rhs.getBitOffset() &&
+           lhs.getStorageBits() == rhs.getStorageBits() &&
+           lhs.getOrder() == rhs.getOrder();
+  };
+  if (!sourceField || !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
+      !fieldElement || fieldElement.isSignless() || !scalarBase ||
+      getLaneAxis() <= 0 ||
+      resultAxis == result.getAxisIds().asArrayRef().end() ||
+      field.getElementType() != result.getElementType() ||
+      result.getLayout().getCarrier() != "rvv" || !parts || *parts <= 0 ||
+      getLogicalSpan() <= 0 || getWindowOffsets().empty() ||
+      getWindowForPart().size() != static_cast<size_t>(*parts) ||
+      getLayerForPart().size() != static_cast<size_t>(*parts) ||
+      (!natural && !layered) ||
+      (validity != "full" && validity != "tail") ||
+      !exactLeaf(getLeaf(), "rvv", "replica-storage-load", instruction, "none",
+                 tail))
+    return emitOpError()
+           << "replica storage load requires one scalar base and a closed field-to-register window map; field="
+           << field << ", result=" << result << ", source_field="
+           << static_cast<bool>(sourceField) << ", access=" << getAccess()
+           << ", lane_axis=" << getLaneAxis()
+           << ", logical_span=" << getLogicalSpan()
+           << ", window_offsets=" << getWindowOffsets()
+           << ", window_for_part=" << getWindowForPart()
+           << ", layer_for_part=" << getLayerForPart()
+           << ", parts=" << (parts ? *parts : -1)
+           << ", base_type=" << baseType << ", leaf=" << getLeaf();
+
+  const size_t lanePosition = static_cast<size_t>(
+      resultAxis - result.getAxisIds().asArrayRef().begin());
+  const int64_t primaryLanes =
+      result.getLayout().getLaneFactors()[lanePosition];
+  auto physicalLanes =
+      checkedPositiveProduct(result.getLayout().getLaneFactors().asArrayRef());
+  if (primaryLanes <= 1 || !physicalLanes || *physicalLanes <= 1 ||
+      result.getShape()[lanePosition] !=
+          primaryLanes * result.getLayout().getTimeFactors()[lanePosition] ||
+      result.getLayout().getReplicaFactors()[lanePosition] != 1 ||
+      result.getLayout().getFragmentFactors()[lanePosition] != 1 ||
+      result.getLayout().getLocalFactors()[lanePosition] != 1)
+    return emitOpError(
+        "replica storage load lane axis must be one complete SIMD window");
+  for (size_t position = 0; position < result.getShape().size(); ++position) {
+    const int64_t time = result.getLayout().getTimeFactors()[position];
+    const int64_t lane = result.getLayout().getLaneFactors()[position];
+    const int64_t replica = result.getLayout().getReplicaFactors()[position];
+    int64_t factors[] = {time, lane, replica};
+    auto represented = checkedPositiveProduct(factors);
+    if ((layered && position != lanePosition && lane != 1) ||
+        (lane > 1 && replica != 1) ||
+        (time > 1 && replica > 1) || !represented ||
+        *represented != result.getShape()[position] ||
+        result.getLayout().getFragmentFactors()[position] != 1 ||
+        result.getLayout().getLocalFactors()[position] != 1)
+      return emitOpError(
+          "replica storage load must preserve every non-lane axis as issue time or register replicas");
+  }
+
+  if (natural) {
+    if (getAccess().getForm() != "indexed" || getAccess().getBitOffset() % 8 ||
+        (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
+         fieldElement.getWidth() != 32) ||
+        result.getLayout().getSew() !=
+            static_cast<int64_t>(fieldElement.getWidth()))
+      return emitOpError(
+          "natural replica storage load requires byte-addressable indexed source elements");
+  } else {
+    if (getAccess().getForm() != "indexed" || group <= 0 || layer <= 0 ||
+        group % layer || layers <= 1 || layer % *physicalLanes ||
+        fieldElement.getWidth() * layers > 8 ||
+        result.getLayout().getSew() != 8 || getAccess().getBitOffset() % 8 ||
+        (getAccess().getOrder() != "lo_first" &&
+         getAccess().getOrder() != "hi_first") ||
+        group % getLogicalSpan())
+      return emitOpError(
+          "layered replica storage load requires closed grouped/layered byte geometry");
+  }
+
+
+  for (int64_t offset : getWindowOffsets()) {
+    const bool bounded = natural ? offset >= 0 && offset <= getLogicalSpan() - *physicalLanes
+                                 : offset >= 0 && offset <= layer - *physicalLanes;
+    if (!bounded)
+      return emitOpError("replica storage load window offset is out of bounds");
+  }
+  for (auto [window, storageLayer] :
+       llvm::zip(getWindowForPart(), getLayerForPart())) {
+    if (window < 0 || window >= static_cast<int64_t>(getWindowOffsets().size()) ||
+        storageLayer < 0 || storageLayer >= layers ||
+        (natural && storageLayer != 0))
+      return emitOpError(
+          "replica storage load part map references an invalid window or layer");
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVWidenAccumulateOp::verify() {
   ValueType lhs = getLhs().getType();
   ValueType rhs = getRhs().getType();
@@ -3454,6 +3756,48 @@ mlir::LogicalResult RVVWidenAccumulateOp::verify() {
       break;
     }
   }
+  bool explicitChain = false;
+  if (!loopCarried) {
+    mlir::Value first = getAccumulator();
+    while (auto previous = first.getDefiningOp<RVVWidenAccumulateOp>()) {
+      if (previous.getOperation()->getBlock() != getOperation()->getBlock() ||
+          previous.getReductionAxis() != getReductionAxis()) {
+        first = {};
+        break;
+      }
+      first = previous.getAccumulator();
+    }
+    auto splatSeed = first ? first.getDefiningOp<RVVSplatOp>() : RVVSplatOp();
+    auto productSeed =
+        first ? first.getDefiningOp<RVVWidenMultiplyOp>()
+              : RVVWidenMultiplyOp();
+    explicitChain =
+        (splatSeed && splatSeed.getOperation()->getBlock() ==
+                          getOperation()->getBlock()) ||
+        (productSeed && productSeed.getOperation()->getBlock() ==
+                            getOperation()->getBlock());
+    mlir::Value current = getResult();
+    while (explicitChain) {
+      if (!current.hasOneUse()) {
+        explicitChain = false;
+        break;
+      }
+      mlir::Operation *user = *current.getUsers().begin();
+      if (auto next = mlir::dyn_cast<RVVWidenAccumulateOp>(user)) {
+        if (next.getAccumulator() != current ||
+            next.getReductionAxis() != getReductionAxis() ||
+            next.getOperation()->getBlock() != getOperation()->getBlock()) {
+          explicitChain = false;
+          break;
+        }
+        current = next.getResult();
+        continue;
+      }
+      auto capture = mlir::dyn_cast<RVVPartialCaptureOp>(user);
+      explicitChain = capture && capture.getInput() == current;
+      break;
+    }
+  }
   if (!lhsElement || !rhsElement || !partialElement ||
       lhsElement.isSignless() || rhsElement.isSignless() ||
       !partialElement.isSigned() ||
@@ -3482,11 +3826,12 @@ mlir::LogicalResult RVVWidenAccumulateOp::verify() {
           llvm::ArrayRef<int64_t>(expectedAxes) ||
       accumulator.getShape().asArrayRef() !=
           llvm::ArrayRef<int64_t>(expectedShape) ||
-      !operandMapsToPartial(lhs) || !operandMapsToPartial(rhs) || !loopCarried ||
+      !operandMapsToPartial(lhs) || !operandMapsToPartial(rhs) ||
+      (!loopCarried && !explicitChain) ||
       !exactLeaf(getLeaf(), "rvv", "widen-accumulate",
                  "rvv.vwmacc.partial", "none", "agnostic"))
     return emitOpError(
-        "RVV widened accumulation requires matching single-window operands and one loop-carried partial");
+        "RVV widened accumulation requires matching single-window operands and one closed partial chain");
   return mlir::success();
 }
 
@@ -3555,7 +3900,7 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
       !resultElement ||
       !resultElement.isSigned() || resultElement.getWidth() != 32 ||
       !completeMapping || !legalResult || !kernel ||
-      !supportsLayout(kernel.getTarget(), partial.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), partial.getLayout()) ||
       !exactLeaf(getLeaf(), "rvv", "finalize-widen-dot",
                  instruction, "none", "exact"))
     return emitOpError(
@@ -3575,28 +3920,63 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
     return static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin());
   };
   auto partialAxis = positionOf(partial);
-  if (getLhs().empty() || getLhs().size() != getRhs().size() ||
-      getLhs().size() != getLhsReplicas().size() ||
-      getRhs().size() != getRhsReplicas().size() || !partialElement ||
+  if (getLhs().empty() || getRhs().empty() || !partialElement ||
       !partialElement.isSigned() || !partialAxis ||
+      getLhsOperands().size() != static_cast<size_t>(result.getSlots()) ||
+      getRhsOperands().size() != static_cast<size_t>(result.getSlots()) ||
+      getLhsParts().size() != static_cast<size_t>(result.getSlots()) ||
+      getRhsParts().size() != static_cast<size_t>(result.getSlots()) ||
       getReductionAxis() != result.getReductionAxis() ||
       !exactLeaf(getLeaf(), "rvv", "partial-set", "rvv.partial-set",
                  "none", "exact"))
     return emitOpError(
         "RVV partial set requires paired stream operands and one closed result topology");
-
-  int64_t totalSlots = 0;
-  for (size_t pair = 0; pair < getLhs().size(); ++pair) {
-    ValueType lhs = mlir::cast<ValueType>(getLhs()[pair].getType());
-    ValueType rhs = mlir::cast<ValueType>(getRhs()[pair].getType());
+  auto preservesPartialAxes = [&](ValueType operand) {
+    if (partial.getAxisIds().size() == 1)
+      return true;
+    if (partial.getAxisIds() != operand.getAxisIds() ||
+        partial.getShape().size() != operand.getShape().size())
+      return false;
+    for (size_t position = 0; position < partial.getShape().size(); ++position) {
+      if (partial.getAxisIds()[position] == getReductionAxis()) {
+        if (partial.getShape()[position] !=
+                operand.getLayout().getLaneFactors()[position] ||
+            partial.getLayout().getTimeFactors()[position] != 1 ||
+            partial.getLayout().getLaneFactors()[position] !=
+                operand.getLayout().getLaneFactors()[position] ||
+            partial.getLayout().getReplicaFactors()[position] != 1)
+          return false;
+        continue;
+      }
+      if (partial.getShape()[position] != operand.getShape()[position] ||
+          operand.getLayout().getTimeFactors()[position] != 1 ||
+          partial.getLayout().getTimeFactors()[position] != 1 ||
+          partial.getLayout().getLaneFactors()[position] !=
+              operand.getLayout().getLaneFactors()[position] ||
+          partial.getLayout().getReplicaFactors()[position] !=
+              operand.getLayout().getReplicaFactors()[position])
+        return false;
+    }
+    return checkedPositiveProduct(
+               partial.getLayout().getLaneFactors().asArrayRef()) ==
+           checkedPositiveProduct(
+               operand.getLayout().getLaneFactors().asArrayRef());
+  };
+  for (int64_t slot = 0; slot < result.getSlots(); ++slot) {
+    const int64_t lhsOperand = getLhsOperands()[slot];
+    const int64_t rhsOperand = getRhsOperands()[slot];
+    if (lhsOperand < 0 || lhsOperand >= static_cast<int64_t>(getLhs().size()) ||
+        rhsOperand < 0 || rhsOperand >= static_cast<int64_t>(getRhs().size()))
+      return emitOpError(
+          "RVV partial set slot references an absent operand");
+    ValueType lhs = mlir::cast<ValueType>(getLhs()[lhsOperand].getType());
+    ValueType rhs = mlir::cast<ValueType>(getRhs()[rhsOperand].getType());
     auto lhsElement = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
     auto rhsElement = mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType());
     auto lhsAxis = positionOf(lhs);
     auto rhsAxis = positionOf(rhs);
-    auto lhsReplicas = checkedPositiveProduct(
-        lhs.getLayout().getReplicaFactors().asArrayRef());
-    auto rhsReplicas = checkedPositiveProduct(
-        rhs.getLayout().getReplicaFactors().asArrayRef());
+    auto lhsParts = physicalPartCount(lhs);
+    auto rhsParts = physicalPartCount(rhs);
     const llvm::StringRef instruction = getMultiplyInstruction();
     const bool exactMultiply =
         (instruction == "rvv.vwmul.vv" && lhsElement && rhsElement &&
@@ -3630,23 +4010,153 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
         lhs.getLayout().getTimeFactors()[*lhsAxis] !=
             rhs.getLayout().getTimeFactors()[*rhsAxis] ||
         partial.getLayout().getLaneFactors()[*partialAxis] !=
-            lhs.getLayout().getLaneFactors()[*lhsAxis] ||
+            (partial.getAxisIds().size() == 1
+                 ? checkedPositiveProduct(
+                       lhs.getLayout().getLaneFactors().asArrayRef())
+                       .value_or(-1)
+                 : lhs.getLayout().getLaneFactors()[*lhsAxis]) ||
         partial.getLayout().getSew() != 2 * lhs.getLayout().getSew() ||
         partial.getLayout().getLmulEighths() !=
             2 * lhs.getLayout().getLmulEighths() ||
         result.getTermsPerSlot() !=
             partial.getLayout().getLaneFactors()[*partialAxis] ||
-        !lhsReplicas || !rhsReplicas || getLhsReplicas()[pair] < 0 ||
-        getRhsReplicas()[pair] < 0 ||
-        getLhsReplicas()[pair] >= *lhsReplicas ||
-        getRhsReplicas()[pair] >= *rhsReplicas || !exactMultiply)
+        !preservesPartialAxes(lhs) || !preservesPartialAxes(rhs) ||
+        !lhsParts || !rhsParts || getLhsParts()[slot] < 0 ||
+        getRhsParts()[slot] < 0 || getLhsParts()[slot] >= *lhsParts ||
+        getRhsParts()[slot] >= *rhsParts || !exactMultiply)
       return emitOpError(
           "RVV partial set operand pair does not produce the declared widened slots");
-    totalSlots += lhs.getLayout().getTimeFactors()[*lhsAxis];
   }
-  if (totalSlots != result.getSlots())
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartialCaptureOp::verify() {
+  ValueType input = getInput().getType();
+  PartialSetType result = getResult().getType();
+  auto axis = llvm::find(input.getAxisIds().asArrayRef(),
+                         result.getReductionAxis());
+  auto parts = physicalPartCount(input);
+  llvm::StringRef tail = input.getLayout().getValidity() == "tail"
+                             ? llvm::StringRef("agnostic")
+                             : llvm::StringRef("exact");
+  if (input.getLayout().getCarrier() != "rvv" || !parts || *parts != 1 ||
+      axis == input.getAxisIds().asArrayRef().end() ||
+      result.getPartialType() != input || result.getSlots() != 1 ||
+      result.getTermsPerSlot() !=
+          input.getLayout().getLaneFactors()[static_cast<size_t>(
+              axis - input.getAxisIds().asArrayRef().begin())] ||
+      result.getResourceGroups() != input.getLayout().getRegisterGroups() ||
+      getLeaf().getOperandGroups() != input.getLayout().getRegisterGroups() ||
+      getLeaf().getResultGroups() != result.getResourceGroups() ||
+      !exactLeaf(getLeaf(), "rvv", "partial-capture",
+                 "rvv.partial-capture", "none", tail))
     return emitOpError(
-        "RVV partial set slot count disagrees with its typed operand streams");
+        "RVV partial capture requires one complete register-resident lane partial");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartialRepackOp::verify() {
+  PartialSetType input = getInput().getType();
+  PartialSetType result = getResult().getType();
+  ValueType source = input.getPartialType();
+  ValueType target = result.getPartialType();
+  auto sourceElement =
+      mlir::dyn_cast<mlir::IntegerType>(source.getElementType());
+  auto targetElement =
+      mlir::dyn_cast<mlir::IntegerType>(target.getElementType());
+  auto sourceAxis = llvm::find(source.getAxisIds().asArrayRef(),
+                               input.getReductionAxis());
+  auto targetAxis = llvm::find(target.getAxisIds().asArrayRef(),
+                               input.getReductionAxis());
+  const int64_t split = static_cast<int64_t>(getSplitFactor());
+  bool compatibleAxes = source.getAxisIds() == target.getAxisIds() &&
+                        source.getShape().size() == target.getShape().size();
+  if (compatibleAxes && sourceAxis != source.getAxisIds().asArrayRef().end() &&
+      targetAxis != target.getAxisIds().asArrayRef().end()) {
+    const size_t sourcePosition = static_cast<size_t>(
+        sourceAxis - source.getAxisIds().asArrayRef().begin());
+    const size_t targetPosition = static_cast<size_t>(
+        targetAxis - target.getAxisIds().asArrayRef().begin());
+    compatibleAxes &= sourcePosition == targetPosition;
+    for (size_t position = 0; position < source.getShape().size(); ++position) {
+      if (position == sourcePosition) {
+        compatibleAxes &= source.getShape()[position] ==
+                              target.getShape()[position] * split &&
+                          source.getLayout().getLaneFactors()[position] ==
+                              target.getLayout().getLaneFactors()[position] * split &&
+                          source.getLayout().getTimeFactors()[position] == 1 &&
+                          target.getLayout().getTimeFactors()[position] == 1 &&
+                          source.getLayout().getReplicaFactors()[position] == 1 &&
+                          target.getLayout().getReplicaFactors()[position] == 1;
+      } else {
+        compatibleAxes &= source.getShape()[position] == target.getShape()[position] &&
+                          source.getLayout().getTimeFactors()[position] ==
+                              target.getLayout().getTimeFactors()[position] &&
+                          source.getLayout().getLaneFactors()[position] ==
+                              target.getLayout().getLaneFactors()[position] &&
+                          source.getLayout().getReplicaFactors()[position] ==
+                              target.getLayout().getReplicaFactors()[position];
+      }
+    }
+  } else {
+    compatibleAxes = false;
+  }
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (split <= 1 || !sourceElement || !targetElement ||
+      sourceElement != targetElement || !compatibleAxes ||
+      source.getLayout().getCarrier() != "rvv" ||
+      target.getLayout().getCarrier() != "rvv" ||
+      source.getLayout().getSew() != target.getLayout().getSew() ||
+      source.getLayout().getLmulEighths() !=
+          target.getLayout().getLmulEighths() * split ||
+      source.getLayout().getVl() != target.getLayout().getVl() * split ||
+      result.getReductionAxis() != input.getReductionAxis() ||
+      result.getSlots() != input.getSlots() * split ||
+      result.getTermsPerSlot() * split != input.getTermsPerSlot() ||
+      result.getResourceGroups() != input.getResourceGroups() || !kernel ||
+      !supportsRVVLayout(kernel.getTarget(), source.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), target.getLayout()) ||
+      !exactLeaf(getLeaf(), "rvv", "partial-repack",
+                 "rvv.partial-repack.split", "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({input.getReductionAxis(), split}))
+    return emitOpError(
+        "RVV partial repack requires one exact lane/LMUL split preserving all logical terms and resources");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartialMergeOp::verify() {
+  PartialSetType result = getResult().getType();
+  if (getInputs().size() < 2)
+    return emitOpError("RVV partial merge requires at least two input sets");
+  int64_t slots = 0;
+  int64_t terms = 0;
+  int64_t resources = 0;
+  for (mlir::Value inputValue : getInputs()) {
+    PartialSetType input = mlir::cast<PartialSetType>(inputValue.getType());
+    if (input.getPartialType() != result.getPartialType() ||
+        input.getReductionAxis() != result.getReductionAxis())
+      return emitOpError(
+          "RVV partial merge inputs must share one partial layout and reduction axis");
+    slots += input.getSlots();
+    terms += input.getSlots() * input.getTermsPerSlot();
+    resources += input.getResourceGroups();
+  }
+  const int64_t resultGroups =
+      result.getPartialType().getLayout().getRegisterGroups();
+  if (getTopology() != "pairwise" || result.getSlots() != 1 ||
+      result.getTermsPerSlot() != terms ||
+      result.getResourceGroups() != resultGroups ||
+      getLeaf().getOperandGroups() != resources ||
+      getLeaf().getResultGroups() != resultGroups ||
+      !exactLeaf(getLeaf(), "rvv", "partial-merge", "rvv.partial-merge",
+                 "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({result.getReductionAxis(),
+                                   static_cast<int64_t>(getInputs().size()),
+                                   slots, terms}))
+    return emitOpError(
+        "RVV partial merge must pairwise combine every compatible slot into one typed partial");
   return mlir::success();
 }
 
@@ -3720,18 +4230,18 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
        llvm::zip(getScales(), getScaleReplicas())) {
     ValueType type = mlir::cast<ValueType>(scale.getType());
     auto scaleElement = mlir::dyn_cast<mlir::IntegerType>(type.getElementType());
-    auto parts = checkedPositiveProduct(
+    auto replicas = checkedPositiveProduct(
         type.getLayout().getReplicaFactors().asArrayRef());
     if (!scaleElement || !scaleElement.isSigned() ||
         scaleElement.getWidth() != 32 ||
-        type.getLayout().getCarrier() != "scalar" || !parts || replica < 0 ||
-        replica >= *parts ||
-        llvm::any_of(type.getLayout().getTimeFactors().asArrayRef(),
-                     [](int64_t value) { return value != 1; }) ||
-        llvm::any_of(type.getLayout().getLaneFactors().asArrayRef(),
-                     [](int64_t value) { return value != 1; }))
+        type.getLayout().getCarrier() != "scalar" || !replicas ||
+        replica < 0 || replica >= *replicas ||
+        !llvm::all_of(type.getLayout().getTimeFactors().asArrayRef(),
+                      [](int64_t factor) { return factor == 1; }) ||
+        !llvm::all_of(type.getLayout().getLaneFactors().asArrayRef(),
+                      [](int64_t factor) { return factor == 1; }))
       return emitOpError(
-          "RVV scaled partial combine scales must be signed i32 scalar values with explicit replica projections");
+          "RVV scaled partial combine scales require in-bounds signed-i32 scalar replicas");
   }
   return mlir::success();
 }
@@ -3739,27 +4249,32 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
 mlir::LogicalResult RVVPartialCombineOp::verify() {
   PartialSetType input = getInput().getType();
   PartialSetType result = getResult().getType();
-  if (getArity() <= 1 || input.getSlots() % getArity() ||
+  if (getArity() <= 1 || getTopology() != "pairwise" ||
+      input.getSlots() % getArity() ||
       result.getPartialType() != input.getPartialType() ||
       result.getReductionAxis() != input.getReductionAxis() ||
       result.getSlots() != input.getSlots() / getArity() ||
       result.getTermsPerSlot() != input.getTermsPerSlot() * getArity() ||
       !exactLeaf(getLeaf(), "rvv", "partial-combine",
-                 "rvv.partial-combine", "none", "exact"))
+                 "rvv.partial-combine", "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({input.getReductionAxis(),
+                                   static_cast<int64_t>(getArity()),
+                                   result.getSlots()}))
     return emitOpError(
-        "RVV partial combine requires an exact, divisive tree level over one partial set");
+        "RVV partial combine requires an exact pairwise divisive tree level over one partial set");
   return mlir::success();
 }
 
 mlir::LogicalResult RVVPartialFinalizeOp::verify() {
   PartialSetType input = getInput().getType();
   auto result = mlir::dyn_cast<mlir::IntegerType>(getResult().getType());
+  auto resultValue = mlir::dyn_cast<ValueType>(getResult().getType());
   auto partial = mlir::dyn_cast<mlir::IntegerType>(
       input.getPartialType().getElementType());
   auto axis = llvm::find(input.getPartialType().getAxisIds().asArrayRef(),
                          getReductionAxis());
-  if (!result || !result.isSigned() || result.getWidth() != 32 || !partial ||
-      !partial.isSigned() ||
+  if ((!result && !resultValue) || !partial || !partial.isSigned() ||
       (partial.getWidth() != 16 && partial.getWidth() != 32) ||
       getReductionAxis() != input.getReductionAxis() ||
       axis == input.getPartialType().getAxisIds().asArrayRef().end())
@@ -3767,14 +4282,71 @@ mlir::LogicalResult RVVPartialFinalizeOp::verify() {
         "RVV partial finalize requires one signed widened set and an i32 result");
   const size_t position = static_cast<size_t>(
       axis - input.getPartialType().getAxisIds().asArrayRef().begin());
+  if (resultValue) {
+    auto resultElement =
+        mlir::dyn_cast<mlir::IntegerType>(resultValue.getElementType());
+    bool preservesFreeAxes =
+        resultElement && resultElement.isSigned() &&
+        resultElement.getWidth() == 32 && partial.getWidth() == 16 &&
+        input.getSlots() == 1 &&
+        input.getPartialType().getShape()[position] == 1 &&
+        input.getPartialType().getLayout().getTimeFactors()[position] == 1 &&
+        input.getPartialType().getLayout().getLaneFactors()[position] == 1 &&
+        input.getPartialType().getLayout().getReplicaFactors()[position] == 1 &&
+        resultValue.getLayout().getCarrier() == "rvv" &&
+        resultValue.getAxisIds().size() + 1 ==
+            input.getPartialType().getAxisIds().size() &&
+        resultValue.getLayout().getSew() == 32 &&
+        resultValue.getLayout().getLmulEighths() ==
+            input.getPartialType().getLayout().getLmulEighths() * 2 &&
+        resultValue.getLayout().getVl() ==
+            input.getPartialType().getLayout().getVl();
+    size_t resultPosition = 0;
+    for (size_t partialPosition = 0;
+         preservesFreeAxes &&
+         partialPosition < input.getPartialType().getAxisIds().size();
+         ++partialPosition) {
+      if (partialPosition == position)
+        continue;
+      preservesFreeAxes &=
+          resultPosition < resultValue.getAxisIds().size() &&
+          resultValue.getAxisIds()[resultPosition] ==
+              input.getPartialType().getAxisIds()[partialPosition] &&
+          resultValue.getShape()[resultPosition] ==
+              input.getPartialType().getShape()[partialPosition] &&
+          resultValue.getLayout().getTimeFactors()[resultPosition] ==
+              input.getPartialType().getLayout().getTimeFactors()[partialPosition] &&
+          resultValue.getLayout().getLaneFactors()[resultPosition] ==
+              input.getPartialType().getLayout().getLaneFactors()[partialPosition] &&
+          resultValue.getLayout().getReplicaFactors()[resultPosition] ==
+              input.getPartialType().getLayout().getReplicaFactors()[partialPosition] &&
+          resultValue.getLayout().getFragmentFactors()[resultPosition] ==
+              input.getPartialType().getLayout().getFragmentFactors()[partialPosition] &&
+          resultValue.getLayout().getLocalFactors()[resultPosition] ==
+              input.getPartialType().getLayout().getLocalFactors()[partialPosition];
+      ++resultPosition;
+    }
+    if (!preservesFreeAxes ||
+        !exactLeaf(getLeaf(), "rvv", "partial-finalize",
+                   "rvv.partial-finalize.widen", "none", "exact"))
+      return emitOpError(
+          "RVV vector partial finalize must widen one singleton reduction coordinate and preserve every free physical axis");
+    return mlir::success();
+  }
+  if (!result || !result.isSigned() || result.getWidth() != 32)
+    return emitOpError(
+        "RVV scalar partial finalize requires one signed i32 result");
   llvm::StringRef instruction =
       input.getPartialType().getLayout().getLaneFactors()[position] == 1
           ? "rvv.partial-finalize.extract"
           : "rvv.partial-finalize.reduce";
   if (!exactLeaf(getLeaf(), "rvv", "partial-finalize", instruction, "none",
                  "exact"))
-    return emitOpError(
-        "RVV partial finalize leaf disagrees with its typed lane topology");
+    return emitOpError()
+           << "RVV partial finalize leaf disagrees with its typed lane topology; "
+              "expected_instruction="
+           << instruction << ", reduction_axis=" << getReductionAxis()
+           << ", partial=" << input.getPartialType() << ", leaf=" << getLeaf();
   return mlir::success();
 }
 
@@ -4232,6 +4804,42 @@ mlir::LogicalResult RVVSplatOp::verify() {
            << "RVV splat requires a matching scalar and RVV result; scalar="
            << getScalar().getType() << ", result=" << getResult().getType()
            << ", leaf engine=" << getLeaf().getEngine();
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVAxisBroadcastOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  auto inputLayout = input.getLayout();
+  auto resultLayout = result.getLayout();
+  auto inputLanes = checkedProduct(inputLayout.getLaneFactors().asArrayRef());
+  auto resultLanes = checkedProduct(resultLayout.getLaneFactors().asArrayRef());
+  bool preservesSourceDomain = input.getElementType() == result.getElementType();
+  for (auto [position, axis] :
+       llvm::enumerate(input.getAxisIds().asArrayRef())) {
+    auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+    if (found == result.getAxisIds().asArrayRef().end()) {
+      preservesSourceDomain = false;
+      break;
+    }
+    size_t resultPosition = static_cast<size_t>(
+        found - result.getAxisIds().asArrayRef().begin());
+    preservesSourceDomain &=
+        input.getShape()[position] == result.getShape()[resultPosition];
+  }
+  if (!preservesSourceDomain || input.getAxisIds().size() >=
+                                    result.getAxisIds().size() ||
+      inputLayout.getCarrier() != "rvv" ||
+      resultLayout.getCarrier() != "rvv" || !inputLanes || !resultLanes ||
+      *inputLanes <= 0 || *resultLanes <= *inputLanes ||
+      inputLayout.getSew() != resultLayout.getSew() ||
+      inputLayout.getLmulEighths() > resultLayout.getLmulEighths() ||
+      !exactLeaf(getLeaf(), "rvv", "axis-broadcast",
+                 "rvv.axis-broadcast", "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({*inputLanes, *resultLanes}))
+    return emitOpError(
+        "RVV axis broadcast must embed one proper logical sub-domain in a wider typed lane layout");
   return mlir::success();
 }
 

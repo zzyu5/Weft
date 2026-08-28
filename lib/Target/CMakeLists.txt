@@ -16,6 +16,7 @@ add_library(WeftRISCVTarget STATIC
   MaterializeRISCVPartialAccumulators.cpp
   FinalizeRISCVLeaves.cpp
   MaterializeRISCVResources.cpp
+  EliminateDeadRISCVLayouts.cpp
   VerifyFinalRISCV.cpp
   RISCVIntrinsicC.cpp
   RISCVCompiler.cpp

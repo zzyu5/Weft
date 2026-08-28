@@ -44,12 +44,16 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
       riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
-      riscv::RVVWidenMultiplyOp, riscv::RVVRegularRepeatIndexOp,
+      riscv::RVVWidenMultiplyOp, riscv::RVVWidenScalarMultiplyOp,
+      riscv::RVVRegularRepeatIndexOp,
       riscv::RVVRegularRepeatGatherOp,
       riscv::RVVStorageWindowOp, riscv::RVVLayeredStorageLoadOp,
-      riscv::RVVLayeredStorageDecodeOp, riscv::RVVWidenAccumulateOp,
+      riscv::RVVLayeredStorageDecodeOp, riscv::RVVReplicaStorageLoadOp,
+      riscv::RVVWidenAccumulateOp,
       riscv::RVVFinalizeWidenDotOp,
-      riscv::RVVPartialSetOp, riscv::RVVPartialReduceOp,
+      riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
+      riscv::RVVPartialRepackOp,
+      riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
       riscv::RVVPartialScaleCombineOp, riscv::RVVPartialCombineOp,
       riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
       riscv::RVVWidenReduceOp,
@@ -58,6 +62,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVProjectedLayeredStreamOp,
       riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
       riscv::RVVStreamContractOp, riscv::RVVSplatOp,
+      riscv::RVVAxisBroadcastOp,
       riscv::ProjectReductionOperandOp, riscv::RVVContractStepOp,
       riscv::RVVEncodedContractStepOp>(operation);
 }
@@ -78,11 +83,15 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
       riscv::RVVWidenDotOp, riscv::RVVWidenMultiplyOp,
+      riscv::RVVWidenScalarMultiplyOp,
       riscv::RVVRegularRepeatIndexOp, riscv::RVVRegularRepeatGatherOp,
       riscv::RVVStorageWindowOp,
       riscv::RVVLayeredStorageLoadOp, riscv::RVVLayeredStorageDecodeOp,
-      riscv::RVVWidenAccumulateOp, riscv::RVVFinalizeWidenDotOp,
-      riscv::RVVPartialSetOp, riscv::RVVPartialReduceOp,
+      riscv::RVVReplicaStorageLoadOp, riscv::RVVWidenAccumulateOp,
+      riscv::RVVFinalizeWidenDotOp,
+      riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
+      riscv::RVVPartialRepackOp,
+      riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
       riscv::RVVPartialScaleCombineOp, riscv::RVVPartialCombineOp,
       riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
       riscv::RVVWidenReduceOp,
@@ -91,6 +100,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVProjectedLayeredStreamOp,
       riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
       riscv::RVVStreamContractOp, riscv::RVVSplatOp,
+      riscv::RVVAxisBroadcastOp,
       riscv::ProjectReductionOperandOp,
       riscv::RVVContractStepOp, riscv::RVVEncodedContractStepOp>(operation);
 }
@@ -205,6 +215,8 @@ bool requiresIntegerWidening(mlir::Operation *operation) {
                 riscv::RVVEncodedDotStepOp,
                 riscv::RVVWidenDotOp,
                 riscv::RVVPartialSetOp,
+                riscv::RVVPartialCaptureOp, riscv::RVVPartialRepackOp,
+                riscv::RVVPartialMergeOp,
                 riscv::RVVPartialReduceOp,
                 riscv::RVVPartialScaleCombineOp,
                 riscv::RVVPartialCombineOp,
@@ -295,7 +307,11 @@ public:
       if (auto leaf = operation->getAttrOfType<riscv::LeafAttr>("leaf")) {
         if (leaf.getEngine() == "unselected" ||
             leaf.getInstruction().starts_with("pending-")) {
-          operation->emitError("final target operation has no closed local leaf");
+          operation->emitError()
+              << "final target operation " << operation->getName()
+              << " has no closed local leaf; leaf=" << leaf
+              << ", operands=" << operation->getOperandTypes()
+              << ", results=" << operation->getResultTypes();
           failed = true;
         }
         if (mlir::isa<riscv::IotaOp, riscv::UnaryOp, riscv::BinaryOp,
@@ -335,7 +351,11 @@ public:
               static_cast<bool>(riscv_internal::sourceField(extract.getInput()));
         if (!rematerializable) {
           conversion.emitError(
-              "final time-to-lane conversion was not rematerialized to an encoded field edge");
+              "final time-to-lane conversion was not rematerialized to an encoded field edge; input_def=")
+              << (definition ? definition->getName().getStringRef()
+                             : llvm::StringRef("<block-argument>"))
+              << ", input_type=" << conversion.getInput().getType()
+              << ", result_type=" << conversion.getResult().getType();
           failed = true;
         }
       }

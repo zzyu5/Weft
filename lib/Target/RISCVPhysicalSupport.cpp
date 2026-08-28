@@ -633,6 +633,11 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
                std::to_string(factor);
     }
     if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(operation);
+        narrow && sourceInteger && targetInteger && !narrow.getSaturate() &&
+        sourceInteger.getWidth() == targetInteger.getWidth() * 2 &&
+        targetInteger.getWidth() >= 8)
+      return "rvv.narrow.int.vf2";
+    if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(operation);
         narrow && source.isF32() && targetInteger &&
         targetInteger.getWidth() == 8)
       return ("rvv.f32-i8-" +

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import weft
-from weft.language import View, commit, f32, i8, u32
+from weft.language import View, commit, f32, i8, u8, u32
 from weft.std.encodings import (
     IQ1_M,
     IQ1_S,

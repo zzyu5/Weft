@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -24,6 +25,13 @@ namespace {
 
 struct Roles {
   int64_t laneAxis = 0;
+  // Some target operations consume a cartesian logical tile in one RVV
+  // register group.  laneAxis is the instruction's primary lane coordinate
+  // (for example a contraction reduction axis); coalescedLaneAxes are
+  // surviving logical coordinates that are linearized beside it.  Keeping the
+  // axes distinct here lets later typed operations recover each logical
+  // coordinate while the physical lane count is their product.
+  llvm::SmallSet<int64_t, 4> coalescedLaneAxes;
   llvm::SmallSet<int64_t, 4> replicaAxes;
   llvm::SmallSet<int64_t, 4> sequentialAxes;
   bool ime = false;
@@ -31,8 +39,237 @@ struct Roles {
   bool anchored = false;
   bool fullLaneExtent = false;
   bool registerTuple = false;
+  // A typed affine extract may have a storage-contiguous axis that conflicts
+  // with a downstream compute layout.  Keep that memory anchor intact and let
+  // insertUseConversions materialize the representation change on the SSA use
+  // edge.  Propagating the compute layout back into the extract would turn a
+  // provably contiguous window into an indexed gather.
+  bool memoryAnchored = false;
   llvm::SmallVector<int64_t, 4> fragmentParameters;
 };
+
+struct AffineAxes {
+  llvm::DenseMap<int64_t, int64_t> coefficients;
+  bool valid = true;
+};
+
+bool checkedMultiply(int64_t lhs, int64_t rhs, int64_t &result) {
+  if (lhs == 0 || rhs == 0) {
+    result = 0;
+    return true;
+  }
+  if (lhs > 0) {
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() / rhs) ||
+        (rhs < 0 && rhs < std::numeric_limits<int64_t>::min() / lhs))
+      return false;
+  } else {
+    if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() / rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::max() / rhs))
+      return false;
+  }
+  result = lhs * rhs;
+  return true;
+}
+
+void addAxisCoefficient(AffineAxes &result, int64_t axis,
+                        int64_t coefficient) {
+  if (!result.valid)
+    return;
+  int64_t next = result.coefficients.lookup(axis);
+  if ((coefficient > 0 &&
+       next > std::numeric_limits<int64_t>::max() - coefficient) ||
+      (coefficient < 0 &&
+       next < std::numeric_limits<int64_t>::min() - coefficient)) {
+    result.valid = false;
+    return;
+  }
+  next += coefficient;
+  if (next)
+    result.coefficients[axis] = next;
+  else
+    result.coefficients.erase(axis);
+}
+
+void decomposeAffineAxes(mlir::Value value, int64_t coefficient,
+                         AffineAxes &result, unsigned depth = 0) {
+  if (!result.valid || depth > 24)
+    return result.valid = false, void();
+  if (riscv_internal::constantInt(value))
+    return;
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
+    if (conversion.getConversion().getEffect() != "pure")
+      return result.valid = false, void();
+    decomposeAffineAxes(conversion.getInput(), coefficient, result, depth + 1);
+    return;
+  }
+  if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+    decomposeAffineAxes(cast.getInput(), coefficient, result, depth + 1);
+    return;
+  }
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    auto type = iota.getResult().getType();
+    if (type.getShape().size() != 1 || type.getAxisIds().size() != 1 ||
+        iota.getEnd() - iota.getStart() != type.getShape()[0])
+      return result.valid = false, void();
+    addAxisCoefficient(result, type.getAxisIds()[0], coefficient);
+    return;
+  }
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    llvm::StringRef kind = binary.getKind();
+    if (kind == "add" || kind == "sub") {
+      decomposeAffineAxes(binary.getLhs(), coefficient, result, depth + 1);
+      int64_t rhsCoefficient = coefficient;
+      if (kind == "sub" &&
+          !checkedMultiply(coefficient, -1, rhsCoefficient))
+        return result.valid = false, void();
+      decomposeAffineAxes(binary.getRhs(), rhsCoefficient, result, depth + 1);
+      return;
+    }
+    if (kind == "mul") {
+      if (auto lhs = riscv_internal::constantInt(binary.getLhs())) {
+        int64_t scaled = 0;
+        if (!checkedMultiply(coefficient, *lhs, scaled))
+          return result.valid = false, void();
+        decomposeAffineAxes(binary.getRhs(), scaled, result, depth + 1);
+        return;
+      }
+      if (auto rhs = riscv_internal::constantInt(binary.getRhs())) {
+        int64_t scaled = 0;
+        if (!checkedMultiply(coefficient, *rhs, scaled))
+          return result.valid = false, void();
+        decomposeAffineAxes(binary.getLhs(), scaled, result, depth + 1);
+        return;
+      }
+    }
+  }
+  // Scalar loop/Level bases do not affect which shaped axis is contiguous.
+  if (!mlir::isa<riscv::ValueType>(value.getType()))
+    return;
+  result.valid = false;
+}
+
+std::optional<Roles> storageRolesFor(mlir::Value value) {
+  auto extract = value.getDefiningOp<riscv::ExtractOp>();
+  auto result = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  if (!extract || !result)
+    return std::nullopt;
+  llvm::SmallVector<mlir::Value> worklist{value};
+  llvm::SmallPtrSet<mlir::Operation *, 16> visited;
+  bool feedsWideningContraction = false;
+  while (!worklist.empty() && !feedsWideningContraction) {
+    mlir::Value current = worklist.pop_back_val();
+    for (mlir::Operation *user : current.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      if (mlir::isa<riscv::DotOp, riscv::ContractOp,
+                    riscv::OuterContractOp>(user)) {
+        auto implementation =
+            user->getAttrOfType<riscv::ImplementationAttr>("implementation");
+        feedsWideningContraction =
+            implementation && implementation.getFamily() == "widen-dot" &&
+            (user->getOperand(0) == current || user->getOperand(1) == current);
+        continue;
+      }
+      if (!mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+                     riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
+                     riscv::ConvertLayoutOp>(user) ||
+          user->getNumResults() != 1)
+        continue;
+      auto next = mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
+      if (next && next.getShape() == result.getShape() &&
+          next.getAxisIds() == result.getAxisIds())
+        worklist.push_back(user->getResult(0));
+    }
+  }
+  if (!feedsWideningContraction)
+    return std::nullopt;
+  auto field = riscv_internal::sourceField(extract.getInput());
+  if (!field)
+    return std::nullopt;
+  riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+  if (facts.mapping != "natural" && facts.mapping != "grouped_layered")
+    return std::nullopt;
+
+  size_t indexCursor = 0;
+  mlir::Value gatherIndex;
+  for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
+    llvm::StringRef selector =
+        mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+    if (selector == "all")
+      continue;
+    if (indexCursor >= extract.getIndices().size())
+      return std::nullopt;
+    mlir::Value index = extract.getIndices()[indexCursor++];
+    if (selector == "gather") {
+      if (gatherIndex)
+        return std::nullopt;
+      gatherIndex = index;
+    }
+  }
+  if (!gatherIndex || indexCursor != extract.getIndices().size())
+    return std::nullopt;
+
+  AffineAxes affine;
+  decomposeAffineAxes(gatherIndex, 1, affine);
+  if (!affine.valid)
+    return std::nullopt;
+  int64_t contiguousAxis = 0;
+  for (auto [axis, extent] :
+       llvm::zip(result.getAxisIds().asArrayRef(), result.getShape().asArrayRef())) {
+    if (affine.coefficients.lookup(axis) != 1 || extent <= 1)
+      continue;
+    if (facts.mapping == "grouped_layered" &&
+        (facts.layer <= 0 || extent > facts.layer))
+      continue;
+    if (contiguousAxis)
+      return std::nullopt;
+    contiguousAxis = axis;
+  }
+  if (!contiguousAxis)
+    return std::nullopt;
+
+  Roles roles;
+  roles.laneAxis = contiguousAxis;
+  if (facts.mapping == "natural") {
+    int64_t span = 0;
+    for (auto [axis, extent] : llvm::zip(result.getAxisIds().asArrayRef(),
+                                         result.getShape().asArrayRef()))
+      if (axis == contiguousAxis)
+        span = extent;
+    if (span <= 0)
+      return std::nullopt;
+    llvm::SmallSet<int64_t, 4> consumed{contiguousAxis};
+    while (true) {
+      int64_t nextAxis = 0;
+      int64_t nextExtent = 0;
+      for (auto [axis, extent] : llvm::zip(
+               result.getAxisIds().asArrayRef(), result.getShape().asArrayRef())) {
+        if (consumed.contains(axis) || extent <= 1 ||
+            affine.coefficients.lookup(axis) != span)
+          continue;
+        if (nextAxis)
+          return std::nullopt;
+        nextAxis = axis;
+        nextExtent = extent;
+      }
+      if (!nextAxis)
+        break;
+      roles.coalescedLaneAxes.insert(nextAxis);
+      consumed.insert(nextAxis);
+      if (!checkedMultiply(span, nextExtent, span))
+        return std::nullopt;
+    }
+  }
+  roles.anchored = true;
+  roles.fullLaneExtent = true;
+  roles.memoryAnchored = true;
+  for (int64_t axis : riscv_internal::logicalAxes(value.getType())) {
+    const int64_t extent = riscv_internal::physicalExtent(value, axis);
+    if (axis != contiguousAxis && extent > 0 && extent <= 16)
+      roles.replicaAxes.insert(axis);
+  }
+  return roles;
+}
 
 bool containsAxis(mlir::Type type, int64_t axis) {
   return llvm::is_contained(riscv_internal::logicalAxes(type), axis);
@@ -41,9 +278,55 @@ bool containsAxis(mlir::Type type, int64_t axis) {
 void addSmallReplicas(mlir::Value value, Roles &roles, int64_t except = 0) {
   for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
     if (int64_t extent = riscv_internal::physicalExtent(value, axis);
-        axis != except && !roles.sequentialAxes.contains(axis) && extent > 0 &&
+        axis != except && !roles.coalescedLaneAxes.contains(axis) &&
+        !roles.sequentialAxes.contains(axis) && extent > 0 &&
         extent <= 16)
       roles.replicaAxes.insert(axis);
+}
+
+bool layoutPreservingPointwise(mlir::Operation *operation) {
+  return mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+                   riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
+                   riscv::ConvertLayoutOp, riscv::MaterializeOp>(operation);
+}
+
+llvm::SmallVector<int64_t>
+downstreamReducedFreeAxes(mlir::Operation *contraction,
+                          llvm::ArrayRef<int64_t> reductionAxes) {
+  llvm::SmallVector<int64_t> reducedAxes;
+  if (!contraction || contraction->getNumResults() != 1)
+    return reducedAxes;
+  llvm::SmallVector<mlir::Value> worklist{contraction->getResult(0)};
+  llvm::SmallPtrSet<mlir::Operation *, 16> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
+    if (!source)
+      continue;
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      if (auto reduce = mlir::dyn_cast<riscv::ReduceOp>(user)) {
+        if (reduce.getAxis() < 0 ||
+            reduce.getAxis() >= static_cast<int64_t>(source.getAxisIds().size()))
+          continue;
+        const int64_t axis = source.getAxisIds()[reduce.getAxis()];
+        if (!llvm::is_contained(reductionAxes, axis) &&
+            !llvm::is_contained(reducedAxes, axis))
+          reducedAxes.push_back(axis);
+        worklist.push_back(reduce.getResult());
+        continue;
+      }
+      if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
+        continue;
+      auto result = mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
+      if (!result || result.getShape() != source.getShape() ||
+          result.getAxisIds() != source.getAxisIds())
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return reducedAxes;
 }
 
 int64_t freeAxisSharedByOneOperand(mlir::Value lhs, mlir::Value rhs) {
@@ -69,12 +352,21 @@ void constrainGroupedMac(riscv::MacGroupsOp operation, mlir::Value value,
   // matcher: canonical and derived encodings use the same rule.
   int64_t lane =
       freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs());
+  int64_t groupedAxis = 0;
+  auto lhsAxes = riscv_internal::logicalAxes(operation.getLhs().getType());
+  auto rhsAxes = riscv_internal::logicalAxes(operation.getRhs().getType());
+  if (!lhsAxes.empty() && !rhsAxes.empty() && lhsAxes.back() == rhsAxes.back())
+    groupedAxis = lhsAxes.back();
   if (!lane) {
-    auto lhsAxes = riscv_internal::logicalAxes(operation.getLhs().getType());
-    auto rhsAxes = riscv_internal::logicalAxes(operation.getRhs().getType());
-    if (!lhsAxes.empty() && !rhsAxes.empty() && lhsAxes.back() == rhsAxes.back())
-      lane = lhsAxes.back();
+    lane = groupedAxis;
   }
+  // When a free output axis occupies lanes, the final common axis remains the
+  // grouped reduction coordinate.  It is issued in time; treating its small
+  // extent as register replicas would keep every term live simultaneously and
+  // multiply the partial resource count by the group size.
+  if (groupedAxis && lane != groupedAxis &&
+      containsAxis(value.getType(), groupedAxis))
+    roles.sequentialAxes.insert(groupedAxis);
   if (lane && containsAxis(value.getType(), lane))
     roles.laneAxis = lane;
   addSmallReplicas(value, roles, roles.laneAxis);
@@ -164,15 +456,17 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
   const int64_t baseLanes =
       kernel && sew > 0 ? kernel.getTarget().getVlenBits() / sew : 0;
   // A contraction shorter than one base RVV vector whose operand already
-  // carries one vector-sized free axis is an outer-product issue: keep that
-  // free axis in lanes and advance the reduction in time.  Materializing the
-  // short reduction axis instead would create one vector replica per output
-  // only to extract those replicas again in the contract-step lowering.
+  // carries a free axis at least as wide as the reduction is an outer-product
+  // issue: keep that free axis in lanes and advance the reduction in time.
+  // A smaller free axis does not amortize serializing the larger reduction;
+  // keep the reduction in lanes and preserve the free axis as replicas instead.
+  // This is derived from the two axis extents and the target base vector, not
+  // from an operator or encoding family.
   if (completeReduction && baseLanes > 1 && reductionElements < baseLanes)
     for (int64_t axis : riscv_internal::logicalAxes(value.getType())) {
       const int64_t extent = riscv_internal::physicalExtent(value, axis);
-      if (!llvm::is_contained(reduction, axis) && extent > 1 &&
-          extent <= baseLanes) {
+      if (!llvm::is_contained(reduction, axis) &&
+          extent > reductionElements && extent <= baseLanes) {
         roles.laneAxis = axis;
         for (int64_t reductionAxis : reduction)
           if (containsAxis(value.getType(), reductionAxis))
@@ -185,6 +479,29 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
       roles.laneAxis = axis;
       break;
     }
+  // A free axis that is consumed by a downstream reduction is not an output
+  // microtile that must remain as register replicas.  It is a segmented lane
+  // coordinate of the same local contraction.  Coalesce as much of it as the
+  // instantiated LMUL permits; any remainder stays as explicit issue time.
+  // This is derived from the typed contraction/use relation and applies to
+  // dense, bit-plane, and codebook inputs alike.
+  if (roles.laneAxis)
+    for (int64_t freeAxis :
+         downstreamReducedFreeAxes(operation.getOperation(), reduction))
+      if (freeAxis != roles.laneAxis &&
+          containsAxis(value.getType(), freeAxis)) {
+        roles.coalescedLaneAxes.insert(freeAxis);
+        roles.replicaAxes.erase(freeAxis);
+      }
+  // A shaped contraction result no longer contains the eliminated reduction
+  // axis.  Its surviving free axes form a register/time tuple; a downstream
+  // pointwise scale or reduction must not re-anchor one of those free axes as
+  // the contraction's SIMD lane merely because that consumer uses lanes.
+  if (!roles.laneAxis) {
+    roles.registerTuple = true;
+    addSmallReplicas(value, roles);
+    return;
+  }
   for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
     if (!llvm::is_contained(reduction, axis) && axis != roles.laneAxis &&
         riscv_internal::physicalExtent(value, axis) > 0 &&
@@ -197,6 +514,9 @@ Roles rolesFor(mlir::Value value) {
   auto element = riscv_internal::logicalElement(value.getType());
   if (mlir::isa<kernel::EncodingType>(element))
     return roles;
+
+  if (auto storage = storageRolesFor(value))
+    return *storage;
 
   if (value.getDefiningOp<riscv::FieldOp>()) {
     for (mlir::OpOperand &use : value.getUses()) {
@@ -270,11 +590,6 @@ Roles rolesFor(mlir::Value value) {
   }
   if (auto operation = value.getDefiningOp<riscv::MacGroupsOp>()) {
     constrainGroupedMac(operation, value, roles);
-  } else if (auto operation = value.getDefiningOp<riscv::LookupOp>()) {
-    auto axes = riscv_internal::logicalAxes(value.getType());
-    if (!axes.empty())
-      roles.laneAxis = axes.back();
-    addSmallReplicas(value, roles, roles.laneAxis);
   } else if (auto operation = value.getDefiningOp<riscv::DotOp>()) {
     constrainReductionContractOperand(operation, value, roles);
   } else if (auto operation = value.getDefiningOp<riscv::ContractOp>()) {
@@ -317,6 +632,7 @@ Roles rolesFor(mlir::Value value) {
 bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
                 bool preserveCarrier = false) {
   bool changed = false;
+  const bool destinationWasAnchored = destination.anchored;
   auto axes = riscv_internal::logicalAxes(target.getType());
   if (preserveCarrier && source.local && !destination.local) {
     destination.local = true;
@@ -342,9 +658,18 @@ bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
   }
   for (int64_t axis : source.replicaAxes)
     if (axis != destination.laneAxis && llvm::is_contained(axes, axis) &&
+        !destination.coalescedLaneAxes.contains(axis) &&
         !destination.sequentialAxes.contains(axis) &&
         destination.replicaAxes.insert(axis).second)
       changed = true;
+  for (int64_t axis : source.coalescedLaneAxes)
+    if (axis != destination.laneAxis && llvm::is_contained(axes, axis) &&
+        !destination.memoryAnchored &&
+        !destination.sequentialAxes.contains(axis) &&
+        destination.coalescedLaneAxes.insert(axis).second) {
+      destination.replicaAxes.erase(axis);
+      changed = true;
+    }
   for (int64_t axis : source.sequentialAxes)
     if (llvm::is_contained(axes, axis) &&
         destination.sequentialAxes.insert(axis).second) {
@@ -357,6 +682,11 @@ bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
   }
   if (source.fullLaneExtent && !destination.fullLaneExtent) {
     destination.fullLaneExtent = true;
+    changed = true;
+  }
+  if (source.memoryAnchored && !destinationWasAnchored &&
+      !destination.memoryAnchored) {
+    destination.memoryAnchored = true;
     changed = true;
   }
   return changed;
@@ -379,6 +709,8 @@ void completeRoles(mlir::Value value, Roles &roles) {
   addSmallReplicas(value, roles, roles.laneAxis);
   if (roles.laneAxis)
     roles.replicaAxes.erase(roles.laneAxis);
+  for (int64_t axis : roles.coalescedLaneAxes)
+    roles.replicaAxes.erase(axis);
 }
 
 int64_t roundLegalLMUL(riscv::TargetAttr target, int64_t requested,
@@ -468,6 +800,8 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
   }
 
   int64_t desiredLanes = 1;
+  const int64_t laneCapacity =
+      std::max<int64_t>(1, target.getVlenBits() * lmulEighths / (8 * sew));
   if (roles.laneAxis) {
     int64_t logicalExtent = riscv_internal::physicalExtent(value, roles.laneAxis);
     int64_t representationExtent =
@@ -476,15 +810,37 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
     // The instantiated LMUL binding is a maximum lane capacity, not a new
     // logical axis.  Smaller values still use the smallest legal LMUL that
     // covers their extent; larger values become explicit issue-time strips.
-    int64_t laneCapacity =
-        target.getVlenBits() * lmulEighths / (8 * sew);
     desiredLanes = std::min(
         representationExtent,
         std::max<int64_t>(1, std::min(laneCapacity, connectedLaneSpan)));
+    if (logicalExtent > 0 && logicalExtent % desiredLanes != 0) {
+      int64_t divisor = 1;
+      while (divisor <= desiredLanes / 2)
+        divisor *= 2;
+      while (divisor > 1 && logicalExtent % divisor != 0)
+        divisor /= 2;
+      desiredLanes = divisor;
+    }
+  }
+  int64_t totalDesiredLanes = desiredLanes;
+  for (int64_t position = static_cast<int64_t>(axes.size()) - 1;
+       position >= 0; --position) {
+    const size_t index = static_cast<size_t>(position);
+    const int64_t axis = axes[index];
+    if (!roles.coalescedLaneAxes.contains(axis))
+      continue;
+    const int64_t extent =
+        std::max<int64_t>(1, riscv_internal::physicalExtent(value, axis));
+    int64_t available = std::max<int64_t>(1, laneCapacity / totalDesiredLanes);
+    int64_t factor = std::min(extent, available);
+    while (factor > 1 && extent % factor)
+      --factor;
+    lane[index] = std::max<int64_t>(1, factor);
+    totalDesiredLanes *= lane[index];
   }
   int64_t requestedLMUL =
       roles.laneAxis
-          ? std::max<int64_t>(1, (desiredLanes * sew * 8 +
+          ? std::max<int64_t>(1, (totalDesiredLanes * sew * 8 +
                                   target.getVlenBits() - 1) /
                                      target.getVlenBits())
           : 0;
@@ -492,10 +848,7 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
       roles.laneAxis ? roundLegalLMUL(target, requestedLMUL, sew) : 0;
   if (roles.laneAxis && lmul == 0)
     return {};
-  int64_t actualLanes = roles.laneAxis
-                            ? target.getVlenBits() * lmul / (8 * sew)
-                            : 1;
-  actualLanes = std::max<int64_t>(1, std::min(actualLanes, desiredLanes));
+  int64_t actualLanes = roles.laneAxis ? totalDesiredLanes : 1;
 
   int64_t replicas = 1;
   for (size_t index = 0; index < axes.size(); ++index) {
@@ -505,7 +858,7 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
                          ? std::max<int64_t>(1, connectedLaneSpan)
                          : 1;
     if (axes[index] == roles.laneAxis)
-      lane[index] = std::min(extent, actualLanes);
+      lane[index] = std::min(extent, desiredLanes);
     if (roles.replicaAxes.contains(axes[index])) {
       replica[index] = extent;
       replicas *= extent;
@@ -874,12 +1227,19 @@ public:
         return;
       const int64_t eliminated = axes[reduce.getAxis()];
       Roles &inputRoles = roles[input];
-      if (!inputRoles.laneAxis)
+      // A structured-product result deliberately remains a scalar register
+      // tuple over its surviving free axes.  A following reduction requires a
+      // different lane representation of that same logical value; preserve the
+      // producer mapping here and insert the typed use-edge conversion below.
+      // Ordinary shaped producers still anchor the eliminated axis directly.
+      if (!inputRoles.laneAxis && !inputRoles.registerTuple)
         inputRoles.laneAxis = eliminated;
       inputRoles.anchored = true;
-      inputRoles.replicaAxes.erase(inputRoles.laneAxis);
-      addSmallReplicas(input, inputRoles, inputRoles.laneAxis);
-      inputRoles.replicaAxes.erase(eliminated);
+      if (inputRoles.laneAxis) {
+        inputRoles.replicaAxes.erase(inputRoles.laneAxis);
+        addSmallReplicas(input, inputRoles, inputRoles.laneAxis);
+        inputRoles.replicaAxes.erase(eliminated);
+      }
     });
     propagateRoles();
     for (mlir::Value value : values)
@@ -1055,6 +1415,17 @@ public:
       return;
     }
 
+    llvm::SmallVector<riscv::ConvertLayoutOp> redundantConversions;
+    getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
+      if (conversion.getConversion().getEffect() == "pure" &&
+          conversion.getInput().getType() == conversion.getResult().getType())
+        redundantConversions.push_back(conversion);
+    });
+    for (riscv::ConvertLayoutOp conversion : redundantConversions) {
+      conversion.getResult().replaceAllUsesWith(conversion.getInput());
+      conversion.erase();
+    }
+
     insertUseConversions(builder);
   }
 
@@ -1174,6 +1545,70 @@ private:
       signalPassFailure();
       return;
     }
+    // A contraction may produce one scalar register tuple over its surviving
+    // free axes while a downstream reduction consumes one of those axes in
+    // RVV lanes.  Keep both operation anchors intact and make their handoff a
+    // first-class physical conversion instead of forcing one layout onto the
+    // shared SSA value.
+    llvm::SmallVector<riscv::ReduceOp> reductions;
+    getOperation().walk(
+        [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
+    for (riscv::ReduceOp reduce : reductions) {
+      mlir::Value input = reduce.getInput();
+      auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+      if (!inputType || reduce.getAxis() < 0 ||
+          reduce.getAxis() >=
+              static_cast<int64_t>(inputType.getAxisIds().size()))
+        continue;
+      const int64_t eliminated = inputType.getAxisIds()[reduce.getAxis()];
+      if (input.hasOneUse() &&
+          mlir::isa_and_nonnull<riscv::DotOp, riscv::ContractOp,
+                                riscv::OuterContractOp>(
+              input.getDefiningOp()))
+        continue;
+      const auto axes = inputType.getAxisIds().asArrayRef();
+      const auto lane = inputType.getLayout().getLaneFactors().asArrayRef();
+      auto position = llvm::find(axes, eliminated);
+      if (position == axes.end())
+        continue;
+      const size_t ordinal = static_cast<size_t>(position - axes.begin());
+      if (ordinal < lane.size() && lane[ordinal] > 1)
+        continue;
+      if (inputType.getLayout().getCarrier() != "scalar") {
+        reduce.emitError(
+            "reduction layout conflict requires an unsupported non-scalar lane remap");
+        signalPassFailure();
+        continue;
+      }
+      Roles consumerRoles;
+      consumerRoles.anchored = true;
+      consumerRoles.fullLaneExtent = true;
+      consumerRoles.laneAxis = eliminated;
+      addSmallReplicas(input, consumerRoles, eliminated);
+      const int64_t extent =
+          std::max<int64_t>(1,
+                            riscv_internal::physicalExtent(input, eliminated));
+      riscv::LayoutAttr required =
+          buildLayout(builder, input, consumerRoles, extent, lmulEighths);
+      if (!required) {
+        reduce.emitError(
+            "no legal RVV layout can consume the scalar register-axis reduction");
+        signalPassFailure();
+        continue;
+      }
+      mlir::Type requiredType =
+          riscv_internal::withLayout(input.getType(), required);
+      if (requiredType == input.getType())
+        continue;
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(reduce);
+      auto conversion = builder.create<riscv::ConvertLayoutOp>(
+          reduce.getLoc(), requiredType, input,
+          riscv_internal::layoutConversion(builder, inputType.getLayout(),
+                                           required),
+          riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
+      reduce.getInputMutable().assign(conversion.getResult());
+    }
     llvm::SmallVector<mlir::Operation *> operations;
     getOperation().walk([&](mlir::Operation *operation) {
       // Pointwise operations require one shared element mapping.  Structured
@@ -1199,8 +1634,8 @@ private:
             operand.getOperandNumber() == 0)
           continue;
         auto kernel = operation->getParentOfType<riscv::KernelOp>();
-        auto operandType =
-            mlir::cast<riscv::ValueType>(operand.get().getType());
+        mlir::Value sourceValue = operand.get();
+        auto operandType = mlir::cast<riscv::ValueType>(sourceValue.getType());
         riscv::LayoutAttr required =
             mlir::isa<riscv::MaterializeOp>(operation) &&
                     operandType.getElementType() == result.getElementType() &&
@@ -1217,22 +1652,130 @@ private:
           continue;
         }
         mlir::Type requiredType =
-            riscv_internal::withLayout(operand.get().getType(), required);
-        if (operand.get().getType() == requiredType)
-          continue;
+            riscv_internal::withLayout(sourceValue.getType(), required);
         mlir::OpBuilder::InsertionGuard guard(builder);
         builder.setInsertionPoint(operation);
-        auto conversion = builder.create<riscv::ConvertLayoutOp>(
-            operation->getLoc(), requiredType, operand.get(),
-            riscv_internal::layoutConversion(
-                builder,
-                mlir::cast<riscv::ValueType>(operand.get().getType())
-                    .getLayout(),
-                required),
-            riscv::AccessAttr(),
-            riscv_internal::unselectedLeaf(builder));
-        operand.set(conversion.getResult());
+        if (sourceValue.getType() != requiredType) {
+          auto conversion = builder.create<riscv::ConvertLayoutOp>(
+              operation->getLoc(), requiredType, sourceValue,
+              riscv_internal::layoutConversion(builder,
+                                               operandType.getLayout(), required),
+              riscv::AccessAttr(),
+              riscv_internal::unselectedLeaf(builder));
+          riscv_internal::copyOrigin(operation, conversion);
+          sourceValue = conversion.getResult();
+          operandType = mlir::cast<riscv::ValueType>(sourceValue.getType());
+        }
+
+        if (operandType.getShape() == result.getShape() &&
+            operandType.getAxisIds() == result.getAxisIds()) {
+          operand.set(sourceValue);
+          continue;
+        }
+        bool properSubdomain = operandType.getAxisIds().size() <
+                                   result.getAxisIds().size() &&
+                               operandType.getElementType() ==
+                                   result.getElementType() &&
+                               operandType.getLayout().getCarrier() == "rvv" &&
+                               result.getLayout().getCarrier() == "rvv" &&
+                               operandType.getLayout().getSew() ==
+                                   result.getLayout().getSew();
+        for (auto [position, axis] :
+             llvm::enumerate(operandType.getAxisIds().asArrayRef())) {
+          auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+          properSubdomain &=
+              found != result.getAxisIds().asArrayRef().end() &&
+              operandType.getShape()[position] ==
+                  result.getShape()[static_cast<size_t>(
+                      found - result.getAxisIds().asArrayRef().begin())];
+        }
+        auto inputLanes = riscv_internal::staticProduct(
+            operandType.getLayout().getLaneFactors().asArrayRef());
+        auto resultLanes = riscv_internal::staticProduct(
+            result.getLayout().getLaneFactors().asArrayRef());
+        // Missing logical axes that remain scalar time/register coordinates are
+        // handled by the ordinary pointwise projection.  A physical broadcast
+        // is needed only when the result introduces additional SIMD lanes.
+        if (inputLanes && resultLanes && *resultLanes <= *inputLanes) {
+          operand.set(sourceValue);
+          continue;
+        }
+        if (operandType.getLayout().getCarrier() == "scalar") {
+          operand.set(sourceValue);
+          continue;
+        }
+        if (!properSubdomain || !inputLanes || !resultLanes ||
+            *inputLanes <= 0 || *resultLanes <= *inputLanes) {
+          operation->emitError(
+              "pointwise broadcast has no typed RVV sub-domain realization; operand=")
+              << operandType << ", result=" << result
+              << ", proper_subdomain=" << properSubdomain
+              << ", input_lanes=" << inputLanes.value_or(-1)
+              << ", result_lanes=" << resultLanes.value_or(-1);
+          signalPassFailure();
+          continue;
+        }
+        auto broadcast = builder.create<riscv::RVVAxisBroadcastOp>(
+            operation->getLoc(), operation->getResult(0).getType(), sourceValue,
+            riscv_internal::leaf(
+                builder, "rvv", "axis-broadcast", "rvv.axis-broadcast",
+                "rvv.axis-broadcast",
+                operandType.getLayout().getRegisterGroups(),
+                result.getLayout().getRegisterGroups(), 1, 0, "none", "exact",
+                {*inputLanes, *resultLanes}));
+        riscv_internal::copyOrigin(operation, broadcast);
+        operand.set(broadcast.getResult());
       }
+    }
+
+    // A selected widening contraction anchors one common operand layout.  A
+    // storage-contiguous producer may deliberately keep a narrower lane window
+    // and therefore reaches the contraction through an explicit typed
+    // register-to-lane conversion.  This is the same conflict boundary used by
+    // pointwise operations above; do not force the compute layout back through
+    // the memory edge.
+    llvm::SmallVector<mlir::Operation *> wideningContractions;
+    getOperation().walk([&](mlir::Operation *operation) {
+      if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
+                     riscv::OuterContractOp>(operation))
+        return;
+      auto implementation =
+          operation->getAttrOfType<riscv::ImplementationAttr>("implementation");
+      if (implementation && implementation.getFamily() == "widen-dot")
+        wideningContractions.push_back(operation);
+    });
+    for (mlir::Operation *operation : wideningContractions) {
+      auto lhs = mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
+      auto rhs = mlir::dyn_cast<riscv::ValueType>(operation->getOperand(1).getType());
+      if (!lhs || !rhs || lhs.getElementType() != rhs.getElementType() ||
+          lhs.getShape() != rhs.getShape() || lhs.getAxisIds() != rhs.getAxisIds())
+        continue;
+      auto lhsLanes = riscv_internal::staticProduct(
+          lhs.getLayout().getLaneFactors().asArrayRef());
+      auto rhsLanes = riscv_internal::staticProduct(
+          rhs.getLayout().getLaneFactors().asArrayRef());
+      if (!lhsLanes || !rhsLanes || *lhsLanes <= 0 || *rhsLanes <= 0 ||
+          *lhsLanes == *rhsLanes)
+        continue;
+      const unsigned sourceIndex = *lhsLanes < *rhsLanes ? 0 : 1;
+      auto source = sourceIndex ? rhs : lhs;
+      auto target = sourceIndex ? lhs : rhs;
+      if (source.getLayout().getCarrier() != "rvv" ||
+          target.getLayout().getCarrier() != "rvv" ||
+          source.getLayout().getSew() != target.getLayout().getSew())
+        continue;
+      mlir::Value sourceValue = operation->getOperand(sourceIndex);
+      mlir::Type requiredType =
+          riscv_internal::withLayout(sourceValue.getType(), target.getLayout());
+      mlir::OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(operation);
+      auto conversion = builder.create<riscv::ConvertLayoutOp>(
+          operation->getLoc(), requiredType, sourceValue,
+          riscv_internal::layoutConversion(builder, source.getLayout(),
+                                           target.getLayout()),
+          riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
+      riscv_internal::copyOrigin(operation, conversion);
+      operation->setOperand(sourceIndex, conversion.getResult());
     }
 
     llvm::SmallVector<riscv::ExtractOp> gathers;

@@ -402,6 +402,7 @@ public:
       // compiler-created local array.
       if (!field && inputLayout && inputLayout.getCarrier() == "local") {
         if (gather) {
+          operation.setAccessAttr(makeAccess(builder, "indexed", "dense", 1));
           auto target =
               operation->getParentOfType<riscv::KernelOp>().getTarget();
           if (!target.getHasIndexedMemory()) {
@@ -410,7 +411,6 @@ public:
             failed = true;
             return;
           }
-          operation.setAccessAttr(makeAccess(builder, "indexed", "dense", 1));
           operation.setLeafAttr(riscv_internal::leaf(
               builder, "rvv", "local-gather", "rvv.local-gather",
               "rvv.local-gather", 0, 0));

@@ -21,4 +21,12 @@
 #define GET_OP_CLASSES
 #include "Weft/Dialect/RISCV/IR/RISCVOps.h.inc"
 
+namespace weft::riscv {
+
+/// Returns whether an RVV layout is executable under the complete target
+/// register contract, including the ELEN-dependent fractional-LMUL bound.
+bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
+
+} // namespace weft::riscv
+
 #endif // WEFT_DIALECT_RISCV_IR_RISCVDIALECT_H

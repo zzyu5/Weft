@@ -16,7 +16,7 @@ using namespace weft;
 namespace {
 
 bool rematerializable(mlir::Operation *operation) {
-  return mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+  return mlir::isa<riscv::IotaOp, riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
                    riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(operation) &&
          operation->getNumResults() == 1;
 }
@@ -50,14 +50,41 @@ public:
         if (auto previous =
                 conversion.getInput().getDefiningOp<riscv::ConvertLayoutOp>()) {
           if (isPureRepresentationConversion(previous) &&
-              isPureRepresentationConversion(conversion) &&
-              previous.getInput().getType() == conversion.getResult().getType()) {
-            conversion.getResult().replaceAllUsesWith(previous.getInput());
-            rewriter.eraseOp(conversion);
-            if (previous.getResult().use_empty())
-              rewriter.eraseOp(previous);
-            changed = true;
-            continue;
+              isPureRepresentationConversion(conversion)) {
+            if (previous.getInput().getType() ==
+                conversion.getResult().getType()) {
+              conversion.getResult().replaceAllUsesWith(previous.getInput());
+              rewriter.eraseOp(conversion);
+              if (previous.getResult().use_empty())
+                rewriter.eraseOp(previous);
+              changed = true;
+              continue;
+            }
+            // Compose two pure, layout-only edges before attempting backward
+            // rematerialization.  Without this, an iota or pointwise producer
+            // can remain hidden behind an intermediate representation and the
+            // terminal emitter would be forced to interpret a conversion
+            // chain.  Memory-carrying conversions keep their explicit edges.
+            if (!previous->hasAttr("source_access") &&
+                !conversion->hasAttr("source_access")) {
+              auto source = mlir::cast<riscv::ValueType>(
+                  previous.getInput().getType());
+              auto target = mlir::cast<riscv::ValueType>(
+                  conversion.getResult().getType());
+              rewriter.setInsertionPoint(conversion);
+              auto composed = rewriter.create<riscv::ConvertLayoutOp>(
+                  conversion.getLoc(), target, previous.getInput(),
+                  riscv_internal::layoutConversion(
+                      rewriter, source.getLayout(), target.getLayout()),
+                  riscv::AccessAttr(),
+                  riscv_internal::unselectedLeaf(rewriter));
+              conversion.getResult().replaceAllUsesWith(composed.getResult());
+              rewriter.eraseOp(conversion);
+              if (previous.getResult().use_empty())
+                rewriter.eraseOp(previous);
+              changed = true;
+              continue;
+            }
           }
         }
         if (!isPureRepresentationConversion(conversion))
@@ -85,6 +112,7 @@ public:
             !conversion.getInput().hasOneUse())
           continue;
         auto targetType = conversion.getResult().getType();
+        auto targetValue = mlir::cast<riscv::ValueType>(targetType);
         rewriter.setInsertionPoint(conversion);
         llvm::SmallVector<mlir::Value> operands;
         for (mlir::Value operand : producer->getOperands()) {
@@ -103,17 +131,54 @@ public:
             return;
           }
           mlir::Type requiredType = riscv_internal::withLayout(operandType, required);
-          if (requiredType == operand.getType()) {
-            operands.push_back(operand);
-            continue;
+          mlir::Value projected = operand;
+          if (requiredType != operand.getType()) {
+            auto edge = rewriter.create<riscv::ConvertLayoutOp>(
+                conversion.getLoc(), requiredType, operand,
+                riscv_internal::layoutConversion(
+                    rewriter, operandType.getLayout(), required),
+                riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+            riscv_internal::copyOrigin(producer, edge);
+            projected = edge.getResult();
+            operandType = mlir::cast<riscv::ValueType>(requiredType);
           }
-          auto edge = rewriter.create<riscv::ConvertLayoutOp>(
-              conversion.getLoc(), requiredType, operand,
-              riscv_internal::layoutConversion(rewriter,
-                                               operandType.getLayout(), required),
-              riscv::AccessAttr(),
-              riscv_internal::unselectedLeaf(rewriter));
-          operands.push_back(edge.getResult());
+
+          bool properSubdomain =
+              operandType.getAxisIds().size() < targetValue.getAxisIds().size() &&
+              operandType.getLayout().getCarrier() == "rvv" &&
+              targetValue.getLayout().getCarrier() == "rvv" &&
+              operandType.getLayout().getSew() == targetValue.getLayout().getSew();
+          for (auto [position, axis] :
+               llvm::enumerate(operandType.getAxisIds().asArrayRef())) {
+            auto found = llvm::find(targetValue.getAxisIds().asArrayRef(), axis);
+            properSubdomain &=
+                found != targetValue.getAxisIds().asArrayRef().end() &&
+                operandType.getShape()[position] ==
+                    targetValue.getShape()[static_cast<size_t>(
+                        found - targetValue.getAxisIds().asArrayRef().begin())];
+          }
+          auto inputLanes = riscv_internal::staticProduct(
+              operandType.getLayout().getLaneFactors().asArrayRef());
+          auto targetLanes = riscv_internal::staticProduct(
+              targetValue.getLayout().getLaneFactors().asArrayRef());
+          if (properSubdomain && inputLanes && targetLanes &&
+              *targetLanes > *inputLanes) {
+            auto broadcastType = riscv::ValueType::get(
+                rewriter.getContext(), operandType.getElementType(),
+                targetValue.getShape(), targetValue.getAxisIds(),
+                targetValue.getLayout());
+            auto broadcast = rewriter.create<riscv::RVVAxisBroadcastOp>(
+                conversion.getLoc(), broadcastType, projected,
+                riscv_internal::leaf(
+                    rewriter, "rvv", "axis-broadcast",
+                    "rvv.axis-broadcast", "rvv.axis-broadcast",
+                    operandType.getLayout().getRegisterGroups(),
+                    targetValue.getLayout().getRegisterGroups(), 1, 0, "none",
+                    "exact", {*inputLanes, *targetLanes}));
+            riscv_internal::copyOrigin(producer, broadcast);
+            projected = broadcast.getResult();
+          }
+          operands.push_back(projected);
         }
         mlir::OperationState state(producer->getLoc(), producer->getName());
         state.addOperands(operands);
@@ -147,6 +212,7 @@ public:
         rewriter.eraseOp(conversion);
       }
     });
+
   }
 };
 

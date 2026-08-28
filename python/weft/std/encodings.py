@@ -93,9 +93,10 @@ class Q2_K:
 class Q3_K:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
-    hmask: u8[32]
-    q: u8[64]
-    scales: u8[12]
+    hmask: u1[256] @ grouped(256) @ layered(32, lo_first)
+    q: u2[256] @ grouped(128) @ layered(32, lo_first)
+    scale_low: u4[16] @ grouped(16) @ layered(8, lo_first)
+    scale_high: u2[16] @ grouped(16) @ layered(4, lo_first)
     d: f16
 
 

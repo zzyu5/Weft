@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -44,13 +45,218 @@ int64_t resultParts(riscv::LayoutAttr layout) {
       {product(layout.getTimeFactors()), product(layout.getReplicaFactors())});
 }
 
-bool supportsRVVLayout(riscv::TargetAttr target, riscv::LayoutAttr layout) {
-  return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
-         target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
-         llvm::is_contained(target.getSupportedSEW().asArrayRef(),
-                            layout.getSew()) &&
-         llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
-                            layout.getLmulEighths());
+std::optional<size_t> axisPosition(riscv::ValueType value, int64_t axis) {
+  auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
+  if (found == value.getAxisIds().asArrayRef().end())
+    return std::nullopt;
+  return static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin());
+}
+
+struct WidenDotLaneSlicePlan {
+  int64_t reductionLanes = 0;
+  int64_t reductionStreams = 0;
+  int64_t sliceLmulEighths = 0;
+  llvm::SmallVector<int64_t> offsets;
+  llvm::SmallVector<int64_t> parts;
+};
+
+std::optional<WidenDotLaneSlicePlan>
+planWidenDotLaneSlices(riscv::ValueType operand, riscv::ValueType result,
+                       llvm::ArrayRef<int64_t> reductionAxes,
+                       riscv::TargetAttr target) {
+  auto layout = operand.getLayout();
+  auto lanes = riscv_internal::staticProduct(
+      layout.getLaneFactors().asArrayRef());
+  if (!lanes || *lanes <= 0)
+    return std::nullopt;
+
+  int64_t reductionLanes = 1;
+  bool sawFreeLane = false;
+  for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
+       position >= 0; --position) {
+    const int64_t lane = layout.getLaneFactors()[position];
+    if (lane <= 1)
+      continue;
+    const int64_t axis = operand.getAxisIds()[position];
+    if (llvm::is_contained(reductionAxes, axis)) {
+      // A contiguous vector slice can retain a reduction only when all lane
+      // coordinates belonging to that reduction are the innermost lane
+      // dimensions.  Other geometries need an explicit permutation first.
+      if (sawFreeLane ||
+          reductionLanes > std::numeric_limits<int64_t>::max() / lane)
+        return std::nullopt;
+      reductionLanes *= lane;
+    } else {
+      sawFreeLane = true;
+    }
+  }
+  if (reductionLanes <= 0 || *lanes % reductionLanes)
+    return std::nullopt;
+
+  const int64_t numerator =
+      product({layout.getLmulEighths(), reductionLanes});
+  if (numerator <= 0 || numerator % *lanes)
+    return std::nullopt;
+  int64_t sliceLmul = numerator / *lanes;
+  // RVV register-group extraction has no fractional destination form.  When a
+  // logical reduction slice is smaller than one architectural vector register
+  // but lives inside a larger group, select an m1 carrier and retain the
+  // sub-register lane offset in the typed slice plan.  Terminal emission then
+  // performs group extraction followed by an intra-register slide when needed.
+  if (sliceLmul < 8 && layout.getLmulEighths() > sliceLmul)
+    sliceLmul = 8;
+  if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
+                          sliceLmul))
+    return std::nullopt;
+
+  int64_t outputParts = 1;
+  if (result) {
+    if (result.getLayout().getCarrier() != "scalar")
+      return std::nullopt;
+    outputParts = product(result.getLayout().getReplicaFactors());
+    if (outputParts <= 0)
+      return std::nullopt;
+  }
+
+  WidenDotLaneSlicePlan plan;
+  plan.reductionLanes = reductionLanes;
+  plan.sliceLmulEighths = sliceLmul;
+  llvm::SmallVector<int64_t> reductionTimeExtents;
+  for (int64_t axis : reductionAxes) {
+    auto position = axisPosition(operand, axis);
+    if (!position)
+      return std::nullopt;
+    const int64_t extent = layout.getTimeFactors()[*position];
+    if (extent <= 0)
+      return std::nullopt;
+    reductionTimeExtents.push_back(extent);
+  }
+  plan.reductionStreams =
+      riscv_internal::staticProduct(reductionTimeExtents).value_or(-1);
+  const int64_t totalStreams = product(layout.getTimeFactors());
+  if (plan.reductionStreams <= 0 || totalStreams <= 0)
+    return std::nullopt;
+
+  for (int64_t outputPart = 0; outputPart < outputParts; ++outputPart) {
+    llvm::SmallVector<int64_t> resultCoordinates(
+        result ? result.getAxisIds().size() : 0, 0);
+    int64_t remaining = outputPart;
+    if (result) {
+      for (int64_t position = static_cast<int64_t>(result.getAxisIds().size()) - 1;
+           position >= 0; --position) {
+        const int64_t replica =
+            result.getLayout().getReplicaFactors()[position];
+        if (replica <= 0)
+          return std::nullopt;
+        resultCoordinates[position] = remaining % replica;
+        remaining /= replica;
+      }
+      if (remaining)
+        return std::nullopt;
+    }
+
+    auto resultCoordinateForAxis = [&](int64_t axis) -> std::optional<int64_t> {
+      if (!result)
+        return std::nullopt;
+      auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+      if (found == result.getAxisIds().asArrayRef().end())
+        return std::nullopt;
+      return resultCoordinates[static_cast<size_t>(
+          found - result.getAxisIds().asArrayRef().begin())];
+    };
+
+    int64_t laneOffset = 0;
+    int64_t laneStride = 1;
+    for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
+         position >= 0; --position) {
+      const int64_t lane = layout.getLaneFactors()[position];
+      if (lane <= 1)
+        continue;
+      const int64_t axis = operand.getAxisIds()[position];
+      int64_t coordinate = 0;
+      if (!llvm::is_contained(reductionAxes, axis)) {
+        auto logicalCoordinate = resultCoordinateForAxis(axis);
+        if (!logicalCoordinate || *logicalCoordinate < 0)
+          return std::nullopt;
+        coordinate = *logicalCoordinate % lane;
+      }
+      if (coordinate > 0 &&
+          laneOffset > std::numeric_limits<int64_t>::max() -
+                           coordinate * laneStride)
+        return std::nullopt;
+      laneOffset += coordinate * laneStride;
+      if (laneStride > std::numeric_limits<int64_t>::max() / lane)
+        return std::nullopt;
+      laneStride *= lane;
+    }
+    if (laneOffset < 0 || laneOffset % reductionLanes ||
+        laneOffset > *lanes - reductionLanes)
+      return std::nullopt;
+    plan.offsets.push_back(laneOffset);
+
+    for (int64_t reductionStream = 0;
+         reductionStream < plan.reductionStreams; ++reductionStream) {
+      llvm::SmallVector<int64_t> reductionCoordinates(reductionAxes.size(), 0);
+      int64_t remainingReduction = reductionStream;
+      for (int64_t index = static_cast<int64_t>(reductionAxes.size()) - 1;
+           index >= 0; --index) {
+        reductionCoordinates[index] =
+            remainingReduction % reductionTimeExtents[index];
+        remainingReduction /= reductionTimeExtents[index];
+      }
+      if (remainingReduction)
+        return std::nullopt;
+
+      int64_t streamPart = 0;
+      int64_t registerPart = 0;
+      for (size_t position = 0; position < operand.getAxisIds().size();
+           ++position) {
+        const int64_t axis = operand.getAxisIds()[position];
+        const int64_t time = layout.getTimeFactors()[position];
+        const int64_t lane = layout.getLaneFactors()[position];
+        const int64_t replica = layout.getReplicaFactors()[position];
+        int64_t timeCoordinate = 0;
+        int64_t replicaCoordinate = 0;
+        if (auto reduction = llvm::find(reductionAxes, axis);
+            reduction != reductionAxes.end()) {
+          timeCoordinate = reductionCoordinates[static_cast<size_t>(
+              reduction - reductionAxes.begin())];
+        } else {
+          auto logicalCoordinate = resultCoordinateForAxis(axis);
+          if (!logicalCoordinate)
+            return std::nullopt;
+          if (lane > 1) {
+            if (replica != 1 || *logicalCoordinate >= time * lane)
+              return std::nullopt;
+            timeCoordinate = *logicalCoordinate / lane;
+          } else {
+            if (*logicalCoordinate >= time * replica)
+              return std::nullopt;
+            timeCoordinate = *logicalCoordinate / replica;
+            replicaCoordinate = *logicalCoordinate % replica;
+          }
+        }
+        streamPart = streamPart * time + timeCoordinate;
+        registerPart = registerPart * replica + replicaCoordinate;
+      }
+      const int64_t physicalPart = registerPart * totalStreams + streamPart;
+      if (physicalPart < 0 ||
+          physicalPart >= resultParts(layout))
+        return std::nullopt;
+      plan.parts.push_back(physicalPart);
+    }
+  }
+  return plan;
+}
+
+std::optional<int64_t> constantInteger(mlir::Value value) {
+  auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  if (!integer)
+    return std::nullopt;
+  return integer.getInt();
 }
 
 struct IntegerRange {
@@ -59,7 +265,7 @@ struct IntegerRange {
 };
 
 std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) {
-  if (depth > 8)
+  if (depth > 16)
     return std::nullopt;
   mlir::Value source = riscv_internal::stripRepresentationConversions(value);
   if (source != value)
@@ -68,6 +274,19 @@ std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) 
       riscv_internal::logicalElement(value.getType()));
   if (!type || type.getWidth() == 0 || type.getWidth() >= 63)
     return std::nullopt;
+  const __int128 typeMinimum =
+      type.isSigned() ? -(__int128{1} << (type.getWidth() - 1)) : 0;
+  const __int128 typeMaximum =
+      type.isSigned() ? (__int128{1} << (type.getWidth() - 1)) - 1
+                      : (__int128{1} << type.getWidth()) - 1;
+  auto checkedRange = [&](const __int128 minimum,
+                          const __int128 maximum)
+      -> std::optional<IntegerRange> {
+    if (minimum < typeMinimum || maximum > typeMaximum || minimum > maximum)
+      return std::nullopt;
+    return IntegerRange{static_cast<int64_t>(minimum),
+                        static_cast<int64_t>(maximum)};
+  };
 
   auto constantRange = [](mlir::Attribute attribute)
       -> std::optional<IntegerRange> {
@@ -89,21 +308,53 @@ std::optional<IntegerRange> integerRange(mlir::Value value, unsigned depth = 0) 
       return range;
   if (auto cast = value.getDefiningOp<riscv::CastOp>())
     if (auto range = integerRange(cast.getInput(), depth + 1))
-      return range;
-
-  if (auto binary = value.getDefiningOp<riscv::BinaryOp>();
-      binary && binary.getKind() == "sub") {
+      if (auto checked = checkedRange(range->minimum, range->maximum))
+        return checked;
+  if (auto narrow = value.getDefiningOp<riscv::NarrowOp>())
+    if (!narrow.getSaturate())
+      if (auto range = integerRange(narrow.getInput(), depth + 1))
+        if (auto checked = checkedRange(range->minimum, range->maximum))
+          return checked;
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
     auto lhs = integerRange(binary.getLhs(), depth + 1);
     auto rhs = integerRange(binary.getRhs(), depth + 1);
     if (lhs && rhs) {
-      const __int128 minimum = static_cast<__int128>(lhs->minimum) -
-                               static_cast<__int128>(rhs->maximum);
-      const __int128 maximum = static_cast<__int128>(lhs->maximum) -
-                               static_cast<__int128>(rhs->minimum);
-      if (minimum >= std::numeric_limits<int64_t>::min() &&
-          maximum <= std::numeric_limits<int64_t>::max())
-        return IntegerRange{static_cast<int64_t>(minimum),
-                            static_cast<int64_t>(maximum)};
+      if (binary.getKind() == "add")
+        if (auto range = checkedRange(
+                static_cast<__int128>(lhs->minimum) + rhs->minimum,
+                static_cast<__int128>(lhs->maximum) + rhs->maximum))
+          return range;
+      if (binary.getKind() == "sub")
+        if (auto range = checkedRange(
+                static_cast<__int128>(lhs->minimum) - rhs->maximum,
+                static_cast<__int128>(lhs->maximum) - rhs->minimum))
+          return range;
+      if (binary.getKind() == "mul") {
+        const __int128 candidates[] = {
+            static_cast<__int128>(lhs->minimum) * rhs->minimum,
+            static_cast<__int128>(lhs->minimum) * rhs->maximum,
+            static_cast<__int128>(lhs->maximum) * rhs->minimum,
+            static_cast<__int128>(lhs->maximum) * rhs->maximum};
+        if (auto range = checkedRange(
+                *std::min_element(std::begin(candidates), std::end(candidates)),
+                *std::max_element(std::begin(candidates), std::end(candidates))))
+          return range;
+      }
+      if (binary.getKind() == "and") {
+        const IntegerRange *mask =
+            rhs->minimum == rhs->maximum && rhs->minimum >= 0 ? &*rhs
+            : lhs->minimum == lhs->maximum && lhs->minimum >= 0 ? &*lhs
+                                                                  : nullptr;
+        if (mask)
+          if (auto range = checkedRange(0, mask->maximum))
+            return range;
+      }
+      if (binary.getKind() == "shr" && lhs->minimum >= 0 &&
+          rhs->minimum == rhs->maximum && rhs->minimum >= 0 &&
+          rhs->minimum < static_cast<int64_t>(type.getWidth()))
+        if (auto range = checkedRange(
+                lhs->minimum >> rhs->minimum, lhs->maximum >> rhs->minimum))
+          return range;
     }
   }
 
@@ -172,9 +423,9 @@ public:
     lowerStreamReductions(rewriter, failed);
     lowerGroupedReductions(rewriter, failed);
     lowerEncodedDots(rewriter, failed);
+    lowerLoopCarriedWideningPartials(rewriter, failed);
     lowerContracts(rewriter, failed);
     eraseDeadComposites(rewriter);
-    closeConversions(rewriter, failed);
     if (failed)
       signalPassFailure();
   }
@@ -258,7 +509,7 @@ private:
           count <= 1 || inputParts <= 0 || count % inputParts ||
           destination.getAxisIds().size() != 1 || owner.getElements() <= 0 ||
           !target.getHasRVV() || !target.getHasWideningInteger() ||
-          !supportsRVVLayout(target, input.getLayout()) ||
+          !riscv::supportsRVVLayout(target, input.getLayout()) ||
           !loop->isProperAncestor(point) ||
           loop->isProperAncestor(extract.getInput().getDefiningOp()))
         continue;
@@ -330,7 +581,7 @@ private:
           input.getLayout().getCarrier() != "rvv" ||
           resultParts(input.getLayout()) != 1 || !target.getHasRVV() ||
           !target.getHasWideningInteger() ||
-          !supportsRVVLayout(target, input.getLayout()))
+          !riscv::supportsRVVLayout(target, input.getLayout()))
         continue;
       rewriter.setInsertionPoint(reduce);
       auto folded = rewriter.create<riscv::RVVWidenReduceOp>(
@@ -1335,13 +1586,17 @@ private:
       mlir::Value point = lhsPoint ? lhsPoint : rhsPoint;
       auto target = reduce->getParentOfType<riscv::KernelOp>().getTarget();
       int64_t laneAxis = 0;
+      bool reductionLane = false;
       for (auto [axis, factor] :
            llvm::zip(lhsType.getAxisIds().asArrayRef(),
-                     lhsLayout.getLaneFactors().asArrayRef()))
+                     lhsLayout.getLaneFactors().asArrayRef())) {
+        if (axis == reductionAxis && factor > 1)
+          reductionLane = true;
         if (axis != reductionAxis && factor > 1) {
           laneAxis = axis;
           break;
         }
+      }
       bool hasCohortStride = false;
       if (lhsMemory && laneAxis > 0)
         for (auto [axis, stride] :
@@ -1351,6 +1606,7 @@ private:
             hasCohortStride = true;
       const int64_t storageGroup = lhsAccess.getGroupSize();
       const int64_t storageLayer = lhsAccess.getLayerSize();
+      const int64_t outputParts = resultParts(accumulatorType.getLayout());
       const bool exactGeometry =
           lhsInteger.isUnsigned() && lhsInteger.getWidth() < 8 &&
           rhsInteger.isSigned() && rhsInteger.getWidth() == 8 && lhsField &&
@@ -1363,16 +1619,41 @@ private:
            lhsAccess.getOrder() == "hi_first") &&
           lhsAccess.getBitOffset() % 8 == 0 &&
           rhsAccess.getBitOffset() % 8 == 0 &&
-          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
-          resultParts(accumulatorType.getLayout()) == 1 &&
-          supportsRVVLayout(target, lhsLayout) &&
-          supportsRVVLayout(target, partialLayout) &&
-          supportsRVVLayout(target, accumulatorType.getLayout()) &&
+          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride ||
+           reductionLane) &&
+          outputParts > 0 &&
+          riscv::supportsRVVLayout(target, lhsLayout) &&
+          riscv::supportsRVVLayout(target, partialLayout) &&
+          riscv::supportsRVVLayout(target, accumulatorType.getLayout()) &&
           target.getHasWideningInteger();
       if (!exactGeometry) {
         reduce.emitError(
             "selected grouped MAC has no complete typed field, cohort-storage, "
-            "RVV-layout, or shared reduction-point realization");
+            "RVV-layout, or shared reduction-point realization; lhs=")
+            << lhsType << ", rhs=" << rhsType << ", lhs_access=" << lhsAccess
+            << ", rhs_access=" << rhsAccess
+            << ", lhs_field=" << static_cast<bool>(lhsField)
+            << ", rhs_field=" << static_cast<bool>(rhsField)
+            << ", lhs_load=" << static_cast<bool>(lhsLoad)
+            << ", rhs_load=" << static_cast<bool>(rhsLoad)
+            << ", shared_point=" << (lhsPoint && lhsPoint == rhsPoint)
+            << ", reduction_lane=" << reductionLane
+            << ", cohort_stride=" << hasCohortStride
+            << ", interleave_rows="
+            << (lhsMemory ? lhsMemory.getInterleaveRows() : -1)
+            << ", result_parts="
+            << (accumulatorType ? resultParts(accumulatorType.getLayout()) : -1)
+            << ", partial_layout=" << partialLayout
+            << ", accumulator_layout="
+            << (accumulatorType ? accumulatorType.getLayout()
+                                : riscv::LayoutAttr())
+            << ", lhs_layout_legal="
+            << riscv::supportsRVVLayout(target, lhsLayout)
+            << ", partial_layout_legal="
+            << riscv::supportsRVVLayout(target, partialLayout)
+            << ", accumulator_layout_legal="
+            << (accumulatorType && riscv::supportsRVVLayout(
+                                       target, accumulatorType.getLayout()));
         failed = true;
         continue;
       }
@@ -1395,7 +1676,8 @@ private:
           schedule.getBufferCount() == 1) {
         const int64_t operandGroups = lhsLayout.getRegisterGroups();
         const int64_t temporaryGroups =
-            product({partialLayout.getRegisterGroups(), schedule.getUnroll()});
+            product({partialLayout.getRegisterGroups(), schedule.getUnroll(),
+                     outputParts});
         if (operandGroups <= 0 || temporaryGroups <= 0) {
           reduce.emitError(
               "grouped MAC leaf resources overflow their physical domain");
@@ -1653,6 +1935,210 @@ private:
     }
   }
 
+  void lowerLoopCarriedWideningPartials(mlir::IRRewriter &rewriter,
+                                        bool &failed) {
+    llvm::SmallVector<mlir::scf::ForOp> loops;
+    getOperation().walk<mlir::WalkOrder::PostOrder>(
+        [&](mlir::scf::ForOp loop) { loops.push_back(loop); });
+
+    for (mlir::scf::ForOp loop : loops) {
+      if (!loop || loop.getInitArgs().size() != 1 || loop.getNumResults() != 1)
+        continue;
+      auto carryType =
+          mlir::dyn_cast<mlir::IntegerType>(loop.getRegionIterArg(0).getType());
+      auto initRange = integerRange(loop.getInitArgs().front());
+      if (!carryType || !carryType.isSigned() || carryType.getWidth() != 16 ||
+          !initRange || initRange->minimum != 0 || initRange->maximum != 0 ||
+          !loop.getRegionIterArg(0).hasOneUse() ||
+          !loop.getResult(0).hasOneUse())
+        continue;
+
+      auto widen = mlir::dyn_cast<riscv::WidenOp>(
+          *loop.getResult(0).getUsers().begin());
+      auto widenedType = widen ? mlir::dyn_cast<mlir::IntegerType>(
+                                    widen.getResult().getType())
+                               : mlir::IntegerType();
+      auto yield =
+          mlir::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+      auto add = yield && yield.getNumOperands() == 1
+                     ? yield.getOperand(0).getDefiningOp<riscv::BinaryOp>()
+                     : riscv::BinaryOp();
+      if (!widen || !widenedType || !widenedType.isSigned() ||
+          widenedType.getWidth() != 32 || !add || add.getKind() != "add" ||
+          !add.getResult().hasOneUse() ||
+          *add.getResult().getUsers().begin() != yield.getOperation())
+        continue;
+
+      mlir::Value contribution;
+      if (add.getLhs() == loop.getRegionIterArg(0))
+        contribution = add.getRhs();
+      else if (add.getRhs() == loop.getRegionIterArg(0))
+        contribution = add.getLhs();
+      else
+        continue;
+      auto contract = contribution.getDefiningOp<riscv::ContractOp>();
+      if (!contract || !contract.getResult().hasOneUse() ||
+          contract.getResult().getType() != carryType ||
+          contract.getOver().size() != 1)
+        continue;
+
+      const int64_t reductionAxis = contract.getOver()[0];
+      auto lhs = mlir::dyn_cast<riscv::ValueType>(contract.getLhs().getType());
+      auto rhs = mlir::dyn_cast<riscv::ValueType>(contract.getRhs().getType());
+      auto lhsElement = lhs ? mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType())
+                            : mlir::IntegerType();
+      auto rhsElement = rhs ? mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType())
+                            : mlir::IntegerType();
+      auto lhsPosition = lhs ? axisPosition(lhs, reductionAxis)
+                             : std::optional<size_t>();
+      auto rhsPosition = rhs ? axisPosition(rhs, reductionAxis)
+                             : std::optional<size_t>();
+      if (!lhs || !rhs || !lhsElement || !rhsElement || lhsElement.isSignless() ||
+          rhsElement.isSignless() ||
+          (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+          std::max<unsigned>(8, lhsElement.getWidth()) !=
+              std::max<unsigned>(8, rhsElement.getWidth()) ||
+          2 * std::max<unsigned>(8, lhsElement.getWidth()) !=
+              carryType.getWidth() ||
+          !lhsPosition || !rhsPosition ||
+          lhs.getLayout().getCarrier() != "rvv" ||
+          rhs.getLayout().getCarrier() != "rvv" ||
+          product(lhs.getLayout().getTimeFactors()) != 1 ||
+          product(rhs.getLayout().getTimeFactors()) != 1 ||
+          lhs.getLayout().getSew() != rhs.getLayout().getSew() ||
+          lhs.getLayout().getLmulEighths() !=
+              rhs.getLayout().getLmulEighths() ||
+          lhs.getLayout().getVl() != rhs.getLayout().getVl() ||
+          lhs.getLayout().getLaneFactors()[*lhsPosition] !=
+              rhs.getLayout().getLaneFactors()[*rhsPosition] ||
+          lhs.getShape()[*lhsPosition] !=
+              lhs.getLayout().getLaneFactors()[*lhsPosition] ||
+          rhs.getShape()[*rhsPosition] !=
+              rhs.getLayout().getLaneFactors()[*rhsPosition])
+        continue;
+
+      auto lower = constantInteger(loop.getLowerBound());
+      auto upper = constantInteger(loop.getUpperBound());
+      auto step = constantInteger(loop.getStep());
+      if (!lower || !upper || !step || *step <= 0 || *upper <= *lower ||
+          (*upper - *lower) % *step)
+        continue;
+      const int64_t iterations = (*upper - *lower) / *step;
+      auto lhsMagnitude = maximumMagnitude(contract.getLhs());
+      auto rhsMagnitude = maximumMagnitude(contract.getRhs());
+      const int64_t lanes = lhs.getLayout().getLaneFactors()[*lhsPosition];
+      const __int128 bound =
+          lhsMagnitude && rhsMagnitude
+              ? static_cast<__int128>(*lhsMagnitude) * *rhsMagnitude * lanes *
+                    iterations
+              : static_cast<__int128>(std::numeric_limits<int64_t>::max());
+      if (!lhsMagnitude || !rhsMagnitude || bound > 32767)
+        continue;
+
+      llvm::SmallVector<int64_t> axisIds{reductionAxis};
+      llvm::SmallVector<int64_t> one{1};
+      llvm::SmallVector<int64_t> lane{lanes};
+      const int64_t partialLMUL = lhs.getLayout().getLmulEighths() * 2;
+      const int64_t partialGroups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
+      auto partialLayout = riscv::LayoutAttr::get(
+          rewriter.getContext(), "rvv", riscv_internal::integers(rewriter, axisIds),
+          riscv_internal::integers(rewriter, one),
+          riscv_internal::integers(rewriter, lane),
+          riscv_internal::integers(rewriter, one),
+          riscv_internal::integers(rewriter, one),
+          riscv_internal::integers(rewriter, one), carryType.getWidth(),
+          partialLMUL, lhs.getLayout().getVl(), partialGroups,
+          lhs.getLayout().getValidity());
+      auto partialType = riscv::ValueType::get(
+          rewriter.getContext(), carryType,
+          riscv_internal::integers(rewriter, lane),
+          riscv_internal::integers(rewriter, axisIds), partialLayout);
+      auto kernel = loop->getParentOfType<riscv::KernelOp>();
+      const int64_t operandGroups = lhs.getLayout().getRegisterGroups() +
+                                    rhs.getLayout().getRegisterGroups();
+      if (!kernel || !kernel.getTarget().getHasWideningInteger() ||
+          !llvm::is_contained(
+              kernel.getTarget().getLegalLMULEighths().asArrayRef(), partialLMUL) ||
+          !riscv::supportsRVVLayout(kernel.getTarget(), partialLayout) ||
+          partialGroups + operandGroups >
+              kernel.getTarget().getVectorRegisters())
+        continue;
+
+      rewriter.setInsertionPoint(loop);
+      auto zero = rewriter.create<riscv::ConstantOp>(
+          loop.getLoc(), carryType, rewriter.getIntegerAttr(carryType, 0));
+      auto initial = rewriter.create<riscv::RVVSplatOp>(
+          loop.getLoc(), partialType, zero.getResult(),
+          riscv_internal::leaf(rewriter, "rvv", "splat", "rvv.splat",
+                               "rvv.splat", 0, partialGroups));
+      auto replacement = rewriter.create<mlir::scf::ForOp>(
+          loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(),
+          loop.getStep(), mlir::ValueRange{initial.getResult()});
+      for (mlir::NamedAttribute attribute : loop->getAttrs())
+        replacement->setAttr(attribute.getName(), attribute.getValue());
+      replacement->setAttr("weft.riscv.system_unroll",
+                           rewriter.getStringAttr("disable"));
+      if (iterations > 1 && iterations <= 8)
+        replacement->setAttr(
+            "weft.riscv.unroll_factor",
+            rewriter.getI64IntegerAttr(iterations));
+      if (auto defaultYield = mlir::dyn_cast<mlir::scf::YieldOp>(
+              replacement.getBody()->getTerminator()))
+        rewriter.eraseOp(defaultYield);
+
+      mlir::IRMapping mapping;
+      mapping.map(loop.getInductionVar(), replacement.getInductionVar());
+      rewriter.setInsertionPointToStart(replacement.getBody());
+      mlir::Value carried = replacement.getRegionIterArg(0);
+      for (mlir::Operation &operation : loop.getBody()->without_terminator()) {
+        if (&operation == contract.getOperation()) {
+          mlir::Value mappedLhs = mapping.lookupOrDefault(contract.getLhs());
+          mlir::Value mappedRhs = mapping.lookupOrDefault(contract.getRhs());
+          auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+              contract.getLoc(), partialType, mappedLhs, mappedRhs, carried,
+              reductionAxis,
+              riscv_internal::leaf(
+                  rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
+                  "rvv.vwmacc.partial", operandGroups + partialGroups,
+                  partialGroups, 0, 0, "none", "agnostic"));
+          copyIdentity(contract, accumulate);
+          carried = accumulate.getResult();
+          continue;
+        }
+        if (&operation == add.getOperation())
+          continue;
+        rewriter.clone(operation, mapping);
+      }
+      rewriter.setInsertionPointToEnd(replacement.getBody());
+      rewriter.create<mlir::scf::YieldOp>(loop.getLoc(), carried);
+
+      rewriter.setInsertionPointAfter(replacement);
+      auto setType = riscv::PartialSetType::get(
+          rewriter.getContext(), partialType, reductionAxis, 1, lanes,
+          partialGroups);
+      auto captured = rewriter.create<riscv::RVVPartialCaptureOp>(
+          widen.getLoc(), setType, replacement.getResult(0),
+          riscv_internal::leaf(rewriter, "rvv", "partial-capture",
+                               "rvv.partial-capture", "rvv.partial-capture",
+                               partialGroups, partialGroups, 0, 0, "none",
+                               partialType.getLayout().getValidity() == "tail"
+                                   ? "agnostic"
+                                   : "exact"));
+      copyIdentity(widen, captured);
+      auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
+          widen.getLoc(), widenedType, captured.getResult(), reductionAxis,
+          riscv_internal::leaf(rewriter, "rvv", "partial-finalize",
+                               "rvv.partial-finalize.reduce",
+                               "rvv.partial-finalize.reduce", partialGroups, 0,
+                               0, 0, "none", "exact",
+                               {reductionAxis, 1}));
+      copyIdentity(widen, finalized);
+      widen.getResult().replaceAllUsesWith(finalized.getResult());
+      rewriter.eraseOp(widen);
+      rewriter.eraseOp(loop);
+    }
+  }
+
   void lowerContracts(mlir::IRRewriter &rewriter, bool &failed) {
     llvm::SmallVector<mlir::Operation *> contracts;
     getOperation().walk([&](mlir::Operation *operation) {
@@ -1839,10 +2325,88 @@ private:
       }
       if (implementation.getFamily() == "widen-dot" &&
           implementation.getOperation() == "rvv.vwmul-vwredsum") {
+        riscv::ReduceOp fusedFreeAxisReduce;
+        int64_t fusedFreeAxis = 0;
+        if (resultType && operation->getResult(0).hasOneUse()) {
+          auto reduce = mlir::dyn_cast<riscv::ReduceOp>(
+              *operation->getResult(0).getUsers().begin());
+          if (reduce && reduce.getKind() == "add" &&
+              resultType.getAxisIds().size() == 1 && reduce.getAxis() == 0 &&
+              mlir::isa<mlir::IntegerType>(reduce.getResult().getType())) {
+            fusedFreeAxisReduce = reduce;
+            fusedFreeAxis = resultType.getAxisIds()[0];
+          }
+        }
+
+        mlir::Value lhsValue = operation->getOperand(0);
+        mlir::Value rhsValue = operation->getOperand(1);
+        auto streamFreeAxis = [&](mlir::Value value) -> mlir::Value {
+          auto type = mlir::dyn_cast<riscv::ValueType>(value.getType());
+          if (!type || !fusedFreeAxis)
+            return value;
+          auto axes = type.getAxisIds().asArrayRef();
+          auto found = llvm::find(axes, fusedFreeAxis);
+          if (found == axes.end())
+            return value;
+          const size_t position =
+              static_cast<size_t>(found - axes.begin());
+          auto layout = type.getLayout();
+          llvm::SmallVector<int64_t> time(
+              layout.getTimeFactors().asArrayRef().begin(),
+              layout.getTimeFactors().asArrayRef().end());
+          llvm::SmallVector<int64_t> lane(
+              layout.getLaneFactors().asArrayRef().begin(),
+              layout.getLaneFactors().asArrayRef().end());
+          llvm::SmallVector<int64_t> replica(
+              layout.getReplicaFactors().asArrayRef().begin(),
+              layout.getReplicaFactors().asArrayRef().end());
+          if (position >= time.size() || position >= lane.size() ||
+              position >= replica.size() || lane[position] != 1) {
+            operation->emitError(
+                "free-axis reduction cannot map its typed operand to issue time");
+            failed = true;
+            return {};
+          }
+          const int64_t moved = replica[position];
+          if (moved <= 1)
+            return value;
+          time[position] = product({time[position], moved});
+          replica[position] = 1;
+          const int64_t replicaProduct =
+              riscv_internal::staticProduct(replica).value_or(-1);
+          const int64_t groups =
+              product({std::max<int64_t>(
+                           1, (layout.getLmulEighths() + 7) / 8),
+                       replicaProduct});
+          auto streamedLayout = riscv::LayoutAttr::get(
+              rewriter.getContext(), layout.getCarrier(), layout.getAxisIds(),
+              riscv_internal::integers(rewriter, time),
+              riscv_internal::integers(rewriter, lane),
+              riscv_internal::integers(rewriter, replica),
+              layout.getFragmentFactors(), layout.getLocalFactors(),
+              layout.getSew(), layout.getLmulEighths(), layout.getVl(), groups,
+              layout.getValidity());
+          auto streamedType = mlir::cast<riscv::ValueType>(
+              riscv_internal::withLayout(type, streamedLayout));
+          rewriter.setInsertionPoint(operation);
+          auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
+              operation->getLoc(), streamedType, value,
+              riscv_internal::layoutConversion(rewriter, layout,
+                                               streamedLayout),
+              riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+          copyIdentity(operation, conversion);
+          return conversion.getResult();
+        };
+        if (fusedFreeAxisReduce) {
+          lhsValue = streamFreeAxis(lhsValue);
+          rhsValue = streamFreeAxis(rhsValue);
+          if (!lhsValue || !rhsValue || failed)
+            continue;
+        }
         auto lhsType =
-            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
+            mlir::dyn_cast<riscv::ValueType>(lhsValue.getType());
         auto rhsType =
-            mlir::dyn_cast<riscv::ValueType>(operation->getOperand(1).getType());
+            mlir::dyn_cast<riscv::ValueType>(rhsValue.getType());
         auto lhsElement = lhsType
                               ? mlir::dyn_cast<mlir::IntegerType>(
                                     lhsType.getElementType())
@@ -1854,9 +2418,26 @@ private:
         auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
             riscv_internal::logicalElement(operation->getResult(0).getType()));
         auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
+        llvm::SmallVector<int64_t> physicalReductionAxes(
+            over.asArrayRef().begin(), over.asArrayRef().end());
+        mlir::Type physicalResultType = operation->getResult(0).getType();
+        riscv::ValueType laneResultType = resultType;
+        if (fusedFreeAxisReduce) {
+          physicalReductionAxes.push_back(fusedFreeAxis);
+          physicalResultType = fusedFreeAxisReduce.getResult().getType();
+          laneResultType = {};
+        }
+        auto lhsLaneSlices =
+            lhsType ? planWidenDotLaneSlices(lhsType, laneResultType,
+                                             physicalReductionAxes, target)
+                    : std::nullopt;
+        auto rhsLaneSlices =
+            rhsType ? planWidenDotLaneSlices(rhsType, laneResultType,
+                                             physicalReductionAxes, target)
+                    : std::nullopt;
         const int64_t partialLMUL =
-            lhsType
-                ? product({lhsType.getLayout().getLmulEighths(), int64_t{2}})
+            lhsLaneSlices
+                ? product({lhsLaneSlices->sliceLmulEighths, int64_t{2}})
                 : -1;
         if (!lhsType || !rhsType || !lhsElement || !rhsElement ||
             !resultElement || lhsElement.isSignless() ||
@@ -1867,12 +2448,19 @@ private:
             (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
             !resultElement.isSigned() || resultElement.getWidth() != 32 ||
             over.size() != 1 || !target.getHasWideningInteger() ||
-            !supportsRVVLayout(target, lhsType.getLayout()) ||
-            !supportsRVVLayout(target, rhsType.getLayout()) ||
+            !riscv::supportsRVVLayout(target, lhsType.getLayout()) ||
+            !riscv::supportsRVVLayout(target, rhsType.getLayout()) ||
             lhsType.getLayout().getSew() != rhsType.getLayout().getSew() ||
             lhsType.getLayout().getLmulEighths() !=
                 rhsType.getLayout().getLmulEighths() ||
             lhsType.getLayout().getVl() != rhsType.getLayout().getVl() ||
+            !lhsLaneSlices || !rhsLaneSlices ||
+            lhsLaneSlices->reductionLanes != rhsLaneSlices->reductionLanes ||
+            lhsLaneSlices->reductionStreams != rhsLaneSlices->reductionStreams ||
+            lhsLaneSlices->sliceLmulEighths !=
+                rhsLaneSlices->sliceLmulEighths ||
+            lhsLaneSlices->offsets.size() != rhsLaneSlices->offsets.size() ||
+            lhsLaneSlices->parts.size() != rhsLaneSlices->parts.size() ||
             !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
                                 partialLMUL) ||
             (resultType && resultType.getLayout().getCarrier() != "scalar")) {
@@ -1886,13 +2474,13 @@ private:
           failed = true;
           continue;
         }
-        const int64_t streams = product(lhsType.getLayout().getTimeFactors());
+        const int64_t streams = lhsLaneSlices->reductionStreams;
         const unsigned partialWidth =
             std::max<unsigned>(8, lhsElement.getWidth()) * 2;
         const int64_t partialMaximum =
             (int64_t{1} << (partialWidth - 1)) - 1;
-        auto lhsMagnitude = maximumMagnitude(operation->getOperand(0));
-        auto rhsMagnitude = maximumMagnitude(operation->getOperand(1));
+        auto lhsMagnitude = maximumMagnitude(lhsValue);
+        auto rhsMagnitude = maximumMagnitude(rhsValue);
         auto hasFullReductionMapping = [&](riscv::ValueType value) {
           auto found = llvm::find(value.getAxisIds().asArrayRef(), over[0]);
           if (found == value.getAxisIds().asArrayRef().end())
@@ -1914,7 +2502,8 @@ private:
             fusedStreamsAreExact ? "fused" : "per_stream";
         const int64_t partialGroups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
         const int64_t outputParts =
-            resultType ? product(resultType.getLayout().getReplicaFactors()) : 1;
+            lhsLaneSlices ? static_cast<int64_t>(lhsLaneSlices->offsets.size())
+                           : -1;
         // RVVWidenDot emits output replicas sequentially.  Only the partials
         // for one output, the reduction seed, and the reduction result are
         // simultaneously live.  Per-stream reduction retains one partial per
@@ -1938,9 +2527,16 @@ private:
           continue;
         }
         auto widenedDot = rewriter.create<riscv::RVVWidenDotOp>(
-            operation->getLoc(), operation->getResult(0).getType(),
-            operation->getOperand(0), operation->getOperand(1), over,
+            operation->getLoc(), physicalResultType, lhsValue, rhsValue,
+            rewriter.getDenseI64ArrayAttr(physicalReductionAxes),
             rewriter.getStringAttr(streamReduction), schedule.getUnroll(),
+            lhsLaneSlices->reductionLanes,
+            lhsLaneSlices->reductionStreams,
+            lhsLaneSlices->sliceLmulEighths,
+            rewriter.getDenseI64ArrayAttr(lhsLaneSlices->offsets),
+            rewriter.getDenseI64ArrayAttr(rhsLaneSlices->offsets),
+            rewriter.getDenseI64ArrayAttr(lhsLaneSlices->parts),
+            rewriter.getDenseI64ArrayAttr(rhsLaneSlices->parts),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",
                 "rvv.vwmul-vwredsum",
@@ -1965,13 +2561,22 @@ private:
                 rewriter.getI64IntegerAttr(schedule.getUnroll()));
           }
         }
-        operation->getResult(0).replaceAllUsesWith(widenedDot.getResult());
+        if (fusedFreeAxisReduce) {
+          fusedFreeAxisReduce.getResult().replaceAllUsesWith(
+              widenedDot.getResult());
+          rewriter.eraseOp(fusedFreeAxisReduce);
+        } else {
+          operation->getResult(0).replaceAllUsesWith(widenedDot.getResult());
+        }
         rewriter.eraseOp(operation);
         continue;
       }
       if (!resultType) {
         operation->emitError(
-            "selected contract implementation requires a shaped physical result");
+            "selected contract implementation requires a shaped physical result; implementation=")
+            << implementation << ", lhs=" << operation->getOperand(0).getType()
+            << ", rhs=" << operation->getOperand(1).getType()
+            << ", result=" << operation->getResult(0).getType();
         failed = true;
         continue;
       }
@@ -2669,44 +3274,6 @@ private:
       }
       rewriter.eraseOp(operation);
     }
-  }
-
-  void closeConversions(mlir::IRRewriter &rewriter, bool &failed) {
-    getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
-      llvm::StringRef kind = conversion.getConversion().getKind();
-      llvm::StringRef instruction;
-      if (kind == "splat")
-        instruction = "rvv.splat";
-      else if (kind == "extract")
-        instruction = "rvv.extract";
-      else if (kind == "local_load")
-        instruction = "rvv.local-load";
-      else if (kind == "local_store")
-        instruction = "rvv.local-store";
-      else if (kind == "tuple")
-        instruction = "rvv.tuple-convert";
-      else if (kind == "register_to_lane")
-        instruction = "rvv.register-to-lane";
-      else if (kind == "time_to_lane")
-        instruction = "rvv.time-to-lane";
-      else if (kind == "lane_to_register")
-        instruction = "rvv.lane-to-register";
-      else if (kind == "reshape")
-        instruction = "rvv.layout-reshape";
-      else {
-        conversion.emitError()
-            << "no terminal leaf implements typed layout conversion kind '"
-            << kind << "'";
-        failed = true;
-        return;
-      }
-      conversion.setLeafAttr(riscv_internal::leaf(
-          rewriter, "rvv", "layout-conversion", instruction, instruction,
-          conversion.getLeaf().getOperandGroups(),
-          conversion.getLeaf().getResultGroups(),
-          conversion.getConversion().getTemporaryGroups(), 0));
-      conversion->removeAttr("implementation");
-    });
   }
 
 };

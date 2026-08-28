@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 
 using namespace weft;
@@ -82,6 +83,201 @@ bool sameTerms(const LinearIndex &lhs, const LinearIndex &rhs) {
       return false;
   }
   return true;
+}
+
+struct ShapedAffineIndex {
+  llvm::DenseMap<int64_t, int64_t> axisCoefficients;
+  mlir::Value scalarBase;
+  int64_t constant = 0;
+  bool valid = true;
+};
+
+bool checkedAdd(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+      (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+    return false;
+  result = lhs + rhs;
+  return true;
+}
+
+bool checkedMultiply(int64_t lhs, int64_t rhs, int64_t &result) {
+  if (lhs == 0 || rhs == 0) {
+    result = 0;
+    return true;
+  }
+  if ((lhs == -1 && rhs == std::numeric_limits<int64_t>::min()) ||
+      (rhs == -1 && lhs == std::numeric_limits<int64_t>::min()))
+    return false;
+  if (lhs > 0) {
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() / rhs) ||
+        (rhs < 0 && rhs < std::numeric_limits<int64_t>::min() / lhs))
+      return false;
+  } else {
+    if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() / rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::max() / rhs))
+      return false;
+  }
+  result = lhs * rhs;
+  return true;
+}
+
+void addConstant(ShapedAffineIndex &result, int64_t value) {
+  int64_t next = 0;
+  if (!checkedAdd(result.constant, value, next)) {
+    result.valid = false;
+    return;
+  }
+  result.constant = next;
+}
+
+void addAxisCoefficient(ShapedAffineIndex &result, int64_t axis,
+                        int64_t coefficient) {
+  int64_t next = 0;
+  if (!checkedAdd(result.axisCoefficients.lookup(axis), coefficient, next)) {
+    result.valid = false;
+    return;
+  }
+  if (next == 0)
+    result.axisCoefficients.erase(axis);
+  else
+    result.axisCoefficients[axis] = next;
+}
+
+void decomposeShapedIndex(mlir::Value value, int64_t coefficient,
+                          ShapedAffineIndex &result, unsigned depth = 0) {
+  if (!result.valid || depth > 24)
+    return result.valid = false, void();
+  if (auto constant = constantIndex(value)) {
+    int64_t scaled = 0;
+    if (!checkedMultiply(coefficient, *constant, scaled))
+      return result.valid = false, void();
+    addConstant(result, scaled);
+    return;
+  }
+
+  auto shaped = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  if (!shaped) {
+    if (coefficient != 1 || result.scalarBase)
+      return result.valid = false, void();
+    result.scalarBase = value;
+    return;
+  }
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
+    if (conversion.getConversion().getEffect() != "pure")
+      return result.valid = false, void();
+    decomposeShapedIndex(conversion.getInput(), coefficient, result, depth + 1);
+    return;
+  }
+  if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+    decomposeShapedIndex(cast.getInput(), coefficient, result, depth + 1);
+    return;
+  }
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    auto type = iota.getResult().getType();
+    if (type.getShape().size() != 1 || type.getAxisIds().size() != 1 ||
+        iota.getEnd() - iota.getStart() != type.getShape()[0])
+      return result.valid = false, void();
+    int64_t start = 0;
+    if (!checkedMultiply(coefficient, iota.getStart(), start))
+      return result.valid = false, void();
+    addConstant(result, start);
+    addAxisCoefficient(result, type.getAxisIds()[0], coefficient);
+    return;
+  }
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    llvm::StringRef kind = binary.getKind();
+    if (kind == "add" || kind == "sub") {
+      decomposeShapedIndex(binary.getLhs(), coefficient, result, depth + 1);
+      int64_t rhsCoefficient = coefficient;
+      if (kind == "sub" &&
+          !checkedMultiply(coefficient, -1, rhsCoefficient))
+        return result.valid = false, void();
+      decomposeShapedIndex(binary.getRhs(), rhsCoefficient, result, depth + 1);
+      return;
+    }
+    if (kind == "mul") {
+      if (auto lhs = constantIndex(binary.getLhs())) {
+        int64_t scaled = 0;
+        if (!checkedMultiply(coefficient, *lhs, scaled))
+          return result.valid = false, void();
+        decomposeShapedIndex(binary.getRhs(), scaled, result, depth + 1);
+        return;
+      }
+      if (auto rhs = constantIndex(binary.getRhs())) {
+        int64_t scaled = 0;
+        if (!checkedMultiply(coefficient, *rhs, scaled))
+          return result.valid = false, void();
+        decomposeShapedIndex(binary.getLhs(), scaled, result, depth + 1);
+        return;
+      }
+    }
+  }
+  result.valid = false;
+}
+
+int64_t knownMultiple(mlir::Value value, unsigned depth = 0) {
+  if (depth > 24)
+    return 1;
+  if (auto constant = constantIndex(value))
+    return *constant == std::numeric_limits<int64_t>::min()
+               ? 1
+               : std::abs(*constant);
+  if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    return knownMultiple(cast.getInput(), depth + 1);
+  if (auto cast = value.getDefiningOp<mlir::arith::IndexCastOp>())
+    return knownMultiple(cast.getIn(), depth + 1);
+  if (auto cast = value.getDefiningOp<mlir::arith::IndexCastUIOp>())
+    return knownMultiple(cast.getIn(), depth + 1);
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    if (binary.getKind() == "mul") {
+      if (auto lhs = constantIndex(binary.getLhs())) {
+        int64_t factor = *lhs == std::numeric_limits<int64_t>::min()
+                             ? 1
+                             : std::abs(*lhs);
+        int64_t result = 0;
+        return checkedMultiply(factor, knownMultiple(binary.getRhs(), depth + 1),
+                               result)
+                   ? result
+                   : 1;
+      }
+      if (auto rhs = constantIndex(binary.getRhs())) {
+        int64_t factor = *rhs == std::numeric_limits<int64_t>::min()
+                             ? 1
+                             : std::abs(*rhs);
+        int64_t result = 0;
+        return checkedMultiply(factor, knownMultiple(binary.getLhs(), depth + 1),
+                               result)
+                   ? result
+                   : 1;
+      }
+    }
+    if (binary.getKind() == "add" || binary.getKind() == "sub")
+      return std::gcd(knownMultiple(binary.getLhs(), depth + 1),
+                      knownMultiple(binary.getRhs(), depth + 1));
+  }
+  if (auto multiply = value.getDefiningOp<mlir::arith::MulIOp>()) {
+    if (auto lhs = constantIndex(multiply.getLhs())) {
+      int64_t result = 0;
+      return checkedMultiply(std::abs(*lhs),
+                             knownMultiple(multiply.getRhs(), depth + 1), result)
+                 ? result
+                 : 1;
+    }
+    if (auto rhs = constantIndex(multiply.getRhs())) {
+      int64_t result = 0;
+      return checkedMultiply(std::abs(*rhs),
+                             knownMultiple(multiply.getLhs(), depth + 1), result)
+                 ? result
+                 : 1;
+    }
+  }
+  if (auto add = value.getDefiningOp<mlir::arith::AddIOp>())
+    return std::gcd(knownMultiple(add.getLhs(), depth + 1),
+                    knownMultiple(add.getRhs(), depth + 1));
+  if (auto sub = value.getDefiningOp<mlir::arith::SubIOp>())
+    return std::gcd(knownMultiple(sub.getLhs(), depth + 1),
+                    knownMultiple(sub.getRhs(), depth + 1));
+  return 1;
 }
 
 bool isReadOnlyOrPure(mlir::Operation *operation) {
@@ -416,6 +612,313 @@ bool sameCompleteLayeredGroup(CompleteLayeredExtract &lhs,
          sameTerms(lhs.relative, rhs.relative);
 }
 
+bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
+                                   riscv::ExtractOp extract) {
+  llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
+  mlir::Value input = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), &conversions);
+  auto field = input.getDefiningOp<riscv::FieldOp>();
+  auto fieldType = field
+                       ? mlir::dyn_cast<riscv::ValueType>(field.getResult().getType())
+                       : riscv::ValueType();
+  auto resultType =
+      mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  auto kernel = extract->getParentOfType<riscv::KernelOp>();
+  if (!field || !fieldType || !resultType || extract.getIndices().size() != 1 ||
+      !kernel ||
+      extract.getSelectors().size() != 1 ||
+      mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() !=
+          "gather" ||
+      extract.getAccess().getForm() != "indexed" ||
+      (extract.getAccess().getMapping() != "natural" &&
+       extract.getAccess().getMapping() != "grouped_layered"))
+    return false;
+
+  ShapedAffineIndex affine;
+  decomposeShapedIndex(extract.getIndices().front(), 1, affine);
+  if (!affine.valid)
+    return false;
+
+  riscv::ConvertLayoutOp consumerConversion;
+  riscv::ValueType selectedType = resultType;
+  if (extract.getResult().hasOneUse()) {
+    auto *user = *extract.getResult().getUsers().begin();
+    auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(user);
+    auto targetType =
+        conversion
+            ? mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType())
+            : riscv::ValueType();
+    if (conversion && conversion.getConversion().getEffect() == "pure" &&
+        targetType &&
+        targetType.getLayout().getCarrier() == "rvv" &&
+        targetType.getElementType() == resultType.getElementType() &&
+        targetType.getShape() == resultType.getShape() &&
+        targetType.getAxisIds() == resultType.getAxisIds()) {
+      if (extract.getAccess().getMapping() == "natural") {
+        consumerConversion = conversion;
+        selectedType = targetType;
+      }
+    }
+  }
+  const bool scalarReplicas = resultType.getLayout().getCarrier() == "scalar";
+  if (selectedType == resultType && scalarReplicas)
+    return false;
+  if (selectedType.getLayout().getCarrier() != "rvv") {
+    return false;
+  }
+
+  const bool layered =
+      extract.getAccess().getMapping() == "grouped_layered";
+  int64_t laneAxis = 0;
+  size_t lanePosition = 0;
+  llvm::SmallVector<size_t> lanePositions;
+  int64_t lanes = 0;
+  int64_t streams = 1;
+  int64_t replicas = 1;
+  for (size_t position = 0; position < selectedType.getShape().size(); ++position) {
+    const int64_t time = selectedType.getLayout().getTimeFactors()[position];
+    const int64_t lane = selectedType.getLayout().getLaneFactors()[position];
+    const int64_t replica = selectedType.getLayout().getReplicaFactors()[position];
+    const int64_t fragment =
+        selectedType.getLayout().getFragmentFactors()[position];
+    const int64_t local = selectedType.getLayout().getLocalFactors()[position];
+    int64_t represented = 0;
+    if (time <= 0 || lane <= 0 || replica <= 0 || fragment != 1 || local != 1 ||
+        !checkedMultiply(time, lane, represented) ||
+        !checkedMultiply(represented, replica, represented) ||
+        represented != selectedType.getShape()[position])
+      return false;
+    if (lane > 1) {
+      if ((layered && laneAxis) || replica != 1)
+        return false;
+      lanePositions.push_back(position);
+      laneAxis = selectedType.getAxisIds()[position];
+      lanePosition = position;
+    } else {
+      if ((time > 1 && replica > 1) ||
+          (selectedType.getShape()[position] > 1 &&
+           !affine.axisCoefficients.contains(selectedType.getAxisIds()[position])))
+        return false;
+    }
+    if (!checkedMultiply(streams, time, streams) ||
+        !checkedMultiply(replicas, replica, replicas))
+      return false;
+  }
+  lanes = 1;
+  for (size_t position : lanePositions)
+    if (!checkedMultiply(lanes,
+                         selectedType.getLayout().getLaneFactors()[position],
+                         lanes))
+      return false;
+  if (!laneAxis || affine.axisCoefficients.lookup(laneAxis) != 1 ||
+      streams <= 0 || replicas <= 0 ||
+      streams > std::numeric_limits<int64_t>::max() / replicas)
+    return false;
+  for (const auto &[axis, coefficient] : affine.axisCoefficients) {
+    auto found = llvm::find(selectedType.getAxisIds().asArrayRef(), axis);
+    if (found == selectedType.getAxisIds().asArrayRef().end() || coefficient <= 0)
+      return false;
+  }
+
+  // A natural byte-addressable field may map several logical axes into one
+  // RVV register.  Accept that representation only when the affine storage
+  // coordinates prove that the lane axes flatten to one contiguous interval
+  // in row-major axis order.  Packed/layered storage keeps its single-lane-axis
+  // semantic result; its raw byte windows may still be coalesced below.
+  if (!layered && lanePositions.size() > 1) {
+    int64_t expectedStride = 1;
+    for (int64_t position =
+             static_cast<int64_t>(selectedType.getShape().size()) - 1;
+         position >= 0; --position) {
+      const int64_t lane =
+          selectedType.getLayout().getLaneFactors()[position];
+      if (lane <= 1)
+        continue;
+      const int64_t axis = selectedType.getAxisIds()[position];
+      if (affine.axisCoefficients.lookup(axis) != expectedStride ||
+          !checkedMultiply(expectedStride, lane, expectedStride))
+        return false;
+    }
+  }
+
+  auto fieldAxis = llvm::find(fieldType.getAxisIds().asArrayRef(), laneAxis);
+  const bool gatherAxis =
+      fieldAxis == fieldType.getAxisIds().asArrayRef().end();
+  if (gatherAxis &&
+      (fieldType.getShape().size() != 1 ||
+       affine.axisCoefficients.lookup(laneAxis) != 1))
+    return false;
+  const int64_t fieldExtent =
+      gatherAxis
+          ? fieldType.getShape()[0]
+          : fieldType.getShape()[static_cast<size_t>(
+                fieldAxis - fieldType.getAxisIds().asArrayRef().begin())];
+  if (fieldExtent <= 0)
+    return false;
+
+  llvm::SmallVector<int64_t> partOffsets;
+  int64_t logicalSpan = 0;
+  const int64_t parts = streams * replicas;
+  for (int64_t part = 0; part < parts; ++part) {
+    int64_t remainingStream = part % streams;
+    int64_t remainingReplica = part / streams;
+    llvm::SmallVector<int64_t> timeCoordinates(selectedType.getShape().size(), 0);
+    llvm::SmallVector<int64_t> replicaCoordinates(selectedType.getShape().size(), 0);
+    for (int64_t position = static_cast<int64_t>(selectedType.getShape().size()) - 1;
+         position >= 0; --position) {
+      const int64_t time =
+          selectedType.getLayout().getTimeFactors()[static_cast<size_t>(position)];
+      const int64_t replica =
+          selectedType.getLayout().getReplicaFactors()[static_cast<size_t>(position)];
+      timeCoordinates[static_cast<size_t>(position)] = remainingStream % time;
+      remainingStream /= time;
+      replicaCoordinates[static_cast<size_t>(position)] =
+          remainingReplica % replica;
+      remainingReplica /= replica;
+    }
+    if (remainingStream || remainingReplica)
+      return false;
+    int64_t logicalOffset = 0;
+    for (size_t position = 0; position < selectedType.getShape().size(); ++position) {
+      const int64_t time = selectedType.getLayout().getTimeFactors()[position];
+      const int64_t replica =
+          selectedType.getLayout().getReplicaFactors()[position];
+      int64_t coordinate = 0;
+      const int64_t lane =
+          selectedType.getLayout().getLaneFactors()[position];
+      if (lane > 1) {
+        if (!checkedMultiply(timeCoordinates[position], lane, coordinate))
+          return false;
+      } else {
+        if (!checkedMultiply(timeCoordinates[position], replica, coordinate) ||
+            !checkedAdd(coordinate, replicaCoordinates[position], coordinate))
+          return false;
+      }
+      if (time == 1 && replica == 1 && position != lanePosition)
+        continue;
+      int64_t contribution = 0;
+      if (!checkedMultiply(
+              coordinate,
+              affine.axisCoefficients.lookup(selectedType.getAxisIds()[position]),
+              contribution) ||
+          !checkedAdd(logicalOffset, contribution, logicalOffset))
+        return false;
+    }
+    if (logicalOffset < 0 || logicalOffset % lanes)
+      return false;
+    partOffsets.push_back(logicalOffset);
+    int64_t end = 0;
+    if (!checkedAdd(logicalOffset, lanes, end))
+      return false;
+    logicalSpan = std::max(logicalSpan, end);
+  }
+  if (logicalSpan <= 0 || logicalSpan > fieldExtent || affine.constant < 0 ||
+      (affine.scalarBase && knownMultiple(affine.scalarBase) % logicalSpan))
+    return false;
+
+  const int64_t group = extract.getAccess().getGroupSize();
+  const int64_t layer = extract.getAccess().getLayerSize();
+  if (layered &&
+      (group <= 0 || layer <= 0 || group % layer || layer % lanes ||
+       group % logicalSpan ||
+       logicalSpan % layer || affine.constant != 0))
+    return false;
+  if (!layered && !affine.scalarBase &&
+      affine.constant > fieldExtent - logicalSpan)
+    return false;
+  if (affine.scalarBase && affine.constant != 0)
+    return false;
+
+  llvm::DenseMap<int64_t, int64_t> windowIds;
+  llvm::SmallVector<int64_t> windowOffsets;
+  llvm::SmallVector<int64_t> windowForPart;
+  llvm::SmallVector<int64_t> layerForPart;
+  for (int64_t offset : partOffsets) {
+    const int64_t windowOffset = layered ? offset % layer : offset;
+    auto [found, inserted] = windowIds.try_emplace(
+        windowOffset, static_cast<int64_t>(windowOffsets.size()));
+    if (inserted)
+      windowOffsets.push_back(windowOffset);
+    windowForPart.push_back(found->second);
+    layerForPart.push_back(layered ? offset / layer : 0);
+  }
+
+  rewriter.setInsertionPoint(extract);
+  mlir::Value scalarBase = affine.scalarBase;
+  if (!scalarBase)
+    scalarBase = rewriter.create<mlir::arith::ConstantIndexOp>(extract.getLoc(),
+                                                               affine.constant);
+  const int64_t resultGroups = selectedType.getLayout().getRegisterGroups();
+  const int64_t temporaryGroups =
+      std::max<int64_t>(1,
+                        (selectedType.getLayout().getLmulEighths() + 7) / 8);
+  const bool tail = selectedType.getLayout().getValidity() == "tail";
+  llvm::StringRef instruction =
+      layered ? "rvv.replica-storage-load.layered"
+              : "rvv.replica-storage-load.natural";
+  auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
+      extract.getLoc(), selectedType, field.getResult(), scalarBase, laneAxis,
+      logicalSpan,
+      rewriter.getDenseI64ArrayAttr(windowOffsets),
+      rewriter.getDenseI64ArrayAttr(windowForPart),
+      rewriter.getDenseI64ArrayAttr(layerForPart), extract.getAccess(),
+      riscv_internal::leaf(rewriter, "rvv", "replica-storage-load",
+                           instruction, instruction, 0, resultGroups,
+                           temporaryGroups, 0, "none",
+                           tail ? "agnostic" : "exact"));
+  riscv_internal::copyOrigin(extract, load);
+  if (auto canonical = extract->getAttr("canonical_op"))
+    load->setAttr("canonical_op", canonical);
+  mlir::Value replacement = load.getResult();
+  if (consumerConversion) {
+    consumerConversion.getResult().replaceAllUsesWith(replacement);
+    rewriter.eraseOp(consumerConversion);
+  }
+  extract.getResult().replaceAllUsesWith(replacement);
+  rewriter.eraseOp(extract);
+  for (riscv::ConvertLayoutOp conversion : llvm::reverse(conversions))
+    if (conversion.getResult().use_empty())
+      rewriter.eraseOp(conversion);
+  return true;
+}
+
+void eraseDeadPureProducers(mlir::IRRewriter &rewriter,
+                            llvm::ArrayRef<mlir::Value> roots) {
+  llvm::SmallVector<mlir::Operation *> worklist;
+  llvm::SmallVector<mlir::Operation *> candidates;
+  llvm::DenseSet<mlir::Operation *> seen;
+  for (mlir::Value root : roots)
+    if (mlir::Operation *definition = root.getDefiningOp())
+      worklist.push_back(definition);
+  while (!worklist.empty()) {
+    mlir::Operation *operation = worklist.pop_back_val();
+    if (!operation || !seen.insert(operation).second ||
+        operation->getNumRegions() != 0)
+      continue;
+    if (!mlir::isMemoryEffectFree(operation))
+      continue;
+    candidates.push_back(operation);
+    for (mlir::Value operand : operation->getOperands())
+      if (mlir::Operation *definition = operand.getDefiningOp())
+        worklist.push_back(definition);
+  }
+
+  llvm::DenseSet<mlir::Operation *> erased;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (mlir::Operation *operation : llvm::reverse(candidates)) {
+      if (erased.contains(operation) ||
+          llvm::any_of(operation->getResults(),
+                       [](mlir::Value result) { return !result.use_empty(); }))
+        continue;
+      rewriter.eraseOp(operation);
+      erased.insert(operation);
+      changed = true;
+    }
+  }
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -497,6 +1000,18 @@ public:
         if (conversion.getResult().use_empty())
           rewriter.eraseOp(conversion);
     }
+
+    llvm::SmallVector<riscv::ExtractOp> replicaExtracts;
+    getOperation().walk(
+        [&](riscv::ExtractOp extract) { replicaExtracts.push_back(extract); });
+    llvm::SmallVector<mlir::Value> replacedReplicaIndices;
+    for (riscv::ExtractOp extract : replicaExtracts) {
+      llvm::SmallVector<mlir::Value> indices(extract.getIndices().begin(),
+                                             extract.getIndices().end());
+      if (materializeReplicaStorageLoad(rewriter, extract))
+        replacedReplicaIndices.append(indices.begin(), indices.end());
+    }
+    eraseDeadPureProducers(rewriter, replacedReplicaIndices);
 
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(

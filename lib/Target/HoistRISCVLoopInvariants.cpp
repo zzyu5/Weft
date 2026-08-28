@@ -27,6 +27,21 @@ public:
     getOperation().walk<mlir::WalkOrder::PostOrder>(
         [&](mlir::LoopLikeOpInterface loop) { loops.push_back(loop); });
     for (mlir::LoopLikeOpInterface loop : loops) {
+      bool hasWriteEffect = false;
+      for (mlir::Region *region : loop.getLoopRegions())
+        region->walk([&](mlir::Operation *operation) {
+          if (operation == loop.getOperation())
+            return;
+          auto effects =
+              mlir::dyn_cast<mlir::MemoryEffectOpInterface>(operation);
+          if (!effects)
+            return;
+          llvm::SmallVector<mlir::MemoryEffects::EffectInstance> instances;
+          effects.getEffects(instances);
+          hasWriteEffect |= llvm::any_of(instances, [](const auto &instance) {
+            return !mlir::isa<mlir::MemoryEffects::Read>(instance.getEffect());
+          });
+        });
       auto regions = loop.getLoopRegions();
       mlir::moveLoopInvariantCode(
           regions,
@@ -37,10 +52,21 @@ public:
             if (operation->getDialect() &&
                 operation->getDialect()->getNamespace() == "arith")
               return mlir::isMemoryEffectFree(operation);
-            return mlir::isa<weft::riscv::ConstantOp, weft::riscv::IotaOp,
+            if (auto lookup =
+                    mlir::dyn_cast<weft::riscv::LookupOp>(operation))
+              return mlir::isa<weft::riscv::ValueType>(
+                  lookup.getTable().getType());
+            if (mlir::isa<weft::riscv::RVVReplicaStorageLoadOp>(operation))
+              return !hasWriteEffect;
+            if (auto conversion =
+                    mlir::dyn_cast<weft::riscv::ConvertLayoutOp>(operation))
+              return conversion.getConversion().getEffect() == "pure";
+            return mlir::isa<weft::riscv::ConstantOp,
+                             weft::riscv::IotaOp,
                              weft::riscv::UnaryOp, weft::riscv::BinaryOp,
                              weft::riscv::CompareOp, weft::riscv::CastOp,
-                             weft::riscv::NarrowOp, weft::riscv::WidenOp>(
+                             weft::riscv::NarrowOp, weft::riscv::WidenOp,
+                             weft::riscv::LookupOp, weft::riscv::ExtractOp>(
                        operation) &&
                    mlir::isMemoryEffectFree(operation);
           },

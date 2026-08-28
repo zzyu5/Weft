@@ -38,9 +38,21 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createUnrollRISCVLevelsPass());
   manager.addPass(weft::createShareRISCVLayeredWindowsPass());
   manager.addPass(weft::createMaterializeRISCVPartialAccumulatorsPass());
+  // Partial materialization can introduce fresh lane-to-register edges around
+  // shaped iotas and other pure producers.  Canonicalize those new edges
+  // before scheduling/final leaf selection so their register forms remain
+  // explicit typed values instead of terminal vector extracts.
+  manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
+  // Layout canonicalization and partial materialization may rewrite the
+  // carrier of surviving numerical operations.  Re-select their exact
+  // target-local implementation from the final typed result instead of
+  // carrying an implementation chosen for a pre-rewrite layout into leaf
+  // finalization.
+  manager.addPass(weft::createSelectRISCVOperationsPass());
   manager.addPass(weft::createFinalizeRISCVLeavesPass());
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
+  manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createVerifyFinalRISCVPass());
   return manager.run(module);
 }

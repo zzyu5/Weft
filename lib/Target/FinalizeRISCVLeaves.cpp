@@ -29,6 +29,38 @@ public:
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {
+      // Layout canonicalization, scheduling, and partial materialization can
+      // all create conversions after composite lowering.  Close conversions
+      // here, after the last physical rewrite, so every conversion in the
+      // final program receives its leaf from the same typed ConversionAttr.
+      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation)) {
+        llvm::StringRef kind = conversion.getConversion().getKind();
+        llvm::StringRef instruction =
+            kind == "splat"          ? "rvv.splat"
+            : kind == "extract"      ? "rvv.extract"
+            : kind == "local_load"   ? "rvv.local-load"
+            : kind == "local_store"  ? "rvv.local-store"
+            : kind == "tuple"        ? "rvv.tuple-convert"
+            : kind == "register_to_lane" ? "rvv.register-to-lane"
+            : kind == "time_to_lane" ? "rvv.time-to-lane"
+            : kind == "lane_to_register" ? "rvv.lane-to-register"
+            : kind == "reshape"      ? "rvv.layout-reshape"
+                                      : llvm::StringRef();
+        if (instruction.empty()) {
+          conversion.emitError()
+              << "no terminal leaf implements typed layout conversion kind '"
+              << kind << "'";
+          failed = true;
+          return;
+        }
+        riscv::LeafAttr oldLeaf = conversion.getLeaf();
+        conversion.setLeafAttr(riscv_internal::leaf(
+            builder, "rvv", "layout-conversion", instruction, instruction,
+            oldLeaf.getOperandGroups(), oldLeaf.getResultGroups(),
+            conversion.getConversion().getTemporaryGroups(), 0));
+        conversion->removeAttr("implementation");
+        return;
+      }
       auto implementation =
           operation->getAttrOfType<riscv::ImplementationAttr>("implementation");
       if (!implementation)
@@ -46,7 +78,8 @@ public:
         if ((implementation.getEngine() == "rvv" && carrier != "rvv") ||
             (implementation.getEngine() == "scalar" && carrier != "scalar")) {
           operation->emitError()
-              << "selected operation engine " << implementation.getEngine()
+              << "selected " << operation->getName() << " engine "
+              << implementation.getEngine()
               << " disagrees with propagated result carrier " << carrier;
           failed = true;
           return;

@@ -502,6 +502,64 @@ def mul_mat_q3_k(
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        integer_acc = new(i32, [MR, NR], init=i32(0))
+                        half_index = index(0)
+                        with L.subs(kb, extent=128) as half:
+                            plane = iota(4, dtype=u8)
+                            scale_part = iota(2, dtype=u8)
+                            lane = iota(16, dtype=u8, axis="k")
+                            coordinate = (
+                                u8(half_index) * u8(128)
+                                + plane * u8(32)
+                                + scale_part * u8(16)
+                                + lane
+                            )
+                            q = (
+                                i8(w.q[:, coordinate])
+                                + i8(4) * i8(w.hmask[:, coordinate])
+                                - i8(4)
+                            )
+                            products = contract(
+                                x.q[:, coordinate], q, over="k", acc=i32
+                            )
+                            scale_coordinate = (
+                                u8(half_index) * u8(8)
+                                + plane * u8(2)
+                                + scale_part
+                            )
+                            scale = (
+                                i32(w.scale_low[:, scale_coordinate])
+                                | (i32(w.scale_high[:, scale_coordinate]) << u32(4))
+                            ) - i32(32)
+                            integer_acc += reduce(
+                                reduce(products * scale, axis=1), axis=1
+                            )
+                            half_index += index(1)
+                        acc += (
+                            f32(x.ds)
+                            * f32(w.d)
+                            * widen(integer_acc, f32)
+                        )
+                    commit(acc, Y[mb, nb])
+
+
+def mul_mat_q3_k_decode(
+    W: View[Q3_K, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
     for row in range(M):
         for column in range(N):
             commit(vec_dot_q3_k_q8_k(W[column], Xq[row]), Y[row, column])

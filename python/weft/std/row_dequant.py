@@ -116,31 +116,13 @@ def dequantize_q2_k(W: View[Q2_K, (K,)], Y: View[f32, (K,)]):
 def dequantize_q3_k(W: View[Q3_K, (K,)], Y: View[f32, (K,)]):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            within = j % 128
-            packed = w.q[(j // 128) * 32 + (within % 32)]
-            low = extract_bits(packed, (within // 32) * 2, 2)
-            high = extract_bits(w.hmask[j % 32], j // 32)
-            q = i32(low) + i32(high) * i32(4) - i32(4)
-
-            sub = j // 16
-            quarter = sub // 4
-            position = sub % 4
-            low_source = u32(w.scales[position])
-            if quarter == 1:
-                low_source = u32(w.scales[4 + position])
-            if quarter == 2:
-                low_source = u32(w.scales[position])
-            if quarter == 3:
-                low_source = u32(w.scales[4 + position])
-            low_shift = i32(0)
-            if quarter >= 2:
-                low_shift = i32(4)
-            high_shift = quarter * 2
-            low_scale = extract_bits(low_source, low_shift, 4)
-            high_scale = extract_bits(w.scales[8 + position], high_shift, 2)
-            scale = signed_scale(low_scale | (high_scale << u32(4)), zero=32)
-            commit(f32(w.d) * f32(scale) * f32(q), Y[kb][j])
+        with L.subs(kb, extent=16) as sub:
+            scale = (
+                i32(w.scale_low[sub])
+                | (i32(w.scale_high[sub]) << u32(4))
+            ) - i32(32)
+            q = i32(w.q[sub]) + i32(w.hmask[sub]) * i32(4) - i32(4)
+            commit(f32(w.d) * f32(scale) * f32(q), Y[kb][sub])
 
 
 def dequantize_q4_k(W: View[Q4_K, (K,)], Y: View[f32, (K,)]):
