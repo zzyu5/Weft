@@ -70,6 +70,268 @@ int64_t riscv_internal::physicalExtent(mlir::Value value, int64_t axis) {
   return 0;
 }
 
+llvm::StringRef riscv_internal::layeredStorageDecodeInstruction(
+    int64_t shiftAmount, int64_t maskValue) {
+  if (shiftAmount > 0)
+    return maskValue > 0 ? "rvv.layered-storage-decode.shift-mask"
+                         : "rvv.layered-storage-decode.shift";
+  return maskValue > 0 ? "rvv.layered-storage-decode.mask"
+                       : "rvv.layered-storage-decode.identity";
+}
+
+std::optional<riscv::StorageWindowPlanAttr>
+riscv_internal::storageWindowPlan(
+    mlir::Builder &builder, riscv::FieldOp field, int64_t reductionAxis,
+    int64_t projectionBase, int64_t projectionStride,
+    int64_t projectionRepeat, int64_t projectionExtent,
+    int64_t offsetAlignment) {
+  riscv::LoadOp load = sourceLoad(field.getOwner());
+  auto memory = load ? load.getRegion().getType() : riscv::MemDescType();
+  auto fieldType =
+      mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+  auto integer = fieldType
+                     ? mlir::dyn_cast<mlir::IntegerType>(
+                           fieldType.getElementType())
+                     : mlir::IntegerType();
+  auto floating = fieldType
+                      ? mlir::dyn_cast<mlir::FloatType>(
+                            fieldType.getElementType())
+                      : mlir::FloatType();
+  const int64_t elementBits =
+      integer ? integer.getWidth() : floating ? floating.getWidth() : 0;
+  riscv::AccessAttr access = field.getAccess();
+  if (!memory || !fieldType || !access || reductionAxis <= 0 ||
+      projectionBase < 0 || projectionStride <= 0 || projectionRepeat <= 0 ||
+      projectionExtent <= 0 || offsetAlignment <= 0 ||
+      memory.getElements() <= 0 || access.getBitOffset() < 0 ||
+      access.getBitOffset() % 8 || elementBits <= 0)
+    return std::nullopt;
+
+  llvm::StringRef kind;
+  int64_t group = 0;
+  int64_t layer = 0;
+  int64_t physicalLayerBase = 0;
+  int64_t physicalLayerStep = 0;
+  int64_t shiftBase = 0;
+  int64_t shiftStep = 0;
+  int64_t maskValue = 0;
+  if (access.getMapping() == "natural") {
+    kind = projectionRepeat > 1
+               ? "repeat"
+               : projectionStride == 1 ? "unit" : "strided";
+  } else if (access.getMapping() == "grouped_layered") {
+    group = access.getGroupSize();
+    layer = access.getLayerSize();
+    const int64_t layers = layer > 0 ? group / layer : 0;
+    if (!integer || integer.isSigned() || elementBits >= 8 || group <= 0 ||
+        layer <= 0 || group % layer || layers <= 1 ||
+        (access.getOrder() != "lo_first" &&
+         access.getOrder() != "hi_first"))
+      return std::nullopt;
+    kind = "layered";
+    physicalLayerBase = access.getOrder() == "lo_first" ? 0 : layers - 1;
+    physicalLayerStep = access.getOrder() == "lo_first" ? 1 : -1;
+    shiftBase = physicalLayerBase * elementBits;
+    shiftStep = physicalLayerStep * elementBits;
+    maskValue = (int64_t{1} << elementBits) - 1;
+  } else {
+    return std::nullopt;
+  }
+  return riscv::StorageWindowPlanAttr::get(
+      builder.getContext(), kind, reductionAxis, projectionBase,
+      projectionStride, projectionRepeat, projectionExtent, offsetAlignment,
+      memory.getElements(), access.getBitOffset() / 8, elementBits, group,
+      layer, physicalLayerBase, physicalLayerStep, shiftBase, shiftStep,
+      maskValue);
+}
+
+std::optional<riscv_internal::WidenDotLaneSlicePlan>
+riscv_internal::planWidenDotLaneSlices(
+    riscv::ValueType operand, riscv::ValueType result,
+    llvm::ArrayRef<int64_t> reductionAxes, riscv::TargetAttr target) {
+  auto layout = operand.getLayout();
+  auto lanes = staticProduct(layout.getLaneFactors().asArrayRef());
+  if (!lanes || *lanes <= 0)
+    return std::nullopt;
+
+  int64_t reductionLanes = 1;
+  bool sawFreeLane = false;
+  for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
+       position >= 0; --position) {
+    const int64_t lane = layout.getLaneFactors()[position];
+    if (lane <= 1)
+      continue;
+    const int64_t axis = operand.getAxisIds()[position];
+    if (llvm::is_contained(reductionAxes, axis)) {
+      if (sawFreeLane ||
+          reductionLanes > std::numeric_limits<int64_t>::max() / lane)
+        return std::nullopt;
+      reductionLanes *= lane;
+    } else {
+      sawFreeLane = true;
+    }
+  }
+  if (reductionLanes <= 0 || *lanes % reductionLanes)
+    return std::nullopt;
+
+  if (layout.getLmulEighths() <= 0 ||
+      layout.getLmulEighths() >
+          std::numeric_limits<int64_t>::max() / reductionLanes)
+    return std::nullopt;
+  const int64_t numerator = layout.getLmulEighths() * reductionLanes;
+  if (numerator % *lanes)
+    return std::nullopt;
+  int64_t sliceLmul = numerator / *lanes;
+  if (sliceLmul < 8 && layout.getLmulEighths() > sliceLmul)
+    sliceLmul = 8;
+  if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), sliceLmul))
+    return std::nullopt;
+
+  int64_t outputParts = 1;
+  if (result) {
+    if (result.getLayout().getCarrier() != "scalar")
+      return std::nullopt;
+    outputParts = staticProduct(result.getLayout().getReplicaFactors().asArrayRef())
+                      .value_or(-1);
+    if (outputParts <= 0)
+      return std::nullopt;
+  }
+
+  WidenDotLaneSlicePlan plan;
+  plan.reductionLanes = reductionLanes;
+  plan.sliceLmulEighths = sliceLmul;
+  llvm::SmallVector<int64_t> reductionTimeExtents;
+  for (int64_t axis : reductionAxes) {
+    auto found = llvm::find(operand.getAxisIds().asArrayRef(), axis);
+    if (found == operand.getAxisIds().asArrayRef().end())
+      return std::nullopt;
+    const size_t position = static_cast<size_t>(
+        found - operand.getAxisIds().asArrayRef().begin());
+    const int64_t extent = layout.getTimeFactors()[position];
+    if (extent <= 0)
+      return std::nullopt;
+    reductionTimeExtents.push_back(extent);
+  }
+  plan.reductionStreams = staticProduct(reductionTimeExtents).value_or(-1);
+  const int64_t totalStreams =
+      staticProduct(layout.getTimeFactors().asArrayRef()).value_or(-1);
+  const int64_t registerParts =
+      staticProduct(layout.getReplicaFactors().asArrayRef()).value_or(-1);
+  if (plan.reductionStreams <= 0 || totalStreams <= 0 || registerParts <= 0 ||
+      registerParts > std::numeric_limits<int64_t>::max() / totalStreams)
+    return std::nullopt;
+  const int64_t totalParts = registerParts * totalStreams;
+
+  for (int64_t outputPart = 0; outputPart < outputParts; ++outputPart) {
+    llvm::SmallVector<int64_t> resultCoordinates(
+        result ? result.getAxisIds().size() : 0, 0);
+    int64_t remaining = outputPart;
+    if (result) {
+      for (int64_t position = static_cast<int64_t>(result.getAxisIds().size()) - 1;
+           position >= 0; --position) {
+        const int64_t replica = result.getLayout().getReplicaFactors()[position];
+        if (replica <= 0)
+          return std::nullopt;
+        resultCoordinates[position] = remaining % replica;
+        remaining /= replica;
+      }
+      if (remaining)
+        return std::nullopt;
+    }
+
+    auto resultCoordinateForAxis = [&](int64_t axis) -> std::optional<int64_t> {
+      if (!result)
+        return std::nullopt;
+      auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+      if (found == result.getAxisIds().asArrayRef().end())
+        return std::nullopt;
+      return resultCoordinates[static_cast<size_t>(
+          found - result.getAxisIds().asArrayRef().begin())];
+    };
+
+    int64_t laneOffset = 0;
+    int64_t laneStride = 1;
+    for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
+         position >= 0; --position) {
+      const int64_t lane = layout.getLaneFactors()[position];
+      if (lane <= 1)
+        continue;
+      const int64_t axis = operand.getAxisIds()[position];
+      int64_t coordinate = 0;
+      if (!llvm::is_contained(reductionAxes, axis)) {
+        auto logicalCoordinate = resultCoordinateForAxis(axis);
+        if (!logicalCoordinate || *logicalCoordinate < 0)
+          return std::nullopt;
+        coordinate = *logicalCoordinate % lane;
+      }
+      if (coordinate > 0 &&
+          laneOffset > std::numeric_limits<int64_t>::max() -
+                           coordinate * laneStride)
+        return std::nullopt;
+      laneOffset += coordinate * laneStride;
+      if (laneStride > std::numeric_limits<int64_t>::max() / lane)
+        return std::nullopt;
+      laneStride *= lane;
+    }
+    if (laneOffset < 0 || laneOffset % reductionLanes ||
+        laneOffset > *lanes - reductionLanes)
+      return std::nullopt;
+    plan.offsets.push_back(laneOffset);
+
+    for (int64_t reductionStream = 0;
+         reductionStream < plan.reductionStreams; ++reductionStream) {
+      llvm::SmallVector<int64_t> reductionCoordinates(reductionAxes.size(), 0);
+      int64_t remainingReduction = reductionStream;
+      for (int64_t index = static_cast<int64_t>(reductionAxes.size()) - 1;
+           index >= 0; --index) {
+        reductionCoordinates[index] =
+            remainingReduction % reductionTimeExtents[index];
+        remainingReduction /= reductionTimeExtents[index];
+      }
+      if (remainingReduction)
+        return std::nullopt;
+
+      int64_t streamPart = 0;
+      int64_t registerPart = 0;
+      for (size_t position = 0; position < operand.getAxisIds().size();
+           ++position) {
+        const int64_t axis = operand.getAxisIds()[position];
+        const int64_t time = layout.getTimeFactors()[position];
+        const int64_t lane = layout.getLaneFactors()[position];
+        const int64_t replica = layout.getReplicaFactors()[position];
+        int64_t timeCoordinate = 0;
+        int64_t replicaCoordinate = 0;
+        if (auto reduction = llvm::find(reductionAxes, axis);
+            reduction != reductionAxes.end()) {
+          timeCoordinate = reductionCoordinates[static_cast<size_t>(
+              reduction - reductionAxes.begin())];
+        } else {
+          auto logicalCoordinate = resultCoordinateForAxis(axis);
+          if (!logicalCoordinate)
+            return std::nullopt;
+          if (lane > 1) {
+            if (replica != 1 || *logicalCoordinate >= time * lane)
+              return std::nullopt;
+            timeCoordinate = *logicalCoordinate / lane;
+          } else {
+            if (*logicalCoordinate >= time * replica)
+              return std::nullopt;
+            timeCoordinate = *logicalCoordinate / replica;
+            replicaCoordinate = *logicalCoordinate % replica;
+          }
+        }
+        streamPart = streamPart * time + timeCoordinate;
+        registerPart = registerPart * replica + replicaCoordinate;
+      }
+      const int64_t physicalPart = registerPart * totalStreams + streamPart;
+      if (physicalPart < 0 || physicalPart >= totalParts)
+        return std::nullopt;
+      plan.parts.push_back(physicalPart);
+    }
+  }
+  return plan;
+}
+
 mlir::ArrayAttr riscv_internal::strings(
     mlir::Builder &builder, llvm::ArrayRef<std::string> values) {
   llvm::SmallVector<mlir::Attribute> attributes;
@@ -890,6 +1152,13 @@ riscv_internal::integerRange(mlir::Value value, unsigned depth) {
       if (auto range = integerRange(narrow.getInput(), depth + 1))
         if (auto checked = checkedRange(range->minimum, range->maximum))
           return checked;
+  // A typed logical extract selects elements without changing their numeric
+  // interpretation.  Its result range is therefore a subset of the input
+  // range, independent of the selected coordinates or physical layout.
+  if (auto extract = value.getDefiningOp<riscv::ExtractOp>())
+    if (auto range = integerRange(extract.getInput(), depth + 1))
+      if (auto checked = checkedRange(range->minimum, range->maximum))
+        return checked;
   if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
     auto lhs = integerRange(binary.getLhs(), depth + 1);
     auto rhs = integerRange(binary.getRhs(), depth + 1);

@@ -230,7 +230,7 @@ std::optional<Roles> storageRolesFor(mlir::Value value) {
 
   Roles roles;
   roles.laneAxis = contiguousAxis;
-  if (facts.mapping == "natural") {
+  if (facts.mapping == "natural" || facts.mapping == "grouped_layered") {
     int64_t span = 0;
     for (auto [axis, extent] : llvm::zip(result.getAxisIds().asArrayRef(),
                                          result.getShape().asArrayRef()))
@@ -254,10 +254,18 @@ std::optional<Roles> storageRolesFor(mlir::Value value) {
       }
       if (!nextAxis)
         break;
+      int64_t nextSpan = 0;
+      if (!checkedMultiply(span, nextExtent, nextSpan))
+        return std::nullopt;
+      // A grouped/layered field is contiguous only inside one physical layer.
+      // Crossing the layer boundary changes which packed bits supply the
+      // logical value, so that axis must remain a replica/time coordinate.
+      if (facts.mapping == "grouped_layered" &&
+          (facts.layer <= 0 || nextSpan > facts.layer))
+        break;
       roles.coalescedLaneAxes.insert(nextAxis);
       consumed.insert(nextAxis);
-      if (!checkedMultiply(span, nextExtent, span))
-        return std::nullopt;
+      span = nextSpan;
     }
   }
   roles.anchored = true;
@@ -265,7 +273,8 @@ std::optional<Roles> storageRolesFor(mlir::Value value) {
   roles.memoryAnchored = true;
   for (int64_t axis : riscv_internal::logicalAxes(value.getType())) {
     const int64_t extent = riscv_internal::physicalExtent(value, axis);
-    if (axis != contiguousAxis && extent > 0 && extent <= 16)
+    if (axis != contiguousAxis &&
+        !roles.coalescedLaneAxes.contains(axis) && extent > 0 && extent <= 16)
       roles.replicaAxes.insert(axis);
   }
   return roles;
@@ -331,6 +340,81 @@ downstreamImmediateReducedFreeAxis(mlir::Operation *contraction,
     }
   }
   return reducedAxis;
+}
+
+llvm::SmallVector<int64_t>
+downstreamReducedFreeAxes(mlir::Operation *contraction,
+                          llvm::ArrayRef<int64_t> contractionAxes) {
+  llvm::SmallVector<int64_t> reducedAxes;
+  if (!contraction || contraction->getNumResults() != 1)
+    return reducedAxes;
+
+  llvm::SmallVector<mlir::Value> worklist{contraction->getResult(0)};
+  llvm::SmallPtrSet<mlir::Operation *, 32> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
+    if (!source)
+      continue;
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      if (auto reduce = mlir::dyn_cast<riscv::ReduceOp>(user)) {
+        if (reduce.getAxis() < 0 ||
+            reduce.getAxis() >= static_cast<int64_t>(source.getAxisIds().size()))
+          continue;
+        const int64_t axis = source.getAxisIds()[reduce.getAxis()];
+        if (!llvm::is_contained(contractionAxes, axis) &&
+            !llvm::is_contained(reducedAxes, axis))
+          reducedAxes.push_back(axis);
+        worklist.push_back(reduce.getResult());
+        continue;
+      }
+      if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
+        continue;
+      auto result =
+          mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
+      if (!result || result.getShape() != source.getShape() ||
+          result.getAxisIds() != source.getAxisIds())
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return reducedAxes;
+}
+
+bool storageSupportsLaneAxes(mlir::Value root,
+                             llvm::ArrayRef<int64_t> requestedAxes) {
+  llvm::SmallVector<mlir::Value> worklist{root};
+  llvm::SmallPtrSet<mlir::Operation *, 32> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    mlir::Operation *definition = value.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      continue;
+    if (mlir::isa<riscv::ExtractOp>(definition)) {
+      auto storage = storageRolesFor(value);
+      if (!storage || !storage->memoryAnchored)
+        continue;
+      for (int64_t axis : requestedAxes)
+        if (containsAxis(value.getType(), axis) &&
+            axis != storage->laneAxis &&
+            !storage->coalescedLaneAxes.contains(axis))
+          return false;
+      continue;
+    }
+    if (!layoutPreservingPointwise(definition))
+      continue;
+    for (mlir::Value operand : definition->getOperands()) {
+      auto operandType = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+      auto resultType = mlir::dyn_cast<riscv::ValueType>(value.getType());
+      if (operandType && resultType &&
+          operandType.getShape() == resultType.getShape() &&
+          operandType.getAxisIds() == resultType.getAxisIds())
+        worklist.push_back(operand);
+    }
+  }
+  return true;
 }
 
 int64_t freeAxisSharedByOneOperand(mlir::Value lhs, mlir::Value rhs) {
@@ -483,30 +567,50 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
       roles.laneAxis = axis;
       break;
     }
-  // The first free axis eliminated immediately after a contraction belongs to
-  // the same lane-local partial.  Later nested reductions describe a distinct
-  // partial-combine hierarchy and therefore remain register replicas.  Folding
-  // every downstream reduction axis into one large LMUL value destroys that
-  // author-visible hierarchy and forces avoidable register-to-lane packing.
-  if (roles.laneAxis)
-    if (auto freeAxis = downstreamImmediateReducedFreeAxis(
-            operation.getOperation(), reduction);
-        freeAxis && *freeAxis != roles.laneAxis &&
-        containsAxis(value.getType(), *freeAxis)) {
-      roles.coalescedLaneAxes.insert(*freeAxis);
-      roles.replicaAxes.erase(*freeAxis);
-    }
+  // A contraction result and its operands deliberately have different physical
+  // layouts.  The result preserves every later reduction coordinate as an
+  // independent register partial.  An operand may instead carry those same
+  // coordinates beside K in one wide lane window, from which the typed partial
+  // program takes narrow slices.  This is the RVV analogue of a Triton
+  // DotOperandEncoding whose parent is the accumulator encoding: it changes the
+  // operand representation, not the accumulator topology.
+  const bool isOperand = value == operation.getLhs() || value == operation.getRhs();
+  auto reducedFreeAxes =
+      downstreamReducedFreeAxes(operation.getOperation(), reduction);
+  if (roles.laneAxis && isOperand)
+    for (int64_t freeAxis : reducedFreeAxes)
+      if (freeAxis != roles.laneAxis && containsAxis(value.getType(), freeAxis) &&
+          storageSupportsLaneAxes(value, llvm::ArrayRef<int64_t>(freeAxis))) {
+        roles.coalescedLaneAxes.insert(freeAxis);
+        roles.replicaAxes.erase(freeAxis);
+      }
   // A shaped contraction result no longer contains the eliminated reduction
-  // axis.  Its surviving free axes form a register/time tuple; a downstream
-  // pointwise scale or reduction must not re-anchor one of those free axes as
-  // the contraction's SIMD lane merely because that consumer uses lanes.
+  // axis.  When exactly one operand contributes a surviving free axis, that
+  // axis is the contraction's reusable output cohort and preserves the same
+  // lane organization already chosen on that operand.  A scalar-output dot has
+  // no such axis and remains a register tuple.
   if (!roles.laneAxis) {
+    if (auto reducedFreeAxis = downstreamImmediateReducedFreeAxis(
+            operation.getOperation(), reduction);
+        reducedFreeAxis && containsAxis(value.getType(), *reducedFreeAxis)) {
+      roles.registerTuple = true;
+      addSmallReplicas(value, roles);
+      return;
+    }
+    const int64_t freeLane =
+        freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs());
+    if (freeLane && containsAxis(value.getType(), freeLane)) {
+      roles.laneAxis = freeLane;
+      addSmallReplicas(value, roles, freeLane);
+      return;
+    }
     roles.registerTuple = true;
     addSmallReplicas(value, roles);
     return;
   }
   for (int64_t axis : riscv_internal::logicalAxes(value.getType()))
     if (!llvm::is_contained(reduction, axis) && axis != roles.laneAxis &&
+        !roles.coalescedLaneAxes.contains(axis) &&
         riscv_internal::physicalExtent(value, axis) > 0 &&
         riscv_internal::physicalExtent(value, axis) <= 16)
       roles.replicaAxes.insert(axis);
@@ -1201,7 +1305,12 @@ public:
         // filtered by mergeRoles rather than rediscovered from source shape.
         changed |= mergeRoles(roles[input], result, roles[result]);
         Roles projectedResult = roles[result];
-        if (projectedResult.registerTuple) {
+        const bool shapedGather = llvm::any_of(
+            extract.getSelectors(), [](mlir::Attribute selector) {
+              return mlir::cast<mlir::StringAttr>(selector).getValue() ==
+                     "gather";
+            });
+        if (projectedResult.registerTuple && !shapedGather) {
           auto inputAxes = riscv_internal::logicalAxes(input.getType());
           auto resultAxes = riscv_internal::logicalAxes(result.getType());
           if (llvm::any_of(inputAxes, [&](int64_t axis) {
@@ -1652,16 +1761,33 @@ private:
               input.getDefiningOp()))
         continue;
       const auto axes = inputType.getAxisIds().asArrayRef();
+      const auto time = inputType.getLayout().getTimeFactors().asArrayRef();
       const auto lane = inputType.getLayout().getLaneFactors().asArrayRef();
+      const auto replica =
+          inputType.getLayout().getReplicaFactors().asArrayRef();
       auto position = llvm::find(axes, eliminated);
       if (position == axes.end())
         continue;
       const size_t ordinal = static_cast<size_t>(position - axes.begin());
       if (ordinal < lane.size() && lane[ordinal] > 1)
         continue;
-      if (inputType.getLayout().getCarrier() != "scalar") {
+      // A reduction may consume an issue-time coordinate while preserving an
+      // independent SIMD coordinate carried by a surviving free axis.  This is
+      // already a closed parent representation: the reduction removes only the
+      // selected time factor and does not require a lane transpose.  Treating
+      // every non-lane reduction as a layout conflict used to reject grouped
+      // reductions whose target lowering explicitly accumulates their streams.
+      if (inputType.getLayout().getCarrier() == "rvv" &&
+          ordinal < time.size() && time[ordinal] > 1 &&
+          ordinal < replica.size() && replica[ordinal] == 1 &&
+          llvm::any_of(llvm::enumerate(lane), [&](auto entry) {
+            return entry.index() != ordinal && entry.value() > 1;
+          }))
+        continue;
+      if (inputType.getLayout().getCarrier() != "scalar" &&
+          inputType.getLayout().getCarrier() != "rvv") {
         auto diagnostic = reduce.emitError(
-            "reduction layout conflict requires an unsupported non-scalar lane remap");
+            "reduction layout conflict has neither a lane nor a time-axis realization");
         if (mlir::Operation *definition = input.getDefiningOp())
           diagnostic << "; producer=" << definition->getName();
         diagnostic << "; layout=" << inputType.getLayout();
@@ -1671,16 +1797,44 @@ private:
       Roles consumerRoles;
       consumerRoles.anchored = true;
       consumerRoles.fullLaneExtent = true;
-      consumerRoles.laneAxis = eliminated;
-      addSmallReplicas(input, consumerRoles, eliminated);
-      const int64_t extent =
+      auto resultType =
+          mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
+      int64_t connectedLaneSpan =
           std::max<int64_t>(1,
                             riscv_internal::physicalExtent(input, eliminated));
+      if (resultType) {
+        for (auto [axis, resultTime, resultLane, resultReplica] : llvm::zip(
+                 resultType.getAxisIds().asArrayRef(),
+                 resultType.getLayout().getTimeFactors().asArrayRef(),
+                 resultType.getLayout().getLaneFactors().asArrayRef(),
+                 resultType.getLayout().getReplicaFactors().asArrayRef())) {
+          if (resultLane > 1) {
+            if (!consumerRoles.laneAxis)
+              consumerRoles.laneAxis = axis;
+            else
+              consumerRoles.coalescedLaneAxes.insert(axis);
+            if (connectedLaneSpan <=
+                std::numeric_limits<int64_t>::max() / resultLane)
+              connectedLaneSpan *= resultLane;
+          }
+          if (resultReplica > 1)
+            consumerRoles.replicaAxes.insert(axis);
+          if (resultTime > 1)
+            consumerRoles.sequentialAxes.insert(axis);
+        }
+      }
+      if (consumerRoles.laneAxis)
+        consumerRoles.coalescedLaneAxes.insert(eliminated);
+      else
+        consumerRoles.laneAxis = eliminated;
+      addSmallReplicas(input, consumerRoles, consumerRoles.laneAxis);
+      consumerRoles.replicaAxes.erase(eliminated);
       riscv::LayoutAttr required =
-          buildLayout(builder, input, consumerRoles, extent, lmulEighths);
+          buildLayout(builder, input, consumerRoles, connectedLaneSpan,
+                      lmulEighths);
       if (!required) {
         reduce.emitError(
-            "no legal RVV layout can consume the scalar register-axis reduction");
+            "no legal RVV layout can consume the register-axis reduction");
         signalPassFailure();
         continue;
       }
@@ -1816,82 +1970,12 @@ private:
       }
     }
 
-    // A selected widening contraction anchors one common operand layout.  A
-    // storage-contiguous producer may deliberately keep a narrower lane window
-    // and therefore reaches the contraction through an explicit typed
-    // register-to-lane conversion.  This is the same conflict boundary used by
-    // pointwise operations above; do not force the compute layout back through
-    // the memory edge.
-    llvm::SmallVector<mlir::Operation *> wideningContractions;
-    getOperation().walk([&](mlir::Operation *operation) {
-      if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
-                     riscv::OuterContractOp>(operation))
-        return;
-      auto implementation =
-          operation->getAttrOfType<riscv::ImplementationAttr>("implementation");
-      if (implementation && implementation.getFamily() == "widen-dot")
-        wideningContractions.push_back(operation);
-    });
-    for (mlir::Operation *operation : wideningContractions) {
-      auto lhs = mlir::dyn_cast<riscv::ValueType>(operation->getOperand(0).getType());
-      auto rhs = mlir::dyn_cast<riscv::ValueType>(operation->getOperand(1).getType());
-      if (!lhs || !rhs || lhs.getElementType() != rhs.getElementType() ||
-          lhs.getShape() != rhs.getShape() || lhs.getAxisIds() != rhs.getAxisIds())
-        continue;
-      auto lhsLanes = riscv_internal::staticProduct(
-          lhs.getLayout().getLaneFactors().asArrayRef());
-      auto rhsLanes = riscv_internal::staticProduct(
-          rhs.getLayout().getLaneFactors().asArrayRef());
-      if (!lhsLanes || !rhsLanes || *lhsLanes <= 0 || *rhsLanes <= 0 ||
-          *lhsLanes == *rhsLanes)
-        continue;
-      llvm::SmallVector<int64_t> contractionReductionAxes;
-      if (auto over =
-              operation->getAttrOfType<mlir::DenseI64ArrayAttr>("over"))
-        contractionReductionAxes.assign(over.asArrayRef().begin(),
-                                        over.asArrayRef().end());
-      auto immediate = downstreamImmediateReducedFreeAxis(
-          operation, contractionReductionAxes);
-      auto extraLaneAxes = [&](riscv::ValueType type) {
-        int64_t extras = 0;
-        for (auto [position, axis] :
-             llvm::enumerate(type.getAxisIds().asArrayRef()))
-          if (type.getLayout().getLaneFactors()[position] > 1 &&
-              !llvm::is_contained(contractionReductionAxes, axis) &&
-              (!immediate || axis != *immediate))
-            ++extras;
-        return extras;
-      };
-      const int64_t lhsExtras = extraLaneAxes(lhs);
-      const int64_t rhsExtras = extraLaneAxes(rhs);
-      // The explicit nested reduction tree fixes which free coordinate joins
-      // the contraction lanes.  When one operand's memory mapping has flattened
-      // additional outer partial axes into lanes, convert that operand back to
-      // the contraction topology instead of forcing every other operand into
-      // the larger flattened register group.  If both already preserve the
-      // same hierarchy, retain the wider common issue shape.
-      const unsigned sourceIndex =
-          lhsExtras != rhsExtras ? (lhsExtras > rhsExtras ? 0 : 1)
-                                 : (*lhsLanes < *rhsLanes ? 0 : 1);
-      auto source = sourceIndex ? rhs : lhs;
-      auto target = sourceIndex ? lhs : rhs;
-      if (source.getLayout().getCarrier() != "rvv" ||
-          target.getLayout().getCarrier() != "rvv" ||
-          source.getLayout().getSew() != target.getLayout().getSew())
-        continue;
-      mlir::Value sourceValue = operation->getOperand(sourceIndex);
-      mlir::Type requiredType =
-          riscv_internal::withLayout(sourceValue.getType(), target.getLayout());
-      mlir::OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPoint(operation);
-      auto conversion = builder.create<riscv::ConvertLayoutOp>(
-          operation->getLoc(), requiredType, sourceValue,
-          riscv_internal::layoutConversion(builder, source.getLayout(),
-                                           target.getLayout()),
-          riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
-      riscv_internal::copyOrigin(operation, conversion);
-      operation->setOperand(sourceIndex, conversion.getResult());
-    }
+    // Structured products do not require one common full operand layout.  Each
+    // operand owns its storage-compatible DotOperand-style representation; the
+    // selected widening operation requires only equal reduction slices.  The
+    // later partial plan records the exact part and lane offset taken from each
+    // operand.  Forcing the wider operand through the narrower layout (or vice
+    // versa) duplicates loads and recreates a second layout owner here.
 
     llvm::SmallVector<riscv::ExtractOp> gathers;
     getOperation().walk([&](riscv::ExtractOp extract) {

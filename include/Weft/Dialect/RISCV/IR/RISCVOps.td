@@ -183,7 +183,7 @@ def WeftRISCV_ScheduleAttr : WeftRISCV_Attr<"Schedule", "schedule"> {
 def WeftRISCV_PartialTopologyAttr
     : WeftRISCV_Attr<"PartialTopology", "partial_topology"> {
   let parameters = (ins
-    StringRefParameter<"unassigned, sequential_fused, sequential_per_stream, independent, scaled, level_scaled, merged, or layered">:$kind,
+    StringRefParameter<"unassigned, sequential_fused, sequential_per_stream, independent, scaled, reduced_scaled, level_scaled, merged, or layered">:$kind,
     "int64_t":$rootOperand,
     "::mlir::DenseI64ArrayAttr":$partialAxes,
     "::mlir::DenseI64ArrayAttr":$outputAxes,
@@ -199,6 +199,184 @@ def WeftRISCV_PartialTopologyAttr
     `<` $kind `,` $rootOperand `,` $partialAxes `,` $outputAxes `,`
         $sourceSlots `,` $partialSlots `,` $outputReplicas `,` $laneSplit `,`
         $combineArity `,` $slotOrder `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_PackedPlaneMergePlanAttr
+    : WeftRISCV_Attr<"PackedPlaneMergePlan", "packed_plane_merge_plan"> {
+  let parameters = (ins
+    "int64_t":$logicalAxis,
+    "int64_t":$logicalElements,
+    "int64_t":$lowBits,
+    "int64_t":$highBits,
+    "int64_t":$groupSize,
+    "int64_t":$lowLayerBytes,
+    "int64_t":$highLayerBytes,
+    "int64_t":$lowByteOffset,
+    "int64_t":$highByteOffset,
+    "int64_t":$insertBit
+  );
+  let assemblyFormat = [{
+    `<` $logicalAxis `,` $logicalElements `,` $lowBits `,` $highBits `,`
+        $groupSize `,` $lowLayerBytes `,` $highLayerBytes `,`
+        $lowByteOffset `,` $highByteOffset `,` $insertBit `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_PartialLayoutPlanAttr
+    : WeftRISCV_Attr<"PartialLayoutPlan", "partial_layout_plan"> {
+  let parameters = (ins
+    "::mlir::Type":$sourceLhsType,
+    "::mlir::Type":$sourceRhsType,
+    "::mlir::Type":$sourceSlotType,
+    "::mlir::Type":$splitSourceSlotType,
+    "::mlir::Type":$partialSlotType,
+    "::mlir::Type":$widenedSlotType,
+    "::mlir::Type":$reducedSlotType,
+    "::mlir::Type":$vectorSlotType,
+    "::mlir::Type":$sourceSetType,
+    "::mlir::Type":$repackedSetType,
+    "::mlir::Type":$partialSetType,
+    "::mlir::Type":$scaledSetType,
+    "::mlir::Type":$directSetType,
+    "::mlir::Type":$reducedSetType,
+    "::mlir::Type":$scaleCombinedSetType,
+    "::mlir::Type":$fullScaledSetType,
+    "::mlir::DenseI64ArrayAttr":$sourceLhsParts,
+    "::mlir::DenseI64ArrayAttr":$sourceRhsParts,
+    "::mlir::DenseI64ArrayAttr":$sourceLhsOffsets,
+    "::mlir::DenseI64ArrayAttr":$sourceRhsOffsets
+  );
+  let assemblyFormat = [{
+    `<` $sourceLhsType `,` $sourceRhsType `,`
+        $sourceSlotType `,` $splitSourceSlotType `,` $partialSlotType `,`
+        $widenedSlotType `,` $reducedSlotType `,` $vectorSlotType `,`
+        $sourceSetType `,` $repackedSetType `,` $partialSetType `,`
+        $scaledSetType `,` $directSetType `,` $reducedSetType `,`
+        $scaleCombinedSetType `,` $fullScaledSetType `,`
+        $sourceLhsParts `,` $sourceRhsParts `,`
+        $sourceLhsOffsets `,` $sourceRhsOffsets `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_LayeredStreamGeometryAttr
+    : WeftRISCV_Attr<"LayeredStreamGeometry", "layered_stream_geometry"> {
+  let parameters = (ins
+    "int64_t":$axis,
+    "int64_t":$groupSize,
+    "int64_t":$layerSize,
+    "int64_t":$laneCount,
+    "int64_t":$streamCount,
+    "int64_t":$replicaCount,
+    "::mlir::DenseI64ArrayAttr":$windowForStream,
+    "::mlir::DenseI64ArrayAttr":$representativeStreamForWindow,
+    "::mlir::DenseI64ArrayAttr":$physicalLayerForStream,
+    "::mlir::DenseI64ArrayAttr":$physicalLayerForLogicalLayer,
+    "::mlir::DenseI64ArrayAttr":$shiftAmountForLogicalLayer,
+    "::mlir::DenseI64ArrayAttr":$maskValueForLogicalLayer,
+    "::mlir::DenseI64ArrayAttr":$shiftAmountForStream,
+    "::mlir::DenseI64ArrayAttr":$maskValueForStream,
+    "::mlir::DenseI64ArrayAttr":$groupForWindow,
+    "::mlir::DenseI64ArrayAttr":$withinForWindow
+  );
+  let assemblyFormat = [{
+    `<` $axis `,` $groupSize `,` $layerSize `,` $laneCount `,`
+        $streamCount `,` $replicaCount `,` $windowForStream `,`
+        $representativeStreamForWindow `,` $physicalLayerForStream `,`
+        $physicalLayerForLogicalLayer `,`
+        $shiftAmountForLogicalLayer `,` $maskValueForLogicalLayer `,`
+        $shiftAmountForStream `,` $maskValueForStream `,`
+        $groupForWindow `,` $withinForWindow `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_StorageWindowPlanAttr
+    : WeftRISCV_Attr<"StorageWindowPlan", "storage_window_plan"> {
+  let parameters = (ins
+    StringRefParameter<"unit, strided, repeat, or layered">:$kind,
+    "int64_t":$reductionAxis,
+    "int64_t":$projectionBase,
+    "int64_t":$projectionStride,
+    "int64_t":$projectionRepeat,
+    "int64_t":$projectionExtent,
+    "int64_t":$offsetAlignment,
+    "int64_t":$recordElements,
+    "int64_t":$byteOffset,
+    "int64_t":$elementBits,
+    "int64_t":$groupSize,
+    "int64_t":$layerSize,
+    "int64_t":$physicalLayerBase,
+    "int64_t":$physicalLayerStep,
+    "int64_t":$shiftBase,
+    "int64_t":$shiftStep,
+    "int64_t":$maskValue
+  );
+  let assemblyFormat = [{
+    `<` $kind `,` $reductionAxis `,` $projectionBase `,`
+        $projectionStride `,` $projectionRepeat `,` $projectionExtent `,`
+        $offsetAlignment `,` $recordElements `,` $byteOffset `,`
+        $elementBits `,` $groupSize `,` $layerSize `,`
+        $physicalLayerBase `,` $physicalLayerStep `,` $shiftBase `,`
+        $shiftStep `,` $maskValue `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_LayeredPartialPlanAttr
+    : WeftRISCV_Attr<"LayeredPartialPlan", "layered_partial_plan"> {
+  let parameters = (ins
+    "int64_t":$rootIndex,
+    "::mlir::Type":$decodedWindowType,
+    "::mlir::Type":$storageWindowType,
+    "::mlir::Type":$accumulatorType,
+    "::mlir::ArrayAttr":$rootWindowTypes,
+    "::mlir::ArrayAttr":$rootStoragePlans,
+    "::weft::riscv::LayeredStreamGeometryAttr":$geometry
+  );
+  let assemblyFormat = [{
+    `<` $rootIndex `,` $decodedWindowType `,` $storageWindowType `,`
+        $accumulatorType `,` $rootWindowTypes `,` $rootStoragePlans `,`
+        $geometry `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_GroupedMacPlanAttr
+    : WeftRISCV_Attr<"GroupedMacPlan", "grouped_mac_plan"> {
+  let parameters = (ins
+    StringRefParameter<"reduce, compact, or fragmented">:$kind,
+    "int64_t":$group,
+    "int64_t":$unroll,
+    "int64_t":$reductionAxis,
+    "int64_t":$storageGroup,
+    "int64_t":$storageLayer,
+    "int64_t":$logicalWidth,
+    "int64_t":$lhsBitOffsetBytes,
+    "int64_t":$rhsBitOffsetBytes,
+    "int64_t":$recordElements,
+    "int64_t":$interleaveRows,
+    StringRefParameter<"unit or strided">:$loadForm,
+    "int64_t":$rowStrideAxis,
+    "int64_t":$termByteStride,
+    "int64_t":$physicalLayerBase,
+    "int64_t":$physicalLayerStep,
+    "int64_t":$shiftBase,
+    "int64_t":$shiftStep,
+    "int64_t":$maskValue,
+    "::mlir::DenseI64ArrayAttr":$termOrder
+  );
+  let assemblyFormat = [{
+    `<` $kind `,` $group `,` $unroll `,` $reductionAxis `,`
+        $storageGroup `,` $storageLayer `,` $logicalWidth `,`
+        $lhsBitOffsetBytes `,` $rhsBitOffsetBytes `,` $recordElements `,`
+        $interleaveRows `,` $loadForm `,` $rowStrideAxis `,`
+        $termByteStride `,` $physicalLayerBase `,` $physicalLayerStep `,`
+        $shiftBase `,` $shiftStep `,`
+        $maskValue `,` $termOrder `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -729,7 +907,8 @@ def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout"> {
+def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_ConversionAttr:$conversion,
                        OptionalAttr<WeftRISCV_AccessAttr>:$source_access,
@@ -844,6 +1023,16 @@ def WeftRISCV_RVVBitplaneMergeOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_PackedPlaneMergeOp
+    : WeftRISCV_Op<"packed_plane_merge", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$low_field,
+                       WeftRISCV_ValueType:$high_field,
+                       WeftRISCV_PackedPlaneMergePlanAttr:$plan,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVBitmaskDecodeOp
     : WeftRISCV_Op<"rvv_bitmask_decode", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
@@ -858,11 +1047,8 @@ def WeftRISCV_RVVBitmaskDecodeOp
 def WeftRISCV_RVVGroupedMacReduceOp
     : WeftRISCV_Op<"rvv_grouped_mac_reduce", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
-                       I64Attr:$group, I64Attr:$unroll,
-                       I64Attr:$reduction_axis,
                        WeftRISCV_LayoutAttr:$partial_layout,
-                       WeftRISCV_AccessAttr:$lhs_access,
-                       WeftRISCV_AccessAttr:$rhs_access,
+                       WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
@@ -871,12 +1057,9 @@ def WeftRISCV_RVVGroupedMacReduceOp
 def WeftRISCV_RVVGroupedMacLoadOp
     : WeftRISCV_Op<"rvv_grouped_mac_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$group_index,
-                       Index:$active_terms, I64Attr:$group,
-                       I64Attr:$unroll, I64Attr:$reduction_axis,
-                       StrAttr:$window_form,
+                       Index:$active_terms,
                        WeftRISCV_LayoutAttr:$partial_layout,
-                       WeftRISCV_AccessAttr:$lhs_access,
-                       WeftRISCV_AccessAttr:$rhs_access,
+                       WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_WindowType:$result);
   let hasVerifier = 1;
@@ -927,6 +1110,8 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        DenseI64ArrayAttr:$rhs_lane_offsets,
                        DenseI64ArrayAttr:$lhs_parts,
                        DenseI64ArrayAttr:$rhs_parts,
+                       OptionalAttr<WeftRISCV_PartialLayoutPlanAttr>:$partial_layout_plan,
+                       OptionalAttr<WeftRISCV_LayeredPartialPlanAttr>:$layered_partial_plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
@@ -980,12 +1165,7 @@ def WeftRISCV_RVVStorageWindowOp
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        Index:$logical_offset,
-                       I64Attr:$reduction_axis,
-                       I64Attr:$projection_base,
-                       I64Attr:$projection_stride,
-                       I64Attr:$projection_repeat,
-                       I64Attr:$projection_extent,
-                       I64Attr:$offset_alignment,
+                       WeftRISCV_StorageWindowPlanAttr:$plan,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
@@ -997,9 +1177,7 @@ def WeftRISCV_RVVLayeredStorageLoadOp
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        Index:$window_index,
-                       I64Attr:$reduction_axis,
-                       I64Attr:$projection_base,
-                       I64Attr:$projection_extent,
+                       WeftRISCV_StorageWindowPlanAttr:$plan,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_LayeredWindowType:$result);
@@ -1010,6 +1188,9 @@ def WeftRISCV_RVVLayeredStorageDecodeOp
     : WeftRISCV_Op<"rvv_layered_storage_decode", [Pure]> {
   let arguments = (ins WeftRISCV_LayeredWindowType:$window,
                        I64Attr:$layer,
+                       I64Attr:$physical_layer,
+                       I64Attr:$shift_amount,
+                       I64Attr:$mask_value,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
@@ -1019,12 +1200,15 @@ def WeftRISCV_RVVReplicaStorageLoadOp
     : WeftRISCV_Op<"rvv_replica_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        AnyType:$logical_base,
-                       I64Attr:$logical_base_multiple,
-                       I64Attr:$lane_axis,
-                       I64Attr:$logical_span,
+                       WeftRISCV_StorageWindowPlanAttr:$plan,
                        DenseI64ArrayAttr:$window_offsets,
+                       DenseI64ArrayAttr:$record_replica_for_window,
                        DenseI64ArrayAttr:$window_for_part,
                        DenseI64ArrayAttr:$layer_for_part,
+                       DenseI64ArrayAttr:$physical_layer_for_part,
+                       DenseI64ArrayAttr:$shift_offset_for_part,
+                       DenseI64ArrayAttr:$shift_base_factor_for_part,
+                       DenseI64ArrayAttr:$mask_value_for_part,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
@@ -1180,6 +1364,10 @@ def WeftRISCV_RVVLayeredWindowOp
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$point,
                        WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_StorageWindowPlanAttr:$plan,
+                       DenseI64ArrayAttr:$physical_layer_for_result,
+                       DenseI64ArrayAttr:$shift_for_result,
+                       DenseI64ArrayAttr:$mask_for_result,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$first,
                       WeftRISCV_ValueType:$second);
@@ -1190,6 +1378,7 @@ def WeftRISCV_RVVLayeredStreamOp
     : WeftRISCV_Op<"rvv_layered_stream", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LayeredStreamGeometryAttr:$geometry,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
@@ -1206,6 +1395,7 @@ def WeftRISCV_RVVProjectedLayeredStreamOp
                        I64Attr:$projection_repeat,
                        I64Attr:$projection_extent,
                        WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LayeredStreamGeometryAttr:$geometry,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;

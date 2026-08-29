@@ -52,201 +52,14 @@ std::optional<size_t> axisPosition(riscv::ValueType value, int64_t axis) {
   return static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin());
 }
 
-struct WidenDotLaneSlicePlan {
-  int64_t reductionLanes = 0;
-  int64_t reductionStreams = 0;
-  int64_t sliceLmulEighths = 0;
-  llvm::SmallVector<int64_t> offsets;
-  llvm::SmallVector<int64_t> parts;
-};
+using WidenDotLaneSlicePlan = riscv_internal::WidenDotLaneSlicePlan;
 
 std::optional<WidenDotLaneSlicePlan>
 planWidenDotLaneSlices(riscv::ValueType operand, riscv::ValueType result,
                        llvm::ArrayRef<int64_t> reductionAxes,
                        riscv::TargetAttr target) {
-  auto layout = operand.getLayout();
-  auto lanes = riscv_internal::staticProduct(
-      layout.getLaneFactors().asArrayRef());
-  if (!lanes || *lanes <= 0)
-    return std::nullopt;
-
-  int64_t reductionLanes = 1;
-  bool sawFreeLane = false;
-  for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
-       position >= 0; --position) {
-    const int64_t lane = layout.getLaneFactors()[position];
-    if (lane <= 1)
-      continue;
-    const int64_t axis = operand.getAxisIds()[position];
-    if (llvm::is_contained(reductionAxes, axis)) {
-      // A contiguous vector slice can retain a reduction only when all lane
-      // coordinates belonging to that reduction are the innermost lane
-      // dimensions.  Other geometries need an explicit permutation first.
-      if (sawFreeLane ||
-          reductionLanes > std::numeric_limits<int64_t>::max() / lane)
-        return std::nullopt;
-      reductionLanes *= lane;
-    } else {
-      sawFreeLane = true;
-    }
-  }
-  if (reductionLanes <= 0 || *lanes % reductionLanes)
-    return std::nullopt;
-
-  const int64_t numerator =
-      product({layout.getLmulEighths(), reductionLanes});
-  if (numerator <= 0 || numerator % *lanes)
-    return std::nullopt;
-  int64_t sliceLmul = numerator / *lanes;
-  // RVV register-group extraction has no fractional destination form.  When a
-  // logical reduction slice is smaller than one architectural vector register
-  // but lives inside a larger group, select an m1 carrier and retain the
-  // sub-register lane offset in the typed slice plan.  Terminal emission then
-  // performs group extraction followed by an intra-register slide when needed.
-  if (sliceLmul < 8 && layout.getLmulEighths() > sliceLmul)
-    sliceLmul = 8;
-  if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
-                          sliceLmul))
-    return std::nullopt;
-
-  int64_t outputParts = 1;
-  if (result) {
-    if (result.getLayout().getCarrier() != "scalar")
-      return std::nullopt;
-    outputParts = product(result.getLayout().getReplicaFactors());
-    if (outputParts <= 0)
-      return std::nullopt;
-  }
-
-  WidenDotLaneSlicePlan plan;
-  plan.reductionLanes = reductionLanes;
-  plan.sliceLmulEighths = sliceLmul;
-  llvm::SmallVector<int64_t> reductionTimeExtents;
-  for (int64_t axis : reductionAxes) {
-    auto position = axisPosition(operand, axis);
-    if (!position)
-      return std::nullopt;
-    const int64_t extent = layout.getTimeFactors()[*position];
-    if (extent <= 0)
-      return std::nullopt;
-    reductionTimeExtents.push_back(extent);
-  }
-  plan.reductionStreams =
-      riscv_internal::staticProduct(reductionTimeExtents).value_or(-1);
-  const int64_t totalStreams = product(layout.getTimeFactors());
-  if (plan.reductionStreams <= 0 || totalStreams <= 0)
-    return std::nullopt;
-
-  for (int64_t outputPart = 0; outputPart < outputParts; ++outputPart) {
-    llvm::SmallVector<int64_t> resultCoordinates(
-        result ? result.getAxisIds().size() : 0, 0);
-    int64_t remaining = outputPart;
-    if (result) {
-      for (int64_t position = static_cast<int64_t>(result.getAxisIds().size()) - 1;
-           position >= 0; --position) {
-        const int64_t replica =
-            result.getLayout().getReplicaFactors()[position];
-        if (replica <= 0)
-          return std::nullopt;
-        resultCoordinates[position] = remaining % replica;
-        remaining /= replica;
-      }
-      if (remaining)
-        return std::nullopt;
-    }
-
-    auto resultCoordinateForAxis = [&](int64_t axis) -> std::optional<int64_t> {
-      if (!result)
-        return std::nullopt;
-      auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
-      if (found == result.getAxisIds().asArrayRef().end())
-        return std::nullopt;
-      return resultCoordinates[static_cast<size_t>(
-          found - result.getAxisIds().asArrayRef().begin())];
-    };
-
-    int64_t laneOffset = 0;
-    int64_t laneStride = 1;
-    for (int64_t position = static_cast<int64_t>(operand.getAxisIds().size()) - 1;
-         position >= 0; --position) {
-      const int64_t lane = layout.getLaneFactors()[position];
-      if (lane <= 1)
-        continue;
-      const int64_t axis = operand.getAxisIds()[position];
-      int64_t coordinate = 0;
-      if (!llvm::is_contained(reductionAxes, axis)) {
-        auto logicalCoordinate = resultCoordinateForAxis(axis);
-        if (!logicalCoordinate || *logicalCoordinate < 0)
-          return std::nullopt;
-        coordinate = *logicalCoordinate % lane;
-      }
-      if (coordinate > 0 &&
-          laneOffset > std::numeric_limits<int64_t>::max() -
-                           coordinate * laneStride)
-        return std::nullopt;
-      laneOffset += coordinate * laneStride;
-      if (laneStride > std::numeric_limits<int64_t>::max() / lane)
-        return std::nullopt;
-      laneStride *= lane;
-    }
-    if (laneOffset < 0 || laneOffset % reductionLanes ||
-        laneOffset > *lanes - reductionLanes)
-      return std::nullopt;
-    plan.offsets.push_back(laneOffset);
-
-    for (int64_t reductionStream = 0;
-         reductionStream < plan.reductionStreams; ++reductionStream) {
-      llvm::SmallVector<int64_t> reductionCoordinates(reductionAxes.size(), 0);
-      int64_t remainingReduction = reductionStream;
-      for (int64_t index = static_cast<int64_t>(reductionAxes.size()) - 1;
-           index >= 0; --index) {
-        reductionCoordinates[index] =
-            remainingReduction % reductionTimeExtents[index];
-        remainingReduction /= reductionTimeExtents[index];
-      }
-      if (remainingReduction)
-        return std::nullopt;
-
-      int64_t streamPart = 0;
-      int64_t registerPart = 0;
-      for (size_t position = 0; position < operand.getAxisIds().size();
-           ++position) {
-        const int64_t axis = operand.getAxisIds()[position];
-        const int64_t time = layout.getTimeFactors()[position];
-        const int64_t lane = layout.getLaneFactors()[position];
-        const int64_t replica = layout.getReplicaFactors()[position];
-        int64_t timeCoordinate = 0;
-        int64_t replicaCoordinate = 0;
-        if (auto reduction = llvm::find(reductionAxes, axis);
-            reduction != reductionAxes.end()) {
-          timeCoordinate = reductionCoordinates[static_cast<size_t>(
-              reduction - reductionAxes.begin())];
-        } else {
-          auto logicalCoordinate = resultCoordinateForAxis(axis);
-          if (!logicalCoordinate)
-            return std::nullopt;
-          if (lane > 1) {
-            if (replica != 1 || *logicalCoordinate >= time * lane)
-              return std::nullopt;
-            timeCoordinate = *logicalCoordinate / lane;
-          } else {
-            if (*logicalCoordinate >= time * replica)
-              return std::nullopt;
-            timeCoordinate = *logicalCoordinate / replica;
-            replicaCoordinate = *logicalCoordinate % replica;
-          }
-        }
-        streamPart = streamPart * time + timeCoordinate;
-        registerPart = registerPart * replica + replicaCoordinate;
-      }
-      const int64_t physicalPart = registerPart * totalStreams + streamPart;
-      if (physicalPart < 0 ||
-          physicalPart >= resultParts(layout))
-        return std::nullopt;
-      plan.parts.push_back(physicalPart);
-    }
-  }
-  return plan;
+  return riscv_internal::planWidenDotLaneSlices(operand, result, reductionAxes,
+                                                 target);
 }
 
 std::optional<int64_t> constantInteger(mlir::Value value) {
@@ -1505,8 +1318,7 @@ private:
            lhsAccess.getOrder() == "hi_first") &&
           lhsAccess.getBitOffset() % 8 == 0 &&
           rhsAccess.getBitOffset() % 8 == 0 &&
-          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride ||
-           reductionLane) &&
+          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
           outputParts > 0 &&
           riscv::supportsRVVLayout(target, lhsLayout) &&
           riscv::supportsRVVLayout(target, partialLayout) &&
@@ -1557,6 +1369,35 @@ private:
         failed = true;
         continue;
       }
+      auto groupedPlan = [&](llvm::StringRef kind) {
+        llvm::SmallVector<int64_t> termOrder;
+        const int64_t terms =
+            static_cast<int64_t>(mac.getGroup()) * schedule.getUnroll();
+        termOrder.reserve(static_cast<size_t>(terms));
+        for (int64_t term = 0; term < terms; ++term)
+          termOrder.push_back(term);
+        const bool lowFirst = lhsAccess.getOrder() == "lo_first";
+        const bool unitLoad = lhsMemory.getInterleaveRows() > 0;
+        const int64_t layers =
+            lhsAccess.getGroupSize() / lhsAccess.getLayerSize();
+        const int64_t physicalLayerBase = lowFirst ? 0 : layers - 1;
+        const int64_t physicalLayerStep = lowFirst ? 1 : -1;
+        const int64_t shiftBase =
+            physicalLayerBase * lhsInteger.getWidth();
+        const int64_t shiftStep =
+            physicalLayerStep * lhsInteger.getWidth();
+        return riscv::GroupedMacPlanAttr::get(
+            rewriter.getContext(), kind, mac.getGroup(), schedule.getUnroll(),
+            reductionAxis, lhsAccess.getGroupSize(), lhsAccess.getLayerSize(),
+            lhsInteger.getWidth(), lhsAccess.getBitOffset() / 8,
+            rhsAccess.getBitOffset() / 8, lhsMemory.getElements(),
+            lhsMemory.getInterleaveRows(), unitLoad ? "unit" : "strided",
+            unitLoad ? 0 : laneAxis,
+            unitLoad ? lhsMemory.getInterleaveRows() : 1,
+            physicalLayerBase, physicalLayerStep, shiftBase, shiftStep,
+            (int64_t{1} << lhsInteger.getWidth()) - 1,
+            rewriter.getDenseI64ArrayAttr(termOrder));
+      };
       rewriter.setInsertionPoint(reduce);
       if (schedule.getPipelineDepth() == 1 &&
           schedule.getBufferCount() == 1) {
@@ -1571,9 +1412,8 @@ private:
           continue;
         }
         auto grouped = rewriter.create<riscv::RVVGroupedMacReduceOp>(
-            reduce.getLoc(), accumulatorType, lhs, rhs, active, mac.getGroup(),
-            schedule.getUnroll(), reductionAxis, partialLayout, lhsAccess,
-            rhsAccess,
+            reduce.getLoc(), accumulatorType, lhs, rhs, active, partialLayout,
+            groupedPlan("reduce"),
             riscv_internal::leaf(
                 rewriter, "rvv", "grouped-mac-reduce",
                 "rvv.grouped-mac-reduce.u8-s8",
@@ -1641,9 +1481,8 @@ private:
       rewriter.setInsertionPointToStart(loop.getBody());
       auto load = rewriter.create<riscv::RVVGroupedMacLoadOp>(
           reduce.getLoc(), windowType, lhs, rhs, loop.getInductionVar(), active,
-          mac.getGroup(), schedule.getUnroll(), reductionAxis,
-          compactWindow ? "compact" : "fragmented", partialLayout, lhsAccess,
-          rhsAccess,
+          partialLayout,
+          groupedPlan(compactWindow ? "compact" : "fragmented"),
           riscv_internal::leaf(
               rewriter, "rvv", "grouped-mac-load",
               "rvv.grouped-mac-load.u8-s8",
@@ -2337,9 +2176,6 @@ private:
             !riscv::supportsRVVLayout(target, lhsType.getLayout()) ||
             !riscv::supportsRVVLayout(target, rhsType.getLayout()) ||
             lhsType.getLayout().getSew() != rhsType.getLayout().getSew() ||
-            lhsType.getLayout().getLmulEighths() !=
-                rhsType.getLayout().getLmulEighths() ||
-            lhsType.getLayout().getVl() != rhsType.getLayout().getVl() ||
             !lhsLaneSlices || !rhsLaneSlices ||
             lhsLaneSlices->reductionLanes != rhsLaneSlices->reductionLanes ||
             lhsLaneSlices->reductionStreams != rhsLaneSlices->reductionStreams ||
@@ -2424,6 +2260,8 @@ private:
             rewriter.getDenseI64ArrayAttr(rhsLaneSlices->offsets),
             rewriter.getDenseI64ArrayAttr(lhsLaneSlices->parts),
             rewriter.getDenseI64ArrayAttr(rhsLaneSlices->parts),
+            riscv::PartialLayoutPlanAttr(),
+            riscv::LayeredPartialPlanAttr(),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",
                 "rvv.vwmul-vwredsum",
@@ -2778,7 +2616,9 @@ private:
                                 : riscv::LayoutAttr();
       if (!laneLoadLayout || laneLoadLayout.getCarrier() != "rvv") {
         operation->emitError(
-            "contract lane operand has no legal projected RVV representation");
+            "contract lane operand has no legal projected RVV representation")
+            << "; lane=" << laneType << "; projected=" << projectedLaneSeed
+            << "; result_layout=" << resultLayout;
         failed = true;
         rewriter.eraseOp(reductionLoop);
         if (zeroAccumulator)

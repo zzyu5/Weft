@@ -35,6 +35,14 @@ struct IntegerRange {
   int64_t maximum;
 };
 
+struct WidenDotLaneSlicePlan {
+  int64_t reductionLanes = 0;
+  int64_t reductionStreams = 0;
+  int64_t sliceLmulEighths = 0;
+  llvm::SmallVector<int64_t> offsets;
+  llvm::SmallVector<int64_t> parts;
+};
+
 mlir::DenseI64ArrayAttr integers(mlir::Builder &builder,
                                  llvm::ArrayRef<int64_t> values);
 mlir::ArrayAttr strings(mlir::Builder &builder,
@@ -95,8 +103,14 @@ riscv::LayoutAttr layoutOf(mlir::Type type);
 mlir::Type withLayout(mlir::Type type, riscv::LayoutAttr layout);
 int64_t physicalExtent(mlir::Value value, int64_t axis);
 std::string terminalInstruction(mlir::Operation *operation);
+llvm::StringRef layeredStorageDecodeInstruction(int64_t shiftAmount,
+                                                int64_t maskValue);
 
 std::optional<int64_t> staticProduct(llvm::ArrayRef<int64_t> values);
+std::optional<WidenDotLaneSlicePlan>
+planWidenDotLaneSlices(riscv::ValueType operand, riscv::ValueType result,
+                       llvm::ArrayRef<int64_t> reductionAxes,
+                       riscv::TargetAttr target);
 std::string printType(mlir::Type type);
 
 riscv::EncodingDeclOp findEncoding(mlir::Operation *operation,
@@ -118,6 +132,11 @@ riscv::FieldOp sourceField(mlir::Value value);
 riscv::LoadOp sourceLoad(mlir::Value value);
 riscv::AccessAttr accessOf(mlir::Value value);
 riscv::PhysicalPointOp originPoint(mlir::Value value, int64_t axis);
+std::optional<riscv::StorageWindowPlanAttr>
+storageWindowPlan(mlir::Builder &builder, riscv::FieldOp field,
+                  int64_t reductionAxis, int64_t projectionBase,
+                  int64_t projectionStride, int64_t projectionRepeat,
+                  int64_t projectionExtent, int64_t offsetAlignment);
 
 void copyOrigin(mlir::Operation *source, mlir::Operation *target);
 

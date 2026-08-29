@@ -38,6 +38,34 @@ public:
         changed = true;
       }
 
+      // Resource materialization may spill a value whose reload-side slice is
+      // subsequently deleted as a dead physical producer.  The spill writes a
+      // compiler-owned local slot and is unobservable once that slot has no
+      // reader; retaining it would turn a dead representation choice into real
+      // vector stores in the emitted kernel.
+      llvm::SmallVector<riscv::SpillOp> unreadSpills;
+      getOperation().walk([&](riscv::SpillOp spill) {
+        const bool hasReader = llvm::any_of(
+            spill.getSlot().getUsers(),
+            [](mlir::Operation *user) { return !mlir::isa<riscv::SpillOp>(user); });
+        if (!hasReader)
+          unreadSpills.push_back(spill);
+      });
+      for (riscv::SpillOp spill : unreadSpills) {
+        spill.erase();
+        changed = true;
+      }
+      llvm::SmallVector<riscv::LocalAllocOp> deadSpillSlots;
+      getOperation().walk([&](riscv::LocalAllocOp allocation) {
+        if (allocation.getResult().use_empty() &&
+            allocation.getResult().getType().getPurpose() == "spill")
+          deadSpillSlots.push_back(allocation);
+      });
+      for (riscv::LocalAllocOp allocation : deadSpillSlots) {
+        allocation.erase();
+        changed = true;
+      }
+
       llvm::SmallVector<mlir::Operation *> deadProducers;
       getOperation().walk([&](mlir::Operation *operation) {
         if (operation != getOperation() && mlir::isOpTriviallyDead(operation))

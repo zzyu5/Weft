@@ -58,6 +58,8 @@ from weft.std.mul_mat import (
     mul_mat_q2_k_group_reduced_decode,
     mul_mat_q3_k,
     mul_mat_q3_k_decode,
+    mul_mat_q3_k_predecoded_scales,
+    mul_mat_q3_k_predecoded_scales_decode,
     mul_mat_q4_0,
     mul_mat_q4_0_decode,
     mul_mat_q4_1,
@@ -252,6 +254,20 @@ def production_mul_mat_q3_k_decode(
     W: View[Q3_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
 ):
     mul_mat_q3_k_decode(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q3_k_predecoded_scales(
+    W: View[Q3_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
+):
+    mul_mat_q3_k_predecoded_scales(W, X, Xq, Y)
+
+
+@weft.kernel
+def production_mul_mat_q3_k_predecoded_scales_decode(
+    W: View[Q3_K, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)], Y: View[f32, (M, N)]
+):
+    mul_mat_q3_k_predecoded_scales_decode(W, X, Xq, Y)
 
 
 @weft.kernel

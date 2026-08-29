@@ -41,6 +41,7 @@ struct BitplaneRelation {
   riscv::FieldOp plane;
   int64_t insertBit = 0;
   llvm::StringRef instruction;
+  riscv::PackedPlaneMergePlanAttr packedPlan;
 };
 
 struct BitmaskRelation {
@@ -150,7 +151,94 @@ matchLogicalBitplane(riscv::BinaryOp merge, mlir::Value low,
   if (!encoding || riscv_internal::interleaveRows(plane, encoding) != 0)
     return std::nullopt;
   return BitplaneRelation{low, plane, insertBit,
-                          "rvv.bitplane-merge.mask"};
+                          "rvv.bitplane-merge.mask", {}};
+}
+
+riscv::FieldOp sourceSubByteField(mlir::Value value) {
+  value = riscv_internal::stripRepresentationConversions(value);
+  if (auto widen = value.getDefiningOp<riscv::WidenOp>())
+    value = riscv_internal::stripRepresentationConversions(widen.getInput());
+  else if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    value = riscv_internal::stripRepresentationConversions(cast.getInput());
+  return riscv_internal::sourceField(value);
+}
+
+std::optional<BitplaneRelation>
+matchPackedPlaneMerge(riscv::BinaryOp merge, mlir::Value low,
+                      riscv::BinaryOp shiftHigh, int64_t insertBit) {
+  auto lowField = sourceSubByteField(low);
+  auto highField = sourceSubByteField(shiftHigh.getLhs());
+  auto lowType = lowField
+                     ? mlir::dyn_cast<riscv::ValueType>(lowField.getResult().getType())
+                     : riscv::ValueType();
+  auto highType = highField
+                      ? mlir::dyn_cast<riscv::ValueType>(highField.getResult().getType())
+                      : riscv::ValueType();
+  auto resultType = mlir::dyn_cast<riscv::ValueType>(merge.getResult().getType());
+  auto lowInteger = lowType
+                        ? mlir::dyn_cast<mlir::IntegerType>(lowType.getElementType())
+                        : mlir::IntegerType();
+  auto highInteger = highType
+                         ? mlir::dyn_cast<mlir::IntegerType>(highType.getElementType())
+                         : mlir::IntegerType();
+  auto resultInteger =
+      resultType
+          ? mlir::dyn_cast<mlir::IntegerType>(resultType.getElementType())
+          : mlir::IntegerType();
+  if (!lowField || !highField || lowField.getOwner() != highField.getOwner() ||
+      !lowType || !highType || !resultType || !lowInteger ||
+      lowInteger.isSigned() || !highInteger || highInteger.isSigned() ||
+      !resultInteger || resultInteger.isSigned() || resultInteger.getWidth() != 8 ||
+      lowType.getShape() != resultType.getShape() ||
+      highType.getShape() != resultType.getShape() ||
+      lowType.getAxisIds() != resultType.getAxisIds() ||
+      highType.getAxisIds() != resultType.getAxisIds() ||
+      resultType.getLayout().getCarrier() != "scalar")
+    return std::nullopt;
+
+  riscv_internal::FieldFacts lowFacts = riscv_internal::fieldFacts(lowField);
+  riscv_internal::FieldFacts highFacts = riscv_internal::fieldFacts(highField);
+  if (lowFacts.mapping != "grouped_layered" ||
+      highFacts.mapping != "grouped_layered" || lowFacts.logicalRank != 1 ||
+      highFacts.logicalRank != 1 || lowFacts.group != highFacts.group ||
+      lowFacts.group <= 0 || lowFacts.layer <= 0 || highFacts.layer <= 0 ||
+      lowFacts.group * lowInteger.getWidth() != lowFacts.layer * 8 ||
+      highFacts.group * highInteger.getWidth() != highFacts.layer * 8 ||
+      lowFacts.layer % 4 || highFacts.layer % 4 ||
+      lowFacts.bitOffset % 8 || highFacts.bitOffset % 8 ||
+      lowFacts.order != "lo_first" || highFacts.order != "lo_first" ||
+      insertBit < lowInteger.getWidth() ||
+      insertBit + highInteger.getWidth() > 8)
+    return std::nullopt;
+  auto logicalAxes = lowType.getAxisIds().asArrayRef().take_back(1);
+  if (logicalAxes.empty())
+    return std::nullopt;
+  const int64_t logicalAxis = logicalAxes.front();
+  auto position = llvm::find(resultType.getAxisIds().asArrayRef(), logicalAxis);
+  if (position == resultType.getAxisIds().asArrayRef().end())
+    return std::nullopt;
+  const size_t ordinal = static_cast<size_t>(
+      position - resultType.getAxisIds().asArrayRef().begin());
+  if (resultType.getShape()[ordinal] != lowFacts.group ||
+      resultType.getLayout().getTimeFactors()[ordinal] != 1 ||
+      resultType.getLayout().getLaneFactors()[ordinal] != 1 ||
+      resultType.getLayout().getReplicaFactors()[ordinal] != lowFacts.group)
+    return std::nullopt;
+  auto owner = mlir::dyn_cast<riscv::ValueType>(lowField.getOwner().getType());
+  auto encoding = owner ? mlir::dyn_cast<kernel::EncodingType>(
+                              riscv_internal::logicalElement(owner))
+                        : kernel::EncodingType();
+  if (!encoding || riscv_internal::interleaveRows(lowField, encoding) != 0 ||
+      riscv_internal::interleaveRows(highField, encoding) != 0)
+    return std::nullopt;
+
+  auto plan = riscv::PackedPlaneMergePlanAttr::get(
+      merge.getContext(), logicalAxis, lowFacts.group, lowInteger.getWidth(),
+      highInteger.getWidth(), lowFacts.group, lowFacts.layer, highFacts.layer,
+      lowFacts.bitOffset / 8, highFacts.bitOffset / 8, insertBit);
+  return BitplaneRelation{lowField.getResult(), highField, insertBit,
+                          "scalar.packed-plane-merge.words",
+                          plan};
 }
 
 std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
@@ -165,6 +253,10 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
   auto insertBit = riscv_internal::constantInt(shiftHigh.getRhs());
   if (!insertBit || *insertBit <= 0 || *insertBit >= 8)
     return std::nullopt;
+
+  if (auto packed =
+          matchPackedPlaneMerge(merge, low, shiftHigh, *insertBit))
+    return packed;
 
   if (auto logical = matchLogicalBitplane(merge, low, shiftHigh, *insertBit))
     return logical;
@@ -309,7 +401,7 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
     return std::nullopt;
   }
 
-  return BitplaneRelation{low, plane, *insertBit, instruction};
+  return BitplaneRelation{low, plane, *insertBit, instruction, {}};
 }
 
 void eraseDeadTree(mlir::Value value, mlir::IRRewriter &rewriter) {
@@ -384,19 +476,38 @@ public:
         relation = matchBitplane(merge, merge.getRhs(), merge.getLhs());
       if (!relation)
         continue;
-      rewriter.setInsertionPoint(merge);
-      auto fused = rewriter.create<riscv::RVVBitplaneMergeOp>(
-          merge.getLoc(), merge.getResult().getType(), relation->low,
-          relation->plane.getResult(), relation->insertBit,
-          riscv_internal::leaf(rewriter, "rvv", "bitplane-merge",
-                               relation->instruction, relation->instruction, 0,
-                               0, 1, 0, "none", "agnostic",
-                               {relation->insertBit}));
-      riscv_internal::copyOrigin(merge, fused);
-      fused->setAttr("canonical_op",
-                     rewriter.getStringAttr("weft_kernel.binary"));
       llvm::SmallVector<mlir::Value> oldOperands(merge->getOperands());
-      rewriter.replaceOp(merge, fused.getResult());
+      rewriter.setInsertionPoint(merge);
+      if (relation->packedPlan) {
+        auto packed = rewriter.create<riscv::PackedPlaneMergeOp>(
+            merge.getLoc(), merge.getResult().getType(), relation->low,
+            relation->plane.getResult(), relation->packedPlan,
+            riscv_internal::leaf(
+                rewriter, "scalar", "packed-plane-merge",
+                relation->instruction, relation->instruction, 0, 0, 0, 0,
+                "none", "exact",
+                {relation->packedPlan.getLogicalAxis(),
+                 relation->packedPlan.getLogicalElements(),
+                 relation->packedPlan.getLowBits(),
+                 relation->packedPlan.getHighBits(),
+                 relation->packedPlan.getInsertBit()}));
+        riscv_internal::copyOrigin(merge, packed);
+        packed->setAttr("canonical_op",
+                        rewriter.getStringAttr("weft_kernel.binary"));
+        rewriter.replaceOp(merge, packed.getResult());
+      } else {
+        auto rvv = rewriter.create<riscv::RVVBitplaneMergeOp>(
+            merge.getLoc(), merge.getResult().getType(), relation->low,
+            relation->plane.getResult(), relation->insertBit,
+            riscv_internal::leaf(rewriter, "rvv", "bitplane-merge",
+                                 relation->instruction, relation->instruction,
+                                 0, 0, 1, 0, "none", "agnostic",
+                                 {relation->insertBit}));
+        riscv_internal::copyOrigin(merge, rvv);
+        rvv->setAttr("canonical_op",
+                     rewriter.getStringAttr("weft_kernel.binary"));
+        rewriter.replaceOp(merge, rvv.getResult());
+      }
       for (mlir::Value operand : oldOperands)
         eraseDeadTree(operand, rewriter);
     }

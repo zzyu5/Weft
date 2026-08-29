@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -83,6 +84,161 @@ bool sameTerms(const LinearIndex &lhs, const LinearIndex &rhs) {
       return false;
   }
   return true;
+}
+
+std::optional<int64_t> timeCoordinate(riscv::ValueType type, int64_t stream,
+                                      int64_t axis) {
+  if (stream < 0)
+    return std::nullopt;
+  int64_t coordinateForAxis = 0;
+  bool found = false;
+  for (int64_t position = static_cast<int64_t>(type.getAxisIds().size()) - 1;
+       position >= 0; --position) {
+    const int64_t factor = type.getLayout().getTimeFactors()[position];
+    if (factor <= 0)
+      return std::nullopt;
+    const int64_t coordinate = stream % factor;
+    stream /= factor;
+    if (type.getAxisIds()[position] == axis) {
+      coordinateForAxis = coordinate;
+      found = true;
+    }
+  }
+  if (stream != 0 || !found)
+    return std::nullopt;
+  return coordinateForAxis;
+}
+
+struct LayerSelection {
+  int64_t physicalLayer = 0;
+  int64_t mode = 0;
+  int64_t shift = 0;
+  int64_t mask = 0;
+};
+
+std::optional<LayerSelection>
+selectLayer(riscv::AccessAttr access, int64_t logicalLayer,
+            int64_t layerCount, unsigned elementBits,
+            bool dynamicLogicalBase = false) {
+  if (!access || logicalLayer < 0 || logicalLayer >= layerCount ||
+      layerCount <= 1 || elementBits == 0 ||
+      layerCount * static_cast<int64_t>(elementBits) > 8 ||
+      (access.getOrder() != "lo_first" && access.getOrder() != "hi_first"))
+    return std::nullopt;
+  LayerSelection selection;
+  if (dynamicLogicalBase) {
+    selection.mode = access.getOrder() == "lo_first" ? 1 : 2;
+    selection.shift = 1;
+    selection.mask = 1;
+    return selection;
+  }
+  selection.physicalLayer = access.getOrder() == "lo_first"
+                                ? logicalLayer
+                                : layerCount - 1 - logicalLayer;
+  selection.shift = selection.physicalLayer != 0;
+  selection.mask =
+      (selection.physicalLayer + 1) * static_cast<int64_t>(elementBits) != 8;
+  return selection;
+}
+
+std::optional<riscv::LayeredStreamGeometryAttr> buildLayeredStreamGeometry(
+    mlir::Builder &builder, riscv::ValueType type, riscv::AccessAttr access,
+    int64_t axis, int64_t projectionBase) {
+  auto axisIt = llvm::find(type.getAxisIds().asArrayRef(), axis);
+  auto streams =
+      riscv_internal::staticProduct(type.getLayout().getTimeFactors().asArrayRef());
+  auto replicas = riscv_internal::staticProduct(
+      type.getLayout().getReplicaFactors().asArrayRef());
+  const int64_t group = access.getGroupSize();
+  const int64_t layer = access.getLayerSize();
+  if (axisIt == type.getAxisIds().asArrayRef().end() || !streams || !replicas ||
+      *streams <= 0 || *replicas <= 0 || group <= 0 || layer <= 0 ||
+      group % layer)
+    return std::nullopt;
+  const size_t axisPosition =
+      static_cast<size_t>(axisIt - type.getAxisIds().asArrayRef().begin());
+  const int64_t lanes = type.getLayout().getLaneFactors()[axisPosition];
+  const int64_t layers = group / layer;
+  const unsigned elementBits =
+      riscv_internal::logicalBitWidth(type.getElementType());
+  if (lanes <= 0 || layers <= 1 || elementBits == 0 ||
+      layers * static_cast<int64_t>(elementBits) > 8)
+    return std::nullopt;
+
+  std::map<std::pair<int64_t, int64_t>, int64_t> windows;
+  llvm::SmallVector<int64_t> windowForStream;
+  llvm::SmallVector<int64_t> physicalLayerForStream;
+  llvm::SmallVector<int64_t> physicalLayerForLogicalLayer(layers, -1);
+  llvm::SmallVector<int64_t> shiftAmountForLogicalLayer(layers, -1);
+  llvm::SmallVector<int64_t> maskValueForLogicalLayer(layers, -1);
+  llvm::SmallVector<int64_t> shiftAmountForStream;
+  llvm::SmallVector<int64_t> maskValueForStream;
+  llvm::SmallVector<int64_t> groupForWindow;
+  llvm::SmallVector<int64_t> withinForWindow;
+  for (int64_t stream = 0; stream < *streams; ++stream) {
+    auto coordinate = timeCoordinate(type, stream, axis);
+    if (!coordinate)
+      return std::nullopt;
+    const int64_t logicalOffset = projectionBase + *coordinate * lanes;
+    const int64_t groupIndex = logicalOffset / group;
+    const int64_t withinGroup = logicalOffset % group;
+    const int64_t logicalLayer = withinGroup / layer;
+    const int64_t withinLayer = withinGroup % layer;
+    if (groupIndex < 0 || logicalLayer < 0 || logicalLayer >= layers ||
+        withinLayer < 0 || withinLayer + lanes > layer)
+      return std::nullopt;
+    auto key = std::make_pair(groupIndex, withinLayer);
+    auto [found, inserted] =
+        windows.emplace(key, static_cast<int64_t>(windows.size()));
+    if (inserted) {
+      groupForWindow.push_back(groupIndex);
+      withinForWindow.push_back(withinLayer);
+    }
+    windowForStream.push_back(found->second);
+    auto selection = selectLayer(access, logicalLayer, layers, elementBits);
+    if (!selection)
+      return std::nullopt;
+    physicalLayerForStream.push_back(selection->physicalLayer);
+    shiftAmountForStream.push_back(
+        selection->physicalLayer * static_cast<int64_t>(elementBits));
+    maskValueForStream.push_back(selection->mask
+                                     ? (int64_t(1) << elementBits) - 1
+                                     : 0);
+    int64_t &logicalMapping =
+        physicalLayerForLogicalLayer[static_cast<size_t>(logicalLayer)];
+    if (logicalMapping >= 0 && logicalMapping != selection->physicalLayer)
+      return std::nullopt;
+    logicalMapping = selection->physicalLayer;
+    shiftAmountForLogicalLayer[static_cast<size_t>(logicalLayer)] =
+        selection->physicalLayer * static_cast<int64_t>(elementBits);
+    maskValueForLogicalLayer[static_cast<size_t>(logicalLayer)] =
+        selection->mask ? (int64_t(1) << elementBits) - 1 : 0;
+  }
+  if (llvm::any_of(physicalLayerForLogicalLayer,
+                   [](int64_t layer) { return layer < 0; }))
+    return std::nullopt;
+  llvm::SmallVector<int64_t> representativeStreamForWindow(windows.size(), -1);
+  for (auto [stream, window] : llvm::enumerate(windowForStream)) {
+    int64_t &representative =
+        representativeStreamForWindow[static_cast<size_t>(window)];
+    if (representative < 0)
+      representative = static_cast<int64_t>(stream);
+  }
+  if (llvm::any_of(representativeStreamForWindow,
+                   [](int64_t stream) { return stream < 0; }))
+    return std::nullopt;
+  return riscv::LayeredStreamGeometryAttr::get(
+      builder.getContext(), axis, group, layer, lanes, *streams, *replicas,
+      builder.getDenseI64ArrayAttr(windowForStream),
+      builder.getDenseI64ArrayAttr(representativeStreamForWindow),
+      builder.getDenseI64ArrayAttr(physicalLayerForStream),
+      builder.getDenseI64ArrayAttr(physicalLayerForLogicalLayer),
+      builder.getDenseI64ArrayAttr(shiftAmountForLogicalLayer),
+      builder.getDenseI64ArrayAttr(maskValueForLogicalLayer),
+      builder.getDenseI64ArrayAttr(shiftAmountForStream),
+      builder.getDenseI64ArrayAttr(maskValueForStream),
+      builder.getDenseI64ArrayAttr(groupForWindow),
+      builder.getDenseI64ArrayAttr(withinForWindow));
 }
 
 struct ShapedAffineIndex {
@@ -830,6 +986,8 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     return false;
 
   llvm::SmallVector<int64_t> partOffsets;
+  llvm::SmallVector<int64_t> recordReplicaKeys;
+  llvm::SmallVector<int64_t> representativeReplicas;
   int64_t logicalSpan = 0;
   const int64_t parts = streams * replicas;
   for (int64_t part = 0; part < parts; ++part) {
@@ -880,6 +1038,22 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     if (logicalOffset < 0 || logicalOffset % lanes)
       return false;
     partOffsets.push_back(logicalOffset);
+    int64_t recordReplicaKey = 0;
+    for (size_t position = 0; position < selectedType.getShape().size();
+         ++position) {
+      const int64_t axis = selectedType.getAxisIds()[position];
+      const int64_t replica =
+          selectedType.getLayout().getReplicaFactors()[position];
+      if (replica <= 1 ||
+          !llvm::is_contained(fieldType.getAxisIds().asArrayRef(), axis))
+        continue;
+      if (!checkedMultiply(recordReplicaKey, replica, recordReplicaKey) ||
+          !checkedAdd(recordReplicaKey, replicaCoordinates[position],
+                      recordReplicaKey))
+        return false;
+    }
+    recordReplicaKeys.push_back(recordReplicaKey);
+    representativeReplicas.push_back(part / streams);
     int64_t end = 0;
     if (!checkedAdd(logicalOffset, lanes, end))
       return false;
@@ -904,16 +1078,18 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
 
   llvm::DenseMap<std::pair<int64_t, int64_t>, int64_t> windowIds;
   llvm::SmallVector<int64_t> windowOffsets;
+  llvm::SmallVector<int64_t> recordReplicaForWindow;
   llvm::SmallVector<int64_t> windowForPart;
   llvm::SmallVector<int64_t> layerForPart;
   for (auto [part, offset] : llvm::enumerate(partOffsets)) {
     const int64_t windowOffset = layered ? offset % layer : offset;
-    const int64_t recordReplica = static_cast<int64_t>(part) / streams;
     auto [found, inserted] = windowIds.try_emplace(
-        std::make_pair(recordReplica, windowOffset),
+        std::make_pair(recordReplicaKeys[part], windowOffset),
         static_cast<int64_t>(windowOffsets.size()));
-    if (inserted)
+    if (inserted) {
       windowOffsets.push_back(windowOffset);
+      recordReplicaForWindow.push_back(representativeReplicas[part]);
+    }
     windowForPart.push_back(found->second);
     layerForPart.push_back(layered ? offset / layer : 0);
   }
@@ -929,6 +1105,47 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
           : (affine.constant == 0
                  ? logicalSpan
                  : std::max<int64_t>(1, std::abs(affine.constant)));
+  llvm::SmallVector<int64_t> physicalLayerForPart;
+  llvm::SmallVector<int64_t> shiftOffsetForPart;
+  llvm::SmallVector<int64_t> shiftBaseFactorForPart;
+  llvm::SmallVector<int64_t> maskValueForPart;
+  physicalLayerForPart.reserve(layerForPart.size());
+  shiftOffsetForPart.reserve(layerForPart.size());
+  shiftBaseFactorForPart.reserve(layerForPart.size());
+  maskValueForPart.reserve(layerForPart.size());
+  const int64_t layerCount = layered ? group / layer : 1;
+  const int64_t elementBits =
+      riscv_internal::logicalBitWidth(selectedType.getElementType());
+  for (int64_t logicalLayer : layerForPart) {
+    if (!layered) {
+      physicalLayerForPart.push_back(0);
+      shiftOffsetForPart.push_back(0);
+      shiftBaseFactorForPart.push_back(0);
+      maskValueForPart.push_back(0);
+      continue;
+    }
+    auto selection = selectLayer(
+        extract.getAccess(), logicalLayer, layerCount, elementBits,
+        logicalBaseMultiple % group);
+    if (!selection)
+      return false;
+    physicalLayerForPart.push_back(selection->physicalLayer);
+    if (selection->mode == 0) {
+      shiftOffsetForPart.push_back(selection->physicalLayer * elementBits);
+      shiftBaseFactorForPart.push_back(0);
+    } else if (selection->mode == 1) {
+      shiftOffsetForPart.push_back(logicalLayer * elementBits);
+      shiftBaseFactorForPart.push_back(elementBits);
+    } else if (selection->mode == 2) {
+      shiftOffsetForPart.push_back(
+          (layerCount - 1 - logicalLayer) * elementBits);
+      shiftBaseFactorForPart.push_back(-elementBits);
+    } else {
+      return false;
+    }
+    maskValueForPart.push_back(
+        selection->mask ? (int64_t{1} << elementBits) - 1 : 0);
+  }
   const int64_t resultGroups = selectedType.getLayout().getRegisterGroups();
   const int64_t temporaryGroups =
       std::max<int64_t>(1,
@@ -937,12 +1154,22 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   llvm::StringRef instruction =
       layered ? "rvv.replica-storage-load.layered"
               : "rvv.replica-storage-load.natural";
+  auto storagePlan = riscv_internal::storageWindowPlan(
+      rewriter, field, laneAxis, 0, 1, 1, logicalSpan,
+      logicalBaseMultiple);
+  if (!storagePlan)
+    return false;
   auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
       extract.getLoc(), selectedType, field.getResult(), scalarBase,
-      logicalBaseMultiple, laneAxis, logicalSpan,
+      *storagePlan,
       rewriter.getDenseI64ArrayAttr(windowOffsets),
+      rewriter.getDenseI64ArrayAttr(recordReplicaForWindow),
       rewriter.getDenseI64ArrayAttr(windowForPart),
-      rewriter.getDenseI64ArrayAttr(layerForPart), extract.getAccess(),
+      rewriter.getDenseI64ArrayAttr(layerForPart),
+      rewriter.getDenseI64ArrayAttr(physicalLayerForPart),
+      rewriter.getDenseI64ArrayAttr(shiftOffsetForPart),
+      rewriter.getDenseI64ArrayAttr(shiftBaseFactorForPart),
+      rewriter.getDenseI64ArrayAttr(maskValueForPart), extract.getAccess(),
       riscv_internal::leaf(rewriter, "rvv", "replica-storage-load",
                            instruction, instruction, 0, resultGroups,
                            temporaryGroups, 0, "none",
@@ -1025,9 +1252,20 @@ public:
           std::max<int64_t>(1,
                             (type.getLayout().getLmulEighths() + 7) / 8);
       const bool tail = type.getLayout().getValidity() == "tail";
+      int64_t streamAxis = 0;
+      for (auto [axis, time, lane] :
+           llvm::zip(type.getAxisIds().asArrayRef(),
+                     type.getLayout().getTimeFactors().asArrayRef(),
+                     type.getLayout().getLaneFactors().asArrayRef()))
+        if (time > 1 && lane > 1)
+          streamAxis = axis;
+      auto geometry = buildLayeredStreamGeometry(
+          rewriter, type, field.getAccess(), streamAxis, 0);
+      if (!geometry)
+        continue;
       rewriter.setInsertionPointAfter(field);
       auto stream = rewriter.create<riscv::RVVLayeredStreamOp>(
-          field.getLoc(), type, field.getResult(), field.getAccess(),
+          field.getLoc(), type, field.getResult(), field.getAccess(), *geometry,
           riscv_internal::leaf(rewriter, "rvv", "layered-stream",
                                "rvv.layered-stream", "rvv.layered-stream", 0,
                                resultGroups, temporaryGroups, 0, "none",
@@ -1060,10 +1298,14 @@ public:
       const int64_t temporaryGroups =
           std::max<int64_t>(1, (type.getLayout().getLmulEighths() + 7) / 8);
       const bool tail = type.getLayout().getValidity() == "tail";
+      auto geometry = buildLayeredStreamGeometry(rewriter, type,
+                                                 extract.getAccess(), axis, base);
+      if (!geometry)
+        continue;
       rewriter.setInsertionPoint(extract);
       auto stream = rewriter.create<riscv::RVVProjectedLayeredStreamOp>(
           extract.getLoc(), type, field.getResult(), origin.getResult(), axis,
-          base, stride, repeat, extent, extract.getAccess(),
+          base, stride, repeat, extent, extract.getAccess(), *geometry,
           riscv_internal::leaf(
               rewriter, "rvv", "projected-layered-stream",
               "rvv.projected-layered-stream", "rvv.projected-layered-stream",
@@ -1188,10 +1430,29 @@ public:
               fieldAxis - fieldType.getAxisIds().asArrayRef().begin())];
       const int64_t rawGroups =
           firstInfo->resultType.getLayout().getRegisterGroups();
+      llvm::SmallVector<LayerSelection> layerPlan;
+      layerPlan.reserve(layers);
+      for (int64_t storageLayer = 0; storageLayer < layers; ++storageLayer) {
+        auto layerSelection = selectLayer(
+            first.getAccess(), storageLayer, layers,
+            riscv_internal::logicalBitWidth(
+                leader.resultType.getElementType()));
+        if (!layerSelection)
+          break;
+        layerPlan.push_back(*layerSelection);
+      }
+      if (layerPlan.size() != static_cast<size_t>(layers))
+        continue;
       auto storageType = riscv::LayeredWindowType::get(
           rewriter.getContext(), fieldType, leader.resultType,
           leader.point.getResult().getType().getDomain().getAxisId(), layers,
           windowsPerLayer, rawGroups);
+      auto storagePlan = riscv_internal::storageWindowPlan(
+          rewriter, leader.field,
+          leader.point.getResult().getType().getDomain().getAxisId(), 0, 1, 1,
+          projectionExtent, lanes);
+      if (!storagePlan)
+        continue;
       llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> decoded(
           static_cast<size_t>(windowsPerLayer));
       for (int64_t window = 0; window < windowsPerLayer; ++window) {
@@ -1204,9 +1465,8 @@ public:
         }
         auto storage = rewriter.create<riscv::RVVLayeredStorageLoadOp>(
             first.getLoc(), storageType, leader.field.getResult(),
-            leader.parent.getResult(), windowIndex,
-            leader.point.getResult().getType().getDomain().getAxisId(), 0,
-            projectionExtent, first.getAccess(),
+            leader.parent.getResult(), windowIndex, *storagePlan,
+            first.getAccess(),
             riscv_internal::leaf(
                 rewriter, "rvv", "layered-storage-load",
                 "rvv.layered-storage-load", "rvv.layered-storage-load",
@@ -1217,12 +1477,22 @@ public:
                     : "exact"));
         riscv_internal::copyOrigin(first, storage);
         for (int64_t storageLayer = 0; storageLayer < layers; ++storageLayer) {
+          const LayerSelection &selection =
+              layerPlan[static_cast<size_t>(storageLayer)];
+          const int64_t elementBits = riscv_internal::logicalBitWidth(
+              leader.resultType.getElementType());
+          const int64_t shiftAmount = selection.physicalLayer * elementBits;
+          const int64_t maskValue =
+              selection.mask ? (int64_t(1) << elementBits) - 1 : 0;
+          llvm::StringRef instruction =
+              riscv_internal::layeredStorageDecodeInstruction(shiftAmount,
+                                                              maskValue);
           auto value = rewriter.create<riscv::RVVLayeredStorageDecodeOp>(
               first.getLoc(), leader.resultType, storage.getResult(),
-              storageLayer,
+              storageLayer, selection.physicalLayer, shiftAmount, maskValue,
               riscv_internal::leaf(
                   rewriter, "rvv", "layered-storage-decode",
-                  "rvv.layered-storage-decode", "rvv.layered-storage-decode",
+                  instruction, instruction,
                   rawGroups,
                   leader.resultType.getLayout().getRegisterGroups(), 1, 0,
                   "none",
@@ -1317,11 +1587,47 @@ public:
       auto firstType = mlir::cast<riscv::ValueType>(first.getResult().getType());
       const int64_t groups = firstType.getLayout().getRegisterGroups();
       const bool tail = firstType.getLayout().getValidity() == "tail";
+      auto element =
+          mlir::cast<mlir::IntegerType>(firstType.getElementType());
+      auto firstSelection =
+          selectLayer(first.getAccess(), 0, 2, element.getWidth());
+      auto secondSelection =
+          selectLayer(first.getAccess(), 1, 2, element.getWidth());
+      if (!firstSelection || !secondSelection)
+        continue;
+      llvm::SmallVector<int64_t> physicalLayers{
+          firstSelection->physicalLayer, secondSelection->physicalLayer};
+      llvm::SmallVector<int64_t> shifts{
+          firstSelection->physicalLayer * static_cast<int64_t>(element.getWidth()),
+          secondSelection->physicalLayer * static_cast<int64_t>(element.getWidth())};
+      llvm::SmallVector<int64_t> masks{
+          firstSelection->mask
+              ? (int64_t{1} << static_cast<int64_t>(element.getWidth())) - 1
+              : 0,
+          secondSelection->mask
+              ? (int64_t{1} << static_cast<int64_t>(element.getWidth())) - 1
+              : 0};
+      const int64_t axis =
+          firstPoint.getResult().getType().getDomain().getAxisId();
+      auto axisPosition = llvm::find(firstType.getAxisIds().asArrayRef(), axis);
+      if (axisPosition == firstType.getAxisIds().asArrayRef().end())
+        continue;
+      const size_t axisOrdinal = static_cast<size_t>(
+          axisPosition - firstType.getAxisIds().asArrayRef().begin());
+      auto storagePlan = riscv_internal::storageWindowPlan(
+          rewriter, firstField, axis, 0, 1, 1, layer,
+          firstType.getLayout().getLaneFactors()[axisOrdinal]);
+      if (!storagePlan)
+        continue;
       rewriter.setInsertionPoint(first);
       auto shared = rewriter.create<riscv::RVVLayeredWindowOp>(
           first.getLoc(),
           mlir::TypeRange{first.getResult().getType(), second.getResult().getType()},
           firstField.getResult(), firstPoint.getResult(), first.getAccess(),
+          *storagePlan,
+          rewriter.getDenseI64ArrayAttr(physicalLayers),
+          rewriter.getDenseI64ArrayAttr(shifts),
+          rewriter.getDenseI64ArrayAttr(masks),
           riscv_internal::leaf(rewriter, "rvv", "layered-window",
                                "rvv.layered-window", "rvv.layered-window", 0,
                                groups * 2, groups, 0, "none",
@@ -1347,6 +1653,7 @@ public:
       if (secondField.getResult().use_empty())
         rewriter.eraseOp(secondField);
     }
+
   }
 };
 

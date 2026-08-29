@@ -39,6 +39,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RegisterMaterializeOp, riscv::RVVBitplaneMergeOp,
+      riscv::PackedPlaneMergeOp,
       riscv::RVVBitmaskDecodeOp,
       riscv::RVVGroupedMacReduceOp,
       riscv::RVVGroupedMacLoadOp,
@@ -79,7 +80,8 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVLocalMaterializeOp, riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RVVBitplaneMergeOp, riscv::RVVBitmaskDecodeOp,
+      riscv::RVVBitplaneMergeOp, riscv::PackedPlaneMergeOp,
+      riscv::RVVBitmaskDecodeOp,
       riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
@@ -448,13 +450,24 @@ public:
             access && access.getForm() == "register" &&
             leaf.getEngine() == "rvv" && leaf.getFamily() == "extract" &&
             leaf.getInstruction() == "rvv.extract.vrgather";
+        const bool laneReplicaExtract =
+            access && access.getForm() == "register" &&
+            leaf.getEngine() == "rvv" && leaf.getFamily() == "extract" &&
+            leaf.getInstruction() == "rvv.extract.lane-to-replica";
+        const bool scalarReplicaExtract =
+            access && access.getForm() == "register" &&
+            leaf.getEngine() == "scalar" && leaf.getFamily() == "extract" &&
+            leaf.getInstruction() == "scalar.replica-gather";
         const bool ordinaryExtract =
             access && !local && !localGather && !registerExtract &&
+            !laneReplicaExtract && !scalarReplicaExtract &&
             leaf.getEngine() == "transfer" && leaf.getFamily() == "extract" &&
             leaf.getInstruction() ==
                 ("rvv.extract." + access.getForm()).str();
-        if (!access || (!localExtract && !localGather && !registerExtract &&
-                        !ordinaryExtract)) {
+        if (!access ||
+            (!localExtract && !localGather && !registerExtract &&
+             !laneReplicaExtract &&
+             !scalarReplicaExtract && !ordinaryExtract)) {
           extract.emitError(
               "final extract has no closed physical access and transfer leaf");
           failed = true;

@@ -5,6 +5,7 @@
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -41,6 +42,25 @@ struct RegularGatherCandidate {
   int64_t repeat = 1;
   int64_t lanes = 0;
   llvm::SmallVector<int64_t> partBases;
+};
+
+struct ReplicaAffineIndex {
+  int64_t constant = 0;
+  int64_t dynamicMultiple = 0;
+  llvm::DenseMap<int64_t, int64_t> axisCoefficients;
+};
+
+struct ScalarReplicaGatherPlan {
+  int64_t arity = 0;
+  llvm::SmallVector<int64_t> candidates;
+  llvm::SmallVector<int64_t> keys;
+  llvm::SmallVector<int64_t> localBases;
+};
+
+struct VectorReplicaGatherPlan {
+  int64_t laneCount = 0;
+  llvm::SmallVector<int64_t> sourceParts;
+  llvm::SmallVector<int64_t> indexParts;
 };
 
 std::optional<int64_t> positiveProduct(llvm::ArrayRef<int64_t> values) {
@@ -105,10 +125,452 @@ bool checkedScale(int64_t value, int64_t factor, int64_t &result) {
 
 std::optional<int64_t> constantInteger(mlir::Value value) {
   auto constant = value.getDefiningOp<riscv::ConstantOp>();
-  if (!constant)
+  if (constant) {
+    auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+    return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+  }
+  auto arithmetic = value.getDefiningOp<mlir::arith::ConstantOp>();
+  if (!arithmetic)
     return std::nullopt;
-  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(arithmetic.getValue());
   return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
+}
+
+bool isSingleScalarCoordinate(mlir::Value value) {
+  if (mlir::isa<mlir::IntegerType, mlir::IndexType>(value.getType()))
+    return true;
+  auto physical = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  if (!physical)
+    return false;
+  auto layout = physical.getLayout();
+  auto time = riscv_internal::staticProduct(layout.getTimeFactors().asArrayRef());
+  auto lanes = riscv_internal::staticProduct(layout.getLaneFactors().asArrayRef());
+  auto replicas =
+      riscv_internal::staticProduct(layout.getReplicaFactors().asArrayRef());
+  auto fragments =
+      riscv_internal::staticProduct(layout.getFragmentFactors().asArrayRef());
+  auto local = riscv_internal::staticProduct(layout.getLocalFactors().asArrayRef());
+  return layout.getCarrier() == "scalar" && time && *time == 1 && lanes &&
+         *lanes == 1 && replicas && *replicas == 1 && fragments &&
+         *fragments == 1 && local && *local == 1;
+}
+
+bool combineReplicaAffine(ReplicaAffineIndex &result,
+                          const ReplicaAffineIndex &other, bool subtract) {
+  if (subtract ? !checkedSubtract(result.constant, other.constant,
+                                  result.constant)
+               : !checkedAdd(result.constant, other.constant, result.constant))
+    return false;
+  for (const auto &[axis, coefficient] : other.axisCoefficients) {
+    int64_t updated = result.axisCoefficients.lookup(axis);
+    if (subtract ? !checkedSubtract(updated, coefficient, updated)
+                 : !checkedAdd(updated, coefficient, updated))
+      return false;
+    if (updated)
+      result.axisCoefficients[axis] = updated;
+    else
+      result.axisCoefficients.erase(axis);
+  }
+  if (other.dynamicMultiple) {
+    if (!result.dynamicMultiple)
+      result.dynamicMultiple = other.dynamicMultiple;
+    else
+      result.dynamicMultiple =
+          std::gcd(result.dynamicMultiple, other.dynamicMultiple);
+  }
+  return true;
+}
+
+std::optional<ReplicaAffineIndex>
+analyzeReplicaAffineIndex(mlir::Value value, unsigned depth = 0) {
+  if (depth > 24)
+    return std::nullopt;
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    return analyzeReplicaAffineIndex(conversion.getInput(), depth + 1);
+  if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    return analyzeReplicaAffineIndex(cast.getInput(), depth + 1);
+  if (auto constant = constantInteger(value)) {
+    ReplicaAffineIndex result;
+    result.constant = *constant;
+    return result;
+  }
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    auto type = mlir::dyn_cast<riscv::ValueType>(iota.getResult().getType());
+    if (!type || type.getAxisIds().size() != 1 ||
+        iota.getStart() >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return std::nullopt;
+    ReplicaAffineIndex result;
+    result.constant = static_cast<int64_t>(iota.getStart());
+    result.axisCoefficients[type.getAxisIds()[0]] = 1;
+    return result;
+  }
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    if (binary.getKind() == "add" || binary.getKind() == "sub") {
+      auto lhs = analyzeReplicaAffineIndex(binary.getLhs(), depth + 1);
+      auto rhs = analyzeReplicaAffineIndex(binary.getRhs(), depth + 1);
+      if (!lhs || !rhs ||
+          !combineReplicaAffine(*lhs, *rhs, binary.getKind() == "sub"))
+        return std::nullopt;
+      return lhs;
+    }
+    if (binary.getKind() == "mul") {
+      mlir::Value source;
+      std::optional<int64_t> factor;
+      if ((factor = constantInteger(binary.getRhs())))
+        source = binary.getLhs();
+      else if ((factor = constantInteger(binary.getLhs())))
+        source = binary.getRhs();
+      if (!source || !factor || *factor <= 0)
+        return std::nullopt;
+      auto result = analyzeReplicaAffineIndex(source, depth + 1);
+      if (!result || !checkedScale(result->constant, *factor,
+                                   result->constant))
+        return std::nullopt;
+      for (auto &[axis, coefficient] : result->axisCoefficients)
+        if (!checkedScale(coefficient, *factor, coefficient))
+          return std::nullopt;
+      if (result->dynamicMultiple &&
+          !checkedScale(result->dynamicMultiple, *factor,
+                        result->dynamicMultiple))
+        return std::nullopt;
+      return result;
+    }
+    return std::nullopt;
+  }
+  if (!isSingleScalarCoordinate(value))
+    return std::nullopt;
+  ReplicaAffineIndex result;
+  result.dynamicMultiple = 1;
+  return result;
+}
+
+llvm::SmallVector<std::pair<int64_t, int64_t>>
+replicaAxes(riscv::ValueType value) {
+  llvm::SmallVector<std::pair<int64_t, int64_t>> result;
+  for (auto [axis, factor] :
+       llvm::zip(value.getAxisIds().asArrayRef(),
+                 value.getLayout().getReplicaFactors().asArrayRef()))
+    if (factor > 1)
+      result.emplace_back(axis, factor);
+  return result;
+}
+
+std::optional<llvm::DenseMap<int64_t, int64_t>>
+replicaCoordinates(riscv::ValueType value, int64_t part) {
+  auto axes = replicaAxes(value);
+  llvm::DenseMap<int64_t, int64_t> result;
+  int64_t remaining = part;
+  for (int64_t position = static_cast<int64_t>(axes.size()) - 1;
+       position >= 0; --position) {
+    const auto &[axis, extent] = axes[static_cast<size_t>(position)];
+    if (extent <= 0)
+      return std::nullopt;
+    result[axis] = remaining % extent;
+    remaining /= extent;
+  }
+  if (remaining)
+    return std::nullopt;
+  return result;
+}
+
+std::optional<int64_t>
+replicaPartFor(riscv::ValueType value,
+               const llvm::DenseMap<int64_t, int64_t> &coordinates) {
+  int64_t part = 0;
+  for (auto [axis, factor] :
+       llvm::zip(value.getAxisIds().asArrayRef(),
+                 value.getLayout().getReplicaFactors().asArrayRef())) {
+    if (factor <= 0 || part > std::numeric_limits<int64_t>::max() / factor)
+      return std::nullopt;
+    int64_t coordinate = 0;
+    if (factor > 1) {
+      auto found = coordinates.find(axis);
+      if (found == coordinates.end() || found->second < 0 ||
+          found->second >= factor)
+        return std::nullopt;
+      coordinate = found->second;
+    }
+    part = part * factor + coordinate;
+  }
+  return part;
+}
+
+std::optional<VectorReplicaGatherPlan>
+planVectorReplicaGather(riscv::ExtractOp operation, mlir::Value index) {
+  auto input = operation.getInput().getType();
+  auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+  auto indexType = mlir::dyn_cast<riscv::ValueType>(index.getType());
+  if (!result || !indexType || input.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getCarrier() != "scalar" ||
+      indexType.getLayout().getCarrier() != "scalar")
+    return std::nullopt;
+
+  size_t gatherDimension = operation.getSelectors().size();
+  size_t indexCursor = 0;
+  unsigned gatherCount = 0;
+  for (auto [dimension, selectorAttribute] :
+       llvm::enumerate(operation.getSelectors())) {
+    llvm::StringRef selector =
+        mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+    if (selector == "all")
+      continue;
+    if (indexCursor >= operation.getIndices().size())
+      return std::nullopt;
+    if (selector == "gather") {
+      ++gatherCount;
+      gatherDimension = dimension;
+      if (operation.getIndices()[indexCursor] != index)
+        return std::nullopt;
+    }
+    ++indexCursor;
+  }
+  if (gatherCount != 1 || indexCursor != operation.getIndices().size() ||
+      gatherDimension >= input.getAxisIds().size())
+    return std::nullopt;
+
+  auto sourceTime = riscv_internal::staticProduct(
+      input.getLayout().getTimeFactors().asArrayRef());
+  auto sourceLanes = riscv_internal::staticProduct(
+      input.getLayout().getLaneFactors().asArrayRef());
+  auto sourceParts = riscv_internal::staticProduct(
+      input.getLayout().getReplicaFactors().asArrayRef());
+  auto resultTime = riscv_internal::staticProduct(
+      result.getLayout().getTimeFactors().asArrayRef());
+  auto resultLanes = riscv_internal::staticProduct(
+      result.getLayout().getLaneFactors().asArrayRef());
+  auto resultParts = riscv_internal::staticProduct(
+      result.getLayout().getReplicaFactors().asArrayRef());
+  auto indexTime = riscv_internal::staticProduct(
+      indexType.getLayout().getTimeFactors().asArrayRef());
+  auto indexLanes = riscv_internal::staticProduct(
+      indexType.getLayout().getLaneFactors().asArrayRef());
+  auto indexParts = riscv_internal::staticProduct(
+      indexType.getLayout().getReplicaFactors().asArrayRef());
+  if (!sourceTime || *sourceTime != 1 || !sourceLanes || *sourceLanes <= 1 ||
+      !sourceParts || *sourceParts <= 0 || !resultTime || *resultTime != 1 ||
+      !resultLanes || *resultLanes != 1 || !resultParts || *resultParts <= 0 ||
+      !indexTime || *indexTime != 1 || !indexLanes || *indexLanes != 1 ||
+      !indexParts || *indexParts <= 0)
+    return std::nullopt;
+
+  for (size_t dimension = 0; dimension < input.getAxisIds().size(); ++dimension) {
+    const int64_t laneFactor = input.getLayout().getLaneFactors()[dimension];
+    if (dimension == gatherDimension) {
+      if (laneFactor != *sourceLanes || input.getShape()[dimension] != laneFactor)
+        return std::nullopt;
+    } else if (laneFactor != 1) {
+      return std::nullopt;
+    }
+  }
+
+  auto matchingResultReplica = [&](int64_t axis,
+                                   int64_t factor) -> bool {
+    auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+    if (found == result.getAxisIds().asArrayRef().end())
+      return factor == 1;
+    const size_t position = static_cast<size_t>(
+        found - result.getAxisIds().asArrayRef().begin());
+    return result.getLayout().getReplicaFactors()[position] == factor;
+  };
+  for (auto [axis, factor] :
+       llvm::zip(indexType.getAxisIds().asArrayRef(),
+                 indexType.getLayout().getReplicaFactors().asArrayRef()))
+    if (!matchingResultReplica(axis, factor))
+      return std::nullopt;
+  for (auto [axis, factor] :
+       llvm::zip(input.getAxisIds().asArrayRef(),
+                 input.getLayout().getReplicaFactors().asArrayRef()))
+    if (axis != input.getAxisIds()[gatherDimension] &&
+        !matchingResultReplica(axis, factor))
+      return std::nullopt;
+
+  VectorReplicaGatherPlan plan;
+  plan.laneCount = *sourceLanes;
+  plan.sourceParts.reserve(*resultParts);
+  plan.indexParts.reserve(*resultParts);
+  for (int64_t part = 0; part < *resultParts; ++part) {
+    auto coordinates = replicaCoordinates(result, part);
+    if (!coordinates)
+      return std::nullopt;
+    auto sourcePart = replicaPartFor(input, *coordinates);
+    auto indexPart = replicaPartFor(indexType, *coordinates);
+    if (!sourcePart || !indexPart || *sourcePart < 0 ||
+        *sourcePart >= *sourceParts || *indexPart < 0 ||
+        *indexPart >= *indexParts)
+      return std::nullopt;
+    plan.sourceParts.push_back(*sourcePart);
+    plan.indexParts.push_back(*indexPart);
+  }
+  return plan;
+}
+
+std::optional<ScalarReplicaGatherPlan>
+planScalarReplicaGather(riscv::ExtractOp operation, mlir::Value index) {
+  auto reject = [&](llvm::StringRef reason)
+      -> std::optional<ScalarReplicaGatherPlan> {
+    (void)reason;
+    return std::nullopt;
+  };
+  auto input = operation.getInput().getType();
+  auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+  auto indexType = mlir::dyn_cast<riscv::ValueType>(index.getType());
+  if (!result || !indexType || input.getLayout().getCarrier() != "scalar" ||
+      result.getLayout().getCarrier() != "scalar" ||
+      indexType.getLayout().getCarrier() != "scalar")
+    return reject("carrier");
+  auto inputTime = riscv_internal::staticProduct(
+      input.getLayout().getTimeFactors().asArrayRef());
+  auto resultTime = riscv_internal::staticProduct(
+      result.getLayout().getTimeFactors().asArrayRef());
+  auto indexTime = riscv_internal::staticProduct(
+      indexType.getLayout().getTimeFactors().asArrayRef());
+  auto inputParts = riscv_internal::staticProduct(
+      input.getLayout().getReplicaFactors().asArrayRef());
+  auto resultParts = riscv_internal::staticProduct(
+      result.getLayout().getReplicaFactors().asArrayRef());
+  auto indexParts = riscv_internal::staticProduct(
+      indexType.getLayout().getReplicaFactors().asArrayRef());
+  if (!inputTime || *inputTime != 1 || !resultTime || *resultTime != 1 ||
+      !indexTime || *indexTime != 1 || !inputParts || !resultParts ||
+      !indexParts || *resultParts <= 1 || *indexParts <= 1)
+    return reject("part counts");
+
+  size_t gatherDimension = operation.getSelectors().size();
+  size_t indexCursor = 0;
+  unsigned gatherCount = 0;
+  for (auto [dimension, selectorAttribute] :
+       llvm::enumerate(operation.getSelectors())) {
+    llvm::StringRef selector =
+        mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+    if (selector == "all")
+      continue;
+    if (indexCursor >= operation.getIndices().size())
+      return reject("selector index");
+    if (selector == "gather") {
+      ++gatherCount;
+      gatherDimension = dimension;
+      if (operation.getIndices()[indexCursor] != index)
+        return reject("gather index identity");
+    }
+    ++indexCursor;
+  }
+  if (gatherCount != 1 || indexCursor != operation.getIndices().size() ||
+      gatherDimension >= input.getAxisIds().size())
+    return reject("gather selector");
+
+  auto resultAxes = replicaAxes(result);
+  auto indexAxes = replicaAxes(indexType);
+  auto factorFor = [](llvm::ArrayRef<std::pair<int64_t, int64_t>> axes,
+                      int64_t axis) -> std::optional<int64_t> {
+    auto found = llvm::find_if(
+        axes, [&](const auto &entry) { return entry.first == axis; });
+    return found == axes.end() ? std::nullopt
+                               : std::optional<int64_t>(found->second);
+  };
+  for (const auto &[axis, factor] : indexAxes)
+    if (factorFor(resultAxes, axis) != factor)
+      return reject("index/result replica axes");
+  const int64_t gatherAxis = input.getAxisIds()[gatherDimension];
+  const int64_t gatherFactor =
+      input.getLayout().getReplicaFactors()[gatherDimension];
+  if (gatherFactor <= 1 || gatherFactor % *indexParts)
+    return reject("gather source factor");
+  auto inputAxes = replicaAxes(input);
+  for (const auto &[axis, factor] : inputAxes)
+    if (axis != gatherAxis && factorFor(resultAxes, axis) != factor)
+      return reject("retained source axes");
+  auto affine = analyzeReplicaAffineIndex(index);
+  if (!affine ||
+      (affine->dynamicMultiple &&
+       affine->dynamicMultiple % *indexParts))
+    return reject("affine dynamic base");
+  llvm::DenseSet<int64_t> replicaAxisSet;
+  for (const auto &[axis, factor] : indexAxes)
+    replicaAxisSet.insert(axis);
+  for (const auto &[axis, coefficient] : affine->axisCoefficients)
+    if (!replicaAxisSet.contains(axis))
+      return reject("affine axis ownership");
+
+  auto evaluateIndex = [&](const llvm::DenseMap<int64_t, int64_t> &coordinates)
+      -> std::optional<int64_t> {
+    int64_t relative = affine->constant;
+    for (const auto &[axis, coefficient] : affine->axisCoefficients) {
+      int64_t term = 0;
+      if (!checkedScale(coordinates.lookup(axis), coefficient, term) ||
+          !checkedAdd(relative, term, relative))
+        return std::nullopt;
+    }
+    return relative;
+  };
+  auto evaluateResidue = [&](const llvm::DenseMap<int64_t, int64_t> &coordinates)
+      -> std::optional<int64_t> {
+    auto relative = evaluateIndex(coordinates);
+    if (!relative)
+      return std::nullopt;
+    int64_t residue = *relative % *indexParts;
+    if (residue < 0)
+      residue += *indexParts;
+    return residue;
+  };
+
+  llvm::DenseSet<int64_t> seen;
+  for (int64_t part = 0; part < *indexParts; ++part) {
+    auto coordinates = replicaCoordinates(indexType, part);
+    if (!coordinates)
+      return reject("replica coordinate");
+    auto selected = affine->dynamicMultiple ? evaluateResidue(*coordinates)
+                                            : evaluateIndex(*coordinates);
+    if (!selected || (!affine->dynamicMultiple &&
+                      (*selected < 0 || *selected >= gatherFactor)))
+      return reject("affine evaluation");
+    if (!seen.insert(*selected).second)
+      return reject("residue permutation");
+  }
+  if (seen.size() != static_cast<size_t>(*indexParts))
+    return reject("residue coverage");
+
+  ScalarReplicaGatherPlan plan;
+  plan.arity = affine->dynamicMultiple ? gatherFactor / *indexParts : 1;
+  plan.candidates.reserve(*resultParts * plan.arity);
+  plan.keys.reserve(*resultParts * plan.arity);
+  plan.localBases.reserve(*resultParts);
+  for (int64_t part = 0; part < *resultParts; ++part) {
+    auto coordinates = replicaCoordinates(result, part);
+    if (!coordinates)
+      return reject("result replica coordinate");
+    auto selected = affine->dynamicMultiple ? evaluateResidue(*coordinates)
+                                            : evaluateIndex(*coordinates);
+    if (!selected)
+      return reject("result affine evaluation");
+    std::optional<int64_t> localBase;
+    for (int64_t cohort = 0; cohort < plan.arity; ++cohort) {
+      const int64_t key =
+          *selected + (affine->dynamicMultiple ? cohort * *indexParts : 0);
+      int64_t sourcePart = 0;
+      for (auto [axis, factor] :
+           llvm::zip(input.getAxisIds().asArrayRef(),
+                     input.getLayout().getReplicaFactors().asArrayRef())) {
+        int64_t coordinate =
+            axis == gatherAxis ? key : coordinates->lookup(axis);
+        if (factor <= 0 || coordinate < 0 || coordinate >= factor)
+          return reject("source replica coordinate");
+        sourcePart = sourcePart * factor + coordinate;
+      }
+      if (sourcePart < 0 || sourcePart >= *inputParts)
+        return reject("source replica part");
+      const int64_t candidateBase = sourcePart - key;
+      if (localBase && *localBase != candidateBase)
+        return reject("local gather base");
+      localBase = candidateBase;
+      plan.candidates.push_back(sourcePart);
+      plan.keys.push_back(key);
+    }
+    if (!localBase)
+      return reject("local gather base missing");
+    plan.localBases.push_back(*localBase);
+  }
+  return plan;
 }
 
 std::optional<RegularIndex> analyzeRegularIndex(mlir::Value value,
@@ -389,6 +851,43 @@ public:
           indexValue.getLayout().getSew() == resultValue.getLayout().getSew() &&
           indexValue.getLayout().getLmulEighths() ==
               resultValue.getLayout().getLmulEighths();
+      if (gatherIndex) {
+        auto scalarPlan = planScalarReplicaGather(operation, gatherIndex);
+        if (scalarPlan) {
+          operation.setAccessAttr(
+              makeAccess(builder, "register", "natural", 1));
+          operation.setLeafAttr(riscv_internal::leaf(
+              builder, "scalar", "extract", "scalar.replica-gather",
+              "scalar.replica-gather", 0, 0));
+          operation->setAttr("replica_gather_arity",
+                             builder.getI64IntegerAttr(scalarPlan->arity));
+          operation->setAttr(
+              "replica_gather_candidates",
+              builder.getDenseI64ArrayAttr(scalarPlan->candidates));
+          operation->setAttr(
+              "replica_gather_keys",
+              builder.getDenseI64ArrayAttr(scalarPlan->keys));
+          return;
+        }
+        auto vectorPlan = planVectorReplicaGather(operation, gatherIndex);
+        if (vectorPlan) {
+          operation.setAccessAttr(
+              makeAccess(builder, "register", "natural", 1));
+          operation.setLeafAttr(riscv_internal::leaf(
+              builder, "rvv", "extract", "rvv.extract.lane-to-replica",
+              "rvv.extract.lane-to-replica", 1, 0));
+          operation->setAttr(
+              "lane_gather_count",
+              builder.getI64IntegerAttr(vectorPlan->laneCount));
+          operation->setAttr(
+              "lane_gather_source_parts",
+              builder.getDenseI64ArrayAttr(vectorPlan->sourceParts));
+          operation->setAttr(
+              "lane_gather_index_parts",
+              builder.getDenseI64ArrayAttr(vectorPlan->indexParts));
+          return;
+        }
+      }
       if (gather && compatibleRegisterGather) {
         operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
         operation.setLeafAttr(riscv_internal::leaf(

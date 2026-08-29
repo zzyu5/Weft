@@ -236,6 +236,9 @@ def vec_dot_q3_k_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        decoded_scales = i8(
+            (u8(w.scale_low) | (u8(w.scale_high) << u8(4))) - u8(32)
+        )
         integer_acc = i32(0)
         half_index = index(0)
         with L.subs(kb, extent=128) as half:
@@ -249,8 +252,10 @@ def vec_dot_q3_k_q8_k(
                 + lane
             )
             q = (
-                i8(w.q[coordinate])
-                + i8(w.hmask[coordinate]) * i8(4)
+                i8(
+                    u8(w.q[coordinate])
+                    | (u8(w.hmask[coordinate]) << u8(2))
+                )
                 - i8(4)
             )
             products = contract(x.q[coordinate], q, over="k", acc=i32)
@@ -259,10 +264,52 @@ def vec_dot_q3_k_q8_k(
                 + plane * u8(2)
                 + scale_part
             )
-            scales = (
-                i32(w.scale_low[scale_coordinate])
-                | (i32(w.scale_high[scale_coordinate]) << u32(4))
-            ) - i32(32)
+            scales = i32(decoded_scales[scale_coordinate])
+            integer_acc += reduce(
+                reduce(products * scales, axis=1), axis=0
+            )
+            half_index += index(1)
+        result += (f32(w.d) * f32(x.ds)) * f32(integer_acc)
+    return result
+
+
+def vec_dot_q3_k_q8_k_predecoded_scales(
+    W: View[Q3_K, (K,)],
+    X: View[Q8_K, (K,)],
+):
+    result = f32(0.0)
+    with L.blocks(K, extent=256) as kb:
+        w = admit(W[kb])
+        x = admit(X[kb])
+        decoded_scales = materialize(
+            i8((u8(w.scale_low) | (u8(w.scale_high) << u8(4))) - u8(32))
+        )
+        integer_acc = i32(0)
+        half_index = index(0)
+        with L.subs(kb, extent=128) as half:
+            plane = iota(4, dtype=u8)
+            scale_part = iota(2, dtype=u8)
+            lane = iota(16, dtype=u8, axis="k")
+            coordinate = (
+                u8(half_index) * u8(128)
+                + plane * u8(32)
+                + scale_part * u8(16)
+                + lane
+            )
+            q = (
+                i8(
+                    u8(w.q[coordinate])
+                    | (u8(w.hmask[coordinate]) << u8(2))
+                )
+                - i8(4)
+            )
+            products = contract(x.q[coordinate], q, over="k", acc=i32)
+            scale_coordinate = (
+                u8(half_index) * u8(8)
+                + plane * u8(2)
+                + scale_part
+            )
+            scales = i32(decoded_scales[scale_coordinate])
             integer_acc += reduce(
                 reduce(products * scales, axis=1), axis=0
             )

@@ -621,6 +621,8 @@ private:
   mlir::LogicalResult
   compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation);
   mlir::LogicalResult
+  compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation);
+  mlir::LogicalResult
   compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation);
   mlir::LogicalResult
   compileGroupedMacReduce(riscv::RVVGroupedMacReduceOp operation);
@@ -1748,10 +1750,12 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
         owner = std::move(*record);
       }
       auto field = fieldFor(binding);
+      auto valueType = mlir::dyn_cast<riscv::ValueType>(value.getType());
       llvm::SmallVector<int64_t, 4> registerAxes = registerAxesFor(value);
       const int64_t registerParts = registerPartCount(value);
       llvm::SmallVector<std::string, 4> registerStrides;
       llvm::SmallVector<int64_t, 4> indexAxes;
+      llvm::SmallVector<int64_t, 4> directFieldAxes;
       llvm::SmallVector<std::string, 4> tupleLogicalIndices;
       for (int64_t registerAxis : registerAxes) {
         std::string stride;
@@ -1820,6 +1824,14 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
       unsigned logicalWidth =
           field ? riscv_internal::logicalBitWidth(field->type) : 0;
       const bool joined = field && field->access.getMapping() == "joined";
+      if (!binding.field.index && valueType && binding.field.logicalRank > 0 &&
+          binding.field.logicalRank <=
+              static_cast<int64_t>(valueType.getAxisIds().size())) {
+        const size_t first = valueType.getAxisIds().size() -
+                             static_cast<size_t>(binding.field.logicalRank);
+        directFieldAxes.append(valueType.getAxisIds().asArrayRef().begin() + first,
+                               valueType.getAxisIds().asArrayRef().end());
+      }
       if (owner.kind != Binding::Kind::Record || !field || registerAxes.empty() ||
           registerParts <= 0 || registerAxes.size() != registerStrides.size() ||
           field->bitOffset % 8)
@@ -1827,7 +1839,8 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                    "selected scalar tuple has no closed encoded-field mapping"),
                mlir::failure();
       for (auto [axis, stride] : llvm::zip(registerAxes, registerStrides))
-        if (stride.empty() && !llvm::is_contained(indexAxes, axis))
+        if (stride.empty() && !llvm::is_contained(indexAxes, axis) &&
+            !llvm::is_contained(directFieldAxes, axis))
           return value.getDefiningOp()->emitError(
                      "selected scalar tuple axis is represented by neither a record stride nor its typed gather index"),
                  mlir::failure();
@@ -1845,10 +1858,49 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
           if (!stride.empty())
             record += " + " + std::to_string(coordinate) + " * " + stride;
         record += ")";
-        const std::string &partLogicalIndex =
+        std::string partLogicalIndex =
             tupleLogicalIndices.empty()
                 ? logicalIndex
                 : tupleLogicalIndices[static_cast<size_t>(part)];
+        // The selected scalar-replica layout already fixes the coordinates of
+        // a whole encoded field value.  Project its trailing logical field
+        // axes to the field's linear element index; this is a mechanical
+        // spelling of the typed layout, not a terminal layout choice.
+        if (tupleLogicalIndices.empty() && !directFieldAxes.empty()) {
+          if (!valueType || binding.field.logicalRank < 0 ||
+              binding.field.logicalRank >
+                  static_cast<int64_t>(binding.field.shape.size()))
+            return value.getDefiningOp()->emitError(
+                       "selected scalar tuple field has no typed logical rank"),
+                   mlir::failure();
+          const size_t logicalRank =
+              static_cast<size_t>(binding.field.logicalRank);
+          const size_t valueOuterRank = valueType.getAxisIds().size() - logicalRank;
+          const size_t shapeOuterRank = binding.field.shape.size() - logicalRank;
+          int64_t linear = 0;
+          for (size_t dimension = 0; dimension < logicalRank; ++dimension) {
+            const int64_t axis = valueType.getAxisIds()[valueOuterRank + dimension];
+            const int64_t extent = binding.field.shape[shapeOuterRank + dimension];
+            auto registerAxis = llvm::find(registerAxes, axis);
+            int64_t coordinate = 0;
+            if (registerAxis != registerAxes.end())
+              coordinate = (*coordinates)[static_cast<size_t>(
+                  std::distance(registerAxes.begin(), registerAxis))];
+            auto valueAxis = llvm::find(valueType.getAxisIds().asArrayRef(), axis);
+            const size_t valuePosition = static_cast<size_t>(std::distance(
+                valueType.getAxisIds().asArrayRef().begin(), valueAxis));
+            if (extent <= 0 || valueAxis == valueType.getAxisIds().asArrayRef().end() ||
+                coordinate < 0 || coordinate >= extent ||
+                (registerAxis == registerAxes.end() &&
+                 valueType.getLayout().getReplicaFactors()[valuePosition] != 1))
+              return value.getDefiningOp()->emitError(
+                         "selected scalar tuple field has no closed logical-axis projection"),
+                     mlir::failure();
+            linear = linear * extent + coordinate;
+          }
+          partLogicalIndex = "((" + logicalIndex + ") + " +
+                             std::to_string(linear) + ")";
+        }
         auto fragment =
             singleStorageFragment(*field, partLogicalIndex, logicalWidth);
         if (!fragment && !joined)
@@ -2246,6 +2298,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileFold2(fold);
   if (auto merge = mlir::dyn_cast<riscv::RVVBitplaneMergeOp>(operation))
     return compileRVVBitplaneMerge(merge);
+  if (auto merge = mlir::dyn_cast<riscv::PackedPlaneMergeOp>(operation))
+    return compilePackedPlaneMerge(merge);
   if (auto decode = mlir::dyn_cast<riscv::RVVBitmaskDecodeOp>(operation))
     return compileRVVBitmaskDecode(decode);
   if (auto reduce = mlir::dyn_cast<riscv::RVVGroupedMacReduceOp>(operation))
@@ -3434,6 +3488,98 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
   }
+  if (instructionOf(operation.getOperation()) ==
+      "rvv.extract.lane-to-replica") {
+    mlir::FailureOr<Binding> source =
+        materializeNumeric(operation.getInput(), std::move(binding));
+    if (mlir::failed(source) || source->kind != Binding::Kind::Vector)
+      return fail(operation,
+                  "lane-to-replica extract requires one materialized RVV source");
+    mlir::Value gatherIndex;
+    size_t cursor = 0;
+    for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (cursor >= operation.getIndices().size() || gatherIndex ||
+          selector != "gather")
+        return fail(operation,
+                    "lane-to-replica extract requires one typed gather index");
+      gatherIndex = operation.getIndices()[cursor++];
+    }
+    auto laneCount = operation->getAttrOfType<mlir::IntegerAttr>(
+        "lane_gather_count");
+    auto sourceParts = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+        "lane_gather_source_parts");
+    auto indexParts = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+        "lane_gather_index_parts");
+    const int64_t resultParts = registerPartCount(operation.getResult());
+    const Binding &indices = bindings.lookup(gatherIndex);
+    mlir::Type element =
+        riscv_internal::logicalElement(operation.getResult().getType());
+    auto scalarType = scalarCType(element);
+    if (!gatherIndex || cursor != operation.getIndices().size() || !laneCount ||
+        laneCount.getInt() <= 1 || !sourceParts || !indexParts ||
+        resultParts <= 0 ||
+        sourceParts.size() != static_cast<size_t>(resultParts) ||
+        indexParts.size() != static_cast<size_t>(resultParts) || !scalarType ||
+        (indices.kind != Binding::Kind::Scalar &&
+         indices.kind != Binding::Kind::ScalarTuple))
+      return fail(operation,
+                  "lane-to-replica extract has no complete pass-selected mapping");
+
+    const std::string suffix = vectorSuffix(operation.getInput());
+    Binding result;
+    result.kind = resultParts == 1 ? Binding::Kind::Scalar
+                                   : Binding::Kind::ScalarTuple;
+    for (int64_t part = 0; part < resultParts; ++part) {
+      const int64_t sourcePart = sourceParts[part];
+      const int64_t indexPart = indexParts[part];
+      if (sourcePart < 0 ||
+          sourcePart >= static_cast<int64_t>(source->parts.size()))
+        return fail(operation,
+                    "lane-to-replica extract source part exceeds its RVV value");
+      std::string selected;
+      if (indices.kind == Binding::Kind::Scalar) {
+        if (indexPart != 0)
+          return fail(operation,
+                      "lane-to-replica scalar index has a nonzero selected part");
+        selected = indices.scalar;
+      } else {
+        if (indexPart < 0 ||
+            indexPart >= static_cast<int64_t>(indices.parts.size()))
+          return fail(operation,
+                      "lane-to-replica index part exceeds its scalar tuple");
+        selected = indices.parts[static_cast<size_t>(indexPart)];
+      }
+      const std::string shifted =
+          "__riscv_vslidedown_vx_" + suffix + "(" +
+          source->parts[static_cast<size_t>(sourcePart)] + ", " + selected +
+          ", " + std::to_string(laneCount.getInt()) + ")";
+      std::string expression;
+      if (mlir::isa<mlir::FloatType>(element)) {
+        expression = "__riscv_vfmv_f_s_" + suffix + "_f" +
+                     std::to_string(riscv_internal::logicalBitWidth(element)) +
+                     "(" + shifted + ")";
+      } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element)) {
+        expression = "__riscv_vmv_x_s_" + suffix + "_" +
+                     std::string(integer.isUnsigned() ? "u" : "i") +
+                     std::to_string(integer.getWidth()) + "(" + shifted + ")";
+      } else {
+        return fail(operation,
+                    "lane-to-replica extract has no intrinsic scalar spelling");
+      }
+      std::string name = fresh("lane_gather");
+      line(*scalarType + " " + name + " = " + expression + ";");
+      if (result.kind == Binding::Kind::Scalar)
+        result.scalar = std::move(name);
+      else
+        result.parts.push_back(std::move(name));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   if (binding.kind == Binding::Kind::Scalar &&
       !mlir::isa<riscv::ValueType>(operation.getResult().getType())) {
     auto input = mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
@@ -3773,6 +3919,81 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
       return mlir::success();
     }
     binding = std::move(*materialized);
+  }
+
+  if (binding.kind == Binding::Kind::ScalarTuple) {
+    auto resultType =
+        mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+    const int64_t resultParts = registerPartCount(operation.getResult());
+    auto arity = operation->getAttrOfType<mlir::IntegerAttr>(
+        "replica_gather_arity");
+    auto candidates = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+        "replica_gather_candidates");
+    auto keys = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+        "replica_gather_keys");
+    mlir::Value gatherIndex;
+    size_t cursor = 0;
+    for (mlir::Attribute selectorAttribute : operation.getSelectors()) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (cursor >= operation.getIndices().size() || gatherIndex ||
+          selector != "gather")
+        return fail(operation,
+                    "scalar tuple extract requires exactly one typed gather index");
+      gatherIndex = operation.getIndices()[cursor++];
+    }
+    if (instructionOf(operation.getOperation()) != "scalar.replica-gather" ||
+        operation.getAccess().getForm() != "register" || !arity ||
+        arity.getInt() <= 0 || !candidates || !keys ||
+        keys.size() != candidates.size() || !resultType || resultParts <= 0 ||
+        static_cast<int64_t>(binding.parts.size()) !=
+            registerPartCount(operation.getInput()) ||
+        candidates.size() !=
+            static_cast<size_t>(resultParts * arity.getInt()) || !gatherIndex ||
+        cursor != operation.getIndices().size())
+      return fail(operation,
+                  "scalar tuple extract has no pass-selected replica candidate mapping");
+    const Binding &index = bindings.lookup(gatherIndex);
+    Binding tuple;
+    tuple.kind = Binding::Kind::ScalarTuple;
+    for (int64_t part = 0; part < resultParts; ++part) {
+      std::string selected;
+      if (index.kind == Binding::Kind::Scalar) {
+        selected = index.scalar;
+      } else if (index.kind == Binding::Kind::ScalarTuple) {
+        auto indexPart = projectRegisterPart(gatherIndex, operation.getResult(), part);
+        if (!indexPart || *indexPart >= index.parts.size())
+          return fail(operation,
+                      "scalar tuple extract index does not project to its result replica");
+        selected = index.parts[*indexPart];
+      } else {
+        return fail(operation,
+                    "scalar tuple extract index has no selected scalar representation");
+      }
+      const size_t row = static_cast<size_t>(part * arity.getInt());
+      int64_t last = candidates[row + static_cast<size_t>(arity.getInt() - 1)];
+      if (last < 0 || static_cast<size_t>(last) >= binding.parts.size())
+        return fail(operation,
+                    "scalar tuple extract candidate exceeds its source tuple");
+      std::string expression = binding.parts[static_cast<size_t>(last)];
+      if (arity.getInt() == 1)
+        expression = "((void)(" + selected + "), " + expression + ")";
+      for (int64_t candidate = arity.getInt() - 2; candidate >= 0; --candidate) {
+        int64_t source = candidates[row + static_cast<size_t>(candidate)];
+        if (source < 0 || static_cast<size_t>(source) >= binding.parts.size())
+          return fail(operation,
+                      "scalar tuple extract candidate exceeds its source tuple");
+        const int64_t key = keys[row + static_cast<size_t>(candidate)];
+        expression = "((" + selected + ") == " + std::to_string(key) +
+                     " ? " + binding.parts[static_cast<size_t>(source)] + " : " +
+                     expression + ")";
+      }
+      tuple.parts.push_back(std::move(expression));
+    }
+    bindings[operation.getResult()] = std::move(tuple);
+    return mlir::success();
   }
 
   if (binding.kind != Binding::Kind::Vector)
@@ -5215,6 +5436,11 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
       return fail(operation,
                   "unsupported selected scalar-tuple pointwise binary kind");
     const int64_t parts = registerPartCount(operation.getResult());
+    auto scalarResultType = scalarCType(
+        riscv_internal::logicalElement(operation.getResult().getType()));
+    if (parts > 1 && !scalarResultType)
+      return fail(operation,
+                  "scalar-tuple binary result has no exact intrinsic-C type");
     Binding result;
     result.kind = parts == 1 ? Binding::Kind::Scalar
                              : Binding::Kind::ScalarTuple;
@@ -5250,8 +5476,14 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
                      *rhsExpression + "))";
       if (parts == 1)
         result.scalar = std::move(expression);
-      else
-        result.parts.push_back(std::move(expression));
+      else {
+        // A physical scalar tuple is SSA state, not a macro expression.  Name
+        // every selected replica once so consumers in descendant Levels reuse
+        // the value instead of duplicating its encoded loads and decode chain.
+        std::string name = fresh("scalar_tuple");
+        line(*scalarResultType + " " + name + " = " + expression + ";");
+        result.parts.push_back(std::move(name));
+      }
     }
     bindings[operation.getResult()] = std::move(result);
     return mlir::success();
@@ -5885,263 +6117,10 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
       }
       return vectorResult;
     }
-    if (vectorResult && selectedForm == "strided" &&
-        field->access.getMapping() == "grouped_layered") {
-      auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
-      const int64_t laneAxis = laneAxisFor(result);
-      auto laneStride = llvm::find_if(
-          owner.recordByteStrides,
-          [&](const auto &entry) { return entry.first == laneAxis; });
-      const int64_t group = field->access.getGroupSize();
-      const int64_t layer = field->access.getLayerSize();
-      const int64_t layers = layer > 0 ? group / layer : 0;
-      llvm::StringRef order = field->access.getOrder();
-      if (!integer || integer.isSigned() || !laneAxis ||
-          laneStride == owner.recordByteStrides.end() || field->bitOffset % 8 ||
-          logicalWidth == 0 || logicalWidth > 8 || group <= 0 || layer <= 0 ||
-          group % layer || layers * logicalWidth > 8)
-        return {};
-
-      Binding decoded;
-      decoded.kind = Binding::Kind::Vector;
-      const std::string suffix = vectorSuffix(result);
-      const std::string type = vectorType(result);
-      const int64_t streams = streamPartCount(result);
-      llvm::SmallVector<int64_t, 4> axes = registerAxesFor(result);
-      const uint64_t mask = (uint64_t(1) << logicalWidth) - 1;
-      for (int64_t part = 0; part < vectorPartCount(result); ++part) {
-        auto coordinates = registerCoordinates(result, part / streams);
-        auto partLogical = logicalIndexForPart(part);
-        if (streams <= 0 || !coordinates || coordinates->size() != axes.size() ||
-            !partLogical) {
-          if (!partLogical)
-            result.getDefiningOp()->emitError(
-                "grouped/layered field has no closed per-part logical coordinate: ")
-                << logicalProjectionFailure;
-          return {};
-        }
-        std::string record = "(" + owner.recordPointer;
-        for (auto [axis, coordinate] : llvm::zip(axes, *coordinates))
-          for (const auto &[recordAxis, stride] : owner.recordByteStrides)
-            if (recordAxis == axis)
-              record += " + " + std::to_string(coordinate) + " * " + stride;
-        record += " + (" + partOffset(result, part) + ") * (" +
-                  laneStride->second + "))";
-        const std::string logical = "(" + *partLogical + ")";
-        const std::string within =
-            "(" + logical + " % " + std::to_string(group) + ")";
-        std::string physicalLayer =
-            "(" + within + " / " + std::to_string(layer) + ")";
-        if (order == "hi_first")
-          physicalLayer = "(" + std::to_string(layers - 1) + " - " +
-                          physicalLayer + ")";
-        const std::string byte =
-            "(" + std::to_string(field->bitOffset / 8) + " + (" + logical +
-            " / " + std::to_string(group) + ") * " + std::to_string(layer) +
-            " + " + within + " % " + std::to_string(layer) + ")";
-        const std::string vl = partVL(result, part);
-        std::string loaded = fresh("grouped_layered_strided");
-        line(type + " " + loaded + " = __riscv_vlse8_v_" + suffix +
-             "((const uint8_t *)(" + record + " + " + byte +
-             "), (ptrdiff_t)(" + laneStride->second + "), " + vl + ");");
-        if (layers > 1) {
-          std::string shifted = fresh("grouped_layered_shift");
-          line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-               loaded + ", " + physicalLayer + " * " +
-               std::to_string(logicalWidth) + ", " + vl + ");");
-          loaded = std::move(shifted);
-        }
-        if (logicalWidth < 8) {
-          std::string masked = fresh("grouped_layered_mask");
-          line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-               loaded + ", " + std::to_string(mask) + ", " + vl + ");");
-          loaded = std::move(masked);
-        }
-        decoded.parts.push_back(std::move(loaded));
-      }
-      return decoded;
-    }
-    if (vectorResult && !field->shape.empty() &&
-        selectedForm == "indexed" &&
-        field->access.getMapping() == "grouped_layered" &&
-        logicalPartition > 0 &&
-        logicalPartition <= field->access.getLayerSize() &&
-        field->access.getLayerSize() % logicalPartition == 0 &&
-        physicalLanes(result) <= logicalPartition) {
-      auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
-      const int64_t group = field->access.getGroupSize();
-      const int64_t layer = field->access.getLayerSize();
-      const int64_t layers = layer > 0 ? group / layer : 0;
-      const int64_t selectedPartition =
-          logicalPartition > 0 ? logicalPartition : physicalLanes(result);
-      llvm::StringRef order = field->access.getOrder();
-      if (!integer || integer.isSigned() || field->bitOffset % 8 || group <= 0 ||
-          layer <= 0 || group % layer || layers * logicalWidth > 8 ||
-          selectedPartition <= 0 || selectedPartition > layer ||
-          layer % selectedPartition || physicalLanes(result) > selectedPartition)
-        return {};
-
-      Binding decoded;
-      decoded.kind = Binding::Kind::Vector;
-      const std::string suffix = vectorSuffix(result);
-      const std::string type = vectorType(result);
-      const int64_t streams = streamPartCount(result);
-      llvm::SmallVector<int64_t, 4> axes = registerAxesFor(result);
-      const uint64_t mask = (uint64_t(1) << logicalWidth) - 1;
-      llvm::StringMap<std::string> loadedWindows;
-      for (int64_t part = 0; part < vectorPartCount(result); ++part) {
-        auto coordinates = registerCoordinates(result, part / streams);
-        if (streams <= 0 || !coordinates || coordinates->size() != axes.size())
-          return {};
-        std::string record = "(" + owner.recordPointer;
-        for (auto [axis, coordinate] : llvm::zip(axes, *coordinates))
-          for (const auto &[recordAxis, stride] : owner.recordByteStrides)
-            if (recordAxis == axis)
-              record += " + " + std::to_string(coordinate) + " * " + stride;
-        record += ")";
-
-        const std::string offset = partOffset(result, part);
-        int64_t staticBase = 0;
-        int64_t staticOffset = 0;
-        const bool staticLogical =
-            !llvm::StringRef(logicalIndex).getAsInteger(10, staticBase) &&
-            !llvm::StringRef(offset).getAsInteger(10, staticOffset);
-        std::string layerIndex;
-        std::string byte;
-        if (staticLogical) {
-          const int64_t logical = staticBase + staticOffset;
-          int64_t physicalLayer = (logical % group) / layer;
-          if (order == "hi_first")
-            physicalLayer = layers - 1 - physicalLayer;
-          layerIndex = std::to_string(physicalLayer);
-          byte = std::to_string(field->bitOffset / 8 +
-                                (logical / group) * layer + logical % layer);
-        } else {
-          const std::string logical =
-              "((" + logicalIndex + ") + " + offset + ")";
-          const std::string within =
-              "(" + logical + " % " + std::to_string(group) + ")";
-          layerIndex =
-              "(" + within + " / " + std::to_string(layer) + ")";
-          if (order == "hi_first")
-            layerIndex = "(" + std::to_string(layers - 1) + " - " +
-                         layerIndex + ")";
-          byte = "(" + std::to_string(field->bitOffset / 8) + " + (" +
-                 logical + " / " + std::to_string(group) + ") * " +
-                 std::to_string(layer) + " + " + within + " % " +
-                 std::to_string(layer) + ")";
-        }
-        const std::string vl = partVL(result, part);
-        const std::string windowKey = record + "|" + byte + "|" + vl;
-        auto cached = loadedWindows.find(windowKey);
-        std::string loaded;
-        if (cached != loadedWindows.end()) {
-          loaded = cached->second;
-        } else {
-          loaded = fresh("grouped_layered");
-          line(type + " " + loaded + " = __riscv_vle8_v_" + suffix +
-               "((const uint8_t *)(" + record + " + " + byte + "), " + vl +
-               ");");
-          loadedWindows.try_emplace(windowKey, loaded);
-        }
-        if (layers > 1 && layerIndex != "0") {
-          std::string shifted = fresh("grouped_layered_shift");
-          line(type + " " + shifted + " = ((" + layerIndex + ") == 0) ? " +
-               loaded + " : __riscv_vsrl_vx_" + suffix + "(" + loaded + ", " +
-               layerIndex + " * " + std::to_string(logicalWidth) + ", " + vl +
-               ");");
-          loaded = std::move(shifted);
-        }
-        const bool shiftExposesOnlyLogicalBits =
-            staticLogical && layers * logicalWidth == 8 &&
-            layerIndex == std::to_string(layers - 1);
-        if (logicalWidth < 8 && !shiftExposesOnlyLogicalBits) {
-          std::string masked = fresh("grouped_layered_mask");
-          line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-               loaded + ", " + std::to_string(mask) + ", " + vl + ");");
-          loaded = std::move(masked);
-        }
-        decoded.parts.push_back(std::move(loaded));
-      }
-      return decoded;
-    }
-    if (vectorResult && selectedForm == "indexed" &&
-        field->access.getMapping() == "grouped_layered") {
-      auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
-      auto resultLayout = layoutOf(result);
-      const int64_t group = field->access.getGroupSize();
-      const int64_t layer = field->access.getLayerSize();
-      const int64_t layers = layer > 0 ? group / layer : 0;
-      llvm::StringRef order = field->access.getOrder();
-      if (!integer || integer.isSigned() || !resultLayout ||
-          resultLayout.getSew() != 8 || field->bitOffset % 8 ||
-          logicalWidth == 0 || logicalWidth > 8 || group <= 0 || layer <= 0 ||
-          group % layer || layers * logicalWidth > 8)
-        return {};
-
-      Binding decoded;
-      decoded.kind = Binding::Kind::Vector;
-      const std::string suffix = vectorSuffix(result);
-      const std::string type = vectorType(result);
-      const int64_t streams = streamPartCount(result);
-      llvm::SmallVector<int64_t, 4> axes = registerAxesFor(result);
-      const uint64_t mask = (uint64_t(1) << logicalWidth) - 1;
-      for (int64_t part = 0; part < vectorPartCount(result); ++part) {
-        auto coordinates = registerCoordinates(result, part / streams);
-        if (streams <= 0 || !coordinates || coordinates->size() != axes.size())
-          return {};
-        std::string record = "(" + owner.recordPointer;
-        for (auto [axis, coordinate] : llvm::zip(axes, *coordinates))
-          for (const auto &[recordAxis, stride] : owner.recordByteStrides)
-            if (recordAxis == axis)
-              record += " + " + std::to_string(coordinate) + " * " + stride;
-        record += " + " + std::to_string(field->bitOffset / 8) + ")";
-        const std::string vl = partVL(result, part);
-        const std::string base = "((" + logicalIndex + ") + " +
-                                 partOffset(result, part) + ")";
-        std::string logical = fresh("encoded_logical");
-        line(type + " " + logical + " = __riscv_vadd_vx_" + suffix +
-             "(__riscv_vid_v_" + suffix + "(" + vl + "), " + base + ", " +
-             vl + ");");
-        std::string within = fresh("encoded_within");
-        line(type + " " + within + " = __riscv_vremu_vx_" + suffix + "(" +
-             logical + ", " + std::to_string(group) + ", " + vl + ");");
-        std::string bytes = fresh("encoded_bytes");
-        line(type + " " + bytes + " = __riscv_vadd_vv_" + suffix +
-             "(__riscv_vmul_vx_" + suffix + "(__riscv_vdivu_vx_" + suffix +
-             "(" + logical + ", " + std::to_string(group) + ", " + vl + "), " +
-             std::to_string(layer) + ", " + vl + "), __riscv_vremu_vx_" +
-             suffix + "(" + within + ", " + std::to_string(layer) + ", " +
-             vl + "), " + vl + ");");
-        std::string loaded = fresh("encoded_gather");
-        line(type + " " + loaded + " = __riscv_vluxei8_v_" + suffix +
-             "((const uint8_t *)(" + record + "), " + bytes + ", " + vl +
-             ");");
-        if (layers > 1) {
-          std::string shift = fresh("encoded_shift");
-          std::string layerIndex =
-              "__riscv_vdivu_vx_" + suffix + "(" + within + ", " +
-              std::to_string(layer) + ", " + vl + ")";
-          if (order == "hi_first")
-            layerIndex = "__riscv_vrsub_vx_" + suffix + "(" + layerIndex +
-                         ", " + std::to_string(layers - 1) + ", " + vl + ")";
-          line(type + " " + shift + " = __riscv_vmul_vx_" + suffix + "(" +
-               layerIndex + ", " + std::to_string(logicalWidth) + ", " + vl +
-               ");");
-          std::string shifted = fresh("encoded_shifted");
-          line(type + " " + shifted + " = __riscv_vsrl_vv_" + suffix + "(" +
-               loaded + ", " + shift + ", " + vl + ");");
-          loaded = std::move(shifted);
-        }
-        if (logicalWidth < 8) {
-          std::string masked = fresh("encoded_mask");
-          line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-               loaded + ", " + std::to_string(mask) + ", " + vl + ");");
-          loaded = std::move(masked);
-        }
-        decoded.parts.push_back(std::move(loaded));
-      }
-      return decoded;
+    if (vectorResult && field->access.getMapping() == "grouped_layered") {
+      result.getDefiningOp()->emitError(
+          "grouped/layered vector access reached emission without a typed physical window/stream operation");
+      return {};
     }
     if (vectorResult && !field->shape.empty()) {
       if (field->bitOffset % 8 || field->access.getMapping() != "natural" ||
@@ -6523,9 +6502,15 @@ mlir::LogicalResult Emitter::compileRVVLocalMaterialize(
 mlir::LogicalResult Emitter::compileSpill(riscv::SpillOp operation) {
   Binding input = bindings.lookup(operation.getInput());
   Binding slot = bindings.lookup(operation.getSlot());
-  if (operation.getLeaf().getEngine() != "transfer" ||
-      operation.getLeaf().getFamily() != "spill" ||
-      operation.getLeaf().getInstruction() != "rvv.spill" ||
+  const bool rvvSpill =
+      operation.getLeaf().getEngine() == "transfer" &&
+      operation.getLeaf().getFamily() == "spill" &&
+      operation.getLeaf().getInstruction() == "rvv.spill";
+  const bool scalarTupleSpill =
+      operation.getLeaf().getEngine() == "transfer" &&
+      operation.getLeaf().getFamily() == "spill" &&
+      operation.getLeaf().getInstruction() == "scalar.tuple-spill";
+  if ((!rvvSpill && !scalarTupleSpill) ||
       slot.kind != Binding::Kind::LocalArray || slot.scalar.empty())
     return fail(operation, "spill destination has no typed local allocation");
   riscv::LocalType slotType = operation.getSlot().getType();
@@ -6541,6 +6526,8 @@ mlir::LogicalResult Emitter::compileSpill(riscv::SpillOp operation) {
     input = std::move(*materialized);
   }
   if (input.kind == Binding::Kind::Vector) {
+    if (!rvvSpill)
+      return fail(operation, "vector spill requires the selected RVV spill leaf");
     auto inputType =
         mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
     const int64_t parts = vectorPartCount(operation.getInput());
@@ -6560,6 +6547,9 @@ mlir::LogicalResult Emitter::compileSpill(riscv::SpillOp operation) {
   }
   if (input.kind == Binding::Kind::Scalar ||
       input.kind == Binding::Kind::ScalarTuple) {
+    if (!scalarTupleSpill)
+      return fail(operation,
+                  "scalar register spill requires the selected tuple-spill leaf");
     llvm::SmallVector<std::string> values;
     if (input.kind == Binding::Kind::Scalar)
       values.push_back(input.scalar);
@@ -7448,6 +7438,82 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
 }
 
 mlir::LogicalResult
+Emitter::compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation) {
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "scalar.packed-plane-merge.words")
+    return fail(operation, "packed plane merge has no exact selected leaf");
+  Binding low = bindings.lookup(operation.getLowField());
+  Binding high = bindings.lookup(operation.getHighField());
+  if (low.kind != Binding::Kind::Field || high.kind != Binding::Kind::Field ||
+      low.field.owner != high.field.owner)
+    return fail(operation,
+                "packed plane merge requires two fields from one encoded record");
+  Binding owner = bindings.lookup(low.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(low.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto lowField = fieldFor(low);
+  auto highField = fieldFor(high);
+  auto plan = operation.getPlan();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      !lowField || !highField || lowField->bitOffset % 8 ||
+      highField->bitOffset % 8 ||
+      lowField->bitOffset / 8 != plan.getLowByteOffset() ||
+      highField->bitOffset / 8 != plan.getHighByteOffset() ||
+      registerPartCount(operation.getResult()) != plan.getLogicalElements())
+    return fail(operation,
+                "packed plane merge has no closed record and scalar-tuple mapping");
+
+  llvm::DenseMap<int64_t, std::string> loadedWords;
+  auto loadWord = [&](int64_t byteOffset) -> std::string {
+    auto found = loadedWords.find(byteOffset);
+    if (found != loadedWords.end())
+      return found->second;
+    std::string name = fresh("packed_plane_word");
+    line("uint32_t " + name + " = weft_load_u32_le((const uint8_t *)(" +
+         owner.recordPointer + " + " + std::to_string(byteOffset) + "));");
+    loadedWords[byteOffset] = name;
+    return name;
+  };
+  auto repeatedByteMask = [](int64_t bits) -> uint32_t {
+    const uint32_t byte = (uint32_t{1} << bits) - 1;
+    return byte * uint32_t{0x01010101};
+  };
+
+  Binding result;
+  result.kind = Binding::Kind::ScalarTuple;
+  const int64_t words = plan.getLogicalElements() / 4;
+  for (int64_t word = 0; word < words; ++word) {
+    const int64_t logical = word * 4;
+    const int64_t lowLayer = logical / plan.getLowLayerBytes();
+    const int64_t highLayer = logical / plan.getHighLayerBytes();
+    const int64_t lowOffset =
+        plan.getLowByteOffset() + logical % plan.getLowLayerBytes();
+    const int64_t highOffset =
+        plan.getHighByteOffset() + logical % plan.getHighLayerBytes();
+    const std::string lowWord = loadWord(lowOffset);
+    const std::string highWord = loadWord(highOffset);
+    const uint32_t lowMask = repeatedByteMask(plan.getLowBits());
+    const uint32_t highMask = repeatedByteMask(plan.getHighBits());
+    std::string merged = fresh("packed_plane_merge");
+    line("uint32_t " + merged + " = ((" + lowWord + " >> " +
+         std::to_string(lowLayer * plan.getLowBits()) + ") & " +
+         std::to_string(lowMask) + "u) | (((" + highWord + " >> " +
+         std::to_string(highLayer * plan.getHighBits()) + ") & " +
+         std::to_string(highMask) + "u) << " +
+         std::to_string(plan.getInsertBit()) + ");");
+    for (int64_t byte = 0; byte < 4; ++byte)
+      result.parts.push_back("((uint8_t)((" + merged + " >> " +
+                             std::to_string(byte * 8) + ") & 255u))");
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
 Emitter::compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation) {
   llvm::StringRef instruction = instructionOf(operation.getOperation());
   if (instruction != "rvv.bitplane-merge.mask" &&
@@ -7747,12 +7813,14 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   auto rhsInteger = rhsField ? mlir::dyn_cast<mlir::IntegerType>(rhsField->type)
                              : mlir::IntegerType();
   auto lhsType = mlir::dyn_cast<riscv::ValueType>(operation.getLhs().getType());
-  const int64_t outputParts = registerPartCount(operation.getResult());
+  const int64_t outputParts = vectorPartCount(operation.getResult());
+  const int64_t outputStreams = streamPartCount(operation.getResult());
   if (!lhsField || !rhsField || lhsOwner.kind != Binding::Kind::Record ||
       rhsOwner.kind != Binding::Kind::Record || !lhsInteger ||
       !lhsInteger.isUnsigned() || lhsInteger.getWidth() >= 8 || !rhsInteger ||
       !rhsInteger.isSigned() || rhsInteger.getWidth() != 8 || !lhsType ||
-      lhsType.getLayout().getCarrier() != "rvv" || outputParts <= 0)
+      lhsType.getLayout().getCarrier() != "rvv" || outputParts <= 0 ||
+      outputStreams <= 0 || outputParts % outputStreams)
     return fail(operation,
                 "grouped MAC reduction fields do not match its selected mixed-width vector form");
   Binding point = lhs.field.index ? bindings.lookup(*lhs.field.index) : Binding();
@@ -7763,29 +7831,20 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
     return fail(operation,
                 "grouped MAC reduction operands do not share one typed reduction point");
 
-  const int64_t group = operation.getGroup();
-  const int64_t unroll = operation.getUnroll();
-  const int64_t storageGroup = operation.getLhsAccess().getGroupSize();
-  const int64_t storageLayer = operation.getLhsAccess().getLayerSize();
-  if (operation.getLhsAccess().getMapping() != "grouped_layered" ||
-      operation.getRhsAccess().getMapping() != "natural" || group <= 0 ||
-      unroll <= 0 || storageGroup <= 0 || storageLayer <= 0 ||
-      storageGroup % storageLayer || storageLayer % group ||
-      lhsField->bitOffset % 8 || rhsField->bitOffset % 8)
-    return fail(operation,
-                "grouped MAC reduction has no legal packed window geometry");
+  riscv::GroupedMacPlanAttr plan = operation.getPlan();
+  const int64_t group = plan.getGroup();
+  const int64_t unroll = plan.getUnroll();
+  const int64_t storageGroup = plan.getStorageGroup();
+  const int64_t storageLayer = plan.getStorageLayer();
   std::string rowStride;
   for (const auto &[axis, stride] : lhsOwner.recordByteStrides)
-    if (axis == laneAxisFor(operation.getLhs()))
+    if (axis == plan.getRowStrideAxis())
       rowStride = stride;
-  if (lhsOwner.interleaveRows <= 0 && rowStride.empty())
+  if ((plan.getLoadForm() == "unit" && plan.getInterleaveRows() <= 0) ||
+      (plan.getLoadForm() == "strided" && rowStride.empty()))
     return fail(operation,
-                "grouped MAC reduction has neither interleaved nor strided cohort storage");
+                "grouped MAC reduction plan has no bound load form");
 
-  const int64_t storageLayers = storageGroup / storageLayer;
-  const bool lowFirst = operation.getLhsAccess().getOrder() == "lo_first";
-  if (!lowFirst && operation.getLhsAccess().getOrder() != "hi_first")
-    return fail(operation, "grouped MAC reduction has an invalid layer order");
   const std::string outSuffix = vectorSuffix(operation.getResult());
   const std::string outType = vectorType(operation.getResult());
   const std::string vl = partVL(operation.getResult(), 0);
@@ -7811,7 +7870,8 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   llvm::SmallVector<std::string> rhsRecords;
   auto recordForPart = [&](const Binding &owner, riscv::ValueType operand,
                            int64_t part) -> std::optional<std::string> {
-    auto coordinates = registerCoordinates(operation.getResult(), part);
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / outputStreams);
     if (!coordinates || coordinates->size() != resultAxes.size())
       return std::nullopt;
     std::string record = "(" + owner.recordPointer;
@@ -7825,6 +7885,14 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
       if (stride == owner.recordByteStrides.end())
         return std::nullopt;
       record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    const int64_t laneAxis = laneAxisFor(operation.getResult());
+    if (llvm::is_contained(operand.getAxisIds().asArrayRef(), laneAxis)) {
+      const std::string issueOffset = partOffset(operation.getResult(), part);
+      if (plan.getLoadForm() == "unit")
+        record += " + " + issueOffset;
+      else
+        record += " + (" + issueOffset + ") * (" + rowStride + ")";
     }
     record += ")";
     return record;
@@ -7851,29 +7919,22 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   }
   std::string logical = fresh("group_logical_base");
   std::string within = fresh("group_layer_within");
-  std::string layer = fresh("group_physical_layer");
   std::string byte = fresh("group_storage_byte");
   std::string shift = fresh("group_shift");
   line("const size_t " + logical + " = " + point.point.base + " % " +
-       std::to_string(lhsOwner.recordElements) + ";");
+       std::to_string(plan.getRecordElements()) + ";");
   line("const size_t " + within + " = " + logical + " % " +
        std::to_string(storageGroup) + ";");
-  if (lowFirst)
-    line("const size_t " + layer + " = " + within + " / " +
-         std::to_string(storageLayer) + ";");
-  else
-    line("const size_t " + layer + " = " +
-         std::to_string(storageLayers - 1) + " - " + within + " / " +
-         std::to_string(storageLayer) + ";");
   line("const size_t " + byte + " = " +
-       std::to_string(lhsField->bitOffset / 8) + " + (" + logical + " / " +
+       std::to_string(plan.getLhsBitOffsetBytes()) + " + (" + logical + " / " +
        std::to_string(storageGroup) + ") * " +
        std::to_string(storageLayer) + " + " + within + " % " +
        std::to_string(storageLayer) + ";");
-  line("const size_t " + shift + " = " + layer + " * " +
-       std::to_string(lhsInteger.getWidth()) + ";");
-  const int64_t qTermStride =
-      std::max<int64_t>(1, lhsOwner.interleaveRows);
+  line("const ptrdiff_t " + shift + " = " +
+       std::to_string(plan.getShiftBase()) + " + (" + within + " / " +
+       std::to_string(storageLayer) + ") * " +
+       std::to_string(plan.getShiftStep()) + ";");
+  const int64_t qTermStride = plan.getTermByteStride();
   llvm::SmallVector<std::string> qWindows;
   llvm::SmallVector<std::string> xWindows;
   for (int64_t part = 0; part < outputParts; ++part) {
@@ -7883,7 +7944,7 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
          byte + " * " + std::to_string(qTermStride) + ";");
     line("const int8_t *" + xWindow + " = (const int8_t *)(" +
          rhsRecords[part] + " + " +
-         std::to_string(rhsField->bitOffset / 8) + " + " + logical + ");");
+         std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical + ");");
     qWindows.push_back(std::move(qWindow));
     xWindows.push_back(std::move(xWindow));
   }
@@ -7893,7 +7954,7 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
     std::string address = window.str() + " + (" + term.str() + ") * " +
                           std::to_string(qTermStride);
     std::string loaded;
-    if (lhsOwner.interleaveRows > 0)
+    if (plan.getLoadForm() == "unit")
       loaded = "__riscv_vle8_v_" + rawSuffix +
                "((const uint8_t *)(" + address + "), " + partVL.str() + ")";
     else
@@ -7902,10 +7963,10 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
                rowStride + "), " + partVL.str() + ")";
     return "__riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" +
            rawSuffix + "(" + loaded + ", " + shift + ", " + partVL.str() +
-           "), " + std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " +
+           "), " + std::to_string(plan.getMaskValue()) + ", " +
            partVL.str() + ")";
   };
-  auto accumulateGroup = [&](llvm::StringRef groupIndex,
+  auto accumulateGroup = [&](llvm::StringRef groupIndex, int64_t termBase,
                              llvm::StringRef termLimit) {
     llvm::SmallVector<std::string> partials;
     for (int64_t part = 0; part < outputParts; ++part) {
@@ -7913,31 +7974,24 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
       line(partialType + " " + partial + ";");
       partials.push_back(std::move(partial));
     }
-    llvm::StringMap<std::string> decodedLoads;
     for (int64_t term = 0; term < group; ++term) {
+      const int64_t plannedTerm =
+          plan.getTermOrder()[static_cast<size_t>(termBase + term)] % group;
       std::string linear = "((" + groupIndex.str() + ") * " +
                            std::to_string(group) + " + " +
-                           std::to_string(term) + ")";
+                           std::to_string(plannedTerm) + ")";
       if (!termLimit.empty() && term != 0) {
-        line("if (" + std::to_string(term) + " < " + termLimit.str() + ") {");
+        line("if (" + std::to_string(plannedTerm) + " < " + termLimit.str() + ") {");
         ++indent;
       }
       for (int64_t part = 0; part < outputParts; ++part) {
         const std::string partVl = partVL(operation.getResult(), part);
-        std::string key = qWindows[part] + ":" + linear;
-        auto cached = decodedLoads.find(key);
-        std::string signedQ;
-        if (cached != decodedLoads.end()) {
-          signedQ = cached->second;
-        } else {
-          std::string q = fresh("group_q");
-          line(rawType + " " + q + " = " +
-               qLoad(qWindows[part], linear, partVl) + ";");
-          signedQ = fresh("group_q_signed");
-          line(signedRawType + " " + signedQ + " = __riscv_vreinterpret_v_" +
-               rawSuffix + "_" + signedRawSuffix + "(" + q + ");");
-          decodedLoads[key] = signedQ;
-        }
+        std::string q = fresh("group_q");
+        line(rawType + " " + q + " = " +
+             qLoad(qWindows[part], linear, partVl) + ";");
+        std::string signedQ = fresh("group_q_signed");
+        line(signedRawType + " " + signedQ + " = __riscv_vreinterpret_v_" +
+             rawSuffix + "_" + signedRawSuffix + "(" + q + ");");
         const std::string x = "*(" + xWindows[part] + " + " + linear + ")";
         if (term == 0)
           line(partials[part] + " = __riscv_vwmul_vx_" + partialSuffix +
@@ -7979,6 +8033,7 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   for (int64_t slot = 0; slot < unroll; ++slot)
     accumulateGroup("(" + chunk + " * " + std::to_string(unroll) + " + " +
                         std::to_string(slot) + ")",
+                    slot * group,
                     "");
   --indent;
   line("}");
@@ -7987,12 +8042,12 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
        std::to_string(unroll) + "; " + remainder + " < " + fullGroups +
        "; ++" + remainder + ") {");
   ++indent;
-  accumulateGroup(remainder, "");
+  accumulateGroup(remainder, 0, "");
   --indent;
   line("}");
   line("if (" + tail + " != 0) {");
   ++indent;
-  accumulateGroup(fullGroups, tail);
+  accumulateGroup(fullGroups, 0, tail);
   --indent;
   line("}");
 
@@ -8066,34 +8121,28 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
       point.point.base != rhsPoint.point.base)
     return fail(operation,
                 "grouped MAC load operands do not share one reduction point");
-  if (lhsOwner.recordElements <= 0)
-    return fail(operation, "grouped MAC load record has no logical element extent");
+  riscv::GroupedMacPlanAttr plan = operation.getPlan();
   const std::string logicalBase = "((" + point.point.base + " % " +
-                                  std::to_string(lhsOwner.recordElements) +
+                                  std::to_string(plan.getRecordElements()) +
                                   ") + " + groupIndex.scalar + " * " +
-                                  std::to_string(operation.getGroup()) + ")";
+                                  std::to_string(plan.getGroup()) + ")";
   std::string rowStride;
   for (const auto &[axis, stride] : lhsOwner.recordByteStrides)
-    if (axis == laneAxisFor(operation.getLhs()))
+    if (axis == plan.getRowStrideAxis())
       rowStride = stride;
+  if ((plan.getLoadForm() == "unit" && plan.getInterleaveRows() <= 0) ||
+      (plan.getLoadForm() == "strided" && rowStride.empty()))
+    return fail(operation, "grouped MAC load plan has no bound load form");
 
-  const int64_t storageGroup = operation.getLhsAccess().getGroupSize();
-  const int64_t storageLayer = operation.getLhsAccess().getLayerSize();
-  if (operation.getWindowForm() != "compact" &&
-      operation.getWindowForm() != "fragmented")
-    return fail(operation, "grouped MAC load has no selected window form");
-  const bool compactWindow = operation.getWindowForm() == "compact";
+  const int64_t storageGroup = plan.getStorageGroup();
+  const int64_t storageLayer = plan.getStorageLayer();
+  const bool compactWindow = plan.getKind() == "compact";
   std::string compactQBase;
   std::string compactXBase;
   std::string compactShift;
   if (compactWindow) {
-    const int64_t storageLayers = storageGroup / storageLayer;
-    const bool lowFirst = operation.getLhsAccess().getOrder() == "lo_first";
-    if (!lowFirst && operation.getLhsAccess().getOrder() != "hi_first")
-      return fail(operation, "grouped MAC window has an invalid layer order");
     std::string logical = fresh("group_logical_base");
     std::string within = fresh("group_layer_within");
-    std::string layer = fresh("group_physical_layer");
     std::string byte = fresh("group_storage_byte");
     compactShift = fresh("group_shift");
     compactQBase = fresh("group_q_window");
@@ -8101,43 +8150,37 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
     line("const size_t " + logical + " = " + logicalBase + ";");
     line("const size_t " + within + " = " + logical + " % " +
          std::to_string(storageGroup) + ";");
-    if (lowFirst)
-      line("const size_t " + layer + " = " + within + " / " +
-           std::to_string(storageLayer) + ";");
-    else
-      line("const size_t " + layer + " = " +
-           std::to_string(storageLayers - 1) + " - " + within + " / " +
-           std::to_string(storageLayer) + ";");
     line("const size_t " + byte + " = " +
-         std::to_string(lhsField->bitOffset / 8) + " + (" + logical + " / " +
+         std::to_string(plan.getLhsBitOffsetBytes()) + " + (" + logical + " / " +
          std::to_string(storageGroup) + ") * " +
          std::to_string(storageLayer) + " + " + within + " % " +
          std::to_string(storageLayer) + ";");
-    line("const size_t " + compactShift + " = " + layer + " * " +
-         std::to_string(lhsInteger.getWidth()) + ";");
-    const std::string qScale = lhsOwner.interleaveRows > 0
-                                   ? std::to_string(lhsOwner.interleaveRows)
-                                   : "1";
+    line("const ptrdiff_t " + compactShift + " = " +
+         std::to_string(plan.getShiftBase()) + " + (" + within + " / " +
+         std::to_string(storageLayer) + ") * " +
+         std::to_string(plan.getShiftStep()) + ";");
+    const std::string qScale = std::to_string(plan.getTermByteStride());
     line("const uint8_t *" + compactQBase + " = " + lhsOwner.recordPointer +
          " + " + byte + " * " + qScale + ";");
     line("const int8_t *" + compactXBase + " = (const int8_t *)(" +
          rhsOwner.recordPointer + " + " +
-         std::to_string(rhsField->bitOffset / 8) + " + " + logical + ");");
+         std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical + ");");
   }
 
   Binding window;
   window.kind = Binding::Kind::Window;
   window.windowFamily = "grouped-mac";
   const bool exactWindow = operation.getLeaf().getTail() == "exact";
-  for (int64_t slot = 0; slot < operation.getUnroll(); ++slot) {
-    for (int64_t term = 0; term < operation.getGroup(); ++term) {
-      const int64_t linear = slot * operation.getGroup() + term;
+  for (int64_t slot = 0; slot < plan.getUnroll(); ++slot) {
+    for (int64_t term = 0; term < plan.getGroup(); ++term) {
+      const int64_t ordinal = slot * plan.getGroup() + term;
+      const int64_t linear = plan.getTermOrder()[ordinal];
       const std::string logical = "(" + logicalBase + " + " +
                                   std::to_string(linear) + ")";
       const std::string valid =
           exactWindow ? "1"
                       : "(" + groupIndex.scalar + " * " +
-                            std::to_string(operation.getGroup()) + " + " +
+                            std::to_string(plan.getGroup()) + " + " +
                             std::to_string(linear) + " < " +
                             activeTerms.scalar + ")";
       std::string qAddress;
@@ -8146,32 +8189,36 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
       std::string xAddress;
       if (compactWindow) {
         const int64_t qOffset =
-            linear * std::max<int64_t>(1, lhsOwner.interleaveRows);
+            linear * plan.getTermByteStride();
         qAddress = compactQBase + " + " + std::to_string(qOffset);
-        if (lhsOwner.interleaveRows <= 0)
+        if (plan.getLoadForm() == "strided")
           qStride = rowStride;
         shift = compactShift;
         xAddress = compactXBase + " + " + std::to_string(linear);
       } else {
-        auto fragment = singleStorageFragment(
-            *lhsField, logical, static_cast<unsigned>(lhsInteger.getWidth()));
-        auto rhsFragment = singleStorageFragment(
-            *rhsField, logical, static_cast<unsigned>(rhsInteger.getWidth()));
-        if (!fragment || !rhsFragment)
-          return fail(operation,
-                      "grouped MAC load field has no typed storage fragment");
-        if (lhsOwner.interleaveRows > 0) {
-          qAddress = lhsOwner.recordPointer + " + (" + fragment->byte + ") * " +
-                     std::to_string(lhsOwner.interleaveRows);
-        } else if (!rowStride.empty()) {
-          qAddress = lhsOwner.recordPointer + " + (" + fragment->byte + ")";
-          qStride = rowStride;
+        const std::string within = "((" + logical + ") % " +
+                                   std::to_string(storageGroup) + ")";
+        const std::string physicalLayer =
+            "(" + std::to_string(plan.getPhysicalLayerBase()) + " + ((" +
+            within + ") / " + std::to_string(storageLayer) + ") * " +
+            std::to_string(plan.getPhysicalLayerStep()) + ")";
+        const std::string byte =
+            "(" + std::to_string(plan.getLhsBitOffsetBytes()) + " + ((" +
+            logical + ") / " + std::to_string(storageGroup) + ") * " +
+            std::to_string(storageLayer) + " + (" + within + ") % " +
+            std::to_string(storageLayer) + ")";
+        if (plan.getLoadForm() == "unit") {
+          qAddress = lhsOwner.recordPointer + " + (" + byte + ") * " +
+                     std::to_string(plan.getInterleaveRows());
         } else {
-          return fail(operation,
-                      "grouped MAC load has neither interleaved nor strided cohort storage");
+          qAddress = lhsOwner.recordPointer + " + (" + byte + ")";
+          qStride = rowStride;
         }
-        shift = fragment->shift;
-        xAddress = rhsOwner.recordPointer + " + " + rhsFragment->byte;
+        shift = "(" + std::to_string(plan.getShiftBase()) + " + ((" + within +
+                ") / " + std::to_string(storageLayer) + ") * " +
+                std::to_string(plan.getShiftStep()) + ")";
+        xAddress = rhsOwner.recordPointer + " + " +
+                   std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical;
       }
       auto loadExpression = [&]() {
         if (qStride.empty())
@@ -8196,9 +8243,9 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
       if (shift != "0")
         decoded = "__riscv_vsrl_vx_" + rawSuffix + "(" + decoded + ", " +
                   shift + ", " + laneVL() + ")";
-      if (lhsInteger.getWidth() < 8)
+      if (plan.getLogicalWidth() < 8)
         decoded = "__riscv_vand_vx_" + rawSuffix + "(" + decoded + ", " +
-                  std::to_string((1u << lhsInteger.getWidth()) - 1) + ", " +
+                  std::to_string(plan.getMaskValue()) + ", " +
                   laneVL() + ")";
       if (exactWindow) {
         line(rawType + " " + q + " = " + decoded + ";");
@@ -8856,7 +8903,9 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
 
 mlir::LogicalResult
 Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.storage-window")
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.storage-window.natural" &&
+      instruction != "rvv.storage-window.layered")
     return fail(operation, "RVV storage window has no exact selected leaf");
   Binding field = bindings.lookup(operation.getField());
   Binding point = bindings.lookup(operation.getOrigin());
@@ -8866,8 +8915,9 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
       offset.kind != Binding::Kind::Scalar || field.field.index)
     return fail(operation,
                 "RVV storage window requires one unprojected field, point, and scalar offset");
+  riscv::StorageWindowPlanAttr plan = operation.getPlan();
   field.field.useAccess = operation.getAccess();
-  if (operation.getAccess().getMapping() == "natural") {
+  if (instruction == "rvv.storage-window.natural") {
     Binding owner = bindings.lookup(field.field.owner);
     if (owner.kind == Binding::Kind::Slice) {
       auto record = recordForSlice(field.field.owner);
@@ -8879,7 +8929,7 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
     auto resultType = operation.getResult().getType();
     auto elementType = storage ? scalarCType(storage->type) : std::nullopt;
     auto axis = llvm::find(resultType.getAxisIds().asArrayRef(),
-                           operation.getReductionAxis());
+                           plan.getReductionAxis());
     const int64_t lanes =
         axis == resultType.getAxisIds().asArrayRef().end()
             ? 0
@@ -8892,11 +8942,16 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
       else if (auto floating = mlir::dyn_cast<mlir::FloatType>(storage->type))
         width = floating.getWidth();
     const int64_t bytes = width / 8;
-    const int64_t repeat = operation.getProjectionRepeat();
-    const int64_t stride = operation.getProjectionStride();
+    const int64_t repeat = plan.getProjectionRepeat();
+    const int64_t stride = plan.getProjectionStride();
     if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
         !storage || !elementType ||
-        storage->bitOffset % 8 || (width != 8 && width != 16 && width != 32) ||
+        owner.recordElements != plan.getRecordElements() ||
+        storage->bitOffset / 8 != plan.getByteOffset() ||
+        width != static_cast<unsigned>(plan.getElementBits()) ||
+        (plan.getKind() != "unit" && plan.getKind() != "strided" &&
+         plan.getKind() != "repeat") ||
+        (width != 8 && width != 16 && width != 32) ||
         bytes <= 0 || lanes <= 0 || repeat <= 0 || stride <= 0 ||
         (repeat % lanes && lanes % repeat))
       return fail(operation,
@@ -8914,7 +8969,7 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
     for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
       auto coordinates =
           registerCoordinates(operation.getResult(), part / streams);
-      if (streams != 1 || !coordinates || coordinates->size() != axes.size())
+      if (streams <= 0 || !coordinates || coordinates->size() != axes.size())
         return fail(operation,
                     "RVV projected storage window has no register-coordinate mapping");
       std::string record = "(" + owner.recordPointer;
@@ -8931,22 +8986,22 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
       record += ")";
       const std::string logical =
           "((" + point.point.base + ") % " +
-          std::to_string(owner.recordElements) + " + (" + offset.scalar + "))";
+          std::to_string(plan.getRecordElements()) + " + (" + offset.scalar + "))";
       auto address = [&](llvm::StringRef sourceIndex) {
         return "((const " + *elementType + " *)((const uint8_t *)(" + record +
-               ") + " + std::to_string(storage->bitOffset / 8) + "))[(" +
+               ") + " + std::to_string(plan.getByteOffset()) + "))[(" +
                sourceIndex.str() + ")]";
       };
       const std::string vl = partVL(operation.getResult(), part);
       std::string value;
-      if (repeat == 1) {
+      if (plan.getKind() == "unit" || plan.getKind() == "strided") {
         const std::string sourceIndex =
-            std::to_string(operation.getProjectionBase()) + " + (" + logical +
+            std::to_string(plan.getProjectionBase()) + " + (" + logical +
             ") * " + std::to_string(stride);
         std::string name = fresh("projected_window");
         const std::string pointer = "&(" + address(sourceIndex) + ")";
         const std::string expression =
-            stride == 1
+            plan.getKind() == "unit"
                 ? "__riscv_vle" + std::to_string(width) + "_v_" + suffix +
                       "(" + pointer + ", " + vl + ")"
                 : "__riscv_vlse" + std::to_string(width) + "_v_" + suffix +
@@ -8959,7 +9014,7 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
         const int64_t pieces = lanes / pieceWidth;
         for (int64_t piece = 0; piece < pieces; ++piece) {
           const std::string sourceIndex =
-              std::to_string(operation.getProjectionBase()) + " + ((" + logical +
+              std::to_string(plan.getProjectionBase()) + " + ((" + logical +
               " + " + std::to_string(piece * pieceWidth) + ") / " +
               std::to_string(repeat) + ") * " + std::to_string(stride);
           const std::string next =
@@ -8981,15 +9036,84 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
     bindings[operation.getResult()] = std::move(loaded);
     return mlir::success();
   }
-  field.field.index = operation.getOrigin();
-  field.field.selector = "domain";
-  field.field.relativeIndices.push_back(operation.getLogicalOffset());
-  Binding loaded = emitInterleavedField(operation.getResult(), field, "0");
-  if (loaded.kind != Binding::Kind::Vector ||
-      loaded.parts.size() !=
-          static_cast<size_t>(vectorPartCount(operation.getResult())))
+  Binding owner = bindings.lookup(field.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(field.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto storage = fieldFor(field);
+  auto integer = storage
+                     ? mlir::dyn_cast<mlir::IntegerType>(storage->type)
+                     : mlir::IntegerType();
+  auto resultType = operation.getResult().getType();
+  const int64_t group = plan.getGroupSize();
+  const int64_t layer = plan.getLayerSize();
+  const int64_t width = plan.getElementBits();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      owner.recordElements != plan.getRecordElements() || !storage || !integer ||
+      integer.isSigned() || integer.getWidth() != width ||
+      storage->bitOffset / 8 != plan.getByteOffset() ||
+      plan.getKind() != "layered" ||
+      width <= 0 || width >= 8 || group <= 0 || layer <= 0 || group % layer ||
+      plan.getProjectionBase() != 0 || plan.getProjectionStride() != 1 ||
+      plan.getProjectionRepeat() != 1)
     return fail(operation,
-                "RVV storage window did not materialize every selected vector part");
+                "layered RVV storage window has incomplete typed record geometry");
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> axes =
+      registerAxesFor(operation.getResult());
+  Binding loaded;
+  loaded.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / streams);
+    if (streams <= 0 || !coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "layered RVV storage window has no register-coordinate mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      auto byteStride = llvm::find_if(owner.recordByteStrides,
+                                      [&](const auto &entry) {
+                                        return entry.first == axis;
+                                      });
+      if (byteStride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "layered RVV storage window free axis has no record stride");
+      record += " + " + std::to_string(coordinate) + " * " + byteStride->second;
+    }
+    record += ")";
+    const std::string logical =
+        "((" + point.point.base + ") % " +
+        std::to_string(plan.getRecordElements()) + " + (" + offset.scalar +
+        ") + " + std::to_string(plan.getProjectionBase()) + " + " +
+        partOffset(operation.getResult(), part) + ")";
+    const std::string within = "((" + logical + ") % " +
+                               std::to_string(group) + ")";
+    const std::string byte =
+        "(" + std::to_string(plan.getByteOffset()) + " + ((" + logical +
+        ") / " + std::to_string(group) + ") * " + std::to_string(layer) +
+        " + (" + within + ") % " + std::to_string(layer) + ")";
+    const std::string logicalLayer =
+        "((" + within + ") / " + std::to_string(layer) + ")";
+    const std::string shift =
+        "(" + std::to_string(plan.getShiftBase()) + " + (" + logicalLayer +
+        ") * " + std::to_string(plan.getShiftStep()) + ")";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string raw = fresh("layered_window_raw");
+    line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+         "((const uint8_t *)(" + record + " + " + byte + "), " + vl + ");");
+    std::string decoded = "__riscv_vsrl_vx_" + suffix + "(" + raw + ", " +
+                          shift + ", " + vl + ")";
+    decoded = "__riscv_vand_vx_" + suffix + "(" + decoded + ", " +
+              std::to_string(plan.getMaskValue()) + ", " + vl + ")";
+    std::string name = fresh("layered_window");
+    line(type + " " + name + " = " + decoded + ";");
+    loaded.parts.push_back(std::move(name));
+  }
   bindings[operation.getResult()] = std::move(loaded);
   return mlir::success();
 }
@@ -9021,10 +9145,11 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
   auto windowType = operation.getResult().getType();
   auto valueType = windowType.getResultType();
   auto layout = valueType.getLayout();
-  const int64_t group = operation.getAccess().getGroupSize();
-  const int64_t layer = operation.getAccess().getLayerSize();
+  riscv::StorageWindowPlanAttr plan = operation.getPlan();
+  const int64_t group = plan.getGroupSize();
+  const int64_t layer = plan.getLayerSize();
   auto reduction = llvm::find(valueType.getAxisIds().asArrayRef(),
-                              operation.getReductionAxis());
+                              plan.getReductionAxis());
   const int64_t lanes =
       reduction == valueType.getAxisIds().asArrayRef().end()
           ? 0
@@ -9034,6 +9159,10 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
   const int64_t replicas = product(layout.getReplicaFactors());
   if (owner.kind != Binding::Kind::Record || !field || !integer ||
       integer.isSigned() || field->bitOffset % 8 || owner.recordElements <= 0 ||
+      plan.getKind() != "layered" ||
+      owner.recordElements != plan.getRecordElements() ||
+      field->bitOffset / 8 != plan.getByteOffset() ||
+      integer.getWidth() != plan.getElementBits() ||
       group <= 0 || layer <= 0 || lanes <= 0 || windowsPerLayer <= 0 ||
       replicas <= 0 || layout.getSew() != 8)
     return fail(operation,
@@ -9089,8 +9218,8 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
     record += ")";
     const std::string logicalBase =
         "(((" + point.point.base + ") % " +
-        std::to_string(owner.recordElements) + ") + " +
-        std::to_string(operation.getProjectionBase()) + ")";
+        std::to_string(plan.getRecordElements()) + ") + " +
+        std::to_string(plan.getProjectionBase()) + ")";
     const std::string groupIndex =
         "((" + logicalBase + " / " + std::to_string(group) + ") + (" +
         windowIndex.scalar + " / " + std::to_string(windowsPerLayer) + "))";
@@ -9099,7 +9228,7 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
         windowIndex.scalar + " % " + std::to_string(windowsPerLayer) + ") * " +
         std::to_string(lanes) + ")";
     const std::string byte =
-        "(" + std::to_string(field->bitOffset / 8) + " + " + groupIndex +
+        "(" + std::to_string(plan.getByteOffset()) + " + " + groupIndex +
         " * " + std::to_string(layer) + " + " + within + ")";
     std::string raw = fresh("layered_window_raw");
     line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
@@ -9114,7 +9243,17 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
 
 mlir::LogicalResult Emitter::compileRVVLayeredStorageDecode(
     riscv::RVVLayeredStorageDecodeOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.layered-storage-decode")
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool emitsShift =
+      instruction == "rvv.layered-storage-decode.shift" ||
+      instruction == "rvv.layered-storage-decode.shift-mask";
+  const bool emitsMask =
+      instruction == "rvv.layered-storage-decode.mask" ||
+      instruction == "rvv.layered-storage-decode.shift-mask";
+  if (instruction != "rvv.layered-storage-decode.identity" &&
+      instruction != "rvv.layered-storage-decode.mask" &&
+      instruction != "rvv.layered-storage-decode.shift" &&
+      instruction != "rvv.layered-storage-decode.shift-mask")
     return fail(operation,
                 "RVV layered storage decode has no exact selected leaf");
   Binding window = bindings.lookup(operation.getWindow());
@@ -9127,12 +9266,6 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageDecode(
       integer.isSigned() || window.windowLhs.empty())
     return fail(operation,
                 "RVV layered storage decode has no typed raw storage window");
-  const int64_t layers = load.getResult().getType().getLayers();
-  int64_t physicalLayer = operation.getLayer();
-  if (load.getAccess().getOrder() == "hi_first")
-    physicalLayer = layers - 1 - physicalLayer;
-  const unsigned width = integer.getWidth();
-  const uint64_t mask = (uint64_t(1) << width) - 1;
   const std::string suffix = vectorSuffix(operation.getResult());
   const std::string type = vectorType(operation.getResult());
   Binding result;
@@ -9142,17 +9275,18 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageDecode(
     const std::string vl = part < window.windowValidity.size()
                                ? window.windowValidity[part]
                                : std::to_string(physicalLanes(operation.getResult()));
-    if (physicalLayer != 0) {
+    if (emitsShift) {
       std::string shifted = fresh("layered_window_shift");
       line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-           value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+           value + ", " + std::to_string(operation.getShiftAmount()) + ", " + vl +
            ");");
       value = std::move(shifted);
     }
-    if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+    if (emitsMask) {
       std::string masked = fresh("layered_window_value");
       line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-           value + ", " + std::to_string(mask) + ", " + vl + ");");
+           value + ", " + std::to_string(operation.getMaskValue()) + ", " + vl +
+           ");");
       value = std::move(masked);
     }
     result.parts.push_back(std::move(value));
@@ -9167,7 +9301,12 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageDecode(
 
 mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
     riscv::RVVReplicaStorageLoadOp operation) {
-  const bool layered = operation.getAccess().getMapping() == "grouped_layered";
+  riscv::StorageWindowPlanAttr plan = operation.getPlan();
+  const bool layered = plan.getKind() == "layered";
+  const bool natural = plan.getKind() == "unit";
+  if (!natural && !layered)
+    return fail(operation,
+                "RVV replica storage load has no selected storage-window form");
   const std::string expected = layered
                                    ? "rvv.replica-storage-load.layered"
                                    : "rvv.replica-storage-load.natural";
@@ -9196,10 +9335,23 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   const int64_t lanes = physicalLanes(operation.getResult());
   if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
       !field || !fieldInteger || field->bitOffset % 8 || lanes <= 0 ||
+      owner.recordElements != plan.getRecordElements() ||
+      field->bitOffset / 8 != plan.getByteOffset() ||
+      static_cast<int64_t>(fieldInteger.getWidth()) != plan.getElementBits() ||
       operation.getWindowOffsets().empty() ||
+      operation.getRecordReplicaForWindow().size() !=
+          operation.getWindowOffsets().size() ||
       operation.getWindowForPart().size() !=
           static_cast<size_t>(vectorPartCount(operation.getResult())) ||
       operation.getLayerForPart().size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())) ||
+      operation.getPhysicalLayerForPart().size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())) ||
+      operation.getShiftOffsetForPart().size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())) ||
+      operation.getShiftBaseFactorForPart().size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())) ||
+      operation.getMaskValueForPart().size() !=
           static_cast<size_t>(vectorPartCount(operation.getResult())))
     return fail(operation,
                 "RVV replica storage load has incomplete record or part geometry");
@@ -9210,29 +9362,15 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   const int64_t streams = streamPartCount(operation.getResult());
   llvm::SmallVector<int64_t, 4> registerAxes =
       registerAxesFor(operation.getResult());
-  llvm::SmallVector<int64_t> windowReplicas(operation.getWindowOffsets().size(),
-                                            -1);
   if (streams <= 0)
     return fail(operation,
                 "RVV replica storage load has no issue-time part mapping");
-  for (auto [part, window] :
-       llvm::enumerate(operation.getWindowForPart())) {
-    if (window < 0 ||
-        window >= static_cast<int64_t>(windowReplicas.size()))
-      return fail(operation,
-                  "RVV replica storage load part references an absent source window");
-    const int64_t replica = static_cast<int64_t>(part) / streams;
-    int64_t &known = windowReplicas[static_cast<size_t>(window)];
-    if (known >= 0 && known != replica)
-      return fail(operation,
-                  "RVV replica storage window crosses register replicas");
-    known = replica;
-  }
   auto recordForWindow = [&](size_t window) -> std::optional<std::string> {
-    if (window >= windowReplicas.size() || windowReplicas[window] < 0)
+    if (window >= operation.getRecordReplicaForWindow().size())
       return std::nullopt;
+    const int64_t replica = operation.getRecordReplicaForWindow()[window];
     auto coordinates =
-        registerCoordinates(operation.getResult(), windowReplicas[window]);
+        registerCoordinates(operation.getResult(), replica);
     if (!coordinates || coordinates->size() != registerAxes.size())
       return std::nullopt;
     std::string record = "(" + owner.recordPointer;
@@ -9262,7 +9400,6 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
     if (!scalarType || (width != 8 && width != 16 && width != 32))
       return fail(operation,
                   "natural replica storage load requires a byte-addressable integer field");
-    const int64_t bytes = width / 8;
     for (auto [window, offset] :
          llvm::enumerate(operation.getWindowOffsets())) {
       auto record = recordForWindow(window);
@@ -9273,7 +9410,7 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
                                 std::to_string(offset) + ")";
       const std::string pointer =
           "((const " + *scalarType + " *)((const uint8_t *)(" +
-          *record + ") + " + std::to_string(field->bitOffset / 8) +
+          *record + ") + " + std::to_string(plan.getByteOffset()) +
           ")) + " + index;
       std::string raw = fresh("replica_window");
       line(vectorTypeValue + " " + raw + " = __riscv_vle" +
@@ -9282,8 +9419,8 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       windows.push_back(std::move(raw));
     }
   } else {
-    const int64_t group = operation.getAccess().getGroupSize();
-    const int64_t layer = operation.getAccess().getLayerSize();
+    const int64_t group = plan.getGroupSize();
+    const int64_t layer = plan.getLayerSize();
     const int64_t layers = group / layer;
     if (fieldInteger.isSigned() || group <= 0 || layer <= 0 || group % layer ||
         fieldInteger.getWidth() * layers > 8 || layout.getSew() != 8)
@@ -9300,7 +9437,7 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
         return fail(operation,
                     "layered replica storage window has no register-coordinate record");
       const std::string byte =
-          "(" + std::to_string(field->bitOffset / 8) + " + " + groupIndex +
+          "(" + std::to_string(plan.getByteOffset()) + " + " + groupIndex +
           " * " + std::to_string(layer) + " + " + withinLayer + " + " +
           std::to_string(offset) + ")";
       std::string raw = fresh("replica_layered_raw");
@@ -9313,7 +9450,6 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
 
   Binding result;
   result.kind = Binding::Kind::Vector;
-  const uint64_t mask = (uint64_t(1) << fieldInteger.getWidth()) - 1;
   for (size_t part = 0; part < operation.getWindowForPart().size(); ++part) {
     const int64_t window = operation.getWindowForPart()[part];
     if (window < 0 || window >= static_cast<int64_t>(windows.size()))
@@ -9321,40 +9457,32 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
                   "RVV replica storage load part references an absent source window");
     std::string value = windows[static_cast<size_t>(window)];
     if (layered) {
-      const int64_t group = operation.getAccess().getGroupSize();
-      const int64_t layer = operation.getAccess().getLayerSize();
-      const int64_t layers = group / layer;
-      std::optional<int64_t> constantLayer;
-      if (operation.getLogicalBaseMultiple() % group == 0) {
-        constantLayer = operation.getLayerForPart()[part];
-        if (operation.getAccess().getOrder() == "hi_first")
-          constantLayer = layers - 1 - *constantLayer;
-      }
-      if (!constantLayer || *constantLayer != 0) {
-        std::string physicalLayer;
-        if (constantLayer) {
-          physicalLayer = std::to_string(*constantLayer);
-        } else {
-          physicalLayer =
-              "(((" + logicalBase.scalar + ") % " + std::to_string(group) +
-              ") / " + std::to_string(layer) + " + " +
-              std::to_string(operation.getLayerForPart()[part]) + ")";
-          if (operation.getAccess().getOrder() == "hi_first")
-            physicalLayer = "(" + std::to_string(layers - 1) + " - " +
-                            physicalLayer + ")";
-        }
+      const int64_t group = plan.getGroupSize();
+      const int64_t layer = plan.getLayerSize();
+      const int64_t shiftOffset = operation.getShiftOffsetForPart()[part];
+      const int64_t shiftBaseFactor =
+          operation.getShiftBaseFactorForPart()[part];
+      if (shiftOffset != 0 || shiftBaseFactor != 0) {
+        std::string shift = std::to_string(shiftOffset);
+        if (shiftBaseFactor != 0)
+          shift = "(" + shift + " + " + std::to_string(shiftBaseFactor) +
+                  " * (((" + logicalBase.scalar + ") % " +
+                  std::to_string(group) + ") / " + std::to_string(layer) +
+                  "))";
         std::string shifted = fresh("replica_layered_shift");
         line(vectorTypeValue + " " + shifted + " = __riscv_vsrl_vx_" +
              vectorSuffixValue + "(" + value + ", (size_t)(" +
-             physicalLayer + " * " +
-             std::to_string(fieldInteger.getWidth()) + "), " + vl + ");");
+             shift + "), " + vl + ");");
         value = std::move(shifted);
       }
-      std::string decoded = fresh("replica_layered_value");
-      line(vectorTypeValue + " " + decoded + " = __riscv_vand_vx_" +
-           vectorSuffixValue + "(" + value + ", " +
-           std::to_string(mask) + ", " + vl + ");");
-      value = std::move(decoded);
+      const int64_t maskValue = operation.getMaskValueForPart()[part];
+      if (maskValue != 0) {
+        std::string decoded = fresh("replica_layered_value");
+        line(vectorTypeValue + " " + decoded + " = __riscv_vand_vx_" +
+             vectorSuffixValue + "(" + value + ", " +
+             std::to_string(maskValue) + ", " + vl + ");");
+        value = std::move(decoded);
+      }
     }
     result.parts.push_back(std::move(value));
   }
@@ -9787,22 +9915,31 @@ mlir::LogicalResult Emitter::compileRVVPartialScaleCombine(
       std::to_string(physicalLanesFor(inputType.getPartialType()));
   Binding result;
   result.kind = Binding::Kind::PartialSet;
+  llvm::SmallVector<std::string> combined;
+  combined.reserve(resultType.getSlots());
   for (int64_t resultSlot = 0; resultSlot < resultType.getSlots(); ++resultSlot) {
     const int64_t first = operation.getSlotOrder()[resultSlot * fanout];
-    std::string combined = fresh("scaled_partial");
-    line(type + " " + combined + " = __riscv_vmul_vx_" + suffix + "(" +
+    std::string seed = fresh("scaled_partial");
+    line(type + " " + seed + " = __riscv_vmul_vx_" + suffix + "(" +
          input.parts[first] + ", " + scales[first] + ", " + vl + ");");
-    for (int64_t term = 1; term < fanout; ++term) {
+    combined.push_back(std::move(seed));
+  }
+  // Independent chains are already fixed by the typed result slots.  Spell
+  // one dependency level from every chain before advancing to the next level
+  // so the C compiler can preserve their instruction-level parallelism.
+  for (int64_t term = 1; term < fanout; ++term) {
+    for (int64_t resultSlot = 0; resultSlot < resultType.getSlots();
+         ++resultSlot) {
       const int64_t slot =
           operation.getSlotOrder()[resultSlot * fanout + term];
       std::string next = fresh("scaled_partial_chain");
       line(type + " " + next + " = __riscv_vmacc_vx_" + suffix + "(" +
-           combined + ", " + scales[slot] + ", " + input.parts[slot] + ", " +
-           vl + ");");
-      combined = std::move(next);
+           combined[resultSlot] + ", " + scales[slot] + ", " +
+           input.parts[slot] + ", " + vl + ");");
+      combined[resultSlot] = std::move(next);
     }
-    result.parts.push_back(std::move(combined));
   }
+  result.parts = std::move(combined);
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
@@ -9852,30 +9989,20 @@ mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
   result.kind = Binding::Kind::PartialSet;
   for (int64_t resultSlot = 0; resultSlot < resultType.getSlots();
        ++resultSlot) {
-    llvm::SmallVector<std::string> level;
-    for (int64_t term = 0; term < operation.getCombineArity(); ++term) {
-      const size_t slot = static_cast<size_t>(
-          resultSlot * operation.getCombineArity() + term);
-      std::string scaled = fresh("partial_widen_scale");
-      line(type + " " + scaled + " = __riscv_vwmul_vx_" + suffix + "(" +
-           input.parts[slot] + ", " + scales[slot] + ", " + vl + ");");
-      level.push_back(std::move(scaled));
+    const size_t first =
+        static_cast<size_t>(resultSlot * operation.getCombineArity());
+    std::string accumulated = fresh("partial_widen_scale");
+    line(type + " " + accumulated + " = __riscv_vwmul_vx_" + suffix + "(" +
+         input.parts[first] + ", " + scales[first] + ", " + vl + ");");
+    for (int64_t term = 1; term < operation.getCombineArity(); ++term) {
+      const size_t slot = first + static_cast<size_t>(term);
+      std::string next = fresh("partial_widen_scale_chain");
+      line(type + " " + next + " = __riscv_vwmacc_vx_" + suffix + "(" +
+           accumulated + ", " + scales[slot] + ", " + input.parts[slot] +
+           ", " + vl + ");");
+      accumulated = std::move(next);
     }
-    while (level.size() > 1) {
-      llvm::SmallVector<std::string> next;
-      for (size_t term = 0; term < level.size(); term += 2) {
-        if (term + 1 == level.size()) {
-          next.push_back(std::move(level[term]));
-          continue;
-        }
-        std::string combined = fresh("partial_widen_scale_add");
-        line(type + " " + combined + " = __riscv_vadd_vv_" + suffix + "(" +
-             level[term] + ", " + level[term + 1] + ", " + vl + ");");
-        next.push_back(std::move(combined));
-      }
-      level = std::move(next);
-    }
-    result.parts.push_back(std::move(level.front()));
+    result.parts.push_back(std::move(accumulated));
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
@@ -10159,32 +10286,30 @@ Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
   auto field = fieldFor(fieldBinding);
   auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
                        : mlir::IntegerType();
-  auto resultType = operation.getResult().getType();
-  const int64_t group = operation.getAccess().getGroupSize();
-  const int64_t layer = operation.getAccess().getLayerSize();
-  const int64_t layers = layer > 0 ? group / layer : 0;
-  const int64_t streams = streamPartCount(operation.getResult());
-  const int64_t replicas = registerPartCount(operation.getResult());
+  auto geometry = operation.getGeometry();
+  const int64_t layer = geometry.getLayerSize();
+  const int64_t streams = geometry.getStreamCount();
+  const int64_t replicas = geometry.getReplicaCount();
+  const int64_t lanes = geometry.getLaneCount();
   llvm::SmallVector<int64_t, 4> axes =
       registerAxesFor(operation.getResult());
-  int64_t streamAxis = 0;
-  int64_t streamAxes = 0;
-  for (size_t index = 0; index < resultType.getShape().size(); ++index)
-    if (resultType.getLayout().getTimeFactors()[index] > 1 &&
-        resultType.getLayout().getLaneFactors()[index] > 1) {
-      streamAxis = resultType.getAxisIds()[index];
-      ++streamAxes;
-    }
   if (owner.kind != Binding::Kind::Record || !field || !integer ||
-      integer.isSigned() || field->bitOffset % 8 || layer <= 0 ||
-      group <= 0 || group % layer || layers <= 1 ||
-      integer.getWidth() * layers > 8 || streamAxes != 1 || streams <= 1 ||
-      replicas <= 0)
+      integer.isSigned() || field->bitOffset % 8 || layer <= 0 || lanes <= 0 ||
+      streams <= 1 || replicas <= 0 ||
+      geometry.getWindowForStream().size() != static_cast<size_t>(streams) ||
+      geometry.getRepresentativeStreamForWindow().size() !=
+          geometry.getGroupForWindow().size() ||
+      geometry.getPhysicalLayerForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getShiftAmountForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getMaskValueForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getGroupForWindow().size() !=
+          geometry.getWithinForWindow().size())
     return fail(operation,
                 "RVV layered stream has incomplete field, record, or layout geometry");
 
-  const unsigned width = integer.getWidth();
-  const uint64_t mask = (uint64_t(1) << width) - 1;
   const std::string suffix = vectorSuffix(operation.getResult());
   const std::string type = vectorType(operation.getResult());
   Binding result;
@@ -10207,57 +10332,43 @@ Emitter::compileRVVLayeredStream(riscv::RVVLayeredStreamOp operation) {
                     "RVV layered stream register axis has no record-byte stride");
     }
     record += ")";
-    llvm::StringMap<std::string> loadedWindows;
+    llvm::SmallVector<std::string> loadedWindows;
+    loadedWindows.reserve(geometry.getRepresentativeStreamForWindow().size());
+    for (auto [window, firstStream] :
+         llvm::enumerate(
+             geometry.getRepresentativeStreamForWindow().asArrayRef())) {
+      if (firstStream < 0)
+        return fail(operation,
+                    "RVV layered stream geometry contains an unused raw window");
+      const int64_t byteOffset =
+          field->bitOffset / 8 + geometry.getGroupForWindow()[window] * layer +
+          geometry.getWithinForWindow()[window];
+      const int64_t part = replica * streams + firstStream;
+      std::string raw = fresh("layered_stream_raw");
+      line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+           "((const uint8_t *)(" + record + " + " +
+           std::to_string(byteOffset) + "), " +
+           partVL(operation.getResult(), part) + ");");
+      loadedWindows.push_back(std::move(raw));
+    }
     for (int64_t stream = 0; stream < streams; ++stream) {
       const int64_t part = replica * streams + stream;
-      auto coordinate = timeCoordinate(operation.getResult(), part, streamAxis);
-      if (!coordinate)
-        return fail(operation,
-                    "RVV layered stream has no complete time coordinate");
-      const int64_t logicalOffset = *coordinate * physicalLanes(operation.getResult());
-      const int64_t groupIndex = logicalOffset / group;
-      const int64_t withinGroup = logicalOffset % group;
-      const int64_t logicalLayer = withinGroup / layer;
-      const int64_t withinLayer = withinGroup % layer;
-      if (logicalLayer < 0 || logicalLayer >= layers || withinLayer < 0 ||
-          withinLayer + physicalLanes(operation.getResult()) > layer)
-        return fail(operation,
-                    "RVV layered stream time/lane decomposition crosses a storage layer");
-      const int64_t physicalLayer =
-          operation.getAccess().getOrder() == "lo_first"
-              ? logicalLayer
-              : layers - 1 - logicalLayer;
-      const int64_t byteOffset = field->bitOffset / 8 + groupIndex * layer +
-                                 withinLayer;
+      const int64_t window = geometry.getWindowForStream()[stream];
+      const int64_t shiftAmount = geometry.getShiftAmountForStream()[stream];
+      const int64_t maskValue = geometry.getMaskValueForStream()[stream];
       const std::string vl = partVL(operation.getResult(), part);
-      // Time coordinates visit logical layers in order.  For one storage
-      // byte window the first visit therefore has at least as many active
-      // lanes as every later layer that shares it, so the raw load can be
-      // reused while each decode still uses its own selected VL.
-      const std::string cacheKey = std::to_string(byteOffset);
-      auto cached = loadedWindows.find(cacheKey);
-      std::string raw;
-      if (cached != loadedWindows.end()) {
-        raw = cached->second;
-      } else {
-        raw = fresh("layered_stream_raw");
-        line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
-             "((const uint8_t *)(" + record + " + " +
-             std::to_string(byteOffset) + "), " + vl + ");");
-        loadedWindows[cacheKey] = raw;
-      }
-      std::string value = raw;
-      if (physicalLayer != 0) {
+      std::string value = loadedWindows[static_cast<size_t>(window)];
+      if (shiftAmount != 0) {
         std::string shifted = fresh("layered_stream_shift");
         line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-             value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+             value + ", " + std::to_string(shiftAmount) + ", " + vl +
              ");");
         value = std::move(shifted);
       }
-      if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+      if (maskValue != 0) {
         std::string masked = fresh("layered_stream_value");
         line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-             value + ", " + std::to_string(mask) + ", " + vl + ");");
+             value + ", " + std::to_string(maskValue) + ", " + vl + ");");
         value = std::move(masked);
       }
       result.parts.push_back(std::move(value));
@@ -10294,33 +10405,30 @@ mlir::LogicalResult Emitter::compileRVVProjectedLayeredStream(
   auto field = fieldFor(fieldBinding);
   auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
                        : mlir::IntegerType();
-  auto resultType = operation.getResult().getType();
-  auto reduction = llvm::find(resultType.getAxisIds().asArrayRef(),
-                              operation.getReductionAxis());
-  const int64_t reductionPosition =
-      reduction == resultType.getAxisIds().asArrayRef().end()
-          ? -1
-          : reduction - resultType.getAxisIds().asArrayRef().begin();
-  const int64_t group = operation.getAccess().getGroupSize();
-  const int64_t layer = operation.getAccess().getLayerSize();
-  const int64_t layers = layer > 0 ? group / layer : 0;
-  const int64_t lanes = reductionPosition < 0
-                            ? 0
-                            : resultType.getLayout().getLaneFactors()[
-                                  static_cast<size_t>(reductionPosition)];
-  const int64_t streams = streamPartCount(operation.getResult());
-  const int64_t replicas = registerPartCount(operation.getResult());
+  auto geometry = operation.getGeometry();
+  const int64_t group = geometry.getGroupSize();
+  const int64_t layer = geometry.getLayerSize();
+  const int64_t streams = geometry.getStreamCount();
+  const int64_t replicas = geometry.getReplicaCount();
   if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
       !field || !integer || integer.isSigned() || field->bitOffset % 8 ||
-      reductionPosition < 0 || group <= 0 || layer <= 0 || group % layer ||
-      layers <= 1 || lanes <= 1 || streams <= 1 || replicas <= 0 ||
+      group <= 0 || layer <= 0 || group % layer || streams <= 1 || replicas <= 0 ||
       operation.getProjectionStride() != 1 ||
-      operation.getProjectionRepeat() != 1)
+      operation.getProjectionRepeat() != 1 ||
+      geometry.getWindowForStream().size() != static_cast<size_t>(streams) ||
+      geometry.getRepresentativeStreamForWindow().size() !=
+          geometry.getGroupForWindow().size() ||
+      geometry.getPhysicalLayerForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getShiftAmountForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getMaskValueForStream().size() !=
+          static_cast<size_t>(streams) ||
+      geometry.getGroupForWindow().size() !=
+          geometry.getWithinForWindow().size())
     return fail(operation,
                 "projected RVV layered stream has incomplete field or projection geometry");
 
-  const unsigned width = integer.getWidth();
-  const uint64_t mask = (uint64_t(1) << width) - 1;
   const std::string suffix = vectorSuffix(operation.getResult());
   const std::string type = vectorType(operation.getResult());
   llvm::SmallVector<int64_t, 4> axes =
@@ -10348,58 +10456,44 @@ mlir::LogicalResult Emitter::compileRVVProjectedLayeredStream(
         "(((" + point.point.base + ") % " +
         std::to_string(owner.recordElements) + ") / " +
         std::to_string(group) + ")";
-    llvm::StringMap<std::string> loadedWindows;
+    llvm::SmallVector<std::string> loadedWindows;
+    loadedWindows.reserve(geometry.getRepresentativeStreamForWindow().size());
+    for (auto [window, firstStream] :
+         llvm::enumerate(
+             geometry.getRepresentativeStreamForWindow().asArrayRef())) {
+      if (firstStream < 0)
+        return fail(operation,
+                    "projected RVV layered stream geometry contains an unused raw window");
+      const std::string byte =
+          "(" + std::to_string(field->bitOffset / 8) + " + (" + recordGroup +
+          " + " + std::to_string(geometry.getGroupForWindow()[window]) +
+          ") * " + std::to_string(layer) + " + " +
+          std::to_string(geometry.getWithinForWindow()[window]) + ")";
+      const int64_t part = replica * streams + firstStream;
+      std::string raw = fresh("projected_layered_raw");
+      line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
+           "((const uint8_t *)(" + record + " + " + byte + "), " +
+           partVL(operation.getResult(), part) + ");");
+      loadedWindows.push_back(std::move(raw));
+    }
     for (int64_t stream = 0; stream < streams; ++stream) {
       const int64_t part = replica * streams + stream;
-      auto coordinate = timeCoordinate(operation.getResult(), part,
-                                       operation.getReductionAxis());
-      if (!coordinate)
-        return fail(operation,
-                    "projected RVV layered stream has no complete time coordinate");
-      const int64_t logicalOffset =
-          operation.getProjectionBase() + *coordinate * lanes;
-      const int64_t groupIndex = logicalOffset / group;
-      const int64_t withinGroup = logicalOffset % group;
-      const int64_t logicalLayer = withinGroup / layer;
-      const int64_t withinLayer = withinGroup % layer;
-      if (logicalLayer < 0 || logicalLayer >= layers || withinLayer < 0 ||
-          withinLayer + lanes > layer)
-        return fail(operation,
-                    "projected RVV layered stream crosses one storage layer");
-      const int64_t physicalLayer =
-          operation.getAccess().getOrder() == "lo_first"
-              ? logicalLayer
-              : layers - 1 - logicalLayer;
-      const std::string cacheKey =
-          std::to_string(groupIndex) + ":" + std::to_string(withinLayer);
-      auto cached = loadedWindows.find(cacheKey);
-      std::string raw;
+      const int64_t window = geometry.getWindowForStream()[stream];
+      const int64_t shiftAmount = geometry.getShiftAmountForStream()[stream];
+      const int64_t maskValue = geometry.getMaskValueForStream()[stream];
       const std::string vl = partVL(operation.getResult(), part);
-      if (cached != loadedWindows.end()) {
-        raw = cached->second;
-      } else {
-        const std::string byte =
-            "(" + std::to_string(field->bitOffset / 8) + " + (" +
-            recordGroup + " + " + std::to_string(groupIndex) + ") * " +
-            std::to_string(layer) + " + " + std::to_string(withinLayer) + ")";
-        raw = fresh("projected_layered_raw");
-        line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
-             "((const uint8_t *)(" + record + " + " + byte + "), " + vl +
-             ");");
-        loadedWindows[cacheKey] = raw;
-      }
-      std::string value = raw;
-      if (physicalLayer != 0) {
+      std::string value = loadedWindows[static_cast<size_t>(window)];
+      if (shiftAmount != 0) {
         std::string shifted = fresh("projected_layered_shift");
         line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-             value + ", " + std::to_string(physicalLayer * width) + ", " + vl +
+             value + ", " + std::to_string(shiftAmount) + ", " + vl +
              ");");
         value = std::move(shifted);
       }
-      if ((physicalLayer + 1) * static_cast<int64_t>(width) != 8) {
+      if (maskValue != 0) {
         std::string masked = fresh("projected_layered_value");
         line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-             value + ", " + std::to_string(mask) + ", " + vl + ");");
+             value + ", " + std::to_string(maskValue) + ", " + vl + ");");
         value = std::move(masked);
       }
       result.parts.push_back(std::move(value));
@@ -10432,27 +10526,29 @@ Emitter::compileRVVLayeredWindow(riscv::RVVLayeredWindowOp operation) {
   Binding point = bindings.lookup(operation.getPoint());
   auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
                        : mlir::IntegerType();
-  const int64_t group = operation.getAccess().getGroupSize();
-  const int64_t layer = operation.getAccess().getLayerSize();
+  auto plan = operation.getPlan();
+  const int64_t group = plan.getGroupSize();
+  const int64_t layer = plan.getLayerSize();
   if (owner.kind != Binding::Kind::Record || !field ||
       point.kind != Binding::Kind::Point || !integer || integer.isSigned() ||
-      field->bitOffset % 8 || group != layer * 2 || owner.recordElements <= 0 ||
+      field->bitOffset % 8 || plan.getKind() != "layered" ||
+      group != layer * 2 || owner.recordElements != plan.getRecordElements() ||
+      field->bitOffset / 8 != plan.getByteOffset() ||
+      operation.getPhysicalLayerForResult().size() != 2 ||
+      operation.getShiftForResult().size() != 2 ||
+      operation.getMaskForResult().size() != 2 ||
       vectorPartCount(operation.getFirst()) !=
           vectorPartCount(operation.getSecond()))
     return fail(operation,
                 "layered window has no closed two-layer encoded realization");
 
-  const unsigned width = integer.getWidth();
-  const uint64_t mask = (uint64_t(1) << width) - 1;
   const std::string suffix = vectorSuffix(operation.getFirst());
   const std::string type = vectorType(operation.getFirst());
   const int64_t streams = streamPartCount(operation.getFirst());
   llvm::SmallVector<int64_t, 4> axes =
       registerAxesFor(operation.getFirst());
   const std::string logical = "(" + point.point.base + " % " +
-                              std::to_string(owner.recordElements) + ")";
-  const int64_t firstLayer = operation.getAccess().getOrder() == "lo_first" ? 0 : 1;
-  const int64_t secondLayer = 1 - firstLayer;
+                              std::to_string(plan.getRecordElements()) + ")";
   Binding first;
   Binding second;
   first.kind = Binding::Kind::Vector;
@@ -10469,7 +10565,7 @@ Emitter::compileRVVLayeredWindow(riscv::RVVLayeredWindowOp operation) {
           record += " + " + std::to_string(coordinate) + " * " + stride;
     record += ")";
     const std::string byte =
-        "(" + std::to_string(field->bitOffset / 8) + " + (" + logical +
+        "(" + std::to_string(plan.getByteOffset()) + " + (" + logical +
         " / " + std::to_string(group) + ") * " + std::to_string(layer) +
         " + (" + logical + " % " + std::to_string(layer) + ") + " +
         partOffset(operation.getFirst(), part) + ")";
@@ -10478,24 +10574,26 @@ Emitter::compileRVVLayeredWindow(riscv::RVVLayeredWindowOp operation) {
     line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
          "((const uint8_t *)(" + record + " + " + byte + "), " + vl +
          ");");
-    auto decode = [&](int64_t layerIndex, llvm::StringRef prefix) {
+    auto decode = [&](size_t resultIndex, llvm::StringRef prefix) {
+      const int64_t shiftAmount = operation.getShiftForResult()[resultIndex];
+      const int64_t maskValue = operation.getMaskForResult()[resultIndex];
       std::string value = raw;
-      if (layerIndex != 0) {
+      if (shiftAmount != 0) {
         std::string shifted = fresh("layered_shift");
         line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
-             value + ", " + std::to_string(layerIndex * width) + ", " + vl +
+             value + ", " + std::to_string(shiftAmount) + ", " + vl +
              ");");
         value = std::move(shifted);
       }
-      if ((layerIndex + 1) * static_cast<int64_t>(width) == 8)
+      if (maskValue == 0)
         return value;
       std::string masked = fresh(prefix);
       line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
-           value + ", " + std::to_string(mask) + ", " + vl + ");");
+           value + ", " + std::to_string(maskValue) + ", " + vl + ");");
       return masked;
     };
-    first.parts.push_back(decode(firstLayer, "layered_first"));
-    second.parts.push_back(decode(secondLayer, "layered_second"));
+    first.parts.push_back(decode(0, "layered_first"));
+    second.parts.push_back(decode(1, "layered_second"));
   }
   bindings[operation.getFirst()] = std::move(first);
   bindings[operation.getSecond()] = std::move(second);
@@ -11751,6 +11849,9 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
          << "}\n"
          << "static inline __attribute__((unused)) uint16_t weft_load_u16_le(const uint8_t *p) {\n"
          << "  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);\n"
+         << "}\n"
+         << "static inline __attribute__((unused)) uint32_t weft_load_u32_le(const uint8_t *p) {\n"
+         << "  uint32_t value; memcpy(&value, p, sizeof(value)); return value;\n"
          << "}\n"
          << "static inline __attribute__((unused)) _Float16 weft_load_f16_le(const uint8_t *p) {\n"
          << "  _Float16 value; memcpy(&value, p, sizeof(value)); return value;\n"

@@ -92,6 +92,7 @@ class Q2_K:
 @weft.encoding
 class Q3_K:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     hmask: u1[256] @ grouped(256) @ layered(32, lo_first)
     q: u2[256] @ grouped(128) @ layered(32, lo_first)
