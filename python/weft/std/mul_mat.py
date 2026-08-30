@@ -930,16 +930,9 @@ def mul_mat_iq2_xxs_staged(
                             x = admit(Xq[mb, kb])
                             entry_lane = iota(4)
                             codebook_lane = iota(8)
-                            block_partial = _iq2_xxs_group_products(
-                                w,
-                                x,
-                                grid,
-                                signs,
-                                entry_lane,
-                                codebook_lane,
-                                0,
-                            )
-                            for group in range(1, 8):
+                            block_sum = new(i32, [MR, NR], init=i32(0))
+                            group_index = index(0)
+                            with L.subs(kb, extent=32) as group:
                                 group_partial = _iq2_xxs_group_products(
                                     w,
                                     x,
@@ -947,13 +940,11 @@ def mul_mat_iq2_xxs_staged(
                                     signs,
                                     entry_lane,
                                     codebook_lane,
-                                    group,
+                                    group_index,
                                 )
-                                block_partial = (
-                                    block_partial + group_partial
-                                )
-                            entry_sum = reduce(block_partial, axis=1)
-                            block_sum = reduce(entry_sum, axis=1)
+                                entry_sum = reduce(group_partial, axis=2)
+                                block_sum += reduce(entry_sum, axis=1)
+                                group_index += index(1)
                             f32_acc += (
                                 f32(w.d)
                                 * f32(x.ds)
