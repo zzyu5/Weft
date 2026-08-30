@@ -50,7 +50,7 @@ from .encodings import (
 from .quant_fragments import (
     exponent_scale,
     nonlinear_lookup,
-    radix3_digit,
+    radix3_digit_i8,
     small_nonlinear_lookup,
 )
 
@@ -726,23 +726,43 @@ def vec_dot_tq1_0_q8_k(
     X: View[Q8_K, (K,)],
     powers: View[u32, (5,)],
 ):
+    power_table = materialize(admit(powers))
     result = f32(0.0)
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        integer = i32(0)
-        for j in range(32):
-            for digit in range(5):
-                q = radix3_digit(powers, w.q[j], digit)
-                integer += q * i32(x.q[digit * 32 + j])
-        for j in range(16):
-            for digit in range(5):
-                q = radix3_digit(powers, w.q[32 + j], digit)
-                integer += q * i32(x.q[160 + digit * 16 + j])
-        for digit in range(4):
-            for j in range(4):
-                q = radix3_digit(powers, w.qh[j], digit)
-                integer += q * i32(x.q[240 + digit * 4 + j])
+        lane0 = iota(32, axis="k")
+        q0 = radix3_digit_i8(power_table, w.q[lane0], 0)
+        partial0 = widen(q0, i16) * widen(x.q[lane0], i16)
+        for digit0 in range(1, 5):
+            q0 = radix3_digit_i8(power_table, w.q[lane0], digit0)
+            partial0 += widen(q0, i16) * widen(
+                x.q[u32(digit0 * 32) + lane0], i16
+            )
+        integer = reduce(widen(partial0, i32), axis=0)
+
+        lane1 = iota(16, axis="k")
+        q1 = radix3_digit_i8(power_table, w.q[u32(32) + lane1], 0)
+        partial1 = widen(q1, i16) * widen(x.q[u32(160) + lane1], i16)
+        for digit1 in range(1, 5):
+            q1 = radix3_digit_i8(
+                power_table, w.q[u32(32) + lane1], digit1
+            )
+            partial1 += widen(q1, i16) * widen(
+                x.q[u32(160 + digit1 * 16) + lane1], i16
+            )
+        integer += reduce(widen(partial1, i32), axis=0)
+
+        lane2 = iota(16, axis="k")
+        q2 = radix3_digit_i8(
+            power_table, w.qh[lane2 // u32(4)], lane2 % u32(4)
+        )
+        integer += contract(
+            q2,
+            x.q[u32(240) + (lane2 % u32(4)) * u32(4) + lane2 // u32(4)],
+            over="k",
+            acc=i32,
+        )
         result += f32(integer) * (f32(w.d) * f32(x.ds))
     return result
 

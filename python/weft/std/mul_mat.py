@@ -57,7 +57,7 @@ from .encodings import (
     TQ2_0,
 )
 from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
-from .quant_fragments import exponent_scale
+from .quant_fragments import exponent_scale, radix3_digit_i8
 from .vec_dot import (
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
@@ -83,7 +83,6 @@ from .vec_dot import (
     vec_dot_q5_k_q8_k,
     vec_dot_q6_k_q8_k,
     vec_dot_q8_0_q8_0,
-    vec_dot_tq1_0_q8_k,
     vec_dot_tq2_0_q8_k,
 )
 
@@ -1105,10 +1104,63 @@ def mul_mat_tq1_0(
     powers: View[u32, (5,)],
     Y: View[f32, (M, N)],
 ):
+    power_table = materialize(admit(powers))
     quantize_q8_K(X, Xq)
-    for row in range(M):
-        for column in range(N):
-            commit(vec_dot_tq1_0_q8_k(W[column], Xq[row], powers), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        wp = materialize(admit(W[nc]))
+        with L.tiles(M, extent=auto("MC")) as mc:
+            xp = materialize(admit(Xq[mc]))
+            with L.cols(nc, group=auto("NR")) as nb:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    acc = new(f32, [MR, NR], init=f32(0.0))
+                    with L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+
+                        integer = new(i32, [MR, NR], init=i32(0))
+                        lane0 = iota(32, axis="k")
+                        for digit0 in range(5):
+                            q0 = radix3_digit_i8(
+                                power_table, w.q[:, lane0], digit0
+                            )
+                            integer += outer_contract(
+                                x.q[:, u32(digit0 * 32) + lane0],
+                                q0,
+                                over="k",
+                                acc=i32,
+                            )
+
+                        lane1 = iota(16, axis="k")
+                        for digit1 in range(5):
+                            q1 = radix3_digit_i8(
+                                power_table, w.q[:, u32(32) + lane1], digit1
+                            )
+                            integer += outer_contract(
+                                x.q[:, u32(160 + digit1 * 16) + lane1],
+                                q1,
+                                over="k",
+                                acc=i32,
+                            )
+
+                        lane2 = iota(16, axis="k")
+                        q2 = radix3_digit_i8(
+                            power_table,
+                            w.qh[:, lane2 // u32(4)],
+                            lane2 % u32(4),
+                        )
+                        integer += outer_contract(
+                            x.q[
+                                :,
+                                u32(240)
+                                + (lane2 % u32(4)) * u32(4)
+                                + lane2 // u32(4),
+                            ],
+                            q2,
+                            over="k",
+                            acc=i32,
+                        )
+                        acc += (f32(w.d) * f32(x.ds)) * widen(integer, f32)
+                    commit(acc, Y[mb, nb])
 
 
 def mul_mat_tq2_0(

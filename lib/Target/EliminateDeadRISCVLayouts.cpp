@@ -2,14 +2,79 @@
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/BitVector.h"
 
 #include <memory>
 
 using namespace weft;
 
 namespace {
+
+bool eliminateOneDeadSCFForIterArgSet(mlir::ModuleOp module) {
+  mlir::scf::ForOp loop;
+  llvm::SmallVector<unsigned> deadIndices;
+  module.walk([&](mlir::scf::ForOp candidate) {
+    for (auto [index, iterArg, result] : llvm::enumerate(
+             candidate.getRegionIterArgs(), candidate.getResults())) {
+      if (iterArg.use_empty() && result.use_empty())
+        deadIndices.push_back(index);
+    }
+    if (deadIndices.empty())
+      return mlir::WalkResult::advance();
+    loop = candidate;
+    return mlir::WalkResult::interrupt();
+  });
+  if (!loop)
+    return false;
+
+  llvm::BitVector dead(loop.getInitArgs().size());
+  for (unsigned index : deadIndices)
+    dead.set(index);
+
+  llvm::SmallVector<mlir::Value> keptInitialValues;
+  llvm::SmallVector<unsigned> keptIndices;
+  for (auto [index, value] : llvm::enumerate(loop.getInitArgs())) {
+    if (dead.test(index))
+      continue;
+    keptInitialValues.push_back(value);
+    keptIndices.push_back(index);
+  }
+
+  mlir::IRRewriter rewriter(module.getContext());
+  rewriter.setInsertionPoint(loop);
+  auto replacement = rewriter.create<mlir::scf::ForOp>(
+      loop.getLoc(), loop.getLowerBound(), loop.getUpperBound(), loop.getStep(),
+      keptInitialValues,
+      [&](mlir::OpBuilder &builder, mlir::Location location,
+          mlir::Value induction, mlir::ValueRange iterArgs) {
+        mlir::IRMapping mapping;
+        mapping.map(loop.getInductionVar(), induction);
+        for (auto [replacementIndex, originalIndex] :
+             llvm::enumerate(keptIndices))
+          mapping.map(loop.getRegionIterArg(originalIndex),
+                      iterArgs[replacementIndex]);
+        for (mlir::Operation &operation : loop.getBody()->without_terminator())
+          builder.clone(operation, mapping);
+        auto oldYield =
+            mlir::cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+        llvm::SmallVector<mlir::Value> keptYields;
+        for (unsigned originalIndex : keptIndices)
+          keptYields.push_back(
+              mapping.lookupOrDefault(oldYield.getOperand(originalIndex)));
+        builder.create<mlir::scf::YieldOp>(location, keptYields);
+      });
+  replacement->setAttrs(loop->getAttrs());
+  for (auto [replacementIndex, originalIndex] : llvm::enumerate(keptIndices))
+    loop.getResult(originalIndex)
+        .replaceAllUsesWith(replacement.getResult(replacementIndex));
+  rewriter.eraseOp(loop);
+  return true;
+}
 
 class EliminateDeadRISCVLayoutsPass
     : public mlir::PassWrapper<EliminateDeadRISCVLayoutsPass,
@@ -27,6 +92,8 @@ public:
     bool changed = true;
     while (changed) {
       changed = false;
+      while (eliminateOneDeadSCFForIterArgSet(getOperation()))
+        changed = true;
       llvm::SmallVector<riscv::ConvertLayoutOp> dead;
       getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
         if (conversion.getConversion().getEffect() == "pure" &&

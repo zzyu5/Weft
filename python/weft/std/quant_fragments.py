@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from weft.language import f32, i32, lookup, u8, u32
+from weft.language import f32, i8, i32, lookup, narrow, u8, u16, u32, widen
 
 
 def extract_bits(value, shift, width: int = 1):
@@ -47,3 +47,20 @@ def radix3_digit(powers, packed, digit):
     power = lookup(powers, u32(digit), bounds="in_bounds")
     wrapped = (u32(packed) * u32(power)) & u32(255)
     return i32((wrapped * u32(3)) >> u32(8)) - i32(1)
+
+
+def radix3_digit_i8(powers, packed, digit):
+    power = narrow(
+        lookup(powers, u32(digit), bounds="in_bounds"),
+        u16,
+        rounding="rtz",
+        saturation=False,
+    )
+    wrapped = (widen(u8(packed), u16) * power) & u16(255)
+    decoded = narrow(
+        (wrapped * u16(3)) >> u16(8),
+        u8,
+        rounding="rtz",
+        saturation=False,
+    )
+    return i8(decoded) - i8(1)

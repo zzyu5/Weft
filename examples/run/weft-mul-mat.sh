@@ -303,6 +303,10 @@ else
       kernel=production_mul_mat_nvfp4
       meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=4)
     fi
+  elif [[ ${format} == tq1_0 ]]; then
+    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    kernel=production_mul_mat_tq1_0
+    meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=2)
   else
     kernel=production_mul_mat_${format}
   fi
