@@ -384,6 +384,29 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
   return reducedAxes;
 }
 
+bool constrainIndexedEntryLookup(riscv::LookupOp lookup, mlir::Value value,
+                                 Roles &roles) {
+  auto result = mlir::dyn_cast<riscv::ValueType>(lookup.getResult().getType());
+  if (!result)
+    return false;
+  auto relation = riscv_internal::analyzeIndexedEntryRelation(
+      lookup.getIndices(), result, {}, {});
+  if (!relation || !containsAxis(value.getType(), relation->payloadAxis))
+    return false;
+  // The payload inside one table entry is contiguous and therefore owns the
+  // memory-facing lane coordinate.  Entry coordinates remain independent
+  // register replicas here; a consumer that needs one flat contraction tile
+  // receives an explicit typed register-to-lane conversion.  Coalescing the
+  // entry coordinate into an ordinary byte gather is legal but substantially
+  // slower on both current targets.
+  roles.anchored = true;
+  roles.fullLaneExtent = true;
+  roles.memoryAnchored = true;
+  roles.laneAxis = relation->payloadAxis;
+  addSmallReplicas(value, roles, roles.laneAxis);
+  return true;
+}
+
 bool storageSupportsLaneAxes(mlir::Value root,
                              llvm::ArrayRef<int64_t> requestedAxes) {
   llvm::SmallVector<mlir::Value> worklist{root};
@@ -585,8 +608,10 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
     }
   for (int64_t axis : reduction)
     if (containsAxis(value.getType(), axis)) {
-      roles.laneAxis = axis;
-      break;
+      if (!roles.laneAxis)
+        roles.laneAxis = axis;
+      else
+        roles.coalescedLaneAxes.insert(axis);
     }
   // A contraction result and its operands deliberately have different physical
   // layouts.  The result preserves every later reduction coordinate as an
@@ -716,6 +741,9 @@ Roles rolesFor(mlir::Value value) {
     addSmallReplicas(value, roles, roles.laneAxis);
     return roles;
   }
+  if (auto lookup = value.getDefiningOp<riscv::LookupOp>();
+      lookup && constrainIndexedEntryLookup(lookup, value, roles))
+    return roles;
   if (auto operation = value.getDefiningOp<riscv::MacGroupsOp>()) {
     constrainGroupedMac(operation, value, roles);
   } else if (auto operation = value.getDefiningOp<riscv::DotOp>()) {
@@ -747,10 +775,12 @@ Roles rolesFor(mlir::Value value) {
     } else if (auto contract = mlir::dyn_cast<riscv::OuterContractOp>(owner)) {
       constrainOuterContractOperand(contract, value, roles);
     } else if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(owner)) {
-      auto axes = riscv_internal::logicalAxes(lookup.getIndices().getType());
-      if (!axes.empty() && containsAxis(value.getType(), axes.back()))
-        roles.laneAxis = axes.back();
-      addSmallReplicas(value, roles, roles.laneAxis);
+      if (!constrainIndexedEntryLookup(lookup, value, roles)) {
+        auto axes = riscv_internal::logicalAxes(lookup.getIndices().getType());
+        if (!axes.empty() && containsAxis(value.getType(), axes.back()))
+          roles.laneAxis = axes.back();
+        addSmallReplicas(value, roles, roles.laneAxis);
+      }
     }
   }
 

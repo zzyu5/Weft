@@ -87,29 +87,6 @@ from .vec_dot import (
 )
 
 
-def _iq2_xxs_entry_products(
-    word0,
-    word1,
-    x,
-    grid,
-    signs,
-    codebook_lane,
-    group,
-    entry,
-):
-    grid_index = (word0 >> u32(entry * 8)) & u32(255)
-    sign_index = (word1 >> u32(entry * 7)) & u32(127)
-    weight = lookup(
-        grid, grid_index * u32(8) + codebook_lane, bounds="in_bounds"
-    )
-    sign = lookup(
-        signs, sign_index * u32(8) + codebook_lane, bounds="in_bounds"
-    )
-    signed_weight = weight * sign
-    activation = x.q[:, group * 32 + entry * 8 + codebook_lane]
-    return widen(activation, i16) * widen(signed_weight, i16)
-
-
 def _iq2_xxs_group_products(
     w,
     x,
@@ -125,18 +102,24 @@ def _iq2_xxs_group_products(
     word1 = widen(w.q[:, group * 4 + 2], u32) | (
         widen(w.q[:, group * 4 + 3], u32) << u32(16)
     )
-    local = _iq2_xxs_entry_products(
-        word0,
-        word1,
-        x,
-        grid,
-        signs,
-        codebook_lane,
-        group,
-        entry_lane,
+    grid_index = (word0 >> u32(entry_lane * 8)) & u32(255)
+    sign_index = (word1 >> u32(entry_lane * 7)) & u32(127)
+    weight = lookup(
+        grid, grid_index * u32(8) + codebook_lane, bounds="in_bounds"
+    )
+    sign = lookup(
+        signs, sign_index * u32(8) + codebook_lane, bounds="in_bounds"
+    )
+    signed_weight = weight * sign
+    activation = x.q[:, group * 32 + entry_lane * 8 + codebook_lane]
+    integer = contract(
+        activation,
+        signed_weight,
+        over=("entry", "payload"),
+        acc=i32,
     )
     scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
-    return widen(local, i32) * scale
+    return integer * scale
 
 
 def mul_mat_q1_0(
@@ -928,8 +911,8 @@ def mul_mat_iq2_xxs_staged(
                         with L.blocks(kc, extent=256) as kb:
                             w = wp[nb, kb]
                             x = admit(Xq[mb, kb])
-                            entry_lane = iota(4)
-                            codebook_lane = iota(8)
+                            entry_lane = iota(4, axis="entry")
+                            codebook_lane = iota(8, axis="payload")
                             block_sum = new(i32, [MR, NR], init=i32(0))
                             group_index = index(0)
                             with L.subs(kb, extent=32) as group:
@@ -942,8 +925,7 @@ def mul_mat_iq2_xxs_staged(
                                     codebook_lane,
                                     group_index,
                                 )
-                                entry_sum = reduce(group_partial, axis=2)
-                                block_sum += reduce(entry_sum, axis=1)
+                                block_sum += group_partial
                                 group_index += index(1)
                             f32_acc += (
                                 f32(w.d)

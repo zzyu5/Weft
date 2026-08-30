@@ -346,7 +346,7 @@ private:
               std::max<unsigned>(8, rhsInteger.getWidth()) &&
           (lhsInteger.isSigned() || rhsInteger.isSigned()) &&
           resultInteger.isSigned() && resultInteger.getWidth() == 32 &&
-          over.size() == 1 && target.getHasWideningInteger() &&
+          !over.empty() && target.getHasWideningInteger() &&
           wideningDotFitsRegisterMicrotile())
         return rvvImplementation(builder, "widen-dot",
                                  "rvv.vwmul-vwredsum", over);

@@ -187,7 +187,7 @@ lane = iota(8, dtype=u32)
 within_k = iota(32, dtype=u32, axis="k")
 ```
 
-未指定 `axis` 时，`iota` 建立一条新的 logical axis。`axis="k"` 则让坐标值沿已经存在的 K axis 排列；它用于显式描述一个 K block 内的 field gather、bit-plane 组合或 lookup，不创建第二条同 extent 轴。两种形式都产生 shaped logical index Value，后续 gather、lookup、pointwise 与 reduce 按其 axis identity 组合。
+未指定 `axis` 时，`iota` 建立一条匿名 logical axis。`axis="k"` 为该轴给出可引用的名称：名称已经存在时复用已有 axis，否则建立一条新的具名 axis。它用于显式描述 field gather、bit-plane 组合、lookup 以及多轴 contraction；重复使用同一名称不会创建第二条同 extent 轴。两种形式都产生 shaped logical index Value，后续 gather、lookup、pointwise、reduce 与 contraction 按其 axis identity 组合。
 
 它与下面程序不同：
 

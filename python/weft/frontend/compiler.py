@@ -1583,11 +1583,7 @@ class FrontendCompiler:
                     "iota axis must name an existing logical axis",
                     self._location(call),
                 )
-            axis = self._axis_ids.get(axis_name.lower())
-            if axis is None:
-                raise FrontendError(
-                    f"unknown iota axis {axis_name!r}", self._location(call)
-                )
+            axis = self._axis_id(axis_name)
         result_type = value_type(ScalarType(dtype), (extent,), (axis,))
         return self._emit(
             "weft_kernel.iota",

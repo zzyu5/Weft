@@ -4265,22 +4265,12 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
     return factors[static_cast<size_t>(
         found - layout.getAxisIds().asArrayRef().begin())];
   };
-  const int64_t reductionAxis = getOver().empty() ? 0 : getOver()[0];
-  const bool compatibleReductionMapping =
-      reductionAxis && lhs.getLayout().getCarrier() == "rvv" &&
+  bool compatibleReductionMapping =
+      !getOver().empty() && lhs.getLayout().getCarrier() == "rvv" &&
       rhs.getLayout().getCarrier() == "rvv" &&
-      lhs.getLayout().getSew() == rhs.getLayout().getSew() &&
-      factorFor(lhs.getLayout(), lhs.getLayout().getLaneFactors(),
-                reductionAxis) ==
-          factorFor(rhs.getLayout(), rhs.getLayout().getLaneFactors(),
-                    reductionAxis) &&
-      factorFor(lhs.getLayout(), lhs.getLayout().getTimeFactors(),
-                reductionAxis) ==
-          factorFor(rhs.getLayout(), rhs.getLayout().getTimeFactors(),
-                    reductionAxis);
-  bool compatibleStreamedReductions = true;
-  for (int64_t axis : getOver().drop_front()) {
-    auto completeTimeAxis = [&](ValueType value) {
+      lhs.getLayout().getSew() == rhs.getLayout().getSew();
+  for (int64_t axis : getOver()) {
+    auto completeMappedAxis = [&](ValueType value) {
       auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
       if (found == value.getAxisIds().asArrayRef().end())
         return false;
@@ -4288,14 +4278,20 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
           found - value.getAxisIds().asArrayRef().begin());
       const int64_t extent = value.getShape()[position];
       auto layout = value.getLayout();
-      return extent > 0 && layout.getTimeFactors()[position] == extent &&
-             layout.getLaneFactors()[position] == 1 &&
+      return extent > 0 &&
+             layout.getTimeFactors()[position] *
+                     layout.getLaneFactors()[position] ==
+                 extent &&
              layout.getReplicaFactors()[position] == 1 &&
              layout.getFragmentFactors()[position] == 1 &&
              layout.getLocalFactors()[position] == 1;
     };
-    compatibleStreamedReductions &= completeTimeAxis(lhs) &&
-                                    completeTimeAxis(rhs);
+    compatibleReductionMapping &=
+        completeMappedAxis(lhs) && completeMappedAxis(rhs) &&
+        factorFor(lhs.getLayout(), lhs.getLayout().getLaneFactors(), axis) ==
+            factorFor(rhs.getLayout(), rhs.getLayout().getLaneFactors(), axis) &&
+        factorFor(lhs.getLayout(), lhs.getLayout().getTimeFactors(), axis) ==
+            factorFor(rhs.getLayout(), rhs.getLayout().getTimeFactors(), axis);
   }
   llvm::StringRef topologyKind = getPartialTopology().getKind();
   auto partialLayoutPlan = getPartialLayoutPlanAttr();
@@ -4307,13 +4303,24 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   if (partialLayoutPlan) {
     auto partialSlot = mlir::dyn_cast<ValueType>(
         partialLayoutPlan.getPartialSlotType());
-    auto partialAxis = partialSlot && !getOver().empty()
-                           ? llvm::find(partialSlot.getAxisIds().asArrayRef(),
-                                        getOver()[0])
-                           : llvm::ArrayRef<int64_t>::iterator();
-    layoutPlanClosed &= partialSlot &&
-                        partialSlot.getLayout().getCarrier() == "rvv" &&
-                        partialAxis != partialSlot.getAxisIds().asArrayRef().end();
+    int64_t plannedLanes = 1;
+    bool completePartialAxes =
+        partialSlot && partialSlot.getLayout().getCarrier() == "rvv" &&
+        partialSlot.getAxisIds().asArrayRef() == getOver() &&
+        partialSlot.getShape().size() == getOver().size();
+    if (completePartialAxes)
+      for (auto [extent, lane] :
+           llvm::zip(partialSlot.getShape().asArrayRef(),
+                     partialSlot.getLayout().getLaneFactors().asArrayRef())) {
+        if (extent <= 0 || extent != lane ||
+            plannedLanes > getReductionLanes() / extent) {
+          completePartialAxes = false;
+          break;
+        }
+        plannedLanes *= extent;
+      }
+    layoutPlanClosed &=
+        completePartialAxes && plannedLanes == getReductionLanes();
     const int64_t sourceSlots = getPartialTopology().getSourceSlots();
     const int64_t split = getPartialTopology().getLaneSplit();
     const int64_t expected =
@@ -4397,7 +4404,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
           std::max<unsigned>(8, rhsElement.getWidth()) ||
       (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
       resultElement.getWidth() != 32 || !legalResult ||
-      getOver().empty() || !compatibleStreamedReductions ||
+      getOver().empty() ||
       !llvm::is_contained(lhs.getAxisIds().asArrayRef(), getOver()[0]) ||
       !llvm::is_contained(rhs.getAxisIds().asArrayRef(), getOver()[0]) ||
       !compatibleReductionMapping ||
@@ -4413,8 +4420,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
     return emitOpError()
            << "RVV widening dot requires matching <=16-bit integer vectors with "
               "at least one signed operand, one selected partial topology, "
-              "one shared lane reduction axis, optional "
-              "issue-time reduction axes, a signed-i32 scalar result, and a legal doubled "
+              "one or more mapped reduction axes, a signed-i32 scalar result, "
+              "and a legal doubled "
               "LMUL; lhs="
            << lhs << ", rhs=" << rhs << ", result=" << getResult().getType()
            << ", over=" << getOver() << ", partial_lmul=" << partialLMUL

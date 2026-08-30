@@ -553,22 +553,39 @@ riscv::ValueType partialSlotType(mlir::Builder &builder,
   if (!inputElement || inputElement.isSignless() ||
       inputElement.getWidth() > 16)
     return {};
-  const int64_t reductionAxis = dot.getOver()[0];
   const int64_t partialWidth =
       2 * std::max<int64_t>(8, inputElement.getWidth());
   const int64_t partialLMUL = 2 * dot.getSliceLmulEighths();
   const int64_t groups = std::max<int64_t>(1, (partialLMUL + 7) / 8);
-  auto axisIds = riscv_internal::integers(builder, {reductionAxis});
-  auto one = riscv_internal::integers(builder, {1});
-  auto lanes = riscv_internal::integers(
-      builder, {static_cast<int64_t>(dot.getReductionLanes())});
+  llvm::SmallVector<int64_t> axes;
+  llvm::SmallVector<int64_t> lanes;
+  int64_t laneProduct = 1;
+  for (int64_t axis : dot.getOver()) {
+    auto position = axisPosition(dot.getLhs().getType(), axis);
+    if (!position)
+      return {};
+    const int64_t lane =
+        dot.getLhs().getType().getLayout().getLaneFactors()[*position];
+    if (lane <= 0 || laneProduct > dot.getReductionLanes() / lane)
+      return {};
+    axes.push_back(axis);
+    lanes.push_back(lane);
+    laneProduct *= lane;
+  }
+  if (laneProduct != dot.getReductionLanes())
+    return {};
+  llvm::SmallVector<int64_t> one(axes.size(), 1);
+  auto axisIds = riscv_internal::integers(builder, axes);
+  auto oneAttr = riscv_internal::integers(builder, one);
+  auto lanesAttr = riscv_internal::integers(builder, lanes);
   auto layout = riscv::LayoutAttr::get(
-      builder.getContext(), "rvv", axisIds, one, lanes, one, one, one,
+      builder.getContext(), "rvv", axisIds, oneAttr, lanesAttr, oneAttr,
+      oneAttr, oneAttr,
       partialWidth, partialLMUL, dot.getReductionLanes(), groups,
       dot.getLhs().getType().getLayout().getValidity());
   auto element = mlir::IntegerType::get(builder.getContext(), partialWidth,
                                         mlir::IntegerType::Signed);
-  return riscv::ValueType::get(builder.getContext(), element, lanes, axisIds,
+  return riscv::ValueType::get(builder.getContext(), element, lanesAttr, axisIds,
                                layout);
 }
 
@@ -2030,7 +2047,7 @@ public:
       riscv::ValueType reducedSlot =
           sourcePlan
               ? sourcePlan->geometry.reducedSlot
-              : (partialSlot && !dot.getOver().empty()
+              : (partialSlot && dot.getOver().size() == 1
                      ? reducedPartialSlotType(builder, partialSlot,
                                               dot.getOver()[0])
                      : riscv::ValueType());
@@ -2045,7 +2062,7 @@ public:
               mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
       }
       riscv::ValueType vectorSlot =
-          vectorResult && !dot.getOver().empty()
+          vectorResult && dot.getOver().size() == 1
               ? vectorPartialSlotType(builder, dot.getLhs().getType(),
                                       vectorResult, dot.getOver()[0])
               : riscv::ValueType();
@@ -2069,7 +2086,8 @@ public:
       const int64_t reductionAxis =
           dot.getOver().empty() ? 0 : dot.getOver()[0];
       const bool completeSetGeometry =
-          reductionAxis > 0 && combineArity > 0 && partialSlots > 0 &&
+          dot.getOver().size() == 1 && reductionAxis > 0 &&
+          combineArity > 0 && partialSlots > 0 &&
           partialSlots % combineArity == 0 && !partialSlot.getShape().empty();
       if (completeSetGeometry) {
         const int64_t partialGroups =

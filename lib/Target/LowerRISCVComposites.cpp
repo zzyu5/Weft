@@ -2297,7 +2297,7 @@ private:
                 std::max<unsigned>(8, rhsElement.getWidth()) ||
             (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
             !resultElement.isSigned() || resultElement.getWidth() != 32 ||
-            over.size() != 1 || !target.getHasWideningInteger() ||
+            over.empty() || !target.getHasWideningInteger() ||
             !riscv::supportsRVVLayout(target, lhsType.getLayout()) ||
             !riscv::supportsRVVLayout(target, rhsType.getLayout()) ||
             lhsType.getLayout().getSew() != rhsType.getLayout().getSew() ||
@@ -2329,16 +2329,20 @@ private:
         auto lhsMagnitude = riscv_internal::maximumMagnitude(lhsValue);
         auto rhsMagnitude = riscv_internal::maximumMagnitude(rhsValue);
         auto hasFullReductionMapping = [&](riscv::ValueType value) {
-          auto found = llvm::find(value.getAxisIds().asArrayRef(), over[0]);
-          if (found == value.getAxisIds().asArrayRef().end())
-            return false;
-          const size_t position = static_cast<size_t>(
-              found - value.getAxisIds().asArrayRef().begin());
-          const int64_t extent = value.getShape()[position];
-          return extent > 0 &&
-                 value.getLayout().getLaneFactors()[position] *
-                         value.getLayout().getTimeFactors()[position] ==
-                     extent;
+          for (int64_t axis : over.asArrayRef()) {
+            auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
+            if (found == value.getAxisIds().asArrayRef().end())
+              return false;
+            const size_t position = static_cast<size_t>(
+                found - value.getAxisIds().asArrayRef().begin());
+            const int64_t extent = value.getShape()[position];
+            if (extent <= 0 ||
+                value.getLayout().getLaneFactors()[position] *
+                        value.getLayout().getTimeFactors()[position] !=
+                    extent)
+              return false;
+          }
+          return true;
         };
         const bool fusedStreamsLegal =
             hasFullReductionMapping(lhsType) &&

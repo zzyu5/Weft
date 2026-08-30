@@ -1268,7 +1268,8 @@ riscv_internal::analyzeIndexedEntryRelation(
     entryIndices = stripRepresentationConversions(entryIndices);
     auto entryType = mlir::dyn_cast<riscv::ValueType>(entryIndices.getType());
     if (!entryType ||
-        (entryType.getLayout().getCarrier() != "scalar" &&
+        (entryType.getLayout().getCarrier() != "unassigned" &&
+         entryType.getLayout().getCarrier() != "scalar" &&
          entryType.getLayout().getCarrier() != "rvv") ||
         indices.getAxisIds().size() != entryType.getAxisIds().size() + 1 ||
         !llvm::equal(entryType.getAxisIds().asArrayRef(),

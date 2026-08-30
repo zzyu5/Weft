@@ -32,6 +32,8 @@ if [[ ${format} != f32 && ${format_id} -lt 0 ]]; then
 fi
 if [[ ${format} == q4_k && ${phase} == prefill ]]; then
   format=q4_k_staged
+elif [[ ${format} == iq2_xxs && ${phase} == prefill ]]; then
+  format=iq2_xxs_staged
 fi
 
 case "${target}" in
@@ -118,7 +120,7 @@ else
     runtime_kernel_define=-DWEFT_IQ2_XXS_STAGED=1
     kernel=production_mul_mat_iq2_xxs_staged
     if [[ ${target} == sg2044 ]]; then
-      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=1)
+      meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=1 --meta NR=2)
       physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
     else
       meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
