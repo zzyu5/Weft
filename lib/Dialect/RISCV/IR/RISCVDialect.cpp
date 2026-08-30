@@ -4065,9 +4065,16 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
       (validity != "full" && validity != "tail") ||
       !exactLeaf(getLeaf(), "rvv", "bitmask-window-load",
                  "rvv.bitmask-window-load", "none", tail))
-    return emitOpError(
-        "RVV bitmask window load requires one byte-aligned logical-u1 field, "
-        "one scalar byte base, complete lane window axes, and the exact RVV leaf");
+    return emitOpError()
+           << "RVV bitmask window load requires one byte-aligned logical-u1 field, "
+              "one scalar byte base, complete lane window axes, and the exact RVV leaf; "
+              "field_def="
+           << (getField().getDefiningOp()
+                   ? getField().getDefiningOp()->getName().getStringRef()
+                   : llvm::StringRef("block-argument"))
+           << ", field=" << field << ", byte_base=" << getByteBase().getType()
+           << ", scalar_base=" << scalarBase << ", result=" << result
+           << ", access=" << getAccess();
 
   llvm::DenseSet<int64_t> windowAxes;
   for (int64_t axis : getWindowAxes())

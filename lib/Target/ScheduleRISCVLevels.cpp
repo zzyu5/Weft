@@ -6,6 +6,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <memory>
 
@@ -96,6 +97,32 @@ bool dependsOnStageOne(mlir::Operation *operation,
       return true;
   }
   return false;
+}
+
+bool isReplayableDescriptor(mlir::Operation *operation) {
+  // FieldOp carries an encoded-field view, not runtime data.  If every in-loop
+  // consumer belongs to the compute stage, replaying the descriptor there is
+  // both cheaper and semantically stronger than turning it into a cross-stage
+  // loop carry that intrinsic-C cannot represent as a value.
+  return mlir::isa<riscv::FieldOp>(operation);
+}
+
+bool onlyFeedsStageOne(mlir::Operation *operation,
+                       const llvm::DenseSet<mlir::Operation *> &stageOne,
+                       mlir::Block *body) {
+  bool hasConsumer = false;
+  for (mlir::Value result : operation->getResults())
+    for (mlir::OpOperand &use : result.getUses()) {
+      mlir::Operation *owner = use.getOwner();
+      while (owner && owner->getBlock() != body)
+        owner = owner->getParentOp();
+      if (!owner || owner->getBlock() != body)
+        continue;
+      hasConsumer = true;
+      if (!stageOne.contains(owner))
+        return false;
+    }
+  return hasConsumer;
 }
 
 class ScheduleRISCVLevelsPass
@@ -198,6 +225,15 @@ public:
           }
       }
 
+      // Descriptor aliases follow their consumers.  Tile-language pipeline
+      // planners replay scalar/view bindings instead of versioning them as
+      // buffers; the same rule keeps a typed FieldOp adjacent to the physical
+      // load that consumes its access relation.
+      for (mlir::Operation *operation : llvm::reverse(operations))
+        if (!stageOne.contains(operation) && isReplayableDescriptor(operation) &&
+            onlyFeedsStageOne(operation, stageOne, body))
+          stageOne.insert(operation);
+
       bool hasStageZero = false;
       bool hasStageOne = false;
       bool crossesStage = false;
@@ -228,9 +264,11 @@ public:
           operation->removeAttr(kStageAttr);
           operation->removeAttr(kOrderAttr);
         }
-        loop.emitError(
-            "physical Level has no dependency-derived producer/consumer cluster for the requested pipeline depth");
-        failed = true;
+        // The CLI depth is an auto parameter over eligible local clusters, not
+        // an author requirement that every innermost carried Level be
+        // pipelined.  A loop with no producer/consumer split remains the same
+        // legal sequential program.
+        loop->removeAttr("weft.riscv.schedule");
       }
     }
 
