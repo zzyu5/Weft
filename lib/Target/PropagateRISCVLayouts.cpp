@@ -1930,8 +1930,9 @@ private:
               riscv_internal::analyzeIndexedEntryRelation(
                   sourceValue, result, {}, {}))
             continue;
-          operation->emitError(
-              "no legal target layout projects the pointwise result mapping to its operand");
+          operation->emitError()
+              << "no legal target layout projects pointwise result "
+              << result << " to operand " << operandType;
           signalPassFailure();
           continue;
         }

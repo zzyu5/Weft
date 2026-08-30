@@ -1605,6 +1605,7 @@ private:
       auto load = rewriter.create<riscv::RVVGroupedMacLoadOp>(
           reduce.getLoc(), windowType, lhs, rhs, loop.getInductionVar(), active,
           loadLayout, partialLayout,
+          rewriter.getDenseI64ArrayAttr(*supplyPlan),
           groupedPlan(compactWindow ? "compact" : "fragmented"),
           riscv_internal::leaf(
               rewriter, "rvv", "grouped-mac-load",

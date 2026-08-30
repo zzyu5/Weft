@@ -275,7 +275,7 @@ def dequantize_iq2_s(
                 extract_bits(w.qh[group], entry * 2, 2) << u32(8)
             )
             value = nonlinear_lookup(grid, grid_index * u32(8) + u32(lane))
-            if extract_bits(w.q[32 + group * 4 + entry], lane) != u32(0):
+            if u32(w.signs[group * 32 + entry * 8 + lane]) != u32(0):
                 value = -value
             subscale = extract_bits(w.scales[group], (entry // 2) * 4, 4)
             scale = f32(w.d) * (f32(0.5) + f32(subscale)) * f32(0.25)

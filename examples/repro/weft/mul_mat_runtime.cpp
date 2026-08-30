@@ -413,8 +413,13 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_s_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_IQ2_S_STAGED)
+extern "C" void production_mul_mat_iq2_s_staged(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_s_staged(w, x, xq, iq2s.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq2_s(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq2_s(w, x, xq, iq2s.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 15
 using selected_weight = block_iq2_xs;
 using selected_activation = block_q8_K;
@@ -423,8 +428,13 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq2_xs_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_IQ2_XS_STAGED)
+extern "C" void production_mul_mat_iq2_xs_staged(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs_staged(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq2_xs(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq2_xs(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 16
 using selected_weight = block_iq2_xxs;
 using selected_activation = block_q8_K;

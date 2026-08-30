@@ -158,7 +158,8 @@ class IQ2_S:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
     d: f16
-    q: u8[64]
+    q: u8[32]
+    signs: u1[256] @ grouped(8) @ layered(1, lo_first)
     qh: u8[8]
     scales: u8[8]
 

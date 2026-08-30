@@ -172,6 +172,7 @@ public:
                     riscv::ExtractOp, riscv::LookupOp,
                     riscv::RVVIndexedEntryLoadOp,
                     riscv::RVVUnitEntryWindowLoadOp,
+                    riscv::RVVBitmaskWindowLoadOp,
                     riscv::ConvertLayoutOp>(operation))
         return;
       riscv::ImplementationAttr selected = select(operation, builder);

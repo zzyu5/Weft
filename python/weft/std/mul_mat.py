@@ -122,6 +122,90 @@ def _iq2_xxs_group_products(
     return integer * scale
 
 
+def _iq2_xs_group_products(
+    w,
+    x,
+    grid,
+    signs,
+    scale_group,
+    entry,
+    payload,
+    group,
+):
+    linear_entry = scale_group * u32(2) + entry
+    code = widen(w.q[:, group * 4 + linear_entry], u32)
+    grid_index = code & u32(511)
+    sign_index = code >> u32(9)
+    weight = lookup(
+        grid, grid_index * u32(8) + payload, bounds="in_bounds"
+    )
+    sign = lookup(
+        signs, sign_index * u32(8) + payload, bounds="in_bounds"
+    )
+    signed_weight = weight * sign
+    entry_offset = scale_group * u32(16) + entry * u32(8)
+    activation = x.q[:, group * 32 + entry_offset + payload]
+    partial = contract(
+        activation,
+        signed_weight,
+        over=("entry", "payload"),
+        acc=i32,
+    )
+    metadata = widen(
+        w.scales[
+            :,
+            group + scale_group // u32(2),
+        ],
+        u32,
+    )
+    scale = i32(
+        ((metadata >> ((scale_group % u32(2)) * u32(4))) & u32(15)) * u32(2)
+        + u32(1)
+    )
+    return reduce(partial * scale, axis="scale_group")
+
+
+def _iq2_s_group_products(
+    w,
+    x,
+    grid,
+    scale_group,
+    entry,
+    payload,
+    group,
+):
+    linear_entry = scale_group * u32(2) + entry
+    grid_index = widen(w.q[:, group * 4 + linear_entry], u32) | (
+        (
+            widen(w.qh[:, group], u32)
+            >> (linear_entry * u32(2))
+        )
+        & u32(3)
+    ) << u32(8)
+    sign_bit = w.signs[
+        :, group * 32 + linear_entry * u32(8) + payload
+    ]
+    weight = lookup(
+        grid, grid_index * u32(8) + payload, bounds="in_bounds"
+    )
+    sign_value = i8(sign_bit)
+    signed_weight = weight * (i8(1) - sign_value * i8(2))
+    entry_offset = scale_group * u32(16) + entry * u32(8)
+    activation = x.q[:, group * 32 + entry_offset + payload]
+    partial = contract(
+        activation,
+        signed_weight,
+        over=("entry", "payload"),
+        acc=i32,
+    )
+    metadata = widen(w.scales[:, group], u32)
+    scale = i32(
+        ((metadata >> (scale_group * u32(4))) & u32(15)) * u32(2)
+        + u32(1)
+    )
+    return reduce(partial * scale, axis="scale_group")
+
+
 def mul_mat_q1_0(
     W: View[Q1_0, (N, K)],
     X: View[f32, (M, K)],
@@ -844,6 +928,54 @@ def mul_mat_iq2_s(
             commit(vec_dot_iq2_s_q8_k(W[column], Xq[row], grid), Y[row, column])
 
 
+def mul_mat_iq2_s_staged(
+    W: View[IQ2_S, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (8192,)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(admit(W[nc, kc]))
+            with L.tiles(M, extent=auto("MC")) as mc:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=auto("NR")) as nb:
+                        f32_acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=256) as kb:
+                            w = wp[nb, kb]
+                            x = admit(Xq[mb, kb])
+                            scale_group = iota(
+                                2, dtype=u32, axis="scale_group"
+                            )
+                            entry = iota(2, dtype=u32, axis="entry")
+                            payload = iota(8, dtype=u32, axis="payload")
+                            block_sum = new(i32, [MR, NR], init=i32(0))
+                            group_index = index(0)
+                            with L.subs(kb, extent=32) as group:
+                                block_sum += _iq2_s_group_products(
+                                    w,
+                                    x,
+                                    grid,
+                                    scale_group,
+                                    entry,
+                                    payload,
+                                    group_index,
+                                )
+                                group_index += index(1)
+                            f32_acc += (
+                                f32(0.125)
+                                * f32(w.d)
+                                * f32(x.ds)
+                                * widen(block_sum, f32)
+                            )
+                        commit(f32_acc, Y[mb, nb])
+
+
 def mul_mat_iq2_xs(
     W: View[IQ2_XS, (N, K)],
     X: View[f32, (M, K)],
@@ -859,6 +991,52 @@ def mul_mat_iq2_xs(
             commit(value, Y[row, column])
 
 
+def mul_mat_iq2_xs_staged(
+    W: View[IQ2_XS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (4096,)],
+    signs: View[i8, (1024,)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(f32(0.0), Y[row, column])
+    with L.tiles(N, extent=auto("NC")) as nc:
+        with L.tiles(K, extent=auto("KC")) as kc:
+            wp = materialize(admit(W[nc, kc]))
+            with L.tiles(M, extent=auto("MC")) as mc:
+                with L.rows(mc, group=auto("MR")) as mb:
+                    with L.cols(nc, group=auto("NR")) as nb:
+                        f32_acc = new(f32, [MR, NR], init=admit(Y[mb, nb]))
+                        with L.blocks(kc, extent=256) as kb:
+                            w = wp[nb, kb]
+                            x = admit(Xq[mb, kb])
+                            scale_group = iota(2, dtype=u32, axis="scale_group")
+                            entry = iota(2, dtype=u32, axis="entry")
+                            payload = iota(8, dtype=u32, axis="payload")
+                            block_sum = new(i32, [MR, NR], init=i32(0))
+                            group_index = index(0)
+                            with L.subs(kb, extent=32) as group:
+                                block_sum += _iq2_xs_group_products(
+                                    w,
+                                    x,
+                                    grid,
+                                    signs,
+                                    scale_group,
+                                    entry,
+                                    payload,
+                                    group_index,
+                                )
+                                group_index += index(1)
+                            f32_acc += (
+                                f32(0.125)
+                                * f32(w.d)
+                                * f32(x.ds)
+                                * widen(block_sum, f32)
+                            )
+                        commit(f32_acc, Y[mb, nb])
 def mul_mat_iq2_xxs(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],

@@ -948,8 +948,8 @@ def WeftRISCV_RVVUnitEntryWindowLoadOp
   let arguments = (ins WeftRISCV_ValueType:$source,
                        AnyType:$entry_base,
                        I64Attr:$source_axis,
-                       I64Attr:$entry_axis,
-                       I64Attr:$entry_extent,
+                       DenseI64ArrayAttr:$entry_axes,
+                       DenseI64ArrayAttr:$entry_extents,
                        I64Attr:$payload_axis,
                        I64Attr:$payload_extent,
                        I64Attr:$entry_stride,
@@ -1111,6 +1111,20 @@ def WeftRISCV_RVVBitmaskDecodeOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVBitmaskWindowLoadOp
+    : WeftRISCV_Op<"rvv_bitmask_window_load",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       AnyType:$byte_base,
+                       I64Attr:$source_axis,
+                       DenseI64ArrayAttr:$window_axes,
+                       DenseI64ArrayAttr:$window_extents,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVGroupedMacReduceOp
     : WeftRISCV_Op<"rvv_grouped_mac_reduce", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
@@ -1129,6 +1143,7 @@ def WeftRISCV_RVVGroupedMacLoadOp
                        Index:$active_terms,
                        WeftRISCV_LayoutAttr:$load_layout,
                        WeftRISCV_LayoutAttr:$partial_layout,
+                       DenseI64ArrayAttr:$packed_supply_for_result,
                        WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_WindowType:$result);

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
-  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q4_k_persistent|q4_k_staged|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_xs|iq2_xxs|iq2_xxs_staged|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
+  echo "usage: $0 <sg2044|k1> <f32|f16|q1_0|q4_0|q4_1|q5_0|q5_1|q8_0|q2_k|q3_k|q4_k|q4_k_persistent|q4_k_staged|q5_k|q6_k|iq1_s|iq1_m|iq2_s|iq2_s_staged|iq2_xs|iq2_xs_staged|iq2_xxs|iq2_xxs_staged|iq3_s|iq3_xxs|iq4_nl|iq4_xs|tq1_0|tq2_0|mxfp4|nvfp4> <decode|prefill> <repetitions>" >&2
   exit 2
 fi
 
@@ -16,6 +16,10 @@ formats=(f16 q1_0 q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq1_m 
 format_id=-1
 if [[ ${format} == q4_k_persistent || ${format} == q4_k_staged ]]; then
   format_id=9
+elif [[ ${format} == iq2_s_staged ]]; then
+  format_id=14
+elif [[ ${format} == iq2_xs_staged ]]; then
+  format_id=15
 elif [[ ${format} == iq2_xxs_staged ]]; then
   format_id=16
 elif [[ ${format} != f32 ]]; then
@@ -34,6 +38,10 @@ if [[ ${format} == q4_k && ${phase} == prefill ]]; then
   format=q4_k_staged
 elif [[ ${format} == iq2_xxs && ${phase} == prefill ]]; then
   format=iq2_xxs_staged
+elif [[ ${format} == iq2_xs && ${phase} == prefill ]]; then
+  format=iq2_xs_staged
+elif [[ ${format} == iq2_s && ${phase} == prefill ]]; then
+  format=iq2_s_staged
 fi
 
 case "${target}" in
@@ -119,6 +127,26 @@ else
   elif [[ ${format} == iq2_xxs_staged ]]; then
     runtime_kernel_define=-DWEFT_IQ2_XXS_STAGED=1
     kernel=production_mul_mat_iq2_xxs_staged
+    if [[ ${target} == sg2044 ]]; then
+      meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=1 --meta NR=2)
+      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
+      physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+    fi
+  elif [[ ${format} == iq2_xs_staged ]]; then
+    runtime_kernel_define=-DWEFT_IQ2_XS_STAGED=1
+    kernel=production_mul_mat_iq2_xs_staged
+    if [[ ${target} == sg2044 ]]; then
+      meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=1 --meta NR=2)
+      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
+      physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+    fi
+  elif [[ ${format} == iq2_s_staged ]]; then
+    runtime_kernel_define=-DWEFT_IQ2_S_STAGED=1
+    kernel=production_mul_mat_iq2_s_staged
     if [[ ${target} == sg2044 ]]; then
       meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=1 --meta NR=2)
       physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)

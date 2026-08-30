@@ -572,10 +572,9 @@ def vec_dot_iq2_s_q8_k(
                     ((u32(w.qh[group]) >> u32(entry * 2)) & u32(3)) << u32(8)
                 )
                 local = i32(0)
-                sign_byte = u32(w.q[32 + group * 4 + entry])
                 for lane in range(8):
                     sign = i32(1)
-                    if ((sign_byte >> u32(lane)) & u32(1)) != u32(0):
+                    if u32(w.signs[group * 32 + entry * 8 + lane]) != u32(0):
                         sign = i32(-1)
                     value = i32(
                         nonlinear_lookup(grid, grid_index * u32(8) + u32(lane))

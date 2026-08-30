@@ -631,6 +631,8 @@ private:
   compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation);
   mlir::LogicalResult
   compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation);
+  mlir::LogicalResult compileRVVBitmaskWindowLoad(
+      riscv::RVVBitmaskWindowLoadOp operation);
   mlir::LogicalResult
   compileGroupedMacReduce(riscv::RVVGroupedMacReduceOp operation);
   mlir::LogicalResult
@@ -2329,6 +2331,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compilePackedPlaneMerge(merge);
   if (auto decode = mlir::dyn_cast<riscv::RVVBitmaskDecodeOp>(operation))
     return compileRVVBitmaskDecode(decode);
+  if (auto load =
+          mlir::dyn_cast<riscv::RVVBitmaskWindowLoadOp>(operation))
+    return compileRVVBitmaskWindowLoad(load);
   if (auto reduce = mlir::dyn_cast<riscv::RVVGroupedMacReduceOp>(operation))
     return compileGroupedMacReduce(reduce);
   if (auto load = mlir::dyn_cast<riscv::RVVGroupedMacLoadOp>(operation))
@@ -2514,6 +2519,8 @@ mlir::LogicalResult Emitter::compileFor(mlir::scf::ForOp operation) {
       for (llvm::StringRef expression : source.windowValidity)
         copy.windowValidity.push_back(
             declare(expression, "for_window_valid"));
+      for (llvm::StringRef validity : copy.windowValidity)
+        line("(void)" + validity.str() + ";");
       carried.push_back(std::move(copy));
     } else {
       return fail(operation,
@@ -5815,7 +5822,15 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
   bool floating = suffix.front() == 'f';
   llvm::StringRef leaf = selected;
   if (!leaf.consume_front("rvv."))
-    return fail(operation, "vector binary has no exact selected RVV instruction");
+    return fail(operation,
+                ("vector binary has selected instruction '" + selected +
+                 "' for operand types " +
+                 riscv_internal::printType(operation.getLhs().getType()) +
+                 " and " +
+                 riscv_internal::printType(operation.getRhs().getType()) +
+                 ", result " +
+                 riscv_internal::printType(operation.getResult().getType()))
+                    .str());
   size_t separator = leaf.find('.');
   if (separator == llvm::StringRef::npos)
     return fail(operation, "selected RVV binary instruction has no operand form");
@@ -8233,6 +8248,104 @@ Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
+    riscv::RVVBitmaskWindowLoadOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.bitmask-window-load")
+    return fail(operation,
+                "RVV bitmask window load has no exact selected leaf");
+  Binding byteBase = bindings.lookup(operation.getByteBase());
+  auto materializedBase = materializeNumeric(operation.getByteBase(), byteBase);
+  if (mlir::failed(materializedBase))
+    return mlir::failure();
+  byteBase = std::move(*materializedBase);
+  if (byteBase.kind != Binding::Kind::Scalar)
+    return fail(operation,
+                "RVV bitmask window load requires one scalar byte base");
+
+  Binding packed = bindings.lookup(operation.getField());
+  if (packed.kind != Binding::Kind::Field)
+    return fail(operation,
+                "RVV bitmask window load requires one encoded field");
+  packed.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(packed.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto materializedRecord = recordForSlice(packed.field.owner);
+    if (mlir::failed(materializedRecord))
+      return mlir::failure();
+    owner = std::move(*materializedRecord);
+  }
+  auto field = fieldFor(packed);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      owner.recordAxis != operation.getSourceAxis() || !field || !integer ||
+      !integer.isUnsigned() || integer.getWidth() != 1 ||
+      field->access.getMapping() != "grouped_layered" ||
+      field->access.getOrder() != "lo_first" || field->bitOffset % 8 ||
+      field->access.getGroupSize() != field->access.getLayerSize() * 8)
+    return fail(operation,
+                "RVV bitmask window field has no direct contiguous mask address");
+
+  auto layout = operation.getResult().getType().getLayout();
+  const int64_t maskBits = layout.getSew() * 8 / layout.getLmulEighths();
+  if (maskBits != 1 && maskBits != 2 && maskBits != 4 && maskBits != 8 &&
+      maskBits != 16 && maskBits != 32 && maskBits != 64)
+    return fail(operation,
+                "RVV bitmask window load selected an illegal mask ratio");
+  const int64_t parts = vectorPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  const std::string maskType =
+      "vbool" + std::to_string(maskBits) + "_t";
+  auto fieldType = operation.getField().getType();
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / streams);
+    if (streams <= 0 || !coordinates ||
+        coordinates->size() != registerAxes.size())
+      return fail(operation,
+                  "RVV bitmask window load has no register-coordinate mapping");
+    std::string recordPointer = "(" + owner.recordPointer;
+    for (int64_t axis : fieldType.getAxisIds().asArrayRef()) {
+      if (axis == operation.getSourceAxis())
+        continue;
+      auto resultAxis = llvm::find(registerAxes, axis);
+      int64_t coordinate = 0;
+      if (resultAxis != registerAxes.end())
+        coordinate = (*coordinates)[resultAxis - registerAxes.begin()];
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "RVV bitmask window retained source axis has no byte stride");
+      recordPointer += " + " + std::to_string(coordinate) + " * " +
+                       stride->second;
+    }
+    recordPointer += " + " + std::to_string(field->bitOffset / 8) + " + " +
+                     byteBase.scalar + " + (" +
+                     partOffset(operation.getResult(), part) + " / 8))";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string mask = fresh("bitmask_window");
+    line(maskType + " " + mask + " = __riscv_vlm_v_b" +
+         std::to_string(maskBits) + "((const uint8_t *)(" + recordPointer +
+         "), " + vl + ");");
+    std::string decoded = fresh("bitmask_window_decode");
+    line(type + " " + decoded + " = __riscv_vmerge_vxm_" + suffix +
+         "(__riscv_vmv_v_x_" + suffix + "(0, " + vl + "), 1, " + mask +
+         ", " + vl + ");");
+    result.parts.push_back(std::move(decoded));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileGroupedMacReduce(
     riscv::RVVGroupedMacReduceOp operation) {
   if (operation.getLeaf().getInstruction() !=
@@ -8592,12 +8705,24 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
                 "grouped MAC load fields do not match the selected narrow/signed window");
 
   auto lhsType = mlir::dyn_cast<riscv::ValueType>(operation.getLhs().getType());
-  if (!lhsType || lhsType.getLayout().getCarrier() != "rvv" ||
-      product(operation.getResult().getType().getResultLayout().getTimeFactors()) *
-              product(operation.getResult().getType().getResultLayout().getReplicaFactors()) !=
-          1)
+  auto rhsType = mlir::dyn_cast<riscv::ValueType>(operation.getRhs().getType());
+  auto windowType = operation.getResult().getType();
+  auto resultType = mlir::dyn_cast<riscv::ValueType>(windowType.getResultType());
+  const int64_t outputParts = windowType.getResultParts();
+  auto supplyForResult = operation.getPackedSupplyForResult();
+  const int64_t packedSupplies =
+      supplyForResult.empty()
+          ? 0
+          : *llvm::max_element(supplyForResult) + int64_t{1};
+  if (!lhsType || !rhsType || !resultType ||
+      lhsType.getLayout().getCarrier() != "rvv" ||
+      outputParts <= 0 ||
+      product(resultType.getLayout().getTimeFactors()) != 1 ||
+      product(resultType.getLayout().getReplicaFactors()) != outputParts ||
+      supplyForResult.size() != static_cast<size_t>(outputParts) ||
+      packedSupplies <= 0)
     return fail(operation,
-                "grouped MAC load currently requires one closed output RVV part");
+                "grouped MAC load has no closed result-replica or packed-supply mapping");
   const std::string rawSuffix =
       "u8" + lmulSpelling(operation.getLoadLayout().getLmulEighths());
   const std::string rawType =
@@ -8626,19 +8751,89 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
       (plan.getLoadForm() == "strided" && rowStride.empty()))
     return fail(operation, "grouped MAC load plan has no bound load form");
 
+  llvm::SmallVector<int64_t, 4> resultAxes;
+  llvm::SmallVector<int64_t, 4> resultExtents;
+  for (auto [axis, factor] :
+       llvm::zip(resultType.getAxisIds().asArrayRef(),
+                 resultType.getLayout().getReplicaFactors().asArrayRef()))
+    if (factor > 1) {
+      resultAxes.push_back(axis);
+      resultExtents.push_back(factor);
+    }
+  auto coordinatesForPart = [&](int64_t part)
+      -> std::optional<llvm::SmallVector<int64_t, 4>> {
+    llvm::SmallVector<int64_t, 4> coordinates(resultExtents.size(), 0);
+    for (int64_t index = static_cast<int64_t>(resultExtents.size()) - 1;
+         index >= 0; --index) {
+      const int64_t extent = resultExtents[static_cast<size_t>(index)];
+      if (extent <= 0)
+        return std::nullopt;
+      coordinates[static_cast<size_t>(index)] = part % extent;
+      part /= extent;
+    }
+    if (part != 0)
+      return std::nullopt;
+    return coordinates;
+  };
+  auto recordForPart = [&](const Binding &owner, riscv::ValueType operand,
+                           int64_t part) -> std::optional<std::string> {
+    auto coordinates = coordinatesForPart(part);
+    if (!coordinates || coordinates->size() != resultAxes.size())
+      return std::nullopt;
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(resultAxes, *coordinates)) {
+      if (!llvm::is_contained(operand.getAxisIds().asArrayRef(), axis))
+        continue;
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return std::nullopt;
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += ")";
+    return record;
+  };
+
+  llvm::SmallVector<std::string> lhsRecords;
+  llvm::SmallVector<std::string> rhsRecords;
+  for (int64_t part = 0; part < outputParts; ++part) {
+    auto lhsRecord = recordForPart(lhsOwner, lhsType, part);
+    auto rhsRecord = recordForPart(rhsOwner, rhsType, part);
+    if (!lhsRecord || !rhsRecord)
+      return fail(operation,
+                  "grouped MAC window output replica has no record-coordinate mapping");
+    lhsRecords.push_back(std::move(*lhsRecord));
+    rhsRecords.push_back(std::move(*rhsRecord));
+  }
+
+  llvm::SmallVector<int64_t> representative(
+      static_cast<size_t>(packedSupplies), int64_t{-1});
+  for (int64_t part = 0; part < outputParts; ++part) {
+    const int64_t supply = supplyForResult[static_cast<size_t>(part)];
+    if (supply < 0 || supply >= packedSupplies)
+      return fail(operation,
+                  "grouped MAC window packed-supply index is out of range");
+    if (representative[static_cast<size_t>(supply)] < 0)
+      representative[static_cast<size_t>(supply)] = part;
+  }
+  if (llvm::any_of(representative,
+                   [](int64_t part) { return part < 0; }))
+    return fail(operation,
+                "grouped MAC window packed-supply mapping is not dense");
+
   const int64_t storageGroup = plan.getStorageGroup();
   const int64_t storageLayer = plan.getStorageLayer();
   const bool compactWindow = plan.getKind() == "compact";
-  std::string compactQBase;
-  std::string compactXBase;
+  llvm::SmallVector<std::string> compactQBases;
+  llvm::SmallVector<std::string> compactXBases;
   std::string compactShift;
   if (compactWindow) {
     std::string logical = fresh("group_logical_base");
     std::string within = fresh("group_layer_within");
     std::string byte = fresh("group_storage_byte");
     compactShift = fresh("group_shift");
-    compactQBase = fresh("group_q_window");
-    compactXBase = fresh("group_x_window");
     line("const size_t " + logical + " = " + logicalBase + ";");
     line("const size_t " + within + " = " + logical + " % " +
          std::to_string(storageGroup) + ";");
@@ -8652,17 +8847,31 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
          std::to_string(storageLayer) + ") * " +
          std::to_string(plan.getShiftStep()) + ";");
     const std::string qScale = std::to_string(plan.getTermByteStride());
-    line("const uint8_t *" + compactQBase + " = " + lhsOwner.recordPointer +
-         " + " + byte + " * " + qScale + ";");
-    line("const int8_t *" + compactXBase + " = (const int8_t *)(" +
-         rhsOwner.recordPointer + " + " +
-         std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical + ");");
+    for (int64_t supply = 0; supply < packedSupplies; ++supply) {
+      std::string qBase = fresh("group_q_window");
+      line("const uint8_t *" + qBase + " = " +
+           lhsRecords[static_cast<size_t>(
+               representative[static_cast<size_t>(supply)])] +
+           " + " + byte + " * " + qScale + ";");
+      compactQBases.push_back(std::move(qBase));
+    }
+    for (int64_t part = 0; part < outputParts; ++part) {
+      std::string xBase = fresh("group_x_window");
+      line("const int8_t *" + xBase + " = (const int8_t *)(" +
+           rhsRecords[static_cast<size_t>(part)] + " + " +
+           std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical +
+           ");");
+      compactXBases.push_back(std::move(xBase));
+    }
   }
 
   Binding window;
   window.kind = Binding::Kind::Window;
   window.windowFamily = "grouped-mac";
   const bool exactWindow = operation.getLeaf().getTail() == "exact";
+  const int64_t terms = plan.getUnroll() * plan.getGroup();
+  llvm::SmallVector<std::string> packedValues(
+      static_cast<size_t>(packedSupplies * terms));
   for (int64_t slot = 0; slot < plan.getUnroll(); ++slot) {
     for (int64_t term = 0; term < plan.getGroup(); ++term) {
       const int64_t ordinal = slot * plan.getGroup() + term;
@@ -8675,88 +8884,101 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
                             std::to_string(plan.getGroup()) + " + " +
                             std::to_string(linear) + " < " +
                             activeTerms.scalar + ")";
-      std::string qAddress;
-      std::string qStride;
-      std::string shift;
-      std::string xAddress;
-      if (compactWindow) {
-        const int64_t qOffset =
-            linear * plan.getTermByteStride();
-        qAddress = compactQBase + " + " + std::to_string(qOffset);
-        if (plan.getLoadForm() == "strided")
-          qStride = rowStride;
-        shift = compactShift;
-        xAddress = compactXBase + " + " + std::to_string(linear);
-      } else {
-        const std::string within = "((" + logical + ") % " +
-                                   std::to_string(storageGroup) + ")";
-        const std::string physicalLayer =
-            "(" + std::to_string(plan.getPhysicalLayerBase()) + " + ((" +
-            within + ") / " + std::to_string(storageLayer) + ") * " +
-            std::to_string(plan.getPhysicalLayerStep()) + ")";
-        const std::string byte =
-            "(" + std::to_string(plan.getLhsBitOffsetBytes()) + " + ((" +
-            logical + ") / " + std::to_string(storageGroup) + ") * " +
-            std::to_string(storageLayer) + " + (" + within + ") % " +
-            std::to_string(storageLayer) + ")";
-        if (plan.getLoadForm() == "unit") {
-          qAddress = lhsOwner.recordPointer + " + (" + byte + ") * " +
-                     std::to_string(plan.getInterleaveRows());
-        } else {
-          qAddress = lhsOwner.recordPointer + " + (" + byte + ")";
-          qStride = rowStride;
-        }
-        shift = "(" + std::to_string(plan.getShiftBase()) + " + ((" + within +
-                ") / " + std::to_string(storageLayer) + ") * " +
-                std::to_string(plan.getShiftStep()) + ")";
-        xAddress = rhsOwner.recordPointer + " + " +
-                   std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical;
-      }
-      auto loadExpression = [&]() {
+      const std::string within = "((" + logical + ") % " +
+                                 std::to_string(storageGroup) + ")";
+      const std::string byte =
+          "(" + std::to_string(plan.getLhsBitOffsetBytes()) + " + ((" +
+          logical + ") / " + std::to_string(storageGroup) + ") * " +
+          std::to_string(storageLayer) + " + (" + within + ") % " +
+          std::to_string(storageLayer) + ")";
+      const std::string dynamicShift =
+          "(" + std::to_string(plan.getShiftBase()) + " + ((" + within +
+          ") / " + std::to_string(storageLayer) + ") * " +
+          std::to_string(plan.getShiftStep()) + ")";
+      auto loadExpression = [&](llvm::StringRef qAddress,
+                                llvm::StringRef qStride) {
         if (qStride.empty())
           return "__riscv_vle8_v_" + rawSuffix +
-                 "((const uint8_t *)(" + qAddress + "), " + laneVL() + ")";
+                 "((const uint8_t *)(" + qAddress.str() + "), " + laneVL() +
+                 ")";
         return "__riscv_vlse8_v_" + rawSuffix +
-               "((const uint8_t *)(" + qAddress + "), (ptrdiff_t)(" + qStride +
-               "), " + laneVL() + ")";
+               "((const uint8_t *)(" + qAddress.str() + "), (ptrdiff_t)(" +
+               qStride.str() + "), " + laneVL() + ")";
       };
-      std::string loaded = fresh("group_q_raw");
-      std::string q = fresh("group_q");
-      if (exactWindow) {
-        line(rawType + " " + loaded + " = " + loadExpression() + ";");
-      } else {
-        line(rawType + " " + q + " = __riscv_vmv_v_x_" + rawSuffix +
-             "(0, " + laneVL() + ");");
-        line("if (" + valid + ") {");
-        ++indent;
-        line(rawType + " " + loaded + " = " + loadExpression() + ";");
+      for (int64_t supply = 0; supply < packedSupplies; ++supply) {
+        std::string qAddress;
+        std::string qStride;
+        std::string shift;
+        if (compactWindow) {
+          qAddress = compactQBases[static_cast<size_t>(supply)] + " + " +
+                     std::to_string(linear * plan.getTermByteStride());
+          if (plan.getLoadForm() == "strided")
+            qStride = rowStride;
+          shift = compactShift;
+        } else {
+          const std::string &record = lhsRecords[static_cast<size_t>(
+              representative[static_cast<size_t>(supply)])];
+          if (plan.getLoadForm() == "unit")
+            qAddress = record + " + (" + byte + ") * " +
+                       std::to_string(plan.getInterleaveRows());
+          else {
+            qAddress = record + " + (" + byte + ")";
+            qStride = rowStride;
+          }
+          shift = dynamicShift;
+        }
+        std::string loaded = fresh("group_q_raw");
+        std::string q = fresh("group_q");
+        if (exactWindow) {
+          line(rawType + " " + loaded + " = " +
+               loadExpression(qAddress, qStride) + ";");
+        } else {
+          line(rawType + " " + q + " = __riscv_vmv_v_x_" + rawSuffix +
+               "(0, " + laneVL() + ");");
+          line("if (" + valid + ") {");
+          ++indent;
+          line(rawType + " " + loaded + " = " +
+               loadExpression(qAddress, qStride) + ";");
+        }
+        std::string decoded = loaded;
+        if (shift != "0")
+          decoded = "__riscv_vsrl_vx_" + rawSuffix + "(" + decoded + ", " +
+                    shift + ", " + laneVL() + ")";
+        if (plan.getLogicalWidth() < 8)
+          decoded = "__riscv_vand_vx_" + rawSuffix + "(" + decoded + ", " +
+                    std::to_string(plan.getMaskValue()) + ", " + laneVL() +
+                    ")";
+        if (exactWindow) {
+          line(rawType + " " + q + " = " + decoded + ";");
+        } else {
+          line(q + " = " + decoded + ";");
+          --indent;
+          line("}");
+        }
+        packedValues[static_cast<size_t>(supply * terms + ordinal)] =
+            std::move(q);
       }
-      std::string decoded = loaded;
-      if (shift != "0")
-        decoded = "__riscv_vsrl_vx_" + rawSuffix + "(" + decoded + ", " +
-                  shift + ", " + laneVL() + ")";
-      if (plan.getLogicalWidth() < 8)
-        decoded = "__riscv_vand_vx_" + rawSuffix + "(" + decoded + ", " +
-                  std::to_string(plan.getMaskValue()) + ", " +
-                  laneVL() + ")";
-      if (exactWindow) {
-        line(rawType + " " + q + " = " + decoded + ";");
-      } else {
-        line(q + " = " + decoded + ";");
-        --indent;
-        line("}");
+      for (int64_t part = 0; part < outputParts; ++part) {
+        const std::string xAddress =
+            (compactWindow
+                 ? compactXBases[static_cast<size_t>(part)] + " + " +
+                       std::to_string(linear)
+                 : rhsRecords[static_cast<size_t>(part)] + " + " +
+                       std::to_string(plan.getRhsBitOffsetBytes()) + " + " +
+                       logical);
+        std::string x = fresh("group_x");
+        if (exactWindow)
+          line("int8_t " + x + " = *(const int8_t *)(" + xAddress + ");");
+        else {
+          line("int8_t " + x + " = 0;");
+          line("if (" + valid + ") " + x + " = *(const int8_t *)(" +
+               xAddress + ");");
+        }
+        const int64_t supply = supplyForResult[static_cast<size_t>(part)];
+        window.windowLhs.push_back(
+            packedValues[static_cast<size_t>(supply * terms + ordinal)]);
+        window.windowRhs.push_back(std::move(x));
       }
-      std::string x = fresh("group_x");
-      if (exactWindow)
-        line("int8_t " + x + " = *(const int8_t *)(" + xAddress + ");");
-      else {
-        line("int8_t " + x + " = 0;");
-        line("if (" + valid + ") " + x + " = *(const int8_t *)(" +
-             xAddress + ");");
-      }
-      window.windowLhs.push_back(std::move(q));
-      window.windowRhs.push_back(std::move(x));
-      window.windowValidity.push_back(valid);
     }
   }
   bindings[operation.getResult()] = std::move(window);
@@ -8771,12 +8993,15 @@ Emitter::compileGroupedMacStep(riscv::RVVGroupedMacStepOp operation) {
   Binding window = bindings.lookup(operation.getWindow());
   Binding accumulator = bindings.lookup(operation.getAccumulator());
   auto windowType = operation.getWindow().getType();
+  const int64_t outputParts = windowType.getResultParts();
+  const int64_t terms = windowType.getSlots() * windowType.getTermsPerSlot();
   if (window.kind != Binding::Kind::Window ||
       window.windowFamily != "grouped-mac" ||
-      accumulator.kind != Binding::Kind::Vector || accumulator.parts.size() != 1 ||
+      accumulator.kind != Binding::Kind::Vector || outputParts <= 0 ||
+      accumulator.parts.size() != static_cast<size_t>(outputParts) ||
       window.windowLhs.size() != window.windowRhs.size() ||
-      window.windowLhs.size() != static_cast<size_t>(windowType.getSlots() *
-                                                     windowType.getTermsPerSlot()))
+      window.windowLhs.size() !=
+          static_cast<size_t>(outputParts * terms))
     return fail(operation, "grouped MAC step has an incomplete physical window");
   const std::string partialSuffix =
       "i16" + lmulSpelling(windowType.getPartialLayout().getLmulEighths());
@@ -8784,29 +9009,32 @@ Emitter::compileGroupedMacStep(riscv::RVVGroupedMacStepOp operation) {
       "vint16" + lmulSpelling(windowType.getPartialLayout().getLmulEighths()) +
       "_t";
   const std::string resultSuffix = vectorSuffix(operation.getResult());
-  std::string result = fresh("grouped_mac");
-  line(vectorType(operation.getResult()) + " " + result + " = " +
-       accumulator.parts.front() + ";");
-  for (int64_t slot = 0; slot < windowType.getSlots(); ++slot) {
-    std::string partial = fresh("group_partial");
-    line(partialType + " " + partial + " = __riscv_vmv_v_x_" +
-         partialSuffix + "(0, " + laneVL() + ");");
-    for (int64_t term = 0; term < windowType.getTermsPerSlot(); ++term) {
-      size_t index = static_cast<size_t>(slot * windowType.getTermsPerSlot() + term);
-      line(partial + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
-           partial + ", " + window.windowRhs[index] + ", " +
-           window.windowLhs[index] + ", " + laneVL() + ");");
-    }
-    std::string widened = fresh("group_partial_wide");
-    line(vectorType(operation.getResult()) + " " + widened +
-         " = __riscv_vwcvt_x_x_v_" + resultSuffix + "(" + partial + ", " +
-         laneVL() + ");");
-    line(result + " = __riscv_vadd_vv_" + resultSuffix + "(" + result + ", " +
-         widened + ", " + laneVL() + ");");
-  }
   Binding output;
   output.kind = Binding::Kind::Vector;
-  output.parts.push_back(std::move(result));
+  for (int64_t part = 0; part < outputParts; ++part) {
+    std::string result = fresh("grouped_mac");
+    line(vectorType(operation.getResult()) + " " + result + " = " +
+         accumulator.parts[static_cast<size_t>(part)] + ";");
+    for (int64_t slot = 0; slot < windowType.getSlots(); ++slot) {
+      std::string partial = fresh("group_partial");
+      line(partialType + " " + partial + " = __riscv_vmv_v_x_" +
+           partialSuffix + "(0, " + laneVL() + ");");
+      for (int64_t term = 0; term < windowType.getTermsPerSlot(); ++term) {
+        const size_t index = static_cast<size_t>(
+            (slot * windowType.getTermsPerSlot() + term) * outputParts + part);
+        line(partial + " = __riscv_vwmaccsu_vx_" + partialSuffix + "(" +
+             partial + ", " + window.windowRhs[index] + ", " +
+             window.windowLhs[index] + ", " + laneVL() + ");");
+      }
+      std::string widened = fresh("group_partial_wide");
+      line(vectorType(operation.getResult()) + " " + widened +
+           " = __riscv_vwcvt_x_x_v_" + resultSuffix + "(" + partial + ", " +
+           laneVL() + ");");
+      line(result + " = __riscv_vadd_vv_" + resultSuffix + "(" + result +
+           ", " + widened + ", " + laneVL() + ");");
+    }
+    output.parts.push_back(std::move(result));
+  }
   bindings[operation.getResult()] = std::move(output);
   return mlir::success();
 }
@@ -12578,6 +12806,7 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
   llvm::raw_string_ostream output(body);
   output << "#include <stddef.h>\n"
          << "#include <stdint.h>\n"
+         << "#include <stdbool.h>\n"
          << "#include <math.h>\n"
          << "#include <string.h>\n"
          << "#include <riscv_vector.h>\n\n"

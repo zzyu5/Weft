@@ -2806,8 +2806,9 @@ mlir::LogicalResult LookupOp::verify() {
     if (auto result = mlir::dyn_cast<ValueType>(getResult().getType()))
       for (size_t position = 0; position < indices.getAxisIds().size(); ++position)
         if (!sameAxisMapping(indices, position, result, position))
-          return emitOpError(
-              "physical lookup indices/result require an explicit layout conversion");
+          return emitOpError()
+                 << "physical lookup indices/result require an explicit layout conversion; indices="
+                 << indices << ", result=" << result;
   llvm::StringRef carrier = "scalar";
   if (auto indices = mlir::dyn_cast<ValueType>(getIndices().getType()))
     carrier = indices.getLayout().getCarrier();
@@ -3006,9 +3007,13 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
   if (!field || source.getLayout().getCarrier() != "local" || !scalarBase ||
       result.getLayout().getCarrier() != "rvv" ||
       source.getElementType() != result.getElementType() ||
-      getEntryExtent() <= 1 || getPayloadExtent() <= 0 ||
+      getEntryAxes().empty() ||
+      getEntryAxes().size() != getEntryExtents().size() ||
+      llvm::any_of(getEntryExtents(),
+                   [](int64_t extent) { return extent <= 0; }) ||
+      getPayloadExtent() <= 0 ||
       getEntryStride() != getPayloadExtent() ||
-      getEntryAxis() == getPayloadAxis() ||
+      llvm::is_contained(getEntryAxes(), getPayloadAxis()) ||
       getAccess().getForm() != "unit" ||
       getAccess().getMapping() != "natural" ||
       !exactLeaf(getLeaf(), "rvv", "unit-entry-window-load",
@@ -3016,11 +3021,18 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
     return emitOpError(
         "unit entry window load requires one byte-contiguous typed local field, scalar base, and exact RVV leaf");
 
+  llvm::DenseSet<int64_t> entryAxes;
+  for (int64_t axis : getEntryAxes())
+    if (!entryAxes.insert(axis).second)
+      return emitOpError("unit entry window entry axes must be unique");
+
   auto sourceAxes = source.getAxisIds().asArrayRef();
   auto sourceShape = source.getShape().asArrayRef();
   auto sourceAxis = llvm::find(sourceAxes, getSourceAxis());
   if (sourceAxis == sourceAxes.end() ||
-      llvm::is_contained(sourceAxes, getEntryAxis()) ||
+      llvm::any_of(getEntryAxes(), [&](int64_t axis) {
+        return llvm::is_contained(sourceAxes, axis);
+      }) ||
       llvm::is_contained(sourceAxes, getPayloadAxis()))
     return emitOpError(
         "unit entry window source, entry, and payload axes must be disjoint");
@@ -3035,8 +3047,8 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
     expectedShape.push_back(sourceShape[position]);
   }
   const size_t retainedAxes = expectedAxes.size();
-  expectedAxes.push_back(getEntryAxis());
-  expectedShape.push_back(getEntryExtent());
+  expectedAxes.append(getEntryAxes().begin(), getEntryAxes().end());
+  expectedShape.append(getEntryExtents().begin(), getEntryExtents().end());
   expectedAxes.push_back(getPayloadAxis());
   expectedShape.push_back(getPayloadExtent());
   if (!llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
@@ -3051,10 +3063,10 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
         layout.getLocalFactors()[position] != 1)
       return emitOpError(
           "unit entry window retained axes must remain register coordinates");
-  const int64_t windowExtents[] = {
-      static_cast<int64_t>(getEntryExtent()),
-      static_cast<int64_t>(getPayloadExtent())};
-  for (size_t offset = 0; offset < 2; ++offset) {
+  llvm::SmallVector<int64_t> windowExtents(getEntryExtents().begin(),
+                                           getEntryExtents().end());
+  windowExtents.push_back(getPayloadExtent());
+  for (size_t offset = 0; offset < windowExtents.size(); ++offset) {
     const size_t position = retainedAxes + offset;
     const int64_t extent = windowExtents[offset];
     if (layout.getTimeFactors()[position] != 1 ||
@@ -3064,7 +3076,7 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
         layout.getLocalFactors()[position] != 1)
       return emitOpError(
                  "unit entry and payload axes must form one complete RVV lane window")
-             << "; entry_axis=" << getEntryAxis()
+             << "; entry_axes=" << getEntryAxes()
              << ", payload_axis=" << getPayloadAxis()
              << ", result_type=" << result;
   }
@@ -3129,8 +3141,8 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
     auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
     std::optional<size_t> laneDimension;
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-        if (targetLane[dimension] > 1) {
-          if (laneDimension)
+      if (targetLane[dimension] > 1) {
+        if (laneDimension)
           return emitOpError(
               "scalar register-to-lane conversion requires exactly one lane axis");
         laneDimension = dimension;
@@ -4000,6 +4012,119 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto resultElement = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto baseValue = mlir::dyn_cast<ValueType>(getByteBase().getType());
+  mlir::Type baseElement =
+      baseValue ? baseValue.getElementType() : getByteBase().getType();
+  auto baseInteger = mlir::dyn_cast<mlir::IntegerType>(baseElement);
+  bool scalarBase = baseElement.isIndex() ||
+                    (baseInteger && !baseInteger.isSigned());
+  if (baseValue) {
+    auto layout = baseValue.getLayout();
+    scalarBase = scalarBase && layout.getCarrier() == "scalar" &&
+                 llvm::all_of(layout.getTimeFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getLaneFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getReplicaFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getFragmentFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getLocalFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; });
+  }
+  auto sourceAccess = sourceField ? sourceField.getAccess() : AccessAttr();
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  if (!sourceField || !fieldElement || fieldElement.isSigned() ||
+      fieldElement.getWidth() != 1 || !resultElement ||
+      resultElement.isSigned() || resultElement.getWidth() != 1 ||
+      field.getLayout().getCarrier() != "local" ||
+      result.getLayout().getCarrier() != "rvv" || !scalarBase ||
+      getWindowAxes().empty() ||
+      getWindowAxes().size() != getWindowExtents().size() ||
+      llvm::any_of(getWindowExtents(),
+                   [](int64_t extent) { return extent <= 0; }) ||
+      getAccess().getForm() != "unit" ||
+      getAccess().getMapping() != "grouped_layered" ||
+      getAccess().getGroupSize() <= 0 || getAccess().getLayerSize() <= 0 ||
+      getAccess().getGroupSize() != getAccess().getLayerSize() * 8 ||
+      getAccess().getOrder() != "lo_first" || getAccess().getBitOffset() % 8 ||
+      sourceAccess.getMapping() != getAccess().getMapping() ||
+      sourceAccess.getGroupSize() != getAccess().getGroupSize() ||
+      sourceAccess.getLayerSize() != getAccess().getLayerSize() ||
+      sourceAccess.getOrder() != getAccess().getOrder() ||
+      sourceAccess.getBitOffset() != getAccess().getBitOffset() ||
+      (validity != "full" && validity != "tail") ||
+      !exactLeaf(getLeaf(), "rvv", "bitmask-window-load",
+                 "rvv.bitmask-window-load", "none", tail))
+    return emitOpError(
+        "RVV bitmask window load requires one byte-aligned logical-u1 field, "
+        "one scalar byte base, complete lane window axes, and the exact RVV leaf");
+
+  llvm::DenseSet<int64_t> windowAxes;
+  for (int64_t axis : getWindowAxes())
+    if (!windowAxes.insert(axis).second)
+      return emitOpError("RVV bitmask window axes must be unique");
+  auto windowElements =
+      checkedPositiveProduct(getWindowExtents());
+  if (!windowElements || *windowElements % getAccess().getGroupSize())
+    return emitOpError(
+        "RVV bitmask window extent must cover complete packed groups");
+
+  auto fieldAxes = field.getAxisIds().asArrayRef();
+  auto fieldShape = field.getShape().asArrayRef();
+  auto sourceAxis = llvm::find(fieldAxes, getSourceAxis());
+  if (sourceAxis == fieldAxes.end() ||
+      llvm::any_of(getWindowAxes(), [&](int64_t axis) {
+        return llvm::is_contained(fieldAxes, axis);
+      }))
+    return emitOpError(
+        "RVV bitmask source and window axes must be disjoint");
+  const size_t sourcePosition =
+      static_cast<size_t>(sourceAxis - fieldAxes.begin());
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  for (size_t position = 0; position < fieldAxes.size(); ++position) {
+    if (position == sourcePosition)
+      continue;
+    expectedAxes.push_back(fieldAxes[position]);
+    expectedShape.push_back(fieldShape[position]);
+  }
+  const size_t retainedAxes = expectedAxes.size();
+  expectedAxes.append(getWindowAxes().begin(), getWindowAxes().end());
+  expectedShape.append(getWindowExtents().begin(), getWindowExtents().end());
+  if (!llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
+      !llvm::equal(expectedShape, result.getShape().asArrayRef()))
+    return emitOpError(
+        "RVV bitmask window result must retain source axes and append its logical window axes");
+
+  auto layout = result.getLayout();
+  for (size_t position = 0; position < retainedAxes; ++position)
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return emitOpError(
+          "RVV bitmask window retained axes must remain register coordinates");
+  for (size_t offset = 0; offset < getWindowExtents().size(); ++offset) {
+    const size_t position = retainedAxes + offset;
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != getWindowExtents()[offset] ||
+        layout.getReplicaFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return emitOpError(
+          "RVV bitmask window axes must form one complete RVV lane window");
+  }
+  return verifyLeafOperation(*this);
+}
+
 mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
   auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
   auto resultParts = physicalPartCount(getResult().getType());
@@ -4085,6 +4210,18 @@ mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
       window.getRhsType() != getRhs().getType() ||
       window.getPartialLayout() != getPartialLayout())
     return emitOpError("grouped MAC window type disagrees with its operands");
+  auto windowResult = mlir::dyn_cast<ValueType>(window.getResultType());
+  auto supplyPlan = groupedMacSupplyProjection(lhs, windowResult);
+  auto issueParts = checkedPositiveProduct(
+      window.getResultLayout().getTimeFactors().asArrayRef());
+  auto replicaParts = checkedPositiveProduct(
+      window.getResultLayout().getReplicaFactors().asArrayRef());
+  if (!supplyPlan ||
+      getPackedSupplyForResult() != llvm::ArrayRef<int64_t>(*supplyPlan) ||
+      !issueParts || *issueParts != 1 || !replicaParts ||
+      *replicaParts != window.getResultParts())
+    return emitOpError(
+        "grouped MAC window requires one typed packed-supply mapping over register replicas");
   auto kernel = getOperation()->getParentOfType<KernelOp>();
   if (!kernel)
     return emitOpError("grouped MAC load must be nested in one target kernel");

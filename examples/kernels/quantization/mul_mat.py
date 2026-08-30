@@ -36,7 +36,9 @@ from weft.std.mul_mat import (
     mul_mat_iq1_m,
     mul_mat_iq1_s,
     mul_mat_iq2_s,
+    mul_mat_iq2_s_staged,
     mul_mat_iq2_xs,
+    mul_mat_iq2_xs_staged,
     mul_mat_iq2_xxs,
     mul_mat_iq2_xxs_decode,
     mul_mat_iq2_xxs_staged,
@@ -363,11 +365,34 @@ def production_mul_mat_iq2_s(
 
 
 @weft.kernel
+def production_mul_mat_iq2_s_staged(
+    W: View[IQ2_S, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (8192,)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_iq2_s_staged(W, X, Xq, grid, Y)
+
+
+@weft.kernel
 def production_mul_mat_iq2_xs(
     W: View[IQ2_XS, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
     grid: View[i8, (4096,)], signs: View[i8, (1024,)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq2_xs(W, X, Xq, grid, signs, Y)
+
+
+@weft.kernel
+def production_mul_mat_iq2_xs_staged(
+    W: View[IQ2_XS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[i8, (4096,)],
+    signs: View[i8, (1024,)],
+    Y: View[f32, (M, N)],
+):
+    mul_mat_iq2_xs_staged(W, X, Xq, grid, signs, Y)
 
 
 @weft.kernel
