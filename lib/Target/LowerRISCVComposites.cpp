@@ -1302,17 +1302,24 @@ private:
             hasCohortStride = true;
       const int64_t storageGroup = lhsAccess.getGroupSize();
       const int64_t storageLayer = lhsAccess.getLayerSize();
+      auto storageWindow = lhsField
+                               ? riscv_internal::storageWindowPlan(
+                                     rewriter, lhsField, reductionAxis,
+                                     /*projectionBase=*/0,
+                                     /*projectionStride=*/1,
+                                     /*projectionRepeat=*/1,
+                                     /*projectionExtent=*/storageGroup,
+                                     /*offsetAlignment=*/1)
+                               : std::nullopt;
       const int64_t outputParts = resultParts(accumulatorType.getLayout());
       const bool exactGeometry =
           lhsInteger.isUnsigned() && lhsInteger.getWidth() < 8 &&
           rhsInteger.isSigned() && rhsInteger.getWidth() == 8 && lhsField &&
           rhsField && lhsLoad && rhsLoad && lhsPoint && rhsPoint &&
-          lhsPoint == rhsPoint && lhsAccess.getMapping() == "grouped_layered" &&
-          rhsAccess.getMapping() == "natural" && storageGroup > 0 &&
-          storageLayer > 0 && storageGroup % storageLayer == 0 &&
-          storageLayer % mac.getGroup() == 0 &&
-          (lhsAccess.getOrder() == "lo_first" ||
-           lhsAccess.getOrder() == "hi_first") &&
+          lhsPoint == rhsPoint && storageWindow &&
+          storageWindow->getKind() == "layered" &&
+          rhsAccess.getMapping() == "natural" &&
+          storageWindow->getLayerSize() % mac.getGroup() == 0 &&
           lhsAccess.getBitOffset() % 8 == 0 &&
           rhsAccess.getBitOffset() % 8 == 0 &&
           (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
@@ -1377,26 +1384,20 @@ private:
         termOrder.reserve(static_cast<size_t>(terms));
         for (int64_t term = 0; term < terms; ++term)
           termOrder.push_back(term);
-        const bool lowFirst = lhsAccess.getOrder() == "lo_first";
         const bool unitLoad = lhsMemory.getInterleaveRows() > 0;
-        const int64_t layers =
-            lhsAccess.getGroupSize() / lhsAccess.getLayerSize();
-        const int64_t physicalLayerBase = lowFirst ? 0 : layers - 1;
-        const int64_t physicalLayerStep = lowFirst ? 1 : -1;
-        const int64_t shiftBase =
-            physicalLayerBase * lhsInteger.getWidth();
-        const int64_t shiftStep =
-            physicalLayerStep * lhsInteger.getWidth();
         return riscv::GroupedMacPlanAttr::get(
             rewriter.getContext(), kind, mac.getGroup(), schedule.getUnroll(),
-            reductionAxis, lhsAccess.getGroupSize(), lhsAccess.getLayerSize(),
-            lhsInteger.getWidth(), lhsAccess.getBitOffset() / 8,
+            reductionAxis, storageWindow->getGroupSize(),
+            storageWindow->getLayerSize(), storageWindow->getElementBits(),
+            storageWindow->getByteOffset(),
             rhsAccess.getBitOffset() / 8, lhsMemory.getElements(),
             lhsMemory.getInterleaveRows(), unitLoad ? "unit" : "strided",
             unitLoad ? 0 : laneAxis,
             unitLoad ? lhsMemory.getInterleaveRows() : 1,
-            physicalLayerBase, physicalLayerStep, shiftBase, shiftStep,
-            (int64_t{1} << lhsInteger.getWidth()) - 1,
+            storageWindow->getPhysicalLayerBase(),
+            storageWindow->getPhysicalLayerStep(),
+            storageWindow->getShiftBase(), storageWindow->getShiftStep(),
+            storageWindow->getMaskValue(),
             rewriter.getDenseI64ArrayAttr(termOrder));
       };
       rewriter.setInsertionPoint(reduce);
