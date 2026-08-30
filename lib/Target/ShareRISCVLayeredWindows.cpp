@@ -786,6 +786,258 @@ bool sameCompleteLayeredGroup(CompleteLayeredExtract &lhs,
          sameTerms(lhs.relative, rhs.relative);
 }
 
+struct InterleavedReplicaGeometry {
+  int64_t laneAxis = 0;
+  int64_t lanes = 0;
+  int64_t parts = 0;
+  llvm::SmallVector<int64_t> recordCoordinates;
+  llvm::SmallVector<int64_t> windowForPart;
+};
+
+std::optional<InterleavedReplicaGeometry>
+buildInterleavedReplicaGeometry(riscv::ValueType type, size_t recordRank) {
+  if (!type || type.getLayout().getCarrier() != "rvv" || recordRank == 0 ||
+      recordRank > type.getAxisIds().size())
+    return std::nullopt;
+  auto streams = riscv_internal::staticProduct(
+      type.getLayout().getTimeFactors().asArrayRef());
+  auto replicas = riscv_internal::staticProduct(
+      type.getLayout().getReplicaFactors().asArrayRef());
+  auto lanes = riscv_internal::staticProduct(
+      type.getLayout().getLaneFactors().asArrayRef());
+  if (!streams || !replicas || !lanes || *streams <= 0 || *replicas <= 0 ||
+      *lanes <= 1 || *streams > std::numeric_limits<int64_t>::max() / *replicas)
+    return std::nullopt;
+
+  InterleavedReplicaGeometry result;
+  result.lanes = *lanes;
+  result.parts = *streams * *replicas;
+  for (size_t position = 0; position < type.getShape().size(); ++position) {
+    const int64_t time = type.getLayout().getTimeFactors()[position];
+    const int64_t lane = type.getLayout().getLaneFactors()[position];
+    const int64_t replica = type.getLayout().getReplicaFactors()[position];
+    const int64_t fragment = type.getLayout().getFragmentFactors()[position];
+    const int64_t local = type.getLayout().getLocalFactors()[position];
+    int64_t represented = 0;
+    if (time <= 0 || lane <= 0 || replica <= 0 || fragment != 1 || local != 1 ||
+        !checkedMultiply(time, lane, represented) ||
+        !checkedMultiply(represented, replica, represented) ||
+        represented != type.getShape()[position] ||
+        (lane > 1 && position >= recordRank))
+      return std::nullopt;
+    if (lane > 1) {
+      if (result.laneAxis)
+        return std::nullopt;
+      result.laneAxis = type.getAxisIds()[position];
+    }
+  }
+  if (!result.laneAxis)
+    return std::nullopt;
+
+  result.recordCoordinates.reserve(
+      static_cast<size_t>(result.parts) * recordRank);
+  result.windowForPart.reserve(static_cast<size_t>(result.parts));
+  for (int64_t part = 0; part < result.parts; ++part) {
+    int64_t remainingStream = part % *streams;
+    int64_t remainingReplica = part / *streams;
+    llvm::SmallVector<int64_t> timeCoordinates(type.getShape().size(), 0);
+    llvm::SmallVector<int64_t> replicaCoordinates(type.getShape().size(), 0);
+    for (int64_t position = static_cast<int64_t>(type.getShape().size()) - 1;
+         position >= 0; --position) {
+      const int64_t time =
+          type.getLayout().getTimeFactors()[static_cast<size_t>(position)];
+      const int64_t replica =
+          type.getLayout().getReplicaFactors()[static_cast<size_t>(position)];
+      timeCoordinates[static_cast<size_t>(position)] = remainingStream % time;
+      remainingStream /= time;
+      replicaCoordinates[static_cast<size_t>(position)] =
+          remainingReplica % replica;
+      remainingReplica /= replica;
+    }
+    if (remainingStream || remainingReplica)
+      return std::nullopt;
+    for (size_t position = 0; position < recordRank; ++position) {
+      const int64_t lane = type.getLayout().getLaneFactors()[position];
+      const int64_t replica = type.getLayout().getReplicaFactors()[position];
+      int64_t coordinate = 0;
+      if (lane > 1) {
+        if (!checkedMultiply(timeCoordinates[position], lane, coordinate) ||
+            coordinate + lane > type.getShape()[position])
+          return std::nullopt;
+      } else if (!checkedMultiply(timeCoordinates[position], replica, coordinate) ||
+                 !checkedAdd(coordinate, replicaCoordinates[position], coordinate) ||
+                 coordinate >= type.getShape()[position]) {
+        return std::nullopt;
+      }
+      result.recordCoordinates.push_back(coordinate);
+    }
+    result.windowForPart.push_back(part);
+  }
+  return result;
+}
+
+riscv::ConvertLayoutOp selectedReplicaConsumer(mlir::Value value,
+                                               riscv::ValueType sourceType,
+                                               riscv::ValueType &selectedType) {
+  selectedType = sourceType;
+  if (!value.hasOneUse())
+    return {};
+  auto conversion =
+      mlir::dyn_cast<riscv::ConvertLayoutOp>(*value.getUsers().begin());
+  auto targetType =
+      conversion
+          ? mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType())
+          : riscv::ValueType();
+  if (!conversion || !targetType ||
+      conversion.getConversion().getEffect() != "pure" ||
+      targetType.getLayout().getCarrier() != "rvv" ||
+      targetType.getElementType() != sourceType.getElementType() ||
+      targetType.getShape() != sourceType.getShape() ||
+      targetType.getAxisIds() != sourceType.getAxisIds())
+    return {};
+  selectedType = targetType;
+  return conversion;
+}
+
+bool createInterleavedReplicaLoad(mlir::IRRewriter &rewriter,
+                                  mlir::Location location,
+                                  riscv::FieldOp field,
+                                  riscv::ValueType selectedType,
+                                  mlir::Value logicalBase, size_t recordRank,
+                                  mlir::Operation *origin,
+                                  mlir::Value valueToReplace,
+                                  riscv::ConvertLayoutOp consumerConversion) {
+  auto ownerEncoding = mlir::dyn_cast<kernel::EncodingType>(
+      riscv_internal::logicalElement(field.getOwner().getType()));
+  const int64_t interleave =
+      ownerEncoding ? riscv_internal::interleaveRows(field, ownerEncoding) : 0;
+  auto geometry = buildInterleavedReplicaGeometry(selectedType, recordRank);
+  if (interleave <= 0 || !geometry || recordRank != 1 ||
+      selectedType.getShape()[0] > interleave ||
+      (field.getAccess().getMapping() != "natural" &&
+       field.getAccess().getMapping() != "joined"))
+    return false;
+  const int64_t resultGroups = selectedType.getLayout().getRegisterGroups();
+  const int64_t temporaryGroups =
+      std::max<int64_t>(1, (selectedType.getLayout().getLmulEighths() + 7) / 8);
+  const bool tail = selectedType.getLayout().getValidity() == "tail";
+  auto storagePlan = riscv_internal::storageWindowPlan(
+      rewriter, field, geometry->laneAxis, 0, 1, 1,
+      selectedType.getShape()[0], 1, true);
+  if (!storagePlan)
+    return false;
+  llvm::SmallVector<int64_t> zeros(static_cast<size_t>(geometry->parts), 0);
+  llvm::SmallVector<int64_t> windowOffsets(static_cast<size_t>(geometry->parts), 0);
+  llvm::StringRef suffix = field.getAccess().getMapping() == "joined"
+                              ? "interleaved-joined"
+                              : "interleaved-natural";
+  const std::string instruction =
+      ("rvv.replica-storage-load." + suffix).str();
+  if (origin == field.getOperation())
+    rewriter.setInsertionPointAfter(field);
+  else
+    rewriter.setInsertionPoint(origin);
+  auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
+      location, selectedType, field.getResult(), logicalBase, *storagePlan,
+      static_cast<int64_t>(recordRank),
+      rewriter.getDenseI64ArrayAttr(windowOffsets),
+      rewriter.getDenseI64ArrayAttr(geometry->recordCoordinates),
+      rewriter.getDenseI64ArrayAttr(geometry->windowForPart),
+      rewriter.getDenseI64ArrayAttr(zeros),
+      rewriter.getDenseI64ArrayAttr(zeros),
+      rewriter.getDenseI64ArrayAttr(zeros),
+      rewriter.getDenseI64ArrayAttr(zeros),
+      rewriter.getDenseI64ArrayAttr(zeros), field.getAccess(),
+      riscv_internal::leaf(rewriter, "rvv", "replica-storage-load",
+                           instruction, instruction, 0, resultGroups,
+                           temporaryGroups, 0, "none",
+                           tail ? "agnostic" : "exact"));
+  riscv_internal::copyOrigin(origin, load);
+  if (auto canonical = origin->getAttr("canonical_op"))
+    load->setAttr("canonical_op", canonical);
+  if (consumerConversion) {
+    consumerConversion.getResult().replaceAllUsesWith(load.getResult());
+    rewriter.eraseOp(consumerConversion);
+  } else {
+    valueToReplace.replaceAllUsesExcept(load.getResult(), load.getOperation());
+  }
+  return true;
+}
+
+bool materializeInterleavedReplicaExtract(mlir::IRRewriter &rewriter,
+                                          riscv::ExtractOp extract) {
+  llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
+  mlir::Value input = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), &conversions);
+  auto field = input.getDefiningOp<riscv::FieldOp>();
+  auto fieldType = field
+                       ? mlir::dyn_cast<riscv::ValueType>(field.getResult().getType())
+                       : riscv::ValueType();
+  auto sourceType =
+      mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  if (!field || !fieldType || !sourceType || extract.getIndices().size() != 1)
+    return false;
+  const riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+  if (facts.logicalRank <= 0 ||
+      facts.logicalRank >= static_cast<int64_t>(fieldType.getAxisIds().size()))
+    return false;
+  const size_t recordRank =
+      fieldType.getAxisIds().size() - static_cast<size_t>(facts.logicalRank);
+  if (extract.getSelectors().size() != fieldType.getAxisIds().size())
+    return false;
+  for (size_t position = 0; position < recordRank; ++position)
+    if (mlir::cast<mlir::StringAttr>(extract.getSelectors()[position]).getValue() !=
+        "all")
+      return false;
+  int64_t selectedLogicalAxes = 0;
+  for (size_t position = recordRank; position < extract.getSelectors().size();
+       ++position) {
+    llvm::StringRef selector =
+        mlir::cast<mlir::StringAttr>(extract.getSelectors()[position]).getValue();
+    if (selector == "index")
+      ++selectedLogicalAxes;
+    else if (selector != "all")
+      return false;
+  }
+  mlir::Type baseType = extract.getIndices().front().getType();
+  if (selectedLogicalAxes != 1 || sourceType.getAxisIds().size() != recordRank ||
+      (!baseType.isIndex() && !mlir::isa<mlir::IntegerType>(baseType)))
+    return false;
+  riscv::ValueType selectedType;
+  riscv::ConvertLayoutOp consumer =
+      selectedReplicaConsumer(extract.getResult(), sourceType, selectedType);
+  if (!createInterleavedReplicaLoad(
+          rewriter, extract.getLoc(), field, selectedType,
+          extract.getIndices().front(), recordRank, extract, extract.getResult(),
+          consumer))
+    return false;
+  rewriter.eraseOp(extract);
+  for (riscv::ConvertLayoutOp conversion : llvm::reverse(conversions))
+    if (conversion.getResult().use_empty())
+      rewriter.eraseOp(conversion);
+  return true;
+}
+
+bool materializeInterleavedReplicaField(mlir::IRRewriter &rewriter,
+                                        riscv::FieldOp field) {
+  auto sourceType = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+  const riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+  if (!sourceType || facts.logicalRank != 0 || sourceType.getAxisIds().empty())
+    return false;
+  riscv::ValueType selectedType;
+  riscv::ConvertLayoutOp consumer =
+      selectedReplicaConsumer(field.getResult(), sourceType, selectedType);
+  rewriter.setInsertionPoint(field);
+  auto zero = rewriter.create<mlir::arith::ConstantIndexOp>(field.getLoc(), 0);
+  if (!createInterleavedReplicaLoad(
+          rewriter, field.getLoc(), field, selectedType, zero,
+          sourceType.getAxisIds().size(), field, field.getResult(), consumer)) {
+    rewriter.eraseOp(zero);
+    return false;
+  }
+  return true;
+}
+
 bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
                                    riscv::ExtractOp extract) {
   llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
@@ -986,8 +1238,13 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     return false;
 
   llvm::SmallVector<int64_t> partOffsets;
-  llvm::SmallVector<int64_t> recordReplicaKeys;
-  llvm::SmallVector<int64_t> representativeReplicas;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> recordCoordinatesForPart;
+  const riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
+  if (facts.logicalRank < 0 ||
+      facts.logicalRank > static_cast<int64_t>(fieldType.getAxisIds().size()))
+    return false;
+  const size_t recordRank =
+      fieldType.getAxisIds().size() - static_cast<size_t>(facts.logicalRank);
   int64_t logicalSpan = 0;
   const int64_t parts = streams * replicas;
   for (int64_t part = 0; part < parts; ++part) {
@@ -1038,22 +1295,34 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     if (logicalOffset < 0 || logicalOffset % lanes)
       return false;
     partOffsets.push_back(logicalOffset);
-    int64_t recordReplicaKey = 0;
-    for (size_t position = 0; position < selectedType.getShape().size();
-         ++position) {
-      const int64_t axis = selectedType.getAxisIds()[position];
+    llvm::SmallVector<int64_t> recordCoordinates;
+    recordCoordinates.reserve(recordRank);
+    for (size_t fieldPosition = 0; fieldPosition < recordRank; ++fieldPosition) {
+      const int64_t axis = fieldType.getAxisIds()[fieldPosition];
+      auto selectedAxis =
+          llvm::find(selectedType.getAxisIds().asArrayRef(), axis);
+      if (selectedAxis == selectedType.getAxisIds().asArrayRef().end()) {
+        if (fieldType.getShape()[fieldPosition] != 1)
+          return false;
+        recordCoordinates.push_back(0);
+        continue;
+      }
+      const size_t position = static_cast<size_t>(
+          selectedAxis - selectedType.getAxisIds().asArrayRef().begin());
+      const int64_t lane = selectedType.getLayout().getLaneFactors()[position];
       const int64_t replica =
           selectedType.getLayout().getReplicaFactors()[position];
-      if (replica <= 1 ||
-          !llvm::is_contained(fieldType.getAxisIds().asArrayRef(), axis))
-        continue;
-      if (!checkedMultiply(recordReplicaKey, replica, recordReplicaKey) ||
-          !checkedAdd(recordReplicaKey, replicaCoordinates[position],
-                      recordReplicaKey))
+      int64_t coordinate = 0;
+      if (lane > 1) {
+        if (!checkedMultiply(timeCoordinates[position], lane, coordinate))
+          return false;
+      } else if (!checkedMultiply(timeCoordinates[position], replica, coordinate) ||
+                 !checkedAdd(coordinate, replicaCoordinates[position], coordinate)) {
         return false;
+      }
+      recordCoordinates.push_back(coordinate);
     }
-    recordReplicaKeys.push_back(recordReplicaKey);
-    representativeReplicas.push_back(part / streams);
+    recordCoordinatesForPart.push_back(std::move(recordCoordinates));
     int64_t end = 0;
     if (!checkedAdd(logicalOffset, lanes, end))
       return false;
@@ -1076,21 +1345,30 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   if (affine.scalarBase && affine.constant != 0)
     return false;
 
-  llvm::DenseMap<std::pair<int64_t, int64_t>, int64_t> windowIds;
   llvm::SmallVector<int64_t> windowOffsets;
-  llvm::SmallVector<int64_t> recordReplicaForWindow;
+  llvm::SmallVector<int64_t> recordCoordinatesForWindow;
   llvm::SmallVector<int64_t> windowForPart;
   llvm::SmallVector<int64_t> layerForPart;
   for (auto [part, offset] : llvm::enumerate(partOffsets)) {
     const int64_t windowOffset = layered ? offset % layer : offset;
-    auto [found, inserted] = windowIds.try_emplace(
-        std::make_pair(recordReplicaKeys[part], windowOffset),
-        static_cast<int64_t>(windowOffsets.size()));
-    if (inserted) {
-      windowOffsets.push_back(windowOffset);
-      recordReplicaForWindow.push_back(representativeReplicas[part]);
+    int64_t windowId = -1;
+    for (size_t candidate = 0; candidate < windowOffsets.size(); ++candidate) {
+      if (windowOffsets[candidate] != windowOffset)
+        continue;
+      llvm::ArrayRef<int64_t> coordinates(
+          recordCoordinatesForWindow.data() + candidate * recordRank, recordRank);
+      if (coordinates ==
+          llvm::ArrayRef<int64_t>(recordCoordinatesForPart[part])) {
+        windowId = static_cast<int64_t>(candidate);
+        break;
+      }
     }
-    windowForPart.push_back(found->second);
+    if (windowId < 0) {
+      windowId = static_cast<int64_t>(windowOffsets.size());
+      windowOffsets.push_back(windowOffset);
+      recordCoordinatesForWindow.append(recordCoordinatesForPart[part]);
+    }
+    windowForPart.push_back(windowId);
     layerForPart.push_back(layered ? offset / layer : 0);
   }
 
@@ -1147,13 +1425,12 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
         selection->mask ? (int64_t{1} << elementBits) - 1 : 0);
   }
   const int64_t resultGroups = selectedType.getLayout().getRegisterGroups();
-  const int64_t temporaryGroups =
-      std::max<int64_t>(1,
-                        (selectedType.getLayout().getLmulEighths() + 7) / 8);
+  const int64_t temporaryGroups = std::max<int64_t>(
+      1, (selectedType.getLayout().getLmulEighths() + 7) / 8);
   const bool tail = selectedType.getLayout().getValidity() == "tail";
-  llvm::StringRef instruction =
-      layered ? "rvv.replica-storage-load.layered"
-              : "rvv.replica-storage-load.natural";
+  llvm::StringRef instruction = layered
+                                    ? "rvv.replica-storage-load.layered"
+                                    : "rvv.replica-storage-load.natural";
   auto storagePlan = riscv_internal::storageWindowPlan(
       rewriter, field, laneAxis, 0, 1, 1, logicalSpan,
       logicalBaseMultiple);
@@ -1161,9 +1438,9 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
     return false;
   auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
       extract.getLoc(), selectedType, field.getResult(), scalarBase,
-      *storagePlan,
+      *storagePlan, static_cast<int64_t>(recordRank),
       rewriter.getDenseI64ArrayAttr(windowOffsets),
-      rewriter.getDenseI64ArrayAttr(recordReplicaForWindow),
+      rewriter.getDenseI64ArrayAttr(recordCoordinatesForWindow),
       rewriter.getDenseI64ArrayAttr(windowForPart),
       rewriter.getDenseI64ArrayAttr(layerForPart),
       rewriter.getDenseI64ArrayAttr(physicalLayerForPart),
@@ -1244,6 +1521,8 @@ public:
     getOperation().walk(
         [&](riscv::FieldOp field) { fields.push_back(field); });
     for (riscv::FieldOp field : fields) {
+      if (materializeInterleavedReplicaField(rewriter, field))
+        continue;
       if (!isLayeredStreamField(field))
         continue;
       auto type = mlir::cast<riscv::ValueType>(field.getResult().getType());
@@ -1331,7 +1610,8 @@ public:
     for (riscv::ExtractOp extract : replicaExtracts) {
       llvm::SmallVector<mlir::Value> indices(extract.getIndices().begin(),
                                              extract.getIndices().end());
-      if (materializeReplicaStorageLoad(rewriter, extract))
+      if (materializeInterleavedReplicaExtract(rewriter, extract) ||
+          materializeReplicaStorageLoad(rewriter, extract))
         replacedReplicaIndices.append(indices.begin(), indices.end());
     }
     eraseDeadPureProducers(rewriter, replacedReplicaIndices);

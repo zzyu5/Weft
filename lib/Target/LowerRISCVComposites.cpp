@@ -1251,27 +1251,25 @@ private:
           mlir::cast<riscv::ValueType>(widen.getResult().getType())
               .getAxisIds()[reduce.getAxis()];
       riscv::ScheduleAttr schedule = mac.getSchedule();
-      auto lhsLayout =
-          mlir::cast<riscv::ValueType>(mac.getLhs().getType()).getLayout();
-      const int64_t partialLMUL =
-          product({lhsLayout.getLmulEighths(), int64_t{2}});
-      const int64_t partialRegisterGroups = product(
-          {std::max<int64_t>(1, lhsLayout.getRegisterGroups()), int64_t{2}});
-      if (partialLMUL <= 0 || partialRegisterGroups <= 0) {
+      auto target = reduce->getParentOfType<riscv::KernelOp>().getTarget();
+      auto lhsLayout = lhsType.getLayout();
+      riscv::LayoutAttr resultLayout = accumulatorType.getLayout();
+      riscv::LayoutAttr loadLayout = riscv_internal::projectLayout(
+          rewriter, lhsType, resultLayout, target);
+      auto partialElement = mlir::IntegerType::get(
+          rewriter.getContext(), 16,
+          mlir::IntegerType::SignednessSemantics::Signed);
+      auto partialSeed = riscv::ValueType::get(
+          rewriter.getContext(), partialElement, lhsType.getShape(),
+          lhsType.getAxisIds(), lhsLayout);
+      riscv::LayoutAttr partialLayout = riscv_internal::projectLayout(
+          rewriter, partialSeed, resultLayout, target);
+      if (!loadLayout || !partialLayout) {
         reduce.emitError(
-            "grouped MAC partial LMUL or register groups overflow their physical domain");
+            "grouped MAC operands have no result-anchored load/partial representation");
         failed = true;
         continue;
       }
-      auto partialLayout = riscv::LayoutAttr::get(
-          rewriter.getContext(), lhsLayout.getCarrier(), lhsLayout.getAxisIds(),
-          lhsLayout.getTimeFactors(), lhsLayout.getLaneFactors(),
-          lhsLayout.getReplicaFactors(), lhsLayout.getFragmentFactors(),
-          lhsLayout.getLocalFactors(), 16,
-          partialLMUL,
-          lhsLayout.getVl(),
-          partialRegisterGroups,
-          lhsLayout.getValidity());
       riscv::FieldOp lhsField = sourceField(lhs);
       riscv::FieldOp rhsField = sourceField(rhs);
       riscv::LoadOp lhsLoad = lhsField ? sourceLoad(lhsField.getOwner())
@@ -1283,7 +1281,6 @@ private:
       mlir::Value lhsPoint = findOperandPoint(lhs, reductionAxis);
       mlir::Value rhsPoint = findOperandPoint(rhs, reductionAxis);
       mlir::Value point = lhsPoint ? lhsPoint : rhsPoint;
-      auto target = reduce->getParentOfType<riscv::KernelOp>().getTarget();
       int64_t laneAxis = 0;
       bool reductionLane = false;
       for (auto [axis, factor] :
@@ -1321,6 +1318,7 @@ private:
           (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
           outputParts > 0 &&
           riscv::supportsRVVLayout(target, lhsLayout) &&
+          riscv::supportsRVVLayout(target, loadLayout) &&
           riscv::supportsRVVLayout(target, partialLayout) &&
           riscv::supportsRVVLayout(target, accumulatorType.getLayout()) &&
           target.getHasWideningInteger();
@@ -1347,6 +1345,9 @@ private:
                                 : riscv::LayoutAttr())
             << ", lhs_layout_legal="
             << riscv::supportsRVVLayout(target, lhsLayout)
+            << ", load_layout=" << loadLayout
+            << ", load_layout_legal="
+            << riscv::supportsRVVLayout(target, loadLayout)
             << ", partial_layout_legal="
             << riscv::supportsRVVLayout(target, partialLayout)
             << ", accumulator_layout_legal="
@@ -1401,19 +1402,22 @@ private:
       rewriter.setInsertionPoint(reduce);
       if (schedule.getPipelineDepth() == 1 &&
           schedule.getBufferCount() == 1) {
-        const int64_t operandGroups = lhsLayout.getRegisterGroups();
+        const int64_t operandGroups =
+            (loadLayout.getLmulEighths() + 7) / 8;
+        const int64_t issueParts =
+            product(resultLayout.getTimeFactors());
         const int64_t temporaryGroups =
             product({partialLayout.getRegisterGroups(), schedule.getUnroll(),
-                     outputParts});
-        if (operandGroups <= 0 || temporaryGroups <= 0) {
+                     issueParts});
+        if (operandGroups <= 0 || issueParts <= 0 || temporaryGroups <= 0) {
           reduce.emitError(
               "grouped MAC leaf resources overflow their physical domain");
           failed = true;
           continue;
         }
         auto grouped = rewriter.create<riscv::RVVGroupedMacReduceOp>(
-            reduce.getLoc(), accumulatorType, lhs, rhs, active, partialLayout,
-            groupedPlan("reduce"),
+            reduce.getLoc(), accumulatorType, lhs, rhs, active, loadLayout,
+            partialLayout, groupedPlan("reduce"),
             riscv_internal::leaf(
                 rewriter, "rvv", "grouped-mac-reduce",
                 "rvv.grouped-mac-reduce.u8-s8",
@@ -1481,7 +1485,7 @@ private:
       rewriter.setInsertionPointToStart(loop.getBody());
       auto load = rewriter.create<riscv::RVVGroupedMacLoadOp>(
           reduce.getLoc(), windowType, lhs, rhs, loop.getInductionVar(), active,
-          partialLayout,
+          loadLayout, partialLayout,
           groupedPlan(compactWindow ? "compact" : "fragmented"),
           riscv_internal::leaf(
               rewriter, "rvv", "grouped-mac-load",

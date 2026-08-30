@@ -297,7 +297,7 @@ def WeftRISCV_LayeredStreamGeometryAttr
 def WeftRISCV_StorageWindowPlanAttr
     : WeftRISCV_Attr<"StorageWindowPlan", "storage_window_plan"> {
   let parameters = (ins
-    StringRefParameter<"unit, strided, repeat, or layered">:$kind,
+    StringRefParameter<"unit, strided, repeat, layered, interleaved_natural, or interleaved_joined">:$kind,
     "int64_t":$reductionAxis,
     "int64_t":$projectionBase,
     "int64_t":$projectionStride,
@@ -1047,6 +1047,7 @@ def WeftRISCV_RVVBitmaskDecodeOp
 def WeftRISCV_RVVGroupedMacReduceOp
     : WeftRISCV_Op<"rvv_grouped_mac_reduce", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
+                       WeftRISCV_LayoutAttr:$load_layout,
                        WeftRISCV_LayoutAttr:$partial_layout,
                        WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1058,6 +1059,7 @@ def WeftRISCV_RVVGroupedMacLoadOp
     : WeftRISCV_Op<"rvv_grouped_mac_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$group_index,
                        Index:$active_terms,
+                       WeftRISCV_LayoutAttr:$load_layout,
                        WeftRISCV_LayoutAttr:$partial_layout,
                        WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1201,8 +1203,9 @@ def WeftRISCV_RVVReplicaStorageLoadOp
   let arguments = (ins WeftRISCV_ValueType:$field,
                        AnyType:$logical_base,
                        WeftRISCV_StorageWindowPlanAttr:$plan,
+                       I64Attr:$record_rank,
                        DenseI64ArrayAttr:$window_offsets,
-                       DenseI64ArrayAttr:$record_replica_for_window,
+                       DenseI64ArrayAttr:$record_coordinates_for_window,
                        DenseI64ArrayAttr:$window_for_part,
                        DenseI64ArrayAttr:$layer_for_part,
                        DenseI64ArrayAttr:$physical_layer_for_part,

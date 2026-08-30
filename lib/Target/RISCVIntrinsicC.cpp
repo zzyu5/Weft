@@ -7854,13 +7854,15 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
       "vint16" + lmulSpelling(operation.getPartialLayout().getLmulEighths()) +
       "_t";
   const std::string rawSuffix =
-      "u8" + lmulSpelling(lhsType.getLayout().getLmulEighths());
+      "u8" + lmulSpelling(operation.getLoadLayout().getLmulEighths());
   const std::string rawType =
-      "vuint8" + lmulSpelling(lhsType.getLayout().getLmulEighths()) + "_t";
+      "vuint8" + lmulSpelling(operation.getLoadLayout().getLmulEighths()) +
+      "_t";
   const std::string signedRawSuffix =
-      "i8" + lmulSpelling(lhsType.getLayout().getLmulEighths());
+      "i8" + lmulSpelling(operation.getLoadLayout().getLmulEighths());
   const std::string signedRawType =
-      "vint8" + lmulSpelling(lhsType.getLayout().getLmulEighths()) + "_t";
+      "vint8" + lmulSpelling(operation.getLoadLayout().getLmulEighths()) +
+      "_t";
   if (outSuffix.empty() || partialSuffix == "i16" || rawSuffix == "u8")
     return fail(operation, "grouped MAC reduction has an invalid RVV type spelling");
 
@@ -8108,9 +8110,10 @@ Emitter::compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation) {
     return fail(operation,
                 "grouped MAC load currently requires one closed output RVV part");
   const std::string rawSuffix =
-      "u8" + lmulSpelling(lhsType.getLayout().getLmulEighths());
+      "u8" + lmulSpelling(operation.getLoadLayout().getLmulEighths());
   const std::string rawType =
-      "vuint8" + lmulSpelling(lhsType.getLayout().getLmulEighths()) + "_t";
+      "vuint8" + lmulSpelling(operation.getLoadLayout().getLmulEighths()) +
+      "_t";
   if (rawSuffix == "u8" || rawType == "vuint8_t")
     return fail(operation, "grouped MAC load has no legal raw RVV shape");
 
@@ -9304,12 +9307,18 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   riscv::StorageWindowPlanAttr plan = operation.getPlan();
   const bool layered = plan.getKind() == "layered";
   const bool natural = plan.getKind() == "unit";
-  if (!natural && !layered)
+  const bool interleavedNatural = plan.getKind() == "interleaved_natural";
+  const bool interleavedJoined = plan.getKind() == "interleaved_joined";
+  const bool interleaved = interleavedNatural || interleavedJoined;
+  if (!natural && !layered && !interleaved)
     return fail(operation,
                 "RVV replica storage load has no selected storage-window form");
-  const std::string expected = layered
-                                   ? "rvv.replica-storage-load.layered"
-                                   : "rvv.replica-storage-load.natural";
+  const std::string expected =
+      layered ? "rvv.replica-storage-load.layered"
+      : natural ? "rvv.replica-storage-load.natural"
+      : interleavedNatural
+          ? "rvv.replica-storage-load.interleaved-natural"
+          : "rvv.replica-storage-load.interleaved-joined";
   if (instructionOf(operation.getOperation()) != expected)
     return fail(operation,
                 "RVV replica storage load has no exact selected leaf");
@@ -9330,17 +9339,24 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   auto field = fieldFor(fieldBinding);
   auto fieldInteger = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
                             : mlir::IntegerType();
+  auto fieldFloat = field ? mlir::dyn_cast<mlir::FloatType>(field->type)
+                          : mlir::FloatType();
+  const unsigned fieldWidth =
+      fieldInteger ? fieldInteger.getWidth() : fieldFloat ? fieldFloat.getWidth() : 0;
   auto resultType = operation.getResult().getType();
   auto layout = resultType.getLayout();
   const int64_t lanes = physicalLanes(operation.getResult());
+  const int64_t recordRank = operation.getRecordRank();
   if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
-      !field || !fieldInteger || field->bitOffset % 8 || lanes <= 0 ||
+      !field || !fieldWidth || field->bitOffset % 8 || lanes <= 0 ||
       owner.recordElements != plan.getRecordElements() ||
       field->bitOffset / 8 != plan.getByteOffset() ||
-      static_cast<int64_t>(fieldInteger.getWidth()) != plan.getElementBits() ||
+      static_cast<int64_t>(fieldWidth) != plan.getElementBits() ||
       operation.getWindowOffsets().empty() ||
-      operation.getRecordReplicaForWindow().size() !=
-          operation.getWindowOffsets().size() ||
+      recordRank < 0 ||
+      recordRank > static_cast<int64_t>(operation.getField().getType().getShape().size()) ||
+      operation.getRecordCoordinatesForWindow().size() !=
+          operation.getWindowOffsets().size() * static_cast<size_t>(recordRank) ||
       operation.getWindowForPart().size() !=
           static_cast<size_t>(vectorPartCount(operation.getResult())) ||
       operation.getLayerForPart().size() !=
@@ -9359,25 +9375,27 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   const std::string vectorSuffixValue = vectorSuffix(operation.getResult());
   const std::string vectorTypeValue = vectorType(operation.getResult());
   const std::string vl = std::to_string(lanes);
-  const int64_t streams = streamPartCount(operation.getResult());
-  llvm::SmallVector<int64_t, 4> registerAxes =
-      registerAxesFor(operation.getResult());
-  if (streams <= 0)
-    return fail(operation,
-                "RVV replica storage load has no issue-time part mapping");
+  const char category = vectorSuffixValue.empty() ? '\0' : vectorSuffixValue.front();
+  const std::string loadSuffix =
+      category == '\0'
+          ? std::string()
+          : std::string(1, category) + std::to_string(layout.getSew()) +
+                lmulSpelling(layout.getLmulEighths());
+  const std::string loadType =
+      category == 'u' ? "vuint" + loadSuffix.substr(1) + "_t"
+      : category == 'i' ? "vint" + loadSuffix.substr(1) + "_t"
+      : category == 'f' ? "vfloat" + loadSuffix.substr(1) + "_t"
+                        : std::string();
+  const std::string loadVL = std::to_string(layout.getVl());
   auto recordForWindow = [&](size_t window) -> std::optional<std::string> {
-    if (window >= operation.getRecordReplicaForWindow().size())
-      return std::nullopt;
-    const int64_t replica = operation.getRecordReplicaForWindow()[window];
-    auto coordinates =
-        registerCoordinates(operation.getResult(), replica);
-    if (!coordinates || coordinates->size() != registerAxes.size())
+    if (window >= operation.getWindowOffsets().size())
       return std::nullopt;
     std::string record = "(" + owner.recordPointer;
     auto fieldType = operation.getField().getType();
-    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
-      if (!llvm::is_contained(fieldType.getAxisIds().asArrayRef(), axis))
-        continue;
+    for (int64_t position = 0; position < recordRank; ++position) {
+      const int64_t axis = fieldType.getAxisIds()[static_cast<size_t>(position)];
+      const int64_t coordinate = operation.getRecordCoordinatesForWindow()[
+          window * static_cast<size_t>(recordRank) + static_cast<size_t>(position)];
       auto stride = llvm::find_if(owner.recordByteStrides,
                                   [&](const auto &entry) {
                                     return entry.first == axis;
@@ -9394,10 +9412,136 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   };
   llvm::SmallVector<std::string> windows;
   windows.reserve(operation.getWindowOffsets().size());
-  if (!layered) {
+  if (interleaved) {
+    if (owner.interleaveRows <= 0 || layout.getSew() <= 0 ||
+        layout.getLmulEighths() <= 0)
+      return fail(operation,
+                  "interleaved replica storage load has no selected byte-plane geometry");
+    const int64_t rawNumerator = layout.getLmulEighths() * 8;
+    if (rawNumerator % layout.getSew())
+      return fail(operation,
+                  "interleaved replica storage load cannot preserve the selected lane count");
+    const int64_t rawLMUL = rawNumerator / layout.getSew();
+    const std::string rawLMULName = lmulSpelling(rawLMUL);
+    if (rawLMULName.empty())
+      return fail(operation,
+                  "interleaved replica storage load has an illegal raw-byte LMUL");
+    const std::string rawSuffix = "u8" + rawLMULName;
+    const std::string rawType = "vuint8" + rawLMULName + "_t";
+    auto byteLoad = [&](llvm::StringRef record, const std::string &byte,
+                        llvm::StringRef stem) {
+      std::string loaded = fresh(stem);
+      line(rawType + " " + loaded + " = __riscv_vle8_v_" + rawSuffix +
+           "((const uint8_t *)(" + record.str() + " + (" + byte + ") * " +
+           std::to_string(owner.interleaveRows) + "), " + vl + ");");
+      return loaded;
+    };
+    for (auto [window, offset] :
+         llvm::enumerate(operation.getWindowOffsets())) {
+      auto record = recordForWindow(window);
+      if (!record)
+        return fail(operation,
+                    "interleaved replica storage window has no typed record coordinate");
+      const std::string logical = "((" + logicalBase.scalar + ") + " +
+                                  std::to_string(offset) + ")";
+      if (interleavedJoined) {
+        if (!fieldInteger || !fieldInteger.isUnsigned())
+          return fail(operation,
+                      "joined interleaved storage requires an unsigned logical field");
+        const int64_t group = operation.getAccess().getGroupSize();
+        const int64_t fields = operation.getAccess().getJoinFields();
+        const int64_t lowBits = operation.getAccess().getJoinLowBits();
+        const int64_t role = operation.getAccess().getJoinRole();
+        const int64_t physicalRole = operation.getAccess().getOrder() == "lo_first"
+                                         ? role
+                                         : fields - 1 - role;
+        const uint64_t logicalMask = (uint64_t{1} << fieldWidth) - 1;
+        const uint64_t lowMask = (uint64_t{1} << lowBits) - 1;
+        const uint64_t highMask =
+            (uint64_t{1} << (fieldWidth - lowBits)) - 1;
+        const std::string tail = "(" + logical + " - " +
+                                 std::to_string(group) + ")";
+        const std::string headByte =
+            std::to_string(plan.getByteOffset() + role * group) + " + " + logical;
+        const std::string lowByte =
+            std::to_string(plan.getByteOffset() + fields * group) + " + " + tail;
+        const std::string highByte =
+            std::to_string(plan.getByteOffset() + role * group) + " + " + tail;
+        std::string head = byteLoad(*record, headByte, "replica_joined_head");
+        head = "__riscv_vand_vx_" + rawSuffix + "(" + head + ", " +
+               std::to_string(logicalMask) + ", " + vl + ")";
+        std::string low = byteLoad(*record, lowByte, "replica_joined_low");
+        low = "__riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" +
+              rawSuffix + "(" + low + ", " +
+              std::to_string(physicalRole * lowBits) + ", " + vl + "), " +
+              std::to_string(lowMask) + ", " + vl + ")";
+        std::string high = byteLoad(*record, highByte, "replica_joined_high");
+        high = "__riscv_vand_vx_" + rawSuffix + "(__riscv_vsrl_vx_" +
+               rawSuffix + "(" + high + ", " + std::to_string(fieldWidth) +
+               ", " + vl + "), " + std::to_string(highMask) + ", " + vl +
+               ")";
+        const std::string assembled =
+            operation.getAccess().getOrder() == "lo_first"
+                ? "__riscv_vor_vv_" + rawSuffix + "(" + low +
+                      ", __riscv_vsll_vx_" + rawSuffix + "(" + high + ", " +
+                      std::to_string(lowBits) + ", " + vl + "), " + vl + ")"
+                : "__riscv_vor_vv_" + rawSuffix + "(" + high +
+                      ", __riscv_vsll_vx_" + rawSuffix + "(" + low + ", " +
+                      std::to_string(fieldWidth - lowBits) + ", " + vl +
+                      "), " + vl + ")";
+        std::string value = fresh("replica_joined_value");
+        line(rawType + " " + value + " = (" + logical + " < " +
+             std::to_string(group) + " ? " + head + " : " + assembled +
+             ");");
+        windows.push_back(std::move(value));
+        continue;
+      }
+
+      const unsigned bytes = fieldWidth / 8;
+      if (!bytes || (fieldWidth != 8 && fieldWidth != 16 && fieldWidth != 32))
+        return fail(operation,
+                    "natural interleaved storage requires one byte-addressable logical element");
+      const std::string unsignedSuffix =
+          "u" + std::to_string(fieldWidth) +
+          lmulSpelling(layout.getLmulEighths());
+      const std::string unsignedType =
+          "vuint" + std::to_string(fieldWidth) +
+          lmulSpelling(layout.getLmulEighths()) + "_t";
+      std::string assembled;
+      for (unsigned byte = 0; byte < bytes; ++byte) {
+        const std::string byteIndex =
+            std::to_string(plan.getByteOffset() + byte) + " + (" + logical +
+            ") * " + std::to_string(bytes);
+        std::string loaded =
+            byteLoad(*record, byteIndex, "replica_natural_byte");
+        std::string widened = loaded;
+        if (bytes > 1) {
+          widened = "__riscv_vzext_vf" + std::to_string(bytes) + "_" +
+                    unsignedSuffix + "(" + loaded + ", " + vl + ")";
+          if (byte)
+            widened = "__riscv_vsll_vx_" + unsignedSuffix + "(" + widened +
+                      ", " + std::to_string(byte * 8) + ", " + vl + ")";
+        }
+        assembled = assembled.empty()
+                        ? widened
+                        : "__riscv_vor_vv_" + unsignedSuffix + "(" +
+                              assembled + ", " + widened + ", " + vl + ")";
+      }
+      std::string value = fresh("replica_natural_value");
+      if (vectorSuffixValue == unsignedSuffix) {
+        line(vectorTypeValue + " " + value + " = " + assembled + ";");
+      } else {
+        line(vectorTypeValue + " " + value + " = __riscv_vreinterpret_v_" +
+             unsignedSuffix + "_" + vectorSuffixValue + "(" + assembled +
+             ");");
+      }
+      windows.push_back(std::move(value));
+    }
+  } else if (!layered) {
     const unsigned width = fieldInteger.getWidth();
     auto scalarType = scalarCType(field->type);
-    if (!scalarType || (width != 8 && width != 16 && width != 32))
+    if (!scalarType || (width != 8 && width != 16 && width != 32) ||
+        loadSuffix.empty() || loadType.empty())
       return fail(operation,
                   "natural replica storage load requires a byte-addressable integer field");
     for (auto [window, offset] :
@@ -9413,9 +9557,9 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
           *record + ") + " + std::to_string(plan.getByteOffset()) +
           ")) + " + index;
       std::string raw = fresh("replica_window");
-      line(vectorTypeValue + " " + raw + " = __riscv_vle" +
-           std::to_string(width) + "_v_" + vectorSuffixValue + "(" + pointer +
-           ", " + vl + ");");
+      line(loadType + " " + raw + " = __riscv_vle" +
+           std::to_string(width) + "_v_" + loadSuffix + "(" + pointer +
+           ", " + loadVL + ");");
       windows.push_back(std::move(raw));
     }
   } else {

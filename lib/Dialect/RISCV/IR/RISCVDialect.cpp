@@ -278,7 +278,9 @@ std::optional<int64_t> doubledPositive(int64_t value) {
 bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
                                   mlir::Value rhs, int64_t reductionAxis,
                                   GroupedMacPlanAttr plan,
-                                  LayoutAttr partialLayout) {
+                                  LayoutAttr loadLayout,
+                                  LayoutAttr partialLayout,
+                                  LayoutAttr resultLayout) {
   auto lhsType = mlir::dyn_cast<ValueType>(lhs.getType());
   auto rhsType = mlir::dyn_cast<ValueType>(rhs.getType());
   auto lhsInteger = lhsType
@@ -314,6 +316,7 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
       (lhsAccess.getOrder() != "lo_first" &&
        lhsAccess.getOrder() != "hi_first") ||
       !supportsRVVLayout(kernel.getTarget(), lhsType.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), loadLayout) ||
       !supportsRVVLayout(kernel.getTarget(), partialLayout) ||
       !kernel.getTarget().getHasWideningInteger())
     return false;
@@ -355,7 +358,75 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
                     (plan.getLoadForm() == "strided" && hasCohortStride &&
                      plan.getRowStrideAxis() == laneAxis));
   (void)reductionLane;
-  return result;
+  auto sameCoordinates = [](LayoutAttr lhsLayout, LayoutAttr rhsLayout) {
+    return lhsLayout.getAxisIds() == rhsLayout.getAxisIds() &&
+           lhsLayout.getTimeFactors() == rhsLayout.getTimeFactors() &&
+           lhsLayout.getLaneFactors() == rhsLayout.getLaneFactors() &&
+           lhsLayout.getReplicaFactors() == rhsLayout.getReplicaFactors() &&
+           lhsLayout.getFragmentFactors() == rhsLayout.getFragmentFactors() &&
+           lhsLayout.getLocalFactors() == rhsLayout.getLocalFactors() &&
+           lhsLayout.getVl() == rhsLayout.getVl() &&
+           lhsLayout.getValidity() == rhsLayout.getValidity();
+  };
+  auto resultType = mlir::dyn_cast<ValueType>(
+      mlir::isa<RVVGroupedMacReduceOp>(operation)
+          ? mlir::cast<RVVGroupedMacReduceOp>(operation).getResult().getType()
+          : mlir::cast<RVVGroupedMacLoadOp>(operation)
+                .getResult()
+                .getType()
+                .getResultType());
+  if (!resultType || resultType.getLayout() != resultLayout ||
+      resultLayout.getSew() != 32 ||
+      resultLayout.getLmulEighths() !=
+          2 * partialLayout.getLmulEighths())
+    return false;
+  auto expectedGroups = [](LayoutAttr layout) {
+    auto replicas = checkedPositiveProduct(
+        layout.getReplicaFactors().asArrayRef());
+    return replicas ? ((layout.getLmulEighths() + 7) / 8) * *replicas : -1;
+  };
+  if (loadLayout.getRegisterGroups() != expectedGroups(loadLayout) ||
+      partialLayout.getRegisterGroups() != expectedGroups(partialLayout) ||
+      resultLayout.getRegisterGroups() != expectedGroups(resultLayout))
+    return false;
+  for (auto [position, axis] :
+       llvm::enumerate(lhsType.getAxisIds().asArrayRef())) {
+    auto resultAxis = llvm::find(resultLayout.getAxisIds().asArrayRef(), axis);
+    if (resultAxis == resultLayout.getAxisIds().asArrayRef().end()) {
+      if (axis != reductionAxis ||
+          loadLayout.getTimeFactors()[position] !=
+              std::max<int64_t>(1, lhsType.getShape()[position]) ||
+          loadLayout.getLaneFactors()[position] != 1 ||
+          loadLayout.getReplicaFactors()[position] != 1 ||
+          loadLayout.getFragmentFactors()[position] != 1 ||
+          loadLayout.getLocalFactors()[position] != 1)
+        return false;
+      continue;
+    }
+    const size_t resultPosition = static_cast<size_t>(
+        resultAxis - resultLayout.getAxisIds().asArrayRef().begin());
+    if (loadLayout.getTimeFactors()[position] !=
+            resultLayout.getTimeFactors()[resultPosition] ||
+        loadLayout.getLaneFactors()[position] !=
+            resultLayout.getLaneFactors()[resultPosition] ||
+        loadLayout.getReplicaFactors()[position] !=
+            resultLayout.getReplicaFactors()[resultPosition] ||
+        loadLayout.getFragmentFactors()[position] !=
+            resultLayout.getFragmentFactors()[resultPosition] ||
+        loadLayout.getLocalFactors()[position] !=
+            resultLayout.getLocalFactors()[resultPosition])
+      return false;
+  }
+  for (int64_t axis : resultLayout.getAxisIds().asArrayRef())
+    if (!llvm::is_contained(lhsType.getAxisIds().asArrayRef(), axis))
+      return false;
+  return result && loadLayout.getAxisIds() == lhsType.getAxisIds() &&
+         partialLayout.getAxisIds() == lhsType.getAxisIds() &&
+         sameCoordinates(loadLayout, partialLayout) &&
+         loadLayout.getSew() == 8 && partialLayout.getSew() == 16 &&
+         partialLayout.getLmulEighths() ==
+             2 * loadLayout.getLmulEighths() &&
+         loadLayout.getVl() == resultLayout.getVl();
 }
 
 mlir::LogicalResult verifyBroadcastDomain(mlir::Operation *operation,
@@ -578,6 +649,21 @@ llvm::StringRef baseEncodingFamily(mlir::Operation *operation,
         result = derived.getSourceFamily();
     });
   return result;
+}
+
+int64_t derivedInterleaveRows(mlir::Operation *operation,
+                              weft::kernel::EncodingType encoding) {
+  if (!encoding || encoding.getKind() != "derived_instance")
+    return 0;
+  int64_t rows = 0;
+  if (auto module = operation->getParentOfType<mlir::ModuleOp>())
+    module.walk([&](DerivedEncodingOp derived) {
+      if (derived.getResultFamily() == encoding.getFamily() &&
+          derived.getLayoutIdentity() == encoding.getLayoutIdentity() &&
+          derived.getParameterValues() == encoding.getParameters().asArrayRef())
+        rows = derived.getInterleaveRows();
+    });
+  return rows;
 }
 
 } // namespace
@@ -1096,6 +1182,15 @@ mlir::LogicalResult StorageWindowPlanAttr::verify(
         shiftStep != 0 || maskValue != 0)
       return emitError()
              << "natural storage window plan disagrees with its selected load form";
+    return mlir::success();
+  }
+  if (kind == "interleaved_natural" || kind == "interleaved_joined") {
+    if (projectionBase != 0 || projectionStride != 1 ||
+        projectionRepeat != 1 || groupSize != 0 || layerSize != 0 ||
+        physicalLayerBase != 0 || physicalLayerStep != 0 || shiftBase != 0 ||
+        shiftStep != 0 || maskValue != 0)
+      return emitError()
+             << "interleaved record projection disagrees with its selected load form";
     return mlir::success();
   }
   if (kind != "layered")
@@ -3470,7 +3565,8 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
   auto target = kernel.getTarget();
   const bool operandGeometry = hasGroupedMacOperandGeometry(
       getOperation(), getLhs(), getRhs(), getPlan().getReductionAxis(),
-      getPlan(), getPartialLayout());
+      getPlan(), getLoadLayout(), getPartialLayout(),
+      getResult().getType().getLayout());
   const bool resultLayout =
       supportsRVVLayout(target, getResult().getType().getLayout());
   if (!operandGeometry || !resultLayout)
@@ -3481,6 +3577,7 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
            << ", lhs=" << getLhs().getType() << ", rhs=" << getRhs().getType()
            << ", result=" << getResult().getType()
            << ", plan=" << getPlan()
+           << ", load_layout=" << getLoadLayout()
            << ", partial_layout=" << getPartialLayout();
   if (!exactLeaf(getLeaf(), "rvv", "grouped-mac-reduce",
                  "rvv.grouped-mac-reduce.u8-s8", "none", "agnostic") &&
@@ -3491,6 +3588,22 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
       llvm::ArrayRef<int64_t>({getPlan().getGroup(), getPlan().getUnroll(),
                                getPlan().getReductionAxis()}))
     return emitOpError("grouped MAC reduction leaf parameters disagree with its schedule");
+  auto issueParts = checkedPositiveProduct(
+      getResult().getType().getLayout().getTimeFactors().asArrayRef());
+  auto expectedTemporaries =
+      issueParts
+          ? checkedPositiveProduct(
+                {getPartialLayout().getRegisterGroups(), getPlan().getUnroll(),
+                 *issueParts})
+          : std::nullopt;
+  if (!expectedTemporaries ||
+      getLeaf().getOperandGroups() !=
+          (getLoadLayout().getLmulEighths() + 7) / 8 ||
+      getLeaf().getResultGroups() !=
+          getResult().getType().getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != *expectedTemporaries)
+    return emitOpError(
+        "grouped MAC reduction leaf resources disagree with its typed layouts");
   return mlir::success();
 }
 
@@ -3517,7 +3630,8 @@ mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
   auto target = kernel.getTarget();
   if (!hasGroupedMacOperandGeometry(
           getOperation(), getLhs(), getRhs(), getPlan().getReductionAxis(),
-          getPlan(), getPartialLayout()) ||
+          getPlan(), getLoadLayout(), getPartialLayout(),
+          window.getResultLayout()) ||
       !supportsRVVLayout(target, window.getResultLayout()))
     return emitOpError(
         "grouped MAC load has no complete typed field, cohort-storage, "
@@ -4364,48 +4478,66 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   auto sourceField = getField().getDefiningOp<FieldOp>();
   auto storageLoad = sourceField ? sourceLoad(sourceField.getOwner()) : LoadOp();
   auto memory = storageLoad ? storageLoad.getRegion().getType() : MemDescType();
-  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  mlir::Type fieldElement = field.getElementType();
+  auto fieldInteger = mlir::dyn_cast<mlir::IntegerType>(fieldElement);
+  const int64_t fieldBits = elementBitWidth(fieldElement);
   mlir::Type baseType = getLogicalBase().getType();
   const bool scalarBase = baseType.isIndex() || mlir::isa<mlir::IntegerType>(baseType);
   StorageWindowPlanAttr plan = getPlan();
   const int64_t laneAxis = plan.getReductionAxis();
   const int64_t logicalSpan = plan.getProjectionExtent();
   const int64_t logicalBaseMultiple = plan.getOffsetAlignment();
+  const int64_t recordRank = getRecordRank();
   auto resultAxis = llvm::find(result.getAxisIds().asArrayRef(), laneAxis);
   auto parts = physicalPartCount(result);
   const bool natural = plan.getKind() == "unit";
   const bool layered = plan.getKind() == "layered";
+  const bool interleavedNatural = plan.getKind() == "interleaved_natural";
+  const bool interleavedJoined = plan.getKind() == "interleaved_joined";
+  const bool interleaved = interleavedNatural || interleavedJoined;
   const int64_t group = plan.getGroupSize();
   const int64_t layer = plan.getLayerSize();
   const int64_t layers = layered && layer > 0 ? group / layer : 1;
   llvm::StringRef validity = result.getLayout().getValidity();
   llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
-  llvm::StringRef instruction =
-      natural ? "rvv.replica-storage-load.natural"
-              : "rvv.replica-storage-load.layered";
+  llvm::StringRef instruction = natural
+                                    ? "rvv.replica-storage-load.natural"
+                                : layered
+                                    ? "rvv.replica-storage-load.layered"
+                                : interleavedNatural
+                                    ? "rvv.replica-storage-load.interleaved-natural"
+                                    : "rvv.replica-storage-load.interleaved-joined";
+  auto ownerEncoding = mlir::dyn_cast<weft::kernel::EncodingType>(
+      sourceField ? elementOf(sourceField.getOwner().getType()) : mlir::Type());
+  const int64_t interleave =
+      sourceField ? derivedInterleaveRows(*this, ownerEncoding) : 0;
   if (!sourceField || !storageLoad || !memory ||
       !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
-      !fieldElement || fieldElement.isSignless() || !scalarBase ||
+      fieldBits <= 0 || (fieldInteger && fieldInteger.isSignless()) || !scalarBase ||
       laneAxis <= 0 || plan.getProjectionBase() != 0 ||
       plan.getProjectionStride() != 1 || plan.getProjectionRepeat() != 1 ||
       plan.getRecordElements() != memory.getElements() ||
       plan.getByteOffset() != getAccess().getBitOffset() / 8 ||
-      plan.getElementBits() != static_cast<int64_t>(fieldElement.getWidth()) ||
+      plan.getElementBits() != fieldBits ||
       (natural && getAccess().getMapping() != "natural") ||
       (layered && getAccess().getMapping() != "grouped_layered") ||
+      (interleavedNatural && getAccess().getMapping() != "natural") ||
+      (interleavedJoined && getAccess().getMapping() != "joined") ||
       resultAxis == result.getAxisIds().asArrayRef().end() ||
       field.getElementType() != result.getElementType() ||
       result.getLayout().getCarrier() != "rvv" || !parts || *parts <= 0 ||
       logicalBaseMultiple <= 0 || logicalSpan <= 0 ||
       getWindowOffsets().empty() ||
-      getRecordReplicaForWindow().size() != getWindowOffsets().size() ||
+      recordRank < 0 || recordRank > static_cast<int64_t>(field.getShape().size()) ||
+      getRecordCoordinatesForWindow().size() !=
+          getWindowOffsets().size() * static_cast<size_t>(recordRank) ||
       getWindowForPart().size() != static_cast<size_t>(*parts) ||
       getLayerForPart().size() != static_cast<size_t>(*parts) ||
       getPhysicalLayerForPart().size() != static_cast<size_t>(*parts) ||
       getShiftOffsetForPart().size() != static_cast<size_t>(*parts) ||
       getShiftBaseFactorForPart().size() != static_cast<size_t>(*parts) ||
       getMaskValueForPart().size() != static_cast<size_t>(*parts) ||
-      (!natural && !layered) ||
+      (!natural && !layered && !interleaved) ||
       (validity != "full" && validity != "tail") ||
       !exactLeaf(getLeaf(), "rvv", "replica-storage-load", instruction, "none",
                  tail))
@@ -4415,6 +4547,9 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
            << static_cast<bool>(sourceField) << ", access=" << getAccess()
            << ", plan=" << plan
            << ", window_offsets=" << getWindowOffsets()
+           << ", record_rank=" << recordRank
+           << ", record_coordinates_for_window="
+           << getRecordCoordinatesForWindow()
            << ", window_for_part=" << getWindowForPart()
            << ", layer_for_part=" << getLayerForPart()
            << ", physical_layer_for_part=" << getPhysicalLayerForPart()
@@ -4468,32 +4603,72 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   if (!streams || *streams <= 0)
     return emitOpError(
         "replica storage load must define a positive issue-time decomposition");
-  const int64_t replicaCount = *parts / *streams;
-  if (replicaCount <= 0 || *parts % *streams)
+  if (*parts % *streams)
     return emitOpError(
         "replica storage load has an incomplete stream/replica product");
-  for (int64_t replica : getRecordReplicaForWindow())
-    if (replica < 0 || replica >= replicaCount)
-      return emitOpError(
-          "replica storage load window references an invalid record replica");
+  auto loadLanes = checkedPositiveProduct(
+      result.getLayout().getLaneFactors().asArrayRef());
+  if (!loadLanes || *loadLanes <= 1)
+    return emitOpError(
+        "replica storage load has no positive typed load-lane extent");
+  for (size_t window = 0; window < getWindowOffsets().size(); ++window) {
+    for (int64_t position = 0; position < recordRank; ++position) {
+      const int64_t coordinate = getRecordCoordinatesForWindow()[
+          window * static_cast<size_t>(recordRank) + static_cast<size_t>(position)];
+      const int64_t extent = field.getShape()[static_cast<size_t>(position)];
+      int64_t width = 1;
+      auto mapped = llvm::find(result.getAxisIds().asArrayRef(),
+                               field.getAxisIds()[static_cast<size_t>(position)]);
+      if (mapped != result.getAxisIds().asArrayRef().end())
+        width = result.getLayout().getLaneFactors()[static_cast<size_t>(
+            mapped - result.getAxisIds().asArrayRef().begin())];
+      if (coordinate < 0 || width <= 0 ||
+          (extent > 0 && coordinate > extent - width))
+        return emitOpError()
+               << "replica storage load window has an out-of-range record coordinate; window="
+               << window << ", position=" << position
+               << ", coordinate=" << coordinate << ", width=" << width
+               << ", extent=" << extent << ", record_rank=" << recordRank
+               << ", field=" << field << ", result=" << result;
+    }
+  }
   for (int64_t window : getWindowForPart())
     if (window < 0 ||
         window >= static_cast<int64_t>(getWindowOffsets().size()))
       return emitOpError(
           "replica storage load part references an invalid source window");
 
-  if (natural) {
+  if (interleaved) {
+    if (interleave <= 0 || recordRank != 1 ||
+        result.getAxisIds()[lanePosition] != field.getAxisIds()[0] ||
+        result.getShape()[lanePosition] > interleave ||
+        logicalSpan != result.getShape()[lanePosition] ||
+        (getAccess().getForm() != "strided" &&
+         getAccess().getForm() != "indexed") ||
+        (interleavedNatural && fieldBits != 8 && fieldBits != 16 &&
+         fieldBits != 32) ||
+        (interleavedJoined &&
+         (!fieldInteger || !fieldInteger.isUnsigned() || fieldBits > 8 ||
+          getAccess().getGroupSize() <= 0 || getAccess().getJoinFields() <= 1 ||
+          getAccess().getJoinLowBits() <= 0 ||
+          getAccess().getJoinLowBits() >= fieldBits ||
+          getAccess().getJoinRole() < 0 ||
+          getAccess().getJoinRole() >= getAccess().getJoinFields() ||
+          (getAccess().getOrder() != "lo_first" &&
+           getAccess().getOrder() != "hi_first"))))
+      return emitOpError(
+          "interleaved replica storage load requires one explicit record-axis projection and closed byte assembly");
+  } else if (natural) {
     if (getAccess().getForm() != "indexed" || getAccess().getBitOffset() % 8 ||
-        (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
-         fieldElement.getWidth() != 32) ||
-        result.getLayout().getSew() !=
-            static_cast<int64_t>(fieldElement.getWidth()))
+        !fieldInteger ||
+        (fieldBits != 8 && fieldBits != 16 && fieldBits != 32) ||
+        result.getLayout().getSew() != fieldBits)
       return emitOpError(
           "natural replica storage load requires byte-addressable indexed source elements");
   } else {
     if (getAccess().getForm() != "indexed" || group <= 0 || layer <= 0 ||
         group % layer || layers <= 1 || layer % *physicalLanes ||
-        fieldElement.getWidth() * layers > 8 ||
+        !fieldInteger || fieldInteger.isSigned() || fieldBits * layers > 8 ||
         result.getLayout().getSew() != 8 || getAccess().getBitOffset() % 8 ||
         (getAccess().getOrder() != "lo_first" &&
          getAccess().getOrder() != "hi_first") ||
@@ -4504,8 +4679,11 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
 
 
   for (int64_t offset : getWindowOffsets()) {
-    const bool bounded = natural ? offset >= 0 && offset <= logicalSpan - *physicalLanes
-                                 : offset >= 0 && offset <= layer - *physicalLanes;
+    const bool bounded = natural || interleaved
+                             ? offset >= 0 &&
+                                   offset <= logicalSpan - *loadLanes
+                             : offset >= 0 &&
+                                   offset <= layer - *physicalLanes;
     if (!bounded)
       return emitOpError("replica storage load window offset is out of bounds");
   }
@@ -4513,20 +4691,20 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
        llvm::zip(getWindowForPart(), getLayerForPart())) {
     if (window < 0 || window >= static_cast<int64_t>(getWindowOffsets().size()) ||
         storageLayer < 0 || storageLayer >= layers ||
-        (natural && storageLayer != 0))
+        ((natural || interleaved) && storageLayer != 0))
       return emitOpError(
           "replica storage load part map references an invalid window or layer");
   }
-  const int64_t elementBits = fieldElement.getWidth();
+  const int64_t elementBits = fieldBits;
   const int64_t fullMask = (int64_t{1} << elementBits) - 1;
   const bool dynamicBase =
-      !natural && logicalBaseMultiple % group != 0;
+      layered && logicalBaseMultiple % group != 0;
   for (auto [logicalLayer, physicalLayer, shiftOffset, shiftBaseFactor,
              maskValue] :
        llvm::zip(getLayerForPart(), getPhysicalLayerForPart(),
                  getShiftOffsetForPart(), getShiftBaseFactorForPart(),
                  getMaskValueForPart())) {
-    if (natural) {
+    if (natural || interleaved) {
       if (physicalLayer != 0 || shiftOffset != 0 || shiftBaseFactor != 0 ||
           maskValue != 0)
         return emitOpError(

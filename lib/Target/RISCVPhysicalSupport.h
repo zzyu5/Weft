@@ -136,7 +136,8 @@ std::optional<riscv::StorageWindowPlanAttr>
 storageWindowPlan(mlir::Builder &builder, riscv::FieldOp field,
                   int64_t reductionAxis, int64_t projectionBase,
                   int64_t projectionStride, int64_t projectionRepeat,
-                  int64_t projectionExtent, int64_t offsetAlignment);
+                  int64_t projectionExtent, int64_t offsetAlignment,
+                  bool recordProjection = false);
 
 void copyOrigin(mlir::Operation *source, mlir::Operation *target);
 

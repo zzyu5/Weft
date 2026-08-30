@@ -84,7 +84,7 @@ riscv_internal::storageWindowPlan(
     mlir::Builder &builder, riscv::FieldOp field, int64_t reductionAxis,
     int64_t projectionBase, int64_t projectionStride,
     int64_t projectionRepeat, int64_t projectionExtent,
-    int64_t offsetAlignment) {
+    int64_t offsetAlignment, bool recordProjection) {
   riscv::LoadOp load = sourceLoad(field.getOwner());
   auto memory = load ? load.getRegion().getType() : riscv::MemDescType();
   auto fieldType =
@@ -115,7 +115,17 @@ riscv_internal::storageWindowPlan(
   int64_t shiftBase = 0;
   int64_t shiftStep = 0;
   int64_t maskValue = 0;
-  if (access.getMapping() == "natural") {
+  auto ownerElement = logicalElement(field.getOwner().getType());
+  auto ownerEncoding = mlir::dyn_cast<kernel::EncodingType>(ownerElement);
+  const int64_t recordInterleave =
+      ownerEncoding ? interleaveRows(field, ownerEncoding) : 0;
+  if (recordProjection && recordInterleave > 0 &&
+      access.getMapping() == "natural") {
+    kind = "interleaved_natural";
+  } else if (recordProjection && recordInterleave > 0 &&
+             access.getMapping() == "joined") {
+    kind = "interleaved_joined";
+  } else if (access.getMapping() == "natural") {
     kind = projectionRepeat > 1
                ? "repeat"
                : projectionStride == 1 ? "unit" : "strided";
