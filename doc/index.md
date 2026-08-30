@@ -28,6 +28,7 @@ Weft 是一门面向非 SIMT 机器的数值 realization 语言。作者写下�
 - [编译器总览](compiler/index.md)：两层 MLIR、candidate authority 与完整文档入口。
 - [RISC-V Physical IR](compiler/riscv-ir.md)：physical value、memory、conversion、Level/control 与 final invariants。
 - [编译 Pass](compiler/passes.md)：layout、memory、schedule、resource 与 target-op rewrite。
+- [非 SIMT 物理优化方法](compiler/optimization-principles.md)：可复用的工作量计数、五类优化原则、资源仲裁与可证伪预测。
 - [RISC-V Local Leaf](compiler/leaves.md)：RVV intrinsic、IME/opaque asm 的合同与选择。
 - [Intrinsic C / ASM Emission](compiler/emission.md)：terminal translator 与 system compiler 边界。
 

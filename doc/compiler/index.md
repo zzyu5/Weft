@@ -45,6 +45,7 @@ source `auto` 在进入 lowering 前绑定。结构固定后的 LMUL、microtile
 
 - [RISC-V IR](riscv-ir.md)：physical values、memory descriptors、conversion、local objects 与 schedule entities。
 - [编译 Pass](passes.md)：同一份 RISC-V IR 上的分析、选择与真实 rewrite。
+- [非 SIMT 物理优化方法](optimization-principles.md)：从生成 IR/C/汇编分类动态工作、定位 carrier、supply、memory、reduction 与 pipeline 缺口。
 - [Local Leaf](leaves.md)：RVV intrinsic、IME/opaque asm leaf 的合同与选择。
 - [Terminal Emission](emission.md)：已选 leaf 和已物化程序怎样确定地写成 C/asm。
 - [非 SIMT 物理机器](../machine/physical-machine.md)：time/lane/register-replica/fragment/local-storage 的机器语义。

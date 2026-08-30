@@ -1,0 +1,365 @@
+# 非 SIMT 物理优化方法
+
+## 1. 目的
+
+Weft 的物理编译器面对的是一份已经确定 logical values、axes、Level、Encoding、
+数值 operation 与 effects 的程序。优化不能改变这棵程序树；它要减少同一程序在
+单控制器 RISC-V core 上执行的动态工作，并在寄存器预算内隐藏剩余延迟。
+
+本文件给出一套可复用的诊断方法。它不是 pass 清单，也不以“新增了 typed op”作为
+进展。每次优化前后都必须回答：哪类动态工作减少了，减少多少，代价转移到了哪里。
+
+方法由一个前置门槛、五条物理原则和一个全局仲裁器组成：
+
+```text
+P0 先数工作
+P1 载体归属        logical axis → lane / register replica / issue time / fragment
+P2 供应唯一        distinct producer value 在其复用域内只产生一次
+P3 形态跟随        memory instruction 服从 storage geometry 与 consumer layout
+P4 延迟收敛        宽 partial 保持到该形态能完成的工作全部完成
+P5 issue-time 重叠  在真实依赖允许时把 producer latency 与 compute 重叠
+
+R  寄存器、fragment 与 local-storage live set 是共同合法性约束
+```
+
+P1–P5 不是互斥 pass。一个 kernel 可以同时违反多条；诊断必须把现象归到产生它的
+物理实体，不能用一个总的“向量化不好”替代。
+
+## 2. P0：命名不等于减少
+
+新增 physical type、op、window、partial 或 cluster 只增加了可观察性。只有它消除了
+动态 load、decode、index、conversion、MAC、reduction、spill 或等待，才是优化。
+
+动手前建立一份 physical work ledger：
+
+| 类别 | 静态实体 | 动态计数方法 |
+|---|---|---|
+| supply | load、decode、lookup、address/index producer | 静态 op 数 × 所在 loop trip count |
+| compute | multiply、MAC、pointwise、cast | 每个 leaf 的指令数 × issue 次数 |
+| convergence | partial combine、lane reduction、scalar extract | 每个 result/partial 的 reduce 次数 |
+| movement | conversion、gather、slide、spill/reload | 指令数、bytes 与 live interval |
+| schedule | stage、buffer、prefetch、wait | steady-state iteration 与 prologue/epilogue 开销 |
+
+两个操作只有在完整 identity 相同并且一个结果支配所有 consumers 时才可合并。memory
+identity 至少包含 source SSA、logical coordinate/offset、Encoding relation、access、result
+layout、validity 与 effect。地址在运行时偶尔别名，不等于 SSA producer 相同。
+
+历史证据：
+
+- `fec0c9943` 为 Q2_K 增加 projected window 后，IR 形成 2 loads、16 windows、8 updates、
+  2 finalizers，但没有减少 decode/activation/finalize；SG `2.136→1.763`，K1
+  `1.823→1.660` GOP/s。见
+  [`riscv-projected-layered-window-q2-cross-format.md`](../../report/history/riscv-projected-layered-window-q2-cross-format.md)。
+- `ff89f1ec1` 给 16 个 Q2_K windows 补全 `logical_offset` 后，合法 read-CSE 可删除
+  **0** 个 op；忽略 offset 会读错数据，因此没有实现该 pass。见
+  [`riscv-q2-window-reuse-static-disproof.md`](../../report/history/riscv-q2-window-reuse-static-disproof.md)。
+- 独立的 Q5_K 证据位于 `b72cefad0`：interleave 前后 bytes footprint 都是 `1.000×`，
+  但指令数为 `1.99×`、cycles 为 `1.372×`、吞吐为 `0.729×`。布局有名字且没有复制
+  bytes，仍不能说明 decode/index 工作减少。
+
+对应参考机制：Triton `RemoveLayoutConversions.cpp:1044-1078` 比较 conversion 与
+rematerialization 的真实成本；TileLang `layout_cost_model.cc:55-92` 计算 global-memory
+segment bytes 与 issue-equivalent bytes。二者都不是“出现某种 IR 名称就认为更快”。
+
+## 3. P1：载体归属
+
+### 3.1 原则
+
+每条 logical axis 必须在一个具体 value/use 上映射到：
+
+- SIMD lane：同一条宽指令中的 coordinates；
+- register replica：同时存活的 output/partial copies；
+- issue time：顺序 strip、unroll instance 或 loop iteration；
+- extension fragment：固定硬件坐标；
+- local storage：可寻址临时载体。
+
+选错载体会改变动态指令数和 live set。reduction axis 放进 register replica 会复制
+partial；free/output axis 放进 lane 后过早 scalar extract 会失去多个 accumulator；本应顺序
+issue 的小 reduction 全部同时存活会直接超出寄存器预算。
+
+### 3.2 在代码里看什么
+
+```text
+final IR:  ValueType 的 time/lane/replica factors、register groups、vl
+C/asm:     每个 logical output 的 vector op 数、vmv.x.s 数、tuple 数、spill/reload
+```
+
+先数每个 axis 的 physical factor，再数由该 factor 产生的 instruction multiplicity。仅看
+LMUL 不够；相同 LMUL 下 replica 数可以相差一个数量级。
+
+### 3.3 历史证据
+
+- `00afcbbce` 将 reduction axis 放入 lane、free axes 放入 register replicas，十个格式在两台
+  机器同时提升。例如 SG Q4_0 `0.501→7.113`、Q5_K `0.345→6.968`；K1
+  Q4_0 `0.368→1.858`、Q5_K `0.277→2.361` GOP/s。见
+  [`riscv-reduction-lane-microkernel-and-blocked-quant-performance.md`](../../report/history/riscv-reduction-lane-microkernel-and-blocked-quant-performance.md)。
+- `8ca6a994c` 对 Q4_K correction 的小 reduction 采用相反映射：M free axis 进 lane、K
+  reduction 进 time，峰值从 `34/32` 降到 `20/32` groups，kernel 从资源非法变为 SG
+  `10.128` GOP/s。见
+  [`riscv-dot-layout-layered-storage-and-affected-performance.md`](../../report/history/riscv-dot-layout-layered-storage-and-affected-performance.md)。
+
+这两个结果说明不存在“reduction 永远进 lane”的公式。规则必须读取 axis extent、SEW、
+VLEN、surviving free axes、consumer contract 与完整 live set。
+
+### 3.4 责任与 pass
+
+logical axis 是否存在、是否是普通 scalar loop，归作者；同一 shaped axis 的物理载体归编译器。
+当前主要 owner 是 `SelectRISCVOperations`、`PropagateRISCVLayouts` 和
+`MaterializeRISCVResources`。若达到性能必须把 Python 展开的标量循环重新发明成 axis，
+应停止并修改 std tree，而不是增加 matcher。
+
+Triton 的对应机制不是“SIMT 总工作固定”。`OptimizeThreadLocality.cpp:106-176` 会重分配
+thread/warp ownership以减少 shuffle；`AccelerateMatmul.cpp:86-145,449-485` 会按 dot shape、
+MMA instruction shape 与 warp 数重构 operand/result layout。固定的是 launch participants 的
+某些覆盖关系，不是复制、shuffle、register 或动态 instruction 总量。Weft 的差异是 logical
+value 没有预先分给 thread，P1 必须直接在完整值上决定 lane/replica/time。
+
+## 4. P2：供应唯一
+
+### 4.1 原则
+
+一次 load、decode、lookup、index 或 address construction 应按它产生的 **distinct physical
+value** 发生一次，而不是按 consumer 次数发生。共享需要同时满足：
+
+1. source 中存在共同 SSA producer或可证明等价的 physical producer；
+2. producer 支配所有 uses，且 effect/alias/order允许移动；
+3. consumers 接受同一 representation，或共享点之前/之后有显式 conversion；
+4. 扩大的 lifetime 不导致更昂贵的 spill。
+
+P2 不允许把不同 logical offset、不同 table entry 或不同 decode layer 合并。那会改变程序，
+不是 reuse。
+
+### 4.2 在代码里看什么
+
+```text
+distinct source/offset identities
+每个 identity 的 load/decode/index 指令次数
+consumer 数与实际 producer 数
+producer 定义点到 last use 的 live interval
+因扩大 lifetime 新增的 spill/reload
+```
+
+### 4.3 历史证据
+
+- `d2e5758bc` 让 IQ4_XS 的 window identity包含 record replica 与 logical offset；相同
+  activation record load服务多个 output consumers，而不同 replica/offset不合并。SG
+  `3.471709→7.666652`，K1 `1.277462→2.325529` GOP/s。
+- `8ca6a994c` 让 Q1_0 的一个 raw-byte window服务八个 bit consumers，不再每个输出各做
+  byte gather/index chain。SG `3.376→6.912`，K1 `1.828→3.479` GOP/s。
+
+前者见
+[`riscv-partial-topology-unification-and-ir-pass-audit.md`](../../report/history/riscv-partial-topology-unification-and-ir-pass-audit.md)，
+后者见
+[`riscv-dot-layout-layered-storage-and-affected-performance.md`](../../report/history/riscv-dot-layout-layered-storage-and-affected-performance.md)。
+
+### 4.4 责任与 pass
+
+source Value 的 birth、Level 与 handoff 归作者；同一次 birth 的 physical placement、reload、
+rematerialize和consumer sharing归编译器。当前 `CanonicalizeRISCVLayouts` 只有受限
+single-use rematerialization，`ShareRISCVLayeredWindows` 只覆盖 typed layered geometry，
+`PlanRISCVMemory` 能形成部分 shared window。一般的 multi-consumer placement/lifetime
+选择仍没有统一 owner。
+
+Triton `OptimizeDotOperands.cpp:181-299` 把 local allocation/load 提到共同 base tensor并让
+多个 views消费；`RemoveLayoutConversions.cpp:42-59` 以 anchor、propagation、conflict与
+dominance rewrite组织 representation reuse。TileLang reducer只有同一个 epoch、structurally
+equal plan的 update sites 才共享 partial storage；它同样不会按相似地址合并独立值。
+
+## 5. P3：访问形态跟随 storage geometry
+
+### 5.1 原则
+
+memory form 必须由 Encoding/storage mapping、pointer relation、consumer layout和target
+capability共同得到：
+
+```text
+contiguous coordinates       → unit load/store
+fixed affine stride          → strided
+entry/payload relation       → indexed/gather or entry window
+interleaved fields           → segment
+sub-byte layered geometry    → one raw window + mask/shift/merge
+joined planes                → typed multi-source reconstruction
+```
+
+P3 决定“怎样取得同一个值”；P2 决定“取得几次”。二者不能合成一个含糊的 memory pass。
+
+### 5.2 在代码里看什么
+
+```text
+vle/vlse/vluxei/vlseg 的数量与宽度
+scalar address mul/add、index-vector construction、vrgather/vslide
+每个 raw byte window服务的logical elements
+mask/shift是否与Encoding geometry一致
+```
+
+### 5.3 历史证据
+
+- `8ca6a994c` 的 typed layered geometry同时覆盖 Q4/Q5/TQ：SG Q4_1
+  `4.711→6.691`，Q5_1 `3.984→6.464`；K1 TQ2_0 `2.312→3.681` GOP/s。
+- 同一提交的 Q1_0 从每输出八次 byte gather改为 mask load + vector merge，SG提升
+  `104.8%`、K1提升约 `90.3%`。这是访问形式变化，不是多一个格式 selector。
+
+### 5.4 责任与 pass
+
+Encoding 若没有表达 bit/byte/group/layer/joined relation，作者必须修 Encoding；relation
+已经存在时，unit/strided/indexed/segment/gather/unpack归编译器。当前主要由
+`PlanRISCVMemory`、`FuseRISCVBitplanes`、`ShareRISCVLayeredWindows` 负责。joined high-plane、
+radix storage projection和codebook entry payload仍有覆盖缺口。
+
+Triton `CoalesceUtils.cpp:17-94` 读取 pointer contiguity/divisibility、shape、load/store语义与
+thread count选择order和per-thread width；`Coalesce.cpp:82-119` 插入真实 layout conversion。
+TileLang `loop_vectorize.cc:216-266,428-476` 从target最大load宽度和所有access约束的GCD决定
+vector size。它们提供的是基于访问事实的规则，不是按kernel名称选择load模板。
+
+## 6. P4：延迟收敛
+
+### 6.1 原则
+
+lane/register partial 应保持到该形态能做的乘加、scale combine和partial combine全部完成，
+再发生 lane reduction 或 scalar extract。过早 reduction 会产生：
+
+- 每个 contribution 一次 `vwredsum/vredsum`；
+- `vmv.x.s` 后重新 broadcast；
+- scalar carry串行依赖；
+- 大量独立 partial spill后再reload。
+
+但“延迟收敛”不能改变作者声明的整数宽度、溢出边界、浮点结合或 source partial集合。
+`scale * reduce(product)` 与 `reduce(scale * product)` 若改变中间值，就是另一棵作者程序。
+
+### 6.2 在代码里看什么
+
+```text
+每个block/half/output的reduction次数
+vector partial slots、combine arity和tree depth
+vmv.x.s / scalar carry update次数
+partial spill/reload与最终reduce之前完成的MAC数量
+```
+
+### 6.3 历史证据
+
+- `c29d835ac` 让 TQ2_0 从逐项partial/spill变成typed partial program。SG
+  `1.564→19.977`（12.77×），K1 `3.681→6.245` GOP/s；SG汇编从
+  `120 vwmacc / 80 spill / 128 reload / 207 csrr` 收敛到
+  `32 vwmacc / 5 spill / 5 reload / 12 reductions`。
+- Q2_K 的 typed regular-repeat + independent partial + combine topology 将 SG
+  `4.845207→9.969884`、K1 `1.659511→2.508207` GOP/s，并在两机超过 source。
+  见
+  [`riscv-q2-regular-repeat-independent-partial-topology.md`](../../report/history/riscv-q2-regular-repeat-independent-partial-topology.md)。
+
+### 6.4 责任与 pass
+
+closed contract/reduce 内的 physical partial set、combine topology和final reduction归编译器；
+改变 canonical partial、widening位置或Level carry归作者。当前
+`PlanRISCVPartialTopologies`、`MaterializeRISCVPartialAccumulators` 与
+`LowerRISCVComposites` 服务P4。computed scale、codebook-derived operand和非统一SSA拼写仍会
+使同一物理关系落回顺序reduction。
+
+Triton `ReduceOpToLLVM.cpp:228-351` 从register/lane bases和被消去axis组织local/lane tree
+reduction；TileLang `reducer_plan_materialize.cc:559-946` 从update-site reduction axes投影
+partial storage并选择narrow/wide/packed plan。可复用的是“先有typed distribution/plan，
+再materialize combine”，不是GPU thread collective本身。
+
+## 7. P5：issue-time 重叠
+
+### 7.1 为什么单列
+
+流水不一定减少指令；它可能增加guard、buffer version、prologue/epilogue和register
+pressure，但通过把下一iteration的load/decode与当前compute重叠而缩短critical path。因此它
+既不是P2供应唯一，也不是P4延迟reduction。
+
+### 7.2 形成条件与计数
+
+只有同时满足以下条件才尝试pipeline：
+
+- source loop至少有两个动态iterations；
+- physical IR中存在可移动的pure/read producer与carry-dependent consumer；
+- effect、alias、tail和control允许跨iteration移动；
+- producer latency足以覆盖buffer/guard开销；
+- 增加的buffer live set不导致spill。
+
+应检查：load-to-use距离、steady-state中producer/consumer交错、跨stage SSA数量、buffer
+versions、prologue/epilogue占比、spill变化。只看到`pipeline_depth=2`不算实现。
+
+### 7.3 历史证据与反例
+
+- `63de9c28f` 的dependency-derived depth-2 pipeline使 Q4_0 SG
+  `7.777527→11.773182`、K1 `2.261673→2.769195`；Q4_1 SG
+  `6.620159→9.627385`、K1 `1.960523→2.665530` GOP/s。
+- 同一机制对 F16 SG为 `15.856819→14.450291`（-8.9%），因为`KC=K`只有一次
+  K iteration；Q4_0 decode与IQ4_NL也分别为-1.3%和-0.7%。因此depth必须是参数，不能由
+  “这是GEMM/quant”猜定。
+
+当前`ScheduleRISCVLevels`负责从use-def/effect写stage/order，`PipelineRISCVLevels`只做
+SSA version与prologue/steady/epilogue展开。只实现distance=1、depth=2/buffer=2；没有typed
+transfer和latency事实时，prefetch保持不存在，而不是设一个非零默认值。
+
+Triton `SoftwarePipeliner.cpp:21-27` 同样分schedule与expander；
+`LowerLoops.cpp:49-117`、`AssignLatencies.cpp:172-231`读取async能力、shared encoding、use
+distance、mask与MMA wait约束。TileLang `pipeline_planning.cc:1083-1337`读取source stage/order
+或producer closure，`inject_pipeline.cc`再版本化buffer并生成同步。
+
+## 8. R：资源仲裁
+
+寄存器预算不是第六种优化，它是P1–P5共享的全局合法性约束。每项候选结构必须计算同时
+live的operands、results、partials、indices、masks、conversions、pipeline buffers和fragments。
+
+冲突处理顺序：
+
+1. 数值、axis、Encoding、effect与2.2边界不可让步；
+2. 先拒绝没有减少工作的结构（P0）；
+3. 先确定P1 carrier与P4 convergence topology，因为它们决定基本live set；
+4. P3选择能直接供应该carrier的memory form；
+5. P2只在不造成更昂贵spill时扩大共享lifetime；
+6. P5最后增加buffer和stage；资源不足时该parameter binding非法，不回头让emitter换结构。
+
+Q4_K correction `34→20` 是成功仲裁；Q3_K 是反例：一次m8 load静态少一条load，却让
+allocator看见更大的独立SSA live set，SG从约`6.69`降到`2.68` GOP/s并产生vector spill；
+NR2/LMULm4达到`36/32`直接非法。缺的不是更宽load，而是让load和partial consumer成为一个
+带完整input/temporary/output resource合同的联合local operation。
+
+Triton也不是资源无限：`OptimizePartitionWarps.cpp:143-253`用rough register estimate调整
+partition warps并重新分配layouts。TileLang layout cost以register为次级成本，但最终register
+allocation仍交给LLVM/NVCC。Weft必须在intrinsic C之前闭合RVV/IME resource groups，因为系统
+compiler不能替Weft重新选择carrier、partial topology或fragment。
+
+## 9. 可复用诊断动作
+
+分析一个慢kernel时，固定执行以下动作，而不是从某个pass名称出发：
+
+1. 从final RISC-V IR列出每个hot Level的axis→time/lane/replica映射与resource peak；
+2. 按source origin、logical coordinate和loop trip count建立work ledger；
+3. 对每个supply identity统计load/decode/index次数与consumer数；
+4. 对每条memory edge统计unit/strided/indexed/segment及地址算术；
+5. 对每个contraction/reduction统计partial slots、MAC、reduce、scalar extract与spill；
+6. 仅在前五项合理后检查load-to-use距离和pipeline可行性；
+7. 与donor逐段对照，先判断差异归作者tree还是physical compiler，再修改代码。
+
+新机制动手前必须回答：
+
+```text
+它删除或合并哪些动态工作？静态上限是多少？
+它依赖哪些typed facts？第二个独立input在哪里？
+它是否改变logical values、Level、widening或artifact？
+它增加多少live register/local/fragment资源？
+收益应在IR、C和assembly的哪个计数上出现？
+若计数不变，为什么还值得实现？
+```
+
+最后一问无法回答时，不实现。
+
+## 10. 可证伪预测
+
+下表用于后续对答案。若完成作者前置条件后，主要瓶颈分类有一半以上错误，本方法应被
+视为事后归纳并重写。
+
+| 格式/入口 | 作者前置条件 | 主要预测 | 预期可见现象 |
+|---|---|---|---|
+| IQ1_S / IQ1_M | grid/sign的entry与lane必须成为shaped axes，不能保留Python展开 | 先P2，再P4；P3次之 | 同一grid/sign entry跨output共享；reduce前保留lane partial；lookup/load次数不随consumer线性增长 |
+| IQ2_S / IQ2_XS / IQ2_XXS | entry、payload、group与output cohort显式存在 | P2供应与P4 partial topology；indexed-entry只解决P3的一部分 | entry payload一次载入服务多个uses；当前逐group scalar carry变成partial set；若只出现typed indexed load而计数不降，预测未成立 |
+| IQ3_S / IQ3_XXS | grid/sign与high-bit plane写成shaped values | P3 joined/bit-plane geometry，然后P2/P4 | scalar shift/index链减少；raw plane/window供应一次；最终reduction次数下降 |
+| TQ1_0 | 当前shaped radix-3 tree已满足 | P4为主，P3为次；prefill再看P5 | 每个32/16-lane段的五个products形成independent/compact partial而非串行chain；`vwredsum/vmv.x.s`推迟；qh regular-repeat不退化为scalar地址 |
+| Q4_K canonical | 必须先决定canonical ABI下的blocked/local-materialize作者tree；persistent derived encoding是另一程序 | 作者边界优先；tree成立后P2/P3/P5 | 若仍是row×column，compiler不能创造output cohort；若blocked tree成立，应看到activation跨output共享、typed local pack和跨K steady state |
+| Q5_K剩余dequant | 现有shaped sub-axis足够 | P3 joined q/qh geometry与P2 raw-window供应 | q/qh不分别重复构造scalar index；一个typed joined window服务decode；contraction partial不是主要矛盾 |
+
+这些预测不授权按格式名实现pass。格式名只用于实验定位；真正的compiler规则仍必须以axis、
+storage geometry、use-def、effect、target facts和resources为输入，并在第二个独立输入上验证。
