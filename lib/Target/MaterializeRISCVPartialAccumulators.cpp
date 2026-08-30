@@ -517,6 +517,148 @@ riscv::ValueType partialType(mlir::Builder &builder, riscv::ValueType lhs,
                                riscv_internal::integers(builder, axes), layout);
 }
 
+riscv::ValueType projectReplicaReductionOperandType(
+    mlir::Builder &builder, riscv::ValueType input, int64_t removedAxis) {
+  auto removed = axisPosition(input, removedAxis);
+  if (!removed || input.getLayout().getCarrier() != "rvv" ||
+      input.getLayout().getTimeFactors()[*removed] <= 1 ||
+      input.getLayout().getLaneFactors()[*removed] != 1 ||
+      input.getLayout().getReplicaFactors()[*removed] != 1 ||
+      input.getLayout().getFragmentFactors()[*removed] != 1 ||
+      input.getLayout().getLocalFactors()[*removed] != 1)
+    return {};
+
+  llvm::SmallVector<int64_t> shape;
+  llvm::SmallVector<int64_t> axes;
+  llvm::SmallVector<int64_t> time;
+  llvm::SmallVector<int64_t> lane;
+  llvm::SmallVector<int64_t> replica;
+  llvm::SmallVector<int64_t> fragment;
+  llvm::SmallVector<int64_t> local;
+  auto source = input.getLayout();
+  for (size_t position = 0; position < input.getAxisIds().size(); ++position) {
+    if (position == *removed)
+      continue;
+    shape.push_back(input.getShape()[position]);
+    axes.push_back(input.getAxisIds()[position]);
+    time.push_back(source.getTimeFactors()[position]);
+    lane.push_back(source.getLaneFactors()[position]);
+    replica.push_back(source.getReplicaFactors()[position]);
+    fragment.push_back(source.getFragmentFactors()[position]);
+    local.push_back(source.getLocalFactors()[position]);
+  }
+  const int64_t laneCount = product(lane);
+  const int64_t replicaCount = product(replica);
+  if (laneCount <= 1 || replicaCount <= 0 || product(time) != 1 ||
+      product(fragment) != 1 || product(local) != 1)
+    return {};
+  const int64_t groupsPerVector =
+      std::max<int64_t>(1, (source.getLmulEighths() + 7) / 8);
+  auto axisIds = riscv_internal::integers(builder, axes);
+  auto layout = riscv::LayoutAttr::get(
+      builder.getContext(), "rvv", axisIds,
+      riscv_internal::integers(builder, time),
+      riscv_internal::integers(builder, lane),
+      riscv_internal::integers(builder, replica),
+      riscv_internal::integers(builder, fragment),
+      riscv_internal::integers(builder, local), source.getSew(),
+      source.getLmulEighths(), laneCount, groupsPerVector * replicaCount,
+      source.getValidity());
+  return riscv::ValueType::get(builder.getContext(), input.getElementType(),
+                               riscv_internal::integers(builder, shape), axisIds,
+                               layout);
+}
+
+riscv::ValueType replicaReducedAccumulatorType(
+    mlir::Builder &builder, riscv::ValueType lhs, riscv::ValueType rhs,
+    int64_t reductionAxis) {
+  auto lhsElement = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+  auto rhsElement = mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType());
+  auto lhsReduction = axisPosition(lhs, reductionAxis);
+  auto rhsReduction = axisPosition(rhs, reductionAxis);
+  if (!lhsElement || !rhsElement || lhsElement.isSignless() ||
+      rhsElement.isSignless() ||
+      (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+      std::max<unsigned>(8, lhsElement.getWidth()) !=
+          std::max<unsigned>(8, rhsElement.getWidth()) ||
+      !lhsReduction || !rhsReduction ||
+      lhs.getLayout().getCarrier() != "rvv" ||
+      rhs.getLayout().getCarrier() != "rvv" ||
+      lhs.getLayout().getSew() != rhs.getLayout().getSew() ||
+      lhs.getLayout().getLmulEighths() != rhs.getLayout().getLmulEighths() ||
+      lhs.getLayout().getVl() != rhs.getLayout().getVl())
+    return {};
+
+  const int64_t reductionLanes =
+      lhs.getLayout().getLaneFactors()[*lhsReduction];
+  if (reductionLanes <= 1 ||
+      reductionLanes != rhs.getLayout().getLaneFactors()[*rhsReduction] ||
+      lhs.getShape()[*lhsReduction] != rhs.getShape()[*rhsReduction])
+    return {};
+
+  llvm::SmallVector<int64_t> axes;
+  llvm::SmallVector<int64_t> shape;
+  llvm::SmallVector<int64_t> replicas;
+  auto appendFree = [&](riscv::ValueType operand) -> bool {
+    for (size_t position = 0; position < operand.getAxisIds().size(); ++position) {
+      const int64_t axis = operand.getAxisIds()[position];
+      if (axis == reductionAxis)
+        continue;
+      if (operand.getLayout().getTimeFactors()[position] != 1 ||
+          operand.getLayout().getLaneFactors()[position] != 1 ||
+          operand.getLayout().getReplicaFactors()[position] <= 0 ||
+          operand.getLayout().getFragmentFactors()[position] != 1 ||
+          operand.getLayout().getLocalFactors()[position] != 1)
+        return false;
+      auto found = llvm::find(axes, axis);
+      if (found == axes.end()) {
+        axes.push_back(axis);
+        shape.push_back(operand.getShape()[position]);
+        replicas.push_back(operand.getLayout().getReplicaFactors()[position]);
+        continue;
+      }
+      const size_t target = static_cast<size_t>(found - axes.begin());
+      if (shape[target] != operand.getShape()[position] ||
+          replicas[target] != operand.getLayout().getReplicaFactors()[position])
+        return false;
+    }
+    return true;
+  };
+  if (!appendFree(lhs) || !appendFree(rhs))
+    return {};
+
+  axes.push_back(reductionAxis);
+  shape.push_back(lhs.getShape()[*lhsReduction]);
+  replicas.push_back(1);
+  llvm::SmallVector<int64_t> time(axes.size(), 1);
+  llvm::SmallVector<int64_t> lane(axes.size(), 1);
+  llvm::SmallVector<int64_t> one(axes.size(), 1);
+  lane.back() = reductionLanes;
+  const int64_t partialWidth =
+      2 * std::max<unsigned>(8, lhsElement.getWidth());
+  const int64_t partialLMUL = 2 * lhs.getLayout().getLmulEighths();
+  const int64_t groupsPerVector =
+      std::max<int64_t>(1, (partialLMUL + 7) / 8);
+  const int64_t replicaCount = product(replicas);
+  if (partialLMUL <= 0 || replicaCount <= 0)
+    return {};
+  auto axisIds = riscv_internal::integers(builder, axes);
+  auto layout = riscv::LayoutAttr::get(
+      builder.getContext(), "rvv", axisIds,
+      riscv_internal::integers(builder, time),
+      riscv_internal::integers(builder, lane),
+      riscv_internal::integers(builder, replicas),
+      riscv_internal::integers(builder, one),
+      riscv_internal::integers(builder, one), partialWidth, partialLMUL,
+      reductionLanes, groupsPerVector * replicaCount,
+      lhs.getLayout().getValidity());
+  auto element = mlir::IntegerType::get(builder.getContext(), partialWidth,
+                                        mlir::IntegerType::Signed);
+  return riscv::ValueType::get(builder.getContext(), element,
+                               riscv_internal::integers(builder, shape), axisIds,
+                               layout);
+}
+
 riscv::ValueType partialSlotType(mlir::Builder &builder, riscv::ValueType operand,
                                  int64_t reductionAxis) {
   auto position = axisPosition(operand, reductionAxis);
@@ -1884,16 +2026,42 @@ public:
   void runOnOperation() override {
     mlir::Builder builder(&getContext());
     llvm::DenseMap<mlir::Operation *, ScaledTopologyFacts> scaledFacts;
+    llvm::DenseMap<mlir::Operation *, riscv::ReduceOp> replicaReductions;
     llvm::DenseSet<mlir::Operation *> levelScaledDots;
     llvm::SmallVector<riscv::ReduceOp> reductions;
     getOperation().walk(
         [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
     for (riscv::ReduceOp reduce : reductions) {
+      auto input = mlir::dyn_cast<riscv::ValueType>(reduce.getInput().getType());
+      auto result = mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
+      auto dot = reduce.getInput().getDefiningOp<riscv::RVVWidenDotOp>();
+      auto resultElement =
+          result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+                 : mlir::IntegerType();
+      if (reduce.getKind() == "add" && input && result && dot &&
+          dot.getResult().hasOneUse() && dot.getOver().size() == 1 &&
+          reduce.getAxis() >= 0 &&
+          static_cast<size_t>(reduce.getAxis()) < input.getAxisIds().size() &&
+          input.getLayout().getCarrier() == "scalar" &&
+          result.getLayout().getCarrier() == "scalar" && resultElement &&
+          resultElement.isSigned() && resultElement.getWidth() == 32) {
+        const size_t position = static_cast<size_t>(reduce.getAxis());
+        const int64_t reducedAxis = input.getAxisIds()[position];
+        const int64_t replicas =
+            input.getLayout().getReplicaFactors()[position];
+        if (reducedAxis != dot.getOver()[0] && replicas > 1 &&
+            input.getLayout().getTimeFactors()[position] == 1 &&
+            input.getLayout().getLaneFactors()[position] == 1 &&
+            input.getLayout().getFragmentFactors()[position] == 1 &&
+            input.getLayout().getLocalFactors()[position] == 1)
+          replicaReductions[dot.getOperation()] = reduce;
+      }
       auto match = matchReplicaScaledDotReduction(reduce);
       if (!match)
         continue;
-      auto result = mlir::dyn_cast<riscv::ValueType>(match->dot.getResult().getType());
-      if (!result)
+      auto dotResultType =
+          mlir::dyn_cast<riscv::ValueType>(match->dot.getResult().getType());
+      if (!dotResultType)
         continue;
       ScaledTopologyFacts facts;
       facts.partialAxes = match->reducedAxes;
@@ -1901,9 +2069,11 @@ public:
       facts.partialAxes.erase(
           std::unique(facts.partialAxes.begin(), facts.partialAxes.end()),
           facts.partialAxes.end());
-      facts.outputAxes = remainingAxes(result, facts.partialAxes);
-      facts.partialSlots = replicaProductForAxes(result, facts.partialAxes);
-      facts.outputReplicas = replicaProductForAxes(result, facts.outputAxes);
+      facts.outputAxes = remainingAxes(dotResultType, facts.partialAxes);
+      facts.partialSlots =
+          replicaProductForAxes(dotResultType, facts.partialAxes);
+      facts.outputReplicas =
+          replicaProductForAxes(dotResultType, facts.outputAxes);
       if (facts.partialSlots <= 1 || facts.outputReplicas <= 0)
         continue;
       auto found = scaledFacts.find(match->dot.getOperation());
@@ -1952,8 +2122,47 @@ public:
       int64_t resources = std::max<int64_t>(1, partialSlots * partialGroups + 2);
       std::optional<SourceLanePlan> sourcePlan;
       std::optional<LayeredTopologyFacts> layeredPlan;
+      riscv::ValueType replicaAccumulator;
 
-      if (fused)
+      if (auto found = replicaReductions.find(dot.getOperation());
+          found != replicaReductions.end()) {
+        riscv::ReduceOp reduce = found->second;
+        auto input = mlir::cast<riscv::ValueType>(reduce.getInput().getType());
+        auto reduced = mlir::cast<riscv::ValueType>(reduce.getResult().getType());
+        const size_t position = static_cast<size_t>(reduce.getAxis());
+        const int64_t reducedAxis = input.getAxisIds()[position];
+        const int64_t reducedReplicas =
+            input.getLayout().getReplicaFactors()[position];
+        const int64_t survivingReplicas = replicaProduct(reduced);
+        auto projectedLhs = projectReplicaReductionOperandType(
+            builder, dot.getLhs().getType(), reducedAxis);
+        auto projectedRhs = projectReplicaReductionOperandType(
+            builder, dot.getRhs().getType(), reducedAxis);
+        replicaAccumulator =
+            projectedLhs && projectedRhs
+                ? replicaReducedAccumulatorType(builder, projectedLhs,
+                                                projectedRhs, dot.getOver()[0])
+                : riscv::ValueType();
+        const int64_t accumulatorGroups =
+            replicaAccumulator
+                ? replicaAccumulator.getLayout().getRegisterGroups()
+                : 0;
+        if (reducedReplicas > 1 && survivingReplicas > 0 && kernel &&
+            replicaAccumulator && accumulatorGroups <= available &&
+            riscv::supportsRVVLayout(kernel.getTarget(),
+                                     replicaAccumulator.getLayout())) {
+          kind = "replica_reduced";
+          partialAxes.assign(1, reducedAxis);
+          outputAxes.assign(reduced.getAxisIds().asArrayRef().begin(),
+                            reduced.getAxisIds().asArrayRef().end());
+          sourceSlots = reducedReplicas;
+          partialSlots = reducedReplicas;
+          replicas = survivingReplicas;
+          combineArity = reducedReplicas;
+          resources = std::max<int64_t>(1, operandGroups + accumulatorGroups + 2);
+        }
+      }
+      if (kind.empty() && fused)
         if (auto layered = analyzeLayeredTopology(builder, dot)) {
           kind = "layered";
           rootOperand = layered->rootOperand;
@@ -2061,12 +2270,14 @@ public:
           vectorResult =
               mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
       }
-      riscv::ValueType vectorSlot =
-          vectorResult && dot.getOver().size() == 1
-              ? vectorPartialSlotType(builder, dot.getLhs().getType(),
-                                      vectorResult, dot.getOver()[0])
-              : riscv::ValueType();
-      if (vectorSlot &&
+      riscv::ValueType vectorSlot = kind == "replica_reduced"
+                                        ? replicaAccumulator
+                                    : vectorResult && dot.getOver().size() == 1
+                                        ? vectorPartialSlotType(
+                                              builder, dot.getLhs().getType(),
+                                              vectorResult, dot.getOver()[0])
+                                        : riscv::ValueType();
+      if (kind != "replica_reduced" && vectorSlot &&
           vectorPartialSlotType(builder, dot.getRhs().getType(), vectorResult,
                                 dot.getOver()[0]) != vectorSlot)
         vectorSlot = {};
@@ -2593,14 +2804,14 @@ public:
         rewriter.eraseOp(constant);
     }
 
-    llvm::SmallVector<riscv::ReduceOp> replicaReductions;
+    llvm::SmallVector<riscv::ReduceOp> replicaPartialReductions;
     llvm::SmallVector<mlir::Value> replicaCleanupRoots;
     getOperation().walk([&](riscv::ReduceOp reduce) {
       if (mlir::isa<mlir::IntegerType>(
               riscv_internal::logicalElement(reduce.getResult().getType())))
-        replicaReductions.push_back(reduce);
+        replicaPartialReductions.push_back(reduce);
     });
-    for (riscv::ReduceOp reduce : replicaReductions) {
+    for (riscv::ReduceOp reduce : replicaPartialReductions) {
       auto match = matchReplicaScaledDotReduction(reduce);
       if (!match)
         continue;
@@ -3333,6 +3544,105 @@ public:
         rewriter.eraseOp(contribution.scaleMultiply);
         rewriter.eraseOp(contribution.dot);
       }
+    }
+
+    // A canonical reduction over one surviving replica axis of a widened dot
+    // is one register-local accumulation chain followed by one lane reduction.
+    // The topology planner freezes the accumulator layout; this pass only
+    // projects each replica contribution and instantiates that closed chain.
+    llvm::SmallVector<riscv::ReduceOp> replicaReductions;
+    getOperation().walk([&](riscv::ReduceOp reduce) {
+      auto dot = reduce.getInput().getDefiningOp<riscv::RVVWidenDotOp>();
+      if (dot && hasTopology(dot, "replica_reduced"))
+        replicaReductions.push_back(reduce);
+    });
+    for (riscv::ReduceOp reduce : replicaReductions) {
+      auto dot = reduce.getInput().getDefiningOp<riscv::RVVWidenDotOp>();
+      auto result = mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
+      auto resultElement =
+          result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+                 : mlir::IntegerType();
+      auto topology = dot ? dot.getPartialTopologyAttr()
+                          : riscv::PartialTopologyAttr();
+      auto layoutPlan = dot ? dot.getPartialLayoutPlanAttr()
+                            : riscv::PartialLayoutPlanAttr();
+      auto accumulatorType =
+          layoutPlan ? mlir::dyn_cast<riscv::ValueType>(
+                           layoutPlan.getVectorSlotType())
+                     : riscv::ValueType();
+      if (!dot || !result || !resultElement ||
+          !resultElement.isSigned() || resultElement.getWidth() != 32 ||
+          !topology || topology.getPartialAxes().size() != 1 ||
+          !accumulatorType || dot.getReductionStreams() != 1)
+        continue;
+      const int64_t replicaAxis = topology.getPartialAxes()[0];
+      auto projectedLhs = projectReplicaReductionOperandType(
+          rewriter, dot.getLhs().getType(), replicaAxis);
+      auto projectedRhs = projectReplicaReductionOperandType(
+          rewriter, dot.getRhs().getType(), replicaAxis);
+      if (!projectedLhs || !projectedRhs ||
+          replicaReducedAccumulatorType(rewriter, projectedLhs, projectedRhs,
+                                        dot.getOver()[0]) != accumulatorType)
+        continue;
+
+      rewriter.setInsertionPoint(reduce);
+      const int64_t reductionAxis = dot.getOver()[0];
+      auto partialElement =
+          mlir::cast<mlir::IntegerType>(accumulatorType.getElementType());
+      auto zero = rewriter.create<riscv::ConstantOp>(
+          reduce.getLoc(), partialElement,
+          rewriter.getIntegerAttr(partialElement, 0));
+      auto initial = rewriter.create<riscv::RVVSplatOp>(
+          reduce.getLoc(), accumulatorType, zero.getResult(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "splat", "rvv.splat", "rvv.splat", 0,
+              accumulatorType.getLayout().getRegisterGroups()));
+      mlir::Value carried = initial.getResult();
+      for (int64_t replica = 0; replica < topology.getSourceSlots(); ++replica) {
+        auto index = rewriter.create<mlir::arith::ConstantIndexOp>(
+            reduce.getLoc(), replica);
+        auto lhs = rewriter.create<riscv::ProjectReductionOperandOp>(
+            reduce.getLoc(), projectedLhs, dot.getLhs(), index, replicaAxis,
+            riscv_internal::leaf(
+                rewriter, "transfer", "reduction-projection",
+                "rvv.project-reduction-operand",
+                "rvv.project-reduction-operand", 0, 0, 1, 0));
+        auto rhs = rewriter.create<riscv::ProjectReductionOperandOp>(
+            reduce.getLoc(), projectedRhs, dot.getRhs(), index, replicaAxis,
+            riscv_internal::leaf(
+                rewriter, "transfer", "reduction-projection",
+                "rvv.project-reduction-operand",
+                "rvv.project-reduction-operand", 0, 0, 1, 0));
+        auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+            reduce.getLoc(), accumulatorType, lhs.getResult(), rhs.getResult(),
+            carried, reductionAxis,
+            riscv_internal::leaf(
+                rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
+                "rvv.vwmacc.partial",
+                projectedLhs.getLayout().getRegisterGroups() +
+                    projectedRhs.getLayout().getRegisterGroups() +
+                    accumulatorType.getLayout().getRegisterGroups(),
+                accumulatorType.getLayout().getRegisterGroups(), 0, 0, "none",
+                "agnostic"));
+        riscv_internal::copyOrigin(dot, lhs);
+        riscv_internal::copyOrigin(dot, rhs);
+        riscv_internal::copyOrigin(dot, accumulate);
+        carried = accumulate.getResult();
+      }
+      auto finalized = rewriter.create<riscv::RVVFinalizeWidenDotOp>(
+          reduce.getLoc(), result, carried, reductionAxis,
+          riscv_internal::leaf(
+              rewriter, "rvv", "finalize-widen-dot",
+              partialElement.getWidth() == 16 ? "rvv.vwredsum.partial"
+                                              : "rvv.vredsum.partial",
+              partialElement.getWidth() == 16 ? "rvv.vwredsum.partial"
+                                              : "rvv.vredsum.partial",
+              accumulatorType.getLayout().getRegisterGroups(), 0, 2, 0,
+              "none", "exact", {reductionAxis}));
+      riscv_internal::copyOrigin(reduce, finalized);
+      reduce.getResult().replaceAllUsesWith(finalized.getResult());
+      rewriter.eraseOp(reduce);
+      rewriter.eraseOp(dot);
     }
 
     llvm::SmallVector<riscv::RVVWidenDotOp> independentDots;

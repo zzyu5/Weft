@@ -932,6 +932,13 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
              input.getAxisIds().asArrayRef(),
              input.getLayout().getReplicaFactors().asArrayRef()))
       registerAxis |= identity == axis && factor > 1;
+    llvm::StringRef carrier = input.getLayout().getCarrier();
+    if (carrier == "scalar")
+      return registerAxis
+                 ? "scalar.register-reduce." + reduce.getKind().str()
+                 : std::string();
+    if (carrier != "rvv")
+      return {};
     return std::string(registerAxis ? "rvv.register-reduce."
                                     : "rvv.lane-reduce.") +
            reduce.getKind().str();

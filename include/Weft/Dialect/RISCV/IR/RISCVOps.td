@@ -183,7 +183,7 @@ def WeftRISCV_ScheduleAttr : WeftRISCV_Attr<"Schedule", "schedule"> {
 def WeftRISCV_PartialTopologyAttr
     : WeftRISCV_Attr<"PartialTopology", "partial_topology"> {
   let parameters = (ins
-    StringRefParameter<"unassigned, sequential_fused, sequential_per_stream, independent, scaled, reduced_scaled, level_scaled, merged, or layered">:$kind,
+    StringRefParameter<"unassigned, sequential_fused, sequential_per_stream, independent, replica_reduced, scaled, reduced_scaled, level_scaled, merged, or layered">:$kind,
     "int64_t":$rootOperand,
     "::mlir::DenseI64ArrayAttr":$partialAxes,
     "::mlir::DenseI64ArrayAttr":$outputAxes,

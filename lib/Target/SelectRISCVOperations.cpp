@@ -275,6 +275,16 @@ private:
       return {};
     }
     if (auto op = mlir::dyn_cast<riscv::ReduceOp>(operation)) {
+      auto input = mlir::dyn_cast<riscv::ValueType>(op.getInput().getType());
+      if (!input)
+        return {};
+      if (input.getLayout().getCarrier() == "scalar") {
+        std::string instruction =
+            ("scalar.register-reduce." + op.getKind()).str();
+        return riscv_internal::implementation(
+            builder, "scalar", "reduce", instruction,
+            {static_cast<int64_t>(op.getAxis())});
+      }
       if (!supportsRVVOperation(operation))
         return {};
       std::string instruction =

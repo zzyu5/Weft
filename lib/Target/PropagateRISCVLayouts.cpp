@@ -854,6 +854,18 @@ void completeRoles(mlir::Value value, Roles &roles) {
   if (roles.local || roles.ime)
     return;
   auto axes = riscv_internal::logicalAxes(value.getType());
+  // A coalesced lane coordinate cannot exist without a primary lane carrier.
+  // Pointwise propagation can legitimately retain only a surviving coalesced
+  // axis after its original primary axis was projected away.  Promote the
+  // innermost such axis so the resulting type never claims a scalar carrier
+  // while still containing non-unit lane factors.
+  if (!roles.laneAxis && !roles.coalescedLaneAxes.empty())
+    for (auto axis = axes.rbegin(); axis != axes.rend(); ++axis)
+      if (roles.coalescedLaneAxes.erase(*axis)) {
+        roles.laneAxis = *axis;
+        roles.anchored = true;
+        break;
+      }
   if (!roles.anchored && roles.laneAxis == 0 && !axes.empty()) {
     // A shaped Value already carries an explicit logical domain.  Unlike an
     // ordinary scalar for/while iteration, that domain is legal input to the

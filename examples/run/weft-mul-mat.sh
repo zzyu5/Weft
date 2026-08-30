@@ -349,7 +349,13 @@ else
   elif [[ ${format} == tq1_0 ]]; then
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
     kernel=production_mul_mat_tq1_0
-    meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=2)
+    if [[ ${target} == sg2044 ]]; then
+      physical+=(--auto-lmul-eighths=16)
+      meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=1)
+    else
+      physical+=(--auto-lmul-eighths=8)
+      meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
+    fi
   else
     kernel=production_mul_mat_${format}
   fi

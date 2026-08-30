@@ -1270,28 +1270,30 @@ def mul_mat_tq1_0(
 
                         integer = new(i32, [MR, NR], init=i32(0))
                         lane0 = iota(32, axis="k")
-                        for digit0 in range(5):
-                            q0 = radix3_digit_i8(
-                                power_table, w.q[:, lane0], digit0
-                            )
-                            integer += outer_contract(
-                                x.q[:, u32(digit0 * 32) + lane0],
-                                q0,
-                                over="k",
-                                acc=i32,
-                            )
+                        digit0 = iota(5, dtype=u32, axis="digit0")
+                        q0 = radix3_digit_i8(
+                            power_table, w.q[:, lane0], digit0
+                        )
+                        partial0 = contract(
+                            x.q[:, digit0 * u32(32) + lane0],
+                            q0,
+                            over="k",
+                            acc=i32,
+                        )
+                        integer += reduce(partial0, axis="digit0")
 
                         lane1 = iota(16, axis="k")
-                        for digit1 in range(5):
-                            q1 = radix3_digit_i8(
-                                power_table, w.q[:, u32(32) + lane1], digit1
-                            )
-                            integer += outer_contract(
-                                x.q[:, u32(160 + digit1 * 16) + lane1],
-                                q1,
-                                over="k",
-                                acc=i32,
-                            )
+                        digit1 = iota(5, dtype=u32, axis="digit1")
+                        q1 = radix3_digit_i8(
+                            power_table, w.q[:, u32(32) + lane1], digit1
+                        )
+                        partial1 = contract(
+                            x.q[:, u32(160) + digit1 * u32(16) + lane1],
+                            q1,
+                            over="k",
+                            acc=i32,
+                        )
+                        integer += reduce(partial1, axis="digit1")
 
                         lane2 = iota(16, axis="k")
                         q2 = radix3_digit_i8(

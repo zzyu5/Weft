@@ -3178,7 +3178,7 @@ mlir::LogicalResult Emitter::compileIota(riscv::IotaOp operation) {
   }
   if (realization == "register.iota") {
     auto type = scalarCType(element);
-    const int64_t parts = registerPartCount(operation.getResult());
+    const int64_t parts = scalarPartCount(operation.getResult());
     if (!type || parts <= 1)
       return fail(operation,
                   "register iota requires a non-trivial scalar tuple mapping");
@@ -4618,7 +4618,7 @@ mlir::LogicalResult Emitter::compileCastImpl(ConversionOp operation) {
                   "scalar cast has no exact selected scalar instruction");
     const int64_t parts = *targetBindingKind == Binding::Kind::Scalar
                               ? 1
-                              : registerPartCount(operation.getResult());
+                              : scalarPartCount(operation.getResult());
     Binding result;
     result.kind = *targetBindingKind;
     for (int64_t part = 0; part < parts; ++part) {
@@ -4980,17 +4980,121 @@ mlir::LogicalResult Emitter::compileReduce(riscv::ReduceOp operation) {
           : 0;
   llvm::StringRef selected = operation.getLeaf().getInstruction();
   llvm::StringRef selectedKind = selected;
-  const bool selectedRegister =
-      selectedKind.consume_front("rvv.register-reduce.");
-  if (!selectedRegister &&
-      !selectedKind.consume_front("rvv.lane-reduce."))
-    return fail(operation, "reduction has no exact selected RVV reduction form");
+  const bool selectedScalarRegister =
+      selectedKind.consume_front("scalar.register-reduce.");
+  bool selectedRVVRegister = false;
+  bool selectedRVVLane = false;
+  if (!selectedScalarRegister) {
+    selectedRVVRegister =
+        selectedKind.consume_front("rvv.register-reduce.");
+    if (!selectedRVVRegister)
+      selectedRVVLane = selectedKind.consume_front("rvv.lane-reduce.");
+  }
+  if (!selectedScalarRegister && !selectedRVVRegister && !selectedRVVLane)
+    return fail(operation, "reduction has no exact selected reduction form");
   const bool registerAxis =
       llvm::is_contained(registerAxesFor(operation.getInput()), eliminatedAxis);
-  if (selectedRegister != registerAxis)
+  if ((selectedScalarRegister || selectedRVVRegister) != registerAxis)
     return fail(operation,
                 "selected reduction form disagrees with the input axis mapping");
-  if (selectedRegister) {
+  if (selectedScalarRegister) {
+    mlir::FailureOr<Binding> materialized =
+        materializeNumeric(operation.getInput(), std::move(input));
+    if (mlir::failed(materialized))
+      return mlir::failure();
+    auto resultType =
+        mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+    if (materialized->kind != Binding::Kind::ScalarTuple || !inputType ||
+        !resultType || inputType.getLayout().getCarrier() != "scalar" ||
+        resultType.getLayout().getCarrier() != "scalar" ||
+        streamPartCount(operation.getInput()) != 1 ||
+        streamPartCount(operation.getResult()) != 1)
+      return fail(operation,
+                  "scalar register reduction requires one typed scalar tuple without time parts");
+
+    llvm::SmallVector<int64_t, 4> inputAxes =
+        registerAxesFor(operation.getInput());
+    llvm::SmallVector<int64_t, 4> inputExtents =
+        registerExtentsFor(operation.getInput());
+    llvm::SmallVector<int64_t, 4> resultAxes =
+        registerAxesFor(operation.getResult());
+    auto eliminatedPosition = llvm::find(inputAxes, eliminatedAxis);
+    if (inputAxes.size() != inputExtents.size() ||
+        eliminatedPosition == inputAxes.end())
+      return fail(operation,
+                  "scalar register reduction input mapping is incomplete");
+    const int64_t eliminatedExtent =
+        inputExtents[eliminatedPosition - inputAxes.begin()];
+    auto scalarType = scalarCType(inputType.getElementType());
+    if (eliminatedExtent <= 0 || !scalarType)
+      return fail(operation,
+                  "scalar register reduction has no complete scalar representation");
+
+    llvm::StringRef kind = selectedKind;
+    const bool arithmetic = kind == "add";
+    if (!arithmetic && kind != "max" && kind != "min")
+      return fail(operation,
+                  "scalar register reduction implements add, max, and min");
+    const int64_t resultRegisters = registerPartCount(operation.getResult());
+    Binding result;
+    result.kind = resultRegisters == 1 ? Binding::Kind::Scalar
+                                       : Binding::Kind::ScalarTuple;
+    for (int64_t resultRegister = 0; resultRegister < resultRegisters;
+         ++resultRegister) {
+      auto resultCoordinates =
+          registerCoordinates(operation.getResult(), resultRegister);
+      if (!resultCoordinates || resultCoordinates->size() != resultAxes.size())
+        return fail(operation,
+                    "scalar register reduction result mapping is incomplete");
+      std::string accumulator;
+      for (int64_t reduced = 0; reduced < eliminatedExtent; ++reduced) {
+        int64_t inputRegister = 0;
+        for (auto [axis, extent] : llvm::zip(inputAxes, inputExtents)) {
+          if (extent <= 0)
+            return fail(operation,
+                        "scalar register reduction has an invalid input extent");
+          int64_t coordinate = reduced;
+          if (axis != eliminatedAxis) {
+            auto found = llvm::find(resultAxes, axis);
+            if (found == resultAxes.end())
+              return fail(operation,
+                          "scalar register reduction cannot project a free axis");
+            coordinate =
+                (*resultCoordinates)[found - resultAxes.begin()];
+          }
+          if (coordinate < 0 || coordinate >= extent)
+            return fail(operation,
+                        "scalar register reduction coordinate is out of range");
+          inputRegister = inputRegister * extent + coordinate;
+        }
+        if (inputRegister < 0 ||
+            inputRegister >= static_cast<int64_t>(materialized->parts.size()))
+          return fail(operation,
+                      "scalar register reduction source mapping is incomplete");
+        if (accumulator.empty()) {
+          accumulator = fresh("register_reduce");
+          line(*scalarType + " " + accumulator + " = " +
+               materialized->parts[inputRegister] + ";");
+          continue;
+        }
+        if (arithmetic)
+          line(accumulator + " = (" + *scalarType + ")(" + accumulator +
+               " + " + materialized->parts[inputRegister] + ");");
+        else
+          line(accumulator + " = (" + accumulator + ") " +
+               std::string(kind == "max" ? ">" : "<") + " (" +
+               materialized->parts[inputRegister] + ") ? (" + accumulator +
+               ") : (" + materialized->parts[inputRegister] + ");");
+      }
+      if (result.kind == Binding::Kind::Scalar)
+        result.scalar = std::move(accumulator);
+      else
+        result.parts.push_back(std::move(accumulator));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
+  if (selectedRVVRegister) {
     mlir::FailureOr<Binding> materialized =
         materializeNumeric(operation.getInput(), std::move(input));
     if (mlir::failed(materialized))
@@ -5744,7 +5848,7 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
     if (spelling.empty() && kind != "max" && kind != "min")
       return fail(operation,
                   "unsupported selected scalar-tuple pointwise binary kind");
-    const int64_t parts = registerPartCount(operation.getResult());
+    const int64_t parts = scalarPartCount(operation.getResult());
     auto scalarResultType = scalarCType(
         riscv_internal::logicalElement(operation.getResult().getType()));
     if (parts > 1 && !scalarResultType)
@@ -5842,6 +5946,7 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
                           form == (floating ? "vf.swap" : "vx.swap");
   const bool leafSwap = form.ends_with(".swap");
   const int64_t resultParts = vectorPartCount(operation.getResult());
+  std::string incompatibleMapping;
   auto compatibleParts = [&](size_t operand, mlir::Value value,
                              const Binding &binding, bool laneToRegister) {
     if (binding.kind == Binding::Kind::Scalar)
@@ -5856,12 +5961,22 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
       return true;
     }
     if (binding.kind != Binding::Kind::Vector &&
-        binding.kind != Binding::Kind::ScalarTuple)
+        binding.kind != Binding::Kind::ScalarTuple) {
+      incompatibleMapping = "operand " + std::to_string(operand) +
+                            " has binding kind " +
+                            std::to_string(static_cast<int>(binding.kind));
       return false;
+    }
     for (int64_t part = 0; part < resultParts; ++part) {
       auto projected = mappedPart(operation.getOperation(), operand, part);
-      if (!projected || *projected >= binding.parts.size())
+      if (!projected || *projected >= binding.parts.size()) {
+        incompatibleMapping =
+            "operand " + std::to_string(operand) + ", result part " +
+            std::to_string(part) + ", binding parts " +
+            std::to_string(binding.parts.size()) + ", operand type " +
+            riscv_internal::printType(value.getType());
         return false;
+      }
     }
     return true;
   };
@@ -5869,7 +5984,8 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
       !compatibleParts(0, operation.getLhs(), lhs, lhsLaneToRegister) ||
       !compatibleParts(1, operation.getRhs(), rhs, rhsLaneToRegister))
     return fail(operation,
-                "pointwise operand mappings cannot broadcast to the selected result mapping");
+                "pointwise operand mappings cannot broadcast to the selected result mapping: " +
+                    incompatibleMapping);
   for (int64_t index = 0; index < resultParts; ++index) {
     std::string expression;
     if (otherLaneToRegister || other.kind == Binding::Kind::Scalar ||

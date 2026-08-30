@@ -1017,6 +1017,7 @@ mlir::LogicalResult PartialTopologyAttr::verify(
     mlir::DenseI64ArrayAttr slotOrder, int64_t resourceGroups) {
   if (kind != "unassigned" && kind != "sequential_fused" &&
       kind != "sequential_per_stream" && kind != "independent" &&
+      kind != "replica_reduced" &&
       kind != "scaled" && kind != "reduced_scaled" &&
       kind != "level_scaled" &&
       kind != "merged" && kind != "layered")
@@ -1060,7 +1061,8 @@ mlir::LogicalResult PartialTopologyAttr::verify(
       (kind != "scaled" || sourceSlots * laneSplit != partialSlots))
     return emitError()
            << "lane-split topology must close scaled source and partial slots";
-  if ((kind == "independent" || kind == "scaled" ||
+  if ((kind == "independent" || kind == "replica_reduced" ||
+       kind == "scaled" ||
        kind == "reduced_scaled" || kind == "level_scaled" ||
        kind == "layered") &&
       (combineArity > partialSlots || partialSlots % combineArity))
@@ -4529,7 +4531,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   const bool validTopology =
       topologyKind == "unassigned" || topologyKind == "sequential_fused" ||
       topologyKind == "sequential_per_stream" ||
-      topologyKind == "independent" || topologyKind == "scaled" ||
+      topologyKind == "independent" || topologyKind == "replica_reduced" ||
+      topologyKind == "scaled" ||
       topologyKind == "reduced_scaled" ||
       topologyKind == "level_scaled" || topologyKind == "merged" ||
       topologyKind == "layered";
@@ -5610,8 +5613,13 @@ mlir::LogicalResult RVVWidenAccumulateOp::verify() {
         current = next.getResult();
         continue;
       }
-      auto capture = mlir::dyn_cast<RVVPartialCaptureOp>(user);
-      explicitChain = capture && capture.getInput() == current;
+      if (auto capture = mlir::dyn_cast<RVVPartialCaptureOp>(user))
+        explicitChain = capture.getInput() == current;
+      else if (auto finalize = mlir::dyn_cast<RVVFinalizeWidenDotOp>(user))
+        explicitChain = finalize.getPartial() == current &&
+                        finalize.getReductionAxis() == getReductionAxis();
+      else
+        explicitChain = false;
       break;
     }
   }
@@ -5673,6 +5681,7 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
        llvm::equal(expectedAxes, resultValue.getAxisIds().asArrayRef()) &&
        llvm::equal(expectedShape, resultValue.getShape().asArrayRef()));
   auto loop = getPartial().getDefiningOp<mlir::scf::ForOp>();
+  auto explicitChain = getPartial().getDefiningOp<RVVWidenAccumulateOp>();
   auto reduction = llvm::find(partial.getAxisIds().asArrayRef(),
                               getReductionAxis());
   const size_t reductionPosition =
@@ -5680,7 +5689,8 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
           ? 0
           : static_cast<size_t>(reduction -
                                 partial.getAxisIds().asArrayRef().begin());
-  bool completeMapping = partial.getLayout().getCarrier() == "rvv" && loop &&
+  bool completeMapping = partial.getLayout().getCarrier() == "rvv" &&
+                         (loop || explicitChain) &&
                          reduction != partial.getAxisIds().asArrayRef().end();
   if (completeMapping)
     for (size_t position = 0; position < partial.getShape().size(); ++position) {
