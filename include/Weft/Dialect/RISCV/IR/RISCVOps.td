@@ -1174,6 +1174,18 @@ def WeftRISCV_RVVStorageWindowOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVLayeredRecordLoadOp
+    : WeftRISCV_Op<"rvv_layered_record_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       Index:$logical_offset,
+                       WeftRISCV_StorageWindowPlanAttr:$plan,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVLayeredStorageLoadOp
     : WeftRISCV_Op<"rvv_layered_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,

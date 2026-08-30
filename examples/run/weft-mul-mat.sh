@@ -212,7 +212,11 @@ else
     else
       physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q3_k
-      meta=(--meta NC=32 --meta MC=8 --meta MR=1 --meta NR=1)
+      if [[ ${target} == sg2044 ]]; then
+        meta=(--meta NC=32 --meta MC=2 --meta MR=1 --meta NR=1)
+      else
+        meta=(--meta NC=32 --meta MC=8 --meta MR=1 --meta NR=1)
+      fi
     fi
   elif [[ ${format} == q4_k ]]; then
     if [[ ${phase} == decode ]]; then

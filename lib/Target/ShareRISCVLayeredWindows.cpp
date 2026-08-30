@@ -678,6 +678,131 @@ bool isProjectedLayeredExtract(
   return true;
 }
 
+struct LayeredRecordExtract {
+  riscv::ExtractOp extract;
+  riscv::ExtractOp subview;
+  riscv::FieldOp field;
+  riscv::PhysicalPointOp origin;
+  riscv::ValueType fieldType;
+  riscv::ValueType subviewType;
+  riscv::ValueType resultType;
+  int64_t reductionAxis = 0;
+  int64_t laneAxis = 0;
+  int64_t projectionExtent = 0;
+  llvm::SmallVector<riscv::ConvertLayoutOp> extractConversions;
+  llvm::SmallVector<riscv::ConvertLayoutOp> subviewConversions;
+};
+
+std::optional<LayeredRecordExtract>
+layeredRecordExtract(riscv::ExtractOp extract) {
+  LayeredRecordExtract result;
+  result.extract = extract;
+  mlir::Value subviewValue = riscv_internal::stripRepresentationConversions(
+      extract.getInput(), &result.extractConversions);
+  result.subview = subviewValue.getDefiningOp<riscv::ExtractOp>();
+  if (!result.subview || extract.getIndices().size() != 1 ||
+      !extract.getIndices().front().getType().isIndex())
+    return std::nullopt;
+
+  mlir::Value fieldValue = riscv_internal::stripRepresentationConversions(
+      result.subview.getInput(), &result.subviewConversions);
+  result.field = fieldValue.getDefiningOp<riscv::FieldOp>();
+  result.fieldType = result.field
+                         ? mlir::dyn_cast<riscv::ValueType>(
+                               result.field.getResult().getType())
+                         : riscv::ValueType();
+  result.subviewType =
+      mlir::dyn_cast<riscv::ValueType>(result.subview.getResult().getType());
+  result.resultType =
+      mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  if (!result.field || !result.fieldType || !result.subviewType ||
+      !result.resultType ||
+      result.fieldType.getShape().size() != result.subviewType.getShape().size() ||
+      result.subviewType.getShape().size() !=
+          result.subview.getSelectors().size() ||
+      result.subviewType.getShape().size() != extract.getSelectors().size() ||
+      result.resultType.getShape().size() + 1 !=
+          result.subviewType.getShape().size() ||
+      extract.getAccess().getMapping() != "grouped_layered" ||
+      result.subview.getAccess().getMapping() != "grouped_layered" ||
+      (extract.getAccess().getForm() != "strided" &&
+       extract.getAccess().getForm() != "indexed") ||
+      extract.getAccess().getGroupSize() !=
+          result.subview.getAccess().getGroupSize() ||
+      extract.getAccess().getLayerSize() !=
+          result.subview.getAccess().getLayerSize() ||
+      extract.getAccess().getBitOffset() !=
+          result.subview.getAccess().getBitOffset() ||
+      extract.getAccess().getStorageBits() !=
+          result.subview.getAccess().getStorageBits() ||
+      extract.getAccess().getOrder() != result.subview.getAccess().getOrder())
+    return std::nullopt;
+
+  size_t projection = result.subviewType.getShape().size();
+  for (auto [position, subviewSelector, extractSelector] :
+       llvm::zip(llvm::seq<size_t>(0, result.subviewType.getShape().size()),
+                 result.subview.getSelectors(), extract.getSelectors())) {
+    llvm::StringRef subviewName =
+        mlir::cast<mlir::StringAttr>(subviewSelector).getValue();
+    llvm::StringRef extractName =
+        mlir::cast<mlir::StringAttr>(extractSelector).getValue();
+    if (subviewName == "domain" && extractName == "index") {
+      if (projection != result.subviewType.getShape().size())
+        return std::nullopt;
+      projection = position;
+      continue;
+    }
+    if (subviewName != "all" || extractName != "all")
+      return std::nullopt;
+  }
+  if (projection == result.subviewType.getShape().size() ||
+      result.subview.getIndices().size() != 1)
+    return std::nullopt;
+  result.origin = riscv_internal::stripRepresentationConversions(
+                      result.subview.getIndices().front())
+                      .getDefiningOp<riscv::PhysicalPointOp>();
+  result.reductionAxis = result.subviewType.getAxisIds()[projection];
+  result.projectionExtent = result.subviewType.getShape()[projection];
+  if (!result.origin || result.reductionAxis <= 0 ||
+      result.projectionExtent <= 0 ||
+      result.origin.getResult().getType().getDomain().getAxisId() !=
+          result.reductionAxis ||
+      result.origin.getResult().getType().getDomain().getTail() != "exact" ||
+      result.fieldType.getElementType() != result.resultType.getElementType() ||
+      result.resultType.getLayout().getCarrier() != "rvv")
+    return std::nullopt;
+
+  size_t resultPosition = 0;
+  for (size_t fieldPosition = 0;
+       fieldPosition < result.fieldType.getShape().size(); ++fieldPosition) {
+    if (fieldPosition == projection)
+      continue;
+    if (resultPosition >= result.resultType.getShape().size() ||
+        result.fieldType.getAxisIds()[fieldPosition] !=
+            result.resultType.getAxisIds()[resultPosition] ||
+        result.fieldType.getShape()[fieldPosition] !=
+            result.resultType.getShape()[resultPosition])
+      return std::nullopt;
+    if (result.resultType.getLayout().getLaneFactors()[resultPosition] > 1) {
+      if (result.laneAxis != 0)
+        return std::nullopt;
+      result.laneAxis = result.resultType.getAxisIds()[resultPosition];
+    }
+    ++resultPosition;
+  }
+  if (resultPosition != result.resultType.getShape().size() ||
+      result.laneAxis == 0 || result.laneAxis == result.reductionAxis)
+    return std::nullopt;
+
+  if (!canFoldReadConversions(extract, extract, result.extractConversions,
+                              llvm::ArrayRef<riscv::ConvertLayoutOp>{}) ||
+      !canFoldReadConversions(result.subview, extract,
+                              result.subviewConversions,
+                              result.extractConversions))
+    return std::nullopt;
+  return result;
+}
+
 struct CompleteLayeredExtract {
   riscv::ExtractOp extract;
   riscv::FieldOp field;
@@ -1602,6 +1727,67 @@ public:
         if (conversion.getResult().use_empty())
           rewriter.eraseOp(conversion);
     }
+
+    // A local encoded tile can retain its reduction coordinate in time while a
+    // different free axis occupies RVV lanes.  Materialize the child
+    // subscript as a typed record-strided load: the point and scalar offset
+    // select one logical reduction element, and the result layout selects the
+    // records visited by each RVV issue part.
+    llvm::SmallVector<riscv::ExtractOp> recordExtracts;
+    getOperation().walk(
+        [&](riscv::ExtractOp extract) { recordExtracts.push_back(extract); });
+    llvm::SmallVector<riscv::ExtractOp> deadSubviews;
+    for (riscv::ExtractOp extract : recordExtracts) {
+      auto info = layeredRecordExtract(extract);
+      if (!info)
+        continue;
+      const int64_t lanes = [&]() {
+        auto axis = llvm::find(info->resultType.getAxisIds().asArrayRef(),
+                               info->laneAxis);
+        return axis == info->resultType.getAxisIds().asArrayRef().end()
+                   ? int64_t{0}
+                   : info->resultType.getLayout().getLaneFactors()[
+                         static_cast<size_t>(
+                             axis - info->resultType.getAxisIds().asArrayRef().begin())];
+      }();
+      auto storagePlan = riscv_internal::storageWindowPlan(
+          rewriter, info->field, info->reductionAxis, 0, 1, 1,
+          info->projectionExtent, 1);
+      if (!storagePlan || lanes <= 1)
+        continue;
+      const int64_t resultGroups =
+          info->resultType.getLayout().getRegisterGroups();
+      const int64_t temporaryGroups = std::max<int64_t>(
+          1, (info->resultType.getLayout().getLmulEighths() + 7) / 8);
+      const bool tail = info->resultType.getLayout().getValidity() == "tail";
+      rewriter.setInsertionPoint(extract);
+      auto load = rewriter.create<riscv::RVVLayeredRecordLoadOp>(
+          extract.getLoc(), info->resultType, info->field.getResult(),
+          info->origin.getResult(), extract.getIndices().front(), *storagePlan,
+          extract.getAccess(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "layered-record-load",
+              "rvv.layered-record-load", "rvv.layered-record-load",
+              info->fieldType.getLayout().getRegisterGroups(), resultGroups,
+              temporaryGroups, 0, "none", tail ? "agnostic" : "exact"));
+      riscv_internal::copyOrigin(extract, load);
+      if (auto canonical = extract->getAttr("canonical_op"))
+        load->setAttr("canonical_op", canonical);
+      extract.getResult().replaceAllUsesWith(load.getResult());
+      deadSubviews.push_back(info->subview);
+      rewriter.eraseOp(extract);
+      for (riscv::ConvertLayoutOp conversion :
+           llvm::reverse(info->extractConversions))
+        if (conversion.getResult().use_empty())
+          rewriter.eraseOp(conversion);
+      for (riscv::ConvertLayoutOp conversion :
+           llvm::reverse(info->subviewConversions))
+        if (conversion.getResult().use_empty())
+          rewriter.eraseOp(conversion);
+    }
+    for (riscv::ExtractOp subview : deadSubviews)
+      if (subview && subview.getResult().use_empty())
+        rewriter.eraseOp(subview);
 
     llvm::SmallVector<riscv::ExtractOp> replicaExtracts;
     getOperation().walk(

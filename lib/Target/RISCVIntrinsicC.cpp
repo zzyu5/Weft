@@ -646,6 +646,8 @@ private:
   mlir::LogicalResult
   compileRVVStorageWindow(riscv::RVVStorageWindowOp operation);
   mlir::LogicalResult
+  compileRVVLayeredRecordLoad(riscv::RVVLayeredRecordLoadOp operation);
+  mlir::LogicalResult
   compileRVVLayeredStorageLoad(riscv::RVVLayeredStorageLoadOp operation);
   mlir::LogicalResult
   compileRVVLayeredStorageDecode(riscv::RVVLayeredStorageDecodeOp operation);
@@ -2327,6 +2329,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVRegularRepeatGather(gather);
   if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(operation))
     return compileRVVStorageWindow(window);
+  if (auto load = mlir::dyn_cast<riscv::RVVLayeredRecordLoadOp>(operation))
+    return compileRVVLayeredRecordLoad(load);
   if (auto load = mlir::dyn_cast<riscv::RVVLayeredStorageLoadOp>(operation))
     return compileRVVLayeredStorageLoad(load);
   if (auto decode =
@@ -7463,19 +7467,29 @@ Emitter::compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation) {
       highField->bitOffset % 8 ||
       lowField->bitOffset / 8 != plan.getLowByteOffset() ||
       highField->bitOffset / 8 != plan.getHighByteOffset() ||
-      registerPartCount(operation.getResult()) != plan.getLogicalElements())
+      streamPartCount(operation.getResult()) != 1)
     return fail(operation,
                 "packed plane merge has no closed record and scalar-tuple mapping");
 
-  llvm::DenseMap<int64_t, std::string> loadedWords;
-  auto loadWord = [&](int64_t byteOffset) -> std::string {
-    auto found = loadedWords.find(byteOffset);
+  llvm::StringMap<std::string> loadedWords;
+  const int64_t wordAlignment =
+      std::min(lowField->access.getAlignment(), highField->access.getAlignment());
+  auto loadWord = [&](llvm::StringRef record, int64_t byteOffset) -> std::string {
+    std::string key = (record + "#" + llvm::Twine(byteOffset)).str();
+    auto found = loadedWords.find(key);
     if (found != loadedWords.end())
       return found->second;
     std::string name = fresh("packed_plane_word");
-    line("uint32_t " + name + " = weft_load_u32_le((const uint8_t *)(" +
-         owner.recordPointer + " + " + std::to_string(byteOffset) + "));");
-    loadedWords[byteOffset] = name;
+    if (wordAlignment >= 2 && byteOffset % 2 == 0) {
+      line("uint32_t " + name + " = (uint32_t)*(const uint16_t *)(" +
+           record.str() + " + " + std::to_string(byteOffset) +
+           ") | ((uint32_t)*(const uint16_t *)(" + record.str() + " + " +
+           std::to_string(byteOffset + 2) + ") << 16);");
+    } else {
+      line("uint32_t " + name + " = weft_load_u32_le((const uint8_t *)(" +
+           record.str() + " + " + std::to_string(byteOffset) + "));");
+    }
+    loadedWords[key] = name;
     return name;
   };
   auto repeatedByteMask = [](int64_t bits) -> uint32_t {
@@ -7485,17 +7499,50 @@ Emitter::compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation) {
 
   Binding result;
   result.kind = Binding::Kind::ScalarTuple;
-  const int64_t words = plan.getLogicalElements() / 4;
-  for (int64_t word = 0; word < words; ++word) {
-    const int64_t logical = word * 4;
-    const int64_t lowLayer = logical / plan.getLowLayerBytes();
-    const int64_t highLayer = logical / plan.getHighLayerBytes();
+  const int64_t parts = registerPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> axes =
+      registerAxesFor(operation.getResult());
+  auto scaleAxis = llvm::find(axes, plan.getLogicalAxis());
+  if (parts <= 0 || scaleAxis == axes.end())
+    return fail(operation,
+                "packed plane merge has no complete register coordinate mapping");
+  const size_t scalePosition =
+      static_cast<size_t>(scaleAxis - axes.begin());
+  for (int64_t part = 0; part < parts; ++part) {
+    auto coordinates = registerCoordinates(operation.getResult(), part);
+    if (!coordinates || coordinates->size() != axes.size())
+      return fail(operation,
+                  "packed plane merge cannot decode one result register coordinate");
+    const int64_t logical = (*coordinates)[scalePosition];
+    if (logical < 0 || logical >= plan.getLogicalElements())
+      return fail(operation,
+                  "packed plane merge scale coordinate is outside the planned field");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(axes, *coordinates)) {
+      if (axis == plan.getLogicalAxis() || coordinate == 0)
+        continue;
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "packed plane merge replica has no encoded-record stride");
+      record += " + " + std::to_string(coordinate) + " * (" +
+                stride->second + ")";
+    }
+    record += ")";
+    const int64_t word = logical / 4;
+    const int64_t byte = logical % 4;
+    const int64_t wordLogical = word * 4;
+    const int64_t lowLayer = wordLogical / plan.getLowLayerBytes();
+    const int64_t highLayer = wordLogical / plan.getHighLayerBytes();
     const int64_t lowOffset =
-        plan.getLowByteOffset() + logical % plan.getLowLayerBytes();
+        plan.getLowByteOffset() + wordLogical % plan.getLowLayerBytes();
     const int64_t highOffset =
-        plan.getHighByteOffset() + logical % plan.getHighLayerBytes();
-    const std::string lowWord = loadWord(lowOffset);
-    const std::string highWord = loadWord(highOffset);
+        plan.getHighByteOffset() + wordLogical % plan.getHighLayerBytes();
+    const std::string lowWord = loadWord(record, lowOffset);
+    const std::string highWord = loadWord(record, highOffset);
     const uint32_t lowMask = repeatedByteMask(plan.getLowBits());
     const uint32_t highMask = repeatedByteMask(plan.getHighBits());
     std::string merged = fresh("packed_plane_merge");
@@ -7505,9 +7552,8 @@ Emitter::compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation) {
          std::to_string(highLayer * plan.getHighBits()) + ") & " +
          std::to_string(highMask) + "u) << " +
          std::to_string(plan.getInsertBit()) + ");");
-    for (int64_t byte = 0; byte < 4; ++byte)
-      result.parts.push_back("((uint8_t)((" + merged + " >> " +
-                             std::to_string(byte * 8) + ") & 255u))");
+    result.parts.push_back("((uint8_t)((" + merged + " >> " +
+                           std::to_string(byte * 8) + ") & 255u))");
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
@@ -9118,6 +9164,110 @@ Emitter::compileRVVStorageWindow(riscv::RVVStorageWindowOp operation) {
     loaded.parts.push_back(std::move(name));
   }
   bindings[operation.getResult()] = std::move(loaded);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVLayeredRecordLoad(
+    riscv::RVVLayeredRecordLoadOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.layered-record-load")
+    return fail(operation,
+                "RVV layered record load has no exact selected leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  Binding point = bindings.lookup(operation.getOrigin());
+  Binding offset = bindings.lookup(operation.getLogicalOffset());
+  if (fieldBinding.kind != Binding::Kind::Field ||
+      point.kind != Binding::Kind::Point ||
+      offset.kind != Binding::Kind::Scalar || fieldBinding.field.index)
+    return fail(operation,
+                "RVV layered record load requires one field, point, and scalar offset");
+  fieldBinding.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  auto resultType = operation.getResult().getType();
+  auto layout = resultType.getLayout();
+  riscv::StorageWindowPlanAttr plan = operation.getPlan();
+  const int64_t laneAxis = laneAxisFor(operation.getResult());
+  auto laneStride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == laneAxis;
+                                  });
+  const int64_t group = plan.getGroupSize();
+  const int64_t layer = plan.getLayerSize();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      owner.recordElements != plan.getRecordElements() || !field || !integer ||
+      integer.isSigned() || field->bitOffset % 8 ||
+      field->bitOffset / 8 != plan.getByteOffset() ||
+      integer.getWidth() != plan.getElementBits() ||
+      plan.getKind() != "layered" || laneAxis <= 0 ||
+      laneStride == owner.recordByteStrides.end() || group <= 0 || layer <= 0 ||
+      group % layer || layout.getSew() != 8 || plan.getMaskValue() <= 0)
+    return fail(operation,
+                "RVV layered record load has incomplete record-stride geometry");
+
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / streams);
+    if (streams <= 0 || !coordinates ||
+        coordinates->size() != registerAxes.size())
+      return fail(operation,
+                  "RVV layered record load has no register-coordinate mapping");
+    std::string record = "(" + owner.recordPointer;
+    for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+      auto stride = llvm::find_if(owner.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == owner.recordByteStrides.end())
+        return fail(operation,
+                    "RVV layered record load register axis has no byte stride");
+      record += " + " + std::to_string(coordinate) + " * " + stride->second;
+    }
+    record += " + (" + partOffset(operation.getResult(), part) + ") * (" +
+              laneStride->second + "))";
+    const std::string logical =
+        "(((" + point.point.base + ") % " +
+        std::to_string(plan.getRecordElements()) + ") + (" + offset.scalar +
+        ") + " + std::to_string(plan.getProjectionBase()) + ")";
+    const std::string within =
+        "((" + logical + ") % " + std::to_string(group) + ")";
+    const std::string byte =
+        "(" + std::to_string(plan.getByteOffset()) + " + ((" + logical +
+        ") / " + std::to_string(group) + ") * " + std::to_string(layer) +
+        " + (" + within + ") % " + std::to_string(layer) + ")";
+    const std::string shift =
+        "(" + std::to_string(plan.getShiftBase()) + " + ((" + within +
+        ") / " + std::to_string(layer) + ") * " +
+        std::to_string(plan.getShiftStep()) + ")";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string raw = fresh("layered_record_raw");
+    line(type + " " + raw + " = __riscv_vlse8_v_" + suffix +
+         "((const uint8_t *)(" + record + " + " + byte +
+         "), (ptrdiff_t)(" + laneStride->second + "), " + vl + ");");
+    std::string shifted = fresh("layered_record_shift");
+    line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" + raw +
+         ", " + shift + ", " + vl + ");");
+    std::string decoded = fresh("layered_record_value");
+    line(type + " " + decoded + " = __riscv_vand_vx_" + suffix + "(" +
+         shifted + ", " + std::to_string(plan.getMaskValue()) + ", " + vl +
+         ");");
+    result.parts.push_back(std::move(decoded));
+  }
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

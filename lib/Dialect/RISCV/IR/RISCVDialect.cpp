@@ -3432,9 +3432,10 @@ mlir::LogicalResult PackedPlaneMergeOp::verify() {
     if (index != axisPosition &&
         (result.getLayout().getTimeFactors()[index] != 1 ||
          result.getLayout().getLaneFactors()[index] != 1 ||
-         result.getLayout().getReplicaFactors()[index] != 1))
+         result.getLayout().getFragmentFactors()[index] != 1 ||
+         result.getLayout().getLocalFactors()[index] != 1))
       return emitOpError(
-          "packed plane merge currently requires one isolated logical scale axis");
+          "packed plane merge may only preserve non-scale axes as scalar register replicas");
   const bool scalarWords =
       exactLeaf(getLeaf(), "scalar", "packed-plane-merge",
                 "scalar.packed-plane-merge.words", "none", "exact") &&
@@ -4365,6 +4366,108 @@ mlir::LogicalResult RVVStorageWindowOp::verify() {
       return emitOpError(
           "RVV storage window must preserve every free axis as register replicas");
   }
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVLayeredRecordLoadOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto physicalPoint = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto pointPartition =
+      physicalPoint
+          ? physicalPoint.getPartition().getDefiningOp<mlir::arith::ConstantIndexOp>()
+          : mlir::arith::ConstantIndexOp();
+  StorageWindowPlanAttr plan = getPlan();
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  LoadOp load = sourceField ? sourceLoad(sourceField.getOwner()) : LoadOp();
+  MemDescType memory = load ? load.getRegion().getType() : MemDescType();
+  const int64_t reductionAxis = plan ? plan.getReductionAxis() : 0;
+  auto fieldReduction =
+      llvm::find(field.getAxisIds().asArrayRef(), reductionAxis);
+  auto resultReduction =
+      llvm::find(result.getAxisIds().asArrayRef(), reductionAxis);
+  int64_t laneAxis = 0;
+  int64_t lanes = 0;
+  for (auto [axis, factor] : llvm::zip(
+           result.getAxisIds().asArrayRef(),
+           result.getLayout().getLaneFactors().asArrayRef())) {
+    if (factor <= 1)
+      continue;
+    if (laneAxis != 0)
+      return emitOpError(
+          "layered record load result must have exactly one SIMD lane axis");
+    laneAxis = axis;
+    lanes = factor;
+  }
+  llvm::StringRef validity = result.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  if (!sourceField || !physicalPoint || !pointPartition || !plan || !memory ||
+      !integer || integer.isSigned() || integer.getWidth() <= 0 ||
+      integer.getWidth() >= 8 || !getLogicalOffset().getType().isIndex() ||
+      !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
+      getAccess().getMapping() != "grouped_layered" ||
+      (getAccess().getForm() != "strided" &&
+       getAccess().getForm() != "indexed") ||
+      getOrigin().getType().getDomain().getAxisId() != reductionAxis ||
+      getOrigin().getType().getDomain().getTail() != "exact" ||
+      fieldReduction == field.getAxisIds().asArrayRef().end() ||
+      resultReduction != result.getAxisIds().asArrayRef().end() ||
+      field.getElementType() != result.getElementType() ||
+      field.getShape().size() != result.getShape().size() + 1 ||
+      result.getLayout().getCarrier() != "rvv" || laneAxis <= 0 || lanes <= 1 ||
+      result.getLayout().getSew() != 8 ||
+      (validity != "full" && validity != "tail") ||
+      plan.getKind() != "layered" || plan.getProjectionBase() != 0 ||
+      plan.getProjectionStride() != 1 || plan.getProjectionRepeat() != 1 ||
+      plan.getProjectionExtent() <= 0 || plan.getOffsetAlignment() != 1 ||
+      pointPartition.value() != plan.getProjectionExtent() ||
+      plan.getRecordElements() != memory.getElements() ||
+      plan.getByteOffset() != getAccess().getBitOffset() / 8 ||
+      plan.getElementBits() != integer.getWidth() ||
+      plan.getGroupSize() != getAccess().getGroupSize() ||
+      plan.getLayerSize() != getAccess().getLayerSize() ||
+      plan.getGroupSize() <= 0 || plan.getLayerSize() <= 0 ||
+      plan.getGroupSize() % plan.getLayerSize() ||
+      integer.getWidth() * (plan.getGroupSize() / plan.getLayerSize()) != 8 ||
+      getAccess().getBitOffset() % 8 ||
+      !exactLeaf(getLeaf(), "rvv", "layered-record-load",
+                 "rvv.layered-record-load", "none", tail))
+    return emitOpError(
+        "layered record load requires one typed reduction subview and one independent record-lane result");
+
+  const size_t reductionPosition = static_cast<size_t>(
+      fieldReduction - field.getAxisIds().asArrayRef().begin());
+  if (field.getShape()[reductionPosition] < plan.getProjectionExtent())
+    return emitOpError(
+        "layered record load projection exceeds the encoded field extent");
+  size_t resultPosition = 0;
+  for (size_t fieldPosition = 0; fieldPosition < field.getShape().size();
+       ++fieldPosition) {
+    if (fieldPosition == reductionPosition)
+      continue;
+    if (resultPosition >= result.getShape().size() ||
+        field.getAxisIds()[fieldPosition] !=
+            result.getAxisIds()[resultPosition] ||
+        field.getShape()[fieldPosition] != result.getShape()[resultPosition])
+      return emitOpError(
+          "layered record load must preserve every non-reduction logical axis");
+    ++resultPosition;
+  }
+  if (resultPosition != result.getShape().size())
+    return emitOpError(
+        "layered record load result has an extra logical axis");
+  auto lane = llvm::find(result.getAxisIds().asArrayRef(), laneAxis);
+  const size_t lanePosition = static_cast<size_t>(
+      lane - result.getAxisIds().asArrayRef().begin());
+  if (result.getShape()[lanePosition] !=
+          result.getLayout().getTimeFactors()[lanePosition] * lanes ||
+      result.getLayout().getReplicaFactors()[lanePosition] != 1 ||
+      result.getLayout().getFragmentFactors()[lanePosition] != 1 ||
+      result.getLayout().getLocalFactors()[lanePosition] != 1 ||
+      result.getLayout().getVl() < lanes)
+    return emitOpError(
+        "layered record load lane axis must cover its result through time and SIMD lanes");
   return mlir::success();
 }
 
