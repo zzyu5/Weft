@@ -1283,15 +1283,9 @@ public:
                   mergeRoles(roles[source], target, roles[target], true);
           }
       });
-      getOperation().walk([&](riscv::ReduceOp reduce) {
-        mlir::Value input = reduce.getInput();
-        mlir::Value result = reduce.getResult();
-        if (!mlir::isa<riscv::ValueType>(input.getType()) ||
-            !mlir::isa<riscv::ValueType>(result.getType()))
-          return;
-        changed |= mergeRoles(roles[input], result, roles[result]);
-        changed |= mergeRoles(roles[result], input, roles[input]);
-      });
+      // Reduction is a projection, not a layout-equivalence edge.  Its result
+      // is projected from the selected input representation after all values
+      // receive layouts; consumer conflicts are represented by convert_layout.
       getOperation().walk([&](riscv::ExtractOp extract) {
         mlir::Value input = extract.getInput();
         mlir::Value result = extract.getResult();
@@ -1332,8 +1326,9 @@ public:
     propagateRoles();
     getOperation().walk([&](riscv::ReduceOp reduce) {
       mlir::Value input = reduce.getInput();
+      auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
       auto axes = riscv_internal::logicalAxes(input.getType());
-      if (!mlir::isa<riscv::ValueType>(input.getType()) ||
+      if (!inputType ||
           reduce.getAxis() < 0 ||
           reduce.getAxis() >= static_cast<int64_t>(axes.size()))
         return;
@@ -1733,12 +1728,53 @@ private:
     return failed;
   }
 
-  void insertUseConversions(mlir::OpBuilder &builder) {
-    if (reconcileControlCarries(builder) ||
-        reconcileStateInitializers(builder)) {
-      signalPassFailure();
-      return;
+  bool projectReductionResult(mlir::OpBuilder &builder,
+                              riscv::ReduceOp reduce) {
+    auto input = mlir::dyn_cast<riscv::ValueType>(reduce.getInput().getType());
+    auto result = mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
+    if (!input || reduce.getAxis() < 0 ||
+        reduce.getAxis() >= static_cast<int64_t>(input.getAxisIds().size())) {
+      reduce.emitError(
+          "cannot project a physical reduction result from its input layout");
+      return false;
     }
+    const size_t eliminated = static_cast<size_t>(reduce.getAxis());
+    if (!result) {
+      if (input.getAxisIds().size() == 1)
+        return true;
+      reduce.emitError(
+          "a shaped reduction result is required when free axes survive");
+      return false;
+    }
+    llvm::SmallVector<int64_t> expectedShape;
+    llvm::SmallVector<int64_t> expectedAxes;
+    for (size_t position = 0; position < input.getAxisIds().size(); ++position) {
+      if (position == eliminated)
+        continue;
+      expectedShape.push_back(input.getShape()[position]);
+      expectedAxes.push_back(input.getAxisIds()[position]);
+    }
+    if (result.getShape().asArrayRef() !=
+            llvm::ArrayRef<int64_t>(expectedShape) ||
+        result.getAxisIds().asArrayRef() !=
+            llvm::ArrayRef<int64_t>(expectedAxes)) {
+      reduce.emitError(
+          "physical reduction result does not equal its input domain with one axis removed");
+      return false;
+    }
+    auto kernel = reduce->getParentOfType<riscv::KernelOp>();
+    riscv::LayoutAttr projected = riscv_internal::projectLayout(
+        builder, result, input.getLayout(), kernel.getTarget());
+    if (!projected) {
+      reduce.emitError(
+          "no legal target layout preserves every reduction free axis");
+      return false;
+    }
+    setValueLayout(reduce.getResult(), projected);
+    return true;
+  }
+
+  void insertUseConversions(mlir::OpBuilder &builder) {
     // A contraction may produce one scalar register tuple over its surviving
     // free axes while a downstream reduction consumes one of those axes in
     // RVV lanes.  Keep both operation anchors intact and make their handoff a
@@ -1748,6 +1784,10 @@ private:
     getOperation().walk(
         [&](riscv::ReduceOp reduce) { reductions.push_back(reduce); });
     for (riscv::ReduceOp reduce : reductions) {
+      if (!projectReductionResult(builder, reduce)) {
+        signalPassFailure();
+        continue;
+      }
       mlir::Value input = reduce.getInput();
       auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
       if (!inputType || reduce.getAxis() < 0 ||
@@ -1850,6 +1890,13 @@ private:
                                            required),
           riscv::AccessAttr(), riscv_internal::unselectedLeaf(builder));
       reduce.getInputMutable().assign(conversion.getResult());
+      if (!projectReductionResult(builder, reduce))
+        signalPassFailure();
+    }
+    if (reconcileControlCarries(builder) ||
+        reconcileStateInitializers(builder)) {
+      signalPassFailure();
+      return;
     }
     llvm::SmallVector<mlir::Operation *> operations;
     getOperation().walk([&](mlir::Operation *operation) {
@@ -1888,6 +1935,11 @@ private:
                                                 result.getLayout(),
                                                 kernel.getTarget());
         if (!required) {
+          if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(operation);
+              lookup && operand.getOperandNumber() == 1 &&
+              riscv_internal::analyzeIndexedEntryRelation(
+                  sourceValue, result, {}, {}))
+            continue;
           operation->emitError(
               "no legal target layout projects the pointwise result mapping to its operand");
           signalPassFailure();
@@ -2010,7 +2062,8 @@ private:
         }
       }
       size_t indexCursor = 0;
-      for (mlir::Attribute selectorAttribute : extract.getSelectors()) {
+      for (auto [dimension, selectorAttribute] :
+           llvm::enumerate(extract.getSelectors())) {
         llvm::StringRef selector =
             mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
         if (selector == "all")
@@ -2030,6 +2083,19 @@ private:
             builder, mlir::cast<riscv::ValueType>(operand.get().getType()),
             result.getLayout(), kernel.getTarget());
         if (!required) {
+          llvm::SmallVector<int64_t> retainedAxes;
+          llvm::SmallVector<int64_t> retainedShape;
+          if (input)
+            for (size_t position = 0; position < input.getAxisIds().size();
+                 ++position) {
+              if (position == dimension)
+                continue;
+              retainedAxes.push_back(input.getAxisIds()[position]);
+              retainedShape.push_back(input.getShape()[position]);
+            }
+          if (riscv_internal::analyzeIndexedEntryRelation(
+                  operand.get(), result, retainedAxes, retainedShape))
+            continue;
           extract.emitError(
               "no legal target layout projects the gather result mapping to its index");
           signalPassFailure();
