@@ -193,6 +193,7 @@ struct Binding {
   llvm::SmallVector<std::string> windowRhs;
   llvm::SmallVector<std::string> windowValidity;
   int64_t interleaveRows = 0;
+  int64_t recordGroupAxis = 0;
   int64_t recordAxis = 0;
   int64_t recordElements = 0;
   int64_t recordStrideBytes = 0;
@@ -585,6 +586,8 @@ private:
   mlir::LogicalResult compileLocalStore(riscv::LocalStoreOp operation);
   mlir::LogicalResult
   compileRVVLocalMaterialize(riscv::RVVLocalMaterializeOp operation);
+  mlir::LogicalResult
+  compileEncodedLocalPack(riscv::EncodedLocalPackOp operation);
   mlir::LogicalResult compileSpill(riscv::SpillOp operation);
   mlir::LogicalResult compileReload(riscv::ReloadOp operation);
   mlir::LogicalResult compileIMEPack(riscv::IMEPackOp operation);
@@ -2230,6 +2233,22 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
         scalar("(" + lhs.scalar + " " + symbol.str() + " " + rhs.scalar + ")");
     return mlir::success();
   }
+  if (auto select = mlir::dyn_cast<mlir::arith::SelectOp>(operation)) {
+    Binding condition = bindings.lookup(select.getCondition());
+    Binding trueValue = bindings.lookup(select.getTrueValue());
+    Binding falseValue = bindings.lookup(select.getFalseValue());
+    if (condition.kind != Binding::Kind::Scalar ||
+        trueValue.kind != Binding::Kind::Scalar ||
+        falseValue.kind != Binding::Kind::Scalar ||
+        mlir::isa<riscv::ValueType, riscv::FragmentType, riscv::LocalType>(
+            select.getResult().getType()))
+      return fail(select,
+                  "terminal arith.select requires one scalar condition and two scalar values");
+    bindings[select.getResult()] =
+        scalar("((" + condition.scalar + ") ? (" + trueValue.scalar +
+               ") : (" + falseValue.scalar + "))");
+    return mlir::success();
+  }
   if (auto loop = mlir::dyn_cast<mlir::scf::ForOp>(operation))
     return compileFor(loop);
   if (auto branch = mlir::dyn_cast<mlir::scf::IfOp>(operation))
@@ -2264,6 +2283,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto materialize =
           mlir::dyn_cast<riscv::RVVLocalMaterializeOp>(operation))
     return compileRVVLocalMaterialize(materialize);
+  if (auto pack = mlir::dyn_cast<riscv::EncodedLocalPackOp>(operation))
+    return compileEncodedLocalPack(pack);
   if (auto spill = mlir::dyn_cast<riscv::SpillOp>(operation))
     return compileSpill(spill);
   if (auto reload = mlir::dyn_cast<riscv::ReloadOp>(operation))
@@ -3671,10 +3692,20 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
           expression = "((" + absoluteExpression + ") - (" +
                        origin->second + "))";
       if (stride != binding.recordByteStrides.end()) {
+        const bool selectsInterleaveGroup =
+            binding.recordGroupAxis == axis &&
+            coordinate.kind == Binding::Kind::Point;
+        if (selectsInterleaveGroup &&
+            coordinate.point.physicalExtent != binding.interleaveRows)
+          return fail(operation,
+                      "encoded local-pack row projection is not aligned to its selected interleave cohort");
         pointer = "(" + pointer + " + (" + expression + ") * (" +
                   stride->second + "))";
         if (retainsAxis)
-          remainingStrides.push_back(*stride);
+          remainingStrides.emplace_back(
+              axis, selectsInterleaveGroup ? "1" : stride->second);
+        if (selectsInterleaveGroup)
+          binding.recordGroupAxis = 0;
       } else if (axis == binding.recordAxis && binding.recordElements > 0 &&
                  binding.recordStrideBytes > 0) {
         pointer = "(" + pointer + " + ((" + expression + ") / " +
@@ -6767,6 +6798,94 @@ mlir::LogicalResult Emitter::compileRVVLocalMaterialize(
          *element + " *)" + destination.scalar + " + " +
          std::to_string(part * lanes) + ", " + input->parts[part] + ", " +
          partVL(operation.getInput(), part) + ");");
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "scalar.local-pack.interleave")
+    return fail(operation, "encoded local pack has no exact selected leaf");
+  Binding source = bindings.lookup(operation.getInput());
+  Binding storage = bindings.lookup(operation.getStorage());
+  Binding rowPoint = bindings.lookup(operation.getRowPoint());
+  Binding recordPoint = bindings.lookup(operation.getRecordPoint());
+  riscv::LocalPackPlanAttr plan = operation.getPlan();
+  auto rowStride = llvm::find_if(
+      source.recordByteStrides,
+      [&](const auto &entry) { return entry.first == plan.getRowAxis(); });
+  if (source.kind != Binding::Kind::Record || source.interleaveRows != 0 ||
+      source.recordElements != plan.getRecordElements() ||
+      source.recordStrideBytes != plan.getRecordBytes() ||
+      rowStride == source.recordByteStrides.end() ||
+      storage.kind != Binding::Kind::LocalArray || storage.scalar.empty() ||
+      rowPoint.kind != Binding::Kind::Point ||
+      recordPoint.kind != Binding::Kind::Point)
+    return fail(operation,
+                "encoded local pack has no complete source, storage, and point bindings");
+
+  const std::string rowGroups = fresh("pack_row_groups");
+  const std::string blocks = fresh("pack_blocks");
+  const std::string rowGroup = fresh("pack_row_group");
+  const std::string block = fresh("pack_block");
+  const std::string byte = fresh("pack_byte");
+  const std::string lane = fresh("pack_lane");
+  const std::string row = fresh("pack_row");
+  line("const size_t " + rowGroups + " = ((size_t)(" + rowPoint.point.active +
+       ") + " + std::to_string(plan.getInterleaveRows() - 1) + ") / " +
+       std::to_string(plan.getInterleaveRows()) + ";");
+  line("if (((size_t)(" + recordPoint.point.active + ") % " +
+       std::to_string(plan.getRecordElements()) + ") != 0) __builtin_trap();");
+  line("const size_t " + blocks + " = (size_t)(" + recordPoint.point.active +
+       ") / " + std::to_string(plan.getRecordElements()) + ";");
+  line("for (size_t " + rowGroup + " = 0; " + rowGroup + " < " + rowGroups +
+       "; ++" + rowGroup + ") {");
+  ++indent;
+  line("for (size_t " + block + " = 0; " + block + " < " + blocks + "; ++" +
+       block + ") {");
+  ++indent;
+  line("for (size_t " + byte + " = 0; " + byte + " < " +
+       std::to_string(plan.getRecordBytes()) + "; ++" + byte + ") {");
+  ++indent;
+  line("for (size_t " + lane + " = 0; " + lane + " < " +
+       std::to_string(plan.getInterleaveRows()) + "; ++" + lane + ") {");
+  ++indent;
+  line("const size_t " + row + " = " + rowGroup + " * " +
+       std::to_string(plan.getInterleaveRows()) + " + " + lane + ";");
+  const std::string sourceAddress =
+      source.recordPointer + " + " + row + " * (" + rowStride->second +
+      ") + " + block + " * " + std::to_string(plan.getRecordBytes()) +
+      " + " + byte;
+  const std::string targetAddress =
+      "(((" + rowGroup + " * " + blocks + " + " + block + ") * " +
+      std::to_string(plan.getRecordBytes()) + " + " + byte + ") * " +
+      std::to_string(plan.getInterleaveRows()) + " + " + lane + ")";
+  line(storage.scalar + "[" + targetAddress + "] = (" + row +
+       " < (size_t)(" + rowPoint.point.active + ")) ? *(const uint8_t *)(" +
+       sourceAddress + ") : (uint8_t)0;");
+  --indent;
+  line("}");
+  --indent;
+  line("}");
+  --indent;
+  line("}");
+  --indent;
+  line("}");
+
+  Binding result;
+  result.kind = Binding::Kind::Record;
+  result.recordPointer = storage.scalar;
+  result.interleaveRows = plan.getInterleaveRows();
+  result.recordAxis = plan.getRecordAxis();
+  result.recordElements = plan.getRecordElements();
+  result.recordStrideBytes =
+      plan.getRecordBytes() * plan.getInterleaveRows();
+  result.recordGroupAxis = plan.getRowAxis();
+  result.recordByteStrides.emplace_back(
+      plan.getRowAxis(),
+      "(" + blocks + " * " + std::to_string(plan.getRecordBytes()) + ")");
+  result.recordOrigins = source.recordOrigins;
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

@@ -37,6 +37,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::LocalAllocOp, riscv::LocalCapacityGuardOp,
       riscv::LocalBindOp, riscv::LocalLoadOp,
       riscv::LocalStoreOp, riscv::RVVLocalMaterializeOp,
+      riscv::EncodedLocalPackOp,
       riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RegisterMaterializeOp, riscv::RVVBitplaneMergeOp,
@@ -81,7 +82,8 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::Fold2Op, riscv::LookupOp, riscv::RVVIndexedEntryLoadOp,
       riscv::ConvertLayoutOp,
       riscv::LocalCapacityGuardOp, riscv::LocalLoadOp, riscv::LocalStoreOp,
-      riscv::RVVLocalMaterializeOp, riscv::SpillOp, riscv::ReloadOp,
+      riscv::RVVLocalMaterializeOp, riscv::EncodedLocalPackOp,
+      riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RVVBitplaneMergeOp, riscv::PackedPlaneMergeOp,
@@ -264,7 +266,19 @@ public:
   void runOnOperation() override {
     bool failed = false;
     mlir::ModuleOp module = getOperation();
+    llvm::DenseSet<std::pair<int64_t, int64_t>> partialBirths;
     getOperation().walk([&](mlir::Operation *operation) {
+      auto verifyPartialBirth = [&](int64_t owner, int64_t birth) {
+        if (!partialBirths.insert({owner, birth}).second) {
+          operation->emitError()
+              << "partial owner " << owner << " has duplicate birth " << birth;
+          failed = true;
+        }
+      };
+      if (auto partial = mlir::dyn_cast<riscv::RVVPartialSetOp>(operation))
+        verifyPartialBirth(partial.getOwnerDomainId(), partial.getBirthId());
+      if (auto capture = mlir::dyn_cast<riscv::RVVPartialCaptureOp>(operation))
+        verifyPartialBirth(capture.getOwnerDomainId(), capture.getBirthId());
       if (operation->getDialect() &&
           operation->getDialect()->getNamespace() == "weft_kernel") {
         operation->emitError(
@@ -580,6 +594,13 @@ public:
                       .getStorage()
                       .getType()
                       .getBirthId());
+            if (auto staged =
+                    mlir::dyn_cast<riscv::EncodedLocalPackOp>(nested);
+                staged) {
+              auto storage = staged.getStorage().getType();
+              if (storage.getOwnerDomainId() == level.getDomainId())
+                stagedBirths.insert(storage.getBirthId());
+            }
           }
           const int64_t actualState = stateBirths.size();
           const int64_t actualStaged = stagedBirths.size();

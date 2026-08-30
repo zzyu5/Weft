@@ -110,6 +110,7 @@ public:
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
     bool failed = false;
+    nextPartialBirthId = 0;
     lowerMaterializations(rewriter, failed);
     lowerLocalStates(rewriter, failed);
     lowerLocalCommits(rewriter, failed);
@@ -130,6 +131,18 @@ public:
   }
 
 private:
+  static int64_t ownerDomain(mlir::Operation *operation) {
+    for (mlir::Operation *parent = operation; parent;
+         parent = parent->getParentOp()) {
+      if (auto level =
+              parent->getAttrOfType<riscv::LevelAttr>("weft.riscv.level"))
+        return level.getDomainId();
+    }
+    return 0;
+  }
+
+  int64_t nextPartialBirthId = 0;
+
   void lowerPartitionedWidenReduceStores(mlir::IRRewriter &rewriter,
                                          bool &failed) {
     llvm::SmallVector<mlir::scf::ForOp> loops;
@@ -908,6 +921,64 @@ private:
             mlir::dyn_cast<riscv::ValueType>(operation.getInput().getType());
         auto result =
             mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+        if (auto plan = operation.getLocalPackPlanAttr()) {
+          auto load = riscv_internal::sourceLoad(operation.getInput());
+          auto slice = load ? load.getRegion().getDefiningOp<riscv::SliceOp>()
+                            : riscv::SliceOp();
+          mlir::Value rowPoint;
+          mlir::Value recordPoint;
+          size_t cursor = 0;
+          if (slice) {
+            auto descriptor = slice.getResult().getType();
+            for (auto [dimension, selectorAttribute] :
+                 llvm::enumerate(slice.getSelectors())) {
+              llvm::StringRef selector =
+                  mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+              if (selector == "all")
+                continue;
+              if (cursor >= slice.getIndices().size())
+                break;
+              mlir::Value coordinate = slice.getIndices()[cursor++];
+              if (selector != "domain")
+                continue;
+              const int64_t axis = descriptor.getAxisIds()[dimension];
+              if (axis == plan.getRowAxis())
+                rowPoint = coordinate;
+              if (axis == plan.getRecordAxis())
+                recordPoint = coordinate;
+            }
+          }
+          if (!input || !result || !load || !slice || !rowPoint || !recordPoint) {
+            operation.emitError(
+                "encoded local pack requires one load-backed two-axis materialization");
+            failed = true;
+            continue;
+          }
+          rewriter.setInsertionPoint(operation);
+          mlir::Value allocationBytes =
+              rewriter.create<mlir::arith::ConstantIndexOp>(
+                  operation.getLoc(), plan.getLocalBytes());
+          auto storageType = riscv::LocalType::get(
+              rewriter.getContext(), result.getElementType(), result.getShape(),
+              result.getAxisIds(), plan.getLocalBytes(), 8,
+              operation.getBirthId(), "pack", operation.getOwnerDomainId(),
+              operation.getBirthId(), operation.getLifetimeEndDomainId(),
+              "encoded-interleave");
+          auto allocation = rewriter.create<riscv::LocalAllocOp>(
+              operation.getLoc(), storageType, allocationBytes);
+          auto packed = rewriter.create<riscv::EncodedLocalPackOp>(
+              operation.getLoc(), result, operation.getInput(),
+              allocation.getResult(), rowPoint, recordPoint, plan,
+              riscv_internal::leaf(
+                  rewriter, "transfer", "local-pack",
+                  "scalar.local-pack.interleave",
+                  "scalar.local-pack.interleave", 0, 0));
+          copyIdentity(operation, allocation);
+          copyIdentity(operation, packed);
+          operation.getResult().replaceAllUsesWith(packed.getResult());
+          rewriter.eraseOp(operation);
+          continue;
+        }
         const int64_t elements =
             result ? product(result.getLayout().getLocalFactors()) : -1;
         const int64_t elementBytes =
@@ -1846,8 +1917,10 @@ private:
       auto setType = riscv::PartialSetType::get(
           rewriter.getContext(), partialType, reductionAxis, 1, lanes,
           partialGroups);
+      const int64_t partialOwner = ownerDomain(replacement);
       auto captured = rewriter.create<riscv::RVVPartialCaptureOp>(
           widen.getLoc(), setType, replacement.getResult(0),
+          partialOwner, nextPartialBirthId++, partialOwner,
           riscv_internal::leaf(rewriter, "rvv", "partial-capture",
                                "rvv.partial-capture", "rvv.partial-capture",
                                partialGroups, partialGroups, 0, 0, "none",
@@ -2655,7 +2728,14 @@ private:
           continue;
         }
         auto memory = ownerLoad.getRegion().getType();
-        llvm::StringRef form = memory.getInterleaveRows() > 0 ? "unit" : "strided";
+        auto encodedLaneFieldType = mlir::cast<riscv::ValueType>(
+            encodedLaneField.getResult().getType());
+        auto encoded = mlir::cast<kernel::EncodingType>(
+            encodedLaneFieldType.getElementType());
+        llvm::StringRef form =
+            riscv_internal::interleaveRows(encodedLaneField, encoded) > 0
+                ? "unit"
+                : "strided";
         projectedLaneAccess = riscv::AccessAttr::get(
             rewriter.getContext(), form, encodedLaneAccess.getMapping(),
             encodedLaneAccess.getAlignment(), 0, 0,

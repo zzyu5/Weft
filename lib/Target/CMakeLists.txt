@@ -4,6 +4,7 @@ add_library(WeftRISCVTarget STATIC
   ConvertWeftToRISCV.cpp
   SelectRISCVOperations.cpp
   PropagateRISCVLayouts.cpp
+  PlanRISCVResidency.cpp
   PlanRISCVMemory.cpp
   CanonicalizeRISCVLayouts.cpp
   FuseRISCVBitplanes.cpp

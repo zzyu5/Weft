@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -36,6 +37,51 @@ bool hasAxis(riscv::ValueType value, int64_t axis) {
 
 bool hasTopology(riscv::RVVWidenDotOp dot, llvm::StringRef kind) {
   return dot.getPartialTopology().getKind() == kind;
+}
+
+int64_t ownerDomain(mlir::Operation *operation) {
+  for (mlir::Operation *parent = operation; parent;
+       parent = parent->getParentOp()) {
+    if (auto level =
+            parent->getAttrOfType<riscv::LevelAttr>("weft.riscv.level"))
+      return level.getDomainId();
+  }
+  return 0;
+}
+
+bool mayMoveReadAcross(mlir::Operation *operation) {
+  if (mlir::isMemoryEffectFree(operation))
+    return true;
+  auto effects = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(operation);
+  if (!effects)
+    return false;
+  llvm::SmallVector<mlir::MemoryEffects::EffectInstance> instances;
+  effects.getEffects(instances);
+  return llvm::all_of(instances, [](const auto &instance) {
+    return mlir::isa<mlir::MemoryEffects::Read>(instance.getEffect());
+  });
+}
+
+void sinkReplicaSupplies(riscv::RVVPartialSetOp partial) {
+  llvm::SmallVector<riscv::RVVReplicaStorageLoadOp> supplies;
+  for (mlir::Value operand : partial->getOperands()) {
+    auto supply = operand.getDefiningOp<riscv::RVVReplicaStorageLoadOp>();
+    if (!supply || !supply.getResult().hasOneUse() ||
+        supply->getBlock() != partial->getBlock() ||
+        llvm::is_contained(supplies, supply))
+      continue;
+    bool movable = true;
+    for (mlir::Operation *cursor = supply->getNextNode();
+         cursor && cursor != partial.getOperation(); cursor = cursor->getNextNode())
+      if (!mayMoveReadAcross(cursor)) {
+        movable = false;
+        break;
+      }
+    if (movable)
+      supplies.push_back(supply);
+  }
+  for (riscv::RVVReplicaStorageLoadOp supply : supplies)
+    supply->moveBefore(partial);
 }
 
 std::optional<size_t> axisPosition(riscv::ValueType value, int64_t axis) {
@@ -2192,6 +2238,17 @@ public:
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
     bool failed = false;
+    int64_t nextPartialBirthId = 0;
+    getOperation().walk([&](mlir::Operation *operation) {
+      if (auto partial = mlir::dyn_cast<riscv::RVVPartialSetOp>(operation))
+        nextPartialBirthId =
+            std::max(nextPartialBirthId,
+                     static_cast<int64_t>(partial.getBirthId()) + 1);
+      if (auto capture = mlir::dyn_cast<riscv::RVVPartialCaptureOp>(operation))
+        nextPartialBirthId =
+            std::max(nextPartialBirthId,
+                     static_cast<int64_t>(capture.getBirthId()) + 1);
+    });
 
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(
@@ -2867,11 +2924,13 @@ public:
               rewriter.getDenseI64ArrayAttr(sourceLhsOffsets),
               rewriter.getDenseI64ArrayAttr(sourceRhsOffsets), reductionAxis,
               *multiplyInstruction,
+              ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-set", "rvv.partial-set",
                   "rvv.partial-set", 0, sourceSetType.getResourceGroups(), 0,
                   0, "none", "exact", {reductionAxis, sourceSlots}));
           riscv_internal::copyOrigin(dot, sourceSet);
+          sinkReplicaSupplies(sourceSet);
           auto repacked = rewriter.create<riscv::RVVPartialRepackOp>(
               reduce.getLoc(), repackedSetType, sourceSet.getResult(), laneSplit,
               riscv_internal::leaf(
@@ -2903,11 +2962,13 @@ public:
               rewriter.getDenseI64ArrayAttr(lhsLaneOffsets),
               rewriter.getDenseI64ArrayAttr(rhsLaneOffsets), reductionAxis,
               *multiplyInstruction,
+              ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-set", "rvv.partial-set",
                   "rvv.partial-set", 0, directSetType.getResourceGroups(), 0,
                   0, "none", "exact", {reductionAxis, slots}));
           riscv_internal::copyOrigin(dot, set);
+          sinkReplicaSupplies(set);
           auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
               reduce.getLoc(), reducedSetType, set.getResult(),
               riscv_internal::leaf(
@@ -2933,11 +2994,13 @@ public:
                 rewriter.getDenseI64ArrayAttr(operandSlots), slice(lhsParts),
                 slice(rhsParts), slice(lhsLaneOffsets), slice(rhsLaneOffsets),
                 reductionAxis, *multiplyInstruction,
+                ownerDomain(reduce), nextPartialBirthId++, ownerDomain(reduce),
                 riscv_internal::leaf(
                     rewriter, "rvv", "partial-set", "rvv.partial-set",
                     "rvv.partial-set", 0, setGroups, 0, 0, "none", "exact",
                     {reductionAxis, combineArity}));
             riscv_internal::copyOrigin(dot, set);
+            sinkReplicaSupplies(set);
             llvm::SmallVector<mlir::Value> scales(combineArity, *narrowScale);
             auto scaled = rewriter.create<riscv::RVVPartialWidenScaleOp>(
                 reduce.getLoc(), scaledSetType, set.getResult(), scales,
@@ -3187,11 +3250,13 @@ public:
             rewriter.getDenseI64ArrayAttr(laneOffsets),
             rewriter.getDenseI64ArrayAttr(laneOffsets), reductionAxis,
             multiplyInstruction,
+            ownerDomain(yield), nextPartialBirthId++, ownerDomain(yield),
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-set", "rvv.partial-set",
                 "rvv.partial-set", 0, setType.getResourceGroups(), 0, 0,
                 "none", "exact", {reductionAxis, slots}));
         riscv_internal::copyOrigin(contributions.front().dot, set);
+        sinkReplicaSupplies(set);
         auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
             yield.getLoc(), reducedType, set.getResult(),
             riscv_internal::leaf(
@@ -3368,11 +3433,13 @@ public:
             rewriter.getDenseI64ArrayAttr(operandSlots),
             rewriter.getDenseI64ArrayAttr(operandSlots), reductionAxis,
             *multiplyInstruction,
+            ownerDomain(dot), nextPartialBirthId++, ownerDomain(dot),
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-set", "rvv.partial-set",
                 "rvv.partial-set", operandGroups, setGroups, 0, 0, "none",
                 "exact", {reductionAxis, slots}));
         riscv_internal::copyOrigin(dot, set);
+        sinkReplicaSupplies(set);
         partials = set.getResult();
         while (remainingSlots > 1) {
           if (remainingSlots % 2)
@@ -3462,11 +3529,13 @@ public:
             rewriter.getDenseI64ArrayAttr(operandSlots),
             rewriter.getDenseI64ArrayAttr(operandSlots), reductionAxis,
             *multiplyInstruction,
+            ownerDomain(dot), nextPartialBirthId++, ownerDomain(dot),
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-set", "rvv.partial-set",
                 "rvv.partial-set", operandGroups, setGroups, 0, 0, "none",
                 "exact", {reductionAxis, slots}));
         riscv_internal::copyOrigin(dot, set);
+        sinkReplicaSupplies(set);
         partials = set.getResult();
         while (remainingSlots > 1) {
           const int64_t arity = remainingSlots % 2 == 0 ? 2 : remainingSlots;
@@ -3625,11 +3694,13 @@ public:
               rewriter.getDenseI64ArrayAttr({0}),
               rewriter.getDenseI64ArrayAttr({0}),
               sourceType.getReductionAxis(), *multiplyInstruction,
+              ownerDomain(root), nextPartialBirthId++, ownerDomain(root),
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-set", "rvv.partial-set",
                   "rvv.partial-set", 0, sourceType.getResourceGroups(), 0, 0,
                   "none", "exact", {sourceType.getReductionAxis(), 1}));
           riscv_internal::copyOrigin(leaf.dot, set);
+          sinkReplicaSupplies(set);
           value = set.getResult();
           origin = leaf.dot.getOperation();
         }
@@ -3961,6 +4032,12 @@ public:
       eraseDeadChain(oldLhs, stops, erased, rewriter);
       eraseDeadChain(oldRhs, stops, erased, rewriter);
     }
+
+    llvm::SmallVector<riscv::RVVPartialSetOp> partialSets;
+    getOperation().walk(
+        [&](riscv::RVVPartialSetOp partial) { partialSets.push_back(partial); });
+    for (riscv::RVVPartialSetOp partial : partialSets)
+      sinkReplicaSupplies(partial);
 
     if (failed)
       signalPassFailure();

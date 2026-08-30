@@ -326,6 +326,24 @@ def WeftRISCV_StorageWindowPlanAttr
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_LocalPackPlanAttr
+    : WeftRISCV_Attr<"LocalPackPlan", "local_pack_plan"> {
+  let parameters = (ins
+    StringRefParameter<"currently interleave">:$kind,
+    "int64_t":$rowAxis,
+    "int64_t":$recordAxis,
+    "int64_t":$interleaveRows,
+    "int64_t":$recordBytes,
+    "int64_t":$recordElements,
+    "int64_t":$localBytes
+  );
+  let assemblyFormat = [{
+    `<` $kind `,` $rowAxis `,` $recordAxis `,` $interleaveRows `,`
+        $recordBytes `,` $recordElements `,` $localBytes `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_LayeredPartialPlanAttr
     : WeftRISCV_Attr<"LayeredPartialPlan", "layered_partial_plan"> {
   let parameters = (ins
@@ -749,7 +767,9 @@ def WeftRISCV_NewOp : WeftRISCV_Op<"new", [Pure]> {
 
 def WeftRISCV_MaterializeOp : WeftRISCV_Op<"materialize", [Pure]> {
   let arguments = (ins AnyType:$input, StrAttr:$placement,
-                       StrAttr:$schema, I64Attr:$owner_domain_id,
+                       StrAttr:$schema,
+                       OptionalAttr<WeftRISCV_LocalPackPlanAttr>:$local_pack_plan,
+                       I64Attr:$owner_domain_id,
                        I64Attr:$birth_id, I64Attr:$lifetime_end_domain_id);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
@@ -992,6 +1012,19 @@ def WeftRISCV_RVVLocalMaterializeOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_EncodedLocalPackOp
+    : WeftRISCV_Op<"encoded_local_pack",
+                   [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       WeftRISCV_LocalType:$storage,
+                       WeftRISCV_PointType:$row_point,
+                       WeftRISCV_PointType:$record_point,
+                       WeftRISCV_LocalPackPlanAttr:$plan,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_SpillOp
     : WeftRISCV_Op<"spill", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$input, WeftRISCV_LocalType:$slot,
@@ -1007,7 +1040,8 @@ def WeftRISCV_ReloadOp
 }
 
 def WeftRISCV_IMEFragmentMMAOp
-    : WeftRISCV_Op<"ime_fragment_mma", [Pure]> {
+    : WeftRISCV_Op<"ime_fragment_mma",
+                   [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins WeftRISCV_FragmentType:$lhs,
                        WeftRISCV_FragmentType:$rhs,
                        I64Attr:$groups, I64Attr:$chunks,
@@ -1283,7 +1317,8 @@ def WeftRISCV_RVVFinalizeWidenDotOp
 }
 
 def WeftRISCV_RVVPartialSetOp
-    : WeftRISCV_Op<"rvv_partial_set", [Pure, AttrSizedOperandSegments]> {
+    : WeftRISCV_Op<"rvv_partial_set",
+                   [Pure, AttrSizedOperandSegments]> {
   let arguments = (ins Variadic<WeftRISCV_ValueType>:$lhs,
                        Variadic<WeftRISCV_ValueType>:$rhs,
                        DenseI64ArrayAttr:$lhs_operands,
@@ -1294,6 +1329,9 @@ def WeftRISCV_RVVPartialSetOp
                        DenseI64ArrayAttr:$rhs_lane_offsets,
                        I64Attr:$reduction_axis,
                        StrAttr:$multiply_instruction,
+                       I64Attr:$owner_domain_id,
+                       I64Attr:$birth_id,
+                       I64Attr:$lifetime_end_domain_id,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;
@@ -1302,6 +1340,9 @@ def WeftRISCV_RVVPartialSetOp
 def WeftRISCV_RVVPartialCaptureOp
     : WeftRISCV_Op<"rvv_partial_capture", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
+                       I64Attr:$owner_domain_id,
+                       I64Attr:$birth_id,
+                       I64Attr:$lifetime_end_domain_id,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;

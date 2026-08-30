@@ -1,6 +1,7 @@
 #include "Weft/Target/RISCVPasses.h"
 
 #include "RISCVPhysicalSupport.h"
+#include "RISCVResidencyPlanning.h"
 
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
@@ -1109,51 +1110,6 @@ riscv::LayoutAttr registerGatherSourceLayout(mlir::Builder &builder,
       (resultLayout.getLmulEighths() + 7) / 8, "full");
 }
 
-bool isDenseLoadBacked(riscv::MaterializeOp materialize) {
-  auto load = riscv_internal::sourceLoad(materialize.getInput());
-  if (!load)
-    return false;
-  auto encoding =
-      mlir::dyn_cast<kernel::EncodingType>(load.getRegion().getType().getEncoding());
-  return encoding && encoding.getKind() == "dense";
-}
-
-bool requiresAddressableReload(riscv::MaterializeOp materialize,
-                               riscv::TargetAttr target) {
-  auto value = mlir::dyn_cast<riscv::ValueType>(materialize.getResult().getType());
-  if (!value || value.getLayout().getCarrier() != "rvv" ||
-      !isDenseLoadBacked(materialize))
-    return false;
-
-  bool hasExtract = false;
-  bool allExtracts = true;
-  bool registerProjectionUnsupported = false;
-  for (mlir::Operation *user : materialize.getResult().getUsers()) {
-    auto extract = mlir::dyn_cast<riscv::ExtractOp>(user);
-    if (!extract || extract.getInput() != materialize.getResult()) {
-      allExtracts = false;
-      continue;
-    }
-    hasExtract = true;
-    int64_t selectedAxes = 0;
-    for (mlir::Attribute selector : extract.getSelectors())
-      if (mlir::cast<mlir::StringAttr>(selector).getValue() != "all")
-        ++selectedAxes;
-    registerProjectionUnsupported |= selectedAxes != 1;
-  }
-  if (!hasExtract || !allExtracts)
-    return false;
-
-  auto timeParts = riscv_internal::staticProduct(
-      value.getLayout().getTimeFactors().asArrayRef());
-  if (!timeParts)
-    return true;
-  const int64_t residentGroups =
-      *timeParts * value.getLayout().getRegisterGroups();
-  return registerProjectionUnsupported ||
-         residentGroups > target.getVectorRegisters();
-}
-
 class PropagateRISCVLayoutsPass
     : public mlir::PassWrapper<PropagateRISCVLayoutsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -1573,26 +1529,10 @@ public:
       update(materialize.getInput());
       update(materialize.getResult());
     });
-    // Canonical materialize fixes the value's birth, lifetime, and sharing
-    // scope.  It does not require the complete logical panel to reside in
-    // registers.  A dense load-backed panel whose direct consumers are
-    // projections remains addressable when the selected RVV representation
-    // cannot exist as one legal register-resident value.  Composite lowering
-    // will turn those projections into loads from the staged view.
-    getOperation().walk([&](riscv::MaterializeOp materialize) {
-      if (materialize.getPlacement() != "shared")
-        return;
-      if (auto value =
-              mlir::dyn_cast<riscv::ValueType>(materialize.getResult().getType());
-          value && value.getLayout().getCarrier() == "local" &&
-          !mlir::isa<kernel::EncodingType>(value.getElementType())) {
-        materialize.setPlacementAttr(builder.getStringAttr("local"));
-        return;
-      }
-      auto kernel = materialize->getParentOfType<riscv::KernelOp>();
-      if (kernel && requiresAddressableReload(materialize, kernel.getTarget()))
-        materialize.setPlacementAttr(builder.getStringAttr("reload"));
-    });
+    if (mlir::failed(weft::planRISCVResidency(getOperation()))) {
+      signalPassFailure();
+      return;
+    }
     getOperation().walk([&](riscv::NewOp state) {
       if (auto value = mlir::dyn_cast<riscv::ValueType>(state.getResult().getType()))
         state.setPlacementAttr(builder.getStringAttr(

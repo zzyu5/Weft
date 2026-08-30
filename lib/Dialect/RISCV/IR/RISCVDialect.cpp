@@ -248,6 +248,10 @@ LoadOp sourceLoad(mlir::Value value) {
       value = extract.getInput();
       continue;
     }
+    if (auto pack = mlir::dyn_cast<EncodedLocalPackOp>(definition)) {
+      value = pack.getInput();
+      continue;
+    }
     break;
   }
   return {};
@@ -664,6 +668,31 @@ int64_t derivedInterleaveRows(mlir::Operation *operation,
         rows = derived.getInterleaveRows();
     });
   return rows;
+}
+
+int64_t localPackInterleaveRows(mlir::Value owner) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  while (owner) {
+    mlir::Operation *definition = owner.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      return 0;
+    if (auto pack = mlir::dyn_cast<EncodedLocalPackOp>(definition))
+      return pack.getPlan().getInterleaveRows();
+    if (auto extract = mlir::dyn_cast<ExtractOp>(definition)) {
+      owner = extract.getInput();
+      continue;
+    }
+    if (auto convert = mlir::dyn_cast<ConvertLayoutOp>(definition)) {
+      owner = convert.getInput();
+      continue;
+    }
+    if (auto materialize = mlir::dyn_cast<RegisterMaterializeOp>(definition)) {
+      owner = materialize.getInput();
+      continue;
+    }
+    return 0;
+  }
+  return 0;
 }
 
 } // namespace
@@ -1209,6 +1238,22 @@ mlir::LogicalResult StorageWindowPlanAttr::verify(
       maskValue != ((int64_t{1} << elementBits) - 1))
     return emitError()
            << "layered storage window plan has incomplete address or decode geometry";
+  return mlir::success();
+}
+
+mlir::LogicalResult LocalPackPlanAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    llvm::StringRef kind, int64_t rowAxis, int64_t recordAxis,
+    int64_t interleaveRows, int64_t recordBytes, int64_t recordElements,
+    int64_t localBytes) {
+  auto interleavedRecordBytes =
+      checkedPositiveProduct({interleaveRows, recordBytes});
+  if (kind != "interleave" || rowAxis <= 0 || recordAxis <= 0 ||
+      rowAxis == recordAxis || interleaveRows <= 1 || recordBytes <= 0 ||
+      recordElements <= 0 || localBytes <= 0 ||
+      !interleavedRecordBytes || localBytes % *interleavedRecordBytes != 0)
+    return emitError()
+           << "local pack plan requires one closed record-interleave geometry";
   return mlir::success();
 }
 
@@ -2046,6 +2091,11 @@ mlir::LogicalResult MaterializeOp::verify() {
   if (getOwnerDomainId() < 0 || getBirthId() < 0 ||
       getLifetimeEndDomainId() < getOwnerDomainId() || getSchema().empty())
     return emitOpError("physical staged birth requires explicit owner, lifetime, and schema");
+  if (getLocalPackPlan() && getPlacement() != "local")
+    return emitOpError("a selected local pack plan requires local placement");
+  if (getLocalPackPlan() &&
+      !mlir::isa<kernel::EncodingType>(elementOf(getResult().getType())))
+    return emitOpError("a local encoded pack plan requires an encoded value");
   return mlir::success();
 }
 
@@ -3231,6 +3281,73 @@ mlir::LogicalResult RVVLocalMaterializeOp::verify() {
     return emitOpError(
         "RVV local materialize requires one complete innermost-lane value and an exact local representation");
   return mlir::success();
+}
+
+mlir::LogicalResult EncodedLocalPackOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  LocalType storage = getStorage().getType();
+  LocalPackPlanAttr plan = getPlan();
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(input.getElementType());
+  auto row = getRowPoint().getType().getDomain();
+  auto record = getRecordPoint().getType().getDomain();
+  auto rowPosition = llvm::find(result.getAxisIds().asArrayRef(), plan.getRowAxis());
+  auto recordPosition =
+      llvm::find(result.getAxisIds().asArrayRef(), plan.getRecordAxis());
+  auto representedExtent = [&](decltype(rowPosition) position)
+      -> std::optional<int64_t> {
+    if (position == result.getAxisIds().asArrayRef().end())
+      return std::nullopt;
+    const size_t axis = static_cast<size_t>(
+        position - result.getAxisIds().asArrayRef().begin());
+    int64_t extent = 1;
+    for (mlir::DenseI64ArrayAttr factors : {
+             result.getLayout().getTimeFactors(),
+             result.getLayout().getLaneFactors(),
+             result.getLayout().getReplicaFactors(),
+             result.getLayout().getFragmentFactors(),
+             result.getLayout().getLocalFactors()}) {
+      const int64_t factor = factors[axis];
+      if (factor <= 0 ||
+          extent > std::numeric_limits<int64_t>::max() / factor)
+        return std::nullopt;
+      extent *= factor;
+    }
+    return extent;
+  };
+  auto rowExtent = representedExtent(rowPosition);
+  auto recordExtent = representedExtent(recordPosition);
+  std::optional<int64_t> expectedLocalBytes;
+  if (rowExtent && recordExtent && *recordExtent % plan.getRecordElements() == 0) {
+    auto records = checkedPositiveProduct(
+        {*rowExtent, *recordExtent / plan.getRecordElements()});
+    if (records)
+      expectedLocalBytes =
+          checkedPositiveProduct({*records, plan.getRecordBytes()});
+  }
+  if (!encoding || encoding.getKind() != "base" ||
+      !sameLogicalDomain(input, result) ||
+      input.getElementType() != result.getElementType() ||
+      result.getLayout().getCarrier() != "local" ||
+      storage.getPurpose() != "pack" ||
+      storage.getElementType() != result.getElementType() ||
+      storage.getShape() != result.getShape() ||
+      storage.getAxisIds() != result.getAxisIds() ||
+      storage.getSizeBytes() != plan.getLocalBytes() ||
+      !expectedLocalBytes || *expectedLocalBytes != plan.getLocalBytes() ||
+      row.getAxisId() != plan.getRowAxis() ||
+      record.getAxisId() != plan.getRecordAxis() ||
+      !rowExtent || !recordExtent || *rowExtent % plan.getInterleaveRows() ||
+      *recordExtent % plan.getRecordElements() ||
+      !getStorage().getDefiningOp<LocalAllocOp>() ||
+      !exactLeaf(getLeaf(), "transfer", "local-pack",
+                 "scalar.local-pack.interleave", "none", "exact") ||
+      getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
+      getLeaf().getTemporaryGroups() != 0 ||
+      getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "encoded local pack requires one allocated, lifetime-owned interleaved record view");
+  return verifyLeafOperation(*this);
 }
 
 mlir::LogicalResult SpillOp::verify() {
@@ -4823,8 +4940,10 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
                                     : "rvv.replica-storage-load.interleaved-joined";
   auto ownerEncoding = mlir::dyn_cast<weft::kernel::EncodingType>(
       sourceField ? elementOf(sourceField.getOwner().getType()) : mlir::Type());
-  const int64_t interleave =
-      sourceField ? derivedInterleaveRows(*this, ownerEncoding) : 0;
+  int64_t interleave =
+      sourceField ? localPackInterleaveRows(sourceField.getOwner()) : 0;
+  if (interleave <= 0 && sourceField)
+    interleave = derivedInterleaveRows(*this, ownerEncoding);
   if (!sourceField || !storageLoad || !memory ||
       !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
       fieldBits <= 0 || (fieldInteger && fieldInteger.isSignless()) || !scalarBase ||
@@ -4859,6 +4978,15 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
            << "replica storage load requires one scalar base and a closed field-to-register window map; field="
            << field << ", result=" << result << ", source_field="
            << static_cast<bool>(sourceField) << ", access=" << getAccess()
+           << ", source_access="
+           << (sourceField ? sourceField.getAccess() : AccessAttr())
+           << ", storage_load=" << static_cast<bool>(storageLoad)
+           << ", memory=" << memory << ", interleave=" << interleave
+           << ", result_axis="
+           << (resultAxis == result.getAxisIds().asArrayRef().end()
+                   ? -1
+                   : static_cast<int64_t>(resultAxis -
+                                          result.getAxisIds().asArrayRef().begin()))
            << ", plan=" << plan
            << ", window_offsets=" << getWindowOffsets()
            << ", record_rank=" << recordRank
@@ -5342,6 +5470,8 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
       getLhsLaneOffsets().size() != static_cast<size_t>(result.getSlots()) ||
       getRhsLaneOffsets().size() != static_cast<size_t>(result.getSlots()) ||
       getReductionAxis() != result.getReductionAxis() ||
+      getOwnerDomainId() < 0 || getBirthId() < 0 ||
+      getLifetimeEndDomainId() < getOwnerDomainId() ||
       !exactLeaf(getLeaf(), "rvv", "partial-set", "rvv.partial-set",
                  "none", "exact"))
     return emitOpError(
@@ -5481,6 +5611,8 @@ mlir::LogicalResult RVVPartialCaptureOp::verify() {
           input.getLayout().getLaneFactors()[static_cast<size_t>(
               axis - input.getAxisIds().asArrayRef().begin())] ||
       result.getResourceGroups() != input.getLayout().getRegisterGroups() ||
+      getOwnerDomainId() < 0 || getBirthId() < 0 ||
+      getLifetimeEndDomainId() < getOwnerDomainId() ||
       getLeaf().getOperandGroups() != input.getLayout().getRegisterGroups() ||
       getLeaf().getResultGroups() != result.getResourceGroups() ||
       !exactLeaf(getLeaf(), "rvv", "partial-capture",

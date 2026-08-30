@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -987,6 +988,31 @@ llvm::StringRef riscv_internal::baseEncodingFamily(
 
 int64_t riscv_internal::interleaveRows(mlir::Operation *operation,
                                        kernel::EncodingType encoding) {
+  mlir::Value owner;
+  if (auto field = mlir::dyn_cast<riscv::FieldOp>(operation))
+    owner = field.getOwner();
+  llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+  while (owner) {
+    mlir::Operation *definition = owner.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      break;
+    if (auto pack = mlir::dyn_cast<riscv::EncodedLocalPackOp>(definition))
+      return pack.getPlan().getInterleaveRows();
+    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
+      owner = extract.getInput();
+      continue;
+    }
+    if (auto materialize =
+            mlir::dyn_cast<riscv::RegisterMaterializeOp>(definition)) {
+      owner = materialize.getInput();
+      continue;
+    }
+    if (auto convert = mlir::dyn_cast<riscv::ConvertLayoutOp>(definition)) {
+      owner = convert.getInput();
+      continue;
+    }
+    break;
+  }
   if (encoding.getKind() != "derived_instance")
     return 0;
   int64_t result = 0;
@@ -1420,6 +1446,16 @@ riscv::LoadOp riscv_internal::sourceLoad(mlir::Value value) {
       return load;
     if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition)) {
       value = extract.getInput();
+      continue;
+    }
+    if (auto pack =
+            mlir::dyn_cast_or_null<riscv::EncodedLocalPackOp>(definition)) {
+      value = pack.getInput();
+      continue;
+    }
+    if (auto materialize =
+            mlir::dyn_cast_or_null<riscv::RegisterMaterializeOp>(definition)) {
+      value = materialize.getInput();
       continue;
     }
     break;
