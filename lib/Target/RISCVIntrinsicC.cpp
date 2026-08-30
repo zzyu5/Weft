@@ -6804,7 +6804,7 @@ mlir::LogicalResult Emitter::compileRVVLocalMaterialize(
 mlir::LogicalResult
 Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
   if (instructionOf(operation.getOperation()) !=
-      "scalar.local-pack.interleave")
+      "rvv.local-pack.interleave")
     return fail(operation, "encoded local pack has no exact selected leaf");
   Binding source = bindings.lookup(operation.getInput());
   Binding storage = bindings.lookup(operation.getStorage());
@@ -6829,8 +6829,13 @@ Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
   const std::string rowGroup = fresh("pack_row_group");
   const std::string block = fresh("pack_block");
   const std::string byte = fresh("pack_byte");
-  const std::string lane = fresh("pack_lane");
-  const std::string row = fresh("pack_row");
+  const std::string rowBase = fresh("pack_row_base");
+  const std::string transferVL = fresh("pack_vl");
+  const std::string transferSuffix =
+      "u8" + lmulSpelling(operation.getTransferLayout().getLmulEighths());
+  const std::string transferType =
+      "vuint8" + lmulSpelling(operation.getTransferLayout().getLmulEighths()) +
+      "_t";
   line("const size_t " + rowGroups + " = ((size_t)(" + rowPoint.point.active +
        ") + " + std::to_string(plan.getInterleaveRows() - 1) + ") / " +
        std::to_string(plan.getInterleaveRows()) + ";");
@@ -6841,28 +6846,45 @@ Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
   line("for (size_t " + rowGroup + " = 0; " + rowGroup + " < " + rowGroups +
        "; ++" + rowGroup + ") {");
   ++indent;
+  line("const size_t " + rowBase + " = " + rowGroup + " * " +
+       std::to_string(plan.getInterleaveRows()) + ";");
+  line("const size_t " + transferVL + " = ((size_t)(" +
+       rowPoint.point.active + ") - " + rowBase + " < " +
+       std::to_string(plan.getInterleaveRows()) + ") ? ((size_t)(" +
+       rowPoint.point.active + ") - " + rowBase + ") : " +
+       std::to_string(plan.getInterleaveRows()) + ";");
   line("for (size_t " + block + " = 0; " + block + " < " + blocks + "; ++" +
        block + ") {");
   ++indent;
   line("for (size_t " + byte + " = 0; " + byte + " < " +
        std::to_string(plan.getRecordBytes()) + "; ++" + byte + ") {");
   ++indent;
-  line("for (size_t " + lane + " = 0; " + lane + " < " +
-       std::to_string(plan.getInterleaveRows()) + "; ++" + lane + ") {");
-  ++indent;
-  line("const size_t " + row + " = " + rowGroup + " * " +
-       std::to_string(plan.getInterleaveRows()) + " + " + lane + ";");
   const std::string sourceAddress =
-      source.recordPointer + " + " + row + " * (" + rowStride->second +
+      source.recordPointer + " + " + rowBase + " * (" + rowStride->second +
       ") + " + block + " * " + std::to_string(plan.getRecordBytes()) +
       " + " + byte;
   const std::string targetAddress =
       "(((" + rowGroup + " * " + blocks + " + " + block + ") * " +
       std::to_string(plan.getRecordBytes()) + " + " + byte + ") * " +
-      std::to_string(plan.getInterleaveRows()) + " + " + lane + ")";
-  line(storage.scalar + "[" + targetAddress + "] = (" + row +
-       " < (size_t)(" + rowPoint.point.active + ")) ? *(const uint8_t *)(" +
-       sourceAddress + ") : (uint8_t)0;");
+      std::to_string(plan.getInterleaveRows()) + ")";
+  const std::string packed = fresh("pack_bytes");
+  line(transferType + " " + packed + " = __riscv_vlse8_v_" +
+       transferSuffix + "((const uint8_t *)(" + sourceAddress +
+       "), (ptrdiff_t)(" + rowStride->second + "), " + transferVL + ");");
+  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
+       " + " + targetAddress + "), " + packed + ", " + transferVL + ");");
+  line("if (" + transferVL + " < " +
+       std::to_string(plan.getInterleaveRows()) + ") {");
+  ++indent;
+  const std::string tail = fresh("pack_tail");
+  const std::string zeros = fresh("pack_zeros");
+  line("const size_t " + tail + " = " +
+       std::to_string(plan.getInterleaveRows()) + " - " + transferVL + ";");
+  line(transferType + " " + zeros + " = __riscv_vmv_v_x_" + transferSuffix +
+       "(0, " + tail + ");");
+  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
+       " + " + targetAddress + " + " + transferVL + "), " + zeros + ", " +
+       tail + ");");
   --indent;
   line("}");
   --indent;
@@ -8247,6 +8269,11 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   auto lhsType = mlir::dyn_cast<riscv::ValueType>(operation.getLhs().getType());
   const int64_t outputParts = vectorPartCount(operation.getResult());
   const int64_t outputStreams = streamPartCount(operation.getResult());
+  auto supplyForResult = operation.getPackedSupplyForResult();
+  const int64_t packedSupplies =
+      supplyForResult.empty()
+          ? 0
+          : *llvm::max_element(supplyForResult) + int64_t{1};
   if (!lhsField || !rhsField || lhsOwner.kind != Binding::Kind::Record ||
       rhsOwner.kind != Binding::Kind::Record || !lhsInteger ||
       !lhsInteger.isUnsigned() || lhsInteger.getWidth() >= 8 || !rhsInteger ||
@@ -8255,6 +8282,10 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
       outputStreams <= 0 || outputParts % outputStreams)
     return fail(operation,
                 "grouped MAC reduction fields do not match its selected mixed-width vector form");
+  if (supplyForResult.size() != static_cast<size_t>(outputParts) ||
+      packedSupplies <= 0)
+    return fail(operation,
+                "grouped MAC reduction has no closed packed-supply mapping");
   Binding point = lhs.field.index ? bindings.lookup(*lhs.field.index) : Binding();
   Binding rhsPoint = rhs.field.index ? bindings.lookup(*rhs.field.index) : Binding();
   if (point.kind != Binding::Kind::Point || rhsPoint.kind != Binding::Kind::Point ||
@@ -8371,15 +8402,31 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
   const int64_t qTermStride = plan.getTermByteStride();
   llvm::SmallVector<std::string> qWindows;
   llvm::SmallVector<std::string> xWindows;
+  llvm::SmallVector<int64_t> representative(
+      static_cast<size_t>(packedSupplies), int64_t{-1});
   for (int64_t part = 0; part < outputParts; ++part) {
+    const int64_t supply = supplyForResult[static_cast<size_t>(part)];
+    if (supply < 0 || supply >= packedSupplies)
+      return fail(operation,
+                  "grouped MAC reduction packed-supply index is out of range");
+    if (representative[static_cast<size_t>(supply)] < 0)
+      representative[static_cast<size_t>(supply)] = part;
+  }
+  for (int64_t supply = 0; supply < packedSupplies; ++supply) {
+    const int64_t part = representative[static_cast<size_t>(supply)];
+    if (part < 0)
+      return fail(operation,
+                  "grouped MAC reduction packed-supply mapping is not dense");
     std::string qWindow = fresh("group_q_window");
-    std::string xWindow = fresh("group_x_window");
     line("const uint8_t *" + qWindow + " = " + lhsRecords[part] + " + " +
          byte + " * " + std::to_string(qTermStride) + ";");
+    qWindows.push_back(std::move(qWindow));
+  }
+  for (int64_t part = 0; part < outputParts; ++part) {
+    std::string xWindow = fresh("group_x_window");
     line("const int8_t *" + xWindow + " = (const int8_t *)(" +
          rhsRecords[part] + " + " +
          std::to_string(plan.getRhsBitOffsetBytes()) + " + " + logical + ");");
-    qWindows.push_back(std::move(qWindow));
     xWindows.push_back(std::move(xWindow));
   }
 
@@ -8418,14 +8465,24 @@ mlir::LogicalResult Emitter::compileGroupedMacReduce(
         line("if (" + std::to_string(plannedTerm) + " < " + termLimit.str() + ") {");
         ++indent;
       }
-      for (int64_t part = 0; part < outputParts; ++part) {
+      llvm::SmallVector<std::string> signedPacked;
+      signedPacked.reserve(static_cast<size_t>(packedSupplies));
+      for (int64_t supply = 0; supply < packedSupplies; ++supply) {
+        const int64_t part = representative[static_cast<size_t>(supply)];
         const std::string partVl = partVL(operation.getResult(), part);
         std::string q = fresh("group_q");
         line(rawType + " " + q + " = " +
-             qLoad(qWindows[part], linear, partVl) + ";");
+             qLoad(qWindows[static_cast<size_t>(supply)], linear, partVl) +
+             ";");
         std::string signedQ = fresh("group_q_signed");
         line(signedRawType + " " + signedQ + " = __riscv_vreinterpret_v_" +
              rawSuffix + "_" + signedRawSuffix + "(" + q + ");");
+        signedPacked.push_back(std::move(signedQ));
+      }
+      for (int64_t part = 0; part < outputParts; ++part) {
+        const std::string partVl = partVL(operation.getResult(), part);
+        const std::string &signedQ = signedPacked[static_cast<size_t>(
+            supplyForResult[static_cast<size_t>(part)])];
         const std::string x = "*(" + xWindows[part] + " + " + linear + ")";
         if (term == 0)
           line(partials[part] + " = __riscv_vwmul_vx_" + partialSuffix +

@@ -715,10 +715,10 @@ def mul_mat_q4_k_staged(
                             x = admit(Xq[mb, kb])
                             i32_acc = new(i32, [MR, 16], init=0)
                             with L.subs(extent=32) as s:
-                                p32 = outer_contract(
-                                    x.q[s], w.q[s], over="k", acc=i32
+                                p16 = mac_groups(
+                                    x.q[s], w.q[s], n=4, into=i16
                                 )
-                                i32_acc += p32 * w.sc[s]
+                                i32_acc += reduce(widen(p16, i32)) * w.sc[s]
                             mins = fold2(x.bsum)
                             min_term = outer_contract(
                                 mins, w.m, over="k", acc=i32

@@ -50,6 +50,85 @@ bool weft::riscv::supportsRVVLayout(TargetAttr target, LayoutAttr layout) {
          legalFractionalLMUL;
 }
 
+std::optional<llvm::SmallVector<int64_t>>
+weft::riscv::groupedMacSupplyProjection(ValueType packed, ValueType result) {
+  if (!packed || !result || packed.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getCarrier() != "rvv")
+    return std::nullopt;
+  auto product = [](llvm::ArrayRef<int64_t> factors) -> std::optional<int64_t> {
+    int64_t value = 1;
+    for (int64_t factor : factors) {
+      if (factor <= 0 ||
+          value > std::numeric_limits<int64_t>::max() / factor)
+        return std::nullopt;
+      value *= factor;
+    }
+    return value;
+  };
+  auto timeParts = product(result.getLayout().getTimeFactors().asArrayRef());
+  auto registerParts = product(result.getLayout().getReplicaFactors().asArrayRef());
+  if (!timeParts || !registerParts || *timeParts <= 0 || *registerParts <= 0 ||
+      *registerParts > std::numeric_limits<int64_t>::max() / *timeParts)
+    return std::nullopt;
+
+  int64_t laneAxis = 0;
+  for (auto [axis, factor] :
+       llvm::zip(result.getAxisIds().asArrayRef(),
+                 result.getLayout().getLaneFactors().asArrayRef())) {
+    if (factor <= 1)
+      continue;
+    if (laneAxis != 0)
+      return std::nullopt;
+    laneAxis = axis;
+  }
+  if (laneAxis <= 0)
+    return std::nullopt;
+
+  llvm::SmallVector<int64_t> mapping;
+  llvm::SmallVector<llvm::SmallVector<int64_t>> supplyKeys;
+  const int64_t resultParts = *timeParts * *registerParts;
+  mapping.reserve(static_cast<size_t>(resultParts));
+  for (int64_t part = 0; part < resultParts; ++part) {
+    int64_t stream = part % *timeParts;
+    int64_t replica = part / *timeParts;
+    llvm::SmallVector<int64_t> timeCoordinates(result.getAxisIds().size(), 0);
+    llvm::SmallVector<int64_t> replicaCoordinates(result.getAxisIds().size(), 0);
+    for (int64_t position = static_cast<int64_t>(result.getAxisIds().size()) - 1;
+         position >= 0; --position) {
+      const int64_t time = result.getLayout().getTimeFactors()[position];
+      const int64_t copies = result.getLayout().getReplicaFactors()[position];
+      if (time <= 0 || copies <= 0)
+        return std::nullopt;
+      timeCoordinates[position] = stream % time;
+      stream /= time;
+      replicaCoordinates[position] = replica % copies;
+      replica /= copies;
+    }
+    if (stream != 0 || replica != 0)
+      return std::nullopt;
+
+    llvm::SmallVector<int64_t> key;
+    for (size_t position = 0; position < result.getAxisIds().size(); ++position) {
+      const int64_t axis = result.getAxisIds()[position];
+      if (!llvm::is_contained(packed.getAxisIds().asArrayRef(), axis))
+        continue;
+      key.push_back(replicaCoordinates[position]);
+      if (axis == laneAxis)
+        key.push_back(timeCoordinates[position]);
+    }
+    auto found = llvm::find(supplyKeys, key);
+    if (found == supplyKeys.end()) {
+      mapping.push_back(static_cast<int64_t>(supplyKeys.size()));
+      supplyKeys.push_back(std::move(key));
+    } else {
+      mapping.push_back(static_cast<int64_t>(found - supplyKeys.begin()));
+    }
+  }
+  if (supplyKeys.empty())
+    return std::nullopt;
+  return mapping;
+}
+
 namespace {
 
 mlir::LogicalResult verifyShape(
@@ -279,6 +358,8 @@ std::optional<int64_t> doubledPositive(int64_t value) {
   return value * 2;
 }
 
+int64_t localPackInterleaveRows(mlir::Value owner);
+
 bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
                                   mlir::Value rhs, int64_t reductionAxis,
                                   GroupedMacPlanAttr plan,
@@ -301,6 +382,10 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
   LoadOp rhsLoad = rhsField ? sourceLoad(rhsField.getOwner()) : LoadOp();
   auto lhsMemory = lhsLoad ? lhsLoad.getRegion().getType() : MemDescType();
   auto rhsMemory = rhsLoad ? rhsLoad.getRegion().getType() : MemDescType();
+  int64_t lhsInterleaveRows =
+      lhsField ? localPackInterleaveRows(lhsField.getOwner()) : 0;
+  if (lhsInterleaveRows <= 0 && lhsMemory)
+    lhsInterleaveRows = lhsMemory.getInterleaveRows();
   AccessAttr lhsAccess = lhsField ? lhsField.getAccess() : AccessAttr();
   AccessAttr rhsAccess = rhsField ? rhsField.getAccess() : AccessAttr();
   mlir::Value lhsPoint = sourcePoint(lhs, reductionAxis);
@@ -332,10 +417,9 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
       plan.getRhsBitOffsetBytes() != rhsAccess.getBitOffset() / 8 ||
       plan.getRecordElements() != lhsMemory.getElements() ||
       plan.getRecordElements() != rhsMemory.getElements() ||
-      plan.getInterleaveRows() != lhsMemory.getInterleaveRows() ||
+      plan.getInterleaveRows() != lhsInterleaveRows ||
       plan.getTermByteStride() !=
-          (lhsMemory.getInterleaveRows() > 0 ? lhsMemory.getInterleaveRows()
-                                             : 1))
+          (lhsInterleaveRows > 0 ? lhsInterleaveRows : 1))
     return false;
   int64_t laneAxis = 0;
   bool reductionLane = false;
@@ -358,7 +442,7 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
         hasCohortStride = true;
   const bool result =
       lhsMemory && ((plan.getLoadForm() == "unit" &&
-                     lhsMemory.getInterleaveRows() > 0) ||
+                     lhsInterleaveRows > 0) ||
                     (plan.getLoadForm() == "strided" && hasCohortStride &&
                      plan.getRowStrideAxis() == laneAxis));
   (void)reductionLane;
@@ -421,8 +505,31 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
             resultLayout.getLocalFactors()[resultPosition])
       return false;
   }
+  for (auto [position, axis] :
+       llvm::enumerate(rhsType.getAxisIds().asArrayRef())) {
+    if (axis == reductionAxis)
+      continue;
+    auto resultAxis = llvm::find(resultLayout.getAxisIds().asArrayRef(), axis);
+    if (resultAxis == resultLayout.getAxisIds().asArrayRef().end())
+      return false;
+    const size_t resultPosition = static_cast<size_t>(
+        resultAxis - resultLayout.getAxisIds().asArrayRef().begin());
+    auto rhsLayout = rhsType.getLayout();
+    if (rhsLayout.getTimeFactors()[position] !=
+            resultLayout.getTimeFactors()[resultPosition] ||
+        rhsLayout.getLaneFactors()[position] !=
+            resultLayout.getLaneFactors()[resultPosition] ||
+        rhsLayout.getReplicaFactors()[position] !=
+            resultLayout.getReplicaFactors()[resultPosition] ||
+        rhsLayout.getFragmentFactors()[position] !=
+            resultLayout.getFragmentFactors()[resultPosition] ||
+        rhsLayout.getLocalFactors()[position] !=
+            resultLayout.getLocalFactors()[resultPosition])
+      return false;
+  }
   for (int64_t axis : resultLayout.getAxisIds().asArrayRef())
-    if (!llvm::is_contained(lhsType.getAxisIds().asArrayRef(), axis))
+    if (!llvm::is_contained(lhsType.getAxisIds().asArrayRef(), axis) &&
+        !llvm::is_contained(rhsType.getAxisIds().asArrayRef(), axis))
       return false;
   return result && loadLayout.getAxisIds() == lhsType.getAxisIds() &&
          partialLayout.getAxisIds() == lhsType.getAxisIds() &&
@@ -3288,6 +3395,7 @@ mlir::LogicalResult EncodedLocalPackOp::verify() {
   ValueType result = getResult().getType();
   LocalType storage = getStorage().getType();
   LocalPackPlanAttr plan = getPlan();
+  LayoutAttr transfer = getTransferLayout();
   auto encoding = mlir::dyn_cast<kernel::EncodingType>(input.getElementType());
   auto row = getRowPoint().getType().getDomain();
   auto record = getRecordPoint().getType().getDomain();
@@ -3325,6 +3433,24 @@ mlir::LogicalResult EncodedLocalPackOp::verify() {
       expectedLocalBytes =
           checkedPositiveProduct({*records, plan.getRecordBytes()});
   }
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  const bool transferLayout =
+      kernel && transfer && transfer.getCarrier() == "rvv" &&
+      transfer.getAxisIds().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({plan.getRowAxis()}) &&
+      transfer.getTimeFactors().asArrayRef() == llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getLaneFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({plan.getInterleaveRows()}) &&
+      transfer.getReplicaFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getFragmentFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getLocalFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getSew() == 8 && transfer.getLmulEighths() == 8 &&
+      transfer.getVl() == plan.getInterleaveRows() &&
+      transfer.getRegisterGroups() == 1 &&
+      supportsRVVLayout(kernel.getTarget(), transfer);
   if (!encoding || encoding.getKind() != "base" ||
       !sameLogicalDomain(input, result) ||
       input.getElementType() != result.getElementType() ||
@@ -3340,10 +3466,11 @@ mlir::LogicalResult EncodedLocalPackOp::verify() {
       !rowExtent || !recordExtent || *rowExtent % plan.getInterleaveRows() ||
       *recordExtent % plan.getRecordElements() ||
       !getStorage().getDefiningOp<LocalAllocOp>() ||
+      !transferLayout ||
       !exactLeaf(getLeaf(), "transfer", "local-pack",
-                 "scalar.local-pack.interleave", "none", "exact") ||
+                 "rvv.local-pack.interleave", "none", "exact") ||
       getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
-      getLeaf().getTemporaryGroups() != 0 ||
+      getLeaf().getTemporaryGroups() != transfer.getRegisterGroups() ||
       getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
     return emitOpError(
         "encoded local pack requires one allocated, lifetime-owned interleaved record view");
@@ -3884,6 +4011,11 @@ mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
         "grouped MAC reduction result must have one or more RVV output parts");
   if (!getPlan() || getPlan().getKind() != "reduce")
     return emitOpError("grouped MAC reduction has invalid structural parameters");
+  auto supplyPlan = groupedMacSupplyProjection(lhs, getResult().getType());
+  if (!supplyPlan ||
+      getPackedSupplyForResult() != llvm::ArrayRef<int64_t>(*supplyPlan))
+    return emitOpError(
+        "grouped MAC reduction packed-supply mapping disagrees with its typed axes and layout");
   if (getPartialLayout().getCarrier() != "rvv" ||
       getPartialLayout().getSew() != 16)
     return emitOpError("grouped MAC reduction requires a 16-bit RVV partial layout");

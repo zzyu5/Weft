@@ -966,13 +966,39 @@ private:
               "encoded-interleave");
           auto allocation = rewriter.create<riscv::LocalAllocOp>(
               operation.getLoc(), storageType, allocationBytes);
+          auto kernel = operation->getParentOfType<riscv::KernelOp>();
+          const int64_t transferLmulEighths = 8;
+          const int64_t transferSew = 8;
+          const int64_t transferLanes = plan.getInterleaveRows();
+          auto transferLayout =
+              kernel
+                  ? riscv::LayoutAttr::get(
+                        rewriter.getContext(), "rvv",
+                        riscv_internal::integers(rewriter, {plan.getRowAxis()}),
+                        riscv_internal::integers(rewriter, {1}),
+                        riscv_internal::integers(rewriter, {transferLanes}),
+                        riscv_internal::integers(rewriter, {1}),
+                        riscv_internal::integers(rewriter, {1}),
+                        riscv_internal::integers(rewriter, {1}), transferSew,
+                        transferLmulEighths, transferLanes, 1, "tail")
+                  : riscv::LayoutAttr();
+          if (!kernel || transferLanes <= 0 ||
+              transferLanes > kernel.getTarget().getVlenBits() / transferSew ||
+              !riscv::supportsRVVLayout(kernel.getTarget(), transferLayout)) {
+            operation.emitError(
+                "encoded local pack has no legal one-vector row transfer");
+            failed = true;
+            continue;
+          }
           auto packed = rewriter.create<riscv::EncodedLocalPackOp>(
               operation.getLoc(), result, operation.getInput(),
               allocation.getResult(), rowPoint, recordPoint, plan,
+              transferLayout,
               riscv_internal::leaf(
                   rewriter, "transfer", "local-pack",
-                  "scalar.local-pack.interleave",
-                  "scalar.local-pack.interleave", 0, 0));
+                  "rvv.local-pack.interleave",
+                  "rvv.local-pack.interleave", 0, 0,
+                  transferLayout.getRegisterGroups()));
           copyIdentity(operation, allocation);
           copyIdentity(operation, packed);
           operation.getResult().replaceAllUsesWith(packed.getResult());
@@ -1294,6 +1320,13 @@ private:
       }
       mlir::Value lhs = mac.getLhs();
       mlir::Value rhs = mac.getRhs();
+      auto sourceLhsInteger = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(lhs.getType()));
+      auto sourceRhsInteger = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(rhs.getType()));
+      if (sourceLhsInteger && sourceRhsInteger &&
+          sourceLhsInteger.isSigned() && sourceRhsInteger.isUnsigned())
+        std::swap(lhs, rhs);
       riscv::AccessAttr lhsAccess = accessOf(lhs);
       riscv::AccessAttr rhsAccess = accessOf(rhs);
       auto resultType =
@@ -1349,6 +1382,15 @@ private:
                                       : riscv::LoadOp();
       auto lhsMemory = lhsLoad ? lhsLoad.getRegion().getType()
                                : riscv::MemDescType();
+      auto lhsEncoding = lhsField
+                             ? mlir::dyn_cast<kernel::EncodingType>(
+                                   riscv_internal::logicalElement(
+                                       lhsField.getOwner().getType()))
+                             : kernel::EncodingType();
+      const int64_t interleaveRows =
+          lhsField && lhsEncoding
+              ? riscv_internal::interleaveRows(lhsField, lhsEncoding)
+              : 0;
       mlir::Value lhsPoint = findOperandPoint(lhs, reductionAxis);
       mlir::Value rhsPoint = findOperandPoint(rhs, reductionAxis);
       mlir::Value point = lhsPoint ? lhsPoint : rhsPoint;
@@ -1383,6 +1425,7 @@ private:
                                      /*offsetAlignment=*/1)
                                : std::nullopt;
       const int64_t outputParts = resultParts(accumulatorType.getLayout());
+      auto supplyPlan = riscv::groupedMacSupplyProjection(lhsType, accumulatorType);
       const bool exactGeometry =
           lhsInteger.isUnsigned() && lhsInteger.getWidth() < 8 &&
           rhsInteger.isSigned() && rhsInteger.getWidth() == 8 && lhsField &&
@@ -1393,8 +1436,9 @@ private:
           storageWindow->getLayerSize() % mac.getGroup() == 0 &&
           lhsAccess.getBitOffset() % 8 == 0 &&
           rhsAccess.getBitOffset() % 8 == 0 &&
-          (lhsMemory.getInterleaveRows() > 0 || hasCohortStride) &&
+          (interleaveRows > 0 || hasCohortStride) &&
           outputParts > 0 &&
+          supplyPlan &&
           riscv::supportsRVVLayout(target, lhsLayout) &&
           riscv::supportsRVVLayout(target, loadLayout) &&
           riscv::supportsRVVLayout(target, partialLayout) &&
@@ -1417,6 +1461,7 @@ private:
             << (lhsMemory ? lhsMemory.getInterleaveRows() : -1)
             << ", result_parts="
             << (accumulatorType ? resultParts(accumulatorType.getLayout()) : -1)
+            << ", supply_plan=" << static_cast<bool>(supplyPlan)
             << ", partial_layout=" << partialLayout
             << ", accumulator_layout="
             << (accumulatorType ? accumulatorType.getLayout()
@@ -1455,16 +1500,16 @@ private:
         termOrder.reserve(static_cast<size_t>(terms));
         for (int64_t term = 0; term < terms; ++term)
           termOrder.push_back(term);
-        const bool unitLoad = lhsMemory.getInterleaveRows() > 0;
+        const bool unitLoad = interleaveRows > 0;
         return riscv::GroupedMacPlanAttr::get(
             rewriter.getContext(), kind, mac.getGroup(), schedule.getUnroll(),
             reductionAxis, storageWindow->getGroupSize(),
             storageWindow->getLayerSize(), storageWindow->getElementBits(),
             storageWindow->getByteOffset(),
             rhsAccess.getBitOffset() / 8, lhsMemory.getElements(),
-            lhsMemory.getInterleaveRows(), unitLoad ? "unit" : "strided",
+            interleaveRows, unitLoad ? "unit" : "strided",
             unitLoad ? 0 : laneAxis,
-            unitLoad ? lhsMemory.getInterleaveRows() : 1,
+            unitLoad ? interleaveRows : 1,
             storageWindow->getPhysicalLayerBase(),
             storageWindow->getPhysicalLayerStep(),
             storageWindow->getShiftBase(), storageWindow->getShiftStep(),
@@ -1489,7 +1534,9 @@ private:
         }
         auto grouped = rewriter.create<riscv::RVVGroupedMacReduceOp>(
             reduce.getLoc(), accumulatorType, lhs, rhs, active, loadLayout,
-            partialLayout, groupedPlan("reduce"),
+            partialLayout,
+            rewriter.getDenseI64ArrayAttr(*supplyPlan),
+            groupedPlan("reduce"),
             riscv_internal::leaf(
                 rewriter, "rvv", "grouped-mac-reduce",
                 "rvv.grouped-mac-reduce.u8-s8",

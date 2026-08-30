@@ -439,13 +439,33 @@ void constrainGroupedMac(riscv::MacGroupsOp operation, mlir::Value value,
   // direction.  Falling back to the final reduction axis is only valid for a
   // scalar-output vec-dot.  This is an axis relation, not a source-shape
   // matcher: canonical and derived encodings use the same rule.
-  int64_t lane =
-      freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs());
   int64_t groupedAxis = 0;
   auto lhsAxes = riscv_internal::logicalAxes(operation.getLhs().getType());
   auto rhsAxes = riscv_internal::logicalAxes(operation.getRhs().getType());
   if (!lhsAxes.empty() && !rhsAxes.empty() && lhsAxes.back() == rhsAxes.back())
     groupedAxis = lhsAxes.back();
+  auto integerOf = [](mlir::Value operand) {
+    return mlir::dyn_cast<mlir::IntegerType>(
+        riscv_internal::logicalElement(operand.getType()));
+  };
+  auto lhsInteger = integerOf(operation.getLhs());
+  auto rhsInteger = integerOf(operation.getRhs());
+  mlir::Value packedOperand;
+  if (lhsInteger && rhsInteger) {
+    if (lhsInteger.isUnsigned() && rhsInteger.isSigned())
+      packedOperand = operation.getLhs();
+    if (rhsInteger.isUnsigned() && lhsInteger.isSigned())
+      packedOperand = operation.getRhs();
+  }
+  int64_t lane = 0;
+  if (packedOperand)
+    for (int64_t axis : riscv_internal::logicalAxes(packedOperand.getType()))
+      if (axis != groupedAxis) {
+        lane = axis;
+        break;
+      }
+  if (!lane)
+    lane = freeAxisSharedByOneOperand(operation.getLhs(), operation.getRhs());
   if (!lane) {
     lane = groupedAxis;
   }

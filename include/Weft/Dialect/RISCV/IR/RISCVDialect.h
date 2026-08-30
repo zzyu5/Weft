@@ -9,6 +9,9 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <optional>
 
 #include "Weft/Dialect/RISCV/IR/RISCVOpsDialect.h.inc"
 
@@ -26,6 +29,12 @@ namespace weft::riscv {
 /// Returns whether an RVV layout is executable under the complete target
 /// register contract, including the ELEN-dependent fractional-LMUL bound.
 bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
+
+/// Projects every result part onto the packed operand address identity used by
+/// grouped MAC. Equal entries denote one typed packed supply shared by those
+/// result consumers.
+std::optional<llvm::SmallVector<int64_t>>
+groupedMacSupplyProjection(ValueType packed, ValueType result);
 
 } // namespace weft::riscv
 

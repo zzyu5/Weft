@@ -1020,6 +1020,7 @@ def WeftRISCV_EncodedLocalPackOp
                        WeftRISCV_PointType:$row_point,
                        WeftRISCV_PointType:$record_point,
                        WeftRISCV_LocalPackPlanAttr:$plan,
+                       WeftRISCV_LayoutAttr:$transfer_layout,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
@@ -1115,6 +1116,7 @@ def WeftRISCV_RVVGroupedMacReduceOp
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
                        WeftRISCV_LayoutAttr:$load_layout,
                        WeftRISCV_LayoutAttr:$partial_layout,
+                       DenseI64ArrayAttr:$packed_supply_for_result,
                        WeftRISCV_GroupedMacPlanAttr:$plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);

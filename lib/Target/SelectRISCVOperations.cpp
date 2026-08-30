@@ -260,8 +260,13 @@ private:
       auto target = operation->getParentOfType<riscv::KernelOp>().getTarget();
       if (!supportsRVVOperation(operation))
         return {};
-      if (isUnsigned(op.getLhs().getType()) && isSigned(op.getRhs().getType()) &&
-          width(op.getLhs().getType()) <= 8 && width(op.getRhs().getType()) <= 8 &&
+      const bool mixedUnsignedSigned =
+          (isUnsigned(op.getLhs().getType()) &&
+           isSigned(op.getRhs().getType())) ||
+          (isSigned(op.getLhs().getType()) &&
+           isUnsigned(op.getRhs().getType()));
+      if (mixedUnsignedSigned && width(op.getLhs().getType()) <= 8 &&
+          width(op.getRhs().getType()) <= 8 &&
           target.getHasWideningInteger())
         return rvvImplementation(
             builder, "grouped-mac", "rvv.vwmaccsu.typed",
