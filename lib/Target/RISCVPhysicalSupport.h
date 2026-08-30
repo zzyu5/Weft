@@ -43,6 +43,14 @@ struct WidenDotLaneSlicePlan {
   llvm::SmallVector<int64_t> parts;
 };
 
+struct IndexedEntryRelation {
+  mlir::Value entryIndices;
+  int64_t payloadAxis = 0;
+  int64_t payloadExtent = 0;
+  int64_t entryStride = 0;
+  int64_t indexDivisor = 1;
+};
+
 mlir::DenseI64ArrayAttr integers(mlir::Builder &builder,
                                  llvm::ArrayRef<int64_t> values);
 mlir::ArrayAttr strings(mlir::Builder &builder,
@@ -111,6 +119,10 @@ std::optional<WidenDotLaneSlicePlan>
 planWidenDotLaneSlices(riscv::ValueType operand, riscv::ValueType result,
                        llvm::ArrayRef<int64_t> reductionAxes,
                        riscv::TargetAttr target);
+std::optional<IndexedEntryRelation>
+analyzeIndexedEntryRelation(mlir::Value fullIndices, riscv::ValueType result,
+                            llvm::ArrayRef<int64_t> retainedAxes,
+                            llvm::ArrayRef<int64_t> retainedShape);
 std::string printType(mlir::Type type);
 
 riscv::EncodingDeclOp findEncoding(mlir::Operation *operation,
@@ -122,6 +134,8 @@ int64_t interleaveRows(mlir::Operation *operation,
 FieldFacts fieldFacts(riscv::FieldOp operation);
 
 std::optional<int64_t> constantInt(mlir::Value value);
+bool knownMultipleOf(mlir::Value value, int64_t divisor,
+                     unsigned depth = 0);
 std::optional<IntegerRange> integerRange(mlir::Value value,
                                          unsigned depth = 0);
 std::optional<int64_t> maximumMagnitude(mlir::Value value);

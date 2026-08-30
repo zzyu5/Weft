@@ -1113,6 +1113,151 @@ mlir::Value riscv_internal::stripRepresentationConversions(
   return value;
 }
 
+bool riscv_internal::knownMultipleOf(mlir::Value value, int64_t divisor,
+                                     unsigned depth) {
+  if (divisor <= 0 || depth > 24)
+    return false;
+  if (auto constant = riscv_internal::constantInt(value))
+    return *constant % divisor == 0;
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    return riscv_internal::knownMultipleOf(conversion.getInput(), divisor,
+                                           depth + 1);
+  if (auto cast = value.getDefiningOp<riscv::CastOp>())
+    return riscv_internal::knownMultipleOf(cast.getInput(), divisor, depth + 1);
+  if (auto widen = value.getDefiningOp<riscv::WidenOp>())
+    return riscv_internal::knownMultipleOf(widen.getInput(), divisor,
+                                           depth + 1);
+  auto binary = value.getDefiningOp<riscv::BinaryOp>();
+  if (!binary)
+    return false;
+  if (binary.getKind() == "add" || binary.getKind() == "sub")
+    return riscv_internal::knownMultipleOf(binary.getLhs(), divisor,
+                                           depth + 1) &&
+           riscv_internal::knownMultipleOf(binary.getRhs(), divisor,
+                                           depth + 1);
+  if (binary.getKind() != "mul")
+    return false;
+  if (auto lhs = riscv_internal::constantInt(binary.getLhs());
+      lhs && *lhs % divisor == 0)
+    return true;
+  if (auto rhs = riscv_internal::constantInt(binary.getRhs());
+      rhs && *rhs % divisor == 0)
+    return true;
+  return riscv_internal::knownMultipleOf(binary.getLhs(), divisor, depth + 1) ||
+         riscv_internal::knownMultipleOf(binary.getRhs(), divisor, depth + 1);
+}
+
+namespace {
+
+mlir::Value stripIndexWidthConversions(mlir::Value value) {
+  while (true) {
+    if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
+      value = conversion.getInput();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+      value = cast.getInput();
+      continue;
+    }
+    if (auto widen = value.getDefiningOp<riscv::WidenOp>()) {
+      value = widen.getInput();
+      continue;
+    }
+    return value;
+  }
+}
+
+} // namespace
+
+std::optional<riscv_internal::IndexedEntryRelation>
+riscv_internal::analyzeIndexedEntryRelation(
+    mlir::Value fullIndices, riscv::ValueType result,
+    llvm::ArrayRef<int64_t> retainedAxes,
+    llvm::ArrayRef<int64_t> retainedShape) {
+  auto indices = mlir::dyn_cast<riscv::ValueType>(fullIndices.getType());
+  auto resultAxes = result.getAxisIds().asArrayRef();
+  auto resultShape = result.getShape().asArrayRef();
+  if (!indices || retainedAxes.size() != retainedShape.size() ||
+      resultAxes.size() != retainedAxes.size() + indices.getAxisIds().size() ||
+      resultShape.size() != retainedShape.size() + indices.getShape().size() ||
+      !llvm::equal(retainedAxes, resultAxes.take_front(retainedAxes.size())) ||
+      !llvm::equal(retainedShape, resultShape.take_front(retainedShape.size())) ||
+      !llvm::equal(indices.getAxisIds().asArrayRef(),
+                   resultAxes.drop_front(retainedAxes.size())) ||
+      !llvm::equal(indices.getShape().asArrayRef(),
+                   resultShape.drop_front(retainedShape.size())))
+    return std::nullopt;
+
+  mlir::Value indexValue = stripRepresentationConversions(fullIndices);
+  auto add = indexValue.getDefiningOp<riscv::BinaryOp>();
+  if (!add || add.getKind() != "add")
+    return std::nullopt;
+  auto match = [&](mlir::Value entryTerm,
+                   mlir::Value payloadTerm)
+      -> std::optional<IndexedEntryRelation> {
+    auto stripAxisBroadcast = [](mlir::Value value) {
+      while (auto broadcast =
+                 value.getDefiningOp<riscv::RVVAxisBroadcastOp>())
+        value = broadcast.getInput();
+      return value;
+    };
+    mlir::Value payloadSource =
+        stripIndexWidthConversions(stripAxisBroadcast(payloadTerm));
+    auto payloadIota = payloadSource.getDefiningOp<riscv::IotaOp>();
+    auto payloadType = payloadIota
+                           ? mlir::dyn_cast<riscv::ValueType>(
+                                 payloadIota.getResult().getType())
+                           : riscv::ValueType();
+    if (!payloadIota || !payloadType || payloadType.getAxisIds().size() != 1 ||
+        payloadIota.getStart() != 0 ||
+        payloadIota.getEnd() !=
+            static_cast<uint64_t>(payloadType.getShape()[0]) ||
+        payloadType.getShape()[0] <= 0)
+      return std::nullopt;
+    const int64_t payloadAxis = payloadType.getAxisIds()[0];
+    const int64_t payloadExtent = payloadType.getShape()[0];
+    if (resultAxes.empty() || resultAxes.back() != payloadAxis ||
+        resultShape.back() != payloadExtent)
+      return std::nullopt;
+
+    mlir::Value scaledEntry =
+        stripRepresentationConversions(stripAxisBroadcast(entryTerm));
+    auto multiply = scaledEntry.getDefiningOp<riscv::BinaryOp>();
+    mlir::Value entryIndices;
+    std::optional<int64_t> stride;
+    int64_t indexDivisor = 1;
+    if (multiply && multiply.getKind() == "mul") {
+      if ((stride = constantInt(multiply.getRhs())))
+        entryIndices = multiply.getLhs();
+      else if ((stride = constantInt(multiply.getLhs())))
+        entryIndices = multiply.getRhs();
+    }
+    if (!entryIndices || !stride || *stride < payloadExtent) {
+      if (!riscv_internal::knownMultipleOf(scaledEntry, payloadExtent))
+        return std::nullopt;
+      entryIndices = scaledEntry;
+      stride = payloadExtent;
+      indexDivisor = payloadExtent;
+    }
+    entryIndices = stripRepresentationConversions(entryIndices);
+    auto entryType = mlir::dyn_cast<riscv::ValueType>(entryIndices.getType());
+    if (!entryType ||
+        (entryType.getLayout().getCarrier() != "scalar" &&
+         entryType.getLayout().getCarrier() != "rvv") ||
+        indices.getAxisIds().size() != entryType.getAxisIds().size() + 1 ||
+        !llvm::equal(entryType.getAxisIds().asArrayRef(),
+                     indices.getAxisIds().asArrayRef().drop_back()) ||
+        !llvm::equal(entryType.getShape().asArrayRef(),
+                     indices.getShape().asArrayRef().drop_back()))
+      return std::nullopt;
+    return IndexedEntryRelation{entryIndices, payloadAxis, payloadExtent,
+                                *stride, indexDivisor};
+  };
+  if (auto relation = match(add.getLhs(), add.getRhs()))
+    return relation;
+  return match(add.getRhs(), add.getLhs());
+}
+
 std::optional<riscv_internal::IntegerRange>
 riscv_internal::integerRange(mlir::Value value, unsigned depth) {
   if (depth > 16)

@@ -63,6 +63,14 @@ struct VectorReplicaGatherPlan {
   llvm::SmallVector<int64_t> indexParts;
 };
 
+struct UnitEntryWindowPlan {
+  mlir::Value base;
+  int64_t entryAxis = 0;
+  int64_t entryExtent = 0;
+};
+
+using IndexedEntryLoadPlan = riscv_internal::IndexedEntryRelation;
+
 std::optional<int64_t> positiveProduct(llvm::ArrayRef<int64_t> values) {
   int64_t product = 1;
   for (int64_t value : values) {
@@ -136,6 +144,83 @@ std::optional<int64_t> constantInteger(mlir::Value value) {
   return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
 }
 
+mlir::FailureOr<mlir::Value>
+materializeEntryIndices(const IndexedEntryLoadPlan &plan,
+                        mlir::Operation *origin, riscv::ValueType result,
+                        mlir::IRRewriter &rewriter) {
+  auto type = mlir::dyn_cast<riscv::ValueType>(plan.entryIndices.getType());
+  if (!type)
+    return origin->emitError(
+               "indexed entry relation has no shaped scalar index type"),
+           mlir::failure();
+  mlir::Value entryIndices = plan.entryIndices;
+  if (plan.indexDivisor != 1) {
+    mlir::TypedAttr divisor;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type.getElementType()))
+      divisor = rewriter.getIntegerAttr(integer, plan.indexDivisor);
+    else if (type.getElementType().isIndex())
+      divisor = rewriter.getIndexAttr(plan.indexDivisor);
+    if (!divisor)
+      return origin->emitError(
+                 "indexed entry relation has no integer divisor type"),
+             mlir::failure();
+    auto constant = rewriter.create<riscv::ConstantOp>(
+        origin->getLoc(), type.getElementType(), divisor);
+    auto divided = rewriter.create<riscv::BinaryOp>(
+        origin->getLoc(), type, entryIndices, constant.getResult(), "div",
+        riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, divided);
+    entryIndices = divided.getResult();
+  }
+
+  auto kernel = origin->getParentOfType<riscv::KernelOp>();
+  auto required = riscv_internal::projectLayout(
+      rewriter, type, result.getLayout(), kernel.getTarget());
+  if (!required)
+    return origin->emitError(
+               "indexed entry relation has no legal entry-axis projection"),
+           mlir::failure();
+  mlir::Type requiredType = riscv_internal::withLayout(type, required);
+  if (entryIndices.getType() == requiredType)
+    return entryIndices;
+  auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
+      origin->getLoc(), requiredType, entryIndices,
+      riscv_internal::layoutConversion(rewriter, type.getLayout(), required),
+      riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+  riscv_internal::copyOrigin(origin, conversion);
+  return conversion.getResult();
+}
+
+bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
+                              riscv::ValueType entryIndices,
+                              riscv::ValueType result, int64_t alignment,
+                              int64_t bitOffset) {
+  if (entryIndices.getLayout().getCarrier() != "rvv")
+    return true;
+  auto index = mlir::dyn_cast<mlir::IntegerType>(entryIndices.getElementType());
+  const unsigned payloadBits =
+      riscv_internal::logicalBitWidth(result.getElementType());
+  auto resultAxes = result.getAxisIds().asArrayRef();
+  auto payload = llvm::find(resultAxes, plan.payloadAxis);
+  if (payload == resultAxes.end())
+    return false;
+  const size_t payloadPosition =
+      static_cast<size_t>(payload - resultAxes.begin());
+  auto layout = result.getLayout();
+  return index && !index.isSigned() &&
+         (index.getWidth() == 16 || index.getWidth() == 32 ||
+          index.getWidth() == 64) &&
+         payloadBits > 0 && plan.payloadExtent > 0 &&
+         payloadBits * static_cast<uint64_t>(plan.payloadExtent) == 64 &&
+         plan.entryStride == plan.payloadExtent && bitOffset % 64 == 0 &&
+         alignment >= 8 &&
+         layout.getTimeFactors()[payloadPosition] == 1 &&
+         layout.getLaneFactors()[payloadPosition] == plan.payloadExtent &&
+         layout.getReplicaFactors()[payloadPosition] == 1 &&
+         layout.getFragmentFactors()[payloadPosition] == 1 &&
+         layout.getLocalFactors()[payloadPosition] == 1;
+}
+
 bool isSingleScalarCoordinate(mlir::Value value) {
   if (mlir::isa<mlir::IntegerType, mlir::IndexType>(value.getType()))
     return true;
@@ -153,6 +238,170 @@ bool isSingleScalarCoordinate(mlir::Value value) {
   return layout.getCarrier() == "scalar" && time && *time == 1 && lanes &&
          *lanes == 1 && replicas && *replicas == 1 && fragments &&
          *fragments == 1 && local && *local == 1;
+}
+
+mlir::Value stripEntryIndexConversions(mlir::Value value) {
+  while (true) {
+    if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
+      value = conversion.getInput();
+      continue;
+    }
+    if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+      value = cast.getInput();
+      continue;
+    }
+    if (auto narrow = value.getDefiningOp<riscv::NarrowOp>()) {
+      value = narrow.getInput();
+      continue;
+    }
+    if (auto widen = value.getDefiningOp<riscv::WidenOp>()) {
+      value = widen.getInput();
+      continue;
+    }
+    return value;
+  }
+}
+
+bool isScaledEntryIota(mlir::Value value, int64_t scale, int64_t axis,
+                       int64_t extent) {
+  value = stripEntryIndexConversions(value);
+  mlir::Value iotaValue = value;
+  if (scale != 1) {
+    auto multiply = value.getDefiningOp<riscv::BinaryOp>();
+    if (!multiply || multiply.getKind() != "mul")
+      return false;
+    if (auto rhs = constantInteger(multiply.getRhs()); rhs && *rhs == scale)
+      iotaValue = multiply.getLhs();
+    else if (auto lhs = constantInteger(multiply.getLhs());
+             lhs && *lhs == scale)
+      iotaValue = multiply.getRhs();
+    else
+      return false;
+  }
+  iotaValue = stripEntryIndexConversions(iotaValue);
+  auto iota = iotaValue.getDefiningOp<riscv::IotaOp>();
+  auto type = iota
+                  ? mlir::dyn_cast<riscv::ValueType>(iota.getResult().getType())
+                  : riscv::ValueType();
+  return iota && type && type.getAxisIds().size() == 1 &&
+         type.getAxisIds()[0] == axis && type.getShape()[0] == extent &&
+         iota.getStart() == 0 &&
+         iota.getEnd() == static_cast<uint64_t>(extent);
+}
+
+std::optional<UnitEntryWindowPlan>
+materializeUnitEntryWindowBase(mlir::Value entryIndices,
+                               riscv::ValueType result, int64_t payloadAxis,
+                               int64_t payloadExtent, int64_t entryStride,
+                               mlir::Operation *origin,
+                               mlir::IRRewriter &rewriter) {
+  auto entryType = mlir::dyn_cast<riscv::ValueType>(entryIndices.getType());
+  auto resultAxes = result.getAxisIds().asArrayRef();
+  auto resultShape = result.getShape().asArrayRef();
+  if (!entryType || entryType.getAxisIds().size() != 1 ||
+      entryType.getShape().size() != 1 || entryType.getShape()[0] <= 1 ||
+      entryStride != payloadExtent || resultAxes.size() < 2 ||
+      resultAxes[resultAxes.size() - 2] != entryType.getAxisIds()[0] ||
+      resultAxes.back() != payloadAxis ||
+      resultShape[resultShape.size() - 2] != entryType.getShape()[0] ||
+      resultShape.back() != payloadExtent)
+    return std::nullopt;
+  const int64_t entryAxis = entryType.getAxisIds()[0];
+  const int64_t entryExtent = entryType.getShape()[0];
+
+  mlir::Value expression =
+      riscv_internal::stripRepresentationConversions(entryIndices);
+  int64_t divisor = 1;
+  if (auto division = expression.getDefiningOp<riscv::BinaryOp>();
+      division && division.getKind() == "div") {
+    auto constant = constantInteger(division.getRhs());
+    if (!constant || *constant <= 0)
+      return std::nullopt;
+    divisor = *constant;
+    expression = division.getLhs();
+  }
+  mlir::Value scalarBase;
+  mlir::Value laneOffsets;
+  auto addition = expression.getDefiningOp<riscv::BinaryOp>();
+  if (addition && addition.getKind() == "add" &&
+      isSingleScalarCoordinate(addition.getLhs())) {
+    scalarBase = addition.getLhs();
+    laneOffsets = addition.getRhs();
+  } else if (addition && addition.getKind() == "add" &&
+             isSingleScalarCoordinate(addition.getRhs())) {
+    scalarBase = addition.getRhs();
+    laneOffsets = addition.getLhs();
+  } else if (isScaledEntryIota(expression, divisor, entryAxis, entryExtent)) {
+    mlir::Type element = entryType.getElementType();
+    mlir::TypedAttr zero;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element))
+      zero = rewriter.getIntegerAttr(integer, 0);
+    else if (element.isIndex())
+      zero = rewriter.getIndexAttr(0);
+    if (!zero)
+      return std::nullopt;
+    auto constant = rewriter.create<riscv::ConstantOp>(origin->getLoc(), element,
+                                                        zero);
+    riscv_internal::copyOrigin(origin, constant);
+    scalarBase = constant.getResult();
+    laneOffsets = expression;
+  } else {
+    return std::nullopt;
+  }
+  if (!isScaledEntryIota(laneOffsets, divisor, entryAxis, entryExtent) ||
+      !riscv_internal::knownMultipleOf(scalarBase, divisor))
+    return std::nullopt;
+  if (divisor != 1) {
+    mlir::Type type = scalarBase.getType();
+    mlir::TypedAttr divisorValue;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+      divisorValue = rewriter.getIntegerAttr(integer, divisor);
+    else if (type.isIndex())
+      divisorValue = rewriter.getIndexAttr(divisor);
+    if (!divisorValue)
+      return std::nullopt;
+    auto constant = rewriter.create<riscv::ConstantOp>(
+        origin->getLoc(), type, divisorValue);
+    auto divided = rewriter.create<riscv::BinaryOp>(
+        origin->getLoc(), type, scalarBase, constant.getResult(), "div",
+        riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, divided);
+    scalarBase = divided.getResult();
+  }
+  return UnitEntryWindowPlan{scalarBase, entryAxis, entryExtent};
+}
+
+bool supportsUnitEntryWindowLayout(riscv::ValueType result,
+                                   size_t retainedAxes, int64_t entryAxis,
+                                   int64_t entryExtent, int64_t payloadAxis,
+                                   int64_t payloadExtent) {
+  auto axes = result.getAxisIds().asArrayRef();
+  auto shape = result.getShape().asArrayRef();
+  if (result.getLayout().getCarrier() != "rvv" ||
+      axes.size() != retainedAxes + 2 || shape.size() != axes.size() ||
+      axes[retainedAxes] != entryAxis ||
+      shape[retainedAxes] != entryExtent ||
+      axes[retainedAxes + 1] != payloadAxis ||
+      shape[retainedAxes + 1] != payloadExtent)
+    return false;
+  auto layout = result.getLayout();
+  for (size_t position = 0; position < retainedAxes; ++position)
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return false;
+  const int64_t extents[] = {entryExtent, payloadExtent};
+  for (size_t offset = 0; offset < 2; ++offset) {
+    const size_t position = retainedAxes + offset;
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != extents[offset] ||
+        layout.getReplicaFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return false;
+  }
+  return true;
 }
 
 bool combineReplicaAffine(ReplicaAffineIndex &result,
@@ -950,6 +1199,117 @@ public:
           builder, "extract", ("rvv.extract." + form).str()));
     });
 
+    llvm::SmallVector<riscv::ExtractOp> entryExtracts;
+    getOperation().walk(
+        [&](riscv::ExtractOp extract) { entryExtracts.push_back(extract); });
+    for (riscv::ExtractOp extract : entryExtracts) {
+      auto source = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
+      auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+      if (!source || !result || source.getLayout().getCarrier() != "local" ||
+          extract.getSelectors().size() != source.getAxisIds().size())
+        continue;
+      size_t indexCursor = 0;
+      size_t gatherDimension = source.getAxisIds().size();
+      mlir::Value gatherIndex;
+      bool onlyRetainOrGather = true;
+      for (auto [dimension, selectorAttribute] :
+           llvm::enumerate(extract.getSelectors())) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (selector != "gather" || gatherIndex ||
+            indexCursor >= extract.getIndices().size()) {
+          onlyRetainOrGather = false;
+          break;
+        }
+        gatherDimension = dimension;
+        gatherIndex = extract.getIndices()[indexCursor++];
+      }
+      if (!onlyRetainOrGather || !gatherIndex ||
+          indexCursor != extract.getIndices().size())
+        continue;
+      llvm::SmallVector<int64_t> retainedAxes;
+      llvm::SmallVector<int64_t> retainedShape;
+      for (size_t position = 0; position < source.getAxisIds().size(); ++position) {
+        if (position == gatherDimension)
+          continue;
+        retainedAxes.push_back(source.getAxisIds()[position]);
+        retainedShape.push_back(source.getShape()[position]);
+      }
+      auto plan = riscv_internal::analyzeIndexedEntryRelation(
+          gatherIndex, result, retainedAxes, retainedShape);
+      if (!plan)
+        continue;
+      rewriter.setInsertionPoint(extract);
+      auto entryIndices =
+          materializeEntryIndices(*plan, extract, result, rewriter);
+      if (mlir::failed(entryIndices)) {
+        failed = true;
+        continue;
+      }
+      auto unitWindow = materializeUnitEntryWindowBase(
+          *entryIndices, result, plan->payloadAxis, plan->payloadExtent,
+          plan->entryStride, extract, rewriter);
+      auto sourceField = extract.getInput().getDefiningOp<riscv::FieldOp>();
+      const size_t retainedAxisCount = source.getAxisIds().size() - 1;
+      if (unitWindow && sourceField &&
+          supportsUnitEntryWindowLayout(
+              result, retainedAxisCount, unitWindow->entryAxis,
+              unitWindow->entryExtent, plan->payloadAxis,
+              plan->payloadExtent)) {
+        auto window = rewriter.create<riscv::RVVUnitEntryWindowLoadOp>(
+            extract.getLoc(), result, extract.getInput(), unitWindow->base,
+            source.getAxisIds()[gatherDimension], unitWindow->entryAxis,
+            unitWindow->entryExtent, plan->payloadAxis, plan->payloadExtent,
+            plan->entryStride, makeAccess(builder, "unit", "natural", 1),
+            riscv_internal::leaf(
+                builder, "rvv", "unit-entry-window-load",
+                "rvv.unit-entry-window-load", "rvv.unit-entry-window-load", 0,
+                result.getLayout().getRegisterGroups()));
+        riscv_internal::copyOrigin(extract, window);
+        mlir::Value fullIndices = gatherIndex;
+        extract.getResult().replaceAllUsesWith(window.getResult());
+        rewriter.eraseOp(extract);
+        llvm::DenseSet<mlir::Operation *> visited;
+        eraseDeadRegularIndexChain(fullIndices, visited, rewriter);
+        continue;
+      }
+      auto entryType =
+          mlir::cast<riscv::ValueType>((*entryIndices).getType());
+      const auto sourceFacts =
+          sourceField ? riscv_internal::fieldFacts(sourceField)
+                      : riscv_internal::FieldFacts();
+      if (!supportsIndexedEntryLoad(*plan, entryType, result,
+                                    sourceFacts.alignment,
+                                    sourceFacts.bitOffset)) {
+        llvm::DenseSet<mlir::Operation *> visited;
+        eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
+        continue;
+      }
+      const bool vectorEntries =
+          entryType.getLayout().getCarrier() == "rvv";
+      auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
+          extract.getLoc(), result, extract.getInput(), *entryIndices,
+          source.getAxisIds()[gatherDimension], plan->payloadAxis,
+          plan->payloadExtent, plan->entryStride,
+          makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
+          riscv_internal::leaf(
+              builder, "rvv",
+              vectorEntries ? "indexed-entry-gather" : "indexed-entry-load",
+              vectorEntries ? "rvv.indexed-entry-gather"
+                            : "rvv.indexed-entry-load",
+              vectorEntries ? "rvv.indexed-entry-gather"
+                            : "rvv.indexed-entry-load",
+              0, 0));
+      riscv_internal::copyOrigin(extract, entryLoad);
+      mlir::Value fullIndices = gatherIndex;
+      extract.getResult().replaceAllUsesWith(entryLoad.getResult());
+      rewriter.eraseOp(extract);
+      llvm::DenseSet<mlir::Operation *> visited;
+      eraseDeadRegularIndexChain(fullIndices, visited, rewriter);
+    }
+
     llvm::SmallVector<RegularGatherCandidate> regularCandidates;
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(
@@ -1279,6 +1639,61 @@ public:
       operation.setLeafAttr(
           transferLeaf(builder, "local-update", "local.update"));
     });
+    llvm::SmallVector<riscv::LookupOp> entryLookups;
+    getOperation().walk(
+        [&](riscv::LookupOp operation) { entryLookups.push_back(operation); });
+    for (riscv::LookupOp operation : entryLookups) {
+      auto table = mlir::dyn_cast<riscv::MemDescType>(
+          operation.getTable().getType());
+      auto resultType =
+          mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+      auto plan = table && resultType
+                      ? riscv_internal::analyzeIndexedEntryRelation(
+                            operation.getIndices(), resultType, {}, {})
+                      : std::optional<IndexedEntryLoadPlan>();
+      if (!plan)
+        continue;
+      if (table.getAxisIds().size() != 1)
+        continue;
+      mlir::Value fullIndices = operation.getIndices();
+      rewriter.setInsertionPoint(operation);
+      auto entryIndices =
+          materializeEntryIndices(*plan, operation, resultType, rewriter);
+      if (mlir::failed(entryIndices)) {
+        failed = true;
+        continue;
+      }
+      auto entryType =
+          mlir::cast<riscv::ValueType>((*entryIndices).getType());
+      if (!supportsIndexedEntryLoad(*plan, entryType, resultType,
+                                    table.getAlignment(), 0)) {
+        llvm::DenseSet<mlir::Operation *> visited;
+        eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
+        continue;
+      }
+      const bool vectorEntries =
+          entryType.getLayout().getCarrier() == "rvv";
+      auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
+          operation.getLoc(), resultType, operation.getTable(),
+          *entryIndices, table.getAxisIds()[0], plan->payloadAxis,
+          plan->payloadExtent,
+          plan->entryStride,
+          makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
+          riscv_internal::leaf(
+              builder, "rvv",
+              vectorEntries ? "indexed-entry-gather" : "indexed-entry-load",
+              vectorEntries ? "rvv.indexed-entry-gather"
+                            : "rvv.indexed-entry-load",
+              vectorEntries ? "rvv.indexed-entry-gather"
+                            : "rvv.indexed-entry-load",
+              0, 0));
+      riscv_internal::copyOrigin(operation, entryLoad);
+      operation.getResult().replaceAllUsesWith(entryLoad.getResult());
+      rewriter.eraseOp(operation);
+      llvm::DenseSet<mlir::Operation *> visited;
+      eraseDeadRegularIndexChain(fullIndices, visited, rewriter);
+    }
+
     getOperation().walk([&](riscv::LookupOp operation) {
       // An unmaterialized admitted table remains an addressable memory edge.
       // Explicit materialize carries cross-use lifetime, so its selected RVV

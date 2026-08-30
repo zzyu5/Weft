@@ -609,6 +609,10 @@ private:
   mlir::LogicalResult compileReduce(riscv::ReduceOp operation);
   mlir::LogicalResult compileFold2(riscv::Fold2Op operation);
   mlir::LogicalResult compileLookup(riscv::LookupOp operation);
+  mlir::LogicalResult compileRVVIndexedEntryLoad(
+      riscv::RVVIndexedEntryLoadOp operation);
+  mlir::LogicalResult compileRVVUnitEntryWindowLoad(
+      riscv::RVVUnitEntryWindowLoadOp operation);
   mlir::LogicalResult compileBinary(riscv::BinaryOp operation);
   mlir::LogicalResult compileCommit(riscv::StoreOp operation);
   mlir::LogicalResult compileRVVSplat(riscv::RVVSplatOp operation);
@@ -2387,6 +2391,12 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVStreamContract(contract);
   if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(operation))
     return compileLookup(lookup);
+  if (auto entryLoad =
+          mlir::dyn_cast<riscv::RVVIndexedEntryLoadOp>(operation))
+    return compileRVVIndexedEntryLoad(entryLoad);
+  if (auto window =
+          mlir::dyn_cast<riscv::RVVUnitEntryWindowLoadOp>(operation))
+    return compileRVVUnitEntryWindowLoad(window);
   if (auto splat = mlir::dyn_cast<riscv::RVVSplatOp>(operation))
     return compileRVVSplat(splat);
   if (auto projected =
@@ -5232,6 +5242,263 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
     folded.parts.push_back(std::move(sum));
   }
   bindings[operation.getResult()] = std::move(folded);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
+    riscv::RVVIndexedEntryLoadOp operation) {
+  Binding entries = bindings.lookup(operation.getEntryIndices());
+  auto materializedEntries =
+      materializeNumeric(operation.getEntryIndices(), entries);
+  if (mlir::failed(materializedEntries))
+    return mlir::failure();
+  entries = std::move(*materializedEntries);
+  if (entries.kind != Binding::Kind::Scalar &&
+      entries.kind != Binding::Kind::ScalarTuple &&
+      entries.kind != Binding::Kind::Vector)
+    return fail(operation,
+                "indexed entry load requires scalar, replica-tuple, or RVV entry indices");
+
+  mlir::Type element = operation.getResult().getType().getElementType();
+  auto cType = scalarCType(element);
+  const unsigned elementBits = riscv_internal::logicalBitWidth(element);
+  if (!cType || !elementBits || elementBits % 8)
+    return fail(operation,
+                "indexed entry load requires a byte-addressable payload element");
+
+  Binding source = bindings.lookup(operation.getSource());
+  std::optional<std::string> descriptorBase;
+  Binding record;
+  std::optional<EncodingField> field;
+  if (source.kind == Binding::Kind::Slice) {
+    auto address = denseAddress(source.slice, {});
+    if (address)
+      descriptorBase = "((const " + *cType + " *)(" + *address + "))";
+  } else if (source.kind == Binding::Kind::Memory) {
+    descriptorBase =
+        "((const " + *cType + " *)(" + source.memory.name + "))";
+  } else if (source.kind == Binding::Kind::Field) {
+    source.field.useAccess = operation.getAccess();
+    record = bindings.lookup(source.field.owner);
+    if (record.kind == Binding::Kind::Slice) {
+      auto materializedRecord = recordForSlice(source.field.owner);
+      if (mlir::failed(materializedRecord))
+        return mlir::failure();
+      record = std::move(*materializedRecord);
+    }
+    field = fieldFor(source);
+  } else {
+    return fail(operation,
+                "indexed entry load source has no dense descriptor or encoded field binding");
+  }
+  if (!descriptorBase &&
+      (record.kind != Binding::Kind::Record || !field ||
+       field->access.getMapping() != "natural" || field->bitOffset % 8 ||
+       record.recordAxis != operation.getSourceAxis()))
+    return fail(operation,
+                "indexed entry load field has no byte-aligned record-axis mapping");
+
+  const std::string resultType = vectorType(operation.getResult());
+  const std::string resultSuffix = vectorSuffix(operation.getResult());
+  const int64_t parts = vectorPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    std::optional<std::string> entry;
+    if (entries.kind == Binding::Kind::Scalar) {
+      entry = entries.scalar;
+    } else if (entries.kind == Binding::Kind::ScalarTuple) {
+      auto entryPart = mappedPart(operation.getOperation(), 1, part);
+      if (entryPart && *entryPart < entries.parts.size())
+        entry = entries.parts[*entryPart];
+    }
+    if (!entry && entries.kind != Binding::Kind::Vector)
+      return fail(operation,
+                  "indexed entry load outer axes have no typed entry-index projection");
+    std::string base;
+    if (descriptorBase) {
+      base = *descriptorBase;
+    } else {
+      auto coordinates = registerCoordinates(operation.getResult(), part / streams);
+      auto sourceType =
+          mlir::dyn_cast<riscv::ValueType>(operation.getSource().getType());
+      if (streams <= 0 || !coordinates ||
+          coordinates->size() != registerAxes.size() || !sourceType)
+        return fail(operation,
+                    "indexed entry load field has no register-coordinate mapping");
+      std::string recordPointer = "(" + record.recordPointer;
+      for (int64_t axis : sourceType.getAxisIds().asArrayRef()) {
+        if (axis == operation.getSourceAxis())
+          continue;
+        auto resultAxis = llvm::find(registerAxes, axis);
+        int64_t coordinate = 0;
+        if (resultAxis != registerAxes.end())
+          coordinate = (*coordinates)[resultAxis - registerAxes.begin()];
+        auto stride = llvm::find_if(record.recordByteStrides,
+                                    [&](const auto &entry) {
+                                      return entry.first == axis;
+                                    });
+        if (stride == record.recordByteStrides.end())
+          return fail(operation,
+                      "indexed entry load retained source axis has no byte stride");
+        recordPointer += " + " + std::to_string(coordinate) + " * " +
+                         stride->second;
+      }
+      recordPointer += " + " + std::to_string(field->bitOffset / 8) + ")";
+      base = "((const " + *cType + " *)(" + recordPointer + "))";
+    }
+    if (entries.kind == Binding::Kind::Vector) {
+      if (streams <= 0)
+        return fail(operation,
+                    "indexed entry gather has no result stream mapping");
+      auto entryPart = projectRegisterPart(operation.getEntryIndices(),
+                                           operation.getResult(),
+                                           part / streams);
+      if (!entryPart || *entryPart >= entries.parts.size())
+        return fail(operation,
+                    "indexed entry gather free axes have no typed entry projection");
+      auto entryType = operation.getEntryIndices().getType();
+      auto entryInteger =
+          mlir::dyn_cast<mlir::IntegerType>(entryType.getElementType());
+      if (!entryInteger || entryInteger.isSigned() ||
+          (entryInteger.getWidth() != 16 && entryInteger.getWidth() != 32 &&
+           entryInteger.getWidth() != 64))
+        return fail(operation,
+                    "indexed entry gather requires u16, u32, or u64 indices");
+      const std::string indexSuffix =
+          vectorSuffix(operation.getEntryIndices());
+      const std::string indexType = vectorType(operation.getEntryIndices());
+      const std::string entryVL =
+          partVL(operation.getEntryIndices(), *entryPart);
+      std::string byteOffsets = fresh("entry_byte_offsets");
+      line(indexType + " " + byteOffsets + " = __riscv_vmul_vx_" +
+           indexSuffix + "(" + entries.parts[*entryPart] + ", " +
+           std::to_string(operation.getEntryStride()) + ", " + entryVL +
+           ");");
+
+      const std::string lmul =
+          lmulSpelling(operation.getResult().getType().getLayout().getLmulEighths());
+      const std::string packedSuffix = "u64" + lmul;
+      const std::string packedType = "vuint64" + lmul + "_t";
+      std::string packed = fresh("entry_gather");
+      line(packedType + " " + packed + " = __riscv_vluxei" +
+           std::to_string(entryInteger.getWidth()) + "_v_" + packedSuffix +
+           "((const uint64_t *)(" + base + "), " + byteOffsets + ", " +
+           entryVL + ");");
+      const std::string unsignedResultSuffix = "u8" + lmul;
+      std::string unpacked = "__riscv_vreinterpret_v_" + packedSuffix + "_" +
+                             unsignedResultSuffix + "(" + packed + ")";
+      if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
+          integer && integer.isSigned())
+        unpacked = "__riscv_vreinterpret_v_" + unsignedResultSuffix + "_" +
+                   resultSuffix + "(" + unpacked + ")";
+      std::string loaded = fresh("entry_payload");
+      line(resultType + " " + loaded + " = " + unpacked + ";");
+      result.parts.push_back(std::move(loaded));
+      continue;
+    }
+    const std::string pointer =
+        base + " + ((size_t)(" + *entry + ") * " +
+        std::to_string(operation.getEntryStride()) + ")";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string loaded = fresh("entry_payload");
+    line(resultType + " " + loaded + " = __riscv_vle" +
+         std::to_string(elementBits) + "_v_" + resultSuffix + "(" + pointer +
+         ", " + vl + ");");
+    result.parts.push_back(std::move(loaded));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVUnitEntryWindowLoad(
+    riscv::RVVUnitEntryWindowLoadOp operation) {
+  Binding baseIndex = bindings.lookup(operation.getEntryBase());
+  auto materializedBase =
+      materializeNumeric(operation.getEntryBase(), baseIndex);
+  if (mlir::failed(materializedBase))
+    return mlir::failure();
+  baseIndex = std::move(*materializedBase);
+  if (baseIndex.kind != Binding::Kind::Scalar)
+    return fail(operation,
+                "unit entry window requires one selected scalar base index");
+
+  mlir::Type element = operation.getResult().getType().getElementType();
+  auto cType = scalarCType(element);
+  const unsigned elementBits = riscv_internal::logicalBitWidth(element);
+  if (!cType || !elementBits || elementBits % 8)
+    return fail(operation,
+                "unit entry window requires a byte-addressable payload element");
+
+  Binding source = bindings.lookup(operation.getSource());
+  if (source.kind != Binding::Kind::Field)
+    return fail(operation,
+                "unit entry window source has no encoded field binding");
+  source.field.useAccess = operation.getAccess();
+  Binding record = bindings.lookup(source.field.owner);
+  if (record.kind == Binding::Kind::Slice) {
+    auto materializedRecord = recordForSlice(source.field.owner);
+    if (mlir::failed(materializedRecord))
+      return mlir::failure();
+    record = std::move(*materializedRecord);
+  }
+  auto field = fieldFor(source);
+  if (record.kind != Binding::Kind::Record || !field ||
+      field->access.getMapping() != "natural" || field->bitOffset % 8 ||
+      record.recordAxis != operation.getSourceAxis())
+    return fail(operation,
+                "unit entry window field has no byte-aligned record-axis mapping");
+
+  const std::string resultType = vectorType(operation.getResult());
+  const std::string resultSuffix = vectorSuffix(operation.getResult());
+  const int64_t parts = vectorPartCount(operation.getResult());
+  const int64_t streams = streamPartCount(operation.getResult());
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getResult());
+  auto sourceType = operation.getSource().getType();
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    auto coordinates =
+        registerCoordinates(operation.getResult(), part / streams);
+    if (streams <= 0 || !coordinates ||
+        coordinates->size() != registerAxes.size())
+      return fail(operation,
+                  "unit entry window has no register-coordinate mapping");
+    std::string recordPointer = "(" + record.recordPointer;
+    for (int64_t axis : sourceType.getAxisIds().asArrayRef()) {
+      if (axis == operation.getSourceAxis())
+        continue;
+      auto resultAxis = llvm::find(registerAxes, axis);
+      int64_t coordinate = 0;
+      if (resultAxis != registerAxes.end())
+        coordinate = (*coordinates)[resultAxis - registerAxes.begin()];
+      auto stride = llvm::find_if(record.recordByteStrides,
+                                  [&](const auto &entry) {
+                                    return entry.first == axis;
+                                  });
+      if (stride == record.recordByteStrides.end())
+        return fail(operation,
+                    "unit entry window retained source axis has no byte stride");
+      recordPointer += " + " + std::to_string(coordinate) + " * " +
+                       stride->second;
+    }
+    recordPointer += " + " + std::to_string(field->bitOffset / 8) + ")";
+    const std::string pointer =
+        "((const " + *cType + " *)(" + recordPointer + ")) + ((size_t)(" +
+        baseIndex.scalar + ") * " + std::to_string(operation.getEntryStride()) +
+        ")";
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string loaded = fresh("entry_window");
+    line(resultType + " " + loaded + " = __riscv_vle" +
+         std::to_string(elementBits) + "_v_" + resultSuffix + "(" + pointer +
+         ", " + vl + ");");
+    result.parts.push_back(std::move(loaded));
+  }
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

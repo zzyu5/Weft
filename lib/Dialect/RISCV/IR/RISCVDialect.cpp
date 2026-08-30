@@ -2703,6 +2703,217 @@ mlir::LogicalResult LookupOp::verify() {
   return verifyLeafOperation(*this);
 }
 
+mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
+  auto entry = getEntryIndices().getType();
+  auto result = getResult().getType();
+  auto indexElement = mlir::dyn_cast<mlir::IntegerType>(entry.getElementType());
+  const bool scalarEntries = entry.getLayout().getCarrier() == "scalar";
+  const bool vectorEntries = entry.getLayout().getCarrier() == "rvv";
+  if ((!entry.getElementType().isIndex() &&
+       (!indexElement || indexElement.isSigned())) ||
+      (!scalarEntries && !vectorEntries) ||
+      result.getLayout().getCarrier() != "rvv")
+    return emitOpError(
+        "indexed entry load requires unsigned scalar or RVV entry indices and an RVV result");
+  if (getPayloadExtent() <= 0 || getEntryStride() < getPayloadExtent())
+    return emitOpError(
+        "indexed entry load requires one positive contiguous payload within each entry stride");
+
+  llvm::SmallVector<int64_t> sourceAxes;
+  llvm::SmallVector<int64_t> sourceShape;
+  if (auto descriptor = mlir::dyn_cast<MemDescType>(getSource().getType())) {
+    auto encoding =
+        mlir::cast<weft::kernel::EncodingType>(descriptor.getEncoding());
+    if (encoding.getKind() != "dense" || descriptor.getShape().size() != 1 ||
+        descriptor.getStorageBits() != elementBitWidth(result.getElementType()))
+      return emitOpError(
+          "indexed entry load requires a dense descriptor matching the payload element width");
+    sourceAxes.append(descriptor.getAxisIds().asArrayRef().begin(),
+                      descriptor.getAxisIds().asArrayRef().end());
+    sourceShape.append(descriptor.getShape().asArrayRef().begin(),
+                       descriptor.getShape().asArrayRef().end());
+  } else if (auto value = mlir::dyn_cast<ValueType>(getSource().getType())) {
+    if (value.getLayout().getCarrier() != "local" ||
+        value.getElementType() != result.getElementType())
+      return emitOpError(
+          "indexed entry value source must be one local payload with matching element type");
+    sourceAxes.append(value.getAxisIds().asArrayRef().begin(),
+                      value.getAxisIds().asArrayRef().end());
+    sourceShape.append(value.getShape().asArrayRef().begin(),
+                       value.getShape().asArrayRef().end());
+  } else {
+    return emitOpError(
+        "indexed entry load source must be a dense descriptor or local value");
+  }
+  auto sourceAxis = llvm::find(sourceAxes, getSourceAxis());
+  if (sourceAxis == sourceAxes.end())
+    return emitOpError("indexed entry load source axis is absent from its source");
+  const size_t sourcePosition =
+      static_cast<size_t>(sourceAxis - sourceAxes.begin());
+
+  auto entryAxes = entry.getAxisIds().asArrayRef();
+  auto entryShape = entry.getShape().asArrayRef();
+  auto resultAxes = result.getAxisIds().asArrayRef();
+  auto resultShape = result.getShape().asArrayRef();
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  for (size_t position = 0; position < sourceAxes.size(); ++position) {
+    if (position == sourcePosition)
+      continue;
+    expectedAxes.push_back(sourceAxes[position]);
+    expectedShape.push_back(sourceShape[position]);
+  }
+  const size_t retainedSourceAxes = expectedAxes.size();
+  for (auto [axis, extent] : llvm::zip(entryAxes, entryShape)) {
+    if (llvm::is_contained(expectedAxes, axis) || axis == getPayloadAxis())
+      return emitOpError(
+          "indexed entry axes must be disjoint from retained source and payload axes");
+    expectedAxes.push_back(axis);
+    expectedShape.push_back(extent);
+  }
+  expectedAxes.push_back(getPayloadAxis());
+  expectedShape.push_back(getPayloadExtent());
+  if (!llvm::equal(expectedAxes, resultAxes) ||
+      !llvm::equal(expectedShape, resultShape))
+    return emitOpError(
+        "indexed entry load result must retain source axes and append entry plus payload axes");
+  for (size_t position = 0; position < entryAxes.size(); ++position)
+    if (!sameAxisMapping(entry, position, result,
+                         retainedSourceAxes + position))
+      return emitOpError(
+          "indexed entry load must preserve every outer entry-axis representation");
+
+  const size_t payloadPosition = resultAxes.size() - 1;
+  auto layout = result.getLayout();
+  const unsigned payloadBits = elementBitWidth(result.getElementType());
+  if (layout.getTimeFactors()[payloadPosition] != 1 ||
+      layout.getLaneFactors()[payloadPosition] != getPayloadExtent() ||
+      layout.getReplicaFactors()[payloadPosition] != 1 ||
+      layout.getFragmentFactors()[payloadPosition] != 1 ||
+      layout.getLocalFactors()[payloadPosition] != 1)
+    return emitOpError(
+        "indexed entry payload axis must be one complete RVV lane dimension");
+
+  if (getAccess().getMapping() != "natural")
+    return emitOpError(
+        "indexed entry load requires one natural entry-payload mapping");
+  if (scalarEntries) {
+    if (getAccess().getForm() != "unit" ||
+        !exactLeaf(getLeaf(), "rvv", "indexed-entry-load",
+                   "rvv.indexed-entry-load", "none", "exact"))
+      return emitOpError(
+          "scalar indexed entries require one exact unit-payload RVV leaf");
+  } else {
+    if (!indexElement ||
+        (indexElement.getWidth() != 16 && indexElement.getWidth() != 32 &&
+         indexElement.getWidth() != 64) ||
+        payloadBits == 0 ||
+        payloadBits * static_cast<uint64_t>(getPayloadExtent()) != 64 ||
+        getEntryStride() != getPayloadExtent() ||
+        getAccess().getForm() != "indexed" ||
+        !exactLeaf(getLeaf(), "rvv", "indexed-entry-gather",
+                   "rvv.indexed-entry-gather", "none", "exact"))
+      return emitOpError(
+          "RVV indexed entries require one exact contiguous-entry gather leaf")
+             << "; entry_stride=" << getEntryStride()
+             << ", payload_extent=" << getPayloadExtent()
+             << ", index_type=" << entry << ", result_type=" << result;
+  }
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
+  ValueType source = getSource().getType();
+  ValueType result = getResult().getType();
+  auto field = getSource().getDefiningOp<FieldOp>();
+  auto baseValue = mlir::dyn_cast<ValueType>(getEntryBase().getType());
+  mlir::Type baseElement = baseValue ? baseValue.getElementType()
+                                     : getEntryBase().getType();
+  auto baseInteger = mlir::dyn_cast<mlir::IntegerType>(baseElement);
+  bool scalarBase = baseElement.isIndex() ||
+                    (baseInteger && !baseInteger.isSigned());
+  if (baseValue) {
+    auto layout = baseValue.getLayout();
+    scalarBase = scalarBase && layout.getCarrier() == "scalar" &&
+                 llvm::all_of(layout.getTimeFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getLaneFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getReplicaFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getFragmentFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; }) &&
+                 llvm::all_of(layout.getLocalFactors().asArrayRef(),
+                              [](int64_t factor) { return factor == 1; });
+  }
+  if (!field || source.getLayout().getCarrier() != "local" || !scalarBase ||
+      result.getLayout().getCarrier() != "rvv" ||
+      source.getElementType() != result.getElementType() ||
+      getEntryExtent() <= 1 || getPayloadExtent() <= 0 ||
+      getEntryStride() != getPayloadExtent() ||
+      getEntryAxis() == getPayloadAxis() ||
+      getAccess().getForm() != "unit" ||
+      getAccess().getMapping() != "natural" ||
+      !exactLeaf(getLeaf(), "rvv", "unit-entry-window-load",
+                 "rvv.unit-entry-window-load", "none", "exact"))
+    return emitOpError(
+        "unit entry window load requires one byte-contiguous typed local field, scalar base, and exact RVV leaf");
+
+  auto sourceAxes = source.getAxisIds().asArrayRef();
+  auto sourceShape = source.getShape().asArrayRef();
+  auto sourceAxis = llvm::find(sourceAxes, getSourceAxis());
+  if (sourceAxis == sourceAxes.end() ||
+      llvm::is_contained(sourceAxes, getEntryAxis()) ||
+      llvm::is_contained(sourceAxes, getPayloadAxis()))
+    return emitOpError(
+        "unit entry window source, entry, and payload axes must be disjoint");
+  const size_t sourcePosition =
+      static_cast<size_t>(sourceAxis - sourceAxes.begin());
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  for (size_t position = 0; position < sourceAxes.size(); ++position) {
+    if (position == sourcePosition)
+      continue;
+    expectedAxes.push_back(sourceAxes[position]);
+    expectedShape.push_back(sourceShape[position]);
+  }
+  const size_t retainedAxes = expectedAxes.size();
+  expectedAxes.push_back(getEntryAxis());
+  expectedShape.push_back(getEntryExtent());
+  expectedAxes.push_back(getPayloadAxis());
+  expectedShape.push_back(getPayloadExtent());
+  if (!llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
+      !llvm::equal(expectedShape, result.getShape().asArrayRef()))
+    return emitOpError(
+        "unit entry window result must retain source axes and append entry plus payload axes");
+  auto layout = result.getLayout();
+  for (size_t position = 0; position < retainedAxes; ++position)
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return emitOpError(
+          "unit entry window retained axes must remain register coordinates");
+  const int64_t windowExtents[] = {
+      static_cast<int64_t>(getEntryExtent()),
+      static_cast<int64_t>(getPayloadExtent())};
+  for (size_t offset = 0; offset < 2; ++offset) {
+    const size_t position = retainedAxes + offset;
+    const int64_t extent = windowExtents[offset];
+    if (layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != extent ||
+        layout.getReplicaFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1)
+      return emitOpError(
+                 "unit entry and payload axes must form one complete RVV lane window")
+             << "; entry_axis=" << getEntryAxis()
+             << ", payload_axis=" << getPayloadAxis()
+             << ", result_type=" << result;
+  }
+  return verifyLeafOperation(*this);
+}
+
 void ConvertLayoutOp::getEffects(
     llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
         mlir::MemoryEffects::Effect>> &effects) {
@@ -2761,8 +2972,8 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
     auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
     std::optional<size_t> laneDimension;
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-      if (targetLane[dimension] > 1) {
-        if (laneDimension)
+        if (targetLane[dimension] > 1) {
+          if (laneDimension)
           return emitOpError(
               "scalar register-to-lane conversion requires exactly one lane axis");
         laneDimension = dimension;

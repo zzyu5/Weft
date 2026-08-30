@@ -907,6 +907,38 @@ def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVIndexedEntryLoadOp
+    : WeftRISCV_Op<"rvv_indexed_entry_load",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins AnyType:$source,
+                       WeftRISCV_ValueType:$entry_indices,
+                       I64Attr:$source_axis,
+                       I64Attr:$payload_axis,
+                       I64Attr:$payload_extent,
+                       I64Attr:$entry_stride,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVUnitEntryWindowLoadOp
+    : WeftRISCV_Op<"rvv_unit_entry_window_load",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$source,
+                       AnyType:$entry_base,
+                       I64Attr:$source_axis,
+                       I64Attr:$entry_axis,
+                       I64Attr:$entry_extent,
+                       I64Attr:$payload_axis,
+                       I64Attr:$payload_extent,
+                       I64Attr:$entry_stride,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout",
     [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,

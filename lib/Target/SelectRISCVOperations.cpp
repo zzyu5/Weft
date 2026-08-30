@@ -170,6 +170,8 @@ public:
       // numerical/structured operation anchors.
       if (mlir::isa<riscv::LoadOp, riscv::StoreOp, riscv::FieldOp,
                     riscv::ExtractOp, riscv::LookupOp,
+                    riscv::RVVIndexedEntryLoadOp,
+                    riscv::RVVUnitEntryWindowLoadOp,
                     riscv::ConvertLayoutOp>(operation))
         return;
       riscv::ImplementationAttr selected = select(operation, builder);
