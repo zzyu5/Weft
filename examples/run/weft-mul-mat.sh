@@ -30,6 +30,9 @@ if [[ ${format} != f32 && ${format_id} -lt 0 ]]; then
   echo "unsupported MUL_MAT format: ${format}" >&2
   exit 2
 fi
+if [[ ${format} == q4_k && ${phase} == prefill ]]; then
+  format=q4_k_staged
+fi
 
 case "${target}" in
   sg2044)
