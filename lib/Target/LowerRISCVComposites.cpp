@@ -2392,6 +2392,7 @@ private:
             rewriter.getDenseI64ArrayAttr(rhsLaneSlices->parts),
             riscv::PartialLayoutPlanAttr(),
             riscv::NestedPartialPlanAttr(),
+            riscv::SequentialPartialPlanAttr(),
             riscv::LayeredPartialPlanAttr(),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",

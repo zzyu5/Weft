@@ -128,6 +128,21 @@ write/unknown effect 的 `local_load` 与 integer index cast 之后，仍用 fie
 layer 共享一个 RVV storage window。成功时它以真实 `rvv_layered_window` op 替换两个
 extract。当前仅对 full-validity layer 改写；tail cohort 没有证明安全时保持原程序。
 
+### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
+
+planner 读取 contraction/reduction 的 typed axes、time/lane/replica 分解、storage window、
+consumer use 与 target resource budget，唯一写入 product carrier、issue slices、partial-set、
+combine/final-reduction topology、selected local instructions 和联合资源合同。顺序 fused contraction
+若跨多个 issue，必须得到显式 `sequential_partial_plan`；该 plan 给出每个 issue 的 source-part
+投影、唯一 widened accumulator 与最终 reduction，而不是让 composite dot 按 issue 数预留一组
+临时 partial。
+
+materializer 只核验仍存在的 SSA graph 与 plan 一致，并实例化真实
+`rvv_issue_slice → rvv_widen_accumulate → rvv_finalize_widen_dot` 或对应 partial-set program。
+它不能重新选择 carrier、combine tree、instruction 或 resource groups。没有闭合 plan 的已选
+topology 直接失败；terminal emitter 只按 `source_parts` 投影已有 vector binding，并拼写已选
+accumulate/reduction leaf。
+
 ### `FinalizeRISCVLeaves`
 
 读取 `ImplementationAttr` 与已经确定的 value carrier/SEW/operand form，为 pointwise、cast、

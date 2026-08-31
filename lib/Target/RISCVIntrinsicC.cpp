@@ -666,6 +666,7 @@ private:
   compileRVVLayeredStorageDecode(riscv::RVVLayeredStorageDecodeOp operation);
   mlir::LogicalResult
   compileRVVReplicaStorageLoad(riscv::RVVReplicaStorageLoadOp operation);
+  mlir::LogicalResult compileRVVIssueSlice(riscv::RVVIssueSliceOp operation);
   mlir::LogicalResult
   compileRVVWidenAccumulate(riscv::RVVWidenAccumulateOp operation);
   mlir::LogicalResult
@@ -2378,6 +2379,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVLayeredStorageDecode(decode);
   if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation))
     return compileRVVReplicaStorageLoad(load);
+  if (auto slice = mlir::dyn_cast<riscv::RVVIssueSliceOp>(operation))
+    return compileRVVIssueSlice(slice);
   if (auto accumulate =
           mlir::dyn_cast<riscv::RVVWidenAccumulateOp>(operation))
     return compileRVVWidenAccumulate(accumulate);
@@ -10772,6 +10775,31 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       }
     }
     result.parts.push_back(std::move(value));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVIssueSlice(riscv::RVVIssueSliceOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.issue-slice")
+    return fail(operation, "RVV issue slice has no exact selected leaf");
+  auto input = materializeNumeric(operation.getInput(),
+                                  bindings.lookup(operation.getInput()));
+  const int64_t resultParts = vectorPartCount(operation.getResult());
+  if (mlir::failed(input) || input->kind != Binding::Kind::Vector ||
+      resultParts <= 0 || operation.getSourceParts().size() !=
+                              static_cast<size_t>(resultParts))
+    return fail(operation,
+                "RVV issue slice requires one materialized source vector per result part");
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  result.parts.reserve(static_cast<size_t>(resultParts));
+  for (int64_t sourcePart : operation.getSourceParts()) {
+    if (sourcePart < 0 || sourcePart >= static_cast<int64_t>(input->parts.size()))
+      return fail(operation,
+                  "RVV issue slice references an absent source vector part");
+    result.parts.push_back(input->parts[static_cast<size_t>(sourcePart)]);
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();

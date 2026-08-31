@@ -1145,6 +1145,40 @@ riscv::ValueType partialSlotType(mlir::Builder &builder,
                                layout);
 }
 
+riscv::ValueType issueSliceType(mlir::Builder &builder,
+                                riscv::ValueType source,
+                                int64_t reductionAxis) {
+  auto position = axisPosition(source, reductionAxis);
+  if (!position || source.getLayout().getCarrier() != "rvv")
+    return {};
+  const int64_t time = source.getLayout().getTimeFactors()[*position];
+  const int64_t lane = source.getLayout().getLaneFactors()[*position];
+  const int64_t replica = source.getLayout().getReplicaFactors()[*position];
+  if (time <= 1 || lane <= 0 || replica != 1 ||
+      source.getShape()[*position] != time * lane ||
+      source.getLayout().getFragmentFactors()[*position] != 1 ||
+      source.getLayout().getLocalFactors()[*position] != 1)
+    return {};
+  llvm::SmallVector<int64_t> shape(source.getShape().asArrayRef());
+  llvm::SmallVector<int64_t> timeFactors(
+      source.getLayout().getTimeFactors().asArrayRef());
+  shape[*position] = lane;
+  timeFactors[*position] = 1;
+  auto layout = riscv::LayoutAttr::get(
+      builder.getContext(), "rvv", source.getAxisIds(),
+      builder.getDenseI64ArrayAttr(timeFactors),
+      source.getLayout().getLaneFactors(),
+      source.getLayout().getReplicaFactors(),
+      source.getLayout().getFragmentFactors(),
+      source.getLayout().getLocalFactors(), source.getLayout().getSew(),
+      source.getLayout().getLmulEighths(), source.getLayout().getVl(),
+      source.getLayout().getRegisterGroups(),
+      source.getLayout().getValidity());
+  return riscv::ValueType::get(builder.getContext(), source.getElementType(),
+                               builder.getDenseI64ArrayAttr(shape),
+                               source.getAxisIds(), layout);
+}
+
 riscv::ValueType groupedLanePartialSlotType(mlir::Builder &builder,
                                             riscv::ValueType lhs,
                                             riscv::ValueType rhs,
@@ -2748,6 +2782,7 @@ public:
     for (riscv::RVVWidenDotOp dot : dots) {
       dot->removeAttr("partial_layout_plan");
       dot->removeAttr("nested_partial_plan");
+      dot->removeAttr("sequential_partial_plan");
       dot->removeAttr("layered_partial_plan");
       dot->removeAttr("partial_combine_plan");
       auto result = mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
@@ -2779,6 +2814,9 @@ public:
       std::optional<riscv::NestedPartialPlanAttr> nestedPlan;
       std::optional<LayeredTopologyFacts> layeredPlan;
       riscv::ValueType replicaAccumulator;
+      riscv::ValueType sequentialLhsIssue;
+      riscv::ValueType sequentialRhsIssue;
+      riscv::ValueType sequentialAccumulator;
 
       if (auto found = nestedScaledReductions.find(dot.getOperation());
           found != nestedScaledReductions.end()) {
@@ -2966,6 +3004,27 @@ public:
       if (kind.empty())
         kind = fused ? "sequential_fused" : "sequential_per_stream";
 
+      // A fused sequential contraction is only real when its complete issue
+      // slice, accumulator carrier, and simultaneous resource contract are
+      // selected before materialization.  Otherwise the old composite dot
+      // keeps reserving one live temporary for every issue stream.
+      if (kind == "sequential_fused" && streams > 1) {
+        const int64_t reductionAxis =
+            dot.getOver().empty() ? 0 : dot.getOver()[0];
+        sequentialLhsIssue =
+            issueSliceType(builder, dot.getLhs().getType(), reductionAxis);
+        sequentialRhsIssue =
+            issueSliceType(builder, dot.getRhs().getType(), reductionAxis);
+        sequentialAccumulator = partialSlotType(builder, dot);
+        if (sequentialLhsIssue && sequentialRhsIssue &&
+            sequentialAccumulator)
+          resources = std::max<int64_t>(
+              sequentialLhsIssue.getLayout().getRegisterGroups() +
+                  sequentialRhsIssue.getLayout().getRegisterGroups() +
+                  sequentialAccumulator.getLayout().getRegisterGroups(),
+              sequentialAccumulator.getLayout().getRegisterGroups() + 2);
+      }
+
       dot->setAttr("partial_topology",
                    makePartialTopology(builder, dot, kind, rootOperand,
                                        partialAxes, outputAxes, sourceSlots,
@@ -3123,6 +3182,65 @@ public:
                                                       : empty),
               builder.getDenseI64ArrayAttr(sourcePlan ? sourcePlan->rhsOffsets
                                                       : empty)));
+
+      if (kind == "sequential_fused") {
+        auto lhsIssue = sequentialLhsIssue;
+        auto rhsIssue = sequentialRhsIssue;
+        auto accumulator = sequentialAccumulator;
+        auto accumulatorElement = accumulator
+                                      ? mlir::dyn_cast<mlir::IntegerType>(
+                                            accumulator.getElementType())
+                                      : mlir::IntegerType();
+        auto lhsParts = riscv_internal::staticProduct(
+            lhsIssue ? lhsIssue.getLayout().getReplicaFactors().asArrayRef()
+                     : llvm::ArrayRef<int64_t>());
+        auto rhsParts = riscv_internal::staticProduct(
+            rhsIssue ? rhsIssue.getLayout().getReplicaFactors().asArrayRef()
+                     : llvm::ArrayRef<int64_t>());
+        const int64_t issueCount = dot.getReductionStreams();
+        const int64_t partsPerIssue =
+            outputReplicas > 0 ? outputReplicas : int64_t{0};
+        const int64_t plannedResources =
+            lhsIssue && rhsIssue && accumulator
+                ? std::max<int64_t>(
+                      lhsIssue.getLayout().getRegisterGroups() +
+                          rhsIssue.getLayout().getRegisterGroups() +
+                          accumulator.getLayout().getRegisterGroups(),
+                      accumulator.getLayout().getRegisterGroups() + 2)
+                : 0;
+        if (issueCount <= 1)
+          continue;
+        if (!lhsIssue || !rhsIssue || !accumulator || !accumulatorElement ||
+            !lhsParts || !rhsParts || *lhsParts != partsPerIssue ||
+            *rhsParts != partsPerIssue ||
+            dot.getLhsParts().size() !=
+                static_cast<size_t>(issueCount * partsPerIssue) ||
+            dot.getRhsParts().size() !=
+                static_cast<size_t>(issueCount * partsPerIssue) ||
+            llvm::any_of(dot.getLhsLaneOffsets(),
+                         [](int64_t offset) { return offset != 0; }) ||
+            llvm::any_of(dot.getRhsLaneOffsets(),
+                         [](int64_t offset) { return offset != 0; }) ||
+            plannedResources != resources || !kernel ||
+            plannedResources > kernel.getTarget().getVectorRegisters()) {
+          dot.emitError(
+              "selected sequential-fused topology has no closed issue-slice and accumulator plan");
+          signalPassFailure();
+          return;
+        }
+        const llvm::StringRef finalizeInstruction =
+            accumulatorElement.getWidth() == 16 ? "rvv.vwredsum.partial"
+                                                : "rvv.vredsum.partial";
+        dot->setAttr(
+            "sequential_partial_plan",
+            riscv::SequentialPartialPlanAttr::get(
+                builder.getContext(), issueCount, reductionAxis, lhsIssue,
+                rhsIssue, accumulator,
+                builder.getDenseI64ArrayAttr(dot.getLhsParts()),
+                builder.getDenseI64ArrayAttr(dot.getRhsParts()),
+                "rvv.vwmacc.partial", finalizeInstruction,
+                plannedResources));
+      }
 
       if (kind == "layered") {
         if (!layeredPlan) {
@@ -5089,6 +5207,104 @@ public:
       riscv_internal::copyOrigin(reduce, finalized);
       reduce.getResult().replaceAllUsesWith(finalized.getResult());
       rewriter.eraseOp(reduce);
+      rewriter.eraseOp(dot);
+    }
+
+    // Instantiate the already-selected sequential fused program.  Each issue
+    // slice is a typed projection of an existing vector part; all issues feed
+    // one widened accumulator and only the completed carrier is reduced.
+    llvm::SmallVector<riscv::RVVWidenDotOp> sequentialDots;
+    getOperation().walk([&](riscv::RVVWidenDotOp dot) {
+      if (hasTopology(dot, "sequential_fused") &&
+          dot.getSequentialPartialPlanAttr())
+        sequentialDots.push_back(dot);
+    });
+    for (riscv::RVVWidenDotOp dot : sequentialDots) {
+      auto plan = dot.getSequentialPartialPlanAttr();
+      auto lhsIssue = mlir::dyn_cast<riscv::ValueType>(plan.getLhsIssueType());
+      auto rhsIssue = mlir::dyn_cast<riscv::ValueType>(plan.getRhsIssueType());
+      auto accumulator =
+          mlir::dyn_cast<riscv::ValueType>(plan.getAccumulatorType());
+      auto partialElement =
+          accumulator
+              ? mlir::dyn_cast<mlir::IntegerType>(accumulator.getElementType())
+              : mlir::IntegerType();
+      const int64_t issueCount = plan.getIssueCount();
+      const int64_t partsPerIssue =
+          issueCount > 0
+              ? static_cast<int64_t>(plan.getLhsSourceParts().size()) /
+                    issueCount
+              : 0;
+      if (!lhsIssue || !rhsIssue || !accumulator || !partialElement ||
+          issueCount <= 1 || partsPerIssue <= 0 ||
+          plan.getLhsSourceParts().size() !=
+              plan.getRhsSourceParts().size() ||
+          plan.getLhsSourceParts().size() !=
+              static_cast<size_t>(issueCount * partsPerIssue)) {
+        dot.emitError(
+            "selected sequential fused topology lost its closed issue program");
+        failed = true;
+        continue;
+      }
+
+      rewriter.setInsertionPoint(dot);
+      auto zero = rewriter.create<riscv::ConstantOp>(
+          dot.getLoc(), partialElement,
+          rewriter.getIntegerAttr(partialElement, 0));
+      auto initial = rewriter.create<riscv::RVVSplatOp>(
+          dot.getLoc(), accumulator, zero.getResult(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "splat", "rvv.splat", "rvv.splat", 0,
+              accumulator.getLayout().getRegisterGroups()));
+      riscv_internal::copyOrigin(dot, initial);
+      mlir::Value carried = initial.getResult();
+      for (int64_t issue = 0; issue < issueCount; ++issue) {
+        const size_t begin = static_cast<size_t>(issue * partsPerIssue);
+        auto lhsParts = plan.getLhsSourceParts().asArrayRef().slice(
+            begin, static_cast<size_t>(partsPerIssue));
+        auto rhsParts = plan.getRhsSourceParts().asArrayRef().slice(
+            begin, static_cast<size_t>(partsPerIssue));
+        auto lhsSlice = rewriter.create<riscv::RVVIssueSliceOp>(
+            dot.getLoc(), lhsIssue, dot.getLhs(),
+            rewriter.getDenseI64ArrayAttr(lhsParts),
+            riscv_internal::leaf(rewriter, "transfer", "issue-slice",
+                                 "rvv.issue-slice", "rvv.issue-slice", 0,
+                                 lhsIssue.getLayout().getRegisterGroups(), 0, 0,
+                                 "none", "exact"));
+        auto rhsSlice = rewriter.create<riscv::RVVIssueSliceOp>(
+            dot.getLoc(), rhsIssue, dot.getRhs(),
+            rewriter.getDenseI64ArrayAttr(rhsParts),
+            riscv_internal::leaf(rewriter, "transfer", "issue-slice",
+                                 "rvv.issue-slice", "rvv.issue-slice", 0,
+                                 rhsIssue.getLayout().getRegisterGroups(), 0, 0,
+                                 "none", "exact"));
+        auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+            dot.getLoc(), accumulator, lhsSlice.getResult(),
+            rhsSlice.getResult(), carried, plan.getReductionAxis(),
+            riscv_internal::leaf(
+                rewriter, "rvv", "widen-accumulate",
+                plan.getAccumulateInstruction(),
+                plan.getAccumulateInstruction(),
+                lhsIssue.getLayout().getRegisterGroups() +
+                    rhsIssue.getLayout().getRegisterGroups() +
+                    accumulator.getLayout().getRegisterGroups(),
+                accumulator.getLayout().getRegisterGroups(), 0, 0, "none",
+                "agnostic"));
+        riscv_internal::copyOrigin(dot, lhsSlice);
+        riscv_internal::copyOrigin(dot, rhsSlice);
+        riscv_internal::copyOrigin(dot, accumulate);
+        carried = accumulate.getResult();
+      }
+      auto finalized = rewriter.create<riscv::RVVFinalizeWidenDotOp>(
+          dot.getLoc(), dot.getResult().getType(), carried,
+          plan.getReductionAxis(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "finalize-widen-dot",
+              plan.getFinalizeInstruction(), plan.getFinalizeInstruction(),
+              accumulator.getLayout().getRegisterGroups(), 0, 2, 0, "none",
+              "exact", {plan.getReductionAxis()}));
+      riscv_internal::copyOrigin(dot, finalized);
+      dot.getResult().replaceAllUsesWith(finalized.getResult());
       rewriter.eraseOp(dot);
     }
 

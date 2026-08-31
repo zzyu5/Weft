@@ -343,6 +343,28 @@ def WeftRISCV_NestedPartialPlanAttr
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_SequentialPartialPlanAttr
+    : WeftRISCV_Attr<"SequentialPartialPlan", "sequential_partial_plan"> {
+  let parameters = (ins
+    "int64_t":$issueCount,
+    "int64_t":$reductionAxis,
+    "::mlir::Type":$lhsIssueType,
+    "::mlir::Type":$rhsIssueType,
+    "::mlir::Type":$accumulatorType,
+    "::mlir::DenseI64ArrayAttr":$lhsSourceParts,
+    "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
+    StringRefParameter<"selected widened accumulate instruction">:$accumulateInstruction,
+    StringRefParameter<"selected final reduction instruction">:$finalizeInstruction,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $issueCount `,` $reductionAxis `,` $lhsIssueType `,` $rhsIssueType `,`
+        $accumulatorType `,` $lhsSourceParts `,` $rhsSourceParts `,`
+        $accumulateInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_LayeredStreamGeometryAttr
     : WeftRISCV_Attr<"LayeredStreamGeometry", "layered_stream_geometry"> {
   let parameters = (ins
@@ -1292,6 +1314,7 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        DenseI64ArrayAttr:$rhs_parts,
                        OptionalAttr<WeftRISCV_PartialLayoutPlanAttr>:$partial_layout_plan,
                        OptionalAttr<WeftRISCV_NestedPartialPlanAttr>:$nested_partial_plan,
+                       OptionalAttr<WeftRISCV_SequentialPartialPlanAttr>:$sequential_partial_plan,
                        OptionalAttr<WeftRISCV_LayeredPartialPlanAttr>:$layered_partial_plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1420,6 +1443,15 @@ def WeftRISCV_RVVReplicaStorageLoadOp
                        DenseI64ArrayAttr:$shift_base_factor_for_part,
                        DenseI64ArrayAttr:$mask_value_for_part,
                        WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVIssueSliceOp
+    : WeftRISCV_Op<"rvv_issue_slice", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       DenseI64ArrayAttr:$source_parts,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
