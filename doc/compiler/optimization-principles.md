@@ -97,6 +97,12 @@ LMUL 不够；相同 LMUL 下 replica 数可以相差一个数量级。
   reduction 进 time，峰值从 `34/32` 降到 `20/32` groups，kernel 从资源非法变为 SG
   `10.128` GOP/s。见
   [`riscv-dot-layout-layered-storage-and-affected-performance.md`](../../report/history/riscv-dot-layout-layered-storage-and-affected-performance.md)。
+- `f822bd54e` 让 IQ2_XS 的 widened product 在收敛前保持为一个完整 carrier。SG 从每个
+  issue 的 `4×i16m2 product + 3×slide` 变为 `1×i16m8 product + 4×reduction`；K1 从
+  `16×i16m2 product + 30×slide1up + 18×slidedown` 变为
+  `1×i16m8 product + 8×reduction`。standalone/decode 在 SG 从
+  `2.530/2.517→3.392/3.121`，K1 从 `1.393/1.409→2.176/2.175` GOP/s。见
+  [`riscv-full-product-carrier-and-vec-dot-pair.md`](../../report/riscv-full-product-carrier-and-vec-dot-pair.md)。
 
 这两个结果说明不存在“reduction 永远进 lane”的公式。规则必须读取 axis extent、SEW、
 VLEN、surviving free axes、consumer contract 与完整 live set。
@@ -105,7 +111,8 @@ VLEN、surviving free axes、consumer contract 与完整 live set。
 
 logical axis 是否存在、是否是普通 scalar loop，归作者；同一 shaped axis 的物理载体归编译器。
 当前主要 owner 是 `SelectRISCVOperations`、`PropagateRISCVLayouts` 和
-`MaterializeRISCVResources`。若达到性能必须把 Python 展开的标量循环重新发明成 axis，
+`PlanRISCVPartialTopologies`；`MaterializeRISCVResources` 只检查最终 live set。若达到性能
+必须把 Python 展开的标量循环重新发明成 axis，
 应停止并修改 std tree，而不是增加 matcher。
 
 target 可以决定同一 canonical tree 的 LMUL、VL、lane/time 分解、auto 参数、memory
@@ -252,14 +259,20 @@ partial spill/reload与最终reduce之前完成的MAC数量
   `4.845207→9.969884`、K1 `1.659511→2.508207` GOP/s，并在两机超过 source。
   见
   [`riscv-q2-regular-repeat-independent-partial-topology.md`](../../report/history/riscv-q2-regular-repeat-independent-partial-topology.md)。
+- IQ2_XS 的完整 product carrier 是 P1 与 P4 的联合证据：product 的 logical elements、
+  widening 与最终 reduce 未变，改变的是何时从一个宽 carrier 切成 reduction windows。
+  `f822bd54e` 把 carrier、repack、partial set、scale supply 与 resource peak 写入同一个 typed
+  plan，materializer 只实例化；K1 的纯拼装 slide 全部消失。SG 仍保留 4 次 scale
+  vector-to-scalar extract，说明 product 收敛已修复不等于所有供应形态都相同。
 
 ### 6.4 责任与 pass
 
 closed contract/reduce 内的 physical partial set、combine topology和final reduction归编译器；
 改变 canonical partial、widening位置或Level carry归作者。当前
 `PlanRISCVPartialTopologies`、`MaterializeRISCVPartialAccumulators` 与
-`LowerRISCVComposites` 服务P4。computed scale、codebook-derived operand和非统一SSA拼写仍会
-使同一物理关系落回顺序reduction。
+`LowerRISCVComposites` 服务P4。planner 必须先冻结 product carrier、切片点、partial-set
+类型、combine topology、scale supply 与资源合同；materializer 不得重新选择这些结构。
+computed scale、codebook-derived operand和非统一SSA拼写仍会使同一物理关系落回顺序reduction。
 
 Triton `ReduceOpToLLVM.cpp:228-351` 从register/lane bases和被消去axis组织local/lane tree
 reduction；TileLang `reducer_plan_materialize.cc:559-946` 从update-site reduction axes投影
@@ -341,6 +354,10 @@ compiler不能替Weft重新选择carrier、partial topology或fragment。
 6. 仅在前五项合理后检查load-to-use距离和pipeline可行性；
 7. 与donor逐段对照，先判断差异归作者tree还是physical compiler，再修改代码。
 
+第五步必须把“先形成完整 product 再切片”和“先切 input、逐片 product、再拼回”分开计数。
+二者可以有相同的数学乘法数，却有完全不同的 product 指令数、carrier LMUL、slide 数与
+live set；只统计最终 reduction 数会漏掉这种 P1/P4 联合错误。
+
 量化 contraction 还必须成对观察 standalone vec-dot 与同格式 MUL_MAT decode。两者的
 logical contraction 相同；若优化只提升 blocked prefill，或只在某个 wrapper 中出现，说明
 能力仍绑定在 GEMM tree/ABI 上，没有进入共享 vec-dot 底座。只有两项的 final IR 机制计数
@@ -364,14 +381,15 @@ logical contraction 相同；若优化只提升 blocked prefill，或只在某�
 下表用于后续对答案。若完成作者前置条件后，主要瓶颈分类有一半以上错误，本方法应被
 视为事后归纳并重写。
 
-| 格式/入口 | 作者前置条件 | 主要预测 | 预期可见现象 |
-|---|---|---|---|
-| IQ1_S / IQ1_M | grid/sign的entry与lane必须成为shaped axes，不能保留Python展开 | 先P2，再P4；P3次之 | 同一grid/sign entry跨output共享；reduce前保留lane partial；lookup/load次数不随consumer线性增长 |
-| IQ2_S / IQ2_XS / IQ2_XXS | entry、payload、group与output cohort显式存在 | P2供应与P4 partial topology；indexed-entry只解决P3的一部分 | entry payload一次载入服务多个uses；当前逐group scalar carry变成partial set；若只出现typed indexed load而计数不降，预测未成立 |
-| IQ3_S / IQ3_XXS | grid/sign与high-bit plane写成shaped values | P3 joined/bit-plane geometry，然后P2/P4 | scalar shift/index链减少；raw plane/window供应一次；最终reduction次数下降 |
-| TQ1_0 | 当前shaped radix-3 tree已满足 | P4为主，P3为次；prefill再看P5 | 每个32/16-lane段的五个products形成independent/compact partial而非串行chain；`vwredsum/vmv.x.s`推迟；qh regular-repeat不退化为scalar地址 |
-| Q4_K canonical | 必须先决定canonical ABI下的blocked/local-materialize作者tree；persistent derived encoding是另一程序 | 作者边界优先；tree成立后P2/P3/P5 | 若仍是row×column，compiler不能创造output cohort；若blocked tree成立，应看到activation跨output共享、typed local pack和跨K steady state |
-| Q5_K剩余dequant | 现有shaped sub-axis足够 | P3 joined q/qh geometry与P2 raw-window供应 | q/qh不分别重复构造scalar index；一个typed joined window服务decode；contraction partial不是主要矛盾 |
+| 格式/入口 | 作者前置条件 | 主要预测 | 预期可见现象 | 对答案 |
+|---|---|---|---|---|
+| IQ1_S / IQ1_M | grid/sign的entry与lane必须成为shaped axes，不能保留Python展开 | 先P2，再P4；P3次之 | 同一grid/sign entry跨output共享；reduce前保留lane partial；lookup/load次数不随consumer线性增长 | 待验证 |
+| IQ2_S / IQ2_XS / IQ2_XXS | entry、payload、group与output cohort显式存在 | P2供应与P4 partial topology；indexed-entry只解决P3的一部分 | entry payload一次载入服务多个uses；当前逐group scalar carry变成partial set；若只出现typed indexed load而计数不降，预测未成立 | **MISS**：首要缺口实际是P1 issue/product carrier与P3 indexed-entry；P2随后生效，P4完整product最后补齐。不能用后两项部分命中改写首因 |
+| IQ3_S / IQ3_XXS | grid/sign与high-bit plane写成shaped values | P3 joined/bit-plane geometry，然后P2/P4 | scalar shift/index链减少；raw plane/window供应一次；最终reduction次数下降 | 待验证 |
+| TQ1_0 | 当前shaped radix-3 tree已满足 | P4为主，P3为次；prefill再看P5 | 每个32/16-lane段的五个products形成independent/compact partial而非串行chain；`vwredsum/vmv.x.s`推迟；qh regular-repeat不退化为scalar地址 | 待验证 |
+| Q4_K canonical | 必须先决定canonical ABI下的blocked/local-materialize作者tree；persistent derived encoding是另一程序 | 作者边界优先；tree成立后P2/P3/P5 | 若仍是row×column，compiler不能创造output cohort；若blocked tree成立，应看到activation跨output共享、typed local pack和跨K steady state | 待验证 |
+| Q5_K剩余dequant | 现有shaped sub-axis足够 | P3 joined q/qh geometry与P2 raw-window供应 | q/qh不分别重复构造scalar index；一个typed joined window服务decode；contraction partial不是主要矛盾 | 待验证 |
 
 这些预测不授权按格式名实现pass。格式名只用于实验定位；真正的compiler规则仍必须以axis、
 storage geometry、use-def、effect、target facts和resources为输入，并在第二个独立输入上验证。
+当前累计对答案为 `0 HIT / 1 MISS / 5 pending`。后续结果只追加事实，不回改原预测措辞。
