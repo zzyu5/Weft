@@ -262,6 +262,55 @@ def WeftRISCV_PartialLayoutPlanAttr
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_PartialCombinePlanAttr
+    : WeftRISCV_Attr<"PartialCombinePlan", "partial_combine_plan"> {
+  let parameters = (ins
+    StringRefParameter<"level_scaled, independent_vector, or independent_scalar">:$realization,
+    "::mlir::Type":$sourceSetType,
+    "::mlir::Type":$reducedSetType,
+    "::mlir::Type":$finalSetType,
+    "::mlir::ArrayAttr":$combineSetTypes,
+    "::mlir::DenseI64ArrayAttr":$combineArities,
+    "::mlir::DenseI64ArrayAttr":$lhsParts,
+    "::mlir::DenseI64ArrayAttr":$rhsParts,
+    "::mlir::DenseI64ArrayAttr":$scaleParts,
+    StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
+    StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
+    "int64_t":$outputParts,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $realization `,` $sourceSetType `,` $reducedSetType `,`
+        $finalSetType `,` $combineSetTypes `,` $combineArities `,`
+        $lhsParts `,` $rhsParts `,` $scaleParts `,`
+        $multiplyInstruction `,` $finalizeInstruction `,`
+        $outputParts `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_PartialAddTreePlanAttr
+    : WeftRISCV_Attr<"PartialAddTreePlan", "partial_add_tree_plan"> {
+  let parameters = (ins
+    "::mlir::ArrayAttr":$leafSetTypes,
+    "::mlir::ArrayAttr":$normalizedSetTypes,
+    "::mlir::ArrayAttr":$leafMultiplyInstructions,
+    "::mlir::DenseI64ArrayAttr":$splits,
+    "::mlir::Type":$mergedSetType,
+    StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
+    "int64_t":$totalSlots,
+    "int64_t":$totalTerms,
+    "int64_t":$totalResourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $leafSetTypes `,` $normalizedSetTypes `,`
+        $leafMultiplyInstructions `,` $splits `,` $mergedSetType `,`
+        $finalizeInstruction `,` $totalSlots `,` $totalTerms `,`
+        $totalResourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_NestedPartialPlanAttr
     : WeftRISCV_Attr<"NestedPartialPlan", "nested_partial_plan"> {
   let parameters = (ins
@@ -1140,6 +1189,20 @@ def WeftRISCV_RVVBitmaskDecodeOp
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVSignedBitmaskReduceOp
+    : WeftRISCV_Op<"rvv_signed_bitmask_reduce",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$data,
+                       WeftRISCV_ValueType:$field,
+                       WeftRISCV_PointType:$origin,
+                       WeftRISCV_PointType:$point,
+                       I64Attr:$reduction_axis,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 

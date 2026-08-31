@@ -1445,7 +1445,7 @@ partialTypeForAddLeaf(mlir::Builder &builder, PartialAddLeaf leaf) {
   auto result = mlir::dyn_cast<mlir::IntegerType>(leaf.dot.getResult().getType());
   if (!lhsStreams || !rhsStreams || *lhsStreams != 1 || *rhsStreams != 1 ||
       !slot || !result || !result.isSigned() ||
-      result.getWidth() != 32 || !partialMultiplyInstruction(lhs, rhs))
+      result.getWidth() != 32)
     return std::nullopt;
   return riscv::PartialSetType::get(
       builder.getContext(), slot, reductionAxis, 1,
@@ -2749,6 +2749,7 @@ public:
       dot->removeAttr("partial_layout_plan");
       dot->removeAttr("nested_partial_plan");
       dot->removeAttr("layered_partial_plan");
+      dot->removeAttr("partial_combine_plan");
       auto result = mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
       llvm::SmallVector<int64_t> outputAxes =
           result ? llvm::SmallVector<int64_t>(result.getAxisIds().asArrayRef())
@@ -3184,6 +3185,387 @@ public:
                 builder.getArrayAttr(rootStoragePlans),
                 layeredPlan->layered.geometry));
       }
+    }
+
+    // Freeze the complete combine program after every dot has its selected
+    // topology and typed layout plan.  The following materialization pass may
+    // validate these facts against the still-present SSA graph, but it must not
+    // choose a vector/scalar realization or rebuild intermediate set types.
+    for (riscv::RVVWidenDotOp dot : dots) {
+      if (!dot || !dot->getBlock() ||
+          dot.getPartialTopology().getKind() != "independent")
+        continue;
+      const int64_t reductionAxis = dot.getOver()[0];
+      riscv::ValueType lhs = dot.getLhs().getType();
+      riscv::ValueType rhs = dot.getRhs().getType();
+      auto lhsStreams = riscv_internal::staticProduct(
+          lhs.getLayout().getTimeFactors().asArrayRef());
+      auto rhsStreams = riscv_internal::staticProduct(
+          rhs.getLayout().getTimeFactors().asArrayRef());
+      auto layoutPlan = dot.getPartialLayoutPlanAttr();
+      auto slotType =
+          layoutPlan ? mlir::dyn_cast<riscv::ValueType>(
+                           layoutPlan.getPartialSlotType())
+                     : riscv::ValueType();
+      auto resultValue =
+          mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
+      auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
+          resultValue ? resultValue.getElementType() : dot.getResult().getType());
+      auto outputParts = resultValue
+                             ? riscv_internal::staticProduct(
+                                   resultValue.getLayout()
+                                       .getReplicaFactors()
+                                       .asArrayRef())
+                             : std::optional<int64_t>(1);
+      auto multiplyInstruction = partialMultiplyInstruction(lhs, rhs);
+      if (!lhsStreams || !rhsStreams || *lhsStreams != *rhsStreams ||
+          *lhsStreams < 2 || !layoutPlan || !slotType || !resultElement ||
+          !resultElement.isSigned() || resultElement.getWidth() != 32 ||
+          !outputParts || *outputParts <= 0 || !multiplyInstruction) {
+        dot.emitError(
+            "selected independent topology has no complete typed combine inputs");
+        signalPassFailure();
+        return;
+      }
+      const int64_t slots = *lhsStreams;
+      riscv::ConvertLayoutOp vectorConsumer;
+      riscv::ValueType vectorResult;
+      if (dot.getResult().hasOneUse()) {
+        vectorConsumer = mlir::dyn_cast<riscv::ConvertLayoutOp>(
+            *dot.getResult().getUsers().begin());
+        if (vectorConsumer &&
+            vectorConsumer.getConversion().getEffect() == "pure" &&
+            vectorConsumer.getConversion().getKind() == "register_to_lane")
+          vectorResult =
+              mlir::dyn_cast<riscv::ValueType>(vectorConsumer.getResult().getType());
+      }
+      auto vectorSlotType =
+          mlir::dyn_cast<riscv::ValueType>(layoutPlan.getVectorSlotType());
+      auto lhsReplicas = riscv_internal::staticProduct(
+          lhs.getLayout().getReplicaFactors().asArrayRef());
+      auto rhsReplicas = riscv_internal::staticProduct(
+          rhs.getLayout().getReplicaFactors().asArrayRef());
+      auto vectorResultStreams =
+          vectorResult
+              ? riscv_internal::staticProduct(
+                    vectorResult.getLayout().getTimeFactors().asArrayRef())
+              : std::optional<int64_t>();
+      auto vectorResultReplicas =
+          vectorResult
+              ? riscv_internal::staticProduct(
+                    vectorResult.getLayout().getReplicaFactors().asArrayRef())
+              : std::optional<int64_t>();
+      const bool preservesFreeLane =
+          vectorConsumer && vectorResult && vectorSlotType && lhsReplicas &&
+          rhsReplicas && *lhsReplicas == 1 && *rhsReplicas == 1 &&
+          vectorResultStreams && vectorResultReplicas &&
+          *vectorResultStreams == 1 && *vectorResultReplicas == 1;
+      riscv::ValueType selectedSlot =
+          preservesFreeLane ? vectorSlotType : slotType;
+      const int64_t slotGroups = selectedSlot.getLayout().getRegisterGroups();
+      const int64_t setGroups = slots * slotGroups;
+      const int64_t operandGroups = lhs.getLayout().getRegisterGroups() +
+                                    rhs.getLayout().getRegisterGroups();
+      auto kernel = dot->getParentOfType<riscv::KernelOp>();
+      if (!kernel || setGroups <= 0 || operandGroups < 0 ||
+          setGroups > kernel.getTarget().getVectorRegisters() - operandGroups) {
+        dot.emitError(
+            "selected independent topology exceeds its typed source-set resource contract");
+        signalPassFailure();
+        return;
+      }
+      const auto reductionPosition = axisPosition(selectedSlot, reductionAxis);
+      if (!reductionPosition) {
+        dot.emitError(
+            "selected independent topology lost its reduction axis in the partial carrier");
+        signalPassFailure();
+        return;
+      }
+      auto sourceSet = riscv::PartialSetType::get(
+          builder.getContext(), selectedSlot, reductionAxis, slots,
+          selectedSlot.getShape()[*reductionPosition], setGroups);
+      llvm::SmallVector<mlir::Attribute> combineTypes;
+      llvm::SmallVector<int64_t> combineArities;
+      riscv::PartialSetType finalSet = sourceSet;
+      int64_t remainingSlots = slots;
+      int64_t termsPerSlot = sourceSet.getTermsPerSlot();
+      while (remainingSlots > 1) {
+        const int64_t arity = remainingSlots % 2 == 0 ? 2 : remainingSlots;
+        remainingSlots /= arity;
+        termsPerSlot *= arity;
+        finalSet = riscv::PartialSetType::get(
+            builder.getContext(), selectedSlot, reductionAxis, remainingSlots,
+            termsPerSlot, remainingSlots * slotGroups);
+        combineTypes.push_back(mlir::TypeAttr::get(finalSet));
+        combineArities.push_back(arity);
+      }
+      llvm::SmallVector<int64_t> lhsParts;
+      llvm::SmallVector<int64_t> rhsParts;
+      const int64_t plannedOutputs = preservesFreeLane ? 1 : *outputParts;
+      for (int64_t outputPart = 0; outputPart < plannedOutputs; ++outputPart) {
+        int64_t lhsBase = 0;
+        int64_t rhsBase = 0;
+        if (!preservesFreeLane) {
+          auto lhsReplica = resultValue
+                                ? projectReplica(lhs, resultValue, outputPart)
+                                : std::optional<int64_t>(0);
+          auto rhsReplica = resultValue
+                                ? projectReplica(rhs, resultValue, outputPart)
+                                : std::optional<int64_t>(0);
+          if (!lhsReplica || !rhsReplica) {
+            dot.emitError(
+                "selected independent topology has no complete output-replica map");
+            signalPassFailure();
+            return;
+          }
+          lhsBase = *lhsReplica * slots;
+          rhsBase = *rhsReplica * slots;
+        }
+        for (int64_t stream = 0; stream < slots; ++stream) {
+          lhsParts.push_back(preservesFreeLane ? stream : lhsBase + stream);
+          rhsParts.push_back(preservesFreeLane ? stream : rhsBase + stream);
+        }
+      }
+      auto finalizeInstruction =
+          preservesFreeLane
+              ? std::optional<llvm::StringRef>("rvv.partial-finalize.widen")
+              : partialFinalizeInstruction(finalSet, reductionAxis);
+      if (!finalizeInstruction) {
+        dot.emitError(
+            "selected independent topology has no typed finalization leaf");
+        signalPassFailure();
+        return;
+      }
+      llvm::ArrayRef<int64_t> empty;
+      dot->setAttr(
+          "partial_combine_plan",
+          riscv::PartialCombinePlanAttr::get(
+              builder.getContext(),
+              preservesFreeLane ? "independent_vector"
+                                : "independent_scalar",
+              sourceSet, mlir::NoneType::get(builder.getContext()), finalSet,
+              builder.getArrayAttr(combineTypes),
+              builder.getDenseI64ArrayAttr(combineArities),
+              builder.getDenseI64ArrayAttr(lhsParts),
+              builder.getDenseI64ArrayAttr(rhsParts),
+              builder.getDenseI64ArrayAttr(empty), *multiplyInstruction,
+              *finalizeInstruction, plannedOutputs,
+              dot.getPartialTopology().getResourceGroups()));
+    }
+
+    llvm::SmallVector<mlir::scf::ForOp> plannedLevelLoops;
+    getOperation().walk(
+        [&](mlir::scf::ForOp loop) { plannedLevelLoops.push_back(loop); });
+    for (mlir::scf::ForOp loop : plannedLevelLoops) {
+      auto matched = matchLevelScaledLoop(loop);
+      if (!matched ||
+          !llvm::all_of(*matched, [](const ScaledPartialContribution &item) {
+            return hasTopology(item.dot, "level_scaled");
+          }))
+        continue;
+      auto carryType =
+          mlir::dyn_cast<riscv::ValueType>(loop.getRegionIterArg(0).getType());
+      auto outputParts =
+          carryType ? riscv_internal::staticProduct(
+                          carryType.getLayout().getReplicaFactors().asArrayRef())
+                    : std::optional<int64_t>();
+      auto firstLayout = matched->front().dot.getPartialLayoutPlanAttr();
+      auto firstTopology = matched->front().dot.getPartialTopology();
+      auto slotType =
+          firstLayout ? mlir::dyn_cast<riscv::ValueType>(
+                            firstLayout.getPartialSlotType())
+                      : riscv::ValueType();
+      auto reducedSet =
+          firstLayout ? mlir::dyn_cast<riscv::PartialSetType>(
+                            firstLayout.getReducedSetType())
+                      : riscv::PartialSetType();
+      auto finalSet =
+          firstLayout ? mlir::dyn_cast<riscv::PartialSetType>(
+                            firstLayout.getScaleCombinedSetType())
+                      : riscv::PartialSetType();
+      const int64_t slots = firstTopology.getPartialSlots();
+      const int64_t reductionAxis = matched->front().dot.getOver()[0];
+      if (!carryType || carryType.getLayout().getCarrier() != "scalar" ||
+          !outputParts || *outputParts <= 0 || !slotType || !reducedSet ||
+          !finalSet || slots <= 0) {
+        loop.emitError(
+            "selected level-scaled topology has no complete typed combine carrier");
+        signalPassFailure();
+        return;
+      }
+      auto sourceSet = riscv::PartialSetType::get(
+          builder.getContext(), slotType, reductionAxis, slots,
+          slotType.getShape()[0],
+          slots * slotType.getLayout().getRegisterGroups());
+      auto finalizeInstruction =
+          partialFinalizeInstruction(finalSet, reductionAxis);
+      std::optional<std::string> commonMultiply;
+      for (ScaledPartialContribution &contribution : *matched) {
+        auto selected = partialMultiplyInstruction(contribution.dot.getLhs().getType(),
+                                                   contribution.dot.getRhs().getType());
+        if (!selected || (commonMultiply && *commonMultiply != *selected)) {
+          loop.emitError(
+              "selected level-scaled topology has inconsistent multiply leaves");
+          signalPassFailure();
+          return;
+        }
+        commonMultiply = *selected;
+      }
+      if (!commonMultiply || !finalizeInstruction) {
+        loop.emitError(
+            "selected level-scaled topology has no complete leaf selection");
+        signalPassFailure();
+        return;
+      }
+      llvm::ArrayRef<int64_t> empty;
+      for (ScaledPartialContribution &contribution : *matched) {
+        llvm::SmallVector<int64_t> lhsParts;
+        llvm::SmallVector<int64_t> rhsParts;
+        llvm::SmallVector<int64_t> scaleParts;
+        for (int64_t outputPart = 0; outputPart < *outputParts; ++outputPart) {
+          auto lhsPart = projectReplica(contribution.dot.getLhs().getType(),
+                                        carryType, outputPart);
+          auto rhsPart = projectReplica(contribution.dot.getRhs().getType(),
+                                        carryType, outputPart);
+          auto scalePart = projectReplica(
+              mlir::cast<riscv::ValueType>(contribution.scale.getType()),
+              carryType, outputPart);
+          if (!lhsPart || !rhsPart || !scalePart) {
+            loop.emitError(
+                "selected level-scaled topology has no complete output-replica map");
+            signalPassFailure();
+            return;
+          }
+          lhsParts.push_back(*lhsPart);
+          rhsParts.push_back(*rhsPart);
+          scaleParts.push_back(*scalePart);
+        }
+        contribution.dot->setAttr(
+            "partial_combine_plan",
+            riscv::PartialCombinePlanAttr::get(
+                builder.getContext(), "level_scaled", sourceSet, reducedSet,
+                finalSet, builder.getArrayAttr({}),
+                builder.getDenseI64ArrayAttr(empty),
+                builder.getDenseI64ArrayAttr(lhsParts),
+                builder.getDenseI64ArrayAttr(rhsParts),
+                builder.getDenseI64ArrayAttr(scaleParts), *commonMultiply,
+                *finalizeInstruction, *outputParts,
+                firstTopology.getResourceGroups()));
+      }
+    }
+
+    // Scalar add trees combine multiple already-planned partial leaves.  Plan
+    // the common carrier and every repack before materialization so equivalent
+    // add spelling cannot trigger a second layout search in the next pass.
+    llvm::SmallVector<riscv::BinaryOp> partialAddRoots;
+    getOperation().walk([&](riscv::BinaryOp add) {
+      add->removeAttr("partial_add_tree_plan");
+      if (add.getKind() == "add" &&
+          mlir::isa<mlir::IntegerType>(add.getResult().getType()))
+        partialAddRoots.push_back(add);
+    });
+    for (riscv::BinaryOp root : partialAddRoots) {
+      llvm::SmallVector<riscv::BinaryOp> adds;
+      llvm::SmallVector<PartialAddLeaf> leaves;
+      if (!collectPartialAddTree(root.getResult(), root, adds, leaves) ||
+          leaves.size() < 2)
+        continue;
+      llvm::SmallVector<riscv::PartialSetType> leafTypes;
+      bool complete = true;
+      for (PartialAddLeaf leaf : leaves) {
+        auto type = partialTypeForAddLeaf(builder, leaf);
+        if (!type) {
+          complete = false;
+          break;
+        }
+        leafTypes.push_back(*type);
+      }
+      if (!complete)
+        continue;
+      riscv::PartialSetType targetType;
+      llvm::SmallVector<int64_t> splits;
+      llvm::SmallVector<size_t> order(leaves.size());
+      std::iota(order.begin(), order.end(), 0);
+      llvm::sort(order, [&](size_t lhsIndex, size_t rhsIndex) {
+        auto lhsSet = leafTypes[lhsIndex];
+        auto rhsSet = leafTypes[rhsIndex];
+        auto lhsPosition = axisPosition(lhsSet.getPartialType(),
+                                        lhsSet.getReductionAxis());
+        auto rhsPosition = axisPosition(rhsSet.getPartialType(),
+                                        rhsSet.getReductionAxis());
+        return lhsSet.getPartialType().getLayout().getLaneFactors()[*lhsPosition] >
+               rhsSet.getPartialType().getLayout().getLaneFactors()[*rhsPosition];
+      });
+      for (size_t targetIndex : order) {
+        auto candidate = leafTypes[targetIndex];
+        llvm::SmallVector<int64_t> candidateSplits;
+        bool compatible = true;
+        for (riscv::PartialSetType source : leafTypes) {
+          auto split = partialSplitFactor(source, candidate);
+          if (!split || *split > 2) {
+            compatible = false;
+            break;
+          }
+          candidateSplits.push_back(*split);
+        }
+        if (compatible) {
+          targetType = candidate;
+          splits = std::move(candidateSplits);
+          break;
+        }
+      }
+      if (!targetType)
+        continue;
+      llvm::SmallVector<mlir::Attribute> leafTypeAttrs;
+      llvm::SmallVector<mlir::Attribute> normalizedTypeAttrs;
+      llvm::SmallVector<mlir::Attribute> multiplyAttrs;
+      int64_t totalSlots = 0;
+      int64_t totalTerms = 0;
+      int64_t totalResources = 0;
+      for (auto [leaf, source, split] : llvm::zip(leaves, leafTypes, splits)) {
+        auto normalized =
+            split == 1
+                ? source
+                : riscv::PartialSetType::get(
+                      builder.getContext(), targetType.getPartialType(),
+                      targetType.getReductionAxis(), source.getSlots() * split,
+                      source.getTermsPerSlot() / split,
+                      source.getResourceGroups());
+        leafTypeAttrs.push_back(mlir::TypeAttr::get(source));
+        normalizedTypeAttrs.push_back(mlir::TypeAttr::get(normalized));
+        if (leaf.dot) {
+          auto multiply = partialMultiplyInstruction(leaf.dot.getLhs().getType(),
+                                                     leaf.dot.getRhs().getType());
+          if (!multiply) {
+            complete = false;
+            break;
+          }
+          multiplyAttrs.push_back(builder.getStringAttr(*multiply));
+        } else {
+          multiplyAttrs.push_back(builder.getStringAttr(""));
+        }
+        totalSlots += normalized.getSlots();
+        totalTerms += normalized.getSlots() * normalized.getTermsPerSlot();
+        totalResources += normalized.getResourceGroups();
+      }
+      if (!complete)
+        continue;
+      auto mergedType = riscv::PartialSetType::get(
+          builder.getContext(), targetType.getPartialType(),
+          targetType.getReductionAxis(), 1, totalTerms,
+          targetType.getPartialType().getLayout().getRegisterGroups());
+      auto finalizeInstruction =
+          partialFinalizeInstruction(mergedType, targetType.getReductionAxis());
+      if (!finalizeInstruction)
+        continue;
+      root->setAttr(
+          "partial_add_tree_plan",
+          riscv::PartialAddTreePlanAttr::get(
+              builder.getContext(), builder.getArrayAttr(leafTypeAttrs),
+              builder.getArrayAttr(normalizedTypeAttrs),
+              builder.getArrayAttr(multiplyAttrs),
+              builder.getDenseI64ArrayAttr(splits), mergedType,
+              *finalizeInstruction, totalSlots, totalTerms, totalResources));
     }
 
   }
@@ -4384,19 +4766,27 @@ public:
       auto firstLayoutPlan =
           contributions.front().dot.getPartialLayoutPlanAttr();
       auto firstTopology = contributions.front().dot.getPartialTopology();
+      auto firstCombinePlan =
+          contributions.front().dot->getAttrOfType<riscv::PartialCombinePlanAttr>(
+              "partial_combine_plan");
       auto slotType =
           firstLayoutPlan
               ? mlir::dyn_cast<riscv::ValueType>(
                     firstLayoutPlan.getPartialSlotType())
               : riscv::ValueType();
-      bool complete = firstLayoutPlan && carryType &&
+      bool complete = firstLayoutPlan && firstCombinePlan && carryType &&
+                      carryParts && *carryParts > 0 &&
+                      firstCombinePlan.getRealization() == "level_scaled" &&
+                      firstCombinePlan.getOutputParts() == *carryParts &&
                       carryType.getLayout().getCarrier() == "scalar" &&
-                      carryParts && *carryParts > 0 && slotType;
+                      slotType;
       for (ScaledPartialContribution &contribution : contributions) {
         riscv::ValueType lhs = contribution.dot.getLhs().getType();
         riscv::ValueType rhs = contribution.dot.getRhs().getType();
         auto lhsPosition = axisPosition(lhs, reductionAxis);
         auto rhsPosition = axisPosition(rhs, reductionAxis);
+        auto combinePlan = contribution.dot->getAttrOfType<
+            riscv::PartialCombinePlanAttr>("partial_combine_plan");
         complete &= contribution.dot.getPartialUnroll() == slots &&
                     contribution.dot.getOver().size() == 1 &&
                     contribution.dot.getOver()[0] == reductionAxis &&
@@ -4408,6 +4798,24 @@ public:
                     lhs.getLayout().getTimeFactors()[*lhsPosition] == 1 &&
                     rhs.getLayout().getTimeFactors()[*rhsPosition] == 1 &&
                     contribution.dot.getPartialLayoutPlanAttr() &&
+                    combinePlan &&
+                    combinePlan.getRealization() == "level_scaled" &&
+                    combinePlan.getSourceSetType() ==
+                        firstCombinePlan.getSourceSetType() &&
+                    combinePlan.getReducedSetType() ==
+                        firstCombinePlan.getReducedSetType() &&
+                    combinePlan.getFinalSetType() ==
+                        firstCombinePlan.getFinalSetType() &&
+                    combinePlan.getMultiplyInstruction() ==
+                        firstCombinePlan.getMultiplyInstruction() &&
+                    combinePlan.getFinalizeInstruction() ==
+                        firstCombinePlan.getFinalizeInstruction() &&
+                    combinePlan.getLhsParts().size() ==
+                        static_cast<size_t>(*carryParts) &&
+                    combinePlan.getRhsParts().size() ==
+                        static_cast<size_t>(*carryParts) &&
+                    combinePlan.getScaleParts().size() ==
+                        static_cast<size_t>(*carryParts) &&
                     mlir::dyn_cast<riscv::ValueType>(
                         contribution.dot.getPartialLayoutPlanAttr()
                             .getPartialSlotType()) == slotType;
@@ -4424,66 +4832,31 @@ public:
         llvm::SmallVector<int64_t> scaleReplicas;
       };
       llvm::SmallVector<OutputPartialOperands, 1> outputOperands(*carryParts);
-      std::string multiplyInstruction;
       for (int64_t outputPart = 0; outputPart < *carryParts; ++outputPart) {
         OutputPartialOperands &operands = outputOperands[outputPart];
         for (ScaledPartialContribution &contribution : contributions) {
-          riscv::ValueType lhs = contribution.dot.getLhs().getType();
-          riscv::ValueType rhs = contribution.dot.getRhs().getType();
-          riscv::ValueType scale =
-              mlir::cast<riscv::ValueType>(contribution.scale.getType());
-          auto lhsReplica = projectReplica(lhs, carryType, outputPart);
-          auto rhsReplica = projectReplica(rhs, carryType, outputPart);
-          auto scaleReplica = projectReplica(scale, carryType, outputPart);
-          if (!lhsReplica || !rhsReplica || !scaleReplica) {
-            complete = false;
-            break;
-          }
-          auto selected = partialMultiplyInstruction(lhs, rhs);
-          if (!selected) {
-            complete = false;
-            break;
-          }
-          if (multiplyInstruction.empty())
-            multiplyInstruction = *selected;
-          else if (multiplyInstruction != *selected) {
-            complete = false;
-            break;
-          }
+          auto combinePlan = contribution.dot->getAttrOfType<
+              riscv::PartialCombinePlanAttr>("partial_combine_plan");
           operands.lhs.push_back(contribution.dot.getLhs());
           operands.rhs.push_back(contribution.dot.getRhs());
           operands.scales.push_back(contribution.scale);
-          operands.lhsReplicas.push_back(*lhsReplica);
-          operands.rhsReplicas.push_back(*rhsReplica);
-          operands.scaleReplicas.push_back(*scaleReplica);
+          operands.lhsReplicas.push_back(combinePlan.getLhsParts()[outputPart]);
+          operands.rhsReplicas.push_back(combinePlan.getRhsParts()[outputPart]);
+          operands.scaleReplicas.push_back(
+              combinePlan.getScaleParts()[outputPart]);
         }
-        if (!complete)
-          break;
       }
-      if (!complete)
-        continue;
-
-      auto reducedSlot = mlir::dyn_cast<riscv::ValueType>(
-          firstLayoutPlan.getReducedSlotType());
-      if (!reducedSlot)
-        continue;
-      auto setType = riscv::PartialSetType::get(
-          rewriter.getContext(), slotType, reductionAxis, slots,
-          slotType.getShape()[0],
-          slots * slotType.getLayout().getRegisterGroups());
-      auto reducedType = riscv::PartialSetType::get(
-          rewriter.getContext(), reducedSlot, reductionAxis, slots,
-          setType.getTermsPerSlot(),
-          slots * reducedSlot.getLayout().getRegisterGroups());
+      auto setType = mlir::cast<riscv::PartialSetType>(
+          firstCombinePlan.getSourceSetType());
+      auto reducedType = mlir::cast<riscv::PartialSetType>(
+          firstCombinePlan.getReducedSetType());
+      auto combinedType = mlir::cast<riscv::PartialSetType>(
+          firstCombinePlan.getFinalSetType());
       const int64_t chains = firstTopology.getCombineArity();
       if (chains <= 0 || slots % chains ||
           firstTopology.getSlotOrder().size() != static_cast<size_t>(slots))
         continue;
       const int64_t fanout = slots / chains;
-      auto combinedType = riscv::PartialSetType::get(
-          rewriter.getContext(), reducedSlot, reductionAxis, chains,
-          reducedType.getTermsPerSlot() * fanout,
-          chains * reducedSlot.getLayout().getRegisterGroups());
 
       rewriter.setInsertionPoint(yield);
       llvm::SmallVector<mlir::Value> scalarParts;
@@ -4500,7 +4873,7 @@ public:
             rewriter.getDenseI64ArrayAttr(operands.rhsReplicas),
             rewriter.getDenseI64ArrayAttr(laneOffsets),
             rewriter.getDenseI64ArrayAttr(laneOffsets), reductionAxis,
-            multiplyInstruction,
+            firstCombinePlan.getMultiplyInstruction(),
             ownerDomain(yield), nextPartialBirthId++, ownerDomain(yield),
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-set", "rvv.partial-set",
@@ -4539,8 +4912,8 @@ public:
             reductionAxis,
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-finalize",
-                *partialFinalizeInstruction(combinedType, reductionAxis),
-                *partialFinalizeInstruction(combinedType, reductionAxis),
+                firstCombinePlan.getFinalizeInstruction(),
+                firstCombinePlan.getFinalizeInstruction(),
                 combinedType.getResourceGroups(), 0, 0, 0, "none", "exact",
                 {reductionAxis, chains}));
         riscv_internal::copyOrigin(contributions.front().dot, finalized);
@@ -4677,44 +5050,35 @@ public:
       const int64_t reductionAxis = dot.getOver()[0];
       riscv::ValueType lhs = dot.getLhs().getType();
       riscv::ValueType rhs = dot.getRhs().getType();
-      auto lhsPosition = axisPosition(lhs, reductionAxis);
-      auto rhsPosition = axisPosition(rhs, reductionAxis);
-      if (!lhsPosition || !rhsPosition)
-        continue;
-      auto lhsStreams = riscv_internal::staticProduct(
-          lhs.getLayout().getTimeFactors().asArrayRef());
-      auto rhsStreams = riscv_internal::staticProduct(
-          rhs.getLayout().getTimeFactors().asArrayRef());
-      if (!lhsStreams || !rhsStreams || *lhsStreams != *rhsStreams)
-        continue;
-      const int64_t slots = *lhsStreams;
-      if (slots < 2 || (slots & (slots - 1)) != 0)
-        continue;
-      auto layoutPlan = dot.getPartialLayoutPlanAttr();
-      auto slotType =
-          layoutPlan ? mlir::dyn_cast<riscv::ValueType>(
-                           layoutPlan.getPartialSlotType())
-                     : riscv::ValueType();
+      auto plan = dot->getAttrOfType<riscv::PartialCombinePlanAttr>(
+          "partial_combine_plan");
+      auto sourceSet =
+          plan ? mlir::dyn_cast<riscv::PartialSetType>(plan.getSourceSetType())
+               : riscv::PartialSetType();
+      auto finalSet =
+          plan ? mlir::dyn_cast<riscv::PartialSetType>(plan.getFinalSetType())
+               : riscv::PartialSetType();
       auto resultValue =
           mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
       auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
           resultValue ? resultValue.getElementType() : dot.getResult().getType());
-      auto outputParts = resultValue
-                             ? riscv_internal::staticProduct(
-                                   resultValue.getLayout()
-                                       .getReplicaFactors()
-                                       .asArrayRef())
-                             : std::optional<int64_t>(1);
-      if (!slotType || !resultElement || !resultElement.isSigned() ||
-          resultElement.getWidth() != 32 || !outputParts || *outputParts <= 0)
+      if (!plan || !sourceSet || !finalSet || !resultElement ||
+          !resultElement.isSigned() || resultElement.getWidth() != 32 ||
+          plan.getOutputParts() <= 0 ||
+          plan.getLhsParts().size() != plan.getRhsParts().size() ||
+          plan.getLhsParts().size() !=
+              static_cast<size_t>(plan.getOutputParts() * sourceSet.getSlots()) ||
+          plan.getCombineSetTypes().size() !=
+              plan.getCombineArities().size()) {
+        dot.emitError(
+            "selected independent topology reached materialization without a closed combine plan");
+        failed = true;
         continue;
-      auto multiplyInstruction = partialMultiplyInstruction(lhs, rhs);
-      if (!multiplyInstruction)
-        continue;
-
+      }
       riscv::ConvertLayoutOp vectorConsumer;
       riscv::ValueType vectorResult;
-      if (dot.getResult().hasOneUse()) {
+      if (plan.getRealization() == "independent_vector" &&
+          dot.getResult().hasOneUse()) {
         vectorConsumer = mlir::dyn_cast<riscv::ConvertLayoutOp>(
             *dot.getResult().getUsers().begin());
         if (vectorConsumer &&
@@ -4723,154 +5087,29 @@ public:
           vectorResult =
               mlir::dyn_cast<riscv::ValueType>(vectorConsumer.getResult().getType());
       }
-      auto vectorSlotType =
-          layoutPlan ? mlir::dyn_cast<riscv::ValueType>(
-                           layoutPlan.getVectorSlotType())
-                     : riscv::ValueType();
-      auto lhsReplicas = riscv_internal::staticProduct(
-          lhs.getLayout().getReplicaFactors().asArrayRef());
-      auto rhsReplicas = riscv_internal::staticProduct(
-          rhs.getLayout().getReplicaFactors().asArrayRef());
-      auto vectorResultStreams =
-          vectorResult
-              ? riscv_internal::staticProduct(
-                    vectorResult.getLayout().getTimeFactors().asArrayRef())
-              : std::optional<int64_t>();
-      auto vectorResultReplicas =
-          vectorResult
-              ? riscv_internal::staticProduct(
-                    vectorResult.getLayout().getReplicaFactors().asArrayRef())
-              : std::optional<int64_t>();
-      const bool preservesFreeLane =
-          vectorConsumer && vectorResult && vectorSlotType && lhsStreams && rhsStreams &&
-          *lhsStreams == slots && *rhsStreams == slots && lhsReplicas &&
-          rhsReplicas && *lhsReplicas == 1 && *rhsReplicas == 1 &&
-          vectorResultStreams && vectorResultReplicas &&
-          *vectorResultStreams == 1 && *vectorResultReplicas == 1;
-      if (preservesFreeLane) {
-        const int64_t slotGroups =
-            vectorSlotType.getLayout().getRegisterGroups();
-        const int64_t setGroups =
-            slots * slotGroups;
-        const int64_t operandGroups = lhs.getLayout().getRegisterGroups() +
-                                      rhs.getLayout().getRegisterGroups();
-        auto kernel = dot->getParentOfType<riscv::KernelOp>();
-        if (!kernel || setGroups <= 0 || operandGroups < 0 ||
-            setGroups >
-                kernel.getTarget().getVectorRegisters() - operandGroups)
-          continue;
-
-        rewriter.setInsertionPoint(dot);
-        auto partialType = riscv::PartialSetType::get(
-            rewriter.getContext(), vectorSlotType, reductionAxis, slots,
-            vectorSlotType.getShape()[*axisPosition(vectorSlotType,
-                                                     reductionAxis)],
-            setGroups);
-        llvm::SmallVector<int64_t> operandSlots(slots, 0);
-        llvm::SmallVector<int64_t> operandParts;
-        for (int64_t stream = 0; stream < slots; ++stream)
-          operandParts.push_back(stream);
-        mlir::Value partials;
-        int64_t remainingSlots = slots;
-        int64_t termsPerSlot = partialType.getTermsPerSlot();
-        auto set = rewriter.create<riscv::RVVPartialSetOp>(
-            dot.getLoc(), partialType, mlir::ValueRange{dot.getLhs()},
-            mlir::ValueRange{dot.getRhs()},
-            rewriter.getDenseI64ArrayAttr(operandSlots),
-            rewriter.getDenseI64ArrayAttr(operandSlots),
-            rewriter.getDenseI64ArrayAttr(operandParts),
-            rewriter.getDenseI64ArrayAttr(operandParts),
-            rewriter.getDenseI64ArrayAttr(operandSlots),
-            rewriter.getDenseI64ArrayAttr(operandSlots), reductionAxis,
-            *multiplyInstruction,
-            ownerDomain(dot), nextPartialBirthId++, ownerDomain(dot),
-            riscv_internal::leaf(
-                rewriter, "rvv", "partial-set", "rvv.partial-set",
-                "rvv.partial-set", operandGroups, setGroups, 0, 0, "none",
-                "exact", {reductionAxis, slots}));
-        riscv_internal::copyOrigin(dot, set);
-        sinkReplicaSupplies(set);
-        partials = set.getResult();
-        while (remainingSlots > 1) {
-          if (remainingSlots % 2)
-            break;
-          remainingSlots /= 2;
-          termsPerSlot *= 2;
-          auto combinedType = riscv::PartialSetType::get(
-              rewriter.getContext(), vectorSlotType, reductionAxis,
-              remainingSlots, termsPerSlot,
-              remainingSlots *
-                  vectorSlotType.getLayout().getRegisterGroups());
-          auto combine = rewriter.create<riscv::RVVPartialCombineOp>(
-              dot.getLoc(), combinedType, partials, 2, "pairwise",
-              riscv_internal::leaf(
-                  rewriter, "rvv", "partial-combine",
-                  "rvv.partial-combine", "rvv.partial-combine",
-                  mlir::cast<riscv::PartialSetType>(partials.getType())
-                      .getResourceGroups(),
-                  combinedType.getResourceGroups(), 0, 0, "none", "exact",
-                  {reductionAxis, 2, remainingSlots}));
-          riscv_internal::copyOrigin(dot, combine);
-          partials = combine.getResult();
-        }
-        if (remainingSlots != 1)
-          continue;
-        auto finalize = rewriter.create<riscv::RVVPartialFinalizeOp>(
-            dot.getLoc(), vectorResult, partials, reductionAxis,
-            riscv_internal::leaf(
-                rewriter, "rvv", "partial-finalize",
-                "rvv.partial-finalize.widen",
-                "rvv.partial-finalize.widen",
-                mlir::cast<riscv::PartialSetType>(partials.getType())
-                    .getResourceGroups(),
-                vectorResult.getLayout().getRegisterGroups(), 1, 0, "none",
-                "exact", {reductionAxis, slots}));
-        riscv_internal::copyOrigin(dot, finalize);
-        vectorConsumer.getResult().replaceAllUsesWith(finalize.getResult());
-        rewriter.eraseOp(vectorConsumer);
-        rewriter.eraseOp(dot);
-        continue;
-      }
-
-      const int64_t slotGroups = slotType.getLayout().getRegisterGroups();
-      const int64_t setGroups = slots * slotGroups;
       const int64_t operandGroups = lhs.getLayout().getRegisterGroups() +
                                     rhs.getLayout().getRegisterGroups();
-      auto kernel = dot->getParentOfType<riscv::KernelOp>();
-      if (!kernel || setGroups <= 0 || operandGroups < 0 ||
-          setGroups >
-              kernel.getTarget().getVectorRegisters() - operandGroups)
+      if ((plan.getRealization() == "independent_vector") !=
+              static_cast<bool>(vectorResult) ||
+          (plan.getRealization() != "independent_vector" &&
+           plan.getRealization() != "independent_scalar")) {
+        dot.emitError(
+            "selected independent realization no longer matches its consumer");
+        failed = true;
         continue;
-
+      }
       rewriter.setInsertionPoint(dot);
-      llvm::SmallVector<mlir::Value> scalarParts;
-      bool complete = true;
-      for (int64_t outputPart = 0; outputPart < *outputParts; ++outputPart) {
-        auto lhsReplica = resultValue
-                              ? projectReplica(lhs, resultValue, outputPart)
-                              : std::optional<int64_t>(0);
-        auto rhsReplica = resultValue
-                              ? projectReplica(rhs, resultValue, outputPart)
-                              : std::optional<int64_t>(0);
-        if (!lhsReplica || !rhsReplica) {
-          complete = false;
-          break;
-        }
-        auto partialType = riscv::PartialSetType::get(
-            rewriter.getContext(), slotType, reductionAxis, slots,
-            slotType.getShape()[0], setGroups);
+      llvm::SmallVector<mlir::Value> materializedParts;
+      const int64_t slots = sourceSet.getSlots();
+      for (int64_t outputPart = 0; outputPart < plan.getOutputParts();
+           ++outputPart) {
         llvm::SmallVector<int64_t> operandSlots(slots, 0);
-        llvm::SmallVector<int64_t> lhsParts;
-        llvm::SmallVector<int64_t> rhsParts;
-        for (int64_t stream = 0; stream < slots; ++stream) {
-          lhsParts.push_back(*lhsReplica * slots + stream);
-          rhsParts.push_back(*rhsReplica * slots + stream);
-        }
-        mlir::Value partials;
-        int64_t remainingSlots = slots;
-        int64_t termsPerSlot = partialType.getTermsPerSlot();
+        auto lhsParts = plan.getLhsParts().asArrayRef().slice(
+            static_cast<size_t>(outputPart * slots), static_cast<size_t>(slots));
+        auto rhsParts = plan.getRhsParts().asArrayRef().slice(
+            static_cast<size_t>(outputPart * slots), static_cast<size_t>(slots));
         auto set = rewriter.create<riscv::RVVPartialSetOp>(
-            dot.getLoc(), partialType, mlir::ValueRange{dot.getLhs()},
+            dot.getLoc(), sourceSet, mlir::ValueRange{dot.getLhs()},
             mlir::ValueRange{dot.getRhs()},
             rewriter.getDenseI64ArrayAttr(operandSlots),
             rewriter.getDenseI64ArrayAttr(operandSlots),
@@ -4878,23 +5117,21 @@ public:
             rewriter.getDenseI64ArrayAttr(rhsParts),
             rewriter.getDenseI64ArrayAttr(operandSlots),
             rewriter.getDenseI64ArrayAttr(operandSlots), reductionAxis,
-            *multiplyInstruction,
+            plan.getMultiplyInstruction(),
             ownerDomain(dot), nextPartialBirthId++, ownerDomain(dot),
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-set", "rvv.partial-set",
-                "rvv.partial-set", operandGroups, setGroups, 0, 0, "none",
-                "exact", {reductionAxis, slots}));
+                "rvv.partial-set", operandGroups,
+                sourceSet.getResourceGroups(), 0, 0, "none", "exact",
+                {reductionAxis, slots}));
         riscv_internal::copyOrigin(dot, set);
         sinkReplicaSupplies(set);
-        partials = set.getResult();
-        while (remainingSlots > 1) {
-          const int64_t arity = remainingSlots % 2 == 0 ? 2 : remainingSlots;
-          remainingSlots /= arity;
-          termsPerSlot *= arity;
-          auto combinedType = riscv::PartialSetType::get(
-              rewriter.getContext(), slotType, reductionAxis, remainingSlots,
-              termsPerSlot,
-              remainingSlots * slotType.getLayout().getRegisterGroups());
+        mlir::Value partials = set.getResult();
+        for (auto [typeAttr, arity] :
+             llvm::zip(plan.getCombineSetTypes(),
+                       plan.getCombineArities().asArrayRef())) {
+          auto combinedType = mlir::cast<riscv::PartialSetType>(
+              mlir::cast<mlir::TypeAttr>(typeAttr).getValue());
           auto combine = rewriter.create<riscv::RVVPartialCombineOp>(
               dot.getLoc(), combinedType, partials, arity, "pairwise",
               riscv_internal::leaf(
@@ -4903,46 +5140,43 @@ public:
                   mlir::cast<riscv::PartialSetType>(partials.getType())
                       .getResourceGroups(),
                   combinedType.getResourceGroups(), 0, 0, "none", "exact",
-                  {reductionAxis, arity, remainingSlots}));
+                  {reductionAxis, arity, combinedType.getSlots()}));
           riscv_internal::copyOrigin(dot, combine);
           partials = combine.getResult();
         }
-        if (!complete)
-          break;
-        auto finalizeInstruction = partialFinalizeInstruction(
-            mlir::cast<riscv::PartialSetType>(partials.getType()),
-            reductionAxis);
-        if (!finalizeInstruction) {
-          complete = false;
-          break;
-        }
+        mlir::Type finalizedType = vectorResult
+                                       ? mlir::Type(vectorResult)
+                                       : mlir::Type(resultElement);
         auto finalize = rewriter.create<riscv::RVVPartialFinalizeOp>(
-            dot.getLoc(), resultElement, partials, reductionAxis,
+            dot.getLoc(), finalizedType, partials, reductionAxis,
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-finalize",
-                *finalizeInstruction, *finalizeInstruction,
+                plan.getFinalizeInstruction(), plan.getFinalizeInstruction(),
                 mlir::cast<riscv::PartialSetType>(partials.getType())
                     .getResourceGroups(),
-                0, 2, 0, "none", "exact",
-                {reductionAxis, remainingSlots}));
+                vectorResult ? vectorResult.getLayout().getRegisterGroups() : 0,
+                2, 0, "none", "exact", {reductionAxis, slots}));
         riscv_internal::copyOrigin(dot, finalize);
-        scalarParts.push_back(finalize.getResult());
+        materializedParts.push_back(finalize.getResult());
       }
-      if (!complete)
-        continue;
       mlir::Value replacement;
-      if (resultValue) {
+      if (vectorResult) {
+        replacement = materializedParts.front();
+        vectorConsumer.getResult().replaceAllUsesWith(replacement);
+        rewriter.eraseOp(vectorConsumer);
+      } else if (resultValue) {
         auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
-            dot.getLoc(), resultValue, scalarParts,
+            dot.getLoc(), resultValue, materializedParts,
             riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
                                  "scalar.assemble-replicas",
                                  "scalar.assemble-replicas", 0, 0));
         riscv_internal::copyOrigin(dot, assembled);
         replacement = assembled.getResult();
       } else {
-        replacement = scalarParts.front();
+        replacement = materializedParts.front();
       }
-      dot.getResult().replaceAllUsesWith(replacement);
+      if (!vectorResult)
+        dot.getResult().replaceAllUsesWith(replacement);
       rewriter.eraseOp(dot);
     }
 
@@ -4959,80 +5193,56 @@ public:
     for (riscv::BinaryOp root : partialAddRoots) {
       if (!root || !root->getBlock())
         continue;
+      auto plan = root->getAttrOfType<riscv::PartialAddTreePlanAttr>(
+          "partial_add_tree_plan");
+      if (!plan)
+        continue;
       llvm::SmallVector<riscv::BinaryOp> adds;
       llvm::SmallVector<PartialAddLeaf> leaves;
       if (!collectPartialAddTree(root.getResult(), root, adds, leaves) ||
-          leaves.size() < 2)
+          leaves.size() != plan.getLeafSetTypes().size() ||
+          leaves.size() != plan.getNormalizedSetTypes().size() ||
+          leaves.size() != plan.getLeafMultiplyInstructions().size() ||
+          leaves.size() != plan.getSplits().size()) {
+        root.emitError(
+            "partial add tree no longer matches its frozen typed leaf plan");
+        failed = true;
         continue;
-
-      llvm::SmallVector<riscv::PartialSetType> leafTypes;
-      bool completeTypes = true;
-      for (PartialAddLeaf leaf : leaves) {
-        auto type = partialTypeForAddLeaf(rewriter, leaf);
-        if (!type) {
-          completeTypes = false;
-          break;
-        }
-        leafTypes.push_back(*type);
       }
-      if (!completeTypes)
-        continue;
-
-      riscv::PartialSetType targetType;
-      llvm::SmallVector<int64_t> splits;
-      llvm::SmallVector<size_t> order(leaves.size());
-      std::iota(order.begin(), order.end(), 0);
-      llvm::sort(order, [&](size_t lhs, size_t rhs) {
-        auto lhsSet = leafTypes[lhs];
-        auto rhsSet = leafTypes[rhs];
-        auto lhsPosition = axisPosition(lhsSet.getPartialType(),
-                                        lhsSet.getReductionAxis());
-        auto rhsPosition = axisPosition(rhsSet.getPartialType(),
-                                        rhsSet.getReductionAxis());
-        return lhsSet.getPartialType().getLayout().getLaneFactors()
-                   [*lhsPosition] >
-               rhsSet.getPartialType().getLayout().getLaneFactors()
-                   [*rhsPosition];
-      });
-      for (size_t targetIndex : order) {
-        auto candidate = leafTypes[targetIndex];
-        llvm::SmallVector<int64_t> candidateSplits;
-        bool compatible = true;
-        for (riscv::PartialSetType source : leafTypes) {
-          auto split = partialSplitFactor(source, candidate);
-          if (!split || *split > 2) {
-            compatible = false;
-            break;
-          }
-          candidateSplits.push_back(*split);
-        }
-        if (compatible) {
-          targetType = candidate;
-          splits = std::move(candidateSplits);
-          break;
-        }
-      }
-      if (!targetType)
-        continue;
 
       rewriter.setInsertionPoint(root);
       llvm::SmallVector<mlir::Value> normalized;
-      int64_t totalSlots = 0;
-      int64_t totalTerms = 0;
-      int64_t totalResources = 0;
-      for (auto [leaf, declaredType, split] :
-           llvm::zip(leaves, leafTypes, splits)) {
-        auto sourceType = declaredType;
+      bool complete = true;
+      for (size_t index = 0; index < leaves.size(); ++index) {
+        PartialAddLeaf leaf = leaves[index];
+        auto sourceType = mlir::cast<riscv::PartialSetType>(
+            mlir::cast<mlir::TypeAttr>(plan.getLeafSetTypes()[index])
+                .getValue());
+        auto normalizedType = mlir::cast<riscv::PartialSetType>(
+            mlir::cast<mlir::TypeAttr>(plan.getNormalizedSetTypes()[index])
+                .getValue());
+        auto currentType = partialTypeForAddLeaf(rewriter, leaf);
+        const int64_t split = plan.getSplits()[index];
+        auto multiply = mlir::cast<mlir::StringAttr>(
+            plan.getLeafMultiplyInstructions()[index]);
+        if (!currentType || *currentType != sourceType) {
+          complete = false;
+          break;
+        }
         mlir::Value value;
         mlir::Operation *origin = nullptr;
         if (leaf.finalize) {
+          if (!multiply.getValue().empty()) {
+            complete = false;
+            break;
+          }
           value = leaf.finalize.getInput();
           origin = leaf.finalize.getOperation();
         } else {
-          auto multiplyInstruction = partialMultiplyInstruction(
-              leaf.dot.getLhs().getType(), leaf.dot.getRhs().getType());
-          if (!multiplyInstruction)
+          if (multiply.getValue().empty()) {
+            complete = false;
             break;
+          }
           auto set = rewriter.create<riscv::RVVPartialSetOp>(
               root.getLoc(), sourceType,
               mlir::ValueRange{leaf.dot.getLhs()},
@@ -5043,7 +5253,7 @@ public:
               rewriter.getDenseI64ArrayAttr({0}),
               rewriter.getDenseI64ArrayAttr({0}),
               rewriter.getDenseI64ArrayAttr({0}),
-              sourceType.getReductionAxis(), *multiplyInstruction,
+              sourceType.getReductionAxis(), multiply.getValue(),
               ownerDomain(root), nextPartialBirthId++, ownerDomain(root),
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-set", "rvv.partial-set",
@@ -5055,55 +5265,48 @@ public:
           origin = leaf.dot.getOperation();
         }
         if (split > 1) {
-          auto repackedType = riscv::PartialSetType::get(
-              rewriter.getContext(), targetType.getPartialType(),
-              targetType.getReductionAxis(), sourceType.getSlots() * split,
-              sourceType.getTermsPerSlot() / split,
-              sourceType.getResourceGroups());
           auto repack = rewriter.create<riscv::RVVPartialRepackOp>(
-              root.getLoc(), repackedType, value, split,
+              root.getLoc(), normalizedType, value, split,
               riscv_internal::leaf(
                   rewriter, "rvv", "partial-repack",
                   "rvv.partial-repack.split", "rvv.partial-repack.split",
                   sourceType.getResourceGroups(),
-                  repackedType.getResourceGroups(), 0, 0, "none", "exact",
+                  normalizedType.getResourceGroups(), 0, 0, "none", "exact",
                   {sourceType.getReductionAxis(), split}));
           riscv_internal::copyOrigin(origin, repack);
           value = repack.getResult();
-          sourceType = repackedType;
+        } else if (normalizedType != sourceType) {
+          complete = false;
+          break;
         }
         normalized.push_back(value);
-        totalSlots += sourceType.getSlots();
-        totalTerms += sourceType.getSlots() * sourceType.getTermsPerSlot();
-        totalResources += sourceType.getResourceGroups();
       }
-      if (normalized.size() != leaves.size())
+      if (!complete || normalized.size() != leaves.size()) {
+        root.emitError(
+            "partial add tree materialization disagrees with its frozen typed plan");
+        failed = true;
         continue;
-      auto combinedType = riscv::PartialSetType::get(
-          rewriter.getContext(), targetType.getPartialType(),
-          targetType.getReductionAxis(), 1, totalTerms,
-          targetType.getPartialType().getLayout().getRegisterGroups());
+      }
+      auto combinedType =
+          mlir::cast<riscv::PartialSetType>(plan.getMergedSetType());
       auto combine = rewriter.create<riscv::RVVPartialMergeOp>(
           root.getLoc(), combinedType, normalized, "pairwise",
           riscv_internal::leaf(
               rewriter, "rvv", "partial-merge", "rvv.partial-merge",
-              "rvv.partial-merge", totalResources,
+              "rvv.partial-merge", plan.getTotalResourceGroups(),
               combinedType.getResourceGroups(), 0, 0, "none", "exact",
-              {targetType.getReductionAxis(),
-               static_cast<int64_t>(normalized.size()), totalSlots,
-               totalTerms}));
+              {combinedType.getReductionAxis(),
+               static_cast<int64_t>(normalized.size()), plan.getTotalSlots(),
+               plan.getTotalTerms()}));
       riscv_internal::copyOrigin(root, combine);
-      auto instruction = partialFinalizeInstruction(
-          combinedType, targetType.getReductionAxis());
-      if (!instruction)
-        continue;
       auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
           root.getLoc(), root.getResult().getType(), combine.getResult(),
-          targetType.getReductionAxis(),
+          combinedType.getReductionAxis(),
           riscv_internal::leaf(
-              rewriter, "rvv", "partial-finalize", *instruction,
-              *instruction, combinedType.getResourceGroups(), 0, 2, 0,
-              "none", "exact", {targetType.getReductionAxis(), 1}));
+              rewriter, "rvv", "partial-finalize",
+              plan.getFinalizeInstruction(), plan.getFinalizeInstruction(),
+              combinedType.getResourceGroups(), 0, 2, 0, "none", "exact",
+              {combinedType.getReductionAxis(), 1}));
       riscv_internal::copyOrigin(root, finalized);
 
       root.getResult().replaceAllUsesWith(finalized.getResult());

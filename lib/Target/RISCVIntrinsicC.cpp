@@ -631,6 +631,8 @@ private:
   compilePackedPlaneMerge(riscv::PackedPlaneMergeOp operation);
   mlir::LogicalResult
   compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation);
+  mlir::LogicalResult compileRVVSignedBitmaskReduce(
+      riscv::RVVSignedBitmaskReduceOp operation);
   mlir::LogicalResult compileRVVBitmaskWindowLoad(
       riscv::RVVBitmaskWindowLoadOp operation);
   mlir::LogicalResult
@@ -2333,6 +2335,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compilePackedPlaneMerge(merge);
   if (auto decode = mlir::dyn_cast<riscv::RVVBitmaskDecodeOp>(operation))
     return compileRVVBitmaskDecode(decode);
+  if (auto reduction =
+          mlir::dyn_cast<riscv::RVVSignedBitmaskReduceOp>(operation))
+    return compileRVVSignedBitmaskReduce(reduction);
   if (auto load =
           mlir::dyn_cast<riscv::RVVBitmaskWindowLoadOp>(operation))
     return compileRVVBitmaskWindowLoad(load);
@@ -8407,6 +8412,102 @@ Emitter::compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation) {
          ", " + vl + ");");
     result.parts.push_back(std::move(decoded));
   }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVSignedBitmaskReduce(
+    riscv::RVVSignedBitmaskReduceOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "rvv.signed-bitmask-reduce.i8-i16")
+    return fail(operation,
+                "RVV signed-bitmask reduction has no exact selected leaf");
+  Binding data = bindings.lookup(operation.getData());
+  Binding packed = bindings.lookup(operation.getField());
+  Binding origin = bindings.lookup(operation.getOrigin());
+  Binding point = bindings.lookup(operation.getPoint());
+  auto materializedData = materializeNumeric(operation.getData(), data);
+  if (mlir::failed(materializedData))
+    return mlir::failure();
+  data = std::move(*materializedData);
+  if (data.kind != Binding::Kind::Vector || packed.kind != Binding::Kind::Field ||
+      origin.kind != Binding::Kind::Point || point.kind != Binding::Kind::Point ||
+      data.parts.size() != 1)
+    return fail(operation,
+                "RVV signed-bitmask reduction requires one vector data part, one encoded field, and two typed points");
+  Binding owner = bindings.lookup(packed.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    mlir::FailureOr<Binding> record = recordForSlice(packed.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(packed);
+  auto integer = field ? mlir::dyn_cast<mlir::IntegerType>(field->type)
+                       : mlir::IntegerType();
+  if (owner.kind != Binding::Kind::Record || owner.interleaveRows != 0 ||
+      !field || !integer || !integer.isUnsigned() || integer.getWidth() != 1 ||
+      field->access.getMapping() != "grouped_layered" ||
+      field->access.getOrder() != "lo_first" || field->bitOffset % 8 ||
+      field->access.getGroupSize() != field->access.getLayerSize() * 8)
+    return fail(operation,
+                "RVV signed-bitmask reduction field has no direct contiguous mask address");
+
+  auto dataType = operation.getData().getType();
+  auto layout = dataType.getLayout();
+  const int64_t maskBits = layout.getSew() * 8 / layout.getLmulEighths();
+  if (maskBits != 1 && maskBits != 2 && maskBits != 4 && maskBits != 8 &&
+      maskBits != 16 && maskBits != 32 && maskBits != 64)
+    return fail(operation,
+                "RVV signed-bitmask reduction selected an illegal mask ratio");
+  llvm::SmallVector<int64_t, 4> registerAxes =
+      registerAxesFor(operation.getData());
+  auto coordinates = registerCoordinates(operation.getData(), 0);
+  if (!coordinates || coordinates->size() != registerAxes.size())
+    return fail(operation,
+                "RVV signed-bitmask reduction lacks a typed register mapping");
+  std::string record = "(" + owner.recordPointer;
+  for (auto [axis, coordinate] : llvm::zip(registerAxes, *coordinates)) {
+    auto stride = llvm::find_if(owner.recordByteStrides, [&](const auto &entry) {
+      return entry.first == axis;
+    });
+    if (stride == owner.recordByteStrides.end())
+      return fail(operation,
+                  "RVV signed-bitmask reduction register axis has no record-byte stride");
+    record += " + " + std::to_string(coordinate) + " * " + stride->second;
+  }
+  const std::string relative =
+      "((" + point.point.base + ") - (" + origin.point.base + ") + " +
+      partOffset(operation.getData(), 0) + ")";
+  record += " + " + std::to_string(field->bitOffset / 8) + " + ((" +
+            relative + ") / " +
+            std::to_string(field->access.getGroupSize()) + ") * " +
+            std::to_string(field->access.getLayerSize()) + ")";
+  const std::string vl = partVL(operation.getData(), 0);
+  const std::string suffix = vectorSuffix(operation.getData());
+  const std::string vectorTypeName = vectorType(operation.getData());
+  const std::string maskType =
+      "vbool" + std::to_string(maskBits) + "_t";
+  std::string mask = fresh("signed_bitmask");
+  line(maskType + " " + mask + " = __riscv_vlm_v_b" +
+       std::to_string(maskBits) + "((const uint8_t *)(" + record + "), " +
+       vl + ");");
+  std::string negated = fresh("signed_bitmask_negated");
+  line(vectorTypeName + " " + negated + " = __riscv_vneg_v_" + suffix +
+       "(" + data.parts.front() + ", " + vl + ");");
+  std::string selected = fresh("signed_bitmask_selected");
+  line(vectorTypeName + " " + selected + " = __riscv_vmerge_vvm_" + suffix +
+       "(" + negated + ", " + data.parts.front() + ", " + mask + ", " + vl +
+       ");");
+  std::string zero = fresh("signed_bitmask_zero");
+  line("vint16m1_t " + zero +
+       " = __riscv_vmv_v_x_i16m1(0, 1);");
+  std::string reduced = fresh("signed_bitmask_sum");
+  line("vint16m1_t " + reduced + " = __riscv_vwredsum_vs_" + suffix +
+       "_i16m1(" + selected + ", " + zero + ", " + vl + ");");
+  Binding result;
+  result.kind = Binding::Kind::Scalar;
+  result.scalar = "((int32_t)__riscv_vmv_x_s_i16m1_i16(" + reduced + "))";
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }

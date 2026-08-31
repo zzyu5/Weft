@@ -27,6 +27,7 @@ from weft.language import (
 @weft.encoding
 class Q1_0:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 128
     d: f16
     q: u1[128] @ grouped(8) @ layered(1, lo_first)

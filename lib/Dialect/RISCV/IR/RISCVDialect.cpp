@@ -1219,6 +1219,123 @@ mlir::LogicalResult PartialLayoutPlanAttr::verify(
   return mlir::success();
 }
 
+mlir::LogicalResult PartialCombinePlanAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    llvm::StringRef realization, mlir::Type sourceSetType,
+    mlir::Type reducedSetType, mlir::Type finalSetType,
+    mlir::ArrayAttr combineSetTypes,
+    mlir::DenseI64ArrayAttr combineArities,
+    mlir::DenseI64ArrayAttr lhsParts, mlir::DenseI64ArrayAttr rhsParts,
+    mlir::DenseI64ArrayAttr scaleParts, llvm::StringRef multiplyInstruction,
+    llvm::StringRef finalizeInstruction, int64_t outputParts,
+    int64_t resourceGroups) {
+  auto source = mlir::dyn_cast<weft::riscv::PartialSetType>(sourceSetType);
+  auto reduced = mlir::dyn_cast<weft::riscv::PartialSetType>(reducedSetType);
+  auto final = mlir::dyn_cast<weft::riscv::PartialSetType>(finalSetType);
+  if ((realization != "level_scaled" &&
+       realization != "independent_vector" &&
+       realization != "independent_scalar") ||
+      !source || !final || outputParts <= 0 || resourceGroups <= 0 ||
+      multiplyInstruction.empty() || finalizeInstruction.empty() ||
+      lhsParts.size() != rhsParts.size())
+    return emitError()
+           << "partial combine plan requires one complete typed realization";
+  if (realization == "level_scaled") {
+    if (!reduced || !combineSetTypes.empty() || !combineArities.empty() ||
+        lhsParts.size() != static_cast<size_t>(outputParts) ||
+        scaleParts.size() != static_cast<size_t>(outputParts) ||
+        source.getReductionAxis() != reduced.getReductionAxis() ||
+        source.getReductionAxis() != final.getReductionAxis())
+      return emitError()
+             << "level-scaled combine plan requires one source/reduced/final set and one part map per output";
+  } else {
+    if (reduced || !scaleParts.empty() ||
+        combineSetTypes.size() != combineArities.size() ||
+        lhsParts.size() !=
+            static_cast<size_t>(outputParts * source.getSlots()))
+      return emitError()
+             << "independent combine plan requires one flattened source map and one typed set per combine stage";
+    weft::riscv::PartialSetType previous = source;
+    for (auto [typeAttr, arity] :
+         llvm::zip(combineSetTypes, combineArities.asArrayRef())) {
+      auto typed = mlir::dyn_cast<mlir::TypeAttr>(typeAttr);
+      auto next = typed ? mlir::dyn_cast<weft::riscv::PartialSetType>(
+                              typed.getValue())
+                        : weft::riscv::PartialSetType();
+      if (!next || arity <= 1 || previous.getSlots() % arity ||
+          next.getPartialType() != previous.getPartialType() ||
+          next.getReductionAxis() != previous.getReductionAxis() ||
+          next.getSlots() != previous.getSlots() / arity ||
+          next.getTermsPerSlot() != previous.getTermsPerSlot() * arity)
+        return emitError()
+               << "independent combine plan contains an inconsistent typed stage";
+      previous = next;
+    }
+    if (previous != final || final.getSlots() != 1)
+      return emitError()
+             << "independent combine stages must close to the declared final set";
+  }
+  if (llvm::any_of(lhsParts.asArrayRef(), [](int64_t value) { return value < 0; }) ||
+      llvm::any_of(rhsParts.asArrayRef(), [](int64_t value) { return value < 0; }) ||
+      llvm::any_of(scaleParts.asArrayRef(),
+                   [](int64_t value) { return value < 0; }))
+    return emitError() << "partial combine part maps must be non-negative";
+  return mlir::success();
+}
+
+mlir::LogicalResult PartialAddTreePlanAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    mlir::ArrayAttr leafSetTypes, mlir::ArrayAttr normalizedSetTypes,
+    mlir::ArrayAttr leafMultiplyInstructions,
+    mlir::DenseI64ArrayAttr splits, mlir::Type mergedSetType,
+    llvm::StringRef finalizeInstruction, int64_t totalSlots,
+    int64_t totalTerms, int64_t totalResourceGroups) {
+  auto merged = mlir::dyn_cast<weft::riscv::PartialSetType>(mergedSetType);
+  const size_t leaves = leafSetTypes.size();
+  if (leaves < 2 || normalizedSetTypes.size() != leaves ||
+      leafMultiplyInstructions.size() != leaves || splits.size() != leaves ||
+      !merged || merged.getSlots() != 1 || finalizeInstruction.empty() ||
+      totalSlots <= 0 || totalTerms <= 0 || totalResourceGroups <= 0)
+    return emitError()
+           << "partial add-tree plan requires one complete typed plan for every leaf";
+  int64_t computedSlots = 0;
+  int64_t computedTerms = 0;
+  int64_t computedResources = 0;
+  for (size_t index = 0; index < leaves; ++index) {
+    auto sourceAttr = mlir::dyn_cast<mlir::TypeAttr>(leafSetTypes[index]);
+    auto normalizedAttr =
+        mlir::dyn_cast<mlir::TypeAttr>(normalizedSetTypes[index]);
+    auto instruction =
+        mlir::dyn_cast<mlir::StringAttr>(leafMultiplyInstructions[index]);
+    auto source = sourceAttr
+                      ? mlir::dyn_cast<weft::riscv::PartialSetType>(
+                            sourceAttr.getValue())
+                      : weft::riscv::PartialSetType();
+    auto normalized = normalizedAttr
+                          ? mlir::dyn_cast<weft::riscv::PartialSetType>(
+                                normalizedAttr.getValue())
+                          : weft::riscv::PartialSetType();
+    const int64_t split = splits[index];
+    if (!source || !normalized || !instruction || split <= 0 || split > 2 ||
+        source.getSlots() * split != normalized.getSlots() ||
+        source.getTermsPerSlot() != normalized.getTermsPerSlot() * split ||
+        source.getResourceGroups() != normalized.getResourceGroups() ||
+        normalized.getPartialType() != merged.getPartialType() ||
+        normalized.getReductionAxis() != merged.getReductionAxis())
+      return emitError()
+             << "partial add-tree leaf disagrees with its normalized typed representation";
+    computedSlots += normalized.getSlots();
+    computedTerms += normalized.getSlots() * normalized.getTermsPerSlot();
+    computedResources += normalized.getResourceGroups();
+  }
+  if (computedSlots != totalSlots || computedTerms != totalTerms ||
+      computedResources != totalResourceGroups ||
+      merged.getTermsPerSlot() != totalTerms)
+    return emitError()
+           << "partial add-tree resource and term totals do not close";
+  return mlir::success();
+}
+
 mlir::LogicalResult NestedPartialPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     int64_t windowAxis, int64_t issueStreams, int64_t windowExtent,
@@ -4157,6 +4274,92 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
         "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
         "a record owner covering the sub-Level origin, an explicitly anchored "
         "sub-Level point, and a complete time/lane result");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVSignedBitmaskReduceOp::verify() {
+  ValueType data = getData().getType();
+  ValueType field = getField().getType();
+  auto dataElement = mlir::dyn_cast<mlir::IntegerType>(data.getElementType());
+  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto resultElement = mlir::dyn_cast<mlir::IntegerType>(getResult().getType());
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto origin = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto point = getPoint().getDefiningOp<PhysicalPointOp>();
+  auto position = llvm::find(data.getAxisIds().asArrayRef(), getReductionAxis());
+  const bool hasAxis = position != data.getAxisIds().asArrayRef().end();
+  const size_t axisPosition =
+      hasAxis ? static_cast<size_t>(position - data.getAxisIds().asArrayRef().begin())
+              : 0;
+  const int64_t extent = hasAxis ? data.getShape()[axisPosition] : 0;
+  auto partition = point
+                       ? point.getPartition().getDefiningOp<
+                             mlir::arith::ConstantIndexOp>()
+                       : mlir::arith::ConstantIndexOp();
+  bool compatibleShape = field.getAxisIds() == data.getAxisIds() &&
+                         field.getShape().size() == data.getShape().size();
+  if (compatibleShape)
+    for (size_t index = 0; index < field.getShape().size(); ++index)
+      compatibleShape &= index == axisPosition
+                             ? field.getShape()[index] >= data.getShape()[index]
+                             : field.getShape()[index] == data.getShape()[index];
+  bool ownerCoversOriginRecord =
+      sourceField &&
+      static_cast<bool>(sourceField.getOwner().getDefiningOp<LoadOp>());
+  if (sourceField && origin)
+    if (auto owner = sourceField.getOwner().getDefiningOp<ExtractOp>()) {
+      auto ownerInput = mlir::dyn_cast<ValueType>(owner.getInput().getType());
+      size_t cursor = 0;
+      for (auto [ownerPosition, selectorAttribute] :
+           llvm::enumerate(owner.getSelectors())) {
+        llvm::StringRef selector =
+            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+        if (selector == "all")
+          continue;
+        if (cursor >= owner.getIndices().size())
+          break;
+        mlir::Value index = owner.getIndices()[cursor++];
+        if (ownerInput && ownerPosition < ownerInput.getAxisIds().size() &&
+            ownerInput.getAxisIds()[ownerPosition] == getReductionAxis() &&
+            selector == "domain" && index == getOrigin())
+          ownerCoversOriginRecord = true;
+      }
+    }
+  llvm::StringRef validity = data.getLayout().getValidity();
+  llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  bool onlyReductionAxisIsStreamed = hasAxis;
+  if (onlyReductionAxisIsStreamed)
+    for (size_t index = 0; index < data.getShape().size(); ++index)
+      if (index != axisPosition)
+        onlyReductionAxisIsStreamed &=
+            data.getLayout().getTimeFactors()[index] == 1 &&
+            data.getLayout().getLaneFactors()[index] == 1;
+  if (!dataElement || !dataElement.isSigned() || dataElement.getWidth() != 8 ||
+      !fieldElement || fieldElement.isSigned() || fieldElement.getWidth() != 1 ||
+      !resultElement || !resultElement.isSigned() ||
+      resultElement.getWidth() != 32 || !sourceField || !origin || !point ||
+      !partition || !hasAxis || extent <= 0 || extent * 128 >= 32768 ||
+      partition.value() != extent || point.getParent() != getOrigin() ||
+      point.getResult().getType().getDomain().getAxisId() !=
+          getReductionAxis() ||
+      origin.getResult().getType().getDomain().getAxisId() !=
+          getReductionAxis() ||
+      !ownerCoversOriginRecord || !compatibleShape ||
+      !onlyReductionAxisIsStreamed || getAccess() != sourceField.getAccess() ||
+      getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "grouped_layered" ||
+      getAccess().getGroupSize() <= 0 || getAccess().getLayerSize() <= 0 ||
+      getAccess().getGroupSize() != getAccess().getLayerSize() * 8 ||
+      getAccess().getOrder() != "lo_first" || getAccess().getBitOffset() % 8 ||
+      data.getLayout().getCarrier() != "rvv" ||
+      data.getLayout().getTimeFactors()[axisPosition] *
+              data.getLayout().getLaneFactors()[axisPosition] !=
+          extent ||
+      (validity != "full" && validity != "tail") ||
+      !exactLeaf(getLeaf(), "rvv", "signed-bitmask-reduce",
+                 "rvv.signed-bitmask-reduce.i8-i16", "none", tail))
+    return emitOpError(
+        "RVV signed-bitmask reduction requires one signed-i8 lane value, one byte-aligned logical-u1 field over the same exact sub-Level, a proven i16-safe reduction extent, and the exact selected leaf");
   return mlir::success();
 }
 
