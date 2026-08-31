@@ -5636,7 +5636,7 @@ mlir::LogicalResult Emitter::compileRVVUnitEntryWindowLoad(
     const std::string pointer =
         "((const " + *cType + " *)(" + recordPointer + ")) + ((size_t)(" +
         baseIndex.scalar + ") * " + std::to_string(operation.getEntryStride()) +
-        ")";
+        ") + " + partOffset(operation.getResult(), part);
     const std::string vl = partVL(operation.getResult(), part);
     std::string loaded = fresh("entry_window");
     line(resultType + " " + loaded + " = __riscv_vle" +
@@ -9688,6 +9688,11 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     return fail(operation, "regular-repeat gather has no lane extent");
 
   const int64_t registerParts = registerPartCount(firstValue);
+  auto sourceBase = materializeNumeric(operation.getSourceBase(),
+                                       bindings.lookup(operation.getSourceBase()));
+  if (mlir::failed(sourceBase) || sourceBase->kind != Binding::Kind::Scalar)
+    return fail(operation,
+                "regular-repeat gather requires one selected scalar source base");
   llvm::SmallVector<std::string> sourceWindows;
   llvm::SmallVector<std::string> sourceRecords;
   llvm::SmallVector<int64_t, 4> axes = registerAxesFor(firstValue);
@@ -9715,7 +9720,7 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     const std::string pointer =
         "((const " + *elementType + " *)((const uint8_t *)(" + record +
         ") + " + std::to_string(storage->bitOffset / 8) + ") + " +
-        std::to_string(operation.getSourceBase()) + ")";
+        sourceBase->scalar + ")";
     std::string loaded = fresh("repeat_source");
     line(type + " " + loaded + " = __riscv_vle" +
          std::to_string(integer.getWidth()) + "_v_" + suffix + "(" + pointer +
@@ -9752,12 +9757,13 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
         return fail(operation,
                     "regular-repeat gather result parts exceed its selected window");
       if (broadcastOnly) {
-        const int64_t sourceIndex = operation.getSourceBase() + bases[stream];
+        const std::string sourceIndex = "(" + sourceBase->scalar + " + " +
+                                        std::to_string(bases[stream]) + ")";
         const std::string scalarValue =
             "((const " + *elementType + " *)((const uint8_t *)(" +
             sourceRecords[replica] + ") + " +
             std::to_string(storage->bitOffset / 8) + "))[" +
-            std::to_string(sourceIndex) + "]";
+            sourceIndex + "]";
         std::string gathered = fresh("regular_broadcast");
         const bool floating = mlir::isa<mlir::FloatType>(storage->type);
         line(vectorType(resultValue) + " " + gathered + " = __riscv_" +
@@ -11253,13 +11259,18 @@ mlir::LogicalResult Emitter::compileRVVAssembleReplicas(
     return fail(operation,
                 "scalar replica assembly has no exact selected leaf");
   Binding result;
-  result.kind = Binding::Kind::ScalarTuple;
+  const bool singleton = operation.getValues().size() == 1;
+  result.kind = singleton ? Binding::Kind::Scalar
+                          : Binding::Kind::ScalarTuple;
   for (mlir::Value value : operation.getValues()) {
     Binding part = bindings.lookup(value);
     if (part.kind != Binding::Kind::Scalar)
       return fail(operation,
                   "scalar replica assembly operand has no scalar binding");
-    result.parts.push_back(part.scalar);
+    if (singleton)
+      result.scalar = part.scalar;
+    else
+      result.parts.push_back(part.scalar);
   }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();

@@ -2117,9 +2117,27 @@ private:
       if (!result)
         continue;
       auto input = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
+      auto encodedField = riscv_internal::sourceField(extract.getInput());
+      const bool hasGatherSelector =
+          llvm::any_of(extract.getSelectors(), [](mlir::Attribute selector) {
+            return mlir::cast<mlir::StringAttr>(selector).getValue() == "gather";
+          });
+      const riscv_internal::FieldFacts encodedFacts =
+          encodedField ? riscv_internal::fieldFacts(encodedField)
+                       : riscv_internal::FieldFacts();
+      const bool typedEncodedEntry =
+          encodedField && hasGatherSelector &&
+          encodedFacts.mapping == "natural" && encodedFacts.bitOffset % 8 == 0 &&
+          !extract.getIndices().empty() &&
+          llvm::all_of(extract.getIndices(), [](mlir::Value index) {
+            mlir::Type element = riscv_internal::logicalElement(index.getType());
+            auto integer = mlir::dyn_cast<mlir::IntegerType>(element);
+            return element.isIndex() || (integer && integer.isUnsigned());
+          });
       if (input && input.getLayout().getCarrier() == "local" &&
           result.getLayout().getCarrier() == "rvv" &&
-          input.getElementType() == result.getElementType()) {
+          input.getElementType() == result.getElementType() &&
+          !typedEncodedEntry) {
         auto kernel = extract->getParentOfType<riscv::KernelOp>();
         auto required = registerGatherSourceLayout(
             builder, input, result.getLayout(), kernel.getTarget());

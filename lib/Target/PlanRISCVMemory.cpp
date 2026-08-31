@@ -37,6 +37,7 @@ struct RegularGatherCandidate {
   riscv::FieldOp field;
   riscv::ValueType resultType;
   mlir::Value index;
+  int64_t sourceAxis = 0;
   int64_t reductionAxis = 0;
   int64_t base = 0;
   int64_t stride = 1;
@@ -205,9 +206,16 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
                               riscv::ValueType entryIndices,
                               riscv::ValueType result, int64_t alignment,
                               int64_t bitOffset) {
-  if (entryIndices.getLayout().getCarrier() != "rvv")
+  if (result.getLayout().getCarrier() != "rvv")
+    return false;
+  mlir::Type indexElement = entryIndices.getElementType();
+  auto index = mlir::dyn_cast<mlir::IntegerType>(indexElement);
+  if (!indexElement.isIndex() && (!index || index.isSigned()))
+    return false;
+  if (entryIndices.getLayout().getCarrier() == "scalar")
     return true;
-  auto index = mlir::dyn_cast<mlir::IntegerType>(entryIndices.getElementType());
+  if (entryIndices.getLayout().getCarrier() != "rvv")
+    return false;
   const unsigned payloadBits =
       riscv_internal::logicalBitWidth(result.getElementType());
   auto resultAxes = result.getAxisIds().asArrayRef();
@@ -423,14 +431,32 @@ bool supportsUnitEntryWindowLayout(riscv::ValueType result,
       return false;
   llvm::SmallVector<int64_t> extents(entryExtents.begin(), entryExtents.end());
   extents.push_back(payloadExtent);
+  bool striped = false;
+  int64_t precedingLaneSpan = 1;
   for (size_t offset = 0; offset < extents.size(); ++offset) {
     const size_t position = retainedAxes + offset;
-    if (layout.getTimeFactors()[position] != 1 ||
-        layout.getLaneFactors()[position] != extents[offset] ||
-        layout.getReplicaFactors()[position] != 1 ||
+    const int64_t time = layout.getTimeFactors()[position];
+    const int64_t lane = layout.getLaneFactors()[position];
+    if (time <= 0 || lane <= 0 || layout.getReplicaFactors()[position] != 1 ||
         layout.getFragmentFactors()[position] != 1 ||
         layout.getLocalFactors()[position] != 1)
       return false;
+    if (time == 1) {
+      if (lane != extents[offset])
+        return false;
+    } else {
+      // One outer entry coordinate may be striped through issue time.  It must
+      // be the primary lane coordinate; every inner entry/payload coordinate
+      // remains fully contiguous inside the same unit load.
+      if (striped || precedingLaneSpan != 1 || lane <= 1 ||
+          time > std::numeric_limits<int64_t>::max() / lane ||
+          time * lane != extents[offset])
+        return false;
+      striped = true;
+    }
+    if (precedingLaneSpan > std::numeric_limits<int64_t>::max() / lane)
+      return false;
+    precedingLaneSpan *= lane;
   }
   return true;
 }
@@ -528,10 +554,23 @@ materializeAffineWindowBase(mlir::Value index, riscv::ValueType result,
   for (mlir::Value term : terms)
     if (isSingleScalarCoordinate(term))
       scalarTerms.push_back(term);
-  if (scalarTerms.empty())
-    return std::nullopt;
-  mlir::Value scalarBase = scalarTerms.front();
-  for (mlir::Value term : llvm::drop_begin(scalarTerms)) {
+  mlir::Value scalarBase;
+  if (scalarTerms.empty()) {
+    mlir::Type type = indexType.getElementType();
+    mlir::TypedAttr zero;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+      zero = rewriter.getIntegerAttr(integer, 0);
+    else if (type.isIndex())
+      zero = rewriter.getIndexAttr(0);
+    if (!zero)
+      return std::nullopt;
+    scalarBase = rewriter.create<riscv::ConstantOp>(origin->getLoc(), type, zero);
+  } else {
+    scalarBase = scalarTerms.front();
+  }
+  const size_t firstAdditionalTerm = scalarTerms.empty() ? 0 : 1;
+  for (mlir::Value term :
+       llvm::ArrayRef<mlir::Value>(scalarTerms).drop_front(firstAdditionalTerm)) {
     if (term.getType() != scalarBase.getType())
       return std::nullopt;
     auto addition = rewriter.create<riscv::BinaryOp>(
@@ -1668,27 +1707,30 @@ public:
       auto input = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
       if (!input || gatherDimension >= input.getShape().size())
         continue;
+      auto fieldType =
+          mlir::dyn_cast<riscv::ValueType>(candidate.field.getResult().getType());
+      if (!fieldType || gatherDimension >= fieldType.getAxisIds().size())
+        continue;
+      candidate.sourceAxis = fieldType.getAxisIds()[gatherDimension];
       // Replacing a shaped gather with a regular extract removes the explicit
       // index value, so the field itself must already carry the result axes.
       // A gather may legitimately introduce a new logical axis (for example a
-      // typed table-entry coordinate); such an edge must remain indexed rather
-      // than being rewritten into an invalid all/regular projection.
-      auto regularInput = mlir::dyn_cast<riscv::ValueType>(
-          candidate.field.getResult().getType());
-      if (!regularInput ||
-          regularInput.getShape().size() !=
-              candidate.resultType.getShape().size() ||
-          regularInput.getAxisIds() != candidate.resultType.getAxisIds())
-        continue;
+      // typed table-entry coordinate).  That relation cannot become a bare
+      // regular selector, but it can still become a typed regular-repeat
+      // load/gather carrying distinct source and result axes.
+      const bool preservesSourceAxes =
+          fieldType.getShape().size() == candidate.resultType.getShape().size() &&
+          fieldType.getAxisIds() == candidate.resultType.getAxisIds();
       bool preservesFreeAxes = true;
-      for (size_t dimension = 0; dimension < regularInput.getShape().size();
-           ++dimension)
-        if (dimension != gatherDimension &&
-            regularInput.getShape()[dimension] !=
+      if (preservesSourceAxes)
+        for (size_t dimension = 0; dimension < fieldType.getShape().size();
+             ++dimension)
+          if (dimension != gatherDimension &&
+              fieldType.getShape()[dimension] !=
                 candidate.resultType.getShape()[dimension]) {
-          preservesFreeAxes = false;
-          break;
-        }
+            preservesFreeAxes = false;
+            break;
+          }
       if (!preservesFreeAxes)
         continue;
       candidate.lanes =
@@ -1721,7 +1763,7 @@ public:
       }
       if (!bounded)
         continue;
-      if (!alreadyRegular) {
+      if (!alreadyRegular && preservesSourceAxes) {
         rewriter.setInsertionPoint(extract);
         auto replacement = rewriter.create<riscv::ExtractOp>(
             extract.getLoc(), selectedResultType, candidate.field.getResult(),
@@ -1776,6 +1818,7 @@ public:
         if (consumedRegular.contains(other.extract.getOperation()) ||
             other.extract->getBlock() != first.extract->getBlock() ||
             other.field != first.field ||
+            other.sourceAxis != first.sourceAxis ||
             other.repeat != first.repeat ||
             other.stride != first.stride || other.lanes != first.lanes ||
             other.reductionAxis != first.reductionAxis ||
@@ -1863,9 +1906,12 @@ public:
         indices.append(indexOp.getResults().begin(), indexOp.getResults().end());
       }
       rewriter.setInsertionPoint(first.extract);
+      auto sourceBaseValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+          first.extract.getLoc(), sourceBase);
       auto gather = rewriter.create<riscv::RVVRegularRepeatGatherOp>(
           first.extract.getLoc(), resultTypes, first.field.getResult(),
-          indices, first.reductionAxis, sourceBase, sourceCount, first.repeat,
+          indices, first.sourceAxis, first.reductionAxis, sourceBaseValue,
+          sourceCount, first.repeat,
           rewriter.getArrayAttr(partBases), first.field.getAccess(),
           riscv_internal::leaf(
               rewriter, "rvv", "regular-repeat-gather",
@@ -1874,7 +1920,8 @@ public:
                   .getLayout()
                   .getRegisterGroups(),
               0, temporaryGroups, 0, "none", "exact",
-              {first.reductionAxis, sourceBase, sourceCount, first.repeat}));
+              {first.sourceAxis, first.reductionAxis, sourceCount,
+               first.repeat}));
       riscv_internal::copyOrigin(first.extract, gather);
 
       for (auto [index, candidate] : llvm::enumerate(group)) {
@@ -2100,6 +2147,21 @@ public:
     for (riscv::LoadOp load : deadTableLoads)
       if (load && load.getResult().use_empty())
         load.erase();
+    // Memory materialization can replace the source of an existing pure
+    // representation conversion with exactly the representation it requested.
+    // Close that edge in the same pass so the verifier never observes an
+    // identity conversion between the memory decision and the following
+    // layout canonicalization pass.
+    llvm::SmallVector<riscv::ConvertLayoutOp> identityConversions;
+    getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
+      if (conversion.getConversion().getEffect() == "pure" &&
+          conversion.getInput().getType() == conversion.getResult().getType())
+        identityConversions.push_back(conversion);
+    });
+    for (riscv::ConvertLayoutOp conversion : identityConversions) {
+      conversion.getResult().replaceAllUsesWith(conversion.getInput());
+      rewriter.eraseOp(conversion);
+    }
     getOperation().walk([&](mlir::Operation *operation) {
       if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
                      riscv::OuterContractOp>(operation))

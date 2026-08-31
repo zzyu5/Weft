@@ -11,10 +11,12 @@ from weft.language import (
     i32,
     iota,
     index,
+    lookup,
     mac_groups,
     materialize,
     reduce,
     u8,
+    u16,
     u32,
     widen,
 )
@@ -29,6 +31,7 @@ from .encodings import (
     IQ3_XXS,
     IQ4_NL,
     IQ4_XS,
+    I8X8,
     MXFP4,
     NVFP4,
     Q1_0,
@@ -76,6 +79,41 @@ def _grid8(grid, grid_index, x, base):
     value = nonlinear_lookup(grid, u32(grid_index) * u32(8) + lane)
     product = widen(value, i32) * widen(x[base + lane], i32)
     return reduce(product, axis=0)
+
+
+def _iq2_xs_entry_reduce(
+    code,
+    metadata,
+    activation,
+    grid,
+    signs,
+    scale_group,
+    payload,
+):
+    code_bits = u16(code)
+    grid_index = code_bits & u16(511)
+    sign_index = code_bits >> u16(9)
+    weight = lookup(
+        grid, grid_index * u16(8) + payload, bounds="in_bounds"
+    )
+    sign = lookup(
+        signs, sign_index * u16(8) + payload, bounds="in_bounds"
+    )
+    partial = contract(
+        activation,
+        weight * sign,
+        over=("entry", "payload"),
+        acc=i32,
+    )
+    scale = i32(
+        (
+            (widen(metadata, u32) >> ((scale_group % u32(2)) * u32(4)))
+            & u32(15)
+        )
+        * u32(2)
+        + u32(1)
+    )
+    return reduce(partial * scale, axis="scale_group")
 
 
 def vec_dot_q1_0_q8_0(
@@ -483,35 +521,29 @@ def vec_dot_iq2_xxs_q8_k(
 def vec_dot_iq2_xs_q8_k(
     W: View[IQ2_XS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (4096,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X8, (512, 8)],
+    signs: View[I8X8, (128, 8)],
 ):
     sumf = f32(0.0)
+    grid_values = grid.values
+    sign_values = signs.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        block_sum = i32(0)
-        for group in range(8):
-            first = i32(0)
-            second = i32(0)
-            for entry in range(4):
-                code = u32(w.q[group * 4 + entry])
-                dot = _signed_grid8(
-                    grid,
-                    signs,
-                    code & u32(511),
-                    code >> u32(9),
-                    x.q,
-                    group * 32 + entry * 8,
-                )
-                if entry < 2:
-                    first += dot
-                if entry >= 2:
-                    second += dot
-            metadata = u32(w.scales[group])
-            ls1 = i32((metadata & u32(15)) * u32(2) + u32(1))
-            ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
-            block_sum += first * ls1 + second * ls2
+        scale_group = iota(16, dtype=u32, axis="scale_group")
+        entry = iota(2, dtype=u32, axis="entry")
+        payload = iota(8, dtype=u16, axis="payload")
+        linear_entry = scale_group * u32(2) + entry
+        entry_offset = scale_group * u32(16) + entry * u32(8)
+        block_sum = _iq2_xs_entry_reduce(
+            w.q[linear_entry],
+            w.scales[scale_group // u32(2)],
+            x.q[entry_offset + u32(payload)],
+            grid_values,
+            sign_values,
+            scale_group,
+            payload,
+        )
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
     return f32(0.125) * sumf
 

@@ -23,6 +23,7 @@ from weft.language import (
     outer_contract,
     reduce,
     u8,
+    u16,
     u32,
     widen,
 )
@@ -60,6 +61,7 @@ from .encodings import (
 from .quantize import quantize_q8_0, quantize_q8_1, quantize_q8_K
 from .quant_fragments import exponent_scale, radix3_digit_i8
 from .vec_dot import (
+    _iq2_xs_entry_reduce,
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
     vec_dot_iq2_s_q8_k,
@@ -174,30 +176,18 @@ def _iq2_xs_entry_products(
     payload,
 ):
     linear_entry = scale_group * u32(2) + entry
-    code = widen(w.q[:, linear_entry], u32)
-    grid_index = code & u32(511)
-    sign_index = code >> u32(9)
-    weight = lookup(
-        grid, grid_index * u32(8) + payload, bounds="in_bounds"
-    )
-    sign = lookup(
-        signs, sign_index * u32(8) + payload, bounds="in_bounds"
-    )
-    signed_weight = weight * sign
+    code = w.q[:, linear_entry]
     entry_offset = scale_group * u32(16) + entry * u32(8)
-    activation = x.q[:, entry_offset + payload]
-    partial = contract(
-        activation,
-        signed_weight,
-        over=("entry", "payload"),
-        acc=i32,
+    metadata = w.scales[:, scale_group // u32(2)]
+    return _iq2_xs_entry_reduce(
+        code,
+        metadata,
+        x.q[:, entry_offset + u32(payload)],
+        grid,
+        signs,
+        scale_group,
+        payload,
     )
-    metadata = widen(w.scales[:, scale_group // u32(2)], u32)
-    scale = i32(
-        ((metadata >> ((scale_group % u32(2)) * u32(4))) & u32(15)) * u32(2)
-        + u32(1)
-    )
-    return reduce(partial * scale, axis="scale_group")
 
 
 def _iq2_s_group_products(
@@ -956,7 +946,7 @@ def mul_mat_iq2_xs(
                 x = admit(Xq[mb, kb])
                 scale_group = iota(16, dtype=u32, axis="scale_group")
                 entry = iota(2, dtype=u32, axis="entry")
-                payload = iota(8, dtype=u32, axis="payload")
+                payload = iota(8, dtype=u16, axis="payload")
                 block_sum = _iq2_xs_entry_products(
                     w,
                     x,

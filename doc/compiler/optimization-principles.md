@@ -108,6 +108,13 @@ logical axis 是否存在、是否是普通 scalar loop，归作者；同一 sha
 `MaterializeRISCVResources`。若达到性能必须把 Python 展开的标量循环重新发明成 axis，
 应停止并修改 std tree，而不是增加 matcher。
 
+target 可以决定同一 canonical tree 的 LMUL、VL、lane/time 分解、auto 参数、memory
+instruction、partial topology、pipeline 以及 RVV/IME realization。target 不能决定是否存在
+logical axis、选择 scalar tree 还是 shaped tree、替换 std function、改变 reduction 结构，或
+改变 Value/Level 集合。后几项一旦不同，就是不同作者程序；不能以 VLEN、target 名称或
+实现能力作为 source-level 分支条件。多个确实不同的数值程序若都需要保留，由调用方以
+entry 身份显式选择，tuner 只能选择同一程序的参数性物理实例。
+
 Triton 的对应机制不是“SIMT 总工作固定”。`OptimizeThreadLocality.cpp:106-176` 会重分配
 thread/warp ownership以减少 shuffle；`AccelerateMatmul.cpp:86-145,449-485` 会按 dot shape、
 MMA instruction shape 与 warp 数重构 operand/result layout。固定的是 launch participants 的
@@ -333,6 +340,11 @@ compiler不能替Weft重新选择carrier、partial topology或fragment。
 5. 对每个contraction/reduction统计partial slots、MAC、reduce、scalar extract与spill；
 6. 仅在前五项合理后检查load-to-use距离和pipeline可行性；
 7. 与donor逐段对照，先判断差异归作者tree还是physical compiler，再修改代码。
+
+量化 contraction 还必须成对观察 standalone vec-dot 与同格式 MUL_MAT decode。两者的
+logical contraction 相同；若优化只提升 blocked prefill，或只在某个 wrapper 中出现，说明
+能力仍绑定在 GEMM tree/ABI 上，没有进入共享 vec-dot 底座。只有两项的 final IR 机制计数
+与真实吞吐同步变化，才能把收益归给 contraction compiler。
 
 新机制动手前必须回答：
 

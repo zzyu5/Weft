@@ -1234,8 +1234,9 @@ def WeftRISCV_RVVRegularRepeatGatherOp
     : WeftRISCV_Op<"rvv_regular_repeat_gather", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        Variadic<WeftRISCV_ValueType>:$indices,
+                       I64Attr:$source_axis,
                        I64Attr:$reduction_axis,
-                       I64Attr:$source_base,
+                       AnyType:$source_base,
                        I64Attr:$source_count,
                        I64Attr:$repeat,
                        ArrayAttr:$part_bases,

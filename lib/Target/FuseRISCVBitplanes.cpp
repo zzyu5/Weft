@@ -83,6 +83,30 @@ matchBitmaskDecode(riscv::ConvertLayoutOp conversion) {
   if (!point || !origin || cursor != extract.getIndices().size())
     return std::nullopt;
 
+  const int64_t axis = point.getResult().getType().getDomain().getAxisId();
+  bool ownerCoversOriginRecord =
+      static_cast<bool>(field.getOwner().getDefiningOp<riscv::LoadOp>());
+  if (auto owner = field.getOwner().getDefiningOp<riscv::ExtractOp>()) {
+    auto ownerInput = mlir::dyn_cast<riscv::ValueType>(owner.getInput().getType());
+    size_t ownerCursor = 0;
+    for (auto [position, selectorAttribute] :
+         llvm::enumerate(owner.getSelectors())) {
+      llvm::StringRef selector =
+          mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
+      if (selector == "all")
+        continue;
+      if (ownerCursor >= owner.getIndices().size())
+        break;
+      mlir::Value index = owner.getIndices()[ownerCursor++];
+      if (ownerInput && position < ownerInput.getAxisIds().size() &&
+          ownerInput.getAxisIds()[position] == axis && selector == "domain" &&
+          index == origin.getResult())
+        ownerCoversOriginRecord = true;
+    }
+  }
+  if (!ownerCoversOriginRecord)
+    return std::nullopt;
+
   riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(field);
   if (facts.mapping != "grouped_layered" || facts.group <= 0 ||
       facts.layer <= 0 || facts.group != facts.layer * 8 ||

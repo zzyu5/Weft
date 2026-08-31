@@ -1019,7 +1019,7 @@ mlir::LogicalResult PartialTopologyAttr::verify(
       kind != "sequential_per_stream" && kind != "independent" &&
       kind != "replica_reduced" &&
       kind != "scaled" && kind != "reduced_scaled" &&
-      kind != "level_scaled" &&
+      kind != "level_scaled" && kind != "nested_scaled_stream" &&
       kind != "merged" && kind != "layered")
     return emitError() << "unknown partial topology kind";
   if (kind == "unassigned") {
@@ -1064,6 +1064,7 @@ mlir::LogicalResult PartialTopologyAttr::verify(
   if ((kind == "independent" || kind == "replica_reduced" ||
        kind == "scaled" ||
        kind == "reduced_scaled" || kind == "level_scaled" ||
+       kind == "nested_scaled_stream" ||
        kind == "layered") &&
       (combineArity > partialSlots || partialSlots % combineArity))
     return emitError()
@@ -3081,12 +3082,14 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
   llvm::SmallVector<int64_t> windowExtents(getEntryExtents().begin(),
                                            getEntryExtents().end());
   windowExtents.push_back(getPayloadExtent());
+  bool striped = false;
+  int64_t precedingLaneSpan = 1;
   for (size_t offset = 0; offset < windowExtents.size(); ++offset) {
     const size_t position = retainedAxes + offset;
     const int64_t extent = windowExtents[offset];
-    if (layout.getTimeFactors()[position] != 1 ||
-        layout.getLaneFactors()[position] != extent ||
-        layout.getReplicaFactors()[position] != 1 ||
+    const int64_t time = layout.getTimeFactors()[position];
+    const int64_t lane = layout.getLaneFactors()[position];
+    if (time <= 0 || lane <= 0 || layout.getReplicaFactors()[position] != 1 ||
         layout.getFragmentFactors()[position] != 1 ||
         layout.getLocalFactors()[position] != 1)
       return emitOpError(
@@ -3094,6 +3097,23 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
              << "; entry_axes=" << getEntryAxes()
              << ", payload_axis=" << getPayloadAxis()
              << ", result_type=" << result;
+    if (time == 1) {
+      if (lane != extent)
+        return emitOpError(
+                   "unit entry window lane factors do not cover one complete contiguous strip")
+               << "; result_type=" << result;
+    } else {
+      if (striped || precedingLaneSpan != 1 || lane <= 1 ||
+          time > std::numeric_limits<int64_t>::max() / lane ||
+          time * lane != extent)
+        return emitOpError(
+                   "unit entry window permits one primary time-striped entry axis")
+               << "; result_type=" << result;
+      striped = true;
+    }
+    if (precedingLaneSpan > std::numeric_limits<int64_t>::max() / lane)
+      return emitOpError("unit entry window lane span overflows");
+    precedingLaneSpan *= lane;
   }
   return verifyLeafOperation(*this);
 }
@@ -3122,7 +3142,10 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
   if (input.getElementType() != result.getElementType() ||
       input.getShape() != result.getShape() || input.getAxisIds() != result.getAxisIds() ||
       input.getLayout() == result.getLayout())
-    return emitOpError("convert_layout changes only a non-identical physical representation");
+    return emitOpError()
+           << "convert_layout changes only a non-identical physical representation; input="
+           << input << ", result=" << result
+           << ", conversion=" << getConversion();
   llvm::StringRef source = input.getLayout().getCarrier();
   llvm::StringRef target = result.getLayout().getCarrier();
   llvm::StringRef kind = getConversion().getKind();
@@ -3969,7 +3992,9 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
             result.getLayout().getTimeFactors()[index] == 1 &&
             result.getLayout().getLaneFactors()[index] == 1;
 
-  bool ownerAnchoredAtOrigin = false;
+  bool ownerCoversOriginRecord =
+      sourceField &&
+      static_cast<bool>(sourceField.getOwner().getDefiningOp<LoadOp>());
   if (sourceField && origin) {
     if (auto owner = sourceField.getOwner().getDefiningOp<ExtractOp>()) {
       auto ownerInput = mlir::dyn_cast<ValueType>(owner.getInput().getType());
@@ -3986,7 +4011,7 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
         if (ownerInput && position < ownerInput.getAxisIds().size() &&
             ownerInput.getAxisIds()[position] == axis && selector == "domain" &&
             index == getOrigin())
-          ownerAnchoredAtOrigin = true;
+          ownerCoversOriginRecord = true;
       }
     }
   }
@@ -3997,7 +4022,8 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
       point.getParent() != getOrigin() ||
       point.getResult().getType().getDomain().getAxisId() !=
           origin.getResult().getType().getDomain().getAxisId() ||
-      !ownerAnchoredAtOrigin || !compatibleShape || !onlyPointAxisIsStreamed ||
+      !ownerCoversOriginRecord || !compatibleShape ||
+      !onlyPointAxisIsStreamed ||
       getAccess() != sourceField.getAccess() ||
       getAccess().getForm() != "indexed" ||
       getAccess().getMapping() != "grouped_layered" ||
@@ -4017,7 +4043,8 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
                  "none", tail))
     return emitOpError(
         "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
-        "an explicitly anchored sub-Level point, and a complete time/lane result");
+        "a record owner covering the sub-Level origin, an explicitly anchored "
+        "sub-Level point, and a complete time/lane result");
   return mlir::success();
 }
 
@@ -4548,7 +4575,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       topologyKind == "independent" || topologyKind == "replica_reduced" ||
       topologyKind == "scaled" ||
       topologyKind == "reduced_scaled" ||
-      topologyKind == "level_scaled" || topologyKind == "merged" ||
+      topologyKind == "level_scaled" ||
+      topologyKind == "nested_scaled_stream" || topologyKind == "merged" ||
       topologyKind == "layered";
   if (!validTopology || !layoutPlanClosed || getPartialUnroll() <= 0 ||
       getSliceLmulEighths() <= 0 || !closedLaneSlices ||
@@ -4754,23 +4782,32 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
   ValueType field = getField().getType();
   auto sourceField = getField().getDefiningOp<FieldOp>();
   auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  mlir::Type sourceBaseType = elementOf(getSourceBase().getType());
+  auto sourceBaseInteger = mlir::dyn_cast<mlir::IntegerType>(sourceBaseType);
+  const bool scalarSourceBase =
+      isScalar(getSourceBase().getType()) &&
+      (sourceBaseType.isIndex() ||
+       (sourceBaseInteger && !sourceBaseInteger.isSigned()));
+  const int64_t sourceAxis = getSourceAxis();
   const int64_t axis = getReductionAxis();
-  auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), axis);
-  if (!sourceField || !fieldElement || fieldElement.isSignless() || axis <= 0 ||
+  auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), sourceAxis);
+  if (!sourceField || !fieldElement || fieldElement.isSignless() ||
+      sourceAxis <= 0 || axis <= 0 ||
       fieldAxis == field.getAxisIds().asArrayRef().end() ||
       getAccess() != sourceField.getAccess() ||
       getAccess().getMapping() != "natural" ||
       getAccess().getForm() != "unit" || getAccess().getBitOffset() % 8 ||
       (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
        fieldElement.getWidth() != 32) ||
-      getSourceBase() < 0 || getSourceCount() <= 0 || getRepeat() <= 1 ||
+      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
       getResults().empty() || getPartBases().size() != getResults().size())
     return emitOpError()
            << "regular-repeat gather requires one natural encoded field and closed load/gather geometry; field="
            << field << ", source-field=" << static_cast<bool>(sourceField)
-           << ", element=" << field.getElementType() << ", axis=" << axis
-           << ", access=" << getAccess() << ", source-base="
-           << getSourceBase() << ", source-count=" << getSourceCount()
+           << ", element=" << field.getElementType()
+           << ", source-axis=" << sourceAxis << ", result-axis=" << axis
+           << ", access=" << getAccess() << ", source-base-type="
+           << getSourceBase().getType() << ", source-count=" << getSourceCount()
            << ", repeat=" << getRepeat() << ", results=" << getResults().size()
            << ", indices=" << getIndices().size();
   const bool powerOfTwo =
@@ -4791,11 +4828,17 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
                  "none", "exact"))
     return emitOpError(
         "regular-repeat gather leaf disagrees with its repeat-index geometry");
+  if (getLeaf().getParameters().asArrayRef() !=
+      llvm::ArrayRef<int64_t>(
+          {sourceAxis, axis, static_cast<int64_t>(getSourceCount()),
+           static_cast<int64_t>(getRepeat())}))
+    return emitOpError(
+        "regular-repeat gather leaf does not preserve its selected source/result axis relation");
 
   const size_t fieldPosition = static_cast<size_t>(
       fieldAxis - field.getAxisIds().asArrayRef().begin());
   if (field.getShape()[fieldPosition] <= 0 ||
-      getSourceBase() > field.getShape()[fieldPosition] - getSourceCount())
+      getSourceCount() > field.getShape()[fieldPosition])
     return emitOpError("regular-repeat gather source window is out of bounds");
 
   if ((firstLanes <= getRepeat() && !getIndices().empty()) ||
