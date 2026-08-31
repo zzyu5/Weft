@@ -8561,6 +8561,7 @@ mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
                 "RVV bitmask window load selected an illegal mask ratio");
   const int64_t parts = vectorPartCount(operation.getResult());
   const int64_t streams = streamPartCount(operation.getResult());
+  auto partBitOffsets = operation.getPartBitOffsets();
   llvm::SmallVector<int64_t, 4> registerAxes =
       registerAxesFor(operation.getResult());
   const std::string suffix = vectorSuffix(operation.getResult());
@@ -8573,7 +8574,8 @@ mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
   for (int64_t part = 0; part < parts; ++part) {
     auto coordinates =
         registerCoordinates(operation.getResult(), part / streams);
-    if (streams <= 0 || !coordinates ||
+    if (streams <= 0 || partBitOffsets.size() != static_cast<size_t>(parts) ||
+        !coordinates ||
         coordinates->size() != registerAxes.size())
       return fail(operation,
                   "RVV bitmask window load has no register-coordinate mapping");
@@ -8596,8 +8598,8 @@ mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
                        stride->second;
     }
     recordPointer += " + " + std::to_string(field->bitOffset / 8) + " + " +
-                     byteBase.scalar + " + (" +
-                     partOffset(operation.getResult(), part) + " / 8))";
+                     byteBase.scalar + " + " +
+                     std::to_string(partBitOffsets[part] / 8) + ")";
     const std::string vl = partVL(operation.getResult(), part);
     std::string mask = fresh("bitmask_window");
     line(maskType + " " + mask + " = __riscv_vlm_v_b" +

@@ -173,7 +173,7 @@ def quantized_vec_dot_iq1_m_q8_k(
 def quantized_vec_dot_iq2_s_q8_k(
     W: View[IQ2_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (8192,)],
+    grid: View[I8X8, (1024, 8)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq2_s_q8_k(W, X, grid), Y[0])
@@ -194,8 +194,8 @@ def quantized_vec_dot_iq2_xs_q8_k(
 def quantized_vec_dot_iq2_xxs_q8_k(
     W: View[IQ2_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (2048,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X8, (256, 8)],
+    signs: View[I8X8, (128, 8)],
     Y: View[f32, (1,)],
 ):
     commit(vec_dot_iq2_xxs_q8_k(W, X, grid, signs), Y[0])

@@ -493,9 +493,13 @@ bool supportsBitmaskWindowLayout(riscv::FieldOp field,
       return false;
   for (size_t offset = 0; offset < windowExtents.size(); ++offset) {
     const size_t position = retainedAxes + offset;
-    if (layout.getTimeFactors()[position] != 1 ||
-        layout.getLaneFactors()[position] != windowExtents[offset] ||
-        layout.getReplicaFactors()[position] != 1 ||
+    const int64_t time = layout.getTimeFactors()[position];
+    const int64_t lane = layout.getLaneFactors()[position];
+    const int64_t replica = layout.getReplicaFactors()[position];
+    if (time <= 0 || lane <= 0 || replica <= 0 ||
+        time > std::numeric_limits<int64_t>::max() / lane ||
+        time * lane > std::numeric_limits<int64_t>::max() / replica ||
+        time * lane * replica != windowExtents[offset] ||
         layout.getFragmentFactors()[position] != 1 ||
         layout.getLocalFactors()[position] != 1)
       return false;
@@ -1570,6 +1574,11 @@ public:
       const bool tail = result.getLayout().getValidity() == "tail";
       const int64_t temporaryGroups = std::max<int64_t>(
           1, (loadResult.getLayout().getLmulEighths() + 7) / 8);
+      auto partBitOffsets = riscv::bitmaskWindowPartOffsets(
+          loadResult, {source.getAxisIds()[*windowPosition]},
+          {source.getShape()[*windowPosition]});
+      if (!partBitOffsets)
+        continue;
       auto window = rewriter.create<riscv::RVVBitmaskWindowLoadOp>(
           conversion.getLoc(), loadResult, field.getResult(), zero,
           source.getAxisIds()[*windowPosition],
@@ -1577,6 +1586,7 @@ public:
               {source.getAxisIds()[*windowPosition]}),
           rewriter.getDenseI64ArrayAttr(
               {source.getShape()[*windowPosition]}),
+          rewriter.getDenseI64ArrayAttr(*partBitOffsets),
           makeAccess(builder, "unit", facts.mapping, facts.alignment,
                      facts.group, facts.layer, facts.joinFields,
                      facts.joinLowBits, facts.joinRole, facts.bitOffset,
@@ -1659,6 +1669,10 @@ public:
             supportsBitmaskWindowLayout(
                 sourceField, result, retainedAxes.size(), bitmaskWindow->axes,
                 bitmaskWindow->extents)) {
+          auto partBitOffsets = riscv::bitmaskWindowPartOffsets(
+              result, bitmaskWindow->axes, bitmaskWindow->extents);
+          if (!partBitOffsets)
+            continue;
           const bool tail = result.getLayout().getValidity() == "tail";
           const int64_t temporaryGroups = std::max<int64_t>(
               1, (result.getLayout().getLmulEighths() + 7) / 8);
@@ -1667,6 +1681,7 @@ public:
               bitmaskWindow->base, source.getAxisIds()[gatherDimension],
               rewriter.getDenseI64ArrayAttr(bitmaskWindow->axes),
               rewriter.getDenseI64ArrayAttr(bitmaskWindow->extents),
+              rewriter.getDenseI64ArrayAttr(*partBitOffsets),
               makeAccess(builder, "unit", sourceFacts.mapping,
                          sourceFacts.alignment, sourceFacts.group,
                          sourceFacts.layer, sourceFacts.joinFields,

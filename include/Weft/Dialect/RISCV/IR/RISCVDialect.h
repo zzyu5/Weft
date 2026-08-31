@@ -36,6 +36,14 @@ bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
 std::optional<llvm::SmallVector<int64_t>>
 groupedMacSupplyProjection(ValueType packed, ValueType result);
 
+/// Returns the logical bit offset owned by every physical RVV part of a
+/// bitmask window. Window axes are flattened in their declared logical order;
+/// retained register axes select the surrounding record and do not contribute
+/// to the bit offset inside that record.
+std::optional<llvm::SmallVector<int64_t>>
+bitmaskWindowPartOffsets(ValueType result, llvm::ArrayRef<int64_t> windowAxes,
+                         llvm::ArrayRef<int64_t> windowExtents);
+
 } // namespace weft::riscv
 
 #endif // WEFT_DIALECT_RISCV_IR_RISCVDIALECT_H

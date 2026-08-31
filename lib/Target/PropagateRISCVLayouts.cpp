@@ -149,14 +149,15 @@ void decomposeAffineAxes(mlir::Value value, int64_t coefficient,
   result.valid = false;
 }
 
-std::optional<Roles> storageRolesFor(mlir::Value value) {
+std::optional<Roles> storageRolesFor(mlir::Value value,
+                                     bool requireWideningConsumer = true) {
   auto extract = value.getDefiningOp<riscv::ExtractOp>();
   auto result = mlir::dyn_cast<riscv::ValueType>(value.getType());
   if (!extract || !result)
     return std::nullopt;
   llvm::SmallVector<mlir::Value> worklist{value};
   llvm::SmallPtrSet<mlir::Operation *, 16> visited;
-  bool feedsWideningContraction = false;
+  bool feedsWideningContraction = !requireWideningConsumer;
   while (!worklist.empty() && !feedsWideningContraction) {
     mlir::Value current = worklist.pop_back_val();
     for (mlir::Operation *user : current.getUsers()) {
@@ -591,6 +592,66 @@ int64_t rhsFreeLane(mlir::Value lhs, mlir::Value rhs,
   return 0;
 }
 
+std::optional<Roles>
+reductionSupplyRoles(mlir::Value value,
+                     llvm::ArrayRef<int64_t> reductionAxes) {
+  llvm::SmallVector<mlir::Value> worklist{value};
+  llvm::SmallPtrSet<mlir::Operation *, 16> visited;
+  std::optional<Roles> result;
+  auto mergeCandidate = [&](const Roles &candidate) {
+    if (!candidate.laneAxis ||
+        !llvm::is_contained(reductionAxes, candidate.laneAxis))
+      return true;
+    for (int64_t axis : candidate.coalescedLaneAxes)
+      if (!llvm::is_contained(reductionAxes, axis))
+        return true;
+    if (!result) {
+      result = candidate;
+      return true;
+    }
+    if (result->laneAxis != candidate.laneAxis)
+      return false;
+    for (int64_t axis : candidate.coalescedLaneAxes)
+      result->coalescedLaneAxes.insert(axis);
+    result->fullLaneExtent |= candidate.fullLaneExtent;
+    result->memoryAnchored |= candidate.memoryAnchored;
+    return true;
+  };
+
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    mlir::Operation *definition = current.getDefiningOp();
+    if (!definition || !visited.insert(definition).second)
+      continue;
+    if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(definition)) {
+      Roles candidate;
+      if (constrainIndexedEntryLookup(lookup, current, candidate) &&
+          !mergeCandidate(candidate))
+        return std::nullopt;
+      continue;
+    }
+    if (mlir::isa<riscv::ExtractOp>(definition)) {
+      auto candidate = storageRolesFor(current, false);
+      if (candidate && !mergeCandidate(*candidate))
+        return std::nullopt;
+      continue;
+    }
+    if (!layoutPreservingPointwise(definition) ||
+        definition->getNumResults() != 1)
+      continue;
+    auto currentType = mlir::dyn_cast<riscv::ValueType>(current.getType());
+    if (!currentType)
+      continue;
+    for (mlir::Value operand : definition->getOperands()) {
+      auto operandType = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+      if (operandType && operandType.getShape() == currentType.getShape() &&
+          operandType.getAxisIds() == currentType.getAxisIds())
+        worklist.push_back(operand);
+    }
+  }
+  return result;
+}
+
 template <typename Contract>
 void constrainOuterContractOperand(Contract operation, mlir::Value value,
                                    Roles &roles) {
@@ -678,13 +739,21 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
         return;
       }
     }
-  for (int64_t axis : reduction)
-    if (containsAxis(value.getType(), axis)) {
-      if (!roles.laneAxis)
-        roles.laneAxis = axis;
-      else
-        roles.coalescedLaneAxes.insert(axis);
+  const bool isOperand = value == operation.getLhs() || value == operation.getRhs();
+  if (isOperand)
+    if (auto supply = reductionSupplyRoles(value, reduction)) {
+      roles.laneAxis = supply->laneAxis;
+      roles.coalescedLaneAxes = supply->coalescedLaneAxes;
+      roles.memoryAnchored = supply->memoryAnchored;
     }
+  if (!roles.laneAxis)
+    for (int64_t axis : reduction)
+      if (containsAxis(value.getType(), axis)) {
+        if (!roles.laneAxis)
+          roles.laneAxis = axis;
+        else
+          roles.coalescedLaneAxes.insert(axis);
+      }
   // A contraction result and its operands deliberately have different physical
   // layouts.  The result preserves every later reduction coordinate as an
   // independent register partial.  An operand may instead carry those same
@@ -692,7 +761,6 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
   // program takes narrow slices.  This is the RVV analogue of a Triton
   // DotOperandEncoding whose parent is the accumulator encoding: it changes the
   // operand representation, not the accumulator topology.
-  const bool isOperand = value == operation.getLhs() || value == operation.getRhs();
   auto reducedFreeAxes =
       downstreamReducedFreeAxes(operation.getOperation(), reduction);
   if (roles.laneAxis && isOperand)
@@ -1450,6 +1518,48 @@ public:
     // other operand before layouts are built.  Unique output axes remain owned
     // by their respective operand.
     getOperation().walk([&](mlir::Operation *operation) {
+      llvm::SmallVector<int64_t> reductionAxes;
+      if (auto dot = mlir::dyn_cast<riscv::DotOp>(operation))
+        reductionAxes.assign(dot.getOver().begin(), dot.getOver().end());
+      else if (auto contract = mlir::dyn_cast<riscv::ContractOp>(operation))
+        reductionAxes.assign(contract.getOver().begin(), contract.getOver().end());
+      if (!reductionAxes.empty()) {
+        auto implementation = operation->getAttrOfType<
+            riscv::ImplementationAttr>("implementation");
+        if (!implementation || implementation.getFamily() != "widen-dot")
+          return;
+        mlir::Value lhs = operation->getOperand(0);
+        mlir::Value rhs = operation->getOperand(1);
+        auto lhsSupply = reductionSupplyRoles(lhs, reductionAxes);
+        auto rhsSupply = reductionSupplyRoles(rhs, reductionAxes);
+        const Roles *anchor = nullptr;
+        if (lhsSupply && rhsSupply &&
+            lhsSupply->laneAxis == rhsSupply->laneAxis &&
+            lhsSupply->coalescedLaneAxes == rhsSupply->coalescedLaneAxes)
+          anchor = &*lhsSupply;
+        else if (lhsSupply && !rhsSupply)
+          anchor = &*lhsSupply;
+        else if (!lhsSupply && rhsSupply)
+          anchor = &*rhsSupply;
+        if (!anchor)
+          return;
+        for (mlir::Value operand : {lhs, rhs}) {
+          Roles &operandRoles = roles[operand];
+          for (int64_t axis : reductionAxes) {
+            operandRoles.replicaAxes.erase(axis);
+            operandRoles.coalescedLaneAxes.erase(axis);
+            operandRoles.sequentialAxes.erase(axis);
+          }
+          operandRoles.laneAxis = anchor->laneAxis;
+          for (int64_t axis : anchor->coalescedLaneAxes)
+            operandRoles.coalescedLaneAxes.insert(axis);
+          operandRoles.registerTuple = false;
+          operandRoles.anchored = true;
+          operandRoles.fullLaneExtent = anchor->fullLaneExtent;
+          operandRoles.memoryAnchored = anchor->memoryAnchored;
+        }
+        return;
+      }
       // Only an outer contraction has two independently surviving free-axis
       // domains whose shared partial coordinates require one issue mapping.
       // Dot/contract and grouped-MAC reductions already anchor their single

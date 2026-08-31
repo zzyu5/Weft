@@ -870,7 +870,7 @@ def mul_mat_iq2_s(
     W: View[IQ2_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (8192,)],
+    grid: View[I8X8, (1024, 8)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -1015,8 +1015,8 @@ def mul_mat_iq2_xxs(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X8, (256, 8)],
+    signs: View[I8X8, (128, 8)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -1030,8 +1030,8 @@ def mul_mat_iq2_xxs_decode(
     W: View[IQ2_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X8, (256, 8)],
+    signs: View[I8X8, (128, 8)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)

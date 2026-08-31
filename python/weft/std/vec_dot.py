@@ -494,26 +494,50 @@ def vec_dot_iq1_m_q8_k(
 def vec_dot_iq2_xxs_q8_k(
     W: View[IQ2_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (2048,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X8, (256, 8)],
+    signs: View[I8X8, (128, 8)],
 ):
     sumf = f32(0.0)
+    grid_values = grid.values
+    sign_values = signs.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        entry = iota(4, dtype=u32, axis="entry")
+        payload = iota(8, dtype=u16, axis="payload")
         block_sum = i32(0)
-        for group in range(8):
-            word0 = u32(w.q[group * 4]) | (u32(w.q[group * 4 + 1]) << u32(16))
-            word1 = u32(w.q[group * 4 + 2]) | (u32(w.q[group * 4 + 3]) << u32(16))
-            local = i32(0)
-            for entry in range(4):
-                grid_index = (word0 >> u32(entry * 8)) & u32(255)
-                sign_index = (word1 >> u32(entry * 7)) & u32(127)
-                local += _signed_grid8(
-                    grid, signs, grid_index, sign_index, x.q, group * 32 + entry * 8
-                )
+        group_index = index(0)
+        with L.subs(kb, extent=32) as group:
+            word0 = widen(w.q[group_index * index(4)], u32) | (
+                widen(w.q[group_index * index(4) + index(1)], u32)
+                << u32(16)
+            )
+            word1 = widen(w.q[group_index * index(4) + index(2)], u32) | (
+                widen(w.q[group_index * index(4) + index(3)], u32)
+                << u32(16)
+            )
+            grid_index = (word0 >> (entry * u32(8))) & u32(255)
+            sign_index = (word1 >> (entry * u32(7))) & u32(127)
+            weight = lookup(
+                grid_values, grid_index * u32(8) + payload, bounds="in_bounds"
+            )
+            sign = lookup(
+                sign_values, sign_index * u32(8) + payload, bounds="in_bounds"
+            )
+            activation = x.q[
+                u32(group_index) * u32(32)
+                + entry * u32(8)
+                + u32(payload)
+            ]
+            partial = contract(
+                activation,
+                weight * sign,
+                over=("entry", "payload"),
+                acc=i32,
+            )
             scale = i32((word1 >> u32(28)) * u32(2) + u32(1))
-            block_sum += local * scale
+            block_sum += partial * scale
+            group_index += index(1)
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
     return f32(0.125) * sumf
 
@@ -551,37 +575,62 @@ def vec_dot_iq2_xs_q8_k(
 def vec_dot_iq2_s_q8_k(
     W: View[IQ2_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (8192,)],
+    grid: View[I8X8, (1024, 8)],
 ):
     sumf = f32(0.0)
+    grid_values = grid.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        scale_group = iota(2, dtype=u32, axis="scale_group")
+        entry = iota(2, dtype=u32, axis="entry")
+        payload = iota(8, dtype=u16, axis="payload")
         block_sum = i32(0)
-        for group in range(8):
-            first = i32(0)
-            second = i32(0)
-            for entry in range(4):
-                grid_index = u32(w.q[group * 4 + entry]) | (
-                    ((u32(w.qh[group]) >> u32(entry * 2)) & u32(3)) << u32(8)
+        group_index = index(0)
+        with L.subs(kb, extent=32) as group:
+            linear_entry = scale_group * u32(2) + entry
+            grid_index = widen(
+                w.q[u32(group_index) * u32(4) + linear_entry], u32
+            ) | (
+                (
+                    widen(w.qh[group_index], u32)
+                    >> (linear_entry * u32(2))
                 )
-                local = i32(0)
-                for lane in range(8):
-                    sign = i32(1)
-                    if u32(w.signs[group * 32 + entry * 8 + lane]) != u32(0):
-                        sign = i32(-1)
-                    value = i32(
-                        nonlinear_lookup(grid, grid_index * u32(8) + u32(lane))
-                    )
-                    local += i32(x.q[group * 32 + entry * 8 + lane]) * value * sign
-                if entry < 2:
-                    first += local
-                if entry >= 2:
-                    second += local
-            metadata = u32(w.scales[group])
-            ls1 = i32((metadata & u32(15)) * u32(2) + u32(1))
-            ls2 = i32((metadata >> u32(4)) * u32(2) + u32(1))
-            block_sum += ls1 * first + ls2 * second
+                & u32(3)
+            ) << u32(8)
+            sign_bit = w.signs[
+                u32(group_index) * u32(32)
+                + linear_entry * u32(8)
+                + u32(payload)
+            ]
+            weight = lookup(
+                grid_values,
+                grid_index * u32(8) + payload,
+                bounds="in_bounds",
+            )
+            signed_weight = weight * (i8(1) - i8(sign_bit) * i8(2))
+            activation = x.q[
+                u32(group_index) * u32(32)
+                + linear_entry * u32(8)
+                + u32(payload)
+            ]
+            partial = contract(
+                activation,
+                signed_weight,
+                over=("entry", "payload"),
+                acc=i32,
+            )
+            metadata = widen(w.scales[group_index], u32)
+            scale = i32(
+                (
+                    (metadata >> (scale_group * u32(4)))
+                    & u32(15)
+                )
+                * u32(2)
+                + u32(1)
+            )
+            block_sum += reduce(partial * scale, axis="scale_group")
+            group_index += index(1)
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
     return f32(0.125) * sumf
 

@@ -1266,6 +1266,7 @@ def WeftRISCV_RVVBitmaskWindowLoadOp
                        I64Attr:$source_axis,
                        DenseI64ArrayAttr:$window_axes,
                        DenseI64ArrayAttr:$window_extents,
+                       DenseI64ArrayAttr:$part_bit_offsets,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);

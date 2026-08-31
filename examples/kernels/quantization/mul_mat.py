@@ -344,7 +344,7 @@ def production_mul_mat_iq1_m(
 @weft.kernel
 def production_mul_mat_iq2_s(
     W: View[IQ2_S, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (8192,)], Y: View[f32, (M, N)]
+    grid: View[I8X8, (1024, 8)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq2_s(W, X, Xq, grid, Y)
 
@@ -383,7 +383,7 @@ def production_mul_mat_iq2_xs_staged(
 @weft.kernel
 def production_mul_mat_iq2_xxs(
     W: View[IQ2_XXS, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)], signs: View[i8, (1024,)], Y: View[f32, (M, N)]
+    grid: View[I8X8, (256, 8)], signs: View[I8X8, (128, 8)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq2_xxs(W, X, Xq, grid, signs, Y)
 
@@ -391,7 +391,7 @@ def production_mul_mat_iq2_xxs(
 @weft.kernel
 def production_mul_mat_iq2_xxs_decode(
     W: View[IQ2_XXS, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)], signs: View[i8, (1024,)], Y: View[f32, (M, N)]
+    grid: View[I8X8, (256, 8)], signs: View[I8X8, (128, 8)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq2_xxs_decode(W, X, Xq, grid, signs, Y)
 

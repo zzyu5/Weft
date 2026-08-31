@@ -284,6 +284,87 @@ std::optional<int64_t> physicalPartCount(ValueType value) {
   return *time * *replicas;
 }
 
+std::optional<llvm::SmallVector<int64_t>>
+computeBitmaskWindowPartOffsets(
+    ValueType result, llvm::ArrayRef<int64_t> windowAxes,
+    llvm::ArrayRef<int64_t> windowExtents) {
+  if (!result || windowAxes.empty() ||
+      windowAxes.size() != windowExtents.size())
+    return std::nullopt;
+  auto layout = result.getLayout();
+  auto axes = result.getAxisIds().asArrayRef();
+  auto shape = result.getShape().asArrayRef();
+  llvm::SmallVector<size_t> positions;
+  llvm::DenseSet<int64_t> uniqueAxes;
+  for (auto [axis, extent] : llvm::zip(windowAxes, windowExtents)) {
+    auto position = llvm::find(axes, axis);
+    if (extent <= 0 || position == axes.end() ||
+        !uniqueAxes.insert(axis).second)
+      return std::nullopt;
+    const size_t index = static_cast<size_t>(position - axes.begin());
+    if (shape[index] != extent)
+      return std::nullopt;
+    positions.push_back(index);
+  }
+
+  auto streams =
+      checkedPositiveProduct(layout.getTimeFactors().asArrayRef());
+  auto replicas =
+      checkedPositiveProduct(layout.getReplicaFactors().asArrayRef());
+  if (!streams || !replicas ||
+      *streams > std::numeric_limits<int64_t>::max() / *replicas)
+    return std::nullopt;
+  const int64_t parts = *streams * *replicas;
+  llvm::SmallVector<int64_t> offsets;
+  offsets.reserve(parts);
+  for (int64_t part = 0; part < parts; ++part) {
+    int64_t remainingStream = part % *streams;
+    int64_t remainingReplica = part / *streams;
+    llvm::SmallVector<int64_t> timeCoordinates(axes.size(), 0);
+    llvm::SmallVector<int64_t> replicaCoordinates(axes.size(), 0);
+    for (int64_t position = static_cast<int64_t>(axes.size()) - 1;
+         position >= 0; --position) {
+      const int64_t time = layout.getTimeFactors()[position];
+      const int64_t replica = layout.getReplicaFactors()[position];
+      if (time <= 0 || replica <= 0)
+        return std::nullopt;
+      timeCoordinates[position] = remainingStream % time;
+      remainingStream /= time;
+      replicaCoordinates[position] = remainingReplica % replica;
+      remainingReplica /= replica;
+    }
+    if (remainingStream || remainingReplica)
+      return std::nullopt;
+
+    int64_t offset = 0;
+    for (auto [position, extent] : llvm::zip(positions, windowExtents)) {
+      const int64_t lane = layout.getLaneFactors()[position];
+      const int64_t replica = layout.getReplicaFactors()[position];
+      if (lane <= 0 || replica <= 0 || (lane > 1 && replica > 1))
+        return std::nullopt;
+      int64_t coordinate = 0;
+      if (lane > 1) {
+        if (timeCoordinates[position] >
+            std::numeric_limits<int64_t>::max() / lane)
+          return std::nullopt;
+        coordinate = timeCoordinates[position] * lane;
+      } else {
+        if (timeCoordinates[position] >
+            std::numeric_limits<int64_t>::max() / replica)
+          return std::nullopt;
+        coordinate =
+            timeCoordinates[position] * replica + replicaCoordinates[position];
+      }
+      if (coordinate < 0 || coordinate >= extent ||
+          offset > (std::numeric_limits<int64_t>::max() - coordinate) / extent)
+        return std::nullopt;
+      offset = offset * extent + coordinate;
+    }
+    offsets.push_back(offset);
+  }
+  return offsets;
+}
+
 bool isNumericPhysical(mlir::Type type) {
   mlir::Type element = elementOf(type);
   return element.isIndex() ||
@@ -803,6 +884,13 @@ int64_t localPackInterleaveRows(mlir::Value owner) {
 }
 
 } // namespace
+
+std::optional<llvm::SmallVector<int64_t>>
+weft::riscv::bitmaskWindowPartOffsets(
+    ValueType result, llvm::ArrayRef<int64_t> windowAxes,
+    llvm::ArrayRef<int64_t> windowExtents) {
+  return computeBitmaskWindowPartOffsets(result, windowAxes, windowExtents);
+}
 
 mlir::LogicalResult LayoutAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
@@ -4743,6 +4831,16 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   if (!windowElements || *windowElements % getAccess().getGroupSize())
     return emitOpError(
         "RVV bitmask window extent must cover complete packed groups");
+
+  auto expectedPartOffsets = bitmaskWindowPartOffsets(
+      result, getWindowAxes(), getWindowExtents());
+  if (!expectedPartOffsets ||
+      getPartBitOffsets() != llvm::ArrayRef<int64_t>(*expectedPartOffsets) ||
+      llvm::any_of(*expectedPartOffsets, [&](int64_t offset) {
+        return offset < 0 || offset >= *windowElements || offset % 8;
+      }))
+    return emitOpError(
+        "RVV bitmask window part offsets disagree with its typed time/lane/replica mapping");
 
   auto fieldAxes = field.getAxisIds().asArrayRef();
   auto fieldShape = field.getShape().asArrayRef();
