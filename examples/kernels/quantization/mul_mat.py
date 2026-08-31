@@ -3,6 +3,7 @@ from __future__ import annotations
 import weft
 from weft.language import View, f16, f32, i8, u8, u32
 from weft.std.encodings import (
+    I8X4,
     I8X8,
     IQ1_M,
     IQ1_S,
@@ -411,7 +412,7 @@ def production_mul_mat_iq2_xxs_staged(
 @weft.kernel
 def production_mul_mat_iq3_s(
     W: View[IQ3_S, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)], Y: View[f32, (M, N)]
+    grid: View[I8X4, (512, 4)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq3_s(W, X, Xq, grid, Y)
 
@@ -419,7 +420,7 @@ def production_mul_mat_iq3_s(
 @weft.kernel
 def production_mul_mat_iq3_xxs(
     W: View[IQ3_XXS, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (1024,)], signs: View[i8, (1024,)], Y: View[f32, (M, N)]
+    grid: View[I8X4, (256, 4)], signs: View[I8X4, (256, 4)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq3_xxs(W, X, Xq, grid, signs, Y)
 

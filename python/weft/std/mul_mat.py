@@ -29,6 +29,7 @@ from weft.language import (
 )
 
 from .encodings import (
+    I8X4,
     I8X8,
     IQ1_M,
     IQ1_S,
@@ -842,7 +843,7 @@ def mul_mat_iq1_s(
     W: View[IQ1_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (16384,)],
+    grid: View[I8X8, (2048, 8)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -1097,7 +1098,7 @@ def mul_mat_iq3_s(
     W: View[IQ3_S, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (2048,)],
+    grid: View[I8X4, (512, 4)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)
@@ -1110,8 +1111,8 @@ def mul_mat_iq3_xxs(
     W: View[IQ3_XXS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (1024,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X4, (256, 4)],
+    signs: View[I8X4, (256, 4)],
     Y: View[f32, (M, N)],
 ):
     quantize_q8_K(X, Xq)

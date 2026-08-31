@@ -318,13 +318,14 @@ def dequantize_iq3_s(
             group = j // 32
             entry = (j % 32) // 8
             lane = j % 8
-            grid_index = u32(w.q[group * 8 + entry * 2 + lane // 4]) | (
-                extract_bits(w.qh[group], entry * 2 + lane // 4) << u32(8)
+            storage_coordinate = group * 8 + entry * 2 + lane // 4
+            grid_index = u32(w.q[storage_coordinate]) | (
+                u32(w.qh[storage_coordinate]) << u32(8)
             )
             value = nonlinear_lookup(grid, grid_index * u32(4) + u32(lane % 4))
-            if extract_bits(w.signs[group * 4 + entry], lane) != u32(0):
+            if u32(w.signs[j]) != u32(0):
                 value = -value
-            subscale = extract_bits(w.scales[group // 2], (group % 2) * 4, 4)
+            subscale = w.scales[group]
             scale = f32(w.d) * f32(i32(1) + i32(2) * i32(subscale))
             commit(iq_codebook(value, scale), Y[kb][j])
 

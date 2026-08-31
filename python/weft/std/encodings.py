@@ -191,14 +191,22 @@ class I8X8:
 
 
 @weft.encoding
+class I8X4:
+    layout = bitorder.lsb_first, byteorder.little
+    alignment = 4
+    elements = 4
+    values: i8[4]
+
+
+@weft.encoding
 class IQ3_S:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256
     d: f16
     q: u8[64]
-    qh: u8[8]
-    signs: u8[32]
-    scales: u8[4]
+    qh: u1[64] @ grouped(8) @ layered(1, lo_first)
+    signs: u1[256] @ grouped(8) @ layered(1, lo_first)
+    scales: u4[8] @ grouped(2) @ layered(1, lo_first)
 
 
 @weft.encoding

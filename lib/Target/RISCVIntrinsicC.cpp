@@ -5538,16 +5538,24 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
            std::to_string(operation.getEntryStride()) + ", " + entryVL +
            ");");
 
+      const unsigned packedBits =
+          elementBits * static_cast<unsigned>(operation.getPayloadExtent());
+      if (packedBits != 32 && packedBits != 64)
+        return fail(operation,
+                    "indexed entry gather has no exact packed word width");
       const std::string lmul =
           lmulSpelling(operation.getResult().getType().getLayout().getLmulEighths());
-      const std::string packedSuffix = "u64" + lmul;
-      const std::string packedType = "vuint64" + lmul + "_t";
+      const std::string packedSuffix =
+          "u" + std::to_string(packedBits) + lmul;
+      const std::string packedType =
+          "vuint" + std::to_string(packedBits) + lmul + "_t";
       std::string packed = fresh("entry_gather");
       line(packedType + " " + packed + " = __riscv_vluxei" +
            std::to_string(entryInteger.getWidth()) + "_v_" + packedSuffix +
-           "((const uint64_t *)(" + base + "), " + byteOffsets + ", " +
-           entryVL + ");");
-      const std::string unsignedResultSuffix = "u8" + lmul;
+           "((const uint" + std::to_string(packedBits) + "_t *)(" + base +
+           "), " + byteOffsets + ", " + entryVL + ");");
+      const std::string unsignedResultSuffix =
+          "u" + std::to_string(elementBits) + lmul;
       std::string unpacked = "__riscv_vreinterpret_v_" + packedSuffix + "_" +
                              unsignedResultSuffix + "(" + packed + ")";
       if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element);

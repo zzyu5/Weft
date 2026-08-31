@@ -3603,11 +3603,13 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
       return emitOpError(
           "scalar indexed entries require one exact unit-payload RVV leaf");
   } else {
+    const uint64_t packedBits =
+        payloadBits * static_cast<uint64_t>(getPayloadExtent());
     if (!indexElement ||
         (indexElement.getWidth() != 16 && indexElement.getWidth() != 32 &&
          indexElement.getWidth() != 64) ||
         payloadBits == 0 ||
-        payloadBits * static_cast<uint64_t>(getPayloadExtent()) != 64 ||
+        (packedBits != 32 && packedBits != 64) ||
         getEntryStride() != getPayloadExtent() ||
         getAccess().getForm() != "indexed" ||
         !exactLeaf(getLeaf(), "rvv", "indexed-entry-gather",

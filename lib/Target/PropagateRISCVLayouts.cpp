@@ -429,9 +429,10 @@ llvm::SmallVector<int64_t> downstreamContractionAxes(mlir::Value root) {
 bool supportsPackedIndexedEntryLookup(riscv::LookupOp lookup,
                                       const riscv_internal::IndexedEntryRelation &relation,
                                       riscv::ValueType result) {
-  if (riscv_internal::logicalBitWidth(result.getElementType()) *
-          relation.payloadExtent !=
-      64)
+  const int64_t packedBits =
+      riscv_internal::logicalBitWidth(result.getElementType()) *
+      relation.payloadExtent;
+  if (packedBits != 32 && packedBits != 64)
     return false;
   mlir::Value table =
       riscv_internal::stripRepresentationConversions(lookup.getTable());
@@ -447,7 +448,7 @@ bool supportsPackedIndexedEntryLookup(riscv::LookupOp lookup,
     alignment = facts.alignment;
     bitOffset = facts.bitOffset;
   }
-  return alignment >= 8 && bitOffset % 64 == 0;
+  return alignment >= packedBits / 8 && bitOffset % packedBits == 0;
 }
 
 bool constrainIndexedEntryLookup(riscv::LookupOp lookup, mlir::Value value,

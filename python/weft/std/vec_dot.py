@@ -22,6 +22,7 @@ from weft.language import (
 )
 
 from .encodings import (
+    I8X4,
     IQ1_M,
     IQ1_S,
     IQ2_S,
@@ -657,46 +658,60 @@ def vec_dot_iq2_s_q8_k(
 def vec_dot_iq3_xxs_q8_k(
     W: View[IQ3_XXS, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (1024,)],
-    signs: View[i8, (1024,)],
+    grid: View[I8X4, (256, 4)],
+    signs: View[I8X4, (256, 4)],
 ):
     sumf = f32(0.0)
+    grid_values = grid.values
+    sign_values = signs.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        entry = iota(4, dtype=u32, axis="entry")
+        code = iota(2, dtype=u32, axis="code")
+        payload = iota(4, dtype=u16, axis="payload")
         block_sum = i32(0)
-        for group in range(8):
-            metadata_base = 64 + group * 4
+        group_index = index(0)
+        with L.subs(kb, extent=32) as group:
+            metadata_base = index(64) + group_index * index(4)
             metadata = u32(w.q[metadata_base]) | (u32(w.q[metadata_base + 1]) << u32(8))
             metadata = metadata | (u32(w.q[metadata_base + 2]) << u32(16))
             metadata = metadata | (u32(w.q[metadata_base + 3]) << u32(24))
-            local = i32(0)
-            for entry in range(4):
-                sign_index = (metadata >> u32(entry * 7)) & u32(127)
-                for lane in range(4):
-                    q0 = i32(
-                        nonlinear_lookup(
-                            grid,
-                            u32(w.q[group * 8 + entry * 2]) * u32(4) + u32(lane),
-                        )
-                    )
-                    q1 = i32(
-                        nonlinear_lookup(
-                            grid,
-                            u32(w.q[group * 8 + entry * 2 + 1]) * u32(4) + u32(lane),
-                        )
-                    )
-                    s0 = i32(
-                        nonlinear_lookup(signs, sign_index * u32(8) + u32(lane))
-                    )
-                    s1 = i32(
-                        nonlinear_lookup(signs, sign_index * u32(8) + u32(lane + 4))
-                    )
-                    base = group * 32 + entry * 8
-                    local += q0 * i32(x.q[base + lane]) * s0
-                    local += q1 * i32(x.q[base + lane + 4]) * s1
+            grid_index = widen(
+                w.q[
+                    u32(group_index) * u32(8)
+                    + entry * u32(2)
+                    + code
+                ],
+                u32,
+            )
+            sign_index = (metadata >> (entry * u32(7))) & u32(127)
+            sign_entry = sign_index * u32(2) + code
+            weight = lookup(
+                grid_values,
+                grid_index * u32(4) + payload,
+                bounds="in_bounds",
+            )
+            sign = lookup(
+                sign_values,
+                sign_entry * u32(4) + payload,
+                bounds="in_bounds",
+            )
+            activation = x.q[
+                u32(group_index) * u32(32)
+                + entry * u32(8)
+                + code * u32(4)
+                + u32(payload)
+            ]
+            local = contract(
+                activation,
+                weight * sign,
+                over=("entry", "code", "payload"),
+                acc=i32,
+            )
             scale = i32((metadata >> u32(28)) * u32(2) + u32(1))
             block_sum += local * scale
+            group_index += index(1)
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
     return f32(0.25) * sumf
 
@@ -704,40 +719,54 @@ def vec_dot_iq3_xxs_q8_k(
 def vec_dot_iq3_s_q8_k(
     W: View[IQ3_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (2048,)],
+    grid: View[I8X4, (512, 4)],
 ):
     result = f32(0.0)
+    grid_values = grid.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        entry = iota(4, dtype=u32, axis="entry")
+        code = iota(2, dtype=u32, axis="code")
+        payload = iota(4, dtype=u16, axis="payload")
         block_sum = i32(0)
-        for group in range(8):
-            local = i32(0)
-            for entry in range(4):
-                qh = u32(w.qh[group])
-                grid0 = u32(w.q[group * 8 + entry * 2]) | (
-                    ((qh >> u32(entry * 2)) & u32(1)) << u32(8)
-                )
-                grid1 = u32(w.q[group * 8 + entry * 2 + 1]) | (
-                    ((qh >> u32(entry * 2 + 1)) & u32(1)) << u32(8)
-                )
-                sign_byte = u32(w.signs[group * 4 + entry])
-                for lane in range(4):
-                    sign0 = i32(1)
-                    sign1 = i32(1)
-                    if ((sign_byte >> u32(lane)) & u32(1)) != u32(0):
-                        sign0 = i32(-1)
-                    if ((sign_byte >> u32(lane + 4)) & u32(1)) != u32(0):
-                        sign1 = i32(-1)
-                    q0 = i32(nonlinear_lookup(grid, grid0 * u32(4) + u32(lane)))
-                    q1 = i32(nonlinear_lookup(grid, grid1 * u32(4) + u32(lane)))
-                    base = group * 32 + entry * 8
-                    local += q0 * i32(x.q[base + lane]) * sign0
-                    local += q1 * i32(x.q[base + lane + 4]) * sign1
-            metadata = u32(w.scales[group // 2])
-            shift = (group % 2) * 4
-            scale = i32(((metadata >> u32(shift)) & u32(15)) * u32(2) + u32(1))
+        group_index = index(0)
+        with L.subs(kb, extent=32) as group:
+            storage_coordinate = (
+                u32(group_index) * u32(8)
+                + entry * u32(2)
+                + code
+            )
+            grid_index = widen(w.q[storage_coordinate], u32) | (
+                widen(w.qh[storage_coordinate], u32) << u32(8)
+            )
+            weight = lookup(
+                grid_values,
+                grid_index * u32(4) + payload,
+                bounds="in_bounds",
+            )
+            sign_bit = w.signs[
+                u32(group_index) * u32(32)
+                + entry * u32(8)
+                + code * u32(4)
+                + u32(payload)
+            ]
+            signed_weight = weight * (i8(1) - i8(sign_bit) * i8(2))
+            activation = x.q[
+                u32(group_index) * u32(32)
+                + entry * u32(8)
+                + code * u32(4)
+                + u32(payload)
+            ]
+            local = contract(
+                activation,
+                signed_weight,
+                over=("entry", "code", "payload"),
+                acc=i32,
+            )
+            scale = i32(w.scales[group_index]) * i32(2) + i32(1)
             block_sum += local * scale
+            group_index += index(1)
         result += f32(w.d) * f32(x.ds) * f32(block_sum)
     return result
 

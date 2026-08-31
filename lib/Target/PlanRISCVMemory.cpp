@@ -218,6 +218,8 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
     return false;
   const unsigned payloadBits =
       riscv_internal::logicalBitWidth(result.getElementType());
+  const uint64_t packedBits =
+      payloadBits * static_cast<uint64_t>(plan.payloadExtent);
   auto resultAxes = result.getAxisIds().asArrayRef();
   auto payload = llvm::find(resultAxes, plan.payloadAxis);
   if (payload == resultAxes.end())
@@ -229,9 +231,10 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
          (index.getWidth() == 16 || index.getWidth() == 32 ||
           index.getWidth() == 64) &&
          payloadBits > 0 && plan.payloadExtent > 0 &&
-         payloadBits * static_cast<uint64_t>(plan.payloadExtent) == 64 &&
-         plan.entryStride == plan.payloadExtent && bitOffset % 64 == 0 &&
-         alignment >= 8 &&
+         (packedBits == 32 || packedBits == 64) &&
+         plan.entryStride == plan.payloadExtent &&
+         bitOffset % packedBits == 0 &&
+         alignment >= static_cast<int64_t>(packedBits / 8) &&
          layout.getTimeFactors()[payloadPosition] == 1 &&
          layout.getLaneFactors()[payloadPosition] == plan.payloadExtent &&
          layout.getReplicaFactors()[payloadPosition] == 1 &&
