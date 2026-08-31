@@ -7901,7 +7901,6 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
             auto resultLayout = layoutOf(conversion.getResult());
             if (pieces == 2 && sourceLayout && resultLayout &&
                 sourceLayout.getSew() == resultLayout.getSew() &&
-                sourceLayout.getLmulEighths() >= 8 &&
                 sourceLayout.getLmulEighths() * 2 ==
                     resultLayout.getLmulEighths()) {
               const int64_t firstStream = resultStream * pieces;
@@ -7912,9 +7911,22 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
                   secondPart >= input.parts.size())
                 return fail(conversion,
                             "RVV create repartition exceeds its source streams");
-              expression = "__riscv_vcreate_v_" + sourceSuffix + "_" +
-                           resultSuffix + "(" + input.parts[firstPart] + ", " +
-                           input.parts[secondPart] + ")";
+              if (sourceLayout.getLmulEighths() >= 8) {
+                expression = "__riscv_vcreate_v_" + sourceSuffix + "_" +
+                             resultSuffix + "(" + input.parts[firstPart] + ", " +
+                             input.parts[secondPart] + ")";
+              } else {
+                const std::string extend =
+                    "__riscv_vlmul_ext_v_" + sourceSuffix + "_" + resultSuffix;
+                expression = "__riscv_vslideup_vx_" + resultSuffix + "(" +
+                             extend + "(" + input.parts[firstPart] + "), " +
+                             extend + "(" + input.parts[secondPart] + "), " +
+                             std::to_string(sourceLanes) + ", " +
+                             partVL(conversion.getResult(),
+                                    resultRegister * resultStreams +
+                                        resultStream) +
+                             ")";
+              }
               std::string name = fresh("layout_repartition");
               line(resultCType + " " + name + " = " + expression + ";");
               repartitioned.parts.push_back(std::move(name));
