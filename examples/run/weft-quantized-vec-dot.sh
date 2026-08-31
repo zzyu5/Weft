@@ -69,7 +69,7 @@ if [[ ${format} == iq2_xs ]]; then
   if [[ ${target} == sg2044 ]]; then
     [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
       physical_auto+=(--auto-lmul-eighths 32)
-    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 2)
+    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
   else
     [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
       physical_auto+=(--auto-lmul-eighths 32)

@@ -1219,6 +1219,118 @@ mlir::LogicalResult PartialLayoutPlanAttr::verify(
   return mlir::success();
 }
 
+mlir::LogicalResult NestedPartialPlanAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    int64_t windowAxis, int64_t issueStreams, int64_t windowExtent,
+    int64_t issueUnroll, mlir::Type issueLhsType, mlir::Type issueRhsType,
+    mlir::Type sourceSlotType, mlir::Type splitSlotType,
+    mlir::Type reducedSlotType, mlir::Type scaleReplicaType,
+    mlir::Type sourceSetType, mlir::Type repackedSetType,
+    mlir::Type reducedSetType, mlir::Type scaleCombinedSetType,
+    llvm::StringRef scaleSupply, llvm::StringRef multiplyInstruction,
+    int64_t resourceGroups) {
+  auto issueLhs = mlir::dyn_cast<weft::riscv::ValueType>(issueLhsType);
+  auto issueRhs = mlir::dyn_cast<weft::riscv::ValueType>(issueRhsType);
+  auto sourceSlot = mlir::dyn_cast<weft::riscv::ValueType>(sourceSlotType);
+  auto splitSlot = mlir::dyn_cast<weft::riscv::ValueType>(splitSlotType);
+  auto reducedSlot = mlir::dyn_cast<weft::riscv::ValueType>(reducedSlotType);
+  auto scaleReplica = mlir::dyn_cast<weft::riscv::ValueType>(scaleReplicaType);
+  auto sourceSet =
+      mlir::dyn_cast<weft::riscv::PartialSetType>(sourceSetType);
+  auto repackedSet =
+      mlir::dyn_cast<weft::riscv::PartialSetType>(repackedSetType);
+  auto reducedSet =
+      mlir::dyn_cast<weft::riscv::PartialSetType>(reducedSetType);
+  auto scaleCombinedSet =
+      mlir::dyn_cast<weft::riscv::PartialSetType>(scaleCombinedSetType);
+  const bool exactMultiply =
+      multiplyInstruction == "rvv.vwmul.vv" ||
+      multiplyInstruction == "rvv.vwmul.vv.reinterpret-rhs" ||
+      multiplyInstruction == "rvv.vwmul.vv.reinterpret-lhs" ||
+      multiplyInstruction == "rvv.vwmulsu.vv" ||
+      multiplyInstruction == "rvv.vwmulsu.vv.swap";
+  if (windowAxis <= 0 || issueStreams <= 1 || windowExtent <= 1 ||
+      issueUnroll <= 0 || issueUnroll > issueStreams || resourceGroups <= 0 ||
+      !issueLhs || !issueRhs || !sourceSlot || !splitSlot || !reducedSlot ||
+      !scaleReplica || !sourceSet || !repackedSet || !reducedSet ||
+      !scaleCombinedSet || !exactMultiply)
+    return emitError()
+           << "nested partial plan requires one complete issue/product/reduction topology";
+  if (scaleSupply != "vector-convert" &&
+      scaleSupply != "scalar-rematerialize")
+    return emitError()
+           << "nested partial plan requires one selected scale supply form";
+  if (issueLhs.getLayout().getCarrier() != "rvv" ||
+      issueRhs.getLayout().getCarrier() != "rvv" ||
+      sourceSlot.getLayout().getCarrier() != "rvv" ||
+      splitSlot.getLayout().getCarrier() != "rvv" ||
+      reducedSlot.getLayout().getCarrier() != "rvv" ||
+      scaleReplica.getLayout().getCarrier() != "scalar")
+    return emitError()
+           << "nested partial plan requires RVV issue/product values and scalar scale replicas";
+  auto lhsLanes = checkedPositiveProduct(
+      issueLhs.getLayout().getLaneFactors().asArrayRef());
+  auto rhsLanes = checkedPositiveProduct(
+      issueRhs.getLayout().getLaneFactors().asArrayRef());
+  auto lhsTime = checkedPositiveProduct(
+      issueLhs.getLayout().getTimeFactors().asArrayRef());
+  auto rhsTime = checkedPositiveProduct(
+      issueRhs.getLayout().getTimeFactors().asArrayRef());
+  auto lhsReplicas = checkedPositiveProduct(
+      issueLhs.getLayout().getReplicaFactors().asArrayRef());
+  auto rhsReplicas = checkedPositiveProduct(
+      issueRhs.getLayout().getReplicaFactors().asArrayRef());
+  auto scaleReplicas = checkedPositiveProduct(
+      scaleReplica.getLayout().getReplicaFactors().asArrayRef());
+  if (!lhsLanes || !rhsLanes || !lhsTime || !rhsTime || !lhsReplicas ||
+      !rhsReplicas || !scaleReplicas || *lhsLanes != *rhsLanes ||
+      *lhsLanes != sourceSet.getTermsPerSlot() || *lhsTime != 1 ||
+      *rhsTime != 1 || *lhsReplicas != 1 || *rhsReplicas != 1 ||
+      *scaleReplicas != windowExtent ||
+      !llvm::all_of(scaleReplica.getLayout().getTimeFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }) ||
+      !llvm::all_of(scaleReplica.getLayout().getLaneFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }))
+    return emitError()
+           << "nested partial issue values must be one complete lane product with one scalar scale replica per window";
+  if (sourceSlot.getAxisIds().size() != 1 ||
+      splitSlot.getAxisIds() != sourceSlot.getAxisIds() ||
+      reducedSlot.getAxisIds() != sourceSlot.getAxisIds() ||
+      sourceSlot.getShape().size() != 1 || splitSlot.getShape().size() != 1 ||
+      reducedSlot.getShape().size() != 1 ||
+      sourceSlot.getShape()[0] != splitSlot.getShape()[0] * windowExtent ||
+      reducedSlot.getShape()[0] != 1 ||
+      sourceSlot.getLayout().getLmulEighths() !=
+          splitSlot.getLayout().getLmulEighths() * windowExtent ||
+      sourceSlot.getLayout().getVl() !=
+          splitSlot.getLayout().getVl() * windowExtent)
+    return emitError()
+           << "nested partial product carrier must split exactly into typed reduction windows";
+  const int64_t reductionAxis = sourceSlot.getAxisIds()[0];
+  if (sourceSet.getPartialType() != sourceSlot || sourceSet.getSlots() != 1 ||
+      sourceSet.getReductionAxis() != reductionAxis ||
+      repackedSet.getPartialType() != splitSlot ||
+      repackedSet.getReductionAxis() != reductionAxis ||
+      repackedSet.getSlots() != windowExtent ||
+      repackedSet.getTermsPerSlot() * windowExtent !=
+          sourceSet.getTermsPerSlot() ||
+      repackedSet.getResourceGroups() != sourceSet.getResourceGroups() ||
+      reducedSet.getPartialType() != reducedSlot ||
+      reducedSet.getReductionAxis() != reductionAxis ||
+      reducedSet.getSlots() != windowExtent ||
+      reducedSet.getTermsPerSlot() != repackedSet.getTermsPerSlot() ||
+      scaleCombinedSet.getPartialType() != reducedSlot ||
+      scaleCombinedSet.getReductionAxis() != reductionAxis ||
+      scaleCombinedSet.getSlots() != 1 ||
+      scaleCombinedSet.getTermsPerSlot() != sourceSet.getTermsPerSlot() ||
+      resourceGroups < issueLhs.getLayout().getRegisterGroups() +
+                           issueRhs.getLayout().getRegisterGroups() +
+                           sourceSet.getResourceGroups())
+    return emitError()
+           << "nested partial plan set types disagree with the selected full-product carrier";
+  return mlir::success();
+}
+
 mlir::LogicalResult LayeredStreamGeometryAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError, int64_t axis,
     int64_t groupSize, int64_t layerSize, int64_t laneCount,
@@ -4475,10 +4587,13 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   }
   llvm::StringRef topologyKind = getPartialTopology().getKind();
   auto partialLayoutPlan = getPartialLayoutPlanAttr();
+  auto nestedPartialPlan = getNestedPartialPlanAttr();
   auto layeredPartialPlan = getLayeredPartialPlanAttr();
   const bool topologyAssigned = topologyKind != "unassigned";
   bool layoutPlanClosed =
       topologyAssigned == static_cast<bool>(partialLayoutPlan) &&
+      (topologyKind == "nested_scaled_stream") ==
+          static_cast<bool>(nestedPartialPlan) &&
       (topologyKind == "layered") == static_cast<bool>(layeredPartialPlan);
   if (partialLayoutPlan) {
     auto partialSlot = mlir::dyn_cast<ValueType>(
@@ -4514,7 +4629,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       return expected > 0 &&
              values.size() == static_cast<size_t>(expected);
     };
-    const bool sourcePlanRequired = split > 1;
+    const bool sourcePlanRequired = split > 1 && !nestedPartialPlan;
     layoutPlanClosed &=
         sourcePlanRequired == static_cast<bool>(sourceLhs) &&
         sourcePlanRequired == static_cast<bool>(sourceRhs) &&
@@ -4563,6 +4678,63 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
                               lhsOffset <= plannedLhsLanes - sourceLanes &&
                               rhsOffset <= plannedRhsLanes - sourceLanes;
       }
+    }
+  }
+  if (nestedPartialPlan) {
+    auto windowAxis = llvm::find(lhs.getAxisIds().asArrayRef(),
+                                 nestedPartialPlan.getWindowAxis());
+    auto rhsWindowAxis = llvm::find(rhs.getAxisIds().asArrayRef(),
+                                    nestedPartialPlan.getWindowAxis());
+    std::optional<size_t> resultWindowPosition;
+    if (shapedResult) {
+      auto found = llvm::find(shapedResult.getAxisIds().asArrayRef(),
+                              nestedPartialPlan.getWindowAxis());
+      if (found != shapedResult.getAxisIds().asArrayRef().end())
+        resultWindowPosition = static_cast<size_t>(
+            found - shapedResult.getAxisIds().asArrayRef().begin());
+    }
+    auto issueLhs = mlir::dyn_cast<ValueType>(nestedPartialPlan.getIssueLhsType());
+    auto issueRhs = mlir::dyn_cast<ValueType>(nestedPartialPlan.getIssueRhsType());
+    auto sourceSet = mlir::dyn_cast<PartialSetType>(
+        nestedPartialPlan.getSourceSetType());
+    const bool axesPresent =
+        windowAxis != lhs.getAxisIds().asArrayRef().end() &&
+        rhsWindowAxis != rhs.getAxisIds().asArrayRef().end() && shapedResult &&
+        resultWindowPosition;
+    layoutPlanClosed &= axesPresent && issueLhs && issueRhs && sourceSet;
+    if (layoutPlanClosed) {
+      const size_t lhsPosition = static_cast<size_t>(
+          windowAxis - lhs.getAxisIds().asArrayRef().begin());
+      const size_t rhsPosition = static_cast<size_t>(
+          rhsWindowAxis - rhs.getAxisIds().asArrayRef().begin());
+      const size_t resultPosition = *resultWindowPosition;
+      layoutPlanClosed &=
+          nestedPartialPlan.getIssueStreams() ==
+              lhs.getLayout().getTimeFactors()[lhsPosition] &&
+          nestedPartialPlan.getIssueStreams() ==
+              rhs.getLayout().getTimeFactors()[rhsPosition] &&
+          nestedPartialPlan.getWindowExtent() ==
+              lhs.getLayout().getLaneFactors()[lhsPosition] &&
+          nestedPartialPlan.getWindowExtent() ==
+              rhs.getLayout().getLaneFactors()[rhsPosition] &&
+          shapedResult.getShape()[resultPosition] ==
+              nestedPartialPlan.getIssueStreams() *
+                  nestedPartialPlan.getWindowExtent() &&
+          getPartialTopology().getSourceSlots() ==
+              nestedPartialPlan.getIssueStreams() &&
+          getPartialTopology().getPartialSlots() ==
+              nestedPartialPlan.getIssueStreams() *
+                  nestedPartialPlan.getWindowExtent() &&
+          getPartialTopology().getLaneSplit() ==
+              nestedPartialPlan.getWindowExtent() &&
+          getPartialTopology().getCombineArity() ==
+              nestedPartialPlan.getWindowExtent() &&
+          getPartialTopology().getResourceGroups() ==
+              nestedPartialPlan.getResourceGroups() &&
+          llvm::is_contained(getOver(), sourceSet.getReductionAxis()) &&
+          supportsRVVLayout(target, issueLhs.getLayout()) &&
+          supportsRVVLayout(target, issueRhs.getLayout()) &&
+          nestedPartialPlan.getResourceGroups() <= target.getVectorRegisters();
     }
   }
   if (layeredPartialPlan)
@@ -4900,6 +5072,75 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
       return emitOpError(
           "regular-repeat gather index bases disagree with the selected source window");
   }
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVRegularRepeatScalarLoadOp::verify() {
+  ValueType field = getField().getType();
+  ValueType result = getResult().getType();
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  mlir::Type sourceBaseType = elementOf(getSourceBase().getType());
+  auto sourceBaseInteger = mlir::dyn_cast<mlir::IntegerType>(sourceBaseType);
+  const bool scalarSourceBase =
+      isScalar(getSourceBase().getType()) &&
+      (sourceBaseType.isIndex() ||
+       (sourceBaseInteger && !sourceBaseInteger.isSigned()));
+  auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), getSourceAxis());
+  auto resultAxis =
+      llvm::find(result.getAxisIds().asArrayRef(), getReductionAxis());
+  auto replicas = checkedPositiveProduct(
+      result.getLayout().getReplicaFactors().asArrayRef());
+  if (!sourceField || !fieldElement || fieldElement.isSignless() ||
+      getSourceAxis() <= 0 || getReductionAxis() <= 0 ||
+      fieldAxis == field.getAxisIds().asArrayRef().end() ||
+      resultAxis == result.getAxisIds().asArrayRef().end() ||
+      getAccess() != sourceField.getAccess() ||
+      getAccess().getMapping() != "natural" ||
+      getAccess().getForm() != "unit" || getAccess().getBitOffset() % 8 ||
+      (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
+       fieldElement.getWidth() != 32) ||
+      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
+      result.getElementType() != field.getElementType() ||
+      result.getLayout().getCarrier() != "scalar" || !replicas ||
+      *replicas != getSourceCount() * getRepeat() ||
+      !llvm::all_of(result.getLayout().getTimeFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }) ||
+      !llvm::all_of(result.getLayout().getLaneFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }))
+    return emitOpError(
+        "regular-repeat scalar load requires one natural field window and one scalar replica per repeated logical element");
+  const size_t resultPosition = static_cast<size_t>(
+      resultAxis - result.getAxisIds().asArrayRef().begin());
+  for (size_t position = 0; position < result.getShape().size(); ++position) {
+    const int64_t expectedReplicas =
+        position == resultPosition ? getSourceCount() * getRepeat() : 1;
+    const bool validExtent =
+        position == resultPosition
+            ? result.getShape()[position] == getSourceCount() * getRepeat()
+            : result.getShape()[position] <= 0 ||
+                  result.getShape()[position] == 1;
+    if (!validExtent ||
+        result.getLayout().getReplicaFactors()[position] != expectedReplicas)
+      return emitOpError()
+             << "regular-repeat scalar load may preserve only singleton non-reduction axes; result="
+             << result << ", reduction-position=" << resultPosition
+             << ", source-count=" << getSourceCount()
+             << ", repeat=" << getRepeat();
+  }
+  const size_t fieldPosition = static_cast<size_t>(
+      fieldAxis - field.getAxisIds().asArrayRef().begin());
+  if (field.getShape()[fieldPosition] <= 0 ||
+      getSourceCount() > field.getShape()[fieldPosition] ||
+      !exactLeaf(getLeaf(), "scalar", "regular-repeat-scalar-load",
+                 "scalar.regular-repeat-load", "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() !=
+          llvm::ArrayRef<int64_t>({static_cast<int64_t>(getSourceAxis()),
+                                   static_cast<int64_t>(getReductionAxis()),
+                                   static_cast<int64_t>(getSourceCount()),
+                                   static_cast<int64_t>(getRepeat())}))
+    return emitOpError(
+        "regular-repeat scalar load field bounds or selected leaf are incomplete");
   return mlir::success();
 }
 

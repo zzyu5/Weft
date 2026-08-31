@@ -652,6 +652,8 @@ private:
       riscv::RVVRegularRepeatIndexOp operation);
   mlir::LogicalResult compileRVVRegularRepeatGather(
       riscv::RVVRegularRepeatGatherOp operation);
+  mlir::LogicalResult compileRVVRegularRepeatScalarLoad(
+      riscv::RVVRegularRepeatScalarLoadOp operation);
   mlir::LogicalResult
   compileRVVStorageWindow(riscv::RVVStorageWindowOp operation);
   mlir::LogicalResult
@@ -2357,6 +2359,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto gather =
           mlir::dyn_cast<riscv::RVVRegularRepeatGatherOp>(operation))
     return compileRVVRegularRepeatGather(gather);
+  if (auto load =
+          mlir::dyn_cast<riscv::RVVRegularRepeatScalarLoadOp>(operation))
+    return compileRVVRegularRepeatScalarLoad(load);
   if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(operation))
     return compileRVVStorageWindow(window);
   if (auto load = mlir::dyn_cast<riscv::RVVLayeredRecordLoadOp>(operation))
@@ -9782,6 +9787,58 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     }
     bindings[resultValue] = std::move(result);
   }
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVRegularRepeatScalarLoad(
+    riscv::RVVRegularRepeatScalarLoadOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "scalar.regular-repeat-load")
+    return fail(operation,
+                "regular-repeat scalar load has no exact selected spelling");
+  Binding field = bindings.lookup(operation.getField());
+  if (field.kind != Binding::Kind::Field || field.field.index)
+    return fail(operation,
+                "regular-repeat scalar load requires one unprojected encoded field");
+  Binding owner = bindings.lookup(field.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(field.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto storage = fieldFor(field);
+  auto elementType = storage ? scalarCType(storage->type) : std::nullopt;
+  auto sourceBase = materializeNumeric(operation.getSourceBase(),
+                                       bindings.lookup(operation.getSourceBase()));
+  const int64_t sourceCount = operation.getSourceCount();
+  const int64_t repeat = operation.getRepeat();
+  const int64_t replicas = registerPartCount(operation.getResult());
+  if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
+      !storage || !elementType || storage->bitOffset % 8 ||
+      mlir::failed(sourceBase) || sourceBase->kind != Binding::Kind::Scalar ||
+      sourceCount <= 0 || repeat <= 1 || replicas != sourceCount * repeat)
+    return fail(operation,
+                "regular-repeat scalar load has incomplete typed storage geometry");
+
+  const std::string pointer =
+      "((const " + *elementType + " *)((const uint8_t *)(" +
+      owner.recordPointer + ") + " +
+      std::to_string(storage->bitOffset / 8) + "))";
+  llvm::SmallVector<std::string> sources;
+  sources.reserve(sourceCount);
+  for (int64_t source = 0; source < sourceCount; ++source) {
+    std::string loaded = fresh("repeat_scalar");
+    line(*elementType + " " + loaded + " = " + pointer + "[" +
+         sourceBase->scalar + " + " + std::to_string(source) + "];");
+    sources.push_back(std::move(loaded));
+  }
+  Binding result;
+  result.kind = Binding::Kind::ScalarTuple;
+  result.parts.reserve(replicas);
+  for (int64_t replica = 0; replica < replicas; ++replica)
+    result.parts.push_back(sources[replica / repeat]);
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

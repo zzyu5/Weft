@@ -262,6 +262,38 @@ def WeftRISCV_PartialLayoutPlanAttr
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_NestedPartialPlanAttr
+    : WeftRISCV_Attr<"NestedPartialPlan", "nested_partial_plan"> {
+  let parameters = (ins
+    "int64_t":$windowAxis,
+    "int64_t":$issueStreams,
+    "int64_t":$windowExtent,
+    "int64_t":$issueUnroll,
+    "::mlir::Type":$issueLhsType,
+    "::mlir::Type":$issueRhsType,
+    "::mlir::Type":$sourceSlotType,
+    "::mlir::Type":$splitSlotType,
+    "::mlir::Type":$reducedSlotType,
+    "::mlir::Type":$scaleReplicaType,
+    "::mlir::Type":$sourceSetType,
+    "::mlir::Type":$repackedSetType,
+    "::mlir::Type":$reducedSetType,
+    "::mlir::Type":$scaleCombinedSetType,
+    StringRefParameter<"selected scale supply form">:$scaleSupply,
+    StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $windowAxis `,` $issueStreams `,` $windowExtent `,` $issueUnroll `,`
+        $issueLhsType `,` $issueRhsType `,` $sourceSlotType `,`
+        $splitSlotType `,` $reducedSlotType `,` $scaleReplicaType `,`
+        $sourceSetType `,` $repackedSetType `,` $reducedSetType `,`
+        $scaleCombinedSetType `,` $scaleSupply `,` $multiplyInstruction `,`
+        $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_LayeredStreamGeometryAttr
     : WeftRISCV_Attr<"LayeredStreamGeometry", "layered_stream_geometry"> {
   let parameters = (ins
@@ -1196,6 +1228,7 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        DenseI64ArrayAttr:$lhs_parts,
                        DenseI64ArrayAttr:$rhs_parts,
                        OptionalAttr<WeftRISCV_PartialLayoutPlanAttr>:$partial_layout_plan,
+                       OptionalAttr<WeftRISCV_NestedPartialPlanAttr>:$nested_partial_plan,
                        OptionalAttr<WeftRISCV_LayeredPartialPlanAttr>:$layered_partial_plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1243,6 +1276,21 @@ def WeftRISCV_RVVRegularRepeatGatherOp
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs Variadic<WeftRISCV_ValueType>:$results);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRegularRepeatScalarLoadOp
+    : WeftRISCV_Op<"rvv_regular_repeat_scalar_load",
+                   [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       I64Attr:$source_axis,
+                       I64Attr:$reduction_axis,
+                       AnyType:$source_base,
+                       I64Attr:$source_count,
+                       I64Attr:$repeat,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
