@@ -223,6 +223,7 @@ class IQ3_XXS:
 @weft.encoding
 class IQ4_NL:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 32
     d: f16
     q: u4[32] @ grouped(32) @ layered(16, lo_first)
@@ -231,6 +232,7 @@ class IQ4_NL:
 @weft.encoding
 class IQ4_XS:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     scales_h: u16
