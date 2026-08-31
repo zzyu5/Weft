@@ -27,10 +27,6 @@ if [[ ${format_id} -lt 0 ]]; then
 fi
 kernel="quantized_vec_dot_${format}_${partners[format_id]}"
 runtime_kernel_define=
-if [[ ${target} == sg2044 && ${format} == q2_k ]]; then
-  kernel=quantized_vec_dot_q2_k_q8_k_group_reduced
-  runtime_kernel_define=-DWEFT_Q2K_GROUP_REDUCED=1
-fi
 physical_auto=()
 if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
   physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
@@ -57,6 +53,15 @@ if [[ ${format} == q3_k ]]; then
     fi
   fi
   [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+    physical_auto+=(--auto-pipeline-depth 1)
+fi
+if [[ ${format} == q2_k ]]; then
+  if [[ ${target} == sg2044 ]]; then
+    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 16)
+  else
+    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
+  fi
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
     physical_auto+=(--auto-pipeline-depth 1)
 fi

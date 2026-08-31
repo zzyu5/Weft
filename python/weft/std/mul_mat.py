@@ -72,7 +72,6 @@ from .vec_dot import (
     vec_dot_nvfp4_q8_0,
     vec_dot_q1_0_q8_0,
     vec_dot_q2_k_q8_k,
-    vec_dot_q2_k_q8_k_group_reduced,
     vec_dot_q3_k_q8_k,
     vec_dot_q3_k_q8_k_predecoded_scales,
     vec_dot_q4_0_q8_0,
@@ -485,80 +484,6 @@ def mul_mat_q2_k(
                     with L.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
-                        coordinates = iota(128, dtype=u32, axis="k")
-                        first_scale = widen(
-                            u8(w.scales[:, coordinates / u32(16)]) & u8(15),
-                            i16,
-                        )
-                        first_weight = (
-                            widen(w.q[:, coordinates], i16) * first_scale
-                        )
-                        first = outer_contract(
-                            widen(x.q[:, coordinates], i16),
-                            first_weight,
-                            over="k",
-                            acc=i32,
-                        )
-
-                        second_coordinates = coordinates + u32(128)
-                        second_scale = widen(
-                            u8(
-                                w.scales[:, coordinates / u32(16) + u32(8)]
-                            )
-                            & u8(15),
-                            i16,
-                        )
-                        second_weight = (
-                            widen(w.q[:, second_coordinates], i16) * second_scale
-                        )
-                        second = outer_contract(
-                            widen(x.q[:, second_coordinates], i16),
-                            second_weight,
-                            over="k",
-                            acc=i32,
-                        )
-
-                        mins = widen(u8(w.scales) >> u8(4), i16)
-                        correction = outer_contract(
-                            x.bsum, mins, over="k", acc=i32
-                        )
-                        integer = first + second
-                        acc += f32(x.ds) * (
-                            f32(w.d) * widen(integer, f32)
-                            - f32(w.dmin) * widen(correction, f32)
-                        )
-                    commit(acc, Y[mb, nb])
-
-
-def mul_mat_q2_k_decode(
-    W: View[Q2_K, (N, K)],
-    X: View[f32, (M, K)],
-    Xq: View[Q8_K, (M, K)],
-    Y: View[f32, (M, N)],
-):
-    quantize_q8_K(X, Xq)
-    for row in range(M):
-        for column in range(N):
-            commit(vec_dot_q2_k_q8_k(W[column], Xq[row]), Y[row, column])
-
-
-def mul_mat_q2_k_group_reduced(
-    W: View[Q2_K, (N, K)],
-    X: View[f32, (M, K)],
-    Xq: View[Q8_K, (M, K)],
-    Y: View[f32, (M, N)],
-):
-    quantize_q8_K(X, Xq)
-    with L.tiles(N, extent=auto("NC")) as nc:
-        wp = materialize(admit(W[nc]))
-        with L.tiles(M, extent=auto("MC")) as mc:
-            xp = materialize(admit(Xq[mc]))
-            with L.cols(nc, group=auto("NR")) as nb:
-                with L.rows(mc, group=auto("MR")) as mb:
-                    acc = new(f32, [MR, NR], init=f32(0.0))
-                    with L.blocks(K, extent=256) as kb:
-                        w = wp[nb, kb]
-                        x = xp[mb, kb]
                         low_scales = materialize(
                             u8(wp[nb, kb].scales) & u8(15)
                         )
@@ -583,7 +508,7 @@ def mul_mat_q2_k_group_reduced(
                     commit(acc, Y[mb, nb])
 
 
-def mul_mat_q2_k_group_reduced_decode(
+def mul_mat_q2_k_decode(
     W: View[Q2_K, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -593,7 +518,7 @@ def mul_mat_q2_k_group_reduced_decode(
     for row in range(M):
         for column in range(N):
             commit(
-                vec_dot_q2_k_q8_k_group_reduced(W[column], Xq[row]),
+                vec_dot_q2_k_q8_k(W[column], Xq[row]),
                 Y[row, column],
             )
 

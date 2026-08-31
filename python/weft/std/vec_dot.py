@@ -172,44 +172,6 @@ def vec_dot_q2_k_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        coordinates = iota(128, dtype=u32, axis="k")
-        first_scale = widen(
-            u8(w.scales[coordinates / u32(16)]) & u8(15), i16
-        )
-        first_weight = widen(w.q[coordinates], i16) * first_scale
-        first = contract(
-            widen(x.q[coordinates], i16), first_weight, over="k", acc=i32
-        )
-
-        second_coordinates = coordinates + u32(128)
-        second_scale = widen(
-            u8(w.scales[coordinates / u32(16) + u32(8)]) & u8(15), i16
-        )
-        second_weight = widen(w.q[second_coordinates], i16) * second_scale
-        second = contract(
-            widen(x.q[second_coordinates], i16),
-            second_weight,
-            over="k",
-            acc=i32,
-        )
-
-        mins = widen(u8(w.scales) >> u8(4), i16)
-        minimum = contract(x.bsum, mins, over="k", acc=i32)
-        scaled = first + second
-        result += f32(x.ds) * (
-            f32(w.d) * f32(scaled) - f32(w.dmin) * f32(minimum)
-        )
-    return result
-
-
-def vec_dot_q2_k_q8_k_group_reduced(
-    W: View[Q2_K, (K,)],
-    X: View[Q8_K, (K,)],
-):
-    result = f32(0.0)
-    with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb])
-        x = admit(X[kb])
         integer = i32(0)
         with L.subs(kb, extent=16) as sub:
             partial = contract(

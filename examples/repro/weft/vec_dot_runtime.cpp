@@ -198,13 +198,8 @@ using selected_activation = block_q8_K;
 #define selected_wqk 256
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_q2_K_q8_K_generic
-#if defined(WEFT_Q2K_GROUP_REDUCED)
-extern "C" void quantized_vec_dot_q2_k_q8_k_group_reduced(const std::uint8_t *, const std::uint8_t *, float *, std::size_t);
-#define selected_call(w, x, y) quantized_vec_dot_q2_k_q8_k_group_reduced(w, x, y, kElements)
-#else
 extern "C" void quantized_vec_dot_q2_k_q8_k(const std::uint8_t *, const std::uint8_t *, float *, std::size_t);
 #define selected_call(w, x, y) quantized_vec_dot_q2_k_q8_k(w, x, y, kElements)
-#endif
 #elif WEFT_VEC_DOT_FORMAT == 7
 using selected_weight = block_q3_K;
 using selected_activation = block_q8_K;
