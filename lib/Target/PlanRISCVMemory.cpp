@@ -1607,7 +1607,8 @@ public:
       candidate.resultType =
           mlir::dyn_cast<riscv::ValueType>(selectedResultType);
       if (!candidate.field || !candidate.resultType ||
-          extract.getAccess().getForm() != "indexed")
+          extract.getAccess().getForm() != "indexed" ||
+          candidate.field.getAccess().getMapping() != "natural")
         continue;
 
       size_t indexCursor = 0;
@@ -1666,6 +1667,29 @@ public:
 
       auto input = mlir::dyn_cast<riscv::ValueType>(extract.getInput().getType());
       if (!input || gatherDimension >= input.getShape().size())
+        continue;
+      // Replacing a shaped gather with a regular extract removes the explicit
+      // index value, so the field itself must already carry the result axes.
+      // A gather may legitimately introduce a new logical axis (for example a
+      // typed table-entry coordinate); such an edge must remain indexed rather
+      // than being rewritten into an invalid all/regular projection.
+      auto regularInput = mlir::dyn_cast<riscv::ValueType>(
+          candidate.field.getResult().getType());
+      if (!regularInput ||
+          regularInput.getShape().size() !=
+              candidate.resultType.getShape().size() ||
+          regularInput.getAxisIds() != candidate.resultType.getAxisIds())
+        continue;
+      bool preservesFreeAxes = true;
+      for (size_t dimension = 0; dimension < regularInput.getShape().size();
+           ++dimension)
+        if (dimension != gatherDimension &&
+            regularInput.getShape()[dimension] !=
+                candidate.resultType.getShape()[dimension]) {
+          preservesFreeAxes = false;
+          break;
+        }
+      if (!preservesFreeAxes)
         continue;
       candidate.lanes =
           candidate.resultType.getLayout().getLaneFactors()[gatherDimension];
