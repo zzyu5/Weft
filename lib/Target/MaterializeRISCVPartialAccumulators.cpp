@@ -2833,8 +2833,7 @@ public:
             lhsWindow > 1 && lhsWindow == rhsWindow &&
             logicalExtent == lhsTime * lhsWindow && finalElement &&
             finalElement.isSigned() && finalElement.getWidth() == 32 &&
-            singleScalarFinal &&
-            dot.getPartialUnroll() > 0 && dot.getPartialUnroll() <= 2) {
+            singleScalarFinal && dot.getPartialUnroll() > 0) {
           nestedPlan = planNestedPartialCarrier(
               builder, dot, *match, windowAxis, lhsTime, lhsWindow);
           if (!nestedPlan) {
@@ -3185,6 +3184,59 @@ public:
                 builder.getArrayAttr(rootStoragePlans),
                 layeredPlan->layered.geometry));
       }
+    }
+
+    // A nested partial plan owns the contraction's issue unroll.  Lowering
+    // records the same requested factor on the original issue loop so
+    // non-partial contractions can still use generic loop unrolling.  Once a
+    // nested plan has been selected, consume that loop attribute here: the
+    // materializer will create the planned issue loop and attach the frozen
+    // NestedPartialPlanAttr::issue_unroll exactly once.  A mixed loop would
+    // otherwise have two incompatible schedule owners, so reject it instead
+    // of silently unrolling the whole canonical contraction as well.
+    llvm::SmallVector<mlir::scf::ForOp> issueLoops;
+    getOperation().walk([&](mlir::scf::ForOp loop) {
+      if (loop->hasAttr("weft.riscv.unroll_factor"))
+        issueLoops.push_back(loop);
+    });
+    for (mlir::scf::ForOp loop : issueLoops) {
+      llvm::SmallVector<riscv::RVVWidenDotOp> ownedDots;
+      loop.walk([&](riscv::RVVWidenDotOp dot) {
+        if (dot->getParentOfType<mlir::scf::ForOp>() == loop)
+          ownedDots.push_back(dot);
+      });
+      const bool consumesIssueUnroll = llvm::any_of(
+          ownedDots, [](riscv::RVVWidenDotOp dot) {
+            return static_cast<bool>(dot.getNestedPartialPlanAttr());
+          });
+      if (!consumesIssueUnroll)
+        continue;
+      if (ownedDots.empty() ||
+          !llvm::all_of(ownedDots, [](riscv::RVVWidenDotOp dot) {
+            return static_cast<bool>(dot.getNestedPartialPlanAttr());
+          })) {
+        loop.emitError(
+            "one physical issue loop mixes planner-owned and generic unroll contracts");
+        signalPassFailure();
+        return;
+      }
+      const int64_t requested =
+          loop
+              ->getAttrOfType<mlir::IntegerAttr>(
+                  "weft.riscv.unroll_factor")
+              .getInt();
+      for (riscv::RVVWidenDotOp dot : ownedDots) {
+        auto plan = dot.getNestedPartialPlanAttr();
+        if (dot.getPartialUnroll() != requested ||
+            plan.getIssueUnroll() !=
+                std::min<int64_t>(requested, plan.getIssueStreams())) {
+          dot.emitError(
+              "nested partial plan did not consume the issue-loop unroll contract exactly once");
+          signalPassFailure();
+          return;
+        }
+      }
+      loop->removeAttr("weft.riscv.unroll_factor");
     }
 
     // Freeze the complete combine program after every dot has its selected

@@ -37,10 +37,15 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createScheduleRISCVLevelsPass());
   manager.addPass(weft::createPipelineRISCVLevelsPass());
   manager.addPass(mlir::createSCCPPass());
-  manager.addPass(weft::createUnrollRISCVLevelsPass());
   manager.addPass(weft::createShareRISCVLayeredWindowsPass());
   manager.addPass(weft::createPlanRISCVPartialTopologiesPass());
   manager.addPass(weft::createMaterializeRISCVPartialAccumulatorsPass());
+  // Partial topology owns issue unroll.  Preserve the original typed
+  // contraction until the planner has frozen its carrier and the materializer
+  // has created the issue loop; only then mechanically clone loop iterations.
+  // Unrolling earlier duplicates the reduction use-def graph and makes the
+  // selected full-product topology unrecognizable to its own planner.
+  manager.addPass(weft::createUnrollRISCVLevelsPass());
   // Partial materialization can introduce fresh lane-to-register edges around
   // shaped iotas and other pure producers.  Canonicalize those new edges
   // before scheduling/final leaf selection so their register forms remain

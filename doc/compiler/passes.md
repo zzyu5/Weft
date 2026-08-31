@@ -13,22 +13,35 @@ ConvertWeftToRISCV
 → SelectRISCVOperations
 → PlanRISCVMemory
 → CanonicalizeRISCVLayouts
-→ FuseRISCVBitplanes
+→ PlanRISCVMemory
+→ SelectRISCVOperations
 → LowerRISCVComposites
+→ CanonicalizeRISCVLayouts
+→ FuseRISCVBitplanes
 → HoistRISCVLoopInvariants
 → ScheduleRISCVLevels
 → PipelineRISCVLevels
-→ UnrollRISCVLevels
+→ SCCP
 → ShareRISCVLayeredWindows
+→ PlanRISCVPartialTopologies
+→ MaterializeRISCVPartialAccumulators
+→ UnrollRISCVLevels
+→ CanonicalizeRISCVLayouts
+→ PlanRISCVMemory
+→ HoistRISCVLoopInvariants
+→ SelectRISCVOperations
 → FinalizeRISCVLeaves
 → MaterializeRISCVResources
+→ EliminateDeadRISCVLayouts
 → VerifyFinalRISCV
 ```
 
 该顺序是依赖关系，不是阶段标签。`LowerRISCVComposites` 必须先产生带 typed
 operation/effect 的显式 physical loop，`schedule` 才能从真实 use-def 分配 stage/order，
-`pipeline` 再只负责版本化 SSA 值并生成 prologue/steady-state/epilogue。exact leaf 完成后，
-resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
+`pipeline` 再只负责版本化 SSA 值并生成 prologue/steady-state/epilogue。partial planner 必须在
+generic unroll 之前读取未复制的 contraction/reduction use-def，冻结 carrier、combine topology
+与 issue unroll；materializer 生成 issue loop后，`UnrollRISCVLevels`才机械复制迭代。exact leaf
+完成后，resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
 
 ## 2. 各 pass 合同
 
