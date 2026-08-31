@@ -135,13 +135,18 @@ consumer use 与 target resource budget，唯一写入 product carrier、issue s
 combine/final-reduction topology、selected local instructions 和联合资源合同。顺序 fused contraction
 若跨多个 issue，必须得到显式 `sequential_partial_plan`；该 plan 给出每个 issue 的 source-part
 投影、唯一 widened accumulator 与最终 reduction，而不是让 composite dot 按 issue 数预留一组
-临时 partial。
+临时 partial。当前该 fused program 只在 lhs/rhs 的 issue slice 与 reduction-only accumulator
+具有同一完整 physical-part 映射时合法；带互异 free-axis replicas 的 outer contraction 由 planner
+明确选择 `sequential_per_stream`，materializer 不得在失败后自行降级。
 
 materializer 只核验仍存在的 SSA graph 与 plan 一致，并实例化真实
 `rvv_issue_slice → rvv_widen_accumulate → rvv_finalize_widen_dot` 或对应 partial-set program。
 它不能重新选择 carrier、combine tree、instruction 或 resource groups。没有闭合 plan 的已选
 topology 直接失败；terminal emitter 只按 `source_parts` 投影已有 vector binding，并拼写已选
-accumulate/reduction leaf。
+accumulate/reduction leaf。nested、layered 与 scaled/reduced-scaled plan 同样必须在 planner
+中冻结 issue types、scale supply、narrow-scale type、storage-window/decode instruction、partial
+reduction、finalization leaf 与同时存活的 resource groups；materializer 只能按这些字段创建
+operation，不能从 shape 或当前 SSA spelling 再次推断。
 
 ### `FinalizeRISCVLeaves`
 

@@ -330,6 +330,8 @@ def WeftRISCV_NestedPartialPlanAttr
     "::mlir::Type":$scaleCombinedSetType,
     StringRefParameter<"selected scale supply form">:$scaleSupply,
     StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
+    StringRefParameter<"selected partial reduction instruction">:$reduceInstruction,
+    StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
     "int64_t":$resourceGroups
   );
   let assemblyFormat = [{
@@ -338,7 +340,27 @@ def WeftRISCV_NestedPartialPlanAttr
         $splitSlotType `,` $reducedSlotType `,` $scaleReplicaType `,`
         $sourceSetType `,` $repackedSetType `,` $reducedSetType `,`
         $scaleCombinedSetType `,` $scaleSupply `,` $multiplyInstruction `,`
-        $resourceGroups `>`
+        $reduceInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
+  }];
+  let genVerifyDecl = 1;
+}
+
+def WeftRISCV_ScaledPartialPlanAttr
+    : WeftRISCV_Attr<"ScaledPartialPlan", "scaled_partial_plan"> {
+  let parameters = (ins
+    StringRefParameter<"scaled or reduced_scaled">:$realization,
+    "::mlir::Type":$scalarScaleType,
+    "::mlir::Type":$narrowScaleType,
+    StringRefParameter<"scalar-rematerialize or vector-convert">:$scaleSupply,
+    StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
+    StringRefParameter<"selected partial reduction instruction or none">:$reduceInstruction,
+    StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
+    "int64_t":$resourceGroups
+  );
+  let assemblyFormat = [{
+    `<` $realization `,` $scalarScaleType `,` $narrowScaleType `,`
+        $scaleSupply `,` $multiplyInstruction `,` $reduceInstruction `,`
+        $finalizeInstruction `,` $resourceGroups `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -453,15 +475,23 @@ def WeftRISCV_LayeredPartialPlanAttr
     "int64_t":$rootIndex,
     "::mlir::Type":$decodedWindowType,
     "::mlir::Type":$storageWindowType,
+    "::mlir::Type":$lhsIssueType,
+    "::mlir::Type":$rhsIssueType,
     "::mlir::Type":$accumulatorType,
     "::mlir::ArrayAttr":$rootWindowTypes,
     "::mlir::ArrayAttr":$rootStoragePlans,
-    "::weft::riscv::LayeredStreamGeometryAttr":$geometry
+    "::mlir::ArrayAttr":$rootWindowInstructions,
+    "::mlir::ArrayAttr":$decodeInstructions,
+    StringRefParameter<"selected final reduction instruction">:$finalizeInstruction,
+    "::weft::riscv::LayeredStreamGeometryAttr":$geometry,
+    "int64_t":$resourceGroups
   );
   let assemblyFormat = [{
     `<` $rootIndex `,` $decodedWindowType `,` $storageWindowType `,`
-        $accumulatorType `,` $rootWindowTypes `,` $rootStoragePlans `,`
-        $geometry `>`
+        $lhsIssueType `,` $rhsIssueType `,` $accumulatorType `,`
+        $rootWindowTypes `,` $rootStoragePlans `,`
+        $rootWindowInstructions `,` $decodeInstructions `,`
+        $finalizeInstruction `,` $geometry `,` $resourceGroups `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -1315,6 +1345,7 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
                        OptionalAttr<WeftRISCV_PartialLayoutPlanAttr>:$partial_layout_plan,
                        OptionalAttr<WeftRISCV_NestedPartialPlanAttr>:$nested_partial_plan,
                        OptionalAttr<WeftRISCV_SequentialPartialPlanAttr>:$sequential_partial_plan,
+                       OptionalAttr<WeftRISCV_ScaledPartialPlanAttr>:$scaled_partial_plan,
                        OptionalAttr<WeftRISCV_LayeredPartialPlanAttr>:$layered_partial_plan,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);

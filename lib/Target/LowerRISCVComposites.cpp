@@ -2393,6 +2393,7 @@ private:
             riscv::PartialLayoutPlanAttr(),
             riscv::NestedPartialPlanAttr(),
             riscv::SequentialPartialPlanAttr(),
+            riscv::ScaledPartialPlanAttr(),
             riscv::LayeredPartialPlanAttr(),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-dot", "rvv.vwmul-vwredsum",

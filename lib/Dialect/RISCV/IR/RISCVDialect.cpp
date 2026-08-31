@@ -1345,13 +1345,18 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     mlir::Type sourceSetType, mlir::Type repackedSetType,
     mlir::Type reducedSetType, mlir::Type scaleCombinedSetType,
     llvm::StringRef scaleSupply, llvm::StringRef multiplyInstruction,
-    int64_t resourceGroups) {
+    llvm::StringRef reduceInstruction,
+    llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
   auto issueLhs = mlir::dyn_cast<weft::riscv::ValueType>(issueLhsType);
   auto issueRhs = mlir::dyn_cast<weft::riscv::ValueType>(issueRhsType);
   auto sourceSlot = mlir::dyn_cast<weft::riscv::ValueType>(sourceSlotType);
   auto splitSlot = mlir::dyn_cast<weft::riscv::ValueType>(splitSlotType);
   auto reducedSlot = mlir::dyn_cast<weft::riscv::ValueType>(reducedSlotType);
   auto scaleReplica = mlir::dyn_cast<weft::riscv::ValueType>(scaleReplicaType);
+  auto scaleElement =
+      scaleReplica
+          ? mlir::dyn_cast<mlir::IntegerType>(scaleReplica.getElementType())
+          : mlir::IntegerType();
   auto sourceSet =
       mlir::dyn_cast<weft::riscv::PartialSetType>(sourceSetType);
   auto repackedSet =
@@ -1370,7 +1375,10 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       issueUnroll <= 0 || issueUnroll > issueStreams || resourceGroups <= 0 ||
       !issueLhs || !issueRhs || !sourceSlot || !splitSlot || !reducedSlot ||
       !scaleReplica || !sourceSet || !repackedSet || !reducedSet ||
-      !scaleCombinedSet || !exactMultiply)
+      !scaleCombinedSet || !exactMultiply ||
+      reduceInstruction != "rvv.partial-reduce.widen" ||
+      (finalizeInstruction != "rvv.partial-finalize.extract" &&
+       finalizeInstruction != "rvv.partial-finalize.reduce"))
     return emitError()
            << "nested partial plan requires one complete issue/product/reduction topology";
   if (scaleSupply != "vector-convert" &&
@@ -1382,7 +1390,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       sourceSlot.getLayout().getCarrier() != "rvv" ||
       splitSlot.getLayout().getCarrier() != "rvv" ||
       reducedSlot.getLayout().getCarrier() != "rvv" ||
-      scaleReplica.getLayout().getCarrier() != "scalar")
+      scaleReplica.getLayout().getCarrier() != "scalar" || !scaleElement ||
+      !scaleElement.isSigned() || scaleElement.getWidth() != 32)
     return emitError()
            << "nested partial plan requires RVV issue/product values and scalar scale replicas";
   auto lhsLanes = checkedPositiveProduct(
@@ -1440,6 +1449,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       scaleCombinedSet.getReductionAxis() != reductionAxis ||
       scaleCombinedSet.getSlots() != 1 ||
       scaleCombinedSet.getTermsPerSlot() != sourceSet.getTermsPerSlot() ||
+      (scaleCombinedSet.getPartialType().getLayout().getLaneFactors()[0] == 1) !=
+          (finalizeInstruction == "rvv.partial-finalize.extract") ||
       resourceGroups < issueLhs.getLayout().getRegisterGroups() +
                            issueRhs.getLayout().getRegisterGroups() +
                            sourceSet.getResourceGroups())
@@ -1545,6 +1556,61 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
       resourceGroups != expectedResources)
     return emitError()
            << "sequential partial plan carrier or resource contract is inconsistent";
+  return mlir::success();
+}
+
+mlir::LogicalResult ScaledPartialPlanAttr::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    llvm::StringRef realization, mlir::Type scalarScaleType,
+    mlir::Type narrowScaleType, llvm::StringRef scaleSupply,
+    llvm::StringRef multiplyInstruction, llvm::StringRef reduceInstruction,
+    llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
+  auto scalarScale =
+      mlir::dyn_cast<weft::riscv::ValueType>(scalarScaleType);
+  auto narrowScale =
+      mlir::dyn_cast<weft::riscv::ValueType>(narrowScaleType);
+  auto scalarElement =
+      scalarScale
+          ? mlir::dyn_cast<mlir::IntegerType>(scalarScale.getElementType())
+          : mlir::IntegerType();
+  auto narrowElement =
+      narrowScale
+          ? mlir::dyn_cast<mlir::IntegerType>(narrowScale.getElementType())
+          : mlir::IntegerType();
+  const bool exactMultiply =
+      multiplyInstruction == "rvv.vwmul.vv" ||
+      multiplyInstruction == "rvv.vwmul.vv.reinterpret-rhs" ||
+      multiplyInstruction == "rvv.vwmul.vv.reinterpret-lhs" ||
+      multiplyInstruction == "rvv.vwmulsu.vv" ||
+      multiplyInstruction == "rvv.vwmulsu.vv.swap";
+  if ((realization != "scaled" && realization != "reduced_scaled") ||
+      !scalarScale || !scalarElement || !scalarElement.isSigned() ||
+      scalarElement.getWidth() != 32 ||
+      scalarScale.getLayout().getCarrier() != "scalar" ||
+      (scaleSupply != "scalar-rematerialize" &&
+       scaleSupply != "vector-convert") ||
+      !exactMultiply ||
+      (reduceInstruction != "none" &&
+       reduceInstruction != "rvv.partial-reduce.widen") ||
+      (finalizeInstruction != "rvv.partial-finalize.extract" &&
+       finalizeInstruction != "rvv.partial-finalize.reduce") ||
+      resourceGroups <= 0)
+    return emitError()
+           << "scaled partial plan requires one scalar scale supply and closed multiply/reduce/finalize program";
+  if (narrowScale &&
+      (!narrowElement || !narrowElement.isSigned() ||
+       narrowElement.getWidth() > 16 ||
+       narrowScale.getLayout().getCarrier() != "scalar" ||
+       narrowScale.getShape() != scalarScale.getShape() ||
+       narrowScale.getAxisIds() != scalarScale.getAxisIds() ||
+       narrowScale.getLayout().getReplicaFactors() !=
+           scalarScale.getLayout().getReplicaFactors()))
+    return emitError()
+           << "scaled partial narrow scale disagrees with the selected scalar replica carrier";
+  if (realization == "reduced_scaled" &&
+      (narrowScale || reduceInstruction != "rvv.partial-reduce.widen"))
+    return emitError()
+           << "reduced-scaled partial plan must reduce widened products before scalar scaling";
   return mlir::success();
 }
 
@@ -1699,37 +1765,155 @@ mlir::LogicalResult LocalPackPlanAttr::verify(
 mlir::LogicalResult LayeredPartialPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     int64_t rootIndex, mlir::Type decodedWindowType,
-    mlir::Type storageWindowType, mlir::Type accumulatorType,
+    mlir::Type storageWindowType, mlir::Type lhsIssueType,
+    mlir::Type rhsIssueType, mlir::Type accumulatorType,
     mlir::ArrayAttr rootWindowTypes, mlir::ArrayAttr rootStoragePlans,
-    LayeredStreamGeometryAttr geometry) {
+    mlir::ArrayAttr rootWindowInstructions,
+    mlir::ArrayAttr decodeInstructions,
+    llvm::StringRef finalizeInstruction,
+    LayeredStreamGeometryAttr geometry, int64_t resourceGroups) {
   auto decoded =
       mlir::dyn_cast<weft::riscv::ValueType>(decodedWindowType);
   auto storage =
       mlir::dyn_cast<weft::riscv::LayeredWindowType>(storageWindowType);
+  auto lhsIssue = mlir::dyn_cast<weft::riscv::ValueType>(lhsIssueType);
+  auto rhsIssue = mlir::dyn_cast<weft::riscv::ValueType>(rhsIssueType);
   auto accumulator =
       mlir::dyn_cast<weft::riscv::ValueType>(accumulatorType);
   if (rootIndex < 0 || rootIndex >= static_cast<int64_t>(rootWindowTypes.size()) ||
-      !decoded || !storage || !accumulator || !geometry ||
+      !decoded || !storage || !lhsIssue || !rhsIssue || !accumulator ||
+      !geometry || resourceGroups <= 0 ||
       rootWindowTypes.empty() || rootStoragePlans.size() != rootWindowTypes.size() ||
+      rootWindowInstructions.size() != rootWindowTypes.size() ||
+      decodeInstructions.size() !=
+          geometry.getShiftAmountForLogicalLayer().size() ||
       decoded.getLayout().getCarrier() != "rvv" ||
       accumulator.getLayout().getCarrier() != "rvv" ||
       storage.getResultType() != decoded ||
       storage.getReductionAxis() != geometry.getAxis() ||
       storage.getLayers() != geometry.getGroupSize() / geometry.getLayerSize() ||
       storage.getWindowsPerLayer() * geometry.getLaneCount() !=
-          geometry.getLayerSize())
+          geometry.getLayerSize() ||
+      (finalizeInstruction != "rvv.vwredsum.partial" &&
+       finalizeInstruction != "rvv.vredsum.partial"))
     return emitError()
            << "layered partial plan requires one closed typed storage, decode, accumulator, and root plan";
+  auto lhsElement =
+      mlir::dyn_cast<mlir::IntegerType>(lhsIssue.getElementType());
+  auto rhsElement =
+      mlir::dyn_cast<mlir::IntegerType>(rhsIssue.getElementType());
+  auto accumulatorElement =
+      mlir::dyn_cast<mlir::IntegerType>(accumulator.getElementType());
+  auto lhsReduction = llvm::find(lhsIssue.getAxisIds().asArrayRef(),
+                                 geometry.getAxis());
+  auto rhsReduction = llvm::find(rhsIssue.getAxisIds().asArrayRef(),
+                                 geometry.getAxis());
+  if (!lhsElement || !rhsElement || !accumulatorElement ||
+      lhsElement.isSignless() || rhsElement.isSignless() ||
+      accumulatorElement.isSignless() ||
+      (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+      std::max<unsigned>(8, lhsElement.getWidth()) !=
+          std::max<unsigned>(8, rhsElement.getWidth()) ||
+      accumulatorElement.getWidth() !=
+          2 * std::max<unsigned>(8, lhsElement.getWidth()) ||
+      lhsIssue.getLayout().getCarrier() != "rvv" ||
+      rhsIssue.getLayout().getCarrier() != "rvv" ||
+      lhsReduction == lhsIssue.getAxisIds().asArrayRef().end() ||
+      rhsReduction == rhsIssue.getAxisIds().asArrayRef().end())
+    return emitError()
+           << "layered partial issue and accumulator element contracts do not close";
+  const size_t lhsReductionPosition = static_cast<size_t>(
+      lhsReduction - lhsIssue.getAxisIds().asArrayRef().begin());
+  const size_t rhsReductionPosition = static_cast<size_t>(
+      rhsReduction - rhsIssue.getAxisIds().asArrayRef().begin());
+  if (lhsIssue.getShape()[lhsReductionPosition] != geometry.getLaneCount() ||
+      rhsIssue.getShape()[rhsReductionPosition] != geometry.getLaneCount() ||
+      lhsIssue.getLayout().getTimeFactors()[lhsReductionPosition] != 1 ||
+      rhsIssue.getLayout().getTimeFactors()[rhsReductionPosition] != 1 ||
+      lhsIssue.getLayout().getLaneFactors()[lhsReductionPosition] !=
+          geometry.getLaneCount() ||
+      rhsIssue.getLayout().getLaneFactors()[rhsReductionPosition] !=
+          geometry.getLaneCount() ||
+      lhsIssue.getLayout().getReplicaFactors()[lhsReductionPosition] != 1 ||
+      rhsIssue.getLayout().getReplicaFactors()[rhsReductionPosition] != 1 ||
+      lhsIssue.getLayout().getSew() != rhsIssue.getLayout().getSew() ||
+      lhsIssue.getLayout().getLmulEighths() !=
+          rhsIssue.getLayout().getLmulEighths() ||
+      lhsIssue.getLayout().getVl() != rhsIssue.getLayout().getVl() ||
+      accumulator.getLayout().getSew() !=
+          2 * lhsIssue.getLayout().getSew() ||
+      accumulator.getLayout().getLmulEighths() !=
+          2 * lhsIssue.getLayout().getLmulEighths() ||
+      accumulator.getLayout().getVl() != lhsIssue.getLayout().getVl())
+    return emitError()
+           << "layered partial issue windows disagree with the selected RVV carrier";
+
+  llvm::SmallVector<int64_t> expectedAxes;
+  llvm::SmallVector<int64_t> expectedShape;
+  auto appendFreeAxes = [&](weft::riscv::ValueType issue,
+                            size_t reductionPosition) -> bool {
+    for (size_t position = 0; position < issue.getAxisIds().size(); ++position) {
+      if (position == reductionPosition)
+        continue;
+      if (issue.getLayout().getTimeFactors()[position] != 1 ||
+          issue.getLayout().getLaneFactors()[position] != 1 ||
+          issue.getLayout().getReplicaFactors()[position] !=
+              issue.getShape()[position] ||
+          issue.getLayout().getFragmentFactors()[position] != 1 ||
+          issue.getLayout().getLocalFactors()[position] != 1)
+        return false;
+      auto found = llvm::find(expectedAxes, issue.getAxisIds()[position]);
+      if (found == expectedAxes.end()) {
+        expectedAxes.push_back(issue.getAxisIds()[position]);
+        expectedShape.push_back(issue.getShape()[position]);
+        continue;
+      }
+      if (expectedShape[static_cast<size_t>(found - expectedAxes.begin())] !=
+          issue.getShape()[position])
+        return false;
+    }
+    return true;
+  };
+  if (!appendFreeAxes(lhsIssue, lhsReductionPosition) ||
+      !appendFreeAxes(rhsIssue, rhsReductionPosition))
+    return emitError()
+           << "layered partial free axes require exact register-replica ownership";
+  expectedAxes.push_back(geometry.getAxis());
+  expectedShape.push_back(geometry.getLaneCount());
+  if (!llvm::equal(expectedAxes, accumulator.getAxisIds().asArrayRef()) ||
+      !llvm::equal(expectedShape, accumulator.getShape().asArrayRef()))
+    return emitError()
+           << "layered partial accumulator does not preserve its free and reduction axes";
+  for (size_t position = 0; position < expectedAxes.size(); ++position) {
+    const bool reduction = position + 1 == expectedAxes.size();
+    if (accumulator.getLayout().getTimeFactors()[position] != 1 ||
+        accumulator.getLayout().getLaneFactors()[position] !=
+            (reduction ? geometry.getLaneCount() : 1) ||
+        accumulator.getLayout().getReplicaFactors()[position] !=
+            (reduction ? 1 : expectedShape[position]) ||
+        accumulator.getLayout().getFragmentFactors()[position] != 1 ||
+        accumulator.getLayout().getLocalFactors()[position] != 1)
+      return emitError()
+             << "layered partial accumulator has an inconsistent time/lane/replica mapping";
+  }
+  int64_t expectedResources =
+      accumulator.getLayout().getRegisterGroups() + storage.getResourceGroups() + 1;
   for (size_t index = 0; index < rootWindowTypes.size(); ++index) {
     mlir::Attribute typeValue = rootWindowTypes[index];
     mlir::Attribute planValue = rootStoragePlans[index];
+    auto instruction =
+        mlir::dyn_cast<mlir::StringAttr>(rootWindowInstructions[index]);
     auto typeAttribute = mlir::dyn_cast<mlir::TypeAttr>(typeValue);
     auto type = typeAttribute
                     ? mlir::dyn_cast<weft::riscv::ValueType>(
                           typeAttribute.getValue())
                     : weft::riscv::ValueType();
     auto plan = mlir::dyn_cast<weft::riscv::StorageWindowPlanAttr>(planValue);
+    const llvm::StringRef expectedWindowInstruction =
+        plan && plan.getKind() == "layered" ? "rvv.storage-window.layered"
+                                            : "rvv.storage-window.natural";
     if (!type || type.getLayout().getCarrier() != "rvv" || !plan ||
+        !instruction || instruction.getValue() != expectedWindowInstruction ||
         plan.getReductionAxis() != geometry.getAxis() ||
         (static_cast<int64_t>(index) == rootIndex &&
          (plan.getKind() != "layered" ||
@@ -1737,7 +1921,31 @@ mlir::LogicalResult LayeredPartialPlanAttr::verify(
           plan.getLayerSize() != geometry.getLayerSize())))
       return emitError()
              << "layered partial root requires one typed RVV window and storage plan";
+    expectedResources += type.getLayout().getRegisterGroups();
   }
+  for (auto [instructionValue, shift, mask] : llvm::zip(
+           decodeInstructions,
+           geometry.getShiftAmountForLogicalLayer().asArrayRef(),
+           geometry.getMaskValueForLogicalLayer().asArrayRef())) {
+    auto instruction = mlir::dyn_cast<mlir::StringAttr>(instructionValue);
+    const llvm::StringRef expected =
+        shift > 0 ? (mask > 0
+                         ? llvm::StringRef(
+                               "rvv.layered-storage-decode.shift-mask")
+                         : llvm::StringRef("rvv.layered-storage-decode.shift"))
+                  : (mask > 0
+                         ? llvm::StringRef("rvv.layered-storage-decode.mask")
+                         : llvm::StringRef(
+                               "rvv.layered-storage-decode.identity"));
+    if (!instruction || instruction.getValue() != expected)
+      return emitError()
+             << "layered partial decode instruction disagrees with its typed storage geometry";
+  }
+  if ((accumulatorElement.getWidth() == 16) !=
+          (finalizeInstruction == "rvv.vwredsum.partial") ||
+      resourceGroups != expectedResources)
+    return emitError()
+           << "layered partial final reduction or resource contract disagrees with its program";
   return mlir::success();
 }
 
@@ -4914,6 +5122,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   auto partialLayoutPlan = getPartialLayoutPlanAttr();
   auto nestedPartialPlan = getNestedPartialPlanAttr();
   auto sequentialPartialPlan = getSequentialPartialPlanAttr();
+  auto scaledPartialPlan = getScaledPartialPlanAttr();
   auto layeredPartialPlan = getLayeredPartialPlanAttr();
   const bool topologyAssigned = topologyKind != "unassigned";
   const bool sequentialPlanRequired =
@@ -4923,6 +5132,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       (topologyKind == "nested_scaled_stream") ==
           static_cast<bool>(nestedPartialPlan) &&
       sequentialPlanRequired == static_cast<bool>(sequentialPartialPlan) &&
+      (topologyKind == "scaled" || topologyKind == "reduced_scaled") ==
+          static_cast<bool>(scaledPartialPlan) &&
       (topologyKind == "layered") == static_cast<bool>(layeredPartialPlan);
   if (partialLayoutPlan) {
     auto partialSlot = mlir::dyn_cast<ValueType>(
@@ -5119,10 +5330,48 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
             sequentialPartialPlan.getResourceGroups() &&
         sequentialPartialPlan.getResourceGroups() <= target.getVectorRegisters();
   }
+  if (scaledPartialPlan) {
+    auto narrowScale = mlir::dyn_cast<ValueType>(
+        scaledPartialPlan.getNarrowScaleType());
+    auto finalSet =
+        partialLayoutPlan
+            ? mlir::dyn_cast<PartialSetType>(
+                  getPartialTopology().getLaneSplit() > 1 ||
+                          topologyKind == "reduced_scaled"
+                      ? partialLayoutPlan.getScaleCombinedSetType()
+                      : partialLayoutPlan.getFullScaledSetType())
+            : PartialSetType();
+    auto finalInstruction =
+        finalSet ? (finalSet.getPartialType()
+                            .getLayout()
+                            .getLaneFactors()[0] == 1
+                        ? llvm::StringRef("rvv.partial-finalize.extract")
+                        : llvm::StringRef("rvv.partial-finalize.reduce"))
+                 : llvm::StringRef();
+    const llvm::StringRef reduceInstruction =
+        getPartialTopology().getLaneSplit() > 1 ||
+                topologyKind == "reduced_scaled"
+            ? llvm::StringRef("rvv.partial-reduce.widen")
+            : llvm::StringRef("none");
+    layoutPlanClosed &=
+        scaledPartialPlan.getRealization() == topologyKind && finalSet &&
+        scaledPartialPlan.getReduceInstruction() == reduceInstruction &&
+        scaledPartialPlan.getFinalizeInstruction() == finalInstruction &&
+        (topologyKind != "scaled" ||
+         getPartialTopology().getLaneSplit() > 1 || narrowScale) &&
+        (topologyKind != "reduced_scaled" || !narrowScale) &&
+        getPartialTopology().getResourceGroups() ==
+            scaledPartialPlan.getResourceGroups() &&
+        scaledPartialPlan.getResourceGroups() <= target.getVectorRegisters();
+  }
   if (layeredPartialPlan)
     layoutPlanClosed &= getPartialTopology().getRootOperand() >= 0 &&
                         getOver().size() == 1 &&
-                        layeredPartialPlan.getGeometry().getAxis() == getOver()[0];
+                        layeredPartialPlan.getGeometry().getAxis() == getOver()[0] &&
+                        getPartialTopology().getResourceGroups() ==
+                            layeredPartialPlan.getResourceGroups() &&
+                        layeredPartialPlan.getResourceGroups() <=
+                            target.getVectorRegisters();
   const bool validTopology =
       topologyKind == "unassigned" || topologyKind == "sequential_fused" ||
       topologyKind == "sequential_per_stream" ||
