@@ -1,6 +1,6 @@
 # RISC-V Partial Plan Owner、Q1_0 Signed-mask 与 IQ2_XS Supply 审计
 
-日期：2026-08-31  
+日期：2026-08-31
 实现提交：`24a72067c`（`Close RVV partial plans and fuse signed mask reductions`）
 
 ## 1. 本轮结论
