@@ -1443,6 +1443,165 @@ public:
           builder, "extract", ("rvv.extract." + form).str()));
     });
 
+    // A direct logical-u1 field may already carry the complete logical axis;
+    // unlike the gather form below, there is no separate projected index from
+    // which to recover a window.  The grouped/layered encoding nevertheless
+    // defines one exact byte-mask window.  Materialize that physical access
+    // before the generic layout conversion so emission never has to recover
+    // packed storage geometry from a vector value.
+    llvm::SmallVector<riscv::ConvertLayoutOp> directBitmaskConversions;
+    getOperation().walk([&](riscv::ConvertLayoutOp conversion) {
+      directBitmaskConversions.push_back(conversion);
+    });
+    for (riscv::ConvertLayoutOp conversion : directBitmaskConversions) {
+      if (!conversion || !conversion->getBlock() ||
+          conversion.getConversion().getEffect() != "pure")
+        continue;
+      auto field = conversion.getInput().getDefiningOp<riscv::FieldOp>();
+      auto source = field ? mlir::dyn_cast<riscv::ValueType>(field.getResult().getType())
+                          : riscv::ValueType();
+      auto result = mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
+      auto sourceElement = source
+                               ? mlir::dyn_cast<mlir::IntegerType>(
+                                     source.getElementType())
+                               : mlir::IntegerType();
+      auto resultElement = result
+                               ? mlir::dyn_cast<mlir::IntegerType>(
+                                     result.getElementType())
+                               : mlir::IntegerType();
+      const auto facts = field ? riscv_internal::fieldFacts(field)
+                               : riscv_internal::FieldFacts();
+      if (!field || !source || !result || !sourceElement ||
+          sourceElement.isSigned() || sourceElement.getWidth() != 1 ||
+          !resultElement || resultElement.isSigned() ||
+          resultElement.getWidth() != 1 ||
+          (source.getLayout().getCarrier() != "local" &&
+           source.getLayout().getCarrier() != "scalar") ||
+          result.getLayout().getCarrier() != "rvv" ||
+          source.getShape() != result.getShape() ||
+          source.getAxisIds() != result.getAxisIds() ||
+          facts.mapping != "grouped_layered" || facts.group <= 0 ||
+          facts.layer <= 0 || facts.group != facts.layer * 8 ||
+          facts.order != "lo_first" || facts.bitOffset % 8)
+        continue;
+
+      std::optional<size_t> windowPosition;
+      for (size_t position = 0; position < result.getShape().size(); ++position) {
+        const int64_t extent = result.getShape()[position];
+        const int64_t time = result.getLayout().getTimeFactors()[position];
+        const int64_t lane = result.getLayout().getLaneFactors()[position];
+        const int64_t replica = result.getLayout().getReplicaFactors()[position];
+        const bool window = extent > 1 && time > 0 && lane > 0 && replica > 0 &&
+                            time * lane * replica == extent &&
+                            result.getLayout().getFragmentFactors()[position] == 1 &&
+                            result.getLayout().getLocalFactors()[position] == 1;
+        if (window) {
+          if (windowPosition) {
+            windowPosition.reset();
+            break;
+          }
+          windowPosition = position;
+          continue;
+        }
+        if (result.getLayout().getTimeFactors()[position] != 1 ||
+            result.getLayout().getLaneFactors()[position] != 1 ||
+            result.getLayout().getFragmentFactors()[position] != 1 ||
+            result.getLayout().getLocalFactors()[position] != 1) {
+          windowPosition.reset();
+          break;
+        }
+      }
+      if (!windowPosition ||
+          result.getShape()[*windowPosition] % facts.group)
+        continue;
+
+      // `vlm` starts at a byte address.  If the consumer layout slices one
+      // packed group into sub-byte issue windows (for example four lanes of a
+      // grouped(8) field), select a byte-aligned load carrier here and leave a
+      // typed layout conversion to the consumer representation.  Advancing the
+      // pointer by `partOffset / 8` for a four-bit slice would otherwise reread
+      // the low half of the same byte.
+      riscv::ValueType loadResult = result;
+      const size_t position = *windowPosition;
+      const int64_t currentLane = result.getLayout().getLaneFactors()[position];
+      if (currentLane % facts.group) {
+        auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+        const int64_t replicas =
+            result.getLayout().getReplicaFactors()[position];
+        const int64_t extent = result.getShape()[position];
+        const int64_t selectedLane =
+            ((currentLane + facts.group - 1) / facts.group) * facts.group;
+        const int64_t sew = result.getLayout().getSew();
+        const int64_t lmulNumerator =
+            selectedLane * sew * int64_t{8};
+        if (!kernel || replicas <= 0 || selectedLane <= 0 ||
+            extent % (selectedLane * replicas) ||
+            lmulNumerator % kernel.getTarget().getVlenBits())
+          continue;
+        const int64_t selectedLMUL =
+            lmulNumerator / kernel.getTarget().getVlenBits();
+        if (!llvm::is_contained(
+                kernel.getTarget().getLegalLMULEighths().asArrayRef(),
+                selectedLMUL))
+          continue;
+        llvm::SmallVector<int64_t> time(
+            result.getLayout().getTimeFactors().asArrayRef());
+        llvm::SmallVector<int64_t> lane(
+            result.getLayout().getLaneFactors().asArrayRef());
+        time[position] = extent / (selectedLane * replicas);
+        lane[position] = selectedLane;
+        auto loadLayout = riscv::LayoutAttr::get(
+            builder.getContext(), "rvv", result.getAxisIds(),
+            builder.getDenseI64ArrayAttr(time),
+            builder.getDenseI64ArrayAttr(lane),
+            result.getLayout().getReplicaFactors(),
+            result.getLayout().getFragmentFactors(),
+            result.getLayout().getLocalFactors(), sew, selectedLMUL,
+            selectedLane, std::max<int64_t>(1, (selectedLMUL + 7) / 8),
+            result.getLayout().getValidity());
+        loadResult = riscv::ValueType::get(
+            builder.getContext(), result.getElementType(), result.getShape(),
+            result.getAxisIds(), loadLayout);
+      }
+
+      rewriter.setInsertionPoint(conversion);
+      auto zero = rewriter.create<mlir::arith::ConstantIndexOp>(
+          conversion.getLoc(), 0);
+      const bool tail = result.getLayout().getValidity() == "tail";
+      const int64_t temporaryGroups = std::max<int64_t>(
+          1, (loadResult.getLayout().getLmulEighths() + 7) / 8);
+      auto window = rewriter.create<riscv::RVVBitmaskWindowLoadOp>(
+          conversion.getLoc(), loadResult, field.getResult(), zero,
+          source.getAxisIds()[*windowPosition],
+          rewriter.getDenseI64ArrayAttr(
+              {source.getAxisIds()[*windowPosition]}),
+          rewriter.getDenseI64ArrayAttr(
+              {source.getShape()[*windowPosition]}),
+          makeAccess(builder, "unit", facts.mapping, facts.alignment,
+                     facts.group, facts.layer, facts.joinFields,
+                     facts.joinLowBits, facts.joinRole, facts.bitOffset,
+                     facts.storageBits, facts.order),
+          riscv_internal::leaf(
+              builder, "rvv", "bitmask-window-load",
+              "rvv.bitmask-window-load", "rvv.bitmask-window-load", 0,
+              loadResult.getLayout().getRegisterGroups(), temporaryGroups, 0,
+              "none", tail ? "agnostic" : "exact"));
+      riscv_internal::copyOrigin(conversion, window);
+      mlir::Value replacement = window.getResult();
+      if (loadResult != result) {
+        auto bridge = rewriter.create<riscv::ConvertLayoutOp>(
+            conversion.getLoc(), result, replacement,
+            riscv_internal::layoutConversion(rewriter,
+                                             loadResult.getLayout(),
+                                             result.getLayout()),
+            riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+        riscv_internal::copyOrigin(conversion, bridge);
+        replacement = bridge.getResult();
+      }
+      conversion.getResult().replaceAllUsesWith(replacement);
+      rewriter.eraseOp(conversion);
+    }
+
     llvm::SmallVector<riscv::ExtractOp> entryExtracts;
     getOperation().walk(
         [&](riscv::ExtractOp extract) { entryExtracts.push_back(extract); });

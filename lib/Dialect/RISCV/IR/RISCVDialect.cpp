@@ -4395,7 +4395,8 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   if (!sourceField || !fieldElement || fieldElement.isSigned() ||
       fieldElement.getWidth() != 1 || !resultElement ||
       resultElement.isSigned() || resultElement.getWidth() != 1 ||
-      field.getLayout().getCarrier() != "local" ||
+      (field.getLayout().getCarrier() != "local" &&
+       field.getLayout().getCarrier() != "scalar") ||
       result.getLayout().getCarrier() != "rvv" || !scalarBase ||
       getWindowAxes().empty() ||
       getWindowAxes().size() != getWindowExtents().size() ||
@@ -4438,12 +4439,16 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   auto fieldAxes = field.getAxisIds().asArrayRef();
   auto fieldShape = field.getShape().asArrayRef();
   auto sourceAxis = llvm::find(fieldAxes, getSourceAxis());
-  if (sourceAxis == fieldAxes.end() ||
+  if (sourceAxis == fieldAxes.end())
+    return emitOpError("RVV bitmask source axis is absent from its field");
+  const bool replacesSourceAxis =
+      getWindowAxes().size() == 1 && getWindowAxes()[0] == getSourceAxis();
+  if (!replacesSourceAxis &&
       llvm::any_of(getWindowAxes(), [&](int64_t axis) {
         return llvm::is_contained(fieldAxes, axis);
       }))
     return emitOpError(
-        "RVV bitmask source and window axes must be disjoint");
+        "RVV bitmask appended window axes must be disjoint from retained field axes");
   const size_t sourcePosition =
       static_cast<size_t>(sourceAxis - fieldAxes.begin());
   llvm::SmallVector<int64_t> expectedAxes;
@@ -4455,30 +4460,47 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
     expectedShape.push_back(fieldShape[position]);
   }
   const size_t retainedAxes = expectedAxes.size();
-  expectedAxes.append(getWindowAxes().begin(), getWindowAxes().end());
-  expectedShape.append(getWindowExtents().begin(), getWindowExtents().end());
+  if (replacesSourceAxis) {
+    expectedAxes.insert(expectedAxes.begin() + sourcePosition,
+                        getWindowAxes().begin(), getWindowAxes().end());
+    expectedShape.insert(expectedShape.begin() + sourcePosition,
+                         getWindowExtents().begin(), getWindowExtents().end());
+  } else {
+    expectedAxes.append(getWindowAxes().begin(), getWindowAxes().end());
+    expectedShape.append(getWindowExtents().begin(), getWindowExtents().end());
+  }
   if (!llvm::equal(expectedAxes, result.getAxisIds().asArrayRef()) ||
       !llvm::equal(expectedShape, result.getShape().asArrayRef()))
     return emitOpError(
         "RVV bitmask window result must retain source axes and append its logical window axes");
 
   auto layout = result.getLayout();
-  for (size_t position = 0; position < retainedAxes; ++position)
+  for (size_t position = 0; position < result.getAxisIds().size(); ++position) {
+    if (replacesSourceAxis && position == sourcePosition)
+      continue;
+    if (!replacesSourceAxis && position >= retainedAxes)
+      continue;
     if (layout.getTimeFactors()[position] != 1 ||
         layout.getLaneFactors()[position] != 1 ||
         layout.getFragmentFactors()[position] != 1 ||
         layout.getLocalFactors()[position] != 1)
       return emitOpError(
           "RVV bitmask window retained axes must remain register coordinates");
+  }
   for (size_t offset = 0; offset < getWindowExtents().size(); ++offset) {
-    const size_t position = retainedAxes + offset;
-    if (layout.getTimeFactors()[position] != 1 ||
-        layout.getLaneFactors()[position] != getWindowExtents()[offset] ||
-        layout.getReplicaFactors()[position] != 1 ||
+    const size_t position = replacesSourceAxis ? sourcePosition
+                                               : retainedAxes + offset;
+    if (layout.getTimeFactors()[position] <= 0 ||
+        layout.getLaneFactors()[position] <= 0 ||
+        layout.getReplicaFactors()[position] <= 0 ||
+        layout.getTimeFactors()[position] *
+                layout.getLaneFactors()[position] *
+                layout.getReplicaFactors()[position] !=
+            getWindowExtents()[offset] ||
         layout.getFragmentFactors()[position] != 1 ||
         layout.getLocalFactors()[position] != 1)
       return emitOpError(
-          "RVV bitmask window axes must form one complete RVV lane window");
+          "RVV bitmask window axes must form one complete time/lane/replica window");
   }
   return verifyLeafOperation(*this);
 }
