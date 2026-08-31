@@ -328,7 +328,7 @@ def production_mul_mat_q6_k_decode(
 @weft.kernel
 def production_mul_mat_iq1_s(
     W: View[IQ1_S, (N, K)], X: View[f32, (M, K)], Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (16384,)], Y: View[f32, (M, N)]
+    grid: View[I8X8, (2048, 8)], Y: View[f32, (M, N)]
 ):
     mul_mat_iq1_s(W, X, Xq, grid, Y)
 

@@ -403,28 +403,47 @@ def vec_dot_q6_k_q8_k(
 def vec_dot_iq1_s_q8_k(
     W: View[IQ1_S, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (16384,)],
+    grid: View[I8X8, (2048, 8)],
 ):
     result = f32(0.0)
+    grid_values = grid.values
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        entry = iota(4, dtype=u32, axis="entry")
+        payload = iota(8, dtype=u16, axis="payload")
         main = i32(0)
         correction = i32(0)
-        for group in range(8):
-            metadata = u32(w.qh[group])
+        group_index = index(0)
+        with L.subs(kb, extent=32) as group:
+            metadata = widen(w.qh[group_index], u32)
             scale = i32(((metadata >> u32(12)) & u32(7)) * u32(2) + u32(1))
-            group_sum = i32(0)
-            for entry in range(4):
-                grid_index = u32(w.q[group * 4 + entry]) | (
-                    ((metadata >> u32(entry * 3)) & u32(7)) << u32(8)
-                )
-                group_sum += _grid8(grid, grid_index, x.q, group * 32 + entry * 8)
-            delta = i32(1)
-            if ((metadata >> u32(15)) & u32(1)) != u32(0):
-                delta = i32(-1)
+            grid_index = widen(
+                w.q[u32(group_index) * u32(4) + entry], u32
+            ) | (((metadata >> (entry * u32(3))) & u32(7)) << u32(8))
+            weight = lookup(
+                grid_values,
+                grid_index * u32(8) + payload,
+                bounds="in_bounds",
+            )
+            activation = x.q[
+                u32(group_index) * u32(32)
+                + entry * u32(8)
+                + u32(payload)
+            ]
+            group_sum = contract(
+                activation,
+                weight,
+                over=("entry", "payload"),
+                acc=i32,
+            )
+            delta = i32(1) - i32((metadata >> u32(15)) & u32(1)) * i32(2)
             main += scale * group_sum
-            correction += scale * delta * (i32(x.bsum[group * 2]) + i32(x.bsum[group * 2 + 1]))
+            correction += scale * delta * (
+                i32(x.bsum[group_index * index(2)])
+                + i32(x.bsum[group_index * index(2) + index(1)])
+            )
+            group_index += index(1)
         combined = f32(main) + f32(0.125) * f32(correction)
         result += f32(w.d) * f32(x.ds) * combined
     return result

@@ -855,7 +855,7 @@ def mul_mat_iq1_m(
     W: View[IQ1_M, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (16384,)],
+    grid: View[I8X8, (2048, 8)],
     f16_bits: View[f32, (65536,)],
     Y: View[f32, (M, N)],
 ):

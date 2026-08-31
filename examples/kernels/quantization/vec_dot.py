@@ -162,7 +162,7 @@ def quantized_vec_dot_iq1_s_q8_k(
 def quantized_vec_dot_iq1_m_q8_k(
     W: View[IQ1_M, (K,)],
     X: View[Q8_K, (K,)],
-    grid: View[i8, (16384,)],
+    grid: View[I8X8, (2048, 8)],
     f16_bits: View[f32, (65536,)],
     Y: View[f32, (1,)],
 ):
