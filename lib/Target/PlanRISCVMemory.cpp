@@ -1923,6 +1923,13 @@ public:
     for (riscv::LookupOp operation : entryLookups) {
       auto table = mlir::dyn_cast<riscv::MemDescType>(
           operation.getTable().getType());
+      riscv::LoadOp tableLoad;
+      if (!table) {
+        tableLoad = operation.getTable().getDefiningOp<riscv::LoadOp>();
+        if (tableLoad)
+          table = mlir::dyn_cast<riscv::MemDescType>(
+              tableLoad.getRegion().getType());
+      }
       auto resultType =
           mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
       auto plan = table && resultType
@@ -1931,8 +1938,26 @@ public:
                       : std::optional<IndexedEntryLoadPlan>();
       if (!plan)
         continue;
-      if (table.getAxisIds().size() != 1)
+      int64_t sourceAxis = 0;
+      if (table.getAxisIds().size() == 1) {
+        sourceAxis = table.getAxisIds()[0];
+      } else if (table.getAxisIds().size() == 2 &&
+                 table.getShape()[1] == plan->payloadExtent &&
+                 table.getStrides()[0] == plan->entryStride &&
+                 table.getStrides()[1] == 1) {
+        sourceAxis = table.getAxisIds()[0];
+      } else {
         continue;
+      }
+      int64_t alignment = table.getAlignment();
+      int64_t bitOffset = 0;
+      if (auto field = tableLoad
+                           ? tableLoad.getRegion().getDefiningOp<riscv::FieldOp>()
+                           : operation.getTable().getDefiningOp<riscv::FieldOp>()) {
+        auto facts = riscv_internal::fieldFacts(field);
+        alignment = facts.alignment;
+        bitOffset = facts.bitOffset;
+      }
       mlir::Value fullIndices = operation.getIndices();
       rewriter.setInsertionPoint(operation);
       auto entryIndices =
@@ -1943,8 +1968,8 @@ public:
       }
       auto entryType =
           mlir::cast<riscv::ValueType>((*entryIndices).getType());
-      if (!supportsIndexedEntryLoad(*plan, entryType, resultType,
-                                    table.getAlignment(), 0)) {
+      if (!supportsIndexedEntryLoad(*plan, entryType, resultType, alignment,
+                                    bitOffset)) {
         llvm::DenseSet<mlir::Operation *> visited;
         eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
         continue;
@@ -1952,8 +1977,9 @@ public:
       const bool vectorEntries =
           entryType.getLayout().getCarrier() == "rvv";
       auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
-          operation.getLoc(), resultType, operation.getTable(),
-          *entryIndices, table.getAxisIds()[0], plan->payloadAxis,
+          operation.getLoc(), resultType,
+          tableLoad ? tableLoad.getRegion() : operation.getTable(), *entryIndices,
+          sourceAxis, plan->payloadAxis,
           plan->payloadExtent,
           plan->entryStride,
           makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
@@ -1968,6 +1994,8 @@ public:
       riscv_internal::copyOrigin(operation, entryLoad);
       operation.getResult().replaceAllUsesWith(entryLoad.getResult());
       rewriter.eraseOp(operation);
+      if (tableLoad && !llvm::is_contained(deadTableLoads, tableLoad))
+        deadTableLoads.push_back(tableLoad);
       llvm::DenseSet<mlir::Operation *> visited;
       eraseDeadRegularIndexChain(fullIndices, visited, rewriter);
     }

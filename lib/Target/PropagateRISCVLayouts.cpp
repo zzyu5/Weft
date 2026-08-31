@@ -384,6 +384,71 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
   return reducedAxes;
 }
 
+llvm::SmallVector<int64_t> downstreamContractionAxes(mlir::Value root) {
+  llvm::SmallVector<int64_t> axes;
+  llvm::SmallVector<mlir::Value> worklist{root};
+  llvm::SmallPtrSet<mlir::Operation *, 32> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
+    if (!source)
+      continue;
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!visited.insert(user).second)
+        continue;
+      if (auto contract = mlir::dyn_cast<riscv::ContractOp>(user)) {
+        auto implementation =
+            contract->getAttrOfType<riscv::ImplementationAttr>("implementation");
+        if (!implementation || implementation.getFamily() != "widen-dot" ||
+            (contract.getLhs() != value && contract.getRhs() != value))
+          continue;
+        for (int64_t axis : contract.getOver())
+          if (!llvm::is_contained(axes, axis))
+            axes.push_back(axis);
+        for (int64_t axis : downstreamReducedFreeAxes(
+                 contract.getOperation(), contract.getOver()))
+          if (containsAxis(root.getType(), axis) &&
+              !llvm::is_contained(axes, axis))
+            axes.push_back(axis);
+        continue;
+      }
+      if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
+        continue;
+      auto result =
+          mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
+      if (!result || result.getShape() != source.getShape() ||
+          result.getAxisIds() != source.getAxisIds())
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return axes;
+}
+
+bool supportsPackedIndexedEntryLookup(riscv::LookupOp lookup,
+                                      const riscv_internal::IndexedEntryRelation &relation,
+                                      riscv::ValueType result) {
+  if (riscv_internal::logicalBitWidth(result.getElementType()) *
+          relation.payloadExtent !=
+      64)
+    return false;
+  mlir::Value table =
+      riscv_internal::stripRepresentationConversions(lookup.getTable());
+  mlir::Value descriptor = table;
+  if (auto load = table.getDefiningOp<riscv::LoadOp>())
+    descriptor = load.getRegion();
+  int64_t alignment = 1;
+  int64_t bitOffset = 0;
+  if (auto memory = mlir::dyn_cast<riscv::MemDescType>(descriptor.getType()))
+    alignment = memory.getAlignment();
+  if (auto field = descriptor.getDefiningOp<riscv::FieldOp>()) {
+    auto facts = riscv_internal::fieldFacts(field);
+    alignment = facts.alignment;
+    bitOffset = facts.bitOffset;
+  }
+  return alignment >= 8 && bitOffset % 64 == 0;
+}
+
 bool constrainIndexedEntryLookup(riscv::LookupOp lookup, mlir::Value value,
                                  Roles &roles) {
   auto result = mlir::dyn_cast<riscv::ValueType>(lookup.getResult().getType());
@@ -393,16 +458,23 @@ bool constrainIndexedEntryLookup(riscv::LookupOp lookup, mlir::Value value,
       lookup.getIndices(), result, {}, {});
   if (!relation || !containsAxis(value.getType(), relation->payloadAxis))
     return false;
-  // The payload inside one table entry is contiguous and therefore owns the
-  // memory-facing lane coordinate.  Entry coordinates remain independent
-  // register replicas here; a consumer that needs one flat contraction tile
-  // receives an explicit typed register-to-lane conversion.  Coalescing the
-  // entry coordinate into an ordinary byte gather is legal but substantially
-  // slower on both current targets.
+  // The payload inside one table entry owns the primary memory-facing lane
+  // coordinate. Entry coordinates consumed by the same contraction can join
+  // that lane domain; surviving axes remain independent replicas.
   roles.anchored = true;
   roles.fullLaneExtent = true;
   roles.memoryAnchored = true;
   roles.laneAxis = relation->payloadAxis;
+  if (supportsPackedIndexedEntryLookup(lookup, *relation, result)) {
+    llvm::SmallVector<int64_t> contractionAxes =
+        downstreamContractionAxes(lookup.getResult());
+    auto entryType =
+        mlir::dyn_cast<riscv::ValueType>(relation->entryIndices.getType());
+    if (entryType)
+      for (int64_t axis : entryType.getAxisIds().asArrayRef())
+        if (llvm::is_contained(contractionAxes, axis))
+          roles.coalescedLaneAxes.insert(axis);
+  }
   addSmallReplicas(value, roles, roles.laneAxis);
   return true;
 }

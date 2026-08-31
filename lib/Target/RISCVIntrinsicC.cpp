@@ -5429,6 +5429,11 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       record = std::move(*materializedRecord);
     }
     field = fieldFor(source);
+    if (record.kind == Binding::Kind::Memory && field &&
+        field->access.getMapping() == "natural" && !(field->bitOffset % 8))
+      descriptorBase =
+          "((const " + *cType + " *)(" + record.memory.name + " + " +
+          std::to_string(field->bitOffset / 8) + "))";
   } else {
     return fail(operation,
                 "indexed entry load source has no dense descriptor or encoded field binding");
@@ -5496,9 +5501,8 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       if (streams <= 0)
         return fail(operation,
                     "indexed entry gather has no result stream mapping");
-      auto entryPart = projectRegisterPart(operation.getEntryIndices(),
-                                           operation.getResult(),
-                                           part / streams);
+      auto entryPart = projectPart(operation.getEntryIndices(),
+                                   operation.getResult(), part);
       if (!entryPart || *entryPart >= entries.parts.size())
         return fail(operation,
                     "indexed entry gather free axes have no typed entry projection");
@@ -7665,21 +7669,44 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
       input.kind == Binding::Kind::ScalarTuple) {
     auto sourceLayout = layoutOf(conversion.getInput());
     auto resultLayout = layoutOf(conversion.getResult());
-    const int64_t laneAxis = laneAxisFor(conversion.getResult());
     const int64_t lanes = physicalLanes(conversion.getResult());
     const int64_t streams = streamPartCount(conversion.getResult());
     const int64_t resultRegisters =
         registerPartCount(conversion.getResult());
-    auto sourceAxes = registerAxesFor(conversion.getInput());
-    auto sourceExtents = registerExtentsFor(conversion.getInput());
-    auto resultAxes = registerAxesFor(conversion.getResult());
-    if (!sourceLayout || !resultLayout || laneAxis <= 0 || lanes <= 1 ||
+    if (!sourceLayout || !resultLayout || lanes <= 1 ||
         streams <= 0 || resultRegisters <= 0 ||
         streamPartCount(conversion.getInput()) != 1 ||
-        sourceAxes.size() != sourceExtents.size() ||
-        !llvm::is_contained(sourceAxes, laneAxis))
+        sourceLayout.getAxisIds() != resultLayout.getAxisIds() ||
+        sourceLayout.getReplicaFactors().size() !=
+            resultLayout.getReplicaFactors().size())
       return fail(conversion,
                   "register-to-lane conversion has incomplete typed factors");
+
+    auto decode = [](int64_t linear, llvm::ArrayRef<int64_t> factors)
+        -> std::optional<llvm::SmallVector<int64_t>> {
+      llvm::SmallVector<int64_t> coordinates(factors.size(), 0);
+      for (int64_t position = static_cast<int64_t>(factors.size()) - 1;
+           position >= 0; --position) {
+        const int64_t factor = factors[static_cast<size_t>(position)];
+        if (factor <= 0)
+          return std::nullopt;
+        coordinates[static_cast<size_t>(position)] = linear % factor;
+        linear /= factor;
+      }
+      if (linear)
+        return std::nullopt;
+      return coordinates;
+    };
+    const auto sourceTime = sourceLayout.getTimeFactors().asArrayRef();
+    const auto sourceReplica = sourceLayout.getReplicaFactors().asArrayRef();
+    const auto resultTime = resultLayout.getTimeFactors().asArrayRef();
+    const auto resultLane = resultLayout.getLaneFactors().asArrayRef();
+    const auto resultReplica = resultLayout.getReplicaFactors().asArrayRef();
+    if (llvm::any_of(sourceTime, [](int64_t factor) { return factor != 1; }) ||
+        static_cast<int64_t>(input.parts.size()) !=
+            registerPartCount(conversion.getInput()))
+      return fail(conversion,
+                  "register-to-lane scalar tuple must reside entirely in register replicas");
 
     mlir::Type element =
         riscv_internal::logicalElement(conversion.getResult().getType());
@@ -7699,31 +7726,33 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     packed.kind = Binding::Kind::Vector;
     for (int64_t resultRegister = 0; resultRegister < resultRegisters;
          ++resultRegister) {
-      auto resultCoordinates =
-          registerCoordinates(conversion.getResult(), resultRegister);
-      if (!resultCoordinates || resultCoordinates->size() != resultAxes.size())
+      auto resultRegisterCoordinates = decode(resultRegister, resultReplica);
+      if (!resultRegisterCoordinates)
         return fail(conversion,
                     "register-to-lane result has no register coordinates");
       for (int64_t stream = 0; stream < streams; ++stream) {
+        auto resultTimeCoordinates = decode(stream, resultTime);
+        if (!resultTimeCoordinates)
+          return fail(conversion,
+                      "register-to-lane result has no issue-time coordinates");
         llvm::SmallVector<size_t, 16> sourceParts;
         for (int64_t lane = 0; lane < lanes; ++lane) {
-          const int64_t laneCoordinate = stream * lanes + lane;
+          auto resultLaneCoordinates = decode(lane, resultLane);
+          if (!resultLaneCoordinates)
+            return fail(conversion,
+                        "register-to-lane result has no lane coordinates");
           int64_t sourcePart = 0;
-          for (auto [axis, extent] : llvm::zip(sourceAxes, sourceExtents)) {
-            int64_t coordinate = laneCoordinate;
-            if (axis != laneAxis) {
-              auto found = llvm::find(resultAxes, axis);
-              if (found == resultAxes.end())
-                return fail(
-                    conversion,
-                    "register-to-lane source axis is absent from result registers");
-              coordinate = (*resultCoordinates)[static_cast<size_t>(
-                  found - resultAxes.begin())];
-            }
-            if (extent <= 0 || coordinate < 0 || coordinate >= extent)
+          for (size_t position = 0; position < sourceReplica.size(); ++position) {
+            const int64_t coordinate =
+                (((*resultTimeCoordinates)[position] * resultReplica[position] +
+                  (*resultRegisterCoordinates)[position]) *
+                     resultLane[position] +
+                 (*resultLaneCoordinates)[position]);
+            if (sourceReplica[position] <= 0 || coordinate < 0 ||
+                coordinate >= sourceReplica[position])
               return fail(conversion,
                           "register-to-lane coordinate exceeds source tuple");
-            sourcePart = sourcePart * extent + coordinate;
+            sourcePart = sourcePart * sourceReplica[position] + coordinate;
           }
           if (sourcePart < 0 ||
               sourcePart >= static_cast<int64_t>(input.parts.size()))
@@ -7770,11 +7799,24 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
     auto resultType = conversion.getResult().getType();
     auto sourceLayout = sourceType.getLayout();
     auto resultLayout = resultType.getLayout();
+    bool sameRepartitionDomain =
+        sourceLayout.getAxisIds() == resultLayout.getAxisIds() &&
+        sourceLayout.getReplicaFactors() == resultLayout.getReplicaFactors() &&
+        sourceLayout.getFragmentFactors() == resultLayout.getFragmentFactors() &&
+        sourceLayout.getLocalFactors() == resultLayout.getLocalFactors();
+    if (sameRepartitionDomain)
+      for (size_t position = 0;
+           position < sourceLayout.getAxisIds().size(); ++position)
+        sameRepartitionDomain &=
+            sourceLayout.getTimeFactors()[position] *
+                    sourceLayout.getLaneFactors()[position] ==
+            resultLayout.getTimeFactors()[position] *
+                resultLayout.getLaneFactors()[position];
     if (input.kind == Binding::Kind::Vector &&
         sourceLayout.getCarrier() == "rvv" &&
         resultLayout.getCarrier() == "rvv" &&
         sourceType.getElementType() == resultType.getElementType() &&
-        laneAxisFor(conversion.getInput()) == laneAxisFor(conversion.getResult())) {
+        sameRepartitionDomain) {
       const int64_t sourceLanes = physicalLanes(conversion.getInput());
       const int64_t resultLanes = physicalLanes(conversion.getResult());
       const int64_t sourceStreams = streamPartCount(conversion.getInput());

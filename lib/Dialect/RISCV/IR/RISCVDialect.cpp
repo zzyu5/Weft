@@ -2804,13 +2804,6 @@ mlir::LogicalResult LookupOp::verify() {
       return emitOpError(
           "physical lookup descriptor must match the result element width");
   }
-  if (auto indices = mlir::dyn_cast<ValueType>(getIndices().getType()))
-    if (auto result = mlir::dyn_cast<ValueType>(getResult().getType()))
-      for (size_t position = 0; position < indices.getAxisIds().size(); ++position)
-        if (!sameAxisMapping(indices, position, result, position))
-          return emitOpError()
-                 << "physical lookup indices/result require an explicit layout conversion; indices="
-                 << indices << ", result=" << result;
   llvm::StringRef carrier = "scalar";
   if (auto indices = mlir::dyn_cast<ValueType>(getIndices().getType()))
     carrier = indices.getLayout().getCarrier();
@@ -2824,6 +2817,13 @@ mlir::LogicalResult LookupOp::verify() {
   if (getAccess().getForm() == "unassigned" &&
       getLeaf().getEngine() == "unselected")
     return verifyLeafOperation(*this);
+  if (auto indices = mlir::dyn_cast<ValueType>(getIndices().getType()))
+    if (auto result = mlir::dyn_cast<ValueType>(getResult().getType()))
+      for (size_t position = 0; position < indices.getAxisIds().size(); ++position)
+        if (!sameAxisMapping(indices, position, result, position))
+          return emitOpError()
+                 << "physical lookup indices/result require an explicit layout conversion; indices="
+                 << indices << ", result=" << result;
   if (tableValue) {
     auto tableLayout = tableValue.getLayout();
     auto indexValue = mlir::dyn_cast<ValueType>(getIndices().getType());
@@ -2881,10 +2881,13 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
 
   llvm::SmallVector<int64_t> sourceAxes;
   llvm::SmallVector<int64_t> sourceShape;
+  std::optional<size_t> sourcePayloadPosition;
   if (auto descriptor = mlir::dyn_cast<MemDescType>(getSource().getType())) {
     auto encoding =
         mlir::cast<weft::kernel::EncodingType>(descriptor.getEncoding());
-    if (encoding.getKind() != "dense" || descriptor.getShape().size() != 1 ||
+    if (encoding.getKind() != "dense" ||
+        (descriptor.getShape().size() != 1 &&
+         descriptor.getShape().size() != 2) ||
         descriptor.getStorageBits() != elementBitWidth(result.getElementType()))
       return emitOpError(
           "indexed entry load requires a dense descriptor matching the payload element width");
@@ -2910,6 +2913,15 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
     return emitOpError("indexed entry load source axis is absent from its source");
   const size_t sourcePosition =
       static_cast<size_t>(sourceAxis - sourceAxes.begin());
+  if (auto descriptor = mlir::dyn_cast<MemDescType>(getSource().getType());
+      descriptor && descriptor.getShape().size() == 2) {
+    if (sourcePosition != 0 || descriptor.getShape()[1] != getPayloadExtent() ||
+        descriptor.getStrides()[0] != getEntryStride() ||
+        descriptor.getStrides()[1] != 1)
+      return emitOpError(
+          "indexed entry table must be contiguous entry-major payload storage");
+    sourcePayloadPosition = 1;
+  }
 
   auto entryAxes = entry.getAxisIds().asArrayRef();
   auto entryShape = entry.getShape().asArrayRef();
@@ -2918,7 +2930,8 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
   llvm::SmallVector<int64_t> expectedAxes;
   llvm::SmallVector<int64_t> expectedShape;
   for (size_t position = 0; position < sourceAxes.size(); ++position) {
-    if (position == sourcePosition)
+    if (position == sourcePosition ||
+        (sourcePayloadPosition && position == *sourcePayloadPosition))
       continue;
     expectedAxes.push_back(sourceAxes[position]);
     expectedShape.push_back(sourceShape[position]);
@@ -3141,32 +3154,27 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
     auto targetReplica = targetLayout.getReplicaFactors().asArrayRef();
     auto targetFragment = targetLayout.getFragmentFactors().asArrayRef();
     auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
-    std::optional<size_t> laneDimension;
+    bool hasLaneDimension = false;
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-      if (targetLane[dimension] > 1) {
-        if (laneDimension)
-          return emitOpError(
-              "scalar register-to-lane conversion requires exactly one lane axis");
-        laneDimension = dimension;
-      }
+      hasLaneDimension |= targetLane[dimension] > 1;
       if (sourceLane[dimension] != 1 ||
           sourceFragment[dimension] != 1 || sourceLocal[dimension] != 1 ||
           targetFragment[dimension] != 1 || targetLocal[dimension] != 1)
         return emitOpError(
             "scalar register-to-lane conversion only uses scalar time/replica coordinates and RVV lanes");
     }
-    if (!laneDimension)
+    if (!hasLaneDimension)
       return emitOpError(
           "scalar register-to-lane conversion requires one non-unit target lane axis");
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-      if (dimension == *laneDimension) {
+      if (targetLane[dimension] > 1) {
         auto represented = checkedPositiveProduct(
-            {targetTime[dimension], targetLane[dimension]});
+            {targetTime[dimension], targetLane[dimension],
+             targetReplica[dimension]});
         if (!represented || sourceTime[dimension] != 1 ||
-            sourceReplica[dimension] != *represented ||
-            targetReplica[dimension] != 1)
+            sourceReplica[dimension] != *represented)
           return emitOpError(
-              "scalar register-to-lane conversion must preserve the complete moved axis");
+              "scalar register-to-lane conversion must preserve every complete moved axis");
         continue;
       }
       auto sourceRepresented = checkedPositiveProduct(
@@ -3192,32 +3200,31 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
     auto targetReplica = targetLayout.getReplicaFactors().asArrayRef();
     auto targetFragment = targetLayout.getFragmentFactors().asArrayRef();
     auto targetLocal = targetLayout.getLocalFactors().asArrayRef();
-    std::optional<size_t> laneDimension;
+    bool hasLaneDimension = false;
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-      if (targetLane[dimension] > 1) {
-        if (laneDimension)
-          return emitOpError(
-              "scalar time-to-lane conversion requires exactly one lane axis");
-        laneDimension = dimension;
-      }
+      hasLaneDimension |= targetLane[dimension] > 1;
       if (sourceLane[dimension] != 1 ||
           sourceFragment[dimension] != 1 || sourceLocal[dimension] != 1 ||
           targetFragment[dimension] != 1 || targetLocal[dimension] != 1)
         return emitOpError(
             "scalar time-to-lane conversion only moves issue-time parts into RVV lanes");
     }
-    if (!laneDimension)
+    if (!hasLaneDimension)
       return emitOpError(
           "scalar time-to-lane conversion requires one non-unit target lane axis");
     for (size_t dimension = 0; dimension < targetLane.size(); ++dimension) {
-      if (dimension == *laneDimension) {
+      if (targetLane[dimension] > 1) {
         auto represented = checkedPositiveProduct(
-            {targetTime[dimension], targetLane[dimension]});
-        if (!represented || sourceTime[dimension] != *represented ||
+            {targetTime[dimension], targetLane[dimension],
+             targetReplica[dimension]});
+        auto sourceRepresented = checkedPositiveProduct(
+            {sourceTime[dimension], sourceReplica[dimension]});
+        if (!represented || !sourceRepresented ||
+            *sourceRepresented != *represented ||
             sourceReplica[dimension] != targetReplica[dimension] ||
             sourceTime[dimension] <= targetTime[dimension])
           return emitOpError(
-              "scalar time-to-lane conversion must preserve the complete moved axis");
+              "scalar time-to-lane conversion must preserve every complete moved axis");
         continue;
       }
       auto sourceRepresented = checkedPositiveProduct(

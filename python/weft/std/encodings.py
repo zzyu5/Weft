@@ -182,6 +182,14 @@ class IQ2_XXS:
 
 
 @weft.encoding
+class I8X8:
+    layout = bitorder.lsb_first, byteorder.little
+    alignment = 8
+    elements = 8
+    values: i8[8]
+
+
+@weft.encoding
 class IQ3_S:
     layout = bitorder.lsb_first, byteorder.little
     elements = 256

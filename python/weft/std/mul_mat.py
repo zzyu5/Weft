@@ -28,6 +28,7 @@ from weft.language import (
 )
 
 from .encodings import (
+    I8X8,
     IQ1_M,
     IQ1_S,
     IQ2_S,
@@ -158,6 +159,42 @@ def _iq2_xs_group_products(
         ],
         u32,
     )
+    scale = i32(
+        ((metadata >> ((scale_group % u32(2)) * u32(4))) & u32(15)) * u32(2)
+        + u32(1)
+    )
+    return reduce(partial * scale, axis="scale_group")
+
+
+def _iq2_xs_entry_products(
+    w,
+    x,
+    grid,
+    signs,
+    scale_group,
+    entry,
+    payload,
+):
+    linear_entry = scale_group * u32(2) + entry
+    code = widen(w.q[:, linear_entry], u32)
+    grid_index = code & u32(511)
+    sign_index = code >> u32(9)
+    weight = lookup(
+        grid, grid_index * u32(8) + payload, bounds="in_bounds"
+    )
+    sign = lookup(
+        signs, sign_index * u32(8) + payload, bounds="in_bounds"
+    )
+    signed_weight = weight * sign
+    entry_offset = scale_group * u32(16) + entry * u32(8)
+    activation = x.q[:, entry_offset + payload]
+    partial = contract(
+        activation,
+        signed_weight,
+        over=("entry", "payload"),
+        acc=i32,
+    )
+    metadata = widen(w.scales[:, scale_group // u32(2)], u32)
     scale = i32(
         ((metadata >> ((scale_group % u32(2)) * u32(4))) & u32(15)) * u32(2)
         + u32(1)
@@ -976,7 +1013,7 @@ def mul_mat_iq2_s_staged(
                         commit(f32_acc, Y[mb, nb])
 
 
-def mul_mat_iq2_xs(
+def mul_mat_iq2_xs_scalar(
     W: View[IQ2_XS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],
@@ -989,6 +1026,44 @@ def mul_mat_iq2_xs(
         for column in range(N):
             value = vec_dot_iq2_xs_q8_k(W[column], Xq[row], grid, signs)
             commit(value, Y[row, column])
+
+
+def mul_mat_iq2_xs_entry(
+    W: View[IQ2_XS, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    grid: View[I8X8, (512, 8)],
+    signs: View[I8X8, (128, 8)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    grid_values = grid.values
+    sign_values = signs.values
+    with L.rows(M, group=1) as mb:
+        with L.cols(N, group=auto("NR")) as nb:
+            f32_acc = new(f32, [1, NR], init=f32(0.0))
+            with L.blocks(K, extent=256) as kb:
+                w = admit(W[nb, kb])
+                x = admit(Xq[mb, kb])
+                scale_group = iota(16, dtype=u32, axis="scale_group")
+                entry = iota(2, dtype=u32, axis="entry")
+                payload = iota(8, dtype=u32, axis="payload")
+                block_sum = _iq2_xs_entry_products(
+                    w,
+                    x,
+                    grid_values,
+                    sign_values,
+                    scale_group,
+                    entry,
+                    payload,
+                )
+                f32_acc += (
+                    f32(0.125)
+                    * f32(w.d)
+                    * f32(x.ds)
+                    * widen(block_sum, f32)
+                )
+            commit(f32_acc, Y[mb, nb])
 
 
 def mul_mat_iq2_xs_staged(
