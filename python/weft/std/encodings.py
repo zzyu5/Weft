@@ -45,6 +45,7 @@ class Q4_0:
 @weft.encoding
 class Q4_1:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 32
     d: f16
     m: f16
@@ -54,6 +55,7 @@ class Q4_1:
 @weft.encoding
 class Q5_0:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 32
     d: f16
     qh: u1[32] @ grouped(8) @ layered(1, lo_first)
@@ -63,6 +65,7 @@ class Q5_0:
 @weft.encoding
 class Q5_1:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 32
     d: f16
     m: f16
@@ -271,6 +274,7 @@ class NVFP4:
 @weft.encoding
 class Q8_1:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 32
     d: f16
     s: f16
