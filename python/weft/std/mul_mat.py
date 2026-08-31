@@ -63,7 +63,6 @@ from .vec_dot import (
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
     vec_dot_iq2_s_q8_k,
-    vec_dot_iq2_xs_q8_k,
     vec_dot_iq2_xxs_q8_k,
     vec_dot_iq3_s_q8_k,
     vec_dot_iq3_xxs_q8_k,
@@ -1013,22 +1012,7 @@ def mul_mat_iq2_s_staged(
                         commit(f32_acc, Y[mb, nb])
 
 
-def mul_mat_iq2_xs_scalar(
-    W: View[IQ2_XS, (N, K)],
-    X: View[f32, (M, K)],
-    Xq: View[Q8_K, (M, K)],
-    grid: View[i8, (4096,)],
-    signs: View[i8, (1024,)],
-    Y: View[f32, (M, N)],
-):
-    quantize_q8_K(X, Xq)
-    for row in range(M):
-        for column in range(N):
-            value = vec_dot_iq2_xs_q8_k(W[column], Xq[row], grid, signs)
-            commit(value, Y[row, column])
-
-
-def mul_mat_iq2_xs_entry(
+def mul_mat_iq2_xs(
     W: View[IQ2_XS, (N, K)],
     X: View[f32, (M, K)],
     Xq: View[Q8_K, (M, K)],

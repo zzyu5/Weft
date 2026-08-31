@@ -155,15 +155,13 @@ else
       physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
     fi
   elif [[ ${format} == iq2_xs ]]; then
+    meta=(--meta NR=1)
     if [[ ${target} == sg2044 ]]; then
-      kernel=production_mul_mat_iq2_xs_scalar
-      runtime_kernel_define=-DWEFT_IQ2_XS_SCALAR=1
+      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
     else
-      meta=(--meta NR=1)
       physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
-      kernel=production_mul_mat_iq2_xs_entry
-      runtime_kernel_define=-DWEFT_IQ2_XS_ENTRY=1
     fi
+    kernel=production_mul_mat_iq2_xs
   elif [[ ${format} == q1_0 ]]; then
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
     if [[ ${phase} == decode ]]; then

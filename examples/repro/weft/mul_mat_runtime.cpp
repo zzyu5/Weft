@@ -431,12 +431,9 @@ constexpr int kElements = 256;
 #if defined(WEFT_IQ2_XS_STAGED)
 extern "C" void production_mul_mat_iq2_xs_staged(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq2_xs_staged(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
-#elif defined(WEFT_IQ2_XS_ENTRY)
-extern "C" void production_mul_mat_iq2_xs_entry(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs_entry(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
 #else
-extern "C" void production_mul_mat_iq2_xs_scalar(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
-#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs_scalar(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
+extern "C" void production_mul_mat_iq2_xs(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const std::int8_t *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq2_xs(w, x, xq, iq2xs.data(), signs.data(), y, kN, kK, runtimeM)
 #endif
 #elif WEFT_MUL_MAT_FORMAT == 16
 using selected_weight = block_iq2_xxs;
