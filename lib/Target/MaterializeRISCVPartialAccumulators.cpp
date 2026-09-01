@@ -4784,6 +4784,11 @@ public:
         }
         scalarScale = *rematerializedScale;
         llvm::DenseSet<mlir::Value> stops;
+        // A pure layout conversion may rematerialize to an existing scalar
+        // producer from the old scale chain.  Keep that selected SSA owner
+        // alive while deleting the now-dead vector representation; otherwise
+        // the scale-combine op below would receive a dangling Value.
+        stops.insert(scalarScale);
         llvm::DenseSet<mlir::Operation *> candidates;
         collectDeadChainCandidates(*scale, stops, candidates);
         sweepDeadChainCandidates(candidates, rewriter);

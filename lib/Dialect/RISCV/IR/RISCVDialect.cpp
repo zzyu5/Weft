@@ -1153,10 +1153,12 @@ mlir::LogicalResult PartialTopologyAttr::verify(
                    [](int64_t axis) { return axis == 0; }))
     return emitError()
            << "partial and output axes must be nonzero and disjoint";
+  const bool ownsLaneSplit = kind == "scaled" || kind == "reduced_scaled" ||
+                             kind == "nested_scaled_stream";
   if (laneSplit > 1 &&
-      (kind != "scaled" || sourceSlots * laneSplit != partialSlots))
+      (!ownsLaneSplit || sourceSlots * laneSplit != partialSlots))
     return emitError()
-           << "lane-split topology must close scaled source and partial slots";
+           << "lane-split topology must close one scaled source carrier and its partial slots";
   if ((kind == "independent" || kind == "replica_reduced" ||
        kind == "scaled" ||
        kind == "reduced_scaled" || kind == "level_scaled" ||
@@ -6631,16 +6633,25 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
     }
     const size_t inputPosition = static_cast<size_t>(
         inputAxis - input.getAxisIds().asArrayRef().begin());
-    closedAxes &=
-        result.getShape()[resultPosition] > 0 &&
-        input.getShape()[inputPosition] ==
-            result.getShape()[resultPosition] *
-                input.getLayout().getTimeFactors()[inputPosition] &&
+    const int64_t inputShape = input.getShape()[inputPosition];
+    const int64_t resultShape = result.getShape()[resultPosition];
+    const int64_t inputTime =
+        input.getLayout().getTimeFactors()[inputPosition];
+    const int64_t inputLanes =
+        input.getLayout().getLaneFactors()[inputPosition];
+    const int64_t resultLanes =
+        result.getLayout().getLaneFactors()[resultPosition];
+    const bool timeSlice =
+        resultShape > 0 && inputShape == resultShape * inputTime &&
         result.getLayout().getTimeFactors()[resultPosition] == 1 &&
-        result.getLayout().getLaneFactors()[resultPosition] ==
-            input.getLayout().getLaneFactors()[inputPosition] &&
-        result.getLayout().getLaneFactors()[resultPosition] ==
-            result.getShape()[resultPosition] &&
+        resultLanes == inputLanes && resultLanes == resultShape;
+    const bool laneSlice =
+        resultShape > 0 && inputTime == 1 &&
+        result.getLayout().getTimeFactors()[resultPosition] == 1 &&
+        inputShape == inputLanes && resultShape == resultLanes &&
+        inputLanes >= resultLanes && inputLanes % resultLanes == 0;
+    closedAxes &=
+        (timeSlice || laneSlice) &&
         result.getLayout().getReplicaFactors()[resultPosition] == 1 &&
         result.getLayout().getFragmentFactors()[resultPosition] == 1 &&
         result.getLayout().getLocalFactors()[resultPosition] == 1;

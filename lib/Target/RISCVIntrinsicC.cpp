@@ -10531,21 +10531,16 @@ Emitter::compileRVVIssueSlice(riscv::RVVIssueSliceOp operation) {
   auto input = materializeNumeric(operation.getInput(),
                                   bindings.lookup(operation.getInput()));
   const int64_t resultParts = vectorPartCount(operation.getResult());
-  auto kernel = operation->getParentOfType<riscv::KernelOp>();
   auto inputType = operation.getInput().getType();
   auto resultType = operation.getResult().getType();
   const int64_t sourceLMUL = inputType.getLayout().getLmulEighths();
   const int64_t resultLMUL = resultType.getLayout().getLmulEighths();
-  const int64_t sew = resultType.getLayout().getSew();
-  const int64_t sliceSpan =
-      kernel && sew > 0 ? kernel.getTarget().getVlenBits() * resultLMUL /
-                              (8 * sew)
-                        : 0;
+  const int64_t sourceLanes = physicalLanesFor(inputType);
   const std::string sourceSuffix = vectorSuffix(operation.getInput());
   const std::string resultSuffix = vectorSuffix(operation.getResult());
   if (mlir::failed(input) || input->kind != Binding::Kind::Vector ||
-      !kernel || resultParts <= 0 || sourceLMUL <= 0 || resultLMUL <= 0 ||
-      sliceSpan <= 0 || sourceSuffix.empty() || resultSuffix.empty() ||
+      resultParts <= 0 || sourceLMUL <= 0 || resultLMUL <= 0 ||
+      sourceLanes <= 0 || sourceSuffix.empty() || resultSuffix.empty() ||
       operation.getSourceParts().size() != static_cast<size_t>(resultParts) ||
       operation.getLaneOffsets().size() != static_cast<size_t>(resultParts))
     return fail(operation,
@@ -10559,24 +10554,29 @@ Emitter::compileRVVIssueSlice(riscv::RVVIssueSliceOp operation) {
     if (sourcePart < 0 || sourcePart >= static_cast<int64_t>(input->parts.size()))
       return fail(operation,
                   "RVV issue slice references an absent source vector part");
-    const int64_t group = laneOffset / sliceSpan;
-    const int64_t intra = laneOffset % sliceSpan;
     std::string sliced = input->parts[static_cast<size_t>(sourcePart)];
     if (sourceLMUL != resultLMUL) {
-      sliced = fresh("issue_slice_part");
-      line(vectorType(operation.getResult()) + " " + sliced +
-           " = __riscv_vget_v_" + sourceSuffix + "_" + resultSuffix + "(" +
-           input->parts[static_cast<size_t>(sourcePart)] + ", " +
-           std::to_string(group) + ");");
-    } else if (group != 0) {
-      return fail(operation,
-                  "RVV issue slice lane offset exceeds its selected source part");
-    }
-    if (intra != 0) {
+      if (sourceLMUL < resultLMUL || sourceLMUL % resultLMUL)
+        return fail(operation,
+                    "RVV issue slice requires an integral LMUL truncation");
+      if (laneOffset != 0) {
+        std::string shifted = fresh("issue_slice_lane");
+        line(vectorType(operation.getInput()) + " " + shifted +
+             " = __riscv_vslidedown_vx_" + sourceSuffix + "(" + sliced + ", " +
+             std::to_string(laneOffset) + ", " +
+             std::to_string(sourceLanes) + ");");
+        sliced = std::move(shifted);
+      }
+      std::string truncated = fresh("issue_slice_part");
+      line(vectorType(operation.getResult()) + " " + truncated +
+           " = __riscv_vlmul_trunc_v_" + sourceSuffix + "_" + resultSuffix +
+           "(" + sliced + ");");
+      sliced = std::move(truncated);
+    } else if (laneOffset != 0) {
       std::string shifted = fresh("issue_slice_lane");
       line(vectorType(operation.getResult()) + " " + shifted +
            " = __riscv_vslidedown_vx_" + resultSuffix + "(" + sliced + ", " +
-           std::to_string(intra) + ", " +
+           std::to_string(laneOffset) + ", " +
            partVL(operation.getResult(), resultPart) + ");");
       sliced = std::move(shifted);
     }

@@ -25,6 +25,13 @@ bool isPureRepresentationConversion(riscv::ConvertLayoutOp conversion) {
   return conversion.getConversion().getEffect() == "pure";
 }
 
+bool hasFinalResourceContract(riscv::ConvertLayoutOp conversion) {
+  auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+  return kernel && kernel->hasAttr("vector_register_peak") &&
+         kernel->hasAttr("fragment_register_peak") &&
+         kernel->hasAttr("local_storage_bytes");
+}
+
 class CanonicalizeRISCVLayoutsPass
     : public mlir::PassWrapper<CanonicalizeRISCVLayoutsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -46,6 +53,14 @@ public:
           [&](riscv::ConvertLayoutOp operation) { conversions.push_back(operation); });
       for (riscv::ConvertLayoutOp conversion : conversions) {
         if (!conversion)
+          continue;
+        // Resource materialization freezes the final physical program.  A
+        // backward-rematerialization after that point would change layouts,
+        // selected leaves, and the measured live-set without rerunning their
+        // owners.  Keep only the dominance-safe identical-conversion CSE below
+        // available when this pass is replayed on independently parsed final
+        // RISC-V IR.
+        if (hasFinalResourceContract(conversion))
           continue;
         if (auto previous =
                 conversion.getInput().getDefiningOp<riscv::ConvertLayoutOp>()) {
