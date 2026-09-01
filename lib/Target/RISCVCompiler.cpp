@@ -104,3 +104,18 @@ weft::compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
     return mlir::failure();
   return result;
 }
+
+mlir::FailureOr<weft::RISCVCompilationResult>
+weft::translateRISCVModule(mlir::ModuleOp module) {
+  mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
+  mlir::PassManager manager(module.getContext());
+  manager.enableVerifier(true);
+  manager.addPass(weft::createVerifyFinalRISCVPass());
+  if (mlir::failed(manager.run(*working)))
+    return mlir::failure();
+  RISCVCompilationResult result;
+  result.riscvIR = printModule(*working);
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+    return mlir::failure();
+  return result;
+}

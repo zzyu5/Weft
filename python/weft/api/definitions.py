@@ -5,7 +5,7 @@ import inspect
 import textwrap
 from dataclasses import dataclass
 from types import FunctionType
-from typing import Any, Callable, Generic, ParamSpec, TypeVar
+from typing import Any, Callable, Generic, Mapping, ParamSpec, TypeVar
 
 from weft.diagnostics import DefinitionError, LanguageUseError
 
@@ -36,10 +36,31 @@ def _function_source(function: FunctionType, noun: str) -> DefinitionSource:
 class KernelDefinition(Generic[P, R]):
     """Captured source for one AOT Weft kernel."""
 
-    def __init__(self, function: Callable[P, R]) -> None:
+    def __init__(
+        self,
+        function: Callable[P, R],
+        *,
+        alias_groups: Mapping[str, str] | None = None,
+    ) -> None:
         if not isinstance(function, FunctionType):
             raise DefinitionError("Weft kernels must decorate a Python function")
+        if alias_groups is not None and not isinstance(alias_groups, Mapping):
+            raise DefinitionError(
+                "kernel alias_groups must be a parameter-to-group mapping"
+            )
+        groups = dict(alias_groups or {})
+        if any(
+            not isinstance(parameter, str)
+            or not parameter
+            or not isinstance(group, str)
+            or not group
+            for parameter, group in groups.items()
+        ):
+            raise DefinitionError(
+                "kernel alias_groups maps parameter names to non-empty group names"
+            )
         self.python_function = function
+        self.alias_groups = groups
         self.source = _function_source(function, "decorated DSL kernel")
         functools.update_wrapper(self, function)
 
@@ -152,10 +173,16 @@ class OverloadSet:
         )
 
 
-def kernel(function: Callable[P, R] | None = None) -> Any:
+def kernel(
+    function: Callable[P, R] | None = None,
+    *,
+    alias_groups: Mapping[str, str] | None = None,
+) -> Any:
     if function is None:
-        return KernelDefinition
-    return KernelDefinition(function)
+        return lambda decorated: KernelDefinition(
+            decorated, alias_groups=alias_groups
+        )
+    return KernelDefinition(function, alias_groups=alias_groups)
 
 
 def encoding(declaration: type[object]) -> EncodingDefinition:

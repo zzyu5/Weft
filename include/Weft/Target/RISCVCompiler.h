@@ -38,6 +38,11 @@ physicalizeRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 mlir::FailureOr<RISCVCompilationResult>
 compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
+/// Verify and mechanically translate an already-physicalized RISC-V program.
+/// This is the terminal boundary used after independent Physical IR rewrites.
+mlir::FailureOr<RISCVCompilationResult>
+translateRISCVModule(mlir::ModuleOp module);
+
 } // namespace weft
 
 #endif // WEFT_TARGET_RISCVCOMPILER_H

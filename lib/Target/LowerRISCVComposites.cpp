@@ -1517,52 +1517,6 @@ private:
             rewriter.getDenseI64ArrayAttr(termOrder));
       };
       rewriter.setInsertionPoint(reduce);
-      if (schedule.getPipelineDepth() == 1 &&
-          schedule.getBufferCount() == 1) {
-        const int64_t operandGroups =
-            (loadLayout.getLmulEighths() + 7) / 8;
-        const int64_t issueParts =
-            product(resultLayout.getTimeFactors());
-        const int64_t temporaryGroups =
-            product({partialLayout.getRegisterGroups(), schedule.getUnroll(),
-                     issueParts});
-        if (operandGroups <= 0 || issueParts <= 0 || temporaryGroups <= 0) {
-          reduce.emitError(
-              "grouped MAC leaf resources overflow their physical domain");
-          failed = true;
-          continue;
-        }
-        auto grouped = rewriter.create<riscv::RVVGroupedMacReduceOp>(
-            reduce.getLoc(), accumulatorType, lhs, rhs, active, loadLayout,
-            partialLayout,
-            rewriter.getDenseI64ArrayAttr(*supplyPlan),
-            groupedPlan("reduce"),
-            riscv_internal::leaf(
-                rewriter, "rvv", "grouped-mac-reduce",
-                "rvv.grouped-mac-reduce.u8-s8",
-                "rvv.grouped-mac-reduce.u8-s8",
-                operandGroups,
-                accumulatorType.getLayout().getRegisterGroups(),
-                temporaryGroups, 0,
-                "none", exactWindow ? "exact" : "agnostic",
-                {static_cast<int64_t>(mac.getGroup()), schedule.getUnroll(),
-                 reductionAxis}));
-        copyIdentity(reduce, grouped);
-        if (resultType) {
-          reduce.getResult().replaceAllUsesWith(grouped.getResult());
-          rewriter.eraseOp(reduce);
-        } else {
-          reduce.getInputMutable().assign(grouped.getResult());
-        }
-        if (widen.getResult().use_empty())
-          rewriter.eraseOp(widen);
-        for (riscv::ConvertLayoutOp conversion : llvm::reverse(bridges))
-          if (conversion.getResult().use_empty())
-            rewriter.eraseOp(conversion);
-        if (mac.getResult().use_empty())
-          rewriter.eraseOp(mac);
-        continue;
-      }
       mlir::Type element = accumulatorType.getElementType();
       mlir::TypedAttr zero = mlir::isa<mlir::FloatType>(element)
                                  ? mlir::cast<mlir::TypedAttr>(
@@ -1590,6 +1544,8 @@ private:
       loop->setAttr("weft.riscv.direction",
                     rewriter.getStringAttr("ascending"));
       loop->setAttr("weft.riscv.schedule", schedule);
+      loop->setAttr("weft.riscv.system_unroll",
+                    rewriter.getStringAttr("disable"));
       auto windowType = riscv::WindowType::get(
           rewriter.getContext(), "grouped-mac", lhs.getType(), rhs.getType(),
           accumulatorType, reductionAxis, schedule.getUnroll(), mac.getGroup(),
@@ -1739,6 +1695,8 @@ private:
       loop->setAttr("weft.riscv.direction",
                     rewriter.getStringAttr("ascending"));
       loop->setAttr("weft.riscv.schedule", schedule);
+      loop->setAttr("weft.riscv.system_unroll",
+                    rewriter.getStringAttr("disable"));
       auto windowType = riscv::WindowType::get(
           rewriter.getContext(), "encoded-dot", lhs.getType(),
           rhsField.getResult().getType(), resultType, reductionAxis, schedule.getUnroll(),

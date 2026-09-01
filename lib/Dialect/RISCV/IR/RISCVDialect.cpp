@@ -538,12 +538,10 @@ bool hasGroupedMacOperandGeometry(mlir::Operation *operation, mlir::Value lhs,
            lhsLayout.getValidity() == rhsLayout.getValidity();
   };
   auto resultType = mlir::dyn_cast<ValueType>(
-      mlir::isa<RVVGroupedMacReduceOp>(operation)
-          ? mlir::cast<RVVGroupedMacReduceOp>(operation).getResult().getType()
-          : mlir::cast<RVVGroupedMacLoadOp>(operation)
-                .getResult()
-                .getType()
-                .getResultType());
+      mlir::cast<RVVGroupedMacLoadOp>(operation)
+          .getResult()
+          .getType()
+          .getResultType());
   if (!resultType || resultType.getLayout() != resultLayout ||
       resultLayout.getSew() != 32 ||
       resultLayout.getLmulEighths() !=
@@ -1023,7 +1021,8 @@ mlir::LogicalResult TargetAttr::verify(
     bool hasSegmentMemory, bool hasWideningInteger, bool hasWideningFloat,
     int64_t vlenBits, int64_t vectorRegisters,
     int64_t maxPrivateStackBytes, mlir::DenseI64ArrayAttr supportedSEW,
-    mlir::DenseI64ArrayAttr legalLMULEighths, mlir::ArrayAttr fragments) {
+    mlir::DenseI64ArrayAttr legalLMULEighths,
+    llvm::StringRef partialCombinePolicy, mlir::ArrayAttr fragments) {
   if (triple.empty() || march.empty() || abi.empty() || vlenBits <= 0 ||
       vectorRegisters <= 0 || maxPrivateStackBytes < 0 || supportedSEW.empty() ||
       legalLMULEighths.empty())
@@ -1034,6 +1033,9 @@ mlir::LogicalResult TargetAttr::verify(
   (void)hasVectorF16;
   (void)hasIndexedMemory;
   (void)hasSegmentMemory;
+  if (partialCombinePolicy != "independent-multilevel" &&
+      partialCombinePolicy != "sequential")
+    return emitError() << "unknown partial combine structural priority";
   if (llvm::any_of(supportedSEW.asArrayRef(), [](int64_t value) { return value <= 0; }) ||
       llvm::any_of(legalLMULEighths.asArrayRef(),
                    [](int64_t value) { return value <= 0; }) ||
@@ -1549,10 +1551,13 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
 
 mlir::LogicalResult SequentialPartialPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-    int64_t issueCount, mlir::DenseI64ArrayAttr reductionAxes,
+    llvm::StringRef realization, int64_t issueCount,
+    mlir::DenseI64ArrayAttr reductionAxes,
     mlir::Type lhsIssueType, mlir::Type rhsIssueType,
     mlir::Type accumulatorType, mlir::DenseI64ArrayAttr lhsSourceParts,
     mlir::DenseI64ArrayAttr rhsSourceParts,
+    mlir::DenseI64ArrayAttr lhsLaneOffsets,
+    mlir::DenseI64ArrayAttr rhsLaneOffsets,
     llvm::StringRef accumulateInstruction,
     llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
   auto lhs = mlir::dyn_cast<weft::riscv::ValueType>(lhsIssueType);
@@ -1573,7 +1578,8 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
   bool validReductionAxes = !reductionAxes.empty();
   for (int64_t axis : reductionAxes.asArrayRef())
     validReductionAxes &= axis > 0 && seenReductionAxes.insert(axis).second;
-  if (issueCount <= 1 || !validReductionAxes || !lhs || !rhs || !accumulator ||
+  if ((realization != "fused" && realization != "per_stream") ||
+      issueCount <= 1 || !validReductionAxes || !lhs || !rhs || !accumulator ||
       !lhsElement || !rhsElement || !accumulatorElement ||
       lhsElement.isSignless() || rhsElement.isSignless() ||
       accumulatorElement.isSignless() ||
@@ -1583,8 +1589,9 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
           std::max<unsigned>(8, rhsElement.getWidth()) ||
       accumulatorElement.getWidth() !=
           2 * std::max<unsigned>(8, lhsElement.getWidth()) ||
-      accumulator.getAxisIds() != reductionAxes ||
       lhsSourceParts.empty() || lhsSourceParts.size() != rhsSourceParts.size() ||
+      lhsSourceParts.size() != lhsLaneOffsets.size() ||
+      rhsSourceParts.size() != rhsLaneOffsets.size() ||
       lhsSourceParts.size() % static_cast<size_t>(issueCount) ||
       accumulateInstruction != "rvv.vwmacc.partial" ||
       (finalizeInstruction != "rvv.vwredsum.partial" &&
@@ -1592,34 +1599,6 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
       resourceGroups <= 0)
     return emitError()
            << "sequential partial plan requires one closed multi-axis issue-slice, widened-accumulator, and final-reduction program";
-  auto positionOf = [](weft::riscv::ValueType value,
-                       int64_t axis) -> std::optional<size_t> {
-    auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
-    if (found == value.getAxisIds().asArrayRef().end())
-      return std::nullopt;
-    return static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin());
-  };
-  auto mapsCompleteReductionCarrier = [&](weft::riscv::ValueType value) {
-    if (value.getAxisIds().size() != reductionAxes.size())
-      return false;
-    for (int64_t axis : reductionAxes.asArrayRef()) {
-      auto position = positionOf(value, axis);
-      auto accumulatorPosition = positionOf(accumulator, axis);
-      if (!position || !accumulatorPosition ||
-          value.getShape()[*position] !=
-              accumulator.getShape()[*accumulatorPosition] ||
-          value.getLayout().getTimeFactors()[*position] != 1 ||
-          value.getLayout().getLaneFactors()[*position] !=
-              accumulator.getLayout().getLaneFactors()[*accumulatorPosition] ||
-          value.getLayout().getReplicaFactors()[*position] != 1 ||
-          value.getLayout().getFragmentFactors()[*position] != 1 ||
-          value.getLayout().getLocalFactors()[*position] != 1)
-        return false;
-    }
-    return true;
-  };
-  const int64_t issueParts =
-      static_cast<int64_t>(lhsSourceParts.size()) / issueCount;
   auto lhsPhysicalParts = physicalPartCount(lhs);
   auto rhsPhysicalParts = physicalPartCount(rhs);
   const int64_t expectedResources = std::max<int64_t>(
@@ -1627,19 +1606,26 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
           rhs.getLayout().getRegisterGroups() +
           accumulator.getLayout().getRegisterGroups(),
       accumulator.getLayout().getRegisterGroups() + 2);
-  auto allUnit = [](mlir::DenseI64ArrayAttr factors) {
-    return llvm::all_of(factors.asArrayRef(),
-                        [](int64_t factor) { return factor == 1; });
+  auto closedIssueCarrier = [&](weft::riscv::ValueType value) {
+    if (value.getAxisIds() != reductionAxes ||
+        value.getShape().size() != reductionAxes.size())
+      return false;
+    for (size_t position = 0; position < value.getShape().size(); ++position)
+      if (value.getShape()[position] <= 0 ||
+          value.getLayout().getTimeFactors()[position] != 1 ||
+          value.getLayout().getLaneFactors()[position] != value.getShape()[position] ||
+          value.getLayout().getReplicaFactors()[position] != 1 ||
+          value.getLayout().getFragmentFactors()[position] != 1 ||
+          value.getLayout().getLocalFactors()[position] != 1)
+        return false;
+    return true;
   };
   if (lhs.getLayout().getCarrier() != "rvv" ||
       rhs.getLayout().getCarrier() != "rvv" ||
       accumulator.getLayout().getCarrier() != "rvv" ||
-      !mapsCompleteReductionCarrier(lhs) ||
-      !mapsCompleteReductionCarrier(rhs) ||
-      !allUnit(accumulator.getLayout().getTimeFactors()) ||
-      !allUnit(accumulator.getLayout().getReplicaFactors()) ||
-      !allUnit(accumulator.getLayout().getFragmentFactors()) ||
-      !allUnit(accumulator.getLayout().getLocalFactors()) ||
+      !closedIssueCarrier(lhs) || !closedIssueCarrier(rhs) ||
+      !closedIssueCarrier(accumulator) || lhs.getShape() != rhs.getShape() ||
+      lhs.getShape() != accumulator.getShape() ||
       accumulator.getLayout().getSew() !=
           2 * lhs.getLayout().getSew() ||
       accumulator.getLayout().getLmulEighths() !=
@@ -1647,7 +1633,11 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
       lhs.getLayout().getVl() != rhs.getLayout().getVl() ||
       lhs.getLayout().getVl() != accumulator.getLayout().getVl() ||
       !lhsPhysicalParts || !rhsPhysicalParts ||
-      issueParts != *lhsPhysicalParts || issueParts != *rhsPhysicalParts ||
+      *lhsPhysicalParts != 1 || *rhsPhysicalParts != 1 ||
+      llvm::any_of(lhsLaneOffsets.asArrayRef(),
+                   [](int64_t offset) { return offset < 0; }) ||
+      llvm::any_of(rhsLaneOffsets.asArrayRef(),
+                   [](int64_t offset) { return offset < 0; }) ||
       resourceGroups != expectedResources)
     return emitError()
            << "sequential partial plan carrier or resource contract is inconsistent";
@@ -2669,9 +2659,15 @@ mlir::LogicalResult KernelOp::verify() {
       failed(verifyStringArray(*this, getShapeSymbols(), "shape_symbols")) ||
       failed(verifyStringArray(*this, getParameterNames(), "parameter_names")))
     return mlir::failure();
-  for (mlir::BlockArgument argument : body.getArguments())
-    if (!mlir::isa<MemDescType>(argument.getType()))
+  for (mlir::BlockArgument argument : body.getArguments()) {
+    auto descriptor = mlir::dyn_cast<MemDescType>(argument.getType());
+    if (!descriptor)
       return emitOpError("physical kernel pointer arguments are typed memdescs");
+    if (descriptor.getAliasSet() !=
+        getArgAliasSets()[argument.getArgNumber()])
+      return emitOpError(
+          "physical kernel ABI alias facts must match argument memdescs");
+  }
   if (!mlir::isa<ReturnOp>(body.getTerminator()))
     return emitOpError("physical kernel body must end in weft_riscv.return");
   if (getVectorRegisterPeak() < 0 || getFragmentRegisterPeak() < 0 ||
@@ -3592,6 +3588,9 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
   const size_t payloadPosition = resultAxes.size() - 1;
   auto layout = result.getLayout();
   const unsigned payloadBits = elementBitWidth(result.getElementType());
+  if (!payloadBits || payloadBits % 8)
+    return emitOpError(
+        "indexed entry load requires a byte-addressable payload element");
   if (layout.getTimeFactors()[payloadPosition] != 1 ||
       layout.getLaneFactors()[payloadPosition] != getPayloadExtent() ||
       layout.getReplicaFactors()[payloadPosition] != 1 ||
@@ -4949,74 +4948,6 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   return verifyLeafOperation(*this);
 }
 
-mlir::LogicalResult RVVGroupedMacReduceOp::verify() {
-  auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
-  auto resultParts = physicalPartCount(getResult().getType());
-  if (!lhs || lhs.getLayout().getCarrier() != "rvv")
-    return emitOpError("grouped MAC reduction lhs must use an RVV representation");
-  if (!resultParts || *resultParts <= 0 ||
-      getResult().getType().getLayout().getCarrier() != "rvv")
-    return emitOpError(
-        "grouped MAC reduction result must have one or more RVV output parts");
-  if (!getPlan() || getPlan().getKind() != "reduce")
-    return emitOpError("grouped MAC reduction has invalid structural parameters");
-  auto supplyPlan = groupedMacSupplyProjection(lhs, getResult().getType());
-  if (!supplyPlan ||
-      getPackedSupplyForResult() != llvm::ArrayRef<int64_t>(*supplyPlan))
-    return emitOpError(
-        "grouped MAC reduction packed-supply mapping disagrees with its typed axes and layout");
-  if (getPartialLayout().getCarrier() != "rvv" ||
-      getPartialLayout().getSew() != 16)
-    return emitOpError("grouped MAC reduction requires a 16-bit RVV partial layout");
-  auto kernel = getOperation()->getParentOfType<KernelOp>();
-  if (!kernel)
-    return emitOpError(
-        "grouped MAC reduction must be nested in one target kernel");
-  auto target = kernel.getTarget();
-  const bool operandGeometry = hasGroupedMacOperandGeometry(
-      getOperation(), getLhs(), getRhs(), getPlan().getReductionAxis(),
-      getPlan(), getLoadLayout(), getPartialLayout(),
-      getResult().getType().getLayout());
-  const bool resultLayout =
-      supportsRVVLayout(target, getResult().getType().getLayout());
-  if (!operandGeometry || !resultLayout)
-    return emitOpError()
-           << "grouped MAC reduction has no complete typed field, cohort-storage, "
-              "RVV-layout, or shared reduction-point realization; operand_geometry="
-           << operandGeometry << ", result_layout=" << resultLayout
-           << ", lhs=" << getLhs().getType() << ", rhs=" << getRhs().getType()
-           << ", result=" << getResult().getType()
-           << ", plan=" << getPlan()
-           << ", load_layout=" << getLoadLayout()
-           << ", partial_layout=" << getPartialLayout();
-  if (!exactLeaf(getLeaf(), "rvv", "grouped-mac-reduce",
-                 "rvv.grouped-mac-reduce.u8-s8", "none", "agnostic") &&
-      !exactLeaf(getLeaf(), "rvv", "grouped-mac-reduce",
-                 "rvv.grouped-mac-reduce.u8-s8", "none", "exact"))
-    return emitOpError("grouped MAC reduction leaf is not the selected RVV operation");
-  if (getLeaf().getParameters().asArrayRef() !=
-      llvm::ArrayRef<int64_t>({getPlan().getGroup(), getPlan().getUnroll(),
-                               getPlan().getReductionAxis()}))
-    return emitOpError("grouped MAC reduction leaf parameters disagree with its schedule");
-  auto issueParts = checkedPositiveProduct(
-      getResult().getType().getLayout().getTimeFactors().asArrayRef());
-  auto expectedTemporaries =
-      issueParts
-          ? checkedPositiveProduct(
-                {getPartialLayout().getRegisterGroups(), getPlan().getUnroll(),
-                 *issueParts})
-          : std::nullopt;
-  if (!expectedTemporaries ||
-      getLeaf().getOperandGroups() !=
-          (getLoadLayout().getLmulEighths() + 7) / 8 ||
-      getLeaf().getResultGroups() !=
-          getResult().getType().getLayout().getRegisterGroups() ||
-      getLeaf().getTemporaryGroups() != *expectedTemporaries)
-    return emitOpError(
-        "grouped MAC reduction leaf resources disagree with its typed layouts");
-  return mlir::success();
-}
-
 mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
   auto window = getResult().getType();
   auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
@@ -5036,16 +4967,12 @@ mlir::LogicalResult RVVGroupedMacLoadOp::verify() {
     return emitOpError("grouped MAC window type disagrees with its operands");
   auto windowResult = mlir::dyn_cast<ValueType>(window.getResultType());
   auto supplyPlan = groupedMacSupplyProjection(lhs, windowResult);
-  auto issueParts = checkedPositiveProduct(
-      window.getResultLayout().getTimeFactors().asArrayRef());
-  auto replicaParts = checkedPositiveProduct(
-      window.getResultLayout().getReplicaFactors().asArrayRef());
+  auto physicalParts = physicalPartCount(windowResult);
   if (!supplyPlan ||
       getPackedSupplyForResult() != llvm::ArrayRef<int64_t>(*supplyPlan) ||
-      !issueParts || *issueParts != 1 || !replicaParts ||
-      *replicaParts != window.getResultParts())
+      !physicalParts || *physicalParts != window.getResultParts())
     return emitOpError(
-        "grouped MAC window requires one typed packed-supply mapping over register replicas");
+        "grouped MAC window requires one typed packed-supply mapping over all issue and register parts");
   auto kernel = getOperation()->getParentOfType<KernelOp>();
   if (!kernel)
     return emitOpError("grouped MAC load must be nested in one target kernel");
@@ -5276,24 +5203,35 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   auto layeredPartialPlan = getLayeredPartialPlanAttr();
   const bool topologyAssigned = topologyKind != "unassigned";
   const bool sequentialPlanRequired =
-      topologyKind == "sequential_fused" && getReductionStreams() > 1;
+      getReductionStreams() > 1 &&
+      (topologyKind == "sequential_fused" ||
+       topologyKind == "sequential_per_stream");
+  const bool terminalSequential =
+      getReductionStreams() == 1 &&
+      (topologyKind == "sequential_per_stream" ||
+       topologyKind == "sequential_fused");
   // LowerRISCVComposites creates a legal but deliberately unassigned physical
   // contraction.  The topology pass owns every plan attribute and the final
   // verifier rejects any surviving unassigned op.  Do not require a topology
   // plan at this intermediate verifier boundary; once assigned, require the
   // complete mutually consistent plan set below.
   bool layoutPlanClosed = !topologyAssigned;
-  if (topologyAssigned)
-    layoutPlanClosed = static_cast<bool>(partialLayoutPlan) &&
-                       (topologyKind == "nested_scaled_stream") ==
-                           static_cast<bool>(nestedPartialPlan) &&
-                       sequentialPlanRequired ==
-                           static_cast<bool>(sequentialPartialPlan) &&
-                       (topologyKind == "scaled" ||
-                        topologyKind == "reduced_scaled") ==
-                           static_cast<bool>(scaledPartialPlan) &&
-                       (topologyKind == "layered") ==
-                           static_cast<bool>(layeredPartialPlan);
+  if (topologyAssigned) {
+    if (partialLayoutPlan)
+      layoutPlanClosed =
+          (topologyKind == "nested_scaled_stream") ==
+              static_cast<bool>(nestedPartialPlan) &&
+          sequentialPlanRequired ==
+              static_cast<bool>(sequentialPartialPlan) &&
+          (topologyKind == "scaled" || topologyKind == "reduced_scaled") ==
+              static_cast<bool>(scaledPartialPlan) &&
+          (topologyKind == "layered") ==
+              static_cast<bool>(layeredPartialPlan);
+    else
+      layoutPlanClosed = terminalSequential && !nestedPartialPlan &&
+                         !sequentialPartialPlan && !scaledPartialPlan &&
+                         !layeredPartialPlan;
+  }
   if (topologyAssigned && partialLayoutPlan) {
     auto partialSlot = mlir::dyn_cast<ValueType>(
         partialLayoutPlan.getPartialSlotType());
@@ -5443,48 +5381,74 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
         sequentialPartialPlan.getRhsIssueType());
     auto accumulator = mlir::dyn_cast<ValueType>(
         sequentialPartialPlan.getAccumulatorType());
-    auto plannedAccumulator =
-        partialLayoutPlan
-            ? mlir::dyn_cast<ValueType>(partialLayoutPlan.getPartialSlotType())
-            : ValueType();
     auto lhsIssueParts = lhsIssue ? physicalPartCount(lhsIssue) : std::nullopt;
     auto rhsIssueParts = rhsIssue ? physicalPartCount(rhsIssue) : std::nullopt;
     const int64_t issueCount = sequentialPartialPlan.getIssueCount();
     auto sourceMatchesIssue = [&](ValueType source, ValueType issue) {
       if (!issue || source.getElementType() != issue.getElementType() ||
-          source.getAxisIds() != issue.getAxisIds() ||
-          source.getShape().size() != issue.getShape().size())
+          issue.getAxisIds().asArrayRef() != getOver() ||
+          issue.getShape().size() != getOver().size())
         return false;
-      int64_t slicedAxes = 0;
-      for (size_t position = 0; position < source.getShape().size(); ++position) {
-        if (source.getShape()[position] == issue.getShape()[position])
-          continue;
-        ++slicedAxes;
-        if (!llvm::is_contained(
-                getOver(), source.getAxisIds()[position]) ||
-            issue.getShape()[position] !=
-                issue.getLayout().getLaneFactors()[position] ||
-            source.getShape()[position] !=
-                issue.getShape()[position] *
-                    source.getLayout().getTimeFactors()[position])
+      for (size_t issuePosition = 0; issuePosition < getOver().size();
+           ++issuePosition) {
+        auto sourcePosition = llvm::find(source.getAxisIds().asArrayRef(),
+                                         getOver()[issuePosition]);
+        if (sourcePosition == source.getAxisIds().asArrayRef().end())
+          return false;
+        const size_t position = static_cast<size_t>(
+            sourcePosition - source.getAxisIds().asArrayRef().begin());
+        if (source.getShape()[position] !=
+                issue.getShape()[issuePosition] *
+                    source.getLayout().getTimeFactors()[position] ||
+            issue.getShape()[issuePosition] !=
+                issue.getLayout().getLaneFactors()[issuePosition] ||
+            issue.getLayout().getLaneFactors()[issuePosition] !=
+                source.getLayout().getLaneFactors()[position])
           return false;
       }
-      return slicedAxes >= 1;
+      for (size_t position = 0; position < source.getAxisIds().size();
+           ++position)
+        if (!llvm::is_contained(getOver(), source.getAxisIds()[position]) &&
+            (source.getLayout().getLaneFactors()[position] != 1 ||
+             source.getLayout().getFragmentFactors()[position] != 1 ||
+             source.getLayout().getLocalFactors()[position] != 1))
+          return false;
+      return issue.getLayout().getSew() == source.getLayout().getSew() &&
+             issue.getLayout().getLmulEighths() == getSliceLmulEighths() &&
+             issue.getLayout().getVl() == getReductionLanes();
     };
+    bool laneOffsetsClosed =
+        sequentialPartialPlan.getLhsLaneOffsets().size() ==
+            sequentialPartialPlan.getLhsSourceParts().size() &&
+        sequentialPartialPlan.getRhsLaneOffsets().size() ==
+            sequentialPartialPlan.getRhsSourceParts().size();
+    if (laneOffsetsClosed)
+      for (int64_t output = 0; output < outputParts; ++output)
+        for (int64_t issue = 0; issue < issueCount; ++issue) {
+          const size_t index = static_cast<size_t>(output * issueCount + issue);
+          laneOffsetsClosed &=
+              sequentialPartialPlan.getLhsLaneOffsets()[index] ==
+                  getLhsLaneOffsets()[output] &&
+              sequentialPartialPlan.getRhsLaneOffsets()[index] ==
+                  getRhsLaneOffsets()[output];
+        }
     const bool sequentialPlanClosed =
         !getOver().empty() && issueCount == getReductionStreams() &&
+        sequentialPartialPlan.getRealization() ==
+            (topologyKind == "sequential_fused" ? "fused" : "per_stream") &&
         sequentialPartialPlan.getReductionAxes().asArrayRef() == getOver() &&
         lhsIssue &&
-        rhsIssue && accumulator && accumulator == plannedAccumulator &&
+        rhsIssue && accumulator &&
         lhsIssueParts && rhsIssueParts && issueCount > 1 &&
         sequentialPartialPlan.getLhsSourceParts().asArrayRef() ==
             getLhsParts() &&
         sequentialPartialPlan.getRhsSourceParts().asArrayRef() ==
             getRhsParts() &&
         sequentialPartialPlan.getLhsSourceParts().size() ==
-            static_cast<size_t>(issueCount * *lhsIssueParts) &&
+            static_cast<size_t>(issueCount * outputParts) &&
         sequentialPartialPlan.getRhsSourceParts().size() ==
-            static_cast<size_t>(issueCount * *rhsIssueParts) &&
+            static_cast<size_t>(issueCount * outputParts) &&
+        *lhsIssueParts == 1 && *rhsIssueParts == 1 && laneOffsetsClosed &&
         sourceMatchesIssue(lhs, lhsIssue) && sourceMatchesIssue(rhs, rhsIssue) &&
         getPartialTopology().getResourceGroups() ==
             sequentialPartialPlan.getResourceGroups() &&
@@ -6568,67 +6532,69 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
   ValueType result = getResult().getType();
   auto inputParts = physicalPartCount(input);
   auto resultParts = physicalPartCount(result);
+  auto inputLanes = checkedPositiveProduct(
+      input.getLayout().getLaneFactors().asArrayRef());
+  auto resultLanes = checkedPositiveProduct(
+      result.getLayout().getLaneFactors().asArrayRef());
   if (input.getElementType() != result.getElementType() ||
-      input.getAxisIds() != result.getAxisIds() ||
-      input.getShape().size() != result.getShape().size() ||
       input.getLayout().getCarrier() != "rvv" ||
       result.getLayout().getCarrier() != "rvv" || !inputParts || !resultParts ||
-      *resultParts <= 0 ||
+      *resultParts <= 0 || !inputLanes || !resultLanes ||
       getSourceParts().size() != static_cast<size_t>(*resultParts) ||
+      getLaneOffsets().size() != static_cast<size_t>(*resultParts) ||
       llvm::any_of(getSourceParts(), [&](int64_t part) {
         return part < 0 || part >= *inputParts;
+      }) ||
+      llvm::any_of(getLaneOffsets(), [&](int64_t offset) {
+        return offset < 0 || offset % *resultLanes ||
+               offset > *inputLanes - *resultLanes;
       }) ||
       !exactLeaf(getLeaf(), "transfer", "issue-slice", "rvv.issue-slice",
                  "none", "exact"))
     return emitOpError(
         "RVV issue slice requires one exact physical-part projection");
 
-  int64_t slicedAxes = 0;
-  for (size_t position = 0; position < input.getShape().size(); ++position) {
-    const bool sliced = input.getShape()[position] != result.getShape()[position];
-    if (sliced) {
-      ++slicedAxes;
-      if (result.getShape()[position] <= 0 ||
-          input.getShape()[position] !=
-              result.getShape()[position] *
-                  input.getLayout().getTimeFactors()[position] ||
-          result.getLayout().getTimeFactors()[position] != 1 ||
-          result.getLayout().getLaneFactors()[position] !=
-              input.getLayout().getLaneFactors()[position] ||
-          result.getLayout().getLaneFactors()[position] !=
-              result.getShape()[position] ||
-          result.getLayout().getReplicaFactors()[position] !=
-              input.getLayout().getReplicaFactors()[position] ||
-          result.getLayout().getFragmentFactors()[position] !=
-              input.getLayout().getFragmentFactors()[position] ||
-          result.getLayout().getLocalFactors()[position] !=
-              input.getLayout().getLocalFactors()[position])
-        return emitOpError(
-            "RVV issue slice does not select one complete time coordinate");
+  bool closedAxes = !result.getAxisIds().empty();
+  for (size_t resultPosition = 0;
+       resultPosition < result.getAxisIds().size(); ++resultPosition) {
+    auto inputAxis = llvm::find(input.getAxisIds().asArrayRef(),
+                                result.getAxisIds()[resultPosition]);
+    if (inputAxis == input.getAxisIds().asArrayRef().end()) {
+      closedAxes = false;
       continue;
     }
-    if (result.getLayout().getTimeFactors()[position] !=
-            input.getLayout().getTimeFactors()[position] ||
-        result.getLayout().getLaneFactors()[position] !=
-            input.getLayout().getLaneFactors()[position] ||
-        result.getLayout().getReplicaFactors()[position] !=
-            input.getLayout().getReplicaFactors()[position] ||
-        result.getLayout().getFragmentFactors()[position] !=
-            input.getLayout().getFragmentFactors()[position] ||
-        result.getLayout().getLocalFactors()[position] !=
-            input.getLayout().getLocalFactors()[position])
-      return emitOpError(
-          "RVV issue slice changed an unrelated physical coordinate");
+    const size_t inputPosition = static_cast<size_t>(
+        inputAxis - input.getAxisIds().asArrayRef().begin());
+    closedAxes &=
+        result.getShape()[resultPosition] > 0 &&
+        input.getShape()[inputPosition] ==
+            result.getShape()[resultPosition] *
+                input.getLayout().getTimeFactors()[inputPosition] &&
+        result.getLayout().getTimeFactors()[resultPosition] == 1 &&
+        result.getLayout().getLaneFactors()[resultPosition] ==
+            input.getLayout().getLaneFactors()[inputPosition] &&
+        result.getLayout().getLaneFactors()[resultPosition] ==
+            result.getShape()[resultPosition] &&
+        result.getLayout().getReplicaFactors()[resultPosition] == 1 &&
+        result.getLayout().getFragmentFactors()[resultPosition] == 1 &&
+        result.getLayout().getLocalFactors()[resultPosition] == 1;
   }
-  if (slicedAxes < 1 ||
-      input.getLayout().getSew() != result.getLayout().getSew() ||
-      input.getLayout().getLmulEighths() !=
+  for (size_t inputPosition = 0; inputPosition < input.getAxisIds().size();
+       ++inputPosition)
+    if (!llvm::is_contained(result.getAxisIds().asArrayRef(),
+                            input.getAxisIds()[inputPosition]))
+      closedAxes &= input.getLayout().getLaneFactors()[inputPosition] == 1 &&
+                    input.getLayout().getFragmentFactors()[inputPosition] == 1 &&
+                    input.getLayout().getLocalFactors()[inputPosition] == 1;
+  if (!closedAxes || input.getLayout().getSew() != result.getLayout().getSew() ||
+      result.getLayout().getLmulEighths() <= 0 ||
+      input.getLayout().getLmulEighths() <
           result.getLayout().getLmulEighths() ||
-      input.getLayout().getVl() != result.getLayout().getVl() ||
-      input.getLayout().getRegisterGroups() !=
-          result.getLayout().getRegisterGroups())
+      input.getLayout().getLmulEighths() %
+          result.getLayout().getLmulEighths() ||
+      result.getLayout().getVl() != *resultLanes)
     return emitOpError(
-        "RVV issue slice must preserve one vector carrier while removing one or more issue-time coordinates");
+        "RVV issue slice must select one typed lane window and remove only issue-time/register coordinates");
   return mlir::success();
 }
 
@@ -6790,11 +6756,14 @@ mlir::LogicalResult RVVWidenAccumulateOp::verify() {
     auto productSeed =
         first ? first.getDefiningOp<RVVWidenMultiplyOp>()
               : RVVWidenMultiplyOp();
-    explicitChain =
-        (splatSeed && splatSeed.getOperation()->getBlock() ==
-                          getOperation()->getBlock()) ||
-        (productSeed && productSeed.getOperation()->getBlock() ==
-                            getOperation()->getBlock());
+    // A pure seed may be shared from any dominating block.  Requiring it to
+    // live beside every consumer rejects the legal CSE/LICM form where one
+    // zero vector (or one widened product) feeds several explicit partial
+    // chains in nested regions.  SSA dominance already guarantees that such a
+    // definition is available here; the closed-chain contract starts at this
+    // accumulate result, not at a block-local copy of the seed.
+    explicitChain = static_cast<bool>(splatSeed) ||
+                    static_cast<bool>(productSeed);
     mlir::Value current = getResult();
     while (explicitChain) {
       if (!current.hasOneUse()) {

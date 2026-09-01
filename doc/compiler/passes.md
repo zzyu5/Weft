@@ -174,6 +174,10 @@ accumulate/reduction leaf。nested、layered 与 scaled/reduced-scaled plan 同�
 reduction、finalization leaf 与同时存活的 resource groups；materializer 只能按这些字段创建
 operation，不能从 shape 或当前 SSA spelling 再次推断。
 
+上述 plan attributes 是第二层内部、一次 lowering 中的瞬态冻结结果。完成物化后它们必须删除；
+final verifier拒绝任何残留plan，terminal translator也不读取它们。只有单stream的closed widening-dot
+leaf可以直接保留typed topology、lane/source-part relation与exact leaf，而不保留待解释program plan。
+
 ### `FinalizeRISCVLeaves`
 
 读取 `ImplementationAttr` 与已经确定的 value carrier/SEW/operand form，为 pointwise、cast、

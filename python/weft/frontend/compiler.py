@@ -319,6 +319,36 @@ class FrontendCompiler:
         if not body.terminated:
             self._emit("weft_kernel.return", function)
 
+        unknown_alias_parameters = set(self.definition.alias_groups).difference(
+            parameter.arg for parameter in parameters
+        )
+        if unknown_alias_parameters:
+            unknown = ", ".join(sorted(unknown_alias_parameters))
+            raise FrontendError(
+                f"kernel alias_groups names unknown parameters: {unknown}",
+                self.source.location(function),
+            )
+        alias_ids: dict[str, int] = {}
+        next_alias_id = 1
+        argument_alias_sets: list[int] = []
+        for parameter, argument_type in zip(parameters, argument_types):
+            group = self.definition.alias_groups.get(parameter.arg)
+            if not isinstance(argument_type, ViewType):
+                if group is not None:
+                    raise FrontendError(
+                        f"kernel alias group applies only to View parameter {parameter.arg}",
+                        self.source.location(parameter),
+                    )
+                argument_alias_sets.append(-1)
+                continue
+            if group is None:
+                argument_alias_sets.append(0)
+                continue
+            if group not in alias_ids:
+                alias_ids[group] = next_alias_id
+                next_alias_id += 1
+            argument_alias_sets.append(alias_ids[group])
+
         kernel = self.builder.operation(
             "weft_kernel.kernel",
             self.source.location(function),
@@ -337,9 +367,7 @@ class FrontendCompiler:
                         for access in self._argument_access
                     ]
                 ),
-                "arg_alias_sets": _i64_array(
-                    [0 if isinstance(value_type_, ViewType) else -1 for value_type_ in argument_types]
-                ),
+                "arg_alias_sets": _i64_array(argument_alias_sets),
                 "shape_symbols": _strings(list(self._shape_ids)),
                 "source": _string(f"{self.source.filename}:{self.source.first_line}"),
             },

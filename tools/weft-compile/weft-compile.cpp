@@ -21,7 +21,7 @@
 namespace {
 
 llvm::cl::opt<std::string> inputFilename(
-    llvm::cl::Positional, llvm::cl::desc("<canonical Weft MLIR>"),
+    llvm::cl::Positional, llvm::cl::desc("<Weft MLIR>"),
     llvm::cl::init("-"));
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
@@ -37,6 +37,11 @@ llvm::cl::opt<std::string> matrixExtension(
     "matrix-extension",
     llvm::cl::desc("Target matrix extension: none or spacemit-ime1"),
     llvm::cl::init("none"));
+llvm::cl::opt<std::string> partialCombinePolicy(
+    "partial-combine-policy",
+    llvm::cl::desc(
+        "Target partial combine priority: independent-multilevel or sequential"),
+    llvm::cl::init("independent-multilevel"));
 llvm::cl::list<std::string> metaBindings(
     "meta", llvm::cl::desc("Auto specialization choices NAME=INTEGER[,INTEGER...]"),
     llvm::cl::ZeroOrMore);
@@ -101,6 +106,11 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sourceManager, &context);
   if (!module || mlir::failed(mlir::verify(*module)))
     return 1;
+  bool hasPhysicalProgram = false;
+  module->walk([&](mlir::Operation *operation) {
+    if (mlir::isa<weft::riscv::KernelOp>(operation))
+      hasPhysicalProgram = true;
+  });
 
   std::error_code errorCode;
   llvm::ToolOutputFile output(outputFilename, errorCode,
@@ -110,22 +120,26 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (emitKind == "kernel-ir") {
-    bool hasPhysicalProgram = false;
-    module->walk([&](mlir::Operation *operation) {
-      if (mlir::isa<weft::riscv::KernelOp>(operation))
-        hasPhysicalProgram = true;
-    });
     if (hasPhysicalProgram) {
-      llvm::errs() << "kernel-ir input cannot contain compiler-owned weft_riscv operations\n";
+      llvm::errs()
+          << "kernel-ir input cannot contain compiler-owned weft_riscv operations\n";
       return 1;
     }
     module->print(output.os());
     output.os() << '\n';
+  } else if (hasPhysicalProgram) {
+    mlir::FailureOr<weft::RISCVCompilationResult> result =
+        weft::translateRISCVModule(*module);
+    if (mlir::failed(result))
+      return 1;
+    output.os() << (emitKind == "riscv-ir" ? result->riscvIR
+                                           : result->intrinsicC);
   } else {
     weft::RISCVCompilerOptions options;
     std::string error;
-    if (!weft::parseRISCVTargetProfile(march, abi, vlenBits, matrixExtension,
-                                       options.target, error)) {
+    if (!weft::parseRISCVTargetProfile(
+            march, abi, vlenBits, matrixExtension, partialCombinePolicy,
+            options.target, error)) {
       llvm::errs() << error << '\n';
       return 1;
     }

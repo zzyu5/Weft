@@ -27,6 +27,11 @@ enum class RISCVFragmentSignedness {
   Unsigned,
 };
 
+enum class RISCVPartialCombinePolicy {
+  IndependentMultilevel,
+  Sequential,
+};
+
 struct RISCVFragmentCapability {
   RISCVFragmentInstruction instruction =
       RISCVFragmentInstruction::SpacemitIME1I8MMA;
@@ -65,6 +70,8 @@ struct RISCVTargetProfile {
   std::vector<unsigned> supportedSEW;
   std::vector<int> legalLMULEighths;
   std::vector<RISCVFragmentCapability> fragmentCapabilities;
+  RISCVPartialCombinePolicy partialCombinePolicy =
+      RISCVPartialCombinePolicy::IndependentMultilevel;
 
   bool supportsSEW(unsigned sew) const;
   bool supportsLMULEighths(int lmulEighths) const;
@@ -81,6 +88,7 @@ struct RISCVTargetProfile {
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                              int64_t vlenBits,
                              llvm::StringRef matrixExtension,
+                             llvm::StringRef partialCombinePolicy,
                              RISCVTargetProfile &profile, std::string &error);
 
 } // namespace weft

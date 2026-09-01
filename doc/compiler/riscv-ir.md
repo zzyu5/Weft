@@ -100,6 +100,8 @@ pipeline参数只有在改写成真实 guard、prologue、steady-state、epilogu
 - memory edge具有完整 descriptor、Encoding mapping、access form与leaf；
 - source Level births/handoff、ordinary control与ABI `memory_view` identity仍可验证；
 - composite、source Level op、`implementation`与未展开 schedule均已消失；
+- planner使用的partial layout/combine/nested/sequential/scaled/layered plan attributes已被真实
+  use-def、loop与local operations取代，不再是terminal translator输入；
 - every target-local terminal op具有唯一 exact [local leaf](leaves.md)；
 - register、fragment与local-storage summary不超过target profile。
 

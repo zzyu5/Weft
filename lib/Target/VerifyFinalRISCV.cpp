@@ -45,7 +45,6 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::PackedPlaneMergeOp,
       riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
       riscv::RVVBitmaskWindowLoadOp,
-      riscv::RVVGroupedMacReduceOp,
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
       riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
@@ -93,7 +92,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVBitplaneMergeOp, riscv::PackedPlaneMergeOp,
       riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
       riscv::RVVBitmaskWindowLoadOp,
-      riscv::RVVGroupedMacReduceOp, riscv::RVVGroupedMacLoadOp,
+      riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
       riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
       riscv::RVVWidenDotOp, riscv::RVVWidenMultiplyOp,
@@ -228,8 +227,7 @@ mlir::LogicalResult verifyDescriptorFacts(mlir::Operation *owner,
 }
 
 bool requiresIntegerWidening(mlir::Operation *operation) {
-  if (mlir::isa<riscv::RVVGroupedMacReduceOp,
-                riscv::RVVGroupedMacStepOp,
+  if (mlir::isa<riscv::RVVGroupedMacStepOp,
                 riscv::RVVEncodedDotStepOp,
                 riscv::RVVWidenDotOp,
                 riscv::RVVPartialSetOp,
@@ -371,13 +369,38 @@ public:
             "structural implementation anchor survived terminal leaf lowering");
         failed = true;
       }
+      for (llvm::StringRef name :
+           {"partial_layout_plan", "partial_combine_plan",
+            "nested_partial_plan", "sequential_partial_plan",
+            "scaled_partial_plan", "layered_partial_plan",
+            "partial_add_tree_plan"})
+        if (operation->hasAttr(name)) {
+          operation->emitError()
+              << "transient physical plan " << name
+              << " survived materialization";
+          failed = true;
+        }
       if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation)) {
         llvm::StringRef kind = dot.getPartialTopology().getKind();
-        if (kind != "sequential_fused" &&
-            kind != "sequential_per_stream") {
+        if (dot.getReductionStreams() != 1 ||
+            (kind != "sequential_fused" &&
+             kind != "sequential_per_stream")) {
           dot.emitError()
-              << "selected partial topology was not materialized; topology="
+              << "multi-stream partial topology was not materialized; topology="
               << dot.getPartialTopology();
+          failed = true;
+        }
+      }
+      if (mlir::isa<riscv::RVVGroupedMacLoadOp,
+                    riscv::RVVEncodedDotLoadOp>(operation)) {
+        auto loop = operation->getParentOfType<mlir::scf::ForOp>();
+        auto systemUnroll =
+            loop ? loop->getAttrOfType<mlir::StringAttr>(
+                       "weft.riscv.system_unroll")
+                 : mlir::StringAttr();
+        if (!loop || !systemUnroll || systemUnroll.getValue() != "disable") {
+          operation->emitError(
+              "final fixed-window load requires a nearest parent loop with downstream unrolling disabled");
           failed = true;
         }
       }
@@ -548,6 +571,13 @@ public:
                   : direction ? direction.getValue() : llvm::StringRef();
         if (ordered != "ascending" && ordered != "descending") {
           loop.emitError("final ordered loop has no physical direction");
+          failed = true;
+        }
+        auto systemUnroll = loop->getAttrOfType<mlir::StringAttr>(
+            "weft.riscv.system_unroll");
+        if (systemUnroll && systemUnroll.getValue() != "disable") {
+          loop.emitError(
+              "final ordered loop has an unsupported downstream-unroll contract");
           failed = true;
         }
         if (level) {
@@ -828,7 +858,6 @@ public:
             riscv::RVVSplatOp, riscv::RVVBitmaskDecodeOp,
             riscv::RVVSignedBitmaskReduceOp,
             riscv::RVVBitmaskWindowLoadOp,
-            riscv::RVVGroupedMacReduceOp,
             riscv::RVVGroupedMacStepOp,
             riscv::RVVEncodedDotStepOp, riscv::RVVLayeredRecordLoadOp,
             riscv::RVVLayeredWindowOp,

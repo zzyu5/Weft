@@ -128,6 +128,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
     "int64_t":$maxPrivateStackBytes,
     "::mlir::DenseI64ArrayAttr":$supportedSEW,
     "::mlir::DenseI64ArrayAttr":$legalLMULEighths,
+    StringRefParameter<"partial combine structural priority">:$partialCombinePolicy,
     "::mlir::ArrayAttr":$fragments
   );
   let assemblyFormat = [{
@@ -135,7 +136,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
         $hasIndexedMemory `,` $hasSegmentMemory `,` $hasWideningInteger `,`
         $hasWideningFloat `,` $vlenBits `,` $vectorRegisters `,`
         $maxPrivateStackBytes `,` $supportedSEW `,` $legalLMULEighths `,`
-        $fragments `>`
+        $partialCombinePolicy `,` $fragments `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -368,6 +369,7 @@ def WeftRISCV_ScaledPartialPlanAttr
 def WeftRISCV_SequentialPartialPlanAttr
     : WeftRISCV_Attr<"SequentialPartialPlan", "sequential_partial_plan"> {
   let parameters = (ins
+    StringRefParameter<"fused or per_stream">:$realization,
     "int64_t":$issueCount,
     "::mlir::DenseI64ArrayAttr":$reductionAxes,
     "::mlir::Type":$lhsIssueType,
@@ -375,13 +377,17 @@ def WeftRISCV_SequentialPartialPlanAttr
     "::mlir::Type":$accumulatorType,
     "::mlir::DenseI64ArrayAttr":$lhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
+    "::mlir::DenseI64ArrayAttr":$lhsLaneOffsets,
+    "::mlir::DenseI64ArrayAttr":$rhsLaneOffsets,
     StringRefParameter<"selected widened accumulate instruction">:$accumulateInstruction,
     StringRefParameter<"selected final reduction instruction">:$finalizeInstruction,
     "int64_t":$resourceGroups
   );
   let assemblyFormat = [{
-    `<` $issueCount `,` $reductionAxes `,` $lhsIssueType `,` $rhsIssueType `,`
+    `<` $realization `,` $issueCount `,` $reductionAxes `,`
+        $lhsIssueType `,` $rhsIssueType `,`
         $accumulatorType `,` $lhsSourceParts `,` $rhsSourceParts `,`
+        $lhsLaneOffsets `,` $rhsLaneOffsets `,`
         $accumulateInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
   }];
   let genVerifyDecl = 1;
@@ -1273,18 +1279,6 @@ def WeftRISCV_RVVBitmaskWindowLoadOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RVVGroupedMacReduceOp
-    : WeftRISCV_Op<"rvv_grouped_mac_reduce", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$active_terms,
-                       WeftRISCV_LayoutAttr:$load_layout,
-                       WeftRISCV_LayoutAttr:$partial_layout,
-                       DenseI64ArrayAttr:$packed_supply_for_result,
-                       WeftRISCV_GroupedMacPlanAttr:$plan,
-                       WeftRISCV_LeafAttr:$leaf);
-  let results = (outs WeftRISCV_ValueType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftRISCV_RVVGroupedMacLoadOp
     : WeftRISCV_Op<"rvv_grouped_mac_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$group_index,
@@ -1484,6 +1478,7 @@ def WeftRISCV_RVVIssueSliceOp
     : WeftRISCV_Op<"rvv_issue_slice", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        DenseI64ArrayAttr:$source_parts,
+                       DenseI64ArrayAttr:$lane_offsets,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;

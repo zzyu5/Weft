@@ -151,6 +151,30 @@ View 是带 Encoding 的内存对象。它规定：
 
 View 不等于一个已加载的 tile。对 View 做 slice 得到逻辑 region；`admit` 才把 region 供应给当前 Level。
 
+参数之间的 alias relation 是 kernel ABI 的事实，而不是允许某项优化的权限位。默认情况下，
+所有未声明的 View 参数属于同一个 may-alias 组；编译器不能假设它们互不重叠。调用方能保证
+关系时，可以在 kernel 定义上声明命名等价类：
+
+```python
+@weft.kernel(alias_groups={
+    "weights": "weights",
+    "activation": "activation",
+    "output": "output",
+})
+def gemv(
+    weights: View[Q4_K, (N, K)],
+    activation: View[Q8_K, (K,)],
+    output: View[f32, (N,)],
+):
+    ...
+```
+
+相同组名表示参数可能互相 alias；不同组名表示调用方承诺对应内存对象不重叠。省略的 View
+仍留在共同的保守组中；任一显式命名组也承诺与这个省略组不重叠。因此只命名一个参数，
+就表示它和所有未命名 View 都不重叠。alias group 不改变 View 的 Encoding、shape 或 logical axes；
+它只进入 Canonical Kernel IR 的参数合同，并原样传播到 physical memory descriptor。违反该承诺
+是调用方错误，target pass 不得自行拆分或合并组。
+
 ## 5. Base、derived family 与 derived instance
 
 三种身份必须分开：

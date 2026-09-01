@@ -67,6 +67,7 @@ bool weft::RISCVTargetProfile::supportsSegmentVectorMemory(
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                                    int64_t vlenBits,
                                    llvm::StringRef matrixExtension,
+                                   llvm::StringRef partialCombinePolicy,
                                    RISCVTargetProfile &profile,
                                    std::string &error) {
   if (march.empty()) {
@@ -203,6 +204,16 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
   profile.hasSegmentMemory = true;
   profile.hasWideningInteger = true;
   profile.hasWideningFloat = profile.hasF;
+  if (partialCombinePolicy == "independent-multilevel") {
+    profile.partialCombinePolicy =
+        RISCVPartialCombinePolicy::IndependentMultilevel;
+  } else if (partialCombinePolicy == "sequential") {
+    profile.partialCombinePolicy = RISCVPartialCombinePolicy::Sequential;
+  } else {
+    error =
+        "--partial-combine-policy must be independent-multilevel or sequential";
+    return false;
+  }
   const bool spacemitIME1 = matrixExtension == "spacemit-ime1";
   if (matrixExtension != "none" && !spacemitIME1) {
     error = "unsupported --matrix-extension value: " + matrixExtension.str();

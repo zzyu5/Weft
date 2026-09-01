@@ -1705,6 +1705,18 @@ void materializeReplicaStorageLoads(mlir::IRRewriter &rewriter,
   eraseDeadPureProducers(rewriter, replacedIndices);
 }
 
+bool hasTypedStorageMaterialization(riscv::FieldOp field) {
+  return llvm::any_of(field.getResult().getUsers(), [](mlir::Operation *user) {
+    return mlir::isa<riscv::RVVReplicaStorageLoadOp,
+                     riscv::RVVLayeredWindowOp,
+                     riscv::RVVLayeredStreamOp,
+                     riscv::RVVProjectedLayeredStreamOp,
+                     riscv::RVVLayeredRecordLoadOp,
+                     riscv::RVVLayeredStorageLoadOp,
+                     riscv::RVVStorageWindowOp>(user);
+  });
+}
+
 class ShareRISCVLayeredWindowsPass
     : public mlir::PassWrapper<ShareRISCVLayeredWindowsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -1722,6 +1734,8 @@ public:
     getOperation().walk(
         [&](riscv::FieldOp field) { fields.push_back(field); });
     for (riscv::FieldOp field : fields) {
+      if (hasTypedStorageMaterialization(field))
+        continue;
       if (materializeInterleavedReplicaField(rewriter, field))
         continue;
       if (!isLayeredStreamField(field))

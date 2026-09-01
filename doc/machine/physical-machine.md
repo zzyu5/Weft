@@ -302,7 +302,7 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 
 ### 13.3 参数性选择
 
-结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count 和 prefetch distance。target 提供有限合法域，tuner 通过实测选择；非法绑定在 emission 前拒绝。当前RISC-V compiler API只暴露unroll和pipeline depth；depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
+结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count 和 prefetch distance。target 提供有限合法域，tuner 通过实测选择；非法绑定在 emission 前拒绝。当前RISC-V compiler API暴露 LMUL、unroll 和pipeline depth；depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
 
 ## 14. Target profile
 
@@ -325,7 +325,7 @@ spill/rematerialize legality
 intrinsic / local asm availability
 ```
 
-当前 RISC-V `TargetAttr` 只物化已经有真实 consumer 的子集：ISA/ABI、显式 VLEN、32 个 vector registers、合法 SEW/LMUL、完整 `V` 的 indexed/segment/widening 能力、local-storage 上界，以及 typed IME fragment capability。当前 backend 要求完整 `V` 和显式正 VLEN；`Zve`、纯标量 target、未知 VLEN、异步 transfer/wait/barrier、独立 prefetch 域及通用 latency model 均明确不在当前实现范围。它们没有占位字段，也不能通过默认值假装可用。
+当前 RISC-V `TargetAttr` 只物化已经有真实 consumer 的子集：ISA/ABI、显式 VLEN、32 个 vector registers、合法 SEW/LMUL、完整 `V` 的 indexed/segment/widening 能力、local-storage 上界、partial-combine 固定结构优先级，以及 typed IME fragment capability。partial-combine policy 只在多个 topology 均合法时规定 `independent-multilevel` 或 `sequential` 的优先关系；它不是 source `auto`、tuner 参数或 target-name 分支。当前 backend 要求完整 `V` 和显式正 VLEN；`Zve`、纯标量 target、未知 VLEN、异步 transfer/wait/barrier、独立 prefetch 域及通用 latency model 均明确不在当前实现范围。它们没有占位字段，也不能通过默认值假装可用。
 
 换目标时可以改变这些 profile facts、规则、参数域和最终指令；不能改变：
 

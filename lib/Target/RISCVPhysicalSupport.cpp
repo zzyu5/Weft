@@ -651,6 +651,15 @@ riscv_internal::target(mlir::Builder &builder,
     sews.push_back(sew);
   for (int lmul : profile.legalLMULEighths)
     lmuls.push_back(lmul);
+  llvm::StringRef partialCombinePolicy;
+  switch (profile.partialCombinePolicy) {
+  case RISCVPartialCombinePolicy::IndependentMultilevel:
+    partialCombinePolicy = "independent-multilevel";
+    break;
+  case RISCVPartialCombinePolicy::Sequential:
+    partialCombinePolicy = "sequential";
+    break;
+  }
   for (const RISCVFragmentCapability &fragment : profile.fragmentCapabilities) {
     llvm::StringRef instruction;
     riscv::FragmentPackingAttr lhsPacking;
@@ -703,6 +712,7 @@ riscv_internal::target(mlir::Builder &builder,
       profile.hasWideningFloat,
       profile.vlenBits, profile.vectorRegisters, profile.maxPrivateStackBytes,
       integers(builder, sews), integers(builder, lmuls),
+      partialCombinePolicy,
       builder.getArrayAttr(fragments));
 }
 
