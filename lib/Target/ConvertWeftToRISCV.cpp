@@ -955,6 +955,7 @@ private:
     state.addAttribute("vector_register_peak", builder.getI64IntegerAttr(0));
     state.addAttribute("fragment_register_peak", builder.getI64IntegerAttr(0));
     state.addAttribute("local_storage_bytes", builder.getI64IntegerAttr(0));
+    state.addAttribute("resources_materialized", builder.getBoolAttr(false));
     state.addRegion();
     mlir::Operation *rawKernel = builder.create(state);
     riscv_internal::copyOrigin(source, rawKernel);

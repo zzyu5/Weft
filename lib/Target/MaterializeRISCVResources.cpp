@@ -365,6 +365,8 @@ public:
     mlir::IRRewriter rewriter(&getContext());
     bool failed = false;
     for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>()) {
+      if (kernel.getResourcesMaterialized())
+        continue;
       int64_t spillIdentity = 1;
       unsigned materializableValues = 0;
       kernel.walk([&](mlir::Operation *operation) {
@@ -529,6 +531,8 @@ public:
         kernel.emitError(
             "resource materialization exhausted every physical SSA spill candidate");
         failed = true;
+      } else if (closed) {
+        kernel.setResourcesMaterialized(true);
       }
     }
     if (failed)

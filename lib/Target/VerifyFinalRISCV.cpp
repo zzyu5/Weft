@@ -675,6 +675,11 @@ public:
       }
     });
     for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>()) {
+      if (!kernel.getResourcesMaterialized()) {
+        kernel.emitError(
+            "final physical program has no closed resource materialization contract");
+        failed = true;
+      }
       for (mlir::BlockArgument argument : kernel.getBody().front().getArguments()) {
         if (!mlir::isa<riscv::MemDescType>(argument.getType()))
           continue;

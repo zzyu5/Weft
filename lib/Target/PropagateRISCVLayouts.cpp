@@ -301,6 +301,52 @@ bool layoutPreservingPointwise(mlir::Operation *operation) {
                    riscv::ConvertLayoutOp, riscv::MaterializeOp>(operation);
 }
 
+bool preservesExistingAxes(mlir::Type sourceType, mlir::Type resultType) {
+  auto source = mlir::dyn_cast<riscv::ValueType>(sourceType);
+  auto result = mlir::dyn_cast<riscv::ValueType>(resultType);
+  if (!source || !result)
+    return false;
+  for (auto [position, axis] :
+       llvm::enumerate(source.getAxisIds().asArrayRef())) {
+    auto found = llvm::find(result.getAxisIds().asArrayRef(), axis);
+    if (found == result.getAxisIds().asArrayRef().end() ||
+        source.getShape()[position] !=
+            result.getShape()[static_cast<size_t>(
+                found - result.getAxisIds().asArrayRef().begin())])
+      return false;
+  }
+  return true;
+}
+
+bool feedsExpandedIndexedLookup(mlir::Value root) {
+  auto rootType = mlir::dyn_cast<riscv::ValueType>(root.getType());
+  if (!rootType || rootType.getAxisIds().size() != 1)
+    return false;
+  llvm::SmallVector<mlir::Value> worklist{root};
+  llvm::SmallPtrSet<mlir::Operation *, 32> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    for (mlir::OpOperand &use : value.getUses()) {
+      mlir::Operation *user = use.getOwner();
+      if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(user)) {
+        auto indices = mlir::dyn_cast<riscv::ValueType>(
+            lookup.getIndices().getType());
+        if (use.getOperandNumber() == 1 && indices &&
+            indices.getAxisIds().size() > rootType.getAxisIds().size() &&
+            preservesExistingAxes(root.getType(), indices))
+          return true;
+        continue;
+      }
+      if (!layoutPreservingPointwise(user) || user->getNumResults() != 1 ||
+          !visited.insert(user).second ||
+          !preservesExistingAxes(value.getType(), user->getResult(0).getType()))
+        continue;
+      worklist.push_back(user->getResult(0));
+    }
+  }
+  return false;
+}
+
 std::optional<int64_t>
 downstreamImmediateReducedFreeAxis(mlir::Operation *contraction,
                                    llvm::ArrayRef<int64_t> reductionAxes) {
@@ -809,12 +855,14 @@ Roles rolesFor(mlir::Value value) {
   if (mlir::isa<kernel::EncodingType>(element))
     return roles;
 
-  // A storage-facing carrier is authoritative only when this exact shaped
-  // value (through shape-preserving pointwise uses) supplies a widening
-  // contraction.  Scale/index side values can have an equally valid affine
-  // storage order but a different downstream reduction carrier; anchoring
-  // those here would make storage order override the consumer relation.
-  if (auto storage = storageRolesFor(value))
+  // A storage-facing carrier is authoritative when this exact shaped value
+  // supplies either a widening contraction or an indexed lookup.  The latter
+  // may add broadcast axes while preserving every source axis: those existing
+  // axes still have to arrive in lanes so the lookup index is not rebuilt from
+  // a scalar tuple at every issue.  This remains narrower than treating every
+  // affine scale/index value as a contraction anchor.
+  if (auto storage =
+          storageRolesFor(value, !feedsExpandedIndexedLookup(value)))
     return *storage;
 
   if (value.getDefiningOp<riscv::FieldOp>()) {

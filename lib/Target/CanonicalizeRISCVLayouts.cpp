@@ -27,9 +27,7 @@ bool isPureRepresentationConversion(riscv::ConvertLayoutOp conversion) {
 
 bool hasFinalResourceContract(riscv::ConvertLayoutOp conversion) {
   auto kernel = conversion->getParentOfType<riscv::KernelOp>();
-  return kernel && kernel->hasAttr("vector_register_peak") &&
-         kernel->hasAttr("fragment_register_peak") &&
-         kernel->hasAttr("local_storage_bytes");
+  return kernel && kernel.getResourcesMaterialized();
 }
 
 class CanonicalizeRISCVLayoutsPass

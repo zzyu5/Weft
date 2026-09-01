@@ -827,7 +827,8 @@ def WeftRISCV_KernelOp
                        DenseI64ArrayAttr:$parameter_values,
                        I64Attr:$vector_register_peak,
                        I64Attr:$fragment_register_peak,
-                       I64Attr:$local_storage_bytes);
+                       I64Attr:$local_storage_bytes,
+                       BoolAttr:$resources_materialized);
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
 }

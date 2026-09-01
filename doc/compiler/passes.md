@@ -84,6 +84,11 @@ pointwise、state 与 control handoff 的要求不一致时，pass 插入真实 
 `for/if/while` 的 carried/result types 同时被改写。无法保持 logical axes 或无合法 LMUL 时
 失败，不通过静默 scalarization 继续。
 
+若一个单轴 encoded metadata value 经保持既有 axis 的 pointwise 链扩展成 lookup index，
+原 metadata axis 的 storage-contiguous carrier 仍沿 use-def 保留；新加的 entry/payload axis
+由 lookup relation 决定。该规则只接受保持原 axis extent 的 typed 链，不能把任意 affine
+storage proposal 当成 contraction carrier。
+
 ### `PlanRISCVMemory`
 
 读取 `MemDescType`、Encoding field mapping 和 value layout，为每条 memory edge写入
@@ -194,6 +199,11 @@ operand/result resource groups写实。资源超限时，只对同一 block 内�
 `ValueType` 插入显式 local slot、`spill` 和各 use-site `reload`；fragment spill、跨 block spill
 和任意 pure-producer rematerialization尚未实现时判当前 module非法。
 
+kernel 创建时 `resources_materialized=false`；只有资源分析、必要 spill 与峰值汇总全部闭合后，
+本 pass 才把它设为 `true`。初始化为零的 peak 不是闭合证据。layout canonicalization 仅在该
+marker 为 `false` 时允许改变 producer lifetime 的 backward rematerialization；marker 为
+`true` 后只能做不改变资源合同的等价 conversion CSE。本 pass 对已经闭合的 kernel 幂等跳过。
+
 动态 local object必须紧邻一个 typed `local_capacity_guard`。guard给出 target-bounded byte
 上界，kernel resource summary按上界计算；缺少闭合上界时拒绝生成 C VLA。
 
@@ -201,7 +211,8 @@ operand/result resource groups写实。资源超限时，只对同一 block 内�
 
 最终 verifier 拒绝：残留 canonical op、非 terminal RISC-V op、`unassigned` layout/access、
 `implementation`、未展开 schedule、未选 leaf、丢失 Level birth/handoff、绕过 runtime
-`memory_view` 的 ABI edge，以及超出 target 的 register/fragment/local-storage 使用。
+`memory_view` 的 ABI edge、`resources_materialized=false`，以及超出 target 的
+register/fragment/local-storage 使用。
 
 operation/type verifier继续检查 logical domain、axis projection、Encoding field、conversion、
 window、fragment role/packing和 exact leaf之间的局部合同；final verifier还把descriptor
