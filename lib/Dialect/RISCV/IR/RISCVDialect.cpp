@@ -408,6 +408,10 @@ LoadOp sourceLoad(mlir::Value value) {
       value = extract.getInput();
       continue;
     }
+    if (auto pack = mlir::dyn_cast<EncodedLocalBindOp>(definition)) {
+      value = pack.getInput();
+      continue;
+    }
     if (auto pack = mlir::dyn_cast<EncodedLocalPackOp>(definition)) {
       value = pack.getInput();
       continue;
@@ -862,6 +866,8 @@ int64_t localPackInterleaveRows(mlir::Value owner) {
     mlir::Operation *definition = owner.getDefiningOp();
     if (!definition || !visited.insert(definition).second)
       return 0;
+    if (auto pack = mlir::dyn_cast<EncodedLocalBindOp>(definition))
+      return pack.getPlan().getInterleaveRows();
     if (auto pack = mlir::dyn_cast<EncodedLocalPackOp>(definition))
       return pack.getPlan().getInterleaveRows();
     if (auto extract = mlir::dyn_cast<ExtractOp>(definition)) {
@@ -2338,33 +2344,33 @@ mlir::LogicalResult WindowType::verify(
   if (lhsReduction > 0 && rhsReduction > 0 && lhsReduction != rhsReduction)
     return emitError()
            << "operand window reduction-axis extents must agree";
-  llvm::SmallVector<int64_t> expectedFreeAxes;
-  llvm::SmallVector<int64_t> expectedFreeShape;
-  auto appendFree = [&](ValueType value) -> mlir::LogicalResult {
+  llvm::DenseMap<int64_t, int64_t> freeExtents;
+  auto collectFree = [&](ValueType value) -> mlir::LogicalResult {
     for (auto [axis, extent] : llvm::zip(value.getAxisIds().asArrayRef(),
                                         value.getShape().asArrayRef())) {
       if (axis == reductionAxis)
         continue;
-      auto found = llvm::find(expectedFreeAxes, axis);
-      if (found == expectedFreeAxes.end()) {
-        expectedFreeAxes.push_back(axis);
-        expectedFreeShape.push_back(extent);
+      auto [found, inserted] = freeExtents.try_emplace(axis, extent);
+      if (inserted)
         continue;
-      }
-      size_t position =
-          static_cast<size_t>(found - expectedFreeAxes.begin());
-      if (expectedFreeShape[position] != extent)
+      if (found->second != extent)
         return emitError()
                << "operand window operands disagree on a shared free-axis extent";
     }
     return mlir::success();
   };
-  if (failed(appendFree(lhs)) || failed(appendFree(rhs)))
+  if (failed(collectFree(lhs)) || failed(collectFree(rhs)))
     return mlir::failure();
-  if (!llvm::equal(expectedFreeAxes, result.getAxisIds().asArrayRef()) ||
-      !llvm::equal(expectedFreeShape, result.getShape().asArrayRef()))
+  if (freeExtents.size() != result.getAxisIds().size())
     return emitError()
-           << "operand window result must preserve ordered free logical axes and extents";
+           << "operand window result must preserve every free logical axis";
+  for (auto [axis, extent] : llvm::zip(result.getAxisIds().asArrayRef(),
+                                      result.getShape().asArrayRef())) {
+    auto found = freeExtents.find(axis);
+    if (found == freeExtents.end() || found->second != extent)
+      return emitError()
+             << "operand window result must preserve each free-axis extent in its result order";
+  }
   if (partialLayout.getAxisIds() != lhs.getAxisIds() &&
       partialLayout.getAxisIds() != result.getAxisIds())
     return emitError()
@@ -4151,6 +4157,107 @@ mlir::LogicalResult EncodedLocalPackOp::verify() {
       getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
     return emitOpError(
         "encoded local pack requires one allocated, lifetime-owned interleaved record view");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult IndexMultipleGuardOp::verify() {
+  if (getMultiple() <= 0 ||
+      !exactLeaf(getLeaf(), "scalar", "index-guard",
+                 "scalar.index-multiple-guard", "none", "exact") ||
+      getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
+      getLeaf().getTemporaryGroups() != 0 ||
+      getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "index multiple guard requires one positive exact scalar divisibility contract");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult EncodedLocalBindOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  LocalType storage = getStorage().getType();
+  LocalPackPlanAttr plan = getPlan();
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(input.getElementType());
+  auto representedExtent = [&](ValueType value,
+                               int64_t axis) -> std::optional<int64_t> {
+    auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
+    if (found == value.getAxisIds().asArrayRef().end())
+      return std::nullopt;
+    const size_t position = static_cast<size_t>(
+        found - value.getAxisIds().asArrayRef().begin());
+    int64_t extent = 1;
+    for (mlir::DenseI64ArrayAttr factors : {
+             value.getLayout().getTimeFactors(),
+             value.getLayout().getLaneFactors(),
+             value.getLayout().getReplicaFactors(),
+             value.getLayout().getFragmentFactors(),
+             value.getLayout().getLocalFactors()}) {
+      const int64_t factor = factors[position];
+      if (factor <= 0 ||
+          extent > std::numeric_limits<int64_t>::max() / factor)
+        return std::nullopt;
+      extent *= factor;
+    }
+    return extent;
+  };
+  auto rowExtent = representedExtent(result, plan.getRowAxis());
+  auto recordExtent = representedExtent(result, plan.getRecordAxis());
+  if (!encoding || encoding.getKind() != "base" ||
+      !sameLogicalDomain(input, result) ||
+      input.getElementType() != result.getElementType() ||
+      result.getLayout().getCarrier() != "local" ||
+      storage.getPurpose() != "pack" ||
+      storage.getElementType() != result.getElementType() ||
+      storage.getShape() != result.getShape() ||
+      storage.getAxisIds() != result.getAxisIds() ||
+      storage.getSizeBytes() != plan.getLocalBytes() ||
+      !rowExtent || !recordExtent || *rowExtent <= 0 || *recordExtent <= 0 ||
+      *rowExtent % plan.getInterleaveRows() ||
+      *recordExtent % plan.getRecordElements() ||
+      !getStorage().getDefiningOp<LocalAllocOp>())
+    return emitOpError(
+        "encoded local bind requires one complete allocated interleaved record view");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVEncodedLocalPackTransferOp::verify() {
+  ValueType input = getInput().getType();
+  LocalType storage = getStorage().getType();
+  LocalPackPlanAttr plan = getPlan();
+  LayoutAttr transfer = getTransferLayout();
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(input.getElementType());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  const bool transferLayout =
+      kernel && transfer && transfer.getCarrier() == "rvv" &&
+      transfer.getAxisIds().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({plan.getRowAxis()}) &&
+      transfer.getTimeFactors().asArrayRef() == llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getLaneFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({plan.getInterleaveRows()}) &&
+      transfer.getReplicaFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getFragmentFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getLocalFactors().asArrayRef() ==
+          llvm::ArrayRef<int64_t>({1}) &&
+      transfer.getSew() == 8 && transfer.getLmulEighths() == 8 &&
+      transfer.getVl() == plan.getInterleaveRows() &&
+      transfer.getRegisterGroups() == 1 &&
+      supportsRVVLayout(kernel.getTarget(), transfer);
+  if (!encoding || encoding.getKind() != "base" ||
+      storage.getPurpose() != "pack" ||
+      storage.getElementType() != input.getElementType() ||
+      storage.getShape() != input.getShape() ||
+      storage.getAxisIds() != input.getAxisIds() ||
+      storage.getSizeBytes() != plan.getLocalBytes() ||
+      !getStorage().getDefiningOp<LocalAllocOp>() || !transferLayout ||
+      !exactLeaf(getLeaf(), "transfer", "local-pack-transfer",
+                 "rvv.local-pack.transfer.interleave", "none", "exact") ||
+      getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
+      getLeaf().getTemporaryGroups() != transfer.getRegisterGroups() ||
+      getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "encoded local pack transfer requires one exact interleaved byte-window copy");
   return verifyLeafOperation(*this);
 }
 

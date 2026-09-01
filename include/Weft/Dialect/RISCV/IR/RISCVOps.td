@@ -1165,6 +1165,37 @@ def WeftRISCV_EncodedLocalPackOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_IndexMultipleGuardOp
+    : WeftRISCV_Op<"index_multiple_guard"> {
+  let arguments = (ins Index:$value, I64Attr:$multiple,
+                       WeftRISCV_LeafAttr:$leaf);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_EncodedLocalBindOp
+    : WeftRISCV_Op<"encoded_local_bind", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       WeftRISCV_LocalType:$storage,
+                       Index:$block_count,
+                       WeftRISCV_LocalPackPlanAttr:$plan);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVEncodedLocalPackTransferOp
+    : WeftRISCV_Op<"rvv_encoded_local_pack_transfer",
+                   [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       WeftRISCV_LocalType:$storage,
+                       Index:$row_group, Index:$row_base,
+                       Index:$block, Index:$block_count,
+                       Index:$byte, Index:$transfer_vl,
+                       WeftRISCV_LocalPackPlanAttr:$plan,
+                       WeftRISCV_LayoutAttr:$transfer_layout,
+                       WeftRISCV_LeafAttr:$leaf);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_SpillOp
     : WeftRISCV_Op<"spill", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$input, WeftRISCV_LocalType:$slot,

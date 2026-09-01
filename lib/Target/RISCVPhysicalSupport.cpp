@@ -1013,6 +1013,8 @@ int64_t riscv_internal::interleaveRows(mlir::Operation *operation,
     mlir::Operation *definition = owner.getDefiningOp();
     if (!definition || !visited.insert(definition).second)
       break;
+    if (auto pack = mlir::dyn_cast<riscv::EncodedLocalBindOp>(definition))
+      return pack.getPlan().getInterleaveRows();
     if (auto pack = mlir::dyn_cast<riscv::EncodedLocalPackOp>(definition))
       return pack.getPlan().getInterleaveRows();
     if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
@@ -1464,6 +1466,11 @@ riscv::LoadOp riscv_internal::sourceLoad(mlir::Value value) {
       return load;
     if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition)) {
       value = extract.getInput();
+      continue;
+    }
+    if (auto pack =
+            mlir::dyn_cast_or_null<riscv::EncodedLocalBindOp>(definition)) {
+      value = pack.getInput();
       continue;
     }
     if (auto pack =

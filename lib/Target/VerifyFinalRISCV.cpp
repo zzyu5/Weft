@@ -37,7 +37,8 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::LocalAllocOp, riscv::LocalCapacityGuardOp,
       riscv::LocalBindOp, riscv::LocalLoadOp,
       riscv::LocalStoreOp, riscv::RVVLocalMaterializeOp,
-      riscv::EncodedLocalPackOp,
+      riscv::IndexMultipleGuardOp, riscv::EncodedLocalBindOp,
+      riscv::RVVEncodedLocalPackTransferOp,
       riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
       riscv::RegisterMaterializeOp,
@@ -85,7 +86,8 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::Fold2Op, riscv::LookupOp, riscv::RVVIndexedEntryLoadOp,
       riscv::ConvertLayoutOp,
       riscv::LocalCapacityGuardOp, riscv::LocalLoadOp, riscv::LocalStoreOp,
-      riscv::RVVLocalMaterializeOp, riscv::EncodedLocalPackOp,
+      riscv::RVVLocalMaterializeOp, riscv::IndexMultipleGuardOp,
+      riscv::RVVEncodedLocalPackTransferOp,
       riscv::SpillOp, riscv::ReloadOp,
       riscv::IMEPackOp,
       riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
@@ -633,7 +635,7 @@ public:
                       .getType()
                       .getBirthId());
             if (auto staged =
-                    mlir::dyn_cast<riscv::EncodedLocalPackOp>(nested);
+                    mlir::dyn_cast<riscv::EncodedLocalBindOp>(nested);
                 staged) {
               auto storage = staged.getStorage().getType();
               if (storage.getOwnerDomainId() == level.getDomainId())

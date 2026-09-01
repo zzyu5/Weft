@@ -588,7 +588,11 @@ private:
   mlir::LogicalResult
   compileRVVLocalMaterialize(riscv::RVVLocalMaterializeOp operation);
   mlir::LogicalResult
-  compileEncodedLocalPack(riscv::EncodedLocalPackOp operation);
+  compileIndexMultipleGuard(riscv::IndexMultipleGuardOp operation);
+  mlir::LogicalResult
+  compileEncodedLocalBind(riscv::EncodedLocalBindOp operation);
+  mlir::LogicalResult compileRVVEncodedLocalPackTransfer(
+      riscv::RVVEncodedLocalPackTransferOp operation);
   mlir::LogicalResult compileSpill(riscv::SpillOp operation);
   mlir::LogicalResult compileReload(riscv::ReloadOp operation);
   mlir::LogicalResult compileIMEPack(riscv::IMEPackOp operation);
@@ -2113,6 +2117,16 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     bindings[result] = scalar(expression);
     return mlir::success();
   };
+  auto bindIndexExpression = [&](mlir::Value result,
+                                 std::string expression) {
+    if (result.hasOneUse()) {
+      bindings[result] = scalar(expression);
+      return;
+    }
+    std::string name = fresh("index_value");
+    line("const size_t " + name + " = (size_t)(" + expression + ");");
+    bindings[result] = scalar(name);
+  };
   if (auto symbol = mlir::dyn_cast<riscv::SymbolOp>(operation)) {
     if (auto binding = autoBindings.find(symbol.getName());
         binding != autoBindings.end()) {
@@ -2169,7 +2183,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     Binding rhs = bindings.lookup(ceil.getRhs());
     if (lhs.kind != Binding::Kind::Scalar || rhs.kind != Binding::Kind::Scalar)
       return fail(ceil, "ceildiv operands require scalar index values");
-    bindings[ceil.getResult()] = scalar(
+    bindIndexExpression(
+        ceil.getResult(),
         "((" + lhs.scalar + " + " + rhs.scalar + " - 1) / " + rhs.scalar + ")");
     return mlir::success();
   }
@@ -2180,8 +2195,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     Binding rhs = bindings.lookup(rhsValue);
     if (lhs.kind != Binding::Kind::Scalar || rhs.kind != Binding::Kind::Scalar)
       return fail(&operation, "physical index arithmetic requires scalar values");
-    bindings[result] =
-        scalar("(" + lhs.scalar + " " + symbol.str() + " " + rhs.scalar + ")");
+    bindIndexExpression(
+        result, "(" + lhs.scalar + " " + symbol.str() + " " + rhs.scalar + ")");
     return mlir::success();
   };
   if (auto add = mlir::dyn_cast<mlir::arith::AddIOp>(operation))
@@ -2206,9 +2221,10 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     Binding rhs = bindings.lookup(minimum.getRhs());
     if (lhs.kind != Binding::Kind::Scalar || rhs.kind != Binding::Kind::Scalar)
       return fail(minimum, "physical index minimum requires scalar values");
-    bindings[minimum.getResult()] =
-        scalar("((" + lhs.scalar + " < " + rhs.scalar + ") ? " + lhs.scalar +
-               " : " + rhs.scalar + ")");
+    bindIndexExpression(
+        minimum.getResult(),
+        "((" + lhs.scalar + " < " + rhs.scalar + ") ? " + lhs.scalar +
+            " : " + rhs.scalar + ")");
     return mlir::success();
   }
   if (auto compare = mlir::dyn_cast<mlir::arith::CmpIOp>(operation)) {
@@ -2295,8 +2311,13 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto materialize =
           mlir::dyn_cast<riscv::RVVLocalMaterializeOp>(operation))
     return compileRVVLocalMaterialize(materialize);
-  if (auto pack = mlir::dyn_cast<riscv::EncodedLocalPackOp>(operation))
-    return compileEncodedLocalPack(pack);
+  if (auto guard = mlir::dyn_cast<riscv::IndexMultipleGuardOp>(operation))
+    return compileIndexMultipleGuard(guard);
+  if (auto binding = mlir::dyn_cast<riscv::EncodedLocalBindOp>(operation))
+    return compileEncodedLocalBind(binding);
+  if (auto transfer =
+          mlir::dyn_cast<riscv::RVVEncodedLocalPackTransferOp>(operation))
+    return compileRVVEncodedLocalPackTransfer(transfer);
   if (auto spill = mlir::dyn_cast<riscv::SpillOp>(operation))
     return compileSpill(spill);
   if (auto reload = mlir::dyn_cast<riscv::ReloadOp>(operation))
@@ -6984,98 +7005,33 @@ mlir::LogicalResult Emitter::compileRVVLocalMaterialize(
   return mlir::success();
 }
 
-mlir::LogicalResult
-Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
+mlir::LogicalResult Emitter::compileIndexMultipleGuard(
+    riscv::IndexMultipleGuardOp operation) {
   if (instructionOf(operation.getOperation()) !=
-      "rvv.local-pack.interleave")
-    return fail(operation, "encoded local pack has no exact selected leaf");
+      "scalar.index-multiple-guard")
+    return fail(operation, "index multiple guard has no exact selected leaf");
+  Binding value = bindings.lookup(operation.getValue());
+  if (value.kind != Binding::Kind::Scalar || operation.getMultiple() <= 0)
+    return fail(operation,
+                "index multiple guard requires one scalar value and positive divisor");
+  line("if (((size_t)(" + value.scalar + ") % " +
+       std::to_string(operation.getMultiple()) + ") != 0) __builtin_trap();");
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileEncodedLocalBind(riscv::EncodedLocalBindOp operation) {
   Binding source = bindings.lookup(operation.getInput());
   Binding storage = bindings.lookup(operation.getStorage());
-  Binding rowPoint = bindings.lookup(operation.getRowPoint());
-  Binding recordPoint = bindings.lookup(operation.getRecordPoint());
+  Binding blocks = bindings.lookup(operation.getBlockCount());
   riscv::LocalPackPlanAttr plan = operation.getPlan();
-  auto rowStride = llvm::find_if(
-      source.recordByteStrides,
-      [&](const auto &entry) { return entry.first == plan.getRowAxis(); });
   if (source.kind != Binding::Kind::Record || source.interleaveRows != 0 ||
       source.recordElements != plan.getRecordElements() ||
       source.recordStrideBytes != plan.getRecordBytes() ||
-      rowStride == source.recordByteStrides.end() ||
       storage.kind != Binding::Kind::LocalArray || storage.scalar.empty() ||
-      rowPoint.kind != Binding::Kind::Point ||
-      recordPoint.kind != Binding::Kind::Point)
+      blocks.kind != Binding::Kind::Scalar)
     return fail(operation,
-                "encoded local pack has no complete source, storage, and point bindings");
-
-  const std::string rowGroups = fresh("pack_row_groups");
-  const std::string blocks = fresh("pack_blocks");
-  const std::string rowGroup = fresh("pack_row_group");
-  const std::string block = fresh("pack_block");
-  const std::string byte = fresh("pack_byte");
-  const std::string rowBase = fresh("pack_row_base");
-  const std::string transferVL = fresh("pack_vl");
-  const std::string transferSuffix =
-      "u8" + lmulSpelling(operation.getTransferLayout().getLmulEighths());
-  const std::string transferType =
-      "vuint8" + lmulSpelling(operation.getTransferLayout().getLmulEighths()) +
-      "_t";
-  line("const size_t " + rowGroups + " = ((size_t)(" + rowPoint.point.active +
-       ") + " + std::to_string(plan.getInterleaveRows() - 1) + ") / " +
-       std::to_string(plan.getInterleaveRows()) + ";");
-  line("if (((size_t)(" + recordPoint.point.active + ") % " +
-       std::to_string(plan.getRecordElements()) + ") != 0) __builtin_trap();");
-  line("const size_t " + blocks + " = (size_t)(" + recordPoint.point.active +
-       ") / " + std::to_string(plan.getRecordElements()) + ";");
-  line("for (size_t " + rowGroup + " = 0; " + rowGroup + " < " + rowGroups +
-       "; ++" + rowGroup + ") {");
-  ++indent;
-  line("const size_t " + rowBase + " = " + rowGroup + " * " +
-       std::to_string(plan.getInterleaveRows()) + ";");
-  line("const size_t " + transferVL + " = ((size_t)(" +
-       rowPoint.point.active + ") - " + rowBase + " < " +
-       std::to_string(plan.getInterleaveRows()) + ") ? ((size_t)(" +
-       rowPoint.point.active + ") - " + rowBase + ") : " +
-       std::to_string(plan.getInterleaveRows()) + ";");
-  line("for (size_t " + block + " = 0; " + block + " < " + blocks + "; ++" +
-       block + ") {");
-  ++indent;
-  line("for (size_t " + byte + " = 0; " + byte + " < " +
-       std::to_string(plan.getRecordBytes()) + "; ++" + byte + ") {");
-  ++indent;
-  const std::string sourceAddress =
-      source.recordPointer + " + " + rowBase + " * (" + rowStride->second +
-      ") + " + block + " * " + std::to_string(plan.getRecordBytes()) +
-      " + " + byte;
-  const std::string targetAddress =
-      "(((" + rowGroup + " * " + blocks + " + " + block + ") * " +
-      std::to_string(plan.getRecordBytes()) + " + " + byte + ") * " +
-      std::to_string(plan.getInterleaveRows()) + ")";
-  const std::string packed = fresh("pack_bytes");
-  line(transferType + " " + packed + " = __riscv_vlse8_v_" +
-       transferSuffix + "((const uint8_t *)(" + sourceAddress +
-       "), (ptrdiff_t)(" + rowStride->second + "), " + transferVL + ");");
-  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
-       " + " + targetAddress + "), " + packed + ", " + transferVL + ");");
-  line("if (" + transferVL + " < " +
-       std::to_string(plan.getInterleaveRows()) + ") {");
-  ++indent;
-  const std::string tail = fresh("pack_tail");
-  const std::string zeros = fresh("pack_zeros");
-  line("const size_t " + tail + " = " +
-       std::to_string(plan.getInterleaveRows()) + " - " + transferVL + ";");
-  line(transferType + " " + zeros + " = __riscv_vmv_v_x_" + transferSuffix +
-       "(0, " + tail + ");");
-  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
-       " + " + targetAddress + " + " + transferVL + "), " + zeros + ", " +
-       tail + ");");
-  --indent;
-  line("}");
-  --indent;
-  line("}");
-  --indent;
-  line("}");
-  --indent;
-  line("}");
+                "encoded local bind has no complete source, storage, and block-count bindings");
 
   Binding result;
   result.kind = Binding::Kind::Record;
@@ -7087,10 +7043,85 @@ Emitter::compileEncodedLocalPack(riscv::EncodedLocalPackOp operation) {
       plan.getRecordBytes() * plan.getInterleaveRows();
   result.recordGroupAxis = plan.getRowAxis();
   result.recordByteStrides.emplace_back(
-      plan.getRowAxis(),
-      "(" + blocks + " * " + std::to_string(plan.getRecordBytes()) + ")");
+      plan.getRowAxis(), "((" + blocks.scalar + ") * " +
+                             std::to_string(plan.getRecordBytes()) + ")");
   result.recordOrigins = source.recordOrigins;
   bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVEncodedLocalPackTransfer(
+    riscv::RVVEncodedLocalPackTransferOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "rvv.local-pack.transfer.interleave")
+    return fail(operation,
+                "encoded local pack transfer has no exact selected leaf");
+  Binding source = bindings.lookup(operation.getInput());
+  Binding storage = bindings.lookup(operation.getStorage());
+  Binding rowGroup = bindings.lookup(operation.getRowGroup());
+  Binding rowBase = bindings.lookup(operation.getRowBase());
+  Binding block = bindings.lookup(operation.getBlock());
+  Binding blocks = bindings.lookup(operation.getBlockCount());
+  Binding byte = bindings.lookup(operation.getByte());
+  Binding transferVL = bindings.lookup(operation.getTransferVl());
+  riscv::LocalPackPlanAttr plan = operation.getPlan();
+  auto rowStride = llvm::find_if(
+      source.recordByteStrides,
+      [&](const auto &entry) { return entry.first == plan.getRowAxis(); });
+  if (source.kind != Binding::Kind::Record || source.interleaveRows != 0 ||
+      source.recordElements != plan.getRecordElements() ||
+      source.recordStrideBytes != plan.getRecordBytes() ||
+      rowStride == source.recordByteStrides.end() ||
+      storage.kind != Binding::Kind::LocalArray || storage.scalar.empty() ||
+      rowGroup.kind != Binding::Kind::Scalar ||
+      rowBase.kind != Binding::Kind::Scalar ||
+      block.kind != Binding::Kind::Scalar ||
+      blocks.kind != Binding::Kind::Scalar ||
+      byte.kind != Binding::Kind::Scalar ||
+      transferVL.kind != Binding::Kind::Scalar)
+    return fail(operation,
+                "encoded local pack transfer has incomplete typed coordinates");
+
+  const std::string transferSuffix =
+      "u8" + lmulSpelling(operation.getTransferLayout().getLmulEighths());
+  const std::string transferType =
+      "vuint8" + lmulSpelling(operation.getTransferLayout().getLmulEighths()) +
+      "_t";
+  const std::string transferVLName = fresh("pack_vl");
+  line("const size_t " + transferVLName + " = (size_t)(" +
+       transferVL.scalar + ");");
+  const std::string sourceAddress =
+      source.recordPointer + " + (" + rowBase.scalar + ") * (" +
+      rowStride->second + ") + (" + block.scalar + ") * " +
+      std::to_string(plan.getRecordBytes()) + " + (" + byte.scalar + ")";
+  const std::string targetAddress =
+      "((((" + rowGroup.scalar + ") * (" + blocks.scalar + ") + (" +
+      block.scalar + ")) * " + std::to_string(plan.getRecordBytes()) +
+      " + (" + byte.scalar + ")) * " +
+      std::to_string(plan.getInterleaveRows()) + ")";
+  const std::string packed = fresh("pack_bytes");
+  line(transferType + " " + packed + " = __riscv_vlse8_v_" +
+       transferSuffix + "((const uint8_t *)(" + sourceAddress +
+       "), (ptrdiff_t)(" + rowStride->second + "), " + transferVLName +
+       ");");
+  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
+       " + " + targetAddress + "), " + packed + ", " + transferVLName +
+       ");");
+  line("if (" + transferVLName + " < " +
+       std::to_string(plan.getInterleaveRows()) + ") {");
+  ++indent;
+  const std::string tail = fresh("pack_tail");
+  const std::string zeros = fresh("pack_zeros");
+  line("const size_t " + tail + " = " +
+       std::to_string(plan.getInterleaveRows()) + " - " + transferVLName +
+       ";");
+  line(transferType + " " + zeros + " = __riscv_vmv_v_x_" + transferSuffix +
+       "(0, " + tail + ");");
+  line("__riscv_vse8_v_" + transferSuffix + "((uint8_t *)(" + storage.scalar +
+       " + " + targetAddress + " + " + transferVLName + "), " + zeros +
+       ", " + tail + ");");
+  --indent;
+  line("}");
   return mlir::success();
 }
 
