@@ -120,6 +120,7 @@ class Q4_K:
 @weft.encoding
 class Q5_K:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     dmin: f16
@@ -142,6 +143,7 @@ class Q6_K:
 @weft.encoding
 class IQ1_S:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u8[32]
@@ -160,6 +162,7 @@ class IQ1_M:
 @weft.encoding
 class IQ2_S:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u8[32]
@@ -171,6 +174,7 @@ class IQ2_S:
 @weft.encoding
 class IQ2_XS:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u16[32]
@@ -180,6 +184,7 @@ class IQ2_XS:
 @weft.encoding
 class IQ2_XXS:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u16[32]
@@ -204,6 +209,7 @@ class I8X4:
 @weft.encoding
 class IQ3_S:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u8[64]
@@ -215,6 +221,7 @@ class IQ3_S:
 @weft.encoding
 class IQ3_XXS:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     d: f16
     q: u8[96]
@@ -243,6 +250,7 @@ class IQ4_XS:
 @weft.encoding
 class TQ1_0:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     q: u8[48]
     qh: u8[4]
@@ -252,6 +260,7 @@ class TQ1_0:
 @weft.encoding
 class TQ2_0:
     layout = bitorder.lsb_first, byteorder.little
+    alignment = 2
     elements = 256
     q: u2[256] @ grouped(128) @ layered(32, lo_first)
     d: f16
