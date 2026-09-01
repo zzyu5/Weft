@@ -461,8 +461,10 @@ mlir::FailureOr<mlir::Value> cloneWindowSlice(
 // projectOneWindow: an upstream producer may carry a wider lane group than its
 // downstream consumer and therefore needs to be sliced to the consumer's
 // selected window extent, not merely to its own current lane factor.
-riscv::ValueType issueWindowType(mlir::Builder &builder, riscv::ValueType source,
-                                 int64_t axis, int64_t windowExtent) {
+riscv::ValueType issueWindowType(mlir::Builder &builder,
+                                 riscv::TargetAttr target,
+                                 riscv::ValueType source, int64_t axis,
+                                 int64_t windowExtent) {
   auto position = axisPosition(source, axis);
   if (!position || windowExtent <= 0 ||
       source.getShape()[*position] < windowExtent ||
@@ -502,10 +504,16 @@ riscv::ValueType issueWindowType(mlir::Builder &builder, riscv::ValueType source
     const int64_t newLanes = product(lane);
     const int64_t replicas = product(replica);
     if (oldLanes <= 0 || newLanes <= 0 || replicas <= 0 || lmul <= 0 ||
-        lmul > std::numeric_limits<int64_t>::max() / newLanes ||
-        (lmul * newLanes) % oldLanes)
+        lmul > std::numeric_limits<int64_t>::max() / newLanes)
       return {};
-    lmul = lmul * newLanes / oldLanes;
+    const int64_t scaledLmul = lmul * newLanes;
+    const int64_t requestedLmul =
+        scaledLmul / oldLanes + (scaledLmul % oldLanes != 0);
+    lmul = 0;
+    for (int64_t legal : target.getLegalLMULEighths().asArrayRef()) {
+      if (legal >= requestedLmul && (lmul == 0 || legal < lmul))
+        lmul = legal;
+    }
     if (lmul <= 0)
       return {};
     vl = newLanes;
@@ -522,14 +530,17 @@ riscv::ValueType issueWindowType(mlir::Builder &builder, riscv::ValueType source
       riscv_internal::integers(builder, fragment),
       riscv_internal::integers(builder, local), source.getLayout().getSew(),
       lmul, vl, groups, source.getLayout().getValidity());
-  return riscv::ValueType::get(builder.getContext(), source.getElementType(),
-                               riscv_internal::integers(builder, shape),
-                               source.getAxisIds(), layout);
+  if (layout.getCarrier() == "rvv" && !riscv::supportsRVVLayout(target, layout))
+    return {};
+  return riscv::ValueType::get(
+      builder.getContext(), source.getElementType(),
+      riscv_internal::integers(builder, shape), source.getAxisIds(), layout);
 }
 
 mlir::FailureOr<mlir::Value> cloneIssueWindow(
     mlir::Value value, int64_t axis, int64_t windowExtent,
-    mlir::Value windowIndex, mlir::IRRewriter &rewriter,
+    mlir::Value windowIndex, riscv::TargetAttr target,
+    mlir::IRRewriter &rewriter,
     llvm::DenseMap<mlir::Value, mlir::Value> &clones) {
   if (auto found = clones.find(value); found != clones.end())
     return found->second;
@@ -538,7 +549,8 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
                              : std::optional<size_t>();
   if (!sourceType || !position)
     return value;
-  auto resultType = issueWindowType(rewriter, sourceType, axis, windowExtent);
+  auto resultType =
+      issueWindowType(rewriter, target, sourceType, axis, windowExtent);
   mlir::Operation *definition = value.getDefiningOp();
   if (!resultType || !definition) {
     if (definition)
@@ -551,8 +563,8 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
   auto cloneOperand = [&](mlir::Value operand) -> mlir::FailureOr<mlir::Value> {
     if (!mlir::isa<riscv::ValueType>(operand.getType()))
       return operand;
-    return cloneIssueWindow(operand, axis, windowExtent, windowIndex, rewriter,
-                            clones);
+    return cloneIssueWindow(operand, axis, windowExtent, windowIndex, target,
+                            rewriter, clones);
   };
   auto remember = [&](mlir::Value cloned) -> mlir::Value {
     riscv_internal::copyOrigin(definition, cloned.getDefiningOp());
@@ -641,6 +653,82 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
             rewriter, "rvv", "unit-entry-window-load",
             "rvv.unit-entry-window-load", "rvv.unit-entry-window-load", 0,
             resultType.getLayout().getRegisterGroups()));
+    return remember(cloned.getResult());
+  }
+
+  if (auto load =
+          mlir::dyn_cast<riscv::RVVBitmaskWindowLoadOp>(definition)) {
+    llvm::SmallVector<int64_t> axes(load.getWindowAxes());
+    llvm::SmallVector<int64_t> extents(load.getWindowExtents());
+    auto found = llvm::find(axes, axis);
+    if (found == axes.end() || axes.size() != extents.size())
+      return mlir::failure();
+    const size_t windowPosition = static_cast<size_t>(found - axes.begin());
+    int64_t suffix = 1;
+    for (size_t index = windowPosition + 1; index < extents.size(); ++index) {
+      if (extents[index] <= 0 ||
+          suffix > std::numeric_limits<int64_t>::max() / extents[index])
+        return mlir::failure();
+      suffix *= extents[index];
+    }
+    if (windowExtent > std::numeric_limits<int64_t>::max() / suffix)
+      return mlir::failure();
+    const int64_t windowBits = windowExtent * suffix;
+    if (windowBits <= 0 || windowBits % 8)
+      return mlir::failure();
+    extents[windowPosition] = windowExtent;
+
+    mlir::Value base = load.getByteBase();
+    mlir::Value windowBase;
+    const int64_t windowBytes = windowBits / 8;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(base.getType())) {
+      auto typedIndex = rewriter.create<riscv::CastOp>(
+          load.getLoc(), integer, windowIndex,
+          riscv_internal::unselectedLeaf(rewriter));
+      auto span = rewriter.create<riscv::ConstantOp>(
+          load.getLoc(), integer,
+          rewriter.getIntegerAttr(integer, windowBytes));
+      auto offset = rewriter.create<riscv::BinaryOp>(
+          load.getLoc(), integer, typedIndex.getResult(), span.getResult(),
+          "mul", riscv_internal::unselectedLeaf(rewriter));
+      windowBase = rewriter
+                       .create<riscv::BinaryOp>(
+                           load.getLoc(), integer, base, offset.getResult(),
+                           "add", riscv_internal::unselectedLeaf(rewriter))
+                       .getResult();
+    } else if (base.getType().isIndex()) {
+      auto span = rewriter.create<mlir::arith::ConstantIndexOp>(
+          load.getLoc(), windowBytes);
+      auto offset = rewriter.create<mlir::arith::MulIOp>(
+          load.getLoc(), windowIndex, span.getResult());
+      windowBase = rewriter
+                       .create<mlir::arith::AddIOp>(load.getLoc(), base,
+                                                   offset.getResult())
+                       .getResult();
+    } else {
+      return mlir::failure();
+    }
+
+    auto partBitOffsets =
+        riscv::bitmaskWindowPartOffsets(resultType, axes, extents);
+    if (!partBitOffsets)
+      return mlir::failure();
+    auto selected = load.getLeaf();
+    const int64_t temporaryGroups = std::max<int64_t>(
+        1, (resultType.getLayout().getLmulEighths() + 7) / 8);
+    auto cloned = rewriter.create<riscv::RVVBitmaskWindowLoadOp>(
+        load.getLoc(), resultType, load.getField(), windowBase,
+        load.getSourceAxis(), rewriter.getDenseI64ArrayAttr(axes),
+        rewriter.getDenseI64ArrayAttr(extents),
+        rewriter.getDenseI64ArrayAttr(*partBitOffsets), load.getAccess(),
+        riscv_internal::leaf(
+            rewriter, selected.getEngine(), selected.getFamily(),
+            selected.getInstruction(), selected.getSpelling(),
+            selected.getOperandGroups(),
+            resultType.getLayout().getRegisterGroups(), temporaryGroups,
+            selected.getFragmentGroups(), selected.getMask(),
+            selected.getTail(), selected.getParameters(),
+            selected.getLocalBytes()));
     return remember(cloned.getResult());
   }
 
@@ -2524,16 +2612,18 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
     int64_t issueStreams, int64_t windowExtent) {
   auto kernel = dot->getParentOfType<riscv::KernelOp>();
   auto scaleType = mlir::dyn_cast<riscv::ValueType>(match.scale.getType());
-  if (!kernel || dot.getOver().empty() || issueStreams <= 1 ||
+  if (!kernel || dot.getOver().empty() || issueStreams <= 0 ||
       windowExtent <= 1 || !scaleType)
     return std::nullopt;
 
-  auto issueLhs =
-      issueWindowType(builder, dot.getLhs().getType(), windowAxis, windowExtent);
-  auto issueRhs =
-      issueWindowType(builder, dot.getRhs().getType(), windowAxis, windowExtent);
-  auto issueScale =
-      issueWindowType(builder, scaleType, windowAxis, windowExtent);
+  auto issueLhs = issueWindowType(builder, kernel.getTarget(),
+                                  dot.getLhs().getType(), windowAxis,
+                                  windowExtent);
+  auto issueRhs = issueWindowType(builder, kernel.getTarget(),
+                                  dot.getRhs().getType(), windowAxis,
+                                  windowExtent);
+  auto issueScale = issueWindowType(builder, kernel.getTarget(), scaleType,
+                                    windowAxis, windowExtent);
   auto scaleReplicas =
       issueScale ? scalarReplicaType(builder, issueScale) : riscv::ValueType();
   auto scaleElement =
@@ -2938,7 +3028,7 @@ public:
              product(finalValue.getLayout().getFragmentFactors()) == 1 &&
              product(finalValue.getLayout().getLocalFactors()) == 1);
         if (match && windowAxis > 0 && lhsPosition && rhsPosition &&
-            resultPosition && lhsTime >= 2 && lhsTime == rhsTime &&
+            resultPosition && lhsTime >= 1 && lhsTime == rhsTime &&
             lhsWindow > 1 && lhsWindow == rhsWindow &&
             logicalExtent == lhsTime * lhsWindow && finalElement &&
             finalElement.isSigned() && finalElement.getWidth() == 32 &&
@@ -4383,7 +4473,7 @@ public:
            product(finalValue.getLayout().getReplicaFactors()) == 1 &&
            product(finalValue.getLayout().getFragmentFactors()) == 1 &&
            product(finalValue.getLayout().getLocalFactors()) == 1);
-      if (!nestedPlan || windowAxis <= 0 || streams <= 1 || windowExtent <= 1 ||
+      if (!nestedPlan || windowAxis <= 0 || streams <= 0 || windowExtent <= 1 ||
           !issueLhsType || !issueRhsType || !scaleReplicaType ||
           !sourceSetType || !repackedSetType || !reducedSetType ||
           !scaleCombinedSetType || !resultElement || !resultElement.isSigned() ||
@@ -4434,10 +4524,13 @@ public:
       rewriter.setInsertionPointToStart(loop.getBody());
 
       llvm::DenseMap<mlir::Value, mlir::Value> clones;
+      auto target = dot->getParentOfType<riscv::KernelOp>().getTarget();
       auto lhsSlice = cloneIssueWindow(dot.getLhs(), windowAxis, windowExtent,
-                                       loop.getInductionVar(), rewriter, clones);
+                                       loop.getInductionVar(), target, rewriter,
+                                       clones);
       auto rhsSlice = cloneIssueWindow(dot.getRhs(), windowAxis, windowExtent,
-                                       loop.getInductionVar(), rewriter, clones);
+                                       loop.getInductionVar(), target, rewriter,
+                                       clones);
       auto lhsType = mlir::succeeded(lhsSlice)
                          ? mlir::dyn_cast<riscv::ValueType>((*lhsSlice).getType())
                          : riscv::ValueType();
@@ -4492,7 +4585,8 @@ public:
       riscv_internal::copyOrigin(dot, partialReduced);
 
       auto scale = cloneIssueWindow(match->scale, windowAxis, windowExtent,
-                                    loop.getInductionVar(), rewriter, clones);
+                                    loop.getInductionVar(), target, rewriter,
+                                    clones);
       auto scaleSourceType =
           mlir::succeeded(scale)
               ? mlir::dyn_cast<riscv::ValueType>((*scale).getType())

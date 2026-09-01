@@ -602,24 +602,30 @@ def vec_dot_iq2_s_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
-        scale_group = iota(2, dtype=u32, axis="scale_group")
+        scale_group = iota(4, dtype=u32, axis="scale_group")
         entry = iota(2, dtype=u32, axis="entry")
         payload = iota(8, dtype=u16, axis="payload")
         block_sum = i32(0)
         group_index = index(0)
-        with L.subs(kb, extent=32) as group:
+        with L.subs(kb, extent=64) as group:
             linear_entry = scale_group * u32(2) + entry
             grid_index = widen(
-                w.q[u32(group_index) * u32(4) + linear_entry], u32
+                w.q[u32(group_index) * u32(8) + linear_entry], u32
             ) | (
                 (
-                    widen(w.qh[group_index], u32)
+                    (
+                        widen(w.qh[group_index * index(2)], u32)
+                        | (
+                            widen(w.qh[group_index * index(2) + index(1)], u32)
+                            << u32(8)
+                        )
+                    )
                     >> (linear_entry * u32(2))
                 )
                 & u32(3)
             ) << u32(8)
             sign_bit = w.signs[
-                u32(group_index) * u32(32)
+                u32(group_index) * u32(64)
                 + linear_entry * u32(8)
                 + u32(payload)
             ]
@@ -630,7 +636,7 @@ def vec_dot_iq2_s_q8_k(
             )
             signed_weight = weight * (i8(1) - i8(sign_bit) * i8(2))
             activation = x.q[
-                u32(group_index) * u32(32)
+                u32(group_index) * u32(64)
                 + linear_entry * u32(8)
                 + u32(payload)
             ]
@@ -640,10 +646,16 @@ def vec_dot_iq2_s_q8_k(
                 over=("entry", "payload"),
                 acc=i32,
             )
-            metadata = widen(w.scales[group_index], u32)
+            metadata = widen(
+                w.scales[
+                    u32(group_index) * u32(2)
+                    + scale_group // u32(2)
+                ],
+                u32,
+            )
             scale = i32(
                 (
-                    (metadata >> (scale_group * u32(4)))
+                    (metadata >> ((scale_group % u32(2)) * u32(4)))
                     & u32(15)
                 )
                 * u32(2)

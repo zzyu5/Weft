@@ -154,6 +154,13 @@ else
       meta=(--meta NC=512 --meta KC=1024 --meta MC=8 --meta MR=8 --meta NR=3)
       physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
     fi
+  elif [[ ${format} == iq2_s ]]; then
+    kernel=production_mul_mat_iq2_s
+    if [[ ${target} == sg2044 ]]; then
+      physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+    fi
   elif [[ ${format} == iq2_xs ]]; then
     meta=(--meta NR=1)
     iq2_xs_unroll=${WEFT_AUTO_UNROLL:-1}
