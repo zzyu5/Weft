@@ -10538,15 +10538,17 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
   riscv::StorageWindowPlanAttr plan = operation.getPlan();
   const bool layered = plan.getKind() == "layered";
   const bool natural = plan.getKind() == "unit";
+  const bool strided = plan.getKind() == "strided";
   const bool interleavedNatural = plan.getKind() == "interleaved_natural";
   const bool interleavedJoined = plan.getKind() == "interleaved_joined";
   const bool interleaved = interleavedNatural || interleavedJoined;
-  if (!natural && !layered && !interleaved)
+  if (!natural && !strided && !layered && !interleaved)
     return fail(operation,
                 "RVV replica storage load has no selected storage-window form");
   const std::string expected =
       layered ? "rvv.replica-storage-load.layered"
       : natural ? "rvv.replica-storage-load.natural"
+      : strided ? "rvv.replica-storage-load.strided"
       : interleavedNatural
           ? "rvv.replica-storage-load.interleaved-natural"
           : "rvv.replica-storage-load.interleaved-joined";
@@ -10617,7 +10619,7 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       : category == 'i' ? "vint" + loadSuffix.substr(1) + "_t"
       : category == 'f' ? "vfloat" + loadSuffix.substr(1) + "_t"
                         : std::string();
-  const std::string loadVL = std::to_string(layout.getVl());
+  const std::string loadVL = std::to_string(lanes);
   auto recordForWindow = [&](size_t window) -> std::optional<std::string> {
     if (window >= operation.getWindowOffsets().size())
       return std::nullopt;
@@ -10788,9 +10790,17 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
           *record + ") + " + std::to_string(plan.getByteOffset()) +
           ")) + " + index;
       std::string raw = fresh("replica_window");
-      line(loadType + " " + raw + " = __riscv_vle" +
-           std::to_string(width) + "_v_" + loadSuffix + "(" + pointer +
-           ", " + loadVL + ");");
+      if (strided) {
+        const int64_t strideBytes =
+            plan.getProjectionStride() * static_cast<int64_t>(width / 8);
+        line(loadType + " " + raw + " = __riscv_vlse" +
+             std::to_string(width) + "_v_" + loadSuffix + "(" + pointer +
+             ", " + std::to_string(strideBytes) + ", " + loadVL + ");");
+      } else {
+        line(loadType + " " + raw + " = __riscv_vle" +
+             std::to_string(width) + "_v_" + loadSuffix + "(" + pointer +
+             ", " + loadVL + ");");
+      }
       windows.push_back(std::move(raw));
     }
   } else {

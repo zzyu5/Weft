@@ -28,6 +28,7 @@ ConvertWeftToRISCV
 → UnrollRISCVLevels
 → CanonicalizeRISCVLayouts
 → PlanRISCVMemory
+→ MaterializeRISCVReplicaStorageLoads
 → HoistRISCVLoopInvariants
 → SelectRISCVOperations
 → FinalizeRISCVLeaves
@@ -88,8 +89,10 @@ pointwise、state 与 control handoff 的要求不一致时，pass 插入真实 
 读取 `MemDescType`、Encoding field mapping 和 value layout，为每条 memory edge写入
 `AccessAttr` 与 transfer leaf。dense access 得到 unit/strided/indexed；encoded field 得到
 natural/grouped-layered/joined 的完整 storage geometry。lookup table被保留为 descriptor edge，
-不是先整表 load。contract 的 lane operand 与 lane memory form也在这里唯一确定，并在
-composite lowering 中消费。
+不是先整表 load。contract 的 lane operand与source storage relation在这里确定，并在
+composite lowering中消费。partial materialization后新出现的replica memory edge会再次经过
+该 pass写入typed storage relation；它最终采用unit、strided还是保留indexed，唯一由后置的
+`MaterializeRISCVReplicaStorageLoads`根据最终consumer layout决定。
 
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
@@ -133,11 +136,23 @@ dependency-derived producer/consumer cluster 仍会失败，不算 pipeline。
 
 ### `ShareRISCVLayeredWindows`
 
-该 pass 读取 typed `grouped_layered` access geometry，并在 pure conversion、无中间
-write/unknown effect 的 `local_load` 与 integer index cast 之后，仍用 field owner、logical point
-与线性 byte-coordinate 关系证明两个
-layer 共享一个 RVV storage window。成功时它以真实 `rvv_layered_window` op 替换两个
-extract。当前仅对 full-validity layer 改写；tail cohort 没有证明安全时保持原程序。
+该 pass 读取 typed storage geometry、field owner、logical point、consumer layout 与 affine
+record relation，物化 layered stream、record load 和 field-to-register replica load；在 pure
+conversion、无中间 write/unknown effect 时，它还能证明多个 layer 共享一个 RVV storage
+window。成功时都以真实 physical operation替换 extract。当前仅对 full-validity layer做共享；
+tail cohort没有证明安全时保持原程序。
+
+### `MaterializeRISCVReplicaStorageLoads`
+
+该 pass 位于最终一次 memory planning 之后。它读取已经闭合的 typed field/storage relation、
+affine index、time/lane/replica分解、consumer layout与target facts，按target固定优先级选择
+保留indexed、unit或strided field-to-register form。成功时把extract物化为
+`rvv.replica_storage_load`；选中的op明确携带window plan、每个physical part的source window
+以及exact load leaf，layered relation不会伪装成strided load。
+
+这个 pass只闭合现有 field-to-register edge，不创建logical axis、Level或source traversal。
+partial materializer若需把一个已选unit load投影到issue window，只能机械投影原有plan与leaf，
+不能重新选择memory form。
 
 ### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
 

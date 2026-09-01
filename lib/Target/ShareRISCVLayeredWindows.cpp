@@ -244,6 +244,7 @@ std::optional<riscv::LayeredStreamGeometryAttr> buildLayeredStreamGeometry(
 struct ShapedAffineIndex {
   llvm::DenseMap<int64_t, int64_t> axisCoefficients;
   mlir::Value scalarBase;
+  int64_t scalarBaseCoefficient = 0;
   int64_t constant = 0;
   bool valid = true;
 };
@@ -313,9 +314,17 @@ void decomposeShapedIndex(mlir::Value value, int64_t coefficient,
 
   auto shaped = mlir::dyn_cast<riscv::ValueType>(value.getType());
   if (!shaped) {
-    if (coefficient != 1 || result.scalarBase)
+    if (!result.scalarBase) {
+      result.scalarBase = value;
+      result.scalarBaseCoefficient = coefficient;
+      return;
+    }
+    if (result.scalarBase != value)
       return result.valid = false, void();
-    result.scalarBase = value;
+    int64_t combined = 0;
+    if (!checkedAdd(result.scalarBaseCoefficient, coefficient, combined))
+      return result.valid = false, void();
+    result.scalarBaseCoefficient = combined;
     return;
   }
   if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>()) {
@@ -1316,9 +1325,15 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
                          selectedType.getLayout().getLaneFactors()[position],
                          lanes))
       return false;
-  if (!laneAxis || affine.axisCoefficients.lookup(laneAxis) != 1 ||
-      streams <= 0 || replicas <= 0 ||
+  const int64_t laneStride = affine.axisCoefficients.lookup(laneAxis);
+  if (!laneAxis || laneStride <= 0 || streams <= 0 || replicas <= 0 ||
       streams > std::numeric_limits<int64_t>::max() / replicas)
+    return false;
+  const bool profitableStridedWindow =
+      laneStride == 1 || lanes >= 4 || kernel.getTarget().getVlenBits() >= 256;
+  if ((layered && laneStride != 1) ||
+      (laneStride != 1 &&
+       (lanePositions.size() != 1 || !profitableStridedWindow)))
     return false;
   for (const auto &[axis, coefficient] : affine.axisCoefficients) {
     auto found = llvm::find(selectedType.getAxisIds().asArrayRef(), axis);
@@ -1352,7 +1367,7 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       fieldAxis == fieldType.getAxisIds().asArrayRef().end();
   if (gatherAxis &&
       (fieldType.getShape().size() != 1 ||
-       affine.axisCoefficients.lookup(laneAxis) != 1))
+       laneStride <= 0 || (layered && laneStride != 1)))
     return false;
   const int64_t fieldExtent =
       gatherAxis
@@ -1417,7 +1432,9 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
           !checkedAdd(logicalOffset, contribution, logicalOffset))
         return false;
     }
-    if (logicalOffset < 0 || logicalOffset % lanes)
+    int64_t partAlignment = 0;
+    if (!checkedMultiply(lanes, laneStride, partAlignment) ||
+        logicalOffset < 0 || logicalOffset % partAlignment)
       return false;
     partOffsets.push_back(logicalOffset);
     llvm::SmallVector<int64_t> recordCoordinates;
@@ -1448,13 +1465,25 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       recordCoordinates.push_back(coordinate);
     }
     recordCoordinatesForPart.push_back(std::move(recordCoordinates));
+    int64_t covered = 0;
     int64_t end = 0;
-    if (!checkedAdd(logicalOffset, lanes, end))
+    if (!checkedMultiply(lanes - 1, laneStride, covered) ||
+        !checkedAdd(covered, 1, covered) ||
+        !checkedAdd(logicalOffset, covered, end))
       return false;
     logicalSpan = std::max(logicalSpan, end);
   }
+  int64_t logicalBaseAlignment = 0;
+  if (!checkedMultiply(lanes, laneStride, logicalBaseAlignment))
+    return false;
+  int64_t scalarBaseMultiple = 1;
+  if (affine.scalarBase &&
+      (affine.scalarBaseCoefficient <= 0 ||
+       !checkedMultiply(knownMultiple(affine.scalarBase),
+                        affine.scalarBaseCoefficient, scalarBaseMultiple)))
+    return false;
   if (logicalSpan <= 0 || logicalSpan > fieldExtent || affine.constant < 0 ||
-      (affine.scalarBase && knownMultiple(affine.scalarBase) % logicalSpan))
+      (affine.scalarBase && scalarBaseMultiple % logicalBaseAlignment))
     return false;
 
   const int64_t group = extract.getAccess().getGroupSize();
@@ -1499,14 +1528,35 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
 
   rewriter.setInsertionPoint(extract);
   mlir::Value scalarBase = affine.scalarBase;
-  if (!scalarBase)
+  if (!scalarBase) {
     scalarBase = rewriter.create<mlir::arith::ConstantIndexOp>(extract.getLoc(),
                                                                affine.constant);
+  } else if (affine.scalarBaseCoefficient != 1) {
+    if (scalarBase.getType().isIndex()) {
+      auto coefficient = rewriter.create<mlir::arith::ConstantIndexOp>(
+          extract.getLoc(), affine.scalarBaseCoefficient);
+      scalarBase = rewriter.create<mlir::arith::MulIOp>(
+          extract.getLoc(), scalarBase, coefficient);
+    } else if (auto integer =
+                   mlir::dyn_cast<mlir::IntegerType>(scalarBase.getType())) {
+      auto coefficient = rewriter.create<riscv::ConstantOp>(
+          extract.getLoc(), integer,
+          rewriter.getIntegerAttr(integer, affine.scalarBaseCoefficient));
+      scalarBase = rewriter
+                       .create<riscv::BinaryOp>(
+                           extract.getLoc(), integer, scalarBase,
+                           coefficient.getResult(), "mul",
+                           riscv_internal::unselectedLeaf(rewriter))
+                       .getResult();
+    } else {
+      return false;
+    }
+  }
   const int64_t logicalBaseMultiple =
       affine.scalarBase
-          ? std::max<int64_t>(1, knownMultiple(affine.scalarBase))
+          ? std::max<int64_t>(1, scalarBaseMultiple)
           : (affine.constant == 0
-                 ? logicalSpan
+                 ? logicalBaseAlignment
                  : std::max<int64_t>(1, std::abs(affine.constant)));
   llvm::SmallVector<int64_t> physicalLayerForPart;
   llvm::SmallVector<int64_t> shiftOffsetForPart;
@@ -1553,14 +1603,25 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
   const int64_t temporaryGroups = std::max<int64_t>(
       1, (selectedType.getLayout().getLmulEighths() + 7) / 8);
   const bool tail = selectedType.getLayout().getValidity() == "tail";
-  llvm::StringRef instruction = layered
-                                    ? "rvv.replica-storage-load.layered"
-                                    : "rvv.replica-storage-load.natural";
+  const bool strided = !layered && laneStride > 1;
+  llvm::StringRef instruction =
+      layered ? "rvv.replica-storage-load.layered"
+              : strided ? "rvv.replica-storage-load.strided"
+                        : "rvv.replica-storage-load.natural";
   auto storagePlan = riscv_internal::storageWindowPlan(
-      rewriter, field, laneAxis, 0, 1, 1, logicalSpan,
+      rewriter, field, laneAxis, 0, laneStride, 1, logicalSpan,
       logicalBaseMultiple);
   if (!storagePlan)
     return false;
+  riscv::AccessAttr loadAccess = extract.getAccess();
+  if (strided)
+    loadAccess = riscv::AccessAttr::get(
+        rewriter.getContext(), "strided", loadAccess.getMapping(),
+        loadAccess.getAlignment(), 0, 0, loadAccess.getGroupSize(),
+        loadAccess.getLayerSize(), loadAccess.getJoinFields(),
+        loadAccess.getJoinLowBits(), loadAccess.getJoinRole(),
+        loadAccess.getBitOffset(), loadAccess.getStorageBits(),
+        loadAccess.getOrder());
   auto load = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
       extract.getLoc(), selectedType, field.getResult(), scalarBase,
       *storagePlan, static_cast<int64_t>(recordRank),
@@ -1571,7 +1632,7 @@ bool materializeReplicaStorageLoad(mlir::IRRewriter &rewriter,
       rewriter.getDenseI64ArrayAttr(physicalLayerForPart),
       rewriter.getDenseI64ArrayAttr(shiftOffsetForPart),
       rewriter.getDenseI64ArrayAttr(shiftBaseFactorForPart),
-      rewriter.getDenseI64ArrayAttr(maskValueForPart), extract.getAccess(),
+      rewriter.getDenseI64ArrayAttr(maskValueForPart), loadAccess,
       riscv_internal::leaf(rewriter, "rvv", "replica-storage-load",
                            instruction, instruction, 0, resultGroups,
                            temporaryGroups, 0, "none",
@@ -1627,6 +1688,21 @@ void eraseDeadPureProducers(mlir::IRRewriter &rewriter,
       changed = true;
     }
   }
+}
+
+void materializeReplicaStorageLoads(mlir::IRRewriter &rewriter,
+                                    mlir::ModuleOp module) {
+  llvm::SmallVector<riscv::ExtractOp> extracts;
+  module.walk([&](riscv::ExtractOp extract) { extracts.push_back(extract); });
+  llvm::SmallVector<mlir::Value> replacedIndices;
+  for (riscv::ExtractOp extract : extracts) {
+    llvm::SmallVector<mlir::Value> indices(extract.getIndices().begin(),
+                                           extract.getIndices().end());
+    if (materializeInterleavedReplicaExtract(rewriter, extract) ||
+        materializeReplicaStorageLoad(rewriter, extract))
+      replacedIndices.append(indices.begin(), indices.end());
+  }
+  eraseDeadPureProducers(rewriter, replacedIndices);
 }
 
 class ShareRISCVLayeredWindowsPass
@@ -1789,18 +1865,7 @@ public:
       if (subview && subview.getResult().use_empty())
         rewriter.eraseOp(subview);
 
-    llvm::SmallVector<riscv::ExtractOp> replicaExtracts;
-    getOperation().walk(
-        [&](riscv::ExtractOp extract) { replicaExtracts.push_back(extract); });
-    llvm::SmallVector<mlir::Value> replacedReplicaIndices;
-    for (riscv::ExtractOp extract : replicaExtracts) {
-      llvm::SmallVector<mlir::Value> indices(extract.getIndices().begin(),
-                                             extract.getIndices().end());
-      if (materializeInterleavedReplicaExtract(rewriter, extract) ||
-          materializeReplicaStorageLoad(rewriter, extract))
-        replacedReplicaIndices.append(indices.begin(), indices.end());
-    }
-    eraseDeadPureProducers(rewriter, replacedReplicaIndices);
+    materializeReplicaStorageLoads(rewriter, getOperation());
 
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(
@@ -2123,8 +2188,30 @@ public:
   }
 };
 
+class MaterializeRISCVReplicaStorageLoadsPass
+    : public mlir::PassWrapper<MaterializeRISCVReplicaStorageLoadsPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  llvm::StringRef getArgument() const override {
+    return "weft-riscv-materialize-replica-storage-loads";
+  }
+  llvm::StringRef getDescription() const override {
+    return "Materialize typed natural and strided field-to-register loads";
+  }
+
+  void runOnOperation() override {
+    mlir::IRRewriter rewriter(&getContext());
+    materializeReplicaStorageLoads(rewriter, getOperation());
+  }
+};
+
 } // namespace
 
 std::unique_ptr<mlir::Pass> weft::createShareRISCVLayeredWindowsPass() {
   return std::make_unique<ShareRISCVLayeredWindowsPass>();
+}
+
+std::unique_ptr<mlir::Pass>
+weft::createMaterializeRISCVReplicaStorageLoadsPass() {
+  return std::make_unique<MaterializeRISCVReplicaStorageLoadsPass>();
 }

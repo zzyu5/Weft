@@ -36,6 +36,12 @@ Encoding field access用 `AccessAttr` 保存 selected memory form以及 natural�
 joined 的完整 storage geometry。terminal lowering可以据此计算确定地址和bit extraction，
 不能按量化格式名补布局。
 
+natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示。它的
+`StorageWindowPlanAttr`给出logical lane axis、unit/strided projection、extent/alignment、record
+坐标与每个time/replica part对应的source window；result layout给出唯一SEW、LMUL与实际`vl`，
+leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
+两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
+
 `LocalType` 是 invocation-local、target管理的可寻址对象，明确 size、alignment、alias、
 purpose、owner domain、birth与lifetime。当前真实用途包括 state/handoff object、spill slot与
 pipeline window；它不能替代 caller-visible workspace。动态对象必须由紧邻的

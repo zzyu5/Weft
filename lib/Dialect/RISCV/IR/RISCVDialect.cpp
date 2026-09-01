@@ -6284,6 +6284,9 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   mlir::Type baseType = getLogicalBase().getType();
   const bool scalarBase = baseType.isIndex() || mlir::isa<mlir::IntegerType>(baseType);
   StorageWindowPlanAttr plan = getPlan();
+  if (!plan)
+    return emitOpError(
+        "replica storage load requires one selected storage-window plan");
   const int64_t laneAxis = plan.getReductionAxis();
   const int64_t logicalSpan = plan.getProjectionExtent();
   const int64_t logicalBaseMultiple = plan.getOffsetAlignment();
@@ -6291,6 +6294,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   auto resultAxis = llvm::find(result.getAxisIds().asArrayRef(), laneAxis);
   auto parts = physicalPartCount(result);
   const bool natural = plan.getKind() == "unit";
+  const bool strided = plan.getKind() == "strided";
   const bool layered = plan.getKind() == "layered";
   const bool interleavedNatural = plan.getKind() == "interleaved_natural";
   const bool interleavedJoined = plan.getKind() == "interleaved_joined";
@@ -6302,6 +6306,8 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
   llvm::StringRef instruction = natural
                                     ? "rvv.replica-storage-load.natural"
+                                : strided
+                                    ? "rvv.replica-storage-load.strided"
                                 : layered
                                     ? "rvv.replica-storage-load.layered"
                                 : interleavedNatural
@@ -6317,11 +6323,14 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
       fieldBits <= 0 || (fieldInteger && fieldInteger.isSignless()) || !scalarBase ||
       laneAxis <= 0 || plan.getProjectionBase() != 0 ||
-      plan.getProjectionStride() != 1 || plan.getProjectionRepeat() != 1 ||
+      ((natural || layered || interleaved) &&
+       plan.getProjectionStride() != 1) ||
+      (strided && plan.getProjectionStride() <= 1) ||
+      plan.getProjectionRepeat() != 1 ||
       plan.getRecordElements() != memory.getElements() ||
       plan.getByteOffset() != getAccess().getBitOffset() / 8 ||
       plan.getElementBits() != fieldBits ||
-      (natural && getAccess().getMapping() != "natural") ||
+      ((natural || strided) && getAccess().getMapping() != "natural") ||
       (layered && getAccess().getMapping() != "grouped_layered") ||
       (interleavedNatural && getAccess().getMapping() != "natural") ||
       (interleavedJoined && getAccess().getMapping() != "joined") ||
@@ -6339,7 +6348,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       getShiftOffsetForPart().size() != static_cast<size_t>(*parts) ||
       getShiftBaseFactorForPart().size() != static_cast<size_t>(*parts) ||
       getMaskValueForPart().size() != static_cast<size_t>(*parts) ||
-      (!natural && !layered && !interleaved) ||
+      (!natural && !strided && !layered && !interleaved) ||
       (validity != "full" && validity != "tail") ||
       !exactLeaf(getLeaf(), "rvv", "replica-storage-load", instruction, "none",
                  tail))
@@ -6419,9 +6428,10 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
         "replica storage load has an incomplete stream/replica product");
   auto loadLanes = checkedPositiveProduct(
       result.getLayout().getLaneFactors().asArrayRef());
-  if (!loadLanes || *loadLanes <= 1)
+  if (!loadLanes || *loadLanes <= 1 ||
+      result.getLayout().getVl() != *loadLanes)
     return emitOpError(
-        "replica storage load has no positive typed load-lane extent");
+        "replica storage load must use exactly its typed load-lane extent as vl");
   for (size_t window = 0; window < getWindowOffsets().size(); ++window) {
     for (int64_t position = 0; position < recordRank; ++position) {
       const int64_t coordinate = getRecordCoordinatesForWindow()[
@@ -6469,13 +6479,15 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
            getAccess().getOrder() != "hi_first"))))
       return emitOpError(
           "interleaved replica storage load requires one explicit record-axis projection and closed byte assembly");
-  } else if (natural) {
-    if (getAccess().getForm() != "indexed" || getAccess().getBitOffset() % 8 ||
+  } else if (natural || strided) {
+    if ((natural && getAccess().getForm() != "indexed") ||
+        (strided && getAccess().getForm() != "strided") ||
+        getAccess().getBitOffset() % 8 ||
         !fieldInteger ||
         (fieldBits != 8 && fieldBits != 16 && fieldBits != 32) ||
         result.getLayout().getSew() != fieldBits)
       return emitOpError(
-          "natural replica storage load requires byte-addressable indexed source elements");
+          "natural or strided replica storage load requires one byte-addressable source relation");
   } else {
     if (getAccess().getForm() != "indexed" || group <= 0 || layer <= 0 ||
         group % layer || layers <= 1 || layer % *physicalLanes ||
@@ -6490,9 +6502,11 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
 
 
   for (int64_t offset : getWindowOffsets()) {
-    const bool bounded = natural || interleaved
+    const bool bounded = natural || strided || interleaved
                              ? offset >= 0 &&
-                                   offset <= logicalSpan - *loadLanes
+                                   offset + (*loadLanes - 1) *
+                                                plan.getProjectionStride() <
+                                       logicalSpan
                              : offset >= 0 &&
                                    offset <= layer - *physicalLanes;
     if (!bounded)
@@ -6502,7 +6516,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
        llvm::zip(getWindowForPart(), getLayerForPart())) {
     if (window < 0 || window >= static_cast<int64_t>(getWindowOffsets().size()) ||
         storageLayer < 0 || storageLayer >= layers ||
-        ((natural || interleaved) && storageLayer != 0))
+        ((natural || strided || interleaved) && storageLayer != 0))
       return emitOpError(
           "replica storage load part map references an invalid window or layer");
   }
@@ -6515,7 +6529,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
        llvm::zip(getLayerForPart(), getPhysicalLayerForPart(),
                  getShiftOffsetForPart(), getShiftBaseFactorForPart(),
                  getMaskValueForPart())) {
-    if (natural || interleaved) {
+    if (natural || strided || interleaved) {
       if (physicalLayer != 0 || shiftOffset != 0 || shiftBaseFactor != 0 ||
           maskValue != 0)
         return emitOpError(

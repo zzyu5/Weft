@@ -51,12 +51,12 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   // before scheduling/final leaf selection so their register forms remain
   // explicit typed values instead of terminal vector extracts.
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
-  // Partial materialization can also create a new scalar-replica projection
-  // whose final access form depends on the just-canonicalized layouts.  Close
-  // that physical memory edge here; terminal emission must not reconstruct a
-  // gather decision for an ExtractOp that did not exist at the earlier memory
-  // planning points.
+  // Partial materialization can also create a new scalar-replica projection.
+  // First annotate its typed storage relation, then select and materialize the
+  // final field-to-register form from the just-canonicalized layout.  Terminal
+  // emission must not reconstruct that decision from an ExtractOp.
   manager.addPass(weft::createPlanRISCVMemoryPass());
+  manager.addPass(weft::createMaterializeRISCVReplicaStorageLoadsPass());
   manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
   // Layout canonicalization and partial materialization may rewrite the
   // carrier of surviving numerical operations.  Re-select their exact

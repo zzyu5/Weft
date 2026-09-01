@@ -380,18 +380,10 @@ logical contraction 相同；若优化只提升 blocked prefill，或只在某�
 
 ## 10. 可证伪预测
 
-下表用于后续对答案。若完成作者前置条件后，主要瓶颈分类有一半以上错误，本方法应被
-视为事后归纳并重写。
+每个新机制必须在实现前把作者前置条件、主要瓶颈类别、预期可见计数和第二个独立输入写进
+当轮 report。实现后只追加 HIT/MISS 与反例，不能改写原预测来迁就结果。完成作者前置条件后，
+若已决项中主要分类有一半以上错误，这套分类应被视为事后归纳并重写。
 
-| 格式/入口 | 作者前置条件 | 主要预测 | 预期可见现象 | 对答案 |
-|---|---|---|---|---|
-| IQ1_S / IQ1_M | grid/sign的entry与lane必须成为shaped axes，不能保留Python展开 | 先P2，再P4；P3次之 | 同一grid/sign entry跨output共享；reduce前保留lane partial；lookup/load次数不随consumer线性增长 | 待验证 |
-| IQ2_S / IQ2_XS / IQ2_XXS | entry、payload、group与output cohort显式存在 | P2供应与P4 partial topology；indexed-entry只解决P3的一部分 | entry payload一次载入服务多个uses；当前逐group scalar carry变成partial set；若只出现typed indexed load而计数不降，预测未成立 | **MISS**：首要缺口实际是P1 issue/product carrier与P3 indexed-entry；P2随后生效，P4完整product最后补齐。不能用后两项部分命中改写首因 |
-| IQ3_S / IQ3_XXS | grid/sign与high-bit plane写成shaped values | P3 joined/bit-plane geometry，然后P2/P4 | scalar shift/index链减少；raw plane/window供应一次；最终reduction次数下降 | 待验证 |
-| TQ1_0 | 当前shaped radix-3 tree已满足 | P4为主，P3为次；prefill再看P5 | 每个32/16-lane段的五个products形成independent/compact partial而非串行chain；`vwredsum/vmv.x.s`推迟；qh regular-repeat不退化为scalar地址 | 待验证 |
-| Q4_K canonical | 必须先决定canonical ABI下的blocked/local-materialize作者tree；persistent derived encoding是另一程序 | 作者边界优先；tree成立后P2/P3/P5 | 若仍是row×column，compiler不能创造output cohort；若blocked tree成立，应看到activation跨output共享、typed local pack和跨K steady state | 待验证 |
-| Q5_K剩余dequant | 现有shaped sub-axis足够 | P3 joined q/qh geometry与P2 raw-window供应 | q/qh不分别重复构造scalar index；一个typed joined window服务decode；contraction partial不是主要矛盾 | 待验证 |
-
-这些预测不授权按格式名实现pass。格式名只用于实验定位；真正的compiler规则仍必须以axis、
-storage geometry、use-def、effect、target facts和resources为输入，并在第二个独立输入上验证。
-当前累计对答案为 `0 HIT / 1 MISS / 5 pending`。后续结果只追加事实，不回改原预测措辞。
+预测中的格式名只用于实验定位，不授权按格式名实现pass。真正的compiler规则仍必须以axis、
+storage geometry、use-def、effect、target facts和resources为输入。预测表、累计数字和待验证状态
+是可变实验事实，只进入`report/`，不进入本设计规范。

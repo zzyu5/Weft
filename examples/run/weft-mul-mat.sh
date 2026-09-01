@@ -328,8 +328,19 @@ else
       kernel=production_mul_mat_iq4_nl
       meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
     fi
+  elif [[ ${format} == iq1_s ]]; then
+    kernel=production_mul_mat_iq1_s
+    if [[ ${phase} == decode ]]; then
+      physical=(--auto-lmul-eighths=32 --auto-unroll=4 --auto-pipeline-depth=1)
+    else
+      physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+    fi
   elif [[ ${format} == iq2_xxs ]]; then
-    physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+    if [[ ${target} == sg2044 ]]; then
+      physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      physical=(--auto-lmul-eighths=32 --auto-unroll=4 --auto-pipeline-depth=1)
+    fi
     if [[ ${phase} == decode ]]; then
       kernel=production_mul_mat_iq2_xxs_decode
       runtime_kernel_define=-DWEFT_IQ2_XXS_DECODE=1

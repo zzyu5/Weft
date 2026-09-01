@@ -735,11 +735,12 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
   if (auto load =
           mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(definition)) {
     auto field = load.getField().getDefiningOp<riscv::FieldOp>();
+    auto sourcePlan = load.getPlan();
     const int64_t issueParts =
         product(resultType.getLayout().getTimeFactors()) *
         product(resultType.getLayout().getReplicaFactors());
-    if (!field || load.getPlan().getKind() != "unit" ||
-        load.getPlan().getReductionAxis() != axis ||
+    if (!field || !sourcePlan || sourcePlan.getKind() != "unit" ||
+        sourcePlan.getReductionAxis() != axis ||
         load.getRecordRank() != 0 || issueParts != 1)
       return mlir::failure();
 
@@ -773,22 +774,38 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
       return mlir::failure();
     }
 
-    auto plan = riscv_internal::storageWindowPlan(
-        rewriter, field, axis, 0, 1, 1, windowExtent, 1);
-    if (!plan)
-      return mlir::failure();
+    // The storage-load owner has already selected the physical memory form.
+    // Issue-window materialization only projects that closed unit-load plan to
+    // one smaller carrier; it must not re-run storage-form selection.
+    const int64_t projectedAlignment =
+        std::gcd(sourcePlan.getOffsetAlignment(), windowExtent);
+    auto projectedPlan = riscv::StorageWindowPlanAttr::get(
+        rewriter.getContext(), sourcePlan.getKind(),
+        sourcePlan.getReductionAxis(), sourcePlan.getProjectionBase(),
+        sourcePlan.getProjectionStride(), sourcePlan.getProjectionRepeat(),
+        windowExtent, std::max<int64_t>(1, projectedAlignment),
+        sourcePlan.getRecordElements(), sourcePlan.getByteOffset(),
+        sourcePlan.getElementBits(), sourcePlan.getGroupSize(),
+        sourcePlan.getLayerSize(), sourcePlan.getPhysicalLayerBase(),
+        sourcePlan.getPhysicalLayerStep(), sourcePlan.getShiftBase(),
+        sourcePlan.getShiftStep(), sourcePlan.getMaskValue());
     auto zero = rewriter.getDenseI64ArrayAttr({0});
     auto empty = rewriter.getDenseI64ArrayAttr({});
+    auto selected = load.getLeaf();
+    const int64_t temporaryGroups = std::max<int64_t>(
+        1, (resultType.getLayout().getLmulEighths() + 7) / 8);
     auto cloned = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
-        load.getLoc(), resultType, load.getField(), issueBase, *plan, 0, zero,
-        empty, zero, zero, zero, zero, zero, zero, load.getAccess(),
+        load.getLoc(), resultType, load.getField(), issueBase, projectedPlan, 0,
+        zero, empty, zero, zero, zero, zero, zero, zero, load.getAccess(),
         riscv_internal::leaf(
-            rewriter, "rvv", "replica-storage-load",
-            "rvv.replica-storage-load.natural",
-            "rvv.replica-storage-load.natural", 0,
-            resultType.getLayout().getRegisterGroups(), 1, 0, "none",
+            rewriter, selected.getEngine(), selected.getFamily(),
+            selected.getInstruction(), selected.getSpelling(),
+            selected.getOperandGroups(),
+            resultType.getLayout().getRegisterGroups(), temporaryGroups,
+            selected.getFragmentGroups(), selected.getMask(),
             resultType.getLayout().getValidity() == "tail" ? "agnostic"
-                                                           : "exact"));
+                                                           : "exact",
+            selected.getParameters(), selected.getLocalBytes()));
     return remember(cloned.getResult());
   }
 
