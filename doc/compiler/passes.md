@@ -73,6 +73,12 @@ validity 与 register groups。普通无特殊 anchor 的 shaped value使用 tar
 storage layer 宽度同样沿这条 use-def 链传播；target 不能因此把超过真实
 grouped/layered 宽度的逻辑 lane 伪装成一次 indexed load。
 
+同一个 widening contraction 的两个 operand 必须共享一套 reduction carrier。两侧
+storage proposal 一致时保留该 mapping；不一致但拥有相同 reduction axes 与 extents 时，
+按作者声明的 reduction-axis 顺序建立共同 carrier：最后一轴作为 primary lane，其余轴在其外
+coalesce。storage order 只决定 operand 怎样供应这个 carrier，不能分别替两个 operand 决定
+互不相容的 contraction layout；所需差异必须由后续显式 memory form 或 conversion 承载。
+
 pointwise、state 与 control handoff 的要求不一致时，pass 插入真实 `convert_layout`；
 `for/if/while` 的 carried/result types 同时被改写。无法保持 logical axes 或无合法 LMUL 时
 失败，不通过静默 scalarization 继续。

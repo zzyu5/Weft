@@ -732,6 +732,66 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
     return remember(cloned.getResult());
   }
 
+  if (auto load =
+          mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(definition)) {
+    auto field = load.getField().getDefiningOp<riscv::FieldOp>();
+    const int64_t issueParts =
+        product(resultType.getLayout().getTimeFactors()) *
+        product(resultType.getLayout().getReplicaFactors());
+    if (!field || load.getPlan().getKind() != "unit" ||
+        load.getPlan().getReductionAxis() != axis ||
+        load.getRecordRank() != 0 || issueParts != 1)
+      return mlir::failure();
+
+    mlir::Value base = load.getLogicalBase();
+    mlir::Value issueBase;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(base.getType())) {
+      auto typedIndex = rewriter.create<riscv::CastOp>(
+          load.getLoc(), integer, windowIndex,
+          riscv_internal::unselectedLeaf(rewriter));
+      auto extent = rewriter.create<riscv::ConstantOp>(
+          load.getLoc(), integer,
+          rewriter.getIntegerAttr(integer, windowExtent));
+      auto offset = rewriter.create<riscv::BinaryOp>(
+          load.getLoc(), integer, typedIndex.getResult(), extent.getResult(),
+          "mul", riscv_internal::unselectedLeaf(rewriter));
+      issueBase = rewriter
+                      .create<riscv::BinaryOp>(
+                          load.getLoc(), integer, base, offset.getResult(),
+                          "add", riscv_internal::unselectedLeaf(rewriter))
+                      .getResult();
+    } else if (base.getType().isIndex()) {
+      auto extent = rewriter.create<mlir::arith::ConstantIndexOp>(
+          load.getLoc(), windowExtent);
+      auto offset = rewriter.create<mlir::arith::MulIOp>(
+          load.getLoc(), windowIndex, extent.getResult());
+      issueBase = rewriter
+                      .create<mlir::arith::AddIOp>(
+                          load.getLoc(), base, offset.getResult())
+                      .getResult();
+    } else {
+      return mlir::failure();
+    }
+
+    auto plan = riscv_internal::storageWindowPlan(
+        rewriter, field, axis, 0, 1, 1, windowExtent, 1);
+    if (!plan)
+      return mlir::failure();
+    auto zero = rewriter.getDenseI64ArrayAttr({0});
+    auto empty = rewriter.getDenseI64ArrayAttr({});
+    auto cloned = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
+        load.getLoc(), resultType, load.getField(), issueBase, *plan, 0, zero,
+        empty, zero, zero, zero, zero, zero, zero, load.getAccess(),
+        riscv_internal::leaf(
+            rewriter, "rvv", "replica-storage-load",
+            "rvv.replica-storage-load.natural",
+            "rvv.replica-storage-load.natural", 0,
+            resultType.getLayout().getRegisterGroups(), 1, 0, "none",
+            resultType.getLayout().getValidity() == "tail" ? "agnostic"
+                                                           : "exact"));
+    return remember(cloned.getResult());
+  }
+
   if (auto load = mlir::dyn_cast<riscv::RVVIndexedEntryLoadOp>(definition)) {
     auto indices = cloneOperand(load.getEntryIndices());
     if (mlir::failed(indices)) {
