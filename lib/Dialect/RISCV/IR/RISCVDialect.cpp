@@ -1566,6 +1566,7 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
     mlir::DenseI64ArrayAttr rhsSourceParts,
     mlir::DenseI64ArrayAttr lhsLaneOffsets,
     mlir::DenseI64ArrayAttr rhsLaneOffsets,
+    llvm::StringRef multiplyInstruction,
     llvm::StringRef accumulateInstruction,
     llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
   auto lhs = mlir::dyn_cast<weft::riscv::ValueType>(lhsIssueType);
@@ -1578,6 +1579,15 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
   auto rhsElement =
       rhs ? mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType())
           : mlir::IntegerType();
+  llvm::StringRef expectedMultiply;
+  if (lhsElement && rhsElement) {
+    if (lhsElement.isSigned() && rhsElement.isSigned())
+      expectedMultiply = "rvv.vwmul.vv";
+    else if (lhsElement.isSigned())
+      expectedMultiply = "rvv.vwmulsu.vv";
+    else if (rhsElement.isSigned())
+      expectedMultiply = "rvv.vwmulsu.vv.swap";
+  }
   auto accumulatorElement =
       accumulator
           ? mlir::dyn_cast<mlir::IntegerType>(accumulator.getElementType())
@@ -1587,7 +1597,7 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
   for (int64_t axis : reductionAxes.asArrayRef())
     validReductionAxes &= axis > 0 && seenReductionAxes.insert(axis).second;
   if ((realization != "fused" && realization != "per_stream") ||
-      issueCount <= 1 || !validReductionAxes || !lhs || !rhs || !accumulator ||
+      issueCount <= 0 || !validReductionAxes || !lhs || !rhs || !accumulator ||
       !lhsElement || !rhsElement || !accumulatorElement ||
       lhsElement.isSignless() || rhsElement.isSignless() ||
       accumulatorElement.isSignless() ||
@@ -1601,12 +1611,13 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
       lhsSourceParts.size() != lhsLaneOffsets.size() ||
       rhsSourceParts.size() != rhsLaneOffsets.size() ||
       lhsSourceParts.size() % static_cast<size_t>(issueCount) ||
+      multiplyInstruction != expectedMultiply ||
       accumulateInstruction != "rvv.vwmacc.partial" ||
       (finalizeInstruction != "rvv.vwredsum.partial" &&
        finalizeInstruction != "rvv.vredsum.partial") ||
       resourceGroups <= 0)
     return emitError()
-           << "sequential partial plan requires one closed multi-axis issue-slice, widened-accumulator, and final-reduction program";
+           << "sequential partial plan requires one closed issue-slice, widened product/accumulator, and final-reduction program";
   auto lhsPhysicalParts = physicalPartCount(lhs);
   auto rhsPhysicalParts = physicalPartCount(rhs);
   const int64_t expectedResources = std::max<int64_t>(
@@ -5271,13 +5282,9 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   auto layeredPartialPlan = getLayeredPartialPlanAttr();
   const bool topologyAssigned = topologyKind != "unassigned";
   const bool sequentialPlanRequired =
-      getReductionStreams() > 1 &&
+      getReductionStreams() > 0 &&
       (topologyKind == "sequential_fused" ||
        topologyKind == "sequential_per_stream");
-  const bool terminalSequential =
-      getReductionStreams() == 1 &&
-      (topologyKind == "sequential_per_stream" ||
-       topologyKind == "sequential_fused");
   // LowerRISCVComposites creates a legal but deliberately unassigned physical
   // contraction.  The topology pass owns every plan attribute and the final
   // verifier rejects any surviving unassigned op.  Do not require a topology
@@ -5296,9 +5303,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
           (topologyKind == "layered") ==
               static_cast<bool>(layeredPartialPlan);
     else
-      layoutPlanClosed = terminalSequential && !nestedPartialPlan &&
-                         !sequentialPartialPlan && !scaledPartialPlan &&
-                         !layeredPartialPlan;
+      layoutPlanClosed = false;
   }
   if (topologyAssigned && partialLayoutPlan) {
     auto partialSlot = mlir::dyn_cast<ValueType>(
@@ -5477,8 +5482,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       for (size_t position = 0; position < source.getAxisIds().size();
            ++position)
         if (!llvm::is_contained(getOver(), source.getAxisIds()[position]) &&
-            (source.getLayout().getLaneFactors()[position] != 1 ||
-             source.getLayout().getFragmentFactors()[position] != 1 ||
+            (source.getLayout().getFragmentFactors()[position] != 1 ||
              source.getLayout().getLocalFactors()[position] != 1))
           return false;
       return issue.getLayout().getSew() == source.getLayout().getSew() &&
@@ -5507,7 +5511,7 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
         sequentialPartialPlan.getReductionAxes().asArrayRef() == getOver() &&
         lhsIssue &&
         rhsIssue && accumulator &&
-        lhsIssueParts && rhsIssueParts && issueCount > 1 &&
+        lhsIssueParts && rhsIssueParts && issueCount > 0 &&
         sequentialPartialPlan.getLhsSourceParts().asArrayRef() ==
             getLhsParts() &&
         sequentialPartialPlan.getRhsSourceParts().asArrayRef() ==
@@ -6660,8 +6664,7 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
        ++inputPosition)
     if (!llvm::is_contained(result.getAxisIds().asArrayRef(),
                             input.getAxisIds()[inputPosition]))
-      closedAxes &= input.getLayout().getLaneFactors()[inputPosition] == 1 &&
-                    input.getLayout().getFragmentFactors()[inputPosition] == 1 &&
+      closedAxes &= input.getLayout().getFragmentFactors()[inputPosition] == 1 &&
                     input.getLayout().getLocalFactors()[inputPosition] == 1;
   if (!closedAxes || input.getLayout().getSew() != result.getLayout().getSew() ||
       result.getLayout().getLmulEighths() <= 0 ||
@@ -6671,7 +6674,7 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
           result.getLayout().getLmulEighths() ||
       result.getLayout().getVl() != *resultLanes)
     return emitOpError(
-        "RVV issue slice must select one typed lane window and remove only issue-time/register coordinates");
+        "RVV issue slice must select one typed contiguous lane window and remove only non-fragment/non-local coordinates");
   return mlir::success();
 }
 
@@ -6932,11 +6935,13 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
        llvm::equal(expectedShape, resultValue.getShape().asArrayRef()));
   auto loop = getPartial().getDefiningOp<mlir::scf::ForOp>();
   auto explicitChain = getPartial().getDefiningOp<RVVWidenAccumulateOp>();
+  auto explicitProduct = getPartial().getDefiningOp<RVVWidenMultiplyOp>();
   bool completeMapping = validReductionAxes &&
                          partial.getLayout().getCarrier() == "rvv" &&
                          (loop || (explicitChain &&
                                    explicitChain.getReductionAxes() ==
-                                       getReductionAxes()));
+                                       getReductionAxes()) ||
+                          explicitProduct);
   for (int64_t axis : reductionAxes)
     completeMapping &= llvm::is_contained(partial.getAxisIds().asArrayRef(), axis);
   if (completeMapping)

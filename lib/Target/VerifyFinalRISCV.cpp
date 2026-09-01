@@ -47,7 +47,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
       riscv::RVVBitmaskWindowLoadOp,
       riscv::RVVGroupedMacLoadOp,
-      riscv::RVVGroupedMacStepOp, riscv::RVVWidenDotOp,
+      riscv::RVVGroupedMacStepOp,
       riscv::RVVWidenMultiplyOp, riscv::RVVWidenScalarMultiplyOp,
       riscv::RVVRegularRepeatIndexOp,
       riscv::RVVRegularRepeatGatherOp,
@@ -96,7 +96,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVBitmaskWindowLoadOp,
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
-      riscv::RVVWidenDotOp, riscv::RVVWidenMultiplyOp,
+      riscv::RVVWidenMultiplyOp,
       riscv::RVVWidenScalarMultiplyOp,
       riscv::RVVRegularRepeatIndexOp, riscv::RVVRegularRepeatGatherOp,
       riscv::RVVRegularRepeatScalarLoadOp,
@@ -373,24 +373,13 @@ public:
            {"partial_layout_plan", "partial_combine_plan",
             "nested_partial_plan", "sequential_partial_plan",
             "scaled_partial_plan", "layered_partial_plan",
-            "partial_add_tree_plan"})
+            "partial_add_tree_plan", "weft.riscv.unroll_factor"})
         if (operation->hasAttr(name)) {
           operation->emitError()
               << "transient physical plan " << name
               << " survived materialization";
           failed = true;
         }
-      if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation)) {
-        llvm::StringRef kind = dot.getPartialTopology().getKind();
-        if (dot.getReductionStreams() != 1 ||
-            (kind != "sequential_fused" &&
-             kind != "sequential_per_stream")) {
-          dot.emitError()
-              << "multi-stream partial topology was not materialized; topology="
-              << dot.getPartialTopology();
-          failed = true;
-        }
-      }
       if (mlir::isa<riscv::RVVGroupedMacLoadOp>(operation)) {
         auto loop = operation->getParentOfType<mlir::scf::ForOp>();
         auto systemUnroll =

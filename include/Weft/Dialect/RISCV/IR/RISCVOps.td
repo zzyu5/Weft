@@ -379,6 +379,7 @@ def WeftRISCV_SequentialPartialPlanAttr
     "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$lhsLaneOffsets,
     "::mlir::DenseI64ArrayAttr":$rhsLaneOffsets,
+    StringRefParameter<"selected widened multiply instruction">:$multiplyInstruction,
     StringRefParameter<"selected widened accumulate instruction">:$accumulateInstruction,
     StringRefParameter<"selected final reduction instruction">:$finalizeInstruction,
     "int64_t":$resourceGroups
@@ -388,7 +389,8 @@ def WeftRISCV_SequentialPartialPlanAttr
         $lhsIssueType `,` $rhsIssueType `,`
         $accumulatorType `,` $lhsSourceParts `,` $rhsSourceParts `,`
         $lhsLaneOffsets `,` $rhsLaneOffsets `,`
-        $accumulateInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
+        $multiplyInstruction `,` $accumulateInstruction `,`
+        $finalizeInstruction `,` $resourceGroups `>`
   }];
   let genVerifyDecl = 1;
 }

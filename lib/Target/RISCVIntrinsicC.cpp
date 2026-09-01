@@ -644,7 +644,6 @@ private:
   compileGroupedMacLoad(riscv::RVVGroupedMacLoadOp operation);
   mlir::LogicalResult
   compileGroupedMacStep(riscv::RVVGroupedMacStepOp operation);
-  mlir::LogicalResult compileRVVWidenDot(riscv::RVVWidenDotOp operation);
   mlir::LogicalResult
   compileRVVWidenMultiply(riscv::RVVWidenMultiplyOp operation);
   mlir::LogicalResult compileRVVWidenScalarMultiply(
@@ -2375,8 +2374,6 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileGroupedMacLoad(load);
   if (auto step = mlir::dyn_cast<riscv::RVVGroupedMacStepOp>(operation))
     return compileGroupedMacStep(step);
-  if (auto dot = mlir::dyn_cast<riscv::RVVWidenDotOp>(operation))
-    return compileRVVWidenDot(dot);
   if (auto multiply = mlir::dyn_cast<riscv::RVVWidenMultiplyOp>(operation))
     return compileRVVWidenMultiply(multiply);
   if (auto multiply =
@@ -9160,169 +9157,6 @@ Emitter::compileGroupedMacStep(riscv::RVVGroupedMacStepOp operation) {
            ", " + widened + ", " + vl + ");");
     }
     output.parts.push_back(std::move(result));
-  }
-  bindings[operation.getResult()] = std::move(output);
-  return mlir::success();
-}
-
-mlir::LogicalResult
-Emitter::compileRVVWidenDot(riscv::RVVWidenDotOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.vwmul-vwredsum")
-    return fail(operation, "RVV widening dot has no exact selected leaf");
-  if (operation.getReductionStreams() != 1)
-    return fail(operation,
-                "multi-stream RVV widening dot was not materialized before terminal emission");
-  mlir::FailureOr<Binding> lhs = materializeNumeric(
-      operation.getLhs(), bindings.lookup(operation.getLhs()));
-  mlir::FailureOr<Binding> rhs = materializeNumeric(
-      operation.getRhs(), bindings.lookup(operation.getRhs()));
-  if (mlir::failed(lhs) || mlir::failed(rhs))
-    return mlir::failure();
-  if (lhs->kind != Binding::Kind::Vector ||
-      rhs->kind != Binding::Kind::Vector || lhs->parts.empty() ||
-      rhs->parts.empty())
-    return fail(operation,
-                "RVV widening dot requires materialized vector operands");
-  const int64_t lhsStreams = streamPartCount(operation.getLhs());
-  const int64_t rhsStreams = streamPartCount(operation.getRhs());
-  if (lhsStreams <= 0 || rhsStreams <= 0 ||
-      lhs->parts.size() !=
-          static_cast<size_t>(lhsStreams * registerPartCount(operation.getLhs())) ||
-      rhs->parts.size() !=
-          static_cast<size_t>(rhsStreams * registerPartCount(operation.getRhs())))
-    return fail(operation,
-                "RVV widening dot operand streams disagree with their layouts");
-  const int64_t sliceLMUL = operation.getSliceLmulEighths();
-  const int64_t partialLMUL = sliceLMUL * 2;
-  const int64_t inputSEW = operation.getLhs().getType().getLayout().getSew();
-  const int64_t partialSEW = inputSEW * 2;
-  const std::string partialSuffix =
-      "i" + std::to_string(partialSEW) + lmulSpelling(partialLMUL);
-  const std::string partialType =
-      "vint" + std::to_string(partialSEW) + lmulSpelling(partialLMUL) + "_t";
-  auto lhsElement = mlir::cast<mlir::IntegerType>(
-      riscv_internal::logicalElement(operation.getLhs().getType()));
-  auto rhsElement = mlir::cast<mlir::IntegerType>(
-      riscv_internal::logicalElement(operation.getRhs().getType()));
-  const bool mixedSignedness = lhsElement.isSigned() != rhsElement.isSigned();
-  std::string seed = fresh("widen_seed");
-  line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
-  auto resultValue = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
-  const int64_t outputParts =
-      resultValue ? registerPartCount(operation.getResult()) : 1;
-  Binding output;
-  output.kind = resultValue ? Binding::Kind::ScalarTuple : Binding::Kind::Scalar;
-  if (operation.getReductionLanes() <= 0 || sliceLMUL <= 0 ||
-      operation.getReductionStreams() <= 0 ||
-      operation.getLhsLaneOffsets().size() !=
-          static_cast<size_t>(outputParts) ||
-      operation.getRhsLaneOffsets().size() !=
-          static_cast<size_t>(outputParts) ||
-      operation.getLhsParts().size() !=
-          static_cast<size_t>(outputParts * operation.getReductionStreams()) ||
-      operation.getRhsParts().size() !=
-          static_cast<size_t>(outputParts * operation.getReductionStreams()))
-    return fail(operation,
-                "RVV widening dot is missing its typed lane-slice plan");
-  for (int64_t outputPart = 0; outputPart < outputParts; ++outputPart) {
-    std::string total = fresh("widen_dot");
-    line("int32_t " + total + " = 0;");
-    llvm::SmallVector<std::string> products;
-    llvm::SmallVector<std::string> productVLs;
-    for (int64_t stream = 0; stream < operation.getReductionStreams(); ++stream) {
-      const size_t planned = static_cast<size_t>(
-          outputPart * operation.getReductionStreams() + stream);
-      const int64_t lhsPartValue = operation.getLhsParts()[planned];
-      const int64_t rhsPartValue = operation.getRhsParts()[planned];
-      if (lhsPartValue < 0 || rhsPartValue < 0 ||
-          lhsPartValue >= static_cast<int64_t>(lhs->parts.size()) ||
-          rhsPartValue >= static_cast<int64_t>(rhs->parts.size()))
-        return fail(operation,
-                    "RVV widening dot typed operand-part plan is out of bounds");
-      const size_t lhsPart = static_cast<size_t>(lhsPartValue);
-      const size_t rhsPart = static_cast<size_t>(rhsPartValue);
-      auto sliceOperand = [&](mlir::Value value, llvm::StringRef source,
-                              int64_t laneOffset) -> std::optional<std::string> {
-        const int64_t sourceLMUL =
-            mlir::cast<riscv::ValueType>(value.getType())
-                .getLayout()
-                .getLmulEighths();
-        if (sliceLMUL <= 0 || sourceLMUL < sliceLMUL ||
-            sourceLMUL % sliceLMUL || laneOffset < 0 ||
-            laneOffset % operation.getReductionLanes())
-          return std::nullopt;
-        const std::string sourceSuffix = vectorSuffix(value);
-        if (sourceSuffix.empty())
-          return std::nullopt;
-        const char category = sourceSuffix.front();
-        const std::string sliceSuffix =
-            std::string(1, category) + std::to_string(inputSEW) +
-            lmulSpelling(sliceLMUL);
-        const std::string sliceType =
-            std::string(category == 'u' ? "vuint" : "vint") +
-            sliceSuffix.substr(1) + "_t";
-        auto kernel = operation->getParentOfType<riscv::KernelOp>();
-        if (!kernel)
-          return std::nullopt;
-        const int64_t sliceSpan =
-            kernel.getTarget().getVlenBits() * sliceLMUL / (8 * inputSEW);
-        if (sliceSpan <= 0)
-          return std::nullopt;
-        const int64_t group = laneOffset / sliceSpan;
-        const int64_t intra = laneOffset % sliceSpan;
-        std::string sliced = source.str();
-        if (sourceLMUL != sliceLMUL) {
-          sliced = fresh("widen_dot_slice");
-          line(sliceType + " " + sliced + " = __riscv_vget_v_" +
-               sourceSuffix + "_" + sliceSuffix + "(" + source.str() + ", " +
-               std::to_string(group) + ");");
-        } else if (group != 0) {
-          return std::nullopt;
-        }
-        if (intra != 0) {
-          std::string shifted = fresh("widen_dot_slide");
-          line(sliceType + " " + shifted + " = __riscv_vslidedown_vx_" +
-               sliceSuffix + "(" + sliced + ", " + std::to_string(intra) +
-               ", " + std::to_string(operation.getReductionLanes()) + ");");
-          sliced = std::move(shifted);
-        }
-        return sliced;
-      };
-      auto lhsSlice = sliceOperand(operation.getLhs(), lhs->parts[lhsPart],
-                                   operation.getLhsLaneOffsets()[outputPart]);
-      auto rhsSlice = sliceOperand(operation.getRhs(), rhs->parts[rhsPart],
-                                   operation.getRhsLaneOffsets()[outputPart]);
-      if (!lhsSlice || !rhsSlice)
-        return fail(operation,
-                    "RVV widening dot cannot materialize its selected lane slice");
-      const std::string vl = std::to_string(operation.getReductionLanes());
-      const std::string &signedOperand =
-          lhsElement.isSigned() ? *lhsSlice : *rhsSlice;
-      const std::string &unsignedOperand =
-          lhsElement.isSigned() ? *rhsSlice : *lhsSlice;
-      const std::string operands =
-          mixedSignedness
-              ? signedOperand + ", " + unsignedOperand
-              : *lhsSlice + ", " + *rhsSlice;
-      std::string product = fresh("widen_product");
-      line(partialType + " " + product + " = __riscv_" +
-           std::string(mixedSignedness ? "vwmulsu" : "vwmul") + "_vv_" +
-           partialSuffix + "(" + operands + ", " + vl + ");");
-      products.push_back(std::move(product));
-      productVLs.push_back(vl);
-    }
-    for (size_t part = 0; part < products.size(); ++part) {
-      std::string reduced = fresh("widen_sum");
-      const std::string reduction = partialSEW == 16 ? "vwredsum" : "vredsum";
-      line("vint32m1_t " + reduced + " = __riscv_" + reduction + "_vs_" +
-           partialSuffix + "_i32m1(" + products[part] + ", " + seed + ", " +
-           productVLs[part] + ");");
-      line(total + " += __riscv_vmv_x_s_i32m1_i32(" + reduced + ");");
-    }
-    if (resultValue)
-      output.parts.push_back(std::move(total));
-    else
-      output.scalar = std::move(total);
   }
   bindings[operation.getResult()] = std::move(output);
   return mlir::success();
