@@ -47,8 +47,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
       riscv::RVVBitmaskWindowLoadOp,
       riscv::RVVGroupedMacLoadOp,
-      riscv::RVVGroupedMacStepOp, riscv::RVVEncodedDotLoadOp,
-      riscv::RVVEncodedDotStepOp, riscv::RVVWidenDotOp,
+      riscv::RVVGroupedMacStepOp, riscv::RVVWidenDotOp,
       riscv::RVVWidenMultiplyOp, riscv::RVVWidenScalarMultiplyOp,
       riscv::RVVRegularRepeatIndexOp,
       riscv::RVVRegularRepeatGatherOp,
@@ -70,8 +69,9 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
       riscv::RVVProjectedLayeredStreamOp,
-      riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
-      riscv::RVVStreamContractOp, riscv::RVVSplatOp,
+      riscv::RVVStreamLoadOp, riscv::RVVStreamReduceStepOp,
+      riscv::RVVStreamDotStepOp, riscv::RVVStreamContractStepOp,
+      riscv::RVVStreamFinalizeOp, riscv::RVVSplatOp,
       riscv::RVVAxisBroadcastOp,
       riscv::ProjectReductionOperandOp, riscv::RVVContractStepOp,
       riscv::RVVEncodedContractStepOp>(operation);
@@ -96,7 +96,6 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVBitmaskWindowLoadOp,
       riscv::RVVGroupedMacLoadOp,
       riscv::RVVGroupedMacStepOp,
-      riscv::RVVEncodedDotLoadOp, riscv::RVVEncodedDotStepOp,
       riscv::RVVWidenDotOp, riscv::RVVWidenMultiplyOp,
       riscv::RVVWidenScalarMultiplyOp,
       riscv::RVVRegularRepeatIndexOp, riscv::RVVRegularRepeatGatherOp,
@@ -117,8 +116,9 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVPartitionedWidenReduceStoreOp,
       riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
       riscv::RVVProjectedLayeredStreamOp,
-      riscv::RVVStreamReduceOp, riscv::RVVStreamDotOp,
-      riscv::RVVStreamContractOp, riscv::RVVSplatOp,
+      riscv::RVVStreamLoadOp, riscv::RVVStreamReduceStepOp,
+      riscv::RVVStreamDotStepOp, riscv::RVVStreamContractStepOp,
+      riscv::RVVStreamFinalizeOp, riscv::RVVSplatOp,
       riscv::RVVAxisBroadcastOp,
       riscv::ProjectReductionOperandOp,
       riscv::RVVContractStepOp, riscv::RVVEncodedContractStepOp>(operation);
@@ -229,9 +229,7 @@ mlir::LogicalResult verifyDescriptorFacts(mlir::Operation *owner,
 }
 
 bool requiresIntegerWidening(mlir::Operation *operation) {
-  if (mlir::isa<riscv::RVVGroupedMacStepOp,
-                riscv::RVVEncodedDotStepOp,
-                riscv::RVVWidenDotOp,
+  if (mlir::isa<riscv::RVVGroupedMacStepOp, riscv::RVVWidenDotOp,
                 riscv::RVVPartialSetOp,
                 riscv::RVVPartialCaptureOp, riscv::RVVPartialRepackOp,
                 riscv::RVVPartialMergeOp,
@@ -393,8 +391,7 @@ public:
           failed = true;
         }
       }
-      if (mlir::isa<riscv::RVVGroupedMacLoadOp,
-                    riscv::RVVEncodedDotLoadOp>(operation)) {
+      if (mlir::isa<riscv::RVVGroupedMacLoadOp>(operation)) {
         auto loop = operation->getParentOfType<mlir::scf::ForOp>();
         auto systemUnroll =
             loop ? loop->getAttrOfType<mlir::StringAttr>(
@@ -860,8 +857,7 @@ public:
             riscv::RVVSplatOp, riscv::RVVBitmaskDecodeOp,
             riscv::RVVSignedBitmaskReduceOp,
             riscv::RVVBitmaskWindowLoadOp,
-            riscv::RVVGroupedMacStepOp,
-            riscv::RVVEncodedDotStepOp, riscv::RVVLayeredRecordLoadOp,
+            riscv::RVVGroupedMacStepOp, riscv::RVVLayeredRecordLoadOp,
             riscv::RVVLayeredWindowOp,
             riscv::RVVLayeredStreamOp, riscv::RVVProjectedLayeredStreamOp,
             riscv::RVVContractStepOp,

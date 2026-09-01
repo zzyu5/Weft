@@ -5122,47 +5122,6 @@ mlir::LogicalResult RVVGroupedMacStepOp::verify() {
   return mlir::success();
 }
 
-mlir::LogicalResult RVVEncodedDotLoadOp::verify() {
-  auto window = getResult().getType();
-  auto lhs = mlir::dyn_cast<ValueType>(getLhs().getType());
-  auto lhsParts = lhs ? physicalPartCount(lhs) : std::nullopt;
-  if (!lhs || lhs.getLayout().getCarrier() != "rvv" || !lhsParts ||
-      *lhsParts % window.getResultParts() ||
-      window.getFamily() != "encoded-dot" || getUnroll() <= 0 ||
-      getRhsPairsPerGroup() <= 0 || getReductionAxis() <= 0 ||
-      window.getReductionAxis() != getReductionAxis() ||
-      window.getSlots() != getUnroll() ||
-      window.getTermsPerSlot() != getRhsPairsPerGroup() ||
-      window.getLhsType() != getLhs().getType() ||
-      window.getRhsType() != getRhs().getType() ||
-      getLhsAccess().getForm() == "unassigned" ||
-      getRhsAccess().getForm() == "unassigned" ||
-      !exactLeaf(getLeaf(), "rvv", "encoded-dot-load",
-                 "rvv.encoded-dot-load.i16-pairs", "none", "agnostic") ||
-      getLeaf().getParameters().asArrayRef() !=
-          llvm::ArrayRef<int64_t>(
-              {static_cast<int64_t>(getReductionAxis()),
-               static_cast<int64_t>(getUnroll()),
-               static_cast<int64_t>(getRhsPairsPerGroup())}))
-    return emitOpError("encoded dot load window contract is incomplete");
-  return mlir::success();
-}
-
-mlir::LogicalResult RVVEncodedDotStepOp::verify() {
-  auto window = getWindow().getType();
-  if (window.getFamily() != "encoded-dot" ||
-      getAccumulator().getType() != getResult().getType() ||
-      window.getResultType() != getResult().getType() ||
-      window.getResultLayout() != getResult().getType().getLayout() ||
-      !exactLeaf(getLeaf(), "rvv", "encoded-dot-step",
-                 "rvv.vzext-vmacc.vx", "none", "agnostic") ||
-      getLeaf().getParameters().asArrayRef() !=
-          llvm::ArrayRef<int64_t>({window.getReductionAxis(), window.getSlots(),
-                                   window.getTermsPerSlot()}))
-    return emitOpError("encoded dot compute step contract is incomplete");
-  return mlir::success();
-}
-
 mlir::LogicalResult RVVWidenDotOp::verify() {
   ValueType lhs = getLhs().getType();
   ValueType rhs = getRhs().getType();
@@ -8091,6 +8050,176 @@ mlir::LogicalResult RVVStreamContractOp::verify() {
     return emitOpError(
         "stream contract reduction axis has a non-lane physical factor");
   return mlir::success();
+}
+
+mlir::LogicalResult RVVStreamLoadOp::verify() {
+  MemDescType source = getSource().getType();
+  ValueType result = getResult().getType();
+  auto encoding = mlir::dyn_cast<kernel::EncodingType>(source.getEncoding());
+  auto element = result.getElementType();
+  const bool supportedElement = element.isF16() || element.isF32();
+  const bool familyMatches =
+      encoding && ((element.isF16() && encoding.getFamily() == "f16") ||
+                   (element.isF32() && encoding.getFamily() == "f32"));
+  auto axisPosition = llvm::find(result.getAxisIds().asArrayRef(), getAxis());
+  bool domainClosed = axisPosition != result.getAxisIds().asArrayRef().end();
+  llvm::DenseSet<int64_t> pointAxes;
+  for (mlir::Value point : getFreePoints())
+    pointAxes.insert(mlir::cast<PointType>(point.getType())
+                         .getDomain()
+                         .getAxisId());
+  for (auto [position, axis] :
+       llvm::enumerate(result.getAxisIds().asArrayRef())) {
+    auto sourceAxis = llvm::find(source.getAxisIds().asArrayRef(), axis);
+    domainClosed &= sourceAxis != source.getAxisIds().asArrayRef().end();
+    if (axis == getAxis()) {
+      domainClosed &= result.getLayout().getLaneFactors()[position] ==
+                          result.getLayout().getVl() &&
+                      result.getLayout().getTimeFactors()[position] == 1 &&
+                      result.getLayout().getReplicaFactors()[position] == 1;
+    } else {
+      domainClosed &= result.getLayout().getLaneFactors()[position] == 1 &&
+                      result.getLayout().getTimeFactors()[position] == 1;
+      if (result.getLayout().getReplicaFactors()[position] > 1)
+        domainClosed &= pointAxes.contains(axis);
+    }
+  }
+  llvm::StringRef tail = getGuarded() ? "agnostic" : "exact";
+  if (!encoding || encoding.getKind() != "dense" || !supportedElement ||
+      !familyMatches || !domainClosed ||
+      result.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getSew() != elementBitWidth(element) ||
+      result.getLayout().getVl() <= 1 ||
+      (getAccess().getForm() != "unit" &&
+       getAccess().getForm() != "strided") ||
+      getAccess().getMapping() != "dense" ||
+      !exactLeaf(getLeaf(), "transfer", "stream-load", "rvv.stream-load",
+                 "none", tail) ||
+      getLeaf().getOperandGroups() != 0 ||
+      getLeaf().getResultGroups() !=
+          result.getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != 0 ||
+      getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "RVV stream load requires one dense typed lane window, explicit free-axis points, and an exact selected memory form");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVStreamReduceStepOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType accumulator = getAccumulator().getType();
+  ValueType result = getResult().getType();
+  if (input != accumulator || result != accumulator ||
+      !result.getElementType().isF32() ||
+      (getKind() != "add" && getKind() != "max" && getKind() != "min") ||
+      !exactLeaf(getLeaf(), "rvv", "stream-reduce-step",
+                 "rvv.stream-reduce-step", "none", "exact") ||
+      getLeaf().getOperandGroups() !=
+          input.getLayout().getRegisterGroups() +
+              accumulator.getLayout().getRegisterGroups() ||
+      getLeaf().getResultGroups() != result.getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != 0)
+    return emitOpError(
+        "RVV stream reduce step requires matching f32 lane values and one selected reduction operator");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVStreamDotStepOp::verify() {
+  ValueType lhs = getLhs().getType();
+  ValueType rhs = getRhs().getType();
+  ValueType accumulator = getAccumulator().getType();
+  ValueType result = getResult().getType();
+  if (lhs != rhs || lhs != accumulator || result != accumulator ||
+      !result.getElementType().isF32() ||
+      !exactLeaf(getLeaf(), "rvv", "stream-dot-step",
+                 "rvv.stream-dot-step", "none", "exact") ||
+      getLeaf().getOperandGroups() !=
+          lhs.getLayout().getRegisterGroups() +
+              rhs.getLayout().getRegisterGroups() +
+              accumulator.getLayout().getRegisterGroups() ||
+      getLeaf().getResultGroups() != result.getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != 0)
+    return emitOpError(
+        "RVV stream dot step requires matching f32 lane operands and accumulator");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVStreamContractStepOp::verify() {
+  ValueType lhs = getLhs().getType();
+  ValueType rhs = getRhs().getType();
+  ValueType accumulator = getAccumulator().getType();
+  ValueType result = getResult().getType();
+  const bool ordinary = lhs.getElementType().isF32() &&
+                        rhs.getElementType().isF32();
+  const bool widening = lhs.getElementType().isF16() &&
+                        rhs.getElementType().isF16();
+  const llvm::StringRef instruction =
+      widening ? "rvv.stream-widen-contract-step"
+               : "rvv.stream-contract-step";
+  auto hasAxis = [&](ValueType value) {
+    return llvm::is_contained(value.getAxisIds().asArrayRef(),
+                              getReductionAxis());
+  };
+  if ((!ordinary && !widening) || !hasAxis(lhs) || !hasAxis(rhs) ||
+      !hasAxis(accumulator) || result != accumulator ||
+      !accumulator.getElementType().isF32() ||
+      !exactLeaf(getLeaf(), "rvv", "stream-contract-step", instruction,
+                 "none", "exact") ||
+      getLeaf().getOperandGroups() !=
+          lhs.getLayout().getRegisterGroups() +
+              rhs.getLayout().getRegisterGroups() +
+              accumulator.getLayout().getRegisterGroups() ||
+      getLeaf().getResultGroups() != result.getLayout().getRegisterGroups() ||
+      getLeaf().getTemporaryGroups() != 0)
+    return emitOpError(
+        "RVV stream contract step requires two typed floating lane windows and one f32 accumulator topology");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVStreamFinalizeOp::verify() {
+  ValueType input = getInput().getType();
+  llvm::SmallVector<int64_t> expectedShape;
+  llvm::SmallVector<int64_t> expectedAxes;
+  bool foundAxis = false;
+  for (auto [shape, axis] : llvm::zip(input.getShape().asArrayRef(),
+                                     input.getAxisIds().asArrayRef())) {
+    if (axis == getAxis()) {
+      foundAxis = true;
+      continue;
+    }
+    expectedShape.push_back(shape);
+    expectedAxes.push_back(axis);
+  }
+  bool resultClosed = getResult().getType().isF32() && expectedAxes.empty();
+  if (auto result = mlir::dyn_cast<ValueType>(getResult().getType())) {
+    resultClosed = result.getElementType().isF32() &&
+                   result.getLayout().getCarrier() == "scalar" &&
+                   result.getAxisIds().asArrayRef() == llvm::ArrayRef(expectedAxes) &&
+                   result.getShape().size() == expectedShape.size();
+    for (size_t position = 0; resultClosed && position < expectedShape.size();
+         ++position) {
+      const int64_t declared = result.getShape()[position];
+      const int64_t represented =
+          result.getLayout().getTimeFactors()[position] *
+          result.getLayout().getLaneFactors()[position] *
+          result.getLayout().getReplicaFactors()[position] *
+          result.getLayout().getFragmentFactors()[position] *
+          result.getLayout().getLocalFactors()[position];
+      resultClosed &= (declared > 0 ? declared : represented) ==
+                      expectedShape[position];
+    }
+  }
+  if (!foundAxis || !input.getElementType().isF32() ||
+      input.getLayout().getCarrier() != "rvv" || !resultClosed ||
+      (getKind() != "add" && getKind() != "max" && getKind() != "min") ||
+      !exactLeaf(getLeaf(), "rvv", "stream-finalize",
+                 "rvv.stream-finalize", "none", "exact") ||
+      getLeaf().getOperandGroups() != input.getLayout().getRegisterGroups() ||
+      getLeaf().getResultGroups() != 0 ||
+      getLeaf().getTemporaryGroups() != 1)
+    return emitOpError(
+        "RVV stream finalize requires one f32 reduction lane and its exact scalar free-axis projection");
+  return verifyLeafOperation(*this);
 }
 
 mlir::LogicalResult RVVSplatOp::verify() {

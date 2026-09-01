@@ -1332,28 +1332,6 @@ def WeftRISCV_RVVGroupedMacStepOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RVVEncodedDotLoadOp
-    : WeftRISCV_Op<"rvv_encoded_dot_load", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$group_index,
-                       Index:$group_count, I64Attr:$unroll,
-                       I64Attr:$rhs_pairs_per_group,
-                       I64Attr:$reduction_axis,
-                       WeftRISCV_AccessAttr:$lhs_access,
-                       WeftRISCV_AccessAttr:$rhs_access,
-                       WeftRISCV_LeafAttr:$leaf);
-  let results = (outs WeftRISCV_WindowType:$result);
-  let hasVerifier = 1;
-}
-
-def WeftRISCV_RVVEncodedDotStepOp
-    : WeftRISCV_Op<"rvv_encoded_dot_step", [Pure]> {
-  let arguments = (ins WeftRISCV_WindowType:$window,
-                       WeftRISCV_ValueType:$accumulator,
-                       WeftRISCV_LeafAttr:$leaf);
-  let results = (outs WeftRISCV_ValueType:$result);
-  let hasVerifier = 1;
-}
-
 def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
@@ -1748,6 +1726,58 @@ def WeftRISCV_RVVStreamContractOp
                        WeftRISCV_AccessAttr:$rhs_access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStreamLoadOp
+    : WeftRISCV_Op<"rvv_stream_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_MemDescType:$source,
+                       Index:$offset, Index:$active, I1:$valid,
+                       Variadic<WeftRISCV_PointType>:$free_points,
+                       I64Attr:$axis, BoolAttr:$guarded,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStreamReduceStepOp
+    : WeftRISCV_Op<"rvv_stream_reduce_step", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       WeftRISCV_ValueType:$accumulator,
+                       Index:$active, StrAttr:$kind,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStreamDotStepOp
+    : WeftRISCV_Op<"rvv_stream_dot_step", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$lhs,
+                       WeftRISCV_ValueType:$rhs,
+                       WeftRISCV_ValueType:$accumulator,
+                       Index:$active, WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStreamContractStepOp
+    : WeftRISCV_Op<"rvv_stream_contract_step", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$lhs,
+                       WeftRISCV_ValueType:$rhs,
+                       WeftRISCV_ValueType:$accumulator,
+                       Index:$active, I64Attr:$reduction_axis,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVStreamFinalizeOp
+    : WeftRISCV_Op<"rvv_stream_finalize", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       I64Attr:$axis, StrAttr:$kind,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
