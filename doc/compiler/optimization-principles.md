@@ -169,10 +169,12 @@ producer 定义点到 last use 的 live interval
 ### 4.4 责任与 pass
 
 source Value 的 birth、Level 与 handoff 归作者；同一次 birth 的 physical placement、reload、
-rematerialize和consumer sharing归编译器。当前 `CanonicalizeRISCVLayouts` 只有受限
-single-use rematerialization，`ShareRISCVLayeredWindows` 只覆盖 typed layered geometry，
-`PlanRISCVMemory` 能形成部分 shared window。一般的 multi-consumer placement/lifetime
-选择仍没有统一 owner。
+rematerialize和consumer sharing归编译器。`PlanRISCVMemory`拥有同一block内byte-aligned
+natural encoded scalar的multi-consumer placement：它沿纯一元use-def链找到共同supply，
+并以真实`physical-share` SSA value冻结一次load/decode。跨block、跨Level、vector/local
+allocation以及混合effect的placement尚无统一owner；这些情况仍分别受
+`CanonicalizeRISCVLayouts`的受限single-use rematerialization、
+`ShareRISCVLayeredWindows`的typed layered geometry与显式local materialization约束。
 
 Triton `OptimizeDotOperands.cpp:181-299` 把 local allocation/load 提到共同 base tensor并让
 多个 views消费；`RemoveLayoutConversions.cpp:42-59` 以 anchor、propagation、conflict与

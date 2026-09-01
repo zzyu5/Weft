@@ -336,6 +336,13 @@ else
     else
       kernel=production_mul_mat_iq2_xxs
     fi
+  elif [[ ${format} == iq3_s || ${format} == iq3_xxs ]]; then
+    kernel=production_mul_mat_${format}
+    if [[ ${target} == sg2044 ]]; then
+      physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+    else
+      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+    fi
   elif [[ ${format} == iq4_xs ]]; then
     physical=(--auto-unroll=1 --auto-pipeline-depth=1)
     if [[ ${phase} == decode ]]; then

@@ -4406,11 +4406,20 @@ mlir::LogicalResult IMEUnpackOp::verify() {
 }
 
 mlir::LogicalResult RegisterMaterializeOp::verify() {
+  const bool physicalShare = getRealization() == "physical-share";
+  auto value = mlir::dyn_cast<ValueType>(getResult().getType());
+  const bool scalarPhysical =
+      isScalar(getResult().getType()) ||
+      (value && value.getLayout().getCarrier() == "scalar");
   if (!isPhysicalValue(getInput().getType()) ||
       getInput().getType() != getResult().getType() ||
-      getOwnerDomainId() < 0 || getBirthId() < 0 ||
-      getLifetimeEndDomainId() < getOwnerDomainId() ||
-      (getRealization() != "share" && getRealization() != "reload" &&
+      (physicalShare
+           ? (!scalarPhysical || getOwnerDomainId() != -1 || getBirthId() != -1 ||
+              getLifetimeEndDomainId() != -1)
+           : (getOwnerDomainId() < 0 || getBirthId() < 0 ||
+              getLifetimeEndDomainId() < getOwnerDomainId())) ||
+      (!physicalShare && getRealization() != "share" &&
+       getRealization() != "reload" &&
        getRealization() != "rematerialize"))
     return emitOpError("register materialize requires stable value identity and lifetime");
   return mlir::success();

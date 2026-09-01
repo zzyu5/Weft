@@ -1225,6 +1225,51 @@ riscv::AccessAttr fieldAccess(mlir::Builder &builder,
                     facts.order);
 }
 
+riscv::ExtractOp encodedScalarRoot(mlir::Value value) {
+  mlir::Operation *definition = value.getDefiningOp();
+  while (definition && definition->getBlock() == value.getParentBlock()) {
+    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition))
+      return extract;
+    if (definition->getNumOperands() != 1 || definition->getNumResults() != 1 ||
+        !mlir::isMemoryEffectFree(definition) ||
+        mlir::isa<riscv::RegisterMaterializeOp>(definition))
+      return {};
+    value = definition->getOperand(0);
+    definition = value.getDefiningOp();
+  }
+  return {};
+}
+
+bool needsScalarEncodedShare(mlir::Value value) {
+  auto result = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  const bool scalar =
+      value.getType().isIndex() ||
+      mlir::isa<mlir::IntegerType, mlir::FloatType>(value.getType()) ||
+      (result && result.getLayout().getCarrier() == "scalar");
+  auto extract = encodedScalarRoot(value);
+  auto field = extract ? riscv_internal::sourceField(extract.getInput())
+                       : riscv::FieldOp();
+  if (!scalar || !extract || !field ||
+      extract.getAccess().getMapping() != "natural" ||
+      extract.getAccess().getBitOffset() % 8)
+    return false;
+
+  auto element = mlir::dyn_cast<mlir::IntegerType>(
+      riscv_internal::logicalElement(value.getType()));
+  if (!element || (element.getWidth() != 8 && element.getWidth() != 16 &&
+                   element.getWidth() != 32))
+    return false;
+
+  unsigned uses = 0;
+  for (mlir::OpOperand &use : value.getUses()) {
+    if (use.getOwner()->getBlock() != value.getParentBlock() ||
+        mlir::isa<riscv::RegisterMaterializeOp>(use.getOwner()))
+      return false;
+    ++uses;
+  }
+  return uses > 1;
+}
+
 class PlanRISCVMemoryPass
     : public mlir::PassWrapper<PlanRISCVMemoryPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -2339,6 +2384,31 @@ public:
     for (riscv::LoadOp load : deadTableLoads)
       if (load && load.getResult().use_empty())
         load.erase();
+
+    // A byte-aligned encoded scalar with several consumers is one physical
+    // supply, not one reload per consumer.  Materialize it at its defining
+    // point so all representation conversions and pointwise users share the
+    // same SSA value.  This is deliberately limited to one block and one Level;
+    // cross-block placement requires a dominance/LCA lifetime decision.
+    llvm::SmallVector<mlir::Value> scalarShareCandidates;
+    getOperation().walk([&](mlir::Operation *operation) {
+      for (mlir::Value result : operation->getResults())
+        if (needsScalarEncodedShare(result))
+          scalarShareCandidates.push_back(result);
+    });
+    for (mlir::Value value : scalarShareCandidates) {
+      mlir::Operation *definition = value.getDefiningOp();
+      if (!definition || !definition->getBlock() ||
+          !needsScalarEncodedShare(value))
+        continue;
+      rewriter.setInsertionPointAfter(definition);
+      auto shared = rewriter.create<riscv::RegisterMaterializeOp>(
+          definition->getLoc(), value.getType(), value, -1, -1, -1,
+          "physical-share");
+      riscv_internal::copyOrigin(definition, shared);
+      value.replaceAllUsesExcept(shared.getResult(), shared.getOperation());
+    }
+
     // Memory materialization can replace the source of an existing pure
     // representation conversion with exactly the representation it requested.
     // Close that edge in the same pass so the verifier never observes an

@@ -679,19 +679,18 @@ def vec_dot_iq3_xxs_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        half = iota(2, dtype=u32, axis="half")
         entry = iota(4, dtype=u32, axis="entry")
         code = iota(2, dtype=u32, axis="code")
         payload = iota(4, dtype=u16, axis="payload")
         block_sum = i32(0)
         group_index = index(0)
-        with L.subs(kb, extent=32) as group:
-            metadata_base = index(64) + group_index * index(4)
-            metadata = u32(w.q[metadata_base]) | (u32(w.q[metadata_base + 1]) << u32(8))
-            metadata = metadata | (u32(w.q[metadata_base + 2]) << u32(16))
-            metadata = metadata | (u32(w.q[metadata_base + 3]) << u32(24))
+        with L.subs(kb, extent=64) as group:
+            metadata = w.metadata[u32(group_index) * u32(2) + half]
             grid_index = widen(
                 w.q[
-                    u32(group_index) * u32(8)
+                    u32(group_index) * u32(16)
+                    + half * u32(8)
                     + entry * u32(2)
                     + code
                 ],
@@ -710,7 +709,8 @@ def vec_dot_iq3_xxs_q8_k(
                 bounds="in_bounds",
             )
             activation = x.q[
-                u32(group_index) * u32(32)
+                u32(group_index) * u32(64)
+                + half * u32(32)
                 + entry * u32(8)
                 + code * u32(4)
                 + u32(payload)
@@ -722,7 +722,7 @@ def vec_dot_iq3_xxs_q8_k(
                 acc=i32,
             )
             scale = i32((metadata >> u32(28)) * u32(2) + u32(1))
-            block_sum += local * scale
+            block_sum += reduce(local * scale, axis="half")
             group_index += index(1)
         sumf += f32(w.d) * f32(x.ds) * f32(block_sum)
     return f32(0.25) * sumf
@@ -738,14 +738,16 @@ def vec_dot_iq3_s_q8_k(
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
         x = admit(X[kb])
+        half = iota(2, dtype=u32, axis="half")
         entry = iota(4, dtype=u32, axis="entry")
         code = iota(2, dtype=u32, axis="code")
         payload = iota(4, dtype=u16, axis="payload")
         block_sum = i32(0)
         group_index = index(0)
-        with L.subs(kb, extent=32) as group:
+        with L.subs(kb, extent=64) as group:
             storage_coordinate = (
-                u32(group_index) * u32(8)
+                u32(group_index) * u32(16)
+                + half * u32(8)
                 + entry * u32(2)
                 + code
             )
@@ -758,14 +760,16 @@ def vec_dot_iq3_s_q8_k(
                 bounds="in_bounds",
             )
             sign_bit = w.signs[
-                u32(group_index) * u32(32)
+                u32(group_index) * u32(64)
+                + half * u32(32)
                 + entry * u32(8)
                 + code * u32(4)
                 + u32(payload)
             ]
             signed_weight = weight * (i8(1) - i8(sign_bit) * i8(2))
             activation = x.q[
-                u32(group_index) * u32(32)
+                u32(group_index) * u32(64)
+                + half * u32(32)
                 + entry * u32(8)
                 + code * u32(4)
                 + u32(payload)
@@ -776,8 +780,11 @@ def vec_dot_iq3_s_q8_k(
                 over=("entry", "code", "payload"),
                 acc=i32,
             )
-            scale = i32(w.scales[group_index]) * i32(2) + i32(1)
-            block_sum += local * scale
+            scale = (
+                i32(w.scales[u32(group_index) * u32(2) + half]) * i32(2)
+                + i32(1)
+            )
+            block_sum += reduce(local * scale, axis="half")
             group_index += index(1)
         result += f32(w.d) * f32(x.ds) * f32(block_sum)
     return result

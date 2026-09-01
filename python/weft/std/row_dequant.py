@@ -295,11 +295,8 @@ def dequantize_iq3_xxs(
             entry = (j % 32) // 8
             lane = j % 8
             grid_base = group * 8
-            metadata_base = 64 + group * 4
             grid_index = w.q[grid_base + entry * 2 + lane // 4]
-            metadata = u32(w.q[metadata_base]) | (u32(w.q[metadata_base + 1]) << u32(8))
-            metadata = metadata | (u32(w.q[metadata_base + 2]) << u32(16))
-            metadata = metadata | (u32(w.q[metadata_base + 3]) << u32(24))
+            metadata = w.metadata[group]
             sign_index = extract_bits(metadata, entry * 7, 7)
             grid_value = nonlinear_lookup(grid, u32(grid_index) * u32(4) + u32(lane % 4))
             sign = nonlinear_lookup(signs, u32(sign_index) * u32(8) + u32(lane))

@@ -582,7 +582,8 @@ public:
               stateBirths.insert(state.getStorage().getType().getBirthId());
             if (auto staged =
                     mlir::dyn_cast<riscv::RegisterMaterializeOp>(nested);
-                staged && staged.getOwnerDomainId() == level.getDomainId())
+                staged && staged.getRealization() != "physical-share" &&
+                staged.getOwnerDomainId() == level.getDomainId())
               stagedBirths.insert(staged.getBirthId());
             if (auto staged = mlir::dyn_cast<riscv::StagedViewOp>(nested);
                 staged && staged.getOwnerDomainId() == level.getDomainId())

@@ -1993,6 +1993,12 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                                                  "weft_load_i16_le(") +
               byteAddress + ")");
         else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
+                 integer && integer.getWidth() == 32)
+          tuple.parts.push_back(
+              std::string(integer.isSigned() ? "((int32_t)" : "") +
+              "weft_load_u32_le(" + byteAddress + ")" +
+              (integer.isSigned() ? ")" : ""));
+        else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
                  integer && integer.getWidth() == 8)
           tuple.parts.push_back(
               std::string(integer.isUnsigned() ? "*(const uint8_t *)(" :
@@ -6696,6 +6702,12 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
           std::string(integer.isUnsigned() ? "weft_load_u16_le(" :
                                              "weft_load_i16_le(") +
           owner.recordPointer + " + " + fragment->byte + ")";
+    } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
+               integer && integer.getWidth() == 32 && naturallyByteAligned) {
+      scalarResult.scalar =
+          std::string(integer.isSigned() ? "((int32_t)" : "") +
+          "weft_load_u32_le(" + owner.recordPointer + " + " +
+          fragment->byte + ")" + (integer.isSigned() ? ")" : "");
     } else {
       return {};
     }
@@ -6841,8 +6853,26 @@ mlir::LogicalResult Emitter::compileRegisterMaterialize(
         materializeNumeric(materialize.getResult(), std::move(input));
     if (mlir::failed(value))
       return mlir::failure();
-    bindings[materialize.getResult()] = std::move(*value);
-    return mlir::success();
+    input = std::move(*value);
+  }
+  if (materialize.getRealization() == "physical-share") {
+    auto type = scalarCType(
+        riscv_internal::logicalElement(materialize.getResult().getType()));
+    if (!type || (input.kind != Binding::Kind::Scalar &&
+                  input.kind != Binding::Kind::ScalarTuple))
+      return fail(materialize,
+                  "physical scalar share has no closed intrinsic-C value");
+    if (input.kind == Binding::Kind::Scalar) {
+      std::string name = fresh("physical_share");
+      line(*type + " " + name + " = " + input.scalar + ";");
+      input.scalar = std::move(name);
+    } else {
+      for (std::string &part : input.parts) {
+        std::string name = fresh("physical_share");
+        line(*type + " " + name + " = " + part + ";");
+        part = std::move(name);
+      }
+    }
   }
   bindings[materialize.getResult()] = std::move(input);
   return mlir::success();

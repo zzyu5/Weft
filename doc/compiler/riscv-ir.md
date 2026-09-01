@@ -42,7 +42,9 @@ pipeline window；它不能替代 caller-visible workspace。动态对象必须�
 `local_capacity_guard` 给出 target-bounded上界，否则 resource pass拒绝它。
 
 `staged_view` 是 reload placement 的唯一 SSA birth authority；register materialization也有真实
-SSA result。staged lifetime不靠无 result marker保存。
+SSA result。作者 staged birth携带 owner/birth/lifetime；编译器在同一block内冻结一次scalar
+supply时使用`physical-share`，其作用域完全由SSA dominance给出，不伪造作者birth。
+staged lifetime不靠无 result marker保存。
 
 ## 4. Explicit conversion
 

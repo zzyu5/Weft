@@ -21,6 +21,7 @@ from weft.language import (
     u6,
     u8,
     u16,
+    u32,
 )
 
 
@@ -224,7 +225,8 @@ class IQ3_XXS:
     alignment = 2
     elements = 256
     d: f16
-    q: u8[96]
+    q: u8[64]
+    metadata: u32[8]
 
 
 @weft.encoding

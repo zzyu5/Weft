@@ -994,6 +994,12 @@ bool mergeRoles(const Roles &source, mlir::Value target, Roles &destination,
 void completeRoles(mlir::Value value, Roles &roles) {
   if (roles.local || roles.ime)
     return;
+  if (roles.registerTuple) {
+    roles.laneAxis = 0;
+    roles.coalescedLaneAxes.clear();
+    addSmallReplicas(value, roles);
+    return;
+  }
   auto axes = riscv_internal::logicalAxes(value.getType());
   // A coalesced lane coordinate cannot exist without a primary lane carrier.
   // Pointwise propagation can legitimately retain only a surviving coalesced

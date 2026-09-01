@@ -85,6 +85,11 @@ natural/grouped-layered/joined 的完整 storage geometry。lookup table被保�
 不是先整表 load。contract 的 lane operand 与 lane memory form也在这里唯一确定，并在
 composite lowering 中消费。
 
+同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
+supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
+birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。
+跨block或跨Level的placement仍需dominance/LCA与effect证明，不能由这条局部规则猜测。
+
 ### `CanonicalizeRISCVLayouts`
 
 该 pass 只做已经实现的真实 rewrite：相邻 pure 逆 conversion 消除、单 use 纯 pointwise producer
