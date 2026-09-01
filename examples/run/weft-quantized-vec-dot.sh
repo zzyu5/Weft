@@ -56,6 +56,18 @@ if [[ ${format} == q3_k ]]; then
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
     physical_auto+=(--auto-pipeline-depth 1)
 fi
+if [[ ${format} == q5_0 || ${format} == q5_1 ]]; then
+  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+    if [[ ${target} == sg2044 ]]; then
+      physical_auto+=(--auto-lmul-eighths 16)
+    else
+      physical_auto+=(--auto-lmul-eighths 8)
+    fi
+  fi
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+    physical_auto+=(--auto-pipeline-depth 1)
+fi
 if [[ ${format} == q2_k ]]; then
   if [[ ${target} == sg2044 ]]; then
     [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 16)

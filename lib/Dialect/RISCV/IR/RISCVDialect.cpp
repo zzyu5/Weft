@@ -4423,14 +4423,26 @@ mlir::LogicalResult RVVBitplaneMergeOp::verify() {
   auto lowElement = mlir::dyn_cast<mlir::IntegerType>(low.getElementType());
   auto planeElement =
       mlir::dyn_cast<mlir::IntegerType>(plane.getElementType());
-  auto field = getPlane().getDefiningOp<FieldOp>();
+  auto window = getPlane().getDefiningOp<RVVBitmaskWindowLoadOp>();
+  auto field = window ? window.getField().getDefiningOp<FieldOp>()
+                      : getPlane().getDefiningOp<FieldOp>();
   const bool logicalPlane =
       planeElement && !planeElement.isSigned() && planeElement.getWidth() == 1 &&
       plane.getShape() == low.getShape() && plane.getAxisIds() == low.getAxisIds() &&
       field && field.getAccess().getForm() == "indexed" &&
       field.getAccess().getMapping() == "grouped_layered" &&
       field.getAccess().getGroupSize() == 8 &&
-      field.getAccess().getLayerSize() == 1;
+      field.getAccess().getLayerSize() == 1 &&
+      (!window ||
+       (window.getAccess().getMapping() == field.getAccess().getMapping() &&
+        window.getAccess().getGroupSize() ==
+            field.getAccess().getGroupSize() &&
+        window.getAccess().getLayerSize() ==
+            field.getAccess().getLayerSize() &&
+        window.getAccess().getOrder() == field.getAccess().getOrder() &&
+        window.getAccess().getBitOffset() ==
+            field.getAccess().getBitOffset() &&
+        window.getResult().getType() == plane));
   const bool bytePlane =
       planeElement && !planeElement.isSigned() && planeElement.getWidth() == 8 &&
       plane.getLayout().getCarrier() == "local";
@@ -4797,6 +4809,15 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   auto sourceAccess = sourceField ? sourceField.getAccess() : AccessAttr();
   llvm::StringRef validity = result.getLayout().getValidity();
   llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
+  const bool vectorLeaf =
+      exactLeaf(getLeaf(), "rvv", "bitmask-window-load",
+                "rvv.bitmask-window-load", "none", tail);
+  const bool maskLeaf =
+      exactLeaf(getLeaf(), "rvv", "bitmask-window-load",
+                "rvv.bitmask-window-mask", "none", tail);
+  const bool maskUse =
+      maskLeaf && getResult().hasOneUse() &&
+      mlir::isa<RVVBitplaneMergeOp>(*getResult().getUsers().begin());
   if (!sourceField || !fieldElement || fieldElement.isSigned() ||
       fieldElement.getWidth() != 1 || !resultElement ||
       resultElement.isSigned() || resultElement.getWidth() != 1 ||
@@ -4818,8 +4839,7 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
       sourceAccess.getOrder() != getAccess().getOrder() ||
       sourceAccess.getBitOffset() != getAccess().getBitOffset() ||
       (validity != "full" && validity != "tail") ||
-      !exactLeaf(getLeaf(), "rvv", "bitmask-window-load",
-                 "rvv.bitmask-window-load", "none", tail))
+      (!vectorLeaf && !maskUse))
     return emitOpError()
            << "RVV bitmask window load requires one byte-aligned logical-u1 field, "
               "one scalar byte base, complete lane window axes, and the exact RVV leaf; "

@@ -39,6 +39,7 @@ bool isBinaryWithConstant(riscv::BinaryOp operation, llvm::StringRef kind,
 struct BitplaneRelation {
   mlir::Value low;
   riscv::FieldOp plane;
+  mlir::Value physicalPlane;
   int64_t insertBit = 0;
   llvm::StringRef instruction;
   riscv::PackedPlaneMergePlanAttr packedPlan;
@@ -198,12 +199,17 @@ matchLogicalBitplane(riscv::BinaryOp merge, mlir::Value low,
   else
     return std::nullopt;
 
-  auto plane = riscv_internal::sourceField(planeValue);
+  auto window = planeValue.getDefiningOp<riscv::RVVBitmaskWindowLoadOp>();
+  auto plane = window
+                   ? window.getField().getDefiningOp<riscv::FieldOp>()
+                   : riscv_internal::sourceField(planeValue);
   auto lowType = mlir::dyn_cast<riscv::ValueType>(low.getType());
   auto resultType = mlir::dyn_cast<riscv::ValueType>(merge.getResult().getType());
-  auto planeType = plane
-                       ? mlir::dyn_cast<riscv::ValueType>(plane.getResult().getType())
-                       : riscv::ValueType();
+  auto planeType = window
+                       ? window.getResult().getType()
+                       : (plane ? mlir::dyn_cast<riscv::ValueType>(
+                                      plane.getResult().getType())
+                                : riscv::ValueType());
   auto lowInteger = lowType ? mlir::dyn_cast<mlir::IntegerType>(
                                   riscv_internal::logicalElement(lowType))
                             : mlir::IntegerType();
@@ -245,7 +251,7 @@ matchLogicalBitplane(riscv::BinaryOp merge, mlir::Value low,
                         : kernel::EncodingType();
   if (!encoding || riscv_internal::interleaveRows(plane, encoding) != 0)
     return std::nullopt;
-  return BitplaneRelation{low, plane, insertBit,
+  return BitplaneRelation{low, plane, planeValue, insertBit,
                           "rvv.bitplane-merge.mask", {}};
 }
 
@@ -331,7 +337,8 @@ matchPackedPlaneMerge(riscv::BinaryOp merge, mlir::Value low,
       merge.getContext(), logicalAxis, lowFacts.group, lowInteger.getWidth(),
       highInteger.getWidth(), lowFacts.group, lowFacts.layer, highFacts.layer,
       lowFacts.bitOffset / 8, highFacts.bitOffset / 8, insertBit);
-  return BitplaneRelation{lowField.getResult(), highField, insertBit,
+  return BitplaneRelation{lowField.getResult(), highField,
+                          highField.getResult(), insertBit,
                           "scalar.packed-plane-merge.words",
                           plan};
 }
@@ -496,7 +503,8 @@ std::optional<BitplaneRelation> matchBitplane(riscv::BinaryOp merge,
     return std::nullopt;
   }
 
-  return BitplaneRelation{low, plane, *insertBit, instruction, {}};
+  return BitplaneRelation{low, plane, plane.getResult(), *insertBit,
+                          instruction, {}};
 }
 
 void eraseDeadTree(mlir::Value value, mlir::IRRewriter &rewriter) {
@@ -631,9 +639,22 @@ public:
                         rewriter.getStringAttr("weft_kernel.binary"));
         rewriter.replaceOp(merge, packed.getResult());
       } else {
+        if (auto window = relation->physicalPlane
+                              .getDefiningOp<riscv::RVVBitmaskWindowLoadOp>()) {
+          auto selected = window.getLeaf();
+          window->setAttr(
+              "leaf",
+              riscv_internal::leaf(
+                  rewriter, selected.getEngine(), selected.getFamily(),
+                  "rvv.bitmask-window-mask", "rvv.bitmask-window-mask",
+                  selected.getOperandGroups(), selected.getResultGroups(),
+                  selected.getTemporaryGroups(), selected.getFragmentGroups(),
+                  selected.getMask(), selected.getTail(),
+                  selected.getParameters(), selected.getLocalBytes()));
+        }
         auto rvv = rewriter.create<riscv::RVVBitplaneMergeOp>(
             merge.getLoc(), merge.getResult().getType(), relation->low,
-            relation->plane.getResult(), relation->insertBit,
+            relation->physicalPlane, relation->insertBit,
             riscv_internal::leaf(rewriter, "rvv", "bitplane-merge",
                                  relation->instruction, relation->instruction,
                                  0, 0, 1, 0, "none", "agnostic",

@@ -187,17 +187,26 @@ else
       fi
     fi
   elif [[ ${format} == q5_0 ]]; then
-    physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
     if [[ ${phase} == decode ]]; then
+      if [[ ${target} == sg2044 ]]; then
+        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+      else
+        physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+      fi
       kernel=production_mul_mat_q5_0_decode
       runtime_kernel_define=-DWEFT_Q50_DECODE=1
     else
+      physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q5_0
       meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=2)
     fi
   elif [[ ${format} == q5_1 ]]; then
     if [[ ${phase} == decode ]]; then
-      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      if [[ ${target} == sg2044 ]]; then
+        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+      else
+        physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
+      fi
       kernel=production_mul_mat_q5_1_decode
       runtime_kernel_define=-DWEFT_Q51_DECODE=1
     else

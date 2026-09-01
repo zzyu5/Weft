@@ -162,6 +162,7 @@ struct Binding {
     Scalar,
     ScalarTuple,
     Vector,
+    Mask,
     Memory,
     Slice,
     Record,
@@ -8183,9 +8184,35 @@ Emitter::compileRVVBitplaneMerge(riscv::RVVBitplaneMergeOp operation) {
       operation.getLow(), bindings.lookup(operation.getLow()));
   Binding plane = bindings.lookup(operation.getPlane());
   if (mlir::failed(low) || low->kind != Binding::Kind::Vector ||
-      plane.kind != Binding::Kind::Field)
+      (plane.kind != Binding::Kind::Field &&
+       plane.kind != Binding::Kind::Mask))
     return fail(operation,
-                "RVV bitplane merge requires one vector value and one encoded field edge");
+                "RVV bitplane merge requires one vector value and one typed bitplane supply");
+  if (plane.kind == Binding::Kind::Mask) {
+    const std::string suffix = vectorSuffix(operation.getResult());
+    const std::string type = vectorType(operation.getResult());
+    const int64_t parts = vectorPartCount(operation.getResult());
+    const int64_t streams = streamPartCount(operation.getResult());
+    Binding result;
+    result.kind = Binding::Kind::Vector;
+    for (int64_t part = 0; part < parts; ++part) {
+      auto lowPart = mappedPart(operation.getOperation(), 0, part);
+      if (!lowPart || *lowPart >= low->parts.size() ||
+          part >= static_cast<int64_t>(plane.parts.size()) || streams <= 0)
+        return fail(operation,
+                    "RVV bitplane merge mask has no typed part mapping");
+      const std::string vl = partVL(operation.getResult(), part);
+      std::string merged = fresh("bitplane_merge");
+      line(type + " " + merged + " = __riscv_vor_vx_" + suffix + "_mu(" +
+           plane.parts[part] + ", " + low->parts[*lowPart] + ", " +
+           low->parts[*lowPart] + ", " +
+           std::to_string(int64_t(1) << operation.getInsertBit()) + ", " + vl +
+           ");");
+      result.parts.push_back(std::move(merged));
+    }
+    bindings[operation.getResult()] = std::move(result);
+    return mlir::success();
+  }
   Binding owner = bindings.lookup(plane.field.owner);
   if (owner.kind == Binding::Kind::Slice) {
     mlir::FailureOr<Binding> record = recordForSlice(plane.field.owner);
@@ -8537,7 +8564,9 @@ mlir::LogicalResult Emitter::compileRVVSignedBitmaskReduce(
 
 mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
     riscv::RVVBitmaskWindowLoadOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.bitmask-window-load")
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool directMask = instruction == "rvv.bitmask-window-mask";
+  if (instruction != "rvv.bitmask-window-load" && !directMask)
     return fail(operation,
                 "RVV bitmask window load has no exact selected leaf");
   Binding byteBase = bindings.lookup(operation.getByteBase());
@@ -8590,7 +8619,7 @@ mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
       "vbool" + std::to_string(maskBits) + "_t";
   auto fieldType = operation.getField().getType();
   Binding result;
-  result.kind = Binding::Kind::Vector;
+  result.kind = directMask ? Binding::Kind::Mask : Binding::Kind::Vector;
   for (int64_t part = 0; part < parts; ++part) {
     auto coordinates =
         registerCoordinates(operation.getResult(), part / streams);
@@ -8625,6 +8654,10 @@ mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
     line(maskType + " " + mask + " = __riscv_vlm_v_b" +
          std::to_string(maskBits) + "((const uint8_t *)(" + recordPointer +
          "), " + vl + ");");
+    if (directMask) {
+      result.parts.push_back(std::move(mask));
+      continue;
+    }
     std::string decoded = fresh("bitmask_window_decode");
     line(type + " " + decoded + " = __riscv_vmerge_vxm_" + suffix +
          "(__riscv_vmv_v_x_" + suffix + "(0, " + vl + "), 1, " + mask +
