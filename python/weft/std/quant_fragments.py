@@ -50,15 +50,24 @@ def radix3_digit(powers, packed, digit):
 
 
 def radix3_digit_i8(powers, packed, digit):
-    power = narrow(
+    power16 = narrow(
         lookup(powers, u32(digit), bounds="in_bounds"),
         u16,
         rounding="rtz",
         saturation=False,
     )
-    wrapped = (widen(u8(packed), u16) * power) & u16(255)
+    power = narrow(
+        power16,
+        u8,
+        rounding="rtz",
+        saturation=False,
+    )
+    # Keep the explicit radix axis before the payload axes in the shaped value.
+    # A scalar digit is unchanged; a shaped digit now has the same logical axis
+    # order as the activation index that it selects.
+    wrapped = power * u8(packed)
     decoded = narrow(
-        (wrapped * u16(3)) >> u16(8),
+        (widen(wrapped, u16) * u16(3)) >> u16(8),
         u8,
         rounding="rtz",
         saturation=False,

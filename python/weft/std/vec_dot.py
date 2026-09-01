@@ -822,37 +822,34 @@ def vec_dot_tq1_0_q8_k(
         w = admit(W[kb])
         x = admit(X[kb])
         lane0 = iota(32, axis="k")
-        q0 = radix3_digit_i8(power_table, w.q[lane0], 0)
-        partial0 = widen(q0, i16) * widen(x.q[lane0], i16)
-        for digit0 in range(1, 5):
-            q0 = radix3_digit_i8(power_table, w.q[lane0], digit0)
-            partial0 += widen(q0, i16) * widen(
-                x.q[u32(digit0 * 32) + lane0], i16
-            )
-        integer = reduce(widen(partial0, i32), axis=0)
+        digit0 = iota(5, dtype=u32, axis="digit0")
+        q0 = radix3_digit_i8(power_table, w.q[lane0], digit0)
+        partial0 = contract(
+            x.q[digit0 * u32(32) + lane0], q0, over="k", acc=i32
+        )
+        integer = reduce(partial0, axis="digit0")
 
         lane1 = iota(16, axis="k")
-        q1 = radix3_digit_i8(power_table, w.q[u32(32) + lane1], 0)
-        partial1 = widen(q1, i16) * widen(x.q[u32(160) + lane1], i16)
-        for digit1 in range(1, 5):
-            q1 = radix3_digit_i8(
-                power_table, w.q[u32(32) + lane1], digit1
-            )
-            partial1 += widen(q1, i16) * widen(
-                x.q[u32(160 + digit1 * 16) + lane1], i16
-            )
-        integer += reduce(widen(partial1, i32), axis=0)
-
-        lane2 = iota(16, axis="k")
-        q2 = radix3_digit_i8(
-            power_table, w.qh[lane2 // u32(4)], lane2 % u32(4)
-        )
-        integer += contract(
-            q2,
-            x.q[u32(240) + (lane2 % u32(4)) * u32(4) + lane2 // u32(4)],
+        digit1 = iota(5, dtype=u32, axis="digit1")
+        q1 = radix3_digit_i8(power_table, w.q[u32(32) + lane1], digit1)
+        partial1 = contract(
+            x.q[u32(160) + digit1 * u32(16) + lane1],
+            q1,
             over="k",
             acc=i32,
         )
+        integer += reduce(partial1, axis="digit1")
+
+        lane2 = iota(4, axis="k")
+        digit2 = iota(4, dtype=u32, axis="digit2")
+        q2 = radix3_digit_i8(power_table, w.qh[lane2], digit2)
+        partial2 = contract(
+            x.q[u32(240) + digit2 * u32(4) + lane2],
+            q2,
+            over="k",
+            acc=i32,
+        )
+        integer += reduce(partial2, axis="digit2")
         result += f32(integer) * (f32(w.d) * f32(x.ds))
     return result
 

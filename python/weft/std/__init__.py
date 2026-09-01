@@ -59,6 +59,7 @@ from .mul_mat import (
     mul_mat_q6_k,
     mul_mat_q8_0,
     mul_mat_tq1_0,
+    mul_mat_tq1_0_decode,
     mul_mat_tq2_0,
 )
 from .quant import q4k_gemv, q4k_gemv_contract, q4k_gemv_groups4
@@ -207,6 +208,7 @@ __all__ = [
     "mul_mat_iq4_nl_decode",
     "mul_mat_iq4_xs",
     "mul_mat_tq1_0",
+    "mul_mat_tq1_0_decode",
     "mul_mat_tq2_0",
     "mul_mat_mxfp4",
     "mul_mat_nvfp4",

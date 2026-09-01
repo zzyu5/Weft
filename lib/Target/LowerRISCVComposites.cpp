@@ -1945,7 +1945,7 @@ private:
           mlir::Value mappedRhs = mapping.lookupOrDefault(contract.getRhs());
           auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
               contract.getLoc(), partialType, mappedLhs, mappedRhs, carried,
-              reductionAxis,
+              rewriter.getDenseI64ArrayAttr({reductionAxis}),
               riscv_internal::leaf(
                   rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
                   "rvv.vwmacc.partial", operandGroups + partialGroups,
@@ -2212,9 +2212,25 @@ private:
               layout.getReplicaFactors().asArrayRef().begin(),
               layout.getReplicaFactors().asArrayRef().end());
           if (position >= time.size() || position >= lane.size() ||
-              position >= replica.size() || lane[position] != 1) {
+              position >= replica.size()) {
             operation->emitError(
                 "free-axis reduction cannot map its typed operand to issue time");
+            failed = true;
+            return {};
+          }
+          // Layout propagation may already coalesce the immediately reduced
+          // free axis with the contraction axis into one complete product lane
+          // carrier.  In that case no replica-to-time conversion is required:
+          // the widened-dot slice planner below consumes both axes as physical
+          // reduction lanes and validates that they form one legal contiguous
+          // RVV carrier.  Reject mixed lane/time or lane/replica ownership here;
+          // those still require an explicit conversion that this lowering does
+          // not define.
+          if (lane[position] > 1) {
+            if (time[position] == 1 && replica[position] == 1)
+              return value;
+            operation->emitError(
+                "free-axis reduction has an incomplete coalesced lane carrier");
             failed = true;
             return {};
           }

@@ -1147,23 +1147,33 @@ riscv::ValueType partialSlotType(mlir::Builder &builder,
 
 riscv::ValueType issueSliceType(mlir::Builder &builder,
                                 riscv::ValueType source,
-                                int64_t reductionAxis) {
-  auto position = axisPosition(source, reductionAxis);
-  if (!position || source.getLayout().getCarrier() != "rvv")
-    return {};
-  const int64_t time = source.getLayout().getTimeFactors()[*position];
-  const int64_t lane = source.getLayout().getLaneFactors()[*position];
-  const int64_t replica = source.getLayout().getReplicaFactors()[*position];
-  if (time <= 1 || lane <= 0 || replica != 1 ||
-      source.getShape()[*position] != time * lane ||
-      source.getLayout().getFragmentFactors()[*position] != 1 ||
-      source.getLayout().getLocalFactors()[*position] != 1)
+                                llvm::ArrayRef<int64_t> reductionAxes) {
+  if (reductionAxes.empty() || source.getLayout().getCarrier() != "rvv")
     return {};
   llvm::SmallVector<int64_t> shape(source.getShape().asArrayRef());
   llvm::SmallVector<int64_t> timeFactors(
       source.getLayout().getTimeFactors().asArrayRef());
-  shape[*position] = lane;
-  timeFactors[*position] = 1;
+  bool sliced = false;
+  for (int64_t reductionAxis : reductionAxes) {
+    auto position = axisPosition(source, reductionAxis);
+    if (!position)
+      return {};
+    const int64_t time = source.getLayout().getTimeFactors()[*position];
+    const int64_t lane = source.getLayout().getLaneFactors()[*position];
+    const int64_t replica = source.getLayout().getReplicaFactors()[*position];
+    if (time <= 0 || lane <= 0 || replica != 1 ||
+        source.getShape()[*position] != time * lane ||
+        source.getLayout().getFragmentFactors()[*position] != 1 ||
+        source.getLayout().getLocalFactors()[*position] != 1)
+      return {};
+    if (time > 1) {
+      shape[*position] = lane;
+      timeFactors[*position] = 1;
+      sliced = true;
+    }
+  }
+  if (!sliced)
+    return {};
   auto layout = riscv::LayoutAttr::get(
       builder.getContext(), "rvv", source.getAxisIds(),
       builder.getDenseI64ArrayAttr(timeFactors),
@@ -3082,12 +3092,10 @@ public:
       // selected before materialization.  Otherwise the old composite dot
       // keeps reserving one live temporary for every issue stream.
       if (kind == "sequential_fused" && streams > 1) {
-        const int64_t reductionAxis =
-            dot.getOver().empty() ? 0 : dot.getOver()[0];
         sequentialLhsIssue =
-            issueSliceType(builder, dot.getLhs().getType(), reductionAxis);
+            issueSliceType(builder, dot.getLhs().getType(), dot.getOver());
         sequentialRhsIssue =
-            issueSliceType(builder, dot.getRhs().getType(), reductionAxis);
+            issueSliceType(builder, dot.getRhs().getType(), dot.getOver());
         sequentialAccumulator = partialSlotType(builder, dot);
         auto lhsParts = riscv_internal::staticProduct(
             sequentialLhsIssue
@@ -3330,7 +3338,8 @@ public:
         dot->setAttr(
             "sequential_partial_plan",
             riscv::SequentialPartialPlanAttr::get(
-                builder.getContext(), issueCount, reductionAxis, lhsIssue,
+                builder.getContext(), issueCount,
+                builder.getDenseI64ArrayAttr(dot.getOver()), lhsIssue,
                 rhsIssue, accumulator,
                 builder.getDenseI64ArrayAttr(dot.getLhsParts()),
                 builder.getDenseI64ArrayAttr(dot.getRhsParts()),
@@ -5394,7 +5403,7 @@ public:
                 "rvv.project-reduction-operand", 0, 0, 1, 0));
         auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
             reduce.getLoc(), accumulatorType, lhs.getResult(), rhs.getResult(),
-            carried, reductionAxis,
+            carried, rewriter.getDenseI64ArrayAttr({reductionAxis}),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
                 "rvv.vwmacc.partial",
@@ -5409,7 +5418,8 @@ public:
         carried = accumulate.getResult();
       }
       auto finalized = rewriter.create<riscv::RVVFinalizeWidenDotOp>(
-          reduce.getLoc(), result, carried, reductionAxis,
+          reduce.getLoc(), result, carried,
+          rewriter.getDenseI64ArrayAttr({reductionAxis}),
           riscv_internal::leaf(
               rewriter, "rvv", "finalize-widen-dot",
               partialElement.getWidth() == 16 ? "rvv.vwredsum.partial"
@@ -5494,7 +5504,7 @@ public:
                                  "none", "exact"));
         auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
             dot.getLoc(), accumulator, lhsSlice.getResult(),
-            rhsSlice.getResult(), carried, plan.getReductionAxis(),
+            rhsSlice.getResult(), carried, plan.getReductionAxes(),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-accumulate",
                 plan.getAccumulateInstruction(),
@@ -5511,12 +5521,12 @@ public:
       }
       auto finalized = rewriter.create<riscv::RVVFinalizeWidenDotOp>(
           dot.getLoc(), dot.getResult().getType(), carried,
-          plan.getReductionAxis(),
+          plan.getReductionAxes(),
           riscv_internal::leaf(
               rewriter, "rvv", "finalize-widen-dot",
               plan.getFinalizeInstruction(), plan.getFinalizeInstruction(),
               accumulator.getLayout().getRegisterGroups(), 0, 2, 0, "none",
-              "exact", {plan.getReductionAxis()}));
+              "exact", plan.getReductionAxes().asArrayRef()));
       riscv_internal::copyOrigin(dot, finalized);
       dot.getResult().replaceAllUsesWith(finalized.getResult());
       rewriter.eraseOp(dot);
@@ -6037,7 +6047,7 @@ public:
 
         auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
             dot.getLoc(), accumulatorType, *lhsSlice, *rhsSlice, carried,
-            reductionAxis,
+            rewriter.getDenseI64ArrayAttr({reductionAxis}),
             riscv_internal::leaf(
                 rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
                 "rvv.vwmacc.partial",
@@ -6060,7 +6070,7 @@ public:
       rewriter.setInsertionPointAfter(loop);
       auto finalized = rewriter.create<riscv::RVVFinalizeWidenDotOp>(
           dot.getLoc(), dot.getResult().getType(), loop.getResult(0),
-          reductionAxis,
+          rewriter.getDenseI64ArrayAttr({reductionAxis}),
           riscv_internal::leaf(rewriter, "rvv", "finalize-widen-dot",
                                plan.getFinalizeInstruction(),
                                plan.getFinalizeInstruction(),

@@ -85,6 +85,7 @@ from .vec_dot import (
     vec_dot_q5_k_q8_k,
     vec_dot_q6_k_q8_k,
     vec_dot_q8_0_q8_0,
+    vec_dot_tq1_0_q8_k,
     vec_dot_tq2_0_q8_k,
 )
 
@@ -1289,6 +1290,22 @@ def mul_mat_tq1_0(
                         )
                         acc += (f32(w.d) * f32(x.ds)) * widen(integer, f32)
                     commit(acc, Y[mb, nb])
+
+
+def mul_mat_tq1_0_decode(
+    W: View[TQ1_0, (N, K)],
+    X: View[f32, (M, K)],
+    Xq: View[Q8_K, (M, K)],
+    powers: View[u32, (5,)],
+    Y: View[f32, (M, N)],
+):
+    quantize_q8_K(X, Xq)
+    for row in range(M):
+        for column in range(N):
+            commit(
+                vec_dot_tq1_0_q8_k(W[column], Xq[row], powers),
+                Y[row, column],
+            )
 
 
 def mul_mat_tq2_0(

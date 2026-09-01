@@ -369,7 +369,7 @@ def WeftRISCV_SequentialPartialPlanAttr
     : WeftRISCV_Attr<"SequentialPartialPlan", "sequential_partial_plan"> {
   let parameters = (ins
     "int64_t":$issueCount,
-    "int64_t":$reductionAxis,
+    "::mlir::DenseI64ArrayAttr":$reductionAxes,
     "::mlir::Type":$lhsIssueType,
     "::mlir::Type":$rhsIssueType,
     "::mlir::Type":$accumulatorType,
@@ -380,7 +380,7 @@ def WeftRISCV_SequentialPartialPlanAttr
     "int64_t":$resourceGroups
   );
   let assemblyFormat = [{
-    `<` $issueCount `,` $reductionAxis `,` $lhsIssueType `,` $rhsIssueType `,`
+    `<` $issueCount `,` $reductionAxes `,` $lhsIssueType `,` $rhsIssueType `,`
         $accumulatorType `,` $lhsSourceParts `,` $rhsSourceParts `,`
         $accumulateInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
   }];
@@ -1494,7 +1494,7 @@ def WeftRISCV_RVVWidenAccumulateOp
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        WeftRISCV_ValueType:$accumulator,
-                       I64Attr:$reduction_axis,
+                       DenseI64ArrayAttr:$reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
@@ -1503,7 +1503,7 @@ def WeftRISCV_RVVWidenAccumulateOp
 def WeftRISCV_RVVFinalizeWidenDotOp
     : WeftRISCV_Op<"rvv_finalize_widen_dot", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$partial,
-                       I64Attr:$reduction_axis,
+                       DenseI64ArrayAttr:$reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;

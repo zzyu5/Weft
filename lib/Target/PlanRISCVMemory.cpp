@@ -212,10 +212,6 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
   auto index = mlir::dyn_cast<mlir::IntegerType>(indexElement);
   if (!indexElement.isIndex() && (!index || index.isSigned()))
     return false;
-  if (entryIndices.getLayout().getCarrier() == "scalar")
-    return true;
-  if (entryIndices.getLayout().getCarrier() != "rvv")
-    return false;
   const unsigned payloadBits =
       riscv_internal::logicalBitWidth(result.getElementType());
   const uint64_t packedBits =
@@ -227,6 +223,19 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
   const size_t payloadPosition =
       static_cast<size_t>(payload - resultAxes.begin());
   auto layout = result.getLayout();
+  const bool completePayloadLane =
+      plan.payloadExtent > 0 &&
+      layout.getTimeFactors()[payloadPosition] == 1 &&
+      layout.getLaneFactors()[payloadPosition] == plan.payloadExtent &&
+      layout.getReplicaFactors()[payloadPosition] == 1 &&
+      layout.getFragmentFactors()[payloadPosition] == 1 &&
+      layout.getLocalFactors()[payloadPosition] == 1;
+  if (!completePayloadLane)
+    return false;
+  if (entryIndices.getLayout().getCarrier() == "scalar")
+    return true;
+  if (entryIndices.getLayout().getCarrier() != "rvv")
+    return false;
   return index && !index.isSigned() &&
          (index.getWidth() == 16 || index.getWidth() == 32 ||
           index.getWidth() == 64) &&
@@ -234,12 +243,7 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
          (packedBits == 32 || packedBits == 64) &&
          plan.entryStride == plan.payloadExtent &&
          bitOffset % packedBits == 0 &&
-         alignment >= static_cast<int64_t>(packedBits / 8) &&
-         layout.getTimeFactors()[payloadPosition] == 1 &&
-         layout.getLaneFactors()[payloadPosition] == plan.payloadExtent &&
-         layout.getReplicaFactors()[payloadPosition] == 1 &&
-         layout.getFragmentFactors()[payloadPosition] == 1 &&
-         layout.getLocalFactors()[payloadPosition] == 1;
+         alignment >= static_cast<int64_t>(packedBits / 8);
 }
 
 bool isSingleScalarCoordinate(mlir::Value value) {
@@ -1707,7 +1711,17 @@ public:
       }
       auto directWindow = materializeAffineUnitWindowBase(
           gatherIndex, result, retainedAxes.size(), extract, rewriter);
+      const auto sourceAxes = source.getAxisIds().asArrayRef();
+      auto unitEntryAxesAreDisjoint = [&](llvm::ArrayRef<int64_t> entryAxes,
+                                          int64_t payloadAxis) {
+        return !llvm::is_contained(sourceAxes, payloadAxis) &&
+               llvm::none_of(entryAxes, [&](int64_t axis) {
+                 return llvm::is_contained(sourceAxes, axis);
+               });
+      };
       if (directWindow && sourceField &&
+          unitEntryAxesAreDisjoint(
+              directWindow->entryAxes, result.getAxisIds().asArrayRef().back()) &&
           supportsUnitEntryWindowLayout(
               result, retainedAxes.size(), directWindow->entryAxes,
               directWindow->entryExtents,
@@ -1749,6 +1763,7 @@ public:
           plan->entryStride, extract, rewriter);
       const size_t retainedAxisCount = source.getAxisIds().size() - 1;
       if (unitWindow && sourceField &&
+          unitEntryAxesAreDisjoint(unitWindow->entryAxes, plan->payloadAxis) &&
           supportsUnitEntryWindowLayout(
               result, retainedAxisCount, unitWindow->entryAxes,
               unitWindow->entryExtents, plan->payloadAxis,
