@@ -608,18 +608,17 @@ public:
               stagedBirths.insert(staged.getBirthId());
             if (auto staged =
                     mlir::dyn_cast<riscv::RVVLocalMaterializeOp>(nested);
-                staged &&
-                staged.getDestination()
-                        .getDefiningOp<riscv::LocalBindOp>()
-                        .getStorage()
-                        .getType()
-                        .getOwnerDomainId() == level.getDomainId())
-              stagedBirths.insert(
-                  staged.getDestination()
-                      .getDefiningOp<riscv::LocalBindOp>()
-                      .getStorage()
-                      .getType()
-                      .getBirthId());
+                staged) {
+              auto storage = staged.getDestination()
+                                 .getDefiningOp<riscv::LocalBindOp>()
+                                 .getStorage()
+                                 .getType();
+              // A compiler-created physical share has no author staged birth;
+              // its lifetime is carried by LocalType and the resource pass.
+              if (storage.getSchema() != "physical-share" &&
+                  storage.getOwnerDomainId() == level.getDomainId())
+                stagedBirths.insert(storage.getBirthId());
+            }
             if (auto staged =
                     mlir::dyn_cast<riscv::EncodedLocalBindOp>(nested);
                 staged) {

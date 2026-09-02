@@ -74,6 +74,10 @@ form，也不写 exact intrinsic。没有合法局部结构时当前 module 失�
 validity 与 register groups。普通无特殊 anchor 的 shaped value使用 target 的固定规则：
 最内逻辑轴进入 lane；一元素表示保持 scalar。LMUL 是实现该 lane extent 的最小合法值，
 不是 emitter 默认值。
+已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
+保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
+LMUL；widening contraction 的两个 operand 再共享该 lane span。目标不支持派生
+LMUL 或最终联合 live set 超资源时，当前 candidate 失败，不回头改作者树。
 当 encoded field 经过保持 shape/axis 的 conversion 或作为 lookup index 流向下游时，
 storage layer 宽度同样沿这条 use-def 链传播；target 不能因此把超过真实
 grouped/layered 宽度的逻辑 lane 伪装成一次 indexed load。
@@ -106,7 +110,14 @@ composite lowering中消费。partial materialization后新出现的replica memo
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
 birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。
-跨block或跨Level的placement仍需dominance/LCA与effect证明，不能由这条局部规则猜测。
+
+对一个完整 encoded field 同时有外层 RVV consumer 与内层 `group_index` scalar
+consumer 的情形，pass 只在 field owner/name、logical shape/axes、parent/sub-Level point
+几何、分组步长和重复 decode 全部一致时，在两类 use 的共同支配 Level 物化
+`local_alloc → local_bind → rvv_local_materialize`，子 Level 以真实 `local_load` 读取。
+这种 `physical-share` local lifetime 完全属于物理 IR，不增加作者 staged birth。
+其他跨block/跨Level placement 仍需更一般的 dominance/LCA、effect 与 cost-independent
+reuse 证明，不由该窄合同猜测。
 
 ### `CanonicalizeRISCVLayouts`
 
@@ -132,6 +143,10 @@ birth；它只冻结一次已选load/decode结果，使后续不同layout consum
 local-pack 与 grouped-MAC program 展开成真实 `scf` control、point、load/step 和 SSA
 use-def，然后删除 macro op。该 pass 只展开已冻结的 plan，不重选 layout、memory
 form、tail 或 leaf；final verifier 拒绝任何尚待 terminal emitter 解释的 macro program。
+
+contraction 的 unroll 只能属于它真实的多 issue reduction loop。单 issue 已经覆盖
+完整 reduction carrier 时，不存在可展开的 local issue loop；该 unroll 不得改挂到
+最近的外层 Level，否则会复制整个 storage-block program。
 
 ### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 

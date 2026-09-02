@@ -2236,13 +2236,15 @@ private:
                     rhsType.getLayout().getRegisterGroups(),
                 0, temporaryGroups));
         copyIdentity(operation, widenedDot);
-        // A dot whose complete reduction-time decomposition can be fused has
-        // no local per-stream issue loop to unroll.  Its enclosing loop may be
-        // the storage-block traversal, so attaching the contraction unroll to
-        // that loop would duplicate whole blocks.  The topology planner still
-        // owns the final fused/independent choice; this legality fact only
-        // determines whether a local issue-loop binding exists.
-        if (schedule.getUnroll() > 1 && !fusedStreamsLegal) {
+        // A single-stream dot, or a dot whose complete reduction-time
+        // decomposition can be fused, has no local per-stream issue loop to
+        // unroll.  Its enclosing loop may be the storage-block traversal, so
+        // attaching the contraction unroll to that loop would duplicate whole
+        // blocks.  The topology planner still owns the final fused/independent
+        // choice; this legality fact only determines whether a local issue-loop
+        // binding exists.
+        if (schedule.getUnroll() > 1 && streams > 1 &&
+            !fusedStreamsLegal) {
           // The schedule belongs to the physical issue loop that directly
           // contains this contraction.  A more distant Level may carry the
           // same logical reduction axis while iterating whole storage blocks;

@@ -1357,6 +1357,278 @@ bool needsScalarEncodedShare(mlir::Value value) {
   return uses > 1;
 }
 
+struct CrossLevelEncodedSupply {
+  mlir::scf::ForOp loop;
+  riscv::FieldOp innerField;
+  riscv::ExtractOp extract;
+  riscv::BinaryOp decode;
+  riscv::PhysicalPointOp point;
+  riscv::PhysicalPointOp parent;
+  riscv::FieldOp outerField;
+  mlir::Value localIndex;
+  mlir::Value mask;
+  int64_t maskValue = 0;
+  int64_t partition = 0;
+};
+
+bool isOnlySelector(riscv::ExtractOp extract, llvm::StringRef expected) {
+  return extract.getSelectors().size() == 1 &&
+         mlir::cast<mlir::StringAttr>(extract.getSelectors()[0])
+                 .getValue() == expected &&
+         extract.getIndices().size() == 1;
+}
+
+std::optional<mlir::Value>
+subLevelOrdinal(riscv::PhysicalPointOp point,
+                riscv::PhysicalPointOp parent, int64_t partition) {
+  auto addition = point.getBase().getDefiningOp<mlir::arith::AddIOp>();
+  if (!addition || partition <= 0)
+    return std::nullopt;
+  mlir::Value offset;
+  if (addition.getLhs() == parent.getBase())
+    offset = addition.getRhs();
+  else if (addition.getRhs() == parent.getBase())
+    offset = addition.getLhs();
+  else
+    return std::nullopt;
+  auto multiply = offset.getDefiningOp<mlir::arith::MulIOp>();
+  if (!multiply)
+    return std::nullopt;
+  auto lhs = constantInteger(multiply.getLhs());
+  auto rhs = constantInteger(multiply.getRhs());
+  if (lhs && *lhs == partition)
+    return multiply.getRhs();
+  if (rhs && *rhs == partition)
+    return multiply.getLhs();
+  return std::nullopt;
+}
+
+riscv::FieldOp outerRVVFieldFor(riscv::FieldOp inner,
+                                mlir::scf::ForOp loop) {
+  auto innerType = mlir::dyn_cast<riscv::ValueType>(inner.getResult().getType());
+  if (!innerType || innerType.getLayout().getCarrier() != "local")
+    return {};
+  riscv::FieldOp selected;
+  for (mlir::Operation &operation : *loop->getBlock()) {
+    auto candidate = mlir::dyn_cast<riscv::FieldOp>(operation);
+    auto type = candidate
+                    ? mlir::dyn_cast<riscv::ValueType>(
+                          candidate.getResult().getType())
+                    : riscv::ValueType();
+    if (!candidate || candidate.getOwner() != inner.getOwner() ||
+        candidate.getName() != inner.getName() || !type ||
+        type.getLayout().getCarrier() != "rvv" ||
+        type.getElementType() != innerType.getElementType() ||
+        type.getShape() != innerType.getShape() ||
+        type.getAxisIds() != innerType.getAxisIds())
+      continue;
+    const bool hasOuterUse = llvm::any_of(
+        candidate.getResult().getUsers(),
+        [&](mlir::Operation *user) { return !loop->isAncestor(user); });
+    if (!hasOuterUse)
+      continue;
+    if (selected)
+      return {};
+    selected = candidate;
+  }
+  return selected;
+}
+
+std::optional<CrossLevelEncodedSupply>
+matchCrossLevelEncodedSupply(riscv::ExtractOp extract) {
+  CrossLevelEncodedSupply result;
+  result.extract = extract;
+  result.loop = extract->getParentOfType<mlir::scf::ForOp>();
+  result.innerField = extract.getInput().getDefiningOp<riscv::FieldOp>();
+  result.point = extract.getIndices().empty()
+                     ? riscv::PhysicalPointOp()
+                     : extract.getIndices().front().getDefiningOp<
+                           riscv::PhysicalPointOp>();
+  result.parent = result.point
+                      ? result.point.getParent().getDefiningOp<
+                            riscv::PhysicalPointOp>()
+                      : riscv::PhysicalPointOp();
+  auto partition = result.point
+                       ? result.point.getPartition()
+                             .getDefiningOp<mlir::arith::ConstantIndexOp>()
+                       : mlir::arith::ConstantIndexOp();
+  if (!result.loop || !result.innerField || !result.point || !result.parent ||
+      !partition || !isOnlySelector(extract, "group_index") ||
+      extract.getResult().getUses().empty() ||
+      !extract.getResult().hasOneUse())
+    return std::nullopt;
+  result.partition = partition.value();
+  auto ordinal = subLevelOrdinal(result.point, result.parent, result.partition);
+  if (!ordinal)
+    return std::nullopt;
+  result.localIndex = *ordinal;
+
+  result.decode = mlir::dyn_cast<riscv::BinaryOp>(
+      extract.getResult().use_begin()->getOwner());
+  if (!result.decode || result.decode.getKind() != "and" ||
+      !result.decode.getResult().hasOneUse())
+    return std::nullopt;
+  if (result.decode.getLhs() == extract.getResult())
+    result.mask = result.decode.getRhs();
+  else if (result.decode.getRhs() == extract.getResult())
+    result.mask = result.decode.getLhs();
+  else
+    return std::nullopt;
+  auto mask = constantInteger(result.mask);
+  if (!mask || *mask <= 0)
+    return std::nullopt;
+  result.maskValue = *mask;
+  result.outerField = outerRVVFieldFor(result.innerField, result.loop);
+  if (!result.outerField)
+    return std::nullopt;
+  return result;
+}
+
+bool sameCrossLevelSupply(const CrossLevelEncodedSupply &lhs,
+                          const CrossLevelEncodedSupply &rhs) {
+  return lhs.loop == rhs.loop && lhs.outerField == rhs.outerField &&
+         lhs.parent == rhs.parent && lhs.maskValue == rhs.maskValue &&
+         lhs.partition == rhs.partition;
+}
+
+std::optional<riscv::ValueType>
+localValueForRVVSupply(mlir::Builder &builder, riscv::ValueType input) {
+  auto layout = input.getLayout();
+  if (layout.getCarrier() != "rvv" || input.getShape().empty())
+    return std::nullopt;
+  llvm::SmallVector<int64_t> ones(input.getShape().size(), 1);
+  llvm::SmallVector<int64_t> local;
+  local.reserve(input.getShape().size());
+  int64_t laneDimensions = 0;
+  for (size_t dimension = 0; dimension < input.getShape().size(); ++dimension) {
+    const int64_t lane = layout.getLaneFactors()[dimension];
+    const int64_t replica = layout.getReplicaFactors()[dimension];
+    if (layout.getTimeFactors()[dimension] != 1 ||
+        layout.getFragmentFactors()[dimension] != 1 ||
+        layout.getLocalFactors()[dimension] != 1 || lane <= 0 || replica <= 0)
+      return std::nullopt;
+    if (lane > 1) {
+      ++laneDimensions;
+      if (dimension + 1 != input.getShape().size() || replica != 1)
+        return std::nullopt;
+      local.push_back(lane);
+    } else {
+      local.push_back(replica);
+    }
+    if (input.getShape()[dimension] != lane * replica)
+      return std::nullopt;
+  }
+  if (laneDimensions != 1)
+    return std::nullopt;
+  auto localLayout = riscv::LayoutAttr::get(
+      builder.getContext(), "local", input.getAxisIds(),
+      riscv_internal::integers(builder, ones),
+      riscv_internal::integers(builder, ones),
+      riscv_internal::integers(builder, ones),
+      riscv_internal::integers(builder, ones),
+      riscv_internal::integers(builder, local), layout.getSew(), 0, 1, 0,
+      "full");
+  return riscv::ValueType::get(builder.getContext(), input.getElementType(),
+                              input.getShape(), input.getAxisIds(), localLayout);
+}
+
+void materializeCrossLevelEncodedSupplies(mlir::ModuleOp module,
+                                          mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<CrossLevelEncodedSupply> candidates;
+  module.walk([&](riscv::ExtractOp extract) {
+    if (auto candidate = matchCrossLevelEncodedSupply(extract))
+      candidates.push_back(*candidate);
+  });
+  llvm::DenseSet<mlir::Operation *> consumed;
+  int64_t nextAlias = 0;
+  int64_t nextBirth = 0;
+  module.walk([&](riscv::LocalAllocOp allocation) {
+    auto type = allocation.getResult().getType();
+    nextAlias = std::max(nextAlias, type.getAliasSet() + 1);
+    nextBirth = std::max(nextBirth, type.getBirthId() + 1);
+  });
+
+  for (CrossLevelEncodedSupply &leader : candidates) {
+    if (consumed.contains(leader.extract))
+      continue;
+    llvm::SmallVector<CrossLevelEncodedSupply *> group;
+    for (CrossLevelEncodedSupply &candidate : candidates)
+      if (!consumed.contains(candidate.extract) &&
+          sameCrossLevelSupply(leader, candidate))
+        group.push_back(&candidate);
+    // One physical supply must eliminate at least two dynamic decode edges.
+    if (group.size() < 2)
+      continue;
+
+    auto input = mlir::dyn_cast<riscv::ValueType>(
+        leader.outerField.getResult().getType());
+    auto localValue = input ? localValueForRVVSupply(rewriter, input)
+                            : std::optional<riscv::ValueType>();
+    auto element = input
+                       ? mlir::dyn_cast<mlir::IntegerType>(input.getElementType())
+                       : mlir::IntegerType();
+    auto elements = input ? positiveProduct(input.getShape().asArrayRef())
+                          : std::optional<int64_t>();
+    if (!localValue || !element || element.isSigned() ||
+        element.getWidth() % 8 || !elements || *elements <= 0)
+      continue;
+    if (*elements >
+        std::numeric_limits<int64_t>::max() / (element.getWidth() / 8))
+      continue;
+    const int64_t bytes = *elements * (element.getWidth() / 8);
+    const int64_t owner = leader.parent.getResult().getType().getDomain().getDomainId();
+    const int64_t lifetime =
+        leader.point.getResult().getType().getDomain().getDomainId();
+
+    leader.outerField->moveBefore(leader.loop);
+    rewriter.setInsertionPoint(leader.loop);
+    auto decoded = rewriter.create<riscv::BinaryOp>(
+        leader.outerField.getLoc(), input, leader.outerField.getResult(),
+        leader.mask, "and", riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(leader.decode, decoded);
+    auto allocationBytes = rewriter.create<mlir::arith::ConstantIndexOp>(
+        leader.outerField.getLoc(), bytes);
+    auto storageType = riscv::LocalType::get(
+        rewriter.getContext(), input.getElementType(), input.getShape(),
+        input.getAxisIds(), bytes, std::max<int64_t>(8, element.getWidth() / 8),
+        nextAlias++, "pack", owner, nextBirth++, lifetime, "physical-share");
+    auto allocation = rewriter.create<riscv::LocalAllocOp>(
+        leader.outerField.getLoc(), storageType, allocationBytes);
+    auto logicalElements = rewriter.create<mlir::arith::ConstantIndexOp>(
+        leader.outerField.getLoc(), *elements);
+    auto binding = rewriter.create<riscv::LocalBindOp>(
+        leader.outerField.getLoc(), *localValue, allocation.getResult(),
+        logicalElements);
+    auto stored = rewriter.create<riscv::RVVLocalMaterializeOp>(
+        leader.outerField.getLoc(), decoded.getResult(), binding.getResult(),
+        riscv_internal::leaf(
+            rewriter, "transfer", "local-materialize",
+            "rvv.local-materialize", "rvv.local-materialize",
+            input.getLayout().getRegisterGroups(), 0, 0, 0, "none", "exact",
+            {}, bytes));
+    riscv_internal::copyOrigin(leader.outerField, allocation);
+    riscv_internal::copyOrigin(leader.outerField, binding);
+    riscv_internal::copyOrigin(leader.outerField, stored);
+
+    for (CrossLevelEncodedSupply *candidate : group) {
+      rewriter.setInsertionPoint(candidate->decode);
+      auto loaded = rewriter.create<riscv::LocalLoadOp>(
+          candidate->decode.getLoc(), candidate->decode.getResult().getType(),
+          binding.getResult(), candidate->localIndex,
+          riscv_internal::leaf(rewriter, "transfer", "local-load",
+                               "local.load.element", "local.load.element", 0,
+                               0));
+      riscv_internal::copyOrigin(candidate->decode, loaded);
+      candidate->decode.getResult().replaceAllUsesWith(loaded.getResult());
+      consumed.insert(candidate->extract);
+      rewriter.eraseOp(candidate->decode);
+      rewriter.eraseOp(candidate->extract);
+      if (candidate->innerField.getResult().use_empty())
+        rewriter.eraseOp(candidate->innerField);
+    }
+  }
+}
+
 class PlanRISCVMemoryPass
     : public mlir::PassWrapper<PlanRISCVMemoryPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -2497,6 +2769,14 @@ public:
     for (riscv::LoadOp load : deadTableLoads)
       if (load && load.getResult().use_empty())
         load.erase();
+
+    // A complete encoded field can feed an outer vector consumer while a
+    // nested Level projects the same bytes to scalar consumers.  Place one
+    // typed local representation at their common dominating Level and make
+    // each child projection a real local_load.  The relation is proved from
+    // field identity, logical domain, point geometry, and one repeated decode;
+    // terminal emission does not reconstruct it.
+    materializeCrossLevelEncodedSupplies(getOperation(), rewriter);
 
     // A byte-aligned encoded scalar with several consumers is one physical
     // supply, not one reload per consumer.  Materialize it at its defining

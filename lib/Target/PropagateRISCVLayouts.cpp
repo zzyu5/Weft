@@ -1733,6 +1733,105 @@ public:
     });
     propagateRoles();
 
+    // The command-line LMUL binding fixes the base physical parameter, but a
+    // width-changing use-def chain has one additional legality relation: a
+    // widening value that preserves its logical lane span needs proportionally
+    // more register width.  Freeze that derived width per SSA value and carry it
+    // through the selected widening contraction.  This is not a second LMUL
+    // candidate; it is the unique width required to keep the same logical lanes.
+    llvm::DenseMap<mlir::Value, int64_t> valueLMULBounds;
+    for (mlir::Value value : values)
+      valueLMULBounds[value] = lmulEighths;
+    bool widthChanged = true;
+    while (widthChanged) {
+      widthChanged = false;
+      getOperation().walk([&](mlir::Operation *operation) {
+        if (mlir::isa<riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(operation) &&
+            operation->getNumOperands() == 1 && operation->getNumResults() == 1) {
+          mlir::Value input = operation->getOperand(0);
+          mlir::Value result = operation->getResult(0);
+          auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+          auto resultType = mlir::dyn_cast<riscv::ValueType>(result.getType());
+          if (!inputType || !resultType ||
+              inputType.getShape() != resultType.getShape() ||
+              inputType.getAxisIds() != resultType.getAxisIds() ||
+              roles[input].laneAxis == 0 ||
+              roles[input].laneAxis != roles[result].laneAxis ||
+              roles[input].local || roles[result].local || roles[input].ime ||
+              roles[result].ime)
+            return;
+          auto kernel = operation->getParentOfType<riscv::KernelOp>();
+          if (!kernel)
+            return;
+          const int64_t inputSEW = std::max<int64_t>(
+              8, riscv_internal::logicalBitWidth(inputType));
+          const int64_t resultSEW = std::max<int64_t>(
+              8, riscv_internal::logicalBitWidth(resultType));
+          auto propagateWidth = [&](mlir::Value from, int64_t fromSEW,
+                                    mlir::Value to, int64_t toSEW) {
+            const int64_t fromWidth = valueLMULBounds.lookup(from);
+            const int64_t requested =
+                (fromWidth * toSEW + fromSEW - 1) / fromSEW;
+            const int64_t legal =
+                roundLegalLMUL(kernel.getTarget(), requested, toSEW);
+            if (legal && legal > valueLMULBounds.lookup(to)) {
+              valueLMULBounds[to] = legal;
+              widthChanged = true;
+            }
+          };
+          propagateWidth(input, inputSEW, result, resultSEW);
+          propagateWidth(result, resultSEW, input, inputSEW);
+          return;
+        }
+
+        if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
+                       riscv::OuterContractOp>(operation))
+          return;
+        auto implementation = operation->getAttrOfType<
+            riscv::ImplementationAttr>("implementation");
+        if (!implementation || implementation.getFamily() != "widen-dot")
+          return;
+        mlir::Value lhs = operation->getOperand(0);
+        mlir::Value rhs = operation->getOperand(1);
+        if (!valueLMULBounds.count(lhs) || !valueLMULBounds.count(rhs) ||
+            roles[lhs].laneAxis == 0 ||
+            roles[lhs].laneAxis != roles[rhs].laneAxis)
+          return;
+        auto kernel = operation->getParentOfType<riscv::KernelOp>();
+        if (!kernel)
+          return;
+        const int64_t axis = roles[lhs].laneAxis;
+        const int64_t lhsExtent = riscv_internal::physicalExtent(lhs, axis);
+        const int64_t rhsExtent = riscv_internal::physicalExtent(rhs, axis);
+        if (lhsExtent <= 0 || lhsExtent != rhsExtent)
+          return;
+        auto laneCapacity = [&](mlir::Value value) {
+          const int64_t sew = std::max<int64_t>(
+              8, riscv_internal::logicalBitWidth(value.getType()));
+          return std::min(
+              lhsExtent,
+              std::max<int64_t>(
+                  1, kernel.getTarget().getVlenBits() *
+                         valueLMULBounds.lookup(value) / (8 * sew)));
+        };
+        const int64_t desired = std::max(laneCapacity(lhs), laneCapacity(rhs));
+        for (mlir::Value value : {lhs, rhs}) {
+          const int64_t sew = std::max<int64_t>(
+              8, riscv_internal::logicalBitWidth(value.getType()));
+          const int64_t requested =
+              std::max<int64_t>(1, (desired * sew * 8 +
+                                    kernel.getTarget().getVlenBits() - 1) /
+                                       kernel.getTarget().getVlenBits());
+          const int64_t legal =
+              roundLegalLMUL(kernel.getTarget(), requested, sew);
+          if (legal && legal > valueLMULBounds.lookup(value)) {
+            valueLMULBounds[value] = legal;
+            widthChanged = true;
+          }
+        }
+      });
+    }
+
     // Each physical value receives the largest lane span legal for its own
     // type and the instantiated LMUL bound.  Structured-product operands and
     // a same-axis extract remain coupled where the target instruction requires
@@ -1749,7 +1848,8 @@ public:
       int64_t sew = std::max<int64_t>(
           8, riscv_internal::logicalBitWidth(value.getType()));
       int64_t capacity = std::max<int64_t>(
-          1, kernel.getTarget().getVlenBits() * lmulEighths / (8 * sew));
+          1, kernel.getTarget().getVlenBits() * valueLMULBounds.lookup(value) /
+                 (8 * sew));
       // Indexed memory makes a storage relation executable; it does not erase
       // the number of logical elements represented by one encoded layer.
       // Preserve that per-use storage width on every target, then express any
@@ -1811,7 +1911,7 @@ public:
           std::max<int64_t>(1, connectedLaneSpans.lookup(value));
       riscv::LayoutAttr layout =
           buildLayout(builder, value, roles[value], connectedLaneSpan,
-                      lmulEighths);
+                      valueLMULBounds.lookup(value));
       if (!layout) {
         value.getParentRegion()->getParentOp()->emitError(
             "no legal LMUL can preserve the inferred logical lane mapping");
@@ -2153,7 +2253,9 @@ private:
       consumerRoles.replicaAxes.erase(eliminated);
       riscv::LayoutAttr required =
           buildLayout(builder, input, consumerRoles, connectedLaneSpan,
-                      lmulEighths);
+                      std::max<int64_t>(
+                          lmulEighths,
+                          inputType.getLayout().getLmulEighths()));
       if (!required) {
         reduce.emitError(
             "no legal RVV layout can consume the register-axis reduction");
