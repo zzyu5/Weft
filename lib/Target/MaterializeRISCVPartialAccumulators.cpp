@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -2331,17 +2332,24 @@ matchScaledPartialContribution(mlir::Value value) {
     riscv::RVVWidenDotOp dot = lhsDot ? lhsDot : rhsDot;
     mlir::Value scale = lhsDot ? multiply.getRhs() : multiply.getLhs();
     auto scaleType = mlir::dyn_cast<riscv::ValueType>(scale.getType());
+    auto scalarInteger = mlir::dyn_cast<mlir::IntegerType>(scale.getType());
     auto scaleParts = scaleType
                           ? riscv_internal::staticProduct(
                                 scaleType.getLayout()
                                     .getReplicaFactors()
                                     .asArrayRef())
-                          : std::optional<int64_t>();
+                          : scalarInteger && scalarInteger.isSigned() &&
+                                    scalarInteger.getWidth() == 32
+                                ? std::optional<int64_t>(1)
+                                : std::optional<int64_t>();
     auto scaleElement =
         scaleType
             ? mlir::dyn_cast<mlir::IntegerType>(scaleType.getElementType())
-            : mlir::IntegerType();
-    if (!scaleType || scaleType.getLayout().getCarrier() != "scalar" ||
+            : scalarInteger;
+    const bool scalarCarrier =
+        scaleType ? scaleType.getLayout().getCarrier() == "scalar"
+                  : static_cast<bool>(scalarInteger);
+    if (!scalarCarrier ||
         !scaleParts || *scaleParts <= 0 || !scaleElement ||
         !scaleElement.isSigned() || scaleElement.getWidth() != 32 ||
         dot.getPartialUnroll() <= 1 || dot.getOver().size() != 1 ||
@@ -2385,6 +2393,49 @@ matchLevelScaledLoop(mlir::scf::ForOp loop) {
     return std::nullopt;
   std::reverse(contributions.begin(), contributions.end());
   return contributions;
+}
+
+std::optional<ScaledPartialContribution>
+matchLevelScaledLoopSeed(mlir::scf::ForOp loop) {
+  if (loop.getInitArgs().size() != 1 || loop.getNumResults() != 1)
+    return std::nullopt;
+  auto yield =
+      mlir::dyn_cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!yield || yield.getNumOperands() != 1)
+    return std::nullopt;
+  auto contribution = matchScaledPartialContribution(yield.getOperand(0));
+  if (!contribution || contribution->previous != loop.getRegionIterArg(0))
+    return std::nullopt;
+  auto factor = loop->getAttrOfType<mlir::IntegerAttr>(
+      "weft.riscv.unroll_factor");
+  if (!factor || factor.getInt() != contribution->dot.getPartialUnroll() ||
+      factor.getInt() <= 1)
+    return std::nullopt;
+  return contribution;
+}
+
+mlir::FailureOr<mlir::scf::ForOp>
+expandPlannedLevelScaledIssueLoop(mlir::scf::ForOp loop, int64_t factor,
+                                  mlir::IRRewriter &) {
+  auto lower = loop.getLowerBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  auto upper = loop.getUpperBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  auto step = loop.getStep().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  if (!lower || !upper || !step || factor <= 1 || step.value() <= 0 ||
+      upper.value() < lower.value())
+    return mlir::failure();
+  const int64_t distance = upper.value() - lower.value();
+  if (distance % step.value())
+    return mlir::failure();
+  const int64_t iterations = distance / step.value();
+  if (iterations <= 0 || iterations % factor)
+    return mlir::failure();
+
+  loop->removeAttr("weft.riscv.unroll_factor");
+  loop->removeAttr("weft.riscv.unroll_order");
+  auto unrolled = mlir::loopUnrollByFactor(loop, factor);
+  if (mlir::failed(unrolled) || !(*unrolled).mainLoopOp)
+    return mlir::failure();
+  return *(*unrolled).mainLoopOp;
 }
 
 struct ReplicaScaledDotReduction {
@@ -3222,10 +3273,13 @@ public:
     }
     getOperation().walk([&](mlir::scf::ForOp loop) {
       auto contributions = matchLevelScaledLoop(loop);
-      if (!contributions)
+      if (contributions) {
+        for (ScaledPartialContribution &contribution : *contributions)
+          levelScaledDots.insert(contribution.dot.getOperation());
         return;
-      for (ScaledPartialContribution &contribution : *contributions)
-        levelScaledDots.insert(contribution.dot.getOperation());
+      }
+      if (auto seed = matchLevelScaledLoopSeed(loop))
+        levelScaledDots.insert(seed->dot.getOperation());
     });
 
     llvm::SmallVector<riscv::RVVWidenDotOp> dots;
@@ -3460,6 +3514,15 @@ public:
         combineArity = partialSlots % 2 == 0 ? 2 : partialSlots;
         resources =
             std::max<int64_t>(1, partialSlots * partialGroups + 2);
+        if (!kernel || resources > kernel.getTarget().getVectorRegisters()) {
+          dot.emitError(
+              "selected level-scaled issue cohort exceeds the target vector-register budget; requested_slots=")
+              << partialSlots << ", resource_groups=" << resources
+              << ", available="
+              << (kernel ? kernel.getTarget().getVectorRegisters() : int64_t{-1});
+          signalPassFailure();
+          return;
+        }
       }
       // Independent partials are a structural preference supplied by the
       // target profile, not a universal property of RVV.  The generic planner
@@ -4154,17 +4217,27 @@ public:
         [&](mlir::scf::ForOp loop) { plannedLevelLoops.push_back(loop); });
     for (mlir::scf::ForOp loop : plannedLevelLoops) {
       auto matched = matchLevelScaledLoop(loop);
+      if (!matched)
+        if (auto seed = matchLevelScaledLoopSeed(loop))
+          matched = llvm::SmallVector<ScaledPartialContribution>{*seed};
       if (!matched ||
           !llvm::all_of(*matched, [](const ScaledPartialContribution &item) {
             return hasTopology(item.dot, "level_scaled");
           }))
         continue;
-      auto carryType =
-          mlir::dyn_cast<riscv::ValueType>(loop.getRegionIterArg(0).getType());
-      auto outputParts =
-          carryType ? riscv_internal::staticProduct(
-                          carryType.getLayout().getReplicaFactors().asArrayRef())
-                    : std::optional<int64_t>();
+      mlir::Type carry = loop.getRegionIterArg(0).getType();
+      auto carryType = mlir::dyn_cast<riscv::ValueType>(carry);
+      auto carryInteger = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(carry));
+      auto outputParts = carryType
+                             ? riscv_internal::staticProduct(
+                                   carryType.getLayout()
+                                       .getReplicaFactors()
+                                       .asArrayRef())
+                             : carryInteger && carryInteger.isSigned() &&
+                                       carryInteger.getWidth() == 32
+                                   ? std::optional<int64_t>(1)
+                                   : std::optional<int64_t>();
       auto firstLayout = matched->front().dot.getPartialLayoutPlanAttr();
       auto firstTopology = matched->front().dot.getPartialTopology();
       auto slotType =
@@ -4181,9 +4254,11 @@ public:
                       : riscv::PartialSetType();
       const int64_t slots = firstTopology.getPartialSlots();
       const int64_t reductionAxis = matched->front().dot.getOver()[0];
-      if (!carryType || carryType.getLayout().getCarrier() != "scalar" ||
-          !outputParts || *outputParts <= 0 || !slotType || !reducedSet ||
-          !finalSet || slots <= 0) {
+      const bool scalarCarry =
+          carryType ? carryType.getLayout().getCarrier() == "scalar"
+                    : static_cast<bool>(carryInteger);
+      if (!scalarCarry || !outputParts || *outputParts <= 0 || !slotType ||
+          !reducedSet || !finalSet || slots <= 0) {
         loop.emitError(
             "selected level-scaled topology has no complete typed combine carrier");
         signalPassFailure();
@@ -4219,13 +4294,29 @@ public:
         llvm::SmallVector<int64_t> rhsParts;
         llvm::SmallVector<int64_t> scaleParts;
         for (int64_t outputPart = 0; outputPart < *outputParts; ++outputPart) {
-          auto lhsPart = projectReplica(contribution.dot.getLhs().getType(),
-                                        carryType, outputPart);
-          auto rhsPart = projectReplica(contribution.dot.getRhs().getType(),
-                                        carryType, outputPart);
-          auto scalePart = projectReplica(
-              mlir::cast<riscv::ValueType>(contribution.scale.getType()),
-              carryType, outputPart);
+          auto singletonPart = [](riscv::ValueType value)
+              -> std::optional<int64_t> {
+            auto parts = riscv_internal::staticProduct(
+                value.getLayout().getReplicaFactors().asArrayRef());
+            return parts && *parts == 1 ? std::optional<int64_t>(0)
+                                        : std::nullopt;
+          };
+          auto lhsPart = carryType
+                             ? projectReplica(contribution.dot.getLhs().getType(),
+                                              carryType, outputPart)
+                             : singletonPart(contribution.dot.getLhs().getType());
+          auto rhsPart = carryType
+                             ? projectReplica(contribution.dot.getRhs().getType(),
+                                              carryType, outputPart)
+                             : singletonPart(contribution.dot.getRhs().getType());
+          auto scaleType =
+              mlir::dyn_cast<riscv::ValueType>(contribution.scale.getType());
+          auto scalePart =
+              carryType && scaleType
+                  ? projectReplica(scaleType, carryType, outputPart)
+                  : !carryType && !scaleType
+                        ? std::optional<int64_t>(0)
+                        : scaleType ? singletonPart(scaleType) : std::nullopt;
           if (!lhsPart || !rhsPart || !scalePart) {
             loop.emitError(
                 "selected level-scaled topology has no complete output-replica map");
@@ -5567,6 +5658,29 @@ public:
       eraseDeadChain(root, replicaCleanupStops, replicaCleanupVisited,
                      rewriter);
 
+    // The planner sees one unreplicated loop-carried contribution and freezes
+    // the complete issue cohort before any cloning.  Expand that exact cohort
+    // here so the materializer consumes its typed plan rather than asking the
+    // generic Level unroller to duplicate an unplanned reduction graph.
+    llvm::SmallVector<mlir::scf::ForOp> levelScaledSeeds;
+    getOperation().walk([&](mlir::scf::ForOp loop) {
+      auto seed = matchLevelScaledLoopSeed(loop);
+      if (seed && hasTopology(seed->dot, "level_scaled"))
+        levelScaledSeeds.push_back(loop);
+    });
+    for (mlir::scf::ForOp loop : levelScaledSeeds) {
+      auto seed = matchLevelScaledLoopSeed(loop);
+      const int64_t factor = seed ? seed->dot.getPartialTopology().getPartialSlots()
+                                  : int64_t{0};
+      auto expanded = seed ? expandPlannedLevelScaledIssueLoop(loop, factor,
+                                                               rewriter)
+                           : mlir::FailureOr<mlir::scf::ForOp>(mlir::failure());
+      if (mlir::failed(expanded)) {
+        loop.emitError(
+            "selected level-scaled topology cannot mechanically expand its exact issue cohort");
+        failed = true;
+      }
+    }
     llvm::SmallVector<mlir::scf::ForOp> partialLoops;
     getOperation().walk(
         [&](mlir::scf::ForOp loop) { partialLoops.push_back(loop); });
@@ -5585,13 +5699,18 @@ public:
           mlir::cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
 
       const int64_t reductionAxis = contributions.front().dot.getOver()[0];
-      auto carryType =
-          mlir::dyn_cast<riscv::ValueType>(loop.getRegionIterArg(0).getType());
+      mlir::Type carry = loop.getRegionIterArg(0).getType();
+      auto carryType = mlir::dyn_cast<riscv::ValueType>(carry);
+      auto carryElement = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(carry));
       auto carryParts =
           carryType
               ? riscv_internal::staticProduct(
                     carryType.getLayout().getReplicaFactors().asArrayRef())
-              : std::optional<int64_t>();
+              : carryElement && carryElement.isSigned() &&
+                        carryElement.getWidth() == 32
+                    ? std::optional<int64_t>(1)
+                    : std::optional<int64_t>();
       auto firstLayoutPlan =
           contributions.front().dot.getPartialLayoutPlanAttr();
       auto firstTopology = contributions.front().dot.getPartialTopology();
@@ -5603,11 +5722,14 @@ public:
               ? mlir::dyn_cast<riscv::ValueType>(
                     firstLayoutPlan.getPartialSlotType())
               : riscv::ValueType();
-      bool complete = firstLayoutPlan && firstCombinePlan && carryType &&
-                      carryParts && *carryParts > 0 &&
+      const bool scalarCarry =
+          carryType ? carryType.getLayout().getCarrier() == "scalar"
+                    : static_cast<bool>(carryElement);
+      bool complete = firstLayoutPlan && firstCombinePlan && scalarCarry &&
+                      carryParts && *carryParts > 0 && carryElement &&
+                      carryElement.isSigned() && carryElement.getWidth() == 32 &&
                       firstCombinePlan.getRealization() == "level_scaled" &&
                       firstCombinePlan.getOutputParts() == *carryParts &&
-                      carryType.getLayout().getCarrier() == "scalar" &&
                       slotType;
       for (ScaledPartialContribution &contribution : contributions) {
         riscv::ValueType lhs = contribution.dot.getLhs().getType();
@@ -5620,9 +5742,9 @@ public:
                     contribution.dot.getOver().size() == 1 &&
                     contribution.dot.getOver()[0] == reductionAxis &&
                     contribution.dot.getPartialTopology() == firstTopology &&
-                    contribution.dot.getResult().getType() == carryType &&
-                    contribution.scaleMultiply.getResult().getType() == carryType &&
-                    contribution.carryAdd.getResult().getType() == carryType &&
+                    contribution.dot.getResult().getType() == carry &&
+                    contribution.scaleMultiply.getResult().getType() == carry &&
+                    contribution.carryAdd.getResult().getType() == carry &&
                     lhsPosition && rhsPosition &&
                     lhs.getLayout().getTimeFactors()[*lhsPosition] == 1 &&
                     rhs.getLayout().getTimeFactors()[*rhsPosition] == 1 &&
@@ -5737,7 +5859,7 @@ public:
                 {reductionAxis, slots, chains, fanout}));
         riscv_internal::copyOrigin(contributions.front().dot, combined);
         auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
-            yield.getLoc(), carryType.getElementType(), combined.getResult(),
+            yield.getLoc(), carryElement, combined.getResult(),
             reductionAxis,
             riscv_internal::leaf(
                 rewriter, "rvv", "partial-finalize",
@@ -5748,17 +5870,23 @@ public:
         riscv_internal::copyOrigin(contributions.front().dot, finalized);
         scalarParts.push_back(finalized.getResult());
       }
-      auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
-          yield.getLoc(), carryType, scalarParts,
-          riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
-                               "scalar.assemble-replicas",
-                               "scalar.assemble-replicas", 0, 0));
-      riscv_internal::copyOrigin(contributions.front().dot, assembled);
+      mlir::Value materializedCarry;
+      if (carryType) {
+        auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
+            yield.getLoc(), carryType, scalarParts,
+            riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
+                                 "scalar.assemble-replicas",
+                                 "scalar.assemble-replicas", 0, 0));
+        riscv_internal::copyOrigin(contributions.front().dot, assembled);
+        materializedCarry = assembled.getResult();
+      } else {
+        materializedCarry = scalarParts.front();
+      }
       riscv::BinaryOp finalAdd = contributions.back().carryAdd;
       finalAdd->moveBefore(yield);
       rewriter.modifyOpInPlace(finalAdd, [&] {
         finalAdd->setOperand(0, loop.getRegionIterArg(0));
-        finalAdd->setOperand(1, assembled.getResult());
+        finalAdd->setOperand(1, materializedCarry);
       });
 
       for (ScaledPartialContribution &contribution :

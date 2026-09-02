@@ -7393,18 +7393,26 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
   }
   for (auto [scale, replica] :
        llvm::zip(getScales(), getScaleReplicas())) {
-    ValueType type = mlir::cast<ValueType>(scale.getType());
-    auto scaleElement = mlir::dyn_cast<mlir::IntegerType>(type.getElementType());
-    auto replicas = checkedPositiveProduct(
-        type.getLayout().getReplicaFactors().asArrayRef());
+    auto type = mlir::dyn_cast<ValueType>(scale.getType());
+    auto direct = mlir::dyn_cast<mlir::IntegerType>(scale.getType());
+    auto scaleElement = type
+                            ? mlir::dyn_cast<mlir::IntegerType>(
+                                  type.getElementType())
+                            : direct;
+    auto replicas = type ? checkedPositiveProduct(
+                               type.getLayout().getReplicaFactors().asArrayRef())
+                         : direct ? std::optional<int64_t>(1)
+                                  : std::optional<int64_t>();
+    const bool closedCarrier =
+        type ? type.getLayout().getCarrier() == "scalar" &&
+                   llvm::all_of(type.getLayout().getTimeFactors().asArrayRef(),
+                                [](int64_t factor) { return factor == 1; }) &&
+                   llvm::all_of(type.getLayout().getLaneFactors().asArrayRef(),
+                                [](int64_t factor) { return factor == 1; })
+             : static_cast<bool>(direct);
     if (!scaleElement || !scaleElement.isSigned() ||
-        scaleElement.getWidth() != 32 ||
-        type.getLayout().getCarrier() != "scalar" || !replicas ||
-        replica < 0 || replica >= *replicas ||
-        !llvm::all_of(type.getLayout().getTimeFactors().asArrayRef(),
-                      [](int64_t factor) { return factor == 1; }) ||
-        !llvm::all_of(type.getLayout().getLaneFactors().asArrayRef(),
-                      [](int64_t factor) { return factor == 1; }))
+        scaleElement.getWidth() != 32 || !closedCarrier || !replicas ||
+        replica < 0 || replica >= *replicas)
       return emitOpError(
           "RVV scaled partial combine scales require in-bounds signed-i32 scalar replicas");
   }

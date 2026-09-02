@@ -822,6 +822,92 @@ struct CompleteLayeredExtract {
   llvm::SmallVector<riscv::ConvertLayoutOp> conversions;
 };
 
+struct CompleteLayeredStorageWindow {
+  riscv::RVVStorageWindowOp window;
+  riscv::FieldOp field;
+  riscv::PhysicalPointOp point;
+  riscv::PhysicalPointOp parent;
+  riscv::ValueType fieldType;
+  riscv::ValueType resultType;
+  LinearIndex relative;
+};
+
+std::optional<CompleteLayeredStorageWindow>
+completeLayeredStorageWindow(riscv::RVVStorageWindowOp window) {
+  CompleteLayeredStorageWindow result;
+  result.window = window;
+  result.field = window.getField().getDefiningOp<riscv::FieldOp>();
+  result.point = window.getOrigin().getDefiningOp<riscv::PhysicalPointOp>();
+  result.parent = result.point
+                      ? result.point.getParent().getDefiningOp<
+                            riscv::PhysicalPointOp>()
+                      : riscv::PhysicalPointOp();
+  result.fieldType =
+      result.field
+          ? mlir::dyn_cast<riscv::ValueType>(result.field.getResult().getType())
+          : riscv::ValueType();
+  result.resultType =
+      mlir::dyn_cast<riscv::ValueType>(window.getResult().getType());
+  auto element = result.fieldType
+                     ? mlir::dyn_cast<mlir::IntegerType>(
+                           result.fieldType.getElementType())
+                     : mlir::IntegerType();
+  auto plan = window.getPlan();
+  if (!result.field || !result.point || !result.parent || !result.fieldType ||
+      !result.resultType || !element || element.isSigned() || !plan ||
+      window.getAccess().getForm() != "indexed" ||
+      window.getAccess().getMapping() != "grouped_layered" ||
+      plan.getKind() != "layered" ||
+      plan.getReductionAxis() !=
+          result.point.getResult().getType().getDomain().getAxisId() ||
+      result.parent.getResult().getType().getDomain().getAxisId() !=
+          plan.getReductionAxis() ||
+      result.parent.getResult().getType().getDomain().getTail() != "exact")
+    return std::nullopt;
+
+  const int64_t group = window.getAccess().getGroupSize();
+  const int64_t layer = window.getAccess().getLayerSize();
+  const int64_t layers = layer > 0 ? group / layer : 0;
+  auto axis = llvm::find(result.resultType.getAxisIds().asArrayRef(),
+                         plan.getReductionAxis());
+  auto parentPartition = result.parent.getPartition()
+                             .getDefiningOp<mlir::arith::ConstantIndexOp>();
+  if (group <= 0 || layer <= 0 || group % layer || layers <= 1 ||
+      element.getWidth() * layers != 8 ||
+      axis == result.resultType.getAxisIds().asArrayRef().end() ||
+      !parentPartition || parentPartition.value() % group)
+    return std::nullopt;
+  const size_t axisPosition = static_cast<size_t>(
+      axis - result.resultType.getAxisIds().asArrayRef().begin());
+  const int64_t lanes =
+      result.resultType.getLayout().getLaneFactors()[axisPosition];
+  if (lanes <= 1 || layer % lanes ||
+      result.resultType.getShape()[axisPosition] != lanes ||
+      result.resultType.getLayout().getTimeFactors()[axisPosition] != 1 ||
+      result.resultType.getLayout().getCarrier() != "rvv")
+    return std::nullopt;
+
+  decomposeIndex(result.point.getBase(), 1, result.relative);
+  decomposeIndex(result.parent.getBase(), -1, result.relative);
+  decomposeIndex(window.getLogicalOffset(), 1, result.relative);
+  if (!result.relative.valid || result.relative.constant < 0)
+    return std::nullopt;
+  return result;
+}
+
+bool sameCompleteLayeredStorageGroup(CompleteLayeredStorageWindow &lhs,
+                                     CompleteLayeredStorageWindow &rhs) {
+  return lhs.window->getBlock() == rhs.window->getBlock() &&
+         sameFieldEdge(lhs.field, rhs.field) && lhs.parent == rhs.parent &&
+         lhs.point.getActive() == rhs.point.getActive() &&
+         lhs.point.getPartition() == rhs.point.getPartition() &&
+         lhs.point.getResult().getType() == rhs.point.getResult().getType() &&
+         lhs.resultType == rhs.resultType &&
+         lhs.window.getAccess() == rhs.window.getAccess() &&
+         lhs.window.getPlan() == rhs.window.getPlan() &&
+         sameTerms(lhs.relative, rhs.relative);
+}
+
 std::optional<CompleteLayeredExtract>
 completeLayeredExtract(riscv::ExtractOp extract) {
   CompleteLayeredExtract result;
@@ -1705,6 +1791,204 @@ void materializeReplicaStorageLoads(mlir::IRRewriter &rewriter,
   eraseDeadPureProducers(rewriter, replacedIndices);
 }
 
+bool readRangeIsShareable(mlir::Operation *first, mlir::Operation *last) {
+  if (!first || !last || first->getBlock() != last->getBlock())
+    return false;
+  for (mlir::Operation *operation = first; operation;
+       operation = operation->getNextNode()) {
+    // Physical points are pure SSA coordinates, but deliberately carry no
+    // generic fold trait.  A read may cross them when it depends only on the
+    // already-dominating parent point used by the shared window.
+    if (!mlir::isa<riscv::PhysicalPointOp>(operation) &&
+        !isReadOnlyOrPure(operation))
+      return false;
+    if (operation == last)
+      return true;
+  }
+  return false;
+}
+
+void materializeSharedLayeredStorageWindows(mlir::IRRewriter &rewriter,
+                                            mlir::ModuleOp module) {
+  llvm::SmallVector<riscv::RVVStorageWindowOp> windows;
+  module.walk([&](riscv::RVVStorageWindowOp window) {
+    windows.push_back(window);
+  });
+  llvm::DenseSet<mlir::Operation *> consumed;
+
+  for (riscv::RVVStorageWindowOp first : windows) {
+    if (consumed.contains(first))
+      continue;
+    auto firstInfo = completeLayeredStorageWindow(first);
+    if (!firstInfo)
+      continue;
+    const int64_t group = first.getAccess().getGroupSize();
+    const int64_t layer = first.getAccess().getLayerSize();
+    const int64_t layers = group / layer;
+    const int64_t axis = first.getPlan().getReductionAxis();
+    auto axisIt = llvm::find(firstInfo->resultType.getAxisIds().asArrayRef(), axis);
+    if (axisIt == firstInfo->resultType.getAxisIds().asArrayRef().end())
+      continue;
+    const size_t axisPosition = static_cast<size_t>(
+        axisIt - firstInfo->resultType.getAxisIds().asArrayRef().begin());
+    const int64_t lanes =
+        firstInfo->resultType.getLayout().getLaneFactors()[axisPosition];
+    const int64_t windowsPerLayer = layer / lanes;
+    const int64_t slots = layers * windowsPerLayer;
+    const int64_t groupBase =
+        (firstInfo->relative.constant / group) * group;
+    if (slots <= 1)
+      continue;
+
+    llvm::SmallVector<
+        llvm::SmallVector<CompleteLayeredStorageWindow, 1>, 8>
+        bySlot(static_cast<size_t>(slots));
+    for (riscv::RVVStorageWindowOp candidate : windows) {
+      if (consumed.contains(candidate))
+        continue;
+      auto info = completeLayeredStorageWindow(candidate);
+      if (!info || !sameCompleteLayeredStorageGroup(*firstInfo, *info))
+        continue;
+      const int64_t delta = info->relative.constant - groupBase;
+      if (delta < 0 || delta >= group || delta % lanes)
+        continue;
+      bySlot[static_cast<size_t>(delta / lanes)].push_back(std::move(*info));
+    }
+    if (llvm::any_of(bySlot, [](const auto &slot) { return slot.empty(); }))
+      continue;
+
+    mlir::Operation *insertion = bySlot.front().front().window;
+    mlir::Operation *last = insertion;
+    for (auto &slot : bySlot)
+      for (CompleteLayeredStorageWindow &info : slot) {
+        if (info.window->isBeforeInBlock(insertion))
+          insertion = info.window;
+        if (last->isBeforeInBlock(info.window))
+          last = info.window;
+      }
+    if (!readRangeIsShareable(insertion, last))
+      continue;
+
+    CompleteLayeredStorageWindow &leader = bySlot.front().front();
+    auto fieldAxis = llvm::find(leader.fieldType.getAxisIds().asArrayRef(), axis);
+    if (fieldAxis == leader.fieldType.getAxisIds().asArrayRef().end())
+      continue;
+    const int64_t projectionExtent =
+        leader.fieldType.getShape()[static_cast<size_t>(
+            fieldAxis - leader.fieldType.getAxisIds().asArrayRef().begin())];
+    const int64_t rawGroups =
+        leader.resultType.getLayout().getRegisterGroups();
+    auto storagePlan = riscv_internal::storageWindowPlan(
+        rewriter, leader.field, axis, 0, 1, 1, projectionExtent, lanes);
+    if (!storagePlan)
+      continue;
+    llvm::SmallVector<LayerSelection> layerPlan;
+    layerPlan.reserve(static_cast<size_t>(layers));
+    for (int64_t logicalLayer = 0; logicalLayer < layers; ++logicalLayer) {
+      auto selection = selectLayer(
+          first.getAccess(), logicalLayer, layers,
+          riscv_internal::logicalBitWidth(leader.resultType.getElementType()));
+      if (!selection)
+        break;
+      layerPlan.push_back(*selection);
+    }
+    if (layerPlan.size() != static_cast<size_t>(layers))
+      continue;
+
+    rewriter.setInsertionPoint(insertion);
+    auto groupValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+        first.getLoc(), group);
+    auto relativeBase = rewriter.create<mlir::arith::SubIOp>(
+        first.getLoc(), leader.point.getBase(), leader.parent.getBase());
+    mlir::Value logicalBase = relativeBase;
+    auto constantOffset = constantIndex(leader.window.getLogicalOffset());
+    if (!constantOffset || *constantOffset != 0)
+      logicalBase = rewriter.create<mlir::arith::AddIOp>(
+          first.getLoc(), relativeBase, leader.window.getLogicalOffset());
+    auto groupIndex = rewriter.create<mlir::arith::DivUIOp>(
+        first.getLoc(), logicalBase, groupValue);
+    mlir::Value windowGroup = groupIndex;
+    if (windowsPerLayer != 1) {
+      auto windowsValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+          first.getLoc(), windowsPerLayer);
+      windowGroup = rewriter.create<mlir::arith::MulIOp>(
+          first.getLoc(), groupIndex, windowsValue);
+    }
+
+    auto storageType = riscv::LayeredWindowType::get(
+        rewriter.getContext(), leader.fieldType, leader.resultType, axis, layers,
+        windowsPerLayer, rawGroups);
+    llvm::SmallVector<llvm::SmallVector<mlir::Value, 4>, 2> decoded(
+        static_cast<size_t>(windowsPerLayer));
+    for (int64_t window = 0; window < windowsPerLayer; ++window) {
+      mlir::Value windowIndex = windowGroup;
+      if (window) {
+        auto offset = rewriter.create<mlir::arith::ConstantIndexOp>(
+            first.getLoc(), window);
+        windowIndex = rewriter.create<mlir::arith::AddIOp>(
+            first.getLoc(), windowGroup, offset);
+      }
+      auto storage = rewriter.create<riscv::RVVLayeredStorageLoadOp>(
+          first.getLoc(), storageType, leader.field.getResult(),
+          leader.parent.getResult(), windowIndex, *storagePlan, first.getAccess(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "layered-storage-load",
+              "rvv.layered-storage-load", "rvv.layered-storage-load",
+              leader.fieldType.getLayout().getRegisterGroups(), rawGroups,
+              rawGroups, 0, "none",
+              leader.resultType.getLayout().getValidity() == "tail" ? "agnostic"
+                                                                    : "exact"));
+      riscv_internal::copyOrigin(first, storage);
+      for (int64_t logicalLayer = 0; logicalLayer < layers; ++logicalLayer) {
+        const LayerSelection &selection =
+            layerPlan[static_cast<size_t>(logicalLayer)];
+        const int64_t elementBits =
+            riscv_internal::logicalBitWidth(leader.resultType.getElementType());
+        const int64_t shiftAmount = selection.physicalLayer * elementBits;
+        const int64_t maskValue =
+            selection.mask ? (int64_t{1} << elementBits) - 1 : 0;
+        llvm::StringRef instruction =
+            riscv_internal::layeredStorageDecodeInstruction(shiftAmount,
+                                                            maskValue);
+        auto value = rewriter.create<riscv::RVVLayeredStorageDecodeOp>(
+            first.getLoc(), leader.resultType, storage.getResult(), logicalLayer,
+            selection.physicalLayer, shiftAmount, maskValue,
+            riscv_internal::leaf(
+                rewriter, "rvv", "layered-storage-decode", instruction,
+                instruction, rawGroups,
+                leader.resultType.getLayout().getRegisterGroups(), 1, 0, "none",
+                leader.resultType.getLayout().getValidity() == "tail"
+                    ? "agnostic"
+                    : "exact"));
+        riscv_internal::copyOrigin(first, value);
+        decoded[static_cast<size_t>(window)].push_back(value.getResult());
+      }
+    }
+
+    for (int64_t logicalLayer = 0; logicalLayer < layers; ++logicalLayer)
+      for (int64_t window = 0; window < windowsPerLayer; ++window) {
+        const size_t slot = static_cast<size_t>(
+            logicalLayer * windowsPerLayer + window);
+        for (CompleteLayeredStorageWindow &info : bySlot[slot]) {
+          info.window.getResult().replaceAllUsesWith(
+              decoded[static_cast<size_t>(window)]
+                     [static_cast<size_t>(logicalLayer)]);
+          consumed.insert(info.window);
+        }
+      }
+
+    llvm::DenseSet<mlir::Operation *> deadFields;
+    for (auto &slot : bySlot)
+      for (CompleteLayeredStorageWindow &info : slot) {
+        rewriter.eraseOp(info.window);
+        if (info.field != leader.field && info.field.getResult().use_empty())
+          deadFields.insert(info.field);
+      }
+    for (mlir::Operation *field : deadFields)
+      rewriter.eraseOp(field);
+  }
+}
+
 bool hasTypedStorageMaterialization(riscv::FieldOp field) {
   return llvm::any_of(field.getResult().getUsers(), [](mlir::Operation *user) {
     return mlir::isa<riscv::RVVReplicaStorageLoadOp,
@@ -2198,6 +2482,14 @@ public:
       if (secondField.getResult().use_empty())
         rewriter.eraseOp(secondField);
     }
+
+    // Partial materialization introduces typed per-issue storage windows after
+    // the first sharing pass.  Once mechanical issue unrolling exposes one
+    // complete grouped/layered relation, collapse those logical windows to one
+    // raw load per physical byte window and retain each layer as an explicit
+    // decode result.  Distinct logical offsets are not CSE-equivalent; their
+    // affine (raw-window, layer) decomposition is the proof used here.
+    materializeSharedLayeredStorageWindows(rewriter, getOperation());
 
   }
 };

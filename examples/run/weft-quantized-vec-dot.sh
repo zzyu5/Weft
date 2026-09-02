@@ -69,11 +69,7 @@ if [[ ${format} == q5_0 || ${format} == q5_1 ]]; then
     physical_auto+=(--auto-pipeline-depth 1)
 fi
 if [[ ${format} == q2_k ]]; then
-  if [[ ${target} == sg2044 ]]; then
-    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 16)
-  else
-    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
-  fi
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
     physical_auto+=(--auto-pipeline-depth 1)
 fi

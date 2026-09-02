@@ -47,6 +47,11 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   // Unrolling earlier duplicates the reduction use-def graph and makes the
   // selected full-product topology unrecognizable to its own planner.
   manager.addPass(weft::createUnrollRISCVLevelsPass());
+  // Mechanical unrolling exposes complete grouped/layered issue groups created
+  // by partial materialization.  Re-run the idempotent sharing owner so those
+  // distinct logical offsets become explicit raw-window loads plus typed layer
+  // decodes before later layout and resource passes inspect their lifetimes.
+  manager.addPass(weft::createShareRISCVLayeredWindowsPass());
   // Partial materialization can introduce fresh lane-to-register edges around
   // shaped iotas and other pure producers.  Canonicalize those new edges
   // before scheduling/final leaf selection so their register forms remain

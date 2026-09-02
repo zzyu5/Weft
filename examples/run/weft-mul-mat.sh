@@ -258,11 +258,7 @@ else
     fi
   elif [[ ${format} == q2_k ]]; then
     if [[ ${phase} == decode ]]; then
-      if [[ ${target} == sg2044 ]]; then
-        physical=(--auto-unroll=16 --auto-pipeline-depth=1)
-      else
-        physical=(--auto-unroll=8 --auto-pipeline-depth=1)
-      fi
+      physical=(--auto-unroll=8 --auto-pipeline-depth=1)
       runtime_kernel_define=-DWEFT_Q2K_DECODE=1
       kernel=production_mul_mat_q2_k_decode
     else

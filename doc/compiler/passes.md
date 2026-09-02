@@ -16,6 +16,7 @@ ConvertWeftToRISCV
 → PlanRISCVMemory
 → SelectRISCVOperations
 → LowerRISCVComposites
+→ MaterializeRISCVPrograms
 → CanonicalizeRISCVLayouts
 → FuseRISCVBitplanes
 → HoistRISCVLoopInvariants
@@ -26,6 +27,7 @@ ConvertWeftToRISCV
 → PlanRISCVPartialTopologies
 → MaterializeRISCVPartialAccumulators
 → UnrollRISCVLevels
+→ ShareRISCVLayeredWindows
 → CanonicalizeRISCVLayouts
 → PlanRISCVMemory
 → MaterializeRISCVReplicaStorageLoads
@@ -41,7 +43,9 @@ ConvertWeftToRISCV
 operation/effect 的显式 physical loop，`schedule` 才能从真实 use-def 分配 stage/order，
 `pipeline` 再只负责版本化 SSA 值并生成 prologue/steady-state/epilogue。partial planner 必须在
 generic unroll 之前读取未复制的 contraction/reduction use-def，冻结 carrier、combine topology
-与 issue unroll；materializer 生成 issue loop后，`UnrollRISCVLevels`才机械复制迭代。exact leaf
+与 issue unroll；materializer 生成 issue loop后，`UnrollRISCVLevels`才机械复制迭代。展开后才完整
+出现的 grouped/layered issue relation 再交给同一个幂等 sharing owner，物化为共享
+raw-window load 与显式 layer decode。exact leaf
 完成后，resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
 
 ## 2. 各 pass 合同
@@ -124,6 +128,11 @@ birth；它只冻结一次已选load/decode结果，使后续不同layout consum
 未知 conversion kind、缺失 reduction extent、缺失 access 或不闭合 fragment capability均明确
 失败。该 pass 不创建 source outer traversal、Level、workspace 或 persistent Encoding。
 
+`MaterializeRISCVPrograms` 紧随其后，把仍以 transient macro op 承载的已选
+local-pack 与 grouped-MAC program 展开成真实 `scf` control、point、load/step 和 SSA
+use-def，然后删除 macro op。该 pass 只展开已冻结的 plan，不重选 layout、memory
+form、tail 或 leaf；final verifier 拒绝任何尚待 terminal emitter 解释的 macro program。
+
 ### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 
 `ScheduleRISCVLevels` 是 scheduler。它读取已 lowering 的 physical `scf.for`、SSA use-def、
@@ -178,6 +187,12 @@ accumulate/reduction leaf。nested、layered 与 scaled/reduced-scaled plan 同�
 中冻结 issue types、scale supply、narrow-scale type、storage-window/decode instruction、partial
 reduction、finalization leaf 与同时存活的 resource groups；materializer 只能按这些字段创建
 operation，不能从 shape 或当前 SSA spelling 再次推断。
+
+带 Level-local issue unroll 的 scaled contraction 在展开前只有一个 loop-carried
+contribution。planner 必须从该 seed 冻结完整 slots、product carrier、scale supply、
+combine topology 与 resource groups；materializer 再按该 slots 机械展开。scale 可以是
+typed scalar carrier 或已终结的 signed-i32 scalar，两者都必须由 verifier 证明为单一
+replica；不能因展开时的 SSA 拼写不同而重选 topology。
 
 上述 plan attributes 是第二层内部、一次 lowering 中的瞬态冻结结果。完成物化后它们必须删除；
 final verifier拒绝任何残留plan，terminal translator也不读取它们。只有单stream的closed widening-dot
