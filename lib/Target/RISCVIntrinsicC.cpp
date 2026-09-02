@@ -3328,6 +3328,15 @@ Emitter::compileRVVAxisBroadcast(riscv::RVVAxisBroadcastOp operation) {
       source = "__riscv_vlmul_ext_v_" + inputSuffix + "_" + resultSuffix +
                "(" + source + ")";
 
+    const int64_t inputLanes =
+        product(inputType.getLayout().getLaneFactors());
+    const int64_t resultLanes =
+        product(resultType.getLayout().getLaneFactors());
+    if (inputLanes == resultLanes) {
+      result.parts.push_back(std::move(source));
+      continue;
+    }
+
     const std::string vl = partVL(operation.getResult(), part);
     std::string index = fresh("broadcast_index");
     line(indexCType + " " + index + " = __riscv_vmv_v_x_" + indexSuffix +
@@ -5426,9 +5435,9 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
 
 mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
     riscv::RVVIndexedEntryLoadOp operation) {
-  Binding entries = bindings.lookup(operation.getEntryIndices());
+  Binding entries = bindings.lookup(operation.getEntryOffsets());
   auto materializedEntries =
-      materializeNumeric(operation.getEntryIndices(), entries);
+      materializeNumeric(operation.getEntryOffsets(), entries);
   if (mlir::failed(materializedEntries))
     return mlir::failure();
   entries = std::move(*materializedEntries);
@@ -5436,7 +5445,7 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       entries.kind != Binding::Kind::ScalarTuple &&
       entries.kind != Binding::Kind::Vector)
     return fail(operation,
-                "indexed entry load requires scalar, replica-tuple, or RVV entry indices");
+                "indexed entry load requires scalar, replica-tuple, or RVV byte offsets");
 
   mlir::Type element = operation.getResult().getType().getElementType();
   auto cType = scalarCType(element);
@@ -5501,7 +5510,7 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
     }
     if (!entry && entries.kind != Binding::Kind::Vector)
       return fail(operation,
-                  "indexed entry load outer axes have no typed entry-index projection");
+                  "indexed entry load outer axes have no typed byte-offset projection");
     std::string base;
     if (descriptorBase) {
       base = *descriptorBase;
@@ -5538,29 +5547,21 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       if (streams <= 0)
         return fail(operation,
                     "indexed entry gather has no result stream mapping");
-      auto entryPart = projectPart(operation.getEntryIndices(),
+      auto entryPart = projectPart(operation.getEntryOffsets(),
                                    operation.getResult(), part);
       if (!entryPart || *entryPart >= entries.parts.size())
         return fail(operation,
                     "indexed entry gather free axes have no typed entry projection");
-      auto entryType = operation.getEntryIndices().getType();
+      auto entryType = operation.getEntryOffsets().getType();
       auto entryInteger =
           mlir::dyn_cast<mlir::IntegerType>(entryType.getElementType());
       if (!entryInteger || entryInteger.isSigned() ||
           (entryInteger.getWidth() != 16 && entryInteger.getWidth() != 32 &&
            entryInteger.getWidth() != 64))
         return fail(operation,
-                    "indexed entry gather requires u16, u32, or u64 indices");
-      const std::string indexSuffix =
-          vectorSuffix(operation.getEntryIndices());
-      const std::string indexType = vectorType(operation.getEntryIndices());
+                    "indexed entry gather requires u16, u32, or u64 byte offsets");
       const std::string entryVL =
-          partVL(operation.getEntryIndices(), *entryPart);
-      std::string byteOffsets = fresh("entry_byte_offsets");
-      line(indexType + " " + byteOffsets + " = __riscv_vmul_vx_" +
-           indexSuffix + "(" + entries.parts[*entryPart] + ", " +
-           std::to_string(operation.getEntryStride()) + ", " + entryVL +
-           ");");
+          partVL(operation.getEntryOffsets(), *entryPart);
 
       const unsigned packedBits =
           elementBits * static_cast<unsigned>(operation.getPayloadExtent());
@@ -5577,7 +5578,7 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       line(packedType + " " + packed + " = __riscv_vluxei" +
            std::to_string(entryInteger.getWidth()) + "_v_" + packedSuffix +
            "((const uint" + std::to_string(packedBits) + "_t *)(" + base +
-           "), " + byteOffsets + ", " + entryVL + ");");
+           "), " + entries.parts[*entryPart] + ", " + entryVL + ");");
       const std::string unsignedResultSuffix =
           "u" + std::to_string(elementBits) + lmul;
       std::string unpacked = "__riscv_vreinterpret_v_" + packedSuffix + "_" +
@@ -5592,8 +5593,8 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       continue;
     }
     const std::string pointer =
-        base + " + ((size_t)(" + *entry + ") * " +
-        std::to_string(operation.getEntryStride()) + ")";
+        "((const " + *cType + " *)((const uint8_t *)(" + base +
+        ") + (size_t)(" + *entry + ")))";
     const std::string vl = partVL(operation.getResult(), part);
     std::string loaded = fresh("entry_payload");
     line(resultType + " " + loaded + " = __riscv_vle" +
@@ -7947,9 +7948,19 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
               expression = "__riscv_vslidedown_vx_" + sourceSuffix + "(" +
                            expression + ", " + std::to_string(laneOffset) +
                            ", " + std::to_string(sourceLanes) + ")";
-            if (sourceSuffix != resultSuffix)
-              expression = "__riscv_vlmul_trunc_v_" + sourceSuffix + "_" +
-                           resultSuffix + "(" + expression + ")";
+            if (sourceSuffix != resultSuffix) {
+              const int64_t sourceLMUL = sourceLayout.getLmulEighths();
+              const int64_t resultLMUL = resultLayout.getLmulEighths();
+              if (sourceLMUL < resultLMUL && resultLMUL % sourceLMUL == 0)
+                expression = "__riscv_vlmul_ext_v_" + sourceSuffix + "_" +
+                             resultSuffix + "(" + expression + ")";
+              else if (sourceLMUL > resultLMUL && sourceLMUL % resultLMUL == 0)
+                expression = "__riscv_vlmul_trunc_v_" + sourceSuffix + "_" +
+                             resultSuffix + "(" + expression + ")";
+              else
+                return fail(conversion,
+                            "RVV repartition requires one integral LMUL relation");
+            }
           } else {
             if (resultLanes % sourceLanes != 0)
               return fail(conversion,

@@ -145,5 +145,5 @@ tar -C "${local_root}" -cf - runtime.cpp |
       -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o ggml_kernel_runtime
 
-    exec taskset -c \"\${cpu}\" ./ggml_kernel_runtime ${kernel_argument} ${repetitions_argument}
+    taskset -c \"\${cpu}\" ./ggml_kernel_runtime ${kernel_argument} ${repetitions_argument}
   "

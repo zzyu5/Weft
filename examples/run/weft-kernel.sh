@@ -206,7 +206,8 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -L\"\${link_path}\" -Wl,-rpath,\"\${link_path}\" -o runtime
     runtime_phase=${runtime_phase_argument}
     if [ -n \"\${runtime_phase}\" ]; then
-      exec taskset -c \"\${cpu}\" ./runtime \"\${runtime_phase}\" ${repetitions_argument}
+      taskset -c \"\${cpu}\" ./runtime \"\${runtime_phase}\" ${repetitions_argument}
+    else
+      taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
     fi
-    exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
   "

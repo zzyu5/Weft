@@ -202,6 +202,62 @@ materializeEntryIndices(const IndexedEntryLoadPlan &plan,
   return conversion.getResult();
 }
 
+mlir::FailureOr<mlir::Value>
+materializeEntryByteOffsets(mlir::Value entryIndices, int64_t entryStride,
+                            mlir::Operation *origin,
+                            mlir::IRRewriter &rewriter) {
+  auto type = mlir::dyn_cast<riscv::ValueType>(entryIndices.getType());
+  if (!type || entryStride <= 0)
+    return origin->emitError(
+               "indexed entry relation has no positive typed byte stride"),
+           mlir::failure();
+  if (entryStride == 1)
+    return entryIndices;
+  const bool powerOfTwo = (entryStride & (entryStride - 1)) == 0;
+  int64_t immediate = entryStride;
+  if (powerOfTwo) {
+    immediate = 0;
+    for (int64_t value = entryStride; value > 1; value >>= 1)
+      ++immediate;
+  }
+  mlir::TypedAttr stride;
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type.getElementType())) {
+    if (integer.getWidth() < 63) {
+      const int64_t maximum = (int64_t{1} << integer.getWidth()) - 1;
+      if (entryStride > maximum ||
+          (powerOfTwo && immediate >= integer.getWidth()))
+        return origin->emitError(
+                   "indexed entry byte stride is not representable by its selected unsigned carrier"),
+               mlir::failure();
+    }
+    stride = rewriter.getIntegerAttr(integer, immediate);
+  } else if (type.getElementType().isIndex())
+    stride = rewriter.getIndexAttr(immediate);
+  if (!stride)
+    return origin->emitError(
+               "indexed entry relation has no integer byte-offset type"),
+           mlir::failure();
+  auto constant = rewriter.create<riscv::ConstantOp>(
+      origin->getLoc(), type.getElementType(), stride);
+  auto offsets = rewriter.create<riscv::BinaryOp>(
+      origin->getLoc(), type, entryIndices, constant.getResult(),
+      powerOfTwo ? "shl" : "mul",
+      riscv_internal::unselectedLeaf(rewriter));
+  riscv_internal::copyOrigin(origin, offsets);
+  return offsets.getResult();
+}
+
+std::optional<int64_t> entryByteStride(const IndexedEntryLoadPlan &plan,
+                                       riscv::ValueType result) {
+  const unsigned bits =
+      riscv_internal::logicalBitWidth(result.getElementType());
+  int64_t bytes = 0;
+  if (!bits || bits % 8 ||
+      !checkedScale(plan.entryStride, static_cast<int64_t>(bits / 8), bytes))
+    return std::nullopt;
+  return bytes;
+}
+
 bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
                               riscv::ValueType entryIndices,
                               riscv::ValueType result, int64_t alignment,
@@ -1225,19 +1281,42 @@ riscv::AccessAttr fieldAccess(mlir::Builder &builder,
                     facts.order);
 }
 
-riscv::ExtractOp encodedScalarRoot(mlir::Value value) {
+bool collectEncodedScalarRoots(
+    mlir::Value value, mlir::Block *block,
+    llvm::DenseSet<mlir::Operation *> &visited,
+    llvm::SmallVectorImpl<riscv::ExtractOp> &roots) {
   mlir::Operation *definition = value.getDefiningOp();
-  while (definition && definition->getBlock() == value.getParentBlock()) {
-    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition))
-      return extract;
-    if (definition->getNumOperands() != 1 || definition->getNumResults() != 1 ||
-        !mlir::isMemoryEffectFree(definition) ||
-        mlir::isa<riscv::RegisterMaterializeOp>(definition))
-      return {};
-    value = definition->getOperand(0);
-    definition = value.getDefiningOp();
+  if (!definition)
+    return true;
+  if (definition->getBlock() != block)
+    return false;
+  if (!visited.insert(definition).second)
+    return true;
+  if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
+    auto field = riscv_internal::sourceField(extract.getInput());
+    if (!field || extract.getAccess().getMapping() != "natural" ||
+        extract.getAccess().getBitOffset() % 8)
+      return false;
+    roots.push_back(extract);
+    return true;
   }
-  return {};
+  if (mlir::isa<riscv::ConstantOp, riscv::IotaOp>(definition))
+    return true;
+  if (definition->getNumResults() != 1 ||
+      !mlir::isMemoryEffectFree(definition) ||
+      mlir::isa<riscv::RegisterMaterializeOp>(definition) ||
+      !mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
+                 riscv::NarrowOp, riscv::WidenOp,
+                 riscv::ConvertLayoutOp>(definition))
+    return false;
+  for (mlir::Value operand : definition->getOperands()) {
+    auto type = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+    if (type && type.getLayout().getCarrier() != "scalar")
+      return false;
+    if (!collectEncodedScalarRoots(operand, block, visited, roots))
+      return false;
+  }
+  return true;
 }
 
 bool needsScalarEncodedShare(mlir::Value value) {
@@ -1246,13 +1325,21 @@ bool needsScalarEncodedShare(mlir::Value value) {
       value.getType().isIndex() ||
       mlir::isa<mlir::IntegerType, mlir::FloatType>(value.getType()) ||
       (result && result.getLayout().getCarrier() == "scalar");
-  auto extract = encodedScalarRoot(value);
-  auto field = extract ? riscv_internal::sourceField(extract.getInput())
-                       : riscv::FieldOp();
-  if (!scalar || !extract || !field ||
-      extract.getAccess().getMapping() != "natural" ||
-      extract.getAccess().getBitOffset() % 8)
+  llvm::DenseSet<mlir::Operation *> visited;
+  llvm::SmallVector<riscv::ExtractOp> roots;
+  if (!scalar ||
+      !collectEncodedScalarRoots(value, value.getParentBlock(), visited, roots) ||
+      roots.empty())
     return false;
+  auto rootField = riscv_internal::sourceField(roots.front().getInput());
+  if (!rootField)
+    return false;
+  for (riscv::ExtractOp root : llvm::drop_begin(roots)) {
+    auto field = riscv_internal::sourceField(root.getInput());
+    if (!field || field.getOwner() != rootField.getOwner() ||
+        field.getName() != rootField.getName())
+      return false;
+  }
 
   auto element = mlir::dyn_cast<mlir::IntegerType>(
       riscv_internal::logicalElement(value.getType()));
@@ -1841,12 +1928,25 @@ public:
         eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
         continue;
       }
+      auto byteStride = entryByteStride(*plan, result);
+      if (!byteStride) {
+        extract.emitError(
+            "indexed entry relation has no exact byte-address stride");
+        failed = true;
+        continue;
+      }
+      auto entryOffsets = materializeEntryByteOffsets(
+          *entryIndices, *byteStride, extract, rewriter);
+      if (mlir::failed(entryOffsets)) {
+        failed = true;
+        continue;
+      }
       const bool vectorEntries =
           entryType.getLayout().getCarrier() == "rvv";
       auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
-          extract.getLoc(), result, extract.getInput(), *entryIndices,
+          extract.getLoc(), result, extract.getInput(), *entryOffsets,
           source.getAxisIds()[gatherDimension], plan->payloadAxis,
-          plan->payloadExtent, plan->entryStride,
+          plan->payloadExtent, *byteStride,
           makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
           riscv_internal::leaf(
               builder, "rvv",
@@ -2282,14 +2382,27 @@ public:
         eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
         continue;
       }
+      auto byteStride = entryByteStride(*plan, resultType);
+      if (!byteStride) {
+        operation.emitError(
+            "indexed entry relation has no exact byte-address stride");
+        failed = true;
+        continue;
+      }
+      auto entryOffsets = materializeEntryByteOffsets(
+          *entryIndices, *byteStride, operation, rewriter);
+      if (mlir::failed(entryOffsets)) {
+        failed = true;
+        continue;
+      }
       const bool vectorEntries =
           entryType.getLayout().getCarrier() == "rvv";
       auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
           operation.getLoc(), resultType,
-          tableLoad ? tableLoad.getRegion() : operation.getTable(), *entryIndices,
+          tableLoad ? tableLoad.getRegion() : operation.getTable(), *entryOffsets,
           sourceAxis, plan->payloadAxis,
           plan->payloadExtent,
-          plan->entryStride,
+          *byteStride,
           makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
           riscv_internal::leaf(
               builder, "rvv",

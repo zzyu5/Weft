@@ -566,13 +566,13 @@ def vec_dot_iq2_xxs_q8_k(
         group = iota(8, dtype=u32, axis="group")
         entry = iota(4, dtype=u32, axis="entry")
         payload = iota(8, dtype=u16, axis="payload")
-        word0 = widen(w.q[group * u32(4)], u32) | (
-            widen(w.q[group * u32(4) + u32(1)], u32) << u32(16)
+        group_byte = group * u32(8)
+        grid_index = widen(w.q[group_byte + entry], u32)
+        word1 = widen(w.q[group_byte + u32(4)], u32) | (
+            widen(w.q[group_byte + u32(5)], u32) << u32(8)
         )
-        word1 = widen(w.q[group * u32(4) + u32(2)], u32) | (
-            widen(w.q[group * u32(4) + u32(3)], u32) << u32(16)
-        )
-        grid_index = (word0 >> (entry * u32(8))) & u32(255)
+        word1 = word1 | (widen(w.q[group_byte + u32(6)], u32) << u32(16))
+        word1 = word1 | (widen(w.q[group_byte + u32(7)], u32) << u32(24))
         sign_index = (word1 >> (entry * u32(7))) & u32(127)
         weight = lookup(
             grid_values, grid_index * u32(8) + payload, bounds="in_bounds"

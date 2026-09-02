@@ -231,9 +231,13 @@ def dequantize_iq2_xxs(
             group = j // 32
             entry = (j % 32) // 8
             lane = j % 8
-            word = w.q[group * 4 + entry // 2]
-            grid_index = extract_bits(word, (entry % 2) * 8, 8)
-            metadata = u32(w.q[group * 4 + 2]) | (u32(w.q[group * 4 + 3]) << u32(16))
+            group_byte = group * 8
+            grid_index = u32(w.q[group_byte + entry])
+            metadata = u32(w.q[group_byte + 4]) | (
+                u32(w.q[group_byte + 5]) << u32(8)
+            )
+            metadata = metadata | (u32(w.q[group_byte + 6]) << u32(16))
+            metadata = metadata | (u32(w.q[group_byte + 7]) << u32(24))
             sign_index = extract_bits(metadata, entry * 7, 7)
             subscale = f32(0.5) + f32(extract_bits(metadata, 28, 4))
             scale = f32(w.d) * subscale * f32(0.25)

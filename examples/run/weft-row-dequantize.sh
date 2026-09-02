@@ -146,5 +146,5 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o runtime
-    exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
+    taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
   "

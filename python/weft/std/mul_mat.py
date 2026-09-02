@@ -99,13 +99,17 @@ def _iq2_xxs_group_products(
     codebook_lane,
     group,
 ):
-    word0 = widen(w.q[:, group * 4], u32) | (
-        widen(w.q[:, group * 4 + 1], u32) << u32(16)
+    group_byte = group * 8
+    grid_index = widen(w.q[:, group_byte + entry_lane], u32)
+    word1 = widen(w.q[:, group_byte + 4], u32) | (
+        widen(w.q[:, group_byte + 5], u32) << u32(8)
     )
-    word1 = widen(w.q[:, group * 4 + 2], u32) | (
-        widen(w.q[:, group * 4 + 3], u32) << u32(16)
+    word1 = word1 | (
+        widen(w.q[:, group_byte + 6], u32) << u32(16)
     )
-    grid_index = (word0 >> u32(entry_lane * 8)) & u32(255)
+    word1 = word1 | (
+        widen(w.q[:, group_byte + 7], u32) << u32(24)
+    )
     sign_index = (word1 >> u32(entry_lane * 7)) & u32(127)
     weight = lookup(
         grid, grid_index * u32(8) + codebook_lane, bounds="in_bounds"

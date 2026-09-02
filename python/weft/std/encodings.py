@@ -188,7 +188,7 @@ class IQ2_XXS:
     alignment = 2
     elements = 256
     d: f16
-    q: u16[32]
+    q: u8[64]
 
 
 @weft.encoding

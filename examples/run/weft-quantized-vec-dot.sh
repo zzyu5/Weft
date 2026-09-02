@@ -114,7 +114,7 @@ if [[ ${format} == iq2_xxs ]]; then
     physical_auto+=(--auto-lmul-eighths 32)
   if [[ -z ${WEFT_AUTO_UNROLL:-} ]]; then
     if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-unroll 1)
+      physical_auto+=(--auto-unroll 2)
     else
       physical_auto+=(--auto-unroll 4)
     fi
@@ -272,5 +272,5 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
       -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o runtime
-    exec taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
+    taskset -c \"\${cpu}\" ./runtime ${repetitions_argument}
   "

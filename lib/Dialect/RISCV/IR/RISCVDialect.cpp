@@ -3512,20 +3512,32 @@ mlir::LogicalResult LookupOp::verify() {
 }
 
 mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
-  auto entry = getEntryIndices().getType();
+  auto offsets = getEntryOffsets().getType();
   auto result = getResult().getType();
-  auto indexElement = mlir::dyn_cast<mlir::IntegerType>(entry.getElementType());
-  const bool scalarEntries = entry.getLayout().getCarrier() == "scalar";
-  const bool vectorEntries = entry.getLayout().getCarrier() == "rvv";
-  if ((!entry.getElementType().isIndex() &&
+  auto indexElement =
+      mlir::dyn_cast<mlir::IntegerType>(offsets.getElementType());
+  const bool scalarEntries = offsets.getLayout().getCarrier() == "scalar";
+  const bool vectorEntries = offsets.getLayout().getCarrier() == "rvv";
+  if ((!offsets.getElementType().isIndex() &&
        (!indexElement || indexElement.isSigned())) ||
       (!scalarEntries && !vectorEntries) ||
       result.getLayout().getCarrier() != "rvv")
     return emitOpError(
-        "indexed entry load requires unsigned scalar or RVV entry indices and an RVV result");
-  if (getPayloadExtent() <= 0 || getEntryStride() < getPayloadExtent())
+        "indexed entry load requires unsigned scalar or RVV byte offsets and an RVV result");
+  const unsigned payloadBits = elementBitWidth(result.getElementType());
+  const int64_t payloadElementBytes =
+      payloadBits && payloadBits % 8 == 0
+          ? static_cast<int64_t>(payloadBits / 8)
+          : 0;
+  const bool payloadBytesOverflow =
+      getPayloadExtent() <= 0 || payloadElementBytes <= 0 ||
+      getPayloadExtent() >
+          std::numeric_limits<int64_t>::max() / payloadElementBytes;
+  const int64_t payloadBytes =
+      payloadBytesOverflow ? 0 : getPayloadExtent() * payloadElementBytes;
+  if (payloadBytesOverflow || getEntryByteStride() < payloadBytes)
     return emitOpError(
-        "indexed entry load requires one positive contiguous payload within each entry stride");
+        "indexed entry load requires one positive contiguous payload within each byte stride");
 
   llvm::SmallVector<int64_t> sourceAxes;
   llvm::SmallVector<int64_t> sourceShape;
@@ -3563,16 +3575,23 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
       static_cast<size_t>(sourceAxis - sourceAxes.begin());
   if (auto descriptor = mlir::dyn_cast<MemDescType>(getSource().getType());
       descriptor && descriptor.getShape().size() == 2) {
+    const int64_t descriptorEntryBytes =
+        payloadElementBytes > 0 && descriptor.getStrides()[0] > 0 &&
+                descriptor.getStrides()[0] <=
+                    std::numeric_limits<int64_t>::max() /
+                        payloadElementBytes
+            ? descriptor.getStrides()[0] * payloadElementBytes
+            : 0;
     if (sourcePosition != 0 || descriptor.getShape()[1] != getPayloadExtent() ||
-        descriptor.getStrides()[0] != getEntryStride() ||
+        descriptorEntryBytes != getEntryByteStride() ||
         descriptor.getStrides()[1] != 1)
       return emitOpError(
           "indexed entry table must be contiguous entry-major payload storage");
     sourcePayloadPosition = 1;
   }
 
-  auto entryAxes = entry.getAxisIds().asArrayRef();
-  auto entryShape = entry.getShape().asArrayRef();
+  auto entryAxes = offsets.getAxisIds().asArrayRef();
+  auto entryShape = offsets.getShape().asArrayRef();
   auto resultAxes = result.getAxisIds().asArrayRef();
   auto resultShape = result.getShape().asArrayRef();
   llvm::SmallVector<int64_t> expectedAxes;
@@ -3599,15 +3618,14 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
     return emitOpError(
         "indexed entry load result must retain source axes and append entry plus payload axes");
   for (size_t position = 0; position < entryAxes.size(); ++position)
-    if (!sameAxisMapping(entry, position, result,
+    if (!sameAxisMapping(offsets, position, result,
                          retainedSourceAxes + position))
       return emitOpError(
           "indexed entry load must preserve every outer entry-axis representation");
 
   const size_t payloadPosition = resultAxes.size() - 1;
   auto layout = result.getLayout();
-  const unsigned payloadBits = elementBitWidth(result.getElementType());
-  if (!payloadBits || payloadBits % 8)
+  if (!payloadElementBytes)
     return emitOpError(
         "indexed entry load requires a byte-addressable payload element");
   if (layout.getTimeFactors()[payloadPosition] != 1 ||
@@ -3635,15 +3653,15 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
          indexElement.getWidth() != 64) ||
         payloadBits == 0 ||
         (packedBits != 32 && packedBits != 64) ||
-        getEntryStride() != getPayloadExtent() ||
+        getEntryByteStride() != payloadBytes ||
         getAccess().getForm() != "indexed" ||
         !exactLeaf(getLeaf(), "rvv", "indexed-entry-gather",
                    "rvv.indexed-entry-gather", "none", "exact"))
       return emitOpError(
           "RVV indexed entries require one exact contiguous-entry gather leaf")
-             << "; entry_stride=" << getEntryStride()
+             << "; entry_byte_stride=" << getEntryByteStride()
              << ", payload_extent=" << getPayloadExtent()
-             << ", index_type=" << entry << ", result_type=" << result;
+             << ", offset_type=" << offsets << ", result_type=" << result;
   }
   return verifyLeafOperation(*this);
 }
@@ -5418,15 +5436,47 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       const size_t rhsPosition = static_cast<size_t>(
           rhsWindowAxis - rhs.getAxisIds().asArrayRef().begin());
       const size_t resultPosition = *resultWindowPosition;
+      auto closesIssuePartition = [&](ValueType source, ValueType issue,
+                                      size_t position) {
+        const int64_t sourceTime =
+            source.getLayout().getTimeFactors()[position];
+        const int64_t sourceLanes =
+            source.getLayout().getLaneFactors()[position];
+        const int64_t streams = nestedPartialPlan.getIssueStreams();
+        const int64_t window = nestedPartialPlan.getWindowExtent();
+        if (sourceTime <= 0 || sourceLanes <= 0 || streams <= 0 || window <= 0 ||
+            sourceTime > std::numeric_limits<int64_t>::max() / sourceLanes ||
+            streams > std::numeric_limits<int64_t>::max() / window ||
+            sourceTime * sourceLanes != streams * window ||
+            issue.getElementType() != source.getElementType() ||
+            issue.getAxisIds() != source.getAxisIds() ||
+            issue.getShape().size() != source.getShape().size() ||
+            issue.getShape()[position] != window ||
+            issue.getLayout().getTimeFactors()[position] != 1 ||
+            issue.getLayout().getLaneFactors()[position] != window ||
+            issue.getLayout().getReplicaFactors()[position] != 1)
+          return false;
+        for (size_t axis = 0; axis < source.getShape().size(); ++axis) {
+          if (axis == position)
+            continue;
+          if (issue.getShape()[axis] != source.getShape()[axis] ||
+              issue.getLayout().getTimeFactors()[axis] !=
+                  source.getLayout().getTimeFactors()[axis] ||
+              issue.getLayout().getLaneFactors()[axis] !=
+                  source.getLayout().getLaneFactors()[axis] ||
+              issue.getLayout().getReplicaFactors()[axis] !=
+                  source.getLayout().getReplicaFactors()[axis] ||
+              issue.getLayout().getFragmentFactors()[axis] !=
+                  source.getLayout().getFragmentFactors()[axis] ||
+              issue.getLayout().getLocalFactors()[axis] !=
+                  source.getLayout().getLocalFactors()[axis])
+            return false;
+        }
+        return true;
+      };
       layoutPlanClosed &=
-          nestedPartialPlan.getIssueStreams() ==
-              lhs.getLayout().getTimeFactors()[lhsPosition] &&
-          nestedPartialPlan.getIssueStreams() ==
-              rhs.getLayout().getTimeFactors()[rhsPosition] &&
-          nestedPartialPlan.getWindowExtent() ==
-              lhs.getLayout().getLaneFactors()[lhsPosition] &&
-          nestedPartialPlan.getWindowExtent() ==
-              rhs.getLayout().getLaneFactors()[rhsPosition] &&
+          closesIssuePartition(lhs, issueLhs, lhsPosition) &&
+          closesIssuePartition(rhs, issueRhs, rhsPosition) &&
           shapedResult.getShape()[resultPosition] ==
               nestedPartialPlan.getIssueStreams() *
                   nestedPartialPlan.getWindowExtent() &&
@@ -8271,11 +8321,31 @@ mlir::LogicalResult RVVAxisBroadcastOp::verify() {
     preservesSourceDomain &=
         input.getShape()[position] == result.getShape()[resultPosition];
   }
+  bool addsOnlySingletonAxes = true;
+  for (auto [position, axis] :
+       llvm::enumerate(result.getAxisIds().asArrayRef())) {
+    if (llvm::is_contained(input.getAxisIds().asArrayRef(), axis))
+      continue;
+    addsOnlySingletonAxes &=
+        result.getShape()[position] == 1 &&
+        resultLayout.getTimeFactors()[position] == 1 &&
+        resultLayout.getLaneFactors()[position] == 1 &&
+        resultLayout.getReplicaFactors()[position] == 1 &&
+        resultLayout.getFragmentFactors()[position] == 1 &&
+        resultLayout.getLocalFactors()[position] == 1;
+  }
+  const bool properLaneExpansion =
+      inputLanes && resultLanes && *resultLanes > *inputLanes;
+  const bool singletonAxisExpansion =
+      inputLanes && resultLanes && *resultLanes == *inputLanes &&
+      addsOnlySingletonAxes &&
+      inputLayout.getLmulEighths() == resultLayout.getLmulEighths();
   if (!preservesSourceDomain || input.getAxisIds().size() >=
                                     result.getAxisIds().size() ||
       inputLayout.getCarrier() != "rvv" ||
       resultLayout.getCarrier() != "rvv" || !inputLanes || !resultLanes ||
-      *inputLanes <= 0 || *resultLanes <= *inputLanes ||
+      *inputLanes <= 0 ||
+      (!properLaneExpansion && !singletonAxisExpansion) ||
       inputLayout.getSew() != resultLayout.getSew() ||
       inputLayout.getLmulEighths() > resultLayout.getLmulEighths() ||
       !exactLeaf(getLeaf(), "rvv", "axis-broadcast",
@@ -8283,7 +8353,7 @@ mlir::LogicalResult RVVAxisBroadcastOp::verify() {
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>({*inputLanes, *resultLanes}))
     return emitOpError(
-        "RVV axis broadcast must embed one proper logical sub-domain in a wider typed lane layout");
+        "RVV axis broadcast must embed one proper logical sub-domain in a wider lane layout or add only singleton physical axes");
   return mlir::success();
 }
 

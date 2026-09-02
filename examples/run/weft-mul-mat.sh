@@ -92,6 +92,16 @@ trap cleanup_local EXIT
 
 meta=()
 physical=()
+set_physical_option() {
+  local name=$1
+  local value=$2
+  local retained=()
+  local option
+  for option in "${physical[@]}"; do
+    [[ ${option} == "--${name}="* ]] || retained+=("${option}")
+  done
+  physical=("${retained[@]}" "--${name}=${value}")
+}
 runtime_kernel_define=
 if [[ ${format} == f32 ]]; then
   dsl=examples/kernels/dense/gemm.py
@@ -337,7 +347,7 @@ else
     fi
   elif [[ ${format} == iq2_xxs ]]; then
     if [[ ${target} == sg2044 ]]; then
-      physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+      physical=(--auto-lmul-eighths=32 --auto-unroll=2 --auto-pipeline-depth=1)
     else
       physical=(--auto-lmul-eighths=32 --auto-unroll=4 --auto-pipeline-depth=1)
     fi
@@ -412,16 +422,12 @@ if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
     [[ -n ${binding} ]] && meta+=(--meta "${binding}")
   done
 fi
-if [[ -n ${WEFT_AUTO_UNROLL:-} || -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
-  physical=()
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] &&
-    physical+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] &&
-    physical+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
-fi
-if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  physical+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
-fi
+[[ -n ${WEFT_AUTO_UNROLL:-} ]] &&
+  set_physical_option auto-unroll "${WEFT_AUTO_UNROLL}"
+[[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] &&
+  set_physical_option auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}"
+[[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] &&
+  set_physical_option auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}"
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \

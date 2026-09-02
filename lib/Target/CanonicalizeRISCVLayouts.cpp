@@ -126,6 +126,17 @@ public:
           continue;
         auto targetType = conversion.getResult().getType();
         auto targetValue = mlir::cast<riscv::ValueType>(targetType);
+        if (auto cast = mlir::dyn_cast<riscv::CastOp>(producer)) {
+          auto inputType =
+              mlir::dyn_cast<riscv::ValueType>(cast.getInput().getType());
+          auto castType =
+              mlir::dyn_cast<riscv::ValueType>(cast.getResult().getType());
+          if (inputType && castType &&
+              riscv_internal::logicalBitWidth(inputType.getElementType()) ==
+                  riscv_internal::logicalBitWidth(castType.getElementType()) &&
+              castType.getLayout() != targetValue.getLayout())
+            continue;
+        }
         rewriter.setInsertionPoint(conversion);
         llvm::SmallVector<mlir::Value> operands;
         for (mlir::Value operand : producer->getOperands()) {
