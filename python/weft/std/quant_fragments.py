@@ -24,8 +24,14 @@ def grid_sign(grid, signs, grid_index, sign_index, lane, lanes: int = 8):
 
 def grid_delta(grid, grid_index, lane, delta):
     return (
-        lookup(
-            grid, u32(grid_index) * u32(8) + u32(lane), bounds="in_bounds"
+        f32(
+            i32(
+                lookup(
+                    grid,
+                    u32(grid_index) * u32(8) + u32(lane),
+                    bounds="in_bounds",
+                )
+            )
         )
         + f32(delta)
     )

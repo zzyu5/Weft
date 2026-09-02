@@ -209,30 +209,43 @@ def dequantize_iq1_m(
         scale_bits = scale_bits | ((sc2 >> u32(4)) & u32(0x0F00))
         scale_bits = scale_bits | (sc3 & u32(0xF000))
         d = nonlinear_lookup(f16_bits, scale_bits)
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            qh = w.qh[group * 2 + entry // 2]
-            high_shift = i32(0)
-            delta_shift = i32(3)
-            if entry % 2 == 1:
-                high_shift = i32(4)
-                delta_shift = i32(7)
-            grid_index = u32(w.q[group * 4 + entry]) | (
-                extract_bits(qh, high_shift, 3) << u32(8)
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
+            scale_word = u32(w.scales[index(2) * (group // index(2))]) | (
+                u32(w.scales[index(2) * (group // index(2)) + index(1)])
+                << u32(8)
             )
-            delta = f32(0.125)
-            if extract_bits(qh, delta_shift) != u32(0):
-                delta = f32(-0.125)
-            word = u32(w.scales[2 * (group // 2)]) | (
-                u32(w.scales[2 * (group // 2) + 1]) << u32(8)
-            )
-            subscale_shift = (group % 2) * 6
-            if entry >= 2:
-                subscale_shift = subscale_shift + 3
-            subscale = i32(extract_bits(word, subscale_shift, 3)) * i32(2) + i32(1)
-            commit(iq_codebook(grid_delta(grid, grid_index, lane, delta), d * f32(subscale)), Y[kb][j])
+            entry = index(0)
+            with L.subs(group_point, extent=8) as entry_point:
+                lane = iota(8, dtype=u32, axis="k")
+                qh = w.qh[group * index(2) + entry // index(2)]
+                half = u32(entry % index(2))
+                high_shift = half * u32(4)
+                delta_shift = u32(3) + high_shift
+                grid_index = u32(w.q[group * index(4) + entry]) | (
+                    extract_bits(qh, high_shift, 3) << u32(8)
+                )
+                delta = f32(0.125)
+                if extract_bits(qh, delta_shift) != u32(0):
+                    delta = f32(-0.125)
+                subscale_shift = (
+                    u32(group % index(2)) * u32(6)
+                    + u32(entry // index(2)) * u32(3)
+                )
+                subscale = (
+                    i32(extract_bits(scale_word, subscale_shift, 3))
+                    * i32(2)
+                    + i32(1)
+                )
+                commit(
+                    iq_codebook(
+                        grid_delta(grid, grid_index, lane, delta),
+                        d * f32(subscale),
+                    ),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += index(1)
+            group += index(1)
 
 
 def dequantize_iq2_xxs(
@@ -342,19 +355,32 @@ def dequantize_iq2_s(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            grid_index = u32(w.q[group * 4 + entry]) | (
-                extract_bits(w.qh[group], entry * 2, 2) << u32(8)
-            )
-            value = nonlinear_lookup(grid, grid_index * u32(8) + u32(lane))
-            if u32(w.signs[group * 32 + entry * 8 + lane]) != u32(0):
-                value = -value
-            subscale = extract_bits(w.scales[group], (entry // 2) * 4, 4)
-            scale = f32(w.d) * (f32(0.5) + f32(subscale)) * f32(0.25)
-            commit(iq_codebook(value, scale), Y[kb][j])
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
+            high = w.qh[group]
+            scale_bits = w.scales[group]
+            entry = index(0)
+            with L.subs(group_point, extent=8) as entry_point:
+                lane = iota(8, dtype=u32, axis="k")
+                grid_index = u32(w.q[group * index(4) + entry]) | (
+                    extract_bits(high, u32(entry) * u32(2), 2) << u32(8)
+                )
+                value = nonlinear_lookup(
+                    grid, grid_index * u32(8) + lane
+                )
+                sign = i32(1) - i32(w.signs[entry_point]) * i32(2)
+                subscale = extract_bits(
+                    scale_bits, u32(entry // index(2)) * u32(4), 4
+                )
+                scale = (
+                    f32(w.d) * (f32(0.5) + f32(subscale)) * f32(0.25)
+                )
+                commit(
+                    iq_codebook(i32(value) * sign, scale),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += index(1)
+            group += index(1)
 
 
 def dequantize_iq3_xxs(
@@ -365,18 +391,37 @@ def dequantize_iq3_xxs(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            grid_base = group * 8
-            grid_index = w.q[grid_base + entry * 2 + lane // 4]
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
             metadata = w.metadata[group]
-            sign_index = extract_bits(metadata, entry * 7, 7)
-            grid_value = nonlinear_lookup(grid, u32(grid_index) * u32(4) + u32(lane % 4))
-            sign = nonlinear_lookup(signs, u32(sign_index) * u32(8) + u32(lane))
-            scale = f32(w.d) * (f32(0.5) + f32(extract_bits(metadata, 28, 4))) * f32(0.5)
-            commit(iq_codebook(grid_value * sign, scale), Y[kb][j])
+            subscale = f32(0.5) + f32(extract_bits(metadata, 28, 4))
+            scale = f32(w.d) * subscale * f32(0.5)
+            entry = index(0)
+            with L.subs(group_point, extent=8) as entry_point:
+                lane = iota(8, dtype=u32, axis="k")
+                half = lane // u32(4)
+                payload = lane % u32(4)
+                storage_coordinate = group * index(8) + entry * index(2)
+                grid_index0 = u32(w.q[storage_coordinate])
+                grid_index1 = u32(w.q[storage_coordinate + index(1)])
+                grid_index = (
+                    grid_index0 * (u32(1) - half) + grid_index1 * half
+                )
+                sign_index = extract_bits(
+                    metadata, u32(entry) * u32(7), 7
+                )
+                grid_value = nonlinear_lookup(
+                    grid, grid_index * u32(4) + payload
+                )
+                sign = nonlinear_lookup(
+                    signs, sign_index * u32(8) + lane
+                )
+                commit(
+                    iq_codebook(i32(grid_value) * i32(sign), scale),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += index(1)
+            group += index(1)
 
 
 def dequantize_iq3_s(
