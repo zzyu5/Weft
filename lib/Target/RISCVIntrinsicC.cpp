@@ -5552,7 +5552,11 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       if (!entryPart || *entryPart >= entries.parts.size())
         return fail(operation,
                     "indexed entry gather free axes have no typed entry projection");
-      auto entryType = operation.getEntryOffsets().getType();
+      auto entryType = mlir::dyn_cast<riscv::ValueType>(
+          operation.getEntryOffsets().getType());
+      if (!entryType || entryType.getLayout().getCarrier() != "rvv")
+        return fail(operation,
+                    "indexed entry gather requires typed RVV byte offsets");
       auto entryInteger =
           mlir::dyn_cast<mlir::IntegerType>(entryType.getElementType());
       if (!entryInteger || entryInteger.isSigned() ||
@@ -6873,13 +6877,18 @@ mlir::LogicalResult Emitter::compileRegisterMaterialize(
       return mlir::failure();
     input = std::move(*value);
   }
-  if (materialize.getRealization() == "physical-share") {
+  const bool scalarShare =
+      materialize.getRealization() == "physical-share" ||
+      (materialize.getRealization() == "share" &&
+       (input.kind == Binding::Kind::Scalar ||
+        input.kind == Binding::Kind::ScalarTuple));
+  if (scalarShare) {
     auto type = scalarCType(
         riscv_internal::logicalElement(materialize.getResult().getType()));
     if (!type || (input.kind != Binding::Kind::Scalar &&
                   input.kind != Binding::Kind::ScalarTuple))
       return fail(materialize,
-                  "physical scalar share has no closed intrinsic-C value");
+                  "physical scalar materialization has no closed intrinsic-C value");
     if (input.kind == Binding::Kind::Scalar) {
       std::string name = fresh("physical_share");
       line(*type + " " + name + " = " + input.scalar + ";");

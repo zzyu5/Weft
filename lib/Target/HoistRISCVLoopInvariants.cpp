@@ -1,15 +1,35 @@
 #include "Weft/Target/RISCVPasses.h"
 
+#include "RISCVPhysicalSupport.h"
+
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+
 #include <memory>
 
 namespace {
+
+bool dependsOnDeferredField(mlir::Value value,
+                            llvm::SmallPtrSetImpl<mlir::Operation *> &visited) {
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition ||
+      mlir::isa<weft::riscv::RegisterMaterializeOp>(definition))
+    return false;
+  if (mlir::isa<weft::riscv::FieldOp>(definition))
+    return true;
+  if (!mlir::isMemoryEffectFree(definition) || !visited.insert(definition).second)
+    return false;
+  return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
+    return dependsOnDeferredField(operand, visited);
+  });
+}
 
 class HoistRISCVLoopInvariantsPass
     : public mlir::PassWrapper<HoistRISCVLoopInvariantsPass,
@@ -66,13 +86,46 @@ public:
                              weft::riscv::UnaryOp, weft::riscv::BinaryOp,
                              weft::riscv::CompareOp, weft::riscv::CastOp,
                              weft::riscv::NarrowOp, weft::riscv::WidenOp,
-                             weft::riscv::LookupOp, weft::riscv::ExtractOp>(
-                       operation) &&
+                             weft::riscv::LookupOp, weft::riscv::FieldOp,
+                             weft::riscv::ExtractOp>(operation) &&
                    mlir::isMemoryEffectFree(operation);
           },
           [&](mlir::Operation *operation, mlir::Region *) {
             loop.moveOutOfLoop(operation);
           });
+    }
+    llvm::SmallVector<mlir::Operation *> operations;
+    getOperation().walk(
+        [&](mlir::Operation *operation) { operations.push_back(operation); });
+    for (mlir::Operation *operation : operations) {
+      for (mlir::Value result : operation->getResults()) {
+        mlir::Type type = result.getType();
+        if (!type.isIndex() &&
+            !mlir::isa<mlir::IntegerType, mlir::FloatType>(type))
+          continue;
+        llvm::SmallPtrSet<mlir::Operation *, 8> visited;
+        if (!dependsOnDeferredField(result, visited))
+          continue;
+        llvm::SmallVector<mlir::OpOperand *> nestedUses;
+        for (mlir::OpOperand &use : result.getUses()) {
+          mlir::Operation *ancestor = use.getOwner();
+          while (ancestor && ancestor->getBlock() != operation->getBlock())
+            ancestor = ancestor->getParentOp();
+          if (ancestor && ancestor != use.getOwner())
+            nestedUses.push_back(&use);
+        }
+        if (nestedUses.empty())
+          continue;
+        mlir::OpBuilder builder(operation);
+        builder.setInsertionPointAfter(operation);
+        auto materialized = builder.create<weft::riscv::RegisterMaterializeOp>(
+            operation->getLoc(), type, result, -1, -1, -1,
+            "physical-share");
+        weft::riscv_internal::copyOrigin(operation,
+                                         materialized.getOperation());
+        for (mlir::OpOperand *use : nestedUses)
+          use->set(materialized.getResult());
+      }
     }
   }
 };

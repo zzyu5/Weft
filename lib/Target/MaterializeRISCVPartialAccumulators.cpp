@@ -33,6 +33,34 @@ int64_t product(llvm::ArrayRef<int64_t> values) {
   return result;
 }
 
+std::optional<int64_t> checkedProduct(llvm::ArrayRef<int64_t> values) {
+  int64_t result = 1;
+  for (int64_t value : values) {
+    if (value <= 0 || result > std::numeric_limits<int64_t>::max() / value)
+      return std::nullopt;
+    result *= value;
+  }
+  return result;
+}
+
+bool checkedSubtract(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() + rhs) ||
+      (rhs < 0 && lhs > std::numeric_limits<int64_t>::max() + rhs))
+    return false;
+  result = lhs - rhs;
+  return true;
+}
+
+bool checkedScale(int64_t value, int64_t factor, int64_t &result) {
+  if (factor < 0 ||
+      (factor > 0 &&
+       (value > std::numeric_limits<int64_t>::max() / factor ||
+        value < std::numeric_limits<int64_t>::min() / factor)))
+    return false;
+  result = value * factor;
+  return true;
+}
+
 bool hasAxis(riscv::ValueType value, int64_t axis) {
   return llvm::is_contained(value.getAxisIds().asArrayRef(), axis);
 }
@@ -765,12 +793,206 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
           mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(definition)) {
     auto field = load.getField().getDefiningOp<riscv::FieldOp>();
     auto sourcePlan = load.getPlan();
-    const int64_t issueParts =
-        product(resultType.getLayout().getTimeFactors()) *
-        product(resultType.getLayout().getReplicaFactors());
-    if (!field || !sourcePlan || sourcePlan.getKind() != "unit" ||
-        sourcePlan.getReductionAxis() != axis ||
-        load.getRecordRank() != 0 || issueParts != 1)
+    auto issueTimes =
+        checkedProduct(resultType.getLayout().getTimeFactors().asArrayRef());
+    auto issueReplicas =
+        checkedProduct(resultType.getLayout().getReplicaFactors().asArrayRef());
+    int64_t issueParts = 0;
+    if (!issueTimes || !issueReplicas ||
+        !checkedScale(*issueTimes, *issueReplicas, issueParts))
+      return mlir::failure();
+    if (!field || !sourcePlan || sourcePlan.getKind() != "unit")
+      return mlir::failure();
+
+    // A preplanned storage value may be split in issue time along an axis
+    // orthogonal to its load-lane axis.  When that split is a translation of
+    // one otherwise identical physical window, project it by advancing the
+    // scalar base and retaining the selected one-part load.  The storage form
+    // and all decode facts remain owned by the original plan.
+    if (sourcePlan.getReductionAxis() != axis) {
+      auto issuePosition = axisPosition(sourceType, axis);
+      auto sourceTimes =
+          checkedProduct(sourceType.getLayout().getTimeFactors().asArrayRef());
+      auto sourceReplicas = checkedProduct(
+          sourceType.getLayout().getReplicaFactors().asArrayRef());
+      int64_t sourceParts = 0;
+      int64_t representedIssueExtent = 0;
+      const int64_t issueCount =
+          issuePosition
+              ? sourceType.getLayout().getTimeFactors()[*issuePosition]
+              : 0;
+      const bool oneTimeAxis =
+          issuePosition && sourceTimes && sourceReplicas &&
+          checkedScale(*sourceTimes, *sourceReplicas, sourceParts) &&
+          checkedScale(issueCount, windowExtent, representedIssueExtent) &&
+          issueCount > 1 && issueParts == 1 &&
+          sourceParts == issueCount &&
+          sourceType.getLayout().getLaneFactors()[*issuePosition] ==
+              windowExtent &&
+          sourceType.getShape()[*issuePosition] == representedIssueExtent &&
+          llvm::all_of(sourceType.getLayout().getReplicaFactors().asArrayRef(),
+                       [](int64_t factor) { return factor == 1; });
+      if (!oneTimeAxis ||
+          load.getWindowForPart().size() != static_cast<size_t>(issueCount) ||
+          load.getLayerForPart().size() != static_cast<size_t>(issueCount) ||
+          load.getPhysicalLayerForPart().size() !=
+              static_cast<size_t>(issueCount) ||
+          load.getShiftOffsetForPart().size() !=
+              static_cast<size_t>(issueCount) ||
+          load.getShiftBaseFactorForPart().size() !=
+              static_cast<size_t>(issueCount) ||
+          load.getMaskValueForPart().size() !=
+              static_cast<size_t>(issueCount))
+        return mlir::failure();
+
+      const int64_t firstWindow = load.getWindowForPart()[0];
+      if (firstWindow < 0 ||
+          firstWindow >= static_cast<int64_t>(load.getWindowOffsets().size()))
+        return mlir::failure();
+      const int64_t firstOffset = load.getWindowOffsets()[firstWindow];
+      int64_t issueStride = 0;
+      if (issueCount > 1) {
+        const int64_t secondWindow = load.getWindowForPart()[1];
+        if (secondWindow < 0 ||
+            secondWindow >= static_cast<int64_t>(load.getWindowOffsets().size()) ||
+            !checkedSubtract(load.getWindowOffsets()[secondWindow], firstOffset,
+                             issueStride) ||
+            issueStride <= 0)
+          return mlir::failure();
+      }
+      const int64_t recordRank = load.getRecordRank();
+      for (int64_t issue = 0; issue < issueCount; ++issue) {
+        const int64_t window = load.getWindowForPart()[issue];
+        int64_t expectedDelta = 0;
+        int64_t actualDelta = 0;
+        if (window < 0 ||
+            window >= static_cast<int64_t>(load.getWindowOffsets().size()) ||
+            !checkedScale(issue, issueStride, expectedDelta) ||
+            !checkedSubtract(load.getWindowOffsets()[window], firstOffset,
+                             actualDelta) ||
+            actualDelta != expectedDelta ||
+            load.getLayerForPart()[issue] != load.getLayerForPart()[0] ||
+            load.getPhysicalLayerForPart()[issue] !=
+                load.getPhysicalLayerForPart()[0] ||
+            load.getShiftOffsetForPart()[issue] !=
+                load.getShiftOffsetForPart()[0] ||
+            load.getShiftBaseFactorForPart()[issue] !=
+                load.getShiftBaseFactorForPart()[0] ||
+            load.getMaskValueForPart()[issue] !=
+                load.getMaskValueForPart()[0])
+          return mlir::failure();
+        for (int64_t coordinate = 0; coordinate < recordRank; ++coordinate)
+          if (load.getRecordCoordinatesForWindow()[static_cast<size_t>(window) *
+                                                       recordRank +
+                                                   coordinate] !=
+              load.getRecordCoordinatesForWindow()[
+                  static_cast<size_t>(firstWindow) * recordRank + coordinate])
+            return mlir::failure();
+      }
+
+      mlir::Value issueBase = load.getLogicalBase();
+      const int64_t constantOffset = firstOffset;
+      if (auto integer =
+              mlir::dyn_cast<mlir::IntegerType>(issueBase.getType())) {
+        auto typedIndex = rewriter.create<riscv::CastOp>(
+            load.getLoc(), integer, windowIndex,
+            riscv_internal::unselectedLeaf(rewriter));
+        auto stride = rewriter.create<riscv::ConstantOp>(
+            load.getLoc(), integer,
+            rewriter.getIntegerAttr(integer, issueStride));
+        auto dynamicOffset = rewriter.create<riscv::BinaryOp>(
+            load.getLoc(), integer, typedIndex.getResult(), stride.getResult(),
+            "mul", riscv_internal::unselectedLeaf(rewriter));
+        mlir::Value totalOffset = dynamicOffset.getResult();
+        if (constantOffset) {
+          auto constant = rewriter.create<riscv::ConstantOp>(
+              load.getLoc(), integer,
+              rewriter.getIntegerAttr(integer, constantOffset));
+          totalOffset = rewriter
+                            .create<riscv::BinaryOp>(
+                                load.getLoc(), integer, totalOffset,
+                                constant.getResult(), "add",
+                                riscv_internal::unselectedLeaf(rewriter))
+                            .getResult();
+        }
+        issueBase = rewriter
+                        .create<riscv::BinaryOp>(
+                            load.getLoc(), integer, issueBase, totalOffset,
+                            "add", riscv_internal::unselectedLeaf(rewriter))
+                        .getResult();
+      } else if (issueBase.getType().isIndex()) {
+        auto stride = rewriter.create<mlir::arith::ConstantIndexOp>(
+            load.getLoc(), issueStride);
+        mlir::Value totalOffset =
+            rewriter
+                .create<mlir::arith::MulIOp>(load.getLoc(), windowIndex,
+                                             stride.getResult())
+                .getResult();
+        if (constantOffset) {
+          auto constant = rewriter.create<mlir::arith::ConstantIndexOp>(
+              load.getLoc(), constantOffset);
+          totalOffset =
+              rewriter
+                  .create<mlir::arith::AddIOp>(load.getLoc(), totalOffset,
+                                              constant.getResult())
+                  .getResult();
+        }
+        issueBase =
+            rewriter
+                .create<mlir::arith::AddIOp>(load.getLoc(), issueBase,
+                                            totalOffset)
+                .getResult();
+      } else {
+        return mlir::failure();
+      }
+
+      int64_t projectedAlignment = sourcePlan.getOffsetAlignment();
+      projectedAlignment = std::gcd(projectedAlignment, issueStride);
+      if (constantOffset)
+        projectedAlignment = std::gcd(projectedAlignment, constantOffset);
+      projectedAlignment = std::max<int64_t>(1, projectedAlignment);
+      auto projectedPlan = riscv::StorageWindowPlanAttr::get(
+          rewriter.getContext(), sourcePlan.getKind(),
+          sourcePlan.getReductionAxis(), sourcePlan.getProjectionBase(),
+          sourcePlan.getProjectionStride(), sourcePlan.getProjectionRepeat(),
+          sourcePlan.getProjectionExtent(), projectedAlignment,
+          sourcePlan.getRecordElements(), sourcePlan.getByteOffset(),
+          sourcePlan.getElementBits(), sourcePlan.getGroupSize(),
+          sourcePlan.getLayerSize(), sourcePlan.getPhysicalLayerBase(),
+          sourcePlan.getPhysicalLayerStep(), sourcePlan.getShiftBase(),
+          sourcePlan.getShiftStep(), sourcePlan.getMaskValue());
+      llvm::SmallVector<int64_t> recordCoordinates;
+      for (int64_t coordinate = 0; coordinate < recordRank; ++coordinate)
+        recordCoordinates.push_back(load.getRecordCoordinatesForWindow()[
+            static_cast<size_t>(firstWindow) * recordRank + coordinate]);
+      auto singleton = [&](int64_t value) {
+        return rewriter.getDenseI64ArrayAttr({value});
+      };
+      auto selected = load.getLeaf();
+      const int64_t temporaryGroups = std::max<int64_t>(
+          1, (resultType.getLayout().getLmulEighths() + 7) / 8);
+      auto cloned = rewriter.create<riscv::RVVReplicaStorageLoadOp>(
+          load.getLoc(), resultType, load.getField(), issueBase, projectedPlan,
+          recordRank, singleton(0),
+          rewriter.getDenseI64ArrayAttr(recordCoordinates), singleton(0),
+          singleton(load.getLayerForPart()[0]),
+          singleton(load.getPhysicalLayerForPart()[0]),
+          singleton(load.getShiftOffsetForPart()[0]),
+          singleton(load.getShiftBaseFactorForPart()[0]),
+          singleton(load.getMaskValueForPart()[0]), load.getAccess(),
+          riscv_internal::leaf(
+              rewriter, selected.getEngine(), selected.getFamily(),
+              selected.getInstruction(), selected.getSpelling(),
+              selected.getOperandGroups(),
+              resultType.getLayout().getRegisterGroups(), temporaryGroups,
+              selected.getFragmentGroups(), selected.getMask(),
+              resultType.getLayout().getValidity() == "tail" ? "agnostic"
+                                                              : "exact",
+              selected.getParameters(), selected.getLocalBytes()));
+      return remember(cloned.getResult());
+    }
+
+    if (load.getRecordRank() != 0 || issueParts != 1)
       return mlir::failure();
 
     mlir::Value base = load.getLogicalBase();
@@ -842,13 +1064,20 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
     auto offsets = cloneOperand(load.getEntryOffsets());
     if (mlir::failed(offsets)) {
       load.emitError(
-          "issue-window projection could not project indexed-entry byte offsets");
+          "issue-window projection could not project indexed-entry byte offsets; offset_type=")
+          << load.getEntryOffsets().getType() << ", offset_def="
+          << (load.getEntryOffsets().getDefiningOp()
+                  ? load.getEntryOffsets()
+                        .getDefiningOp()
+                        ->getName()
+                        .getStringRef()
+                  : llvm::StringRef("<block-argument>"));
       return mlir::failure();
     }
-    auto offsetType = mlir::cast<riscv::ValueType>((*offsets).getType());
+    auto offsetType = mlir::dyn_cast<riscv::ValueType>((*offsets).getType());
     auto selected = load.getLeaf();
     const int64_t operandGroups =
-        offsetType.getLayout().getCarrier() == "rvv"
+        offsetType && offsetType.getLayout().getCarrier() == "rvv"
             ? offsetType.getLayout().getRegisterGroups()
             : 0;
     auto cloned = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
@@ -4454,7 +4683,6 @@ public:
               builder.getDenseI64ArrayAttr(splits), mergedType,
               *finalizeInstruction, totalSlots, totalTerms, totalResources));
     }
-
   }
 };
 

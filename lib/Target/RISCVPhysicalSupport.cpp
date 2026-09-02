@@ -1286,16 +1286,23 @@ riscv_internal::analyzeIndexedEntryRelation(
     }
     entryIndices = stripRepresentationConversions(entryIndices);
     auto entryType = mlir::dyn_cast<riscv::ValueType>(entryIndices.getType());
-    if (!entryType ||
-        (entryType.getLayout().getCarrier() != "unassigned" &&
-         entryType.getLayout().getCarrier() != "scalar" &&
-         entryType.getLayout().getCarrier() != "rvv") ||
-        indices.getAxisIds().size() != entryType.getAxisIds().size() + 1 ||
-        !llvm::equal(entryType.getAxisIds().asArrayRef(),
-                     indices.getAxisIds().asArrayRef().drop_back()) ||
-        !llvm::equal(entryType.getShape().asArrayRef(),
-                     indices.getShape().asArrayRef().drop_back()))
-      return std::nullopt;
+    if (entryType) {
+      if ((entryType.getLayout().getCarrier() != "unassigned" &&
+           entryType.getLayout().getCarrier() != "scalar" &&
+           entryType.getLayout().getCarrier() != "rvv") ||
+          indices.getAxisIds().size() != entryType.getAxisIds().size() + 1 ||
+          !llvm::equal(entryType.getAxisIds().asArrayRef(),
+                       indices.getAxisIds().asArrayRef().drop_back()) ||
+          !llvm::equal(entryType.getShape().asArrayRef(),
+                       indices.getShape().asArrayRef().drop_back()))
+        return std::nullopt;
+    } else {
+      auto integer = mlir::dyn_cast<mlir::IntegerType>(entryIndices.getType());
+      if ((!entryIndices.getType().isIndex() &&
+           (!integer || integer.isSigned())) ||
+          indices.getAxisIds().size() != 1 || indices.getShape().size() != 1)
+        return std::nullopt;
+    }
     return IndexedEntryRelation{entryIndices, payloadAxis, payloadExtent,
                                 *stride, indexDivisor};
   };

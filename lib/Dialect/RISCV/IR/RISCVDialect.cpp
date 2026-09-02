@@ -3512,13 +3512,17 @@ mlir::LogicalResult LookupOp::verify() {
 }
 
 mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
-  auto offsets = getEntryOffsets().getType();
+  mlir::Type offsetType = getEntryOffsets().getType();
+  auto offsets = mlir::dyn_cast<ValueType>(offsetType);
   auto result = getResult().getType();
+  mlir::Type offsetElement = offsets ? offsets.getElementType() : offsetType;
   auto indexElement =
-      mlir::dyn_cast<mlir::IntegerType>(offsets.getElementType());
-  const bool scalarEntries = offsets.getLayout().getCarrier() == "scalar";
-  const bool vectorEntries = offsets.getLayout().getCarrier() == "rvv";
-  if ((!offsets.getElementType().isIndex() &&
+      mlir::dyn_cast<mlir::IntegerType>(offsetElement);
+  const bool scalarEntries =
+      !offsets || offsets.getLayout().getCarrier() == "scalar";
+  const bool vectorEntries =
+      offsets && offsets.getLayout().getCarrier() == "rvv";
+  if ((!offsetElement.isIndex() &&
        (!indexElement || indexElement.isSigned())) ||
       (!scalarEntries && !vectorEntries) ||
       result.getLayout().getCarrier() != "rvv")
@@ -3590,8 +3594,14 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
     sourcePayloadPosition = 1;
   }
 
-  auto entryAxes = offsets.getAxisIds().asArrayRef();
-  auto entryShape = offsets.getShape().asArrayRef();
+  llvm::SmallVector<int64_t> entryAxes;
+  llvm::SmallVector<int64_t> entryShape;
+  if (offsets) {
+    entryAxes.append(offsets.getAxisIds().asArrayRef().begin(),
+                     offsets.getAxisIds().asArrayRef().end());
+    entryShape.append(offsets.getShape().asArrayRef().begin(),
+                      offsets.getShape().asArrayRef().end());
+  }
   auto resultAxes = result.getAxisIds().asArrayRef();
   auto resultShape = result.getShape().asArrayRef();
   llvm::SmallVector<int64_t> expectedAxes;
@@ -4834,9 +4844,11 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
       !exactLeaf(getLeaf(), "rvv", "bitmask-decode", "rvv.bitmask-decode",
                  "none", tail))
     return emitOpError(
-        "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
-        "a record owner covering the sub-Level origin, an explicitly anchored "
-        "sub-Level point, and a complete time/lane result");
+               "RVV bitmask decode requires a byte-aligned contiguous logical-u1 field, "
+               "a record owner covering the sub-Level origin, an explicitly anchored "
+               "sub-Level point, and a complete time/lane result; field=")
+           << field << ", result=" << result << ", origin=" << getOrigin().getType()
+           << ", point=" << getPoint().getType() << ", access=" << getAccess();
   return mlir::success();
 }
 
@@ -5014,8 +5026,15 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
       llvm::any_of(*expectedPartOffsets, [&](int64_t offset) {
         return offset < 0 || offset >= *windowElements || offset % 8;
       }))
-    return emitOpError(
-        "RVV bitmask window part offsets disagree with its typed time/lane/replica mapping");
+    return emitOpError()
+           << "RVV bitmask window part offsets disagree with its typed "
+              "time/lane/replica mapping; actual="
+           << getPartBitOffsets() << ", expected="
+           << (expectedPartOffsets
+                   ? llvm::ArrayRef<int64_t>(*expectedPartOffsets)
+                   : llvm::ArrayRef<int64_t>())
+           << ", result=" << result << ", window_axes=" << getWindowAxes()
+           << ", window_extents=" << getWindowExtents();
 
   auto fieldAxes = field.getAxisIds().asArrayRef();
   auto fieldShape = field.getShape().asArrayRef();

@@ -1073,7 +1073,7 @@ def WeftRISCV_RVVIndexedEntryLoadOp
     : WeftRISCV_Op<"rvv_indexed_entry_load",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$source,
-                       WeftRISCV_ValueType:$entry_offsets,
+                       AnyType:$entry_offsets,
                        I64Attr:$source_axis,
                        I64Attr:$payload_axis,
                        I64Attr:$payload_extent,

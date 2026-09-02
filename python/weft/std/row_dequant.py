@@ -10,8 +10,11 @@ from weft.language import (
     i32,
     iota,
     index,
+    lookup,
     materialize,
+    narrow,
     u8,
+    u16,
     u32,
 )
 
@@ -162,19 +165,32 @@ def dequantize_iq1_s(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
             metadata = w.qh[group]
-            grid_index = u32(w.q[group * 4 + entry]) | (
-                extract_bits(metadata, entry * 3, 3) << u32(8)
-            )
             delta = f32(0.125)
             if extract_bits(metadata, 15) != u32(0):
                 delta = f32(-0.125)
-            scale = f32(w.d) * f32(i32(extract_bits(metadata, 12, 3)) * i32(2) + i32(1))
-            commit(iq_codebook(grid_delta(grid, grid_index, lane, delta), scale), Y[kb][j])
+            scale = f32(w.d) * f32(
+                i32(extract_bits(metadata, 12, 3)) * i32(2) + i32(1)
+            )
+            entry = index(0)
+            with L.subs(group_point, extent=8) as entry_point:
+                lane = iota(8, dtype=u16, axis="k")
+                grid_index = u32(w.q[group * index(4) + entry]) | (
+                    extract_bits(metadata, u32(entry) * u32(3), 3) << u32(8)
+                )
+                grid_value = lookup(
+                    grid,
+                    grid_index * u32(8) + u32(lane),
+                    bounds="in_bounds",
+                )
+                commit(
+                    iq_codebook(f32(i32(grid_value)) + delta, scale),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += index(1)
+            group += index(1)
 
 
 def dequantize_iq1_m(
@@ -227,21 +243,41 @@ def dequantize_iq2_xxs(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            group_byte = group * 8
-            grid_index = u32(w.q[group_byte + entry])
-            metadata = u32(w.q[group_byte + 4]) | (
-                u32(w.q[group_byte + 5]) << u32(8)
+        group = index(0)
+        with L.subs(kb, extent=32) as sub:
+            element = iota(32, dtype=u8, axis="k")
+            entry = element // u8(8)
+            lane = element % u8(8)
+            group_byte = group * index(8)
+            grid_index = u16(w.q[u16(group_byte) + u16(entry)])
+            metadata = u32(w.q[group_byte + index(4)]) | (
+                u32(w.q[group_byte + index(5)]) << u32(8)
             )
-            metadata = metadata | (u32(w.q[group_byte + 6]) << u32(16))
-            metadata = metadata | (u32(w.q[group_byte + 7]) << u32(24))
-            sign_index = extract_bits(metadata, entry * 7, 7)
+            metadata = metadata | (u32(w.q[group_byte + index(6)]) << u32(16))
+            metadata = metadata | (u32(w.q[group_byte + index(7)]) << u32(24))
+            sign_index = narrow(
+                extract_bits(metadata, u32(entry) * u32(7), 7),
+                u16,
+                rounding="rtz",
+                saturation=False,
+            )
             subscale = f32(0.5) + f32(extract_bits(metadata, 28, 4))
             scale = f32(w.d) * subscale * f32(0.25)
-            commit(iq_codebook(grid_sign(grid, signs, grid_index, sign_index, lane), scale), Y[kb][j])
+            grid_value = lookup(
+                grid,
+                grid_index * u16(8) + u16(lane),
+                bounds="in_bounds",
+            )
+            sign_value = lookup(
+                signs,
+                sign_index * u16(8) + u16(lane),
+                bounds="in_bounds",
+            )
+            commit(
+                iq_codebook(i32(grid_value) * i32(sign_value), scale),
+                Y[kb][sub],
+            )
+            group += index(1)
 
 
 def dequantize_iq2_xs(
@@ -251,17 +287,52 @@ def dequantize_iq2_xs(
     Y: View[f32, (K,)],
 ):
     with L.blocks(K, extent=256) as kb:
-        w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            word = w.q[group * 4 + entry]
-            grid_index = extract_bits(word, 0, 9)
-            sign_index = extract_bits(word, 9, 7)
-            subscale = extract_bits(w.scales[group], (entry // 2) * 4, 4)
-            scale = f32(w.d) * (f32(0.5) + f32(subscale)) * f32(0.25)
-            commit(iq_codebook(grid_sign(grid, signs, grid_index, sign_index, lane), scale), Y[kb][j])
+        w = materialize(admit(W[kb]))
+        d = materialize(f32(w.d))
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
+            scale_byte = materialize(w.scales[group_point])
+            scale_low = materialize(
+                d * (f32(0.5) + f32(extract_bits(scale_byte, 0, 4))) * f32(0.25)
+            )
+            scale_high = materialize(
+                d * (f32(0.5) + f32(extract_bits(scale_byte, 4, 4))) * f32(0.25)
+            )
+            entry = index(0)
+            with L.subs(group_point, extent=8) as entry_point:
+                lane = iota(8, dtype=u8, axis="k")
+                word = w.q[group * index(4) + entry]
+                grid_index = narrow(
+                    extract_bits(word, 0, 9),
+                    u16,
+                    rounding="rtz",
+                    saturation=False,
+                )
+                sign_index = narrow(
+                    extract_bits(word, 9, 7),
+                    u16,
+                    rounding="rtz",
+                    saturation=False,
+                )
+                scale = scale_low
+                if entry >= index(2):
+                    scale = scale_high
+                grid_value = lookup(
+                    grid,
+                    grid_index * u16(8) + u16(lane),
+                    bounds="in_bounds",
+                )
+                sign_value = lookup(
+                    signs,
+                    sign_index * u16(8) + u16(lane),
+                    bounds="in_bounds",
+                )
+                commit(
+                    iq_codebook(i32(grid_value) * i32(sign_value), scale),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += index(1)
+            group += index(1)
 
 
 def dequantize_iq2_s(
@@ -315,20 +386,33 @@ def dequantize_iq3_s(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            group = j // 32
-            entry = (j % 32) // 8
-            lane = j % 8
-            storage_coordinate = group * 8 + entry * 2 + lane // 4
-            grid_index = u32(w.q[storage_coordinate]) | (
-                u32(w.qh[storage_coordinate]) << u32(8)
-            )
-            value = nonlinear_lookup(grid, grid_index * u32(4) + u32(lane % 4))
-            if u32(w.signs[j]) != u32(0):
-                value = -value
+        group = index(0)
+        with L.subs(kb, extent=32) as group_point:
             subscale = w.scales[group]
             scale = f32(w.d) * f32(i32(1) + i32(2) * i32(subscale))
-            commit(iq_codebook(value, scale), Y[kb][j])
+            pair = index(0)
+            with L.subs(group_point, extent=8) as pair_point:
+                lane = iota(8, dtype=u16, axis="k")
+                half = u32(lane // u16(4))
+                payload = u32(lane % u16(4))
+                storage_coordinate = group * index(8) + pair * index(2)
+                grid_index0 = u32(w.q[storage_coordinate]) | (
+                    u32(w.qh[storage_coordinate]) << u32(8)
+                )
+                grid_index1 = u32(w.q[storage_coordinate + index(1)]) | (
+                    u32(w.qh[storage_coordinate + index(1)]) << u32(8)
+                )
+                grid_index = grid_index0 * (u32(1) - half) + grid_index1 * half
+                value = nonlinear_lookup(
+                    grid, grid_index * u32(4) + payload
+                )
+                sign = i32(1) - i32(w.signs[pair_point]) * i32(2)
+                commit(
+                    iq_codebook(value * sign, scale),
+                    Y[kb][group_point][pair_point],
+                )
+                pair += index(1)
+            group += index(1)
 
 
 def dequantize_iq4_xs(

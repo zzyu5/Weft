@@ -122,7 +122,8 @@ public:
           continue;
         }
         if (!producer || !rematerializable(producer) ||
-            !conversion.getInput().hasOneUse())
+            (!conversion.getInput().hasOneUse() &&
+             !mlir::isa<riscv::IotaOp>(producer)))
           continue;
         auto targetType = conversion.getResult().getType();
         auto targetValue = mlir::cast<riscv::ValueType>(targetType);
