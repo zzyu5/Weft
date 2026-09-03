@@ -162,8 +162,8 @@ int main(int argc, char **argv) {
   }
   std::vector<float> input(kRows * kColumns);
   for (std::size_t index = 0; index < input.size(); ++index)
-    input[index] = static_cast<float>(static_cast<int>(index % 251U) - 125) /
-                   17.0F;
+    input[index] = static_cast<float>(static_cast<int>(index % 31U) - 15) /
+                   16.0F;
   const std::size_t outputBytes =
       kRows * (kColumns / kBlock) * kRecordBytes;
   std::vector<std::uint8_t> expected(outputBytes, 0);
@@ -193,9 +193,11 @@ int main(int argc, char **argv) {
   const double medianMs = median(samples);
   std::printf("kernel=%s\ntarget=%s\nM=%zu\nK=%zu\n", kKernel,
               WEFT_TARGET_NAME, kRows, kColumns);
+  std::printf("input_policy=fixed-float-mod31\n");
   std::printf("numeric=bit-exact\nrepetitions=%zu\n", repetitions);
   std::printf("cold_median_ms=%.6f\n", medianMs);
   std::printf("melements_s=%.6f\n",
               static_cast<double>(kRows * kColumns) / medianMs / 1.0e3);
+  std::printf("output_sample=%u\n", static_cast<unsigned>(actual[0]));
   return 0;
 }

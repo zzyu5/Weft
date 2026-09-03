@@ -124,6 +124,7 @@ int main(int argc, char **argv) {
   std::printf("M=%zu\nK=%zu\n", kM, kK);
   std::printf("vlen_bits=%d\n", vlen_bytes * 8);
   std::printf("cold_protocol=64MiB-evict-then-full-activation\n");
+  std::printf("input_policy=fixed-float-mod31\n");
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_melements_s=%.6f\n", elements / cold_median_us);
