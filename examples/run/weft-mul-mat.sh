@@ -107,8 +107,16 @@ if [[ ${format} == f32 ]]; then
   dsl=examples/kernels/dense/gemm.py
   kernel=gemm_f32
   runtime=examples/repro/weft/gemm_runtime.cpp
-  meta=(--meta NC=16 --meta MC=64 --meta NR=2 --meta MR=2)
-  physical=(--auto-lmul-eighths=16)
+  if [[ ${phase} == prefill ]]; then
+    meta=(--meta NC=16 --meta MC=64 --meta NR=4 --meta MR=4)
+    physical=(--auto-lmul-eighths=8)
+  elif [[ ${target} == sg2044 ]]; then
+    meta=(--meta NC=16 --meta MC=64 --meta NR=2 --meta MR=2)
+    physical=(--auto-lmul-eighths=16)
+  else
+    meta=(--meta NC=64 --meta MC=64 --meta NR=1 --meta MR=2)
+    physical=(--auto-lmul-eighths=32)
+  fi
 else
   dsl=examples/kernels/quantization/mul_mat.py
   if [[ ${format} == f16 ]]; then

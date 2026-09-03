@@ -137,3 +137,75 @@ typed materialization contract 后的真实动态工作，不是 conversion lega
 当前性能边界没有被隐藏：IQ2_S/XS staged 已经有合法共同 carrier 和正确 memory edge，但仍没有
 形成 IQ2_XXS 那种完整 partial set；继续优化它们属于 partial/materialization 的下一类工作，不能
 归入本次 layout closure 的收益。
+
+## 3. F32 dense contraction carrier
+
+### 3.1 修改前工作账与参照
+
+作者树已经在 `python/weft/std/dense.py:21-26` 表达 NC/MC blocking、MR/NR output cohort 与
+`over="k"` contraction。旧 Physical IR 却把 MR=2 放进 lane、K 放进 issue time；在 decode
+shape 上每个热 K 点动态执行一次 `vlse32`、两次 scalar `flw`、两次 `vfmacc.vf` 和三次数据
+指针递增。K=4096、N=4096 时共执行 8,388,608 次 strided X load、16,777,216 次 scalar W
+load/FMA 和 25,165,824 次热循环数据指针递增。没有 spill，也没有可由 CSE 删除的重复 supply。
+
+GGML 的 `ggml_vec_dot_f32`（`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/vec.cpp:87-102`）
+让 K 骑 contiguous RVV lane，以两次 `vle32`、一次 `vfmacc.vv` 和末端一次 `vfredusum` 完成
+单输出 dot。差异首先是 P1 carrier 与 P3 memory form，不是 pipeline，也不要求改变 canonical
+Value、Level 或作者 blocking。
+
+动手前对照的机制是：
+
+- Triton `LinearLayoutConversions.cpp:877-915` 从 result blocked layout 派生 FMA
+  DotOperand layout，K 在 register basis 中完整保留、lane/warp 在 K 上 broadcast；
+  `FMADotUtility.cpp:88-164` 再消费冻结的 M/N ownership 与 K pairing；
+  `DotOpToLLVM/FMA.cpp:9-45` 只拼写最终 FMA。
+- TileLang `loop_vectorize.cc:895-958,1068-1171` 先证明 lane substitution 后 flat offset 是
+  unit Ramp 且 chunk base 合法，再由 `loop_vectorize.cc:1003-1041` 机械 strip-mine。其 CPU
+  `src/cpu/op/gemm.cc:25-49` 仍固定 `cpu.scalar`，因此不是可直接移植的 F32 GEMM leaf；可借鉴的
+  是先冻结 ownership/access、后展开的责任顺序。
+
+预期可见计数是 strided/scalar operand supply 消失，改为两侧 unit stream load、`vfmacc.vv`
+和末端 reduction；若这些计数不变，这个改动没有实现价值。第二个输入不是另一个格式，而是
+同一 F32 tree 的 decode 与 prefill 两个 shape regime；两者必须同时形成相同 typed stream
+contract，参数绑定可以不同。
+
+### 3.2 Physical IR 改动与静态结果
+
+layout propagation 现在只在已选 operation 为 `rvv.vfmacc`、且两个 operand 各自贡献一个独立
+surviving free axis 时，把它解释为 RVV outer-product physical relation：K 留在完整 lane
+carrier，M/N 留在 register replicas。已有 `RVVStreamContractOp` 随后物化 K loop、两侧 unit
+`rvv_stream_load`、`rvv_stream_contract_step` 和 `rvv_stream_finalize`；没有新增 physical op，也
+没有改 terminal emitter。
+
+默认 MR2×NR2,m2 的生成汇编在两台机器上都变成每个 K chunk 四次 unit `vle32`、四次
+`vfmacc.vv`，tile 末端四次 reduction；SG 的 VL=8，K1 的 VL=16，均无 vector spill。保持旧
+参数时，单独这一项改动已经产生：
+
+| target | phase | 修改前 | carrier 修改后、旧参数 | source |
+|---|---|---:|---:|---:|
+| SG2044 | decode | 1.494676 | 2.523213 | 1.717123 |
+| SG2044 | prefill | 1.528872 | 7.392094 | 7.432725 |
+| K1 | decode | 0.564268 | 1.780391 | 2.011619 |
+| K1 | prefill | 1.108171 | 2.397623 | 2.574251 |
+
+剩余差距是参数性绑定。静态枚举先排除了不合法组合：m8 只有 MR1×NR1 合法；m8 多输出的
+同时 live peak 是 40--64 groups。合法 Pareto 点中，单输出 m8 虽接近 donor，却使 prefill 降到
+SG 4.035 / K1 2.143 GOP/s；它减少 output reuse。MR4×NR4,m1 的 peak 为 24 groups，在两台机器
+都保留 16 个 output accumulators 且不 spill，成为 prefill 实测 winner。这个过程只绑定作者声明的
+auto 参数和 target physical LMUL，没有产生新的程序树或结构候选 pass。
+
+### 3.3 十次真机结果
+
+| target | phase | 最终 binding | Weft | source | Weft/source | numeric |
+|---|---|---|---:|---:|---:|---|
+| SG2044 | decode | NC16/MC64/MR2/NR2, m2 | 2.501721 | 1.717123 | 1.457× | error 0 |
+| SG2044 | prefill | NC16/MC64/MR4/NR4, m1 | 8.888305 | 7.432725 | 1.196× | error 0 |
+| K1 | decode | NC64/MC64/MR2/NR1, m4 | 2.088328 | 2.011619 | 1.038× | error 0 |
+| K1 | prefill | NC16/MC64/MR4/NR4, m1 | 3.723850 | 2.574251 | 1.447× | error 0 |
+
+四项均使用 `dense-fixed-values`，Clang 18、`-O3 -ffp-contract=fast`，10 repetitions。runner
+现在按 target/shape 绑定这些已实测 auto 参数；canonical F32 tree 保持一份。
+
+四个最终 binding 生成的 RISC-V IR 均可由 `weft-opt` 独立 parse/verify，安全运行
+canonicalizer、CSE、layout canonicalization、Share 两次与 final verifier；同一流水第二次文本
+diff 为零。四项的 vector peak 分别为 16、24、20、24 groups，均低于 32-group 合同。

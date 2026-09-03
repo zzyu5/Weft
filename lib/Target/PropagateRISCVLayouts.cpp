@@ -719,7 +719,8 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
       riscv::ImplementationAttr>("implementation");
   if (implementation &&
       (implementation.getFamily() == "widen-float-contract" ||
-       implementation.getFamily() == "widen-dot")) {
+       implementation.getFamily() == "widen-dot" ||
+       implementation.getOperation() == "rvv.vfmacc")) {
     roles.fullLaneExtent = true;
     for (int64_t axis : reduction)
       if (containsAxis(value.getType(), axis)) {
@@ -755,6 +756,20 @@ void constrainOuterContractOperand(Contract operation, mlir::Value value,
 template <typename Contract>
 void constrainReductionContractOperand(Contract operation, mlir::Value value,
                                        Roles &roles) {
+  auto implementation = operation->template getAttrOfType<
+      riscv::ImplementationAttr>("implementation");
+  if (implementation && implementation.getOperation() == "rvv.vfmacc" &&
+      hasOperandLocalFreeAxis(operation.getLhs(), operation.getRhs(),
+                              operation.getOver()) &&
+      hasOperandLocalFreeAxis(operation.getRhs(), operation.getLhs(),
+                              operation.getOver())) {
+    // A contract whose two operands contribute independent output axes is the
+    // same physical outer-product relation regardless of which canonical
+    // spelling produced it.  For an RVV FMA stream, keep K in the lane carrier
+    // and both surviving output axes as register replicas.
+    constrainOuterContractOperand(operation, value, roles);
+    return;
+  }
   roles.anchored = true;
   roles.fullLaneExtent = true;
   auto reduction = operation.getOver();
