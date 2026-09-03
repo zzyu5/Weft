@@ -17,6 +17,7 @@ ConvertWeftToRISCV
 → SelectRISCVOperations
 → LowerRISCVComposites
 → MaterializeRISCVPrograms
+→ VectorizeRISCVRecordLoops
 → CanonicalizeRISCVLayouts
 → FuseRISCVBitplanes
 → HoistRISCVLoopInvariants
@@ -150,6 +151,18 @@ reuse 证明，不由该窄合同猜测。
 local-pack 与 grouped-MAC program 展开成真实 `scf` control、point、load/step 和 SSA
 use-def，然后删除 macro op。该 pass 只展开已冻结的 plan，不重选 layout、memory
 form、tail 或 leaf；final verifier 拒绝任何尚待 terminal emitter 解释的 macro program。
+
+`VectorizeRISCVRecordLoops` 消费 target profile 的 record-axis 固定结构优先级。选择
+`across-records` 时，它只接受 ascending、zero-based、unit-step、无 carry 的 exact Level，且
+source 与 destination 都必须证明为同一一维 unit-stride record axis；point 必须有静态且相等的
+active/partition，store value不能依赖被替换 loop 的 induction variable。loop body只允许一个
+domain-point store、同一 encoded record 的 field load、闭合 pure pointwise use-def，以及不被
+可观察闭包使用的 dead pure op；额外 read/write 或未知 effect 都拒绝。pass 将
+动态 trip count显式拆成整 cohort 的主 `scf.for` 与原语义的 scalar tail，并物化
+`record_cohort`、record-strided storage load/decode/store。cohort width、每条 field 的 storage
+unit、静态 byte stride、logical ownership 与 output offset全部进入 typed op；terminal emitter
+不能重新推导 ramp、stride 或 tail。任何 proof 不闭合时保留原 within-record physical program，
+而不是猜测跨 record 映射。
 
 contraction 的 unroll 只能属于它真实的多 issue reduction loop。单 issue 已经覆盖
 完整 reduction carrier 时，不存在可展开的 local issue loop；该 unroll 不得改挂到

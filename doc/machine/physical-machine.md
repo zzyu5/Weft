@@ -325,7 +325,7 @@ spill/rematerialize legality
 intrinsic / local asm availability
 ```
 
-当前 RISC-V `TargetAttr` 只物化已经有真实 consumer 的子集：ISA/ABI、显式 VLEN、32 个 vector registers、合法 SEW/LMUL、完整 `V` 的 indexed/segment/widening 能力、local-storage 上界、partial-combine 固定结构优先级，以及 typed IME fragment capability。partial-combine policy 只在多个 topology 均合法时规定 `independent-multilevel` 或 `sequential` 的优先关系；它不是 source `auto`、tuner 参数或 target-name 分支。当前 backend 要求完整 `V` 和显式正 VLEN；`Zve`、纯标量 target、未知 VLEN、异步 transfer/wait/barrier、独立 prefetch 域及通用 latency model 均明确不在当前实现范围。它们没有占位字段，也不能通过默认值假装可用。
+当前 RISC-V `TargetAttr` 只物化已经有真实 consumer 的子集：ISA/ABI、显式 VLEN、32 个 vector registers、合法 SEW/LMUL、完整 `V` 的 indexed/segment/widening 能力、local-storage 上界、partial-combine 与 record-axis placement 的固定结构优先级，以及 typed IME fragment capability。partial-combine policy 只在多个 topology 均合法时规定 `independent-multilevel` 或 `sequential` 的优先关系；record-axis policy 则在已经证明合法的 pointwise record loop 上规定优先保留 record 内 lane mapping，还是把多个完整 record instance 放进一个 lane cohort。二者都不是 source `auto`、tuner 参数或 target-name 分支。当前 backend 要求完整 `V` 和显式正 VLEN；`Zve`、纯标量 target、未知 VLEN、异步 transfer/wait/barrier、独立 prefetch 域及通用 latency model 均明确不在当前实现范围。它们没有占位字段，也不能通过默认值假装可用。
 
 换目标时可以改变这些 profile facts、规则、参数域和最终指令；不能改变：
 

@@ -68,6 +68,7 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                                    int64_t vlenBits,
                                    llvm::StringRef matrixExtension,
                                    llvm::StringRef partialCombinePolicy,
+                                   llvm::StringRef recordAxisPolicy,
                                    RISCVTargetProfile &profile,
                                    std::string &error) {
   if (march.empty()) {
@@ -87,6 +88,15 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
     profile.triple = "riscv32-unknown-linux-gnu";
   } else {
     error = "--march must begin with rv32 or rv64";
+    return false;
+  }
+  if (recordAxisPolicy == "within-record") {
+    profile.recordAxisPolicy = RISCVRecordAxisPolicy::WithinRecord;
+  } else if (recordAxisPolicy == "across-records") {
+    profile.recordAxisPolicy = RISCVRecordAxisPolicy::AcrossRecords;
+  } else {
+    error =
+        "--record-axis-policy must be within-record or across-records";
     return false;
   }
   std::optional<RISCVABI> parsedABI =

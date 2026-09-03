@@ -10,6 +10,7 @@ add_library(WeftRISCVTarget STATIC
   FuseRISCVBitplanes.cpp
   LowerRISCVComposites.cpp
   MaterializeRISCVPrograms.cpp
+  VectorizeRISCVRecordLoops.cpp
   HoistRISCVLoopInvariants.cpp
   ScheduleRISCVLevels.cpp
   PipelineRISCVLevels.cpp

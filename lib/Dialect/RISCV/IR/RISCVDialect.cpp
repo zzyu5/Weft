@@ -38,16 +38,33 @@ bool weft::riscv::supportsRVVLayout(TargetAttr target, LayoutAttr layout) {
   int64_t elen = 0;
   for (int64_t supported : target.getSupportedSEW().asArrayRef())
     elen = std::max(elen, supported);
+  const bool positivePhysicalShape =
+      layout && layout.getSew() > 0 && layout.getLmulEighths() > 0 &&
+      layout.getVl() > 0 && layout.getRegisterGroups() > 0;
   const bool legalFractionalLMUL =
-      layout && elen > 0 &&
+      positivePhysicalShape && elen > 0 &&
+      layout.getLmulEighths() <=
+          std::numeric_limits<int64_t>::max() / elen &&
+      layout.getSew() <= std::numeric_limits<int64_t>::max() / 8 &&
       layout.getLmulEighths() * elen >= 8 * layout.getSew();
+  const bool vlFits =
+      positivePhysicalShape && target.getVlenBits() > 0 &&
+      layout.getVl() <=
+          std::numeric_limits<int64_t>::max() / layout.getSew() &&
+      layout.getVl() * layout.getSew() <=
+          std::numeric_limits<int64_t>::max() / 8 &&
+      target.getVlenBits() <=
+          std::numeric_limits<int64_t>::max() / layout.getLmulEighths() &&
+      layout.getVl() * layout.getSew() * 8 <=
+          target.getVlenBits() * layout.getLmulEighths();
   return layout && layout.getCarrier() == "rvv" && target.getHasRVV() &&
          target.getVlenBits() > 0 && target.getVectorRegisters() > 0 &&
          llvm::is_contained(target.getSupportedSEW().asArrayRef(),
                             layout.getSew()) &&
          llvm::is_contained(target.getLegalLMULEighths().asArrayRef(),
                             layout.getLmulEighths()) &&
-         legalFractionalLMUL;
+         legalFractionalLMUL && vlFits &&
+         layout.getRegisterGroups() <= target.getVectorRegisters();
 }
 
 std::optional<llvm::SmallVector<int64_t>>
@@ -805,11 +822,97 @@ FragmentCapabilityAttr fragmentCapability(mlir::Operation *operation,
 }
 
 unsigned elementBitWidth(mlir::Type type) {
+  if (!type)
+    return 0;
   if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
     return integer.getWidth();
   if (auto floating = mlir::dyn_cast<mlir::FloatType>(type))
     return floating.getWidth();
   return 0;
+}
+
+std::optional<int64_t> computeRecordFieldRelativeBit(AccessAttr access,
+                                                     int64_t elementBits,
+                                                     int64_t logicalIndex) {
+  if (!access || elementBits <= 0 || logicalIndex < 0)
+    return std::nullopt;
+  if (access.getMapping() == "natural") {
+    if (logicalIndex > std::numeric_limits<int64_t>::max() / elementBits)
+      return std::nullopt;
+    return logicalIndex * elementBits;
+  }
+  if (access.getMapping() != "grouped_layered" ||
+      access.getGroupSize() <= 0 || access.getLayerSize() <= 0 ||
+      access.getGroupSize() % access.getLayerSize() ||
+      (access.getOrder() != "lo_first" && access.getOrder() != "hi_first"))
+    return std::nullopt;
+  const int64_t group = access.getGroupSize();
+  const int64_t layer = access.getLayerSize();
+  const int64_t layers = group / layer;
+  if (layers <= 0 || group > std::numeric_limits<int64_t>::max() / elementBits)
+    return std::nullopt;
+  const int64_t groupBits = group * elementBits;
+  const int64_t groupIndex = logicalIndex / group;
+  if (groupIndex > std::numeric_limits<int64_t>::max() / groupBits)
+    return std::nullopt;
+  const int64_t within = logicalIndex % group;
+  const int64_t logicalLayer = within / layer;
+  const int64_t physicalLayer =
+      access.getOrder() == "lo_first" ? logicalLayer
+                                      : layers - 1 - logicalLayer;
+  const int64_t withinLayer = within % layer;
+  const int64_t layerStrideBits = layers * elementBits;
+  if (withinLayer > std::numeric_limits<int64_t>::max() / layerStrideBits)
+    return std::nullopt;
+  if (physicalLayer >
+      std::numeric_limits<int64_t>::max() / elementBits)
+    return std::nullopt;
+  const int64_t groupOffset = groupIndex * groupBits;
+  const int64_t layerOffset = withinLayer * layerStrideBits;
+  const int64_t physicalOffset = physicalLayer * elementBits;
+  if (groupOffset > std::numeric_limits<int64_t>::max() - layerOffset)
+    return std::nullopt;
+  const int64_t prefix = groupOffset + layerOffset;
+  if (prefix > std::numeric_limits<int64_t>::max() - physicalOffset)
+    return std::nullopt;
+  return prefix + physicalOffset;
+}
+
+bool isClosedRecordCohortValue(ValueType value, RecordCohortType cohort) {
+  if (!value || !cohort || value.getShape().size() != 1 ||
+      value.getAxisIds().size() != 1 ||
+      value.getShape()[0] != cohort.getWidth() ||
+      value.getAxisIds()[0] != cohort.getDomain().getAxisId())
+    return false;
+  LayoutAttr layout = value.getLayout();
+  return layout.getCarrier() == "rvv" && layout.getTimeFactors().size() == 1 &&
+         layout.getTimeFactors()[0] == 1 &&
+         layout.getLaneFactors().size() == 1 &&
+         layout.getLaneFactors()[0] == cohort.getWidth() &&
+         layout.getReplicaFactors().size() == 1 &&
+         layout.getReplicaFactors()[0] == 1 &&
+         layout.getFragmentFactors().size() == 1 &&
+         layout.getFragmentFactors()[0] == 1 &&
+         layout.getLocalFactors().size() == 1 &&
+         layout.getLocalFactors()[0] == 1 &&
+         layout.getVl() == cohort.getWidth() && layout.getValidity() == "full";
+}
+
+std::optional<int64_t> exactRecordByteStride(MemDescType memory,
+                                             RecordCohortType cohort) {
+  if (!memory || !cohort || memory.getShape().size() != 1 ||
+      memory.getAxisIds().size() != 1 || memory.getStrides().size() != 1 ||
+      memory.getAxisIds()[0] != cohort.getDomain().getAxisId() ||
+      memory.getStrides()[0] != 1 || memory.getElements() <= 0 ||
+      memory.getStorageBits() <= 0 || memory.getStorageBits() % 8 ||
+      cohort.getPartition() % memory.getElements())
+    return std::nullopt;
+  const int64_t recordBytes = memory.getStorageBits() / 8;
+  const int64_t recordsPerPoint = cohort.getPartition() / memory.getElements();
+  if (recordsPerPoint <= 0 ||
+      recordBytes > std::numeric_limits<int64_t>::max() / recordsPerPoint)
+    return std::nullopt;
+  return recordBytes * recordsPerPoint;
 }
 
 bool integerSignednessMatches(mlir::Type type, llvm::StringRef signedness) {
@@ -888,6 +991,12 @@ int64_t localPackInterleaveRows(mlir::Value owner) {
 }
 
 } // namespace
+
+std::optional<int64_t>
+weft::riscv::recordFieldRelativeBit(AccessAttr access, int64_t elementBits,
+                                    int64_t logicalIndex) {
+  return computeRecordFieldRelativeBit(access, elementBits, logicalIndex);
+}
 
 std::optional<llvm::SmallVector<int64_t>>
 weft::riscv::bitmaskWindowPartOffsets(
@@ -1028,7 +1137,8 @@ mlir::LogicalResult TargetAttr::verify(
     int64_t vlenBits, int64_t vectorRegisters,
     int64_t maxPrivateStackBytes, mlir::DenseI64ArrayAttr supportedSEW,
     mlir::DenseI64ArrayAttr legalLMULEighths,
-    llvm::StringRef partialCombinePolicy, mlir::ArrayAttr fragments) {
+    llvm::StringRef partialCombinePolicy, llvm::StringRef recordAxisPolicy,
+    mlir::ArrayAttr fragments) {
   if (triple.empty() || march.empty() || abi.empty() || vlenBits <= 0 ||
       vectorRegisters <= 0 || maxPrivateStackBytes < 0 || supportedSEW.empty() ||
       legalLMULEighths.empty())
@@ -1042,6 +1152,9 @@ mlir::LogicalResult TargetAttr::verify(
   if (partialCombinePolicy != "independent-multilevel" &&
       partialCombinePolicy != "sequential")
     return emitError() << "unknown partial combine structural priority";
+  if (recordAxisPolicy != "within-record" &&
+      recordAxisPolicy != "across-records")
+    return emitError() << "unknown record-axis placement structural priority";
   if (llvm::any_of(supportedSEW.asArrayRef(), [](int64_t value) { return value <= 0; }) ||
       llvm::any_of(legalLMULEighths.asArrayRef(),
                    [](int64_t value) { return value <= 0; }) ||
@@ -2215,6 +2328,17 @@ mlir::LogicalResult ValueType::verify(
   return mlir::success();
 }
 
+mlir::LogicalResult RecordCohortType::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    DomainType domain, int64_t width, int64_t partition) {
+  if (!domain || domain.getRelation() == "root" || domain.getDomainId() <= 0)
+    return emitError() << "record cohort requires one non-root Level domain";
+  if (width <= 1 || partition <= 0)
+    return emitError()
+           << "record cohort width must exceed one and partition must be positive";
+  return mlir::success();
+}
+
 mlir::LogicalResult MemDescType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     mlir::Type encoding, mlir::DenseI64ArrayAttr shape,
@@ -2784,6 +2908,23 @@ mlir::LogicalResult PhysicalPointOp::verify() {
   if (result.getDomainId() <= 0 ||
       result.getParentDomainId() != parent.getDomainId())
     return emitOpError("physical point requires a non-root domain identity");
+  return mlir::success();
+}
+
+mlir::LogicalResult RecordCohortOp::verify() {
+  auto origin = getOrigin().getDefiningOp<PhysicalPointOp>();
+  auto partition =
+      origin ? origin.getPartition().getDefiningOp<mlir::arith::ConstantIndexOp>()
+             : mlir::arith::ConstantIndexOp();
+  auto active =
+      origin ? origin.getActive().getDefiningOp<mlir::arith::ConstantIndexOp>()
+             : mlir::arith::ConstantIndexOp();
+  RecordCohortType cohort = getResult().getType();
+  if (!origin || origin.getResult().getType().getDomain() != cohort.getDomain() ||
+      !partition || !active || partition.value() != cohort.getPartition() ||
+      active.value() != partition.value())
+    return emitOpError(
+        "record cohort must preserve one fully active physical Level point and its static partition");
   return mlir::success();
 }
 
@@ -6818,6 +6959,161 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
           "replica storage physical layer disagrees with the selected base proof");
   }
   return mlir::success();
+}
+
+mlir::LogicalResult RVVRecordStorageLoadOp::verify() {
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto sourceLoad = sourceField ? ::sourceLoad(sourceField.getOwner()) : LoadOp();
+  auto sourceSlice =
+      sourceLoad ? sourceLoad.getRegion().getDefiningOp<SliceOp>() : SliceOp();
+  RecordCohortType cohort = getCohort().getType();
+  auto cohortOp = getCohort().getDefiningOp<RecordCohortOp>();
+  auto origin = cohortOp ? cohortOp.getOrigin().getDefiningOp<PhysicalPointOp>()
+                         : PhysicalPointOp();
+  ValueType result = getResult().getType();
+  mlir::Type fieldElement = sourceField
+                                ? elementOf(sourceField.getResult().getType())
+                                : mlir::Type();
+  const int64_t fieldBits = sourceField ? elementBitWidth(fieldElement) : 0;
+  const bool layered = getAccess().getMapping() == "grouped_layered";
+  const int64_t expectedStorageWidth = layered ? 8 : fieldBits;
+  mlir::Type expectedElement =
+      layered ? mlir::IntegerType::get(getContext(), 8,
+                                       mlir::IntegerType::Unsigned)
+              : fieldElement;
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  auto target = kernel ? kernel.getTarget() : TargetAttr();
+  auto expectedRecordStride =
+      sourceLoad ? exactRecordByteStride(sourceLoad.getRegion().getType(), cohort)
+                 : std::optional<int64_t>();
+  auto sourceEncoding = sourceLoad
+                            ? mlir::dyn_cast<weft::kernel::EncodingType>(
+                                  sourceLoad.getRegion().getType().getEncoding())
+                            : weft::kernel::EncodingType();
+  if (!sourceField || !sourceLoad || !sourceSlice || !cohort || !cohortOp ||
+      !origin || !kernel)
+    return emitOpError(
+        "record storage load requires explicit field, source-load, source-point, cohort, and target owners");
+  if (!sourceEncoding || sourceEncoding.getKind() == "dense" ||
+      sourceSlice.getIndices().size() != 1 ||
+      sourceSlice.getIndices().front() != origin.getResult() ||
+      sourceSlice.getSelectors().size() != 1 ||
+      mlir::cast<mlir::StringAttr>(sourceSlice.getSelectors()[0]).getValue() !=
+          "domain")
+    return emitOpError(
+        "record storage load source must be one encoded record at the cohort origin point");
+  if (!sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
+      getAccess().getForm() != "strided" ||
+      (getAccess().getMapping() != "natural" && !layered) ||
+      getAccess().getBitOffset() % 8 || getStorageIndex() < 0 ||
+      getStorageWidth() != expectedStorageWidth ||
+      !expectedRecordStride ||
+      getRecordByteStride() != *expectedRecordStride ||
+      (expectedStorageWidth != 8 && expectedStorageWidth != 16 &&
+       expectedStorageWidth != 32 && expectedStorageWidth != 64))
+    return emitOpError(
+        "record storage load requires one byte-addressable strided field geometry");
+  if (result.getElementType() != expectedElement ||
+      result.getLayout().getSew() != expectedStorageWidth ||
+      !isClosedRecordCohortValue(result, cohort) ||
+      !supportsRVVLayout(target, result.getLayout()))
+    return emitOpError(
+        "record storage load result must be one target-legal closed Level cohort");
+  if (getLogicalIndices().empty() ||
+      !exactLeaf(getLeaf(), "rvv", "record-storage-load",
+                 "rvv.record-storage-load.strided", "none", "exact"))
+    return emitOpError(
+        "record storage load requires non-empty logical ownership and its exact selected leaf");
+
+  int64_t logicalElements = 1;
+  if (auto fieldValue =
+          mlir::dyn_cast<ValueType>(sourceField.getResult().getType())) {
+    auto product = checkedPositiveProduct(fieldValue.getShape().asArrayRef());
+    if (!product)
+      return emitOpError("record storage field has no static logical extent");
+    logicalElements = *product;
+  }
+  llvm::SmallVector<int64_t> expectedIndices;
+  for (int64_t logical = 0; logical < logicalElements; ++logical) {
+    auto bit = recordFieldRelativeBit(getAccess(), fieldBits, logical);
+    if (!bit || *bit < 0 || *bit % 8 + fieldBits > expectedStorageWidth)
+      return emitOpError(
+          "record storage field element crosses its selected storage unit");
+    if (*bit / 8 == getStorageIndex())
+      expectedIndices.push_back(logical);
+  }
+  if (expectedIndices != getLogicalIndices() ||
+      getStorageIndex() >
+          (getAccess().getStorageBits() - expectedStorageWidth) / 8)
+    return emitOpError(
+        "record storage load logical indices do not exactly name one source storage unit");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVRecordStorageDecodeOp::verify() {
+  auto load = getInput().getDefiningOp<RVVRecordStorageLoadOp>();
+  auto sourceField = load ? load.getField().getDefiningOp<FieldOp>() : FieldOp();
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  mlir::Type resultElement = result.getElementType();
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(resultElement);
+  const int64_t elementBits = integer ? integer.getWidth() : 0;
+  auto bit = sourceField ? recordFieldRelativeBit(
+                              load.getAccess(), elementBits, getLogicalIndex())
+                         : std::optional<int64_t>();
+  const int64_t expectedShift = bit ? *bit % 8 : -1;
+  const int64_t expectedMask =
+      elementBits > 0 && elementBits < 8 ? (int64_t(1) << elementBits) - 1
+                                         : 0;
+  llvm::StringRef instruction =
+      expectedShift > 0
+          ? (expectedMask > 0 ? "rvv.record-storage-decode.shift-mask"
+                              : "rvv.record-storage-decode.shift")
+          : (expectedMask > 0 ? "rvv.record-storage-decode.mask"
+                              : "rvv.record-storage-decode.identity");
+  if (!load || !sourceField || !integer || integer.isSigned() ||
+      elementBits <= 0 || elementBits >= 8 || !bit ||
+      *bit / 8 != load.getStorageIndex() ||
+      !llvm::is_contained(load.getLogicalIndices(),
+                          getLogicalIndex()) ||
+      getShiftAmount() != expectedShift || getMaskValue() != expectedMask ||
+      input.getElementType() !=
+          mlir::IntegerType::get(getContext(), 8, mlir::IntegerType::Unsigned) ||
+      resultElement != elementOf(sourceField.getResult().getType()) ||
+      input.getShape() != result.getShape() ||
+      input.getAxisIds() != result.getAxisIds() ||
+      input.getLayout() != result.getLayout() ||
+      !exactLeaf(getLeaf(), "rvv", "record-storage-decode", instruction,
+                 "none", "exact"))
+    return emitOpError(
+        "record storage decode must select one typed sub-byte field element from its raw storage unit");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVRecordStoreOp::verify() {
+  ValueType value = getValue().getType();
+  MemDescType destination = getDestination().getType();
+  RecordCohortType cohort = getCohort().getType();
+  auto encoding = mlir::dyn_cast<weft::kernel::EncodingType>(
+      destination.getEncoding());
+  auto expectedRecordStride = exactRecordByteStride(destination, cohort);
+  if (!encoding || encoding.getKind() != "dense" ||
+      !canWrite(destination.getAccess()) || destination.getShape().size() != 1 ||
+      destination.getAxisIds().size() != 1 ||
+      destination.getAxisIds()[0] != cohort.getDomain().getAxisId() ||
+      destination.getElements() != 1 ||
+      destination.getStorageBits() != elementBitWidth(value.getElementType()) ||
+      !isClosedRecordCohortValue(value, cohort) || getElementOffset() < 0 ||
+      getElementOffset() >= cohort.getPartition() ||
+      !expectedRecordStride ||
+      getRecordByteStride() != *expectedRecordStride ||
+      getAccess().getForm() != "strided" ||
+      getAccess().getMapping() != "dense" ||
+      !exactLeaf(getLeaf(), "transfer", "record-store",
+                 "rvv.record-store.strided", "none", "exact"))
+    return emitOpError(
+        "record store requires one writable dense destination and a closed strided Level cohort");
+  return verifyLeafOperation(*this);
 }
 
 mlir::LogicalResult RVVIssueSliceOp::verify() {

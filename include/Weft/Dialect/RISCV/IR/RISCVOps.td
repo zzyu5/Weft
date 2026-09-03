@@ -129,6 +129,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
     "::mlir::DenseI64ArrayAttr":$supportedSEW,
     "::mlir::DenseI64ArrayAttr":$legalLMULEighths,
     StringRefParameter<"partial combine structural priority">:$partialCombinePolicy,
+    StringRefParameter<"record-axis placement structural priority">:$recordAxisPolicy,
     "::mlir::ArrayAttr":$fragments
   );
   let assemblyFormat = [{
@@ -136,7 +137,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
         $hasIndexedMemory `,` $hasSegmentMemory `,` $hasWideningInteger `,`
         $hasWideningFloat `,` $vlenBits `,` $vectorRegisters `,`
         $maxPrivateStackBytes `,` $supportedSEW `,` $legalLMULEighths `,`
-        $partialCombinePolicy `,` $fragments `>`
+        $partialCombinePolicy `,` $recordAxisPolicy `,` $fragments `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -755,6 +756,17 @@ def WeftRISCV_PointType : WeftRISCV_Type<"Point", "point"> {
   let genVerifyDecl = 1;
 }
 
+def WeftRISCV_RecordCohortType
+    : WeftRISCV_Type<"RecordCohort", "record_cohort"> {
+  let parameters = (ins
+    WeftRISCV_DomainType:$domain,
+    "int64_t":$width,
+    "int64_t":$partition
+  );
+  let assemblyFormat = "`<` $domain `,` $width `,` $partition `>`";
+  let genVerifyDecl = 1;
+}
+
 def WeftRISCV_EncodingDeclOp
     : WeftRISCV_Op<"encoding_decl", [Symbol, Pure]> {
   let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$kind,
@@ -884,6 +896,12 @@ def WeftRISCV_PhysicalPointOp : WeftRISCV_Op<"physical_point"> {
   let arguments = (ins WeftRISCV_PointType:$parent, Index:$base,
                        Index:$active, Index:$partition);
   let results = (outs WeftRISCV_PointType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RecordCohortOp : WeftRISCV_Op<"record_cohort"> {
+  let arguments = (ins WeftRISCV_PointType:$origin);
+  let results = (outs WeftRISCV_RecordCohortType:$result);
   let hasVerifier = 1;
 }
 
@@ -1499,6 +1517,43 @@ def WeftRISCV_RVVReplicaStorageLoadOp
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRecordStorageLoadOp
+    : WeftRISCV_Op<"rvv_record_storage_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins AnyType:$field,
+                       WeftRISCV_RecordCohortType:$cohort,
+                       I64Attr:$storage_index,
+                       I64Attr:$storage_width,
+                       I64Attr:$record_byte_stride,
+                       DenseI64ArrayAttr:$logical_indices,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRecordStorageDecodeOp
+    : WeftRISCV_Op<"rvv_record_storage_decode", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       I64Attr:$logical_index,
+                       I64Attr:$shift_amount,
+                       I64Attr:$mask_value,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVRecordStoreOp
+    : WeftRISCV_Op<"rvv_record_store", [MemoryEffects<[MemWrite]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$value,
+                       WeftRISCV_MemDescType:$destination,
+                       WeftRISCV_RecordCohortType:$cohort,
+                       I64Attr:$element_offset,
+                       I64Attr:$record_byte_stride,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 

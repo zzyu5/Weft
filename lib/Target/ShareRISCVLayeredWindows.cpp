@@ -1991,7 +1991,8 @@ void materializeSharedLayeredStorageWindows(mlir::IRRewriter &rewriter,
 
 bool hasTypedStorageMaterialization(riscv::FieldOp field) {
   return llvm::any_of(field.getResult().getUsers(), [](mlir::Operation *user) {
-    return mlir::isa<riscv::RVVReplicaStorageLoadOp,
+    return mlir::isa<riscv::RVVRecordStorageLoadOp,
+                     riscv::RVVReplicaStorageLoadOp,
                      riscv::RVVLayeredWindowOp,
                      riscv::RVVLayeredStreamOp,
                      riscv::RVVProjectedLayeredStreamOp,

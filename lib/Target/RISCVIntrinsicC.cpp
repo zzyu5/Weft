@@ -232,6 +232,7 @@ struct Binding {
     Window,
     PartialSet,
     Point,
+    RecordCohort,
     Domain,
   } kind = Kind::None;
 
@@ -258,6 +259,8 @@ struct Binding {
   int64_t recordAxis = 0;
   int64_t recordElements = 0;
   int64_t recordStrideBytes = 0;
+  int64_t cohortWidth = 0;
+  int64_t cohortPartition = 0;
   llvm::SmallVector<std::pair<int64_t, std::string>> recordByteStrides;
   llvm::SmallVector<std::pair<int64_t, std::string>> recordOrigins;
 };
@@ -628,6 +631,7 @@ private:
 
   mlir::LogicalResult compileOperation(mlir::Operation &operation);
   mlir::LogicalResult compilePhysicalPoint(riscv::PhysicalPointOp point);
+  mlir::LogicalResult compileRecordCohort(riscv::RecordCohortOp cohort);
   mlir::LogicalResult compileFor(mlir::scf::ForOp operation);
   mlir::LogicalResult compileIf(mlir::scf::IfOp operation);
   mlir::LogicalResult compileWhile(mlir::scf::WhileOp operation);
@@ -726,6 +730,12 @@ private:
   compileRVVLayeredStorageDecode(riscv::RVVLayeredStorageDecodeOp operation);
   mlir::LogicalResult
   compileRVVReplicaStorageLoad(riscv::RVVReplicaStorageLoadOp operation);
+  mlir::LogicalResult compileRVVRecordStorageLoad(
+      riscv::RVVRecordStorageLoadOp operation);
+  mlir::LogicalResult compileRVVRecordStorageDecode(
+      riscv::RVVRecordStorageDecodeOp operation);
+  mlir::LogicalResult
+  compileRVVRecordStore(riscv::RVVRecordStoreOp operation);
   mlir::LogicalResult compileRVVIssueSlice(riscv::RVVIssueSliceOp operation);
   mlir::LogicalResult
   compileRVVWidenAccumulate(riscv::RVVWidenAccumulateOp operation);
@@ -2238,6 +2248,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   }
   if (auto point = mlir::dyn_cast<riscv::PhysicalPointOp>(operation))
     return compilePhysicalPoint(point);
+  if (auto cohort = mlir::dyn_cast<riscv::RecordCohortOp>(operation))
+    return compileRecordCohort(cohort);
   if (auto constant = mlir::dyn_cast<riscv::ConstantOp>(operation))
     return bindConstant(constant.getValue(), constant.getResult());
   if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(operation))
@@ -2468,6 +2480,12 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVLayeredStorageDecode(decode);
   if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation))
     return compileRVVReplicaStorageLoad(load);
+  if (auto load = mlir::dyn_cast<riscv::RVVRecordStorageLoadOp>(operation))
+    return compileRVVRecordStorageLoad(load);
+  if (auto decode = mlir::dyn_cast<riscv::RVVRecordStorageDecodeOp>(operation))
+    return compileRVVRecordStorageDecode(decode);
+  if (auto store = mlir::dyn_cast<riscv::RVVRecordStoreOp>(operation))
+    return compileRVVRecordStore(store);
   if (auto slice = mlir::dyn_cast<riscv::RVVIssueSliceOp>(operation))
     return compileRVVIssueSlice(slice);
   if (auto accumulate =
@@ -2567,6 +2585,25 @@ Emitter::compilePhysicalPoint(riscv::PhysicalPointOp point) {
   binding.point.active = std::move(active.scalar);
   binding.point.physicalExtent = extent;
   bindings[point.getResult()] = std::move(binding);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRecordCohort(riscv::RecordCohortOp cohort) {
+  Binding origin = bindings.lookup(cohort.getOrigin());
+  auto type = cohort.getResult().getType();
+  if (origin.kind != Binding::Kind::Point || type.getWidth() <= 1 ||
+      type.getPartition() <= 0 ||
+      origin.point.axis != type.getDomain().getAxisId() ||
+      origin.point.physicalExtent != type.getPartition())
+    return fail(cohort,
+                "record cohort requires one matching physical Level point");
+  Binding binding;
+  binding.kind = Binding::Kind::RecordCohort;
+  binding.point = std::move(origin.point);
+  binding.cohortWidth = type.getWidth();
+  binding.cohortPartition = type.getPartition();
+  bindings[cohort.getResult()] = std::move(binding);
   return mlir::success();
 }
 
@@ -10511,6 +10548,130 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
     result.parts.push_back(std::move(value));
   }
   bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVRecordStorageLoad(
+    riscv::RVVRecordStorageLoadOp operation) {
+  if (instructionOf(operation.getOperation()) !=
+      "rvv.record-storage-load.strided")
+    return fail(operation,
+                "record storage load has no exact selected strided leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  Binding cohort = bindings.lookup(operation.getCohort());
+  if (fieldBinding.kind != Binding::Kind::Field ||
+      cohort.kind != Binding::Kind::RecordCohort)
+    return fail(operation,
+                "record storage load requires one field and record cohort");
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  auto scalarType = scalarCType(operation.getResult().getType().getElementType());
+  const int64_t parts = vectorPartCount(operation.getResult());
+  if (owner.kind != Binding::Kind::Record || !field || !scalarType ||
+      field->bitOffset % 8 || operation.getRecordByteStride() <= 0 ||
+      cohort.cohortWidth != operation.getResult().getType().getLayout().getVl() ||
+      parts != 1)
+    return fail(operation,
+                "record storage load has incomplete field/stride/vector geometry");
+  const std::string type = vectorType(operation.getResult());
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string name = fresh("record_storage");
+  const std::string pointer =
+      "((const " + *scalarType + " *)(" + owner.recordPointer + " + " +
+      std::to_string(field->bitOffset / 8 + operation.getStorageIndex()) + "))";
+  const std::string vl = partVL(operation.getResult(), 0);
+  line(type + " " + name + " = __riscv_vlse" +
+       std::to_string(operation.getStorageWidth()) + "_v_" + suffix + "(" +
+       pointer + ", (ptrdiff_t)" +
+       std::to_string(operation.getRecordByteStride()) + ", " + vl + ");");
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  result.parts.push_back(name);
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVRecordStorageDecode(
+    riscv::RVVRecordStorageDecodeOp operation) {
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool emitsShift =
+      instruction == "rvv.record-storage-decode.shift" ||
+      instruction == "rvv.record-storage-decode.shift-mask";
+  const bool emitsMask =
+      instruction == "rvv.record-storage-decode.mask" ||
+      instruction == "rvv.record-storage-decode.shift-mask";
+  if (instruction != "rvv.record-storage-decode.identity" && !emitsShift &&
+      !emitsMask)
+    return fail(operation,
+                "record storage decode has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  if (input.kind != Binding::Kind::Vector || input.parts.size() != 1 ||
+      vectorPartCount(operation.getResult()) != 1)
+    return fail(operation,
+                "record storage decode requires one complete raw vector");
+  const std::string type = vectorType(operation.getResult());
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string vl = partVL(operation.getResult(), 0);
+  std::string value = input.parts.front();
+  if (emitsShift) {
+    std::string shifted = fresh("record_shift");
+    line(type + " " + shifted + " = __riscv_vsrl_vx_" + suffix + "(" +
+         value + ", " + std::to_string(operation.getShiftAmount()) + ", " +
+         vl + ");");
+    value = std::move(shifted);
+  }
+  if (emitsMask) {
+    std::string masked = fresh("record_mask");
+    line(type + " " + masked + " = __riscv_vand_vx_" + suffix + "(" +
+         value + ", " + std::to_string(operation.getMaskValue()) + ", " + vl +
+         ");");
+    value = std::move(masked);
+  }
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  result.parts.push_back(std::move(value));
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVRecordStore(riscv::RVVRecordStoreOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.record-store.strided")
+    return fail(operation, "record store has no exact selected strided leaf");
+  Binding value = bindings.lookup(operation.getValue());
+  Binding destination = bindings.lookup(operation.getDestination());
+  Binding cohort = bindings.lookup(operation.getCohort());
+  auto valueType = operation.getValue().getType();
+  auto scalarType = scalarCType(valueType.getElementType());
+  const int64_t storageBytes = operation.getDestination().getType().getStorageBits() / 8;
+  if (value.kind != Binding::Kind::Vector || value.parts.size() != 1 ||
+      destination.kind != Binding::Kind::Memory ||
+      cohort.kind != Binding::Kind::RecordCohort || !scalarType ||
+      destination.memory.axes.size() != 1 ||
+      destination.memory.strides.size() != 1 ||
+      destination.memory.origins.size() != 1 || storageBytes <= 0 ||
+      vectorPartCount(operation.getValue()) != 1)
+    return fail(operation,
+                "record store has incomplete dense destination geometry");
+  const std::string logical =
+      "(" + cohort.point.base + " + " +
+      std::to_string(operation.getElementOffset()) + ")";
+  const std::string pointer =
+      destination.memory.name + " + (" + destination.memory.origins.front() +
+      " + " + logical + " * " + destination.memory.strides.front() + ")";
+  if (operation.getRecordByteStride() <= 0)
+    return fail(operation, "record store requires one positive selected stride");
+  line("__riscv_vsse" + std::to_string(valueType.getLayout().getSew()) + "_v_" +
+       vectorSuffix(operation.getValue()) + "(" + pointer +
+       ", (ptrdiff_t)" + std::to_string(operation.getRecordByteStride()) +
+       ", " + value.parts.front() + ", " +
+       partVL(operation.getValue(), 0) + ");");
   return mlir::success();
 }
 

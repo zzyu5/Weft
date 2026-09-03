@@ -53,6 +53,15 @@ natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示�
 leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
 两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
 
+当 target 的固定 record-axis 优先级选择跨 Level instance 的 lane cohort 时，
+`RecordCohortType` 将一个 physical point、静态 Level partition 与 cohort width 绑定为同一坐标
+实体。`rvv_record_storage_load` 明确保存 source field、cohort、storage unit、record byte stride
+及该 unit 覆盖的 logical indices；sub-byte decode 是独立 pure op；`rvv_record_store` 明确保存
+dense destination、logical element offset 与 record byte stride。动态 Level trip count仍由真实
+主 `scf.for` 和 scalar tail 表示，不能藏在上述 leaf 或 emitter 中。该表示只在 source/destination
+的一维 unit-stride encoded-record geometry、完整 active partition 与 target VLMAX 都可证明时合法；
+否则保留原来的 within-record mapping。
+
 若regular-repeat relation使同一个encoded scalar覆盖一个或多个完整lane window，
 `rvv_regular_repeat_scalar_load`明确保存source axis、dynamic source base、source count、repeat与
 每个physical time/replica part对应的`part_bases`。其result仍保留原logical axes以及

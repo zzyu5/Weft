@@ -25,6 +25,7 @@ if [[ ${format_id} -lt 0 ]]; then
   exit 2
 fi
 physical_auto=()
+record_axis_policy=()
 if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
   physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
 fi
@@ -33,6 +34,9 @@ if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
 fi
 if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
   physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
+fi
+if [[ -n ${WEFT_RECORD_AXIS_POLICY:-} ]]; then
+  record_axis_policy+=(--record-axis-policy "${WEFT_RECORD_AXIS_POLICY}")
 fi
 case "${target}" in
   sg2044)
@@ -85,6 +89,7 @@ PYTHONPATH="${project_root}/python" python -m weft \
   --kernel "row_dequantize_${format}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
+  "${record_axis_policy[@]}" \
   "${physical_auto[@]}" \
   -o "${local_root}/kernel.c"
 cp "${project_root}/examples/repro/weft/row_dequantize_runtime.cpp" \

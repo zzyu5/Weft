@@ -42,6 +42,11 @@ llvm::cl::opt<std::string> partialCombinePolicy(
     llvm::cl::desc(
         "Target partial combine priority: independent-multilevel or sequential"),
     llvm::cl::init("independent-multilevel"));
+llvm::cl::opt<std::string> recordAxisPolicy(
+    "record-axis-policy",
+    llvm::cl::desc(
+        "Target record-axis placement priority: within-record or across-records"),
+    llvm::cl::init("within-record"));
 llvm::cl::list<std::string> metaBindings(
     "meta", llvm::cl::desc("Auto specialization choices NAME=INTEGER[,INTEGER...]"),
     llvm::cl::ZeroOrMore);
@@ -139,6 +144,7 @@ int main(int argc, char **argv) {
     std::string error;
     if (!weft::parseRISCVTargetProfile(
             march, abi, vlenBits, matrixExtension, partialCombinePolicy,
+            recordAxisPolicy,
             options.target, error)) {
       llvm::errs() << error << '\n';
       return 1;

@@ -781,6 +781,15 @@ riscv_internal::target(mlir::Builder &builder,
     partialCombinePolicy = "sequential";
     break;
   }
+  llvm::StringRef recordAxisPolicy;
+  switch (profile.recordAxisPolicy) {
+  case RISCVRecordAxisPolicy::WithinRecord:
+    recordAxisPolicy = "within-record";
+    break;
+  case RISCVRecordAxisPolicy::AcrossRecords:
+    recordAxisPolicy = "across-records";
+    break;
+  }
   for (const RISCVFragmentCapability &fragment : profile.fragmentCapabilities) {
     llvm::StringRef instruction;
     riscv::FragmentPackingAttr lhsPacking;
@@ -833,7 +842,7 @@ riscv_internal::target(mlir::Builder &builder,
       profile.hasWideningFloat,
       profile.vlenBits, profile.vectorRegisters, profile.maxPrivateStackBytes,
       integers(builder, sews), integers(builder, lmuls),
-      partialCombinePolicy,
+      partialCombinePolicy, recordAxisPolicy,
       builder.getArrayAttr(fragments));
 }
 
@@ -937,10 +946,15 @@ riscv_internal::terminalInstruction(mlir::Operation *operation) {
     auto layout = layoutOf(iota.getResult().getType());
     if (layout && layout.getCarrier() == "rvv")
       return "rvv.iota";
-    auto replicas =
-        layout ? staticProduct(layout.getReplicaFactors().asArrayRef())
-               : std::optional<int64_t>();
-    return replicas && *replicas > 1 ? "register.iota" : "scalar.iota";
+    auto time = layout ? staticProduct(layout.getTimeFactors().asArrayRef())
+                       : std::optional<int64_t>();
+    auto replicas = layout
+                        ? staticProduct(layout.getReplicaFactors().asArrayRef())
+                        : std::optional<int64_t>();
+    const bool tuple = time && replicas && *time > 0 && *replicas > 0 &&
+                       *time <= std::numeric_limits<int64_t>::max() / *replicas &&
+                       *time * *replicas > 1;
+    return tuple ? "register.iota" : "scalar.iota";
   }
   if (auto unary = mlir::dyn_cast<riscv::UnaryOp>(operation)) {
     if (carrierOf(unary.getResult().getType()) != "rvv")

@@ -32,6 +32,7 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createSelectRISCVOperationsPass());
   manager.addPass(weft::createLowerRISCVCompositesPass());
   manager.addPass(weft::createMaterializeRISCVProgramsPass());
+  manager.addPass(weft::createVectorizeRISCVRecordLoopsPass());
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   // Level materialization creates the physical points that close nested
   // domain-relative memory windows.  Plan those memory edges before bitplane

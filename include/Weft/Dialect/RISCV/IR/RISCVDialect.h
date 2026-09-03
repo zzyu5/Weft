@@ -27,8 +27,14 @@
 namespace weft::riscv {
 
 /// Returns whether an RVV layout is executable under the complete target
-/// register contract, including the ELEN-dependent fractional-LMUL bound.
+/// register contract, including fractional LMUL, VLMAX, and register groups.
 bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
+
+/// Returns the bit offset of one logical field element under the declared
+/// natural or grouped/layered storage geometry.
+std::optional<int64_t> recordFieldRelativeBit(AccessAttr access,
+                                              int64_t elementBits,
+                                              int64_t logicalIndex);
 
 /// Projects every result part onto the packed operand address identity used by
 /// grouped MAC. Equal entries denote one typed packed supply shared by those
