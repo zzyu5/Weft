@@ -358,6 +358,7 @@ int main(int argc, char **argv) {
                                                        selected_xqk);
   float recordExpected = 0.0f;
   bool found = false;
+  int inputAttempt = -1;
   for (int attempt = 0; attempt < 4096; ++attempt) {
     auto *weight_bytes = reinterpret_cast<std::uint8_t *>(&weightRecord);
     auto *activation_bytes =
@@ -371,6 +372,7 @@ int main(int argc, char **argv) {
                        activationRecord.data(), 0, 1);
     if (__builtin_isfinite(recordExpected)) {
       found = true;
+      inputAttempt = attempt;
       break;
     }
   }
@@ -462,10 +464,14 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(kRows) * kElements;
   std::printf("target=%s\nM=1\nN=%zu\nK=%d\n", kTarget, kRows,
               kElements);
+  std::printf("input_policy=finite-random-record-replicated\n");
+  std::printf("input_seed=%u\ninput_attempt=%d\n",
+              0x56444f54U + WEFT_VEC_DOT_FORMAT, inputAttempt);
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               maxAbsolute, maxRelative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", medianUs,
               operations / medianUs / 1.0e3);
+  std::printf("output_sample=%.9g\n", output[0]);
   return 0;
 }

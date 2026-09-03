@@ -743,6 +743,7 @@ int main(int argc, char **argv) {
   std::vector<selected_weight> weightRow(kK / selected_wqk);
   std::vector<float> expectedRows(runtimeM, 0.0f);
   bool found = false;
+  int inputAttempt = -1;
   for (int attempt = 0; attempt < 4096; ++attempt) {
     auto *raw = reinterpret_cast<std::uint8_t *>(&weightRecord);
     for (std::size_t index = 0; index < sizeof(selected_weight); ++index)
@@ -761,8 +762,10 @@ int main(int argc, char **argv) {
 #endif
       found = found && __builtin_isfinite(expectedRows[row]);
     }
-    if (found)
+    if (found) {
+      inputAttempt = attempt;
       break;
+    }
   }
   if (!found) {
     std::fprintf(stderr, "failed to generate finite random encoded weights\n");
@@ -818,10 +821,18 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(runtimeM) * kN * kK;
   std::printf("target=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n", kTarget,
               phase, runtimeM, kN, kK);
+#if WEFT_MUL_MAT_FORMAT == 0
+  std::printf("input_policy=dense-fixed-values\n");
+#else
+  std::printf("input_policy=finite-random-record-replicated\n");
+  std::printf("input_seed=%u\ninput_attempt=%d\n",
+              0x4d554c4dU + WEFT_MUL_MAT_FORMAT, inputAttempt);
+#endif
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               maxAbsolute, maxRelative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", medianUs,
               operations / medianUs / 1.0e3);
+  std::printf("output_sample=%.9g\n", actual[0]);
   return 0;
 }

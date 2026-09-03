@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <vector>
 
 namespace {
@@ -21,66 +22,63 @@ constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 
 using dot_fn = void (*)(int, float *, std::size_t, const void *, std::size_t,
                         const void *, std::size_t, int);
-using quantize_fn = void (*)(const float *, void *, std::int64_t);
-
 struct dot_case {
   const char *name;
   ggml_type weight_type;
   ggml_type activation_type;
   dot_fn dot;
-  quantize_fn quantize_weight;
   const char *implementation;
 };
 
 const dot_case cases[] = {
     {"q1_0_q8_0", GGML_TYPE_Q1_0, GGML_TYPE_Q8_0,
-     ggml_vec_dot_q1_0_q8_0, quantize_row_q1_0, "rvv_intrinsic"},
+     ggml_vec_dot_q1_0_q8_0, "rvv_intrinsic"},
     {"q4_0_q8_0", GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-     ggml_vec_dot_q4_0_q8_0, quantize_row_q4_0, "rvv_intrinsic"},
+     ggml_vec_dot_q4_0_q8_0, "rvv_intrinsic"},
     {"q4_1_q8_1", GGML_TYPE_Q4_1, GGML_TYPE_Q8_1,
-     ggml_vec_dot_q4_1_q8_1, quantize_row_q4_1, "rvv_intrinsic"},
+     ggml_vec_dot_q4_1_q8_1, "rvv_intrinsic"},
     {"q5_0_q8_0", GGML_TYPE_Q5_0, GGML_TYPE_Q8_0,
-     ggml_vec_dot_q5_0_q8_0, quantize_row_q5_0, "rvv_intrinsic"},
+     ggml_vec_dot_q5_0_q8_0, "rvv_intrinsic"},
     {"q5_1_q8_1", GGML_TYPE_Q5_1, GGML_TYPE_Q8_1,
-     ggml_vec_dot_q5_1_q8_1, quantize_row_q5_1, "rvv_intrinsic"},
+     ggml_vec_dot_q5_1_q8_1, "rvv_intrinsic"},
     {"q8_0_q8_0", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
-     ggml_vec_dot_q8_0_q8_0, quantize_row_q8_0, "rvv_intrinsic"},
+     ggml_vec_dot_q8_0_q8_0, "rvv_intrinsic"},
     {"q2_K_q8_K", GGML_TYPE_Q2_K, GGML_TYPE_Q8_K,
-     ggml_vec_dot_q2_K_q8_K, quantize_row_q2_K, "rvv_intrinsic"},
+     ggml_vec_dot_q2_K_q8_K, "rvv_intrinsic"},
     {"q3_K_q8_K", GGML_TYPE_Q3_K, GGML_TYPE_Q8_K,
-     ggml_vec_dot_q3_K_q8_K, quantize_row_q3_K, "rvv_intrinsic"},
+     ggml_vec_dot_q3_K_q8_K, "rvv_intrinsic"},
     {"q4_K_q8_K", GGML_TYPE_Q4_K, GGML_TYPE_Q8_K,
-     ggml_vec_dot_q4_K_q8_K, quantize_row_q4_K, "rvv_intrinsic"},
+     ggml_vec_dot_q4_K_q8_K, "rvv_intrinsic"},
     {"q5_K_q8_K", GGML_TYPE_Q5_K, GGML_TYPE_Q8_K,
-     ggml_vec_dot_q5_K_q8_K, quantize_row_q5_K, "rvv_intrinsic"},
+     ggml_vec_dot_q5_K_q8_K, "rvv_intrinsic"},
     {"q6_K_q8_K", GGML_TYPE_Q6_K, GGML_TYPE_Q8_K,
-     ggml_vec_dot_q6_K_q8_K, quantize_row_q6_K, "rvv_intrinsic"},
+     ggml_vec_dot_q6_K_q8_K, "rvv_intrinsic"},
     {"iq1_s_q8_K", GGML_TYPE_IQ1_S, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq1_s_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq1_s_q8_K, "rvv_intrinsic"},
     {"iq1_m_q8_K", GGML_TYPE_IQ1_M, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq1_m_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq1_m_q8_K, "rvv_intrinsic"},
     {"iq2_s_q8_K", GGML_TYPE_IQ2_S, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq2_s_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq2_s_q8_K, "rvv_intrinsic"},
     {"iq2_xs_q8_K", GGML_TYPE_IQ2_XS, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq2_xs_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq2_xs_q8_K, "rvv_intrinsic"},
     {"iq2_xxs_q8_K", GGML_TYPE_IQ2_XXS, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq2_xxs_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq2_xxs_q8_K, "rvv_intrinsic"},
     {"iq3_s_q8_K", GGML_TYPE_IQ3_S, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq3_s_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq3_s_q8_K, "rvv_intrinsic"},
     {"iq3_xxs_q8_K", GGML_TYPE_IQ3_XXS, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq3_xxs_q8_K, nullptr, "rvv_intrinsic"},
+     ggml_vec_dot_iq3_xxs_q8_K, "rvv_intrinsic"},
     {"iq4_nl_q8_0", GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0,
-     ggml_vec_dot_iq4_nl_q8_0, quantize_row_iq4_nl, "rvv_intrinsic"},
+     ggml_vec_dot_iq4_nl_q8_0, "rvv_intrinsic"},
     {"iq4_xs_q8_K", GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_K,
-     ggml_vec_dot_iq4_xs_q8_K, quantize_row_iq4_xs, "rvv_intrinsic"},
+     ggml_vec_dot_iq4_xs_q8_K, "rvv_intrinsic"},
     {"tq1_0_q8_K", GGML_TYPE_TQ1_0, GGML_TYPE_Q8_K,
-     ggml_vec_dot_tq1_0_q8_K, quantize_row_tq1_0, "rvv_intrinsic"},
+     ggml_vec_dot_tq1_0_q8_K, "rvv_intrinsic"},
     {"tq2_0_q8_K", GGML_TYPE_TQ2_0, GGML_TYPE_Q8_K,
-     ggml_vec_dot_tq2_0_q8_K, quantize_row_tq2_0, "rvv_intrinsic"},
+     ggml_vec_dot_tq2_0_q8_K, "rvv_intrinsic"},
     {"mxfp4_q8_0", GGML_TYPE_MXFP4, GGML_TYPE_Q8_0,
-     ggml_vec_dot_mxfp4_q8_0, quantize_row_mxfp4, "rvv_intrinsic"},
+     ggml_vec_dot_mxfp4_q8_0, "rvv_intrinsic"},
     {"nvfp4_q8_0", GGML_TYPE_NVFP4, GGML_TYPE_Q8_0,
-     ggml_vec_dot_nvfp4_q8_0, quantize_row_nvfp4, "scalar"},
+     ggml_vec_dot_nvfp4_q8_0, "scalar"},
 };
 
 volatile std::uint64_t flush_sink = 0;
@@ -101,19 +99,6 @@ std::size_t parse_repetitions(const char *text) {
     return 0;
   }
   return static_cast<std::size_t>(value);
-}
-
-quantize_fn activation_quantizer(ggml_type type) {
-  switch (type) {
-    case GGML_TYPE_Q8_0:
-      return quantize_row_q8_0;
-    case GGML_TYPE_Q8_1:
-      return quantize_row_q8_1;
-    case GGML_TYPE_Q8_K:
-      return quantize_row_q8_K;
-    default:
-      return nullptr;
-  }
 }
 
 void evict_cache(std::vector<std::uint8_t> &buffer) {
@@ -163,28 +148,76 @@ int main(int argc, char **argv) {
   const std::size_t weight_row_bytes = ggml_row_size(selected->weight_type, kK);
   const std::size_t activation_row_bytes =
       ggml_row_size(selected->activation_type, kK);
-  std::vector<float> source(kK);
-  for (std::size_t i = 0; i < source.size(); ++i) {
-    source[i] = static_cast<float>(static_cast<int>(i % 31) - 15) / 16.0F;
+  const std::int64_t weight_block_elements =
+      ggml_blck_size(selected->weight_type);
+  const std::int64_t activation_block_elements =
+      ggml_blck_size(selected->activation_type);
+  const std::size_t weight_record_bytes =
+      ggml_type_size(selected->weight_type);
+  if (weight_block_elements <= 0 || activation_block_elements <= 0 ||
+      weight_block_elements % activation_block_elements != 0 ||
+      weight_record_bytes == 0 ||
+      kK % static_cast<std::size_t>(weight_block_elements) != 0) {
+    std::fprintf(stderr, "incompatible vec-dot block geometry for %s\n",
+                 argv[1]);
+    return 1;
+  }
+  const std::size_t activation_record_bytes =
+      ggml_type_size(selected->activation_type) *
+      static_cast<std::size_t>(weight_block_elements /
+                               activation_block_elements);
+  if (activation_record_bytes == 0 ||
+      weight_row_bytes % weight_record_bytes != 0 ||
+      activation_row_bytes % activation_record_bytes != 0) {
+    std::fprintf(stderr, "incompatible vec-dot block geometry for %s\n",
+                 argv[1]);
+    return 1;
   }
 
-  std::vector<std::uint8_t> weight_row(weight_row_bytes, 0);
-  if (selected->quantize_weight != nullptr) {
-    selected->quantize_weight(source.data(), weight_row.data(), kK);
+  const std::size_t input_case =
+      static_cast<std::size_t>(selected - cases);
+  const std::uint32_t input_seed =
+      0x56444f54U + static_cast<std::uint32_t>(input_case);
+  std::mt19937 generator(input_seed);
+  std::uniform_int_distribution<unsigned> bytes(0, 255);
+  std::vector<std::uint8_t> weight_record(weight_record_bytes);
+  std::vector<std::uint8_t> activation_record(activation_record_bytes);
+  float record_output = 0.0F;
+  int input_attempt = -1;
+  ggml_cpu_init();
+  for (int attempt = 0; attempt < 4096; ++attempt) {
+    for (std::uint8_t &value : weight_record)
+      value = static_cast<std::uint8_t>(bytes(generator));
+    for (std::uint8_t &value : activation_record)
+      value = static_cast<std::uint8_t>(bytes(generator));
+    selected->dot(static_cast<int>(weight_block_elements), &record_output, 0,
+                  weight_record.data(), 0, activation_record.data(), 0, 1);
+    if (std::isfinite(record_output)) {
+      input_attempt = attempt;
+      break;
+    }
   }
+  if (input_attempt < 0) {
+    std::fprintf(stderr, "failed to generate finite random encoded data\n");
+    return 1;
+  }
+
+  std::vector<std::uint8_t> weight_row(weight_row_bytes);
+  for (std::size_t offset = 0; offset < weight_row.size();
+       offset += weight_record.size())
+    std::memcpy(weight_row.data() + offset, weight_record.data(),
+                weight_record.size());
   std::vector<std::uint8_t> weights(weight_row_bytes * kN);
   for (std::size_t row = 0; row < kN; ++row) {
     std::memcpy(weights.data() + row * weight_row_bytes, weight_row.data(),
                 weight_row_bytes);
   }
 
-  quantize_fn quantize_activation = activation_quantizer(selected->activation_type);
-  if (quantize_activation == nullptr) {
-    std::fprintf(stderr, "missing activation quantizer for %s\n", argv[1]);
-    return 1;
-  }
   std::vector<std::uint8_t> activation(activation_row_bytes);
-  quantize_activation(source.data(), activation.data(), kK);
+  for (std::size_t offset = 0; offset < activation.size();
+       offset += activation_record.size())
+    std::memcpy(activation.data() + offset, activation_record.data(),
+                activation_record.size());
   std::vector<float> output(kN);
   std::vector<std::uint8_t> flush_buffer(kFlushBytes, 1);
 
@@ -221,6 +254,9 @@ int main(int argc, char **argv) {
   std::printf("M=1\nN=%zu\nK=%zu\n", kN, kK);
   std::printf("vlen_bits=%d\n", vlen_bytes * 8);
   std::printf("cold_protocol=64MiB-evict-then-full-projection\n");
+  std::printf("input_policy=finite-random-record-replicated\n");
+  std::printf("input_seed=%u\ninput_attempt=%d\n", input_seed,
+              input_attempt);
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_gop_s=%.6f\n", operations / cold_median_us / 1.0e3);

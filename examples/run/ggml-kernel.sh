@@ -21,6 +21,7 @@ case "${target}" in
     remote_cpu=48
     remote_march=rv64gcv_zfh_zfhmin_zvfh_zvfhmin_zfa_zba_zbb_zbc_zbs_zicbom_zicboz_zicbop_zicond_zawrs_zihintpause
     remote_extra_cxx_flags='--gcc-toolchain=/opt/tcrv-toolchains/gcc-15.2.0 -B/opt/tcrv-toolchains/binutils-2.46.1/bin -fno-integrated-as'
+    remote_link_path=/opt/tcrv-toolchains/gcc-15.2.0/lib
     remote_extra_define=
     ;;
   k1)
@@ -31,6 +32,7 @@ case "${target}" in
     remote_cpu=3
     remote_march=rv64gcv_zfh_zvfh_zicbop_zihintpause_zba
     remote_extra_cxx_flags=-fno-integrated-as
+    remote_link_path=/usr/lib/riscv64-linux-gnu
     remote_extra_define=
     ;;
   *)
@@ -102,6 +104,7 @@ printf -v cxx_argument '%q' "${remote_cxx}"
 printf -v cpu_argument '%q' "${remote_cpu}"
 printf -v march_argument '%q' "${remote_march}"
 printf -v extra_cxx_flags_argument '%q' "${remote_extra_cxx_flags}"
+printf -v link_path_argument '%q' "${remote_link_path}"
 printf -v extra_define_argument '%q' "${remote_extra_define}"
 
 tar -C "${local_root}" -cf - runtime.cpp |
@@ -129,6 +132,7 @@ tar -C "${local_root}" -cf - runtime.cpp |
     cpu=${cpu_argument}
     march=${march_argument}
     extra_cxx_flags=${extra_cxx_flags_argument}
+    link_path=${link_path_argument}
     extra_define=${extra_define_argument}
 
     \"\${cxx}\" -O3 -std=c++17 -Wall -Wextra -Werror -ffp-contract=fast \
@@ -139,8 +143,8 @@ tar -C "${local_root}" -cf - runtime.cpp |
       -I\"\${source_root}/ggml/src/ggml-cpu\" \
       -I\"\${source_root}/ggml/src/ggml-cpu/spacemit\" \
       runtime.cpp -L\"\${build_root}/bin\" \
-      -L/opt/tcrv-toolchains/gcc-15.2.0/lib \
-      -Wl,-rpath,\"\${build_root}/bin:/opt/tcrv-toolchains/gcc-15.2.0/lib\" \
+      -L"\${link_path}" \
+      -Wl,-rpath,\"\${build_root}/bin:\${link_path}\" \
       -Wl,--no-as-needed \
       -lggml -lggml-cpu -lggml-base -lgomp -lm -ldl -pthread \
       -o ggml_kernel_runtime

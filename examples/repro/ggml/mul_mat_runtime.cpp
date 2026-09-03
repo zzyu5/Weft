@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -21,42 +22,39 @@ constexpr std::size_t kN = 4096;
 constexpr std::size_t kK = 4096;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 
-using quantize_fn = void (*)(const float *, void *, std::int64_t);
-
 struct format_case {
   const char *name;
   ggml_type type;
-  quantize_fn quantize;
   const char *implementation;
 };
 
 const format_case formats[] = {
-    {"f32", GGML_TYPE_F32, nullptr, "rvv_f32_vec_dot"},
-    {"f16", GGML_TYPE_F16, nullptr, "rvv_f16_vec_dot"},
-    {"q1_0", GGML_TYPE_Q1_0, quantize_row_q1_0, "rvv_quantized_vec_dot"},
-    {"q4_0", GGML_TYPE_Q4_0, quantize_row_q4_0, "rvv_quantized_vec_dot"},
-    {"q4_1", GGML_TYPE_Q4_1, quantize_row_q4_1, "rvv_quantized_vec_dot"},
-    {"q5_0", GGML_TYPE_Q5_0, quantize_row_q5_0, "rvv_quantized_vec_dot"},
-    {"q5_1", GGML_TYPE_Q5_1, quantize_row_q5_1, "rvv_quantized_vec_dot"},
-    {"q8_0", GGML_TYPE_Q8_0, quantize_row_q8_0, "rvv_quantized_vec_dot"},
-    {"q2_K", GGML_TYPE_Q2_K, quantize_row_q2_K, "rvv_quantized_vec_dot"},
-    {"q3_K", GGML_TYPE_Q3_K, quantize_row_q3_K, "rvv_quantized_vec_dot"},
-    {"q4_K", GGML_TYPE_Q4_K, quantize_row_q4_K, "rvv_quantized_vec_dot"},
-    {"q5_K", GGML_TYPE_Q5_K, quantize_row_q5_K, "rvv_quantized_vec_dot"},
-    {"q6_K", GGML_TYPE_Q6_K, quantize_row_q6_K, "rvv_quantized_vec_dot"},
-    {"iq1_s", GGML_TYPE_IQ1_S, nullptr, "rvv_quantized_vec_dot"},
-    {"iq1_m", GGML_TYPE_IQ1_M, nullptr, "rvv_quantized_vec_dot"},
-    {"iq2_s", GGML_TYPE_IQ2_S, nullptr, "rvv_quantized_vec_dot"},
-    {"iq2_xs", GGML_TYPE_IQ2_XS, nullptr, "rvv_quantized_vec_dot"},
-    {"iq2_xxs", GGML_TYPE_IQ2_XXS, nullptr, "rvv_quantized_vec_dot"},
-    {"iq3_s", GGML_TYPE_IQ3_S, nullptr, "rvv_quantized_vec_dot"},
-    {"iq3_xxs", GGML_TYPE_IQ3_XXS, nullptr, "rvv_quantized_vec_dot"},
-    {"iq4_nl", GGML_TYPE_IQ4_NL, quantize_row_iq4_nl, "rvv_quantized_vec_dot"},
-    {"iq4_xs", GGML_TYPE_IQ4_XS, quantize_row_iq4_xs, "rvv_quantized_vec_dot"},
-    {"tq1_0", GGML_TYPE_TQ1_0, quantize_row_tq1_0, "rvv_quantized_vec_dot"},
-    {"tq2_0", GGML_TYPE_TQ2_0, quantize_row_tq2_0, "rvv_quantized_vec_dot"},
-    {"mxfp4", GGML_TYPE_MXFP4, quantize_row_mxfp4, "rvv_quantized_vec_dot"},
-    {"nvfp4", GGML_TYPE_NVFP4, quantize_row_nvfp4, "scalar_quantized_vec_dot"},
+    {"f32", GGML_TYPE_F32, "rvv_f32_vec_dot"},
+    {"f16", GGML_TYPE_F16, "rvv_f16_vec_dot"},
+    {"q1_0", GGML_TYPE_Q1_0, "rvv_quantized_vec_dot"},
+    {"q4_0", GGML_TYPE_Q4_0, "rvv_quantized_vec_dot"},
+    {"q4_1", GGML_TYPE_Q4_1, "rvv_quantized_vec_dot"},
+    {"q5_0", GGML_TYPE_Q5_0, "rvv_quantized_vec_dot"},
+    {"q5_1", GGML_TYPE_Q5_1, "rvv_quantized_vec_dot"},
+    {"q8_0", GGML_TYPE_Q8_0, "rvv_quantized_vec_dot"},
+    {"q2_K", GGML_TYPE_Q2_K, "rvv_quantized_vec_dot"},
+    {"q3_K", GGML_TYPE_Q3_K, "rvv_quantized_vec_dot"},
+    {"q4_K", GGML_TYPE_Q4_K, "rvv_quantized_vec_dot"},
+    {"q5_K", GGML_TYPE_Q5_K, "rvv_quantized_vec_dot"},
+    {"q6_K", GGML_TYPE_Q6_K, "rvv_quantized_vec_dot"},
+    {"iq1_s", GGML_TYPE_IQ1_S, "rvv_quantized_vec_dot"},
+    {"iq1_m", GGML_TYPE_IQ1_M, "rvv_quantized_vec_dot"},
+    {"iq2_s", GGML_TYPE_IQ2_S, "rvv_quantized_vec_dot"},
+    {"iq2_xs", GGML_TYPE_IQ2_XS, "rvv_quantized_vec_dot"},
+    {"iq2_xxs", GGML_TYPE_IQ2_XXS, "rvv_quantized_vec_dot"},
+    {"iq3_s", GGML_TYPE_IQ3_S, "rvv_quantized_vec_dot"},
+    {"iq3_xxs", GGML_TYPE_IQ3_XXS, "rvv_quantized_vec_dot"},
+    {"iq4_nl", GGML_TYPE_IQ4_NL, "rvv_quantized_vec_dot"},
+    {"iq4_xs", GGML_TYPE_IQ4_XS, "rvv_quantized_vec_dot"},
+    {"tq1_0", GGML_TYPE_TQ1_0, "rvv_quantized_vec_dot"},
+    {"tq2_0", GGML_TYPE_TQ2_0, "rvv_quantized_vec_dot"},
+    {"mxfp4", GGML_TYPE_MXFP4, "rvv_quantized_vec_dot"},
+    {"nvfp4", GGML_TYPE_NVFP4, "scalar_quantized_vec_dot"},
 };
 
 struct invocation {
@@ -180,34 +178,111 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  std::vector<float> source_row(kK);
-  for (std::size_t i = 0; i < source_row.size(); ++i) {
-    source_row[i] =
-        static_cast<float>(static_cast<int>(i % 31) - 15) / 16.0F;
+  std::vector<float> activation_values(selected.m * kK);
+  if (selected.format->type == GGML_TYPE_F32) {
+    std::fill(activation_values.begin(), activation_values.end(),
+              1.0F / 4096.0F);
+  } else {
+    for (std::size_t i = 0; i < activation_values.size(); ++i)
+      activation_values[i] =
+          static_cast<float>(static_cast<int>((i * 37U) % 251U) - 125) /
+          17.0F;
   }
+
   const std::size_t weight_row_bytes =
       ggml_row_size(selected.format->type, kK);
   std::vector<std::uint8_t> weight_row(weight_row_bytes, 0);
+  const char *input_policy = nullptr;
+  std::uint32_t input_seed = 0;
+  int input_attempt = 0;
   if (selected.format->type == GGML_TYPE_F32) {
-    std::memcpy(weight_row.data(), source_row.data(), weight_row_bytes);
+    std::vector<float> dense_row(kK, 1.0F);
+    std::memcpy(weight_row.data(), dense_row.data(), weight_row_bytes);
+    input_policy = "dense-fixed-values";
   } else if (selected.format->type == GGML_TYPE_F16) {
-    for (std::size_t i = 0; i < source_row.size(); ++i) {
-      const ggml_fp16_t value = ggml_fp32_to_fp16(source_row[i]);
+    for (std::size_t i = 0; i < kK; ++i) {
+      const float source =
+          static_cast<float>(static_cast<int>((i * 19U) % 127U) - 63) /
+          13.0F;
+      const ggml_fp16_t value = ggml_fp32_to_fp16(source);
       std::memcpy(weight_row.data() + i * sizeof(value), &value, sizeof(value));
     }
-  } else if (selected.format->quantize != nullptr) {
-    selected.format->quantize(source_row.data(), weight_row.data(), kK);
+    input_policy = "dense-fixed-values";
+  } else {
+    const auto *weight_traits =
+        ggml_get_type_traits_cpu(selected.format->type);
+    const ggml_type activation_type =
+        weight_traits ? weight_traits->vec_dot_type : GGML_TYPE_COUNT;
+    const auto *activation_traits = activation_type != GGML_TYPE_COUNT
+                                        ? ggml_get_type_traits_cpu(activation_type)
+                                        : nullptr;
+    const std::int64_t weight_block_elements =
+        ggml_blck_size(selected.format->type);
+    const std::size_t weight_record_bytes =
+        ggml_type_size(selected.format->type);
+    if (!weight_traits || !weight_traits->vec_dot || !activation_traits ||
+        !activation_traits->from_float || weight_block_elements <= 0 ||
+        weight_record_bytes == 0 ||
+        kK % static_cast<std::size_t>(weight_block_elements) != 0 ||
+        weight_row_bytes % weight_record_bytes != 0) {
+      std::fprintf(stderr, "incomplete quantized input contract for %s\n",
+                   argv[1]);
+      ggml_backend_buffer_free(buffer);
+      ggml_backend_free(backend);
+      ggml_free(ctx);
+      return 1;
+    }
+
+    const std::size_t activation_row_bytes =
+        ggml_row_size(activation_type, kK);
+    std::vector<std::uint8_t> quantized_activation(selected.m *
+                                                    activation_row_bytes);
+    for (std::size_t row = 0; row < selected.m; ++row)
+      activation_traits->from_float(
+          activation_values.data() + row * kK,
+          quantized_activation.data() + row * activation_row_bytes, kK);
+
+    input_seed = 0x4d554c4dU + static_cast<std::uint32_t>(
+                                      selected.format - formats - 1);
+    std::mt19937 generator(input_seed);
+    std::uniform_int_distribution<unsigned> bytes(0, 255);
+    std::vector<std::uint8_t> weight_record(weight_record_bytes);
+    std::vector<float> reference_rows(selected.m);
+    input_attempt = -1;
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+      for (std::uint8_t &value : weight_record)
+        value = static_cast<std::uint8_t>(bytes(generator));
+      for (std::size_t offset = 0; offset < weight_row.size();
+           offset += weight_record.size())
+        std::memcpy(weight_row.data() + offset, weight_record.data(),
+                    weight_record.size());
+      bool finite = true;
+      for (std::size_t row = 0; row < selected.m; ++row) {
+        weight_traits->vec_dot(
+            static_cast<int>(kK), &reference_rows[row], 0,
+            weight_row.data(), 0,
+            quantized_activation.data() + row * activation_row_bytes, 0, 1);
+        finite = finite && std::isfinite(reference_rows[row]);
+      }
+      if (finite) {
+        input_attempt = attempt;
+        break;
+      }
+    }
+    if (input_attempt < 0) {
+      std::fprintf(stderr, "failed to generate finite random encoded weights\n");
+      ggml_backend_buffer_free(buffer);
+      ggml_backend_free(backend);
+      ggml_free(ctx);
+      return 1;
+    }
+    input_policy = "finite-random-record-replicated";
   }
   for (std::size_t row = 0; row < kN; ++row) {
     ggml_backend_tensor_set(weight, weight_row.data(), row * weight_row_bytes,
                             weight_row_bytes);
   }
 
-  std::vector<float> activation_values(selected.m * kK);
-  for (std::size_t i = 0; i < activation_values.size(); ++i) {
-    activation_values[i] =
-        static_cast<float>(static_cast<int>(i % 17) - 8) / 9.0F;
-  }
   ggml_backend_tensor_set(activation, activation_values.data(), 0,
                           ggml_nbytes(activation));
 
@@ -269,6 +344,10 @@ int main(int argc, char **argv) {
   std::printf("threads=1\n");
   std::printf("vlen_bits=%d\n", ggml_cpu_get_rvv_vlen() * 8);
   std::printf("cold_protocol=64MiB-evict-then-single-op-graph\n");
+  std::printf("input_policy=%s\n", input_policy);
+  if (input_seed != 0)
+    std::printf("input_seed=%u\ninput_attempt=%d\n", input_seed,
+                input_attempt);
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_gop_s=%.6f\n", operations / cold_median_us / 1.0e3);
