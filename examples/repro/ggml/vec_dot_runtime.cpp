@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <vector>
 
 namespace {
@@ -174,31 +173,46 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const std::size_t input_case =
-      static_cast<std::size_t>(selected - cases);
-  const std::uint32_t input_seed =
-      0x56444f54U + static_cast<std::uint32_t>(input_case);
-  std::mt19937 generator(input_seed);
-  std::uniform_int_distribution<unsigned> bytes(0, 255);
+  const std::size_t input_case = static_cast<std::size_t>(selected - cases);
+  std::vector<float> weight_source(
+      static_cast<std::size_t>(weight_block_elements));
+  std::vector<float> activation_source(
+      static_cast<std::size_t>(weight_block_elements));
+  std::vector<float> importance(
+      static_cast<std::size_t>(weight_block_elements), 1.0F);
+  for (std::size_t index = 0; index < weight_source.size(); ++index) {
+    weight_source[index] =
+        static_cast<float>(static_cast<int>(
+                               (index * 19U + input_case * 7U) % 127U) -
+                           63) /
+        13.0F;
+    activation_source[index] =
+        static_cast<float>(static_cast<int>((index * 37U) % 251U) - 125) /
+        17.0F;
+  }
   std::vector<std::uint8_t> weight_record(weight_record_bytes);
   std::vector<std::uint8_t> activation_record(activation_record_bytes);
-  float record_output = 0.0F;
-  int input_attempt = -1;
-  ggml_cpu_init();
-  for (int attempt = 0; attempt < 4096; ++attempt) {
-    for (std::uint8_t &value : weight_record)
-      value = static_cast<std::uint8_t>(bytes(generator));
-    for (std::uint8_t &value : activation_record)
-      value = static_cast<std::uint8_t>(bytes(generator));
-    selected->dot(static_cast<int>(weight_block_elements), &record_output, 0,
-                  weight_record.data(), 0, activation_record.data(), 0, 1);
-    if (std::isfinite(record_output)) {
-      input_attempt = attempt;
-      break;
-    }
+  const std::size_t encoded_bytes = ggml_quantize_chunk(
+      selected->weight_type, weight_source.data(), weight_record.data(), 0, 1,
+      weight_block_elements, importance.data());
+  const auto *activation_traits =
+      ggml_get_type_traits_cpu(selected->activation_type);
+  if (encoded_bytes != weight_record_bytes || activation_traits == nullptr ||
+      activation_traits->from_float == nullptr) {
+    std::fprintf(stderr, "failed to construct valid encoded input for %s\n",
+                 argv[1]);
+    return 1;
   }
-  if (input_attempt < 0) {
-    std::fprintf(stderr, "failed to generate finite random encoded data\n");
+  activation_traits->from_float(activation_source.data(),
+                                activation_record.data(),
+                                weight_block_elements);
+
+  float record_output = 0.0F;
+  ggml_cpu_init();
+  selected->dot(static_cast<int>(weight_block_elements), &record_output, 0,
+                weight_record.data(), 0, activation_record.data(), 0, 1);
+  if (!std::isfinite(record_output)) {
+    std::fprintf(stderr, "valid encoded input produced a non-finite result\n");
     return 1;
   }
 
@@ -254,9 +268,7 @@ int main(int argc, char **argv) {
   std::printf("M=1\nN=%zu\nK=%zu\n", kN, kK);
   std::printf("vlen_bits=%d\n", vlen_bytes * 8);
   std::printf("cold_protocol=64MiB-evict-then-full-projection\n");
-  std::printf("input_policy=finite-random-record-replicated\n");
-  std::printf("input_seed=%u\ninput_attempt=%d\n", input_seed,
-              input_attempt);
+  std::printf("input_policy=valid-quantized-record-replicated\n");
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_gop_s=%.6f\n", operations / cold_median_us / 1.0e3);

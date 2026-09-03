@@ -1,4 +1,5 @@
 #include "ggml-quants.h"
+#include "ggml.h"
 #include "quants.h"
 
 #define GGML_COMMON_IMPL_C
@@ -12,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <vector>
 
 #ifndef WEFT_MUL_MAT_FORMAT
@@ -47,6 +47,17 @@ constexpr std::size_t kK = 4096;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 std::size_t runtimeM = 0;
 volatile std::uint64_t flushSink = 0;
+
+constexpr ggml_type kQuantizedWeightTypes[] = {
+    GGML_TYPE_Q1_0,    GGML_TYPE_Q4_0,   GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,    GGML_TYPE_Q5_1,   GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,    GGML_TYPE_Q6_K,   GGML_TYPE_IQ1_S,
+    GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_S,  GGML_TYPE_IQ2_XS,
+    GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S,  GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ4_XS, GGML_TYPE_TQ1_0,
+    GGML_TYPE_TQ2_0,   GGML_TYPE_MXFP4,  GGML_TYPE_NVFP4,
+};
 
 std::size_t parse_repetitions(const char *text) {
   char *end = nullptr;
@@ -737,38 +748,42 @@ int main(int argc, char **argv) {
   (void)fp4;
   (void)powers;
 
-  std::mt19937 generator(0x4d554c4dU + WEFT_MUL_MAT_FORMAT);
-  std::uniform_int_distribution<unsigned> bytes(0, 255);
+  static_assert(WEFT_MUL_MAT_FORMAT >= 1 && WEFT_MUL_MAT_FORMAT <= 24);
+  std::vector<float> weightSource(selected_wqk);
+  std::vector<float> importance(selected_wqk, 1.0F);
+  for (std::size_t index = 0; index < weightSource.size(); ++index)
+    weightSource[index] =
+        static_cast<float>(static_cast<int>(
+                               (index * 19U + WEFT_MUL_MAT_FORMAT * 7U) %
+                               127U) -
+                           63) /
+        13.0F;
   selected_weight weightRecord{};
   std::vector<selected_weight> weightRow(kK / selected_wqk);
   std::vector<float> expectedRows(runtimeM, 0.0f);
-  bool found = false;
-  int inputAttempt = -1;
-  for (int attempt = 0; attempt < 4096; ++attempt) {
-    auto *raw = reinterpret_cast<std::uint8_t *>(&weightRecord);
-    for (std::size_t index = 0; index < sizeof(selected_weight); ++index)
-      raw[index] = static_cast<std::uint8_t>(bytes(generator));
-    std::fill(weightRow.begin(), weightRow.end(), weightRecord);
-    found = true;
-    for (std::size_t row = 0; row < runtimeM; ++row) {
+  const std::size_t encodedBytes = ggml_quantize_chunk(
+      kQuantizedWeightTypes[WEFT_MUL_MAT_FORMAT - 1], weightSource.data(),
+      &weightRecord, 0, 1, selected_wqk, importance.data());
+  if (encodedBytes != sizeof(selected_weight)) {
+    std::fprintf(stderr, "failed to construct valid encoded weight record\n");
+    return 2;
+  }
+  std::fill(weightRow.begin(), weightRow.end(), weightRecord);
+  bool finite = true;
+  for (std::size_t row = 0; row < runtimeM; ++row) {
 #if WEFT_MUL_MAT_FORMAT == 9 &&                                                \
     (defined(WEFT_Q4_DERIVED) || defined(WEFT_Q4_STAGED))
-      expectedRows[row] = q4k_blocked_reference(
-          weightRow.data(), expected_workspace.data() + row * kK / selected_xqk);
+    expectedRows[row] = q4k_blocked_reference(
+        weightRow.data(), expected_workspace.data() + row * kK / selected_xqk);
 #else
-      selected_reference(kK, &expectedRows[row], 0, weightRow.data(), 0,
-                         expected_workspace.data() + row * kK / selected_xqk,
-                         0, 1);
+    selected_reference(kK, &expectedRows[row], 0, weightRow.data(), 0,
+                       expected_workspace.data() + row * kK / selected_xqk, 0,
+                       1);
 #endif
-      found = found && __builtin_isfinite(expectedRows[row]);
-    }
-    if (found) {
-      inputAttempt = attempt;
-      break;
-    }
+    finite = finite && __builtin_isfinite(expectedRows[row]);
   }
-  if (!found) {
-    std::fprintf(stderr, "failed to generate finite random encoded weights\n");
+  if (!finite) {
+    std::fprintf(stderr, "valid encoded input produced a non-finite result\n");
     return 2;
   }
   std::vector<selected_weight> weights(kN * weightRow.size());
@@ -824,9 +839,7 @@ int main(int argc, char **argv) {
 #if WEFT_MUL_MAT_FORMAT == 0
   std::printf("input_policy=dense-fixed-values\n");
 #else
-  std::printf("input_policy=finite-random-record-replicated\n");
-  std::printf("input_seed=%u\ninput_attempt=%d\n",
-              0x4d554c4dU + WEFT_MUL_MAT_FORMAT, inputAttempt);
+  std::printf("input_policy=valid-quantized-record-replicated\n");
 #endif
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",

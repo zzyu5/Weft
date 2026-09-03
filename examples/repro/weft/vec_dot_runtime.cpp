@@ -1,3 +1,5 @@
+#include "ggml-quants.h"
+#include "ggml.h"
 #include "quants.h"
 
 #define GGML_COMMON_IMPL_C
@@ -11,7 +13,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <vector>
 
 #ifndef WEFT_VEC_DOT_FORMAT
@@ -45,6 +46,35 @@ constexpr int kElements = 4096;
 constexpr std::size_t kRows = 14336;
 constexpr std::size_t kFlushBytes = 64U * 1024U * 1024U;
 volatile std::uint64_t flushSink = 0;
+
+constexpr ggml_type kWeightTypes[] = {
+    GGML_TYPE_Q1_0,    GGML_TYPE_Q4_0,   GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,    GGML_TYPE_Q5_1,   GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,    GGML_TYPE_Q6_K,   GGML_TYPE_IQ1_S,
+    GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_S,  GGML_TYPE_IQ2_XS,
+    GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S,  GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ4_XS, GGML_TYPE_TQ1_0,
+    GGML_TYPE_TQ2_0,   GGML_TYPE_MXFP4,  GGML_TYPE_NVFP4,
+};
+
+[[maybe_unused]] void quantize_activation(const float *source,
+                                          block_q8_0 *destination,
+                                          std::int64_t count) {
+  quantize_row_q8_0_ref(source, destination, count);
+}
+
+[[maybe_unused]] void quantize_activation(const float *source,
+                                          block_q8_1 *destination,
+                                          std::int64_t count) {
+  quantize_row_q8_1_ref(source, destination, count);
+}
+
+[[maybe_unused]] void quantize_activation(const float *source,
+                                          block_q8_K *destination,
+                                          std::int64_t count) {
+  quantize_row_q8_K_ref(source, destination, count);
+}
 
 std::size_t parse_repetitions(const char *text) {
   char *end = nullptr;
@@ -351,33 +381,38 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::mt19937 generator(0x56444f54U + WEFT_VEC_DOT_FORMAT);
-  std::uniform_int_distribution<unsigned> bytes(0, 255);
+  static_assert(WEFT_VEC_DOT_FORMAT >= 0 && WEFT_VEC_DOT_FORMAT < 24);
+  std::vector<float> weightSource(selected_wqk);
+  std::vector<float> activationSource(selected_wqk);
+  std::vector<float> importance(selected_wqk, 1.0F);
+  for (std::size_t index = 0; index < weightSource.size(); ++index) {
+    weightSource[index] =
+        static_cast<float>(static_cast<int>(
+                               (index * 19U + WEFT_VEC_DOT_FORMAT * 7U) %
+                               127U) -
+                           63) /
+        13.0F;
+    activationSource[index] =
+        static_cast<float>(static_cast<int>((index * 37U) % 251U) - 125) /
+        17.0F;
+  }
   selected_weight weightRecord{};
   std::vector<selected_activation> activationRecord(selected_wqk /
-                                                       selected_xqk);
-  float recordExpected = 0.0f;
-  bool found = false;
-  int inputAttempt = -1;
-  for (int attempt = 0; attempt < 4096; ++attempt) {
-    auto *weight_bytes = reinterpret_cast<std::uint8_t *>(&weightRecord);
-    auto *activation_bytes =
-        reinterpret_cast<std::uint8_t *>(activationRecord.data());
-    for (std::size_t i = 0; i < sizeof(selected_weight); ++i)
-      weight_bytes[i] = static_cast<std::uint8_t>(bytes(generator));
-    for (std::size_t i = 0;
-         i < activationRecord.size() * sizeof(selected_activation); ++i)
-      activation_bytes[i] = static_cast<std::uint8_t>(bytes(generator));
-    selected_reference(selected_wqk, &recordExpected, 0, &weightRecord, 0,
-                       activationRecord.data(), 0, 1);
-    if (__builtin_isfinite(recordExpected)) {
-      found = true;
-      inputAttempt = attempt;
-      break;
-    }
+                                                     selected_xqk);
+  const std::size_t encodedBytes = ggml_quantize_chunk(
+      kWeightTypes[WEFT_VEC_DOT_FORMAT], weightSource.data(), &weightRecord, 0,
+      1, selected_wqk, importance.data());
+  quantize_activation(activationSource.data(), activationRecord.data(),
+                      selected_wqk);
+  if (encodedBytes != sizeof(selected_weight)) {
+    std::fprintf(stderr, "failed to construct valid encoded weight record\n");
+    return 2;
   }
-  if (!found) {
-    std::fprintf(stderr, "failed to generate finite random encoded data\n");
+  float recordExpected = 0.0f;
+  selected_reference(selected_wqk, &recordExpected, 0, &weightRecord, 0,
+                     activationRecord.data(), 0, 1);
+  if (!__builtin_isfinite(recordExpected)) {
+    std::fprintf(stderr, "valid encoded input produced a non-finite result\n");
     return 2;
   }
 
@@ -464,9 +499,7 @@ int main(int argc, char **argv) {
   const double operations = 2.0 * static_cast<double>(kRows) * kElements;
   std::printf("target=%s\nM=1\nN=%zu\nK=%d\n", kTarget, kRows,
               kElements);
-  std::printf("input_policy=finite-random-record-replicated\n");
-  std::printf("input_seed=%u\ninput_attempt=%d\n",
-              0x56444f54U + WEFT_VEC_DOT_FORMAT, inputAttempt);
+  std::printf("input_policy=valid-quantized-record-replicated\n");
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               maxAbsolute, maxRelative, repetitions);

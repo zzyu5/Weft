@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -193,8 +192,6 @@ int main(int argc, char **argv) {
       ggml_row_size(selected.format->type, kK);
   std::vector<std::uint8_t> weight_row(weight_row_bytes, 0);
   const char *input_policy = nullptr;
-  std::uint32_t input_seed = 0;
-  int input_attempt = 0;
   if (selected.format->type == GGML_TYPE_F32) {
     std::vector<float> dense_row(kK, 1.0F);
     std::memcpy(weight_row.data(), dense_row.data(), weight_row_bytes);
@@ -209,20 +206,11 @@ int main(int argc, char **argv) {
     }
     input_policy = "dense-fixed-values";
   } else {
-    const auto *weight_traits =
-        ggml_get_type_traits_cpu(selected.format->type);
-    const ggml_type activation_type =
-        weight_traits ? weight_traits->vec_dot_type : GGML_TYPE_COUNT;
-    const auto *activation_traits = activation_type != GGML_TYPE_COUNT
-                                        ? ggml_get_type_traits_cpu(activation_type)
-                                        : nullptr;
     const std::int64_t weight_block_elements =
         ggml_blck_size(selected.format->type);
     const std::size_t weight_record_bytes =
         ggml_type_size(selected.format->type);
-    if (!weight_traits || !weight_traits->vec_dot || !activation_traits ||
-        !activation_traits->from_float || weight_block_elements <= 0 ||
-        weight_record_bytes == 0 ||
+    if (weight_block_elements <= 0 || weight_record_bytes == 0 ||
         kK % static_cast<std::size_t>(weight_block_elements) != 0 ||
         weight_row_bytes % weight_record_bytes != 0) {
       std::fprintf(stderr, "incomplete quantized input contract for %s\n",
@@ -233,50 +221,34 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    const std::size_t activation_row_bytes =
-        ggml_row_size(activation_type, kK);
-    std::vector<std::uint8_t> quantized_activation(selected.m *
-                                                    activation_row_bytes);
-    for (std::size_t row = 0; row < selected.m; ++row)
-      activation_traits->from_float(
-          activation_values.data() + row * kK,
-          quantized_activation.data() + row * activation_row_bytes, kK);
-
-    input_seed = 0x4d554c4dU + static_cast<std::uint32_t>(
-                                      selected.format - formats - 1);
-    std::mt19937 generator(input_seed);
-    std::uniform_int_distribution<unsigned> bytes(0, 255);
+    const std::size_t input_case =
+        static_cast<std::size_t>(selected.format - formats - 1);
+    std::vector<float> weight_source(
+        static_cast<std::size_t>(weight_block_elements));
+    std::vector<float> importance(
+        static_cast<std::size_t>(weight_block_elements), 1.0F);
+    for (std::size_t index = 0; index < weight_source.size(); ++index)
+      weight_source[index] =
+          static_cast<float>(static_cast<int>(
+                                 (index * 19U + input_case * 7U) % 127U) -
+                             63) /
+          13.0F;
     std::vector<std::uint8_t> weight_record(weight_record_bytes);
-    std::vector<float> reference_rows(selected.m);
-    input_attempt = -1;
-    for (int attempt = 0; attempt < 4096; ++attempt) {
-      for (std::uint8_t &value : weight_record)
-        value = static_cast<std::uint8_t>(bytes(generator));
-      for (std::size_t offset = 0; offset < weight_row.size();
-           offset += weight_record.size())
-        std::memcpy(weight_row.data() + offset, weight_record.data(),
-                    weight_record.size());
-      bool finite = true;
-      for (std::size_t row = 0; row < selected.m; ++row) {
-        weight_traits->vec_dot(
-            static_cast<int>(kK), &reference_rows[row], 0,
-            weight_row.data(), 0,
-            quantized_activation.data() + row * activation_row_bytes, 0, 1);
-        finite = finite && std::isfinite(reference_rows[row]);
-      }
-      if (finite) {
-        input_attempt = attempt;
-        break;
-      }
-    }
-    if (input_attempt < 0) {
-      std::fprintf(stderr, "failed to generate finite random encoded weights\n");
+    const std::size_t encoded_bytes = ggml_quantize_chunk(
+        selected.format->type, weight_source.data(), weight_record.data(), 0,
+        1, weight_block_elements, importance.data());
+    if (encoded_bytes != weight_record_bytes) {
+      std::fprintf(stderr, "failed to construct valid encoded weights\n");
       ggml_backend_buffer_free(buffer);
       ggml_backend_free(backend);
       ggml_free(ctx);
       return 1;
     }
-    input_policy = "finite-random-record-replicated";
+    for (std::size_t offset = 0; offset < weight_row.size();
+         offset += weight_record.size())
+      std::memcpy(weight_row.data() + offset, weight_record.data(),
+                  weight_record.size());
+    input_policy = "valid-quantized-record-replicated";
   }
   for (std::size_t row = 0; row < kN; ++row) {
     ggml_backend_tensor_set(weight, weight_row.data(), row * weight_row_bytes,
@@ -345,9 +317,6 @@ int main(int argc, char **argv) {
   std::printf("vlen_bits=%d\n", ggml_cpu_get_rvv_vlen() * 8);
   std::printf("cold_protocol=64MiB-evict-then-single-op-graph\n");
   std::printf("input_policy=%s\n", input_policy);
-  if (input_seed != 0)
-    std::printf("input_seed=%u\ninput_attempt=%d\n", input_seed,
-                input_attempt);
   std::printf("repetitions=%zu\n", repetitions);
   std::printf("cold_median_us=%.3f\n", cold_median_us);
   std::printf("cold_gop_s=%.6f\n", operations / cold_median_us / 1.0e3);
