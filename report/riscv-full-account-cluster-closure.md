@@ -249,7 +249,7 @@ whole-loop-read-only边界，没有假设尚不存在的精确 alias证明。
 
 第二输入静态检查中，Q2_K新增3个 preheader scalar materialization、Q3_K新增2个；Q2_K的既有
 local bytes/peak仍为32/18，三次短跑为 SG 6.335/6.218、K1 3.443/3.414 GOP/s（standalone/decode），
-与全量账处在同一档，没有用 Q1收益掩盖横向退化。Q3_K的实际收益留给下一簇判定，不在这里宣称。
+与全量账处在同一档，没有用 Q1收益掩盖横向退化。Q3_K的实际收益在第5节单独闭合。
 
 ### 4.2 参数与十次真机结果
 
@@ -272,3 +272,80 @@ signed leaves，不改变作者树或 reduction结构。
 production runner已记录的 physical auto binding。合计96/96可生成、独立parse/verify，并安全运行
 canonicalizer、CSE、layout canonicalization、Share两次与final verifier；同一流水第二次文本
 diff为0。
+
+## 5. Q3_K single-output grouped/layered supply
+
+### 5.1 七步工作账与实现前预测
+
+Q3_K 的 shaped 作者树和 contraction topology已经闭合。SG final IR中的product shape为
+`[plane=4, scale_part=2, lane=16]`：plane骑register replica，scale-part与lane共同形成32-lane
+carrier；随后依次是`rvv_partial_set → repack → reduce → scale_combine → finalize`。vector peak为
+17 groups，local storage为0。K1采用同一作者树，vector peak为9 groups、local storage为0。
+
+生成代码每个128-element half做4次`vle8`、2次`vwmul`和8次`vwredsum`；没有slide、gather或
+spill。和GGML donor逐段核对后，数学乘法、reduction topology和scale extraction数量处于同一档，
+剩余最显眼差异是SG donor在Q3 raw window前有`lb zero,31(q3)`，而Weft直接进入vector load。
+Q8侧的dummy read与scale/reduction重排是否有收益，先用临时C逐项隔离，没有直接写pass。
+
+实现前工作账如下；数字均为SG standalone vec-dot的同批短测，临时代码未保留：
+
+| 变体 | GOP/s | 相对2.878 | 静态变化 | 结论 |
+|---|---:|---:|---|---|
+| 当前生成物 | 2.878 | 1.000× | 基线 | — |
+| 空memory barrier | 2.848 | 0.990× | 不增加memory read | 排除纯编译器屏障 |
+| `__builtin_prefetch` / `prefetch.r` | 2.845 | 0.989× | 每block增加8次generic prefetch | 排除通用prefetch拼写 |
+| scale提前到reduction之前 | 2.842 | 0.987× | 指令数不变，只改issue order | 排除scale/reduce交错 |
+| 只读Q8 edge | 2.829 | 0.983× | 每half增加Q8 scalar read | 排除Q8流 |
+| 只读Q3 window末端 | 7.543 | 2.621× | 每half增加1次`lb zero,31` | 唯一正向局部关系 |
+| 读Q3 window起点 | 7.239 | 2.515× | 每half增加1次`lb zero,0` | 有收益但弱于末端 |
+
+第二输入与反例在实现前一并测量：Q2_K同一类grouped/layered partial supply从约6.237提升到
+8.107 GOP/s；Q6_K加入donor式18次touch从5.091降到3.955，压缩为少量touch仍降到4.175；
+K1 Q3_K从2.867降到2.766。由此预测不是“packed load都要prime”的结构规则，而是一个有限
+physical parameter：只有已经闭合、单window、送入partial set的grouped/layered memory edge才是
+合法对象；tuner分别决定开或关。预期IR变化只有load op的exact leaf，C中增加一次scalar byte
+read，vector load/MAC/reduction/slide和vector/local resource计数全部不变。它不改logical value、
+Level、widening或artifact。
+
+Triton `Prefetch.cpp:164-199,469-519,522-562` 会建立memdesc/token loop carries并重写下一iteration
+的producer，TileLang `pipeline_planning.cc:406-445,634-855`以buffer region和scalar def-use分配
+stage。这里没有future iteration、distance、buffer version或新增SSA，直接套两者会制造一个并不
+存在的pipeline。保留的机制因此是同一memory edge上的closed local leaf，而不是generic prefetch。
+
+### 5.2 Physical IR 与静态结果
+
+新增boolean physical binding `scalar-load-prime`。`FinalizeRISCVLeaves`之后的独立pass只沿
+同block、单result、pure use-def查找送入`rvv_partial_set`的第一个grouped/layered storage edge；
+replica load还必须只有一个raw window。pass把已经闭合的vector-load leaf替换为
+`*.scalar-prime`，启用但没有合法edge时candidate失败。默认关闭；pass和emitter都不读取target、
+kernel或format名称。
+
+terminal translator只拼写“对同一raw window最后一个active byte执行有序`lb`，再发原vector
+load”。Q3 final IR中其它op逐字不变，C中恰好1处`lb zero`；Clang展开两个half后汇编中为2处。
+最终汇编仍有8次`vle8`、16次`vwredsum`，无slide/gather/spill；vector peak仍为17，local仍为0。
+SG production binding在Q3/Q2上启用，Q6与两台K1 binding保持关闭。
+
+### 5.3 双机十次真机结果
+
+| target | entry | 修改前 | 修改后 | source | Weft/source | numeric |
+|---|---|---:|---:|---:|---:|---|
+| SG2044 | Q3 standalone vec-dot | 2.796738 | 7.539297 | 7.489920 | 1.007× | within-tolerance，abs `0.0029296875` |
+| SG2044 | Q3 MUL_MAT decode | 2.825398 | 7.603906 | 7.214206 | 1.054× | within-tolerance，abs `7.62939453e-05` |
+| K1 | Q3 standalone vec-dot | 2.895601 | 2.873894 | 2.435477 | 1.180× | within-tolerance，abs `0.0029296875` |
+| K1 | Q3 MUL_MAT decode | 2.895763 | 2.881587 | 2.391775 | 1.205× | within-tolerance，abs `7.62939453e-05` |
+
+Q3 standalone/decode在SG同步过线；K1保持未启用参数的同一档并继续过线。独立横向正例Q2_K
+在SG为standalone `8.130436/9.460538=0.859×`、decode
+`8.214989/9.337415=0.880×`；相对当轮无prime生成物约提升30%，但Q2本身尚未过线，不能把该
+收益写成Q2 closure。Q6关闭参数后的单次回归为5.151596 GOP/s，数值正确；其负实验不进入CSV。
+
+这项结果落在P3 memory-leaf selection与局部load-latency的边界。它增加一条指令而不是减少工作，
+所以不冒充P0/P2收益；它也没有P5所要求的跨iteration schedule。实现价值由“同一closed edge的
+一条scalar read使Q3和Q2真机critical path下降、Q6/K1反向”这个可实测parameter域给出。
+
+### 5.4 机械验收
+
+24 row-dequant + 24 vec-dot × 2 targets共96份既有Physical IR全部用当前`weft-opt`独立parse/
+verify，安全运行canonicalizer、CSE、layout canonicalization、Share两次与final verifier；同一
+流水第二次运行96/96文本diff为0。显式启用参数但没有合法storage edge的module会明确失败，
+不会静默当作关闭。构建通过`cmake --build build -j2`自然重链接`weft-compile`和`weft-opt`。

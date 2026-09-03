@@ -273,6 +273,10 @@ write/unknown effect 还没有 predication/ordering 合同，会明确拒绝。a
 多于两个 buffer、显式 local-storage ping-pong 和非零 prefetch 尚未形成合法 physical
 program，不能仅通过设置参数声称支持。
 
+同一iteration内，闭合grouped/layered raw window可以选择一个target-local
+`scalar-prime + vector-load` leaf。它只改变该memory edge的有限指令拼写，不读取下一iteration，
+也没有distance、buffer version或跨stage SSA，因此不属于本节的software prefetch。
+
 ## 12. Resource model
 
 每份完整物理参数绑定都必须计算同时 live 的：
@@ -302,7 +306,11 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 
 ### 13.3 参数性选择
 
-结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count 和 prefetch distance。target 提供有限合法域，tuner 通过实测选择；非法绑定在 emission 前拒绝。当前RISC-V compiler API暴露 LMUL、unroll 和pipeline depth；depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
+结构固定后的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth、buffer count、
+local memory-leaf variant和prefetch distance。target提供有限合法域，tuner通过实测选择；非法绑定
+在emission前拒绝。当前RISC-V compiler API暴露LMUL、unroll、pipeline depth和boolean
+scalar-load-prime；后者只适用于已经证明为单window grouped/layered partial supply的local leaf。
+depth=2固定导出两个buffer，prefetch固定为0，后二者还不是独立可调域。
 
 ## 14. Target profile
 

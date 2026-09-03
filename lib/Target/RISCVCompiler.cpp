@@ -17,6 +17,7 @@ namespace {
 mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
                                        weft::RISCVCompilerOptions options) {
   const int64_t lmulEighths = options.lmulEighths;
+  const bool scalarLoadPrime = options.scalarLoadPrime != 0;
   module.getContext()->getOrLoadDialect<mlir::arith::ArithDialect>();
   module.getContext()->getOrLoadDialect<mlir::scf::SCFDialect>();
   module.getContext()->getOrLoadDialect<weft::riscv::WEFTRISCVDialect>();
@@ -76,6 +77,8 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   // finalization.
   manager.addPass(weft::createSelectRISCVOperationsPass());
   manager.addPass(weft::createFinalizeRISCVLeavesPass());
+  manager.addPass(
+      weft::createSelectRISCVScalarLoadPrimesPass(scalarLoadPrime));
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createVerifyFinalRISCVPass());

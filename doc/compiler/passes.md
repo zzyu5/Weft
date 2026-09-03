@@ -35,6 +35,7 @@ ConvertWeftToRISCV
 → HoistRISCVLoopInvariants
 → SelectRISCVOperations
 → FinalizeRISCVLeaves
+→ SelectRISCVScalarLoadPrimes
 → MaterializeRISCVResources
 → EliminateDeadRISCVLayouts
 → VerifyFinalRISCV
@@ -241,6 +242,19 @@ reduce、state transfer等仍未闭合的 operation写入 exact instruction/spel
 `LowerRISCVComposites`新建的window step、RVV contract step、fragment和layout-conversion op在
 创建时已有自己的exact leaf；本pass只终结仍保留generic operation的那一组。两者作用于互斥的
 physical op集合，不为同一个operation重复选择instruction。
+
+### `SelectRISCVScalarLoadPrimes`
+
+该pass消费已经实例化的boolean physical parameter，并且只在`FinalizeRISCVLeaves`之后运行。
+启用时，它在每个physical loop中沿单result、pure、同block use-def查找第一个送入
+`rvv_partial_set`的grouped/layered storage edge。合法edge必须已经具有完整window plan、exact
+vector-load leaf；`rvv_replica_storage_load`还必须只有一个source window。pass把该op的leaf改为
+对应的`scalar-prime` form，不改变type、SSA、control或storage geometry。启用但整个module没有
+合法edge时当前candidate失败，而不是把参数静默当成零。
+
+这个leaf固定为同一raw window末端的一次有序scalar byte read加原vector load。它是有限的局部
+memory spelling，不携带future-iteration、distance、buffer或pipeline schedule；若需要跨iteration
+prefetch，必须先在RISC-V IR中建立真实producer/carry/control，不能扩展本pass暗做。
 
 ### `MaterializeRISCVResources`
 

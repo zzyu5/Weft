@@ -61,6 +61,11 @@ llvm::cl::opt<int64_t> autoPipelineDepth(
     "auto-pipeline-depth",
     llvm::cl::desc("Instantiated Level-local pipeline-depth binding"),
     llvm::cl::init(1));
+llvm::cl::opt<int64_t> autoScalarLoadPrime(
+    "auto-scalar-load-prime",
+    llvm::cl::desc(
+        "Instantiated target-local scalar-prime memory-leaf binding (0 or 1)"),
+    llvm::cl::init(0));
 
 bool parseMetaBindings(
     llvm::StringMap<int64_t> &result) {
@@ -156,15 +161,17 @@ int main(int argc, char **argv) {
     }
     if (!parseMetaBindings(options.metaBindings))
       return 1;
-    if (autoUnroll <= 0 || autoPipelineDepth <= 0 || autoPipelineDepth > 2) {
+    if (autoUnroll <= 0 || autoPipelineDepth <= 0 || autoPipelineDepth > 2 ||
+        (autoScalarLoadPrime != 0 && autoScalarLoadPrime != 1)) {
       llvm::errs()
           << "--auto-unroll must be positive and --auto-pipeline-depth must "
-             "be 1 or 2\n";
+             "be 1 or 2; --auto-scalar-load-prime must be 0 or 1\n";
       return 1;
     }
     options.lmulEighths = autoLMULEighths;
     options.unroll = autoUnroll;
     options.pipelineDepth = autoPipelineDepth;
+    options.scalarLoadPrime = autoScalarLoadPrime;
     if (emitKind == "riscv-ir") {
       mlir::FailureOr<weft::RISCVPhysicalizationResult> result =
           weft::physicalizeRISCVModule(*module, std::move(options));

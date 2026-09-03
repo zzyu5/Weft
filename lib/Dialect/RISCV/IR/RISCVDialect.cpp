@@ -6747,8 +6747,10 @@ mlir::LogicalResult RVVLayeredStorageLoadOp::verify() {
                                             plan.getReductionAxis() ||
       window.getLayers() != layers ||
       window.getWindowsPerLayer() != layer / lanes ||
-      !exactLeaf(getLeaf(), "rvv", "layered-storage-load",
-                 "rvv.layered-storage-load", "none", tail))
+      (!exactLeaf(getLeaf(), "rvv", "layered-storage-load",
+                  "rvv.layered-storage-load", "none", tail) &&
+       !exactLeaf(getLeaf(), "rvv", "layered-storage-load",
+                  "rvv.layered-storage-load.scalar-prime", "none", tail)))
     return emitOpError(
         "layered storage load requires one grouped/layered field and closed byte-window geometry");
   return mlir::success();
@@ -6841,6 +6843,12 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       sourceField ? localPackInterleaveRows(sourceField.getOwner()) : 0;
   if (interleave <= 0 && sourceField)
     interleave = derivedInterleaveRows(*this, ownerEncoding);
+  const bool exactBaseLeaf =
+      exactLeaf(getLeaf(), "rvv", "replica-storage-load", instruction,
+                "none", tail);
+  const bool exactScalarPrimeLeaf = exactLeaf(
+      getLeaf(), "rvv", "replica-storage-load",
+      (instruction + ".scalar-prime").str(), "none", tail);
   if (!sourceField || !storageLoad || !memory ||
       !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
       fieldBits <= 0 || (fieldInteger && fieldInteger.isSignless()) || !scalarBase ||
@@ -6872,8 +6880,9 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       getMaskValueForPart().size() != static_cast<size_t>(*parts) ||
       (!natural && !strided && !layered && !interleaved) ||
       (validity != "full" && validity != "tail") ||
-      !exactLeaf(getLeaf(), "rvv", "replica-storage-load", instruction, "none",
-                 tail))
+      (!exactBaseLeaf && !exactScalarPrimeLeaf) ||
+      (exactScalarPrimeLeaf &&
+       (!layered || getWindowOffsets().size() != 1)))
     return emitOpError()
            << "replica storage load requires one scalar base and a closed field-to-register window map; field="
            << field << ", result=" << result << ", source_field="

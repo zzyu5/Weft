@@ -10005,7 +10005,10 @@ mlir::LogicalResult Emitter::compileRVVLayeredRecordLoad(
 
 mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
     riscv::RVVLayeredStorageLoadOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.layered-storage-load")
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool scalarPrime =
+      instruction == "rvv.layered-storage-load.scalar-prime";
+  if (instruction != "rvv.layered-storage-load" && !scalarPrime)
     return fail(operation,
                 "RVV layered storage load has no exact selected leaf");
   Binding fieldBinding = bindings.lookup(operation.getField());
@@ -10115,6 +10118,10 @@ mlir::LogicalResult Emitter::compileRVVLayeredStorageLoad(
     const std::string byte =
         "(" + std::to_string(plan.getByteOffset()) + " + " + groupIndex +
         " * " + std::to_string(layer) + " + " + within + ")";
+    if (scalarPrime)
+      line("__asm__ volatile(\"lb zero, " + std::to_string(lanes - 1) +
+           "(%0)\" : : \"r\"((const uint8_t *)(" + record + " + " +
+           byte + ")) : \"memory\");");
     std::string raw = fresh("layered_window_raw");
     line(type + " " + raw + " = __riscv_vle8_v_" + suffix +
          "((const uint8_t *)(" + record + " + " + byte + "), " +
@@ -10203,7 +10210,9 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
       : interleavedNatural
           ? "rvv.replica-storage-load.interleaved-natural"
           : "rvv.replica-storage-load.interleaved-joined";
-  if (instructionOf(operation.getOperation()) != expected)
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  const bool scalarPrime = instruction == expected + ".scalar-prime";
+  if (instruction != expected && !scalarPrime)
     return fail(operation,
                 "RVV replica storage load has no exact selected leaf");
   Binding fieldBinding = bindings.lookup(operation.getField());
@@ -10466,6 +10475,20 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
                                    std::to_string(group) + ")";
     const std::string withinLayer = "((" + logicalBase.scalar + ") % " +
                                     std::to_string(layer) + ")";
+    if (scalarPrime) {
+      auto record = recordForWindow(0);
+      if (!record)
+        return fail(operation,
+                    "scalar-prime replica storage window has no record coordinate");
+      const int64_t offset = operation.getWindowOffsets()[0];
+      const std::string byte =
+          "(" + std::to_string(plan.getByteOffset()) + " + " + groupIndex +
+          " * " + std::to_string(layer) + " + " + withinLayer + " + " +
+          std::to_string(offset) + ")";
+      line("__asm__ volatile(\"lb zero, " + std::to_string(lanes - 1) +
+           "(%0)\" : : \"r\"((const uint8_t *)(" + *record + " + " +
+           byte + ")) : \"memory\");");
+    }
     for (auto [window, offset] :
          llvm::enumerate(operation.getWindowOffsets())) {
       auto record = recordForWindow(window);

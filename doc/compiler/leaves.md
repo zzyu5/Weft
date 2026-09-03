@@ -40,6 +40,12 @@ split/merge/slide/splat/extract；translator实现该映射不等于重新推导
 spill/reload必须具有exact transfer leaf、typed local slot和完整value layout；translator不能仅凭
 binding kind自行选择一条隐藏路径。
 
+一个已经选定的grouped/layered byte-window load可以使用固定的
+`scalar-prime + vector-load` leaf。其op必须只含一个raw window，logical base、byte offset、active
+lane数和vector load form均已闭合；translator只把“读取最后一个active byte，再发原vector load”
+拼成两条有序指令。该leaf没有跨iteration对象、distance、buffer或额外result，不能冒充通用
+prefetch，也不能由translator临时加到普通load上。
+
 ## 3. IME / opaque asm leaf
 
 IME capability和operations共同固定：
@@ -67,7 +73,8 @@ VLEN256的IME1 target当前均是明确unsupported，不会由terminal translato
 1. `SelectRISCVOperations`只选择局部structural family；
 2. layout、memory与composite passes把representation和真实control闭合；
 3. `FinalizeRISCVLeaves`为尚未终结的普通op写唯一exact instruction；
-4. resource pass补全leaf resource counts，final verifier核对整个合同。
+4. 已实例化的local memory-leaf参数可以在完整storage/use relation上改写exact leaf；
+5. resource pass补全leaf resource counts，final verifier核对整个合同。
 
 leaf/capability集合不按kernel、operator或量化格式注册。无合法leaf、packing/access不完整、
 toolchain不支持spelling、resource/effect不闭合时当前module失败；不能回到emitter重选、静默

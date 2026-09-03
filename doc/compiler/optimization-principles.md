@@ -315,6 +315,9 @@ versions、prologue/epilogue占比、spill变化。只看到`pipeline_depth=2`�
 SSA version与prologue/steady/epilogue展开。只实现distance=1、depth=2/buffer=2；没有typed
 transfer和latency事实时，prefetch保持不存在，而不是设一个非零默认值。
 
+同一raw window上的scalar-prime leaf不构成上述prefetch：它没有future-iteration、distance、
+buffer version或新增SSA，只是一个由完整memory edge和实测parameter共同选择的固定局部序列。
+
 Triton `SoftwarePipeliner.cpp:21-27` 同样分schedule与expander；
 `LowerLoops.cpp:49-117`、`AssignLatencies.cpp:172-231`读取async能力、shared encoding、use
 distance、mask与MMA wait约束。TileLang `pipeline_planning.cc:1083-1337`读取source stage/order

@@ -272,6 +272,9 @@ else
   elif [[ ${format} == q2_k ]]; then
     if [[ ${phase} == decode ]]; then
       physical=(--auto-unroll=8 --auto-pipeline-depth=1)
+      if [[ ${target} == sg2044 ]]; then
+        physical+=(--auto-scalar-load-prime=1)
+      fi
       runtime_kernel_define=-DWEFT_Q2K_DECODE=1
       kernel=production_mul_mat_q2_k_decode
     else
@@ -282,7 +285,7 @@ else
   elif [[ ${format} == q3_k ]]; then
     if [[ ${phase} == decode ]]; then
       if [[ ${target} == sg2044 ]]; then
-        physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+        physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1 --auto-scalar-load-prime=1)
       else
         physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
       fi
@@ -437,6 +440,8 @@ fi
   set_physical_option auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}"
 [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] &&
   set_physical_option auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}"
+[[ -n ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]] &&
+  set_physical_option auto-scalar-load-prime "${WEFT_AUTO_SCALAR_LOAD_PRIME}"
 PYTHONPATH="${project_root}/python" python -m weft \
   "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \

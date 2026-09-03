@@ -37,6 +37,9 @@ fi
 if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
   physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
 fi
+if [[ -n ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
+  physical_auto+=(--auto-scalar-load-prime "${WEFT_AUTO_SCALAR_LOAD_PRIME}")
+fi
 if [[ ${format} == q1_0 ]]; then
   if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
     if [[ ${target} == sg2044 ]]; then
@@ -73,6 +76,9 @@ if [[ ${format} == q3_k ]]; then
   [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
     physical_auto+=(--auto-pipeline-depth 1)
+  if [[ ${target} == sg2044 && -z ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
+    physical_auto+=(--auto-scalar-load-prime 1)
+  fi
 fi
 if [[ ${format} == q5_0 || ${format} == q5_1 ]]; then
   if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
@@ -90,6 +96,9 @@ if [[ ${format} == q2_k ]]; then
   [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
   [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
     physical_auto+=(--auto-pipeline-depth 1)
+  if [[ ${target} == sg2044 && -z ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
+    physical_auto+=(--auto-scalar-load-prime 1)
+  fi
 fi
 if [[ ${format} == iq2_xs ]]; then
   if [[ ${target} == sg2044 ]]; then

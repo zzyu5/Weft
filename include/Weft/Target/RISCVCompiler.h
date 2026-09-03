@@ -18,6 +18,7 @@ struct RISCVCompilerOptions {
   int64_t lmulEighths = 8;
   int64_t unroll = 1;
   int64_t pipelineDepth = 1;
+  int64_t scalarLoadPrime = 0;
 };
 
 struct RISCVPhysicalizationResult {

@@ -59,6 +59,13 @@ natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示�
 leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
 两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
 
+对一个已经闭合、只有一个raw byte window的grouped/layered load，physical parameter可以把
+exact leaf选为`scalar-prime + vector-load`：先对该window中最后一个active byte执行一次有序的
+scalar byte read，再执行原来已经选定的vector load。这个选择直接写在load op的`LeafAttr`中；
+未选择时仍是原来的单vector-load leaf。它不读取未来iteration、不产生SSA result、不建立buffer
+version，也不改变window、carrier或control，因此不是prefetch/pipeline。多window edge若没有显式
+给出prime对象则非法，terminal emitter不能自行挑一个window。
+
 当 target 的固定 record-axis 优先级选择跨 Level instance 的 lane cohort 时，
 `RecordCohortType` 将一个 physical point、静态 Level partition 与 cohort width 绑定为同一坐标
 实体。`rvv_record_storage_load` 明确保存 source field、cohort、storage unit、record byte stride
