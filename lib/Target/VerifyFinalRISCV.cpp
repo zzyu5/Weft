@@ -9,8 +9,10 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <algorithm>
 #include <memory>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 
@@ -425,6 +427,7 @@ public:
       if (auto field = mlir::dyn_cast<riscv::FieldOp>(operation)) {
         auto access = field.getAccess();
         auto leaf = field.getLeaf();
+        const auto facts = riscv_internal::fieldFacts(field);
         if (!access || access.getMapping() == "opaque" ||
             leaf.getEngine() != "transfer" ||
             leaf.getFamily() != "encoded-field" ||
@@ -432,6 +435,43 @@ public:
                 ("rvv.encoded." + access.getMapping()).str()) {
           field.emitError(
               "final encoded field has no closed storage mapping and transfer leaf");
+          failed = true;
+        }
+        if (access && access.getAlignment() > facts.alignment) {
+          field.emitError(
+              "final encoded field overstates its declared base-plus-offset alignment");
+          failed = true;
+        }
+        auto value = mlir::dyn_cast<riscv::ValueType>(field.getResult().getType());
+        const unsigned elementBits =
+            value ? riscv_internal::logicalBitWidth(value.getElementType()) : 0;
+        if (access && value && value.getLayout().getCarrier() == "rvv" &&
+            access.getMapping() == "natural" && elementBits > 8 &&
+            elementBits % 8 == 0 &&
+            access.getAlignment() < static_cast<int64_t>(elementBits / 8)) {
+          field.emitError(
+              "final natural RVV field requires a typed byte-load operation for its proven alignment");
+          failed = true;
+        }
+      }
+      if (auto entry =
+              mlir::dyn_cast<riscv::RVVIndexedEntryLoadOp>(operation)) {
+        int64_t sourceAlignment = 1;
+        if (auto field = riscv_internal::sourceField(entry.getSource()))
+          sourceAlignment = riscv_internal::fieldFacts(field).alignment;
+        else if (auto load = riscv_internal::sourceLoad(entry.getSource()))
+          sourceAlignment = load.getRegion().getType().getAlignment();
+        else if (auto descriptor =
+                     mlir::dyn_cast<riscv::MemDescType>(entry.getSource().getType()))
+          sourceAlignment = descriptor.getAlignment();
+        const int64_t availableAlignment =
+            std::gcd(std::max<int64_t>(1, sourceAlignment),
+                     entry.getEntryByteStride());
+        if (entry.getAccess().getAlignment() > availableAlignment) {
+          entry.emitError(
+              "final indexed-entry load overstates source and entry-stride alignment")
+              << "; access_alignment=" << entry.getAccess().getAlignment()
+              << ", available_alignment=" << availableAlignment;
           failed = true;
         }
       }

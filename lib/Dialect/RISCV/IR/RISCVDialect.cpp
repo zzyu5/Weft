@@ -3880,11 +3880,16 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
     return emitOpError(
         "indexed entry load requires one natural entry-payload mapping");
   if (scalarEntries) {
+    const bool naturallyAligned =
+        getAccess().getAlignment() >= payloadElementBytes;
+    const llvm::StringRef instruction =
+        naturallyAligned ? "rvv.indexed-entry-load"
+                         : "rvv.indexed-entry-byte-load";
     if (getAccess().getForm() != "unit" ||
-        !exactLeaf(getLeaf(), "rvv", "indexed-entry-load",
-                   "rvv.indexed-entry-load", "none", "exact"))
+        !exactLeaf(getLeaf(), "rvv", "indexed-entry-load", instruction,
+                   "none", "exact"))
       return emitOpError(
-          "scalar indexed entries require one exact unit-payload RVV leaf");
+          "scalar indexed entries require one alignment-legal exact unit-payload RVV leaf");
   } else {
     const uint64_t packedBits =
         payloadBits * static_cast<uint64_t>(getPayloadExtent());
@@ -3901,6 +3906,7 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
           "RVV indexed entries require one exact contiguous-entry gather leaf")
              << "; entry_byte_stride=" << getEntryByteStride()
              << ", payload_extent=" << getPayloadExtent()
+             << ", access=" << getAccess() << ", leaf=" << getLeaf()
              << ", offset_type=" << offsets << ", result_type=" << result;
   }
   return verifyLeafOperation(*this);

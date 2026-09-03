@@ -388,6 +388,8 @@ bool supportsIndexedEntryLoad(const IndexedEntryLoadPlan &plan,
   // grouped/layered or joined storage owner instead of entering this path.
   if (!payloadBits || payloadBits % 8)
     return false;
+  if (bitOffset % 8)
+    return false;
   const uint64_t packedBits =
       payloadBits * static_cast<uint64_t>(plan.payloadExtent);
   auto resultAxes = result.getAxisIds().asArrayRef();
@@ -1392,6 +1394,40 @@ riscv::LeafAttr transferLeaf(mlir::Builder &builder, llvm::StringRef family,
                               instruction, 0, 0);
 }
 
+struct IndexedEntryPhysicalChoice {
+  riscv::AccessAttr access;
+  riscv::LeafAttr leaf;
+};
+
+IndexedEntryPhysicalChoice
+selectIndexedEntryPhysicalChoice(mlir::Builder &builder,
+                                 riscv::ValueType result,
+                                 bool vectorEntries,
+                                 int64_t sourceAlignment,
+                                 int64_t entryByteStride) {
+  const int64_t entryAlignment =
+      std::gcd(std::max<int64_t>(1, sourceAlignment), entryByteStride);
+  const unsigned payloadBits =
+      riscv_internal::logicalBitWidth(result.getElementType());
+  const int64_t payloadBytes =
+      payloadBits && payloadBits % 8 == 0
+          ? static_cast<int64_t>(payloadBits / 8)
+          : 0;
+  const bool byteLoad =
+      !vectorEntries && payloadBytes > 1 && entryAlignment < payloadBytes;
+  const llvm::StringRef family =
+      vectorEntries ? "indexed-entry-gather" : "indexed-entry-load";
+  const llvm::StringRef instruction =
+      vectorEntries ? "rvv.indexed-entry-gather"
+                    : byteLoad ? "rvv.indexed-entry-byte-load"
+                               : "rvv.indexed-entry-load";
+  return {
+      makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural",
+                 vectorEntries ? 1 : entryAlignment),
+      riscv_internal::leaf(builder, "rvv", family, instruction, instruction,
+                           0, 0)};
+}
+
 mlir::LogicalResult verifyAccessCapability(mlir::Operation *operation,
                                            riscv::AccessAttr access) {
   auto kernel = operation->getParentOfType<riscv::KernelOp>();
@@ -2233,10 +2269,17 @@ public:
           extract.getSelectors().size() != source.getAxisIds().size())
         continue;
 
-      auto sourceField = extract.getInput().getDefiningOp<riscv::FieldOp>();
+      auto sourceField = riscv_internal::sourceField(extract.getInput());
       const auto sourceFacts =
           sourceField ? riscv_internal::fieldFacts(sourceField)
                       : riscv_internal::FieldFacts();
+      int64_t sourceAlignment = sourceFacts.alignment;
+      int64_t sourceBitOffset = sourceFacts.bitOffset;
+      if (!sourceField)
+        if (auto load = riscv_internal::sourceLoad(extract.getInput())) {
+          sourceAlignment = load.getRegion().getType().getAlignment();
+          sourceBitOffset = 0;
+        }
       riscv::ConvertLayoutOp domainResultConversion;
       riscv::ValueType domainResult = result;
       if (result.getLayout().getCarrier() == "scalar" &&
@@ -2553,8 +2596,7 @@ public:
       }
       mlir::Type entryType = (*entryIndices).getType();
       if (!supportsIndexedEntryLoad(*plan, entryType, result,
-                                    sourceFacts.alignment,
-                                    sourceFacts.bitOffset)) {
+                                    sourceAlignment, sourceBitOffset)) {
         llvm::DenseSet<mlir::Operation *> visited;
         eraseDeadRegularIndexChain(*entryIndices, visited, rewriter);
         continue;
@@ -2576,19 +2618,14 @@ public:
       const bool vectorEntries = physicalEntryType &&
                                  physicalEntryType.getLayout().getCarrier() ==
                                      "rvv";
+      const IndexedEntryPhysicalChoice choice =
+          selectIndexedEntryPhysicalChoice(builder, result, vectorEntries,
+                                           sourceAlignment, *byteStride);
       auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
           extract.getLoc(), result, extract.getInput(), *entryOffsets,
           source.getAxisIds()[gatherDimension], plan->payloadAxis,
           plan->payloadExtent, *byteStride,
-          makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
-          riscv_internal::leaf(
-              builder, "rvv",
-              vectorEntries ? "indexed-entry-gather" : "indexed-entry-load",
-              vectorEntries ? "rvv.indexed-entry-gather"
-                            : "rvv.indexed-entry-load",
-              vectorEntries ? "rvv.indexed-entry-gather"
-                            : "rvv.indexed-entry-load",
-              0, 0));
+          choice.access, choice.leaf);
       riscv_internal::copyOrigin(extract, entryLoad);
       mlir::Value fullIndices = gatherIndex;
       extract.getResult().replaceAllUsesWith(entryLoad.getResult());
@@ -3141,21 +3178,15 @@ public:
       const bool vectorEntries = physicalEntryType &&
                                  physicalEntryType.getLayout().getCarrier() ==
                                      "rvv";
+      const IndexedEntryPhysicalChoice choice =
+          selectIndexedEntryPhysicalChoice(builder, resultType, vectorEntries,
+                                           alignment, *byteStride);
       auto entryLoad = rewriter.create<riscv::RVVIndexedEntryLoadOp>(
           operation.getLoc(), resultType,
           tableLoad ? tableLoad.getRegion() : operation.getTable(), *entryOffsets,
           sourceAxis, plan->payloadAxis,
           plan->payloadExtent,
-          *byteStride,
-          makeAccess(builder, vectorEntries ? "indexed" : "unit", "natural", 1),
-          riscv_internal::leaf(
-              builder, "rvv",
-              vectorEntries ? "indexed-entry-gather" : "indexed-entry-load",
-              vectorEntries ? "rvv.indexed-entry-gather"
-                            : "rvv.indexed-entry-load",
-              vectorEntries ? "rvv.indexed-entry-gather"
-                            : "rvv.indexed-entry-load",
-              0, 0));
+          *byteStride, choice.access, choice.leaf);
       riscv_internal::copyOrigin(operation, entryLoad);
       operation.getResult().replaceAllUsesWith(entryLoad.getResult());
       rewriter.eraseOp(operation);

@@ -47,6 +47,12 @@ Encoding field access用 `AccessAttr` 保存 selected memory form以及 natural�
 joined 的完整 storage geometry。terminal lowering可以据此计算确定地址和bit extraction，
 不能按量化格式名补布局。
 
+natural field 的有效对齐由 record/base alignment、field byte offset 与动态 entry stride共同约束。
+当有效对齐不足以支持 element-width unit load 时，Physical IR 必须选择显式 byte-load leaf，
+由该 leaf按 byte载入并机械重解释为已经选定的RVV value；terminal emitter不能自行把`vle32`
+降级成 byte load。final verifier拒绝任何超过Encoding与offset事实的alignment声明，以及任何
+在不足对齐上仍选择element-width vector load的physical edge。
+
 natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示。它的
 `StorageWindowPlanAttr`给出logical lane axis、unit/strided projection、extent/alignment、record
 坐标与每个time/replica part对应的source window；result layout给出唯一SEW、LMUL与实际`vl`，

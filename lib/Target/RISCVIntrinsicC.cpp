@@ -5589,6 +5589,7 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
 
 mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
     riscv::RVVIndexedEntryLoadOp operation) {
+  const llvm::StringRef realization = instructionOf(operation.getOperation());
   Binding entries = bindings.lookup(operation.getEntryOffsets());
   auto materializedEntries =
       materializeNumeric(operation.getEntryOffsets(), entries);
@@ -5609,16 +5610,16 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
                 "indexed entry load requires a byte-addressable payload element");
 
   Binding source = bindings.lookup(operation.getSource());
-  std::optional<std::string> descriptorBase;
+  std::optional<std::string> descriptorByteBase;
   Binding record;
   std::optional<EncodingField> field;
   if (source.kind == Binding::Kind::Slice) {
     auto address = denseAddress(source.slice, {});
     if (address)
-      descriptorBase = "((const " + *cType + " *)(" + *address + "))";
+      descriptorByteBase = "((const uint8_t *)(" + *address + "))";
   } else if (source.kind == Binding::Kind::Memory) {
-    descriptorBase =
-        "((const " + *cType + " *)(" + source.memory.name + "))";
+    descriptorByteBase =
+        "((const uint8_t *)(" + source.memory.name + "))";
   } else if (source.kind == Binding::Kind::Field) {
     source.field.useAccess = operation.getAccess();
     record = bindings.lookup(source.field.owner);
@@ -5631,14 +5632,14 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
     field = fieldFor(source);
     if (record.kind == Binding::Kind::Memory && field &&
         field->access.getMapping() == "natural" && !(field->bitOffset % 8))
-      descriptorBase =
-          "((const " + *cType + " *)(" + record.memory.name + " + " +
+      descriptorByteBase =
+          "((const uint8_t *)(" + record.memory.name + " + " +
           std::to_string(field->bitOffset / 8) + "))";
   } else {
     return fail(operation,
                 "indexed entry load source has no dense descriptor or encoded field binding");
   }
-  if (!descriptorBase &&
+  if (!descriptorByteBase &&
       (record.kind != Binding::Kind::Record || !field ||
        field->access.getMapping() != "natural" || field->bitOffset % 8 ||
        record.recordAxis != operation.getSourceAxis()))
@@ -5665,9 +5666,9 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
     if (!entry && entries.kind != Binding::Kind::Vector)
       return fail(operation,
                   "indexed entry load outer axes have no typed byte-offset projection");
-    std::string base;
-    if (descriptorBase) {
-      base = *descriptorBase;
+    std::string byteBase;
+    if (descriptorByteBase) {
+      byteBase = *descriptorByteBase;
     } else {
       auto coordinates = registerCoordinates(operation.getResult(), part / streams);
       auto sourceType =
@@ -5695,8 +5696,10 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
                          stride->second;
       }
       recordPointer += " + " + std::to_string(field->bitOffset / 8) + ")";
-      base = "((const " + *cType + " *)(" + recordPointer + "))";
+      byteBase = "((const uint8_t *)(" + recordPointer + "))";
     }
+    const std::string base =
+        "((const " + *cType + " *)(" + byteBase + "))";
     if (entries.kind == Binding::Kind::Vector) {
       if (streams <= 0)
         return fail(operation,
@@ -5750,14 +5753,38 @@ mlir::LogicalResult Emitter::compileRVVIndexedEntryLoad(
       result.parts.push_back(std::move(loaded));
       continue;
     }
+    const std::string bytePointer =
+        "((const uint8_t *)(" + byteBase + ") + (size_t)(" + *entry + "))";
     const std::string pointer =
-        "((const " + *cType + " *)((const uint8_t *)(" + base +
-        ") + (size_t)(" + *entry + ")))";
+        "((const " + *cType + " *)(" + bytePointer + "))";
     const std::string vl = partVL(operation.getResult(), part);
     std::string loaded = fresh("entry_payload");
-    line(resultType + " " + loaded + " = __riscv_vle" +
-         std::to_string(elementBits) + "_v_" + resultSuffix + "(" + pointer +
-         ", " + vl + ");");
+    if (realization == "rvv.indexed-entry-byte-load") {
+      const int64_t lmulEighths =
+          operation.getResult().getType().getLayout().getLmulEighths();
+      const std::string rawLMUL = lmulSpelling(lmulEighths);
+      if (rawLMUL.empty() || elementBits <= 8)
+        return fail(operation,
+                    "indexed entry byte load has no legal raw-byte carrier");
+      const std::string rawSuffix = "u8" + rawLMUL;
+      const std::string rawType = "vuint8" + rawLMUL + "_t";
+      std::string bytes = fresh("entry_payload_bytes");
+      // Reinterpretation preserves one physical register group.  The byte
+      // load therefore keeps the selected LMUL and scales VL by the payload
+      // width instead of selecting a second carrier here.
+      line(rawType + " " + bytes + " = __riscv_vle8_v_" + rawSuffix +
+           "(" + bytePointer + ", (" + vl + ") * " +
+           std::to_string(elementBits / 8) + ");");
+      line(resultType + " " + loaded + " = __riscv_vreinterpret_v_" +
+           rawSuffix + "_" + resultSuffix + "(" + bytes + ");");
+    } else if (realization == "rvv.indexed-entry-load") {
+      line(resultType + " " + loaded + " = __riscv_vle" +
+           std::to_string(elementBits) + "_v_" + resultSuffix + "(" +
+           pointer + ", " + vl + ");");
+    } else {
+      return fail(operation,
+                  "scalar indexed entry load has no exact selected unit leaf");
+    }
     result.parts.push_back(std::move(loaded));
   }
   bindings[operation.getResult()] = std::move(result);
