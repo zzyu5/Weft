@@ -815,6 +815,18 @@ private:
           base.getLayoutIdentity(), base.getStorageBits(), base.getElements(),
           base.getInterleaveRows());
       targetName = riscv::SliceOp::getOperationName();
+    } else if (auto subview = mlir::dyn_cast<kernel::SubviewOp>(source)) {
+      auto base = mlir::cast<riscv::MemDescType>(operands.front().getType());
+      auto result = mlir::cast<riscv::MemDescType>(results.front());
+      results.front() = riscv::MemDescType::get(
+          builder.getContext(), result.getEncoding(), result.getShape(),
+          result.getAxisIds(), base.getStrides(), base.getOrigins(),
+          base.getAlignment(), "slice", base.getAccess(), base.getAliasSet(),
+          base.getLayoutIdentity(), base.getStorageBits(), base.getElements(),
+          base.getInterleaveRows());
+      targetName = riscv::SubviewOp::getOperationName();
+    } else if (mlir::isa<kernel::ReshapeOp>(source)) {
+      targetName = riscv::ReshapeOp::getOperationName();
     } else if (mlir::isa<kernel::AdmitOp>(source)) {
       addAccess(attrs);
       addLeaf(attrs);

@@ -234,6 +234,20 @@ def WeftKernel_SliceOp : WeftKernel_Op<"slice", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftKernel_SubviewOp : WeftKernel_Op<"subview", [Pure]> {
+  let arguments = (ins AnyType:$base, DenseI64ArrayAttr:$offsets,
+                       DenseI64ArrayAttr:$extents);
+  let results = (outs WeftKernel_SliceType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftKernel_ReshapeOp : WeftKernel_Op<"reshape", [Pure]> {
+  let arguments = (ins WeftKernel_ValueType:$input,
+                       DenseI64ArrayAttr:$order);
+  let results = (outs WeftKernel_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftKernel_FieldOp : WeftKernel_Op<"field", [Pure]> {
   let arguments = (ins AnyType:$owner, StrAttr:$name);
   let results = (outs AnyType:$result);

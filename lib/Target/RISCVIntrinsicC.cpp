@@ -197,6 +197,7 @@ struct SliceInfo {
   llvm::SmallVector<mlir::Value> indices;
   llvm::SmallVector<std::string> selectors;
   llvm::SmallVector<std::pair<int64_t, mlir::Value>> localOffsets;
+  llvm::SmallVector<std::pair<int64_t, int64_t>> staticOffsets;
 };
 
 struct FieldInfo {
@@ -634,6 +635,8 @@ private:
   mlir::LogicalResult compileStorageLoad(riscv::StorageLoadOp operation);
   mlir::LogicalResult compileStorageStore(riscv::StorageStoreOp operation);
   mlir::LogicalResult compileSlice(riscv::SliceOp slice);
+  mlir::LogicalResult compileSubview(riscv::SubviewOp subview);
+  mlir::LogicalResult compileReshape(riscv::ReshapeOp reshape);
   mlir::LogicalResult compileAdmit(riscv::LoadOp admit);
   mlir::LogicalResult compileStagedView(riscv::StagedViewOp staged);
   mlir::LogicalResult
@@ -1620,6 +1623,9 @@ std::optional<std::string> Emitter::denseAddress(
         return std::nullopt;
       coordinate = "(" + coordinate + " + " + expression + ")";
     }
+    for (auto [axis, offset] : slice.staticOffsets)
+      if (axis == memory.axes[dimension] && offset != 0)
+        coordinate = "(" + coordinate + " + " + std::to_string(offset) + ")";
     auto extra = offsetByAxis.find(std::to_string(memory.axes[dimension]));
     if (extra != offsetByAxis.end())
       coordinate = "(" + coordinate + " + " + extra->second + ")";
@@ -2352,6 +2358,10 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileStorageStore(store);
   if (auto slice = mlir::dyn_cast<riscv::SliceOp>(operation))
     return compileSlice(slice);
+  if (auto subview = mlir::dyn_cast<riscv::SubviewOp>(operation))
+    return compileSubview(subview);
+  if (auto reshape = mlir::dyn_cast<riscv::ReshapeOp>(operation))
+    return compileReshape(reshape);
   if (auto admit = mlir::dyn_cast<riscv::LoadOp>(operation))
     return compileAdmit(admit);
   if (auto staged = mlir::dyn_cast<riscv::StagedViewOp>(operation))
@@ -3058,6 +3068,54 @@ mlir::LogicalResult Emitter::compileSlice(riscv::SliceOp slice) {
           mlir::cast<mlir::StringAttr>(selector).getValue().str());
   }
   bindings[slice.getResult()] = std::move(binding);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileSubview(riscv::SubviewOp subview) {
+  Binding base = bindings.lookup(subview.getBase());
+  Binding result;
+  result.kind = Binding::Kind::Slice;
+  if (base.kind == Binding::Kind::Memory) {
+    result.slice.base = subview.getBase();
+  } else if (base.kind == Binding::Kind::Slice) {
+    result.slice = base.slice;
+  } else {
+    return fail(subview, "subview base has no memory-backed slice binding");
+  }
+  auto baseType = subview.getBase().getType();
+  if (subview.getOffsets().size() != baseType.getAxisIds().size())
+    return fail(subview, "subview offset rank disagrees with its descriptor");
+  for (auto [axis, offset] :
+       llvm::zip(baseType.getAxisIds().asArrayRef(),
+                 subview.getOffsets()))
+    if (offset != 0)
+      result.slice.staticOffsets.emplace_back(axis, offset);
+  bindings[subview.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileReshape(riscv::ReshapeOp reshape) {
+  Binding input = bindings.lookup(reshape.getInput());
+  const int64_t inputParts =
+      input.kind == Binding::Kind::Vector
+          ? vectorPartCount(reshape.getInput())
+          : input.kind == Binding::Kind::ScalarTuple
+                ? scalarPartCount(reshape.getInput())
+                : 1;
+  const int64_t resultParts =
+      input.kind == Binding::Kind::Vector
+          ? vectorPartCount(reshape.getResult())
+          : input.kind == Binding::Kind::ScalarTuple
+                ? scalarPartCount(reshape.getResult())
+                : 1;
+  if (input.kind == Binding::Kind::None || inputParts <= 0 ||
+      inputParts != resultParts ||
+      ((input.kind == Binding::Kind::Vector ||
+        input.kind == Binding::Kind::ScalarTuple) &&
+       static_cast<int64_t>(input.parts.size()) != inputParts))
+    return fail(reshape,
+                "reshape input does not match its selected linear carrier partition");
+  bindings[reshape.getResult()] = std::move(input);
   return mlir::success();
 }
 

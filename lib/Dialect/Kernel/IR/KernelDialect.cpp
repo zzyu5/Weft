@@ -14,8 +14,9 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
 
-#include <limits>
 #include <functional>
+#include <limits>
+#include <optional>
 
 using namespace weft::kernel;
 
@@ -91,6 +92,16 @@ llvm::ArrayRef<int64_t> logicalAxes(mlir::Type type) {
 bool sameDomain(mlir::Type lhs, mlir::Type rhs) {
   return logicalShape(lhs) == logicalShape(rhs) &&
          logicalAxes(lhs) == logicalAxes(rhs);
+}
+
+std::optional<int64_t> staticElementCount(mlir::Type type) {
+  int64_t count = 1;
+  for (int64_t extent : logicalShape(type)) {
+    if (extent <= 0 || count > std::numeric_limits<int64_t>::max() / extent)
+      return std::nullopt;
+    count *= extent;
+  }
+  return count;
 }
 
 bool isNumeric(mlir::Type type) {
@@ -892,6 +903,10 @@ mlir::LogicalResult KernelOp::verify() {
         value = slice.getBase();
         continue;
       }
+      if (auto subview = mlir::dyn_cast<SubviewOp>(producer)) {
+        value = subview.getBase();
+        continue;
+      }
       if (auto field = mlir::dyn_cast<FieldOp>(producer)) {
         value = field.getOwner();
         continue;
@@ -1149,6 +1164,59 @@ mlir::LogicalResult SliceOp::verify() {
     return emitOpError("slice preserves its View encoding");
   return verifyProjection(*this, getBase().getType(), getIndices(),
                           getSelectors(), getResult().getType(), false);
+}
+
+mlir::LogicalResult SubviewOp::verify() {
+  if (!isViewLike(getBase().getType()))
+    return emitOpError("subview base must be a View or slice");
+  auto baseShape = logicalShape(getBase().getType());
+  auto offsets = getOffsets();
+  auto extents = getExtents();
+  if (offsets.size() != baseShape.size() || extents.size() != baseShape.size())
+    return emitOpError(
+        "subview requires one static offset and extent per base axis");
+  for (auto [offset, extent, baseExtent] :
+       llvm::zip(offsets, extents, baseShape)) {
+    if (offset < 0 || extent <= 0 || baseExtent <= 0 ||
+        offset > baseExtent - extent)
+      return emitOpError(
+          "subview offsets/extents must define a positive region inside the static base");
+  }
+  if (logicalElement(getBase().getType()) !=
+          logicalElement(getResult().getType()) ||
+      !llvm::equal(extents, logicalShape(getResult().getType())) ||
+      !llvm::equal(logicalAxes(getBase().getType()),
+                   logicalAxes(getResult().getType())))
+    return emitOpError(
+        "subview preserves Encoding and axes and uses extents as its result shape");
+  for (mlir::OpOperand &use : getResult().getUses()) {
+    auto commit = mlir::dyn_cast<CommitOp>(use.getOwner());
+    if (!commit || use.getOperandNumber() != 1)
+      return emitOpError("subview result may only be a commit destination");
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult ReshapeOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  if (input.getElementType() != result.getElementType())
+    return emitOpError("reshape preserves the logical element type");
+  auto inputCount = staticElementCount(input);
+  auto resultCount = staticElementCount(result);
+  if (!inputCount || !resultCount || *inputCount != *resultCount)
+    return emitOpError(
+        "reshape requires equal positive static input and output element counts");
+  auto order = getOrder();
+  auto inputAxes = input.getAxisIds().asArrayRef();
+  if (order.size() != inputAxes.size())
+    return emitOpError("reshape order must name every input logical axis");
+  llvm::DenseSet<int64_t> seen;
+  for (int64_t axis : order)
+    if (!llvm::is_contained(inputAxes, axis) || !seen.insert(axis).second)
+      return emitOpError(
+          "reshape order must be a permutation of the input logical axes");
+  return mlir::success();
 }
 
 mlir::LogicalResult FieldOp::verify() {

@@ -1712,6 +1712,113 @@ class FrontendCompiler:
         self._emit("weft_kernel.commit", call, operands=(value, region))
         return None
 
+    def _intrinsic_subview(self, call: ast.Call) -> Value:
+        args = self._arguments(call, ("region", "offsets", "extents"), {})
+        region = self._expect_value(self._compile_expr(args["region"]), args["region"])
+        if not isinstance(region.type, (SliceType, ViewType)):
+            raise FrontendError("subview base must be a View region", self._location(call))
+
+        def static_tuple(name: str) -> tuple[int, ...]:
+            node = args[name]
+            value = self._eval_static(node) if isinstance(node, ast.expr) else node
+            if not isinstance(value, tuple) or not all(
+                isinstance(item, int) and not isinstance(item, bool) for item in value
+            ):
+                raise FrontendError(
+                    f"subview {name} must be a tuple of compile-time integers",
+                    self._location(node if isinstance(node, ast.AST) else call),
+                )
+            return tuple(value)
+
+        offsets = static_tuple("offsets")
+        extents = static_tuple("extents")
+        shape = shape_of(region.type)
+        if len(offsets) != len(shape) or len(extents) != len(shape):
+            raise FrontendError(
+                "subview requires one offset and extent per base axis",
+                self._location(call),
+            )
+        for offset, extent, base_extent in zip(offsets, extents, shape):
+            if offset < 0 or extent <= 0 or base_extent <= 0 or offset + extent > base_extent:
+                raise FrontendError(
+                    "subview offsets/extents must define a positive region inside the static base",
+                    self._location(call),
+                )
+        result = self._emit(
+            "weft_kernel.subview",
+            call,
+            operands=(region,),
+            result_types=(SliceType(region.type.encoding, extents, axes_of(region.type)),),
+            attributes={"offsets": _i64_array(offsets), "extents": _i64_array(extents)},
+        )[0]
+        self._propagate_view_root(result, region)
+        return result
+
+    def _intrinsic_reshape(self, call: ast.Call) -> Value:
+        args = self._arguments(call, ("value", "shape", "axes", "order"), {})
+        value = self._expect_value(self._compile_expr(args["value"]), args["value"])
+        if not isinstance(value.type, LocalValueType):
+            raise FrontendError("reshape requires a shaped local Value", self._location(call))
+
+        def static_tuple(name: str) -> tuple[object, ...]:
+            node = args[name]
+            result = self._eval_static(node) if isinstance(node, ast.expr) else node
+            if not isinstance(result, tuple):
+                raise FrontendError(
+                    f"reshape {name} must be an explicit tuple",
+                    self._location(node if isinstance(node, ast.AST) else call),
+                )
+            return result
+
+        raw_shape = static_tuple("shape")
+        raw_axes = static_tuple("axes")
+        raw_order = static_tuple("order")
+        if not raw_shape or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0
+            for item in raw_shape
+        ):
+            raise FrontendError(
+                "reshape shape must contain positive compile-time integers",
+                self._location(call),
+            )
+        if len(raw_axes) != len(raw_shape) or not all(
+            isinstance(item, str) and item for item in raw_axes
+        ):
+            raise FrontendError(
+                "reshape axes must name every output dimension",
+                self._location(call),
+            )
+        if len(set(raw_axes)) != len(raw_axes):
+            raise FrontendError("reshape output axes must be unique", self._location(call))
+        if len(raw_order) != len(value.type.axes) or not all(
+            isinstance(item, str) and item for item in raw_order
+        ):
+            raise FrontendError(
+                "reshape order must name every input logical axis",
+                self._location(call),
+            )
+        order = tuple(self._axis_id(str(item)) for item in raw_order)
+        if len(set(order)) != len(order) or set(order) != set(value.type.axes):
+            raise FrontendError(
+                "reshape order must be a permutation of the input logical axes",
+                self._location(call),
+            )
+        shape = tuple(int(item) for item in raw_shape)
+        if math.prod(shape) != math.prod(value.type.shape):
+            raise FrontendError(
+                "reshape cannot change the number of logical elements",
+                self._location(call),
+            )
+        axes = tuple(self._axis_id(str(item)) for item in raw_axes)
+        result_type = LocalValueType(value.type.element_type, shape, axes)
+        return self._emit(
+            "weft_kernel.reshape",
+            call,
+            operands=(value,),
+            result_types=(result_type,),
+            attributes={"order": _i64_array(order)},
+        )[0]
+
     def _intrinsic_widen(self, call: ast.Call) -> Value:
         args = self._arguments(call, ("value", "dtype"), {})
         value = self._expect_value(self._compile_expr(args["value"]), args["value"])

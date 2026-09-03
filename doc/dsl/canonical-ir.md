@@ -84,6 +84,8 @@ canonical verifier必须检查程序是不是一份合法Weft程序：
 - 普通控制carry与branch result类型一致；
 - admit/materialize/new/commit的domain与value关系一致；
 - primitive operand/result shape和axis relation合法；
+- `subview` 的静态 offsets/extents 与 base rank 一致且完全位于 base 内，结果只流向 `commit`；
+- `reshape` 的输入 axis order 是完整排列，输入输出元素数和 dtype 相同，结果 shape/axes 与显式坐标映射一致；
 - derive builder result与declared family一致；
 - pinned layout identity在ABI边界明确。
 

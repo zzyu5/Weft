@@ -32,6 +32,8 @@ from .builtins import (
     new,
     outer_contract,
     reduce,
+    reshape,
+    subview,
     widen,
 )
 from .dtypes import (
@@ -98,7 +100,9 @@ __all__ = [
     "outer_contract",
     "padding",
     "reduce",
+    "reshape",
     "static",
+    "subview",
     "u1",
     "u2",
     "u4",

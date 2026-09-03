@@ -13,6 +13,8 @@ from weft.language import (
     lookup,
     materialize,
     narrow,
+    reshape,
+    subview,
     u8,
     u16,
     u32,
@@ -58,7 +60,7 @@ from .quant_fragments import (
     grid_delta,
     grid_sign,
     nonlinear_lookup,
-    radix3_digit,
+    radix3_digit_i8,
     signed_scale,
     small_nonlinear_lookup,
 )
@@ -498,19 +500,39 @@ def dequantize_tq1_0(
 ):
     with L.blocks(K, extent=256) as kb:
         w = admit(W[kb])
-        for j in range(256):
-            packed = u32(w.q[0])
-            digit = j // 32
-            if j < 160:
-                packed = u32(w.q[j % 32])
-            if j >= 160:
-                packed = u32(w.q[32 + ((j - 160) % 16)])
-                digit = (j - 160) // 16
-            if j >= 240:
-                packed = u32(w.qh[(j - 240) % 4])
-                digit = (j - 240) // 4
-            q = radix3_digit(powers, packed, digit)
-            commit(ternary_radix(q, w.d), Y[kb][j])
+
+        lane0 = iota(32, axis="k")
+        digit0 = iota(5, dtype=u32, axis="tq1_digit0")
+        q0 = radix3_digit_i8(powers, w.q[lane0], digit0)
+        y0 = reshape(
+            ternary_radix(q0, w.d),
+            shape=(160,),
+            axes=("k",),
+            order=("tq1_digit0", "k"),
+        )
+        commit(y0, subview(Y[kb], offsets=(0,), extents=(160,)))
+
+        lane1 = iota(16, axis="k")
+        digit1 = iota(5, dtype=u32, axis="tq1_digit1")
+        q1 = radix3_digit_i8(powers, w.q[u32(32) + lane1], digit1)
+        y1 = reshape(
+            ternary_radix(q1, w.d),
+            shape=(80,),
+            axes=("k",),
+            order=("tq1_digit1", "k"),
+        )
+        commit(y1, subview(Y[kb], offsets=(160,), extents=(80,)))
+
+        lane2 = iota(4, axis="k")
+        digit2 = iota(4, dtype=u32, axis="tq1_digit2")
+        q2 = radix3_digit_i8(powers, w.qh[lane2], digit2)
+        y2 = reshape(
+            ternary_radix(q2, w.d),
+            shape=(16,),
+            axes=("k",),
+            order=("tq1_digit2", "k"),
+        )
+        commit(y2, subview(Y[kb], offsets=(240,), extents=(16,)))
 
 
 def dequantize_iq4_nl(

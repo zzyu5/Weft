@@ -2922,6 +2922,95 @@ mlir::LogicalResult SliceOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult SubviewOp::verify() {
+  MemDescType base = getBase().getType();
+  MemDescType result = getResult().getType();
+  auto offsets = getOffsets();
+  auto extents = getExtents();
+  if (offsets.size() != base.getShape().size() ||
+      extents.size() != base.getShape().size())
+    return emitOpError(
+        "physical subview requires one static offset and extent per base axis");
+  for (auto [offset, extent, baseExtent] :
+       llvm::zip(offsets, extents, base.getShape().asArrayRef())) {
+    if (offset < 0 || extent <= 0 || baseExtent <= 0 ||
+        offset > baseExtent - extent)
+      return emitOpError(
+          "physical subview lies outside its static base descriptor");
+  }
+  if (base.getEncoding() != result.getEncoding() ||
+      base.getAxisIds() != result.getAxisIds() ||
+      result.getShape().asArrayRef() != extents ||
+      base.getStrides() != result.getStrides() ||
+      base.getOrigins() != result.getOrigins() ||
+      result.getAddressClass() != "slice" ||
+      base.getAccess() != result.getAccess() ||
+      base.getAliasSet() != result.getAliasSet() ||
+      base.getLayoutIdentity() != result.getLayoutIdentity() ||
+      base.getAlignment() != result.getAlignment() ||
+      base.getStorageBits() != result.getStorageBits() ||
+      base.getElements() != result.getElements() ||
+      base.getInterleaveRows() != result.getInterleaveRows())
+    return emitOpError(
+        "physical subview preserves base storage facts and narrows only its logical extents");
+  for (mlir::OpOperand &use : getResult().getUses()) {
+    auto store = mlir::dyn_cast<StoreOp>(use.getOwner());
+    if (!store || use.getOperandNumber() != 1)
+      return emitOpError("physical subview may only be a store destination");
+  }
+  return mlir::success();
+}
+
+mlir::LogicalResult ReshapeOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  auto inputCount = checkedProduct(input.getShape().asArrayRef());
+  auto resultCount = checkedProduct(result.getShape().asArrayRef());
+  if (input.getElementType() != result.getElementType() || !inputCount ||
+      !resultCount || *inputCount != *resultCount)
+    return emitOpError(
+        "physical reshape preserves element type and static element count");
+  auto order = getOrder();
+  auto inputAxes = input.getAxisIds().asArrayRef();
+  if (order.size() != inputAxes.size())
+    return emitOpError("physical reshape order must cover every input axis");
+  llvm::DenseSet<int64_t> seen;
+  for (int64_t axis : order)
+    if (!llvm::is_contained(inputAxes, axis) || !seen.insert(axis).second)
+      return emitOpError(
+          "physical reshape order must be an input-axis permutation");
+
+  LayoutAttr source = input.getLayout();
+  LayoutAttr target = result.getLayout();
+  if (source.getCarrier() == "unassigned" || target.getCarrier() == "unassigned") {
+    if (source.getCarrier() != target.getCarrier())
+      return emitOpError(
+          "physical reshape layouts must be assigned together");
+    return mlir::success();
+  }
+  if (!llvm::equal(order, inputAxes))
+    return emitOpError(
+        "selected target currently requires reshape order to follow the input axis order");
+  auto sameFactorCount = [&](mlir::DenseI64ArrayAttr lhs,
+                             mlir::DenseI64ArrayAttr rhs) {
+    return checkedProduct(lhs.asArrayRef()) == checkedProduct(rhs.asArrayRef());
+  };
+  if (source.getCarrier() != target.getCarrier() ||
+      source.getSew() != target.getSew() ||
+      source.getLmulEighths() != target.getLmulEighths() ||
+      source.getVl() != target.getVl() ||
+      source.getRegisterGroups() != target.getRegisterGroups() ||
+      source.getValidity() != target.getValidity() ||
+      !sameFactorCount(source.getTimeFactors(), target.getTimeFactors()) ||
+      !sameFactorCount(source.getLaneFactors(), target.getLaneFactors()) ||
+      !sameFactorCount(source.getReplicaFactors(), target.getReplicaFactors()) ||
+      !sameFactorCount(source.getFragmentFactors(), target.getFragmentFactors()) ||
+      !sameFactorCount(source.getLocalFactors(), target.getLocalFactors()))
+    return emitOpError(
+        "physical reshape requires one linearly identical carrier partition");
+  return mlir::success();
+}
+
 mlir::LogicalResult LoadOp::verify() {
   if (!canRead(getRegion().getType().getAccess()) ||
       !isPhysicalValue(getResult().getType()) ||

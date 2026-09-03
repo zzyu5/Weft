@@ -26,11 +26,22 @@ operation消去的 logical axes必须保留；例如 `[M,K] -> [M]` reduction �
 lhs/rhs/accumulator role与完整`FragmentPackingAttr`，不能伪装成 generic
 `ValueType(carrier=ime)`。
 
+canonical `reshape` lower为真实的 `weft_riscv.reshape`。op保留作者给出的input-axis
+order和不同的result shape/axis identities；layout pass必须为两端形成线性序号相同的carrier
+partition。只有time/lane/register/fragment/local各自的总分解一致时，terminal translation才可
+把它拼写成零拷贝binding；否则必须在此前插入显式physical conversion或把candidate判非法，
+不能由emitter调整坐标顺序。
+
 ## 3. Memory 与 local storage
 
 `MemDescType` 保存 pinned Encoding、shape/axes、static stride/origin facts、alignment、alias、
 effect、layout identity与record geometry。kernel入口随后用 `memory_view` 的 SSA operands明确
 给出每个动态 extent、stride和origin；ABI descriptor不能绕过这个 view。
+
+canonical `subview` lower为 `weft_riscv.subview`：base descriptor、每轴static offset/extent和
+缩小后的result descriptor同时存在于IR。它保留Encoding、axis、stride、origin、access与alias，
+只向base address加入规则连续offset；其result只能作为`store` destination。它不是indexed
+memory edge，也不允许terminal translator把它扩成scatter。
 
 Encoding field access用 `AccessAttr` 保存 selected memory form以及 natural、grouped-layered、
 joined 的完整 storage geometry。terminal lowering可以据此计算确定地址和bit extraction，

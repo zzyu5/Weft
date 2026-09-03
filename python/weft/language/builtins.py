@@ -43,6 +43,8 @@ iota = _intrinsic("iota")
 materialize = _intrinsic("materialize")
 admit = _intrinsic("admit")
 commit = _intrinsic("commit")
+subview = _intrinsic("subview")
+reshape = _intrinsic("reshape")
 
 mac_pairs = _intrinsic("mac_pairs")
 mac_groups = _intrinsic("mac_groups")

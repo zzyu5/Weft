@@ -128,7 +128,7 @@ values = lookup(codebook, base + indices)
 
 `lookup` 对每个 index coordinate 读取 table entry；result shape/axes 与 indices 完全相同。越界 policy、mask 与 fill 必须由调用显式给出。八个独立 scalar lookup 不等于一条 `[8]` lookup；target 只能为已经存在的 shaped index 选择 unit/indexed/gather 或专用 table realization。
 
-## 9. Logical projection、reshape 与 transpose
+## 9. Logical projection、subview、reshape 与 transpose
 
 对 shaped Value 的 slice/projection 必须显式保存输入输出 axis relation：
 
@@ -137,7 +137,33 @@ panel = materialize(admit(B[kc, nc]))
 b = panel[kb, nb]
 ```
 
-`reshape`、`transpose` 和显式 index operation 若改变 logical axes、coordinates 或遍历关系，必须作为 canonical operation 写入程序，并完整定义坐标映射。它们不是 physical layout hint。
+`subview` 表示同一个 View 或 slice 内的连续矩形子区域：
+
+```python
+tail = subview(Y[kb], offsets=(160,), extents=(80,))
+commit(value, tail)
+```
+
+`offsets` 和 `extents` 以 logical element coordinate 计数，每个 base axis 恰好对应一项；它们必须是编译期整数，`offset >= 0`、`extent > 0`，并且 `offset + extent` 不得越过 base extent。结果保留 base 的 Encoding、axis identity、access 与 alias relation，只把 logical shape 缩为 `extents`。`subview` 不改变 Level domain、partition、multiplicity、birth 或 handoff。
+
+`subview` 只定义规则连续区域，不接受 stride、index Value、gather 或 scatter。它的结果只能作为 `commit` destination；多个 subview 是否重叠由作者负责，canonical verifier 不做跨 op 的重叠证明。
+
+`reshape` 表示 local shaped Value 的显式坐标重排：
+
+```python
+flat = reshape(
+    tile,
+    shape=(160,),
+    axes=("k",),
+    order=("digit", "k"),
+)
+```
+
+`shape` 和 `axes` 完整声明输出 domain。`order` 必填，且必须把输入的每个 logical axis 恰好列出一次，按从最慢变化到最快变化的顺序定义输入坐标的线性序号；输出按 `axes` 的声明顺序从最慢到最快解码同一个线性序号。因而 `order=("digit", "k")` 与 `order=("k", "digit")` 是两个不同的 canonical program，编译器不得互换。
+
+`reshape` 必须满足输入和输出 shape 的元素总数相同，元素 dtype 不变；结果 axis identity 由 `axes` 显式给出，输入 axis、`order` 和结果 axis/shape 一起保存在 canonical op 中，使坐标来源可追溯。它不执行 storage access，也不选择 lane、register、fragment、local pack 或 target instruction。
+
+`transpose` 和其它显式 index operation 若改变 logical axes、coordinates 或遍历关系，同样必须作为 canonical operation 写入程序，并完整定义坐标映射。它们不是 physical layout hint。
 
 invocation-local pack 不是 core operation。target 可以根据 producer Encoding、all consumers、axis mapping、widening、reuse、pipeline 与 resources，为同一 canonical Value/use edge 选择 register window、local-storage panel、RVV tuple、IME operand 或其它 local pack。这个选择不得改变 Value 的 shape/axes、Level birth、effects 或 pin ABI。
 

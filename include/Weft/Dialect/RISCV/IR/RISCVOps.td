@@ -942,6 +942,21 @@ def WeftRISCV_SliceOp : WeftRISCV_Op<"slice", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftRISCV_SubviewOp : WeftRISCV_Op<"subview", [Pure]> {
+  let arguments = (ins WeftRISCV_MemDescType:$base,
+                       DenseI64ArrayAttr:$offsets,
+                       DenseI64ArrayAttr:$extents);
+  let results = (outs WeftRISCV_MemDescType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_ReshapeOp : WeftRISCV_Op<"reshape", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       DenseI64ArrayAttr:$order);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_LoadOp : WeftRISCV_Op<"load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_MemDescType:$region,
                        WeftRISCV_AccessAttr:$access,

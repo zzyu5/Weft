@@ -918,6 +918,15 @@ Roles rolesFor(mlir::Value value) {
       return roles;
     }
   }
+  if (auto reshape = value.getDefiningOp<riscv::ReshapeOp>()) {
+    auto axes = reshape.getResult().getType().getAxisIds().asArrayRef();
+    if (!axes.empty()) {
+      roles.laneAxis = axes.back();
+      roles.anchored = true;
+      roles.fullLaneExtent = true;
+    }
+    return roles;
+  }
   if (value.getDefiningOp<riscv::ReduceOp>()) {
     // A reduction result preserves every free logical axis.  Small free axes
     // are register replicas; the eliminated axis is anchored on the producer,
@@ -975,6 +984,17 @@ Roles rolesFor(mlir::Value value) {
           roles.laneAxis = axes.back();
         addSmallReplicas(value, roles, roles.laneAxis);
       }
+    } else if (auto reshape = mlir::dyn_cast<riscv::ReshapeOp>(owner)) {
+      if (reshape.getInput() != value || reshape.getOrder().empty())
+        continue;
+      roles.laneAxis = reshape.getOrder().back();
+      roles.coalescedLaneAxes.clear();
+      roles.replicaAxes.clear();
+      roles.sequentialAxes.clear();
+      for (int64_t axis : reshape.getOrder().drop_back())
+        roles.coalescedLaneAxes.insert(axis);
+      roles.anchored = true;
+      roles.fullLaneExtent = true;
     }
   }
 
