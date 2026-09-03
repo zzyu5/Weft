@@ -1,210 +1,210 @@
 category,kernel,phase,hardware,implementation,shape,median_ms,throughput,throughput_unit
-matrix_multiplication,mul_mat_f32,decode,SG2044,RVV F32 vec-dot,M=1;N=4096;K=4096,20.612,1.627926,GOP/s
-matrix_multiplication,mul_mat_f32,decode,K1/X60,RVV F32 vec-dot,M=1;N=4096;K=4096,16.715,2.007385,GOP/s
-matrix_multiplication,mul_mat_f16,decode,SG2044,RVV F16 vec-dot,M=1;N=4096;K=4096,7.387,4.542330,GOP/s
-matrix_multiplication,mul_mat_f16,decode,K1/X60,RVV F16 vec-dot,M=1;N=4096;K=4096,9.785,3.429088,GOP/s
-matrix_multiplication,mul_mat_q1_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,14.379,2.333519,GOP/s
-matrix_multiplication,mul_mat_q1_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,9.078,3.696397,GOP/s
-matrix_multiplication,mul_mat_q4_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,4.525,7.415338,GOP/s
-matrix_multiplication,mul_mat_q4_0,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,2.941,11.409209,GOP/s
-matrix_multiplication,mul_mat_q4_1,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,13.336,2.516081,GOP/s
-matrix_multiplication,mul_mat_q4_1,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,3.519,9.535097,GOP/s
-matrix_multiplication,mul_mat_q5_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,5.444,6.163659,GOP/s
-matrix_multiplication,mul_mat_q5_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,18.758,1.788813,GOP/s
-matrix_multiplication,mul_mat_q5_1,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,5.797,5.788574,GOP/s
-matrix_multiplication,mul_mat_q5_1,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,19.692,1.703933,GOP/s
-matrix_multiplication,mul_mat_q8_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,60.024,0.559013,GOP/s
-matrix_multiplication,mul_mat_q8_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,16.003,2.096733,GOP/s
-matrix_multiplication,mul_mat_q2_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,3.806,8.815042,GOP/s
-matrix_multiplication,mul_mat_q2_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,13.958,2.403987,GOP/s
-matrix_multiplication,mul_mat_q3_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,4.665,7.192864,GOP/s
-matrix_multiplication,mul_mat_q3_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,14.014,2.394356,GOP/s
-matrix_multiplication,mul_mat_q4_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,3.425,9.797607,GOP/s
-matrix_multiplication,mul_mat_q4_K,decode,K1/X60,IME1 asm,M=1;N=4096;K=4096,3.436,9.766010,GOP/s
-matrix_multiplication,mul_mat_q5_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,25.712,1.305015,GOP/s
-matrix_multiplication,mul_mat_q5_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,27.260,1.230904,GOP/s
-matrix_multiplication,mul_mat_q6_K,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,6.917,4.851051,GOP/s
-matrix_multiplication,mul_mat_q6_K,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,14.384,2.332811,GOP/s
-matrix_multiplication,mul_mat_iq1_s,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,12.033,2.788436,GOP/s
-matrix_multiplication,mul_mat_iq1_s,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,12.531,2.677784,GOP/s
-matrix_multiplication,mul_mat_iq1_m,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,7.389,4.541027,GOP/s
-matrix_multiplication,mul_mat_iq1_m,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,23.535,1.425721,GOP/s
-matrix_multiplication,mul_mat_iq2_s,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,16.593,2.022167,GOP/s
-matrix_multiplication,mul_mat_iq2_s,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,23.214,1.445449,GOP/s
-matrix_multiplication,mul_mat_iq2_xs,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,9.616,3.489556,GOP/s
-matrix_multiplication,mul_mat_iq2_xs,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,19.069,1.759671,GOP/s
-matrix_multiplication,mul_mat_iq2_xxs,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,8.315,4.035300,GOP/s
-matrix_multiplication,mul_mat_iq2_xxs,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,20.138,1.666187,GOP/s
-matrix_multiplication,mul_mat_iq3_s,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,40.956,0.819278,GOP/s
-matrix_multiplication,mul_mat_iq3_s,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,20.438,1.641799,GOP/s
-matrix_multiplication,mul_mat_iq3_xxs,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,24.555,1.366526,GOP/s
-matrix_multiplication,mul_mat_iq3_xxs,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,21.235,1.580157,GOP/s
-matrix_multiplication,mul_mat_iq4_nl,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,4.887,6.866703,GOP/s
-matrix_multiplication,mul_mat_iq4_nl,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,12.116,2.769476,GOP/s
-matrix_multiplication,mul_mat_iq4_xs,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,12.412,2.703370,GOP/s
-matrix_multiplication,mul_mat_iq4_xs,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,19.812,1.693673,GOP/s
-matrix_multiplication,mul_mat_tq1_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,5.457,6.148615,GOP/s
-matrix_multiplication,mul_mat_tq1_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,10.046,3.339951,GOP/s
-matrix_multiplication,mul_mat_tq2_0,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,5.596,5.996033,GOP/s
-matrix_multiplication,mul_mat_tq2_0,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,7.020,4.779641,GOP/s
-matrix_multiplication,mul_mat_mxfp4,decode,SG2044,RVV quantized vec-dot,M=1;N=4096;K=4096,5.156,6.508292,GOP/s
-matrix_multiplication,mul_mat_mxfp4,decode,K1/X60,RVV quantized vec-dot,M=1;N=4096;K=4096,13.191,2.543730,GOP/s
-matrix_multiplication,mul_mat_nvfp4,decode,SG2044,scalar vec-dot,M=1;N=4096;K=4096,88.900,0.377442,GOP/s
-matrix_multiplication,mul_mat_nvfp4,decode,K1/X60,scalar vec-dot,M=1;N=4096;K=4096,214.137,0.156696,GOP/s
-matrix_multiplication,mul_mat_f32,prefill,SG2044,RVV F32 vec-dot,M=128;N=4096;K=4096,599.441,7.164959,GOP/s
-matrix_multiplication,mul_mat_f32,prefill,K1/X60,RVV F32 vec-dot,M=128;N=4096;K=4096,1606.776,2.673035,GOP/s
-matrix_multiplication,mul_mat_f16,prefill,SG2044,RVV F16 vec-dot,M=128;N=4096;K=4096,299.138,14.357800,GOP/s
-matrix_multiplication,mul_mat_f16,prefill,K1/X60,RVV F16 vec-dot,M=128;N=4096;K=4096,782.657,5.487675,GOP/s
-matrix_multiplication,mul_mat_q1_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1010.623,4.249822,GOP/s
-matrix_multiplication,mul_mat_q1_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1132.405,3.792784,GOP/s
-matrix_multiplication,mul_mat_q4_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,566.585,7.580451,GOP/s
-matrix_multiplication,mul_mat_q4_0,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,151.069,28.430585,GOP/s
-matrix_multiplication,mul_mat_q4_1,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1694.128,2.535208,GOP/s
-matrix_multiplication,mul_mat_q4_1,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,174.724,24.581428,GOP/s
-matrix_multiplication,mul_mat_q5_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,680.931,6.307497,GOP/s
-matrix_multiplication,mul_mat_q5_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2321.729,1.849900,GOP/s
-matrix_multiplication,mul_mat_q5_1,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,721.764,5.950653,GOP/s
-matrix_multiplication,mul_mat_q5_1,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2429.874,1.767568,GOP/s
-matrix_multiplication,mul_mat_q8_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,2093.162,2.051904,GOP/s
-matrix_multiplication,mul_mat_q8_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1926.148,2.229822,GOP/s
-matrix_multiplication,mul_mat_q2_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,453.908,9.462195,GOP/s
-matrix_multiplication,mul_mat_q2_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1781.885,2.410350,GOP/s
-matrix_multiplication,mul_mat_q3_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,594.975,7.218739,GOP/s
-matrix_multiplication,mul_mat_q3_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1753.587,2.449247,GOP/s
-matrix_multiplication,mul_mat_q4_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,442.818,9.699175,GOP/s
-matrix_multiplication,mul_mat_q4_K,prefill,K1/X60,IME1 asm,M=128;N=4096;K=4096,174.758,24.576693,GOP/s
-matrix_multiplication,mul_mat_q5_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1589.374,2.702302,GOP/s
-matrix_multiplication,mul_mat_q5_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,3434.231,1.250635,GOP/s
-matrix_multiplication,mul_mat_q6_K,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,580.638,7.396984,GOP/s
-matrix_multiplication,mul_mat_q6_K,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1711.685,2.509204,GOP/s
-matrix_multiplication,mul_mat_iq1_s,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1529.498,2.808090,GOP/s
-matrix_multiplication,mul_mat_iq1_s,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1563.161,2.747617,GOP/s
-matrix_multiplication,mul_mat_iq1_m,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,941.799,4.560388,GOP/s
-matrix_multiplication,mul_mat_iq1_m,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2962.101,1.449973,GOP/s
-matrix_multiplication,mul_mat_iq2_s,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1531.405,2.804593,GOP/s
-matrix_multiplication,mul_mat_iq2_s,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2910.575,1.475642,GOP/s
-matrix_multiplication,mul_mat_iq2_xs,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1050.595,4.088130,GOP/s
-matrix_multiplication,mul_mat_iq2_xs,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2374.329,1.808918,GOP/s
-matrix_multiplication,mul_mat_iq2_xxs,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1022.966,4.198543,GOP/s
-matrix_multiplication,mul_mat_iq2_xxs,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2516.053,1.707026,GOP/s
-matrix_multiplication,mul_mat_iq3_s,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,3456.974,1.242407,GOP/s
-matrix_multiplication,mul_mat_iq3_s,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2551.970,1.683001,GOP/s
-matrix_multiplication,mul_mat_iq3_xxs,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,1717.850,2.500199,GOP/s
-matrix_multiplication,mul_mat_iq3_xxs,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2649.375,1.621125,GOP/s
-matrix_multiplication,mul_mat_iq4_nl,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,617.610,6.954179,GOP/s
-matrix_multiplication,mul_mat_iq4_nl,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1496.994,2.869061,GOP/s
-matrix_multiplication,mul_mat_iq4_xs,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,728.606,5.894772,GOP/s
-matrix_multiplication,mul_mat_iq4_xs,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,2498.640,1.718922,GOP/s
-matrix_multiplication,mul_mat_tq1_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,694.845,6.181190,GOP/s
-matrix_multiplication,mul_mat_tq1_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1242.588,3.456469,GOP/s
-matrix_multiplication,mul_mat_tq2_0,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,615.096,6.982594,GOP/s
-matrix_multiplication,mul_mat_tq2_0,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,862.583,4.979196,GOP/s
-matrix_multiplication,mul_mat_mxfp4,prefill,SG2044,RVV quantized vec-dot,M=128;N=4096;K=4096,650.432,6.603252,GOP/s
-matrix_multiplication,mul_mat_mxfp4,prefill,K1/X60,RVV quantized vec-dot,M=128;N=4096;K=4096,1634.120,2.628305,GOP/s
-matrix_multiplication,mul_mat_nvfp4,prefill,SG2044,scalar vec-dot,M=128;N=4096;K=4096,11341.923,0.378681,GOP/s
-matrix_multiplication,mul_mat_nvfp4,prefill,K1/X60,scalar vec-dot,M=128;N=4096;K=4096,27330.694,0.157148,GOP/s
-vec_dot_microkernel,q1_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,51.859,2.264629,GOP/s
-vec_dot_microkernel,q1_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,31.129,3.772674,GOP/s
-vec_dot_microkernel,q4_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,47.504,2.472224,GOP/s
-vec_dot_microkernel,q4_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,52.794,2.224505,GOP/s
-vec_dot_microkernel,q4_1_q8_1,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,46.365,2.532951,GOP/s
-vec_dot_microkernel,q4_1_q8_1,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,52.854,2.221999,GOP/s
-vec_dot_microkernel,q5_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,18.514,6.343468,GOP/s
-vec_dot_microkernel,q5_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,64.756,1.813580,GOP/s
-vec_dot_microkernel,q5_1_q8_1,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,20.121,5.836734,GOP/s
-vec_dot_microkernel,q5_1_q8_1,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,68.025,1.726429,GOP/s
-vec_dot_microkernel,q8_0_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,177.175,0.662852,GOP/s
-vec_dot_microkernel,q8_0_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,55.091,2.131744,GOP/s
-vec_dot_microkernel,q2_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,12.617,9.307765,GOP/s
-vec_dot_microkernel,q2_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,48.013,2.445995,GOP/s
-vec_dot_microkernel,q3_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,15.894,7.388895,GOP/s
-vec_dot_microkernel,q3_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,48.107,2.441261,GOP/s
-vec_dot_microkernel,q4_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,11.816,9.938788,GOP/s
-vec_dot_microkernel,q4_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,45.462,2.583276,GOP/s
-vec_dot_microkernel,q5_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,90.167,1.302480,GOP/s
-vec_dot_microkernel,q5_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,94.593,1.241532,GOP/s
-vec_dot_microkernel,q6_K_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,23.991,4.895281,GOP/s
-vec_dot_microkernel,q6_K_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,49.253,2.384436,GOP/s
-vec_dot_microkernel,iq1_s_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,41.876,2.804481,GOP/s
-vec_dot_microkernel,iq1_s_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,43.243,2.715809,GOP/s
-vec_dot_microkernel,iq1_m_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,25.578,4.591404,GOP/s
-vec_dot_microkernel,iq1_m_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,81.768,1.436265,GOP/s
-vec_dot_microkernel,iq2_s_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,49.069,2.393391,GOP/s
-vec_dot_microkernel,iq2_s_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,80.397,1.460757,GOP/s
-vec_dot_microkernel,iq2_xs_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,33.720,3.482858,GOP/s
-vec_dot_microkernel,iq2_xs_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,65.832,1.783955,GOP/s
-vec_dot_microkernel,iq2_xxs_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,28.986,4.051562,GOP/s
-vec_dot_microkernel,iq2_xxs_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,69.737,1.684037,GOP/s
-vec_dot_microkernel,iq3_s_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,142.783,0.822512,GOP/s
-vec_dot_microkernel,iq3_s_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,70.562,1.664363,GOP/s
-vec_dot_microkernel,iq3_xxs_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,76.014,1.544992,GOP/s
-vec_dot_microkernel,iq3_xxs_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,73.452,1.598867,GOP/s
-vec_dot_microkernel,iq4_nl_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,16.924,6.939433,GOP/s
-vec_dot_microkernel,iq4_nl_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,41.497,2.830128,GOP/s
-vec_dot_microkernel,iq4_xs_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,43.546,2.696948,GOP/s
-vec_dot_microkernel,iq4_xs_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,68.559,1.712982,GOP/s
-vec_dot_microkernel,tq1_0_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,18.967,6.191992,GOP/s
-vec_dot_microkernel,tq1_0_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,34.457,3.408322,GOP/s
-vec_dot_microkernel,tq2_0_q8_K,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,17.677,6.643537,GOP/s
-vec_dot_microkernel,tq2_0_q8_K,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,23.848,4.924574,GOP/s
-vec_dot_microkernel,mxfp4_q8_0,decode,SG2044,RVV intrinsic,M=1;N=14336;K=4096,17.522,6.702385,GOP/s
-vec_dot_microkernel,mxfp4_q8_0,decode,K1/X60,RVV intrinsic,M=1;N=14336;K=4096,45.392,2.587276,GOP/s
-vec_dot_microkernel,nvfp4_q8_0,decode,SG2044,scalar,M=1;N=14336;K=4096,310.850,0.377805,GOP/s
-vec_dot_microkernel,nvfp4_q8_0,decode,K1/X60,scalar,M=1;N=14336;K=4096,748.241,0.156956,GOP/s
-quantization,quantize_row_q8_0,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.380,542.905469,MElements/s
-quantization,quantize_row_q8_0,prefill,K1/X60,RVV intrinsic,M=128;K=14336,5.560,330.016487,MElements/s
-quantization,quantize_row_q8_1,prefill,SG2044,RVV intrinsic,M=128;K=14336,4.503,407.500644,MElements/s
-quantization,quantize_row_q8_1,prefill,K1/X60,RVV intrinsic,M=128;K=14336,6.395,286.933900,MElements/s
-quantization,quantize_row_q8_K,prefill,SG2044,RVV intrinsic,M=128;K=14336,3.615,507.651815,MElements/s
-quantization,quantize_row_q8_K,prefill,K1/X60,RVV intrinsic,M=128;K=14336,5.112,358.931036,MElements/s
-dequantization,dequantize_row_q1_0,tensor,SG2044,scalar,N=1024;K=4096,5.611,747.540638,MElements/s
-dequantization,dequantize_row_q1_0,tensor,K1/X60,scalar,N=1024;K=4096,27.911,150.275866,MElements/s
-dequantization,dequantize_row_q4_0,tensor,SG2044,scalar,N=1024;K=4096,9.831,426.623182,MElements/s
-dequantization,dequantize_row_q4_0,tensor,K1/X60,scalar,N=1024;K=4096,24.439,171.620159,MElements/s
-dequantization,dequantize_row_q4_1,tensor,SG2044,scalar,N=1024;K=4096,11.275,372.006690,MElements/s
-dequantization,dequantize_row_q4_1,tensor,K1/X60,scalar,N=1024;K=4096,27.847,150.617066,MElements/s
-dequantization,dequantize_row_q5_0,tensor,SG2044,scalar,N=1024;K=4096,24.944,168.147155,MElements/s
-dequantization,dequantize_row_q5_0,tensor,K1/X60,scalar,N=1024;K=4096,26.144,160.432722,MElements/s
-dequantization,dequantize_row_q5_1,tensor,SG2044,scalar,N=1024;K=4096,26.558,157.928401,MElements/s
-dequantization,dequantize_row_q5_1,tensor,K1/X60,scalar,N=1024;K=4096,28.352,147.934841,MElements/s
-dequantization,dequantize_row_q8_0,tensor,SG2044,scalar,N=1024;K=4096,12.558,333.988894,MElements/s
-dequantization,dequantize_row_q8_0,tensor,K1/X60,scalar,N=1024;K=4096,22.806,183.911155,MElements/s
-dequantization,dequantize_row_mxfp4,tensor,SG2044,scalar,N=1024;K=4096,26.166,160.296560,MElements/s
-dequantization,dequantize_row_mxfp4,tensor,K1/X60,scalar,N=1024;K=4096,24.989,167.844679,MElements/s
-dequantization,dequantize_row_nvfp4,tensor,SG2044,scalar,N=1024;K=4096,27.669,151.588795,MElements/s
-dequantization,dequantize_row_nvfp4,tensor,K1/X60,scalar,N=1024;K=4096,42.156,99.494909,MElements/s
-dequantization,dequantize_row_q2_K,tensor,SG2044,scalar,N=1024;K=4096,6.655,630.210798,MElements/s
-dequantization,dequantize_row_q2_K,tensor,K1/X60,scalar,N=1024;K=4096,30.436,137.807734,MElements/s
-dequantization,dequantize_row_q3_K,tensor,SG2044,scalar,N=1024;K=4096,11.086,378.329548,MElements/s
-dequantization,dequantize_row_q3_K,tensor,K1/X60,scalar,N=1024;K=4096,36.718,114.229143,MElements/s
-dequantization,dequantize_row_q4_K,tensor,SG2044,scalar,N=1024;K=4096,6.127,684.531078,MElements/s
-dequantization,dequantize_row_q4_K,tensor,K1/X60,scalar,N=1024;K=4096,25.029,167.579795,MElements/s
-dequantization,dequantize_row_q5_K,tensor,SG2044,scalar,N=1024;K=4096,10.224,410.224792,MElements/s
-dequantization,dequantize_row_q5_K,tensor,K1/X60,scalar,N=1024;K=4096,37.405,112.132028,MElements/s
-dequantization,dequantize_row_q6_K,tensor,SG2044,scalar,N=1024;K=4096,22.260,188.424503,MElements/s
-dequantization,dequantize_row_q6_K,tensor,K1/X60,scalar,N=1024;K=4096,41.460,101.165527,MElements/s
-dequantization,dequantize_row_tq1_0,tensor,SG2044,scalar,N=1024;K=4096,6.272,668.761670,MElements/s
-dequantization,dequantize_row_tq1_0,tensor,K1/X60,scalar,N=1024;K=4096,37.954,110.510572,MElements/s
-dequantization,dequantize_row_tq2_0,tensor,SG2044,scalar,N=1024;K=4096,6.129,684.362424,MElements/s
-dequantization,dequantize_row_tq2_0,tensor,K1/X60,scalar,N=1024;K=4096,24.191,173.382918,MElements/s
-dequantization,dequantize_row_iq2_xxs,tensor,SG2044,scalar,N=1024;K=4096,9.442,444.217727,MElements/s
-dequantization,dequantize_row_iq2_xxs,tensor,K1/X60,scalar,N=1024;K=4096,28.171,148.884965,MElements/s
-dequantization,dequantize_row_iq2_xs,tensor,SG2044,scalar,N=1024;K=4096,8.857,473.532560,MElements/s
-dequantization,dequantize_row_iq2_xs,tensor,K1/X60,scalar,N=1024;K=4096,30.657,136.813951,MElements/s
-dequantization,dequantize_row_iq2_s,tensor,SG2044,scalar,N=1024;K=4096,9.778,428.962768,MElements/s
-dequantization,dequantize_row_iq2_s,tensor,K1/X60,scalar,N=1024;K=4096,28.500,147.166646,MElements/s
-dequantization,dequantize_row_iq3_xxs,tensor,SG2044,scalar,N=1024;K=4096,9.425,445.010517,MElements/s
-dequantization,dequantize_row_iq3_xxs,tensor,K1/X60,scalar,N=1024;K=4096,28.200,148.732626,MElements/s
-dequantization,dequantize_row_iq3_s,tensor,SG2044,scalar,N=1024;K=4096,11.963,350.612202,MElements/s
-dequantization,dequantize_row_iq3_s,tensor,K1/X60,scalar,N=1024;K=4096,27.588,152.031828,MElements/s
-dequantization,dequantize_row_iq1_s,tensor,SG2044,scalar,N=1024;K=4096,5.754,728.974524,MElements/s
-dequantization,dequantize_row_iq1_s,tensor,K1/X60,scalar,N=1024;K=4096,32.282,129.928630,MElements/s
-dequantization,dequantize_row_iq1_m,tensor,SG2044,scalar,N=1024;K=4096,5.883,712.918718,MElements/s
-dequantization,dequantize_row_iq1_m,tensor,K1/X60,scalar,N=1024;K=4096,34.481,121.641207,MElements/s
-dequantization,dequantize_row_iq4_nl,tensor,SG2044,scalar,N=1024;K=4096,22.882,183.304207,MElements/s
-dequantization,dequantize_row_iq4_nl,tensor,K1/X60,scalar,N=1024;K=4096,27.100,154.772999,MElements/s
-dequantization,dequantize_row_iq4_xs,tensor,SG2044,scalar,N=1024;K=4096,23.183,180.924593,MElements/s
-dequantization,dequantize_row_iq4_xs,tensor,K1/X60,scalar,N=1024;K=4096,26.496,158.302011,MElements/s
+matrix_multiplication,mul_mat_f32,decode,SG2044,rvv_f32_vec_dot,M=1;N=4096;K=4096,19.541076,1.717123,GOP/s
+matrix_multiplication,mul_mat_f32,decode,K1/X60,rvv_f32_vec_dot,M=1;N=4096;K=4096,16.680309,2.011619,GOP/s
+matrix_multiplication,mul_mat_f16,decode,SG2044,rvv_f16_vec_dot,M=1;N=4096;K=4096,6.833510,4.910278,GOP/s
+matrix_multiplication,mul_mat_f16,decode,K1/X60,rvv_f16_vec_dot,M=1;N=4096;K=4096,10.094934,3.323888,GOP/s
+matrix_multiplication,mul_mat_q1_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,3.235204,10.371659,GOP/s
+matrix_multiplication,mul_mat_q1_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,9.088584,3.691932,GOP/s
+matrix_multiplication,mul_mat_q4_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,4.518320,7.426307,GOP/s
+matrix_multiplication,mul_mat_q4_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,15.211242,2.205897,GOP/s
+matrix_multiplication,mul_mat_q4_1,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,5.444093,6.163456,GOP/s
+matrix_multiplication,mul_mat_q4_1,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,16.099845,2.084146,GOP/s
+matrix_multiplication,mul_mat_q5_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,6.294038,5.331145,GOP/s
+matrix_multiplication,mul_mat_q5_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,18.693953,1.794935,GOP/s
+matrix_multiplication,mul_mat_q5_1,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,7.537963,4.451393,GOP/s
+matrix_multiplication,mul_mat_q5_1,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,20.294408,1.653383,GOP/s
+matrix_multiplication,mul_mat_q8_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,54.051598,0.620785,GOP/s
+matrix_multiplication,mul_mat_q8_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,15.924164,2.107139,GOP/s
+matrix_multiplication,mul_mat_q2_K,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,3.593546,9.337415,GOP/s
+matrix_multiplication,mul_mat_q2_K,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,13.702322,2.448814,GOP/s
+matrix_multiplication,mul_mat_q3_K,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,4.651160,7.214206,GOP/s
+matrix_multiplication,mul_mat_q3_K,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,14.029094,2.391775,GOP/s
+matrix_multiplication,mul_mat_q4_K,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,3.488385,9.618902,GOP/s
+matrix_multiplication,mul_mat_q4_K,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,13.629952,2.461816,GOP/s
+matrix_multiplication,mul_mat_q5_K,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,29.056817,1.154787,GOP/s
+matrix_multiplication,mul_mat_q5_K,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,26.925787,1.246182,GOP/s
+matrix_multiplication,mul_mat_q6_K,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,7.243702,4.632221,GOP/s
+matrix_multiplication,mul_mat_q6_K,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,14.289597,2.348172,GOP/s
+matrix_multiplication,mul_mat_iq1_s,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,6.932851,4.839919,GOP/s
+matrix_multiplication,mul_mat_iq1_s,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,12.598438,2.663380,GOP/s
+matrix_multiplication,mul_mat_iq1_m,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,12.713226,2.639333,GOP/s
+matrix_multiplication,mul_mat_iq1_m,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,23.560875,1.424159,GOP/s
+matrix_multiplication,mul_mat_iq2_s,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,16.569793,2.025036,GOP/s
+matrix_multiplication,mul_mat_iq2_s,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,23.254533,1.442920,GOP/s
+matrix_multiplication,mul_mat_iq2_xs,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,8.200546,4.091731,GOP/s
+matrix_multiplication,mul_mat_iq2_xs,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,19.146297,1.752529,GOP/s
+matrix_multiplication,mul_mat_iq2_xxs,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,8.429827,3.980441,GOP/s
+matrix_multiplication,mul_mat_iq2_xxs,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,20.196183,1.661424,GOP/s
+matrix_multiplication,mul_mat_iq3_s,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,30.565645,1.097783,GOP/s
+matrix_multiplication,mul_mat_iq3_s,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,20.500965,1.636725,GOP/s
+matrix_multiplication,mul_mat_iq3_xxs,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,12.816356,2.618095,GOP/s
+matrix_multiplication,mul_mat_iq3_xxs,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,23.362855,1.436230,GOP/s
+matrix_multiplication,mul_mat_iq4_nl,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,5.150412,6.514902,GOP/s
+matrix_multiplication,mul_mat_iq4_nl,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,12.144835,2.762856,GOP/s
+matrix_multiplication,mul_mat_iq4_xs,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,12.443914,2.696453,GOP/s
+matrix_multiplication,mul_mat_iq4_xs,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,19.829567,1.692141,GOP/s
+matrix_multiplication,mul_mat_tq1_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,4.186209,8.015470,GOP/s
+matrix_multiplication,mul_mat_tq1_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,10.049628,3.338873,GOP/s
+matrix_multiplication,mul_mat_tq2_0,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,3.082524,10.885378,GOP/s
+matrix_multiplication,mul_mat_tq2_0,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,7.000006,4.793486,GOP/s
+matrix_multiplication,mul_mat_mxfp4,decode,SG2044,rvv_quantized_vec_dot,M=1;N=4096;K=4096,5.394894,6.219665,GOP/s
+matrix_multiplication,mul_mat_mxfp4,decode,K1/X60,rvv_quantized_vec_dot,M=1;N=4096;K=4096,13.234815,2.535316,GOP/s
+matrix_multiplication,mul_mat_nvfp4,decode,SG2044,scalar_quantized_vec_dot,M=1;N=4096;K=4096,110.654219,0.303237,GOP/s
+matrix_multiplication,mul_mat_nvfp4,decode,K1/X60,scalar_quantized_vec_dot,M=1;N=4096;K=4096,207.564220,0.161658,GOP/s
+matrix_multiplication,mul_mat_f32,prefill,SG2044,rvv_f32_vec_dot,M=128;N=4096;K=4096,577.845586,7.432725,GOP/s
+matrix_multiplication,mul_mat_f32,prefill,K1/X60,rvv_f32_vec_dot,M=128;N=4096;K=4096,1668.433894,2.574251,GOP/s
+matrix_multiplication,mul_mat_f16,prefill,SG2044,rvv_f16_vec_dot,M=128;N=4096;K=4096,285.691164,15.033602,GOP/s
+matrix_multiplication,mul_mat_f16,prefill,K1/X60,rvv_f16_vec_dot,M=128;N=4096;K=4096,725.461613,5.920323,GOP/s
+matrix_multiplication,mul_mat_q1_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,376.363372,11.411757,GOP/s
+matrix_multiplication,mul_mat_q1_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1134.469004,3.785883,GOP/s
+matrix_multiplication,mul_mat_q4_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,568.052133,7.560868,GOP/s
+matrix_multiplication,mul_mat_q4_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1895.435308,2.265953,GOP/s
+matrix_multiplication,mul_mat_q4_1,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,685.553110,6.264967,GOP/s
+matrix_multiplication,mul_mat_q4_1,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1988.738638,2.159644,GOP/s
+matrix_multiplication,mul_mat_q5_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,802.537893,5.351731,GOP/s
+matrix_multiplication,mul_mat_q5_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2324.196198,1.847937,GOP/s
+matrix_multiplication,mul_mat_q5_1,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,966.941144,4.441808,GOP/s
+matrix_multiplication,mul_mat_q5_1,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2505.177327,1.714436,GOP/s
+matrix_multiplication,mul_mat_q8_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1070.734500,4.011235,GOP/s
+matrix_multiplication,mul_mat_q8_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1928.411259,2.227205,GOP/s
+matrix_multiplication,mul_mat_q2_K,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,444.701382,9.658093,GOP/s
+matrix_multiplication,mul_mat_q2_K,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1751.230173,2.452543,GOP/s
+matrix_multiplication,mul_mat_q3_K,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,598.618698,7.174796,GOP/s
+matrix_multiplication,mul_mat_q3_K,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1758.333620,2.442635,GOP/s
+matrix_multiplication,mul_mat_q4_K,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,445.681747,9.636848,GOP/s
+matrix_multiplication,mul_mat_q4_K,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1711.840360,2.508977,GOP/s
+matrix_multiplication,mul_mat_q5_K,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1047.753899,4.099214,GOP/s
+matrix_multiplication,mul_mat_q5_K,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,3401.551917,1.262649,GOP/s
+matrix_multiplication,mul_mat_q6_K,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,576.988313,7.443768,GOP/s
+matrix_multiplication,mul_mat_q6_K,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1713.712461,2.506236,GOP/s
+matrix_multiplication,mul_mat_iq1_s,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,884.676403,4.854846,GOP/s
+matrix_multiplication,mul_mat_iq1_s,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1567.172231,2.740584,GOP/s
+matrix_multiplication,mul_mat_iq1_m,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1630.412456,2.634283,GOP/s
+matrix_multiplication,mul_mat_iq1_m,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2968.436420,1.446879,GOP/s
+matrix_multiplication,mul_mat_iq2_s,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1713.720606,2.506224,GOP/s
+matrix_multiplication,mul_mat_iq2_s,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2923.392440,1.469172,GOP/s
+matrix_multiplication,mul_mat_iq2_xs,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,892.979922,4.809702,GOP/s
+matrix_multiplication,mul_mat_iq2_xs,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2391.134226,1.796205,GOP/s
+matrix_multiplication,mul_mat_iq2_xxs,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1044.538911,4.111831,GOP/s
+matrix_multiplication,mul_mat_iq2_xxs,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2518.863607,1.705121,GOP/s
+matrix_multiplication,mul_mat_iq3_s,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2144.988499,2.002326,GOP/s
+matrix_multiplication,mul_mat_iq3_s,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2564.238440,1.674948,GOP/s
+matrix_multiplication,mul_mat_iq3_xxs,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1470.965383,2.919829,GOP/s
+matrix_multiplication,mul_mat_iq3_xxs,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2916.835122,1.472475,GOP/s
+matrix_multiplication,mul_mat_iq4_nl,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,653.276003,6.574506,GOP/s
+matrix_multiplication,mul_mat_iq4_nl,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1496.280262,2.870430,GOP/s
+matrix_multiplication,mul_mat_iq4_xs,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,736.788293,5.829310,GOP/s
+matrix_multiplication,mul_mat_iq4_xs,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,2500.410969,1.717705,GOP/s
+matrix_multiplication,mul_mat_tq1_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,538.116076,7.981489,GOP/s
+matrix_multiplication,mul_mat_tq1_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1242.005829,3.458089,GOP/s
+matrix_multiplication,mul_mat_tq2_0,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,358.251061,11.988708,GOP/s
+matrix_multiplication,mul_mat_tq2_0,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,863.486981,4.973980,GOP/s
+matrix_multiplication,mul_mat_mxfp4,prefill,SG2044,rvv_quantized_vec_dot,M=128;N=4096;K=4096,689.968806,6.224872,GOP/s
+matrix_multiplication,mul_mat_mxfp4,prefill,K1/X60,rvv_quantized_vec_dot,M=128;N=4096;K=4096,1633.675363,2.629021,GOP/s
+matrix_multiplication,mul_mat_nvfp4,prefill,SG2044,scalar_quantized_vec_dot,M=128;N=4096;K=4096,14111.915889,0.304350,GOP/s
+matrix_multiplication,mul_mat_nvfp4,prefill,K1/X60,scalar_quantized_vec_dot,M=128;N=4096;K=4096,26511.182741,0.162006,GOP/s
+vec_dot_microkernel,q1_0_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,10.258445,11.448178,GOP/s
+vec_dot_microkernel,q1_0_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,31.132359,3.772297,GOP/s
+vec_dot_microkernel,q4_0_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,15.528839,7.562736,GOP/s
+vec_dot_microkernel,q4_0_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,52.674398,2.229556,GOP/s
+vec_dot_microkernel,q4_1_q8_1,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,18.700793,6.279975,GOP/s
+vec_dot_microkernel,q4_1_q8_1,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,55.708052,2.108143,GOP/s
+vec_dot_microkernel,q5_0_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,21.670166,5.419456,GOP/s
+vec_dot_microkernel,q5_0_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,64.814675,1.811943,GOP/s
+vec_dot_microkernel,q5_1_q8_1,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,24.626589,4.768850,GOP/s
+vec_dot_microkernel,q5_1_q8_1,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,70.374556,1.668792,GOP/s
+vec_dot_microkernel,q8_0_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,175.741950,0.668255,GOP/s
+vec_dot_microkernel,q8_0_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,55.232876,2.126279,GOP/s
+vec_dot_microkernel,q2_K_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,12.413725,9.460538,GOP/s
+vec_dot_microkernel,q2_K_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,47.363033,2.479582,GOP/s
+vec_dot_microkernel,q3_K_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,15.679809,7.489920,GOP/s
+vec_dot_microkernel,q3_K_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,48.220742,2.435477,GOP/s
+vec_dot_microkernel,q4_K_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,11.578311,10.143147,GOP/s
+vec_dot_microkernel,q4_K_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,46.882691,2.504987,GOP/s
+vec_dot_microkernel,q5_K_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,101.524201,1.156774,GOP/s
+vec_dot_microkernel,q5_K_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,93.608742,1.254589,GOP/s
+vec_dot_microkernel,q6_K_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,23.787856,4.936994,GOP/s
+vec_dot_microkernel,q6_K_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,50.592703,2.321293,GOP/s
+vec_dot_microkernel,iq1_s_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,24.158537,4.861243,GOP/s
+vec_dot_microkernel,iq1_s_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,43.309199,2.711676,GOP/s
+vec_dot_microkernel,iq1_m_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,44.309276,2.650472,GOP/s
+vec_dot_microkernel,iq1_m_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,81.822750,1.435304,GOP/s
+vec_dot_microkernel,iq2_s_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,59.637905,1.969226,GOP/s
+vec_dot_microkernel,iq2_s_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,80.703424,1.455211,GOP/s
+vec_dot_microkernel,iq2_xs_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,28.197355,4.164948,GOP/s
+vec_dot_microkernel,iq2_xs_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,66.221810,1.773442,GOP/s
+vec_dot_microkernel,iq2_xxs_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,29.081428,4.038334,GOP/s
+vec_dot_microkernel,iq2_xxs_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,69.997216,1.677788,GOP/s
+vec_dot_microkernel,iq3_s_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,98.423751,1.193213,GOP/s
+vec_dot_microkernel,iq3_s_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,71.010315,1.653851,GOP/s
+vec_dot_microkernel,iq3_xxs_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,43.927253,2.673523,GOP/s
+vec_dot_microkernel,iq3_xxs_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,81.132560,1.447514,GOP/s
+vec_dot_microkernel,iq4_nl_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,17.660278,6.649981,GOP/s
+vec_dot_microkernel,iq4_nl_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,41.618910,2.821807,GOP/s
+vec_dot_microkernel,iq4_xs_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,43.587251,2.694378,GOP/s
+vec_dot_microkernel,iq4_xs_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,68.538399,1.713500,GOP/s
+vec_dot_microkernel,tq1_0_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,14.456003,8.123996,GOP/s
+vec_dot_microkernel,tq1_0_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,34.452757,3.408741,GOP/s
+vec_dot_microkernel,tq2_0_q8_K,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,10.651867,11.025345,GOP/s
+vec_dot_microkernel,tq2_0_q8_K,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,23.790775,4.936389,GOP/s
+vec_dot_microkernel,mxfp4_q8_0,decode,SG2044,rvv_intrinsic,M=1;N=14336;K=4096,18.636662,6.301585,GOP/s
+vec_dot_microkernel,mxfp4_q8_0,decode,K1/X60,rvv_intrinsic,M=1;N=14336;K=4096,45.511187,2.580476,GOP/s
+vec_dot_microkernel,nvfp4_q8_0,decode,SG2044,scalar,M=1;N=14336;K=4096,387.974273,0.302702,GOP/s
+vec_dot_microkernel,nvfp4_q8_0,decode,K1/X60,scalar,M=1;N=14336;K=4096,741.770647,0.158325,GOP/s
+quantization,quantize_row_q8_0,prefill,SG2044,rvv_intrinsic,M=128;K=14336,3.369885,544.531422,MElements/s
+quantization,quantize_row_q8_0,prefill,K1/X60,rvv_intrinsic,M=128;K=14336,5.551527,330.541129,MElements/s
+quantization,quantize_row_q8_1,prefill,SG2044,rvv_intrinsic,M=128;K=14336,3.452155,531.554348,MElements/s
+quantization,quantize_row_q8_1,prefill,K1/X60,rvv_intrinsic,M=128;K=14336,6.381506,287.550932,MElements/s
+quantization,quantize_row_q8_K,prefill,SG2044,rvv_intrinsic,M=128;K=14336,3.443585,532.877220,MElements/s
+quantization,quantize_row_q8_K,prefill,K1/X60,rvv_intrinsic,M=128;K=14336,5.077997,361.364495,MElements/s
+dequantization,dequantize_row_q1_0,tensor,SG2044,scalar,N=1024;K=4096,5.620935,746.193360,MElements/s
+dequantization,dequantize_row_q1_0,tensor,K1/X60,scalar,N=1024;K=4096,27.957046,150.026726,MElements/s
+dequantization,dequantize_row_q4_0,tensor,SG2044,scalar,N=1024;K=4096,9.818903,427.166253,MElements/s
+dequantization,dequantize_row_q4_0,tensor,K1/X60,scalar,N=1024;K=4096,24.584340,170.608773,MElements/s
+dequantization,dequantize_row_q4_1,tensor,SG2044,scalar,N=1024;K=4096,11.390560,368.226321,MElements/s
+dequantization,dequantize_row_q4_1,tensor,K1/X60,scalar,N=1024;K=4096,27.892194,150.375552,MElements/s
+dequantization,dequantize_row_q5_0,tensor,SG2044,scalar,N=1024;K=4096,24.850589,168.780869,MElements/s
+dequantization,dequantize_row_q5_0,tensor,K1/X60,scalar,N=1024;K=4096,26.275838,159.625889,MElements/s
+dequantization,dequantize_row_q5_1,tensor,SG2044,scalar,N=1024;K=4096,26.117644,160.592736,MElements/s
+dequantization,dequantize_row_q5_1,tensor,K1/X60,scalar,N=1024;K=4096,28.423596,147.564155,MElements/s
+dequantization,dequantize_row_q8_0,tensor,SG2044,scalar,N=1024;K=4096,12.663845,331.203030,MElements/s
+dequantization,dequantize_row_q8_0,tensor,K1/X60,scalar,N=1024;K=4096,22.788447,184.053964,MElements/s
+dequantization,dequantize_row_mxfp4,tensor,SG2044,scalar,N=1024;K=4096,26.103415,160.680279,MElements/s
+dequantization,dequantize_row_mxfp4,tensor,K1/X60,scalar,N=1024;K=4096,25.554878,164.129294,MElements/s
+dequantization,dequantize_row_nvfp4,tensor,SG2044,scalar,N=1024;K=4096,27.667612,151.596170,MElements/s
+dequantization,dequantize_row_nvfp4,tensor,K1/X60,scalar,N=1024;K=4096,41.539392,100.971723,MElements/s
+dequantization,dequantize_row_q2_K,tensor,SG2044,scalar,N=1024;K=4096,6.687770,627.160324,MElements/s
+dequantization,dequantize_row_q2_K,tensor,K1/X60,scalar,N=1024;K=4096,30.962970,135.461938,MElements/s
+dequantization,dequantize_row_q3_K,tensor,SG2044,scalar,N=1024;K=4096,11.294910,371.344615,MElements/s
+dequantization,dequantize_row_q3_K,tensor,K1/X60,scalar,N=1024;K=4096,36.718950,114.227230,MElements/s
+dequantization,dequantize_row_q4_K,tensor,SG2044,scalar,N=1024;K=4096,6.143867,682.681445,MElements/s
+dequantization,dequantize_row_q4_K,tensor,K1/X60,scalar,N=1024;K=4096,25.069472,167.307230,MElements/s
+dequantization,dequantize_row_q5_K,tensor,SG2044,scalar,N=1024;K=4096,11.020818,380.580081,MElements/s
+dequantization,dequantize_row_q5_K,tensor,K1/X60,scalar,N=1024;K=4096,37.416266,112.098412,MElements/s
+dequantization,dequantize_row_q6_K,tensor,SG2044,scalar,N=1024;K=4096,21.633085,193.883766,MElements/s
+dequantization,dequantize_row_q6_K,tensor,K1/X60,scalar,N=1024;K=4096,41.365730,101.395625,MElements/s
+dequantization,dequantize_row_tq1_0,tensor,SG2044,scalar,N=1024;K=4096,6.273427,668.582579,MElements/s
+dequantization,dequantize_row_tq1_0,tensor,K1/X60,scalar,N=1024;K=4096,37.982002,110.428724,MElements/s
+dequantization,dequantize_row_tq2_0,tensor,SG2044,scalar,N=1024;K=4096,6.226667,673.603336,MElements/s
+dequantization,dequantize_row_tq2_0,tensor,K1/X60,scalar,N=1024;K=4096,24.156726,173.628831,MElements/s
+dequantization,dequantize_row_iq2_xxs,tensor,SG2044,scalar,N=1024;K=4096,9.460332,443.356980,MElements/s
+dequantization,dequantize_row_iq2_xxs,tensor,K1/X60,scalar,N=1024;K=4096,28.256143,148.438660,MElements/s
+dequantization,dequantize_row_iq2_xs,tensor,SG2044,scalar,N=1024;K=4096,9.115780,460.114658,MElements/s
+dequantization,dequantize_row_iq2_xs,tensor,K1/X60,scalar,N=1024;K=4096,30.684457,136.691485,MElements/s
+dequantization,dequantize_row_iq2_s,tensor,SG2044,scalar,N=1024;K=4096,9.834103,426.506007,MElements/s
+dequantization,dequantize_row_iq2_s,tensor,K1/X60,scalar,N=1024;K=4096,28.592592,146.691980,MElements/s
+dequantization,dequantize_row_iq3_xxs,tensor,SG2044,scalar,N=1024;K=4096,9.494612,441.756230,MElements/s
+dequantization,dequantize_row_iq3_xxs,tensor,K1/X60,scalar,N=1024;K=4096,28.263643,148.399270,MElements/s
+dequantization,dequantize_row_iq3_s,tensor,SG2044,scalar,N=1024;K=4096,11.710181,358.175832,MElements/s
+dequantization,dequantize_row_iq3_s,tensor,K1/X60,scalar,N=1024;K=4096,27.571494,152.124657,MElements/s
+dequantization,dequantize_row_iq1_s,tensor,SG2044,scalar,N=1024;K=4096,5.768545,727.099121,MElements/s
+dequantization,dequantize_row_iq1_s,tensor,K1/X60,scalar,N=1024;K=4096,32.312082,129.806058,MElements/s
+dequantization,dequantize_row_iq1_m,tensor,SG2044,scalar,N=1024;K=4096,5.953676,704.489798,MElements/s
+dequantization,dequantize_row_iq1_m,tensor,K1/X60,scalar,N=1024;K=4096,34.473382,121.667900,MElements/s
+dequantization,dequantize_row_iq4_nl,tensor,SG2044,scalar,N=1024;K=4096,23.106732,181.518702,MElements/s
+dequantization,dequantize_row_iq4_nl,tensor,K1/X60,scalar,N=1024;K=4096,27.053361,155.038185,MElements/s
+dequantization,dequantize_row_iq4_xs,tensor,SG2044,scalar,N=1024;K=4096,23.163352,181.075002,MElements/s
+dequantization,dequantize_row_iq4_xs,tensor,K1/X60,scalar,N=1024;K=4096,26.552103,157.965043,MElements/s
 elementwise_activation,add,forward,SG2044,scalar,"hidden[128,4096]",0.799,,
 elementwise_activation,add,forward,K1/X60,SpacemiT RVV intrinsic,"hidden[128,4096]",1.556,,
 elementwise_activation,sub,forward,SG2044,scalar,"hidden[128,4096]",0.797,,
