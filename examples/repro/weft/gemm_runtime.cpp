@@ -110,10 +110,12 @@ int main(int argc, char **argv) {
       2.0 * static_cast<double>(m) * kK * static_cast<double>(kN);
   std::printf("kernel=gemm_f32\ntarget=%s\nphase=%s\nM=%zu\nN=%zu\nK=%zu\n",
               WEFT_TARGET_NAME, phase, m, kN, kK);
+  std::printf("input_policy=dense-fixed-values\n");
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               max_absolute, max_relative, repetitions);
   std::printf("cold_median_us=%.3f\ncold_gop_s=%.6f\n", median_us,
               operations / median_us / 1.0e3);
+  std::printf("output_sample=%.9g\n", output[0]);
   return 0;
 }
