@@ -71,4 +71,4 @@ VLEN256的IME1 target当前均是明确unsupported，不会由terminal translato
 
 leaf/capability集合不按kernel、operator或量化格式注册。无合法leaf、packing/access不完整、
 toolchain不支持spelling、resource/effect不闭合时当前module失败；不能回到emitter重选、静默
-scalar化或调用materials/GGML helper。
+scalar化或调用仓库外reference/GGML helper。

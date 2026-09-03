@@ -36,7 +36,7 @@ intrinsic C / local asm
 
 作者树冻结后，baseline不能指定LMUL、`vl`、lane/register/fragment mapping、memory form、invocation-local pack schema、RVV/IME leaf、pipeline、spill或intrinsic spelling。这些由RISC-V passes与[leaf contracts](../compiler/leaves.md)决定。
 
-可以阅读baseline或`materials/`理解microkernel、reuse和指令组织，但知识必须分别进入DSL tree、physical compiler或local leaf；baseline函数本身不得调用、链接、包装或成为fallback。
+可以阅读baseline或仓库外的`ref/materials/`理解microkernel、reuse和指令组织，但知识必须分别进入DSL tree、physical compiler或local leaf；baseline函数本身不得调用、链接、包装或成为fallback。
 
 ### 2.3 不参与编译选择
 
@@ -100,7 +100,7 @@ production `MUL_MAT`、standalone vec-dot、activation quantize和row dequantize
 不允许：
 
 - 为追一行数字增加kernel名、format名、exact closure或whole-kernel leaf；
-- 通过GGML/materials调用、legacy path或silent scalar fallback通过测试；
+- 通过GGML、仓库外reference调用、legacy path或silent scalar fallback通过测试；
 - 数值失败仍记录性能；
 - 为float bit-exact修改作者tree或禁用合法融合；
 - 用更小shape、不同phase、timing scope或helper替换失败case；

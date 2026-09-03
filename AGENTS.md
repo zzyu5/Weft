@@ -25,8 +25,8 @@
   terminal emitter 只能拼写已选 op，缺少决定必须报 verifier 错误，不能重新选择或 fallback。
 - IntentDSL/其他前端在仓库外生成 canonical Weft IR；Weft 不解析或链接 IntentDSL。
   `/home/kingdom/phdworks/intentdsl` 默认只读。
-- `materials/` 只作代码与硬件知识供体，不进入 CMake、include、import、link 或 runtime；
-  新代码不得调用、包装或 fallback 到旧实现。
+- `/home/kingdom/phdworks/ref/materials/` 是仓库外的只读代码与硬件知识供体，不进入 CMake、
+  include、import、link 或 runtime；新代码不得调用、包装或 fallback 到旧实现。
 - `source/` baseline 决定比较时作者应自然表达的算法 variant、blocking、staging、persistent
   layout 与计时边界；作者树冻结后，它不参与 layout、leaf 或参数选择，也不进入生成代码。
 

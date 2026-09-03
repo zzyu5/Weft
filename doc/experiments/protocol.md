@@ -65,7 +65,7 @@ matrix/vec-dot按`2MNK`计算GOP/s；quantize/dequantize按logical elements计�
 - `report/baseline/ggml-riscv-kernel-performance.csv`：当前协议下固定的GGML baseline；
 - `report/weft-kernel-performance.csv`：由当前checkout完整重测固定manifest后得到的Weft结果快照。
 
-baseline只在机器、toolchain、flags、算法/shape或测量协议变化时重测；Weft compiler修改不触发baseline重跑。历史compiler结果、旧协议行和`materials/experiments`不得混入当前表。
+baseline只在机器、toolchain、flags、算法/shape或测量协议变化时重测；Weft compiler修改不触发baseline重跑。历史compiler结果、旧协议行和仓库外历史实验不得混入当前表。
 
 Weft结果表只能由一次完整快照运行整体替换，不能按受影响case局部覆盖旧行。快照运行必须从
 干净worktree执行默认`cmake --build build`，使用本次生成的`weft-compile`完成整个固定manifest，

@@ -35,7 +35,7 @@ translator不能：
 - 生成source Level、contract reduction loop、动态local-pack loop或pipeline结构；
 - 决定spill/reload/rematerialize、workspace或persistent ABI；
 - 同时读取Canonical Kernel IR与side assignment合成physical program；
-- 调用GGML、materials、legacy helper或fallback。
+- 调用GGML、仓库外reference code、legacy helper或fallback。
 
 translator若发现binding/type/leaf之间不一致必须失败。这表示前序pass或verifier合同遗漏，不能在
 这里加一个default或第二selector。

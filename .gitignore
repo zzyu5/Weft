@@ -18,9 +18,3 @@ __pycache__/
 
 # Local parallel worktrees
 /.worktrees/
-
-# Read-only historical materials. Existing tracked files remain tracked; new
-# local captures are intentionally not admitted into the new source tree.
-/materials/archive-local/
-/materials/experiments/**
-/materials/artifacts/**

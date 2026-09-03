@@ -1,4 +1,0 @@
-.trellis/scripts/ondevice/q8_0_verify_driver.c:33:10: fatal error: 'math.h' file not found
-   33 | #include <math.h>
-      |          ^~~~~~~~
-1 error generated.

@@ -1,2 +1,0 @@
-add_mlir_interface(WEFTEmitCLowerableOpInterface)
-add_mlir_interface(TunableScheduleOpInterface)
