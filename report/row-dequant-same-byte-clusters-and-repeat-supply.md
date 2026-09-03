@@ -109,6 +109,8 @@ std 把每个 32-element group改为 4 个 code point，每个 code有 4-element
 | Q4_K `unroll=2` | SG从约 705降至约 499 | row decode没有由该复制形成有效 schedule；保留 unroll=1 |
 | Q4_K 较宽 LMUL | m1/m2约 705，m4/m8约 518–521 | 更宽 carrier增加time/part组织而不删工作；选 m1 |
 | IQ3_S 4-element sign window | verifier拒绝 half-byte起点 | 不能把未闭合的半字节 relation伪装成 byte-aligned window |
+| IQ3_S SG LMUL扫描 | m1/m2/m4/m8均为约 247–253 MElements/s | 参数选择不能消除 pair8 carrier产生的 slide |
+| IQ3_S `code8×payload4` 作者树 | 双机均在4-element logical-u1 sign projection处被拒，未进入计时 | 删除slide需要真实half-byte projection；不能放宽byte-window verifier伪装支持 |
 
 ## 6. 结构验收与参考实现对照
 
@@ -127,7 +129,9 @@ scalar load/broadcast relation成为真实 op，terminal C只拼写。
 - IQ3_S 的数学工作量已经和 donor一致，剩余 SG 差距落在 P3：两个 4-byte entry当前仍作为一个
   8-lane indexed lookup组织，qh/sign 的 half-byte relation没有形成可供两个 entry共享的闭合
   physical window。这里需要 typed two-entry payload relation及合法的半字节 sign projection；
-  当前没有第二个独立生产输入证明合同边界，因此本轮未新增 op。
+  当前没有第二个独立生产输入证明完整合同边界，因此本轮未新增 op。IQ3_XXS也有相邻4-byte
+  entry，但其sign来自同一个u32 metadata而非独立grouped/layered-u1 field，只能证明entry一半，
+  不能证明这个组合合同。
 - TQ1_0 缺的是 canonical shaped output projection，不是 RISC-V leaf。三组 shaped radix值可以用
   现有 `iota` 表达，但现有 `L.subs`没有输出 offset，frontend也禁止对 View做 shaped gather；
   在新增明确的 offset projection/reshape 语言语义以前，只能保留 scalar tree。
