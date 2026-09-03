@@ -408,10 +408,18 @@ public:
         if (havePrevious &&
             (peak.total() > previous.total() ||
              (peak.total() == previous.total() && peak.count >= previous.count))) {
-          kernel.emitError()
+          auto diagnostic = kernel.emitError()
               << "resource spill made no progress: " << peak.vector
               << " vector and " << peak.fragment
               << " fragment groups remain simultaneously live";
+          if (peak.block) {
+            llvm::SmallVector<Interval> intervals = intervalsFor(*peak.block);
+            for (const Interval &interval : intervals)
+              if (interval.begin <= peak.point && peak.point <= interval.end)
+                diagnostic << " [" << interval.value << ": " << interval.groups
+                           << " groups, interval " << interval.begin << ".."
+                           << interval.end << "]";
+          }
           failed = true;
           break;
         }

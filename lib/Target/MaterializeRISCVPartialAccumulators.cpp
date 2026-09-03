@@ -121,6 +121,41 @@ std::optional<size_t> axisPosition(riscv::ValueType value, int64_t axis) {
   return static_cast<size_t>(found - value.getAxisIds().asArrayRef().begin());
 }
 
+std::optional<int64_t>
+laneProductForAxes(riscv::ValueType value, llvm::ArrayRef<int64_t> axes) {
+  int64_t result = 1;
+  for (int64_t axis : axes) {
+    auto position = axisPosition(value, axis);
+    if (!position)
+      return std::nullopt;
+    const int64_t lanes = value.getLayout().getLaneFactors()[*position];
+    if (lanes <= 0 || result > std::numeric_limits<int64_t>::max() / lanes)
+      return std::nullopt;
+    result *= lanes;
+  }
+  return result;
+}
+
+std::optional<int64_t>
+primaryReductionLaneAxis(riscv::ValueType partial,
+                         llvm::ArrayRef<int64_t> reductionAxes) {
+  if (!partial || reductionAxes.empty())
+    return std::nullopt;
+  std::optional<int64_t> primary;
+  for (int64_t axis : reductionAxes) {
+    auto position = axisPosition(partial, axis);
+    if (!position)
+      return std::nullopt;
+    if (partial.getLayout().getLaneFactors()[*position] > 1)
+      primary = axis;
+  }
+  // Layout propagation coalesces reduction coordinates in logical order and
+  // makes the last lane-bearing axis the physical anchor. A scalar product has
+  // no non-unit lane, but still needs one deterministic retained identity.
+  return primary ? primary
+                 : std::optional<int64_t>(reductionAxes.back());
+}
+
 riscv::ValueType projectOneWindow(mlir::Builder &builder, riscv::ValueType value,
                                   int64_t axis) {
   auto position = axisPosition(value, axis);
@@ -1736,35 +1771,12 @@ riscv::ValueType groupedLanePartialSlotType(mlir::Builder &builder,
     return {};
   const int64_t partialWidth =
       2 * std::max<int64_t>(8, lhsElement.getWidth());
-  auto lhsLanes = riscv_internal::staticProduct(
-      lhs.getLayout().getLaneFactors().asArrayRef());
-  auto rhsLanes = riscv_internal::staticProduct(
-      rhs.getLayout().getLaneFactors().asArrayRef());
-  if (!lhsLanes || !rhsLanes || *lhsLanes <= 0 || *rhsLanes <= 0 ||
-      lanes > *lhsLanes || lanes > *rhsLanes ||
-      (lhs.getLayout().getLmulEighths() * lanes) %
-          *lhsLanes ||
-      (rhs.getLayout().getLmulEighths() * lanes) %
-          *rhsLanes)
+  auto lhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(lhs, lanes);
+  auto rhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(rhs, lanes);
+  if (!lhsSliceLMUL || !rhsSliceLMUL || *lhsSliceLMUL != *rhsSliceLMUL ||
+      *lhsSliceLMUL > std::numeric_limits<int64_t>::max() / 2)
     return {};
-  int64_t lhsSliceLMUL =
-      lhs.getLayout().getLmulEighths() * lanes / *lhsLanes;
-  int64_t rhsSliceLMUL =
-      rhs.getLayout().getLmulEighths() * lanes / *rhsLanes;
-  // A hardware sub-register slice is carried in m1, matching the typed
-  // RVVPartialSet contract.  Otherwise the widened product has exactly twice
-  // the LMUL of the actual source lane slice, not twice an independently
-  // reconstructed per-dot factor.
-  if (lhsSliceLMUL > 0 && lhsSliceLMUL < 8 &&
-      lhs.getLayout().getLmulEighths() > lhsSliceLMUL)
-    lhsSliceLMUL = 8;
-  if (rhsSliceLMUL > 0 && rhsSliceLMUL < 8 &&
-      rhs.getLayout().getLmulEighths() > rhsSliceLMUL)
-    rhsSliceLMUL = 8;
-  if (lhsSliceLMUL <= 0 || lhsSliceLMUL != rhsSliceLMUL ||
-      lhsSliceLMUL > std::numeric_limits<int64_t>::max() / 2)
-    return {};
-  const int64_t partialLMUL = 2 * lhsSliceLMUL;
+  const int64_t partialLMUL = 2 * *lhsSliceLMUL;
   auto axisIds = riscv_internal::integers(builder, {reductionAxis});
   auto one = riscv_internal::integers(builder, {1});
   auto lane = riscv_internal::integers(builder, {lanes});
@@ -1965,9 +1977,10 @@ partialFinalizeInstruction(riscv::PartialSetType input,
   auto axis = llvm::find(partial.getAxisIds().asArrayRef(), reductionAxis);
   if (axis == partial.getAxisIds().asArrayRef().end())
     return std::nullopt;
-  const size_t position = static_cast<size_t>(
-      axis - partial.getAxisIds().asArrayRef().begin());
-  return partial.getLayout().getLaneFactors()[position] == 1
+  auto lanes = riscv::rvvLaneCount(partial);
+  if (!lanes)
+    return std::nullopt;
+  return *lanes == 1
              ? llvm::StringRef("rvv.partial-finalize.extract")
              : llvm::StringRef("rvv.partial-finalize.reduce");
 }
@@ -4286,7 +4299,6 @@ public:
       if (!dot || !dot->getBlock() ||
           dot.getPartialTopology().getKind() != "independent")
         continue;
-      const int64_t reductionAxis = dot.getOver()[0];
       riscv::ValueType lhs = dot.getLhs().getType();
       riscv::ValueType rhs = dot.getRhs().getType();
       auto lhsStreams = riscv_internal::staticProduct(
@@ -4353,12 +4365,16 @@ public:
           *vectorResultStreams == 1 && *vectorResultReplicas == 1;
       riscv::ValueType selectedSlot =
           preservesFreeLane ? vectorSlotType : slotType;
+      auto reductionAxis =
+          primaryReductionLaneAxis(selectedSlot, dot.getOver());
+      auto termsPerSourceSlot = laneProductForAxes(selectedSlot, dot.getOver());
       const int64_t slotGroups = selectedSlot.getLayout().getRegisterGroups();
       const int64_t setGroups = slots * slotGroups;
       const int64_t operandGroups = lhs.getLayout().getRegisterGroups() +
                                     rhs.getLayout().getRegisterGroups();
       auto kernel = dot->getParentOfType<riscv::KernelOp>();
-      if (!kernel || setGroups <= 0 || operandGroups < 0 ||
+      if (!reductionAxis || !termsPerSourceSlot || !kernel || setGroups <= 0 ||
+          operandGroups < 0 ||
           kernel.getTarget().getVectorRegisters() < operandGroups + 2 ||
           setGroups >
               kernel.getTarget().getVectorRegisters() - operandGroups - 2) {
@@ -4367,7 +4383,8 @@ public:
         signalPassFailure();
         return;
       }
-      const auto reductionPosition = axisPosition(selectedSlot, reductionAxis);
+      const auto reductionPosition =
+          axisPosition(selectedSlot, *reductionAxis);
       if (!reductionPosition) {
         dot.emitError(
             "selected independent topology lost its reduction axis in the partial carrier");
@@ -4375,8 +4392,8 @@ public:
         return;
       }
       auto sourceSet = riscv::PartialSetType::get(
-          builder.getContext(), selectedSlot, reductionAxis, slots,
-          selectedSlot.getShape()[*reductionPosition], setGroups);
+          builder.getContext(), selectedSlot, *reductionAxis, slots,
+          *termsPerSourceSlot, setGroups);
       llvm::SmallVector<mlir::Attribute> combineTypes;
       llvm::SmallVector<int64_t> combineArities;
       riscv::PartialSetType finalSet = sourceSet;
@@ -4387,7 +4404,7 @@ public:
         remainingSlots /= arity;
         termsPerSlot *= arity;
         finalSet = riscv::PartialSetType::get(
-            builder.getContext(), selectedSlot, reductionAxis, remainingSlots,
+            builder.getContext(), selectedSlot, *reductionAxis, remainingSlots,
             termsPerSlot, remainingSlots * slotGroups);
         combineTypes.push_back(mlir::TypeAttr::get(finalSet));
         combineArities.push_back(arity);
@@ -4422,7 +4439,7 @@ public:
       auto finalizeInstruction =
           preservesFreeLane
               ? std::optional<llvm::StringRef>("rvv.partial-finalize.widen")
-              : partialFinalizeInstruction(finalSet, reductionAxis);
+              : partialFinalizeInstruction(finalSet, *reductionAxis);
       if (!finalizeInstruction) {
         dot.emitError(
             "selected independent topology has no typed finalization leaf");
@@ -6411,7 +6428,6 @@ public:
     for (riscv::RVVWidenDotOp dot : independentDots) {
       if (!hasTopology(dot, "independent") || dot.getOver().empty())
         continue;
-      const int64_t reductionAxis = dot.getOver()[0];
       riscv::ValueType lhs = dot.getLhs().getType();
       riscv::ValueType rhs = dot.getRhs().getType();
       auto plan = dot->getAttrOfType<riscv::PartialCombinePlanAttr>(
@@ -6419,6 +6435,8 @@ public:
       auto sourceSet =
           plan ? mlir::dyn_cast<riscv::PartialSetType>(plan.getSourceSetType())
                : riscv::PartialSetType();
+      const int64_t reductionAxis =
+          sourceSet ? sourceSet.getReductionAxis() : int64_t{0};
       auto finalSet =
           plan ? mlir::dyn_cast<riscv::PartialSetType>(plan.getFinalSetType())
                : riscv::PartialSetType();
@@ -6426,7 +6444,8 @@ public:
           mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
       auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
           resultValue ? resultValue.getElementType() : dot.getResult().getType());
-      if (!plan || !sourceSet || !finalSet || !resultElement ||
+      if (!plan || !sourceSet || !finalSet || reductionAxis <= 0 ||
+          !resultElement ||
           !resultElement.isSigned() || resultElement.getWidth() != 32 ||
           plan.getOutputParts() <= 0 ||
           plan.getLhsParts().size() != plan.getRhsParts().size() ||

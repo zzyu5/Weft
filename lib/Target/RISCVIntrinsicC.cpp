@@ -7740,7 +7740,8 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
       return mlir::failure();
     input = std::move(*materialized);
   }
-  if (kind == "register_to_lane" && input.kind == Binding::Kind::Vector) {
+  if ((kind == "register_to_lane" || kind == "time_to_lane") &&
+      input.kind == Binding::Kind::Vector) {
     auto sourceType = conversion.getInput().getType();
     auto resultType = conversion.getResult().getType();
     auto sourceLayout = sourceType.getLayout();
@@ -7759,12 +7760,18 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
       return fail(conversion,
                   "vector register-to-lane conversion changes its logical domain");
 
+    auto selectedPieces = riscv::rvvPartToLanePieces(sourceType, resultType);
+    if (!selectedPieces)
+      return fail(conversion,
+                  "vector part-to-lane conversion has no closed relative layout mapping");
     llvm::SmallVector<size_t> movedAxes;
     llvm::SmallVector<int64_t> pieceFactors;
-    int64_t pieces = 1;
+    const int64_t pieces = *selectedPieces;
     for (size_t position = 0; position < sourceTime.size(); ++position) {
-      const bool moved = sourceReplica[position] > targetReplica[position] &&
-                         targetLane[position] > sourceLane[position];
+      const bool moved =
+          targetLane[position] > sourceLane[position] &&
+          (sourceReplica[position] > targetReplica[position] ||
+           sourceTime[position] > targetTime[position]);
       if (moved) {
         const int64_t sourceExtent =
             sourceTime[position] * sourceLane[position] *
@@ -7774,21 +7781,12 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
             targetReplica[position];
         if (sourceLane[position] <= 0 ||
             targetLane[position] % sourceLane[position] ||
-            sourceExtent != targetExtent ||
-            pieces > std::numeric_limits<int64_t>::max() /
-                         (targetLane[position] / sourceLane[position]))
+            sourceExtent != targetExtent)
           return fail(conversion,
                       "vector register-to-lane conversion has no closed moved-axis geometry");
         movedAxes.push_back(position);
         pieceFactors.push_back(targetLane[position] / sourceLane[position]);
-        pieces *= pieceFactors.back();
-        continue;
       }
-      if (sourceLane[position] != targetLane[position] ||
-          sourceTime[position] != targetTime[position] ||
-          sourceReplica[position] != targetReplica[position])
-        return fail(conversion,
-                    "vector register-to-lane conversion remaps an unrelated axis");
     }
     const int64_t sourceLanes = physicalLanes(conversion.getInput());
     const int64_t resultLanes = physicalLanes(conversion.getResult());
@@ -7800,8 +7798,7 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
         resultLanes != sourceLanes * pieces || sourceStreams <= 0 ||
         resultStreams <= 0 || resultRegisters <= 0 ||
         resultLayout.getLmulEighths() !=
-            sourceLayout.getLmulEighths() * pieces ||
-        (pieces & (pieces - 1)))
+            sourceLayout.getLmulEighths() * pieces)
       return fail(conversion,
                   "vector register-to-lane conversion has incomplete pack geometry");
 
@@ -10872,15 +10869,10 @@ Emitter::compileRVVPartialSet(riscv::RVVPartialSetOp operation) {
     return fail(operation, "RVV partial set has no exact selected leaf");
   auto setType = operation.getResult().getType();
   auto partialType = setType.getPartialType();
-  auto partialAxis = llvm::find(partialType.getAxisIds().asArrayRef(),
-                                operation.getReductionAxis());
   auto kernel = operation->getParentOfType<riscv::KernelOp>();
   const int64_t sliceLMUL = partialType.getLayout().getLmulEighths() / 2;
   const int64_t sliceLanes =
-      partialAxis == partialType.getAxisIds().asArrayRef().end()
-          ? 0
-          : partialType.getLayout().getLaneFactors()[static_cast<size_t>(
-                partialAxis - partialType.getAxisIds().asArrayRef().begin())];
+      riscv::rvvLaneCount(partialType).value_or(int64_t{0});
   if (!kernel || sliceLMUL <= 0 || sliceLanes <= 0 ||
       operation.getLhsLaneOffsets().size() !=
           static_cast<size_t>(setType.getSlots()) ||

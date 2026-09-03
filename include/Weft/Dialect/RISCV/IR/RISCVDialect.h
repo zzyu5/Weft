@@ -30,6 +30,22 @@ namespace weft::riscv {
 /// register contract, including fractional LMUL, VLMAX, and register groups.
 bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
 
+/// Returns the complete physical lane span of one RVV value.
+std::optional<int64_t> rvvLaneCount(ValueType value);
+
+/// Returns the RVV LMUL, in eighths, of a contiguous lane slice. Fractional
+/// source groups retain their smallest addressable carrier; wider groups may
+/// expose an m1 subgroup.
+std::optional<int64_t> rvvLaneSliceLMULEighths(ValueType source,
+                                               int64_t sliceLanes);
+
+/// Returns the number of source lane pieces packed by one RVV part-to-lane
+/// conversion. A moved lane axis may draw its additional pieces from issue-time
+/// or register-replica coordinates; the complete source/result layouts may also
+/// repartition unaffected coordinates. No logical coordinate may be lost or
+/// duplicated.
+std::optional<int64_t> rvvPartToLanePieces(ValueType source, ValueType result);
+
 /// Returns the bit offset of one logical field element under the declared
 /// natural or grouped/layered storage geometry.
 std::optional<int64_t> recordFieldRelativeBit(AccessAttr access,

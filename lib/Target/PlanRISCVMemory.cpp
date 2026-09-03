@@ -760,6 +760,75 @@ byteAlignedBitmaskLoadType(riscv::ValueType result,
                                 result.getShape(), result.getAxisIds(), layout);
   };
 
+  // A unit mask load requires its lane coordinates to be one contiguous
+  // interval in logical storage order. Move the consumer's lane width onto the
+  // innermost window suffix, trying the original width before narrower divisors.
+  // This exchanges lane and issue-time ownership without increasing
+  // simultaneous register pressure. Only if no non-widening relation exists do
+  // the candidates below absorb additional issue-time coordinates.
+  auto tryContiguousLaneWidth = [&](int64_t requestedLanes)
+      -> std::optional<riscv::ValueType> {
+    if (requestedLanes <= 0)
+      return std::nullopt;
+    llvm::SmallVector<int64_t> contiguousTime(time);
+    llvm::SmallVector<int64_t> contiguousLane(lane);
+    int64_t remainingLanes = requestedLanes;
+    bool representable = true;
+    for (int64_t ordinal = static_cast<int64_t>(positions.size()) - 1;
+         ordinal >= 0; --ordinal) {
+      const size_t position = positions[static_cast<size_t>(ordinal)];
+      const int64_t extent = windowExtents[static_cast<size_t>(ordinal)];
+      const int64_t replica = result.getLayout().getReplicaFactors()[position];
+      if (replica <= 0 || extent <= 0 || extent % replica) {
+        representable = false;
+        break;
+      }
+      const int64_t available = extent / replica;
+      int64_t selectedLane = 1;
+      if (remainingLanes > 1) {
+        if (remainingLanes >= available) {
+          if (remainingLanes % available) {
+            representable = false;
+            break;
+          }
+          selectedLane = available;
+          remainingLanes /= available;
+        } else {
+          if (available % remainingLanes) {
+            representable = false;
+            break;
+          }
+          selectedLane = remainingLanes;
+          remainingLanes = 1;
+        }
+      }
+      contiguousLane[position] = selectedLane;
+      contiguousTime[position] = available / selectedLane;
+    }
+    representable &= remainingLanes == 1;
+    if (!representable)
+      return std::nullopt;
+    std::swap(time, contiguousTime);
+    std::swap(lane, contiguousLane);
+    auto candidate = build();
+    std::swap(time, contiguousTime);
+    std::swap(lane, contiguousLane);
+    return candidate && byteAligned(*candidate) ? candidate : std::nullopt;
+  };
+  auto originalLanes = positiveProduct(lane);
+  if (originalLanes) {
+    // Prefer the widest contiguous divisor that does not exceed the consumer's
+    // lane carrier. Narrowing creates more issue parts but never increases the
+    // live RVV group width; widening is considered only by the fallback below.
+    for (int64_t candidateLanes = *originalLanes; candidateLanes >= 1;
+         --candidateLanes) {
+      if (*originalLanes % candidateLanes)
+        continue;
+      if (auto candidate = tryContiguousLaneWidth(candidateLanes))
+        return candidate;
+    }
+  }
+
   // A bitmask instruction starts at a byte address.  Absorb only as much of
   // the innermost issue-time decomposition into lanes as is necessary to make
   // every physical part begin on a byte boundary.  This is a storage-geometry

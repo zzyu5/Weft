@@ -402,16 +402,33 @@ public:
       }
       if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
           conversion &&
-          conversion.getConversion().getKind() == "time_to_lane") {
+          (conversion.getConversion().getKind() == "register_to_lane" ||
+           conversion.getConversion().getKind() == "time_to_lane")) {
+        auto inputType =
+            mlir::dyn_cast<riscv::ValueType>(conversion.getInput().getType());
+        auto resultType =
+            mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
+        const bool rvvToRVV =
+            inputType && resultType &&
+            inputType.getLayout().getCarrier() == "rvv" &&
+            resultType.getLayout().getCarrier() == "rvv";
+        const bool closedRVVPack =
+            rvvToRVV && static_cast<bool>(
+                            riscv::rvvPartToLanePieces(inputType, resultType));
         mlir::Operation *definition = conversion.getInput().getDefiningOp();
         bool rematerializable =
             mlir::isa_and_nonnull<riscv::FieldOp, riscv::SliceOp>(definition);
         if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition))
           rematerializable =
               static_cast<bool>(riscv_internal::sourceField(extract.getInput()));
-        if (!rematerializable) {
+        const bool invalidRVVPack = rvvToRVV && !closedRVVPack;
+        const bool missingEncodedRematerialization =
+            !rvvToRVV &&
+            conversion.getConversion().getKind() == "time_to_lane" &&
+            !rematerializable;
+        if (invalidRVVPack || missingEncodedRematerialization) {
           conversion.emitError(
-              "final time-to-lane conversion was not rematerialized to an encoded field edge; input_def=")
+              "final part-to-lane conversion has no closed RVV pack or encoded rematerialization; input_def=")
               << (definition ? definition->getName().getStringRef()
                              : llvm::StringRef("<block-argument>"))
               << ", input_type=" << conversion.getInput().getType()

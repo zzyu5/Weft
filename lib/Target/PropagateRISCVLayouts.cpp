@@ -573,6 +573,16 @@ int64_t freeAxisSharedByOneOperand(mlir::Value lhs, mlir::Value rhs) {
   return 0;
 }
 
+bool hasOperandLocalFreeAxis(mlir::Value value, mlir::Value other,
+                             llvm::ArrayRef<int64_t> reductionAxes) {
+  auto otherAxes = riscv_internal::logicalAxes(other.getType());
+  return llvm::any_of(riscv_internal::logicalAxes(value.getType()),
+                      [&](int64_t axis) {
+                        return !llvm::is_contained(reductionAxes, axis) &&
+                               !llvm::is_contained(otherAxes, axis);
+                      });
+}
+
 void constrainGroupedMac(riscv::MacGroupsOp operation, mlir::Value value,
                          Roles &roles) {
   roles.anchored = true;
@@ -1597,87 +1607,98 @@ public:
     // to reconcile them.  When both storage proposals agree, preserve them.  If
     // they disagree, use the canonical logical reduction order: the last
     // declared reduction axis is primary and the preceding reduction axes
-    // coalesce outside it.  Memory planning may then realize either operand with a direct
-    // load or an explicit representation conversion.  Unique output axes remain
-    // owned by their respective operand.
-    getOperation().walk([&](mlir::Operation *operation) {
+    // coalesce outside it.  Memory planning may then realize either operand with
+    // a direct load or an explicit representation conversion.  Unique output
+    // axes remain owned by their respective operand.
+    auto normalizeWidenDotReductionCarrier =
+        [&](mlir::Operation *operation) -> bool {
       llvm::SmallVector<int64_t> reductionAxes;
       if (auto dot = mlir::dyn_cast<riscv::DotOp>(operation))
         reductionAxes.assign(dot.getOver().begin(), dot.getOver().end());
       else if (auto contract = mlir::dyn_cast<riscv::ContractOp>(operation))
         reductionAxes.assign(contract.getOver().begin(), contract.getOver().end());
-      if (!reductionAxes.empty()) {
-        auto implementation = operation->getAttrOfType<
-            riscv::ImplementationAttr>("implementation");
-        if (!implementation || implementation.getFamily() != "widen-dot")
-          return;
-        mlir::Value lhs = operation->getOperand(0);
-        mlir::Value rhs = operation->getOperand(1);
-        auto lhsSupply = reductionSupplyRoles(lhs, reductionAxes);
-        auto rhsSupply = reductionSupplyRoles(rhs, reductionAxes);
-        Roles commonReductionCarrier;
-        const Roles *anchor = nullptr;
-        if (lhsSupply && rhsSupply &&
-            lhsSupply->laneAxis == rhsSupply->laneAxis &&
-            lhsSupply->coalescedLaneAxes == rhsSupply->coalescedLaneAxes)
-          anchor = &*lhsSupply;
-        else if (lhsSupply && !rhsSupply)
-          anchor = &*lhsSupply;
-        else if (!lhsSupply && rhsSupply)
-          anchor = &*rhsSupply;
-        if (!anchor) {
-          auto lhsType = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
-          auto rhsType = mlir::dyn_cast<riscv::ValueType>(rhs.getType());
-          bool commonDomain = lhsType && rhsType;
-          for (int64_t axis : reductionAxes) {
-            auto lhsAxis = lhsType
-                               ? llvm::find(lhsType.getAxisIds().asArrayRef(), axis)
-                               : llvm::ArrayRef<int64_t>::iterator();
-            auto rhsAxis = rhsType
-                               ? llvm::find(rhsType.getAxisIds().asArrayRef(), axis)
-                               : llvm::ArrayRef<int64_t>::iterator();
-            commonDomain &= lhsType && rhsType &&
-                            lhsAxis != lhsType.getAxisIds().asArrayRef().end() &&
-                            rhsAxis != rhsType.getAxisIds().asArrayRef().end();
-            if (!commonDomain)
-              break;
-            const size_t lhsPosition = static_cast<size_t>(
-                lhsAxis - lhsType.getAxisIds().asArrayRef().begin());
-            const size_t rhsPosition = static_cast<size_t>(
-                rhsAxis - rhsType.getAxisIds().asArrayRef().begin());
-            commonDomain &= lhsType.getShape()[lhsPosition] > 0 &&
-                            lhsType.getShape()[lhsPosition] ==
-                                rhsType.getShape()[rhsPosition];
-          }
+      if (reductionAxes.empty())
+        return false;
+      auto implementation = operation->getAttrOfType<
+          riscv::ImplementationAttr>("implementation");
+      if (!implementation || implementation.getFamily() != "widen-dot")
+        return false;
+      mlir::Value lhs = operation->getOperand(0);
+      mlir::Value rhs = operation->getOperand(1);
+      // A common carrier is required when both operands contribute an
+      // independently surviving free-axis domain, as in a blocked outer
+      // contraction.  A scalar-output dot has no such relation: forcing its
+      // storage/index producers through this anchor can only create an
+      // unrelated lane/time repartition before the lookup or decode leaf.
+      if (!hasOperandLocalFreeAxis(lhs, rhs, reductionAxes) ||
+          !hasOperandLocalFreeAxis(rhs, lhs, reductionAxes))
+        return false;
+      auto lhsSupply = reductionSupplyRoles(lhs, reductionAxes);
+      auto rhsSupply = reductionSupplyRoles(rhs, reductionAxes);
+      Roles commonReductionCarrier;
+      const Roles *anchor = nullptr;
+      if (lhsSupply && rhsSupply &&
+          lhsSupply->laneAxis == rhsSupply->laneAxis &&
+          lhsSupply->coalescedLaneAxes == rhsSupply->coalescedLaneAxes)
+        anchor = &*lhsSupply;
+      else if (lhsSupply && !rhsSupply)
+        anchor = &*lhsSupply;
+      else if (!lhsSupply && rhsSupply)
+        anchor = &*rhsSupply;
+      if (!anchor) {
+        auto lhsType = mlir::dyn_cast<riscv::ValueType>(lhs.getType());
+        auto rhsType = mlir::dyn_cast<riscv::ValueType>(rhs.getType());
+        bool commonDomain = lhsType && rhsType;
+        for (int64_t axis : reductionAxes) {
+          auto lhsAxis = lhsType
+                             ? llvm::find(lhsType.getAxisIds().asArrayRef(), axis)
+                             : llvm::ArrayRef<int64_t>::iterator();
+          auto rhsAxis = rhsType
+                             ? llvm::find(rhsType.getAxisIds().asArrayRef(), axis)
+                             : llvm::ArrayRef<int64_t>::iterator();
+          commonDomain &= lhsType && rhsType &&
+                          lhsAxis != lhsType.getAxisIds().asArrayRef().end() &&
+                          rhsAxis != rhsType.getAxisIds().asArrayRef().end();
           if (!commonDomain)
-            return;
-          commonReductionCarrier.anchored = true;
-          commonReductionCarrier.fullLaneExtent = true;
-          commonReductionCarrier.laneAxis = reductionAxes.back();
-          for (int64_t axis :
-               llvm::ArrayRef<int64_t>(reductionAxes).drop_back())
-            commonReductionCarrier.coalescedLaneAxes.insert(axis);
-          anchor = &commonReductionCarrier;
+            break;
+          const size_t lhsPosition = static_cast<size_t>(
+              lhsAxis - lhsType.getAxisIds().asArrayRef().begin());
+          const size_t rhsPosition = static_cast<size_t>(
+              rhsAxis - rhsType.getAxisIds().asArrayRef().begin());
+          commonDomain &= lhsType.getShape()[lhsPosition] > 0 &&
+                          lhsType.getShape()[lhsPosition] ==
+                              rhsType.getShape()[rhsPosition];
         }
-        if (!anchor)
-          return;
-        for (mlir::Value operand : {lhs, rhs}) {
-          Roles &operandRoles = roles[operand];
-          for (int64_t axis : reductionAxes) {
-            operandRoles.replicaAxes.erase(axis);
-            operandRoles.coalescedLaneAxes.erase(axis);
-            operandRoles.sequentialAxes.erase(axis);
-          }
-          operandRoles.laneAxis = anchor->laneAxis;
-          for (int64_t axis : anchor->coalescedLaneAxes)
-            operandRoles.coalescedLaneAxes.insert(axis);
-          operandRoles.registerTuple = false;
-          operandRoles.anchored = true;
-          operandRoles.fullLaneExtent = anchor->fullLaneExtent;
-          operandRoles.memoryAnchored = anchor->memoryAnchored;
-        }
-        return;
+        if (!commonDomain)
+          return true;
+        commonReductionCarrier.anchored = true;
+        commonReductionCarrier.fullLaneExtent = true;
+        commonReductionCarrier.laneAxis = reductionAxes.back();
+        for (int64_t axis :
+             llvm::ArrayRef<int64_t>(reductionAxes).drop_back())
+          commonReductionCarrier.coalescedLaneAxes.insert(axis);
+        anchor = &commonReductionCarrier;
       }
+      for (mlir::Value operand : {lhs, rhs}) {
+        Roles &operandRoles = roles[operand];
+        for (int64_t axis : reductionAxes) {
+          operandRoles.replicaAxes.erase(axis);
+          operandRoles.coalescedLaneAxes.erase(axis);
+          operandRoles.sequentialAxes.erase(axis);
+        }
+        operandRoles.laneAxis = anchor->laneAxis;
+        for (int64_t axis : anchor->coalescedLaneAxes)
+          operandRoles.coalescedLaneAxes.insert(axis);
+        operandRoles.registerTuple = false;
+        operandRoles.anchored = true;
+        operandRoles.fullLaneExtent = anchor->fullLaneExtent;
+        operandRoles.memoryAnchored = anchor->memoryAnchored;
+      }
+      return true;
+    };
+    getOperation().walk([&](mlir::Operation *operation) {
+      if (normalizeWidenDotReductionCarrier(operation))
+        return;
       // Only an outer contraction has two independently surviving free-axis
       // domains whose shared partial coordinates require one issue mapping.
       // Dot/contract and grouped-MAC reductions already anchor their single
@@ -1752,6 +1773,15 @@ public:
       targetRoles.fullLaneExtent = anchorRoles.fullLaneExtent;
     });
     propagateRoles();
+    // The fixed-point propagation above carries the selected operand relation
+    // through producers, but storage-facing proposals may also reintroduce a
+    // reduction axis as issue time or a replica.  Reapply the same operation
+    // anchor once, after propagation, so the final operand types consumed by
+    // LowerRISCVComposites have one closed lane/time decomposition.  This is the
+    // same owner and rule, not a second topology decision.
+    getOperation().walk([&](mlir::Operation *operation) {
+      normalizeWidenDotReductionCarrier(operation);
+    });
 
     // The command-line LMUL binding fixes the base physical parameter, but a
     // width-changing use-def chain has one additional legality relation: a

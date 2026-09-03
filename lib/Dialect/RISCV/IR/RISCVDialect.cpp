@@ -67,6 +67,120 @@ bool weft::riscv::supportsRVVLayout(TargetAttr target, LayoutAttr layout) {
          layout.getRegisterGroups() <= target.getVectorRegisters();
 }
 
+std::optional<int64_t> weft::riscv::rvvLaneCount(ValueType value) {
+  if (!value || value.getLayout().getCarrier() != "rvv")
+    return std::nullopt;
+  int64_t lanes = 1;
+  for (int64_t factor : value.getLayout().getLaneFactors().asArrayRef()) {
+    if (factor <= 0 || lanes > std::numeric_limits<int64_t>::max() / factor)
+      return std::nullopt;
+    lanes *= factor;
+  }
+  return lanes;
+}
+
+std::optional<int64_t>
+weft::riscv::rvvLaneSliceLMULEighths(ValueType source, int64_t sliceLanes) {
+  auto lanes = rvvLaneCount(source);
+  const int64_t sourceLMUL =
+      source ? source.getLayout().getLmulEighths() : int64_t{0};
+  if (!lanes || *lanes <= 0 || sliceLanes <= 0 || sliceLanes > *lanes ||
+      sourceLMUL <= 0 ||
+      sourceLMUL > std::numeric_limits<int64_t>::max() / sliceLanes)
+    return std::nullopt;
+  const int64_t numerator = sourceLMUL * sliceLanes;
+  if (numerator % *lanes)
+    return std::nullopt;
+  int64_t sliceLMUL = numerator / *lanes;
+  if (sliceLMUL <= 0)
+    return std::nullopt;
+  if (sliceLMUL < 8 && sourceLMUL > sliceLMUL)
+    sliceLMUL = std::min<int64_t>(8, sourceLMUL);
+  return sliceLMUL;
+}
+
+std::optional<int64_t>
+weft::riscv::rvvPartToLanePieces(ValueType source, ValueType result) {
+  if (!source || !result || source.getElementType() != result.getElementType() ||
+      source.getShape() != result.getShape() ||
+      source.getAxisIds() != result.getAxisIds() ||
+      source.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getCarrier() != "rvv" ||
+      source.getLayout().getSew() != result.getLayout().getSew())
+    return std::nullopt;
+  auto sourceLayout = source.getLayout();
+  auto resultLayout = result.getLayout();
+  auto sourceTime = sourceLayout.getTimeFactors().asArrayRef();
+  auto sourceLane = sourceLayout.getLaneFactors().asArrayRef();
+  auto sourceReplica = sourceLayout.getReplicaFactors().asArrayRef();
+  auto sourceFragment = sourceLayout.getFragmentFactors().asArrayRef();
+  auto sourceLocal = sourceLayout.getLocalFactors().asArrayRef();
+  auto resultTime = resultLayout.getTimeFactors().asArrayRef();
+  auto resultLane = resultLayout.getLaneFactors().asArrayRef();
+  auto resultReplica = resultLayout.getReplicaFactors().asArrayRef();
+  auto resultFragment = resultLayout.getFragmentFactors().asArrayRef();
+  auto resultLocal = resultLayout.getLocalFactors().asArrayRef();
+  const size_t rank = source.getAxisIds().size();
+  if (sourceTime.size() != rank || sourceLane.size() != rank ||
+      sourceReplica.size() != rank || sourceFragment.size() != rank ||
+      sourceLocal.size() != rank || resultTime.size() != rank ||
+      resultLane.size() != rank || resultReplica.size() != rank ||
+      resultFragment.size() != rank || resultLocal.size() != rank)
+    return std::nullopt;
+
+  auto represented = [](int64_t time, int64_t lane,
+                        int64_t replica) -> std::optional<int64_t> {
+    if (time <= 0 || lane <= 0 || replica <= 0 ||
+        time > std::numeric_limits<int64_t>::max() / lane)
+      return std::nullopt;
+    const int64_t timeLane = time * lane;
+    if (timeLane > std::numeric_limits<int64_t>::max() / replica)
+      return std::nullopt;
+    return timeLane * replica;
+  };
+  int64_t pieces = 1;
+  bool movedAnyAxis = false;
+  for (size_t position = 0; position < rank; ++position) {
+    auto sourceExtent = represented(sourceTime[position], sourceLane[position],
+                                    sourceReplica[position]);
+    auto resultExtent = represented(resultTime[position], resultLane[position],
+                                    resultReplica[position]);
+    if (!sourceExtent || !resultExtent || *sourceExtent != *resultExtent ||
+        sourceFragment[position] != resultFragment[position] ||
+        sourceLocal[position] != resultLocal[position])
+      return std::nullopt;
+    const bool moved =
+        resultLane[position] > sourceLane[position] &&
+        (sourceReplica[position] > resultReplica[position] ||
+         sourceTime[position] > resultTime[position]);
+    if (!moved) {
+      if (sourceLane[position] != resultLane[position])
+        return std::nullopt;
+      continue;
+    }
+    if (sourceLane[position] <= 0 ||
+        resultLane[position] % sourceLane[position])
+      return std::nullopt;
+    const int64_t factor = resultLane[position] / sourceLane[position];
+    if (factor <= 1 || pieces > std::numeric_limits<int64_t>::max() / factor)
+      return std::nullopt;
+    pieces *= factor;
+    movedAnyAxis = true;
+  }
+  auto sourceLanes = rvvLaneCount(source);
+  auto resultLanes = rvvLaneCount(result);
+  if (!movedAnyAxis || pieces <= 1 || (pieces & (pieces - 1)) || !sourceLanes ||
+      !resultLanes || *sourceLanes > std::numeric_limits<int64_t>::max() / pieces ||
+      *resultLanes != *sourceLanes * pieces ||
+      sourceLayout.getLmulEighths() <= 0 ||
+      sourceLayout.getLmulEighths() >
+          std::numeric_limits<int64_t>::max() / pieces ||
+      resultLayout.getLmulEighths() !=
+          sourceLayout.getLmulEighths() * pieces)
+    return std::nullopt;
+  return pieces;
+}
+
 std::optional<llvm::SmallVector<int64_t>>
 weft::riscv::groupedMacSupplyProjection(ValueType packed, ValueType result) {
   if (!packed || !result || packed.getLayout().getCarrier() != "rvv" ||
@@ -324,6 +438,16 @@ computeBitmaskWindowPartOffsets(
     positions.push_back(index);
   }
 
+  llvm::DenseSet<size_t> windowPositions(positions.begin(), positions.end());
+  for (size_t position = 0; position < axes.size(); ++position)
+    if (!windowPositions.contains(position) &&
+        layout.getLaneFactors()[position] != 1)
+      return std::nullopt;
+  auto lanes = checkedPositiveProduct(layout.getLaneFactors().asArrayRef());
+  auto windowElements = checkedPositiveProduct(windowExtents);
+  if (!lanes || !windowElements)
+    return std::nullopt;
+
   auto streams =
       checkedPositiveProduct(layout.getTimeFactors().asArrayRef());
   auto replicas =
@@ -376,6 +500,39 @@ computeBitmaskWindowPartOffsets(
           offset > (std::numeric_limits<int64_t>::max() - coordinate) / extent)
         return std::nullopt;
       offset = offset * extent + coordinate;
+    }
+    if (offset > *windowElements - *lanes)
+      return std::nullopt;
+    for (int64_t linearLane = 0; linearLane < *lanes; ++linearLane) {
+      int64_t remainingLane = linearLane;
+      llvm::SmallVector<int64_t> laneCoordinates(axes.size(), 0);
+      for (int64_t position = static_cast<int64_t>(axes.size()) - 1;
+           position >= 0; --position) {
+        const int64_t lane = layout.getLaneFactors()[position];
+        if (lane <= 0)
+          return std::nullopt;
+        laneCoordinates[position] = remainingLane % lane;
+        remainingLane /= lane;
+      }
+      if (remainingLane)
+        return std::nullopt;
+      int64_t logicalOffset = 0;
+      for (auto [position, extent] : llvm::zip(positions, windowExtents)) {
+        const int64_t lane = layout.getLaneFactors()[position];
+        const int64_t replica = layout.getReplicaFactors()[position];
+        int64_t coordinate =
+            lane > 1
+                ? timeCoordinates[position] * lane + laneCoordinates[position]
+                : timeCoordinates[position] * replica +
+                      replicaCoordinates[position];
+        if (coordinate < 0 || coordinate >= extent ||
+            logicalOffset >
+                (std::numeric_limits<int64_t>::max() - coordinate) / extent)
+          return std::nullopt;
+        logicalOffset = logicalOffset * extent + coordinate;
+      }
+      if (logicalOffset != offset + linearLane)
+        return std::nullopt;
     }
     offsets.push_back(offset);
   }
@@ -4072,7 +4229,8 @@ mlir::LogicalResult ConvertLayoutOp::verify() {
       (source == "local" && target != "local" && kind != "local_load") ||
       (source != "local" && target == "local" && kind != "local_store") ||
       (source == target && kind != "reshape" && kind != "tuple" &&
-       kind != "register_to_lane" && kind != "lane_to_register") ||
+       kind != "register_to_lane" && kind != "time_to_lane" &&
+       kind != "lane_to_register") ||
       (kind == "local_load" && effect != "read") ||
       (kind == "local_store" && effect != "write") ||
       (kind != "local_load" && kind != "local_store" && effect != "pure") ||
@@ -5843,13 +6001,14 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
                       ? partialLayoutPlan.getScaleCombinedSetType()
                       : partialLayoutPlan.getFullScaledSetType())
             : PartialSetType();
+    auto finalLanes = finalSet ? rvvLaneCount(finalSet.getPartialType())
+                               : std::optional<int64_t>();
     auto finalInstruction =
-        finalSet ? (finalSet.getPartialType()
-                            .getLayout()
-                            .getLaneFactors()[0] == 1
-                        ? llvm::StringRef("rvv.partial-finalize.extract")
-                        : llvm::StringRef("rvv.partial-finalize.reduce"))
-                 : llvm::StringRef();
+        finalSet && finalLanes
+            ? (*finalLanes == 1
+                   ? llvm::StringRef("rvv.partial-finalize.extract")
+                   : llvm::StringRef("rvv.partial-finalize.reduce"))
+            : llvm::StringRef();
     const llvm::StringRef reduceInstruction =
         getPartialTopology().getLaneSplit() > 1 ||
                 topologyKind == "reduced_scaled"
@@ -7550,33 +7709,35 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
   auto preservesPartialAxes = [&](ValueType operand) {
     if (partial.getAxisIds().size() == 1)
       return true;
-    if (partial.getAxisIds() != operand.getAxisIds() ||
-        partial.getShape().size() != operand.getShape().size())
-      return false;
-    for (size_t position = 0; position < partial.getShape().size(); ++position) {
-      if (partial.getAxisIds()[position] == getReductionAxis()) {
-        if (partial.getShape()[position] !=
-                operand.getLayout().getLaneFactors()[position] ||
-            partial.getLayout().getTimeFactors()[position] != 1 ||
-            partial.getLayout().getLaneFactors()[position] !=
-                operand.getLayout().getLaneFactors()[position] ||
-            partial.getLayout().getReplicaFactors()[position] != 1)
-          return false;
-        continue;
-      }
-      if (partial.getShape()[position] != operand.getShape()[position] ||
-          operand.getLayout().getTimeFactors()[position] != 1 ||
-          partial.getLayout().getTimeFactors()[position] != 1 ||
-          partial.getLayout().getLaneFactors()[position] !=
-              operand.getLayout().getLaneFactors()[position] ||
-          partial.getLayout().getReplicaFactors()[position] !=
-              operand.getLayout().getReplicaFactors()[position])
+    for (size_t partialPosition = 0;
+         partialPosition < partial.getShape().size(); ++partialPosition) {
+      auto operandAxis = llvm::find(operand.getAxisIds().asArrayRef(),
+                                    partial.getAxisIds()[partialPosition]);
+      if (operandAxis == operand.getAxisIds().asArrayRef().end())
+        return false;
+      const size_t operandPosition = static_cast<size_t>(
+          operandAxis - operand.getAxisIds().asArrayRef().begin());
+      if (partial.getShape()[partialPosition] !=
+              operand.getLayout().getLaneFactors()[operandPosition] ||
+          partial.getLayout().getTimeFactors()[partialPosition] != 1 ||
+          partial.getLayout().getLaneFactors()[partialPosition] !=
+              operand.getLayout().getLaneFactors()[operandPosition] ||
+          partial.getLayout().getReplicaFactors()[partialPosition] != 1 ||
+          partial.getLayout().getFragmentFactors()[partialPosition] != 1 ||
+          partial.getLayout().getLocalFactors()[partialPosition] != 1)
         return false;
     }
-    return checkedPositiveProduct(
-               partial.getLayout().getLaneFactors().asArrayRef()) ==
-           checkedPositiveProduct(
-               operand.getLayout().getLaneFactors().asArrayRef());
+    for (size_t operandPosition = 0;
+         operandPosition < operand.getAxisIds().size(); ++operandPosition) {
+      if (llvm::is_contained(partial.getAxisIds().asArrayRef(),
+                             operand.getAxisIds()[operandPosition]))
+        continue;
+      if (operand.getLayout().getLaneFactors()[operandPosition] != 1 ||
+          operand.getLayout().getFragmentFactors()[operandPosition] != 1 ||
+          operand.getLayout().getLocalFactors()[operandPosition] != 1)
+        return false;
+    }
+    return rvvLaneCount(partial) == rvvLaneCount(operand);
   };
   for (int64_t slot = 0; slot < result.getSlots(); ++slot) {
     const int64_t lhsOperand = getLhsOperands()[slot];
@@ -7593,31 +7754,19 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
     auto rhsAxis = positionOf(rhs);
     auto lhsParts = physicalPartCount(lhs);
     auto rhsParts = physicalPartCount(rhs);
-    auto lhsLanes = checkedPositiveProduct(
-        lhs.getLayout().getLaneFactors().asArrayRef());
-    auto rhsLanes = checkedPositiveProduct(
-        rhs.getLayout().getLaneFactors().asArrayRef());
-    const int64_t sliceLanes =
+    auto lhsLanes = rvvLaneCount(lhs);
+    auto rhsLanes = rvvLaneCount(rhs);
+    auto partialLanes = rvvLaneCount(partial);
+    const int64_t sliceLanes = partialLanes.value_or(-1);
+    auto lhsSliceLMUL = rvvLaneSliceLMULEighths(lhs, sliceLanes);
+    auto rhsSliceLMUL = rvvLaneSliceLMULEighths(rhs, sliceLanes);
+    const int64_t primaryLanes =
         partial.getLayout().getLaneFactors()[*partialAxis];
-    int64_t lhsSliceLMUL =
-        lhsLanes && *lhsLanes > 0 &&
-                (lhs.getLayout().getLmulEighths() * sliceLanes) % *lhsLanes == 0
-            ? lhs.getLayout().getLmulEighths() * sliceLanes / *lhsLanes
-            : -1;
-    int64_t rhsSliceLMUL =
-        rhsLanes && *rhsLanes > 0 &&
-                (rhs.getLayout().getLmulEighths() * sliceLanes) % *rhsLanes == 0
-            ? rhs.getLayout().getLmulEighths() * sliceLanes / *rhsLanes
-            : -1;
-    // RVV group extraction cannot name a fractional destination register.
-    // A sub-register slice therefore uses an m1 carrier and records its true
-    // lane offset; this is the same typed contract used by RVVWidenDotOp.
-    if (lhsSliceLMUL > 0 && lhsSliceLMUL < 8 &&
-        lhs.getLayout().getLmulEighths() > lhsSliceLMUL)
-      lhsSliceLMUL = 8;
-    if (rhsSliceLMUL > 0 && rhsSliceLMUL < 8 &&
-        rhs.getLayout().getLmulEighths() > rhsSliceLMUL)
-      rhsSliceLMUL = 8;
+    // reductionAxis names the primary physical lane axis, while termsPerSlot
+    // covers the complete product carrier.  A multi-axis carrier therefore
+    // carries the product of all lane factors, not just the primary factor.
+    const bool closedTerms = primaryLanes > 0 && sliceLanes > 0 &&
+                             result.getTermsPerSlot() == sliceLanes;
     const llvm::StringRef instruction = getMultiplyInstruction();
     const bool exactMultiply =
         (instruction == "rvv.vwmul.vv" && lhsElement && rhsElement &&
@@ -7652,16 +7801,27 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
         getLhsLaneOffsets()[slot] > *lhsLanes - sliceLanes ||
         getRhsLaneOffsets()[slot] > *rhsLanes - sliceLanes ||
         partial.getLayout().getSew() != 2 * lhs.getLayout().getSew() ||
-        lhsSliceLMUL <= 0 || lhsSliceLMUL != rhsSliceLMUL ||
-        partial.getLayout().getLmulEighths() != 2 * lhsSliceLMUL ||
-        result.getTermsPerSlot() !=
-            partial.getLayout().getLaneFactors()[*partialAxis] ||
+        !lhsSliceLMUL || !rhsSliceLMUL || *lhsSliceLMUL != *rhsSliceLMUL ||
+        partial.getLayout().getLmulEighths() != 2 * *lhsSliceLMUL ||
+        !closedTerms ||
         !preservesPartialAxes(lhs) || !preservesPartialAxes(rhs) ||
         !lhsParts || !rhsParts || getLhsParts()[slot] < 0 ||
         getRhsParts()[slot] < 0 || getLhsParts()[slot] >= *lhsParts ||
         getRhsParts()[slot] >= *rhsParts || !exactMultiply)
       return emitOpError(
-          "RVV partial set operand pair does not produce the declared widened slots");
+                 "RVV partial set operand pair does not produce the declared widened slots")
+             << "; slot=" << slot << ", partial=" << partial
+             << ", lhs=" << lhs << ", rhs=" << rhs
+             << ", lhs_slice_lmul=" << lhsSliceLMUL.value_or(-1)
+             << ", rhs_slice_lmul=" << rhsSliceLMUL.value_or(-1)
+             << ", lhs_offset=" << getLhsLaneOffsets()[slot]
+             << ", rhs_offset=" << getRhsLaneOffsets()[slot]
+             << ", lhs_part=" << getLhsParts()[slot]
+             << ", rhs_part=" << getRhsParts()[slot]
+             << ", reduction_axis=" << getReductionAxis()
+             << ", slots=" << result.getSlots()
+             << ", terms_per_slot=" << result.getTermsPerSlot()
+             << ", multiply=" << instruction;
   }
   return mlir::success();
 }
@@ -8062,12 +8222,12 @@ mlir::LogicalResult RVVPartialFinalizeOp::verify() {
   if (!result || !result.isSigned() || result.getWidth() != 32)
     return emitOpError(
         "RVV scalar partial finalize requires one signed i32 result");
-  llvm::StringRef instruction =
-      input.getPartialType().getLayout().getLaneFactors()[position] == 1
-          ? "rvv.partial-finalize.extract"
-          : "rvv.partial-finalize.reduce";
-  if (!exactLeaf(getLeaf(), "rvv", "partial-finalize", instruction, "none",
-                 "exact"))
+  auto lanes = rvvLaneCount(input.getPartialType());
+  llvm::StringRef instruction = lanes && *lanes == 1
+                                    ? "rvv.partial-finalize.extract"
+                                    : "rvv.partial-finalize.reduce";
+  if (!lanes || !exactLeaf(getLeaf(), "rvv", "partial-finalize", instruction,
+                           "none", "exact"))
     return emitOpError()
            << "RVV partial finalize leaf disagrees with its typed lane topology; "
               "expected_instruction="

@@ -597,7 +597,7 @@ def WeftRISCV_LeafAttr : WeftRISCV_Attr<"Leaf", "leaf"> {
 
 def WeftRISCV_ConversionAttr : WeftRISCV_Attr<"Conversion", "conversion"> {
   let parameters = (ins
-    StringRefParameter<"splat, extract, reshape, tuple, register_to_lane, lane_to_register, rvv_to_fragment, fragment_to_rvv, local_load, or local_store">:$kind,
+    StringRefParameter<"splat, extract, reshape, tuple, register_to_lane, time_to_lane, lane_to_register, rvv_to_fragment, fragment_to_rvv, local_load, or local_store">:$kind,
     StringRefParameter<"pure, read, write, or handoff">:$effect,
     "int64_t":$temporaryGroups
   );

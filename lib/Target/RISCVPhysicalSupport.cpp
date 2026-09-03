@@ -306,17 +306,9 @@ riscv_internal::planWidenDotLaneSlices(
   if (reductionLanes <= 0 || *lanes % reductionLanes)
     return std::nullopt;
 
-  if (layout.getLmulEighths() <= 0 ||
-      layout.getLmulEighths() >
-          std::numeric_limits<int64_t>::max() / reductionLanes)
-    return std::nullopt;
-  const int64_t numerator = layout.getLmulEighths() * reductionLanes;
-  if (numerator % *lanes)
-    return std::nullopt;
-  int64_t sliceLmul = numerator / *lanes;
-  if (sliceLmul < 8 && layout.getLmulEighths() > sliceLmul)
-    sliceLmul = 8;
-  if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), sliceLmul))
+  auto sliceLmul = riscv::rvvLaneSliceLMULEighths(operand, reductionLanes);
+  if (!sliceLmul ||
+      !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), *sliceLmul))
     return std::nullopt;
 
   int64_t outputParts = 1;
@@ -331,7 +323,7 @@ riscv_internal::planWidenDotLaneSlices(
 
   WidenDotLaneSlicePlan plan;
   plan.reductionLanes = reductionLanes;
-  plan.sliceLmulEighths = sliceLmul;
+  plan.sliceLmulEighths = *sliceLmul;
   llvm::SmallVector<int64_t> reductionTimeExtents;
   for (int64_t axis : reductionAxes) {
     auto found = llvm::find(operand.getAxisIds().asArrayRef(), axis);
@@ -673,6 +665,7 @@ riscv_internal::layoutConversion(mlir::Builder &builder,
   llvm::StringRef effect = "pure";
   if (source.getCarrier() == target.getCarrier()) {
     bool registerToLane = false;
+    bool timeToLane = false;
     bool laneToRegister = false;
     auto sourceAxes = source.getAxisIds().asArrayRef();
     auto targetAxes = target.getAxisIds().asArrayRef();
@@ -681,12 +674,22 @@ riscv_internal::layoutConversion(mlir::Builder &builder,
       if (found == targetAxes.end())
         continue;
       size_t targetIndex = static_cast<size_t>(found - targetAxes.begin());
-      registerToLane |= source.getReplicaFactors()[index] > 1 &&
-                        target.getLaneFactors()[targetIndex] > 1;
-      laneToRegister |= source.getLaneFactors()[index] > 1 &&
-                        target.getReplicaFactors()[targetIndex] > 1;
+      const int64_t sourceLane = source.getLaneFactors()[index];
+      const int64_t targetLane = target.getLaneFactors()[targetIndex];
+      registerToLane |=
+          targetLane > sourceLane &&
+          source.getReplicaFactors()[index] >
+              target.getReplicaFactors()[targetIndex];
+      timeToLane |= targetLane > sourceLane &&
+                    source.getTimeFactors()[index] >
+                        target.getTimeFactors()[targetIndex];
+      laneToRegister |=
+          sourceLane > targetLane &&
+          target.getReplicaFactors()[targetIndex] >
+              source.getReplicaFactors()[index];
     }
     kind = registerToLane ? "register_to_lane"
+           : timeToLane   ? "time_to_lane"
            : laneToRegister ? "lane_to_register"
                             : "tuple";
   } else if (source.getCarrier() == "scalar" &&
