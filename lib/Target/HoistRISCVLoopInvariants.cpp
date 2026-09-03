@@ -5,6 +5,7 @@
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
@@ -29,6 +30,92 @@ bool dependsOnDeferredField(mlir::Value value,
   return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
     return dependsOnDeferredField(operand, visited);
   });
+}
+
+bool hasOnlyReadEffects(mlir::Operation *operation) {
+  // Physical points are SSA coordinate constructors.  They intentionally do
+  // not carry the generic Pure trait because their iteration identity must
+  // remain explicit, but they do not read or write memory.
+  if (mlir::isa<weft::riscv::PhysicalPointOp>(operation))
+    return true;
+  if (mlir::isMemoryEffectFree(operation))
+    return true;
+  auto interface =
+      mlir::dyn_cast<mlir::MemoryEffectOpInterface>(operation);
+  if (!interface)
+    return false;
+  llvm::SmallVector<mlir::MemoryEffects::EffectInstance> effects;
+  interface.getEffects(effects);
+  return llvm::all_of(effects, [](const auto &effect) {
+    return mlir::isa<mlir::MemoryEffects::Read>(effect.getEffect());
+  });
+}
+
+bool hasOnlyReadEffects(mlir::LoopLikeOpInterface loop) {
+  bool onlyReads = true;
+  for (mlir::Region *region : loop.getLoopRegions())
+    region->walk([&](mlir::Operation *operation) {
+      if (operation != loop.getOperation() &&
+          !hasOnlyReadEffects(operation))
+        onlyReads = false;
+    });
+  return onlyReads;
+}
+
+bool hasAtLeastTwoIterations(mlir::LoopLikeOpInterface loop) {
+  auto forLoop = mlir::dyn_cast<mlir::scf::ForOp>(loop.getOperation());
+  if (!forLoop)
+    return false;
+  auto lower =
+      forLoop.getLowerBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  auto upper =
+      forLoop.getUpperBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  auto step = forLoop.getStep().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  return lower && upper && step && step.value() > 0 &&
+         upper.value() - lower.value() > step.value();
+}
+
+void materializeDeferredScalarFieldsBeforeReadLoops(
+    mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<weft::riscv::FieldOp> fields;
+  module.walk([&](weft::riscv::FieldOp field) { fields.push_back(field); });
+  for (weft::riscv::FieldOp field : fields) {
+    mlir::Type type = field.getResult().getType();
+    if ((!type.isIndex() &&
+         !mlir::isa<mlir::IntegerType, mlir::FloatType>(type)) ||
+        llvm::any_of(field.getResult().getUsers(), [](mlir::Operation *user) {
+          return mlir::isa<weft::riscv::RegisterMaterializeOp>(user);
+        }))
+      continue;
+
+    mlir::Operation *target = nullptr;
+    for (mlir::Operation *cursor = field->getPrevNode(); cursor;
+         cursor = cursor->getPrevNode()) {
+      if (cursor == field.getOwner().getDefiningOp())
+        break;
+      auto loop = mlir::dyn_cast<mlir::LoopLikeOpInterface>(cursor);
+      if (loop) {
+        if (!loop.isDefinedOutsideOfLoop(field.getOwner()) ||
+            !hasAtLeastTwoIterations(loop) || !hasOnlyReadEffects(loop))
+          break;
+        target = cursor;
+        continue;
+      }
+      if (!hasOnlyReadEffects(cursor))
+        break;
+    }
+    if (!target)
+      continue;
+
+    field->moveBefore(target);
+    rewriter.setInsertionPointAfter(field);
+    auto materialized = rewriter.create<weft::riscv::RegisterMaterializeOp>(
+        field.getLoc(), type, field.getResult(), -1, -1, -1,
+        "physical-share");
+    weft::riscv_internal::copyOrigin(field, materialized);
+    field.getResult().replaceAllUsesExcept(materialized.getResult(),
+                                           materialized.getOperation());
+  }
 }
 
 class HoistRISCVLoopInvariantsPass
@@ -94,6 +181,8 @@ public:
             loop.moveOutOfLoop(operation);
           });
     }
+    mlir::IRRewriter rewriter(&getContext());
+    materializeDeferredScalarFieldsBeforeReadLoops(getOperation(), rewriter);
     llvm::SmallVector<mlir::Operation *> operations;
     getOperation().walk(
         [&](mlir::Operation *operation) { operations.push_back(operation); });

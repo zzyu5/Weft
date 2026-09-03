@@ -1318,14 +1318,10 @@ def WeftRISCV_RVVBitmaskDecodeOp
 }
 
 def WeftRISCV_RVVSignedBitmaskReduceOp
-    : WeftRISCV_Op<"rvv_signed_bitmask_reduce",
-                   [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_Op<"rvv_signed_bitmask_reduce", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$data,
-                       WeftRISCV_ValueType:$field,
-                       WeftRISCV_PointType:$origin,
-                       WeftRISCV_PointType:$point,
+                       WeftRISCV_ValueType:$mask,
                        I64Attr:$reduction_axis,
-                       WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;

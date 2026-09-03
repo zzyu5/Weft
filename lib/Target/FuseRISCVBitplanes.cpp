@@ -54,7 +54,7 @@ struct BitmaskRelation {
 struct SignedBitmaskReductionRelation {
   mlir::Value data;
   mlir::Value centeredRoot;
-  riscv::RVVBitmaskDecodeOp decode;
+  riscv::RVVBitmaskWindowLoadOp mask;
   int64_t reductionAxis = 0;
   int64_t extent = 0;
 };
@@ -148,7 +148,7 @@ matchSignedBitmaskReduction(riscv::RVVWidenDotOp dot, mlir::Value centered,
     bitValue = riscv_internal::stripRepresentationConversions(cast.getInput());
   else
     return std::nullopt;
-  auto decode = bitValue.getDefiningOp<riscv::RVVBitmaskDecodeOp>();
+  auto mask = bitValue.getDefiningOp<riscv::RVVBitmaskWindowLoadOp>();
   auto dataType = mlir::dyn_cast<riscv::ValueType>(data.getType());
   auto centeredType =
       mlir::dyn_cast<riscv::ValueType>(centeredRoot.getType());
@@ -166,7 +166,7 @@ matchSignedBitmaskReduction(riscv::RVVWidenDotOp dot, mlir::Value centered,
   auto axis = dataType
                   ? llvm::find(dataType.getAxisIds().asArrayRef(), reductionAxis)
                   : llvm::ArrayRef<int64_t>::iterator();
-  if (!decode || !dataType || !centeredType || !dataElement ||
+  if (!mask || !dataType || !centeredType || !dataElement ||
       !dataElement.isSigned() || dataElement.getWidth() != 8 ||
       !centeredElement || !centeredElement.isSigned() ||
       centeredElement.getWidth() != 8 || !resultElement ||
@@ -183,7 +183,7 @@ matchSignedBitmaskReduction(riscv::RVVWidenDotOp dot, mlir::Value centered,
       dataType.getLayout().getTimeFactors()[position] != 1 ||
       dataType.getLayout().getLaneFactors()[position] != extent)
     return std::nullopt;
-  return SignedBitmaskReductionRelation{data, centeredRoot, decode,
+  return SignedBitmaskReductionRelation{data, centeredRoot, mask,
                                         reductionAxis, extent};
 }
 
@@ -585,12 +585,20 @@ public:
       const int64_t dataGroups = dataType.getLayout().getRegisterGroups();
       const int64_t temporaryGroups = std::max<int64_t>(1, dataGroups + 1);
       const bool tail = dataType.getLayout().getValidity() == "tail";
+      auto maskLeaf = relation->mask.getLeaf();
+      relation->mask->setAttr(
+          "leaf", riscv_internal::leaf(
+                      rewriter, maskLeaf.getEngine(), maskLeaf.getFamily(),
+                      "rvv.bitmask-window-mask", "rvv.bitmask-window-mask",
+                      maskLeaf.getOperandGroups(), maskLeaf.getResultGroups(),
+                      maskLeaf.getTemporaryGroups(),
+                      maskLeaf.getFragmentGroups(), maskLeaf.getMask(),
+                      maskLeaf.getTail(), maskLeaf.getParameters(),
+                      maskLeaf.getLocalBytes()));
       rewriter.setInsertionPoint(dot);
       auto reduction = rewriter.create<riscv::RVVSignedBitmaskReduceOp>(
           dot.getLoc(), dot.getResult().getType(), relation->data,
-          relation->decode.getField(), relation->decode.getOrigin(),
-          relation->decode.getPoint(), relation->reductionAxis,
-          relation->decode.getAccess(),
+          relation->mask.getResult(), relation->reductionAxis,
           riscv_internal::leaf(
               rewriter, "rvv", "signed-bitmask-reduce",
               "rvv.signed-bitmask-reduce.i8-i16",
@@ -601,11 +609,8 @@ public:
       reduction->setAttr("canonical_op",
                          rewriter.getStringAttr("weft_kernel.contract"));
       mlir::Value centeredRoot = relation->centeredRoot;
-      riscv::RVVBitmaskDecodeOp decode = relation->decode;
       rewriter.replaceOp(dot, reduction.getResult());
       eraseDeadTree(centeredRoot, rewriter);
-      if (decode && decode->getBlock() && decode.getResult().use_empty())
-        rewriter.eraseOp(decode);
     }
 
     llvm::SmallVector<riscv::BinaryOp> merges;

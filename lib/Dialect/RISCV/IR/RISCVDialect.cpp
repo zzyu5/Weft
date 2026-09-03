@@ -5248,52 +5248,17 @@ mlir::LogicalResult RVVBitmaskDecodeOp::verify() {
 
 mlir::LogicalResult RVVSignedBitmaskReduceOp::verify() {
   ValueType data = getData().getType();
-  ValueType field = getField().getType();
+  ValueType mask = getMask().getType();
   auto dataElement = mlir::dyn_cast<mlir::IntegerType>(data.getElementType());
-  auto fieldElement = mlir::dyn_cast<mlir::IntegerType>(field.getElementType());
+  auto maskElement = mlir::dyn_cast<mlir::IntegerType>(mask.getElementType());
   auto resultElement = mlir::dyn_cast<mlir::IntegerType>(getResult().getType());
-  auto sourceField = getField().getDefiningOp<FieldOp>();
-  auto origin = getOrigin().getDefiningOp<PhysicalPointOp>();
-  auto point = getPoint().getDefiningOp<PhysicalPointOp>();
+  auto maskLoad = getMask().getDefiningOp<RVVBitmaskWindowLoadOp>();
   auto position = llvm::find(data.getAxisIds().asArrayRef(), getReductionAxis());
   const bool hasAxis = position != data.getAxisIds().asArrayRef().end();
   const size_t axisPosition =
       hasAxis ? static_cast<size_t>(position - data.getAxisIds().asArrayRef().begin())
               : 0;
   const int64_t extent = hasAxis ? data.getShape()[axisPosition] : 0;
-  auto partition = point
-                       ? point.getPartition().getDefiningOp<
-                             mlir::arith::ConstantIndexOp>()
-                       : mlir::arith::ConstantIndexOp();
-  bool compatibleShape = field.getAxisIds() == data.getAxisIds() &&
-                         field.getShape().size() == data.getShape().size();
-  if (compatibleShape)
-    for (size_t index = 0; index < field.getShape().size(); ++index)
-      compatibleShape &= index == axisPosition
-                             ? field.getShape()[index] >= data.getShape()[index]
-                             : field.getShape()[index] == data.getShape()[index];
-  bool ownerCoversOriginRecord =
-      sourceField &&
-      static_cast<bool>(sourceField.getOwner().getDefiningOp<LoadOp>());
-  if (sourceField && origin)
-    if (auto owner = sourceField.getOwner().getDefiningOp<ExtractOp>()) {
-      auto ownerInput = mlir::dyn_cast<ValueType>(owner.getInput().getType());
-      size_t cursor = 0;
-      for (auto [ownerPosition, selectorAttribute] :
-           llvm::enumerate(owner.getSelectors())) {
-        llvm::StringRef selector =
-            mlir::cast<mlir::StringAttr>(selectorAttribute).getValue();
-        if (selector == "all")
-          continue;
-        if (cursor >= owner.getIndices().size())
-          break;
-        mlir::Value index = owner.getIndices()[cursor++];
-        if (ownerInput && ownerPosition < ownerInput.getAxisIds().size() &&
-            ownerInput.getAxisIds()[ownerPosition] == getReductionAxis() &&
-            selector == "domain" && index == getOrigin())
-          ownerCoversOriginRecord = true;
-      }
-    }
   llvm::StringRef validity = data.getLayout().getValidity();
   llvm::StringRef tail = validity == "tail" ? "agnostic" : "exact";
   bool onlyReductionAxisIsStreamed = hasAxis;
@@ -5304,22 +5269,15 @@ mlir::LogicalResult RVVSignedBitmaskReduceOp::verify() {
             data.getLayout().getTimeFactors()[index] == 1 &&
             data.getLayout().getLaneFactors()[index] == 1;
   if (!dataElement || !dataElement.isSigned() || dataElement.getWidth() != 8 ||
-      !fieldElement || fieldElement.isSigned() || fieldElement.getWidth() != 1 ||
+      !maskElement || maskElement.isSigned() || maskElement.getWidth() != 1 ||
       !resultElement || !resultElement.isSigned() ||
-      resultElement.getWidth() != 32 || !sourceField || !origin || !point ||
-      !partition || !hasAxis || extent <= 0 || extent * 128 >= 32768 ||
-      partition.value() != extent || point.getParent() != getOrigin() ||
-      point.getResult().getType().getDomain().getAxisId() !=
-          getReductionAxis() ||
-      origin.getResult().getType().getDomain().getAxisId() !=
-          getReductionAxis() ||
-      !ownerCoversOriginRecord || !compatibleShape ||
-      !onlyReductionAxisIsStreamed || getAccess() != sourceField.getAccess() ||
-      getAccess().getForm() != "indexed" ||
-      getAccess().getMapping() != "grouped_layered" ||
-      getAccess().getGroupSize() <= 0 || getAccess().getLayerSize() <= 0 ||
-      getAccess().getGroupSize() != getAccess().getLayerSize() * 8 ||
-      getAccess().getOrder() != "lo_first" || getAccess().getBitOffset() % 8 ||
+      resultElement.getWidth() != 32 || !hasAxis || extent <= 0 ||
+      extent * 128 >= 32768 || mask.getShape() != data.getShape() ||
+      mask.getAxisIds() != data.getAxisIds() ||
+      mask.getLayout() != data.getLayout() || !onlyReductionAxisIsStreamed ||
+      !maskLoad ||
+      !exactLeaf(maskLoad.getLeaf(), "rvv", "bitmask-window-load",
+                 "rvv.bitmask-window-mask", "none", tail) ||
       data.getLayout().getCarrier() != "rvv" ||
       data.getLayout().getTimeFactors()[axisPosition] *
               data.getLayout().getLaneFactors()[axisPosition] !=
@@ -5328,7 +5286,7 @@ mlir::LogicalResult RVVSignedBitmaskReduceOp::verify() {
       !exactLeaf(getLeaf(), "rvv", "signed-bitmask-reduce",
                  "rvv.signed-bitmask-reduce.i8-i16", "none", tail))
     return emitOpError(
-        "RVV signed-bitmask reduction requires one signed-i8 lane value, one byte-aligned logical-u1 field over the same exact sub-Level, a proven i16-safe reduction extent, and the exact selected leaf");
+        "RVV signed-bitmask reduction requires one signed-i8 lane value, one materialized logical-u1 mask in the same exact lane carrier, a proven i16-safe reduction extent, and the exact selected leaf");
   return mlir::success();
 }
 
@@ -5369,7 +5327,8 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
                 "rvv.bitmask-window-mask", "none", tail);
   const bool maskUse =
       maskLeaf && getResult().hasOneUse() &&
-      mlir::isa<RVVBitplaneMergeOp>(*getResult().getUsers().begin());
+      mlir::isa<RVVBitplaneMergeOp, RVVSignedBitmaskReduceOp>(
+          *getResult().getUsers().begin());
   if (!sourceField || !fieldElement || fieldElement.isSigned() ||
       fieldElement.getWidth() != 1 || !resultElement ||
       resultElement.isSigned() || resultElement.getWidth() != 1 ||

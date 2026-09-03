@@ -209,3 +209,66 @@ auto 参数和 target physical LMUL，没有产生新的程序树或结构候选
 四个最终 binding 生成的 RISC-V IR 均可由 `weft-opt` 独立 parse/verify，安全运行
 canonicalizer、CSE、layout canonicalization、Share 两次与 final verifier；同一流水第二次文本
 diff 为零。四项的 vector peak 分别为 16、24、20、24 groups，均低于 32-group 合同。
+
+## 4. Q1_0 single-output packed contraction
+
+### 4.1 七步工作账与参照
+
+旧 SG2044 Physical IR 让 32-element reduction carrier 分成两个 16-lane parts。每个 128-element
+record 因而执行 8 次 mask load、8 次 Q8 byte load、8 次 widened product，随后才做 4 次
+reduction。GGML VLEN128 donor（`source/c/ggml/llama.cpp/ggml/src/ggml-cpu/arch/riscv/quants.c:523-559`）
+以 i8m2 保持完整 32-lane carrier：每个 sub-block 各一次 `vlm`、`vle8`、`vneg`、`vmerge` 与
+`vwredsum`，不建立显式 product vector。这里首先是 P1 carrier 与 P3 selected leaf，不是 P2/P4。
+
+第一次把整个 `FuseRISCVBitplanes` 提前到 nested-memory planning 之前，Q1 能形成 signed leaf，但
+96-entry 机械扫描新增 7 个 compile failure：IQ2/IQ3 的 decode/window 关系被过早物化。该排程已
+删除。最终实现保留原 pass 顺序，让 nested-memory owner 先建立 `rvv_bitmask_window_load`，再由
+fusion 把其 typed mask result 与 signed-i8 data 合成 `rvv_signed_bitmask_reduce`。signed op 现在
+消费真实 mask SSA value；mask 地址、window 与 memory effect 属于前一个 op，terminal emitter不再
+从 field/origin/point 重建地址。
+
+这和 Triton 把 masked load 的 vector width约束在 mask alignment 上、随后将 mask作为普通SSA值
+交给消费者的分层一致（`LoadStoreOpToLLVM.cpp:161-173`）；TileLang reducer同样只在 layout冻结后
+物化 update/finalize（`reducer_plan_materialize.cc:5-11`）。两者都没有 Q1 的专用 signed-mask
+reduction leaf；Weft保留该局部 target operation，但不让它拥有 memory edge。
+
+SG 汇编在上述变化后已与 donor具有相同的每-record向量工作计数，但第一次真机仍只有约
+3.4--4.6 GOP/s。硬件计数显示两者 retired instructions 与 cache misses基本相同，而 Weft cycles
+约为 donor的1.78倍。逐段排列的唯一实质差异是 Q1 scalar scale 在四次 reduction之后才 load；
+临时 C 变体只把这一次 load移到 loop前，吞吐即达到 11.553 GOP/s。这个实验不删除指令，收益来自
+增加 load-to-use距离，因此属于 P5；若位置不变，该机制没有实现价值。
+
+`HoistRISCVLoopInvariants` 现在对至少两次迭代、全体 effect均为 read/pure、field owner定义在 loop外
+的物理 loop，在 preheader建立显式 `register_materialize<physical-share>`。`physical_point` 是无
+memory effect的坐标构造，但为保留 iteration identity刻意不带通用 `Pure` trait；pass按这个精确
+合同处理它。Triton 的 LICM 对 readonly load要求 loop只读（`LoopInvariantCodeMotion.cpp:20-77`），
+其 pipeliner utility则以 dominance和producer DAG决定可移动集合（`PipeliningUtility.cpp:42-105`）；
+TileLang最接近的合同是 scalar use-def加“不读 loop内写入 buffer”
+（`loop_unswitching.cc:350-387`、`bind_utils.h:22-49`）。当前 Weft采用与 Triton LICM同样保守的
+whole-loop-read-only边界，没有假设尚不存在的精确 alias证明。
+
+第二输入静态检查中，Q2_K新增3个 preheader scalar materialization、Q3_K新增2个；Q2_K的既有
+local bytes/peak仍为32/18，三次短跑为 SG 6.335/6.218、K1 3.443/3.414 GOP/s（standalone/decode），
+与全量账处在同一档，没有用 Q1收益掩盖横向退化。Q3_K的实际收益留给下一簇判定，不在这里宣称。
+
+### 4.2 参数与十次真机结果
+
+SG 的完整 32-lane carrier需要 m2；K1 的 VLEN256以 m1即可承载。K1 对 unroll=1/2/4/8的短扫分别
+约为3.71/4.22/4.45/3.71 GOP/s，最终绑定 unroll=4。它只机械减少 issue-loop控制并扩大独立
+signed leaves，不改变作者树或 reduction结构。
+
+| target | entry | 修改前 | 修改后 | source | Weft/source | numeric |
+|---|---|---:|---:|---:|---:|---|
+| SG2044 | standalone vec-dot | 4.622418 | 11.651234 | 11.448178 | 1.018× | error 0 |
+| SG2044 | MUL_MAT decode | 4.315042 | 11.709463 | 10.371659 | 1.129× | error 0 |
+| K1 | standalone vec-dot | 2.798971 | 4.538486 | 3.772297 | 1.203× | error 0 |
+| K1 | MUL_MAT decode | 2.807047 | 4.536049 | 3.691932 | 1.229× | error 0 |
+
+四项均为 10 repetitions、相同合法 record输入和 Clang 18 flags。standalone/decode同步过线，说明
+收益位于共享 contraction底座，不依赖 GEMM wrapper。SG final IR peak为7 groups/local 0，K1为
+4 groups/local 0。
+
+24 row-dequant + 24 vec-dot × 2 targets再次机械验收：91份用默认 profile直接通过；其余5份使用
+production runner已记录的 physical auto binding。合计96/96可生成、独立parse/verify，并安全运行
+canonicalizer、CSE、layout canonicalization、Share两次与final verifier；同一流水第二次文本
+diff为0。
