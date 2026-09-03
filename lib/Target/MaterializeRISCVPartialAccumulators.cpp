@@ -2347,10 +2347,15 @@ mlir::FailureOr<mlir::Value> rematerializeScalarReplicas(
         gather.getIndices().size() != 1 || !bases || bases.size() != 1 ||
         bases[0] != 0 || *replicas != gather.getSourceCount() * gather.getRepeat())
       return mlir::failure();
+    llvm::SmallVector<int64_t> partBases;
+    partBases.reserve(*replicas);
+    for (int64_t replica = 0; replica < *replicas; ++replica)
+      partBases.push_back(replica / gather.getRepeat());
     auto scalarLoad = rewriter.create<riscv::RVVRegularRepeatScalarLoadOp>(
         gather.getLoc(), targetType, gather.getField(), gather.getSourceAxis(),
         gather.getReductionAxis(), gather.getSourceBase(),
-        gather.getSourceCount(), gather.getRepeat(), gather.getAccess(),
+        gather.getSourceCount(), gather.getRepeat(),
+        rewriter.getDenseI64ArrayAttr(partBases), gather.getAccess(),
         riscv_internal::leaf(
             rewriter, "scalar", "regular-repeat-scalar-load",
             "scalar.regular-repeat-load", "scalar.regular-repeat-load", 0, 0,

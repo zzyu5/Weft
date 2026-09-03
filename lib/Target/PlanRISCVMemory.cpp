@@ -24,11 +24,7 @@ using namespace weft;
 
 namespace {
 
-struct RegularIndex {
-  int64_t base = 0;
-  int64_t stride = 1;
-  int64_t repeat = 1;
-};
+using RegularIndex = riscv_internal::RegularIndexRelation;
 
 struct RegularGatherCandidate {
   riscv::ExtractOp extract;
@@ -43,6 +39,7 @@ struct RegularGatherCandidate {
   int64_t stride = 1;
   int64_t repeat = 1;
   int64_t lanes = 0;
+  mlir::Value dynamicBase;
   llvm::SmallVector<int64_t> partBases;
 };
 
@@ -103,6 +100,109 @@ riscv::ValueType repeatIndexType(mlir::Builder &builder,
   return riscv::ValueType::get(builder.getContext(), indexElement,
                                value.getShape(), value.getAxisIds(),
                                value.getLayout());
+}
+
+riscv::ValueType repeatedScalarSupplyType(mlir::Builder &builder,
+                                          riscv::ValueType value) {
+  auto layout = value.getLayout();
+  if (!layout || layout.getCarrier() != "rvv" ||
+      llvm::any_of(layout.getFragmentFactors().asArrayRef(),
+                   [](int64_t factor) { return factor != 1; }) ||
+      llvm::any_of(layout.getLocalFactors().asArrayRef(),
+                   [](int64_t factor) { return factor != 1; }))
+    return {};
+  unsigned width = 0;
+  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(value.getElementType()))
+    width = integer.getWidth();
+  else if (auto floating =
+               mlir::dyn_cast<mlir::FloatType>(value.getElementType()))
+    width = floating.getWidth();
+  if (!width)
+    return {};
+  auto scalarLayout = riscv::LayoutAttr::get(
+      builder.getContext(), "scalar", value.getAxisIds(),
+      layout.getTimeFactors(), layout.getLaneFactors(),
+      layout.getReplicaFactors(), layout.getFragmentFactors(),
+      layout.getLocalFactors(), std::max<unsigned>(8, width), 0,
+      layout.getVl(), 0, layout.getValidity());
+  return riscv::ValueType::get(builder.getContext(), value.getElementType(),
+                               value.getShape(), value.getAxisIds(),
+                               scalarLayout);
+}
+
+bool scalarRepeatOperation(mlir::Operation *operation) {
+  return mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
+                   riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(operation);
+}
+
+struct ScalarRepeatUsePlan {
+  llvm::SmallVector<mlir::Operation *> scalarOperations;
+  llvm::SmallVector<mlir::Operation *> vectorBoundaries;
+};
+
+std::optional<ScalarRepeatUsePlan>
+planScalarRepeatUses(mlir::Value root) {
+  ScalarRepeatUsePlan plan;
+  llvm::DenseSet<mlir::Value> scalarValues;
+  llvm::DenseSet<mlir::Operation *> scalarOperations;
+  llvm::DenseSet<mlir::Operation *> vectorBoundaries;
+  llvm::SmallVector<mlir::Value> worklist{root};
+  scalarValues.insert(root);
+  for (size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+    mlir::Value value = worklist[cursor];
+    for (mlir::Operation *user : value.getUsers()) {
+      if (!scalarRepeatOperation(user) || user->getNumResults() != 1)
+        return std::nullopt;
+      auto result = mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
+      if (!result)
+        return std::nullopt;
+      bool hasForeignVector = false;
+      for (mlir::Value operand : user->getOperands()) {
+        auto operandType = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+        if (!operandType || scalarValues.contains(operand) ||
+            operandType.getLayout().getCarrier() == "scalar")
+          continue;
+        hasForeignVector = true;
+      }
+      if (hasForeignVector) {
+        if (!mlir::isa<riscv::BinaryOp, riscv::CompareOp>(user) ||
+            result.getLayout().getCarrier() != "rvv")
+          return std::nullopt;
+        if (vectorBoundaries.insert(user).second)
+          plan.vectorBoundaries.push_back(user);
+        continue;
+      }
+      if (scalarOperations.insert(user).second) {
+        plan.scalarOperations.push_back(user);
+        scalarValues.insert(user->getResult(0));
+        worklist.push_back(user->getResult(0));
+      }
+    }
+  }
+  if (plan.vectorBoundaries.empty())
+    return std::nullopt;
+  return plan;
+}
+
+bool materializeScalarRepeatUse(const ScalarRepeatUsePlan &plan,
+                                mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::ValueType> scalarTypes;
+  scalarTypes.reserve(plan.scalarOperations.size());
+  for (mlir::Operation *operation : plan.scalarOperations) {
+    auto result = mlir::cast<riscv::ValueType>(operation->getResult(0).getType());
+    auto scalarType = repeatedScalarSupplyType(rewriter, result);
+    if (!scalarType)
+      return false;
+    scalarTypes.push_back(scalarType);
+  }
+  for (auto [operation, scalarType] :
+       llvm::zip(plan.scalarOperations, scalarTypes)) {
+    operation->getResult(0).setType(scalarType);
+    operation->setAttr("leaf", riscv_internal::unselectedLeaf(rewriter));
+  }
+  for (mlir::Operation *operation : plan.vectorBoundaries)
+    operation->setAttr("leaf", riscv_internal::unselectedLeaf(rewriter));
+  return true;
 }
 
 bool canMoveReadBefore(mlir::Operation *operation) {
@@ -1253,63 +1353,6 @@ planScalarReplicaGather(riscv::ExtractOp operation, mlir::Value index) {
     plan.localBases.push_back(*localBase);
   }
   return plan;
-}
-
-std::optional<RegularIndex> analyzeRegularIndex(mlir::Value value,
-                                                unsigned depth = 0) {
-  if (depth > 16)
-    return std::nullopt;
-  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
-    return analyzeRegularIndex(conversion.getInput(), depth + 1);
-  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
-    if (iota.getStart() >
-        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-      return std::nullopt;
-    return RegularIndex{static_cast<int64_t>(iota.getStart()), 1, 1};
-  }
-  auto binary = value.getDefiningOp<riscv::BinaryOp>();
-  if (!binary)
-    return std::nullopt;
-
-  auto lhs = analyzeRegularIndex(binary.getLhs(), depth + 1);
-  auto rhs = analyzeRegularIndex(binary.getRhs(), depth + 1);
-  auto lhsConstant = constantInteger(binary.getLhs());
-  auto rhsConstant = constantInteger(binary.getRhs());
-  if (binary.getKind() == "add") {
-    if (lhs && rhsConstant) {
-      return checkedAdd(lhs->base, *rhsConstant, lhs->base) ? lhs
-                                                            : std::nullopt;
-    }
-    if (rhs && lhsConstant) {
-      return checkedAdd(rhs->base, *lhsConstant, rhs->base) ? rhs
-                                                            : std::nullopt;
-    }
-  }
-  if (binary.getKind() == "sub" && lhs && rhsConstant) {
-    return checkedSubtract(lhs->base, *rhsConstant, lhs->base) ? lhs
-                                                               : std::nullopt;
-  }
-  if (binary.getKind() == "mul") {
-    auto scale = [&](RegularIndex pattern, int64_t factor)
-        -> std::optional<RegularIndex> {
-      if (!checkedScale(pattern.base, factor, pattern.base) ||
-          !checkedScale(pattern.stride, factor, pattern.stride))
-        return std::nullopt;
-      return pattern;
-    };
-    if (lhs && rhsConstant)
-      return scale(*lhs, *rhsConstant);
-    if (rhs && lhsConstant)
-      return scale(*rhs, *lhsConstant);
-  }
-  if (binary.getKind() == "div" && lhs && rhsConstant && *rhsConstant > 0 &&
-      lhs->base % *rhsConstant == 0 && lhs->stride == 1 &&
-      lhs->repeat <= std::numeric_limits<int64_t>::max() / *rhsConstant) {
-    lhs->base /= *rhsConstant;
-    lhs->repeat *= *rhsConstant;
-    return lhs;
-  }
-  return std::nullopt;
 }
 
 void eraseDeadRegularIndexChain(mlir::Value value,
@@ -2578,9 +2621,12 @@ public:
                                           : extract.getResult().getType();
       candidate.resultType =
           mlir::dyn_cast<riscv::ValueType>(selectedResultType);
+      const llvm::StringRef fieldMapping =
+          candidate.field ? candidate.field.getAccess().getMapping()
+                          : llvm::StringRef();
       if (!candidate.field || !candidate.resultType ||
           extract.getAccess().getForm() != "indexed" ||
-          candidate.field.getAccess().getMapping() != "natural")
+          (fieldMapping != "natural" && fieldMapping != "joined"))
         continue;
 
       size_t indexCursor = 0;
@@ -2625,9 +2671,9 @@ public:
           auto attribute = extract->getAttrOfType<mlir::DenseI64ArrayAttr>(
               "index_pattern");
           if (attribute && attribute.size() == 3)
-            pattern = RegularIndex{attribute[0], attribute[1], attribute[2]};
+            pattern = RegularIndex{{}, attribute[0], attribute[1], attribute[2]};
         } else {
-          pattern = analyzeRegularIndex(candidate.index);
+          pattern = riscv_internal::analyzeRegularIndexRelation(candidate.index);
         }
       }
       if (!pattern || pattern->base < 0 || pattern->stride != 1 ||
@@ -2682,6 +2728,7 @@ public:
       candidate.base = pattern->base;
       candidate.stride = pattern->stride;
       candidate.repeat = pattern->repeat;
+      candidate.dynamicBase = pattern->dynamicBase;
       bool bounded = true;
       for (int64_t stream = 0; stream < time; ++stream) {
         const int64_t logicalOffset = stream * candidate.lanes;
@@ -2696,7 +2743,7 @@ public:
       }
       if (!bounded)
         continue;
-      if (!alreadyRegular && preservesSourceAxes) {
+      if (!alreadyRegular && preservesSourceAxes && fieldMapping == "natural") {
         rewriter.setInsertionPoint(extract);
         auto replacement = rewriter.create<riscv::ExtractOp>(
             extract.getLoc(), selectedResultType, candidate.field.getResult(),
@@ -2729,7 +2776,7 @@ public:
       // Only a repeated source needs the typed source-window + gather
       // operation materialized by the second memory-planning pass.
       if (candidate.repeat == 1 ||
-          candidate.field.getAccess().getMapping() != "natural")
+          (fieldMapping == "joined" && candidate.lanes > candidate.repeat))
         continue;
       candidate.resultConversion = {};
       candidate.inputConversions.clear();
@@ -2754,6 +2801,7 @@ public:
             other.sourceAxis != first.sourceAxis ||
             other.repeat != first.repeat ||
             other.stride != first.stride || other.lanes != first.lanes ||
+            other.dynamicBase != first.dynamicBase ||
             other.reductionAxis != first.reductionAxis ||
             other.resultType.getElementType() != first.resultType.getElementType() ||
             other.resultType.getLayout() != first.resultType.getLayout())
@@ -2798,10 +2846,36 @@ public:
       const bool powerOfTwo =
           first.repeat > 0 && (first.repeat & (first.repeat - 1)) == 0;
       const llvm::StringRef instruction =
-          first.lanes <= first.repeat
-              ? "rvv.regular-repeat-broadcast"
-              : powerOfTwo ? "rvv.regular-repeat-gather.pow2"
-                           : "rvv.regular-repeat-gather.div";
+          first.field.getAccess().getMapping() == "joined"
+              ? "rvv.regular-repeat-joined-broadcast"
+              : first.lanes <= first.repeat
+                    ? "rvv.regular-repeat-broadcast"
+                    : powerOfTwo ? "rvv.regular-repeat-gather.pow2"
+                                 : "rvv.regular-repeat-gather.div";
+      rewriter.setInsertionPoint(first.extract);
+      mlir::Value sourceBaseValue = first.dynamicBase;
+      if (!sourceBaseValue)
+        sourceBaseValue = rewriter.create<mlir::arith::ConstantIndexOp>(
+            first.extract.getLoc(), sourceBase);
+      else if (sourceBase != 0) {
+        mlir::Type element = sourceBaseValue.getType();
+        mlir::TypedAttr constant;
+        if (element.isIndex())
+          constant = rewriter.getIndexAttr(sourceBase);
+        else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element))
+          constant = rewriter.getIntegerAttr(integer, sourceBase);
+        if (!constant) {
+          for (RegularGatherCandidate *candidate : group)
+            consumedRegular.erase(candidate->extract.getOperation());
+          continue;
+        }
+        auto offset = rewriter.create<riscv::ConstantOp>(
+            first.extract.getLoc(), element, constant);
+        sourceBaseValue = rewriter.create<riscv::BinaryOp>(
+            first.extract.getLoc(), element, sourceBaseValue,
+            offset.getResult(), "add", riscv_internal::unselectedLeaf(rewriter));
+      }
+
       llvm::SmallVector<mlir::Value> indices;
       if (first.lanes > first.repeat) {
         llvm::SmallVector<mlir::Type> indexTypes;
@@ -2839,8 +2913,6 @@ public:
         indices.append(indexOp.getResults().begin(), indexOp.getResults().end());
       }
       rewriter.setInsertionPoint(first.extract);
-      auto sourceBaseValue = rewriter.create<mlir::arith::ConstantIndexOp>(
-          first.extract.getLoc(), sourceBase);
       auto gather = rewriter.create<riscv::RVVRegularRepeatGatherOp>(
           first.extract.getLoc(), resultTypes, first.field.getResult(),
           indices, first.sourceAxis, first.reductionAxis, sourceBaseValue,
@@ -2876,6 +2948,81 @@ public:
         }
       }
     }
+
+    llvm::SmallVector<riscv::RVVRegularRepeatGatherOp> repeatedGathers;
+    getOperation().walk([&](riscv::RVVRegularRepeatGatherOp gather) {
+      repeatedGathers.push_back(gather);
+    });
+    for (riscv::RVVRegularRepeatGatherOp gather : repeatedGathers) {
+      if (gather.getResults().size() != 1 || !gather.getIndices().empty())
+        continue;
+      mlir::Value root = gather.getResults().front();
+      riscv::ConvertLayoutOp conversion;
+      if (root.hasOneUse()) {
+        conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(
+            *root.getUsers().begin());
+        if (conversion && conversion.getConversion().getEffect() == "pure")
+          root = conversion.getResult();
+        else
+          conversion = {};
+      }
+      auto targetType = mlir::dyn_cast<riscv::ValueType>(root.getType());
+      if (!targetType || targetType.getLayout().getCarrier() != "rvv")
+        continue;
+      auto axis = llvm::find(targetType.getAxisIds().asArrayRef(),
+                             gather.getReductionAxis());
+      if (axis == targetType.getAxisIds().asArrayRef().end())
+        continue;
+      const size_t axisPosition = static_cast<size_t>(
+          axis - targetType.getAxisIds().asArrayRef().begin());
+      const int64_t lanes =
+          targetType.getLayout().getLaneFactors()[axisPosition];
+      const int64_t axisTime =
+          targetType.getLayout().getTimeFactors()[axisPosition];
+      auto timeParts = positiveProduct(
+          targetType.getLayout().getTimeFactors().asArrayRef());
+      auto replicas = positiveProduct(
+          targetType.getLayout().getReplicaFactors().asArrayRef());
+      if (lanes <= 0 || lanes > gather.getRepeat() ||
+          gather.getRepeat() % lanes || !timeParts || !replicas ||
+          *timeParts != axisTime)
+        continue;
+      auto usePlan = planScalarRepeatUses(root);
+      auto scalarType = repeatedScalarSupplyType(rewriter, targetType);
+      if (!usePlan || !scalarType)
+        continue;
+      llvm::SmallVector<int64_t> partBases;
+      partBases.reserve(*replicas * *timeParts);
+      bool inBounds = true;
+      for (int64_t replica = 0; replica < *replicas; ++replica)
+        for (int64_t stream = 0; stream < *timeParts; ++stream) {
+          const int64_t base = stream * lanes / gather.getRepeat();
+          inBounds &= base >= 0 && base < gather.getSourceCount();
+          partBases.push_back(base);
+        }
+      if (!inBounds || !materializeScalarRepeatUse(*usePlan, rewriter))
+        continue;
+      rewriter.setInsertionPoint(gather);
+      auto scalarLoad = rewriter.create<riscv::RVVRegularRepeatScalarLoadOp>(
+          gather.getLoc(), scalarType, gather.getField(), gather.getSourceAxis(),
+          gather.getReductionAxis(), gather.getSourceBase(),
+          gather.getSourceCount(), gather.getRepeat(),
+          rewriter.getDenseI64ArrayAttr(partBases), gather.getAccess(),
+          riscv_internal::leaf(
+              rewriter, "scalar", "regular-repeat-scalar-load",
+              "scalar.regular-repeat-load", "scalar.regular-repeat-load", 0, 0,
+              0, 0, "none", "exact",
+              {static_cast<int64_t>(gather.getSourceAxis()),
+               static_cast<int64_t>(gather.getReductionAxis()),
+               static_cast<int64_t>(gather.getSourceCount()),
+               static_cast<int64_t>(gather.getRepeat())}));
+      riscv_internal::copyOrigin(gather, scalarLoad);
+      root.replaceAllUsesWith(scalarLoad.getResult());
+      if (conversion)
+        rewriter.eraseOp(conversion);
+      rewriter.eraseOp(gather);
+    }
+
     getOperation().walk([&](riscv::ConvertLayoutOp operation) {
       auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
       if (!result || result.getLayout().getCarrier() != "rvv")

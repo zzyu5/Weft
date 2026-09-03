@@ -465,6 +465,8 @@ int main(int argc, char **argv) {
   const double medianUs = median(samples);
   const double elements = static_cast<double>(kRows) * kElements;
   std::printf("target=%s\nN=%zu\nK=%zu\n", kTarget, kRows, kElements);
+  std::printf("input_policy=finite-random-record-replicated\n");
+  std::printf("input_seed=%u\n", 0x57454654U + WEFT_ROW_FORMAT);
   std::printf("numeric=within-tolerance\nmax_absolute_error=%.9g\n"
               "max_relative_error=%.9g\nrepetitions=%zu\n",
               maxAbsolute, maxRelative, repetitions);

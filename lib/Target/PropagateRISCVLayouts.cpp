@@ -2435,9 +2435,18 @@ private:
       const riscv_internal::FieldFacts encodedFacts =
           encodedField ? riscv_internal::fieldFacts(encodedField)
                        : riscv_internal::FieldFacts();
+      const bool typedRegularJoined =
+          encodedField && hasGatherSelector && encodedFacts.mapping == "joined" &&
+          encodedFacts.bitOffset % 8 == 0 &&
+          llvm::any_of(extract.getIndices(), [](mlir::Value index) {
+            auto relation =
+                riscv_internal::analyzeRegularIndexRelation(index);
+            return relation && relation->stride == 1 && relation->repeat > 1;
+          });
       const bool typedEncodedEntry =
           encodedField && hasGatherSelector &&
-          encodedFacts.mapping == "natural" && encodedFacts.bitOffset % 8 == 0 &&
+          (encodedFacts.mapping == "natural" || typedRegularJoined) &&
+          encodedFacts.bitOffset % 8 == 0 &&
           !extract.getIndices().empty() &&
           llvm::all_of(extract.getIndices(), [](mlir::Value index) {
             mlir::Type element = riscv_internal::logicalElement(index.getType());
@@ -2499,6 +2508,12 @@ private:
           if (riscv_internal::analyzeIndexedEntryRelation(
                   operand.get(), result, retainedAxes, retainedShape))
             continue;
+          if (typedRegularJoined) {
+            auto relation =
+                riscv_internal::analyzeRegularIndexRelation(operand.get());
+            if (relation && relation->stride == 1 && relation->repeat > 1)
+              continue;
+          }
           extract.emitError(
               "no legal target layout projects the gather result mapping to its index");
           signalPassFailure();

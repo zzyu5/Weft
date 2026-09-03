@@ -42,6 +42,14 @@ natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示�
 leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
 两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
 
+若regular-repeat relation使同一个encoded scalar覆盖一个或多个完整lane window，
+`rvv_regular_repeat_scalar_load`明确保存source axis、dynamic source base、source count、repeat与
+每个physical time/replica part对应的`part_bases`。其result仍保留原logical axes以及
+time/lane/replica分解，但carrier是scalar；后续pointwise边界因此只能发射已选的scalar-vector
+operand form。verifier必须从layout与repeat关系重算`part_bases`，不能让terminal emitter推测
+哪个scalar服务哪个lane window。该形式只适用于已证明对齐的完整repeat window；其它relation
+保留为typed gather或普通memory edge。
+
 `LocalType` 是 invocation-local、target管理的可寻址对象，明确 size、alignment、alias、
 purpose、owner domain、birth与lifetime。当前真实用途包括 state/handoff object、spill slot与
 pipeline window；它不能替代 caller-visible workspace。动态对象必须由紧邻的

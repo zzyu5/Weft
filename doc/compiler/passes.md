@@ -111,6 +111,13 @@ composite lowering中消费。partial materialization后新出现的replica memo
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
 birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。
 
+若typed regular-repeat relation证明少量encoded scalar各自覆盖完整lane window，pass先物化
+typed regular-repeat gather，再沿pure pointwise use-def追到第一个vector consumer。只有source
+count、repeat、lane/time/replica mapping与每个physical part的source base全部闭合时，才把该链
+改写成`rvv_regular_repeat_scalar_load`与scalar-carrier pointwise链；vector boundary保留并消费
+scalar-vector leaf。该改写不依赖format名字，也不把任意storage proposal当作contraction
+carrier。无法闭合或不会到达vector boundary时保留原typed gather。
+
 对一个完整 encoded field 同时有外层 RVV consumer 与内层 `group_index` scalar
 consumer 的情形，pass 只在 field owner/name、logical shape/axes、parent/sub-Level point
 几何、分组步长和重复 decode 全部一致时，在两类 use 的共同支配 Level 物化

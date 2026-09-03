@@ -5860,14 +5860,28 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
   const int64_t sourceAxis = getSourceAxis();
   const int64_t axis = getReductionAxis();
   auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), sourceAxis);
+  const bool natural = getAccess().getMapping() == "natural" &&
+                       getAccess().getForm() == "unit" &&
+                       (fieldElement &&
+                        (fieldElement.getWidth() == 8 ||
+                         fieldElement.getWidth() == 16 ||
+                         fieldElement.getWidth() == 32));
+  const bool joined =
+      getAccess().getMapping() == "joined" &&
+      getAccess().getForm() == "indexed" && fieldElement &&
+      fieldElement.isUnsigned() && fieldElement.getWidth() > 0 &&
+      fieldElement.getWidth() <= 8 && getAccess().getGroupSize() > 0 &&
+      getAccess().getJoinFields() > 1 && getAccess().getJoinLowBits() > 0 &&
+      getAccess().getJoinLowBits() < fieldElement.getWidth() &&
+      getAccess().getJoinRole() >= 0 &&
+      getAccess().getJoinRole() < getAccess().getJoinFields() &&
+      (getAccess().getOrder() == "lo_first" ||
+       getAccess().getOrder() == "hi_first");
   if (!sourceField || !fieldElement || fieldElement.isSignless() ||
       sourceAxis <= 0 || axis <= 0 ||
       fieldAxis == field.getAxisIds().asArrayRef().end() ||
       getAccess() != sourceField.getAccess() ||
-      getAccess().getMapping() != "natural" ||
-      getAccess().getForm() != "unit" || getAccess().getBitOffset() % 8 ||
-      (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
-       fieldElement.getWidth() != 32) ||
+      (!natural && !joined) || getAccess().getBitOffset() % 8 ||
       !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
       getResults().empty() || getPartBases().size() != getResults().size())
     return emitOpError()
@@ -5888,11 +5902,15 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
           ? 0
           : firstResult.getLayout().getLaneFactors()[static_cast<size_t>(
                 firstAxis - firstResult.getAxisIds().asArrayRef().begin())];
+  if (joined && firstLanes > getRepeat())
+    return emitOpError(
+        "joined regular-repeat access requires one scalar source per lane window");
   llvm::StringRef instruction =
-      firstLanes <= getRepeat()
-          ? "rvv.regular-repeat-broadcast"
-          : powerOfTwo ? "rvv.regular-repeat-gather.pow2"
-                       : "rvv.regular-repeat-gather.div";
+      joined ? "rvv.regular-repeat-joined-broadcast"
+             : firstLanes <= getRepeat()
+                   ? "rvv.regular-repeat-broadcast"
+                   : powerOfTwo ? "rvv.regular-repeat-gather.pow2"
+                                : "rvv.regular-repeat-gather.div";
   if (!exactLeaf(getLeaf(), "rvv", "regular-repeat-gather", instruction,
                  "none", "exact"))
     return emitOpError(
@@ -5929,7 +5947,8 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
         resultAxis == result.getAxisIds().asArrayRef().end() ||
         result.getElementType() != field.getElementType() ||
         result.getLayout().getCarrier() != "rvv" ||
-        result.getLayout().getSew() != fieldElement.getWidth() ||
+        result.getLayout().getSew() !=
+            static_cast<int64_t>(std::max<unsigned>(8, fieldElement.getWidth())) ||
         *registerParts <= 0)
       return emitOpError(
           "regular-repeat gather result coordinates are incomplete");
@@ -5986,49 +6005,93 @@ mlir::LogicalResult RVVRegularRepeatScalarLoadOp::verify() {
   auto fieldAxis = llvm::find(field.getAxisIds().asArrayRef(), getSourceAxis());
   auto resultAxis =
       llvm::find(result.getAxisIds().asArrayRef(), getReductionAxis());
+  const bool natural = getAccess().getMapping() == "natural" &&
+                       getAccess().getForm() == "unit" && fieldElement &&
+                       (fieldElement.getWidth() == 8 ||
+                        fieldElement.getWidth() == 16 ||
+                        fieldElement.getWidth() == 32);
+  const bool joined =
+      getAccess().getMapping() == "joined" &&
+      getAccess().getForm() == "indexed" && fieldElement &&
+      fieldElement.isUnsigned() && fieldElement.getWidth() > 0 &&
+      fieldElement.getWidth() <= 8 && getAccess().getGroupSize() > 0 &&
+      getAccess().getJoinFields() > 1 && getAccess().getJoinLowBits() > 0 &&
+      getAccess().getJoinLowBits() < fieldElement.getWidth() &&
+      getAccess().getJoinRole() >= 0 &&
+      getAccess().getJoinRole() < getAccess().getJoinFields() &&
+      (getAccess().getOrder() == "lo_first" ||
+       getAccess().getOrder() == "hi_first");
+  auto timeParts = checkedPositiveProduct(
+      result.getLayout().getTimeFactors().asArrayRef());
   auto replicas = checkedPositiveProduct(
       result.getLayout().getReplicaFactors().asArrayRef());
+  const auto partBases = getPartBases();
   if (!sourceField || !fieldElement || fieldElement.isSignless() ||
       getSourceAxis() <= 0 || getReductionAxis() <= 0 ||
       fieldAxis == field.getAxisIds().asArrayRef().end() ||
       resultAxis == result.getAxisIds().asArrayRef().end() ||
       getAccess() != sourceField.getAccess() ||
-      getAccess().getMapping() != "natural" ||
-      getAccess().getForm() != "unit" || getAccess().getBitOffset() % 8 ||
-      (fieldElement.getWidth() != 8 && fieldElement.getWidth() != 16 &&
-       fieldElement.getWidth() != 32) ||
+      (!natural && !joined) || getAccess().getBitOffset() % 8 ||
       !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
       result.getElementType() != field.getElementType() ||
-      result.getLayout().getCarrier() != "scalar" || !replicas ||
-      *replicas != getSourceCount() * getRepeat() ||
-      !llvm::all_of(result.getLayout().getTimeFactors().asArrayRef(),
+      result.getLayout().getCarrier() != "scalar" || !timeParts || !replicas ||
+      *timeParts > std::numeric_limits<int64_t>::max() / *replicas ||
+      partBases.size() != static_cast<size_t>(*timeParts * *replicas) ||
+      !llvm::all_of(result.getLayout().getFragmentFactors().asArrayRef(),
                     [](int64_t factor) { return factor == 1; }) ||
-      !llvm::all_of(result.getLayout().getLaneFactors().asArrayRef(),
+      !llvm::all_of(result.getLayout().getLocalFactors().asArrayRef(),
                     [](int64_t factor) { return factor == 1; }))
     return emitOpError(
-        "regular-repeat scalar load requires one natural field window and one scalar replica per repeated logical element");
+        "regular-repeat scalar load requires one typed field window and one source base per scalar physical part");
   const size_t resultPosition = static_cast<size_t>(
       resultAxis - result.getAxisIds().asArrayRef().begin());
+  const int64_t lanes = result.getLayout().getLaneFactors()[resultPosition];
+  if (getSourceCount() >
+      std::numeric_limits<int64_t>::max() / getRepeat())
+    return emitOpError("regular-repeat scalar load logical extent overflows");
   for (size_t position = 0; position < result.getShape().size(); ++position) {
-    const int64_t expectedReplicas =
-        position == resultPosition ? getSourceCount() * getRepeat() : 1;
     const bool validExtent =
         position == resultPosition
             ? result.getShape()[position] == getSourceCount() * getRepeat()
             : result.getShape()[position] <= 0 ||
                   result.getShape()[position] == 1;
-    if (!validExtent ||
-        result.getLayout().getReplicaFactors()[position] != expectedReplicas)
+    if (!validExtent)
       return emitOpError()
-             << "regular-repeat scalar load may preserve only singleton non-reduction axes; result="
+             << "regular-repeat scalar load may preserve only singleton non-source axes; result="
              << result << ", reduction-position=" << resultPosition
              << ", source-count=" << getSourceCount()
              << ", repeat=" << getRepeat();
   }
+  const int64_t sourceTime =
+      result.getLayout().getTimeFactors()[resultPosition];
+  const int64_t sourceReplicas =
+      result.getLayout().getReplicaFactors()[resultPosition];
+  llvm::SmallVector<int64_t> expectedPartBases;
+  if (sourceReplicas == 1 && *replicas == 1 &&
+      *timeParts == sourceTime && lanes > 0 &&
+      lanes <= getRepeat() && getRepeat() % lanes == 0) {
+    expectedPartBases.reserve(sourceTime);
+    for (int64_t stream = 0; stream < sourceTime; ++stream)
+      expectedPartBases.push_back(stream * lanes / getRepeat());
+  } else if (sourceTime == 1 && *timeParts == 1 && lanes == 1 &&
+             sourceReplicas == getSourceCount() * getRepeat() &&
+             *replicas == sourceReplicas) {
+    expectedPartBases.reserve(sourceReplicas);
+    for (int64_t replica = 0; replica < sourceReplicas; ++replica)
+      expectedPartBases.push_back(replica / getRepeat());
+  } else {
+    return emitOpError(
+        "regular-repeat scalar load supports one scalar per aligned lane window or one scalar per logical replica");
+  }
   const size_t fieldPosition = static_cast<size_t>(
       fieldAxis - field.getAxisIds().asArrayRef().begin());
-  if (field.getShape()[fieldPosition] <= 0 ||
+  if (lanes <= 0 || lanes > getRepeat() || getRepeat() % lanes ||
+      field.getShape()[fieldPosition] <= 0 ||
       getSourceCount() > field.getShape()[fieldPosition] ||
+      llvm::any_of(partBases, [&](int64_t base) {
+        return base < 0 || base >= getSourceCount();
+      }) ||
+      !llvm::equal(partBases, expectedPartBases) ||
       !exactLeaf(getLeaf(), "scalar", "regular-repeat-scalar-load",
                  "scalar.regular-repeat-load", "none", "exact") ||
       getLeaf().getParameters().asArrayRef() !=

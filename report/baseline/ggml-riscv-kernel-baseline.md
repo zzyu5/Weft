@@ -133,34 +133,35 @@ Standalone activation quantize helper，shape 为 `M=128, K=14336`。
 
 ## 3. Row dequantization
 
-Standalone row dequantize helper，shape 为 `N=1024, K=4096`。
+Standalone row dequantize helper，shape 为 `N=1024, K=4096`。每个格式用固定 seed 生成一条
+可有限解码的随机 encoded record，并在整行、整 tensor 中复制；Weft 与 source 读取相同 bytes。
 
 | kernel | SG2044 implementation | SG2044 ms | SG2044 MElements/s | K1/X60 implementation | K1/X60 ms | K1/X60 MElements/s |
 |---|---|---:|---:|---|---:|---:|
-| `dequantize_row_q1_0` | scalar | 9.309 | 450.553 | scalar | 28.287 | 148.276 |
-| `dequantize_row_q4_0` | scalar | 4.602 | 911.391 | scalar | 24.574 | 170.684 |
-| `dequantize_row_q4_1` | scalar | 4.713 | 889.906 | scalar | 28.075 | 149.394 |
-| `dequantize_row_q5_0` | scalar | 4.734 | 885.910 | scalar | 26.209 | 160.035 |
-| `dequantize_row_q5_1` | scalar | 4.806 | 872.782 | scalar | 28.521 | 147.062 |
-| `dequantize_row_q8_0` | scalar | 5.788 | 724.673 | scalar | 22.807 | 183.901 |
-| `dequantize_row_mxfp4` | scalar | 24.783 | 169.239 | scalar | 25.102 | 167.090 |
-| `dequantize_row_nvfp4` | scalar | 21.732 | 193.004 | scalar | 41.578 | 100.879 |
-| `dequantize_row_q2_K` | scalar | 19.897 | 210.802 | scalar | 31.204 | 134.414 |
-| `dequantize_row_q3_K` | scalar | 15.998 | 262.184 | scalar | 36.797 | 113.985 |
-| `dequantize_row_q4_K` | scalar | 5.837 | 718.606 | scalar | 25.133 | 166.886 |
-| `dequantize_row_q5_K` | scalar | 9.509 | 441.095 | scalar | 37.372 | 112.231 |
-| `dequantize_row_q6_K` | scalar | 14.151 | 296.390 | scalar | 41.274 | 101.620 |
-| `dequantize_row_tq1_0` | scalar | 9.322 | 449.957 | scalar | 37.953 | 110.512 |
-| `dequantize_row_tq2_0` | scalar | 5.723 | 732.826 | scalar | 24.113 | 173.940 |
-| `dequantize_row_iq2_xxs` | scalar | 10.892 | 385.071 | scalar | 22.497 | 186.441 |
-| `dequantize_row_iq2_xs` | scalar | 8.070 | 519.730 | scalar | 25.511 | 164.411 |
-| `dequantize_row_iq2_s` | scalar | 10.032 | 418.088 | scalar | 23.349 | 179.633 |
-| `dequantize_row_iq3_xxs` | scalar | 13.421 | 312.528 | scalar | 24.100 | 174.039 |
-| `dequantize_row_iq3_s` | scalar | 10.283 | 407.880 | scalar | 23.352 | 179.614 |
-| `dequantize_row_iq1_s` | scalar | 6.107 | 686.765 | scalar | 32.194 | 130.282 |
-| `dequantize_row_iq1_m` | scalar | 5.987 | 700.561 | scalar | 34.176 | 122.728 |
-| `dequantize_row_iq4_nl` | scalar | 25.982 | 161.431 | scalar | 27.059 | 155.008 |
-| `dequantize_row_iq4_xs` | scalar | 26.202 | 160.073 | scalar | 26.536 | 158.062 |
+| `dequantize_row_q1_0` | scalar | 5.611 | 747.541 | scalar | 27.911 | 150.276 |
+| `dequantize_row_q4_0` | scalar | 9.831 | 426.623 | scalar | 24.439 | 171.620 |
+| `dequantize_row_q4_1` | scalar | 11.275 | 372.007 | scalar | 27.847 | 150.617 |
+| `dequantize_row_q5_0` | scalar | 24.944 | 168.147 | scalar | 26.144 | 160.433 |
+| `dequantize_row_q5_1` | scalar | 26.558 | 157.928 | scalar | 28.352 | 147.935 |
+| `dequantize_row_q8_0` | scalar | 12.558 | 333.989 | scalar | 22.806 | 183.911 |
+| `dequantize_row_mxfp4` | scalar | 26.166 | 160.297 | scalar | 24.989 | 167.845 |
+| `dequantize_row_nvfp4` | scalar | 27.669 | 151.589 | scalar | 42.156 | 99.495 |
+| `dequantize_row_q2_K` | scalar | 6.655 | 630.211 | scalar | 30.436 | 137.808 |
+| `dequantize_row_q3_K` | scalar | 11.086 | 378.330 | scalar | 36.718 | 114.229 |
+| `dequantize_row_q4_K` | scalar | 6.127 | 684.531 | scalar | 25.029 | 167.580 |
+| `dequantize_row_q5_K` | scalar | 10.224 | 410.225 | scalar | 37.405 | 112.132 |
+| `dequantize_row_q6_K` | scalar | 22.260 | 188.425 | scalar | 41.460 | 101.166 |
+| `dequantize_row_tq1_0` | scalar | 6.272 | 668.762 | scalar | 37.954 | 110.511 |
+| `dequantize_row_tq2_0` | scalar | 6.129 | 684.362 | scalar | 24.191 | 173.383 |
+| `dequantize_row_iq2_xxs` | scalar | 9.442 | 444.218 | scalar | 28.171 | 148.885 |
+| `dequantize_row_iq2_xs` | scalar | 8.857 | 473.533 | scalar | 30.657 | 136.814 |
+| `dequantize_row_iq2_s` | scalar | 9.778 | 428.963 | scalar | 28.500 | 147.167 |
+| `dequantize_row_iq3_xxs` | scalar | 9.425 | 445.011 | scalar | 28.200 | 148.733 |
+| `dequantize_row_iq3_s` | scalar | 11.963 | 350.612 | scalar | 27.588 | 152.032 |
+| `dequantize_row_iq1_s` | scalar | 5.754 | 728.975 | scalar | 32.282 | 129.929 |
+| `dequantize_row_iq1_m` | scalar | 5.883 | 712.919 | scalar | 34.481 | 121.641 |
+| `dequantize_row_iq4_nl` | scalar | 22.882 | 183.304 | scalar | 27.100 | 154.773 |
+| `dequantize_row_iq4_xs` | scalar | 23.183 | 180.925 | scalar | 26.496 | 158.302 |
 
 ## 4. Elementwise and activation
 

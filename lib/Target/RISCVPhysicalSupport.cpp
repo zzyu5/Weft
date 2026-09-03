@@ -44,12 +44,133 @@ int64_t domainPartition(riscv::DomainType domain, mlir::Operation *scope) {
   return result;
 }
 
+bool checkedRegularAdd(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+      (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs))
+    return false;
+  result = lhs + rhs;
+  return true;
+}
+
+bool checkedRegularSubtract(int64_t lhs, int64_t rhs, int64_t &result) {
+  if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() + rhs) ||
+      (rhs < 0 && lhs > std::numeric_limits<int64_t>::max() + rhs))
+    return false;
+  result = lhs - rhs;
+  return true;
+}
+
+bool checkedRegularScale(int64_t value, int64_t factor, int64_t &result) {
+  if (factor <= 0 || value > std::numeric_limits<int64_t>::max() / factor ||
+      value < std::numeric_limits<int64_t>::min() / factor)
+    return false;
+  result = value * factor;
+  return true;
+}
+
+std::optional<riscv_internal::RegularIndexRelation>
+analyzeRegularIndexRelationImpl(mlir::Value value, unsigned depth) {
+  if (depth > 16)
+    return std::nullopt;
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    return analyzeRegularIndexRelationImpl(conversion.getInput(), depth + 1);
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>()) {
+    if (iota.getStart() >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      return std::nullopt;
+    return riscv_internal::RegularIndexRelation{
+        {}, static_cast<int64_t>(iota.getStart()), 1, 1};
+  }
+  auto binary = value.getDefiningOp<riscv::BinaryOp>();
+  if (!binary)
+    return std::nullopt;
+
+  auto lhs = analyzeRegularIndexRelationImpl(binary.getLhs(), depth + 1);
+  auto rhs = analyzeRegularIndexRelationImpl(binary.getRhs(), depth + 1);
+  auto lhsConstant = riscv_internal::constantInt(binary.getLhs());
+  auto rhsConstant = riscv_internal::constantInt(binary.getRhs());
+  auto scalarCoordinate = [](mlir::Value candidate) {
+    mlir::Type type = candidate.getType();
+    if (type.isIndex())
+      return true;
+    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
+      return !integer.isSigned();
+    auto physical = mlir::dyn_cast<riscv::ValueType>(type);
+    if (!physical || physical.getLayout().getCarrier() != "scalar")
+      return false;
+    auto productIsOne = [](llvm::ArrayRef<int64_t> factors) {
+      auto product = riscv_internal::staticProduct(factors);
+      return product && *product == 1;
+    };
+    return productIsOne(
+               physical.getLayout().getTimeFactors().asArrayRef()) &&
+           productIsOne(
+               physical.getLayout().getLaneFactors().asArrayRef()) &&
+           productIsOne(
+               physical.getLayout().getReplicaFactors().asArrayRef()) &&
+           productIsOne(
+               physical.getLayout().getFragmentFactors().asArrayRef()) &&
+           productIsOne(
+               physical.getLayout().getLocalFactors().asArrayRef());
+  };
+  if (binary.getKind() == "add") {
+    if (lhs && rhsConstant)
+      return checkedRegularAdd(lhs->base, *rhsConstant, lhs->base)
+                 ? lhs
+                 : std::nullopt;
+    if (rhs && lhsConstant)
+      return checkedRegularAdd(rhs->base, *lhsConstant, rhs->base)
+                 ? rhs
+                 : std::nullopt;
+    if (lhs && !lhs->dynamicBase && scalarCoordinate(binary.getRhs())) {
+      lhs->dynamicBase = binary.getRhs();
+      return lhs;
+    }
+    if (rhs && !rhs->dynamicBase && scalarCoordinate(binary.getLhs())) {
+      rhs->dynamicBase = binary.getLhs();
+      return rhs;
+    }
+  }
+  if (binary.getKind() == "sub" && lhs && rhsConstant)
+    return checkedRegularSubtract(lhs->base, *rhsConstant, lhs->base)
+               ? lhs
+               : std::nullopt;
+  if (binary.getKind() == "mul") {
+    auto scale = [&](riscv_internal::RegularIndexRelation pattern,
+                     int64_t factor)
+        -> std::optional<riscv_internal::RegularIndexRelation> {
+      if (!checkedRegularScale(pattern.base, factor, pattern.base) ||
+          !checkedRegularScale(pattern.stride, factor, pattern.stride))
+        return std::nullopt;
+      return pattern;
+    };
+    if (lhs && rhsConstant)
+      return scale(*lhs, *rhsConstant);
+    if (rhs && lhsConstant)
+      return scale(*rhs, *lhsConstant);
+  }
+  if (binary.getKind() == "div" && lhs && rhsConstant && *rhsConstant > 0 &&
+      lhs->base % *rhsConstant == 0 && lhs->stride == 1 &&
+      lhs->repeat <= std::numeric_limits<int64_t>::max() / *rhsConstant) {
+    lhs->base /= *rhsConstant;
+    lhs->repeat *= *rhsConstant;
+    return lhs;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 mlir::DenseI64ArrayAttr
 riscv_internal::integers(mlir::Builder &builder,
                          llvm::ArrayRef<int64_t> values) {
   return builder.getDenseI64ArrayAttr(values);
+}
+
+std::optional<riscv_internal::RegularIndexRelation>
+riscv_internal::analyzeRegularIndexRelation(mlir::Value value,
+                                            unsigned depth) {
+  return analyzeRegularIndexRelationImpl(value, depth);
 }
 
 int64_t riscv_internal::physicalExtent(mlir::Value value, int64_t axis) {

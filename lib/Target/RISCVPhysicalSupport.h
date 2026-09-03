@@ -51,6 +51,13 @@ struct IndexedEntryRelation {
   int64_t indexDivisor = 1;
 };
 
+struct RegularIndexRelation {
+  mlir::Value dynamicBase;
+  int64_t base = 0;
+  int64_t stride = 1;
+  int64_t repeat = 1;
+};
+
 mlir::DenseI64ArrayAttr integers(mlir::Builder &builder,
                                  llvm::ArrayRef<int64_t> values);
 mlir::ArrayAttr strings(mlir::Builder &builder,
@@ -123,6 +130,8 @@ std::optional<IndexedEntryRelation>
 analyzeIndexedEntryRelation(mlir::Value fullIndices, riscv::ValueType result,
                             llvm::ArrayRef<int64_t> retainedAxes,
                             llvm::ArrayRef<int64_t> retainedShape);
+std::optional<RegularIndexRelation>
+analyzeRegularIndexRelation(mlir::Value value, unsigned depth = 0);
 std::string printType(mlir::Type type);
 
 riscv::EncodingDeclOp findEncoding(mlir::Operation *operation,

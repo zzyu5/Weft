@@ -112,6 +112,65 @@ singleStorageFragment(const EncodingField &field, llvm::StringRef logicalIndex,
   return StorageFragment{byte, shift, logicalWidth};
 }
 
+std::optional<std::string>
+scalarEncodedFieldSource(const EncodingField &field,
+                         llvm::StringRef elementType,
+                         llvm::StringRef record,
+                         llvm::StringRef logicalIndex) {
+  if (field.access.getMapping() == "natural")
+    return "((const " + elementType.str() + " *)((const uint8_t *)(" +
+           record.str() + ") + " + std::to_string(field.bitOffset / 8) +
+           "))[" + logicalIndex.str() + "]";
+  if (field.access.getMapping() != "joined")
+    return std::nullopt;
+
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(field.type);
+  const int64_t group = field.access.getGroupSize();
+  const int64_t fields = field.access.getJoinFields();
+  const int64_t lowBits = field.access.getJoinLowBits();
+  const int64_t role = field.access.getJoinRole();
+  const unsigned logicalWidth = integer ? integer.getWidth() : 0;
+  if (!integer || !integer.isUnsigned() || group <= 0 || fields <= 1 ||
+      lowBits <= 0 || role < 0 || role >= fields ||
+      logicalWidth <= static_cast<unsigned>(lowBits) || logicalWidth > 8 ||
+      (field.access.getOrder() != "lo_first" &&
+       field.access.getOrder() != "hi_first"))
+    return std::nullopt;
+  const int64_t physicalRole =
+      field.access.getOrder() == "lo_first" ? role : fields - 1 - role;
+  const uint64_t logicalMask = (uint64_t(1) << logicalWidth) - 1;
+  const uint64_t lowMask = (uint64_t(1) << lowBits) - 1;
+  const uint64_t highMask =
+      (uint64_t(1) << (logicalWidth - lowBits)) - 1;
+  const std::string index = "(" + logicalIndex.str() + ")";
+  const std::string tail = "(" + index + " - " + std::to_string(group) + ")";
+  const std::string headByte =
+      "((const uint8_t *)(" + record.str() + "))[" +
+      std::to_string(field.bitOffset / 8 + role * group) + " + " + index +
+      "]";
+  const std::string lowByte =
+      "((const uint8_t *)(" + record.str() + "))[" +
+      std::to_string(field.bitOffset / 8 + fields * group) + " + " + tail +
+      "]";
+  const std::string highByte =
+      "((const uint8_t *)(" + record.str() + "))[" +
+      std::to_string(field.bitOffset / 8 + role * group) + " + " + tail +
+      "]";
+  const std::string head = "((uint8_t)(" + headByte + " & " +
+                           std::to_string(logicalMask) + "))";
+  const std::string low =
+      "((uint8_t)((" + lowByte + " >> " +
+      std::to_string(physicalRole * lowBits) + ") & " +
+      std::to_string(lowMask) + "))";
+  const std::string high =
+      "((uint8_t)((" + highByte + " >> " +
+      std::to_string(logicalWidth) + ") & " +
+      std::to_string(highMask) + "))";
+  return "(" + index + " < " + std::to_string(group) + " ? " + head +
+         " : (" + low + " | (" + high + " << " +
+         std::to_string(lowBits) + ")))";
+}
+
 struct PointInfo {
   int64_t axis = 0;
   std::string base;
@@ -9349,7 +9408,10 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
   mlir::Value firstValue = operation.getResults().front();
   const int64_t lanes = physicalLanes(firstValue);
   const llvm::StringRef instruction = instructionOf(operation.getOperation());
-  const bool broadcastOnly = instruction == "rvv.regular-repeat-broadcast";
+  const bool joinedBroadcast =
+      instruction == "rvv.regular-repeat-joined-broadcast";
+  const bool broadcastOnly =
+      joinedBroadcast || instruction == "rvv.regular-repeat-broadcast";
   const bool powerOfTwo = instruction == "rvv.regular-repeat-gather.pow2";
   if (!broadcastOnly && !powerOfTwo &&
       instruction != "rvv.regular-repeat-gather.div")
@@ -9414,6 +9476,9 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     sourceRecords.push_back(record);
     if (broadcastOnly)
       continue;
+    if (operation.getAccess().getMapping() != "natural")
+      return fail(operation,
+                  "non-broadcast regular-repeat gather requires natural storage");
     const std::string pointer =
         "((const " + *elementType + " *)((const uint8_t *)(" + record +
         ") + " + std::to_string(storage->bitOffset / 8) + ") + " +
@@ -9456,16 +9521,16 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
       if (broadcastOnly) {
         const std::string sourceIndex = "(" + sourceBase->scalar + " + " +
                                         std::to_string(bases[stream]) + ")";
-        const std::string scalarValue =
-            "((const " + *elementType + " *)((const uint8_t *)(" +
-            sourceRecords[replica] + ") + " +
-            std::to_string(storage->bitOffset / 8) + "))[" +
-            sourceIndex + "]";
+        auto scalarValue = scalarEncodedFieldSource(
+            *storage, *elementType, sourceRecords[replica], sourceIndex);
+        if (!scalarValue)
+          return fail(operation,
+                      "regular-repeat broadcast has no closed scalar storage spelling");
         std::string gathered = fresh("regular_broadcast");
         const bool floating = mlir::isa<mlir::FloatType>(storage->type);
         line(vectorType(resultValue) + " " + gathered + " = __riscv_" +
              std::string(floating ? "vfmv_v_f_" : "vmv_v_x_") +
-             vectorSuffix(resultValue) + "(" + scalarValue + ", " +
+             vectorSuffix(resultValue) + "(" + *scalarValue + ", " +
              partVL(resultValue, part) + ");");
         result.parts.push_back(std::move(gathered));
         continue;
@@ -9505,31 +9570,44 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatScalarLoad(
                                        bindings.lookup(operation.getSourceBase()));
   const int64_t sourceCount = operation.getSourceCount();
   const int64_t repeat = operation.getRepeat();
-  const int64_t replicas = registerPartCount(operation.getResult());
+  const int64_t scalarParts = scalarPartCount(operation.getResult());
+  auto partBases = operation.getPartBases();
   if (owner.kind != Binding::Kind::Record || owner.recordElements <= 0 ||
       !storage || !elementType || storage->bitOffset % 8 ||
       mlir::failed(sourceBase) || sourceBase->kind != Binding::Kind::Scalar ||
-      sourceCount <= 0 || repeat <= 1 || replicas != sourceCount * repeat)
+      sourceCount <= 0 || repeat <= 1 || scalarParts <= 0 ||
+      partBases.size() != static_cast<size_t>(scalarParts))
     return fail(operation,
                 "regular-repeat scalar load has incomplete typed storage geometry");
 
-  const std::string pointer =
-      "((const " + *elementType + " *)((const uint8_t *)(" +
-      owner.recordPointer + ") + " +
-      std::to_string(storage->bitOffset / 8) + "))";
   llvm::SmallVector<std::string> sources;
   sources.reserve(sourceCount);
   for (int64_t source = 0; source < sourceCount; ++source) {
+    const std::string sourceIndex = "(" + sourceBase->scalar + " + " +
+                                    std::to_string(source) + ")";
+    auto expression = scalarEncodedFieldSource(
+        *storage, *elementType, owner.recordPointer, sourceIndex);
+    if (!expression)
+      return fail(operation,
+                  "regular-repeat scalar load has no closed encoded-field spelling");
     std::string loaded = fresh("repeat_scalar");
-    line(*elementType + " " + loaded + " = " + pointer + "[" +
-         sourceBase->scalar + " + " + std::to_string(source) + "];");
+    line(*elementType + " " + loaded + " = " + *expression + ";");
     sources.push_back(std::move(loaded));
   }
   Binding result;
-  result.kind = Binding::Kind::ScalarTuple;
-  result.parts.reserve(replicas);
-  for (int64_t replica = 0; replica < replicas; ++replica)
-    result.parts.push_back(sources[replica / repeat]);
+  result.kind = scalarParts == 1 ? Binding::Kind::Scalar
+                                 : Binding::Kind::ScalarTuple;
+  result.parts.reserve(scalarParts);
+  for (int64_t base : partBases) {
+    if (base < 0 || base >= sourceCount)
+      return fail(operation,
+                  "regular-repeat scalar load part exceeds its source window");
+    result.parts.push_back(sources[base]);
+  }
+  if (result.kind == Binding::Kind::Scalar) {
+    result.scalar = result.parts.front();
+    result.parts.clear();
+  }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }

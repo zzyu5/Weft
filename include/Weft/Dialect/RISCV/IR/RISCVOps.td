@@ -1412,6 +1412,7 @@ def WeftRISCV_RVVRegularRepeatScalarLoadOp
                        AnyType:$source_base,
                        I64Attr:$source_count,
                        I64Attr:$repeat,
+                       DenseI64ArrayAttr:$part_bases,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
