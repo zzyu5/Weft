@@ -44,6 +44,24 @@ std::optional<int64_t> checkedProduct(llvm::ArrayRef<int64_t> values) {
   return result;
 }
 
+bool reachesReductionThroughPureOps(mlir::Value root) {
+  llvm::SmallVector<mlir::Value> worklist{root};
+  llvm::DenseSet<mlir::Value> visited;
+  while (!worklist.empty()) {
+    mlir::Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (mlir::Operation *consumer : value.getUsers()) {
+      if (mlir::isa<riscv::ReduceOp>(consumer))
+        return true;
+      if (consumer->getNumRegions() == 0 && consumer->getNumResults() == 1 &&
+          mlir::isMemoryEffectFree(consumer))
+        worklist.push_back(consumer->getResult(0));
+    }
+  }
+  return false;
+}
+
 bool checkedSubtract(int64_t lhs, int64_t rhs, int64_t &result) {
   if ((rhs > 0 && lhs < std::numeric_limits<int64_t>::min() + rhs) ||
       (rhs < 0 && lhs > std::numeric_limits<int64_t>::max() + rhs))
@@ -3397,10 +3415,93 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
     const ReplicaScaledDotReduction &match, int64_t windowAxis,
     int64_t issueStreams, int64_t windowExtent) {
   auto kernel = dot->getParentOfType<riscv::KernelOp>();
+  auto dotResult = mlir::dyn_cast<riscv::ValueType>(dot.getResult().getType());
+  mlir::Value finalResult = match.reductions.empty()
+                                ? mlir::Value()
+                                : match.reductions.front()->getResult(0);
+  mlir::Type finalType = finalResult ? finalResult.getType() : mlir::Type();
+  auto finalValue = mlir::dyn_cast<riscv::ValueType>(finalType);
+  llvm::SmallVector<int64_t> outputAxes =
+      finalValue
+          ? llvm::SmallVector<int64_t>(finalValue.getAxisIds().asArrayRef())
+          : llvm::SmallVector<int64_t>();
+  auto outputReplicaCount =
+      finalValue ? riscv_internal::staticProduct(
+                       finalValue.getLayout().getReplicaFactors().asArrayRef())
+                 : std::optional<int64_t>(1);
+  const bool terminalOutputCohort =
+      finalResult && outputReplicaCount && *outputReplicaCount > 1 &&
+      !reachesReductionThroughPureOps(finalResult);
   auto scaleType = mlir::dyn_cast<riscv::ValueType>(match.scale.getType());
-  if (!kernel || dot.getOver().empty() || issueStreams <= 0 ||
-      windowExtent <= 0 || !scaleType)
+  const bool finalCarrierClosed =
+      !finalValue ||
+      (finalValue.getLayout().getCarrier() == "scalar" &&
+       llvm::all_of(finalValue.getLayout().getTimeFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }) &&
+       llvm::all_of(finalValue.getLayout().getLaneFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }) &&
+       llvm::all_of(finalValue.getLayout().getFragmentFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }) &&
+       llvm::all_of(finalValue.getLayout().getLocalFactors().asArrayRef(),
+                    [](int64_t factor) { return factor == 1; }));
+  if (!kernel || !dotResult || dot.getOver().empty() || issueStreams <= 0 ||
+      windowExtent <= 0 || !scaleType || !outputReplicaCount ||
+      *outputReplicaCount <= 0 || !finalCarrierClosed)
     return std::nullopt;
+
+  auto coalesceReductionTime = [&](riscv::ValueType source) {
+    if (!source || source.getLayout().getCarrier() != "rvv")
+      return riscv::ValueType();
+    llvm::SmallVector<int64_t> time(
+        source.getLayout().getTimeFactors().asArrayRef());
+    llvm::SmallVector<int64_t> lane(
+        source.getLayout().getLaneFactors().asArrayRef());
+    auto replica = source.getLayout().getReplicaFactors();
+    auto fragment = source.getLayout().getFragmentFactors();
+    auto local = source.getLayout().getLocalFactors();
+    auto oldLanes = riscv_internal::staticProduct(lane);
+    if (!oldLanes || *oldLanes <= 0)
+      return riscv::ValueType();
+    for (int64_t axis : dot.getOver()) {
+      auto position = axisPosition(source, axis);
+      if (!position || time[*position] <= 0 || lane[*position] <= 0 ||
+          replica[*position] != 1 || fragment[*position] != 1 ||
+          local[*position] != 1 ||
+          lane[*position] >
+              std::numeric_limits<int64_t>::max() / time[*position])
+        return riscv::ValueType();
+      lane[*position] *= time[*position];
+      time[*position] = 1;
+    }
+    auto newLanes = riscv_internal::staticProduct(lane);
+    auto replicas = riscv_internal::staticProduct(replica.asArrayRef());
+    if (!newLanes || !replicas || *newLanes <= 0 || *replicas <= 0 ||
+        source.getLayout().getLmulEighths() <= 0 ||
+        source.getLayout().getLmulEighths() >
+            std::numeric_limits<int64_t>::max() / *newLanes)
+      return riscv::ValueType();
+    const int64_t scaled =
+        source.getLayout().getLmulEighths() * *newLanes;
+    const int64_t requested = scaled / *oldLanes + (scaled % *oldLanes != 0);
+    int64_t selectedLMUL = 0;
+    for (int64_t legal : kernel.getTarget().getLegalLMULEighths().asArrayRef())
+      if (legal >= requested &&
+          (selectedLMUL == 0 || legal < selectedLMUL))
+        selectedLMUL = legal;
+    if (selectedLMUL <= 0)
+      return riscv::ValueType();
+    auto layout = riscv::LayoutAttr::get(
+        builder.getContext(), "rvv", source.getAxisIds(),
+        riscv_internal::integers(builder, time),
+        riscv_internal::integers(builder, lane), replica, fragment, local,
+        source.getLayout().getSew(), selectedLMUL, *newLanes,
+        std::max<int64_t>(1, (selectedLMUL + 7) / 8) * *replicas,
+        source.getLayout().getValidity());
+    if (!riscv::supportsRVVLayout(kernel.getTarget(), layout))
+      return riscv::ValueType();
+    return riscv::ValueType::get(builder.getContext(), source.getElementType(),
+                                 source.getShape(), source.getAxisIds(), layout);
+  };
 
   auto issueLhs = issueWindowType(builder, kernel.getTarget(),
                                   dot.getLhs().getType(), windowAxis,
@@ -3408,13 +3509,21 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
   auto issueRhs = issueWindowType(builder, kernel.getTarget(),
                                   dot.getRhs().getType(), windowAxis,
                                   windowExtent);
+  // A multi-output contraction can amortize one complete reduction carrier
+  // across its output replicas.  For a scalar result the existing nested
+  // topology is already closed; widening it here would rewrite unrelated
+  // index/storage producers without reducing consumer work.
+  if (terminalOutputCohort) {
+    issueLhs = coalesceReductionTime(issueLhs);
+    issueRhs = coalesceReductionTime(issueRhs);
+  }
   auto issueScale = issueWindowType(builder, kernel.getTarget(), scaleType,
                                     windowAxis, windowExtent);
-  auto scaleReplicas =
+  auto scaleReplicaType =
       issueScale ? scalarReplicaType(builder, issueScale) : riscv::ValueType();
   auto scaleElement =
-      scaleReplicas
-          ? mlir::dyn_cast<mlir::IntegerType>(scaleReplicas.getElementType())
+      scaleReplicaType
+          ? mlir::dyn_cast<mlir::IntegerType>(scaleReplicaType.getElementType())
           : mlir::IntegerType();
   auto lhsLanes = issueLhs ? riscv_internal::staticProduct(
                                  issueLhs.getLayout().getLaneFactors().asArrayRef())
@@ -3436,13 +3545,65 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       issueRhs ? riscv_internal::staticProduct(
                      issueRhs.getLayout().getReplicaFactors().asArrayRef())
                : std::optional<int64_t>();
-  const int64_t sourceLanes = dot.getReductionLanes() * windowExtent;
-  if (!issueLhs || !issueRhs || !issueScale || !scaleReplicas || !scaleElement ||
+  const int64_t sourceLanes =
+      dot.getReductionLanes() *
+      (terminalOutputCohort ? dot.getReductionStreams() : int64_t{1}) *
+      windowExtent;
+  if (!issueLhs || !issueRhs || !issueScale || !scaleReplicaType || !scaleElement ||
       !scaleElement.isSigned() || scaleElement.getWidth() != 32 || !lhsLanes ||
       !rhsLanes || !lhsTime || !rhsTime || !lhsReplicas || !rhsReplicas ||
       *lhsLanes != sourceLanes || *rhsLanes != sourceLanes || *lhsTime != 1 ||
-      *rhsTime != 1 || *lhsReplicas != 1 || *rhsReplicas != 1) {
+      *rhsTime != 1 || *lhsReplicas <= 0 || *rhsReplicas <= 0) {
     return std::nullopt;
+  }
+
+  llvm::SmallVector<int64_t> lhsSourceParts;
+  llvm::SmallVector<int64_t> rhsSourceParts;
+  llvm::SmallVector<int64_t> lhsLaneOffsets;
+  llvm::SmallVector<int64_t> rhsLaneOffsets;
+  llvm::SmallVector<int64_t> scaleReplicaParts;
+  llvm::SmallVector<int64_t> windowAxes{windowAxis};
+  if (!terminalOutputCohort) {
+    auto availableScales = riscv_internal::staticProduct(
+        scaleReplicaType.getLayout().getReplicaFactors().asArrayRef());
+    if (*outputReplicaCount != 1 || !availableScales ||
+        *availableScales < windowExtent)
+      return std::nullopt;
+    lhsSourceParts.push_back(0);
+    rhsSourceParts.push_back(0);
+    lhsLaneOffsets.push_back(0);
+    rhsLaneOffsets.push_back(0);
+    for (int64_t window = 0; window < windowExtent; ++window)
+      scaleReplicaParts.push_back(window);
+  }
+  for (int64_t output = 0; terminalOutputCohort &&
+                                   output < *outputReplicaCount;
+       ++output) {
+    auto firstResultPart = composeReplicaPart(
+        dotResult, outputAxes, output, windowAxes, 0);
+    auto lhsPart = firstResultPart
+                       ? projectReplica(issueLhs, dotResult, *firstResultPart)
+                       : std::optional<int64_t>();
+    auto rhsPart = firstResultPart
+                       ? projectReplica(issueRhs, dotResult, *firstResultPart)
+                       : std::optional<int64_t>();
+    if (!lhsPart || !rhsPart)
+      return std::nullopt;
+    lhsSourceParts.push_back(*lhsPart);
+    rhsSourceParts.push_back(*rhsPart);
+    lhsLaneOffsets.push_back(0);
+    rhsLaneOffsets.push_back(0);
+    for (int64_t window = 0; window < windowExtent; ++window) {
+      auto resultPart = composeReplicaPart(dotResult, outputAxes, output,
+                                           windowAxes, window);
+      auto scalePart = resultPart
+                           ? projectReplica(scaleReplicaType, dotResult,
+                                            *resultPart)
+                           : std::optional<int64_t>();
+      if (!scalePart)
+        return std::nullopt;
+      scaleReplicaParts.push_back(*scalePart);
+    }
   }
 
   const int64_t reductionAxis = dot.getOver()[0];
@@ -3501,7 +3662,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
   const int64_t issueUnroll =
       std::min<int64_t>(dot.getPartialUnroll(), issueStreams);
   auto scaleParts = riscv_internal::staticProduct(
-      scaleReplicas.getLayout().getReplicaFactors().asArrayRef());
+      scaleReplicaType.getLayout().getReplicaFactors().asArrayRef());
   llvm::DenseSet<mlir::Operation *> visited;
   const llvm::StringRef scaleSupply =
       scaleParts && *scaleParts >= 8 &&
@@ -3514,7 +3675,13 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
     return std::nullopt;
   return riscv::NestedPartialPlanAttr::get(
       builder.getContext(), windowAxis, issueStreams, windowExtent, issueUnroll,
-      issueLhs, issueRhs, sourceSlot, splitSlot, reducedSlot, scaleReplicas,
+      riscv_internal::integers(builder, outputAxes), *outputReplicaCount,
+      riscv_internal::integers(builder, lhsSourceParts),
+      riscv_internal::integers(builder, rhsSourceParts),
+      riscv_internal::integers(builder, lhsLaneOffsets),
+      riscv_internal::integers(builder, rhsLaneOffsets),
+      riscv_internal::integers(builder, scaleReplicaParts), issueLhs, issueRhs,
+      sourceSlot, splitSlot, reducedSlot, scaleReplicaType,
       sourceSet, repackedSet, reducedSet,
       scaleCombinedSet, scaleSupply, *multiplyInstruction,
       "rvv.partial-reduce.widen", *finalizeInstruction, resources);
@@ -3819,12 +3986,18 @@ public:
         auto finalElement = mlir::dyn_cast<mlir::IntegerType>(
             riscv_internal::logicalElement(finalType));
         auto finalValue = mlir::dyn_cast<riscv::ValueType>(finalType);
-        const bool singleScalarFinal =
+        const int64_t finalReplicaCount =
+            finalValue
+                ? product(finalValue.getLayout().getReplicaFactors())
+                : 1;
+        const bool closedScalarFinal =
             !finalValue ||
             (finalValue.getLayout().getCarrier() == "scalar" &&
              product(finalValue.getLayout().getTimeFactors()) == 1 &&
              product(finalValue.getLayout().getLaneFactors()) == 1 &&
-             product(finalValue.getLayout().getReplicaFactors()) == 1 &&
+             (finalReplicaCount == 1 ||
+              (finalReplicaCount > 1 &&
+               !reachesReductionThroughPureOps(found->second.getResult()))) &&
              product(finalValue.getLayout().getFragmentFactors()) == 1 &&
              product(finalValue.getLayout().getLocalFactors()) == 1);
         if (match && windowAxis > 0 && lhsPosition && rhsPosition &&
@@ -3832,7 +4005,7 @@ public:
             lhsWindow > 1 && lhsWindow == rhsWindow &&
             logicalExtent == lhsTime * lhsWindow && finalElement &&
             finalElement.isSigned() && finalElement.getWidth() == 32 &&
-            singleScalarFinal && dot.getPartialUnroll() > 0) {
+            closedScalarFinal && dot.getPartialUnroll() > 0) {
           const bool issueOnlyWindow =
               hasGappedIndexedWindowRoot(dot.getLhs(), windowAxis) ||
               hasGappedIndexedWindowRoot(dot.getRhs(), windowAxis);
@@ -3846,17 +4019,21 @@ public:
                 "nested scaled contraction has no legal full-product carrier under the target resource contract; lhs=")
                 << dot.getLhs().getType() << ", rhs=" << dot.getRhs().getType()
                 << ", scale=" << match->scale.getType()
-                << ", window_axis=" << windowAxis << ", issue_streams="
-                << lhsTime << ", window_extent=" << lhsWindow;
+                 << ", window_axis=" << windowAxis << ", issue_streams="
+                << lhsTime << ", window_extent=" << lhsWindow
+                << ", reduction_lanes=" << dot.getReductionLanes()
+                << ", reduction_streams=" << dot.getReductionStreams()
+                << ", final_type=" << found->second.getResult().getType();
             signalPassFailure();
             return;
           }
           kind = "nested_scaled_stream";
           partialAxes.assign(1, windowAxis);
-          outputAxes.clear();
+          outputAxes.assign((*nestedPlan).getOutputAxes().asArrayRef().begin(),
+                            (*nestedPlan).getOutputAxes().asArrayRef().end());
           sourceSlots = plannedStreams;
           partialSlots = logicalExtent;
-          replicas = 1;
+          replicas = (*nestedPlan).getOutputReplicas();
           laneSplit = plannedWindow;
           combineArity = plannedWindow;
           resources = (*nestedPlan).getResourceGroups();
@@ -5344,19 +5521,37 @@ public:
       auto resultElement = mlir::dyn_cast<mlir::IntegerType>(
           riscv_internal::logicalElement(finalType));
       auto finalValue = mlir::dyn_cast<riscv::ValueType>(finalType);
-      const bool singleScalarFinal =
+      const int64_t outputReplicas =
+          nestedPlan ? nestedPlan.getOutputReplicas() : int64_t{0};
+      auto finalReplicas =
+          finalValue ? riscv_internal::staticProduct(
+                           finalValue.getLayout().getReplicaFactors().asArrayRef())
+                     : std::optional<int64_t>(1);
+      const bool closedScalarFinal =
           !finalValue ||
           (finalValue.getLayout().getCarrier() == "scalar" &&
            product(finalValue.getLayout().getTimeFactors()) == 1 &&
            product(finalValue.getLayout().getLaneFactors()) == 1 &&
-           product(finalValue.getLayout().getReplicaFactors()) == 1 &&
+           product(finalValue.getLayout().getReplicaFactors()) > 0 &&
            product(finalValue.getLayout().getFragmentFactors()) == 1 &&
            product(finalValue.getLayout().getLocalFactors()) == 1);
       if (!nestedPlan || windowAxis <= 0 || streams <= 0 || windowExtent <= 0 ||
+          outputReplicas <= 0 || !finalReplicas ||
+          *finalReplicas != outputReplicas ||
+          nestedPlan.getLhsSourceParts().size() !=
+              static_cast<size_t>(outputReplicas) ||
+          nestedPlan.getRhsSourceParts().size() !=
+              static_cast<size_t>(outputReplicas) ||
+          nestedPlan.getLhsLaneOffsets().size() !=
+              static_cast<size_t>(outputReplicas) ||
+          nestedPlan.getRhsLaneOffsets().size() !=
+              static_cast<size_t>(outputReplicas) ||
+          nestedPlan.getScaleReplicas().size() !=
+              static_cast<size_t>(outputReplicas * windowExtent) ||
           !issueLhsType || !issueRhsType || !scaleReplicaType ||
           !sourceSetType || !repackedSetType || !reducedSetType ||
           !scaleCombinedSetType || !resultElement || !resultElement.isSigned() ||
-          resultElement.getWidth() != 32 || !singleScalarFinal) {
+          resultElement.getWidth() != 32 || !closedScalarFinal) {
         dot.emitError(
             "nested topology reached materialization without its complete typed carrier plan");
         failed = true;
@@ -5367,16 +5562,8 @@ public:
       auto zero = rewriter.create<riscv::ConstantOp>(
           reduce.getLoc(), resultElement,
           rewriter.getIntegerAttr(resultElement, 0));
-      mlir::Value initial = zero.getResult();
-      if (finalValue) {
-        auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
-            reduce.getLoc(), finalValue, mlir::ValueRange{zero.getResult()},
-            riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
-                                 "scalar.assemble-replicas",
-                                 "scalar.assemble-replicas", 0, 0));
-        riscv_internal::copyOrigin(reduce, assembled);
-        initial = assembled.getResult();
-      }
+      llvm::SmallVector<mlir::Value> initial(
+          static_cast<size_t>(outputReplicas), zero.getResult());
       auto lower = rewriter.create<mlir::arith::ConstantIndexOp>(
           reduce.getLoc(), 0);
       auto upper = rewriter.create<mlir::arith::ConstantIndexOp>(
@@ -5384,8 +5571,7 @@ public:
       auto step = rewriter.create<mlir::arith::ConstantIndexOp>(
           reduce.getLoc(), 1);
       auto loop = rewriter.create<mlir::scf::ForOp>(
-          reduce.getLoc(), lower, upper, step,
-          mlir::ValueRange{initial},
+          reduce.getLoc(), lower, upper, step, initial,
           [&](mlir::OpBuilder &builder, mlir::Location location,
               mlir::Value, mlir::ValueRange carried) {
             builder.create<mlir::scf::YieldOp>(location, carried);
@@ -5417,69 +5603,59 @@ public:
 
       llvm::DenseMap<mlir::Value, mlir::Value> clones;
       auto target = dot->getParentOfType<riscv::KernelOp>().getTarget();
-      auto lhsSlice = cloneIssueWindow(dot.getLhs(), windowAxis, windowExtent,
-                                       loop.getInductionVar(), target, rewriter,
-                                       clones);
-      auto rhsSlice = cloneIssueWindow(dot.getRhs(), windowAxis, windowExtent,
-                                       loop.getInductionVar(), target, rewriter,
-                                       clones);
+      auto materializeIssueOperand = [&](mlir::Value source,
+                                         riscv::ValueType planned)
+          -> mlir::FailureOr<mlir::Value> {
+        auto sourceType = mlir::dyn_cast<riscv::ValueType>(source.getType());
+        // One issue with an output cohort already consumes the operand's
+        // complete logical domain.  Keep that SSA supply and let the explicit
+        // layout edge below move its output replicas into the planned carrier;
+        // cloning its internal storage windows would project coordinates that
+        // are not being iterated.
+        if (streams == 1 && outputReplicas > 1 && sourceType &&
+            sourceType.getShape() == planned.getShape() &&
+            sourceType.getAxisIds() == planned.getAxisIds())
+          return source;
+        return cloneIssueWindow(source, windowAxis, windowExtent,
+                                loop.getInductionVar(), target, rewriter,
+                                clones);
+      };
+      auto lhsSlice = materializeIssueOperand(dot.getLhs(), issueLhsType);
+      auto rhsSlice = materializeIssueOperand(dot.getRhs(), issueRhsType);
       auto lhsType = mlir::succeeded(lhsSlice)
                          ? mlir::dyn_cast<riscv::ValueType>((*lhsSlice).getType())
                          : riscv::ValueType();
       auto rhsType = mlir::succeeded(rhsSlice)
                          ? mlir::dyn_cast<riscv::ValueType>((*rhsSlice).getType())
                          : riscv::ValueType();
-      if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice) ||
-          lhsType != issueLhsType || rhsType != issueRhsType) {
+      if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice) || !lhsType ||
+          !rhsType) {
         dot.emitError(
-            "nested issue-window cloning disagrees with the selected carrier types; lhs=")
+            "nested issue-window cloning did not produce typed RVV operands; lhs=")
             << lhsType << ", planned_lhs=" << issueLhsType
             << ", rhs=" << rhsType << ", planned_rhs=" << issueRhsType;
         rewriter.eraseOp(loop);
         failed = true;
         continue;
       }
-      const int64_t reductionAxis = sourceSetType.getReductionAxis();
-      auto zeroMap = rewriter.getDenseI64ArrayAttr({0});
-      auto sourceSet = rewriter.create<riscv::RVVPartialSetOp>(
-          dot.getLoc(), sourceSetType, mlir::ValueRange{*lhsSlice},
-          mlir::ValueRange{*rhsSlice}, zeroMap, zeroMap, zeroMap, zeroMap,
-          zeroMap, zeroMap, reductionAxis,
-          nestedPlan.getMultiplyInstruction(), ownerDomain(reduce),
-          nextPartialBirthId++, ownerDomain(reduce),
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-set", "rvv.partial-set",
-              "rvv.partial-set",
-              lhsType.getLayout().getRegisterGroups() +
-                  rhsType.getLayout().getRegisterGroups(),
-              sourceSetType.getResourceGroups(), 0, 0, "none", "exact",
-              {reductionAxis, 1}));
-      riscv_internal::copyOrigin(dot, sourceSet);
-      sinkReplicaSupplies(sourceSet);
-      mlir::Value reductionInput = sourceSet.getResult();
-      if (windowExtent > 1) {
-        auto repacked = rewriter.create<riscv::RVVPartialRepackOp>(
-            dot.getLoc(), repackedSetType, sourceSet.getResult(), windowExtent,
-            riscv_internal::leaf(
-                rewriter, "rvv", "partial-repack",
-                "rvv.partial-repack.split", "rvv.partial-repack.split",
-                sourceSetType.getResourceGroups(),
-                repackedSetType.getResourceGroups(), 0, 0, "none", "exact",
-                {reductionAxis, windowExtent}));
-        riscv_internal::copyOrigin(dot, repacked);
-        reductionInput = repacked.getResult();
-      }
-      auto partialReduced = rewriter.create<riscv::RVVPartialReduceOp>(
-          dot.getLoc(), reducedSetType, reductionInput,
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-reduce",
-              nestedPlan.getReduceInstruction(),
-              nestedPlan.getReduceInstruction(),
-              repackedSetType.getResourceGroups(),
-              reducedSetType.getResourceGroups(), 1, 0, "none", "exact",
-              {reductionAxis, windowExtent}));
-      riscv_internal::copyOrigin(dot, partialReduced);
-
+      auto materializeIssueLayout = [&](mlir::Value value,
+                                        riscv::ValueType source,
+                                        riscv::ValueType planned) -> mlir::Value {
+        if (source == planned)
+          return value;
+        auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
+            dot.getLoc(), planned, value,
+            riscv_internal::layoutConversion(rewriter, source.getLayout(),
+                                             planned.getLayout()),
+            riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+        if (mlir::Operation *definition = value.getDefiningOp())
+          riscv_internal::copyOrigin(definition, conversion);
+        return conversion.getResult();
+      };
+      mlir::Value issueLhs =
+          materializeIssueLayout(*lhsSlice, lhsType, issueLhsType);
+      mlir::Value issueRhs =
+          materializeIssueLayout(*rhsSlice, rhsType, issueRhsType);
       auto scale = cloneIssueWindow(match->scale, windowAxis, windowExtent,
                                     loop.getInductionVar(), target, rewriter,
                                     clones);
@@ -5530,51 +5706,109 @@ public:
           riscv_internal::copyOrigin(definition, conversion);
         scalarScale = conversion.getResult();
       }
-      llvm::SmallVector<mlir::Value> scales(windowExtent, scalarScale);
-      llvm::SmallVector<int64_t> scaleReplicas;
-      scaleReplicas.reserve(windowExtent);
-      for (int64_t replica = 0; replica < windowExtent; ++replica)
-        scaleReplicas.push_back(replica);
-      auto combined = rewriter.create<riscv::RVVPartialScaleCombineOp>(
-          reduce.getLoc(), scaleCombinedSetType, partialReduced.getResult(),
-          scales, rewriter.getDenseI64ArrayAttr(scaleReplicas),
-          rewriter.getDenseI64ArrayAttr(scaleReplicas),
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-scale-combine",
-              "rvv.partial-scale-combine", "rvv.partial-scale-combine",
-              reducedSetType.getResourceGroups(),
-              scaleCombinedSetType.getResourceGroups(), 1, 0, "none", "exact",
-              {reductionAxis, windowExtent, 1, windowExtent}));
-      riscv_internal::copyOrigin(dot, combined);
-      auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
-          reduce.getLoc(), resultElement, combined.getResult(), reductionAxis,
-          riscv_internal::leaf(
-              rewriter, "rvv", "partial-finalize",
-              nestedPlan.getFinalizeInstruction(),
-              nestedPlan.getFinalizeInstruction(),
-              scaleCombinedSetType.getResourceGroups(), 0,
-              1, 0, "none", "exact", {reductionAxis, 1}));
-      riscv_internal::copyOrigin(dot, finalized);
-      mlir::Value contribution = finalized.getResult();
+      const int64_t reductionAxis = sourceSetType.getReductionAxis();
+      auto zeroOperand = rewriter.getDenseI64ArrayAttr({0});
+      llvm::SmallVector<int64_t> windowOrder;
+      windowOrder.reserve(static_cast<size_t>(windowExtent));
+      for (int64_t window = 0; window < windowExtent; ++window)
+        windowOrder.push_back(window);
+      llvm::SmallVector<mlir::Value> accumulatedOutputs;
+      accumulatedOutputs.reserve(static_cast<size_t>(outputReplicas));
+      for (int64_t output = 0; output < outputReplicas; ++output) {
+        auto lhsPart = rewriter.getDenseI64ArrayAttr(
+            nestedPlan.getLhsSourceParts().asArrayRef().slice(output, 1));
+        auto rhsPart = rewriter.getDenseI64ArrayAttr(
+            nestedPlan.getRhsSourceParts().asArrayRef().slice(output, 1));
+        auto lhsOffset = rewriter.getDenseI64ArrayAttr(
+            nestedPlan.getLhsLaneOffsets().asArrayRef().slice(output, 1));
+        auto rhsOffset = rewriter.getDenseI64ArrayAttr(
+            nestedPlan.getRhsLaneOffsets().asArrayRef().slice(output, 1));
+        auto sourceSet = rewriter.create<riscv::RVVPartialSetOp>(
+            dot.getLoc(), sourceSetType, mlir::ValueRange{issueLhs},
+            mlir::ValueRange{issueRhs}, zeroOperand, zeroOperand, lhsPart,
+            rhsPart, lhsOffset, rhsOffset, reductionAxis,
+            nestedPlan.getMultiplyInstruction(), ownerDomain(reduce),
+            nextPartialBirthId++, ownerDomain(reduce),
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-set", "rvv.partial-set",
+                "rvv.partial-set",
+                issueLhsType.getLayout().getRegisterGroups() +
+                    issueRhsType.getLayout().getRegisterGroups(),
+                sourceSetType.getResourceGroups(), 0, 0, "none", "exact",
+                {reductionAxis, 1}));
+        riscv_internal::copyOrigin(dot, sourceSet);
+        sinkReplicaSupplies(sourceSet);
+        mlir::Value reductionInput = sourceSet.getResult();
+        if (windowExtent > 1) {
+          auto repacked = rewriter.create<riscv::RVVPartialRepackOp>(
+              dot.getLoc(), repackedSetType, sourceSet.getResult(), windowExtent,
+              riscv_internal::leaf(
+                  rewriter, "rvv", "partial-repack",
+                  "rvv.partial-repack.split", "rvv.partial-repack.split",
+                  sourceSetType.getResourceGroups(),
+                  repackedSetType.getResourceGroups(), 0, 0, "none", "exact",
+                  {reductionAxis, windowExtent}));
+          riscv_internal::copyOrigin(dot, repacked);
+          reductionInput = repacked.getResult();
+        }
+        auto partialReduced = rewriter.create<riscv::RVVPartialReduceOp>(
+            dot.getLoc(), reducedSetType, reductionInput,
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-reduce",
+                nestedPlan.getReduceInstruction(),
+                nestedPlan.getReduceInstruction(),
+                repackedSetType.getResourceGroups(),
+                reducedSetType.getResourceGroups(), 1, 0, "none", "exact",
+                {reductionAxis, windowExtent}));
+        riscv_internal::copyOrigin(dot, partialReduced);
+        llvm::SmallVector<mlir::Value> scales(
+            static_cast<size_t>(windowExtent), scalarScale);
+        auto scaleParts = rewriter.getDenseI64ArrayAttr(
+            nestedPlan.getScaleReplicas().asArrayRef().slice(
+                output * windowExtent, windowExtent));
+        auto combined = rewriter.create<riscv::RVVPartialScaleCombineOp>(
+            reduce.getLoc(), scaleCombinedSetType, partialReduced.getResult(),
+            scales, scaleParts,
+            rewriter.getDenseI64ArrayAttr(windowOrder),
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-scale-combine",
+                "rvv.partial-scale-combine", "rvv.partial-scale-combine",
+                reducedSetType.getResourceGroups(),
+                scaleCombinedSetType.getResourceGroups(), 1, 0, "none",
+                "exact", {reductionAxis, windowExtent, 1, windowExtent}));
+        riscv_internal::copyOrigin(dot, combined);
+        auto finalized = rewriter.create<riscv::RVVPartialFinalizeOp>(
+            reduce.getLoc(), resultElement, combined.getResult(), reductionAxis,
+            riscv_internal::leaf(
+                rewriter, "rvv", "partial-finalize",
+                nestedPlan.getFinalizeInstruction(),
+                nestedPlan.getFinalizeInstruction(),
+                scaleCombinedSetType.getResourceGroups(), 0, 1, 0, "none",
+                "exact", {reductionAxis, 1}));
+        riscv_internal::copyOrigin(dot, finalized);
+        auto accumulated = rewriter.create<riscv::BinaryOp>(
+            reduce.getLoc(), resultElement, loop.getRegionIterArg(output),
+            finalized.getResult(), "add",
+            riscv_internal::unselectedLeaf(rewriter));
+        accumulatedOutputs.push_back(accumulated.getResult());
+      }
+      rewriter.create<mlir::scf::YieldOp>(reduce.getLoc(), accumulatedOutputs);
+
+      rewriter.setInsertionPointAfter(loop);
+      nestedDeadRoots.push_back(reduce.getInput());
+      mlir::Value replacement;
       if (finalValue) {
         auto assembled = rewriter.create<riscv::RVVAssembleReplicasOp>(
-            reduce.getLoc(), finalValue, mlir::ValueRange{contribution},
+            reduce.getLoc(), finalValue, loop.getResults(),
             riscv_internal::leaf(rewriter, "scalar", "assemble-replicas",
                                  "scalar.assemble-replicas",
                                  "scalar.assemble-replicas", 0, 0));
         riscv_internal::copyOrigin(reduce, assembled);
-        contribution = assembled.getResult();
+        replacement = assembled.getResult();
+      } else {
+        replacement = loop.getResult(0);
       }
-      auto accumulated = rewriter.create<riscv::BinaryOp>(
-          reduce.getLoc(), finalType, loop.getRegionIterArg(0),
-          contribution, "add",
-          riscv_internal::unselectedLeaf(rewriter));
-      rewriter.create<mlir::scf::YieldOp>(reduce.getLoc(),
-                                          accumulated.getResult());
-
-      rewriter.setInsertionPointAfter(loop);
-      nestedDeadRoots.push_back(reduce.getInput());
-      reduce.getResult().replaceAllUsesWith(loop.getResult(0));
+      reduce.getResult().replaceAllUsesWith(replacement);
       rewriter.eraseOp(reduce);
     }
     llvm::DenseSet<mlir::Value> nestedCleanupStops;

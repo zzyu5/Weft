@@ -7841,7 +7841,6 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
         resultSuffix != suffixFor(resultLayout.getLmulEighths()))
       return fail(conversion,
                   "vector register-to-lane conversion has inconsistent RVV spelling");
-
     Binding packed;
     packed.kind = Binding::Kind::Vector;
     for (int64_t resultRegister = 0; resultRegister < resultRegisters;
@@ -7930,7 +7929,8 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
         if (level.size() != 1 || currentLMUL != resultLayout.getLmulEighths())
           return fail(conversion,
                       "vector register-to-lane pack did not reach its target LMUL");
-        packed.parts.push_back(std::move(level.front()));
+        std::string packedValue = std::move(level.front());
+        packed.parts.push_back(std::move(packedValue));
       }
     }
     bindings[conversion.getResult()] = std::move(packed);
@@ -9484,10 +9484,15 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
   const llvm::StringRef instruction = instructionOf(operation.getOperation());
   const bool joinedBroadcast =
       instruction == "rvv.regular-repeat-joined-broadcast";
+  const bool joinedGatherPowerOfTwo =
+      instruction == "rvv.regular-repeat-joined-gather.pow2";
+  const bool joinedGatherDivision =
+      instruction == "rvv.regular-repeat-joined-gather.div";
+  const bool joinedGather = joinedGatherPowerOfTwo || joinedGatherDivision;
   const bool broadcastOnly =
       joinedBroadcast || instruction == "rvv.regular-repeat-broadcast";
   const bool powerOfTwo = instruction == "rvv.regular-repeat-gather.pow2";
-  if (!broadcastOnly && !powerOfTwo &&
+  if (!broadcastOnly && !joinedGather && !powerOfTwo &&
       instruction != "rvv.regular-repeat-gather.div")
     return fail(operation,
                 "regular-repeat gather has no exact selected index spelling");
@@ -9548,7 +9553,7 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
     }
     record += ")";
     sourceRecords.push_back(record);
-    if (broadcastOnly)
+    if (broadcastOnly || joinedGather)
       continue;
     if (operation.getAccess().getMapping() != "natural")
       return fail(operation,
@@ -9587,7 +9592,8 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
       const int64_t replica = part / streams;
       const int64_t stream = part % streams;
       const int64_t availableSources = static_cast<int64_t>(
-          broadcastOnly ? sourceRecords.size() : sourceWindows.size());
+          (broadcastOnly || joinedGather) ? sourceRecords.size()
+                                          : sourceWindows.size());
       if (replica < 0 || replica >= availableSources ||
           stream < 0 || stream >= static_cast<int64_t>(bases.size()))
         return fail(operation,
@@ -9607,6 +9613,124 @@ mlir::LogicalResult Emitter::compileRVVRegularRepeatGather(
              vectorSuffix(resultValue) + "(" + *scalarValue + ", " +
              partVL(resultValue, part) + ");");
         result.parts.push_back(std::move(gathered));
+        continue;
+      }
+      if (joinedGather) {
+        mlir::Value indexValue = operation.getIndices()[resultNumber];
+        auto indexLayout = layoutOf(indexValue);
+        auto resultLayout = layoutOf(resultValue);
+        auto logicalInteger =
+            mlir::dyn_cast<mlir::IntegerType>(storage->type);
+        const int64_t group = operation.getAccess().getGroupSize();
+        const int64_t fields = operation.getAccess().getJoinFields();
+        const int64_t lowBits = operation.getAccess().getJoinLowBits();
+        const int64_t role = operation.getAccess().getJoinRole();
+        const int64_t physicalRole =
+            operation.getAccess().getOrder() == "lo_first"
+                ? role
+                : fields - 1 - role;
+        const unsigned logicalWidth =
+            logicalInteger ? logicalInteger.getWidth() : 0;
+        const int64_t maskBits =
+            resultLayout
+                ? resultLayout.getSew() * 8 /
+                      resultLayout.getLmulEighths()
+                : 0;
+        if (!indexLayout || !resultLayout || !logicalInteger ||
+            !logicalInteger.isUnsigned() || logicalWidth == 0 ||
+            logicalWidth > 8 || group <= 0 || fields <= 1 || lowBits <= 0 ||
+            lowBits >= static_cast<int64_t>(logicalWidth) || role < 0 ||
+            role >= fields ||
+            (maskBits != 1 && maskBits != 2 && maskBits != 4 &&
+             maskBits != 8 && maskBits != 16 && maskBits != 32 &&
+             maskBits != 64) ||
+            indexLayout.getSew() != resultLayout.getSew() ||
+            indexLayout.getLmulEighths() !=
+                resultLayout.getLmulEighths())
+          return fail(operation,
+                      "joined regular-repeat gather has incomplete typed byte geometry");
+        const std::string indexSuffix = vectorSuffix(indexValue);
+        const std::string indexType = vectorType(indexValue);
+        const std::string resultSuffix = vectorSuffix(resultValue);
+        const std::string resultType = vectorType(resultValue);
+        const std::string vl = partVL(resultValue, part);
+        const uint64_t logicalMask = (uint64_t(1) << logicalWidth) - 1;
+        const uint64_t lowMask = (uint64_t(1) << lowBits) - 1;
+        const uint64_t highMask =
+            (uint64_t(1) << (logicalWidth - lowBits)) - 1;
+
+        std::string logicalIndex = indexBinding.parts[part];
+        if (sourceBase->scalar != "0") {
+          std::string adjusted = fresh("joined_index");
+          line(indexType + " " + adjusted + " = __riscv_vadd_vx_" +
+               indexSuffix + "(" + logicalIndex + ", " + sourceBase->scalar +
+               ", " + vl + ");");
+          logicalIndex = std::move(adjusted);
+        }
+        std::string within = fresh("joined_within");
+        line(indexType + " " + within + " = __riscv_" +
+             std::string(joinedGatherPowerOfTwo ? "vand_vx_" : "vremu_vx_") +
+             indexSuffix + "(" + logicalIndex + ", " +
+             std::to_string(joinedGatherPowerOfTwo ? group - 1 : group) +
+             ", " + vl + ");");
+        auto addByteOffset = [&](int64_t offset,
+                                 llvm::StringRef stem) -> std::string {
+          if (offset == 0)
+            return within;
+          std::string value = fresh(stem);
+          line(indexType + " " + value + " = __riscv_vadd_vx_" +
+               indexSuffix + "(" + within + ", " +
+               std::to_string(offset) + ", " + vl + ");");
+          return value;
+        };
+        const std::string roleOffsets =
+            addByteOffset(role * group, "joined_role_offsets");
+        const std::string lowOffsets =
+            addByteOffset(fields * group, "joined_low_offsets");
+        const std::string pointer =
+            "((const uint8_t *)(" + sourceRecords[replica] + ") + " +
+            std::to_string(storage->bitOffset / 8) + ")";
+        std::string roleBytes = fresh("joined_role_bytes");
+        line(resultType + " " + roleBytes + " = __riscv_vluxei" +
+             std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
+             "(" + pointer + ", " + roleOffsets + ", " + vl + ");");
+        std::string lowBytes = fresh("joined_low_bytes");
+        line(resultType + " " + lowBytes + " = __riscv_vluxei" +
+             std::to_string(indexLayout.getSew()) + "_v_" + resultSuffix +
+             "(" + pointer + ", " + lowOffsets + ", " + vl + ");");
+        const std::string head =
+            "__riscv_vand_vx_" + resultSuffix + "(" + roleBytes + ", " +
+            std::to_string(logicalMask) + ", " + vl + ")";
+        const std::string low =
+            "__riscv_vand_vx_" + resultSuffix + "(__riscv_vsrl_vx_" +
+            resultSuffix + "(" + lowBytes + ", " +
+            std::to_string(physicalRole * lowBits) + ", " + vl + "), " +
+            std::to_string(lowMask) + ", " + vl + ")";
+        const std::string high =
+            "__riscv_vand_vx_" + resultSuffix + "(__riscv_vsrl_vx_" +
+            resultSuffix + "(" + roleBytes + ", " +
+            std::to_string(logicalWidth) + ", " + vl + "), " +
+            std::to_string(highMask) + ", " + vl + ")";
+        const std::string assembled =
+            operation.getAccess().getOrder() == "lo_first"
+                ? "__riscv_vor_vv_" + resultSuffix + "(" + low +
+                      ", __riscv_vsll_vx_" + resultSuffix + "(" + high +
+                      ", " + std::to_string(lowBits) + ", " + vl + "), " +
+                      vl + ")"
+                : "__riscv_vor_vv_" + resultSuffix + "(" + high +
+                      ", __riscv_vsll_vx_" + resultSuffix + "(" + low +
+                      ", " + std::to_string(logicalWidth - lowBits) + ", " +
+                      vl + "), " + vl + ")";
+        std::string firstHalf = fresh("joined_first_half");
+        line("vbool" + std::to_string(maskBits) + "_t " + firstHalf +
+             " = __riscv_vmsltu_vx_" + indexSuffix + "_b" +
+             std::to_string(maskBits) + "(" + logicalIndex + ", " +
+             std::to_string(group) + ", " + vl + ");");
+        std::string decoded = fresh("joined_gather");
+        line(resultType + " " + decoded + " = __riscv_vmerge_vvm_" +
+             resultSuffix + "(" + assembled + ", " + head + ", " +
+             firstHalf + ", " + vl + ");");
+        result.parts.push_back(std::move(decoded));
         continue;
       }
       std::string gathered = fresh("regular_gather");

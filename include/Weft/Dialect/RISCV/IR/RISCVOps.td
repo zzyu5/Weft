@@ -320,6 +320,13 @@ def WeftRISCV_NestedPartialPlanAttr
     "int64_t":$issueStreams,
     "int64_t":$windowExtent,
     "int64_t":$issueUnroll,
+    "::mlir::DenseI64ArrayAttr":$outputAxes,
+    "int64_t":$outputReplicas,
+    "::mlir::DenseI64ArrayAttr":$lhsSourceParts,
+    "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
+    "::mlir::DenseI64ArrayAttr":$lhsLaneOffsets,
+    "::mlir::DenseI64ArrayAttr":$rhsLaneOffsets,
+    "::mlir::DenseI64ArrayAttr":$scaleReplicas,
     "::mlir::Type":$issueLhsType,
     "::mlir::Type":$issueRhsType,
     "::mlir::Type":$sourceSlotType,
@@ -338,6 +345,9 @@ def WeftRISCV_NestedPartialPlanAttr
   );
   let assemblyFormat = [{
     `<` $windowAxis `,` $issueStreams `,` $windowExtent `,` $issueUnroll `,`
+        $outputAxes `,` $outputReplicas `,` $lhsSourceParts `,`
+        $rhsSourceParts `,` $lhsLaneOffsets `,` $rhsLaneOffsets `,`
+        $scaleReplicas `,`
         $issueLhsType `,` $issueRhsType `,` $sourceSlotType `,`
         $splitSlotType `,` $reducedSlotType `,` $scaleReplicaType `,`
         $sourceSetType `,` $repackedSetType `,` $reducedSetType `,`

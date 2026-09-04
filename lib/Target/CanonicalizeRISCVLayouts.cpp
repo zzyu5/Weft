@@ -105,12 +105,94 @@ public:
         mlir::Operation *producer = conversion.getInput().getDefiningOp();
         if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(producer)) {
           if (!conversion.getInput().hasOneUse() ||
-              !extract->hasAttr("index_pattern"))
+              (!extract->hasAttr("index_pattern") &&
+               extract.getAccess().getForm() != "indexed"))
             continue;
+          auto targetType =
+              mlir::cast<riscv::ValueType>(conversion.getResult().getType());
+          auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+          if (extract->hasAttr("index_pattern")) {
+            rewriter.setInsertionPoint(conversion);
+            auto rematerialized = rewriter.create<riscv::ExtractOp>(
+                extract.getLoc(), conversion.getResult().getType(),
+                extract.getInput(), extract.getIndices(), extract.getSelectors(),
+                extract.getAccess(), extract.getLeaf());
+            for (auto attribute : extract->getAttrs())
+              if (attribute.getName() != "operandSegmentSizes")
+                rematerialized->setAttr(attribute.getName(),
+                                        attribute.getValue());
+            conversion.getResult().replaceAllUsesWith(rematerialized.getResult());
+            rewriter.eraseOp(conversion);
+            rewriter.eraseOp(extract);
+            changed = true;
+            continue;
+          }
+          if (!kernel)
+            continue;
+          llvm::SmallVector<riscv::LayoutAttr> requiredLayouts;
+          requiredLayouts.reserve(extract.getIndices().size());
+          bool legalRematerialization = true;
+          for (mlir::Value index : extract.getIndices()) {
+            auto indexType = mlir::dyn_cast<riscv::ValueType>(index.getType());
+            if (!indexType) {
+              requiredLayouts.push_back(riscv::LayoutAttr());
+              continue;
+            }
+            auto required = riscv_internal::projectLayout(
+                rewriter, indexType, targetType.getLayout(),
+                kernel.getTarget());
+            if (!required) {
+              legalRematerialization = false;
+              break;
+            }
+            auto edge = riscv_internal::layoutConversion(
+                rewriter, indexType.getLayout(), required);
+            auto requiredType = mlir::dyn_cast<riscv::ValueType>(
+                riscv_internal::withLayout(indexType, required));
+            if (required != indexType.getLayout() &&
+                indexType.getLayout().getCarrier() == "rvv" &&
+                required.getCarrier() == "rvv" &&
+                (edge.getKind() == "register_to_lane" ||
+                 edge.getKind() == "time_to_lane") &&
+                (!requiredType ||
+                 !riscv::rvvPartToLanePieces(indexType, requiredType))) {
+              legalRematerialization = false;
+              break;
+            }
+            requiredLayouts.push_back(required);
+          }
+          // Backward rematerialization is an optimization, not a legality
+          // escape.  Preserve the original typed conversion when projecting
+          // an index would require an unsupported cross-axis lane shuffle.
+          if (!legalRematerialization)
+            continue;
+          llvm::SmallVector<mlir::Value> indices;
+          indices.reserve(extract.getIndices().size());
           rewriter.setInsertionPoint(conversion);
+          for (auto [index, required] :
+               llvm::zip(extract.getIndices(), requiredLayouts)) {
+            auto indexType = mlir::dyn_cast<riscv::ValueType>(index.getType());
+            if (!indexType) {
+              indices.push_back(index);
+              continue;
+            }
+            mlir::Type requiredType =
+                riscv_internal::withLayout(indexType, required);
+            if (requiredType == index.getType()) {
+              indices.push_back(index);
+              continue;
+            }
+            auto edge = rewriter.create<riscv::ConvertLayoutOp>(
+                conversion.getLoc(), requiredType, index,
+                riscv_internal::layoutConversion(
+                    rewriter, indexType.getLayout(), required),
+                riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+            riscv_internal::copyOrigin(extract, edge);
+            indices.push_back(edge.getResult());
+          }
           auto rematerialized = rewriter.create<riscv::ExtractOp>(
               extract.getLoc(), conversion.getResult().getType(),
-              extract.getInput(), extract.getIndices(), extract.getSelectors(),
+              extract.getInput(), indices, extract.getSelectors(),
               extract.getAccess(), extract.getLeaf());
           for (auto attribute : extract->getAttrs())
             if (attribute.getName() != "operandSegmentSizes")

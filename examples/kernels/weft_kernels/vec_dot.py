@@ -331,11 +331,15 @@ def vec_dot_q4_k_q8_k(
         with L.subs(extent=32) as sub:
             partial = contract(w.q[sub], x.q[sub], over="k", acc=i32)
             i32_acc += partial * i32(w.sc[sub])
-        minimum = i32(0)
-        for sub in range(8):
-            minimum += i32(w.m[sub]) * (
-                i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])
-            )
+        min_group = iota(8, dtype=u32, axis="min_group")
+        minimum = reduce(
+            widen(w.m[min_group], i32)
+            * (
+                widen(x.bsum[min_group * u32(2)], i32)
+                + widen(x.bsum[min_group * u32(2) + u32(1)], i32)
+            ),
+            axis="min_group",
+        )
         result += f32(x.ds) * (
             f32(w.d) * f32(i32_acc) - f32(w.dmin) * f32(minimum)
         )
@@ -354,11 +358,15 @@ def vec_dot_q5_k_q8_k(
         with L.subs(extent=32) as sub:
             q = u8(w.q[sub]) | (u8(w.qh[sub]) << u8(4))
             integer += contract(q, x.q[sub], over="k", acc=i32) * i32(w.sc[sub])
-        minimum = i32(0)
-        for sub in range(8):
-            minimum += i32(w.m[sub]) * (
-                i32(x.bsum[sub * 2]) + i32(x.bsum[sub * 2 + 1])
-            )
+        min_group = iota(8, dtype=u32, axis="min_group")
+        minimum = reduce(
+            widen(w.m[min_group], i32)
+            * (
+                widen(x.bsum[min_group * u32(2)], i32)
+                + widen(x.bsum[min_group * u32(2) + u32(1)], i32)
+            ),
+            axis="min_group",
+        )
         result += f32(x.ds) * (
             f32(w.d) * f32(integer) - f32(w.dmin) * f32(minimum)
         )

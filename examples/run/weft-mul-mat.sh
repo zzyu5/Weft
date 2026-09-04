@@ -156,10 +156,10 @@ else
     runtime_kernel_define=-DWEFT_IQ2_XS_STAGED=1
     kernel=production_mul_mat_iq2_xs_staged
     if [[ ${target} == sg2044 ]]; then
-      meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=1 --meta NR=2)
+      meta=(--meta NC=64 --meta KC=256 --meta MC=16 --meta MR=2 --meta NR=2)
       physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
     else
-      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=1 --meta NR=2)
+      meta=(--meta NC=64 --meta KC=512 --meta MC=8 --meta MR=4 --meta NR=2)
       physical=(--auto-lmul-eighths=8 --auto-unroll=1 --auto-pipeline-depth=1)
     fi
   elif [[ ${format} == iq2_s_staged ]]; then

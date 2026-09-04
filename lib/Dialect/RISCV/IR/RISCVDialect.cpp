@@ -404,6 +404,29 @@ bool sameAxisMapping(ValueType lhs, size_t lhsIndex, ValueType rhs,
          left.getLocalFactors()[lhsIndex] == right.getLocalFactors()[rhsIndex];
 }
 
+bool hasLegalRVVIndexedEMUL(LayoutAttr indexLayout, int64_t dataSEW,
+                            int64_t dataLMULEighths) {
+  if (!indexLayout || indexLayout.getCarrier() != "rvv" ||
+      indexLayout.getSew() <= 0 || indexLayout.getLmulEighths() <= 0 ||
+      dataSEW <= 0 || dataLMULEighths <= 0 ||
+      indexLayout.getLmulEighths() >
+          std::numeric_limits<int64_t>::max() / dataSEW ||
+      dataLMULEighths >
+          std::numeric_limits<int64_t>::max() / indexLayout.getSew())
+    return false;
+  // RVV indexed memory operations use the data LMUL and index EEW to
+  // determine the index EMUL.  The selected index value must carry exactly
+  // that EMUL; spelling an arbitrary index/result pair is not a legal leaf.
+  return indexLayout.getLmulEighths() * dataSEW ==
+         dataLMULEighths * indexLayout.getSew();
+}
+
+bool hasLegalRVVIndexedEMUL(ValueType indices, ValueType result) {
+  return indices && result && result.getLayout().getCarrier() == "rvv" &&
+         hasLegalRVVIndexedEMUL(indices.getLayout(), result.getLayout().getSew(),
+                                result.getLayout().getLmulEighths());
+}
+
 std::optional<int64_t> physicalPartCount(ValueType value) {
   auto time =
       checkedPositiveProduct(value.getLayout().getTimeFactors().asArrayRef());
@@ -1707,7 +1730,13 @@ mlir::LogicalResult PartialAddTreePlanAttr::verify(
 mlir::LogicalResult NestedPartialPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     int64_t windowAxis, int64_t issueStreams, int64_t windowExtent,
-    int64_t issueUnroll, mlir::Type issueLhsType, mlir::Type issueRhsType,
+    int64_t issueUnroll, mlir::DenseI64ArrayAttr outputAxes,
+    int64_t outputReplicas, mlir::DenseI64ArrayAttr lhsSourceParts,
+    mlir::DenseI64ArrayAttr rhsSourceParts,
+    mlir::DenseI64ArrayAttr lhsLaneOffsets,
+    mlir::DenseI64ArrayAttr rhsLaneOffsets,
+    mlir::DenseI64ArrayAttr scaleReplicas, mlir::Type issueLhsType,
+    mlir::Type issueRhsType,
     mlir::Type sourceSlotType, mlir::Type splitSlotType,
     mlir::Type reducedSlotType, mlir::Type scaleReplicaType,
     mlir::Type sourceSetType, mlir::Type repackedSetType,
@@ -1739,8 +1768,9 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       multiplyInstruction == "rvv.vwmul.vv.reinterpret-lhs" ||
       multiplyInstruction == "rvv.vwmulsu.vv" ||
       multiplyInstruction == "rvv.vwmulsu.vv.swap";
-  if (windowAxis <= 0 || issueStreams <= 1 || windowExtent <= 1 ||
+  if (windowAxis <= 0 || issueStreams <= 0 || windowExtent <= 0 ||
       issueUnroll <= 0 || issueUnroll > issueStreams || resourceGroups <= 0 ||
+      outputReplicas <= 0 ||
       !issueLhs || !issueRhs || !sourceSlot || !splitSlot || !reducedSlot ||
       !scaleReplica || !sourceSet || !repackedSet || !reducedSet ||
       !scaleCombinedSet || !exactMultiply ||
@@ -1774,19 +1804,48 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       issueLhs.getLayout().getReplicaFactors().asArrayRef());
   auto rhsReplicas = checkedPositiveProduct(
       issueRhs.getLayout().getReplicaFactors().asArrayRef());
-  auto scaleReplicas = checkedPositiveProduct(
+  auto scaleReplicaParts = checkedPositiveProduct(
       scaleReplica.getLayout().getReplicaFactors().asArrayRef());
+  auto lhsParts = physicalPartCount(issueLhs);
+  auto rhsParts = physicalPartCount(issueRhs);
+  const bool scaleMapSizeLegal =
+      outputReplicas <= std::numeric_limits<int64_t>::max() / windowExtent &&
+      scaleReplicas.size() ==
+          static_cast<size_t>(outputReplicas * windowExtent);
+  auto validParts = [](mlir::DenseI64ArrayAttr values, int64_t count,
+                       std::optional<int64_t> available) {
+    return available && values.size() == static_cast<size_t>(count) &&
+           llvm::all_of(values.asArrayRef(), [&](int64_t value) {
+             return value >= 0 && value < *available;
+           });
+  };
+  llvm::DenseSet<int64_t> uniqueOutputAxes;
+  const bool outputAxesLegal =
+      llvm::all_of(outputAxes.asArrayRef(), [&](int64_t axis) {
+        return axis > 0 && uniqueOutputAxes.insert(axis).second;
+      });
   if (!lhsLanes || !rhsLanes || !lhsTime || !rhsTime || !lhsReplicas ||
-      !rhsReplicas || !scaleReplicas || *lhsLanes != *rhsLanes ||
+      !rhsReplicas || !scaleReplicaParts || *lhsLanes != *rhsLanes ||
       *lhsLanes != sourceSet.getTermsPerSlot() || *lhsTime != 1 ||
-      *rhsTime != 1 || *lhsReplicas != 1 || *rhsReplicas != 1 ||
-      *scaleReplicas != windowExtent ||
+      *rhsTime != 1 || *lhsReplicas <= 0 || *rhsReplicas <= 0 ||
+      !outputAxesLegal || (outputReplicas > 1 && outputAxes.empty()) ||
+      !validParts(lhsSourceParts, outputReplicas, lhsParts) ||
+      !validParts(rhsSourceParts, outputReplicas, rhsParts) ||
+      lhsLaneOffsets.size() != static_cast<size_t>(outputReplicas) ||
+      rhsLaneOffsets.size() != static_cast<size_t>(outputReplicas) ||
+      !llvm::all_of(lhsLaneOffsets.asArrayRef(),
+                    [](int64_t offset) { return offset == 0; }) ||
+      !llvm::all_of(rhsLaneOffsets.asArrayRef(),
+                    [](int64_t offset) { return offset == 0; }) ||
+      !scaleMapSizeLegal ||
+      !validParts(scaleReplicas, outputReplicas * windowExtent,
+                  scaleReplicaParts) ||
       !llvm::all_of(scaleReplica.getLayout().getTimeFactors().asArrayRef(),
                     [](int64_t factor) { return factor == 1; }) ||
       !llvm::all_of(scaleReplica.getLayout().getLaneFactors().asArrayRef(),
                     [](int64_t factor) { return factor == 1; }))
     return emitError()
-           << "nested partial issue values must be one complete lane product with one scalar scale replica per window";
+           << "nested partial issue values must be one complete lane product with closed output-part and scale-replica maps";
   if (sourceSlot.getAxisIds().size() != 1 ||
       splitSlot.getAxisIds() != sourceSlot.getAxisIds() ||
       reducedSlot.getAxisIds() != sourceSlot.getAxisIds() ||
@@ -3462,6 +3521,15 @@ mlir::LogicalResult ExtractOp::verify() {
                                      true))) {
     return mlir::failure();
   }
+  if (getAccess().getForm() == "indexed") {
+    auto result = mlir::dyn_cast<ValueType>(getResult().getType());
+    for (mlir::Value index : getIndices())
+      if (auto typedIndex = mlir::dyn_cast<ValueType>(index.getType());
+          typedIndex && typedIndex.getLayout().getCarrier() == "rvv" &&
+          (!result || !hasLegalRVVIndexedEMUL(typedIndex, result)))
+        return emitOpError(
+            "indexed extract index EMUL is incompatible with its data layout");
+  }
   if (getAccess().getForm() == "register") {
     auto result = mlir::dyn_cast<ValueType>(getResult().getType());
     auto input = getInput().getType();
@@ -3898,6 +3966,9 @@ mlir::LogicalResult LookupOp::verify() {
                    "exact"))) ||
       (carrier == "rvv" &&
        (getAccess().getForm() != "indexed" ||
+        !resultValue ||
+        !hasLegalRVVIndexedEMUL(
+            mlir::dyn_cast<ValueType>(getIndices().getType()), resultValue) ||
         !exactLeaf(getLeaf(), "rvv", "lookup", "rvv.vluxei", "none",
                    "exact"))) ||
       (carrier != "scalar" && carrier != "rvv"))
@@ -4061,6 +4132,8 @@ mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
     if (!indexElement ||
         (indexElement.getWidth() != 16 && indexElement.getWidth() != 32 &&
          indexElement.getWidth() != 64) ||
+        !hasLegalRVVIndexedEMUL(offsets.getLayout(), packedBits,
+                                result.getLayout().getLmulEighths()) ||
         payloadBits == 0 ||
         (packedBits != 32 && packedBits != 64) ||
         getEntryByteStride() != payloadBytes ||
@@ -5810,6 +5883,18 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
         windowAxis != lhs.getAxisIds().asArrayRef().end() &&
         rhsWindowAxis != rhs.getAxisIds().asArrayRef().end() && shapedResult &&
         resultWindowPosition;
+    llvm::SmallVector<int64_t> expectedOutputAxes;
+    llvm::SmallVector<int64_t> expectedOutputReplicaFactors;
+    if (shapedResult)
+      for (auto [axis, factor] :
+           llvm::zip(shapedResult.getAxisIds().asArrayRef(),
+                     shapedResult.getLayout().getReplicaFactors().asArrayRef()))
+        if (axis != nestedPartialPlan.getWindowAxis()) {
+          expectedOutputAxes.push_back(axis);
+          expectedOutputReplicaFactors.push_back(factor);
+        }
+    auto expectedOutputReplicas =
+        checkedPositiveProduct(expectedOutputReplicaFactors);
     layoutPlanClosed &= axesPresent && issueLhs && issueRhs && sourceSet;
     if (layoutPlanClosed) {
       const size_t lhsPosition = static_cast<size_t>(
@@ -5837,27 +5922,49 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
             issue.getLayout().getLaneFactors()[position] != window ||
             issue.getLayout().getReplicaFactors()[position] != 1)
           return false;
-        for (size_t axis = 0; axis < source.getShape().size(); ++axis) {
-          if (axis == position)
+        for (size_t axisPosition = 0; axisPosition < source.getShape().size();
+             ++axisPosition) {
+          if (axisPosition == position)
             continue;
-          if (issue.getShape()[axis] != source.getShape()[axis] ||
-              issue.getLayout().getTimeFactors()[axis] !=
-                  source.getLayout().getTimeFactors()[axis] ||
-              issue.getLayout().getLaneFactors()[axis] !=
-                  source.getLayout().getLaneFactors()[axis] ||
-              issue.getLayout().getReplicaFactors()[axis] !=
-                  source.getLayout().getReplicaFactors()[axis] ||
-              issue.getLayout().getFragmentFactors()[axis] !=
-                  source.getLayout().getFragmentFactors()[axis] ||
-              issue.getLayout().getLocalFactors()[axis] !=
-                  source.getLayout().getLocalFactors()[axis])
+          const bool reductionAxis =
+              llvm::is_contained(getOver(), source.getAxisIds()[axisPosition]);
+          const int64_t sourceTime =
+              source.getLayout().getTimeFactors()[axisPosition];
+          const int64_t sourceLanes =
+              source.getLayout().getLaneFactors()[axisPosition];
+          const int64_t issueTime =
+              issue.getLayout().getTimeFactors()[axisPosition];
+          const int64_t issueLanes =
+              issue.getLayout().getLaneFactors()[axisPosition];
+          if (issue.getShape()[axisPosition] != source.getShape()[axisPosition] ||
+              issue.getLayout().getReplicaFactors()[axisPosition] !=
+                  source.getLayout().getReplicaFactors()[axisPosition] ||
+              issue.getLayout().getFragmentFactors()[axisPosition] !=
+                  source.getLayout().getFragmentFactors()[axisPosition] ||
+              issue.getLayout().getLocalFactors()[axisPosition] !=
+                  source.getLayout().getLocalFactors()[axisPosition])
             return false;
+          if (reductionAxis) {
+            if (sourceTime <= 0 || sourceLanes <= 0 || issueTime != 1 ||
+                sourceTime > std::numeric_limits<int64_t>::max() / sourceLanes ||
+                issueLanes != sourceTime * sourceLanes)
+              return false;
+          } else if (issueTime != sourceTime || issueLanes != sourceLanes) {
+            return false;
+          }
         }
         return true;
       };
       layoutPlanClosed &=
           closesIssuePartition(lhs, issueLhs, lhsPosition) &&
           closesIssuePartition(rhs, issueRhs, rhsPosition) &&
+          expectedOutputReplicas &&
+          nestedPartialPlan.getOutputAxes().asArrayRef() ==
+              llvm::ArrayRef<int64_t>(expectedOutputAxes) &&
+          nestedPartialPlan.getOutputReplicas() == *expectedOutputReplicas &&
+          getPartialTopology().getOutputAxes().asArrayRef() ==
+              llvm::ArrayRef<int64_t>(expectedOutputAxes) &&
+          getPartialTopology().getOutputReplicas() == *expectedOutputReplicas &&
           shapedResult.getShape()[resultPosition] ==
               nestedPartialPlan.getIssueStreams() *
                   nestedPartialPlan.getWindowExtent() &&
@@ -6180,7 +6287,7 @@ mlir::LogicalResult RVVWidenScalarMultiplyOp::verify() {
 }
 
 mlir::LogicalResult RVVRegularRepeatIndexOp::verify() {
-  if (getReductionAxis() <= 0 || getRepeat() <= 1 || getResults().empty() ||
+  if (getReductionAxis() <= 0 || getRepeat() <= 0 || getResults().empty() ||
       getPartBases().size() != getResults().size())
     return emitOpError(
         "regular-repeat index requires one reduction axis, repeat factor, and base array per result");
@@ -6213,7 +6320,7 @@ mlir::LogicalResult RVVRegularRepeatIndexOp::verify() {
     if (lanes <= getRepeat() || result.getShape()[position] !=
                                     lanes * result.getLayout().getTimeFactors()[position])
       return emitOpError(
-          "regular-repeat index is only valid for a repeated source spanning multiple lanes");
+          "regular-repeat index is only valid when one source relation spans multiple lanes");
     for (int64_t base : bases.asArrayRef())
       if (base < 0)
         return emitOpError("regular-repeat index base must be non-negative");
@@ -6256,7 +6363,7 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
       fieldAxis == field.getAxisIds().asArrayRef().end() ||
       getAccess() != sourceField.getAccess() ||
       (!natural && !joined) || getAccess().getBitOffset() % 8 ||
-      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 1 ||
+      !scalarSourceBase || getSourceCount() <= 0 || getRepeat() <= 0 ||
       getResults().empty() || getPartBases().size() != getResults().size())
     return emitOpError()
            << "regular-repeat gather requires one natural encoded field and closed load/gather geometry; field="
@@ -6276,11 +6383,16 @@ mlir::LogicalResult RVVRegularRepeatGatherOp::verify() {
           ? 0
           : firstResult.getLayout().getLaneFactors()[static_cast<size_t>(
                 firstAxis - firstResult.getAxisIds().asArrayRef().begin())];
-  if (joined && firstLanes > getRepeat())
-    return emitOpError(
-        "joined regular-repeat access requires one scalar source per lane window");
+  const bool joinedIndexed = joined && firstLanes > getRepeat();
+  const bool joinedGroupPowerOfTwo =
+      joined && (getAccess().getGroupSize() &
+                 (getAccess().getGroupSize() - 1)) == 0;
   llvm::StringRef instruction =
-      joined ? "rvv.regular-repeat-joined-broadcast"
+      joinedIndexed
+          ? joinedGroupPowerOfTwo
+                ? "rvv.regular-repeat-joined-gather.pow2"
+                : "rvv.regular-repeat-joined-gather.div"
+          : joined ? "rvv.regular-repeat-joined-broadcast"
              : firstLanes <= getRepeat()
                    ? "rvv.regular-repeat-broadcast"
                    : powerOfTwo ? "rvv.regular-repeat-gather.pow2"

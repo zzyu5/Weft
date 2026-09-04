@@ -139,8 +139,9 @@ def _iq2_xs_group_products(
     payload,
     group,
 ):
+    group_u32 = u32(group)
     linear_entry = scale_group * u32(2) + entry
-    code = widen(w.q[:, group * 4 + linear_entry], u32)
+    code = widen(w.q[:, group_u32 * u32(4) + linear_entry], u32)
     grid_index = code & u32(511)
     sign_index = code >> u32(9)
     weight = lookup(
@@ -151,7 +152,7 @@ def _iq2_xs_group_products(
     )
     signed_weight = weight * sign
     entry_offset = scale_group * u32(16) + entry * u32(8)
-    activation = x.q[:, group * 32 + entry_offset + payload]
+    activation = x.q[:, group_u32 * u32(32) + entry_offset + payload]
     partial = contract(
         activation,
         signed_weight,
@@ -161,7 +162,7 @@ def _iq2_xs_group_products(
     metadata = widen(
         w.scales[
             :,
-            group + scale_group // u32(2),
+            group_u32 + scale_group // u32(2),
         ],
         u32,
     )
@@ -205,8 +206,9 @@ def _iq2_s_group_products(
     payload,
     group,
 ):
+    group_u32 = u32(group)
     linear_entry = scale_group * u32(2) + entry
-    grid_index = widen(w.q[:, group * 4 + linear_entry], u32) | (
+    grid_index = widen(w.q[:, group_u32 * u32(4) + linear_entry], u32) | (
         (
             widen(w.qh[:, group], u32)
             >> (linear_entry * u32(2))
@@ -214,7 +216,7 @@ def _iq2_s_group_products(
         & u32(3)
     ) << u32(8)
     sign_bit = w.signs[
-        :, group * 32 + linear_entry * u32(8) + payload
+        :, group_u32 * u32(32) + linear_entry * u32(8) + payload
     ]
     weight = lookup(
         grid, grid_index * u32(8) + payload, bounds="in_bounds"
@@ -222,7 +224,7 @@ def _iq2_s_group_products(
     sign_value = i8(sign_bit)
     signed_weight = weight * (i8(1) - sign_value * i8(2))
     entry_offset = scale_group * u32(16) + entry * u32(8)
-    activation = x.q[:, group * 32 + entry_offset + payload]
+    activation = x.q[:, group_u32 * u32(32) + entry_offset + payload]
     partial = contract(
         activation,
         signed_weight,

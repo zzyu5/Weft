@@ -459,6 +459,10 @@ mlir::Value stripEntryIndexConversions(mlir::Value value) {
       value = widen.getInput();
       continue;
     }
+    if (auto broadcast = value.getDefiningOp<riscv::RVVAxisBroadcastOp>()) {
+      value = broadcast.getInput();
+      continue;
+    }
     return value;
   }
 }
@@ -1042,6 +1046,8 @@ analyzeReplicaAffineIndex(mlir::Value value, unsigned depth) {
     return analyzeReplicaAffineIndex(cast.getInput(), depth + 1);
   if (auto widen = value.getDefiningOp<riscv::WidenOp>())
     return analyzeReplicaAffineIndex(widen.getInput(), depth + 1);
+  if (auto broadcast = value.getDefiningOp<riscv::RVVAxisBroadcastOp>())
+    return analyzeReplicaAffineIndex(broadcast.getInput(), depth + 1);
   if (auto constant = constantInteger(value)) {
     ReplicaAffineIndex result;
     result.constant = *constant;
@@ -2878,11 +2884,10 @@ public:
         eraseDeadRegularIndexChain(candidate.index, visited, rewriter);
         continue;
       }
-      // A unit-repeat regular index is already a complete direct load form.
-      // Only a repeated source needs the typed source-window + gather
-      // operation materialized by the second memory-planning pass.
-      if (candidate.repeat == 1 ||
-          (fieldMapping == "joined" && candidate.lanes > candidate.repeat))
+      // A unit-repeat natural index is already a complete direct load form.
+      // A joined field still needs a typed physical load because one logical
+      // element is reconstructed from the joined byte geometry.
+      if (candidate.repeat == 1 && fieldMapping == "natural")
         continue;
       candidate.resultConversion = {};
       candidate.inputConversions.clear();
@@ -2947,13 +2952,22 @@ public:
           base -= sourceBase;
         partBases.push_back(rewriter.getDenseI64ArrayAttr(relative));
       }
+      const bool joined = first.field.getAccess().getMapping() == "joined";
       const int64_t temporaryGroups =
-          2 * first.resultType.getLayout().getRegisterGroups();
+          (joined ? 3 : 2) *
+          first.resultType.getLayout().getRegisterGroups();
       const bool powerOfTwo =
           first.repeat > 0 && (first.repeat & (first.repeat - 1)) == 0;
+      const int64_t joinedGroup = first.field.getAccess().getGroupSize();
+      const bool joinedGroupPowerOfTwo =
+          joined && joinedGroup > 0 &&
+          (joinedGroup & (joinedGroup - 1)) == 0;
       const llvm::StringRef instruction =
-          first.field.getAccess().getMapping() == "joined"
-              ? "rvv.regular-repeat-joined-broadcast"
+          joined && first.lanes > first.repeat
+              ? joinedGroupPowerOfTwo
+                    ? "rvv.regular-repeat-joined-gather.pow2"
+                    : "rvv.regular-repeat-joined-gather.div"
+          : joined ? "rvv.regular-repeat-joined-broadcast"
               : first.lanes <= first.repeat
                     ? "rvv.regular-repeat-broadcast"
                     : powerOfTwo ? "rvv.regular-repeat-gather.pow2"

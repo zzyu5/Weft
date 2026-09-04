@@ -17,7 +17,7 @@ using namespace weft;
 
 namespace {
 
-bool feedsPartialSetInBlock(mlir::Value source, mlir::Block *block) {
+bool feedsPartialProgramInBlock(mlir::Value source, mlir::Block *block) {
   llvm::SmallVector<mlir::Value> worklist{source};
   llvm::DenseSet<mlir::Value> visited;
   while (!worklist.empty()) {
@@ -28,7 +28,8 @@ bool feedsPartialSetInBlock(mlir::Value source, mlir::Block *block) {
       mlir::Operation *consumer = use.getOwner();
       if (consumer->getBlock() != block)
         continue;
-      if (mlir::isa<riscv::RVVPartialSetOp>(consumer))
+      if (mlir::isa<riscv::RVVPartialSetOp,
+                    riscv::RVVPartialCollectOp>(consumer))
         return true;
       if (consumer->getNumRegions() != 0 || consumer->getNumResults() != 1 ||
           !mlir::isMemoryEffectFree(consumer))
@@ -55,7 +56,7 @@ bool selectFirstPartialStorageRead(mlir::scf::ForOp loop,
     if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation)) {
       if (load.getPlan().getKind() != "layered" ||
           load.getWindowOffsets().size() != 1 ||
-          !feedsPartialSetInBlock(load.getResult(), loop.getBody()))
+          !feedsPartialProgramInBlock(load.getResult(), loop.getBody()))
         continue;
       llvm::StringRef instruction = load.getLeaf().getInstruction();
       if (instruction == "rvv.replica-storage-load.layered.scalar-prime")
@@ -68,7 +69,7 @@ bool selectFirstPartialStorageRead(mlir::scf::ForOp loop,
       return true;
     }
     if (auto load = mlir::dyn_cast<riscv::RVVLayeredStorageLoadOp>(operation)) {
-      if (!feedsPartialSetInBlock(load.getResult(), loop.getBody()))
+      if (!feedsPartialProgramInBlock(load.getResult(), loop.getBody()))
         continue;
       llvm::StringRef instruction = load.getLeaf().getInstruction();
       if (instruction == "rvv.layered-storage-load.scalar-prime")
