@@ -349,3 +349,73 @@ Q3 standalone/decode在SG同步过线；K1保持未启用参数的同一档并�
 verify，安全运行canonicalizer、CSE、layout canonicalization、Share两次与final verifier；同一
 流水第二次运行96/96文本diff为0。显式启用参数但没有合法storage edge的module会明确失败，
 不会静默当作关闭。构建通过`cmake --build build -j2`自然重链接`weft-compile`和`weft-opt`。
+
+## 6. Q4_K 单输出 complete-product physical program
+
+### 6.1 修改前工作账与参考机制
+
+修改前，Q4_K standalone/decode 都把一个256-element record拆成8个group：每个group重新形成
+packed storage decode，完成两次widened MAC后立即reduction；min correction仍是作者树中的8次
+有序标量更新。静态账显示，若只把已有8个完整product保留到统一的typed reduction之前，可以
+删除8个无效shift和8个重复high-nibble mask；若这些计数不变，这项机制没有实现价值。
+
+这里没有改变logical Value、Level、widening位置或artifact。typed facts来自grouped/layered field、
+reduction axis、issue extent和target carrier；8个signed-i16 product连同accumulator共占16个vector
+groups，低于32-group上限。第二个独立输入是Q5_K：它的q/u4与qh/u1 producer chain也能由同一条
+纯storage几何规则重物化，不依赖格式名。
+
+参考实现的职责分界是：Triton
+`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp:441-485`先决定dot operand/carrier，
+`lib/Dialect/TritonGPU/Transforms/OptimizeDotOperands.cpp:28-81`把选定的local allocation/load写入
+IR，terminal FMA lowering只消费该结构；`Prefetch.cpp:164-199`则只有在存在真实future-iteration
+SSA时才改写循环。TileLang
+`src/transform/reducer_plan_materialize.cc:559-777,1030-1200`同样先冻结partial layout与update-site
+关系，再机械物化。Weft不能直接照搬GPU thread/warp或shared-memory对象，但应采用相同的owner
+顺序：planner先冻结issue supply、product carrier与combine topology，materializer不得现场重选。
+
+### 6.2 Physical IR 变化
+
+`SequentialPartialPlanAttr`现在显式记录lhs/rhs issue supply是`slice`还是
+`storage-rematerialize`，并记录`fused_partial` topology。新增terminal
+`rvv.partial_collect`，以SSA operand顺序承载planner已经决定的8个独立product；它不在emitter中
+重建combine tree。完整exact unroll仍保留一个single-iteration owner region，直到typed partial
+materialization完成，避免generic SCF unroll先打碎producer关系。
+
+Q4_K final RISC-V IR现在有8个`rvv_layered_storage_load`、16个
+`rvv_layered_storage_decode`、16个activation `rvv_issue_slice`、8个
+`rvv_widen_multiply`、8个`rvv_widen_accumulate`和1个`rvv_partial_collect`，随后只有一条typed
+reduce/scale-combine链。最终汇编含26次`vle8`、8次`vwmulsu`、8次`vwmaccsu`、8次
+`vwredsum`与1次`vredsum`；`vsrl`从18降到10，`vand`从16降到8，没有重新出现slide/reassembly。
+
+Q5_K强制`unroll=8`时也形成8个multiply、8个accumulate和1个collect，证明同一typed关系能消费
+第二种storage结构。但它在SG的一次运行从约4.07降到3.112 GOP/s，在K1从约1.59升到1.957
+GOP/s。因此`unroll=8`不是跨target固定优先级，Q5 production binding没有随本次改动改变。
+
+### 6.3 双机十次真机结果
+
+| target | entry | 修改前 | 修改后 | source | 修改后/source | numeric |
+|---|---|---:|---:|---:|---:|---|
+| SG2044 | standalone vec-dot | 4.625649 | 5.693866 | 10.143147 | 0.561× | error 0 |
+| SG2044 | MUL_MAT decode | 4.617287 | 5.910121 | 9.618902 | 0.614× | abs `0.000129699707`，rel `1.17469838e-06` |
+| K1 | standalone vec-dot | 1.955926 | 2.356612 | 2.504987 | 0.941× | error 0 |
+| K1 | MUL_MAT decode | 1.956457 | 2.354080 | 2.461816 | 0.956× | abs `0.000129699707`，rel `1.17469838e-06` |
+
+standalone/decode分别同步提升SG `23.1%/28.0%`、K1 `20.5%/20.3%`。这说明收益进入共享的
+单输出contraction底座，而非只进入MUL_MAT外壳；但四条正式结果都没有达到source，Q4_K簇尚未
+闭合。
+
+SG上做过一个不入仓库的作者侧隔离变体：把8次标量min correction改成显式shaped correction，
+其余decode与本节physical program保持不变，20次运行得到10.478084 GOP/s，高于source
+10.143147。这个结果只用于定位，不能作为正式数字：该改动把8个独立有序标量更新换成新的
+shaped logical value/reduction，改变canonical operation/value graph。按2.2它属于作者树，不能由
+physical pass代做；本节没有把该实验留在std、pass或emitter中。
+
+### 6.4 机械验收与回归
+
+24 row-dequant + 24 vec-dot × 2 targets共96份Physical IR在当前工具上全部独立parse/verify，
+安全运行canonicalizer、CSE、layout canonicalization、Share两次与final verifier；相同流水第二次
+运行96/96文本diff为0。五个入口使用各自已记录的production LMUL/unroll，其余使用默认binding。
+
+已过线回归的单次结果为：SG Q1_0 `11.640080`、Q3_K `7.590017`、Q5_K `4.073818`、
+TQ2_0 `9.929018`、IQ4_XS `6.817540` GOP/s；K1依次为`4.510202`、`2.865011`、
+`1.577928`、`6.259592`、`2.093908` GOP/s。数值均在容差内，未观察到跨格式退化。
