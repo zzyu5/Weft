@@ -811,7 +811,27 @@ void constrainReductionContractOperand(Contract operation, mlir::Value value,
         return;
       }
     }
-  const bool isOperand = value == operation.getLhs() || value == operation.getRhs();
+  const bool isOperand =
+      value == operation.getLhs() || value == operation.getRhs();
+  const bool cartesianOutput =
+      hasOperandLocalFreeAxis(operation.getLhs(), operation.getRhs(),
+                              reduction) &&
+      hasOperandLocalFreeAxis(operation.getRhs(), operation.getLhs(), reduction);
+  const auto lhsAxes = riscv_internal::logicalAxes(operation.getLhs().getType());
+  const auto rhsAxes = riscv_internal::logicalAxes(operation.getRhs().getType());
+  const bool sharedFreeAxis = llvm::any_of(lhsAxes, [&](int64_t axis) {
+    return !llvm::is_contained(reduction, axis) &&
+           llvm::is_contained(rhsAxes, axis);
+  });
+  if (!isOperand && cartesianOutput && !sharedFreeAxis) {
+    // Each operand contributes an independently surviving output coordinate.
+    // With no shared free coordinate, the reduction carrier feeds their final
+    // Cartesian product, so neither output axis is a SIMD reduction lane.
+    // Preserve every output coordinate as a register-replica slot.
+    roles.registerTuple = true;
+    addSmallReplicas(value, roles);
+    return;
+  }
   if (isOperand)
     if (auto supply = reductionSupplyRoles(value, reduction)) {
       roles.laneAxis = supply->laneAxis;
