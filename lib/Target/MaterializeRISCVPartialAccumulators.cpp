@@ -4239,22 +4239,22 @@ public:
             sourcePlan = std::move(*source);
           }
         }
-      if (kind.empty() && outputReplicas == 1 &&
+      auto levelScaledPartialGroups = checkedProduct(
+          {outputReplicas, static_cast<int64_t>(dot.getPartialUnroll()),
+           partialGroups});
+      const int64_t levelScaledResources =
+          levelScaledPartialGroups &&
+                  *levelScaledPartialGroups <=
+                      std::numeric_limits<int64_t>::max() - 2
+              ? *levelScaledPartialGroups + 2
+              : 0;
+      if (kind.empty() && kernel && levelScaledResources > 0 &&
+          levelScaledResources <= kernel.getTarget().getVectorRegisters() &&
           levelScaledDots.contains(dot.getOperation())) {
         kind = "level_scaled";
         partialSlots = dot.getPartialUnroll();
         combineArity = partialSlots % 2 == 0 ? 2 : partialSlots;
-        resources =
-            std::max<int64_t>(1, partialSlots * partialGroups + 2);
-        if (!kernel || resources > kernel.getTarget().getVectorRegisters()) {
-          dot.emitError(
-              "selected level-scaled issue cohort exceeds the target vector-register budget; requested_slots=")
-              << partialSlots << ", resource_groups=" << resources
-              << ", available="
-              << (kernel ? kernel.getTarget().getVectorRegisters() : int64_t{-1});
-          signalPassFailure();
-          return;
-        }
+        resources = levelScaledResources;
       }
       // Independent partials are a structural preference supplied by the
       // target profile, not a universal property of RVV.  The generic planner
@@ -4294,13 +4294,13 @@ public:
           const int64_t reductionAxis = dot.getOver()[0];
           auto lhsPosition = axisPosition(sequentialLhsIssue, reductionAxis);
           auto rhsPosition = axisPosition(sequentialRhsIssue, reductionAxis);
-          if (lhsPosition &&
+          if (replicaProduct(dot.getLhs().getType()) == 1 && lhsPosition &&
               supportsIssueStorageRematerialization(
                   builder, dot.getLhs(), reductionAxis,
                   sequentialLhsIssue.getShape()[*lhsPosition],
                   kernel.getTarget()))
             sequentialLhsSupply = "storage-rematerialize";
-          if (rhsPosition &&
+          if (replicaProduct(dot.getRhs().getType()) == 1 && rhsPosition &&
               supportsIssueStorageRematerialization(
                   builder, dot.getRhs(), reductionAxis,
                   sequentialRhsIssue.getShape()[*rhsPosition],
@@ -6583,7 +6583,7 @@ public:
           carryType ? carryType.getLayout().getCarrier() == "scalar"
                     : static_cast<bool>(carryElement);
       bool complete = firstLayoutPlan && firstCombinePlan && scalarCarry &&
-                      carryParts && *carryParts == 1 && carryElement &&
+                      carryParts && *carryParts > 0 && carryElement &&
                       carryElement.isSigned() && carryElement.getWidth() == 32 &&
                       firstCombinePlan.getRealization() == "level_scaled" &&
                       firstCombinePlan.getOutputParts() == *carryParts &&
@@ -6708,7 +6708,14 @@ public:
                 index, issue);
             if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice)) {
               contribution.dot.emitError(
-                  "selected issue supply cannot materialize its frozen storage/view program");
+                  "selected issue supply cannot materialize its frozen storage/view program; output_part=")
+                  << outputPart << ", issue=" << issue
+                  << ", lhs_supply=" << issuePlan.getLhsIssueSupply()
+                  << ", lhs_source=" << contribution.dot.getLhs().getType()
+                  << ", lhs_issue=" << lhsIssue
+                  << ", rhs_supply=" << issuePlan.getRhsIssueSupply()
+                  << ", rhs_source=" << contribution.dot.getRhs().getType()
+                  << ", rhs_issue=" << rhsIssue;
               failed = true;
               break;
             }

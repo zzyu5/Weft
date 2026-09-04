@@ -2236,22 +2236,28 @@ private:
                     rhsType.getLayout().getRegisterGroups(),
                 0, temporaryGroups));
         copyIdentity(operation, widenedDot);
-        // A single-stream dot, or a dot whose complete reduction-time
-        // decomposition can be fused, has no local per-stream issue loop to
-        // unroll.  Its enclosing loop may be the storage-block traversal, so
-        // attaching the contraction unroll to that loop would duplicate whole
-        // blocks.  The topology planner still owns the final fused/independent
-        // choice; this legality fact only determines whether a local issue-loop
-        // binding exists.
-        if (schedule.getUnroll() > 1 && streams > 1 &&
-            !fusedStreamsLegal) {
+        // A multi-stream contraction owns an implicit issue loop.  A
+        // single-stream contraction can still be nested directly in an
+        // author-visible sub-Level over the same reduction axis; that sub-Level
+        // is likewise an issue loop, not the outer storage-block traversal.
+        // Preserve the selected unroll on either typed relation so the partial
+        // topology planner sees one unexpanded reduction epoch.
+        auto issueLoop = operation->getParentOfType<mlir::scf::ForOp>();
+        auto issueLevel = issueLoop
+                              ? issueLoop->getAttrOfType<riscv::LevelAttr>(
+                                    "weft.riscv.level")
+                              : riscv::LevelAttr();
+        const bool explicitReductionIssue =
+            issueLevel && issueLevel.getRelation() == "subs" &&
+            llvm::is_contained(physicalReductionAxes, issueLevel.getAxisId());
+        if (schedule.getUnroll() > 1 &&
+            ((streams > 1 && !fusedStreamsLegal) || explicitReductionIssue)) {
           // The schedule belongs to the physical issue loop that directly
           // contains this contraction.  A more distant Level may carry the
           // same logical reduction axis while iterating whole storage blocks;
           // binding the local unroll there duplicates the complete block
           // program instead of its partial contributions.
-          if (auto issueLoop =
-                  operation->getParentOfType<mlir::scf::ForOp>()) {
+          if (issueLoop) {
             auto existing = issueLoop->getAttrOfType<mlir::IntegerAttr>(
                 "weft.riscv.unroll_factor");
             if (existing && existing.getInt() != schedule.getUnroll()) {
