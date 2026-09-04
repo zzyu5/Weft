@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f32
-from weft.std import gemm
+from weft_kernels import gemm
 
 
 @weft.kernel

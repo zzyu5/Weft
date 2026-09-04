@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f32
-from weft.std import Q8_K, quantize_row_q8_K
+from weft_kernels import Q8_K, quantize_row_q8_K
 
 
 @weft.kernel

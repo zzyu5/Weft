@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, commit, f32, i8, u8, u32
-from weft.std.encodings import (
+from weft_kernels.encodings import (
     I8X4,
     I8X8,
     IQ1_M,
@@ -32,7 +32,7 @@ from weft.std.encodings import (
     TQ1_0,
     TQ2_0,
 )
-from weft.std.vec_dot import (
+from weft_kernels.vec_dot import (
     vec_dot_iq1_m_q8_k,
     vec_dot_iq1_s_q8_k,
     vec_dot_iq2_s_q8_k,

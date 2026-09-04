@@ -31,7 +31,7 @@ build/tools/weft-opt/weft-opt
 先生成 Canonical Kernel IR，再生成并验证 RISC-V Physical IR：
 
 ```bash
-PYTHONPATH=python python -m weft \
+PYTHONPATH=python:examples/kernels python -m weft \
   examples/kernels/dense/gemv.py \
   > /tmp/weft-gemv.mlir
 

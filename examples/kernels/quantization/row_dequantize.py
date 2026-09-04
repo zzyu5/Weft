@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f32, i8, u8, u32
-from weft.std.encodings import (
+from weft_kernels.encodings import (
     IQ1_M,
     IQ1_S,
     IQ2_S,
@@ -28,7 +28,7 @@ from weft.std.encodings import (
     TQ1_0,
     TQ2_0,
 )
-from weft.std.row_dequant import (
+from weft_kernels.row_dequant import (
     dequantize_iq1_m,
     dequantize_iq1_s,
     dequantize_iq2_s,

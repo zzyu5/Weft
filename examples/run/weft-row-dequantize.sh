@@ -84,7 +84,7 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
-PYTHONPATH="${project_root}/python" python -m weft \
+PYTHONPATH="${project_root}/python:${project_root}/examples/kernels" python -m weft \
   "${project_root}/examples/kernels/quantization/row_dequantize.py" \
   --kernel "row_dequantize_${format}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \

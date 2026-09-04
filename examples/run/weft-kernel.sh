@@ -155,7 +155,7 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
-PYTHONPATH="${project_root}/python" python -m weft "${project_root}/${dsl}" \
+PYTHONPATH="${project_root}/python:${project_root}/examples/kernels" python -m weft "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \

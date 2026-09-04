@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f32, i32
-from weft.std import topk
+from weft_kernels import topk
 
 
 @weft.kernel

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f32
-from weft.std import Q4K_I, Q8_K, q4k_gemv
+from weft_kernels import Q4K_I, Q8_K, q4k_gemv
 
 
 @weft.kernel

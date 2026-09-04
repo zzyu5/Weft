@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f16
-from weft.std import flash_attention
+from weft_kernels import flash_attention
 
 
 @weft.kernel

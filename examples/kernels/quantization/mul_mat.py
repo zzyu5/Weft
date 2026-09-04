@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import weft
 from weft.language import View, f16, f32, i8, u8, u32
-from weft.std.encodings import (
+from weft_kernels.encodings import (
     I8X4,
     I8X8,
     IQ1_M,
@@ -33,7 +33,7 @@ from weft.std.encodings import (
     TQ1_0,
     TQ2_0,
 )
-from weft.std.mul_mat import (
+from weft_kernels.mul_mat import (
     mul_mat_f16,
     mul_mat_iq1_m,
     mul_mat_iq1_s,
