@@ -104,7 +104,7 @@ set_physical_option() {
 }
 runtime_kernel_define=
 if [[ ${format} == f32 ]]; then
-  dsl=examples/kernels/dense/gemm.py
+  dsl=examples/kernels/dense/gemm_f32.py
   kernel=gemm_f32
   runtime=examples/repro/weft/gemm_runtime.cpp
   if [[ ${phase} == prefill ]]; then
@@ -118,7 +118,6 @@ if [[ ${format} == f32 ]]; then
     physical=(--auto-lmul-eighths=32)
   fi
 else
-  dsl=examples/kernels/quantization/mul_mat.py
   if [[ ${format} == f16 ]]; then
     kernel=production_mul_mat_f16
     if [[ ${target} == sg2044 ]]; then
@@ -425,6 +424,7 @@ else
   else
     kernel=production_mul_mat_${format}
   fi
+  dsl=examples/kernels/mul_mat/${kernel#production_mul_mat_}.py
   runtime=examples/repro/weft/mul_mat_runtime.cpp
 fi
 if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
@@ -442,8 +442,8 @@ fi
   set_physical_option auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}"
 [[ -n ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]] &&
   set_physical_option auto-scalar-load-prime "${WEFT_AUTO_SCALAR_LOAD_PRIME}"
-PYTHONPATH="${project_root}/python:${project_root}/examples/kernels" python -m weft \
-  "${project_root}/${dsl}" --kernel "${kernel}" > "${local_root}/kernel.mlir"
+PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft \
+  "${project_root}/${dsl}" > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
   "${physical[@]}" \

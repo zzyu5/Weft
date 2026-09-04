@@ -228,9 +228,10 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
-PYTHONPATH="${project_root}/python:${project_root}/examples/kernels" python -m weft \
-  "${project_root}/examples/kernels/quantization/vec_dot.py" \
-  --kernel "${kernel}" > "${local_root}/kernel.mlir"
+vec_dot_source=${kernel#quantized_vec_dot_}
+PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft \
+  "${project_root}/examples/kernels/vec_dot/${vec_dot_source}.py" \
+  > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
   "${physical_auto[@]}" \

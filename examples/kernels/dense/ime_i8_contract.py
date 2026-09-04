@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import weft
-from weft.language import L, View, admit, auto, commit, i8, i32, new, outer_contract
+import weft.language as wl
 
 
 @weft.kernel
 def ime_i8_contract(
-    A: View[i8, (M, K)],
-    B: View[i8, (K, N)],
-    C: View[i32, (M, N)],
+    A: wl.View[wl.i8, (M, K)], B: wl.View[wl.i8, (K, N)], C: wl.View[wl.i32, (M, N)]
 ):
-    with L.rows(M, group=auto("MR")) as mb:
-        with L.cols(N, group=auto("NR")) as nb:
-            acc = new(i32, [MR, NR], init=0)
-            with L.blocks(K, extent=auto("KB")) as kb:
-                acc += outer_contract(
-                    admit(A[mb, kb]), admit(B[kb, nb]), over="k", acc=i32
+    with wl.L.rows(M, group=wl.auto("MR")) as mb:
+        with wl.L.cols(N, group=wl.auto("NR")) as nb:
+            acc = wl.new(wl.i32, [MR, NR], init=0)
+            with wl.L.blocks(K, extent=wl.auto("KB")) as kb:
+                acc += wl.outer_contract(
+                    wl.admit(A[mb, kb]), wl.admit(B[kb, nb]), over="k", acc=wl.i32
                 )
-            commit(acc, C[mb, nb])
+            wl.commit(acc, C[mb, nb])

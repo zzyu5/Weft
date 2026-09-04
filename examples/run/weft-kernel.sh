@@ -57,11 +57,11 @@ runtime_kernel_define=
 runtime_phase=
 case "${kernel}" in
   q4_k_gemv)
-    dsl=examples/kernels/quantization/q4_k_gemv.py
+    dsl=examples/kernels/gemv/q4_k.py
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     ;;
   q4_k_gemv_groups4)
-    dsl=examples/kernels/quantization/q4_k_gemv_groups4.py
+    dsl=examples/kernels/gemv/q4_k_groups4.py
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     runtime_kernel_define=-DWEFT_Q4_GROUPS4=1
     if [[ ${target} == sg2044 ]]; then
@@ -83,7 +83,8 @@ case "${kernel}" in
     matrix_extension=spacemit-ime1
     ;;
   q8_0_quantize|q8_1_quantize|q8_K_quantize)
-    dsl=examples/kernels/quantization/${kernel}.py
+    quantize_format=${kernel%_quantize}
+    dsl=examples/kernels/quantize/${quantize_format,,}.py
     runtime=examples/repro/weft/q8_quantize_runtime.cpp
     case "${kernel}" in
       q8_0_quantize)
@@ -119,12 +120,12 @@ case "${kernel}" in
     esac
     ;;
   gemv_f32)
-    dsl=examples/kernels/dense/gemv.py
+    dsl=examples/kernels/dense/gemv_f32.py
     runtime=examples/repro/weft/gemv_runtime.cpp
     meta=(--meta MR=4 --meta KB=64)
     ;;
   gemm_f32)
-    dsl=examples/kernels/dense/gemm.py
+    dsl=examples/kernels/dense/gemm_f32.py
     runtime=examples/repro/weft/gemm_runtime.cpp
     meta=(--meta MC=64 --meta NC=16 --meta MR=2 --meta NR=2)
     if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
@@ -155,7 +156,7 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
-PYTHONPATH="${project_root}/python:${project_root}/examples/kernels" python -m weft "${project_root}/${dsl}" \
+PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \

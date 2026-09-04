@@ -17,7 +17,17 @@ from weft.api import (
     OverloadSet,
 )
 from weft.diagnostics import FrontendError, SourceLocation
-from weft.language.annotations import AutoSpec, View, auto
+from weft.language.annotations import (
+    AutoSpec,
+    View,
+    auto,
+    bitorder,
+    byteorder,
+    grouped,
+    joined,
+    layered,
+    padding,
+)
 from weft.language.builtins import Intrinsic, LevelConstructor
 from weft.language.dtypes import (
     DType,
@@ -437,7 +447,7 @@ class FrontendCompiler:
     def _parse_annotation(self, annotation: ast.expr) -> ValueType:
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
             annotation = ast.parse(annotation.value, mode="eval").body
-        if isinstance(annotation, ast.Name):
+        if isinstance(annotation, (ast.Name, ast.Attribute)):
             static = self._resolve_static(annotation)
             if isinstance(static, DType):
                 return ScalarType(static)
@@ -500,7 +510,11 @@ class FrontendCompiler:
                 shape: list[int] = []
                 axes: list[int] = []
                 for dimension in shape_nodes:
-                    if isinstance(dimension, ast.Constant) and isinstance(dimension.value, int):
+                    if (
+                        isinstance(dimension, ast.Constant)
+                        and isinstance(dimension.value, int)
+                        and not isinstance(dimension.value, bool)
+                    ):
                         if dimension.value <= 0:
                             raise FrontendError("View extent must be positive", self._location(dimension))
                         shape.append(dimension.value)
@@ -544,13 +558,29 @@ class FrontendCompiler:
                 isinstance(target, ast.Name) and target.id == "layout"
                 for target in statement.targets
             ):
-                values = statement.value.elts if isinstance(statement.value, ast.Tuple) else [statement.value]
+                values = (
+                    statement.value.elts
+                    if isinstance(statement.value, ast.Tuple)
+                    else [statement.value]
+                )
                 for value in values:
-                    if isinstance(value, ast.Attribute):
-                        if value.attr in {"lsb_first", "msb_first"}:
-                            bit_order = value.attr
-                        elif value.attr in {"little", "big"}:
-                            byte_order = value.attr
+                    resolved = self._resolve_encoding_binding(value, module_bindings)
+                    if resolved in (bitorder.lsb_first, bitorder.msb_first):
+                        if bit_order:
+                            raise FrontendError(
+                                "encoding layout declares bit order more than once"
+                            )
+                        bit_order = resolved.value
+                    elif resolved in (byteorder.little, byteorder.big):
+                        if byte_order:
+                            raise FrontendError(
+                                "encoding layout declares byte order more than once"
+                            )
+                        byte_order = resolved.value
+                    else:
+                        raise FrontendError(
+                            "encoding layout accepts bitorder and byteorder atoms"
+                        )
             elif (
                 isinstance(statement, ast.Assign)
                 and len(statement.targets) == 1
@@ -575,31 +605,53 @@ class FrontendCompiler:
                 and statement.targets[0].id == "alignment"
             ):
                 try:
-                    alignment = int(ast.literal_eval(statement.value))
+                    literal = ast.literal_eval(statement.value)
                 except (ValueError, TypeError) as error:
                     raise FrontendError("encoding alignment must be a positive byte count") from error
-                if alignment <= 0:
+                if (
+                    isinstance(literal, bool)
+                    or not isinstance(literal, int)
+                    or literal <= 0
+                ):
                     raise FrontendError("encoding alignment must be a positive byte count")
+                alignment = literal
             elif (
                 isinstance(statement, ast.Assign)
                 and isinstance(statement.value, ast.Call)
-                and isinstance(statement.value.func, ast.Name)
-                and statement.value.func.id == "padding"
+                and self._resolve_encoding_binding(
+                    statement.value.func, module_bindings
+                )
+                is padding
             ):
                 call = statement.value
                 if not 1 <= len(call.args) <= 2:
                     raise FrontendError("padding expects bytes and optional fill")
                 try:
-                    byte_count = int(ast.literal_eval(call.args[0]))
-                    fill = int(ast.literal_eval(call.args[1])) if len(call.args) == 2 else 0
+                    byte_count = self._resolve_encoding_binding(
+                        call.args[0], module_bindings
+                    )
+                    fill = (
+                        self._resolve_encoding_binding(call.args[1], module_bindings)
+                        if len(call.args) == 2
+                        else 0
+                    )
                     for keyword in call.keywords:
                         if keyword.arg == "value":
-                            fill = int(ast.literal_eval(keyword.value))
+                            fill = self._resolve_encoding_binding(
+                                keyword.value, module_bindings
+                            )
                         else:
                             raise FrontendError("padding accepts only value=")
                 except (ValueError, TypeError) as error:
                     raise FrontendError("padding bytes and fill must be integer literals") from error
-                if byte_count <= 0 or not 0 <= fill <= 255:
+                if (
+                    isinstance(byte_count, bool)
+                    or not isinstance(byte_count, int)
+                    or byte_count <= 0
+                    or isinstance(fill, bool)
+                    or not isinstance(fill, int)
+                    or not 0 <= fill <= 255
+                ):
                     raise FrontendError("padding requires positive bytes and one-byte fill")
                 layout_items.append(("padding", (byte_count, fill)))
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
@@ -746,43 +798,60 @@ class FrontendCompiler:
         while isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.MatMult):
             layout_node = annotation.right
             annotation = annotation.left
-            if not isinstance(layout_node, ast.Call) or not isinstance(layout_node.func, ast.Name):
+            if not isinstance(layout_node, ast.Call):
                 raise FrontendError("encoding field layout must use an explicit constructor")
             values = [
-                bindings.get(argument.id)
-                if isinstance(argument, ast.Name) and argument.id in bindings
-                else ast.literal_eval(argument)
+                self._resolve_encoding_binding(argument, bindings)
                 for argument in layout_node.args
             ]
             if layout_node.keywords:
                 raise FrontendError("encoding field layout constructors use positional arguments")
-            if layout_node.func.id == "grouped" and len(values) == 1:
-                layout = _LayoutInfo("grouped", int(values[0]))
-            elif layout_node.func.id == "layered" and len(values) == 2:
-                layout = _LayoutInfo("layered", int(values[0]), str(values[1]))
-            elif layout_node.func.id == "joined" and len(values) == 4:
-                layout = _LayoutInfo(
-                    "joined",
-                    int(values[0]),
-                    str(values[3]),
-                    int(values[1]),
-                    int(values[2]),
-                )
-            else:
+            constructor = self._resolve_encoding_binding(layout_node.func, bindings)
+            if constructor not in {grouped, layered, joined}:
                 raise FrontendError(
                     "encoding field layout must be grouped, layered, or joined"
                 )
+            try:
+                specification = constructor(*values)
+            except (TypeError, ValueError) as error:
+                raise FrontendError("invalid encoding field layout parameters") from error
+            if constructor is grouped:
+                layout = _LayoutInfo("grouped", specification.size)
+            elif constructor is layered:
+                layout = _LayoutInfo(
+                    "layered", specification.size, specification.order
+                )
+            else:
+                layout = _LayoutInfo(
+                    "joined",
+                    specification.size,
+                    specification.order,
+                    specification.fields,
+                    specification.low_bits,
+                )
             layouts.insert(0, layout)
         shape: tuple[int, ...] = ()
-        if isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name):
-            dtype = bindings.get(annotation.value.id)
+        if isinstance(annotation, ast.Subscript):
+            dtype = self._resolve_encoding_binding(annotation.value, bindings)
             dimensions = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
             try:
-                shape = tuple(int(ast.literal_eval(dimension)) for dimension in dimensions)
+                dimension_values = tuple(
+                    ast.literal_eval(dimension) for dimension in dimensions
+                )
             except (ValueError, TypeError) as error:
                 raise FrontendError("encoding array dimensions must be integers") from error
-        elif isinstance(annotation, ast.Name):
-            dtype = bindings.get(annotation.id)
+            if any(
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension <= 0
+                for dimension in dimension_values
+            ):
+                raise FrontendError(
+                    "encoding array dimensions must be positive integers"
+                )
+            shape = dimension_values
+        elif isinstance(annotation, (ast.Name, ast.Attribute)):
+            dtype = self._resolve_encoding_binding(annotation, bindings)
         else:
             dtype = None
         if not isinstance(dtype, DType) or any(dimension <= 0 for dimension in shape):
@@ -792,6 +861,27 @@ class FrontendCompiler:
         if not layouts:
             layouts.append(_LayoutInfo("natural"))
         return dtype, shape, tuple(layouts)
+
+    @classmethod
+    def _resolve_encoding_binding(
+        cls, node: ast.expr, bindings: dict[str, object]
+    ) -> object:
+        if isinstance(node, ast.Name) and node.id in bindings:
+            return bindings[node.id]
+        if isinstance(node, ast.Attribute):
+            owner = cls._resolve_encoding_binding(node.value, bindings)
+            try:
+                return getattr(owner, node.attr)
+            except AttributeError as error:
+                raise FrontendError(
+                    f"unknown encoding declaration attribute {node.attr!r}"
+                ) from error
+        try:
+            return ast.literal_eval(node)
+        except (ValueError, TypeError) as error:
+            raise FrontendError(
+                "encoding declaration values must be static"
+            ) from error
 
     def _verify_field_layout(
         self,

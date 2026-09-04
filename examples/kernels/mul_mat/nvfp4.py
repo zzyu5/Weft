@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import formats.ggml as ggml
+import functions.quantization as qf
+import kernels.quantize.q8_0 as quant_q8_0
+import weft
+import weft.language as wl
+
+
+@weft.kernel
+def production_mul_mat_nvfp4(
+    W: wl.View[ggml.NVFP4, (N, K)],
+    X: wl.View[wl.f32, (M, K)],
+    Xq: wl.View[ggml.Q8_0, (M, K)],
+    codebook: wl.View[wl.i8, (16,)],
+    scale: wl.View[wl.f32, (256,)],
+    Y: wl.View[wl.f32, (M, N)],
+):
+    table = wl.materialize(wl.admit(codebook))
+    quant_q8_0.quantize_matrix(X, Xq)
+    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.materialize(wl.admit(W[nc]))
+        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.materialize(wl.admit(Xq[mc]))
+            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.L.blocks(K, extent=64) as wb:
+                        w = wp[nb, wb]
+                        with wl.L.subs(wb, extent=32) as xb:
+                            x = xp[mb, xb]
+                            with wl.L.subs(xb, extent=16) as sub:
+                                q = wl.lookup(
+                                    table, wl.u8(w.q[:, sub]), bounds="in_bounds"
+                                )
+                                integer = wl.outer_contract(
+                                    x.q[:, sub], q, over="k", acc=wl.i32
+                                )
+                                block_scale = qf.exponent_scale(scale, w.d[:, sub])
+                                acc += (
+                                    wl.f32(x.d)
+                                    * block_scale
+                                    * wl.widen(integer, wl.f32)
+                                )
+                    wl.commit(acc, Y[mb, nb])
