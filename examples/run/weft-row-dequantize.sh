@@ -38,6 +38,16 @@ fi
 if [[ -n ${WEFT_RECORD_AXIS_POLICY:-} ]]; then
   record_axis_policy+=(--record-axis-policy "${WEFT_RECORD_AXIS_POLICY}")
 fi
+if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  case "${format}" in
+    q1_0)
+      physical_auto+=(--auto-lmul-eighths 16)
+      ;;
+    tq1_0|tq2_0)
+      physical_auto+=(--auto-lmul-eighths 32)
+      ;;
+  esac
+fi
 case "${target}" in
   sg2044)
     remote_host=rvv

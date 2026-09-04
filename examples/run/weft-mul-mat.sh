@@ -421,7 +421,7 @@ else
       kernel=production_mul_mat_tq1_0
     fi
     if [[ ${target} == sg2044 ]]; then
-      physical+=(--auto-lmul-eighths=16)
+      physical+=(--auto-lmul-eighths=8)
       if [[ ${phase} == prefill ]]; then
         meta=(--meta NC=32 --meta MC=16 --meta MR=2 --meta NR=1)
       fi

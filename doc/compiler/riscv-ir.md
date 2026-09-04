@@ -59,6 +59,13 @@ natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示�
 leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
 两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
 
+多轴entry/payload坐标若按行主序线性化为连续source区间，使用
+`rvv_unit_entry_window_load`保存scalar base、entry axes/extents、payload axis/extent与exact unit
+leaf。entry axes必须是source中不存在的新逻辑轴；payload axis可以是新轴，也可以复用唯一被投影
+掉的source axis，后者明确表示`entry * payload_extent + payload`的连续后缀。其它source-axis
+别名、非unit系数或不闭合的layout必须保留为typed indexed edge，terminal emitter不能自行把
+indexed access改写成unit load。
+
 对一个已经闭合、只有一个raw byte window的grouped/layered load，physical parameter可以把
 exact leaf选为`scalar-prime + vector-load`：先对该window中最后一个active byte执行一次有序的
 scalar byte read，再执行原来已经选定的vector load。这个选择直接写在load op的`LeafAttr`中；

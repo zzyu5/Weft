@@ -4285,9 +4285,10 @@ mlir::LogicalResult RVVUnitEntryWindowLoadOp::verify() {
       llvm::any_of(getEntryAxes(), [&](int64_t axis) {
         return llvm::is_contained(sourceAxes, axis);
       }) ||
-      llvm::is_contained(sourceAxes, getPayloadAxis()))
+      (llvm::is_contained(sourceAxes, getPayloadAxis()) &&
+       getPayloadAxis() != getSourceAxis()))
     return emitOpError(
-        "unit entry window source, entry, and payload axes must be disjoint");
+        "unit entry window entry axes must be new and a reused payload axis must be the projected source axis");
   const size_t sourcePosition =
       static_cast<size_t>(sourceAxis - sourceAxes.begin());
   llvm::SmallVector<int64_t> expectedAxes;

@@ -2623,15 +2623,21 @@ public:
       auto directWindow = materializeAffineUnitWindowBase(
           gatherIndex, result, retainedAxes.size(), extract, rewriter);
       const auto sourceAxes = source.getAxisIds().asArrayRef();
-      auto unitEntryAxesAreDisjoint = [&](llvm::ArrayRef<int64_t> entryAxes,
+      const int64_t sourceAxis = source.getAxisIds()[gatherDimension];
+      auto unitEntryAxesMatchSource = [&](llvm::ArrayRef<int64_t> entryAxes,
                                           int64_t payloadAxis) {
-        return !llvm::is_contained(sourceAxes, payloadAxis) &&
-               llvm::none_of(entryAxes, [&](int64_t axis) {
+        // Entry coordinates are new logical axes.  The payload coordinate may
+        // either be new as well, or rebind the one source axis being projected:
+        // [entry, payload] -> entry * payload_extent + payload.  In the latter
+        // case it still denotes a unit contiguous suffix, not an indexed load.
+        return llvm::none_of(entryAxes, [&](int64_t axis) {
                  return llvm::is_contained(sourceAxes, axis);
-               });
+               }) &&
+               (!llvm::is_contained(sourceAxes, payloadAxis) ||
+                payloadAxis == sourceAxis);
       };
       if (directWindow && sourceField &&
-          unitEntryAxesAreDisjoint(
+          unitEntryAxesMatchSource(
               directWindow->entryAxes, result.getAxisIds().asArrayRef().back()) &&
           supportsUnitEntryWindowLayout(
               result, retainedAxes.size(), directWindow->entryAxes,
@@ -2686,7 +2692,7 @@ public:
           plan->entryStride, extract, rewriter);
       const size_t retainedAxisCount = source.getAxisIds().size() - 1;
       if (unitWindow && sourceField &&
-          unitEntryAxesAreDisjoint(unitWindow->entryAxes, plan->payloadAxis) &&
+          unitEntryAxesMatchSource(unitWindow->entryAxes, plan->payloadAxis) &&
           supportsUnitEntryWindowLayout(
               result, retainedAxisCount, unitWindow->entryAxes,
               unitWindow->entryExtents, plan->payloadAxis,

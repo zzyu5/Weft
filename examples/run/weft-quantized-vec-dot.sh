@@ -190,7 +190,7 @@ fi
 if [[ ${format} == tq1_0 ]]; then
   if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
     if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 16)
+      physical_auto+=(--auto-lmul-eighths 8)
     else
       physical_auto+=(--auto-lmul-eighths 8)
     fi
