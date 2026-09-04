@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import formats.ggml as ggml
 import kernels.quantize.q8_k as quant_q8_k
-import kernels.vec_dot.iq1_s_q8_k as vd_iq1_s_q8_k
 import weft
 import weft.language as wl
 
@@ -16,6 +15,57 @@ def production_mul_mat_iq1_s(
     Y: wl.View[wl.f32, (M, N)],
 ):
     quant_q8_k.quantize_matrix(X, Xq)
-    for row in range(M):
-        for column in range(N):
-            wl.commit(vd_iq1_s_q8_k.compute(W[column], Xq[row], grid), Y[row, column])
+    grid_values = grid.values
+    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.materialize(wl.admit(W[nc]))
+        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.materialize(wl.admit(Xq[mc]))
+            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.L.blocks(K, extent=256) as kb:
+                        w = wp[nb, kb]
+                        x = xp[mb, kb]
+                        entry = wl.iota(4, dtype=wl.u32, axis="entry")
+                        payload = wl.iota(8, dtype=wl.u16, axis="payload")
+                        main = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
+                        correction = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
+                        group_index = wl.index(0)
+                        with wl.L.subs(kb, extent=32) as group:
+                            metadata = wl.widen(w.qh[:, group_index], wl.u32)
+                            scale = wl.i32(
+                                (metadata >> wl.u32(12) & wl.u32(7)) * wl.u32(2)
+                                + wl.u32(1)
+                            )
+                            grid_index = wl.widen(
+                                w.q[:, group_index * wl.index(4) + entry], wl.u32
+                            ) | (metadata >> entry * wl.u32(3) & wl.u32(7)) << wl.u32(8)
+                            weight = wl.lookup(
+                                grid_values,
+                                grid_index * wl.u32(8) + payload,
+                                bounds="in_bounds",
+                            )
+                            activation = x.q[
+                                :,
+                                group_index * wl.index(32)
+                                + entry * wl.u32(8)
+                                + wl.u32(payload),
+                            ]
+                            group_sum = wl.contract(
+                                activation,
+                                weight,
+                                over=("entry", "payload"),
+                                acc=wl.i32,
+                            )
+                            main += scale * group_sum
+                            delta = wl.i32(1) - wl.i32(
+                                metadata >> wl.u32(15) & wl.u32(1)
+                            ) * wl.i32(2)
+                            bsum = wl.i32(x.bsum[:, group_index * wl.index(2)]) + wl.i32(
+                                x.bsum[:, group_index * wl.index(2) + wl.index(1)]
+                            )
+                            correction += bsum * scale * delta
+                            group_index += wl.index(1)
+                        combined = wl.f32(main) + wl.f32(0.125) * wl.f32(correction)
+                        acc += wl.f32(w.d) * wl.f32(x.ds) * combined
+                    wl.commit(acc, Y[mb, nb])

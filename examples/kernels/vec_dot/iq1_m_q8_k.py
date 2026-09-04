@@ -38,63 +38,46 @@ def compute(
             grid_values, grid_index * wl.u32(8) + payload, bounds="in_bounds"
         )
         activation = x.q[
-            group * wl.u32(32) + scale_part * wl.u32(16) + entry * wl.u32(8) + payload
+            group * wl.u32(32)
+            + scale_part * wl.u32(16)
+            + entry * wl.u32(8)
+            + payload
         ]
-        dot = wl.contract(activation, weight, over=("entry", "payload"), acc=wl.i32)
+        dot = wl.contract(
+            activation, weight, over=("entry", "payload"), acc=wl.i32
+        )
         scale_word = wl.widen(
             w.scales[group // wl.u32(2) * wl.u32(2)], wl.u32
         ) | wl.widen(
             w.scales[group // wl.u32(2) * wl.u32(2) + wl.u32(1)], wl.u32
-        ) << wl.u32(
-            8
-        )
+        ) << wl.u32(8)
         scale_shift = group % wl.u32(2) * wl.u32(6) + scale_part * wl.u32(3)
-        scale = wl.i32((scale_word >> scale_shift & wl.u32(7)) * wl.u32(2) + wl.u32(1))
+        scale = wl.i32(
+            (scale_word >> scale_shift & wl.u32(7)) * wl.u32(2) + wl.u32(1)
+        )
         main = wl.reduce(wl.reduce(dot * scale, axis="scale_part"), axis="group")
-        correction = wl.i32(0)
-        for correction_group in range(8):
-            correction_part0 = wl.i32(0)
-            correction_part1 = wl.i32(0)
-            for correction_entry in range(4):
-                correction_qh = wl.u32(
-                    w.qh[correction_group * 2 + correction_entry // 2]
-                )
-                correction_delta = wl.i32(1)
-                correction_delta_shift = 3 + correction_entry % 2 * 4
-                if correction_qh >> wl.u32(correction_delta_shift) & wl.u32(
-                    1
-                ) != wl.u32(0):
-                    correction_delta = wl.i32(-1)
-                correction_sum = wl.i32(0)
-                for correction_lane in range(8):
-                    correction_sum += wl.i32(
-                        x.q[
-                            correction_group * 32
-                            + correction_entry * 8
-                            + correction_lane
-                        ]
-                    )
-                if correction_entry < 2:
-                    correction_part0 += correction_sum * correction_delta
-                if correction_entry >= 2:
-                    correction_part1 += correction_sum * correction_delta
-            correction_word = wl.u32(w.scales[2 * (correction_group // 2)]) | wl.u32(
-                w.scales[2 * (correction_group // 2) + 1]
-            ) << wl.u32(8)
-            correction_shift = correction_group % 2 * 6
-            correction_scale0 = wl.i32(
-                (correction_word >> wl.u32(correction_shift) & wl.u32(7)) * wl.u32(2)
-                + wl.u32(1)
-            )
-            correction_scale1 = wl.i32(
-                (correction_word >> wl.u32(correction_shift + 3) & wl.u32(7))
-                * wl.u32(2)
-                + wl.u32(1)
-            )
-            correction += (
-                correction_part0 * correction_scale0
-                + correction_part1 * correction_scale1
-            )
+        delta_shift = wl.u32(3) + entry * wl.u32(4)
+        delta_bit_u16 = wl.narrow(
+            qh >> delta_shift & wl.u32(1),
+            wl.u16,
+            rounding="rtz",
+            saturation=False,
+        )
+        delta_bit = wl.narrow(
+            delta_bit_u16, wl.u8, rounding="rtz", saturation=False
+        )
+        delta = wl.i8(1) - wl.i8(delta_bit) * wl.i8(2)
+        payload_u16 = wl.narrow(payload, wl.u16, rounding="rtz", saturation=False)
+        payload_u8 = wl.narrow(
+            payload_u16, wl.u8, rounding="rtz", saturation=False
+        )
+        delta = delta + wl.i8(payload_u8) * wl.i8(0)
+        correction_part = wl.contract(
+            activation, delta, over=("entry", "payload"), acc=wl.i32
+        )
+        correction = wl.reduce(
+            wl.reduce(correction_part * scale, axis="scale_part"), axis="group"
+        )
         combined = wl.f32(main) + wl.f32(0.125) * wl.f32(correction)
         result += wl.f32(block_scale) * wl.f32(x.ds) * combined
     return result

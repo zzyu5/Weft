@@ -1543,15 +1543,30 @@ bool laneTraversesRecords(riscv::FieldOp operation, mlir::Type physicalType) {
       field.getAxisIds().asArrayRef().take_front(outerRank), laneAxis);
 }
 
+bool isNaturalByteIdentity(const riscv_internal::FieldFacts &facts,
+                           mlir::Type elementType) {
+  return facts.mapping == "grouped_layered" && facts.group > 0 &&
+         facts.group == facts.layer &&
+         riscv_internal::logicalBitWidth(elementType) == 8;
+}
+
 riscv::AccessAttr fieldAccess(mlir::Builder &builder,
                               riscv::FieldOp operation,
                               mlir::Type physicalType) {
   riscv_internal::FieldFacts facts = riscv_internal::fieldFacts(operation);
-  llvm::StringRef form = facts.mapping == "natural" ? "unit" : "indexed";
-  if ((facts.mapping == "natural" && facts.scalarPerRecord) ||
+  llvm::StringRef mapping = facts.mapping;
+  // A byte-sized grouped field with one layer per group has the same affine
+  // byte map as natural storage: floor(i / group) * group + i % group == i.
+  // Record that identity in the selected physical edge so later memory ops do
+  // not have to reinterpret a nominal grouped mapping as a byte base.
+  auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+  if (result && isNaturalByteIdentity(facts, result.getElementType()))
+    mapping = "natural";
+  llvm::StringRef form = mapping == "natural" ? "unit" : "indexed";
+  if ((mapping == "natural" && facts.scalarPerRecord) ||
       laneTraversesRecords(operation, physicalType))
     form = "strided";
-  return makeAccess(builder, form, facts.mapping, facts.alignment, facts.group,
+  return makeAccess(builder, form, mapping, facts.alignment, facts.group,
                     facts.layer, facts.joinFields, facts.joinLowBits,
                     facts.joinRole, facts.bitOffset, facts.storageBits,
                     facts.order);
@@ -2043,7 +2058,7 @@ public:
       }
       operation.setAccessAttr(access);
       operation.setLeafAttr(transferLeaf(
-          builder, "encoded-field", ("rvv.encoded." + facts.mapping).str()));
+          builder, "encoded-field", ("rvv.encoded." + access.getMapping()).str()));
     });
     getOperation().walk([&](riscv::ExtractOp operation) {
       riscv::AccessAttr access;
@@ -2630,6 +2645,18 @@ public:
         eraseDeadRegularIndexChain(fullIndices, visited, rewriter);
         continue;
       }
+      auto resultReplicas = riscv_internal::staticProduct(
+          result.getLayout().getReplicaFactors().asArrayRef());
+      // An affine byte-identity field window with register replicas is a
+      // field-to-register relation, not an arbitrary indexed entry lookup.
+      // Keep the extract until the replica-storage owner can materialize one
+      // typed field-to-register relation for all replicas instead of issuing
+      // an unrelated indexed entry load for each consumer part.
+      if (directWindow && sourceField &&
+          isNaturalByteIdentity(sourceFacts, source.getElementType()) &&
+          result.getLayout().getCarrier() == "rvv" && resultReplicas &&
+          *resultReplicas > 1)
+        continue;
       auto plan = riscv_internal::analyzeIndexedEntryRelation(
           gatherIndex, result, retainedAxes, retainedShape);
       if (!plan)
