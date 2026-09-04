@@ -467,6 +467,101 @@ mlir::Value stripEntryIndexConversions(mlir::Value value) {
   }
 }
 
+mlir::FailureOr<mlir::Value>
+materializeScalarAffineComponent(mlir::Value value, mlir::Operation *origin,
+                                 mlir::IRRewriter &rewriter,
+                                 unsigned depth = 0) {
+  if (depth > 24)
+    return mlir::failure();
+  if (isSingleScalarCoordinate(value))
+    return value;
+
+  auto physical = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  if (!physical)
+    return mlir::failure();
+  mlir::Type scalarType = physical.getElementType();
+  auto makeConstant = [&](int64_t integer) -> mlir::FailureOr<mlir::Value> {
+    mlir::TypedAttr attribute;
+    if (auto type = mlir::dyn_cast<mlir::IntegerType>(scalarType))
+      attribute = rewriter.getIntegerAttr(type, integer);
+    else if (scalarType.isIndex())
+      attribute = rewriter.getIndexAttr(integer);
+    if (!attribute)
+      return mlir::failure();
+    auto constant = rewriter.create<riscv::ConstantOp>(origin->getLoc(),
+                                                        scalarType, attribute);
+    riscv_internal::copyOrigin(origin, constant);
+    return constant.getResult();
+  };
+  auto recurse = [&](mlir::Value operand) {
+    return materializeScalarAffineComponent(operand, origin, rewriter,
+                                            depth + 1);
+  };
+
+  if (auto constant = constantInteger(value))
+    return makeConstant(*constant);
+  if (auto iota = value.getDefiningOp<riscv::IotaOp>())
+    return makeConstant(iota.getStart());
+  if (auto conversion = value.getDefiningOp<riscv::ConvertLayoutOp>())
+    return recurse(conversion.getInput());
+  if (auto broadcast = value.getDefiningOp<riscv::RVVAxisBroadcastOp>())
+    return recurse(broadcast.getInput());
+  if (auto materialize = value.getDefiningOp<riscv::RegisterMaterializeOp>())
+    return recurse(materialize.getInput());
+
+  if (auto cast = value.getDefiningOp<riscv::CastOp>()) {
+    auto input = recurse(cast.getInput());
+    if (mlir::failed(input))
+      return mlir::failure();
+    if ((*input).getType() == scalarType)
+      return *input;
+    auto scalar = rewriter.create<riscv::CastOp>(
+        origin->getLoc(), scalarType, *input,
+        riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, scalar);
+    return scalar.getResult();
+  }
+  if (auto widen = value.getDefiningOp<riscv::WidenOp>()) {
+    auto input = recurse(widen.getInput());
+    if (mlir::failed(input))
+      return mlir::failure();
+    if ((*input).getType() == scalarType)
+      return *input;
+    auto scalar = rewriter.create<riscv::WidenOp>(
+        origin->getLoc(), scalarType, *input,
+        riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, scalar);
+    return scalar.getResult();
+  }
+  if (auto narrow = value.getDefiningOp<riscv::NarrowOp>()) {
+    auto input = recurse(narrow.getInput());
+    if (mlir::failed(input))
+      return mlir::failure();
+    if ((*input).getType() == scalarType)
+      return *input;
+    auto scalar = rewriter.create<riscv::NarrowOp>(
+        origin->getLoc(), scalarType, *input, narrow.getRounding(),
+        narrow.getSaturate(), riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, scalar);
+    return scalar.getResult();
+  }
+  if (auto binary = value.getDefiningOp<riscv::BinaryOp>()) {
+    if (binary.getKind() != "add" && binary.getKind() != "sub" &&
+        binary.getKind() != "mul")
+      return mlir::failure();
+    auto lhs = recurse(binary.getLhs());
+    auto rhs = recurse(binary.getRhs());
+    if (mlir::failed(lhs) || mlir::failed(rhs))
+      return mlir::failure();
+    auto scalar = rewriter.create<riscv::BinaryOp>(
+        origin->getLoc(), scalarType, *lhs, *rhs, binary.getKind(),
+        riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(origin, scalar);
+    return scalar.getResult();
+  }
+  return mlir::failure();
+}
+
 std::optional<UnitEntryWindowPlan>
 materializeUnitEntryWindowBase(mlir::Value entryIndices,
                                riscv::ValueType result, int64_t payloadAxis,
@@ -503,54 +598,12 @@ materializeUnitEntryWindowBase(mlir::Value entryIndices,
     divisor = *constant;
     expression = division.getLhs();
   }
-  llvm::SmallVector<mlir::Value> terms;
-  std::function<void(mlir::Value)> collectTerms = [&](mlir::Value value) {
-    value = stripEntryIndexConversions(value);
-    auto addition = value.getDefiningOp<riscv::BinaryOp>();
-    if (addition && addition.getKind() == "add") {
-      collectTerms(addition.getLhs());
-      collectTerms(addition.getRhs());
-      return;
-    }
-    terms.push_back(value);
-  };
-  collectTerms(expression);
-  llvm::SmallVector<mlir::Value> scalarTerms;
-  for (mlir::Value term : terms)
-    if (isSingleScalarCoordinate(term))
-      scalarTerms.push_back(term);
-
-  mlir::Value scalarBase;
-  if (scalarTerms.empty()) {
-    mlir::Type element = entryType.getElementType();
-    mlir::TypedAttr zero;
-    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(element))
-      zero = rewriter.getIntegerAttr(integer, 0);
-    else if (element.isIndex())
-      zero = rewriter.getIndexAttr(0);
-    if (!zero)
-      return std::nullopt;
-    auto constant = rewriter.create<riscv::ConstantOp>(origin->getLoc(), element,
-                                                        zero);
-    riscv_internal::copyOrigin(origin, constant);
-    scalarBase = constant.getResult();
-  } else {
-    scalarBase = scalarTerms.front();
-    for (mlir::Value term : llvm::drop_begin(scalarTerms)) {
-      if (term.getType() != scalarBase.getType())
-        return std::nullopt;
-      auto addition = rewriter.create<riscv::BinaryOp>(
-          origin->getLoc(), scalarBase.getType(), scalarBase, term, "add",
-          riscv_internal::unselectedLeaf(rewriter));
-      riscv_internal::copyOrigin(origin, addition);
-      scalarBase = addition.getResult();
-    }
-  }
-
   auto affine = analyzeReplicaAffineIndex(expression);
-  if (!affine ||
+  auto scalarBase =
+      materializeScalarAffineComponent(expression, origin, rewriter);
+  if (!affine || mlir::failed(scalarBase) ||
       affine->axisCoefficients.size() != entryType.getAxisIds().size() ||
-      !riscv_internal::knownMultipleOf(scalarBase, divisor))
+      !riscv_internal::knownMultipleOf(*scalarBase, divisor))
     return std::nullopt;
   int64_t expectedCoefficient = divisor;
   for (int64_t position =
@@ -565,7 +618,7 @@ materializeUnitEntryWindowBase(mlir::Value entryIndices,
       return std::nullopt;
   }
   if (divisor != 1) {
-    mlir::Type type = scalarBase.getType();
+    mlir::Type type = (*scalarBase).getType();
     mlir::TypedAttr divisorValue;
     if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
       divisorValue = rewriter.getIntegerAttr(integer, divisor);
@@ -576,13 +629,13 @@ materializeUnitEntryWindowBase(mlir::Value entryIndices,
     auto constant = rewriter.create<riscv::ConstantOp>(
         origin->getLoc(), type, divisorValue);
     auto divided = rewriter.create<riscv::BinaryOp>(
-        origin->getLoc(), type, scalarBase, constant.getResult(), "div",
+        origin->getLoc(), type, *scalarBase, constant.getResult(), "div",
         riscv_internal::unselectedLeaf(rewriter));
     riscv_internal::copyOrigin(origin, divided);
     scalarBase = divided.getResult();
   }
   return UnitEntryWindowPlan{
-      scalarBase,
+      *scalarBase,
       llvm::SmallVector<int64_t>(entryType.getAxisIds().asArrayRef().begin(),
                                  entryType.getAxisIds().asArrayRef().end()),
       llvm::SmallVector<int64_t>(entryType.getShape().asArrayRef().begin(),
@@ -902,63 +955,24 @@ materializeAffineWindowBase(mlir::Value index, riscv::ValueType result,
       return std::nullopt;
   }
 
-  llvm::SmallVector<mlir::Value> terms;
-  std::function<void(mlir::Value)> collectTerms = [&](mlir::Value value) {
-    value = stripEntryIndexConversions(value);
-    auto addition = value.getDefiningOp<riscv::BinaryOp>();
-    if (addition && addition.getKind() == "add") {
-      collectTerms(addition.getLhs());
-      collectTerms(addition.getRhs());
-      return;
-    }
-    terms.push_back(value);
-  };
-  collectTerms(expression);
-  llvm::SmallVector<mlir::Value> scalarTerms;
-  for (mlir::Value term : terms)
-    if (isSingleScalarCoordinate(term))
-      scalarTerms.push_back(term);
-  mlir::Value scalarBase;
-  if (scalarTerms.empty()) {
-    mlir::Type type = indexType.getElementType();
-    mlir::TypedAttr zero;
-    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
-      zero = rewriter.getIntegerAttr(integer, 0);
-    else if (type.isIndex())
-      zero = rewriter.getIndexAttr(0);
-    if (!zero)
-      return std::nullopt;
-    scalarBase = rewriter.create<riscv::ConstantOp>(origin->getLoc(), type, zero);
-  } else {
-    scalarBase = scalarTerms.front();
-  }
-  const size_t firstAdditionalTerm = scalarTerms.empty() ? 0 : 1;
-  for (mlir::Value term :
-       llvm::ArrayRef<mlir::Value>(scalarTerms).drop_front(firstAdditionalTerm)) {
-    if (term.getType() != scalarBase.getType())
-      return std::nullopt;
-    auto addition = rewriter.create<riscv::BinaryOp>(
-        origin->getLoc(), scalarBase.getType(), scalarBase, term, "add",
-        riscv_internal::unselectedLeaf(rewriter));
-    riscv_internal::copyOrigin(origin, addition);
-    scalarBase = addition.getResult();
-  }
-
-  if (!riscv_internal::knownMultipleOf(scalarBase, baseDivisor))
+  auto scalarBase =
+      materializeScalarAffineComponent(expression, origin, rewriter);
+  if (mlir::failed(scalarBase) ||
+      !riscv_internal::knownMultipleOf(*scalarBase, baseDivisor))
     return std::nullopt;
   if (baseDivisor != 1) {
     mlir::TypedAttr divisor;
     if (auto integer =
-            mlir::dyn_cast<mlir::IntegerType>(scalarBase.getType()))
+            mlir::dyn_cast<mlir::IntegerType>((*scalarBase).getType()))
       divisor = rewriter.getIntegerAttr(integer, baseDivisor);
-    else if (scalarBase.getType().isIndex())
+    else if ((*scalarBase).getType().isIndex())
       divisor = rewriter.getIndexAttr(baseDivisor);
     if (!divisor)
       return std::nullopt;
     auto constant = rewriter.create<riscv::ConstantOp>(
-        origin->getLoc(), scalarBase.getType(), divisor);
+        origin->getLoc(), (*scalarBase).getType(), divisor);
     auto divided = rewriter.create<riscv::BinaryOp>(
-        origin->getLoc(), scalarBase.getType(), scalarBase,
+        origin->getLoc(), (*scalarBase).getType(), *scalarBase,
         constant.getResult(), "div", riscv_internal::unselectedLeaf(rewriter));
     riscv_internal::copyOrigin(origin, divided);
     scalarBase = divided.getResult();
@@ -966,16 +980,16 @@ materializeAffineWindowBase(mlir::Value index, riscv::ValueType result,
   if (baseMultiplier != 1) {
     mlir::TypedAttr multiplier;
     if (auto integer =
-            mlir::dyn_cast<mlir::IntegerType>(scalarBase.getType()))
+            mlir::dyn_cast<mlir::IntegerType>((*scalarBase).getType()))
       multiplier = rewriter.getIntegerAttr(integer, baseMultiplier);
-    else if (scalarBase.getType().isIndex())
+    else if ((*scalarBase).getType().isIndex())
       multiplier = rewriter.getIndexAttr(baseMultiplier);
     if (!multiplier)
       return std::nullopt;
     auto constant = rewriter.create<riscv::ConstantOp>(
-        origin->getLoc(), scalarBase.getType(), multiplier);
+        origin->getLoc(), (*scalarBase).getType(), multiplier);
     auto multiplied = rewriter.create<riscv::BinaryOp>(
-        origin->getLoc(), scalarBase.getType(), scalarBase,
+        origin->getLoc(), (*scalarBase).getType(), *scalarBase,
         constant.getResult(), "mul", riscv_internal::unselectedLeaf(rewriter));
     riscv_internal::copyOrigin(origin, multiplied);
     scalarBase = multiplied.getResult();
@@ -983,7 +997,7 @@ materializeAffineWindowBase(mlir::Value index, riscv::ValueType result,
   auto indexAxes = indexType.getAxisIds().asArrayRef();
   auto indexShape = indexType.getShape().asArrayRef();
   return AffineWindowPlan{
-      scalarBase,
+      *scalarBase,
       llvm::SmallVector<int64_t>(indexAxes.begin(), indexAxes.end()),
       llvm::SmallVector<int64_t>(indexShape.begin(), indexShape.end())};
 }

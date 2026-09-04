@@ -1730,6 +1730,8 @@ mlir::LogicalResult PartialAddTreePlanAttr::verify(
 mlir::LogicalResult NestedPartialPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     int64_t windowAxis, int64_t issueStreams, int64_t windowExtent,
+    mlir::DenseI64ArrayAttr partialAxes,
+    mlir::DenseI64ArrayAttr partialAxisExtents, int64_t partialSlots,
     int64_t issueUnroll, mlir::DenseI64ArrayAttr outputAxes,
     int64_t outputReplicas, mlir::DenseI64ArrayAttr lhsSourceParts,
     mlir::DenseI64ArrayAttr rhsSourceParts,
@@ -1741,6 +1743,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     mlir::Type reducedSlotType, mlir::Type scaleReplicaType,
     mlir::Type sourceSetType, mlir::Type repackedSetType,
     mlir::Type reducedSetType, mlir::Type scaleCombinedSetType,
+    mlir::ArrayAttr combineSetTypes, mlir::DenseI64ArrayAttr combineAxes,
+    mlir::DenseI64ArrayAttr combineArities,
     llvm::StringRef scaleSupply, llvm::StringRef multiplyInstruction,
     llvm::StringRef reduceInstruction,
     llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
@@ -1762,13 +1766,48 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       mlir::dyn_cast<weft::riscv::PartialSetType>(reducedSetType);
   auto scaleCombinedSet =
       mlir::dyn_cast<weft::riscv::PartialSetType>(scaleCombinedSetType);
+  llvm::SmallVector<weft::riscv::PartialSetType> combineSets;
+  bool combineSetTypesLegal = true;
+  for (mlir::Attribute attribute : combineSetTypes) {
+    auto typeAttribute = mlir::dyn_cast<mlir::TypeAttr>(attribute);
+    auto set = typeAttribute
+                   ? mlir::dyn_cast<weft::riscv::PartialSetType>(
+                         typeAttribute.getValue())
+                   : weft::riscv::PartialSetType();
+    combineSetTypesLegal &= static_cast<bool>(set);
+    if (set)
+      combineSets.push_back(set);
+  }
   const bool exactMultiply =
       multiplyInstruction == "rvv.vwmul.vv" ||
       multiplyInstruction == "rvv.vwmul.vv.reinterpret-rhs" ||
       multiplyInstruction == "rvv.vwmul.vv.reinterpret-lhs" ||
       multiplyInstruction == "rvv.vwmulsu.vv" ||
       multiplyInstruction == "rvv.vwmulsu.vv.swap";
+  llvm::DenseSet<int64_t> uniquePartialAxes;
+  int64_t computedPartialSlots = 1;
+  bool partialAxesLegal = !partialAxes.empty() &&
+                          partialAxes.size() == partialAxisExtents.size();
+  for (auto [axis, extent] :
+       llvm::zip(partialAxes.asArrayRef(), partialAxisExtents.asArrayRef())) {
+    partialAxesLegal &=
+        axis > 0 && extent > 0 && uniquePartialAxes.insert(axis).second &&
+        computedPartialSlots <= std::numeric_limits<int64_t>::max() / extent;
+    if (partialAxesLegal)
+      computedPartialSlots *= extent;
+  }
+  auto windowPosition = llvm::find(partialAxes.asArrayRef(), windowAxis);
+  const bool windowExtentLegal =
+      windowPosition != partialAxes.asArrayRef().end() &&
+      partialAxisExtents[static_cast<size_t>(
+          windowPosition - partialAxes.asArrayRef().begin())] == windowExtent;
   if (windowAxis <= 0 || issueStreams <= 0 || windowExtent <= 0 ||
+      !partialAxesLegal || !windowExtentLegal ||
+      computedPartialSlots != partialSlots ||
+      !combineSetTypesLegal ||
+      combineSets.size() != combineAxes.size() ||
+      combineSets.size() != combineArities.size() ||
+      combineSets.size() + 1 != partialAxes.size() ||
       issueUnroll <= 0 || issueUnroll > issueStreams || resourceGroups <= 0 ||
       outputReplicas <= 0 ||
       !issueLhs || !issueRhs || !sourceSlot || !splitSlot || !reducedSlot ||
@@ -1809,9 +1848,9 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
   auto lhsParts = physicalPartCount(issueLhs);
   auto rhsParts = physicalPartCount(issueRhs);
   const bool scaleMapSizeLegal =
-      outputReplicas <= std::numeric_limits<int64_t>::max() / windowExtent &&
+      outputReplicas <= std::numeric_limits<int64_t>::max() / partialSlots &&
       scaleReplicas.size() ==
-          static_cast<size_t>(outputReplicas * windowExtent);
+          static_cast<size_t>(outputReplicas * partialSlots);
   auto validParts = [](mlir::DenseI64ArrayAttr values, int64_t count,
                        std::optional<int64_t> available) {
     return available && values.size() == static_cast<size_t>(count) &&
@@ -1822,7 +1861,9 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
   llvm::DenseSet<int64_t> uniqueOutputAxes;
   const bool outputAxesLegal =
       llvm::all_of(outputAxes.asArrayRef(), [&](int64_t axis) {
-        return axis > 0 && uniqueOutputAxes.insert(axis).second;
+        return axis > 0 &&
+               !llvm::is_contained(partialAxes.asArrayRef(), axis) &&
+               uniqueOutputAxes.insert(axis).second;
       });
   if (!lhsLanes || !rhsLanes || !lhsTime || !rhsTime || !lhsReplicas ||
       !rhsReplicas || !scaleReplicaParts || *lhsLanes != *rhsLanes ||
@@ -1838,7 +1879,7 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       !llvm::all_of(rhsLaneOffsets.asArrayRef(),
                     [](int64_t offset) { return offset == 0; }) ||
       !scaleMapSizeLegal ||
-      !validParts(scaleReplicas, outputReplicas * windowExtent,
+      !validParts(scaleReplicas, outputReplicas * partialSlots,
                   scaleReplicaParts) ||
       !llvm::all_of(scaleReplica.getLayout().getTimeFactors().asArrayRef(),
                     [](int64_t factor) { return factor == 1; }) ||
@@ -1851,36 +1892,77 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       reducedSlot.getAxisIds() != sourceSlot.getAxisIds() ||
       sourceSlot.getShape().size() != 1 || splitSlot.getShape().size() != 1 ||
       reducedSlot.getShape().size() != 1 ||
-      sourceSlot.getShape()[0] != splitSlot.getShape()[0] * windowExtent ||
+      sourceSlot.getShape()[0] != splitSlot.getShape()[0] * partialSlots ||
       reducedSlot.getShape()[0] != 1 ||
       sourceSlot.getLayout().getLmulEighths() !=
-          splitSlot.getLayout().getLmulEighths() * windowExtent ||
+          splitSlot.getLayout().getLmulEighths() * partialSlots ||
       sourceSlot.getLayout().getVl() !=
-          splitSlot.getLayout().getVl() * windowExtent)
+          splitSlot.getLayout().getVl() * partialSlots)
     return emitError()
            << "nested partial product carrier must split exactly into typed reduction windows";
   const int64_t reductionAxis = sourceSlot.getAxisIds()[0];
+  auto combinedPartial = scaleCombinedSet.getPartialType();
+  const int64_t scaleCombineArity = partialAxisExtents.asArrayRef().back();
+  const int64_t expectedScaleSlots = partialSlots / scaleCombineArity;
+  const int64_t expectedScaleTerms =
+      reducedSet.getTermsPerSlot() * scaleCombineArity;
+  int64_t expectedSlots = expectedScaleSlots;
+  int64_t expectedTerms = expectedScaleTerms;
+  bool combineStagesLegal = true;
+  weft::riscv::PartialSetType previousSet = scaleCombinedSet;
+  int64_t combinePeak = scaleCombinedSet.getResourceGroups();
+  for (size_t stage = 0; stage < combineSets.size(); ++stage) {
+    const size_t axisPosition = partialAxes.size() - 2 - stage;
+    const int64_t expectedAxis = partialAxes[axisPosition];
+    const int64_t expectedArity = partialAxisExtents[axisPosition];
+    auto nextSet = combineSets[stage];
+    combineStagesLegal &=
+        combineAxes[stage] == expectedAxis &&
+        combineArities[stage] == expectedArity && expectedArity > 0 &&
+        expectedSlots % expectedArity == 0;
+    if (!combineStagesLegal)
+      break;
+    expectedSlots /= expectedArity;
+    expectedTerms *= expectedArity;
+    combineStagesLegal &=
+        nextSet.getPartialType() == combinedPartial &&
+        nextSet.getReductionAxis() == reductionAxis &&
+        nextSet.getSlots() == expectedSlots &&
+        nextSet.getTermsPerSlot() == expectedTerms &&
+        nextSet.getResourceGroups() ==
+            expectedSlots * combinedPartial.getLayout().getRegisterGroups();
+    combinePeak =
+        std::max(combinePeak, previousSet.getResourceGroups() +
+                                  nextSet.getResourceGroups());
+    previousSet = nextSet;
+  }
+  auto finalSet = combineSets.empty() ? scaleCombinedSet : combineSets.back();
   if (sourceSet.getPartialType() != sourceSlot || sourceSet.getSlots() != 1 ||
       sourceSet.getReductionAxis() != reductionAxis ||
       repackedSet.getPartialType() != splitSlot ||
       repackedSet.getReductionAxis() != reductionAxis ||
-      repackedSet.getSlots() != windowExtent ||
-      repackedSet.getTermsPerSlot() * windowExtent !=
+      repackedSet.getSlots() != partialSlots ||
+      repackedSet.getTermsPerSlot() * partialSlots !=
           sourceSet.getTermsPerSlot() ||
       repackedSet.getResourceGroups() != sourceSet.getResourceGroups() ||
       reducedSet.getPartialType() != reducedSlot ||
       reducedSet.getReductionAxis() != reductionAxis ||
-      reducedSet.getSlots() != windowExtent ||
+      reducedSet.getSlots() != partialSlots ||
       reducedSet.getTermsPerSlot() != repackedSet.getTermsPerSlot() ||
-      scaleCombinedSet.getPartialType() != reducedSlot ||
+      combinedPartial != reducedSlot ||
       scaleCombinedSet.getReductionAxis() != reductionAxis ||
-      scaleCombinedSet.getSlots() != 1 ||
-      scaleCombinedSet.getTermsPerSlot() != sourceSet.getTermsPerSlot() ||
-      (scaleCombinedSet.getPartialType().getLayout().getLaneFactors()[0] == 1) !=
+      scaleCombinedSet.getSlots() != expectedScaleSlots ||
+      scaleCombinedSet.getTermsPerSlot() != expectedScaleTerms ||
+      scaleCombinedSet.getResourceGroups() !=
+          expectedScaleSlots * combinedPartial.getLayout().getRegisterGroups() ||
+      !combineStagesLegal || expectedSlots != 1 ||
+      finalSet.getTermsPerSlot() != sourceSet.getTermsPerSlot() ||
+      (finalSet.getPartialType().getLayout().getLaneFactors()[0] == 1) !=
           (finalizeInstruction == "rvv.partial-finalize.extract") ||
       resourceGroups < issueLhs.getLayout().getRegisterGroups() +
                            issueRhs.getLayout().getRegisterGroups() +
-                           sourceSet.getResourceGroups())
+                           sourceSet.getResourceGroups() ||
+      resourceGroups <= combinePeak)
     return emitError()
            << "nested partial plan set types disagree with the selected full-product carrier";
   return mlir::success();
@@ -5889,7 +5971,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
       for (auto [axis, factor] :
            llvm::zip(shapedResult.getAxisIds().asArrayRef(),
                      shapedResult.getLayout().getReplicaFactors().asArrayRef()))
-        if (axis != nestedPartialPlan.getWindowAxis()) {
+        if (!llvm::is_contained(
+                nestedPartialPlan.getPartialAxes().asArrayRef(), axis)) {
           expectedOutputAxes.push_back(axis);
           expectedOutputReplicaFactors.push_back(factor);
         }
@@ -5965,6 +6048,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
           getPartialTopology().getOutputAxes().asArrayRef() ==
               llvm::ArrayRef<int64_t>(expectedOutputAxes) &&
           getPartialTopology().getOutputReplicas() == *expectedOutputReplicas &&
+          getPartialTopology().getPartialAxes().asArrayRef() ==
+              nestedPartialPlan.getPartialAxes().asArrayRef() &&
           shapedResult.getShape()[resultPosition] ==
               nestedPartialPlan.getIssueStreams() *
                   nestedPartialPlan.getWindowExtent() &&
@@ -5972,11 +6057,11 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
               nestedPartialPlan.getIssueStreams() &&
           getPartialTopology().getPartialSlots() ==
               nestedPartialPlan.getIssueStreams() *
-                  nestedPartialPlan.getWindowExtent() &&
+                  nestedPartialPlan.getPartialSlots() &&
           getPartialTopology().getLaneSplit() ==
-              nestedPartialPlan.getWindowExtent() &&
+              nestedPartialPlan.getPartialSlots() &&
           getPartialTopology().getCombineArity() ==
-              nestedPartialPlan.getWindowExtent() &&
+              nestedPartialPlan.getPartialSlots() &&
           getPartialTopology().getResourceGroups() ==
               nestedPartialPlan.getResourceGroups() &&
           llvm::is_contained(getOver(), sourceSet.getReductionAxis()) &&
@@ -8143,7 +8228,14 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
   PartialSetType result = getResult().getType();
   ValueType partial = input.getPartialType();
   auto element = mlir::dyn_cast<mlir::IntegerType>(partial.getElementType());
+  llvm::DenseSet<int64_t> logicalAxes;
+  const bool logicalAxesLegal =
+      !getLogicalReductionAxes().empty() &&
+      llvm::all_of(getLogicalReductionAxes(), [&](int64_t axis) {
+        return axis > 0 && logicalAxes.insert(axis).second;
+      });
   if (!element || !element.isSigned() || element.getWidth() != 32 ||
+      !logicalAxesLegal ||
       getScales().size() != static_cast<size_t>(input.getSlots()) ||
       getScaleReplicas().size() != static_cast<size_t>(input.getSlots()) ||
       getSlotOrder().size() != static_cast<size_t>(input.getSlots()) ||
@@ -8200,6 +8292,12 @@ mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
       mlir::dyn_cast<mlir::IntegerType>(inputPartial.getElementType());
   auto resultElement =
       mlir::dyn_cast<mlir::IntegerType>(resultPartial.getElementType());
+  llvm::DenseSet<int64_t> logicalAxes;
+  const bool logicalAxesLegal =
+      !getLogicalReductionAxes().empty() &&
+      llvm::all_of(getLogicalReductionAxes(), [&](int64_t axis) {
+        return axis > 0 && logicalAxes.insert(axis).second;
+      });
   auto kernel = getOperation()->getParentOfType<KernelOp>();
   const bool sameCoordinates =
       inputPartial.getAxisIds() == resultPartial.getAxisIds() &&
@@ -8216,7 +8314,7 @@ mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
           resultPartial.getLayout().getFragmentFactors() &&
       inputPartial.getLayout().getLocalFactors() ==
           resultPartial.getLayout().getLocalFactors();
-  if (!inputElement || !inputElement.isSigned() ||
+  if (!logicalAxesLegal || !inputElement || !inputElement.isSigned() ||
       inputElement.getWidth() != 16 || !resultElement ||
       !resultElement.isSigned() || resultElement.getWidth() != 32 ||
       inputPartial.getLayout().getCarrier() != "rvv" ||
@@ -8274,7 +8372,13 @@ mlir::LogicalResult RVVPartialWidenScaleOp::verify() {
 mlir::LogicalResult RVVPartialCombineOp::verify() {
   PartialSetType input = getInput().getType();
   PartialSetType result = getResult().getType();
-  if (getArity() <= 1 || getTopology() != "pairwise" ||
+  llvm::DenseSet<int64_t> logicalAxes;
+  const bool logicalAxesLegal =
+      !getLogicalReductionAxes().empty() &&
+      llvm::all_of(getLogicalReductionAxes(), [&](int64_t axis) {
+        return axis > 0 && logicalAxes.insert(axis).second;
+      });
+  if (!logicalAxesLegal || getArity() <= 1 || getTopology() != "pairwise" ||
       input.getSlots() % getArity() ||
       result.getPartialType() != input.getPartialType() ||
       result.getReductionAxis() != input.getReductionAxis() ||

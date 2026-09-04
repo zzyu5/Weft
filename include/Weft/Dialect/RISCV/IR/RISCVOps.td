@@ -319,6 +319,9 @@ def WeftRISCV_NestedPartialPlanAttr
     "int64_t":$windowAxis,
     "int64_t":$issueStreams,
     "int64_t":$windowExtent,
+    "::mlir::DenseI64ArrayAttr":$partialAxes,
+    "::mlir::DenseI64ArrayAttr":$partialAxisExtents,
+    "int64_t":$partialSlots,
     "int64_t":$issueUnroll,
     "::mlir::DenseI64ArrayAttr":$outputAxes,
     "int64_t":$outputReplicas,
@@ -337,6 +340,9 @@ def WeftRISCV_NestedPartialPlanAttr
     "::mlir::Type":$repackedSetType,
     "::mlir::Type":$reducedSetType,
     "::mlir::Type":$scaleCombinedSetType,
+    "::mlir::ArrayAttr":$combineSetTypes,
+    "::mlir::DenseI64ArrayAttr":$combineAxes,
+    "::mlir::DenseI64ArrayAttr":$combineArities,
     StringRefParameter<"selected scale supply form">:$scaleSupply,
     StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
     StringRefParameter<"selected partial reduction instruction">:$reduceInstruction,
@@ -344,14 +350,19 @@ def WeftRISCV_NestedPartialPlanAttr
     "int64_t":$resourceGroups
   );
   let assemblyFormat = [{
-    `<` $windowAxis `,` $issueStreams `,` $windowExtent `,` $issueUnroll `,`
-        $outputAxes `,` $outputReplicas `,` $lhsSourceParts `,`
+    `<` $windowAxis `,` $issueStreams `,` $windowExtent `,`
+        $partialAxes `,`
+        $partialAxisExtents `,` $partialSlots `,` $issueUnroll `,`
+        $outputAxes `,` $outputReplicas `,`
+        $lhsSourceParts `,`
         $rhsSourceParts `,` $lhsLaneOffsets `,` $rhsLaneOffsets `,`
         $scaleReplicas `,`
         $issueLhsType `,` $issueRhsType `,` $sourceSlotType `,`
         $splitSlotType `,` $reducedSlotType `,` $scaleReplicaType `,`
         $sourceSetType `,` $repackedSetType `,` $reducedSetType `,`
-        $scaleCombinedSetType `,` $scaleSupply `,` $multiplyInstruction `,`
+        $scaleCombinedSetType `,` $combineSetTypes `,`
+        $combineAxes `,` $combineArities `,` $scaleSupply `,`
+        $multiplyInstruction `,`
         $reduceInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
   }];
   let genVerifyDecl = 1;
@@ -1671,6 +1682,7 @@ def WeftRISCV_RVVPartialScaleCombineOp
                        Variadic<AnyType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
                        DenseI64ArrayAttr:$slot_order,
+                       DenseI64ArrayAttr:$logical_reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;
@@ -1682,6 +1694,7 @@ def WeftRISCV_RVVPartialWidenScaleOp
                        Variadic<WeftRISCV_ValueType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
                        I64Attr:$combine_arity,
+                       DenseI64ArrayAttr:$logical_reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;
@@ -1692,6 +1705,7 @@ def WeftRISCV_RVVPartialCombineOp
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        I64Attr:$arity,
                        StrAttr:$topology,
+                       DenseI64ArrayAttr:$logical_reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
   let hasVerifier = 1;
