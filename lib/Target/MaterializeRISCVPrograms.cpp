@@ -309,6 +309,8 @@ public:
           operation.getLoc(), zero, upper, one, initial);
       loop->setAttr("weft.riscv.direction",
                     rewriter.getStringAttr("ascending"));
+      loop->setAttr("weft.riscv.system_unroll",
+                    rewriter.getStringAttr("disable"));
       copyProvenance(operation, loop);
       rewriter.setInsertionPointToStart(loop.getBody());
       mlir::Value offset = rewriter.create<mlir::arith::MulIOp>(

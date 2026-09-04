@@ -154,5 +154,10 @@ pipeline参数只有在改写成真实 guard、prologue、steady-state、epilogu
 - every target-local terminal op具有唯一 exact [local leaf](leaves.md)；
 - register、fragment与local-storage summary不超过target profile。
 
+携带已选 RVV stream reduction 的保留循环必须显式带 downstream-unroll-disable
+合同。它的 lane/time 分解和 loop-carried accumulators 已在 Physical IR 中冻结；terminal
+translator 只把该合同拼写为本地 pragma，防止 system compiler 再次展开并改变已核算的
+live range。缺少该合同由 final verifier 拒绝，不能依赖 Clang/GCC 的启发式阈值。
+
 当前没有实现的 conversion、spill、pipeline或extension形态必须在某个 physical pass中明确
 unsupported，不能由terminal emitter给默认值或走另一条路径。

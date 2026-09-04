@@ -405,6 +405,19 @@ public:
           failed = true;
         }
       }
+      if (mlir::isa<riscv::RVVStreamReduceStepOp>(operation)) {
+        auto loop = operation->getParentOfType<mlir::scf::ForOp>();
+        auto systemUnroll =
+            loop ? loop->getAttrOfType<mlir::StringAttr>(
+                       "weft.riscv.system_unroll")
+                 : mlir::StringAttr();
+        if (!loop || !systemUnroll || systemUnroll.getValue() != "disable") {
+          operation->emitError(
+              "final stream step requires a nearest parent loop with "
+              "downstream unrolling disabled");
+          failed = true;
+        }
+      }
       if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
           conversion &&
           (conversion.getConversion().getKind() == "register_to_lane" ||

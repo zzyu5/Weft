@@ -151,7 +151,11 @@ local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
 cleanup_local() {
   status=$?
   trap - EXIT
-  find "${local_root}" -depth -delete
+  if [[ ${WEFT_KEEP_ARTIFACTS:-0} == 1 ]]; then
+    echo "WEFT_LOCAL_ARTIFACTS=${local_root}" >&2
+  else
+    find "${local_root}" -depth -delete
+  fi
   exit "${status}"
 }
 trap cleanup_local EXIT
@@ -175,15 +179,21 @@ printf -v link_path_argument '%q' "${link_path}"
 printf -v runtime_target_define_argument '%q' "${runtime_target_define}"
 printf -v runtime_kernel_define_argument '%q' "${runtime_kernel_define}"
 printf -v runtime_phase_argument '%q' "${runtime_phase}"
+printf -v keep_artifacts_argument '%q' "${WEFT_KEEP_ARTIFACTS:-0}"
 
 tar -C "${local_root}" -cf - kernel.c runtime.cpp |
   ssh "${remote_host}" "
     set -eu
     remote_root=\$(mktemp -d /tmp/weft-kernel.XXXXXX)
+    keep_artifacts=${keep_artifacts_argument}
     cleanup() {
       exit_status=\$?
       trap - EXIT
-      find \"\${remote_root}\" -depth -delete
+      if [ \"\${keep_artifacts}\" = 1 ]; then
+        echo \"WEFT_REMOTE_ARTIFACTS=${remote_host}:\${remote_root}\" >&2
+      else
+        find \"\${remote_root}\" -depth -delete
+      fi
       exit \"\${exit_status}\"
     }
     trap cleanup EXIT
@@ -197,6 +207,11 @@ tar -C "${local_root}" -cf - kernel.c runtime.cpp |
     link_path=${link_path_argument}
     runtime_target_define=${runtime_target_define_argument}
     runtime_kernel_define=${runtime_kernel_define_argument}
+    if [ \"\${keep_artifacts}\" = 1 ]; then
+      \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
+        \${extra_cflags} \
+        -march=\"\${march}\" -mabi=lp64d -S kernel.c -o kernel.s
+    fi
     \"\${cc}\" -O3 -std=c11 -Wall -Wextra -Werror -ffp-contract=fast \
       \${extra_cflags} \
       -march=\"\${march}\" -mabi=lp64d -c kernel.c -o kernel.o
