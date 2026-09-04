@@ -1832,7 +1832,8 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
     llvm::StringRef realization, int64_t issueCount,
     mlir::DenseI64ArrayAttr reductionAxes,
     mlir::Type lhsIssueType, mlir::Type rhsIssueType,
-    mlir::Type accumulatorType, mlir::DenseI64ArrayAttr lhsSourceParts,
+    mlir::Type accumulatorType, llvm::StringRef lhsIssueSupply,
+    llvm::StringRef rhsIssueSupply, mlir::DenseI64ArrayAttr lhsSourceParts,
     mlir::DenseI64ArrayAttr rhsSourceParts,
     mlir::DenseI64ArrayAttr lhsLaneOffsets,
     mlir::DenseI64ArrayAttr rhsLaneOffsets,
@@ -1866,7 +1867,9 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
   bool validReductionAxes = !reductionAxes.empty();
   for (int64_t axis : reductionAxes.asArrayRef())
     validReductionAxes &= axis > 0 && seenReductionAxes.insert(axis).second;
-  if ((realization != "fused" && realization != "per_stream") ||
+  const bool fusedPartial = realization == "fused_partial";
+  if ((realization != "fused" && realization != "per_stream" &&
+       !fusedPartial) ||
       issueCount <= 0 || !validReductionAxes || !lhs || !rhs || !accumulator ||
       !lhsElement || !rhsElement || !accumulatorElement ||
       lhsElement.isSignless() || rhsElement.isSignless() ||
@@ -1877,14 +1880,19 @@ mlir::LogicalResult SequentialPartialPlanAttr::verify(
           std::max<unsigned>(8, rhsElement.getWidth()) ||
       accumulatorElement.getWidth() !=
           2 * std::max<unsigned>(8, lhsElement.getWidth()) ||
+      (lhsIssueSupply != "slice" &&
+       lhsIssueSupply != "storage-rematerialize") ||
+      (rhsIssueSupply != "slice" &&
+       rhsIssueSupply != "storage-rematerialize") ||
       lhsSourceParts.empty() || lhsSourceParts.size() != rhsSourceParts.size() ||
       lhsSourceParts.size() != lhsLaneOffsets.size() ||
       rhsSourceParts.size() != rhsLaneOffsets.size() ||
       lhsSourceParts.size() % static_cast<size_t>(issueCount) ||
       multiplyInstruction != expectedMultiply ||
       accumulateInstruction != "rvv.vwmacc.partial" ||
-      (finalizeInstruction != "rvv.vwredsum.partial" &&
-       finalizeInstruction != "rvv.vredsum.partial") ||
+      (fusedPartial ? finalizeInstruction != "none"
+                    : (finalizeInstruction != "rvv.vwredsum.partial" &&
+                       finalizeInstruction != "rvv.vredsum.partial")) ||
       resourceGroups <= 0)
     return emitError()
            << "sequential partial plan requires one closed issue-slice, widened product/accumulator, and final-reduction program";
@@ -5674,7 +5682,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   const bool sequentialPlanRequired =
       getReductionStreams() > 0 &&
       (topologyKind == "sequential_fused" ||
-       topologyKind == "sequential_per_stream");
+       topologyKind == "sequential_per_stream" ||
+       topologyKind == "level_scaled");
   // LowerRISCVComposites creates a legal but deliberately unassigned physical
   // contraction.  The topology pass owns every plan attribute and the final
   // verifier rejects any surviving unassigned op.  Do not require a topology
@@ -5926,10 +5935,20 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
               sequentialPartialPlan.getRhsLaneOffsets()[index] ==
                   getRhsLaneOffsets()[output];
         }
+    const llvm::StringRef expectedRealization =
+        topologyKind == "level_scaled"
+            ? llvm::StringRef("fused_partial")
+            : topologyKind == "sequential_fused"
+                  ? llvm::StringRef("fused")
+                  : llvm::StringRef("per_stream");
+    const bool issueSupplyConsumed =
+        expectedRealization == "fused_partial" ||
+        (sequentialPartialPlan.getLhsIssueSupply() == "slice" &&
+         sequentialPartialPlan.getRhsIssueSupply() == "slice");
     const bool sequentialPlanClosed =
         !getOver().empty() && issueCount == getReductionStreams() &&
-        sequentialPartialPlan.getRealization() ==
-            (topologyKind == "sequential_fused" ? "fused" : "per_stream") &&
+        sequentialPartialPlan.getRealization() == expectedRealization &&
+        issueSupplyConsumed &&
         sequentialPartialPlan.getReductionAxes().asArrayRef() == getOver() &&
         lhsIssue &&
         rhsIssue && accumulator &&
@@ -5944,8 +5963,9 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
             static_cast<size_t>(issueCount * outputParts) &&
         *lhsIssueParts == 1 && *rhsIssueParts == 1 && laneOffsetsClosed &&
         sourceMatchesIssue(lhs, lhsIssue) && sourceMatchesIssue(rhs, rhsIssue) &&
-        getPartialTopology().getResourceGroups() ==
-            sequentialPartialPlan.getResourceGroups() &&
+        (topologyKind == "level_scaled" ||
+         getPartialTopology().getResourceGroups() ==
+             sequentialPartialPlan.getResourceGroups()) &&
         sequentialPartialPlan.getResourceGroups() <= target.getVectorRegisters();
     layoutPlanClosed &= sequentialPlanClosed;
   }
@@ -7513,6 +7533,8 @@ mlir::LogicalResult RVVWidenAccumulateOp::verify() {
       }
       if (auto capture = mlir::dyn_cast<RVVPartialCaptureOp>(user))
         explicitChain = capture.getInput() == current;
+      else if (auto collect = mlir::dyn_cast<RVVPartialCollectOp>(user))
+        explicitChain = llvm::is_contained(collect.getInputs(), current);
       else if (auto finalize = mlir::dyn_cast<RVVFinalizeWidenDotOp>(user))
         explicitChain = finalize.getPartial() == current &&
                         finalize.getReductionAxes() == getReductionAxes();
@@ -7818,6 +7840,43 @@ mlir::LogicalResult RVVPartialCaptureOp::verify() {
                  "rvv.partial-capture", "none", tail))
     return emitOpError(
         "RVV partial capture requires one complete register-resident lane partial");
+  return mlir::success();
+}
+
+mlir::LogicalResult RVVPartialCollectOp::verify() {
+  PartialSetType result = getResult().getType();
+  ValueType partial = result.getPartialType();
+  auto partialElement =
+      mlir::dyn_cast<mlir::IntegerType>(partial.getElementType());
+  auto lanes = rvvLaneCount(partial);
+  auto parts = physicalPartCount(partial);
+  auto axis = llvm::find(partial.getAxisIds().asArrayRef(),
+                         result.getReductionAxis());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  llvm::StringRef tail = partial.getLayout().getValidity() == "tail"
+                             ? llvm::StringRef("agnostic")
+                             : llvm::StringRef("exact");
+  bool inputsClosed = !getInputs().empty() &&
+                      getInputs().size() == static_cast<size_t>(result.getSlots());
+  for (mlir::Value input : getInputs())
+    inputsClosed &= input.getType() == partial;
+  if (!inputsClosed || !partialElement || !partialElement.isSigned() ||
+      (partialElement.getWidth() != 16 && partialElement.getWidth() != 32) ||
+      partial.getLayout().getCarrier() != "rvv" || !lanes ||
+      *lanes <= 0 || !parts || *parts != 1 ||
+      axis == partial.getAxisIds().asArrayRef().end() ||
+      result.getTermsPerSlot() != *lanes ||
+      result.getResourceGroups() !=
+          result.getSlots() * partial.getLayout().getRegisterGroups() ||
+      getOwnerDomainId() < 0 || getBirthId() < 0 ||
+      getLifetimeEndDomainId() < getOwnerDomainId() || !kernel ||
+      !supportsRVVLayout(kernel.getTarget(), partial.getLayout()) ||
+      getLeaf().getOperandGroups() != result.getResourceGroups() ||
+      getLeaf().getResultGroups() != result.getResourceGroups() ||
+      !exactLeaf(getLeaf(), "rvv", "partial-collect",
+                 "rvv.partial-collect", "none", tail))
+    return emitOpError(
+        "RVV partial collect requires one explicit register-resident product per typed slot");
   return mlir::success();
 }
 

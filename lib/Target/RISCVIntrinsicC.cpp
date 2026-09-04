@@ -745,6 +745,8 @@ private:
   mlir::LogicalResult
   compileRVVPartialCapture(riscv::RVVPartialCaptureOp operation);
   mlir::LogicalResult
+  compileRVVPartialCollect(riscv::RVVPartialCollectOp operation);
+  mlir::LogicalResult
   compileRVVPartialRepack(riscv::RVVPartialRepackOp operation);
   mlir::LogicalResult
   compileRVVPartialMerge(riscv::RVVPartialMergeOp operation);
@@ -2498,6 +2500,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVPartialSet(partial);
   if (auto capture = mlir::dyn_cast<riscv::RVVPartialCaptureOp>(operation))
     return compileRVVPartialCapture(capture);
+  if (auto collect = mlir::dyn_cast<riscv::RVVPartialCollectOp>(operation))
+    return compileRVVPartialCollect(collect);
   if (auto repack = mlir::dyn_cast<riscv::RVVPartialRepackOp>(operation))
     return compileRVVPartialRepack(repack);
   if (auto merge = mlir::dyn_cast<riscv::RVVPartialMergeOp>(operation))
@@ -10996,6 +11000,29 @@ Emitter::compileRVVPartialCapture(riscv::RVVPartialCaptureOp operation) {
   Binding result;
   result.kind = Binding::Kind::PartialSet;
   result.parts.push_back(input->parts.front());
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult
+Emitter::compileRVVPartialCollect(riscv::RVVPartialCollectOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.partial-collect")
+    return fail(operation, "RVV partial collect has no exact selected leaf");
+  auto resultType = operation.getResult().getType();
+  if (operation.getInputs().size() !=
+      static_cast<size_t>(resultType.getSlots()))
+    return fail(operation,
+                "RVV partial collect has no value for every selected slot");
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  for (mlir::Value inputValue : operation.getInputs()) {
+    auto input = materializeNumeric(inputValue, bindings.lookup(inputValue));
+    if (mlir::failed(input) || input->kind != Binding::Kind::Vector ||
+        input->parts.size() != 1 || input->parts.front().empty())
+      return fail(operation,
+                  "RVV partial collect requires one materialized vector per slot");
+    result.parts.push_back(input->parts.front());
+  }
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }

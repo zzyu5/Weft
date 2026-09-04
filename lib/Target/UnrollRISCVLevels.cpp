@@ -240,6 +240,11 @@ public:
           maximumBirth[capture.getOwnerDomainId()] =
               std::max(maximumBirth.lookup(capture.getOwnerDomainId()),
                        static_cast<int64_t>(capture.getBirthId()));
+        if (auto collect =
+                mlir::dyn_cast<riscv::RVVPartialCollectOp>(operation))
+          maximumBirth[collect.getOwnerDomainId()] =
+              std::max(maximumBirth.lookup(collect.getOwnerDomainId()),
+                       static_cast<int64_t>(collect.getBirthId()));
       });
       llvm::DenseSet<std::pair<int64_t, int64_t>> seen;
       mlir::Builder builder(&getContext());
@@ -258,6 +263,9 @@ public:
         if (auto capture =
                 mlir::dyn_cast<riscv::RVVPartialCaptureOp>(operation))
           freshen(operation, capture.getOwnerDomainId(), capture.getBirthId());
+        if (auto collect =
+                mlir::dyn_cast<riscv::RVVPartialCollectOp>(operation))
+          freshen(operation, collect.getOwnerDomainId(), collect.getBirthId());
       });
     }
     if (failed)

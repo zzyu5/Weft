@@ -19,6 +19,7 @@ ConvertWeftToRISCV
 → MaterializeRISCVPrograms
 → VectorizeRISCVRecordLoops
 → CanonicalizeRISCVLayouts
+→ PlanRISCVNestedMemory
 → FuseRISCVBitplanes
 → HoistRISCVLoopInvariants
 → ScheduleRISCVLevels
@@ -210,8 +211,10 @@ planner 读取 contraction/reduction 的 typed axes、time/lane/replica 分解�
 consumer use 与 target resource budget，唯一写入 product carrier、issue slices、partial-set、
 combine/final-reduction topology、selected local instructions 和联合资源合同。顺序 fused contraction
 若跨多个 issue，必须得到显式 `sequential_partial_plan`；该 plan 给出每个 issue 的 source-part
-投影、唯一 widened accumulator 与最终 reduction，而不是让 composite dot 按 issue 数预留一组
-临时 partial。当前该 fused program 只在 lhs/rhs 的 issue slice 与 reduction-only accumulator
+投影、每个 operand 已选的 `slice` 或 `storage-rematerialize` supply、唯一 widened accumulator 与
+最终 reduction，而不是让 composite dot 按 issue 数预留一组临时 partial。storage rematerialize
+只对 typed grouped/layered field window 及其保持 axis 的 pure producer closure 合法；它投影已经选定的
+storage plan，不能重选 memory form。当前该 fused program 只在 lhs/rhs 的 issue slice 与 reduction-only accumulator
 具有同一完整 physical-part 映射时合法；带互异 free-axis replicas 的 outer contraction 由 planner
 明确选择 `sequential_per_stream`，materializer 不得在失败后自行降级。
 
@@ -229,6 +232,12 @@ contribution。planner 必须从该 seed 冻结完整 slots、product carrier、
 combine topology 与 resource groups；materializer 再按该 slots 机械展开。scale 可以是
 typed scalar carrier 或已终结的 signed-i32 scalar，两者都必须由 verifier 证明为单一
 replica；不能因展开时的 SSA 拼写不同而重选 topology。
+
+当每个 logical slot 本身跨多个 issue 时，planner还必须冻结 issue operand supply 与完整
+product carrier。materializer先用显式`rvv_widen_multiply/rvv_widen_accumulate`形成每个slot，
+再由`rvv_partial_collect`按SSA operand顺序建立typed slot集合，之后才执行partial reduction与
+scale combine。`rvv_partial_collect`不生成新的数学运算；它使同时存活的独立product、slot顺序、
+birth/lifetime和资源总量成为可验证的IR合同，terminal translator不能从原dot重新构造这棵程序。
 
 上述 plan attributes 是第二层内部、一次 lowering 中的瞬态冻结结果。完成物化后它们必须删除；
 final verifier拒绝任何残留plan，terminal translator也不读取它们。只有单stream的closed widening-dot

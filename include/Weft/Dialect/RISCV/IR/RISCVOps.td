@@ -370,12 +370,14 @@ def WeftRISCV_ScaledPartialPlanAttr
 def WeftRISCV_SequentialPartialPlanAttr
     : WeftRISCV_Attr<"SequentialPartialPlan", "sequential_partial_plan"> {
   let parameters = (ins
-    StringRefParameter<"fused or per_stream">:$realization,
+    StringRefParameter<"fused, per_stream, or fused_partial">:$realization,
     "int64_t":$issueCount,
     "::mlir::DenseI64ArrayAttr":$reductionAxes,
     "::mlir::Type":$lhsIssueType,
     "::mlir::Type":$rhsIssueType,
     "::mlir::Type":$accumulatorType,
+    StringRefParameter<"slice or storage-rematerialize">:$lhsIssueSupply,
+    StringRefParameter<"slice or storage-rematerialize">:$rhsIssueSupply,
     "::mlir::DenseI64ArrayAttr":$lhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$lhsLaneOffsets,
@@ -388,7 +390,8 @@ def WeftRISCV_SequentialPartialPlanAttr
   let assemblyFormat = [{
     `<` $realization `,` $issueCount `,` $reductionAxes `,`
         $lhsIssueType `,` $rhsIssueType `,`
-        $accumulatorType `,` $lhsSourceParts `,` $rhsSourceParts `,`
+        $accumulatorType `,` $lhsIssueSupply `,` $rhsIssueSupply `,`
+        $lhsSourceParts `,` $rhsSourceParts `,`
         $lhsLaneOffsets `,` $rhsLaneOffsets `,`
         $multiplyInstruction `,` $accumulateInstruction `,`
         $finalizeInstruction `,` $resourceGroups `>`
@@ -1607,6 +1610,17 @@ def WeftRISCV_RVVPartialSetOp
 def WeftRISCV_RVVPartialCaptureOp
     : WeftRISCV_Op<"rvv_partial_capture", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
+                       I64Attr:$owner_domain_id,
+                       I64Attr:$birth_id,
+                       I64Attr:$lifetime_end_domain_id,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
+def WeftRISCV_RVVPartialCollectOp
+    : WeftRISCV_Op<"rvv_partial_collect", [Pure]> {
+  let arguments = (ins Variadic<WeftRISCV_ValueType>:$inputs,
                        I64Attr:$owner_domain_id,
                        I64Attr:$birth_id,
                        I64Attr:$lifetime_end_domain_id,

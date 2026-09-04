@@ -100,6 +100,11 @@ if [[ ${format} == q2_k ]]; then
     physical_auto+=(--auto-scalar-load-prime 1)
   fi
 fi
+if [[ ${format} == q4_k ]]; then
+  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
+  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
+    physical_auto+=(--auto-pipeline-depth 1)
+fi
 if [[ ${format} == iq2_xs ]]; then
   if [[ ${target} == sg2044 ]]; then
     [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||

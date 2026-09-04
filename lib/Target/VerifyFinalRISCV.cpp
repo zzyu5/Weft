@@ -66,6 +66,7 @@ bool isTerminalRISCVOperation(mlir::Operation *operation) {
       riscv::RVVWidenAccumulateOp,
       riscv::RVVFinalizeWidenDotOp,
       riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
+      riscv::RVVPartialCollectOp,
       riscv::RVVPartialRepackOp,
       riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
       riscv::RVVPartialScaleCombineOp, riscv::RVVPartialWidenScaleOp,
@@ -115,6 +116,7 @@ bool requiresLeaf(mlir::Operation *operation) {
       riscv::RVVWidenAccumulateOp,
       riscv::RVVFinalizeWidenDotOp,
       riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
+      riscv::RVVPartialCollectOp,
       riscv::RVVPartialRepackOp,
       riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
       riscv::RVVPartialScaleCombineOp, riscv::RVVPartialWidenScaleOp,
@@ -239,7 +241,8 @@ mlir::LogicalResult verifyDescriptorFacts(mlir::Operation *owner,
 bool requiresIntegerWidening(mlir::Operation *operation) {
   if (mlir::isa<riscv::RVVGroupedMacStepOp, riscv::RVVWidenDotOp,
                 riscv::RVVPartialSetOp,
-                riscv::RVVPartialCaptureOp, riscv::RVVPartialRepackOp,
+                riscv::RVVPartialCaptureOp, riscv::RVVPartialCollectOp,
+                riscv::RVVPartialRepackOp,
                 riscv::RVVPartialMergeOp,
                 riscv::RVVPartialReduceOp,
                 riscv::RVVPartialScaleCombineOp,
@@ -292,6 +295,8 @@ public:
         verifyPartialBirth(partial.getOwnerDomainId(), partial.getBirthId());
       if (auto capture = mlir::dyn_cast<riscv::RVVPartialCaptureOp>(operation))
         verifyPartialBirth(capture.getOwnerDomainId(), capture.getBirthId());
+      if (auto collect = mlir::dyn_cast<riscv::RVVPartialCollectOp>(operation))
+        verifyPartialBirth(collect.getOwnerDomainId(), collect.getBirthId());
       if (operation->getDialect() &&
           operation->getDialect()->getNamespace() == "weft_kernel") {
         operation->emitError(

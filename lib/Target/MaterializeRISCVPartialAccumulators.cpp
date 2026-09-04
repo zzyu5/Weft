@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
@@ -629,6 +630,114 @@ riscv::ValueType issueWindowType(mlir::Builder &builder,
       riscv_internal::integers(builder, shape), source.getAxisIds(), layout);
 }
 
+struct IssueStorageWindowCandidate {
+  riscv::FieldOp field;
+  riscv::PhysicalPointOp point;
+  riscv::ValueType resultType;
+  riscv::StorageWindowPlanAttr plan;
+  int64_t axis;
+};
+
+std::optional<IssueStorageWindowCandidate>
+analyzeIssueStorageWindowCandidate(mlir::Builder &builder,
+                                   riscv::ExtractOp extract) {
+  auto field = extract.getInput().getDefiningOp<riscv::FieldOp>();
+  auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+  if (!field || !result ||
+      extract.getAccess().getMapping() != "grouped_layered" ||
+      extract.getIndices().size() != 1)
+    return std::nullopt;
+  auto point =
+      extract.getIndices().front().getDefiningOp<riscv::PhysicalPointOp>();
+  if (!point || point.getResult().getType().getDomain().getTail() != "exact")
+    return std::nullopt;
+  const int64_t axis = point.getResult().getType().getDomain().getAxisId();
+  auto position = axisPosition(result, axis);
+  if (!position || result.getLayout().getLaneFactors()[*position] <= 1 ||
+      result.getShape()[*position] !=
+          result.getLayout().getLaneFactors()[*position] *
+              result.getLayout().getTimeFactors()[*position])
+    return std::nullopt;
+  auto plan = riscv_internal::storageWindowPlan(
+      builder, field, axis, 0, 1, 1, result.getShape()[*position],
+      result.getLayout().getLaneFactors()[*position]);
+  if (!plan)
+    return std::nullopt;
+  return IssueStorageWindowCandidate{field, point, result, *plan, axis};
+}
+
+struct IssueStorageSupplyFacts {
+  bool closed = false;
+  bool hasStorageWindow = false;
+};
+
+IssueStorageSupplyFacts analyzeIssueStorageSupply(
+    mlir::Builder &builder, mlir::Value value, int64_t axis,
+    int64_t windowExtent, riscv::TargetAttr target,
+    llvm::DenseMap<mlir::Value, IssueStorageSupplyFacts> &memo) {
+  if (auto found = memo.find(value); found != memo.end())
+    return found->second;
+  auto sourceType = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  auto position = sourceType ? axisPosition(sourceType, axis)
+                             : std::optional<size_t>();
+  if (!sourceType || !position)
+    return memo[value] = {true, false};
+  if (!issueWindowType(builder, target, sourceType, axis, windowExtent))
+    return memo[value] = {};
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition)
+    return memo[value] = {};
+
+  if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(definition)) {
+    auto candidate = analyzeIssueStorageWindowCandidate(builder, extract);
+    return memo[value] = {
+               static_cast<bool>(candidate) && candidate->axis == axis,
+               static_cast<bool>(candidate) && candidate->axis == axis};
+  }
+  if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(definition)) {
+    auto plan = window.getPlan();
+    const int64_t lanes =
+        sourceType.getLayout().getLaneFactors()[*position];
+    const bool closed = plan && plan.getReductionAxis() == axis && lanes > 0 &&
+                        sourceType.getShape()[*position] ==
+                            sourceType.getLayout().getTimeFactors()[*position] *
+                                lanes;
+    return memo[value] = {closed, closed};
+  }
+
+  auto analyzeOperand = [&](mlir::Value operand) {
+    return analyzeIssueStorageSupply(builder, operand, axis, windowExtent,
+                                     target, memo);
+  };
+  if (auto unary = mlir::dyn_cast<riscv::UnaryOp>(definition))
+    return memo[value] = analyzeOperand(unary.getInput());
+  if (auto binary = mlir::dyn_cast<riscv::BinaryOp>(definition)) {
+    IssueStorageSupplyFacts lhs = analyzeOperand(binary.getLhs());
+    IssueStorageSupplyFacts rhs = analyzeOperand(binary.getRhs());
+    return memo[value] = {lhs.closed && rhs.closed,
+                          lhs.hasStorageWindow || rhs.hasStorageWindow};
+  }
+  if (auto cast = mlir::dyn_cast<riscv::CastOp>(definition))
+    return memo[value] = analyzeOperand(cast.getInput());
+  if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(definition))
+    return memo[value] = analyzeOperand(narrow.getInput());
+  if (auto widen = mlir::dyn_cast<riscv::WidenOp>(definition))
+    return memo[value] = analyzeOperand(widen.getInput());
+  if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(definition))
+    return memo[value] = analyzeOperand(conversion.getInput());
+  return memo[value] = {};
+}
+
+bool supportsIssueStorageRematerialization(mlir::Builder &builder,
+                                           mlir::Value value, int64_t axis,
+                                           int64_t windowExtent,
+                                           riscv::TargetAttr target) {
+  llvm::DenseMap<mlir::Value, IssueStorageSupplyFacts> memo;
+  IssueStorageSupplyFacts facts = analyzeIssueStorageSupply(
+      builder, value, axis, windowExtent, target, memo);
+  return facts.closed && facts.hasStorageWindow;
+}
+
 mlir::FailureOr<mlir::Value> cloneIssueWindow(
     mlir::Value value, int64_t axis, int64_t windowExtent,
     mlir::Value windowIndex, riscv::TargetAttr target,
@@ -822,6 +931,51 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
             selected.getTail(), selected.getParameters(),
             selected.getLocalBytes()));
     return remember(cloned.getResult());
+  }
+
+  if (auto window = mlir::dyn_cast<riscv::RVVStorageWindowOp>(definition)) {
+    auto sourcePlan = window.getPlan();
+    auto resultPosition = axisPosition(resultType, axis);
+    if (!resultPosition)
+      return mlir::failure();
+    const int64_t lanes =
+        resultType.getLayout().getLaneFactors()[*resultPosition];
+    if (!sourcePlan || sourcePlan.getReductionAxis() != axis || lanes <= 0 ||
+        windowExtent != lanes ||
+        resultType.getLayout().getTimeFactors()[*resultPosition] != 1)
+      return mlir::failure();
+
+    auto extent = rewriter.create<mlir::arith::ConstantIndexOp>(
+        window.getLoc(), windowExtent);
+    auto dynamicOffset = rewriter.create<mlir::arith::MulIOp>(
+        window.getLoc(), windowIndex, extent.getResult());
+    mlir::Value logicalOffset = rewriter.create<mlir::arith::AddIOp>(
+        window.getLoc(), window.getLogicalOffset(), dynamicOffset.getResult());
+    auto projectedPlan = riscv::StorageWindowPlanAttr::get(
+        rewriter.getContext(), sourcePlan.getKind(),
+        sourcePlan.getReductionAxis(), sourcePlan.getProjectionBase(),
+        sourcePlan.getProjectionStride(), sourcePlan.getProjectionRepeat(),
+        windowExtent, lanes, sourcePlan.getRecordElements(),
+        sourcePlan.getByteOffset(), sourcePlan.getElementBits(),
+        sourcePlan.getGroupSize(), sourcePlan.getLayerSize(),
+        sourcePlan.getPhysicalLayerBase(), sourcePlan.getPhysicalLayerStep(),
+        sourcePlan.getShiftBase(), sourcePlan.getShiftStep(),
+        sourcePlan.getMaskValue());
+    auto selected = window.getLeaf();
+    auto projected = rewriter.create<riscv::RVVStorageWindowOp>(
+        window.getLoc(), resultType, window.getField(), window.getOrigin(),
+        logicalOffset, projectedPlan, window.getAccess(),
+        riscv_internal::leaf(
+            rewriter, selected.getEngine(), selected.getFamily(),
+            selected.getInstruction(), selected.getSpelling(),
+            selected.getOperandGroups(),
+            resultType.getLayout().getRegisterGroups(),
+            selected.getTemporaryGroups(), selected.getFragmentGroups(),
+            selected.getMask(),
+            resultType.getLayout().getValidity() == "tail" ? "agnostic"
+                                                            : "exact",
+            selected.getParameters(), selected.getLocalBytes()));
+    return remember(projected.getResult());
   }
 
   if (auto load =
@@ -2663,7 +2817,7 @@ matchLevelScaledLoopSeed(mlir::scf::ForOp loop) {
 
 mlir::FailureOr<mlir::scf::ForOp>
 expandPlannedLevelScaledIssueLoop(mlir::scf::ForOp loop, int64_t factor,
-                                  mlir::IRRewriter &) {
+                                  mlir::IRRewriter &rewriter) {
   auto lower = loop.getLowerBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
   auto upper = loop.getUpperBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
   auto step = loop.getStep().getDefiningOp<mlir::arith::ConstantIndexOp>();
@@ -2679,6 +2833,55 @@ expandPlannedLevelScaledIssueLoop(mlir::scf::ForOp loop, int64_t factor,
 
   loop->removeAttr("weft.riscv.unroll_factor");
   loop->removeAttr("weft.riscv.unroll_order");
+
+  // The generic SCF unroller erases the loop when the selected factor equals
+  // its exact trip count.  A level-scaled partial plan still needs one region
+  // to own the cloned issue cohort until the typed PartialSet program replaces
+  // it.  Keep that owner as a single-iteration loop and clone the remaining
+  // issues into its body, threading the original iter_args mechanically.
+  if (iterations == factor) {
+    auto yield = mlir::dyn_cast<mlir::scf::YieldOp>(
+        loop.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != loop.getInitArgs().size())
+      return mlir::failure();
+
+    llvm::SmallVector<mlir::Operation *> templateOperations;
+    for (mlir::Operation &operation : loop.getBody()->without_terminator())
+      templateOperations.push_back(&operation);
+    llvm::SmallVector<mlir::Value> current(yield.getOperands().begin(),
+                                           yield.getOperands().end());
+    rewriter.setInsertionPoint(yield);
+    for (int64_t iteration = 1; iteration < factor; ++iteration) {
+      mlir::IRMapping mapping;
+      auto induction = rewriter.create<mlir::arith::ConstantIndexOp>(
+          loop.getLoc(), lower.value() + iteration * step.value());
+      mapping.map(loop.getInductionVar(), induction.getResult());
+      for (auto [regionArgument, value] :
+           llvm::zip(loop.getRegionIterArgs(), current))
+        mapping.map(regionArgument, value);
+      for (mlir::Operation *operation : templateOperations)
+        rewriter.clone(*operation, mapping);
+
+      llvm::SmallVector<mlir::Value> next;
+      next.reserve(yield.getNumOperands());
+      for (mlir::Value value : yield.getOperands())
+        next.push_back(mapping.lookupOrDefault(value));
+      current = std::move(next);
+    }
+    rewriter.setInsertionPointToStart(loop.getBody());
+    auto firstInduction = rewriter.create<mlir::arith::ConstantIndexOp>(
+        loop.getLoc(), lower.value());
+    loop.getInductionVar().replaceAllUsesWith(firstInduction.getResult());
+    rewriter.modifyOpInPlace(yield, [&] { yield->setOperands(current); });
+    rewriter.setInsertionPoint(loop);
+    auto singleIterationUpper = rewriter.create<mlir::arith::ConstantIndexOp>(
+        loop.getLoc(), lower.value() + step.value());
+    rewriter.modifyOpInPlace(loop, [&] {
+      loop.getUpperBoundMutable().assign(singleIterationUpper.getResult());
+    });
+    return loop;
+  }
+
   auto unrolled = mlir::loopUnrollByFactor(loop, factor);
   if (mlir::failed(unrolled) || !(*unrolled).mainLoopOp)
     return mlir::failure();
@@ -3572,6 +3775,8 @@ public:
       riscv::ValueType sequentialRhsIssue;
       riscv::ValueType sequentialAccumulator;
       std::optional<std::string> sequentialMultiply;
+      llvm::StringRef sequentialLhsSupply = "slice";
+      llvm::StringRef sequentialRhsSupply = "slice";
       bool sequentialPlanClosed = false;
 
       if (auto found = nestedScaledReductions.find(dot.getOperation());
@@ -3755,7 +3960,8 @@ public:
             sourcePlan = std::move(*source);
           }
         }
-      if (kind.empty() && levelScaledDots.contains(dot.getOperation())) {
+      if (kind.empty() && outputReplicas == 1 &&
+          levelScaledDots.contains(dot.getOperation())) {
         kind = "level_scaled";
         partialSlots = dot.getPartialUnroll();
         combineArity = partialSlots % 2 == 0 ? 2 : partialSlots;
@@ -3795,7 +4001,8 @@ public:
       // before materialization.  Fused and per-stream realizations share the
       // same carrier; they differ only in whether the carrier or the finalized
       // i32 value crosses an issue boundary.
-      if (kind == "sequential_fused" || kind == "sequential_per_stream") {
+      if (kind == "sequential_fused" || kind == "sequential_per_stream" ||
+          kind == "level_scaled") {
         sequentialLhsIssue =
             sequentialIssueType(builder, dot, dot.getLhs().getType());
         sequentialRhsIssue =
@@ -3803,6 +4010,24 @@ public:
         sequentialAccumulator = partialSlotType(builder, dot);
         sequentialMultiply = sequentialMultiplyInstruction(
             sequentialLhsIssue, sequentialRhsIssue);
+        if (kind == "level_scaled" && kernel && dot.getOver().size() == 1 &&
+            sequentialLhsIssue && sequentialRhsIssue) {
+          const int64_t reductionAxis = dot.getOver()[0];
+          auto lhsPosition = axisPosition(sequentialLhsIssue, reductionAxis);
+          auto rhsPosition = axisPosition(sequentialRhsIssue, reductionAxis);
+          if (lhsPosition &&
+              supportsIssueStorageRematerialization(
+                  builder, dot.getLhs(), reductionAxis,
+                  sequentialLhsIssue.getShape()[*lhsPosition],
+                  kernel.getTarget()))
+            sequentialLhsSupply = "storage-rematerialize";
+          if (rhsPosition &&
+              supportsIssueStorageRematerialization(
+                  builder, dot.getRhs(), reductionAxis,
+                  sequentialRhsIssue.getShape()[*rhsPosition],
+                  kernel.getTarget()))
+            sequentialRhsSupply = "storage-rematerialize";
+        }
         auto lhsParts = riscv_internal::staticProduct(
             sequentialLhsIssue
                 ? sequentialLhsIssue.getLayout().getReplicaFactors().asArrayRef()
@@ -3850,7 +4075,8 @@ public:
           signalPassFailure();
           return;
         }
-        resources = plannedResources;
+        if (kind != "level_scaled")
+          resources = plannedResources;
       }
 
       dot->setAttr("partial_topology",
@@ -4011,7 +4237,8 @@ public:
               builder.getDenseI64ArrayAttr(sourcePlan ? sourcePlan->rhsOffsets
                                                       : empty)));
 
-      if (kind == "sequential_fused" || kind == "sequential_per_stream") {
+      if (kind == "sequential_fused" || kind == "sequential_per_stream" ||
+          kind == "level_scaled") {
         auto lhsIssue = sequentialLhsIssue;
         auto rhsIssue = sequentialRhsIssue;
         auto accumulator = sequentialAccumulator;
@@ -4039,24 +4266,32 @@ public:
                 : 0;
         if (!sequentialPlanClosed || !lhsIssue || !rhsIssue || !accumulator ||
             !accumulatorElement ||
-            plannedResources != resources || !kernel ||
+            (kind != "level_scaled" && plannedResources != resources) || !kernel ||
             plannedResources > kernel.getTarget().getVectorRegisters()) {
           dot.emitError(
               "selected sequential topology has no closed issue-slice and accumulator plan");
           signalPassFailure();
           return;
         }
+        const llvm::StringRef realization =
+            kind == "level_scaled"
+                ? llvm::StringRef("fused_partial")
+                : kind == "sequential_fused" ? llvm::StringRef("fused")
+                                              : llvm::StringRef("per_stream");
         const llvm::StringRef finalizeInstruction =
-            accumulatorElement.getWidth() == 16 ? "rvv.vwredsum.partial"
-                                                : "rvv.vredsum.partial";
+            kind == "level_scaled"
+                ? llvm::StringRef("none")
+                : accumulatorElement.getWidth() == 16
+                      ? llvm::StringRef("rvv.vwredsum.partial")
+                      : llvm::StringRef("rvv.vredsum.partial");
         dot->setAttr(
             "sequential_partial_plan",
             riscv::SequentialPartialPlanAttr::get(
-                builder.getContext(),
-                kind == "sequential_fused" ? "fused" : "per_stream",
+                builder.getContext(), realization,
                 issueCount,
                 builder.getDenseI64ArrayAttr(dot.getOver()), lhsIssue,
-                rhsIssue, accumulator,
+                rhsIssue, accumulator, sequentialLhsSupply,
+                sequentialRhsSupply,
                 builder.getDenseI64ArrayAttr(dot.getLhsParts()),
                 builder.getDenseI64ArrayAttr(dot.getRhsParts()),
                 builder.getDenseI64ArrayAttr(lhsLaneOffsets),
@@ -4733,55 +4968,38 @@ public:
         nextPartialBirthId =
             std::max(nextPartialBirthId,
                      static_cast<int64_t>(capture.getBirthId()) + 1);
+      if (auto collect = mlir::dyn_cast<riscv::RVVPartialCollectOp>(operation))
+        nextPartialBirthId =
+            std::max(nextPartialBirthId,
+                     static_cast<int64_t>(collect.getBirthId()) + 1);
     });
 
     llvm::SmallVector<riscv::ExtractOp> extracts;
     getOperation().walk(
         [&](riscv::ExtractOp extract) { extracts.push_back(extract); });
     for (riscv::ExtractOp extract : extracts) {
-      auto field = extract.getInput().getDefiningOp<riscv::FieldOp>();
-      auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
-      if (!field || !result || extract.getAccess().getMapping() !=
-                                   "grouped_layered" ||
-          extract.getIndices().size() != 1)
-        continue;
-      auto point = extract.getIndices().front().getDefiningOp<riscv::PhysicalPointOp>();
-      if (!point)
-        continue;
-      if (point.getResult().getType().getDomain().getTail() != "exact")
-        continue;
-      const int64_t axis = point.getResult().getType().getDomain().getAxisId();
-      auto position = axisPosition(result, axis);
-      if (!position || result.getLayout().getLaneFactors()[*position] <= 1 ||
-          result.getShape()[*position] !=
-              result.getLayout().getLaneFactors()[*position] *
-                  result.getLayout().getTimeFactors()[*position])
+      auto candidate = analyzeIssueStorageWindowCandidate(rewriter, extract);
+      if (!candidate)
         continue;
       rewriter.setInsertionPoint(extract);
       mlir::Value zero = rewriter.create<mlir::arith::ConstantIndexOp>(
           extract.getLoc(), 0);
-      llvm::StringRef tail = result.getLayout().getValidity() == "tail"
+      llvm::StringRef tail = candidate->resultType.getLayout().getValidity() == "tail"
                                  ? "agnostic"
                                  : "exact";
-      auto plan = riscv_internal::storageWindowPlan(
-          rewriter, field, axis, 0, 1, 1, result.getShape()[*position],
-          result.getLayout().getLaneFactors()[*position]);
-      if (!plan) {
-        extract.emitError(
-            "grouped/layered extract has no closed typed storage-window plan");
-        failed = true;
-        continue;
-      }
       auto window = rewriter.create<riscv::RVVStorageWindowOp>(
-          extract.getLoc(), result, field.getResult(), point.getResult(), zero,
-          *plan, extract.getAccess(),
+          extract.getLoc(), candidate->resultType, candidate->field.getResult(),
+          candidate->point.getResult(), zero, candidate->plan,
+          extract.getAccess(),
           riscv_internal::leaf(rewriter, "rvv", "storage-window",
                                "rvv.storage-window.layered",
                                "rvv.storage-window.layered",
-                               mlir::cast<riscv::ValueType>(field.getResult().getType())
+                               mlir::cast<riscv::ValueType>(
+                                   candidate->field.getResult().getType())
                                    .getLayout()
                                    .getRegisterGroups(),
-                               result.getLayout().getRegisterGroups(), 0, 0,
+                               candidate->resultType.getLayout().getRegisterGroups(),
+                               0, 0,
                                "none", tail));
       riscv_internal::copyOrigin(extract, window);
       extract.getResult().replaceAllUsesWith(window.getResult());
@@ -5976,18 +6194,19 @@ public:
           carryType ? carryType.getLayout().getCarrier() == "scalar"
                     : static_cast<bool>(carryElement);
       bool complete = firstLayoutPlan && firstCombinePlan && scalarCarry &&
-                      carryParts && *carryParts > 0 && carryElement &&
+                      carryParts && *carryParts == 1 && carryElement &&
                       carryElement.isSigned() && carryElement.getWidth() == 32 &&
                       firstCombinePlan.getRealization() == "level_scaled" &&
                       firstCombinePlan.getOutputParts() == *carryParts &&
                       slotType;
       for (ScaledPartialContribution &contribution : contributions) {
-        riscv::ValueType lhs = contribution.dot.getLhs().getType();
-        riscv::ValueType rhs = contribution.dot.getRhs().getType();
-        auto lhsPosition = axisPosition(lhs, reductionAxis);
-        auto rhsPosition = axisPosition(rhs, reductionAxis);
         auto combinePlan = contribution.dot->getAttrOfType<
             riscv::PartialCombinePlanAttr>("partial_combine_plan");
+        auto issuePlan = contribution.dot.getSequentialPartialPlanAttr();
+        auto issueAccumulator =
+            issuePlan
+                ? mlir::dyn_cast<riscv::ValueType>(issuePlan.getAccumulatorType())
+                : riscv::ValueType();
         complete &= contribution.dot.getPartialUnroll() == slots &&
                     contribution.dot.getOver().size() == 1 &&
                     contribution.dot.getOver()[0] == reductionAxis &&
@@ -5995,9 +6214,10 @@ public:
                     contribution.dot.getResult().getType() == carry &&
                     contribution.scaleMultiply.getResult().getType() == carry &&
                     contribution.carryAdd.getResult().getType() == carry &&
-                    lhsPosition && rhsPosition &&
-                    lhs.getLayout().getTimeFactors()[*lhsPosition] == 1 &&
-                    rhs.getLayout().getTimeFactors()[*rhsPosition] == 1 &&
+                    issuePlan &&
+                    issuePlan.getRealization() == "fused_partial" &&
+                    issuePlan.getIssueCount() > 0 &&
+                    issueAccumulator == slotType &&
                     contribution.dot.getPartialLayoutPlanAttr() &&
                     combinePlan &&
                     combinePlan.getRealization() == "level_scaled" &&
@@ -6025,28 +6245,11 @@ public:
         continue;
 
       struct OutputPartialOperands {
-        llvm::SmallVector<mlir::Value> lhs;
-        llvm::SmallVector<mlir::Value> rhs;
+        llvm::SmallVector<mlir::Value> partials;
         llvm::SmallVector<mlir::Value> scales;
-        llvm::SmallVector<int64_t> lhsReplicas;
-        llvm::SmallVector<int64_t> rhsReplicas;
         llvm::SmallVector<int64_t> scaleReplicas;
       };
       llvm::SmallVector<OutputPartialOperands, 1> outputOperands(*carryParts);
-      for (int64_t outputPart = 0; outputPart < *carryParts; ++outputPart) {
-        OutputPartialOperands &operands = outputOperands[outputPart];
-        for (ScaledPartialContribution &contribution : contributions) {
-          auto combinePlan = contribution.dot->getAttrOfType<
-              riscv::PartialCombinePlanAttr>("partial_combine_plan");
-          operands.lhs.push_back(contribution.dot.getLhs());
-          operands.rhs.push_back(contribution.dot.getRhs());
-          operands.scales.push_back(contribution.scale);
-          operands.lhsReplicas.push_back(combinePlan.getLhsParts()[outputPart]);
-          operands.rhsReplicas.push_back(combinePlan.getRhsParts()[outputPart]);
-          operands.scaleReplicas.push_back(
-              combinePlan.getScaleParts()[outputPart]);
-        }
-      }
       auto setType = mlir::cast<riscv::PartialSetType>(
           firstCombinePlan.getSourceSetType());
       auto reducedType = mlir::cast<riscv::PartialSetType>(
@@ -6060,28 +6263,123 @@ public:
       const int64_t fanout = slots / chains;
 
       rewriter.setInsertionPoint(yield);
+      for (ScaledPartialContribution &contribution : contributions) {
+        auto combinePlan = contribution.dot->getAttrOfType<
+            riscv::PartialCombinePlanAttr>("partial_combine_plan");
+        auto issuePlan = contribution.dot.getSequentialPartialPlanAttr();
+        auto lhsIssue = mlir::cast<riscv::ValueType>(issuePlan.getLhsIssueType());
+        auto rhsIssue = mlir::cast<riscv::ValueType>(issuePlan.getRhsIssueType());
+        const int64_t issueCount = issuePlan.getIssueCount();
+        auto kernel = contribution.dot->getParentOfType<riscv::KernelOp>();
+        auto materializeIssueOperand =
+            [&](mlir::Value source, riscv::ValueType issueType,
+                llvm::StringRef supply, mlir::DenseI64ArrayAttr sourceParts,
+                mlir::DenseI64ArrayAttr laneOffsets, size_t index,
+                int64_t issue) -> mlir::FailureOr<mlir::Value> {
+          if (supply == "slice") {
+            auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
+                yield.getLoc(), issueType, source,
+                rewriter.getDenseI64ArrayAttr({sourceParts[index]}),
+                rewriter.getDenseI64ArrayAttr({laneOffsets[index]}),
+                riscv_internal::leaf(
+                    rewriter, "transfer", "issue-slice", "rvv.issue-slice",
+                    "rvv.issue-slice", 0,
+                    issueType.getLayout().getRegisterGroups(), 0, 0, "none",
+                    "exact"));
+            riscv_internal::copyOrigin(contribution.dot, slice);
+            return slice.getResult();
+          }
+          auto position = axisPosition(issueType, reductionAxis);
+          if (supply != "storage-rematerialize" || !kernel || !position)
+            return mlir::failure();
+          auto issueIndex = rewriter.create<mlir::arith::ConstantIndexOp>(
+              yield.getLoc(), issue);
+          llvm::DenseMap<mlir::Value, mlir::Value> clones;
+          auto projected = cloneIssueWindow(
+              source, reductionAxis, issueType.getShape()[*position],
+              issueIndex.getResult(), kernel.getTarget(), rewriter, clones);
+          if (mlir::failed(projected) || (*projected).getType() != issueType)
+            return mlir::failure();
+          return *projected;
+        };
+        for (int64_t outputPart = 0; outputPart < *carryParts; ++outputPart) {
+          mlir::Value partial;
+          for (int64_t issue = 0; issue < issueCount; ++issue) {
+            const size_t index =
+                static_cast<size_t>(outputPart * issueCount + issue);
+            auto lhsSlice = materializeIssueOperand(
+                contribution.dot.getLhs(), lhsIssue,
+                issuePlan.getLhsIssueSupply(),
+                issuePlan.getLhsSourceParts(), issuePlan.getLhsLaneOffsets(),
+                index, issue);
+            auto rhsSlice = materializeIssueOperand(
+                contribution.dot.getRhs(), rhsIssue,
+                issuePlan.getRhsIssueSupply(),
+                issuePlan.getRhsSourceParts(), issuePlan.getRhsLaneOffsets(),
+                index, issue);
+            if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice)) {
+              contribution.dot.emitError(
+                  "selected issue supply cannot materialize its frozen storage/view program");
+              failed = true;
+              break;
+            }
+            if (!partial) {
+              auto product = rewriter.create<riscv::RVVWidenMultiplyOp>(
+                  yield.getLoc(), slotType, *lhsSlice, *rhsSlice,
+                  riscv_internal::leaf(
+                      rewriter, "rvv", "widen-multiply",
+                      issuePlan.getMultiplyInstruction(),
+                      issuePlan.getMultiplyInstruction(),
+                      lhsIssue.getLayout().getRegisterGroups() +
+                          rhsIssue.getLayout().getRegisterGroups(),
+                      slotType.getLayout().getRegisterGroups(), 0, 0, "none",
+                      "exact"));
+              riscv_internal::copyOrigin(contribution.dot, product);
+              partial = product.getResult();
+            } else {
+              auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+                  yield.getLoc(), slotType, *lhsSlice, *rhsSlice, partial,
+                  issuePlan.getReductionAxes(),
+                  riscv_internal::leaf(
+                      rewriter, "rvv", "widen-accumulate",
+                      issuePlan.getAccumulateInstruction(),
+                      issuePlan.getAccumulateInstruction(),
+                      lhsIssue.getLayout().getRegisterGroups() +
+                          rhsIssue.getLayout().getRegisterGroups() +
+                          slotType.getLayout().getRegisterGroups(),
+                      slotType.getLayout().getRegisterGroups(), 0, 0, "none",
+                      "agnostic"));
+              riscv_internal::copyOrigin(contribution.dot, accumulate);
+              partial = accumulate.getResult();
+            }
+          }
+          if (failed)
+            break;
+          OutputPartialOperands &operands = outputOperands[outputPart];
+          operands.partials.push_back(partial);
+          operands.scales.push_back(contribution.scale);
+          operands.scaleReplicas.push_back(
+              combinePlan.getScaleParts()[outputPart]);
+        }
+        if (failed)
+          break;
+      }
+      if (failed)
+        continue;
+
       llvm::SmallVector<mlir::Value> scalarParts;
       for (OutputPartialOperands &operands : outputOperands) {
-        llvm::SmallVector<int64_t> operandSlots;
-        llvm::SmallVector<int64_t> laneOffsets(slots, 0);
-        for (int64_t slot = 0; slot < slots; ++slot)
-          operandSlots.push_back(slot);
-        auto set = rewriter.create<riscv::RVVPartialSetOp>(
-            yield.getLoc(), setType, operands.lhs, operands.rhs,
-            rewriter.getDenseI64ArrayAttr(operandSlots),
-            rewriter.getDenseI64ArrayAttr(operandSlots),
-            rewriter.getDenseI64ArrayAttr(operands.lhsReplicas),
-            rewriter.getDenseI64ArrayAttr(operands.rhsReplicas),
-            rewriter.getDenseI64ArrayAttr(laneOffsets),
-            rewriter.getDenseI64ArrayAttr(laneOffsets), reductionAxis,
-            firstCombinePlan.getMultiplyInstruction(),
+        auto set = rewriter.create<riscv::RVVPartialCollectOp>(
+            yield.getLoc(), setType, operands.partials,
             ownerDomain(yield), nextPartialBirthId++, ownerDomain(yield),
             riscv_internal::leaf(
-                rewriter, "rvv", "partial-set", "rvv.partial-set",
-                "rvv.partial-set", 0, setType.getResourceGroups(), 0, 0,
-                "none", "exact", {reductionAxis, slots}));
+                rewriter, "rvv", "partial-collect", "rvv.partial-collect",
+                "rvv.partial-collect", setType.getResourceGroups(),
+                setType.getResourceGroups(), 0, 0, "none",
+                slotType.getLayout().getValidity() == "tail" ? "agnostic"
+                                                               : "exact",
+                {reductionAxis, slots}));
         riscv_internal::copyOrigin(contributions.front().dot, set);
-        sinkReplicaSupplies(set);
         auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
             yield.getLoc(), reducedType, set.getResult(),
             riscv_internal::leaf(
@@ -6139,13 +6437,20 @@ public:
         finalAdd->setOperand(1, materializedCarry);
       });
 
+      llvm::SmallVector<mlir::Value> issueCleanupRoots;
       for (ScaledPartialContribution &contribution :
            llvm::reverse(contributions)) {
+        issueCleanupRoots.push_back(contribution.dot.getLhs());
+        issueCleanupRoots.push_back(contribution.dot.getRhs());
         if (contribution.carryAdd != finalAdd)
           rewriter.eraseOp(contribution.carryAdd);
         rewriter.eraseOp(contribution.scaleMultiply);
         rewriter.eraseOp(contribution.dot);
       }
+      llvm::DenseSet<mlir::Operation *> issueCleanupVisited;
+      llvm::DenseSet<mlir::Value> issueCleanupStops;
+      for (mlir::Value root : issueCleanupRoots)
+        eraseDeadChain(root, issueCleanupStops, issueCleanupVisited, rewriter);
     }
 
     // A canonical reduction over one surviving replica axis of a widened dot
@@ -6254,7 +6559,8 @@ public:
     // finalizes each issue and combines the explicit i32 SSA results.
     llvm::SmallVector<riscv::RVVWidenDotOp> sequentialDots;
     getOperation().walk([&](riscv::RVVWidenDotOp dot) {
-      if (dot.getSequentialPartialPlanAttr())
+      auto plan = dot.getSequentialPartialPlanAttr();
+      if (plan && plan.getRealization() != "fused_partial")
         sequentialDots.push_back(dot);
     });
     for (riscv::RVVWidenDotOp dot : sequentialDots) {

@@ -302,7 +302,7 @@ else
     fi
   elif [[ ${format} == q4_k ]]; then
     if [[ ${phase} == decode ]]; then
-      physical=(--auto-unroll=1 --auto-pipeline-depth=1)
+      physical=(--auto-unroll=8 --auto-pipeline-depth=1)
       kernel=production_mul_mat_q4_k_decode
       runtime_kernel_define=-DWEFT_Q4K_DECODE=1
     else

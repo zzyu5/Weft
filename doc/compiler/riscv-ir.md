@@ -114,6 +114,7 @@ RVV↔IME handoff不用 generic conversion冒充：`ime_pack`、typed fragment M
 - reduction/contract 的 `scf.for` 和 loop-carried accumulator；
 - grouped/encoded `WindowType`、load-window与compute-step；
 - RVV contraction step和明确的 lane operand/memory form；
+- 独立完整product的`rvv_partial_collect`、partial reduction与scale-combine use-def；
 - IME fragment packing geometry、MMA groups/chunks与unpack；
 - local alloc/bind/load/store、spill/reload；
 - 对已支持window cluster展开后的pipeline prologue、steady state与epilogue。
