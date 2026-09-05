@@ -356,11 +356,12 @@ else
       physical=(--auto-lmul-eighths=32 --auto-unroll=4 --auto-pipeline-depth=1)
     else
       kernel=production_mul_mat_iq1_s
-      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
       if [[ ${target} == k1 ]]; then
+        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
         meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=4)
       else
-        meta=(--meta NC=32 --meta MC=16 --meta MR=1 --meta NR=4)
+        physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+        meta=(--meta NC=32 --meta MC=16 --meta MR=1 --meta NR=1)
       fi
     fi
   elif [[ ${format} == iq1_m ]]; then

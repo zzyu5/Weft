@@ -133,6 +133,65 @@ void sinkReplicaSupplies(riscv::RVVPartialSetOp partial) {
     supply->moveBefore(partial);
 }
 
+void placePureSliceAtFirstPostLoopUse(mlir::scf::ForOp loop,
+                                      mlir::Value root) {
+  mlir::Block *block = loop->getBlock();
+  if (!block)
+    return;
+  llvm::SmallPtrSet<mlir::Operation *, 32> slice;
+  llvm::SmallVector<mlir::Value> worklist{root};
+  while (!worklist.empty()) {
+    mlir::Operation *definition = worklist.pop_back_val().getDefiningOp();
+    if (!definition || definition->getBlock() != block ||
+        !definition->isBeforeInBlock(loop) || definition->getNumRegions() != 0 ||
+        definition->getNumResults() != 1 ||
+        !mlir::isMemoryEffectFree(definition) ||
+        !mlir::isa<riscv::ValueType>(definition->getResult(0).getType()) ||
+        !slice.insert(definition).second)
+      continue;
+    for (mlir::Value operand : definition->getOperands())
+      if (mlir::isa<riscv::ValueType>(operand.getType()))
+        worklist.push_back(operand);
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    llvm::SmallVector<mlir::Operation *> rejected;
+    for (mlir::Operation *operation : slice) {
+      bool movable = !operation->getResult(0).use_empty();
+      for (mlir::Operation *user : operation->getResult(0).getUsers())
+        movable &= slice.contains(user) ||
+                   (user->getBlock() == block && loop->isBeforeInBlock(user));
+      if (!movable)
+        rejected.push_back(operation);
+    }
+    for (mlir::Operation *operation : rejected)
+      changed |= slice.erase(operation);
+  }
+  if (slice.empty())
+    return;
+
+  mlir::Operation *firstExternalUser = nullptr;
+  for (mlir::Operation *operation : slice)
+    for (mlir::Operation *user : operation->getResult(0).getUsers())
+      if (!slice.contains(user) &&
+          (!firstExternalUser || user->isBeforeInBlock(firstExternalUser)))
+        firstExternalUser = user;
+  if (!firstExternalUser)
+    return;
+
+  llvm::SmallVector<mlir::Operation *> ordered;
+  for (mlir::Operation &operation : *block) {
+    if (&operation == loop.getOperation())
+      break;
+    if (slice.contains(&operation))
+      ordered.push_back(&operation);
+  }
+  for (mlir::Operation *operation : ordered)
+    operation->moveBefore(firstExternalUser);
+}
+
 std::optional<size_t> axisPosition(riscv::ValueType value, int64_t axis) {
   auto found = llvm::find(value.getAxisIds().asArrayRef(), axis);
   if (found == value.getAxisIds().asArrayRef().end())
@@ -3296,6 +3355,53 @@ bool hasGappedIndexedWindowRoot(mlir::Value value, int64_t windowAxis) {
   return hasGappedIndexedWindowRoot(value, windowAxis, visited);
 }
 
+bool hasIndexedLookupSupply(mlir::Value value,
+                            llvm::DenseSet<mlir::Operation *> &visited) {
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return false;
+  if (mlir::isa<riscv::LookupOp, riscv::RVVIndexedEntryLoadOp>(definition))
+    return true;
+  return llvm::any_of(definition->getOperands(), [&](mlir::Value operand) {
+    return mlir::isa<riscv::ValueType>(operand.getType()) &&
+           hasIndexedLookupSupply(operand, visited);
+  });
+}
+
+bool hasIndexedLookupSupply(mlir::Value value) {
+  llvm::DenseSet<mlir::Operation *> visited;
+  return hasIndexedLookupSupply(value, visited);
+}
+
+void collectConcreteFieldSupplies(
+    mlir::Value value, llvm::SmallPtrSetImpl<mlir::Operation *> &supplies,
+    llvm::SmallPtrSetImpl<mlir::Operation *> &visited) {
+  mlir::Operation *definition = value.getDefiningOp();
+  if (!definition || !visited.insert(definition).second)
+    return;
+  if (mlir::isa<riscv::FieldOp>(definition)) {
+    supplies.insert(definition);
+    return;
+  }
+  if (definition->getNumRegions() != 0)
+    return;
+  for (mlir::Value operand : definition->getOperands())
+    if (mlir::isa<riscv::ValueType>(operand.getType()))
+      collectConcreteFieldSupplies(operand, supplies, visited);
+}
+
+bool sharesConcreteFieldSupply(mlir::Value lhs, mlir::Value rhs) {
+  llvm::SmallPtrSet<mlir::Operation *, 8> lhsSupplies;
+  llvm::SmallPtrSet<mlir::Operation *, 8> rhsSupplies;
+  llvm::SmallPtrSet<mlir::Operation *, 32> lhsVisited;
+  llvm::SmallPtrSet<mlir::Operation *, 32> rhsVisited;
+  collectConcreteFieldSupplies(lhs, lhsSupplies, lhsVisited);
+  collectConcreteFieldSupplies(rhs, rhsSupplies, rhsVisited);
+  return llvm::any_of(lhsSupplies, [&](mlir::Operation *supply) {
+    return rhsSupplies.contains(supply);
+  });
+}
+
 std::optional<riscv::ValueType>
 coalescePartialOperand(mlir::Builder &builder, riscv::ValueType source,
                        llvm::ArrayRef<int64_t> partialAxes,
@@ -3699,9 +3805,22 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
                       : mlir::cast<riscv::PartialSetType>(
                             mlir::cast<mlir::TypeAttr>(combineSetTypes.back())
                                 .getValue());
+  const bool scaleSharesLhs =
+      hasIndexedLookupSupply(dot.getLhs()) &&
+      sharesConcreteFieldSupply(match.scale, dot.getLhs());
+  const bool scaleSharesRhs =
+      hasIndexedLookupSupply(dot.getRhs()) &&
+      sharesConcreteFieldSupply(match.scale, dot.getRhs());
+  const llvm::StringRef scaleSupplyStage =
+      *outputReplicaCount == 1 && (scaleSharesLhs || scaleSharesRhs)
+          ? "after-partial-reduce"
+          : "before-product";
   const int64_t operandAndProduct =
       issueLhs.getLayout().getRegisterGroups() +
-      issueRhs.getLayout().getRegisterGroups() + sourceSet.getResourceGroups();
+      issueRhs.getLayout().getRegisterGroups() + sourceSet.getResourceGroups() +
+      (scaleSupplyStage == "before-product"
+           ? issueScale.getLayout().getRegisterGroups()
+           : 0);
   const int64_t repackAndReduce =
       sourceSet.getResourceGroups() + reducedSet.getResourceGroups();
   const int64_t reduceAndScale =
@@ -3724,6 +3843,15 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
     return std::nullopt;
   const int64_t issueUnroll =
       std::min<int64_t>(dot.getPartialUnroll(), issueStreams);
+  llvm::SmallVector<int64_t> issueMaterializationOrder{0, 1, 2};
+  if (scaleSharesRhs && !scaleSharesLhs)
+    issueMaterializationOrder =
+        *outputReplicaCount == 1 ? llvm::SmallVector<int64_t>{1, 0, 2}
+                                 : llvm::SmallVector<int64_t>{1, 2, 0};
+  else if (scaleSharesLhs && !scaleSharesRhs)
+    issueMaterializationOrder =
+        *outputReplicaCount == 1 ? llvm::SmallVector<int64_t>{0, 1, 2}
+                                 : llvm::SmallVector<int64_t>{0, 2, 1};
   auto scaleParts = riscv_internal::staticProduct(
       scaleReplicaType.getLayout().getReplicaFactors().asArrayRef());
   llvm::DenseSet<mlir::Operation *> visited;
@@ -3741,6 +3869,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       riscv_internal::integers(builder, partialAxisExtents), partialSlots,
       issueUnroll,
       riscv_internal::integers(builder, outputAxes), *outputReplicaCount,
+      riscv_internal::integers(builder, issueMaterializationOrder),
       riscv_internal::integers(builder, lhsSourceParts),
       riscv_internal::integers(builder, rhsSourceParts),
       riscv_internal::integers(builder, lhsLaneOffsets),
@@ -3751,6 +3880,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       scaleCombinedSet, builder.getArrayAttr(combineSetTypes),
       riscv_internal::integers(builder, combineAxes),
       riscv_internal::integers(builder, combineArities), scaleSupply,
+      scaleSupplyStage,
       *multiplyInstruction, "rvv.partial-reduce.widen", *finalizeInstruction,
       resources);
 }
@@ -5580,6 +5710,8 @@ public:
         diagnostic << user->getName().getStringRef() << " ";
     });
     llvm::SmallVector<mlir::Value> nestedDeadRoots;
+    llvm::SmallVector<std::pair<mlir::scf::ForOp, mlir::Value>>
+        deferredPostLoopScales;
     for (riscv::ReduceOp reduce : nestedScaledReductions) {
       if (!reduce || !reduce->getBlock())
         continue;
@@ -5744,18 +5876,42 @@ public:
                                 loop.getInductionVar(), target, rewriter,
                                 clones);
       };
-      auto lhsSlice = materializeIssueOperand(dot.getLhs(), issueLhsType);
-      auto rhsSlice = materializeIssueOperand(dot.getRhs(), issueRhsType);
-      auto lhsType = mlir::succeeded(lhsSlice)
-                         ? mlir::dyn_cast<riscv::ValueType>((*lhsSlice).getType())
+      const bool deferScale =
+          nestedPlan.getScaleSupplyStage() == "after-partial-reduce";
+      std::optional<mlir::Value> lhsSlice;
+      std::optional<mlir::Value> rhsSlice;
+      std::optional<mlir::Value> earlyScaleSlice;
+      for (int64_t supply :
+           nestedPlan.getIssueMaterializationOrder().asArrayRef()) {
+        if (supply == 2 && deferScale)
+          continue;
+        auto slice = supply == 0
+                         ? materializeIssueOperand(dot.getLhs(), issueLhsType)
+                     : supply == 1
+                         ? materializeIssueOperand(dot.getRhs(), issueRhsType)
+                         : cloneIssueWindow(match->scale, windowAxis,
+                                            windowExtent,
+                                            loop.getInductionVar(), target,
+                                            rewriter, clones);
+        if (mlir::failed(slice))
+          break;
+        if (supply == 0)
+          lhsSlice = *slice;
+        else if (supply == 1)
+          rhsSlice = *slice;
+        else
+          earlyScaleSlice = *slice;
+      }
+      auto lhsType = lhsSlice
+                         ? mlir::dyn_cast<riscv::ValueType>(lhsSlice->getType())
                          : riscv::ValueType();
-      auto rhsType = mlir::succeeded(rhsSlice)
-                         ? mlir::dyn_cast<riscv::ValueType>((*rhsSlice).getType())
+      auto rhsType = rhsSlice
+                         ? mlir::dyn_cast<riscv::ValueType>(rhsSlice->getType())
                          : riscv::ValueType();
-      if (mlir::failed(lhsSlice) || mlir::failed(rhsSlice) || !lhsType ||
-          !rhsType) {
+      if (!lhsSlice || !rhsSlice || !lhsType || !rhsType ||
+          (!deferScale && !earlyScaleSlice)) {
         dot.emitError(
-            "nested issue-window cloning did not produce typed RVV operands; lhs=")
+            "nested issue-window cloning did not produce its planned supplies; lhs=")
             << lhsType << ", planned_lhs=" << issueLhsType
             << ", rhs=" << rhsType << ", planned_rhs=" << issueRhsType;
         rewriter.eraseOp(loop);
@@ -5780,55 +5936,46 @@ public:
           materializeIssueLayout(*lhsSlice, lhsType, issueLhsType);
       mlir::Value issueRhs =
           materializeIssueLayout(*rhsSlice, rhsType, issueRhsType);
-      auto scale = cloneIssueWindow(match->scale, windowAxis, windowExtent,
-                                    loop.getInductionVar(), target, rewriter,
-                                    clones);
-      auto scaleSourceType =
-          mlir::succeeded(scale)
-              ? mlir::dyn_cast<riscv::ValueType>((*scale).getType())
-              : riscv::ValueType();
-      if (mlir::failed(scale) || !scaleSourceType) {
-        dot.emitError(
-            "nested issue-window materialization rejected its planned scale supply");
-        rewriter.eraseOp(loop);
-        failed = true;
-        continue;
-      }
-      mlir::Value scalarScale;
-      if (nestedPlan.getScaleSupply() == "scalar-rematerialize") {
-        llvm::DenseMap<mlir::Value, mlir::Value> rematerialized;
-        auto rematerializedScale =
-            rematerializeScalarReplicas(*scale, rewriter, rematerialized);
-        if (mlir::failed(rematerializedScale) ||
-            (*rematerializedScale).getType() != scaleReplicaType) {
+      auto materializeScaleReplica = [&](mlir::Value scale)
+          -> mlir::FailureOr<mlir::Value> {
+        auto sourceType = mlir::dyn_cast<riscv::ValueType>(scale.getType());
+        if (!sourceType)
+          return mlir::failure();
+        if (nestedPlan.getScaleSupply() == "scalar-rematerialize") {
+          llvm::DenseMap<mlir::Value, mlir::Value> rematerialized;
+          auto rematerializedScale =
+              rematerializeScalarReplicas(scale, rewriter, rematerialized);
+          if (mlir::failed(rematerializedScale) ||
+              (*rematerializedScale).getType() != scaleReplicaType)
+            return mlir::failure();
+          llvm::DenseSet<mlir::Value> stops{*rematerializedScale};
+          llvm::DenseSet<mlir::Operation *> candidates;
+          collectDeadChainCandidates(scale, stops, candidates);
+          sweepDeadChainCandidates(candidates, rewriter);
+          return *rematerializedScale;
+        }
+        if (sourceType == scaleReplicaType)
+          return scale;
+        auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
+            reduce.getLoc(), scaleReplicaType, scale,
+            riscv_internal::layoutConversion(rewriter, sourceType.getLayout(),
+                                             scaleReplicaType.getLayout()),
+            riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+        if (mlir::Operation *definition = scale.getDefiningOp())
+          riscv_internal::copyOrigin(definition, conversion);
+        return conversion.getResult();
+      };
+      std::optional<mlir::Value> scalarScale;
+      if (!deferScale) {
+        auto materializedScale = materializeScaleReplica(*earlyScaleSlice);
+        if (mlir::failed(materializedScale)) {
           dot.emitError(
-              "nested carrier materialization disagrees with its selected scalar scale supply");
+              "nested carrier materialization disagrees with its selected scale supply");
           rewriter.eraseOp(loop);
           failed = true;
           continue;
         }
-        scalarScale = *rematerializedScale;
-        llvm::DenseSet<mlir::Value> stops;
-        // A pure layout conversion may rematerialize to an existing scalar
-        // producer from the old scale chain.  Keep that selected SSA owner
-        // alive while deleting the now-dead vector representation; otherwise
-        // the scale-combine op below would receive a dangling Value.
-        stops.insert(scalarScale);
-        llvm::DenseSet<mlir::Operation *> candidates;
-        collectDeadChainCandidates(*scale, stops, candidates);
-        sweepDeadChainCandidates(candidates, rewriter);
-      } else if (scaleSourceType == scaleReplicaType) {
-        scalarScale = *scale;
-      } else {
-        auto conversion = rewriter.create<riscv::ConvertLayoutOp>(
-            reduce.getLoc(), scaleReplicaType, *scale,
-            riscv_internal::layoutConversion(rewriter,
-                                             scaleSourceType.getLayout(),
-                                             scaleReplicaType.getLayout()),
-            riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
-        if (mlir::Operation *definition = (*scale).getDefiningOp())
-          riscv_internal::copyOrigin(definition, conversion);
-        scalarScale = conversion.getResult();
+        scalarScale = *materializedScale;
       }
       const int64_t reductionAxis = sourceSetType.getReductionAxis();
       auto zeroOperand = rewriter.getDenseI64ArrayAttr({0});
@@ -5888,8 +6035,25 @@ public:
                 reducedSetType.getResourceGroups(), 1, 0, "none", "exact",
                 {reductionAxis, partialSlots}));
         riscv_internal::copyOrigin(dot, partialReduced);
+        if (!scalarScale) {
+          llvm::DenseMap<mlir::Value, mlir::Value> deferredScaleClones;
+          auto scale = cloneIssueWindow(
+              match->scale, windowAxis, windowExtent, loop.getInductionVar(),
+              target, rewriter, deferredScaleClones);
+          auto materializedScale =
+              mlir::succeeded(scale)
+                  ? materializeScaleReplica(*scale)
+                  : mlir::FailureOr<mlir::Value>(mlir::failure());
+          if (mlir::failed(materializedScale)) {
+            dot.emitError(
+                "nested carrier could not materialize its deferred scale supply");
+            failed = true;
+            break;
+          }
+          scalarScale = *materializedScale;
+        }
         llvm::SmallVector<mlir::Value> scales(
-            static_cast<size_t>(partialSlots), scalarScale);
+            static_cast<size_t>(partialSlots), *scalarScale);
         auto combined = rewriter.create<riscv::RVVPartialScaleCombineOp>(
             reduce.getLoc(), scaleCombinedSetType, partialReduced.getResult(),
             scales, scaleParts, rewriter.getDenseI64ArrayAttr(windowOrder),
@@ -5962,6 +6126,8 @@ public:
         replacement = loop.getResult(0);
       }
       reduce.getResult().replaceAllUsesWith(replacement);
+      if (!match->scale.hasOneUse())
+        deferredPostLoopScales.emplace_back(loop, match->scale);
       rewriter.eraseOp(reduce);
     }
     llvm::DenseSet<mlir::Value> nestedCleanupStops;
@@ -5970,6 +6136,8 @@ public:
       collectDeadChainCandidates(root, nestedCleanupStops,
                                  nestedCleanupCandidates);
     sweepDeadChainCandidates(nestedCleanupCandidates, rewriter);
+    for (auto [loop, scale] : deferredPostLoopScales)
+      placePureSliceAtFirstPostLoopUse(loop, scale);
 
     llvm::SmallVector<riscv::ReduceOp> replicaPartialReductions;
     llvm::SmallVector<mlir::Value> replicaCleanupRoots;

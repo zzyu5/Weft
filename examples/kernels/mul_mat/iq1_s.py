@@ -30,42 +30,40 @@ def production_mul_mat_iq1_s(
                         payload = wl.iota(8, dtype=wl.u16, axis="payload")
                         main = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
                         correction = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
-                        group_index = wl.index(0)
-                        with wl.L.subs(kb, extent=32) as group:
-                            metadata = wl.widen(w.qh[:, group_index], wl.u32)
-                            scale = wl.i32(
-                                (metadata >> wl.u32(12) & wl.u32(7)) * wl.u32(2)
-                                + wl.u32(1)
-                            )
-                            grid_index = wl.widen(
-                                w.q[:, group_index * wl.index(4) + entry], wl.u32
-                            ) | (metadata >> entry * wl.u32(3) & wl.u32(7)) << wl.u32(8)
-                            weight = wl.lookup(
-                                grid_values,
-                                grid_index * wl.u32(8) + payload,
-                                bounds="in_bounds",
-                            )
-                            activation = x.q[
-                                :,
-                                group_index * wl.index(32)
-                                + entry * wl.u32(8)
-                                + wl.u32(payload),
-                            ]
-                            group_sum = wl.contract(
-                                activation,
-                                weight,
-                                over=("entry", "payload"),
-                                acc=wl.i32,
-                            )
-                            main += scale * group_sum
-                            delta = wl.i32(1) - wl.i32(
-                                metadata >> wl.u32(15) & wl.u32(1)
-                            ) * wl.i32(2)
-                            bsum = wl.i32(x.bsum[:, group_index * wl.index(2)]) + wl.i32(
-                                x.bsum[:, group_index * wl.index(2) + wl.index(1)]
-                            )
-                            correction += bsum * scale * delta
-                            group_index += wl.index(1)
+                        group = wl.iota(8, dtype=wl.u32, axis="group")
+                        metadata = wl.widen(w.qh[:, group], wl.u32)
+                        scale = wl.i32(
+                            (metadata >> wl.u32(12) & wl.u32(7)) * wl.u32(2)
+                            + wl.u32(1)
+                        )
+                        grid_index = wl.widen(
+                            w.q[:, group * wl.u32(4) + entry], wl.u32
+                        ) | (metadata >> entry * wl.u32(3) & wl.u32(7)) << wl.u32(8)
+                        weight = wl.lookup(
+                            grid_values,
+                            grid_index * wl.u32(8) + payload,
+                            bounds="in_bounds",
+                        )
+                        activation = x.q[
+                            :,
+                            group * wl.u32(32)
+                            + entry * wl.u32(8)
+                            + wl.u32(payload),
+                        ]
+                        group_sum = wl.contract(
+                            activation,
+                            weight,
+                            over=("entry", "payload"),
+                            acc=wl.i32,
+                        )
+                        main += wl.reduce(scale * group_sum, axis="group")
+                        delta = wl.i32(1) - wl.i32(
+                            metadata >> wl.u32(15) & wl.u32(1)
+                        ) * wl.i32(2)
+                        bsum = wl.i32(x.bsum[:, group * wl.u32(2)]) + wl.i32(
+                            x.bsum[:, group * wl.u32(2) + wl.u32(1)]
+                        )
+                        correction += wl.reduce(bsum * scale * delta, axis="group")
                         combined = wl.f32(main) + wl.f32(0.125) * wl.f32(correction)
                         acc += wl.f32(w.d) * wl.f32(x.ds) * combined
                     wl.commit(acc, Y[mb, nb])

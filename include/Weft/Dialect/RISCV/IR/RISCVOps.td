@@ -325,6 +325,7 @@ def WeftRISCV_NestedPartialPlanAttr
     "int64_t":$issueUnroll,
     "::mlir::DenseI64ArrayAttr":$outputAxes,
     "int64_t":$outputReplicas,
+    "::mlir::DenseI64ArrayAttr":$issueMaterializationOrder,
     "::mlir::DenseI64ArrayAttr":$lhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$rhsSourceParts,
     "::mlir::DenseI64ArrayAttr":$lhsLaneOffsets,
@@ -344,6 +345,7 @@ def WeftRISCV_NestedPartialPlanAttr
     "::mlir::DenseI64ArrayAttr":$combineAxes,
     "::mlir::DenseI64ArrayAttr":$combineArities,
     StringRefParameter<"selected scale supply form">:$scaleSupply,
+    StringRefParameter<"selected scale supply stage">:$scaleSupplyStage,
     StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
     StringRefParameter<"selected partial reduction instruction">:$reduceInstruction,
     StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
@@ -354,6 +356,7 @@ def WeftRISCV_NestedPartialPlanAttr
         $partialAxes `,`
         $partialAxisExtents `,` $partialSlots `,` $issueUnroll `,`
         $outputAxes `,` $outputReplicas `,`
+        $issueMaterializationOrder `,`
         $lhsSourceParts `,`
         $rhsSourceParts `,` $lhsLaneOffsets `,` $rhsLaneOffsets `,`
         $scaleReplicas `,`
@@ -362,6 +365,7 @@ def WeftRISCV_NestedPartialPlanAttr
         $sourceSetType `,` $repackedSetType `,` $reducedSetType `,`
         $scaleCombinedSetType `,` $combineSetTypes `,`
         $combineAxes `,` $combineArities `,` $scaleSupply `,`
+        $scaleSupplyStage `,`
         $multiplyInstruction `,`
         $reduceInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
   }];

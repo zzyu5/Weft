@@ -320,7 +320,16 @@ bool preservesExistingAxes(mlir::Type sourceType, mlir::Type resultType) {
 
 bool feedsExpandedIndexedLookup(mlir::Value root) {
   auto rootType = mlir::dyn_cast<riscv::ValueType>(root.getType());
-  if (!rootType || rootType.getAxisIds().size() != 1)
+  if (!rootType)
+    return false;
+  int64_t nonSingletonAxes = 0;
+  for (int64_t axis : rootType.getAxisIds().asArrayRef()) {
+    const int64_t extent = riscv_internal::physicalExtent(root, axis);
+    if (extent <= 0)
+      return false;
+    nonSingletonAxes += extent > 1;
+  }
+  if (nonSingletonAxes != 1)
     return false;
   llvm::SmallVector<mlir::Value> worklist{root};
   llvm::SmallPtrSet<mlir::Operation *, 32> visited;
@@ -381,8 +390,8 @@ downstreamImmediateReducedFreeAxis(mlir::Operation *contraction,
       if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
         continue;
       auto result = mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
-      if (!result || result.getShape() != source.getShape() ||
-          result.getAxisIds() != source.getAxisIds())
+      if (!result ||
+          !preservesExistingAxes(value.getType(), user->getResult(0).getType()))
         continue;
       worklist.push_back(user->getResult(0));
     }
@@ -422,8 +431,8 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
         continue;
       auto result =
           mlir::dyn_cast<riscv::ValueType>(user->getResult(0).getType());
-      if (!result || result.getShape() != source.getShape() ||
-          result.getAxisIds() != source.getAxisIds())
+      if (!result ||
+          !preservesExistingAxes(value.getType(), user->getResult(0).getType()))
         continue;
       worklist.push_back(user->getResult(0));
     }

@@ -1733,7 +1733,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     mlir::DenseI64ArrayAttr partialAxes,
     mlir::DenseI64ArrayAttr partialAxisExtents, int64_t partialSlots,
     int64_t issueUnroll, mlir::DenseI64ArrayAttr outputAxes,
-    int64_t outputReplicas, mlir::DenseI64ArrayAttr lhsSourceParts,
+    int64_t outputReplicas, mlir::DenseI64ArrayAttr issueMaterializationOrder,
+    mlir::DenseI64ArrayAttr lhsSourceParts,
     mlir::DenseI64ArrayAttr rhsSourceParts,
     mlir::DenseI64ArrayAttr lhsLaneOffsets,
     mlir::DenseI64ArrayAttr rhsLaneOffsets,
@@ -1745,7 +1746,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     mlir::Type reducedSetType, mlir::Type scaleCombinedSetType,
     mlir::ArrayAttr combineSetTypes, mlir::DenseI64ArrayAttr combineAxes,
     mlir::DenseI64ArrayAttr combineArities,
-    llvm::StringRef scaleSupply, llvm::StringRef multiplyInstruction,
+    llvm::StringRef scaleSupply, llvm::StringRef scaleSupplyStage,
+    llvm::StringRef multiplyInstruction,
     llvm::StringRef reduceInstruction,
     llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
   auto issueLhs = mlir::dyn_cast<weft::riscv::ValueType>(issueLhsType);
@@ -1801,9 +1803,16 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       windowPosition != partialAxes.asArrayRef().end() &&
       partialAxisExtents[static_cast<size_t>(
           windowPosition - partialAxes.asArrayRef().begin())] == windowExtent;
+  llvm::SmallVector<int64_t> sortedIssueMaterializationOrder(
+      issueMaterializationOrder.asArrayRef().begin(),
+      issueMaterializationOrder.asArrayRef().end());
+  llvm::sort(sortedIssueMaterializationOrder);
+  const bool issueMaterializationOrderLegal =
+      sortedIssueMaterializationOrder == llvm::SmallVector<int64_t>({0, 1, 2});
   if (windowAxis <= 0 || issueStreams <= 0 || windowExtent <= 0 ||
       !partialAxesLegal || !windowExtentLegal ||
       computedPartialSlots != partialSlots ||
+      !issueMaterializationOrderLegal ||
       !combineSetTypesLegal ||
       combineSets.size() != combineAxes.size() ||
       combineSets.size() != combineArities.size() ||
@@ -1822,6 +1831,11 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       scaleSupply != "scalar-rematerialize")
     return emitError()
            << "nested partial plan requires one selected scale supply form";
+  if ((scaleSupplyStage != "before-product" &&
+       scaleSupplyStage != "after-partial-reduce") ||
+      (scaleSupplyStage == "after-partial-reduce" && outputReplicas != 1))
+    return emitError()
+           << "nested partial plan requires one scale stage consistent with output multiplicity";
   if (issueLhs.getLayout().getCarrier() != "rvv" ||
       issueRhs.getLayout().getCarrier() != "rvv" ||
       sourceSlot.getLayout().getCarrier() != "rvv" ||
@@ -5979,6 +5993,21 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
         }
     auto expectedOutputReplicas =
         checkedPositiveProduct(expectedOutputReplicaFactors);
+    llvm::SmallVector<int64_t> plannedOutputAxes(
+        nestedPartialPlan.getOutputAxes().asArrayRef().begin(),
+        nestedPartialPlan.getOutputAxes().asArrayRef().end());
+    llvm::SmallVector<int64_t> topologyOutputAxes(
+        getPartialTopology().getOutputAxes().asArrayRef().begin(),
+        getPartialTopology().getOutputAxes().asArrayRef().end());
+    llvm::SmallVector<int64_t> sortedExpectedOutputAxes(expectedOutputAxes);
+    const bool topologyAndPlanAgree =
+        plannedOutputAxes == topologyOutputAxes;
+    llvm::sort(plannedOutputAxes);
+    llvm::sort(topologyOutputAxes);
+    llvm::sort(sortedExpectedOutputAxes);
+    const bool outputAxesClosed =
+        topologyAndPlanAgree && plannedOutputAxes == sortedExpectedOutputAxes &&
+        topologyOutputAxes == sortedExpectedOutputAxes;
     layoutPlanClosed &= axesPresent && issueLhs && issueRhs && sourceSet;
     if (layoutPlanClosed) {
       const size_t lhsPosition = static_cast<size_t>(
@@ -6043,11 +6072,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
           closesIssuePartition(lhs, issueLhs, lhsPosition) &&
           closesIssuePartition(rhs, issueRhs, rhsPosition) &&
           expectedOutputReplicas &&
-          nestedPartialPlan.getOutputAxes().asArrayRef() ==
-              llvm::ArrayRef<int64_t>(expectedOutputAxes) &&
+          outputAxesClosed &&
           nestedPartialPlan.getOutputReplicas() == *expectedOutputReplicas &&
-          getPartialTopology().getOutputAxes().asArrayRef() ==
-              llvm::ArrayRef<int64_t>(expectedOutputAxes) &&
           getPartialTopology().getOutputReplicas() == *expectedOutputReplicas &&
           getPartialTopology().getPartialAxes().asArrayRef() ==
               nestedPartialPlan.getPartialAxes().asArrayRef() &&
