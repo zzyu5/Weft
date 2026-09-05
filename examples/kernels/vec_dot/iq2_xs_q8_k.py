@@ -17,12 +17,12 @@ def quantized_vec_dot_iq2_xs_q8_k(
     sumf = wl.f32(0.0)
     grid_values = grid.values
     sign_values = signs.values
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
-        scale_group = wl.iota(16, dtype=wl.u32, axis="scale_group")
-        entry = wl.iota(2, dtype=wl.u32, axis="entry")
-        payload = wl.iota(8, dtype=wl.u16, axis="payload")
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
+        scale_group = wl.arange(0, 16, dtype=wl.u32, axis="scale_group")
+        entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
+        payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
         linear_entry = scale_group * wl.u32(2) + entry
         entry_offset = scale_group * wl.u32(16) + entry * wl.u32(8)
         block_sum = qf.iq2_xs_entry_reduce(
@@ -35,4 +35,4 @@ def quantized_vec_dot_iq2_xs_q8_k(
             payload,
         )
         sumf += wl.f32(w.d) * wl.f32(x.ds) * wl.f32(block_sum)
-    wl.commit(wl.f32(0.125) * sumf, Y[0])
+    wl.store(Y[0], wl.f32(0.125) * sumf)

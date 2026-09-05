@@ -14,20 +14,20 @@ def production_mul_mat_iq4_xs(
     codebook: wl.View[wl.i8, (16,)],
     Y: wl.View[wl.f32, (M, N)],
 ):
-    table = wl.materialize(wl.admit(codebook))
+    table = wl.stage(wl.load(codebook))
     quant_q8_k.quantize_matrix(X, Xq)
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        wp = wl.materialize(wl.admit(W[nc]))
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            xp = wl.materialize(wl.admit(Xq[mc]))
-            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
-                    with wl.L.blocks(K, extent=256) as kb:
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.stage(wl.load(W[nc]))
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.stage(wl.load(Xq[mc]))
+            with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.state(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.level.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
                         sub_index = wl.index(0)
-                        with wl.L.subs(kb, extent=32) as sub:
+                        with wl.level.subtiles(kb, extent=32) as sub:
                             low = wl.u32(w.scales_l[:, sub_index // wl.index(2)])
                             shift = sub_index % wl.index(2) * wl.index(4)
                             scale_low = low >> wl.u32(shift) & wl.u32(15)
@@ -38,9 +38,7 @@ def production_mul_mat_iq4_xs(
                                 scale_low | scale_high << wl.u32(4)
                             ) - wl.i32(32)
                             q = wl.lookup(table, wl.u8(w.q[:, sub]), bounds="in_bounds")
-                            integer = wl.outer_contract(
-                                x.q[:, sub], q, over="k", acc=wl.i32
-                            )
+                            integer = wl.dot(x.q[:, sub], q, over="k", acc_dtype=wl.i32)
                             acc += (
                                 wl.f32(w.d)
                                 * wl.f32(x.ds)
@@ -48,4 +46,4 @@ def production_mul_mat_iq4_xs(
                                 * wl.widen(integer, wl.f32)
                             )
                             sub_index += wl.index(1)
-                    wl.commit(acc, Y[mb, nb])
+                    wl.store(Y[mb, nb], acc)

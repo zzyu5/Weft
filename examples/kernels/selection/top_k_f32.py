@@ -8,8 +8,8 @@ import weft.language as wl
 
 @weft.kernel
 def top_k_f32(X: wl.View[wl.f32, (N,)], out: wl.View[wl.i32, (K_,)]):
-    heap = wl.new(wl.f32, [K_], init=-inf)
-    idx = wl.new(wl.i32, [K_], init=-1)
+    heap = wl.state(wl.f32, [K_], init=-inf)
+    idx = wl.state(wl.i32, [K_], init=-1)
     for i in range(N):
         score = X[i]
         if score > heap[K_ - 1]:
@@ -24,4 +24,4 @@ def top_k_f32(X: wl.View[wl.f32, (N,)], out: wl.View[wl.i32, (K_,)]):
                 idx[j] = idx[j - 1]
             heap[pos] = score
             idx[pos] = wl.i32(i)
-    wl.commit(idx, out)
+    wl.store(out, idx)

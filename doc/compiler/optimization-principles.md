@@ -58,7 +58,7 @@ layout、validity 与 effect。地址在运行时偶尔别名，不等于 SSA pr
   bytes，仍不能说明 decode/index 工作减少。
 
 对应参考机制：Triton `RemoveLayoutConversions.cpp:1044-1078` 比较 conversion 与
-rematerialization 的真实成本；TileLang `layout_cost_model.cc:55-92` 计算 global-memory
+rematerialization 的估计成本；TileLang `layout_cost_model.cc:55-92` 计算 global-memory
 segment bytes 与 issue-equivalent bytes。二者都不是“出现某种 IR 名称就认为更快”。
 
 ## 3. P1：载体归属
@@ -115,12 +115,12 @@ logical axis 是否存在、是否是普通 scalar loop，归作者；同一 sha
 必须把 Python 展开的标量循环重新发明成 axis，
 应停止并修改 std tree，而不是增加 matcher。
 
-target 可以决定同一 canonical tree 的 LMUL、VL、lane/time 分解、auto 参数、memory
+target 可以决定同一 canonical tree 的 LMUL、VL、lane/time 分解、physical 参数、memory
 instruction、partial topology、pipeline 以及 RVV/IME realization。target 不能决定是否存在
 logical axis、选择 scalar tree 还是 shaped tree、替换 std function、改变 reduction 结构，或
 改变 Value/Level 集合。后几项一旦不同，就是不同作者程序；不能以 VLEN、target 名称或
 实现能力作为 source-level 分支条件。多个确实不同的数值程序若都需要保留，由调用方以
-entry 身份显式选择，tuner 只能选择同一程序的参数性物理实例。
+entry 身份显式选择。tuner 可以枚举作者声明的 source 参数及 target 声明的有限物理结构与参数，但必须分别记录候选来源；物理比较固定已经实例化的 canonical tree。
 
 Triton 的对应机制不是“SIMT 总工作固定”。`OptimizeThreadLocality.cpp:106-176` 会重分配
 thread/warp ownership以减少 shuffle；`AccelerateMatmul.cpp:86-145,449-485` 会按 dot shape、
@@ -372,7 +372,7 @@ logical contraction 相同；若优化只提升 blocked prefill，或只在某�
 
 ```text
 它删除或合并哪些动态工作？静态上限是多少？
-它依赖哪些typed facts？第二个独立input在哪里？
+它依赖哪些typed facts？有哪些独立输入证据，尚未覆盖哪些关系？
 它是否改变logical values、Level、widening或artifact？
 它增加多少live register/local/fragment资源？
 收益应在IR、C和assembly的哪个计数上出现？
@@ -383,10 +383,52 @@ logical contraction 相同；若优化只提升 blocked prefill，或只在某�
 
 ## 10. 可证伪预测
 
-每个新机制必须在实现前把作者前置条件、主要瓶颈类别、预期可见计数和第二个独立输入写进
-当轮 report。实现后只追加 HIT/MISS 与反例，不能改写原预测来迁就结果。完成作者前置条件后，
+每个新机制在实现前应明确作者前置条件、主要瓶颈类别、预期可见计数及独立输入的证据范围。
+没有第二个现成格式不禁止实现一个合同闭合的关系，例如独立 half-byte projection；但一个
+正例只能证明该输入闭合，不能宣称跨格式泛化。不得为了一个 donor 把多种关系捆成带隐藏
+外围程序的大组合 op。预测与实测结果进入当轮 report，不能事后改写原预测来迁就结果。完成作者前置条件后，
 若已决项中主要分类有一半以上错误，这套分类应被视为事后归纳并重写。
 
 预测中的格式名只用于实验定位，不授权按格式名实现pass。真正的compiler规则仍必须以axis、
 storage geometry、use-def、effect、target facts和resources为输入。预测表、累计数字和待验证状态
 是可变实验事实，只进入`report/`，不进入本设计规范。
+
+## 11. 有限选择与成本估计
+
+合法性与性能排序分开。axis/数值/effect/alias/目标指令合同必须先成立，最终完整资源检查
+必须通过；任何估计分数或实测收益都不能覆盖它们。寄存器估计可以帮助排列候选，但不是
+最终 live-set 合法性的替代物。成本模型是可解释、可验证的启发式，不是硬件定理。
+
+target 可以声明少量完整的 memory、layout、partial、pack 或 schedule 候选，并以固定规则、
+分项成本排序或外部实测进行有限选择。每个选择点与整次编译必须有明确的候选/搜索上限，
+相同输入与配置具有确定的 tie-break。模型应公开采用的输入事实、分项估计和选择理由；
+缺少所需事实时拒绝该估计，不能用无依据的零值或默认分数掩盖未知成本。
+
+候选由作者/std 或 target 提供：前者的 source 参数可能实例化不同作者树；后者只改变固定
+作者树的物理表示。tuner 不发明程序树或任意物理结构，也不限于数字参数，可以绑定 target
+已声明的枚举策略。每个候选独立形成一份 Physical program，失败是该候选的可观察结果；
+外部继续编译另一个显式候选不等于在 pass/emitter 内静默 fallback。
+
+调优记录至少关联真实 source 文件/函数与 entry、输入表示和 shape、source bindings、target
+facts、physical bindings、候选来源与完整枚举域、估计分项、拒绝原因、数值结果、计时与
+winner。一个历史选定值、target 默认值或 production 手填值不自动等于完整候选域的 winner。
+配置放在 Python、C++ 或 shell 不改变这项归属与证据要求。
+
+普通 `for/while/if` 仍按当前语言合同保持有序标量控制。本节不授权从普通迭代发明 shaped
+axis，也不随成本政策调整 birth、alias、iteration identity 或 numerical boundary。
+
+## 12. 机械验收的证明范围
+
+parse/verify、指定的 canonicalization/CSE 和二次文本 diff 为零，只证明这个样本在实际
+重放的流程上稳定；必须注明样本、输入 artifact 边界和重放 pass 列表。它不证明全部 pass
+幂等、整个 pipeline 等价，也不证明生成 C 或 RISC-V 可执行程序数值正确。
+
+final kernel 的 `resources_materialized=true` 会使 layout canonicalization 跳过主要
+backward-rematerialization/layout-changing 分支，只保留不改变最终资源合同的 conversion
+CSE。因此 final IR 的稳定重放不能代表 resource closure 之前的改写已被重新执行和验证。
+若要检验某个实际 pass 的稳定性，必须从它适用的输入边界重放；真机数值 repro 仍是独立
+且必须完成的证据。
+
+pass 贡献只能来自固定作者树及其它 binding 下两份均合法的 Physical program，并实际运行
+对应 artifacts。关闭必需 lowering 后编译失败不是性能消融，也不能把多个相互依赖 pass 的
+联合收益拆成没有依据的贡献百分比。

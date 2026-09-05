@@ -14,19 +14,19 @@ def production_mul_mat_q5_1(
     Y: wl.View[wl.f32, (M, N)],
 ):
     quant_q8_1.quantize_matrix(X, Xq)
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        wp = wl.materialize(wl.admit(W[nc]))
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            xp = wl.materialize(wl.admit(Xq[mc]))
-            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
-                    with wl.L.blocks(K, extent=32) as kb:
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.stage(wl.load(W[nc]))
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.stage(wl.load(Xq[mc]))
+            with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.state(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.level.blocks(K, extent=32) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
                         q = wl.u8(w.q) | wl.u8(w.qh) << wl.u8(4)
-                        integer = wl.outer_contract(x.q, q, over="k", acc=wl.i32)
+                        integer = wl.dot(x.q, q, over="k", acc_dtype=wl.i32)
                         acc += wl.f32(w.d) * wl.f32(x.d) * wl.widen(
                             integer, wl.f32
                         ) + wl.f32(w.m) * wl.f32(x.s)
-                    wl.commit(acc, Y[mb, nb])
+                    wl.store(Y[mb, nb], acc)

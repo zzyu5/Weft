@@ -8,8 +8,8 @@ import weft.language as wl
 
 @weft.kernel
 def row_dequantize_q5_k(W: wl.View[ggml.Q5_K, (K,)], Y: wl.View[wl.f32, (K,)]):
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        with wl.L.subs(kb, extent=32) as sub:
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        with wl.level.subtiles(kb, extent=32) as sub:
             q = wl.i32(w.q[sub]) | wl.i32(w.qh[sub]) << wl.u32(4)
-            wl.commit(qf.k_superblock(q, w.sc[sub], w.d, w.m[sub], w.dmin), Y[kb][sub])
+            wl.store(Y[kb][sub], qf.k_superblock(q, w.sc[sub], w.d, w.m[sub], w.dmin))

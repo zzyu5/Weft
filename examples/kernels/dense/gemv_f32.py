@@ -8,9 +8,9 @@ import weft.language as wl
 def gemv_f32(
     W: wl.View[wl.f32, (M, K)], X: wl.View[wl.f32, (K,)], Y: wl.View[wl.f32, (M,)]
 ):
-    with wl.L.rows(M, group=wl.auto("MR")) as mb:
-        acc = wl.new(wl.f32, [MR], init=0)
-        with wl.L.blocks(K, extent=wl.auto("KB")) as kb:
-            x = wl.admit(X[kb])
-            acc += wl.contract(wl.admit(W[mb, kb]), x, over="k")
-        wl.commit(acc, Y[mb])
+    with wl.level.rows(M, group=wl.auto("MR")) as mb:
+        acc = wl.state(wl.f32, [MR], init=0)
+        with wl.level.blocks(K, extent=wl.auto("KB")) as kb:
+            x = wl.load(X[kb])
+            acc += wl.reduce_dot(wl.load(W[mb, kb]), x, over="k")
+        wl.store(Y[mb], acc)

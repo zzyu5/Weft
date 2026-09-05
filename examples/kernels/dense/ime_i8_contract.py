@@ -8,11 +8,9 @@ import weft.language as wl
 def ime_i8_contract(
     A: wl.View[wl.i8, (M, K)], B: wl.View[wl.i8, (K, N)], C: wl.View[wl.i32, (M, N)]
 ):
-    with wl.L.rows(M, group=wl.auto("MR")) as mb:
-        with wl.L.cols(N, group=wl.auto("NR")) as nb:
-            acc = wl.new(wl.i32, [MR, NR], init=0)
-            with wl.L.blocks(K, extent=wl.auto("KB")) as kb:
-                acc += wl.outer_contract(
-                    wl.admit(A[mb, kb]), wl.admit(B[kb, nb]), over="k", acc=wl.i32
-                )
-            wl.commit(acc, C[mb, nb])
+    with wl.level.rows(M, group=wl.auto("MR")) as mb:
+        with wl.level.cols(N, group=wl.auto("NR")) as nb:
+            acc = wl.state(wl.i32, [MR, NR], init=0)
+            with wl.level.blocks(K, extent=wl.auto("KB")) as kb:
+                acc += wl.dot(wl.load(A[mb, kb]), wl.load(B[kb, nb]), over="k", acc_dtype=wl.i32)
+            wl.store(C[mb, nb], acc)

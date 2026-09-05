@@ -11,11 +11,11 @@ def compute(
     X: wl.View[ggml.Q8_0, (K,)],
     codebook: wl.View[wl.i8, (16,)],
 ):
-    table = wl.materialize(wl.admit(codebook))
+    table = wl.stage(wl.load(codebook))
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
         integer = qf.dot_codebook32(w.q, x.q, table)
         result += wl.f32(x.d) * wl.f32(w.d) * wl.f32(integer)
     return result
@@ -28,4 +28,4 @@ def quantized_vec_dot_iq4_nl_q8_0(
     codebook: wl.View[wl.i8, (16,)],
     Y: wl.View[wl.f32, (1,)],
 ):
-    wl.commit(compute(W, X, codebook), Y[0])
+    wl.store(Y[0], compute(W, X, codebook))

@@ -19,9 +19,7 @@ def _iq2_xxs_group_products(w, x, grid, signs, entry_lane, codebook_lane, group)
     sign = wl.lookup(signs, sign_index * wl.u32(8) + codebook_lane, bounds="in_bounds")
     signed_weight = weight * sign
     activation = x.q[:, group * 32 + entry_lane * 8 + codebook_lane]
-    integer = wl.contract(
-        activation, signed_weight, over=("entry", "payload"), acc=wl.i32
-    )
+    integer = wl.reduce_dot(activation, signed_weight, over=("entry", "payload"), acc_dtype=wl.i32)
     scale = wl.i32((word1 >> wl.u32(28)) * wl.u32(2) + wl.u32(1))
     return integer * scale
 
@@ -38,22 +36,22 @@ def production_mul_mat_iq2_xxs_staged(
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
-            wl.commit(wl.f32(0.0), Y[row, column])
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        with wl.L.tiles(K, extent=wl.auto("KC")) as kc:
-            wp = wl.materialize(wl.admit(W[nc, kc]))
-            with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                        f32_acc = wl.new(wl.f32, [MR, NR], init=wl.admit(Y[mb, nb]))
-                        with wl.L.blocks(kc, extent=256) as kb:
+            wl.store(Y[row, column], wl.f32(0.0))
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        with wl.level.tiles(K, extent=wl.auto("KC")) as kc:
+            wp = wl.stage(wl.load(W[nc, kc]))
+            with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                        f32_acc = wl.state(wl.f32, [MR, NR], init=wl.load(Y[mb, nb]))
+                        with wl.level.blocks(kc, extent=256) as kb:
                             w = wp[nb, kb]
-                            x = wl.admit(Xq[mb, kb])
-                            entry_lane = wl.iota(4, axis="entry")
-                            codebook_lane = wl.iota(8, axis="payload")
-                            block_sum = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
+                            x = wl.load(Xq[mb, kb])
+                            entry_lane = wl.arange(0, 4, axis="entry")
+                            codebook_lane = wl.arange(0, 8, axis="payload")
+                            block_sum = wl.state(wl.i32, [MR, NR], init=wl.i32(0))
                             group_index = wl.index(0)
-                            with wl.L.subs(kb, extent=32) as group:
+                            with wl.level.subtiles(kb, extent=32) as group:
                                 group_partial = _iq2_xxs_group_products(
                                     w,
                                     x,
@@ -68,10 +66,10 @@ def production_mul_mat_iq2_xxs_staged(
                             f32_acc += (
                                 wl.f32(w.d) * wl.f32(x.ds) * wl.widen(block_sum, wl.f32)
                             )
-                        wl.commit(f32_acc, Y[mb, nb])
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                    value = wl.admit(Y[mb, nb])
-                    wl.commit(wl.f32(0.125) * value, Y[mb, nb])
+                        wl.store(Y[mb, nb], f32_acc)
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                    value = wl.load(Y[mb, nb])
+                    wl.store(Y[mb, nb], wl.f32(0.125) * value)

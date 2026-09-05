@@ -87,7 +87,7 @@ i8/u4 element products
 
 ## 3. 执行模型
 
-一个 Weft kernel 是一次普通函数调用中的完整有序程序。调用创建一份局部 SSA 执行上下文；普通语句、`for`、`while` 和 `if` 按程序顺序执行。
+一个 Weft kernel 是一次普通函数调用中的完整有序程序。调用创建一份局部 SSA 执行上下文；普通语句、`for`、`while` 和 `if` 按程序顺序执行。Level 的 `state/stage` 初始化先于其 body，初始化区域的可见性由 [Value 与 Level](../dsl/values-and-levels.md) 明确定义，不能把源文件中的混排误认为跨区域的数据依赖。
 
 语言没有隐式：
 
@@ -118,10 +118,10 @@ target profile 根据 canonical operation、typed operands、axes、Encoding、u
 
 ```text
 Encoding / View
-        ↓ admit、materialize
+        ↓ load、stage
 shaped Value + explicit numerical operations
-        ↓ Level births、carry、handoff
-commit / returned effect
+        ↓ Level 初始化、跨迭代更新与层结果
+store / returned effect
 ```
 
 ## 5. Core DSL、build config 与物理机器分层
@@ -161,7 +161,7 @@ core DSL 当前不定义 soft hint。若 build 要求必须使用 IME，使用 `
 | i16 partial 覆盖 2 项还是 4 项 | 改变 primitive、逻辑 partial 关系与溢出行为 |
 | accumulator 是一份还是四份源级 partial | 改变 canonical state 数量与合并位置 |
 | accumulator 跨 KC 还是跨整个 K | 改变状态诞生层、C 的读写频率与浮点累加顺序 |
-| `materialize` 位于 KC 还是 MC | 改变 staged Value 的诞生层、物化次数和复用域 |
+| `stage` 位于 KC 还是 MC | 改变 staged Value 的诞生层、物化次数和复用域 |
 | persistent interleave 是否存在 | 改变 artifact、ABI 和跨调用生命周期 |
 | 普通标量循环还是显式 shaped axis | 改变 canonical 逻辑域 |
 
@@ -194,10 +194,10 @@ core DSL 当前不定义 soft hint。若 build 要求必须使用 IME，使用 `
 | unit/strided/indexed/segment memory form | encoding mapping、pointer relation 与 consumer mapping |
 | 是否建立 invocation-local pack，以及 axis orientation、carrier、consumer handoff 与 local-storage/register/fragment 关系 | producer Encoding/address relation、all consumers、widening、pipeline、资源与 use-def |
 | shared、reload、rematerialize、spill 或 primitive-local pack | dominance、live interval、effect 与资源 |
-| sequential 或 local pipelined schedule、decode materialize 或 decode-compute fusion | Level 内依赖、alias、engine 与 target 能力 |
+| sequential 或 local pipelined schedule、decode stage 或 decode-compute fusion | Level 内依赖、alias、engine 与 target 能力 |
 | fragment family 与 value handoff 结构 | target operation contract 与跨 engine legality |
 
-Weft 不为这些结构建立静态 cost model，也不生成多个合法结构后做性能竞赛。每个 target profile 提供确定的规则和优先级；编译器按规则选择第一个满足语义、target 和资源约束的结构。较低优先级结构只在较高优先级结构不合法时使用，不能因为“可能更快”而隐式改走另一条路径。
+每个 target profile 提供明确、有界的结构候选与选择规则。多个候选合法时，可以使用固定优先级、可解释的分项成本或外部实测；成本不得覆盖数值、effect、target 或最终资源合法性。所选结构必须进入 Physical IR；编译或 emission 失败不能触发未记录的结构替换。搜索预算、估计与候选来源遵守[物理优化方法](../compiler/optimization-principles.md)。
 
 #### 6.2.3 参数性选择
 
@@ -210,7 +210,7 @@ Weft 不为这些结构建立静态 cost model，也不生成多个合法结构�
 | unroll | Level/local cluster |
 | pipeline depth / buffer count / prefetch distance | Level/local cluster 与 memory edge |
 
-目标可以为这些参数给出有限合法域；构建期 tuner 对具体 target 和 shape 实测这些绑定并选择 winner。每个绑定重新经过合法性与资源检查，非法绑定在 emission 前拒绝。tuner 不生成新的结构，也不改变 target 的结构优先级。
+目标为这些参数给出有限合法域；构建期 tuner 对具体 target 和 shape 实测绑定，每个绑定重新经过合法性与资源检查。除数字参数外，tuner 也可以绑定 target 显式声明的有限结构策略，但不能发明结构或暗改未公开的优先级。
 
 源语言中的 `auto` 是另一侧的有限参数域：它由作者或 std 声明，可能实例化不同 cohort、Level extent 或其它 source candidate。目标编译器不得发明这个域。source `auto` 与 target physical 参数可以由同一构建过程测量，但二者的语义归属不能混淆。
 
@@ -230,7 +230,7 @@ Weft 不为这些结构建立静态 cost model，也不生成多个合法结构�
 
 如果编译器把 `group=16` 的一个逻辑 cohort 改成四个源级 `group=4`：
 
-- `admit` 发生四次而不是一次；
+- `load` 发生四次而不是一次；
 - state 与 handoff 被复制四份；
 - staged value 的复用域变化；
 - effects 与浮点结合顺序可能变化。
@@ -283,8 +283,8 @@ Weft 选择暴露另一组事实：
 |---|---|
 | grid/thread binding | 无隐式 grid；普通调用中的逻辑 domain |
 | shared/local/fragment allocation | state/staged value 的逻辑生命周期与 Level 归属 |
-| copy source/destination storage scope | `admit/materialize/handoff/commit` 的供应关系 |
-| tile GEMM primitive | 由基本 contract/outer-contract 与 Level 写成的 std 函数 |
+| copy source/destination storage scope | `load/stage/store` 与普通赋值形成的供应关系 |
+| tile GEMM primitive | 由基本 dot/reduce_dot 与 Level 写成的 std 函数 |
 | 可显式给出 pipeline `num_stages`、stage/order | 只给 logical use-def；物理 local pipeline 由编译器实现 |
 | fragment/thread layout | shaped axis，无物理 owner |
 

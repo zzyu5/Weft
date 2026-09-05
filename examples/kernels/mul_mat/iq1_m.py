@@ -18,14 +18,14 @@ def production_mul_mat_iq1_m(
 ):
     quant_q8_k.quantize_matrix(X, Xq)
     grid_values = grid.values
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        wp = wl.materialize(wl.admit(W[nc]))
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            xp = wl.materialize(wl.admit(Xq[mc]))
-            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
-                    with wl.L.blocks(K, extent=256) as kb:
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.stage(wl.load(W[nc]))
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.stage(wl.load(Xq[mc]))
+            with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.state(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.level.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
 
@@ -38,10 +38,10 @@ def production_mul_mat_iq1_m(
                         scale_bits = scale_bits | sc3 & wl.u32(61440)
                         block_scale = qf.nonlinear_lookup(f16_bits, scale_bits)
 
-                        group = wl.iota(8, dtype=wl.u32, axis="group")
-                        scale_part = wl.iota(2, dtype=wl.u32, axis="scale_part")
-                        entry = wl.iota(2, dtype=wl.u32, axis="entry")
-                        payload = wl.iota(8, dtype=wl.u32, axis="payload")
+                        group = wl.arange(0, 8, dtype=wl.u32, axis="group")
+                        scale_part = wl.arange(0, 2, dtype=wl.u32, axis="scale_part")
+                        entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
+                        payload = wl.arange(0, 8, dtype=wl.u32, axis="payload")
                         qh = wl.widen(w.qh[:, group * wl.u32(2) + scale_part], wl.u32)
                         grid_index = wl.widen(
                             w.q[
@@ -64,12 +64,7 @@ def production_mul_mat_iq1_m(
                             + entry * wl.u32(8)
                             + payload,
                         ]
-                        dot = wl.contract(
-                            activation,
-                            weight,
-                            over=("entry", "payload"),
-                            acc=wl.i32,
-                        )
+                        dot = wl.reduce_dot(activation, weight, over=("entry", "payload"), acc_dtype=wl.i32)
                         scale_word = wl.widen(
                             w.scales[:, group // wl.u32(2) * wl.u32(2)], wl.u32
                         ) | wl.widen(
@@ -112,11 +107,11 @@ def production_mul_mat_iq1_m(
                             saturation=False,
                         )
                         delta = delta + wl.i8(payload_u8) * wl.i8(0)
-                        correction_part = wl.contract(
+                        correction_part = wl.reduce_dot(
                             activation,
                             delta,
                             over=("entry", "payload"),
-                            acc=wl.i32,
+                            acc_dtype=wl.i32,
                         )
                         correction = wl.reduce(
                             wl.reduce(correction_part * scale, axis="scale_part"),
@@ -124,4 +119,4 @@ def production_mul_mat_iq1_m(
                         )
                         combined = wl.f32(main) + wl.f32(0.125) * wl.f32(correction)
                         acc += wl.f32(block_scale) * wl.f32(x.ds) * combined
-                    wl.commit(acc, Y[mb, nb])
+                    wl.store(Y[mb, nb], acc)

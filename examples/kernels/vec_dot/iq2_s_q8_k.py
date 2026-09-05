@@ -12,15 +12,15 @@ def compute(
 ):
     sumf = wl.f32(0.0)
     grid_values = grid.values
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
-        scale_group = wl.iota(4, dtype=wl.u32, axis="scale_group")
-        entry = wl.iota(2, dtype=wl.u32, axis="entry")
-        payload = wl.iota(8, dtype=wl.u16, axis="payload")
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
+        scale_group = wl.arange(0, 4, dtype=wl.u32, axis="scale_group")
+        entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
+        payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
         block_sum = wl.i32(0)
         group_index = wl.index(0)
-        with wl.L.subs(kb, extent=64) as group:
+        with wl.level.subtiles(kb, extent=64) as group:
             linear_entry = scale_group * wl.u32(2) + entry
             grid_index = wl.widen(
                 w.q[wl.u32(group_index) * wl.u32(8) + linear_entry], wl.u32
@@ -49,9 +49,7 @@ def compute(
                 + linear_entry * wl.u32(8)
                 + wl.u32(payload)
             ]
-            partial = wl.contract(
-                activation, signed_weight, over=("entry", "payload"), acc=wl.i32
-            )
+            partial = wl.reduce_dot(activation, signed_weight, over=("entry", "payload"), acc_dtype=wl.i32)
             metadata = wl.widen(
                 w.scales[wl.u32(group_index) * wl.u32(2) + scale_group // wl.u32(2)],
                 wl.u32,
@@ -74,4 +72,4 @@ def quantized_vec_dot_iq2_s_q8_k(
     grid: wl.View[ggml.I8X8, (1024, 8)],
     Y: wl.View[wl.f32, (1,)],
 ):
-    wl.commit(compute(W, X, grid), Y[0])
+    wl.store(Y[0], compute(W, X, grid))

@@ -16,21 +16,21 @@ def production_mul_mat_iq1_s(
 ):
     quant_q8_k.quantize_matrix(X, Xq)
     grid_values = grid.values
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        wp = wl.materialize(wl.admit(W[nc]))
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            xp = wl.materialize(wl.admit(Xq[mc]))
-            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
-                    with wl.L.blocks(K, extent=256) as kb:
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.stage(wl.load(W[nc]))
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.stage(wl.load(Xq[mc]))
+            with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.state(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.level.blocks(K, extent=256) as kb:
                         w = wp[nb, kb]
                         x = xp[mb, kb]
-                        entry = wl.iota(4, dtype=wl.u32, axis="entry")
-                        payload = wl.iota(8, dtype=wl.u16, axis="payload")
-                        main = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
-                        correction = wl.new(wl.i32, [MR, NR], init=wl.i32(0))
-                        group = wl.iota(8, dtype=wl.u32, axis="group")
+                        entry = wl.arange(0, 4, dtype=wl.u32, axis="entry")
+                        payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
+                        main = wl.state(wl.i32, [MR, NR], init=wl.i32(0))
+                        correction = wl.state(wl.i32, [MR, NR], init=wl.i32(0))
+                        group = wl.arange(0, 8, dtype=wl.u32, axis="group")
                         metadata = wl.widen(w.qh[:, group], wl.u32)
                         scale = wl.i32(
                             (metadata >> wl.u32(12) & wl.u32(7)) * wl.u32(2)
@@ -50,11 +50,11 @@ def production_mul_mat_iq1_s(
                             + entry * wl.u32(8)
                             + wl.u32(payload),
                         ]
-                        group_sum = wl.contract(
+                        group_sum = wl.reduce_dot(
                             activation,
                             weight,
                             over=("entry", "payload"),
-                            acc=wl.i32,
+                            acc_dtype=wl.i32,
                         )
                         main += wl.reduce(scale * group_sum, axis="group")
                         delta = wl.i32(1) - wl.i32(
@@ -66,4 +66,4 @@ def production_mul_mat_iq1_s(
                         correction += wl.reduce(bsum * scale * delta, axis="group")
                         combined = wl.f32(main) + wl.f32(0.125) * wl.f32(correction)
                         acc += wl.f32(w.d) * wl.f32(x.ds) * combined
-                    wl.commit(acc, Y[mb, nb])
+                    wl.store(Y[mb, nb], acc)

@@ -83,7 +83,7 @@ max + exp + sum
 
 ## 10. Invocation-local `pack(along=...)`
 
-core DSL 不提供只保持数值、shape、axes 与 Level 不变的 local-pack operation。`materialize(expr)` 已经表达 staged Value 的诞生层、物化次数、lifetime 和复用域；local pack 的存在、连续方向、carrier 和 schema 属于 target physical representation。
+core DSL 不提供只保持数值、shape、axes 与 Level 不变的 local-pack operation。`stage(expr)` 已经表达 staged Value 的诞生层、物化次数、lifetime 和复用域；local pack 的存在、连续方向、carrier 和 schema 属于 target physical representation。
 
 若重排改变 logical axes，作者写真实的 reshape/transpose/index operation；若改变跨调用 bytes 与 ABI，作者写 derived Encoding。两者都不需要模糊的 pack 授权点。
 
@@ -95,7 +95,7 @@ core DSL 不提供 `@wide`、`@matrix`、`@transfer` 或通用 `stage_handoff`�
 
 ## 12. Built-in whole-kernel matmul或quant op
 
-GEMM/GEMV/quantized MUL_MAT不是opaque language op。它们由同语言std函数组织outer traversal、Level、staged lifetime、state和local contract。persistent packing 通过 derived Encoding 表达；invocation-local packing 由 target 物理化。
+GEMM/GEMV/quantized MUL_MAT 不是 opaque language op。它们由同语言 std 函数组织 outer traversal、Level、stage、state 和局部 dot/reduce_dot。persistent packing 通过 derived Encoding 表达；invocation-local packing 由 target 物理化。
 
 允许的closed primitive只拥有局部operand/result numerical relation，不能拥有kernel ABI、outer traversal、persistent layout或workspace。
 
@@ -115,21 +115,21 @@ GEMM/GEMV/quantized MUL_MAT不是opaque language op。它们由同语言std函�
 
 SEW/LMUL属于value，instruction属于op，memory form属于memory edge，pipeline属于Level/local cluster。它们不是kernel-global C/D字典。
 
-唯一事实由实体的typed use推导；存在多个合法物理实现时，target按固定规则与优先级作结构选择；物理参数由有限实测调优选择。冲突用显式physical conversion表示；资源不足时spill或拒绝当前candidate。编译器不通过带回边的全局solver修改作者tree。
+唯一事实由实体的 typed use 推导；多个合法物理实现可以按 target 固定规则、分项成本或有界实测选择。冲突用显式 physical conversion 表示；资源不足时执行已定义的 spill 或拒绝当前 candidate。有限局部比较不授权带回边的全局 solver 修改作者 tree。
 
 这条属于语言与target compiler的职责边界；具体physical IR和pass结构不在本部分定义。
 
-## 16. 静态 cost model
+## 16. 用成本分数替代合法性
 
-Weft 不为结构性选择建立预测执行时间、带宽、cache 命中或综合得分的静态 cost model。当前目标的机器行为、编译器和 runtime 还不足以让这类模型成为可靠的规范组成部分；把未经验证的估计写成公共选择权威只会隐藏硬编码。
+不允许成本估计覆盖数值、effect、alias、target instruction 或最终资源合同。可解释的局部成本模型可以比较多个合法结构，但必须公开输入事实、分项估计与选择理由；估计不是硬件定理，也不是实际延迟测量。
 
-结构性选择由 target 的确定规则和固定优先级完成。规则可以读取 typed use-def、Encoding mapping、target legality 和资源上限，但不能用一个预测分数比较两个都合法的结构。
+缺少估计所需事实时，不能以隐式默认值伪装成精确成本。模型与搜索边界由[物理优化方法](../compiler/optimization-principles.md)规定。
 
-## 17. 编译器生成结构后竞赛
+## 17. 无界或来源不明的结构搜索
 
-目标编译器不为同一个 source candidate 生成多种 lane/register/fragment、memory、pack 或 pipeline 结构，再通过静态排序或真机运行挑 winner。这样做会把编译时间、实现复杂度和结果可解释性绑定到无限增长的结构空间。
+禁止 tuner 发明任意作者树或没有 target 合同的物理结构。target 可以声明有限候选，由固定规则、成本排序或外部真机运行选择；每个选择点和整次编译必须有明确预算，一个 module 只保存一个已选程序。
 
-允许实测的只有有限参数绑定：作者显式声明的 source `auto`，以及 target 为已经固定的物理结构声明的 LMUL、schema 内 physical microtile extent、unroll、pipeline depth 和 buffer count 等参数。tuner 不生成新的结构，也不改变结构优先级。
+可测量的配置包括作者/std 声明的 source `auto`，以及 target 声明的数值参数和枚举策略。二者候选来源分别记录，实际 entry、输入表示和选择结果必须可追溯。候选失败不能触发隐藏 fallback。
 
 ## 18. 第三层 Physical IR 与 side-record planning
 

@@ -12,15 +12,15 @@ def row_dequantize_iq2_s(
     grid: wl.View[wl.i8, (8192,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
         group = wl.index(0)
-        with wl.L.subs(kb, extent=32) as group_point:
+        with wl.level.subtiles(kb, extent=32) as group_point:
             high = w.qh[group]
             scale_bits = w.scales[group]
             entry = wl.index(0)
-            with wl.L.subs(group_point, extent=8) as entry_point:
-                lane = wl.iota(8, dtype=wl.u32, axis="k")
+            with wl.level.subtiles(group_point, extent=8) as entry_point:
+                lane = wl.arange(0, 8, dtype=wl.u32, axis="k")
                 grid_index = wl.u32(w.q[group * wl.index(4) + entry]) | qf.extract_bits(
                     high, wl.u32(entry) * wl.u32(2), 2
                 ) << wl.u32(8)
@@ -30,9 +30,6 @@ def row_dequantize_iq2_s(
                     scale_bits, wl.u32(entry // wl.index(2)) * wl.u32(4), 4
                 )
                 scale = wl.f32(w.d) * (wl.f32(0.5) + wl.f32(subscale)) * wl.f32(0.25)
-                wl.commit(
-                    qf.iq_codebook(wl.i32(value) * sign, scale),
-                    Y[kb][group_point][entry_point],
-                )
+                wl.store(Y[kb][group_point][entry_point], qf.iq_codebook(wl.i32(value) * sign, scale))
                 entry += wl.index(1)
             group += wl.index(1)

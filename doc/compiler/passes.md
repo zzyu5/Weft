@@ -301,6 +301,11 @@ storage facts与Encoding declaration、leaf widening/memory要求与target capab
 fragment rewrite、pipeline expansion与spill/reload。只打印 analysis table或 assignment
 dictionary不能证明程序已经物理化。
 
+独立 parse/verify 和指定 pass/CSE 的二次 diff=0 只说明该样本在该流程上稳定，不证明
+全部 pass 正确或幂等。尤其 final resource marker 会跳过 layout canonicalization 的主要
+rematerialization 分支。机械重放的完整解释与真机验收边界见
+[物理优化方法](optimization-principles.md#12-机械验收的证明范围)。
+
 ## 4. 与 Triton/TileLang 的机制关系
 
 下列路径相对于仓库根目录位于同级reference checkout `../ref/`。Triton 的 layout encoding、`ttg.convert_layout`、Coalesce、AccelerateMatmul、

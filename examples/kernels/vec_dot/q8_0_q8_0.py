@@ -7,10 +7,10 @@ import weft.language as wl
 
 def compute(W: wl.View[ggml.Q8_0, (K,)], X: wl.View[ggml.Q8_0, (K,)]):
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
-        integer = wl.contract(w.q, x.q, over="k", acc=wl.i32)
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
+        integer = wl.reduce_dot(w.q, x.q, over="k", acc_dtype=wl.i32)
         result += wl.f32(integer) * (wl.f32(w.d) * wl.f32(x.d))
     return result
 
@@ -19,4 +19,4 @@ def compute(W: wl.View[ggml.Q8_0, (K,)], X: wl.View[ggml.Q8_0, (K,)]):
 def quantized_vec_dot_q8_0_q8_0(
     W: wl.View[ggml.Q8_0, (K,)], X: wl.View[ggml.Q8_0, (K,)], Y: wl.View[wl.f32, (1,)]
 ):
-    wl.commit(compute(W, X), Y[0])
+    wl.store(Y[0], compute(W, X))

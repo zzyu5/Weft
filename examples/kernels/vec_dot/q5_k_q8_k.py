@@ -7,16 +7,16 @@ import weft.language as wl
 
 def compute(W: wl.View[ggml.Q5_K, (K,)], X: wl.View[ggml.Q8_K, (K,)]):
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
         integer = wl.i32(0)
-        with wl.L.subs(extent=32) as sub:
+        with wl.level.subtiles(extent=32) as sub:
             q = wl.u8(w.q[sub]) | wl.u8(w.qh[sub]) << wl.u8(4)
-            integer += wl.contract(q, x.q[sub], over="k", acc=wl.i32) * wl.i32(
+            integer += wl.reduce_dot(q, x.q[sub], over="k", acc_dtype=wl.i32) * wl.i32(
                 w.sc[sub]
             )
-        min_group = wl.iota(8, dtype=wl.u32, axis="min_group")
+        min_group = wl.arange(0, 8, dtype=wl.u32, axis="min_group")
         minimum = wl.reduce(
             wl.widen(w.m[min_group], wl.i32)
             * (
@@ -35,4 +35,4 @@ def compute(W: wl.View[ggml.Q5_K, (K,)], X: wl.View[ggml.Q8_K, (K,)]):
 def quantized_vec_dot_q5_k_q8_k(
     W: wl.View[ggml.Q5_K, (K,)], X: wl.View[ggml.Q8_K, (K,)], Y: wl.View[wl.f32, (1,)]
 ):
-    wl.commit(compute(W, X), Y[0])
+    wl.store(Y[0], compute(W, X))

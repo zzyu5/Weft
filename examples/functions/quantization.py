@@ -65,7 +65,7 @@ def radix3_digit_i8(powers, packed, digit):
 
 
 def dot_codebook32(q, x, codebook):
-    return wl.contract(small_nonlinear_lookup(codebook, q), x, over="k", acc=wl.i32)
+    return wl.reduce_dot(small_nonlinear_lookup(codebook, q), x, over="k", acc_dtype=wl.i32)
 
 
 def iq2_xs_entry_reduce(code, metadata, activation, grid, signs, scale_group, payload):
@@ -74,9 +74,7 @@ def iq2_xs_entry_reduce(code, metadata, activation, grid, signs, scale_group, pa
     sign_index = code_bits >> wl.u16(9)
     weight = wl.lookup(grid, grid_index * wl.u16(8) + payload, bounds="in_bounds")
     sign = wl.lookup(signs, sign_index * wl.u16(8) + payload, bounds="in_bounds")
-    partial = wl.contract(
-        activation, weight * sign, over=("entry", "payload"), acc=wl.i32
-    )
+    partial = wl.reduce_dot(activation, weight * sign, over=("entry", "payload"), acc_dtype=wl.i32)
     scale = wl.i32(
         (wl.widen(metadata, wl.u32) >> scale_group % wl.u32(2) * wl.u32(4) & wl.u32(15))
         * wl.u32(2)

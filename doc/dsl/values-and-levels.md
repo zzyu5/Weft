@@ -8,54 +8,58 @@ Value 是带 element type、逻辑 shape 和 axis identity 的局部 SSA 值：
 Value[element, shape, axes]
 ```
 
-Value 没有 physical owner、物理 lane、LMUL、register group、fragment 或 hardware storage scope。它仍有由 SSA dominance 与 Level births/handoff 明确规定的逻辑作用域。标量是 rank-0 Value；正 rank Value 的 axis identity 是编译器理解 pointwise、broadcast、reduce、contract 和 memory relation 的依据。
+Value 没有 physical owner、物理 lane、LMUL、register group、fragment 或 hardware storage scope。其可见性来自 SSA dominance、本层初始化与层结果。标量是 rank-0 Value；正 rank Value 的 axis identity 决定 pointwise、broadcast、reduce、dot/reduce_dot 和 memory relation。
 
 Value 可以：
 
 - 被多个 consumer 使用；
-- 进入 pointwise、reduce、contract、lookup 或 memory operation；
+- 进入 pointwise、reduce、dot/reduce_dot、lookup 或 memory operation；
 - 作为 Level state 跨迭代更新；
 - 通过 handoff 交回外层；
 - 在普通 `for/while/if` 中作为 SSA carry；
-- 被 materialize 为本层后代共享的 staged value。
+- 被 stage 为本层后代共享的 staged value。
 
 structured operation 的结果仍是普通 Value，不形成只能 direct-store 的封闭路径。
 
 ## 2. 四个生命周期构造
 
-### 2.1 `new`
+### 2.1 `state`
 
 ```python
-acc = new(f32, [MR, NR], init=0)
+acc = state(f32, [MR, NR], init=0)
 ```
 
-`new` 在当前逻辑作用域诞生一个可更新 state；该作用域可以是 kernel root，也可以是 Level。位于 Level 中时，它是该 Level 的 `births.state`，可被内层 Level 或普通控制更新，并在本层 handoff 时交回。Top-K 的 heap/indices 则是 kernel-root state。
+`state` 声明当前作用域中的可更新数值状态，可以由后续赋值、元素更新或内层控制继续更新。作用域可以是 kernel root 或 Level；把声明放到另一层，会改变初始化次数和跨迭代更新范围。它不分配某类物理寄存器或内存。Top-K 的 heap/indices 也是 state，不限于求和 accumulator。
 
-`init` 是数值语义。`init=0`、`init=admit(C[...])` 和未初始化不是可互换实现。
+`init` 是数值语义。`init=0`、`init=load(C[...])` 和未初始化不是可互换实现。
 
-### 2.2 `materialize`
+### 2.2 `stage`
 
 ```python
-Bp = materialize(admit(B[kc, nc]))
+Bp = stage(load(B[kc, nc]))
 ```
 
-`materialize` 在当前逻辑作用域形成一次 staged Value，后代只读复用；位于 Level 中时，它是该 Level 的 `births.staged`。staged Value 的 element type、logical shape、axes 与 Level 归属进入 canonical IR；它不表示某个具体 cache、栈、vector register、fragment、shared memory 或 packed panel。target 可以在保持这些 canonical facts 的前提下，为该 Value 选择原样引用、register window、local-storage panel、RVV tuple、IME operand 或其它 physical representation。
+`stage(expr)` 在本作用域求得一个供后代只读复用的值。与 `state` 不同，后代不能重新绑定这个值；与普通 load 不同，它显式声明一个有本层归属的复用边界。该边界进入 canonical IR，不是可忽略的优化 hint，也不承诺 cache、shared memory、物理复制或 pipeline stage。target 在保持 dtype、shape、axes、初始化频率与层归属的前提下选择其表示。
 
-### 2.3 `admit`
+Level 顶层直接赋值的 `state(...)` 和 `stage(...)` 分别属于两个初始化区域，执行顺序是 state 初始化、stage 初始化、Level body。各初始化区域只能使用进入 Level 前已可见的值、当前 Level point，以及本区域中此前定义的值；不能引用 Level body 中新定义的值，也不能引用另一个初始化区域的新定义。源码中把 body 赋值写在前面不会改变这项限制。例如 `w = load(W[kb]); panel = stage(decode(w))` 在同一 Level 顶层不合法；应在初始化表达式中直接给出其输入，或从外层传入值。诊断必须点名 body 值或另一初始化区域，不能伪装成未知 Python 名称。
+
+这些限制定义当前初始化区域的可见性，并不授权把 body 的读取、写入或计算复制到初始化区域。初始化中的同名变量按该区域可见环境解析，不能借书写位置假定它来自 body。普通 inline helper 也不建立跨区域捕获通道。
+
+### 2.3 `load`
 
 ```python
-x = admit(X[kb])
+x = load(X[kb])
 ```
 
-`admit` 把一个 View region 在当前 kernel/Level 作用域供应一次。把同一 `admit` 移到更内层会增加逻辑供应次数；移到更外层会扩大 Value 生命周期。两者是不同作者程序。
+`load(region)` 从 View region 读取一个 Value，后续使用的是这次读取的结果，而不是可以任意重新解引用的地址表达式。把读取放在更内层会增加逻辑读取次数，放在更外层会扩大生命周期；跨可能别名的写入移动读取必须有合法性证明。
 
-### 2.4 `commit`
+### 2.4 `store`
 
 ```python
-commit(acc, C[mb, nb])
+store(C[mb, nb], acc)
 ```
 
-`commit` 将 Value 写回指定 View region。写回位置、覆盖域和 effect 顺序属于源程序。
+`store(region, value)` 将 Value 写入第一个参数指定的 View region。它不提交事务、同步其它执行者或触发隐式 barrier；目标区域、覆盖域和与其它读写的顺序属于源程序。
 
 ## 3. Level
 
@@ -72,10 +76,10 @@ multiplicity
     每个父实例中有多少个当前实例
 
 births.state
-    在本层由 new 诞生的状态
+    在本层由 state 诞生的状态
 
 births.staged
-    在本层由 materialize 形成、供后代复用的值
+    在本层由 stage 形成、供后代复用的值
 
 body
     可以包含多棵数值子树、普通控制、多个 state update 和 effect
@@ -86,36 +90,36 @@ handoff
 
 Level 相比普通 `for` 的核心新增语义是 typed lifetime、层归属和 handoff；domain partition、multiplicity 与 tail 使这一层的逻辑覆盖范围可被精确保存。
 
-Level 不是“一层一个 reduce”，也不是 target loop 的别名。同一 Level 可以包含两个 contract、若干 pointwise、多个状态和 memory effect。
+Level 不是“一层一个 reduce”，也不是 target loop 的别名。同一 Level 可以包含多个块乘或乘积归约、pointwise、状态更新和 memory effect。
 
 ## 4. Domain 与 partition
 
 常见 domain 构造：
 
 ```python
-with L.tiles(N, extent=NC) as nc:
-with L.rows(M, group=MR) as mb:
-with L.cols(N, group=NR) as nb:
-with L.blocks(K, extent=KB) as kb:
-with L.subs(extent=32) as s:
+with level.tiles(N, extent=NC) as nc:
+with level.rows(M, group=MR) as mb:
+with level.cols(N, group=NR) as nb:
+with level.blocks(K, extent=KB) as kb:
+with level.subtiles(kb, extent=32) as s:
 ```
 
-这些名字描述逻辑 relation，不指定 lane/thread/fragment。
+`level` 是构造逻辑层级的命名空间。`rows/cols` 指一组逻辑行或列，`tiles/blocks` 指指定宽度的域划分，`subtiles` 指父域内的进一步划分。这些名字不指定 lane/thread/fragment，也不要求嵌套某一种固定层级。第一个参数可以是 shape symbol 或父 point；省略时使用当前父域，示例优先写出父 point。
 
 `extent` 或 `group` 定义当前实例覆盖的逻辑宽度；`multiplicity` 由父域范围和 partition 得出；不能整除时，tail 仍属于同一逻辑 domain。
 
-编译器可以 strip-mine 一个 Level 的物理执行、分多次 issue 或使用 tail mask，但不能把一个 source Level 改成多个独立 source Level，因为 births、admit 和 handoff 的次数会变化。
+编译器可以 strip-mine 一个 Level 的物理执行、分多次 issue 或使用 tail mask，但不能把一个 source Level 改成多个独立 source Level，因为 births、load 和 handoff 的次数会变化。
 
 ## 5. 逻辑 cohort
 
 ```python
-with L.rows(M, group=16) as mb:
-    acc = new(f32, [16], init=0)
+with level.rows(M, group=16) as mb:
+    acc = state(f32, [16], init=0)
 ```
 
 一个 Level instance 逻辑上共同产生 16 个输出。这 16 个输出：
 
-- 可以共同消费在本层发生的一次 `admit` 或 birth；
+- 可以共同消费在本层发生的一次 `load` 或 birth；
 - 共享 births/staged scope；
 - 具有同一 handoff 边界。
 
@@ -130,7 +134,7 @@ with L.rows(M, group=16) as mb:
 ```python
 acc += block_term
 m = m_new
-o = o * alpha + contract(p, v, over="tk")
+o = o * alpha + dot(p, v, over="tk")
 ```
 
 在 canonical Kernel IR 中，Level body 的终结必须保存每个 carried/state result 的名称、类型和来源。作者不需要学习独立 handoff 代数，但层归属不能从 IR 中消失。
@@ -151,11 +155,11 @@ def local_decode(
 ) -> Value[i8, (K,), ("k",)]:
     return i8(packed) - i8(8)
 
-panel = materialize(local_decode(packed))
-acc += contract(panel, x, over="k")
+panel = stage(local_decode(packed))
+acc += reduce_dot(panel, x, over="k")
 ```
 
-`local_decode` 是保持 K axis 的普通 helper。`panel` 的 materialized birth 和普通 SSA use-def 已完整表达 source-visible value boundary；core DSL 不再增加 `stage_handoff` 或 source engine annotation。
+`local_decode` 是保持 K axis 的普通 helper。`panel` 由 `stage` 建立的本层复用边界与普通 SSA use-def 已完整表达 source-visible value boundary；core DSL 不再增加 `stage_handoff` 或 source engine annotation。
 
 若 target 让 producer 与 consumer 使用不同 physical engine，它在具体 use edge 上插入 register/fragment/local-storage conversion，并承担相应 ordering 与 resources。若同步、并发或 workspace 会改变 source-visible effects，则必须定义真实的 effect operation 或另一棵作者程序，不能由 engine convention 暗中补出。
 
@@ -180,14 +184,14 @@ while condition:
 
 Top-K、heap update、依赖前一迭代的搜索和 CSR traversal 可以只用普通控制，不必使用 Level。
 
-## 8. `iota` 与显式逻辑轴
+## 8. `arange` 与显式逻辑轴
 
 ```python
-lane = iota(8, dtype=u32)
-within_k = iota(32, dtype=u32, axis="k")
+lane = arange(0, 8, dtype=u32)
+within_k = arange(0, 32, dtype=u32, axis="k")
 ```
 
-未指定 `axis` 时，`iota` 建立一条匿名 logical axis。`axis="k"` 为该轴给出可引用的名称：名称已经存在时复用已有 axis，否则建立一条新的具名 axis。它用于显式描述 field gather、bit-plane 组合、lookup 以及多轴 contraction；重复使用同一名称不会创建第二条同 extent 轴。两种形式都产生 shaped logical index Value，后续 gather、lookup、pointwise、reduce 与 contraction 按其 axis identity 组合。
+`arange(start, end)` 建立半开区间 `[start, end)`，两端必须是编译期整数，且 end 大于 start。当前 dtype 为 unsigned integer 或 index，默认 u32。未指定 `axis` 时建立匿名 logical axis；`axis="k"` 复用已有同名 axis，或建立新的具名 axis。它显式给出 field gather、bit 组合、lookup 与多轴乘积归约所需的 shaped index，不承诺任何 RVV lane 位置。
 
 它与下面程序不同：
 
@@ -199,7 +203,7 @@ for lane in range(8):
 
 八次 Python/DSL 标量展开只产生八组独立 SSA operation；不存在一个 8-element logical axis。编译器不得根据相同 op count、同构 source closure 或相邻语句重新发明轴。
 
-若算法要求 codebook 的 8 个元素成为一个 shaped value，作者必须用 `iota`、shaped indexing 或返回 shaped Value 的函数显式写出。
+若算法要求 codebook 的 8 个元素成为一个 shaped value，作者必须用 `arange`、shaped indexing 或返回 shaped Value 的函数显式写出。
 
 ## 9. 顺序性
 

@@ -22,4 +22,4 @@ def production_mul_mat_iq1_m_decode(
             value = vd_iq1_m_q8_k.compute(
                 W[column], Xq[row], grid, f16_bits
             )
-            wl.commit(value, Y[row, column])
+            wl.store(Y[row, column], value)

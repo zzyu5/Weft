@@ -13,9 +13,9 @@ def compute(
     e8m0_scale: wl.View[wl.f32, (256,)],
 ):
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
         integer = qf.dot_codebook32(w.q, x.q, codebook)
         scale = wl.f32(x.d) * qf.exponent_scale(e8m0_scale, w.e)
         result += scale * wl.f32(integer)
@@ -30,4 +30,4 @@ def quantized_vec_dot_mxfp4_q8_0(
     scale: wl.View[wl.f32, (256,)],
     Y: wl.View[wl.f32, (1,)],
 ):
-    wl.commit(compute(W, X, codebook, scale), Y[0])
+    wl.store(Y[0], compute(W, X, codebook, scale))

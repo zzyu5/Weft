@@ -7,13 +7,13 @@ import weft.language as wl
 
 def compute(W: wl.View[ggml.Q1_0, (K,)], X: wl.View[ggml.Q8_0, (K,)]):
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=128) as wb:
-        w = wl.admit(W[wb])
+    with wl.level.blocks(K, extent=128) as wb:
+        w = wl.load(W[wb])
         subtotal = wl.f32(0.0)
-        with wl.L.subs(wb, extent=32) as xb:
-            x = wl.admit(X[xb])
+        with wl.level.subtiles(wb, extent=32) as xb:
+            x = wl.load(X[xb])
             centered = wl.i8(w.q[xb]) * wl.i8(2) - wl.i8(1)
-            integer = wl.contract(x.q, centered, over="k", acc=wl.i32)
+            integer = wl.reduce_dot(x.q, centered, over="k", acc_dtype=wl.i32)
             subtotal += wl.f32(x.d) * wl.f32(integer)
         result += wl.f32(w.d) * subtotal
     return result
@@ -23,4 +23,4 @@ def compute(W: wl.View[ggml.Q1_0, (K,)], X: wl.View[ggml.Q8_0, (K,)]):
 def quantized_vec_dot_q1_0_q8_0(
     W: wl.View[ggml.Q1_0, (K,)], X: wl.View[ggml.Q8_0, (K,)], Y: wl.View[wl.f32, (1,)]
 ):
-    wl.commit(compute(W, X), Y[0])
+    wl.store(Y[0], compute(W, X))

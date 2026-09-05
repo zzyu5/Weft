@@ -20,4 +20,4 @@ def production_mul_mat_iq2_xxs(
     for row in range(M):
         for column in range(N):
             value = vd_iq2_xxs_q8_k.compute(W[column], Xq[row], grid, signs)
-            wl.commit(value, Y[row, column])
+            wl.store(Y[row, column], value)

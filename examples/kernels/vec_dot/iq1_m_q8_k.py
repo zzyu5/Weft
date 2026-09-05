@@ -14,9 +14,9 @@ def compute(
 ):
     result = wl.f32(0.0)
     grid_values = grid.values
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        x = wl.admit(X[kb])
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        x = wl.load(X[kb])
         sc0 = wl.u32(w.scales[0]) | wl.u32(w.scales[1]) << wl.u32(8)
         sc1 = wl.u32(w.scales[2]) | wl.u32(w.scales[3]) << wl.u32(8)
         sc2 = wl.u32(w.scales[4]) | wl.u32(w.scales[5]) << wl.u32(8)
@@ -25,10 +25,10 @@ def compute(
         scale_bits = scale_bits | sc2 >> wl.u32(4) & wl.u32(3840)
         scale_bits = scale_bits | sc3 & wl.u32(61440)
         block_scale = qf.nonlinear_lookup(f16_bits, scale_bits)
-        group = wl.iota(8, dtype=wl.u32, axis="group")
-        scale_part = wl.iota(2, dtype=wl.u32, axis="scale_part")
-        entry = wl.iota(2, dtype=wl.u32, axis="entry")
-        payload = wl.iota(8, dtype=wl.u32, axis="payload")
+        group = wl.arange(0, 8, dtype=wl.u32, axis="group")
+        scale_part = wl.arange(0, 2, dtype=wl.u32, axis="scale_part")
+        entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
+        payload = wl.arange(0, 8, dtype=wl.u32, axis="payload")
         qh = wl.widen(w.qh[group * wl.u32(2) + scale_part], wl.u32)
         high_shift = entry * wl.u32(4)
         grid_index = wl.widen(
@@ -43,9 +43,7 @@ def compute(
             + entry * wl.u32(8)
             + payload
         ]
-        dot = wl.contract(
-            activation, weight, over=("entry", "payload"), acc=wl.i32
-        )
+        dot = wl.reduce_dot(activation, weight, over=("entry", "payload"), acc_dtype=wl.i32)
         scale_word = wl.widen(
             w.scales[group // wl.u32(2) * wl.u32(2)], wl.u32
         ) | wl.widen(
@@ -72,9 +70,7 @@ def compute(
             payload_u16, wl.u8, rounding="rtz", saturation=False
         )
         delta = delta + wl.i8(payload_u8) * wl.i8(0)
-        correction_part = wl.contract(
-            activation, delta, over=("entry", "payload"), acc=wl.i32
-        )
+        correction_part = wl.reduce_dot(activation, delta, over=("entry", "payload"), acc_dtype=wl.i32)
         correction = wl.reduce(
             wl.reduce(correction_part * scale, axis="scale_part"), axis="group"
         )
@@ -91,4 +87,4 @@ def quantized_vec_dot_iq1_m_q8_k(
     f16_bits: wl.View[wl.f32, (65536,)],
     Y: wl.View[wl.f32, (1,)],
 ):
-    wl.commit(compute(W, X, grid, f16_bits), Y[0])
+    wl.store(Y[0], compute(W, X, grid, f16_bits))

@@ -40,7 +40,7 @@ intrinsic C / local asm
 
 ### 2.3 不参与编译选择
 
-GGML吞吐不参与leaf selection或physical-parameter tuner。tuner只在编译器自己生成并验证合法的有限参数绑定之间实测；baseline在winner生成以后评价最终artifact。
+GGML 吞吐不参与 leaf selection 或 tuner。tuner 只在作者/std 或 target 明确声明的有限候选之间编译、验证和实测；source 参数与物理策略分开记录，数值失败不能进入 winner。baseline 在 winner 生成以后评价最终 artifact。
 
 ## 3. 可比较 Case
 

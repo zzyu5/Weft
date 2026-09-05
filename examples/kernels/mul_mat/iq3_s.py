@@ -18,4 +18,4 @@ def production_mul_mat_iq3_s(
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
-            wl.commit(vd_iq3_s_q8_k.compute(W[column], Xq[row], grid), Y[row, column])
+            wl.store(Y[row, column], vd_iq3_s_q8_k.compute(W[column], Xq[row], grid))

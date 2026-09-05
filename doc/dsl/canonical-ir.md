@@ -18,7 +18,7 @@ Canonical Kernel IR 是 Weft 源程序的唯一算法与数值 authority。它�
 - base/dense/derived family/derived instance identity；
 - bit order、byte order、elements、alignment和padding；
 - field storage span；
-- grouped/layered/bit-plane/joined mapping；
+- 源级 `grouped/bit_layers/pack_fields` 声明对应的 storage mapping；
 - View/Slice 的 logical shape 和 axis identities；
 - derive builder、persistent interleave 与 pinned artifact layout identity。
 
@@ -47,7 +47,7 @@ Level 不能在canonical化时退化成“一个loop加几个可丢弃attribute�
 
 - pointwise operation；
 - grouped MAC 的group width与accumulator type；
-- reduce/fold/dot/contract的输入、输出与轴；
+- reduce、sum_pairs、dot/reduce_dot 的输入、输出与轴；
 - lookup/index relation；
 - state update与effect；
 - operation精度、顺序、overflow/wrap/saturate语义；
@@ -82,9 +82,9 @@ canonical verifier必须检查程序是不是一份合法Weft程序：
 - domain parent/partition/multiplicity/tail合法；
 - Level births/body/handoff签名一致；
 - 普通控制carry与branch result类型一致；
-- admit/materialize/new/commit的domain与value关系一致；
+- load/stage/state/store 的 domain 与 value 关系一致；
 - primitive operand/result shape和axis relation合法；
-- `subview` 的静态 offsets/extents 与 base rank 一致且完全位于 base 内，结果只流向 `commit`；
+- `subview` 的静态 offsets/extents 与 base rank 一致且完全位于 base 内，结果只流向 `store`；
 - `reshape` 的输入 axis order 是完整排列，输入输出元素数和 dtype 相同，结果 shape/axes 与显式坐标映射一致；
 - derive builder result与declared family一致；
 - pinned layout identity在ABI边界明确。
@@ -139,6 +139,12 @@ intrinsic C / local asm
 
 这是两层 MLIR。target profile、build config、tuner和各个physical pass都是转换输入或对第二层程序的改写，不构成额外IR层。canonical module保持不变；每个candidate从它独立建立一份瞬态RISC-V module。
 
-唯一合法事实必须从这些输入唯一推导；存在多个合法物理结构时，target 按固定规则和优先级选择；结构固定后的有限物理参数可以由构建期实测选择。若物理实现需要改变 canonical values、Level 归属、artifact ABI 或 numerical operation，它不能在 target lowering 中完成；必须返回到作者 tree 或另一个 std overload。
+唯一合法事实必须从这些输入唯一推导；多个合法物理结构可以按 target 声明的固定规则、分项成本或有限实测选择。每个候选独立形成 Physical program，合法性不受成本分数覆盖。若物理实现需要改变 canonical values、Level 归属、artifact ABI 或 numerical operation，它不能在 target lowering 中完成；必须返回到作者 tree 或另一个 std overload。
 
 canonical IR本身不承担目标物理candidate的持久authority。一个candidate被拒绝或替换，不得修改源程序语义；选定layout、conversion、memory、schedule和target operations必须存在于RISC-V IR本身，不能只保存在side record中。
+
+## 6. 源级拼写与 IR operation
+
+源 API 不要求与 IR operation 同名。`load/store` 分别产生带读取/写入 effect 的 `admit/commit`；`state/stage` 产生 `new/materialize`，并保留初始化区域和层归属；`arange/sum_pairs` 对应 `iota/fold2`。Encoding 的 `bit_layers/pack_fields` 保存为 `layered/joined` storage mapping。这些是编译器内部词汇，不是第二套公开 DSL。
+
+块乘 `dot` 保存为 `outer_contract`，包含双方不同的 free axes；一般 `reduce_dot` 保存为 `contract`，保留显式缩并轴、共享 free axes 和 accumulator type。前端不得因为目标性能偏好在两种源操作之间改选，目标后端也不根据源函数名接管数值树。

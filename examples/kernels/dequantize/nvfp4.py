@@ -13,12 +13,12 @@ def row_dequantize_nvfp4(
     scale: wl.View[wl.f32, (256,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    table = wl.materialize(wl.admit(codebook))
-    with wl.L.blocks(K, extent=64) as kb:
-        w = wl.admit(W[kb])
+    table = wl.stage(wl.load(codebook))
+    with wl.level.blocks(K, extent=64) as kb:
+        w = wl.load(W[kb])
         sub_index = wl.index(0)
-        with wl.L.subs(kb, extent=16) as sub:
+        with wl.level.subtiles(kb, extent=16) as sub:
             decoded_scale = qf.exponent_scale(scale, w.d[sub_index])
             q = qf.small_nonlinear_lookup(table, w.q[sub])
-            wl.commit(qf.fp4_codebook(q, decoded_scale), Y[kb][sub])
+            wl.store(Y[kb][sub], qf.fp4_codebook(q, decoded_scale))
             sub_index += wl.index(1)

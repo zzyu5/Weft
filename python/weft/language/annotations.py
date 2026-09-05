@@ -36,26 +36,26 @@ class FieldLayoutSpec:
     low_bits: int = 0
 
 
-def grouped(elements: int) -> FieldLayoutSpec:
+def grouped(*, elements: int) -> FieldLayoutSpec:
     if isinstance(elements, bool) or not isinstance(elements, int) or elements <= 0:
         raise TypeError("grouped expects a positive logical element count")
     return FieldLayoutSpec("grouped", elements)
 
 
-def layered(elements: int, order: str) -> FieldLayoutSpec:
+def bit_layers(*, elements: int, order: str) -> FieldLayoutSpec:
     if isinstance(elements, bool) or not isinstance(elements, int) or elements <= 0:
-        raise TypeError("layered expects a positive logical layer extent")
+        raise TypeError("bit_layers expects a positive logical layer extent")
     if order not in {lo_first, hi_first}:
-        raise TypeError("layered order must be lo_first or hi_first")
+        raise TypeError("bit_layers order must be lo_first or hi_first")
     return FieldLayoutSpec("layered", elements, order)
 
 
-def joined(group: int, fields: int, low_bits: int, order: str) -> FieldLayoutSpec:
+def pack_fields(*, group: int, fields: int, low_bits: int, order: str) -> FieldLayoutSpec:
     for name, value in {"group": group, "fields": fields, "low_bits": low_bits}.items():
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise TypeError(f"joined {name} must be a positive integer")
+            raise TypeError(f"pack_fields {name} must be a positive integer")
     if order not in {lo_first, hi_first}:
-        raise TypeError("joined order must be lo_first or hi_first")
+        raise TypeError("pack_fields order must be lo_first or hi_first")
     return FieldLayoutSpec("joined", group, order, fields, low_bits)
 
 

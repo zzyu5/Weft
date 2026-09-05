@@ -20,4 +20,4 @@ def production_mul_mat_nvfp4_decode(
     for row in range(M):
         for column in range(N):
             value = vd_nvfp4_q8_0.compute(W[column], Xq[row], codebook, scale)
-            wl.commit(value, Y[row, column])
+            wl.store(Y[row, column], value)

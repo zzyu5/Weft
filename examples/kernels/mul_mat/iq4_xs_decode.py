@@ -19,4 +19,4 @@ def production_mul_mat_iq4_xs_decode(
     for row in range(M):
         for column in range(N):
             value = vd_iq4_xs_q8_k.compute(W[column], Xq[row], codebook)
-            wl.commit(value, Y[row, column])
+            wl.store(Y[row, column], value)

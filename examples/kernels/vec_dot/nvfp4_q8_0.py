@@ -12,15 +12,15 @@ def compute(
     codebook: wl.View[wl.i8, (16,)],
     ue4m3_scale: wl.View[wl.f32, (256,)],
 ):
-    table = wl.materialize(wl.admit(codebook))
+    table = wl.stage(wl.load(codebook))
     result = wl.f32(0.0)
-    with wl.L.blocks(K, extent=64) as wb:
-        w = wl.admit(W[wb])
-        with wl.L.subs(wb, extent=32) as xb:
-            x = wl.admit(X[xb])
-            with wl.L.subs(xb, extent=16) as sub:
+    with wl.level.blocks(K, extent=64) as wb:
+        w = wl.load(W[wb])
+        with wl.level.subtiles(wb, extent=32) as xb:
+            x = wl.load(X[xb])
+            with wl.level.subtiles(xb, extent=16) as sub:
                 q = qf.small_nonlinear_lookup(table, w.q[sub])
-                integer = wl.contract(q, x.q[sub], over="k", acc=wl.i32)
+                integer = wl.reduce_dot(q, x.q[sub], over="k", acc_dtype=wl.i32)
                 scale = wl.f32(x.d) * qf.exponent_scale(ue4m3_scale, w.d[sub])
                 result += scale * wl.f32(integer)
     return result
@@ -34,4 +34,4 @@ def quantized_vec_dot_nvfp4_q8_0(
     scale: wl.View[wl.f32, (256,)],
     Y: wl.View[wl.f32, (1,)],
 ):
-    wl.commit(compute(W, X, codebook, scale), Y[0])
+    wl.store(Y[0], compute(W, X, codebook, scale))

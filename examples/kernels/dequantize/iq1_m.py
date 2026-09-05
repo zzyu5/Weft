@@ -22,8 +22,8 @@ def row_dequantize_iq1_m(
     f16_bits: wl.View[wl.f32, (65536,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
         sc0 = wl.u32(w.scales[0]) | wl.u32(w.scales[1]) << wl.u32(8)
         sc1 = wl.u32(w.scales[2]) | wl.u32(w.scales[3]) << wl.u32(8)
         sc2 = wl.u32(w.scales[4]) | wl.u32(w.scales[5]) << wl.u32(8)
@@ -33,7 +33,7 @@ def row_dequantize_iq1_m(
         scale_bits = scale_bits | sc3 & wl.u32(61440)
         d = qf.nonlinear_lookup(f16_bits, scale_bits)
         group = wl.index(0)
-        with wl.L.subs(kb, extent=32) as group_point:
+        with wl.level.subtiles(kb, extent=32) as group_point:
             scale_word = wl.u32(
                 w.scales[wl.index(2) * (group // wl.index(2))]
             ) | wl.u32(
@@ -42,8 +42,8 @@ def row_dequantize_iq1_m(
                 8
             )
             entry = wl.index(0)
-            with wl.L.subs(group_point, extent=8) as entry_point:
-                lane = wl.iota(8, dtype=wl.u32, axis="k")
+            with wl.level.subtiles(group_point, extent=8) as entry_point:
+                lane = wl.arange(0, 8, dtype=wl.u32, axis="k")
                 qh = w.qh[group * wl.index(2) + entry // wl.index(2)]
                 half = wl.u32(entry % wl.index(2))
                 high_shift = half * wl.u32(4)
@@ -60,12 +60,9 @@ def row_dequantize_iq1_m(
                 subscale = wl.i32(
                     qf.extract_bits(scale_word, subscale_shift, 3)
                 ) * wl.i32(2) + wl.i32(1)
-                wl.commit(
-                    qf.iq_codebook(
+                wl.store(Y[kb][group_point][entry_point], qf.iq_codebook(
                         _grid_delta(grid, grid_index, lane, delta),
                         d * wl.f32(subscale),
-                    ),
-                    Y[kb][group_point][entry_point],
-                )
+                    ))
                 entry += wl.index(1)
             group += wl.index(1)

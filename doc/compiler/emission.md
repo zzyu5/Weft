@@ -9,6 +9,11 @@ typed program entities；每个target operation也已有闭合的[local leaf](le
 translator内部可以用临时binding map把SSA value对应到C expression、RVV variable、local array
 或fragment pointer。该表只保存已发射值的文本，不是跨pass decision authority。
 
+纯表达式可以内联，但 memory-read SSA result 必须在对应的读取点求值并形成稳定绑定。
+同一结果的重复 use 不能变成重复解引用，也不能将读取延迟到可能别名的 store 之后。
+这项要求同时覆盖 scalar、scalar tuple、encoded field 与 local load；source record 到
+field 的投影也必须保留原有读取/effect 边界，不能把描述符字符串当成已经加载的值。
+
 ## 2. 允许的确定 lowering
 
 translator可以：

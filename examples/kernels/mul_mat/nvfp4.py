@@ -16,30 +16,28 @@ def production_mul_mat_nvfp4(
     scale: wl.View[wl.f32, (256,)],
     Y: wl.View[wl.f32, (M, N)],
 ):
-    table = wl.materialize(wl.admit(codebook))
+    table = wl.stage(wl.load(codebook))
     quant_q8_0.quantize_matrix(X, Xq)
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        wp = wl.materialize(wl.admit(W[nc]))
-        with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-            xp = wl.materialize(wl.admit(Xq[mc]))
-            with wl.L.cols(nc, group=wl.auto("NR")) as nb:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    acc = wl.new(wl.f32, [MR, NR], init=wl.f32(0.0))
-                    with wl.L.blocks(K, extent=64) as wb:
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        wp = wl.stage(wl.load(W[nc]))
+        with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+            xp = wl.stage(wl.load(Xq[mc]))
+            with wl.level.cols(nc, group=wl.auto("NR")) as nb:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    acc = wl.state(wl.f32, [MR, NR], init=wl.f32(0.0))
+                    with wl.level.blocks(K, extent=64) as wb:
                         w = wp[nb, wb]
-                        with wl.L.subs(wb, extent=32) as xb:
+                        with wl.level.subtiles(wb, extent=32) as xb:
                             x = xp[mb, xb]
-                            with wl.L.subs(xb, extent=16) as sub:
+                            with wl.level.subtiles(xb, extent=16) as sub:
                                 q = wl.lookup(
                                     table, wl.u8(w.q[:, sub]), bounds="in_bounds"
                                 )
-                                integer = wl.outer_contract(
-                                    x.q[:, sub], q, over="k", acc=wl.i32
-                                )
+                                integer = wl.dot(x.q[:, sub], q, over="k", acc_dtype=wl.i32)
                                 block_scale = qf.exponent_scale(scale, w.d[:, sub])
                                 acc += (
                                     wl.f32(x.d)
                                     * block_scale
                                     * wl.widen(integer, wl.f32)
                                 )
-                    wl.commit(acc, Y[mb, nb])
+                    wl.store(Y[mb, nb], acc)

@@ -35,15 +35,15 @@ def production_mul_mat_iq2_xs(
     quant_q8_k.quantize_matrix(X, Xq)
     grid_values = grid.values
     sign_values = signs.values
-    with wl.L.rows(M, group=1) as mb:
-        with wl.L.cols(N, group=wl.auto("NR")) as nb:
-            f32_acc = wl.new(wl.f32, [1, NR], init=wl.f32(0.0))
-            with wl.L.blocks(K, extent=256) as kb:
-                w = wl.admit(W[nb, kb])
-                x = wl.admit(Xq[mb, kb])
-                scale_group = wl.iota(16, dtype=wl.u32, axis="scale_group")
-                entry = wl.iota(2, dtype=wl.u32, axis="entry")
-                payload = wl.iota(8, dtype=wl.u16, axis="payload")
+    with wl.level.rows(M, group=1) as mb:
+        with wl.level.cols(N, group=wl.auto("NR")) as nb:
+            f32_acc = wl.state(wl.f32, [1, NR], init=wl.f32(0.0))
+            with wl.level.blocks(K, extent=256) as kb:
+                w = wl.load(W[nb, kb])
+                x = wl.load(Xq[mb, kb])
+                scale_group = wl.arange(0, 16, dtype=wl.u32, axis="scale_group")
+                entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
+                payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
                 block_sum = _iq2_xs_entry_products(
                     w, x, grid_values, sign_values, scale_group, entry, payload
                 )
@@ -53,4 +53,4 @@ def production_mul_mat_iq2_xs(
                     * wl.f32(x.ds)
                     * wl.widen(block_sum, wl.f32)
                 )
-            wl.commit(f32_acc, Y[mb, nb])
+            wl.store(Y[mb, nb], f32_acc)

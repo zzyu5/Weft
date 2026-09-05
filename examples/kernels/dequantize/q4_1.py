@@ -8,6 +8,6 @@ import weft.language as wl
 
 @weft.kernel
 def row_dequantize_q4_1(W: wl.View[ggml.Q4_1, (K,)], Y: wl.View[wl.f32, (K,)]):
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
-        wl.commit(qf.min_affine(w.q, w.d, w.m), Y[kb])
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
+        wl.store(Y[kb], qf.min_affine(w.q, w.d, w.m))

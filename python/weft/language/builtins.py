@@ -11,7 +11,7 @@ class Intrinsic:
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         raise LanguageUseError(
-            f"W.{self.name} is valid only while lowering a Weft definition"
+            f"wl.{self.name} is valid only while lowering a Weft definition"
         )
 
 
@@ -28,21 +28,21 @@ class LevelNamespace:
     cols = LevelConstructor("cols")
     tiles = LevelConstructor("tiles")
     blocks = LevelConstructor("blocks")
-    subs = LevelConstructor("subs")
+    subtiles = LevelConstructor("subs")
 
 
-L = LevelNamespace()
+level = LevelNamespace()
 
 
 def _intrinsic(name: str) -> Intrinsic:
     return Intrinsic(name)
 
 
-new = _intrinsic("new")
-iota = _intrinsic("iota")
-materialize = _intrinsic("materialize")
-admit = _intrinsic("admit")
-commit = _intrinsic("commit")
+state = _intrinsic("state")
+arange = _intrinsic("arange")
+stage = _intrinsic("stage")
+load = _intrinsic("load")
+store = _intrinsic("store")
 subview = _intrinsic("subview")
 reshape = _intrinsic("reshape")
 
@@ -51,10 +51,9 @@ mac_groups = _intrinsic("mac_groups")
 widen = _intrinsic("widen")
 narrow = _intrinsic("narrow")
 reduce = _intrinsic("reduce")
-fold2 = _intrinsic("fold2")
+sum_pairs = _intrinsic("sum_pairs")
 dot = _intrinsic("dot")
-contract = _intrinsic("contract")
-outer_contract = _intrinsic("outer_contract")
+reduce_dot = _intrinsic("reduce_dot")
 lookup = _intrinsic("lookup")
 interleave = _intrinsic("interleave")
 

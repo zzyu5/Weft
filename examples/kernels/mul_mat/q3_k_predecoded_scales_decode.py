@@ -17,4 +17,4 @@ def production_mul_mat_q3_k_predecoded_scales_decode(
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
-            wl.commit(vd_q3_k_q8_k.compute(W[column], Xq[row]), Y[row, column])
+            wl.store(Y[row, column], vd_q3_k_q8_k.compute(W[column], Xq[row]))

@@ -12,15 +12,15 @@ def row_dequantize_iq3_s(
     grid: wl.View[wl.i8, (2048,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
         group = wl.index(0)
-        with wl.L.subs(kb, extent=32) as group_point:
+        with wl.level.subtiles(kb, extent=32) as group_point:
             subscale = w.scales[group]
             scale = wl.f32(w.d) * wl.f32(wl.i32(1) + wl.i32(2) * wl.i32(subscale))
             pair = wl.index(0)
-            with wl.L.subs(group_point, extent=8) as pair_point:
-                lane = wl.iota(8, dtype=wl.u16, axis="k")
+            with wl.level.subtiles(group_point, extent=8) as pair_point:
+                lane = wl.arange(0, 8, dtype=wl.u16, axis="k")
                 half = wl.u32(lane // wl.u16(4))
                 payload = wl.u32(lane % wl.u16(4))
                 storage_coordinate = group * wl.index(8) + pair * wl.index(2)
@@ -33,8 +33,6 @@ def row_dequantize_iq3_s(
                 grid_index = grid_index0 * (wl.u32(1) - half) + grid_index1 * half
                 value = qf.nonlinear_lookup(grid, grid_index * wl.u32(4) + payload)
                 sign = wl.i32(1) - wl.i32(w.signs[pair_point]) * wl.i32(2)
-                wl.commit(
-                    qf.iq_codebook(value * sign, scale), Y[kb][group_point][pair_point]
-                )
+                wl.store(Y[kb][group_point][pair_point], qf.iq_codebook(value * sign, scale))
                 pair += wl.index(1)
             group += wl.index(1)

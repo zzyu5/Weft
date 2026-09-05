@@ -18,4 +18,4 @@ def production_mul_mat_tq1_0_decode(
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
-            wl.commit(vd_tq1_0_q8_k.compute(W[column], Xq[row], powers), Y[row, column])
+            wl.store(Y[row, column], vd_tq1_0_q8_k.compute(W[column], Xq[row], powers))

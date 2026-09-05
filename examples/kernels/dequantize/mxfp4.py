@@ -13,8 +13,8 @@ def row_dequantize_mxfp4(
     scale: wl.View[wl.f32, (256,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
         decoded_scale = qf.exponent_scale(scale, w.e)
         q = qf.nonlinear_lookup(codebook, w.q)
-        wl.commit(qf.fp4_codebook(q, decoded_scale), Y[kb])
+        wl.store(Y[kb], qf.fp4_codebook(q, decoded_scale))

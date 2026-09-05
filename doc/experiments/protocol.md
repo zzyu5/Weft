@@ -4,7 +4,7 @@
 
 ### Encoding 与离散 Storage
 
-bit-exact只用于同一packed bytes、bit/byte order、padding、grouped/layered/joined/bit-plane mapping、离散field，以及定义为exact wrap/saturate的整数结果。它用于发现Encoding错位、field拼接和ABI错误。
+bit-exact 只用于同一 packed bytes、bit/byte order、padding、`grouped/bit_layers/pack_fields` 的 storage mapping、离散 field，以及定义为 exact wrap/saturate 的整数结果。它用于发现 Encoding 错位、field 拼接和 ABI 错误。
 
 ### 浮点 Kernel
 

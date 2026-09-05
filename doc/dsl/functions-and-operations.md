@@ -20,7 +20,7 @@ gemv(Q4K_I[16], Q8_K)
 gemv_panelized(Q4K_I[16], Q8_K)
 ```
 
-前两者因 operand Encoding 不同而是不同程序；第三者若增加 `materialize` 或改变 Level，则也是另一棵作者树。前端根据函数调用、参数类型和静态 source 参数唯一解析 overload。build config 不能替作者在多棵 std tree 中搜索算法结构。
+前两者因 operand Encoding 不同而是不同程序；第三者若增加 `stage` 或改变 Level，则也是另一棵作者树。前端根据函数调用、参数类型和静态 source 参数唯一解析 overload。build config 不能替作者在多棵 std tree 中搜索算法结构。
 
 ## 2. 没有内置 GEMM
 
@@ -30,21 +30,23 @@ GEMM 使用：
 
 ```text
 Level hierarchy
-materialize / admit / commit
-new accumulator
-outer_contract
+stage / load / store
+state accumulator
+dot / reduce_dot
 ```
 
-GEMV 使用同一组构造，去掉 N/column Level 并把 accumulator 降为一维。`outer_contract` 只定义局部 operand/result 数值关系，不拥有 M/N/K outer traversal、blocking、staging、persistent Encoding、accumulator lifetime 或 kernel ABI。
+GEMM 的局部二维块乘写作 `dot`；GEMV 去掉 column Level，以 `reduce_dot` 对一组行和向量求乘积和。两者都不拥有外围 traversal、blocking、只读复用值、persistent Encoding、state lifetime 或 kernel ABI。
 
 ## 3. `auto`
 
 ```python
-with L.tiles(N, extent=auto("NC")) as nc:
-with L.rows(mc, group=auto("MR")) as mb:
+with level.tiles(N, extent=auto("NC")) as nc:
+with level.rows(mc, group=auto("MR")) as mb:
 ```
 
 `auto` 声明由构建过程实例化的有限 source 参数域。`auto("MR")` 在所在函数中引入同名静态符号；同一作用域内同名 `auto` 必须绑定同一个值。std overload 或显式 build config 必须提供非空有限值域。
+
+View annotation 中的 `M/N/K` 等未绑定名称引入同名 shape symbol；同一名称复用同一 logical axis identity。它们由调用 ABI 的 extent 提供，不要求在 kernel 中另写赋值。`auto("MR")` 引入的静态参数则由构建配置绑定，不能把它当作运行时 shape 输入。候选域可以在 std 或构建调用侧，kernel 不必重复列出；缺少必要绑定必须报错，不能从 target 或默认值猜测作者参数。
 
 每组绑定形成一份固定 source candidate。其 Level tree、logical values、births 和 handoff 不再变化；target 只物理化这棵树。资源不足时 spill 或拒绝，不回头修改 source 参数。
 
@@ -101,28 +103,34 @@ integer `add` 使用声明的 accumulator overflow 规则；floating `add` 在 c
 
 源程序只有一个 reduce result；target 可以在 closed operation 内使用多个 physical partial、lane collective 或树归约。这些 temporary 不成为 canonical Value。
 
-### 7.2 `fold2`
+### 7.2 `sum_pairs`
 
 ```python
-fold2(x)       # T[N] -> i32[N/2]
+sum_pairs(x)       # integer[N] -> i32[N/2]
 ```
 
-相邻两项相加并提升到 `i32`。输入最后一轴必须能被 2 整除。它改变 logical shape，因此是显式 operation。
+`sum_pairs` 将最后一轴上的相邻两项提升并相加，结果固定为 `i32`。该轴长度必须为偶数，其 identity 与其它轴保持不变。它不是任意 dtype 的可调 reduction，也不改变配对位置。
 
-### 7.3 `dot`、`contract` 与 `outer_contract`
+### 7.3 块乘 `dot` 与乘积归约 `reduce_dot`
 
 ```python
-dot(a, b)
-contract(a, b, over="k", acc=f32)
-outer_contract(a, b, over="k", acc=i32)
+dot(a, b, over="k", acc_dtype=f32)
+reduce_dot(a, x, over="k", acc_dtype=i32)
+reduce_dot(a, b, over=("entry", "payload"), acc_dtype=i32)
 ```
 
-`dot` 逐元素相乘并消去 operands 的最后一个共同 axis。`contract` 在指定 reduction axes 上缩并；`outer_contract` 显式保留两侧不同的 free axes，形成 outer-product result。它们只拥有局部数值关系，不拥有外围 traversal、staging、state 或 ABI。
+`dot` 接收两个二维 matrix blocks：`over` 指定双方共有的一条 reduction axis，双方各保留一条不同的 row/column axis。axis identity 决定对应关系，不要求 reduction axis 在两侧具有相同位置。结果轴按左侧 free axis、右侧 free axis 排列。
+
+`reduce_dot` 接收一般 shaped Values，在显式 `over` 指定的一条或多条共同轴上求乘积和；共享的非缩并轴逐点对齐，非共享轴广播。结果先保留左侧 free axes，再添加右侧独有的 free axes。向量内积、matrix-vector、带共享 batch 轴的乘积，以及多轴 decode 支路都使用这一入口。
+
+两者的 `over` 非空、无重复，且每条缩并轴都必须存在于双方；所有共享轴的 extent 必须一致。`acc_dtype` 是累加及结果 dtype，不是初始 accumulator Value；省略时采用 canonical 类型提升规则。它们都是闭合 numerical operation，不能为了改写源码而展开为 `reduce(a * b)`：先在窄输入 dtype 上求乘积可能引入不同的溢出边界。
+
+core 不复制 Triton 的目标尺寸下限，也不保证任意 dtype/shape 都存在 target leaf。RVV/IME 的 operand、extent、alignment、tail 和资源要求由 target verifier 检查；没有合法实现时明确拒绝。名称不指定 engine，不能用 `dot` 请求 IME 或用 `reduce_dot` 强制标量执行。
 
 ## 8. Lookup 与显式 index domain
 
 ```python
-indices = iota(8, dtype=u32)
+indices = arange(0, 8, dtype=u32)
 values = lookup(codebook, base + indices)
 ```
 
@@ -133,7 +141,7 @@ values = lookup(codebook, base + indices)
 对 shaped Value 的 slice/projection 必须显式保存输入输出 axis relation：
 
 ```python
-panel = materialize(admit(B[kc, nc]))
+panel = stage(load(B[kc, nc]))
 b = panel[kb, nb]
 ```
 
@@ -141,12 +149,12 @@ b = panel[kb, nb]
 
 ```python
 tail = subview(Y[kb], offsets=(160,), extents=(80,))
-commit(value, tail)
+store(tail, value)
 ```
 
 `offsets` 和 `extents` 以 logical element coordinate 计数，每个 base axis 恰好对应一项；它们必须是编译期整数，`offset >= 0`、`extent > 0`，并且 `offset + extent` 不得越过 base extent。结果保留 base 的 Encoding、axis identity、access 与 alias relation，只把 logical shape 缩为 `extents`。`subview` 不改变 Level domain、partition、multiplicity、birth 或 handoff。
 
-`subview` 只定义规则连续区域，不接受 stride、index Value、gather 或 scatter。它的结果只能作为 `commit` destination；多个 subview 是否重叠由作者负责，canonical verifier 不做跨 op 的重叠证明。
+`subview` 只定义规则连续区域，不接受 stride、index Value、gather 或 scatter。它的结果只能作为 `store` destination；多个 subview 是否重叠由作者负责，canonical verifier 不做跨 op 的重叠证明。
 
 `reshape` 表示 local shaped Value 的显式坐标重排：
 
@@ -184,7 +192,7 @@ target = K1
 require = uses_extension(IME)
 ```
 
-requirement 是对 target physical program 的谓词。它先把不能满足要求的 physical structures 判为非法，再验证 selected program；不满足就拒绝 build，不静默 fallback。它不改变 canonical values，也不授权编译器改 source tree。普通 use-def 表达 value consumer，`materialize` 表达 logical staged boundary；register↔fragment 或 wide↔matrix 的交接由 physical conversion 表达。
+requirement 是对 target physical program 的谓词。它先把不能满足要求的 physical structures 判为非法，再验证 selected program；不满足就拒绝 build，不静默 fallback。它不改变 canonical values，也不授权编译器改 source tree。普通 use-def 表达 value consumer，`stage` 表达 logical staged boundary；register↔fragment 或 wide↔matrix 的交接由 physical conversion 表达。
 
 Weft core DSL 当前不定义 soft-hint 表面。target schedule preference、cache policy 或 instruction preference若存在，应作为 build/target metadata附着到明确实体，不得进入 numerical operation 或 Value identity。
 

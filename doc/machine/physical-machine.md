@@ -73,7 +73,7 @@ time 表示同一 source instance 内的物理执行次序，包括：
 - prologue、steady state 和 epilogue；
 - spill、reload 或 rematerialize 的发生点。
 
-每个 physical time point 必须保留它对应的 source Level/domain point、ordinary loop iteration、tail validity 和 effect order。增加 physical time point 不能增加 `admit`、`new`、`materialize` 或 handoff 的逻辑次数。
+每个 physical time point 必须保留它对应的 source Level/domain point、ordinary loop iteration、tail validity 和 effect order。增加 physical time point 不能增加 `load`、`state`、`stage` 或 handoff 的逻辑次数。
 
 ### 4.2 SIMD lane
 
@@ -205,7 +205,7 @@ local pack 是 target 为同一个 canonical Value 或 value-use edge选择的�
 
 - logical values、shape 与 axes；
 - producer Encoding、address relation 与 validity；
-- `materialize` 建立的 logical birth、lifetime 与 reuse domain；
+- `stage` 建立的 logical birth、lifetime 与 reuse domain；
 - all consumers 及其 typed operation requirements。
 
 target compiler 据此决定是否需要 local pack、哪条 logical axis 对当前 consumer 连续、pack 的 carrier 与 schema，以及它在 register、fragment 或 local storage 中的表示。选择同时读取：
@@ -216,7 +216,7 @@ target compiler 据此决定是否需要 local pack、哪条 logical axis 对当
 - live interval、pipeline buffers 与 resources；
 - physical engine handoff 与 local-storage 能力。
 
-target 使用确定规则与优先级选取第一个合法 pack 结构；schema 固定后的 lane factor、LMUL、microtile extent 和 buffer count 可以作为有限 physical parameters 实测。local pack 不得改变 canonical axes、Level birth、effects 或 source materialization 次数，也不得越过 pin boundary。
+target 从显式声明的有限 pack 候选中按固定规则、分项成本或外部实测选择；schema 内的 lane factor、LMUL、microtile extent 和 buffer count 同样可以有限调优。候选来源、预算和估计遵守[物理优化方法](../compiler/optimization-principles.md)。local pack 不得改变 canonical axes、Level birth、effects 或 staged value 的逻辑初始化次数，也不得越过 pin boundary。
 
 若作者要改变 logical axes，使用 canonical reshape/transpose/index operation；若要改变跨调用 bytes、artifact 与 ABI，使用 derived Encoding builder。两者都不是 local pack。
 
@@ -248,7 +248,7 @@ spill 将一个 physical representation 保存到不与 source View 混淆的 lo
 
 rematerialize 只允许重新执行 operation semantics 明确允许重算的 pure producer。带 effect、volatile/atomic memory、ordered state、不可重复外部读取或会跨越 source handoff 的 operation 不可 rematerialize。
 
-staged Value 被 spill 不等于再次执行 source `materialize`：它仍然是同一次 logical birth 的物理存储变化。任何会增加 source materialization 次数或越过 pin boundary 的方案都非法。
+staged Value 被 spill 不等于再次执行 source `stage`：它仍然是同一次 logical birth 的物理存储变化。任何会增加 source materialization 次数或越过 pin boundary 的方案都非法。
 
 ## 11. Local cluster 与 software pipeline
 
@@ -302,7 +302,7 @@ axis relation、Encoding mapping、typed conversion关系、effect/alias/order�
 
 ### 13.2 结构性选择
 
-同一 source tree 下的 engine、lane/register/fragment mapping、memory form、local pack、materialization/reload/rematerialize、local pipeline structure、fragment family。target 使用确定规则与固定优先级，不使用 cost model，不生成多个结构进行性能比较。
+同一 source tree 下的 engine、lane/register/fragment mapping、memory form、local pack、materialization/reload/rematerialize、local pipeline structure 与 fragment family，均可由 target 提供有界候选。固定优先级、分项成本或外部实测只比较合法候选，不能代替数值/effect/资源验证；选定结果必须保存在 Physical IR 中。
 
 ### 13.3 参数性选择
 
@@ -353,7 +353,7 @@ target = K1
 require = uses_extension(IME)
 ```
 
-requirement 是 physical legality 的额外约束：结构性选择前，不能满足它的 structures 被排除；选择后、emission 前还要对完整 physical program 验证。不满足就拒绝当前 build，不能静默改用 RVV，也不能修改 source tree。它约束的是 target artifact，不定义 canonical operation 或 Value identity。若高性能 IME 路径需要不同的 Level/materialize/persistent Encoding，作者必须在进入 lowering 前选择另一份 std source tree。
+requirement 是 physical legality 的额外约束：结构性选择前，不能满足它的 structures 被排除；选择后、emission 前还要对完整 physical program 验证。不满足就拒绝当前 build，不能静默改用 RVV，也不能修改 source tree。它约束的是 target artifact，不定义 canonical operation 或 Value identity。若高性能 IME 路径需要不同的 Level/stage/persistent Encoding，作者必须在进入 lowering 前选择另一份 std source tree。
 
 ## 15. 与 Triton/TileLang 可复用的机制边界
 

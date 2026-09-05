@@ -12,10 +12,10 @@ def row_dequantize_tq1_0(
     powers: wl.View[wl.u32, (5,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    with wl.L.blocks(K, extent=256) as kb:
-        w = wl.admit(W[kb])
-        lane0 = wl.iota(32, axis="k")
-        digit0 = wl.iota(5, dtype=wl.u32, axis="tq1_digit0")
+    with wl.level.blocks(K, extent=256) as kb:
+        w = wl.load(W[kb])
+        lane0 = wl.arange(0, 32, axis="k")
+        digit0 = wl.arange(0, 5, dtype=wl.u32, axis="tq1_digit0")
         q0 = qf.radix3_digit_i8(powers, w.q[lane0], digit0)
         y0 = wl.reshape(
             qf.ternary_radix(q0, w.d),
@@ -23,9 +23,9 @@ def row_dequantize_tq1_0(
             axes=("k",),
             order=("tq1_digit0", "k"),
         )
-        wl.commit(y0, wl.subview(Y[kb], offsets=(0,), extents=(160,)))
-        lane1 = wl.iota(16, axis="k")
-        digit1 = wl.iota(5, dtype=wl.u32, axis="tq1_digit1")
+        wl.store(wl.subview(Y[kb], offsets=(0,), extents=(160,)), y0)
+        lane1 = wl.arange(0, 16, axis="k")
+        digit1 = wl.arange(0, 5, dtype=wl.u32, axis="tq1_digit1")
         q1 = qf.radix3_digit_i8(powers, w.q[wl.u32(32) + lane1], digit1)
         y1 = wl.reshape(
             qf.ternary_radix(q1, w.d),
@@ -33,9 +33,9 @@ def row_dequantize_tq1_0(
             axes=("k",),
             order=("tq1_digit1", "k"),
         )
-        wl.commit(y1, wl.subview(Y[kb], offsets=(160,), extents=(80,)))
-        lane2 = wl.iota(4, axis="k")
-        digit2 = wl.iota(4, dtype=wl.u32, axis="tq1_digit2")
+        wl.store(wl.subview(Y[kb], offsets=(160,), extents=(80,)), y1)
+        lane2 = wl.arange(0, 4, axis="k")
+        digit2 = wl.arange(0, 4, dtype=wl.u32, axis="tq1_digit2")
         q2 = qf.radix3_digit_i8(powers, w.qh[lane2], digit2)
         y2 = wl.reshape(
             qf.ternary_radix(q2, w.d),
@@ -43,4 +43,4 @@ def row_dequantize_tq1_0(
             axes=("k",),
             order=("tq1_digit2", "k"),
         )
-        wl.commit(y2, wl.subview(Y[kb], offsets=(240,), extents=(16,)))
+        wl.store(wl.subview(Y[kb], offsets=(240,), extents=(16,)), y2)

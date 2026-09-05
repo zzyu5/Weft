@@ -12,8 +12,8 @@ def row_dequantize_iq4_nl(
     codebook: wl.View[wl.i8, (16,)],
     Y: wl.View[wl.f32, (K,)],
 ):
-    table = wl.materialize(wl.admit(codebook))
-    with wl.L.blocks(K, extent=32) as kb:
-        w = wl.admit(W[kb])
+    table = wl.stage(wl.load(codebook))
+    with wl.level.blocks(K, extent=32) as kb:
+        w = wl.load(W[kb])
         q = qf.small_nonlinear_lookup(table, w.q)
-        wl.commit(qf.fp4_codebook(q, w.d), Y[kb])
+        wl.store(Y[kb], qf.fp4_codebook(q, w.d))

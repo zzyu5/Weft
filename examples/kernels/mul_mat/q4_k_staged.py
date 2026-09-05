@@ -16,24 +16,22 @@ def production_mul_mat_q4_k_staged(
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
-            wl.commit(wl.f32(0.0), Y[row, column])
-    with wl.L.tiles(N, extent=wl.auto("NC")) as nc:
-        with wl.L.tiles(K, extent=wl.auto("KC")) as kc:
-            wp = wl.materialize(wl.admit(W[nc, kc]))
-            with wl.L.tiles(M, extent=wl.auto("MC")) as mc:
-                with wl.L.rows(mc, group=wl.auto("MR")) as mb:
-                    with wl.L.cols(nc, group=16) as nb:
-                        f32_acc = wl.new(wl.f32, [MR, 16], init=wl.admit(Y[mb, nb]))
-                        with wl.L.blocks(kc, extent=256) as kb:
+            wl.store(Y[row, column], wl.f32(0.0))
+    with wl.level.tiles(N, extent=wl.auto("NC")) as nc:
+        with wl.level.tiles(K, extent=wl.auto("KC")) as kc:
+            wp = wl.stage(wl.load(W[nc, kc]))
+            with wl.level.tiles(M, extent=wl.auto("MC")) as mc:
+                with wl.level.rows(mc, group=wl.auto("MR")) as mb:
+                    with wl.level.cols(nc, group=16) as nb:
+                        f32_acc = wl.state(wl.f32, [MR, 16], init=wl.load(Y[mb, nb]))
+                        with wl.level.blocks(kc, extent=256) as kb:
                             w = wp[nb, kb]
-                            x = wl.admit(Xq[mb, kb])
-                            i32_acc = wl.new(wl.i32, [MR, 16], init=0)
-                            with wl.L.subs(extent=32) as s:
+                            x = wl.load(Xq[mb, kb])
+                            i32_acc = wl.state(wl.i32, [MR, 16], init=0)
+                            with wl.level.subtiles(extent=32) as s:
                                 p16 = wl.mac_groups(x.q[s], w.q[s], n=4, into=wl.i16)
                                 i32_acc += wl.reduce(wl.widen(p16, wl.i32)) * w.sc[s]
-                            mins = wl.fold2(x.bsum)
-                            min_term = wl.outer_contract(
-                                mins, w.m, over="k", acc=wl.i32
-                            )
+                            mins = wl.sum_pairs(x.bsum)
+                            min_term = wl.dot(mins, w.m, over="k", acc_dtype=wl.i32)
                             f32_acc += x.ds * (w.d * i32_acc - w.dmin * min_term)
-                        wl.commit(f32_acc, Y[mb, nb])
+                        wl.store(Y[mb, nb], f32_acc)
