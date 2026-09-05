@@ -38,6 +38,13 @@ fi
 if [[ -n ${WEFT_RECORD_AXIS_POLICY:-} ]]; then
   record_axis_policy+=(--record-axis-policy "${WEFT_RECORD_AXIS_POLICY}")
 fi
+if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
+  case "${format}" in
+    iq2_xxs)
+      physical_auto+=(--auto-lmul-eighths 16)
+      ;;
+  esac
+fi
 if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
   case "${format}" in
     q1_0)

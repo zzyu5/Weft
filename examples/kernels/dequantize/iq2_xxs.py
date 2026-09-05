@@ -16,33 +16,34 @@ def row_dequantize_iq2_xxs(
     with wl.L.blocks(K, extent=256) as kb:
         w = wl.admit(W[kb])
         group = wl.index(0)
-        with wl.L.subs(kb, extent=32) as sub:
-            element = wl.iota(32, dtype=wl.u8, axis="k")
-            entry = element // wl.u8(8)
-            lane = element % wl.u8(8)
+        with wl.L.subs(kb, extent=32) as group_point:
             group_byte = group * wl.index(8)
-            grid_index = wl.u16(w.q[wl.u16(group_byte) + wl.u16(entry)])
             metadata = wl.u32(w.q[group_byte + wl.index(4)]) | wl.u32(
                 w.q[group_byte + wl.index(5)]
             ) << wl.u32(8)
             metadata = metadata | wl.u32(w.q[group_byte + wl.index(6)]) << wl.u32(16)
             metadata = metadata | wl.u32(w.q[group_byte + wl.index(7)]) << wl.u32(24)
-            sign_index = wl.narrow(
-                qf.extract_bits(metadata, wl.u32(entry) * wl.u32(7), 7),
-                wl.u16,
-                rounding="rtz",
-                saturation=False,
-            )
             subscale = wl.f32(0.5) + wl.f32(qf.extract_bits(metadata, 28, 4))
             scale = wl.f32(w.d) * subscale * wl.f32(0.25)
-            grid_value = wl.lookup(
-                grid, grid_index * wl.u16(8) + wl.u16(lane), bounds="in_bounds"
-            )
-            sign_value = wl.lookup(
-                signs, sign_index * wl.u16(8) + wl.u16(lane), bounds="in_bounds"
-            )
-            wl.commit(
-                qf.iq_codebook(wl.i32(grid_value) * wl.i32(sign_value), scale),
-                Y[kb][sub],
-            )
+            entry = wl.index(0)
+            with wl.L.subs(group_point, extent=8) as entry_point:
+                lane = wl.iota(8, dtype=wl.u16, axis="k")
+                grid_index = wl.u16(w.q[group_byte + entry])
+                sign_index = wl.narrow(
+                    qf.extract_bits(metadata, wl.u32(entry) * wl.u32(7), 7),
+                    wl.u16,
+                    rounding="rtz",
+                    saturation=False,
+                )
+                grid_value = wl.lookup(
+                    grid, grid_index * wl.u16(8) + lane, bounds="in_bounds"
+                )
+                sign_value = wl.lookup(
+                    signs, sign_index * wl.u16(8) + lane, bounds="in_bounds"
+                )
+                wl.commit(
+                    qf.iq_codebook(wl.i32(grid_value) * wl.i32(sign_value), scale),
+                    Y[kb][group_point][entry_point],
+                )
+                entry += wl.index(1)
             group += wl.index(1)
