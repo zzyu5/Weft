@@ -4386,21 +4386,54 @@ public:
         combineArity = partialSlots % 2 == 0 ? 2 : partialSlots;
         resources = levelScaledResources;
       }
+      auto topologyResultElement = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(dot.getResult().getType()));
+      auto pairSlot = partialSlotType(builder, dot);
+      auto widenedPairSlot =
+          pairSlot ? widenPartialSlotType(builder, pairSlot)
+                   : riscv::ValueType();
+      const int64_t pairSourceGroups =
+          pairSlot ? 2 * pairSlot.getLayout().getRegisterGroups() : 0;
+      const int64_t pairResultGroups =
+          widenedPairSlot
+              ? widenedPairSlot.getLayout().getRegisterGroups()
+              : 0;
+      const int64_t pairResources = std::max<int64_t>(
+          {operandGroups + pairSourceGroups, pairSourceGroups + pairResultGroups,
+           pairResultGroups + 2});
+      const bool exactTwoStreamWidening =
+          !fused && streams == 2 && pairSlot && widenedPairSlot &&
+          topologyResultElement && topologyResultElement.isSigned() &&
+          topologyResultElement.getWidth() == 32 && kernel &&
+          kernel.getTarget().getHasWideningInteger() &&
+          pairResultGroups <= kernel.getTarget().getMaxWideningCombineGroups() &&
+          riscv::supportsRVVLayout(kernel.getTarget(), pairSlot.getLayout()) &&
+          riscv::supportsRVVLayout(kernel.getTarget(),
+                                   widenedPairSlot.getLayout()) &&
+          pairResources <= kernel.getTarget().getVectorRegisters();
+
       // Independent partials are a structural preference supplied by the
-      // target profile, not a universal property of RVV.  The generic planner
-      // only proves that the selected multilevel tree is geometrically and
-      // resource legal.
+      // target profile, not a universal property of RVV.  A two-stream
+      // contraction enters this topology only when narrow fusion is not exact:
+      // its two i16 products are widened into one i32 carrier before the sole
+      // final reduction.  The fixed structural priority applies only while the
+      // widened carrier occupies at most two architectural register groups;
+      // beyond that point the extra wide live range loses to per-stream
+      // reduction on both independent VLEN128 inputs.  Larger trees retain the
+      // existing multilevel policy.
       if (kind.empty() && kernel &&
           kernel.getTarget().getPartialCombinePolicy() ==
               "independent-multilevel" &&
-          streams >= 4 &&
-          (streams & (streams - 1)) == 0 &&
-          available >= 2 && partialGroups > 0 &&
-          streams <= (available - 2) / partialGroups) {
+          (exactTwoStreamWidening ||
+           (streams >= 4 && (streams & (streams - 1)) == 0 &&
+            available >= 2 && partialGroups > 0 &&
+            streams <= (available - 2) / partialGroups))) {
         kind = "independent";
         partialSlots = streams;
         combineArity = 2;
-        resources = std::max<int64_t>(1, streams * partialGroups + 2);
+        resources = exactTwoStreamWidening
+                        ? pairResources
+                        : std::max<int64_t>(1, streams * partialGroups + 2);
       }
       if (kind.empty())
         kind = fused ? "sequential_fused" : "sequential_per_stream";
@@ -5043,13 +5076,31 @@ public:
       riscv::PartialSetType finalSet = sourceSet;
       int64_t remainingSlots = slots;
       int64_t termsPerSlot = sourceSet.getTermsPerSlot();
+      riscv::ValueType combineSlot = selectedSlot;
+      auto selectedElement = mlir::dyn_cast<mlir::IntegerType>(
+          selectedSlot.getElementType());
+      const bool widenFirstCombine =
+          slots == 2 && !dot.getFusedStreamsLegal() && selectedElement &&
+          selectedElement.isSigned() && selectedElement.getWidth() == 16 &&
+          resultElement.isSigned() && resultElement.getWidth() == 32;
       while (remainingSlots > 1) {
         const int64_t arity = remainingSlots % 2 == 0 ? 2 : remainingSlots;
         remainingSlots /= arity;
         termsPerSlot *= arity;
+        if (widenFirstCombine) {
+          combineSlot = widenPartialSlotType(builder, selectedSlot);
+          if (!combineSlot) {
+            dot.emitError(
+                "selected two-stream topology has no legal widened i32 combine carrier");
+            signalPassFailure();
+            return;
+          }
+        }
+        const int64_t combineGroups =
+            combineSlot.getLayout().getRegisterGroups();
         finalSet = riscv::PartialSetType::get(
-            builder.getContext(), selectedSlot, *reductionAxis, remainingSlots,
-            termsPerSlot, remainingSlots * slotGroups);
+            builder.getContext(), combineSlot, *reductionAxis, remainingSlots,
+            termsPerSlot, remainingSlots * combineGroups);
         combineTypes.push_back(mlir::TypeAttr::get(finalSet));
         combineArities.push_back(arity);
       }
@@ -7384,16 +7435,27 @@ public:
         for (auto [typeAttr, arity] :
              llvm::zip(plan.getCombineSetTypes(),
                        plan.getCombineArities().asArrayRef())) {
+          auto inputSet =
+              mlir::cast<riscv::PartialSetType>(partials.getType());
           auto combinedType = mlir::cast<riscv::PartialSetType>(
               mlir::cast<mlir::TypeAttr>(typeAttr).getValue());
+          auto inputElement = mlir::dyn_cast<mlir::IntegerType>(
+              inputSet.getPartialType().getElementType());
+          auto combinedElement = mlir::dyn_cast<mlir::IntegerType>(
+              combinedType.getPartialType().getElementType());
+          const bool wideningCombine =
+              inputElement && combinedElement && inputElement.isSigned() &&
+              combinedElement.isSigned() && inputElement.getWidth() == 16 &&
+              combinedElement.getWidth() == 32;
+          const llvm::StringRef combineInstruction =
+              wideningCombine ? "rvv.partial-combine.widen"
+                              : "rvv.partial-combine";
           auto combine = rewriter.create<riscv::RVVPartialCombineOp>(
               dot.getLoc(), combinedType, partials, arity, "pairwise",
               dot.getPartialTopology().getPartialAxes(),
               riscv_internal::leaf(
-                  rewriter, "rvv", "partial-combine",
-                  "rvv.partial-combine", "rvv.partial-combine",
-                  mlir::cast<riscv::PartialSetType>(partials.getType())
-                      .getResourceGroups(),
+                  rewriter, "rvv", "partial-combine", combineInstruction,
+                  combineInstruction, inputSet.getResourceGroups(),
                   combinedType.getResourceGroups(), 0, 0, "none", "exact",
                   {reductionAxis, arity, combinedType.getSlots()}));
           riscv_internal::copyOrigin(dot, combine);

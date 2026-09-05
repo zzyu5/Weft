@@ -1317,11 +1317,13 @@ mlir::LogicalResult TargetAttr::verify(
     int64_t vlenBits, int64_t vectorRegisters,
     int64_t maxPrivateStackBytes, mlir::DenseI64ArrayAttr supportedSEW,
     mlir::DenseI64ArrayAttr legalLMULEighths,
+    int64_t maxWideningCombineGroups,
     llvm::StringRef partialCombinePolicy, llvm::StringRef recordAxisPolicy,
     mlir::ArrayAttr fragments) {
   if (triple.empty() || march.empty() || abi.empty() || vlenBits <= 0 ||
       vectorRegisters <= 0 || maxPrivateStackBytes < 0 || supportedSEW.empty() ||
-      legalLMULEighths.empty())
+      legalLMULEighths.empty() || maxWideningCombineGroups <= 0 ||
+      maxWideningCombineGroups > vectorRegisters)
     return emitError() << "RISC-V target facts must be complete";
   if (!hasRVV || (!hasWideningInteger && !hasWideningFloat))
     return emitError()
@@ -1610,6 +1612,38 @@ mlir::LogicalResult PartialLayoutPlanAttr::verify(
   return mlir::success();
 }
 
+static bool isWideningPartialCombineStage(weft::riscv::PartialSetType source,
+                                          weft::riscv::PartialSetType result,
+                                          int64_t arity) {
+  auto sourceValue = source.getPartialType();
+  auto resultValue = result.getPartialType();
+  auto sourceElement =
+      mlir::dyn_cast<mlir::IntegerType>(sourceValue.getElementType());
+  auto resultElement =
+      mlir::dyn_cast<mlir::IntegerType>(resultValue.getElementType());
+  auto sourceLayout = sourceValue.getLayout();
+  auto resultLayout = resultValue.getLayout();
+  return arity == 2 && sourceElement && resultElement &&
+         sourceElement.isSigned() && resultElement.isSigned() &&
+         sourceElement.getWidth() == 16 && resultElement.getWidth() == 32 &&
+         sourceValue.getShape() == resultValue.getShape() &&
+         sourceValue.getAxisIds() == resultValue.getAxisIds() &&
+         sourceLayout.getCarrier() == "rvv" &&
+         resultLayout.getCarrier() == "rvv" &&
+         sourceLayout.getAxisIds() == resultLayout.getAxisIds() &&
+         sourceLayout.getTimeFactors() == resultLayout.getTimeFactors() &&
+         sourceLayout.getLaneFactors() == resultLayout.getLaneFactors() &&
+         sourceLayout.getReplicaFactors() == resultLayout.getReplicaFactors() &&
+         sourceLayout.getFragmentFactors() ==
+             resultLayout.getFragmentFactors() &&
+         sourceLayout.getLocalFactors() == resultLayout.getLocalFactors() &&
+         sourceLayout.getSew() == 16 && resultLayout.getSew() == 32 &&
+         resultLayout.getLmulEighths() ==
+             sourceLayout.getLmulEighths() * 2 &&
+         sourceLayout.getVl() == resultLayout.getVl() &&
+         sourceLayout.getValidity() == resultLayout.getValidity();
+}
+
 mlir::LogicalResult PartialCombinePlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::StringRef realization, mlir::Type sourceSetType,
@@ -1653,8 +1687,12 @@ mlir::LogicalResult PartialCombinePlanAttr::verify(
       auto next = typed ? mlir::dyn_cast<weft::riscv::PartialSetType>(
                               typed.getValue())
                         : weft::riscv::PartialSetType();
+      const bool preservesType =
+          next && next.getPartialType() == previous.getPartialType();
+      const bool widensType =
+          next && isWideningPartialCombineStage(previous, next, arity);
       if (!next || arity <= 1 || previous.getSlots() % arity ||
-          next.getPartialType() != previous.getPartialType() ||
+          (!preservesType && !widensType) ||
           next.getReductionAxis() != previous.getReductionAxis() ||
           next.getSlots() != previous.getSlots() / arity ||
           next.getTermsPerSlot() != previous.getTermsPerSlot() * arity)
@@ -8405,14 +8443,20 @@ mlir::LogicalResult RVVPartialCombineOp::verify() {
       llvm::all_of(getLogicalReductionAxes(), [&](int64_t axis) {
         return axis > 0 && logicalAxes.insert(axis).second;
       });
+  const bool preservesType =
+      result.getPartialType() == input.getPartialType();
+  const bool widensType =
+      isWideningPartialCombineStage(input, result, getArity());
+  const llvm::StringRef instruction =
+      widensType ? "rvv.partial-combine.widen" : "rvv.partial-combine";
   if (!logicalAxesLegal || getArity() <= 1 || getTopology() != "pairwise" ||
       input.getSlots() % getArity() ||
-      result.getPartialType() != input.getPartialType() ||
+      (!preservesType && !widensType) ||
       result.getReductionAxis() != input.getReductionAxis() ||
       result.getSlots() != input.getSlots() / getArity() ||
       result.getTermsPerSlot() != input.getTermsPerSlot() * getArity() ||
-      !exactLeaf(getLeaf(), "rvv", "partial-combine",
-                 "rvv.partial-combine", "none", "exact") ||
+      !exactLeaf(getLeaf(), "rvv", "partial-combine", instruction, "none",
+                 "exact") ||
       getLeaf().getParameters().asArrayRef() !=
           llvm::ArrayRef<int64_t>({input.getReductionAxis(),
                                    static_cast<int64_t>(getArity()),

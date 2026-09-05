@@ -11401,7 +11401,9 @@ mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
 
 mlir::LogicalResult
 Emitter::compileRVVPartialCombine(riscv::RVVPartialCombineOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.partial-combine")
+  llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.partial-combine" &&
+      instruction != "rvv.partial-combine.widen")
     return fail(operation, "RVV partial combine has no exact selected leaf");
   Binding input = bindings.lookup(operation.getInput());
   auto inputType = operation.getInput().getType();
@@ -11418,7 +11420,20 @@ Emitter::compileRVVPartialCombine(riscv::RVVPartialCombineOp operation) {
   const std::string suffix = vectorSuffixFor(resultType.getPartialType());
   const std::string vl = std::to_string(
       physicalLanesFor(resultType.getPartialType()));
+  if (instruction == "rvv.partial-combine.widen" &&
+      operation.getArity() != 2)
+    return fail(operation,
+                "RVV widening partial combine requires one exact pair");
   for (int64_t slot = 0; slot < resultType.getSlots(); ++slot) {
+    if (instruction == "rvv.partial-combine.widen") {
+      const size_t first = static_cast<size_t>(slot * 2);
+      std::string next = fresh("partial_widen_tree");
+      line(type + " " + next + " = __riscv_vwadd_vv_" + suffix + "(" +
+           input.parts[first] + ", " + input.parts[first + 1] + ", " + vl +
+           ");");
+      result.parts.push_back(std::move(next));
+      continue;
+    }
     llvm::SmallVector<std::string> level;
     for (int64_t term = 0; term < operation.getArity(); ++term)
       level.push_back(input.parts[slot * operation.getArity() + term]);

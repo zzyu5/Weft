@@ -67,6 +67,7 @@ bool weft::RISCVTargetProfile::supportsSegmentVectorMemory(
 bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                                    int64_t vlenBits,
                                    llvm::StringRef matrixExtension,
+                                   int64_t maxWideningCombineGroups,
                                    llvm::StringRef partialCombinePolicy,
                                    llvm::StringRef recordAxisPolicy,
                                    RISCVTargetProfile &profile,
@@ -122,6 +123,10 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
   }
   if (vlenBits < 0 || (vlenBits != 0 && vlenBits % 8 != 0)) {
     error = "--vlen-bits must be zero or a positive multiple of eight";
+    return false;
+  }
+  if (maxWideningCombineGroups <= 0) {
+    error = "--max-widening-combine-groups must be positive";
     return false;
   }
   llvm::SmallVector<llvm::StringRef> tokens;
@@ -208,6 +213,7 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
   }
   profile.vlenBits = vlenBits;
   profile.vectorRegisters = 32;
+  profile.maxWideningCombineGroups = maxWideningCombineGroups;
   profile.supportedSEW = {8, 16, 32, 64};
   profile.legalLMULEighths = {1, 2, 4, 8, 16, 32, 64};
   profile.hasIndexedMemory = true;

@@ -72,6 +72,7 @@ struct RISCVTargetProfile {
   int64_t vlenBits = 0;
   int64_t vectorRegisters = 0;
   int64_t maxPrivateStackBytes = 65536;
+  int64_t maxWideningCombineGroups = 2;
   std::vector<unsigned> supportedSEW;
   std::vector<int> legalLMULEighths;
   std::vector<RISCVFragmentCapability> fragmentCapabilities;
@@ -95,6 +96,7 @@ struct RISCVTargetProfile {
 bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                              int64_t vlenBits,
                              llvm::StringRef matrixExtension,
+                             int64_t maxWideningCombineGroups,
                              llvm::StringRef partialCombinePolicy,
                              llvm::StringRef recordAxisPolicy,
                              RISCVTargetProfile &profile, std::string &error);

@@ -845,7 +845,7 @@ riscv_internal::target(mlir::Builder &builder,
       profile.hasWideningFloat,
       profile.vlenBits, profile.vectorRegisters, profile.maxPrivateStackBytes,
       integers(builder, sews), integers(builder, lmuls),
-      partialCombinePolicy, recordAxisPolicy,
+      profile.maxWideningCombineGroups, partialCombinePolicy, recordAxisPolicy,
       builder.getArrayAttr(fragments));
 }
 

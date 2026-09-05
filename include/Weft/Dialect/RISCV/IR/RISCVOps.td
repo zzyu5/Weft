@@ -128,6 +128,7 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
     "int64_t":$maxPrivateStackBytes,
     "::mlir::DenseI64ArrayAttr":$supportedSEW,
     "::mlir::DenseI64ArrayAttr":$legalLMULEighths,
+    "int64_t":$maxWideningCombineGroups,
     StringRefParameter<"partial combine structural priority">:$partialCombinePolicy,
     StringRefParameter<"record-axis placement structural priority">:$recordAxisPolicy,
     "::mlir::ArrayAttr":$fragments
@@ -137,7 +138,8 @@ def WeftRISCV_TargetAttr : WeftRISCV_Attr<"Target", "target"> {
         $hasIndexedMemory `,` $hasSegmentMemory `,` $hasWideningInteger `,`
         $hasWideningFloat `,` $vlenBits `,` $vectorRegisters `,`
         $maxPrivateStackBytes `,` $supportedSEW `,` $legalLMULEighths `,`
-        $partialCombinePolicy `,` $recordAxisPolicy `,` $fragments `>`
+        $maxWideningCombineGroups `,` $partialCombinePolicy `,`
+        $recordAxisPolicy `,` $fragments `>`
   }];
   let genVerifyDecl = 1;
 }

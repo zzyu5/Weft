@@ -37,6 +37,11 @@ llvm::cl::opt<std::string> matrixExtension(
     "matrix-extension",
     llvm::cl::desc("Target matrix extension: none or spacemit-ime1"),
     llvm::cl::init("none"));
+llvm::cl::opt<int64_t> maxWideningCombineGroups(
+    "max-widening-combine-groups",
+    llvm::cl::desc(
+        "Target structural limit for one widened partial-combine result"),
+    llvm::cl::init(2));
 llvm::cl::opt<std::string> partialCombinePolicy(
     "partial-combine-policy",
     llvm::cl::desc(
@@ -148,7 +153,8 @@ int main(int argc, char **argv) {
     weft::RISCVCompilerOptions options;
     std::string error;
     if (!weft::parseRISCVTargetProfile(
-            march, abi, vlenBits, matrixExtension, partialCombinePolicy,
+            march, abi, vlenBits, matrixExtension, maxWideningCombineGroups,
+            partialCombinePolicy,
             recordAxisPolicy,
             options.target, error)) {
       llvm::errs() << error << '\n';
