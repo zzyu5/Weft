@@ -409,8 +409,13 @@ constexpr int kElements = 256;
 #define selected_xqk 256
 #define selected_reference ggml_vec_dot_iq1_m_q8_K_generic
 #define selected_quantize quantize_row_q8_K_ref
+#if defined(WEFT_IQ1M_DECODE)
+extern "C" void production_mul_mat_iq1_m_decode(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
+#define selected_call(w, x, xq, y) production_mul_mat_iq1_m_decode(w, x, xq, iq1.data(), fp16.data(), y, kN, kK, runtimeM)
+#else
 extern "C" void production_mul_mat_iq1_m(const std::uint8_t *, const float *, std::uint8_t *, const std::int8_t *, const float *, float *, std::size_t, std::size_t, std::size_t);
 #define selected_call(w, x, xq, y) production_mul_mat_iq1_m(w, x, xq, iq1.data(), fp16.data(), y, kN, kK, runtimeM)
+#endif
 #elif WEFT_MUL_MAT_FORMAT == 14
 using selected_weight = block_iq2_s;
 using selected_activation = block_q8_K;

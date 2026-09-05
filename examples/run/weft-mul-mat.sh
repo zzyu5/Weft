@@ -365,11 +365,23 @@ else
       fi
     fi
   elif [[ ${format} == iq1_m ]]; then
-    kernel=production_mul_mat_iq1_m
-    if [[ ${target} == sg2044 ]]; then
-      physical=(--auto-lmul-eighths=32 --auto-unroll=2 --auto-pipeline-depth=1)
+    if [[ ${phase} == decode ]]; then
+      kernel=production_mul_mat_iq1_m_decode
+      runtime_kernel_define=-DWEFT_IQ1M_DECODE=1
+      if [[ ${target} == sg2044 ]]; then
+        physical=(--auto-lmul-eighths=32 --auto-unroll=2 --auto-pipeline-depth=1)
+      else
+        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+      fi
     else
-      physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+      kernel=production_mul_mat_iq1_m
+      if [[ ${target} == sg2044 ]]; then
+        meta=(--meta NC=32 --meta MC=8 --meta MR=2 --meta NR=1)
+        physical=(--auto-lmul-eighths=32 --auto-unroll=1 --auto-pipeline-depth=1)
+      else
+        meta=(--meta NC=32 --meta MC=16 --meta MR=4 --meta NR=4)
+        physical=(--auto-lmul-eighths=16 --auto-unroll=1 --auto-pipeline-depth=1)
+      fi
     fi
   elif [[ ${format} == iq2_xxs ]]; then
     if [[ ${target} == sg2044 ]]; then
