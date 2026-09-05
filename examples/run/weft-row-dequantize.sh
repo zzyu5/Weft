@@ -50,6 +50,9 @@ if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
     q1_0)
       physical_auto+=(--auto-lmul-eighths 16)
       ;;
+    iq2_s)
+      physical_auto+=(--auto-lmul-eighths 64)
+      ;;
     tq1_0|tq2_0)
       physical_auto+=(--auto-lmul-eighths 32)
       ;;
