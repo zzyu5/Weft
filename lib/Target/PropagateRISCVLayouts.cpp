@@ -660,17 +660,25 @@ int64_t rhsFreeLane(mlir::Value lhs, mlir::Value rhs,
 
 std::optional<Roles>
 reductionSupplyRoles(mlir::Value value,
-                     llvm::ArrayRef<int64_t> reductionAxes) {
+                     llvm::ArrayRef<int64_t> allowedAxes,
+                     bool projectFreeAxes = false) {
   llvm::SmallVector<mlir::Value> worklist{value};
   llvm::SmallPtrSet<mlir::Operation *, 16> visited;
   std::optional<Roles> result;
-  auto mergeCandidate = [&](const Roles &candidate) {
+  auto mergeCandidate = [&](Roles candidate) {
     if (!candidate.laneAxis ||
-        !llvm::is_contained(reductionAxes, candidate.laneAxis))
+        !llvm::is_contained(allowedAxes, candidate.laneAxis))
       return true;
-    for (int64_t axis : candidate.coalescedLaneAxes)
-      if (!llvm::is_contained(reductionAxes, axis))
+    for (int64_t axis :
+         llvm::SmallVector<int64_t>(candidate.coalescedLaneAxes.begin(),
+                                    candidate.coalescedLaneAxes.end()))
+      if (!llvm::is_contained(allowedAxes, axis)) {
+        if (projectFreeAxes) {
+          candidate.coalescedLaneAxes.erase(axis);
+          continue;
+        }
         return true;
+      }
     if (!result) {
       result = candidate;
       return true;
@@ -1626,6 +1634,25 @@ public:
         return;
       const int64_t eliminated = axes[reduce.getAxis()];
       Roles &inputRoles = roles[input];
+      const int64_t eliminatedExtent = inputType.getShape()[reduce.getAxis()];
+      const bool registerReductionKind = reduce.getKind() == "add" ||
+          (mlir::isa<mlir::FloatType>(inputType.getElementType()) &&
+           (reduce.getKind() == "max" || reduce.getKind() == "min"));
+      // Preserve a consistent free-axis memory supply when the eliminated
+      // coordinate already has a bounded register-reduction realization.
+      if (registerReductionKind && !inputRoles.registerTuple &&
+          !inputRoles.local && !inputRoles.ime && eliminatedExtent > 1 &&
+          eliminatedExtent <= 16) {
+        llvm::SmallVector<int64_t> freeAxes;
+        for (int64_t axis : axes)
+          if (axis != eliminated)
+            freeAxes.push_back(axis);
+        if (auto supply = reductionSupplyRoles(input, freeAxes, true)) {
+          inputRoles.laneAxis = supply->laneAxis;
+          inputRoles.coalescedLaneAxes = supply->coalescedLaneAxes;
+          inputRoles.fullLaneExtent = supply->fullLaneExtent;
+        }
+      }
       // A structured-product result deliberately remains a scalar register
       // tuple over its surviving free axes.  A following reduction requires a
       // different lane representation of that same logical value; preserve the
@@ -1637,7 +1664,9 @@ public:
       if (inputRoles.laneAxis) {
         inputRoles.replicaAxes.erase(inputRoles.laneAxis);
         addSmallReplicas(input, inputRoles, inputRoles.laneAxis);
-        inputRoles.replicaAxes.erase(eliminated);
+        if (inputRoles.laneAxis == eliminated ||
+            inputRoles.coalescedLaneAxes.contains(eliminated))
+          inputRoles.replicaAxes.erase(eliminated);
       }
     });
     propagateRoles();
@@ -2286,6 +2315,22 @@ private:
         continue;
       const size_t ordinal = static_cast<size_t>(position - axes.begin());
       if (ordinal < lane.size() && lane[ordinal] > 1)
+        continue;
+      auto projectedResult =
+          mlir::dyn_cast<riscv::ValueType>(reduce.getResult().getType());
+      const bool registerReductionKind =
+          reduce.getKind() == "add" ||
+          (mlir::isa<mlir::FloatType>(inputType.getElementType()) &&
+           (reduce.getKind() == "max" || reduce.getKind() == "min"));
+      if (registerReductionKind && projectedResult &&
+          inputType.getLayout().getCarrier() == "rvv" &&
+          projectedResult.getLayout().getCarrier() == "rvv" &&
+          time[ordinal] == 1 && replica[ordinal] > 1 &&
+          inputType.getLayout().getSew() ==
+              projectedResult.getLayout().getSew() &&
+          inputType.getLayout().getLmulEighths() ==
+              projectedResult.getLayout().getLmulEighths() &&
+          inputType.getLayout().getVl() == projectedResult.getLayout().getVl())
         continue;
       // A reduction may consume an issue-time coordinate while preserving an
       // independent SIMD coordinate carried by a surviving free axis.  This is

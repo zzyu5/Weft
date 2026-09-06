@@ -283,15 +283,25 @@ public:
           continue;
         auto targetType = conversion.getResult().getType();
         auto targetValue = mlir::cast<riscv::ValueType>(targetType);
+        bool integerReinterpret = false;
         if (auto cast = mlir::dyn_cast<riscv::CastOp>(producer)) {
           auto inputType =
               mlir::dyn_cast<riscv::ValueType>(cast.getInput().getType());
           auto castType =
               mlir::dyn_cast<riscv::ValueType>(cast.getResult().getType());
+          auto sourceInteger = inputType
+              ? mlir::dyn_cast<mlir::IntegerType>(inputType.getElementType())
+              : mlir::IntegerType();
+          auto targetInteger = castType
+              ? mlir::dyn_cast<mlir::IntegerType>(castType.getElementType())
+              : mlir::IntegerType();
+          integerReinterpret = sourceInteger && targetInteger &&
+              sourceInteger.getWidth() == targetInteger.getWidth();
           if (inputType && castType &&
               riscv_internal::logicalBitWidth(inputType.getElementType()) ==
                   riscv_internal::logicalBitWidth(castType.getElementType()) &&
-              castType.getLayout() != targetValue.getLayout())
+              castType.getLayout() != targetValue.getLayout() &&
+              !integerReinterpret)
             continue;
         }
         rewriter.setInsertionPoint(conversion);
@@ -303,8 +313,11 @@ public:
             continue;
           }
           auto kernel = conversion->getParentOfType<riscv::KernelOp>();
-          riscv::LayoutAttr required = riscv_internal::projectLayout(
-              rewriter, operandType, targetType.getLayout(), kernel.getTarget());
+          riscv::LayoutAttr required = integerReinterpret
+              ? targetType.getLayout()
+              : riscv_internal::projectLayout(
+                    rewriter, operandType, targetType.getLayout(),
+                    kernel.getTarget());
           if (!required) {
             conversion.emitError(
                 "rematerialized producer has no legal operand layout projection");
