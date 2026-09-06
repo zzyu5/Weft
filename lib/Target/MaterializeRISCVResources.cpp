@@ -307,6 +307,20 @@ mlir::FailureOr<int64_t> localStorageBytes(riscv::KernelOp kernel) {
   return bytes;
 }
 
+bool canPreserveProducerResult(mlir::Operation *operation) {
+  if (mlir::isMemoryEffectFree(operation))
+    return true;
+  auto interface = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(operation);
+  if (!interface || operation->getNumRegions())
+    return false;
+  llvm::SmallVector<mlir::MemoryEffects::EffectInstance> effects;
+  interface.getEffects(effects);
+  // Spill preserves the read result; it never clones or moves the producer.
+  return llvm::all_of(effects, [](const auto &effect) {
+    return mlir::isa<mlir::MemoryEffects::Read>(effect.getEffect());
+  });
+}
+
 const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
                              bool peakBefore,
                              llvm::SmallVectorImpl<Interval> &intervals) {
@@ -327,7 +341,7 @@ const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
         valueType.getLayout().getCarrier() == "local" ||
         (definition &&
          (mlir::isa<riscv::NewOp, riscv::ReloadOp, riscv::RVVSplatOp>(definition) ||
-          !mlir::isMemoryEffectFree(definition))))
+          !canPreserveProducerResult(definition))))
       continue;
 
     bool sameBlock = !interval.value.use_empty();
@@ -368,6 +382,11 @@ public:
       if (kernel.getResourcesMaterialized())
         continue;
       int64_t spillIdentity = 1;
+      kernel.walk([&](riscv::LocalAllocOp allocation) {
+        auto type = allocation.getResult().getType();
+        spillIdentity = std::max({spillIdentity, type.getAliasSet() + 1,
+                                  type.getBirthId() + 1});
+      });
       unsigned materializableValues = 0;
       kernel.walk([&](mlir::Operation *operation) {
         for (mlir::Value result : operation->getResults())

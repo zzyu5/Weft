@@ -4677,6 +4677,38 @@ mlir::LogicalResult LocalCapacityGuardOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult DenseSnapshotOp::verify() {
+  auto source = getSource().getType();
+  auto result = getResult().getType();
+  auto storage = getStorage().getType();
+  auto encoding = mlir::cast<weft::kernel::EncodingType>(source.getEncoding());
+  const int64_t elementBytes = source.getStorageBits() / 8;
+  if (encoding.getKind() != "dense" || source.getShape().size() != 1 ||
+      source.getShape()[0] <= 0 || source.getStrides()[0] != 1 ||
+      source.getStorageBits() % 8 || elementBytes <= 0 ||
+      source.getShape()[0] > std::numeric_limits<int64_t>::max() / elementBytes ||
+      source.getElements() != 1 || source.getInterleaveRows() != 0 ||
+      result.getEncoding() != source.getEncoding() ||
+      result.getShape() != source.getShape() ||
+      result.getAxisIds() != source.getAxisIds() ||
+      result.getStrides() != source.getStrides() || result.getOrigins()[0] != 0 ||
+      result.getStorageBits() != source.getStorageBits() ||
+      result.getElements() != 1 || result.getInterleaveRows() != 0 ||
+      result.getAddressClass() != "local" || result.getAccess() != "read" ||
+      result.getAliasSet() != storage.getAliasSet() ||
+      result.getAlignment() != storage.getAlignment() ||
+      !storage.getElementType().isInteger(8) ||
+      !storage.getShape().empty() || !storage.getAxisIds().empty() ||
+      storage.getSizeBytes() != source.getShape()[0] * elementBytes ||
+      storage.getPurpose() != "pack" || storage.getSchema() != "read-snapshot" ||
+      !getStorage().getDefiningOp<LocalAllocOp>() ||
+      !exactLeaf(getLeaf(), "transfer", "load", "scalar.dense-snapshot",
+                 "none", "exact"))
+    return emitOpError(
+        "dense snapshot requires one complete static contiguous table and exact private byte storage");
+  return verifyLeafOperation(*this);
+}
+
 mlir::LogicalResult LocalBindOp::verify() {
   LocalType storage = getStorage().getType();
   ValueType result = getResult().getType();

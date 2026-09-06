@@ -2013,6 +2013,7 @@ public:
     bool failed = false;
     llvm::SmallVector<riscv::LoadOp> deadTableLoads;
     llvm::SmallVector<riscv::MaterializeOp> deadTableMaterializations;
+    llvm::DenseMap<mlir::Value, mlir::Value> tableSnapshots;
     if (!nestedDomainOnly) {
     getOperation().walk([&](riscv::LoadOp operation) {
       auto memory = operation.getRegion().getType();
@@ -3362,12 +3363,85 @@ public:
           *tableReplicas == 1;
       if (!registerTable && tableLoad) {
         if (riscv_internal::readCrossesWrite(tableLoad, operation)) {
-          operation.emitError(
-              "lookup cannot defer the admitted table read across an aliasing write; selected table representation is unsupported");
-          failed = true;
-          return;
+          mlir::Value table = operation.getTable();
+          mlir::Value snapshot = tableSnapshots.lookup(table);
+          if (!snapshot) {
+            auto memory = tableLoad.getRegion().getType();
+            auto encoding = mlir::cast<kernel::EncodingType>(memory.getEncoding());
+            auto kernel = operation->getParentOfType<riscv::KernelOp>();
+            const int64_t elementBytes = memory.getStorageBits() / 8;
+            if (encoding.getKind() != "dense" || memory.getShape().size() != 1 ||
+                memory.getShape()[0] <= 0 || memory.getStrides()[0] != 1 ||
+                memory.getStorageBits() % 8 || elementBytes <= 0 ||
+                memory.getElements() != 1 || memory.getInterleaveRows() != 0 ||
+                memory.getShape()[0] >
+                    kernel.getTarget().getMaxPrivateStackBytes() / elementBytes) {
+              operation.emitError(
+                  "interfering table read requires a target-bounded static contiguous dense snapshot");
+              failed = true;
+              return;
+            }
+            int64_t identity = 0;
+            getOperation().walk([&](riscv::KernelOp owner) {
+              for (int64_t alias : owner.getArgAliasSets())
+                identity = std::max(identity, alias + 1);
+            });
+            getOperation().walk([&](riscv::LocalAllocOp allocation) {
+              auto type = allocation.getResult().getType();
+              identity = std::max({identity, type.getAliasSet() + 1,
+                                   type.getBirthId() + 1});
+            });
+            int64_t owner =
+                tableMaterialize ? tableMaterialize.getOwnerDomainId() : 0;
+            if (!tableMaterialize)
+              for (mlir::Operation *parent = tableLoad->getParentOp(); parent;
+                   parent = parent->getParentOp()) {
+                if (auto loop = mlir::dyn_cast<riscv::LoopOp>(parent)) {
+                  owner = loop.getDomain().getType().getDomainId();
+                  break;
+                }
+                if (auto level = parent->getAttrOfType<riscv::LevelAttr>(
+                        "weft.riscv.level")) {
+                  owner = level.getDomainId();
+                  break;
+                }
+              }
+            const int64_t birth =
+                tableMaterialize ? tableMaterialize.getBirthId() : identity;
+            const int64_t lifetime = tableMaterialize
+                ? tableMaterialize.getLifetimeEndDomainId() : owner;
+            const int64_t bytes = memory.getShape()[0] * elementBytes;
+            auto empty = rewriter.getDenseI64ArrayAttr({});
+            auto storageType = riscv::LocalType::get(
+                &getContext(), rewriter.getIntegerType(8), empty, empty, bytes,
+                memory.getAlignment(), identity, "pack", owner, birth,
+                lifetime, "read-snapshot");
+            auto descriptor = riscv::MemDescType::get(
+                &getContext(), memory.getEncoding(), memory.getShape(),
+                memory.getAxisIds(), memory.getStrides(),
+                rewriter.getDenseI64ArrayAttr({0}), memory.getAlignment(),
+                "local", "read", identity, memory.getLayoutIdentity(),
+                memory.getStorageBits(), 1, 0);
+            mlir::OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPoint(tableLoad);
+            auto byteCount = rewriter.create<mlir::arith::ConstantIndexOp>(
+                tableLoad.getLoc(), bytes);
+            auto allocation = rewriter.create<riscv::LocalAllocOp>(
+                tableLoad.getLoc(), storageType, byteCount);
+            auto copied = rewriter.create<riscv::DenseSnapshotOp>(
+                tableLoad.getLoc(), descriptor, tableLoad.getRegion(),
+                allocation.getResult(), riscv_internal::leaf(
+                    rewriter, "transfer", "load", "scalar.dense-snapshot",
+                    "scalar.dense-snapshot", 0, 0));
+            riscv_internal::copyOrigin(tableLoad, allocation);
+            riscv_internal::copyOrigin(tableLoad, copied);
+            snapshot = copied.getResult();
+            tableSnapshots[table] = snapshot;
+          }
+          operation->setOperand(0, snapshot);
+        } else {
+          operation->setOperand(0, tableLoad.getRegion());
         }
-        operation->setOperand(0, tableLoad.getRegion());
         if (!llvm::is_contained(deadTableLoads, tableLoad))
           deadTableLoads.push_back(tableLoad);
         if (tableMaterialize &&

@@ -89,6 +89,8 @@ validity 与 register groups。普通无特殊 anchor 的 shaped value使用 tar
 primary lane axis 即使也由其它 use 传播到 coalesced 集合中，其 lane span 只计一次。
 同位宽 integer Cast 的输入与结果共享完整物理 mapping；所需表示变化在 Cast 外显式
 插入 `convert_layout`，op verifier 与 final verifier 均检查这个关系。
+bounded register reduction 可以保留一致的 free-axis memory supply，以 register replica
+表示被消除轴；结果必须逐轴保留其余 mapping，不强制将归约轴搬入 SIMD lane。
 已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
 保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
 LMUL；widening contraction 的两个 operand 再共享该 lane span。目标不支持派生
@@ -126,6 +128,9 @@ composite lowering中消费。partial materialization后新出现的replica memo
 没有可能别名写入，包括嵌套循环的较早迭代。无法保持原读取且没有合法的已物化 table
 表示时，明确拒绝该候选。memory-descriptor lookup 声明 Read effect；只有寄存器 table
 lookup 是 pure，CSE 不得跨写入合并前者。
+不能合法延迟的静态连续 dense table 在原 load 点形成 `local_alloc → dense_snapshot`，
+后续 lookup 读取该私有 descriptor。显式 stage 的 owner/birth/lifetime 保存在 allocation；
+没有 stage 时采用原读取的 Level owner。超出目标 local 容量或非连续、非静态表明确拒绝。
 
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
@@ -156,6 +161,8 @@ partial materialization 后，`physical-share` 的 input/result 都变成单 use
 conversion 的同 block 区间没有写入或未知 effect，允许移除这条已无共享用途的边界，
 继续按原有 typed index/layout 合同 backward rematerialization。作者 materialization、
 多 use supply、跨 block、跨写入和 final resource closure 后的情形不适用。
+同位宽 integer Cast 可随 conversion 重物化，但其 input/result 必须采用完全相同的
+目标 layout，不能在 reinterpret intrinsic 内隐式改变 LMUL 或 logical mapping。
 
 单 use memory lookup 接 scalar conversion 时，在同 block 无跨写入的条件下，可以将
 indices 投影为 consumer 的 scalar time/replica mapping 并直接 scalar lookup。新的 memory
@@ -310,6 +317,8 @@ shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned Vi
 operand/result resource groups写实。资源超限时，只对同一 block 内可合法保存的普通
 `ValueType` 插入显式 local slot、`spill` 和各 use-site `reload`；fragment spill、跨 block spill
 和任意 pure-producer rematerialization尚未实现时判当前 module非法。
+pure 或仅有 Read effect 的 producer 均可提供被 spill 的数值 SSA；原 producer 保持在
+原位置，只保存其已经产生的值并在 use-site reload，不复制读取，也不延迟读取。
 
 kernel 创建时 `resources_materialized=false`；只有资源分析、必要 spill 与峰值汇总全部闭合后，
 本 pass 才把它设为 `true`。初始化为零的 peak 不是闭合证据。layout canonicalization 仅在该

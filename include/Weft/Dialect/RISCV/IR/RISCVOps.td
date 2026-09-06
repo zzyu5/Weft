@@ -1196,6 +1196,15 @@ def WeftRISCV_LocalBindOp : WeftRISCV_Op<"local_bind", [Pure]> {
   let hasVerifier = 1;
 }
 
+def WeftRISCV_DenseSnapshotOp
+    : WeftRISCV_Op<"dense_snapshot", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins WeftRISCV_MemDescType:$source,
+                       WeftRISCV_LocalType:$storage,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_MemDescType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_LocalLoadOp
     : WeftRISCV_Op<"local_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$source, Index:$index,

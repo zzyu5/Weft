@@ -34,7 +34,7 @@ bool mayWriteSource(mlir::Operation *operation, riscv::MemDescType source) {
   if (auto store = mlir::dyn_cast<riscv::RVVRecordStoreOp>(operation))
     return mayAlias(source, store.getDestination().getType());
   if (mlir::isa<riscv::LocalAllocOp, riscv::LocalStoreOp,
-                riscv::RVVLocalMaterializeOp, riscv::SpillOp,
+                riscv::RVVLocalMaterializeOp, riscv::DenseSnapshotOp, riscv::SpillOp,
                 riscv::EncodedLocalPackOp,
                 riscv::RVVEncodedLocalPackTransferOp>(operation))
     return false;
@@ -182,7 +182,8 @@ bool weft::riscv_internal::needsReadSnapshot(riscv::LoadOp load) {
       if (readCrossesWrite(load, user))
         return true;
       if (mlir::isMemoryEffectFree(user) &&
-          !mlir::isa<riscv::RegisterMaterializeOp>(user))
+          !mlir::isa<riscv::RegisterMaterializeOp,
+                     riscv::EncodedLocalBindOp>(user))
         pending.append(user->result_begin(), user->result_end());
     }
   }

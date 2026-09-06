@@ -835,6 +835,24 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
     return value;
   auto resultType =
       issueWindowType(rewriter, target, sourceType, axis, windowExtent);
+  if (resultType == sourceType) {
+    auto argument = mlir::dyn_cast<mlir::BlockArgument>(windowIndex);
+    auto loop = argument
+                    ? mlir::dyn_cast<mlir::scf::ForOp>(
+                          argument.getOwner()->getParentOp())
+                    : mlir::scf::ForOp();
+    if (loop && loop.getInductionVar() == windowIndex) {
+      auto lower =
+          loop.getLowerBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      auto upper =
+          loop.getUpperBound().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      auto step = loop.getStep().getDefiningOp<mlir::arith::ConstantIndexOp>();
+      // A single complete window is an identity, including its read value.
+      if (lower && upper && step && lower.value() == 0 && upper.value() == 1 &&
+          step.value() == 1)
+        return value;
+    }
+  }
   mlir::Operation *definition = value.getDefiningOp();
   if (!resultType || !definition) {
     if (definition)
@@ -1073,8 +1091,11 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
     if (!issueTimes || !issueReplicas ||
         !checkedScale(*issueTimes, *issueReplicas, issueParts))
       return mlir::failure();
-    if (!field || !sourcePlan || sourcePlan.getKind() != "unit")
+    if (!field || !sourcePlan || sourcePlan.getKind() != "unit") {
+      load.emitError("issue-window storage projection requires a concrete unit field; plan=")
+          << sourcePlan << ", field=" << load.getField();
       return mlir::failure();
+    }
 
     // A preplanned storage value may be split in issue time along an axis
     // orthogonal to its load-lane axis.  When that split is a translation of
@@ -5932,6 +5953,7 @@ public:
       std::optional<mlir::Value> lhsSlice;
       std::optional<mlir::Value> rhsSlice;
       std::optional<mlir::Value> earlyScaleSlice;
+      int64_t failedSupply = -1;
       for (int64_t supply :
            nestedPlan.getIssueMaterializationOrder().asArrayRef()) {
         if (supply == 2 && deferScale)
@@ -5944,8 +5966,10 @@ public:
                                             windowExtent,
                                             loop.getInductionVar(), target,
                                             rewriter, clones);
-        if (mlir::failed(slice))
+        if (mlir::failed(slice)) {
+          failedSupply = supply;
           break;
+        }
         if (supply == 0)
           lhsSlice = *slice;
         else if (supply == 1)
@@ -5964,7 +5988,9 @@ public:
         dot.emitError(
             "nested issue-window cloning did not produce its planned supplies; lhs=")
             << lhsType << ", planned_lhs=" << issueLhsType
-            << ", rhs=" << rhsType << ", planned_rhs=" << issueRhsType;
+            << ", rhs=" << rhsType << ", planned_rhs=" << issueRhsType
+            << ", failed_supply=" << failedSupply
+            << ", scale=" << match->scale;
         rewriter.eraseOp(loop);
         failed = true;
         continue;

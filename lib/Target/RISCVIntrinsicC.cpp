@@ -657,6 +657,7 @@ private:
   compileLocalCapacityGuard(riscv::LocalCapacityGuardOp operation);
   mlir::LogicalResult compileLocalAlloc(riscv::LocalAllocOp operation);
   mlir::LogicalResult compileLocalBind(riscv::LocalBindOp operation);
+  mlir::LogicalResult compileDenseSnapshot(riscv::DenseSnapshotOp operation);
   mlir::LogicalResult compileLocalLoad(riscv::LocalLoadOp operation);
   mlir::LogicalResult compileLocalStore(riscv::LocalStoreOp operation);
   mlir::LogicalResult
@@ -2403,6 +2404,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileWhile(loop);
   if (auto view = mlir::dyn_cast<riscv::MemoryViewOp>(operation))
     return compileMemoryView(view);
+  if (auto snapshot = mlir::dyn_cast<riscv::DenseSnapshotOp>(operation))
+    return compileDenseSnapshot(snapshot);
   if (auto load = mlir::dyn_cast<riscv::StorageLoadOp>(operation))
     return compileStorageLoad(load);
   if (auto store = mlir::dyn_cast<riscv::StorageStoreOp>(operation))
@@ -7177,6 +7180,38 @@ mlir::LogicalResult Emitter::compileLocalAlloc(riscv::LocalAllocOp operation) {
   binding.scalar = name;
   binding.localElements = size.scalar;
   bindings[operation.getResult()] = std::move(binding);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileDenseSnapshot(riscv::DenseSnapshotOp operation) {
+  Binding source = bindings.lookup(operation.getSource());
+  Binding storage = bindings.lookup(operation.getStorage());
+  std::optional<std::string> address;
+  if (source.kind == Binding::Kind::Slice)
+    address = denseAddress(source.slice, {});
+  else if (source.kind == Binding::Kind::Memory)
+    address = source.memory.name;
+  auto descriptor = operation.getResult().getType();
+  auto element = denseElementType(descriptor.getEncoding());
+  if (!address || !element || storage.kind != Binding::Kind::LocalArray ||
+      storage.scalar.empty() ||
+      operation.getLeaf().getInstruction() != "scalar.dense-snapshot")
+    return fail(operation, "dense snapshot has no complete memory/storage binding");
+  line("memcpy(" + storage.scalar + ", " + *address + ", " +
+       std::to_string(operation.getStorage().getType().getSizeBytes()) + ");");
+  Binding result;
+  result.kind = Binding::Kind::Memory;
+  result.memory.name = storage.scalar;
+  result.memory.encoding = descriptor.getEncoding();
+  result.memory.elementType = *element;
+  result.memory.axes.assign(descriptor.getAxisIds().asArrayRef().begin(),
+                             descriptor.getAxisIds().asArrayRef().end());
+  result.memory.extents.push_back(std::to_string(descriptor.getShape()[0]));
+  result.memory.strides.push_back("1");
+  result.memory.origins.push_back("0");
+  result.memory.recordBytes = descriptor.getStorageBits() / 8;
+  result.memory.logicalElements = 1;
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 
