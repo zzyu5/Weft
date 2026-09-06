@@ -284,6 +284,9 @@ public:
     mlir::ModuleOp module = getOperation();
     llvm::DenseSet<std::pair<int64_t, int64_t>> partialBirths;
     getOperation().walk([&](mlir::Operation *operation) {
+      if (auto cast = mlir::dyn_cast<riscv::CastOp>(operation);
+          cast && mlir::failed(cast.verify()))
+        failed = true;
       if (auto load = mlir::dyn_cast<riscv::LoadOp>(operation);
           load && !load.getSnapshotStorage() &&
           riscv_internal::needsReadSnapshot(load)) {

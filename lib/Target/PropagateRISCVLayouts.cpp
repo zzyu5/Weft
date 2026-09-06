@@ -1271,7 +1271,7 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
        position >= 0; --position) {
     const size_t index = static_cast<size_t>(position);
     const int64_t axis = axes[index];
-    if (!roles.coalescedLaneAxes.contains(axis))
+    if (axis == roles.laneAxis || !roles.coalescedLaneAxes.contains(axis))
       continue;
     const int64_t extent =
         std::max<int64_t>(1, riscv_internal::physicalExtent(value, axis));
@@ -2403,9 +2403,18 @@ private:
         auto kernel = operation->getParentOfType<riscv::KernelOp>();
         mlir::Value sourceValue = operand.get();
         auto operandType = mlir::cast<riscv::ValueType>(sourceValue.getType());
+        auto sourceInteger =
+            mlir::dyn_cast<mlir::IntegerType>(operandType.getElementType());
+        auto resultInteger =
+            mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+        const bool integerReinterpret =
+            mlir::isa<riscv::CastOp>(operation) && sourceInteger &&
+            resultInteger &&
+            sourceInteger.getWidth() == resultInteger.getWidth();
         riscv::LayoutAttr required =
-            mlir::isa<riscv::MaterializeOp>(operation) &&
-                    operandType.getElementType() == result.getElementType() &&
+            (integerReinterpret ||
+             (mlir::isa<riscv::MaterializeOp>(operation) &&
+              operandType.getElementType() == result.getElementType())) &&
                     operandType.getShape() == result.getShape() &&
                     operandType.getAxisIds() == result.getAxisIds()
                 ? result.getLayout()

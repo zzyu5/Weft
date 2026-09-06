@@ -3904,6 +3904,21 @@ mlir::LogicalResult CompareOp::verify() {
 }
 
 mlir::LogicalResult CastOp::verify() {
+  auto input = mlir::dyn_cast<ValueType>(getInput().getType());
+  auto result = mlir::dyn_cast<ValueType>(getResult().getType());
+  auto sourceInteger = input
+      ? mlir::dyn_cast<mlir::IntegerType>(input.getElementType())
+      : mlir::IntegerType();
+  auto resultInteger = result
+      ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+      : mlir::IntegerType();
+  if (sourceInteger && resultInteger &&
+      sourceInteger.getWidth() == resultInteger.getWidth() &&
+      input.getLayout().getCarrier() == "rvv" &&
+      result.getLayout().getCarrier() == "rvv" &&
+      input.getLayout() != result.getLayout())
+    return emitOpError(
+        "same-width RVV integer cast requires identical physical layouts; representation changes require convert_layout");
   return verifyConversion(*this, getInput().getType(), getResult().getType());
 }
 

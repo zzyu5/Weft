@@ -86,6 +86,9 @@ form，也不写 exact intrinsic。没有合法局部结构时当前 module 失�
 validity 与 register groups。普通无特殊 anchor 的 shaped value使用 target 的固定规则：
 最内逻辑轴进入 lane；一元素表示保持 scalar。LMUL 是实现该 lane extent 的最小合法值，
 不是 emitter 默认值。
+primary lane axis 即使也由其它 use 传播到 coalesced 集合中，其 lane span 只计一次。
+同位宽 integer Cast 的输入与结果共享完整物理 mapping；所需表示变化在 Cast 外显式
+插入 `convert_layout`，op verifier 与 final verifier 均检查这个关系。
 已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
 保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
 LMUL；widening contraction 的两个 operand 再共享该 lane span。目标不支持派生
