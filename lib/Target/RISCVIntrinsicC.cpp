@@ -373,6 +373,14 @@ private:
     return identifier(prefix) + "_" + std::to_string(nextName++);
   }
 
+  std::string materializeScalarRead(llvm::StringRef type,
+                                    llvm::StringRef expression,
+                                    llvm::StringRef prefix = "load") {
+    std::string name = fresh(prefix);
+    line(type.str() + " " + name + " = " + expression.str() + ";");
+    return name;
+  }
+
   riscv::LayoutAttr layoutOf(mlir::Value value) const {
     return riscv_internal::layoutOf(value.getType());
   }
@@ -1788,8 +1796,10 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
           auto address = denseAddress(binding.slice, offsets);
           if (!address)
             return mlir::failure();
-          tuple.parts.push_back("(*(const " + *type + " *)(" + *address + "))");
+          tuple.parts.push_back(materializeScalarRead(
+              *type, "*(const " + *type + " *)(" + *address + ")"));
         }
+        bindings[value] = tuple;
         return tuple;
       }
       auto valueType = mlir::dyn_cast<riscv::ValueType>(value.getType());
@@ -1818,7 +1828,10 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
             "sequential dense load has no address or C type");
         return mlir::failure();
       }
-      return scalar("*(const " + *type + " *)(" + *address + ")");
+      Binding loaded = scalar(materializeScalarRead(
+          *type, "*(const " + *type + " *)(" + *address + ")"));
+      bindings[value] = loaded;
+      return loaded;
     }
     if (carrier != "rvv") {
       value.getDefiningOp()->emitError(
@@ -2087,6 +2100,13 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                      "selected scalar tuple field type has no intrinsic-C load"),
                  mlir::failure();
       }
+      auto type = scalarCType(riscv_internal::logicalElement(value.getType()));
+      if (!type)
+        return value.getDefiningOp()->emitError(
+                   "selected scalar tuple field has no intrinsic-C value type"),
+               mlir::failure();
+      for (std::string &part : tuple.parts)
+        part = materializeScalarRead(*type, part);
       bindings[value] = tuple;
       return tuple;
     }
@@ -2153,6 +2173,19 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
       value.getDefiningOp()->emitError(
           "encoded field load does not materialize every selected physical part");
       return mlir::failure();
+    }
+    if (loaded.kind == Binding::Kind::Scalar ||
+        loaded.kind == Binding::Kind::ScalarTuple) {
+      auto type = scalarCType(riscv_internal::logicalElement(value.getType()));
+      if (!type)
+        return value.getDefiningOp()->emitError(
+                   "selected scalar field has no intrinsic-C value type"),
+               mlir::failure();
+      if (loaded.kind == Binding::Kind::Scalar)
+        loaded.scalar = materializeScalarRead(*type, loaded.scalar);
+      else
+        for (std::string &part : loaded.parts)
+          part = materializeScalarRead(*type, part);
     }
     bindings[value] = loaded;
     return loaded;
@@ -2994,7 +3027,8 @@ mlir::LogicalResult Emitter::compileStorageLoad(
     return fail(operation,
                 "artifact storage load requires explicit memory and byte-index bindings");
   bindings[operation.getResult()] =
-      scalar(source.memory.name + "[(size_t)(" + index.scalar + ")]");
+      scalar(materializeScalarRead(
+          "uint8_t", source.memory.name + "[(size_t)(" + index.scalar + ")]"));
   return mlir::success();
 }
 
@@ -4074,8 +4108,12 @@ mlir::LogicalResult Emitter::compileExtract(riscv::ExtractOp operation) {
         return fail(operation, "local array axis has no physical extent");
       linear = "((" + linear + ") * (" + *extent + ") + (" + index.scalar + "))";
     }
-    bindings[operation.getResult()] =
-        scalar(binding.scalar + "[" + linear + "]");
+    auto type = scalarCType(
+        riscv_internal::logicalElement(operation.getResult().getType()));
+    if (!type)
+      return fail(operation, "scalar local array extract has no C value type");
+    bindings[operation.getResult()] = scalar(materializeScalarRead(
+        *type, binding.scalar + "[" + linear + "]", "local_load"));
     return mlir::success();
   }
   if (binding.kind == Binding::Kind::Field) {
@@ -7153,8 +7191,10 @@ mlir::LogicalResult Emitter::compileLocalLoad(riscv::LocalLoadOp operation) {
       operation.getLeaf().getInstruction() != "local.load.element")
     return fail(operation, "local element load has no closed physical binding");
   bindings[operation.getResult()] =
-      scalar("((const " + *element + " *)" + source.scalar + ")[" +
-             index.scalar + "]");
+      scalar(materializeScalarRead(
+          *element, "((const " + *element + " *)" + source.scalar + ")[" +
+                        index.scalar + "]",
+          "local_load"));
   return mlir::success();
 }
 
@@ -7445,11 +7485,15 @@ mlir::LogicalResult Emitter::compileReload(riscv::ReloadOp operation) {
       result.parts.push_back(std::move(loaded));
     }
   } else if (*kind == Binding::Kind::Scalar) {
-    result.scalar = "((const " + *scalarType + " *)" + slot.scalar + ")[0]";
+    result.scalar = materializeScalarRead(
+        *scalarType, "((const " + *scalarType + " *)" + slot.scalar + ")[0]",
+        "reload");
   } else if (*kind == Binding::Kind::ScalarTuple) {
     for (int64_t part = 0; part < registerPartCount(operation.getResult()); ++part)
-      result.parts.push_back("((const " + *scalarType + " *)" + slot.scalar +
-                             ")[" + std::to_string(part) + "]");
+      result.parts.push_back(materializeScalarRead(
+          *scalarType, "((const " + *scalarType + " *)" + slot.scalar +
+                           ")[" + std::to_string(part) + "]",
+          "reload"));
   } else {
     return fail(operation, "reload supports only typed RVV/scalar values");
   }
