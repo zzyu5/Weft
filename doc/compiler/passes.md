@@ -119,6 +119,11 @@ composite lowering中消费。partial materialization后新出现的replica memo
 该 pass写入typed storage relation；它最终采用unit、strided还是保留indexed，唯一由后置的
 `MaterializeRISCVReplicaStorageLoads`根据最终consumer layout决定。
 
+从 admitted table 改成 consumer-local memory lookup，必须证明原读取点到 consumer
+没有可能别名写入，包括嵌套循环的较早迭代。无法保持原读取且没有合法的已物化 table
+表示时，明确拒绝该候选。memory-descriptor lookup 声明 Read effect；只有寄存器 table
+lookup 是 pure，CSE 不得跨写入合并前者。
+
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
 birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。
@@ -148,6 +153,11 @@ partial materialization 后，`physical-share` 的 input/result 都变成单 use
 conversion 的同 block 区间没有写入或未知 effect，允许移除这条已无共享用途的边界，
 继续按原有 typed index/layout 合同 backward rematerialization。作者 materialization、
 多 use supply、跨 block、跨写入和 final resource closure 后的情形不适用。
+
+单 use memory lookup 接 scalar conversion 时，在同 block 无跨写入的条件下，可以将
+indices 投影为 consumer 的 scalar time/replica mapping 并直接 scalar lookup。新的 memory
+form 和 leaf 由后续 `PlanRISCVMemory` 重选；该规则不把寄存器 table 退回内存，也不 hoist
+潜在空循环中的读取。
 
 ### `LowerRISCVComposites`
 

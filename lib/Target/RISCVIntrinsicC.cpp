@@ -6010,7 +6010,7 @@ mlir::LogicalResult Emitter::compileLookup(riscv::LookupOp operation) {
       bindings[operation.getResult()] = scalar(std::move(loaded));
       return mlir::success();
     }
-    const int64_t resultParts = registerPartCount(operation.getResult());
+    const int64_t resultParts = scalarPartCount(operation.getResult());
     if (indices.kind != Binding::Kind::ScalarTuple || resultParts <= 1 ||
         static_cast<int64_t>(indices.parts.size()) != resultParts)
       return fail(operation,

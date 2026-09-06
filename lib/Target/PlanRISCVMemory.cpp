@@ -3248,6 +3248,8 @@ public:
           table = mlir::dyn_cast<riscv::MemDescType>(
               tableLoad.getRegion().getType());
       }
+      if (tableLoad && riscv_internal::readCrossesWrite(tableLoad, operation))
+        continue;
       auto resultType =
           mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
       auto plan = table && resultType
@@ -3359,6 +3361,12 @@ public:
           tableParts && *tableParts == 1 && tableReplicas &&
           *tableReplicas == 1;
       if (!registerTable && tableLoad) {
+        if (riscv_internal::readCrossesWrite(tableLoad, operation)) {
+          operation.emitError(
+              "lookup cannot defer the admitted table read across an aliasing write; selected table representation is unsupported");
+          failed = true;
+          return;
+        }
         operation->setOperand(0, tableLoad.getRegion());
         if (!llvm::is_contained(deadTableLoads, tableLoad))
           deadTableLoads.push_back(tableLoad);

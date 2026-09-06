@@ -138,6 +138,45 @@ public:
           producer = conversion.getInput().getDefiningOp();
           changed = true;
         }
+        if (auto lookup = mlir::dyn_cast_or_null<riscv::LookupOp>(producer);
+            lookup && mlir::isa<riscv::MemDescType>(lookup.getTable().getType()) &&
+            lookup.getResult().hasOneUse() &&
+            conversion.getResult().getType().getLayout().getCarrier() ==
+                "scalar" && preservesReadOrder(lookup, conversion)) {
+          auto indexType =
+              mlir::dyn_cast<riscv::ValueType>(lookup.getIndices().getType());
+          auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+          auto target = conversion.getResult().getType();
+          auto required = indexType && kernel
+              ? riscv_internal::projectLayout(rewriter, indexType,
+                                               target.getLayout(),
+                                               kernel.getTarget())
+              : riscv::LayoutAttr();
+          if (!required)
+            continue;
+          rewriter.setInsertionPoint(conversion);
+          mlir::Value indices = lookup.getIndices();
+          auto requiredType = riscv_internal::withLayout(indexType, required);
+          if (requiredType != indexType) {
+            auto edge = rewriter.create<riscv::ConvertLayoutOp>(
+                conversion.getLoc(), requiredType, indices,
+                riscv_internal::layoutConversion(
+                    rewriter, indexType.getLayout(), required),
+                riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+            riscv_internal::copyOrigin(lookup, edge);
+            indices = edge.getResult();
+          }
+          auto rematerialized = rewriter.create<riscv::LookupOp>(
+              lookup.getLoc(), target, lookup.getTable(), indices,
+              lookup.getBounds(), riscv_internal::unassignedAccess(rewriter),
+              riscv_internal::unselectedLeaf(rewriter));
+          riscv_internal::copyOrigin(lookup, rematerialized);
+          conversion.getResult().replaceAllUsesWith(rematerialized.getResult());
+          rewriter.eraseOp(conversion);
+          rewriter.eraseOp(lookup);
+          changed = true;
+          continue;
+        }
         if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(producer)) {
           if (!conversion.getInput().hasOneUse() ||
               (!extract->hasAttr("index_pattern") &&

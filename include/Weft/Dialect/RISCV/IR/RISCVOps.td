@@ -1126,7 +1126,8 @@ def WeftRISCV_ContractOp : WeftRISCV_ContractLikeOp<"contract">;
 def WeftRISCV_OuterContractOp
     : WeftRISCV_ContractLikeOp<"outer_contract">;
 
-def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [Pure]> {
+def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins AnyType:$table, AnyType:$indices, StrAttr:$bounds,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);

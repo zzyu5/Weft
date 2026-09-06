@@ -4069,6 +4069,13 @@ mlir::LogicalResult DotOp::verify() { return verifyContractOp(*this); }
 mlir::LogicalResult ContractOp::verify() { return verifyContractOp(*this); }
 mlir::LogicalResult OuterContractOp::verify() { return verifyContractOp(*this); }
 
+void LookupOp::getEffects(
+    llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+        mlir::MemoryEffects::Effect>> &effects) {
+  if (mlir::isa<MemDescType>(getTable().getType()))
+    effects.emplace_back(mlir::MemoryEffects::Read::get());
+}
+
 mlir::LogicalResult LookupOp::verify() {
   auto indexElement = mlir::dyn_cast<mlir::IntegerType>(
       elementOf(getIndices().getType()));

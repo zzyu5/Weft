@@ -153,13 +153,25 @@ public:
 
 } // namespace
 
+bool weft::riscv_internal::readCrossesWrite(riscv::LoadOp load,
+                                          mlir::Operation *consumer) {
+  mlir::Operation *anchor = ancestorInBlock(consumer, load->getBlock());
+  if (!anchor)
+    return true;
+  auto source = load.getRegion().getType();
+  for (mlir::Operation *cursor = load->getNextNode(); cursor != anchor;
+       cursor = cursor->getNextNode())
+    if (!cursor || mayWriteSource(cursor, source))
+      return true;
+  // A nested consumer can observe writes from an earlier loop iteration.
+  return anchor != consumer && mayWriteSource(anchor, source);
+}
+
 bool weft::riscv_internal::needsReadSnapshot(riscv::LoadOp load) {
   auto encoding =
       mlir::cast<kernel::EncodingType>(load.getRegion().getType().getEncoding());
   if (encoding.getKind() == "dense")
     return false;
-  mlir::Block *block = load->getBlock();
-  const auto source = load.getRegion().getType();
   llvm::SmallVector<mlir::Value> pending{load.getResult()};
   llvm::SmallPtrSet<mlir::Operation *, 32> visited;
   while (!pending.empty()) {
@@ -167,16 +179,7 @@ bool weft::riscv_internal::needsReadSnapshot(riscv::LoadOp load) {
     for (mlir::Operation *user : value.getUsers()) {
       if (!visited.insert(user).second)
         continue;
-      mlir::Operation *anchor = ancestorInBlock(user, block);
-      if (!anchor)
-        return true;
-      for (mlir::Operation *cursor = load->getNextNode(); cursor != anchor;
-           cursor = cursor->getNextNode()) {
-        if (!cursor || mayWriteSource(cursor, source))
-          return true;
-      }
-      // A nested consumer can observe writes from an earlier loop iteration.
-      if (anchor != user && mayWriteSource(anchor, source))
+      if (readCrossesWrite(load, user))
         return true;
       if (mlir::isMemoryEffectFree(user) &&
           !mlir::isa<riscv::RegisterMaterializeOp>(user))
