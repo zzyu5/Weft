@@ -736,10 +736,13 @@ analyzeIssueStorageWindowCandidate(mlir::Builder &builder,
     return std::nullopt;
   const int64_t axis = point.getResult().getType().getDomain().getAxisId();
   auto position = axisPosition(result, axis);
-  if (!position || result.getLayout().getLaneFactors()[*position] <= 1 ||
+  if (!position)
+    return std::nullopt;
+  const int64_t lanes = result.getLayout().getLaneFactors()[*position];
+  const int64_t layer = field.getAccess().getLayerSize();
+  if (lanes <= 1 || layer <= 0 || layer % lanes ||
       result.getShape()[*position] !=
-          result.getLayout().getLaneFactors()[*position] *
-              result.getLayout().getTimeFactors()[*position])
+          lanes * result.getLayout().getTimeFactors()[*position])
     return std::nullopt;
   auto plan = riscv_internal::storageWindowPlan(
       builder, field, axis, 0, 1, 1, result.getShape()[*position],

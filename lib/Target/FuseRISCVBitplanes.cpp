@@ -60,14 +60,9 @@ struct SignedBitmaskReductionRelation {
 };
 
 std::optional<BitmaskRelation>
-matchBitmaskDecode(riscv::ConvertLayoutOp conversion) {
-  if (!conversion || conversion.getConversion().getEffect() != "pure" ||
-      conversion.getConversion().getKind() != "time_to_lane")
-    return std::nullopt;
-  auto extract = conversion.getInput().getDefiningOp<riscv::ExtractOp>();
+matchBitmaskDecode(riscv::ExtractOp extract, riscv::ValueType result) {
   auto field = extract ? extract.getInput().getDefiningOp<riscv::FieldOp>()
                        : riscv::FieldOp();
-  auto result = mlir::dyn_cast<riscv::ValueType>(conversion.getResult().getType());
   auto element = result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
                         : mlir::IntegerType();
   if (!extract || !field || !result || !element || element.isSigned() ||
@@ -121,6 +116,25 @@ matchBitmaskDecode(riscv::ConvertLayoutOp conversion) {
       facts.layer <= 0 || facts.group != facts.layer * 8 ||
       facts.bitOffset % 8 || facts.order != "lo_first")
     return std::nullopt;
+  auto position = llvm::find(result.getAxisIds().asArrayRef(), axis);
+  auto partition =
+      point.getPartition().getDefiningOp<mlir::arith::ConstantIndexOp>();
+  if (position == result.getAxisIds().asArrayRef().end() || !partition ||
+      origin.getResult().getType().getDomain().getAxisId() != axis)
+    return std::nullopt;
+  const size_t axisPosition = static_cast<size_t>(
+      position - result.getAxisIds().asArrayRef().begin());
+  const int64_t extent = result.getShape()[axisPosition];
+  const int64_t lanes = result.getLayout().getLaneFactors()[axisPosition];
+  if (extent <= 0 || partition.value() != extent || extent % facts.group ||
+      lanes <= 0 || lanes % facts.group || extent % lanes ||
+      result.getLayout().getTimeFactors()[axisPosition] != extent / lanes)
+    return std::nullopt;
+  for (size_t index = 0; index < result.getShape().size(); ++index)
+    if (index != axisPosition &&
+        (result.getLayout().getTimeFactors()[index] != 1 ||
+         result.getLayout().getLaneFactors()[index] != 1))
+      return std::nullopt;
   return BitmaskRelation{field, origin, point};
 }
 
@@ -542,30 +556,49 @@ public:
       conversions.push_back(operation);
     });
     mlir::IRRewriter rewriter(&getContext());
-    for (riscv::ConvertLayoutOp conversion : conversions) {
-      auto relation = matchBitmaskDecode(conversion);
+    auto materializeDecode = [&](mlir::Operation *root, riscv::ExtractOp extract,
+                                 riscv::ValueType result) {
+      auto relation = matchBitmaskDecode(extract, result);
       if (!relation)
-        continue;
-      auto result = conversion.getResult().getType();
+        return;
       const int64_t resultGroups = result.getLayout().getRegisterGroups();
       const int64_t temporaryGroups = std::max<int64_t>(
           1, (result.getLayout().getLmulEighths() + 7) / 8);
       const bool tail = result.getLayout().getValidity() == "tail";
-      rewriter.setInsertionPoint(conversion);
+      rewriter.setInsertionPoint(root);
       auto decoded = rewriter.create<riscv::RVVBitmaskDecodeOp>(
-          conversion.getLoc(), result, relation->field.getResult(),
+          root->getLoc(), result, relation->field.getResult(),
           relation->origin.getResult(), relation->point.getResult(),
           relation->field.getAccess(),
           riscv_internal::leaf(rewriter, "rvv", "bitmask-decode",
                                "rvv.bitmask-decode", "rvv.bitmask-decode", 0,
                                resultGroups, temporaryGroups, 0, "none",
                                tail ? "agnostic" : "exact"));
-      riscv_internal::copyOrigin(conversion, decoded);
+      riscv_internal::copyOrigin(root, decoded);
       decoded->setAttr("canonical_op",
                        rewriter.getStringAttr("weft_kernel.extract"));
-      mlir::Value oldInput = conversion.getInput();
-      rewriter.replaceOp(conversion, decoded.getResult());
-      eraseDeadTree(oldInput, rewriter);
+      mlir::Value oldInput = extract.getResult();
+      const bool replacesExtract = root == extract.getOperation();
+      rewriter.replaceOp(root, decoded.getResult());
+      if (!replacesExtract)
+        eraseDeadTree(oldInput, rewriter);
+    };
+    for (riscv::ConvertLayoutOp conversion : conversions) {
+      if (conversion.getConversion().getEffect() == "pure" &&
+          conversion.getConversion().getKind() == "time_to_lane")
+        materializeDecode(
+            conversion, conversion.getInput().getDefiningOp<riscv::ExtractOp>(),
+            conversion.getResult().getType());
+    }
+    llvm::SmallVector<riscv::ExtractOp> directBitmasks;
+    getOperation().walk([&](riscv::ExtractOp extract) {
+      if (extract.getAccess().getLayerSize() == 1)
+        directBitmasks.push_back(extract);
+    });
+    for (riscv::ExtractOp extract : directBitmasks) {
+      auto result = mlir::dyn_cast<riscv::ValueType>(extract.getResult().getType());
+      if (result)
+        materializeDecode(extract, extract, result);
     }
 
     llvm::SmallVector<riscv::RVVWidenDotOp> signedMaskDots;

@@ -214,6 +214,14 @@ contraction 的 unroll 只能属于它真实的多 issue reduction loop。单 is
 完整 reduction carrier 时，不存在可展开的 local issue loop；该 unroll 不得改挂到
 最近的外层 Level，否则会复制整个 storage-block program。
 
+### `FuseRISCVBitplanes`
+
+连续 packed-u1 的 bitmask decode 根据 field geometry、record origin、子 Level point 与
+目标 time/lane 范围选择。pure `time_to_lane` conversion 与已经直接承载 RVV layout 的
+`extract` 共用同一关系；直接 extract 限于每 byte 八个连续 logical bit 的 layer=1 表示。
+选择前核对 byte alignment、lo-first 位序、完整 group、point partition 与唯一 streamed axis，
+不以 conversion 节点是否恰好仍存在作为能力边界。
+
 ### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 
 `ScheduleRISCVLevels` 是 scheduler。它读取已 lowering 的 physical `scf.for`、SSA use-def、
