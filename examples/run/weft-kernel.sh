@@ -41,96 +41,38 @@ case "${target}" in
     ;;
 esac
 
-physical_auto=()
-if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
-fi
-if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
-  physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
-fi
-if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
-  physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
-fi
-meta=()
 matrix_extension=none
 runtime_kernel_define=
 runtime_phase=
 case "${kernel}" in
   q4_k_gemv)
-    dsl=examples/kernels/gemv/q4_k.py
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     ;;
   q4_k_gemv_groups4)
-    dsl=examples/kernels/gemv/q4_k_groups4.py
     runtime=examples/repro/weft/q4_k_gemv_runtime.cpp
     runtime_kernel_define=-DWEFT_Q4_GROUPS4=1
-    if [[ ${target} == sg2044 ]]; then
-      [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-        physical_auto+=(--auto-lmul-eighths 32)
-      [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 2)
-      [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-        physical_auto+=(--auto-pipeline-depth 1)
-    fi
     ;;
   ime_i8_contract)
     if [[ ${target} != k1 ]]; then
       echo "ime_i8_contract requires target k1 with IME" >&2
       exit 2
     fi
-    dsl=examples/kernels/dense/ime_i8_contract.py
     runtime=examples/repro/weft/ime_i8_contract_runtime.cpp
-    meta=(--meta MR=4 --meta NR=4 --meta KB=8)
     matrix_extension=spacemit-ime1
     ;;
   q8_0_quantize|q8_1_quantize|q8_K_quantize)
-    quantize_format=${kernel%_quantize}
-    dsl=examples/kernels/quantize/${quantize_format,,}.py
     runtime=examples/repro/weft/q8_quantize_runtime.cpp
     case "${kernel}" in
-      q8_0_quantize)
-        runtime_kernel_define=-DWEFT_Q8_KIND=0
-        if [[ ${target} == sg2044 ]]; then
-          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 32)
-          [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-          [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-            physical_auto+=(--auto-pipeline-depth 1)
-        fi
-        ;;
-      q8_1_quantize)
-        runtime_kernel_define=-DWEFT_Q8_KIND=1
-        if [[ ${target} == sg2044 ]]; then
-          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 64)
-        fi
-        ;;
-      q8_K_quantize)
-        runtime_kernel_define=-DWEFT_Q8_KIND=2
-        if [[ ${target} == sg2044 ]]; then
-          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 16)
-          [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-          [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-            physical_auto+=(--auto-pipeline-depth 1)
-        elif [[ ${target} == k1 ]]; then
-          [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-            physical_auto+=(--auto-lmul-eighths 16)
-        fi
-        ;;
+      q8_0_quantize) runtime_kernel_define=-DWEFT_Q8_KIND=0 ;;
+      q8_1_quantize) runtime_kernel_define=-DWEFT_Q8_KIND=1 ;;
+      q8_K_quantize) runtime_kernel_define=-DWEFT_Q8_KIND=2 ;;
     esac
     ;;
   gemv_f32)
-    dsl=examples/kernels/dense/gemv_f32.py
     runtime=examples/repro/weft/gemv_runtime.cpp
-    meta=(--meta MR=4 --meta KB=64)
     ;;
   gemm_f32)
-    dsl=examples/kernels/dense/gemm_f32.py
     runtime=examples/repro/weft/gemm_runtime.cpp
-    meta=(--meta MC=64 --meta NC=16 --meta MR=2 --meta NR=2)
-    if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-      physical_auto+=(--auto-lmul-eighths 16)
-    fi
     runtime_phase=prefill
     ;;
   *)
@@ -139,13 +81,14 @@ case "${kernel}" in
     ;;
 esac
 
-if [[ -n ${WEFT_META_BINDINGS:-} ]]; then
-  meta=()
-  IFS=';' read -r -a requested_meta <<< "${WEFT_META_BINDINGS}"
-  for binding in "${requested_meta[@]}"; do
-    [[ -n ${binding} ]] && meta+=(--meta "${binding}")
-  done
-fi
+configuration_text=$(python3 "${project_root}/examples/run/kernel_configuration.py" \
+  kernel "${target} ${kernel}" --march="${march}" --vlen-bits="${vlen}" \
+  --matrix-extension="${matrix_extension}")
+mapfile -t selected_configuration <<< "${configuration_text}"
+dsl=${selected_configuration[0]}
+selected_kernel=${selected_configuration[1]}
+physical_auto=("${selected_configuration[@]:3}")
+printf 'configuration=%s\n' "${selected_configuration[2]}"
 
 local_root=$(mktemp -d /tmp/weft-kernel.XXXXXX)
 cleanup_local() {
@@ -163,7 +106,7 @@ trap cleanup_local EXIT
 PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
-  --march="${march}" --abi=lp64d --vlen-bits="${vlen}" "${meta[@]}" \
+  --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
   "${physical_auto[@]}" \
   --matrix-extension="${matrix_extension}" \
   -o "${local_root}/kernel.c"

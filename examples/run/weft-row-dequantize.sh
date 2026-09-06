@@ -24,40 +24,6 @@ if [[ ${format_id} -lt 0 ]]; then
   echo "unsupported row-dequantization format: ${format}" >&2
   exit 2
 fi
-physical_auto=()
-record_axis_policy=()
-if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
-fi
-if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
-  physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
-fi
-if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
-  physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
-fi
-if [[ -n ${WEFT_RECORD_AXIS_POLICY:-} ]]; then
-  record_axis_policy+=(--record-axis-policy "${WEFT_RECORD_AXIS_POLICY}")
-fi
-if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  case "${format}" in
-    iq2_xxs)
-      physical_auto+=(--auto-lmul-eighths 16)
-      ;;
-  esac
-fi
-if [[ ${target} == sg2044 && -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  case "${format}" in
-    q1_0)
-      physical_auto+=(--auto-lmul-eighths 16)
-      ;;
-    iq2_s)
-      physical_auto+=(--auto-lmul-eighths 64)
-      ;;
-    tq1_0|tq2_0)
-      physical_auto+=(--auto-lmul-eighths 32)
-      ;;
-  esac
-fi
 case "${target}" in
   sg2044)
     remote_host=rvv
@@ -91,6 +57,15 @@ case "${target}" in
     ;;
 esac
 
+configuration_text=$(python3 "${project_root}/examples/run/kernel_configuration.py" \
+  row-dequantize "${target} ${format}" --march="${march}" --vlen-bits="${vlen}" \
+  --matrix-extension="none")
+mapfile -t selected_configuration <<< "${configuration_text}"
+dsl=${selected_configuration[0]}
+selected_kernel=${selected_configuration[1]}
+physical_auto=("${selected_configuration[@]:3}")
+printf 'configuration=%s\n' "${selected_configuration[2]}"
+
 local_root=$(mktemp -d /tmp/weft-row-dequantize.XXXXXX)
 cleanup_local() {
   status=$?
@@ -105,11 +80,10 @@ cleanup_local() {
 trap cleanup_local EXIT
 
 PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft \
-  "${project_root}/examples/kernels/dequantize/${format}.py" \
+  "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \
-  "${record_axis_policy[@]}" \
   "${physical_auto[@]}" \
   -o "${local_root}/kernel.c"
 cp "${project_root}/examples/repro/weft/row_dequantize_runtime.cpp" \

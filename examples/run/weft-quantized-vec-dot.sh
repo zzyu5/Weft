@@ -27,179 +27,6 @@ if [[ ${format_id} -lt 0 ]]; then
 fi
 kernel="quantized_vec_dot_${format}_${partners[format_id]}"
 runtime_kernel_define=
-physical_auto=()
-if [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-  physical_auto+=(--auto-lmul-eighths "${WEFT_AUTO_LMUL_EIGHTHS}")
-fi
-if [[ -n ${WEFT_AUTO_UNROLL:-} ]]; then
-  physical_auto+=(--auto-unroll "${WEFT_AUTO_UNROLL}")
-fi
-if [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]]; then
-  physical_auto+=(--auto-pipeline-depth "${WEFT_AUTO_PIPELINE_DEPTH}")
-fi
-if [[ -n ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
-  physical_auto+=(--auto-scalar-load-prime "${WEFT_AUTO_SCALAR_LOAD_PRIME}")
-fi
-if [[ ${format} == q1_0 ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 16)
-    else
-      physical_auto+=(--auto-lmul-eighths 8)
-    fi
-  fi
-  if [[ -z ${WEFT_AUTO_UNROLL:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-unroll 1)
-    else
-      physical_auto+=(--auto-unroll 4)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${target} == sg2044 && ${format} == q8_0 ]]; then
-  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-    physical_auto+=(--auto-lmul-eighths 8)
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == q3_k ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 32)
-    else
-      physical_auto+=(--auto-lmul-eighths 16)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-  if [[ ${target} == sg2044 && -z ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
-    physical_auto+=(--auto-scalar-load-prime 1)
-  fi
-fi
-if [[ ${format} == q5_0 || ${format} == q5_1 ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 16)
-    else
-      physical_auto+=(--auto-lmul-eighths 8)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == q2_k ]]; then
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-  if [[ ${target} == sg2044 && -z ${WEFT_AUTO_SCALAR_LOAD_PRIME:-} ]]; then
-    physical_auto+=(--auto-scalar-load-prime 1)
-  fi
-fi
-if [[ ${format} == q4_k ]]; then
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 8)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq2_xs ]]; then
-  if [[ ${target} == sg2044 ]]; then
-    [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-      physical_auto+=(--auto-lmul-eighths 32)
-    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  else
-    [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-      physical_auto+=(--auto-lmul-eighths 32)
-    [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  fi
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq2_s ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 32)
-    else
-      physical_auto+=(--auto-lmul-eighths 16)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq1_s ]]; then
-  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-    physical_auto+=(--auto-lmul-eighths 32)
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 4)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq1_m ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 32)
-    else
-      physical_auto+=(--auto-lmul-eighths 16)
-    fi
-  fi
-  if [[ -z ${WEFT_AUTO_UNROLL:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-unroll 2)
-    else
-      physical_auto+=(--auto-unroll 1)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq2_xxs ]]; then
-  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-    physical_auto+=(--auto-lmul-eighths 32)
-  if [[ -z ${WEFT_AUTO_UNROLL:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-unroll 2)
-    else
-      physical_auto+=(--auto-unroll 4)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == iq3_s || ${format} == iq3_xxs ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 32)
-    else
-      physical_auto+=(--auto-lmul-eighths 16)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == q6_k ]]; then
-  [[ -n ${WEFT_AUTO_LMUL_EIGHTHS:-} ]] ||
-    physical_auto+=(--auto-lmul-eighths 32)
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 2)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-if [[ ${format} == tq1_0 ]]; then
-  if [[ -z ${WEFT_AUTO_LMUL_EIGHTHS:-} ]]; then
-    if [[ ${target} == sg2044 ]]; then
-      physical_auto+=(--auto-lmul-eighths 8)
-    else
-      physical_auto+=(--auto-lmul-eighths 8)
-    fi
-  fi
-  [[ -n ${WEFT_AUTO_UNROLL:-} ]] || physical_auto+=(--auto-unroll 1)
-  [[ -n ${WEFT_AUTO_PIPELINE_DEPTH:-} ]] ||
-    physical_auto+=(--auto-pipeline-depth 1)
-fi
-
 case "${target}" in
   sg2044)
     remote_host=rvv
@@ -233,6 +60,18 @@ case "${target}" in
     ;;
 esac
 
+configuration_text=$(python3 "${project_root}/examples/run/kernel_configuration.py" \
+  vec-dot "${target} ${format}" --march="${march}" --vlen-bits="${vlen}" \
+  --matrix-extension="none")
+mapfile -t selected_configuration <<< "${configuration_text}"
+dsl=${selected_configuration[0]}
+selected_kernel=${selected_configuration[1]}
+physical_auto=("${selected_configuration[@]:3}")
+printf 'configuration=%s\n' "${selected_configuration[2]}"
+if [[ ${selected_kernel} != ${kernel} ]]; then
+  runtime_kernel_define="-D${kernel}=${selected_kernel}"
+fi
+
 local_root=$(mktemp -d /tmp/weft-quantized-vec-dot.XXXXXX)
 cleanup_local() {
   status=$?
@@ -246,9 +85,8 @@ cleanup_local() {
 }
 trap cleanup_local EXIT
 
-vec_dot_source=${kernel#quantized_vec_dot_}
 PYTHONPATH="${project_root}/python:${project_root}/examples" python -m weft \
-  "${project_root}/examples/kernels/vec_dot/${vec_dot_source}.py" \
+  "${project_root}/${dsl}" \
   > "${local_root}/kernel.mlir"
 "${compiler}" "${local_root}/kernel.mlir" --emit=intrinsic-c \
   --march="${march}" --abi=lp64d --vlen-bits="${vlen}" \

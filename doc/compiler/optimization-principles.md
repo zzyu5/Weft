@@ -414,6 +414,20 @@ facts、physical bindings、候选来源与完整枚举域、估计分项、拒�
 winner。一个历史选定值、target 默认值或 production 手填值不自动等于完整候选域的 winner。
 配置放在 Python、C++ 或 shell 不改变这项归属与证据要求。
 
+仓库示例的 source bindings 与历史 physical bindings 放在对应 kernel 家族旁的
+`examples/kernels/*/tuning.json`；runner 只解析该配置、绑定目标环境并编译/运行。
+其中 `physical_search` 是该构建调用声明的有限搜索子集，不替代 C++ target 合法性规则；
+`binding_origin=historical-selection` 不宣称完整搜索的最优值。
+外部 tuner 可以枚举已声明的数值参数以及 partial-combine、record-axis 策略，默认预算
+256 个 candidate，显式预算最多 1024 个；source 参数展开也在创建笛卡尔积前受限。
+
+`weft-kernel-tune.sh` 在仓库外保存完整 `search.json`、每个 candidate 的 stdout/stderr、
+拒绝原因或数值/计时记录，以及 `selected.json`。当前排序使用数值验证后的实测吞吐，
+没有静态估计时明确记录 `estimate=null`，不伪造成本分数。
+`WEFT_TUNE_SELECTION` 显式复用一份结果时，必须匹配 runner/request、source entry/symbol、
+target facts、原搜索域和原数值候选记录。它不自动改变 co-located 历史选择，也不从其它
+target 或不完整 winner 行中恢复配置。改变 target/shape/source 后需要在对应运行合同下重扫。
+
 普通 `for/while/if` 仍按当前语言合同保持有序标量控制。本节不授权从普通迭代发明 shaped
 axis，也不随成本政策调整 birth、alias、iteration identity 或 numerical boundary。
 
