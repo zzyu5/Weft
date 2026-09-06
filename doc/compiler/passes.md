@@ -89,6 +89,11 @@ form。没有合法局部结构时当前 module 失败。
 carrier/坐标，不重选 partial plan；新 leaf 及资源由原有 verifier/materializer 重新检查。
 该规则不处理独立乘积、tail carrier 或更宽的 partial，不将代数上少一项运算当作其成本结论。
 
+单轴 full-valid i16 loop carry 若仅沿同 block 的 byte widening product + add 链流向其
+对应 yield，可将整条链选择为已有 widening accumulate。每个 product 必须单 use、
+逐坐标同形；保留原 i16 加法边界和迭代顺序，不合并不同 carry，也不只改写链的前缀。
+这条关系不增加作者 reduction，不改变最后的归约位置；资源仍由后续 pass 重新闭合。
+
 ### `PropagateRISCVLayouts`
 
 从 selected operation anchors、logical axes、producer/consumer、control carry 和 target VLEN

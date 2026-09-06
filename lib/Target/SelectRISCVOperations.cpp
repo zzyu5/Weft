@@ -4,6 +4,7 @@
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -148,6 +149,82 @@ riscv::ImplementationAttr rvvImplementation(
                                         parameters);
 }
 
+void selectLoopCarriedWidenProducts(mlir::ModuleOp module,
+                                    mlir::IRRewriter &rewriter) {
+  module.walk([&](mlir::scf::ForOp loop) {
+    auto kernel = loop->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized())
+      return;
+    auto yield = mlir::cast<mlir::scf::YieldOp>(loop.getBody()->getTerminator());
+    for (auto [index, argument] : llvm::enumerate(loop.getRegionIterArgs())) {
+      auto type = mlir::dyn_cast<riscv::ValueType>(argument.getType());
+      auto element = type ? mlir::dyn_cast<mlir::IntegerType>(type.getElementType())
+                          : mlir::IntegerType();
+      if (!type || !element || !element.isSigned() || element.getWidth() != 16 ||
+          type.getShape().size() != 1 || type.getShape()[0] <= 1)
+        continue;
+      auto layout = type.getLayout();
+      if (layout.getCarrier() != "rvv" || layout.getValidity() != "full" ||
+          layout.getTimeFactors()[0] != 1 ||
+          layout.getLaneFactors()[0] != type.getShape()[0] ||
+          layout.getReplicaFactors()[0] != 1 ||
+          layout.getFragmentFactors()[0] != 1 ||
+          layout.getLocalFactors()[0] != 1)
+        continue;
+
+      llvm::SmallVector<std::pair<riscv::BinaryOp, riscv::RVVWidenMultiplyOp>> chain;
+      mlir::Value current = argument;
+      while (current.hasOneUse()) {
+        mlir::Operation *user = *current.getUsers().begin();
+        if (user == yield.getOperation())
+          break;
+        auto add = mlir::dyn_cast<riscv::BinaryOp>(user);
+        if (!add || add.getKind() != "add" ||
+            add->getBlock() != loop.getBody() || add.getResult().getType() != type)
+          break;
+        mlir::Value other = add.getLhs() == current ? add.getRhs() : add.getLhs();
+        auto product = other.getDefiningOp<riscv::RVVWidenMultiplyOp>();
+        if (!product || !other.hasOneUse() || other.getType() != type ||
+            product->getBlock() != loop.getBody())
+          break;
+        auto lhs = product.getLhs().getType();
+        auto rhs = product.getRhs().getType();
+        if (width(lhs) > 8 || width(rhs) > 8 ||
+            (!isSigned(lhs) && !isSigned(rhs)) ||
+            lhs.getLayout().getValidity() != "full" ||
+            rhs.getLayout().getValidity() != "full")
+          break;
+        chain.emplace_back(add, product);
+        current = add.getResult();
+      }
+      // Select the entire carried chain together; a prefix would not satisfy
+      // the existing partial operation's closed-chain contract.
+      if (chain.empty() || !current.hasOneUse() ||
+          *current.getUsers().begin() != yield.getOperation() ||
+          yield.getOperand(index) != current)
+        continue;
+      for (auto [add, product] : chain) {
+        mlir::Value accumulator = add.getLhs() == product.getResult()
+                                      ? add.getRhs() : add.getLhs();
+        auto lhs = product.getLhs().getType().getLayout();
+        auto rhs = product.getRhs().getType().getLayout();
+        rewriter.setInsertionPoint(add);
+        auto accumulate = rewriter.create<riscv::RVVWidenAccumulateOp>(
+            add.getLoc(), type, product.getLhs(), product.getRhs(), accumulator,
+            type.getAxisIds(),
+            riscv_internal::leaf(
+                rewriter, "rvv", "widen-accumulate", "rvv.vwmacc.partial",
+                "rvv.vwmacc.partial", lhs.getRegisterGroups() +
+                    rhs.getRegisterGroups() + layout.getRegisterGroups(),
+                layout.getRegisterGroups(), 0, 0, "none", "agnostic"));
+        riscv_internal::copyOrigin(add, accumulate);
+        rewriter.replaceOp(add, accumulate.getResult());
+        rewriter.eraseOp(product);
+      }
+    }
+  });
+}
+
 void selectZeroSeedProducts(mlir::ModuleOp module,
                             mlir::IRRewriter &rewriter) {
   // Seed a full byte-product chain without keeping a zero vector live.
@@ -229,6 +306,7 @@ public:
 
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
+    selectLoopCarriedWidenProducts(getOperation(), rewriter);
     selectZeroSeedProducts(getOperation(), rewriter);
     mlir::Builder builder(&getContext());
     bool failed = false;
