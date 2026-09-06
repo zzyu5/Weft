@@ -1958,7 +1958,8 @@ public:
     // Each physical value receives the largest lane span legal for its own
     // type and the instantiated LMUL bound.  Structured-product operands and
     // a same-axis extract remain coupled where the target instruction requires
-    // it; ordinary pointwise mismatches become explicit convert_layout edges
+    // it. A domain projection does not shrink its parent's lane span;
+    // ordinary pointwise mismatches become explicit convert_layout edges
     // instead of conservatively shrinking the whole use-def chain.
     llvm::DenseMap<mlir::Value, int64_t> connectedLaneSpans;
     for (mlir::Value value : values) {
@@ -1987,6 +1988,33 @@ public:
     while (laneSpanChanged) {
       laneSpanChanged = false;
       getOperation().walk([&](mlir::Operation *operation) {
+        if (mlir::isa<riscv::CastOp, riscv::NarrowOp, riscv::WidenOp>(operation)) {
+          mlir::Value input = operation->getOperand(0);
+          mlir::Value result = operation->getResult(0);
+          auto inputType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+          auto resultType = mlir::dyn_cast<riscv::ValueType>(result.getType());
+          if (inputType && resultType && inputType.getShape().size() == 1 &&
+              inputType.getShape() == resultType.getShape() &&
+              inputType.getAxisIds() == resultType.getAxisIds() &&
+              connectedLaneSpans.count(result) && roles[input].laneAxis &&
+              roles[input].laneAxis == roles[result].laneAxis) {
+            auto target =
+                operation->getParentOfType<riscv::KernelOp>().getTarget();
+            int64_t maximumLMUL = 0;
+            for (int64_t legal : target.getLegalLMULEighths().asArrayRef())
+              maximumLMUL = std::max(maximumLMUL, legal);
+            const int64_t inputSEW = std::max<int64_t>(
+                8, riscv_internal::logicalBitWidth(inputType));
+            const int64_t capacity =
+                target.getVlenBits() * maximumLMUL / (8 * inputSEW);
+            // The operand must realize the result's lanes at its own SEW.
+            // A narrower result cannot demand an unsupported wide operand.
+            if (capacity > 0 && connectedLaneSpans[result] > capacity) {
+              connectedLaneSpans[result] = capacity;
+              laneSpanChanged = true;
+            }
+          }
+        }
         if (!mlir::isa<riscv::DotOp, riscv::ContractOp,
                        riscv::OuterContractOp>(operation)) {
           if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(operation)) {
@@ -1999,8 +2027,20 @@ public:
               return;
             int64_t span =
                 std::min(connectedLaneSpans[input], connectedLaneSpans[result]);
+            const int64_t axis = roles[input].laneAxis;
+            const int64_t inputExtent =
+                riscv_internal::physicalExtent(input, axis);
+            const int64_t resultExtent =
+                riscv_internal::physicalExtent(result, axis);
+            const bool domainProjection =
+                extract.getSelectors().size() == 1 &&
+                mlir::cast<mlir::StringAttr>(extract.getSelectors()[0])
+                        .getValue() == "domain" &&
+                inputExtent > resultExtent && resultExtent > 0 &&
+                inputExtent % resultExtent == 0;
             for (mlir::Value value : {input, result})
-              if (connectedLaneSpans[value] != span) {
+              if ((!domainProjection || value == result) &&
+                  connectedLaneSpans[value] != span) {
                 connectedLaneSpans[value] = span;
                 laneSpanChanged = true;
               }

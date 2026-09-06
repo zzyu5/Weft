@@ -228,6 +228,60 @@ public:
             continue;
           }
         }
+        if (auto load = mlir::dyn_cast_or_null<riscv::LoadOp>(producer);
+            load && load.getResult().hasOneUse() && !load.getSnapshotStorage() &&
+            conversion.getResult().hasOneUse() &&
+            rematerializable(*conversion.getResult().getUsers().begin()) &&
+            load.getAccess().getForm() == "unit" &&
+            preservesReadOrder(load, conversion)) {
+          auto source = mlir::dyn_cast<riscv::ValueType>(load.getResult().getType());
+          auto target = conversion.getResult().getType();
+          auto encoding = mlir::cast<kernel::EncodingType>(
+              load.getRegion().getType().getEncoding());
+          auto kernel = load->getParentOfType<riscv::KernelOp>();
+          auto slice = load.getRegion().getDefiningOp<riscv::SliceOp>();
+          auto point = slice && slice.getIndices().size() == 1
+              ? slice.getIndices().front().getDefiningOp<riscv::PhysicalPointOp>()
+              : riscv::PhysicalPointOp();
+          if (source && kernel && point && encoding.getKind() == "dense" &&
+              source.getShape().size() == 1 && source.getShape()[0] > 0 &&
+              source.getShape() == target.getShape() &&
+              source.getAxisIds() == target.getAxisIds() &&
+              source.getElementType() == target.getElementType()) {
+            auto before = source.getLayout();
+            auto after = target.getLayout();
+            const int64_t oldLanes = before.getLaneFactors()[0];
+            const int64_t newLanes = after.getLaneFactors()[0];
+            const int64_t extent = source.getShape()[0];
+            if (before.getCarrier() == "rvv" && after.getCarrier() == "rvv" &&
+                before.getSew() == after.getSew() && oldLanes > 0 && newLanes > 0 &&
+                newLanes != oldLanes &&
+                (newLanes % oldLanes == 0 || oldLanes % newLanes == 0) &&
+                extent % oldLanes == 0 && extent % newLanes == 0 &&
+                before.getVl() == oldLanes &&
+                after.getVl() == newLanes &&
+                before.getTimeFactors()[0] == extent / oldLanes &&
+                after.getTimeFactors()[0] == extent / newLanes &&
+                before.getReplicaFactors()[0] == 1 && after.getReplicaFactors()[0] == 1 &&
+                before.getFragmentFactors()[0] == 1 && after.getFragmentFactors()[0] == 1 &&
+                before.getLocalFactors()[0] == 1 && after.getLocalFactors()[0] == 1 &&
+                before.getValidity() == after.getValidity() &&
+                riscv::supportsRVVLayout(kernel.getTarget(), after)) {
+              // Match the final pointwise partition at the original read point.
+              rewriter.setInsertionPoint(load);
+              auto projectedLoad = rewriter.create<riscv::LoadOp>(
+                  load.getLoc(), target, load.getRegion(), mlir::Value(),
+                  riscv_internal::unassignedAccess(rewriter),
+                  riscv_internal::unselectedLeaf(rewriter));
+              riscv_internal::copyOrigin(load, projectedLoad);
+              conversion.getResult().replaceAllUsesWith(projectedLoad.getResult());
+              rewriter.eraseOp(conversion);
+              rewriter.eraseOp(load);
+              changed = true;
+              continue;
+            }
+          }
+        }
         if (auto lookup = mlir::dyn_cast_or_null<riscv::LookupOp>(producer);
             lookup && mlir::isa<riscv::MemDescType>(lookup.getTable().getType()) &&
             lookup.getResult().hasOneUse() &&

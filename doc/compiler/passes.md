@@ -103,8 +103,13 @@ bounded register reduction 可以保留一致的 free-axis memory supply，以 r
 表示被消除轴；结果必须逐轴保留其余 mapping，不强制将归约轴搬入 SIMD lane。
 已实例化的 LMUL binding 是基础表示宽度，不是所有 SSA 值的统一上限。
 保持同一 logical lane span 的 cast/widen/narrow 链会按 SEW 比例唯一派生每个值的
-LMUL；widening contraction 的两个 operand 再共享该 lane span。目标不支持派生
-LMUL 或最终联合 live set 超资源时，当前 candidate 失败，不回头改作者树。
+LMUL；widening contraction 的两个 operand 再共享该 lane span。一维同轴的宽度转换还须
+按 operand SEW 与目标最大合法 LMUL 限制 result lane capacity，其余元素保留为 issue time；
+不能让窄 result 要求无法表示的宽 operand。没有合法派生 LMUL 或最终联合 live set
+超资源时，当前 candidate 失败，不回头改作者树。
+整除的 proper domain Extract 是投影，不是父子 lane-span 等价关系：子域可以使用更窄的
+carrier，但不能反向压缩父值。父值保持独立合法表示，后续 typed extract 或 partitioned
+reduction 消费它；逻辑分组、数值宽度与 reduction 边界不改变。
 当 encoded field 经过保持 shape/axis 的 conversion 或作为 lookup index 流向下游时，
 storage layer 宽度同样沿这条 use-def 链传播；target 不能因此把超过真实
 grouped/layered 宽度的逻辑 lane 伪装成一次 indexed load。
@@ -184,6 +189,12 @@ form 和 leaf 由后续 `PlanRISCVMemory` 重选；该规则不把寄存器 tabl
 完整的 regular-repeat gather 仅被 scalar conversion 使用时，可在原读取位置直接形成
 scalar supply，复用重复的 source byte。该规则保留归约轴及单元素 free-axis mapping，
 要求同 block、无跨写入、完整窗口与精确 part-base；不需要重物化整段坐标/算术程序。
+
+一个单 use、无 snapshot 的一维 dense unit load，经 pure conversion 只供给一个 pointwise
+consumer 时，可以在原读取点直接采用该 consumer 要求的分片。仅接受已物化的 domain-point
+slice、整除的 full lane/time 分片、同 element/axis/validity、无 replica/local/fragment 扩张，
+并检查目标 layout 与同 block 无跨写入。读取字节集合和读取位置均不变；memory form、leaf
+与资源须重新闭合，不把宽 load 本身当作收益，也不复制多 use 或 indexed 读取。
 
 ### `LowerRISCVComposites`
 
