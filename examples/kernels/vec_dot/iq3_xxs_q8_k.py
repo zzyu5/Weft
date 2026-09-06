@@ -18,8 +18,7 @@ def compute(
         w = wl.load(W[kb])
         x = wl.load(X[kb])
         half = wl.arange(0, 2, dtype=wl.u32, axis="half")
-        entry = wl.arange(0, 4, dtype=wl.u32, axis="entry")
-        code = wl.arange(0, 2, dtype=wl.u32, axis="code")
+        entry_code = wl.arange(0, 8, dtype=wl.u32, axis="entry_code")
         payload = wl.arange(0, 4, dtype=wl.u16, axis="payload")
         block_sum = wl.i32(0)
         group_index = wl.index(0)
@@ -29,13 +28,12 @@ def compute(
                 w.q[
                     wl.u32(group_index) * wl.u32(16)
                     + half * wl.u32(8)
-                    + entry * wl.u32(2)
-                    + code
+                    + entry_code
                 ],
                 wl.u32,
             )
-            sign_index = metadata >> entry * wl.u32(7) & wl.u32(127)
-            sign_entry = sign_index * wl.u32(2) + code
+            sign_index = metadata >> (entry_code // wl.u32(2)) * wl.u32(7) & wl.u32(127)
+            sign_entry = sign_index * wl.u32(2) + entry_code % wl.u32(2)
             weight = wl.lookup(
                 grid_values, grid_index * wl.u32(4) + payload, bounds="in_bounds"
             )
@@ -45,14 +43,13 @@ def compute(
             activation = x.q[
                 wl.u32(group_index) * wl.u32(64)
                 + half * wl.u32(32)
-                + entry * wl.u32(8)
-                + code * wl.u32(4)
+                + entry_code * wl.u32(4)
                 + wl.u32(payload)
             ]
             local = wl.reduce_dot(
                 activation,
                 weight * sign,
-                over=("entry", "code", "payload"),
+                over=("entry_code", "payload"),
                 acc_dtype=wl.i32,
             )
             scale = wl.i32((metadata >> wl.u32(28)) * wl.u32(2) + wl.u32(1))
