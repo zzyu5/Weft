@@ -17,6 +17,15 @@ int main(int argc, char **argv) {
       []() { return weft::createCanonicalizeRISCVLayoutsPass(); });
   mlir::registerPass(
       []() { return weft::createEliminateDeadRISCVLayoutsPass(); });
+  mlir::registerPass([]() { return weft::createPlanRISCVMemoryPass(); });
+  mlir::registerPass(
+      []() { return weft::createMaterializeRISCVReplicaStorageLoadsPass(); });
+  mlir::registerPass([]() { return weft::createHoistRISCVLoopInvariantsPass(); });
+  mlir::registerPass([]() { return weft::createSelectRISCVOperationsPass(); });
+  mlir::registerPass([]() { return weft::createFinalizeRISCVLeavesPass(); });
+  mlir::registerPass(
+      []() { return weft::createMaterializeRISCVReadSnapshotsPass(); });
+  mlir::registerPass([]() { return weft::createMaterializeRISCVResourcesPass(); });
   mlir::registerPass([]() { return weft::createVerifyFinalRISCVPass(); });
   mlir::DialectRegistry registry;
   registry.insert<weft::kernel::WEFTKernelDialect,

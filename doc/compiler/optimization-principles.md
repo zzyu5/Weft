@@ -446,6 +446,15 @@ layout 改写的重放从 `--emit=riscv-layout-input` 开始：解析后执行
 重新选择 memory/leaf 并核算资源。应同时记录边界前后的实际改写、重放稳定性与完整编译
 结果的比较；不得只观察一个被跳过的 pass。真机数值 repro 仍是独立且必须完成的证据。
 
+也可对已通过 final verifier 的独立副本清除 `resources_materialized`，并将
+`vector_register_peak`、`fragment_register_peak`、`local_storage_bytes` 清零，
+通过 `weft-opt` 重放 layout canonicalization、CSE、dead-layout 清理及原有的
+memory/replica-load/hoist/operation-selection/leaf-finalization/read-snapshot/resource
+收尾 passes，最后重新运行 final verifier。原有显式 spill、snapshot 和 selected target op
+仍是输入 Physical graph 的一部分，不因清 marker 而删除；已有 scalar-load prime 保留，
+不得据此推测新的参数绑定。每轮都重新清 marker 后重放，二次 diff 为零才表示此流程稳定。
+若改写留下不匹配的 leaf 或无法重新闭合资源，应报告失败，不能补回旧 marker/统计使其通过。
+
 pass 贡献只能来自固定作者树及其它 binding 下两份均合法的 Physical program，并实际运行
 对应 artifacts。关闭必需 lowering 后编译失败不是性能消融，也不能把多个相互依赖 pass 的
 联合收益拆成没有依据的贡献百分比。
