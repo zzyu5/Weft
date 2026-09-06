@@ -1808,6 +1808,136 @@ bool readRangeIsShareable(mlir::Operation *first, mlir::Operation *last) {
   return false;
 }
 
+std::optional<int64_t>
+singleNaturalWindowBase(riscv::RVVReplicaStorageLoadOp load) {
+  auto type = load.getResult().getType();
+  auto layout = type.getLayout();
+  auto plan = load.getPlan();
+  auto ones = [](llvm::ArrayRef<int64_t> factors) {
+    return llvm::all_of(factors, [](int64_t factor) { return factor == 1; });
+  };
+  if (plan.getKind() != "unit" || load.getAccess().getMapping() != "natural" ||
+      plan.getProjectionBase() != 0 || plan.getProjectionStride() != 1 ||
+      plan.getProjectionRepeat() != 1 || layout.getLmulEighths() > 8 ||
+      !ones(layout.getTimeFactors().asArrayRef()) ||
+      !ones(layout.getReplicaFactors().asArrayRef()) ||
+      !ones(layout.getFragmentFactors().asArrayRef()) ||
+      !ones(layout.getLocalFactors().asArrayRef()) ||
+      load.getWindowOffsets().size() != 1 ||
+      load.getWindowForPart() != llvm::ArrayRef<int64_t>({0}))
+    return std::nullopt;
+  LinearIndex base;
+  decomposeIndex(load.getLogicalBase(), 1, base);
+  int64_t offset = 0;
+  if (!base.valid || !base.terms.empty() ||
+      !checkedAdd(base.constant, load.getWindowOffsets()[0], offset) || offset < 0)
+    return std::nullopt;
+  return offset;
+}
+
+bool isContiguousSupplySlice(riscv::ValueType source,
+                             riscv::ValueType result) {
+  if (source == result)
+    return true;
+  auto sourceLayout = source.getLayout();
+  auto resultLayout = result.getLayout();
+  if (source.getElementType() != result.getElementType() ||
+      source.getAxisIds() != result.getAxisIds() ||
+      sourceLayout.getSew() != resultLayout.getSew() ||
+      sourceLayout.getValidity() != resultLayout.getValidity() ||
+      sourceLayout.getLmulEighths() < resultLayout.getLmulEighths() ||
+      sourceLayout.getLmulEighths() % resultLayout.getLmulEighths())
+    return false;
+  bool sliced = false;
+  bool earlierLane = false;
+  for (size_t position = 0; position < source.getShape().size(); ++position) {
+    if (source.getShape()[position] <= 0 || result.getShape()[position] <= 0)
+      return false;
+    const int64_t sourceLanes = sourceLayout.getLaneFactors()[position];
+    const int64_t resultLanes = resultLayout.getLaneFactors()[position];
+    if (source.getShape()[position] == result.getShape()[position]) {
+      if (sourceLanes != resultLanes)
+        return false;
+    } else {
+      if (sliced || earlierLane || source.getShape()[position] != sourceLanes ||
+          result.getShape()[position] != resultLanes || resultLanes <= 0 ||
+          sourceLanes < resultLanes || sourceLanes % resultLanes)
+        return false;
+      sliced = true;
+    }
+    earlierLane |= sourceLanes > 1;
+  }
+  return true;
+}
+
+void reuseNaturalStorageWindows(mlir::IRRewriter &rewriter,
+                                mlir::ModuleOp module) {
+  struct AvailableWindow {
+    riscv::RVVReplicaStorageLoadOp load;
+    mlir::Value value;
+    int64_t base;
+    int64_t lanes;
+  };
+  module.walk([&](mlir::Block *block) {
+    llvm::SmallVector<riscv::RVVReplicaStorageLoadOp> loads;
+    for (mlir::Operation &operation : *block)
+      if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation))
+        loads.push_back(load);
+    llvm::SmallVector<AvailableWindow> available;
+    llvm::SmallVector<riscv::RVVReplicaStorageLoadOp> replaced;
+    for (riscv::RVVReplicaStorageLoadOp load : loads) {
+      if (load.getResult().use_empty())
+        continue;
+      auto base = singleNaturalWindowBase(load);
+      auto type = load.getResult().getType();
+      auto lanes = riscv::rvvLaneCount(type);
+      if (!base || !lanes || *lanes <= 0)
+        continue;
+      mlir::Value replacement;
+      unsigned inspected = 0;
+      for (AvailableWindow &prior : llvm::reverse(available)) {
+        if (++inspected > 32)
+          break;
+        if (prior.load.getField() != load.getField() ||
+            prior.load.getRecordRank() != load.getRecordRank() ||
+            prior.load.getRecordCoordinatesForWindow() !=
+                load.getRecordCoordinatesForWindow() ||
+            prior.load.getPlan().getReductionAxis() !=
+                load.getPlan().getReductionAxis() ||
+            *base < prior.base || prior.lanes < *lanes)
+          continue;
+        const int64_t offset = *base - prior.base;
+        auto priorType = mlir::cast<riscv::ValueType>(prior.value.getType());
+        if (offset > prior.lanes - *lanes || offset % *lanes ||
+            !isContiguousSupplySlice(priorType, type) ||
+            !readRangeIsShareable(prior.load, load))
+          continue;
+        replacement = prior.value;
+        if (offset || priorType != type) {
+          rewriter.setInsertionPoint(load);
+          auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
+              load.getLoc(), type, replacement,
+              rewriter.getDenseI64ArrayAttr({0}),
+              rewriter.getDenseI64ArrayAttr({offset}),
+              riscv_internal::leaf(
+                  rewriter, "transfer", "issue-slice", "rvv.issue-slice",
+                  "rvv.issue-slice", 0, type.getLayout().getRegisterGroups(),
+                  0, 0, "none", "exact"));
+          riscv_internal::copyOrigin(load, slice);
+          replacement = slice.getResult();
+        }
+        load.getResult().replaceAllUsesWith(replacement);
+        replaced.push_back(load);
+        break;
+      }
+      available.push_back(
+          {load, replacement ? replacement : load.getResult(), *base, *lanes});
+    }
+    for (riscv::RVVReplicaStorageLoadOp load : replaced)
+      rewriter.eraseOp(load);
+  });
+}
+
 void materializeSharedLayeredStorageWindows(mlir::IRRewriter &rewriter,
                                             mlir::ModuleOp module) {
   llvm::SmallVector<riscv::RVVStorageWindowOp> windows;
@@ -2509,6 +2639,7 @@ public:
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
     materializeReplicaStorageLoads(rewriter, getOperation());
+    reuseNaturalStorageWindows(rewriter, getOperation());
   }
 };
 

@@ -248,6 +248,11 @@ affine index、time/lane/replica分解、consumer layout与target facts，按tar
 这个 pass只闭合现有 field-to-register edge，不创建logical axis、Level或source traversal。
 partial materializer若需把一个已选unit load投影到issue window，只能机械投影原有plan与leaf，
 不能重新选择memory form。
+同一 block 内的单寄存器 natural/unit 读取可以复用一个已经存在的完整连续窗口。该规则
+向前检查至多 32 个候选，要求同一 field SSA、record 坐标、常量逻辑范围与无写入/未知
+effect 的区间；相同范围共享 SSA，连续子范围用已有 `rvv_issue_slice`，不增加更宽读取。
+子范围只缩小最外侧的有效 lane axis，并保持其余坐标与 validity。跨动态 issue、其它 memory
+节点与无法闭合的范围不由这条规则处理；完整资源分析仍核算共享后的存活区间。
 
 ### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
 
