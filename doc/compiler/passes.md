@@ -81,7 +81,13 @@ birth、handoff、effect、Encoding 与 ABI identity 必须一一保留。
 
 读取 operation semantics、typed operands、axes 和 target capability，按 target 固定优先级
 写入一个 `ImplementationAttr`：scalar、RVV 或 IME 的局部结构 family。它不选择 memory
-form，也不写 exact intrinsic。没有合法局部结构时当前 module 失败。
+form。没有合法局部结构时当前 module 失败。
+
+对已经物化、尚未资源冻结的局部 target op，也可选择合同等价的基本操作：full-valid、
+逐轴同形的 byte 乘积、多项 i16 累加链，其编译期整数零初值可由一个 widening multiply
+起链，后续 accumulate 和最终 reduction 不变。signedness 来自 typed operands，继承完整
+carrier/坐标，不重选 partial plan；新 leaf 及资源由原有 verifier/materializer 重新检查。
+该规则不处理独立乘积、tail carrier 或更宽的 partial，不将代数上少一项运算当作其成本结论。
 
 ### `PropagateRISCVLayouts`
 

@@ -5,6 +5,7 @@
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -147,6 +148,74 @@ riscv::ImplementationAttr rvvImplementation(
                                         parameters);
 }
 
+void selectZeroSeedProducts(mlir::ModuleOp module,
+                            mlir::IRRewriter &rewriter) {
+  // Seed a full byte-product chain without keeping a zero vector live.
+  // Other partial representations retain their selected accumulator form.
+  llvm::SmallVector<riscv::RVVWidenAccumulateOp> accumulates;
+  module.walk([&](riscv::RVVWidenAccumulateOp accumulate) {
+    accumulates.push_back(accumulate);
+  });
+  for (riscv::RVVWidenAccumulateOp accumulate : accumulates) {
+    auto kernel = accumulate->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized())
+      continue;
+    auto seed = accumulate.getAccumulator().getDefiningOp<riscv::RVVSplatOp>();
+    auto constant = seed ? seed.getScalar().getDefiningOp<riscv::ConstantOp>()
+                         : riscv::ConstantOp();
+    auto zero = constant ? mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue())
+                         : mlir::IntegerAttr();
+    if (!zero || !zero.getValue().isZero())
+      continue;
+    auto lhs = accumulate.getLhs().getType();
+    auto rhs = accumulate.getRhs().getType();
+    auto result = accumulate.getResult().getType();
+    auto lhsElement = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+    auto rhsElement = mlir::dyn_cast<mlir::IntegerType>(rhs.getElementType());
+    auto narrow = lhs.getLayout();
+    auto wide = result.getLayout();
+    auto next = accumulate.getResult().hasOneUse()
+        ? mlir::dyn_cast<riscv::RVVWidenAccumulateOp>(
+              *accumulate.getResult().getUsers().begin())
+        : riscv::RVVWidenAccumulateOp();
+    if (!lhsElement || !rhsElement || lhsElement.isSignless() ||
+        rhsElement.isSignless() ||
+        (!lhsElement.isSigned() && !rhsElement.isSigned()) ||
+        lhsElement.getWidth() > 8 || rhsElement.getWidth() > 8 ||
+        narrow.getSew() != 8 || wide.getSew() != 16 ||
+        narrow.getValidity() != "full" || wide.getValidity() != "full" ||
+        !next || next.getAccumulator() != accumulate.getResult() ||
+        next.getReductionAxes() != accumulate.getReductionAxes() ||
+        next->getBlock() != accumulate->getBlock() ||
+        lhs.getShape() != rhs.getShape() ||
+        lhs.getShape() != result.getShape() ||
+        lhs.getAxisIds() != rhs.getAxisIds() ||
+        lhs.getAxisIds() != result.getAxisIds() || narrow != rhs.getLayout() ||
+        narrow.getTimeFactors() != wide.getTimeFactors() ||
+        narrow.getLaneFactors() != wide.getLaneFactors() ||
+        narrow.getReplicaFactors() != wide.getReplicaFactors() ||
+        narrow.getFragmentFactors() != wide.getFragmentFactors() ||
+        narrow.getLocalFactors() != wide.getLocalFactors())
+      continue;
+    llvm::StringRef instruction = lhsElement.isSigned() && rhsElement.isSigned()
+        ? "rvv.vwmul.vv"
+        : lhsElement.isSigned() ? "rvv.vwmulsu.vv"
+                                : "rvv.vwmulsu.vv.swap";
+    rewriter.setInsertionPoint(accumulate);
+    auto product = rewriter.create<riscv::RVVWidenMultiplyOp>(
+        accumulate.getLoc(), result, accumulate.getLhs(), accumulate.getRhs(),
+        riscv_internal::leaf(
+            rewriter, "rvv", "widen-multiply", instruction, instruction,
+            narrow.getRegisterGroups() + rhs.getLayout().getRegisterGroups(),
+            wide.getRegisterGroups(), 0, 0, "none", "exact"));
+    riscv_internal::copyOrigin(accumulate, product);
+    accumulate.getResult().replaceAllUsesWith(product.getResult());
+    rewriter.eraseOp(accumulate);
+    if (seed.getResult().use_empty())
+      rewriter.eraseOp(seed);
+  }
+}
+
 class SelectRISCVOperationsPass
     : public mlir::PassWrapper<SelectRISCVOperationsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -159,6 +228,8 @@ public:
   }
 
   void runOnOperation() override {
+    mlir::IRRewriter rewriter(&getContext());
+    selectZeroSeedProducts(getOperation(), rewriter);
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {
