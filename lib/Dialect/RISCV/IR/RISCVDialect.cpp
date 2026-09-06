@@ -140,6 +140,7 @@ weft::riscv::rvvPartToLanePieces(ValueType source, ValueType result) {
   };
   int64_t pieces = 1;
   bool movedAnyAxis = false;
+  bool hasEarlierLaneAxis = false;
   for (size_t position = 0; position < rank; ++position) {
     auto sourceExtent = represented(sourceTime[position], sourceLane[position],
                                     sourceReplica[position]);
@@ -153,6 +154,11 @@ weft::riscv::rvvPartToLanePieces(ValueType source, ValueType result) {
         resultLane[position] > sourceLane[position] &&
         (sourceReplica[position] > resultReplica[position] ||
          sourceTime[position] > resultTime[position]);
+    // Concatenating complete source vectors cannot interleave an earlier
+    // lane axis with pieces taken from a later logical axis.
+    if (moved && hasEarlierLaneAxis)
+      return std::nullopt;
+    hasEarlierLaneAxis |= sourceLane[position] > 1;
     if (!moved) {
       if (sourceLane[position] != resultLane[position])
         return std::nullopt;

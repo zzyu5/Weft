@@ -53,6 +53,41 @@ bool preservesReadOrder(mlir::Operation *from, mlir::Operation *to) {
   return true;
 }
 
+bool canReprojectIndex(mlir::Value value, riscv::LayoutAttr required,
+                       riscv::TargetAttr target, mlir::Builder &builder,
+                       unsigned &remaining) {
+  if (!remaining)
+    return false;
+  --remaining;
+  auto type = mlir::dyn_cast<riscv::ValueType>(value.getType());
+  if (!type || type.getLayout() == required)
+    return true;
+  auto edge = riscv_internal::layoutConversion(builder, type.getLayout(), required);
+  if (type.getLayout().getCarrier() != "rvv" ||
+      required.getCarrier() != "rvv" ||
+      (edge.getKind() != "register_to_lane" &&
+       edge.getKind() != "time_to_lane") ||
+      riscv::rvvPartToLanePieces(
+          type, mlir::cast<riscv::ValueType>(
+                    riscv_internal::withLayout(type, required))))
+    return true;
+  mlir::Operation *producer = value.getDefiningOp();
+  if (!producer || !rematerializable(producer) ||
+      (!value.hasOneUse() && !mlir::isa<riscv::IotaOp>(producer)))
+    return false;
+  for (mlir::Value operand : producer->getOperands()) {
+    auto operandType = mlir::dyn_cast<riscv::ValueType>(operand.getType());
+    if (!operandType)
+      continue;
+    auto projected = riscv_internal::projectLayout(
+        builder, operandType, required, target);
+    if (!projected ||
+        !canReprojectIndex(operand, projected, target, builder, remaining))
+      return false;
+  }
+  return true;
+}
+
 class CanonicalizeRISCVLayoutsPass
     : public mlir::PassWrapper<CanonicalizeRISCVLayoutsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -261,6 +296,7 @@ public:
           llvm::SmallVector<riscv::LayoutAttr> requiredLayouts;
           requiredLayouts.reserve(extract.getIndices().size());
           bool legalRematerialization = true;
+          unsigned indexProjectionBudget = 32;
           for (mlir::Value index : extract.getIndices()) {
             auto indexType = mlir::dyn_cast<riscv::ValueType>(index.getType());
             if (!indexType) {
@@ -274,17 +310,11 @@ public:
               legalRematerialization = false;
               break;
             }
-            auto edge = riscv_internal::layoutConversion(
-                rewriter, indexType.getLayout(), required);
-            auto requiredType = mlir::dyn_cast<riscv::ValueType>(
-                riscv_internal::withLayout(indexType, required));
-            if (required != indexType.getLayout() &&
-                indexType.getLayout().getCarrier() == "rvv" &&
-                required.getCarrier() == "rvv" &&
-                (edge.getKind() == "register_to_lane" ||
-                 edge.getKind() == "time_to_lane") &&
-                (!requiredType ||
-                 !riscv::rvvPartToLanePieces(indexType, requiredType))) {
+            // An index made from pure iota/pointwise values can be rebuilt in
+            // the consumer layout even when concatenating its old parts would
+            // change axis order. The same bounded path must close every input.
+            if (!canReprojectIndex(index, required, kernel.getTarget(), rewriter,
+                                   indexProjectionBudget)) {
               legalRematerialization = false;
               break;
             }

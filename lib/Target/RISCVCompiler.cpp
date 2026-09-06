@@ -17,6 +17,9 @@ namespace {
 constexpr llvm::StringLiteral layoutInputAttribute = "weft.riscv.layout_input";
 
 void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
+  // Obsolete index paths must not count as consumers when deciding whether
+  // to rematerialize the live representation at its actual use.
+  manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createPlanRISCVMemoryPass());
   manager.addPass(weft::createMaterializeRISCVReplicaStorageLoadsPass());

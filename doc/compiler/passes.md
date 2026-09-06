@@ -30,6 +30,7 @@ ConvertWeftToRISCV
 → MaterializeRISCVPartialAccumulators
 → UnrollRISCVLevels
 → ShareRISCVLayeredWindows
+→ EliminateDeadRISCVLayouts
 → CanonicalizeRISCVLayouts
 → PlanRISCVMemory
 → MaterializeRISCVReplicaStorageLoads
@@ -52,7 +53,10 @@ generic unroll 之前读取未复制的 contraction/reduction use-def，冻结 c
 raw-window load 与显式 layer decode。exact leaf
 完成后，resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
 
-`weft-compile --emit=riscv-layout-input` 在最后一次 `CanonicalizeRISCVLayouts`
+最终 layout 改写前先清理失去消费者的纯 index/conversion 链，避免死路径阻止基于真实
+use 数量的 rematerialization；资源闭合后的清理不能替代这个位置的清理。
+
+`weft-compile --emit=riscv-layout-input` 在这次清理与 `CanonicalizeRISCVLayouts`
 之前输出同一层 Physical IR。module 的 `weft.riscv.layout_input` 保存尚未消费的
 `scalar_load_prime` 单值绑定；其余 target/binding 已体现在 typed program 中。
 `--resume-layout-input --emit=intrinsic-c` 从解析后的该边界运行与普通编译完全共用的
@@ -163,6 +167,9 @@ conversion 的同 block 区间没有写入或未知 effect，允许移除这条�
 多 use supply、跨 block、跨写入和 final resource closure 后的情形不适用。
 同位宽 integer Cast 可随 conversion 重物化，但其 input/result 必须采用完全相同的
 目标 layout，不能在 reinterpret intrinsic 内隐式改变 LMUL 或 logical mapping。
+indexed Extract 的 index 投影可以沿单 use 纯 pointwise 链和 iota 重物化；预检查至多访问
+32 个索引节点，并逐输入核对可执行的 layout projection。不能直接拼接旧 lane parts，
+不等于该纯 index 程序不能在目标 layout 中重新形成；memory producer 不由这条规则复制。
 
 单 use memory lookup 接 scalar conversion 时，在同 block 无跨写入的条件下，可以将
 indices 投影为 consumer 的 scalar time/replica mapping 并直接 scalar lookup。新的 memory

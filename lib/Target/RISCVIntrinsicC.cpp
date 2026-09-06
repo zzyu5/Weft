@@ -8031,7 +8031,13 @@ Emitter::compileConvertLayout(riscv::ConvertLayoutOp conversion) {
           for (size_t index = 0; index < level.size(); index += 2) {
             std::string name = fresh("layout_pack");
             std::string expression;
-            if (currentLMUL >= 8) {
+            const int64_t vectorBits =
+                conversion->getParentOfType<riscv::KernelOp>()
+                    .getTarget().getVlenBits();
+            const bool fullCarrier =
+                currentLanes * resultLayout.getSew() * 8 ==
+                vectorBits * currentLMUL;
+            if (currentLMUL >= 8 && fullCarrier) {
               expression = "__riscv_vcreate_v_" + suffixFor(currentLMUL) +
                            "_" + suffixFor(nextLMUL) + "(" + level[index] +
                            ", " + level[index + 1] + ")";

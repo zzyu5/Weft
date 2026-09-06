@@ -124,6 +124,10 @@ coordinate decomposition。
 conversion canonicalization必须重写/删除该 op。final IR可以保留合同已经闭合的 terminal
 conversion；intrinsic-C translator根据 source/result layout确定地展开 slide、splat、tuple
 split/merge或local transfer。这与重新选择layout不同。
+RVV part-to-lane 直接拼接必须保持源 lane 内部的逻辑轴顺序；已有较早 lane axis 时，
+不能把较晚 axis 的 register/time pieces 当作连续向量尾部拼接。欠满的 carrier 按实际
+active lane 数拼接，不能把整寄存器容量中的无效尾部带入结果。需要交错的关系必须在
+资源闭合前由合法的 index/layout 改写处理，或明确拒绝。
 
 RVV↔IME handoff不用 generic conversion冒充：`ime_pack`、typed fragment MMA与`ime_unpack`
 显式表示 fragment packing、operation和result handoff。
