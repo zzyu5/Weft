@@ -45,7 +45,7 @@ def find_configuration(runner: str, request: str) -> dict:
             "symbol": binding["symbol"],
             "source": binding["source"],
             "physical": physical,
-            "binding_origin": catalog["binding_origin"],
+            "binding_origin": binding.get("binding_origin", catalog["binding_origin"]),
             "catalog": str(path.relative_to(PROJECT)),
             "physical_search": catalog["physical_search"],
             "search_budget": catalog["search_budget"],
