@@ -147,6 +147,11 @@ lookup 是 pure，CSE 不得跨写入合并前者。
 后续 lookup 读取该私有 descriptor。显式 stage 的 owner/birth/lifetime 保存在 allocation；
 没有 stage 时采用原读取的 Level owner。超出目标 local 容量或非连续、非静态表明确拒绝。
 
+indexed-entry 的地址索引若仅由同形、同轴的 unsigned 8/16-bit value 扩展至 32-bit，
+且完整 byte offset 范围可由 16-bit 表示，可以直接选择 16-bit extension/identity 与
+对应 EEW。必须验证 byte stride、范围、两侧 layout projection 和目标能力；不在一般
+32-bit 算术链末尾追加窄化，也不改变 table/data 的读取宽度或位置。
+
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
 birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。

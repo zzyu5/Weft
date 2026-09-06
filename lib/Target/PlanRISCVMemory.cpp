@@ -323,6 +323,72 @@ materializeEntryByteOffsets(mlir::Value entryIndices, int64_t entryStride,
            mlir::failure();
   if (entryStride == 1)
     return entryIndices;
+  if (type && type.getLayout().getCarrier() == "rvv" && integer &&
+      integer.getWidth() == 32) {
+    mlir::Value extended =
+        riscv_internal::stripRepresentationConversions(entryIndices);
+    mlir::Operation *extension = extended.getDefiningOp();
+    mlir::Value smallIndex;
+    if (mlir::isa_and_nonnull<riscv::WidenOp, riscv::CastOp>(extension))
+      smallIndex = extension->getOperand(0);
+    auto smallType = smallIndex
+                         ? mlir::dyn_cast<riscv::ValueType>(smallIndex.getType())
+                         : riscv::ValueType();
+    auto smallElement = smallType
+                            ? mlir::dyn_cast<mlir::IntegerType>(
+                                  smallType.getElementType())
+                            : mlir::IntegerType();
+    auto range = riscv_internal::integerRange(entryIndices);
+    auto target = origin->getParentOfType<riscv::KernelOp>().getTarget();
+    if (smallType && smallElement && smallElement.isUnsigned() &&
+        (smallElement.getWidth() == 8 || smallElement.getWidth() == 16) &&
+        smallType.getLayout().getCarrier() == "rvv" &&
+        smallType.getShape() == type.getShape() &&
+        smallType.getAxisIds() == type.getAxisIds() &&
+        range && range->minimum >= 0 &&
+        entryStride <= std::numeric_limits<uint16_t>::max() &&
+        range->maximum <= std::numeric_limits<uint16_t>::max() / entryStride &&
+        llvm::is_contained(target.getSupportedSEW().asArrayRef(), 16)) {
+      auto indexElement = mlir::IntegerType::get(
+          rewriter.getContext(), 16, mlir::IntegerType::Unsigned);
+      auto indexType = riscv::ValueType::get(
+          rewriter.getContext(), indexElement, type.getShape(), type.getAxisIds(),
+          type.getLayout());
+      auto layout = riscv_internal::projectLayout(
+          rewriter, indexType, type.getLayout(), target);
+      auto inputLayout = layout ? riscv_internal::projectLayout(
+                                      rewriter, smallType, layout, target)
+                                : riscv::LayoutAttr();
+      if (layout && inputLayout && riscv::supportsRVVLayout(target, layout) &&
+          riscv::supportsRVVLayout(target, inputLayout)) {
+        indexType = mlir::cast<riscv::ValueType>(
+            riscv_internal::withLayout(indexType, layout));
+        if (smallType.getLayout() != inputLayout) {
+          auto converted = rewriter.create<riscv::ConvertLayoutOp>(
+              origin->getLoc(),
+              riscv_internal::withLayout(smallType, inputLayout), smallIndex,
+              riscv_internal::layoutConversion(
+                  rewriter, smallType.getLayout(), inputLayout),
+              riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+          riscv_internal::copyOrigin(origin, converted);
+          smallIndex = converted.getResult();
+        }
+        // Select the extension at its proven byte-offset width, without
+        // appending a narrowing instruction to a wider computation chain.
+        if (smallElement.getWidth() == 8) {
+          auto widened = rewriter.create<riscv::WidenOp>(
+              origin->getLoc(), indexType, smallIndex,
+              riscv_internal::unselectedLeaf(rewriter));
+          riscv_internal::copyOrigin(origin, widened);
+          smallIndex = widened.getResult();
+        }
+        entryIndices = smallIndex;
+        type = indexType;
+        integer = indexElement;
+        element = indexElement;
+      }
+    }
+  }
   const bool powerOfTwo = (entryStride & (entryStride - 1)) == 0;
   int64_t immediate = entryStride;
   if (powerOfTwo) {
