@@ -3430,9 +3430,8 @@ public:
                 tableLoad.getLoc(), storageType, byteCount);
             auto copied = rewriter.create<riscv::DenseSnapshotOp>(
                 tableLoad.getLoc(), descriptor, tableLoad.getRegion(),
-                allocation.getResult(), riscv_internal::leaf(
-                    rewriter, "transfer", "load", "scalar.dense-snapshot",
-                    "scalar.dense-snapshot", 0, 0));
+                allocation.getResult(),
+                riscv_internal::readSnapshotLeaf(rewriter, kernel.getTarget(), bytes));
             riscv_internal::copyOrigin(tableLoad, allocation);
             riscv_internal::copyOrigin(tableLoad, copied);
             snapshot = copied.getResult();

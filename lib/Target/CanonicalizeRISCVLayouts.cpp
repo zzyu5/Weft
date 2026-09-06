@@ -138,6 +138,61 @@ public:
           producer = conversion.getInput().getDefiningOp();
           changed = true;
         }
+        if (auto gather =
+                mlir::dyn_cast_or_null<riscv::RVVRegularRepeatGatherOp>(producer);
+            gather && gather.getResults().size() == 1 &&
+            gather.getResults()[0].hasOneUse() &&
+            gather.getIndices().size() == 1 && preservesReadOrder(gather, conversion)) {
+          auto target = conversion.getResult().getType();
+          auto layout = target.getLayout();
+          auto bases = gather.getPartBases().size() == 1
+                           ? mlir::dyn_cast<mlir::DenseI64ArrayAttr>(
+                                 gather.getPartBases()[0])
+                           : mlir::DenseI64ArrayAttr();
+          auto axes = target.getAxisIds().asArrayRef();
+          auto sourceAxis = llvm::find(axes, gather.getReductionAxis());
+          const size_t position = static_cast<size_t>(sourceAxis - axes.begin());
+          const int64_t parts = sourceAxis != axes.end()
+                                    ? target.getShape()[position] : 0;
+          const bool singletonFreeAxes = llvm::all_of(
+              llvm::enumerate(target.getShape().asArrayRef()), [&](auto entry) {
+                return entry.index() == position ||
+                       ((entry.value() <= 0 || entry.value() == 1) &&
+                        layout.getReplicaFactors()[entry.index()] == 1);
+              });
+          if (layout.getCarrier() == "scalar" && parts > 0 &&
+              singletonFreeAxes &&
+              llvm::all_of(layout.getTimeFactors().asArrayRef(),
+                           [](int64_t factor) { return factor == 1; }) &&
+              llvm::all_of(layout.getLaneFactors().asArrayRef(),
+                           [](int64_t factor) { return factor == 1; }) &&
+              layout.getReplicaFactors()[position] == parts && bases &&
+              bases.size() == 1 && bases[0] == 0 &&
+              parts % gather.getRepeat() == 0 &&
+              parts / gather.getRepeat() == gather.getSourceCount()) {
+            llvm::SmallVector<int64_t> partBases;
+            for (int64_t part = 0; part < parts; ++part)
+              partBases.push_back(part / gather.getRepeat());
+            rewriter.setInsertionPoint(gather);
+            auto scalar = rewriter.create<riscv::RVVRegularRepeatScalarLoadOp>(
+                gather.getLoc(), target, gather.getField(), gather.getSourceAxis(),
+                gather.getReductionAxis(), gather.getSourceBase(),
+                gather.getSourceCount(), gather.getRepeat(),
+                rewriter.getDenseI64ArrayAttr(partBases), gather.getAccess(),
+                riscv_internal::leaf(
+                    rewriter, "scalar", "regular-repeat-scalar-load",
+                    "scalar.regular-repeat-load", "scalar.regular-repeat-load",
+                    0, 0, 0, 0, "none", "exact",
+                    {gather.getSourceAxis(), gather.getReductionAxis(),
+                     gather.getSourceCount(), gather.getRepeat()}));
+            riscv_internal::copyOrigin(gather, scalar);
+            conversion.getResult().replaceAllUsesWith(scalar.getResult());
+            rewriter.eraseOp(conversion);
+            rewriter.eraseOp(gather);
+            changed = true;
+            continue;
+          }
+        }
         if (auto lookup = mlir::dyn_cast_or_null<riscv::LookupOp>(producer);
             lookup && mlir::isa<riscv::MemDescType>(lookup.getTable().getType()) &&
             lookup.getResult().hasOneUse() &&

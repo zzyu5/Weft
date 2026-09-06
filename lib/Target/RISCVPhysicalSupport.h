@@ -98,6 +98,8 @@ riscv::ImplementationAttr implementation(
     mlir::Builder &builder, llvm::StringRef engine, llvm::StringRef family,
     llvm::StringRef operation, llvm::ArrayRef<int64_t> parameters = {});
 riscv::LeafAttr unselectedLeaf(mlir::Builder &builder);
+riscv::LeafAttr readSnapshotLeaf(mlir::Builder &builder,
+                                  riscv::TargetAttr target, int64_t bytes);
 riscv::LeafAttr leaf(mlir::Builder &builder, llvm::StringRef engine,
                      llvm::StringRef family, llvm::StringRef instruction,
                      llvm::StringRef spelling, int64_t operandGroups,

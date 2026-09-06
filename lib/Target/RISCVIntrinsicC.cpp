@@ -658,6 +658,10 @@ private:
   mlir::LogicalResult compileLocalAlloc(riscv::LocalAllocOp operation);
   mlir::LogicalResult compileLocalBind(riscv::LocalBindOp operation);
   mlir::LogicalResult compileDenseSnapshot(riscv::DenseSnapshotOp operation);
+  mlir::LogicalResult emitReadSnapshot(mlir::Operation *operation,
+                                        riscv::LeafAttr leaf,
+                                        llvm::StringRef destination,
+                                        llvm::StringRef source, int64_t bytes);
   mlir::LogicalResult compileLocalLoad(riscv::LocalLoadOp operation);
   mlir::LogicalResult compileLocalStore(riscv::LocalStoreOp operation);
   mlir::LogicalResult
@@ -3395,11 +3399,12 @@ mlir::LogicalResult Emitter::compileAdmit(riscv::LoadOp admit) {
   if (mlir::Value allocation = admit.getSnapshotStorage()) {
     Binding storage = bindings.lookup(allocation);
     auto storageType = mlir::cast<riscv::LocalType>(allocation.getType());
-    if (storage.kind != Binding::Kind::LocalArray ||
-        admit.getLeaf().getInstruction() != "scalar.record-snapshot")
+    if (storage.kind != Binding::Kind::LocalArray)
       return fail(admit, "record snapshot has no selected local storage binding");
-    line("memcpy(" + storage.scalar + ", " + result->recordPointer + ", " +
-         std::to_string(storageType.getSizeBytes()) + ");");
+    if (mlir::failed(emitReadSnapshot(admit, admit.getLeaf(), storage.scalar,
+                                     result->recordPointer,
+                                     storageType.getSizeBytes())))
+      return mlir::failure();
     result->recordPointer = storage.scalar;
   }
   bindings[admit.getResult()] = std::move(*result);
@@ -7183,6 +7188,33 @@ mlir::LogicalResult Emitter::compileLocalAlloc(riscv::LocalAllocOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::emitReadSnapshot(
+    mlir::Operation *operation, riscv::LeafAttr leaf,
+    llvm::StringRef destination, llvm::StringRef source, int64_t bytes) {
+  if (leaf.getInstruction() == "scalar.read-snapshot") {
+    line("memcpy(" + destination.str() + ", " + source.str() + ", " +
+         std::to_string(bytes) + ");");
+    return mlir::success();
+  }
+  auto parameters = leaf.getParameters().asArrayRef();
+  if (leaf.getInstruction() != "rvv.read-snapshot" ||
+      parameters.size() != 2 || parameters[1] <= 0 || bytes <= 0)
+    return fail(operation, "read snapshot has no exact byte-transfer leaf");
+  const std::string group = "m" + std::to_string(parameters[0] / 8);
+  for (int64_t offset = 0; offset < bytes;) {
+    const int64_t width = std::min(parameters[1], bytes - offset);
+    const std::string count = std::to_string(width);
+    const std::string at = std::to_string(offset);
+    const std::string value = fresh("snapshot_bytes");
+    line("vuint8" + group + "_t " + value + " = __riscv_vle8_v_u8" + group + "((const uint8_t *)(" +
+         source.str() + ") + " + at + ", " + count + ");");
+    line("__riscv_vse8_v_u8" + group + "((uint8_t *)(" + destination.str() + ") + " + at +
+         ", " + value + ", " + count + ");");
+    offset += width;
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileDenseSnapshot(riscv::DenseSnapshotOp operation) {
   Binding source = bindings.lookup(operation.getSource());
   Binding storage = bindings.lookup(operation.getStorage());
@@ -7194,11 +7226,12 @@ mlir::LogicalResult Emitter::compileDenseSnapshot(riscv::DenseSnapshotOp operati
   auto descriptor = operation.getResult().getType();
   auto element = denseElementType(descriptor.getEncoding());
   if (!address || !element || storage.kind != Binding::Kind::LocalArray ||
-      storage.scalar.empty() ||
-      operation.getLeaf().getInstruction() != "scalar.dense-snapshot")
+      storage.scalar.empty())
     return fail(operation, "dense snapshot has no complete memory/storage binding");
-  line("memcpy(" + storage.scalar + ", " + *address + ", " +
-       std::to_string(operation.getStorage().getType().getSizeBytes()) + ");");
+  if (mlir::failed(emitReadSnapshot(
+          operation, operation.getLeaf(), storage.scalar, *address,
+          operation.getStorage().getType().getSizeBytes())))
+    return mlir::failure();
   Binding result;
   result.kind = Binding::Kind::Memory;
   result.memory.name = storage.scalar;

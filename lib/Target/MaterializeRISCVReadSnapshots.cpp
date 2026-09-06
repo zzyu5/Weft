@@ -142,9 +142,8 @@ public:
           load.getLoc(), storageType, byteCount);
       riscv_internal::copyOrigin(load, storage);
       load.getSnapshotStorageMutable().assign(storage.getResult());
-      load.setLeafAttr(riscv_internal::leaf(
-          rewriter, "transfer", "load", "scalar.record-snapshot",
-          "scalar.record-snapshot", 0, 0));
+      load.setLeafAttr(
+          riscv_internal::readSnapshotLeaf(rewriter, kernel.getTarget(), bytes));
     });
     if (failed)
       signalPassFailure();

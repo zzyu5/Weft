@@ -765,6 +765,31 @@ riscv::LeafAttr riscv_internal::leaf(
       integers(builder, parameters), localBytes);
 }
 
+riscv::LeafAttr riscv_internal::readSnapshotLeaf(
+    mlir::Builder &builder, riscv::TargetAttr target, int64_t bytes) {
+  if (target.getHasRVV()) {
+    int64_t selectedLMUL = 8;
+    int64_t chunkBytes = target.getVlenBits() / 8;
+    int64_t transfers = bytes / chunkBytes + (bytes % chunkBytes != 0);
+    for (int64_t lmul : {16, 32}) {
+      if (!llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), lmul))
+        continue;
+      const int64_t capacity = target.getVlenBits() * lmul / 64;
+      const int64_t count = bytes / capacity + (bytes % capacity != 0);
+      if (count < transfers) {
+        selectedLMUL = lmul;
+        chunkBytes = capacity;
+        transfers = count;
+      }
+    }
+    return leaf(builder, "transfer", "load", "rvv.read-snapshot",
+                "rvv.read-snapshot", 0, 0, selectedLMUL / 8, 0, "none", "exact",
+                {selectedLMUL, chunkBytes});
+  }
+  return leaf(builder, "transfer", "load", "scalar.read-snapshot",
+              "scalar.read-snapshot", 0, 0);
+}
+
 riscv::TargetAttr
 riscv_internal::target(mlir::Builder &builder,
                        const RISCVTargetProfile &profile) {

@@ -530,7 +530,10 @@ public:
           return;
         }
         const std::string expected = load.getSnapshotStorage()
-                                         ? "scalar.record-snapshot"
+                                         ? (load->getParentOfType<riscv::KernelOp>()
+                                                    .getTarget().getHasRVV()
+                                                ? "rvv.read-snapshot"
+                                                : "scalar.read-snapshot")
                                          : ("rvv.load." + access.getForm()).str();
         if (leaf.getEngine() != "transfer" ||
             leaf.getFamily() != "load" ||

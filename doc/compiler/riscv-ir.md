@@ -109,6 +109,10 @@ byte size、alignment、owner/lifetime 和复制的 read/write effects 都必须
 和精确大小的私有 byte allocation，生成同一 logical table 的只读 local descriptor。
 其 leaf 只复制已确定的字节数，不选择 layout 或遍历结构。encoded staging 的私有副本
 由 `encoded_local_bind` 切断对原 load 的值依赖；之后的原地址写入不影响该副本。
+RVV target 的 snapshot 使用精确 SEW=8 transfer，owner 在合法 m1/m2/m4 中以最少
+load/store 对数选择，平局取较少 scratch；leaf 参数冻结 LMUL 与每次搬运字节数，
+temporary resource 为相应的 1/2/4 组，仍须通过完整 live-set 检查。末块只访问剩余字节。
+无 RVV 的 target 才选择 scalar copy leaf。emitter 不自行选择 memcpy 或 RVV 实现。
 
 ## 4. Explicit conversion
 

@@ -3510,6 +3510,29 @@ mlir::LogicalResult ReshapeOp::verify() {
   return mlir::success();
 }
 
+static bool exactReadSnapshotLeaf(mlir::Operation *operation, LeafAttr leaf) {
+  auto kernel = operation->getParentOfType<KernelOp>();
+  if (!kernel)
+    return false;
+  auto target = kernel.getTarget();
+  const bool vector = target.getHasRVV();
+  auto parameters = leaf.getParameters().asArrayRef();
+  return exactLeaf(leaf, "transfer", "load",
+                   vector ? "rvv.read-snapshot" : "scalar.read-snapshot",
+                   "none", "exact") &&
+         leaf.getOperandGroups() == 0 && leaf.getResultGroups() == 0 &&
+         leaf.getFragmentGroups() == 0 && leaf.getLocalBytes() == 0 &&
+         (vector ? parameters.size() == 2 &&
+                       (parameters[0] == 8 || parameters[0] == 16 || parameters[0] == 32) &&
+                       leaf.getTemporaryGroups() == parameters[0] / 8 &&
+                       parameters[1] == target.getVlenBits() * parameters[0] / 64 &&
+                       parameters[1] > 0 &&
+                       llvm::is_contained(
+                           target.getLegalLMULEighths().asArrayRef(), parameters[0]) &&
+                       llvm::is_contained(target.getSupportedSEW().asArrayRef(), 8)
+                 : parameters.empty() && leaf.getTemporaryGroups() == 0);
+}
+
 void LoadOp::getEffects(
     llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
         mlir::MemoryEffects::Effect>> &effects) {
@@ -3557,14 +3580,10 @@ mlir::LogicalResult LoadOp::verify() {
         storage.getSchema() != "read-snapshot" ||
         storage.getAlignment() < memory.getAlignment() ||
         !allocation.getDefiningOp<LocalAllocOp>() || !allocation.hasOneUse() ||
-        !exactLeaf(getLeaf(), "transfer", "load", "scalar.record-snapshot",
-                   "none", "exact") ||
-        getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
-        getLeaf().getTemporaryGroups() != 0 ||
-        getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+        !exactReadSnapshotLeaf(*this, getLeaf()))
       return emitOpError(
           "encoded read snapshot requires an allocated complete contiguous record range");
-  } else if (getLeaf().getInstruction() == "scalar.record-snapshot") {
+  } else if (getLeaf().getInstruction().ends_with("read-snapshot")) {
     return emitOpError("record snapshot leaf requires explicit local storage");
   }
   return verifyLeafOperation(*this);
@@ -4702,8 +4721,7 @@ mlir::LogicalResult DenseSnapshotOp::verify() {
       storage.getSizeBytes() != source.getShape()[0] * elementBytes ||
       storage.getPurpose() != "pack" || storage.getSchema() != "read-snapshot" ||
       !getStorage().getDefiningOp<LocalAllocOp>() ||
-      !exactLeaf(getLeaf(), "transfer", "load", "scalar.dense-snapshot",
-                 "none", "exact"))
+      !exactReadSnapshotLeaf(*this, getLeaf()))
     return emitOpError(
         "dense snapshot requires one complete static contiguous table and exact private byte storage");
   return verifyLeafOperation(*this);

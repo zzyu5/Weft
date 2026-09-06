@@ -168,6 +168,9 @@ conversion 的同 block 区间没有写入或未知 effect，允许移除这条�
 indices 投影为 consumer 的 scalar time/replica mapping 并直接 scalar lookup。新的 memory
 form 和 leaf 由后续 `PlanRISCVMemory` 重选；该规则不把寄存器 table 退回内存，也不 hoist
 潜在空循环中的读取。
+完整的 regular-repeat gather 仅被 scalar conversion 使用时，可在原读取位置直接形成
+scalar supply，复用重复的 source byte。该规则保留归约轴及单元素 free-axis mapping，
+要求同 block、无跨写入、完整窗口与精确 part-base；不需要重物化整段坐标/算术程序。
 
 ### `LowerRISCVComposites`
 
@@ -310,6 +313,9 @@ shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned Vi
 快照要求静态、一维、unit-stride、完整且非 interleaved 的 record 区间；未满足的干扰读取
 必须拒绝。容量和 lifetime 由 `LocalType` 承载，资源 pass 核算分配；没有干扰的读取不增加
 本地复制。final verifier 拒绝仍跨干扰写入但没有快照的 encoded load。
+copy leaf 在 target 合法的 m1/m2/m4 中按精确 transfer 次数与 scratch 占用选择，并记录
+全部所需参数。它完成显式 exact-window transfer，不把热路径交给带未知向量 clobber
+的库函数调用。
 
 ### `MaterializeRISCVResources`
 
