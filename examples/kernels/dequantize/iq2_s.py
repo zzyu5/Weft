@@ -6,7 +6,7 @@ import weft
 import weft.language as wl
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Y": "output"})
 def row_dequantize_iq2_s(
     W: wl.View[ggml.IQ2_S, (K,)],
     grid: wl.View[wl.i8, (8192,)],

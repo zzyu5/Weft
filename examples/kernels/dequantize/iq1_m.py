@@ -15,7 +15,7 @@ def _grid_delta(grid, grid_index, lane, delta):
     return wl.f32(wl.i32(value)) + wl.f32(delta)
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Y": "output"})
 def row_dequantize_iq1_m(
     W: wl.View[ggml.IQ1_M, (K,)],
     grid: wl.View[wl.i8, (16384,)],

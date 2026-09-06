@@ -6,7 +6,7 @@ import weft
 import weft.language as wl
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Y": "output"})
 def row_dequantize_q5_k(W: wl.View[ggml.Q5_K, (K,)], Y: wl.View[wl.f32, (K,)]):
     with wl.level.blocks(K, extent=256) as kb:
         w = wl.load(W[kb])

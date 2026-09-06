@@ -6,7 +6,7 @@ import weft
 import weft.language as wl
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Y": "output"})
 def row_dequantize_tq1_0(
     W: wl.View[ggml.TQ1_0, (K,)],
     powers: wl.View[wl.u32, (5,)],
