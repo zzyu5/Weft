@@ -59,6 +59,12 @@ natural field到RVV register的完整窗口用`rvv.replica_storage_load`表示�
 leaf给出exact `vle`或`vlse`。因此strided与unit不是terminal emitter根据地址表达式临时选择的
 两种拼写。若后续issue materialization缩小窗口，只能投影已选plan，不能重新决定memory form。
 
+`rvv_segment_pair_load` 将同一个 natural field 的两路完整一维交错投影表示为一次双结果读取：
+第一个结果对应 `field[base + 2*i]`，第二个对应 `field[base + 2*i + 1]`。静态 base、两端相同的
+lane/time layout、element alignment、`segmentFields=2` 与 exact `vlseg2` leaf 必须闭合；每个
+issue 的 NF×LMUL 不超过 8，所有静态 tuple parts 的临时资源显式计入 leaf。它不增加读取范围、
+逻辑轴或数值合并；多轴、tail、动态 base 与跨干扰写入的配对不属于这个关系。
+
 多轴entry/payload坐标若按行主序线性化为连续source区间，使用
 `rvv_unit_entry_window_load`保存scalar base、entry axes/extents、payload axis/extent与exact unit
 leaf。entry axes必须是source中不存在的新逻辑轴；payload axis可以是新轴，也可以复用唯一被投影

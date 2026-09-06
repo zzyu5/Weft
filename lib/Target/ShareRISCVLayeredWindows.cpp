@@ -1938,6 +1938,112 @@ void reuseNaturalStorageWindows(mlir::IRRewriter &rewriter,
   });
 }
 
+std::optional<int64_t>
+segmentPairBase(riscv::RVVReplicaStorageLoadOp load) {
+  auto field = load.getField().getType();
+  auto type = load.getResult().getType();
+  auto layout = type.getLayout();
+  auto plan = load.getPlan();
+  auto base = constantIndex(load.getLogicalBase());
+  if (!base || *base < 0 || field.getShape().size() != 1 ||
+      field.getLayout().getCarrier() != "local" ||
+      type.getShape().size() != 1 || layout.getCarrier() != "rvv" ||
+      layout.getValidity() != "full" || layout.getLmulEighths() <= 0 ||
+      layout.getLmulEighths() > 32 || layout.getLaneFactors()[0] <= 1 ||
+      layout.getReplicaFactors()[0] != 1 ||
+      layout.getFragmentFactors()[0] != 1 ||
+      layout.getLocalFactors()[0] != 1 || load.getRecordRank() != 0 ||
+      !load.getRecordCoordinatesForWindow().empty() ||
+      plan.getKind() != "strided" || plan.getProjectionStride() != 2 ||
+      plan.getProjectionBase() != 0 || plan.getProjectionRepeat() != 1 ||
+      load.getAccess().getMapping() != "natural" ||
+      load.getAccess().getAlignment() < layout.getSew() / 8 ||
+      load.getAccess().getAlignment() % (layout.getSew() / 8) ||
+      load.getLeaf().getInstruction() != "rvv.replica-storage-load.strided")
+    return std::nullopt;
+  const int64_t lanes = layout.getLaneFactors()[0];
+  const int64_t elements = type.getShape()[0];
+  const int64_t streams = layout.getTimeFactors()[0];
+  if (elements <= 0 || streams <= 0 || elements % lanes ||
+      elements / lanes != streams ||
+      load.getWindowOffsets().size() != static_cast<size_t>(streams) ||
+      load.getWindowForPart().size() != static_cast<size_t>(streams) ||
+      *base >= field.getShape()[0] ||
+      elements - 1 > (field.getShape()[0] - *base - 1) / 2)
+    return std::nullopt;
+  for (int64_t part = 0; part < streams; ++part)
+    if (load.getWindowForPart()[part] != part ||
+        load.getWindowOffsets()[part] != part * lanes * 2)
+      return std::nullopt;
+  return base;
+}
+
+void materializeSegmentPairs(mlir::IRRewriter &rewriter,
+                             mlir::ModuleOp module) {
+  module.walk([&](mlir::Block *block) {
+    llvm::SmallVector<riscv::RVVReplicaStorageLoadOp> loads;
+    for (mlir::Operation &operation : *block)
+      if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation))
+        loads.push_back(load);
+    llvm::DenseSet<mlir::Operation *> consumed;
+    for (auto [position, first] : llvm::enumerate(loads)) {
+      if (consumed.contains(first) || first.getResult().use_empty())
+        continue;
+      auto base = segmentPairBase(first);
+      if (!base)
+        continue;
+      auto field = first.getField().getDefiningOp<riscv::FieldOp>();
+      auto type = first.getResult().getType();
+      auto kernel = first->getParentOfType<riscv::KernelOp>();
+      const int64_t elements = type.getShape()[0];
+      const int64_t tupleGroups =
+          2 * std::max<int64_t>(1, (type.getLayout().getLmulEighths() + 7) / 8);
+      const int64_t parts = type.getLayout().getTimeFactors()[0];
+      if (!kernel || !kernel.getTarget().getHasSegmentMemory() ||
+          parts > kernel.getTarget().getVectorRegisters() / tupleGroups ||
+          elements > (first.getField().getType().getShape()[0] - *base) / 2)
+        continue;
+      unsigned inspected = 0;
+      for (riscv::RVVReplicaStorageLoadOp second :
+           llvm::drop_begin(loads, position + 1)) {
+        if (++inspected > 32)
+          break;
+        if (consumed.contains(second) || second.getResult().use_empty())
+          continue;
+        auto secondBase = segmentPairBase(second);
+        if (!secondBase || *secondBase != *base + 1 ||
+            second.getResult().getType() != type ||
+            !sameFieldEdge(field,
+                           second.getField().getDefiningOp<riscv::FieldOp>()) ||
+            !readRangeIsShareable(first, second))
+          continue;
+        rewriter.setInsertionPoint(first);
+        auto sourceAccess = first.getAccess();
+        auto access = riscv::AccessAttr::get(
+            rewriter.getContext(), "segment", "natural",
+            type.getLayout().getSew() / 8, 0, 2, 0, 0, 0, 0, 0,
+            sourceAccess.getBitOffset(), sourceAccess.getStorageBits(),
+            sourceAccess.getOrder());
+        auto pair = rewriter.create<riscv::RVVSegmentPairLoadOp>(
+            first.getLoc(), type, type, first.getField(), *base, access,
+            riscv_internal::leaf(
+                rewriter, "rvv", "segment-pair-load", "rvv.vlseg2",
+                "rvv.vlseg2", 0, 2 * type.getLayout().getRegisterGroups(),
+                parts * tupleGroups, 0, "none", "exact"));
+        riscv_internal::copyOrigin(first, pair);
+        first.getResult().replaceAllUsesWith(pair.getFirst());
+        second.getResult().replaceAllUsesWith(pair.getSecond());
+        consumed.insert(first);
+        consumed.insert(second);
+        break;
+      }
+    }
+    for (riscv::RVVReplicaStorageLoadOp load : loads)
+      if (consumed.contains(load))
+        rewriter.eraseOp(load);
+  });
+}
+
 void materializeSharedLayeredStorageWindows(mlir::IRRewriter &rewriter,
                                             mlir::ModuleOp module) {
   llvm::SmallVector<riscv::RVVStorageWindowOp> windows;
@@ -2640,6 +2746,7 @@ public:
     mlir::IRRewriter rewriter(&getContext());
     materializeReplicaStorageLoads(rewriter, getOperation());
     reuseNaturalStorageWindows(rewriter, getOperation());
+    materializeSegmentPairs(rewriter, getOperation());
   }
 };
 

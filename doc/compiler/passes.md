@@ -289,6 +289,13 @@ effect 的区间；相同范围共享 SSA，连续子范围用已有 `rvv_issue_
 子范围只缩小最外侧的有效 lane axis，并保持其余坐标与 validity。跨动态 issue、其它 memory
 节点与无法闭合的范围不由这条规则处理；完整资源分析仍核算共享后的存活区间。
 
+同一 block 内两个完整一维 natural strided window，若 field owner、Encoding、type 与坐标
+相同，步长都是 2、静态 base 相差 1，且每个 time part 覆盖相同的相邻交错区间，可以选择
+`rvv_segment_pair_load`。匹配至多向后检查 32 个 load，并拒绝中间 write/unknown effect；
+必须证明两路读取的并集没有越界、element alignment、NF×LMUL 与完整 tuple 临时资源合法。
+两个结果保持原 layout，后续 widening、加法和 reduction 不变；emitter 只拼写已选 segment
+load 与 tuple component binding，不重新选择 memory form。
+
 ### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
 
 planner 读取 contraction/reduction 的 typed axes、time/lane/replica 分解、storage window、

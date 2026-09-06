@@ -1558,6 +1558,17 @@ def WeftRISCV_RVVReplicaStorageLoadOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVSegmentPairLoadOp
+    : WeftRISCV_Op<"rvv_segment_pair_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins WeftRISCV_ValueType:$field,
+                       I64Attr:$logical_base,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$first,
+                      WeftRISCV_ValueType:$second);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVRecordStorageLoadOp
     : WeftRISCV_Op<"rvv_record_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$field,

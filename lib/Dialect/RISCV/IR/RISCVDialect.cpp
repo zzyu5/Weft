@@ -7495,6 +7495,61 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVSegmentPairLoadOp::verify() {
+  auto field = getField().getType();
+  auto sourceField = getField().getDefiningOp<FieldOp>();
+  auto load = sourceField ? sourceLoad(sourceField.getOwner()) : LoadOp();
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  auto type = getFirst().getType();
+  auto layout = type.getLayout();
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(type.getElementType());
+  if (!sourceField || !load || !kernel ||
+      field.getShape().size() != 1 || field.getShape()[0] <= 0 ||
+      field.getLayout().getCarrier() != "local" ||
+      type != getSecond().getType() || type.getShape().size() != 1 ||
+      type.getElementType() != field.getElementType() || !integer ||
+      integer.isSignless() ||
+      (integer.getWidth() != 8 && integer.getWidth() != 16 &&
+       integer.getWidth() != 32) || layout.getCarrier() != "rvv" ||
+      layout.getValidity() != "full" ||
+      layout.getSew() != static_cast<int64_t>(integer.getWidth()) ||
+      layout.getLaneFactors()[0] <= 1 ||
+      layout.getReplicaFactors()[0] != 1 ||
+      layout.getFragmentFactors()[0] != 1 ||
+      layout.getLocalFactors()[0] != 1 || layout.getLmulEighths() > 32 ||
+      !kernel.getTarget().getHasSegmentMemory() ||
+      !supportsRVVLayout(kernel.getTarget(), layout))
+    return emitOpError(
+        "segment pair load requires two identical full one-axis RVV results and one natural record field");
+  const int64_t elements = type.getShape()[0];
+  const int64_t lanes = layout.getLaneFactors()[0];
+  const int64_t base = getLogicalBase();
+  const int64_t tupleGroups =
+      2 * std::max<int64_t>(1, (layout.getLmulEighths() + 7) / 8);
+  const int64_t parts = layout.getTimeFactors()[0];
+  auto memory = load.getRegion().getType();
+  if (elements <= 0 || elements % lanes ||
+      parts != elements / lanes ||
+      parts > kernel.getTarget().getVectorRegisters() / tupleGroups ||
+      layout.getVl() != lanes || base < 0 || base >= field.getShape()[0] ||
+      elements > (field.getShape()[0] - base) / 2 ||
+      memory.getInterleaveRows() != 0 ||
+      localPackInterleaveRows(sourceField.getOwner()) > 0 ||
+      getAccess().getForm() != "segment" ||
+      getAccess().getSegmentFields() != 2 || getAccess().getIndexSEW() != 0 ||
+      getAccess().getMapping() != "natural" ||
+      !sameStorageGeometry(getAccess(), sourceField.getAccess()) ||
+      getAccess().getBitOffset() % 8 ||
+      getAccess().getAlignment() != integer.getWidth() / 8 ||
+      sourceField.getAccess().getAlignment() % getAccess().getAlignment() ||
+      !exactLeaf(getLeaf(), "rvv", "segment-pair-load", "rvv.vlseg2",
+                 "none", "exact") ||
+      getLeaf().getTemporaryGroups() != parts * tupleGroups)
+    return emitOpError(
+        "segment pair load must cover exactly field[base + 2*i] and field[base + 2*i + 1] without widening the read range");
+  return verifyLeafOperation(*this);
+}
+
 mlir::LogicalResult RVVRecordStorageLoadOp::verify() {
   auto sourceField = getField().getDefiningOp<FieldOp>();
   auto sourceLoad = sourceField ? ::sourceLoad(sourceField.getOwner()) : LoadOp();

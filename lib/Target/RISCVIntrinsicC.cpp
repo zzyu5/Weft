@@ -743,6 +743,8 @@ private:
   compileRVVLayeredStorageDecode(riscv::RVVLayeredStorageDecodeOp operation);
   mlir::LogicalResult
   compileRVVReplicaStorageLoad(riscv::RVVReplicaStorageLoadOp operation);
+  mlir::LogicalResult
+  compileRVVSegmentPairLoad(riscv::RVVSegmentPairLoadOp operation);
   mlir::LogicalResult compileRVVRecordStorageLoad(
       riscv::RVVRecordStorageLoadOp operation);
   mlir::LogicalResult compileRVVRecordStorageDecode(
@@ -2526,6 +2528,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVLayeredStorageDecode(decode);
   if (auto load = mlir::dyn_cast<riscv::RVVReplicaStorageLoadOp>(operation))
     return compileRVVReplicaStorageLoad(load);
+  if (auto load = mlir::dyn_cast<riscv::RVVSegmentPairLoadOp>(operation))
+    return compileRVVSegmentPairLoad(load);
   if (auto load = mlir::dyn_cast<riscv::RVVRecordStorageLoadOp>(operation))
     return compileRVVRecordStorageLoad(load);
   if (auto decode = mlir::dyn_cast<riscv::RVVRecordStorageDecodeOp>(operation))
@@ -10806,6 +10810,62 @@ mlir::LogicalResult Emitter::compileRVVReplicaStorageLoad(
     result.parts.push_back(std::move(value));
   }
   bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVSegmentPairLoad(
+    riscv::RVVSegmentPairLoadOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.vlseg2")
+    return fail(operation, "segment pair load has no exact selected leaf");
+  Binding fieldBinding = bindings.lookup(operation.getField());
+  if (fieldBinding.kind != Binding::Kind::Field)
+    return fail(operation, "segment pair load requires a field binding");
+  fieldBinding.field.useAccess = operation.getAccess();
+  Binding owner = bindings.lookup(fieldBinding.field.owner);
+  if (owner.kind == Binding::Kind::Slice) {
+    auto record = recordForSlice(fieldBinding.field.owner);
+    if (mlir::failed(record))
+      return mlir::failure();
+    owner = std::move(*record);
+  }
+  auto field = fieldFor(fieldBinding);
+  const auto type = operation.getFirst().getType();
+  const int64_t lanes = physicalLanes(operation.getFirst());
+  const int64_t parts = vectorPartCount(operation.getFirst());
+  auto elementType = scalarCType(type.getElementType());
+  if (owner.kind != Binding::Kind::Record || !field || !elementType ||
+      field->bitOffset % 8 || owner.interleaveRows != 0 || lanes <= 0 ||
+      parts <= 0 || type != operation.getSecond().getType() ||
+      type.getShape().size() != 1 || type.getShape()[0] / lanes != parts)
+    return fail(operation, "segment pair load has incomplete record or part geometry");
+  const std::string suffix = vectorSuffix(operation.getFirst());
+  const std::string vectorTypeValue = vectorType(operation.getFirst());
+  const std::string tupleType =
+      vectorTypeValue.substr(0, vectorTypeValue.size() - 2) + "x2_t";
+  const std::string tupleSuffix = suffix + "x2";
+  Binding first;
+  Binding second;
+  first.kind = second.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < parts; ++part) {
+    const int64_t offset = operation.getLogicalBase() + part * lanes * 2;
+    const std::string pointer =
+        "((const " + *elementType + " *)((const uint8_t *)(" +
+        owner.recordPointer + ") + " + std::to_string(field->bitOffset / 8) +
+        ")) + " + std::to_string(offset);
+    const std::string loaded = fresh("segment_pair");
+    line(tupleType + " " + loaded + " = __riscv_vlseg2e" +
+         std::to_string(type.getLayout().getSew()) + "_v_" + tupleSuffix +
+         "(" + pointer + ", " + std::to_string(lanes) + ");");
+    for (int64_t segment = 0; segment < 2; ++segment) {
+      const std::string value = fresh("segment_value");
+      line(vectorTypeValue + " " + value + " = __riscv_vget_v_" +
+           tupleSuffix + "_" + suffix + "(" + loaded + ", " +
+           std::to_string(segment) + ");");
+      (segment == 0 ? first : second).parts.push_back(value);
+    }
+  }
+  bindings[operation.getFirst()] = std::move(first);
+  bindings[operation.getSecond()] = std::move(second);
   return mlir::success();
 }
 
