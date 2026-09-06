@@ -23,7 +23,7 @@ def _iq2_xs_entry_products(w, x, grid, signs, scale_group, entry, payload):
     )
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Xq": "workspace", "Y": "output"})
 def production_mul_mat_iq2_xs(
     W: wl.View[ggml.IQ2_XS, (N, K)],
     X: wl.View[wl.f32, (M, K)],

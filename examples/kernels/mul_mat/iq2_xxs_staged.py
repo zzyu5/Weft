@@ -7,13 +7,12 @@ import weft.language as wl
 
 
 def _iq2_xxs_group_products(w, x, grid, signs, entry_lane, codebook_lane, group):
-    group_byte = group * 8
-    grid_index = wl.widen(w.q[:, group_byte + entry_lane], wl.u32)
-    word1 = wl.widen(w.q[:, group_byte + 4], wl.u32) | wl.widen(
-        w.q[:, group_byte + 5], wl.u32
-    ) << wl.u32(8)
-    word1 = word1 | wl.widen(w.q[:, group_byte + 6], wl.u32) << wl.u32(16)
-    word1 = word1 | wl.widen(w.q[:, group_byte + 7], wl.u32) << wl.u32(24)
+    group_word = group * 4
+    indices = wl.widen(w.q[:, group_word + entry_lane // 2], wl.u32)
+    grid_index = indices >> wl.u32((entry_lane % 2) * 8) & wl.u32(255)
+    word1 = wl.widen(w.q[:, group_word + 2], wl.u32) | wl.widen(
+        w.q[:, group_word + 3], wl.u32
+    ) << wl.u32(16)
     sign_index = word1 >> wl.u32(entry_lane * 7) & wl.u32(127)
     weight = wl.lookup(grid, grid_index * wl.u32(8) + codebook_lane, bounds="in_bounds")
     sign = wl.lookup(signs, sign_index * wl.u32(8) + codebook_lane, bounds="in_bounds")
@@ -24,7 +23,7 @@ def _iq2_xxs_group_products(w, x, grid, signs, entry_lane, codebook_lane, group)
     return integer * scale
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Xq": "workspace", "Y": "output"})
 def production_mul_mat_iq2_xxs_staged(
     W: wl.View[ggml.IQ2_XXS, (N, K)],
     X: wl.View[wl.f32, (M, K)],

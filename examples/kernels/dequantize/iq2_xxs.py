@@ -17,18 +17,22 @@ def row_dequantize_iq2_xxs(
         w = wl.load(W[kb])
         group = wl.index(0)
         with wl.level.subtiles(kb, extent=32) as group_point:
-            group_byte = group * wl.index(8)
-            metadata = wl.u32(w.q[group_byte + wl.index(4)]) | wl.u32(
-                w.q[group_byte + wl.index(5)]
-            ) << wl.u32(8)
-            metadata = metadata | wl.u32(w.q[group_byte + wl.index(6)]) << wl.u32(16)
-            metadata = metadata | wl.u32(w.q[group_byte + wl.index(7)]) << wl.u32(24)
+            group_word = group * wl.index(4)
+            metadata = wl.widen(w.q[group_word + wl.index(2)], wl.u32) | wl.widen(
+                w.q[group_word + wl.index(3)], wl.u32
+            ) << wl.u32(16)
             subscale = wl.f32(0.5) + wl.f32(qf.extract_bits(metadata, 28, 4))
             scale = wl.f32(w.d) * subscale * wl.f32(0.25)
             entry = wl.index(0)
             with wl.level.subtiles(group_point, extent=8) as entry_point:
                 lane = wl.arange(0, 8, dtype=wl.u16, axis="k")
-                grid_index = wl.u16(w.q[group_byte + entry])
+                indices = w.q[group_word + entry // wl.index(2)]
+                grid_index = wl.narrow(
+                    qf.extract_bits(indices, wl.u32(entry % wl.index(2)) * wl.u32(8), 8),
+                    wl.u16,
+                    rounding="rtz",
+                    saturation=False,
+                )
                 sign_index = wl.narrow(
                     qf.extract_bits(metadata, wl.u32(entry) * wl.u32(7), 7),
                     wl.u16,

@@ -6,7 +6,7 @@ import weft
 import weft.language as wl
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Xq": "workspace", "Y": "output"})
 def production_mul_mat_iq1_s(
     W: wl.View[ggml.IQ1_S, (N, K)],
     X: wl.View[wl.f32, (M, K)],

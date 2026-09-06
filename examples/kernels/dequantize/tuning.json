@@ -44,7 +44,7 @@
     "row-dequantize:sg2044 q3_k": {"entry":"q3_k.py","symbol":"row_dequantize_q3_k","source":{},"physical":{"lmul_eighths":32},"binding_origin":"measured-lmul-subset"},
     "row-dequantize:sg2044 q4_0": {"entry":"q4_0.py","symbol":"row_dequantize_q4_0","source":{},"physical":{}},
     "row-dequantize:sg2044 q4_1": {"entry":"q4_1.py","symbol":"row_dequantize_q4_1","source":{},"physical":{}},
-    "row-dequantize:sg2044 q4_k": {"entry":"q4_k.py","symbol":"row_dequantize_q4_k","source":{},"physical":{}},
+    "row-dequantize:sg2044 q4_k": {"entry":"q4_k.py","symbol":"row_dequantize_q4_k","source":{},"physical":{"lmul_eighths":32},"binding_origin":"measured-lmul-subset"},
     "row-dequantize:sg2044 q5_0": {"entry":"q5_0.py","symbol":"row_dequantize_q5_0","source":{},"physical":{}},
     "row-dequantize:sg2044 q5_1": {"entry":"q5_1.py","symbol":"row_dequantize_q5_1","source":{},"physical":{}},
     "row-dequantize:sg2044 q5_k": {"entry":"q5_k.py","symbol":"row_dequantize_q5_k","source":{},"physical":{"lmul_eighths":16},"binding_origin":"measured-lmul-subset"},

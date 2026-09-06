@@ -20,13 +20,12 @@ def compute(
         group = wl.arange(0, 8, dtype=wl.u32, axis="group")
         entry = wl.arange(0, 4, dtype=wl.u32, axis="entry")
         payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
-        group_byte = group * wl.u32(8)
-        grid_index = wl.widen(w.q[group_byte + entry], wl.u32)
-        word1 = wl.widen(w.q[group_byte + wl.u32(4)], wl.u32) | wl.widen(
-            w.q[group_byte + wl.u32(5)], wl.u32
-        ) << wl.u32(8)
-        word1 = word1 | wl.widen(w.q[group_byte + wl.u32(6)], wl.u32) << wl.u32(16)
-        word1 = word1 | wl.widen(w.q[group_byte + wl.u32(7)], wl.u32) << wl.u32(24)
+        group_word = group * wl.u32(4)
+        word0 = wl.widen(w.q[group_word + (entry >> wl.u32(1))], wl.u32)
+        grid_index = word0 >> ((entry & wl.u32(1)) * wl.u32(8)) & wl.u32(255)
+        word1 = wl.widen(w.q[group_word + wl.u32(2)], wl.u32) | wl.widen(
+            w.q[group_word + wl.u32(3)], wl.u32
+        ) << wl.u32(16)
         sign_index = word1 >> entry * wl.u32(7) & wl.u32(127)
         weight = wl.lookup(
             grid_values, grid_index * wl.u32(8) + payload, bounds="in_bounds"

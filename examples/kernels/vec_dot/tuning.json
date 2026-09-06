@@ -34,7 +34,7 @@
     "vec-dot:sg2044 iq2_xs": {"entry":"iq2_xs_q8_k.py","symbol":"quantized_vec_dot_iq2_xs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
     "vec-dot:sg2044 iq2_xxs": {"entry":"iq2_xxs_q8_k.py","symbol":"quantized_vec_dot_iq2_xxs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":2,"pipeline_depth":1}},
     "vec-dot:sg2044 iq3_s": {"entry":"iq3_s_q8_k.py","symbol":"quantized_vec_dot_iq3_s_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
-    "vec-dot:sg2044 iq3_xxs": {"entry":"iq3_xxs_q8_k.py","symbol":"quantized_vec_dot_iq3_xxs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
+    "vec-dot:sg2044 iq3_xxs": {"entry":"iq3_xxs_q8_k.py","symbol":"quantized_vec_dot_iq3_xxs_q8_k","source":{},"physical":{"lmul_eighths":64,"unroll":1,"pipeline_depth":1},"binding_origin":"measured-lmul-subset"},
     "vec-dot:sg2044 iq4_nl": {"entry":"iq4_nl_q8_0.py","symbol":"quantized_vec_dot_iq4_nl_q8_0","source":{},"physical":{}},
     "vec-dot:sg2044 iq4_xs": {"entry":"iq4_xs_q8_k.py","symbol":"quantized_vec_dot_iq4_xs_q8_k","source":{},"physical":{}},
     "vec-dot:sg2044 mxfp4": {"entry":"mxfp4_q8_0.py","symbol":"quantized_vec_dot_mxfp4_q8_0","source":{},"physical":{}},
@@ -51,6 +51,6 @@
     "vec-dot:sg2044 q6_k": {"entry":"q6_k_q8_k.py","symbol":"quantized_vec_dot_q6_k_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":2,"pipeline_depth":1}},
     "vec-dot:sg2044 q8_0": {"entry":"q8_0_q8_0.py","symbol":"quantized_vec_dot_q8_0_q8_0","source":{},"physical":{"lmul_eighths":8,"unroll":1,"pipeline_depth":1}},
     "vec-dot:sg2044 tq1_0": {"entry":"tq1_0_q8_k_lane16.py","symbol":"quantized_vec_dot_tq1_0_q8_k_lane16","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1},"binding_origin":"measured-author-entry"},
-    "vec-dot:sg2044 tq2_0": {"entry":"tq2_0_q8_k.py","symbol":"quantized_vec_dot_tq2_0_q8_k","source":{},"physical":{}}
+    "vec-dot:sg2044 tq2_0": {"entry":"tq2_0_q8_k.py","symbol":"quantized_vec_dot_tq2_0_q8_k","source":{},"physical":{"lmul_eighths":16},"binding_origin":"measured-lmul-subset"}
   }
 }

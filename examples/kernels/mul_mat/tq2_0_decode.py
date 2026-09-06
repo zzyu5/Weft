@@ -7,7 +7,7 @@ import weft
 import weft.language as wl
 
 
-@weft.kernel
+@weft.kernel(alias_groups={"Xq": "workspace", "Y": "output"})
 def production_mul_mat_tq2_0_decode(
     W: wl.View[ggml.TQ2_0, (N, K)],
     X: wl.View[wl.f32, (M, K)],
