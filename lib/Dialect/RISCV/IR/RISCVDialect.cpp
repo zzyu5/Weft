@@ -3510,6 +3510,14 @@ mlir::LogicalResult ReshapeOp::verify() {
   return mlir::success();
 }
 
+void LoadOp::getEffects(
+    llvm::SmallVectorImpl<mlir::SideEffects::EffectInstance<
+        mlir::MemoryEffects::Effect>> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Read::get());
+  if (getSnapshotStorage())
+    effects.emplace_back(mlir::MemoryEffects::Write::get());
+}
+
 mlir::LogicalResult LoadOp::verify() {
   if (!canRead(getRegion().getType().getAccess()) ||
       !isPhysicalValue(getResult().getType()) ||
@@ -3525,6 +3533,39 @@ mlir::LogicalResult LoadOp::verify() {
   } else if (resultElement != encoding) {
     return emitOpError(
         "encoded physical load must preserve the pinned Encoding identity");
+  }
+  if (mlir::Value allocation = getSnapshotStorage()) {
+    auto memory = getRegion().getType();
+    auto value = mlir::dyn_cast<ValueType>(getResult().getType());
+    auto storage = mlir::cast<LocalType>(allocation.getType());
+    const int64_t extent = value && value.getShape().size() == 1
+                               ? value.getShape()[0]
+                               : 0;
+    const int64_t recordBytes = memory.getStorageBits() / 8;
+    if (encoding.getKind() != "base" || !value ||
+        value.getLayout().getCarrier() != "local" ||
+        value.getLayout().getValidity() != "full" || extent <= 0 ||
+        extent % memory.getElements() || memory.getStorageBits() % 8 ||
+        recordBytes <= 0 || memory.getInterleaveRows() != 0 ||
+        memory.getStrides().size() != 1 ||
+        memory.getStrides()[0] != 1 ||
+        extent / memory.getElements() >
+            std::numeric_limits<int64_t>::max() / recordBytes ||
+        storage.getSizeBytes() != extent / memory.getElements() * recordBytes ||
+        !storage.getElementType().isInteger(8) || !storage.getShape().empty() ||
+        !storage.getAxisIds().empty() || storage.getPurpose() != "pack" ||
+        storage.getSchema() != "read-snapshot" ||
+        storage.getAlignment() < memory.getAlignment() ||
+        !allocation.getDefiningOp<LocalAllocOp>() || !allocation.hasOneUse() ||
+        !exactLeaf(getLeaf(), "transfer", "load", "scalar.record-snapshot",
+                   "none", "exact") ||
+        getLeaf().getOperandGroups() != 0 || getLeaf().getResultGroups() != 0 ||
+        getLeaf().getTemporaryGroups() != 0 ||
+        getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+      return emitOpError(
+          "encoded read snapshot requires an allocated complete contiguous record range");
+  } else if (getLeaf().getInstruction() == "scalar.record-snapshot") {
+    return emitOpError("record snapshot leaf requires explicit local storage");
   }
   return verifyLeafOperation(*this);
 }

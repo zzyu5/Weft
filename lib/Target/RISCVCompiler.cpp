@@ -79,6 +79,7 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   manager.addPass(weft::createFinalizeRISCVLeavesPass());
   manager.addPass(
       weft::createSelectRISCVScalarLoadPrimesPass(scalarLoadPrime));
+  manager.addPass(weft::createMaterializeRISCVReadSnapshotsPass());
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createVerifyFinalRISCVPass());

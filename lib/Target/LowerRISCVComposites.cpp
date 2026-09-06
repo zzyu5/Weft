@@ -767,7 +767,7 @@ private:
       return mlir::failure();
     }
     auto projected = rewriter.create<riscv::LoadOp>(
-        origin->getLoc(), projectedType, slice.getResult(), access,
+        origin->getLoc(), projectedType, slice.getResult(), mlir::Value(), access,
         riscv_internal::leaf(rewriter, "transfer", "load",
                              ("rvv.load." + access.getForm()).str(),
                              ("rvv.load." + access.getForm()).str(), 0, 0));
@@ -1110,7 +1110,7 @@ private:
                 ("rvv.load." + form).str(), 0, 0);
             auto projected = rewriter.create<riscv::LoadOp>(
                 extract.getLoc(), result, slice.getResult(),
-                extract.getAccess(), leaf);
+                mlir::Value(), extract.getAccess(), leaf);
             copyIdentity(extract, projected);
             extract.getResult().replaceAllUsesWith(projected.getResult());
             rewriter.eraseOp(extract);
@@ -1124,7 +1124,7 @@ private:
             rewriter.setInsertionPoint(use->getOwner());
             auto cloned = rewriter.create<riscv::LoadOp>(
                 operation.getLoc(), operation.getResult().getType(),
-                staged.getResult(), load.getAccess(), load.getLeaf());
+                staged.getResult(), mlir::Value(), load.getAccess(), load.getLeaf());
             copyIdentity(load, cloned);
             use->set(cloned.getResult());
           }

@@ -575,7 +575,7 @@ private:
           mlir::ValueRange{point.getResult()}, slice.getSelectors());
       clonedLoad = rewriter.create<riscv::LoadOp>(
           load.getLoc(), load.getResult().getType(), clonedSlice.getResult(),
-          load.getAccess(), load.getLeaf());
+          mlir::Value(), load.getAccess(), load.getLeaf());
       weft::riscv_internal::copyOrigin(slice, clonedSlice);
       weft::riscv_internal::copyOrigin(load, clonedLoad);
       loads.try_emplace(load.getResult(), clonedLoad.getResult());

@@ -1804,11 +1804,15 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
       }
       auto valueType = mlir::dyn_cast<riscv::ValueType>(value.getType());
       auto layout = valueType ? valueType.getLayout() : riscv::LayoutAttr();
-      if (!layout || product(layout.getTimeFactors()) != 1 ||
-          product(layout.getLaneFactors()) != 1 ||
-          product(layout.getReplicaFactors()) != 1 ||
-          product(layout.getFragmentFactors()) != 1 ||
-          product(layout.getLocalFactors()) != 1) {
+      const bool scalarElement = value.getType().isIntOrFloat() ||
+                                 value.getType().isIndex();
+      if ((!valueType && !scalarElement) ||
+          (valueType &&
+           (!layout || product(layout.getTimeFactors()) != 1 ||
+            product(layout.getLaneFactors()) != 1 ||
+            product(layout.getReplicaFactors()) != 1 ||
+            product(layout.getFragmentFactors()) != 1 ||
+            product(layout.getLocalFactors()) != 1))) {
         value.getDefiningOp()->emitError(
             "sequential dense load requires one selected physical element");
         return mlir::failure();
@@ -3385,6 +3389,16 @@ mlir::LogicalResult Emitter::compileAdmit(riscv::LoadOp admit) {
   mlir::FailureOr<Binding> result = recordForSlice(admit.getRegion());
   if (mlir::failed(result))
     return mlir::failure();
+  if (mlir::Value allocation = admit.getSnapshotStorage()) {
+    Binding storage = bindings.lookup(allocation);
+    auto storageType = mlir::cast<riscv::LocalType>(allocation.getType());
+    if (storage.kind != Binding::Kind::LocalArray ||
+        admit.getLeaf().getInstruction() != "scalar.record-snapshot")
+      return fail(admit, "record snapshot has no selected local storage binding");
+    line("memcpy(" + storage.scalar + ", " + result->recordPointer + ", " +
+         std::to_string(storageType.getSizeBytes()) + ");");
+    result->recordPointer = storage.scalar;
+  }
   bindings[admit.getResult()] = std::move(*result);
   return mlir::success();
 }
@@ -12872,7 +12886,11 @@ mlir::LogicalResult Emitter::compileRVVEncodedContractStep(
 }
 
 mlir::LogicalResult Emitter::compileCommit(riscv::StoreOp operation) {
-  Binding value = bindings.lookup(operation.getValue());
+  auto materialized = materializeNumeric(
+      operation.getValue(), bindings.lookup(operation.getValue()));
+  if (mlir::failed(materialized))
+    return mlir::failure();
+  Binding value = std::move(*materialized);
   Binding region = bindings.lookup(operation.getRegion());
   riscv::AccessAttr selectedEdge = operation.getAccess();
   if (region.kind == Binding::Kind::Field) {

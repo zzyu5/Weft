@@ -284,6 +284,13 @@ public:
     mlir::ModuleOp module = getOperation();
     llvm::DenseSet<std::pair<int64_t, int64_t>> partialBirths;
     getOperation().walk([&](mlir::Operation *operation) {
+      if (auto load = mlir::dyn_cast<riscv::LoadOp>(operation);
+          load && !load.getSnapshotStorage() &&
+          riscv_internal::needsReadSnapshot(load)) {
+        load.emitError(
+            "encoded read crosses a possibly aliasing write without a physical snapshot");
+        failed = true;
+      }
       auto verifyPartialBirth = [&](int64_t owner, int64_t birth) {
         if (!partialBirths.insert({owner, birth}).second) {
           operation->emitError()
@@ -513,9 +520,17 @@ public:
       if (auto load = mlir::dyn_cast<riscv::LoadOp>(operation)) {
         auto access = load.getAccess();
         auto leaf = load.getLeaf();
-        if (!access || leaf.getEngine() != "transfer" ||
+        if (!access) {
+          load.emitError("final load has no selected memory access");
+          failed = true;
+          return;
+        }
+        const std::string expected = load.getSnapshotStorage()
+                                         ? "scalar.record-snapshot"
+                                         : ("rvv.load." + access.getForm()).str();
+        if (leaf.getEngine() != "transfer" ||
             leaf.getFamily() != "load" ||
-            leaf.getInstruction() != ("rvv.load." + access.getForm()).str() ||
+            leaf.getInstruction() != expected ||
             leaf.getSpelling() != leaf.getInstruction()) {
           load.emitError(
               "final load has no exact access-form transfer leaf");

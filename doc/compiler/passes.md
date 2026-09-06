@@ -37,6 +37,7 @@ ConvertWeftToRISCV
 → SelectRISCVOperations
 → FinalizeRISCVLeaves
 → SelectRISCVScalarLoadPrimes
+→ MaterializeRISCVReadSnapshots
 → MaterializeRISCVResources
 → EliminateDeadRISCVLayouts
 → VerifyFinalRISCV
@@ -264,6 +265,18 @@ vector-load leaf；`rvv_replica_storage_load`还必须只有一个source window�
 这个leaf固定为同一raw window末端的一次有序scalar byte read加原vector load。它是有限的局部
 memory spelling，不携带future-iteration、distance、buffer或pipeline schedule；若需要跨iteration
 prefetch，必须先在RISC-V IR中建立真实producer/carry/control，不能扩展本pass暗做。
+
+### `MaterializeRISCVReadSnapshots`
+
+encoded `load` 的 field/projection 可以延迟实现，但不能跨越可能修改原 bytes 的写入。
+该 pass 沿读取结果的 use-def 检查中间 effects、参数 alias set 和嵌套循环；存在干扰时，
+在原读取位置插入显式 `local_alloc`，将它作为 `load.snapshot_storage` operand，选择
+完整 record byte-copy leaf。之后的 field 投影读取这份私有存储，原 Value 的 Encoding、
+shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned View 混为一类。
+
+快照要求静态、一维、unit-stride、完整且非 interleaved 的 record 区间；未满足的干扰读取
+必须拒绝。容量和 lifetime 由 `LocalType` 承载，资源 pass 核算分配；没有干扰的读取不增加
+本地复制。final verifier 拒绝仍跨干扰写入但没有快照的 encoded load。
 
 ### `MaterializeRISCVResources`
 

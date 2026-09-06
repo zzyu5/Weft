@@ -1005,8 +1005,10 @@ def WeftRISCV_ReshapeOp : WeftRISCV_Op<"reshape", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_LoadOp : WeftRISCV_Op<"load", [MemoryEffects<[MemRead]>]> {
+def WeftRISCV_LoadOp : WeftRISCV_Op<"load", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins WeftRISCV_MemDescType:$region,
+                       Optional<WeftRISCV_LocalType>:$snapshot_storage,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);

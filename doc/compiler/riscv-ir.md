@@ -100,6 +100,12 @@ SSA result。作者 staged birth携带 owner/birth/lifetime；编译器在同一
 supply时使用`physical-share`，其作用域完全由SSA dominance给出，不伪造作者birth。
 staged lifetime不靠无 result marker保存。
 
+encoded `load` 可携带显式 `snapshot_storage` operand，指向 schema 为 `read-snapshot`
+的私有 byte allocation。其 selected leaf 在原读取点复制完整连续 record range，field
+与 extract 继续投影同一个 Value，但不再重新读取可能已被覆盖的 pinned bytes。allocation、
+byte size、alignment、owner/lifetime 和复制的 read/write effects 都必须在 IR 中闭合；
+没有配套存储的 snapshot leaf 或跨干扰写入的无快照 encoded load 均非法。
+
 ## 4. Explicit conversion
 
 representation conflict是一个真实 `weft_riscv.convert_layout`：source/result type保存完整

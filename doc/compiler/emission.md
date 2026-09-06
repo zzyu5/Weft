@@ -13,6 +13,8 @@ translator内部可以用临时binding map把SSA value对应到C expression、RV
 同一结果的重复 use 不能变成重复解引用，也不能将读取延迟到可能别名的 store 之后。
 这项要求同时覆盖 scalar、scalar tuple、encoded field 与 local load；source record 到
 field 的投影也必须保留原有读取/effect 边界，不能把描述符字符串当成已经加载的值。
+带 `snapshot_storage` 的 encoded load 只按已选 byte-copy leaf 写入对应 local allocation，
+随后绑定该私有存储；translator 不自行决定是否复制、复制范围或生命周期。
 
 ## 2. 允许的确定 lowering
 
