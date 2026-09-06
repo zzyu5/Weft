@@ -35,6 +35,14 @@ struct RISCVCompilationResult {
 mlir::FailureOr<RISCVPhysicalizationResult>
 physicalizeRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);
 
+/// Stop before the final layout canonicalization, with its remaining binding.
+mlir::FailureOr<RISCVPhysicalizationResult>
+prepareRISCVLayoutModule(mlir::ModuleOp module, RISCVCompilerOptions options);
+
+/// Run the normal finalization suffix from an explicit layout input checkpoint.
+mlir::FailureOr<RISCVCompilationResult>
+completeRISCVLayoutModule(mlir::ModuleOp module);
+
 /// Translate a verified RISC-V Physical IR program mechanically to intrinsic C.
 mlir::FailureOr<RISCVCompilationResult>
 compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options);

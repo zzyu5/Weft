@@ -14,8 +14,26 @@
 
 namespace {
 
+constexpr llvm::StringLiteral layoutInputAttribute = "weft.riscv.layout_input";
+
+void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
+  manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
+  manager.addPass(weft::createPlanRISCVMemoryPass());
+  manager.addPass(weft::createMaterializeRISCVReplicaStorageLoadsPass());
+  manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
+  manager.addPass(weft::createSelectRISCVOperationsPass());
+  manager.addPass(weft::createFinalizeRISCVLeavesPass());
+  manager.addPass(
+      weft::createSelectRISCVScalarLoadPrimesPass(scalarLoadPrime));
+  manager.addPass(weft::createMaterializeRISCVReadSnapshotsPass());
+  manager.addPass(weft::createMaterializeRISCVResourcesPass());
+  manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
+  manager.addPass(weft::createVerifyFinalRISCVPass());
+}
+
 mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
-                                       weft::RISCVCompilerOptions options) {
+                                       weft::RISCVCompilerOptions options,
+                                       bool stopBeforeLayout = false) {
   const int64_t lmulEighths = options.lmulEighths;
   const bool scalarLoadPrime = options.scalarLoadPrime != 0;
   module.getContext()->getOrLoadDialect<mlir::arith::ArithDialect>();
@@ -58,32 +76,19 @@ mlir::LogicalResult runPhysicalization(mlir::ModuleOp module,
   // distinct logical offsets become explicit raw-window loads plus typed layer
   // decodes before later layout and resource passes inspect their lifetimes.
   manager.addPass(weft::createShareRISCVLayeredWindowsPass());
-  // Partial materialization can introduce fresh lane-to-register edges around
-  // shaped iotas and other pure producers.  Canonicalize those new edges
-  // before scheduling/final leaf selection so their register forms remain
-  // explicit typed values instead of terminal vector extracts.
-  manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
-  // Partial materialization can also create a new scalar-replica projection.
-  // First annotate its typed storage relation, then select and materialize the
-  // final field-to-register form from the just-canonicalized layout.  Terminal
-  // emission must not reconstruct that decision from an ExtractOp.
-  manager.addPass(weft::createPlanRISCVMemoryPass());
-  manager.addPass(weft::createMaterializeRISCVReplicaStorageLoadsPass());
-  manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
-  // Layout canonicalization and partial materialization may rewrite the
-  // carrier of surviving numerical operations.  Re-select their exact
-  // target-local implementation from the final typed result instead of
-  // carrying an implementation chosen for a pre-rewrite layout into leaf
-  // finalization.
-  manager.addPass(weft::createSelectRISCVOperationsPass());
-  manager.addPass(weft::createFinalizeRISCVLeavesPass());
-  manager.addPass(
-      weft::createSelectRISCVScalarLoadPrimesPass(scalarLoadPrime));
-  manager.addPass(weft::createMaterializeRISCVReadSnapshotsPass());
-  manager.addPass(weft::createMaterializeRISCVResourcesPass());
-  manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
-  manager.addPass(weft::createVerifyFinalRISCVPass());
-  return manager.run(module);
+  // The normal compiler and parsed checkpoint share this exact suffix.  Fresh
+  // rematerialization must precede memory/leaf selection and resource closure.
+  if (!stopBeforeLayout)
+    addLayoutFinalization(manager, scalarLoadPrime);
+  if (mlir::failed(manager.run(module)))
+    return mlir::failure();
+  if (stopBeforeLayout) {
+    mlir::Builder builder(module.getContext());
+    module->setAttr(layoutInputAttribute, builder.getDictionaryAttr({
+        builder.getNamedAttr("scalar_load_prime",
+                             builder.getBoolAttr(scalarLoadPrime))}));
+  }
+  return mlir::success();
 }
 
 std::string printModule(mlir::ModuleOp module) {
@@ -105,6 +110,49 @@ weft::physicalizeRISCVModule(mlir::ModuleOp module,
     return mlir::failure();
   RISCVPhysicalizationResult result;
   result.riscvIR = printModule(*working);
+  return result;
+}
+
+mlir::FailureOr<weft::RISCVPhysicalizationResult>
+weft::prepareRISCVLayoutModule(mlir::ModuleOp module,
+                               RISCVCompilerOptions options) {
+  mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
+  if (mlir::failed(runPhysicalization(*working, std::move(options), true)))
+    return mlir::failure();
+  return RISCVPhysicalizationResult{printModule(*working)};
+}
+
+mlir::FailureOr<weft::RISCVCompilationResult>
+weft::completeRISCVLayoutModule(mlir::ModuleOp module) {
+  auto checkpoint = module->getAttrOfType<mlir::DictionaryAttr>(
+      layoutInputAttribute);
+  auto scalarLoadPrime = checkpoint
+      ? checkpoint.getAs<mlir::BoolAttr>("scalar_load_prime") : mlir::BoolAttr();
+  if (!checkpoint || checkpoint.size() != 1 || !scalarLoadPrime) {
+    module.emitError("layout input requires its explicit remaining binding");
+    return mlir::failure();
+  }
+  bool foundKernel = false;
+  bool closedResources = false;
+  module.walk([&](riscv::KernelOp kernel) {
+    foundKernel = true;
+    closedResources |= kernel.getResourcesMaterialized();
+  });
+  if (!foundKernel || closedResources) {
+    module.emitError("layout input must precede final resource materialization");
+    return mlir::failure();
+  }
+  mlir::OwningOpRef<mlir::ModuleOp> working = module.clone();
+  (*working)->removeAttr(layoutInputAttribute);
+  mlir::PassManager manager(module.getContext());
+  manager.enableVerifier(true);
+  addLayoutFinalization(manager, scalarLoadPrime.getValue());
+  if (mlir::failed(manager.run(*working)))
+    return mlir::failure();
+  RISCVCompilationResult result;
+  result.riscvIR = printModule(*working);
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+    return mlir::failure();
   return result;
 }
 

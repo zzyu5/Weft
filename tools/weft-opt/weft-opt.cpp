@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
       []() { return weft::createShareRISCVLayeredWindowsPass(); });
   mlir::registerPass(
       []() { return weft::createCanonicalizeRISCVLayoutsPass(); });
+  mlir::registerPass(
+      []() { return weft::createEliminateDeadRISCVLayoutsPass(); });
   mlir::registerPass([]() { return weft::createVerifyFinalRISCVPass(); });
   mlir::DialectRegistry registry;
   registry.insert<weft::kernel::WEFTKernelDialect,

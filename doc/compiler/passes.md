@@ -52,6 +52,14 @@ generic unroll 之前读取未复制的 contraction/reduction use-def，冻结 c
 raw-window load 与显式 layer decode。exact leaf
 完成后，resource pass 才能把 leaf temporary 与 SSA live interval 一起计入峰值。
 
+`weft-compile --emit=riscv-layout-input` 在最后一次 `CanonicalizeRISCVLayouts`
+之前输出同一层 Physical IR。module 的 `weft.riscv.layout_input` 保存尚未消费的
+`scalar_load_prime` 单值绑定；其余 target/binding 已体现在 typed program 中。
+`--resume-layout-input --emit=intrinsic-c` 从解析后的该边界运行与普通编译完全共用的
+layout、memory、leaf、read-snapshot、resource 和 final verification 后缀，再机械生成 C。
+缺少标记、已经资源闭合或试图用 CLI 更换 target/binding 均拒绝；不清除 final resource
+marker 来强行重放。该边界不增加 IR 层，也不是备用编译主链。
+
 ## 2. 各 pass 合同
 
 ### `ConvertWeftToRISCV`

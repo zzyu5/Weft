@@ -26,8 +26,12 @@ llvm::cl::opt<std::string> inputFilename(
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
 llvm::cl::opt<std::string> emitKind(
-    "emit", llvm::cl::desc("kernel-ir, riscv-ir, or intrinsic-c"),
+    "emit", llvm::cl::desc("kernel-ir, riscv-layout-input, riscv-ir, or intrinsic-c"),
     llvm::cl::init("riscv-ir"));
+llvm::cl::opt<bool> resumeLayoutInput(
+    "resume-layout-input",
+    llvm::cl::desc("Finalize a parsed pre-resource layout input checkpoint"),
+    llvm::cl::init(false));
 llvm::cl::opt<std::string> march("march", llvm::cl::desc("RISC-V ISA string"));
 llvm::cl::opt<std::string> abi("abi", llvm::cl::desc("RISC-V ABI"));
 llvm::cl::opt<int64_t> vlenBits(
@@ -99,7 +103,8 @@ bool parseMetaBindings(
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Weft RISC-V representation compiler\n");
-  if (emitKind != "kernel-ir" && emitKind != "riscv-ir" &&
+  if (emitKind != "kernel-ir" && emitKind != "riscv-layout-input" &&
+      emitKind != "riscv-ir" &&
       emitKind != "intrinsic-c") {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
@@ -126,6 +131,25 @@ int main(int argc, char **argv) {
     if (mlir::isa<weft::riscv::KernelOp>(operation))
       hasPhysicalProgram = true;
   });
+  if (resumeLayoutInput &&
+      (!hasPhysicalProgram ||
+       (emitKind != "riscv-ir" && emitKind != "intrinsic-c") ||
+       march.getNumOccurrences() || abi.getNumOccurrences() ||
+       vlenBits.getNumOccurrences() || matrixExtension.getNumOccurrences() ||
+       maxWideningCombineGroups.getNumOccurrences() ||
+       partialCombinePolicy.getNumOccurrences() ||
+       recordAxisPolicy.getNumOccurrences() || !metaBindings.empty() ||
+       autoUnroll.getNumOccurrences() || autoLMULEighths.getNumOccurrences() ||
+       autoPipelineDepth.getNumOccurrences() ||
+       autoScalarLoadPrime.getNumOccurrences())) {
+    llvm::errs() << "--resume-layout-input requires physical input, final output, "
+                    "and no replacement target or parameter bindings\n";
+    return 1;
+  }
+  if (hasPhysicalProgram && emitKind == "riscv-layout-input") {
+    llvm::errs() << "riscv-layout-input must be produced from Canonical Kernel IR\n";
+    return 1;
+  }
 
   std::error_code errorCode;
   llvm::ToolOutputFile output(outputFilename, errorCode,
@@ -144,7 +168,8 @@ int main(int argc, char **argv) {
     output.os() << '\n';
   } else if (hasPhysicalProgram) {
     mlir::FailureOr<weft::RISCVCompilationResult> result =
-        weft::translateRISCVModule(*module);
+        resumeLayoutInput ? weft::completeRISCVLayoutModule(*module)
+                          : weft::translateRISCVModule(*module);
     if (mlir::failed(result))
       return 1;
     output.os() << (emitKind == "riscv-ir" ? result->riscvIR
@@ -178,9 +203,11 @@ int main(int argc, char **argv) {
     options.unroll = autoUnroll;
     options.pipelineDepth = autoPipelineDepth;
     options.scalarLoadPrime = autoScalarLoadPrime;
-    if (emitKind == "riscv-ir") {
+    if (emitKind == "riscv-ir" || emitKind == "riscv-layout-input") {
       mlir::FailureOr<weft::RISCVPhysicalizationResult> result =
-          weft::physicalizeRISCVModule(*module, std::move(options));
+          emitKind == "riscv-layout-input"
+              ? weft::prepareRISCVLayoutModule(*module, std::move(options))
+              : weft::physicalizeRISCVModule(*module, std::move(options));
       if (mlir::failed(result))
         return 1;
       output.os() << result->riscvIR;

@@ -426,8 +426,11 @@ parse/verify、指定的 canonicalization/CSE 和二次文本 diff 为零，只�
 final kernel 的 `resources_materialized=true` 会使 layout canonicalization 跳过主要
 backward-rematerialization/layout-changing 分支，只保留不改变最终资源合同的 conversion
 CSE。因此 final IR 的稳定重放不能代表 resource closure 之前的改写已被重新执行和验证。
-若要检验某个实际 pass 的稳定性，必须从它适用的输入边界重放；真机数值 repro 仍是独立
-且必须完成的证据。
+layout 改写的重放从 `--emit=riscv-layout-input` 开始：解析后执行
+`weft-riscv-canonicalize-layouts → cse → weft-riscv-eliminate-dead-layouts`，
+以固定点 dead-producer 清理消费 CSE 暴露的纯死链，再以 `--resume-layout-input` 运行同一收尾后缀，
+重新选择 memory/leaf 并核算资源。应同时记录边界前后的实际改写、重放稳定性与完整编译
+结果的比较；不得只观察一个被跳过的 pass。真机数值 repro 仍是独立且必须完成的证据。
 
 pass 贡献只能来自固定作者树及其它 binding 下两份均合法的 Physical program，并实际运行
 对应 artifacts。关闭必需 lowering 后编译失败不是性能消融，也不能把多个相互依赖 pass 的
