@@ -454,6 +454,9 @@ memory/replica-load/hoist/operation-selection/leaf-finalization/read-snapshot/re
 仍是输入 Physical graph 的一部分，不因清 marker 而删除；已有 scalar-load prime 保留，
 不得据此推测新的参数绑定。每轮都重新清 marker 后重放，二次 diff 为零才表示此流程稳定。
 若改写留下不匹配的 leaf 或无法重新闭合资源，应报告失败，不能补回旧 marker/统计使其通过。
+rematerialization 必须使旧 `leaf`/`implementation` 失效，再由原有选择 pass 闭合新表示。
+资源闭合可能使原本属性不同的 leaf 变得相同；若随后再次 CSE/dead-layout 清理，应先清除
+final marker 与统计，并在清理后重新核算资源。二次 diff 比较必须包含这一收尾，不能保留旧统计。
 
 pass 贡献只能来自固定作者树及其它 binding 下两份均合法的 Physical program，并实际运行
 对应 artifacts。关闭必需 lowering 后编译失败不是性能消融，也不能把多个相互依赖 pass 的

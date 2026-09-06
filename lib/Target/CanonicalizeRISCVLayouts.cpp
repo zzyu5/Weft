@@ -285,6 +285,8 @@ public:
               if (attribute.getName() != "operandSegmentSizes")
                 rematerialized->setAttr(attribute.getName(),
                                         attribute.getValue());
+            rematerialized->setAttr("leaf", riscv_internal::unselectedLeaf(rewriter));
+            rematerialized->removeAttr("implementation");
             conversion.getResult().replaceAllUsesWith(rematerialized.getResult());
             rewriter.eraseOp(conversion);
             rewriter.eraseOp(extract);
@@ -356,6 +358,8 @@ public:
           for (auto attribute : extract->getAttrs())
             if (attribute.getName() != "operandSegmentSizes")
               rematerialized->setAttr(attribute.getName(), attribute.getValue());
+          rematerialized->setAttr("leaf", riscv_internal::unselectedLeaf(rewriter));
+          rematerialized->removeAttr("implementation");
           conversion.getResult().replaceAllUsesWith(rematerialized.getResult());
           rewriter.eraseOp(conversion);
           rewriter.eraseOp(extract);
@@ -464,6 +468,9 @@ public:
         state.addTypes(targetType);
         state.addAttributes(producer->getAttrs());
         mlir::Operation *rematerialized = rewriter.create(state);
+        // A leaf belongs to its solved representation, not just its source op.
+        rematerialized->setAttr("leaf", riscv_internal::unselectedLeaf(rewriter));
+        rematerialized->removeAttr("implementation");
         conversion.getResult().replaceAllUsesWith(rematerialized->getResult(0));
         rewriter.eraseOp(conversion);
         if (producer->use_empty())
