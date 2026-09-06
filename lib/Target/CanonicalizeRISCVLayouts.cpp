@@ -6,6 +6,7 @@
 
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 
@@ -28,6 +29,28 @@ bool isPureRepresentationConversion(riscv::ConvertLayoutOp conversion) {
 bool hasFinalResourceContract(riscv::ConvertLayoutOp conversion) {
   auto kernel = conversion->getParentOfType<riscv::KernelOp>();
   return kernel && kernel.getResourcesMaterialized();
+}
+
+bool preservesReadOrder(mlir::Operation *from, mlir::Operation *to) {
+  if (from->getBlock() != to->getBlock())
+    return false;
+  for (mlir::Operation *cursor = from->getNextNode(); cursor != to;
+       cursor = cursor->getNextNode()) {
+    if (!cursor)
+      return false;
+    if (mlir::isMemoryEffectFree(cursor))
+      continue;
+    auto interface = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(cursor);
+    if (!interface)
+      return false;
+    llvm::SmallVector<mlir::MemoryEffects::EffectInstance> effects;
+    interface.getEffects(effects);
+    if (llvm::any_of(effects, [](const auto &effect) {
+          return !mlir::isa<mlir::MemoryEffects::Read>(effect.getEffect());
+        }))
+      return false;
+  }
+  return true;
 }
 
 class CanonicalizeRISCVLayoutsPass
@@ -103,6 +126,18 @@ public:
         if (!isPureRepresentationConversion(conversion))
           continue;
         mlir::Operation *producer = conversion.getInput().getDefiningOp();
+        if (auto share =
+                mlir::dyn_cast_or_null<riscv::RegisterMaterializeOp>(producer);
+            share && share.getRealization() == "physical-share" &&
+            share.getInput().hasOneUse() && share.getResult().hasOneUse() &&
+            preservesReadOrder(share, conversion)) {
+          // A formerly shared scalar supply may become single-use after
+          // partial materialization. It no longer needs a sharing boundary.
+          conversion.getInputMutable().assign(share.getInput());
+          rewriter.eraseOp(share);
+          producer = conversion.getInput().getDefiningOp();
+          changed = true;
+        }
         if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(producer)) {
           if (!conversion.getInput().hasOneUse() ||
               (!extract->hasAttr("index_pattern") &&

@@ -144,6 +144,11 @@ reuse 证明，不由该窄合同猜测。
 的 backward rematerialization，以及同一 block 内相同 conversion 的 SSA CSE。它不声称已经
 实现跨 block hoist/sink、全局 conversion algebra 或任意 producer rematerialization。
 
+partial materialization 后，`physical-share` 的 input/result 都变成单 use 时，若到唯一
+conversion 的同 block 区间没有写入或未知 effect，允许移除这条已无共享用途的边界，
+继续按原有 typed index/layout 合同 backward rematerialization。作者 materialization、
+多 use supply、跨 block、跨写入和 final resource closure 后的情形不适用。
+
 ### `LowerRISCVComposites`
 
 把 source-level physical composites 改写为终端前的真实程序结构：
