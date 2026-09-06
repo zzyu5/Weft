@@ -36,8 +36,6 @@ if [[ ${format} != f32 && ${format_id} -lt 0 ]]; then
 fi
 if [[ ${format} == q4_k && ${phase} == prefill ]]; then
   format=q4_k_staged
-elif [[ ${format} == iq2_xxs && ${phase} == prefill ]]; then
-  format=iq2_xxs_staged
 elif [[ ${format} == iq2_xs && ${phase} == prefill ]]; then
   format=iq2_xs_staged
 elif [[ ${format} == iq2_s && ${phase} == prefill ]]; then
