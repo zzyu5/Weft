@@ -21,6 +21,13 @@ knowledge:
   # 项目知识 Provider。
   # 可选值：local | remote
   provider: local
+  # 直接检索少量权威文档，不另建知识总纲或索引历史报告。
+  local:
+    include:
+      - doc/index.md
+      - doc/compiler/index.md
+      - doc/compiler/optimization-principles.md
+      - doc/experiments/index.md
 # Native 工作流配置，不会改变 Classic 的状态或行为。
 native:
   # Native 规格和 change 的存放根目录；运行时数据始终位于 .comet。
