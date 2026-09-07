@@ -18,8 +18,11 @@ __pycache__/
 
 # Local parallel worktrees
 /.worktrees/
-# >>> Comet managed project state >>>
-!/.comet/
-/.comet/*
-!/.comet/config.yaml
-# <<< Comet managed project state <<<
+
+# Local Comet tooling and workflow artifacts
+/.comet/
+/.agents/skills/comet/
+/.agents/skills/comet-*/
+/.codex/hooks.json
+/.codex/rules/comet-workflow-guard.md
+/docs/comet/
