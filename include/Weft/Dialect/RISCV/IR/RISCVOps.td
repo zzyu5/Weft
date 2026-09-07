@@ -1452,6 +1452,15 @@ def WeftRISCV_RVVWidenScalarMultiplyOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVMultiplyHighScalarOp
+    : WeftRISCV_Op<"rvv_multiply_high_scalar", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$lhs,
+                       AnyType:$rhs,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVRegularRepeatIndexOp
     : WeftRISCV_Op<"rvv_regular_repeat_index", [Pure]> {
   let arguments = (ins I64Attr:$reduction_axis,

@@ -799,6 +799,8 @@ private:
   compileRVVWidenMultiply(riscv::RVVWidenMultiplyOp operation);
   mlir::LogicalResult compileRVVWidenScalarMultiply(
       riscv::RVVWidenScalarMultiplyOp operation);
+  mlir::LogicalResult compileRVVMultiplyHighScalar(
+      riscv::RVVMultiplyHighScalarOp operation);
   mlir::LogicalResult compileRVVRegularRepeatIndex(
       riscv::RVVRegularRepeatIndexOp operation);
   mlir::LogicalResult compileRVVRegularRepeatGather(
@@ -2580,6 +2582,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto multiply =
           mlir::dyn_cast<riscv::RVVWidenScalarMultiplyOp>(operation))
     return compileRVVWidenScalarMultiply(multiply);
+  if (auto multiply =
+          mlir::dyn_cast<riscv::RVVMultiplyHighScalarOp>(operation))
+    return compileRVVMultiplyHighScalar(multiply);
   if (auto index =
           mlir::dyn_cast<riscv::RVVRegularRepeatIndexOp>(operation))
     return compileRVVRegularRepeatIndex(index);
@@ -9624,6 +9629,35 @@ mlir::LogicalResult Emitter::compileRVVWidenScalarMultiply(
     std::string name = fresh("widen_scalar_multiply");
     line(vectorType(operation.getResult()) + " " + name + " = " + expression +
          ";");
+    result.parts.push_back(std::move(name));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVMultiplyHighScalar(
+    riscv::RVVMultiplyHighScalarOp operation) {
+  auto lhs = materializeNumeric(operation.getLhs(),
+                                bindings.lookup(operation.getLhs()));
+  auto rhs = materializeNumeric(operation.getRhs(),
+                                bindings.lookup(operation.getRhs()));
+  if (mlir::failed(lhs) || mlir::failed(rhs) ||
+      lhs->kind != Binding::Kind::Vector || rhs->kind != Binding::Kind::Scalar ||
+      instructionOf(operation.getOperation()) != "rvv.vmulhu.vx")
+    return fail(operation,
+                "RVV multiply-high requires its selected vector-scalar leaf");
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto source = mappedPart(operation.getOperation(), 0, part);
+    if (!source || *source >= lhs->parts.size())
+      return fail(operation,
+                  "RVV multiply-high has no closed operand-part mapping");
+    std::string name = fresh("multiply_high");
+    line(vectorType(operation.getResult()) + " " + name +
+         " = __riscv_vmulhu_vx_" + vectorSuffix(operation.getResult()) + "(" +
+         lhs->parts[*source] + ", " + rhs->scalar + ", " +
+         partVL(operation.getResult(), part) + ");");
     result.parts.push_back(std::move(name));
   }
   bindings[operation.getResult()] = std::move(result);

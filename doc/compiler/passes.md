@@ -362,6 +362,12 @@ physical op集合，不为同一个operation重复选择instruction。
 producer，仅穿过整数常量、整数转换、纯布局转换、splat/broadcast 和整数乘零，
 不把浮点恒等式或轴消除混入该规则。失去用途的广播链由后续同一条 CSE/dead-layout 主链清理。
 
+已选 unsigned widening vector-scalar multiply 的结果若只被同宽右移消费，右移量是
+输入 SEW 的直接整数常量，且右移也只被非饱和、rtz narrow 消费，narrow 的完整结果 type
+恰好恢复原 vector type，则三步选择为单个 `rvv_multiply_high_scalar`。匹配只检查这条
+固定 use-def 链；u8/u16 的 doubled-width unsigned product 不溢出，前置 wrap、后续
+累加/归约与全部 axes 不变。emitter 只拼写该已选 leaf，资源由原有收尾重新核算。
+
 ### `SelectRISCVScalarLoadPrimes`
 
 该pass消费已经实例化的boolean physical parameter，并且只在`FinalizeRISCVLeaves`之后运行。

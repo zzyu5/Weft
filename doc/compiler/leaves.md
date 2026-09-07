@@ -29,6 +29,13 @@ kernel local-storage上界；不能只在terminal translator中出现。
 一对一RVV operation由leaf固定 intrinsic family，value type固定SEW/LMUL/`vl`/register parts，
 access或conversion固定operand form。terminal lowering只把这些事实投影为Clang RVV spelling。
 
+`rvv_multiply_high_scalar` 表示无符号 u8/u16 vector 与同宽 scalar 乘积的高半部分，
+结果完整 type 必须等于 vector 输入，leaf 固定为 `rvv.vmulhu.vx`。它没有 rounding、
+saturation、outer loop 或私有 scratch；active lanes 与全部 time/replica parts 仍由输入
+layout 确定。数值语义为 `floor(unsigned_product / 2^SEW)`，遵守
+[RVV 单宽整数乘法合同](https://docs.riscv.org/reference/isa/unpriv/v-st-ext)。
+它是独立的 selected local op，不扩大普通 BinaryOp，也不授权 scalar fallback。
+
 grouped MAC、encoded dot和contract step允许作为closed sequence：reduction loop已经在IR中，
 window type固定slots/terms/result parts，access固定storage geometry，step leaf固定widen/MAC
 sequence。改变group、unroll、lane operand或memory form会产生另一份physical op，而不是

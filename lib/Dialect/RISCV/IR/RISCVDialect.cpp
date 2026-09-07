@@ -6628,6 +6628,25 @@ mlir::LogicalResult RVVWidenScalarMultiplyOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult RVVMultiplyHighScalarOp::verify() {
+  auto lhs = getLhs().getType();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel || !element || !element.isUnsigned() ||
+      (element.getWidth() != 8 && element.getWidth() != 16) ||
+      getRhs().getType() != element || getResult().getType() != lhs ||
+      lhs.getLayout().getCarrier() != "rvv" ||
+      lhs.getLayout().getSew() != element.getWidth() ||
+      !kernel.getTarget().getHasRVV() ||
+      !supportsRVVLayout(kernel.getTarget(), lhs.getLayout()) ||
+      !exactLeaf(getLeaf(), "rvv", "multiply-high-scalar", "rvv.vmulhu.vx",
+                 "none", "exact"))
+    return emitOpError(
+        "RVV unsigned multiply-high requires matching u8/u16 vector and scalar "
+        "operands and an unchanged result layout");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVRegularRepeatIndexOp::verify() {
   if (getReductionAxis() <= 0 || getRepeat() <= 0 || getResults().empty() ||
       getPartBases().size() != getResults().size())

@@ -71,6 +71,55 @@ void foldIntegerIdentities(mlir::ModuleOp module) {
   });
 }
 
+void selectUnsignedMultiplyHigh(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  llvm::SmallVector<riscv::NarrowOp> candidates;
+  module.walk([&](riscv::NarrowOp op) { candidates.push_back(op); });
+  for (auto narrow : candidates) {
+    auto kernel = narrow->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() || narrow.getSaturate() ||
+        narrow.getRounding() != "rtz")
+      continue;
+    auto shift = narrow.getInput().getDefiningOp<riscv::BinaryOp>();
+    if (!shift || shift.getKind() != "shr" ||
+        !shift.getResult().hasOneUse())
+      continue;
+    auto multiply =
+        shift.getLhs().getDefiningOp<riscv::RVVWidenScalarMultiplyOp>();
+    if (!multiply || !multiply.getResult().hasOneUse())
+      continue;
+    auto input = multiply.getLhs().getType();
+    auto element = mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
+    mlir::Attribute amount;
+    if (auto constant = shift.getRhs().getDefiningOp<riscv::ConstantOp>())
+      amount = constant.getValue();
+    if (auto constant = shift.getRhs().getDefiningOp<mlir::arith::ConstantOp>())
+      amount = constant.getValue();
+    auto bits = mlir::dyn_cast_or_null<mlir::IntegerAttr>(amount);
+    if (!element || !element.isUnsigned() ||
+        (element.getWidth() != 8 && element.getWidth() != 16) ||
+        narrow.getResult().getType() != input ||
+        shift.getResult().getType() != multiply.getResult().getType() ||
+        multiply.getLeaf().getInstruction() != "rvv.vwmulu.vx" ||
+        !bits || bits.getValue().getLimitedValue() != element.getWidth())
+      continue;
+    // The doubled-width unsigned product cannot overflow; taking its upper
+    // half needs neither rounding nor saturation. The preceding byte wrap,
+    // every logical axis, and every later accumulation remain unchanged.
+    rewriter.setInsertionPoint(narrow);
+    auto high = rewriter.create<riscv::RVVMultiplyHighScalarOp>(
+        narrow.getLoc(), input, multiply.getLhs(), multiply.getRhs(),
+        riscv_internal::leaf(
+            rewriter, "rvv", "multiply-high-scalar", "rvv.vmulhu.vx",
+            "rvv.vmulhu.vx", input.getLayout().getRegisterGroups(),
+            input.getLayout().getRegisterGroups()));
+    riscv_internal::copyOrigin(narrow, high);
+    rewriter.replaceOp(narrow, high.getResult());
+    rewriter.eraseOp(shift);
+    rewriter.eraseOp(multiply);
+  }
+}
+
 class FinalizeRISCVLeavesPass
     : public mlir::PassWrapper<FinalizeRISCVLeavesPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -84,6 +133,7 @@ public:
 
   void runOnOperation() override {
     foldIntegerIdentities(getOperation());
+    selectUnsignedMultiplyHigh(getOperation());
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {
