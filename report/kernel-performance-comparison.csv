@@ -21,7 +21,7 @@ mul_mat_q2_k,SG2044,decode,7.734432,9.337415,0.828327,targeted-rerun
 iq4_nl_q8_0,K1/X60,decode,2.375253,2.821807,0.841749,targeted-rerun
 mul_mat_iq4_nl,K1/X60,decode,2.372110,2.762856,0.858572,targeted-rerun
 mul_mat_iq2_xxs,K1/X60,prefill,1.479605,1.705121,0.867742,targeted-rerun
-mul_mat_iq1_m,SG2044,prefill,2.286510,2.634283,0.867982,targeted-rerun
+mul_mat_iq1_m,SG2044,prefill,2.289016,2.634283,0.868933,targeted-rerun
 q4_k_q8_k,SG2044,decode,8.950387,10.143147,0.882407,targeted-rerun
 mul_mat_q6_k,K1/X60,prefill,2.243279,2.506236,0.895079,targeted-rerun
 mul_mat_q4_1,K1/X60,prefill,1.969616,2.159644,0.912010,targeted-rerun
