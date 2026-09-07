@@ -586,6 +586,10 @@ public:
 
 } // namespace
 
+int64_t weft::riscv_internal::physicalRegisterPressure(riscv::KernelOp kernel) {
+  return analyzeBlock(kernel.getBody().front()).total();
+}
+
 std::unique_ptr<mlir::Pass> weft::createMaterializeRISCVResourcesPass() {
   return std::make_unique<MaterializeRISCVResourcesPass>();
 }

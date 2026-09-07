@@ -4,6 +4,8 @@
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -13,6 +15,61 @@
 using namespace weft;
 
 namespace {
+
+bool isIntegerZero(mlir::Value value, unsigned &remaining) {
+  if (!remaining ||
+      !mlir::isa<mlir::IntegerType>(
+          riscv_internal::logicalElement(value.getType())))
+    return false;
+  --remaining;
+  mlir::Attribute attribute;
+  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
+    attribute = constant.getValue();
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+    attribute = constant.getValue();
+  if (auto integer = mlir::dyn_cast_or_null<mlir::IntegerAttr>(attribute))
+    return integer.getValue().isZero();
+  auto *producer = value.getDefiningOp();
+  if (!producer)
+    return false;
+  if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(producer))
+    return conversion.getConversion().getEffect() == "pure" &&
+           isIntegerZero(conversion.getInput(), remaining);
+  if (mlir::isa<riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
+                riscv::RVVSplatOp, riscv::RVVAxisBroadcastOp>(producer))
+    return isIntegerZero(producer->getOperand(0), remaining);
+  if (auto binary = mlir::dyn_cast<riscv::BinaryOp>(producer))
+    if (binary.getKind() == "mul")
+      return isIntegerZero(binary.getLhs(), remaining) ||
+             isIntegerZero(binary.getRhs(), remaining);
+  return false;
+}
+
+void foldIntegerIdentities(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  module.walk([&](riscv::BinaryOp operation) {
+    auto kernel = operation->getParentOfType<riscv::KernelOp>();
+    auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        !result || result.getLayout().getCarrier() != "rvv" ||
+        (operation.getKind() != "add" && operation.getKind() != "sub"))
+      return;
+    auto tryIdentity = [&](mlir::Value input, mlir::Value zero) {
+      // Equality includes all axes, validity, and carrier factors. Removing an
+      // integer identity must not silently remove an author's broadcast axis.
+      unsigned remaining = 32;
+      if (input.getType() != operation.getResult().getType() ||
+          !isIntegerZero(zero, remaining))
+        return false;
+      rewriter.replaceOp(operation, input);
+      return true;
+    };
+    if (tryIdentity(operation.getLhs(), operation.getRhs()))
+      return;
+    if (operation.getKind() == "add")
+      tryIdentity(operation.getRhs(), operation.getLhs());
+  });
+}
 
 class FinalizeRISCVLeavesPass
     : public mlir::PassWrapper<FinalizeRISCVLeavesPass,
@@ -26,6 +83,7 @@ public:
   }
 
   void runOnOperation() override {
+    foldIntegerIdentities(getOperation());
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {

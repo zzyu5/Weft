@@ -41,6 +41,7 @@ ConvertWeftToRISCV
 → MaterializeRISCVReadSnapshots
 → CloseRISCVLeafResources
 → CSE
+→ FuseRISCVPhysicalIssueLoops
 → EliminateDeadRISCVLayouts
 → MaterializeRISCVResources
 → EliminateDeadRISCVLayouts
@@ -350,6 +351,11 @@ reduce、state transfer等仍未闭合的 operation写入 exact instruction/spel
 创建时已有自己的exact leaf；本pass只终结仍保留generic operation的那一组。两者作用于互斥的
 physical op集合，不为同一个operation重复选择instruction。
 
+在资源闭合前，整数 RVV pointwise 的 `x+0`、`0+x`、`x-0` 可直接复用输入；
+输入与结果的完整 type（含 axes、validity、layout）必须一致。零值证明最多访问 32 个
+producer，仅穿过整数常量、整数转换、纯布局转换、splat/broadcast 和整数乘零，
+不把浮点恒等式或轴消除混入该规则。失去用途的广播链由后续同一条 CSE/dead-layout 主链清理。
+
 ### `SelectRISCVScalarLoadPrimes`
 
 该pass消费已经实例化的boolean physical parameter，并且只在`FinalizeRISCVLeaves`之后运行。
@@ -384,6 +390,21 @@ copy leaf 在 target 合法的 m1/m2/m4 中按精确 transfer 次数与 scratch 
 kernel 的 final resource marker，不改变 leaf instruction、临时资源或表示。随后 CSE 与
 dead-layout 清理可合并仅因旧资源字段不同而未合并的相同纯供应；真实 SSA live set、spill
 和峰值仍在 `MaterializeRISCVResources` 中重新核算，不能在清理后复用旧统计。
+
+### `FuseRISCVPhysicalIssueLoops`
+
+仅消费 nested partial materializer 写在生成的 `scf.for` 上的 `weft.riscv.issue_window`
+（axis、extent），不从作者循环或名称猜测 issue。候选必须具有相同边界、步长与属性，
+两个平坦 body 只含纯操作或 Read effect；第二个循环的初值和外部 operand 必须支配第一个
+循环，循环之间不能跨越副作用。每次只合并两个遍历，每个 kernel 最多检查 32 对候选；
+合并结果不再参与扩大合并，候选标记在 pass 结束时消费掉。
+
+候选副本先 CSE，再按 SSA 读取前沿安排独立消费者，避免机械展开后的共享供应跨越后续
+issue 才被消费；每条原有累加依赖保持不变。仅当实际静态 Read 数减少、且原有
+region-aware 资源分析的峰值不超过 target 寄存器预算时接受。候选数、共享 Read 数、
+资源拒绝数与最大已选峰值写入候选诊断，并接入 pass statistics。这个估计不代替 effect/数值/type
+合法性，也不保证 intrinsic C 后的 LLVM 寄存器分配没有 spill；有限物理绑定仍由 kernel
+旁的配置提供并通过真实运行选择。最终资源 pass 重新核算实际选择的 Physical graph。
 
 ### `MaterializeRISCVResources`
 

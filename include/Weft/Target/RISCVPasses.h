@@ -36,6 +36,7 @@ createSelectRISCVScalarLoadPrimesPass(bool enabled);
 std::unique_ptr<mlir::Pass> createMaterializeRISCVReadSnapshotsPass();
 std::unique_ptr<mlir::Pass> createMaterializeRISCVResourcesPass();
 std::unique_ptr<mlir::Pass> createCloseRISCVLeafResourcesPass();
+std::unique_ptr<mlir::Pass> createFuseRISCVPhysicalIssueLoopsPass();
 std::unique_ptr<mlir::Pass> createEliminateDeadRISCVLayoutsPass();
 std::unique_ptr<mlir::Pass> createVerifyFinalRISCVPass();
 

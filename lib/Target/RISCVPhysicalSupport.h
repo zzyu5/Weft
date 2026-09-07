@@ -117,6 +117,7 @@ llvm::ArrayRef<int64_t> logicalShape(mlir::Type type);
 llvm::ArrayRef<int64_t> logicalAxes(mlir::Type type);
 unsigned logicalBitWidth(mlir::Type type);
 riscv::LayoutAttr layoutOf(mlir::Type type);
+int64_t physicalRegisterPressure(riscv::KernelOp kernel);
 mlir::Type withLayout(mlir::Type type, riscv::LayoutAttr layout);
 int64_t physicalExtent(mlir::Value value, int64_t axis);
 std::string terminalInstruction(mlir::Operation *operation);

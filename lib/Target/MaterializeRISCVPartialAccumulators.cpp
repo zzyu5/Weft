@@ -5974,6 +5974,8 @@ public:
                     rewriter.getStringAttr("ascending"));
       loop->setAttr("weft.riscv.system_unroll",
                     rewriter.getStringAttr("disable"));
+      loop->setAttr("weft.riscv.issue_window",
+                    rewriter.getDenseI64ArrayAttr({windowAxis, windowExtent}));
       if (nestedPlan.getIssueUnroll() > 1) {
         loop->setAttr("weft.riscv.unroll_factor",
                       rewriter.getI64IntegerAttr(nestedPlan.getIssueUnroll()));

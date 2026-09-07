@@ -31,6 +31,7 @@ void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
   manager.addPass(weft::createMaterializeRISCVReadSnapshotsPass());
   manager.addPass(weft::createCloseRISCVLeafResourcesPass());
   manager.addPass(mlir::createCSEPass());
+  manager.addPass(weft::createFuseRISCVPhysicalIssueLoopsPass());
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
