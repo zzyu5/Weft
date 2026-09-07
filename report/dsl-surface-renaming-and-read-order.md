@@ -122,7 +122,7 @@ partial materializer 的 operation-major 选择、后生成 issue loop 的专用
 
 ## 7. 最终运行结果
 
-完整逐配置记录见 [dsl-surface-entry-replay.csv](dsl-surface-entry-replay.csv)，包含请求、实际 entry、compiler bindings、数值状态、计时、C 对照、重放结果及拒绝原因。正式性能 CSV 和 baseline CSV 未修改。
+逐配置记录包含请求、实际 entry、compiler bindings、数值状态、计时、C 对照、重放结果及拒绝原因。独立 CSV 已按用户要求清理，可从清理前的 Git 历史恢复；本节保留验收范围与关键结果。该轮正式性能 CSV 和 baseline CSV 未修改。
 
 | 范围 | 请求数 | 数值运行、C 同一性与指定重放均通过 | 改名前后相同的拒绝 |
 |---|---:|---:|---:|

@@ -8,11 +8,11 @@
 
 本轮最终证据：
 
-- [逐项运行记录](read-value-physical-closure-runs.csv)：151 项，SG2044 70 项、K1/X60 81 项，保存 source/physical bindings、input policy、数值误差、吞吐、旧值、source 值及本地/远端 artifact 路径。
+- 逐项运行记录：151 项，SG2044 70 项、K1/X60 81 项，保存 source/physical bindings、input policy、数值误差、吞吐、旧值、source 值及本地/远端 artifact 路径。独立 CSV 已按用户要求清理，原文可从清理前的 Git 历史恢复；对应仓库外记录见下列 `verified-final.json`。
 - [性能对照表](kernel-performance-comparison.csv)：只更新这 151 行，其余 51 行保持原值；`weft-kernel-performance.csv` 未修改。
 - `/tmp/weft-closure-regression.cHyRjn/verified-final.json` 与 `final-summary.json`：最终选取的完整运行记录和汇总。
 - `/tmp/weft-closure-regression.cHyRjn/terminal-code-audit.json`：用最终编译器重建 151 份 C，全部成功。最后两份变化的 IQ2_XS decode 已重新实际运行；最终生成 C 与这 151 份实际执行 C 全部逐字节相同，没有用摘要校验替代比较。
-- `/tmp/weft-read-closure.HVGWnF/`：作者树比较、读取顺序 repro、重放、环境与中间失败记录。临时目录不属于持久归档，仓库 CSV 保存运行结果和定位信息。
+- `/tmp/weft-read-closure.HVGWnF/`：作者树比较、读取顺序 repro、重放、环境与中间失败记录。临时目录不属于持久归档，已清理的逐项 CSV 在 Git 历史中保存运行结果和定位信息。
 
 最终 151 项中，147 项按现有 `within-tolerance` policy 通过、4 项 `bit-exact`；29 项有非零浮点误差，不能称为全部零误差。IQ1_M/TQ1_0 本轮最终 standalone、decode、prefill 的记录均为零误差。未放宽 runtime 容差或输入生成 policy。
 
@@ -137,7 +137,7 @@ snapshot copy 使用最多三个合法候选及明确 pair-count 估计，估计
 
 十二项从过线变成低于 source，全部在 SG2044：IQ2_XS standalone/decode，Q2_K prefill，Q3_K standalone，以及 Q5_K、Q4_K、Q2_K、IQ3_XXS、TQ1_0、Q3_K、IQ2_XXS、IQ2_S 的 dequant。接近 1 的比值也如实保留，没有未经重复测量就断言微小变化的因果。
 
-不能把这 30 项全部归因于本轮。与紧邻本轮之前的 [DSL 实际运行记录](dsl-surface-entry-replay.csv) 对照：
+不能把这 30 项全部归因于本轮。与紧邻本轮之前的 DSL 实际运行记录对照如下；独立 CSV 已清理，原文保留在 Git 历史中，[DSL 报告](dsl-surface-renaming-and-read-order.md)保留验收范围：
 
 - SG Q4_K dequant 此前已经是 443.208491，本轮 443.732709；旧对照表 710.758518 没有反映这个已存在差距。
 - K1 Q6_K decode 此前为 2.455462，本轮 2.446343，旧表为 3.122822，同样不是本轮才出现的全部差距。
