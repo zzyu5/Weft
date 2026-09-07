@@ -4272,6 +4272,33 @@ mlir::LogicalResult LookupOp::verify() {
   return verifyLeafOperation(*this);
 }
 
+static mlir::LogicalResult verifyByteReadSource(mlir::Operation *operation,
+                                               mlir::Value value) {
+  if (auto memory = mlir::dyn_cast<MemDescType>(value.getType())) {
+    auto encoding = mlir::cast<weft::kernel::EncodingType>(memory.getEncoding());
+    if (encoding.getKind() != "dense" || !canRead(memory.getAccess()) ||
+        memory.getShape().size() != 1 || memory.getStrides()[0] != 1 ||
+        (memory.getStorageBits() != 16 && memory.getStorageBits() != 32))
+      return operation->emitError("byte read requires one contiguous readable word descriptor");
+  } else {
+    auto field = value.getDefiningOp<FieldOp>();
+    auto source = mlir::dyn_cast<ValueType>(value.getType());
+    auto word = source ? mlir::dyn_cast<mlir::IntegerType>(source.getElementType())
+                       : mlir::IntegerType();
+    if (!field || !source || !word || !word.isUnsigned() ||
+        (word.getWidth() != 16 && word.getWidth() != 32) ||
+        source.getShape().size() != 1 || source.getShape()[0] <= 0 ||
+        source.getLayout().getCarrier() != "local" ||
+        source.getLayout().getValidity() != "full" ||
+        field.getAccess().getMapping() != "natural" ||
+        field.getAccess().getBitOffset() % 8 ||
+        field.getAccess().getStorageBits() / word.getWidth() != source.getShape()[0] ||
+        field.getAccess().getStorageBits() % word.getWidth())
+      return operation->emitError("byte read requires one complete byte-aligned natural word field");
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVByteGatherOp::verify() {
   auto offsets = getByteOffsets().getType();
   auto index = mlir::dyn_cast<mlir::IntegerType>(offsets.getElementType());
@@ -4298,34 +4325,56 @@ mlir::LogicalResult RVVByteGatherOp::verify() {
   for (size_t axis = 0; axis < result.getShape().size(); ++axis)
     if (!sameAxisMapping(offsets, axis, result, axis))
       return emitOpError("byte gather must preserve every index-axis mapping");
-  if (auto memory = mlir::dyn_cast<MemDescType>(getSource().getType())) {
-    auto encoding = mlir::cast<weft::kernel::EncodingType>(memory.getEncoding());
-    if (encoding.getKind() != "dense" || !canRead(memory.getAccess()) ||
-        memory.getShape().size() != 1 || memory.getStrides()[0] != 1 ||
-        (memory.getStorageBits() != 16 && memory.getStorageBits() != 32))
-      return emitOpError("byte gather requires one contiguous readable word descriptor");
-  } else {
-    auto field = getSource().getDefiningOp<FieldOp>();
-    auto source = mlir::dyn_cast<ValueType>(getSource().getType());
-    auto word = source ? mlir::dyn_cast<mlir::IntegerType>(source.getElementType())
-                       : mlir::IntegerType();
-    if (!field || !source || !word || !word.isUnsigned() ||
-        (word.getWidth() != 16 && word.getWidth() != 32) ||
-        source.getShape().size() != 1 || source.getShape()[0] <= 0 ||
-        source.getLayout().getCarrier() != "local" ||
-        source.getLayout().getValidity() != "full" ||
-        field.getAccess().getMapping() != "natural" ||
-        field.getAccess().getBitOffset() % 8 ||
-        field.getAccess().getStorageBits() / word.getWidth() != source.getShape()[0] ||
-        field.getAccess().getStorageBits() % word.getWidth())
-      return emitOpError("byte gather requires one complete byte-aligned natural word field");
-  }
+  if (mlir::failed(verifyByteReadSource(*this, getSource())))
+    return mlir::failure();
   if (getAccess().getForm() != "indexed" ||
       getAccess().getMapping() != "natural" ||
       getAccess().getIndexSEW() != index.getWidth() ||
       getAccess().getAlignment() != 1 ||
       !exactLeaf(getLeaf(), "rvv", "byte-gather", "rvv.byte-gather", "none", "exact"))
     return emitOpError("byte gather requires its exact indexed byte leaf");
+  return verifyLeafOperation(*this);
+}
+
+mlir::LogicalResult RVVByteWindowsLoadOp::verify() {
+  if (mlir::failed(verifyByteReadSource(*this, getSource())))
+    return mlir::failure();
+  auto base = mlir::dyn_cast<mlir::IntegerType>(getByteBase().getType());
+  auto result = getResult().getType();
+  auto layout = result.getLayout();
+  auto byte = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto offsets = getWindowOffsets();
+  const int64_t width = getWindowBytesAttr().getInt();
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  if (!base || !base.isUnsigned() ||
+      (base.getWidth() != 16 && base.getWidth() != 32) ||
+      !byte || !byte.isUnsigned() || byte.getWidth() != 8 || !kernel ||
+      !kernel.getTarget().getHasRVV() ||
+      !supportsRVVLayout(kernel.getTarget(), layout) ||
+      layout.getCarrier() != "rvv" || layout.getValidity() != "full" ||
+      !llvm::equal(result.getShape().asArrayRef(), layout.getLaneFactors().asArrayRef()))
+    return emitOpError("byte windows require a scalar unsigned base and one full RVV byte carrier");
+  for (auto factors : {layout.getTimeFactors(), layout.getReplicaFactors(),
+                       layout.getFragmentFactors(), layout.getLocalFactors()})
+    if (llvm::any_of(factors.asArrayRef(), [](int64_t factor) { return factor != 1; }))
+      return emitOpError("byte windows cannot own traversal, replicas, fragments, or local storage");
+  const int64_t domain = int64_t{1} << base.getWidth();
+  if (offsets.empty() || offsets.size() > 4 || offsets.front() != 0 ||
+      width <= 0 || width > domain || (width & (width - 1)) ||
+      static_cast<int64_t>(offsets.size()) * width != layout.getVl())
+    return emitOpError("byte windows require one to four complete power-of-two windows");
+  int64_t end = 0;
+  for (int64_t offset : offsets) {
+    if (offset < end || offset % width || offset > domain - width)
+      return emitOpError("byte windows must be ordered, disjoint, and word-domain aligned");
+    end = offset + width;
+  }
+  const int64_t temporary = offsets.size() == 1 ? 0 : layout.getRegisterGroups();
+  if (getAccess().getForm() != "unit" || getAccess().getMapping() != "natural" ||
+      getAccess().getAlignment() != 1 || getAccess().getIndexSEW() != 0 ||
+      !exactLeaf(getLeaf(), "rvv", "byte-windows-load", "rvv.byte-windows-pack", "none", "exact") ||
+      getLeaf().getTemporaryGroups() != temporary)
+    return emitOpError("byte windows require exact byte loads and the bounded pack temporary");
   return verifyLeafOperation(*this);
 }
 

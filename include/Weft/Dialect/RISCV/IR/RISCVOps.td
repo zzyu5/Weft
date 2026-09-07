@@ -1149,6 +1149,17 @@ def WeftRISCV_RVVByteGatherOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVByteWindowsLoadOp
+    : WeftRISCV_Op<"rvv_byte_windows_load", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins AnyType:$source, AnyType:$byte_base,
+                       DenseI64ArrayAttr:$window_offsets,
+                       I64Attr:$window_bytes,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVIndexedEntryLoadOp
     : WeftRISCV_Op<"rvv_indexed_entry_load",
                    [MemoryEffects<[MemRead]>]> {

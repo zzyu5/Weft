@@ -769,6 +769,8 @@ private:
   mlir::LogicalResult compileFold2(riscv::Fold2Op operation);
   mlir::LogicalResult compileLookup(riscv::LookupOp operation);
   mlir::LogicalResult compileRVVByteGather(riscv::RVVByteGatherOp operation);
+  mlir::LogicalResult compileRVVByteWindowsLoad(riscv::RVVByteWindowsLoadOp operation);
+  std::optional<std::string> byteReadAddress(mlir::Value value);
   mlir::LogicalResult compileRVVIndexedEntryLoad(
       riscv::RVVIndexedEntryLoadOp operation);
   mlir::LogicalResult compileRVVUnitEntryWindowLoad(
@@ -2673,6 +2675,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileLookup(lookup);
   if (auto byteGather = mlir::dyn_cast<riscv::RVVByteGatherOp>(operation))
     return compileRVVByteGather(byteGather);
+  if (auto windows = mlir::dyn_cast<riscv::RVVByteWindowsLoadOp>(operation))
+    return compileRVVByteWindowsLoad(windows);
   if (auto entryLoad =
           mlir::dyn_cast<riscv::RVVIndexedEntryLoadOp>(operation))
     return compileRVVIndexedEntryLoad(entryLoad);
@@ -5735,10 +5739,8 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
   return mlir::success();
 }
 
-mlir::LogicalResult Emitter::compileRVVByteGather(riscv::RVVByteGatherOp operation) {
-  if (instructionOf(operation) != "rvv.byte-gather")
-    return fail(operation, "byte gather has no selected byte-load instruction");
-  Binding source = bindings.lookup(operation.getSource());
+std::optional<std::string> Emitter::byteReadAddress(mlir::Value value) {
+  Binding source = bindings.lookup(value);
   std::optional<std::string> address;
   if (source.kind == Binding::Kind::Slice) {
     address = denseAddress(source.slice, {});
@@ -5756,6 +5758,13 @@ mlir::LogicalResult Emitter::compileRVVByteGather(riscv::RVVByteGatherOp operati
                   std::to_string(field->bitOffset / 8) + ")";
     }
   }
+  return address;
+}
+
+mlir::LogicalResult Emitter::compileRVVByteGather(riscv::RVVByteGatherOp operation) {
+  if (instructionOf(operation) != "rvv.byte-gather")
+    return fail(operation, "byte gather has no selected byte-load instruction");
+  auto address = byteReadAddress(operation.getSource());
   auto offsets = materializeNumeric(operation.getByteOffsets(),
                                     bindings.lookup(operation.getByteOffsets()));
   if (!address || mlir::failed(offsets) || offsets->kind != Binding::Kind::Vector)
@@ -5775,6 +5784,41 @@ mlir::LogicalResult Emitter::compileRVVByteGather(riscv::RVVByteGatherOp operati
          ", " + partVL(operation.getResult(), part) + ");");
     result.parts.push_back(std::move(value));
   }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVByteWindowsLoad(riscv::RVVByteWindowsLoadOp operation) {
+  if (instructionOf(operation) != "rvv.byte-windows-pack")
+    return fail(operation, "byte windows have no exact load-and-pack instruction");
+  auto address = byteReadAddress(operation.getSource());
+  auto base = materializeNumeric(operation.getByteBase(), bindings.lookup(operation.getByteBase()));
+  auto baseType = scalarCType(operation.getByteBase().getType());
+  if (!address || !baseType || mlir::failed(base) || base->kind != Binding::Kind::Scalar ||
+      vectorPartCount(operation.getResult()) != 1)
+    return fail(operation, "byte windows require their selected scalar base and single RVV result");
+  const std::string type = vectorType(operation.getResult());
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const int64_t width = operation.getWindowBytesAttr().getInt();
+  std::string packed;
+  for (auto [ordinal, offset] : llvm::enumerate(operation.getWindowOffsets())) {
+    std::string loaded = fresh("byte_window");
+    line(type + " " + loaded + " = __riscv_vle8_v_" + suffix +
+         "(((const uint8_t *)(" + *address + ")) + ((" + *baseType + ")(" +
+         base->scalar + " + " + std::to_string(offset) + ")), " + std::to_string(width) + ");");
+    if (ordinal == 0) {
+      packed = std::move(loaded);
+    } else {
+      std::string next = fresh("byte_window_pack");
+      line(type + " " + next + " = __riscv_vslideup_vx_" + suffix + "_tu(" +
+           packed + ", " + loaded + ", " + std::to_string(ordinal * width) +
+           ", " + std::to_string((ordinal + 1) * width) + ");");
+      packed = std::move(next);
+    }
+  }
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  result.parts.push_back(std::move(packed));
   bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }

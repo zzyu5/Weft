@@ -42,6 +42,13 @@ layout 确定。数值语义为 `floor(unsigned_product / 2^SEW)`，遵守
 verifier 核验；leaf 固定为 `rvv.byte-gather`。它只读取所选字节，不在 emitter 中恢复
 word、shift 或 mask。encoded value 的原 load/快照身份仍经 field operand 保留。
 
+`rvv_byte_windows_load` 读取同一 storage 的一至四个连续字节窗口，按显式
+`window_offsets` 顺序拼成一个 full-valid RVV byte value。`byte_base` 是相对 storage 的
+unsigned u16/u32 字节偏移，每个窗口起点的加法保留该宽度的 wrap；`window_bytes` 与 result 的完整 lane 数
+必须闭合。leaf 固定为 `rvv.byte-windows-pack`：逐窗口 `vle8`，后续窗口以 tail-undisturbed
+`vslideup` 拼接，不能增加读取字节、对齐要求或外围遍历。多窗口只保留一个额外载体，
+其完整寄存器组数必须计入 leaf temporary；scalar base 与原 storage/快照身份仍显式存在。
+
 grouped MAC、encoded dot和contract step允许作为closed sequence：reduction loop已经在IR中，
 window type固定slots/terms/result parts，access固定storage geometry，step leaf固定widen/MAC
 sequence。改变group、unroll、lane operand或memory form会产生另一份physical op，而不是

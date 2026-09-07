@@ -2066,6 +2066,151 @@ mlir::IntegerAttr directInteger(mlir::Value value) {
   return {};
 }
 
+bool isSameWidthAffineByteIndex(mlir::Value value, mlir::IntegerType element,
+                                unsigned &remaining, unsigned depth = 0) {
+  if (!remaining || depth > 24 ||
+      riscv_internal::logicalElement(value.getType()) != element)
+    return false;
+  --remaining;
+  if (!mlir::isa<riscv::ValueType>(value.getType()))
+    return true; // An existing scalar value is uniform, including its wrap.
+  if (directInteger(value) || value.getDefiningOp<riscv::IotaOp>())
+    return true;
+  auto *producer = value.getDefiningOp();
+  if (mlir::isa_and_nonnull<riscv::ConvertLayoutOp,
+                            riscv::RVVAxisBroadcastOp>(producer) &&
+      mlir::isMemoryEffectFree(producer))
+    return isSameWidthAffineByteIndex(producer->getOperand(0), element,
+                                      remaining, depth + 1);
+  auto binary = mlir::dyn_cast_or_null<riscv::BinaryOp>(producer);
+  if (!binary || (binary.getKind() != "add" && binary.getKind() != "sub" &&
+                  binary.getKind() != "mul"))
+    return false;
+  if (binary.getKind() == "mul") {
+    auto lhs = directInteger(binary.getLhs());
+    auto rhs = directInteger(binary.getRhs());
+    if ((!lhs || lhs.getInt() <= 0) && (!rhs || rhs.getInt() <= 0))
+      return false;
+  }
+  return isSameWidthAffineByteIndex(binary.getLhs(), element, remaining, depth + 1) &&
+         isSameWidthAffineByteIndex(binary.getRhs(), element, remaining, depth + 1);
+}
+
+bool isAlignedUnsignedByteBase(mlir::Value value, mlir::IntegerType element,
+                               int64_t divisor, unsigned depth = 0) {
+  if (divisor == 1)
+    return true;
+  if (depth > 24 || value.getType() != element)
+    return false;
+  if (auto constant = directInteger(value))
+    return constant.getInt() % divisor == 0;
+  auto binary = value.getDefiningOp<riscv::BinaryOp>();
+  if (!binary || binary.getLhs().getType() != element ||
+      binary.getRhs().getType() != element)
+    return false;
+  auto aligned = [&](mlir::Value operand, int64_t multiple) {
+    return isAlignedUnsignedByteBase(operand, element, multiple, depth + 1);
+  };
+  if (binary.getKind() == "add" || binary.getKind() == "sub")
+    return aligned(binary.getLhs(), divisor) && aligned(binary.getRhs(), divisor);
+  if (binary.getKind() == "mul") {
+    if (auto factor = directInteger(binary.getRhs()))
+      return aligned(binary.getLhs(), divisor / std::gcd(divisor, factor.getInt()));
+    if (auto factor = directInteger(binary.getLhs()))
+      return aligned(binary.getRhs(), divisor / std::gcd(divisor, factor.getInt()));
+  }
+  return false;
+}
+
+mlir::LogicalResult selectByteWindows(mlir::ModuleOp module,
+                                      mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::RVVByteGatherOp> gathers;
+  module.walk([&](riscv::RVVByteGatherOp gather) { gathers.push_back(gather); });
+  for (riscv::RVVByteGatherOp gather : gathers) {
+    auto kernel = gather->getParentOfType<riscv::KernelOp>();
+    auto result = gather.getResult().getType();
+    auto layout = result.getLayout();
+    auto shape = result.getShape().asArrayRef();
+    auto axes = result.getAxisIds().asArrayRef();
+    if (kernel.getResourcesMaterialized() || layout.getValidity() != "full" ||
+        !llvm::equal(shape, layout.getLaneFactors().asArrayRef()))
+      continue;
+    bool singleVector = true;
+    for (auto factors : {layout.getTimeFactors(), layout.getReplicaFactors(),
+                         layout.getFragmentFactors(), layout.getLocalFactors()})
+      singleVector &= llvm::all_of(factors.asArrayRef(),
+                                  [](int64_t factor) { return factor == 1; });
+    if (!singleVector)
+      continue;
+    auto element = mlir::cast<mlir::IntegerType>(
+        gather.getByteOffsets().getType().getElementType());
+    unsigned remaining = 64;
+    if (!isSameWidthAffineByteIndex(gather.getByteOffsets(), element, remaining))
+      continue;
+    auto affine = analyzeReplicaAffineIndex(gather.getByteOffsets());
+    if (!affine || affine->axisCoefficients.size() != axes.size())
+      continue;
+    int64_t width = 1;
+    size_t suffix = shape.size();
+    while (suffix && shape[suffix - 1] > 0 &&
+           affine->axisCoefficients.lookup(axes[suffix - 1]) == width) {
+      if (!checkedScale(width, shape[suffix - 1], width))
+        break;
+      --suffix;
+    }
+    // This relation packs contiguous multi-byte windows, not arbitrary scalar
+    // gathers.  Each added window costs a unit load and at most one slide.
+    if (width < 2 || (width & (width - 1)))
+      continue;
+    auto count = positiveProduct(shape.take_front(suffix));
+    if (!count || *count > 4 || *count * width != layout.getVl())
+      continue;
+    llvm::SmallVector<int64_t> offsets;
+    int64_t end = 0;
+    const int64_t domain = int64_t{1} << element.getWidth();
+    for (int64_t window = 0; window < *count; ++window) {
+      int64_t coordinate = window, offset = 0;
+      bool valid = true;
+      for (size_t position = suffix; position > 0; --position) {
+        const size_t axis = position - 1;
+        int64_t term = 0;
+        valid &= checkedScale(coordinate % shape[axis],
+                              affine->axisCoefficients.lookup(axes[axis]), term) &&
+                 checkedAdd(offset, term, offset);
+        coordinate /= shape[axis];
+      }
+      if (!valid || offset < end || offset % width || offset > domain - width)
+        break;
+      offsets.push_back(offset);
+      end = offset + width;
+    }
+    if (offsets.size() != static_cast<size_t>(*count))
+      continue;
+    rewriter.setInsertionPoint(gather);
+    auto base = materializeScalarAffineComponent(gather.getByteOffsets(), gather, rewriter);
+    if (mlir::failed(base))
+      return gather.emitError("proven affine byte index has no scalar component");
+    if ((*base).getType() != element ||
+        !isAlignedUnsignedByteBase(*base, element, width))
+      continue;
+    // Window starts retain the original unsigned wrap.  Alignment to a
+    // power-of-two width proves that no individual unit load crosses that
+    // integer domain boundary, so exactly the original bytes are read.
+    const int64_t temporary = *count == 1 ? 0 : layout.getRegisterGroups();
+    auto windows = rewriter.create<riscv::RVVByteWindowsLoadOp>(
+        gather.getLoc(), result, gather.getSource(), *base,
+        rewriter.getDenseI64ArrayAttr(offsets), width,
+        makeAccess(rewriter, "unit", "natural", 1),
+        riscv_internal::leaf(rewriter, "rvv", "byte-windows-load",
+                             "rvv.byte-windows-pack", "rvv.byte-windows-pack",
+                             0, layout.getRegisterGroups(), temporary));
+    riscv_internal::copyOrigin(gather, windows);
+    gather.getResult().replaceAllUsesWith(windows.getResult());
+    rewriter.eraseOp(gather);
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult selectByteProjections(mlir::ModuleOp module,
                                          mlir::IRRewriter &rewriter) {
   llvm::SmallVector<mlir::Operation *> roots;
@@ -2394,7 +2539,8 @@ public:
   }
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
-    if (mlir::failed(selectByteProjections(getOperation(), rewriter)))
+    if (mlir::failed(selectByteProjections(getOperation(), rewriter)) ||
+        mlir::failed(selectByteWindows(getOperation(), rewriter)))
       signalPassFailure();
   }
 };

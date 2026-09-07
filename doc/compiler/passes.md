@@ -180,6 +180,16 @@ little-endian、完整的一维 natural storage；dense descriptor 必须连续�
 后的 memory 收尾选择该 RVV leaf，不在较早的 memory planning 提前冻结通用 lookup；scalar consumer 的反向
 rematerialization 必须先完成。
 
+已选 byte gather 的地址若可证明为同宽 unsigned 仿射表达式，连续的 lane 后缀可形成
+多字节窗口。分析最多访问 64 个节点、深度 24；只穿过 pure layout/broadcast 与同宽
+add/sub/常数乘法，不穿过 shaped narrowing 或数据查表。匹配只形成一至四个窗口，
+每个窗口至少两个字节，result 必须是一个完整 RVV carrier；不枚举其它 layout。
+相对 storage 的 `byte_base` 数值与窗口偏移必须是 power-of-two 窗口宽度的倍数，从而
+证明窗口内部不会跨过原 unsigned index 的 wrap 边界；这不提高 storage 地址的对齐要求。
+各窗口起点仍按原位宽计算，原 gather 的字节集合、顺序、
+读取点和 snapshot 关系不变。选择结果及窗口数/宽度/offset 均可直接从 Physical IR 观察；
+它只替换字节读取和地址供应，不改变后续索引值、contraction 或 reduction。
+
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者
 birth；它只冻结一次已选load/decode结果，使后续不同layout consumer共享同一SSA值。
