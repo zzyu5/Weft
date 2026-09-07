@@ -1,8 +1,8 @@
 kernel,target,phase,weft,source,ratio,measurement
-iq2_xxs_q8_k,SG2044,decode,1.995166,4.038334,0.494057,targeted-rerun
-mul_mat_iq2_xxs,SG2044,decode,1.994094,3.980441,0.500973,targeted-rerun
+iq2_xxs_q8_k,SG2044,decode,2.270194,4.038334,0.562161,targeted-rerun
+mul_mat_iq2_xxs,SG2044,decode,2.280217,3.980441,0.572855,targeted-rerun
 mul_mat_tq1_0,SG2044,prefill,4.591138,7.981489,0.575223,targeted-rerun
-mul_mat_iq1_s,SG2044,prefill,3.141983,4.854846,0.647185,targeted-rerun
+mul_mat_iq1_s,SG2044,prefill,3.331304,4.854846,0.686181,targeted-rerun
 mul_mat_iq1_m,K1/X60,decode,1.089734,1.424159,0.765177,targeted-rerun
 iq1_m_q8_k,K1/X60,decode,1.111222,1.435304,0.774207,targeted-rerun
 dequantize_row_iq3_s,SG2044,tensor,261.305373,358.175832,0.729545,targeted-rerun

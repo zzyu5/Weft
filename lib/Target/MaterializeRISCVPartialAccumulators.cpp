@@ -3917,6 +3917,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
   llvm::DenseSet<mlir::Operation *> visited;
   const llvm::StringRef scaleSupply =
       scaleParts && *scaleParts >= 8 &&
+              !scaleSharesLhs && !scaleSharesRhs &&
               supportsScalarReplicaRematerialization(match.scale, visited)
           ? "scalar-rematerialize"
           : "vector-convert";
@@ -6182,7 +6183,20 @@ public:
                 {reductionAxis, partialSlots}));
         riscv_internal::copyOrigin(dot, partialReduced);
         if (!scalarScale) {
+          // Reuse reads and their shared pointwise decode, but not width/layout
+          // conversions. Sharing a widen would prevent use-local scalar
+          // conversion from consuming its narrow source across the product.
           llvm::DenseMap<mlir::Value, mlir::Value> deferredScaleClones;
+          for (auto [source, cloned] : clones) {
+            auto *producer = cloned.getDefiningOp();
+            auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(producer);
+            const bool fieldRead =
+                extract && riscv_internal::sourceField(extract.getInput());
+            if (producer && (fieldRead || mlir::isa<riscv::BinaryOp>(producer) ||
+                             (!mlir::isMemoryEffectFree(producer) &&
+                              mayMoveReadAcross(producer))))
+              deferredScaleClones.try_emplace(source, cloned);
+          }
           auto scale = cloneIssueWindow(
               match->scale, windowAxis, windowExtent, loop.getInductionVar(),
               target, rewriter, deferredScaleClones);

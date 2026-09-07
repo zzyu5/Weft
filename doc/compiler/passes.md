@@ -332,6 +332,12 @@ combine topology 与 resource groups；materializer 再按该 slots 机械展开
 typed scalar carrier 或已终结的 signed-i32 scalar，两者都必须由 verifier 证明为单一
 replica；不能因展开时的 SSA 拼写不同而重选 topology。
 
+nested scale 与 indexed operand 共用具体 field 供应时，planner 保留表示转换路线，
+不能仅因 replica 数较多就选择会重新读取字段的 scalar rematerialization。deferred scale
+的 issue 克隆复用已有 field extract、Read-only supply 及共有 pointwise decode；
+width/layout conversion 仍可在各 use 点重新物化，避免为共享而延长宽载体的 lifetime。
+复用以同一个 SSA source 为键，不以字段名称、格式名称或相似地址猜测等价。
+
 当每个 logical slot 本身跨多个 issue 时，planner还必须冻结 issue operand supply 与完整
 product carrier。materializer先用显式`rvv_widen_multiply/rvv_widen_accumulate`形成每个slot，
 再由`rvv_partial_collect`按SSA operand顺序建立typed slot集合，之后才执行partial reduction与
