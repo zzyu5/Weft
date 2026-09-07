@@ -1,14 +1,14 @@
 kernel,target,phase,weft,source,ratio,measurement
-iq2_xxs_q8_k,SG2044,decode,2.270194,4.038334,0.562161,targeted-rerun
-mul_mat_iq2_xxs,SG2044,decode,2.280217,3.980441,0.572855,targeted-rerun
-mul_mat_tq1_0,SG2044,prefill,9.630630,7.981489,1.206621,targeted-rerun
+iq2_xxs_q8_k,SG2044,decode,2.486963,4.038334,0.615839,targeted-rerun
+mul_mat_iq2_xxs,SG2044,decode,2.490284,3.980441,0.625630,targeted-rerun
+mul_mat_tq1_0,SG2044,prefill,9.997058,7.981489,1.252530,targeted-rerun
 mul_mat_iq1_s,SG2044,prefill,3.331304,4.854846,0.686181,targeted-rerun
 mul_mat_iq1_m,K1/X60,decode,1.089734,1.424159,0.765177,targeted-rerun
 iq1_m_q8_k,K1/X60,decode,1.110642,1.435304,0.773803,targeted-rerun
 dequantize_row_iq3_s,SG2044,tensor,261.305373,358.175832,0.729545,targeted-rerun
-tq1_0_q8_k,SG2044,decode,8.639188,8.123996,1.063416,targeted-rerun
+tq1_0_q8_k,SG2044,decode,8.696933,8.123996,1.070524,targeted-rerun
 iq3_xxs_q8_k,SG2044,decode,2.186950,2.673523,0.818003,targeted-rerun
-mul_mat_tq1_0,SG2044,decode,8.718706,8.015470,1.087735,targeted-rerun
+mul_mat_tq1_0,SG2044,decode,8.752956,8.015470,1.092008,targeted-rerun
 iq1_s_q8_k,K1/X60,decode,2.146736,2.711676,0.791664,targeted-rerun
 iq1_s_q8_k,SG2044,decode,3.914857,4.861243,0.805320,targeted-rerun
 mul_mat_iq1_s,K1/X60,decode,2.152402,2.663380,0.808147,targeted-rerun
@@ -37,7 +37,7 @@ q6_k_q8_k,SG2044,decode,4.719221,4.936994,0.955890,targeted-rerun
 mul_mat_iq4_nl,K1/X60,prefill,2.265862,2.870430,0.789381,targeted-rerun
 q6_k_q8_k,K1/X60,decode,2.455563,2.321293,1.057843,targeted-rerun
 iq4_nl_q8_0,SG2044,decode,6.471515,6.649981,0.973163,full-rerun
-tq1_0_q8_k,K1/X60,decode,4.762901,3.408741,1.397261,targeted-rerun
+tq1_0_q8_k,K1/X60,decode,4.780688,3.408741,1.402479,targeted-rerun
 q4_0_q8_0,SG2044,decode,7.702504,7.562736,1.018481,targeted-rerun
 q3_k_q8_k,SG2044,decode,7.327597,7.489920,0.978328,targeted-rerun
 mul_mat_q1_0,K1/X60,prefill,3.705024,3.785883,0.978642,targeted-rerun
@@ -55,7 +55,7 @@ q4_1_q8_1,SG2044,decode,6.259834,6.279975,0.996793,targeted-rerun
 mul_mat_iq1_s,K1/X60,prefill,2.732845,2.740584,0.997176,targeted-rerun
 q5_1_q8_1,SG2044,decode,4.757137,4.768850,0.997544,targeted-rerun
 dequantize_row_iq1_s,SG2044,tensor,726.445533,727.099121,0.999101,full-rerun
-mul_mat_tq1_0,K1/X60,decode,4.804181,3.338873,1.438863,targeted-rerun
+mul_mat_tq1_0,K1/X60,decode,4.819722,3.338873,1.443518,targeted-rerun
 mul_mat_iq2_xs,SG2044,decode,4.113865,4.091731,1.005409,targeted-rerun
 mul_mat_iq4_nl,SG2044,decode,6.552751,6.514902,1.005810,targeted-rerun
 iq2_xs_q8_k,SG2044,decode,4.067998,4.164948,0.976722,targeted-rerun
@@ -63,7 +63,7 @@ mul_mat_iq2_s,K1/X60,decode,1.456806,1.442920,1.009624,targeted-rerun
 iq2_s_q8_k,K1/X60,decode,1.470329,1.455211,1.010389,targeted-rerun
 quantize_row_q8_1,SG2044,prefill,537.129225,531.554348,1.010488,targeted-rerun
 mul_mat_f32,K1/X60,decode,2.033257,2.011619,1.010757,targeted-rerun
-mul_mat_iq2_xxs,SG2044,prefill,4.161454,4.111831,1.012068,targeted-rerun
+mul_mat_iq2_xxs,SG2044,prefill,4.161487,4.111831,1.012076,targeted-rerun
 mul_mat_q6_k,SG2044,prefill,7.539165,7.443768,1.012816,targeted-rerun
 q1_0_q8_0,SG2044,decode,11.666197,11.448178,1.019044,targeted-rerun
 mxfp4_q8_0,SG2044,decode,6.441955,6.301585,1.022275,targeted-rerun
@@ -82,11 +82,11 @@ dequantize_row_q5_k,SG2044,tensor,413.902137,380.580081,1.087556,targeted-rerun
 dequantize_row_tq2_0,SG2044,tensor,733.096140,673.603336,1.088320,targeted-rerun
 quantize_row_q8_k,K1/X60,prefill,393.633969,361.364495,1.089299,targeted-rerun
 mul_mat_f16,SG2044,prefill,16.497160,15.033602,1.097352,targeted-rerun
-iq2_xxs_q8_k,K1/X60,decode,1.842701,1.677788,1.098292,targeted-rerun
+iq2_xxs_q8_k,K1/X60,decode,1.818306,1.677788,1.083752,targeted-rerun
 dequantize_row_nvfp4,SG2044,tensor,166.822264,151.596170,1.100439,targeted-rerun
 mul_mat_mxfp4,K1/X60,prefill,2.913049,2.629021,1.108036,targeted-rerun
 mul_mat_q4_0,K1/X60,prefill,2.518589,2.265953,1.111492,targeted-rerun
-dequantize_row_tq1_0,SG2044,tensor,746.124269,668.582579,1.115979,targeted-rerun
+dequantize_row_tq1_0,SG2044,tensor,744.615554,668.582579,1.113723,targeted-rerun
 q1_0_q8_0,K1/X60,decode,4.211660,3.772297,1.116471,targeted-rerun
 mul_mat_q6_k,SG2044,decode,5.172008,4.632221,1.116529,targeted-rerun
 mul_mat_q4_1,SG2044,prefill,6.999483,6.264967,1.117242,targeted-rerun
@@ -94,7 +94,7 @@ mul_mat_q3_k,K1/X60,prefill,2.729316,2.442635,1.117365,targeted-rerun
 q4_1_q8_1,K1/X60,decode,2.362929,2.108143,1.120858,targeted-rerun
 mul_mat_q1_0,SG2044,decode,11.654274,10.371659,1.123665,targeted-rerun
 mul_mat_iq1_m,K1/X60,prefill,1.548798,1.446879,1.070441,targeted-rerun
-mul_mat_iq2_xxs,K1/X60,decode,1.881637,1.661424,1.132545,targeted-rerun
+mul_mat_iq2_xxs,K1/X60,decode,1.851995,1.661424,1.114703,targeted-rerun
 mul_mat_q4_1,K1/X60,decode,2.360337,2.084146,1.132520,targeted-rerun
 mul_mat_q1_0,K1/X60,decode,4.217241,3.691932,1.142286,targeted-rerun
 q4_0_q8_0,K1/X60,decode,2.559524,2.229556,1.147997,targeted-rerun
@@ -119,7 +119,7 @@ mul_mat_iq2_xs,K1/X60,decode,2.218244,1.752529,1.265739,targeted-rerun
 mul_mat_q5_0,K1/X60,decode,2.273063,1.794935,1.266376,targeted-rerun
 tq2_0_q8_k,K1/X60,decode,6.259811,4.936389,1.268095,targeted-rerun
 mul_mat_q5_0,K1/X60,prefill,2.375165,1.847937,1.285306,targeted-rerun
-mul_mat_tq1_0,K1/X60,prefill,5.025224,3.458089,1.453179,targeted-rerun
+mul_mat_tq1_0,K1/X60,prefill,5.012705,3.458089,1.449559,targeted-rerun
 quantize_row_q8_1,K1/X60,prefill,374.930825,287.550932,1.303876,targeted-rerun
 mul_mat_tq2_0,K1/X60,prefill,6.519875,4.973980,1.310796,targeted-rerun
 mul_mat_tq2_0,K1/X60,decode,6.285132,4.793486,1.311182,targeted-rerun
@@ -194,7 +194,7 @@ q5_k_q8_k,SG2044,decode,5.056894,1.156774,4.371549,targeted-rerun
 mul_mat_q5_k,SG2044,decode,5.090654,1.154787,4.408306,targeted-rerun
 dequantize_row_q5_1,SG2044,tensor,733.043673,160.592736,4.564613,targeted-rerun
 dequantize_row_mxfp4,SG2044,tensor,738.239495,160.680279,4.594462,targeted-rerun
-dequantize_row_tq1_0,K1/X60,tensor,549.595571,110.428724,4.976926,targeted-rerun
+dequantize_row_tq1_0,K1/X60,tensor,580.976410,110.428724,5.261099,targeted-rerun
 mul_mat_nvfp4,K1/X60,decode,0.945475,0.161658,5.848613,targeted-rerun
 nvfp4_q8_0,K1/X60,decode,0.945144,0.158325,5.969645,targeted-rerun
 mul_mat_nvfp4,K1/X60,prefill,1.049023,0.162006,6.475211,targeted-rerun

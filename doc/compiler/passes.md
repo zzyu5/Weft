@@ -33,6 +33,7 @@ ConvertWeftToRISCV
 → EliminateDeadRISCVLayouts
 → CanonicalizeRISCVLayouts
 → PlanRISCVMemory
+→ SelectRISCVMemoryByteProjections
 → MaterializeRISCVReplicaStorageLoads
 → HoistRISCVLoopInvariants
 → SelectRISCVOperations
@@ -59,6 +60,8 @@ raw-window load 与显式 layer decode。exact leaf
 
 最终 layout 改写前先清理失去消费者的纯 index/conversion 链，避免死路径阻止基于真实
 use 数量的 rematerialization；资源闭合后的清理不能替代这个位置的清理。
+派生节点继承已有 `source_origin`；只有没有来源标签时才从 location 建立初始来源。
+解析 Physical IR 的文件位置不能覆盖作者来源，否则同一程序重放会改变 CSE 的匹配集合。
 
 `weft-compile --emit=riscv-layout-input` 在这次清理与 `CanonicalizeRISCVLayouts`
 之前输出同一层 Physical IR。module 的 `weft.riscv.layout_input` 保存尚未消费的
@@ -160,6 +163,22 @@ indexed-entry 的地址索引若仅由同形、同轴的 unsigned 8/16-bit value
 且完整 byte offset 范围可由 16-bit 表示，可以直接选择 16-bit extension/identity 与
 对应 EEW。必须验证 byte stride、范围、两侧 layout projection 和目标能力；不在一般
 32-bit 算术链末尾追加窄化，也不改变 table/data 的读取宽度或位置。
+
+物理 word read 后只观察一个完整字节时，可以选择 `rvv_byte_gather`。当前匹配 unsigned
+u16/u32 read 的 byte-aligned shift 加 `&255`，或非饱和 `rtz` 的低字节窄化链；shift 的
+byte selector 必须经有界 use-def 与范围证明位于原 word 内。encoded field 必须是
+little-endian、完整的一维 natural storage；dense descriptor 必须连续。word 到最终投影
+的中间链只能有唯一消费者，读取与投影间不能跨 effect，不能把已物化 register table
+改为重新读内存。返回字节以显式 widening 恢复原消费者的类型与 layout，不改变数值图。
+该 widening 也适用上述 indexed-entry 16-bit 地址规则，包括较早 nested-memory pass
+已选中的 entry edge；不为其它 32-bit 解码链追加窄化。
+字节地址中的 unsigned quotient/remainder 可按
+`(base + (x >> k)) * 2^k + (x & (2^k - 1)) = base * 2^k + x`
+合成，当前只处理 2/4-byte word、至多四层 pure axis/layout projection，以及同一 SSA
+或完整 type/start/end 一致的 iota。该等式保持原整数宽度的 wrap 语义，不跨读取边界，
+不使用无界结构比较。`SelectRISCVMemoryByteProjections` 只在最终 layout canonicalization
+后的 memory 收尾选择该 RVV leaf，不在较早的 memory planning 提前冻结通用 lookup；scalar consumer 的反向
+rematerialization 必须先完成。
 
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者

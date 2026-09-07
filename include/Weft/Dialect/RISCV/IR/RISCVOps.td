@@ -1139,6 +1139,16 @@ def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVByteGatherOp
+    : WeftRISCV_Op<"rvv_byte_gather", [MemoryEffects<[MemRead]>]> {
+  let arguments = (ins AnyType:$source,
+                       WeftRISCV_ValueType:$byte_offsets,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVIndexedEntryLoadOp
     : WeftRISCV_Op<"rvv_indexed_entry_load",
                    [MemoryEffects<[MemRead]>]> {

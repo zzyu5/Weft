@@ -768,6 +768,7 @@ private:
   mlir::LogicalResult compileReduce(riscv::ReduceOp operation);
   mlir::LogicalResult compileFold2(riscv::Fold2Op operation);
   mlir::LogicalResult compileLookup(riscv::LookupOp operation);
+  mlir::LogicalResult compileRVVByteGather(riscv::RVVByteGatherOp operation);
   mlir::LogicalResult compileRVVIndexedEntryLoad(
       riscv::RVVIndexedEntryLoadOp operation);
   mlir::LogicalResult compileRVVUnitEntryWindowLoad(
@@ -2670,6 +2671,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
     return compileRVVStreamFinalize(finalize);
   if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(operation))
     return compileLookup(lookup);
+  if (auto byteGather = mlir::dyn_cast<riscv::RVVByteGatherOp>(operation))
+    return compileRVVByteGather(byteGather);
   if (auto entryLoad =
           mlir::dyn_cast<riscv::RVVIndexedEntryLoadOp>(operation))
     return compileRVVIndexedEntryLoad(entryLoad);
@@ -5729,6 +5732,50 @@ mlir::LogicalResult Emitter::compileFold2(riscv::Fold2Op operation) {
     folded.parts.push_back(std::move(sum));
   }
   bindings[operation.getResult()] = std::move(folded);
+  return mlir::success();
+}
+
+mlir::LogicalResult Emitter::compileRVVByteGather(riscv::RVVByteGatherOp operation) {
+  if (instructionOf(operation) != "rvv.byte-gather")
+    return fail(operation, "byte gather has no selected byte-load instruction");
+  Binding source = bindings.lookup(operation.getSource());
+  std::optional<std::string> address;
+  if (source.kind == Binding::Kind::Slice) {
+    address = denseAddress(source.slice, {});
+  } else if (source.kind == Binding::Kind::Memory) {
+    address = source.memory.name;
+  } else if (source.kind == Binding::Kind::Field) {
+    Binding owner = bindings.lookup(source.field.owner);
+    auto field = fieldFor(source);
+    if (field && field->bitOffset % 8 == 0) {
+      if (owner.kind == Binding::Kind::Record)
+        address = "(" + owner.recordPointer + " + " +
+                  std::to_string(field->bitOffset / 8) + ")";
+      else if (owner.kind == Binding::Kind::Memory)
+        address = "(" + owner.memory.name + " + " +
+                  std::to_string(field->bitOffset / 8) + ")";
+    }
+  }
+  auto offsets = materializeNumeric(operation.getByteOffsets(),
+                                    bindings.lookup(operation.getByteOffsets()));
+  if (!address || mlir::failed(offsets) || offsets->kind != Binding::Kind::Vector)
+    return fail(operation, "byte gather requires its selected contiguous storage and RVV offsets");
+  const unsigned width = riscv_internal::logicalBitWidth(
+      operation.getByteOffsets().getType().getElementType());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto indexPart = projectPart(operation.getByteOffsets(), operation.getResult(), part);
+    if (!indexPart || *indexPart >= offsets->parts.size())
+      return fail(operation, "byte gather has no exact index-part projection");
+    std::string value = fresh("byte_gather");
+    line(vectorType(operation.getResult()) + " " + value + " = __riscv_vluxei" +
+         std::to_string(width) + "_v_" + vectorSuffix(operation.getResult()) +
+         "((const uint8_t *)(" + *address + "), " + offsets->parts[*indexPart] +
+         ", " + partVL(operation.getResult(), part) + ");");
+    result.parts.push_back(std::move(value));
+  }
+  bindings[operation.getResult()] = std::move(result);
   return mlir::success();
 }
 

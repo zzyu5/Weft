@@ -4272,6 +4272,63 @@ mlir::LogicalResult LookupOp::verify() {
   return verifyLeafOperation(*this);
 }
 
+mlir::LogicalResult RVVByteGatherOp::verify() {
+  auto offsets = getByteOffsets().getType();
+  auto index = mlir::dyn_cast<mlir::IntegerType>(offsets.getElementType());
+  auto result = getResult().getType();
+  auto byte = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  if (!kernel || !kernel.getTarget().getHasRVV() ||
+      !kernel.getTarget().getHasIndexedMemory() ||
+      !supportsRVVLayout(kernel.getTarget(), offsets.getLayout()) ||
+      !supportsRVVLayout(kernel.getTarget(), result.getLayout()))
+    return emitOpError("byte gather requires supported RVV indexed-memory carriers");
+  if (!index || !index.isUnsigned() ||
+      (index.getWidth() != 16 && index.getWidth() != 32) || !byte ||
+      !byte.isUnsigned() || byte.getWidth() != 8 ||
+      offsets.getShape() != result.getShape() ||
+      offsets.getAxisIds() != result.getAxisIds() ||
+      offsets.getLayout().getCarrier() != "rvv" ||
+      result.getLayout().getCarrier() != "rvv" ||
+      offsets.getLayout().getValidity() != "full" ||
+      result.getLayout().getValidity() != "full" ||
+      !hasLegalRVVIndexedEMUL(offsets.getLayout(), 8,
+                             result.getLayout().getLmulEighths()))
+    return emitOpError("byte gather requires matching full RVV axes and unsigned byte offsets");
+  for (size_t axis = 0; axis < result.getShape().size(); ++axis)
+    if (!sameAxisMapping(offsets, axis, result, axis))
+      return emitOpError("byte gather must preserve every index-axis mapping");
+  if (auto memory = mlir::dyn_cast<MemDescType>(getSource().getType())) {
+    auto encoding = mlir::cast<weft::kernel::EncodingType>(memory.getEncoding());
+    if (encoding.getKind() != "dense" || !canRead(memory.getAccess()) ||
+        memory.getShape().size() != 1 || memory.getStrides()[0] != 1 ||
+        (memory.getStorageBits() != 16 && memory.getStorageBits() != 32))
+      return emitOpError("byte gather requires one contiguous readable word descriptor");
+  } else {
+    auto field = getSource().getDefiningOp<FieldOp>();
+    auto source = mlir::dyn_cast<ValueType>(getSource().getType());
+    auto word = source ? mlir::dyn_cast<mlir::IntegerType>(source.getElementType())
+                       : mlir::IntegerType();
+    if (!field || !source || !word || !word.isUnsigned() ||
+        (word.getWidth() != 16 && word.getWidth() != 32) ||
+        source.getShape().size() != 1 || source.getShape()[0] <= 0 ||
+        source.getLayout().getCarrier() != "local" ||
+        source.getLayout().getValidity() != "full" ||
+        field.getAccess().getMapping() != "natural" ||
+        field.getAccess().getBitOffset() % 8 ||
+        field.getAccess().getStorageBits() / word.getWidth() != source.getShape()[0] ||
+        field.getAccess().getStorageBits() % word.getWidth())
+      return emitOpError("byte gather requires one complete byte-aligned natural word field");
+  }
+  if (getAccess().getForm() != "indexed" ||
+      getAccess().getMapping() != "natural" ||
+      getAccess().getIndexSEW() != index.getWidth() ||
+      getAccess().getAlignment() != 1 ||
+      !exactLeaf(getLeaf(), "rvv", "byte-gather", "rvv.byte-gather", "none", "exact"))
+    return emitOpError("byte gather requires its exact indexed byte leaf");
+  return verifyLeafOperation(*this);
+}
+
 mlir::LogicalResult RVVIndexedEntryLoadOp::verify() {
   mlir::Type offsetType = getEntryOffsets().getType();
   auto offsets = mlir::dyn_cast<ValueType>(offsetType);

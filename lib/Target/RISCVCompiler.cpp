@@ -22,6 +22,7 @@ void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createCanonicalizeRISCVLayoutsPass());
   manager.addPass(weft::createPlanRISCVMemoryPass());
+  manager.addPass(weft::createSelectRISCVMemoryByteProjectionsPass());
   manager.addPass(weft::createMaterializeRISCVReplicaStorageLoadsPass());
   manager.addPass(weft::createHoistRISCVLoopInvariantsPass());
   manager.addPass(weft::createSelectRISCVOperationsPass());

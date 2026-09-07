@@ -2058,6 +2058,347 @@ void materializeCrossLevelEncodedSupplies(mlir::ModuleOp module,
   }
 }
 
+mlir::IntegerAttr directInteger(mlir::Value value) {
+  if (auto constant = value.getDefiningOp<riscv::ConstantOp>())
+    return mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  if (auto constant = value.getDefiningOp<mlir::arith::ConstantOp>())
+    return mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue());
+  return {};
+}
+
+mlir::LogicalResult selectByteProjections(mlir::ModuleOp module,
+                                         mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<mlir::Operation *> roots;
+  module.walk([&](mlir::Operation *operation) {
+    if (auto mask = mlir::dyn_cast<riscv::BinaryOp>(operation)) {
+      auto constant = directInteger(mask.getRhs());
+      if (mask.getKind() == "and" && constant && constant.getInt() == 255)
+        roots.push_back(operation);
+    } else if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(operation)) {
+      if (riscv_internal::logicalElement(narrow.getResult().getType()).isUnsignedInteger(8) &&
+          !narrow.getSaturate() && narrow.getRounding() == "rtz")
+        roots.push_back(operation);
+    }
+  });
+  for (mlir::Operation *root : roots) {
+    auto kernel = root->getParentOfType<riscv::KernelOp>();
+    auto result = mlir::dyn_cast<riscv::ValueType>(root->getResult(0).getType());
+    auto resultElement = result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+                                : mlir::IntegerType();
+    if (!kernel || kernel.getResourcesMaterialized() || !result || !resultElement ||
+        !resultElement.isUnsigned() || result.getLayout().getCarrier() != "rvv" ||
+        result.getLayout().getValidity() != "full")
+      continue;
+    mlir::Value input = root->getOperand(0);
+    llvm::SmallVector<mlir::Operation *> chain;
+    mlir::Value bitShift;
+    if (auto shift = input.getDefiningOp<riscv::BinaryOp>();
+        shift && shift.getKind() == "shr" && input.hasOneUse()) {
+      bitShift = shift.getRhs();
+      chain.push_back(shift);
+      input = shift.getLhs();
+    }
+    for (unsigned depth = 0; depth < 3 && input.hasOneUse(); ++depth) {
+      mlir::Operation *conversion = input.getDefiningOp();
+      if (!mlir::isa_and_nonnull<riscv::WidenOp, riscv::NarrowOp>(conversion))
+        break;
+      if (auto narrow = mlir::dyn_cast<riscv::NarrowOp>(conversion))
+        if (narrow.getSaturate() || narrow.getRounding() != "rtz" ||
+            !riscv_internal::logicalElement(narrow.getResult().getType()).isUnsignedInteger(16))
+          break;
+      auto before = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(conversion->getOperand(0).getType()));
+      auto after = mlir::dyn_cast<mlir::IntegerType>(
+          riscv_internal::logicalElement(input.getType()));
+      if (!before || !after || !before.isUnsigned() || !after.isUnsigned())
+        break;
+      chain.push_back(conversion);
+      input = conversion->getOperand(0);
+    }
+    auto wordType = mlir::dyn_cast<riscv::ValueType>(input.getType());
+    auto word = wordType ? mlir::dyn_cast<mlir::IntegerType>(wordType.getElementType())
+                         : mlir::IntegerType();
+    mlir::Operation *read = input.getDefiningOp();
+    if (!read || !input.hasOneUse() || !word || !word.isUnsigned() ||
+        (word.getWidth() != 16 && word.getWidth() != 32) ||
+        wordType.getShape() != result.getShape() ||
+        wordType.getAxisIds() != result.getAxisIds() || read->getBlock() != root->getBlock())
+      continue;
+    // Shifts after an intervening narrowing may discard bits before the byte
+    // selection.  Only zero-extension chains can move a nonzero byte selector.
+    if (bitShift && llvm::any_of(chain, [](mlir::Operation *operation) {
+          return mlir::isa<riscv::NarrowOp>(operation);
+        }))
+      continue;
+    mlir::Value source, indices;
+    if (auto extract = mlir::dyn_cast<riscv::ExtractOp>(read)) {
+      auto field = extract.getInput().getDefiningOp<riscv::FieldOp>();
+      auto type = extract.getInput().getType();
+      auto facts = field ? riscv_internal::fieldFacts(field) : riscv_internal::FieldFacts();
+      if (!field || type.getShape().size() != 1 || type.getShape()[0] <= 0 ||
+          type.getLayout().getCarrier() != "local" || facts.mapping != "natural" ||
+          facts.bitOffset % 8 || facts.storageBits / word.getWidth() != type.getShape()[0] ||
+          facts.storageBits % word.getWidth() ||
+          extract.getSelectors().size() != 1 || extract.getIndices().size() != 1 ||
+          mlir::cast<mlir::StringAttr>(extract.getSelectors()[0]).getValue() != "gather")
+        continue;
+      auto encoding = mlir::dyn_cast<kernel::EncodingType>(
+          riscv_internal::logicalElement(field.getOwner().getType()));
+      auto declaration = encoding ? riscv_internal::findEncoding(field,
+          riscv_internal::baseEncodingFamily(field, encoding)) : riscv::EncodingDeclOp();
+      if (!declaration || declaration.getByteOrder() != "little")
+        continue;
+      source = extract.getInput();
+      indices = extract.getIndices()[0];
+    } else if (auto lookup = mlir::dyn_cast<riscv::LookupOp>(read)) {
+      auto memory = mlir::dyn_cast<riscv::MemDescType>(lookup.getTable().getType());
+      if (!memory || mlir::cast<kernel::EncodingType>(memory.getEncoding()).getKind() != "dense" ||
+          memory.getShape().size() != 1 || memory.getStrides()[0] != 1 ||
+          memory.getStorageBits() != word.getWidth())
+        continue;
+      source = lookup.getTable();
+      indices = lookup.getIndices();
+    } else {
+      continue;
+    }
+    auto indexType = mlir::dyn_cast<riscv::ValueType>(indices.getType());
+    auto indexElement = indexType ? mlir::dyn_cast<mlir::IntegerType>(indexType.getElementType())
+                                  : mlir::IntegerType();
+    if (!indexElement || !indexElement.isUnsigned() ||
+        (indexElement.getWidth() != 16 && indexElement.getWidth() != 32) ||
+        indexType.getShape() != result.getShape() || indexType.getAxisIds() != result.getAxisIds() ||
+        indexType.getLayout().getCarrier() != "rvv" ||
+        indexType.getLayout().getValidity() != "full")
+      continue;
+    bool ordered = true;
+    for (mlir::Operation *cursor = read->getNextNode(); cursor != root;
+         cursor = cursor->getNextNode()) {
+      if (!cursor || !mlir::isMemoryEffectFree(cursor)) {
+        ordered = false;
+        break;
+      }
+    }
+    if (!ordered)
+      continue;
+
+    mlir::Value byteSelector;
+    int64_t constantByte = 0;
+    llvm::SmallVector<mlir::Operation *> selectorProjections;
+    if (bitShift) {
+      mlir::Value selector = bitShift;
+      for (unsigned depth = 0; depth < 4; ++depth) {
+        auto *operation = selector.getDefiningOp();
+        if (!mlir::isa_and_nonnull<riscv::RVVAxisBroadcastOp, riscv::ConvertLayoutOp>(operation) ||
+            !mlir::isMemoryEffectFree(operation))
+          break;
+        selectorProjections.push_back(operation);
+        selector = operation->getOperand(0);
+      }
+      if (auto constant = directInteger(selector)) {
+        if (constant.getInt() < 0 || constant.getInt() % 8 ||
+            constant.getInt() > static_cast<int64_t>(word.getWidth()) - 8)
+          continue;
+        constantByte = constant.getInt() / 8;
+      } else {
+        auto multiply = selector.getDefiningOp<riscv::BinaryOp>();
+        auto factor = multiply ? directInteger(multiply.getRhs()) : mlir::IntegerAttr();
+        if (!multiply || !factor ||
+            !((multiply.getKind() == "mul" && factor.getInt() == 8) ||
+              (multiply.getKind() == "shl" && factor.getInt() == 3)))
+          continue;
+        byteSelector = multiply.getLhs();
+        auto range = riscv_internal::integerRange(byteSelector);
+        if (byteSelector.getType() != selector.getType() || !range || range->minimum < 0 ||
+            range->maximum >= static_cast<int64_t>(word.getWidth() / 8))
+          continue;
+      }
+    }
+    if (byteSelector && riscv_internal::logicalElement(byteSelector.getType()) != indexElement)
+      continue;
+    auto byteElement = mlir::IntegerType::get(rewriter.getContext(), 8, mlir::IntegerType::Unsigned);
+    auto byteType = riscv::ValueType::get(rewriter.getContext(), byteElement,
+                                         result.getShape(), result.getAxisIds(), result.getLayout());
+    auto layout = riscv_internal::projectLayout(rewriter, byteType, indexType.getLayout(), kernel.getTarget());
+    if (!layout || !riscv::supportsRVVLayout(kernel.getTarget(), layout) ||
+        !kernel.getTarget().getHasIndexedMemory())
+      continue;
+    byteType = mlir::cast<riscv::ValueType>(riscv_internal::withLayout(byteType, layout));
+    // The widening back to the observed value must preserve the original
+    // consumer representation, not silently introduce a repack.
+    auto observedLayout = riscv_internal::projectLayout(rewriter, result, layout, kernel.getTarget());
+    if (!observedLayout || observedLayout != result.getLayout())
+      continue;
+    rewriter.setInsertionPoint(root);
+    auto factor = rewriter.create<riscv::ConstantOp>(root->getLoc(), indexElement,
+        rewriter.getIntegerAttr(indexElement, word.getWidth() / 8));
+    mlir::Value offsets = rewriter.create<riscv::BinaryOp>(root->getLoc(), indexType,
+        indices, factor.getResult(), "mul", riscv_internal::unselectedLeaf(rewriter));
+    riscv_internal::copyOrigin(root, offsets.getDefiningOp());
+    if (byteSelector) {
+      for (mlir::Operation *projection : llvm::reverse(selectorProjections)) {
+        auto *copy = rewriter.clone(*projection);
+        copy->setOperand(0, byteSelector);
+        byteSelector = copy->getResult(0);
+      }
+    } else if (constantByte) {
+      byteSelector = rewriter.create<riscv::ConstantOp>(root->getLoc(), indexElement,
+          rewriter.getIntegerAttr(indexElement, constantByte));
+    }
+    if (byteSelector) {
+      offsets = rewriter.create<riscv::BinaryOp>(root->getLoc(), indexType,
+          offsets, byteSelector, "add", riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(root, offsets.getDefiningOp());
+    }
+    auto gather = rewriter.create<riscv::RVVByteGatherOp>(root->getLoc(), byteType,
+        source, offsets, riscv::AccessAttr::get(rewriter.getContext(),
+            "indexed", "natural", 1, indexElement.getWidth(), 0, 0, 0, 0, 0, 0, 0, 0, "none"),
+        riscv_internal::leaf(rewriter, "rvv", "byte-gather", "rvv.byte-gather", "rvv.byte-gather", 0, 0));
+    riscv_internal::copyOrigin(root, gather);
+    mlir::Value replacement = gather.getResult();
+    if (byteType != result) {
+      auto widen = rewriter.create<riscv::WidenOp>(root->getLoc(), result, replacement,
+          riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(root, widen);
+      replacement = widen.getResult();
+    }
+    root->getResult(0).replaceAllUsesWith(replacement);
+    rewriter.eraseOp(root);
+    for (mlir::Operation *operation : chain)
+      rewriter.eraseOp(operation);
+    rewriter.eraseOp(read);
+  }
+  // Recompose quotient/remainder byte addresses in the same unsigned ring:
+  // ((base + (x >> k)) * 2^k) + (x & (2^k - 1)) = base * 2^k + x.
+  // The two terms may have identical axis broadcasts around them.  Match only
+  // a bounded projection chain and identical SSA/iota coordinates, not a
+  // symbolic search.
+  module.walk([&](riscv::RVVByteGatherOp gather) {
+    if (gather->getParentOfType<riscv::KernelOp>().getResourcesMaterialized())
+      return;
+    auto sum = gather.getByteOffsets().getDefiningOp<riscv::BinaryOp>();
+    auto scale = sum ? sum.getLhs().getDefiningOp<riscv::BinaryOp>() : riscv::BinaryOp();
+    auto factor = scale ? directInteger(scale.getRhs()) : mlir::IntegerAttr();
+    auto words = scale ? scale.getLhs().getDefiningOp<riscv::BinaryOp>() : riscv::BinaryOp();
+    if (!sum || sum.getKind() != "add" || !scale || scale.getKind() != "mul" ||
+        !factor || (factor.getInt() != 2 && factor.getInt() != 4) ||
+        !words || words.getKind() != "add" || !sum.getResult().hasOneUse() ||
+        !scale.getResult().hasOneUse())
+      return;
+    auto peel = [](mlir::Value value, llvm::SmallVectorImpl<mlir::Operation *> &path) {
+      for (unsigned depth = 0; depth < 4; ++depth) {
+        auto *operation = value.getDefiningOp();
+        if (!mlir::isa_and_nonnull<riscv::RVVAxisBroadcastOp, riscv::ConvertLayoutOp>(operation) ||
+            !mlir::isMemoryEffectFree(operation))
+          break;
+        path.push_back(operation);
+        value = operation->getOperand(0);
+      }
+      return value;
+    };
+    llvm::SmallVector<mlir::Operation *> remainderPath;
+    auto remainder = peel(sum.getRhs(), remainderPath).getDefiningOp<riscv::BinaryOp>();
+    auto mask = remainder ? directInteger(remainder.getRhs()) : mlir::IntegerAttr();
+    if (!remainder || remainder.getKind() != "and" || !mask ||
+        mask.getInt() != factor.getInt() - 1)
+      return;
+    for (unsigned side = 0; side != 2; ++side) {
+      llvm::SmallVector<mlir::Operation *> quotientPath;
+      mlir::Value projected = words->getOperand(side);
+      auto quotient = peel(projected, quotientPath).getDefiningOp<riscv::BinaryOp>();
+      auto shift = quotient ? directInteger(quotient.getRhs()) : mlir::IntegerAttr();
+      auto sameCoordinate = [](mlir::Value lhs, mlir::Value rhs) {
+        if (lhs == rhs)
+          return true;
+        auto first = lhs.getDefiningOp<riscv::IotaOp>();
+        auto second = rhs.getDefiningOp<riscv::IotaOp>();
+        return first && second && lhs.getType() == rhs.getType() &&
+               first.getStart() == second.getStart() && first.getEnd() == second.getEnd();
+      };
+      if (!quotient || quotient.getKind() != "shr" || !shift ||
+          shift.getInt() != (factor.getInt() == 2 ? 1 : 2) ||
+          !sameCoordinate(quotient.getLhs(), remainder.getLhs()) ||
+          quotient.getLhs().getType() != quotient.getResult().getType() ||
+          riscv_internal::logicalElement(quotient.getLhs().getType()) !=
+              gather.getByteOffsets().getType().getElementType())
+        continue;
+      rewriter.setInsertionPoint(sum);
+      mlir::Value coordinate = quotient.getLhs();
+      for (mlir::Operation *projection : llvm::reverse(quotientPath)) {
+        auto *copy = rewriter.clone(*projection);
+        copy->setOperand(0, coordinate);
+        coordinate = copy->getResult(0);
+      }
+      mlir::Value base = words->getOperand(1 - side);
+      auto byteBase = rewriter.create<riscv::BinaryOp>(sum.getLoc(), base.getType(),
+          base, scale.getRhs(), "mul", riscv_internal::unselectedLeaf(rewriter));
+      auto recomposed = rewriter.create<riscv::BinaryOp>(sum.getLoc(), sum.getResult().getType(),
+          byteBase.getResult(), coordinate, "add", riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(sum, byteBase);
+      riscv_internal::copyOrigin(sum, recomposed);
+      sum.getResult().replaceAllUsesWith(recomposed.getResult());
+      rewriter.eraseOp(sum);
+      rewriter.eraseOp(scale);
+      if (words.getResult().use_empty())
+        rewriter.eraseOp(words);
+      break;
+    }
+  });
+  // A nested memory pass may have selected entry loads before the word decode
+  // became a byte read.  Reuse the same direct-extension address rule on that
+  // already-selected edge; this never appends a narrowing to a decoded chain.
+  bool failed = false;
+  module.walk([&](riscv::RVVIndexedEntryLoadOp entry) {
+    if (entry->getParentOfType<riscv::KernelOp>().getResourcesMaterialized())
+      return;
+    auto offset = entry.getEntryOffsets().getDefiningOp<riscv::BinaryOp>();
+    auto stride = offset ? directInteger(offset.getRhs()) : mlir::IntegerAttr();
+    auto widen = offset ? offset.getLhs().getDefiningOp<riscv::WidenOp>() : riscv::WidenOp();
+    if (!offset || !stride || !widen ||
+        (offset.getKind() != "shl" && offset.getKind() != "mul") ||
+        !riscv_internal::logicalElement(offset.getResult().getType()).isUnsignedInteger(32))
+      return;
+    const int64_t shift = stride.getInt();
+    if ((offset.getKind() == "shl" && (shift < 0 || shift > 15 ||
+         (int64_t{1} << shift) != entry.getEntryByteStride())) ||
+        (offset.getKind() == "mul" && shift != entry.getEntryByteStride()))
+      return;
+    auto small = mlir::dyn_cast<mlir::IntegerType>(
+        riscv_internal::logicalElement(widen.getInput().getType()));
+    auto range = riscv_internal::integerRange(widen.getResult());
+    if (!small || !small.isUnsigned() || (small.getWidth() != 8 && small.getWidth() != 16) ||
+        !range || range->minimum < 0 || range->maximum >
+            std::numeric_limits<uint16_t>::max() / entry.getEntryByteStride())
+      return;
+    rewriter.setInsertionPoint(entry);
+    auto narrowed = materializeEntryByteOffsets(widen.getResult(), entry.getEntryByteStride(), entry, rewriter);
+    if (mlir::failed(narrowed)) {
+      failed = true;
+      return;
+    }
+    entry.getEntryOffsetsMutable().assign(*narrowed);
+    if (offset.getResult().use_empty())
+      rewriter.eraseOp(offset);
+  });
+  return mlir::failure(failed);
+}
+
+class SelectRISCVMemoryByteProjectionsPass
+    : public mlir::PassWrapper<SelectRISCVMemoryByteProjectionsPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  llvm::StringRef getArgument() const override {
+    return "weft-riscv-select-memory-byte-projections";
+  }
+  llvm::StringRef getDescription() const override {
+    return "Select observed-byte reads after consumer layout rematerialization";
+  }
+  void runOnOperation() override {
+    mlir::IRRewriter rewriter(&getContext());
+    if (mlir::failed(selectByteProjections(getOperation(), rewriter)))
+      signalPassFailure();
+  }
+};
+
 class PlanRISCVMemoryPass
     : public mlir::PassWrapper<PlanRISCVMemoryPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -3686,4 +4027,8 @@ std::unique_ptr<mlir::Pass> weft::createPlanRISCVMemoryPass() {
 
 std::unique_ptr<mlir::Pass> weft::createPlanRISCVNestedMemoryPass() {
   return std::make_unique<PlanRISCVMemoryPass>(true);
+}
+
+std::unique_ptr<mlir::Pass> weft::createSelectRISCVMemoryByteProjectionsPass() {
+  return std::make_unique<SelectRISCVMemoryByteProjectionsPass>();
 }

@@ -16,6 +16,7 @@ std::unique_ptr<mlir::Pass>
 createPropagateRISCVLayoutsPass(int64_t lmulEighths);
 std::unique_ptr<mlir::Pass> createPlanRISCVMemoryPass();
 std::unique_ptr<mlir::Pass> createPlanRISCVNestedMemoryPass();
+std::unique_ptr<mlir::Pass> createSelectRISCVMemoryByteProjectionsPass();
 std::unique_ptr<mlir::Pass> createCanonicalizeRISCVLayoutsPass();
 std::unique_ptr<mlir::Pass> createFuseRISCVBitplanesPass();
 std::unique_ptr<mlir::Pass> createLowerRISCVCompositesPass();

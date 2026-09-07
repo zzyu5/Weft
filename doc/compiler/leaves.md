@@ -36,6 +36,12 @@ layout 确定。数值语义为 `floor(unsigned_product / 2^SEW)`，遵守
 [RVV 单宽整数乘法合同](https://docs.riscv.org/reference/isa/unpriv/v-st-ext)。
 它是独立的 selected local op，不扩大普通 BinaryOp，也不授权 scalar fallback。
 
+`rvv_byte_gather` 从连续 word descriptor 或一个完整、byte-aligned natural word field
+读取指定的原始字节，返回 unsigned u8 RVV value。byte offsets 是显式的 u16/u32 value，
+所有 index/result axes 和 active lanes 必须一致，EEW/EMUL 与 indexed-memory 能力由
+verifier 核验；leaf 固定为 `rvv.byte-gather`。它只读取所选字节，不在 emitter 中恢复
+word、shift 或 mask。encoded value 的原 load/快照身份仍经 field operand 保留。
+
 grouped MAC、encoded dot和contract step允许作为closed sequence：reduction loop已经在IR中，
 window type固定slots/terms/result parts，access固定storage geometry，step leaf固定widen/MAC
 sequence。改变group、unroll、lane operand或memory form会产生另一份physical op，而不是

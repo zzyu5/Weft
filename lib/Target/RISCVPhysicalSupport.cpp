@@ -1715,6 +1715,10 @@ riscv::PhysicalPointOp riscv_internal::originPoint(mlir::Value value,
 
 void riscv_internal::copyOrigin(mlir::Operation *source,
                                 mlir::Operation *target) {
+  if (mlir::Attribute origin = source->getAttr("source_origin")) {
+    target->setAttr("source_origin", origin);
+    return;
+  }
   std::string spelling;
   llvm::raw_string_ostream output(spelling);
   source->getLoc().print(output);
