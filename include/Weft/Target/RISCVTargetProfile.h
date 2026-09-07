@@ -101,6 +101,13 @@ bool parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
                              llvm::StringRef recordAxisPolicy,
                              RISCVTargetProfile &profile, std::string &error);
 
+struct RISCVNativeTarget {
+  RISCVTargetProfile profile;
+  std::vector<int> cpus;
+};
+
+bool queryNativeRISCVTarget(RISCVNativeTarget &target, std::string &error);
+
 } // namespace weft
 
 #endif // WEFT_TARGET_RISCVTARGETPROFILE_H

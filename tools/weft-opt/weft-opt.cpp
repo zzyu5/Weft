@@ -26,6 +26,7 @@ int main(int argc, char **argv) {
   mlir::registerPass(
       []() { return weft::createMaterializeRISCVReadSnapshotsPass(); });
   mlir::registerPass([]() { return weft::createMaterializeRISCVResourcesPass(); });
+  mlir::registerPass([]() { return weft::createCloseRISCVLeafResourcesPass(); });
   mlir::registerPass([]() { return weft::createVerifyFinalRISCVPass(); });
   mlir::DialectRegistry registry;
   registry.insert<weft::kernel::WEFTKernelDialect,

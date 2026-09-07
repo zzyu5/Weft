@@ -12,6 +12,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -26,8 +28,11 @@ llvm::cl::opt<std::string> inputFilename(
 llvm::cl::opt<std::string> outputFilename(
     "o", llvm::cl::desc("Output path"), llvm::cl::init("-"));
 llvm::cl::opt<std::string> emitKind(
-    "emit", llvm::cl::desc("kernel-ir, riscv-layout-input, riscv-ir, or intrinsic-c"),
+    "emit", llvm::cl::desc("kernel-ir, riscv-layout-input, riscv-ir, intrinsic-c, or artifact"),
     llvm::cl::init("riscv-ir"));
+llvm::cl::opt<bool> queryNativeTarget(
+    "query-native-target", llvm::cl::desc("Discover the local RISC-V execution target as JSON"),
+    llvm::cl::init(false));
 llvm::cl::opt<bool> resumeLayoutInput(
     "resume-layout-input",
     llvm::cl::desc("Finalize a parsed pre-resource layout input checkpoint"),
@@ -98,14 +103,82 @@ bool parseMetaBindings(
   return true;
 }
 
+void writeCompilationResult(weft::RISCVCompilationResult &result,
+                            llvm::raw_ostream &output) {
+  if (emitKind == "riscv-ir") {
+    output << result.riscvIR;
+    return;
+  }
+  if (emitKind == "intrinsic-c") {
+    output << result.intrinsicC;
+    return;
+  }
+  llvm::json::Array kernels;
+  for (const auto &kernel : result.kernels) {
+    llvm::json::Array arguments;
+    for (const auto &parameter : kernel.arguments) {
+      llvm::json::Array shape;
+      for (const auto &dimension : parameter.shape)
+        shape.push_back(dimension);
+      arguments.push_back(llvm::json::Object{
+          {"name", parameter.name}, {"c_type", parameter.cType},
+          {"encoding", parameter.encoding}, {"shape", std::move(shape)},
+          {"storage_bytes", parameter.storageBytes},
+          {"record_elements", parameter.recordElements},
+          {"alignment", parameter.alignment}, {"alias_set", parameter.aliasSet},
+          {"writable", parameter.writable}});
+    }
+    llvm::json::Array shapeParameters;
+    for (const auto &symbol : kernel.shapeParameters)
+      shapeParameters.push_back(symbol);
+    llvm::json::Object bindings;
+    for (const auto &[name, value] : kernel.bindings)
+      bindings[name] = value;
+    kernels.push_back(llvm::json::Object{
+        {"symbol", kernel.symbol}, {"march", kernel.march},
+        {"abi", kernel.abi}, {"vlen_bits", kernel.vlenBits},
+        {"arguments", std::move(arguments)},
+        {"shape_parameters", std::move(shapeParameters)},
+        {"bindings", std::move(bindings)}});
+  }
+  llvm::json::Object artifact{
+      {"kind", "weft-riscv-artifact"}, {"riscv_ir", result.riscvIR},
+      {"intrinsic_c", result.intrinsicC}, {"kernels", std::move(kernels)}};
+  output << llvm::formatv("{0:2}", llvm::json::Value(std::move(artifact))) << '\n';
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "Weft RISC-V representation compiler\n");
+  if (queryNativeTarget) {
+    if (inputFilename.getNumOccurrences() || emitKind.getNumOccurrences() ||
+        outputFilename.getNumOccurrences() || march.getNumOccurrences() ||
+        abi.getNumOccurrences() || vlenBits.getNumOccurrences() ||
+        !metaBindings.empty()) {
+      llvm::errs() << "--query-native-target is a standalone discovery operation\n";
+      return 1;
+    }
+    weft::RISCVNativeTarget native;
+    std::string error;
+    if (!weft::queryNativeRISCVTarget(native, error)) {
+      llvm::errs() << error << '\n';
+      return 1;
+    }
+    llvm::json::Array cpus;
+    for (int cpu : native.cpus)
+      cpus.push_back(cpu);
+    llvm::json::Object target{
+        {"march", native.profile.march}, {"abi", native.profile.abi},
+        {"xlen", native.profile.xlen}, {"vlen_bits", native.profile.vlenBits},
+        {"cpus", std::move(cpus)}};
+    llvm::outs() << llvm::formatv("{0:2}", llvm::json::Value(std::move(target))) << '\n';
+    return 0;
+  }
   if (emitKind != "kernel-ir" && emitKind != "riscv-layout-input" &&
       emitKind != "riscv-ir" &&
-      emitKind != "intrinsic-c") {
+      emitKind != "intrinsic-c" && emitKind != "artifact") {
     llvm::errs() << "unsupported --emit value: " << emitKind << "\n";
     return 1;
   }
@@ -133,7 +206,7 @@ int main(int argc, char **argv) {
   });
   if (resumeLayoutInput &&
       (!hasPhysicalProgram ||
-       (emitKind != "riscv-ir" && emitKind != "intrinsic-c") ||
+       (emitKind != "riscv-ir" && emitKind != "intrinsic-c" && emitKind != "artifact") ||
        march.getNumOccurrences() || abi.getNumOccurrences() ||
        vlenBits.getNumOccurrences() || matrixExtension.getNumOccurrences() ||
        maxWideningCombineGroups.getNumOccurrences() ||
@@ -172,8 +245,7 @@ int main(int argc, char **argv) {
                           : weft::translateRISCVModule(*module);
     if (mlir::failed(result))
       return 1;
-    output.os() << (emitKind == "riscv-ir" ? result->riscvIR
-                                           : result->intrinsicC);
+    writeCompilationResult(*result, output.os());
   } else {
     weft::RISCVCompilerOptions options;
     std::string error;
@@ -216,7 +288,7 @@ int main(int argc, char **argv) {
           weft::compileRISCVModule(*module, std::move(options));
       if (mlir::failed(result))
         return 1;
-      output.os() << result->intrinsicC;
+      writeCompilationResult(*result, output.os());
     }
   }
   output.keep();

@@ -22,6 +22,9 @@ system C compiler
 
 ## 2. 两层的 authority
 
+完整 `V` 的 VLEN 必须为 128–65536 bits 范围内的二次幂；CLI profile 与 Physical IR target
+verifier 使用相同的合法域，不能以任意正整数冒充真实 RVV target。
+
 [Canonical Kernel IR](../dsl/canonical-ir.md) 是唯一持久作者程序，保存 logical tree、Level/lifetime、Encoding/ABI、ordinary control 与数值语义。target pass 不能增加 canonical Value、Level、effect、persistent artifact 或算法阶段。
 
 [RISC-V IR](riscv-ir.md) 是一份瞬态、target-aware、可改写的 physical program。layout、conversion、memory form、local object、pipeline、resource handling 和 [RVV/IME leaf](leaves.md) 必须存在于这份程序中，不能只保存在 side record。
@@ -61,3 +64,32 @@ Weft 不采用：
 - final emitter 中的 layout/default/selector/source-closure reconstruction。
 
 未来 target 实现同一非 SIMT 机器合同时，替换第二层 target-aware physical IR，不插入第三层，也不要求另一份 source DSL。
+
+## 6. 原生 runtime 与编译产物
+
+原生入口在 RISC-V Linux 进程中通过 `weft.compile(definition, options=..., toolchain=...)`
+立即编译，或由 `weft.jit(...)` 在首次调用时编译；二者复用同一编译服务与进程内缓存。
+`CompileOptions` 分开保存 source `meta` 和有限 physical bindings，`Toolchain` 明确指定
+Weft/system compiler 及构建 flags。JIT 不发明作者树、physical structure 或跨调用 workspace。
+
+`weft-compile --query-native-target` 在原生进程中取得 Linux 可用 ISA、进程 ABI 和实际
+`vlenb`，并核对允许执行的 CPU 集合具有一致 VLEN。发现的硬件事实在进入 lowering 前成为
+明确 target profile；它不意味着一份二进制自动跨不同 VLEN。不能取得必要事实、向量状态
+不可用或执行 affinity 超出已发现集合时明确失败；每次调用还检查当前线程的向量状态，
+不能用 exec 后编译子进程的状态替代它。标准 ISA 查询不猜测 vendor matrix
+capability；没有相应发现合同的原生 matrix JIT 明确 unsupported。
+
+`--emit=artifact` 返回同一次编译的 Physical IR、C 与 typed kernel ABI；ABI 描述入口、View
+Encoding、逻辑 shape、storage record、alignment、access/alias 及动态 shape 参数顺序。
+这些是编译结果，不是第三层 planning IR，也不参与重选 lowering。原生服务再编译、加载
+shared object，通过该 ABI 调用；同一 kernel 定义、canonical 程序、target、toolchain 与完整
+绑定复用产物，不将不同 Python 定义的调用签名混入同一缓存对象。
+`CompiledKernel.options` 保留绑定，`metadata` 只读；`close()` 释放加载句柄和临时编译文件。
+
+Runtime `Buffer` 借用连续 Python buffer storage；dense buffer 可由其格式和 shape 得到
+Encoding，packed buffer 必须显式提供逻辑 shape 与 Encoding identity。调用检查 storage
+大小、record 完整性、alignment、可写性和已声明 alias 关系，不偷偷复制、repack 或分配
+签名之外的 workspace。动态 extents 按 ABI 输入，不强制每个 shape 产生一份编译产物。
+
+开发机生成 C、目标机编译运行仍是可显式调用的部署方式，与原生入口共用 compiler API；
+它不是原生调用失败后的自动 fallback。原生使用不依赖 SSH 或实验 runner。

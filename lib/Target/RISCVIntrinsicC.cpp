@@ -1,6 +1,7 @@
 #include "RISCVIntrinsicC.h"
 
 #include "RISCVPhysicalSupport.h"
+#include "Weft/Target/RISCVCompiler.h"
 
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
@@ -349,6 +350,77 @@ public:
     line("}");
     line("");
     return mlir::success();
+  }
+
+  mlir::FailureOr<RISCVKernelABI> kernelABI() {
+    RISCVKernelABI result;
+    result.symbol = identifier(kernel.getSymName());
+    result.march = kernel.getTarget().getMarch().str();
+    result.abi = kernel.getTarget().getAbi().str();
+    result.vlenBits = kernel.getTarget().getVlenBits();
+    for (auto [index, argument] :
+         llvm::enumerate(kernel.getBody().front().getArguments())) {
+      auto view = mlir::dyn_cast<riscv::MemDescType>(argument.getType());
+      auto cType = argumentCType(argument);
+      if (!view || !cType) {
+        kernel.emitError("kernel ABI requires a typed memory parameter");
+        return mlir::failure();
+      }
+      auto encoding = mlir::cast<kernel::EncodingType>(view.getEncoding());
+      RISCVArgumentABI parameter;
+      parameter.name = mlir::cast<mlir::StringAttr>(
+          kernel.getArgNames()[index]).getValue().str();
+      parameter.cType = *cType;
+      parameter.encoding = encoding.getLayoutIdentity().str();
+      parameter.aliasSet = kernel.getArgAliasSets()[index];
+      auto access = mlir::cast<mlir::StringAttr>(
+          kernel.getArgAccess()[index]).getValue();
+      parameter.writable = access == "write" || access == "readwrite";
+      for (int64_t extent : view.getShape().asArrayRef()) {
+        if (extent > 0) {
+          parameter.shape.push_back(std::to_string(extent));
+        } else if (extent < 0 &&
+                   extent >= -static_cast<int64_t>(kernel.getShapeSymbols().size())) {
+          parameter.shape.push_back(mlir::cast<mlir::StringAttr>(
+              kernel.getShapeSymbols()[-extent - 1]).getValue().str());
+        } else {
+          kernel.emitError("kernel ABI has an unresolved logical extent");
+          return mlir::failure();
+        }
+      }
+      if (encoding.getKind() == "dense") {
+        auto element = denseElementType(encoding);
+        if (!element || !element->isIntOrFloat()) {
+          kernel.emitError("kernel ABI has an unsupported dense element");
+          return mlir::failure();
+        }
+        parameter.storageBytes = std::max<unsigned>(8, element->getIntOrFloatBitWidth()) / 8;
+        parameter.recordElements = 1;
+        parameter.alignment = parameter.storageBytes;
+      } else {
+        auto base = riscv_internal::baseEncodingFamily(kernel, encoding);
+        auto found = encodings.find(base);
+        if (found == encodings.end() || found->second.storageBits % 8 ||
+            found->second.logicalElements <= 0) {
+          kernel.emitError("kernel ABI has no closed storage record");
+          return mlir::failure();
+        }
+        parameter.storageBytes = found->second.storageBits / 8;
+        parameter.recordElements = found->second.logicalElements;
+        parameter.alignment = found->second.alignment;
+      }
+      result.arguments.push_back(std::move(parameter));
+    }
+    for (mlir::Attribute symbol : kernel.getShapeSymbols()) {
+      auto name = mlir::cast<mlir::StringAttr>(symbol).getValue();
+      if (!autoBindings.contains(name))
+        result.shapeParameters.push_back(name.str());
+    }
+    for (auto [name, value] :
+         llvm::zip(kernel.getParameterNames(), kernel.getParameterValues()))
+      result.bindings.emplace_back(
+          mlir::cast<mlir::StringAttr>(name).getValue().str(), value);
+    return result;
   }
 
 private:
@@ -11345,7 +11417,9 @@ Emitter::compileRVVPartialCollect(riscv::RVVPartialCollectOp operation) {
 
 mlir::LogicalResult
 Emitter::compileRVVPartialRepack(riscv::RVVPartialRepackOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.partial-repack.split")
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.partial-repack.split" &&
+      instruction != "rvv.partial-repack.slice")
     return fail(operation, "RVV partial repack has no exact selected leaf");
   Binding input = bindings.lookup(operation.getInput());
   auto inputType = operation.getInput().getType();
@@ -11363,7 +11437,54 @@ Emitter::compileRVVPartialRepack(riscv::RVVPartialRepackOp operation) {
   const std::string targetType = vectorTypeFor(resultType.getPartialType());
   Binding result;
   result.kind = Binding::Kind::PartialSet;
-  for (llvm::StringRef part : input.parts)
+  if (instruction == "rvv.partial-repack.slice") {
+    auto parameters = operation.getLeaf().getParameters().asArrayRef();
+    if (parameters.size() != 3)
+      return fail(operation, "partial repack slice lacks its selected carrier");
+    const int64_t carrierLMUL = parameters[2];
+    const int64_t sourceLMUL =
+        inputType.getPartialType().getLayout().getLmulEighths();
+    const int64_t targetLMUL =
+        resultType.getPartialType().getLayout().getLmulEighths();
+    const int64_t sew = resultType.getPartialType().getLayout().getSew();
+    const int64_t window = resultType.getPartialType().getLayout().getVl();
+    const int64_t capacity = kernel.getTarget().getVlenBits() * carrierLMUL /
+                             (8 * sew);
+    const std::string carrierSuffix = sourceSuffix.substr(0, 1) +
+        std::to_string(sew) + lmulSpelling(carrierLMUL);
+    const std::string carrierType =
+        std::string(sourceSuffix.front() == 'u' ? "vuint" : "vint") +
+        carrierSuffix.substr(1) + "_t";
+    for (llvm::StringRef part : input.parts) {
+      llvm::DenseMap<int64_t, std::string> groups;
+      for (int64_t chunk = 0; chunk < split; ++chunk) {
+        const int64_t group = chunk * window / capacity;
+        const int64_t offset = chunk * window % capacity;
+        auto [entry, inserted] = groups.try_emplace(group, part.str());
+        if (inserted && sourceLMUL != carrierLMUL) {
+          entry->second = fresh("partial_group");
+          line(carrierType + " " + entry->second + " = __riscv_vget_v_" +
+               sourceSuffix + "_" + carrierSuffix + "(" + part.str() + ", " +
+               std::to_string(group) + ");");
+        }
+        std::string value = entry->second;
+        if (offset != 0) {
+          std::string shifted = fresh("partial_window");
+          line(carrierType + " " + shifted + " = __riscv_vslidedown_vx_" +
+               carrierSuffix + "(" + value + ", " + std::to_string(offset) +
+               ", " + std::to_string(window) + ");");
+          value = std::move(shifted);
+        }
+        if (carrierLMUL != targetLMUL) {
+          std::string narrowed = fresh("partial_slice");
+          line(targetType + " " + narrowed + " = __riscv_vlmul_trunc_v_" +
+               carrierSuffix + "_" + targetSuffix + "(" + value + ");");
+          value = std::move(narrowed);
+        }
+        result.parts.push_back(std::move(value));
+      }
+    }
+  } else for (llvm::StringRef part : input.parts)
     for (int64_t chunk = 0; chunk < split; ++chunk) {
       std::string splitPart = fresh("partial_split");
       line(targetType + " " + splitPart + " = __riscv_vget_v_" +
@@ -13219,7 +13340,8 @@ mlir::LogicalResult Emitter::compileCommit(riscv::StoreOp operation) {
 } // namespace
 
 mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
-                                                      std::string &result) {
+                                                      std::string &result,
+                                                      std::vector<RISCVKernelABI> &kernels) {
   std::string body;
   llvm::raw_string_ostream output(body);
   output << "#include <stddef.h>\n"
@@ -13254,6 +13376,7 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
          << "}\n"
          << "\n";
   bool found = false;
+  kernels.clear();
   for (riscv::ArtifactPackOp artifact :
        module.getOps<riscv::ArtifactPackOp>()) {
     Emitter emitter(module, artifact, output);
@@ -13264,6 +13387,10 @@ mlir::LogicalResult weft::emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
     Emitter emitter(module, kernel, output);
     if (mlir::failed(emitter.emit()))
       return mlir::failure();
+    auto abi = emitter.kernelABI();
+    if (mlir::failed(abi))
+      return mlir::failure();
+    kernels.push_back(std::move(*abi));
     found = true;
   }
   if (!found)

@@ -9,6 +9,8 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
+#include <utility>
 
 namespace weft {
 
@@ -25,9 +27,32 @@ struct RISCVPhysicalizationResult {
   std::string riscvIR;
 };
 
+struct RISCVArgumentABI {
+  std::string name;
+  std::string cType;
+  std::string encoding;
+  std::vector<std::string> shape;
+  int64_t storageBytes = 0;
+  int64_t recordElements = 0;
+  int64_t alignment = 0;
+  int64_t aliasSet = 0;
+  bool writable = false;
+};
+
+struct RISCVKernelABI {
+  std::string symbol;
+  std::string march;
+  std::string abi;
+  int64_t vlenBits = 0;
+  std::vector<RISCVArgumentABI> arguments;
+  std::vector<std::string> shapeParameters;
+  std::vector<std::pair<std::string, int64_t>> bindings;
+};
+
 struct RISCVCompilationResult {
   std::string riscvIR;
   std::string intrinsicC;
+  std::vector<RISCVKernelABI> kernels;
 };
 
 /// Convert one instantiated Canonical Kernel IR candidate into a complete,

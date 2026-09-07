@@ -1,5 +1,6 @@
 add_library(WeftRISCVTarget STATIC
   RISCVTargetProfile.cpp
+  RISCVNativeTarget.cpp
   RISCVPhysicalSupport.cpp
   ConvertWeftToRISCV.cpp
   SelectRISCVOperations.cpp
@@ -37,3 +38,9 @@ target_link_libraries(WeftRISCVTarget PUBLIC
   MLIRSCFTransforms
   MLIRTransforms
 )
+
+if(LLVM_LINK_LLVM_DYLIB)
+  llvm_config(WeftRISCVTarget USE_SHARED TargetParser)
+else()
+  llvm_config(WeftRISCVTarget TargetParser)
+endif()

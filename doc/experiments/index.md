@@ -67,6 +67,11 @@ production `MUL_MAT`、standalone vec-dot、activation quantize和row dequantize
 
 具体correctness、toolchain、machines、timing与CSV合同见[测量协议](protocol.md)。
 
+原生调用 repro 为 `examples/repro/weft/native_jit.py`，通过公开 JIT API 运行现有 dense 与
+encoded source，并检查同绑定复用和不同绑定专门化。它服务于原生调用/ABI 的数值验收，
+不替代上面的 production 性能 case；GGML 仅在 repro 中生成参考输入/输出，不进入 runtime。
+JIT 编译与加载耗时不混入已有 kernel-only timing；需要测冷启动时必须另行声明计时边界。
+
 ## 4. 性能差距的所有权
 
 按顺序判断：

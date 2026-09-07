@@ -29,6 +29,9 @@ void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
   manager.addPass(
       weft::createSelectRISCVScalarLoadPrimesPass(scalarLoadPrime));
   manager.addPass(weft::createMaterializeRISCVReadSnapshotsPass());
+  manager.addPass(weft::createCloseRISCVLeafResourcesPass());
+  manager.addPass(mlir::createCSEPass());
+  manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createMaterializeRISCVResourcesPass());
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());
   manager.addPass(weft::createVerifyFinalRISCVPass());
@@ -154,7 +157,8 @@ weft::completeRISCVLayoutModule(mlir::ModuleOp module) {
     return mlir::failure();
   RISCVCompilationResult result;
   result.riscvIR = printModule(*working);
-  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC,
+                                             result.kernels)))
     return mlir::failure();
   return result;
 }
@@ -166,7 +170,8 @@ weft::compileRISCVModule(mlir::ModuleOp module, RISCVCompilerOptions options) {
     return mlir::failure();
   RISCVCompilationResult result;
   result.riscvIR = printModule(*working);
-  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC,
+                                             result.kernels)))
     return mlir::failure();
   return result;
 }
@@ -181,7 +186,8 @@ weft::translateRISCVModule(mlir::ModuleOp module) {
     return mlir::failure();
   RISCVCompilationResult result;
   result.riscvIR = printModule(*working);
-  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC)))
+  if (mlir::failed(emitSelectedRISCVIntrinsicC(*working, result.intrinsicC,
+                                             result.kernels)))
     return mlir::failure();
   return result;
 }

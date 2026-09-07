@@ -34,7 +34,7 @@ def _function_source(function: FunctionType, noun: str) -> DefinitionSource:
 
 
 class KernelDefinition(Generic[P, R]):
-    """Captured source for one AOT Weft kernel."""
+    """Captured source for one Weft kernel."""
 
     def __init__(
         self,
@@ -78,7 +78,7 @@ class KernelDefinition(Generic[P, R]):
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         raise LanguageUseError(
-            f"kernel {self.__name__} is an AOT Weft DSL kernel and cannot run as Python"
+            f"kernel {self.__name__} is a definition; use weft.jit or weft.compile to execute it"
         )
 
     def __repr__(self) -> str:

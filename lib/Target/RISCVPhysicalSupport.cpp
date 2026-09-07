@@ -306,7 +306,8 @@ riscv_internal::planWidenDotLaneSlices(
   if (reductionLanes <= 0 || *lanes % reductionLanes)
     return std::nullopt;
 
-  auto sliceLmul = riscv::rvvLaneSliceLMULEighths(operand, reductionLanes);
+  auto sliceLmul =
+      riscv::rvvLaneSliceLMULEighths(target, operand, reductionLanes);
   if (!sliceLmul ||
       !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), *sliceLmul))
     return std::nullopt;

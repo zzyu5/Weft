@@ -80,23 +80,56 @@ std::optional<int64_t> weft::riscv::rvvLaneCount(ValueType value) {
 }
 
 std::optional<int64_t>
-weft::riscv::rvvLaneSliceLMULEighths(ValueType source, int64_t sliceLanes) {
+weft::riscv::rvvLaneSliceLMULEighths(TargetAttr target, ValueType source,
+                                   int64_t sliceLanes) {
   auto lanes = rvvLaneCount(source);
   const int64_t sourceLMUL =
       source ? source.getLayout().getLmulEighths() : int64_t{0};
   if (!lanes || *lanes <= 0 || sliceLanes <= 0 || sliceLanes > *lanes ||
-      sourceLMUL <= 0 ||
-      sourceLMUL > std::numeric_limits<int64_t>::max() / sliceLanes)
+      !target || !supportsRVVLayout(target, source.getLayout()))
     return std::nullopt;
-  const int64_t numerator = sourceLMUL * sliceLanes;
-  if (numerator % *lanes)
-    return std::nullopt;
-  int64_t sliceLMUL = numerator / *lanes;
-  if (sliceLMUL <= 0)
-    return std::nullopt;
-  if (sliceLMUL < 8 && sourceLMUL > sliceLMUL)
-    sliceLMUL = std::min<int64_t>(8, sourceLMUL);
+  const int64_t minimum = std::min<int64_t>(8, sourceLMUL);
+  int64_t sliceLMUL = sourceLMUL;
+  while (sliceLMUL > minimum) {
+    const int64_t smaller = sliceLMUL / 2;
+    const int64_t capacity = target.getVlenBits() * smaller /
+                             (8 * source.getLayout().getSew());
+    // Every complete window must stay inside the selected register group.
+    if (capacity < sliceLanes ||
+        (capacity % sliceLanes &&
+         *lanes / sliceLanes * sliceLanes > capacity) ||
+        !llvm::is_contained(target.getLegalLMULEighths().asArrayRef(), smaller))
+      break;
+    sliceLMUL = smaller;
+  }
   return sliceLMUL;
+}
+
+std::optional<int64_t> weft::riscv::rvvPartialRepackCarrierLMULEighths(
+    TargetAttr target, ValueType source, ValueType result, int64_t split) {
+  if (!target || !source || !result || split <= 1 ||
+      !supportsRVVLayout(target, source.getLayout()) ||
+      !supportsRVVLayout(target, result.getLayout()) ||
+      source.getLayout().getSew() != result.getLayout().getSew() ||
+      source.getLayout().getVl() % split ||
+      source.getLayout().getVl() / split != result.getLayout().getVl())
+    return std::nullopt;
+  const int64_t sourceLMUL = source.getLayout().getLmulEighths();
+  int64_t carrier = std::min(sourceLMUL,
+      std::max<int64_t>(8, result.getLayout().getLmulEighths()));
+  const int64_t window = result.getLayout().getVl();
+  for (; carrier <= sourceLMUL; carrier *= 2) {
+    const int64_t capacity = target.getVlenBits() * carrier /
+                             (8 * source.getLayout().getSew());
+    if (capacity <= 0)
+      return std::nullopt;
+    bool contained = true;
+    for (int64_t chunk = 0; chunk < split; ++chunk)
+      contained &= (chunk * window) % capacity + window <= capacity;
+    if (contained)
+      return carrier;
+  }
+  return std::nullopt;
 }
 
 std::optional<int64_t>
@@ -1334,6 +1367,8 @@ mlir::LogicalResult TargetAttr::verify(
   if (!hasRVV || (!hasWideningInteger && !hasWideningFloat))
     return emitError()
            << "current RISC-V physical dialect requires RVV and at least one widening class";
+  if (vlenBits < 128 || vlenBits > 65536 || (vlenBits & (vlenBits - 1)))
+    return emitError() << "full V requires a power-of-two VLEN from 128 to 65536 bits";
   (void)hasVectorF16;
   (void)hasIndexedMemory;
   (void)hasSegmentMemory;
@@ -1493,6 +1528,34 @@ mlir::LogicalResult PackedPlaneMergePlanAttr::verify(
   return mlir::success();
 }
 
+static bool matchesPartialRepackLeaf(mlir::Attribute attribute,
+                                    PartialSetType source,
+                                    PartialSetType result, int64_t split) {
+  if (split == 1)
+    return source == result && mlir::isa<mlir::UnitAttr>(attribute);
+  auto leaf = mlir::dyn_cast<LeafAttr>(attribute);
+  if (!source || !result || !leaf || split <= 1 ||
+      leaf.getEngine() != "rvv" || leaf.getFamily() != "partial-repack" ||
+      leaf.getSpelling() != leaf.getInstruction() ||
+      leaf.getOperandGroups() != source.getResourceGroups() ||
+      leaf.getResultGroups() != result.getResourceGroups())
+    return false;
+  auto parameters = leaf.getParameters().asArrayRef();
+  if (parameters.size() < 2 || parameters[0] != source.getReductionAxis() ||
+      parameters[1] != split)
+    return false;
+  if (leaf.getInstruction() == "rvv.partial-repack.split")
+    return parameters.size() == 2 && leaf.getTemporaryGroups() == 0;
+  if (leaf.getInstruction() != "rvv.partial-repack.slice" || parameters.size() != 3)
+    return false;
+  const int64_t carrier = parameters[2];
+  return carrier > 0 && !(carrier & (carrier - 1)) &&
+      carrier >= result.getPartialType().getLayout().getLmulEighths() &&
+      carrier <= source.getPartialType().getLayout().getLmulEighths() &&
+      leaf.getTemporaryGroups() == result.getResourceGroups() +
+          std::max<int64_t>(1, carrier / 8);
+}
+
 mlir::LogicalResult PartialLayoutPlanAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     mlir::Type sourceLhsType, mlir::Type sourceRhsType,
@@ -1506,7 +1569,7 @@ mlir::LogicalResult PartialLayoutPlanAttr::verify(
     mlir::DenseI64ArrayAttr sourceLhsParts,
     mlir::DenseI64ArrayAttr sourceRhsParts,
     mlir::DenseI64ArrayAttr sourceLhsOffsets,
-    mlir::DenseI64ArrayAttr sourceRhsOffsets) {
+    mlir::DenseI64ArrayAttr sourceRhsOffsets, mlir::Attribute repackLeaf) {
   auto sourceLhs = mlir::dyn_cast<weft::riscv::ValueType>(sourceLhsType);
   auto sourceRhs = mlir::dyn_cast<weft::riscv::ValueType>(sourceRhsType);
   auto source = mlir::dyn_cast<weft::riscv::ValueType>(sourceSlotType);
@@ -1601,6 +1664,10 @@ mlir::LogicalResult PartialLayoutPlanAttr::verify(
        scaleCombinedSet.getSlots() != sourceSet.getSlots()))
     return emitError()
            << "partial source layout plan has inconsistent typed set geometry";
+  if ((hasSourcePlan && !matchesPartialRepackLeaf(repackLeaf, sourceSet,
+          repackedSet, repackedSet.getSlots() / sourceSet.getSlots())) ||
+      (!hasSourcePlan && !mlir::isa<mlir::UnitAttr>(repackLeaf)))
+    return emitError() << "partial source layout plan has no matching frozen repack leaf";
   auto partialMatches = [](weft::riscv::PartialSetType set,
                            weft::riscv::ValueType value) {
     return !set || (value && set.getPartialType() == value &&
@@ -1724,10 +1791,11 @@ mlir::LogicalResult PartialAddTreePlanAttr::verify(
     mlir::ArrayAttr leafMultiplyInstructions,
     mlir::DenseI64ArrayAttr splits, mlir::Type mergedSetType,
     llvm::StringRef finalizeInstruction, int64_t totalSlots,
-    int64_t totalTerms, int64_t totalResourceGroups) {
+    int64_t totalTerms, int64_t totalResourceGroups, mlir::ArrayAttr repackLeaves) {
   auto merged = mlir::dyn_cast<weft::riscv::PartialSetType>(mergedSetType);
   const size_t leaves = leafSetTypes.size();
   if (leaves < 2 || normalizedSetTypes.size() != leaves ||
+      repackLeaves.size() != leaves ||
       leafMultiplyInstructions.size() != leaves || splits.size() != leaves ||
       !merged || merged.getSlots() != 1 || finalizeInstruction.empty() ||
       totalSlots <= 0 || totalTerms <= 0 || totalResourceGroups <= 0)
@@ -1754,9 +1822,11 @@ mlir::LogicalResult PartialAddTreePlanAttr::verify(
     if (!source || !normalized || !instruction || split <= 0 || split > 2 ||
         source.getSlots() * split != normalized.getSlots() ||
         source.getTermsPerSlot() != normalized.getTermsPerSlot() * split ||
-        source.getResourceGroups() != normalized.getResourceGroups() ||
+        normalized.getResourceGroups() != normalized.getSlots() *
+            normalized.getPartialType().getLayout().getRegisterGroups() ||
         normalized.getPartialType() != merged.getPartialType() ||
-        normalized.getReductionAxis() != merged.getReductionAxis())
+        normalized.getReductionAxis() != merged.getReductionAxis() ||
+        !matchesPartialRepackLeaf(repackLeaves[index], source, normalized, split))
       return emitError()
              << "partial add-tree leaf disagrees with its normalized typed representation";
     computedSlots += normalized.getSlots();
@@ -1793,7 +1863,8 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     llvm::StringRef scaleSupply, llvm::StringRef scaleSupplyStage,
     llvm::StringRef multiplyInstruction,
     llvm::StringRef reduceInstruction,
-    llvm::StringRef finalizeInstruction, int64_t resourceGroups) {
+    llvm::StringRef finalizeInstruction, int64_t resourceGroups,
+    mlir::Attribute repackLeaf) {
   auto issueLhs = mlir::dyn_cast<weft::riscv::ValueType>(issueLhsType);
   auto issueRhs = mlir::dyn_cast<weft::riscv::ValueType>(issueRhsType);
   auto sourceSlot = mlir::dyn_cast<weft::riscv::ValueType>(sourceSlotType);
@@ -2002,7 +2073,9 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
       repackedSet.getSlots() != partialSlots ||
       repackedSet.getTermsPerSlot() * partialSlots !=
           sourceSet.getTermsPerSlot() ||
-      repackedSet.getResourceGroups() != sourceSet.getResourceGroups() ||
+      repackedSet.getResourceGroups() != partialSlots *
+          splitSlot.getLayout().getRegisterGroups() ||
+      !matchesPartialRepackLeaf(repackLeaf, sourceSet, repackedSet, partialSlots) ||
       reducedSet.getPartialType() != reducedSlot ||
       reducedSet.getReductionAxis() != reductionAxis ||
       reducedSet.getSlots() != partialSlots ||
@@ -8106,6 +8179,9 @@ mlir::LogicalResult RVVFinalizeWidenDotOp::verify() {
 }
 
 mlir::LogicalResult RVVPartialSetOp::verify() {
+  auto enclosingKernel = getOperation()->getParentOfType<KernelOp>();
+  if (!enclosingKernel)
+    return emitOpError("RVV partial set requires an enclosing target kernel");
   PartialSetType result = getResult().getType();
   ValueType partial = result.getPartialType();
   auto partialElement =
@@ -8184,8 +8260,9 @@ mlir::LogicalResult RVVPartialSetOp::verify() {
     auto rhsLanes = rvvLaneCount(rhs);
     auto partialLanes = rvvLaneCount(partial);
     const int64_t sliceLanes = partialLanes.value_or(-1);
-    auto lhsSliceLMUL = rvvLaneSliceLMULEighths(lhs, sliceLanes);
-    auto rhsSliceLMUL = rvvLaneSliceLMULEighths(rhs, sliceLanes);
+    auto target = enclosingKernel.getTarget();
+    auto lhsSliceLMUL = rvvLaneSliceLMULEighths(target, lhs, sliceLanes);
+    auto rhsSliceLMUL = rvvLaneSliceLMULEighths(target, rhs, sliceLanes);
     const int64_t primaryLanes =
         partial.getLayout().getLaneFactors()[*partialAxis];
     // reductionAxis names the primary physical lane axis, while termsPerSlot
@@ -8374,15 +8451,31 @@ mlir::LogicalResult RVVPartialRepackOp::verify() {
       result.getReductionAxis() != input.getReductionAxis() ||
       result.getSlots() != input.getSlots() * split ||
       result.getTermsPerSlot() * split != input.getTermsPerSlot() ||
-      result.getResourceGroups() != input.getResourceGroups() || !kernel ||
+      result.getResourceGroups() != result.getSlots() *
+          target.getLayout().getRegisterGroups() || !kernel ||
       !supportsRVVLayout(kernel.getTarget(), source.getLayout()) ||
-      !supportsRVVLayout(kernel.getTarget(), target.getLayout()) ||
-      !exactLeaf(getLeaf(), "rvv", "partial-repack",
-                 "rvv.partial-repack.split", "none", "exact") ||
-      getLeaf().getParameters().asArrayRef() !=
-          llvm::ArrayRef<int64_t>({input.getReductionAxis(), split}))
+      !supportsRVVLayout(kernel.getTarget(), target.getLayout()))
     return emitOpError(
-        "RVV partial repack requires one exact lane/LMUL split preserving all logical terms and resources");
+        "RVV partial repack requires an exact lane/LMUL split with independent slot resources");
+  auto carrier = rvvPartialRepackCarrierLMULEighths(
+      kernel.getTarget(), source, target, split);
+  if (!carrier)
+    return emitOpError("RVV partial repack windows have no addressable carrier");
+  const int64_t capacity = kernel.getTarget().getVlenBits() * *carrier /
+                           (8 * target.getLayout().getSew());
+  const bool registerView = *carrier == target.getLayout().getLmulEighths() &&
+      target.getLayout().getLmulEighths() >= 8 && target.getLayout().getVl() == capacity;
+  const llvm::StringRef instruction = registerView
+      ? "rvv.partial-repack.split" : "rvv.partial-repack.slice";
+  llvm::SmallVector<int64_t> parameters{input.getReductionAxis(), split};
+  if (!registerView)
+    parameters.push_back(*carrier);
+  const int64_t temporaries = registerView ? 0 :
+      result.getResourceGroups() + std::max<int64_t>(1, *carrier / 8);
+  if (!exactLeaf(getLeaf(), "rvv", "partial-repack", instruction, "none", "exact") ||
+      getLeaf().getParameters().asArrayRef() != llvm::ArrayRef<int64_t>(parameters) ||
+      getLeaf().getTemporaryGroups() != temporaries)
+    return emitOpError("RVV partial repack leaf disagrees with its carrier and temporary resources");
   return mlir::success();
 }
 

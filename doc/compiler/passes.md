@@ -39,6 +39,9 @@ ConvertWeftToRISCV
 → FinalizeRISCVLeaves
 → SelectRISCVScalarLoadPrimes
 → MaterializeRISCVReadSnapshots
+→ CloseRISCVLeafResources
+→ CSE
+→ EliminateDeadRISCVLayouts
 → MaterializeRISCVResources
 → EliminateDeadRISCVLayouts
 → VerifyFinalRISCV
@@ -318,6 +321,10 @@ accumulate/reduction leaf。nested、layered 与 scaled/reduced-scaled plan 同�
 reduction、finalization leaf 与同时存活的 resource groups；materializer 只能按这些字段创建
 operation，不能从 shape 或当前 SSA spelling 再次推断。
 
+需要 partial-repack 的 layout、nested 或 add-tree plan 还必须保存已选 repack leaf，包含
+addressable carrier 与临时资源；无需 repack 的位置使用显式空项。materializer 核验并消费
+该 leaf，不重新选择 `split`/`slice` 或载体宽度。
+
 带 Level-local issue unroll 的 scaled contraction 在展开前只有一个 loop-carried
 contribution。planner 必须从该 seed 冻结完整 slots、product carrier、scale supply、
 combine topology 与 resource groups；materializer 再按该 slots 机械展开。scale 可以是
@@ -370,6 +377,13 @@ shape、axes 和 Level 归属保持不变。私有 local writes 不与 pinned Vi
 copy leaf 在 target 合法的 m1/m2/m4 中按精确 transfer 次数与 scratch 占用选择，并记录
 全部所需参数。它完成显式 exact-window transfer，不把热路径交给带未知向量 clobber
 的库函数调用。
+
+### `CloseRISCVLeafResources`
+
+从已选 op 的 typed operands/results 统一 leaf 的 operand/result resource fields，不冻结
+kernel 的 final resource marker，不改变 leaf instruction、临时资源或表示。随后 CSE 与
+dead-layout 清理可合并仅因旧资源字段不同而未合并的相同纯供应；真实 SSA live set、spill
+和峰值仍在 `MaterializeRISCVResources` 中重新核算，不能在清理后复用旧统计。
 
 ### `MaterializeRISCVResources`
 

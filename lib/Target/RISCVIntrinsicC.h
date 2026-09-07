@@ -5,11 +5,15 @@
 #include "mlir/Support/LogicalResult.h"
 
 #include <string>
+#include <vector>
 
 namespace weft {
 
+struct RISCVKernelABI;
+
 mlir::LogicalResult emitSelectedRISCVIntrinsicC(mlir::ModuleOp module,
-                                                std::string &output);
+                                                std::string &output,
+                                                std::vector<RISCVKernelABI> &kernels);
 
 } // namespace weft
 

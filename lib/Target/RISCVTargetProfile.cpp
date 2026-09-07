@@ -211,6 +211,10 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
     error = "the current Weft RISC-V physical compiler requires an explicit positive --vlen-bits";
     return false;
   }
+  if (vlenBits < 128 || vlenBits > 65536 || (vlenBits & (vlenBits - 1))) {
+    error = "full V requires a power-of-two --vlen-bits from 128 to 65536";
+    return false;
+  }
   profile.vlenBits = vlenBits;
   profile.vectorRegisters = 32;
   profile.maxWideningCombineGroups = maxWideningCombineGroups;

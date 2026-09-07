@@ -364,6 +364,23 @@ const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
   return victim;
 }
 
+class CloseRISCVLeafResourcesPass
+    : public mlir::PassWrapper<CloseRISCVLeafResourcesPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+public:
+  llvm::StringRef getArgument() const override {
+    return "weft-riscv-close-leaf-resources";
+  }
+  llvm::StringRef getDescription() const override {
+    return "Close selected leaf operand/result resource fields before physical CSE";
+  }
+  void runOnOperation() override {
+    mlir::IRRewriter rewriter(&getContext());
+    for (riscv::KernelOp kernel : getOperation().getOps<riscv::KernelOp>())
+      closeLeafResources(kernel, rewriter);
+  }
+};
+
 class MaterializeRISCVResourcesPass
     : public mlir::PassWrapper<MaterializeRISCVResourcesPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -571,4 +588,8 @@ public:
 
 std::unique_ptr<mlir::Pass> weft::createMaterializeRISCVResourcesPass() {
   return std::make_unique<MaterializeRISCVResourcesPass>();
+}
+
+std::unique_ptr<mlir::Pass> weft::createCloseRISCVLeafResourcesPass() {
+  return std::make_unique<CloseRISCVLeafResourcesPass>();
 }

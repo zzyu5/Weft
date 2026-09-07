@@ -251,7 +251,8 @@ def WeftRISCV_PartialLayoutPlanAttr
     "::mlir::DenseI64ArrayAttr":$sourceLhsParts,
     "::mlir::DenseI64ArrayAttr":$sourceRhsParts,
     "::mlir::DenseI64ArrayAttr":$sourceLhsOffsets,
-    "::mlir::DenseI64ArrayAttr":$sourceRhsOffsets
+    "::mlir::DenseI64ArrayAttr":$sourceRhsOffsets,
+    "::mlir::Attribute":$repackLeaf
   );
   let assemblyFormat = [{
     `<` $sourceLhsType `,` $sourceRhsType `,`
@@ -261,7 +262,7 @@ def WeftRISCV_PartialLayoutPlanAttr
         $scaledSetType `,` $directSetType `,` $reducedSetType `,`
         $scaleCombinedSetType `,` $fullScaledSetType `,`
         $sourceLhsParts `,` $sourceRhsParts `,`
-        $sourceLhsOffsets `,` $sourceRhsOffsets `>`
+        $sourceLhsOffsets `,` $sourceRhsOffsets `,` $repackLeaf `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -304,13 +305,14 @@ def WeftRISCV_PartialAddTreePlanAttr
     StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
     "int64_t":$totalSlots,
     "int64_t":$totalTerms,
-    "int64_t":$totalResourceGroups
+    "int64_t":$totalResourceGroups,
+    "::mlir::ArrayAttr":$repackLeaves
   );
   let assemblyFormat = [{
     `<` $leafSetTypes `,` $normalizedSetTypes `,`
         $leafMultiplyInstructions `,` $splits `,` $mergedSetType `,`
         $finalizeInstruction `,` $totalSlots `,` $totalTerms `,`
-        $totalResourceGroups `>`
+        $totalResourceGroups `,` $repackLeaves `>`
   }];
   let genVerifyDecl = 1;
 }
@@ -351,7 +353,8 @@ def WeftRISCV_NestedPartialPlanAttr
     StringRefParameter<"selected widening multiply instruction">:$multiplyInstruction,
     StringRefParameter<"selected partial reduction instruction">:$reduceInstruction,
     StringRefParameter<"selected partial finalization instruction">:$finalizeInstruction,
-    "int64_t":$resourceGroups
+    "int64_t":$resourceGroups,
+    "::mlir::Attribute":$repackLeaf
   );
   let assemblyFormat = [{
     `<` $windowAxis `,` $issueStreams `,` $windowExtent `,`
@@ -369,7 +372,8 @@ def WeftRISCV_NestedPartialPlanAttr
         $combineAxes `,` $combineArities `,` $scaleSupply `,`
         $scaleSupplyStage `,`
         $multiplyInstruction `,`
-        $reduceInstruction `,` $finalizeInstruction `,` $resourceGroups `>`
+        $reduceInstruction `,` $finalizeInstruction `,` $resourceGroups `,`
+        $repackLeaf `>`
   }];
   let genVerifyDecl = 1;
 }

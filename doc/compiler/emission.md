@@ -53,3 +53,12 @@ Weft已经决定logical-to-physical mapping、target-local instruction sequence�
 system C compiler继续负责最终register allocation、machine scheduling、peephole、constant
 folding与machine code。生成C中的局部pragma可以阻止system compiler破坏已选physical形态，
 但不能要求它重新发现SIMD、microkernel或pipeline。
+
+## 5. 可调用 artifact
+
+同一次 terminal translation 同时生成 C prototype 与 `RISCVKernelABI`。ABI 的参数顺序、
+Encoding identity、record span、logical extents、alignment、access 和 alias groups 均来自
+已验证的 kernel/MemDesc，而不由 runtime 解析 C 文本或按格式名补齐。
+`RISCVCompilationResult` 保存代码和这些 ABI；`weft-compile --emit=artifact` 机械序列化它们。
+动态 shape 参数顺序与实际 prototype 一致，source binding 与发现的 target 随产物保持明确。
+加载器负责系统编译、句柄与调用生命周期，不参与 leaf 或资源选择。

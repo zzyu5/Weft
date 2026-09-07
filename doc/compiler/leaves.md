@@ -40,6 +40,20 @@ split/merge/slide/splat/extract；translator实现该映射不等于重新推导
 spill/reload必须具有exact transfer leaf、typed local slot和完整value layout；translator不能仅凭
 binding kind自行选择一条隐藏路径。
 
+连续 lane slice 的载体容量按 `VLEN × LMUL / SEW` 计算，不按源 value 的 active lanes
+比例推算 LMUL；未占满载体不是新的逻辑维度，也不能使合法窗口被误判成非整数 LMUL。
+缩小载体还必须保证每个完整窗口的起点与终点位于同一寄存器组内；长度放得下不能替代
+offset 合法性，跨组窗口保留能够完整容纳它的载体。
+
+`rvv.partial-repack.split` 仅表示可直接寻址的完整寄存器组切片；fractional 结果或未占满
+寄存器的窗口使用显式选定的 `rvv.partial-repack.slice`。后者的 leaf 固定 addressable carrier，
+terminal translation 只据此展开 subgroup extract、intra-group slide 与 LMUL truncation。
+不能输出不存在的 fractional `vget`，也不能在 emitter 临时换载体。
+每个独立 partial slot 按至少一个寄存器组计数；窗口 materialization 的结果与临时载体
+必须计入 leaf 资源，不能将 fractional slots 假定为共享同一寄存器的免费视图。
+逐槽 reduction 的资源计数遵守消费时序，允许已消费输入与对应结果复用寄存器，不将
+所有旧输入和所有新输出重复计为同时存活。
+
 一个已经选定的grouped/layered byte-window load可以使用固定的
 `scalar-prime + vector-load` leaf。其op必须只含一个raw window，logical base、byte offset、active
 lane数和vector load form均已闭合；translator只把“读取最后一个active byte，再发原vector load”

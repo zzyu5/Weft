@@ -449,7 +449,8 @@ layout 改写的重放从 `--emit=riscv-layout-input` 开始：解析后执行
 也可对已通过 final verifier 的独立副本清除 `resources_materialized`，并将
 `vector_register_peak`、`fragment_register_peak`、`local_storage_bytes` 清零，
 通过 `weft-opt` 重放 layout canonicalization、CSE、dead-layout 清理及原有的
-memory/replica-load/hoist/operation-selection/leaf-finalization/read-snapshot/resource
+memory/replica-load/hoist/operation-selection/leaf-finalization/read-snapshot/
+leaf-resource-closure/CSE/dead-layout/resource
 收尾 passes，最后重新运行 final verifier。原有显式 spill、snapshot 和 selected target op
 仍是输入 Physical graph 的一部分，不因清 marker 而删除；已有 scalar-load prime 保留，
 不得据此推测新的参数绑定。每轮都重新清 marker 后重放，二次 diff 为零才表示此流程稳定。

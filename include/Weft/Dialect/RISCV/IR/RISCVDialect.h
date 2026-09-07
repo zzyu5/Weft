@@ -36,8 +36,15 @@ std::optional<int64_t> rvvLaneCount(ValueType value);
 /// Returns the RVV LMUL, in eighths, of a contiguous lane slice. Fractional
 /// source groups retain their smallest addressable carrier; wider groups may
 /// expose an m1 subgroup.
-std::optional<int64_t> rvvLaneSliceLMULEighths(ValueType source,
-                                               int64_t sliceLanes);
+std::optional<int64_t> rvvLaneSliceLMULEighths(TargetAttr target,
+                                             ValueType source,
+                                             int64_t sliceLanes);
+
+/// Smallest addressable group containing every contiguous repack window.
+/// The selected carrier can be wider than a fractional result; the remaining
+/// intra-group offset is an explicit slide, not a fractional vget.
+std::optional<int64_t> rvvPartialRepackCarrierLMULEighths(
+    TargetAttr target, ValueType source, ValueType result, int64_t split);
 
 /// Returns the number of source lane pieces packed by one RVV part-to-lane
 /// conversion. A moved lane axis may draw its additional pieces from issue-time

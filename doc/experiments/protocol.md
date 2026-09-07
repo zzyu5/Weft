@@ -63,14 +63,17 @@ matrix/vec-dot按`2MNK`计算GOP/s；quantize/dequantize按logical elements计�
 ## 5. Result Files
 
 - `report/baseline/ggml-riscv-kernel-performance.csv`：当前协议下固定的GGML baseline；
-- `report/weft-kernel-performance.csv`：由当前checkout完整重测固定manifest后得到的Weft结果快照。
+- `report/weft-kernel-performance.csv`：每个 case 最近一次有效测量的 Weft 性能与完整配置；
+- `report/kernel-performance-comparison.csv`：与固定 baseline 对齐的明确比较，记录 ratio 与 measurement。
 
 baseline只在机器、toolchain、flags、算法/shape或测量协议变化时重测；Weft compiler修改不触发baseline重跑。历史compiler结果、旧协议行和仓库外历史实验不得混入当前表。
 
-Weft结果表只能由一次完整快照运行整体替换，不能按受影响case局部覆盖旧行。快照运行必须从
-干净worktree执行默认`cmake --build build`，使用本次生成的`weft-compile`完成整个固定manifest，
-先写临时文件，全部case成功后再原子替换正式CSV；任一case编译、数值或字段合同失败时正式表保持
-不变。单轮定向回归只写入当轮`report/`报告，不写正式CSV。这样“当前表”始终表示同一checkout、
-同一build和同一协议下的完整结果，而不是不同compiler快照的逐行拼接。
+受影响 case 的定向测量数值通过、字段完整且与 baseline 合同相同时，同步更新当前性能表和
+比较表的对应行；比较表的 `measurement` 与当前性能表的 `configuration` 都标明
+`targeted-rerun`。未测行保留既有结果与测量性质，不宣称整表来自本次 checkout/build。
+失败或不可比较的结果不能覆盖有效性能数字，需如实报告失败和 artifact 边界。
+只有实际完成整个固定 manifest 才能将对应测量标为 `full-rerun`；编译器修改不要求为了更新
+局部结果而重跑全量。三张表承担 baseline、当前性能和比较的职责，不另建定向 CSV 或仅为
+保存这些数字另写报告。
 
 每行至少保存case identity、hardware/ISA、shape、timing scope、compiler/version、flags、physical configuration、repetitions、correctness、absolute/relative error、median与throughput。合同字段缺失的运行记录不得计算baseline ratio。

@@ -2017,6 +2017,7 @@ riscv::ValueType sequentialIssueType(mlir::Builder &builder,
 }
 
 riscv::ValueType groupedLanePartialSlotType(mlir::Builder &builder,
+                                            riscv::TargetAttr target,
                                             riscv::ValueType lhs,
                                             riscv::ValueType rhs,
                                             int64_t reductionAxis,
@@ -2032,8 +2033,8 @@ riscv::ValueType groupedLanePartialSlotType(mlir::Builder &builder,
     return {};
   const int64_t partialWidth =
       2 * std::max<int64_t>(8, lhsElement.getWidth());
-  auto lhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(lhs, lanes);
-  auto rhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(rhs, lanes);
+  auto lhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(target, lhs, lanes);
+  auto rhsSliceLMUL = riscv::rvvLaneSliceLMULEighths(target, rhs, lanes);
   if (!lhsSliceLMUL || !rhsSliceLMUL || *lhsSliceLMUL != *rhsSliceLMUL ||
       *lhsSliceLMUL > std::numeric_limits<int64_t>::max() / 2)
     return {};
@@ -2074,6 +2075,34 @@ riscv::ValueType splitPartialSlotType(mlir::Builder &builder,
       source.getLayout().getValidity());
   return riscv::ValueType::get(builder.getContext(), source.getElementType(),
                                lane, axisIds, layout);
+}
+
+std::optional<riscv::LeafAttr> partialRepackLeaf(
+    mlir::Builder &builder, riscv::TargetAttr target,
+    riscv::PartialSetType source, riscv::PartialSetType result, int64_t split) {
+  if (!source || !result)
+    return std::nullopt;
+  auto carrier = riscv::rvvPartialRepackCarrierLMULEighths(
+      target, source.getPartialType(), result.getPartialType(), split);
+  if (!carrier)
+    return std::nullopt;
+  auto layout = result.getPartialType().getLayout();
+  const int64_t capacity = target.getVlenBits() * *carrier /
+                           (8 * layout.getSew());
+  const bool registerView = *carrier == layout.getLmulEighths() &&
+                            layout.getLmulEighths() >= 8 &&
+                            layout.getVl() == capacity;
+  const llvm::StringRef instruction = registerView
+      ? "rvv.partial-repack.split" : "rvv.partial-repack.slice";
+  llvm::SmallVector<int64_t> parameters{source.getReductionAxis(), split};
+  if (!registerView)
+    parameters.push_back(*carrier);
+  const int64_t temporaries = registerView ? 0 :
+      result.getResourceGroups() + std::max<int64_t>(1, *carrier / 8);
+  return riscv_internal::leaf(
+      builder, "rvv", "partial-repack", instruction, instruction,
+      source.getResourceGroups(), result.getResourceGroups(), temporaries, 0,
+      "none", "exact", parameters);
 }
 
 riscv::ValueType widenPartialSlotType(mlir::Builder &builder,
@@ -3508,7 +3537,8 @@ deriveScaledSourceLaneGeometry(mlir::Builder &builder,
   const int64_t reductionAxis = dot.getOver()[0];
   const int64_t sourceLanes = dot.getReductionLanes() * laneSplit;
   auto sourceSlot = groupedLanePartialSlotType(
-      builder, lhsSource, rhsSource, reductionAxis, sourceLanes);
+      builder, dot->getParentOfType<riscv::KernelOp>().getTarget(),
+      lhsSource, rhsSource, reductionAxis, sourceLanes);
   auto splitSourceSlot = sourceSlot
                              ? splitPartialSlotType(builder, sourceSlot,
                                                     reductionAxis, laneSplit)
@@ -3534,13 +3564,9 @@ deriveScaledSourceLaneGeometry(mlir::Builder &builder,
       sourceSlots * sourceSlot.getLayout().getRegisterGroups();
   const int64_t reducedGroups =
       partialSlots * reducedSlot.getLayout().getRegisterGroups();
-  // RVVPartialRepack is a typed register-group view: its verifier requires the
-  // source and split result to carry the same aggregate resource groups.  It
-  // therefore extends one resource identity instead of allocating a second
-  // set.  Cross-value pressure is checked later from the materialized SSA live
-  // intervals; this local legality check only rejects an individually
-  // impossible aggregate.
-  if (std::max(sourceSetGroups, reducedGroups) >
+  const int64_t repackedGroups =
+      partialSlots * splitSourceSlot.getLayout().getRegisterGroups();
+  if (std::max({sourceSetGroups, repackedGroups, reducedGroups}) >
       kernel.getTarget().getVectorRegisters())
     return std::nullopt;
   return ScaledSourceLaneGeometry{sourceSlot, splitSourceSlot, partialSlot,
@@ -3759,7 +3785,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
 
   const int64_t reductionAxis = dot.getOver()[0];
   auto sourceSlot = groupedLanePartialSlotType(
-      builder, issueLhs, issueRhs, reductionAxis, sourceLanes);
+      builder, kernel.getTarget(), issueLhs, issueRhs, reductionAxis, sourceLanes);
   auto splitSlot =
       partialSlots == 1
           ? sourceSlot
@@ -3788,7 +3814,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
           : riscv::PartialSetType::get(
                 builder.getContext(), splitSlot, reductionAxis, partialSlots,
                 sourceSet.getTermsPerSlot() / partialSlots,
-                sourceSet.getResourceGroups());
+                partialSlots * splitSlot.getLayout().getRegisterGroups());
   auto reducedSet = riscv::PartialSetType::get(
       builder.getContext(), reducedSlot, reductionAxis, partialSlots,
       repackedSet.getTermsPerSlot(),
@@ -3845,8 +3871,18 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       (scaleSupplyStage == "before-product"
            ? issueScale.getLayout().getRegisterGroups()
            : 0);
-  const int64_t repackAndReduce =
-      sourceSet.getResourceGroups() + reducedSet.getResourceGroups();
+  int64_t repackAndReduce =
+      std::max(repackedSet.getResourceGroups(), reducedSet.getResourceGroups());
+  mlir::Attribute selectedRepackLeaf = builder.getUnitAttr();
+  if (partialSlots > 1) {
+    auto repack = partialRepackLeaf(builder, kernel.getTarget(), sourceSet,
+                                    repackedSet, partialSlots);
+    if (!repack)
+      return std::nullopt;
+    selectedRepackLeaf = *repack;
+    repackAndReduce = std::max(repackAndReduce,
+        sourceSet.getResourceGroups() + repack->getTemporaryGroups());
+  }
   const int64_t reduceAndScale =
       reducedSet.getResourceGroups() +
       issueScale.getLayout().getRegisterGroups() +
@@ -3906,7 +3942,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       riscv_internal::integers(builder, combineArities), scaleSupply,
       scaleSupplyStage,
       *multiplyInstruction, "rvv.partial-reduce.widen", *finalizeInstruction,
-      resources);
+      resources, selectedRepackLeaf);
 }
 
 std::optional<SourceLanePlan>
@@ -4649,7 +4685,8 @@ public:
             sourceSlot.getShape()[0], sourceSetGroups);
         repackedSetType = riscv::PartialSetType::get(
             builder.getContext(), partialSlot, reductionAxis, chunkPartialSlots,
-            sourceSetType.getTermsPerSlot() / laneSplit, sourceSetGroups);
+            sourceSetType.getTermsPerSlot() / laneSplit,
+            chunkPartialSlots * partialSlot.getLayout().getRegisterGroups());
         reducedSetType = riscv::PartialSetType::get(
             builder.getContext(), reducedSlot, reductionAxis, chunkPartialSlots,
             repackedSetType.getTermsPerSlot(), reducedSetGroups);
@@ -4677,6 +4714,17 @@ public:
                     : mlir::Type(mlir::NoneType::get(builder.getContext()));
       };
       llvm::ArrayRef<int64_t> empty;
+      mlir::Attribute selectedRepackLeaf = builder.getUnitAttr();
+      if (sourcePlan) {
+        auto repack = partialRepackLeaf(builder, kernel.getTarget(),
+            sourceSetType, repackedSetType, laneSplit);
+        if (!repack) {
+          dot.emitError("partial source plan has no legal repack carrier");
+          signalPassFailure();
+          return;
+        }
+        selectedRepackLeaf = *repack;
+      }
       dot->setAttr(
           "partial_layout_plan",
           riscv::PartialLayoutPlanAttr::get(
@@ -4701,7 +4749,7 @@ public:
               builder.getDenseI64ArrayAttr(sourcePlan ? sourcePlan->lhsOffsets
                                                       : empty),
               builder.getDenseI64ArrayAttr(sourcePlan ? sourcePlan->rhsOffsets
-                                                      : empty)));
+                                                      : empty), selectedRepackLeaf));
 
       if (kind == "sequential_fused" || kind == "sequential_per_stream" ||
           kind == "level_scaled") {
@@ -5376,6 +5424,7 @@ public:
       llvm::SmallVector<mlir::Attribute> leafTypeAttrs;
       llvm::SmallVector<mlir::Attribute> normalizedTypeAttrs;
       llvm::SmallVector<mlir::Attribute> multiplyAttrs;
+      llvm::SmallVector<mlir::Attribute> repackLeaves;
       int64_t totalSlots = 0;
       int64_t totalTerms = 0;
       int64_t totalResources = 0;
@@ -5387,9 +5436,22 @@ public:
                       builder.getContext(), targetType.getPartialType(),
                       targetType.getReductionAxis(), source.getSlots() * split,
                       source.getTermsPerSlot() / split,
-                      source.getResourceGroups());
+                      source.getSlots() * split *
+                          targetType.getPartialType().getLayout().getRegisterGroups());
         leafTypeAttrs.push_back(mlir::TypeAttr::get(source));
         normalizedTypeAttrs.push_back(mlir::TypeAttr::get(normalized));
+        mlir::Attribute repack = builder.getUnitAttr();
+        if (split > 1) {
+          auto selected = partialRepackLeaf(builder,
+              root->getParentOfType<riscv::KernelOp>().getTarget(),
+              source, normalized, split);
+          if (!selected) {
+            complete = false;
+            break;
+          }
+          repack = *selected;
+        }
+        repackLeaves.push_back(repack);
         if (leaf.dot) {
           auto multiply = partialMultiplyInstruction(leaf.dot.getLhs().getType(),
                                                      leaf.dot.getRhs().getType());
@@ -5422,7 +5484,8 @@ public:
               builder.getArrayAttr(normalizedTypeAttrs),
               builder.getArrayAttr(multiplyAttrs),
               builder.getDenseI64ArrayAttr(splits), mergedType,
-              *finalizeInstruction, totalSlots, totalTerms, totalResources));
+              *finalizeInstruction, totalSlots, totalTerms, totalResources,
+              builder.getArrayAttr(repackLeaves)));
     }
   }
 };
@@ -6091,14 +6154,15 @@ public:
         sinkReplicaSupplies(sourceSet);
         mlir::Value reductionInput = sourceSet.getResult();
         if (partialSlots > 1) {
+          auto repackLeaf = mlir::dyn_cast<riscv::LeafAttr>(nestedPlan.getRepackLeaf());
+          if (!repackLeaf) {
+            dot.emitError("selected partial repack has no legal carrier");
+            signalPassFailure();
+            return;
+          }
           auto repacked = rewriter.create<riscv::RVVPartialRepackOp>(
               dot.getLoc(), repackedSetType, sourceSet.getResult(), partialSlots,
-              riscv_internal::leaf(
-                  rewriter, "rvv", "partial-repack",
-                  "rvv.partial-repack.split", "rvv.partial-repack.split",
-                  sourceSetType.getResourceGroups(),
-                  repackedSetType.getResourceGroups(), 0, 0, "none", "exact",
-                  {reductionAxis, partialSlots}));
+              repackLeaf);
           riscv_internal::copyOrigin(dot, repacked);
           reductionInput = repacked.getResult();
         }
@@ -6589,14 +6653,15 @@ public:
                   0, "none", "exact", {reductionAxis, sourceSlots}));
           riscv_internal::copyOrigin(dot, sourceSet);
           sinkReplicaSupplies(sourceSet);
+          auto repackLeaf = mlir::dyn_cast<riscv::LeafAttr>(layoutPlan.getRepackLeaf());
+          if (!repackLeaf) {
+            dot.emitError("selected partial repack has no legal carrier");
+            signalPassFailure();
+            return;
+          }
           auto repacked = rewriter.create<riscv::RVVPartialRepackOp>(
               reduce.getLoc(), repackedSetType, sourceSet.getResult(), laneSplit,
-              riscv_internal::leaf(
-                  rewriter, "rvv", "partial-repack",
-                  "rvv.partial-repack.split", "rvv.partial-repack.split",
-                  sourceSetType.getResourceGroups(),
-                  repackedSetType.getResourceGroups(), 0, 0, "none", "exact",
-                  {reductionAxis, laneSplit}));
+              repackLeaf);
           riscv_internal::copyOrigin(dot, repacked);
           auto reduced = rewriter.create<riscv::RVVPartialReduceOp>(
               reduce.getLoc(), reducedSetType, repacked.getResult(),
@@ -7549,6 +7614,7 @@ public:
           leaves.size() != plan.getLeafSetTypes().size() ||
           leaves.size() != plan.getNormalizedSetTypes().size() ||
           leaves.size() != plan.getLeafMultiplyInstructions().size() ||
+          leaves.size() != plan.getRepackLeaves().size() ||
           leaves.size() != plan.getSplits().size()) {
         root.emitError(
             "partial add tree no longer matches its frozen typed leaf plan");
@@ -7611,14 +7677,15 @@ public:
           origin = leaf.dot.getOperation();
         }
         if (split > 1) {
+          auto repackLeaf = mlir::dyn_cast<riscv::LeafAttr>(plan.getRepackLeaves()[index]);
+          if (!repackLeaf) {
+            root->emitError("selected partial repack has no legal carrier");
+            signalPassFailure();
+            return;
+          }
           auto repack = rewriter.create<riscv::RVVPartialRepackOp>(
               root.getLoc(), normalizedType, value, split,
-              riscv_internal::leaf(
-                  rewriter, "rvv", "partial-repack",
-                  "rvv.partial-repack.split", "rvv.partial-repack.split",
-                  sourceType.getResourceGroups(),
-                  normalizedType.getResourceGroups(), 0, 0, "none", "exact",
-                  {sourceType.getReductionAxis(), split}));
+              repackLeaf);
           riscv_internal::copyOrigin(origin, repack);
           value = repack.getResult();
         } else if (normalizedType != sourceType) {
