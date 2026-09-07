@@ -14,6 +14,7 @@ __pycache__/
 /build-demo/
 /cmake-build-*/
 /dist/
+/.codegraph/
 *.log
 
 # Local parallel worktrees
