@@ -6,9 +6,9 @@ mul_mat_iq1_s,SG2044,prefill,3.331304,4.854846,0.686181,targeted-rerun
 mul_mat_iq1_m,K1/X60,decode,1.089734,1.424159,0.765177,targeted-rerun
 iq1_m_q8_k,K1/X60,decode,1.110642,1.435304,0.773803,targeted-rerun
 dequantize_row_iq3_s,SG2044,tensor,261.305373,358.175832,0.729545,targeted-rerun
-tq1_0_q8_k,SG2044,decode,6.948866,8.123996,0.855351,targeted-rerun
+tq1_0_q8_k,SG2044,decode,8.639188,8.123996,1.063416,targeted-rerun
 iq3_xxs_q8_k,SG2044,decode,2.186950,2.673523,0.818003,targeted-rerun
-mul_mat_tq1_0,SG2044,decode,6.999079,8.015470,0.873196,targeted-rerun
+mul_mat_tq1_0,SG2044,decode,8.718706,8.015470,1.087735,targeted-rerun
 iq1_s_q8_k,K1/X60,decode,2.146736,2.711676,0.791664,targeted-rerun
 iq1_s_q8_k,SG2044,decode,3.914857,4.861243,0.805320,targeted-rerun
 mul_mat_iq1_s,K1/X60,decode,2.152402,2.663380,0.808147,targeted-rerun
