@@ -6,7 +6,7 @@
   "bindings": {
     "mul-mat:k1 f16 decode": {"entry":"f16.py","symbol":"production_mul_mat_f16","source":{"NC":32,"KC":4096,"MC":16,"MR":2,"NR":2,"KB":4096},"physical":{"lmul_eighths":16}},
     "mul-mat:k1 f16 prefill": {"entry":"f16.py","symbol":"production_mul_mat_f16","source":{"NC":32,"KC":4096,"MC":16,"MR":2,"NR":2,"KB":4096},"physical":{"lmul_eighths":16}},
-    "mul-mat:k1 iq1_m decode": {"entry":"iq1_m_decode.py","symbol":"production_mul_mat_iq1_m_decode","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
+    "mul-mat:k1 iq1_m decode": {"entry":"iq1_m_decode.py","symbol":"production_mul_mat_iq1_m_decode","source":{},"physical":{"lmul_eighths":16,"unroll":4,"pipeline_depth":1},"binding_origin":"measured-unroll-subset"},
     "mul-mat:k1 iq1_m prefill": {"entry":"iq1_m.py","symbol":"production_mul_mat_iq1_m","source":{"NC":32,"MC":16,"MR":4,"NR":4},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "mul-mat:k1 iq1_s decode": {"entry":"iq1_s_decode.py","symbol":"production_mul_mat_iq1_s_decode","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1}},
     "mul-mat:k1 iq1_s prefill": {"entry":"iq1_s.py","symbol":"production_mul_mat_iq1_s","source":{"NC":32,"MC":16,"MR":4,"NR":4},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},

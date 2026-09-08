@@ -3,8 +3,8 @@ iq2_xxs_q8_k,SG2044,decode,3.153307,4.038334,0.780844,targeted-rerun
 mul_mat_iq2_xxs,SG2044,decode,3.162283,3.980441,0.794455,targeted-rerun
 mul_mat_tq1_0,SG2044,prefill,10.139560,7.981489,1.270385,targeted-rerun
 mul_mat_iq1_s,SG2044,prefill,4.361318,4.854846,0.898343,targeted-rerun
-mul_mat_iq1_m,K1/X60,decode,1.089703,1.424159,0.765155,targeted-rerun
-iq1_m_q8_k,K1/X60,decode,1.110423,1.435304,0.773650,targeted-rerun
+mul_mat_iq1_m,K1/X60,decode,1.182471,1.424159,0.830294,targeted-rerun
+iq1_m_q8_k,K1/X60,decode,1.174918,1.435304,0.818585,targeted-rerun
 dequantize_row_iq3_s,SG2044,tensor,260.421661,358.175832,0.727078,targeted-rerun
 tq1_0_q8_k,SG2044,decode,8.717413,8.123996,1.073045,targeted-rerun
 iq3_xxs_q8_k,SG2044,decode,2.196920,2.673523,0.821732,targeted-rerun
