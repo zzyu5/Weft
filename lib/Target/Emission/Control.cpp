@@ -326,6 +326,8 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto reduction =
           mlir::dyn_cast<riscv::RVVSignedBitmaskReduceOp>(operation))
     return compileRVVSignedBitmaskReduce(reduction);
+  if (auto negate = mlir::dyn_cast<riscv::RVVMaskedNegateOp>(operation))
+    return compileRVVMaskedNegate(negate);
   if (auto load =
           mlir::dyn_cast<riscv::RVVBitmaskWindowLoadOp>(operation))
     return compileRVVBitmaskWindowLoad(load);

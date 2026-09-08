@@ -31,6 +31,7 @@ namespace weft::riscv {
 /// Returns whether an RVV layout is executable under the complete target
 /// register contract, including fractional LMUL, VLMAX, and register groups.
 bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
+bool supportsRVVMaskedNegate(TargetAttr target, ValueType data, ValueType mask);
 
 /// Returns the complete physical lane span of one RVV value.
 std::optional<int64_t> rvvLaneCount(ValueType value);

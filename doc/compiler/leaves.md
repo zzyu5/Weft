@@ -57,6 +57,13 @@ emitter分支选择。
 `convert_layout`同样是terminal physical op。source/result type和`ConversionAttr`唯一决定
 split/merge/slide/splat/extract；translator实现该映射不等于重新推导layout。
 
+`rvv_masked_negate` 在 mask bit 为 1 时对 signed integer data 取负，否则保留 data；
+result 的完整 type 不变，逐 lane 保留该整数宽度的运算边界。mask 来自同一读取点的
+`rvv.bitmask-window-mask`，shape、axis、time/lane/replica mapping、active lanes 和
+SEW/LMUL mask ratio 必须与 data 一致。leaf 固定为 `rvv.masked-negate`，每个 physical
+part 只拼写同宽 `vneg` 与 `vmerge`；一个额外 data carrier 计入 temporary groups。
+它不包含数据 widening、浮点 scale、reduction 或额外读取，也不在 translator 匹配表达式。
+
 `field_read` 是 Read-effect 的 terminal transfer：input 保留 encoded field/projection 的
 原 load/快照身份，access 固定读取与 bit mapping，result 是具有完整布局的 RVV/scalar numeric SSA。
 它可以读取同一表示，也可以直接供应已选的另一表示；不能把一个已经计算的 numeric value

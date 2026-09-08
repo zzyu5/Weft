@@ -283,6 +283,13 @@ contraction 的 unroll 只能属于它真实的多 issue reduction loop。单 is
 选择前核对 byte alignment、lo-first 位序、完整 group、point partition 与唯一 streamed axis，
 不以 conversion 节点是否恰好仍存在作为能力边界。
 
+点式 signed integer `data * (1 - 2 * widen(bit))` 可以在同一 block 的单 use 链上选择
+`rvv_masked_negate`：bit 必须来自已物化的 logical-u1 window，sign 与 data 的完整 type
+一致，mask 与 data 的全部 physical coordinates 和 mask ratio 一致。匹配最多剥离 16 个
+同 type、单 use 的 pure copy；不穿过 read conversion，不复制或移动 mask 读取。
+data 上已有的 widening/cast 原位保留，因而不能用窄整数取负替代宽整数取负；也不改变
+scale/reduction 的位置。`1-2*bit` 与 reduction 使用的 `2*bit-1` 分别匹配，不能混用符号方向。
+
 ### `ScheduleRISCVLevels` 与 `PipelineRISCVLevels`
 
 `ScheduleRISCVLevels` 是 scheduler。它读取已 lowering 的 physical `scf.for`、SSA use-def、

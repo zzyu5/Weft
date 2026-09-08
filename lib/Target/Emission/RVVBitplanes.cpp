@@ -459,6 +459,37 @@ mlir::LogicalResult Emitter::compileRVVSignedBitmaskReduce(
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVMaskedNegate(
+    riscv::RVVMaskedNegateOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.masked-negate")
+    return fail(operation, "RVV masked negate has no exact selected leaf");
+  Binding data = bindings.lookup(operation.getData());
+  Binding mask = bindings.lookup(operation.getMask());
+  if (data.kind != Binding::Kind::Vector || mask.kind != Binding::Kind::Mask ||
+      data.parts.size() != mask.parts.size() ||
+      data.parts.size() !=
+          static_cast<size_t>(vectorPartCount(operation.getResult())))
+    return fail(operation,
+                "RVV masked negate requires matching materialized data and mask parts");
+  const std::string suffix = vectorSuffix(operation.getResult());
+  const std::string type = vectorType(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (size_t part = 0; part < data.parts.size(); ++part) {
+    const std::string vl = partVL(operation.getResult(), part);
+    std::string negated = fresh("masked_negate");
+    line(type + " " + negated + " = __riscv_vneg_v_" + suffix + "(" +
+         data.parts[part] + ", " + vl + ");");
+    std::string selected = fresh("masked_negate_selected");
+    line(type + " " + selected + " = __riscv_vmerge_vvm_" + suffix + "(" +
+         data.parts[part] + ", " + negated + ", " + mask.parts[part] + ", " +
+         vl + ");");
+    result.parts.push_back(std::move(selected));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileRVVBitmaskWindowLoad(
     riscv::RVVBitmaskWindowLoadOp operation) {
   const llvm::StringRef instruction = instructionOf(operation.getOperation());

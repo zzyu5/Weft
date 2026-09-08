@@ -843,7 +843,7 @@ public:
             riscv::IotaOp, riscv::UpdateOp, riscv::UnaryOp, riscv::BinaryOp,
             riscv::CompareOp, riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
             riscv::RVVSplatOp, riscv::RVVBitmaskDecodeOp,
-            riscv::RVVSignedBitmaskReduceOp,
+            riscv::RVVSignedBitmaskReduceOp, riscv::RVVMaskedNegateOp,
             riscv::RVVBitmaskWindowLoadOp,
             riscv::RVVGroupedMacStepOp, riscv::RVVLayeredRecordLoadOp,
             riscv::RVVLayeredWindowOp,

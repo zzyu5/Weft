@@ -59,6 +59,74 @@ struct SignedBitmaskReductionRelation {
   int64_t extent = 0;
 };
 
+struct MaskedNegateRelation {
+  mlir::Value data;
+  mlir::Value sign;
+  riscv::RVVBitmaskWindowLoadOp mask;
+};
+
+mlir::Value stripSingleUsePureCopies(mlir::Value value, mlir::Block *block) {
+  for (unsigned depth = 0; depth < 16; ++depth) {
+    auto operation = value.getDefiningOp();
+    if (!operation || operation->getBlock() != block || !value.hasOneUse())
+      return {};
+    if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation)) {
+      if (conversion.getConversion().getEffect() != "pure" ||
+          conversion.getInput().getType() != value.getType())
+        return {};
+      value = conversion.getInput();
+    } else if (auto materialize =
+                   mlir::dyn_cast<riscv::RegisterMaterializeOp>(operation)) {
+      if (materialize.getInput().getType() != value.getType())
+        return {};
+      value = materialize.getInput();
+    } else {
+      return value;
+    }
+  }
+  return {};
+}
+
+std::optional<MaskedNegateRelation>
+matchMaskedNegate(riscv::BinaryOp product, mlir::Value data, mlir::Value sign) {
+  auto type = mlir::dyn_cast<riscv::ValueType>(data.getType());
+  auto kernel = product->getParentOfType<riscv::KernelOp>();
+  if (product.getKind() != "mul" || !type || !kernel ||
+      sign.getType() != type || product.getResult().getType() != type)
+    return std::nullopt;
+  mlir::Block *block = product->getBlock();
+  mlir::Value centered = stripSingleUsePureCopies(sign, block);
+  auto subtract = centered ? centered.getDefiningOp<riscv::BinaryOp>()
+                           : riscv::BinaryOp();
+  // This relation is 1 - 2*b, not the reduction relation's 2*b - 1.
+  if (!subtract || subtract.getKind() != "sub" ||
+      riscv_internal::constantInt(subtract.getLhs()) != 1)
+    return std::nullopt;
+  mlir::Value doubled = stripSingleUsePureCopies(subtract.getRhs(), block);
+  auto multiply = doubled ? doubled.getDefiningOp<riscv::BinaryOp>()
+                          : riscv::BinaryOp();
+  mlir::Value bit;
+  if (!isBinaryWithConstant(multiply, "mul", 2, bit))
+    return std::nullopt;
+  bit = stripSingleUsePureCopies(bit, block);
+  if (!bit || bit.getType() != type)
+    return std::nullopt;
+  if (auto widen = bit.getDefiningOp<riscv::WidenOp>())
+    bit = widen.getInput();
+  else if (auto cast = bit.getDefiningOp<riscv::CastOp>())
+    bit = cast.getInput();
+  else
+    return std::nullopt;
+  bit = stripSingleUsePureCopies(bit, block);
+  auto mask = bit ? bit.getDefiningOp<riscv::RVVBitmaskWindowLoadOp>()
+                  : riscv::RVVBitmaskWindowLoadOp();
+  if (!mask || mask.getLeaf().getInstruction() != "rvv.bitmask-window-load" ||
+      !riscv::supportsRVVMaskedNegate(kernel.getTarget(), type,
+                                     mask.getResult().getType()))
+    return std::nullopt;
+  return MaskedNegateRelation{data, sign, mask};
+}
+
 std::optional<BitmaskRelation>
 matchBitmaskDecode(riscv::ExtractOp extract, riscv::ValueType result) {
   auto field = extract ? extract.getInput().getDefiningOp<riscv::FieldOp>()
@@ -645,6 +713,48 @@ public:
       rewriter.replaceOp(dot, reduction.getResult());
       eraseDeadTree(centeredRoot, rewriter);
     }
+
+    llvm::SmallVector<riscv::BinaryOp> signProducts;
+    getOperation().walk([&](riscv::BinaryOp product) {
+      if (product.getKind() == "mul")
+        signProducts.push_back(product);
+    });
+    llvm::SmallVector<mlir::Value> deadSigns;
+    for (riscv::BinaryOp product : signProducts) {
+      auto relation = matchMaskedNegate(product, product.getLhs(), product.getRhs());
+      if (!relation)
+        relation = matchMaskedNegate(product, product.getRhs(), product.getLhs());
+      if (!relation)
+        continue;
+      auto data = mlir::cast<riscv::ValueType>(relation->data.getType());
+      auto maskLeaf = relation->mask.getLeaf();
+      relation->mask->setAttr(
+          "leaf", riscv_internal::leaf(
+                      rewriter, "rvv", "bitmask-window-load",
+                      "rvv.bitmask-window-mask", "rvv.bitmask-window-mask",
+                      maskLeaf.getOperandGroups(), maskLeaf.getResultGroups(),
+                      0, 0, "none", maskLeaf.getTail(),
+                      maskLeaf.getParameters(), 0));
+      rewriter.setInsertionPoint(product);
+      auto selected = rewriter.create<riscv::RVVMaskedNegateOp>(
+          product.getLoc(), data, relation->data, relation->mask.getResult(),
+          riscv_internal::leaf(
+              rewriter, "rvv", "masked-negate", "rvv.masked-negate",
+              "rvv.masked-negate", 0, 0,
+              std::max<int64_t>(1, (data.getLayout().getLmulEighths() + 7) / 8),
+              0, "none", maskLeaf.getTail()));
+      riscv_internal::copyOrigin(product, selected);
+      selected->setAttr("canonical_op",
+                        rewriter.getStringAttr("weft_kernel.binary"));
+      rewriter.replaceOp(product, selected.getResult());
+      // Keep the data producer (including its widening) and the original mask
+      // read in place. Only the now-dead single-use integer sign chain is gone.
+      deadSigns.push_back(relation->sign);
+    }
+    // A sign chain contains multiplication ops from signProducts itself.
+    // Defer its deletion until every candidate handle has been inspected.
+    for (mlir::Value sign : deadSigns)
+      eraseDeadTree(sign, rewriter);
 
     llvm::SmallVector<riscv::BinaryOp> merges;
     getOperation().walk([&](riscv::BinaryOp operation) {

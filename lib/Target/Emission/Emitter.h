@@ -684,6 +684,7 @@ private:
   compileRVVBitmaskDecode(riscv::RVVBitmaskDecodeOp operation);
   mlir::LogicalResult compileRVVSignedBitmaskReduce(
       riscv::RVVSignedBitmaskReduceOp operation);
+  mlir::LogicalResult compileRVVMaskedNegate(riscv::RVVMaskedNegateOp operation);
   mlir::LogicalResult compileRVVBitmaskWindowLoad(
       riscv::RVVBitmaskWindowLoadOp operation);
   mlir::LogicalResult

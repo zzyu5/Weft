@@ -5662,6 +5662,63 @@ mlir::LogicalResult RVVSignedBitmaskReduceOp::verify() {
   return mlir::success();
 }
 
+bool weft::riscv::supportsRVVMaskedNegate(TargetAttr target, ValueType data,
+                                       ValueType mask) {
+  if (!target || !data || !mask || data.getShape() != mask.getShape() ||
+      data.getAxisIds() != mask.getAxisIds())
+    return false;
+  auto element = mlir::dyn_cast<mlir::IntegerType>(data.getElementType());
+  auto maskElement = mlir::dyn_cast<mlir::IntegerType>(mask.getElementType());
+  auto layout = data.getLayout();
+  auto maskLayout = mask.getLayout();
+  auto lanes = rvvLaneCount(data);
+  if (!element || !element.isSigned() ||
+      (element.getWidth() != 8 && element.getWidth() != 16 &&
+       element.getWidth() != 32 && element.getWidth() != 64) ||
+      !maskElement || !maskElement.isUnsigned() || maskElement.getWidth() != 1 ||
+      layout.getSew() != element.getWidth() ||
+      !supportsRVVLayout(target, layout) ||
+      !supportsRVVLayout(target, maskLayout) || !lanes ||
+      *lanes != layout.getVl() ||
+      llvm::any_of(layout.getFragmentFactors().asArrayRef(),
+                   [](int64_t factor) { return factor != 1; }) ||
+      llvm::any_of(layout.getLocalFactors().asArrayRef(),
+                   [](int64_t factor) { return factor != 1; }))
+    return false;
+  return layout.getTimeFactors() == maskLayout.getTimeFactors() &&
+         layout.getLaneFactors() == maskLayout.getLaneFactors() &&
+         layout.getReplicaFactors() == maskLayout.getReplicaFactors() &&
+         layout.getFragmentFactors() == maskLayout.getFragmentFactors() &&
+         layout.getLocalFactors() == maskLayout.getLocalFactors() &&
+         layout.getVl() == maskLayout.getVl() &&
+         layout.getValidity() == maskLayout.getValidity() &&
+         (layout.getValidity() == "full" || layout.getValidity() == "tail") &&
+         layout.getSew() * maskLayout.getLmulEighths() ==
+             maskLayout.getSew() * layout.getLmulEighths();
+}
+
+mlir::LogicalResult RVVMaskedNegateOp::verify() {
+  auto kernel = (*this)->getParentOfType<KernelOp>();
+  auto maskLoad = getMask().getDefiningOp<RVVBitmaskWindowLoadOp>();
+  auto data = getData().getType();
+  llvm::StringRef tail =
+      data.getLayout().getValidity() == "tail" ? "agnostic" : "exact";
+  const int64_t temporaryGroups =
+      std::max<int64_t>(1, (data.getLayout().getLmulEighths() + 7) / 8);
+  if (!kernel ||
+      !supportsRVVMaskedNegate(kernel.getTarget(), data, getMask().getType()) ||
+      getResult().getType() != data || !maskLoad ||
+      !exactLeaf(maskLoad.getLeaf(), "rvv", "bitmask-window-load",
+                 "rvv.bitmask-window-mask", "none", tail) ||
+      !exactLeaf(getLeaf(), "rvv", "masked-negate", "rvv.masked-negate",
+                 "none", tail) ||
+      getLeaf().getTemporaryGroups() != temporaryGroups ||
+      getLeaf().getFragmentGroups() != 0 || getLeaf().getLocalBytes() != 0)
+    return emitOpError(
+        "RVV masked negate requires signed integer data, one materialized u1 mask with identical pointwise geometry and mask ratio, an unchanged result type, and the exact temporary carrier");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
   ValueType field = getField().getType();
   ValueType result = getResult().getType();
@@ -5699,7 +5756,7 @@ mlir::LogicalResult RVVBitmaskWindowLoadOp::verify() {
                 "rvv.bitmask-window-mask", "none", tail);
   const bool maskUse =
       maskLeaf && getResult().hasOneUse() &&
-      mlir::isa<RVVBitplaneMergeOp, RVVSignedBitmaskReduceOp>(
+      mlir::isa<RVVBitplaneMergeOp, RVVSignedBitmaskReduceOp, RVVMaskedNegateOp>(
           *getResult().getUsers().begin());
   if (!sourceField || !fieldElement || fieldElement.isSigned() ||
       fieldElement.getWidth() != 1 || !resultElement ||

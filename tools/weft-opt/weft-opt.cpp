@@ -13,6 +13,7 @@ int main(int argc, char **argv) {
   mlir::registerTransformsPasses();
   mlir::registerPass(
       []() { return weft::createShareRISCVLayeredWindowsPass(); });
+  mlir::registerPass([]() { return weft::createFuseRISCVBitplanesPass(); });
   mlir::registerPass(
       []() { return weft::createCanonicalizeRISCVLayoutsPass(); });
   mlir::registerPass(

@@ -1414,6 +1414,15 @@ def WeftRISCV_RVVSignedBitmaskReduceOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVMaskedNegateOp
+    : WeftRISCV_LeafOp<"rvv_masked_negate", [Pure]> {
+  let arguments = (ins WeftRISCV_ValueType:$data,
+                       WeftRISCV_ValueType:$mask,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVBitmaskWindowLoadOp
     : WeftRISCV_LeafOp<"rvv_bitmask_window_load",
                    [MemoryEffects<[MemRead]>]> {
