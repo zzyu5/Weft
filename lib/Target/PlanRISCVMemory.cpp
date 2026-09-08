@@ -539,7 +539,10 @@ materializeScalarAffineComponent(mlir::Value value, mlir::Operation *origin,
                                  unsigned depth = 0) {
   if (depth > 24)
     return mlir::failure();
-  if (isSingleScalarCoordinate(value))
+  // A one-element shaped coordinate still owns its logical axes.  Only an
+  // axis-free scalar is already a base; shaped affine expressions must be
+  // projected below even when their current issue window has extent one.
+  if (mlir::isa<mlir::IntegerType, mlir::IndexType>(value.getType()))
     return value;
 
   auto physical = mlir::dyn_cast<riscv::ValueType>(value.getType());

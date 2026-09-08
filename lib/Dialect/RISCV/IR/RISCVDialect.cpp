@@ -871,7 +871,8 @@ mlir::LogicalResult verifyBroadcastDomain(mlir::Operation *operation,
       expectedAxes.push_back(axis);
   if (!llvm::equal(expectedAxes, axesOf(result)))
     return operation->emitOpError(
-        "pointwise result axes must follow lhs order then rhs-only axes");
+        "pointwise result axes must follow lhs order then rhs-only axes; lhs=")
+           << lhs << ", rhs=" << rhs << ", result=" << result;
   for (auto [axis, extent] : llvm::zip(axesOf(result), shapeOf(result))) {
     std::optional<int64_t> expectedExtent;
     for (mlir::Type operand : {lhs, rhs}) {

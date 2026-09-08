@@ -233,11 +233,22 @@ public:
           const bool issueOnlyWindow =
               hasGappedIndexedWindowRoot(dot.getLhs(), windowAxis) ||
               hasGappedIndexedWindowRoot(dot.getRhs(), windowAxis);
-          const int64_t plannedStreams =
-              issueOnlyWindow ? logicalExtent : lhsTime;
-          const int64_t plannedWindow = issueOnlyWindow ? 1 : lhsWindow;
-          nestedPlan = planNestedPartialCarrier(
-              builder, dot, *match, windowAxis, plannedStreams, plannedWindow);
+          int64_t plannedStreams = 0;
+          int64_t plannedWindow = issueOnlyWindow ? 1 : lhsWindow;
+          // The widest input representation can exceed the full-product or
+          // reduced-slot budget even when smaller issue windows are legal.
+          // Prefer fewer issues; only consider exact power-of-two partitions
+          // of this same physical axis before freezing one complete plan.
+          // A positive i64 window admits at most 63 halvings.
+          int64_t candidates = 0;
+          for (; candidates < 64; ++candidates) {
+            plannedStreams = logicalExtent / plannedWindow;
+            nestedPlan = planNestedPartialCarrier(
+                builder, dot, *match, windowAxis, plannedStreams, plannedWindow);
+            if (nestedPlan || plannedWindow <= 1 || plannedWindow % 2)
+              break;
+            plannedWindow /= 2;
+          }
           if (!nestedPlan) {
             dot.emitError(
                 "nested scaled contraction has no legal full-product carrier under the target resource contract; lhs=")
@@ -247,6 +258,7 @@ public:
                 << lhsTime << ", window_extent=" << lhsWindow
                 << ", reduction_lanes=" << dot.getReductionLanes()
                 << ", reduction_streams=" << dot.getReductionStreams()
+                << ", issue_window_candidates=" << candidates + 1
                 << ", final_type=" << found->second.getResult().getType();
             signalPassFailure();
             return;

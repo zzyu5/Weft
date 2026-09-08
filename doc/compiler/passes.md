@@ -356,6 +356,13 @@ accumulate/reduction leaf。nested、layered 与 scaled/reduced-scaled plan 同�
 reduction、finalization leaf 与同时存活的 resource groups；materializer 只能按这些字段创建
 operation，不能从 shape 或当前 SSA spelling 再次推断。
 
+nested planner 的最大 issue window 若不能闭合资源，可以沿同一物理轴依次减半，
+只考虑能精确划分原逻辑 extent 的窗口，至多检查 64 个候选，优先选择 issue 数最少的合法项。
+这不改变作者的 reduction axes、scale 位置或整数宽度。选定的 window、issue 数与资源估计
+写入原有 nested plan；全部不合法时报告尝试数并失败，materializer 和 emitter 不重试。
+窗口缩到一个元素时，带轴坐标仍保留其轴；memory pass 必须沿已支持的仿射表达式
+物化无轴标量地址基值，不能把单元素 shaped value 直接冒充 scalar。
+
 需要 partial-repack 的 layout、nested 或 add-tree plan 还必须保存已选 repack leaf，包含
 addressable carrier 与临时资源；无需 repack 的位置使用显式空项。materializer 核验并消费
 该 leaf，不重新选择 `split`/`slice` 或载体宽度。
