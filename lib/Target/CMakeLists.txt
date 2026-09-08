@@ -17,7 +17,9 @@ add_library(WeftRISCVTarget STATIC
   PipelineRISCVLevels.cpp
   UnrollRISCVLevels.cpp
   ShareRISCVLayeredWindows.cpp
-  MaterializeRISCVPartialAccumulators.cpp
+  Partial/Support.cpp
+  Partial/PlanTopologies.cpp
+  Partial/Materialize.cpp
   FinalizeRISCVLeaves.cpp
   SelectRISCVScalarLoadPrimes.cpp
   MaterializeRISCVReadSnapshots.cpp
@@ -26,10 +28,24 @@ add_library(WeftRISCVTarget STATIC
   EliminateDeadRISCVLayouts.cpp
   VerifyFinalRISCV.cpp
   RISCVIntrinsicC.cpp
+  Emission/Control.cpp
+  Emission/Layout.cpp
+  Emission/Memory.cpp
+  Emission/RVVArithmetic.cpp
+  Emission/Encoding.cpp
+  Emission/RVVMemory.cpp
+  Emission/IME.cpp
+  IME/FragmentEmission.cpp
+  IME/FragmentMaterialization.cpp
+  Emission/RVVBitplanes.cpp
+  Emission/RVVContraction.cpp
+  Emission/RVVPartial.cpp
+  Emission/Support.cpp
   RISCVCompiler.cpp
 )
 
 target_link_libraries(WeftRISCVTarget PUBLIC
+  WeftRISCVContracts
   WeftKernelDialect
   WeftRISCVDialect
   MLIRArithDialect

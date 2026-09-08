@@ -234,27 +234,25 @@ bool weft::parseRISCVTargetProfile(llvm::StringRef march, llvm::StringRef abi,
         "--partial-combine-policy must be independent-multilevel or sequential";
     return false;
   }
-  const bool spacemitIME1 = matrixExtension == "spacemit-ime1";
-  if (matrixExtension != "none" && !spacemitIME1) {
-    error = "unsupported --matrix-extension value: " + matrixExtension.str();
-    return false;
-  }
-  if (spacemitIME1) {
-    if (profile.xlen != 64 || !profile.hasRVV || profile.vlenBits != 256) {
-      error = "spacemit-ime1 requires RV64, RVV, and an explicit VLEN of exactly 256 bits";
+  if (matrixExtension != "none") {
+    for (const auto &fragment : riscvFragmentCapabilities()) {
+      if (fragment.extension != matrixExtension)
+        continue;
+      if (!profile.littleEndian || profile.xlen != fragment.xlen ||
+          !profile.supportsFixedRVV() || profile.vlenBits != fragment.vlenBits ||
+          !profile.supportsVectorShape(fragment.lhsElementBits, 8) ||
+          !profile.supportsVectorShape(fragment.rhsElementBits, 8) ||
+          !profile.supportsVectorShape(fragment.accumulatorElementBits, 8)) {
+        error = matrixExtension.str() + " has no legal target for fragment " +
+                fragment.name;
+        return false;
+      }
+      profile.fragmentCapabilities.push_back(fragment);
+    }
+    if (profile.fragmentCapabilities.empty()) {
+      error = "unsupported --matrix-extension value: " + matrixExtension.str();
       return false;
     }
-  }
-  if (spacemitIME1 && profile.littleEndian && profile.xlen == 64 &&
-      profile.supportsFixedRVV() && profile.vlenBits == 256 &&
-      profile.supportsVectorShape(8, 8) &&
-      profile.supportsVectorShape(32, 8)) {
-    // The board-validated leaf consumes v0/v1 as two 4x8 signed-i8 fragments
-    // and produces one 4x4 i32 fragment in v2/v3.
-    profile.fragmentCapabilities.push_back(RISCVFragmentCapability{
-        RISCVFragmentInstruction::SpacemitIME1I8MMA,
-        RISCVFragmentSignedness::Signed, RISCVFragmentSignedness::Signed,
-        8, 8, 32, 4, 4, 8, 1, 1, 2});
   }
   return true;
 }

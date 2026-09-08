@@ -321,6 +321,58 @@ bool canPreserveProducerResult(mlir::Operation *operation) {
   });
 }
 
+mlir::LogicalResult rebindFieldReadProjections(
+    riscv::KernelOp kernel, mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::FieldReadOp> reads;
+  kernel.walk([&](riscv::FieldReadOp read) { reads.push_back(read); });
+  for (auto read : reads) {
+    llvm::SmallVector<mlir::Value> captured;
+    auto field = riscv::fieldReadProjection(read.getInput(), &captured);
+    if (!field || captured.size() != read.getIndices().size())
+      return read.emitError("spill rewriting lost the field address operand structure");
+    if (llvm::equal(captured, read.getIndices()))
+      continue;
+    for (auto [before, after] : llvm::zip(captured, read.getIndices()))
+      if (before.getType() != after.getType())
+        return read.emitError("spill rewriting changed a field address operand type");
+
+    // The read owns its use-site reloads. Clone only the pure address
+    // projections, binding their index slots to this read's actual operands.
+    llvm::SmallVector<riscv::ExtractOp> projections;
+    mlir::Value value = read.getInput();
+    while (auto extract = value.getDefiningOp<riscv::ExtractOp>()) {
+      projections.push_back(extract);
+      value = extract.getInput();
+    }
+    rewriter.setInsertionPoint(read);
+    value = field.getResult();
+    size_t cursor = captured.size();
+    for (auto extract : llvm::reverse(projections)) {
+      const size_t count = extract.getIndices().size();
+      cursor -= count;
+      auto copy = mlir::cast<riscv::ExtractOp>(rewriter.clone(*extract));
+      copy.getInputMutable().assign(value);
+      copy.getIndicesMutable().assign(read.getIndices().slice(cursor, count));
+      value = copy.getResult();
+    }
+    read.getInputMutable().assign(value);
+    for (auto extract : projections) {
+      if (!extract.getResult().use_empty())
+        break;
+      llvm::SmallVector<riscv::ReloadOp> oldReloads;
+      for (mlir::Value index : extract.getIndices())
+        if (auto reload = index.getDefiningOp<riscv::ReloadOp>();
+            reload && !llvm::is_contained(oldReloads, reload))
+          oldReloads.push_back(reload);
+      rewriter.eraseOp(extract);
+      for (auto reload : oldReloads)
+        if (reload.getResult().use_empty())
+          rewriter.eraseOp(reload);
+    }
+  }
+  return mlir::success();
+}
+
 const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
                              bool peakBefore,
                              llvm::SmallVectorImpl<Interval> &intervals) {
@@ -331,7 +383,8 @@ const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
           ? &*std::next(block.begin(), peakPoint)
           : nullptr;
   for (const Interval &interval : intervals) {
-    if (interval.fragment || interval.end <= peakPoint)
+    if (interval.fragment || interval.end <= peakPoint ||
+        riscv::fieldReadProjection(interval.value))
       continue;
     mlir::Operation *definition = interval.value.getDefiningOp();
     if (definition && interval.begin >= peakPoint)
@@ -563,11 +616,22 @@ public:
         auto reloadLeaf = riscv_internal::leaf(
             rewriter, "transfer", "reload", "rvv.reload", "rvv.reload", 0,
             victim->groups, 0, 0, "none", "exact");
+        llvm::DenseMap<mlir::Operation *, mlir::Value> reloads;
         for (mlir::OpOperand *use : uses) {
+          auto found = reloads.find(use->getOwner());
+          if (found != reloads.end()) {
+            use->set(found->second);
+            continue;
+          }
           rewriter.setInsertionPoint(use->getOwner());
           auto reload = rewriter.create<riscv::ReloadOp>(
               use->getOwner()->getLoc(), valueType, slot.getResult(), reloadLeaf);
           use->set(reload.getResult());
+          reloads[use->getOwner()] = reload.getResult();
+        }
+        if (mlir::failed(rebindFieldReadProjections(kernel, rewriter))) {
+          failed = true;
+          break;
         }
         ++spillIdentity;
       }

@@ -21,125 +21,11 @@ using namespace weft;
 namespace {
 
 bool isTerminalRISCVOperation(mlir::Operation *operation) {
-  return mlir::isa<
-      riscv::EncodingDeclOp, riscv::DerivedEncodingOp, riscv::ArtifactPackOp,
-      riscv::ArtifactSizeYieldOp, riscv::ArtifactReturnOp,
-      riscv::StorageLoadOp, riscv::StorageStoreOp, riscv::KernelOp,
-      riscv::ReturnOp, riscv::RootDomainOp, riscv::RootPointOp,
-      riscv::SymbolOp, riscv::DomainOp, riscv::PhysicalPointOp,
-      riscv::RecordCohortOp,
-      riscv::ConstantOp, riscv::IotaOp, riscv::NewOp,
-      riscv::StagedViewOp,
-      riscv::MemoryViewOp, riscv::SliceOp, riscv::SubviewOp,
-      riscv::ReshapeOp, riscv::LoadOp, riscv::StoreOp,
-      riscv::FieldOp,
-      riscv::ExtractOp, riscv::UpdateOp, riscv::UnaryOp, riscv::BinaryOp,
-      riscv::CompareOp, riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
-      riscv::ReduceOp, riscv::Fold2Op, riscv::LookupOp,
-      riscv::RVVByteGatherOp, riscv::RVVByteWindowsLoadOp,
-      riscv::RVVIndexedEntryLoadOp,
-      riscv::ConvertLayoutOp,
-      riscv::LocalAllocOp, riscv::LocalCapacityGuardOp,
-      riscv::LocalBindOp, riscv::DenseSnapshotOp, riscv::LocalLoadOp,
-      riscv::LocalStoreOp, riscv::RVVLocalMaterializeOp,
-      riscv::IndexMultipleGuardOp, riscv::EncodedLocalBindOp,
-      riscv::RVVEncodedLocalPackTransferOp,
-      riscv::SpillOp, riscv::ReloadOp,
-      riscv::IMEPackOp, riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RegisterMaterializeOp,
-      riscv::RVVBitplaneMergeOp,
-      riscv::PackedPlaneMergeOp,
-      riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
-      riscv::RVVBitmaskWindowLoadOp,
-      riscv::RVVGroupedMacLoadOp,
-      riscv::RVVGroupedMacStepOp,
-      riscv::RVVWidenMultiplyOp, riscv::RVVWidenScalarMultiplyOp,
-      riscv::RVVMultiplyHighScalarOp,
-      riscv::RVVRegularRepeatIndexOp,
-      riscv::RVVRegularRepeatGatherOp,
-      riscv::RVVRegularRepeatScalarLoadOp,
-      riscv::RVVStorageWindowOp, riscv::RVVUnitEntryWindowLoadOp,
-      riscv::RVVLayeredRecordLoadOp,
-      riscv::RVVLayeredStorageLoadOp,
-      riscv::RVVLayeredStorageDecodeOp, riscv::RVVReplicaStorageLoadOp,
-      riscv::RVVSegmentPairLoadOp,
-      riscv::RVVRecordStorageLoadOp, riscv::RVVRecordStorageDecodeOp,
-      riscv::RVVRecordStoreOp,
-      riscv::RVVIssueSliceOp,
-      riscv::RVVWidenAccumulateOp,
-      riscv::RVVFinalizeWidenDotOp,
-      riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
-      riscv::RVVPartialCollectOp,
-      riscv::RVVPartialRepackOp,
-      riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
-      riscv::RVVPartialScaleCombineOp, riscv::RVVPartialWidenScaleOp,
-      riscv::RVVPartialCombineOp,
-      riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
-      riscv::RVVWidenReduceOp,
-      riscv::RVVPartitionedWidenReduceStoreOp,
-      riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
-      riscv::RVVProjectedLayeredStreamOp,
-      riscv::RVVStreamLoadOp, riscv::RVVStreamReduceStepOp,
-      riscv::RVVStreamDotStepOp, riscv::RVVStreamContractStepOp,
-      riscv::RVVStreamFinalizeOp, riscv::RVVSplatOp,
-      riscv::RVVAxisBroadcastOp,
-      riscv::ProjectReductionOperandOp, riscv::RVVContractStepOp,
-      riscv::RVVEncodedContractStepOp>(operation);
+  return operation->hasTrait<mlir::OpTrait::WeftRISCVTerminal>();
 }
 
 bool requiresLeaf(mlir::Operation *operation) {
-  return mlir::isa<
-      riscv::StorageLoadOp, riscv::StorageStoreOp, riscv::IotaOp,
-      riscv::LoadOp, riscv::StoreOp, riscv::FieldOp, riscv::ExtractOp,
-      riscv::UpdateOp, riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
-      riscv::CastOp, riscv::NarrowOp, riscv::WidenOp, riscv::ReduceOp,
-      riscv::Fold2Op, riscv::LookupOp, riscv::RVVByteGatherOp,
-      riscv::RVVByteWindowsLoadOp,
-      riscv::RVVIndexedEntryLoadOp,
-      riscv::ConvertLayoutOp,
-      riscv::LocalCapacityGuardOp, riscv::DenseSnapshotOp,
-      riscv::LocalLoadOp, riscv::LocalStoreOp,
-      riscv::RVVLocalMaterializeOp, riscv::IndexMultipleGuardOp,
-      riscv::RVVEncodedLocalPackTransferOp,
-      riscv::SpillOp, riscv::ReloadOp,
-      riscv::IMEPackOp,
-      riscv::IMEFragmentMMAOp, riscv::IMEUnpackOp,
-      riscv::RVVBitplaneMergeOp, riscv::PackedPlaneMergeOp,
-      riscv::RVVBitmaskDecodeOp, riscv::RVVSignedBitmaskReduceOp,
-      riscv::RVVBitmaskWindowLoadOp,
-      riscv::RVVGroupedMacLoadOp,
-      riscv::RVVGroupedMacStepOp,
-      riscv::RVVWidenMultiplyOp,
-      riscv::RVVWidenScalarMultiplyOp,
-      riscv::RVVMultiplyHighScalarOp,
-      riscv::RVVRegularRepeatIndexOp, riscv::RVVRegularRepeatGatherOp,
-      riscv::RVVRegularRepeatScalarLoadOp,
-      riscv::RVVStorageWindowOp, riscv::RVVUnitEntryWindowLoadOp,
-      riscv::RVVLayeredRecordLoadOp,
-      riscv::RVVLayeredStorageLoadOp, riscv::RVVLayeredStorageDecodeOp,
-      riscv::RVVReplicaStorageLoadOp, riscv::RVVRecordStorageLoadOp,
-      riscv::RVVSegmentPairLoadOp,
-      riscv::RVVRecordStorageDecodeOp, riscv::RVVRecordStoreOp,
-      riscv::RVVIssueSliceOp,
-      riscv::RVVWidenAccumulateOp,
-      riscv::RVVFinalizeWidenDotOp,
-      riscv::RVVPartialSetOp, riscv::RVVPartialCaptureOp,
-      riscv::RVVPartialCollectOp,
-      riscv::RVVPartialRepackOp,
-      riscv::RVVPartialMergeOp, riscv::RVVPartialReduceOp,
-      riscv::RVVPartialScaleCombineOp, riscv::RVVPartialWidenScaleOp,
-      riscv::RVVPartialCombineOp,
-      riscv::RVVPartialFinalizeOp, riscv::RVVAssembleReplicasOp,
-      riscv::RVVWidenReduceOp,
-      riscv::RVVPartitionedWidenReduceStoreOp,
-      riscv::RVVLayeredWindowOp, riscv::RVVLayeredStreamOp,
-      riscv::RVVProjectedLayeredStreamOp,
-      riscv::RVVStreamLoadOp, riscv::RVVStreamReduceStepOp,
-      riscv::RVVStreamDotStepOp, riscv::RVVStreamContractStepOp,
-      riscv::RVVStreamFinalizeOp, riscv::RVVSplatOp,
-      riscv::RVVAxisBroadcastOp,
-      riscv::ProjectReductionOperandOp,
-      riscv::RVVContractStepOp, riscv::RVVEncodedContractStepOp>(operation);
+  return operation->hasTrait<mlir::OpTrait::WeftRISCVLeaf>();
 }
 
 int64_t resourceGroups(mlir::Type type) {
@@ -437,6 +323,11 @@ public:
         }
       }
       if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
+          conversion && riscv::fieldReadProjection(conversion.getInput())) {
+        conversion.emitError("final encoded conversion input must be supplied by field_read");
+        failed = true;
+      }
+      if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(operation);
           conversion &&
           (conversion.getConversion().getKind() == "register_to_lane" ||
            conversion.getConversion().getKind() == "time_to_lane")) {
@@ -452,19 +343,13 @@ public:
             rvvToRVV && static_cast<bool>(
                             riscv::rvvPartToLanePieces(inputType, resultType));
         mlir::Operation *definition = conversion.getInput().getDefiningOp();
-        bool rematerializable =
-            mlir::isa_and_nonnull<riscv::FieldOp, riscv::SliceOp>(definition);
-        if (auto extract = mlir::dyn_cast_or_null<riscv::ExtractOp>(definition))
-          rematerializable =
-              static_cast<bool>(riscv_internal::sourceField(extract.getInput()));
         const bool invalidRVVPack = rvvToRVV && !closedRVVPack;
-        const bool missingEncodedRematerialization =
+        const bool unmaterializedFieldRead =
             !rvvToRVV &&
-            conversion.getConversion().getKind() == "time_to_lane" &&
-            !rematerializable;
-        if (invalidRVVPack || missingEncodedRematerialization) {
+            conversion.getConversion().getKind() == "time_to_lane";
+        if (invalidRVVPack || unmaterializedFieldRead) {
           conversion.emitError(
-              "final part-to-lane conversion has no closed RVV pack or encoded rematerialization; input_def=")
+              "final part-to-lane conversion requires a closed numeric pack; encoded supply must be an explicit field_read; input_def=")
               << (definition ? definition->getName().getStringRef()
                              : llvm::StringRef("<block-argument>"))
               << ", input_type=" << conversion.getInput().getType()

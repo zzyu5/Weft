@@ -33,6 +33,15 @@ class WeftRISCV_Type<string name, string typeMnemonic, list<Trait> traits = []>
 class WeftRISCV_Op<string mnemonic, list<Trait> traits = []>
     : Op<WEFT_RISCV_Dialect, mnemonic, traits>;
 
+def WeftRISCV_Terminal : NativeOpTrait<"WeftRISCVTerminal">;
+def WeftRISCV_Leaf : NativeOpTrait<"WeftRISCVLeaf">;
+
+class WeftRISCV_TerminalOp<string mnemonic, list<Trait> traits = []>
+    : WeftRISCV_Op<mnemonic, !listconcat([WeftRISCV_Terminal], traits)>;
+
+class WeftRISCV_LeafOp<string mnemonic, list<Trait> traits = []>
+    : WeftRISCV_TerminalOp<mnemonic, !listconcat([WeftRISCV_Leaf], traits)>;
+
 def WeftRISCV_LayoutAttr : WeftRISCV_Attr<"Layout", "layout"> {
   let parameters = (ins
     StringRefParameter<"unassigned, scalar, rvv, ime, or local">:$carrier,
@@ -802,7 +811,7 @@ def WeftRISCV_RecordCohortType
 }
 
 def WeftRISCV_EncodingDeclOp
-    : WeftRISCV_Op<"encoding_decl", [Symbol, Pure]> {
+    : WeftRISCV_TerminalOp<"encoding_decl", [Symbol, Pure]> {
   let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$kind,
                        StrAttr:$layout_identity, StrAttr:$bit_order,
                        StrAttr:$byte_order, I64Attr:$alignment,
@@ -816,7 +825,7 @@ def WeftRISCV_EncodingDeclOp
 }
 
 def WeftRISCV_DerivedEncodingOp
-    : WeftRISCV_Op<"derived_encoding", [Symbol, Pure]> {
+    : WeftRISCV_TerminalOp<"derived_encoding", [Symbol, Pure]> {
   let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$source_family,
                        StrAttr:$result_family, StrAttr:$layout_identity,
                        ArrayAttr:$parameter_names,
@@ -826,7 +835,7 @@ def WeftRISCV_DerivedEncodingOp
 }
 
 def WeftRISCV_ArtifactPackOp
-    : WeftRISCV_Op<"artifact_pack", [Symbol, IsolatedFromAbove]> {
+    : WeftRISCV_TerminalOp<"artifact_pack", [Symbol, IsolatedFromAbove]> {
   let arguments = (ins SymbolNameAttr:$sym_name,
                        StrAttr:$source_family, StrAttr:$result_family,
                        StrAttr:$layout_identity, I64Attr:$record_bytes,
@@ -837,18 +846,18 @@ def WeftRISCV_ArtifactPackOp
 }
 
 def WeftRISCV_ArtifactSizeYieldOp
-    : WeftRISCV_Op<"artifact_size_yield", [Terminator]> {
+    : WeftRISCV_TerminalOp<"artifact_size_yield", [Terminator]> {
   let arguments = (ins Index:$value);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_ArtifactReturnOp
-    : WeftRISCV_Op<"artifact_return", [Terminator]> {
+    : WeftRISCV_TerminalOp<"artifact_return", [Terminator]> {
   let hasVerifier = 1;
 }
 
 def WeftRISCV_StorageLoadOp
-    : WeftRISCV_Op<"storage_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_MemDescType:$source, Index:$byte_index,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyInteger:$result);
@@ -856,14 +865,14 @@ def WeftRISCV_StorageLoadOp
 }
 
 def WeftRISCV_StorageStoreOp
-    : WeftRISCV_Op<"storage_store", [MemoryEffects<[MemWrite]>]> {
+    : WeftRISCV_LeafOp<"storage_store", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyInteger:$value, WeftRISCV_MemDescType:$destination,
                        Index:$byte_index, WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_KernelOp
-    : WeftRISCV_Op<"kernel", [Symbol, IsolatedFromAbove, SingleBlock]> {
+    : WeftRISCV_TerminalOp<"kernel", [Symbol, IsolatedFromAbove, SingleBlock]> {
   let arguments = (ins SymbolNameAttr:$sym_name, ArrayAttr:$arg_names,
                        ArrayAttr:$arg_access,
                        DenseI64ArrayAttr:$arg_alias_sets,
@@ -879,23 +888,23 @@ def WeftRISCV_KernelOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ReturnOp : WeftRISCV_Op<"return", [Terminator]> {
+def WeftRISCV_ReturnOp : WeftRISCV_TerminalOp<"return", [Terminator]> {
   let arguments = (ins Variadic<AnyType>:$values);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RootDomainOp : WeftRISCV_Op<"root_domain", [Pure]> {
+def WeftRISCV_RootDomainOp : WeftRISCV_TerminalOp<"root_domain", [Pure]> {
   let results = (outs WeftRISCV_DomainType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_SymbolOp : WeftRISCV_Op<"symbol", [Pure]> {
+def WeftRISCV_SymbolOp : WeftRISCV_TerminalOp<"symbol", [Pure]> {
   let arguments = (ins StrAttr:$name);
   let results = (outs Index:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_DomainOp : WeftRISCV_Op<"domain", [Pure]> {
+def WeftRISCV_DomainOp : WeftRISCV_TerminalOp<"domain", [Pure]> {
   let arguments = (ins WeftRISCV_DomainType:$parent, Index:$extent,
                        Index:$partition, Index:$multiplicity);
   let results = (outs WeftRISCV_DomainType:$result);
@@ -920,38 +929,38 @@ def WeftRISCV_YieldOp : WeftRISCV_Op<"yield", [Terminator]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RootPointOp : WeftRISCV_Op<"root_point"> {
+def WeftRISCV_RootPointOp : WeftRISCV_TerminalOp<"root_point"> {
   let arguments = (ins WeftRISCV_DomainType:$domain);
   let results = (outs WeftRISCV_PointType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_PhysicalPointOp : WeftRISCV_Op<"physical_point"> {
+def WeftRISCV_PhysicalPointOp : WeftRISCV_TerminalOp<"physical_point"> {
   let arguments = (ins WeftRISCV_PointType:$parent, Index:$base,
                        Index:$active, Index:$partition);
   let results = (outs WeftRISCV_PointType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RecordCohortOp : WeftRISCV_Op<"record_cohort"> {
+def WeftRISCV_RecordCohortOp : WeftRISCV_TerminalOp<"record_cohort"> {
   let arguments = (ins WeftRISCV_PointType:$origin);
   let results = (outs WeftRISCV_RecordCohortType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ConstantOp : WeftRISCV_Op<"constant", [Pure]> {
+def WeftRISCV_ConstantOp : WeftRISCV_TerminalOp<"constant", [Pure]> {
   let arguments = (ins AnyAttr:$value);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_IotaOp : WeftRISCV_Op<"iota", [Pure]> {
+def WeftRISCV_IotaOp : WeftRISCV_LeafOp<"iota", [Pure]> {
   let arguments = (ins I64Attr:$start, I64Attr:$end, WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_NewOp : WeftRISCV_Op<"new", [Pure]> {
+def WeftRISCV_NewOp : WeftRISCV_TerminalOp<"new", [Pure]> {
   let arguments = (ins Optional<AnyType>:$initial, BoolAttr:$initialized,
                        StrAttr:$placement, I64Attr:$owner_domain_id,
                        I64Attr:$birth_id, I64Attr:$lifetime_end_domain_id);
@@ -969,7 +978,7 @@ def WeftRISCV_MaterializeOp : WeftRISCV_Op<"materialize", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_StagedViewOp : WeftRISCV_Op<"staged_view", [Pure]> {
+def WeftRISCV_StagedViewOp : WeftRISCV_TerminalOp<"staged_view", [Pure]> {
   let arguments = (ins WeftRISCV_MemDescType:$source, StrAttr:$schema,
                        I64Attr:$owner_domain_id, I64Attr:$birth_id,
                        I64Attr:$lifetime_end_domain_id);
@@ -978,7 +987,7 @@ def WeftRISCV_StagedViewOp : WeftRISCV_Op<"staged_view", [Pure]> {
 }
 
 def WeftRISCV_MemoryViewOp
-    : WeftRISCV_Op<"memory_view", [Pure, AttrSizedOperandSegments]> {
+    : WeftRISCV_TerminalOp<"memory_view", [Pure, AttrSizedOperandSegments]> {
   let arguments = (ins WeftRISCV_MemDescType:$base,
                        Variadic<Index>:$extents,
                        Variadic<Index>:$strides,
@@ -987,14 +996,14 @@ def WeftRISCV_MemoryViewOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_SliceOp : WeftRISCV_Op<"slice", [Pure]> {
+def WeftRISCV_SliceOp : WeftRISCV_TerminalOp<"slice", [Pure]> {
   let arguments = (ins WeftRISCV_MemDescType:$base,
                        Variadic<AnyType>:$indices, ArrayAttr:$selectors);
   let results = (outs WeftRISCV_MemDescType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_SubviewOp : WeftRISCV_Op<"subview", [Pure]> {
+def WeftRISCV_SubviewOp : WeftRISCV_TerminalOp<"subview", [Pure]> {
   let arguments = (ins WeftRISCV_MemDescType:$base,
                        DenseI64ArrayAttr:$offsets,
                        DenseI64ArrayAttr:$extents);
@@ -1002,14 +1011,14 @@ def WeftRISCV_SubviewOp : WeftRISCV_Op<"subview", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ReshapeOp : WeftRISCV_Op<"reshape", [Pure]> {
+def WeftRISCV_ReshapeOp : WeftRISCV_TerminalOp<"reshape", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        DenseI64ArrayAttr:$order);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_LoadOp : WeftRISCV_Op<"load", [
+def WeftRISCV_LoadOp : WeftRISCV_LeafOp<"load", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins WeftRISCV_MemDescType:$region,
                        Optional<WeftRISCV_LocalType>:$snapshot_storage,
@@ -1019,14 +1028,14 @@ def WeftRISCV_LoadOp : WeftRISCV_Op<"load", [
   let hasVerifier = 1;
 }
 
-def WeftRISCV_StoreOp : WeftRISCV_Op<"store", [MemoryEffects<[MemWrite]>]> {
+def WeftRISCV_StoreOp : WeftRISCV_LeafOp<"store", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$value, WeftRISCV_MemDescType:$region,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_FieldOp : WeftRISCV_Op<"field", [Pure]> {
+def WeftRISCV_FieldOp : WeftRISCV_LeafOp<"field", [Pure]> {
   let arguments = (ins AnyType:$owner, StrAttr:$name,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1034,7 +1043,7 @@ def WeftRISCV_FieldOp : WeftRISCV_Op<"field", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ExtractOp : WeftRISCV_Op<"extract", [Pure]> {
+def WeftRISCV_ExtractOp : WeftRISCV_LeafOp<"extract", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        Variadic<AnyType>:$indices, ArrayAttr:$selectors,
                        WeftRISCV_AccessAttr:$access,
@@ -1043,7 +1052,7 @@ def WeftRISCV_ExtractOp : WeftRISCV_Op<"extract", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_UpdateOp : WeftRISCV_Op<"update", [Pure]> {
+def WeftRISCV_UpdateOp : WeftRISCV_LeafOp<"update", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input, AnyType:$value,
                        Variadic<AnyType>:$indices, ArrayAttr:$selectors,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1051,21 +1060,21 @@ def WeftRISCV_UpdateOp : WeftRISCV_Op<"update", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_UnaryOp : WeftRISCV_Op<"unary", [Pure]> {
+def WeftRISCV_UnaryOp : WeftRISCV_LeafOp<"unary", [Pure]> {
   let arguments = (ins AnyType:$input, StrAttr:$kind,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_BinaryOp : WeftRISCV_Op<"binary", [Pure]> {
+def WeftRISCV_BinaryOp : WeftRISCV_LeafOp<"binary", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$kind,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_CompareOp : WeftRISCV_Op<"compare", [Pure]> {
+def WeftRISCV_CompareOp : WeftRISCV_LeafOp<"compare", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, StrAttr:$predicate,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1073,7 +1082,7 @@ def WeftRISCV_CompareOp : WeftRISCV_Op<"compare", [Pure]> {
 }
 
 class WeftRISCV_ConversionOp<string mnemonic>
-    : WeftRISCV_Op<mnemonic, [Pure]> {
+    : WeftRISCV_LeafOp<mnemonic, [Pure]> {
   let arguments = (ins AnyType:$input, WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
@@ -1081,7 +1090,7 @@ class WeftRISCV_ConversionOp<string mnemonic>
 
 def WeftRISCV_CastOp : WeftRISCV_ConversionOp<"cast">;
 
-def WeftRISCV_NarrowOp : WeftRISCV_Op<"narrow", [Pure]> {
+def WeftRISCV_NarrowOp : WeftRISCV_LeafOp<"narrow", [Pure]> {
   let arguments = (ins AnyType:$input, StrAttr:$rounding, BoolAttr:$saturate,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1098,14 +1107,14 @@ def WeftRISCV_MacGroupsOp : WeftRISCV_Op<"mac_groups", [Pure]> {
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ReduceOp : WeftRISCV_Op<"reduce", [Pure]> {
+def WeftRISCV_ReduceOp : WeftRISCV_LeafOp<"reduce", [Pure]> {
   let arguments = (ins AnyType:$input, StrAttr:$kind, I64Attr:$axis,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_Fold2Op : WeftRISCV_Op<"fold2", [Pure]> {
+def WeftRISCV_Fold2Op : WeftRISCV_LeafOp<"fold2", [Pure]> {
   let arguments = (ins AnyType:$input, WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1130,7 +1139,7 @@ def WeftRISCV_ContractOp : WeftRISCV_ContractLikeOp<"contract">;
 def WeftRISCV_OuterContractOp
     : WeftRISCV_ContractLikeOp<"outer_contract">;
 
-def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [
+def WeftRISCV_LookupOp : WeftRISCV_LeafOp<"lookup", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins AnyType:$table, AnyType:$indices, StrAttr:$bounds,
                        WeftRISCV_AccessAttr:$access,
@@ -1140,7 +1149,7 @@ def WeftRISCV_LookupOp : WeftRISCV_Op<"lookup", [
 }
 
 def WeftRISCV_RVVByteGatherOp
-    : WeftRISCV_Op<"rvv_byte_gather", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_byte_gather", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$source,
                        WeftRISCV_ValueType:$byte_offsets,
                        WeftRISCV_AccessAttr:$access,
@@ -1150,7 +1159,7 @@ def WeftRISCV_RVVByteGatherOp
 }
 
 def WeftRISCV_RVVByteWindowsLoadOp
-    : WeftRISCV_Op<"rvv_byte_windows_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_byte_windows_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$source, AnyType:$byte_base,
                        DenseI64ArrayAttr:$window_offsets,
                        I64Attr:$window_bytes,
@@ -1161,7 +1170,7 @@ def WeftRISCV_RVVByteWindowsLoadOp
 }
 
 def WeftRISCV_RVVIndexedEntryLoadOp
-    : WeftRISCV_Op<"rvv_indexed_entry_load",
+    : WeftRISCV_LeafOp<"rvv_indexed_entry_load",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$source,
                        AnyType:$entry_offsets,
@@ -1176,7 +1185,7 @@ def WeftRISCV_RVVIndexedEntryLoadOp
 }
 
 def WeftRISCV_RVVUnitEntryWindowLoadOp
-    : WeftRISCV_Op<"rvv_unit_entry_window_load",
+    : WeftRISCV_LeafOp<"rvv_unit_entry_window_load",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$source,
                        AnyType:$entry_base,
@@ -1192,7 +1201,7 @@ def WeftRISCV_RVVUnitEntryWindowLoadOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout",
+def WeftRISCV_ConvertLayoutOp : WeftRISCV_LeafOp<"convert_layout",
     [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_ConversionAttr:$conversion,
@@ -1202,27 +1211,38 @@ def WeftRISCV_ConvertLayoutOp : WeftRISCV_Op<"convert_layout",
   let hasVerifier = 1;
 }
 
+def WeftRISCV_FieldReadOp : WeftRISCV_LeafOp<"field_read",
+    [MemoryEffects<[MemRead]>]> {
+  let summary = "Read an encoded projection into an explicit numeric representation";
+  let arguments = (ins WeftRISCV_ValueType:$input,
+                       Variadic<AnyType>:$indices,
+                       WeftRISCV_AccessAttr:$access,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_ValueType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_LocalAllocOp
-    : WeftRISCV_Op<"local_alloc", [MemoryEffects<[MemAlloc]>]> {
+    : WeftRISCV_TerminalOp<"local_alloc", [MemoryEffects<[MemAlloc]>]> {
   let arguments = (ins Index:$size_bytes);
   let results = (outs WeftRISCV_LocalType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_LocalCapacityGuardOp : WeftRISCV_Op<"local_capacity_guard"> {
+def WeftRISCV_LocalCapacityGuardOp : WeftRISCV_LeafOp<"local_capacity_guard"> {
   let arguments = (ins Index:$size_bytes, I64Attr:$limit_bytes,
                        I64Attr:$birth_id, WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_LocalBindOp : WeftRISCV_Op<"local_bind", [Pure]> {
+def WeftRISCV_LocalBindOp : WeftRISCV_TerminalOp<"local_bind", [Pure]> {
   let arguments = (ins WeftRISCV_LocalType:$storage, Index:$elements);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_DenseSnapshotOp
-    : WeftRISCV_Op<"dense_snapshot", [MemoryEffects<[MemRead, MemWrite]>]> {
+    : WeftRISCV_LeafOp<"dense_snapshot", [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins WeftRISCV_MemDescType:$source,
                        WeftRISCV_LocalType:$storage,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1231,7 +1251,7 @@ def WeftRISCV_DenseSnapshotOp
 }
 
 def WeftRISCV_LocalLoadOp
-    : WeftRISCV_Op<"local_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"local_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$source, Index:$index,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
@@ -1239,7 +1259,7 @@ def WeftRISCV_LocalLoadOp
 }
 
 def WeftRISCV_LocalStoreOp
-    : WeftRISCV_Op<"local_store", [MemoryEffects<[MemWrite]>]> {
+    : WeftRISCV_LeafOp<"local_store", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$value, WeftRISCV_ValueType:$destination,
                        Index:$index,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1247,7 +1267,7 @@ def WeftRISCV_LocalStoreOp
 }
 
 def WeftRISCV_RVVLocalMaterializeOp
-    : WeftRISCV_Op<"rvv_local_materialize", [MemoryEffects<[MemWrite]>]> {
+    : WeftRISCV_LeafOp<"rvv_local_materialize", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_ValueType:$destination,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1269,14 +1289,14 @@ def WeftRISCV_EncodedLocalPackOp
 }
 
 def WeftRISCV_IndexMultipleGuardOp
-    : WeftRISCV_Op<"index_multiple_guard"> {
+    : WeftRISCV_LeafOp<"index_multiple_guard"> {
   let arguments = (ins Index:$value, I64Attr:$multiple,
                        WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_EncodedLocalBindOp
-    : WeftRISCV_Op<"encoded_local_bind", [Pure]> {
+    : WeftRISCV_TerminalOp<"encoded_local_bind", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_LocalType:$storage,
                        Index:$block_count,
@@ -1286,7 +1306,7 @@ def WeftRISCV_EncodedLocalBindOp
 }
 
 def WeftRISCV_RVVEncodedLocalPackTransferOp
-    : WeftRISCV_Op<"rvv_encoded_local_pack_transfer",
+    : WeftRISCV_LeafOp<"rvv_encoded_local_pack_transfer",
                    [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_LocalType:$storage,
@@ -1300,21 +1320,21 @@ def WeftRISCV_RVVEncodedLocalPackTransferOp
 }
 
 def WeftRISCV_SpillOp
-    : WeftRISCV_Op<"spill", [MemoryEffects<[MemWrite]>]> {
+    : WeftRISCV_LeafOp<"spill", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins AnyType:$input, WeftRISCV_LocalType:$slot,
                        WeftRISCV_LeafAttr:$leaf);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_ReloadOp
-    : WeftRISCV_Op<"reload", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"reload", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_LocalType:$slot, WeftRISCV_LeafAttr:$leaf);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_IMEFragmentMMAOp
-    : WeftRISCV_Op<"ime_fragment_mma",
+    : WeftRISCV_LeafOp<"ime_fragment_mma",
                    [MemoryEffects<[MemRead, MemWrite]>]> {
   let arguments = (ins WeftRISCV_FragmentType:$lhs,
                        WeftRISCV_FragmentType:$rhs,
@@ -1327,7 +1347,7 @@ def WeftRISCV_IMEFragmentMMAOp
 }
 
 def WeftRISCV_IMEPackOp
-    : WeftRISCV_Op<"ime_pack", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"ime_pack", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$input, StrAttr:$role,
                        WeftRISCV_FragmentPackingAttr:$packing,
                        WeftRISCV_AccessAttr:$access,
@@ -1336,7 +1356,7 @@ def WeftRISCV_IMEPackOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_IMEUnpackOp : WeftRISCV_Op<"ime_unpack", [Pure]> {
+def WeftRISCV_IMEUnpackOp : WeftRISCV_LeafOp<"ime_unpack", [Pure]> {
   let arguments = (ins WeftRISCV_FragmentType:$input,
                        WeftRISCV_ConversionAttr:$conversion,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1345,7 +1365,7 @@ def WeftRISCV_IMEUnpackOp : WeftRISCV_Op<"ime_unpack", [Pure]> {
 }
 
 def WeftRISCV_RegisterMaterializeOp
-    : WeftRISCV_Op<"register_materialize", [Pure]> {
+    : WeftRISCV_TerminalOp<"register_materialize", [Pure]> {
   let arguments = (ins AnyType:$input, I64Attr:$owner_domain_id,
                        I64Attr:$birth_id, I64Attr:$lifetime_end_domain_id,
                        StrAttr:$realization);
@@ -1354,7 +1374,7 @@ def WeftRISCV_RegisterMaterializeOp
 }
 
 def WeftRISCV_RVVBitplaneMergeOp
-    : WeftRISCV_Op<"rvv_bitplane_merge", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_bitplane_merge", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$low,
                        WeftRISCV_ValueType:$plane,
                        I64Attr:$insert_bit,
@@ -1364,7 +1384,7 @@ def WeftRISCV_RVVBitplaneMergeOp
 }
 
 def WeftRISCV_PackedPlaneMergeOp
-    : WeftRISCV_Op<"packed_plane_merge", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"packed_plane_merge", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$low_field,
                        WeftRISCV_ValueType:$high_field,
                        WeftRISCV_PackedPlaneMergePlanAttr:$plan,
@@ -1374,7 +1394,7 @@ def WeftRISCV_PackedPlaneMergeOp
 }
 
 def WeftRISCV_RVVBitmaskDecodeOp
-    : WeftRISCV_Op<"rvv_bitmask_decode", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_bitmask_decode", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        WeftRISCV_PointType:$point,
@@ -1385,7 +1405,7 @@ def WeftRISCV_RVVBitmaskDecodeOp
 }
 
 def WeftRISCV_RVVSignedBitmaskReduceOp
-    : WeftRISCV_Op<"rvv_signed_bitmask_reduce", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_signed_bitmask_reduce", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$data,
                        WeftRISCV_ValueType:$mask,
                        I64Attr:$reduction_axis,
@@ -1395,7 +1415,7 @@ def WeftRISCV_RVVSignedBitmaskReduceOp
 }
 
 def WeftRISCV_RVVBitmaskWindowLoadOp
-    : WeftRISCV_Op<"rvv_bitmask_window_load",
+    : WeftRISCV_LeafOp<"rvv_bitmask_window_load",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        AnyType:$byte_base,
@@ -1410,7 +1430,7 @@ def WeftRISCV_RVVBitmaskWindowLoadOp
 }
 
 def WeftRISCV_RVVGroupedMacLoadOp
-    : WeftRISCV_Op<"rvv_grouped_mac_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_grouped_mac_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, Index:$group_index,
                        Index:$active_terms,
                        WeftRISCV_LayoutAttr:$load_layout,
@@ -1423,7 +1443,7 @@ def WeftRISCV_RVVGroupedMacLoadOp
 }
 
 def WeftRISCV_RVVGroupedMacStepOp
-    : WeftRISCV_Op<"rvv_grouped_mac_step", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_grouped_mac_step", [Pure]> {
   let arguments = (ins WeftRISCV_WindowType:$window,
                        WeftRISCV_ValueType:$accumulator,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1456,7 +1476,7 @@ def WeftRISCV_RVVWidenDotOp : WeftRISCV_Op<"rvv_widen_dot", [Pure]> {
 }
 
 def WeftRISCV_RVVWidenMultiplyOp
-    : WeftRISCV_Op<"rvv_widen_multiply", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_widen_multiply", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1465,7 +1485,7 @@ def WeftRISCV_RVVWidenMultiplyOp
 }
 
 def WeftRISCV_RVVWidenScalarMultiplyOp
-    : WeftRISCV_Op<"rvv_widen_scalar_multiply", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_widen_scalar_multiply", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        AnyType:$rhs,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1474,7 +1494,7 @@ def WeftRISCV_RVVWidenScalarMultiplyOp
 }
 
 def WeftRISCV_RVVMultiplyHighScalarOp
-    : WeftRISCV_Op<"rvv_multiply_high_scalar", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_multiply_high_scalar", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        AnyType:$rhs,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1483,7 +1503,7 @@ def WeftRISCV_RVVMultiplyHighScalarOp
 }
 
 def WeftRISCV_RVVRegularRepeatIndexOp
-    : WeftRISCV_Op<"rvv_regular_repeat_index", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_regular_repeat_index", [Pure]> {
   let arguments = (ins I64Attr:$reduction_axis,
                        I64Attr:$repeat,
                        ArrayAttr:$part_bases,
@@ -1493,7 +1513,7 @@ def WeftRISCV_RVVRegularRepeatIndexOp
 }
 
 def WeftRISCV_RVVRegularRepeatGatherOp
-    : WeftRISCV_Op<"rvv_regular_repeat_gather", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_regular_repeat_gather", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        Variadic<WeftRISCV_ValueType>:$indices,
                        I64Attr:$source_axis,
@@ -1509,7 +1529,7 @@ def WeftRISCV_RVVRegularRepeatGatherOp
 }
 
 def WeftRISCV_RVVRegularRepeatScalarLoadOp
-    : WeftRISCV_Op<"rvv_regular_repeat_scalar_load",
+    : WeftRISCV_LeafOp<"rvv_regular_repeat_scalar_load",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        I64Attr:$source_axis,
@@ -1525,7 +1545,7 @@ def WeftRISCV_RVVRegularRepeatScalarLoadOp
 }
 
 def WeftRISCV_RVVStorageWindowOp
-    : WeftRISCV_Op<"rvv_storage_window", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_storage_window", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        Index:$logical_offset,
@@ -1537,7 +1557,7 @@ def WeftRISCV_RVVStorageWindowOp
 }
 
 def WeftRISCV_RVVLayeredRecordLoadOp
-    : WeftRISCV_Op<"rvv_layered_record_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_layered_record_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        Index:$logical_offset,
@@ -1549,7 +1569,7 @@ def WeftRISCV_RVVLayeredRecordLoadOp
 }
 
 def WeftRISCV_RVVLayeredStorageLoadOp
-    : WeftRISCV_Op<"rvv_layered_storage_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_layered_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
                        Index:$window_index,
@@ -1561,7 +1581,7 @@ def WeftRISCV_RVVLayeredStorageLoadOp
 }
 
 def WeftRISCV_RVVLayeredStorageDecodeOp
-    : WeftRISCV_Op<"rvv_layered_storage_decode", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_layered_storage_decode", [Pure]> {
   let arguments = (ins WeftRISCV_LayeredWindowType:$window,
                        I64Attr:$layer,
                        I64Attr:$physical_layer,
@@ -1573,7 +1593,7 @@ def WeftRISCV_RVVLayeredStorageDecodeOp
 }
 
 def WeftRISCV_RVVReplicaStorageLoadOp
-    : WeftRISCV_Op<"rvv_replica_storage_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_replica_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        AnyType:$logical_base,
                        WeftRISCV_StorageWindowPlanAttr:$plan,
@@ -1593,7 +1613,7 @@ def WeftRISCV_RVVReplicaStorageLoadOp
 }
 
 def WeftRISCV_RVVSegmentPairLoadOp
-    : WeftRISCV_Op<"rvv_segment_pair_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_segment_pair_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        I64Attr:$logical_base,
                        WeftRISCV_AccessAttr:$access,
@@ -1604,7 +1624,7 @@ def WeftRISCV_RVVSegmentPairLoadOp
 }
 
 def WeftRISCV_RVVRecordStorageLoadOp
-    : WeftRISCV_Op<"rvv_record_storage_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_record_storage_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins AnyType:$field,
                        WeftRISCV_RecordCohortType:$cohort,
                        I64Attr:$storage_index,
@@ -1618,7 +1638,7 @@ def WeftRISCV_RVVRecordStorageLoadOp
 }
 
 def WeftRISCV_RVVRecordStorageDecodeOp
-    : WeftRISCV_Op<"rvv_record_storage_decode", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_record_storage_decode", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        I64Attr:$logical_index,
                        I64Attr:$shift_amount,
@@ -1629,7 +1649,7 @@ def WeftRISCV_RVVRecordStorageDecodeOp
 }
 
 def WeftRISCV_RVVRecordStoreOp
-    : WeftRISCV_Op<"rvv_record_store", [MemoryEffects<[MemWrite]>]> {
+    : WeftRISCV_LeafOp<"rvv_record_store", [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins WeftRISCV_ValueType:$value,
                        WeftRISCV_MemDescType:$destination,
                        WeftRISCV_RecordCohortType:$cohort,
@@ -1641,7 +1661,7 @@ def WeftRISCV_RVVRecordStoreOp
 }
 
 def WeftRISCV_RVVIssueSliceOp
-    : WeftRISCV_Op<"rvv_issue_slice", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_issue_slice", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        DenseI64ArrayAttr:$source_parts,
                        DenseI64ArrayAttr:$lane_offsets,
@@ -1651,7 +1671,7 @@ def WeftRISCV_RVVIssueSliceOp
 }
 
 def WeftRISCV_RVVWidenAccumulateOp
-    : WeftRISCV_Op<"rvv_widen_accumulate", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_widen_accumulate", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        WeftRISCV_ValueType:$accumulator,
@@ -1662,7 +1682,7 @@ def WeftRISCV_RVVWidenAccumulateOp
 }
 
 def WeftRISCV_RVVFinalizeWidenDotOp
-    : WeftRISCV_Op<"rvv_finalize_widen_dot", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_finalize_widen_dot", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$partial,
                        DenseI64ArrayAttr:$reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1671,7 +1691,7 @@ def WeftRISCV_RVVFinalizeWidenDotOp
 }
 
 def WeftRISCV_RVVPartialSetOp
-    : WeftRISCV_Op<"rvv_partial_set",
+    : WeftRISCV_LeafOp<"rvv_partial_set",
                    [Pure, AttrSizedOperandSegments]> {
   let arguments = (ins Variadic<WeftRISCV_ValueType>:$lhs,
                        Variadic<WeftRISCV_ValueType>:$rhs,
@@ -1692,7 +1712,7 @@ def WeftRISCV_RVVPartialSetOp
 }
 
 def WeftRISCV_RVVPartialCaptureOp
-    : WeftRISCV_Op<"rvv_partial_capture", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_capture", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        I64Attr:$owner_domain_id,
                        I64Attr:$birth_id,
@@ -1703,7 +1723,7 @@ def WeftRISCV_RVVPartialCaptureOp
 }
 
 def WeftRISCV_RVVPartialCollectOp
-    : WeftRISCV_Op<"rvv_partial_collect", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_collect", [Pure]> {
   let arguments = (ins Variadic<WeftRISCV_ValueType>:$inputs,
                        I64Attr:$owner_domain_id,
                        I64Attr:$birth_id,
@@ -1714,7 +1734,7 @@ def WeftRISCV_RVVPartialCollectOp
 }
 
 def WeftRISCV_RVVPartialRepackOp
-    : WeftRISCV_Op<"rvv_partial_repack", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_repack", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        I64Attr:$split_factor,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1723,7 +1743,7 @@ def WeftRISCV_RVVPartialRepackOp
 }
 
 def WeftRISCV_RVVPartialMergeOp
-    : WeftRISCV_Op<"rvv_partial_merge", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_merge", [Pure]> {
   let arguments = (ins Variadic<WeftRISCV_PartialSetType>:$inputs,
                        StrAttr:$topology,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1732,7 +1752,7 @@ def WeftRISCV_RVVPartialMergeOp
 }
 
 def WeftRISCV_RVVPartialReduceOp
-    : WeftRISCV_Op<"rvv_partial_reduce", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_reduce", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_PartialSetType:$result);
@@ -1740,7 +1760,7 @@ def WeftRISCV_RVVPartialReduceOp
 }
 
 def WeftRISCV_RVVPartialScaleCombineOp
-    : WeftRISCV_Op<"rvv_partial_scale_combine", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_scale_combine", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        Variadic<AnyType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
@@ -1752,7 +1772,7 @@ def WeftRISCV_RVVPartialScaleCombineOp
 }
 
 def WeftRISCV_RVVPartialWidenScaleOp
-    : WeftRISCV_Op<"rvv_partial_widen_scale", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_widen_scale", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        Variadic<WeftRISCV_ValueType>:$scales,
                        DenseI64ArrayAttr:$scale_replicas,
@@ -1764,7 +1784,7 @@ def WeftRISCV_RVVPartialWidenScaleOp
 }
 
 def WeftRISCV_RVVPartialCombineOp
-    : WeftRISCV_Op<"rvv_partial_combine", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_combine", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        I64Attr:$arity,
                        StrAttr:$topology,
@@ -1775,7 +1795,7 @@ def WeftRISCV_RVVPartialCombineOp
 }
 
 def WeftRISCV_RVVPartialFinalizeOp
-    : WeftRISCV_Op<"rvv_partial_finalize", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_partial_finalize", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
                        I64Attr:$reduction_axis,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1784,7 +1804,7 @@ def WeftRISCV_RVVPartialFinalizeOp
 }
 
 def WeftRISCV_RVVAssembleReplicasOp
-    : WeftRISCV_Op<"rvv_assemble_replicas", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_assemble_replicas", [Pure]> {
   let arguments = (ins Variadic<AnyInteger>:$values,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
@@ -1792,7 +1812,7 @@ def WeftRISCV_RVVAssembleReplicasOp
 }
 
 def WeftRISCV_RVVWidenReduceOp
-    : WeftRISCV_Op<"rvv_widen_reduce", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_widen_reduce", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        StrAttr:$kind,
                        I64Attr:$axis,
@@ -1802,7 +1822,7 @@ def WeftRISCV_RVVWidenReduceOp
 }
 
 def WeftRISCV_RVVPartitionedWidenReduceStoreOp
-    : WeftRISCV_Op<"rvv_partitioned_widen_reduce_store",
+    : WeftRISCV_LeafOp<"rvv_partitioned_widen_reduce_store",
                    [MemoryEffects<[MemWrite]>]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_MemDescType:$destination,
@@ -1816,7 +1836,7 @@ def WeftRISCV_RVVPartitionedWidenReduceStoreOp
 }
 
 def WeftRISCV_RVVLayeredWindowOp
-    : WeftRISCV_Op<"rvv_layered_window", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_layered_window", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$point,
                        WeftRISCV_AccessAttr:$access,
@@ -1831,7 +1851,7 @@ def WeftRISCV_RVVLayeredWindowOp
 }
 
 def WeftRISCV_RVVLayeredStreamOp
-    : WeftRISCV_Op<"rvv_layered_stream", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_layered_stream", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LayeredStreamGeometryAttr:$geometry,
@@ -1841,7 +1861,7 @@ def WeftRISCV_RVVLayeredStreamOp
 }
 
 def WeftRISCV_RVVProjectedLayeredStreamOp
-    : WeftRISCV_Op<"rvv_projected_layered_stream",
+    : WeftRISCV_LeafOp<"rvv_projected_layered_stream",
                    [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_ValueType:$field,
                        WeftRISCV_PointType:$origin,
@@ -1901,7 +1921,7 @@ def WeftRISCV_RVVStreamContractOp
 }
 
 def WeftRISCV_RVVStreamLoadOp
-    : WeftRISCV_Op<"rvv_stream_load", [MemoryEffects<[MemRead]>]> {
+    : WeftRISCV_LeafOp<"rvv_stream_load", [MemoryEffects<[MemRead]>]> {
   let arguments = (ins WeftRISCV_MemDescType:$source,
                        Index:$offset, Index:$active, I1:$valid,
                        Variadic<WeftRISCV_PointType>:$free_points,
@@ -1913,7 +1933,7 @@ def WeftRISCV_RVVStreamLoadOp
 }
 
 def WeftRISCV_RVVStreamReduceStepOp
-    : WeftRISCV_Op<"rvv_stream_reduce_step", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_stream_reduce_step", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_ValueType:$accumulator,
                        Index:$active, StrAttr:$kind,
@@ -1923,7 +1943,7 @@ def WeftRISCV_RVVStreamReduceStepOp
 }
 
 def WeftRISCV_RVVStreamDotStepOp
-    : WeftRISCV_Op<"rvv_stream_dot_step", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_stream_dot_step", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        WeftRISCV_ValueType:$accumulator,
@@ -1933,7 +1953,7 @@ def WeftRISCV_RVVStreamDotStepOp
 }
 
 def WeftRISCV_RVVStreamContractStepOp
-    : WeftRISCV_Op<"rvv_stream_contract_step", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_stream_contract_step", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$lhs,
                        WeftRISCV_ValueType:$rhs,
                        WeftRISCV_ValueType:$accumulator,
@@ -1944,7 +1964,7 @@ def WeftRISCV_RVVStreamContractStepOp
 }
 
 def WeftRISCV_RVVStreamFinalizeOp
-    : WeftRISCV_Op<"rvv_stream_finalize", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_stream_finalize", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        I64Attr:$axis, StrAttr:$kind,
                        WeftRISCV_LeafAttr:$leaf);
@@ -1952,14 +1972,14 @@ def WeftRISCV_RVVStreamFinalizeOp
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RVVSplatOp : WeftRISCV_Op<"rvv_splat", [Pure]> {
+def WeftRISCV_RVVSplatOp : WeftRISCV_LeafOp<"rvv_splat", [Pure]> {
   let arguments = (ins AnyType:$scalar, WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
 def WeftRISCV_RVVAxisBroadcastOp
-    : WeftRISCV_Op<"rvv_axis_broadcast", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_axis_broadcast", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input,
                        WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
@@ -1967,14 +1987,14 @@ def WeftRISCV_RVVAxisBroadcastOp
 }
 
 def WeftRISCV_ProjectReductionOperandOp
-    : WeftRISCV_Op<"project_reduction_operand", [Pure]> {
+    : WeftRISCV_LeafOp<"project_reduction_operand", [Pure]> {
   let arguments = (ins WeftRISCV_ValueType:$input, Index:$reduction_index,
                        I64Attr:$reduction_axis, WeftRISCV_LeafAttr:$leaf);
   let results = (outs WeftRISCV_ValueType:$result);
   let hasVerifier = 1;
 }
 
-def WeftRISCV_RVVContractStepOp : WeftRISCV_Op<"rvv_contract_step", [Pure]> {
+def WeftRISCV_RVVContractStepOp : WeftRISCV_LeafOp<"rvv_contract_step", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                        WeftRISCV_ValueType:$accumulator, Index:$reduction_index,
                        I64Attr:$reduction_axis, StrAttr:$lane_operand,
@@ -1986,7 +2006,7 @@ def WeftRISCV_RVVContractStepOp : WeftRISCV_Op<"rvv_contract_step", [Pure]> {
 }
 
 def WeftRISCV_RVVEncodedContractStepOp
-    : WeftRISCV_Op<"rvv_encoded_contract_step", [Pure]> {
+    : WeftRISCV_LeafOp<"rvv_encoded_contract_step", [Pure]> {
   let arguments = (ins AnyType:$lhs, AnyType:$rhs,
                        WeftRISCV_ValueType:$accumulator, Index:$reduction_index,
                        I64Attr:$reduction_axis, StrAttr:$lane_operand,

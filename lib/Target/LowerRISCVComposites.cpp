@@ -1,6 +1,7 @@
 #include "Weft/Target/RISCVPasses.h"
 
 #include "RISCVPhysicalSupport.h"
+#include "IME/FragmentMaterialization.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
 
@@ -77,23 +78,6 @@ void copyIdentity(mlir::Operation *source, mlir::Operation *target) {
     target->setAttr("source_origin", origin);
   if (auto canonical = source->getAttr("canonical_op"))
     target->setAttr("canonical_op", canonical);
-}
-
-riscv::LayoutAttr fragmentLayout(mlir::Builder &builder, riscv::ValueType value,
-                                 llvm::ArrayRef<int64_t> physicalShape) {
-  auto axes = value.getAxisIds().asArrayRef();
-  llvm::SmallVector<int64_t> time(axes.size(), 1);
-  llvm::SmallVector<int64_t> one(axes.size(), 1);
-  llvm::SmallVector<int64_t> fragment(physicalShape.begin(), physicalShape.end());
-  return riscv::LayoutAttr::get(
-      builder.getContext(), "ime", value.getAxisIds(),
-      riscv_internal::integers(builder, time),
-      riscv_internal::integers(builder, one),
-      riscv_internal::integers(builder, one),
-      riscv_internal::integers(builder, fragment),
-      riscv_internal::integers(builder, one),
-      std::max<int64_t>(8, riscv_internal::logicalBitWidth(value)), 0, 1, 0,
-      value.getLayout().getValidity());
 }
 
 class LowerRISCVCompositesPass
@@ -2315,108 +2299,13 @@ private:
       }
       rewriter.setInsertionPoint(operation);
       if (implementation.getEngine() == "ime") {
-        auto parameters = implementation.getParameters().asArrayRef();
-        riscv::FragmentCapabilityAttr capability;
-        for (mlir::Attribute candidate :
-             operation->getParentOfType<riscv::KernelOp>()
-                 .getTarget()
-                 .getFragments()) {
-          auto fragment = mlir::cast<riscv::FragmentCapabilityAttr>(candidate);
-          if (fragment.getInstruction() == implementation.getOperation()) {
-            capability = fragment;
-            break;
-          }
-        }
-        if (parameters.size() != 3 || !capability) {
-          operation->emitError("IME selection has no fragment shape/resources");
+        auto result = riscv_internal::materializeFragmentProduct(
+            rewriter, operation, implementation, resultType);
+        if (mlir::failed(result)) {
           failed = true;
           continue;
         }
-        auto lhsType =
-            mlir::cast<riscv::ValueType>(operation->getOperand(0).getType());
-        auto rhsType =
-            mlir::cast<riscv::ValueType>(operation->getOperand(1).getType());
-        llvm::SmallVector<int64_t, 2> lhsShape = {
-            capability.getMFactor(), capability.getKFactor()};
-        llvm::SmallVector<int64_t, 2> rhsShape = {
-            capability.getKFactor(), capability.getNFactor()};
-        llvm::SmallVector<int64_t, 2> resultShape = {
-            capability.getMFactor(), capability.getNFactor()};
-        auto makeFragment = [&](riscv::ValueType value, llvm::StringRef role,
-                                riscv::FragmentPackingAttr packing,
-                                llvm::ArrayRef<int64_t> shape) {
-          const int64_t resources =
-              role == "lhs" ? capability.getLhsResourceGroups()
-              : role == "rhs" ? capability.getRhsResourceGroups()
-                              : capability.getAccumulatorResourceGroups();
-          return riscv::FragmentType::get(
-              value.getContext(), implementation.getOperation(),
-              role, packing, value.getElementType(),
-              riscv_internal::integers(rewriter, shape), value.getAxisIds(),
-              fragmentLayout(rewriter, value, shape), resources);
-        };
-        riscv::FragmentType lhsFragment =
-            makeFragment(lhsType, "lhs", capability.getLhsPacking(), lhsShape);
-        riscv::FragmentType rhsFragment =
-            makeFragment(rhsType, "rhs", capability.getRhsPacking(), rhsShape);
-        riscv::FragmentType resultFragment = makeFragment(
-            resultType, "accumulator", capability.getAccumulatorPacking(),
-            resultShape);
-        auto packLeaf = [&](llvm::StringRef role, riscv::ValueType value,
-                            riscv::FragmentPackingAttr packing,
-                            riscv::FragmentType fragment) {
-          const int64_t elements = product(fragment.getShape());
-          const int64_t logicalBytes =
-              product({elements,
-                       std::max<int64_t>(
-                           1, (riscv_internal::logicalBitWidth(value) + 7) / 8)});
-          const int64_t packedBytes =
-              product({elements, packing.getStorageBits() / 8});
-          return riscv_internal::leaf(
-              rewriter, "ime", "fragment-pack", ("ime.pack." + role).str(),
-              ("ime.pack." + role).str(), 0, 0, 1, 0, "none", "exact",
-              parameters, sum(logicalBytes, packedBytes));
-        };
-        riscv::AccessAttr lhsAccess = accessOf(operation->getOperand(0));
-        riscv::AccessAttr rhsAccess = accessOf(operation->getOperand(1));
-        if (!lhsAccess || !rhsAccess) {
-          operation->emitError("IME operands have no typed memory access contract");
-          failed = true;
-          continue;
-        }
-        auto lhsPack = rewriter.create<riscv::IMEPackOp>(
-            operation->getLoc(), lhsFragment, operation->getOperand(0), "lhs",
-            capability.getLhsPacking(), lhsAccess,
-            packLeaf("lhs", lhsType, capability.getLhsPacking(), lhsFragment));
-        auto rhsPack = rewriter.create<riscv::IMEPackOp>(
-            operation->getLoc(), rhsFragment, operation->getOperand(1), "rhs",
-            capability.getRhsPacking(), rhsAccess,
-            packLeaf("rhs", rhsType, capability.getRhsPacking(), rhsFragment));
-        const int64_t mmaLocalBytes =
-            product({product(resultFragment.getShape()),
-                     std::max<int64_t>(
-                         1, (riscv_internal::logicalBitWidth(resultType) + 7) / 8)});
-        auto mmaLeaf = riscv_internal::leaf(
-            rewriter, "ime", "fragment-mma", implementation.getOperation(),
-            implementation.getOperation(), 0, 0, 0, 0, "none", "exact",
-            parameters, mmaLocalBytes);
-        auto mma = rewriter.create<riscv::IMEFragmentMMAOp>(
-            operation->getLoc(), resultFragment, lhsPack.getResult(),
-            rhsPack.getResult(), capability.getMmaGroups(),
-            capability.getMmaChunks(), capability.getClobbers(),
-            capability.getVolatileAsm(), capability.getMemoryClobber(), mmaLeaf);
-        auto unpackLeaf = riscv_internal::leaf(
-            rewriter, "ime", "fragment-unpack", "ime.unpack.rvv",
-            "ime.unpack.rvv", 0, 0, 1, 0);
-        auto unpack = rewriter.create<riscv::IMEUnpackOp>(
-            operation->getLoc(), resultType, mma.getResult(),
-            riscv_internal::conversion(rewriter, "fragment_to_rvv", "handoff",
-                                       1),
-            unpackLeaf);
-        copyIdentity(operation, mma);
-        copyIdentity(operation, unpack);
-        operation->getResult(0).replaceAllUsesWith(unpack.getResult());
-        rewriter.eraseOp(operation);
+        rewriter.replaceOp(operation, *result);
         continue;
       }
 

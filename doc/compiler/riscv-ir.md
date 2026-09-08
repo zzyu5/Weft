@@ -127,6 +127,14 @@ layout，`ConversionAttr`保存 transfer kind/effect/temporaries，leaf保存 ex
 conversion保持 element、shape、axes和 logical Value identity，只改变 physical carrier或
 coordinate decomposition。
 
+storage projection 与 numeric SSA 不混同。`field_read` 是显式 Read-effect op：input 保留
+field/extract 到原 load 或 snapshot 的来源，access 固定字节/bit mapping 与 memory form，
+result type 固定数值元素、axes、每个 part 的布局与活跃范围。它不改变 logical domain，
+也不允许把算术结果当作 descriptor 重新读取。pure `time_to_lane` 不再承载字段重供应。
+projection 捕获的 index SSA 同时列为 `field_read.indices`，不能仅靠祖先 Extract 隐式延长
+向量索引寿命。load/decode 的输出组与临时载体上界由共享几何函数计算，leaf verifier 核对，
+资源 pass 与其它 live values 共同计数；转换的零临时数不能代替读取资源。
+
 conversion canonicalization必须重写/删除该 op。final IR可以保留合同已经闭合的 terminal
 conversion；intrinsic-C translator根据 source/result layout确定地展开 slide、splat、tuple
 split/merge或local transfer。这与重新选择layout不同。

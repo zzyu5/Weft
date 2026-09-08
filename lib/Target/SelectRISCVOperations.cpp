@@ -3,6 +3,7 @@
 #include "RISCVPhysicalSupport.h"
 
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Fragment.h"
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -119,7 +120,7 @@ riscv::FragmentCapabilityAttr matchingFragment(mlir::Operation *operation,
         fragment.getRhsBits() == width(rhs.getType()) &&
         signednessMatches(lhs.getType(), fragment.getLhsSignedness()) &&
         signednessMatches(rhs.getType(), fragment.getRhsSignedness()) &&
-        fragment.getAccumulatorBits() == width(result) &&
+        riscv::fragmentAccumulatorTypeMatches(fragment, riscv_internal::logicalElement(result)) &&
         lhsAxes.size() == 2 && rhsAxes.size() == 2 && resultAxes.size() == 2 &&
         riscv_internal::physicalExtent(lhs, lhsAxes[0]) == fragment.getMFactor() &&
         riscv_internal::physicalExtent(lhs, lhsAxes[1]) == fragment.getKFactor() &&

@@ -57,6 +57,11 @@ emitter分支选择。
 `convert_layout`同样是terminal physical op。source/result type和`ConversionAttr`唯一决定
 split/merge/slide/splat/extract；translator实现该映射不等于重新推导layout。
 
+`field_read` 是 Read-effect 的 terminal transfer：input 保留 encoded field/projection 的
+原 load/快照身份，access 固定读取与 bit mapping，result 是具有完整布局的 RVV/scalar numeric SSA。
+它可以读取同一表示，也可以直接供应已选的另一表示；不能把一个已经计算的 numeric value
+追溯回 storage 后重读。pure conversion 不承担这项存储供应职责。
+
 spill/reload必须具有exact transfer leaf、typed local slot和完整value layout；translator不能仅凭
 binding kind自行选择一条隐藏路径。
 
@@ -98,6 +103,25 @@ axis order和各role的resource groups都是typed attribute，不能只靠`role=
 固定的pack、`vmadot`和unpack序列可以opaque，因为shape、trip count、signedness、storage width
 和clobber集合已由唯一capability/spelling合同封闭。i4 operand、其它fragment shape以及非
 VLEN256的IME1 target当前均是明确unsupported，不会由terminal translator改走另一条实现。
+
+ISA capability、packing、fragment groups、私有 scratch 与 clobbers 的唯一描述在
+`lib/Target/IME/FragmentContracts.cpp`。不依赖 MLIR 的 `WeftRISCVContracts` 同时由 target
+profile 与 IR dialect 消费；`FragmentOps.cpp` 负责属性序列化及针对该合同的 verifier，
+`IME/FragmentMaterialization.cpp` 物化 selected product，`IME/FragmentEmission.cpp` 实现拼写。
+属性不能用一个已知 instruction key 冒充不同的 dtype、shape、VLEN 或寄存器约束。
+MMA 的固定 vector clobbers 必须在 issue 点全部预留；已经 live 的 lhs/rhs fragment groups
+只抵扣一次，其余寄存器写入 leaf 的 additional fragment groups。不能假定固定 asm 的
+accumulator 寄存器与输入重叠，或仅用指令前后的最大 live set 代替执行期间的需求。
+
+使用已有 atom 的新算子在 primitive/数值/存储合同已覆盖时，只增加 source/std 表达与显式
+绑定。同类 fragment 合同的新 atom 修改上述目标局部描述、合法性、packing/spelling 与静态
+登记，不修改公共 pipeline、ABI 或 live-set 算法。新的 effect、residency 或数值机制仍需
+显式扩充对应通用合同；这不承诺任意新硬件无需公共改动。
+
+RVV 与 IME 共享 frontend/Canonical IR、外围 control、memory/effect、compiler API、ABI 和
+region-aware live-set 分析；两者的寄存器需求进入同一预算。RVV 的 LMUL/partial/spill 策略
+不因此自动适用于 fragment。标准 ISA 的 native JIT 发现不等于厂商 matrix 扩展发现，后者
+没有实现时仍明确 unsupported。
 
 完整GEMM/GEMV、persistent repack、M/N/K dispatch和outer loop不属于IME leaf。若extension需要
 不同Level/materialization或persistent Encoding，作者在lowering前选择另一份std tree。

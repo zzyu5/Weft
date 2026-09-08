@@ -1,6 +1,8 @@
 #ifndef WEFT_DIALECT_RISCV_IR_RISCVDIALECT_H
 #define WEFT_DIALECT_RISCV_IR_RISCVDIALECT_H
 
+#include "Weft/Dialect/RISCV/IR/RISCVOpsTraits.h"
+
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Dialect.h"
@@ -52,6 +54,16 @@ std::optional<int64_t> rvvPartialRepackCarrierLMULEighths(
 /// repartition unaffected coordinates. No logical coordinate may be lost or
 /// duplicated.
 std::optional<int64_t> rvvPartToLanePieces(ValueType source, ValueType result);
+
+/// Storage projection identity and the address values it captures. Numeric
+/// register extracts are not reloadable storage projections.
+FieldOp fieldReadProjection(mlir::Value value,
+                            llvm::SmallVectorImpl<mlir::Value> *indices = nullptr);
+std::optional<int64_t> encodedFieldRawLMULEighths(ValueType result);
+/// Upper bound for the selected fixed load/decode sequence, including its
+/// output assembly. Address operands themselves are separate SSA live values.
+std::optional<int64_t> fieldReadTemporaryGroups(
+    ValueType result, AccessAttr access, mlir::ValueRange indices);
 
 /// Returns the bit offset of one logical field element under the declared
 /// natural or grouped/layered storage geometry.

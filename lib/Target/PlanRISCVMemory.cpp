@@ -3746,7 +3746,11 @@ public:
 
     getOperation().walk([&](riscv::ConvertLayoutOp operation) {
       auto result = mlir::dyn_cast<riscv::ValueType>(operation.getResult().getType());
-      if (!result || result.getLayout().getCarrier() != "rvv")
+      auto kind = operation.getConversion().getKind();
+      auto readType = kind == "local_load" || kind == "time_to_lane"
+                          ? result : operation.getInput().getType();
+      if (!readType || (readType.getLayout().getCarrier() != "rvv" &&
+                        readType.getLayout().getCarrier() != "scalar"))
         return;
 
       riscv::AccessAttr access;
@@ -3757,7 +3761,7 @@ public:
           return;
         access = extract.getAccess();
       } else if (auto field = source.getDefiningOp<riscv::FieldOp>()) {
-        access = fieldAccess(builder, field, operation.getResult().getType());
+        access = fieldAccess(builder, field, readType);
       } else {
         return;
       }

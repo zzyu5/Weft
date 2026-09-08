@@ -1,4 +1,5 @@
 #include "RISCVPhysicalSupport.h"
+#include "Weft/Dialect/RISCV/IR/Fragment.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -819,51 +820,8 @@ riscv_internal::target(mlir::Builder &builder,
     recordAxisPolicy = "across-records";
     break;
   }
-  for (const RISCVFragmentCapability &fragment : profile.fragmentCapabilities) {
-    llvm::StringRef instruction;
-    riscv::FragmentPackingAttr lhsPacking;
-    riscv::FragmentPackingAttr rhsPacking;
-    riscv::FragmentPackingAttr accumulatorPacking;
-    int64_t mmaGroups = 0;
-    int64_t mmaChunks = 0;
-    mlir::ArrayAttr clobbers;
-    bool volatileAsm = false;
-    bool memoryClobber = false;
-    switch (fragment.instruction) {
-    case RISCVFragmentInstruction::SpacemitIME1I8MMA:
-      instruction = "spacemit-ime1-i8-mma";
-      lhsPacking = riscv::FragmentPackingAttr::get(
-          builder.getContext(), "ime1-i8-m4-k8",
-          integers(builder, {0, 1}), 4, 8, "row_major", "row_major", 8, 32);
-      rhsPacking = riscv::FragmentPackingAttr::get(
-          builder.getContext(), "ime1-i8-n4-k8-transposed",
-          integers(builder, {1, 0}), 4, 8, "row_major", "row_major", 8, 32);
-      accumulatorPacking = riscv::FragmentPackingAttr::get(
-          builder.getContext(), "ime1-i32-m4-n4",
-          integers(builder, {0, 1}), 4, 4, "row_major", "row_major", 32, 32);
-      mmaGroups = 1;
-      mmaChunks = 1;
-      clobbers = builder.getArrayAttr(
-          {builder.getStringAttr("t0"), builder.getStringAttr("v0"),
-           builder.getStringAttr("v1"), builder.getStringAttr("v2"),
-           builder.getStringAttr("v3")});
-      volatileAsm = true;
-      memoryClobber = true;
-      break;
-    }
-    auto signedness = [](RISCVFragmentSignedness value) -> llvm::StringRef {
-      return value == RISCVFragmentSignedness::Signed ? "signed" : "unsigned";
-    };
-    fragments.push_back(riscv::FragmentCapabilityAttr::get(
-        builder.getContext(), instruction, signedness(fragment.lhsSignedness),
-        signedness(fragment.rhsSignedness), fragment.lhsElementBits,
-        fragment.rhsElementBits, fragment.accumulatorElementBits,
-        fragment.mFactor, fragment.nFactor, fragment.kFactor,
-        fragment.lhsResourceGroups, fragment.rhsResourceGroups,
-        fragment.accumulatorResourceGroups, lhsPacking, rhsPacking,
-        accumulatorPacking, mmaGroups, mmaChunks, clobbers, volatileAsm,
-        memoryClobber));
-  }
+  for (const RISCVFragmentCapability &fragment : profile.fragmentCapabilities)
+    fragments.push_back(riscv::fragmentCapabilityAttr(builder.getContext(), fragment));
   return riscv::TargetAttr::get(
       builder.getContext(), profile.triple, profile.march, profile.abi,
       profile.hasRVV, profile.hasVectorF16, profile.hasIndexedMemory,

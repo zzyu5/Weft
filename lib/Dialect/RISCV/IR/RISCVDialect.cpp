@@ -1,4 +1,6 @@
 #include "Weft/Dialect/RISCV/IR/RISCVDialect.h"
+#include "Weft/Dialect/RISCV/IR/Fragment.h"
+#include "Verification.h"
 
 #include "Weft/Dialect/Kernel/IR/KernelDialect.h"
 
@@ -22,6 +24,7 @@
 #include <optional>
 
 using namespace weft::riscv;
+using namespace weft::riscv::detail;
 
 #include "Weft/Dialect/RISCV/IR/RISCVOpsDialect.cpp.inc"
 
@@ -1009,15 +1012,6 @@ mlir::LogicalResult verifyLeafOperation(mlir::Operation *operation) {
   return mlir::success();
 }
 
-bool exactLeaf(LeafAttr leaf, llvm::StringRef engine,
-               llvm::StringRef family, llvm::StringRef instruction,
-               llvm::StringRef mask, llvm::StringRef tail) {
-  return leaf && leaf.getEngine() == engine && leaf.getFamily() == family &&
-         leaf.getInstruction() == instruction &&
-         leaf.getSpelling() == instruction && leaf.getMask() == mask &&
-         leaf.getTail() == tail;
-}
-
 mlir::LogicalResult verifyConversion(mlir::Operation *operation,
                                      mlir::Type input, mlir::Type result) {
   if (!isPhysicalValue(input) || !isPhysicalValue(result) ||
@@ -1025,29 +1019,6 @@ mlir::LogicalResult verifyConversion(mlir::Operation *operation,
     return operation->emitOpError(
         "physical conversion preserves the logical value domain");
   return verifyLeafOperation(operation);
-}
-
-FragmentCapabilityAttr fragmentCapability(mlir::Operation *operation,
-                                          llvm::StringRef instruction) {
-  auto kernel = operation->getParentOfType<KernelOp>();
-  if (!kernel)
-    return {};
-  for (mlir::Attribute attribute : kernel.getTarget().getFragments()) {
-    auto capability = mlir::cast<FragmentCapabilityAttr>(attribute);
-    if (capability.getInstruction() == instruction)
-      return capability;
-  }
-  return {};
-}
-
-unsigned elementBitWidth(mlir::Type type) {
-  if (!type)
-    return 0;
-  if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
-    return integer.getWidth();
-  if (auto floating = mlir::dyn_cast<mlir::FloatType>(type))
-    return floating.getWidth();
-  return 0;
 }
 
 std::optional<int64_t> computeRecordFieldRelativeBit(AccessAttr access,
@@ -1132,13 +1103,6 @@ std::optional<int64_t> exactRecordByteStride(MemDescType memory,
       recordBytes > std::numeric_limits<int64_t>::max() / recordsPerPoint)
     return std::nullopt;
   return recordBytes * recordsPerPoint;
-}
-
-bool integerSignednessMatches(mlir::Type type, llvm::StringRef signedness) {
-  auto integer = mlir::dyn_cast<mlir::IntegerType>(type);
-  return integer && !integer.isSignless() &&
-         ((signedness == "signed" && integer.isSigned()) ||
-          (signedness == "unsigned" && integer.isUnsigned()));
 }
 
 EncodingDeclOp findEncodingDeclaration(mlir::Operation *operation,
@@ -1277,77 +1241,6 @@ mlir::LogicalResult LayoutAttr::verify(
   return mlir::success();
 }
 
-mlir::LogicalResult FragmentPackingAttr::verify(
-    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-    llvm::StringRef schema, mlir::DenseI64ArrayAttr axisOrder,
-    int64_t rowsPerTile, int64_t columnsPerTile,
-    llvm::StringRef tileOrder, llvm::StringRef elementOrder,
-    int64_t storageBits, int64_t alignment) {
-  if (schema.empty() || rowsPerTile <= 0 || columnsPerTile <= 0 ||
-      !axisOrder || axisOrder.size() != 2 || axisOrder[0] == axisOrder[1] ||
-      llvm::any_of(axisOrder.asArrayRef(),
-                   [](int64_t axis) { return axis < 0 || axis > 1; }) ||
-      storageBits <= 0 || storageBits % 8 || alignment <= 0)
-    return emitError()
-           << "fragment packing requires one rank-two byte-addressable tiled storage mapping";
-  auto validOrder = [](llvm::StringRef order) {
-    return order == "row_major" || order == "column_major";
-  };
-  if (!validOrder(tileOrder) || !validOrder(elementOrder))
-    return emitError()
-           << "fragment packing requires explicit tile and in-tile orders";
-  return mlir::success();
-}
-
-mlir::LogicalResult FragmentCapabilityAttr::verify(
-    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-    llvm::StringRef instruction, llvm::StringRef lhsSignedness,
-    llvm::StringRef rhsSignedness, int64_t lhsBits, int64_t rhsBits,
-    int64_t accumulatorBits, int64_t mFactor, int64_t nFactor,
-    int64_t kFactor, int64_t lhsResourceGroups, int64_t rhsResourceGroups,
-    int64_t accumulatorResourceGroups, FragmentPackingAttr lhsPacking,
-    FragmentPackingAttr rhsPacking, FragmentPackingAttr accumulatorPacking,
-    int64_t mmaGroups, int64_t mmaChunks, mlir::ArrayAttr clobbers,
-    bool volatileAsm, bool memoryClobber) {
-  if (instruction.empty() || lhsBits <= 0 || rhsBits <= 0 ||
-      accumulatorBits <= 0 || mFactor <= 0 || nFactor <= 0 || kFactor <= 0 ||
-      (lhsSignedness != "signed" && lhsSignedness != "unsigned") ||
-      (rhsSignedness != "signed" && rhsSignedness != "unsigned") ||
-      lhsResourceGroups <= 0 || rhsResourceGroups <= 0 ||
-      accumulatorResourceGroups <= 0 || !lhsPacking || !rhsPacking ||
-      !accumulatorPacking ||
-      mmaGroups <= 0 || mmaChunks <= 0 || !volatileAsm || !memoryClobber ||
-      clobbers.empty() ||
-      llvm::any_of(clobbers, [](mlir::Attribute attribute) {
-        auto value = mlir::dyn_cast<mlir::StringAttr>(attribute);
-        return !value || value.getValue().empty();
-      }))
-    return emitError() << "fragment capability fields must be positive and complete";
-  if (lhsPacking.getRowsPerTile() * lhsPacking.getColumnsPerTile() *
-              lhsPacking.getStorageBits() / 8 <=
-          0 ||
-      rhsPacking.getRowsPerTile() * rhsPacking.getColumnsPerTile() *
-              rhsPacking.getStorageBits() / 8 <=
-          0 ||
-      accumulatorPacking.getRowsPerTile() *
-              accumulatorPacking.getColumnsPerTile() *
-              accumulatorPacking.getStorageBits() / 8 <=
-          0)
-    return emitError() << "fragment packing tile geometry is incomplete";
-  if (mFactor % lhsPacking.getRowsPerTile() ||
-      kFactor % lhsPacking.getColumnsPerTile() ||
-      nFactor % rhsPacking.getRowsPerTile() ||
-      kFactor % rhsPacking.getColumnsPerTile() ||
-      mFactor % accumulatorPacking.getRowsPerTile() ||
-      nFactor % accumulatorPacking.getColumnsPerTile() ||
-      lhsPacking.getStorageBits() < lhsBits ||
-      rhsPacking.getStorageBits() < rhsBits ||
-      accumulatorPacking.getStorageBits() < accumulatorBits)
-    return emitError()
-           << "fragment packing geometry does not cover the capability operands";
-  return mlir::success();
-}
-
 mlir::LogicalResult TargetAttr::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::StringRef triple, llvm::StringRef march, llvm::StringRef abi,
@@ -1385,6 +1278,18 @@ mlir::LogicalResult TargetAttr::verify(
         return !mlir::isa<FragmentCapabilityAttr>(value);
       }))
     return emitError() << "target capability domains are malformed";
+  for (mlir::Attribute attribute : fragments) {
+    auto fragment = mlir::cast<FragmentCapabilityAttr>(attribute);
+    const auto *contract = weft::findRISCVFragmentCapability(fragment.getInstruction());
+    if (!contract || vlenBits != contract->vlenBits ||
+        !march.starts_with("rv" + std::to_string(contract->xlen)) ||
+        !triple.starts_with("riscv" + std::to_string(contract->xlen)))
+      return emitError() << "fragment ISA/VLEN requirements disagree with the target";
+    for (int64_t bits : {fragment.getLhsBits(), fragment.getRhsBits(),
+                         fragment.getAccumulatorBits()})
+      if (!llvm::is_contained(supportedSEW.asArrayRef(), bits))
+        return emitError() << "fragment handoff requires an unsupported RVV SEW";
+  }
   return mlir::success();
 }
 
@@ -4692,6 +4597,137 @@ void ConvertLayoutOp::getEffects(
   }
 }
 
+FieldOp weft::riscv::fieldReadProjection(
+    mlir::Value value, llvm::SmallVectorImpl<mlir::Value> *indices) {
+  while (auto extract = value.getDefiningOp<ExtractOp>()) {
+    if (extract.getAccess().getForm() == "register")
+      return {};
+    if (indices)
+      indices->append(extract.getIndices().begin(), extract.getIndices().end());
+    value = extract.getInput();
+  }
+  return value.getDefiningOp<FieldOp>();
+}
+
+std::optional<int64_t>
+weft::riscv::encodedFieldRawLMULEighths(ValueType result) {
+  if (!result || result.getLayout().getCarrier() != "rvv")
+    return std::nullopt;
+  const int64_t bits = std::max<int64_t>(8, elementBitWidth(result.getElementType()));
+  static constexpr int64_t legalLMULValues[] = {1, 2, 4, 8, 16, 32, 64};
+  const auto legalLMUL = llvm::ArrayRef<int64_t>(legalLMULValues);
+  const int64_t resultLMUL = result.getLayout().getLmulEighths();
+  if (!llvm::is_contained(legalLMUL, resultLMUL))
+    return std::nullopt;
+  const int64_t numerator = resultLMUL * 8;
+  if (numerator % bits)
+    return std::nullopt;
+  const int64_t lmul = numerator / bits;
+  if (!llvm::is_contained(legalLMUL, lmul))
+    return std::nullopt;
+  return lmul;
+}
+
+std::optional<int64_t> weft::riscv::fieldReadTemporaryGroups(
+    ValueType result, AccessAttr access, mlir::ValueRange indices) {
+  if (result && result.getLayout().getCarrier() == "scalar")
+    return 0;
+  auto rawLMUL = encodedFieldRawLMULEighths(result);
+  if (!rawLMUL || !access)
+    return std::nullopt;
+  const int64_t rawGroups = (*rawLMUL + 7) / 8;
+  const int64_t valueGroups = (result.getLayout().getLmulEighths() + 7) / 8;
+  int64_t indexGroups = 0;
+  int64_t heldIndexGroups = 0;
+  llvm::DenseSet<mlir::Value> seenIndices;
+  for (mlir::Value index : indices)
+    if (auto value = mlir::dyn_cast<ValueType>(index.getType());
+        value && value.getLayout().getCarrier() == "rvv" && seenIndices.insert(index).second) {
+      if (!llvm::is_contained(llvm::ArrayRef<int64_t>({1, 2, 4, 8, 16, 32, 64}),
+                              value.getLayout().getLmulEighths()))
+        return std::nullopt;
+      indexGroups = std::max(indexGroups, (value.getLayout().getLmulEighths() + 7) / 8);
+      auto streams = checkedPositiveProduct(value.getLayout().getTimeFactors().asArrayRef());
+      auto allParts = streams ? checkedPositiveProduct(
+          {value.getLayout().getRegisterGroups(), *streams}) : std::nullopt;
+      if (!allParts)
+        return std::nullopt;
+      const int64_t extra = *allParts - value.getLayout().getRegisterGroups();
+      if (heldIndexGroups > std::numeric_limits<int64_t>::max() - extra)
+        return std::nullopt;
+      heldIndexGroups += extra;
+    }
+  int64_t localPeak = 0;
+  if (access.getMapping() == "joined") {
+    // Head/low/high may coexist for record-strided joined storage; each
+    // shift/mask reuses its own byte carrier. Interleaved storage needs no more.
+    localPeak = 3 * rawGroups;
+  } else if (access.getMapping() == "grouped_layered") {
+    // Quotient/remainder, byte offset and layer offset use index-width carriers;
+    // narrowing the shift and decoding the byte retain one additional carrier.
+    localPeak = std::max(3 * indexGroups, 2 * rawGroups);
+  } else if (access.getMapping() == "natural") {
+    localPeak = elementBitWidth(result.getElementType()) > 8
+                    ? std::max(2 * valueGroups, indexGroups + valueGroups)
+                    : valueGroups;
+  } else {
+    return std::nullopt;
+  }
+  auto streams = checkedPositiveProduct(result.getLayout().getTimeFactors().asArrayRef());
+  auto outputs = streams ? checkedPositiveProduct(
+      {result.getLayout().getRegisterGroups(), *streams}) : std::nullopt;
+  if (!outputs || *outputs < valueGroups ||
+      heldIndexGroups > std::numeric_limits<int64_t>::max() - localPeak)
+    return std::nullopt;
+  const int64_t scratch = heldIndexGroups + localPeak;
+  const int64_t priorOutputs = *outputs - valueGroups;
+  if (priorOutputs > std::numeric_limits<int64_t>::max() - scratch)
+    return std::nullopt;
+  return priorOutputs + scratch;
+}
+
+mlir::LogicalResult FieldReadOp::verify() {
+  ValueType input = getInput().getType();
+  ValueType result = getResult().getType();
+  llvm::SmallVector<mlir::Value> indices;
+  auto field = fieldReadProjection(getInput(), &indices);
+  auto temporaryGroups = fieldReadTemporaryGroups(result, getAccess(), getIndices());
+  if (!field || !sameLogicalDomain(input, result) ||
+      input.getElementType() != result.getElementType() ||
+      (input.getLayout().getCarrier() != "scalar" &&
+       input.getLayout().getCarrier() != "local" &&
+       input.getLayout().getCarrier() != "rvv") ||
+      (result.getLayout().getCarrier() != "rvv" &&
+       result.getLayout().getCarrier() != "scalar") ||
+      elementBitWidth(result.getElementType()) == 0 ||
+      !exactLeaf(getLeaf(), "transfer", "field-read", "encoded.field-read",
+                 "none", "exact") ||
+      getLeaf().getLocalBytes() != 0 || getLeaf().getFragmentGroups() != 0 ||
+      !llvm::equal(indices, getIndices()) || !temporaryGroups ||
+      getLeaf().getTemporaryGroups() != *temporaryGroups)
+    return emitOpError("field read requires a storage projection and a numeric result with closed resources");
+  auto access = getAccess();
+  auto storage = field.getAccess();
+  if ((access.getForm() != "unit" && access.getForm() != "strided" &&
+       access.getForm() != "indexed" && access.getForm() != "segment") ||
+      access.getMapping() != storage.getMapping() ||
+      access.getBitOffset() != storage.getBitOffset() ||
+      access.getStorageBits() != storage.getStorageBits() ||
+      access.getGroupSize() != storage.getGroupSize() ||
+      access.getLayerSize() != storage.getLayerSize() ||
+      access.getOrder() != storage.getOrder() ||
+      access.getJoinFields() != storage.getJoinFields() ||
+      access.getJoinLowBits() != storage.getJoinLowBits() ||
+      access.getJoinRole() != storage.getJoinRole())
+    return emitOpError("field read must preserve its encoded storage mapping");
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (!kernel ||
+      (access.getForm() == "indexed" && !kernel.getTarget().getHasIndexedMemory()) ||
+      (access.getForm() == "segment" && !kernel.getTarget().getHasSegmentMemory()))
+    return emitOpError("field read memory form is unsupported by the target");
+  return mlir::success();
+}
+
 mlir::LogicalResult ConvertLayoutOp::verify() {
   ValueType input = getInput().getType();
   ValueType result = getResult().getType();
@@ -5211,6 +5247,8 @@ mlir::LogicalResult RVVEncodedLocalPackTransferOp::verify() {
 }
 
 mlir::LogicalResult SpillOp::verify() {
+  if (fieldReadProjection(getInput()))
+    return emitOpError("spill requires a numeric SSA value, not an encoded storage projection");
   auto value = mlir::dyn_cast<ValueType>(getInput().getType());
   LocalType slot = getSlot().getType();
   if (!value || slot.getPurpose() != "spill" ||
@@ -5277,187 +5315,6 @@ mlir::LogicalResult ReloadOp::verify() {
     return emitOpError(
         "reload slot size must preserve every selected RVV time part");
   return verifyLeafOperation(*this);
-}
-
-mlir::LogicalResult IMEFragmentMMAOp::verify() {
-  FragmentType lhs = getLhs().getType();
-  FragmentType rhs = getRhs().getType();
-  FragmentType result = getResult().getType();
-  auto capability = fragmentCapability(*this, getLeaf().getInstruction());
-  if (!capability ||
-      capability.getInstruction() != "spacemit-ime1-i8-mma" ||
-      !exactLeaf(getLeaf(), "ime", "fragment-mma",
-                 capability.getInstruction(), "none", "exact") ||
-      lhs.getFamily() != rhs.getFamily() || result.getFamily() != lhs.getFamily() ||
-      lhs.getFamily() != capability.getInstruction() ||
-      lhs.getRole() != "lhs" || rhs.getRole() != "rhs" ||
-      result.getRole() != "accumulator" ||
-      lhs.getPacking() != capability.getLhsPacking() ||
-      rhs.getPacking() != capability.getRhsPacking() ||
-      result.getPacking() != capability.getAccumulatorPacking() ||
-      elementBitWidth(lhs.getElementType()) != capability.getLhsBits() ||
-      elementBitWidth(rhs.getElementType()) != capability.getRhsBits() ||
-      !integerSignednessMatches(lhs.getElementType(),
-                                capability.getLhsSignedness()) ||
-      !integerSignednessMatches(rhs.getElementType(),
-                                capability.getRhsSignedness()) ||
-      elementBitWidth(result.getElementType()) != capability.getAccumulatorBits() ||
-      getLeaf().getFragmentGroups() != 0 ||
-      getGroups() != capability.getMmaGroups() ||
-      getChunks() != capability.getMmaChunks() ||
-      getAsmClobbers() != capability.getClobbers() ||
-      getVolatileAsm() != capability.getVolatileAsm() ||
-      getMemoryClobber() != capability.getMemoryClobber() ||
-      getLeaf().getParameters().asArrayRef() !=
-          llvm::ArrayRef<int64_t>({capability.getMFactor(),
-                                   capability.getNFactor(),
-                                   capability.getKFactor()}) ||
-      lhs.getShape().size() != 2 || rhs.getShape().size() != 2 ||
-      result.getShape().size() != 2 ||
-      getLeaf().getLocalBytes() !=
-          result.getShape()[0] * result.getShape()[1] *
-              std::max<int64_t>(
-                  1, (elementBitWidth(result.getElementType()) + 7) / 8))
-    return emitOpError("IME fragment MMA requires an IME leaf contract");
-  if (lhs.getShape().size() != 2 || rhs.getShape().size() != 2 ||
-      result.getShape().size() != 2 ||
-      lhs.getShape()[0] != capability.getMFactor() ||
-      lhs.getShape()[1] != capability.getKFactor() ||
-      rhs.getShape()[0] != capability.getKFactor() ||
-      rhs.getShape()[1] != capability.getNFactor() ||
-      result.getShape()[0] != capability.getMFactor() ||
-      result.getShape()[1] != capability.getNFactor() ||
-      lhs.getAxisIds()[1] != rhs.getAxisIds()[0] ||
-      lhs.getAxisIds()[0] != result.getAxisIds()[0] ||
-      rhs.getAxisIds()[1] != result.getAxisIds()[1])
-    return emitOpError(
-        "IME fragment MMA axes and shapes do not match the selected M4xN4xK8 capability");
-  if (lhs.getResourceGroups() != capability.getLhsResourceGroups() ||
-      rhs.getResourceGroups() != capability.getRhsResourceGroups() ||
-      result.getResourceGroups() != capability.getAccumulatorResourceGroups())
-    return emitOpError(
-        "IME fragment resources do not match the target capability");
-  return mlir::success();
-}
-
-mlir::LogicalResult IMEPackOp::verify() {
-  FragmentType result = getResult().getType();
-  auto input = mlir::dyn_cast<ValueType>(getInput().getType());
-  auto capability = fragmentCapability(*this, result.getFamily());
-  if (!input || !capability ||
-      capability.getInstruction() != "spacemit-ime1-i8-mma" ||
-      (getRole() != "lhs" && getRole() != "rhs") ||
-      !exactLeaf(getLeaf(), "ime", "fragment-pack",
-                 getRole() == "lhs" ? "ime.pack.lhs" : "ime.pack.rhs",
-                 "none", "exact") ||
-      getPacking() != (getRole() == "lhs" ? capability.getLhsPacking()
-                                           : capability.getRhsPacking()) ||
-      result.getRole() != getRole() || result.getPacking() != getPacking() ||
-      result.getResourceGroups() !=
-          (getRole() == "lhs" ? capability.getLhsResourceGroups()
-                              : capability.getRhsResourceGroups()) ||
-      getPacking().getStorageBits() != 8 ||
-      result.getLayout().getCarrier() != "ime" ||
-      getLeaf().getParameters().asArrayRef() !=
-          llvm::ArrayRef<int64_t>({capability.getMFactor(),
-                                   capability.getNFactor(),
-                                   capability.getKFactor()}))
-    return emitOpError("IME pack requires one typed fragment operand contract");
-  const bool lhs = getRole() == "lhs";
-  auto packing = getPacking();
-  const int64_t expectedBits = lhs ? capability.getLhsBits()
-                                   : capability.getRhsBits();
-  const llvm::StringRef expectedSignedness =
-      lhs ? capability.getLhsSignedness() : capability.getRhsSignedness();
-  if (elementBitWidth(result.getElementType()) != expectedBits ||
-      elementBitWidth(input.getElementType()) != expectedBits ||
-      !integerSignednessMatches(input.getElementType(), expectedSignedness) ||
-      input.getAxisIds() != result.getAxisIds())
-    return emitOpError("IME pack input and fragment logical domains must agree");
-  auto layout = input.getLayout();
-  int64_t laneAxes = 0;
-  if (layout.getCarrier() != "rvv" || layout.getSew() != 8 ||
-      input.getShape().size() != layout.getTimeFactors().size() ||
-      input.getShape().size() != layout.getLaneFactors().size() ||
-      input.getShape().size() != layout.getReplicaFactors().size() ||
-      input.getShape().size() != layout.getFragmentFactors().size() ||
-      input.getShape().size() != layout.getLocalFactors().size())
-    return emitOpError("IME pack input requires one complete eight-bit RVV mapping");
-  for (auto [extent, time, lane, replica, fragment, local] :
-       llvm::zip(result.getShape().asArrayRef(),
-                 layout.getTimeFactors().asArrayRef(),
-                 layout.getLaneFactors().asArrayRef(),
-                 layout.getReplicaFactors().asArrayRef(),
-                 layout.getFragmentFactors().asArrayRef(),
-                 layout.getLocalFactors().asArrayRef())) {
-    if (extent <= 0 || time <= 0 || lane <= 0 || replica <= 0 ||
-        fragment <= 0 || local <= 0 ||
-        time * lane * replica * fragment * local != extent)
-      return emitOpError("IME pack input time/lane/register factors are incomplete");
-    laneAxes += lane > 1;
-  }
-  if (laneAxes != 1)
-    return emitOpError("IME pack input requires exactly one SIMD lane axis");
-  if ((lhs && (result.getShape().size() != 2 ||
-               result.getShape()[0] != capability.getMFactor() ||
-               result.getShape()[1] != capability.getKFactor())) ||
-      (!lhs && (result.getShape().size() != 2 ||
-                result.getShape()[0] != capability.getKFactor() ||
-                result.getShape()[1] != capability.getNFactor())))
-    return emitOpError("IME pack logical shape disagrees with the target fragment");
-  auto axisOrder = packing.getAxisOrder().asArrayRef();
-  const int64_t rows = result.getShape()[axisOrder[0]];
-  const int64_t columns = result.getShape()[axisOrder[1]];
-  if (rows % packing.getRowsPerTile() ||
-      columns % packing.getColumnsPerTile() ||
-      packing.getStorageBits() < expectedBits)
-    return emitOpError(
-        "IME operand shape and element width do not fit the selected tiled packing");
-  const int64_t logicalBytes =
-      rows * columns *
-      std::max<int64_t>(1, (elementBitWidth(input.getElementType()) + 7) / 8);
-  const int64_t packedBytes =
-      rows * columns * packing.getStorageBits() / 8;
-  if (getLeaf().getLocalBytes() != logicalBytes + packedBytes)
-    return emitOpError(
-        "IME pack leaf must account for every primitive-private byte");
-  if (getAccess().getMapping() == "opaque" || getAccess().getForm() == "opaque")
-    return emitOpError("IME operand has no selected physical access form");
-  return mlir::success();
-}
-
-mlir::LogicalResult IMEUnpackOp::verify() {
-  auto capability = fragmentCapability(*this, getInput().getType().getFamily());
-  if (!capability ||
-      capability.getInstruction() != "spacemit-ime1-i8-mma" ||
-      !exactLeaf(getLeaf(), "ime", "fragment-unpack", "ime.unpack.rvv",
-                 "none", "exact") ||
-      getConversion().getKind() != "fragment_to_rvv" ||
-      getConversion().getEffect() != "handoff" ||
-      getInput().getType().getRole() != "accumulator" ||
-      getInput().getType().getPacking() !=
-          capability.getAccumulatorPacking() ||
-      getResult().getType().getLayout().getCarrier() != "rvv" ||
-      getInput().getType().getAxisIds() != getResult().getType().getAxisIds() ||
-      getInput().getType().getElementType() !=
-          getResult().getType().getElementType() ||
-      elementBitWidth(getResult().getType().getElementType()) !=
-          capability.getAccumulatorBits() ||
-      getLeaf().getLocalBytes() != 0)
-    return emitOpError("IME unpack must preserve a fragment logical domain into RVV");
-  auto fragment = getInput().getType();
-  auto layout = getResult().getType().getLayout();
-  for (auto [extent, time, lane, replica, fragmentFactor, local] :
-       llvm::zip(fragment.getShape().asArrayRef(),
-                 layout.getTimeFactors().asArrayRef(),
-                 layout.getLaneFactors().asArrayRef(),
-                 layout.getReplicaFactors().asArrayRef(),
-                 layout.getFragmentFactors().asArrayRef(),
-                 layout.getLocalFactors().asArrayRef()))
-    if (time * lane * replica * fragmentFactor * local != extent)
-      return emitOpError(
-          "IME unpack result layout does not cover the complete fragment domain");
-  return mlir::success();
 }
 
 mlir::LogicalResult RegisterMaterializeOp::verify() {

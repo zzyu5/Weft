@@ -1,6 +1,8 @@
 #ifndef WEFT_TARGET_RISCVTARGETPROFILE_H
 #define WEFT_TARGET_RISCVTARGETPROFILE_H
 
+#include "Weft/Target/RISCVFragment.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,15 +20,6 @@ enum class RISCVABI {
   ILP32D,
 };
 
-enum class RISCVFragmentInstruction {
-  SpacemitIME1I8MMA,
-};
-
-enum class RISCVFragmentSignedness {
-  Signed,
-  Unsigned,
-};
-
 enum class RISCVPartialCombinePolicy {
   IndependentMultilevel,
   Sequential,
@@ -35,22 +28,6 @@ enum class RISCVPartialCombinePolicy {
 enum class RISCVRecordAxisPolicy {
   WithinRecord,
   AcrossRecords,
-};
-
-struct RISCVFragmentCapability {
-  RISCVFragmentInstruction instruction =
-      RISCVFragmentInstruction::SpacemitIME1I8MMA;
-  RISCVFragmentSignedness lhsSignedness = RISCVFragmentSignedness::Signed;
-  RISCVFragmentSignedness rhsSignedness = RISCVFragmentSignedness::Signed;
-  unsigned lhsElementBits = 0;
-  unsigned rhsElementBits = 0;
-  unsigned accumulatorElementBits = 0;
-  unsigned mFactor = 1;
-  unsigned nFactor = 1;
-  unsigned kFactor = 1;
-  unsigned lhsResourceGroups = 0;
-  unsigned rhsResourceGroups = 0;
-  unsigned accumulatorResourceGroups = 0;
 };
 
 struct RISCVTargetProfile {

@@ -120,6 +120,73 @@ void selectUnsignedMultiplyHigh(mlir::ModuleOp module) {
   }
 }
 
+mlir::LogicalResult materializeFieldReads(mlir::ModuleOp module) {
+  mlir::IRRewriter rewriter(module.getContext());
+  llvm::SmallVector<riscv::ConvertLayoutOp> candidates;
+  module.walk([&](riscv::ConvertLayoutOp op) { candidates.push_back(op); });
+  for (auto conversion : candidates) {
+    auto kernel = conversion->getParentOfType<riscv::KernelOp>();
+    auto kind = conversion.getConversion().getKind();
+    auto input = conversion.getInput();
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        !conversion.getSourceAccess())
+      continue;
+    // Only storage projections are reads. A computed numeric SSA value must
+    // retain its explicit representation conversion, never reload its source.
+    llvm::SmallVector<mlir::Value> indices;
+    if (!riscv::fieldReadProjection(input, &indices))
+      continue;
+    const bool resupply = kind == "local_load" || kind == "time_to_lane";
+    auto readType = resupply ? conversion.getResult().getType() : input.getType();
+    if (readType.getLayout().getCarrier() != "rvv" &&
+        readType.getLayout().getCarrier() != "scalar")
+      continue;
+    auto temporaries = riscv::fieldReadTemporaryGroups(
+        readType, *conversion.getSourceAccess(), indices);
+    if (!temporaries)
+      return conversion.emitError("encoded read has no closed local resource contract");
+    rewriter.setInsertionPoint(conversion);
+    auto read = rewriter.create<riscv::FieldReadOp>(
+        conversion.getLoc(), readType, input, indices,
+        *conversion.getSourceAccess(),
+        riscv_internal::leaf(
+            rewriter, "transfer", "field-read", "encoded.field-read",
+            "encoded.field-read", 0, 0,
+            *temporaries, 0, "none", "exact"));
+    riscv_internal::copyOrigin(conversion, read);
+    if (resupply)
+      rewriter.replaceOp(conversion, read.getResult());
+    else {
+      conversion.getInputMutable().assign(read.getResult());
+      conversion.removeSourceAccessAttr();
+    }
+  }
+  llvm::SmallVector<riscv::ExtractOp> extracts;
+  module.walk([&](riscv::ExtractOp extract) { extracts.push_back(extract); });
+  for (auto extract : extracts) {
+    auto kernel = extract->getParentOfType<riscv::KernelOp>();
+    llvm::SmallVector<mlir::Value> indices;
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        extract.getAccess().getForm() != "register" ||
+        !riscv::fieldReadProjection(extract.getInput(), &indices))
+      continue;
+    auto input = extract.getInput();
+    auto access = input.getDefiningOp()->getAttrOfType<riscv::AccessAttr>("access");
+    auto temporaries = riscv::fieldReadTemporaryGroups(input.getType(), access, indices);
+    if (!access || !temporaries)
+      return extract.emitError("register extract source has no closed encoded read");
+    rewriter.setInsertionPoint(extract);
+    auto read = rewriter.create<riscv::FieldReadOp>(
+        extract.getLoc(), input.getType(), input, indices, access,
+        riscv_internal::leaf(rewriter, "transfer", "field-read",
+                             "encoded.field-read", "encoded.field-read",
+                             0, 0, *temporaries, 0, "none", "exact"));
+    riscv_internal::copyOrigin(input.getDefiningOp(), read);
+    extract.getInputMutable().assign(read.getResult());
+  }
+  return mlir::success();
+}
+
 class FinalizeRISCVLeavesPass
     : public mlir::PassWrapper<FinalizeRISCVLeavesPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -134,6 +201,10 @@ public:
   void runOnOperation() override {
     foldIntegerIdentities(getOperation());
     selectUnsignedMultiplyHigh(getOperation());
+    if (mlir::failed(materializeFieldReads(getOperation()))) {
+      signalPassFailure();
+      return;
+    }
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {

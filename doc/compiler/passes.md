@@ -331,6 +331,10 @@ load 与 tuple component binding，不重新选择 memory form。
 
 ### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
 
+两者分别实现在 `lib/Target/Partial/PlanTopologies.cpp` 与 `Materialize.cpp`，共同的
+typed topology/几何工具在 `Support.h/.cpp`。公开 pass factory 和 pipeline 顺序不变；
+planner 与 materializer 不通过 include 实现片段形成第二份算法。
+
 planner 读取 contraction/reduction 的 typed axes、time/lane/replica 分解、storage window、
 consumer use 与 target resource budget，唯一写入 product carrier、issue slices、partial-set、
 combine/final-reduction topology、selected local instructions 和联合资源合同。顺序 fused contraction
@@ -378,6 +382,14 @@ final verifier拒绝任何残留plan，terminal translator也不读取它们。�
 leaf可以直接保留typed topology、lane/source-part relation与exact leaf，而不保留待解释program plan。
 
 ### `FinalizeRISCVLeaves`
+
+此收尾还将 conversion 输入侧的 encoded 读取显式物化为 `field_read`：
+`local_load`/`time_to_lane` 的字段供应直接产生已选结果；其它转换先读取原表示，再转换 numeric SSA。
+复用既有 access 与 result layout，不追穿已经计算的 numeric SSA，不改原 load/快照身份。
+`field_read` 的 Read effect、读取点和结果存活区间进入后续 CSE、snapshot 与资源核算；
+final pure `time_to_lane` 只允许已闭合的 numeric RVV pack，不保留 emitter 重读字段的例外。
+已选的 register Extract 也是 numeric consumer：若它的 input 仍是 encoded storage
+projection，先形成同表示的 `field_read`；register gather 的 result 不能重新解释成地址。
 
 读取 `ImplementationAttr` 与已经确定的 value carrier/SEW/operand form，为 pointwise、cast、
 reduce、state transfer等仍未闭合的 operation写入 exact instruction/spelling leaf，并删除
@@ -455,6 +467,9 @@ operand/result resource groups写实。资源超限时，只对同一 block 内�
 和任意 pure-producer rematerialization尚未实现时判当前 module非法。
 pure 或仅有 Read effect 的 producer 均可提供被 spill 的数值 SSA；原 producer 保持在
 原位置，只保存其已经产生的值并在 use-site reload，不复制读取，也不延迟读取。
+encoded storage projection 本身不是 spill 对象。捕获索引 spill 后，同一 consumer 的相同
+索引复用一次 reload；`field_read` 的纯地址投影在该读取点按它自己的索引 operands 重绑，
+严格保留 selector、type 与来源关系，重新核算资源，不克隆数值 producer 或扩大读取字节。
 
 kernel 创建时 `resources_materialized=false`；只有资源分析、必要 spill 与峰值汇总全部闭合后，
 本 pass 才把它设为 `true`。初始化为零的 peak 不是闭合证据。layout canonicalization 仅在该
@@ -465,6 +480,10 @@ marker 为 `false` 时允许改变 producer lifetime 的 backward rematerializat
 上界，kernel resource summary按上界计算；缺少闭合上界时拒绝生成 C VLA。
 
 ### `VerifyFinalRISCV`
+
+terminal eligibility 与 required-leaf 由 `RISCVOps.td` 的 `WeftRISCVTerminal` /
+`WeftRISCVLeaf` traits 唯一定义；final verifier 不另维护 op 名单。terminal dispatcher
+只登记实际实现，不能用自身分支补齐未选择的 leaf。
 
 最终 verifier 拒绝：残留 canonical op、非 terminal RISC-V op、`unassigned` layout/access、
 `implementation`、未展开 schedule、未选 leaf、丢失 Level birth/handoff、绕过 runtime
