@@ -17,6 +17,9 @@ namespace {
 constexpr llvm::StringLiteral layoutInputAttribute = "weft.riscv.layout_input";
 
 void addLayoutFinalization(mlir::PassManager &manager, bool scalarLoadPrime) {
+  // Issue unrolling exposes scalar add trees of already-reduced partials.
+  // Retain those i32 carriers without moving their reduction or scale.
+  manager.addPass(weft::createCoalesceRISCVPartialExtractionsPass());
   // Obsolete index paths must not count as consumers when deciding whether
   // to rematerialize the live representation at its actual use.
   manager.addPass(weft::createEliminateDeadRISCVLayoutsPass());

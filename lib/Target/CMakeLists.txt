@@ -18,6 +18,7 @@ add_library(WeftRISCVTarget STATIC
   UnrollRISCVLevels.cpp
   ShareRISCVLayeredWindows.cpp
   Partial/Support.cpp
+  Partial/AddTrees.cpp
   Partial/PlanTopologies.cpp
   Partial/Materialize.cpp
   FinalizeRISCVLeaves.cpp

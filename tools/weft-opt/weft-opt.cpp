@@ -17,6 +17,8 @@ int main(int argc, char **argv) {
       []() { return weft::createCanonicalizeRISCVLayoutsPass(); });
   mlir::registerPass(
       []() { return weft::createEliminateDeadRISCVLayoutsPass(); });
+  mlir::registerPass(
+      []() { return weft::createCoalesceRISCVPartialExtractionsPass(); });
   mlir::registerPass([]() { return weft::createPlanRISCVMemoryPass(); });
   mlir::registerPass([]() { return weft::createSelectRISCVMemoryByteProjectionsPass(); });
   mlir::registerPass(

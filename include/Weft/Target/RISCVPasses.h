@@ -29,6 +29,7 @@ std::unique_ptr<mlir::Pass> createUnrollRISCVLevelsPass();
 std::unique_ptr<mlir::Pass> createShareRISCVLayeredWindowsPass();
 std::unique_ptr<mlir::Pass> createMaterializeRISCVReplicaStorageLoadsPass();
 std::unique_ptr<mlir::Pass> createPlanRISCVPartialTopologiesPass();
+std::unique_ptr<mlir::Pass> createCoalesceRISCVPartialExtractionsPass();
 std::unique_ptr<mlir::Pass>
 createMaterializeRISCVPartialAccumulatorsPass();
 std::unique_ptr<mlir::Pass> createFinalizeRISCVLeavesPass();

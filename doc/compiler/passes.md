@@ -30,6 +30,7 @@ ConvertWeftToRISCV
 → MaterializeRISCVPartialAccumulators
 → UnrollRISCVLevels
 → ShareRISCVLayeredWindows
+→ CoalesceRISCVPartialExtractions
 → EliminateDeadRISCVLayouts
 → CanonicalizeRISCVLayouts
 → PlanRISCVMemory
@@ -332,7 +333,7 @@ load 与 tuple component binding，不重新选择 memory form。
 ### `PlanRISCVPartialTopologies` 与 `MaterializeRISCVPartialAccumulators`
 
 两者分别实现在 `lib/Target/Partial/PlanTopologies.cpp` 与 `Materialize.cpp`，共同的
-typed topology/几何工具在 `Support.h/.cpp`。公开 pass factory 和 pipeline 顺序不变；
+typed topology/几何工具在 `Support.h/.cpp`，add-tree 的规划与物化共用 `AddTrees.cpp`；
 planner 与 materializer 不通过 include 实现片段形成第二份算法。
 
 planner 读取 contraction/reduction 的 typed axes、time/lane/replica 分解、storage window、
@@ -380,6 +381,19 @@ birth/lifetime和资源总量成为可验证的IR合同，terminal translator不
 上述 plan attributes 是第二层内部、一次 lowering 中的瞬态冻结结果。完成物化后它们必须删除；
 final verifier拒绝任何残留plan，terminal translator也不读取它们。只有单stream的closed widening-dot
 leaf可以直接保留typed topology、lane/source-part relation与exact leaf，而不保留待解释program plan。
+
+### `CoalesceRISCVPartialExtractions`
+
+issue 展开后，重用上述 add-tree planner/materializer 合并已完成 reduction 与 scale 的
+signed-i32 singleton partial，再做一次 scalar extract。只接受同一 block 内、单一 consumer、
+同一 reduction axis 与完整 RVV layout 的 `rvv.partial-finalize.extract`；不接纳 i16 partial、
+尚未 reduction 的 lane 集合、原始 dot 或 scale 前移，不改变 source Level/carry 或浮点结合。
+局部搜索最多访问32个add节点和32个partial leaf；plan只保留互不重叠的最大可接受树，防止
+子树改写使父计划的leaf身份失效。物化只生成既有 `rvv_partial_merge` 与finalize，完整资源
+分析仍重新计算延长的partial lifetime；局部预算检查不是全局live-set合法性的替代。
+
+该pass位于普通编译与layout-input恢复共用的收尾入口，并由`weft-opt`公开供重放。已带
+final resource marker的图不重新选择；独立副本须先清marker和统计后才能重放此改写。
 
 ### `FinalizeRISCVLeaves`
 

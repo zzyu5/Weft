@@ -448,7 +448,7 @@ layout 改写的重放从 `--emit=riscv-layout-input` 开始：解析后执行
 
 也可对已通过 final verifier 的独立副本清除 `resources_materialized`，并将
 `vector_register_peak`、`fragment_register_peak`、`local_storage_bytes` 清零，
-通过 `weft-opt` 重放 layout canonicalization、CSE、dead-layout 清理及原有的
+通过 `weft-opt` 重放 partial-extraction coalescing、layout canonicalization、CSE、dead-layout 清理及原有的
 memory/replica-load/hoist/operation-selection/leaf-finalization/read-snapshot/
 leaf-resource-closure/CSE/physical-issue-fusion/dead-layout/resource
 收尾 passes，最后重新运行 final verifier。原有显式 spill、snapshot 和 selected target op

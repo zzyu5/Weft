@@ -2235,6 +2235,9 @@ bool collectPartialAddTree(
     mlir::Value value, riscv::BinaryOp root,
     llvm::SmallVectorImpl<riscv::BinaryOp> &adds,
     llvm::SmallVectorImpl<PartialAddLeaf> &leaves) {
+  // A local selection never searches an unbounded arithmetic graph.
+  if (adds.size() >= 32 || leaves.size() >= 32)
+    return false;
   if (auto add = value.getDefiningOp<riscv::BinaryOp>()) {
     if (add.getKind() != "add" ||
         (add != root && !add.getResult().hasOneUse()))

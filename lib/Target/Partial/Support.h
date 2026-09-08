@@ -28,6 +28,11 @@
 
 namespace weft::riscv_partial {
 
+void planPartialAddTrees(mlir::ModuleOp module, bool extractionsOnly);
+bool materializePartialAddTrees(mlir::ModuleOp module,
+                               mlir::IRRewriter &rewriter,
+                               int64_t &nextPartialBirthId);
+
 int64_t product(llvm::ArrayRef<int64_t> values);
 
 std::optional<int64_t> checkedProduct(llvm::ArrayRef<int64_t> values);
