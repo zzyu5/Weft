@@ -32,6 +32,16 @@ partition。只有time/lane/register/fragment/local各自的总分解一致时�
 把它拼写成零拷贝binding；否则必须在此前插入显式physical conversion或把candidate判非法，
 不能由emitter调整坐标顺序。
 
+当 input-axis order 不变、前缀 axis/extent 完全相同，且被拆分或合并的尾部全部由完整
+lane 承载时，layout propagation 保留前缀的逐轴分解，并按相同线性序号重分解尾部 lane。
+这条关系不跨 time、replica、fragment 或 local 边界；consumer 需要不同表示时使用显式
+conversion。索引表供应可以沿该 reshape 的不变前缀追踪后续 contraction，但不能凭尾部
+复用的 axis 名称推断坐标相同。
+
+完整表项的 packed indexed gather 同时约束 payload 与 storage-word carrier：分配给字节
+payload 的 LMUL 还须在实际 32/64-bit storage SEW 下合法。较宽 VLEN 不取消该约束；必要时
+保留较宽的 memory result，再通过显式 conversion 交给较窄 consumer，active VL 和读取范围不变。
+
 ## 3. Memory 与 local storage
 
 `MemDescType` 保存 pinned Encoding、shape/axes、static stride/origin facts、alignment、alias、

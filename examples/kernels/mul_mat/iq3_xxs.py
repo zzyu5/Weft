@@ -13,7 +13,7 @@ def production_mul_mat_iq3_xxs(
     X: wl.View[wl.f32, (M, K)],
     Xq: wl.View[ggml.Q8_K, (M, K)],
     grid: wl.View[ggml.I8X4, (256, 4)],
-    signs: wl.View[ggml.I8X4, (256, 4)],
+    signs: wl.View[ggml.I8X8, (128, 8)],
     Y: wl.View[wl.f32, (M, N)],
 ):
     quant_q8_k.quantize_matrix(X, Xq)

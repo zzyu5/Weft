@@ -3491,7 +3491,8 @@ mlir::LogicalResult ReshapeOp::verify() {
       !sameFactorCount(source.getFragmentFactors(), target.getFragmentFactors()) ||
       !sameFactorCount(source.getLocalFactors(), target.getLocalFactors()))
     return emitOpError(
-        "physical reshape requires one linearly identical carrier partition");
+        "physical reshape requires one linearly identical carrier partition; input=")
+           << input << ", result=" << result;
   return mlir::success();
 }
 
@@ -7460,7 +7461,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
       result.getLayout().getLaneFactors()[lanePosition];
   auto physicalLanes =
       checkedPositiveProduct(result.getLayout().getLaneFactors().asArrayRef());
-  if (primaryLanes <= 1 || !physicalLanes || *physicalLanes <= 1 ||
+  if (primaryLanes <= 0 || !physicalLanes || *physicalLanes <= 0 ||
       result.getShape()[lanePosition] !=
           primaryLanes * result.getLayout().getTimeFactors()[lanePosition] ||
       result.getLayout().getReplicaFactors()[lanePosition] != 1 ||
@@ -7503,7 +7504,7 @@ mlir::LogicalResult RVVReplicaStorageLoadOp::verify() {
         "replica storage load has an incomplete stream/replica product");
   auto loadLanes = checkedPositiveProduct(
       result.getLayout().getLaneFactors().asArrayRef());
-  if (!loadLanes || *loadLanes <= 1 ||
+  if (!loadLanes || *loadLanes <= 0 ||
       result.getLayout().getVl() != *loadLanes)
     return emitOpError(
         "replica storage load must use exactly its typed load-lane extent as vl");

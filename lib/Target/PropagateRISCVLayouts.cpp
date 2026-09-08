@@ -442,10 +442,12 @@ downstreamReducedFreeAxes(mlir::Operation *contraction,
 
 llvm::SmallVector<int64_t> downstreamContractionAxes(mlir::Value root) {
   llvm::SmallVector<int64_t> axes;
-  llvm::SmallVector<mlir::Value> worklist{root};
+  using WorkItem = std::pair<mlir::Value, llvm::SmallVector<int64_t>>;
+  llvm::SmallVector<WorkItem> worklist;
+  worklist.emplace_back(root, riscv_internal::logicalAxes(root.getType()));
   llvm::SmallPtrSet<mlir::Operation *, 32> visited;
   while (!worklist.empty()) {
-    mlir::Value value = worklist.pop_back_val();
+    auto [value, preservedAxes] = worklist.pop_back_val();
     auto source = mlir::dyn_cast<riscv::ValueType>(value.getType());
     if (!source)
       continue;
@@ -459,13 +461,37 @@ llvm::SmallVector<int64_t> downstreamContractionAxes(mlir::Value root) {
             (contract.getLhs() != value && contract.getRhs() != value))
           continue;
         for (int64_t axis : contract.getOver())
-          if (!llvm::is_contained(axes, axis))
+          if (llvm::is_contained(preservedAxes, axis) &&
+              !llvm::is_contained(axes, axis))
             axes.push_back(axis);
         for (int64_t axis : downstreamReducedFreeAxes(
                  contract.getOperation(), contract.getOver()))
-          if (containsAxis(root.getType(), axis) &&
+          if (llvm::is_contained(preservedAxes, axis) &&
               !llvm::is_contained(axes, axis))
             axes.push_back(axis);
+        continue;
+      }
+      if (auto reshape = mlir::dyn_cast<riscv::ReshapeOp>(user)) {
+        auto result = reshape.getResult().getType();
+        if (reshape.getInput() != value ||
+            !llvm::equal(reshape.getOrder(), source.getAxisIds().asArrayRef()))
+          continue;
+        // A suffix reshape changes only its mixed-radix coordinates.  The
+        // identical prefix still names the same entries supplied to a later
+        // contraction; new/reused suffix axis names are not evidence of that.
+        llvm::SmallVector<int64_t> prefix;
+        for (size_t position = 0;
+             position < source.getShape().size() &&
+             position < result.getShape().size(); ++position) {
+          const int64_t axis = source.getAxisIds()[position];
+          if (axis != result.getAxisIds()[position] ||
+              source.getShape()[position] != result.getShape()[position])
+            break;
+          if (llvm::is_contained(preservedAxes, axis))
+            prefix.push_back(axis);
+        }
+        if (!prefix.empty())
+          worklist.emplace_back(reshape.getResult(), std::move(prefix));
         continue;
       }
       if (!layoutPreservingPointwise(user) || user->getNumResults() != 1)
@@ -475,7 +501,7 @@ llvm::SmallVector<int64_t> downstreamContractionAxes(mlir::Value root) {
       if (!result || result.getShape() != source.getShape() ||
           result.getAxisIds() != source.getAxisIds())
         continue;
-      worklist.push_back(user->getResult(0));
+      worklist.emplace_back(user->getResult(0), preservedAxes);
     }
   }
   return axes;
@@ -1298,6 +1324,21 @@ riscv::LayoutAttr buildLayout(mlir::Builder &builder, mlir::Value value,
           : 0;
   int64_t lmul =
       roles.laneAxis ? roundLegalLMUL(target, requestedLMUL, sew) : 0;
+  if (auto lookup = value.getDefiningOp<riscv::LookupOp>()) {
+    auto relation = riscv_internal::analyzeIndexedEntryRelation(
+        lookup.getIndices(), type, {}, {});
+    if (relation && roles.laneAxis == relation->payloadAxis &&
+        desiredLanes == relation->payloadExtent &&
+        totalDesiredLanes > relation->payloadExtent &&
+        supportsPackedIndexedEntryLookup(lookup, *relation, type)) {
+      // Packed indexed memory reinterprets this same register as a complete
+      // storage word. Its LMUL must be legal at that word's SEW as well as at
+      // the payload SEW, even when only part of a wide VLEN is active.
+      const int64_t packedSEW =
+          riscv_internal::logicalBitWidth(type) * relation->payloadExtent;
+      lmul = roundLegalLMUL(target, requestedLMUL, packedSEW);
+    }
+  }
   if (roles.laneAxis && lmul == 0)
     return {};
   int64_t actualLanes = roles.laneAxis ? totalDesiredLanes : 1;
@@ -1350,6 +1391,57 @@ bool pointwiseLike(mlir::Operation *operation) {
   return mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CompareOp,
                    riscv::CastOp, riscv::NarrowOp, riscv::WidenOp,
                    riscv::UpdateOp, riscv::MaterializeOp>(operation);
+}
+
+riscv::LayoutAttr reshapeLaneSuffixLayout(mlir::Builder &builder,
+                                           riscv::ReshapeOp reshape) {
+  auto input = reshape.getInput().getType();
+  auto result = reshape.getResult().getType();
+  auto layout = input.getLayout();
+  if (layout.getCarrier() != "rvv" ||
+      !llvm::equal(reshape.getOrder(), input.getAxisIds().asArrayRef()))
+    return {};
+  size_t prefix = 0;
+  while (prefix < input.getShape().size() &&
+         prefix < result.getShape().size() &&
+         input.getAxisIds()[prefix] == result.getAxisIds()[prefix] &&
+         input.getShape()[prefix] == result.getShape()[prefix])
+    ++prefix;
+  if (prefix == input.getShape().size() ||
+      prefix == result.getShape().size())
+    return {};
+  int64_t inputLanes = 1;
+  for (size_t position = prefix; position < input.getShape().size(); ++position) {
+    const int64_t extent = input.getShape()[position];
+    if (extent <= 0 || layout.getTimeFactors()[position] != 1 ||
+        layout.getLaneFactors()[position] != extent ||
+        layout.getReplicaFactors()[position] != 1 ||
+        layout.getFragmentFactors()[position] != 1 ||
+        layout.getLocalFactors()[position] != 1 ||
+        !checkedMultiply(inputLanes, extent, inputLanes))
+      return {};
+  }
+  int64_t resultLanes = 1;
+  for (int64_t extent : result.getShape().asArrayRef().drop_front(prefix))
+    if (extent <= 0 || !checkedMultiply(resultLanes, extent, resultLanes))
+      return {};
+  if (inputLanes != resultLanes)
+    return {};
+  auto reshapeFactors = [&](mlir::DenseI64ArrayAttr factors, bool lane) {
+    llvm::SmallVector<int64_t> mapped(factors.asArrayRef().take_front(prefix));
+    for (int64_t extent : result.getShape().asArrayRef().drop_front(prefix))
+      mapped.push_back(lane ? extent : 1);
+    return riscv_internal::integers(builder, mapped);
+  };
+  return riscv::LayoutAttr::get(
+      builder.getContext(), layout.getCarrier(), result.getAxisIds(),
+      reshapeFactors(layout.getTimeFactors(), false),
+      reshapeFactors(layout.getLaneFactors(), true),
+      reshapeFactors(layout.getReplicaFactors(), false),
+      reshapeFactors(layout.getFragmentFactors(), false),
+      reshapeFactors(layout.getLocalFactors(), false), layout.getSew(),
+      layout.getLmulEighths(), layout.getVl(), layout.getRegisterGroups(),
+      layout.getValidity());
 }
 
 std::optional<int64_t> encodedLaneLimit(mlir::Value value, int64_t laneAxis) {
@@ -2083,6 +2175,12 @@ public:
       }
       setValueLayout(value, layout);
     }
+    // Preserve the producer's exact partition across an all-lane suffix
+    // split/merge. Consumer layout conflicts remain explicit use conversions.
+    getOperation().walk<mlir::WalkOrder::PreOrder>([&](riscv::ReshapeOp reshape) {
+      if (auto layout = reshapeLaneSuffixLayout(builder, reshape))
+        setValueLayout(reshape.getResult(), layout);
+    });
     // A register lookup uses the result's RVV register group as a table source.
     // The table may contain fewer active lanes than the result (for example a
     // 16-entry codebook feeding a 32-lane result on VLEN256), but vrgather.vv

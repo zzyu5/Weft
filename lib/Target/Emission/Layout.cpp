@@ -294,6 +294,13 @@ std::optional<std::string> Emitter::extractLaneForRegisterBroadcast(
   };
   if (binding.kind != Binding::Kind::Vector)
     return reject("source binding is not an RVV vector");
+  if (physicalLanes(source) == 1 && laneAxisFor(result) == 0) {
+    auto sourcePart = projectPart(source, result, resultPart);
+    if (!sourcePart || *sourcePart >= binding.parts.size())
+      return reject("singleton vector part cannot be projected from the result coordinates");
+    return extractVectorLane(source, binding, *sourcePart, 0,
+                             localExtractions, failureReason);
+  }
   if (laneAxisFor(source) == 0 || laneAxisFor(result) != 0)
     return reject("source/result lane roles do not describe lane-to-register transfer");
   const int64_t resultStreams = streamPartCount(result);

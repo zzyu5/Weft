@@ -252,7 +252,7 @@ public:
              product(finalValue.getLayout().getLocalFactors()) == 1);
         if (match && windowAxis > 0 && lhsPosition && rhsPosition &&
             resultPosition && lhsTime >= 1 && lhsTime == rhsTime &&
-            lhsWindow > 1 && lhsWindow == rhsWindow &&
+            lhsWindow >= 1 && lhsWindow == rhsWindow && logicalExtent > 1 &&
             logicalExtent == lhsTime * lhsWindow && finalElement &&
             finalElement.isSigned() && finalElement.getWidth() == 32 &&
             closedScalarFinal && dot.getPartialUnroll() > 0) {
