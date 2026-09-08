@@ -60,10 +60,17 @@ mlir::Operation *cloneScheduled(mlir::IRRewriter &rewriter,
 
 void copyLoopAttrs(mlir::Operation *source, mlir::Operation *target,
                    bool preserveLevelIdentity) {
-  for (mlir::NamedAttribute attribute : source->getAttrs())
+  for (mlir::NamedAttribute attribute : source->getAttrs()) {
+    // The guard owns the original Level identity, but only the steady-state
+    // loop can consume the selected unroll plan.
+    if (!mlir::isa<mlir::scf::ForOp>(target) &&
+        (attribute.getName() == "weft.riscv.unroll_factor" ||
+         attribute.getName() == "weft.riscv.unroll_order"))
+      continue;
     if (attribute.getName() != "weft.riscv.schedule" &&
         (preserveLevelIdentity || attribute.getName() != "weft.riscv.level"))
       target->setAttr(attribute.getName(), attribute.getValue());
+  }
   if (!preserveLevelIdentity &&
       !target->hasAttr("weft.riscv.direction"))
     if (auto level =
