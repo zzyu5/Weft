@@ -141,6 +141,7 @@ bool requiresIntegerWidening(mlir::Operation *operation) {
                 riscv::RVVPartialMergeOp,
                 riscv::RVVPartialReduceOp,
                 riscv::RVVPartialScaleCombineOp,
+                riscv::RVVPartialPackedScaleOp,
                 riscv::RVVPartialWidenScaleOp,
                 riscv::RVVPartialCombineOp,
                 riscv::RVVPartialFinalizeOp,

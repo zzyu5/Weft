@@ -396,6 +396,9 @@ mlir::LogicalResult Emitter::compileOperation(mlir::Operation &operation) {
   if (auto combine =
           mlir::dyn_cast<riscv::RVVPartialScaleCombineOp>(operation))
     return compileRVVPartialScaleCombine(combine);
+  if (auto packed =
+          mlir::dyn_cast<riscv::RVVPartialPackedScaleOp>(operation))
+    return compileRVVPartialPackedScale(packed);
   if (auto scale =
           mlir::dyn_cast<riscv::RVVPartialWidenScaleOp>(operation))
     return compileRVVPartialWidenScale(scale);

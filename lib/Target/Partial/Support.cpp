@@ -2685,7 +2685,7 @@ bool supportsScalarReplicaRematerialization(
     return true;
 
   mlir::Operation *producer = value.getDefiningOp();
-  if (!producer || !visited.insert(producer).second)
+  if (!producer || visited.size() >= 32 || !visited.insert(producer).second)
     return false;
   if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(producer))
     return conversion.getConversion().getEffect() == "pure" &&

@@ -585,6 +585,40 @@ mlir::LogicalResult Emitter::compileRVVPartialScaleCombine(
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVPartialPackedScale(
+    riscv::RVVPartialPackedScaleOp operation) {
+  if (instructionOf(operation.getOperation()) != "rvv.partial-packed-scale")
+    return fail(operation, "packed partial scale has no exact selected leaf");
+  Binding input = bindings.lookup(operation.getInput());
+  Binding scales = bindings.lookup(operation.getScales());
+  const int64_t slots = operation.getInput().getType().getSlots();
+  if (input.kind != Binding::Kind::PartialSet ||
+      input.parts.size() != static_cast<size_t>(slots) ||
+      scales.kind != Binding::Kind::Vector || scales.parts.size() != 1)
+    return fail(operation, "packed partial scale has incomplete bindings");
+  std::string packed = input.parts[operation.getSlotOrder()[0]];
+  for (int64_t lane = 1; lane < slots; ++lane) {
+    std::string next = fresh("partial_lane_pack");
+    line("vint32m1_t " + next + " = __riscv_vslideup_vx_i32m1_tu(" +
+         packed + ", " + input.parts[operation.getSlotOrder()[lane]] + ", " +
+         std::to_string(lane) + ", " + std::to_string(lane + 1) + ");");
+    packed = std::move(next);
+  }
+  std::string product = fresh("partial_lane_scale");
+  line("vint32m1_t " + product + " = __riscv_vmul_vv_i32m1(" + packed +
+       ", " + scales.parts[0] + ", " + std::to_string(slots) + ");");
+  std::string seed = fresh("partial_lane_seed");
+  line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
+  std::string reduced = fresh("partial_lane_sum");
+  line("vint32m1_t " + reduced + " = __riscv_vredsum_vs_i32m1_i32m1(" +
+       product + ", " + seed + ", " + std::to_string(slots) + ");");
+  Binding result;
+  result.kind = Binding::Kind::PartialSet;
+  result.parts.push_back(std::move(reduced));
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileRVVPartialWidenScale(
     riscv::RVVPartialWidenScaleOp operation) {
   if (instructionOf(operation.getOperation()) != "rvv.partial-widen-scale")

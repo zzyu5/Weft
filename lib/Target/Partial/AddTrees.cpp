@@ -325,6 +325,97 @@ bool materializePartialAddTrees(mlir::ModuleOp module,
   return !failed;
 }
 
+void packReducedScaleCombines(mlir::ModuleOp module,
+                              mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::RVVPartialScaleCombineOp> combines;
+  module.walk([&](riscv::RVVPartialScaleCombineOp op) { combines.push_back(op); });
+  for (auto combine : combines) {
+    auto kernel = combine->getParentOfType<riscv::KernelOp>();
+    auto input = combine.getInput().getType();
+    auto result = combine.getResult().getType();
+    if (!kernel || kernel.getResourcesMaterialized() || result.getSlots() != 1 ||
+        input.getSlots() < 2 || input.getSlots() > 8 ||
+        combine.getLogicalReductionAxes().size() != 1 ||
+        combine.getScales().size() != static_cast<size_t>(input.getSlots()))
+      continue;
+    mlir::Value scalarScale = combine.getScales().front();
+    if (!llvm::all_of(combine.getScales(),
+                      [&](mlir::Value value) { return value == scalarScale; }))
+      continue;
+    auto conversion = scalarScale.getDefiningOp<riscv::ConvertLayoutOp>();
+    if (!conversion || conversion.getConversion().getEffect() != "pure" ||
+        conversion.getResult().getType().getLayout().getCarrier() != "scalar" ||
+        !llvm::all_of(scalarScale.getUsers(), [&](mlir::Operation *user) {
+          return user == combine.getOperation();
+        }))
+      continue;
+    auto source = conversion.getInput().getType();
+    auto before = source.getLayout();
+    if (before.getCarrier() != "rvv" || source.getShape().size() != 1 ||
+        source.getShape()[0] != input.getSlots() ||
+        source.getAxisIds()[0] != combine.getLogicalReductionAxes()[0] ||
+        before.getLmulEighths() > 8)
+      continue;
+    bool matchingOrder = true;
+    for (int64_t lane = 0; lane < input.getSlots(); ++lane)
+      matchingOrder &=
+          combine.getScaleReplicas()[combine.getSlotOrder()[lane]] == lane;
+    if (!matchingOrder)
+      continue;
+    auto layout = riscv::LayoutAttr::get(
+        rewriter.getContext(), "rvv", source.getAxisIds(),
+        before.getTimeFactors(), before.getLaneFactors(),
+        before.getReplicaFactors(), before.getFragmentFactors(),
+        before.getLocalFactors(), 32, 8, before.getVl(), 1,
+        before.getValidity());
+    auto packedType = riscv::ValueType::get(
+        rewriter.getContext(), source.getElementType(), source.getShape(),
+        source.getAxisIds(), layout);
+    if (!riscv::supportsRVVLayout(kernel.getTarget(), before) ||
+        !riscv::supportsRVVPartialPackedScale(kernel.getTarget(), input,
+                                             packedType, result))
+      continue;
+    // Compare two already-legal local representations.  Count the pack slides,
+    // multiply, zero seed, reduction and its VL setup; a reduction has one
+    // additional dependency unit.  Scalar rematerialization may avoid scale
+    // extraction entirely, so use that candidate's lower bound when legal.
+    const int64_t packedIssues = input.getSlots() + 4;
+    llvm::DenseSet<mlir::Operation *> visited;
+    const bool scalarSupply = supportsScalarReplicaRematerialization(
+        conversion.getInput(), visited);
+    if (visited.size() >= 32)
+      continue;
+    const int64_t scalarIssues = scalarSupply ? input.getSlots()
+                                              : input.getSlots() * 3 - 1;
+    if (packedIssues >= scalarIssues)
+      continue;
+    rewriter.setInsertionPoint(combine);
+    mlir::Value scale = conversion.getInput();
+    if (source != packedType) {
+      auto edge = rewriter.create<riscv::ConvertLayoutOp>(
+          combine.getLoc(), packedType, scale,
+          riscv_internal::layoutConversion(rewriter, before, layout),
+          riscv::AccessAttr(), riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(combine, edge);
+      scale = edge.getResult();
+    }
+    auto packed = rewriter.create<riscv::RVVPartialPackedScaleOp>(
+        combine.getLoc(), result, combine.getInput(), scale,
+        combine.getSlotOrderAttr(), combine.getLogicalReductionAxesAttr(),
+        riscv_internal::leaf(
+            rewriter, "rvv", "partial-packed-scale", "rvv.partial-packed-scale",
+            "rvv.partial-packed-scale",
+            input.getResourceGroups() + layout.getRegisterGroups(),
+            result.getResourceGroups(), 3, 0, "none", "exact"));
+    packed->setAttr("weft.riscv.packed_scale_cost",
+                    rewriter.getDenseI64ArrayAttr({packedIssues, scalarIssues}));
+    riscv_internal::copyOrigin(combine, packed);
+    rewriter.replaceOp(combine, packed.getResult());
+    if (conversion.getResult().use_empty())
+      rewriter.eraseOp(conversion);
+  }
+}
+
 class CoalesceRISCVPartialExtractionsPass
     : public mlir::PassWrapper<CoalesceRISCVPartialExtractionsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -340,8 +431,11 @@ public:
     mlir::IRRewriter rewriter(&getContext());
     // The extraction-only plans reuse existing partials and create no births.
     int64_t unusedBirthId = 0;
-    if (!materializePartialAddTrees(getOperation(), rewriter, unusedBirthId))
+    if (!materializePartialAddTrees(getOperation(), rewriter, unusedBirthId)) {
       signalPassFailure();
+      return;
+    }
+    packReducedScaleCombines(getOperation(), rewriter);
   }
 };
 

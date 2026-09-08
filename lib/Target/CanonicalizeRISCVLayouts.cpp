@@ -26,6 +26,21 @@ bool isPureRepresentationConversion(riscv::ConvertLayoutOp conversion) {
   return conversion.getConversion().getEffect() == "pure";
 }
 
+bool isRegisterCarrierResize(riscv::ConvertLayoutOp conversion) {
+  auto before = conversion.getInput().getType().getLayout();
+  auto after = conversion.getResult().getType().getLayout();
+  return before.getCarrier() == "rvv" && after.getCarrier() == "rvv" &&
+         before.getLmulEighths() != after.getLmulEighths() &&
+         before.getAxisIds() == after.getAxisIds() &&
+         before.getTimeFactors() == after.getTimeFactors() &&
+         before.getLaneFactors() == after.getLaneFactors() &&
+         before.getReplicaFactors() == after.getReplicaFactors() &&
+         before.getFragmentFactors() == after.getFragmentFactors() &&
+         before.getLocalFactors() == after.getLocalFactors() &&
+         before.getSew() == after.getSew() && before.getVl() == after.getVl() &&
+         before.getValidity() == after.getValidity();
+}
+
 bool hasFinalResourceContract(riscv::ConvertLayoutOp conversion) {
   auto kernel = conversion->getParentOfType<riscv::KernelOp>();
   return kernel && kernel.getResourcesMaterialized();
@@ -159,6 +174,12 @@ public:
           }
         }
         if (!isPureRepresentationConversion(conversion))
+          continue;
+        // Lane-preserving register resizing is already a closed conversion.
+        // projectLayout chooses a minimum carrier, so rematerializing through
+        // this edge could silently restore smaller operand LMULs than the
+        // selected result instruction requires.
+        if (isRegisterCarrierResize(conversion))
           continue;
         mlir::Operation *producer = conversion.getInput().getDefiningOp();
         if (auto share =

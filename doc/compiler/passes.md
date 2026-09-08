@@ -432,6 +432,16 @@ signed-i32 singleton partial，再做一次 scalar extract。只接受同一 blo
 子树改写使父计划的leaf身份失效。物化只生成既有 `rvv_partial_merge` 与finalize，完整资源
 分析仍重新计算延长的partial lifetime；局部预算检查不是全局live-set合法性的替代。
 
+对已归约的signed-i32/VL1 partial，另比较scalar scale/combine与显式
+`rvv_partial_packed_scale`：后者按完整slot permutation把2至8个结果装入m1的有效lane，
+与同轴、同序、完整的i32 scale向量相乘，再归约为原来的单slot。输入/输出partial类型、
+原scale位置、整数宽度与terms归属不变；不接纳tail、多个输出slot或跨轴scale。
+scale的LMUL调整保留显式conversion，terminal仅拼写已选pack/multiply/reduce。
+局部选择先检查target、坐标与资源合同，再比较包含pack、seed、reduction和VL设置的成本；
+可scalar-rematerialize的供应以无vector extract的成本下界比较。供应搜索最多32个节点，
+估计以`weft.riscv.packed_scale_cost = [packed, scalar]`保存在selected op中，不作为合法性证明。
+该leaf另声明三个temporary vector groups，最终live-set仍由资源pass重算。
+
 该pass位于普通编译与layout-input恢复共用的收尾入口，并由`weft-opt`公开供重放。已带
 final resource marker的图不重新选择；独立副本须先清marker和统计后才能重放此改写。
 

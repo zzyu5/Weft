@@ -744,6 +744,8 @@ private:
   compileRVVPartialReduce(riscv::RVVPartialReduceOp operation);
   mlir::LogicalResult compileRVVPartialScaleCombine(
       riscv::RVVPartialScaleCombineOp operation);
+  mlir::LogicalResult compileRVVPartialPackedScale(
+      riscv::RVVPartialPackedScaleOp operation);
   mlir::LogicalResult compileRVVPartialWidenScale(
       riscv::RVVPartialWidenScaleOp operation);
   mlir::LogicalResult

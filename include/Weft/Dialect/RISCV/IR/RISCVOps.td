@@ -1788,6 +1788,17 @@ def WeftRISCV_RVVPartialScaleCombineOp
   let hasVerifier = 1;
 }
 
+def WeftRISCV_RVVPartialPackedScaleOp
+    : WeftRISCV_LeafOp<"rvv_partial_packed_scale", [Pure]> {
+  let arguments = (ins WeftRISCV_PartialSetType:$input,
+                       WeftRISCV_ValueType:$scales,
+                       DenseI64ArrayAttr:$slot_order,
+                       DenseI64ArrayAttr:$logical_reduction_axes,
+                       WeftRISCV_LeafAttr:$leaf);
+  let results = (outs WeftRISCV_PartialSetType:$result);
+  let hasVerifier = 1;
+}
+
 def WeftRISCV_RVVPartialWidenScaleOp
     : WeftRISCV_LeafOp<"rvv_partial_widen_scale", [Pure]> {
   let arguments = (ins WeftRISCV_PartialSetType:$input,
