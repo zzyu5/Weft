@@ -356,6 +356,7 @@ void collectProjectedRoots(mlir::Value value, int64_t axis,
   if (!mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
                  riscv::NarrowOp, riscv::WidenOp, riscv::ConvertLayoutOp,
                  riscv::LookupOp,
+                 riscv::RVVWidenAddOp,
                  riscv::RVVWidenMultiplyOp,
                  riscv::RVVWidenScalarMultiplyOp,
                  riscv::RegisterMaterializeOp>(definition))
@@ -377,6 +378,7 @@ bool dependsOnAny(mlir::Value value,
     if (mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
                   riscv::NarrowOp, riscv::WidenOp, riscv::ConvertLayoutOp,
                   riscv::LookupOp,
+                  riscv::RVVWidenAddOp,
                   riscv::RVVWidenMultiplyOp,
                   riscv::RVVWidenScalarMultiplyOp,
                   riscv::RegisterMaterializeOp>(definition))
@@ -412,7 +414,8 @@ bool canProjectWindowSlice(
   if (!definition ||
       !mlir::isa<riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
                  riscv::NarrowOp, riscv::WidenOp, riscv::ConvertLayoutOp,
-                 riscv::LookupOp, riscv::RVVWidenMultiplyOp,
+                 riscv::LookupOp, riscv::RVVWidenAddOp,
+                 riscv::RVVWidenMultiplyOp,
                  riscv::RVVWidenScalarMultiplyOp,
                  riscv::RegisterMaterializeOp>(definition) ||
       !projectOneWindow(builder, type, axis)) {
@@ -527,6 +530,15 @@ mlir::FailureOr<mlir::Value> cloneWindowSlice(
                  .create<riscv::LookupOp>(
                      lookup.getLoc(), resultType, lookup.getTable(), *indices,
                      lookup.getBounds(), lookup.getAccess(), lookup.getLeaf())
+                 .getResult();
+  } else if (auto add = mlir::dyn_cast<riscv::RVVWidenAddOp>(definition)) {
+    auto lhs = cloneOperand(add.getLhs());
+    auto rhs = cloneOperand(add.getRhs());
+    if (mlir::failed(lhs) || mlir::failed(rhs))
+      return mlir::failure();
+    cloned = rewriter
+                 .create<riscv::RVVWidenAddOp>(add.getLoc(), resultType,
+                                              *lhs, *rhs, add.getLeaf())
                  .getResult();
   } else if (auto multiply =
                  mlir::dyn_cast<riscv::RVVWidenMultiplyOp>(definition)) {
@@ -1528,6 +1540,15 @@ mlir::FailureOr<mlir::Value> cloneIssueWindow(
                        riscv_internal::unselectedLeaf(rewriter))
                    .getResult();
     }
+  } else if (auto add = mlir::dyn_cast<riscv::RVVWidenAddOp>(definition)) {
+    auto lhs = cloneOperand(add.getLhs());
+    auto rhs = cloneOperand(add.getRhs());
+    if (mlir::failed(lhs) || mlir::failed(rhs))
+      return mlir::failure();
+    cloned = rewriter
+                 .create<riscv::RVVWidenAddOp>(add.getLoc(), resultType,
+                                              *lhs, *rhs, add.getLeaf())
+                 .getResult();
   } else if (auto broadcast =
                  mlir::dyn_cast<riscv::RVVAxisBroadcastOp>(definition)) {
     auto input = cloneOperand(broadcast.getInput());
@@ -2455,6 +2476,7 @@ void eraseDeadChain(mlir::Value value,
                 riscv::RVVIndexedEntryLoadOp, riscv::IotaOp,
                 riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
                 riscv::NarrowOp, riscv::WidenOp,
+                riscv::RVVWidenAddOp,
                 riscv::RVVWidenMultiplyOp,
                 riscv::RVVWidenScalarMultiplyOp, riscv::RVVWidenDotOp,
                 riscv::RVVRegularRepeatIndexOp,
@@ -2475,6 +2497,7 @@ bool isDeadChainCandidate(mlir::Operation *operation) {
                    riscv::UnaryOp, riscv::BinaryOp, riscv::CastOp,
                    riscv::NarrowOp, riscv::WidenOp,
                    riscv::ReduceOp,
+                   riscv::RVVWidenAddOp,
                    riscv::RVVWidenMultiplyOp,
                    riscv::RVVWidenScalarMultiplyOp, riscv::RVVWidenDotOp,
                    riscv::ConvertLayoutOp, riscv::RVVAxisBroadcastOp,

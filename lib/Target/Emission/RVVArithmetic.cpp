@@ -1666,6 +1666,38 @@ mlir::LogicalResult Emitter::compileBinary(riscv::BinaryOp operation) {
   return mlir::success();
 }
 
+mlir::LogicalResult Emitter::compileRVVWidenAdd(riscv::RVVWidenAddOp operation) {
+  auto lhs = materializeNumeric(operation.getLhs(),
+                                bindings.lookup(operation.getLhs()));
+  auto rhs = materializeNumeric(operation.getRhs(),
+                                bindings.lookup(operation.getRhs()));
+  if (mlir::failed(lhs) || mlir::failed(rhs) ||
+      lhs->kind != Binding::Kind::Vector || rhs->kind != Binding::Kind::Vector)
+    return fail(operation, "RVV widening add requires two selected vectors");
+  const llvm::StringRef instruction = instructionOf(operation.getOperation());
+  if (instruction != "rvv.vwadd.vv" && instruction != "rvv.vwaddu.vv")
+    return fail(operation, "RVV widening add has no exact selected instruction");
+  const std::string intrinsic =
+      std::string(instruction == "rvv.vwadd.vv" ? "__riscv_vwadd_vv_"
+                                               : "__riscv_vwaddu_vv_") +
+      vectorSuffix(operation.getResult());
+  Binding result;
+  result.kind = Binding::Kind::Vector;
+  for (int64_t part = 0; part < vectorPartCount(operation.getResult()); ++part) {
+    auto left = mappedPart(operation.getOperation(), 0, part);
+    auto right = mappedPart(operation.getOperation(), 1, part);
+    if (!left || !right || *left >= lhs->parts.size() || *right >= rhs->parts.size())
+      return fail(operation, "RVV widening add has no closed operand-part mapping");
+    std::string name = fresh("widen_add");
+    line(vectorType(operation.getResult()) + " " + name + " = " + intrinsic +
+         "(" + lhs->parts[*left] + ", " + rhs->parts[*right] + ", " +
+         partVL(operation.getResult(), part) + ");");
+    result.parts.push_back(std::move(name));
+  }
+  bindings[operation.getResult()] = std::move(result);
+  return mlir::success();
+}
+
 mlir::LogicalResult Emitter::compileRVVWidenMultiply(
     riscv::RVVWidenMultiplyOp operation) {
   auto lhs = materializeNumeric(operation.getLhs(),

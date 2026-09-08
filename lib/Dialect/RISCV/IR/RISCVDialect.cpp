@@ -6555,6 +6555,53 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   return mlir::success();
 }
 
+bool weft::riscv::supportsRVVWidenAdd(TargetAttr target, ValueType lhs,
+                                     ValueType rhs, ValueType result) {
+  if (!target || !lhs || lhs != rhs || !result)
+    return false;
+  auto narrow = mlir::dyn_cast<mlir::IntegerType>(lhs.getElementType());
+  auto wide = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+  auto source = lhs.getLayout();
+  auto destination = result.getLayout();
+  return narrow && wide && !narrow.isSignless() && !wide.isSignless() &&
+         narrow.getSignedness() == wide.getSignedness() &&
+         narrow.getWidth() >= 8 && wide.getWidth() == 2 * narrow.getWidth() &&
+         lhs.getShape() == result.getShape() &&
+         lhs.getAxisIds() == result.getAxisIds() &&
+         source.getCarrier() == "rvv" && destination.getCarrier() == "rvv" &&
+         source.getAxisIds() == destination.getAxisIds() &&
+         source.getTimeFactors() == destination.getTimeFactors() &&
+         source.getLaneFactors() == destination.getLaneFactors() &&
+         source.getReplicaFactors() == destination.getReplicaFactors() &&
+         source.getFragmentFactors() == destination.getFragmentFactors() &&
+         source.getLocalFactors() == destination.getLocalFactors() &&
+         source.getValidity() == destination.getValidity() &&
+         (source.getValidity() == "full" || source.getValidity() == "tail") &&
+         source.getSew() == narrow.getWidth() &&
+         destination.getSew() == wide.getWidth() &&
+         destination.getLmulEighths() == 2 * source.getLmulEighths() &&
+         source.getVl() == destination.getVl() &&
+         target.getHasWideningInteger() &&
+         supportsRVVLayout(target, source) &&
+         supportsRVVLayout(target, destination);
+}
+
+mlir::LogicalResult RVVWidenAddOp::verify() {
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  auto element = mlir::dyn_cast<mlir::IntegerType>(
+      getLhs().getType().getElementType());
+  const llvm::StringRef instruction = element && element.isUnsigned()
+                                          ? "rvv.vwaddu.vv" : "rvv.vwadd.vv";
+  const llvm::StringRef tail = getResult().getType().getLayout().getValidity() == "tail"
+                                   ? "agnostic" : "exact";
+  if (!kernel || !supportsRVVWidenAdd(kernel.getTarget(), getLhs().getType(),
+                                      getRhs().getType(), getResult().getType()) ||
+      !exactLeaf(getLeaf(), "rvv", "widen-add", instruction, "none", tail))
+    return emitOpError(
+        "RVV widening add requires identical signedness-qualified narrow vectors and a coordinate-identical doubled-width result");
+  return mlir::success();
+}
+
 mlir::LogicalResult RVVWidenMultiplyOp::verify() {
   ValueType lhs = getLhs().getType();
   ValueType rhs = getRhs().getType();

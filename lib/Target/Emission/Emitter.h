@@ -697,6 +697,7 @@ private:
   compileGroupedMacStep(riscv::RVVGroupedMacStepOp operation);
   mlir::LogicalResult
   compileRVVWidenMultiply(riscv::RVVWidenMultiplyOp operation);
+  mlir::LogicalResult compileRVVWidenAdd(riscv::RVVWidenAddOp operation);
   mlir::LogicalResult compileRVVWidenScalarMultiply(
       riscv::RVVWidenScalarMultiplyOp operation);
   mlir::LogicalResult compileRVVMultiplyHighScalar(

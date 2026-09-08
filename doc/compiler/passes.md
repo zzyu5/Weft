@@ -102,6 +102,13 @@ carrier/坐标，不重选 partial plan；新 leaf 及资源由原有 verifier/m
 逐坐标同形；保留原 i16 加法边界和迭代顺序，不合并不同 carry，也不只改写链的前缀。
 这条关系不增加作者 reduction，不改变最后的归约位置；资源仍由后续 pass 重新闭合。
 
+两个单 use 的整数 `widen` 若直接供给同一个 add，且窄 operands 的 signedness/type 与完整
+物理坐标相同、宽 result 保持 signedness 并具有双 SEW/LMUL，可以选择局部
+`rvv_widen_add`。op 只保留原 active VL 上的逐元素加法，分别拼写 `vwadd` 或 `vwaddu`；
+不接受 mixed signedness，不穿过其它计算或改变 reduction。选择器与 verifier 共用类型及
+target 合法性判据，memory reads 和外层 traversal 不变；其 window projection、资源重闭合
+和 terminal part 映射仍必须显式成立。
+
 ### `PropagateRISCVLayouts`
 
 从 selected operation anchors、logical axes、producer/consumer、control carry 和 target VLEN

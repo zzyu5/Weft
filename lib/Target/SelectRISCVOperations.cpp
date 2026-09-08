@@ -294,6 +294,41 @@ void selectZeroSeedProducts(mlir::ModuleOp module,
   }
 }
 
+void selectWidenAdds(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
+  module.walk([&](riscv::BinaryOp binary) {
+    if (binary.getKind() != "add")
+      return;
+    auto lhs = binary.getLhs().getDefiningOp<riscv::WidenOp>();
+    auto rhs = binary.getRhs().getDefiningOp<riscv::WidenOp>();
+    auto result = mlir::dyn_cast<riscv::ValueType>(binary.getResult().getType());
+    auto kernel = binary->getParentOfType<riscv::KernelOp>();
+    if (!lhs || !rhs || !result || !kernel ||
+        !lhs.getResult().hasOneUse() || !rhs.getResult().hasOneUse() ||
+        lhs.getResult().getType() != result || rhs.getResult().getType() != result)
+      return;
+    auto left = mlir::dyn_cast<riscv::ValueType>(lhs.getInput().getType());
+    auto right = mlir::dyn_cast<riscv::ValueType>(rhs.getInput().getType());
+    if (!riscv::supportsRVVWidenAdd(kernel.getTarget(), left, right, result))
+      return;
+    auto element = mlir::cast<mlir::IntegerType>(left.getElementType());
+    const llvm::StringRef instruction =
+        element.isUnsigned() ? "rvv.vwaddu.vv" : "rvv.vwadd.vv";
+    rewriter.setInsertionPoint(binary);
+    auto added = rewriter.create<riscv::RVVWidenAddOp>(
+        binary.getLoc(), result, lhs.getInput(), rhs.getInput(),
+        riscv_internal::leaf(
+            rewriter, "rvv", "widen-add", instruction, instruction,
+            left.getLayout().getRegisterGroups() +
+                right.getLayout().getRegisterGroups(),
+            result.getLayout().getRegisterGroups(), 0, 0, "none",
+            result.getLayout().getValidity() == "tail" ? "agnostic" : "exact"));
+    riscv_internal::copyOrigin(binary, added);
+    rewriter.replaceOp(binary, added.getResult());
+    rewriter.eraseOp(lhs);
+    rewriter.eraseOp(rhs);
+  });
+}
+
 class SelectRISCVOperationsPass
     : public mlir::PassWrapper<SelectRISCVOperationsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -309,6 +344,7 @@ public:
     mlir::IRRewriter rewriter(&getContext());
     selectLoopCarriedWidenProducts(getOperation(), rewriter);
     selectZeroSeedProducts(getOperation(), rewriter);
+    selectWidenAdds(getOperation(), rewriter);
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {
