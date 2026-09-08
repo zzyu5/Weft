@@ -402,6 +402,12 @@ product carrier。materializer先用显式`rvv_widen_multiply/rvv_widen_accumula
 scale combine。`rvv_partial_collect`不生成新的数学运算；它使同时存活的独立product、slot顺序、
 birth/lifetime和资源总量成为可验证的IR合同，terminal translator不能从原dot重新构造这棵程序。
 
+independent i16 partial tree 若没有同宽跨 stream 合并的合法证明，首层 pairwise combine
+必须 widening 到 i32，后续层保持 i32，再做最终 reduction；这同样适用于四路及更多
+power-of-two streams，不能仅为两路特殊处理。选择前同时计入 operand/source-set live set、
+第一层 source/widened-result live set 和最终收敛资源，并遵守 target 的单载体 widening 限制。
+已冻结计划的 verifier 拒绝未经证明仍在 i16 中合并的首层；materializer 只消费这些 typed stages。
+
 上述 plan attributes 是第二层内部、一次 lowering 中的瞬态冻结结果。完成物化后它们必须删除；
 final verifier拒绝任何残留plan，terminal translator也不读取它们。只有单stream的closed widening-dot
 leaf可以直接保留typed topology、lane/source-part relation与exact leaf，而不保留待解释program plan。

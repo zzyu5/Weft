@@ -6101,6 +6101,8 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
   auto sequentialPartialPlan = getSequentialPartialPlanAttr();
   auto scaledPartialPlan = getScaledPartialPlanAttr();
   auto layeredPartialPlan = getLayeredPartialPlanAttr();
+  auto combinePartialPlan =
+      (*this)->getAttrOfType<PartialCombinePlanAttr>("partial_combine_plan");
   const bool topologyAssigned = topologyKind != "unassigned";
   const bool sequentialPlanRequired =
       getReductionStreams() > 0 &&
@@ -6475,6 +6477,32 @@ mlir::LogicalResult RVVWidenDotOp::verify() {
         getPartialTopology().getResourceGroups() ==
             scaledPartialPlan.getResourceGroups() &&
         scaledPartialPlan.getResourceGroups() <= target.getVectorRegisters();
+  }
+  if (topologyAssigned && topologyKind == "independent") {
+    auto source = combinePartialPlan
+                      ? mlir::dyn_cast<PartialSetType>(combinePartialPlan.getSourceSetType())
+                      : PartialSetType();
+    auto element = source ? mlir::dyn_cast<mlir::IntegerType>(
+                                source.getPartialType().getElementType())
+                          : mlir::IntegerType();
+    layoutPlanClosed &=
+        source && combinePartialPlan.getResourceGroups() ==
+                      getPartialTopology().getResourceGroups() &&
+        combinePartialPlan.getResourceGroups() <= target.getVectorRegisters();
+    if (element && element.getWidth() == 16 && !getFusedStreamsLegal()) {
+      auto stages = combinePartialPlan.getCombineSetTypes();
+      auto arities = combinePartialPlan.getCombineArities().asArrayRef();
+      auto firstAttr = stages.empty() ? mlir::TypeAttr()
+                                     : mlir::dyn_cast<mlir::TypeAttr>(stages[0]);
+      auto first = firstAttr ? mlir::dyn_cast<PartialSetType>(firstAttr.getValue())
+                             : PartialSetType();
+      layoutPlanClosed &=
+          first && !arities.empty() &&
+          isWideningPartialCombineStage(source, first, arities[0]) &&
+          supportsRVVLayout(target, first.getPartialType().getLayout()) &&
+          first.getPartialType().getLayout().getRegisterGroups() <=
+              target.getMaxWideningCombineGroups();
+    }
   }
   if (topologyAssigned && layeredPartialPlan)
     layoutPlanClosed &= getPartialTopology().getRootOperand() >= 0 &&

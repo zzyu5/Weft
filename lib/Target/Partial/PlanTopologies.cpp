@@ -2,6 +2,32 @@
 
 namespace weft::riscv_partial {
 
+static std::optional<int64_t> widenedIndependentResources(
+    riscv::TargetAttr target, riscv::ValueType source,
+    riscv::ValueType widened, int64_t slots, int64_t operandGroups) {
+  if (!target || !source || !widened || slots < 2 ||
+      (slots & (slots - 1)) || operandGroups < 0 ||
+      !target.getHasWideningInteger() ||
+      !riscv::supportsRVVLayout(target, source.getLayout()) ||
+      !riscv::supportsRVVLayout(target, widened.getLayout()) ||
+      widened.getLayout().getRegisterGroups() >
+          target.getMaxWideningCombineGroups())
+    return std::nullopt;
+  const int64_t wideGroups = widened.getLayout().getRegisterGroups();
+  auto sourceGroups = checkedProduct({slots, source.getLayout().getRegisterGroups()});
+  auto firstGroups = checkedProduct({slots / 2, wideGroups});
+  const int64_t budget = target.getVectorRegisters();
+  if (!sourceGroups || !firstGroups || budget < 2 ||
+      *sourceGroups > budget || *firstGroups > budget ||
+      operandGroups > budget - *sourceGroups ||
+      *sourceGroups > budget - *firstGroups || wideGroups > budget - 2)
+    return std::nullopt;
+  // First widening combines dominate later i32 pairwise live sets: the number
+  // of slots halves at every subsequent stage while the carrier stays fixed.
+  return std::max({operandGroups + *sourceGroups,
+                   *sourceGroups + *firstGroups, wideGroups + 2});
+}
+
 class PlanRISCVPartialTopologiesPass
     : public mlir::PassWrapper<PlanRISCVPartialTopologiesPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -398,47 +424,34 @@ public:
       auto widenedPairSlot =
           pairSlot ? widenPartialSlotType(builder, pairSlot)
                    : riscv::ValueType();
-      const int64_t pairSourceGroups =
-          pairSlot ? 2 * pairSlot.getLayout().getRegisterGroups() : 0;
-      const int64_t pairResultGroups =
-          widenedPairSlot
-              ? widenedPairSlot.getLayout().getRegisterGroups()
-              : 0;
-      const int64_t pairResources = std::max<int64_t>(
-          {operandGroups + pairSourceGroups, pairSourceGroups + pairResultGroups,
-           pairResultGroups + 2});
-      const bool exactTwoStreamWidening =
-          !fused && streams == 2 && pairSlot && widenedPairSlot &&
+      auto wideningResources =
+          kernel && pairSlot && widenedPairSlot
+              ? widenedIndependentResources(kernel.getTarget(), pairSlot,
+                                             widenedPairSlot, streams,
+                                             operandGroups)
+              : std::optional<int64_t>();
+      const bool exactWideningTree =
+          !fused && wideningResources &&
           topologyResultElement && topologyResultElement.isSigned() &&
-          topologyResultElement.getWidth() == 32 && kernel &&
-          kernel.getTarget().getHasWideningInteger() &&
-          pairResultGroups <= kernel.getTarget().getMaxWideningCombineGroups() &&
-          riscv::supportsRVVLayout(kernel.getTarget(), pairSlot.getLayout()) &&
-          riscv::supportsRVVLayout(kernel.getTarget(),
-                                   widenedPairSlot.getLayout()) &&
-          pairResources <= kernel.getTarget().getVectorRegisters();
+          topologyResultElement.getWidth() == 32;
+      const bool needsWidenedCombine = !fused && static_cast<bool>(widenedPairSlot);
 
       // Independent partials are a structural preference supplied by the
-      // target profile, not a universal property of RVV.  A two-stream
-      // contraction enters this topology only when narrow fusion is not exact:
-      // its two i16 products are widened into one i32 carrier before the sole
-      // final reduction.  The fixed structural priority applies only while the
-      // widened carrier occupies at most two architectural register groups;
-      // beyond that point the extra wide live range loses to per-stream
-      // reduction on both independent VLEN128 inputs.  Larger trees retain the
-      // existing multilevel policy.
+      // target profile. If narrow fusion is not exact, every i16 tree widens
+      // its first pairwise stage, regardless of its number of streams. The
+      // target carrier limit and the full first-stage live set gate selection.
       if (kind.empty() && kernel &&
           kernel.getTarget().getPartialCombinePolicy() ==
               "independent-multilevel" &&
-          (exactTwoStreamWidening ||
-           (streams >= 4 && (streams & (streams - 1)) == 0 &&
+          (exactWideningTree ||
+           (!needsWidenedCombine && streams >= 4 && (streams & (streams - 1)) == 0 &&
             available >= 2 && partialGroups > 0 &&
             streams <= (available - 2) / partialGroups))) {
         kind = "independent";
         partialSlots = streams;
         combineArity = 2;
-        resources = exactTwoStreamWidening
-                        ? pairResources
+        resources = exactWideningTree
+                        ? *wideningResources
                         : std::max<int64_t>(1, streams * partialGroups + 2);
       }
       if (kind.empty())
@@ -1098,22 +1111,25 @@ public:
       auto selectedElement = mlir::dyn_cast<mlir::IntegerType>(
           selectedSlot.getElementType());
       const bool widenFirstCombine =
-          slots == 2 && !dot.getFusedStreamsLegal() && selectedElement &&
+          !dot.getFusedStreamsLegal() && selectedElement &&
           selectedElement.isSigned() && selectedElement.getWidth() == 16 &&
           resultElement.isSigned() && resultElement.getWidth() == 32;
+      if (widenFirstCombine) {
+        combineSlot = widenPartialSlotType(builder, selectedSlot);
+        auto wideResources = widenedIndependentResources(
+            kernel.getTarget(), selectedSlot, combineSlot, slots, operandGroups);
+        if (!wideResources ||
+            *wideResources > dot.getPartialTopology().getResourceGroups()) {
+          dot.emitError(
+              "selected independent topology has no resource-legal first i32 combine stage");
+          signalPassFailure();
+          return;
+        }
+      }
       while (remainingSlots > 1) {
         const int64_t arity = remainingSlots % 2 == 0 ? 2 : remainingSlots;
         remainingSlots /= arity;
         termsPerSlot *= arity;
-        if (widenFirstCombine) {
-          combineSlot = widenPartialSlotType(builder, selectedSlot);
-          if (!combineSlot) {
-            dot.emitError(
-                "selected two-stream topology has no legal widened i32 combine carrier");
-            signalPassFailure();
-            return;
-          }
-        }
         const int64_t combineGroups =
             combineSlot.getLayout().getRegisterGroups();
         finalSet = riscv::PartialSetType::get(
