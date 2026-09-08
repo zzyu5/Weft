@@ -13,7 +13,7 @@ def compute(W: wl.View[ggml.Q2_K, (K,)], X: wl.View[ggml.Q8_K, (K,)]):
         integer = wl.i32(0)
         with wl.level.subtiles(kb, extent=16) as sub:
             partial = wl.reduce_dot(w.q[sub], x.q[sub], over="k", acc_dtype=wl.i32)
-            scale = wl.i32(wl.u8(w.scales[sub]) & wl.u8(15))
+            scale = wl.i32(w.scales[sub]) & wl.i32(15)
             integer += partial * scale
         mins = wl.widen(wl.u8(w.scales) >> wl.u8(4), wl.i16)
         minimum = wl.reduce_dot(x.bsum, mins, over="k", acc_dtype=wl.i32)
