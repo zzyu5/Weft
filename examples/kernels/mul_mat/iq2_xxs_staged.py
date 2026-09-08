@@ -29,11 +29,13 @@ def _compute(
     W: wl.View[ggml.IQ2_XXS, (N, K)],
     X: wl.View[wl.f32, (M, K)],
     Xq: wl.View[ggml.Q8_K, (M, K)],
-    grid: wl.View[wl.i8, (2048,)],
-    signs: wl.View[wl.i8, (1024,)],
+    grid: wl.View[ggml.I8X8, (256, 8)],
+    signs: wl.View[ggml.I8X8, (128, 8)],
     Y: wl.View[wl.f32, (M, N)],
     bounded_indices,
 ):
+    grid_values = grid.values
+    sign_values = signs.values
     quant_q8_k.quantize_matrix(X, Xq)
     for row in range(M):
         for column in range(N):
@@ -57,14 +59,14 @@ def _compute(
                             with wl.level.subtiles(kb, extent=32) as group:
                                 if bounded_indices:
                                     group_partial = _iq2_xxs_group_products(
-                                        w, x, grid, signs, entry_u32, payload_u32,
+                                        w, x, grid_values, sign_values, entry_u32, payload_u32,
                                         group_index,
                                         wl.u32(group_index) * wl.u32(4) + entry_u32 // wl.u32(2),
                                         wl.u32(group_index) * wl.u32(32) + entry_u32 * wl.u32(8) + payload_u32,
                                     )
                                 else:
                                     group_partial = _iq2_xxs_group_products(
-                                        w, x, grid, signs, entry_lane, codebook_lane,
+                                        w, x, grid_values, sign_values, entry_lane, codebook_lane,
                                         group_index,
                                         group_index * 4 + entry_lane // 2,
                                         group_index * 32 + entry_lane * 8 + codebook_lane,
@@ -88,8 +90,8 @@ def production_mul_mat_iq2_xxs_staged(
     W: wl.View[ggml.IQ2_XXS, (N, K)],
     X: wl.View[wl.f32, (M, K)],
     Xq: wl.View[ggml.Q8_K, (M, K)],
-    grid: wl.View[wl.i8, (2048,)],
-    signs: wl.View[wl.i8, (1024,)],
+    grid: wl.View[ggml.I8X8, (256, 8)],
+    signs: wl.View[ggml.I8X8, (128, 8)],
     Y: wl.View[wl.f32, (M, N)],
 ):
     _compute(W, X, Xq, grid, signs, Y, False)
