@@ -4184,8 +4184,9 @@ static mlir::LogicalResult verifyByteReadSource(mlir::Operation *operation,
     auto encoding = mlir::cast<weft::kernel::EncodingType>(memory.getEncoding());
     if (encoding.getKind() != "dense" || !canRead(memory.getAccess()) ||
         memory.getShape().size() != 1 || memory.getStrides()[0] != 1 ||
-        (memory.getStorageBits() != 16 && memory.getStorageBits() != 32))
-      return operation->emitError("byte read requires one contiguous readable word descriptor");
+        (memory.getStorageBits() != 8 && memory.getStorageBits() != 16 &&
+         memory.getStorageBits() != 32))
+      return operation->emitError("byte read requires one contiguous readable byte or word descriptor");
   } else {
     auto field = value.getDefiningOp<FieldOp>();
     auto source = mlir::dyn_cast<ValueType>(value.getType());
@@ -4245,41 +4246,42 @@ mlir::LogicalResult RVVByteGatherOp::verify() {
 mlir::LogicalResult RVVByteWindowsLoadOp::verify() {
   if (mlir::failed(verifyByteReadSource(*this, getSource())))
     return mlir::failure();
-  auto base = mlir::dyn_cast<mlir::IntegerType>(getByteBase().getType());
+  auto bases = getByteBases();
+  auto base = bases.empty() ? mlir::IntegerType()
+                           : mlir::dyn_cast<mlir::IntegerType>(bases.front().getType());
   auto result = getResult().getType();
   auto layout = result.getLayout();
   auto byte = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
-  auto offsets = getWindowOffsets();
   const int64_t width = getWindowBytesAttr().getInt();
+  auto lanes = checkedPositiveProduct(result.getShape().asArrayRef());
   auto kernel = (*this)->getParentOfType<KernelOp>();
   if (!base || !base.isUnsigned() ||
       (base.getWidth() != 16 && base.getWidth() != 32) ||
-      !byte || !byte.isUnsigned() || byte.getWidth() != 8 || !kernel ||
+      !byte || byte.isSignless() || byte.getWidth() != 8 || !kernel ||
       !kernel.getTarget().getHasRVV() ||
-      !supportsRVVLayout(kernel.getTarget(), layout) ||
+      !supportsRVVLayout(kernel.getTarget(), layout) || layout.getSew() != 8 ||
+      !lanes || *lanes != layout.getVl() ||
       layout.getCarrier() != "rvv" || layout.getValidity() != "full" ||
       !llvm::equal(result.getShape().asArrayRef(), layout.getLaneFactors().asArrayRef()))
-    return emitOpError("byte windows require a scalar unsigned base and one full RVV byte carrier");
+    return emitOpError("byte windows require scalar unsigned bases and one full RVV byte carrier");
   for (auto factors : {layout.getTimeFactors(), layout.getReplicaFactors(),
                        layout.getFragmentFactors(), layout.getLocalFactors()})
     if (llvm::any_of(factors.asArrayRef(), [](int64_t factor) { return factor != 1; }))
       return emitOpError("byte windows cannot own traversal, replicas, fragments, or local storage");
   const int64_t domain = int64_t{1} << base.getWidth();
-  if (offsets.empty() || offsets.size() > 4 || offsets.front() != 0 ||
+  if (bases.empty() || bases.size() > 4 ||
       width <= 0 || width > domain || (width & (width - 1)) ||
-      static_cast<int64_t>(offsets.size()) * width != layout.getVl())
+      static_cast<int64_t>(bases.size()) * width != layout.getVl())
     return emitOpError("byte windows require one to four complete power-of-two windows");
-  int64_t end = 0;
-  for (int64_t offset : offsets) {
-    if (offset < end || offset % width || offset > domain - width)
-      return emitOpError("byte windows must be ordered, disjoint, and word-domain aligned");
-    end = offset + width;
-  }
-  const int64_t temporary = offsets.size() == 1 ? 0 : layout.getRegisterGroups();
+  for (mlir::Value windowBase : bases)
+    if (windowBase.getType() != base)
+      return emitOpError("byte window bases must share one scalar unsigned integer type");
+  const int64_t temporary = bases.size() == 1 ? 0 : layout.getRegisterGroups();
   if (getAccess().getForm() != "unit" || getAccess().getMapping() != "natural" ||
       getAccess().getAlignment() != 1 || getAccess().getIndexSEW() != 0 ||
       !exactLeaf(getLeaf(), "rvv", "byte-windows-load", "rvv.byte-windows-pack", "none", "exact") ||
-      getLeaf().getTemporaryGroups() != temporary)
+      getLeaf().getTemporaryGroups() != temporary ||
+      getLeaf().getLocalBytes() != 0 || getLeaf().getFragmentGroups() != 0)
     return emitOpError("byte windows require exact byte loads and the bounded pack temporary");
   return verifyLeafOperation(*this);
 }

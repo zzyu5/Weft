@@ -2199,10 +2199,23 @@ mlir::LogicalResult selectByteWindows(mlir::ModuleOp module,
     // Window starts retain the original unsigned wrap.  Alignment to a
     // power-of-two width proves that no individual unit load crosses that
     // integer domain boundary, so exactly the original bytes are read.
+    llvm::SmallVector<mlir::Value> bases;
+    for (int64_t offset : offsets) {
+      if (offset == 0) {
+        bases.push_back(*base);
+        continue;
+      }
+      auto constant = rewriter.create<riscv::ConstantOp>(
+          gather.getLoc(), element, rewriter.getIntegerAttr(element, offset));
+      auto start = rewriter.create<riscv::BinaryOp>(
+          gather.getLoc(), element, *base, constant.getResult(), "add",
+          riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(gather, start);
+      bases.push_back(start.getResult());
+    }
     const int64_t temporary = *count == 1 ? 0 : layout.getRegisterGroups();
     auto windows = rewriter.create<riscv::RVVByteWindowsLoadOp>(
-        gather.getLoc(), result, gather.getSource(), *base,
-        rewriter.getDenseI64ArrayAttr(offsets), width,
+        gather.getLoc(), result, gather.getSource(), bases, width,
         makeAccess(rewriter, "unit", "natural", 1),
         riscv_internal::leaf(rewriter, "rvv", "byte-windows-load",
                              "rvv.byte-windows-pack", "rvv.byte-windows-pack",
@@ -2212,6 +2225,185 @@ mlir::LogicalResult selectByteWindows(mlir::ModuleOp module,
     rewriter.eraseOp(gather);
   }
   return mlir::success();
+}
+
+bool sameWindowCoordinates(riscv::ValueType lhs, riscv::ValueType rhs) {
+  if (!lhs || !rhs || lhs.getShape() != rhs.getShape() ||
+      lhs.getAxisIds() != rhs.getAxisIds())
+    return false;
+  auto left = lhs.getLayout();
+  auto right = rhs.getLayout();
+  return left.getCarrier() == "rvv" && right.getCarrier() == "rvv" &&
+         left.getValidity() == "full" && right.getValidity() == "full" &&
+         left.getVl() == right.getVl() &&
+         left.getTimeFactors() == right.getTimeFactors() &&
+         left.getLaneFactors() == right.getLaneFactors() &&
+         left.getReplicaFactors() == right.getReplicaFactors() &&
+         left.getFragmentFactors() == right.getFragmentFactors() &&
+         left.getLocalFactors() == right.getLocalFactors();
+}
+
+mlir::Value stripUnsignedWindowCasts(mlir::Value value) {
+  for (unsigned depth = 0; depth < 16; ++depth) {
+    auto *producer = value.getDefiningOp();
+    auto result = mlir::dyn_cast<riscv::ValueType>(value.getType());
+    if (!producer || !result || producer->getNumOperands() != 1)
+      return value;
+    auto input = mlir::dyn_cast<riscv::ValueType>(producer->getOperand(0).getType());
+    if (!sameWindowCoordinates(input, result))
+      return value;
+    auto from = mlir::dyn_cast<mlir::IntegerType>(input.getElementType());
+    auto to = mlir::dyn_cast<mlir::IntegerType>(result.getElementType());
+    if (!from || !to || !from.isUnsigned() || !to.isUnsigned())
+      return value;
+    if (auto conversion = mlir::dyn_cast<riscv::ConvertLayoutOp>(producer)) {
+      if (from != to || conversion.getConversion().getEffect() != "pure")
+        return value;
+    } else if (mlir::isa<riscv::CastOp, riscv::WidenOp>(producer)) {
+      if (from.getWidth() > to.getWidth())
+        return value;
+    } else {
+      return value;
+    }
+    value = producer->getOperand(0);
+  }
+  return {};
+}
+
+bool isTwoWindowCoordinate(mlir::Value value, llvm::StringRef kind,
+                           int64_t width, riscv::ValueType result) {
+  value = stripUnsignedWindowCasts(value);
+  auto binary = value ? value.getDefiningOp<riscv::BinaryOp>() : riscv::BinaryOp();
+  auto divisor = binary ? directInteger(binary.getRhs()) : mlir::IntegerAttr();
+  if (!binary || binary.getKind() != kind || !divisor || divisor.getInt() != width)
+    return false;
+  auto ramp = stripUnsignedWindowCasts(binary.getLhs());
+  auto iota = ramp ? ramp.getDefiningOp<riscv::IotaOp>() : riscv::IotaOp();
+  auto type = iota ? iota.getResult().getType() : riscv::ValueType();
+  auto element = type ? mlir::dyn_cast<mlir::IntegerType>(type.getElementType())
+                      : mlir::IntegerType();
+  return iota && element && element.isUnsigned() && element.getWidth() <= 32 &&
+         iota.getStart() == 0 && iota.getEnd() == 2 * width &&
+         2 * width <= (int64_t{1} << element.getWidth()) &&
+         sameWindowCoordinates(type, result);
+}
+
+struct TwoWindowByteRelation {
+  mlir::Value first;
+  mlir::Value second;
+  int64_t width = 0;
+};
+
+std::optional<TwoWindowByteRelation>
+matchTwoWindowByteIndex(mlir::Value scaled, mlir::Value payload,
+                        riscv::ValueType result) {
+  auto multiply = scaled.getDefiningOp<riscv::BinaryOp>();
+  if (!multiply || multiply.getKind() != "mul")
+    return std::nullopt;
+  mlir::Value selected = multiply.getLhs();
+  auto widthAttr = directInteger(multiply.getRhs());
+  if (!widthAttr) {
+    selected = multiply.getRhs();
+    widthAttr = directInteger(multiply.getLhs());
+  }
+  auto type = mlir::dyn_cast<riscv::ValueType>(scaled.getType());
+  auto element = type ? mlir::dyn_cast<mlir::IntegerType>(type.getElementType())
+                      : mlir::IntegerType();
+  const int64_t width = widthAttr ? widthAttr.getInt() : 0;
+  if (!element || !element.isUnsigned() ||
+      (element.getWidth() != 16 && element.getWidth() != 32) ||
+      width < 2 || width > (int64_t{1} << (element.getWidth() - 1)) ||
+      (width & (width - 1)) || result.getShape().size() != 1 ||
+      result.getShape()[0] != 2 * width ||
+      !isTwoWindowCoordinate(payload, "mod", width, type))
+    return std::nullopt;
+  auto sum = selected.getDefiningOp<riscv::BinaryOp>();
+  if (!sum || sum.getKind() != "add" || sum.getResult().getType() != type)
+    return std::nullopt;
+  for (unsigned order = 0; order < 2; ++order) {
+    auto first = sum->getOperand(order).getDefiningOp<riscv::BinaryOp>();
+    auto second = sum->getOperand(1 - order).getDefiningOp<riscv::BinaryOp>();
+    if (!first || !second || first.getKind() != "mul" || second.getKind() != "mul")
+      continue;
+    auto scalarAndCoordinate = [&](riscv::BinaryOp product) {
+      return product.getLhs().getType() == element
+                 ? std::pair(product.getLhs(), product.getRhs())
+                 : std::pair(product.getRhs(), product.getLhs());
+    };
+    auto [firstBase, inverse] = scalarAndCoordinate(first);
+    auto [secondBase, half] = scalarAndCoordinate(second);
+    auto subtract = inverse.getDefiningOp<riscv::BinaryOp>();
+    auto one = subtract ? directInteger(subtract.getLhs()) : mlir::IntegerAttr();
+    if (firstBase.getType() != element || secondBase.getType() != element ||
+        first.getResult().getType() != type || second.getResult().getType() != type ||
+        !subtract || subtract.getKind() != "sub" || !one || one.getInt() != 1 ||
+        subtract.getRhs() != half ||
+        !isTwoWindowCoordinate(half, "div", width, type))
+      continue;
+    return TwoWindowByteRelation{firstBase, secondBase, width};
+  }
+  return std::nullopt;
+}
+
+void selectTwoWindowByteLookups(mlir::ModuleOp module,
+                                mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::LookupOp> lookups;
+  module.walk([&](riscv::LookupOp lookup) { lookups.push_back(lookup); });
+  for (riscv::LookupOp lookup : lookups) {
+    auto result = mlir::dyn_cast<riscv::ValueType>(lookup.getResult().getType());
+    auto storage = mlir::dyn_cast<riscv::MemDescType>(lookup.getTable().getType());
+    auto sum = lookup.getIndices().getDefiningOp<riscv::BinaryOp>();
+    auto byte = result ? mlir::dyn_cast<mlir::IntegerType>(result.getElementType())
+                       : mlir::IntegerType();
+    auto kernel = lookup->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() || !result || !byte ||
+        byte.isSignless() || byte.getWidth() != 8 || !storage ||
+        storage.getStorageBits() != 8 || storage.getElements() != 1 ||
+        storage.getShape().size() != 1 || storage.getStrides()[0] != 1 ||
+        (storage.getAccess() != "read" && storage.getAccess() != "readwrite") ||
+        lookup.getAccess().getForm() != "indexed" || !sum || sum.getKind() != "add")
+      continue;
+    auto layout = result.getLayout();
+    if (!riscv::supportsRVVLayout(kernel.getTarget(), layout) ||
+        layout.getValidity() != "full" ||
+        !llvm::equal(result.getShape().asArrayRef(), layout.getLaneFactors().asArrayRef()))
+      continue;
+    bool singleVector = true;
+    for (auto factors : {layout.getTimeFactors(), layout.getReplicaFactors(),
+                         layout.getFragmentFactors(), layout.getLocalFactors()})
+      singleVector &= llvm::all_of(factors.asArrayRef(),
+                                  [](int64_t factor) { return factor == 1; });
+    if (!singleVector)
+      continue;
+    auto relation = matchTwoWindowByteIndex(sum.getLhs(), sum.getRhs(), result);
+    if (!relation)
+      relation = matchTwoWindowByteIndex(sum.getRhs(), sum.getLhs(), result);
+    if (!relation || 2 * relation->width != layout.getVl())
+      continue;
+    // half = lane / width is exactly 0 or 1 and payload = lane % width.
+    // Each wrapped base*width is aligned within the unsigned index domain;
+    // adding a payload below width therefore cannot wrap inside a unit load.
+    rewriter.setInsertionPoint(lookup);
+    auto element = relation->first.getType();
+    auto width = rewriter.create<riscv::ConstantOp>(
+        lookup.getLoc(), element, rewriter.getIntegerAttr(element, relation->width));
+    llvm::SmallVector<mlir::Value> bases;
+    for (mlir::Value index : {relation->first, relation->second}) {
+      auto base = rewriter.create<riscv::BinaryOp>(
+          lookup.getLoc(), element, index, width.getResult(), "mul",
+          riscv_internal::unselectedLeaf(rewriter));
+      riscv_internal::copyOrigin(lookup, base);
+      bases.push_back(base.getResult());
+    }
+    auto windows = rewriter.create<riscv::RVVByteWindowsLoadOp>(
+        lookup.getLoc(), result, lookup.getTable(), bases, relation->width,
+        makeAccess(rewriter, "unit", "natural", 1),
+        riscv_internal::leaf(rewriter, "rvv", "byte-windows-load",
+                             "rvv.byte-windows-pack", "rvv.byte-windows-pack",
+                             0, layout.getRegisterGroups(), layout.getRegisterGroups()));
+    riscv_internal::copyOrigin(lookup, windows);
+    rewriter.replaceOp(lookup, windows.getResult());
+  }
 }
 
 mlir::LogicalResult selectByteProjections(mlir::ModuleOp module,
@@ -2543,8 +2735,11 @@ public:
   void runOnOperation() override {
     mlir::IRRewriter rewriter(&getContext());
     if (mlir::failed(selectByteProjections(getOperation(), rewriter)) ||
-        mlir::failed(selectByteWindows(getOperation(), rewriter)))
+        mlir::failed(selectByteWindows(getOperation(), rewriter))) {
       signalPassFailure();
+      return;
+    }
+    selectTwoWindowByteLookups(getOperation(), rewriter);
   }
 };
 

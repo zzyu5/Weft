@@ -33,20 +33,21 @@ mlir::LogicalResult Emitter::compileRVVByteWindowsLoad(riscv::RVVByteWindowsLoad
   if (instructionOf(operation) != "rvv.byte-windows-pack")
     return fail(operation, "byte windows have no exact load-and-pack instruction");
   auto address = byteReadAddress(operation.getSource());
-  auto base = materializeNumeric(operation.getByteBase(), bindings.lookup(operation.getByteBase()));
-  auto baseType = scalarCType(operation.getByteBase().getType());
-  if (!address || !baseType || mlir::failed(base) || base->kind != Binding::Kind::Scalar ||
-      vectorPartCount(operation.getResult()) != 1)
-    return fail(operation, "byte windows require their selected scalar base and single RVV result");
+  auto elementType = scalarCType(operation.getResult().getType().getElementType());
+  if (!address || !elementType || vectorPartCount(operation.getResult()) != 1)
+    return fail(operation, "byte windows require their selected storage and single RVV result");
   const std::string type = vectorType(operation.getResult());
   const std::string suffix = vectorSuffix(operation.getResult());
   const int64_t width = operation.getWindowBytesAttr().getInt();
   std::string packed;
-  for (auto [ordinal, offset] : llvm::enumerate(operation.getWindowOffsets())) {
+  for (auto [ordinal, byteBase] : llvm::enumerate(operation.getByteBases())) {
+    auto base = materializeNumeric(byteBase, bindings.lookup(byteBase));
+    if (mlir::failed(base) || base->kind != Binding::Kind::Scalar)
+      return fail(operation, "byte window base is not a materialized scalar value");
     std::string loaded = fresh("byte_window");
     line(type + " " + loaded + " = __riscv_vle8_v_" + suffix +
-         "(((const uint8_t *)(" + *address + ")) + ((" + *baseType + ")(" +
-         base->scalar + " + " + std::to_string(offset) + ")), " + std::to_string(width) + ");");
+         "(((const " + *elementType + " *)(" + *address + ")) + " +
+         base->scalar + ", " + std::to_string(width) + ");");
     if (ordinal == 0) {
       packed = std::move(loaded);
     } else {

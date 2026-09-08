@@ -187,9 +187,19 @@ add/sub/常数乘法，不穿过 shaped narrowing 或数据查表。匹配只形
 每个窗口至少两个字节，result 必须是一个完整 RVV carrier；不枚举其它 layout。
 相对 storage 的 `byte_base` 数值与窗口偏移必须是 power-of-two 窗口宽度的倍数，从而
 证明窗口内部不会跨过原 unsigned index 的 wrap 边界；这不提高 storage 地址的对齐要求。
-各窗口起点仍按原位宽计算，原 gather 的字节集合、顺序、
-读取点和 snapshot 关系不变。选择结果及窗口数/宽度/offset 均可直接从 Physical IR 观察；
+各窗口起点仍按原位宽计算并物化为显式 scalar SSA bases，原 gather 的字节集合、顺序、
+读取点和 snapshot 关系不变。选择结果及窗口数/宽度/bases 均可直接从 Physical IR 观察；
 它只替换字节读取和地址供应，不改变后续索引值、contraction 或 reduction。
+
+同一 leaf 也可承载连续 byte descriptor 上的双窗口 pointwise lookup：
+`(a*(1-h)+b*h)*w+p`，其中 `h=lane/w`、`p=lane%w`，lane 是同一一维逻辑域内
+`0..2*w` 的 unsigned iota，w 是至少 2 的 power-of-two。关系最多比较两个乘法顺序，
+每条坐标链最多穿过 16 个 unsigned value-preserving cast/widen 或 pure layout conversion。
+穿过的每个 value 与 iota 必须具有一致的 full-valid time/lane/replica 等 pointwise mapping；
+允许不同 SSA 的等价 iota，不把 SSA 身份当成逻辑坐标相等的必要条件。
+`h` 的取值只有 0/1，两个 scalar `a*w`、`b*w` 在原 unsigned 位宽内计算，其低位为零，
+所以窗口内部不会 wrap。两个 unit load 和一个 slide pack 替代向量插值地址与 indexed load；
+原 source、读取点、byte signedness、输出 lane 顺序和后续数值运算保持不变。
 
 同一block内，若一个byte-aligned natural encoded scalar沿纯一元链形成一个多消费者
 supply，pass插入`register_materialize(realization=physical-share)`。该op没有作者

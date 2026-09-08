@@ -1160,8 +1160,7 @@ def WeftRISCV_RVVByteGatherOp
 
 def WeftRISCV_RVVByteWindowsLoadOp
     : WeftRISCV_LeafOp<"rvv_byte_windows_load", [MemoryEffects<[MemRead]>]> {
-  let arguments = (ins AnyType:$source, AnyType:$byte_base,
-                       DenseI64ArrayAttr:$window_offsets,
+  let arguments = (ins AnyType:$source, Variadic<AnyType>:$byte_bases,
                        I64Attr:$window_bytes,
                        WeftRISCV_AccessAttr:$access,
                        WeftRISCV_LeafAttr:$leaf);

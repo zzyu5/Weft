@@ -36,18 +36,20 @@ layout 确定。数值语义为 `floor(unsigned_product / 2^SEW)`，遵守
 [RVV 单宽整数乘法合同](https://docs.riscv.org/reference/isa/unpriv/v-st-ext)。
 它是独立的 selected local op，不扩大普通 BinaryOp，也不授权 scalar fallback。
 
-`rvv_byte_gather` 从连续 word descriptor 或一个完整、byte-aligned natural word field
+`rvv_byte_gather` 从连续 byte/word descriptor 或一个完整、byte-aligned natural word field
 读取指定的原始字节，返回 unsigned u8 RVV value。byte offsets 是显式的 u16/u32 value，
 所有 index/result axes 和 active lanes 必须一致，EEW/EMUL 与 indexed-memory 能力由
 verifier 核验；leaf 固定为 `rvv.byte-gather`。它只读取所选字节，不在 emitter 中恢复
 word、shift 或 mask。encoded value 的原 load/快照身份仍经 field operand 保留。
 
-`rvv_byte_windows_load` 读取同一 storage 的一至四个连续字节窗口，按显式
-`window_offsets` 顺序拼成一个 full-valid RVV byte value。`byte_base` 是相对 storage 的
-unsigned u16/u32 字节偏移，每个窗口起点的加法保留该宽度的 wrap；`window_bytes` 与 result 的完整 lane 数
-必须闭合。leaf 固定为 `rvv.byte-windows-pack`：逐窗口 `vle8`，后续窗口以 tail-undisturbed
+`rvv_byte_windows_load` 读取同一 storage 的一至四个连续字节窗口，按显式 `byte_bases`
+operand 顺序拼成一个 full-valid signed/unsigned RVV byte value。每个 base 是相对 storage
+的同宽 unsigned u16/u32 字节偏移；base 的计算与 wrap 已在 scalar SSA 中完成，窗口内读取
+连续 `window_bytes` 字节，不再隐式做窄整数 wrap。窗口宽度与 result 的完整 lane 数必须闭合。
+由 indexed read 选择此 leaf 时，pass 必须证明每个窗口内部不跨原 index 的 wrap 边界；不同窗口
+可以来自不同动态 base，不要求 storage 地址有序或互不相交。leaf 固定为 `rvv.byte-windows-pack`：逐窗口 `vle8`，后续窗口以 tail-undisturbed
 `vslideup` 拼接，不能增加读取字节、对齐要求或外围遍历。多窗口只保留一个额外载体，
-其完整寄存器组数必须计入 leaf temporary；scalar base 与原 storage/快照身份仍显式存在。
+其完整寄存器组数必须计入 leaf temporary；scalar bases 与原 storage/快照身份仍显式存在。
 
 grouped MAC、encoded dot和contract step允许作为closed sequence：reduction loop已经在IR中，
 window type固定slots/terms/result parts，access固定storage geometry，step leaf固定widen/MAC
