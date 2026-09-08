@@ -163,6 +163,10 @@ composite lowering中消费。partial materialization后新出现的replica memo
 没有可能别名写入，包括嵌套循环的较早迭代。无法保持原读取且没有合法的已物化 table
 表示时，明确拒绝该候选。memory-descriptor lookup 声明 Read effect；只有寄存器 table
 lookup 是 pure，CSE 不得跨写入合并前者。
+同轴的一维full寄存器table若以`iota + 常量`读取完整、对齐且不越界的连续窗口，
+可直接选已有`rvv_issue_slice`，不再生成向量gather索引。常量求值最多访问32个节点，
+只处理无溢出的index加乘与值域可精确保留的cast；iota及加法也必须在索引位宽内。
+这只投影已经读取的numeric SSA，不新增、延迟或扩大memory read。
 不能合法延迟的静态连续 dense table 在原 load 点形成 `local_alloc → dense_snapshot`，
 后续 lookup 读取该私有 descriptor。显式 stage 的 owner/birth/lifetime 保存在 allocation；
 没有 stage 时采用原读取的 Level owner。超出目标 local 容量或非连续、非静态表明确拒绝。
@@ -405,6 +409,12 @@ nested scale 与 indexed operand 共用具体 field 供应时，planner 保留�
 的 issue 克隆复用已有 field extract、Read-only supply 及共有 pointwise decode；
 width/layout conversion 仍可在各 use 点重新物化，避免为共享而延长宽载体的 lifetime。
 复用以同一个 SSA source 为键，不以字段名称、格式名称或相似地址猜测等价。
+
+若完整scale已经有其它consumer、单轴full值可驻留一个vector register，且issue窗口
+至少有四项，nested plan可选择`shared-before-issue`：保持原scale SSA，在各issue中以
+显式numeric lookup取得连续窗口，不再克隆其算术链。该选择冻结在plan中，并额外预算
+共享源、窗口与索引的存活资源；最终resource pass仍检查完整live set。它不改变原scale
+的计算宽度或乘法/reduction结合位置，也不把没有共享收益的小窗口强制搬到vector上。
 
 当每个 logical slot 本身跨多个 issue 时，planner还必须冻结 issue operand supply 与完整
 product carrier。materializer先用显式`rvv_widen_multiply/rvv_widen_accumulate`形成每个slot，

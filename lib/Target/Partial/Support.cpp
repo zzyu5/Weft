@@ -3762,14 +3762,29 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
   const bool scaleSharesRhs =
       hasIndexedLookupSupply(dot.getRhs()) &&
       sharesConcreteFieldSupply(match.scale, dot.getRhs());
+  auto scaleLayout = scaleType.getLayout();
+  const bool sharedScale =
+      !match.scale.hasOneUse() && issueStreams > 1 && windowExtent >= 4 &&
+      *outputReplicaCount == 1 && scaleType.getShape().size() == 1 &&
+      scaleType.getAxisIds()[0] == windowAxis &&
+      scaleType.getShape()[0] == issueStreams * windowExtent &&
+      scaleLayout.getCarrier() == "rvv" && scaleLayout.getValidity() == "full" &&
+      scaleLayout.getTimeFactors()[0] == 1 &&
+      scaleLayout.getLaneFactors()[0] == scaleType.getShape()[0] &&
+      scaleLayout.getReplicaFactors()[0] == 1 &&
+      scaleLayout.getFragmentFactors()[0] == 1 &&
+      scaleLayout.getLocalFactors()[0] == 1 &&
+      scaleLayout.getRegisterGroups() == 1 &&
+      riscv::supportsRVVLayout(kernel.getTarget(), scaleLayout);
   const llvm::StringRef scaleSupplyStage =
-      *outputReplicaCount == 1 && (scaleSharesLhs || scaleSharesRhs)
+      sharedScale ? "shared-before-issue"
+      : *outputReplicaCount == 1 && (scaleSharesLhs || scaleSharesRhs)
           ? "after-partial-reduce"
           : "before-product";
   const int64_t operandAndProduct =
       issueLhs.getLayout().getRegisterGroups() +
       issueRhs.getLayout().getRegisterGroups() + sourceSet.getResourceGroups() +
-      (scaleSupplyStage == "before-product"
+      (scaleSupplyStage != "after-partial-reduce"
            ? issueScale.getLayout().getRegisterGroups()
            : 0);
   int64_t repackAndReduce =
@@ -3798,8 +3813,10 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
                                        nextSet.getResourceGroups());
     previousSet = nextSet;
   }
-  const int64_t resources = 1 + std::max(
-      {operandAndProduct, repackAndReduce, reduceAndScale, combineResources});
+  const int64_t resources =
+      1 + std::max({operandAndProduct, repackAndReduce, reduceAndScale,
+                    combineResources}) +
+      (sharedScale ? 3 * scaleLayout.getRegisterGroups() : 0);
   if (resources > kernel.getTarget().getVectorRegisters())
     return std::nullopt;
   const int64_t issueUnroll =
@@ -3817,7 +3834,7 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       scaleReplicaType.getLayout().getReplicaFactors().asArrayRef());
   llvm::DenseSet<mlir::Operation *> visited;
   const llvm::StringRef scaleSupply =
-      scaleParts && *scaleParts >= 8 &&
+      !sharedScale && scaleParts && *scaleParts >= 8 &&
               !scaleSharesLhs && !scaleSharesRhs &&
               supportsScalarReplicaRematerialization(match.scale, visited)
           ? "scalar-rematerialize"

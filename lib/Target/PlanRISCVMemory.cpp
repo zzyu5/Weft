@@ -255,6 +255,91 @@ std::optional<int64_t> constantInteger(mlir::Value value) {
   return integer ? std::optional<int64_t>(integer.getInt()) : std::nullopt;
 }
 
+std::optional<int64_t> exactNonnegativeConstantImpl(mlir::Value value,
+                                                   unsigned &remaining) {
+  if (!remaining)
+    return std::nullopt;
+  --remaining;
+  if (auto constant = constantInteger(value))
+    return *constant >= 0 &&
+                   (!value.getType().isIndex() ||
+                    *constant <= std::numeric_limits<uint32_t>::max())
+               ? constant : std::nullopt;
+  auto addition = value.getDefiningOp<mlir::arith::AddIOp>();
+  auto multiply = value.getDefiningOp<mlir::arith::MulIOp>();
+  if (value.getType().isIndex() && (addition || multiply)) {
+    mlir::Value lhs = addition ? addition.getLhs() : multiply.getLhs();
+    mlir::Value rhs = addition ? addition.getRhs() : multiply.getRhs();
+    auto a = exactNonnegativeConstantImpl(lhs, remaining);
+    auto b = exactNonnegativeConstantImpl(rhs, remaining);
+    if (!a || !b)
+      return std::nullopt;
+    int64_t result = 0;
+    if (addition)
+      return checkedAdd(*a, *b, result) &&
+                     result <= std::numeric_limits<uint32_t>::max()
+                 ? std::optional<int64_t>(result) : std::nullopt;
+    if (*a == 0 || *b == 0)
+      return 0;
+    // Use the smaller supported XLEN bound: no intermediate index operation
+    // may wrap on RV32 while appearing constant and in-bounds on RV64.
+    return checkedScale(*a, *b, result) &&
+                   result <= std::numeric_limits<uint32_t>::max()
+               ? std::optional<int64_t>(result) : std::nullopt;
+  }
+  auto cast = value.getDefiningOp<riscv::CastOp>();
+  if (!cast)
+    return std::nullopt;
+  auto integer = mlir::dyn_cast<mlir::IntegerType>(cast.getResult().getType());
+  auto input = exactNonnegativeConstantImpl(cast.getInput(), remaining);
+  if (!integer || integer.isSignless() || integer.getWidth() > 64 || !input)
+    return std::nullopt;
+  const __int128 limit = static_cast<__int128>(1)
+                        << (integer.getWidth() - (integer.isSigned() ? 1 : 0));
+  return *input < limit ? input : std::nullopt;
+}
+
+std::optional<int64_t> exactNonnegativeConstant(mlir::Value value) {
+  unsigned remaining = 32;
+  return exactNonnegativeConstantImpl(value, remaining);
+}
+
+std::optional<int64_t> contiguousIndexBase(mlir::Value indices,
+                                          riscv::ValueType result) {
+  auto type = mlir::dyn_cast<riscv::ValueType>(indices.getType());
+  auto integer = type ? mlir::dyn_cast<mlir::IntegerType>(type.getElementType())
+                      : mlir::IntegerType();
+  if (!integer || !integer.isUnsigned() || integer.getWidth() > 64 ||
+      type.getShape() != result.getShape() || type.getAxisIds() != result.getAxisIds() ||
+      result.getShape().size() != 1 || result.getShape()[0] <= 0)
+    return std::nullopt;
+  mlir::Value sequence = indices;
+  int64_t base = 0;
+  if (auto add = indices.getDefiningOp<riscv::BinaryOp>()) {
+    if (add.getKind() != "add")
+      return std::nullopt;
+    auto offset = exactNonnegativeConstant(add.getRhs());
+    sequence = add.getLhs();
+    if (!offset) {
+      offset = exactNonnegativeConstant(add.getLhs());
+      sequence = add.getRhs();
+    }
+    if (!offset)
+      return std::nullopt;
+    base = *offset;
+  }
+  auto iota = sequence.getDefiningOp<riscv::IotaOp>();
+  if (!iota || iota.getResult().getType() != type ||
+      iota.getStart() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+      iota.getEnd() - iota.getStart() != static_cast<uint64_t>(result.getShape()[0]) ||
+      !checkedAdd(base, static_cast<int64_t>(iota.getStart()), base))
+    return std::nullopt;
+  const __int128 end = static_cast<__int128>(base) + result.getShape()[0];
+  if (end > (static_cast<__int128>(1) << integer.getWidth()))
+    return std::nullopt;
+  return base;
+}
+
 mlir::FailureOr<mlir::Value>
 materializeEntryIndices(const IndexedEntryLoadPlan &plan,
                         mlir::Operation *origin, riscv::ValueType result,
@@ -4204,6 +4289,38 @@ public:
           deadTableMaterializations.push_back(tableMaterialize);
       }
       if (registerTable) {
+        auto tableType = mlir::cast<riscv::ValueType>(operation.getTable().getType());
+        auto resultType = mlir::cast<riscv::ValueType>(operation.getResult().getType());
+        const auto completeVector = [](riscv::ValueType type) {
+          auto layout = type.getLayout();
+          return type.getShape().size() == 1 && type.getShape()[0] > 0 &&
+                 layout.getValidity() == "full" &&
+                 layout.getTimeFactors()[0] == 1 &&
+                 layout.getLaneFactors()[0] == type.getShape()[0] &&
+                 layout.getReplicaFactors()[0] == 1 &&
+                 layout.getFragmentFactors()[0] == 1 &&
+                 layout.getLocalFactors()[0] == 1;
+        };
+        auto base = contiguousIndexBase(operation.getIndices(), resultType);
+        if (completeVector(tableType) && completeVector(resultType) &&
+            tableType.getAxisIds() == resultType.getAxisIds() && base &&
+            tableType.getShape()[0] % resultType.getShape()[0] == 0 &&
+            *base % resultType.getShape()[0] == 0 &&
+            *base <= tableType.getShape()[0] - resultType.getShape()[0]) {
+          rewriter.setInsertionPoint(operation);
+          auto slice = rewriter.create<riscv::RVVIssueSliceOp>(
+              operation.getLoc(), resultType, operation.getTable(),
+              rewriter.getDenseI64ArrayAttr({0}),
+              rewriter.getDenseI64ArrayAttr({*base}),
+              riscv_internal::leaf(
+                  rewriter, "transfer", "issue-slice", "rvv.issue-slice",
+                  "rvv.issue-slice", tableLayout.getRegisterGroups(),
+                  resultLayout.getRegisterGroups(),
+                  tableLayout.getRegisterGroups(), 0, "none", "exact"));
+          riscv_internal::copyOrigin(operation, slice);
+          rewriter.replaceOp(operation, slice.getResult());
+          return;
+        }
         operation.setAccessAttr(makeAccess(builder, "register", "natural", 1));
         operation.setLeafAttr(riscv_internal::leaf(
             builder, "rvv", "lookup", "rvv.vrgather", "rvv.vrgather", 0,

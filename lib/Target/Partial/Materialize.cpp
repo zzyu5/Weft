@@ -530,6 +530,61 @@ public:
       };
       const bool deferScale =
           nestedPlan.getScaleSupplyStage() == "after-partial-reduce";
+      const bool sharedScale =
+          nestedPlan.getScaleSupplyStage() == "shared-before-issue";
+      auto materializeScaleWindow = [&]() -> mlir::FailureOr<mlir::Value> {
+        if (!sharedScale)
+          return cloneIssueWindow(match->scale, windowAxis, windowExtent,
+                                  loop.getInductionVar(), target, rewriter,
+                                  clones);
+        mlir::Value scaleSource = match->scale;
+        auto source = mlir::cast<riscv::ValueType>(scaleSource.getType());
+        auto type = issueWindowType(rewriter, target, source, windowAxis,
+                                    windowExtent);
+        if (!type || source.getShape().size() != 1 ||
+            source.getAxisIds()[0] != windowAxis ||
+            source.getShape()[0] != streams * windowExtent ||
+            source.getLayout().getTimeFactors()[0] != 1 ||
+            source.getLayout().getLaneFactors()[0] != source.getShape()[0] ||
+            source.getLayout().getValidity() != "full")
+          return mlir::failure();
+        auto layout = riscv::LayoutAttr::get(
+            rewriter.getContext(), "rvv", type.getAxisIds(),
+            type.getLayout().getTimeFactors(), type.getLayout().getLaneFactors(),
+            type.getLayout().getReplicaFactors(),
+            type.getLayout().getFragmentFactors(),
+            type.getLayout().getLocalFactors(), source.getLayout().getSew(),
+            source.getLayout().getLmulEighths(), windowExtent,
+            source.getLayout().getRegisterGroups(), "full");
+        type = riscv::ValueType::get(
+            rewriter.getContext(), source.getElementType(), type.getShape(),
+            type.getAxisIds(), layout);
+        auto indexElement = mlir::IntegerType::get(
+            rewriter.getContext(), source.getLayout().getSew(),
+            mlir::IntegerType::Unsigned);
+        auto indexType = riscv::ValueType::get(
+            rewriter.getContext(), indexElement, type.getShape(),
+            type.getAxisIds(), type.getLayout());
+        auto local = rewriter.create<riscv::IotaOp>(
+            reduce.getLoc(), indexType, 0, windowExtent,
+            riscv_internal::unselectedLeaf(rewriter));
+        auto width = rewriter.create<mlir::arith::ConstantIndexOp>(
+            reduce.getLoc(), windowExtent);
+        auto offset = rewriter.create<mlir::arith::MulIOp>(
+            reduce.getLoc(), loop.getInductionVar(), width.getResult());
+        auto indexOffset = rewriter.create<riscv::CastOp>(
+            reduce.getLoc(), indexElement, offset.getResult(),
+            riscv_internal::unselectedLeaf(rewriter));
+        auto indices = rewriter.create<riscv::BinaryOp>(
+            reduce.getLoc(), indexType, local.getResult(), indexOffset.getResult(),
+            "add", riscv_internal::unselectedLeaf(rewriter));
+        auto slice = rewriter.create<riscv::LookupOp>(
+            reduce.getLoc(), type, scaleSource, indices.getResult(), "in_bounds",
+            riscv_internal::unassignedAccess(rewriter),
+            riscv_internal::unselectedLeaf(rewriter));
+        riscv_internal::copyOrigin(reduce, slice);
+        return slice.getResult();
+      };
       std::optional<mlir::Value> lhsSlice;
       std::optional<mlir::Value> rhsSlice;
       std::optional<mlir::Value> earlyScaleSlice;
@@ -542,10 +597,7 @@ public:
                          ? materializeIssueOperand(dot.getLhs(), issueLhsType)
                      : supply == 1
                          ? materializeIssueOperand(dot.getRhs(), issueRhsType)
-                         : cloneIssueWindow(match->scale, windowAxis,
-                                            windowExtent,
-                                            loop.getInductionVar(), target,
-                                            rewriter, clones);
+                         : materializeScaleWindow();
         if (mlir::failed(slice)) {
           failedSupply = supply;
           break;

@@ -1853,8 +1853,11 @@ mlir::LogicalResult NestedPartialPlanAttr::verify(
     return emitError()
            << "nested partial plan requires one selected scale supply form";
   if ((scaleSupplyStage != "before-product" &&
-       scaleSupplyStage != "after-partial-reduce") ||
-      (scaleSupplyStage == "after-partial-reduce" && outputReplicas != 1))
+       scaleSupplyStage != "after-partial-reduce" &&
+       scaleSupplyStage != "shared-before-issue") ||
+      (scaleSupplyStage != "before-product" && outputReplicas != 1) ||
+      (scaleSupplyStage == "shared-before-issue" &&
+       (scaleSupply != "vector-convert" || issueStreams <= 1)))
     return emitError()
            << "nested partial plan requires one scale stage consistent with output multiplicity";
   if (issueLhs.getLayout().getCarrier() != "rvv" ||
