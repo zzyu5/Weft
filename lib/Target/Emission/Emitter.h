@@ -36,6 +36,10 @@ namespace weft::riscv_emission {
 
 std::string identifier(llvm::StringRef source);
 
+std::string alignedScalarReadAddress(llvm::StringRef address, int64_t alignment,
+                                    int64_t recordStrideBytes,
+                                    unsigned byteWidth);
+
 std::string arrayString(mlir::ArrayAttr values, llvm::StringRef separator);
 
 struct EncodingField {

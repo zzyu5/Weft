@@ -1,6 +1,19 @@
 #include "Emitter.h"
 
+#include <numeric>
+
 namespace weft::riscv_emission {
+
+std::string alignedScalarReadAddress(llvm::StringRef address, int64_t alignment,
+                                    int64_t recordStrideBytes,
+                                    unsigned byteWidth) {
+  const int64_t effectiveAlignment = std::gcd<int64_t>(
+      std::gcd(alignment, recordStrideBytes), byteWidth);
+  if (effectiveAlignment == 1)
+    return address.str();
+  return "((const uint8_t *)__builtin_assume_aligned((" + address.str() +
+         "), " + std::to_string(effectiveAlignment) + "))";
+}
 
 mlir::LogicalResult Emitter::compileFieldRead(riscv::FieldReadOp operation) {
   auto projection = fieldProjections.find(operation.getInput());
@@ -496,9 +509,15 @@ mlir::FailureOr<Binding> Emitter::materializeNumeric(mlir::Value value,
                                 std::to_string(lowBits) + ")))" );
           continue;
         }
-        const std::string byteAddress =
+        std::string byteAddress =
             record + " + (" + fragment->byte + ") * " +
             std::to_string(byteStride);
+        if (field->access.getMapping() == "natural" &&
+            owner.interleaveRows == 0 &&
+            (logicalWidth == 16 || logicalWidth == 32))
+          byteAddress = alignedScalarReadAddress(
+              byteAddress, field->access.getAlignment(), owner.recordStrideBytes,
+              logicalWidth / 8);
         if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
             integer && integer.getWidth() < 8) {
           const unsigned width = integer.getWidth();

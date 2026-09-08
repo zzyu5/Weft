@@ -72,6 +72,11 @@ Encoding identity、record span、logical extents、alignment、access 和 alias
 动态 shape 参数顺序与实际 prototype 一致，source binding 与发现的 target 随产物保持明确。
 加载器负责系统编译、句柄与调用生命周期，不参与 leaf 或资源选择。
 
+非交错自然布局的 scalar field read 将已验证的访问对齐在读取点传给 system compiler；
+注解只保留访问对齐、record byte stride 与读取宽度共同保证的二次幂因子。
+它不增强 kernel 参数的 ABI 对齐、不改变空 View 的调用条件，不把 byte storage
+转成更强别名类型，也不根据字段或 kernel 名选择读取算法。
+
 ## 6. 实现模块边界
 
 `lib/Target/RISCVIntrinsicC.cpp` 保留唯一公开 translation 入口；`Emission/Control.cpp`

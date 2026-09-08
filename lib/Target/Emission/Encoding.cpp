@@ -1335,16 +1335,20 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
     const std::string address = owner.recordPointer + " + (" + fragment->byte + ")";
     const bool naturallyByteAligned =
         kind == "natural" && field->bitOffset % 8 == 0 && logicalWidth % 8 == 0;
+    const std::string readAddress =
+        naturallyByteAligned && owner.interleaveRows == 0 &&
+                (logicalWidth == 16 || logicalWidth == 32)
+            ? alignedScalarReadAddress(address, field->access.getAlignment(),
+                                       owner.recordStrideBytes, logicalWidth / 8)
+            : address;
     if (field->type.isF32() && logicalWidth == 32 && naturallyByteAligned)
       scalarResult.scalar = field->access.getAlignment() >= 4
                                 ? "*(const float *)(" + address + ")"
-                                : "weft_load_f32_le(" + owner.recordPointer +
-                                      " + " + fragment->byte + ")";
+                                : "weft_load_f32_le(" + readAddress + ")";
     else if (field->type.isF16() && logicalWidth == 16 && naturallyByteAligned)
       scalarResult.scalar = field->access.getAlignment() >= 2
                                 ? "*(const _Float16 *)(" + address + ")"
-                                : "weft_load_f16_le(" + owner.recordPointer +
-                                      " + " + fragment->byte + ")";
+                                : "weft_load_f16_le(" + readAddress + ")";
     else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
              integer && integer.getWidth() <= 8) {
       const uint64_t mask = (uint64_t(1) << integer.getWidth()) - 1;
@@ -1365,13 +1369,13 @@ Binding Emitter::emitInterleavedField(mlir::Value result,
       scalarResult.scalar =
           std::string(integer.isUnsigned() ? "weft_load_u16_le(" :
                                              "weft_load_i16_le(") +
-          owner.recordPointer + " + " + fragment->byte + ")";
+          readAddress + ")";
     } else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(field->type);
                integer && integer.getWidth() == 32 && naturallyByteAligned) {
       scalarResult.scalar =
           std::string(integer.isSigned() ? "((int32_t)" : "") +
-          "weft_load_u32_le(" + owner.recordPointer + " + " +
-          fragment->byte + ")" + (integer.isSigned() ? ")" : "");
+          "weft_load_u32_le(" + readAddress + ")" +
+          (integer.isSigned() ? ")" : "");
     } else {
       return {};
     }
