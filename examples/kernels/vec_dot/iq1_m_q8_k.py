@@ -25,50 +25,41 @@ def compute(
         scale_bits = scale_bits | sc2 >> wl.u32(4) & wl.u32(3840)
         scale_bits = scale_bits | sc3 & wl.u32(61440)
         block_scale = qf.nonlinear_lookup(f16_bits, scale_bits)
-        group = wl.arange(0, 8, dtype=wl.u32, axis="group")
-        scale_part = wl.arange(0, 2, dtype=wl.u32, axis="scale_part")
-        entry = wl.arange(0, 2, dtype=wl.u32, axis="entry")
-        payload = wl.arange(0, 8, dtype=wl.u32, axis="payload")
-        qh = wl.widen(w.qh[group * wl.u32(2) + scale_part], wl.u32)
-        high_shift = entry * wl.u32(4)
+        group = wl.arange(0, 8, dtype=wl.u16, axis="group")
+        scale_part = wl.arange(0, 2, dtype=wl.u16, axis="scale_part")
+        entry = wl.arange(0, 2, dtype=wl.u16, axis="entry")
+        payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
+        qh = wl.widen(w.qh[group * wl.u16(2) + scale_part], wl.u16)
+        high_shift = entry * wl.u16(4)
         grid_index = wl.widen(
-            w.q[group * wl.u32(4) + scale_part * wl.u32(2) + entry], wl.u32
-        ) | (qh >> high_shift & wl.u32(7)) << wl.u32(8)
+            w.q[group * wl.u16(4) + scale_part * wl.u16(2) + entry], wl.u16
+        ) | (qh >> high_shift & wl.u16(7)) << wl.u16(8)
         weight = wl.lookup(
-            grid_values, grid_index * wl.u32(8) + payload, bounds="in_bounds"
+            grid_values, grid_index * wl.u16(8) + payload, bounds="in_bounds"
         )
         activation = x.q[
-            group * wl.u32(32)
-            + scale_part * wl.u32(16)
-            + entry * wl.u32(8)
+            group * wl.u16(32)
+            + scale_part * wl.u16(16)
+            + entry * wl.u16(8)
             + payload
         ]
         dot = wl.reduce_dot(activation, weight, over=("entry", "payload"), acc_dtype=wl.i32)
         scale_word = wl.widen(
-            w.scales[group // wl.u32(2) * wl.u32(2)], wl.u32
+            w.scales[group // wl.u16(2) * wl.u16(2)], wl.u16
         ) | wl.widen(
-            w.scales[group // wl.u32(2) * wl.u32(2) + wl.u32(1)], wl.u32
-        ) << wl.u32(8)
-        scale_shift = group % wl.u32(2) * wl.u32(6) + scale_part * wl.u32(3)
+            w.scales[group // wl.u16(2) * wl.u16(2) + wl.u16(1)], wl.u16
+        ) << wl.u16(8)
+        scale_shift = group % wl.u16(2) * wl.u16(6) + scale_part * wl.u16(3)
         scale = wl.i32(
-            (scale_word >> scale_shift & wl.u32(7)) * wl.u32(2) + wl.u32(1)
+            (scale_word >> scale_shift & wl.u16(7)) * wl.u16(2) + wl.u16(1)
         )
         main = wl.reduce(wl.reduce(dot * scale, axis="scale_part"), axis="group")
-        delta_shift = wl.u32(3) + entry * wl.u32(4)
-        delta_bit_u16 = wl.narrow(
-            qh >> delta_shift & wl.u32(1),
-            wl.u16,
-            rounding="rtz",
-            saturation=False,
-        )
+        delta_shift = wl.u16(3) + entry * wl.u16(4)
         delta_bit = wl.narrow(
-            delta_bit_u16, wl.u8, rounding="rtz", saturation=False
+            qh >> delta_shift & wl.u16(1), wl.u8, rounding="rtz", saturation=False
         )
         delta = wl.i8(1) - wl.i8(delta_bit) * wl.i8(2)
-        payload_u16 = wl.narrow(payload, wl.u16, rounding="rtz", saturation=False)
-        payload_u8 = wl.narrow(
-            payload_u16, wl.u8, rounding="rtz", saturation=False
-        )
+        payload_u8 = wl.narrow(payload, wl.u8, rounding="rtz", saturation=False)
         delta = delta + wl.i8(payload_u8) * wl.i8(0)
         correction_part = wl.reduce_dot(activation, delta, over=("entry", "payload"), acc_dtype=wl.i32)
         correction = wl.reduce(

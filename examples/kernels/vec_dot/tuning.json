@@ -4,7 +4,7 @@
   "physical_search": {"lmul_eighths":[8,16,32,64],"unroll":[1,2,4,8],"pipeline_depth":[1,2],"scalar_load_prime":[0,1],"partial_combine_policy":["independent-multilevel","sequential"],"record_axis_policy":["within-record","across-records"]},
   "search_budget": 256,
   "bindings": {
-    "vec-dot:k1 iq1_m": {"entry":"iq1_m_q8_k.py","symbol":"quantized_vec_dot_iq1_m_q8_k","source":{},"physical":{"lmul_eighths":16,"unroll":4,"pipeline_depth":1},"binding_origin":"measured-unroll-subset"},
+    "vec-dot:k1 iq1_m": {"entry":"iq1_m_q8_k.py","symbol":"quantized_vec_dot_iq1_m_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1},"binding_origin":"targeted-rerun"},
     "vec-dot:k1 iq1_s": {"entry":"iq1_s_q8_k.py","symbol":"quantized_vec_dot_iq1_s_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1}},
     "vec-dot:k1 iq2_s": {"entry":"iq2_s_q8_k.py","symbol":"quantized_vec_dot_iq2_s_q8_k","source":{},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "vec-dot:k1 iq2_xs": {"entry":"iq2_xs_q8_k.py","symbol":"quantized_vec_dot_iq2_xs_q8_k","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
