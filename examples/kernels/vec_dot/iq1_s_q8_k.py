@@ -15,34 +15,34 @@ def compute(
     with wl.level.blocks(K, extent=256) as kb:
         w = wl.load(W[kb])
         x = wl.load(X[kb])
-        group = wl.arange(0, 8, dtype=wl.u32, axis="group")
-        entry = wl.arange(0, 4, dtype=wl.u32, axis="entry")
+        group = wl.arange(0, 8, dtype=wl.u16, axis="group")
+        entry = wl.arange(0, 4, dtype=wl.u16, axis="entry")
         payload = wl.arange(0, 8, dtype=wl.u16, axis="payload")
-        metadata = wl.widen(w.qh[group], wl.u32)
+        metadata = w.qh[group]
         scale = wl.i32(
-            (metadata >> wl.u32(12) & wl.u32(7)) * wl.u32(2) + wl.u32(1)
+            (metadata >> wl.u16(12) & wl.u16(7)) * wl.u16(2) + wl.u16(1)
         )
-        grid_index = wl.widen(w.q[group * wl.u32(4) + entry], wl.u32) | (
-            metadata >> entry * wl.u32(3) & wl.u32(7)
-        ) << wl.u32(8)
+        grid_index = wl.widen(w.q[group * wl.u16(4) + entry], wl.u16) | (
+            metadata >> entry * wl.u16(3) & wl.u16(7)
+        ) << wl.u16(8)
         weight = wl.lookup(
-            grid_values, grid_index * wl.u32(8) + payload, bounds="in_bounds"
+            grid_values, grid_index * wl.u16(8) + payload, bounds="in_bounds"
         )
         activation = x.q[
-            group * wl.u32(32) + entry * wl.u32(8) + wl.u32(payload)
+            group * wl.u16(32) + entry * wl.u16(8) + payload
         ]
         group_sum = wl.reduce_dot(activation, weight, over=("entry", "payload"), acc_dtype=wl.i32)
         delta = (
             wl.i32(1)
-            - wl.i32(metadata >> wl.u32(15) & wl.u32(1)) * wl.i32(2)
+            - wl.i32(metadata >> wl.u16(15) & wl.u16(1)) * wl.i32(2)
         )
         main = wl.reduce(scale * group_sum, axis="group")
         correction = wl.reduce(
             scale
             * delta
             * (
-                wl.i32(x.bsum[group * wl.u32(2)])
-                + wl.i32(x.bsum[group * wl.u32(2) + wl.u32(1)])
+                wl.i32(x.bsum[group * wl.u16(2)])
+                + wl.i32(x.bsum[group * wl.u16(2) + wl.u16(1)])
             ),
             axis="group",
         )
