@@ -69,7 +69,7 @@
     "mul-mat:sg2044 iq1_m decode": {"entry":"iq1_m_decode.py","symbol":"production_mul_mat_iq1_m_decode","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1},"binding_origin":"targeted-rerun"},
     "mul-mat:sg2044 iq1_m prefill": {"entry":"iq1_m.py","symbol":"production_mul_mat_iq1_m","source":{"NC":32,"MC":8,"MR":2,"NR":1},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
     "mul-mat:sg2044 iq1_s decode": {"entry":"iq1_s_decode.py","symbol":"production_mul_mat_iq1_s_decode","source":{},"physical":{"lmul_eighths":32,"unroll":4,"pipeline_depth":1}},
-    "mul-mat:sg2044 iq1_s prefill": {"entry":"iq1_s.py","symbol":"production_mul_mat_iq1_s","source":{"NC":32,"MC":16,"MR":1,"NR":1},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
+    "mul-mat:sg2044 iq1_s prefill": {"entry":"iq1_s.py","symbol":"production_mul_mat_iq1_s","source":{"NC":32,"MC":16,"MR":4,"NR":1},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1},"binding_origin":"measured-source-subset"},
     "mul-mat:sg2044 iq2_s decode": {"entry":"iq2_s.py","symbol":"production_mul_mat_iq2_s","source":{},"physical":{"lmul_eighths":32,"unroll":1,"pipeline_depth":1}},
     "mul-mat:sg2044 iq2_s prefill": {"entry":"iq2_s_staged.py","symbol":"production_mul_mat_iq2_s_staged","source":{"NC":64,"KC":256,"MC":16,"MR":4,"NR":2},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},
     "mul-mat:sg2044 iq2_s_staged decode": {"entry":"iq2_s_staged.py","symbol":"production_mul_mat_iq2_s_staged","source":{"NC":64,"KC":256,"MC":16,"MR":4,"NR":2},"physical":{"lmul_eighths":16,"unroll":1,"pipeline_depth":1}},

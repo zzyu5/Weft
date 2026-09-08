@@ -373,6 +373,72 @@ mlir::LogicalResult rebindFieldReadProjections(
   return mlir::success();
 }
 
+bool shortenSharedReload(Peak &peak, mlir::IRRewriter &rewriter) {
+  if (!peak.block || peak.point >= peak.block->getOperations().size())
+    return false;
+  mlir::Operation *at = &*std::next(peak.block->begin(), peak.point);
+  riscv::ReloadOp selected;
+  int64_t selectedGroups = 0;
+  for (const Interval &interval : intervalsFor(*peak.block)) {
+    auto reload = interval.value.getDefiningOp<riscv::ReloadOp>();
+    if (!reload || reload->getBlock() != peak.block || interval.fragment ||
+        interval.begin >= peak.point || interval.end <= peak.point ||
+        interval.groups <= selectedGroups)
+      continue;
+    // A private slot with one preceding spill and only reload users is immutable
+    // here. Splitting its reads does not rematerialize the numerical producer.
+    if (!reload.getSlot().getDefiningOp<riscv::LocalAllocOp>())
+      continue;
+    riscv::SpillOp writer;
+    bool immutable = true;
+    for (mlir::Operation *user : reload.getSlot().getUsers()) {
+      if (auto spill = mlir::dyn_cast<riscv::SpillOp>(user)) {
+        if (writer || spill.getSlot() != reload.getSlot()) {
+          immutable = false;
+          break;
+        }
+        writer = spill;
+      } else if (!mlir::isa<riscv::ReloadOp>(user)) {
+        immutable = false;
+        break;
+      }
+    }
+    if (!immutable || !writer || writer->getBlock() != peak.block ||
+        !writer->isBeforeInBlock(reload))
+      continue;
+    bool before = false, after = false, usedAtPeak = false, sameBlock = true;
+    for (mlir::Operation *user : reload.getResult().getUsers()) {
+      if (user->getBlock() != peak.block) {
+        sameBlock = false;
+        break;
+      }
+      usedAtPeak |= user == at;
+      before |= user->isBeforeInBlock(at) || (!peak.before && user == at);
+      after |= at->isBeforeInBlock(user);
+    }
+    if (!sameBlock || !before || !after || (peak.before && usedAtPeak))
+      continue;
+    selected = reload;
+    selectedGroups = interval.groups;
+  }
+  if (!selected)
+    return false;
+  llvm::SmallVector<mlir::Operation *> consumers;
+  for (mlir::Operation &operation : *peak.block)
+    if (llvm::is_contained(operation.getOperands(), selected.getResult()))
+      consumers.push_back(&operation);
+  rewriter.moveOpBefore(selected, consumers.front());
+  for (mlir::Operation *consumer : llvm::drop_begin(consumers)) {
+    rewriter.setInsertionPoint(consumer);
+    auto copy = rewriter.create<riscv::ReloadOp>(
+        consumer->getLoc(), selected.getResult().getType(), selected.getSlot(),
+        selected.getLeaf());
+    riscv_internal::copyOrigin(selected, copy);
+    consumer->replaceUsesOfWith(selected.getResult(), copy.getResult());
+  }
+  return true;
+}
+
 const Interval *selectVictim(mlir::Block &block, unsigned peakPoint,
                              bool peakBefore,
                              llvm::SmallVectorImpl<Interval> &intervals) {
@@ -493,6 +559,16 @@ public:
         if (peak.total() <= kernel.getTarget().getVectorRegisters()) {
           closed = true;
           break;
+        }
+        if (shortenSharedReload(peak, rewriter)) {
+          if (mlir::failed(rebindFieldReadProjections(kernel, rewriter))) {
+            failed = true;
+            break;
+          }
+          // Added read sites make peak.count incomparable with the preceding
+          // spill iteration. The original SSA candidate bound still applies.
+          havePrevious = false;
+          continue;
         }
         if (havePrevious &&
             (peak.total() > previous.total() ||

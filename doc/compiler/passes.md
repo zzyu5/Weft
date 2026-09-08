@@ -471,6 +471,12 @@ encoded storage projection 本身不是 spill 对象。捕获索引 spill 后，
 索引复用一次 reload；`field_read` 的纯地址投影在该读取点按它自己的索引 operands 重绑，
 严格保留 selector、type 与来源关系，重新核算资源，不克隆数值 producer 或扩大读取字节。
 
+若 CSE 共享已有 reload 后扩大驻留区间并再次超出预算，可以把该 reload 分到同一 block 的
+各 consumer 前；同一 consumer 的重复 operands 仍共享一次 reload。此改写只接受来自
+私有 allocation、由同 block 中唯一且先于 reload 的 spill 写入、其余用户均为 reload 的
+slot，且该值在超限点仅驻留而非必须作为输入存活。不新增 slot 或重新执行原数值 producer；
+使用点本身所需资源超限不能借此通过。改写仍受初始 SSA 候选数量的尝试上限约束并重新核算峰值。
+
 kernel 创建时 `resources_materialized=false`；只有资源分析、必要 spill 与峰值汇总全部闭合后，
 本 pass 才把它设为 `true`。初始化为零的 peak 不是闭合证据。layout canonicalization 仅在该
 marker 为 `false` 时允许改变 producer lifetime 的 backward rematerialization；marker 为
