@@ -3763,8 +3763,14 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       hasIndexedLookupSupply(dot.getRhs()) &&
       sharesConcreteFieldSupply(match.scale, dot.getRhs());
   auto scaleLayout = scaleType.getLayout();
+  const bool pairedScaleWindows =
+      windowExtent >= 2 && windowExtent <= kernel.getTarget().getVlenBits() / 64 &&
+      issueStreams % 2 == 0 && dot.getPartialUnroll() >= issueStreams &&
+      scaleLayout.getRegisterGroups() <= 2;
   const bool sharedScale =
-      !match.scale.hasOneUse() && issueStreams > 1 && windowExtent >= 4 &&
+      !match.scale.hasOneUse() && issueStreams > 1 &&
+      ((windowExtent >= 4 && scaleLayout.getRegisterGroups() == 1) ||
+       pairedScaleWindows) &&
       *outputReplicaCount == 1 && scaleType.getShape().size() == 1 &&
       scaleType.getAxisIds()[0] == windowAxis &&
       scaleType.getShape()[0] == issueStreams * windowExtent &&
@@ -3774,7 +3780,6 @@ std::optional<riscv::NestedPartialPlanAttr> planNestedPartialCarrier(
       scaleLayout.getReplicaFactors()[0] == 1 &&
       scaleLayout.getFragmentFactors()[0] == 1 &&
       scaleLayout.getLocalFactors()[0] == 1 &&
-      scaleLayout.getRegisterGroups() == 1 &&
       riscv::supportsRVVLayout(kernel.getTarget(), scaleLayout);
   const llvm::StringRef scaleSupplyStage =
       sharedScale ? "shared-before-issue"

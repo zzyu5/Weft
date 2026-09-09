@@ -4,7 +4,9 @@ namespace weft::riscv_emission {
 
 mlir::LogicalResult
 Emitter::compileRVVIssueSlice(riscv::RVVIssueSliceOp operation) {
-  if (instructionOf(operation.getOperation()) != "rvv.issue-slice")
+  const bool registerSlice =
+      instructionOf(operation.getOperation()) == "rvv.issue-slice.split";
+  if (!registerSlice && instructionOf(operation.getOperation()) != "rvv.issue-slice")
     return fail(operation, "RVV issue slice has no exact selected leaf");
   auto input = materializeNumeric(operation.getInput(),
                                   bindings.lookup(operation.getInput()));
@@ -33,7 +35,13 @@ Emitter::compileRVVIssueSlice(riscv::RVVIssueSliceOp operation) {
       return fail(operation,
                   "RVV issue slice references an absent source vector part");
     std::string sliced = input->parts[static_cast<size_t>(sourcePart)];
-    if (sourceLMUL != resultLMUL) {
+    if (registerSlice) {
+      std::string selected = fresh("issue_slice_part");
+      line(vectorType(operation.getResult()) + " " + selected +
+           " = __riscv_vget_v_" + sourceSuffix + "_" + resultSuffix + "(" + sliced +
+           ", " + std::to_string(laneOffset / physicalLanesFor(resultType)) + ");");
+      sliced = std::move(selected);
+    } else if (sourceLMUL != resultLMUL) {
       if (sourceLMUL < resultLMUL || sourceLMUL % resultLMUL)
         return fail(operation,
                     "RVV issue slice requires an integral LMUL truncation");
@@ -589,24 +597,50 @@ mlir::LogicalResult Emitter::compileRVVPartialPackedScale(
     riscv::RVVPartialPackedScaleOp operation) {
   if (instructionOf(operation.getOperation()) != "rvv.partial-packed-scale")
     return fail(operation, "packed partial scale has no exact selected leaf");
-  Binding input = bindings.lookup(operation.getInput());
-  Binding scales = bindings.lookup(operation.getScales());
-  const int64_t slots = operation.getInput().getType().getSlots();
-  if (input.kind != Binding::Kind::PartialSet ||
-      input.parts.size() != static_cast<size_t>(slots) ||
-      scales.kind != Binding::Kind::Vector || scales.parts.size() != 1)
-    return fail(operation, "packed partial scale has incomplete bindings");
-  std::string packed = input.parts[operation.getSlotOrder()[0]];
+  llvm::SmallVector<std::string> partials;
+  for (mlir::Value value : operation.getInputs()) {
+    Binding input = bindings.lookup(value);
+    const int64_t slots = mlir::cast<riscv::PartialSetType>(value.getType()).getSlots();
+    if (input.kind != Binding::Kind::PartialSet ||
+        input.parts.size() != static_cast<size_t>(slots))
+      return fail(operation, "packed partial scale has incomplete slot bindings");
+    llvm::append_range(partials, input.parts);
+  }
+  std::string scales;
+  int64_t scaleLanes = 0;
+  for (mlir::Value value : operation.getScales()) {
+    Binding scale = bindings.lookup(value);
+    auto type = mlir::cast<riscv::ValueType>(value.getType());
+    if (scale.kind != Binding::Kind::Vector || scale.parts.size() != 1)
+      return fail(operation, "packed partial scale has incomplete scale bindings");
+    if (!scaleLanes) {
+      scales = scale.parts[0];
+    } else {
+      std::string next = fresh("partial_scale_pack");
+      line("vint32m1_t " + next + " = __riscv_vslideup_vx_i32m1_tu(" +
+           scales + ", " + scale.parts[0] + ", " + std::to_string(scaleLanes) +
+           ", " + std::to_string(scaleLanes + type.getShape()[0]) + ");");
+      scales = std::move(next);
+    }
+    scaleLanes += type.getShape()[0];
+  }
+  const int64_t slots = partials.size();
+  if (slots < 2 || scaleLanes != slots)
+    return fail(operation, "packed partial scale slot and scale counts disagree");
+  std::string packed = partials[operation.getSlotOrder()[0]];
+  // Only the constructed prefix is observed by a later slide. Every other
+  // lane is overwritten before multiply/reduce, so a single final VL is valid
+  // for the whole pack even though each input defines only lane zero.
   for (int64_t lane = 1; lane < slots; ++lane) {
     std::string next = fresh("partial_lane_pack");
     line("vint32m1_t " + next + " = __riscv_vslideup_vx_i32m1_tu(" +
-         packed + ", " + input.parts[operation.getSlotOrder()[lane]] + ", " +
-         std::to_string(lane) + ", " + std::to_string(lane + 1) + ");");
+         packed + ", " + partials[operation.getSlotOrder()[lane]] + ", " +
+         std::to_string(lane) + ", " + std::to_string(slots) + ");");
     packed = std::move(next);
   }
   std::string product = fresh("partial_lane_scale");
   line("vint32m1_t " + product + " = __riscv_vmul_vv_i32m1(" + packed +
-       ", " + scales.parts[0] + ", " + std::to_string(slots) + ");");
+       ", " + scales + ", " + std::to_string(slots) + ");");
   std::string seed = fresh("partial_lane_seed");
   line("vint32m1_t " + seed + " = __riscv_vmv_v_x_i32m1(0, 1);");
   std::string reduced = fresh("partial_lane_sum");

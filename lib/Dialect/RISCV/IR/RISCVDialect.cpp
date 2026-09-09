@@ -7899,6 +7899,35 @@ mlir::LogicalResult RVVRecordStoreOp::verify() {
   return verifyLeafOperation(*this);
 }
 
+bool weft::riscv::supportsRVVRegisterSlice(
+    TargetAttr target, ValueType input, ValueType result,
+    llvm::ArrayRef<int64_t> offsets) {
+  if (!target || !input || !result || offsets.empty())
+    return false;
+  auto source = input.getLayout();
+  auto destination = result.getLayout();
+  auto sourceLanes = rvvLaneCount(input);
+  auto resultLanes = rvvLaneCount(result);
+  if (!supportsRVVLayout(target, source) || !supportsRVVLayout(target, destination) ||
+      input.getElementType() != result.getElementType() ||
+      elementBitWidth(input.getElementType()) != source.getSew() ||
+      source.getSew() != destination.getSew() ||
+      source.getValidity() != "full" || destination.getValidity() != "full" ||
+      destination.getLmulEighths() < 8 ||
+      source.getLmulEighths() <= destination.getLmulEighths() ||
+      source.getLmulEighths() % destination.getLmulEighths() ||
+      !sourceLanes || !resultLanes || source.getVl() != *sourceLanes)
+    return false;
+  const int64_t capacity = target.getVlenBits() / destination.getSew() *
+                           (destination.getLmulEighths() / 8);
+  return capacity > 0 && *resultLanes == capacity &&
+         destination.getVl() == capacity &&
+         llvm::all_of(offsets, [&](int64_t offset) {
+           return offset >= 0 && offset % capacity == 0 &&
+                  offset <= *sourceLanes - capacity;
+         });
+}
+
 mlir::LogicalResult RVVIssueSliceOp::verify() {
   ValueType input = getInput().getType();
   ValueType result = getResult().getType();
@@ -7908,6 +7937,7 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
       input.getLayout().getLaneFactors().asArrayRef());
   auto resultLanes = checkedPositiveProduct(
       result.getLayout().getLaneFactors().asArrayRef());
+  const bool registerSlice = getLeaf().getInstruction() == "rvv.issue-slice.split";
   if (input.getElementType() != result.getElementType() ||
       input.getLayout().getCarrier() != "rvv" ||
       result.getLayout().getCarrier() != "rvv" || !inputParts || !resultParts ||
@@ -7921,7 +7951,8 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
         return offset < 0 || offset % *resultLanes ||
                offset > *inputLanes - *resultLanes;
       }) ||
-      !exactLeaf(getLeaf(), "transfer", "issue-slice", "rvv.issue-slice",
+      !exactLeaf(getLeaf(), "transfer", "issue-slice",
+                 registerSlice ? "rvv.issue-slice.split" : "rvv.issue-slice",
                  "none", "exact"))
     return emitOpError(
         "RVV issue slice requires one exact physical-part projection");
@@ -7975,6 +8006,11 @@ mlir::LogicalResult RVVIssueSliceOp::verify() {
       result.getLayout().getVl() != *resultLanes)
     return emitOpError(
         "RVV issue slice must select one typed contiguous lane window and remove only non-fragment/non-local coordinates");
+  auto kernel = getOperation()->getParentOfType<KernelOp>();
+  if (registerSlice && (!kernel || getLeaf().getTemporaryGroups() != 0 ||
+                       !supportsRVVRegisterSlice(kernel.getTarget(), input, result,
+                                                  getLaneOffsets())))
+    return emitOpError("register issue slice requires aligned complete target register groups");
   return mlir::success();
 }
 
@@ -8737,65 +8773,105 @@ mlir::LogicalResult RVVPartialScaleCombineOp::verify() {
 }
 
 bool weft::riscv::supportsRVVPartialPackedScale(
-    TargetAttr target, PartialSetType input, ValueType scales,
-    PartialSetType result) {
-  if (!target || !input || !scales || !result)
+    TargetAttr target, llvm::ArrayRef<PartialSetType> inputs,
+    llvm::ArrayRef<ValueType> scales, PartialSetType result) {
+  if (!target || inputs.empty() || inputs.size() > 8 ||
+      scales.empty() || scales.size() > 8 || !result)
     return false;
-  auto partial = input.getPartialType();
+  auto partial = result.getPartialType();
   auto element = mlir::dyn_cast<mlir::IntegerType>(partial.getElementType());
   auto layout = partial.getLayout();
-  auto scaleLayout = scales.getLayout();
-  const int64_t slots = input.getSlots();
   const auto ones = [](auto values) {
     return llvm::all_of(values, [](int64_t factor) { return factor == 1; });
   };
-  return element && element.isSigned() && element.getWidth() == 32 &&
-         slots >= 2 && slots <= 8 && result.getSlots() == 1 &&
-         result.getPartialType() == partial &&
-         result.getReductionAxis() == input.getReductionAxis() &&
-         input.getTermsPerSlot() <= std::numeric_limits<int64_t>::max() / slots &&
-         result.getTermsPerSlot() == input.getTermsPerSlot() * slots &&
-         layout.getCarrier() == "rvv" && layout.getSew() == 32 &&
-         layout.getLmulEighths() == 8 && layout.getVl() == 1 &&
-         layout.getValidity() == "full" &&
-         ones(layout.getTimeFactors().asArrayRef()) &&
-         ones(layout.getLaneFactors().asArrayRef()) &&
-         ones(layout.getReplicaFactors().asArrayRef()) &&
-         ones(layout.getFragmentFactors().asArrayRef()) &&
-         ones(layout.getLocalFactors().asArrayRef()) &&
-         scales.getElementType() == element && scales.getShape().size() == 1 &&
-         scales.getShape()[0] == slots &&
-         scaleLayout.getCarrier() == "rvv" && scaleLayout.getSew() == 32 &&
-         scaleLayout.getLmulEighths() == 8 && scaleLayout.getVl() == slots &&
-         scaleLayout.getValidity() == "full" &&
-         scaleLayout.getLaneFactors()[0] == slots &&
-         ones(scaleLayout.getTimeFactors().asArrayRef()) &&
-         ones(scaleLayout.getReplicaFactors().asArrayRef()) &&
-         ones(scaleLayout.getFragmentFactors().asArrayRef()) &&
-         ones(scaleLayout.getLocalFactors().asArrayRef()) &&
-         supportsRVVLayout(target, layout) &&
-         supportsRVVLayout(target, scaleLayout) &&
-         input.getResourceGroups() + scaleLayout.getRegisterGroups() +
-                 result.getResourceGroups() + 3 <= target.getVectorRegisters();
+  if (!element || !element.isSigned() || element.getWidth() != 32 ||
+      result.getSlots() != 1 || layout.getCarrier() != "rvv" ||
+      layout.getSew() != 32 || layout.getLmulEighths() != 8 ||
+      layout.getVl() != 1 || layout.getValidity() != "full" ||
+      !ones(layout.getTimeFactors().asArrayRef()) ||
+      !ones(layout.getLaneFactors().asArrayRef()) ||
+      !ones(layout.getReplicaFactors().asArrayRef()) ||
+      !ones(layout.getFragmentFactors().asArrayRef()) ||
+      !ones(layout.getLocalFactors().asArrayRef()) ||
+      !supportsRVVLayout(target, layout))
+    return false;
+  int64_t slots = 0, terms = 0, resources = 0;
+  for (auto input : inputs) {
+    if (!input || input.getSlots() <= 0 ||
+        input.getSlots() > 8 - slots ||
+        input.getPartialType() != partial ||
+        input.getReductionAxis() != result.getReductionAxis() ||
+        input.getTermsPerSlot() >
+            (std::numeric_limits<int64_t>::max() - terms) / input.getSlots())
+      return false;
+    const int64_t width = input.getSlots();
+    slots += width;
+    terms += width * input.getTermsPerSlot();
+    resources += input.getResourceGroups();
+  }
+  int64_t scaleAxis = -1, scaleLanes = 0;
+  for (auto scale : scales) {
+    if (!scale || scale.getShape().size() != 1)
+      return false;
+    const int64_t width = scale.getShape()[0];
+    auto scaleLayout = scale.getLayout();
+    if (scale.getElementType() != element || width <= 0 || width > slots - scaleLanes ||
+        (scaleAxis != -1 && scale.getAxisIds()[0] != scaleAxis) ||
+        scaleLayout.getCarrier() != "rvv" || scaleLayout.getSew() != 32 ||
+        scaleLayout.getLmulEighths() != 8 || scaleLayout.getVl() != width ||
+        scaleLayout.getValidity() != "full" ||
+        scaleLayout.getLaneFactors()[0] != width ||
+        !ones(scaleLayout.getTimeFactors().asArrayRef()) ||
+        !ones(scaleLayout.getReplicaFactors().asArrayRef()) ||
+        !ones(scaleLayout.getFragmentFactors().asArrayRef()) ||
+        !ones(scaleLayout.getLocalFactors().asArrayRef()) ||
+        !supportsRVVLayout(target, scaleLayout))
+      return false;
+    scaleAxis = scale.getAxisIds()[0];
+    scaleLanes += width;
+    resources += scaleLayout.getRegisterGroups();
+  }
+  const int64_t temporaries = scales.size() == 1 ? 3 : 4;
+  return slots >= 2 && slots <= target.getVlenBits() / 32 &&
+         scaleLanes == slots && terms == result.getTermsPerSlot() &&
+         resources + result.getResourceGroups() + temporaries <=
+             target.getVectorRegisters();
 }
 
 mlir::LogicalResult RVVPartialPackedScaleOp::verify() {
   auto kernel = (*this)->getParentOfType<KernelOp>();
-  auto input = getInput().getType();
-  auto scales = getScales().getType();
+  llvm::SmallVector<PartialSetType> inputs;
+  llvm::SmallVector<ValueType> scales;
+  int64_t slots = 0, operandGroups = 0;
+  for (mlir::Value value : getInputs()) {
+    auto input = mlir::cast<PartialSetType>(value.getType());
+    inputs.push_back(input);
+    if (input.getSlots() > 8 - slots)
+      return emitOpError("packed scale supports at most eight reduced slots");
+    slots += input.getSlots();
+    operandGroups += input.getResourceGroups();
+  }
+  for (mlir::Value value : getScales()) {
+    auto scale = mlir::cast<ValueType>(value.getType());
+    scales.push_back(scale);
+    operandGroups += scale.getLayout().getRegisterGroups();
+  }
+  const int64_t temporaries = scales.size() == 1 ? 3 : 4;
   if (!kernel || !supportsRVVPartialPackedScale(
-                     kernel.getTarget(), input, scales, getResult().getType()) ||
-      getSlotOrder().size() != static_cast<size_t>(input.getSlots()) ||
+                     kernel.getTarget(), inputs, scales, getResult().getType()) ||
+      getSlotOrder().size() != static_cast<size_t>(slots) ||
       getLogicalReductionAxes().size() != 1 ||
-      getLogicalReductionAxes()[0] != scales.getAxisIds()[0] ||
-      getLeaf().getTemporaryGroups() != 3 ||
+      getLogicalReductionAxes()[0] != scales.front().getAxisIds()[0] ||
+      getLeaf().getOperandGroups() != operandGroups ||
+      getLeaf().getResultGroups() != getResult().getType().getResourceGroups() ||
+      getLeaf().getTemporaryGroups() != temporaries ||
       !exactLeaf(getLeaf(), "rvv", "partial-packed-scale",
                  "rvv.partial-packed-scale", "none", "exact"))
     return emitOpError(
-        "packed scale requires full i32 VL1 slots, one m1 scale vector, and three temporary groups");
-  llvm::SmallVector<bool> seen(input.getSlots(), false);
+        "packed scale requires aligned full i32 VL1 slot sets and m1 scale windows with closed pack resources");
+  llvm::SmallVector<bool> seen(slots, false);
   for (int64_t slot : getSlotOrder()) {
-    if (slot < 0 || slot >= input.getSlots() || seen[slot])
+    if (slot < 0 || slot >= slots || seen[slot])
       return emitOpError("packed scale slot order must be a permutation");
     seen[slot] = true;
   }

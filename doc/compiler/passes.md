@@ -444,13 +444,24 @@ signed-i32 singleton partial，再做一次 scalar extract。只接受同一 blo
 
 对已归约的signed-i32/VL1 partial，另比较scalar scale/combine与显式
 `rvv_partial_packed_scale`：后者按完整slot permutation把2至8个结果装入m1的有效lane，
-与同轴、同序、完整的i32 scale向量相乘，再归约为原来的单slot。输入/输出partial类型、
+与同轴、同序、完整的i32 scale向量相乘，再归约为原来的单slot。输入允许有界的partial-set
+与scale-window列表：分别按operand顺序连接slot与scale lane，数量必须相等并适合target的
+m1容量；slot permutation索引连接后的partial序列，不合并或丢弃各slot的独立权重。
+输入/输出partial类型、
 原scale位置、整数宽度与terms归属不变；不接纳tail、多个输出slot或跨轴scale。
 scale的LMUL调整保留显式conversion，terminal仅拼写已选pack/multiply/reduce。
+同block、single-use、顺序明确的相邻scale/combine可成对选择，最多检查32对；每对在第二个
+原consumer处完成，避免把全部partial延长到最终merge。满unroll且两个窗口可容纳于m1时，
+完整的一维scale可在至多两个register groups内供各issue共享，仍保留原读取和数值结合位置。
+已选scale slice若来自同一数值SSA的连续同轴窗口，operation selector可合为一个完整窗口。
+完整且整组对齐的issue slice由同一selector选择`rvv.issue-slice.split`，verifier按target
+VLMAX、full active lanes、整数LMUL比和offset对齐闭合，terminal只拼写`vget`。
+slot pack统一使用最终VL：每次slide保留已构造前缀，未构造lane在唯一的multiply/reduce之前
+全部被后续slide覆盖；输入的未定义尾lane不会进入最终数值运算。
 局部选择先检查target、坐标与资源合同，再比较包含pack、seed、reduction和VL设置的成本；
 可scalar-rematerialize的供应以无vector extract的成本下界比较。供应搜索最多32个节点，
 估计以`weft.riscv.packed_scale_cost = [packed, scalar]`保存在selected op中，不作为合法性证明。
-该leaf另声明三个temporary vector groups，最终live-set仍由资源pass重算。
+单scale窗口声明三个temporary vector groups，多窗口拼接声明四个；最终live-set仍由资源pass重算。
 
 该pass位于普通编译与layout-input恢复共用的收尾入口，并由`weft-opt`公开供重放。已带
 final resource marker的图不重新选择；独立副本须先清marker和统计后才能重放此改写。

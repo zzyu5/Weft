@@ -329,6 +329,125 @@ void selectWidenAdds(mlir::ModuleOp module, mlir::IRRewriter &rewriter) {
   });
 }
 
+void coalescePackedScaleSlices(mlir::ModuleOp module,
+                               mlir::IRRewriter &rewriter) {
+  llvm::SmallVector<riscv::RVVPartialPackedScaleOp> operations;
+  module.walk([&](riscv::RVVPartialPackedScaleOp op) { operations.push_back(op); });
+  const auto completeVector = [](riscv::ValueType type) {
+    auto layout = type.getLayout();
+    return type.getShape().size() == 1 && type.getShape()[0] > 0 &&
+           layout.getCarrier() == "rvv" && layout.getValidity() == "full" &&
+           layout.getTimeFactors()[0] == 1 &&
+           layout.getLaneFactors()[0] == type.getShape()[0] &&
+           layout.getReplicaFactors()[0] == 1 &&
+           layout.getFragmentFactors()[0] == 1 &&
+           layout.getLocalFactors()[0] == 1 && layout.getVl() == type.getShape()[0];
+  };
+  for (auto operation : operations) {
+    auto kernel = operation->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        operation.getScales().size() < 2 || operation.getScales().size() > 8)
+      continue;
+    mlir::Value source;
+    int64_t base = 0, lanes = 0;
+    bool complete = true;
+    for (mlir::Value scale : operation.getScales()) {
+      auto type = mlir::cast<riscv::ValueType>(scale.getType());
+      if (!completeVector(type) || type.getShape()[0] > 8 - lanes) {
+        complete = false;
+        break;
+      }
+      if (auto conversion = scale.getDefiningOp<riscv::ConvertLayoutOp>()) {
+        auto input = conversion.getInput().getType();
+        if (conversion.getConversion().getEffect() != "pure" ||
+            conversion.getSourceAccess() || !completeVector(input) ||
+            input.getShape() != type.getShape() || input.getAxisIds() != type.getAxisIds() ||
+            input.getElementType() != type.getElementType() ||
+            input.getLayout().getSew() != type.getLayout().getSew()) {
+          complete = false;
+          break;
+        }
+        scale = conversion.getInput();
+      }
+      auto slice = scale.getDefiningOp<riscv::RVVIssueSliceOp>();
+      if (!slice || slice.getSourceParts().size() != 1 ||
+          slice.getSourceParts()[0] != 0 || slice.getLaneOffsets().size() != 1 ||
+          !completeVector(slice.getInput().getType())) {
+        complete = false;
+        break;
+      }
+      if (!source) {
+        source = slice.getInput();
+        base = slice.getLaneOffsets()[0];
+      }
+      if (slice.getInput() != source || base > INT64_MAX - lanes ||
+          slice.getLaneOffsets()[0] != base + lanes) {
+        complete = false;
+        break;
+      }
+      lanes += type.getShape()[0];
+    }
+    if (!complete || !source || lanes <= 0 || base % lanes)
+      continue;
+    auto sourceType = mlir::cast<riscv::ValueType>(source.getType());
+    if (sourceType.getShape()[0] % lanes ||
+        base > sourceType.getShape()[0] - lanes)
+      continue;
+    auto one = rewriter.getDenseI64ArrayAttr({1});
+    auto shape = rewriter.getDenseI64ArrayAttr({lanes});
+    auto layout = riscv::LayoutAttr::get(
+        rewriter.getContext(), "rvv", sourceType.getAxisIds(), one, shape,
+        one, one, one, 32, 8, lanes, 1, "full");
+    auto scaleType = riscv::ValueType::get(
+        rewriter.getContext(), sourceType.getElementType(), shape,
+        sourceType.getAxisIds(), layout);
+    llvm::SmallVector<riscv::PartialSetType> inputs;
+    int64_t inputGroups = 0;
+    for (mlir::Value input : operation.getInputs()) {
+      auto type = mlir::cast<riscv::PartialSetType>(input.getType());
+      inputs.push_back(type);
+      inputGroups += type.getResourceGroups();
+    }
+    if (sourceType.getLayout().getLmulEighths() < 8 ||
+        !riscv::supportsRVVPartialPackedScale(
+            kernel.getTarget(), inputs, {scaleType}, operation.getResult().getType()))
+      continue;
+    rewriter.setInsertionPoint(operation);
+    auto combined = rewriter.create<riscv::RVVIssueSliceOp>(
+        operation.getLoc(), scaleType, source, rewriter.getDenseI64ArrayAttr({0}),
+        rewriter.getDenseI64ArrayAttr({base}),
+        riscv_internal::leaf(
+            rewriter, "transfer", "issue-slice", "rvv.issue-slice", "rvv.issue-slice",
+            sourceType.getLayout().getRegisterGroups(), 1,
+            sourceType.getLayout().getRegisterGroups(), 0, "none", "exact"));
+    riscv_internal::copyOrigin(operation, combined);
+    const int64_t eliminatedPacks = operation.getScales().size() - 1;
+    operation.getScalesMutable().assign(mlir::ValueRange{combined.getResult()});
+    operation.setLeafAttr(riscv_internal::leaf(
+        rewriter, "rvv", "partial-packed-scale", "rvv.partial-packed-scale",
+        "rvv.partial-packed-scale", inputGroups + 1, 1, 3, 0, "none", "exact"));
+    if (auto costs = operation->getAttrOfType<mlir::DenseI64ArrayAttr>(
+            "weft.riscv.packed_scale_cost"); costs && costs.size() == 2)
+      operation->setAttr("weft.riscv.packed_scale_cost",
+                        rewriter.getDenseI64ArrayAttr(
+                            {costs[0] - eliminatedPacks, costs[1]}));
+  }
+}
+
+void selectRegisterSlices(mlir::ModuleOp module, mlir::Builder &builder) {
+  module.walk([&](riscv::RVVIssueSliceOp slice) {
+    auto kernel = slice->getParentOfType<riscv::KernelOp>();
+    if (!kernel || kernel.getResourcesMaterialized() ||
+        !riscv::supportsRVVRegisterSlice(kernel.getTarget(), slice.getInput().getType(),
+                                        slice.getResult().getType(), slice.getLaneOffsets()))
+      return;
+    slice.setLeafAttr(riscv_internal::leaf(
+        builder, "transfer", "issue-slice", "rvv.issue-slice.split", "rvv.issue-slice.split",
+        slice.getInput().getType().getLayout().getRegisterGroups(),
+        slice.getResult().getType().getLayout().getRegisterGroups(), 0, 0, "none", "exact"));
+  });
+}
+
 class SelectRISCVOperationsPass
     : public mlir::PassWrapper<SelectRISCVOperationsPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -345,6 +464,8 @@ public:
     selectLoopCarriedWidenProducts(getOperation(), rewriter);
     selectZeroSeedProducts(getOperation(), rewriter);
     selectWidenAdds(getOperation(), rewriter);
+    coalescePackedScaleSlices(getOperation(), rewriter);
+    selectRegisterSlices(getOperation(), rewriter);
     mlir::Builder builder(&getContext());
     bool failed = false;
     getOperation().walk([&](mlir::Operation *operation) {

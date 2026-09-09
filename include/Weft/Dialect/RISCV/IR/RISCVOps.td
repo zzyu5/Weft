@@ -1789,9 +1789,9 @@ def WeftRISCV_RVVPartialScaleCombineOp
 }
 
 def WeftRISCV_RVVPartialPackedScaleOp
-    : WeftRISCV_LeafOp<"rvv_partial_packed_scale", [Pure]> {
-  let arguments = (ins WeftRISCV_PartialSetType:$input,
-                       WeftRISCV_ValueType:$scales,
+    : WeftRISCV_LeafOp<"rvv_partial_packed_scale", [Pure, AttrSizedOperandSegments]> {
+  let arguments = (ins Variadic<WeftRISCV_PartialSetType>:$inputs,
+                       Variadic<WeftRISCV_ValueType>:$scales,
                        DenseI64ArrayAttr:$slot_order,
                        DenseI64ArrayAttr:$logical_reduction_axes,
                        WeftRISCV_LeafAttr:$leaf);

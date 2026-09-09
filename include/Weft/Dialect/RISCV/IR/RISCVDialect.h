@@ -31,8 +31,12 @@ namespace weft::riscv {
 /// Returns whether an RVV layout is executable under the complete target
 /// register contract, including fractional LMUL, VLMAX, and register groups.
 bool supportsRVVLayout(TargetAttr target, LayoutAttr layout);
-bool supportsRVVPartialPackedScale(TargetAttr target, PartialSetType input,
-                                  ValueType scales, PartialSetType result);
+bool supportsRVVRegisterSlice(TargetAttr target, ValueType input, ValueType result,
+                              llvm::ArrayRef<int64_t> offsets);
+bool supportsRVVPartialPackedScale(TargetAttr target,
+                                  llvm::ArrayRef<PartialSetType> inputs,
+                                  llvm::ArrayRef<ValueType> scales,
+                                  PartialSetType result);
 bool supportsRVVMaskedNegate(TargetAttr target, ValueType data, ValueType mask);
 bool supportsRVVWidenAdd(TargetAttr target, ValueType lhs, ValueType rhs,
                          ValueType result);
